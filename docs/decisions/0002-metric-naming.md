@@ -39,14 +39,46 @@
 | `sys` | システムの数値状態 | `sys.cuda_processes` |
 | `d` | **派生値。予約済みで、`readings` には格納しない**（2.2） | `d.intake_rise` |
 
+#### 文法
+
+`gpu.0.core` や `power.gpu.0` のように**添字セグメント**を含む名前が要件 §5.1 に
+含まれるため、「小文字とアンダースコアのみ」では必須メトリクスを弾いてしまう。
+検証器が書ける形で文法を定義する。
+
+```text
+metric  := segment ("." segment)+     ; 2〜4 セグメント。ドメインなしの1語は不可
+segment := name | index
+name    := [a-z][a-z0-9_]*            ; 先頭は英字。数字とアンダースコアを含めてよい
+index   := [0-9]+                     ; 0 始まりの装置番号など
+```
+
+検証用の正規表現:
+
+```text
+^[a-z][a-z0-9_]*(\.([a-z][a-z0-9_]*|[0-9]+)){1,3}$
+```
+
 規則:
 
-- 小文字とアンダースコアのみ。ハイフンを使わない
+- ハイフンと大文字は使わない
 - 単位はメトリクス名に含めない（`air.room_c` としない）。単位はメトリクス定義側が持つ
 - 一度公開した名前は変更しない。変更が必要なら新しい名前を足し、旧名は移行後に廃止する
 - **カテゴリ値（状態）はメトリクスにしない。** `system_state` テーブルへ持つ（2.6）
 
-v1 で使用する具体的なメトリクスは要件 §5.1 の表に従う。
+#### 要件 §5.1 からの変更: `chipset` → `board.chipset` ★承認が必要
+
+要件 §5.1 は lm-sensors 由来のメトリクスを `cpu.package` / `cpu.vrm` / **`chipset`** と
+挙げているが、`chipset` だけドメインを持たず `<domain>.<name>` に反する。
+このままでは命名規約の検証器が必須メトリクスを弾く。
+
+`board` ドメインを新設して `board.chipset` とする。チップセットは CPU とは別の
+シリコンであり、`cpu.*`（`cpu.package` はCPU自身、`cpu.vrm` はCPUへ給電するVRM）に
+含めると意味がずれる。今後マザーボード側のセンサーが増えた際の置き場所にもなる。
+
+**この名前は #34（NVML / lm-sensors 統合、実機待ち）でしか使わず、
+まだ1行もデータが存在しない。** 変更するなら今が唯一のコストゼロの機会。
+
+v1 で使用する具体的なメトリクスは、上記1点を除き要件 §5.1 の表に従う。
 
 ### 2.2 派生メトリクスは保存しない
 
@@ -145,7 +177,7 @@ NVML から観測した GPU の実状態のようなカテゴリ値を、
 ```sql
 CREATE TABLE system_state (
     ts_ms INTEGER NOT NULL,
-    key   TEXT    NOT NULL,   -- 'gpu_state'
+    key   TEXT    NOT NULL,   -- 'sys.gpu_state'
     value TEXT    NOT NULL,   -- 'compute'
     PRIMARY KEY (ts_ms, key)
 ) WITHOUT ROWID;
@@ -161,7 +193,7 @@ CREATE TABLE system_state (
 主キーの並びが `readings`（2.4）と逆なのは意図的ではなく、行数が桁違いに少なく
 並び順が性能に影響しないため、指定された形をそのまま採ったもの。
 
-#### `gpu_state` の値
+#### `sys.gpu_state` の値
 
 | 値 | 条件 |
 |---|---|
@@ -189,9 +221,10 @@ coldaisle のデータモデルには現れない。
 
 なお `sys.cuda_processes` は個数（数値）なので通常どおり `readings` へ格納する。
 
-> 保存する `key` は `gpu_state` とし、`sys.` を付けない。
-> `system_state` テーブル自体がシステム名前空間であるため。
-> 文書や API 上で `sys.gpu_state` と書く場合との対応関係をここで固定しておく。
+> 保存する `key` は **`sys.gpu_state`** とする（`sys.` を付ける）。
+> `readings.metric` と `system_state.key` で同じ対象を別表記にすると、
+> API のレスポンスやログを読むときに毎回対応付けが必要になる。
+> 名前空間の表記は格納先に関わらず一つにそろえる。
 
 ### 2.7 `node_id` は列を作らず名前だけ予約する
 
@@ -220,30 +253,85 @@ coldaisle のデータモデルには現れない。
 
 ```sql
 CREATE TABLE readings_1m (
-    metric        TEXT    NOT NULL,
-    bucket_ms     INTEGER NOT NULL,   -- 分の開始時刻 (Unix ms, UTC)
-    min_value     REAL,
-    max_value     REAL,
-    mean_value    REAL,
-    sample_count  INTEGER NOT NULL,   -- 実際に値があった数
-    missing_count INTEGER NOT NULL,   -- quality != 'ok' だった数
+    metric         TEXT    NOT NULL,
+    bucket_ms      INTEGER NOT NULL,   -- 分の開始時刻 (Unix ms, UTC)
+    min_value      REAL,               -- quality='ok' の行のみから計算
+    max_value      REAL,
+    mean_value     REAL,
+    ok_value_count INTEGER NOT NULL,   -- quality='ok' の行数。上の3値の母数
+    row_count      INTEGER NOT NULL,   -- バケット内の全行数（品質を問わない）
+    expected_count INTEGER,            -- そのバケットで期待されるサンプル数
     PRIMARY KEY (metric, bucket_ms)
 ) WITHOUT ROWID;
 
 CREATE TABLE readings_1h (
-    metric        TEXT    NOT NULL,
-    bucket_ms     INTEGER NOT NULL,   -- 時の開始時刻 (Unix ms, UTC)
-    min_value     REAL,
-    max_value     REAL,
-    mean_value    REAL,
-    sample_count  INTEGER NOT NULL,
-    missing_count INTEGER NOT NULL,
+    metric         TEXT    NOT NULL,
+    bucket_ms      INTEGER NOT NULL,   -- 時の開始時刻 (Unix ms, UTC)
+    min_value      REAL,
+    max_value      REAL,
+    mean_value     REAL,
+    ok_value_count INTEGER NOT NULL,
+    row_count      INTEGER NOT NULL,
+    expected_count INTEGER,
     PRIMARY KEY (metric, bucket_ms)
 ) WITHOUT ROWID;
 ```
 
-`missing_count` を持つのは、NFR-02（欠測率1%未満）と FR-303（欠測率）を
-**ロールアップだけで計算できるようにする**ため。生データを消した後も欠測率が追える。
+#### 集計は `quality='ok'` の行だけで行う
+
+`suspect`（`-127.00` や ちょうど `85.00`）を平均や最大値に混ぜてはならない。
+センサーの人工物がそのままグラフと統計に乗り、**生データを消した後は
+取り除けなくなる。** 品質の情報は `ok_value_count` と `row_count` の差として残る。
+
+`ok_value_count = 0` のバケットでは `min_value` / `max_value` / `mean_value` は NULL。
+
+#### 3つの計数を持つ理由（重なりのない母数を残す）
+
+当初は `sample_count`（値があった数）と `missing_count`（`ok` 以外の数）の2つにしていたが、
+**この2つは重なるため欠測率を復元できない。**
+数値を持つ `suspect` の行は両方を増やすので、
+
+| 実際に起きたこと | 旧定義での記録 | 本来の欠測率 |
+|---|---|---|
+| 数値付きの `suspect` が1行 | `sample_count=1, missing_count=1` | 100% |
+| `ok` が1行 + 値なし `missing` が1行 | `sample_count=1, missing_count=1` | 50% |
+
+**同じ記録から異なる欠測率が導かれてしまう。** 生データを30日で消したあとは
+どちらだったか判別できず、FR-303 と NFR-02 が満たせない。
+
+そこで、入れ子の関係が明確な3つを持つ。
+
+```text
+ok_value_count  ≦  row_count  ≦  expected_count（通常）
+        欠測率 = 1 - ok_value_count / COALESCE(expected_count, row_count)
+```
+
+| 列 | 何を数えるか | これで分かること |
+|---|---|---|
+| `ok_value_count` | `quality='ok'` の行 | 集計値の重み。欠測率の分子 |
+| `row_count` | バケット内の全行 | **サンプルは届いたが値が異常**（センサー故障、FR-402） |
+| `expected_count` | 期待サンプル数 | **サンプル自体が届かなかった**（通信断、FR-401） |
+
+`row_count` と `expected_count` を分けているのは、この2つが違う障害を指すため。
+どちらも欠測だが、対処は「センサーを見る」と「ケーブルとデーモンを見る」で異なる。
+
+`expected_count` は取り込み側が `devices.interval_ms`（起動バナー由来）から算出する。
+ファームウェアの更新で送信周期が変わっても、**バケット単位で当時の期待値が残る。**
+起動バナーを受け取れていない場合のみ NULL とし、そのときの欠測率は
+`row_count` を母数とした下限値として扱う。
+
+#### 1分 → 1時間の再集計
+
+**平均の単純平均を取ってはならない。** `ok_value_count` で重み付けする。
+
+```text
+min_value      = MIN(min_value)
+max_value      = MAX(max_value)
+mean_value     = SUM(mean_value * ok_value_count) / SUM(ok_value_count)
+ok_value_count = SUM(ok_value_count)
+row_count      = SUM(row_count)
+expected_count = SUM(expected_count)    -- いずれかが NULL なら NULL
+```
 
 `min_value` ではなく `min` としないのは、SQL の集約関数名と紛れるため。
 
