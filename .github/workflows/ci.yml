@@ -1,0 +1,33 @@
+# lint / 型検査 / テスト（#2）
+# 実機が無くても完走することが本プロジェクトの前提（要件 D-02）。
+# 秘匿情報の検出は secrets.yml が担当する。
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      # Python 3.12 は .python-version から uv が解決する（単一の情報源にする）
+      # setup-uv はメジャー移動タグ（v10）を打っていないため完全版で固定する
+      - uses: astral-sh/setup-uv@v10.0.1
+
+      # uv.lock と pyproject.toml がずれていたら失敗させる
+      - run: uv sync --locked
+
+      - run: uv run ruff check .
+      - run: uv run ruff format --check .
+      - run: uv run mypy src
+
+      # 実機必須のテストは除外する（AGENTS.md ルール4）
+      - run: uv run pytest -k "not hardware" --cov --cov-report=term-missing --cov-fail-under=70
