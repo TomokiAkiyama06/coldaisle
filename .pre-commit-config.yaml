@@ -1,0 +1,22 @@
+# 秘匿情報の混入防止（#41）
+#
+# 導入: uvx pre-commit install
+# 手動実行: uvx pre-commit run --all-files
+#
+# pre-commit は自身でフック用の環境を管理するため、プロジェクトの依存には追加しない。
+# 同じチェックを .github/workflows/secrets.yml で CI にも掛けている。
+repos:
+  - repo: https://github.com/Yelp/detect-secrets
+    rev: v1.5.0
+    hooks:
+      - id: detect-secrets
+        args: ["--baseline", ".secrets.baseline"]
+
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v6.0.0
+    hooks:
+      # 秘密鍵の直接コミットを止める
+      - id: detect-private-key
+      # .gitignore をすり抜けた DB・ログの巻き添えコミットを止める
+      - id: check-added-large-files
+        args: ["--maxkb=512"]

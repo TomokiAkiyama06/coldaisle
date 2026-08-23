@@ -281,11 +281,14 @@ coldaisle が NVML / lm-sensors も収集し、`GET /api/v1/server-health` を�
 
 ```json
 {"v":1,"type":"hello","fw":"1.0.0","dev":"xiao-esp32s3","interval_ms":2500,
- "sensors":{"front_intake":{"kind":"ds18b20","gpio":1,"rom":"28FF641E0417032A","res":11}}}
+ "sensors":{"front_intake":{"kind":"ds18b20","gpio":1,"rom":"28FFFFFFFFFFFF01","res":11}}}
 ```
 
 `rom`（DS18B20の64bit ROM ID）を記録することで、**プローブを差し替えた／位置を入れ替えた**
 ことをホスト側が検出できる。仕様書 §15 の「センサー位置の最終固定」を運用で担保する仕組み。
+
+> 上記の `rom` はダミー値です。**実機の ROM ID はドキュメントにもコードにも書かないでください**（#41）。
+> 保存先は #3 / #14 で決めます。
 
 ### 5.3 品質フラグの判定規則
 

@@ -1,0 +1,49 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# uv / 仮想環境
+.venv/
+venv/
+
+# ツールキャッシュ
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+.coverage
+coverage.xml
+htmlcov/
+
+# 秘匿情報（#41）
+# .env.example だけは変数名の雛形としてコミットする
+.env
+.env.*
+!.env.example
+config/secrets.*
+*.pem
+*.key
+
+# 収集データ・データベース（実データはコミットしない）
+*.db
+*.db-wal
+*.db-shm
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
+data/
+
+# ログ・CSVエクスポート（FR-205 の出力先。~/server_sensor_logs 相当）
+logs/
+*.log
+server_sensor_logs/
+sensors_*.csv
+
+# OS / エディタ
+.DS_Store
+*.swp
+.idea/
+.vscode/

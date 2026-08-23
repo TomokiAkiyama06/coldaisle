@@ -11,6 +11,7 @@ GPUサーバーの温湿度監視 + ローカルLLM運用アシスタント。
 ## コマンド
 
 ```bash
+uvx pre-commit install               # 秘匿情報チェックの導入（clone 後1回だけ）
 uv sync                              # 依存解決
 uv run pytest                        # テスト
 uv run pytest -k "not hardware"      # 実機不要のテストのみ（CIと同じ）
