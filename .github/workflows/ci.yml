@@ -19,7 +19,8 @@ jobs:
       - uses: actions/checkout@v7
 
       # Python 3.12 は .python-version から uv が解決する（単一の情報源にする）
-      - uses: astral-sh/setup-uv@v10
+      # setup-uv はメジャー移動タグ（v10）を打っていないため完全版で固定する
+      - uses: astral-sh/setup-uv@v10.0.1
 
       # uv.lock と pyproject.toml がずれていたら失敗させる
       - run: uv sync --locked
