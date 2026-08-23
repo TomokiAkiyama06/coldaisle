@@ -90,4 +90,6 @@ DRY_RUN=1 ./scripts/create_issues.sh   # 確認
 
 ## ライセンス
 
-Apache License 2.0（予定）
+Apache License 2.0
+
+Copyright 2026 TomokiAkiyama06
