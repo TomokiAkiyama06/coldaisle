@@ -1,0 +1,348 @@
+# ADR 0001: メトリクス命名規約とDBスキーマ（ロング形式）
+
+- **Status**: Proposed（本 PR のマージをもって Accepted とする）
+- **Date**: 2026-08-24
+- **関連**: `docs/requirements.md` §5.1 / §5.3 / D-04、`docs/decisions/2026-08-23-open-questions.md` D-02
+- **対象 Issue**: #3
+
+以降のすべての実装（#5 ストレージ層、#9 API、#10 ロールアップ、#18 ルールエンジン）は
+本 ADR の DDL を唯一の参照先とする。
+
+---
+
+## 1. Context
+
+将来 CPU / GPU / VRM / 12V-2x6 コネクタのセンサーを追加する予定がある（要件 S-10、元仕様 §18-8）。
+ワイド形式（列＝センサー）では追加のたびに `ALTER TABLE` が必要になり、
+その都度スキーマ移行とコード変更が発生する。
+
+センサーの追加はこのプロジェクトの既定路線であって例外ではない。
+**スキーマ変更を「時々起きる事故」ではなく「起きない前提」にする**ことを優先する。
+
+---
+
+## 2. Decision
+
+### 2.1 メトリクス命名規約
+
+`<domain>.<name>` のドット区切りとする。domain は名前空間として機能する。
+
+| domain | 意味 | 例 |
+|---|---|---|
+| `air` | 外付けセンサーが測る空気の状態 | `air.room`, `air.gpu_intake` |
+| `gpu` | NVML 由来。`gpu.<index>.<name>` の3段 | `gpu.0.core`, `gpu.0.hotspot` |
+| `cpu` | lm-sensors 由来 | `cpu.package`, `cpu.vrm` |
+| `power` | 消費電力 | `power.gpu.0`, `power.wall` |
+| `sys` | システム状態 | `sys.gpu_mode`, `sys.cuda_processes` |
+| `d` | **派生値。予約済みで、`readings` には格納しない**（2.2） | `d.intake_rise` |
+
+規則:
+
+- 小文字とアンダースコアのみ。ハイフンを使わない
+- 単位はメトリクス名に含めない（`air.room_c` としない）。単位はメトリクス定義側が持つ
+- 一度公開した名前は変更しない。変更が必要なら新しい名前を足し、旧名は移行後に廃止する
+
+v1 で使用する具体的なメトリクスは要件 §5.1 の表に従う。
+
+### 2.2 派生メトリクスは保存しない
+
+`d.intake_rise` / `d.gpu_preheat` / `d.gpu_delta` / `d.top_rise` / `d.gpu_internal_delta` は
+**保存せず、参照のたびに計算する。**
+
+理由:
+
+- 保存すると、元メトリクスの較正オフセット（FR-107）を後から変更したときに
+  **保存済みの派生値と再計算した値が食い違う。** 二つの真実を持つことになる
+- 引き算は安価で、行数を倍にする価値がない
+- 派生値の定義（何から何を引くか）はコード側の一箇所で管理できる
+
+`d.` を予約プレフィクスとし、**`d.` で始まる行を `readings` に INSERT してはならない。**
+
+### 2.3 `readings`（生データ）
+
+```sql
+CREATE TABLE readings (
+    metric  TEXT    NOT NULL,          -- 'air.front_intake'
+    ts_ms   INTEGER NOT NULL,          -- ホスト受信時刻 (Unix ms, UTC)
+    value   REAL,                      -- NULL 可（欠測）
+    quality TEXT    NOT NULL,          -- ok | missing | suspect | stale
+    PRIMARY KEY (metric, ts_ms),
+    -- 派生値は保存しない（2.2）。規約ではなく制約として持つ
+    CHECK (metric NOT LIKE 'd.%'),
+    CHECK (quality IN ('ok', 'missing', 'suspect', 'stale'))
+) WITHOUT ROWID;
+```
+
+**CHECK 制約で不変条件を実体化している。** 「`d.` を保存しない」「`quality` は4値」は
+コメントに書くだけでは守られない。取り込み層の不具合で `quality` に綴り違いが
+混ざると、ダッシュボードのフィルタも欠測率も静かに間違った値を出し続ける。
+書き込みの時点で落とすほうが早く気づける。
+
+代償として、値の集合を変えるにはテーブル再構築が必要になる（SQLite は
+CHECK 制約を後から変更できない）。4値と `d.` 予約は要件 §5.3 と本 ADR 2.2 で
+確定した内容であり、頻繁に変わる想定はない。
+
+**`ts_ms` はホスト受信時刻**であり、デバイス時刻ではない（D-05）。
+**1サンプルから生成される全行は同一の `ts_ms` を持つ。** この規則が破れると
+同時刻の横串（ピボット）ができなくなるため、取り込み側は1サンプルにつき
+時刻を1回だけ確定し、全メトリクスへ配る。
+
+`WITHOUT ROWID` は要件 D-04 の判断を踏襲する。行が小さく（実測見込み40バイト前後）、
+主キーがそのまま本体になるため rowid 分の間接参照とインデックスを節約できる。
+
+### 2.4 主キーの並びを `(metric, ts_ms)` とする ★要件 D-04 からの変更
+
+要件 D-04 は `PRIMARY KEY (ts_ms, metric)` と記載しているが、**逆順を提案する。**
+
+読み出しの支配的なパターンは FR-302 の「1メトリクスを期間で取る」であり、
+この並びなら主キーだけで完結する。逆順にすると同じ用途に
+`(metric, ts_ms)` の二次インデックスが必要になり、`WITHOUT ROWID` では
+二次インデックスが主キー全体を含むため**保存量がほぼ倍**になる。
+
+| 用途 | `(metric, ts_ms)` | `(ts_ms, metric)` + 二次インデックス |
+|---|---|---|
+| 1メトリクスの期間取得（FR-302） | 主キーの範囲走査 | 二次インデックス経由 |
+| 最新値（`v_latest`） | メトリクスごとに1シーク | 同等 |
+| 1分ロールアップ（FR-202） | メトリクス数ぶんのシーク（20回程度） | 時刻範囲の連続走査 |
+| 保持期間超過の削除（FR-203） | **メトリクスごとにループして削除する必要がある** | 時刻範囲の連続走査 |
+| 保存量 | 基準 | **約1.8倍** |
+
+削除だけは不利になるが、`DELETE FROM readings WHERE metric = ? AND ts_ms < ?` を
+既知のメトリクスでループすれば主キーを使える。1日1回の処理であり、
+常時発生する読み出しと保存量を優先する。
+
+### 2.5 `quality` の値
+
+要件 §5.3 の判定規則に対応する4値のみを許す。
+
+| 値 | 条件 |
+|---|---|
+| `ok` | 正常値 |
+| `missing` | JSON が `null`、または `err` に理由が付いている |
+| `suspect` | DS18B20 の `-127.00` / **ちょうど `85.00`**、AM2320 の物理的にありえない値 |
+| `stale` | 前サンプルから10秒以上更新がない |
+
+**`85.00` ちょうどを `suspect` にすることは必須**（spec-review C-02）。
+`-127.00` と違い「排気温度としてありえる値」であるため、見逃すと誤警報ではなく
+**誤った安心**を生む。判定の実装とテストは #5 で行う。
+
+### 2.6 enum 値のメトリクスは整数コードで格納する ★判断が必要
+
+`sys.gpu_mode` は enum（要件 §5.1）だが、`readings.value` は `REAL` である。
+
+**決定: enum は整数コードへ写像して `value` に格納し、コードと名前の対応は
+設定ファイルへ外出しする**（AGENTS.md ルール6）。列を増やして
+`value_text` を持たせる案は、**全行に NULL 列が1つ増える**ため採らない。
+
+小さな整数は `REAL` で厳密に表現できるため、丸め誤差の問題は生じない。
+
+> **コード値そのものは本 ADR では確定しない。**
+> 決定記録 D-19 は GPU Mode を「AI / Shared / Compute の3段階」としているが、
+> FR-309 の見直しに伴う NVML からの推定規則は「ai / compute / idle」を挙げており、
+> **値の集合が一致していない。** #34 / #36 で確定する。
+
+### 2.7 `node_id` は列を作らず名前だけ予約する ★判断が必要
+
+要件 N-04 は「1台前提。ただしスキーマは `node_id` を予約しておく」としている。
+
+**決定: 現時点では列を作らない。** 単一ノード運用で全行に同じ値を持つ列を
+主キーへ加えると、`WITHOUT ROWID` では主キーが本体であるため
+**全データの保存量に定数コストが乗り続ける。**
+
+代わりに以下を予約とする。
+
+- メトリクス名として `node_id` および `node.*` を使わない
+- 複数ノードへ拡張する際は、新テーブルを作って移し替える移行を行う
+  （SQLite は主キーの変更ができないため、いずれにせよテーブル再構築が必要）
+- 移行機構は #5 で用意する `schema_version` に載せる
+
+### 2.8 ロールアップは3段（生 / 1分 / 1時間）
+
+決定記録 D-02 に従う。**要件 §6.2 FR-203 の「既定14日」は D-02 に上書きされている。**
+
+| 粒度 | 保持 | テーブル |
+|---|---|---|
+| 生（2.5秒） | 30日 | `readings` |
+| 1分 | 無期限 | `readings_1m` |
+| 1時間 | 無期限 | `readings_1h` |
+
+```sql
+CREATE TABLE readings_1m (
+    metric        TEXT    NOT NULL,
+    bucket_ms     INTEGER NOT NULL,   -- 分の開始時刻 (Unix ms, UTC)
+    min_value     REAL,
+    max_value     REAL,
+    mean_value    REAL,
+    sample_count  INTEGER NOT NULL,   -- 実際に値があった数
+    missing_count INTEGER NOT NULL,   -- quality != 'ok' だった数
+    PRIMARY KEY (metric, bucket_ms)
+) WITHOUT ROWID;
+
+CREATE TABLE readings_1h (
+    metric        TEXT    NOT NULL,
+    bucket_ms     INTEGER NOT NULL,   -- 時の開始時刻 (Unix ms, UTC)
+    min_value     REAL,
+    max_value     REAL,
+    mean_value    REAL,
+    sample_count  INTEGER NOT NULL,
+    missing_count INTEGER NOT NULL,
+    PRIMARY KEY (metric, bucket_ms)
+) WITHOUT ROWID;
+```
+
+`missing_count` を持つのは、NFR-02（欠測率1%未満）と FR-303（欠測率）を
+**ロールアップだけで計算できるようにする**ため。生データを消した後も欠測率が追える。
+
+`min_value` ではなく `min` としないのは、SQL の集約関数名と紛れるため。
+
+### 2.9 `alerts`
+
+```sql
+CREATE TABLE alerts (
+    id            INTEGER PRIMARY KEY,
+    rule_id       TEXT    NOT NULL,   -- 'RECIRCULATION'（FR-401〜409）
+    severity      TEXT    NOT NULL,   -- info | warning | critical
+    state         TEXT    NOT NULL,   -- pending | firing | resolved
+    metric        TEXT,               -- 対象メトリクス。複数にまたがる規則では NULL
+    started_ms    INTEGER NOT NULL,   -- 条件が成立した時刻
+    fired_ms      INTEGER,            -- 継続時間を満たして発火した時刻
+    resolved_ms   INTEGER,
+    trigger_value REAL,               -- 発火時の値
+    threshold     REAL,               -- 発火時に適用されていた閾値
+    detail        TEXT,               -- 人間向けの補足
+    CHECK (severity IN ('info', 'warning', 'critical')),
+    CHECK (state IN ('pending', 'firing', 'resolved'))
+);
+
+CREATE INDEX ix_alerts_state   ON alerts(state);
+CREATE INDEX ix_alerts_started ON alerts(started_ms);
+```
+
+状態機械 `OK → PENDING → FIRING → RESOLVED`（要件 §6.4）を
+`state` と3つの時刻列で表現する。`started_ms` と `fired_ms` を分けているのは、
+**「条件はいつ成立し、継続時間の要件をいつ満たしたか」を後から検証できるようにする**ため。
+閾値を実測で見直す #19 でこの差分が判断材料になる。
+
+`threshold` を記録するのは、閾値が設定ファイルで変わるため。
+過去のアラートを「当時の閾値」で解釈できないと、履歴が読めなくなる。
+
+このテーブルだけは `WITHOUT ROWID` にしない。行数が桁違いに少なく、
+連番の `id` が必要なため。
+
+### 2.10 `devices` と `device_sensors`
+
+起動バナー（`type:"hello"`、要件 §5.2）を受けて更新する。
+
+```sql
+CREATE TABLE devices (
+    device_id     TEXT PRIMARY KEY,   -- hello.dev 'xiao-esp32s3'
+    fw            TEXT,               -- hello.fw
+    schema_v      INTEGER,            -- hello.v
+    interval_ms   INTEGER,            -- hello.interval_ms
+    first_seen_ms INTEGER NOT NULL,
+    last_seen_ms  INTEGER NOT NULL,
+    last_hello_ms INTEGER             -- 直近の起動バナー受信時刻
+);
+
+CREATE TABLE device_sensors (
+    device_id  TEXT    NOT NULL,
+    channel    TEXT    NOT NULL,      -- 'front_intake'
+    kind       TEXT    NOT NULL,      -- 'ds18b20' | 'am2320'
+    gpio       INTEGER,
+    rom        TEXT,                  -- DS18B20 の64bit ROM ID。AM2320 は NULL
+    resolution INTEGER,               -- ビット数。11 を想定（spec-review C-01）
+    updated_ms INTEGER NOT NULL,
+    PRIMARY KEY (device_id, channel)
+) WITHOUT ROWID;
+```
+
+`device_sensors` を別テーブルにするのは、FR-403 `PROBE_CHANGED` が
+**「どのチャネルの ROM が変わったか」**を必要とするため。
+JSON を1列に丸めて保存すると、差分の特定がアプリ側の文字列処理になる。
+
+### 2.11 `schema_version`
+
+```sql
+CREATE TABLE schema_version (
+    version    INTEGER NOT NULL PRIMARY KEY,
+    applied_ms INTEGER NOT NULL
+);
+```
+
+連番の SQL を順に適用し、適用済みの番号を記録する。実装は #5。
+
+### 2.12 `v_latest` ビュー
+
+ロング形式の弱点（同時刻の横串が面倒）を吸収する。
+
+```sql
+CREATE VIEW v_latest AS
+SELECT metric, MAX(ts_ms) AS ts_ms, value, quality
+FROM readings
+GROUP BY metric;
+```
+
+`MAX()` と同じ行から他の列を取る挙動は SQLite が明示的に保証している
+（bare columns in an aggregate query）。**本プロジェクトは SQLite に限定するため
+この仕様に依存してよい**が、他の DBMS へ移す場合はここを書き換える必要がある。
+
+---
+
+## 3. Consequences
+
+### 良くなること
+
+- センサーを追加しても `ALTER TABLE` が発生しない。行が増えるだけになる
+- メトリクスごとに欠測・品質を独立して持てる。ワイド形式では
+  「この行のこの列だけ suspect」を表現できない
+- 保持期間の異なる3段の粒度を、同じ形のテーブルで扱える
+
+### 悪くなること・その緩和
+
+| トレードオフ | 緩和策 |
+|---|---|
+| 同時刻の全メトリクスを1行で取るクエリが複雑になる | `v_latest` ビュー（2.12）と、API 層でのピボット |
+| メトリクス名の文字列が全行に繰り返され、保存量が増える | 現実的な行数では問題にならない（下記の見積り）。将来必要になれば `metric` を整数 ID へ正規化する移行を行う |
+| 型が `REAL` に統一されるため enum の表現が間接的になる | 整数コード＋設定ファイルでの写像（2.6） |
+| 削除が主キー順に沿わない | メトリクスごとのループ削除（2.4） |
+
+### 保存量の見積り（要件 §6.2 の数値を訂正）
+
+要件 §6.2 は「2.5秒周期 × 7メトリクス = 約 2.4M行/日」「60〜80MB/日」としているが、
+**この行数は約10倍過大である。**
+
+```text
+1日のサンプル数 = 86400秒 ÷ 2.5秒 = 34,560
+1日の行数       = 34,560 × 7メトリクス = 241,920 行/日   （2.4M ではない）
+1行あたり       ≈ 40 バイト
+1日             ≈ 10 MB
+30日保持        ≈ 290 MB
+```
+
+v1 で GPU / CPU / 電力（S-10）を加えて20メトリクスになった場合でも、
+30日で 830MB 程度に収まる。
+
+**この訂正は保持方針を変えるものではない**（ロールアップと削除は引き続き必要）が、
+「14日で1GB」という前提で容量を心配する必要はない。
+
+---
+
+## 4. 却下した代替案
+
+| 案 | 却下理由 |
+|---|---|
+| ワイド形式（列＝センサー） | センサー追加のたびに `ALTER TABLE`。本プロジェクトでは追加が既定路線 |
+| `metric` を整数 ID へ正規化 | 全クエリに JOIN が乗る。上記の見積りでは保存量の節約が見合わない。必要になってからでも移行できる |
+| メトリクスごとにテーブルを分ける | テーブル数がメトリクス数に比例し、横断クエリが破綻する |
+| 派生値も保存する | 較正オフセット変更時に過去の派生値と再計算値が食い違う（2.2） |
+| Prometheus 等の時系列DBを併設 | 決定記録 D-09 で不採用 |
+
+---
+
+## 5. 未決事項
+
+| # | 内容 | 決める場所 |
+|---|---|---|
+| 1 | `sys.gpu_mode` のコード値。D-19（AI/Shared/Compute）と NVML 推定規則（ai/compute/idle）が食い違っている | #34 / #36 |
+| 2 | メトリクスの単位・表示名の定義をどこに置くか（`config/metrics.yaml` を想定） | #5 |
+| 3 | GPU Mode 別に閾値を切り替える場合の `alerts.threshold` の扱い | #18 / #36 |
