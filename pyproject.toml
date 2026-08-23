@@ -1,0 +1,62 @@
+[project]
+name = "coldaisle"
+version = "0.1.0"
+description = "GPUサーバーの温湿度監視 + ローカルLLM運用アシスタント"
+readme = "README.md"
+requires-python = ">=3.12"
+license = "Apache-2.0"
+dependencies = [
+    "fastapi",
+    # WebSocket ライブ配信（FR-306）に websockets が必要なため standard を指定する
+    "uvicorn[standard]",
+    "pyserial",
+    # 要件 §9 は Pydantic v2 の API を前提にしている
+    "pydantic>=2",
+    "pyyaml",
+    "httpx",
+]
+
+[dependency-groups]
+dev = [
+    "pytest",
+    "pytest-asyncio",
+    "ruff",
+    "mypy",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/coldaisle"]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+# T20 は print の禁止（AGENTS.md「ログは構造化。print を使わない」の機械的な担保）
+select = ["E", "F", "W", "I", "UP", "B", "SIM", "ANN", "RUF", "T20"]
+# ドキュメント・コメント・ログ文言を日本語で書くプロジェクトのため、
+# 全角括弧などを「紛らわしいUnicode」として弾く RUF001/002/003 は無効化する
+ignore = ["RUF001", "RUF002", "RUF003"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["ANN", "T20"]
+
+[tool.mypy]
+python_version = "3.12"
+files = ["src"]
+strict = true
+warn_unreachable = true
+disallow_any_unimported = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# マーカーのタイポを黙って無視すると、実機テストが CI で走る事故になる
+addopts = "--strict-markers"
+markers = ['hardware: 実機が必要なテスト（CI は -k "not hardware" で除外する）']
+asyncio_mode = "strict"
+asyncio_default_fixture_loop_scope = "function"
