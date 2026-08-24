@@ -6,7 +6,7 @@
 上位に漏れる。
 """
 
-from coldaisle.store.db import Aggregation, SqliteStore, now_ms
+from coldaisle.store.db import Aggregation, SqliteStore
 from coldaisle.store.migrations import MigrationError
 from coldaisle.store.models import (
     LatestReading,
@@ -32,5 +32,4 @@ __all__ = [
     "SqliteStore",
     "Stats",
     "classify",
-    "now_ms",
 ]

@@ -135,6 +135,7 @@ git worktree list
 
 ```text
 src/coldaisle/
+  clock.py    # レイヤ横断: 時刻ソース（WallClock / SimulatedClock）。#42
   ingest/     # L0: Source実装（serial / mock / replay）、正規化
   store/      # L1: SQLite、ロールアップ、CSVエクスポート
   api/        # L2: FastAPI、WebSocket

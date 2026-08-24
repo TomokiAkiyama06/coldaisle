@@ -10,12 +10,13 @@ from __future__ import annotations
 import math
 import sqlite3
 import time
-from collections.abc import Callable, Iterable, Iterator
+from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
 from enum import StrEnum
 from pathlib import Path
 from types import TracebackType
 
+from coldaisle.clock import Clock
 from coldaisle.store import migrations
 from coldaisle.store.models import (
     LatestReading,
@@ -55,11 +56,6 @@ WHERE metrics.metric IS NOT NULL
 再帰 CTE で「次に大きい metric」を主キーで辿り、各メトリクスの最新行を
 1回のシークで取る。走査量はメトリクス数に比例する（実測 0.01ms）。
 """
-
-
-def now_ms() -> int:
-    """現在時刻（Unix ミリ秒、UTC）。テストで差し替えられるよう関数にしている。"""
-    return time.time_ns() // 1_000_000
 
 
 def _enable_wal(conn: sqlite3.Connection, busy_timeout_ms: int) -> None:
@@ -116,11 +112,13 @@ class SqliteStore:
         path: Path | str,
         *,
         rules: QualityRules,
-        clock: Callable[[], int] = now_ms,
+        clock: Clock,
         busy_timeout_ms: int = 5_000,
     ) -> None:
-        # `rules` は必須。既定値へ黙って落ちると、設定を読めていないことに
-        # 気づかないまま `stale` の判定だけが別のしきい値で動く（AGENTS.md ルール6）
+        # `rules` と `clock` は必須。既定へ黙って落ちると、設定やソースと違う
+        # しきい値・時刻で `stale` が判定される（AGENTS.md ルール6 / #42）。
+        # 特に時計は、取り込みが SimulatedClock で保存が実時計、という
+        # 組み合わせが静かに成立すると、圧縮再生の結果が説明できなくなる
         self._rules = rules
         self._clock = clock
         self._conn = sqlite3.connect(str(path), isolation_level=None)
@@ -133,7 +131,7 @@ class SqliteStore:
         # 直近のチェックポイント以降のみ。2.5秒周期の観測データにはこれで足りる
         _enable_wal(self._conn, busy_timeout_ms)
         self._conn.execute("PRAGMA synchronous = NORMAL")
-        migrations.apply_pending(self._conn, self._clock())
+        migrations.apply_pending(self._conn, self._clock.now_ms())
 
     # ------------------------------------------------------------------ 基本
 
@@ -210,7 +208,7 @@ class SqliteStore:
 
         `v_latest` ビューは使わない。理由は `_LATEST_SQL` を参照。
         """
-        now = self._clock() if at_ms is None else at_ms
+        now = self._clock.now_ms() if at_ms is None else at_ms
         rows = self._conn.execute(_LATEST_SQL).fetchall()
         latest: dict[str, LatestReading] = {}
         for row in rows:

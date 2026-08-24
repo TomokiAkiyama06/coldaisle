@@ -12,6 +12,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
+from coldaisle.clock import SimulatedClock
 from coldaisle.store import (
     Aggregation,
     MigrationError,
@@ -44,8 +45,8 @@ def db_path(tmp_path):
 
 
 @pytest.fixture
-def store(db_path, rules):
-    with SqliteStore(db_path, rules=rules) as opened:
+def store(db_path, rules, clock):
+    with SqliteStore(db_path, rules=rules, clock=clock) as opened:
         yield opened
 
 
@@ -70,9 +71,9 @@ def test_open_applies_migrations(store):
 
 
 def test_reopen_does_not_reapply(db_path, rules):
-    with SqliteStore(db_path, rules=rules, clock=lambda: 111) as first:
+    with SqliteStore(db_path, rules=rules, clock=SimulatedClock(111)) as first:
         first.insert_sample(sample(1_000, **{"air.room": 26.0}))
-    with SqliteStore(db_path, rules=rules, clock=lambda: 222) as second:
+    with SqliteStore(db_path, rules=rules, clock=SimulatedClock(222)) as second:
         query = "SELECT version, applied_ms FROM schema_version"
         rows = second.connection.execute(query).fetchall()
         assert [(row["version"], row["applied_ms"]) for row in rows] == [(1, 111)]
@@ -86,11 +87,11 @@ def test_wal_and_synchronous_are_enabled(store):
     assert store.connection.execute("PRAGMA synchronous").fetchone()[0] == 1  # NORMAL
 
 
-def test_database_newer_than_code_is_refused(db_path, store, rules):
+def test_database_newer_than_code_is_refused(db_path, store, rules, clock):
     store.connection.execute("INSERT INTO schema_version VALUES (999, 0)")
     store.close()
     with pytest.raises(MigrationError, match="新しい"):
-        SqliteStore(db_path, rules=rules)
+        SqliteStore(db_path, rules=rules, clock=clock)
 
 
 def test_failed_migration_leaves_no_partial_schema(tmp_path):
@@ -209,10 +210,10 @@ def test_latest_returns_the_newest_row_per_metric(store):
     assert latest["air.gpu_intake"].ts_ms == 1_000
 
 
-def test_latest_marks_old_values_stale(db_path, rules):
+def test_latest_marks_old_values_stale(db_path, rules, clock):
     """要件 §5.3「前サンプルから10秒以上更新なし」。境界を含む。"""
     ten_seconds = rules.model_copy(update={"stale_after_ms": 10_000})
-    with SqliteStore(db_path, rules=ten_seconds) as store:
+    with SqliteStore(db_path, rules=ten_seconds, clock=clock) as store:
         store.insert_sample(sample(1_000, **{"air.room": 26.0}))
 
         assert store.latest(at_ms=1_000 + 9_999)["air.room"].quality is Quality.OK
@@ -223,7 +224,8 @@ def test_latest_marks_old_values_stale(db_path, rules):
 
 
 def test_latest_uses_the_clock_when_no_time_is_given(db_path, rules):
-    with SqliteStore(db_path, rules=rules, clock=lambda: 60_000) as store:
+    """`at_ms` を渡さなければソースと同じ時計を読む（#42）。"""
+    with SqliteStore(db_path, rules=rules, clock=SimulatedClock(60_000)) as store:
         store.insert_sample(sample(1_000, **{"air.room": 26.0}))
         assert store.latest()["air.room"].quality is Quality.STALE
 
@@ -420,7 +422,7 @@ def test_concurrent_open_does_not_break(tmp_path, rules):
 
     def open_store() -> int:
         ready.wait()
-        with SqliteStore(path, rules=rules) as opened:
+        with SqliteStore(path, rules=rules, clock=SimulatedClock(0)) as opened:
             query = "SELECT COUNT(*) FROM schema_version"
             return int(opened.connection.execute(query).fetchone()[0])
 
@@ -453,7 +455,7 @@ def test_version_is_rechecked_after_taking_the_lock(tmp_path, rules, monkeypatch
         result = real_pending(connection, migrations)
         if first_call:
             first_call = False
-            with SqliteStore(path, rules=rules):  # 別プロセスが先に適用し終える
+            with SqliteStore(path, rules=rules, clock=SimulatedClock(0)):  # 別プロセスが先に適用
                 pass
         return result
 

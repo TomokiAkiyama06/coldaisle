@@ -15,9 +15,16 @@ import pytest
 from jsonschema import Draft202012Validator
 from pydantic import ValidationError
 
+from coldaisle.clock import SimulatedClock
 from coldaisle.ingest import MockSource, RawHello, RawSample, Source, load_scenarios
 from coldaisle.ingest.mock import StuckValue
-from coldaisle.store import Quality, classify
+from coldaisle.store import (
+    Quality,
+    Reading,
+    Sample,
+    SqliteStore,
+    classify,
+)
 from conftest import SCENARIOS_PATH
 
 SCHEMA_PATH = SCENARIOS_PATH.parents[1] / "schemas" / "device_v1.schema.json"
@@ -290,3 +297,99 @@ def test_stuck_value_can_be_a_plain_dropout_of_one_channel(scenarios):
     assert produced[0].channels["top_exhaust"] is not None
     assert produced[-1].channels["top_exhaust"] is None
     assert produced[-1].err == ()
+
+
+# ---------------------------------------------------------------- 時刻（#42）
+
+
+def test_source_exposes_the_clock_to_use(scenarios):
+    """時間基準を決めるのはソース側。デーモンはここから受け取って配る。"""
+    clock = SimulatedClock(1_000)
+    source = MockSource(scenarios["idle"], clock=clock)
+    assert source.clock is clock
+
+
+def test_host_time_advances_with_the_scenario(scenarios):
+    """ホスト受信時刻がシナリオ時間で進む。1サンプルにつき `interval_ms`。"""
+    source = MockSource(scenarios["ramp"], sleep=no_sleep, clock=SimulatedClock(0))
+    stamps = [
+        source.clock.now_ms() for message in source.stream() if isinstance(message, RawSample)
+    ]
+    assert stamps[0] == 0
+    assert stamps[-1] == (len(stamps) - 1) * scenarios["ramp"].interval_ms
+
+
+def test_compression_does_not_change_host_time(scenarios):
+    """`--speed 60` でも生成される時刻は実時間と同一。待ち時間だけが縮む。"""
+
+    def run(speed: float) -> tuple[list[int], float]:
+        slept: list[float] = []
+        source = MockSource(
+            scenarios["ramp"], sleep=slept.append, speed=speed, clock=SimulatedClock(0)
+        )
+        stamps = [
+            source.clock.now_ms() for message in source.stream() if isinstance(message, RawSample)
+        ]
+        return stamps, sum(slept)
+
+    real_time, real_wait = run(1.0)
+    compressed, compressed_wait = run(60.0)
+    assert compressed == real_time
+    assert compressed_wait == pytest.approx(real_wait / 60)
+
+
+def test_compressed_replay_still_spans_five_minutes_of_host_time(scenarios):
+    """#42 の狙い。FR-404 は `d.intake_rise > 5.0℃` が**5分継続**で発火する。
+
+    ルールエンジン（#18）はまだ無いので、ここでは「閾値を超えてから
+    ホスト時刻で5分以上経つこと」と「実際に待った時間はそれよりずっと短いこと」を
+    確かめる。ホスト時刻を実時計にすると、この5分が実時間の15秒に潰れる。
+    """
+    slept: list[float] = []
+    source = MockSource(
+        scenarios["recirculation"], sleep=slept.append, speed=60.0, clock=SimulatedClock(0)
+    )
+    crossed_at_ms: int | None = None
+    last_ms = 0
+    for message in source.stream():
+        if not isinstance(message, RawSample):
+            continue
+        last_ms = source.clock.now_ms()
+        rise = message.channels["front_intake"] - message.channels["room_temp"]
+        if crossed_at_ms is None and rise > 5.0:
+            crossed_at_ms = last_ms
+
+    assert crossed_at_ms is not None, "閾値を超えていない"
+    assert last_ms - crossed_at_ms >= 300_000, "ホスト時刻で5分に足りない"
+    assert sum(slept) < 30, "実際にはこれだけ短い時間しか待っていない"
+
+
+def test_shared_clock_keeps_freshly_ingested_data_out_of_stale(scenarios, rules, tmp_path):
+    """同じ時計を L0 と L1 が共有すると、圧縮再生でも `stale` が正しく出る。
+
+    保存側だけ実時計にすると、シナリオ上は2.5秒前のサンプルが
+    「10秒以上前」と判定されうる（要件 §5.3）。取り込み（#8）は未実装なので、
+    ここでは正規化に相当する最小の橋渡しを手で書いて配線だけを確かめる。
+    """
+    source = MockSource(scenarios["ramp"], sleep=no_sleep, speed=60.0, clock=SimulatedClock(0))
+    with SqliteStore(tmp_path / "mock.db", rules=rules, clock=source.clock) as store:
+        for message in source.stream():
+            if not isinstance(message, RawSample):
+                continue
+            store.insert_sample(
+                Sample(
+                    ts_ms=source.clock.now_ms(),
+                    readings=(
+                        Reading(
+                            metric="air.gpu_exhaust",
+                            value=message.channels["gpu_exhaust"],
+                            quality=Quality.OK,
+                        ),
+                    ),
+                    seq=message.seq,
+                    up_ms=message.up,
+                )
+            )
+        latest = store.latest()["air.gpu_exhaust"]
+    assert latest.quality is Quality.OK, "直前に入れた値が stale になっている"
+    assert latest.age_ms == 0

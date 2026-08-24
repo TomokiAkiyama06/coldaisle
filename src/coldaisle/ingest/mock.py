@@ -20,6 +20,7 @@ from typing import Annotated, Any, Literal
 import yaml
 from pydantic import BaseModel, ConfigDict, Field
 
+from coldaisle.clock import SimulatedClock, WallClock
 from coldaisle.ingest.protocol import RawHello, RawMessage, RawSample, RawSensor
 
 BOOT_UP_MS = 1_200
@@ -160,6 +161,7 @@ class MockSource:
         seed: int | None = None,
         speed: float = 1.0,
         sleep: Callable[[float], None] = time.sleep,
+        clock: SimulatedClock | None = None,
     ) -> None:
         if speed <= 0:
             raise ValueError(f"speed は正の数（1分を1秒にするなら 60）: {speed}")
@@ -167,6 +169,19 @@ class MockSource:
         self._seed = scenario.seed if seed is None else seed
         self._speed = speed
         self._sleep = sleep
+        # 既定の開始時刻は実時計。デーモンで流したときに「いま」のデータとして
+        # ダッシュボードに出るため。再現したいテストは開始時刻を固定して渡す
+        self._clock = SimulatedClock(WallClock().now_ms()) if clock is None else clock
+
+    @property
+    def clock(self) -> SimulatedClock:
+        """シナリオ時間で進む時計（#42）。
+
+        **進めるのはこのソースだけ。** 保存層とルールエンジンは読むだけにする。
+        こうすると `--speed 60` でも、継続時間ベースのルール（FR-401〜409）と
+        `stale` 判定がシナリオ上の経過時間で評価される。
+        """
+        return self._clock
 
     @property
     def hello(self) -> RawHello:
@@ -197,6 +212,7 @@ class MockSource:
             key=lambda effect: effect.at_s,
         )
 
+        start_ms = self._clock.now_ms()
         yield self.hello
         seq = 0
         up_ms = BOOT_UP_MS
@@ -205,6 +221,9 @@ class MockSource:
             elapsed_s = step * interval_s
             if step:
                 self._sleep(interval_s / self._speed)
+            # 待ち時間は圧縮されるが、ホスト受信時刻はシナリオ時間で進める。
+            # ここを実時計にすると、5分継続のルールが圧縮再生では5秒に見える
+            self._clock.advance_to_ms(start_ms + step * self._scenario.interval_ms)
 
             if resets and elapsed_s >= resets[0].at_s:
                 resets.pop(0)

@@ -15,6 +15,8 @@ from typing import Any, Literal, Protocol, runtime_checkable
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from coldaisle.clock import Clock
+
 SCHEMA_VERSION: Literal[1] = 1
 """`v`。破壊的変更でのみ増える（決定記録 0003 §2.7）。"""
 
@@ -96,6 +98,17 @@ class Source(Protocol):
     後始末が必要な実装は `stream()` の内側（`try` / `finally`）で閉じる。
     呼び出し側に `close()` を強いると、閉じ忘れが取り込み停止として現れる。
     """
+
+    @property
+    def clock(self) -> Clock:
+        """このソースで流すときのホスト受信時刻の供給元（#42）。
+
+        **時間基準を決めるのはソース側**にする。圧縮再生かどうかを知っているのは
+        ソースだけであり、決める場所が2つあると、取り込みは圧縮時間・保存は実時計、
+        という組み合わせが静かに成立する。デーモンはここから受け取った時計を
+        保存層とルールエンジンへそのまま渡す。
+        """
+        ...
 
     def stream(self) -> Iterator[RawMessage]:
         """メッセージを届いた順に返す。終端のない実装もある（`idle` シナリオなど）。"""
