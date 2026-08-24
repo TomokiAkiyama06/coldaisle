@@ -1,6 +1,6 @@
 # coldaisle
 
-GPUサーバーの温湿度監視 + ローカルLLM（Qwen3-8B）による運用アシスタント。
+GPUサーバーの温湿度監視 + ローカルLLM（Qwen3.8-27B）による運用アシスタント。
 
 > リポジトリ名は変更可能です。`grep -rl coldaisle . | xargs sed -i '' 's/coldaisle/<新名称>/g'（macOS）で一括置換できます。
 

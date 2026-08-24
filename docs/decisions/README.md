@@ -74,3 +74,5 @@ docs/decisions/NNNN-<slug>.md      例: 0002-metric-naming.md
 | [0002](0002-metric-naming.md) | メトリクス命名規約とDBスキーマ（ロング形式） | FINAL |
 | [0003](0003-device-json-schema.md) | デバイス出力 JSON スキーマ v1 | Proposed |
 | [0004](0004-storage-read-contract.md) | ストレージ層の読み出し契約 | FINAL |
+| [0005](0005-model-selection.md) | ローカルモデルは Qwen3.8-27B 単体構成 | FINAL |
+| [0006](0006-gpu-mode-and-mixed-state.md) | GPU Mode を2段階にし `mixed` を異常として扱う | FINAL |

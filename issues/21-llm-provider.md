@@ -6,7 +6,7 @@ milestone: "M5 AI"
 
 ## 背景
 現在はMac + Ollama、本番はUbuntu + vLLM。どちらもOpenAI互換APIなので抽象化できる。
-モデル差し替え（Qwen3-8B → より大きいモデル）も設定変更だけで済むようにする。
+モデル差し替え（Qwen3.8-27B → より大きいモデル）も設定変更だけで済むようにする。
 
 ## やること
 - [ ] `OPENAI_BASE_URL` / `MODEL_NAME` / `API_KEY` を環境変数で切替

@@ -49,11 +49,11 @@
 | 24 | [アラート発生時のAI要約生成](issues/24-alert-explainer.md) | M5 AI | ai, priority:should |
 | 25 | [日次レポート生成](issues/25-daily-report.md) | M5 AI | ai, priority:should |
 | 26 | [Ubuntu移行（systemd / udev / 固定デバイス名）](issues/26-ubuntu-migration.md) | M6 移行 | infra, priority:must, blocked-by-hardware |
-| 27 | [vLLM + Qwen3-8B の停止可能な GPU AI Service 構成](issues/27-vllm-deployment.md) | M6 移行 | ai, infra, priority:must, blocked-by-hardware |
+| 27 | [vLLM + Qwen3.8-27B の停止可能な GPU AI Service 構成](issues/27-vllm-deployment.md) | M6 移行 | ai, infra, priority:must, blocked-by-hardware |
 | 28 | [GPU / CPU / VRM 内部センサーの統合](issues/28-internal-sensors.md) | M7 拡張 | core, priority:could, blocked-by-hardware |
 | 29 | [Personal AI Workspace の Server Health 統合](issues/29-workspace-integration.md) | M7 拡張 | integration, priority:could |
 | 30 | [【設計のみ】ファン制御の安全設計検討](issues/30-fan-control-design.md) | M7 拡張 | design, safety, priority:could |
-| 31 | [ADR: ローカルモデルの役割分担を確定する（Qwen3-8B / GPT-OSS-120B）](issues/31-adr-model-roles.md) | M0 基盤 | design, ai, priority:must |
+| 31 | [ADR: ローカルモデルの役割分担を確定する](issues/31-adr-model-roles.md) **← 決定記録 0005 で解決。クローズ可** | M0 基盤 | design, ai, priority:must |
 | 32 | [Core Service と GPU AI Service の分離（Compute Mode対応）](issues/32-core-gpu-service-split.md) | M6 移行 | infra, priority:must, safety |
 | 33 | [Docker Compose による3層分離](issues/33-docker-compose-layers.md) | M6 移行 | infra, priority:should, blocked-by-hardware |
 | 34 | [NVML / lm-sensors の統合（v1スコープへ格上げ）](issues/34-internal-sensors-nvml.md) | M7 拡張 | core, priority:must, blocked-by-hardware |

@@ -1,5 +1,5 @@
 ---
-title: "vLLM + Qwen3-8B の停止可能な GPU AI Service 構成"
+title: "vLLM + Qwen3.8-27B の停止可能な GPU AI Service 構成"
 labels: ai, infra, priority:must, blocked-by-hardware
 milestone: "M6 移行"
 ---
@@ -14,10 +14,10 @@ RTX PRO 6000 (96GB) は本来、研究・学習・Kaggle等のCompute Workload�
 
 ## やること
 - [ ] vLLM を systemd サービス化
-- [ ] `--gpu-memory-utilization` を低め（0.2〜0.3）に設定し、根拠をコメント
+- [ ] `--gpu-memory-utilization` を設定し、根拠をコメント（27B FP8 の重み 30〜33GB + KV プールで 0.35〜0.45 が目安。決定記録 0005）
 - [ ] ツールコールパーサの設定と**スモークテスト**（vLLM/モデルのバージョンで推奨値が変わる）
 - [ ] 常駐 vs オンデマンド起動 の判断（要件 Q-04）
-- [ ] 8Bで不足を感じた場合の上位モデル（30B級MoE等）への移行手順をメモ
+- [ ] 27B 単体で不足を感じた場合の上位モデルへの移行手順をメモ（決定記録 0005 未決1）
 
 ## 受入基準
 - 学習ジョブ実行中でもチャットが応答する、または明示的に縮退する

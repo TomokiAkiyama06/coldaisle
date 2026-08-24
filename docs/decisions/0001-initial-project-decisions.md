@@ -100,6 +100,13 @@ coldaisle 側の作業は #22（ツール定義）に集約されます。
 | D-18 | Agent Controller / Router / Memory Engine / Claude Bridge / GPU Manager / Artifact Engine はサーバー側。デスクトップ側は表示と入力のみ |
 | D-19 | GPU Mode は AI / Shared / Compute の3段階。Shared = 小型モデルのみ常駐 |
 
+> **Superseded by**
+>
+> - **D-13** → [`0005-model-selection.md`](0005-model-selection.md)
+>   （二層構成は 96GB に載らないため、Qwen3.8-27B 単体構成へ）
+> - **D-19** → [`0006-gpu-mode-and-mixed-state.md`](0006-gpu-mode-and-mixed-state.md)
+>   （Shared を廃止し AI / Compute の2段階へ。`gpu_state = mixed` は異常として警告する）
+
 ### D-12 補足: 「別リポジトリだが内蔵させる」の意味
 
 ```text
