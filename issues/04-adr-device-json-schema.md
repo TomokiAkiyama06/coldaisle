@@ -9,7 +9,7 @@ milestone: "M0 基盤"
 詳細は `docs/spec-review.md` W-04。
 
 ## やること
-- [ ] `docs/adr/0002-device-json-schema.md`
+- [ ] `docs/decisions/0003-device-json-schema.md`
 - [ ] `schemas/device_v1.schema.json`（JSON Schema）を作成
 - [ ] フィールド確定: `v` `type` `seq` `up` 各メトリクス `err`
 - [ ] 起動バナー `type:"hello"`（`fw`, `dev`, `interval_ms`, センサーごとの `kind`/`gpio`/`rom`/`res`）を定義

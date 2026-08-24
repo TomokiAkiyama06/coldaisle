@@ -52,6 +52,15 @@ uv run uvicorn coldaisle.api:app --host 127.0.0.1 --port 8000
 - コミットは Conventional Commits (`feat:`, `fix:`, `docs:`, `test:`, `refactor:`)
 - **`main` に直接コミットしない**
 
+## 決定記録
+
+設計・運用上の決定は `docs/decisions/NNNN-<slug>.md` に連番で残す。
+`docs/adr/` は作らない。運用ルールとテンプレートは `docs/decisions/README.md`。
+
+- **既存の記録を書き換えない。** 変更は新しい記録を作り `Supersedes` で旧記録を指す
+- 番号は再利用しない。取り下げた決定も `Status: Rejected` で残す
+- 仕様に無い判断をした場合、実装より先にここへ記録して人間の承認を得る
+
 ## エージェント併用（Claude Code / Codex CLI）
 
 同一ワーキングツリーで2つのエージェントを同時に走らせない。必ず worktree で分離する。

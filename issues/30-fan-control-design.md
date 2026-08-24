@@ -9,7 +9,7 @@ milestone: "M7 拡張"
 実装する場合の安全設計を先に文書化する。
 
 ## やること（設計のみ。コードを書かない）
-- [ ] `docs/adr/0003-fan-control-safety.md`
+- [ ] `docs/decisions/NNNN-fan-control-safety.md`（着手時点の最新番号 + 1）
 - [ ] BIOS Q-Fan を最終防衛線として必ず残すこと
 - [ ] ソフトウェア制御が停止した場合に安全側へフェイルする機構
 - [ ] **AIを制御ループに一切入れないこと**を明記（要件 D-03）

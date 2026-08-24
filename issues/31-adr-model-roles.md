@@ -18,7 +18,7 @@ Workspace構想メモ（2026-08-12）は主力ローカルモデルを **GPT-OSS
 | Claude | 故障疑い・高額機材の保護判断・初見の異常パターン | — |
 
 ## やること
-- [ ] `docs/adr/0004-model-roles.md`
+- [ ] `docs/decisions/NNNN-model-roles.md`（着手時点の最新番号 + 1）
 - [ ] 各モデルの用途・VRAM・起動方法・停止方法を確定
 - [ ] Provider抽象（#21）がこの分担を表現できることを確認
 - [ ] 8B/120Bの切替を設定で行えるようにする
