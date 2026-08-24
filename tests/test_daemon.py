@@ -407,7 +407,7 @@ def test_speed_warns_about_the_process_boundary(tmp_path, capsys):
         ]
     )
     logged = [json.loads(line) for line in capsys.readouterr().err.splitlines() if line.strip()]
-    assert any("別プロセスの API" in line["msg"] for line in logged)
+    assert any("同時に使わないこと" in line["msg"] for line in logged)
     logging.getLogger().handlers = []
 
 
