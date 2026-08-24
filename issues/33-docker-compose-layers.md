@@ -9,7 +9,7 @@ Workspace構想メモ §41 のサービス分離をそのまま実現する。
 
 ```text
 Core Services      常時稼働   ← coldaisle-daemon / coldaisle-api
-GPU AI Services    停止可能   ← vLLM / Qwen3-8B / GPT-OSS-120B / coldaisle-ai
+GPU AI Services    停止可能   ← vLLM / Qwen3.8-27B / coldaisle-ai
 Compute Workloads  任意       ← Kaggle / PyTorch / Research
 ```
 
