@@ -88,6 +88,9 @@ class Normalizer:
 
     def normalize(self, raw: RawSample) -> Normalized:
         ts_ms = self._clock.now_ms()
+        # `up` の巻き戻りが再起動の定義（FR-106）。稼働時間は戻らないため、
+        # 戻っていれば電源が入り直したということ。届くのが遅れた古いサンプルも
+        # 同じ形に見えるが、区別する手立ては v1 のスキーマには無い
         restarted = self._last_up is not None and raw.up < self._last_up
         dropped = 0
         out_of_order = False
@@ -99,8 +102,12 @@ class Normalizer:
                 dropped = raw.seq - self._last_seq - 1
             elif raw.seq <= self._last_seq:
                 out_of_order = True
-        self._last_seq = raw.seq
-        self._last_up = raw.up
+        if not out_of_order:
+            # **逆行したサンプルで基準を戻さない。** 戻すと次の正常なサンプルが
+            # 大量の取りこぼしに見える（`10, 5, 11` で 11 が5件飛びと数えられる）。
+            # FR-105 が数えるのは失われた件数なので、基準は到達済みの最大値で持つ
+            self._last_seq = raw.seq
+            self._last_up = raw.up
 
         readings: list[Reading] = []
         unknown: list[str] = []

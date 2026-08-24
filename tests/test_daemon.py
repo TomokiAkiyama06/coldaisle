@@ -366,6 +366,10 @@ def test_sigterm_shuts_down_gracefully(tmp_path):
 
     assert process.returncode == 0, stderr
     assert "取り込みを終了する" in stderr
+    # ログは JSON Lines（AGENTS.md）。1行でも素の文字列が混ざると集約側が壊れる。
+    # `python -m` の二重 import が `runpy` の警告を出していたのが実例
+    for line in stderr.splitlines():
+        json.loads(line)
     with sqlite3.connect(database) as connection:
         stored = connection.execute("SELECT COUNT(*) FROM readings").fetchone()[0]
     assert stored > 0, "終了までに書いたものが残っていない"

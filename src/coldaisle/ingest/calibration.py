@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Any
+from typing import Annotated, Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -29,7 +29,13 @@ class Calibration(BaseModel):
     note: str = ""
     """人間向けの覚書。値ではないので判定には使わない。"""
 
-    offsets_c: dict[str, float] = Field(default_factory=dict)
+    offsets_c: dict[str, Annotated[float, Field(allow_inf_nan=False)]] = Field(default_factory=dict)
+    """非有限値は**読み込み時に**弾く。
+
+    JSON の `1e309` は `json.loads` が `inf` にする。通してしまうと、
+    較正後の値が非有限になって `Reading` に拒否され、**そのチャネルを含む
+    全サンプルが1件ずつ破棄され続ける。** 設定の誤りは設定を読む時点で言う。
+    """
 
     @classmethod
     def from_json(cls, path: Path) -> Calibration:

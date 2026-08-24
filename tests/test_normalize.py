@@ -6,6 +6,7 @@
 import math
 
 import pytest
+from pydantic import ValidationError
 
 from coldaisle.clock import SimulatedClock
 from coldaisle.ingest.calibration import Calibration
@@ -169,6 +170,32 @@ def test_repeated_sequence_is_flagged(normalizer):
     assert normalized.dropped_samples == 0
 
 
+def test_out_of_order_sample_does_not_move_the_baseline(normalizer):
+    """`10, 5, 11` の 11 は 10 の続き。**5件飛んだことにしない。**
+
+    逆行したサンプルで基準を戻すと、次の正常なサンプルが大量の取りこぼしに見える。
+    FR-105 が数えるのは失われた件数なので、基準は到達済みの最大値で持つ。
+
+    `up` は進んでいる（時刻は戻らない）ことに注意。`up` が戻る場合は
+    定義上デバイス再起動である（FR-106）。
+    """
+    normalizer.normalize(raw(seq=10, up=25_000, room_temp=26.0))
+    out_of_order = normalizer.normalize(raw(seq=5, up=27_500, room_temp=26.0))
+    forward = normalizer.normalize(raw(seq=11, up=30_000, room_temp=26.0))
+
+    assert out_of_order.out_of_order
+    assert not out_of_order.device_restarted
+    assert forward.dropped_samples == 0
+    assert DROPPED_SAMPLES_METRIC not in values(forward)
+
+
+def test_gap_after_an_out_of_order_sample_is_measured_from_the_baseline(normalizer):
+    """基準は 10 のまま。13 なら飛びは2件。"""
+    normalizer.normalize(raw(seq=10, up=25_000, room_temp=26.0))
+    normalizer.normalize(raw(seq=5, up=27_500, room_temp=26.0))
+    assert normalizer.normalize(raw(seq=13, up=32_500, room_temp=26.0)).dropped_samples == 2
+
+
 def test_first_sample_has_no_history(normalizer):
     """起動直後は比較対象が無い。飛びとして報告しない。"""
     normalized = normalizer.normalize(raw(seq=1042, up=2_605_250, room_temp=26.0))
@@ -180,4 +207,17 @@ def test_calibration_file_must_be_a_mapping(tmp_path):
     path = tmp_path / "calibration.json"
     path.write_text("[0.0]", encoding="utf-8")
     with pytest.raises(ValueError, match="辞書ではない"):
+        Calibration.from_json(path)
+
+
+@pytest.mark.parametrize("offset", ["1e309", "-1e309"])
+def test_non_finite_offsets_are_rejected_at_load(offset, tmp_path):
+    """`1e309` は `json.loads` が `inf` にする。**読み込み時に弾く。**
+
+    通すと較正後の値が非有限になって `Reading` に拒否され、そのチャネルを含む
+    全サンプルが1件ずつ破棄され続ける。設定の誤りは設定を読む時点で言う。
+    """
+    path = tmp_path / "calibration.json"
+    path.write_text('{"offsets_c": {"gpu_intake": ' + offset + "}}", encoding="utf-8")
+    with pytest.raises(ValidationError):
         Calibration.from_json(path)
