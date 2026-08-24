@@ -1,0 +1,4 @@
+{"v":1,"type":"s","seq":10,"up":25000,"room_temp":26.40
+{"v":1,"type":"s",,"seq":11}
+{'v':1,'type':'s','seq':12}
+{"v":1,"type":"s","seq":14,"up":30000,"room_temp":26.40,}

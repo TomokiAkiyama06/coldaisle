@@ -1,0 +1,2 @@
+{"v":1,"type":"s","seq":20,"up":25000,"room_temp":NaN,"room_humidity":48.20,"front_intake":27.87,"gpu_intake":28.25,"gpu_exhaust":28.87,"top_exhaust":27.06,"rear_exhaust":27.44}
+{"v":1,"type":"s","seq":21,"up":27500,"room_temp":26.40,"room_humidity":48.20,"front_intake":Infinity,"gpu_intake":28.25,"gpu_exhaust":28.87,"top_exhaust":27.06,"rear_exhaust":27.44}

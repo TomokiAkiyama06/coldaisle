@@ -1,0 +1,13 @@
+{"v":2,"type":"s","seq":1,"up":1000,"room_temp":26.4}
+{"v":1,"type":"sample","seq":1,"up":1000,"room_temp":26.4}
+{"v":1,"type":"s","up":1000,"room_temp":26.4}
+{"v":1,"type":"s","seq":"1042","up":1000,"room_temp":26.4}
+{"v":1,"type":"s","seq":1,"up":-5,"room_temp":26.4}
+{"v":1,"type":"s","seq":1,"up":1000,"room_temp":"26.4"}
+{"v":1,"type":"s","seq":1,"up":1000,"err":"rear_exhaust:-127"}
+{"v":1,"type":"s","seq":1,"up":1000,"err":["no-colon-here"]}
+{"v":1,"type":"hello","fw":"1.0.0","dev":"xiao-esp32s3","interval_ms":2500,"sensors":{"front_intake":{"kind":"ds18b20","gpio":1,"res":11}}}
+{"v":1,"type":"hello","fw":"1.0.0","dev":"xiao-esp32s3","interval_ms":2500,"sensors":{"front_intake":{"kind":"ds18b20","gpio":1,"rom":"28ffffffffffff01","res":11}}}
+{"v":1,"type":"hello","fw":"1.0.0","dev":"xiao-esp32s3","interval_ms":2500,"sensors":{}}
+{"v":1,"type":"hello","fw":"1.0.0","dev":"xiao-esp32s3","sensors":{"front_intake":{"kind":"am2320"}}}
+{"v":1,"type":"s","seq":22,"up":-Infinity,"room_temp":26.40}
