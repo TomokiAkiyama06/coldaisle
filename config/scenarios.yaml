@@ -1,0 +1,84 @@
+# MockSource のシナリオ定義（#6）
+#
+# **シナリオはここだけで定義します。** コードに分岐を足さないでください。
+# 新しい状況を作るときは、下の4種類の効果（effects）の組み合わせで書きます。
+# 表現できない状況が出てきたら、効果の種類を足して両方をレビューします。
+#
+# 同じ `seed` なら出力は完全に一致します（受入基準）。時間圧縮（speed）を
+# 変えても値は変わりません。速度は待ち時間だけに効きます。
+
+defaults:
+  interval_ms: 2500 # 要件の送信周期
+  duration_s: 600 # null なら無限に流し続ける
+  seed: 20260824
+  baseline:
+    room_c: 26.0
+    room_humidity_pct: 48.0
+    noise_c: 0.05 # ガウスノイズの標準偏差。DS18B20 の 11bit 分解能（0.0625℃）より小さい
+    noise_pct: 0.2
+    # 室温からの定常オフセット。要件 §5.1 の「各部 +1〜3℃」
+    offsets_c:
+      front_intake: 1.4
+      gpu_intake: 1.8
+      gpu_exhaust: 2.4
+      top_exhaust: 0.6
+      rear_exhaust: 1.0
+
+scenarios:
+  idle:
+    description: 室温26℃前後、各部+1〜3℃、微小なノイズ。異常なし
+    duration_s: null # デーモンの動作確認用に終わらせない
+
+  ramp:
+    description: GPU負荷の上昇。gpu_exhaust が10分で+15℃
+    effects:
+      - kind: drift
+        channel: gpu_exhaust
+        start_s: 0
+        end_s: 600
+        delta_c: 15.0
+      - kind: drift # 吸気も予熱される。排気ほどは上がらない
+        channel: gpu_intake
+        start_s: 0
+        end_s: 600
+        delta_c: 4.0
+
+  recirculation:
+    description: 排気の再循環。front_intake が room から徐々に離れる
+    duration_s: 900
+    effects:
+      # d.intake_rise = front_intake - room が 1.4℃ から 7.4℃ へ。
+      # FR-404 の閾値 5.0℃ を 300秒時点で超え、以降10分間そのままになる
+      - kind: drift
+        channel: front_intake
+        start_s: 60
+        end_s: 300
+        delta_c: 6.0
+
+  sensor_fail:
+    description: rear_exhaust が120秒目から -127.00 を返し続ける
+    effects:
+      # **値をそのまま -127.00 にしています。** 実機のファームは null + err に
+      # 変換して送る想定（決定記録 0003 のフィクスチャ）ですが、要件 §5.3 は
+      # ホスト側が -127.00 を受け取る場合の規則も定めています。両方を試せるよう、
+      # value に null を書けば「null + err」側の挙動も再現できます。
+      - kind: stuck_value
+        channel: rear_exhaust
+        start_s: 120
+        value: -127.0
+        err: "rear_exhaust:-127"
+
+  reset:
+    description: 300秒目にデバイスが再起動。up が巻き戻り seq が 0 に戻る
+    effects:
+      - kind: device_reset
+        at_s: 300
+
+  dropout:
+    description: 200秒目から30秒間、ホストにデータが届かない
+    effects:
+      # デバイスは動き続けているので seq は進む。受信側で見ると seq が飛ぶ。
+      # これが FR-105（取りこぼし検出）の試験入力になる
+      - kind: dropout
+        start_s: 200
+        end_s: 230
