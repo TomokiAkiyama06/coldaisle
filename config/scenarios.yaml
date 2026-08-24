@@ -56,17 +56,42 @@ scenarios:
         delta_c: 6.0
 
   sensor_fail:
-    description: rear_exhaust が120秒目から -127.00 を返し続ける
+    description: rear_exhaust が120秒目から欠測になる（契約どおりの故障）
     effects:
-      # **値をそのまま -127.00 にしています。** 実機のファームは null + err に
-      # 変換して送る想定（決定記録 0003 のフィクスチャ）ですが、要件 §5.3 は
-      # ホスト側が -127.00 を受け取る場合の規則も定めています。両方を試せるよう、
-      # value に null を書けば「null + err」側の挙動も再現できます。
+      # **これが実機の既定の振る舞い。** ファーム（#11）は DS18B20 の -127.00 を
+      # `null` + `err` に変換して送る（決定記録 0003 のフィクスチャ）。
+      # MockSource の役割は「実機が送ってくるもの」の再現なので、こちらを既定にする。
+      # 生値がそのまま届く場合は sensor_fail_raw / sensor_reset_85 で試す。
+      - kind: stuck_value
+        channel: rear_exhaust
+        start_s: 120
+        value: null
+        err: "rear_exhaust:-127"
+
+  sensor_fail_raw:
+    description: rear_exhaust が120秒目から -127.00 の生値を返す（契約違反のファーム）
+    effects:
+      # ファームのバグや旧版では、変換されずに生値が届きうる。**err も付かない。**
+      # そのときホストが -127℃ を黙ってダッシュボードへ出さないこと（要件 §5.3）を
+      # 確かめるための入力。err を付けると「デバイスが教えてくれる」前提になり、
+      # 防御的パースの試験にならない
       - kind: stuck_value
         channel: rear_exhaust
         start_s: 120
         value: -127.0
-        err: "rear_exhaust:-127"
+
+  sensor_reset_85:
+    description: rear_exhaust が300秒目から ちょうど 85.00 を返す（-127 より危険）
+    effects:
+      # DS18B20 のパワーオンリセット値（spec-review C-02）。変換完了前に読む、
+      # あるいは電源が瞬断すると出る。**-127.00 は誰が見ても異常だが、
+      # 85.00 は排気温度としてありえなくはない値なので、ダッシュボードで本物に見える。**
+      # 測定範囲（-55〜125℃）にも収まるため、範囲検査では捕まらない。
+      # 番兵値として名指しで弾いていることの実データ試験になる
+      - kind: stuck_value
+        channel: rear_exhaust
+        start_s: 300
+        value: 85.0
 
   reset:
     description: 300秒目にデバイスが再起動。up が巻き戻り seq が 0 に戻る
