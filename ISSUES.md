@@ -64,6 +64,7 @@
 | 39 | [ハードウェア故障疑い時の Claude エスカレーション](issues/39-claude-escalation.md) | M5 AI | ai, safety, priority:should |
 | 40 | [Markdown Decision Memory への自動記録](issues/40-memory-writer.md) | M5 AI | integration, priority:should |
 | 41 | [秘匿情報の混入防止（.env / トークン / 環境固有情報）](issues/41-public-repo-hygiene.md) | M0 基盤 | infra, priority:must, safety |
+| 42 | [時刻ソースの注入（Clock 抽象）](issues/42-clock-injection.md) | M1 データ基盤 | core, priority:must |
 
 ## 着手順の推奨
 
