@@ -73,3 +73,4 @@ docs/decisions/NNNN-<slug>.md      例: 0002-metric-naming.md
 | [0001](0001-initial-project-decisions.md) | プロジェクト初期の決定（D-01〜D-19、V-01） | FINAL |
 | [0002](0002-metric-naming.md) | メトリクス命名規約とDBスキーマ（ロング形式） | FINAL |
 | [0003](0003-device-json-schema.md) | デバイス出力 JSON スキーマ v1 | Proposed |
+| [0004](0004-storage-read-contract.md) | ストレージ層の読み出し契約 | FINAL |
