@@ -136,6 +136,16 @@ class SqliteStore:
     # ------------------------------------------------------------------ 基本
 
     @property
+    def clock(self) -> Clock:
+        """この接続が `stale` 判定に使う時計。
+
+        **合成の起点が同じインスタンスを配れたか**を呼び出し側が検査できるように
+        公開する。`Clock` は型しか縛らないため、取り込みと保存で別の時計を
+        持っていても型検査は通ってしまう（#42）。
+        """
+        return self._clock
+
+    @property
     def connection(self) -> sqlite3.Connection:
         """生の接続。ロールアップ（#10）など、この層の外で SQL を足すため。"""
         return self._conn

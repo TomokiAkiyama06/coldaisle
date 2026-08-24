@@ -309,6 +309,18 @@ def test_source_exposes_the_clock_to_use(scenarios):
     assert source.clock is clock
 
 
+def test_store_and_source_share_one_clock_instance(scenarios, rules, tmp_path):
+    """**同じ値ではなく同じオブジェクト**であることを見る（#42）。
+
+    `Clock` は型しか縛らないので、取り込みが `SimulatedClock`、保存が実時計、
+    という組み合わせでも型検査は通る。合成の起点（#8 のデーモン）が
+    1つの時計を配れたかは、`is` でしか確かめられない。
+    """
+    source = MockSource(scenarios["idle"], clock=SimulatedClock(0))
+    with SqliteStore(tmp_path / "shared.db", rules=rules, clock=source.clock) as store:
+        assert store.clock is source.clock
+
+
 def test_host_time_advances_with_the_scenario(scenarios):
     """ホスト受信時刻がシナリオ時間で進む。1サンプルにつき `interval_ms`。"""
     source = MockSource(scenarios["ramp"], sleep=no_sleep, clock=SimulatedClock(0))
