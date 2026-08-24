@@ -66,13 +66,25 @@ def test_every_scenario_is_defined_in_yaml(scenarios):
         "ramp",
         "recirculation",
         "sensor_fail",
+        "sensor_fail_raw",
+        "sensor_reset_85",
         "reset",
         "dropout",
     }
 
 
 @pytest.mark.parametrize(
-    "name", ["idle", "ramp", "recirculation", "sensor_fail", "reset", "dropout"]
+    "name",
+    [
+        "idle",
+        "ramp",
+        "recirculation",
+        "sensor_fail",
+        "sensor_fail_raw",
+        "sensor_reset_85",
+        "reset",
+        "dropout",
+    ],
 )
 def test_output_matches_the_device_schema(name, scenarios, validator):
     """生成物が実機と同じ契約に従う（決定記録 0003）。
@@ -179,24 +191,60 @@ def test_recirculation_crosses_the_alert_threshold_and_stays(scenarios):
     assert (len(rises) - crossed_at) * INTERVAL_S >= 300, "5分の継続に足りない"
 
 
-def test_sensor_fail_returns_the_disconnected_sentinel(scenarios):
-    """途中から `-127.00` を返す（要件 §5.3 / spec-review C-02）。"""
+def test_sensor_fail_reports_the_contract_shape(scenarios):
+    """既定は `null` + `err`。**実機のファームが送ってくる形**（決定記録 0003）。
+
+    MockSource の役割は「実機が送ってくるもの」の再現なので、
+    契約どおりの故障をこちらに置く。生値が届く場合は下の2つで試す。
+    """
     produced = samples(scenarios["sensor_fail"])
     before = produced[: int(120 / INTERVAL_S)]
     after = produced[int(120 / INTERVAL_S) :]
 
     assert all(sample.channels["rear_exhaust"] > 20.0 for sample in before)
     assert all(sample.err == () for sample in before)
-    assert all(sample.channels["rear_exhaust"] == -127.0 for sample in after)
+    assert all(sample.channels["rear_exhaust"] is None for sample in after)
     assert all(sample.err == ("rear_exhaust:-127",) for sample in after)
     # 他のチャネルは壊れない。1本の故障が全体の欠測に見えてはいけない
     assert all(sample.channels["gpu_exhaust"] > 20.0 for sample in after)
 
 
-def test_sensor_fail_is_classified_as_suspect(scenarios, rules):
-    """L0 が出した値が L1 の判定に届くことまで確かめる。"""
-    last = samples(scenarios["sensor_fail"])[-1]
-    assert classify("air.rear_exhaust", last.channels["rear_exhaust"], rules) is Quality.SUSPECT
+def test_sensor_fail_raw_sends_the_sentinel_without_any_hint(scenarios):
+    """契約違反のファーム。生値が届き、**`err` も付かない**。
+
+    `err` を付けると「デバイスが教えてくれる」前提になり、
+    ホストの防御的パース（要件 §5.3）の試験にならない。
+    """
+    after = samples(scenarios["sensor_fail_raw"])[int(120 / INTERVAL_S) :]
+    assert all(sample.channels["rear_exhaust"] == -127.0 for sample in after)
+    assert all(sample.err == () for sample in after)
+
+
+def test_sensor_reset_85_is_indistinguishable_from_a_real_reading(scenarios, rules):
+    """ちょうど 85.00 が**測定範囲にも収まり、排気温度としてありえる**こと。
+
+    `-127.00` は誰が見ても異常だが、`85.00` はダッシュボードに出ると本物に見える
+    （spec-review C-02）。範囲検査では捕まらないことを、しきい値そのもので示す。
+    """
+    after = samples(scenarios["sensor_reset_85"])[int(300 / INTERVAL_S) :]
+    assert after, "300秒目以降のサンプルが無い"
+    assert all(sample.channels["rear_exhaust"] == 85.0 for sample in after)
+    assert all(sample.err == () for sample in after)
+    assert rules.sensor_min_c <= 85.0 <= rules.sensor_max_c, "範囲検査では弾けない値"
+
+
+@pytest.mark.parametrize(
+    ("scenario_name", "at_s", "expected"),
+    [
+        ("sensor_fail", 120, Quality.MISSING),
+        ("sensor_fail_raw", 120, Quality.SUSPECT),
+        ("sensor_reset_85", 300, Quality.SUSPECT),
+    ],
+)
+def test_failure_scenarios_reach_the_quality_rules(scenario_name, at_s, expected, scenarios, rules):
+    """L0 が出した値が L1 の判定に届くところまで確かめる（#5 の実データ試験）。"""
+    last = samples(scenarios[scenario_name])[-1]
+    assert classify("air.rear_exhaust", last.channels["rear_exhaust"], rules) is expected
     assert classify("air.gpu_exhaust", last.channels["gpu_exhaust"], rules) is Quality.OK
 
 
@@ -297,6 +345,23 @@ def test_stuck_value_can_be_a_plain_dropout_of_one_channel(scenarios):
     assert produced[0].channels["top_exhaust"] is not None
     assert produced[-1].channels["top_exhaust"] is None
     assert produced[-1].err == ()
+
+
+def test_power_on_reset_stays_suspect_while_it_is_stuck(scenarios, rules):
+    """張り付いている間ずっと `suspect` であること。
+
+    「前サンプルとの差が大きい場合だけ疑う」条件を足すと、最初の1サンプル以外は
+    差がゼロなので `ok` に戻り、**故障が続いている間だけ正常扱いになる。**
+    無条件で疑っていることを、連続サンプルで固定する。
+
+    5サンプル続くことは `SENSOR_MISSING`（FR-402）の発火条件でもある。
+    """
+    stuck = samples(scenarios["sensor_reset_85"])[int(300 / INTERVAL_S) :]
+    assert len(stuck) >= 5, "FR-402 の5サンプル連続を試すには足りない"
+    assert all(
+        classify("air.rear_exhaust", sample.channels["rear_exhaust"], rules) is Quality.SUSPECT
+        for sample in stuck
+    )
 
 
 # ---------------------------------------------------------------- 時刻（#42）
