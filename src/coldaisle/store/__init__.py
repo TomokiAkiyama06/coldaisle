@@ -9,11 +9,13 @@
 from coldaisle.store.db import Aggregation, SqliteStore
 from coldaisle.store.migrations import MigrationError
 from coldaisle.store.models import (
+    DeviceRecord,
     LatestReading,
     Quality,
     Reading,
     RollupPoint,
     Sample,
+    SensorRecord,
     SeriesPoint,
     Stats,
 )
@@ -21,6 +23,7 @@ from coldaisle.store.quality import QualityRules, classify
 
 __all__ = [
     "Aggregation",
+    "DeviceRecord",
     "LatestReading",
     "MigrationError",
     "Quality",
@@ -28,6 +31,7 @@ __all__ = [
     "Reading",
     "RollupPoint",
     "Sample",
+    "SensorRecord",
     "SeriesPoint",
     "SqliteStore",
     "Stats",

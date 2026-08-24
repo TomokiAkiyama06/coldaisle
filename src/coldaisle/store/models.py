@@ -163,3 +163,31 @@ class Stats(BaseModel):
     """最小二乗法による傾き。単位は「メトリクスの単位 / 分」（FR-407 の上昇率）。"""
     missing_ratio: float | None
     """`1 - ok_value_count / row_count`。窓に1行も無ければ None。"""
+
+
+class DeviceRecord(BaseModel):
+    """`devices` の1行（決定記録 0002 §2.10）。起動バナー由来。
+
+    L0 の `RawHello` をそのまま受け取らないのは、下位レイヤの型を L1 が
+    知らないようにするため（AGENTS.md の一方向依存）。詰め替えは取り込み側が行う。
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    device_id: str
+    fw: str | None = None
+    schema_v: int | None = None
+    interval_ms: int | None = Field(default=None, gt=0)
+    """送信周期。`expected_count`（決定記録 0002 §2.8）の算出に使う。"""
+
+
+class SensorRecord(BaseModel):
+    """`device_sensors` の1行。ROM の変化が `PROBE_CHANGED`（FR-403）の根拠になる。"""
+
+    model_config = ConfigDict(frozen=True)
+
+    channel: str
+    kind: str
+    gpio: int | None = None
+    rom: str | None = None
+    resolution: int | None = None

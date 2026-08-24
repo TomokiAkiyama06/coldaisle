@@ -28,6 +28,10 @@ dev = [
     "types-pyyaml>=6.0.12.20260815",
 ]
 
+[project.scripts]
+# 実機なしで起動できること（AGENTS.md のコマンド一覧）
+coldaisle-daemon = "coldaisle.ingest.daemon:main"
+
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
@@ -61,7 +65,10 @@ disallow_any_unimported = true
 testpaths = ["tests"]
 # マーカーのタイポを黙って無視すると、実機テストが CI で走る事故になる
 addopts = "--strict-markers"
-markers = ['hardware: 実機が必要なテスト（CI は -k "not hardware" で除外する）']
+markers = [
+    'hardware: 実機が必要なテスト（CI は -k "not hardware" で除外する）',
+    'slow: 秒単位で時間がかかるテスト（24時間相当の連続運転など）',
+]
 asyncio_mode = "strict"
 asyncio_default_fixture_loop_scope = "function"
 
