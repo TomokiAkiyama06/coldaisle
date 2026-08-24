@@ -3,6 +3,9 @@
 -- このファイルは docs/decisions/0002-metric-naming.md の SQL をそのまま写したもの。
 -- 内容を変更する場合は決定記録を先に更新し、新しい決定記録を作ること（追記のみ）。
 -- tests/test_schema_matches_decision.py が両者の一致を検証している。
+--
+-- 注: `v_latest` は ad-hoc 参照用。GROUP BY のため保持期間に比例して遅くなるので、
+-- `SqliteStore.latest()` はこのビューを使わない（決定記録 0004 §2.11）。
 
 CREATE TABLE readings (
     metric  TEXT    NOT NULL,          -- 'air.front_intake'

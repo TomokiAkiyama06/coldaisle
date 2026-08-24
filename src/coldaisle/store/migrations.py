@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import re
 import sqlite3
+from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -63,16 +64,7 @@ def current_version(conn: sqlite3.Connection) -> int:
     return 0 if row[0] is None else int(row[0])
 
 
-def apply_pending(
-    conn: sqlite3.Connection, now_ms: int, directory: Path = MIGRATIONS_DIR
-) -> tuple[int, ...]:
-    """未適用のマイグレーションを順に適用し、適用したバージョンを返す。
-
-    1ファイル＝1トランザクション。途中の文で失敗したら、そのファイルの
-    変更は丸ごと巻き戻る。中途半端なスキーマが残ると、次回の起動が
-    「テーブルが既にある」で失敗し、手作業でしか復旧できなくなる。
-    """
-    migrations = discover(directory)
+def _pending(conn: sqlite3.Connection, migrations: tuple[Migration, ...]) -> list[Migration]:
     version = current_version(conn)
     newest = migrations[-1].version if migrations else 0
     if version > newest:
@@ -80,34 +72,71 @@ def apply_pending(
             f"DB のスキーマ ({version}) がコード ({newest}) より新しい。"
             "古いバージョンで開くと壊れるため中止する"
         )
+    return [migration for migration in migrations if migration.version > version]
 
-    pending = [migration for migration in migrations if migration.version > version]
-    if not pending:
+
+def _statements(script: str) -> Iterator[str]:
+    """SQL スクリプトを文単位に分ける。
+
+    `executescript()` を使わないのは、**実行前に暗黙 COMMIT を打つ**ため。
+    それでは適用前に取った書き込みロックが外れ、バージョンの判定と適用の間に
+    他プロセスが割り込める（`apply_pending` を参照）。
+
+    分割は `sqlite3.complete_statement()` に任せる。`;` で素朴に切ると、
+    文字列リテラル中の `;` やトリガ本体（`BEGIN ... END;`）で壊れる。
+    """
+    parts = script.split(";")
+    buffer = ""
+    for part in parts[:-1]:
+        buffer += part + ";"
+        if sqlite3.complete_statement(buffer):
+            yield buffer.strip()
+            buffer = ""
+    remainder = "\n".join(
+        line
+        for line in (buffer + parts[-1]).splitlines()
+        if line.strip() and not line.lstrip().startswith("--")
+    )
+    if remainder:
+        raise MigrationError(f"末尾の文が `;` で終わっていない: {remainder[:80]!r}")
+
+
+def apply_pending(
+    conn: sqlite3.Connection, now_ms: int, directory: Path = MIGRATIONS_DIR
+) -> tuple[int, ...]:
+    """未適用のマイグレーションを適用し、適用したバージョンを返す。
+
+    呼び出し側は**自動コミット接続**（`isolation_level=None`）であること。
+    ここで明示的にトランザクションを制御する。
+
+    **バージョンの判定と適用を同じ書き込みトランザクションで行う。**
+    取り込みデーモンと API が新しい DB を同時に開くと、両方が「未適用」と
+    判定してから片方が適用し、もう片方が `table readings already exists` で
+    落ちる。`busy_timeout` では防げない（待つ前に判定が終わっているため）。
+    `BEGIN IMMEDIATE` でロックを取ってから判定し直す。
+
+    適用は丸ごと成功するか丸ごと巻き戻る。中途半端なスキーマが残ると、
+    次回の起動が「テーブルが既にある」で失敗し、手作業でしか復旧できない。
+    """
+    migrations = discover(directory)
+    if not _pending(conn, migrations):
+        # 大半の起動はここで終わる。適用が要らないなら書き込みロックを取らない
         return ()
 
-    # 既定（LEGACY）の接続では executescript が実行前に暗黙 COMMIT を打つため、
-    # スクリプト全体を1トランザクションにできない。PEP 249 準拠モードへ一時的に
-    # 切り替えることでこれを止める（Python 3.12 以降）。
-    previous_autocommit = conn.autocommit
-    conn.autocommit = False
+    conn.execute("BEGIN IMMEDIATE")
     try:
+        # ロックを待っている間に他プロセスが適用し終えている可能性がある
         applied: list[int] = []
-        for migration in pending:
-            try:
-                conn.executescript(migration.read_sql())
-                conn.execute(
-                    "INSERT INTO schema_version (version, applied_ms) VALUES (?, ?)",
-                    (migration.version, now_ms),
-                )
-                conn.commit()
-            except BaseException:
-                conn.rollback()
-                raise
+        for migration in _pending(conn, migrations):
+            for statement in _statements(migration.read_sql()):
+                conn.execute(statement)
+            conn.execute(
+                "INSERT INTO schema_version (version, applied_ms) VALUES (?, ?)",
+                (migration.version, now_ms),
+            )
             applied.append(migration.version)
-        return tuple(applied)
-    finally:
-        conn.autocommit = previous_autocommit
-        if conn.in_transaction:
-            # PEP 249 モードは commit 直後に次のトランザクションを開く。
-            # 何も書いていないので捨ててよい（開いたままだと WAL を切り詰められない）
-            conn.rollback()
+    except BaseException:
+        conn.execute("ROLLBACK")
+        raise
+    conn.execute("COMMIT")
+    return tuple(applied)

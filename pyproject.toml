@@ -25,6 +25,7 @@ dev = [
     "jsonschema",
     "ruff",
     "mypy",
+    "types-pyyaml>=6.0.12.20260815",
 ]
 
 [build-system]

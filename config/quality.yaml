@@ -1,0 +1,22 @@
+# 品質フラグ判定のしきい値（要件 §5.3 / spec-review C-04 / 決定記録 0004 §2.12）
+#
+# **ここが唯一の情報源です。** コード側に既定値を持たせないでください
+# （AGENTS.md「絶対に守るルール」6）。値を変える場合はこのファイルだけを変えます。
+#
+# 読み込みは `QualityRules.from_yaml()`。キーの過不足は読み込み時に落ちます。
+
+# この時間だけ更新が無ければ stale（要件 §5.3「前サンプルから10秒以上」）
+stale_after_ms: 10000
+
+# 室温として物理的にありえない範囲（spec-review C-04）。air.room にのみ適用します
+room_temp_min_c: 0.0
+room_temp_max_c: 60.0
+
+# 湿度がこの値に張り付いたら配線異常を疑う（spec-review C-04）
+# 範囲外ではなく境界を含めて suspect にします
+humidity_min_pct: 0.0
+humidity_max_pct: 100.0
+
+# DS18B20 のデータシート上の測定範囲。外れた値は物理的にありえない
+sensor_min_c: -55.0
+sensor_max_c: 125.0

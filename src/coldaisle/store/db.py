@@ -31,10 +31,58 @@ from coldaisle.store.quality import QualityRules
 P95 = 0.95
 """FR-303 が要求する分位点。"""
 
+_LATEST_SQL = """
+WITH RECURSIVE metrics(metric) AS (
+    SELECT MIN(metric) FROM readings
+    UNION ALL
+    SELECT (SELECT MIN(metric) FROM readings WHERE metric > metrics.metric)
+    FROM metrics WHERE metric IS NOT NULL
+)
+SELECT r.metric, r.ts_ms, r.value, r.quality
+FROM metrics
+JOIN readings r
+  ON r.metric = metrics.metric
+ AND r.ts_ms = (SELECT MAX(ts_ms) FROM readings WHERE metric = metrics.metric)
+WHERE metrics.metric IS NOT NULL
+"""
+"""最新値を主キーのシークだけで引く（決定記録 0004 §2.11）。
+
+`v_latest`（0002 §2.12）は `GROUP BY metric` のため `SCAN readings` になり、
+**保持期間に比例して遅くなる**。実測で 105万行のとき 44.8ms、
+30日保持（約730万行）では 300ms 台に達する。`latest()` は
+`/api/v1/health/summary` から毎秒叩かれるため、ここは行数に依存させない。
+
+再帰 CTE で「次に大きい metric」を主キーで辿り、各メトリクスの最新行を
+1回のシークで取る。走査量はメトリクス数に比例する（実測 0.01ms）。
+"""
+
 
 def now_ms() -> int:
     """現在時刻（Unix ミリ秒、UTC）。テストで差し替えられるよう関数にしている。"""
     return time.time_ns() // 1_000_000
+
+
+def _enable_wal(conn: sqlite3.Connection, busy_timeout_ms: int) -> None:
+    """WAL へ切り替える。切り替え済みなら何もしない。
+
+    **`PRAGMA busy_timeout` はこの切り替えを待ってくれない。**
+    journal_mode の変更は排他ロックを要求するが、SQLite の busy ハンドラは
+    ここでは呼ばれず、即座に `database is locked` を返す。
+    新しい DB を取り込みデーモンと API が同時に開くと、片方が
+    マイグレーション中のロックを持っているため、これに当たる。
+    """
+    if str(conn.execute("PRAGMA journal_mode").fetchone()[0]).lower() == "wal":
+        return
+    deadline = time.monotonic() + busy_timeout_ms / 1000
+    while True:
+        try:
+            conn.execute("PRAGMA journal_mode = WAL")
+        except sqlite3.OperationalError:
+            if time.monotonic() >= deadline:
+                raise
+            time.sleep(0.02)
+        else:
+            return
 
 
 class Aggregation(StrEnum):
@@ -67,11 +115,13 @@ class SqliteStore:
         self,
         path: Path | str,
         *,
-        rules: QualityRules | None = None,
+        rules: QualityRules,
         clock: Callable[[], int] = now_ms,
         busy_timeout_ms: int = 5_000,
     ) -> None:
-        self._rules = rules if rules is not None else QualityRules()
+        # `rules` は必須。既定値へ黙って落ちると、設定を読めていないことに
+        # 気づかないまま `stale` の判定だけが別のしきい値で動く（AGENTS.md ルール6）
+        self._rules = rules
         self._clock = clock
         self._conn = sqlite3.connect(str(path), isolation_level=None)
         self._conn.row_factory = sqlite3.Row
@@ -81,7 +131,7 @@ class SqliteStore:
         # WAL: 読み出し中も取り込みが書ける（NFR-02 の「取りこぼさない」の前提）
         # synchronous=NORMAL: WAL と組み合わせた場合、電源断で失われるのは
         # 直近のチェックポイント以降のみ。2.5秒周期の観測データにはこれで足りる
-        self._conn.execute("PRAGMA journal_mode = WAL")
+        _enable_wal(self._conn, busy_timeout_ms)
         self._conn.execute("PRAGMA synchronous = NORMAL")
         migrations.apply_pending(self._conn, self._clock())
 
@@ -157,9 +207,11 @@ class SqliteStore:
         `at_ms` から `stale_after_ms` 以上離れた値は `stale` に落とす。
         **保存時の品質は上書きする。** 古い値を `ok` のまま返すと、
         止まった時計を正常表示する（api-contract §3 が禁じている失敗）。
+
+        `v_latest` ビューは使わない。理由は `_LATEST_SQL` を参照。
         """
         now = self._clock() if at_ms is None else at_ms
-        rows = self._conn.execute("SELECT metric, ts_ms, value, quality FROM v_latest").fetchall()
+        rows = self._conn.execute(_LATEST_SQL).fetchall()
         latest: dict[str, LatestReading] = {}
         for row in rows:
             age_ms = now - int(row["ts_ms"])

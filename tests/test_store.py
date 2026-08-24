@@ -6,6 +6,9 @@
 """
 
 import sqlite3
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
@@ -13,7 +16,6 @@ from coldaisle.store import (
     Aggregation,
     MigrationError,
     Quality,
-    QualityRules,
     Reading,
     RollupPoint,
     Sample,
@@ -42,8 +44,8 @@ def db_path(tmp_path):
 
 
 @pytest.fixture
-def store(db_path):
-    with SqliteStore(db_path) as opened:
+def store(db_path, rules):
+    with SqliteStore(db_path, rules=rules) as opened:
         yield opened
 
 
@@ -67,10 +69,10 @@ def test_open_applies_migrations(store):
     assert [row["version"] for row in applied] == [1]
 
 
-def test_reopen_does_not_reapply(db_path):
-    with SqliteStore(db_path, clock=lambda: 111) as first:
+def test_reopen_does_not_reapply(db_path, rules):
+    with SqliteStore(db_path, rules=rules, clock=lambda: 111) as first:
         first.insert_sample(sample(1_000, **{"air.room": 26.0}))
-    with SqliteStore(db_path, clock=lambda: 222) as second:
+    with SqliteStore(db_path, rules=rules, clock=lambda: 222) as second:
         query = "SELECT version, applied_ms FROM schema_version"
         rows = second.connection.execute(query).fetchall()
         assert [(row["version"], row["applied_ms"]) for row in rows] == [(1, 111)]
@@ -84,11 +86,11 @@ def test_wal_and_synchronous_are_enabled(store):
     assert store.connection.execute("PRAGMA synchronous").fetchone()[0] == 1  # NORMAL
 
 
-def test_database_newer_than_code_is_refused(db_path, store):
+def test_database_newer_than_code_is_refused(db_path, store, rules):
     store.connection.execute("INSERT INTO schema_version VALUES (999, 0)")
     store.close()
     with pytest.raises(MigrationError, match="新しい"):
-        SqliteStore(db_path)
+        SqliteStore(db_path, rules=rules)
 
 
 def test_failed_migration_leaves_no_partial_schema(tmp_path):
@@ -98,7 +100,7 @@ def test_failed_migration_leaves_no_partial_schema(tmp_path):
     (directory / "0001_broken.sql").write_text(
         "CREATE TABLE first_half (x); CREATE TABLE first_half (x);", encoding="utf-8"
     )
-    conn = sqlite3.connect(":memory:")
+    conn = sqlite3.connect(":memory:", isolation_level=None)
     try:
         with pytest.raises(sqlite3.OperationalError):
             mig.apply_pending(conn, now_ms=0, directory=directory)
@@ -207,9 +209,10 @@ def test_latest_returns_the_newest_row_per_metric(store):
     assert latest["air.gpu_intake"].ts_ms == 1_000
 
 
-def test_latest_marks_old_values_stale(db_path):
+def test_latest_marks_old_values_stale(db_path, rules):
     """要件 §5.3「前サンプルから10秒以上更新なし」。境界を含む。"""
-    with SqliteStore(db_path, rules=QualityRules(stale_after_ms=10_000)) as store:
+    ten_seconds = rules.model_copy(update={"stale_after_ms": 10_000})
+    with SqliteStore(db_path, rules=ten_seconds) as store:
         store.insert_sample(sample(1_000, **{"air.room": 26.0}))
 
         assert store.latest(at_ms=1_000 + 9_999)["air.room"].quality is Quality.OK
@@ -219,8 +222,8 @@ def test_latest_marks_old_values_stale(db_path):
         assert stale.age_ms == 10_000
 
 
-def test_latest_uses_the_clock_when_no_time_is_given(db_path):
-    with SqliteStore(db_path, clock=lambda: 60_000) as store:
+def test_latest_uses_the_clock_when_no_time_is_given(db_path, rules):
+    with SqliteStore(db_path, rules=rules, clock=lambda: 60_000) as store:
         store.insert_sample(sample(1_000, **{"air.room": 26.0}))
         assert store.latest()["air.room"].quality is Quality.STALE
 
@@ -372,3 +375,162 @@ def test_rollup_missing_ratio_is_none_for_an_empty_bucket():
         expected_count=None,
     )
     assert point.missing_ratio is None
+
+
+def test_latest_does_not_scan_all_readings(store):
+    """最新値の走査量をメトリクス数に比例させる（決定記録 0004 §2.11）。
+
+    `v_latest` は `GROUP BY metric` のため `SCAN readings` になり、
+    保持期間に比例して遅くなる（実測: 105万行で 44.8ms、0.01ms との差）。
+    `/api/v1/health/summary` から毎秒叩かれる経路なので、
+    計画に全走査が現れたら落とす。
+    """
+    plan = " | ".join(
+        row["detail"] for row in store.connection.execute("EXPLAIN QUERY PLAN " + db._LATEST_SQL)
+    )
+    assert "SCAN readings" not in plan, plan
+    assert "SEARCH readings USING PRIMARY KEY" in plan, plan
+
+    # ビュー自体は ad-hoc 参照用として残っており、同じ答えを返す
+    store.insert_samples(
+        [
+            sample(1_000, **{"air.room": 26.0, "air.gpu_intake": 28.0}),
+            sample(2_000, **{"air.room": 26.5}),
+        ]
+    )
+    from_view = {
+        row["metric"]: (row["ts_ms"], row["value"])
+        for row in store.connection.execute("SELECT metric, ts_ms, value FROM v_latest")
+    }
+    from_latest = {
+        metric: (reading.ts_ms, reading.value)
+        for metric, reading in store.latest(at_ms=2_000).items()
+    }
+    assert from_latest == from_view
+
+
+def test_concurrent_open_does_not_break(tmp_path, rules):
+    """同時に開いても壊れないことの煙探知。
+
+    実際の競合窓は数ミリ秒しかなく、スレッドを並べても片方が先に完走してしまう。
+    窓を人工的に広げた検証は次のテストで行う。
+    """
+    path = tmp_path / "race.db"
+    ready = threading.Barrier(2, timeout=10)
+
+    def open_store() -> int:
+        ready.wait()
+        with SqliteStore(path, rules=rules) as opened:
+            query = "SELECT COUNT(*) FROM schema_version"
+            return int(opened.connection.execute(query).fetchone()[0])
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futures = [pool.submit(open_store) for _ in range(2)]
+        counts = [future.result(timeout=30) for future in futures]
+
+    assert counts == [1, 1], "どちらの接続から見てもマイグレーションは1回だけ"
+
+
+def test_version_is_rechecked_after_taking_the_lock(tmp_path, rules, monkeypatch):
+    """ロックを取る前に決めた「未適用リスト」を、そのまま適用しない。
+
+    取り込みデーモンと API が新しい DB を同時に開くと、両方が「未適用」と
+    判定してから片方だけが適用に成功し、もう片方が
+    `table readings already exists` で落ちる。`busy_timeout` は
+    **判定が終わったあとにしか効かない**ので防げない。
+
+    競合の窓は実際には数ミリ秒なので、判定の直後に別接続が適用し終える形で
+    人工的に広げて再現する。
+    """
+    path = tmp_path / "race.db"
+    conn = sqlite3.connect(path, isolation_level=None)
+    conn.execute("PRAGMA busy_timeout = 5000")
+    real_pending = mig._pending
+    first_call = True
+
+    def pending_then_lose_the_race(connection, migrations):
+        nonlocal first_call
+        result = real_pending(connection, migrations)
+        if first_call:
+            first_call = False
+            with SqliteStore(path, rules=rules):  # 別プロセスが先に適用し終える
+                pass
+        return result
+
+    monkeypatch.setattr(mig, "_pending", pending_then_lose_the_race)
+    try:
+        assert mig.apply_pending(conn, now_ms=0) == (), "適用済みを検出してやり直さない"
+        assert conn.execute("SELECT COUNT(*) FROM schema_version").fetchone()[0] == 1
+    finally:
+        conn.close()
+
+
+def test_wal_switch_waits_for_a_busy_database(tmp_path):
+    """WAL への切り替えは `busy_timeout` の対象外なので、自前で待つ。
+
+    前半で「待ってくれない」ことを確かめ、後半で `_enable_wal` が待つことを確かめる。
+    前半が通らなくなったら（SQLite 側が busy ハンドラを呼ぶようになったら）、
+    `_enable_wal` の再試行は不要になる。
+    """
+    path = tmp_path / "busy.db"
+    holder = sqlite3.connect(path, isolation_level=None, check_same_thread=False)
+    holder.execute("CREATE TABLE t (x)")
+    holder.execute("BEGIN IMMEDIATE")
+
+    conn = sqlite3.connect(path, isolation_level=None)
+    conn.execute("PRAGMA busy_timeout = 5000")
+    try:
+        with pytest.raises(sqlite3.OperationalError, match="locked"):
+            conn.execute("PRAGMA journal_mode = WAL")
+
+        def release() -> None:
+            time.sleep(0.1)
+            holder.execute("COMMIT")
+
+        thread = threading.Thread(target=release)
+        thread.start()
+        try:
+            db._enable_wal(conn, busy_timeout_ms=5_000)
+        finally:
+            thread.join(timeout=10)
+        assert conn.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
+    finally:
+        conn.close()
+        holder.close()
+
+
+def test_wal_switch_gives_up_after_the_timeout(tmp_path):
+    """待っても空かなければ例外を上げる。握りつぶして非WALで動き続けない。"""
+    path = tmp_path / "busy.db"
+    holder = sqlite3.connect(path, isolation_level=None)
+    holder.execute("CREATE TABLE t (x)")
+    holder.execute("BEGIN IMMEDIATE")
+
+    conn = sqlite3.connect(path, isolation_level=None)
+    try:
+        with pytest.raises(sqlite3.OperationalError):
+            db._enable_wal(conn, busy_timeout_ms=50)
+    finally:
+        conn.close()
+        holder.close()
+
+
+def test_statements_splits_on_real_boundaries():
+    """`;` で素朴に切らない。文字列リテラル中の `;` で壊れる。"""
+    script = "CREATE TABLE a (x); INSERT INTO a VALUES ('one; two');"
+    assert list(mig._statements(script)) == [
+        "CREATE TABLE a (x);",
+        "INSERT INTO a VALUES ('one; two');",
+    ]
+
+
+def test_statements_rejects_an_unterminated_tail():
+    with pytest.raises(MigrationError, match="`;` で終わっていない"):
+        list(mig._statements("CREATE TABLE a (x); CREATE TABLE b (y)"))
+
+
+def test_migration_file_splits_into_the_decided_objects():
+    """0001 は11個の文（テーブル9・インデックス2…とビュー）に分かれる。"""
+    statements = list(mig._statements((mig.MIGRATIONS_DIR / "0001_initial.sql").read_text("utf-8")))
+    assert len(statements) == 11
+    assert all(statement.endswith(";") for statement in statements)
