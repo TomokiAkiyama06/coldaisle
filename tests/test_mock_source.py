@@ -347,6 +347,23 @@ def test_stuck_value_can_be_a_plain_dropout_of_one_channel(scenarios):
     assert produced[-1].err == ()
 
 
+def test_power_on_reset_stays_suspect_while_it_is_stuck(scenarios, rules):
+    """張り付いている間ずっと `suspect` であること。
+
+    「前サンプルとの差が大きい場合だけ疑う」条件を足すと、最初の1サンプル以外は
+    差がゼロなので `ok` に戻り、**故障が続いている間だけ正常扱いになる。**
+    無条件で疑っていることを、連続サンプルで固定する。
+
+    5サンプル続くことは `SENSOR_MISSING`（FR-402）の発火条件でもある。
+    """
+    stuck = samples(scenarios["sensor_reset_85"])[int(300 / INTERVAL_S) :]
+    assert len(stuck) >= 5, "FR-402 の5サンプル連続を試すには足りない"
+    assert all(
+        classify("air.rear_exhaust", sample.channels["rear_exhaust"], rules) is Quality.SUSPECT
+        for sample in stuck
+    )
+
+
 # ---------------------------------------------------------------- 時刻（#42）
 
 
