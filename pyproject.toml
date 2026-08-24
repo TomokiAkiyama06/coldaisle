@@ -21,6 +21,8 @@ dev = [
     "pytest",
     "pytest-asyncio",
     "pytest-cov",
+    # デバイス出力 JSON スキーマ（schemas/device_v1.schema.json）の検証に使う。#4
+    "jsonschema",
     "ruff",
     "mypy",
 ]

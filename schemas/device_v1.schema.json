@@ -1,0 +1,110 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/TomokiAkiyama06/coldaisle/blob/main/schemas/device_v1.schema.json",
+  "title": "coldaisle device output v1",
+  "description": "XIAO ESP32-S3 が USB CDC へ1行1件で出力する JSON の契約。ファームウェアとホストの唯一の参照先。決定記録 0003 を参照。",
+  "type": "object",
+  "required": ["v", "type"],
+  "properties": {
+    "v": {
+      "const": 1,
+      "description": "スキーマバージョン。破壊的変更でのみ増やす。フィールドの追加では増やさない"
+    },
+    "type": {
+      "enum": ["s", "hello", "log"],
+      "description": "s=サンプル / hello=起動バナー / log=デバイスログ（v1では内容未定義）"
+    }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "type": { "const": "s" } }, "required": ["type"] },
+      "then": { "$ref": "#/$defs/sample" }
+    },
+    {
+      "if": { "properties": { "type": { "const": "hello" } }, "required": ["type"] },
+      "then": { "$ref": "#/$defs/hello" }
+    }
+  ],
+  "$defs": {
+    "reading": {
+      "type": ["number", "null"],
+      "description": "測定値。取得できなかった場合は null とし、理由を err に入れる"
+    },
+    "sample": {
+      "required": ["seq", "up"],
+      "properties": {
+        "seq": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "単調増加。取りこぼし検出に使う（FR-105）"
+        },
+        "up": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "デバイス稼働ミリ秒。巻き戻り＝再起動（FR-106）"
+        },
+        "room_temp": { "$ref": "#/$defs/reading" },
+        "room_humidity": { "$ref": "#/$defs/reading" },
+        "front_intake": { "$ref": "#/$defs/reading" },
+        "gpu_intake": { "$ref": "#/$defs/reading" },
+        "gpu_exhaust": { "$ref": "#/$defs/reading" },
+        "top_exhaust": { "$ref": "#/$defs/reading" },
+        "rear_exhaust": { "$ref": "#/$defs/reading" },
+        "err": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "^[a-z][a-z0-9_]*:.+$",
+            "description": "<channel>:<reason> 形式。理由の語彙は v1 では固定しない"
+          }
+        }
+      }
+    },
+    "hello": {
+      "required": ["fw", "dev", "interval_ms", "sensors"],
+      "properties": {
+        "fw": { "type": "string", "description": "ファームウェアのバージョン" },
+        "dev": { "type": "string", "description": "デバイス種別。'xiao-esp32s3'" },
+        "interval_ms": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "送信周期。ホストは期待サンプル数の算出に使う（決定記録 0002 の expected_count）"
+        },
+        "sensors": {
+          "type": "object",
+          "minProperties": 1,
+          "propertyNames": { "pattern": "^[a-z][a-z0-9_]*$" },
+          "additionalProperties": { "$ref": "#/$defs/sensor" }
+        }
+      }
+    },
+    "sensor": {
+      "type": "object",
+      "required": ["kind"],
+      "properties": {
+        "kind": {
+          "type": "string",
+          "description": "'ds18b20' | 'am2320'。将来の換装に備えて列挙にはしない"
+        },
+        "gpio": { "type": "integer", "minimum": 0 },
+        "rom": {
+          "type": "string",
+          "pattern": "^[0-9A-F]{16}$",
+          "description": "DS18B20 の64bit ROM ID。大文字16進16桁。プローブ入れ替え検出に使う（FR-403）"
+        },
+        "res": {
+          "type": "integer",
+          "minimum": 9,
+          "maximum": 12,
+          "description": "DS18B20 の分解能ビット数。11 を推奨（spec-review C-01）"
+        }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "kind": { "const": "ds18b20" } }, "required": ["kind"] },
+          "then": { "required": ["gpio", "rom", "res"] }
+        }
+      ]
+    }
+  }
+}

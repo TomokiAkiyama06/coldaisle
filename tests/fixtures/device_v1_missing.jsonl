@@ -1,0 +1,5 @@
+{"v":1,"type":"s","seq":2000,"up":100000,"room_temp":26.42,"room_humidity":48.20,"front_intake":27.87,"gpu_intake":28.25,"gpu_exhaust":28.87,"top_exhaust":27.06,"rear_exhaust":null,"err":["rear_exhaust:-127"]}
+{"v":1,"type":"s","seq":2001,"up":102500,"room_temp":null,"room_humidity":null,"front_intake":27.90,"gpu_intake":28.30,"gpu_exhaust":28.90,"top_exhaust":27.10,"rear_exhaust":null,"err":["room_temp:nack","room_humidity:nack","rear_exhaust:-127"]}
+{"v":1,"type":"s","seq":2002,"up":105000,"room_temp":26.44,"room_humidity":48.10,"front_intake":27.91,"gpu_intake":28.31,"gpu_exhaust":null,"top_exhaust":27.11,"rear_exhaust":null,"err":["gpu_exhaust:85","rear_exhaust:-127"]}
+{"v":1,"type":"s","seq":2003,"up":107500,"room_temp":26.45,"room_humidity":48.00,"front_intake":27.92,"gpu_intake":28.32,"gpu_exhaust":85.00,"top_exhaust":27.12,"rear_exhaust":-127.00}
+{"v":1,"type":"s","seq":2004,"up":110000,"room_temp":26.46,"room_humidity":100.00,"front_intake":27.93,"gpu_intake":28.33,"gpu_exhaust":28.93,"top_exhaust":27.13,"rear_exhaust":27.50}

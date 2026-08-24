@@ -1,0 +1,13 @@
+ets Jul 29 2019 12:21:46
+
+rst:0x1 (POWERON_RESET),boot:0x8 (SPI_FAST_FLASH_BOOT)
+configsip: 0, SPIWP:0xee
+clk_drv:0x00,q_drv:0x00,d_drv:0x00,cs0_drv:0x00,hd_drv:0x00,wp_drv:0x00
+mode:DIO, clock div:1
+load:0x3fff0030,len:1184
+load:0x40078000,len:13232
+entry 0x40080718
+{"v":1,"type":"hello","fw":"1.0.0","dev":"xiao-esp32s3","interval_ms":2500,"sensors":{"front_intake":{"kind":"ds18b20","gpio":1,"rom":"28FFFFFFFFFFFF01","res":11}}}
+{"v":1,"type":"s","seq":0,"up":2500,"room_temp":26.40,"room_humidity":48.20,"front_intake":27.85,"gpu_intake":28.20,"gpu_exhaust":28.80,"top_exhaust":27.02,"rear_exhaust":27.41}
+E (1523) i2c: i2c driver install error
+{"v":1,"type":"s","seq":1,"up":5000,"room_temp":26.41,"room_humidity":48.20,"front_intake":27.86,"gpu_intake":28.21,"gpu_exhaust":28.81,"top_exhaust":27.03,"rear_exhaust":27.42}

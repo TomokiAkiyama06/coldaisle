@@ -1,0 +1,5 @@
+{"v":1,"type":"hello","fw":"1.0.0","dev":"xiao-esp32s3","interval_ms":2500,"sensors":{"front_intake":{"kind":"ds18b20","gpio":1,"rom":"28FFFFFFFFFFFF01","res":11},"gpu_intake":{"kind":"ds18b20","gpio":2,"rom":"28FFFFFFFFFFFF02","res":11},"gpu_exhaust":{"kind":"ds18b20","gpio":3,"rom":"28FFFFFFFFFFFF03","res":11},"top_exhaust":{"kind":"ds18b20","gpio":4,"rom":"28FFFFFFFFFFFF04","res":11},"rear_exhaust":{"kind":"ds18b20","gpio":7,"rom":"28FFFFFFFFFFFF05","res":11},"room":{"kind":"am2320"}}}
+{"v":1,"type":"s","seq":1040,"up":2600250,"room_temp":26.37,"room_humidity":48.10,"front_intake":27.81,"gpu_intake":28.19,"gpu_exhaust":28.75,"top_exhaust":27.00,"rear_exhaust":27.40}
+{"v":1,"type":"s","seq":1041,"up":2602750,"room_temp":26.40,"room_humidity":48.20,"front_intake":27.87,"gpu_intake":28.25,"gpu_exhaust":28.87,"top_exhaust":27.06,"rear_exhaust":27.44}
+{"v":1,"type":"s","seq":1042,"up":2605250,"room_temp":26.42,"room_humidity":48.20,"front_intake":27.87,"gpu_intake":28.25,"gpu_exhaust":28.87,"top_exhaust":27.06,"rear_exhaust":27.44,"err":[]}
+{"v":1,"type":"log","msg":"i2c bus recovered"}
