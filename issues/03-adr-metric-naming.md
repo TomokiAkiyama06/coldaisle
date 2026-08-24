@@ -9,7 +9,7 @@ milestone: "M0 基盤"
 ワイド形式（列=センサー）だと追加のたびに `ALTER TABLE` が必要になる。
 
 ## やること
-- [ ] `docs/adr/0001-metric-naming.md` を作成
+- [ ] `docs/decisions/0002-metric-naming.md` を作成
 - [ ] メトリクス名を `<domain>.<name>` に確定（要件 §5.1）
 - [ ] `readings` / `readings_1m` / `alerts` / `devices` のDDLを確定
 - [ ] 派生メトリクス（`d.intake_rise` 等）は保存せず計算で出すことを明記

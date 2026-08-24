@@ -1,10 +1,10 @@
 # 決定記録 0002: メトリクス命名規約とDBスキーマ（ロング形式）
 
 - **種別**: Decision Record
-- **Status**: Proposed（本 PR のマージをもって FINAL）
+- **Status**: FINAL（2026-08-24 マージ）
 - **Date**: 2026-08-24
 - **Supersedes**: なし
-- **関連**: `docs/decisions/2026-08-23-open-questions.md`（0001 へ改名予定）D-02 /
+- **関連**: [`0001-initial-project-decisions.md`](0001-initial-project-decisions.md) D-02 /
   `docs/requirements.md` §5.1 / §5.3 / D-04 / `docs/spec-review.md` C-02
 - **対象 Issue**: #3
 

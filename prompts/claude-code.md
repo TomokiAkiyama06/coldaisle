@@ -128,8 +128,8 @@ issues/03-adr-metric-naming.md と issues/04-adr-device-json-schema.md を実装
 - tests/fixtures/ に正常系・欠測・ブートログ混入・不正JSON のサンプル行を置くこと
 
 出力:
-- docs/adr/0001-metric-naming.md
-- docs/adr/0002-device-json-schema.md
+- docs/decisions/0002-metric-naming.md
+- docs/decisions/0003-device-json-schema.md
 - schemas/device_v1.schema.json
 - tests/fixtures/*.jsonl
 ```
