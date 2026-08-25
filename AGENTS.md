@@ -17,6 +17,7 @@ uv run pytest                        # テスト
 uv run pytest -k "not hardware"      # 実機不要のテストのみ（CIと同じ）
 uv run ruff check . && uv run ruff format --check .
 uv run mypy src
+export UV_ENV_FILE=.env              # .env を読ませる（自動では読まれない）
 uv run coldaisle-daemon --source mock # 実機なしでデーモン起動
 uv run coldaisle-daemon --source mock --scenario ramp --speed 60  # 時間圧縮（下記の注意）
 uv run coldaisle-daemon --source replay --csv ~/server_sensor_logs --bulk  # 既存CSVの再生

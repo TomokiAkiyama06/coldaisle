@@ -234,3 +234,60 @@ def test_config_has_no_connection_details():
     for token in ("11434", "8001", "http://127.0.0.1:11434/v1\n"):
         assert f"\n{token}" not in text
     assert "OPENAI_BASE_URL" in text, "どこから読むかは書いてある"
+
+
+# ---------------------------------------------------------------- レビュー指摘の退行防止
+
+
+def test_unterminated_thinking_is_not_shown(settings):
+    """**閉じていない `<think>` も本文から外す。**
+
+    `max_tokens` に達すると閉じタグが出ないまま切れる。閉じたものだけを
+    外す実装では、**長い診断のときだけ内部の推論が利用者へ出る。**
+    """
+    body = reply("<think>まず室温を見る。次に排気を確認して、それから")
+    result = provider(settings, lambda _: httpx.Response(200, json=body)).chat(
+        [ChatMessage(role="user", content="診断して")]
+    )
+    assert result.text == ""
+    assert "まず室温を見る" in result.thinking
+
+
+def test_thinking_before_a_partial_answer_is_not_shown(settings):
+    body = reply("<think>考える</think>結論です。<think>さらに考えて")
+    result = provider(settings, lambda _: httpx.Response(200, json=body)).chat(
+        [ChatMessage(role="user", content="x")]
+    )
+    assert result.text == "結論です。"
+    assert "考える" in result.thinking
+    assert "さらに考えて" in result.thinking
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        {"choices": []},
+        {"choices": [{"message": "文字列だった"}]},
+        {"error": "backend said no"},
+        {"choices": [{}]},
+    ],
+)
+def test_malformed_success_response_is_unavailable_not_an_exception(body, settings):
+    """**形が違っても例外にしない**（FR-507）。
+
+    OpenAI 互換をうたっていても実装差はある。そこで例外が出ると
+    「不達は結果として返す」という約束が破れ、呼び出し側が落ちる。
+    """
+    result = provider(settings, lambda _: httpx.Response(200, json=body)).chat(
+        [ChatMessage(role="user", content="x")]
+    )
+    assert result.available is False
+    assert result.reason
+
+
+def test_documentation_explains_how_env_is_loaded():
+    """`.env` は自動で読まれない。**渡し忘れは静かに「未設定」になる。**"""
+    setup = (Path(AI_PATH).parents[1] / "docs" / "llm-setup.md").read_text(encoding="utf-8")
+    assert "--env-file" in setup
+    example = (Path(AI_PATH).parents[1] / ".env.example").read_text(encoding="utf-8")
+    assert "--env-file" in example

@@ -31,10 +31,17 @@ MODEL_ENV = "MODEL_NAME"
 API_KEY_ENV = "OPENAI_API_KEY"  # pragma: allowlist secret - 変数名であって値ではない
 
 THINK_BLOCK = re.compile(r"<think>(.*?)</think>", re.DOTALL)
-"""思考の出力。**利用者へ見せる本文からは外す。**
+"""閉じた思考の出力。**利用者へ見せる本文からは外す。**
 
 Evidence 形式（FR-508）で答えるべき場面で、思考の途中経過が根拠のように
 読まれてしまうため。必要なときは `ChatResult.thinking` から取る。
+"""
+
+OPEN_THINK = "<think>"
+"""閉じていない思考の始まり。
+
+`max_tokens` に達すると `</think>` が出ないまま切れる。**長い診断のときだけ
+内部の推論が本文に混じる**ことになるので、閉じタグが無くても切り離す。
 """
 
 
@@ -187,16 +194,26 @@ class OpenAiCompatibleProvider:
             return client.post(url, json=payload, headers=headers)
 
     def _parse(self, body: dict[str, Any]) -> ChatResult:
-        choice = body["choices"][0]["message"]
-        content = choice.get("content") or ""
-        thinking = "\n".join(THINK_BLOCK.findall(content)).strip()
-        text = THINK_BLOCK.sub("", content).strip()
+        """応答を読む。**形が想定と違っても例外にしない**（FR-507）。
+
+        OpenAI 互換をうたっていても、`choices` が空だったり `message` が
+        辞書でなかったりする実装がありうる。そこで例外が出ると、
+        `chat()` の「不達は結果として返す」という約束が破れる。
+        """
+        choices = body.get("choices")
+        if not isinstance(choices, list) or not choices:
+            return self._unavailable(f"応答に choices が無い: {str(body)[:200]}")
+        message = choices[0].get("message") if isinstance(choices[0], dict) else None
+        if not isinstance(message, dict):
+            return self._unavailable(f"応答の形が違う: {str(choices[0])[:200]}")
+        text, thinking = split_thinking(str(message.get("content") or ""))
+        tool_calls = message.get("tool_calls")
         return ChatResult(
             available=True,
             text=text,
             thinking=thinking,
             model=str(body.get("model", self.model)),
-            tool_calls=list(choice.get("tool_calls") or []),
+            tool_calls=list(tool_calls) if isinstance(tool_calls, list) else [],
         )
 
     def _unavailable(self, reason: str) -> ChatResult:
@@ -226,6 +243,22 @@ class UnavailableProvider:
 
     def probe(self) -> ChatResult:
         return ChatResult(available=False, reason=self.reason)
+
+
+def split_thinking(content: str) -> tuple[str, str]:
+    """本文と思考に分ける。
+
+    **閉じていない `<think>` も思考として扱う。** `max_tokens` に達すると
+    閉じタグが出ないまま切れるため、閉じたものだけを外す実装では
+    長い診断のときに内部の推論がそのまま利用者へ出る。
+    """
+    thinking = [block.strip() for block in THINK_BLOCK.findall(content)]
+    text = THINK_BLOCK.sub("", content)
+    opened = text.find(OPEN_THINK)
+    if opened != -1:
+        thinking.append(text[opened + len(OPEN_THINK) :].strip())
+        text = text[:opened]
+    return text.strip(), "\n".join(part for part in thinking if part).strip()
 
 
 def from_env(settings: AiSettings) -> Provider:

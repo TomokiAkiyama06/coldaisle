@@ -12,6 +12,21 @@ MODEL_NAME=qwen3:8b
 
 **`config/ai.yaml` に接続先を書かないでください。** 切り替えが2箇所になります。
 
+## `.env` の読み込み方（重要）
+
+**`.env` は自動では読まれません。** `uv run` に `--env-file` を渡すか、
+シェルで export してください。
+
+```bash
+uv run --env-file .env coldaisle-daemon --source mock
+# または
+export UV_ENV_FILE=.env      # 以降の uv run すべてに効く
+```
+
+これは通知（`COLDAISLE_SLACK_WEBHOOK` ほか）や API の設定にも同じく必要です。
+渡し忘れると、**エラーにならずに「未設定」として静かに動きます**
+（LLM なら「利用不可」、通知なら stdout だけに出る）。
+
 ---
 
 ## Mac（サーバー未着の期間）
@@ -92,7 +107,7 @@ GPU の主目的であり（#27）、Compute Mode では上限を切るのでは
 ## 動作確認
 
 ```bash
-uv run python -c "
+uv run --env-file .env python -c "
 from pathlib import Path
 from coldaisle.ai import AiSettings, provider_from_env
 result = provider_from_env(AiSettings.from_yaml(Path('config/ai.yaml'))).probe()
