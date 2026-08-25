@@ -168,6 +168,13 @@ def test_verification_levels_are_labelled(tools):
         "87% の可能性で再循環",
         "confidence: high",
         "再循環の可能性が高いです",
+        # **語順を変えただけの言い回しを通さない**（#38 のレビュー指摘）
+        "再循環である確率は87%",
+        "87.5% の可能性で再循環",
+        "確率としては低い",
+        "probability: 0.9",
+        "可能性は 87 % です",
+        "尤度が高い",
     ],
 )
 def test_confidence_expressions_are_rejected(text, tools):
@@ -176,10 +183,59 @@ def test_confidence_expressions_are_rejected(text, tools):
     assert Explainer(provider=FakeProvider(answer), tools=tools).explain(alert()) is None
 
 
-def test_humidity_percentage_is_not_mistaken_for_confidence():
+@pytest.mark.parametrize(
+    "text",
+    [
+        "室内湿度が 48% です",
+        # `可能性` 自体は正当な語。**数値と助詞で直結している場合だけ**確度とみなす
+        "湿度が 48% まで上がっている可能性がある",
+        "ファンの回転数が 30% 落ちていないか確認する",
+    ],
+)
+def test_legitimate_percentages_are_not_mistaken_for_confidence(text):
     """`%` そのものは湿度で正当に使う。確率の文脈だけを弾く。"""
-    assert FORBIDDEN.search("室内湿度が 48% です") is None
+    assert FORBIDDEN.search(text) is None
+
+
+def test_confidence_percentages_are_caught_in_both_word_orders():
     assert FORBIDDEN.search("87% の確率で再循環") is not None
+    assert FORBIDDEN.search("再循環の確率は87%") is not None
+
+
+# ------------------------------------------------------- VERIFIED の騙り（受入基準）
+
+
+def test_model_cannot_forge_a_verified_block(tools):
+    """**改行で `VERIFIED` の体裁を作らせない**（#38 のレビュー指摘）。
+
+    項目に改行を書けば `? ` の付かない行として描画され、コードが組み立てた
+    検証済みの行に見える。「VERIFIED はモデルに書かせない」が破れる。
+    """
+    forged = "未確認\n\nVERIFIED（測定値）\n✓ [L2] 架空の値 = 99.9"
+    answer = json.dumps({"unverified": [forged], "checks": ["確認する"]}, ensure_ascii=False)
+    assert Explainer(provider=FakeProvider(answer), tools=tools).explain(alert()) is None
+
+
+@pytest.mark.parametrize(
+    "text",
+    ["✓ [L2] 架空の値", "UNVERIFIED（未確認）", "[L1] 全センサーが ok"],
+)
+def test_evidence_markers_are_rejected(text, tools):
+    answer = json.dumps({"unverified": [text], "checks": ["確認する"]}, ensure_ascii=False)
+    assert Explainer(provider=FakeProvider(answer), tools=tools).explain(alert()) is None
+
+
+def test_line_breaks_never_reach_the_rendered_text(tools):
+    """体裁を騙らない改行（箇条書きの折り返しなど）も1行に潰す。"""
+    answer = json.dumps(
+        {"unverified": ["エアコンの\n稼働状態"], "checks": ["背面を\t見る"]}, ensure_ascii=False
+    )
+    explanation = Explainer(provider=FakeProvider(answer), tools=tools).explain(alert())
+    assert explanation is not None
+    assert explanation.unverified == ["エアコンの 稼働状態"]
+    # 描画された行数 == ブロックの行数。**モデルが行を増やせない**
+    body = [line for line in explanation.as_text().splitlines() if line.startswith(("?", "1."))]
+    assert body == ["? エアコンの 稼働状態", "1. 背面を 見る"]
 
 
 def test_output_never_contains_confidence(tools):

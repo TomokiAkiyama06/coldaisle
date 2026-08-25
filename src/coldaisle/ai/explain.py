@@ -33,14 +33,36 @@ from coldaisle.store.models import AlertRecord, Quality
 
 LOGGER = logging.getLogger("coldaisle.ai.explain")
 
+_PERCENT = r"\d+(?:\.\d+)?\s*[%％]"
+
 FORBIDDEN = re.compile(
-    r"(確度|確信度|信頼度|confidence|可能性が高い|おそらく間違いなく|\d+\s*%\s*の(可能性|確率))"
+    # 確度を表す語そのもの。**語順に依存しない**（「確率は87%」も「87%の確率」も）
+    r"確度|確信度|信頼度|確率|尤度"
+    r"|(?i:confidence|probability|likelihood|certainty)"
+    r"|可能性が高い|おそらく間違いなく"
+    # 「87.5% の可能性」。**助詞で直結している場合だけ**弾く（下記の理由）
+    rf"|{_PERCENT}\s*(?:程度|くらい|ほど)?\s*(?:の|である|だ)?\s*可能性"
+    rf"|可能性\s*(?:は|が)\s*(?:およそ|約)?\s*{_PERCENT}"
 )
 """**出力に確度を混ぜさせない**（FR-508）。
 
 プロンプトで禁じるだけでは足りない。書かれていたら丸ごと捨てる。
+
 `%` そのものは湿度で正当に使うため、確率の文脈だけを弾く。
+`可能性` は「〜が未確認である可能性」のように**正当に使う語**なので、
+数値と助詞で直結している場合（`87% の可能性`）だけを確度とみなす。
+「湿度が 48% まで上がっている可能性」は通す。
 """
+
+STRUCTURE = re.compile(r"VERIFIED|✓|\[L[0-9]\]")
+"""**モデルに VERIFIED 行を騙らせない**（#38 のレビュー指摘）。
+
+項目に改行と `VERIFIED（測定値）` を書けば、`? ` の付かない行として
+描画され、コードが組み立てた検証済みの行に見えてしまう。改行は潰すが、
+**そもそも体裁を書いてきた応答は指示に従えていない**ので採用しない。
+"""
+
+_WHITESPACE = re.compile(r"\s+")
 
 MAX_ITEMS = 6
 MAX_ITEM_CHARS = 120
@@ -55,6 +77,7 @@ SYSTEM_PROMPT = """あなたはGPUサーバーの熱管理を監視するアシ�
 - **確度・確信度・パーセントでの可能性を書かない。** 根拠がありません
 - **測定値を新しく作らない。** 与えられた事実以外の数値を書かない
 - 断定しない。「〜が原因です」ではなく「〜が未確認です」と書く
+- **改行や見出しで体裁を作らない。** 1項目は1行の文にする
 - 各項目は120文字以内、最大6件
 
 JSON だけを出力してください（説明文を付けない）:
@@ -237,6 +260,12 @@ class Explainer:
                     extra={logs.FIELDS_KEY: {"text": item[:100]}},
                 )
                 return None
+            if STRUCTURE.search(item):
+                LOGGER.warning(
+                    "AI の出力が VERIFIED の体裁を騙ったので捨てた",
+                    extra={logs.FIELDS_KEY: {"text": item[:100]}},
+                )
+                return None
         return unverified, checks
 
     @staticmethod
@@ -245,6 +274,11 @@ class Explainer:
             return []
         cleaned: list[str] = []
         for value in values[:MAX_ITEMS]:
-            if isinstance(value, str) and value.strip():
-                cleaned.append(value.strip()[:MAX_ITEM_CHARS])
+            if not isinstance(value, str):
+                continue
+            # **改行を潰す。** 残すと `? ` の付かない行が描画され、
+            # コードが組み立てた VERIFIED 行に紛れる（STRUCTURE も参照）
+            text = _WHITESPACE.sub(" ", value).strip()
+            if text:
+                cleaned.append(text[:MAX_ITEM_CHARS])
         return cleaned

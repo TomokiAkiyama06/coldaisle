@@ -39,6 +39,12 @@ class Router:
     notifiers: dict[str, Notifier]
     clock: Clock
     _last_sent_ms: dict[tuple[str, str | None], int] = field(default_factory=dict)
+    _explainable: set[tuple[str, str | None]] = field(default_factory=set)
+    """**発火を届けたという事実**。連投の抑制とは別に持つ（#38 のレビュー指摘）。
+
+    `_last_sent_ms` は解除で消える。説明は非同期で最長120秒あとに届くため、
+    短命なアラートでは解除が先に来て、**届けたはずの発火の説明が消える**。
+    """
     _queue: queue.Queue[Notification | None] = field(
         default_factory=lambda: queue.Queue(QUEUE_SIZE)
     )
@@ -104,8 +110,14 @@ class Router:
         now = self.clock.now_ms()
         if notification.kind == "explanation":
             # **発火を届けた相手にだけ、後から続ける。** 連投の抑制も夜間の方針も
-            # 通さない（元の通知は既に届いている）。逆に届けていないなら送らない
-            return key in self._last_sent_ms
+            # 通さない（元の通知は既に届いている）。逆に届けていないなら送らない。
+            #
+            # 解除で消える `_last_sent_ms` は見ない。生成を待つ間に解除されても、
+            # 発火を届けた事実は変わらない。1回の発火につき説明は1回だけ
+            if key not in self._explainable:
+                return False
+            self._explainable.discard(key)
+            return True
         if notification.state == "resolved":
             # **発火を届けたなら、解除も必ず届ける。** 連投の抑制も夜間の方針も
             # 通さない。送らないと、受け取った側は鳴りっぱなしだと思い続ける。
@@ -120,6 +132,7 @@ class Router:
         if not self._passes_night_policy(notification, now):
             return False
         self._last_sent_ms[key] = now
+        self._explainable.add(key)
         return True
 
     def _passes_night_policy(self, notification: Notification, now_ms: int) -> bool:

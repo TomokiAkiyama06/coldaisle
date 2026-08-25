@@ -375,3 +375,29 @@ def test_explanation_body_is_used_as_is(config):
     body = notification(kind="explanation", body=text).as_text()
     assert text in body
     assert "🔎" in body
+
+
+def test_explanation_survives_an_alert_that_resolved_first(config):
+    """**解除が先に来ても説明は届く**（#38 のレビュー指摘）。
+
+    生成は最長120秒かかる。短命なアラートでは解除が先に来るが、
+    発火を届けた事実は変わらない。連投の抑制（解除で消える）とは別に持つ。
+    """
+    slack = Recorder()
+    clock = SimulatedClock(NOON_MS)
+    sender = router(config, clock, slack=slack)
+    sender.notify(notification())
+
+    clock.advance_to_ms(NOON_MS + 20_000)
+    assert sender.notify(notification(state="resolved")) is True
+    clock.advance_to_ms(NOON_MS + 40_000)  # LLM の生成が終わった
+    assert sender.notify(notification(kind="explanation", body="x")) is True
+    assert [item.kind for item in slack.sent] == ["alert", "alert", "explanation"]
+
+
+def test_explanation_is_sent_once_per_firing(config):
+    """1回の発火につき説明は1回だけ（二重に鳴らさない）。"""
+    sender = router(config, SimulatedClock(NOON_MS))
+    sender.notify(notification())
+    assert sender.notify(notification(kind="explanation", body="x")) is True
+    assert sender.notify(notification(kind="explanation", body="x")) is False
