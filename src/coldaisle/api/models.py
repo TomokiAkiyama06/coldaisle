@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -134,6 +135,54 @@ class HealthResponse(BaseModel):
 
     **0 でない日は原因を追う。** 保存が取り込みに追いつけていない。
     """
+
+
+class ToolListResponse(BaseModel):
+    """`GET /api/v1/tools`（#23）。
+
+    `tools` は OpenAI function calling 形式の定義そのもの。**中身は型付けしない**
+    （形を決めているのは呼び出し先のモデルの作法であって、この契約ではない）。
+    決まっている外側だけを型にする。
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    read_only: bool
+    advisory: bool
+    """**回答は提案であり、実行される操作ではない。** この層に実行の手段は無い。"""
+    guidance: str
+    """呼び出し側の system prompt に入れる注意書き。"""
+    tools: list[dict[str, Any]]
+
+
+class ToolCallMeta(BaseModel):
+    """何を呼んだか（#23「どのツールを呼んだかを可視化」）。"""
+
+    model_config = ConfigDict(frozen=True)
+
+    tool: str
+    arguments: dict[str, str]
+    """届いたクエリ文字列そのもの。**型の変換は各ツールの引数モデルが行う。**"""
+    ok: bool
+    """`false` なら `result.error` に理由が入る（HTTP は 200 のまま）。"""
+    ts_ms: int
+    ts: str
+    elapsed_ms: int
+    read_only: bool
+    advisory: bool
+
+
+class ToolCallResponse(BaseModel):
+    """`GET /api/v1/tools/{name}`（#23）。
+
+    `result` はツールごとに形が違うので型付けしない。**外側の封筒は固定**で、
+    Workspace 側は `meta` を見て呼び出しを表示できる。
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    meta: ToolCallMeta
+    result: dict[str, Any]
 
 
 class StreamMessage(BaseModel):

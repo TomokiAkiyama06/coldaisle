@@ -84,82 +84,113 @@ class EmptyArgs(_Args):
     pass
 
 
-DEFINITIONS: list[dict[str, Any]] = [
-    {
-        "type": "function",
-        "function": {
-            "name": "get_latest",
-            "description": "全メトリクスの現在値・派生値・品質フラグを返す。",
-            "parameters": {"type": "object", "properties": {}, "additionalProperties": False},
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "query_series",
-            "description": (
-                f"時系列を**集計して**返す。各点はバケットの平均・最小・最大で、"
-                f"生の測定値は返さない。最大 {MAX_SERIES_POINTS} 点へ自動で粗くする。"
-                "期間は from/to（Unix ミリ秒）か window（例: 6h）で指定する。"
-                "from だけなら現在まで、to だけなら window ぶん遡る。"
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "metric": {"type": "string", "description": "例: air.gpu_intake"},
-                    "from": {"type": "integer"},
-                    "to": {"type": "integer"},
-                    "window": {"type": "string", "description": "例: 30m / 6h / 7d"},
-                    # **生は選べない。** 集計しない系列をモデルへ渡さない（FR-504）
-                    "agg": {"type": "string", "enum": ["1m", "5m", "1h"]},
-                },
-                "required": ["metric"],
-                "additionalProperties": False,
+GUIDANCE = (
+    "これらのツールは読み取り専用です。coldaisle は温湿度の監視・記録・通知だけを行い、"
+    "ファン制御・電源操作・シャットダウンは一切行いません（AGENTS.md ルール1・2）。"
+    "したがって回答は**人間への提案**であって、実行される操作ではありません。"
+    "対処が必要なときは、人が行う手順として書いてください。"
+)
+"""呼び出し側（Workspace のチャット）の system prompt に入れる注意書き（#23）。
+
+**「実行しておきました」と書かせない。** この層には実行する手段が無いので、
+そう書かれた時点で嘘になる。
+"""
+
+ADVISORY_SUFFIX = "（読み取り専用。制御は行わない）"
+"""各ツールの説明に付ける。**system prompt を組むのは呼び出し側**なので、
+
+`GUIDANCE` が渡らない経路でも、モデルが見る説明文だけで位置づけが分かるようにする。
+"""
+
+
+def _advisory(definitions: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """すべての説明に `ADVISORY_SUFFIX` を付ける。**書き忘れを作らない。**"""
+    for definition in definitions:
+        function = definition["function"]
+        function["description"] = f"{function['description']}{ADVISORY_SUFFIX}"
+    return definitions
+
+
+DEFINITIONS: list[dict[str, Any]] = _advisory(
+    [
+        {
+            "type": "function",
+            "function": {
+                "name": "get_latest",
+                "description": "全メトリクスの現在値・派生値・品質フラグを返す。",
+                "parameters": {"type": "object", "properties": {}, "additionalProperties": False},
             },
         },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "get_stats",
-            "description": "期間の min/max/mean/p95/傾き/欠測率を返す。数値の集計はこれを使う。",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "metric": {"type": "string"},
-                    "window": {"type": "string", "description": "例: 1h / 24h / 7d"},
+        {
+            "type": "function",
+            "function": {
+                "name": "query_series",
+                "description": (
+                    f"時系列を**集計して**返す。各点はバケットの平均・最小・最大で、"
+                    f"生の測定値は返さない。最大 {MAX_SERIES_POINTS} 点へ自動で粗くする。"
+                    "期間は from/to（Unix ミリ秒）か window（例: 6h）で指定する。"
+                    "from だけなら現在まで、to だけなら window ぶん遡る。"
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "metric": {"type": "string", "description": "例: air.gpu_intake"},
+                        "from": {"type": "integer"},
+                        "to": {"type": "integer"},
+                        "window": {"type": "string", "description": "例: 30m / 6h / 7d"},
+                        # **生は選べない。** 集計しない系列をモデルへ渡さない（FR-504）
+                        "agg": {"type": "string", "enum": ["1m", "5m", "1h"]},
+                    },
+                    "required": ["metric"],
+                    "additionalProperties": False,
                 },
-                "required": ["metric"],
-                "additionalProperties": False,
             },
         },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "list_alerts",
-            "description": "アラートの履歴を新しい順に返す。",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "from": {"type": "integer"},
-                    "to": {"type": "integer"},
-                    "state": {"type": "string", "enum": ["pending", "firing", "resolved"]},
-                    "limit": {"type": "integer"},
+        {
+            "type": "function",
+            "function": {
+                "name": "get_stats",
+                "description": (
+                    "期間の min/max/mean/p95/傾き/欠測率を返す。数値の集計はこれを使う。"
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "metric": {"type": "string"},
+                        "window": {"type": "string", "description": "例: 1h / 24h / 7d"},
+                    },
+                    "required": ["metric"],
+                    "additionalProperties": False,
                 },
-                "additionalProperties": False,
             },
         },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "describe_system",
-            "description": "センサー配置・メトリクスの意味・閾値の要約を返す。",
-            "parameters": {"type": "object", "properties": {}, "additionalProperties": False},
+        {
+            "type": "function",
+            "function": {
+                "name": "list_alerts",
+                "description": "アラートの履歴を新しい順に返す。",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "from": {"type": "integer"},
+                        "to": {"type": "integer"},
+                        "state": {"type": "string", "enum": ["pending", "firing", "resolved"]},
+                        "limit": {"type": "integer"},
+                    },
+                    "additionalProperties": False,
+                },
+            },
         },
-    },
-]
+        {
+            "type": "function",
+            "function": {
+                "name": "describe_system",
+                "description": "センサー配置・メトリクスの意味・閾値の要約を返す。",
+                "parameters": {"type": "object", "properties": {}, "additionalProperties": False},
+            },
+        },
+    ]
+)
 """OpenAI function calling 形式の定義。**書き込み・実行系は無い。**"""
 
 
@@ -171,6 +202,11 @@ class ToolRegistry:
     catalog: MetricCatalog
     rules: RuleSet
     clock: Clock
+
+    @property
+    def guidance(self) -> str:
+        """呼び出し側の system prompt に入れる注意書き（#23）。"""
+        return GUIDANCE
 
     def definitions(self) -> list[dict[str, Any]]:
         return DEFINITIONS

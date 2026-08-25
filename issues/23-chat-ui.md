@@ -35,3 +35,11 @@ milestone: "M5 AI"
 
 **v0 ダッシュボード（#17）は引き続き作ります。**（決定 D-3）
 グラフと現在値の目視確認と、自然言語での問い合わせは別の機能です。
+
+## 2026-08-25 の実装（決定記録 0018）
+
+- `GET /api/v1/tools` / `GET /api/v1/tools/{name}` を追加（`coldaisle.server:app`）
+- 呼び出しの記録を `meta` に返す（どのツールを何の引数で呼んだか）
+- `GUIDANCE` と各 description の `（読み取り専用。制御は行わない）` で位置づけを明記
+
+**契約が変わったので、Workspace 側にも Issue が必要です**（api-contract §6）。

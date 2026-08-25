@@ -33,6 +33,8 @@
 | GET | `/api/v1/alerts` | アラート一覧 |
 | GET | `/api/v1/gpu/processes` | CUDA プロセス一覧と VRAM 使用量 |
 | GET | `/api/v1/thermal-gate` | Compute 開始前の熱状態（signal + 理由） |
+| GET | `/api/v1/tools` | **AI 向けツールの関数定義**と注意書き（#23） |
+| GET | `/api/v1/tools/{name}` | ツールを1つ実行し、結果と呼び出しの記録を返す（#23） |
 | WS | `/api/v1/stream` | 新サンプルの push |
 
 ---
@@ -107,6 +109,63 @@ API が返すオフセットは `+00:00` です。同じ瞬間を指すので解
 
 `blocking` は**常に false** です。判断は人間が行います（決定 D-08）。
 将来もこのフィールドを true にする実装を入れないでください。
+
+### `GET /api/v1/tools` と `GET /api/v1/tools/{name}`
+
+Workspace のチャットが coldaisle のデータを読むための窓口です。
+**チャットUI は coldaisle 側では作りません**（決定 D-4）。ここが公開するのは
+「モデルに渡す関数定義」と「それを実行する口」だけです。
+
+```json
+{
+  "read_only": true,
+  "advisory": true,
+  "guidance": "これらのツールは読み取り専用です。…回答は人間への提案であって、実行される操作ではありません。…",
+  "tools": [ { "type": "function", "function": { "name": "get_stats", "description": "…（読み取り専用。制御は行わない）", "parameters": {} } } ]
+}
+```
+
+`guidance` は**呼び出し側の system prompt に入れてください。**
+coldaisle にはファン制御も電源操作も存在しないため、モデルに
+「実行しておきました」と書かせると、その時点で嘘になります。
+
+実行は GET です。引数はクエリ文字列で渡します。
+
+```text
+GET /api/v1/tools/get_stats?metric=air.room&window=24h
+```
+
+```json
+{
+  "meta": {
+    "tool": "get_stats",
+    "arguments": {"metric": "air.room", "window": "24h"},
+    "ok": true,
+    "ts_ms": 1787616000000,
+    "ts": "2026-08-25T00:00:00+00:00",
+    "elapsed_ms": 3,
+    "read_only": true,
+    "advisory": true
+  },
+  "result": { "mean": 26.0, "p95": 28.4 }
+}
+```
+
+`meta` は**回答の根拠を追うため**にあります（#23「どのツールを呼んだかを可視化」）。
+Workspace 側でそのまま表示できます。
+
+封筒（`meta` と一覧の外側）は OpenAPI に型として出ます。§4 の型生成でそのまま扱えます。
+**`result` と `tools` の中身は型付けされません** — ツールごと・モデルの作法ごとに
+形が変わるためです。
+
+**存在しないツール名や壊れた引数でも 200 が返ります。** `meta.ok` が `false` になり、
+`result.error` に理由が入ります。モデルが寄こす名前と引数は入力データであって
+呼び出し側の誤りではないため、4xx にすると会話を続けるたびに例外を結果へ
+翻訳することになります。
+
+> **この2つのエンドポイントは `coldaisle.server:app` でだけ有効です。**
+> `coldaisle.api:app` は L2 のみで動くため、ツールの窓口を持ちません
+> （決定記録 0018 §2.1）。
 
 ---
 
