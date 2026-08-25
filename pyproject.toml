@@ -33,6 +33,8 @@ dev = [
 coldaisle-daemon = "coldaisle.daemon:main"
 # ロールアップと削除。cron / systemd タイマーから呼ぶ（#10）
 coldaisle-rollup = "coldaisle.store.rollup:main"
+# 日次レポート。cron から毎朝、ロールアップのあとに呼ぶ（#25）
+coldaisle-report = "coldaisle.report:main"
 
 [build-system]
 requires = ["hatchling"]

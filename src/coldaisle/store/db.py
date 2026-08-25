@@ -85,6 +85,16 @@ WITH RECURSIVE metrics(metric) AS (
 SELECT metric FROM metrics WHERE metric IS NOT NULL
 """
 
+_ROLLUP_METRICS_SQL = """
+WITH RECURSIVE metrics(metric) AS (
+    SELECT MIN(metric) FROM {table}
+    UNION ALL
+    SELECT (SELECT MIN(metric) FROM {table} WHERE metric > metrics.metric)
+    FROM metrics WHERE metric IS NOT NULL
+)
+SELECT metric FROM metrics WHERE metric IS NOT NULL
+"""
+
 _LATEST_SQL = """
 WITH RECURSIVE metrics(metric) AS (
     SELECT MIN(metric) FROM readings
@@ -407,6 +417,19 @@ class SqliteStore:
         rows = self._conn.execute(_METRICS_SQL).fetchall()
         return tuple(row["metric"] for row in rows)
 
+    def rollup_metrics(self, agg: Aggregation) -> tuple[str, ...]:
+        """ロールアップ済みのメトリクス名。**生データが消えたあとも残る。**
+
+        日次レポートはロールアップから作るので、保持期間（30日）を過ぎた日でも
+        「そこに何のメトリクスがあったか」を答えられる必要がある（#25）。
+        `metrics()` と同じ理由で `SELECT DISTINCT` は使わない（決定記録 0004 §2.11）。
+        """
+        table = _ROLLUP_TABLES.get(agg)
+        if table is None:
+            raise ValueError(f"ロールアップ表を持たない集計: {agg}")
+        rows = self._conn.execute(_ROLLUP_METRICS_SQL.format(table=table)).fetchall()
+        return tuple(row["metric"] for row in rows)
+
     def set_system_state(self, key: str, value: str, *, at_ms: int) -> bool:
         """カテゴリ値の状態を記録する（決定記録 0002 §2.6）。書いたら True。
 
@@ -541,6 +564,27 @@ class SqliteStore:
             f"trigger_value, threshold, detail FROM alerts {where}"
             "ORDER BY started_ms DESC, id DESC LIMIT ?",
             (*params, limit),
+        ).fetchall()
+        return tuple(AlertRecord.model_validate(dict(row)) for row in rows)
+
+    def fired_alerts(
+        self, *, start_ms: int, end_ms: int, limit: int = 100
+    ) -> tuple[AlertRecord, ...]:
+        """`fired_ms` が `[start_ms, end_ms)` に入るアラート（#25）。
+
+        **日の境界は「発火した時刻」に当てる。** `started_ms` に当てると、
+        23:55 に条件が成立して 00:03 に発火したアラートが前日の件数に入る。
+        通知が飛んだのは翌日であり、数え方が受け取った人の記憶と食い違う。
+
+        `alerts()` と分けたのは、一覧（FR-304）が見たいのは「いつ始まったか」で、
+        並びも母数も別物だからである。引数で切り替えると呼び分けを間違える。
+        """
+        rows = self._conn.execute(
+            "SELECT id, rule_id, severity, state, metric, started_ms, fired_ms, resolved_ms, "
+            "trigger_value, threshold, detail FROM alerts "
+            "WHERE fired_ms IS NOT NULL AND fired_ms >= ? AND fired_ms < ? "
+            "ORDER BY fired_ms DESC, id DESC LIMIT ?",
+            (start_ms, end_ms, limit),
         ).fetchall()
         return tuple(AlertRecord.model_validate(dict(row)) for row in rows)
 

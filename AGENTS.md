@@ -22,6 +22,8 @@ uv run coldaisle-daemon --source mock # 実機なしでデーモン起動
 uv run coldaisle-daemon --source mock --scenario ramp --speed 60  # 時間圧縮（下記の注意）
 uv run coldaisle-daemon --source replay --csv ~/server_sensor_logs --bulk  # 既存CSVの再生
 uv run coldaisle-rollup             # ロールアップと保持期間の適用（1日1回）
+uv run coldaisle-report             # 前日の日次レポート（ロールアップのあと）
+uv run coldaisle-report --date 2026-08-24 --no-send --print  # 任意の日を作り直す
 COLDAISLE_DB=var/coldaisle.db uv run uvicorn coldaisle.api:app --host 127.0.0.1 --port 8000
 ```
 
@@ -151,6 +153,7 @@ src/coldaisle/
   metrics.py  # レイヤ横断: 単位・表示名・派生値の定義。#9
   daemon.py   # 合成の起点: Source→Normalizer→Store→Rules を束ねる。#8 / #18
   ingest/     # L0: Source実装（serial / mock / replay）、正規化
+  report.py   # 合成の起点: 日次レポート（Store→AI→通知）。#25
   store/      # L1: SQLite、ロールアップ、CSVエクスポート
   api/        # L2: FastAPI、WebSocket
   rules/      # L2: ルールエンジン（決定論的。AI非依存）

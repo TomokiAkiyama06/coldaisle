@@ -1,0 +1,32 @@
+# 日次レポート（FR-506 / #25）
+#
+# `coldaisle-report` を cron から毎朝呼びます。**`coldaisle-rollup` のあとに**
+# 走らせてください。集計元は1分ロールアップなので、前日ぶんが埋まっている必要が
+# あります（決定記録 0017 §2.1）。
+#
+#   0 3 * * *  cd /path/to/coldaisle && uv run coldaisle-rollup
+#   5 8 * * *  cd /path/to/coldaisle && uv run coldaisle-report
+
+# 日の境界に使うローカル時刻
+timezone: "Asia/Tokyo"
+
+# Markdown の保存先。`~` は展開します。
+#
+# **`docs/` には置きません**（#25 の記述からの変更。決定記録 0017 §2.4）。
+# 生成物であって文書ではなく、リポジトリは public です。室温と在室の傾向は
+# 生活パターンそのものなので、公開リポジトリへ自動でコミットされうる場所には
+# 置きません。閲覧したいだけなら `--print` で標準出力へ出せます。
+output_dir: "var/reports"
+
+# 宛先の名前。空にすると送らず、ファイルだけ残します。
+# **`Router` は通しません**（連投の抑制・夜間の方針はアラートの都合）
+to: [stdout]
+
+# AI に所見（2〜3文）を書かせるか。**失敗しても表だけで成立します**
+summarise: true
+
+# アラートの内訳に載せるルール数の上限
+max_alerts: 20
+
+# 通知に載せる文字数。全文はファイルに残ります（LINE は5000文字で切られる）
+max_notification_chars: 3500
