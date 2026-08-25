@@ -83,3 +83,4 @@ docs/decisions/NNNN-<slug>.md      例: 0002-metric-naming.md
 | [0011](0011-dashboard.md) | 開発用ダッシュボードの方針 | Proposed |
 | [0012](0012-rule-engine.md) | ルールエンジンの規約 | FINAL |
 | [0013](0013-notifications.md) | 通知の規約 | Proposed |
+| [0014](0014-llm-provider.md) | LLM Provider の規約 | Proposed |
