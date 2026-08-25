@@ -1,0 +1,56 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>coldaisle</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<!--
+  開発用・フォールバック用のダッシュボード（#17）。本番UIは Workspace 側。
+  **作り込まない。** 外部への参照を持たないこと（オフラインでも見えるため）。
+-->
+<div id="banner" class="banner hidden" role="alert"></div>
+
+<header>
+  <h1>coldaisle</h1>
+  <div class="status">
+    <span id="conn" class="conn">接続中…</span>
+    <span id="age" class="age"></span>
+  </div>
+</header>
+
+<main>
+  <section aria-label="現在値">
+    <div id="cards" class="cards"></div>
+  </section>
+
+  <section aria-label="派生値">
+    <h2>派生値</h2>
+    <div id="derived" class="cards derived"></div>
+  </section>
+
+  <section aria-label="履歴">
+    <h2>履歴</h2>
+    <div class="ranges" id="ranges"></div>
+    <div class="chart-wrap">
+      <svg id="chart-temp" class="chart" viewBox="0 0 800 260" preserveAspectRatio="none"></svg>
+      <div id="legend-temp" class="legend"></div>
+    </div>
+    <div class="chart-wrap">
+      <svg id="chart-humidity" class="chart" viewBox="0 0 800 160" preserveAspectRatio="none"></svg>
+      <div id="legend-humidity" class="legend"></div>
+    </div>
+    <p id="chart-note" class="note"></p>
+  </section>
+
+  <section aria-label="アラート">
+    <h2>アラート</h2>
+    <div id="alerts" class="alerts"></div>
+  </section>
+</main>
+
+<script src="app.js"></script>
+</body>
+</html>

@@ -19,6 +19,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
+from fastapi.staticfiles import StaticFiles
 
 from coldaisle.api import derived as derived_values
 from coldaisle.api.metrics_meta import MetricCatalog
@@ -38,6 +39,9 @@ from coldaisle.clock import Clock, WallClock
 from coldaisle.store import Aggregation, Quality, QualityRules, SqliteStore
 from coldaisle.store.db import FIVE_MINUTES_MS, HOUR_MS, MINUTE_MS
 from coldaisle.store.models import LatestReading, validate_metric
+
+WEB_ROOT = Path(__file__).resolve().parents[1] / "web"
+"""ダッシュボードの静的アセット（L4）。**外部への参照を持たない**（オフラインでも見える）。"""
 
 DEFAULT_SAMPLE_INTERVAL_MS = 2_500
 """起動バナーを受け取れていないときの想定周期。点数の見積りにだけ使う。"""
@@ -374,6 +378,9 @@ def create_app(config: Config | None = None, *, clock: Clock | None = None) -> F
             return None
         return round(1 - float(row[0] or 0) / float(row[1]), 4)
 
+    # 開発用ダッシュボード（#17）。API ルートの**後ろ**に置く。
+    # 先に置くと `/api/v1/...` まで静的配信に飲まれる
+    app.mount("/", StaticFiles(directory=WEB_ROOT, html=True), name="web")
     return app
 
 
