@@ -345,3 +345,59 @@ def test_invalid_timezone_fails_at_load(tmp_path):
     path.write_text(text, encoding="utf-8")
     with pytest.raises(ValueError, match="タイムゾーン"):
         NotifyConfig.from_yaml(path)
+
+
+# ---------------------------------------------------------------- 説明の後追い（#38）
+
+
+def test_explanation_follows_a_delivered_alert(config):
+    """説明は**発火を届けた相手にだけ**、抑制を通さず後から続く（#38）。"""
+    slack = Recorder()
+    clock = SimulatedClock(NOON_MS)
+    sender = router(config, clock, slack=slack)
+    sender.notify(notification())
+
+    clock.advance_to_ms(NOON_MS + 30_000)  # 抑制の間隔より短い
+    assert sender.notify(notification(kind="explanation", body="VERIFIED\n✓ ...")) is True
+    assert [item.kind for item in slack.sent] == ["alert", "explanation"]
+
+
+def test_explanation_is_not_sent_when_the_alert_was_suppressed(config):
+    """届けていない発火の説明だけを送らない。"""
+    slack = Recorder()
+    sender = router(config, SimulatedClock(NIGHT_MS), slack=slack)
+    assert sender.notify(notification(severity="warning")) is False
+    assert sender.notify(notification(kind="explanation", body="x")) is False
+
+
+def test_explanation_body_is_used_as_is(config):
+    text = "VERIFIED（測定値・閾値判定）\n✓ [L2] 6.20（閾値 5.00）"
+    body = notification(kind="explanation", body=text).as_text()
+    assert text in body
+    assert "🔎" in body
+
+
+def test_explanation_survives_an_alert_that_resolved_first(config):
+    """**解除が先に来ても説明は届く**（#38 のレビュー指摘）。
+
+    生成は最長120秒かかる。短命なアラートでは解除が先に来るが、
+    発火を届けた事実は変わらない。連投の抑制（解除で消える）とは別に持つ。
+    """
+    slack = Recorder()
+    clock = SimulatedClock(NOON_MS)
+    sender = router(config, clock, slack=slack)
+    sender.notify(notification())
+
+    clock.advance_to_ms(NOON_MS + 20_000)
+    assert sender.notify(notification(state="resolved")) is True
+    clock.advance_to_ms(NOON_MS + 40_000)  # LLM の生成が終わった
+    assert sender.notify(notification(kind="explanation", body="x")) is True
+    assert [item.kind for item in slack.sent] == ["alert", "alert", "explanation"]
+
+
+def test_explanation_is_sent_once_per_firing(config):
+    """1回の発火につき説明は1回だけ（二重に鳴らさない）。"""
+    sender = router(config, SimulatedClock(NOON_MS))
+    sender.notify(notification())
+    assert sender.notify(notification(kind="explanation", body="x")) is True
+    assert sender.notify(notification(kind="explanation", body="x")) is False

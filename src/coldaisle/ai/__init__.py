@@ -7,6 +7,7 @@
 「利用不可」という結果として返る。
 """
 
+from coldaisle.ai.explain import Evidence, Explainer, Explanation
 from coldaisle.ai.provider import (
     AiSettings,
     ChatMessage,
@@ -23,6 +24,9 @@ __all__ = [
     "AiSettings",
     "ChatMessage",
     "ChatResult",
+    "Evidence",
+    "Explainer",
+    "Explanation",
     "OpenAiCompatibleProvider",
     "Provider",
     "ToolRegistry",
