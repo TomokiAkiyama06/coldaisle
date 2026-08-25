@@ -27,6 +27,7 @@ from coldaisle.clock import Clock
 from coldaisle.metrics import MetricCatalog, compute_derived
 from coldaisle.rules.models import RuleSet
 from coldaisle.store import Aggregation, SqliteStore
+from coldaisle.store.db import MINUTE_MS
 from coldaisle.store.models import validate_metric
 
 LOGGER = logging.getLogger("coldaisle.ai.tools")
@@ -97,8 +98,10 @@ DEFINITIONS: list[dict[str, Any]] = [
         "function": {
             "name": "query_series",
             "description": (
-                f"時系列を返す。最大 {MAX_SERIES_POINTS} 点へ自動で粗くする。"
+                f"時系列を**集計して**返す。各点はバケットの平均・最小・最大で、"
+                f"生の測定値は返さない。最大 {MAX_SERIES_POINTS} 点へ自動で粗くする。"
                 "期間は from/to（Unix ミリ秒）か window（例: 6h）で指定する。"
+                "from だけなら現在まで、to だけなら window ぶん遡る。"
             ),
             "parameters": {
                 "type": "object",
@@ -107,7 +110,8 @@ DEFINITIONS: list[dict[str, Any]] = [
                     "from": {"type": "integer"},
                     "to": {"type": "integer"},
                     "window": {"type": "string", "description": "例: 30m / 6h / 7d"},
-                    "agg": {"type": "string", "enum": ["raw", "1m", "5m", "1h"]},
+                    # **生は選べない。** 集計しない系列をモデルへ渡さない（FR-504）
+                    "agg": {"type": "string", "enum": ["1m", "5m", "1h"]},
                 },
                 "required": ["metric"],
                 "additionalProperties": False,
@@ -221,19 +225,26 @@ class ToolRegistry:
         }
 
     def _tool_query_series(self, arguments: dict[str, Any]) -> dict[str, Any]:
+        """**必ず集計して返す。** 生の測定値は1点も渡さない。
+
+        AGENTS.md のルール5（生の時系列を LLM のプロンプトに直接入れない）は
+        点数の上限とは別の話である。200点に切り詰めても、
+        中身が個々の測定値なら「生の時系列」のままになる。
+        """
         args = SeriesArgs.model_validate(arguments)
         validate_metric(args.metric)
         start_ms, end_ms = self._range(args.from_ms, args.to_ms, args.window)
         agg = self._choose_agg(args.agg, end_ms - start_ms)
-        if agg is Aggregation.RAW:
-            points = [
-                {"ts_ms": point.ts_ms, "value": point.value, "quality": point.quality.value}
-                for point in self.store.series(
-                    args.metric, start_ms, end_ms, limit=MAX_SERIES_POINTS
-                )
-            ]
-        else:
-            points = [
+        buckets = self.store.aggregate(args.metric, start_ms, end_ms, agg, limit=MAX_SERIES_POINTS)
+        return {
+            "metric": args.metric,
+            "unit": self.catalog.unit_for(args.metric),
+            "agg": agg.value,
+            "from_ms": start_ms,
+            "to_ms": end_ms,
+            "point_count": len(buckets),
+            "note": "各点はバケットの集計値。生の測定値は返さない（FR-504）",
+            "points": [
                 {
                     "ts_ms": bucket.bucket_ms,
                     "mean": bucket.mean_value,
@@ -241,18 +252,8 @@ class ToolRegistry:
                     "max": bucket.max_value,
                     "missing_ratio": bucket.missing_ratio,
                 }
-                for bucket in self.store.aggregate(
-                    args.metric, start_ms, end_ms, agg, limit=MAX_SERIES_POINTS
-                )
-            ]
-        return {
-            "metric": args.metric,
-            "unit": self.catalog.unit_for(args.metric),
-            "agg": agg.value,
-            "from_ms": start_ms,
-            "to_ms": end_ms,
-            "point_count": len(points),
-            "points": points,
+                for bucket in buckets
+            ],
         }
 
     def _tool_get_stats(self, arguments: dict[str, Any]) -> dict[str, Any]:
@@ -303,13 +304,15 @@ class ToolRegistry:
         EmptyArgs.model_validate(arguments)
         devices = [
             {
-                "device_id": row[0],
-                "fw": row[1],
+                # `dev` / `fw` / `kind` はデバイスが名乗る文字列。
+                # **指示として読まれないよう囲む**（要件 §7.4）
+                "device_id": as_data(str(row[0])),
+                "fw": as_data(None if row[1] is None else str(row[1])),
                 "interval_ms": row[2],
                 "sensors": [
                     {
-                        "channel": sensor.channel,
-                        "kind": sensor.kind,
+                        "channel": as_data(sensor.channel),
+                        "kind": as_data(sensor.kind),
                         "gpio": sensor.gpio,
                         # **ROM は伏せる。** 環境固有の識別子をモデルへ出さない（#41）
                         "rom_suffix": None if sensor.rom is None else sensor.rom[-4:],
@@ -346,25 +349,36 @@ class ToolRegistry:
     # ------------------------------------------------------------------ 内部
 
     def _thresholds(self) -> dict[str, Any]:
-        summary: dict[str, Any] = {}
-        for name, rule in self.rules:
-            values = {
-                key: getattr(rule, key)
-                for key in ("metric", "threshold", "clear", "fire_after_s", "low", "high")
-                if hasattr(rule, key)
-            }
-            summary[name.upper()] = {
-                "severity": rule.severity.value,
-                "enabled": rule.enabled,
-                **values,
-            }
-        return summary
+        """設定された項目を**そのまま全部**出す。
+
+        選んで載せると、`SENSOR_FAULT` の無音秒数や `SENSOR_MISSING` の連続回数の
+        ように「そのルールの発火条件そのもの」が抜ける。
+        抜けたまま説明させると、モデルは無い情報を埋めようとする。
+        """
+        return {name.upper(): rule.model_dump(mode="json") for name, rule in self.rules}
 
     def _range(self, from_ms: int | None, to_ms: int | None, window: str | None) -> tuple[int, int]:
+        """期間を決める。**片側だけの指定を黙って捨てない。**
+
+        捨てて既定の1時間に落とすと、**要求と無関係な区間の結果を
+        「成功」として返す**ことになる。次のように解く（返り値にも入れる）。
+
+        | 指定 | 解釈 |
+        |---|---|
+        | from と to | そのまま |
+        | from だけ | from 〜 現在 |
+        | to だけ | to から window ぶん遡る |
+        | どちらも無い | 現在から window ぶん遡る |
+        """
         if from_ms is not None and to_ms is not None:
             if from_ms > to_ms:
                 raise ValueError(f"範囲が逆転している: from={from_ms} > to={to_ms}")
             return from_ms, to_ms
+        if from_ms is not None:
+            end = self.clock.now_ms()
+            if from_ms > end:
+                raise ValueError(f"from が未来: from={from_ms}")
+            return from_ms, end
         matched = WINDOW_PATTERN.match(window or "1h")
         if matched is None:
             raise ValueError(f"window の書式が不正: {window!r}（例: 30m, 6h, 7d）")
@@ -372,15 +386,18 @@ class ToolRegistry:
         return end - int(matched.group(1)) * _WINDOW_UNITS[matched.group(2)], end
 
     def _choose_agg(self, requested: str | None, span_ms: int) -> Aggregation:
-        """**生の時系列をそのまま渡さない**（FR-504）。点数から粒度を決める。"""
+        """点数が上限に収まるいちばん細かい粒度を選ぶ。
+
+        **候補に生は入らない**（2.2）。いちばん細かくても1分バケットである。
+        要求より粗くはするが細かくはしない（決定記録 0009 §2.4 と同じ）。
+        """
         order = [
-            (Aggregation.RAW, 2_500),
-            (Aggregation.MINUTE, 60_000),
-            (Aggregation.FIVE_MINUTES, 300_000),
-            (Aggregation.HOUR, 3_600_000),
+            (Aggregation.MINUTE, MINUTE_MS),
+            (Aggregation.FIVE_MINUTES, 5 * MINUTE_MS),
+            (Aggregation.HOUR, 60 * MINUTE_MS),
         ]
         start = 0
-        if requested is not None:
+        if requested is not None and requested != Aggregation.RAW.value:
             wanted = Aggregation(requested)
             start = next(i for i, (agg, _) in enumerate(order) if agg is wanted)
         for agg, step in order[start:]:
