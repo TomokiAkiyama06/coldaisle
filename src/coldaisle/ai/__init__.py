@@ -16,13 +16,17 @@ from coldaisle.ai.provider import (
     UnavailableProvider,
 )
 from coldaisle.ai.provider import from_env as provider_from_env
+from coldaisle.ai.tools import DEFINITIONS, ToolRegistry, as_data
 
 __all__ = [
+    "DEFINITIONS",
     "AiSettings",
     "ChatMessage",
     "ChatResult",
     "OpenAiCompatibleProvider",
     "Provider",
+    "ToolRegistry",
     "UnavailableProvider",
+    "as_data",
     "provider_from_env",
 ]
