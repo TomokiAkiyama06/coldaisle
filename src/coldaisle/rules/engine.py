@@ -44,6 +44,12 @@ class RuleState:
     """連続回数（FR-402 用）。"""
     resumed_ms: int | None = None
     """無音から復帰した時刻（FR-401 用）。"""
+    severity: str = "warning"
+    """このアラートの重大度。**解除したあとに DB から引けない**ので持っておく。
+
+    引こうとすると、行は既に `resolved` になっていて未解決の検索に掛からず、
+    既定値に落ちる。critical の解除が warning の経路へ流れることになる。
+    """
 
 
 @dataclass(frozen=True)
@@ -110,6 +116,7 @@ class Engine:
             state.since_ms = alert.started_ms
             state.alert_id = alert.id
             state.firing = alert.state.value == "firing"
+            state.severity = alert.severity.value
             self._advance(alert.started_ms)
 
     def begin(self, at_ms: int) -> None:
@@ -341,11 +348,6 @@ class Engine:
 
     # ------------------------------------------------------------------ 状態機械
 
-    def _severity(self, rule_id: str, metric: str | None) -> str:
-        """保存済みの行から重大度を引く。設定と履歴で食い違わせない。"""
-        alert = self.store.active_alert(rule_id, metric)
-        return alert.severity.value if alert is not None else "warning"
-
     def _advance(self, proposed_ms: int) -> int:
         """評価時刻を進める。**巻き戻さない**（決定記録 0012 §2.2）。"""
         self._now_ms = max(self._now_ms, proposed_ms)
@@ -374,11 +376,13 @@ class Engine:
             state.since_ms = existing.started_ms
             state.alert_id = existing.id
             state.firing = existing.state.value == "firing"
+            state.severity = existing.severity.value
             if state.firing:
                 return []
             return self._continue(rule_id, metric, value, fire_after_s)
         state.since_ms = now
         state.firing = False
+        state.severity = severity
         state.alert_id = self.store.open_alert(
             rule_id=rule_id,
             severity=severity,
@@ -416,9 +420,7 @@ class Engine:
             "アラートが発火した",
             extra={logs.FIELDS_KEY: {"rule": rule_id, "metric": metric, "value": value}},
         )
-        return [
-            Transition(rule_id, metric, "firing", value, detail, self._severity(rule_id, metric))
-        ]
+        return [Transition(rule_id, metric, "firing", value, detail, state.severity)]
 
     def _end(self, rule_id: str, metric: str | None) -> list[Transition]:
         state = self._state(rule_id, metric)
@@ -426,6 +428,7 @@ class Engine:
             return []
         now = self._now_ms
         was_firing = state.firing
+        severity = state.severity  # 解除するとDBから引けなくなる。先に控える
         if was_firing:
             self.store.resolve_alert(state.alert_id, resolved_ms=now)
             LOGGER.info(
@@ -440,6 +443,4 @@ class Engine:
         state.resumed_ms = None
         if not was_firing:
             return []
-        return [
-            Transition(rule_id, metric, "resolved", None, None, self._severity(rule_id, metric))
-        ]
+        return [Transition(rule_id, metric, "resolved", None, None, severity)]

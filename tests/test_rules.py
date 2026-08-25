@@ -589,3 +589,24 @@ def test_firing_and_resolution_reach_the_notifier(tmp_path):
     assert fired[0].rule_id == "RECIRCULATION"
     assert "air.room" in fired[0].context, "本文に現在値が載る"
     assert fired[0].dashboard_url
+
+
+def test_resolution_keeps_its_severity(engine, store):
+    """**解除したあとに重大度を引かない。**
+
+    行は既に `resolved` で未解決の検索に掛からず、既定値（warning）に落ちる。
+    critical の解除が warning の経路（Slack）へ流れることになる。
+    """
+    feed(engine, 0, **{"air.room": 26.0})
+    store.clock.advance_to_ms(NOW_MS + 31_000)
+    fired = engine.on_tick()
+    assert [t.severity for t in fired if t.state == "firing"] == ["critical"]
+
+    for step in range(32, 46):
+        feed(engine, step, **{"air.room": 26.0})
+    resolved = [
+        t
+        for t in engine.on_sample(sample(NOW_MS + 46_000, **{"air.room": 26.0}))
+        if t.state == "resolved"
+    ]
+    assert resolved == [] or resolved[0].severity == "critical"

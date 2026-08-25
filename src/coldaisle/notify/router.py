@@ -62,12 +62,23 @@ class Router:
             self._worker = threading.Thread(target=self._run, daemon=True)
             self._worker.start()
 
-    def stop(self, *, timeout_s: float = 5.0) -> None:
-        """送信し切ってから止める。**送る前に落とさない。**"""
+    def stop(self, *, timeout_s: float = 30.0) -> None:
+        """送信し切ってから止める。**送る前に落とさない。**
+
+        宛先1つあたり最大10秒かかり、宛先は順に処理する。短い待ちで諦めて
+        参照を捨てると、**最後の critical を積んだままプロセスが終わる。**
+        送り切れなかった場合はスレッドを手放さず、記録して知らせる。
+        """
         if self._worker is None:
             return
         self._queue.put(None)
         self._worker.join(timeout=timeout_s)
+        if self._worker.is_alive():  # pragma: no cover - 宛先が長時間詰まったとき
+            LOGGER.error(
+                "通知を送り切れないまま停止しようとしている",
+                extra={logs.FIELDS_KEY: {"pending": self._queue.qsize()}},
+            )
+            return
         self._worker = None
 
     def notify(self, notification: Notification) -> bool:
@@ -92,9 +103,13 @@ class Router:
         key = (notification.rule_id, notification.metric)
         now = self.clock.now_ms()
         if notification.state == "resolved":
-            # **解除は必ず送る。** 送らないと、鳴りっぱなしと区別できない
-            self._last_sent_ms.pop(key, None)
-            return self._passes_night_policy(notification, now)
+            # **発火を届けたなら、解除も必ず届ける。** 連投の抑制も夜間の方針も
+            # 通さない。送らないと、受け取った側は鳴りっぱなしだと思い続ける。
+            #
+            # 逆に、発火を送っていない（夜間に抑制した warning など）なら
+            # 解除も送らない。知らせていないものの「解除」を夜中に鳴らすのは、
+            # 夜間の方針（決定記録 0001 D-04）が避けようとしていることそのもの。
+            return self._last_sent_ms.pop(key, None) is not None
         last = self._last_sent_ms.get(key)
         if last is not None and (now - last) / 1000 < self.config.repeat_after_s:
             return False
@@ -107,6 +122,7 @@ class Router:
         """夜間は critical だけにする（閾値が確定するまで。決定記録 0001 D-04）。
 
         **誤警報が睡眠を削るほうが、通知が遅れるより実害が大きい。**
+        解除には適用しない（上記）。
         """
         if notification.severity is AlertSeverity.CRITICAL:
             return True

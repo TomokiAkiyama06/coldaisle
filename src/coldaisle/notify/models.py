@@ -33,8 +33,18 @@ class NightPolicy(BaseModel):
     「通知が信用されなくなる」より深刻な実害である。
     """
 
+    @property
+    def zone(self) -> ZoneInfo:
+        """**読み込み時に検証済み。** 綴り違いをここで初めて知ることにしない。
+
+        遅らせると、最初の warning の遷移で例外になる。その例外は取り込み側で
+        「1サンプルの破棄」として記録され、**そのアラートは二度と通知されない**
+        （発火の遷移はもう出ないため）。
+        """
+        return ZoneInfo(self.timezone)
+
     def is_night(self, at_ms: int) -> bool:
-        hour = datetime.fromtimestamp(at_ms / 1000, tz=ZoneInfo(self.timezone)).hour
+        hour = datetime.fromtimestamp(at_ms / 1000, tz=self.zone).hour
         if self.start_hour == self.end_hour:
             return False
         if self.start_hour < self.end_hour:
@@ -59,6 +69,10 @@ class NotifyConfig(BaseModel):
         if not isinstance(loaded, dict):
             raise ValueError(f"通知の設定が辞書ではない: {path}")
         config = cls.model_validate(loaded)
+        try:
+            _ = config.night.zone  # 綴り違いは起動時に落とす
+        except Exception as error:
+            raise ValueError(f"タイムゾーンが不正: {config.night.timezone!r}") from error
         missing = set(AlertSeverity) - set(config.routing)
         if missing:
             # 宛先の書き漏らしは「その重大度だけ届かない」として静かに通る

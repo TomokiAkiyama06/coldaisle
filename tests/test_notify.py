@@ -287,3 +287,61 @@ def test_no_secrets_in_the_config_file():
     assert "hooks.slack.com" not in text
     assert "Bearer" not in text
     assert "COLDAISLE_SLACK_WEBHOOK" in text, "どこから読むかは書いてある"
+
+
+# ---------------------------------------------------------------- レビュー指摘の退行防止
+
+
+def test_resolution_is_sent_at_night_when_the_firing_was_sent(config):
+    """**昼に発火し、夜に解除**しても届く。
+
+    夜間の抑制を解除にも当てると、受け取った側は**鳴りっぱなしだと思い続ける。**
+    """
+    slack = Recorder()
+    clock = SimulatedClock(NOON_MS)
+    sender = router(config, clock, slack=slack)
+    assert sender.notify(notification(severity="warning")) is True
+
+    clock.advance_to_ms(NIGHT_MS)  # 22時を過ぎた
+    assert sender.notify(notification(state="resolved", severity="warning")) is True
+    assert [item.state for item in slack.sent] == ["firing", "resolved"]
+
+
+def test_resolution_is_not_sent_when_the_firing_was_suppressed(config):
+    """知らせていないものの「解除」を夜中に鳴らさない。
+
+    夜間の方針（決定記録 0001 D-04）が避けようとしていることそのものになる。
+    """
+    slack = Recorder()
+    sender = router(config, SimulatedClock(NIGHT_MS), slack=slack)
+    assert sender.notify(notification(severity="warning")) is False
+    assert sender.notify(notification(state="resolved", severity="warning")) is False
+    assert slack.sent == []
+
+
+def test_critical_resolution_reaches_line(config):
+    """**解除の重大度が落ちない。** critical の解除が Slack へ流れてはいけない。"""
+    line, slack = Recorder("line"), Recorder("slack")
+    sender = router(config, SimulatedClock(NOON_MS), line=line, slack=slack)
+    sender.notify(notification(severity="critical", rule_id="SENSOR_FAULT"))
+    sender.notify(notification(severity="critical", rule_id="SENSOR_FAULT", state="resolved"))
+
+    assert [item.state for item in line.sent] == ["firing", "resolved"]
+    assert slack.sent == []
+
+
+def test_invalid_timezone_fails_at_load(tmp_path):
+    """綴り違いを最初の warning まで持ち越さない。
+
+    持ち越すと、その例外は取り込み側で「1サンプルの破棄」として記録され、
+    **そのアラートは二度と通知されない**（発火の遷移はもう出ないため）。
+    """
+    text = (
+        Path(NOTIFY_PATH)
+        .read_text(encoding="utf-8")
+        .replace('timezone: "Asia/Tokyo"', 'timezone: "Asia/Tokyoo"')
+    )
+    path = tmp_path / "notify.yaml"
+    path.write_text(text, encoding="utf-8")
+    with pytest.raises(ValueError, match="タイムゾーン"):
+        NotifyConfig.from_yaml(path)
