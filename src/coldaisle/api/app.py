@@ -21,8 +21,6 @@ from pathlib import Path
 from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
 from fastapi.staticfiles import StaticFiles
 
-from coldaisle.api import derived as derived_values
-from coldaisle.api.metrics_meta import MetricCatalog
 from coldaisle.api.models import (
     AlertsResponse,
     HealthResponse,
@@ -36,6 +34,7 @@ from coldaisle.api.models import (
 )
 from coldaisle.channels import EVENT_METRICS
 from coldaisle.clock import Clock, WallClock
+from coldaisle.metrics import MetricCatalog, compute_derived
 from coldaisle.store import Aggregation, Quality, QualityRules, SqliteStore
 from coldaisle.store.db import FIVE_MINUTES_MS, HOUR_MS, MINUTE_MS
 from coldaisle.store.models import LatestReading, validate_metric
@@ -186,7 +185,7 @@ def create_app(config: Config | None = None, *, clock: Clock | None = None) -> F
                 )
                 for metric, reading in sorted(readings.items())
             },
-            derived=derived_values.compute(readings, catalog),
+            derived=compute_derived(readings, catalog),
             stale=_is_stale(readings),
         )
 

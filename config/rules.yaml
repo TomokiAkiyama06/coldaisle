@@ -1,0 +1,98 @@
+# ルールエンジンの定義（FR-401〜409 / #18）
+#
+# ############################################################################
+# **閾値はすべて暫定値です。**
+#
+# 実機到着後、無負荷・軽負荷・フルロードのベースライン測定（#19）を経て
+# 確定します。それまでの発火は「この値で鳴る」ことの確認であって、
+# 「この値が危険」という意味ではありません。
+#
+# 変更したら決定記録に残してください（安全性に関わる判断は人間の承認が要る。
+# AGENTS.md「迷ったら」）。
+# ############################################################################
+#
+# 共通の項目
+#   enabled       : false にすると評価しない
+#   severity      : info | warning | critical
+#   fire_after_s  : 条件が続いたら発火するまでの秒数（0 なら即時）
+#   threshold     : 発火の閾値
+#   clear         : 解除の閾値。**発火と別に持つ**（ヒステリシス。要件 §6.4）
+#                   閾値ちょうどを往復するデータでフラッピングしないため
+
+rules:
+  # FR-401: 30秒以上サンプルが来ない。取り込み・ケーブル・デバイスのどれかが死んでいる
+  sensor_fault:
+    enabled: true
+    severity: critical
+    silence_s: 30.0
+    fire_after_s: 0.0
+    clear_s: 10.0 # 再開してこの秒数だけ届き続けたら解除する
+
+  # FR-402: 特定メトリクスが連続で null / suspect。センサー1本の故障
+  sensor_missing:
+    enabled: true
+    severity: warning
+    consecutive: 5
+    clear_consecutive: 3 # 正常値がこれだけ続いたら解除
+
+  # FR-403: 起動バナーの ROM が前回と違う。プローブの差し替え・入れ替わり
+  probe_changed:
+    enabled: true
+    severity: info
+
+  # FR-404: 排気の再循環。自分の排気を吸っている
+  recirculation:
+    enabled: true
+    severity: warning
+    metric: d.intake_rise
+    threshold: 5.0
+    clear: 4.0
+    fire_after_s: 300.0
+
+  # FR-405: GPU 吸気温が高い
+  intake_high:
+    enabled: true
+    severity: warning
+    metric: air.gpu_intake
+    threshold: 40.0
+    clear: 38.0
+    fire_after_s: 120.0
+
+  # FR-406: 風量低下。GPU が空気に与える熱が増えている
+  airflow_degraded:
+    enabled: true
+    severity: warning
+    metric: d.gpu_delta
+    threshold: 20.0
+    clear: 18.0
+    fire_after_s: 300.0
+
+  # FR-407: 急上昇。何かが急に起きている（critical）
+  rapid_rise:
+    enabled: true
+    severity: critical
+    metric: air.gpu_intake
+    slope_window_s: 120.0
+    threshold: 5.0 # ℃/分
+    clear: 3.0
+    fire_after_s: 0.0
+
+  # FR-408: 室温が高い。エアコンや外気の問題
+  room_high:
+    enabled: true
+    severity: warning
+    metric: air.room
+    threshold: 30.0
+    clear: 28.0
+    fire_after_s: 600.0
+
+  # FR-409: 湿度の逸脱。低湿は静電気、高湿は結露。どちらも高額GPUの実害要因
+  humidity_out_of_range:
+    enabled: true
+    severity: warning
+    metric: air.room_humidity
+    low: 20.0
+    low_clear: 23.0
+    high: 70.0
+    high_clear: 67.0
+    fire_after_s: 600.0

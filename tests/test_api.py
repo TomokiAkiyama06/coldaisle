@@ -16,9 +16,9 @@ from coldaisle.api.app import (
     parse_window,
     stream_state,
 )
-from coldaisle.api.metrics_meta import MetricCatalog
 from coldaisle.api.models import LatestResponse
 from coldaisle.clock import SimulatedClock
+from coldaisle.metrics import MetricCatalog
 from coldaisle.store import Aggregation, DeviceRecord, Quality, Reading, Sample, SqliteStore
 from coldaisle.store.rollup import rollup_minutes
 from conftest import CONFIG_DIR, QUALITY_RULES_PATH

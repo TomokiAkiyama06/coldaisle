@@ -12,7 +12,9 @@ from __future__ import annotations
 
 import argparse
 import logging
+import queue
 import signal
+import threading
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -26,6 +28,8 @@ from coldaisle.ingest.mock import MockSource, load_scenarios
 from coldaisle.ingest.normalize import Normalizer
 from coldaisle.ingest.protocol import RawHello, RawMessage, RawSample, Source
 from coldaisle.ingest.replay import ReplaySource
+from coldaisle.metrics import MetricCatalog
+from coldaisle.rules import Engine, RuleSet, Transition
 from coldaisle.store import DeviceRecord, QualityRules, SensorRecord, SqliteStore
 
 LOGGER = logging.getLogger("coldaisle.ingest")
@@ -37,6 +41,8 @@ DEFAULT_DB = Path("var/coldaisle.db")
 DEFAULT_SCENARIOS = Path("config/scenarios.yaml")
 DEFAULT_QUALITY_RULES = Path("config/quality.yaml")
 DEFAULT_CALIBRATION = Path("config/calibration.json")
+DEFAULT_RULES = Path("config/rules.yaml")
+DEFAULT_METRICS = Path("config/metrics.yaml")
 
 
 @dataclass
@@ -52,6 +58,8 @@ class Stats:
     """`seq` の飛びの合計（FR-105）。"""
     restarts: int = 0
     """`up` の巻き戻りの回数（FR-106）。"""
+    alerts_fired: int = 0
+    """発火したアラートの数（FR-401〜409）。"""
     unknown_channels: set[str] = field(default_factory=set)
 
     def as_fields(self) -> dict[str, object]:
@@ -62,6 +70,7 @@ class Stats:
             "discarded": self.discarded,
             "dropped_samples": self.dropped_samples,
             "restarts": self.restarts,
+            "alerts_fired": self.alerts_fired,
             "unknown_channels": sorted(self.unknown_channels),
         }
 
@@ -76,11 +85,15 @@ class Daemon:
         store: SqliteStore,
         normalizer: Normalizer,
         source_name: str = "unknown",
+        engine: Engine | None = None,
+        tick_s: float = 1.0,
     ) -> None:
         self._source = source
         self._store = store
         self._normalizer = normalizer
         self._source_name = source_name
+        self._engine = engine
+        self._tick_s = tick_s
         self._stop = False
         self._device_id: str | None = None
         self.stats = Stats()
@@ -107,6 +120,16 @@ class Daemon:
         self._stop = True
 
     def run(self, *, max_samples: int | None = None) -> Stats:
+        """取り込みループ。
+
+        ソースは**別スレッド**で読む。同じスレッドで読むと `stream()` の待機中は
+        何もできず、**サンプルが来ないこと自体を検出できない**（FR-401 の無音は
+        30秒サンプルが無いことで判定する）。待ち受けに時間切れを設け、
+        空振りのたびに時刻ベースのルールを評価する。
+
+        DB を触るのはこのスレッドだけ。読み取りスレッドはソースを回すだけにする
+        （接続はスレッド間で共有しない。決定記録 0004 §2.8）。
+        """
         LOGGER.info(
             "取り込みを開始する",
             extra={logs.FIELDS_KEY: {"max_samples": max_samples, "source": self._source_name}},
@@ -115,22 +138,59 @@ class Daemon:
         self._store.set_system_state(
             INGEST_SOURCE_KEY, self._source_name, at_ms=self._normalizer.clock.now_ms()
         )
-        for message in self._source.stream():
+
+        # 受信時刻を**受け取った瞬間に**確定して一緒に運ぶ（決定 D-05）。
+        # 処理時刻で付けると、追いつくまでの間に進んだぶんだけずれる
+        inbox: queue.Queue[tuple[int, RawMessage] | None] = queue.Queue(maxsize=64)
+        reader = threading.Thread(target=self._read_into, args=(inbox,), daemon=True)
+        reader.start()
+        while True:
             if self._stop:
                 LOGGER.info("停止要求を受けた")
                 break
-            self._handle(message)
+            try:
+                received = inbox.get(timeout=self._tick_s)
+            except queue.Empty:
+                self._tick()
+                continue
+            if received is None:
+                break  # ソースが尽きた
+            self._handle(*received)
             if max_samples is not None and self.stats.samples >= max_samples:
                 break
         LOGGER.info("取り込みを終了する", extra={logs.FIELDS_KEY: self.stats.as_fields()})
         return self.stats
 
-    def _handle(self, message: RawMessage) -> None:
+    def _read_into(self, inbox: queue.Queue[tuple[int, RawMessage] | None]) -> None:
+        """ソースを回して詰めるだけのスレッド。**DB には触らない。**"""
+        try:
+            for message in self._source.stream():
+                if self._stop:
+                    break
+                inbox.put((self._source.clock.now_ms(), message))
+        except Exception:
+            LOGGER.warning("ソースの読み取りが落ちた", exc_info=True)
+        finally:
+            inbox.put(None)
+
+    def _tick(self) -> None:
+        """サンプルが来ないときの評価。無音の検出（FR-401）はここで動く。"""
+        if self._engine is None:
+            return
+        try:
+            self._record(self._engine.on_tick())
+        except Exception:
+            LOGGER.warning("ルールの評価に失敗した", exc_info=True)
+
+    def _record(self, transitions: list[Transition]) -> None:
+        self.stats.alerts_fired += sum(1 for t in transitions if t.state == "firing")
+
+    def _handle(self, received_ms: int, message: RawMessage) -> None:
         try:
             if isinstance(message, RawHello):
                 self._on_hello(message)
             else:
-                self._on_sample(message)
+                self._on_sample(message, received_ms)
         except Exception:
             self.stats.discarded += 1
             LOGGER.warning(
@@ -186,9 +246,11 @@ class Daemon:
                 "プローブの ROM が前回と違う",
                 extra={logs.FIELDS_KEY: {"device": hello.dev, "channels": changed}},
             )
+            if self._engine is not None:
+                self._record(self._engine.on_probe_changed(changed))
 
-    def _on_sample(self, raw: RawSample) -> None:
-        normalized = self._normalizer.normalize(raw)
+    def _on_sample(self, raw: RawSample, received_ms: int) -> None:
+        normalized = self._normalizer.normalize(raw, ts_ms=received_ms)
         self._store.insert_sample(normalized.sample)
         self.stats.samples += 1
         self.stats.readings += len(normalized.sample.readings)
@@ -213,6 +275,8 @@ class Daemon:
             )
         if normalized.out_of_order:
             LOGGER.warning("seq が進んでいない", extra={logs.FIELDS_KEY: {"seq": raw.seq}})
+        if self._engine is not None:
+            self._record(self._engine.on_sample(normalized.sample))
         if normalized.unknown_channels:
             new = set(normalized.unknown_channels) - self.stats.unknown_channels
             self.stats.unknown_channels |= set(normalized.unknown_channels)
@@ -240,6 +304,10 @@ class Config:
     """一括投入。待たずに流す（`--speed` は無視される）。"""
     timezone: str = "Asia/Tokyo"
     """CSV の時刻の解釈に使う。ファイルにオフセットが無いため（決定記録 0008 §2.8）。"""
+    rules: Path = DEFAULT_RULES
+    metrics: Path = DEFAULT_METRICS
+    tick_s: float = 1.0
+    """サンプルが来ないときに時刻ベースのルールを評価する間隔。"""
 
 
 def build(config: Config) -> Daemon:
@@ -253,11 +321,22 @@ def build(config: Config) -> Daemon:
     calibration = _calibration_for(config)
     config.db.parent.mkdir(parents=True, exist_ok=True)
     clock: Clock = source.clock
+    store = SqliteStore(config.db, rules=rules, clock=clock)
     return Daemon(
         source=source,
-        store=SqliteStore(config.db, rules=rules, clock=clock),
+        store=store,
         normalizer=Normalizer(rules=rules, calibration=calibration, clock=clock),
         source_name=config.source,
+        # ルールエンジンは**取り込みと同じプロセス・同じ時計**で動かす。
+        # 継続時間の判定が実時間に依存すると、圧縮再生で検証できない
+        # （決定記録 0007 §2.11 / §5 未決3）
+        engine=Engine(
+            rules=RuleSet.from_yaml(config.rules),
+            catalog=MetricCatalog.from_yaml(config.metrics),
+            store=store,
+            clock=clock,
+        ),
+        tick_s=config.tick_s,
     )
 
 
@@ -308,6 +387,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--scenarios", type=Path, default=DEFAULT_SCENARIOS)
     parser.add_argument("--quality-rules", type=Path, default=DEFAULT_QUALITY_RULES)
     parser.add_argument("--calibration", type=Path, default=DEFAULT_CALIBRATION)
+    parser.add_argument("--rules", type=Path, default=DEFAULT_RULES)
+    parser.add_argument("--metrics", type=Path, default=DEFAULT_METRICS)
     parser.add_argument(
         "--csv", type=Path, default=None, help="replay の入力（ファイル/ディレクトリ）"
     )
@@ -330,6 +411,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             scenarios=args.scenarios,
             quality_rules=args.quality_rules,
             calibration=args.calibration,
+            rules=args.rules,
+            metrics=args.metrics,
             csv=args.csv,
             bulk=args.bulk,
             timezone=args.timezone,

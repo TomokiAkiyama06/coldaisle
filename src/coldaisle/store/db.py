@@ -413,6 +413,65 @@ class SqliteStore:
         ).fetchone()
         return None if row is None else str(row["value"])
 
+    def open_alert(
+        self,
+        *,
+        rule_id: str,
+        severity: str,
+        metric: str | None,
+        started_ms: int,
+        threshold: float | None,
+        trigger_value: float | None,
+        detail: str | None = None,
+    ) -> int:
+        """条件が成立した時点で行を作る（`pending`）。行 id を返す。
+
+        **発火してから作らない。** 「条件はいつ成立し、継続時間の要件をいつ
+        満たしたか」を後から検証できるようにするため（決定記録 0002 §2.9）。
+        閾値を実測で見直す #19 で、この差分が判断材料になる。
+        """
+        with self.transaction():
+            cursor = self._conn.execute(
+                "INSERT INTO alerts "
+                "(rule_id, severity, state, metric, started_ms, trigger_value, threshold, detail) "
+                "VALUES (?, ?, 'pending', ?, ?, ?, ?, ?)",
+                (rule_id, severity, metric, started_ms, trigger_value, threshold, detail),
+            )
+        return int(cursor.lastrowid or 0)
+
+    def fire_alert(
+        self,
+        alert_id: int,
+        *,
+        fired_ms: int,
+        trigger_value: float | None,
+        detail: str | None = None,
+    ) -> None:
+        """継続時間の条件を満たしたので発火させる。"""
+        with self.transaction():
+            self._conn.execute(
+                "UPDATE alerts SET state = 'firing', fired_ms = ?, trigger_value = ?, "
+                "detail = COALESCE(?, detail) WHERE id = ?",
+                (fired_ms, trigger_value, detail, alert_id),
+            )
+
+    def resolve_alert(self, alert_id: int, *, resolved_ms: int) -> None:
+        """条件が解けた。**行は消さない。** 履歴として残す。"""
+        with self.transaction():
+            self._conn.execute(
+                "UPDATE alerts SET state = 'resolved', resolved_ms = ? WHERE id = ?",
+                (resolved_ms, alert_id),
+            )
+
+    def delete_alert(self, alert_id: int) -> None:
+        """発火せずに条件が解けた `pending` を取り消す。
+
+        継続時間に届かなかった揺らぎまで履歴に残すと、**本物の発火が埋もれる。**
+        「いつ成立したか」を残す意味があるのは、発火まで至った事象だけである。
+        """
+        with self.transaction():
+            self._conn.execute("DELETE FROM alerts WHERE id = ? AND state = 'pending'", (alert_id,))
+
     def alerts(
         self,
         *,
