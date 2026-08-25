@@ -265,15 +265,54 @@ def test_sensor_fault_does_not_resolve_on_the_first_sample(engine, store):
     assert alerts(store, "SENSOR_FAULT")[0].state == "resolved", "届き続けたら解除"
 
 
-def test_probe_changed_is_recorded_as_a_point_event(engine, store):
-    """FR-403。継続する状態ではないので、発火と同時に解決する。"""
-    transitions = engine.on_probe_changed(["rear_exhaust"])
+def test_probe_changed_stays_firing_until_the_record_matches(engine, store):
+    """FR-403。**「変わった瞬間」ではなく「不一致が続いている」で判定する。**
+
+    意味するのは「較正のオフセットが、いま間違ったプローブに対応している」
+    という、人が直すまで続く状態である。差し替えたまま較正し直さなければ、
+    以降のすべての測定値に誤ったオフセットが乗り続ける。
+
+    点の出来事として即座に解決すると、**静かに間違ったまま運用が続くのを
+    防ぐための仕組みが、まさに静かに消える。**
+    """
+    recorded = {"rear_exhaust": "28FFFFFFFFFFFF05", "front_intake": "28FFFFFFFFFFFF01"}
+    observed = {"rear_exhaust": "28FFFFFFFFFFFF09", "front_intake": "28FFFFFFFFFFFF01"}
+
+    engine.on_hello(observed, recorded)
     fired = alerts(store, "PROBE_CHANGED")
     assert len(fired) == 1
-    assert fired[0].state == "resolved"
-    assert fired[0].fired_ms is not None
+    assert fired[0].state == "firing", "発生中のアラートとして残る"
     assert "rear_exhaust" in (fired[0].detail or "")
-    assert [t.state for t in transitions] == ["firing"], "通知（#20）は遷移を見る"
+
+    # 再起動しても同じ不一致で行を作り直さない
+    engine.on_hello(observed, recorded)
+    assert len(alerts(store, "PROBE_CHANGED")) == 1
+
+    # 人が較正をやり直して記録を更新した → 次の起動バナーで一致
+    engine.on_hello(observed, observed)
+    resolved = alerts(store, "PROBE_CHANGED")
+    assert len(resolved) == 1
+    assert resolved[0].state == "resolved"
+
+
+def test_probe_changed_is_silent_for_a_new_channel(engine, store):
+    """記録に無いチャネルは不一致ではない。増設で鳴らさない。"""
+    engine.on_hello({"rear_exhaust": "28FFFFFFFFFFFF05"}, {})
+    assert alerts(store, "PROBE_CHANGED") == []
+
+
+def test_active_alert_is_adopted_after_a_restart(store, rule_set):
+    """デーモンを再起動しても、1つの故障が履歴に並ばない。"""
+    catalog = MetricCatalog.from_yaml(METRICS_PATH)
+    recorded = {"rear_exhaust": "28FFFFFFFFFFFF05"}
+    observed = {"rear_exhaust": "28FFFFFFFFFFFF09"}
+
+    first = Engine(rules=rule_set, catalog=catalog, store=store, clock=store.clock)
+    first.on_hello(observed, recorded)
+    second = Engine(rules=rule_set, catalog=catalog, store=store, clock=store.clock)
+    second.on_hello(observed, recorded)
+
+    assert len(alerts(store, "PROBE_CHANGED")) == 1
 
 
 def test_rapid_rise_uses_the_stored_slope(engine, store):

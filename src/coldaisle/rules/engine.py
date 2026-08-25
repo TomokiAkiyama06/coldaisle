@@ -72,11 +72,12 @@ class Engine:
     _states: dict[tuple[str, str | None], RuleState] = field(default_factory=dict)
     _last_sample_ms: int | None = field(default=None)
     _now_ms: int = field(default=0)
-    """評価中の時刻。**サンプルの受信時刻**で評価する（`on_sample`）。
+    """評価中の時刻（決定記録 0012 §2.2）。**巻き戻さない。**
 
-    処理が追いつくまでの間に時計が進むため、`clock.now_ms()` で評価すると
-    一括再生で継続時間の条件が一瞬で満たされてしまう。
-    時計を読むのはサンプルが無いとき（`on_tick`）だけ。
+    駆動する時刻は2つの出どころを持つ。サンプルがあるときはその受信時刻、
+    無いときは `clock.now_ms()`。どちらも同じ「ホスト受信時刻」の軸だが、
+    処理が滞ると前者が後者より古くなる。単調にしておかないと、
+    経過時間が負になって継続時間の判定が動かなくなる。
     """
 
     def __post_init__(self) -> None:
@@ -94,7 +95,7 @@ class Engine:
 
         **サンプルの受信時刻で評価する。** 時計は処理より先に進んでいることがある。
         """
-        self._now_ms = sample.ts_ms
+        self._advance(sample.ts_ms)
         self._last_sample_ms = sample.ts_ms
         readings = {reading.metric: reading for reading in sample.readings}
         values: dict[str, float | None] = {
@@ -123,34 +124,44 @@ class Engine:
         **無音の検出（FR-401）はこれが無いと動かない。** サンプルが来た時だけ
         評価すると、止まったことに気づけるのは再開した後になる。
         """
-        self._now_ms = self.clock.now_ms()
+        self._advance(self.clock.now_ms())
         return self._evaluate_silence()
 
-    def on_probe_changed(self, channels: list[str]) -> list[Transition]:
-        """起動バナーの ROM が前回と違った（FR-403）。
+    def on_hello(
+        self, observed: dict[str, str | None], recorded: dict[str, str | None]
+    ) -> list[Transition]:
+        """起動バナーを受けた（FR-403）。**ROM の不一致は「続く状態」として扱う。**
 
-        **点の出来事なので、発火と同時に解決する。** 継続する状態ではないため、
-        発生中のアラートとして残し続けると、いつまでも赤いままになる。
-        記録は履歴として残り、通知（#20）は遷移を見て送る。
+        `PROBE_CHANGED` が意味するのは「ROM が変わった瞬間」ではない。
+        **「較正のオフセットが、いま間違ったプローブに対応している」という、
+        人が直すまで続く状態**である。差し替えたまま較正し直さなければ、
+        以降のすべての測定値に誤ったオフセットが乗り続ける。ΔT の判定
+        （`d.intake_rise` など）は数℃の話なので、実害になる。
+
+        点の出来事として即座に解決すると、**静かに間違ったまま運用が続くのを
+        防ぐための仕組みが、まさに静かに消える。**
+
+        解除は、人が較正をやり直して記録側の ROM を更新し、
+        次の起動バナーで一致したとき。
         """
         rule = self.rules.probe_changed
-        if not rule.enabled or not channels:
+        if not rule.enabled:
             return []
-        now = self._now_ms = self.clock.now_ms()
-        detail = f"ROM が前回と違うチャネル: {', '.join(channels)}"
-        alert_id = self.store.open_alert(
-            rule_id="PROBE_CHANGED",
-            severity=rule.severity.value,
-            metric=None,
-            started_ms=now,
-            threshold=None,
-            trigger_value=None,
-            detail=detail,
+        self._advance(self.clock.now_ms())
+        changed = sorted(
+            channel
+            for channel, rom in observed.items()
+            if channel in recorded and recorded[channel] != rom
         )
-        self.store.fire_alert(alert_id, fired_ms=now, trigger_value=None)
-        self.store.resolve_alert(alert_id, resolved_ms=now)
-        LOGGER.warning("PROBE_CHANGED", extra={logs.FIELDS_KEY: {"channels": channels}})
-        return [Transition("PROBE_CHANGED", None, "firing", None, detail)]
+        state = self._state("PROBE_CHANGED", None)
+        if changed:
+            if state.since_ms is None:
+                detail = f"較正が対応していないプローブ: {', '.join(changed)}"
+                return self._begin(
+                    "PROBE_CHANGED", None, rule.severity.value, None, None, 0.0, detail=detail
+                )
+            return []
+        return self._end("PROBE_CHANGED", None) if state.since_ms is not None else []
 
     # ------------------------------------------------------------------ 各ルール
 
@@ -287,6 +298,11 @@ class Engine:
 
     # ------------------------------------------------------------------ 状態機械
 
+    def _advance(self, proposed_ms: int) -> int:
+        """評価時刻を進める。**巻き戻さない**（決定記録 0012 §2.2）。"""
+        self._now_ms = max(self._now_ms, proposed_ms)
+        return self._now_ms
+
     def _state(self, rule_id: str, metric: str | None) -> RuleState:
         return self._states.setdefault((rule_id, metric), RuleState())
 
@@ -303,6 +319,16 @@ class Engine:
     ) -> list[Transition]:
         now = self._now_ms
         state = self._state(rule_id, metric)
+        existing = self.store.active_alert(rule_id, metric)
+        if existing is not None:
+            # デーモンを再起動しても同じ事象で行を作り直さない。
+            # 作り直すと、1つの故障が再起動の回数だけ履歴に並ぶ
+            state.since_ms = existing.started_ms
+            state.alert_id = existing.id
+            state.firing = existing.state.value == "firing"
+            if state.firing:
+                return []
+            return self._continue(rule_id, metric, value, fire_after_s)
         state.since_ms = now
         state.firing = False
         state.alert_id = self.store.open_alert(

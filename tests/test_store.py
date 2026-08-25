@@ -144,19 +144,28 @@ def test_check_constraint_rejects_unknown_quality(store):
         store.connection.execute("INSERT INTO readings VALUES ('air.room', 1000, 26.0, 'okay')")
 
 
-def test_duplicate_timestamp_is_rejected(store):
-    """同じ `(metric, ts_ms)` を黙って上書きしない。上書きすると観測が1つ消える。"""
-    store.insert_sample(sample(1_000, **{"air.room": 26.0}))
-    with pytest.raises(sqlite3.IntegrityError):
-        store.insert_sample(sample(1_000, **{"air.room": 26.5}))
+def test_duplicate_timestamp_is_ignored_not_overwritten(store):
+    """同じ `(metric, ts_ms)` は**無視する**（決定記録 0012 §2.4）。
+
+    上書きすると、同じ時刻に2つの値が観測された事実が消える。
+    落とすと、同じ CSV を2回再生しただけで取り込みが止まる。
+    無視して**件数を返す**ことで、呼び出し側が黙って捨てずに数えられる。
+    """
+    assert store.insert_sample(sample(1_000, **{"air.room": 26.0})) == 1
+    assert store.insert_sample(sample(1_000, **{"air.room": 26.5})) == 0, "書いた行数は0"
+    assert store.series("air.room", 0, 2_000)[0].value == 26.0, "先に入った値が残る"
 
 
-def test_failed_insert_writes_nothing(store):
-    """サンプル単位で原子的。半分だけ書かれた時刻があると横串が壊れる。"""
+def test_partial_duplicate_writes_the_new_rows(store):
+    """重複した列だけを飛ばし、新しい列は書く。
+
+    1メトリクスの重複でサンプル全体を捨てると、他の観測まで失う。
+    """
     store.insert_sample(sample(1_000, **{"air.room": 26.0}))
-    with pytest.raises(sqlite3.IntegrityError):
-        store.insert_sample(sample(1_000, **{"air.gpu_intake": 28.0, "air.room": 26.5}))
-    assert store.series("air.gpu_intake", 0, 2_000) == ()
+    written = store.insert_sample(sample(1_000, **{"air.room": 26.5, "air.gpu_intake": 28.0}))
+    assert written == 1
+    assert store.series("air.gpu_intake", 0, 2_000)[0].value == 28.0
+    assert store.series("air.room", 0, 2_000)[0].value == 26.0
 
 
 def test_insert_empty_sample_is_a_noop(store):

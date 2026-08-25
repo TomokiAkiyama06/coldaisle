@@ -16,12 +16,14 @@ import queue
 import signal
 import threading
 from collections.abc import Sequence
+from contextlib import suppress
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import FrameType
 from zoneinfo import ZoneInfo
 
 from coldaisle import logs
+from coldaisle.channels import QUEUE_DROPS_METRIC
 from coldaisle.clock import Clock
 from coldaisle.ingest.calibration import Calibration
 from coldaisle.ingest.mock import MockSource, load_scenarios
@@ -30,9 +32,23 @@ from coldaisle.ingest.protocol import RawHello, RawMessage, RawSample, Source
 from coldaisle.ingest.replay import ReplaySource
 from coldaisle.metrics import MetricCatalog
 from coldaisle.rules import Engine, RuleSet, Transition
-from coldaisle.store import DeviceRecord, QualityRules, SensorRecord, SqliteStore
+from coldaisle.store import (
+    DeviceRecord,
+    Quality,
+    QualityRules,
+    Reading,
+    Sample,
+    SensorRecord,
+    SqliteStore,
+)
 
 LOGGER = logging.getLogger("coldaisle.ingest")
+
+MAX_LOGGED_DUPLICATES = 10
+"""重複を個別に記録する上限。総数は終了時にまとめて出す。"""
+
+QUEUE_SIZE = 256
+"""読み取りスレッドとの待ち行列。**有界にする**（常駐メモリ。NFR-05）。"""
 
 INGEST_SOURCE_KEY = "sys.ingest_source"
 """`system_state` のキー。API の `/health` がソース種別として返す（FR-305）。"""
@@ -60,6 +76,10 @@ class Stats:
     """`up` の巻き戻りの回数（FR-106）。"""
     alerts_fired: int = 0
     """発火したアラートの数（FR-401〜409）。"""
+    duplicates: int = 0
+    """既にある `(metric, ts_ms)` として無視された行数（決定記録 0012 §2.4）。"""
+    queue_drops: int = 0
+    """待ち行列が溢れて捨てたメッセージ数（決定記録 0012 §2.3）。"""
     unknown_channels: set[str] = field(default_factory=set)
 
     def as_fields(self) -> dict[str, object]:
@@ -71,6 +91,8 @@ class Stats:
             "dropped_samples": self.dropped_samples,
             "restarts": self.restarts,
             "alerts_fired": self.alerts_fired,
+            "duplicates": self.duplicates,
+            "queue_drops": self.queue_drops,
             "unknown_channels": sorted(self.unknown_channels),
         }
 
@@ -96,6 +118,7 @@ class Daemon:
         self._tick_s = tick_s
         self._stop = False
         self._device_id: str | None = None
+        self._reported_drops = 0
         self.stats = Stats()
 
     @property
@@ -141,7 +164,7 @@ class Daemon:
 
         # 受信時刻を**受け取った瞬間に**確定して一緒に運ぶ（決定 D-05）。
         # 処理時刻で付けると、追いつくまでの間に進んだぶんだけずれる
-        inbox: queue.Queue[tuple[int, RawMessage] | None] = queue.Queue(maxsize=64)
+        inbox: queue.Queue[tuple[int, RawMessage] | None] = queue.Queue(maxsize=QUEUE_SIZE)
         reader = threading.Thread(target=self._read_into, args=(inbox,), daemon=True)
         reader.start()
         while True:
@@ -167,11 +190,41 @@ class Daemon:
             for message in self._source.stream():
                 if self._stop:
                     break
-                inbox.put((self._source.clock.now_ms(), message))
+                received = (self._source.clock.now_ms(), message)
+                try:
+                    inbox.put_nowait(received)
+                except queue.Full:
+                    # **捨てるのは古い側**（決定記録 0004 §2.6 と同じ理由。
+                    # 監視で欠けてはならないのは直近）。黙って捨てない
+                    with suppress(queue.Empty):
+                        inbox.get_nowait()
+                    self.stats.queue_drops += 1
+                    inbox.put(received)
         except Exception:
             LOGGER.warning("ソースの読み取りが落ちた", exc_info=True)
         finally:
             inbox.put(None)
+
+    def _with_queue_drops(self, sample: Sample) -> Sample:
+        """待ち行列の取りこぼしを、次のサンプルに乗せて記録する。
+
+        捨てるのは読み取りスレッドだが、**DB を触るのは取り込みスレッドだけ**
+        （決定記録 0004 §2.8）。API は別プロセスなので、`/api/v1/health` から
+        見えるようにするには残すしかない（決定記録 0012 §2.3）。
+        """
+        pending = self.stats.queue_drops - self._reported_drops
+        if pending <= 0:
+            return sample
+        self._reported_drops = self.stats.queue_drops
+        LOGGER.warning("待ち行列が溢れた", extra={logs.FIELDS_KEY: {"dropped": pending}})
+        return sample.model_copy(
+            update={
+                "readings": (
+                    *sample.readings,
+                    Reading(metric=QUEUE_DROPS_METRIC, value=float(pending), quality=Quality.OK),
+                )
+            }
+        )
 
     def _tick(self) -> None:
         """サンプルが来ないときの評価。無音の検出（FR-401）はここで動く。"""
@@ -202,7 +255,13 @@ class Daemon:
     def _on_hello(self, hello: RawHello) -> None:
         at_ms = self._normalizer.clock.now_ms()
         self._device_id = hello.dev
-        previous = {sensor.channel: sensor.rom for sensor in self._store.sensors_for(hello.dev)}
+        recorded = {sensor.channel: sensor.rom for sensor in self._store.sensors_for(hello.dev)}
+        observed = {channel: sensor.rom for channel, sensor in hello.sensors.items()}
+        mismatched = sorted(
+            channel
+            for channel, rom in observed.items()
+            if channel in recorded and recorded[channel] != rom
+        )
         sensors = [
             SensorRecord(
                 channel=channel,
@@ -213,6 +272,9 @@ class Daemon:
             )
             for channel, sensor in hello.sensors.items()
         ]
+        # **不一致のあいだは記録側を上書きしない。** 記録された ROM は「較正が
+        # 対応している構成」であり、人が較正をやり直すまでの基準になる
+        # （FR-403 / 決定記録 0012 §2.6）
         self._store.record_hello(
             DeviceRecord(
                 device_id=hello.dev,
@@ -222,6 +284,7 @@ class Daemon:
             ),
             sensors,
             at_ms=at_ms,
+            replace_sensors=not mismatched,
         )
         self.stats.hellos += 1
         LOGGER.info(
@@ -235,25 +298,35 @@ class Daemon:
                 }
             },
         )
-        changed = sorted(
-            sensor.channel
-            for sensor in sensors
-            if sensor.channel in previous and previous[sensor.channel] != sensor.rom
-        )
-        if changed:
-            # 位置の入れ替えか差し替え。アラート化（FR-403）は #14
+        if mismatched:
             LOGGER.warning(
-                "プローブの ROM が前回と違う",
-                extra={logs.FIELDS_KEY: {"device": hello.dev, "channels": changed}},
+                "プローブの ROM が記録と違う（較正のやり直しが要る）",
+                extra={logs.FIELDS_KEY: {"device": hello.dev, "channels": mismatched}},
             )
-            if self._engine is not None:
-                self._record(self._engine.on_probe_changed(changed))
+        if self._engine is not None:
+            self._record(self._engine.on_hello(observed, recorded))
 
     def _on_sample(self, raw: RawSample, received_ms: int) -> None:
         normalized = self._normalizer.normalize(raw, ts_ms=received_ms)
-        self._store.insert_sample(normalized.sample)
+        stored_sample = self._with_queue_drops(normalized.sample)
+        expected = len(stored_sample.readings)
+        written = self._store.insert_sample(stored_sample)
         self.stats.samples += 1
-        self.stats.readings += len(normalized.sample.readings)
+        self.stats.readings += written
+        if written < expected:
+            # 同じ `(metric, ts_ms)` は無視される（決定記録 0012 §2.4）。
+            # **黙って捨てない。** 同じ CSV の二重再生などで起こる
+            self.stats.duplicates += expected - written
+            if self.stats.duplicates <= MAX_LOGGED_DUPLICATES:
+                LOGGER.warning(
+                    "既にある時刻の行を書かなかった",
+                    extra={
+                        logs.FIELDS_KEY: {
+                            "ts_ms": normalized.sample.ts_ms,
+                            "ignored": expected - written,
+                        }
+                    },
+                )
 
         if normalized.dropped_samples:
             self.stats.dropped_samples += normalized.dropped_samples

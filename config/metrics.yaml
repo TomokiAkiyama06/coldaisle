@@ -16,6 +16,7 @@ metrics:
   air.rear_exhaust:    {unit: "C",   label: "リア排気"}
   sys.dropped_samples: {unit: "count", label: "取りこぼし"}
   sys.device_restarts: {unit: "count", label: "デバイス再起動"}
+  sys.queue_drops:     {unit: "count", label: "取り込みの取りこぼし（待ち行列）"}
 
 # 派生値。**保存せず、参照のたびに計算する**（決定記録 0002 §2.2）。
 # すべて「引き算1つ」で表せるため、式ではなく被減数と減数で書く。

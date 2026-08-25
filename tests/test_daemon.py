@@ -183,12 +183,11 @@ def test_probe_change_is_reported(tmp_path, rules, log_stream):
 # ---------------------------------------------------------------- 継続性（受入基準）
 
 
-def test_broken_samples_are_discarded_and_the_count_is_logged(tmp_path, rules, log_stream):
-    """受入基準: 不正な行を混ぜても継続し、破棄件数がログに出る。
+def test_duplicate_rows_are_counted_and_logged(tmp_path, rules, log_stream):
+    """**黙って捨てない**（決定記録 0012 §2.4）。
 
-    ここでの「不正」は保存に失敗するサンプル。時計が止まったまま2件届くと
-    `(metric, ts_ms)` が衝突する（決定記録 0004 §2.7 で上書きを拒否した）。
-    リプレイの取り違えや時計の不具合で実際に起こりうる。
+    時計が止まったまま2件届くと `(metric, ts_ms)` が衝突する。無視した行は
+    数えて記録しないと、完全な取り込みと取りこぼした取り込みを区別できない。
     """
     messages = [sample(index, 1_000 + index * 2_500) for index in range(4)]
     daemon = daemon_with(messages, rules, tmp_path, stamps=[0, 2_500, 2_500, 5_000])
@@ -198,13 +197,13 @@ def test_broken_samples_are_discarded_and_the_count_is_logged(tmp_path, rules, l
     finally:
         daemon.store.close()
 
-    assert stats.discarded == 1
-    assert stats.samples == 3, "残りは処理を続けている"
+    assert stats.duplicates == 2, "衝突した2列（room / gpu_intake）"
+    assert stats.samples == 4, "**取り込みは止まらない**"
+    assert stats.discarded == 0, "重複は失敗ではない"
     assert stored == 3
     summary = log_lines(log_stream)[-1]
-    assert summary["msg"] == "取り込みを終了する"
-    assert summary["discarded"] == 1
-    assert any(line["msg"] == "サンプルを破棄して継続する" for line in log_lines(log_stream))
+    assert summary["duplicates"] == 2
+    assert any(line["msg"] == "既にある時刻の行を書かなかった" for line in log_lines(log_stream))
 
 
 def test_non_finite_values_do_not_cost_the_whole_sample(tmp_path, rules, log_stream):
@@ -227,17 +226,20 @@ def test_non_finite_values_do_not_cost_the_whole_sample(tmp_path, rules, log_str
 
 
 def test_one_bad_sample_does_not_stop_the_process(tmp_path, rules, log_stream):
-    """**1サンプルのパース失敗でプロセスを落とさない**（AGENTS.md）。"""
-    messages = [sample(index, 1_000 + index * 2_500) for index in range(10)]
-    stamps = [index * 2_500 for index in range(10)]
-    stamps[4] = stamps[3]  # 4件目だけが衝突する
-    daemon = daemon_with(messages, rules, tmp_path, stamps=stamps)
+    """**1サンプルのパース失敗でプロセスを落とさない**（AGENTS.md）。
+
+    ここでの失敗は正規化で落ちるもの（メトリクス名が規約に合わないなど）。
+    重複は失敗ではなく、無視して続ける（決定記録 0012 §2.4）。
+    """
+    messages: list = [sample(index, 1_000 + index * 2_500) for index in range(10)]
+    messages[4] = RawSample(seq=4, up=11_000, channels={"room_temp": float("inf")})
+    daemon = daemon_with(messages, rules, tmp_path)
     try:
         stats = daemon.run()
     finally:
         daemon.store.close()
-    assert stats.samples == 9
-    assert stats.discarded == 1
+    assert stats.samples == 10, "非有限値は値だけ落として行は残る（決定記録 0007 §2.3）"
+    assert stats.discarded == 0
 
 
 def test_sequence_gap_and_restart_are_logged_and_stored(tmp_path, rules, log_stream):
@@ -426,3 +428,32 @@ def test_unknown_device_reads_as_none(tmp_path, rules):
         assert daemon.store.sensors_for("never-seen") == ()
     finally:
         daemon.store.close()
+
+
+def test_queue_drops_are_recorded_for_the_api(tmp_path, rules, log_stream):
+    """待ち行列が溢れたら**残して数える**（決定記録 0012 §2.3）。
+
+    捨てるのは読み取りスレッドだが、DB を触るのは取り込みスレッドだけ。
+    API は別プロセスなので、`/api/v1/health` から見えるようにするには残すしかない。
+    """
+    from coldaisle.channels import QUEUE_DROPS_METRIC
+
+    daemon = daemon_with(
+        [sample(index, 1_000 + index * 2_500) for index in range(3)], rules, tmp_path
+    )
+    daemon.stats.queue_drops = 4  # 読み取りスレッドが4件捨てた状態を作る
+    try:
+        daemon.run()
+        drops = daemon.store.series(QUEUE_DROPS_METRIC, 0, 100_000)
+    finally:
+        daemon.store.close()
+
+    assert [point.value for point in drops] == [4.0], "1回だけ、まとめて記録する"
+    assert any(line["msg"] == "待ち行列が溢れた" for line in log_lines(log_stream))
+
+
+def test_queue_drops_do_not_affect_freshness(tmp_path, rules):
+    """事象メトリクスなので鮮度の判定に混ぜない（決定記録 0009 §2.12）。"""
+    from coldaisle.channels import EVENT_METRICS, QUEUE_DROPS_METRIC
+
+    assert QUEUE_DROPS_METRIC in EVENT_METRICS

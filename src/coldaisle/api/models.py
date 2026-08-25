@@ -129,6 +129,11 @@ class HealthResponse(BaseModel):
     metrics: int
     missing_ratio_1h: float | None
     """直近1時間の欠測率。1分ロールアップから出す（決定記録 0002 §2.8）。"""
+    queue_drops_1h: int = 0
+    """直近1時間に取り込みの待ち行列が捨てたメッセージ数（決定記録 0012 §2.3）。
+
+    **0 でない日は原因を追う。** 保存が取り込みに追いつけていない。
+    """
 
 
 class StreamMessage(BaseModel):

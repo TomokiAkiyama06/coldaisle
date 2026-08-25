@@ -32,7 +32,7 @@ from coldaisle.api.models import (
     StreamMessage,
     iso,
 )
-from coldaisle.channels import EVENT_METRICS
+from coldaisle.channels import EVENT_METRICS, QUEUE_DROPS_METRIC
 from coldaisle.clock import Clock, WallClock
 from coldaisle.metrics import MetricCatalog, compute_derived
 from coldaisle.store import Aggregation, Quality, QualityRules, SqliteStore
@@ -308,6 +308,7 @@ def create_app(config: Config | None = None, *, clock: Clock | None = None) -> F
             stale=stale,
             metrics=len(readings),
             missing_ratio_1h=_missing_ratio_1h(store, now_ms),
+            queue_drops_1h=_queue_drops_1h(store, now_ms),
         )
 
     @app.websocket("/api/v1/stream")
@@ -371,6 +372,17 @@ def create_app(config: Config | None = None, *, clock: Clock | None = None) -> F
         if from_ms > to_ms:
             raise HTTPException(422, f"範囲が逆転している: from={from_ms} > to={to_ms}")
         return from_ms, to_ms
+
+    def _queue_drops_1h(store: SqliteStore, now_ms: int) -> int:
+        """直近1時間に待ち行列が捨てたメッセージ数（決定記録 0012 §2.3）。
+
+        **0 でない日は原因を追う。** 取り込みが保存に追いつけていない。
+        """
+        row = store.connection.execute(
+            "SELECT SUM(value) FROM readings WHERE metric = ? AND ts_ms >= ?",
+            (QUEUE_DROPS_METRIC, now_ms - HOUR_MS),
+        ).fetchone()
+        return 0 if row is None or row[0] is None else int(row[0])
 
     def _missing_ratio_1h(store: SqliteStore, now_ms: int) -> float | None:
         row = store.connection.execute(

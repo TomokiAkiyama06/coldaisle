@@ -81,4 +81,4 @@ docs/decisions/NNNN-<slug>.md      例: 0002-metric-naming.md
 | [0009](0009-read-api.md) | 読み取り API の契約 | Proposed |
 | [0010](0010-csv-replay.md) | CSV 再生の規約 | Proposed |
 | [0011](0011-dashboard.md) | 開発用ダッシュボードの方針 | Proposed |
-| [0012](0012-rule-engine.md) | ルールエンジンの規約 | Proposed |
+| [0012](0012-rule-engine.md) | ルールエンジンの規約 | FINAL |
