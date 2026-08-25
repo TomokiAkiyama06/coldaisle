@@ -163,6 +163,22 @@ def test_a_drifting_level_is_not_a_step(store, rules, catalog):
     assert evaluate(store, rules, catalog, day=DAY) == []
 
 
+def test_a_gap_inside_the_tail_breaks_the_continuity(store, rules, catalog):
+    """**欠けた日を詰めない**（#39 のレビュー指摘）。
+
+    値のある日だけを並べると、間に取り込みが止まった日があっても「3日続いた」
+    と書ける。**続いたことを見ていないのに続いたと書く**のが、この資料で
+    いちばんやってはいけないこと。
+    """
+    for offset in range(-13, 1):
+        if offset == -1:
+            continue  # 取り込みが止まった日
+        gap = 22.0 if offset >= -3 else 12.0
+        day_of(store, "gpu.0.core", day_offset=offset, mean=70.0)
+        day_of(store, "gpu.0.hotspot", day_offset=offset, mean=70.0 + gap)
+    assert evaluate(store, rules, catalog, day=DAY) == []
+
+
 def test_missing_days_do_not_produce_a_step(store, rules, catalog):
     """**データが無い日を「変わっていない」とみなさない。**"""
     day_of(store, "gpu.0.core", day_offset=0, mean=70.0)
@@ -222,6 +238,43 @@ def test_two_criticals_are_not_enough(store, rules, catalog):
     assert evaluate(store, rules, catalog, day=DAY) == []
 
 
+def test_every_qualifying_rule_is_reported(store, rules, catalog):
+    """**1件目で打ち切らない**（#39 のレビュー指摘）。
+
+    打ち切ると、残りは翌日以降も出てこない（1件目が条件を満たし続けるかぎり
+    毎日そちらが選ばれ、資料は重複として捨てられるため）。
+    """
+    for offset in (-4, -2, 0):
+        critical(store, "SENSOR_FAULT", day_offset=offset)
+        critical(store, "HUMIDITY_OUT_OF_RANGE", day_offset=offset)
+    findings = evaluate(store, rules, catalog, day=DAY)
+    assert sorted(finding.rule_id for finding in findings) == [
+        "HUMIDITY_OUT_OF_RANGE",
+        "SENSOR_FAULT",
+    ]
+
+
+def test_a_continuing_pattern_keeps_the_same_case_name(store, rules, catalog):
+    """**窓の端で案件の名前を決めない**（#39 のレビュー指摘）。
+
+    古い発火が窓から出るたびに起点が動くと、同じ状況の資料が毎朝できる。
+    途切れずに続いている一連の発火の最初を起点にする。
+    """
+    for offset in range(-10, 1, 2):  # 2日おきに発火し続けている
+        critical(store, "SENSOR_FAULT", day_offset=offset)
+    today = evaluate(store, rules, catalog, day=DAY)[0]
+    yesterday = evaluate(store, rules, catalog, day=DAY - timedelta(days=1))[0]
+    assert today.slug == yesterday.slug
+    assert today.started == DAY - timedelta(days=10)
+
+
+def test_a_new_outbreak_after_a_quiet_spell_is_a_new_case(store, rules, catalog):
+    """**間隔が窓を超えたら別の案件。** 半年前の同じルールと1つにまとめない。"""
+    for offset in (-60, -4, -2, 0):
+        critical(store, "SENSOR_FAULT", day_offset=offset)
+    assert evaluate(store, rules, catalog, day=DAY)[0].started == DAY - timedelta(days=4)
+
+
 def test_criticals_outside_the_window_are_not_counted(store, rules, catalog):
     for offset in (-30, -20, 0):
         critical(store, "SENSOR_FAULT", day_offset=offset)
@@ -238,6 +291,39 @@ def test_the_packet_has_the_five_sections(store, rules, catalog):
     text = build_packet(store, finding, rules, catalog, day=DAY)
     for section in ("## 問題", "## 測定値", "## 経過", "## 試行済み", "## 争点"):
         assert section in text
+
+
+def test_a_critical_packet_also_has_five_sections(store, rules, catalog):
+    """**メトリクスが1つに定まらなくても5節そろえる**（#39 のレビュー指摘）。
+
+    経過は発火の回数、測定値は発火したアラートが指していたメトリクスから作る。
+    """
+    for offset in (-4, -2, 0):
+        critical(store, "SENSOR_FAULT", day_offset=offset)
+    store.insert_samples(
+        [
+            Sample(
+                ts_ms=DAY_START_MS + DAY_MS - 5_000,
+                readings=(Reading(metric="air.room", value=26.0, quality=Quality.OK),),
+            )
+        ]
+    )
+    finding = evaluate(store, rules, catalog, day=DAY)[0]
+    text = build_packet(store, finding, rules, catalog, day=DAY)
+    for section in ("## 問題", "## 測定値", "## 経過", "## 試行済み", "## 争点"):
+        assert section in text
+    assert "SENSOR_FAULT の発火回数" in text
+    assert "| air.room |" in text
+
+
+def test_the_occurrence_course_shows_quiet_days_as_zero(store, rules, catalog):
+    """**間の静かな日も並べる。** 3行だけ見せると、頻度が分からない。"""
+    for offset in (-4, -2, 0):
+        critical(store, "SENSOR_FAULT", day_offset=offset)
+    finding = evaluate(store, rules, catalog, day=DAY)[0]
+    course = build_packet(store, finding, rules, catalog, day=DAY).split("## 経過")[1]
+    assert f"| {(DAY - timedelta(days=3)).isoformat()} | 0 |" in course
+    assert f"| {(DAY - timedelta(days=4)).isoformat()} | 1 |" in course
 
 
 def test_the_packet_says_it_was_not_sent(store, rules, catalog):
@@ -361,15 +447,30 @@ def test_untested_things_are_not_claimed_as_checked(store, rules, catalog):
 # ---------------------------------------------------------------- 送らない（受入基準）
 
 
-def test_the_notification_carries_the_path_not_the_contents(store, rules, catalog):
-    """**知らせるだけ。** 中身も送らない。"""
+def test_the_notification_carries_the_headline_and_the_path(store, rules, catalog):
+    """**問題の1文と場所だけ。** 測定値・経過・争点は資料に残す。
+
+    1文を載せるのは、無いと「読みに行くかどうか」を判断できないため
+    （アラートの通知が値を載せるのと同じ理由。決定記録 0013）。
+    """
     finding = Finding(
         trigger="step_change", problem="段差がある", question="争点", started=DAY, metric="air.room"
     )
     notification = as_notification(finding, Path("var/escalations/x.md"), dashboard_url="http://x/")
+    assert "段差がある" in notification.body
     assert "var/escalations/x.md" in notification.body
-    assert "送信していません" in notification.body
     assert "争点" not in notification.body
+
+
+def test_the_notification_says_precisely_what_was_not_sent():
+    """**「送信していません」だけでは足りない。** その知らせ自体が送信物である。
+
+    Slack を宛先にすれば、この文面は Slack へ届く。「何を送っていないのか」を
+    書かないと、読む側は「どこへも出ていない」と読める。
+    """
+    finding = Finding(trigger="step_change", problem="x", question="y", started=DAY)
+    body = as_notification(finding, Path("x.md"), dashboard_url="").body
+    assert "Claude へは送っていません" in body
 
 
 def test_the_same_case_is_not_written_twice(tmp_path):
@@ -384,6 +485,31 @@ def test_the_same_case_is_not_written_twice(tmp_path):
 
 def test_nothing_is_written_when_there_is_nothing_to_escalate(store, rules, catalog, tmp_path):
     assert evaluate(store, rules, catalog, day=DAY) == []
+
+
+def test_the_checks_ignore_readings_after_the_cutoff(store, rules, catalog):
+    """**あとから届いた値を「その時点で確認したこと」に書かない**（#39 のレビュー指摘）。
+
+    朝の cron は前日を対象にするが、DB には当日の値が既に入っている。
+    区切りより後の品質を混ぜると、当日の故障を前日の案件に付けてしまう。
+    """
+    with_step_change(store, before=12.0, after=22.0)
+    store.insert_samples(
+        [
+            Sample(
+                ts_ms=DAY_START_MS + DAY_MS - 5_000,  # 前日の終わり際: 正常
+                readings=(Reading(metric="air.room", value=26.0, quality=Quality.OK),),
+            ),
+            Sample(
+                ts_ms=DAY_START_MS + DAY_MS + HOUR_MS,  # 当日: 故障
+                readings=(Reading(metric="air.room", value=None, quality=Quality.MISSING),),
+            ),
+        ]
+    )
+    finding = evaluate(store, rules, catalog, day=DAY)[0]
+    checked = build_packet(store, finding, rules, catalog, day=DAY).split("## 試行済み")[1]
+    assert "air.room=missing" not in checked
+    assert "すべて ok" in checked
 
 
 # ---------------------------------------------------------------- 設定と CLI

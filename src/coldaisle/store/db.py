@@ -95,6 +95,9 @@ WITH RECURSIVE metrics(metric) AS (
 SELECT metric FROM metrics WHERE metric IS NOT NULL
 """
 
+_NO_UPPER_BOUND = 2**63 - 1
+"""`latest()` に上限を設けないときの番人。SQLite の INTEGER の上限。"""
+
 _LATEST_SQL = """
 WITH RECURSIVE metrics(metric) AS (
     SELECT MIN(metric) FROM readings
@@ -106,7 +109,9 @@ SELECT r.metric, r.ts_ms, r.value, r.quality
 FROM metrics
 JOIN readings r
   ON r.metric = metrics.metric
- AND r.ts_ms = (SELECT MAX(ts_ms) FROM readings WHERE metric = metrics.metric)
+ AND r.ts_ms = (
+       SELECT MAX(ts_ms) FROM readings WHERE metric = metrics.metric AND ts_ms <= ?
+     )
 WHERE metrics.metric IS NOT NULL
 """
 """最新値を主キーのシークだけで引く（決定記録 0004 §2.11）。
@@ -385,14 +390,22 @@ class SqliteStore:
     def latest(self, *, at_ms: int | None = None) -> dict[str, LatestReading]:
         """メトリクスごとの最新値（FR-301）。
 
+        `at_ms` は**その時点での**最新値という意味である。`at_ms` より後の行は
+        見ない。過去の日を対象にした処理（#39 の案件資料など）が、**あとから
+        届いた値を「その時点で確認したこと」として書かないため。**
+
         `at_ms` から `stale_after_ms` 以上離れた値は `stale` に落とす。
         **保存時の品質は上書きする。** 古い値を `ok` のまま返すと、
         止まった時計を正常表示する（api-contract §3 が禁じている失敗）。
 
+        省略時は上限を設けない。**時計がずれて未来の行が入った場合も返す**
+        （隠すと、ずれていることに気づけない。`age_ms` が負になる）。
+
         `v_latest` ビューは使わない。理由は `_LATEST_SQL` を参照。
         """
         now = self._clock.now_ms() if at_ms is None else at_ms
-        rows = self._conn.execute(_LATEST_SQL).fetchall()
+        bound = _NO_UPPER_BOUND if at_ms is None else at_ms
+        rows = self._conn.execute(_LATEST_SQL, (bound,)).fetchall()
         latest: dict[str, LatestReading] = {}
         for row in rows:
             age_ms = now - int(row["ts_ms"])

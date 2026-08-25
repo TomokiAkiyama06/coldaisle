@@ -37,7 +37,7 @@ from coldaisle.report import send
 from coldaisle.rules.models import RangeRule, RuleSet, ThresholdRule
 from coldaisle.store.csv_export import day_bounds_ms
 from coldaisle.store.db import Aggregation, SqliteStore
-from coldaisle.store.models import AlertSeverity, RollupPoint
+from coldaisle.store.models import AlertRecord, AlertSeverity, RollupPoint
 from coldaisle.store.quality import QualityRules
 
 LOGGER = logging.getLogger("coldaisle.escalate")
@@ -131,6 +131,10 @@ class Finding:
     """案件の起点。**同じ案件を毎日作らない**ための鍵でもある。"""
     metric: str | None = None
     rule_id: str | None = None
+    occurrences: tuple[int, ...] = ()
+    """発火時刻（`repeated_critical` 用）。**資料の経過はここから作る。**"""
+    related: tuple[str, ...] = ()
+    """関係するメトリクス（`repeated_critical` 用）。発火したアラートが指していたもの。"""
 
     @property
     def slug(self) -> str:
@@ -147,12 +151,13 @@ def evaluate(
 ) -> list[Finding]:
     """`day` の終わりまでを見て候補を返す。**判定は決定論的**（受入基準）。"""
     _, end_ms = day_bounds_ms(day, rules.zone)
-    found = [
+    single = [
         _step_change(store, rules, catalog, day=day),
         _sustained_deviation(store, rules, catalog, end_ms=end_ms),
-        _repeated_critical(store, rules, end_ms=end_ms),
     ]
-    return [finding for finding in found if finding is not None]
+    return [finding for finding in single if finding is not None] + _repeated_critical(
+        store, rules, end_ms=end_ms
+    )
 
 
 def _step_change(
@@ -173,16 +178,24 @@ def _step_change(
     series = daily_means(
         store, trigger.metric, catalog, day=day, days=rules.course_days, tz=rules.zone
     )
-    values = [(at, value) for at, value in series if value is not None]
-    if len(values) < trigger.hold_days + 2:
+    if len(series) < trigger.hold_days + 1:
         return None
-    # 直近 hold_days ぶんが「跳ねたあとの水準」で、その手前に段差があること
-    tail = values[-trigger.hold_days :]
-    before = values[: -trigger.hold_days]
-    step = tail[0][1] - before[-1][1]
+    # 直近 hold_days ぶんが「跳ねたあとの水準」で、その手前に段差があること。
+    #
+    # **欠けた日を詰めない。** 値のある日だけを並べると、間に取り込みが
+    # 止まった日があっても「3日続いた」と書ける。続いたことを見ていないのに
+    # 続いたと書くのは、この資料がいちばんやってはいけないことである
+    tail = series[-trigger.hold_days :]
+    previous = series[-trigger.hold_days - 1]
+    if previous[1] is None or any(value is None for _, value in tail):
+        return None
+    before_at, before_value = previous
+    assert before_value is not None  # 直前で確かめた（mypy 向け）
+    levels = [value for _, value in tail if value is not None]
+    step = levels[0] - before_value
     if abs(step) < trigger.delta:
         return None
-    if any(abs(value - tail[0][1]) >= trigger.delta for _, value in tail[1:]):
+    if any(abs(value - levels[0]) >= trigger.delta for value in levels[1:]):
         return None  # 跳ねたあとも動いている。段差ではなく変動
     unit = catalog.unit_for(trigger.metric) or ""
     return Finding(
@@ -190,8 +203,8 @@ def _step_change(
         metric=trigger.metric,
         started=tail[0][0],
         problem=(
-            f"{trigger.metric} が {before[-1][0].isoformat()} の {before[-1][1]:.1f}{unit} から "
-            f"{tail[0][0].isoformat()} に {tail[0][1]:.1f}{unit} へ変わり、"
+            f"{trigger.metric} が {before_at.isoformat()} の {before_value:.1f}{unit} から "
+            f"{tail[0][0].isoformat()} に {levels[0]:.1f}{unit} へ変わり、"
             f"{len(tail)} 日そのまま続いている（差 {step:+.1f}{unit}）"
         ),
         question=trigger.question,
@@ -233,37 +246,71 @@ def _sustained_deviation(
     )
 
 
-def _repeated_critical(
-    store: SqliteStore, rules: EscalationRules, *, end_ms: int
-) -> Finding | None:
-    """**同じ critical が繰り返し出る**なら、対処が効いていない。"""
+LOOKBACK_FACTOR = 4
+"""再発の起点を探すとき、窓の何倍まで遡るか。**案件の名前を安定させる**ため。"""
+
+
+def _repeated_critical(store: SqliteStore, rules: EscalationRules, *, end_ms: int) -> list[Finding]:
+    """**同じ critical が繰り返し出る**なら、対処が効いていない。
+
+    条件を満たすルールは**すべて**返す。1件目で打ち切ると、残りは翌日以降も
+    出てこない（1件目が条件を満たし続けるかぎり選ばれ続けるため）。
+    """
     trigger = rules.repeated_critical
     if not trigger.enabled:
-        return None
-    start_ms = end_ms - trigger.window_days * DAY_MS
+        return []
+    window_ms = trigger.window_days * DAY_MS
+    # 起点を探すために窓より広く読む。**窓の端だけを見ると案件の名前が毎日ずれる**
     fired = [
         record
-        for record in store.fired_alerts(start_ms=start_ms, end_ms=end_ms, limit=200)
-        if record.severity is AlertSeverity.CRITICAL
-    ]
-    counted: dict[str, list[int]] = {}
-    for record in fired:
-        counted.setdefault(record.rule_id, []).append(record.fired_ms or 0)
-    for rule_id, times in sorted(counted.items()):
-        if len(times) < trigger.min_count:
-            continue
-        first = min(times)
-        return Finding(
-            trigger="repeated_critical",
-            rule_id=rule_id,
-            started=datetime.fromtimestamp(first / 1000, tz=rules.zone).date(),
-            problem=(
-                f"{rule_id}（critical）が {trigger.window_days} 日で {len(times)} 回発火している。"
-                "対処が効いていないか、原因が別にある"
-            ),
-            question=trigger.question,
+        for record in store.fired_alerts(
+            start_ms=end_ms - window_ms * LOOKBACK_FACTOR, end_ms=end_ms, limit=1000
         )
-    return None
+        if record.severity is AlertSeverity.CRITICAL and record.fired_ms is not None
+    ]
+    grouped: dict[str, list[AlertRecord]] = {}
+    for record in fired:
+        grouped.setdefault(record.rule_id, []).append(record)
+
+    findings: list[Finding] = []
+    for rule_id, records in sorted(grouped.items()):
+        inside = [record for record in records if (record.fired_ms or 0) >= end_ms - window_ms]
+        if len(inside) < trigger.min_count:
+            continue
+        onset = _onset(records, window_ms=window_ms)
+        findings.append(
+            Finding(
+                trigger="repeated_critical",
+                rule_id=rule_id,
+                started=datetime.fromtimestamp(onset / 1000, tz=rules.zone).date(),
+                problem=(
+                    f"{rule_id}（critical）が {trigger.window_days} 日で "
+                    f"{len(inside)} 回発火している。対処が効いていないか、原因が別にある"
+                ),
+                question=trigger.question,
+                occurrences=tuple(sorted(record.fired_ms or 0 for record in inside)),
+                related=tuple(
+                    sorted({record.metric for record in inside if record.metric is not None})
+                ),
+            )
+        )
+    return findings
+
+
+def _onset(records: Sequence[AlertRecord], *, window_ms: int) -> int:
+    """**途切れずに続いている一連の発火**の最初の時刻。
+
+    窓の左端をそのまま起点にすると、古い発火が窓から出るたびに日付が動く。
+    案件の名前が毎日変わり、**同じ状況の資料が毎朝できてしまう。**
+    新しいほうから遡り、間隔が窓を超えたところで切る。
+    """
+    times = sorted(record.fired_ms or 0 for record in records)
+    onset = times[-1]
+    for earlier in reversed(times[:-1]):
+        if onset - earlier > window_ms:
+            break
+        onset = earlier
+    return onset
 
 
 # ------------------------------------------------------------------ 値の読み出し
@@ -407,9 +454,21 @@ def _measurements(
 
 
 def _related(finding: Finding, catalog: MetricCatalog) -> list[str]:
-    """案件に関係する**測定**メトリクス。派生値はその材料に展開する。"""
+    """案件に関係する**測定**メトリクス。派生値はその材料に展開する。
+
+    ルールの再発（`repeated_critical`）には対象のメトリクスが1つに定まらないので、
+    **発火したアラートが指していたもの**を使う。
+    """
     if finding.metric is None:
-        return []
+        return [
+            metric
+            for name in finding.related
+            for metric in (
+                [catalog.derived[name].minuend, catalog.derived[name].subtrahend]
+                if name in catalog.derived
+                else [name]
+            )
+        ]
     if finding.metric in catalog.derived:
         derived = catalog.derived[finding.metric]
         return [derived.minuend, derived.subtrahend]
@@ -426,13 +485,30 @@ def _course(
 ) -> list[str]:
     """経過。**日ごとの平均だけ**（生の点は載せない。受入基準）。"""
     if finding.metric is None:
-        return []
+        return _occurrence_course(finding, rules, day=day)
     series = daily_means(
         store, finding.metric, catalog, day=day, days=rules.course_days, tz=rules.zone
     )
     basis = DERIVED_BASIS if finding.metric in catalog.derived else ""
     lines = [f"## 経過（{finding.metric} の日平均）{basis}", "", "| 日 | 平均 |", "|---|---|"]
     lines += [f"| {at.isoformat()} | {_num(value)} |" for at, value in series]
+    return [*lines, ""]
+
+
+def _occurrence_course(finding: Finding, rules: EscalationRules, *, day: date) -> list[str]:
+    """発火の回数を日ごとに並べる。**メトリクスが無くても経過は書ける。**
+
+    「いつから、どのくらいの頻度で起きているか」は、値と同じくらい判断の材料になる。
+    """
+    if not finding.occurrences:
+        return []
+    counted: dict[date, int] = {}
+    for at_ms in finding.occurrences:
+        at = datetime.fromtimestamp(at_ms / 1000, tz=rules.zone).date()
+        counted[at] = counted.get(at, 0) + 1
+    days = [day - timedelta(days=offset) for offset in range(rules.course_days - 1, -1, -1)]
+    lines = [f"## 経過（{finding.rule_id} の発火回数）", "", "| 日 | 回数 |", "|---|---|"]
+    lines += [f"| {at.isoformat()} | {counted.get(at, 0)} |" for at in days if at >= min(counted)]
     return [*lines, ""]
 
 
@@ -525,7 +601,15 @@ def write_packet(text: str, finding: Finding, out_dir: Path, *, force: bool = Fa
 
 
 def as_notification(finding: Finding, path: Path, *, dashboard_url: str) -> Notification:
-    """**「資料ができた」と知らせるだけ。** 中身も送らない（受入基準）。"""
+    """**「資料ができた」と知らせる。** 載せるのは問題の1文と場所だけ。
+
+    測定値・経過・争点は資料に残す。1文を載せるのは、これが無いと
+    「読みに行くかどうか」を判断できないためで、アラートの通知が値を載せるのと
+    同じ理由である（決定記録 0013）。
+
+    **`config/escalation.yaml` の `to` に外部の宛先を書けば、この1文もそこへ届く。**
+    既定は `stdout`（ローカルのログ）のみ。
+    """
     return Notification(
         rule_id=f"エスカレーション候補 {finding.trigger}",
         severity=AlertSeverity.WARNING,
@@ -538,7 +622,8 @@ def as_notification(finding: Finding, path: Path, *, dashboard_url: str) -> Noti
         body=(
             f"{finding.problem}\n\n"
             f"案件資料: {path}\n"
-            "**送信していません。** 内容を確認してから、必要なら人が Claude へ渡してください。"
+            "**Claude へは送っていません**（coldaisle に送る手段がありません）。"
+            "資料を読んでから、必要なら人が渡してください。"
         ),
     )
 
