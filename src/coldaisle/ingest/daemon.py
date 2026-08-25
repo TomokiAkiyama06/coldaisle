@@ -28,6 +28,9 @@ from coldaisle.store import DeviceRecord, QualityRules, SensorRecord, SqliteStor
 
 LOGGER = logging.getLogger("coldaisle.ingest")
 
+INGEST_SOURCE_KEY = "sys.ingest_source"
+"""`system_state` のキー。API の `/health` がソース種別として返す（FR-305）。"""
+
 DEFAULT_DB = Path("var/coldaisle.db")
 DEFAULT_SCENARIOS = Path("config/scenarios.yaml")
 DEFAULT_QUALITY_RULES = Path("config/quality.yaml")
@@ -64,10 +67,18 @@ class Stats:
 class Daemon:
     """取り込みループ。`run()` は `stream()` が尽きるか停止要求まで戻らない。"""
 
-    def __init__(self, *, source: Source, store: SqliteStore, normalizer: Normalizer) -> None:
+    def __init__(
+        self,
+        *,
+        source: Source,
+        store: SqliteStore,
+        normalizer: Normalizer,
+        source_name: str = "unknown",
+    ) -> None:
         self._source = source
         self._store = store
         self._normalizer = normalizer
+        self._source_name = source_name
         self._stop = False
         self._device_id: str | None = None
         self.stats = Stats()
@@ -94,7 +105,14 @@ class Daemon:
         self._stop = True
 
     def run(self, *, max_samples: int | None = None) -> Stats:
-        LOGGER.info("取り込みを開始する", extra={logs.FIELDS_KEY: {"max_samples": max_samples}})
+        LOGGER.info(
+            "取り込みを開始する",
+            extra={logs.FIELDS_KEY: {"max_samples": max_samples, "source": self._source_name}},
+        )
+        # API がソース種別を答えられるようにする（FR-305）。状態は変化時だけ書く
+        self._store.set_system_state(
+            INGEST_SOURCE_KEY, self._source_name, at_ms=self._normalizer.clock.now_ms()
+        )
         for message in self._source.stream():
             if self._stop:
                 LOGGER.info("停止要求を受けた")
@@ -231,6 +249,7 @@ def build(config: Config) -> Daemon:
         source=source,
         store=SqliteStore(config.db, rules=rules, clock=clock),
         normalizer=Normalizer(rules=rules, calibration=calibration, clock=clock),
+        source_name=config.source,
     )
 
 

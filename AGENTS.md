@@ -20,8 +20,11 @@ uv run mypy src
 uv run coldaisle-daemon --source mock # 実機なしでデーモン起動
 uv run coldaisle-daemon --source mock --scenario ramp --speed 60  # 時間圧縮（下記の注意）
 uv run coldaisle-rollup             # ロールアップと保持期間の適用（1日1回）
-uv run uvicorn coldaisle.api:app --host 127.0.0.1 --port 8000
+COLDAISLE_DB=var/coldaisle.db uv run uvicorn coldaisle.api:app --host 127.0.0.1 --port 8000
 ```
+
+API の設定は環境変数（`COLDAISLE_DB` / `COLDAISLE_METRICS` / `COLDAISLE_MAX_POINTS` ほか。
+決定記録 0009 §2.9）。`uvicorn` に引数を渡せないため。
 
 **`--speed` を付けている間は API / ダッシュボードを同時に使わない。**
 圧縮再生ではホスト時刻がシナリオ時間で進むため、別プロセスから見ると

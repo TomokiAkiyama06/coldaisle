@@ -536,3 +536,20 @@ def test_cli_creates_the_database_directory(tmp_path):
         == 0
     )
     assert database.exists()
+
+
+def test_absent_minutes_are_not_filled_before_the_first_observation(store):
+    """観測を始める前まで期待値を作らない。設置前は「欠測」ではない。"""
+    from coldaisle.store import DeviceRecord
+
+    store.record_hello(DeviceRecord(device_id="dev", interval_ms=2_500), [], at_ms=0)
+    write(store, "air.room", 0, 26.0)
+    rollup_minutes(store)
+    # 10分後に別メトリクスが現れても、その手前は埋めない
+    write(store, "air.gpu_intake", 10 * MINUTE_MS, 28.0)
+    rollup_minutes(store)
+
+    rows = store.connection.execute(
+        "SELECT bucket_ms FROM readings_1m WHERE metric = 'air.gpu_intake' ORDER BY bucket_ms"
+    ).fetchall()
+    assert [row["bucket_ms"] for row in rows] == [10 * MINUTE_MS]

@@ -191,3 +191,38 @@ class SensorRecord(BaseModel):
     gpio: int | None = None
     rom: str | None = None
     resolution: int | None = None
+
+
+class AlertSeverity(StrEnum):
+    """`alerts.severity`（決定記録 0002 §2.9）。"""
+
+    INFO = "info"
+    WARNING = "warning"
+    CRITICAL = "critical"
+
+
+class AlertState(StrEnum):
+    """状態機械 `OK → PENDING → FIRING → RESOLVED`（要件 §6.4）。"""
+
+    PENDING = "pending"
+    FIRING = "firing"
+    RESOLVED = "resolved"
+
+
+class AlertRecord(BaseModel):
+    """`alerts` の1行。書き込むのはルールエンジン（#18）。"""
+
+    model_config = ConfigDict(frozen=True)
+
+    id: int
+    rule_id: str
+    severity: AlertSeverity
+    state: AlertState
+    metric: str | None = None
+    started_ms: int
+    fired_ms: int | None = None
+    resolved_ms: int | None = None
+    trigger_value: float | None = None
+    threshold: float | None = None
+    """発火時に適用されていた閾値。**当時の閾値で解釈できないと履歴が読めない**（0002 §2.9）。"""
+    detail: str | None = None

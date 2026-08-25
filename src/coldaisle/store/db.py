@@ -19,6 +19,7 @@ from types import TracebackType
 from coldaisle.clock import Clock
 from coldaisle.store import migrations
 from coldaisle.store.models import (
+    AlertRecord,
     DeviceRecord,
     LatestReading,
     Quality,
@@ -382,6 +383,60 @@ class SqliteStore:
         """
         rows = self._conn.execute(_METRICS_SQL).fetchall()
         return tuple(row["metric"] for row in rows)
+
+    def set_system_state(self, key: str, value: str, *, at_ms: int) -> bool:
+        """カテゴリ値の状態を記録する（決定記録 0002 §2.6）。書いたら True。
+
+        **変化したときだけ書く。** 同じ値を毎周期書くと、状態遷移だけを
+        記録するという設計が崩れ、行数が時間に比例して増える。
+        """
+        if self.current_state(key) == value:
+            return False
+        with self.transaction():
+            self._conn.execute(
+                "INSERT OR REPLACE INTO system_state (ts_ms, key, value) VALUES (?, ?, ?)",
+                (at_ms, key, value),
+            )
+        return True
+
+    def current_state(self, key: str) -> str | None:
+        """直近の状態。行数が少ないのでビューは設けない（決定記録 0002 §2.12）。"""
+        row = self._conn.execute(
+            "SELECT value FROM system_state WHERE key = ? ORDER BY ts_ms DESC LIMIT 1", (key,)
+        ).fetchone()
+        return None if row is None else str(row["value"])
+
+    def alerts(
+        self,
+        *,
+        state: str | None = None,
+        start_ms: int | None = None,
+        end_ms: int | None = None,
+        limit: int = 100,
+    ) -> tuple[AlertRecord, ...]:
+        """アラート一覧（FR-304）。書き込むのはルールエンジン（#18）。
+
+        新しい順に返す。監視の一覧で先に見たいのは直近だからである。
+        """
+        clauses: list[str] = []
+        params: list[object] = []
+        if state is not None:
+            clauses.append("state = ?")
+            params.append(state)
+        if start_ms is not None:
+            clauses.append("started_ms >= ?")
+            params.append(start_ms)
+        if end_ms is not None:
+            clauses.append("started_ms < ?")
+            params.append(end_ms)
+        where = f"WHERE {' AND '.join(clauses)} " if clauses else ""
+        rows = self._conn.execute(
+            "SELECT id, rule_id, severity, state, metric, started_ms, fired_ms, resolved_ms, "
+            f"trigger_value, threshold, detail FROM alerts {where}"
+            "ORDER BY started_ms DESC, id DESC LIMIT ?",
+            (*params, limit),
+        ).fetchall()
+        return tuple(AlertRecord.model_validate(dict(row)) for row in rows)
 
     def series(
         self, metric: str, start_ms: int, end_ms: int, *, limit: int | None = None

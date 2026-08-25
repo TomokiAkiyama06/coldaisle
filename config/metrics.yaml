@@ -1,0 +1,48 @@
+# メトリクスの単位・表示名と派生値の定義（FR-301 / #9）
+#
+# 決定記録 0004 §5 の未決1（置き場所）をここに確定した。API の `unit` と
+# ダッシュボードの表示名がこのファイルだけを見る。
+#
+# **メトリクス名は変えない。** 一度公開した名前の変更は禁止（決定記録 0002 §2.1）。
+# 表示名は変えてよい。表示名は人間向けであり、機械はメトリクス名で参照する。
+
+metrics:
+  air.room:            {unit: "C",   label: "室温"}
+  air.room_humidity:   {unit: "%RH", label: "室内湿度"}
+  air.front_intake:    {unit: "C",   label: "前面吸気"}
+  air.gpu_intake:      {unit: "C",   label: "GPU吸気"}
+  air.gpu_exhaust:     {unit: "C",   label: "GPU排気"}
+  air.top_exhaust:     {unit: "C",   label: "トップ排気"}
+  air.rear_exhaust:    {unit: "C",   label: "リア排気"}
+  sys.dropped_samples: {unit: "count", label: "取りこぼし"}
+  sys.device_restarts: {unit: "count", label: "デバイス再起動"}
+
+# 派生値。**保存せず、参照のたびに計算する**（決定記録 0002 §2.2）。
+# すべて「引き算1つ」で表せるため、式ではなく被減数と減数で書く。
+# 任意の式を書けるようにすると、設定ファイルが小さな言語になる。
+derived:
+  d.intake_rise:
+    unit: "C"
+    label: "吸気上昇（再循環の指標）"
+    minuend: air.front_intake
+    subtrahend: air.room
+  d.gpu_preheat:
+    unit: "C"
+    label: "ケース内予熱"
+    minuend: air.gpu_intake
+    subtrahend: air.front_intake
+  d.gpu_delta:
+    unit: "C"
+    label: "GPUが与えた熱"
+    minuend: air.gpu_exhaust
+    subtrahend: air.gpu_intake
+  d.top_rise:
+    unit: "C"
+    label: "トップ排気の回り込み"
+    minuend: air.top_exhaust
+    subtrahend: air.gpu_exhaust
+  d.gpu_internal_delta:
+    unit: "C"
+    label: "GPU内部の温度差"
+    minuend: gpu.0.hotspot
+    subtrahend: gpu.0.core
