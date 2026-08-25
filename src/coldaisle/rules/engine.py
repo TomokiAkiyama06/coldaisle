@@ -82,11 +82,41 @@ class Engine:
 
     def __post_init__(self) -> None:
         known = set(self.catalog.metrics) | set(self.catalog.derived)
-        for name in ("recirculation", "intake_high", "airflow_degraded", "rapid_rise", "room_high"):
-            metric = getattr(self.rules, name).metric
+        for name, rule in self.rules:
+            metric = getattr(rule, "metric", None)
+            if metric is None:
+                continue
             if metric not in known:
                 # 綴り違いは「一度も成立しないルール」として静かに通る。読み込み時に落とす
                 raise ValueError(f"{name}: 未知のメトリクス {metric!r}（config/metrics.yaml）")
+        self._hydrate()
+
+    def _hydrate(self) -> None:
+        """DB に残っている未解決のアラートを状態として取り込む。
+
+        **これが無いと、再起動したデーモンは古いアラートを解除できない。**
+        条件が解けていても `firing` のまま永久に残り、逆にまだ異常なら
+        同じ事象の行がもう1つ増える。
+        """
+        for alert in self.store.alerts(limit=1_000):
+            if alert.state.value not in ("pending", "firing"):
+                continue
+            state = self._state(alert.rule_id, alert.metric)
+            state.since_ms = alert.started_ms
+            state.alert_id = alert.id
+            state.firing = alert.state.value == "firing"
+            self._advance(alert.started_ms)
+
+    def begin(self, at_ms: int) -> None:
+        """監視を始めた時刻を基準にする。
+
+        **これが無いと、起動時からデバイスが無い場合に `SENSOR_FAULT` が
+        永久に鳴らない。** 最初のサンプルが来るまで無音を測る基準が無いため。
+        「いつから届いていないか」は「いつから見ているか」で決まる。
+        """
+        self._advance(at_ms)
+        if self._last_sample_ms is None:
+            self._last_sample_ms = at_ms
 
     # ------------------------------------------------------------------ 入口
 
@@ -128,7 +158,11 @@ class Engine:
         return self._evaluate_silence()
 
     def on_hello(
-        self, observed: dict[str, str | None], recorded: dict[str, str | None]
+        self,
+        observed: dict[str, str | None],
+        recorded: dict[str, str | None],
+        *,
+        at_ms: int | None = None,
     ) -> list[Transition]:
         """起動バナーを受けた（FR-403）。**ROM の不一致は「続く状態」として扱う。**
 
@@ -147,7 +181,7 @@ class Engine:
         rule = self.rules.probe_changed
         if not rule.enabled:
             return []
-        self._advance(self.clock.now_ms())
+        self._advance(self.clock.now_ms() if at_ms is None else at_ms)
         changed = sorted(
             channel
             for channel, rom in observed.items()
@@ -167,7 +201,11 @@ class Engine:
 
     def _evaluate_silence(self) -> list[Transition]:
         rule = self.rules.sensor_fault
-        if not rule.enabled or self._last_sample_ms is None:
+        if not rule.enabled:
+            return []
+        if self._last_sample_ms is None:
+            # 監視を始めた時刻が基準（`begin`）。呼ばれていなければここで立てる
+            self._last_sample_ms = self._now_ms
             return []
         now = self._now_ms
         state = self._state("SENSOR_FAULT", None)

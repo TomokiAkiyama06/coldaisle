@@ -19,9 +19,9 @@ import pytest
 
 from coldaisle import logs
 from coldaisle.clock import SimulatedClock
+from coldaisle.daemon import Config, Daemon, build, build_parser, main
 from coldaisle.ingest import Normalizer
 from coldaisle.ingest.calibration import Calibration
-from coldaisle.ingest.daemon import Config, Daemon, build, build_parser, main
 from coldaisle.ingest.protocol import RawHello, RawMessage, RawSample, RawSensor
 from coldaisle.store import SqliteStore
 from conftest import CALIBRATION_PATH, QUALITY_RULES_PATH, SCENARIOS_PATH
@@ -345,7 +345,7 @@ def test_sigterm_shuts_down_gracefully(tmp_path):
         [
             sys.executable,
             "-m",
-            "coldaisle.ingest.daemon",
+            "coldaisle.daemon",
             "--source=mock",
             "--scenario=idle",
             "--speed=100",
@@ -457,3 +457,60 @@ def test_queue_drops_do_not_affect_freshness(tmp_path, rules):
     from coldaisle.channels import EVENT_METRICS, QUEUE_DROPS_METRIC
 
     assert QUEUE_DROPS_METRIC in EVENT_METRICS
+
+
+def test_source_failure_is_not_reported_as_normal_completion(tmp_path, rules, log_stream):
+    """**途中で死んだ監視を、完走と区別する。**
+
+    同じに扱うと、サービス管理（systemd）が再起動できない。
+    1サンプルの失敗で落とさないこと（AGENTS.md）とは別の話。
+    """
+
+    class BrokenSource:
+        def __init__(self, clock):
+            self._clock = clock
+
+        @property
+        def clock(self):
+            return self._clock
+
+        def stream(self):
+            yield (self._clock.advance_to_ms(0) or sample(0, 1_000))
+            raise OSError("シリアルが切れた")
+
+    clock = SimulatedClock(0)
+    daemon = Daemon(
+        source=BrokenSource(clock),
+        store=SqliteStore(tmp_path / "broken.db", rules=rules, clock=clock),
+        normalizer=Normalizer(rules=rules, calibration=Calibration(), clock=clock),
+    )
+    try:
+        with pytest.raises(OSError, match="シリアル"):
+            daemon.run()
+    finally:
+        daemon.store.close()
+    assert any(line["msg"] == "ソースが落ちた" for line in log_lines(log_stream))
+
+
+def test_hello_is_stamped_with_its_receive_time(tmp_path, rules):
+    """待ち行列に積まれている間に進んだ時計を使わない。"""
+    clock = SimulatedClock(0)
+    hello = RawHello(
+        fw="1.0.0",
+        dev="dev",
+        interval_ms=2_500,
+        sensors={"rear_exhaust": RawSensor(kind="ds18b20", gpio=7, rom="28FFFFFFFFFFFF01", res=11)},
+    )
+    store = SqliteStore(tmp_path / "hello.db", rules=rules, clock=clock)
+    daemon = Daemon(
+        source=FakeSource([hello], clock, stamps=[7_000]),
+        store=store,
+        normalizer=Normalizer(rules=rules, calibration=Calibration(), clock=clock),
+    )
+    try:
+        daemon.run()
+        clock.advance_to_ms(999_000)  # 処理後に時計が進んでも記録は変わらない
+        row = store.connection.execute("SELECT last_hello_ms FROM devices").fetchone()
+    finally:
+        store.close()
+    assert row[0] == 7_000

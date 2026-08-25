@@ -3,10 +3,13 @@
 **シリアルポートを開いてよいのはこの層の `SerialSource` だけ**（AGENTS.md ルール3）。
 API 層・UI 層・AI 層からデバイスを直接触らない。
 
-`daemon` をここから再輸出しない。**`python -m coldaisle.ingest.daemon` で
+**この層は上位レイヤを import しない。** 取り込み・保存・ルールを束ねるのは
+`coldaisle.daemon`（合成の起点）の役目である。
+
+`daemon` をここから再輸出しない。**`python -m coldaisle.daemon` で
 二重に読み込まれ、`runpy` が JSON でない警告行を stderr へ出す。**
 構造化ログを行単位で読む集約側が壊れる（AGENTS.md コード規約）。
-デーモンは `from coldaisle.ingest.daemon import Daemon` で取る。
+デーモンは `from coldaisle.daemon import Daemon` で取る。
 """
 
 from coldaisle.ingest.calibration import Calibration

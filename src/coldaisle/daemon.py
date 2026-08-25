@@ -1,8 +1,14 @@
-"""取り込みデーモン（L0）。#8
+"""取り込みデーモン（合成の起点）。#8 / #18
 
-`Source → Normalizer → Store` の一本道。**シリアルポートを開く唯一のプロセス**
-（AGENTS.md ルール3、spec-review C-03）。元の仕様ではモニタとダッシュボードが
-それぞれポートを開くため同時起動できなかった。所有者を1つに集約する。
+`Source → Normalizer → Store → Rules` を1つに組み立てて回す。
+**シリアルポートを開く唯一のプロセス**（AGENTS.md ルール3、spec-review C-03）。
+元の仕様ではモニタとダッシュボードがそれぞれポートを開くため同時起動できなかった。
+所有者を1つに集約する。
+
+**`ingest/`（L0）の中に置かない。** ここは L0・L1・L2 を束ねる場所であり、
+L0 の部品ではない。中に置くと取り込み層がルールエンジン（L2）を import することに
+なり、レイヤの依存が逆向きになる（AGENTS.md「レイヤ間の依存は一方向」）。
+`clock` / `channels` / `metrics` と同じく、層をまたぐものはパッケージ直下に置く。
 
 **1サンプルの失敗でプロセスを落とさない。** ここだけは例外を捕まえて継続する
 （AGENTS.md コード規約の唯一の例外）。ただし握りつぶさず、件数とスタックを残す。
@@ -25,11 +31,8 @@ from zoneinfo import ZoneInfo
 from coldaisle import logs
 from coldaisle.channels import QUEUE_DROPS_METRIC
 from coldaisle.clock import Clock
-from coldaisle.ingest.calibration import Calibration
-from coldaisle.ingest.mock import MockSource, load_scenarios
-from coldaisle.ingest.normalize import Normalizer
+from coldaisle.ingest import Calibration, MockSource, Normalizer, ReplaySource, load_scenarios
 from coldaisle.ingest.protocol import RawHello, RawMessage, RawSample, Source
-from coldaisle.ingest.replay import ReplaySource
 from coldaisle.metrics import MetricCatalog
 from coldaisle.rules import Engine, RuleSet, Transition
 from coldaisle.store import (
@@ -164,7 +167,14 @@ class Daemon:
 
         # 受信時刻を**受け取った瞬間に**確定して一緒に運ぶ（決定 D-05）。
         # 処理時刻で付けると、追いつくまでの間に進んだぶんだけずれる
-        inbox: queue.Queue[tuple[int, RawMessage] | None] = queue.Queue(maxsize=QUEUE_SIZE)
+        if self._engine is not None:
+            # **いつから見ているか**を基準にする。起動時からデバイスが無い場合、
+            # これが無いと `SENSOR_FAULT` が永久に鳴らない
+            self._engine.begin(self._normalizer.clock.now_ms())
+
+        inbox: queue.Queue[tuple[int, RawMessage] | BaseException | None] = queue.Queue(
+            maxsize=QUEUE_SIZE
+        )
         reader = threading.Thread(target=self._read_into, args=(inbox,), daemon=True)
         reader.start()
         while True:
@@ -178,14 +188,24 @@ class Daemon:
                 continue
             if received is None:
                 break  # ソースが尽きた
+            if isinstance(received, BaseException):
+                # **ソースが落ちたことを正常終了と区別する。** 同じに扱うと、
+                # 途中で死んだ監視をサービス管理（systemd）が再起動できない。
+                # 1サンプルの失敗で落とさないこと（AGENTS.md）とは別の話
+                LOGGER.error("ソースが落ちた", exc_info=received)
+                raise received
             self._handle(*received)
             if max_samples is not None and self.stats.samples >= max_samples:
                 break
         LOGGER.info("取り込みを終了する", extra={logs.FIELDS_KEY: self.stats.as_fields()})
         return self.stats
 
-    def _read_into(self, inbox: queue.Queue[tuple[int, RawMessage] | None]) -> None:
-        """ソースを回して詰めるだけのスレッド。**DB には触らない。**"""
+    def _read_into(self, inbox: queue.Queue[tuple[int, RawMessage] | BaseException | None]) -> None:
+        """ソースを回して詰めるだけのスレッド。**DB には触らない。**
+
+        ソースが落ちたら例外そのものを渡す。正常終了と同じ印にすると、
+        **途中で死んだ監視を完走と区別できない**（サービス管理が再起動できない）。
+        """
         try:
             for message in self._source.stream():
                 if self._stop:
@@ -200,9 +220,9 @@ class Daemon:
                         inbox.get_nowait()
                     self.stats.queue_drops += 1
                     inbox.put(received)
-        except Exception:
-            LOGGER.warning("ソースの読み取りが落ちた", exc_info=True)
-        finally:
+        except Exception as error:
+            inbox.put(error)
+        else:
             inbox.put(None)
 
     def _with_queue_drops(self, sample: Sample) -> Sample:
@@ -241,7 +261,7 @@ class Daemon:
     def _handle(self, received_ms: int, message: RawMessage) -> None:
         try:
             if isinstance(message, RawHello):
-                self._on_hello(message)
+                self._on_hello(message, received_ms)
             else:
                 self._on_sample(message, received_ms)
         except Exception:
@@ -252,8 +272,9 @@ class Daemon:
                 extra={logs.FIELDS_KEY: {"discarded": self.stats.discarded}},
             )
 
-    def _on_hello(self, hello: RawHello) -> None:
-        at_ms = self._normalizer.clock.now_ms()
+    def _on_hello(self, hello: RawHello, received_ms: int) -> None:
+        # **受け取った瞬間の時刻を使う。** 待ち行列に積まれている間に時計は進む
+        at_ms = received_ms
         self._device_id = hello.dev
         recorded = {sensor.channel: sensor.rom for sensor in self._store.sensors_for(hello.dev)}
         observed = {channel: sensor.rom for channel, sensor in hello.sensors.items()}
@@ -304,7 +325,7 @@ class Daemon:
                 extra={logs.FIELDS_KEY: {"device": hello.dev, "channels": mismatched}},
             )
         if self._engine is not None:
-            self._record(self._engine.on_hello(observed, recorded))
+            self._record(self._engine.on_hello(observed, recorded, at_ms=at_ms))
 
     def _on_sample(self, raw: RawSample, received_ms: int) -> None:
         normalized = self._normalizer.normalize(raw, ts_ms=received_ms)
@@ -514,5 +535,5 @@ def main(argv: Sequence[str] | None = None) -> int:
     return 0
 
 
-if __name__ == "__main__":  # pragma: no cover - `python -m coldaisle.ingest.daemon`
+if __name__ == "__main__":  # pragma: no cover - `python -m coldaisle.daemon`
     raise SystemExit(main())

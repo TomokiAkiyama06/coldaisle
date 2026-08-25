@@ -394,7 +394,7 @@ def test_disabled_rules_are_not_evaluated(store, rule_set):
 
 def _run_scenario(tmp_path, scenario: str, *, speed: float, max_samples: int, tick_s: float = 0.05):
     """デーモンを通してシナリオを流し、DB を返す。"""
-    from coldaisle.ingest.daemon import Config, build
+    from coldaisle.daemon import Config, build
     from conftest import CALIBRATION_PATH, SCENARIOS_PATH
 
     daemon = build(
@@ -466,3 +466,74 @@ def test_idle_scenario_raises_nothing(tmp_path):
     """**正常なデータで鳴らない。** 鳴りっぱなしのアラートは無視される。"""
     found, _ = _run_scenario(tmp_path, "idle", speed=200.0, max_samples=400)
     assert found == [], f"正常なのに鳴った: {[a.rule_id for a in found]}"
+
+
+# ---------------------------------------------------------------- レビュー指摘の退行防止
+
+
+def test_sensor_fault_fires_when_nothing_ever_arrives(engine, store):
+    """**起動時からデバイスが無い場合も鳴る。**
+
+    最初のサンプルを待って基準を立てる実装だと、いちばん重要な場合
+    （最初から死んでいる）で永久に鳴らない。「いつから届いていないか」は
+    「いつから見ているか」で決まる。
+    """
+    engine.begin(NOW_MS)
+    store.clock.advance_to_ms(NOW_MS + 20_000)
+    engine.on_tick()
+    assert alerts(store, "SENSOR_FAULT") == []
+
+    store.clock.advance_to_ms(NOW_MS + 31_000)
+    engine.on_tick()
+    assert alerts(store, "SENSOR_FAULT")[0].state == "firing"
+
+
+def test_restart_resolves_an_alert_whose_condition_has_cleared(store, rule_set):
+    """**再起動したデーモンが古いアラートを解除できること。**
+
+    状態を DB から取り込まないと、条件が解けていても `firing` のまま永久に残る。
+    """
+    catalog = MetricCatalog.from_yaml(METRICS_PATH)
+    first = Engine(rules=rule_set, catalog=catalog, store=store, clock=store.clock)
+    for step in range(0, 700, 20):
+        first.on_sample(sample(NOW_MS + step * 1000, **{"air.room": 32.0}))
+    assert alerts(store, "ROOM_HIGH")[0].state == "firing"
+
+    # デーモンを再起動し、室温が下がった状態で受け取る
+    second = Engine(rules=rule_set, catalog=catalog, store=store, clock=store.clock)
+    second.on_sample(sample(NOW_MS + 800_000, **{"air.room": 26.0}))
+
+    resolved = alerts(store, "ROOM_HIGH")
+    assert len(resolved) == 1, "同じ事象の行を増やさない"
+    assert resolved[0].state == "resolved"
+
+
+def test_restart_does_not_duplicate_a_still_active_alert(store, rule_set):
+    catalog = MetricCatalog.from_yaml(METRICS_PATH)
+    first = Engine(rules=rule_set, catalog=catalog, store=store, clock=store.clock)
+    for step in range(0, 700, 20):
+        first.on_sample(sample(NOW_MS + step * 1000, **{"air.room": 32.0}))
+
+    second = Engine(rules=rule_set, catalog=catalog, store=store, clock=store.clock)
+    second.on_sample(sample(NOW_MS + 800_000, **{"air.room": 33.0}))
+
+    assert len(alerts(store, "ROOM_HIGH")) == 1
+    assert alerts(store, "ROOM_HIGH")[0].state == "firing"
+
+
+def test_humidity_metric_is_validated_too(store, rule_set):
+    """検証の列挙から漏れると、そのルールだけ静かに無効になる。"""
+    broken = rule_set.model_copy(
+        update={
+            "humidity_out_of_range": rule_set.humidity_out_of_range.model_copy(
+                update={"metric": "air.room_humidityy"}
+            )
+        }
+    )
+    with pytest.raises(ValueError, match="未知のメトリクス"):
+        Engine(
+            rules=broken,
+            catalog=MetricCatalog.from_yaml(METRICS_PATH),
+            store=store,
+            clock=store.clock,
+        )
