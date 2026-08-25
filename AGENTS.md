@@ -154,7 +154,7 @@ src/coldaisle/
   api/        # L2: FastAPI、WebSocket
   rules/      # L2: ルールエンジン（決定論的。AI非依存）
   notify/     # L2: 通知（Slack / LINE / stdout）。秘匿情報は .env
-  ai/         # L3: LLM Provider抽象、ツール、プロンプト
+  ai/         # L3: LLM Provider抽象、ツール、プロンプト。準備は docs/llm-setup.md
   web/        # L4: 静的アセット
 firmware/     # ESP32-S3 Arduino スケッチ
 config/       # rules.yaml, calibration.json, coldaisle.toml

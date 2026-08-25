@@ -14,6 +14,7 @@ milestone: "M5 AI"
 - [ ] タイムアウトとリトライ
 - [ ] **LLM不達時に例外を上位へ伝播させず、UIに「AI利用不可」と出すだけにする**（FR-507）
 - [ ] Macでの手順を `docs/llm-setup.md` に記載（`ollama pull qwen3:8b` 等）
+      - モデルは決定記録 0005 で **Qwen3.8-27B** に確定（`qwen3-8b` ではない）
 - [ ] vLLM起動コマンドを記載。`--gpu-memory-utilization` の上限設定理由も明記
 
 ## 受入基準
