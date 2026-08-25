@@ -102,6 +102,47 @@ def test_the_api_layer_does_not_import_the_ai_layer():
     assert offending == []
 
 
+def test_the_envelopes_are_typed_in_openapi(client):
+    """**Workspace は OpenAPI から型を生成する**（api-contract §4 / #23 のレビュー指摘）。
+
+    `dict[str, Any]` のままだと、`meta` も `guidance` も自由形式の object になり、
+    契約の変更を型で検出できない。**外側の封筒は固定する。**
+    `result` と `tools` の中身はツールごと・モデルの作法ごとに変わるので型付けしない。
+    """
+    document = client.get("/openapi.json").json()
+    schemas = document["components"]["schemas"]
+
+    listing = document["paths"]["/api/v1/tools"]["get"]["responses"]["200"]["content"]
+    assert listing["application/json"]["schema"]["$ref"].endswith("ToolListResponse")
+    assert set(schemas["ToolListResponse"]["required"]) == {
+        "read_only",
+        "advisory",
+        "guidance",
+        "tools",
+    }
+
+    call = document["paths"]["/api/v1/tools/{name}"]["get"]["responses"]["200"]["content"]
+    assert call["application/json"]["schema"]["$ref"].endswith("ToolCallResponse")
+    assert set(schemas["ToolCallMeta"]["required"]) == {
+        "tool",
+        "arguments",
+        "ok",
+        "ts_ms",
+        "ts",
+        "elapsed_ms",
+        "read_only",
+        "advisory",
+    }
+    assert schemas["ToolCallMeta"]["properties"]["ok"]["type"] == "boolean"
+
+
+def test_a_result_of_any_shape_still_passes_through(client):
+    """封筒を型にしても、**ツールごとに違う `result` は通る。**"""
+    body = client.get("/api/v1/tools/describe_system").json()
+    assert body["meta"]["ok"] is True
+    assert "metrics" in body["result"]
+
+
 # ---------------------------------------------------------------- 一覧（受入基準）
 
 

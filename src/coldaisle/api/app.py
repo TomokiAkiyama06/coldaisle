@@ -31,6 +31,9 @@ from coldaisle.api.models import (
     SeriesResponse,
     StatsResponse,
     StreamMessage,
+    ToolCallMeta,
+    ToolCallResponse,
+    ToolListResponse,
     iso,
 )
 from coldaisle.channels import EVENT_METRICS, QUEUE_DROPS_METRIC
@@ -439,19 +442,19 @@ def _add_tool_routes(app: FastAPI, provider: StoreProvider, tools: ToolsFactory)
     引数はクエリ文字列で受け、型の変換は各ツールの引数モデルに任せる。
     """
 
-    @app.get("/api/v1/tools")
-    def list_tools() -> dict[str, Any]:
+    @app.get("/api/v1/tools", response_model=ToolListResponse)
+    def list_tools() -> ToolListResponse:
         """関数定義の一覧。**呼び出し側の system prompt に入れる注意書きも返す。**"""
         registry = tools(provider.get())
-        return {
-            "read_only": True,
-            "advisory": True,
-            "guidance": registry.guidance,
-            "tools": registry.definitions(),
-        }
+        return ToolListResponse(
+            read_only=True,
+            advisory=True,
+            guidance=registry.guidance,
+            tools=registry.definitions(),
+        )
 
-    @app.get("/api/v1/tools/{name}")
-    def call_tool(name: str, request: Request) -> dict[str, Any]:
+    @app.get("/api/v1/tools/{name}", response_model=ToolCallResponse)
+    def call_tool(name: str, request: Request) -> ToolCallResponse:
         """1つ実行する。**何が呼ばれたかを `meta` に返す**（回答の根拠が追えること）。
 
         存在しないツール名や壊れた引数でも 200 を返し、`meta.ok` と
@@ -460,23 +463,24 @@ def _add_tool_routes(app: FastAPI, provider: StoreProvider, tools: ToolsFactory)
         ためにいちいち例外を結果へ翻訳することになる。
         """
         arguments = dict(request.query_params)
-        registry = tools(provider.get())
-        started_ms = provider.get().clock.now_ms()
+        store = provider.get()
+        registry = tools(store)
+        started_ms = store.clock.now_ms()
         result = registry.call(name, arguments)
-        finished_ms = provider.get().clock.now_ms()
-        return {
-            "meta": {
-                "tool": name,
-                "arguments": arguments,
-                "ok": "error" not in result,
-                "ts_ms": finished_ms,
-                "ts": iso(finished_ms),
-                "elapsed_ms": max(0, finished_ms - started_ms),
-                "read_only": True,
-                "advisory": True,
-            },
-            "result": result,
-        }
+        finished_ms = store.clock.now_ms()
+        return ToolCallResponse(
+            meta=ToolCallMeta(
+                tool=name,
+                arguments=arguments,
+                ok="error" not in result,
+                ts_ms=finished_ms,
+                ts=iso(finished_ms),
+                elapsed_ms=max(0, finished_ms - started_ms),
+                read_only=True,
+                advisory=True,
+            ),
+            result=result,
+        )
 
 
 def _periodic(readings: Mapping[str, LatestReading]) -> dict[str, LatestReading]:
