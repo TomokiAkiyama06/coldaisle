@@ -1,0 +1,128 @@
+/* 開発用ダッシュボードの体裁（#17）。作り込まない。 */
+:root {
+  --bg: #12151a;
+  --panel: #1b2027;
+  --line: #2b323c;
+  --text: #e6e9ee;
+  --muted: #9aa4b2;
+  --ok: #4ea36b;
+  --warn: #d99a2b;
+  --bad: #cf4b4b;
+  --info: #4b8bcf;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font-family: system-ui, -apple-system, "Hiragino Sans", "Noto Sans JP", sans-serif;
+}
+
+header {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  padding: 16px 20px;
+  border-bottom: 1px solid var(--line);
+}
+
+h1 { font-size: 18px; margin: 0; letter-spacing: 0.04em; }
+h2 { font-size: 14px; color: var(--muted); margin: 24px 0 8px; font-weight: 600; }
+
+main { padding: 0 20px 40px; }
+
+.status { display: flex; gap: 12px; align-items: baseline; font-size: 13px; }
+.conn { color: var(--muted); }
+.conn.live { color: var(--ok); }
+.conn.down { color: var(--bad); }
+.age { color: var(--muted); font-variant-numeric: tabular-nums; }
+
+/* データが古いことを画面全体で伝える（受入基準）。無音で古い値を出さない */
+.banner {
+  padding: 14px 20px;
+  background: var(--bad);
+  color: #fff;
+  font-weight: 700;
+  text-align: center;
+}
+.banner.hidden { display: none; }
+
+.cards {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+  gap: 10px;
+  margin-top: 16px;
+}
+
+.card {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-left-width: 4px;
+  border-radius: 6px;
+  padding: 10px 12px;
+}
+.card .label { font-size: 12px; color: var(--muted); }
+.card .value { font-size: 24px; font-variant-numeric: tabular-nums; margin-top: 4px; }
+.card .unit { font-size: 13px; color: var(--muted); margin-left: 4px; }
+.card .badge {
+  display: inline-block;
+  margin-top: 6px;
+  padding: 1px 8px;
+  border-radius: 10px;
+  font-size: 11px;
+}
+
+/* 品質フラグの4値（要件 §5.3）。**どれか1つでも欠けると異常が正常に見える** */
+.q-ok { border-left-color: var(--ok); }
+.q-ok .badge { background: rgba(78, 163, 107, 0.2); color: var(--ok); }
+.q-missing { border-left-color: var(--muted); }
+.q-missing .badge { background: rgba(154, 164, 178, 0.2); color: var(--muted); }
+.q-suspect { border-left-color: var(--warn); }
+.q-suspect .badge { background: rgba(217, 154, 43, 0.22); color: var(--warn); }
+.q-stale { border-left-color: var(--bad); }
+.q-stale .badge { background: rgba(207, 75, 75, 0.22); color: var(--bad); }
+
+.derived .card { border-left-color: var(--info); }
+
+.ranges { display: flex; gap: 6px; }
+.ranges button {
+  background: var(--panel);
+  color: var(--text);
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  padding: 5px 12px;
+  font-size: 13px;
+  cursor: pointer;
+}
+.ranges button.active { border-color: var(--info); color: var(--info); }
+
+.chart-wrap { margin-top: 12px; }
+.chart {
+  width: 100%;
+  height: auto;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+}
+.legend { display: flex; flex-wrap: wrap; gap: 12px; margin-top: 6px; font-size: 12px; }
+.legend span { color: var(--muted); }
+.legend i { display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 5px; }
+.note { color: var(--muted); font-size: 12px; margin-top: 8px; }
+
+.alerts { display: flex; flex-direction: column; gap: 8px; margin-top: 8px; }
+.alert {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-left-width: 4px;
+  border-radius: 6px;
+  padding: 8px 12px;
+  font-size: 13px;
+}
+.alert .meta { color: var(--muted); font-size: 12px; margin-top: 4px; }
+.sev-info { border-left-color: var(--info); }
+.sev-warning { border-left-color: var(--warn); }
+.sev-critical { border-left-color: var(--bad); }
+.state-resolved { opacity: 0.55; }
+.empty { color: var(--muted); font-size: 13px; }

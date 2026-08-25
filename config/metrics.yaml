@@ -41,6 +41,11 @@ derived:
     label: "トップ排気の回り込み"
     minuend: air.top_exhaust
     subtrahend: air.gpu_exhaust
+  d.rear_rise:
+    unit: "C"
+    label: "背面排気の上昇（室温比）"
+    minuend: air.rear_exhaust
+    subtrahend: air.room
   d.gpu_internal_delta:
     unit: "C"
     label: "GPU内部の温度差"

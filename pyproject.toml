@@ -40,6 +40,8 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/coldaisle"]
+# ダッシュボードの静的アセットとマイグレーション SQL を wheel へ含める
+artifacts = ["src/coldaisle/web/*", "src/coldaisle/store/migrations/*.sql"]
 
 [tool.ruff]
 target-version = "py312"
