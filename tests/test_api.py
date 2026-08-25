@@ -16,9 +16,9 @@ from coldaisle.api.app import (
     parse_window,
     stream_state,
 )
-from coldaisle.api.metrics_meta import MetricCatalog
 from coldaisle.api.models import LatestResponse
 from coldaisle.clock import SimulatedClock
+from coldaisle.metrics import MetricCatalog
 from coldaisle.store import Aggregation, DeviceRecord, Quality, Reading, Sample, SqliteStore
 from coldaisle.store.rollup import rollup_minutes
 from conftest import CONFIG_DIR, QUALITY_RULES_PATH
@@ -490,3 +490,26 @@ def test_stream_state_changes_when_quality_turns_stale(db, rules):
     assert before.stale is False
     assert after.stale is True
     assert stream_state(before) != stream_state(after), "時刻が同じでも押し出す"
+
+
+def test_health_reports_queue_drops(tmp_path, rules, clock):
+    """取り込みが保存に追いつけていないことを API から見える形にする。"""
+    from coldaisle.channels import QUEUE_DROPS_METRIC
+
+    path = tmp_path / "drops.db"
+    with SqliteStore(path, rules=rules, clock=clock) as store:
+        store.insert_sample(
+            Sample(
+                ts_ms=NOW_MS,
+                readings=(
+                    Reading(metric="air.room", value=26.0, quality=Quality.OK),
+                    Reading(metric=QUEUE_DROPS_METRIC, value=7.0, quality=Quality.OK),
+                ),
+            )
+        )
+    app = create_app(
+        Config(db=path, quality_rules=QUALITY_RULES_PATH, metrics=METRICS_PATH), clock=clock
+    )
+    with TestClient(app) as client:
+        body = client.get("/api/v1/health").json()
+    assert body["queue_drops_1h"] == 7

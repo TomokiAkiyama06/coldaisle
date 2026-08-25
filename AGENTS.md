@@ -146,6 +146,9 @@ git worktree list
 ```text
 src/coldaisle/
   clock.py    # レイヤ横断: 時刻ソース（WallClock / SimulatedClock）。#42
+  channels.py # レイヤ横断: チャネル名とメトリクス名の対応。#10
+  metrics.py  # レイヤ横断: 単位・表示名・派生値の定義。#9
+  daemon.py   # 合成の起点: Source→Normalizer→Store→Rules を束ねる。#8 / #18
   ingest/     # L0: Source実装（serial / mock / replay）、正規化
   store/      # L1: SQLite、ロールアップ、CSVエクスポート
   api/        # L2: FastAPI、WebSocket

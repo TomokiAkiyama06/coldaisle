@@ -355,13 +355,19 @@ coldaisle が NVML / lm-sensors も収集し、`GET /api/v1/server-health` を�
 |---|---|---|---|
 | FR-401 | `SENSOR_FAULT` | 30秒以上サンプル無し | critical |
 | FR-402 | `SENSOR_MISSING` | 特定メトリクスが5サンプル連続でnull/suspect | warning |
-| FR-403 | `PROBE_CHANGED` | hello の `rom` が前回起動時と異なる | info |
+| FR-403 | `PROBE_CHANGED` | hello の `rom` が**記録された構成と一致しない状態が続いている**（★2026-08-25 改訂） | info |
 | FR-404 | `RECIRCULATION` | `d.intake_rise > 5.0°C` が5分継続 | warning |
 | FR-405 | `INTAKE_HIGH` | `air.gpu_intake > 40°C` が2分継続 | warning |
 | FR-406 | `AIRFLOW_DEGRADED` | `d.gpu_delta > 20°C` が5分継続 | warning |
 | FR-407 | `RAPID_RISE` | `air.gpu_intake` の上昇率が 5°C/分 超 | critical |
 | FR-408 | `ROOM_HIGH` | `air.room > 30°C` が10分継続 | warning |
 | FR-409 | `HUMIDITY_OUT_OF_RANGE` | `air.room_humidity` が 20%未満 or 70%超 が10分継続 | warning |
+
+> **FR-403 の定義について（2026-08-25 改訂）**: 「変わった瞬間」ではなく
+> **「不一致が続いている状態」**で判定します。意味するのは「較正のオフセットが、
+> いま間違ったプローブに対応している」という、人が直すまで続く状態だからです。
+> 点の出来事として即座に解決すると、静かに間違ったまま運用が続くのを防ぐ仕組みが
+> 静かに消えます。詳細は決定記録 0012 §2.6。
 
 > **閾値はすべて暫定です。** 実機到着後、無負荷・軽負荷・フルロードの
 > ベースライン測定（Issue参照）を経て確定します。設定ファイル `rules.yaml` で外出しすること。

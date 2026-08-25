@@ -37,7 +37,12 @@ DROPPED_SAMPLES_METRIC = "sys.dropped_samples"
 DEVICE_RESTART_METRIC = "sys.device_restarts"
 """`up` の巻き戻りを検出したときだけ書く（FR-106 / 決定記録 0007 §2.4）。"""
 
-EVENT_METRICS: frozenset[str] = frozenset({DROPPED_SAMPLES_METRIC, DEVICE_RESTART_METRIC})
+QUEUE_DROPS_METRIC = "sys.queue_drops"
+"""待ち行列が溢れて捨てたメッセージ数（決定記録 0012 §2.3）。溢れたときだけ書く。"""
+
+EVENT_METRICS: frozenset[str] = frozenset(
+    {DROPPED_SAMPLES_METRIC, DEVICE_RESTART_METRIC, QUEUE_DROPS_METRIC}
+)
 """**起きたときにしか書かないメトリクス。**
 
 周期的に届く前提の判定（鮮度・欠測率）から外す。外さないと、

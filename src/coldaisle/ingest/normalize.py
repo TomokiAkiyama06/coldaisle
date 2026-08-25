@@ -81,8 +81,15 @@ class Normalizer:
         """ホスト受信時刻を決める時計。合成の起点が同じものを配れたかの検査用（#42）。"""
         return self._clock
 
-    def normalize(self, raw: RawSample) -> Normalized:
-        ts_ms = self._clock.now_ms()
+    def normalize(self, raw: RawSample, *, ts_ms: int | None = None) -> Normalized:
+        """`ts_ms` を渡せるのは、**受信した瞬間の時刻**を使うため。
+
+        取り込みはソースを別スレッドで読む（#18）。処理が追いつくまでの間に
+        時計は進むので、処理時刻を使うと受信時刻からずれる。
+        ずれた時刻で保存すると、一括再生では同じ時刻に複数サンプルが集まって
+        主キーが衝突する。
+        """
+        ts_ms = self._clock.now_ms() if ts_ms is None else ts_ms
         # `up` の巻き戻りが再起動の定義（FR-106）。稼働時間は戻らないため、
         # 戻っていれば電源が入り直したということ。届くのが遅れた古いサンプルも
         # 同じ形に見えるが、区別する手立ては v1 のスキーマには無い

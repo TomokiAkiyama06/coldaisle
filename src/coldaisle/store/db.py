@@ -245,17 +245,21 @@ class SqliteStore:
     def insert_sample(self, sample: Sample) -> int:
         """1サンプルを保存し、書いた行数を返す（FR-201）。
 
-        同じ `(metric, ts_ms)` が既にあると `sqlite3.IntegrityError` を送出する。
-        黙って上書きすると、同じ時刻に2つの値が観測された事実が消える。
-        取り込みループはこれを1サンプルのパース失敗と同様に**記録して継続**する。
+        既にある `(metric, ts_ms)` は無視される。渡した数と戻り値が違えば、
+        その差は「重複していて書かなかった行」である（決定記録 0012 §2.4）。
         """
         return self.insert_samples((sample,))
 
     def insert_samples(self, samples: Iterable[Sample]) -> int:
-        """複数サンプルを1トランザクションで保存する。
+        """複数サンプルを1トランザクションで保存し、**実際に書いた行数**を返す。
 
-        リプレイと試験のための一括投入。COMMIT は1回で済むため、
-        1件ずつ `insert_sample` を呼ぶより桁で速い。
+        同じ `(metric, ts_ms)` は**無視する**（`INSERT OR IGNORE`）。
+        同じ CSV を2回再生しても壊れないようにするため（冪等性。決定記録 0012 §2.4）。
+
+        **上書きはしない。** 先に入っている観測を後から来た値で書き換えると、
+        同じ時刻に2つの値が観測された事実が消える（決定記録 0004 §2.7 の懸念）。
+        無視した件数は「渡した数と戻り値の差」で分かる。黙って捨てないために、
+        取り込み側はその差を数えて記録する。
         """
         rows = [
             (reading.metric, sample.ts_ms, reading.value, reading.quality.value)
@@ -265,20 +269,30 @@ class SqliteStore:
         if not rows:
             return 0
         with self.transaction():
-            self._conn.executemany(
-                "INSERT INTO readings (metric, ts_ms, value, quality) VALUES (?, ?, ?, ?)",
+            cursor = self._conn.executemany(
+                "INSERT OR IGNORE INTO readings (metric, ts_ms, value, quality) "
+                "VALUES (?, ?, ?, ?)",
                 rows,
             )
-        return len(rows)
+        return int(cursor.rowcount)
 
     def record_hello(
-        self, device: DeviceRecord, sensors: Sequence[SensorRecord], *, at_ms: int
+        self,
+        device: DeviceRecord,
+        sensors: Sequence[SensorRecord],
+        *,
+        at_ms: int,
+        replace_sensors: bool = True,
     ) -> None:
         """起動バナーを `devices` / `device_sensors` へ反映する（決定記録 0002 §2.10）。
 
         センサーの集合は**丸ごと置き換える。** 起動バナーはその時点の全構成を
         申告するため、差分更新にすると外したセンサーの行が残り続ける。
-        置き換える前の ROM が要る場合は `sensors_for()` で先に読む（FR-403 / #14）。
+        ただし `replace_sensors=False` のときは触らない。記録された ROM は
+        **「較正が対応している構成」**であり、差し替えを検出したら、人が較正を
+        やり直すまで基準として残す必要がある（FR-403 / 決定記録 0012 §2.6）。
+        上書きすると `PROBE_CHANGED` が次の瞬間に解決してしまう。
+        置き換える前の ROM は `sensors_for()` で読める。
 
         `first_seen_ms` は初回だけ書く。上書きすると「いつから見ているか」が消える。
         """
@@ -301,6 +315,8 @@ class SqliteStore:
                     at_ms,
                 ),
             )
+            if not replace_sensors:
+                return
             self._conn.execute(
                 "DELETE FROM device_sensors WHERE device_id = ?", (device.device_id,)
             )
@@ -412,6 +428,80 @@ class SqliteStore:
             "SELECT value FROM system_state WHERE key = ? ORDER BY ts_ms DESC LIMIT 1", (key,)
         ).fetchone()
         return None if row is None else str(row["value"])
+
+    def active_alert(self, rule_id: str, metric: str | None) -> AlertRecord | None:
+        """未解決（`pending` / `firing`）のアラート。
+
+        デーモンを再起動しても**同じ事象で行を作り直さない**ために使う。
+        作り直すと、1つの故障が再起動の回数だけ履歴に並ぶ。
+        """
+        row = self._conn.execute(
+            "SELECT id, rule_id, severity, state, metric, started_ms, fired_ms, resolved_ms, "
+            "trigger_value, threshold, detail FROM alerts "
+            "WHERE rule_id = ? AND metric IS ? AND state IN ('pending', 'firing') "
+            "ORDER BY started_ms DESC LIMIT 1",
+            (rule_id, metric),
+        ).fetchone()
+        return None if row is None else AlertRecord.model_validate(dict(row))
+
+    def open_alert(
+        self,
+        *,
+        rule_id: str,
+        severity: str,
+        metric: str | None,
+        started_ms: int,
+        threshold: float | None,
+        trigger_value: float | None,
+        detail: str | None = None,
+    ) -> int:
+        """条件が成立した時点で行を作る（`pending`）。行 id を返す。
+
+        **発火してから作らない。** 「条件はいつ成立し、継続時間の要件をいつ
+        満たしたか」を後から検証できるようにするため（決定記録 0002 §2.9）。
+        閾値を実測で見直す #19 で、この差分が判断材料になる。
+        """
+        with self.transaction():
+            cursor = self._conn.execute(
+                "INSERT INTO alerts "
+                "(rule_id, severity, state, metric, started_ms, trigger_value, threshold, detail) "
+                "VALUES (?, ?, 'pending', ?, ?, ?, ?, ?)",
+                (rule_id, severity, metric, started_ms, trigger_value, threshold, detail),
+            )
+        return int(cursor.lastrowid or 0)
+
+    def fire_alert(
+        self,
+        alert_id: int,
+        *,
+        fired_ms: int,
+        trigger_value: float | None,
+        detail: str | None = None,
+    ) -> None:
+        """継続時間の条件を満たしたので発火させる。"""
+        with self.transaction():
+            self._conn.execute(
+                "UPDATE alerts SET state = 'firing', fired_ms = ?, trigger_value = ?, "
+                "detail = COALESCE(?, detail) WHERE id = ?",
+                (fired_ms, trigger_value, detail, alert_id),
+            )
+
+    def resolve_alert(self, alert_id: int, *, resolved_ms: int) -> None:
+        """条件が解けた。**行は消さない。** 履歴として残す。"""
+        with self.transaction():
+            self._conn.execute(
+                "UPDATE alerts SET state = 'resolved', resolved_ms = ? WHERE id = ?",
+                (resolved_ms, alert_id),
+            )
+
+    def delete_alert(self, alert_id: int) -> None:
+        """発火せずに条件が解けた `pending` を取り消す。
+
+        継続時間に届かなかった揺らぎまで履歴に残すと、**本物の発火が埋もれる。**
+        「いつ成立したか」を残す意味があるのは、発火まで至った事象だけである。
+        """
+        with self.transaction():
+            self._conn.execute("DELETE FROM alerts WHERE id = ? AND state = 'pending'", (alert_id,))
 
     def alerts(
         self,

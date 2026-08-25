@@ -218,8 +218,8 @@ def test_replayed_data_lands_in_the_store_with_its_original_time(tmp_path, rules
 
     ダッシュボードでの確認は #17。ここでは保存と読み出しまでを確かめる。
     """
+    from coldaisle.daemon import Daemon
     from coldaisle.ingest.calibration import Calibration
-    from coldaisle.ingest.daemon import Daemon
     from coldaisle.ingest.normalize import Normalizer
 
     replay = source(logs, bulk=True)
@@ -296,7 +296,7 @@ def test_non_numeric_values_become_missing(tmp_path):
 
 def test_daemon_builds_a_replay_source(tmp_path, day_24):
     """`--source replay --csv ...` でデーモンが組み上がること。"""
-    from coldaisle.ingest.daemon import Config, build
+    from coldaisle.daemon import Config, build
     from conftest import CALIBRATION_PATH, QUALITY_RULES_PATH, SCENARIOS_PATH
 
     daemon = build(
@@ -320,7 +320,7 @@ def test_daemon_builds_a_replay_source(tmp_path, day_24):
 
 def test_daemon_reports_a_missing_csv(tmp_path):
     """打ち間違いを生の `FileNotFoundError` にしない。"""
-    from coldaisle.ingest.daemon import Config, build
+    from coldaisle.daemon import Config, build
     from conftest import CALIBRATION_PATH, QUALITY_RULES_PATH, SCENARIOS_PATH
 
     with pytest.raises(SystemExit, match="見つからない"):
@@ -343,7 +343,7 @@ def test_replay_does_not_apply_calibration(tmp_path, day_24):
     ときに較正を当てると、再生した温度が全部ずれる。#13 で較正値を測った
     瞬間に効いてくるので、値が 0.0 の今のうちに固定する。
     """
-    from coldaisle.ingest.daemon import Config, build
+    from coldaisle.daemon import Config, build
     from conftest import QUALITY_RULES_PATH, SCENARIOS_PATH
 
     calibration = tmp_path / "calibration.json"

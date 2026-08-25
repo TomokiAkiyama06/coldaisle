@@ -1,8 +1,14 @@
-"""取り込みデーモン（L0）。#8
+"""取り込みデーモン（合成の起点）。#8 / #18
 
-`Source → Normalizer → Store` の一本道。**シリアルポートを開く唯一のプロセス**
-（AGENTS.md ルール3、spec-review C-03）。元の仕様ではモニタとダッシュボードが
-それぞれポートを開くため同時起動できなかった。所有者を1つに集約する。
+`Source → Normalizer → Store → Rules` を1つに組み立てて回す。
+**シリアルポートを開く唯一のプロセス**（AGENTS.md ルール3、spec-review C-03）。
+元の仕様ではモニタとダッシュボードがそれぞれポートを開くため同時起動できなかった。
+所有者を1つに集約する。
+
+**`ingest/`（L0）の中に置かない。** ここは L0・L1・L2 を束ねる場所であり、
+L0 の部品ではない。中に置くと取り込み層がルールエンジン（L2）を import することに
+なり、レイヤの依存が逆向きになる（AGENTS.md「レイヤ間の依存は一方向」）。
+`clock` / `channels` / `metrics` と同じく、層をまたぐものはパッケージ直下に置く。
 
 **1サンプルの失敗でプロセスを落とさない。** ここだけは例外を捕まえて継続する
 （AGENTS.md コード規約の唯一の例外）。ただし握りつぶさず、件数とスタックを残す。
@@ -12,23 +18,40 @@ from __future__ import annotations
 
 import argparse
 import logging
+import queue
 import signal
+import threading
 from collections.abc import Sequence
+from contextlib import suppress
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import FrameType
 from zoneinfo import ZoneInfo
 
 from coldaisle import logs
+from coldaisle.channels import QUEUE_DROPS_METRIC
 from coldaisle.clock import Clock
-from coldaisle.ingest.calibration import Calibration
-from coldaisle.ingest.mock import MockSource, load_scenarios
-from coldaisle.ingest.normalize import Normalizer
+from coldaisle.ingest import Calibration, MockSource, Normalizer, ReplaySource, load_scenarios
 from coldaisle.ingest.protocol import RawHello, RawMessage, RawSample, Source
-from coldaisle.ingest.replay import ReplaySource
-from coldaisle.store import DeviceRecord, QualityRules, SensorRecord, SqliteStore
+from coldaisle.metrics import MetricCatalog
+from coldaisle.rules import Engine, RuleSet, Transition
+from coldaisle.store import (
+    DeviceRecord,
+    Quality,
+    QualityRules,
+    Reading,
+    Sample,
+    SensorRecord,
+    SqliteStore,
+)
 
 LOGGER = logging.getLogger("coldaisle.ingest")
+
+MAX_LOGGED_DUPLICATES = 10
+"""重複を個別に記録する上限。総数は終了時にまとめて出す。"""
+
+QUEUE_SIZE = 256
+"""読み取りスレッドとの待ち行列。**有界にする**（常駐メモリ。NFR-05）。"""
 
 INGEST_SOURCE_KEY = "sys.ingest_source"
 """`system_state` のキー。API の `/health` がソース種別として返す（FR-305）。"""
@@ -37,6 +60,8 @@ DEFAULT_DB = Path("var/coldaisle.db")
 DEFAULT_SCENARIOS = Path("config/scenarios.yaml")
 DEFAULT_QUALITY_RULES = Path("config/quality.yaml")
 DEFAULT_CALIBRATION = Path("config/calibration.json")
+DEFAULT_RULES = Path("config/rules.yaml")
+DEFAULT_METRICS = Path("config/metrics.yaml")
 
 
 @dataclass
@@ -52,6 +77,12 @@ class Stats:
     """`seq` の飛びの合計（FR-105）。"""
     restarts: int = 0
     """`up` の巻き戻りの回数（FR-106）。"""
+    alerts_fired: int = 0
+    """発火したアラートの数（FR-401〜409）。"""
+    duplicates: int = 0
+    """既にある `(metric, ts_ms)` として無視された行数（決定記録 0012 §2.4）。"""
+    queue_drops: int = 0
+    """待ち行列が溢れて捨てたメッセージ数（決定記録 0012 §2.3）。"""
     unknown_channels: set[str] = field(default_factory=set)
 
     def as_fields(self) -> dict[str, object]:
@@ -62,6 +93,9 @@ class Stats:
             "discarded": self.discarded,
             "dropped_samples": self.dropped_samples,
             "restarts": self.restarts,
+            "alerts_fired": self.alerts_fired,
+            "duplicates": self.duplicates,
+            "queue_drops": self.queue_drops,
             "unknown_channels": sorted(self.unknown_channels),
         }
 
@@ -76,13 +110,18 @@ class Daemon:
         store: SqliteStore,
         normalizer: Normalizer,
         source_name: str = "unknown",
+        engine: Engine | None = None,
+        tick_s: float = 1.0,
     ) -> None:
         self._source = source
         self._store = store
         self._normalizer = normalizer
         self._source_name = source_name
+        self._engine = engine
+        self._tick_s = tick_s
         self._stop = False
         self._device_id: str | None = None
+        self._reported_drops = 0
         self.stats = Stats()
 
     @property
@@ -107,6 +146,16 @@ class Daemon:
         self._stop = True
 
     def run(self, *, max_samples: int | None = None) -> Stats:
+        """取り込みループ。
+
+        ソースは**別スレッド**で読む。同じスレッドで読むと `stream()` の待機中は
+        何もできず、**サンプルが来ないこと自体を検出できない**（FR-401 の無音は
+        30秒サンプルが無いことで判定する）。待ち受けに時間切れを設け、
+        空振りのたびに時刻ベースのルールを評価する。
+
+        DB を触るのはこのスレッドだけ。読み取りスレッドはソースを回すだけにする
+        （接続はスレッド間で共有しない。決定記録 0004 §2.8）。
+        """
         LOGGER.info(
             "取り込みを開始する",
             extra={logs.FIELDS_KEY: {"max_samples": max_samples, "source": self._source_name}},
@@ -115,22 +164,106 @@ class Daemon:
         self._store.set_system_state(
             INGEST_SOURCE_KEY, self._source_name, at_ms=self._normalizer.clock.now_ms()
         )
-        for message in self._source.stream():
+
+        # 受信時刻を**受け取った瞬間に**確定して一緒に運ぶ（決定 D-05）。
+        # 処理時刻で付けると、追いつくまでの間に進んだぶんだけずれる
+        if self._engine is not None:
+            # **いつから見ているか**を基準にする。起動時からデバイスが無い場合、
+            # これが無いと `SENSOR_FAULT` が永久に鳴らない
+            self._engine.begin(self._normalizer.clock.now_ms())
+
+        inbox: queue.Queue[tuple[int, RawMessage] | BaseException | None] = queue.Queue(
+            maxsize=QUEUE_SIZE
+        )
+        reader = threading.Thread(target=self._read_into, args=(inbox,), daemon=True)
+        reader.start()
+        while True:
             if self._stop:
                 LOGGER.info("停止要求を受けた")
                 break
-            self._handle(message)
+            try:
+                received = inbox.get(timeout=self._tick_s)
+            except queue.Empty:
+                self._tick()
+                continue
+            if received is None:
+                break  # ソースが尽きた
+            if isinstance(received, BaseException):
+                # **ソースが落ちたことを正常終了と区別する。** 同じに扱うと、
+                # 途中で死んだ監視をサービス管理（systemd）が再起動できない。
+                # 1サンプルの失敗で落とさないこと（AGENTS.md）とは別の話
+                LOGGER.error("ソースが落ちた", exc_info=received)
+                raise received
+            self._handle(*received)
             if max_samples is not None and self.stats.samples >= max_samples:
                 break
         LOGGER.info("取り込みを終了する", extra={logs.FIELDS_KEY: self.stats.as_fields()})
         return self.stats
 
-    def _handle(self, message: RawMessage) -> None:
+    def _read_into(self, inbox: queue.Queue[tuple[int, RawMessage] | BaseException | None]) -> None:
+        """ソースを回して詰めるだけのスレッド。**DB には触らない。**
+
+        ソースが落ちたら例外そのものを渡す。正常終了と同じ印にすると、
+        **途中で死んだ監視を完走と区別できない**（サービス管理が再起動できない）。
+        """
+        try:
+            for message in self._source.stream():
+                if self._stop:
+                    break
+                received = (self._source.clock.now_ms(), message)
+                try:
+                    inbox.put_nowait(received)
+                except queue.Full:
+                    # **捨てるのは古い側**（決定記録 0004 §2.6 と同じ理由。
+                    # 監視で欠けてはならないのは直近）。黙って捨てない
+                    with suppress(queue.Empty):
+                        inbox.get_nowait()
+                    self.stats.queue_drops += 1
+                    inbox.put(received)
+        except Exception as error:
+            inbox.put(error)
+        else:
+            inbox.put(None)
+
+    def _with_queue_drops(self, sample: Sample) -> Sample:
+        """待ち行列の取りこぼしを、次のサンプルに乗せて記録する。
+
+        捨てるのは読み取りスレッドだが、**DB を触るのは取り込みスレッドだけ**
+        （決定記録 0004 §2.8）。API は別プロセスなので、`/api/v1/health` から
+        見えるようにするには残すしかない（決定記録 0012 §2.3）。
+        """
+        pending = self.stats.queue_drops - self._reported_drops
+        if pending <= 0:
+            return sample
+        self._reported_drops = self.stats.queue_drops
+        LOGGER.warning("待ち行列が溢れた", extra={logs.FIELDS_KEY: {"dropped": pending}})
+        return sample.model_copy(
+            update={
+                "readings": (
+                    *sample.readings,
+                    Reading(metric=QUEUE_DROPS_METRIC, value=float(pending), quality=Quality.OK),
+                )
+            }
+        )
+
+    def _tick(self) -> None:
+        """サンプルが来ないときの評価。無音の検出（FR-401）はここで動く。"""
+        if self._engine is None:
+            return
+        try:
+            self._record(self._engine.on_tick())
+        except Exception:
+            LOGGER.warning("ルールの評価に失敗した", exc_info=True)
+
+    def _record(self, transitions: list[Transition]) -> None:
+        self.stats.alerts_fired += sum(1 for t in transitions if t.state == "firing")
+
+    def _handle(self, received_ms: int, message: RawMessage) -> None:
         try:
             if isinstance(message, RawHello):
-                self._on_hello(message)
+                self._on_hello(message, received_ms)
             else:
-                self._on_sample(message)
+                self._on_sample(message, received_ms)
         except Exception:
             self.stats.discarded += 1
             LOGGER.warning(
@@ -139,10 +272,17 @@ class Daemon:
                 extra={logs.FIELDS_KEY: {"discarded": self.stats.discarded}},
             )
 
-    def _on_hello(self, hello: RawHello) -> None:
-        at_ms = self._normalizer.clock.now_ms()
+    def _on_hello(self, hello: RawHello, received_ms: int) -> None:
+        # **受け取った瞬間の時刻を使う。** 待ち行列に積まれている間に時計は進む
+        at_ms = received_ms
         self._device_id = hello.dev
-        previous = {sensor.channel: sensor.rom for sensor in self._store.sensors_for(hello.dev)}
+        recorded = {sensor.channel: sensor.rom for sensor in self._store.sensors_for(hello.dev)}
+        observed = {channel: sensor.rom for channel, sensor in hello.sensors.items()}
+        mismatched = sorted(
+            channel
+            for channel, rom in observed.items()
+            if channel in recorded and recorded[channel] != rom
+        )
         sensors = [
             SensorRecord(
                 channel=channel,
@@ -153,6 +293,9 @@ class Daemon:
             )
             for channel, sensor in hello.sensors.items()
         ]
+        # **不一致のあいだは記録側を上書きしない。** 記録された ROM は「較正が
+        # 対応している構成」であり、人が較正をやり直すまでの基準になる
+        # （FR-403 / 決定記録 0012 §2.6）
         self._store.record_hello(
             DeviceRecord(
                 device_id=hello.dev,
@@ -162,6 +305,7 @@ class Daemon:
             ),
             sensors,
             at_ms=at_ms,
+            replace_sensors=not mismatched,
         )
         self.stats.hellos += 1
         LOGGER.info(
@@ -175,23 +319,35 @@ class Daemon:
                 }
             },
         )
-        changed = sorted(
-            sensor.channel
-            for sensor in sensors
-            if sensor.channel in previous and previous[sensor.channel] != sensor.rom
-        )
-        if changed:
-            # 位置の入れ替えか差し替え。アラート化（FR-403）は #14
+        if mismatched:
             LOGGER.warning(
-                "プローブの ROM が前回と違う",
-                extra={logs.FIELDS_KEY: {"device": hello.dev, "channels": changed}},
+                "プローブの ROM が記録と違う（較正のやり直しが要る）",
+                extra={logs.FIELDS_KEY: {"device": hello.dev, "channels": mismatched}},
             )
+        if self._engine is not None:
+            self._record(self._engine.on_hello(observed, recorded, at_ms=at_ms))
 
-    def _on_sample(self, raw: RawSample) -> None:
-        normalized = self._normalizer.normalize(raw)
-        self._store.insert_sample(normalized.sample)
+    def _on_sample(self, raw: RawSample, received_ms: int) -> None:
+        normalized = self._normalizer.normalize(raw, ts_ms=received_ms)
+        stored_sample = self._with_queue_drops(normalized.sample)
+        expected = len(stored_sample.readings)
+        written = self._store.insert_sample(stored_sample)
         self.stats.samples += 1
-        self.stats.readings += len(normalized.sample.readings)
+        self.stats.readings += written
+        if written < expected:
+            # 同じ `(metric, ts_ms)` は無視される（決定記録 0012 §2.4）。
+            # **黙って捨てない。** 同じ CSV の二重再生などで起こる
+            self.stats.duplicates += expected - written
+            if self.stats.duplicates <= MAX_LOGGED_DUPLICATES:
+                LOGGER.warning(
+                    "既にある時刻の行を書かなかった",
+                    extra={
+                        logs.FIELDS_KEY: {
+                            "ts_ms": normalized.sample.ts_ms,
+                            "ignored": expected - written,
+                        }
+                    },
+                )
 
         if normalized.dropped_samples:
             self.stats.dropped_samples += normalized.dropped_samples
@@ -213,6 +369,8 @@ class Daemon:
             )
         if normalized.out_of_order:
             LOGGER.warning("seq が進んでいない", extra={logs.FIELDS_KEY: {"seq": raw.seq}})
+        if self._engine is not None:
+            self._record(self._engine.on_sample(normalized.sample))
         if normalized.unknown_channels:
             new = set(normalized.unknown_channels) - self.stats.unknown_channels
             self.stats.unknown_channels |= set(normalized.unknown_channels)
@@ -240,6 +398,10 @@ class Config:
     """一括投入。待たずに流す（`--speed` は無視される）。"""
     timezone: str = "Asia/Tokyo"
     """CSV の時刻の解釈に使う。ファイルにオフセットが無いため（決定記録 0008 §2.8）。"""
+    rules: Path = DEFAULT_RULES
+    metrics: Path = DEFAULT_METRICS
+    tick_s: float = 1.0
+    """サンプルが来ないときに時刻ベースのルールを評価する間隔。"""
 
 
 def build(config: Config) -> Daemon:
@@ -253,11 +415,22 @@ def build(config: Config) -> Daemon:
     calibration = _calibration_for(config)
     config.db.parent.mkdir(parents=True, exist_ok=True)
     clock: Clock = source.clock
+    store = SqliteStore(config.db, rules=rules, clock=clock)
     return Daemon(
         source=source,
-        store=SqliteStore(config.db, rules=rules, clock=clock),
+        store=store,
         normalizer=Normalizer(rules=rules, calibration=calibration, clock=clock),
         source_name=config.source,
+        # ルールエンジンは**取り込みと同じプロセス・同じ時計**で動かす。
+        # 継続時間の判定が実時間に依存すると、圧縮再生で検証できない
+        # （決定記録 0007 §2.11 / §5 未決3）
+        engine=Engine(
+            rules=RuleSet.from_yaml(config.rules),
+            catalog=MetricCatalog.from_yaml(config.metrics),
+            store=store,
+            clock=clock,
+        ),
+        tick_s=config.tick_s,
     )
 
 
@@ -308,6 +481,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--scenarios", type=Path, default=DEFAULT_SCENARIOS)
     parser.add_argument("--quality-rules", type=Path, default=DEFAULT_QUALITY_RULES)
     parser.add_argument("--calibration", type=Path, default=DEFAULT_CALIBRATION)
+    parser.add_argument("--rules", type=Path, default=DEFAULT_RULES)
+    parser.add_argument("--metrics", type=Path, default=DEFAULT_METRICS)
     parser.add_argument(
         "--csv", type=Path, default=None, help="replay の入力（ファイル/ディレクトリ）"
     )
@@ -330,6 +505,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             scenarios=args.scenarios,
             quality_rules=args.quality_rules,
             calibration=args.calibration,
+            rules=args.rules,
+            metrics=args.metrics,
             csv=args.csv,
             bulk=args.bulk,
             timezone=args.timezone,
@@ -358,5 +535,5 @@ def main(argv: Sequence[str] | None = None) -> int:
     return 0
 
 
-if __name__ == "__main__":  # pragma: no cover - `python -m coldaisle.ingest.daemon`
+if __name__ == "__main__":  # pragma: no cover - `python -m coldaisle.daemon`
     raise SystemExit(main())
