@@ -250,7 +250,7 @@ def build(config: Config) -> Daemon:
     """
     source = _build_source(config)
     rules = QualityRules.from_yaml(config.quality_rules)
-    calibration = Calibration.from_json(config.calibration)
+    calibration = _calibration_for(config)
     config.db.parent.mkdir(parents=True, exist_ok=True)
     clock: Clock = source.clock
     return Daemon(
@@ -259,6 +259,19 @@ def build(config: Config) -> Daemon:
         normalizer=Normalizer(rules=rules, calibration=calibration, clock=clock),
         source_name=config.source,
     )
+
+
+def _calibration_for(config: Config) -> Calibration:
+    """再生では較正を当てない（決定記録 0010 §2.9）。
+
+    CSV に入っているのは**保存済みの値**である（日次CSV は `readings` の値を
+    書き出す。決定記録 0008 §2.8）。そこへ較正オフセットを当てると**二重になり、
+    再生した温度が全部ずれる。** 較正は取り込み時点の変換であって、
+    記録済みの値へ後から重ねるものではない。
+    """
+    if config.source == "replay":
+        return Calibration(note="再生では較正を当てない（決定記録 0010 §2.9）")
+    return Calibration.from_json(config.calibration)
 
 
 def _build_source(config: Config) -> Source:
@@ -322,6 +335,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             timezone=args.timezone,
         )
     )
+    if args.source == "replay":
+        LOGGER.info("再生では較正を当てない（決定記録 0010 §2.9）")
     if args.speed != 1.0 or args.bulk:
         # 決定記録 0007 §2.11: 圧縮再生はこのプロセスの中だけで意味を持つ
         LOGGER.warning(

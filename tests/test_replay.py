@@ -334,3 +334,70 @@ def test_daemon_reports_a_missing_csv(tmp_path):
                 calibration=CALIBRATION_PATH,
             )
         )
+
+
+def test_replay_does_not_apply_calibration(tmp_path, day_24):
+    """**保存済みの値に較正を二重に当てない**（決定記録 0010 §2.9）。
+
+    日次CSV は `readings` の値を書き出す（決定記録 0008 §2.8）。それを再生した
+    ときに較正を当てると、再生した温度が全部ずれる。#13 で較正値を測った
+    瞬間に効いてくるので、値が 0.0 の今のうちに固定する。
+    """
+    from coldaisle.ingest.daemon import Config, build
+    from conftest import QUALITY_RULES_PATH, SCENARIOS_PATH
+
+    calibration = tmp_path / "calibration.json"
+    calibration.write_text('{"offsets_c": {"room_temp": 5.0}}', encoding="utf-8")
+
+    daemon = build(
+        Config(
+            source="replay",
+            csv=day_24,
+            bulk=True,
+            db=tmp_path / "replay.db",
+            scenarios=SCENARIOS_PATH,
+            quality_rules=QUALITY_RULES_PATH,
+            calibration=calibration,
+        )
+    )
+    try:
+        daemon.run()
+        points = daemon.store.series(
+            "air.room", ms("2026-08-24T00:00:00"), ms("2026-08-25T00:00:00")
+        )
+    finally:
+        daemon.store.close()
+
+    assert points[0].value == 24.4, "CSV の値そのまま。+5.0 されていない"
+
+
+def test_dropped_rows_are_counted_and_logged(odd_columns, caplog):
+    """**黙って捨てない。** 完全な再生かどうかを運用者が判断できるようにする。"""
+    replay = ReplaySource(odd_columns, tz=JST, sleep=no_sleep)
+    with caplog.at_level("WARNING"):
+        produced = samples(replay)
+
+    assert len(produced) == 2
+    assert replay.dropped_rows == 1
+    assert any("読めない行を捨てた" in record.message for record in caplog.records)
+    assert any("再生で行を捨てた" in record.message for record in caplog.records)
+
+
+def test_interval_estimation_reads_only_two_rows(logs, monkeypatch):
+    """起動バナーのために書庫全体を読まない。
+
+    条件で絞るだけだと生成器を最後まで回し、一括投入のたびに
+    入力を2度読むことになる。
+    """
+    replay = ReplaySource(logs, tz=JST, sleep=no_sleep)
+    parsed = 0
+    original = ReplaySource._parse_row
+
+    def counting(self, row, stamp_column):
+        nonlocal parsed
+        parsed += 1
+        return original(self, row, stamp_column)
+
+    monkeypatch.setattr(ReplaySource, "_parse_row", counting)
+    assert replay.hello.interval_ms == 3_000
+    assert parsed <= 3, f"{parsed} 行も読んでいる"
