@@ -537,3 +537,55 @@ def test_humidity_metric_is_validated_too(store, rule_set):
             store=store,
             clock=store.clock,
         )
+
+
+@pytest.mark.slow
+def test_firing_and_resolution_reach_the_notifier(tmp_path):
+    """受入基準: MockSource で発火させた通知が届く（#20）。
+
+    外部サービスへは出ない。宛先を差し替えて確かめる。
+    """
+    from coldaisle.daemon import Config, build
+    from coldaisle.notify import Notification, NotifyConfig, Router
+    from conftest import CALIBRATION_PATH, SCENARIOS_PATH
+
+    received: list[Notification] = []
+
+    class Recorder:
+        name = "slack"
+
+        def send(self, notification: Notification) -> None:
+            received.append(notification)
+
+    daemon = build(
+        Config(
+            source="mock",
+            scenario="recirculation",
+            speed=60.0,
+            db=tmp_path / "notify.db",
+            scenarios=SCENARIOS_PATH,
+            quality_rules=QUALITY_RULES_PATH,
+            calibration=CALIBRATION_PATH,
+            rules=RULES_PATH,
+            metrics=METRICS_PATH,
+            notify=CONFIG_DIR / "notify.yaml",
+            tick_s=0.05,
+        )
+    )
+    # **固定した昼の時刻で判定させる。** 実時計だと、夜に走らせたテストが
+    # 夜間の抑制（決定記録 0001 D-04）に掛かって落ちる
+    daemon._notifier = Router(
+        config=NotifyConfig.from_yaml(CONFIG_DIR / "notify.yaml"),
+        notifiers={"slack": Recorder(), "stdout": Recorder()},
+        clock=SimulatedClock(1_787_626_800_000),  # 2026-08-25T12:00:00+09:00
+    )
+    try:
+        daemon.run(max_samples=360)
+    finally:
+        daemon.store.close()
+
+    fired = [item for item in received if item.state == "firing"]
+    assert fired, "発火が通知されていない"
+    assert fired[0].rule_id == "RECIRCULATION"
+    assert "air.room" in fired[0].context, "本文に現在値が載る"
+    assert fired[0].dashboard_url

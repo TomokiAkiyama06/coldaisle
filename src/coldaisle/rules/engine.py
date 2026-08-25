@@ -48,13 +48,18 @@ class RuleState:
 
 @dataclass(frozen=True)
 class Transition:
-    """状態が変わったこと。通知（#20）はこれを見る。"""
+    """状態が変わったこと。通知（#20）はこれを見る。
+
+    **状態ではなく遷移を配る。** 発生中のあいだ送り続けると、
+    受け取る側が「新しく起きたこと」を見分けられなくなる。
+    """
 
     rule_id: str
     metric: str | None
     state: str
     value: float | None
     detail: str | None = None
+    severity: str = "warning"
 
 
 @dataclass
@@ -336,6 +341,11 @@ class Engine:
 
     # ------------------------------------------------------------------ 状態機械
 
+    def _severity(self, rule_id: str, metric: str | None) -> str:
+        """保存済みの行から重大度を引く。設定と履歴で食い違わせない。"""
+        alert = self.store.active_alert(rule_id, metric)
+        return alert.severity.value if alert is not None else "warning"
+
     def _advance(self, proposed_ms: int) -> int:
         """評価時刻を進める。**巻き戻さない**（決定記録 0012 §2.2）。"""
         self._now_ms = max(self._now_ms, proposed_ms)
@@ -378,7 +388,7 @@ class Engine:
             trigger_value=value,
             detail=detail,
         )
-        transitions = [Transition(rule_id, metric, "pending", value, detail)]
+        transitions = [Transition(rule_id, metric, "pending", value, detail, severity)]
         if fire_after_s <= 0:
             transitions += self._fire(rule_id, metric, value, detail)
         return transitions
@@ -406,7 +416,9 @@ class Engine:
             "アラートが発火した",
             extra={logs.FIELDS_KEY: {"rule": rule_id, "metric": metric, "value": value}},
         )
-        return [Transition(rule_id, metric, "firing", value, detail)]
+        return [
+            Transition(rule_id, metric, "firing", value, detail, self._severity(rule_id, metric))
+        ]
 
     def _end(self, rule_id: str, metric: str | None) -> list[Transition]:
         state = self._state(rule_id, metric)
@@ -426,4 +438,8 @@ class Engine:
         state.alert_id = None
         state.firing = False
         state.resumed_ms = None
-        return [Transition(rule_id, metric, "resolved", None)] if was_firing else []
+        if not was_firing:
+            return []
+        return [
+            Transition(rule_id, metric, "resolved", None, None, self._severity(rule_id, metric))
+        ]

@@ -153,6 +153,7 @@ src/coldaisle/
   store/      # L1: SQLite、ロールアップ、CSVエクスポート
   api/        # L2: FastAPI、WebSocket
   rules/      # L2: ルールエンジン（決定論的。AI非依存）
+  notify/     # L2: 通知（Slack / LINE / stdout）。秘匿情報は .env
   ai/         # L3: LLM Provider抽象、ツール、プロンプト
   web/        # L4: 静的アセット
 firmware/     # ESP32-S3 Arduino スケッチ
