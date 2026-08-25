@@ -35,6 +35,8 @@ coldaisle-daemon = "coldaisle.daemon:main"
 coldaisle-rollup = "coldaisle.store.rollup:main"
 # 日次レポート。cron から毎朝、ロールアップのあとに呼ぶ（#25）
 coldaisle-report = "coldaisle.report:main"
+# 故障疑いの案件資料。**送信はしない**（#39）
+coldaisle-escalate = "coldaisle.escalate:main"
 
 [build-system]
 requires = ["hatchling"]

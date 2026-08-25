@@ -397,7 +397,10 @@ def test_latest_does_not_scan_all_readings(store):
     計画に全走査が現れたら落とす。
     """
     plan = " | ".join(
-        row["detail"] for row in store.connection.execute("EXPLAIN QUERY PLAN " + db._LATEST_SQL)
+        row["detail"]
+        for row in store.connection.execute(
+            "EXPLAIN QUERY PLAN " + db._LATEST_SQL, (db._NO_UPPER_BOUND,)
+        )
     )
     assert "SCAN readings" not in plan, plan
     assert "SEARCH readings USING PRIMARY KEY" in plan, plan

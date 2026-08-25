@@ -24,6 +24,7 @@ uv run coldaisle-daemon --source replay --csv ~/server_sensor_logs --bulk  # 既
 uv run coldaisle-rollup             # ロールアップと保持期間の適用（1日1回）
 uv run coldaisle-report             # 前日の日次レポート（ロールアップのあと）
 uv run coldaisle-report --date 2026-08-24 --no-send --print  # 任意の日を作り直す
+uv run coldaisle-escalate           # 故障疑いの案件資料（**送信はしない**）
 COLDAISLE_DB=var/coldaisle.db uv run uvicorn coldaisle.api:app --host 127.0.0.1 --port 8000
 COLDAISLE_DB=var/coldaisle.db uv run uvicorn coldaisle.server:app --port 8000  # + AI ツールの窓口
 ```
@@ -156,6 +157,7 @@ src/coldaisle/
   ingest/     # L0: Source実装（serial / mock / replay）、正規化
   report.py   # 合成の起点: 日次レポート（Store→AI→通知）。#25
   server.py   # 合成の起点: 読み取りAPI + AIツールの窓口。#23
+  escalate.py # 合成の起点: 故障疑いの案件資料（AI非依存・送信しない）。#39
   store/      # L1: SQLite、ロールアップ、CSVエクスポート
   api/        # L2: FastAPI、WebSocket
   rules/      # L2: ルールエンジン（決定論的。AI非依存）
