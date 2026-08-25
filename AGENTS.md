@@ -25,6 +25,7 @@ uv run coldaisle-rollup             # ロールアップと保持期間の適用
 uv run coldaisle-report             # 前日の日次レポート（ロールアップのあと）
 uv run coldaisle-report --date 2026-08-24 --no-send --print  # 任意の日を作り直す
 COLDAISLE_DB=var/coldaisle.db uv run uvicorn coldaisle.api:app --host 127.0.0.1 --port 8000
+COLDAISLE_DB=var/coldaisle.db uv run uvicorn coldaisle.server:app --port 8000  # + AI ツールの窓口
 ```
 
 API の設定は環境変数（`COLDAISLE_DB` / `COLDAISLE_METRICS` / `COLDAISLE_MAX_POINTS` ほか。
@@ -154,6 +155,7 @@ src/coldaisle/
   daemon.py   # 合成の起点: Source→Normalizer→Store→Rules を束ねる。#8 / #18
   ingest/     # L0: Source実装（serial / mock / replay）、正規化
   report.py   # 合成の起点: 日次レポート（Store→AI→通知）。#25
+  server.py   # 合成の起点: 読み取りAPI + AIツールの窓口。#23
   store/      # L1: SQLite、ロールアップ、CSVエクスポート
   api/        # L2: FastAPI、WebSocket
   rules/      # L2: ルールエンジン（決定論的。AI非依存）

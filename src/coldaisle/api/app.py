@@ -13,12 +13,13 @@ import os
 import re
 import sqlite3
 import threading
-from collections.abc import AsyncIterator, Mapping
+from collections.abc import AsyncIterator, Callable, Mapping
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any, Protocol
 
-from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
 from fastapi.staticfiles import StaticFiles
 
 from coldaisle.api.models import (
@@ -54,6 +55,28 @@ _BUCKET_MS = {
     Aggregation.HOUR: HOUR_MS,
 }
 _COARSER = (Aggregation.RAW, Aggregation.MINUTE, Aggregation.FIVE_MINUTES, Aggregation.HOUR)
+
+
+class Tools(Protocol):
+    """AI 向けツールの最小の形（#23）。
+
+    **L2 は L3 を import しない**（AGENTS.md「レイヤ間の依存は一方向」）。
+    実体は `coldaisle.ai.tools.ToolRegistry`（L3）だが、この層はその名前を知らない。
+    合成の起点（`coldaisle/server.py`）が渡す。
+    """
+
+    @property
+    def guidance(self) -> str:
+        """呼び出し側の system prompt に入れる注意書き。**文面は L3 が持つ。**"""
+        ...
+
+    def definitions(self) -> list[dict[str, Any]]: ...
+
+    def call(self, name: str, arguments: dict[str, Any] | None = None) -> dict[str, Any]: ...
+
+
+ToolsFactory = Callable[[SqliteStore], Tools]
+"""接続からツールを組み立てる関数。**接続はスレッドごと**なので毎回渡す。"""
 
 
 @dataclass(frozen=True)
@@ -146,7 +169,12 @@ def choose_aggregation(
     return Aggregation.HOUR, True
 
 
-def create_app(config: Config | None = None, *, clock: Clock | None = None) -> FastAPI:
+def create_app(
+    config: Config | None = None,
+    *,
+    clock: Clock | None = None,
+    tools: ToolsFactory | None = None,
+) -> FastAPI:
     settings = config or Config.from_env()
     catalog = MetricCatalog.from_yaml(settings.metrics)
     provider = StoreProvider(settings, clock or WallClock())
@@ -394,10 +422,61 @@ def create_app(config: Config | None = None, *, clock: Clock | None = None) -> F
             return None
         return round(1 - float(row[0] or 0) / float(row[1]), 4)
 
+    if tools is not None:
+        _add_tool_routes(app, provider, tools)
+
     # 開発用ダッシュボード（#17）。API ルートの**後ろ**に置く。
     # 先に置くと `/api/v1/...` まで静的配信に飲まれる
     app.mount("/", StaticFiles(directory=WEB_ROOT, html=True), name="web")
     return app
+
+
+def _add_tool_routes(app: FastAPI, provider: StoreProvider, tools: ToolsFactory) -> None:
+    """Workspace のチャットが呼ぶツールの窓口（#23 / api-contract §3）。
+
+    **GET しか無い。** ツールは読み取り専用なので、読み取り専用であることが
+    HTTP メソッドに出る（api-contract §1「v1 に POST / PUT / DELETE は存在しない」）。
+    引数はクエリ文字列で受け、型の変換は各ツールの引数モデルに任せる。
+    """
+
+    @app.get("/api/v1/tools")
+    def list_tools() -> dict[str, Any]:
+        """関数定義の一覧。**呼び出し側の system prompt に入れる注意書きも返す。**"""
+        registry = tools(provider.get())
+        return {
+            "read_only": True,
+            "advisory": True,
+            "guidance": registry.guidance,
+            "tools": registry.definitions(),
+        }
+
+    @app.get("/api/v1/tools/{name}")
+    def call_tool(name: str, request: Request) -> dict[str, Any]:
+        """1つ実行する。**何が呼ばれたかを `meta` に返す**（回答の根拠が追えること）。
+
+        存在しないツール名や壊れた引数でも 200 を返し、`meta.ok` と
+        `result.error` で伝える。**モデルが寄こす名前と引数は入力データであり、
+        呼び出し側の誤りではない。** 4xx にすると、Workspace 側が会話を続ける
+        ためにいちいち例外を結果へ翻訳することになる。
+        """
+        arguments = dict(request.query_params)
+        registry = tools(provider.get())
+        started_ms = provider.get().clock.now_ms()
+        result = registry.call(name, arguments)
+        finished_ms = provider.get().clock.now_ms()
+        return {
+            "meta": {
+                "tool": name,
+                "arguments": arguments,
+                "ok": "error" not in result,
+                "ts_ms": finished_ms,
+                "ts": iso(finished_ms),
+                "elapsed_ms": max(0, finished_ms - started_ms),
+                "read_only": True,
+                "advisory": True,
+            },
+            "result": result,
+        }
 
 
 def _periodic(readings: Mapping[str, LatestReading]) -> dict[str, LatestReading]:
