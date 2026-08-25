@@ -567,6 +567,27 @@ class SqliteStore:
         ).fetchall()
         return tuple(AlertRecord.model_validate(dict(row)) for row in rows)
 
+    def fired_alerts(
+        self, *, start_ms: int, end_ms: int, limit: int = 100
+    ) -> tuple[AlertRecord, ...]:
+        """`fired_ms` が `[start_ms, end_ms)` に入るアラート（#25）。
+
+        **日の境界は「発火した時刻」に当てる。** `started_ms` に当てると、
+        23:55 に条件が成立して 00:03 に発火したアラートが前日の件数に入る。
+        通知が飛んだのは翌日であり、数え方が受け取った人の記憶と食い違う。
+
+        `alerts()` と分けたのは、一覧（FR-304）が見たいのは「いつ始まったか」で、
+        並びも母数も別物だからである。引数で切り替えると呼び分けを間違える。
+        """
+        rows = self._conn.execute(
+            "SELECT id, rule_id, severity, state, metric, started_ms, fired_ms, resolved_ms, "
+            "trigger_value, threshold, detail FROM alerts "
+            "WHERE fired_ms IS NOT NULL AND fired_ms >= ? AND fired_ms < ? "
+            "ORDER BY fired_ms DESC, id DESC LIMIT ?",
+            (start_ms, end_ms, limit),
+        ).fetchall()
+        return tuple(AlertRecord.model_validate(dict(row)) for row in rows)
+
     def series(
         self, metric: str, start_ms: int, end_ms: int, *, limit: int | None = None
     ) -> tuple[SeriesPoint, ...]:

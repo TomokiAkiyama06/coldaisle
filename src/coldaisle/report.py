@@ -103,6 +103,12 @@ class MetricLine:
     prev_mean: float | None = None
     prev_total: float | None = None
     missing_ratio: float | None = None
+    missing_minutes: int = 0
+    """欠測率の母数になった分数。**`minutes` より少ないことがある。**
+
+    起動バナーを受け取る前のバケットは期待サンプル数を持たない。混ぜると
+    欠測率が実際より低く出るので母数から外し、**外したことを表に書く。**
+    """
     minutes: int = 0
     """ロールアップ済みの分数。**1440 未満なら集計が未完了である。**"""
 
@@ -203,7 +209,7 @@ def _gauge_row(line: MetricLine) -> str:
     return (
         f"| {line.label}（{line.metric}） | {_num(line.minimum)} | {_num(line.mean)} "
         f"| {_num(line.maximum)} | {_delta(line.mean, line.prev_mean)} "
-        f"| {_ratio(line.missing_ratio)} | {line.minutes}/{MINUTES_PER_DAY} |"
+        f"| {_missing(line)} | {line.minutes}/{MINUTES_PER_DAY} |"
     )
 
 
@@ -225,8 +231,12 @@ def _delta(value: float | None, previous: float | None) -> str:
     return f"{value - previous:+.2f}"
 
 
-def _ratio(value: float | None) -> str:
-    return "—" if value is None else f"{value * 100:.1f}%"
+def _missing(line: MetricLine) -> str:
+    """欠測率。**母数が1日ぶんに満たないなら、その分数も書く。**"""
+    if line.missing_ratio is None:
+        return "—"
+    text = f"{line.missing_ratio * 100:.1f}%"
+    return text if line.missing_minutes >= line.minutes else f"{text}（{line.missing_minutes}分）"
 
 
 # ---------------------------------------------------------------------- 集計
@@ -268,9 +278,13 @@ def build(
 
 
 def _fired(store: SqliteStore, start_ms: int, end_ms: int) -> list[AlertRecord]:
-    """**発火したものだけ**を数える。pending のまま消えたものは誰にも届いていない。"""
-    records = store.alerts(start_ms=start_ms, end_ms=end_ms, limit=ALERT_SCAN_LIMIT)
-    return [record for record in records if record.fired_ms is not None]
+    """**その日に発火したもの**を数える。
+
+    pending のまま消えたものは誰にも届いていない。日の境界は `fired_ms` に当てる
+    （`SqliteStore.fired_alerts`）。条件の成立時刻に当てると、23:55 に成立して
+    00:03 に発火したアラートが前日の件数に入ってしまう。
+    """
+    return list(store.fired_alerts(start_ms=start_ms, end_ms=end_ms, limit=ALERT_SCAN_LIMIT))
 
 
 def _metric_order(store: SqliteStore, catalog: MetricCatalog) -> list[str]:
@@ -294,28 +308,41 @@ def _metric_line(
     unit = meta.unit if meta is not None else ""
     counter = unit == COUNTER_UNIT
     points = store.rollup(metric, window[0], window[1], Aggregation.MINUTE)
-    prior = store.rollup(metric, previous[0], previous[1], Aggregation.MINUTE)
-    minimum, maximum, mean, total, missing = _fold(points, counter=counter)
-    _, _, prev_mean, prev_total, _ = _fold(prior, counter=counter)
+    folded = _fold(points, counter=counter)
+    prior = _fold(
+        store.rollup(metric, previous[0], previous[1], Aggregation.MINUTE), counter=counter
+    )
     return MetricLine(
         metric=metric,
         label=meta.label if meta is not None else metric,
         unit=unit,
         counter=counter,
-        minimum=minimum,
-        maximum=maximum,
-        mean=mean,
-        total=total,
-        prev_mean=prev_mean,
-        prev_total=prev_total,
-        missing_ratio=missing,
+        minimum=folded.minimum,
+        maximum=folded.maximum,
+        mean=folded.mean,
+        total=folded.total,
+        prev_mean=prior.mean,
+        prev_total=prior.total,
+        missing_ratio=folded.missing_ratio,
+        missing_minutes=folded.missing_minutes,
         minutes=len(points),
     )
 
 
-def _fold(
-    points: Sequence[RollupPoint], *, counter: bool
-) -> tuple[float | None, float | None, float | None, float | None, float | None]:
+@dataclass(frozen=True)
+class _Folded:
+    """分バケットを1日にたたんだ結果。"""
+
+    minimum: float | None = None
+    maximum: float | None = None
+    mean: float | None = None
+    total: float | None = None
+    missing_ratio: float | None = None
+    missing_minutes: int = 0
+    """欠測率の母数になった分数。**1日ぶんとは限らない**（下記）。"""
+
+
+def _fold(points: Sequence[RollupPoint], *, counter: bool) -> _Folded:
     """分バケットを1日にたたむ。
 
     平均は**件数で重み付けする**（決定記録 0004 §2.9）。単純平均だと、
@@ -324,22 +351,28 @@ def _fold(
     if not points:
         # **「データが無い」を「ゼロ」と書かない。** 取り込みが止まっていた日の
         # 取りこぼし件数は 0 件ではなく、分からない
-        return (None, None, None, None, None)
+        return _Folded()
     ok = sum(point.ok_value_count for point in points)
     minima = [point.min_value for point in points if point.min_value is not None]
     maxima = [point.max_value for point in points if point.max_value is not None]
     weighted = sum(
         point.mean_value * point.ok_value_count for point in points if point.mean_value is not None
     )
-    expected = sum(point.expected_count or 0 for point in points)
-    return (
-        min(minima) if minima else None,
-        max(maxima) if maxima else None,
-        weighted / ok if ok else None,
-        weighted if counter else None,
+    # **期待サンプル数を知らないバケットを母数に混ぜない。** 起動バナーを受け取る
+    # 前のバケットは `expected_count` が NULL で、これを 0 として足すと、その分の
+    # `ok` だけが分子に残って欠測率が実際より低く出る（0% に張り付く）
+    known = [point for point in points if point.expected_count is not None]
+    expected = sum(point.expected_count or 0 for point in known)
+    known_ok = sum(point.ok_value_count for point in known)
+    return _Folded(
+        minimum=min(minima) if minima else None,
+        maximum=max(maxima) if maxima else None,
+        mean=weighted / ok if ok else None,
+        total=weighted if counter else None,
         # **カウンタに欠測率を出さない。** 事象が起きたときだけ書かれる値なので、
         # 期待サンプル数と比べる意味がない
-        None if counter or not expected else max(0.0, 1.0 - ok / expected),
+        missing_ratio=(None if counter or not expected else max(0.0, 1.0 - known_ok / expected)),
+        missing_minutes=0 if counter else len(known),
     )
 
 

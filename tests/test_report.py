@@ -124,12 +124,21 @@ def bucket(
     store.connection.commit()
 
 
-def alert(store, rule_id: str, *, minute: int, fired: bool = True, severity="warning") -> None:
+def alert(
+    store,
+    rule_id: str,
+    *,
+    minute: int,
+    fired: bool = True,
+    fired_minute: int | None = None,
+    severity="warning",
+) -> None:
     started = DAY_START_MS + minute * MINUTE_MS
+    at = DAY_START_MS + (minute if fired_minute is None else fired_minute) * MINUTE_MS
     store.connection.execute(
         "INSERT INTO alerts (rule_id, severity, state, metric, started_ms, fired_ms) "
         "VALUES (?, ?, ?, ?, ?, ?)",
-        (rule_id, severity, "resolved", "air.room", started, started if fired else None),
+        (rule_id, severity, "resolved", "air.room", started, at if fired else None),
     )
     store.connection.commit()
 
@@ -179,6 +188,31 @@ def test_missing_ratio_uses_expected_count(store, catalog):
     line = line_for(report_for(store, catalog), "air.room")
     assert line.missing_ratio == pytest.approx(0.5)
     assert "50.0%" in report_for(store, catalog).as_markdown()
+
+
+def test_unknown_expectations_are_left_out_of_the_missing_ratio(store, catalog):
+    """**期待サンプル数を知らないバケットを母数に混ぜない**（#25 のレビュー指摘）。
+
+    起動バナーを受け取る前のバケットは `expected_count` が NULL。0 として足すと
+    その分の `ok` だけが分子に残り、欠測率が実際より低く（0% に）出る。
+    """
+    bucket(store, "air.room", 0, mean=25.0, ok=24)  # 期待サンプル数を知らない
+    bucket(store, "air.room", 1, mean=25.0, ok=12, expected=24)
+    line = line_for(report_for(store, catalog), "air.room")
+    assert line.missing_ratio == pytest.approx(0.5)  # 0% ではない
+    assert (line.missing_minutes, line.minutes) == (1, 2)
+
+
+def test_a_partial_basis_is_written_in_the_table(store, catalog):
+    """母数が1日ぶんに満たないなら、**その分数も書く**（黙って割合だけ出さない）。"""
+    bucket(store, "air.room", 0, mean=25.0, ok=24)
+    bucket(store, "air.room", 1, mean=25.0, ok=12, expected=24)
+    assert "50.0%（1分）" in report_for(store, catalog).as_markdown()
+
+
+def test_a_full_basis_is_written_plainly(store, catalog):
+    bucket(store, "air.room", 0, mean=25.0, ok=12, expected=24)
+    assert "| 50.0% |" in report_for(store, catalog).as_markdown()
 
 
 def test_missing_ratio_is_absent_without_expected_count(store, catalog):
@@ -242,6 +276,21 @@ def test_alerts_are_compared_with_the_previous_day(store, catalog):
 def test_alerts_outside_the_day_are_not_counted(store, catalog):
     alert(store, "RECIRCULATION", minute=MINUTES_PER_DAY + 1)
     assert report_for(store, catalog).alert_total == 0
+
+
+def test_the_day_boundary_applies_to_the_firing_time(store, catalog):
+    """**通知が飛んだ日に数える**（#25 のレビュー指摘）。
+
+    23:55 に条件が成立して 00:03 に発火したアラートは、受け取った人にとって
+    翌日の出来事である。条件の成立時刻で切ると前日の件数に入り、
+    「昨日は静かだったのに件数が1件ある」という食い違いになる。
+    """
+    alert(store, "RECIRCULATION", minute=-5, fired_minute=3)  # 前日 23:55 成立 → 00:03 発火
+    alert(store, "SENSOR_MISSING", minute=MINUTES_PER_DAY - 5, fired_minute=MINUTES_PER_DAY + 3)
+    report = report_for(store, catalog)
+    assert report.alert_total == 1
+    assert report.alerts[0].rule_id == "RECIRCULATION"
+    assert report.prev_alert_total == 0  # 前日側にも入らない（発火は当日）
 
 
 # ---------------------------------------------------------------- 欠けの報告
