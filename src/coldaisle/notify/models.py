@@ -94,9 +94,15 @@ class Notification:
     dashboard_url: str
     context: dict[str, float | None] = field(default_factory=dict)
     """関連するメトリクスの現在値。**何が起きているかを本文だけで判断できるように。**"""
+    kind: str = "alert"
+    """`alert` か `explanation`。後者は発火の通知に**後から続く**説明（#38）。"""
+    body: str = ""
+    """本文をそのまま渡す場合に使う（説明の全文）。"""
 
     @property
     def title(self) -> str:
+        if self.kind == "explanation":
+            return f"🔎 {self.rule_id} の説明"
         mark = "🔴" if self.state == "firing" else "✅"
         target = f" [{self.metric}]" if self.metric else ""
         return f"{mark} {self.rule_id}{target} — {self.state}"
@@ -104,6 +110,8 @@ class Notification:
     def as_text(self) -> str:
         """人が読む本文。宛先によらず同じ内容にする。"""
         lines = [self.title]
+        if self.body:
+            return f"{self.title}\n\n{self.body}\n{self.dashboard_url}"
         if self.value is not None:
             lines.append(f"値: {self.value:.2f}")
         if self.detail:

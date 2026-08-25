@@ -21,7 +21,7 @@ import logging
 import queue
 import signal
 import threading
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from contextlib import suppress
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -29,6 +29,7 @@ from types import FrameType
 from zoneinfo import ZoneInfo
 
 from coldaisle import logs
+from coldaisle.ai import AiSettings, Explainer, ToolRegistry, provider_from_env
 from coldaisle.channels import QUEUE_DROPS_METRIC
 from coldaisle.clock import Clock
 from coldaisle.ingest import Calibration, MockSource, Normalizer, ReplaySource, load_scenarios
@@ -64,6 +65,7 @@ DEFAULT_QUALITY_RULES = Path("config/quality.yaml")
 DEFAULT_CALIBRATION = Path("config/calibration.json")
 DEFAULT_RULES = Path("config/rules.yaml")
 DEFAULT_NOTIFY = Path("config/notify.yaml")
+DEFAULT_AI = Path("config/ai.yaml")
 DEFAULT_METRICS = Path("config/metrics.yaml")
 
 
@@ -88,6 +90,8 @@ class Stats:
     """待ち行列が溢れて捨てたメッセージ数（決定記録 0012 §2.3）。"""
     notifications: int = 0
     """送った通知の数（#20）。抑制されたぶんは含まない。"""
+    explanations: int = 0
+    """後追いで送った Evidence 形式の説明の数（#38）。"""
     unknown_channels: set[str] = field(default_factory=set)
 
     def as_fields(self) -> dict[str, object]:
@@ -102,6 +106,7 @@ class Stats:
             "duplicates": self.duplicates,
             "queue_drops": self.queue_drops,
             "notifications": self.notifications,
+            "explanations": self.explanations,
             "unknown_channels": sorted(self.unknown_channels),
         }
 
@@ -118,6 +123,7 @@ class Daemon:
         source_name: str = "unknown",
         engine: Engine | None = None,
         notifier: Router | None = None,
+        explainer_factory: Callable[[], Explainer] | None = None,
         tick_s: float = 1.0,
     ) -> None:
         self._source = source
@@ -126,6 +132,9 @@ class Daemon:
         self._source_name = source_name
         self._engine = engine
         self._notifier = notifier
+        self._explainer_factory = explainer_factory
+        self._explain_queue: queue.Queue[int | None] = queue.Queue(maxsize=32)
+        self._explain_thread: threading.Thread | None = None
         self._tick_s = tick_s
         self._latest_values: dict[str, float | None] = {}
         self._stop = False
@@ -182,6 +191,9 @@ class Daemon:
             self._engine.begin(self._normalizer.clock.now_ms())
         if self._notifier is not None:
             self._notifier.start()
+        if self._explainer_factory is not None and self._explain_thread is None:
+            self._explain_thread = threading.Thread(target=self._explain_loop, daemon=True)
+            self._explain_thread.start()
 
         inbox: queue.Queue[tuple[int, RawMessage] | BaseException | None] = queue.Queue(
             maxsize=QUEUE_SIZE
@@ -208,6 +220,10 @@ class Daemon:
             self._handle(*received)
             if max_samples is not None and self.stats.samples >= max_samples:
                 break
+        if self._explain_thread is not None:
+            self._explain_queue.put(None)
+            self._explain_thread.join(timeout=5.0)
+            self._explain_thread = None
         if self._notifier is not None:
             # **送り切ってから止める。** 最後の critical を落とさない
             self._notifier.stop()
@@ -260,6 +276,63 @@ class Daemon:
             }
         )
 
+    def _request_explanation(self, transition: Transition) -> None:
+        """説明の生成を予約する。**通知経路をブロックしない**（#38）。
+
+        LLM は最長120秒かかりうる。取り込みループで待つと、その間の
+        サンプルを取りこぼす。発火の通知は既に送ってあり、説明は後から続く。
+        """
+        if self._explain_thread is None or self._store is None:
+            return
+        alert = self._store.active_alert(transition.rule_id, transition.metric)
+        if alert is None:
+            return
+        try:
+            self._explain_queue.put_nowait(alert.id)
+        except queue.Full:  # pragma: no cover - 生成が長時間詰まったとき
+            LOGGER.warning("説明の待ち行列が溢れた（素のアラートは届いている）")
+
+    def _explain_loop(self) -> None:  # pragma: no cover - スレッドの本体
+        """説明を作って後追いで送る。**このスレッドが自分の接続を開く。**
+
+        接続はスレッド間で共有しない（決定記録 0004 §2.8）。
+        """
+        explainer: Explainer | None = None
+        while True:
+            alert_id = self._explain_queue.get()
+            if alert_id is None:
+                return
+            try:
+                if explainer is None and self._explainer_factory is not None:
+                    explainer = self._explainer_factory()
+                if explainer is None:
+                    continue
+                self._send_explanation(explainer, alert_id)
+            except Exception:
+                LOGGER.warning("説明の生成に失敗した", exc_info=True)
+
+    def _send_explanation(self, explainer: Explainer, alert_id: int) -> None:
+        alert = explainer.tools.store.alert(alert_id)
+        if alert is None or self._notifier is None:
+            return
+        explanation = explainer.explain(alert)
+        if explanation is None:
+            return  # 素のアラートだけが届く（#38 のデグレード）
+        self._notifier.notify(
+            Notification(
+                rule_id=alert.rule_id,
+                severity=alert.severity,
+                state=alert.state.value,
+                metric=alert.metric,
+                value=alert.trigger_value,
+                detail=None,
+                dashboard_url=self._notifier.config.dashboard_url,
+                kind="explanation",
+                body=explanation.as_text(),
+            )
+        )
+        self.stats.explanations += 1
+
     def _tick(self) -> None:
         """サンプルが来ないときの評価。無音の検出（FR-401）はここで動く。"""
         if self._engine is None:
@@ -293,8 +366,11 @@ class Daemon:
                     context=dict(self._latest_values),
                 )
             )
-            if sent:
-                self.stats.notifications += 1
+            if not sent:
+                continue
+            self.stats.notifications += 1
+            if transition.state == "firing":
+                self._request_explanation(transition)
 
     def _handle(self, received_ms: int, message: RawMessage) -> None:
         try:
@@ -444,6 +520,7 @@ class Config:
     """CSV の時刻の解釈に使う。ファイルにオフセットが無いため（決定記録 0008 §2.8）。"""
     rules: Path = DEFAULT_RULES
     notify: Path = DEFAULT_NOTIFY
+    ai: Path = DEFAULT_AI
     metrics: Path = DEFAULT_METRICS
     tick_s: float = 1.0
     """サンプルが来ないときに時刻ベースのルールを評価する間隔。"""
@@ -475,6 +552,7 @@ def build(config: Config) -> Daemon:
             store=store,
             clock=clock,
         ),
+        explainer_factory=_explainer_factory(config, rules, clock),
         notifier=Router(
             config=NotifyConfig.from_yaml(config.notify),
             notifiers=notifiers_from_env(),
@@ -482,6 +560,30 @@ def build(config: Config) -> Daemon:
         ),
         tick_s=config.tick_s,
     )
+
+
+def _explainer_factory(
+    config: Config, quality_rules: QualityRules, clock: Clock
+) -> Callable[[], Explainer] | None:
+    """説明器を作る関数を返す。**呼ばれるのは説明スレッドの中。**
+
+    `SqliteStore` はスレッド間で共有しない（決定記録 0004 §2.8）ので、
+    接続を開くのは使う側のスレッドに任せる。
+    """
+    settings = AiSettings.from_yaml(config.ai)
+    if not settings.explain_alerts:
+        return None
+    catalog = MetricCatalog.from_yaml(config.metrics)
+    rule_set = RuleSet.from_yaml(config.rules)
+
+    def build() -> Explainer:
+        store = SqliteStore(config.db, rules=quality_rules, clock=clock)
+        return Explainer(
+            provider=provider_from_env(settings),
+            tools=ToolRegistry(store=store, catalog=catalog, rules=rule_set, clock=clock),
+        )
+
+    return build
 
 
 def _calibration_for(config: Config) -> Calibration:
@@ -533,6 +635,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--calibration", type=Path, default=DEFAULT_CALIBRATION)
     parser.add_argument("--rules", type=Path, default=DEFAULT_RULES)
     parser.add_argument("--notify", type=Path, default=DEFAULT_NOTIFY)
+    parser.add_argument("--ai", type=Path, default=DEFAULT_AI)
     parser.add_argument("--metrics", type=Path, default=DEFAULT_METRICS)
     parser.add_argument(
         "--csv", type=Path, default=None, help="replay の入力（ファイル/ディレクトリ）"
@@ -558,6 +661,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             calibration=args.calibration,
             rules=args.rules,
             notify=args.notify,
+            ai=args.ai,
             metrics=args.metrics,
             csv=args.csv,
             bulk=args.bulk,

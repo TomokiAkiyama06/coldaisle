@@ -58,6 +58,8 @@ class AiSettings(BaseModel):
     max_tokens: int = Field(gt=0)
     thinking: bool
     send_thinking_flag: bool
+    explain_alerts: bool = True
+    """発火したアラートに Evidence 形式の説明を後追いで付けるか（#38）。"""
 
     @classmethod
     def from_yaml(cls, path: Path) -> AiSettings:

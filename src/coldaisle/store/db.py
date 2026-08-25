@@ -503,6 +503,15 @@ class SqliteStore:
         with self.transaction():
             self._conn.execute("DELETE FROM alerts WHERE id = ? AND state = 'pending'", (alert_id,))
 
+    def alert(self, alert_id: int) -> AlertRecord | None:
+        """id で1件読む。説明の生成（#38）が別スレッドで読み直すのに使う。"""
+        row = self._conn.execute(
+            "SELECT id, rule_id, severity, state, metric, started_ms, fired_ms, resolved_ms, "
+            "trigger_value, threshold, detail FROM alerts WHERE id = ?",
+            (alert_id,),
+        ).fetchone()
+        return None if row is None else AlertRecord.model_validate(dict(row))
+
     def alerts(
         self,
         *,

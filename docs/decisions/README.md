@@ -85,3 +85,4 @@ docs/decisions/NNNN-<slug>.md      例: 0002-metric-naming.md
 | [0013](0013-notifications.md) | 通知の規約 | Proposed |
 | [0014](0014-llm-provider.md) | LLM Provider の規約 | Proposed |
 | [0015](0015-llm-tools.md) | 読み取り専用ツールの規約 | Proposed |
+| [0016](0016-evidence-alerts.md) | アラート説明の Evidence 形式 | Proposed |

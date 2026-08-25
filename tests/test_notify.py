@@ -345,3 +345,33 @@ def test_invalid_timezone_fails_at_load(tmp_path):
     path.write_text(text, encoding="utf-8")
     with pytest.raises(ValueError, match="タイムゾーン"):
         NotifyConfig.from_yaml(path)
+
+
+# ---------------------------------------------------------------- 説明の後追い（#38）
+
+
+def test_explanation_follows_a_delivered_alert(config):
+    """説明は**発火を届けた相手にだけ**、抑制を通さず後から続く（#38）。"""
+    slack = Recorder()
+    clock = SimulatedClock(NOON_MS)
+    sender = router(config, clock, slack=slack)
+    sender.notify(notification())
+
+    clock.advance_to_ms(NOON_MS + 30_000)  # 抑制の間隔より短い
+    assert sender.notify(notification(kind="explanation", body="VERIFIED\n✓ ...")) is True
+    assert [item.kind for item in slack.sent] == ["alert", "explanation"]
+
+
+def test_explanation_is_not_sent_when_the_alert_was_suppressed(config):
+    """届けていない発火の説明だけを送らない。"""
+    slack = Recorder()
+    sender = router(config, SimulatedClock(NIGHT_MS), slack=slack)
+    assert sender.notify(notification(severity="warning")) is False
+    assert sender.notify(notification(kind="explanation", body="x")) is False
+
+
+def test_explanation_body_is_used_as_is(config):
+    text = "VERIFIED（測定値・閾値判定）\n✓ [L2] 6.20（閾値 5.00）"
+    body = notification(kind="explanation", body=text).as_text()
+    assert text in body
+    assert "🔎" in body

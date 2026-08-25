@@ -102,6 +102,10 @@ class Router:
     def _should_send(self, notification: Notification) -> bool:
         key = (notification.rule_id, notification.metric)
         now = self.clock.now_ms()
+        if notification.kind == "explanation":
+            # **発火を届けた相手にだけ、後から続ける。** 連投の抑制も夜間の方針も
+            # 通さない（元の通知は既に届いている）。逆に届けていないなら送らない
+            return key in self._last_sent_ms
         if notification.state == "resolved":
             # **発火を届けたなら、解除も必ず届ける。** 連投の抑制も夜間の方針も
             # 通さない。送らないと、受け取った側は鳴りっぱなしだと思い続ける。
