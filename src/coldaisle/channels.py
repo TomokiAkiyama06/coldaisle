@@ -1,4 +1,4 @@
-"""デバイスのチャネル名とメトリクス名の対応（レイヤ横断）。#10
+"""メトリクス名の素性（レイヤ横断）。#10 / #9
 
 決定記録 0003 の対応表。デバイスは短い名前（`front_intake`）を送り、
 ホストは名前空間付き（`air.front_intake`）で保存する。
@@ -29,3 +29,22 @@ METRIC_TO_CHANNEL: dict[str, str] = {
 
 SAMPLE_CHANNELS: tuple[str, ...] = tuple(CHANNEL_TO_METRIC)
 """v1 のサンプルが持つチャネル（要件 §5.2）。JSON へ出す順でもある。"""
+
+
+DROPPED_SAMPLES_METRIC = "sys.dropped_samples"
+"""`seq` が飛んだときだけ書く（FR-105 / 決定記録 0007 §2.4）。"""
+
+DEVICE_RESTART_METRIC = "sys.device_restarts"
+"""`up` の巻き戻りを検出したときだけ書く（FR-106 / 決定記録 0007 §2.4）。"""
+
+EVENT_METRICS: frozenset[str] = frozenset({DROPPED_SAMPLES_METRIC, DEVICE_RESTART_METRIC})
+"""**起きたときにしか書かないメトリクス。**
+
+周期的に届く前提の判定（鮮度・欠測率）から外す。外さないと、
+一度でも取りこぼしが起きた瞬間から10秒後には `stale` になり、
+**センサーが正常に届いていても health が永久に赤になる。**
+
+新しく事象メトリクスを足すときは、ここへも足すこと。
+ここに無いメトリクスは「周期的に届く」とみなす — 判定から漏れて
+「古いのに緑」になるより、鳴りすぎるほうが安全側。
+"""

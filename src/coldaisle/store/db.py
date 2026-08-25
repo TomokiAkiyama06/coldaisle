@@ -16,6 +16,7 @@ from enum import StrEnum
 from pathlib import Path
 from types import TracebackType
 
+from coldaisle.channels import METRIC_TO_CHANNEL
 from coldaisle.clock import Clock
 from coldaisle.store import migrations
 from coldaisle.store.models import (
@@ -153,6 +154,12 @@ HOUR_MS = 60 * MINUTE_MS
 _ROLLUP_TABLES = {
     Aggregation.MINUTE: "readings_1m",
     Aggregation.HOUR: "readings_1h",
+}
+
+_BUCKET_WIDTH = {
+    Aggregation.MINUTE: MINUTE_MS,
+    Aggregation.FIVE_MINUTES: FIVE_MINUTES_MS,
+    Aggregation.HOUR: HOUR_MS,
 }
 
 
@@ -518,6 +525,103 @@ class SqliteStore:
             )
             for row in rows
         )
+
+    def aggregate(
+        self, metric: str, start_ms: int, end_ms: int, agg: Aggregation, *, limit: int | None = None
+    ) -> tuple[RollupPoint, ...]:
+        """集計済みの時系列。**まだロールアップされていない直近ぶんも含める。**
+
+        ロールアップは1日1回の別プロセス（決定記録 0008 §2.7）なので、
+        materialize 済みの表だけを読むと**前回の実行以降が丸ごと欠ける。**
+        「直近3時間」の要求が空で返ることさえある。
+
+        境界より前は保存済みのバケットを読み、後ろは生データからその場で集計する。
+        境界は**目的のバケット幅に揃える**ので、半分だけ保存済みのバケットは生じない。
+
+        `limit` を超える場合は古い側を落とす（決定記録 0004 §2.6 と同じ理由。
+        監視で欠けてはならないのは直近）。
+        """
+        if agg is Aggregation.RAW:
+            raise ValueError("agg=raw は series() を使う")
+        validate_metric(metric)
+        self._check_range(start_ms, end_ms)
+        bucket_ms = _BUCKET_WIDTH[agg]
+        boundary = self._materialised_through(agg, bucket_ms)
+
+        points: list[RollupPoint] = []
+        if start_ms < boundary:
+            points.extend(self.rollup(metric, start_ms, min(end_ms, boundary), agg))
+        if end_ms > boundary:
+            points.extend(
+                self._buckets_from_raw(metric, max(start_ms, boundary), end_ms, bucket_ms)
+            )
+        if limit is not None and len(points) > limit:
+            points = points[-limit:]
+        return tuple(points)
+
+    def _materialised_through(self, agg: Aggregation, bucket_ms: int) -> int:
+        """保存済みのバケットが**完全に**覆っている時刻の上限を返す。
+
+        1分の最終バケットが 12:07 なら、5分の 12:05〜12:09 はまだ埋まりきっていない。
+        そのバケットは生データから作り直す必要があるので、境界は 12:05 になる。
+        """
+        source, source_width = (
+            ("readings_1h", HOUR_MS) if agg is Aggregation.HOUR else ("readings_1m", MINUTE_MS)
+        )
+        row = self._conn.execute(f"SELECT MAX(bucket_ms) FROM {source}").fetchone()
+        if row is None or row[0] is None:
+            return 0
+        return ((int(row[0]) + source_width) // bucket_ms) * bucket_ms
+
+    def _buckets_from_raw(
+        self, metric: str, start_ms: int, end_ms: int, bucket_ms: int
+    ) -> list[RollupPoint]:
+        """生データからその場で集計する。保存はしない。
+
+        `readings_1m` と同じ式で数える（`quality='ok'` の行だけを平均する。
+        決定記録 0002 §2.8）。保存版と値が食い違ってはいけない。
+        """
+        expected = self._expected_per_bucket(metric, bucket_ms)
+        rows = self._conn.execute(
+            f"SELECT (ts_ms / {bucket_ms}) * {bucket_ms} AS bucket_ms, "
+            "  MIN(CASE WHEN quality = 'ok' THEN value END) AS min_value, "
+            "  MAX(CASE WHEN quality = 'ok' THEN value END) AS max_value, "
+            "  AVG(CASE WHEN quality = 'ok' THEN value END) AS mean_value, "
+            "  SUM(CASE WHEN quality = 'ok' AND value IS NOT NULL THEN 1 ELSE 0 END) "
+            "    AS ok_value_count, "
+            "  COUNT(*) AS row_count "
+            "FROM readings WHERE metric = ? AND ts_ms >= ? AND ts_ms < ? "
+            "GROUP BY bucket_ms ORDER BY bucket_ms",
+            (metric, start_ms, end_ms),
+        ).fetchall()
+        return [
+            RollupPoint(
+                bucket_ms=int(row["bucket_ms"]),
+                min_value=row["min_value"],
+                max_value=row["max_value"],
+                mean_value=row["mean_value"],
+                ok_value_count=int(row["ok_value_count"]),
+                row_count=int(row["row_count"]),
+                expected_count=expected,
+            )
+            for row in rows
+        ]
+
+    def _expected_per_bucket(self, metric: str, bucket_ms: int) -> int | None:
+        """このバケットで期待されるサンプル数（決定記録 0002 §2.8）。
+
+        周期的に届くのはデバイスのチャネルだけ。事象メトリクスや
+        まだ周期の分からないメトリクスは `None`（決定記録 0008 §2.1.2）。
+        """
+        if metric not in METRIC_TO_CHANNEL:
+            return None
+        row = self._conn.execute(
+            "SELECT interval_ms FROM devices WHERE interval_ms IS NOT NULL "
+            "ORDER BY last_hello_ms DESC LIMIT 1"
+        ).fetchone()
+        if row is None:
+            return None
+        return bucket_ms // int(row[0])
 
     def stats(self, metric: str, start_ms: int, end_ms: int) -> Stats:
         """窓 `[start_ms, end_ms)` の統計量（FR-303）。

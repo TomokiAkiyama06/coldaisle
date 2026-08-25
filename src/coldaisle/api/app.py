@@ -13,7 +13,7 @@ import os
 import re
 import sqlite3
 import threading
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Mapping
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
 from pathlib import Path
@@ -33,10 +33,11 @@ from coldaisle.api.models import (
     StreamMessage,
     iso,
 )
+from coldaisle.channels import EVENT_METRICS
 from coldaisle.clock import Clock, WallClock
 from coldaisle.store import Aggregation, Quality, QualityRules, SqliteStore
 from coldaisle.store.db import FIVE_MINUTES_MS, HOUR_MS, MINUTE_MS
-from coldaisle.store.models import validate_metric
+from coldaisle.store.models import LatestReading, validate_metric
 
 DEFAULT_SAMPLE_INTERVAL_MS = 2_500
 """起動バナーを受け取れていないときの想定周期。点数の見積りにだけ使う。"""
@@ -182,7 +183,7 @@ def create_app(config: Config | None = None, *, clock: Clock | None = None) -> F
                 for metric, reading in sorted(readings.items())
             },
             derived=derived_values.compute(readings, catalog),
-            stale=any(reading.quality is Quality.STALE for reading in readings.values()),
+            stale=_is_stale(readings),
         )
 
     @app.get("/api/v1/latest", response_model=LatestResponse, response_model_by_alias=True)
@@ -216,6 +217,9 @@ def create_app(config: Config | None = None, *, clock: Clock | None = None) -> F
                 for point in store.series(metric, start_ms, end_ms, limit=settings.max_points)
             ]
         else:
+            # **保存済みのバケットだけを読まない。** ロールアップは1日1回の
+            # 別プロセスなので、直近ぶんが丸ごと欠ける（決定記録 0009 §2.11）
+            buckets = store.aggregate(metric, start_ms, end_ms, used, limit=settings.max_points)
             points = [
                 SeriesPointOut(
                     ts_ms=bucket.bucket_ms,
@@ -226,13 +230,14 @@ def create_app(config: Config | None = None, *, clock: Clock | None = None) -> F
                     row_count=bucket.row_count,
                     missing_ratio=bucket.missing_ratio,
                 )
-                for bucket in store.rollup(metric, start_ms, end_ms, used)
+                for bucket in buckets
             ]
         return SeriesResponse(
             metric=metric,
             unit=catalog.unit_for(metric),
             agg=used.value,
             downsampled=downsampled,
+            truncated=len(points) >= settings.max_points,
             from_ms=start_ms,
             to_ms=end_ms,
             points=points,
@@ -288,10 +293,11 @@ def create_app(config: Config | None = None, *, clock: Clock | None = None) -> F
         store = provider.get()
         readings = store.latest()
         now_ms = store.clock.now_ms()
-        newest = max((reading.ts_ms for reading in readings.values()), default=None)
-        stale = any(reading.quality is Quality.STALE for reading in readings.values())
+        periodic = _periodic(readings)
+        newest = max((reading.ts_ms for reading in periodic.values()), default=None)
+        stale = _is_stale(readings)
         return HealthResponse(
-            ok=bool(readings) and not stale,
+            ok=bool(periodic) and not stale,
             source=store.current_state("sys.ingest_source"),
             last_sample_at=None if newest is None else iso(newest),
             last_sample_ts_ms=newest,
@@ -369,6 +375,19 @@ def create_app(config: Config | None = None, *, clock: Clock | None = None) -> F
         return round(1 - float(row[0] or 0) / float(row[1]), 4)
 
     return app
+
+
+def _periodic(readings: Mapping[str, LatestReading]) -> dict[str, LatestReading]:
+    """周期的に届く前提のメトリクスだけを残す。
+
+    事象メトリクス（`sys.dropped_samples` など）は起きたときにしか書かれない。
+    含めると、**一度取りこぼしが起きた10秒後から health が永久に赤になる。**
+    """
+    return {metric: reading for metric, reading in readings.items() if metric not in EVENT_METRICS}
+
+
+def _is_stale(readings: Mapping[str, LatestReading]) -> bool:
+    return any(reading.quality is Quality.STALE for reading in _periodic(readings).values())
 
 
 def _require_metric(metric: str) -> None:

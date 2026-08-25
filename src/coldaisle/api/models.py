@@ -74,6 +74,8 @@ class SeriesResponse(BaseModel):
     agg: str
     """**実際に使った粒度。** 要求より粗くなることがある（`downsampled`）。"""
     downsampled: bool
+    truncated: bool = False
+    """上限に達して**古い側を落とした**かどうか（決定記録 0004 §2.6）。"""
     from_ms: int = Field(serialization_alias="from")
     to_ms: int = Field(serialization_alias="to")
     points: list[SeriesPointOut]

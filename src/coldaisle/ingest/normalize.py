@@ -27,14 +27,14 @@ CHANNEL_TO_METRIC = channels.CHANNEL_TO_METRIC
 `SENSOR_MISSING`（FR-402）として別途検出される。
 """
 
-DROPPED_SAMPLES_METRIC = "sys.dropped_samples"
+DROPPED_SAMPLES_METRIC = channels.DROPPED_SAMPLES_METRIC
 """`seq` が飛んだときだけ書く。値は飛んだ件数（FR-105）。
 
 毎サンプル書かないのは、行数を14%増やす価値が無いため。**最新値ではなく
-期間の合計で読む**メトリクスである（`latest()` に出る値は直近の欠損の大きさ）。
+期間の合計で読む**メトリクスである（定義は `coldaisle.channels`）。
 """
 
-DEVICE_RESTART_METRIC = "sys.device_restarts"
+DEVICE_RESTART_METRIC = channels.DEVICE_RESTART_METRIC
 """`up` の巻き戻りを検出したときだけ 1 を書く（FR-106）。
 
 イベント表（#36）はまだ無い。ログだけに残すと後から集計できないため、

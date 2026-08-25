@@ -323,3 +323,132 @@ def test_alerts_can_be_filtered(db, rules, clock):
     assert [alert["id"] for alert in window] == [2]
     assert [alert["id"] for alert in limited] == [3]
     assert firing[0]["threshold"] == 5.0, "当時の閾値（決定記録 0002 §2.9）"
+
+
+# ---------------------------------------------------------------- レビュー指摘の退行防止
+
+
+def test_event_metrics_do_not_make_health_stale(db, rules, clock):
+    """**一度取りこぼしが起きても health は赤にならない。**
+
+    `sys.dropped_samples` は起きたときにしか書かれない（決定記録 0007 §2.4）。
+    鮮度の判定に混ぜると、10秒後から永久に `stale` になる。
+    """
+    with SqliteStore(db, rules=rules, clock=clock) as store:
+        store.insert_sample(
+            Sample(
+                ts_ms=NOW_MS - 30 * MINUTE_MS,
+                readings=(Reading(metric="sys.dropped_samples", value=4.0, quality=Quality.OK),),
+            )
+        )
+    app = create_app(
+        Config(db=db, quality_rules=QUALITY_RULES_PATH, metrics=METRICS_PATH), clock=clock
+    )
+    with TestClient(app) as client:
+        health = client.get("/api/v1/health").json()
+        latest = client.get("/api/v1/latest").json()
+
+    assert latest["metrics"]["sys.dropped_samples"]["quality"] == "stale", "値としては古い"
+    assert health["stale"] is False, "センサーは届いている"
+    assert health["ok"] is True
+
+
+def test_series_includes_samples_not_yet_rolled_up(tmp_path, rules, clock):
+    """**ロールアップ前の直近ぶんが欠けない。**
+
+    集計は1日1回の別プロセス（決定記録 0008 §2.7）。保存済みの表だけを読むと、
+    前回の実行以降が丸ごと落ちる。「直近3時間」が空で返ることさえある。
+    """
+    path = tmp_path / "tail.db"
+    with SqliteStore(path, rules=rules, clock=clock) as store:
+        store.record_hello(DeviceRecord(device_id="dev", interval_ms=INTERVAL_MS), [], at_ms=0)
+        samples = [
+            Sample(
+                ts_ms=NOW_MS - 3 * 3_600_000 + step * INTERVAL_MS,
+                readings=(Reading(metric="air.room", value=26.0, quality=Quality.OK),),
+            )
+            for step in range(4_320)  # 3時間ぶん
+        ]
+        store.insert_samples(samples)
+        # ロールアップは一度も走っていない
+
+    app = create_app(
+        Config(db=path, quality_rules=QUALITY_RULES_PATH, metrics=METRICS_PATH, max_points=100),
+        clock=clock,
+    )
+    with TestClient(app) as client:
+        body = client.get("/api/v1/series", params={"metric": "air.room", "window": "3h"}).json()
+
+    assert body["agg"] == "5m"
+    assert body["points"], "保存済みの表だけを見ていると空になる"
+    assert len(body["points"]) == 36, "3時間 ÷ 5分"
+    assert body["points"][0]["ok_count"] == 120
+    assert body["points"][0]["missing_ratio"] == pytest.approx(0.0)
+
+
+def test_series_joins_rolled_and_unrolled_parts(tmp_path, rules, clock):
+    """境界をまたいでも重複も欠落もしないこと。"""
+    path = tmp_path / "join.db"
+    with SqliteStore(path, rules=rules, clock=clock) as store:
+        store.record_hello(DeviceRecord(device_id="dev", interval_ms=INTERVAL_MS), [], at_ms=0)
+        store.insert_samples(
+            [
+                Sample(
+                    ts_ms=NOW_MS - 20 * MINUTE_MS + step * INTERVAL_MS,
+                    readings=(Reading(metric="air.room", value=26.0, quality=Quality.OK),),
+                )
+                for step in range(480)  # 20分ぶん
+            ]
+        )
+        # 前半10分ぶんだけを集計した状態を作る
+        store.connection.execute(
+            "DELETE FROM readings WHERE ts_ms >= ?", (NOW_MS - 10 * MINUTE_MS,)
+        )
+        rollup_minutes(store)
+        store.insert_samples(
+            [
+                Sample(
+                    ts_ms=NOW_MS - 10 * MINUTE_MS + step * INTERVAL_MS,
+                    readings=(Reading(metric="air.room", value=27.0, quality=Quality.OK),),
+                )
+                for step in range(240)
+            ]
+        )
+
+    app = create_app(
+        Config(db=path, quality_rules=QUALITY_RULES_PATH, metrics=METRICS_PATH), clock=clock
+    )
+    with TestClient(app) as client:
+        body = client.get(
+            "/api/v1/series", params={"metric": "air.room", "window": "20m", "agg": "1m"}
+        ).json()
+
+    stamps = [point["ts_ms"] for point in body["points"]]
+    assert len(stamps) == len(set(stamps)), "境界で二重に返さない"
+    assert len(stamps) == 20, "20分ぶんすべて返る"
+    assert body["points"][0]["value"] == 26.0
+    assert body["points"][-1]["value"] == 27.0, "未集計の直近も含む"
+
+
+def test_series_truncates_when_even_hours_exceed_the_limit(tmp_path, rules, clock):
+    """1時間粒度でも上限を超える範囲では、古い側を落として上限を守る。"""
+    path = tmp_path / "long.db"
+    with SqliteStore(path, rules=rules, clock=clock) as store:
+        store.connection.executemany(
+            "INSERT INTO readings_1h VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            [
+                ("air.room", NOW_MS - hour * 3_600_000, 25.0, 27.0, 26.0, 1440, 1440, 1440)
+                for hour in range(1, 200)
+            ],
+        )
+    app = create_app(
+        Config(db=path, quality_rules=QUALITY_RULES_PATH, metrics=METRICS_PATH, max_points=50),
+        clock=clock,
+    )
+    with TestClient(app) as client:
+        body = client.get("/api/v1/series", params={"metric": "air.room", "window": "200h"}).json()
+
+    assert body["agg"] == "1h"
+    assert len(body["points"]) == 50
+    assert body["truncated"] is True
+    assert body["points"][-1]["ts_ms"] > body["points"][0]["ts_ms"], "残すのは新しい側"
