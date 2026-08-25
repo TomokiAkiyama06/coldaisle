@@ -88,3 +88,4 @@ docs/decisions/NNNN-<slug>.md      例: 0002-metric-naming.md
 | [0016](0016-evidence-alerts.md) | アラート説明の Evidence 形式 | Proposed |
 | [0017](0017-daily-report.md) | 日次レポートの規約 | Proposed |
 | [0018](0018-tool-exposure.md) | AI 向けツールの公開方法 | Proposed |
+| [0019](0019-claude-escalation.md) | Claude へのエスカレーション | Proposed |
