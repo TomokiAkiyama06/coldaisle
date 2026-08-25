@@ -1,4 +1,0 @@
-Time,Room,Humidity, front_intake ,gpu_intake,gpu_exhaust,top_exhaust,rear_exhaust,vrm_temp
-2026-08-24T10:00:00,26.0,50.0,27.0,28.0,29.0,27.5,27.2,55.0
-not-a-timestamp,26.0,50.0,27.0,28.0,29.0,27.5,27.2,55.0
-2026-08-24T10:00:03,26.1,50.1,27.1,28.1,29.1,27.6,27.3,55.1
