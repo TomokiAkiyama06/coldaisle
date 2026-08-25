@@ -17,6 +17,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import FrameType
+from zoneinfo import ZoneInfo
 
 from coldaisle import logs
 from coldaisle.clock import Clock
@@ -24,6 +25,7 @@ from coldaisle.ingest.calibration import Calibration
 from coldaisle.ingest.mock import MockSource, load_scenarios
 from coldaisle.ingest.normalize import Normalizer
 from coldaisle.ingest.protocol import RawHello, RawMessage, RawSample, Source
+from coldaisle.ingest.replay import ReplaySource
 from coldaisle.store import DeviceRecord, QualityRules, SensorRecord, SqliteStore
 
 LOGGER = logging.getLogger("coldaisle.ingest")
@@ -232,6 +234,12 @@ class Config:
     scenarios: Path = DEFAULT_SCENARIOS
     quality_rules: Path = DEFAULT_QUALITY_RULES
     calibration: Path = DEFAULT_CALIBRATION
+    csv: Path | None = None
+    """`--source replay` の入力。ファイルかディレクトリ。"""
+    bulk: bool = False
+    """一括投入。待たずに流す（`--speed` は無視される）。"""
+    timezone: str = "Asia/Tokyo"
+    """CSV の時刻の解釈に使う。ファイルにオフセットが無いため（決定記録 0008 §2.8）。"""
 
 
 def build(config: Config) -> Daemon:
@@ -242,7 +250,7 @@ def build(config: Config) -> Daemon:
     """
     source = _build_source(config)
     rules = QualityRules.from_yaml(config.quality_rules)
-    calibration = Calibration.from_json(config.calibration)
+    calibration = _calibration_for(config)
     config.db.parent.mkdir(parents=True, exist_ok=True)
     clock: Clock = source.clock
     return Daemon(
@@ -253,9 +261,34 @@ def build(config: Config) -> Daemon:
     )
 
 
+def _calibration_for(config: Config) -> Calibration:
+    """再生では較正を当てない（決定記録 0010 §2.9）。
+
+    CSV に入っているのは**保存済みの値**である（日次CSV は `readings` の値を
+    書き出す。決定記録 0008 §2.8）。そこへ較正オフセットを当てると**二重になり、
+    再生した温度が全部ずれる。** 較正は取り込み時点の変換であって、
+    記録済みの値へ後から重ねるものではない。
+    """
+    if config.source == "replay":
+        return Calibration(note="再生では較正を当てない（決定記録 0010 §2.9）")
+    return Calibration.from_json(config.calibration)
+
+
 def _build_source(config: Config) -> Source:
+    if config.source == "replay":
+        if config.csv is None:
+            raise SystemExit("--source replay には --csv が要る（ファイルかディレクトリ）")
+        try:
+            return ReplaySource(
+                config.csv,
+                tz=ZoneInfo(config.timezone),
+                speed=config.speed,
+                bulk=config.bulk,
+            )
+        except ValueError as error:
+            raise SystemExit(str(error)) from error
     if config.source != "mock":
-        raise SystemExit(f"--source {config.source} は未実装（replay は #7、serial は #12）")
+        raise SystemExit(f"--source {config.source} は未実装（serial は #12）")
     scenarios = load_scenarios(config.scenarios)
     if config.scenario not in scenarios:
         raise SystemExit(
@@ -275,6 +308,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--scenarios", type=Path, default=DEFAULT_SCENARIOS)
     parser.add_argument("--quality-rules", type=Path, default=DEFAULT_QUALITY_RULES)
     parser.add_argument("--calibration", type=Path, default=DEFAULT_CALIBRATION)
+    parser.add_argument(
+        "--csv", type=Path, default=None, help="replay の入力（ファイル/ディレクトリ）"
+    )
+    parser.add_argument("--bulk", action="store_true", help="replay を待たずに流す（一括投入）")
+    parser.add_argument("--timezone", default="Asia/Tokyo", help="CSV の時刻の解釈")
     parser.add_argument("--max-samples", type=int, default=None, help="試験用。件数で止める")
     parser.add_argument("--log-level", default="INFO")
     return parser
@@ -292,9 +330,14 @@ def main(argv: Sequence[str] | None = None) -> int:
             scenarios=args.scenarios,
             quality_rules=args.quality_rules,
             calibration=args.calibration,
+            csv=args.csv,
+            bulk=args.bulk,
+            timezone=args.timezone,
         )
     )
-    if args.speed != 1.0:
+    if args.source == "replay":
+        LOGGER.info("再生では較正を当てない（決定記録 0010 §2.9）")
+    if args.speed != 1.0 or args.bulk:
         # 決定記録 0007 §2.11: 圧縮再生はこのプロセスの中だけで意味を持つ
         LOGGER.warning(
             "時間圧縮中はホスト時刻がシナリオ時間で進む。"

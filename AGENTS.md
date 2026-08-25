@@ -19,6 +19,7 @@ uv run ruff check . && uv run ruff format --check .
 uv run mypy src
 uv run coldaisle-daemon --source mock # 実機なしでデーモン起動
 uv run coldaisle-daemon --source mock --scenario ramp --speed 60  # 時間圧縮（下記の注意）
+uv run coldaisle-daemon --source replay --csv ~/server_sensor_logs --bulk  # 既存CSVの再生
 uv run coldaisle-rollup             # ロールアップと保持期間の適用（1日1回）
 COLDAISLE_DB=var/coldaisle.db uv run uvicorn coldaisle.api:app --host 127.0.0.1 --port 8000
 ```
