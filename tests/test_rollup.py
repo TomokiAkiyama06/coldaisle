@@ -407,3 +407,132 @@ def test_minute_query_does_far_less_work_than_raw(store):
 
     assert rows == 34_560
     assert minute_steps * 10 < raw_steps, f"raw={raw_steps} 1m={minute_steps}"
+
+
+# ---------------------------------------------------------------- レビュー指摘の退行防止
+
+
+def test_wholly_missing_minutes_are_materialised(store):
+    """1件も届かなかった分を「0行のバケット」として残す。
+
+    **これが無いと通信断が記録から消える。** 行が無い分は集約時に数えられず、
+    1分まるごと落ちた1時間が「欠測ゼロ」として残ってしまう。
+    """
+    from coldaisle.store import DeviceRecord
+
+    store.record_hello(DeviceRecord(device_id="dev", interval_ms=2_500), [], at_ms=0)
+    for minute in (0, 2):  # 1分目がまるごと欠落
+        for index in range(24):
+            write(store, "air.room", minute * MINUTE_MS + index * 2_500, 26.0)
+    rollup_minutes(store)
+
+    minutes = buckets(store, "readings_1m")
+    assert [bucket["bucket_ms"] for bucket in minutes] == [0, MINUTE_MS, 2 * MINUTE_MS]
+    absent = minutes[1]
+    assert (absent["ok_value_count"], absent["row_count"]) == (0, 0)
+    assert absent["expected_count"] == 24
+    assert absent["mean_value"] is None
+
+
+def test_hour_missing_ratio_survives_a_communication_outage(store):
+    """通信断の1分が、生データを消したあとも欠測として残ること。"""
+    from coldaisle.store import DeviceRecord
+
+    store.record_hello(DeviceRecord(device_id="dev", interval_ms=2_500), [], at_ms=0)
+    for minute in range(60):
+        if minute == 30:
+            continue  # まるごと届かなかった
+        for index in range(24):
+            write(store, "air.room", minute * MINUTE_MS + index * 2_500, 26.0)
+    rollup_minutes(store)
+    rollup_hours(store)
+
+    hour = store.rollup("air.room", 0, HOUR_MS, Aggregation.HOUR)[0]
+    assert hour.expected_count == 60 * 24, "落ちた分も期待値に含める"
+    assert hour.ok_value_count == 59 * 24
+    assert hour.missing_ratio == pytest.approx(1 - 59 / 60)
+
+
+def test_event_metrics_have_no_expected_count(store):
+    """`sys.dropped_samples` は起きたときしか書かない（決定記録 0007 §2.4）。
+
+    期待値を持たせると欠測率が無意味な値になる。穴埋めもしない。
+    """
+    from coldaisle.store import DeviceRecord
+
+    store.record_hello(DeviceRecord(device_id="dev", interval_ms=2_500), [], at_ms=0)
+    write(store, "sys.dropped_samples", 0, 4.0)
+    write(store, "sys.dropped_samples", 10 * MINUTE_MS, 2.0)
+    rollup_minutes(store)
+
+    rows = store.connection.execute(
+        "SELECT bucket_ms, expected_count FROM readings_1m WHERE metric = 'sys.dropped_samples'"
+    ).fetchall()
+    assert [row["bucket_ms"] for row in rows] == [0, 10 * MINUTE_MS], "穴埋めしない"
+    assert {row["expected_count"] for row in rows} == {None}
+
+
+def test_rollup_seeks_by_primary_key(store):
+    """`SCAN readings` にしない。保持期間ぶんを毎回舐めることになる。
+
+    書き込みロックを握ったまま全走査すると、取り込み側が busy_timeout を
+    超えて落ちうる（決定記録 0002 §2.4 と同じ理由）。
+    """
+    write(store, "air.room", 0, 26.0)
+    plan = " | ".join(
+        row["detail"]
+        for row in store.connection.execute(
+            "EXPLAIN QUERY PLAN SELECT (ts_ms / 60000) * 60000 AS bucket_ms, COUNT(*) "
+            "FROM readings WHERE metric = ? AND ts_ms >= ? AND ts_ms <= ? GROUP BY bucket_ms",
+            ("air.room", 0, 1),
+        )
+    )
+    assert "SCAN readings" not in plan, plan
+    assert "SEARCH readings USING PRIMARY KEY" in plan, plan
+
+
+def test_five_minute_buckets_are_aligned(store):
+    """要求の開始が境界に揃っていなくても、途中までのバケットを返さない。"""
+    for minute in range(10):
+        for index in range(4):
+            write(store, "air.room", minute * MINUTE_MS + index * 2_500, 20.0 + minute)
+    rollup_minutes(store)
+
+    # 12:02 相当（2分目）から要求する
+    points = store.rollup("air.room", 2 * MINUTE_MS, 10 * MINUTE_MS, Aggregation.FIVE_MINUTES)
+    assert [point.bucket_ms for point in points] == [5 * MINUTE_MS], (
+        "先頭の 0 分バケットは途中からしか作れないので返さない"
+    )
+    assert points[0].ok_value_count == 20, "返すバケットは完全な5分ぶん"
+
+
+def test_five_minute_bucket_uses_its_whole_span(store):
+    """範囲の終端が途中でも、返すバケットはその5分ぶん全体から作る。"""
+    for minute in range(10):
+        for index in range(4):
+            write(store, "air.room", minute * MINUTE_MS + index * 2_500, 20.0 + minute)
+    rollup_minutes(store)
+
+    points = store.rollup("air.room", 0, 7 * MINUTE_MS, Aggregation.FIVE_MINUTES)
+    assert [point.bucket_ms for point in points] == [0, 5 * MINUTE_MS]
+    assert points[1].ok_value_count == 20, "5〜9分の全体を使う"
+
+
+def test_cli_creates_the_database_directory(tmp_path):
+    """`var/` は追跡されていない。既定のコマンドが素の checkout で動くこと。"""
+    retention = tmp_path / "retention.yaml"
+    retention.write_text(f"raw_days: 30\ncsv_dir: {tmp_path / 'csv'}\n", encoding="utf-8")
+    database = tmp_path / "var" / "coldaisle.db"
+    assert not database.parent.exists()
+
+    assert (
+        main(
+            [
+                f"--db={database}",
+                f"--retention={retention}",
+                f"--quality-rules={QUALITY_RULES_PATH}",
+            ]
+        )
+        == 0
+    )
+    assert database.exists()

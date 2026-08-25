@@ -35,7 +35,9 @@ P95 = 0.95
 """FR-303 が要求する分位点。"""
 
 
-def combine_minutes_sql(bucket_ms: int, where: str, *, with_metric: bool = False) -> str:
+def combine_minutes_sql(
+    bucket_ms: int, where: str, *, with_metric: bool = False, having: bool = False
+) -> str:
     """1分バケットを `bucket_ms` 幅へまとめる SELECT を組み立てる。
 
     5分の読み出し（合成）と1時間の書き込み（保存）が**同じ式**を使う。
@@ -56,7 +58,18 @@ def combine_minutes_sql(bucket_ms: int, where: str, *, with_metric: bool = False
         # いずれかのバケットで期待値が不明なら、合計も不明にする（決定記録 0002 §2.8）
         "CASE WHEN COUNT(*) = COUNT(expected_count) THEN SUM(expected_count) END "
         "AS expected_count "
-        f"FROM readings_1m {where} GROUP BY {group_by} ORDER BY bucket_ms"
+        f"FROM readings_1m {where} GROUP BY {group_by} "
+        # 端のバケットは**完成した状態で組み立ててから**捨てる。先に絞ると、
+        # 途中までの平均が完全なバケットとして返る（下の呼び出し側を参照）。
+        # HAVING では別名ではなく式を書き直す。SQLite は HAVING の `bucket_ms` を
+        # **元の列**として解決するため、別名を書くと絞り込みが効かない
+        + (
+            f"HAVING (bucket_ms / {bucket_ms}) * {bucket_ms} >= ? "
+            f"AND (bucket_ms / {bucket_ms}) * {bucket_ms} < ? "
+            if having
+            else ""
+        )
+        + "ORDER BY bucket_ms"
     )
 
 
@@ -416,12 +429,19 @@ class SqliteStore:
         validate_metric(metric)
         self._check_range(start_ms, end_ms)
         if agg is Aggregation.FIVE_MINUTES:
-            # 表を持たず、1分バケットから合成する（決定記録 0004 §2.9）
+            # 表を持たず、1分バケットから合成する（決定記録 0004 §2.9）。
+            # **入力はバケット境界まで広げ、出力を要求範囲で絞る。**
+            # 先に絞ると、12:02 の要求が 12:02〜12:04 だけの平均を
+            # 「12:00 のバケット」として返してしまう
+            aligned_start = (start_ms // FIVE_MINUTES_MS) * FIVE_MINUTES_MS
+            aligned_end = -(-end_ms // FIVE_MINUTES_MS) * FIVE_MINUTES_MS
             rows = self._conn.execute(
                 combine_minutes_sql(
-                    FIVE_MINUTES_MS, "WHERE metric = ? AND bucket_ms >= ? AND bucket_ms < ?"
+                    FIVE_MINUTES_MS,
+                    "WHERE metric = ? AND bucket_ms >= ? AND bucket_ms < ?",
+                    having=True,
                 ),
-                (metric, start_ms, end_ms),
+                (metric, aligned_start, aligned_end, start_ms, end_ms),
             ).fetchall()
         else:
             rows = self._conn.execute(

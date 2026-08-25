@@ -26,6 +26,7 @@ import yaml
 from pydantic import BaseModel, ConfigDict, Field
 
 from coldaisle import logs
+from coldaisle.channels import METRIC_TO_CHANNEL
 from coldaisle.clock import WallClock
 from coldaisle.store.csv_export import export_day
 from coldaisle.store.db import HOUR_MS, MINUTE_MS, SqliteStore, combine_minutes_sql
@@ -77,29 +78,89 @@ def rollup_minutes(store: SqliteStore) -> int:
     走査することになる。ただし前回の最終バケットは**必ず数え直す**。
     そのバケットは実行時点で途中だった可能性があり、
     その後に届いた行を取り込めていないため。
+
+    **メトリクスごとにループする。** `WHERE ts_ms >= ?` の1本にすると主キー
+    `(metric, ts_ms)` を使えず、`SCAN readings` で保持期間ぶんを毎回舐める
+    （決定記録 0002 §2.4 と同じ理由）。トランザクションもメトリクス単位にして、
+    取り込みの書き込みロック待ちを短く保つ。
     """
     conn = store.connection
     newest = conn.execute("SELECT MAX(ts_ms) FROM readings").fetchone()[0]
     if newest is None:
         return 0
-    start = conn.execute("SELECT MAX(bucket_ms) FROM readings_1m").fetchone()[0] or 0
+    start = conn.execute("SELECT MAX(bucket_ms) FROM readings_1m").fetchone()[0]
+    if start is None:
+        # 初回。エポックから数えると欠測の穴埋めが天文学的な件数になる
+        oldest = conn.execute("SELECT MIN(ts_ms) FROM readings").fetchone()[0]
+        start = _floor(int(oldest), MINUTE_MS)
+    newest_bucket = _floor(int(newest), MINUTE_MS)
     expected = _expected_per_minute(conn)
-    with store.transaction():
-        cursor = conn.execute(
-            "INSERT OR REPLACE INTO readings_1m "
-            "(metric, bucket_ms, min_value, max_value, mean_value, "
-            " ok_value_count, row_count, expected_count) "
-            f"SELECT metric, (ts_ms / {MINUTE_MS}) * {MINUTE_MS} AS bucket_ms, "
-            "  MIN(CASE WHEN quality = 'ok' THEN value END), "
-            "  MAX(CASE WHEN quality = 'ok' THEN value END), "
-            "  AVG(CASE WHEN quality = 'ok' THEN value END), "
-            "  SUM(CASE WHEN quality = 'ok' AND value IS NOT NULL THEN 1 ELSE 0 END), "
-            "  COUNT(*), ? "
-            "FROM readings WHERE ts_ms >= ? AND ts_ms <= ? "
-            "GROUP BY metric, bucket_ms",
-            (expected, start, newest),
-        )
-        return int(cursor.rowcount)
+
+    written = 0
+    for metric in store.metrics():
+        # 期待サンプル数は**周期的に届くメトリクスにだけ**意味がある。
+        # `sys.dropped_samples` は起きたときしか書かない（決定記録 0007 §2.4）ので、
+        # 期待値を持たせると欠測率が無意味な値になる
+        metric_expected = expected if metric in METRIC_TO_CHANNEL else None
+        with store.transaction():
+            cursor = conn.execute(
+                "INSERT OR REPLACE INTO readings_1m "
+                "(metric, bucket_ms, min_value, max_value, mean_value, "
+                " ok_value_count, row_count, expected_count) "
+                f"SELECT ?, (ts_ms / {MINUTE_MS}) * {MINUTE_MS} AS bucket_ms, "
+                "  MIN(CASE WHEN quality = 'ok' THEN value END), "
+                "  MAX(CASE WHEN quality = 'ok' THEN value END), "
+                "  AVG(CASE WHEN quality = 'ok' THEN value END), "
+                "  SUM(CASE WHEN quality = 'ok' AND value IS NOT NULL THEN 1 ELSE 0 END), "
+                "  COUNT(*), ? "
+                "FROM readings WHERE metric = ? AND ts_ms >= ? AND ts_ms <= ? "
+                "GROUP BY bucket_ms",
+                (metric, metric_expected, metric, start, newest),
+            )
+            written += int(cursor.rowcount)
+            written += _fill_absent_minutes(conn, metric, start, newest_bucket, metric_expected)
+    return written
+
+
+def _fill_absent_minutes(
+    conn: sqlite3.Connection, metric: str, start: int, newest_bucket: int, expected: int | None
+) -> int:
+    """1件も届かなかった分を「0行のバケット」として作る。
+
+    **これが無いと通信断が記録から消える。** 行が無い分は集約時に数えられず、
+    `SUM(expected_count)` が届いた分だけの合計になるため、
+    1分まるごと落ちた1時間が「欠測ゼロ」として残ってしまう。
+    生データを30日で消したあとは復元できない（決定記録 0002 §2.8 が
+    分けようとした「センサー異常」と「サンプル不着」の区別が失われる）。
+
+    埋めるのは**そのメトリクスを観測し始めてから**の範囲だけ。
+    設置前や停止後にまで期待値を作らない。
+    """
+    if expected is None:
+        return 0
+    first = conn.execute(
+        "SELECT MIN(bucket_ms) FROM readings_1m WHERE metric = ?", (metric,)
+    ).fetchone()[0]
+    if first is None:
+        return 0
+    fill_from = max(start, int(first))
+    if fill_from > newest_bucket:
+        return 0
+    cursor = conn.execute(
+        "INSERT OR IGNORE INTO readings_1m "
+        "(metric, bucket_ms, min_value, max_value, mean_value, "
+        " ok_value_count, row_count, expected_count) "
+        "WITH RECURSIVE minutes(bucket_ms) AS ("
+        "  SELECT ? UNION ALL "
+        f"  SELECT bucket_ms + {MINUTE_MS} FROM minutes WHERE bucket_ms + {MINUTE_MS} <= ?"
+        ") SELECT ?, bucket_ms, NULL, NULL, NULL, 0, 0, ? FROM minutes",
+        (fill_from, newest_bucket, metric, expected),
+    )
+    return int(cursor.rowcount)
+
+
+def _floor(value: int, unit: int) -> int:
+    return (value // unit) * unit
 
 
 def rollup_hours(store: SqliteStore) -> int:
@@ -209,6 +270,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     logs.configure(args.log_level)
     rules = RetentionRules.from_yaml(args.retention)
     clock = WallClock()
+    # 既定の `var/` は追跡されていない。デーモンと同じく、無ければ作る
+    args.db.parent.mkdir(parents=True, exist_ok=True)
     store = SqliteStore(args.db, rules=QualityRules.from_yaml(args.quality_rules), clock=clock)
     try:
         result = run(store, rules, now_ms=clock.now_ms())
