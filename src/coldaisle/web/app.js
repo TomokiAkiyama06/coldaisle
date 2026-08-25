@@ -14,6 +14,10 @@ const RANGES = [
 
 const QUALITY_LABEL = { ok: "正常", missing: "欠測", suspect: "疑わしい", stale: "古い" };
 
+// 集計の粒度ごとのバケット幅。生データは観測から推定する
+const STEP_MS = { "1m": 60000, "5m": 300000, "1h": 3600000 };
+const GAP_FACTOR = 2; // この倍以上空いたら「測れていない区間」とみなす
+
 const SERIES_COLORS = [
   "#7fb3ff", "#7fd6a5", "#f0b86e", "#e08283", "#b39ddb", "#6fd0d8", "#c9d17a",
 ];
@@ -107,6 +111,20 @@ function renderAlerts(alerts) {
   }
 }
 
+/**
+ * 想定される点の間隔。**線を切る判断に使う。**
+ * 取り込みが止まった区間には行そのものが無く、`null` の点すら来ない。
+ */
+function expectedStep(entry) {
+  if (STEP_MS[entry.agg]) return STEP_MS[entry.agg];
+  let smallest = Infinity;
+  for (let i = 1; i < entry.points.length; i += 1) {
+    const delta = entry.points[i].ts_ms - entry.points[i - 1].ts_ms;
+    if (delta > 0 && delta < smallest) smallest = delta;
+  }
+  return Number.isFinite(smallest) ? smallest : 0;
+}
+
 /** 依存の無い折れ線。Chart.js を読み込まない（オフラインでも見えるようにするため）。 */
 function drawChart(svgId, legendId, series) {
   const svg = document.getElementById(svgId);
@@ -143,15 +161,21 @@ function drawChart(svgId, legendId, series) {
 
   series.forEach((entry, index) => {
     const color = SERIES_COLORS[index % SERIES_COLORS.length];
-    // 欠測で線をつながない。つなぐと「その間も測れていた」ように見える
+    // 欠測で線をつながない。つなぐと「その間も測れていた」ように見える。
+    // **点が無い区間も同じ。** 取り込みが止まると行そのものが来ないので、
+    // 時刻の飛びを見て切る（値が null の点すら存在しない）
+    const step = expectedStep(entry);
     let run = [];
+    let previous = null;
     const flush = () => {
       if (run.length > 1) svg.appendChild(polyline(run, color));
       run = [];
     };
     for (const point of entry.points) {
-      if (point.value === null) flush();
-      else run.push(`${sx(point.ts_ms)},${sy(point.value)}`);
+      const jumped = previous !== null && step > 0 && point.ts_ms - previous > step * GAP_FACTOR;
+      if (point.value === null || jumped) flush();
+      previous = point.ts_ms;
+      if (point.value !== null) run.push(`${sx(point.ts_ms)},${sy(point.value)}`);
     }
     flush();
 
@@ -220,6 +244,7 @@ async function loadHistory() {
 }
 
 let lastLatest = null;
+let historyLoaded = false;
 
 function applyLatest(latest) {
   lastLatest = latest;
@@ -227,14 +252,28 @@ function applyLatest(latest) {
   renderDerived(latest);
 }
 
+/**
+ * 定期更新。**最新値もここで取り直す。**
+ *
+ * 取り込みが止まると新しいサンプルは来ないが、品質は `ok` から `stale` へ変わる。
+ * WebSocket 側でも押し出すようにしてあるが（決定記録 0011 §2.7）、
+ * 切断中はそれも届かない。ここで取り直さないと、
+ * **赤帯が出ているのにカードは「正常」のまま**という自己矛盾した画面になる。
+ */
 async function refresh() {
   try {
-    const [health, alerts] = await Promise.all([
+    const [latest, health, alerts] = await Promise.all([
+      fetchJson("/api/v1/latest"),
       fetchJson("/api/v1/health"),
       fetchJson("/api/v1/alerts", { limit: 20 }),
     ]);
+    applyLatest(latest);
     renderBanner(health);
     renderAlerts(alerts.alerts);
+    if (!historyLoaded) {
+      historyLoaded = true;
+      loadHistory();
+    }
   } catch (error) {
     const banner = document.getElementById("banner");
     banner.textContent = `API に接続できません: ${error.message}`;
@@ -280,14 +319,18 @@ function renderRanges() {
   }
 }
 
-async function start() {
+/**
+ * 起動。**最初の取得に失敗しても復帰の仕組みを止めない。**
+ *
+ * 先に再接続とタイマーを立ててから読みに行く。逆にすると、一度の失敗で
+ * 「接続中…」のまま固まり、API が回復しても手で読み込み直すまで戻らない。
+ */
+function start() {
   renderRanges();
-  applyLatest(await fetchJson("/api/v1/latest"));
-  await refresh();
-  await loadHistory();
   connect();
   setInterval(refresh, 5000);
   setInterval(loadHistory, 60000);
+  refresh(); // 失敗しても内側で赤帯にして返る
 }
 
 start();

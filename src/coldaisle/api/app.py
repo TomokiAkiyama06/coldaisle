@@ -313,19 +313,24 @@ def create_app(config: Config | None = None, *, clock: Clock | None = None) -> F
 
     @app.websocket("/api/v1/stream")
     async def stream(websocket: WebSocket) -> None:
-        """新しいサンプルを押し出す（FR-306）。
+        """新しいサンプルと**品質の変化**を押し出す（FR-306）。
 
         取り込みは別プロセスなので、**DB を見に行って変化したら送る。**
         プロセスをまたぐ通知の仕組みを足すより、1秒ごとの問い合わせのほうが
         止まりにくい（最新値の取得はメトリクス数に比例する。決定記録 0004 §2.11）。
+
+        **時刻だけを見て変化を判定しない。** 取り込みが止まると時刻は動かないが、
+        品質は `ok` から `stale` へ変わる（読み出し時に判定するため。0004 §2.2）。
+        時刻だけを見ていると、受け手は古い値を `ok` のまま表示し続ける。
         """
         await websocket.accept()
-        last_sent: int | None = None
+        last_state: tuple[int, bool, tuple[str, ...]] | None = None
         try:
             while True:
                 payload = await asyncio.to_thread(latest_payload)
-                if payload.ts_ms != last_sent:
-                    last_sent = payload.ts_ms
+                state = stream_state(payload)
+                if state != last_state:
+                    last_state = state
                     await websocket.send_json(
                         StreamMessage(latest=payload).model_dump(mode="json", by_alias=True)
                     )
@@ -395,6 +400,20 @@ def _periodic(readings: Mapping[str, LatestReading]) -> dict[str, LatestReading]
 
 def _is_stale(readings: Mapping[str, LatestReading]) -> bool:
     return any(reading.quality is Quality.STALE for reading in _periodic(readings).values())
+
+
+def stream_state(payload: LatestResponse) -> tuple[int, bool, tuple[str, ...]]:
+    """押し出すかどうかを決める指紋。
+
+    **時刻だけを見ない。** 取り込みが止まると時刻は動かないが、品質は `ok` から
+    `stale` へ変わる（読み出し時に判定するため。決定記録 0004 §2.2）。
+    時刻だけを見ていると、受け手は**古い値を「正常」のまま表示し続ける。**
+    """
+    return (
+        payload.ts_ms,
+        payload.stale,
+        tuple(f"{metric}={item.quality.value}" for metric, item in sorted(payload.metrics.items())),
+    )
 
 
 def _require_metric(metric: str) -> None:

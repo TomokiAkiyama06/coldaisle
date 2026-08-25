@@ -146,3 +146,38 @@ def test_script_parses(asset):
     if node is None:
         pytest.skip("node が無い")
     assert subprocess.run([node, "--check", str(asset)], capture_output=True).returncode == 0
+
+
+def test_periodic_refresh_also_reloads_current_values():
+    """**赤帯とカードが食い違わないこと。**
+
+    取り込みが止まると新しいサンプルは来ないが、品質は `stale` へ変わる。
+    定期更新で最新値を取り直さないと、「データが古い」と言いながら
+    カードは「正常」のままになる。
+    """
+    script = SCRIPT.read_text(encoding="utf-8")
+    refresh = script[script.index("async function refresh()") : script.index("function connect()")]
+    assert "/api/v1/latest" in refresh, "定期更新で最新値を取り直していない"
+    assert "applyLatest" in refresh
+
+
+def test_chart_breaks_lines_across_gaps():
+    """点が無い区間で線をつながない。
+
+    取り込みが止まった区間には**行そのものが無い**（`value: null` の点すら来ない）。
+    時刻の飛びで切らないと、測れていない時間帯に線が引かれる。
+    """
+    script = SCRIPT.read_text(encoding="utf-8")
+    assert "expectedStep" in script
+    assert "GAP_FACTOR" in script
+
+
+def test_startup_installs_recovery_before_fetching():
+    """最初の取得に失敗しても「接続中…」で固まらない。
+
+    再接続とタイマーを先に立ててから読みに行く。
+    """
+    script = SCRIPT.read_text(encoding="utf-8")
+    body = script[script.index("function start()") :]
+    assert body.index("connect()") < body.index("refresh()")
+    assert body.index("setInterval(refresh") < body.index("  refresh();")

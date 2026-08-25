@@ -9,8 +9,15 @@ from pathlib import Path
 import pytest
 from fastapi.testclient import TestClient
 
-from coldaisle.api.app import Config, choose_aggregation, create_app, parse_window
+from coldaisle.api.app import (
+    Config,
+    choose_aggregation,
+    create_app,
+    parse_window,
+    stream_state,
+)
 from coldaisle.api.metrics_meta import MetricCatalog
+from coldaisle.api.models import LatestResponse
 from coldaisle.clock import SimulatedClock
 from coldaisle.store import Aggregation, DeviceRecord, Quality, Reading, Sample, SqliteStore
 from coldaisle.store.rollup import rollup_minutes
@@ -453,3 +460,33 @@ def test_series_truncates_when_even_hours_exceed_the_limit(tmp_path, rules, cloc
     assert len(body["points"]) == 50
     assert body["truncated"] is True
     assert body["points"][-1]["ts_ms"] > body["points"][0]["ts_ms"], "残すのは新しい側"
+
+
+def test_stream_state_changes_when_quality_turns_stale(db, rules):
+    """**時刻だけを見て変化を判定しない。**
+
+    取り込みが止まると時刻は動かないが、品質は `ok` から `stale` へ変わる
+    （読み出し時に判定するため。決定記録 0004 §2.2）。時刻だけを見ていると、
+    受け手は**古い値を「正常」のまま表示し続ける。**
+
+    実際のソケットで確かめない。退行すると2通目が永遠に来ず、
+    **テストが落ちる代わりにハングする**（CI が固まる）。判定は純粋関数に
+    切り出してあるので、ここで直接見る。
+    """
+    fresh = SimulatedClock(NOW_MS)
+    stale = SimulatedClock(NOW_MS + 60_000)
+    app_fresh = create_app(
+        Config(db=db, quality_rules=QUALITY_RULES_PATH, metrics=METRICS_PATH), clock=fresh
+    )
+    app_stale = create_app(
+        Config(db=db, quality_rules=QUALITY_RULES_PATH, metrics=METRICS_PATH), clock=stale
+    )
+    with TestClient(app_fresh) as client:
+        before = LatestResponse.model_validate(client.get("/api/v1/latest").json())
+    with TestClient(app_stale) as client:
+        after = LatestResponse.model_validate(client.get("/api/v1/latest").json())
+
+    assert before.ts_ms == after.ts_ms, "新しいサンプルは来ていない"
+    assert before.stale is False
+    assert after.stale is True
+    assert stream_state(before) != stream_state(after), "時刻が同じでも押し出す"
