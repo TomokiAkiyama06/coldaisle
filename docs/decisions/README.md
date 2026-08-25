@@ -76,3 +76,4 @@ docs/decisions/NNNN-<slug>.md      例: 0002-metric-naming.md
 | [0004](0004-storage-read-contract.md) | ストレージ層の読み出し契約 | FINAL |
 | [0005](0005-model-selection.md) | ローカルモデルは Qwen3.8-27B 単体構成 | FINAL |
 | [0006](0006-gpu-mode-and-mixed-state.md) | GPU Mode を2段階にし `mixed` を異常として扱う | FINAL |
+| [0007](0007-ingest-pipeline.md) | 取り込みパイプラインの規約 | Proposed |

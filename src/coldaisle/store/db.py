@@ -10,7 +10,7 @@ from __future__ import annotations
 import math
 import sqlite3
 import time
-from collections.abc import Iterable, Iterator
+from collections.abc import Iterable, Iterator, Sequence
 from contextlib import contextmanager
 from enum import StrEnum
 from pathlib import Path
@@ -19,10 +19,12 @@ from types import TracebackType
 from coldaisle.clock import Clock
 from coldaisle.store import migrations
 from coldaisle.store.models import (
+    DeviceRecord,
     LatestReading,
     Quality,
     RollupPoint,
     Sample,
+    SensorRecord,
     SeriesPoint,
     Stats,
     validate_metric,
@@ -207,7 +209,90 @@ class SqliteStore:
             )
         return len(rows)
 
+    def record_hello(
+        self, device: DeviceRecord, sensors: Sequence[SensorRecord], *, at_ms: int
+    ) -> None:
+        """起動バナーを `devices` / `device_sensors` へ反映する（決定記録 0002 §2.10）。
+
+        センサーの集合は**丸ごと置き換える。** 起動バナーはその時点の全構成を
+        申告するため、差分更新にすると外したセンサーの行が残り続ける。
+        置き換える前の ROM が要る場合は `sensors_for()` で先に読む（FR-403 / #14）。
+
+        `first_seen_ms` は初回だけ書く。上書きすると「いつから見ているか」が消える。
+        """
+        with self._transaction():
+            self._conn.execute(
+                "INSERT INTO devices "
+                "(device_id, fw, schema_v, interval_ms, first_seen_ms, last_seen_ms, last_hello_ms)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(device_id) DO UPDATE SET "
+                "  fw = excluded.fw, schema_v = excluded.schema_v,"
+                "  interval_ms = excluded.interval_ms,"
+                "  last_seen_ms = excluded.last_seen_ms, last_hello_ms = excluded.last_hello_ms",
+                (
+                    device.device_id,
+                    device.fw,
+                    device.schema_v,
+                    device.interval_ms,
+                    at_ms,
+                    at_ms,
+                    at_ms,
+                ),
+            )
+            self._conn.execute(
+                "DELETE FROM device_sensors WHERE device_id = ?", (device.device_id,)
+            )
+            self._conn.executemany(
+                "INSERT INTO device_sensors "
+                "(device_id, channel, kind, gpio, rom, resolution, updated_ms) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                [
+                    (
+                        device.device_id,
+                        sensor.channel,
+                        sensor.kind,
+                        sensor.gpio,
+                        sensor.rom,
+                        sensor.resolution,
+                        at_ms,
+                    )
+                    for sensor in sensors
+                ],
+            )
+
     # ------------------------------------------------------------------ 読み出し
+
+    def device(self, device_id: str) -> DeviceRecord | None:
+        row = self._conn.execute(
+            "SELECT device_id, fw, schema_v, interval_ms FROM devices WHERE device_id = ?",
+            (device_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        return DeviceRecord(
+            device_id=row["device_id"],
+            fw=row["fw"],
+            schema_v=row["schema_v"],
+            interval_ms=row["interval_ms"],
+        )
+
+    def sensors_for(self, device_id: str) -> tuple[SensorRecord, ...]:
+        """申告済みのセンサー構成。ROM の突き合わせ（FR-403）に使う。"""
+        rows = self._conn.execute(
+            "SELECT channel, kind, gpio, rom, resolution FROM device_sensors "
+            "WHERE device_id = ? ORDER BY channel",
+            (device_id,),
+        ).fetchall()
+        return tuple(
+            SensorRecord(
+                channel=row["channel"],
+                kind=row["kind"],
+                gpio=row["gpio"],
+                rom=row["rom"],
+                resolution=row["resolution"],
+            )
+            for row in rows
+        )
 
     def latest(self, *, at_ms: int | None = None) -> dict[str, LatestReading]:
         """メトリクスごとの最新値（FR-301）。

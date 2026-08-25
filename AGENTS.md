@@ -18,8 +18,13 @@ uv run pytest -k "not hardware"      # 実機不要のテストのみ（CIと同
 uv run ruff check . && uv run ruff format --check .
 uv run mypy src
 uv run coldaisle-daemon --source mock # 実機なしでデーモン起動
+uv run coldaisle-daemon --source mock --scenario ramp --speed 60  # 時間圧縮（下記の注意）
 uv run uvicorn coldaisle.api:app --host 127.0.0.1 --port 8000
 ```
+
+**`--speed` を付けている間は API / ダッシュボードを同時に使わない。**
+圧縮再生ではホスト時刻がシナリオ時間で進むため、別プロセスから見ると
+データが未来に見える（決定記録 0007 §2.11）。
 
 ## 絶対に守るルール
 

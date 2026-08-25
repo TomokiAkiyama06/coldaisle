@@ -31,8 +31,8 @@ milestone: "M1 データ基盤"
 
 ## 受入基準
 - `uv run coldaisle-daemon --source mock --scenario ramp` でDBに書き込まれる
-  - **#8 完了後に検証する。** `Source → Normalizer → Store` のパイプラインと
-    CLI は #8 のスコープであり、本 Issue には含めない
+  - **#8 で検証済み**（`tests/test_daemon.py::test_pipeline_writes_to_the_database`）。
+    パイプラインと CLI は #8 のスコープ
 - 各シナリオが決定論的（seed固定で同一出力）
 - この時点でダッシュボードもアラートもAIも開発可能な状態になっている
 

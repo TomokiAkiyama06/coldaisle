@@ -11,6 +11,7 @@ from coldaisle.store import QualityRules
 CONFIG_DIR = Path(__file__).resolve().parents[1] / "config"
 QUALITY_RULES_PATH = CONFIG_DIR / "quality.yaml"
 SCENARIOS_PATH = CONFIG_DIR / "scenarios.yaml"
+CALIBRATION_PATH = CONFIG_DIR / "calibration.json"
 
 TEST_EPOCH_MS = 1_787_616_000_000
 """2026-08-25T00:00:00Z。テストを実時計に依存させないための固定の起点。"""

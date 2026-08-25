@@ -1,0 +1,300 @@
+"""取り込みデーモン（L0）。#8
+
+`Source → Normalizer → Store` の一本道。**シリアルポートを開く唯一のプロセス**
+（AGENTS.md ルール3、spec-review C-03）。元の仕様ではモニタとダッシュボードが
+それぞれポートを開くため同時起動できなかった。所有者を1つに集約する。
+
+**1サンプルの失敗でプロセスを落とさない。** ここだけは例外を捕まえて継続する
+（AGENTS.md コード規約の唯一の例外）。ただし握りつぶさず、件数とスタックを残す。
+"""
+
+from __future__ import annotations
+
+import argparse
+import logging
+import signal
+from collections.abc import Sequence
+from dataclasses import dataclass, field
+from pathlib import Path
+from types import FrameType
+
+from coldaisle import logs
+from coldaisle.clock import Clock
+from coldaisle.ingest.calibration import Calibration
+from coldaisle.ingest.mock import MockSource, load_scenarios
+from coldaisle.ingest.normalize import Normalizer
+from coldaisle.ingest.protocol import RawHello, RawMessage, RawSample, Source
+from coldaisle.store import DeviceRecord, QualityRules, SensorRecord, SqliteStore
+
+LOGGER = logging.getLogger("coldaisle.ingest")
+
+DEFAULT_DB = Path("var/coldaisle.db")
+DEFAULT_SCENARIOS = Path("config/scenarios.yaml")
+DEFAULT_QUALITY_RULES = Path("config/quality.yaml")
+DEFAULT_CALIBRATION = Path("config/calibration.json")
+
+
+@dataclass
+class Stats:
+    """1回の実行で起きたこと。終了時にまとめてログへ出す。"""
+
+    samples: int = 0
+    readings: int = 0
+    hellos: int = 0
+    discarded: int = 0
+    """正規化・保存に失敗して捨てたサンプル数。**0 でない日は原因を追う。**"""
+    dropped_samples: int = 0
+    """`seq` の飛びの合計（FR-105）。"""
+    restarts: int = 0
+    """`up` の巻き戻りの回数（FR-106）。"""
+    unknown_channels: set[str] = field(default_factory=set)
+
+    def as_fields(self) -> dict[str, object]:
+        return {
+            "samples": self.samples,
+            "readings": self.readings,
+            "hellos": self.hellos,
+            "discarded": self.discarded,
+            "dropped_samples": self.dropped_samples,
+            "restarts": self.restarts,
+            "unknown_channels": sorted(self.unknown_channels),
+        }
+
+
+class Daemon:
+    """取り込みループ。`run()` は `stream()` が尽きるか停止要求まで戻らない。"""
+
+    def __init__(self, *, source: Source, store: SqliteStore, normalizer: Normalizer) -> None:
+        self._source = source
+        self._store = store
+        self._normalizer = normalizer
+        self._stop = False
+        self._device_id: str | None = None
+        self.stats = Stats()
+
+    @property
+    def source(self) -> Source:
+        return self._source
+
+    @property
+    def store(self) -> SqliteStore:
+        return self._store
+
+    @property
+    def normalizer(self) -> Normalizer:
+        return self._normalizer
+
+    def request_stop(self) -> None:
+        """次のメッセージの手前で止める。SIGTERM から呼ぶ。
+
+        **今処理しているサンプルは書き切る。** 途中で落とすと、
+        1サンプルの一部だけが保存された時刻ができる（決定記録 0002 §2.3）。
+        ソースが待機中の場合、実際に止まるのは次のサンプルが来たときになる。
+        """
+        self._stop = True
+
+    def run(self, *, max_samples: int | None = None) -> Stats:
+        LOGGER.info("取り込みを開始する", extra={logs.FIELDS_KEY: {"max_samples": max_samples}})
+        for message in self._source.stream():
+            if self._stop:
+                LOGGER.info("停止要求を受けた")
+                break
+            self._handle(message)
+            if max_samples is not None and self.stats.samples >= max_samples:
+                break
+        LOGGER.info("取り込みを終了する", extra={logs.FIELDS_KEY: self.stats.as_fields()})
+        return self.stats
+
+    def _handle(self, message: RawMessage) -> None:
+        try:
+            if isinstance(message, RawHello):
+                self._on_hello(message)
+            else:
+                self._on_sample(message)
+        except Exception:
+            self.stats.discarded += 1
+            LOGGER.warning(
+                "サンプルを破棄して継続する",
+                exc_info=True,
+                extra={logs.FIELDS_KEY: {"discarded": self.stats.discarded}},
+            )
+
+    def _on_hello(self, hello: RawHello) -> None:
+        at_ms = self._normalizer.clock.now_ms()
+        self._device_id = hello.dev
+        previous = {sensor.channel: sensor.rom for sensor in self._store.sensors_for(hello.dev)}
+        sensors = [
+            SensorRecord(
+                channel=channel,
+                kind=sensor.kind,
+                gpio=sensor.gpio,
+                rom=sensor.rom,
+                resolution=sensor.res,
+            )
+            for channel, sensor in hello.sensors.items()
+        ]
+        self._store.record_hello(
+            DeviceRecord(
+                device_id=hello.dev,
+                fw=hello.fw,
+                schema_v=hello.v,
+                interval_ms=hello.interval_ms,
+            ),
+            sensors,
+            at_ms=at_ms,
+        )
+        self.stats.hellos += 1
+        LOGGER.info(
+            "起動バナーを受け取った",
+            extra={
+                logs.FIELDS_KEY: {
+                    "device": hello.dev,
+                    "fw": hello.fw,
+                    "interval_ms": hello.interval_ms,
+                    "ts_ms": at_ms,
+                }
+            },
+        )
+        changed = sorted(
+            sensor.channel
+            for sensor in sensors
+            if sensor.channel in previous and previous[sensor.channel] != sensor.rom
+        )
+        if changed:
+            # 位置の入れ替えか差し替え。アラート化（FR-403）は #14
+            LOGGER.warning(
+                "プローブの ROM が前回と違う",
+                extra={logs.FIELDS_KEY: {"device": hello.dev, "channels": changed}},
+            )
+
+    def _on_sample(self, raw: RawSample) -> None:
+        normalized = self._normalizer.normalize(raw)
+        self._store.insert_sample(normalized.sample)
+        self.stats.samples += 1
+        self.stats.readings += len(normalized.sample.readings)
+
+        if normalized.dropped_samples:
+            self.stats.dropped_samples += normalized.dropped_samples
+            LOGGER.warning(
+                "サンプルの取りこぼしを検出した",
+                extra={
+                    logs.FIELDS_KEY: {
+                        "dropped": normalized.dropped_samples,
+                        "seq": raw.seq,
+                        "ts_ms": normalized.sample.ts_ms,
+                    }
+                },
+            )
+        if normalized.device_restarted:
+            self.stats.restarts += 1
+            LOGGER.warning(
+                "デバイスの再起動を検出した",
+                extra={logs.FIELDS_KEY: {"seq": raw.seq, "up": raw.up}},
+            )
+        if normalized.out_of_order:
+            LOGGER.warning("seq が進んでいない", extra={logs.FIELDS_KEY: {"seq": raw.seq}})
+        if normalized.unknown_channels:
+            new = set(normalized.unknown_channels) - self.stats.unknown_channels
+            self.stats.unknown_channels |= set(normalized.unknown_channels)
+            if new:
+                # 未知フィールドは捨てて継続する（決定記録 0003 §2.7）。初出だけ記録する
+                LOGGER.info(
+                    "未知のチャネルを無視した", extra={logs.FIELDS_KEY: {"channels": sorted(new)}}
+                )
+
+
+@dataclass(frozen=True)
+class Config:
+    """デーモン1回ぶんの設定。CLI 引数から作る。"""
+
+    source: str = "mock"
+    scenario: str = "idle"
+    speed: float = 1.0
+    db: Path = DEFAULT_DB
+    scenarios: Path = DEFAULT_SCENARIOS
+    quality_rules: Path = DEFAULT_QUALITY_RULES
+    calibration: Path = DEFAULT_CALIBRATION
+
+
+def build(config: Config) -> Daemon:
+    """**合成の起点。** 時計を1つ選び、取り込みと保存へ同じものを配る（#42）。
+
+    ここが唯一の組み立て場所であることが、`Clock` を型で縛れないぶんの担保になる。
+    別々に作ると、取り込みはシナリオ時間・保存は実時計という組み合わせが成立する。
+    """
+    source = _build_source(config)
+    rules = QualityRules.from_yaml(config.quality_rules)
+    calibration = Calibration.from_json(config.calibration)
+    config.db.parent.mkdir(parents=True, exist_ok=True)
+    clock: Clock = source.clock
+    return Daemon(
+        source=source,
+        store=SqliteStore(config.db, rules=rules, clock=clock),
+        normalizer=Normalizer(rules=rules, calibration=calibration, clock=clock),
+    )
+
+
+def _build_source(config: Config) -> Source:
+    if config.source != "mock":
+        raise SystemExit(f"--source {config.source} は未実装（replay は #7、serial は #12）")
+    scenarios = load_scenarios(config.scenarios)
+    if config.scenario not in scenarios:
+        raise SystemExit(
+            f"シナリオが無い: {config.scenario}（候補: {', '.join(sorted(scenarios))}）"
+        )
+    return MockSource(scenarios[config.scenario], speed=config.speed)
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="coldaisle-daemon", description="センサー取り込みデーモン"
+    )
+    parser.add_argument("--source", choices=["mock", "replay", "serial"], default="mock")
+    parser.add_argument("--scenario", default="idle", help="mock のシナリオ名")
+    parser.add_argument("--speed", type=float, default=1.0, help="時間圧縮。60 なら1分を1秒で流す")
+    parser.add_argument("--db", type=Path, default=DEFAULT_DB)
+    parser.add_argument("--scenarios", type=Path, default=DEFAULT_SCENARIOS)
+    parser.add_argument("--quality-rules", type=Path, default=DEFAULT_QUALITY_RULES)
+    parser.add_argument("--calibration", type=Path, default=DEFAULT_CALIBRATION)
+    parser.add_argument("--max-samples", type=int, default=None, help="試験用。件数で止める")
+    parser.add_argument("--log-level", default="INFO")
+    return parser
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    logs.configure(args.log_level)
+    daemon = build(
+        Config(
+            source=args.source,
+            scenario=args.scenario,
+            speed=args.speed,
+            db=args.db,
+            scenarios=args.scenarios,
+            quality_rules=args.quality_rules,
+            calibration=args.calibration,
+        )
+    )
+    if args.speed != 1.0:
+        # 決定記録 0007 §2.11: 圧縮再生はこのプロセスの中だけで意味を持つ
+        LOGGER.warning(
+            "時間圧縮中はホスト時刻がシナリオ時間で進む。"
+            "別プロセスの API / ダッシュボードを同時に使わないこと（決定記録 0007 §2.11）",
+            extra={logs.FIELDS_KEY: {"speed": args.speed}},
+        )
+
+    def _stop(signum: int, _frame: FrameType | None) -> None:
+        LOGGER.info("シグナルを受けた", extra={logs.FIELDS_KEY: {"signal": signum}})
+        daemon.request_stop()
+
+    signal.signal(signal.SIGTERM, _stop)
+    signal.signal(signal.SIGINT, _stop)
+    try:
+        daemon.run(max_samples=args.max_samples)
+    finally:
+        daemon.store.close()
+    return 0
+
+
+if __name__ == "__main__":  # pragma: no cover - `python -m coldaisle.ingest.daemon`
+    raise SystemExit(main())
