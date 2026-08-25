@@ -34,8 +34,10 @@ from coldaisle.clock import Clock
 from coldaisle.ingest import Calibration, MockSource, Normalizer, ReplaySource, load_scenarios
 from coldaisle.ingest.protocol import RawHello, RawMessage, RawSample, Source
 from coldaisle.metrics import MetricCatalog
+from coldaisle.notify import Notification, NotifyConfig, Router, notifiers_from_env
 from coldaisle.rules import Engine, RuleSet, Transition
 from coldaisle.store import (
+    AlertSeverity,
     DeviceRecord,
     Quality,
     QualityRules,
@@ -61,6 +63,7 @@ DEFAULT_SCENARIOS = Path("config/scenarios.yaml")
 DEFAULT_QUALITY_RULES = Path("config/quality.yaml")
 DEFAULT_CALIBRATION = Path("config/calibration.json")
 DEFAULT_RULES = Path("config/rules.yaml")
+DEFAULT_NOTIFY = Path("config/notify.yaml")
 DEFAULT_METRICS = Path("config/metrics.yaml")
 
 
@@ -83,6 +86,8 @@ class Stats:
     """既にある `(metric, ts_ms)` として無視された行数（決定記録 0012 §2.4）。"""
     queue_drops: int = 0
     """待ち行列が溢れて捨てたメッセージ数（決定記録 0012 §2.3）。"""
+    notifications: int = 0
+    """送った通知の数（#20）。抑制されたぶんは含まない。"""
     unknown_channels: set[str] = field(default_factory=set)
 
     def as_fields(self) -> dict[str, object]:
@@ -96,6 +101,7 @@ class Stats:
             "alerts_fired": self.alerts_fired,
             "duplicates": self.duplicates,
             "queue_drops": self.queue_drops,
+            "notifications": self.notifications,
             "unknown_channels": sorted(self.unknown_channels),
         }
 
@@ -111,6 +117,7 @@ class Daemon:
         normalizer: Normalizer,
         source_name: str = "unknown",
         engine: Engine | None = None,
+        notifier: Router | None = None,
         tick_s: float = 1.0,
     ) -> None:
         self._source = source
@@ -118,7 +125,9 @@ class Daemon:
         self._normalizer = normalizer
         self._source_name = source_name
         self._engine = engine
+        self._notifier = notifier
         self._tick_s = tick_s
+        self._latest_values: dict[str, float | None] = {}
         self._stop = False
         self._device_id: str | None = None
         self._reported_drops = 0
@@ -171,6 +180,8 @@ class Daemon:
             # **いつから見ているか**を基準にする。起動時からデバイスが無い場合、
             # これが無いと `SENSOR_FAULT` が永久に鳴らない
             self._engine.begin(self._normalizer.clock.now_ms())
+        if self._notifier is not None:
+            self._notifier.start()
 
         inbox: queue.Queue[tuple[int, RawMessage] | BaseException | None] = queue.Queue(
             maxsize=QUEUE_SIZE
@@ -197,6 +208,9 @@ class Daemon:
             self._handle(*received)
             if max_samples is not None and self.stats.samples >= max_samples:
                 break
+        if self._notifier is not None:
+            # **送り切ってから止める。** 最後の critical を落とさない
+            self._notifier.stop()
         LOGGER.info("取り込みを終了する", extra={logs.FIELDS_KEY: self.stats.as_fields()})
         return self.stats
 
@@ -256,7 +270,31 @@ class Daemon:
             LOGGER.warning("ルールの評価に失敗した", exc_info=True)
 
     def _record(self, transitions: list[Transition]) -> None:
+        """遷移を数え、人へ届ける。
+
+        **`pending` は送らない。** 継続時間に届く前の揺らぎまで通知すると、
+        本物の発火が埋もれる（決定記録 0012 §2.4 と同じ理由）。
+        """
         self.stats.alerts_fired += sum(1 for t in transitions if t.state == "firing")
+        if self._notifier is None:
+            return
+        for transition in transitions:
+            if transition.state not in ("firing", "resolved"):
+                continue
+            sent = self._notifier.notify(
+                Notification(
+                    rule_id=transition.rule_id,
+                    severity=AlertSeverity(transition.severity),
+                    state=transition.state,
+                    metric=transition.metric,
+                    value=transition.value,
+                    detail=transition.detail,
+                    dashboard_url=self._notifier.config.dashboard_url,
+                    context=dict(self._latest_values),
+                )
+            )
+            if sent:
+                self.stats.notifications += 1
 
     def _handle(self, received_ms: int, message: RawMessage) -> None:
         try:
@@ -369,6 +407,12 @@ class Daemon:
             )
         if normalized.out_of_order:
             LOGGER.warning("seq が進んでいない", extra={logs.FIELDS_KEY: {"seq": raw.seq}})
+        # 通知の本文に載せる現在値。**何が起きているかを本文だけで判断できるように**
+        self._latest_values = {
+            reading.metric: reading.value
+            for reading in normalized.sample.readings
+            if reading.metric.startswith("air.")
+        }
         if self._engine is not None:
             self._record(self._engine.on_sample(normalized.sample))
         if normalized.unknown_channels:
@@ -399,6 +443,7 @@ class Config:
     timezone: str = "Asia/Tokyo"
     """CSV の時刻の解釈に使う。ファイルにオフセットが無いため（決定記録 0008 §2.8）。"""
     rules: Path = DEFAULT_RULES
+    notify: Path = DEFAULT_NOTIFY
     metrics: Path = DEFAULT_METRICS
     tick_s: float = 1.0
     """サンプルが来ないときに時刻ベースのルールを評価する間隔。"""
@@ -428,6 +473,11 @@ def build(config: Config) -> Daemon:
             rules=RuleSet.from_yaml(config.rules),
             catalog=MetricCatalog.from_yaml(config.metrics),
             store=store,
+            clock=clock,
+        ),
+        notifier=Router(
+            config=NotifyConfig.from_yaml(config.notify),
+            notifiers=notifiers_from_env(),
             clock=clock,
         ),
         tick_s=config.tick_s,
@@ -482,6 +532,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--quality-rules", type=Path, default=DEFAULT_QUALITY_RULES)
     parser.add_argument("--calibration", type=Path, default=DEFAULT_CALIBRATION)
     parser.add_argument("--rules", type=Path, default=DEFAULT_RULES)
+    parser.add_argument("--notify", type=Path, default=DEFAULT_NOTIFY)
     parser.add_argument("--metrics", type=Path, default=DEFAULT_METRICS)
     parser.add_argument(
         "--csv", type=Path, default=None, help="replay の入力（ファイル/ディレクトリ）"
@@ -506,6 +557,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             quality_rules=args.quality_rules,
             calibration=args.calibration,
             rules=args.rules,
+            notify=args.notify,
             metrics=args.metrics,
             csv=args.csv,
             bulk=args.bulk,
