@@ -77,3 +77,4 @@ docs/decisions/NNNN-<slug>.md      例: 0002-metric-naming.md
 | [0005](0005-model-selection.md) | ローカルモデルは Qwen3.8-27B 単体構成 | FINAL |
 | [0006](0006-gpu-mode-and-mixed-state.md) | GPU Mode を2段階にし `mixed` を異常として扱う | FINAL |
 | [0007](0007-ingest-pipeline.md) | 取り込みパイプラインの規約 | Proposed |
+| [0008](0008-rollup-and-retention.md) | ロールアップ・保持期間・日次CSVの規約 | Proposed |

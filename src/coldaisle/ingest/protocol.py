@@ -15,21 +15,14 @@ from typing import Any, Literal, Protocol, runtime_checkable
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from coldaisle import channels
 from coldaisle.clock import Clock
 
 SCHEMA_VERSION: Literal[1] = 1
 """`v`。破壊的変更でのみ増える（決定記録 0003 §2.7）。"""
 
-SAMPLE_CHANNELS = (
-    "room_temp",
-    "room_humidity",
-    "front_intake",
-    "gpu_intake",
-    "gpu_exhaust",
-    "top_exhaust",
-    "rear_exhaust",
-)
-"""v1 のサンプルが持つチャネル（要件 §5.2）。順序は JSON へ出す順でもある。"""
+SAMPLE_CHANNELS = channels.SAMPLE_CHANNELS
+"""v1 のサンプルが持つチャネル（要件 §5.2）。定義は `coldaisle.channels`。"""
 
 
 class RawSensor(BaseModel):

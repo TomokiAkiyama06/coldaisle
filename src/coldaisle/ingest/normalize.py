@@ -11,21 +11,16 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 
+from coldaisle import channels
 from coldaisle.clock import Clock
 from coldaisle.ingest.calibration import Calibration
 from coldaisle.ingest.protocol import RawSample
 from coldaisle.store import Quality, QualityRules, Reading, Sample, classify
 
-CHANNEL_TO_METRIC = {
-    "room_temp": "air.room",
-    "room_humidity": "air.room_humidity",
-    "front_intake": "air.front_intake",
-    "gpu_intake": "air.gpu_intake",
-    "gpu_exhaust": "air.gpu_exhaust",
-    "top_exhaust": "air.top_exhaust",
-    "rear_exhaust": "air.rear_exhaust",
-}
-"""決定記録 0003 の対応表。ここに無いチャネルは**捨てる**（0003 §2.7）。
+CHANNEL_TO_METRIC = channels.CHANNEL_TO_METRIC
+"""決定記録 0003 の対応表（定義は `coldaisle.channels`）。
+
+ここに無いチャネルは**捨てる**（0003 §2.7）。
 
 未知のフィールドで取り込みを止めない。ファームが1つ足しただけで
 全サンプルが落ちるのが最悪の壊れ方であり、足りないチャネルは

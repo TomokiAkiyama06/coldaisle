@@ -34,6 +34,55 @@ from coldaisle.store.quality import QualityRules
 P95 = 0.95
 """FR-303 が要求する分位点。"""
 
+
+def combine_minutes_sql(
+    bucket_ms: int, where: str, *, with_metric: bool = False, having: bool = False
+) -> str:
+    """1分バケットを `bucket_ms` 幅へまとめる SELECT を組み立てる。
+
+    5分の読み出し（合成）と1時間の書き込み（保存）が**同じ式**を使う。
+    別々に書くと、平均の重み付けを片方だけ直す事故が起きる。
+
+    **`mean_value` は `ok_value_count` で加重する。** 単純平均にすると、
+    欠測のあるバケットが同じ重みで効いて値が狂う（決定記録 0004 §2.9）。
+    """
+    metric_column = "metric, " if with_metric else ""
+    group_by = "metric, 2" if with_metric else "1"
+    return (
+        f"SELECT {metric_column}(bucket_ms / {bucket_ms}) * {bucket_ms} AS bucket_ms, "
+        # 列名を付ける。合成した結果も `readings_1m` と同じ形で読めるようにする
+        "MIN(min_value) AS min_value, MAX(max_value) AS max_value, "
+        "CASE WHEN SUM(ok_value_count) > 0 "
+        "     THEN SUM(mean_value * ok_value_count) / SUM(ok_value_count) END AS mean_value, "
+        "SUM(ok_value_count) AS ok_value_count, SUM(row_count) AS row_count, "
+        # いずれかのバケットで期待値が不明なら、合計も不明にする（決定記録 0002 §2.8）
+        "CASE WHEN COUNT(*) = COUNT(expected_count) THEN SUM(expected_count) END "
+        "AS expected_count "
+        f"FROM readings_1m {where} GROUP BY {group_by} "
+        # 端のバケットは**完成した状態で組み立ててから**捨てる。先に絞ると、
+        # 途中までの平均が完全なバケットとして返る（下の呼び出し側を参照）。
+        # HAVING では別名ではなく式を書き直す。SQLite は HAVING の `bucket_ms` を
+        # **元の列**として解決するため、別名を書くと絞り込みが効かない
+        + (
+            f"HAVING (bucket_ms / {bucket_ms}) * {bucket_ms} >= ? "
+            f"AND (bucket_ms / {bucket_ms}) * {bucket_ms} < ? "
+            if having
+            else ""
+        )
+        + "ORDER BY bucket_ms"
+    )
+
+
+_METRICS_SQL = """
+WITH RECURSIVE metrics(metric) AS (
+    SELECT MIN(metric) FROM readings
+    UNION ALL
+    SELECT (SELECT MIN(metric) FROM readings WHERE metric > metrics.metric)
+    FROM metrics WHERE metric IS NOT NULL
+)
+SELECT metric FROM metrics WHERE metric IS NOT NULL
+"""
+
 _LATEST_SQL = """
 WITH RECURSIVE metrics(metric) AS (
     SELECT MIN(metric) FROM readings
@@ -86,14 +135,19 @@ def _enable_wal(conn: sqlite3.Connection, busy_timeout_ms: int) -> None:
 class Aggregation(StrEnum):
     """`GET /api/v1/series` の `agg`（FR-302）。
 
-    `5m` は v1 のテーブルに対応するものが無い（決定記録 0002 §2.8 の3段は
-    生 / 1分 / 1時間）。1分から合成するのは #10 の担当で、ここでは扱わない。
+    `5m` に対応するテーブルは無い（決定記録 0002 §2.8 の3段は生 / 1分 / 1時間）。
+    **読み出しのたびに1分バケットから合成する**（決定記録 0004 §2.9）。
     """
 
     RAW = "raw"
     MINUTE = "1m"
+    FIVE_MINUTES = "5m"
     HOUR = "1h"
 
+
+MINUTE_MS = 60_000
+FIVE_MINUTES_MS = 5 * MINUTE_MS
+HOUR_MS = 60 * MINUTE_MS
 
 _ROLLUP_TABLES = {
     Aggregation.MINUTE: "readings_1m",
@@ -167,7 +221,7 @@ class SqliteStore:
         self.close()
 
     @contextmanager
-    def _transaction(self) -> Iterator[None]:
+    def transaction(self) -> Iterator[None]:
         # BEGIN IMMEDIATE で最初から書き込みロックを取る。DEFERRED だと
         # 読んでから書く途中で昇格に失敗し、busy_timeout を待たずに落ちる
         self._conn.execute("BEGIN IMMEDIATE")
@@ -202,7 +256,7 @@ class SqliteStore:
         ]
         if not rows:
             return 0
-        with self._transaction():
+        with self.transaction():
             self._conn.executemany(
                 "INSERT INTO readings (metric, ts_ms, value, quality) VALUES (?, ?, ?, ?)",
                 rows,
@@ -220,7 +274,7 @@ class SqliteStore:
 
         `first_seen_ms` は初回だけ書く。上書きすると「いつから見ているか」が消える。
         """
-        with self._transaction():
+        with self.transaction():
             self._conn.execute(
                 "INSERT INTO devices "
                 "(device_id, fw, schema_v, interval_ms, first_seen_ms, last_seen_ms, last_hello_ms)"
@@ -320,6 +374,15 @@ class SqliteStore:
             )
         return latest
 
+    def metrics(self) -> tuple[str, ...]:
+        """保存済みのメトリクス名。走査量はメトリクス数に比例する（決定記録 0004 §2.11）。
+
+        `SELECT DISTINCT metric` は全走査になる。保持期間ぶんの行を舐めるので、
+        削除ジョブ（FR-203）のたびに数百万行を読むことになってしまう。
+        """
+        rows = self._conn.execute(_METRICS_SQL).fetchall()
+        return tuple(row["metric"] for row in rows)
+
     def series(
         self, metric: str, start_ms: int, end_ms: int, *, limit: int | None = None
     ) -> tuple[SeriesPoint, ...]:
@@ -365,13 +428,29 @@ class SqliteStore:
             raise ValueError("agg=raw は series() を使う")
         validate_metric(metric)
         self._check_range(start_ms, end_ms)
-        rows = self._conn.execute(
-            # テーブル名は _ROLLUP_TABLES の値だけを取り、呼び出し側の文字列は入らない
-            "SELECT bucket_ms, min_value, max_value, mean_value, ok_value_count, "
-            f"row_count, expected_count FROM {_ROLLUP_TABLES[agg]} "
-            "WHERE metric = ? AND bucket_ms >= ? AND bucket_ms < ? ORDER BY bucket_ms",
-            (metric, start_ms, end_ms),
-        ).fetchall()
+        if agg is Aggregation.FIVE_MINUTES:
+            # 表を持たず、1分バケットから合成する（決定記録 0004 §2.9）。
+            # **入力はバケット境界まで広げ、出力を要求範囲で絞る。**
+            # 先に絞ると、12:02 の要求が 12:02〜12:04 だけの平均を
+            # 「12:00 のバケット」として返してしまう
+            aligned_start = (start_ms // FIVE_MINUTES_MS) * FIVE_MINUTES_MS
+            aligned_end = -(-end_ms // FIVE_MINUTES_MS) * FIVE_MINUTES_MS
+            rows = self._conn.execute(
+                combine_minutes_sql(
+                    FIVE_MINUTES_MS,
+                    "WHERE metric = ? AND bucket_ms >= ? AND bucket_ms < ?",
+                    having=True,
+                ),
+                (metric, aligned_start, aligned_end, start_ms, end_ms),
+            ).fetchall()
+        else:
+            rows = self._conn.execute(
+                # テーブル名は _ROLLUP_TABLES の値だけを取り、呼び出し側の文字列は入らない
+                "SELECT bucket_ms, min_value, max_value, mean_value, ok_value_count, "
+                f"row_count, expected_count FROM {_ROLLUP_TABLES[agg]} "
+                "WHERE metric = ? AND bucket_ms >= ? AND bucket_ms < ? ORDER BY bucket_ms",
+                (metric, start_ms, end_ms),
+            ).fetchall()
         return tuple(
             RollupPoint(
                 bucket_ms=int(row["bucket_ms"]),

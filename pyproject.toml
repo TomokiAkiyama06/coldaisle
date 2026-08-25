@@ -31,6 +31,8 @@ dev = [
 [project.scripts]
 # 実機なしで起動できること（AGENTS.md のコマンド一覧）
 coldaisle-daemon = "coldaisle.ingest.daemon:main"
+# ロールアップと削除。cron / systemd タイマーから呼ぶ（#10）
+coldaisle-rollup = "coldaisle.store.rollup:main"
 
 [build-system]
 requires = ["hatchling"]
