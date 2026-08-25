@@ -272,7 +272,8 @@ def test_choose_aggregation(span_ms, requested, expected):
 def test_metrics_catalog_covers_the_required_derived_values():
     """要件 §5.1 の派生値がすべて定義されていること。"""
     catalog = MetricCatalog.from_yaml(METRICS_PATH)
-    assert set(catalog.derived) == {
+    # 要件の5つは**必ずある**。増やすのは設定だけでできる（決定記録 0009 §2.1）
+    assert set(catalog.derived) >= {
         "d.intake_rise",
         "d.gpu_preheat",
         "d.gpu_delta",
