@@ -85,6 +85,16 @@ WITH RECURSIVE metrics(metric) AS (
 SELECT metric FROM metrics WHERE metric IS NOT NULL
 """
 
+_ROLLUP_METRICS_SQL = """
+WITH RECURSIVE metrics(metric) AS (
+    SELECT MIN(metric) FROM {table}
+    UNION ALL
+    SELECT (SELECT MIN(metric) FROM {table} WHERE metric > metrics.metric)
+    FROM metrics WHERE metric IS NOT NULL
+)
+SELECT metric FROM metrics WHERE metric IS NOT NULL
+"""
+
 _LATEST_SQL = """
 WITH RECURSIVE metrics(metric) AS (
     SELECT MIN(metric) FROM readings
@@ -405,6 +415,19 @@ class SqliteStore:
         削除ジョブ（FR-203）のたびに数百万行を読むことになってしまう。
         """
         rows = self._conn.execute(_METRICS_SQL).fetchall()
+        return tuple(row["metric"] for row in rows)
+
+    def rollup_metrics(self, agg: Aggregation) -> tuple[str, ...]:
+        """ロールアップ済みのメトリクス名。**生データが消えたあとも残る。**
+
+        日次レポートはロールアップから作るので、保持期間（30日）を過ぎた日でも
+        「そこに何のメトリクスがあったか」を答えられる必要がある（#25）。
+        `metrics()` と同じ理由で `SELECT DISTINCT` は使わない（決定記録 0004 §2.11）。
+        """
+        table = _ROLLUP_TABLES.get(agg)
+        if table is None:
+            raise ValueError(f"ロールアップ表を持たない集計: {agg}")
+        rows = self._conn.execute(_ROLLUP_METRICS_SQL.format(table=table)).fetchall()
         return tuple(row["metric"] for row in rows)
 
     def set_system_state(self, key: str, value: str, *, at_ms: int) -> bool:

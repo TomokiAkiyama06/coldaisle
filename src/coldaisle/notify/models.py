@@ -95,7 +95,11 @@ class Notification:
     context: dict[str, float | None] = field(default_factory=dict)
     """関連するメトリクスの現在値。**何が起きているかを本文だけで判断できるように。**"""
     kind: str = "alert"
-    """`alert` か `explanation`。後者は発火の通知に**後から続く**説明（#38）。"""
+    """`alert` / `explanation`（#38）/ `report`（#25）。
+
+    `explanation` は発火の通知に**後から続く**説明。`report` は日次レポートで、
+    `Router` を通さず宛先へ直接送る（`coldaisle.report.send`）。
+    """
     body: str = ""
     """本文をそのまま渡す場合に使う（説明の全文）。"""
 
@@ -103,6 +107,8 @@ class Notification:
     def title(self) -> str:
         if self.kind == "explanation":
             return f"🔎 {self.rule_id} の説明"
+        if self.kind == "report":
+            return f"📄 {self.rule_id}"
         mark = "🔴" if self.state == "firing" else "✅"
         target = f" [{self.metric}]" if self.metric else ""
         return f"{mark} {self.rule_id}{target} — {self.state}"

@@ -35,6 +35,7 @@ config/secrets.*
 *.sqlite3-wal
 *.sqlite3-shm
 data/
+var/
 
 # ログ・CSVエクスポート（FR-205 の出力先。~/server_sensor_logs 相当）
 logs/
