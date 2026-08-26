@@ -62,21 +62,40 @@ class Fact:
 
 
 @dataclass(frozen=True)
-class Change:
-    """記録済みとの差分1つ。"""
+class Recorded:
+    """記録済みの1行。**消えた事実の記録を書くのに、値以外も要る。**"""
 
-    fact: Fact
-    previous: str | None
-    previous_date: str | None
+    label: str
+    value: str
+    source: str
+    at: str
+
+
+@dataclass(frozen=True)
+class Change:
+    """記録済みとの差分1つ。`value` が `None` なら**入力から消えた**。"""
+
+    key: str
+    label: str
+    source: str
+    value: str | None
+    previous: str | None = None
+    previous_date: str | None = None
 
     @property
     def is_new(self) -> bool:
-        return self.previous is None
+        return self.previous is None and self.value is not None
+
+    @property
+    def is_removed(self) -> bool:
+        return self.value is None
 
     def as_line(self) -> str:
+        if self.is_removed:
+            return f"- {self.label}: {self.previous} → **設定から消えた**"
         if self.is_new:
-            return f"+ {self.fact.label}: {self.fact.value}（新規）"
-        return f"~ {self.fact.label}: {self.previous} → {self.fact.value}"
+            return f"+ {self.label}: {self.value}（新規）"
+        return f"~ {self.label}: {self.previous} → {self.value}"
 
 
 # ---------------------------------------------------------------------- 収集
@@ -124,16 +143,24 @@ def _calibration_facts(calibration: Calibration) -> list[Fact]:
 
 
 def _sensor_facts(store: SqliteStore) -> list[Fact]:
-    """センサー構成。**較正値が対応している ROM がどれか**を残す（#14 / FR-403）。"""
+    """センサー構成。**どのチャネルがどの ROM か**を残す（#14 / FR-403）。
+
+    ROM の集合だけを並べると、**2本のプローブが入れ替わっても同じ文字列になる。**
+    較正オフセットはチャネルごとに効くので、入れ替わりは「オフセットが間違った
+    プローブに対応している」状態そのものである。それを見逃す記録では意味がない。
+    """
     facts: list[Fact] = []
     for device_id in sorted(_device_ids(store)):
         sensors = store.sensors_for(device_id)
-        roms = sorted(sensor.rom for sensor in sensors if sensor.rom)
+        pairs = ", ".join(
+            f"{sensor.channel}={sensor.rom or '（ROMなし）'}"
+            for sensor in sorted(sensors, key=lambda item: item.channel)
+        )
         facts.append(
             Fact(
                 key=f"sensors.{device_id}",
                 label=f"{device_id} のセンサー構成",
-                value=f"{len(sensors)} 本" + (f" / ROM {', '.join(roms)}" if roms else ""),
+                value=f"{len(sensors)} 本 / {pairs}" if pairs else f"{len(sensors)} 本",
                 source="devices テーブル（起動バナー）",
             )
         )
@@ -152,39 +179,64 @@ def _fmt(value: object) -> str:
 # ---------------------------------------------------------------------- 読み書き
 
 
-def read_current(text: str) -> dict[str, tuple[str, str]]:
-    """記録済みの Current Facts を `{キー: (値, 記録日)}` で返す。"""
+def read_current(text: str) -> dict[str, Recorded]:
+    """記録済みの Current Facts を読む。"""
     if CURRENT_START not in text or CURRENT_END not in text:
         return {}
     block = text.split(CURRENT_START, 1)[1].split(CURRENT_END, 1)[0]
-    recorded: dict[str, tuple[str, str]] = {}
+    recorded: dict[str, Recorded] = {}
     for line in block.splitlines():
         matched = ROW.match(line.strip())
         if matched is None:
             continue
-        key, _label, value, _source, at = matched.groups()
-        recorded[key.strip()] = (value.strip(), at.strip())
+        key, label, value, source, at = matched.groups()
+        recorded[key.strip()] = Recorded(
+            label=label.strip(), value=value.strip(), source=source.strip(), at=at.strip()
+        )
     return recorded
 
 
-def diff(facts: Sequence[Fact], recorded: dict[str, tuple[str, str]]) -> list[Change]:
-    """**消えた項目は差分に出さない。** 設定から消えたことは History で追える。"""
+def diff(facts: Sequence[Fact], recorded: dict[str, Recorded]) -> list[Change]:
+    """**消えた項目も差分に出す。**
+
+    黙って行が消えると、その項目の最後の記録が `Superseded by` の付かないまま
+    History に残る。**検索した人はそれを現在値として読む**（決定記録 0020 §2.4 が
+    防ごうとしていることそのもの）。
+    """
     changes: list[Change] = []
+    seen = set()
     for fact in facts:
+        seen.add(fact.key)
         previous = recorded.get(fact.key)
-        if previous is not None and previous[0] == fact.value:
+        if previous is not None and previous.value == fact.value:
             continue
         changes.append(
             Change(
-                fact=fact,
-                previous=None if previous is None else previous[0],
-                previous_date=None if previous is None else previous[1],
+                key=fact.key,
+                label=fact.label,
+                source=fact.source,
+                value=fact.value,
+                previous=None if previous is None else previous.value,
+                previous_date=None if previous is None else previous.at,
+            )
+        )
+    for key, previous in sorted(recorded.items()):
+        if key in seen:
+            continue
+        changes.append(
+            Change(
+                key=key,
+                label=previous.label,
+                source=previous.source,
+                value=None,
+                previous=previous.value,
+                previous_date=previous.at,
             )
         )
     return changes
 
 
-def render_current(facts: Sequence[Fact], recorded: dict[str, tuple[str, str]], today: date) -> str:
+def render_current(facts: Sequence[Fact], recorded: dict[str, Recorded], today: date) -> str:
     """Current Facts の区画。**変わっていない項目の記録日は据え置く。**
 
     毎回今日の日付にすると、「いつからこの値なのか」が消える。
@@ -193,7 +245,9 @@ def render_current(facts: Sequence[Fact], recorded: dict[str, tuple[str, str]], 
     for fact in facts:
         previous = recorded.get(fact.key)
         at = (
-            previous[1] if previous is not None and previous[0] == fact.value else today.isoformat()
+            previous.at
+            if previous is not None and previous.value == fact.value
+            else today.isoformat()
         )
         lines.append(f"| `{fact.key}` | {fact.label} | {fact.value} | {fact.source} | {at} |")
     lines += ["", CURRENT_END]
@@ -208,11 +262,16 @@ def render_history(changes: Sequence[Change], today: date) -> str:
     """
     blocks = [f"### {today.isoformat()}"]
     for change in changes:
+        decision = (
+            f"{change.label} は設定から消えた"
+            if change.is_removed
+            else f"{change.label} = {change.value}"
+        )
         lines = [
-            f"Key: `{change.fact.key}`",
-            f"Decision: {change.fact.label} = {change.fact.value}",
+            f"Key: `{change.key}`",
+            f"Decision: {decision}",
             "Status: Observed（coldaisle が設定の変化を記録。確定させるのは人）",
-            f"Evidence: {change.fact.source}",
+            f"Evidence: {change.source}",
         ]
         if change.previous is not None:
             lines.append(f"Supersedes: {change.previous}（{change.previous_date}）")
@@ -288,9 +347,7 @@ def apply(text: str, facts: Sequence[Fact], changes: Sequence[Change], today: da
         return text
     # **古い記録に先に印を付ける。** 新しい記録を積んでからだと、いま積んだものに
     # 「これは古い」と書いてしまう
-    text = mark_superseded(
-        text, {change.fact.key for change in changes if not change.is_new}, today
-    )
+    text = mark_superseded(text, {change.key for change in changes if not change.is_new}, today)
     entry = render_history(changes, today)
     if DECISIONS_HEADING in text:
         head, tail = text.split(DECISIONS_HEADING, 1)
@@ -366,6 +423,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     changes = diff(facts, read_current(text))
     _report(changes, args.memory, applied=args.apply)
     if not args.apply:
+        _log_summary(changes, args.memory, applied=False, committed=False)
         return 0
 
     args.memory.parent.mkdir(parents=True, exist_ok=True)
@@ -373,29 +431,43 @@ def main(argv: Sequence[str] | None = None) -> int:
     committed = False
     if args.commit and changes:
         committed = commit(args.memory, f"chore: 運用メモリを更新する（{len(changes)} 件）")
-    LOGGER.info(
-        "運用メモリを更新した",
-        extra={
-            logs.FIELDS_KEY: {
-                "path": str(args.memory),
-                "changes": len(changes),
-                "committed": committed,
-            }
-        },
-    )
+    _log_summary(changes, args.memory, applied=True, committed=committed)
     return 0
 
 
 def _report(changes: Sequence[Change], path: Path, *, applied: bool) -> None:
-    """人が読んで確認するための出力。**ここが確認の場**なので端末へ出す。"""
+    """人が読んで確認するための出力。**確認の場なので標準出力へ出す。**
+
+    構造化ログ（JSON Lines）は**標準エラー**へ出る（`logs.configure`）。2つの流れは
+    混ざらないので、集める側は `2>` で JSON だけを受け取れる。ここを JSON にすると
+    **確認そのものが読みにくくなる**（要件 Q-12 は人が読んで判断することを求めている）。
+    件数の記録は `_log_summary` がどの実行でも必ず残す。
+    """
     if not changes:
-        print(f"変更はありません（{path}）")  # noqa: T201
+        print(f"変更はありません（{path}）")  # noqa: T201 - 人向けの確認画面
         return
-    print(f"{len(changes)} 件の変更（{path}）")  # noqa: T201
+    print(f"{len(changes)} 件の変更（{path}）")  # noqa: T201 - 人向けの確認画面
     for change in changes:
-        print(f"  {change.as_line()}")  # noqa: T201
+        print(f"  {change.as_line()}")  # noqa: T201 - 人向けの確認画面
     if not applied:
         print("\n書き込んでいません。内容を確認して `--apply` を付けてください。")  # noqa: T201
+
+
+def _log_summary(changes: Sequence[Change], path: Path, *, applied: bool, committed: bool) -> None:
+    """**どの実行にも構造化の記録を1行残す。** 集める側は標準エラーだけを読めばよい。"""
+    LOGGER.info(
+        "運用メモリの差分を確認した",
+        extra={
+            logs.FIELDS_KEY: {
+                "path": str(path),
+                "changes": len(changes),
+                "added": sum(1 for change in changes if change.is_new),
+                "removed": sum(1 for change in changes if change.is_removed),
+                "applied": applied,
+                "committed": committed,
+            }
+        },
+    )
 
 
 if __name__ == "__main__":  # pragma: no cover

@@ -7,6 +7,7 @@
 3. **全自動保存にしない**（`--apply` を付けたときだけ書く）
 """
 
+import json
 import subprocess
 from datetime import date
 from pathlib import Path
@@ -68,10 +69,10 @@ def test_current_values_are_in_one_place(rule_set, calibration):
     """受入基準: **1ファイルを見れば、いまの閾値と較正値が分かる。**"""
     text = build(collect(rule_set, calibration))
     current = read_current(text)
-    assert current["rule.recirculation"][0].endswith(
+    assert current["rule.recirculation"].value.endswith(
         f"threshold={rule_set.recirculation.threshold:g}"
     )
-    assert current["calibration.room_temp"][0] == "+0.00 C"
+    assert current["calibration.room_temp"].value == "+0.00 C"
 
 
 def test_each_key_appears_once_in_the_current_block(rule_set, calibration):
@@ -87,14 +88,20 @@ def test_an_unchanged_value_keeps_its_original_date():
     facts = facts_of(("rule.a", "5"))
     first = build(facts, TODAY)
     second = apply(first, facts, diff(facts, read_current(first)), LATER)
-    assert read_current(second)["rule.a"] == ("5", TODAY.isoformat())
+    assert (read_current(second)["rule.a"].value, read_current(second)["rule.a"].at) == (
+        "5",
+        TODAY.isoformat(),
+    )
 
 
 def test_a_changed_value_takes_the_new_date():
     first = build(facts_of(("rule.a", "5")), TODAY)
     changed = facts_of(("rule.a", "4"))
     second = apply(first, changed, diff(changed, read_current(first)), LATER)
-    assert read_current(second)["rule.a"] == ("4", LATER.isoformat())
+    assert (read_current(second)["rule.a"].value, read_current(second)["rule.a"].at) == (
+        "4",
+        LATER.isoformat(),
+    )
 
 
 def test_a_disabled_rule_is_recorded_as_disabled(rule_set, calibration):
@@ -102,7 +109,8 @@ def test_a_disabled_rule_is_recorded_as_disabled(rule_set, calibration):
     off = rule_set.model_copy(
         update={"recirculation": rule_set.recirculation.model_copy(update={"enabled": False})}
     )
-    assert read_current(build(collect(off, calibration)))["rule.recirculation"][0] == "無効"
+    current = read_current(build(collect(off, calibration)))
+    assert current["rule.recirculation"].value == "無効"
 
 
 # ---------------------------------------------------------------- 履歴（受入基準）
@@ -165,6 +173,37 @@ def test_marking_is_idempotent():
     assert mark_superseded(once, {"rule.a"}, LATEST) == once
 
 
+def test_a_removed_fact_is_reported(capsys):
+    """**消えた項目も差分に出す**（#40 のレビュー指摘）。
+
+    黙って行が消えると、その項目の最後の記録が `Superseded by` の付かないまま
+    History に残り、**検索した人はそれを現在値として読む。**
+    """
+    first = build(facts_of(("rule.a", "5"), ("rule.b", "9")), TODAY)
+    remaining = facts_of(("rule.a", "5"))
+    changes = diff(remaining, read_current(first))
+    assert [change.key for change in changes] == ["rule.b"]
+    assert changes[0].is_removed is True
+    assert "設定から消えた" in changes[0].as_line()
+
+
+def test_a_removed_fact_marks_its_last_entry_superseded():
+    first = build(facts_of(("rule.a", "5"), ("rule.b", "9")), TODAY)
+    remaining = facts_of(("rule.a", "5"))
+    second = apply(first, remaining, diff(remaining, read_current(first)), LATER)
+    assert "rule.b" not in read_current(second)  # 現在値からは消える
+    entries = [block for block in second.split("\n\n") if "Key: `rule.b`" in block]
+    assert all("Superseded by" in block for block in entries[1:])
+    assert "rule.b の値 は設定から消えた" in second
+
+
+def test_a_removal_entry_keeps_the_old_value_visible():
+    """**何が消えたのか**が読めること。値を書かずに消すと追えない。"""
+    first = build(facts_of(("rule.b", "9")), TODAY)
+    second = apply(first, [], diff([], read_current(first)), LATER)
+    assert f"Supersedes: 9（{TODAY.isoformat()}）" in second
+
+
 def test_new_facts_are_recorded_without_supersedes():
     assert "Supersedes" not in build(facts_of(("rule.a", "5")), TODAY)
 
@@ -187,7 +226,7 @@ def test_a_file_without_markers_gets_a_block():
     facts = facts_of(("rule.a", "5"))
     updated = apply(text, facts, diff(facts, read_current(text)), TODAY)
     assert "何か書いてある。" in updated
-    assert read_current(updated)["rule.a"][0] == "5"
+    assert read_current(updated)["rule.a"].value == "5"
 
 
 def test_a_missing_block_is_not_read_as_empty_values():
@@ -206,7 +245,29 @@ def test_sensor_layout_is_recorded(tmp_path, rules, rule_set, calibration):
             at_ms=0,
         )
         facts = {fact.key: fact.value for fact in collect(rule_set, calibration, store)}
-    assert facts["sensors.dev-1"] == "1 本 / ROM 28AABB"
+    assert facts["sensors.dev-1"] == "1 本 / room_temp=28AABB"
+
+
+def test_a_probe_swap_changes_the_record(tmp_path, rules, rule_set, calibration):
+    """**チャネルと ROM の対応**を残す（#40 のレビュー指摘 / #14）。
+
+    ROM の集合だけを並べると、2本のプローブが入れ替わっても同じ文字列になる。
+    較正オフセットはチャネルごとに効くので、入れ替わりは「オフセットが間違った
+    プローブに対応している」状態そのもの。**それを見逃す記録では意味がない。**
+    """
+
+    def layout(pairs):
+        with SqliteStore(tmp_path / f"{pairs[0][1]}.db", rules=rules, clock=SimulatedClock(0)) as s:
+            s.record_hello(
+                DeviceRecord(device_id="dev-1", fw="1.0.0", schema_v=1, interval_ms=2500),
+                [SensorRecord(channel=ch, kind="ds18b20", rom=rom) for ch, rom in pairs],
+                at_ms=0,
+            )
+            return {fact.key: fact.value for fact in collect(rule_set, calibration, s)}
+
+    before = layout([("room_temp", "28AA"), ("gpu_intake", "28BB")])
+    after = layout([("room_temp", "28BB"), ("gpu_intake", "28AA")])  # 入れ替わり
+    assert before["sensors.dev-1"] != after["sensors.dev-1"]
 
 
 def test_values_come_only_from_files_and_the_database(rule_set, calibration):
@@ -216,6 +277,25 @@ def test_values_come_only_from_files_and_the_database(rule_set, calibration):
 
 
 # ---------------------------------------------------------------- 書かない（受入基準）
+
+
+def test_a_structured_record_is_left_on_every_run(tmp_path, capsys):
+    """**確認の出力は標準出力、構造化ログは標準エラー**（#40 のレビュー指摘）。
+
+    2つの流れが混ざらないので、集める側は `2>` で JSON だけを受け取れる。
+    確認そのものを JSON にすると読みにくくなる（要件 Q-12 は人が読んで判断する
+    ことを求めている）。
+    """
+    main([*_args(tmp_path / "m.md"), "--db", str(tmp_path / "none.db")])
+    captured = capsys.readouterr()
+    assert "書き込んでいません" in captured.out  # 人が読む側
+
+    # **標準エラーは1行1件の JSON だけ**（AGENTS.md「ログは構造化」）
+    records = [json.loads(line) for line in captured.err.splitlines() if line.strip()]
+    summary = records[-1]
+    assert summary["msg"] == "運用メモリの差分を確認した"
+    assert summary["applied"] is False
+    assert summary["changes"] > 0
 
 
 def test_nothing_is_written_without_apply(tmp_path, capsys):
