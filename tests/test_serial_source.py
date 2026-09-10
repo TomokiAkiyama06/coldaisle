@@ -133,6 +133,101 @@ def test_null_is_not_confused_with_non_finite():
     assert message.channels == {"room_temp": None}
 
 
+# ------------------------------------------------- 契約との一致（#12 のレビュー指摘）
+
+
+def _fixture_lines(name: str) -> list[str]:
+    return [
+        line for line in (FIXTURES / name).read_text(encoding="utf-8").splitlines() if line.strip()
+    ]
+
+
+def test_every_schema_violation_is_rejected():
+    """**スキーマが弾く行は、取り込みでも弾く。**
+
+    `decode_line` の判定と `schemas/device_v1.schema.json` は別々に書かれている
+    （実行時に `jsonschema` を持ち込まないため）。**別々である以上、ずれる。**
+    契約の違反例をそのまま通して、ずれたら落ちるようにする。
+    """
+    passed = [
+        line for line in _fixture_lines("device_v1_schema_violations.jsonl") if decode_line(line)
+    ]
+    assert passed == []
+
+
+@pytest.mark.parametrize("name", ["device_v1_valid.jsonl", "device_v1_missing.jsonl"])
+def test_valid_fixtures_are_accepted(name):
+    """**弾きすぎない。** 締めすぎると正当なサンプルまで落ちる。"""
+    import json
+
+    for line in _fixture_lines(name):
+        if json.loads(line).get("type") in ("s", "hello"):
+            assert decode_line(line) is not None, line
+
+
+def test_numeric_strings_are_not_coerced():
+    """`"1042"` を 1042 にしない。**電文の契約は型まで含む。**"""
+    assert decode_line('{"v":1,"type":"s","seq":"1042","up":1}') is None
+    assert decode_line('{"v":1,"type":"s","seq":1,"up":1,"room_temp":"26.4"}') is None
+
+
+def test_integers_are_accepted_for_readings():
+    """`27` は `27.0`。**締めすぎない**（`%.2f` でない実装もありうる）。"""
+    message = decode_line('{"v":1,"type":"s","seq":1,"up":1,"room_temp":27}')
+    assert isinstance(message, RawSample)
+    assert message.channels == {"room_temp": 27.0}
+
+
+@pytest.mark.parametrize(
+    "err",
+    ["null", '"rear_exhaust:-127"', '["no-colon-here"]', "5"],
+)
+def test_malformed_err_drops_the_line(err):
+    """**`err` の壊れた値で例外を出さない。**
+
+    出すと `SerialSource` が切断と取り違え、健全なポートを閉じて開き直す。
+    そういう値を出し続けるデバイスがいると、**以降のサンプルが一切入らない。**
+    `"abc"` を `tuple()` に通すと1文字ずつの理由になるのも避ける。
+    """
+    assert decode_line(f'{{"v":1,"type":"s","seq":1,"up":1,"err":{err}}}') is None
+
+
+def test_a_malformed_err_is_not_mistaken_for_a_disconnect():
+    """壊れた行が来ても**接続は保つ**（その行だけ捨てる）。"""
+    source, _ = source_over(
+        [
+            '{"v":1,"type":"s","seq":1,"up":1,"err":null}\n',
+            '{"v":1,"type":"s","seq":2,"up":2}\n',
+        ]
+    )
+    # 壊れた行は捨て、**その次の行は同じ接続で届く**
+    assert [m.seq for m in source.stream()] == [2]  # type: ignore[union-attr]
+    assert source.dropped_lines == 1
+    assert source.reconnects == 1  # 偽のポートが尽きた1回だけ。行では切れていない
+
+
+@pytest.mark.parametrize(
+    "hello",
+    [
+        # ds18b20 なのに rom が無い（決定記録 0003 §2.4）
+        '{"v":1,"type":"hello","fw":"1","dev":"d","interval_ms":2500,'
+        '"sensors":{"a":{"kind":"ds18b20","gpio":1,"res":11}}}',
+        # rom が小文字（FR-403 の判定は文字列の一致）
+        '{"v":1,"type":"hello","fw":"1","dev":"d","interval_ms":2500,'
+        '"sensors":{"a":{"kind":"ds18b20","gpio":1,"rom":"28ffffffffffff01","res":11}}}',
+        # sensors が空
+        '{"v":1,"type":"hello","fw":"1","dev":"d","interval_ms":2500,"sensors":{}}',
+    ],
+)
+def test_incomplete_hellos_are_rejected(hello):
+    """**欠けたバナーを基準として記録しない。**
+
+    `rom` の無いバナーを記録すると、次にプローブを差し替えても比べる相手が無く、
+    FR-403 が黙る。空の `sensors` も同じ理由で受け取らない。
+    """
+    assert decode_line(hello) is None
+
+
 # ---------------------------------------------------------------- 種別
 
 
