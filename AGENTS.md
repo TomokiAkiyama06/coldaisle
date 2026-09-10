@@ -29,6 +29,8 @@ uv run coldaisle-report --date 2026-08-24 --no-send --print  # 任意の日を�
 uv run coldaisle-escalate           # 故障疑いの案件資料（**送信はしない**）
 uv run coldaisle-memory             # 運用メモリの更新案（**既定では書かない**）
 uv run coldaisle-memory --apply --commit  # 確認してから書く
+uv run coldaisle-calibrate          # 較正オフセットの算出（**既定では書かない**）
+uv run coldaisle-calibrate --apply  # 確認してから書く。手順は docs/calibration.md
 COLDAISLE_DB=var/coldaisle.db uv run uvicorn coldaisle.api:app --host 127.0.0.1 --port 8000
 COLDAISLE_DB=var/coldaisle.db uv run uvicorn coldaisle.server:app --port 8000  # + AI ツールの窓口
 ```
@@ -170,6 +172,7 @@ src/coldaisle/
   server.py   # 合成の起点: 読み取りAPI + AIツールの窓口。#23
   escalate.py # 合成の起点: 故障疑いの案件資料（AI非依存・送信しない）。#39
   memory.py   # 合成の起点: 運用メモリの記録（確認を経由する）。#40
+  calibrate.py# 合成の起点: 較正オフセットの算出（確認を経由する）。#13
   store/      # L1: SQLite、ロールアップ、CSVエクスポート
   api/        # L2: FastAPI、WebSocket
   rules/      # L2: ルールエンジン（決定論的。AI非依存）

@@ -31,7 +31,7 @@ from zoneinfo import ZoneInfo
 from coldaisle import logs
 from coldaisle.ai import AiSettings, Explainer, ToolRegistry, provider_from_env
 from coldaisle.channels import QUEUE_DROPS_METRIC
-from coldaisle.clock import Clock
+from coldaisle.clock import Clock, WallClock
 from coldaisle.ingest import (
     Calibration,
     MockSource,
@@ -607,7 +607,23 @@ def _calibration_for(config: Config) -> Calibration:
     """
     if config.source == "replay":
         return Calibration(note="再生では較正を当てない（決定記録 0010 §2.9）")
-    return Calibration.from_json(config.calibration)
+    calibration = Calibration.from_json(config.calibration)
+    now_ms = WallClock().now_ms()
+    if calibration.is_expired(now_ms):
+        age = calibration.age_days(now_ms)
+        # **黙って古い較正を使い続けない**（#13）。ずれたオフセットは、
+        # 測っていないより悪い（補正済みのつもりで誤った値を見ることになる）
+        LOGGER.warning(
+            "較正をやり直す時期（または未較正）",
+            extra={
+                logs.FIELDS_KEY: {
+                    "calibrated_at": calibration.calibrated_at,
+                    "age_days": None if age is None else round(age, 1),
+                    "revalidate_after_days": calibration.revalidate_after_days,
+                }
+            },
+        )
+    return calibration
 
 
 def _build_source(config: Config) -> Source:

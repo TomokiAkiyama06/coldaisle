@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime
 from pathlib import Path
 from typing import Annotated, Any
 
@@ -28,6 +29,25 @@ class Calibration(BaseModel):
 
     note: str = ""
     """人間向けの覚書。値ではないので判定には使わない。"""
+
+    calibrated_at: str | None = None
+    """較正を行った時刻（ISO8601）。**`None` は「まだ測っていない」。**
+
+    黙って古い較正を使い続けないために持つ。`is_expired()` が見る。
+    """
+
+    reference: str = ""
+    """基準の取り方。`mean_of_all`（spec-review W-02）。**何と比べたかを残す。**"""
+
+    revalidate_after_days: int = Field(default=183, gt=0)
+    """この日数を過ぎたら較正をやり直す（#13。既定は約6ヶ月）。
+
+    値の置き場所をこのファイルにしたのは、**「いつまで有効か」が較正の記録の
+    一部**だからである。運用の調整つまみではない。
+    """
+
+    samples: dict[str, int] = Field(default_factory=dict)
+    """チャネルごとの、較正に使った測定の件数。**根拠を残す。**"""
 
     offsets_c: dict[str, Annotated[float, Field(allow_inf_nan=False)]] = Field(default_factory=dict)
     """非有限値は**読み込み時に**弾く。
@@ -51,3 +71,25 @@ class Calibration(BaseModel):
 
     def offset_for(self, channel: str) -> float:
         return self.offsets_c.get(channel, 0.0)
+
+    def age_days(self, now_ms: int) -> float | None:
+        """較正からの経過日数。**測っていなければ `None`。**"""
+        if self.calibrated_at is None:
+            return None
+        try:
+            at = datetime.fromisoformat(self.calibrated_at)
+        except ValueError:
+            return None
+        if at.tzinfo is None:
+            # オフセットの無い時刻は解釈が割れる。**推測しない**
+            return None
+        return (now_ms / 1000 - at.timestamp()) / 86_400
+
+    def is_expired(self, now_ms: int) -> bool:
+        """やり直しが要るか。**未較正も「要る」に含める。**
+
+        センサーは経年でずれる。ずれたオフセットは、**測っていないより悪い**
+        （補正済みのつもりで誤った値を見ることになる）。
+        """
+        age = self.age_days(now_ms)
+        return age is None or age > self.revalidate_after_days
