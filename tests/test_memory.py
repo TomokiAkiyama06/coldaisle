@@ -241,11 +241,11 @@ def test_sensor_layout_is_recorded(tmp_path, rules, rule_set, calibration):
     with SqliteStore(tmp_path / "m.db", rules=rules, clock=SimulatedClock(0)) as store:
         store.record_hello(
             DeviceRecord(device_id="dev-1", fw="1.0.0", schema_v=1, interval_ms=2500),
-            [SensorRecord(channel="room_temp", kind="ds18b20", rom="28AABB")],
+            [SensorRecord(channel="room_temp", kind="ds18b20", rom="28FFFFFFFFFFFF01")],
             at_ms=0,
         )
         facts = {fact.key: fact.value for fact in collect(rule_set, calibration, store)}
-    assert facts["sensors.dev-1"] == "1 本 / room_temp=28AABB"
+    assert facts["sensors.dev-1"] == "1 本 / room_temp=28FFFFFFFFFFFF01"
 
 
 def test_a_probe_swap_changes_the_record(tmp_path, rules, rule_set, calibration):

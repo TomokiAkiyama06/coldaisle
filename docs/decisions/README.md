@@ -90,3 +90,4 @@ docs/decisions/NNNN-<slug>.md      例: 0002-metric-naming.md
 | [0018](0018-tool-exposure.md) | AI 向けツールの公開方法 | Proposed |
 | [0019](0019-claude-escalation.md) | Claude へのエスカレーション | Proposed |
 | [0020](0020-decision-memory.md) | 運用メモリへの記録 | Proposed |
+| [0021](0021-public-repo-hygiene.md) | public リポジトリの衛生 | Proposed |
