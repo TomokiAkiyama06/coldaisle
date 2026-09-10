@@ -21,6 +21,7 @@ import pytest
 
 from coldaisle.calibrate import (
     ChannelMean,
+    accept_probes,
     as_calibration,
     check,
     compute,
@@ -28,11 +29,19 @@ from coldaisle.calibrate import (
     measure,
     write,
 )
-from coldaisle.channels import METRIC_TO_CHANNEL
+from coldaisle.channels import METRIC_TO_CHANNEL, OBSERVED_PROBES_KEY
 from coldaisle.clock import SimulatedClock
 from coldaisle.ingest.calibration import Calibration, CalibrationPolicy
 from coldaisle.metrics import MetricCatalog
-from coldaisle.store import Quality, Reading, Sample, SqliteStore
+from coldaisle.store import (
+    DeviceRecord,
+    Quality,
+    Reading,
+    Sample,
+    SensorRecord,
+    SqliteStore,
+)
+from coldaisle.store.quality import QualityRules
 from conftest import CONFIG_DIR
 
 NOW_MS = 1_787_616_000_000
@@ -410,3 +419,101 @@ def test_an_empty_window_says_so(tmp_path, rules, monkeypatch, capsys):
 def test_channel_means_carry_the_metric_name():
     item = ChannelMean(channel="room_temp", metric="air.room", mean_c=24.0, count=240)
     assert METRIC_TO_CHANNEL[item.metric] == item.channel
+
+
+# --------------------------------------------- 差し替えの受け入れ（#14 のレビュー指摘）
+
+
+def _record_probes(store, roms: dict[str, str]) -> None:
+    store.record_hello(
+        DeviceRecord(device_id="dev", fw="1.0.0", schema_v=1, interval_ms=2500),
+        [
+            SensorRecord(channel=channel, kind="ds18b20", gpio=index + 1, rom=rom, resolution=11)
+            for index, (channel, rom) in enumerate(sorted(roms.items()))
+        ],
+        at_ms=NOW_MS,
+    )
+
+
+def test_accepting_the_replacement_resolves_the_dead_end(store):
+    """**`PROBE_CHANGED` が解ける道を用意する**（#14 のレビュー指摘）。
+
+    記録の側は人が直すまで動かない（決定記録 0012 §2.6）。受け入れる手段が
+    無いと、差し替えたあと**アラートが永久に消えない。**
+    """
+    _record_probes(store, {"front_intake": "28FFFFFFFFFFFF01"})
+    store.set_system_state(
+        OBSERVED_PROBES_KEY, '{"front_intake": "28FFFFFFFFFFFF09"}', at_ms=NOW_MS
+    )
+
+    accepted = accept_probes(store)
+
+    assert accepted == {"front_intake": "28FFFFFFFFFFFF09"}
+    recorded = {s.channel: s.rom for s in store.sensors_for("dev")}
+    assert recorded["front_intake"] == "28FFFFFFFFFFFF09"
+    assert not store.current_state(OBSERVED_PROBES_KEY), "食い違いの記録が残っている"
+
+
+def test_accepting_keeps_the_rest_of_the_sensor_record(store):
+    """**変わったのは ROM だけ。** 種別・GPIO・分解能は引き継ぐ。"""
+    _record_probes(store, {"front_intake": "28FFFFFFFFFFFF01"})
+    store.set_system_state(
+        OBSERVED_PROBES_KEY, '{"front_intake": "28FFFFFFFFFFFF09"}', at_ms=NOW_MS
+    )
+    accept_probes(store)
+    sensor = next(s for s in store.sensors_for("dev") if s.channel == "front_intake")
+    assert (sensor.kind, sensor.gpio, sensor.resolution) == ("ds18b20", 1, 11)
+
+
+def test_nothing_to_accept_is_not_an_error(store):
+    """食い違いが無ければ何もしない。"""
+    _record_probes(store, {"front_intake": "28FFFFFFFFFFFF01"})
+    assert accept_probes(store) == {}
+    assert {s.rom for s in store.sensors_for("dev")} == {"28FFFFFFFFFFFF01"}
+
+
+def test_accepting_without_a_device_is_not_an_error(store):
+    store.set_system_state(OBSERVED_PROBES_KEY, '{"a": "28FFFFFFFFFFFF09"}', at_ms=NOW_MS)
+    assert accept_probes(store) == {}
+
+
+def test_the_cli_accepts_probes_together_with_the_calibration(ready):
+    """**較正と一緒にしか受け入れない。**
+
+    較正し直さずに ROM だけ受け入れると、古いオフセットが新しいプローブに
+    対応していることになり、**アラートが黙るだけで実害は残る。**
+    """
+    db, target = ready
+    with SqliteStore(
+        db, rules=QualityRules.from_yaml(CONFIG_DIR / "quality.yaml"), clock=SimulatedClock(NOW_MS)
+    ) as store:
+        _record_probes(store, {"front_intake": "28FFFFFFFFFFFF01"})
+        store.set_system_state(
+            OBSERVED_PROBES_KEY, '{"front_intake": "28FFFFFFFFFFFF09"}', at_ms=NOW_MS
+        )
+
+    assert main([*_argv(db, target), "--apply"]) == 0
+
+    with SqliteStore(
+        db, rules=QualityRules.from_yaml(CONFIG_DIR / "quality.yaml"), clock=SimulatedClock(NOW_MS)
+    ) as store:
+        recorded = {s.channel: s.rom for s in store.sensors_for("dev")}
+    assert recorded["front_intake"] == "28FFFFFFFFFFFF09"
+
+
+def test_the_cli_does_not_accept_probes_without_apply(ready):
+    """**見せるだけのときは受け入れない。**"""
+    db, target = ready
+    with SqliteStore(
+        db, rules=QualityRules.from_yaml(CONFIG_DIR / "quality.yaml"), clock=SimulatedClock(NOW_MS)
+    ) as store:
+        _record_probes(store, {"front_intake": "28FFFFFFFFFFFF01"})
+        store.set_system_state(
+            OBSERVED_PROBES_KEY, '{"front_intake": "28FFFFFFFFFFFF09"}', at_ms=NOW_MS
+        )
+    assert main(_argv(db, target)) == 0
+    with SqliteStore(
+        db, rules=QualityRules.from_yaml(CONFIG_DIR / "quality.yaml"), clock=SimulatedClock(NOW_MS)
+    ) as store:
+        recorded = {s.channel: s.rom for s in store.sensors_for("dev")}
+    assert recorded["front_intake"] == "28FFFFFFFFFFFF01"

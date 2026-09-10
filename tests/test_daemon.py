@@ -18,6 +18,7 @@ from collections.abc import Iterator
 import pytest
 
 from coldaisle import logs
+from coldaisle.channels import OBSERVED_PROBES_KEY
 from coldaisle.clock import SimulatedClock
 from coldaisle.daemon import Config, Daemon, build, build_parser, main
 from coldaisle.ingest import Normalizer
@@ -552,3 +553,53 @@ def test_a_partial_hello_does_not_erase_known_roms(tmp_path, rules):
     finally:
         daemon.store.close()
     assert recorded.get("rear_exhaust") == "28FFFFFFFFFFFF05", "記録が消えている"
+
+
+def test_a_mismatch_records_what_is_connected_now(tmp_path, rules):
+    """**差し替えたあとの現物を残す**（#14 のレビュー指摘）。
+
+    記録の側は人が直すまで動かない（決定記録 0012 §2.6）ので、これが無いと
+    **「何に差し替わったのか」を知る手段が無い。**
+    """
+
+    def banner(rom: str) -> RawHello:
+        return RawHello(
+            fw="1.0.0",
+            dev="dev",
+            interval_ms=2_500,
+            sensors={"rear_exhaust": RawSensor(kind="ds18b20", gpio=7, rom=rom, res=11)},
+        )
+
+    daemon = daemon_with([banner("28FFFFFFFFFFFF01"), banner("28FFFFFFFFFFFF09")], rules, tmp_path)
+    try:
+        daemon.run()
+        observed = daemon.store.current_state(OBSERVED_PROBES_KEY)
+        recorded = {s.channel: s.rom for s in daemon.store.sensors_for("dev")}
+    finally:
+        daemon.store.close()
+    assert json.loads(observed or "{}") == {"rear_exhaust": "28FFFFFFFFFFFF09"}
+    assert recorded["rear_exhaust"] == "28FFFFFFFFFFFF01", "記録の側は動かさない"
+
+
+def test_a_matching_hello_clears_the_observed_record(tmp_path, rules):
+    """食い違いが解けたら残さない。**古い情報を画面に出し続けない。**"""
+
+    def banner(rom: str) -> RawHello:
+        return RawHello(
+            fw="1.0.0",
+            dev="dev",
+            interval_ms=2_500,
+            sensors={"rear_exhaust": RawSensor(kind="ds18b20", gpio=7, rom=rom, res=11)},
+        )
+
+    daemon = daemon_with(
+        [banner("28FFFFFFFFFFFF01"), banner("28FFFFFFFFFFFF09"), banner("28FFFFFFFFFFFF01")],
+        rules,
+        tmp_path,
+    )
+    try:
+        daemon.run()
+        observed = daemon.store.current_state(OBSERVED_PROBES_KEY)
+    finally:
+        daemon.store.close()
+    assert not observed

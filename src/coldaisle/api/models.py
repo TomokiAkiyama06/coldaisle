@@ -137,6 +137,59 @@ class HealthResponse(BaseModel):
     """
 
 
+class SensorOut(BaseModel):
+    """センサー1本。**どの物理プローブがどのメトリクスか**を示す（#14 / FR-403）。"""
+
+    model_config = ConfigDict(frozen=True)
+
+    channel: str
+    """デバイスが送る名前（`front_intake`）。"""
+    metric: str | None
+    """ホストの名前（`air.front_intake`）。対応表に無ければ `null`。"""
+    kind: str
+    gpio: int | None = None
+    rom: str | None = None
+    """記録された ROM。**較正のオフセットが対応している個体**（spec-review W-03）。"""
+    observed_rom: str | None = None
+    """**いま繋がっている ROM**（食い違っているときだけ入る）。
+
+    これが無いと、差し替えたあとに「何に変わったのか」を知る手段が無い。
+    """
+    changed: bool = False
+    """記録と食い違っているか。**ダッシュボードの印はこれで決める。**
+
+    アラートの文面から読み取らない。文面は最初の不一致のまま更新されない場合が
+    あり（`Engine.on_hello` は発火中なら何も返さない）、**あとから別のチャネルが
+    ずれても印が動かない。**
+    """
+    resolution: int | None = None
+
+
+class DeviceOut(BaseModel):
+    """起動バナーで申告された構成1台ぶん。"""
+
+    model_config = ConfigDict(frozen=True)
+
+    device_id: str
+    fw: str | None = None
+    interval_ms: int | None = None
+    last_hello_at: str | None = None
+    sensors: list[SensorOut]
+
+
+class DevicesResponse(BaseModel):
+    """`GET /api/v1/devices`（#14）。
+
+    **記録された構成**であって、いま繋がっている構成ではない。この2つが
+    食い違っている状態が `PROBE_CHANGED`（FR-403）であり、
+    **記録の側は人が較正をやり直すまで動かさない**（決定記録 0012 §2.6）。
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    devices: list[DeviceOut]
+
+
 class ToolListResponse(BaseModel):
     """`GET /api/v1/tools`（#23）。
 

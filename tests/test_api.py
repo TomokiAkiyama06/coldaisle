@@ -19,7 +19,15 @@ from coldaisle.api.app import (
 from coldaisle.api.models import LatestResponse
 from coldaisle.clock import SimulatedClock
 from coldaisle.metrics import MetricCatalog
-from coldaisle.store import Aggregation, DeviceRecord, Quality, Reading, Sample, SqliteStore
+from coldaisle.store import (
+    Aggregation,
+    DeviceRecord,
+    Quality,
+    Reading,
+    Sample,
+    SensorRecord,
+    SqliteStore,
+)
 from coldaisle.store.rollup import rollup_minutes
 from conftest import CONFIG_DIR, QUALITY_RULES_PATH
 
@@ -513,3 +521,56 @@ def test_health_reports_queue_drops(tmp_path, rules, clock):
     with TestClient(app) as client:
         body = client.get("/api/v1/health").json()
     assert body["queue_drops_1h"] == 7
+
+
+# ---------------------------------------------------------------- センサー構成（#14）
+
+
+def test_devices_returns_the_recorded_layout(client):
+    """**記録された構成**を返す（FR-403 / spec-review W-03）。"""
+    body = client.get("/api/v1/devices").json()
+    assert [device["device_id"] for device in body["devices"]] == ["dev"]
+    assert body["devices"][0]["interval_ms"] == INTERVAL_MS
+
+
+def test_devices_maps_channels_to_metrics(tmp_path, rules, clock):
+    """**どの物理プローブがどのメトリクスか。** これが分からないと ROM に意味が無い。"""
+    path = tmp_path / "devices.db"
+    with SqliteStore(path, rules=rules, clock=SimulatedClock(0)) as store:
+        store.record_hello(
+            DeviceRecord(device_id="dev", fw="1.0.0", schema_v=1, interval_ms=INTERVAL_MS),
+            [
+                SensorRecord(
+                    channel="front_intake",
+                    kind="ds18b20",
+                    gpio=1,
+                    rom="28FFFFFFFFFFFF01",
+                    resolution=11,
+                ),
+                SensorRecord(channel="room_temp", kind="am2320"),
+            ],
+            at_ms=NOW_MS,
+        )
+    app = create_app(
+        Config(db=path, quality_rules=QUALITY_RULES_PATH, metrics=METRICS_PATH), clock=clock
+    )
+    with TestClient(app) as opened:
+        sensors = {
+            s["channel"]: s for s in opened.get("/api/v1/devices").json()["devices"][0]["sensors"]
+        }
+    assert sensors["front_intake"]["metric"] == "air.front_intake"
+    assert sensors["front_intake"]["rom"] == "28FFFFFFFFFFFF01"
+    assert sensors["room_temp"]["metric"] == "air.room"
+    assert sensors["room_temp"]["rom"] is None, "AM2320 は ROM を持たない"
+
+
+def test_devices_is_empty_before_the_first_hello(tmp_path, rules, clock):
+    """**起動バナーを受け取る前は空。** 推測で埋めない。"""
+    path = tmp_path / "empty.db"
+    with SqliteStore(path, rules=rules, clock=SimulatedClock(0)):
+        pass
+    app = create_app(
+        Config(db=path, quality_rules=QUALITY_RULES_PATH, metrics=METRICS_PATH), clock=clock
+    )
+    with TestClient(app) as opened:
+        assert opened.get("/api/v1/devices").json() == {"devices": []}

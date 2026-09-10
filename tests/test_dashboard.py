@@ -111,7 +111,13 @@ def test_script_reads_only_documented_endpoints():
     """叩く先が API 契約の範囲に収まっていること。"""
     script = SCRIPT.read_text(encoding="utf-8")
     used = set(re.findall(r'"(/api/v1/[a-z]+)"', script))
-    assert used == {"/api/v1/latest", "/api/v1/series", "/api/v1/health", "/api/v1/alerts"}
+    assert used == {
+        "/api/v1/latest",
+        "/api/v1/series",
+        "/api/v1/health",
+        "/api/v1/alerts",
+        "/api/v1/devices",
+    }
     assert "/api/v1/stream" in script, "WebSocket を使う（FR-306）"
 
 
@@ -181,3 +187,52 @@ def test_startup_installs_recovery_before_fetching():
     body = script[script.index("function start()") :]
     assert body.index("connect()") < body.index("refresh()")
     assert body.index("setInterval(refresh") < body.index("  refresh();")
+
+
+# ---------------------------------------------------------------- センサー構成（#14）
+
+
+def test_the_dashboard_shows_the_sensor_layout():
+    """**どの物理プローブがどのメトリクスか**を出す（#14 / spec-review W-03）。"""
+    html = (WEB_ROOT / "index.html").read_text(encoding="utf-8")
+    assert 'id="devices"' in html
+    assert "センサー構成" in html
+
+
+def test_the_dashboard_asks_for_the_devices():
+    script = (WEB_ROOT / "app.js").read_text(encoding="utf-8")
+    assert '"/api/v1/devices"' in script
+    assert "renderDevices(" in script
+
+
+def test_a_changed_probe_is_marked():
+    """`PROBE_CHANGED` の対象になっている行に印を付ける。
+
+    **アラート欄に出るだけでは、どのプローブか分からない。**
+    """
+    script = (WEB_ROOT / "app.js").read_text(encoding="utf-8")
+    assert "if (sensor.changed) row.className" in script
+    assert "tr.changed" in (WEB_ROOT / "styles.css").read_text(encoding="utf-8")
+
+
+def test_the_marker_does_not_read_the_alert_text():
+    """**アラートの文面から読み取らない**（#14 のレビュー指摘）。
+
+    文面は最初の不一致のまま更新されないことがあり（`Engine.on_hello` は
+    発火中なら何も返さない）、あとから別のチャネルがずれても印が動かない。
+    一覧の上限で古いアラートが落ちる問題も避けられる。
+    """
+    script = (WEB_ROOT / "app.js").read_text(encoding="utf-8")
+    assert "probeChangeDetails" not in script
+    assert "alert.detail" not in script.split("function renderDevices")[1]
+
+
+def test_the_current_rom_is_shown():
+    """**差し替えたあとに「何に変わったのか」が分かること。**"""
+    assert "sensor.observed_rom" in (WEB_ROOT / "app.js").read_text(encoding="utf-8")
+    assert "いまの ROM" in (WEB_ROOT / "app.js").read_text(encoding="utf-8")
+
+
+def test_the_rom_is_monospaced():
+    """ROM は目で突き合わせるもの。**等幅で並べる。**"""
+    assert "td.rom" in (WEB_ROOT / "styles.css").read_text(encoding="utf-8")

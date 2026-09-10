@@ -33,6 +33,7 @@
 | GET | `/api/v1/alerts` | アラート一覧 |
 | GET | `/api/v1/gpu/processes` | CUDA プロセス一覧と VRAM 使用量 |
 | GET | `/api/v1/thermal-gate` | Compute 開始前の熱状態（signal + 理由） |
+| GET | `/api/v1/devices` | 記録されたセンサー構成（チャネル / メトリクス / ROM）（#14） |
 | GET | `/api/v1/tools` | **AI 向けツールの関数定義**と注意書き（#23） |
 | GET | `/api/v1/tools/{name}` | ツールを1つ実行し、結果と呼び出しの記録を返す（#23） |
 | WS | `/api/v1/stream` | 新サンプルの push |
@@ -109,6 +110,45 @@ API が返すオフセットは `+00:00` です。同じ瞬間を指すので解
 
 `blocking` は**常に false** です。判断は人間が行います（決定 D-08）。
 将来もこのフィールドを true にする実装を入れないでください。
+
+### `GET /api/v1/devices`
+
+**どの物理プローブがどのメトリクスか**を返します（#14 / FR-403）。
+
+```json
+{
+  "devices": [
+    {
+      "device_id": "xiao-esp32s3",
+      "fw": "1.0.0",
+      "interval_ms": 2500,
+      "last_hello_at": "2026-09-10T02:00:00+00:00",
+      "sensors": [
+        {"channel": "front_intake", "metric": "air.front_intake", "kind": "ds18b20",
+         "gpio": 1, "rom": "28FFFFFFFFFFFF01", "observed_rom": null,
+         "changed": false, "resolution": 11},
+        {"channel": "rear_exhaust", "metric": "air.rear_exhaust", "kind": "ds18b20",
+         "gpio": 7, "rom": "28FFFFFFFFFFFF05", "observed_rom": "28FFFFFFFFFFFF09",
+         "changed": true, "resolution": 11}
+      ]
+    }
+  ]
+}
+```
+
+`rom` は**記録された**個体、`observed_rom` は**いま繋がっている**個体です。
+`changed` が `true` の行は、較正のオフセットが**別のプローブに対応している**
+状態です（FR-403）。
+
+**`changed` を使ってください。** アラートの文面から読み取らないこと。文面は
+最初の不一致のまま更新されないことがあり、一覧の上限で古いアラートが落ちることも
+あります。
+
+**これは「記録された構成」であって、いま繋がっている構成ではありません。**
+この2つが食い違っている状態が `PROBE_CHANGED` であり、
+**記録の側は人が較正をやり直すまで動きません**（決定記録 0012 §2.6）。
+
+起動バナーを受け取る前は `devices` が空です。推測で埋めません。
 
 ### `GET /api/v1/tools` と `GET /api/v1/tools/{name}`
 

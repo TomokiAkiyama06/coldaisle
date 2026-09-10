@@ -112,6 +112,58 @@ function renderAlerts(alerts) {
 }
 
 /**
+ * センサー構成（#14 / FR-403）。**どの物理プローブがどのメトリクスか。**
+ *
+ * ケース内で差し替えると、較正のオフセットもラベルも静かに間違ったまま
+ * 運用が続く（spec-review W-03）。ROM を出して人が突き合わせられるようにする。
+ *
+ * 印は `sensor.changed`（API がその場のデータから出す）で決める。
+ * **アラートの文面から読み取らない。** 文面は最初の不一致のまま更新されない
+ * ことがあり、あとから別のチャネルがずれても印が動かない。
+ * 一覧に入りきらなかった古いアラートを取り逃す問題も避けられる。
+ */
+function renderDevices(devices) {
+  const container = document.getElementById("devices");
+  container.replaceChildren();
+  if (devices.length === 0) {
+    container.appendChild(el("p", "empty", "起動バナーをまだ受け取っていません。"));
+    return;
+  }
+  for (const device of devices) {
+    const card = el("div", "device");
+    const meta = [device.fw && `fw ${device.fw}`, device.interval_ms && `${device.interval_ms}ms`]
+      .filter(Boolean)
+      .join(" · ");
+    card.appendChild(el("div", "title", `${device.device_id}${meta ? ` — ${meta}` : ""}`));
+    if (device.last_hello_at) {
+      const at = new Date(device.last_hello_at).toLocaleString();
+      card.appendChild(el("div", "meta", `最終バナー ${at}`));
+    }
+    const table = document.createElement("table");
+    table.className = "sensors";
+    const head = document.createElement("tr");
+    for (const label of ["チャネル", "メトリクス", "種別", "GPIO", "記録された ROM", "いまの ROM"]) {
+      head.appendChild(el("th", "", label));
+    }
+    table.appendChild(head);
+    for (const sensor of device.sensors) {
+      const row = document.createElement("tr");
+      if (sensor.changed) row.className = "changed";
+      row.appendChild(el("td", "", sensor.channel));
+      row.appendChild(el("td", "", sensor.metric || "—"));
+      row.appendChild(el("td", "", sensor.kind));
+      row.appendChild(el("td", "", sensor.gpio === null ? "—" : String(sensor.gpio)));
+      row.appendChild(el("td", "rom", sensor.rom || "—"));
+      // 食い違っていないときは空にする。**同じ値を2列に出しても読みにくいだけ**
+      row.appendChild(el("td", "rom", sensor.changed ? sensor.observed_rom || "（無し）" : ""));
+      table.appendChild(row);
+    }
+    card.appendChild(table);
+    container.appendChild(card);
+  }
+}
+
+/**
  * 想定される点の間隔。**線を切る判断に使う。**
  * 取り込みが止まった区間には行そのものが無く、`null` の点すら来ない。
  */
@@ -262,14 +314,16 @@ function applyLatest(latest) {
  */
 async function refresh() {
   try {
-    const [latest, health, alerts] = await Promise.all([
+    const [latest, health, alerts, devices] = await Promise.all([
       fetchJson("/api/v1/latest"),
       fetchJson("/api/v1/health"),
       fetchJson("/api/v1/alerts", { limit: 20 }),
+      fetchJson("/api/v1/devices"),
     ]);
     applyLatest(latest);
     renderBanner(health);
     renderAlerts(alerts.alerts);
+    renderDevices(devices.devices);
     if (!historyLoaded) {
       historyLoaded = true;
       loadHistory();

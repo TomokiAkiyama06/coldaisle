@@ -671,3 +671,18 @@ def test_a_returning_probe_resolves_the_alert(engine, store):
     resolved = alerts(store, "PROBE_CHANGED")
     assert len(resolved) == 1
     assert resolved[0].state == "resolved"
+
+
+def test_probe_changed_names_the_channels_verbatim(engine, store):
+    """**`detail` にチャネル名がそのまま入る。**
+
+    ダッシュボードのセンサー構成は、この文面にチャネル名が含まれるかどうかで
+    行に印を付ける（#14）。言い回しを変えるのは構わないが、**チャネル名を
+    加工したら印が付かなくなる。**
+    """
+    recorded = {"rear_exhaust": "28FFFFFFFFFFFF05", "front_intake": "28FFFFFFFFFFFF01"}
+    observed = {"rear_exhaust": "28FFFFFFFFFFFF09", "front_intake": "28FFFFFFFFFFFF01"}
+    engine.on_hello(observed, recorded)
+    detail = alerts(store, "PROBE_CHANGED")[0].detail or ""
+    assert "rear_exhaust" in detail
+    assert "front_intake" not in detail, "変わっていないチャネルを名指ししない"

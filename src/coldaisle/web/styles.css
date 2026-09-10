@@ -126,3 +126,13 @@ main { padding: 0 20px 40px; }
 .sev-critical { border-left-color: var(--bad); }
 .state-resolved { opacity: 0.55; }
 .empty { color: var(--muted); font-size: 13px; }
+
+/* センサー構成（#14）。ROM は等幅で並べて、目で突き合わせられるようにする */
+.devices { display: flex; flex-direction: column; gap: 12px; }
+.device { border: 1px solid var(--line); border-radius: 8px; padding: 12px; }
+.sensors { border-collapse: collapse; width: 100%; margin-top: 8px; font-size: 13px; }
+.sensors th, .sensors td { text-align: left; padding: 4px 8px; border-bottom: 1px solid var(--line); }
+.sensors th { color: var(--muted); font-weight: 500; }
+.sensors td.rom { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+/* 記録と食い違っている行。**較正が間違ったプローブに対応している** */
+.sensors tr.changed td { background: #3a2a00; color: var(--warn); }
