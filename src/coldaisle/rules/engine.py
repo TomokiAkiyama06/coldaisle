@@ -68,6 +68,38 @@ class Transition:
     severity: str = "warning"
 
 
+_ABSENT = object()
+"""「そのチャネルが hello に出てこなかった」ことを表す番人。
+
+`None` は「ROM を持たないセンサー」（AM2320）に使われているので、
+**欠けていることと区別できる値が要る。**
+"""
+
+
+def probe_mismatch(
+    observed: Mapping[str, str | None], recorded: Mapping[str, str | None]
+) -> list[str]:
+    """記録と食い違うチャネル。**記録側を基準に数える。**
+
+    含めるもの:
+
+    - ROM が変わった（差し替え）
+    - **記録にあるのに hello に出てこない**（起動時に繋がっていなかった）
+
+    後者を見落とすと、ホストは「そのチャネルは無い」として記録を消す。
+    あとで別のプローブを挿したときに**比べる相手が無く、黙って受け入れる。**
+    較正のオフセットが間違ったプローブに対応したまま運用が続く
+    （FR-403 がまさに防ごうとしている状態）。
+
+    含めないもの: **hello にあって記録に無いチャネル**（新設）。
+    較正された値がまだ無いので、間違った対応にはならない。初回起動で
+    全チャネルが「不一致」になってしまうのも避ける。
+    """
+    return sorted(
+        channel for channel, rom in recorded.items() if observed.get(channel, _ABSENT) != rom
+    )
+
+
 @dataclass
 class Engine:
     """サンプルごと・時刻ごとに評価する。
@@ -194,11 +226,7 @@ class Engine:
         if not rule.enabled:
             return []
         self._advance(self.clock.now_ms() if at_ms is None else at_ms)
-        changed = sorted(
-            channel
-            for channel, rom in observed.items()
-            if channel in recorded and recorded[channel] != rom
-        )
+        changed = probe_mismatch(observed, recorded)
         state = self._state("PROBE_CHANGED", None)
         if changed:
             if state.since_ms is None:

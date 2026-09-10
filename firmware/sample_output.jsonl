@@ -1,0 +1,8 @@
+{"v":1,"type":"hello","fw":"1.0.0","dev":"xiao-esp32s3","interval_ms":2500,"sensors":{"front_intake":{"kind":"ds18b20","gpio":1,"rom":"28FFFFFFFFFFFF01","res":11},"gpu_intake":{"kind":"ds18b20","gpio":2,"rom":"28FFFFFFFFFFFF02","res":11},"gpu_exhaust":{"kind":"ds18b20","gpio":3,"rom":"28FFFFFFFFFFFF03","res":11},"top_exhaust":{"kind":"ds18b20","gpio":4,"rom":"28FFFFFFFFFFFF04","res":11},"rear_exhaust":{"kind":"ds18b20","gpio":7,"rom":"28FFFFFFFFFFFF05","res":11},"room":{"kind":"am2320"}}}
+{"v":1,"type":"s","seq":0,"up":2500,"room_temp":26.37,"room_humidity":48.10,"front_intake":27.81,"gpu_intake":28.19,"gpu_exhaust":28.75,"top_exhaust":27.00,"rear_exhaust":27.44}
+{"v":1,"type":"s","seq":1,"up":5000,"room_temp":26.40,"room_humidity":48.20,"front_intake":27.87,"gpu_intake":28.25,"gpu_exhaust":28.87,"top_exhaust":27.06,"rear_exhaust":null,"err":["rear_exhaust:-127"]}
+{"v":1,"type":"s","seq":2,"up":7500,"room_temp":26.40,"room_humidity":48.20,"front_intake":27.87,"gpu_intake":28.25,"gpu_exhaust":null,"top_exhaust":27.06,"rear_exhaust":27.44,"err":["gpu_exhaust:85"]}
+{"v":1,"type":"s","seq":3,"up":10000,"room_temp":null,"room_humidity":null,"front_intake":27.87,"gpu_intake":28.25,"gpu_exhaust":28.87,"top_exhaust":27.06,"rear_exhaust":27.44,"err":["room:read_failed"]}
+{"v":1,"type":"s","seq":4,"up":12500,"room_temp":null,"room_humidity":null,"front_intake":null,"gpu_intake":28.25,"gpu_exhaust":28.87,"top_exhaust":27.06,"rear_exhaust":27.44,"err":["front_intake:absent","room:backoff"]}
+{"v":1,"type":"log","msg":"no_sensors"}
+{"v":1,"type":"log","msg":"line_truncated"}

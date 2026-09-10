@@ -514,3 +514,37 @@ def test_hello_is_stamped_with_its_receive_time(tmp_path, rules):
     finally:
         store.close()
     assert row[0] == 7_000
+
+
+def test_a_partial_hello_does_not_erase_known_roms(tmp_path, rules):
+    """**起動時に繋がっていなかったプローブの ROM を忘れない**（#11 のレビュー指摘）。
+
+    忘れると、あとで別のプローブを挿したときに**比べる相手が無く、黙って
+    受け入れる。** 較正のオフセットが間違ったプローブに対応したまま運用が続く
+    （FR-403 がまさに防ごうとしている状態）。
+    """
+
+    def banner(*roms: str) -> RawHello:
+        channels = ("front_intake", "rear_exhaust")
+        return RawHello(
+            fw="1.0.0",
+            dev="dev",
+            interval_ms=2_500,
+            sensors={
+                channel: RawSensor(kind="ds18b20", gpio=index + 1, rom=rom, res=11)
+                for index, (channel, rom) in enumerate(zip(channels, roms, strict=False))
+            },
+        )
+
+    # 2本ぶん記録したあと、1本が繋がっていない状態で再起動した
+    daemon = daemon_with(
+        [banner("28FFFFFFFFFFFF01", "28FFFFFFFFFFFF05"), banner("28FFFFFFFFFFFF01")],
+        rules,
+        tmp_path,
+    )
+    try:
+        daemon.run()
+        recorded = {sensor.channel: sensor.rom for sensor in daemon.store.sensors_for("dev")}
+    finally:
+        daemon.store.close()
+    assert recorded.get("rear_exhaust") == "28FFFFFFFFFFFF05", "記録が消えている"

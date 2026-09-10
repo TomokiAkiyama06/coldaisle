@@ -36,7 +36,7 @@ from coldaisle.ingest import Calibration, MockSource, Normalizer, ReplaySource, 
 from coldaisle.ingest.protocol import RawHello, RawMessage, RawSample, Source
 from coldaisle.metrics import MetricCatalog
 from coldaisle.notify import Notification, NotifyConfig, Router, notifiers_from_env
-from coldaisle.rules import Engine, RuleSet, Transition
+from coldaisle.rules import Engine, RuleSet, Transition, probe_mismatch
 from coldaisle.store import (
     AlertSeverity,
     DeviceRecord,
@@ -392,11 +392,10 @@ class Daemon:
         self._device_id = hello.dev
         recorded = {sensor.channel: sensor.rom for sensor in self._store.sensors_for(hello.dev)}
         observed = {channel: sensor.rom for channel, sensor in hello.sensors.items()}
-        mismatched = sorted(
-            channel
-            for channel, rom in observed.items()
-            if channel in recorded and recorded[channel] != rom
-        )
+        # **記録側を基準に数える**（`probe_mismatch` を参照）。hello に出てこない
+        # チャネルも食い違いに含める。含めないと、次の行で記録ごと消してしまい、
+        # あとで別のプローブを挿したときに比べる相手が無くなる
+        mismatched = probe_mismatch(observed, recorded)
         sensors = [
             SensorRecord(
                 channel=channel,

@@ -174,7 +174,7 @@ src/coldaisle/
   notify/     # L2: 通知（Slack / LINE / stdout）。秘匿情報は .env
   ai/         # L3: LLM Provider抽象、ツール、プロンプト。準備は docs/llm-setup.md
   web/        # L4: 静的アセット
-firmware/     # ESP32-S3 Arduino スケッチ
+firmware/     # ESP32-S3 Arduino スケッチ。**コンパイルは人の手**（#11 / 決定記録 0022 §2.9）
 config/       # rules.yaml, calibration.json, coldaisle.toml
 memory/       # 運用メモリ（いまの閾値・較正値）。`coldaisle-memory` が更新案を出す
 docs/         # 要件定義、仕様レビュー、ADR
