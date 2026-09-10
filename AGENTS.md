@@ -21,6 +21,8 @@ export UV_ENV_FILE=.env              # .env を読ませる（自動では読ま
 uv run coldaisle-daemon --source mock # 実機なしでデーモン起動
 uv run coldaisle-daemon --source mock --scenario ramp --speed 60  # 時間圧縮（下記の注意）
 uv run coldaisle-daemon --source replay --csv ~/server_sensor_logs --bulk  # 既存CSVの再生
+uv run coldaisle-daemon --source serial            # 実機から取り込む（ポートは自動検出）
+uv run coldaisle-daemon --source serial --port /dev/cu.usbmodem1101  # ポートを明示する
 uv run coldaisle-rollup             # ロールアップと保持期間の適用（1日1回）
 uv run coldaisle-report             # 前日の日次レポート（ロールアップのあと）
 uv run coldaisle-report --date 2026-08-24 --no-send --print  # 任意の日を作り直す

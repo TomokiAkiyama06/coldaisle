@@ -106,9 +106,13 @@ def test_build_hands_one_clock_to_every_layer(tmp_path):
         daemon.store.close()
 
 
-def test_unimplemented_sources_say_which_issue(tmp_path):
-    with pytest.raises(SystemExit, match="#12"):
-        build(config(tmp_path, source="serial"))
+def test_serial_is_wired_up(tmp_path):
+    """`--source serial` が `SerialSource` になる（#12）。**ポートは開かない。**"""
+    daemon = build(config(tmp_path, source="serial"))
+    try:
+        assert type(daemon._source).__name__ == "SerialSource"
+    finally:
+        daemon.store.close()
 
 
 def test_replay_without_a_csv_says_so(tmp_path):

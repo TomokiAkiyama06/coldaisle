@@ -26,6 +26,8 @@ dev = [
     "ruff",
     "mypy",
     "types-pyyaml>=6.0.12.20260815",
+    # pyserial は型情報を同梱していない。SerialSource（#12）を mypy --strict で通すため
+    "types-pyserial",
 ]
 
 [project.scripts]

@@ -32,8 +32,16 @@ from coldaisle import logs
 from coldaisle.ai import AiSettings, Explainer, ToolRegistry, provider_from_env
 from coldaisle.channels import QUEUE_DROPS_METRIC
 from coldaisle.clock import Clock
-from coldaisle.ingest import Calibration, MockSource, Normalizer, ReplaySource, load_scenarios
+from coldaisle.ingest import (
+    Calibration,
+    MockSource,
+    Normalizer,
+    ReplaySource,
+    SerialSource,
+    load_scenarios,
+)
 from coldaisle.ingest.protocol import RawHello, RawMessage, RawSample, Source
+from coldaisle.ingest.serial_source import DEFAULT_BAUD
 from coldaisle.metrics import MetricCatalog
 from coldaisle.notify import Notification, NotifyConfig, Router, notifiers_from_env
 from coldaisle.rules import Engine, RuleSet, Transition, probe_mismatch
@@ -60,6 +68,7 @@ INGEST_SOURCE_KEY = "sys.ingest_source"
 """`system_state` のキー。API の `/health` がソース種別として返す（FR-305）。"""
 
 DEFAULT_DB = Path("var/coldaisle.db")
+SERIAL_BAUD = DEFAULT_BAUD
 DEFAULT_SCENARIOS = Path("config/scenarios.yaml")
 DEFAULT_QUALITY_RULES = Path("config/quality.yaml")
 DEFAULT_CALIBRATION = Path("config/calibration.json")
@@ -513,6 +522,9 @@ class Config:
     calibration: Path = DEFAULT_CALIBRATION
     csv: Path | None = None
     """`--source replay` の入力。ファイルかディレクトリ。"""
+    port: str | None = None
+    """`--source serial` のポート。`None` なら自動検出（#12）。"""
+    baud: int = SERIAL_BAUD
     bulk: bool = False
     """一括投入。待たずに流す（`--speed` は無視される）。"""
     timezone: str = "Asia/Tokyo"
@@ -611,8 +623,10 @@ def _build_source(config: Config) -> Source:
             )
         except ValueError as error:
             raise SystemExit(str(error)) from error
+    if config.source == "serial":
+        return SerialSource(port=config.port, baud=config.baud)
     if config.source != "mock":
-        raise SystemExit(f"--source {config.source} は未実装（serial は #12）")
+        raise SystemExit(f"--source {config.source} は未実装")
     scenarios = load_scenarios(config.scenarios)
     if config.scenario not in scenarios:
         raise SystemExit(
@@ -626,6 +640,8 @@ def build_parser() -> argparse.ArgumentParser:
         prog="coldaisle-daemon", description="センサー取り込みデーモン"
     )
     parser.add_argument("--source", choices=["mock", "replay", "serial"], default="mock")
+    parser.add_argument("--port", help="シリアルのポート。省略すると自動検出（#12）")
+    parser.add_argument("--baud", type=int, default=DEFAULT_BAUD)
     parser.add_argument("--scenario", default="idle", help="mock のシナリオ名")
     parser.add_argument("--speed", type=float, default=1.0, help="時間圧縮。60 なら1分を1秒で流す")
     parser.add_argument("--db", type=Path, default=DEFAULT_DB)
@@ -665,6 +681,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             csv=args.csv,
             bulk=args.bulk,
             timezone=args.timezone,
+            port=args.port,
+            baud=args.baud,
         )
     )
     if args.source == "replay":
