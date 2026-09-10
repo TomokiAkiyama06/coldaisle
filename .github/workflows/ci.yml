@@ -17,6 +17,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+        with:
+          # 衛生の検査が `main..HEAD` を見るため（#41 / 決定記録 0021 §2.6）。
+          # 既定の浅いクローンでは履歴が無く、検査が飛ばされる
+          fetch-depth: 0
 
       # Python 3.12 は .python-version から uv が解決する（単一の情報源にする）
       # setup-uv はメジャー移動タグ（v10）を打っていないため完全版で固定する
