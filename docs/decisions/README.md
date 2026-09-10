@@ -94,3 +94,4 @@ docs/decisions/NNNN-<slug>.md      例: 0002-metric-naming.md
 | [0022](0022-firmware-v1.md) | 本番ファームウェア v1 | Proposed |
 | [0023](0023-serial-source.md) | シリアル取り込み | Proposed |
 | [0024](0024-calibration.md) | 較正の手順と記録 | Proposed |
+| [0025](0025-probe-identity.md) | プローブの同定 | Proposed |

@@ -111,7 +111,13 @@ def test_script_reads_only_documented_endpoints():
     """叩く先が API 契約の範囲に収まっていること。"""
     script = SCRIPT.read_text(encoding="utf-8")
     used = set(re.findall(r'"(/api/v1/[a-z]+)"', script))
-    assert used == {"/api/v1/latest", "/api/v1/series", "/api/v1/health", "/api/v1/alerts"}
+    assert used == {
+        "/api/v1/latest",
+        "/api/v1/series",
+        "/api/v1/health",
+        "/api/v1/alerts",
+        "/api/v1/devices",
+    }
     assert "/api/v1/stream" in script, "WebSocket を使う（FR-306）"
 
 
@@ -181,3 +187,37 @@ def test_startup_installs_recovery_before_fetching():
     body = script[script.index("function start()") :]
     assert body.index("connect()") < body.index("refresh()")
     assert body.index("setInterval(refresh") < body.index("  refresh();")
+
+
+# ---------------------------------------------------------------- センサー構成（#14）
+
+
+def test_the_dashboard_shows_the_sensor_layout():
+    """**どの物理プローブがどのメトリクスか**を出す（#14 / spec-review W-03）。"""
+    html = (WEB_ROOT / "index.html").read_text(encoding="utf-8")
+    assert 'id="devices"' in html
+    assert "センサー構成" in html
+
+
+def test_the_dashboard_asks_for_the_devices():
+    script = (WEB_ROOT / "app.js").read_text(encoding="utf-8")
+    assert '"/api/v1/devices"' in script
+    assert "renderDevices(" in script
+
+
+def test_a_changed_probe_is_marked():
+    """`PROBE_CHANGED` が指しているチャネルの行に印を付ける。
+
+    **アラート欄に出るだけでは、どのプローブか分からない。**
+    """
+    script = (WEB_ROOT / "app.js").read_text(encoding="utf-8")
+    assert "probeChangeDetails(" in script
+    assert "isChangedProbe(details, sensor.channel)" in script
+    # **文を単語に割って解釈しない**（区切りや語順を変えられると黙って壊れる）
+    assert "detail.includes(channel)" in script
+    assert "tr.changed" in (WEB_ROOT / "styles.css").read_text(encoding="utf-8")
+
+
+def test_the_rom_is_monospaced():
+    """ROM は目で突き合わせるもの。**等幅で並べる。**"""
+    assert "td.rom" in (WEB_ROOT / "styles.css").read_text(encoding="utf-8")

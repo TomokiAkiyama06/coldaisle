@@ -112,6 +112,73 @@ function renderAlerts(alerts) {
 }
 
 /**
+ * センサー構成（#14 / FR-403）。**どの物理プローブがどのメトリクスか。**
+ *
+ * ケース内で差し替えると、較正のオフセットもラベルも静かに間違ったまま
+ * 運用が続く（spec-review W-03）。ROM を出して人が突き合わせられるようにする。
+ *
+ * `details` には発生中の `PROBE_CHANGED` の文面が入る。
+ * **記録の側は人が較正をやり直すまで動かない**ので、ここに出るのは
+ * 「較正が対応している構成」であって、いま繋がっている構成ではない。
+ */
+function renderDevices(devices, details) {
+  const container = document.getElementById("devices");
+  container.replaceChildren();
+  if (devices.length === 0) {
+    container.appendChild(el("p", "empty", "起動バナーをまだ受け取っていません。"));
+    return;
+  }
+  for (const device of devices) {
+    const card = el("div", "device");
+    const meta = [device.fw && `fw ${device.fw}`, device.interval_ms && `${device.interval_ms}ms`]
+      .filter(Boolean)
+      .join(" · ");
+    card.appendChild(el("div", "title", `${device.device_id}${meta ? ` — ${meta}` : ""}`));
+    if (device.last_hello_at) {
+      const at = new Date(device.last_hello_at).toLocaleString();
+      card.appendChild(el("div", "meta", `最終バナー ${at}`));
+    }
+    const table = document.createElement("table");
+    table.className = "sensors";
+    const head = document.createElement("tr");
+    for (const label of ["チャネル", "メトリクス", "種別", "GPIO", "ROM"]) {
+      head.appendChild(el("th", "", label));
+    }
+    table.appendChild(head);
+    for (const sensor of device.sensors) {
+      const row = document.createElement("tr");
+      if (isChangedProbe(details, sensor.channel)) row.className = "changed";
+      row.appendChild(el("td", "", sensor.channel));
+      row.appendChild(el("td", "", sensor.metric || "—"));
+      row.appendChild(el("td", "", sensor.kind));
+      row.appendChild(el("td", "", sensor.gpio === null ? "—" : String(sensor.gpio)));
+      row.appendChild(el("td", "rom", sensor.rom || "—"));
+      table.appendChild(row);
+    }
+    card.appendChild(table);
+    container.appendChild(card);
+  }
+}
+
+/**
+ * 発生中の `PROBE_CHANGED` が言っていること。**文面をそのまま持つ。**
+ *
+ * 文を単語に割って解釈しない。区切り文字や語順を変えられると黙って
+ * 印が付かなくなる。**チャネル名が含まれるか**だけを見る（名前は
+ * `rear_exhaust` のように十分に特徴的で、他の語と紛れない）。
+ */
+function probeChangeDetails(alerts) {
+  return alerts
+    .filter((alert) => alert.rule_id === "PROBE_CHANGED" && alert.state === "firing")
+    .map((alert) => alert.detail || "");
+}
+
+/** そのチャネルが `PROBE_CHANGED` に名指しされているか。 */
+function isChangedProbe(details, channel) {
+  return details.some((detail) => detail.includes(channel));
+}
+
+/**
  * 想定される点の間隔。**線を切る判断に使う。**
  * 取り込みが止まった区間には行そのものが無く、`null` の点すら来ない。
  */
@@ -262,14 +329,16 @@ function applyLatest(latest) {
  */
 async function refresh() {
   try {
-    const [latest, health, alerts] = await Promise.all([
+    const [latest, health, alerts, devices] = await Promise.all([
       fetchJson("/api/v1/latest"),
       fetchJson("/api/v1/health"),
       fetchJson("/api/v1/alerts", { limit: 20 }),
+      fetchJson("/api/v1/devices"),
     ]);
     applyLatest(latest);
     renderBanner(health);
     renderAlerts(alerts.alerts);
+    renderDevices(devices.devices, probeChangeDetails(alerts.alerts));
     if (!historyLoaded) {
       historyLoaded = true;
       loadHistory();
