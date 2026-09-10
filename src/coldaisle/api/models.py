@@ -149,7 +149,19 @@ class SensorOut(BaseModel):
     kind: str
     gpio: int | None = None
     rom: str | None = None
-    """DS18B20 の ROM ID。**較正のオフセットが対応している個体**（spec-review W-03）。"""
+    """記録された ROM。**較正のオフセットが対応している個体**（spec-review W-03）。"""
+    observed_rom: str | None = None
+    """**いま繋がっている ROM**（食い違っているときだけ入る）。
+
+    これが無いと、差し替えたあとに「何に変わったのか」を知る手段が無い。
+    """
+    changed: bool = False
+    """記録と食い違っているか。**ダッシュボードの印はこれで決める。**
+
+    アラートの文面から読み取らない。文面は最初の不一致のまま更新されない場合が
+    あり（`Engine.on_hello` は発火中なら何も返さない）、**あとから別のチャネルが
+    ずれても印が動かない。**
+    """
     resolution: int | None = None
 
 

@@ -17,6 +17,7 @@ L0 の部品ではない。中に置くと取り込み層がルールエンジ�
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import queue
 import signal
@@ -30,7 +31,7 @@ from zoneinfo import ZoneInfo
 
 from coldaisle import logs
 from coldaisle.ai import AiSettings, Explainer, ToolRegistry, provider_from_env
-from coldaisle.channels import QUEUE_DROPS_METRIC
+from coldaisle.channels import OBSERVED_PROBES_KEY, QUEUE_DROPS_METRIC
 from coldaisle.clock import Clock, WallClock
 from coldaisle.ingest import (
     Calibration,
@@ -430,6 +431,13 @@ class Daemon:
             sensors,
             at_ms=at_ms,
             replace_sensors=not mismatched,
+        )
+        # **差し替えたあとの現物を残す。** 記録の側は人が直すまで動かないので、
+        # ここに残さないと「何に差し替わったのか」を知る手段が無い（#14）
+        self._store.set_system_state(
+            OBSERVED_PROBES_KEY,
+            json.dumps(observed, ensure_ascii=False, sort_keys=True) if mismatched else "",
+            at_ms=at_ms,
         )
         self.stats.hellos += 1
         LOGGER.info(

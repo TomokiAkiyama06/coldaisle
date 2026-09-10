@@ -30,11 +30,12 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from coldaisle import logs
-from coldaisle.channels import METRIC_TO_CHANNEL
+from coldaisle.channels import METRIC_TO_CHANNEL, OBSERVED_PROBES_KEY
 from coldaisle.clock import Clock, WallClock
 from coldaisle.ingest.calibration import Calibration, CalibrationPolicy
 from coldaisle.metrics import MetricCatalog
 from coldaisle.store.db import SqliteStore
+from coldaisle.store.models import SensorRecord
 from coldaisle.store.quality import QualityRules
 
 LOGGER = logging.getLogger("coldaisle.calibrate")
@@ -191,6 +192,60 @@ def as_calibration(result: Result, previous: Calibration, *, at: datetime) -> Ca
     )
 
 
+def accept_probes(store: SqliteStore) -> dict[str, str | None]:
+    """差し替えたプローブを**記録として受け入れる**（#14 / FR-403）。
+
+    受け入れた構成を返す（何も無ければ空）。
+
+    **較正と一緒にしか行わない。** 記録された ROM が意味するのは
+    「いまのオフセットが対応している個体」である（決定記録 0012 §2.6）。
+    較正し直さずに ROM だけ受け入れると、**古いオフセットが新しいプローブに
+    対応していることになり、`PROBE_CHANGED` が黙るだけで実害は残る。**
+
+    受け入れないと `PROBE_CHANGED` は永久に解けない。記録の側は人が直すまで
+    動かない設計なので、**「人が直す」経路がここに要る。**
+    """
+    raw = store.current_state(OBSERVED_PROBES_KEY)
+    if not raw:
+        return {}
+    observed = json.loads(raw)
+    if not isinstance(observed, dict) or not observed:
+        return {}
+    device_id = _latest_device_id(store)
+    if device_id is None:
+        return {}
+    device = store.device(device_id)
+    if device is None:
+        return {}
+    previous = {sensor.channel: sensor for sensor in store.sensors_for(device_id)}
+    store.record_hello(
+        device,
+        [
+            SensorRecord(
+                channel=channel,
+                # 種別・GPIO・分解能は前回の記録を引き継ぐ。**変わったのは ROM だけ**
+                kind=previous[channel].kind if channel in previous else "ds18b20",
+                gpio=previous[channel].gpio if channel in previous else None,
+                rom=rom,
+                resolution=previous[channel].resolution if channel in previous else None,
+            )
+            for channel, rom in sorted(observed.items())
+        ],
+        at_ms=store.clock.now_ms(),
+        replace_sensors=True,
+    )
+    # 受け入れたので、食い違いの記録は消す
+    store.set_system_state(OBSERVED_PROBES_KEY, "", at_ms=store.clock.now_ms())
+    return observed
+
+
+def _latest_device_id(store: SqliteStore) -> str | None:
+    row = store.connection.execute(
+        "SELECT device_id FROM devices ORDER BY last_hello_ms DESC LIMIT 1"
+    ).fetchone()
+    return None if row is None else str(row[0])
+
+
 def write(calibration: Calibration, path: Path) -> None:
     """**人が読める形で書く。** git の差分で何が変わったか分かるように。"""
     payload = calibration.model_dump()
@@ -254,6 +309,17 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     at = datetime.fromtimestamp(clock.now_ms() / 1000, tz=UTC).astimezone(ZoneInfo(args.timezone))
     write(as_calibration(result, previous, at=at), args.calibration)
+
+    # **差し替えたプローブを、較正と一緒に受け入れる。**
+    # 較正し直さずに ROM だけ受け入れると、古いオフセットが新しいプローブに
+    # 対応していることになる（`PROBE_CHANGED` が黙るだけで実害は残る）
+    store = SqliteStore(args.db, rules=QualityRules.from_yaml(args.quality_rules), clock=clock)
+    try:
+        accepted = accept_probes(store)
+    finally:
+        store.close()
+    if accepted:
+        print(f"\n差し替えられたプローブを記録として受け入れました: {', '.join(sorted(accepted))}")  # noqa: T201
     LOGGER.info(
         "較正値を書き込んだ",
         extra={
@@ -261,6 +327,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "path": str(args.calibration),
                 "spread_c": round(result.spread_c, 3),
                 "forced": bool(problems),
+                "accepted_probes": sorted(accepted),
             }
         },
     )

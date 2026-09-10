@@ -9,6 +9,7 @@ Workspace から状態を変更できないことが、2つのリポジトリを
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import re
 import sqlite3
@@ -39,7 +40,12 @@ from coldaisle.api.models import (
     ToolListResponse,
     iso,
 )
-from coldaisle.channels import CHANNEL_TO_METRIC, EVENT_METRICS, QUEUE_DROPS_METRIC
+from coldaisle.channels import (
+    CHANNEL_TO_METRIC,
+    EVENT_METRICS,
+    OBSERVED_PROBES_KEY,
+    QUEUE_DROPS_METRIC,
+)
 from coldaisle.clock import Clock, WallClock
 from coldaisle.metrics import MetricCatalog, compute_derived
 from coldaisle.store import Aggregation, Quality, QualityRules, SqliteStore
@@ -333,6 +339,7 @@ def create_app(
         運用が続く（spec-review W-03）。
         """
         store = provider.get()
+        observed = _observed_probes(store)
         devices: list[DeviceOut] = []
         for device_id, last_hello_ms in _all_devices(store):
             record = store.device(device_id)
@@ -351,6 +358,10 @@ def create_app(
                             kind=sensor.kind,
                             gpio=sensor.gpio,
                             rom=sensor.rom,
+                            observed_rom=observed.get(sensor.channel),
+                            # **いま食い違っているか**を、その場のデータから出す
+                            changed=sensor.channel in observed
+                            and observed[sensor.channel] != sensor.rom,
                             resolution=sensor.resolution,
                         )
                         for sensor in store.sensors_for(device_id)
@@ -417,6 +428,17 @@ def create_app(
             None,
         )
         return DEFAULT_SAMPLE_INTERVAL_MS if device is None else int(device.interval_ms or 0)
+
+    def _observed_probes(store: SqliteStore) -> dict[str, str | None]:
+        """いま繋がっている ROM（`sys.observed_probes`）。**食い違うときだけ入る。**"""
+        raw = store.current_state(OBSERVED_PROBES_KEY)
+        if not raw:
+            return {}
+        try:
+            loaded = json.loads(raw)
+        except ValueError:  # pragma: no cover - 書くのはデーモンだけ
+            return {}
+        return loaded if isinstance(loaded, dict) else {}
 
     def _all_devices(store: SqliteStore) -> list[tuple[str, int | None]]:
         """記録されている全デバイスと最終バナー時刻。**新しい順。**

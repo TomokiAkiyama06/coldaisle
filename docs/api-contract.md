@@ -124,15 +124,25 @@ API が返すオフセットは `+00:00` です。同じ瞬間を指すので解
       "interval_ms": 2500,
       "last_hello_at": "2026-09-10T02:00:00+00:00",
       "sensors": [
-        {"channel": "front_intake", "metric": "air.front_intake",
-         "kind": "ds18b20", "gpio": 1, "rom": "28FFFFFFFFFFFF01", "resolution": 11},
-        {"channel": "room_temp", "metric": "air.room", "kind": "am2320",
-         "gpio": null, "rom": null, "resolution": null}
+        {"channel": "front_intake", "metric": "air.front_intake", "kind": "ds18b20",
+         "gpio": 1, "rom": "28FFFFFFFFFFFF01", "observed_rom": null,
+         "changed": false, "resolution": 11},
+        {"channel": "rear_exhaust", "metric": "air.rear_exhaust", "kind": "ds18b20",
+         "gpio": 7, "rom": "28FFFFFFFFFFFF05", "observed_rom": "28FFFFFFFFFFFF09",
+         "changed": true, "resolution": 11}
       ]
     }
   ]
 }
 ```
+
+`rom` は**記録された**個体、`observed_rom` は**いま繋がっている**個体です。
+`changed` が `true` の行は、較正のオフセットが**別のプローブに対応している**
+状態です（FR-403）。
+
+**`changed` を使ってください。** アラートの文面から読み取らないこと。文面は
+最初の不一致のまま更新されないことがあり、一覧の上限で古いアラートが落ちることも
+あります。
 
 **これは「記録された構成」であって、いま繋がっている構成ではありません。**
 この2つが食い違っている状態が `PROBE_CHANGED` であり、

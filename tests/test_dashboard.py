@@ -206,16 +206,31 @@ def test_the_dashboard_asks_for_the_devices():
 
 
 def test_a_changed_probe_is_marked():
-    """`PROBE_CHANGED` が指しているチャネルの行に印を付ける。
+    """`PROBE_CHANGED` の対象になっている行に印を付ける。
 
     **アラート欄に出るだけでは、どのプローブか分からない。**
     """
     script = (WEB_ROOT / "app.js").read_text(encoding="utf-8")
-    assert "probeChangeDetails(" in script
-    assert "isChangedProbe(details, sensor.channel)" in script
-    # **文を単語に割って解釈しない**（区切りや語順を変えられると黙って壊れる）
-    assert "detail.includes(channel)" in script
+    assert "if (sensor.changed) row.className" in script
     assert "tr.changed" in (WEB_ROOT / "styles.css").read_text(encoding="utf-8")
+
+
+def test_the_marker_does_not_read_the_alert_text():
+    """**アラートの文面から読み取らない**（#14 のレビュー指摘）。
+
+    文面は最初の不一致のまま更新されないことがあり（`Engine.on_hello` は
+    発火中なら何も返さない）、あとから別のチャネルがずれても印が動かない。
+    一覧の上限で古いアラートが落ちる問題も避けられる。
+    """
+    script = (WEB_ROOT / "app.js").read_text(encoding="utf-8")
+    assert "probeChangeDetails" not in script
+    assert "alert.detail" not in script.split("function renderDevices")[1]
+
+
+def test_the_current_rom_is_shown():
+    """**差し替えたあとに「何に変わったのか」が分かること。**"""
+    assert "sensor.observed_rom" in (WEB_ROOT / "app.js").read_text(encoding="utf-8")
+    assert "いまの ROM" in (WEB_ROOT / "app.js").read_text(encoding="utf-8")
 
 
 def test_the_rom_is_monospaced():
