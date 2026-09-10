@@ -28,3 +28,14 @@ ESP32-S3は手元にあるため、**GPUサーバーが無くても着手でき�
 
 ## 依存
 #4
+
+## 2026-09-10 の実装（決定記録 0022）
+
+- `firmware/coldaisle_sensor/coldaisle_sensor.ino` を追加（試作 `sketch_aug21a` を土台に）
+- C-01（11bit + 非ブロッキング同時変換）/ C-02（ちょうど 85.00）/ C-04（AM2320 の間引き）に対応
+- `seq` / `up` / `hello`（ROM ID）/ WDT / `Wire.setClock(100000)` を追加
+- `tests/test_firmware_contract.py` が形の食い違いを CI で見張る
+
+**コンパイルと実測は未了。** このマシンに Arduino のツールチェーンが無い。
+受入基準のうち「周期 ±10%」「抜線で null + err」「hello が1回」「リセットで seq が 0」は
+`firmware/README.md` のチェックリストとして人に残した（決定記録 0022 §5-1）。
