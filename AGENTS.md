@@ -25,6 +25,8 @@ uv run coldaisle-rollup             # ロールアップと保持期間の適用
 uv run coldaisle-report             # 前日の日次レポート（ロールアップのあと）
 uv run coldaisle-report --date 2026-08-24 --no-send --print  # 任意の日を作り直す
 uv run coldaisle-escalate           # 故障疑いの案件資料（**送信はしない**）
+uv run coldaisle-memory             # 運用メモリの更新案（**既定では書かない**）
+uv run coldaisle-memory --apply --commit  # 確認してから書く
 COLDAISLE_DB=var/coldaisle.db uv run uvicorn coldaisle.api:app --host 127.0.0.1 --port 8000
 COLDAISLE_DB=var/coldaisle.db uv run uvicorn coldaisle.server:app --port 8000  # + AI ツールの窓口
 ```
@@ -158,6 +160,7 @@ src/coldaisle/
   report.py   # 合成の起点: 日次レポート（Store→AI→通知）。#25
   server.py   # 合成の起点: 読み取りAPI + AIツールの窓口。#23
   escalate.py # 合成の起点: 故障疑いの案件資料（AI非依存・送信しない）。#39
+  memory.py   # 合成の起点: 運用メモリの記録（確認を経由する）。#40
   store/      # L1: SQLite、ロールアップ、CSVエクスポート
   api/        # L2: FastAPI、WebSocket
   rules/      # L2: ルールエンジン（決定論的。AI非依存）
@@ -166,6 +169,7 @@ src/coldaisle/
   web/        # L4: 静的アセット
 firmware/     # ESP32-S3 Arduino スケッチ
 config/       # rules.yaml, calibration.json, coldaisle.toml
+memory/       # 運用メモリ（いまの閾値・較正値）。`coldaisle-memory` が更新案を出す
 docs/         # 要件定義、仕様レビュー、ADR
 tests/
 ```

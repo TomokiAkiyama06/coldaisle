@@ -89,3 +89,4 @@ docs/decisions/NNNN-<slug>.md      例: 0002-metric-naming.md
 | [0017](0017-daily-report.md) | 日次レポートの規約 | Proposed |
 | [0018](0018-tool-exposure.md) | AI 向けツールの公開方法 | Proposed |
 | [0019](0019-claude-escalation.md) | Claude へのエスカレーション | Proposed |
+| [0020](0020-decision-memory.md) | 運用メモリへの記録 | Proposed |

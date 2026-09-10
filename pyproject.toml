@@ -37,6 +37,8 @@ coldaisle-rollup = "coldaisle.store.rollup:main"
 coldaisle-report = "coldaisle.report:main"
 # 故障疑いの案件資料。**送信はしない**（#39）
 coldaisle-escalate = "coldaisle.escalate:main"
+# 運用メモリの更新案。**既定では書かない**（#40）
+coldaisle-memory = "coldaisle.memory:main"
 
 [build-system]
 requires = ["hatchling"]
