@@ -4,7 +4,7 @@
 閾値と継続時間は `config/rules.yaml`（AGENTS.md ルール6）。
 """
 
-from coldaisle.rules.engine import Engine, Transition
+from coldaisle.rules.engine import Engine, Transition, probe_mismatch
 from coldaisle.rules.models import RuleSet
 
-__all__ = ["Engine", "RuleSet", "Transition"]
+__all__ = ["Engine", "RuleSet", "Transition", "probe_mismatch"]

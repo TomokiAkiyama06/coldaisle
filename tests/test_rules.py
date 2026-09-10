@@ -11,7 +11,7 @@ import pytest
 
 from coldaisle.clock import SimulatedClock
 from coldaisle.metrics import MetricCatalog
-from coldaisle.rules import Engine, RuleSet
+from coldaisle.rules import Engine, RuleSet, probe_mismatch
 from coldaisle.rules.models import RangeRule, ThresholdRule
 from coldaisle.store import Quality, Reading, Sample, SqliteStore
 from conftest import CONFIG_DIR, QUALITY_RULES_PATH
@@ -610,3 +610,64 @@ def test_resolution_keeps_its_severity(engine, store):
         if t.state == "resolved"
     ]
     assert resolved == [] or resolved[0].severity == "critical"
+
+
+# ---------------------------------------------------------------- 消えたプローブ（#11）
+
+
+def test_a_probe_missing_from_hello_counts_as_a_mismatch():
+    """**記録にあるのに hello に出てこないチャネル**も食い違いとして数える。
+
+    見落とすと、ホストは「そのチャネルは無い」として記録を消す。あとで別の
+    プローブを挿したときに**比べる相手が無く、黙って受け入れる。** 較正の
+    オフセットが間違ったプローブに対応したまま運用が続く（FR-403）。
+    """
+    assert probe_mismatch({}, {"rear_exhaust": "28FFFFFFFFFFFF05"}) == ["rear_exhaust"]
+
+
+def test_a_new_channel_is_not_a_mismatch():
+    """**hello にあって記録に無いチャネルは数えない。**
+
+    較正された値がまだ無いので、間違った対応にはならない。数えると初回起動で
+    全チャネルが不一致になる。
+    """
+    assert probe_mismatch({"rear_exhaust": "28FFFFFFFFFFFF05"}, {}) == []
+
+
+def test_a_changed_rom_is_a_mismatch():
+    recorded = {"rear_exhaust": "28FFFFFFFFFFFF05", "front_intake": "28FFFFFFFFFFFF01"}
+    observed = {"rear_exhaust": "28FFFFFFFFFFFF09", "front_intake": "28FFFFFFFFFFFF01"}
+    assert probe_mismatch(observed, recorded) == ["rear_exhaust"]
+
+
+def test_a_sensor_without_a_rom_is_not_a_mismatch():
+    """AM2320 は ROM を持たない（`None`）。**欠けていることと混同しない。**"""
+    assert probe_mismatch({"room": None}, {"room": None}) == []
+    assert probe_mismatch({}, {"room": None}) == ["room"]
+
+
+def test_a_missing_probe_fires_probe_changed(engine, store):
+    """消えたプローブでも `PROBE_CHANGED` が出て、**発生中として残る**。"""
+    engine.on_hello({}, {"rear_exhaust": "28FFFFFFFFFFFF05"})
+    fired = alerts(store, "PROBE_CHANGED")
+    assert len(fired) == 1
+    assert fired[0].state == "firing"
+    assert "rear_exhaust" in (fired[0].detail or "")
+
+
+def test_a_missing_probe_does_not_duplicate_the_alert(engine, store):
+    """**人が直すまで続く状態**（決定記録 0012 §2.6）。行を作り直さない。"""
+    recorded = {"rear_exhaust": "28FFFFFFFFFFFF05"}
+    engine.on_hello({}, recorded)
+    engine.on_hello({}, recorded)
+    assert len(alerts(store, "PROBE_CHANGED")) == 1
+
+
+def test_a_returning_probe_resolves_the_alert(engine, store):
+    """同じ ROM で戻ってきたら解除する。"""
+    recorded = {"rear_exhaust": "28FFFFFFFFFFFF05"}
+    engine.on_hello({}, recorded)
+    engine.on_hello(recorded, recorded)
+    resolved = alerts(store, "PROBE_CHANGED")
+    assert len(resolved) == 1
+    assert resolved[0].state == "resolved"

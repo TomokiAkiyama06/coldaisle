@@ -156,6 +156,24 @@ def test_d6_is_not_used(sketch):
     assert not re.search(r"#define \w+\s+D6\b", sketch)
 
 
+def test_the_firmware_readme_repeats_the_reviewed_table():
+    """配線表が spec-review と `firmware/README.md` の2か所にある。**ずれさせない。**
+
+    ピン番号はスケッチに直接書いてある（ファームウェアは `config/*.yaml` を
+    読めない）。その代わり、**表と実装の一致を機械が見張る**ことで
+    AGENTS.md ルール6 の意図（唯一の情報源を持つ）を満たす。
+    """
+    readme = (ROOT / "firmware" / "README.md").read_text(encoding="utf-8")
+    in_readme = {
+        row.group(1): int(row.group(2))
+        for row in re.finditer(r"^\|[^|]*\|\s*(D\d+)\s*\|\s*(\d+)\s*\|", readme, re.MULTILINE)
+    }
+    reviewed = spec_review_pins()
+    assert in_readme, "README に配線表が無い"
+    for pin, gpio in in_readme.items():
+        assert reviewed.get(pin) == gpio, f"{pin} が spec-review と食い違う"
+
+
 def test_the_hello_gpio_numbers_match_the_reviewed_table(lines):
     """`hello` の `gpio` が W-01 の表と一致する。"""
     table = spec_review_pins()
@@ -246,6 +264,23 @@ def test_a_truncated_line_is_not_sent(sketch):
 def test_no_sensors_does_not_emit_an_invalid_hello(sketch):
     """スキーマは `sensors` に1つ以上を要求する。**空の hello を出さない。**"""
     assert "no_sensors" in sketch
+
+
+def test_hello_is_replayed_when_the_host_connects(sketch):
+    """**待つだけでは足りない**（#11 のレビュー指摘）。
+
+    デバイスのほうが先に起動していると、誰も読んでいない間に hello が流れて消える。
+    ホストはサンプルだけを受け取り、ROM の一覧も `interval_ms` も知らないまま動く。
+    """
+    assert "host_connected" in sketch
+    assert re.search(
+        r"if \(connected && !host_connected\) \{" + "\n" + r"\s*send_hello\(\);", sketch
+    )
+
+
+def test_hello_is_not_sent_periodically(sketch):
+    """**立ち上がりだけで出す。** 周期的に出すと「電源投入時に1回だけ」が崩れる。"""
+    assert sketch.count("send_hello();") == 2  # setup と、接続の立ち上がり
 
 
 def test_newlines_are_written_without_carriage_return(sketch):

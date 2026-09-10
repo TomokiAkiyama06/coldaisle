@@ -143,6 +143,9 @@ uint8_t am2320_backoff_left = 0;
 uint32_t seq = 0;
 uint64_t next_due_ms = 0;
 
+// USB CDC が繋がっているか。**繋がった瞬間にもう一度 hello を出す**ためだけに持つ
+bool host_connected = false;
+
 // 1行ぶんの組み立て先。**途中まで書いた行を出さない**ために一度に書き出す
 static char line[768];
 static size_t used = 0;
@@ -290,7 +293,7 @@ static float read_ds(uint8_t index, const char **reason) {
 
 void setup() {
   Serial.begin(115200);
-  // USB CDC が開くまで待つ。**ここを待たないと hello が落ちる**
+  // USB CDC の列挙を待つ。**待つだけでは足りない**（下記 send_hello の呼び出しを参照）
   delay(2000);
 
   // **100kHz にする。** AM2320 は高速モードで不安定（spec-review）
@@ -336,8 +339,14 @@ void setup() {
   }
   esp_task_wdt_add(NULL);
 
-  // **電源投入時に1回だけ**（決定記録 0003 §2.2）
+  // **電源投入時に1回**（決定記録 0003 §2.2）。
+  //
+  // ただし、これだけでは足りない。デバイスのほうが先に起動していると、
+  // **誰も読んでいない間に hello が流れて消える。** ホストはサンプルだけを
+  // 受け取り、ROM の一覧も `interval_ms` も知らないまま動き続ける（FR-403 が
+  // 比べる相手を持てない）。`loop()` で接続を見て、繋がった瞬間に出し直す
   send_hello();
+  host_connected = (bool)Serial;
 
   next_due_ms = (uint64_t)(esp_timer_get_time() / 1000) + INTERVAL_MS;
 }
@@ -348,6 +357,17 @@ void setup() {
 
 void loop() {
   esp_task_wdt_reset();
+
+  // **繋がった瞬間に hello を出し直す。**
+  //
+  // 周期的に出すのではなく、立ち上がりだけで出す。周期的に出すと
+  // 「電源投入時に1回だけ」（#11 の受入基準）が崩れ、ホストの記録が
+  // 何度も書き換わる。読み手が付いたときにだけ、その読み手のために出す
+  bool connected = (bool)Serial;
+  if (connected && !host_connected) {
+    send_hello();
+  }
+  host_connected = connected;
 
   // `millis()` ではなく 64bit のタイマを使う。`millis()` は約49.7日で巻き戻り、
   // ホストはそれを**再起動として扱う**（FR-106）。稼働し続けているのに
