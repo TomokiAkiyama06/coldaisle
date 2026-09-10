@@ -31,9 +31,10 @@ from zoneinfo import ZoneInfo
 from coldaisle import logs
 from coldaisle.ai import AiSettings, Explainer, ToolRegistry, provider_from_env
 from coldaisle.channels import QUEUE_DROPS_METRIC
-from coldaisle.clock import Clock
+from coldaisle.clock import Clock, WallClock
 from coldaisle.ingest import (
     Calibration,
+    CalibrationPolicy,
     MockSource,
     Normalizer,
     ReplaySource,
@@ -72,6 +73,7 @@ SERIAL_BAUD = DEFAULT_BAUD
 DEFAULT_SCENARIOS = Path("config/scenarios.yaml")
 DEFAULT_QUALITY_RULES = Path("config/quality.yaml")
 DEFAULT_CALIBRATION = Path("config/calibration.json")
+DEFAULT_CALIBRATION_POLICY = Path("config/calibration.yaml")
 DEFAULT_RULES = Path("config/rules.yaml")
 DEFAULT_NOTIFY = Path("config/notify.yaml")
 DEFAULT_AI = Path("config/ai.yaml")
@@ -520,6 +522,8 @@ class Config:
     scenarios: Path = DEFAULT_SCENARIOS
     quality_rules: Path = DEFAULT_QUALITY_RULES
     calibration: Path = DEFAULT_CALIBRATION
+    calibration_policy: Path = DEFAULT_CALIBRATION_POLICY
+    """較正の方針（#13 / 決定記録 0024 §2.7）。記録とは別のファイル。"""
     csv: Path | None = None
     """`--source replay` の入力。ファイルかディレクトリ。"""
     port: str | None = None
@@ -607,7 +611,24 @@ def _calibration_for(config: Config) -> Calibration:
     """
     if config.source == "replay":
         return Calibration(note="再生では較正を当てない（決定記録 0010 §2.9）")
-    return Calibration.from_json(config.calibration)
+    calibration = Calibration.from_json(config.calibration)
+    policy = CalibrationPolicy.from_yaml(config.calibration_policy)
+    now_ms = WallClock().now_ms()
+    if calibration.is_expired(now_ms, after_days=policy.revalidate_after_days):
+        age = calibration.age_days(now_ms)
+        # **黙って古い較正を使い続けない**（#13）。ずれたオフセットは、
+        # 測っていないより悪い（補正済みのつもりで誤った値を見ることになる）
+        LOGGER.warning(
+            "較正をやり直す時期（または未較正）",
+            extra={
+                logs.FIELDS_KEY: {
+                    "calibrated_at": calibration.calibrated_at,
+                    "age_days": None if age is None else round(age, 1),
+                    "revalidate_after_days": policy.revalidate_after_days,
+                }
+            },
+        )
+    return calibration
 
 
 def _build_source(config: Config) -> Source:
@@ -648,6 +669,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--scenarios", type=Path, default=DEFAULT_SCENARIOS)
     parser.add_argument("--quality-rules", type=Path, default=DEFAULT_QUALITY_RULES)
     parser.add_argument("--calibration", type=Path, default=DEFAULT_CALIBRATION)
+    parser.add_argument("--calibration-policy", type=Path, default=DEFAULT_CALIBRATION_POLICY)
     parser.add_argument("--rules", type=Path, default=DEFAULT_RULES)
     parser.add_argument("--notify", type=Path, default=DEFAULT_NOTIFY)
     parser.add_argument("--ai", type=Path, default=DEFAULT_AI)
@@ -674,6 +696,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             scenarios=args.scenarios,
             quality_rules=args.quality_rules,
             calibration=args.calibration,
+            calibration_policy=args.calibration_policy,
             rules=args.rules,
             notify=args.notify,
             ai=args.ai,

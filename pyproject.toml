@@ -41,6 +41,8 @@ coldaisle-report = "coldaisle.report:main"
 coldaisle-escalate = "coldaisle.escalate:main"
 # 運用メモリの更新案。**既定では書かない**（#40）
 coldaisle-memory = "coldaisle.memory:main"
+# 較正オフセットの算出。**既定では書かない**（#13）
+coldaisle-calibrate = "coldaisle.calibrate:main"
 
 [build-system]
 requires = ["hatchling"]
