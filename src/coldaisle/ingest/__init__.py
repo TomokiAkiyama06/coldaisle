@@ -22,8 +22,10 @@ from coldaisle.ingest.protocol import (
     RawSample,
     RawSensor,
     Source,
+    decode_line,
 )
 from coldaisle.ingest.replay import ReplaySource
+from coldaisle.ingest.serial_source import SerialSource
 
 __all__ = [
     "SAMPLE_CHANNELS",
@@ -36,6 +38,8 @@ __all__ = [
     "RawSensor",
     "ReplaySource",
     "Scenario",
+    "SerialSource",
     "Source",
+    "decode_line",
     "load_scenarios",
 ]

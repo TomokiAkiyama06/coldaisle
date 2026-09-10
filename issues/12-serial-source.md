@@ -19,3 +19,12 @@ milestone: "M2 実機接続"
 
 ## 依存
 #8, #11
+
+## 2026-09-10 の実装（決定記録 0023）
+
+- `src/coldaisle/ingest/serial_source.py` を追加。`--source serial` を繋いだ
+- 行の解釈は `ingest.protocol.decode_line()` へ。**非有限値は行ごと捨てる**（決定記録 0003 §2.8）
+- 偽のポートで再接続とバックオフを検証（CI で回る）。**実機の抜き差しは `-m hardware`**
+
+**実機での抜き差し確認は未了。** 手元に ESP32 はあるので、書き込み後に
+`uv run pytest -m hardware` で確認できる。
