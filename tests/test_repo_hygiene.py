@@ -94,12 +94,18 @@ ALLOWED_IPV4 = re.compile(
 MAC = re.compile(r"\b(?:[0-9A-Fa-f]{2}[:-]){5}[0-9A-Fa-f]{2}\b")
 
 EXEC_PATH = re.compile(
-    r"/Users/[A-Za-z0-9._-]+|/home/(?!runner\b)[A-Za-z0-9._-]+|/root/|/workspace/"
+    r"/Users/[A-Za-z0-9._-]+"
+    r"|/home/(?!runner\b)[A-Za-z0-9._-]+"
+    # **続きのある実パスだけを弾く。** 裸の `/root/` は何も明かさない
+    r"|/(?:root|workspace)/[A-Za-z0-9._-]+"
 )
 """**実行環境の絶対パスを残さない。**
 
 `/Users/<名前>` と `/home/<名前>` は利用者名がそのまま入る。`/root/` は root で
 動かしていること、`/workspace/` は CI やサンドボックスの作業場所を表す。
+
+続きのある実パスだけを弾く。文書の中で `/root` のように置き場所の名前を挙げる
+のは止めない（何も明かさないため）。
 
 `/var/lib/` `/etc/` `/opt/` `/srv/` は**入れていない。** これらは FHS の標準的な
 置き場所で、誰の環境かを示さない（#26 が `/var/lib/coldaisle` を配置先として
