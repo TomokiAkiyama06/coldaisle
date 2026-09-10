@@ -12,7 +12,7 @@ API 層・UI 層・AI 層からデバイスを直接触らない。
 デーモンは `from coldaisle.daemon import Daemon` で取る。
 """
 
-from coldaisle.ingest.calibration import Calibration
+from coldaisle.ingest.calibration import Calibration, CalibrationPolicy
 from coldaisle.ingest.mock import MockSource, Scenario, load_scenarios
 from coldaisle.ingest.normalize import Normalizer
 from coldaisle.ingest.protocol import (
@@ -30,6 +30,7 @@ from coldaisle.ingest.serial_source import SerialSource
 __all__ = [
     "SAMPLE_CHANNELS",
     "Calibration",
+    "CalibrationPolicy",
     "MockSource",
     "Normalizer",
     "RawHello",

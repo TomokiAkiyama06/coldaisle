@@ -14,6 +14,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Annotated, Any
 
+import yaml
 from pydantic import BaseModel, ConfigDict, Field
 
 
@@ -38,13 +39,6 @@ class Calibration(BaseModel):
 
     reference: str = ""
     """基準の取り方。`mean_of_all`（spec-review W-02）。**何と比べたかを残す。**"""
-
-    revalidate_after_days: int = Field(default=183, gt=0)
-    """この日数を過ぎたら較正をやり直す（#13。既定は約6ヶ月）。
-
-    値の置き場所をこのファイルにしたのは、**「いつまで有効か」が較正の記録の
-    一部**だからである。運用の調整つまみではない。
-    """
 
     samples: dict[str, int] = Field(default_factory=dict)
     """チャネルごとの、較正に使った測定の件数。**根拠を残す。**"""
@@ -85,11 +79,33 @@ class Calibration(BaseModel):
             return None
         return (now_ms / 1000 - at.timestamp()) / 86_400
 
-    def is_expired(self, now_ms: int) -> bool:
+    def is_expired(self, now_ms: int, *, after_days: float) -> bool:
         """やり直しが要るか。**未較正も「要る」に含める。**
 
         センサーは経年でずれる。ずれたオフセットは、**測っていないより悪い**
         （補正済みのつもりで誤った値を見ることになる）。
+
+        期限は**方針**（`config/calibration.yaml`）が持つ。記録の側に置くと、
+        道具が書き直すたびに人の設定を上書きすることになる。
         """
         age = self.age_days(now_ms)
-        return age is None or age > self.revalidate_after_days
+        return age is None or age > after_days
+
+
+class CalibrationPolicy(BaseModel):
+    """`config/calibration.yaml`。**人が決める側**（記録は `calibration.json`）。"""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    window_minutes: float = Field(gt=0)
+    min_samples: int = Field(gt=0)
+    max_spread_c: float = Field(gt=0)
+    """**同じ空気に置けているか**の判定（決定記録 0024 §2.3）。"""
+    revalidate_after_days: float = Field(gt=0)
+
+    @classmethod
+    def from_yaml(cls, path: Path) -> CalibrationPolicy:
+        loaded: Any = yaml.safe_load(path.read_text(encoding="utf-8"))
+        if not isinstance(loaded, dict):
+            raise ValueError(f"較正の方針が辞書ではない: {path}")
+        return cls.model_validate(loaded)

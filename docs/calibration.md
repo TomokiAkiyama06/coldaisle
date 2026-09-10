@@ -46,8 +46,8 @@ uv run coldaisle-calibrate --minutes 10
 基準 24.001 C（mean_of_all）
 ばらつき 0.501 C（上限 2.00）
 
-  front_intake   平均   23.810 C  オフセット +0.191 C  (239 件)
-  gpu_exhaust    平均   24.311 C  オフセット -0.310 C  (239 件)
+  front_intake   平均   23.810 C  オフセット +0.000 → +0.191 C  (239 件)
+  gpu_exhaust    平均   24.311 C  オフセット +0.000 → -0.310 C  (239 件)
   ...
 
 書き込んでいません。内容を確認して `--apply` を付けてください。
@@ -57,6 +57,8 @@ uv run coldaisle-calibrate --minutes 10
 既定では書き込みません。
 
 ### 受け付けられない場合
+
+方針（上限・最低件数・窓の長さ）は `config/calibration.yaml` にあります。
 
 | 表示 | 意味 | どうするか |
 |---|---|---|
@@ -94,9 +96,22 @@ uv run coldaisle-calibrate --minutes 10   # 書かずに見るだけ
 
 ---
 
+## やり直すときの注意
+
+**2回目以降の較正は、前回のオフセットに足されます。**
+
+保存されている値には前回の補正が既に入っているので、計算で出るのは**残差**です。
+出力は `前回 → 今回` の形で両方を表示します。
+
+```text
+  front_intake   平均   24.001 C  オフセット +0.191 → +0.191 C  (239 件)
+```
+
+残差がほぼ 0 なら、**前回の較正がまだ有効**ということです。
+
 ## やり直す時期
 
-`config/calibration.json` の `revalidate_after_days`（既定 183 日 ≒ 6ヶ月）を
+`config/calibration.yaml` の `revalidate_after_days`（既定 183 日 ≒ 6ヶ月）を
 過ぎると、**取り込みデーモンが起動時に警告します。**
 
 ```json

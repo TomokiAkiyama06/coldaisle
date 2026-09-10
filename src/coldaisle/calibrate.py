@@ -32,7 +32,7 @@ from zoneinfo import ZoneInfo
 from coldaisle import logs
 from coldaisle.channels import METRIC_TO_CHANNEL
 from coldaisle.clock import Clock, WallClock
-from coldaisle.ingest.calibration import Calibration
+from coldaisle.ingest.calibration import Calibration, CalibrationPolicy
 from coldaisle.metrics import MetricCatalog
 from coldaisle.store.db import SqliteStore
 from coldaisle.store.quality import QualityRules
@@ -44,20 +44,6 @@ TEMPERATURE_UNIT = "C"
 
 REFERENCE = "mean_of_all"
 """基準の取り方（spec-review W-02）。全センサーの平均を「正しい」とみなす。"""
-
-MIN_SAMPLES = 120
-"""1チャネルあたりの最低件数。2.5秒周期で5分ぶん。
-
-**少ない標本で較正しない。** ノイズをオフセットとして焼き付けることになる。
-"""
-
-MAX_SPREAD_C = 2.0
-"""較正を受け付けるセンサー間のばらつきの上限。
-
-**これを超えるなら、同じ空気に置かれていない。** そのまま較正すると、
-**本物の温度勾配をオフセットとして焼き付ける**（以降その勾配が見えなくなる）。
-spec-review W-02 は30分以上の熱平衡を求めている。
-"""
 
 
 @dataclass(frozen=True)
@@ -76,25 +62,39 @@ class Result:
 
     means: tuple[ChannelMean, ...]
     reference_c: float
-    offsets_c: dict[str, float]
+    residuals_c: dict[str, float]
+    """**今回ぶんの補正量。** 保存済みの値には前回のオフセットが既に入っている。"""
     spread_c: float
     """センサー間のばらつき（最大 − 最小）。**同じ空気に置けているかの指標。**"""
 
-    @property
-    def usable(self) -> bool:
-        return self.spread_c <= MAX_SPREAD_C
+    def usable(self, policy: CalibrationPolicy) -> bool:
+        return self.spread_c <= policy.max_spread_c
 
-    def as_lines(self) -> list[str]:
+    def offsets(self, previous: Calibration) -> dict[str, float]:
+        """書き込む値。**前回のオフセットに今回ぶんを足す。**
+
+        `Normalizer` は**保存する前に**オフセットを足している。したがって DB から
+        読んだ平均は既に補正済みで、ここで出るのは**残差**である。置き換えると、
+        2回目の較正で前回の補正が消え、**個体差が黙って戻る。**
+        """
+        return {
+            channel: round(previous.offset_for(channel) + residual, 3) or 0.0
+            for channel, residual in self.residuals_c.items()
+        }
+
+    def as_lines(self, previous: Calibration, policy: CalibrationPolicy) -> list[str]:
+        offsets = self.offsets(previous)
         lines = [
             f"基準 {self.reference_c:.3f} C（{REFERENCE}）",
-            f"ばらつき {self.spread_c:.3f} C（上限 {MAX_SPREAD_C:.2f}）",
+            f"ばらつき {self.spread_c:.3f} C（上限 {policy.max_spread_c:.2f}）",
             "",
         ]
         for item in sorted(self.means, key=lambda m: m.channel):
-            offset = self.offsets_c[item.channel]
+            before = previous.offset_for(item.channel)
             lines.append(
                 f"  {item.channel:<14} 平均 {item.mean_c:8.3f} C"
-                f"  オフセット {offset:+.3f} C  ({item.count} 件)"
+                f"  オフセット {before:+.3f} → {offsets[item.channel]:+.3f} C"
+                f"  ({item.count} 件)"
             )
         return lines
 
@@ -134,24 +134,28 @@ def compute(means: Sequence[ChannelMean]) -> Result:
     return Result(
         means=tuple(means),
         reference_c=reference,
-        # センサーの読みに足して基準へ寄せる向き。`Normalizer` が値へ加算する
-        offsets_c={item.channel: reference - item.mean_c for item in means},
+        # センサーの読みに足して基準へ寄せる向き。`Normalizer` が値へ加算する。
+        # **これは今回ぶんの残差**（`Result.offsets()` を参照）
+        residuals_c={item.channel: reference - item.mean_c for item in means},
         spread_c=max(values) - min(values),
     )
 
 
-def check(result: Result, *, min_samples: int = MIN_SAMPLES) -> list[str]:
+def check(result: Result, policy: CalibrationPolicy) -> list[str]:
     """受け付けられない理由。**空なら較正してよい。**"""
     problems: list[str] = []
-    if not result.usable:
+    if not result.usable(policy):
         problems.append(
-            f"センサー間のばらつきが {result.spread_c:.3f} C ある（上限 {MAX_SPREAD_C:.2f}）。"
+            f"センサー間のばらつきが {result.spread_c:.3f} C ある"
+            f"（上限 {policy.max_spread_c:.2f}）。"
             "同じ空気に置かれていない可能性がある。**本物の温度勾配を"
             "オフセットとして焼き付けることになる**"
         )
-    thin = sorted(item.channel for item in result.means if item.count < min_samples)
+    thin = sorted(item.channel for item in result.means if item.count < policy.min_samples)
     if thin:
-        problems.append(f"測定が少ないチャネルがある（{min_samples} 件未満）: {', '.join(thin)}")
+        problems.append(
+            f"測定が少ないチャネルがある（{policy.min_samples} 件未満）: {', '.join(thin)}"
+        )
     missing = sorted(set(METRIC_TO_CHANNEL.values()) - {item.channel for item in result.means})
     temperature_missing = [
         channel for channel in missing if channel != METRIC_TO_CHANNEL["air.room_humidity"]
@@ -177,9 +181,8 @@ def as_calibration(result: Result, previous: Calibration, *, at: datetime) -> Ca
     return previous.model_copy(
         update={
             # `-0.0` を残さない。差分で読むときに紛らわしいだけで、意味は同じ
-            "offsets_c": {
-                channel: round(value, 3) or 0.0 for channel, value in result.offsets_c.items()
-            },
+            # **前回の値に足す**（`Result.offsets()` を参照）
+            "offsets_c": result.offsets(previous),
             "calibrated_at": at.isoformat(),
             "reference": REFERENCE,
             "samples": {item.channel: item.count for item in result.means},
@@ -206,7 +209,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--calibration", type=Path, default=Path("config/calibration.json"))
     parser.add_argument("--metrics", type=Path, default=Path("config/metrics.yaml"))
     parser.add_argument("--quality-rules", type=Path, default=Path("config/quality.yaml"))
-    parser.add_argument("--minutes", type=float, default=10.0, help="直近この分数を使う")
+    parser.add_argument("--policy", type=Path, default=Path("config/calibration.yaml"))
+    parser.add_argument("--minutes", type=float, help="直近この分数を使う（既定は方針ファイル）")
     parser.add_argument("--timezone", default="Asia/Tokyo")
     parser.add_argument("--apply", action="store_true", help="書き込む。**付けなければ見せるだけ**")
     parser.add_argument(
@@ -218,23 +222,26 @@ def main(argv: Sequence[str] | None = None) -> int:
     logs.configure(args.log_level)
     clock: Clock = WallClock()
     catalog = MetricCatalog.from_yaml(args.metrics)
+    policy = CalibrationPolicy.from_yaml(args.policy)
+    previous = Calibration.from_json(args.calibration)
+    minutes = policy.window_minutes if args.minutes is None else args.minutes
     store = SqliteStore(args.db, rules=QualityRules.from_yaml(args.quality_rules), clock=clock)
     try:
         end_ms = clock.now_ms()
-        start_ms = end_ms - int(args.minutes * 60_000)
+        start_ms = end_ms - int(minutes * 60_000)
         means = measure(store, catalog, start_ms=start_ms, end_ms=end_ms)
     finally:
         store.close()
 
     if not means:
-        print(f"直近 {args.minutes:g} 分に測定がありません（デーモンは動いていますか）")  # noqa: T201
+        print(f"直近 {minutes:g} 分に測定がありません（デーモンは動いていますか）")  # noqa: T201
         return 1
 
     result = compute(means)
-    for line in result.as_lines():
+    for line in result.as_lines(previous, policy):
         print(line)  # noqa: T201
 
-    problems = check(result)
+    problems = check(result, policy)
     for problem in problems:
         print(f"\n**{problem}**")  # noqa: T201
 
@@ -245,7 +252,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         print("\n上の理由により書き込みません（`--force` で上書きできますが、勧めません）")  # noqa: T201
         return 1
 
-    previous = Calibration.from_json(args.calibration)
     at = datetime.fromtimestamp(clock.now_ms() / 1000, tz=UTC).astimezone(ZoneInfo(args.timezone))
     write(as_calibration(result, previous, at=at), args.calibration)
     LOGGER.info(
