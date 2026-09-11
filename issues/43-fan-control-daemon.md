@@ -1,138 +1,165 @@
 ---
-title: "段階式ファン制御daemon（Front+Rear優先 / Top補助）"
+title: "3系統Fan制御daemon（Front / Rear独立・Top CPU優先）"
 labels: core, safety, priority:must
 milestone: "M7 拡張"
 ---
 
 ## 背景
-GPU高負荷時にケースファンがGPU発熱へ十分追従しないため、GPU/ケースTelemetryに基づいて安全にファンを制御する。
+GPU高負荷時のケース換気とCPU AIO冷却を安全に両立するため、Front / Rear / Topを3系統で独立制御する。
 
 現在のFan topology:
 - Front Intake: Noctua NF-A12x25 G2 ×3
 - Rear Exhaust: Antec FLUX 純正Rear Fan ×1
-- Top Exhaust / CPU Radiator: Cooler Master MasterLiquid Atmos II、120mm Fan ×3
+- Top Exhaust / CPU Radiator: Cooler Master MasterLiquid Atmos II 360
+- AIO Pump: BIOS / 固定安全設定で管理
+
+RearはFrontのHubから分離し、別PWM headerへ接続する。
+TopもcoldaisleがPWMを管理する。
 
 **このIssueは #30 の安全設計ADRが承認されるまで実装開始しない。**
 
-## 制御階層
+## 制御対象
 
-### Stage 1: Front + Rear
+### Front Intake zone
+Front Intake ×3を1 zoneとして制御する。
 
-通常時は **Front Intake ×3 + Rear Exhaust ×1** のFan Hub系統だけを主制御する。
-
-主な入力:
+入力例:
 - GPU power（feed-forward）
 - GPU core / hotspot
-- `air.gpu_intake`
-- `air.gpu_exhaust`
 - `air.front_intake`
+- `air.gpu_intake`
+- Front PWM / RPM / Airflow Index
+
+### Rear Exhaust zone
+Rear Exhaust ×1をFrontと独立して制御する。
+
+Rearは通常時の主排気とし、Frontを上げた際にRearだけを追加で上げられるようにする。
+
+入力例:
 - `air.rear_exhaust`
-- `d.case_delta = rear_exhaust - front_intake`
-- T_SENSOR（12V-2x6外装）
-- Case Fan Hub PWM / RPM
+- `d.case_delta`
+- GPU Intake / GPU Exhaust
+- Rear PWM / RPM / Airflow Index
 
-### Stage 2: Top補助排気
+### Top / CPU Radiator zone
+Topもcoldaisleが常時PWMを管理する。
 
-Front + Rearを十分に上げてもケース内の熱を捌き切れない状態が一定時間継続した場合のみ、Top Radiator Fanを追加で上げる。
+```text
+top_demand = max(cpu_cooling_demand, case_aux_exhaust_demand, safety_floor)
+```
 
-候補判定:
-- Case Fan Hubが高Dutyでも`d.case_delta`が高止まり
-- GPU Intake / Rear Exhaustが高止まり
-- GPU power高負荷が継続
-- Top Exhaust側へ排気能力を追加する余地がある
+- `cpu_cooling_demand`: CPU温度 / CPU power等から決定
+- `case_aux_exhaust_demand`: Front + Rearだけではケース排熱が不足する場合に上げる
+- `safety_floor`: CPU AIOとして維持する最低安全値
 
-正確な閾値・継続時間は #19 の実測で決定する。
-
-## Top制御の安全条件
-
-TopはCPU AIOのラジエーターファンでもあるため、CPU冷却要求を下げない。
-
-- coldaisleは原則Topを「追加で上げる」方向にのみ介入
-- CPU/BIOS側要求を下限とする安全な仲裁方法を実機で確認する
-- 安全な仲裁を確認できない場合、TopはBIOS管理のままとする
-- AIO Pump / VRM Fanは初期版ではBIOS管理
+通常時はケース側のTop要求を低く保ち、Rearを含む通常排気で不足するときだけケース補助要求を増やす。
 
 ## 風量モデル
 
-絶対CFMをファン径とRPMだけから推定しない。
+#44で作成したzone別Airflow Modelを利用する。
 
-- メーカー公称の最大風量 / 最大RPM / 静圧は参考値として保持
-- `RPM / 最大RPM`、PWM dutyを Airflow Proxy として扱う
-- FrontとTopは、ケース前面・ラジエーター等の抵抗が異なるため同一RPMで同じ流量とはみなさない
-- 最終判断は `d.case_delta`、GPU Intake、Rear/Top Exhaust、GPU温度・GPU powerなどの熱応答を優先する
+- メーカー公称値はprior / metadata
+- PWM→RPM curveを実測
+- 起動PWM / 最低安定PWMを実測
+- zoneごとに0〜1のAirflow Indexを持つ
+- Front / Rear / Topの冷却効果を固定熱負荷で実測
+- 絶対CFMの一致を制御目標にしない
+
+最終判断はAirflow Indexに加えて以下の熱応答を使う。
+- `d.case_delta`
+- GPU Intake / GPU Exhaust
+- Rear Exhaust / Top Exhaust
+- GPU core / hotspot / power
+- CPU temperature / power
 
 ## アーキテクチャ
 
 ```text
 GUI
   |
-  | Auto / Manual / Max の指示のみ
+  | Auto / Manual / Max
   v
-coldaisle-fand  (専用daemon / 必要最小限の権限)
+coldaisle-fand
   |
-  +--> Front + Rear Fan Hub  [主制御]
-  |
-  +--> Top Radiator Fan      [不足時のみ補助・安全確認済みの場合]
+  +--> Front PWM  [Intake]
+  +--> Rear PWM   [Primary Exhaust]
+  +--> Top PWM    [CPU Radiator + Auxiliary Exhaust]
+
+AIO Pump          [outside coldaisle control]
 ```
 
-- Core read-only APIと制御経路を分離する
 - GUIをrootで動かさない
-- LLM/AIツールからfan daemonへ到達させない
+- Core read-only APIと制御経路を分離
+- LLM/AIからfan daemonへ到達させない
 - `hwmonX`番号をhard-codeしない
 
 ## モード
 
-- [ ] `Auto`: 決定論的な段階式制御
-- [ ] `Manual`: GUI slider。ただし安全下限を下回れない
-- [ ] `Max`: 安全側の最大冷却
+- [ ] `Auto`: 決定論的な3-zone制御
+- [ ] `Manual`: zone別slider。ただし安全下限を下回れない
+- [ ] `Max`: 制御可能な正常Fanを最大冷却へ
 - [ ] fault時: 強制Safe/Max
+
+ManualでもTopはCPU safety floorを下回れない。
 
 ## やること
 
-- [ ] #30で確定したfan header / pwmX対応だけを操作
-- [ ] Front + Rear Fan HubとTop Radiator Fanを別制御対象として識別
+- [ ] #30で確定したFront / Rear / Top headerだけを操作
+- [ ] RearをFront Hubから分離した配線を実機確認
 - [ ] `% -> driver値`変換を安全に扱う
-- [ ] PWM control modeへ入る前にdriver semanticsを検証
-- [ ] GPU powerによるFront + Rear feed-forward curve
-- [ ] GPU温度 / Intake / Exhaust / Case ΔTによるfeedback補正
-- [ ] Front + Rearの不足判定state machine
-- [ ] Top補助開始 / 解除条件と継続時間を実装
-- [ ] Top補助はCPU冷却要求を下回らないことを保証
+- [ ] 各zoneのPWM control mode / semanticsを検証
+- [ ] Front吸気feed-forward / feedback curve
+- [ ] Rear主排気curve
+- [ ] Front / Rearの協調制御
+- [ ] CPU温度 / powerからTopの `cpu_cooling_demand` を生成
+- [ ] ケース排熱不足から `case_aux_exhaust_demand` を生成
+- [ ] Topを `max(cpu, case, floor)` で制御
+- [ ] #44のAirflow Indexを制御状態へ統合
 - [ ] ramp-upは速く、ramp-downは遅くする
-- [ ] ヒステリシスを入れ、回転数とStage切替のハンチングを防ぐ
-- [ ] tach監視。PWM指令に対してRPMが不足したら`FAN_FAULT`
-- [ ] NVML/T_SENSOR/主要センサーstale時は安全側へ
+- [ ] zoneごとにヒステリシス / slew limitを入れる
+- [ ] tach監視。PWM指令に対してRPM不足ならzone別`FAN_FAULT`
+- [ ] CPU telemetry loss時はTopをSafe/Max
+- [ ] NVML / T_SENSOR / 必須外気センサーstale時は安全側へ
 - [ ] daemon heartbeat / deadman timeout
 - [ ] SIGTERM / crash / restart時の安全動作
 - [ ] systemd unit (`Restart=always`) と権限設計
-- [ ] 制御Stage・指令PWM・実RPM・faultをTelemetryへ記録
+- [ ] zone別PWM / RPM / Airflow Index / demand / faultをTelemetryへ記録
 
 ## フェイルセーフ
 
-重大なfault時はFront + Rearを原則100%へ倒す。
-TopについてはCPU冷却を最優先し、#30で実機確認した安全動作だけを使用する。
+重大fault時は、制御可能な正常Fanを安全側へ上げる。
 
-fault例:
-- NVMLが一定時間読めない
-- T_SENSORが一定時間読めない
-- Front/Rear/GPU Intake等の必要センサーがstale
-- hwmon write失敗
-- tachが期待下限を下回る
-- heartbeat期限切れ
+特にTopはCPU冷却を担うため以下をSafe/Maxへ:
+- CPU temperature telemetry loss
+- Top hwmon write failure
+- Top tach stall
+- daemon startup / state未確定
 - 設定不正
+
+Front / Rearも以下では安全側へ:
+- NVML loss
+- T_SENSOR loss
+- 必須外気センサーstale
+- hwmon write failure
+- tach stall
+- heartbeat timeout
+
+AIO Pumpはcoldaisleから制御しない。
 
 ## 受入基準
 
-- 通常時はFront + Rearだけで制御する
-- Front + Rearだけでは不足する条件でのみTop補助が発動する
-- Top補助がCPU冷却要求を下回らない
-- 風量の絶対CFM測定を前提としない
-- daemonをkillしても冷却が停止しない
-- NVML停止・T_SENSOR欠測・tach異常を注入すると安全側へ移行する
-- 対象外PWMを変更しないことをテスト/実機確認で保証する
-- Auto/Manual/Maxのいずれでも安全下限を破れない
-- AI層からPWMを書き換える経路が存在しない
-- #19の実測結果を使い、Top補助が必要な条件を説明できる
+- Front / Rear / Topが独立PWMとして制御できる
+- Frontを変えずRearだけ上げられる
+- Rearを変えずFrontだけ上げられる
+- Topはアプリ管理で `max(cpu_cooling_demand, case_aux_exhaust_demand, safety_floor)` を守る
+- ManualでもCPU safety floorを破れない
+- CPU telemetry lossでTopが安全側へ移行する
+- #44のAirflow Modelを使う
+- 絶対CFM測定を前提としない
+- daemon kill / restartでも危険な冷却停止にならない
+- 対象外PWMを変更しない
+- AI層からPWM書換経路が存在しない
+- #19 / #44の実測に基づいて各zoneの制御根拠を説明できる
 
 ## 依存
-#30, #34, #19, #26
+#30, #34, #44, #19, #26
