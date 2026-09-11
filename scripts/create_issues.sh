@@ -62,7 +62,7 @@ is_not_planned() {
 # 「実装できるか」ではなく、受入基準の完了に実GPUサーバーが必要か。
 requires_server() {
   case "$1" in
-    19|26|27|28|30|32|33|34|37|43) return 0 ;;
+    19|26|27|28|30|32|33|34|37|43|44) return 0 ;;
     *) return 1 ;;
   esac
 }
@@ -70,7 +70,7 @@ requires_server() {
 # 受入基準の完了に XIAO + DS18B20×5 + AM2320 が必要か。
 requires_sensor_module() {
   case "$1" in
-    11|12|13|14|15|19|26|33|37) return 0 ;;
+    11|12|13|14|15|19|26|33|37|44) return 0 ;;
     *) return 1 ;;
   esac
 }
