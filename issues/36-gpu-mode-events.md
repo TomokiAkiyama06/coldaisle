@@ -5,26 +5,38 @@ milestone: "M7 拡張"
 ---
 
 ## 背景
-AI Mode（GPU 200-300W断続）と Compute Mode（600W連続）では熱的な条件が全く異なる。
-Mode変化を記録しないと「なぜ14時から吸気温が3°C上がったのか」が後から分からない。
+AI ModeとCompute Modeでは熱的な条件が大きく異なる。
+Mode変化を記録しないと、温度変化の原因を後から説明できない。
 
-**副次的効果**: Mode切り替えは**制御された自然実験**になる。
-遷移前後を比較すれば `d.gpu_delta` や `d.intake_rise` の負荷依存性を高精度で測定できる。
-Issue #19（ベースライン測定）はこれを利用すると効率的。
+## 要設計判断
+現行v1 APIは **GET-only** を構造的に保証しているため、Core APIへそのまま`POST /api/v1/events`を追加すると既存の安全契約を破る。
+実装前に、次のどちらかをADRで確定すること。
+
+1. **推奨:** 書き込み専用のlocalhost/Unix socket入口をread-only APIから分離する
+2. v2 APIとして明示的に書き込み契約を導入する
+
+AI/LLMがこの入口を直接呼べる構成にはしない。
 
 ## やること
 - [ ] `events` テーブル（`ts_ms`, `kind`, `payload`）
-- [ ] `POST /api/v1/events` — **唯一の書き込み系エンドポイント**。localhost限定
-- [ ] Workspace の GPU Manager から Mode変更を通知させる
-- [ ] `sys.gpu_mode` メトリクスとしても記録
-- [ ] ダッシュボードのグラフに縦線で注釈
-- [ ] `PROBE_CHANGED` `device_reset` などの既存イベントも同テーブルへ統合
-- [ ] **`sys.gpu_state = mixed` を検出したら「GPU モードの切り替えが失敗している」と警告する**
-      （決定記録 0006 §2.4。「熱くなった」と出すと利用者は冷却を疑い、原因に辿り着かない）
+- [ ] Mode変更イベントの入力経路をADRで確定
+- [ ] WorkspaceのGPU ManagerからMode変更を通知
+- [ ] `sys.gpu_mode` として参照可能にする
+- [ ] ダッシュボードのグラフへ縦線で注釈
+- [ ] `PROBE_CHANGED` / device reset等の既存イベントを統合できる設計にする
+- [ ] `sys.gpu_state = mixed` を検出したら「GPUモード切替が失敗している」と警告
 
 ## セキュリティ
-書き込みエンドポイントを1つ増やすため、**localhost以外からのアクセスを拒否**すること。
-受け付けるkindをホワイトリストで限定する。
+- localhostまたはUnix socket限定
+- 受理するevent kindをホワイトリスト化
+- AIツール一覧には書き込み入口を公開しない
+- read-only APIのOpenAPI契約を壊さない方式を優先
+
+## 受入基準
+- Mode遷移と温度・電力の時系列を後から重ねられる
+- 未認可のevent kindを拒否する
+- LLMからModeイベントの書き込み経路へ到達できない
+- GET-only契約を変更する場合は、破壊的変更としてapi-contractとテストを更新する
 
 ## 依存
 #9, #35
