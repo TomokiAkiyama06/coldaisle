@@ -1,92 +1,167 @@
 # coldaisle
 
-GPUサーバーの温湿度監視 + ローカルLLM（Qwen3.8-27B）による運用アシスタント。
+GPUサーバーの**温度監視・時系列ログ・安全なファン制御**を行うローカル運用ツールです。
 
-> リポジトリ名は変更可能です。`grep -rl coldaisle . | xargs sed -i '' 's/coldaisle/<新名称>/g'（macOS）で一括置換できます。
+XIAO ESP32-S3 + 外付け温度センサー、NVML、lm-sensors / hwmon を同じタイムラインへ統合し、
+「どこが熱いか」「ケース換気が足りているか」「ファン制御が効いているか」を判断できるようにします。
 
-> **v0.2**: Personal AI Workspace 構想メモとの統合を反映しました。
-> 本システムは独立アプリではなく **Workspace の Core Service** です。
-> 境界の定義は [`docs/api-contract.md`](docs/api-contract.md) を参照してください。
+## v1 の目的
 
-## これは何か
+v1 の主目的は次の4点です。
 
-XIAO ESP32-S3 に接続した DS18B20 ×5 と AM2320 で
-GPUサーバー周辺の**空気の温度**を測り、以下を行います。
+1. 外気・吸気・GPU周辺・排気・12V-2x6周辺温度を継続監視する
+2. GPU / CPU / Fan RPM / PWM など内部Telemetryと合わせてSQLiteへ記録する
+3. Web UIで現在値・履歴・温度差・センサー異常を確認する
+4. **Front + Rearを主制御し、必要なときだけTop Radiator Fanを補助排気として上げる**
 
-- 単一のデーモンがUSBシリアルを占有し、SQLiteへ時系列を蓄積
-- 決定論的なルールエンジンが異常を検知し、Slack / LINE へ通知
-- ローカルLLMが履歴の自然言語問い合わせ・異常説明・日次レポートを担当
+AI / LLM、Personal AI Workspace、Slack / LINE、日次AIレポート等は既存実装・将来拡張として残しますが、
+**v1の冷却制御を完成させるための必須要件ではありません。**
 
-マザーボード内蔵センサーでは分からない「排気の再循環」「室温上昇」といった
-**設置環境起因の問題**を切り分けることが目的です。
+## 現在の実機構成
 
-## 設計上の3つの柱
+### 外付けセンサーモジュール
 
-**1. AIを安全系に入れない**
+- Seeed XIAO ESP32-S3
+- DS18B20 ×5
+  - Front Intake
+  - GPU Intake
+  - GPU Exhaust
+  - Top Exhaust
+  - Rear Exhaust
+- AM2320 ×1
+  - Room Temperature
+  - Room Humidity
+- ASUS `T_SENSOR`
+  - 10kΩ NTCを12V-2x6コネクタ外装付近へ設置
+
+固定BOMそのものは履歴化せず、DS18B20の **ROM ID → 設置位置**、較正値、配置変更、プローブ交換を管理します。
+
+### Fan topology
+
+- **Front Intake:** Noctua NF-A12x25 G2 ×3
+- **Rear Exhaust:** Antec FLUX 純正Rear Fan ×1
+- **Top Exhaust / CPU Radiator:** Cooler Master MasterLiquid Atmos II、120mm Fan ×3
+- **AIO Pump:** BIOS / 安全設定で管理
+
+Front + Rearは現在同一Fan Hub系統として扱います。
+TopはCPU AIOのラジエーターファンでもあるため、通常のケース換気では主制御にせず、補助排気として扱います。
+
+## Fan control policy
+
+### Stage 1 — Front + Rear
+
+通常時は **Front Intake ×3 + Rear Exhaust ×1** を主制御します。
+
+主な入力:
+
+- GPU Power（温度上昇前のfeed-forward）
+- GPU core / hotspot
+- Front Intake
+- GPU Intake / GPU Exhaust
+- Rear Exhaust
+- `d.case_delta = rear_exhaust - front_intake`
+- T_SENSOR
+- Case Fan HubのPWM / RPM
+
+### Stage 2 — Top auxiliary exhaust
+
+Front + Rearを十分に上げてもケース内の熱を捌き切れない状態が一定時間続いた場合だけ、
+**Top Radiator Fanを追加で上げて排気を補助**します。
+
+TopはGPU負荷へ常時連動させません。
+またTopはCPU冷却ファンでもあるため、coldaisleがCPU側の冷却要求を下げることは禁止します。
+安全な仲裁方法を実機で確認できない場合、TopはBIOS管理のままとします。
+
+AIO PumpとVRM Fanは初期版ではcoldaisleから制御しません。
+
+## 風量の扱い
+
+ファンの風量は**ファン径とRPMだけから絶対CFMを算出しません**。
+同じ径・RPMでも羽根形状、静圧特性、フィルター、ラジエーター、ケース抵抗で実流量が変わるためです。
+
+coldaisleでは次のように扱います。
+
+- メーカー公称の最大風量・最大RPM・静圧は基礎情報として保持する
+- 現在RPM / 最大RPM、PWM dutyを **Airflow Proxy（相対的な風量指標）** として利用する
+- 最終判断は `d.case_delta`、GPU Intake、Rear / Top Exhaust、GPU温度・電力など、**実際に生じた熱応答**で行う
+- Topはラジエーター抵抗があるため、Frontと同じRPM・公称風量でも同じ実流量とはみなさない
+
+正確なCFM測定を制御の前提にはしません。
+
+## 安全設計
+
+冷却制御にAI / LLMを入れません。
 
 | 層 | 責務 | AI |
 |---|---|---|
-| Safety-0 | BIOS Q-Fan / GPUサーマルスロットリング | なし |
-| Safety-1 | ルールエンジン（閾値・継続時間・ヒステリシス） | **なし** |
-| Advisory-2 | LLMによる説明・診断・要約 | あり（**読み取り専用・提案のみ**） |
+| Safety-0 | BIOS Q-Fan / GPUサーマル保護 | なし |
+| Safety-1 | `coldaisle-fand`、閾値、ヒステリシス、deadman、tach監視 | **なし** |
+| Advisory | 説明・分析・将来のAI連携 | 読み取り専用のみ |
 
-**2. Core Service は GPU に依存しない**
+Fan daemonはGUIやAI層から分離し、NVML / T_SENSOR / 必須センサー欠測、tach異常、hwmon write失敗、heartbeat切れ等では安全側へ移行します。
 
-Kaggle・研究がGPUを使う「Compute Mode」では、ローカルAIは完全停止してVRAMを全解放します。
-しかし **Compute Mode こそGPUが最も熱くなる時間帯** です。
+## ハードウェアなしでの開発
 
-| | Core Service（取り込み・アラート・API・UI） | GPU AI Service（説明・チャット） |
-|---|---|---|
-| AI Mode | 稼働 | 稼働 |
-| **Compute Mode** | **稼働** | **完全停止** |
-
-**3. ハードウェア非依存で開発する**
-
-データソースを `serial` / `mock` / `replay` で抽象化しているため、
-**GPUサーバーもESP32も無い状態で、ダッシュボード・アラート・AI機能のすべてを開発・テストできます。**
+データソースは `serial` / `mock` / `replay` で抽象化しています。
+そのためダッシュボード、ルール、API、fan control state machineの多くは実機なしで開発・テストできます。
 
 ```bash
 uv run coldaisle-daemon --source mock --scenario ramp
 ```
 
+ただし、次は実機確認が必須です。
+
+- DS18B20 / AM2320の較正・長時間運転
+- hwmon上の物理Fan Header対応
+- PWM最低値・起動値・tach特性
+- BIOS Q-Fanとの仲裁 / 復帰挙動
+- Front + Rearだけで不足する条件とTop補助開始条件
+
+## 主な派生値
+
+```text
+d.intake_rise = air.front_intake - air.room
+d.gpu_preheat = air.gpu_intake - air.front_intake
+d.gpu_delta   = air.gpu_exhaust - air.gpu_intake
+d.case_delta  = air.rear_exhaust - air.front_intake
+```
+
+特に `d.case_delta` は、ケース換気が熱を運び出せているかを見る主要指標として使います。
+
 ## ドキュメント
 
 | ファイル | 内容 |
 |---|---|
-| [`docs/requirements.md`](docs/requirements.md) | 要件定義書。スコープ、ユースケース、アーキテクチャ、機能/非機能要件、フェーズ計画 |
-| [`docs/api-contract.md`](docs/api-contract.md) | **Personal AI Workspace との境界。**この契約だけが2リポジトリの接点 |
-| [`docs/spec-review.md`](docs/spec-review.md) | ハードウェア仕様のレビューと改訂提案（重大な指摘6件を含む） |
-| [`docs/decisions/`](docs/decisions/) | 決定記録。追記のみ。変更は新しい記録を作り `Supersedes` で参照する |
-| [`ISSUES.md`](ISSUES.md) | Issue一覧と着手順 |
-| [`issues/`](issues/) | GitHub登録用の個別Issue（フロントマター付き） |
-| [`prompts/claude-code.md`](prompts/claude-code.md) | **Claude Code 向けプロンプト集。**キックオフ、Issue実装テンプレート、レビュー用 |
-| [`AGENTS.md`](AGENTS.md) | AIコーディングエージェント向け指示の正本（Claude Code / Codex 共通） |
+| [`docs/requirements.md`](docs/requirements.md) | 詳細要件・既存設計 |
+| [`docs/api-contract.md`](docs/api-contract.md) | Core API契約 |
+| [`docs/spec-review.md`](docs/spec-review.md) | ハードウェア仕様レビュー |
+| [`docs/decisions/`](docs/decisions/) | ADR / 決定記録 |
+| [`ISSUES.md`](ISSUES.md) | Issue一覧・実機要件・着手順 |
+| [`issues/`](issues/) | 個別Issue仕様の正本 |
+| [`AGENTS.md`](AGENTS.md) | AIコーディングエージェント向け指示 |
 
-## Issueの一括登録
+## 現在の優先順
 
-```bash
-gh auth login
-DRY_RUN=1 ./scripts/create_issues.sh   # 確認
-./scripts/create_issues.sh             # 実行
+```text
+ESP32 / センサー実機確認
+  ↓
+Ubuntu本番化
+  ↓
+NVML / lm-sensors / hwmon / T_SENSOR / Fan Telemetry
+  ↓
+実測ベースライン
+  ↓
+Fan control safety ADR
+  ↓
+Front + Rear主制御
+  ↓ 必要時のみ
+Top Radiator Fan補助排気
 ```
 
-ラベルとマイルストーンも自動作成されます。
-登録後、本文中の `#番号` を実際のIssue番号に合わせて修正してください。
+## 将来拡張
 
-## 最初にやること
-
-1. [`docs/requirements.md`](docs/requirements.md) を読み、設計の前提を把握する
-2. [`docs/decisions/`](docs/decisions/) で確定済みの方針を確認する
-3. **#41**（秘匿情報の混入防止）— 最初のコミット前に
-4. **#1〜#4、#31** で基盤・スキーマ・モデル役割を固める
-5. **#6（MockSource）を最優先で完了させる** — ここが全体のクリティカルパス
-
-## スコープ外
-
-本リポジトリは**ソフトウェアとファームウェアのみ**を扱います。
-物理的な組み立て、部品調達、設置環境に関する事項は管理対象外です。
-それらがソフトウェア要件に影響する場合のみ、
-`docs/spec-review.md` に技術的な背景として記述しています。
+既存のLLM Provider、read-only tools、レポート、Workspace連携等は削除しませんが、
+冷却制御v1とは分離して扱います。AI層がFan PWMを書き換える経路は作りません。
 
 ## ライセンス
 
