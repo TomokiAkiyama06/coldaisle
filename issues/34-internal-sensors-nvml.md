@@ -11,7 +11,7 @@ GPUサーバー実機が到着したため、現在は着手可能。
 外付け空気センサー（`air.*`）と、GPU/CPU/VRM/T_SENSOR/ファンの内部Telemetryを同じタイムラインへ載せ、
 「吸気が熱いのか」「GPU自体が熱いのか」「ケース換気が不足しているのか」「ファン指令が反映されていないのか」を切り分けられるようにする。
 
-Fan control v1では、**Front + Rearを主制御し、Top Radiator Fanは不足時のみ補助排気**として扱うため、両系統を区別してTelemetry化する。
+Fan control v1では **Front / Rear / Topを3系統で独立制御**するため、それぞれを別zoneとしてTelemetry化する。
 
 ## やること
 
@@ -33,54 +33,78 @@ Fan control v1では、**Front + Rearを主制御し、Top Radiator Fanは不足
 - [ ] **ASUS T_SENSOR**（12V-2x6コネクタ外装に設置した10kΩ NTC）
 
 ### Fan Telemetry
-- [ ] Front + Rear Fan HubのRPM
-- [ ] Front + Rear Fan HubのPWM duty / control mode（取得可能な範囲）
-- [ ] Top Radiator FanのRPM
-- [ ] Top Radiator FanのPWM duty / control mode（取得可能な範囲）
-- [ ] AIO Pump RPM
+- [ ] Front zone RPM
+- [ ] Front zone PWM duty / control mode
+- [ ] Rear zone RPM
+- [ ] Rear zone PWM duty / control mode
+- [ ] Top / CPU Radiator zone RPM
+- [ ] Top zone PWM duty / control mode
+- [ ] AIO Pump RPM（参照のみ）
 - [ ] VRM Fan RPM（取得可能な場合）
-- [ ] Front + Rear系統とTop系統の物理header対応を特定
+- [ ] Front / Rear / Topそれぞれの物理headerと `pwmX` / `fanX_input` 対応を特定
+- [ ] RearがFront Hubから分離されていることを確認
 - [ ] hwmon番号を固定せず、driver名・label・安定属性から探索
 
 現在のFan topology:
 - Front Intake: Noctua NF-A12x25 G2 ×3
 - Rear Exhaust: Antec FLUX 純正Rear Fan ×1
-- Top Exhaust / CPU Radiator: Cooler Master MasterLiquid Atmos II、120mm Fan ×3
+- Top Exhaust / CPU Radiator: Cooler Master MasterLiquid Atmos II 360
+
+### Fan metadata
+#44のAirflow Model用に以下を保持できるようにする。
+- zone name
+- fan count
+- known max RPM
+- manufacturer rated airflow（存在する場合）
+- manufacturer rated static pressure（存在する場合）
+- measured startup PWM
+- measured minimum stable PWM / RPM
+- measured maximum RPM
+
+既知の公称値:
+- Front NF-A12x25 G2: 1基あたり最大1800 RPM / 63.15 CFM / 3.14 mmH2O
+- Top Atmos II 360: 公称最大2500 RPM / 190 CFM / 3.61 mmH2O
+- Rear: 実機型番・公開仕様を確認。無ければ測定値のみ使う
 
 ### メトリクス・派生値
 - [ ] 同一`readings`テーブルへ投入（ロング形式のためスキーマ変更不要）
 - [ ] `d.gpu_internal_delta = gpu.0.hotspot - gpu.0.core`
 - [ ] `d.case_delta = air.rear_exhaust - air.front_intake`
-- [ ] `d.gpu_preheat = air.gpu_intake - air.front_intake` を継続利用
-- [ ] `d.gpu_delta = air.gpu_exhaust - air.gpu_intake` を継続利用
-- [ ] `d.rear_rise = air.rear_exhaust - air.room` を継続利用
+- [ ] `d.gpu_preheat = air.gpu_intake - air.front_intake`
+- [ ] `d.gpu_delta = air.gpu_exhaust - air.gpu_intake`
+- [ ] `d.rear_rise = air.rear_exhaust - air.room`
 - [ ] 12V-2x6温度はRoomとの差分も表示可能にする
-- [ ] Fanごとに `rpm_ratio = rpm / known_max_rpm` をAirflow Proxyとして扱えるようにする（最大RPMが確定している場合のみ）
+- [ ] zoneごとの `rpm_ratio = rpm / measured_max_rpm`
+- [ ] #44で確定後、zoneごとの `airflow_index`（0〜1）を参照可能にする
 
 ### 風量に関する原則
 - [ ] ファン径とRPMだけから絶対CFMを算出しない
-- [ ] メーカー公称の最大風量 / 最大RPM / 静圧はmetadataとして保持可能にする
-- [ ] FrontとTopは通気抵抗が異なるため、公称CFMやRPMを単純加算して吸排気バランスを断定しない
-- [ ] Fan RPM/PWMは相対的なAirflow Proxyとして使い、実際の熱応答（`d.case_delta`、GPU Intake、Rear/Top Exhaust等）とセットで評価する
+- [ ] メーカー公称値はprior / metadataとして扱う
+- [ ] Front / Rear / Topの通気抵抗が異なるため、公称CFMやRPMを単純加算して吸排気バランスを断定しない
+- [ ] PWM→RPM実測と熱応答を組み合わせた #44 Airflow Modelを使う
 
 ### 品質・障害
 - [ ] NVML / lm-sensors / hwmonそれぞれのsource healthを持つ
 - [ ] センサーが読めない場合に値を推測しない
-- [ ] fan RPMが取得できる場合、PWM指令と実RPMの相関を記録できるようにする
+- [ ] zoneごとにPWM指令と実RPMの相関を記録できるようにする
 - [ ] T_SENSORのlabelが実機上で安定して識別できることを確認
+- [ ] CPU telemetry lossをfan daemonへ明示できる
 
 ## 検証すべき仮説
-- GPUの高消費電力時、ケースファンBIOS AutoではケースΔTが増えるか
-- Front + Rearを高回転にすると `d.case_delta` / GPU Intake / GPU core / hotspot がどの程度改善するか
-- Front + Rearを高回転にしても不足する条件が存在するか
-- Top Radiator Fanを追加で上げた場合に、どの程度追加改善するか
+- Frontを上げたときGPU Intakeがどの程度改善するか
+- Rearを独立して上げたとき `d.case_delta` / GPU Intake / Rear Exhaustがどの程度改善するか
+- FrontとRearの最適な相対関係は一定か、GPU powerで変わるか
+- Front + Rearだけで不足する条件が存在するか
+- Topをケース補助排気として上げた場合にどの程度追加改善するか
+- TopのCPU cooling demandとcase exhaust demandが競合する条件があるか
 - GPU排熱がTop radiator側へ回り込んでいるか
-- GPU power上昇に対してGPU Intake / Rear Exhaust / Top Exhaustがどの順で応答するか
 
 ## 受入基準
 - `air.*` と内部Telemetryを同一時系列で取得できる
-- T_SENSOR、Front + Rear Fan Hub、Top Radiator FanのRPM/PWM状態を区別して参照できる
-- Fan control #30/#43が必要とする入力を提供できる
+- Front / Rear / TopのRPM/PWM状態を別zoneとして参照できる
+- RearがFrontから独立している
+- CPU temperature / powerがTop制御入力として取得できる
+- #44 / #30 / #43が必要とするFan Telemetryを提供できる
 - 取得不能なTelemetryがあってもCore Service全体が落ちない
 
 ## 依存
