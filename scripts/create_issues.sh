@@ -45,7 +45,6 @@ create_milestone() {
   fi
 }
 
-# 実装が完了し、受入基準も満たしている論理 Issue。
 is_completed() {
   case "$1" in
     1|2|3|4|5|6|7|8|9|10|14|18|21|22|23|25|38|39|40|41|42) return 0 ;;
@@ -53,7 +52,6 @@ is_completed() {
   esac
 }
 
-# 別 Issue / ADR に置き換えられ、今後この Issue 自体を実装しないもの。
 is_not_planned() {
   case "$1" in
     24|28|31) return 0 ;;
@@ -61,7 +59,7 @@ is_not_planned() {
   esac
 }
 
-# 「実装できるか」ではなく、Issue の受入基準を完了するために実GPUサーバーが必要か。
+# 「実装できるか」ではなく、受入基準の完了に実GPUサーバーが必要か。
 requires_server() {
   case "$1" in
     19|26|27|28|30|32|33|34|37|43) return 0 ;;
@@ -69,7 +67,7 @@ requires_server() {
   esac
 }
 
-# Issue の受入基準を完了するために XIAO + DS18B20×5 + AM2320 が必要か。
+# 受入基準の完了に XIAO + DS18B20×5 + AM2320 が必要か。
 requires_sensor_module() {
   case "$1" in
     11|12|13|14|15|19|26|33|37) return 0 ;;
@@ -93,7 +91,6 @@ issue_labels() {
   local labels
   labels=$(sed -n 's/^labels: \(.*\)$/\1/p' "$file" | head -1 | tr -d ' ')
 
-  # 旧 blocked-by-hardware は「到着待ち」と「実機が必要」を混同するため GitHub では使わない。
   labels=$(printf '%s' "$labels" | sed 's/,\?blocked-by-hardware//g; s/blocked-by-hardware,\?//g')
 
   if requires_server "$spec_id"; then
@@ -138,8 +135,6 @@ create_label "requires:sensor-module"  "006b75" "XIAO ESP32-S3 + DS18B20×5 + AM
 create_label "hardware-independent"    "c2e0c6" "サーバー / 自作センサーモジュールなしで完了可能"
 create_label "blocked-by-design"       "d876e3" "安全設計・ADRの承認まで実装開始しない"
 create_label "needs-decision"          "f9d0c4" "実装前に人間の設計判断が必要"
-
-# 旧ラベルは既存 Issue から除去するが、消すと外部参照を壊し得るため label 自体は削除しない。
 create_label "blocked-by-hardware"     "ededed" "旧ラベル（非推奨）。requires:* を使用"
 
 echo "==> milestones"
@@ -161,7 +156,7 @@ if [ "$DRY_RUN" = "1" ]; then
     raw_id=$(basename "$f" | cut -d- -f1)
     spec_id=$((10#$raw_id))
     title=$(sed -n 's/^title: "\(.*\)"$/\1/p' "$f" | head -1)
-    echo "  spec#$spec_id [$($(declare -f issue_state); issue_state "$spec_id")] $title"
+    echo "  spec#$spec_id [$(issue_state "$spec_id")] $title"
     echo "    labels: $(issue_labels "$spec_id" "$f")"
   done
   exit 0
@@ -171,8 +166,6 @@ declare -A ISSUE_NUM
 map_file=$(mktemp)
 trap 'rm -f "$map_file"' EXIT
 
-# Pass 1: 全 Issue の GitHub 番号を確定する。
-# PR と Issue は同じ番号空間なので、ソース内の論理 #N をそのまま使ってはいけない。
 echo "==> pass 1: create/find issues"
 for f in "$ISSUE_DIR"/*.md; do
   raw_id=$(basename "$f" | cut -d- -f1)
@@ -201,8 +194,6 @@ for f in "$ISSUE_DIR"/*.md; do
   printf '%s\t%s\n' "$spec_id" "$number" >> "$map_file"
 done
 
-# Pass 2: 本文中の論理 #N を実際の GitHub Issue 番号へ一括変換して更新する。
-# 1回の regex 置換にすることで、変換後の #番号を別の論理番号として再変換しない。
 echo "==> pass 2: update bodies / labels / state"
 for f in "$ISSUE_DIR"/*.md; do
   raw_id=$(basename "$f" | cut -d- -f1)
@@ -231,7 +222,7 @@ for line in Path(map_path).read_text().splitlines():
 text = Path(body_path).read_text()
 text = re.sub(
     r"#(\d+)\b",
-    lambda m: f"#{mapping.get(int(m.group(1)), int(m.group(1))}",
+    lambda m: f"#{mapping.get(int(m.group(1)), int(m.group(1)))}",
     text,
 )
 source = f"> Source spec: `issues/{filename}` (logical #{spec_id})\n\n"
