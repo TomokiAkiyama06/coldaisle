@@ -61,13 +61,15 @@ is_not_planned() {
   esac
 }
 
+# 「実装できるか」ではなく、Issue の受入基準を完了するために実GPUサーバーが必要か。
 requires_server() {
   case "$1" in
-    19|26|27|28|30|32|33|34|35|36|37|43) return 0 ;;
+    19|26|27|28|30|32|33|34|37|43) return 0 ;;
     *) return 1 ;;
   esac
 }
 
+# Issue の受入基準を完了するために XIAO + DS18B20×5 + AM2320 が必要か。
 requires_sensor_module() {
   case "$1" in
     11|12|13|14|15|19|26|33|37) return 0 ;;
@@ -229,7 +231,7 @@ for line in Path(map_path).read_text().splitlines():
 text = Path(body_path).read_text()
 text = re.sub(
     r"#(\d+)\b",
-    lambda m: f"#{mapping.get(int(m.group(1)), int(m.group(1)))}",
+    lambda m: f"#{mapping.get(int(m.group(1)), int(m.group(1))}",
     text,
 )
 source = f"> Source spec: `issues/{filename}` (logical #{spec_id})\n\n"
