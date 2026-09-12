@@ -5,8 +5,10 @@ Claude Code は `CLAUDE.md` から本ファイルを参照します（内容を�
 
 ## プロジェクト
 
-GPUサーバーの温湿度監視 + ローカルLLM運用アシスタント。
-仕様は `docs/requirements.md`、ハードウェア指摘は `docs/spec-review.md`。
+GPUサーバーの温湿度・内部Telemetry監視 + 3系統Fan制御 + ローカルLLM運用アシスタント。
+制御対象は Front / Rear / Top の3系統で、内部制御単位は PWM ではなく `demand = 0.0..1.0`。
+制御アーキテクチャは **Supervisor + Learned MPC + Reactive Guard + Critical Safety** を採用する。
+仕様は `docs/requirements.md`、ハードウェア指摘は `docs/spec-review.md`、確定済みの設計変更は `docs/decisions/` を参照する。
 
 ## コマンド
 
@@ -44,24 +46,71 @@ API の設定は環境変数（`COLDAISLE_DB` / `COLDAISLE_METRICS` / `COLDAISLE
 
 ## 絶対に守るルール
 
-1. **LLMに書き込み・実行権限を与えない。** AIレイヤのツールは読み取り専用のみ。
-   `subprocess` / `eval` / 任意SQL を呼ぶツールを追加しない。
-2. **ファン制御・シャットダウン等のアクチュエーションを実装しない。** v1のスコープ外。
-   もし必要と判断したら、実装せず Issue を立てて人間に確認する。
-3. **シリアルポートを開くのは ingest daemon だけ。** API層・UI層・AI層から
+1. **LLMに書き込み・実行・アクチュエーション権限を与えない。** LLMレイヤのツールは読み取り専用のみ。
+   `subprocess` / `eval` / 任意SQL を呼ぶツールを追加しない。LLMからFan DemandやPWMを直接変更しない。
+2. **Fan制御は定義済みControl Pipelineを必ず通す。** Learned MPC / Supervisor が出せるのは `requested_demand` まで。
+   `Reactive Guard` と `Critical Safety` を迂回してPWM・hwmonへ書き込む経路を作らない。
+3. **Critical SafetyはMLから独立させる。** 絶対温度上限、最低安全Demand、CPU cooling floor、tach stall、
+   telemetry loss、deadman、emergency Max、Manual safety override は決定論的に実装する。
+4. **学習不足・未知状態を通常状態として扱わない。** Model Confidence / OOD 判定を持ち、低信頼時は
+   Baseline / Fallback Controllerへ退避する。ML停止・optimizer timeout・モデル読込失敗でも安全運転を継続する。
+5. **Supervisor + Learned MPC + Reactive Guard + Critical Safety の役割を混ぜない。**
+   - Supervisor: 数分〜長期の運転戦略・目的関数重み・Workload Regime
+   - Learned MPC: 数十秒〜数分の未来予測とDemand最適化
+   - Reactive Guard: 数秒の急変への即応floor / ceiling
+   - Critical Safety: 即時の安全制約・最終裁定
+6. **シリアルポートを開くのは ingest daemon だけ。** API層・UI層・AI層・control層から
    `serial.Serial(...)` を呼ぶコードを書かない。
-4. **実機がなくてもテストが通ること。** 実機必須のテストには `@pytest.mark.hardware` を付ける。
-   CIは `-k "not hardware"` で走る。
-5. **生の時系列をLLMのプロンプトに直接入れない。** 必ず集計してから渡す（FR-504）。
-6. 閾値・ピン番号・保持期間などの定数をコードにハードコードしない。
+7. **実機がなくてもテストが通ること。** 実機必須のテストには `@pytest.mark.hardware` を付ける。
+   CIは `-k "not hardware"` で走る。Control系も Mock / Replay / simulated backend で検証できること。
+8. **生の時系列をLLMのプロンプトに直接入れない。** 必ず集計してから渡す（FR-504）。
+   ただし制御用MLモデルは時系列Windowを直接扱ってよい。LLMと制御MLを混同しない。
+9. 閾値・ピン番号・保持期間・Safety floor・Ramp・目的関数重みなどの定数をコードにハードコードしない。
    `config/*.yaml` または環境変数へ。
-7. **実機の個体識別子をコミットしない。** 本リポジトリは public で、
+10. **実機の個体識別子をコミットしない。** 本リポジトリは public で、
    一度 push した情報は履歴に残る。例に使うのは明らかな仮の値だけ。
    - IPアドレス: `127.0.0.1` / `0.0.0.0` / 文書用の予約範囲（RFC 5737）
    - DS18B20 の ROM: `28FF…` で始まる値（実物の2バイト目が `FF` になることはまず無い）
    - MACアドレス・ホスト名・実行環境の絶対パスは書かない
 
    `tests/test_repo_hygiene.py` が CI で走査する（決定記録 0021）。
+
+## 制御アーキテクチャの固定前提
+
+```text
+Telemetry
+  ↓
+State Estimator / Workload Regime
+  ↓
+Supervisor（初期はRulePolicyをactive、RLPolicyはshadow可）
+  ↓
+Learned Thermal Model + Learned MPC
+  ↓
+Model Confidence / OOD Gate
+  ↓
+Requested Demand (Front / Rear / Top)
+  ↓
+Reactive Guard
+  ↓
+Critical Safety
+  ↓
+Effective Demand
+  ↓
+Fan Hardware Mapping
+  ↓
+PWM
+```
+
+- Front / Rear / Top は3系統独立制御。ただし推定実効風量とAir Balanceを共有して協調する。
+- AIO Pump は通常制御対象外。BIOS / safety設定で高い安全側の固定運用を基本とする。
+- 初期学習中でもアーキテクチャは完成形を使うが、制御権は段階的に解放する。
+  Shadow → authority制限 → full authority の順とし、低Confidence時はFallbackへ退避する。
+- Supervisorは「負荷があと何時間続くか」を断定しない。観測履歴から `IDLE / TRANSIENT_* / SUSTAINED_* / COOLDOWN / UNKNOWN`
+  等のWorkload Regimeを推定する。外部のexpected duration等はhint/priorとしてのみ扱い、Telemetryを優先する。
+- RL Supervisorを最終形とするが、学習が不十分な期間は同じInterfaceでRulePolicyをactiveにできること。
+- NoiseはThermal Modelと分離する。初期はZone別の近似Penaltyでもよいが、RPM→dBAの単純比例を真値扱いしない。
+  将来は独立したAcoustic Model / 実測SPL・周波数特性を追加できる設計にする。
+- GPU AI ServiceがCompute Modeで停止しても制御は継続しなければならない。制御系はGPU AI Serviceに依存させない。
 
 ## コード規約
 
@@ -96,9 +145,8 @@ API の設定は環境変数（`COLDAISLE_DB` / `COLDAISLE_METRICS` / `COLDAISLE
 | 仕様が曖昧、設計判断を含む | Claude |
 | セキュリティ・安全系（ルールエンジン、閾値、制御） | Claude |
 
-**現時点では GPU 機が未到着のため、ローカルLLMが物理的に使えません。**
-暫定的に Claude Code を使いますが、これは選択ではなく制約です。
-GPU 到着後はローカルを第一候補に切り替えます。
+ローカルLLM / Claude Code の担当分けは実測の成功率とやり直し回数で見直します。
+安全系・制御系の設計変更は、実装担当モデルに関係なく人間レビューを必須とします。
 
 ### 記録のお願い
 
@@ -175,12 +223,21 @@ src/coldaisle/
   calibrate.py# 合成の起点: 較正オフセットの算出（確認を経由する）。#13
   store/      # L1: SQLite、ロールアップ、CSVエクスポート
   api/        # L2: FastAPI、WebSocket
-  rules/      # L2: ルールエンジン（決定論的。AI非依存）
+  rules/      # L2: アラート用ルールエンジン（決定論的。LLM非依存）
+  control/    # Fan制御。Supervisor / MPC / Guard / Safety / Fallback / hardware mapping
+    supervisor/ # RulePolicy / RLPolicy / Workload Regime
+    model/      # Learned Thermal Model、Confidence / OOD
+    mpc/        # Optimizer / horizon制御
+    reactive/   # 急変に対する決定論的Guard
+    safety/     # Critical Safety。ML非依存・最終裁定
+    fallback/   # Baseline / degraded運転
+    hardware/   # Demand→PWM/RPM/flow mapping、mock backendを含む
+    acoustic/   # 独立Acoustic Cost Model（初期は近似、将来実測対応）
   notify/     # L2: 通知（Slack / LINE / stdout）。秘匿情報は .env
-  ai/         # L3: LLM Provider抽象、ツール、プロンプト。準備は docs/llm-setup.md
+  ai/         # L3: LLM Provider抽象、ツール、プロンプト。制御権限を持たない
   web/        # L4: 静的アセット
 firmware/     # ESP32-S3 Arduino スケッチ。**コンパイルは人の手**（#11 / 決定記録 0022 §2.9）
-config/       # rules.yaml, calibration.json, coldaisle.toml
+config/       # rules.yaml, calibration.json, coldaisle.toml, fan-policy.yaml, fan-hardware.yaml, safety.yaml
 memory/       # 運用メモリ（いまの閾値・較正値）。`coldaisle-memory` が更新案を出す
 docs/         # 要件定義、仕様レビュー、ADR
 tests/
