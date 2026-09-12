@@ -282,6 +282,17 @@ class EffectiveZoneDemand(_Frozen):
             raise ValueError(
                 "effective が Guard の floor を下回っている（floor は ceiling に勝つ）"
             )
+        # requested から下げられる項は Guard の ceiling だけ。ほかの項（floor・下げる速さの
+        # 制限・Max）は上げる向きにしか働かない（0028 §2.4）
+        lowest = (
+            self.requested
+            if self.guard_ceiling is None
+            else min(self.requested, self.guard_ceiling)
+        )
+        if self.effective < lowest:
+            raise ValueError("effective が requested / ceiling より下げられている")
+        if self.effective > self.requested and self.bound_by is BoundBy.GUARD_CEILING:
+            raise ValueError("ceiling は requested を上げない")
 
         determined_by: dict[BoundBy, float | None] = {
             BoundBy.SAFETY_FLOOR: self.safety_floor,
@@ -329,7 +340,13 @@ class ControlState(_Frozen):
 
     operating_mode: OperatingMode
     authority_stage: AuthorityStage
-    active_controller: ControllerKind
+    active_controller: ControllerKind | None
+    """requested を作った制御器。
+
+    `MANUAL` / `CALIBRATION` では人や測定計画が requested を作るので None（0028 §2.5 (a)）。
+    `MAX` は AUTO の経路に重ねる override なので、下で動く制御器を記録する
+    （MAX を抜けたときに戻る先を追える）。
+    """
     safety_state: SafetyState
     fallback_active: bool
     fallback_reason: Reason | None = None
@@ -341,8 +358,13 @@ class ControlState(_Frozen):
 
     @model_validator(mode="after")
     def _ml_is_used_only_when_allowed(self) -> Self:
+        set_by_people = self.operating_mode in {OperatingMode.MANUAL, OperatingMode.CALIBRATION}
+        if set_by_people != (self.active_controller is None):
+            raise ValueError("active_controller を持たないのは MANUAL / CALIBRATION のときだけ")
         if self.fallback_active != (self.active_controller is ControllerKind.FALLBACK):
             raise ValueError("fallback_active と active_controller が食い違っている")
+        if self.fallback_reason is not None and not self.fallback_active:
+            raise ValueError("Fallback でない tick に fallback_reason を付けない")
 
         ml_could_run = (
             self.operating_mode is OperatingMode.AUTO
@@ -358,9 +380,26 @@ class ControlState(_Frozen):
                 or self.model_ood is None
             ):
                 raise ValueError("ML を使った tick には model_version / confidence / ood が要る")
+            if self.model_ood:
+                raise ValueError("OOD のモデルに制御させない（0028 §2.5 (c)）")
         elif ml_could_run and self.fallback_reason is None:
             raise ValueError("ML を使えたはずなのに Fallback にした理由が無い")
         return self
+
+
+EMERGENCY_FAULTS: frozenset[FaultCode] = frozenset(
+    {FaultCode.CONFIG_INVALID, FaultCode.FALLBACK_EXCEPTION, FaultCode.GUARD_EXCEPTION}
+)
+"""起きたら無条件に `EMERGENCY` にする故障（設定不正・決定論的な層の例外。0028 §2.7）。"""
+
+TOP_EMERGENCY_FAULTS: frozenset[FaultCode] = frozenset(
+    {FaultCode.TACH_STALL, FaultCode.WRITE_FAILURE, FaultCode.READBACK_MISMATCH}
+)
+"""Top で起きたら無条件に `EMERGENCY` にする故障。Top は CPU の冷却を担う（0028 §2.7）。
+
+回数で決まる対応（overrun の連続、Front / Rear の書き込み失敗の繰り返し）は
+Critical Safety（#78）が数えるので、ここでは検査しない。
+"""
 
 
 class ControlTick(_Frozen):
@@ -373,20 +412,51 @@ class ControlTick(_Frozen):
     state: ControlState
     zones: PerZone[ZoneRecord]
     faults: tuple[Fault, ...] = ()
+    """いま有効な故障。
+
+    **解消しても `fault_clear_hold_ms` の間は残す。** その間は状態を安全側に保つため
+    （0028 §2.5 (d)）、残さないと hold 中の `EMERGENCY` を原因の無い記録にしてしまう。
+    """
 
     @model_validator(mode="after")
     def _state_matches_zones_and_faults(self) -> Self:
-        all_max = self.state.safety_state in {SafetyState.STARTUP, SafetyState.EMERGENCY} or (
-            self.state.operating_mode is OperatingMode.MAX
+        state = self.state
+        all_max = state.safety_state in {SafetyState.STARTUP, SafetyState.EMERGENCY} or (
+            state.operating_mode is OperatingMode.MAX
         )
-        records = (self.zones.front, self.zones.rear, self.zones.top)
-        if all_max and not all(record.demand.forced_max for record in records):
+        if all_max and not all(self.zones.get(zone).demand.forced_max for zone in Zone):
             raise ValueError("STARTUP / EMERGENCY / MAX モードでは、すべての zone が Max")
 
-        if self.state.safety_state is SafetyState.NORMAL and self.faults:
+        if state.safety_state is SafetyState.NORMAL and self.faults:
             raise ValueError("NORMAL なのに fault がある")
-        if self.state.safety_state in {SafetyState.DEGRADED, SafetyState.EMERGENCY} and not (
-            self.faults
-        ):
-            raise ValueError(f"{self.state.safety_state.value} の原因（fault）が無い")
+        if state.safety_state in {SafetyState.DEGRADED, SafetyState.EMERGENCY} and not self.faults:
+            raise ValueError(f"{state.safety_state.value} の原因（fault）が無い")
+
+        for fault in self.faults:
+            self._check_fault_response(fault)
+
+        for zone in Zone:
+            demand = self.zones.get(zone).demand
+            if demand.guard_ceiling is None:
+                continue
+            if state.operating_mode is not OperatingMode.AUTO:
+                raise ValueError("Guard の ceiling を掛けるのは AUTO だけ（0028 §2.4）")
+            if demand.bound_by is BoundBy.REQUESTED and demand.requested > demand.guard_ceiling:
+                raise ValueError(f"{zone.value}: AUTO なのに Guard の ceiling を掛けていない")
         return self
+
+    def _check_fault_response(self, fault: Fault) -> None:
+        """0028 §2.7 の無条件の対応を満たしているか。"""
+        emergency = fault.code in EMERGENCY_FAULTS or (
+            fault.zone is Zone.TOP and fault.code in TOP_EMERGENCY_FAULTS
+        )
+        if emergency and self.state.safety_state is not SafetyState.EMERGENCY:
+            raise ValueError(f"{fault.code.value} は EMERGENCY にする（0028 §2.7）")
+        if (
+            fault.code is FaultCode.TACH_STALL
+            and fault.zone is not None
+            and not self.zones.get(fault.zone).demand.forced_max
+        ):
+            raise ValueError(f"tach stall の {fault.zone.value} は Max にする（再始動を試みる）")
+        if fault.code is FaultCode.CPU_TELEMETRY_STALE and not self.zones.top.demand.forced_max:
+            raise ValueError("CPU 温度が stale なら Top は Max にする（0028 §2.7）")

@@ -8,7 +8,9 @@ Fan Demand を変えられるのは、定義済みの Control Pipeline を通っ
 
 from coldaisle.control.schema import (
     BOUND_BY_PRECEDENCE,
+    EMERGENCY_FAULTS,
     SCHEMA_VERSION,
+    TOP_EMERGENCY_FAULTS,
     ZONE_FAULTS,
     AuthorityStage,
     BoundBy,
@@ -35,7 +37,9 @@ from coldaisle.control.schema import (
 
 __all__ = [
     "BOUND_BY_PRECEDENCE",
+    "EMERGENCY_FAULTS",
     "SCHEMA_VERSION",
+    "TOP_EMERGENCY_FAULTS",
     "ZONE_FAULTS",
     "AuthorityStage",
     "BoundBy",

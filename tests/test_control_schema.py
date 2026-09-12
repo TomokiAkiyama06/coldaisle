@@ -369,8 +369,8 @@ def test_fallback_in_shadow_needs_no_reason():
     "overrides",
     [
         {"authority_stage": AuthorityStage.SHADOW},
-        {"operating_mode": OperatingMode.MANUAL},
         {"safety_state": SafetyState.DEGRADED},
+        {"operating_mode": OperatingMode.MAX},
     ],
 )
 def test_ml_cannot_be_active_outside_its_allowed_conditions(overrides):
@@ -408,7 +408,97 @@ def test_fallback_active_cannot_contradict_the_active_controller():
         fallback_state(fallback_active=False)
 
 
+def test_an_out_of_distribution_model_cannot_stay_in_control():
+    """**学習不足・未知状態を通常状態として扱わない**（AGENTS.md ルール4 / 0028 §2.5 (c)）。"""
+    learned = {
+        "operating_mode": OperatingMode.AUTO,
+        "authority_stage": AuthorityStage.LIMITED,
+        "safety_state": SafetyState.NORMAL,
+        "active_controller": ControllerKind.LEARNED_MPC,
+        "fallback_active": False,
+        "model_version": "thermal-v1",
+        "model_confidence": 0.9,
+    }
+    with pytest.raises(ValidationError, match="OOD"):
+        ControlState(**learned, model_ood=True)
+    assert ControlState(**learned, model_ood=False).active_controller is ControllerKind.LEARNED_MPC
+
+
+@pytest.mark.parametrize("mode", [OperatingMode.MANUAL, OperatingMode.CALIBRATION])
+def test_people_set_the_request_in_manual_and_calibration(mode):
+    """requested を作るのは人や測定計画。**Fallback が動いたことにしない。**"""
+    state = fallback_state(operating_mode=mode, active_controller=None, fallback_active=False)
+    assert state.active_controller is None
+    assert not state.fallback_active
+    with pytest.raises(ValidationError, match="active_controller"):
+        fallback_state(operating_mode=mode)
+
+
+def test_auto_always_names_its_controller():
+    with pytest.raises(ValidationError, match="active_controller"):
+        fallback_state(active_controller=None, fallback_active=False)
+
+
+def test_a_fallback_reason_belongs_only_to_fallback():
+    with pytest.raises(ValidationError, match="fallback_reason"):
+        fallback_state(
+            operating_mode=OperatingMode.MANUAL,
+            active_controller=None,
+            fallback_active=False,
+            fallback_reason=REASON,
+        )
+
+
+# ---------------------------------------- requested を下げられるのは ceiling だけ
+
+
+def test_only_the_guard_ceiling_can_lower_the_request():
+    with pytest.raises(ValidationError, match="下げられている"):
+        EffectiveZoneDemand(
+            requested=0.8,
+            effective=0.5,
+            bound_by=BoundBy.SAFETY_FLOOR,
+            safety_floor=0.5,
+            forced_max=False,
+            reasons=(REASON,),
+        )
+    # ceiling で 0.6 まで下げたなら、それより低い floor（0.5）には下がらない
+    with pytest.raises(ValidationError, match="下げられている"):
+        EffectiveZoneDemand(
+            requested=0.8,
+            effective=0.5,
+            bound_by=BoundBy.SAFETY_FLOOR,
+            safety_floor=0.5,
+            forced_max=False,
+            guard_ceiling=0.6,
+            reasons=(REASON,),
+        )
+
+
+def test_a_ceiling_never_raises_the_request():
+    with pytest.raises(ValidationError, match="上げない"):
+        EffectiveZoneDemand(
+            requested=0.3,
+            effective=0.6,
+            bound_by=BoundBy.GUARD_CEILING,
+            safety_floor=0.2,
+            forced_max=False,
+            guard_ceiling=0.6,
+            reasons=(REASON,),
+        )
+
+
 # ---------------------------------------------------------------- 1 tick の記録
+
+
+def tick(demand: EffectiveZoneDemand, faults=(), **state_overrides) -> ControlTick:
+    return ControlTick(
+        tick_id=1,
+        ts_ms=NOW_MS,
+        state=fallback_state(**state_overrides),
+        zones=zones(demand),
+        faults=faults,
+    )
 
 
 @pytest.mark.parametrize(
@@ -420,38 +510,129 @@ def test_fallback_active_cannot_contradict_the_active_controller():
 )
 def test_all_zones_are_max_when_the_state_says_so(overrides):
     with pytest.raises(ValidationError, match="すべての zone が Max"):
-        ControlTick(
-            tick_id=1, ts_ms=NOW_MS, state=fallback_state(**overrides), zones=zones(passthrough())
-        )
-    tick = ControlTick(
-        tick_id=1, ts_ms=NOW_MS, state=fallback_state(**overrides), zones=zones(forced())
-    )
-    assert tick.zones.get(Zone.FRONT).demand.effective == 1.0
+        tick(passthrough(), **overrides)
+    assert tick(forced(), **overrides).zones.get(Zone.FRONT).demand.effective == 1.0
 
 
 def test_emergency_needs_a_cause_and_all_zones_at_max():
-    state = fallback_state(safety_state=SafetyState.EMERGENCY)
     with pytest.raises(ValidationError, match="fault"):
-        ControlTick(tick_id=1, ts_ms=NOW_MS, state=state, zones=zones(forced()))
-    tick = ControlTick(
-        tick_id=1,
-        ts_ms=NOW_MS,
-        state=state,
-        zones=zones(forced()),
+        tick(forced(), safety_state=SafetyState.EMERGENCY)
+    recorded = tick(
+        forced(),
         faults=(Fault(code=FaultCode.TACH_STALL, zone=Zone.TOP),),
+        safety_state=SafetyState.EMERGENCY,
     )
-    assert tick.faults[0].zone is Zone.TOP
+    assert recorded.faults[0].zone is Zone.TOP
 
 
 def test_normal_cannot_carry_faults():
     with pytest.raises(ValidationError, match="NORMAL"):
-        ControlTick(
-            tick_id=1,
-            ts_ms=NOW_MS,
-            state=fallback_state(),
-            zones=zones(passthrough()),
-            faults=(Fault(code=FaultCode.TICK_OVERRUN),),
+        tick(passthrough(), faults=(Fault(code=FaultCode.TICK_OVERRUN),))
+
+
+def test_auto_must_apply_the_guard_ceiling():
+    """AUTO で ceiling を無視した記録を通さない（0028 §2.4）。"""
+    ignored = EffectiveZoneDemand(
+        requested=0.8,
+        effective=0.8,
+        bound_by=BoundBy.REQUESTED,
+        safety_floor=0.2,
+        forced_max=False,
+        guard_ceiling=0.5,
+    )
+    with pytest.raises(ValidationError, match="ceiling を掛けていない"):
+        tick(ignored)
+    applied = EffectiveZoneDemand(
+        requested=0.8,
+        effective=0.5,
+        bound_by=BoundBy.GUARD_CEILING,
+        safety_floor=0.2,
+        forced_max=False,
+        guard_ceiling=0.5,
+        reasons=(Reason(code="hunting_suppression"),),
+    )
+    assert tick(applied).zones.front.demand.effective == 0.5
+
+
+def test_the_guard_ceiling_is_not_applied_to_values_people_set():
+    """ceiling はハンチング抑制のためのもので、人が指定した値は下げない（0028 §2.4）。"""
+    manual = {
+        "operating_mode": OperatingMode.MANUAL,
+        "active_controller": None,
+        "fallback_active": False,
+    }
+    lowered = EffectiveZoneDemand(
+        requested=0.8,
+        effective=0.5,
+        bound_by=BoundBy.GUARD_CEILING,
+        safety_floor=0.2,
+        forced_max=False,
+        guard_ceiling=0.5,
+        reasons=(REASON,),
+    )
+    with pytest.raises(ValidationError, match="AUTO だけ"):
+        tick(lowered, **manual)
+    assert tick(passthrough(0.8), **manual).zones.top.demand.effective == 0.8
+
+
+@pytest.mark.parametrize(
+    "fault",
+    [
+        Fault(code=FaultCode.TACH_STALL, zone=Zone.TOP),
+        Fault(code=FaultCode.WRITE_FAILURE, zone=Zone.TOP),
+        Fault(code=FaultCode.READBACK_MISMATCH, zone=Zone.TOP),
+        Fault(code=FaultCode.FALLBACK_EXCEPTION),
+        Fault(code=FaultCode.GUARD_EXCEPTION),
+        Fault(code=FaultCode.CONFIG_INVALID),
+    ],
+    ids=lambda fault: f"{fault.code.value}-{fault.zone}",
+)
+def test_unconditional_emergency_faults_cannot_be_recorded_as_degraded(fault):
+    """0028 §2.7 で `EMERGENCY` と決めた故障。Top は CPU の冷却を担う。"""
+    with pytest.raises(ValidationError, match="EMERGENCY"):
+        tick(forced(), faults=(fault,), safety_state=SafetyState.DEGRADED)
+    recorded = tick(forced(), faults=(fault,), safety_state=SafetyState.EMERGENCY)
+    assert recorded.state.safety_state is SafetyState.EMERGENCY
+
+
+def test_a_front_or_rear_stall_can_stay_degraded():
+    front_at_max = PerZone[ZoneRecord](
+        front=record(forced()), rear=record(passthrough()), top=record(passthrough())
+    )
+    recorded = ControlTick(
+        tick_id=1,
+        ts_ms=NOW_MS,
+        state=fallback_state(safety_state=SafetyState.DEGRADED),
+        zones=front_at_max,
+        faults=(Fault(code=FaultCode.TACH_STALL, zone=Zone.FRONT),),
+    )
+    assert recorded.state.safety_state is SafetyState.DEGRADED
+
+
+def test_a_stalled_fan_is_driven_to_max():
+    with pytest.raises(ValidationError, match="tach stall"):
+        tick(
+            passthrough(),
+            faults=(Fault(code=FaultCode.TACH_STALL, zone=Zone.REAR),),
+            safety_state=SafetyState.DEGRADED,
         )
+
+
+def test_stale_cpu_temperature_drives_top_to_max():
+    faults = (Fault(code=FaultCode.CPU_TELEMETRY_STALE),)
+    with pytest.raises(ValidationError, match="CPU 温度"):
+        tick(passthrough(), faults=faults, safety_state=SafetyState.DEGRADED)
+    top_at_max = PerZone[ZoneRecord](
+        front=record(passthrough()), rear=record(passthrough()), top=record(forced())
+    )
+    recorded = ControlTick(
+        tick_id=1,
+        ts_ms=NOW_MS,
+        state=fallback_state(safety_state=SafetyState.DEGRADED),
+        zones=top_at_max,
+        faults=faults,
+    )
+    assert recorded.zones.top.demand.forced_max
 
 
 # ---------------------------------------------------------------- 互換性（#82 の保存データ）
