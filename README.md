@@ -1,219 +1,164 @@
 # coldaisle
 
-GPUサーバーの**温度監視・時系列ログ・安全なファン制御**を行うローカル運用ツールです。
+GPUサーバーの温湿度・内部Telemetry監視 + 3系統Fan制御 + ローカルLLM（Qwen3.8-27B）による運用アシスタント。
 
-XIAO ESP32-S3 + 外付け温度センサー、NVML、lm-sensors / hwmon を同じタイムラインへ統合し、
-「どこが熱いか」「ケース換気が足りているか」「ファン制御が効いているか」を判断できるようにします。
+> リポジトリ名は変更可能です。`grep -rl coldaisle . | xargs sed -i '' 's/coldaisle/<新名称>/g'`（macOS）で一括置換できます。
 
-## v1 の目的
+> **2026-09-12 設計更新**: Personal AI Workspace との統合に加え、Fan control / ML control の方針を反映しました。
+> 本システムは独立アプリではなく **Workspace の Core Service** です。
+> 境界の定義は [`docs/api-contract.md`](docs/api-contract.md) を参照してください。
 
-v1 の主目的は次の4点です。
+## これは何か
 
-1. 外気・吸気・GPU周辺・排気・12V-2x6周辺温度を継続監視する
-2. GPU / CPU / Fan RPM / PWM など内部Telemetryと合わせてSQLiteへ記録する
-3. Web UIで現在値・履歴・温度差・センサー異常を確認する
-4. **Front / Rear / Top の3系統を独立制御し、通常はFront + Rearで換気、必要時だけTopへケース排気要求を上乗せする**
+XIAO ESP32-S3 に接続した DS18B20 ×5 と AM2320、ASUS T_SENSOR、GPU / CPU / Board Telemetryを使い、
+GPUサーバー周辺の空気・発熱・Fan状態を時系列で記録し、監視・異常検知・冷却最適化を行います。
 
-AI / LLM、Personal AI Workspace、Slack / LINE、日次AIレポート等は既存実装・将来拡張として残しますが、
-**v1の冷却制御を完成させるための必須要件ではありません。**
+- 単一のデーモンがUSBシリアルを占有し、SQLiteへ時系列を蓄積
+- NVML / lm-sensors / hwmon 等から GPU / CPU / Board / Fan Telemetry を取得
+- Front / Rear / Top を3系統独立の `demand = 0.0..1.0` で制御し、推定実効風量とAir Balanceで協調
+- **Supervisor + Learned MPC + Reactive Guard + Critical Safety** で冷却制御
+- 決定論的なルールエンジンが異常を検知し、Slack / LINE へ通知
+- ローカルLLMが履歴の自然言語問い合わせ・異常説明・日次レポートを担当
 
-## 現在の実機構成
+外付け温度センサーにより、マザーボード内蔵センサーだけでは分からない「排気の再循環」「室温上昇」
+「GPU吸排気温度差」「ケース吸排気温度差」なども評価します。
 
-### 外付けセンサーモジュール
+## 設計上の柱
 
-- Seeed XIAO ESP32-S3
-- DS18B20 ×5
-  - Front Intake
-  - GPU Intake
-  - GPU Exhaust
-  - Top Exhaust
-  - Rear Exhaust
-- AM2320 ×1
-  - Room Temperature
-  - Room Humidity
-- ASUS `T_SENSOR`
-  - 10kΩ NTCを12V-2x6コネクタ外装付近へ設置
+### 1. LLMと制御MLを分離する
 
-固定BOMそのものは履歴化せず、DS18B20の **ROM ID → 設置位置**、較正値、配置変更、プローブ交換を管理します。
-
-### Fan topology
-
-v1では最初から3系統を独立制御します。
-
-- **Front Intake zone:** Noctua NF-A12x25 G2 ×3
-- **Rear Exhaust zone:** Antec FLUX 純正Rear Fan ×1
-- **Top / CPU Radiator zone:** Cooler Master MasterLiquid Atmos II 360
-- **AIO Pump:** BIOS / 固定安全設定で管理し、coldaisleからは制御しない
-
-RearはFrontのHubから分離し、別のPWM headerへ接続する前提です。
-Front / Rear / Topはそれぞれ別の `pwmX` / `fanX_input` として識別・制御します。
-
-## Fan control policy
-
-### Zone 1 — Front Intake
-
-Frontは主吸気です。GPU powerをfeed-forwardとして使い、GPU Intake / Front Intake / GPU温度などをfeedbackとして必要な吸気量を決めます。
-
-### Zone 2 — Rear Exhaust
-
-Rearは主排気です。Frontとは別PWMで制御し、Frontを上げた際にRearだけを追加で上げることも可能にします。
-
-これにより、Front 3基の吸気能力に対してRear 1基の排気が不足する場合でも、すぐTopへ頼らずRear側で先に調整できます。
-
-### Zone 3 — Top / CPU Radiator
-
-TopもcoldaisleがPWMを管理します。ただし役割は2つあります。
-
-1. CPU AIOの冷却
-2. Front + Rearだけでは不足した場合のケース補助排気
-
-したがってTopの最終要求値は概念上、次で決めます。
+LLMは従来どおり**読み取り専用・提案のみ**で、Fan制御権限を持ちません。
+一方、Learned MPC / RL Supervisor は制御専用MLとして利用しますが、出力できるのは `requested_demand` までです。
 
 ```text
-top_demand = max(cpu_cooling_demand, case_aux_exhaust_demand, safety_floor)
+Telemetry
+  ↓
+State Estimator / Workload Regime
+  ↓
+Supervisor
+  ↓
+Learned Thermal Model + Learned MPC
+  ↓
+Model Confidence / OOD Gate
+  ↓
+Requested Demand (Front / Rear / Top)
+  ↓
+Reactive Guard
+  ↓
+Critical Safety
+  ↓
+Effective Demand
+  ↓
+Fan Hardware Mapping
+  ↓
+PWM
 ```
 
-通常時の `case_aux_exhaust_demand` は低く保ち、Front + Rearで熱を捌き切れない状態が一定時間続いた場合だけ上げます。
-CPU温度 / CPU telemetryが取得不能になった場合は、Topを安全側の高回転へ移行します。
+| 層 | 主な時間軸 | 責務 | ML |
+|---|---:|---|---|
+| Critical Safety | 即時 | 絶対温度、最低安全Demand、CPU cooling floor、tach stall、telemetry loss、deadman、emergency Max | なし |
+| Reactive Guard | 数秒 | 急激な温度上昇・Power上昇に対する即応floor / ceiling | 原則なし |
+| Learned MPC | 数十秒〜数分 | 将来温度・Airflowを予測してFront / Rear / Top Demandを最適化 | あり |
+| Supervisor | 数分〜長期 | Workload Regime、運転戦略、MPC目的関数重みの調整 | 最終形はRL |
+| Advisory LLM | 任意 | 説明・診断・要約・チャット | あり、読み取り専用 |
 
-## 風量設計
+**MLが安全装置になることはありません。** Reactive Guard と Critical Safety が最終裁定し、
+Learned MPC / RL Supervisor からPWMやhwmonへ直接書き込む経路は作りません。
 
-**ファン径 × RPMから絶対CFMを直接算出して制御しません。**
+### 2. 学習不足・未知状態でも安全に動く
 
-同じ径・RPMでも羽根形状、静圧特性、フィルター、ケース抵抗、ラジエーターで実流量が変わるためです。
+アーキテクチャは最初から完成形で実装しますが、学習モデルへ最初から全制御権は与えません。
 
-v1では次の3段階で風量モデルを作ります。
+```text
+Shadow Mode
+  ↓
+制限付きAuthority
+  ↓
+Full Authority
+```
 
-### 1. Manufacturer prior
+Model Confidence / OOD（Out-of-Distribution）判定を持ち、低信頼・未学習領域・optimizer timeout・モデル停止時は
+Baseline / Fallback Controllerへ退避します。
 
-メーカー公称の最大RPM・最大風量・静圧を基礎データとして保持します。
+Supervisorは「このGPU負荷があと何時間続くか」をTelemetryだけから断定しません。
+観測履歴から `IDLE / TRANSIENT_* / SUSTAINED_* / COOLDOWN / UNKNOWN` 等の **Workload Regime** を推定します。
+ジョブ側からexpected duration等を受け取れる場合も、それはhint/priorとして扱い、実Telemetryを優先します。
 
-既知の例:
-- Front NF-A12x25 G2: 1基あたり最大1800 RPM / 63.15 CFM / 3.14 mmH2O
-- Top Atmos II 360: 360mmユニット公称最大2500 RPM / 190 CFM / 3.61 mmH2O
-- Rear FLUX純正Fan: 実機型番・最大RPMを確認し、公開仕様が無ければ実測中心で扱う
+RL Supervisorを最終形としますが、学習初期は同じSupervisor Interface上で `RulePolicy` をactive、`RLPolicy` をshadowにできます。
 
-これらは**free-air / メーカー条件の参考値**であり、ケース装着時の実風量とはみなしません。
+### 3. 騒音はThermal Modelと分離する
 
-### 2. Per-zone characterization
+騒音は単純な `RPM → dBA` 換算を真値として扱いません。
+Fan径・Fan枚数・ラジエーター・フィルター・ケース共振・beat・周波数特性などで、同じ音圧でも感じ方が変わるためです。
 
-Front / Rear / Topを個別にPWM sweepし、次を実測します。
+- 初期: Front / Rear / Topごとの非線形Acoustic Penalty（実測または主観評価）
+- 将来: 固定位置のSPL / マイク測定、周波数スペクトル、annoyance scoreを利用可能
 
-- PWM duty → RPM
-- 起動PWM
-- 最低安定PWM / RPM
-- 最大RPM
-- 応答時間
-- tachのばらつき
+Thermal Modelと独立した **Acoustic Cost Model** としてMPCの目的関数へ入力します。
 
-この結果から各zoneに0〜1の **Airflow Index** を作ります。Airflow Indexは相対指標であり、実測CFMを名乗りません。
+### 4. Core Service は GPU AI Service に依存しない
 
-### 3. Installed thermal effectiveness
+Kaggle・研究がGPUを使う「Compute Mode」では、LLM用GPU AI Serviceを完全停止してVRAMを解放できます。
+しかし **Compute ModeこそGPUが最も熱くなる時間帯** です。
 
-固定したGPU / CPU熱負荷で各zoneを個別に変化させ、以下への影響を測ります。
-
-- `d.case_delta`
-- GPU Intake / GPU Exhaust
-- Rear Exhaust / Top Exhaust
-- GPU core / hotspot
-- CPU temperature
-
-これにより「Rearを10%上げる方が効くのか、Topを10%上げる方が効くのか」のような**実機上の冷却効果**をモデル化します。
-
-最終的な制御は、公称CFMではなく **Airflow Index + 実際の熱応答**を優先します。
-
-## 主な制御入力
-
-- GPU Power
-- GPU core / hotspot
-- CPU temperature / CPU power
-- Front Intake
-- GPU Intake / GPU Exhaust
-- Rear Exhaust / Top Exhaust
-- `d.case_delta = rear_exhaust - front_intake`
-- T_SENSOR
-- Front / Rear / TopそれぞれのPWM / RPM / Airflow Index
-
-## 安全設計
-
-冷却制御にAI / LLMを入れません。
-
-| 層 | 責務 | AI |
+| | Core Service（取り込み・監視・安全・制御・API・UI） | GPU AI Service（説明・チャット） |
 |---|---|---|
-| Safety-0 | GPUサーマル保護 / CPUハードウェア保護 | なし |
-| Safety-1 | `coldaisle-fand`、CPU/GPU制御則、ヒステリシス、deadman、tach監視 | **なし** |
-| Advisory | 説明・分析・将来のAI連携 | 読み取り専用のみ |
+| AI Mode | 稼働 | 稼働 |
+| **Compute Mode** | **稼働** | **完全停止可能** |
 
-Fan daemonはGUIやAI層から分離します。
+Telemetry、Reactive Guard、Critical Safety、Fallback、Fan controlはGPU AI Service停止中も継続します。
+制御モデルもGPU AI Serviceを必須依存にしません。
 
-重大なtelemetry / control faultでは、制御可能な正常Fanを安全側へ上げます。特にTopをアプリ管理するため、CPU温度取得不能・daemon再起動・PWM write失敗・Top tach異常の安全動作を実機で必ず検証します。
+### 5. ハードウェア非依存で開発する
 
-AIO Pumpはcoldaisleから制御せず、独立した安全設定を維持します。
-
-## ハードウェアなしでの開発
-
-データソースは `serial` / `mock` / `replay` で抽象化しています。
-そのためダッシュボード、ルール、API、fan control state machineの多くは実機なしで開発・テストできます。
+データソースを `serial` / `mock` / `replay` で抽象化し、Fan backendも実機 / simulated backendに分離します。
+実機がなくてもControl Pipeline、Shadow Mode、Safety、UIの大部分を開発・テストできる構成にします。
 
 ```bash
 uv run coldaisle-daemon --source mock --scenario ramp
 ```
 
-ただし、次は実機確認が必須です。
-
-- DS18B20 / AM2320の較正・長時間運転
-- Front / Rear / Topそれぞれの物理Fan Header対応
-- PWM最低値・起動値・tach特性
-- PWM→RPM characterization
-- CPU冷却要求を含むTop制御の安全性
-- Front / Rear / Topの実機上の冷却効果
-- daemon停止 / 再起動時のFan挙動
-
-## 主な派生値
-
-```text
-d.intake_rise = air.front_intake - air.room
-d.gpu_preheat = air.gpu_intake - air.front_intake
-d.gpu_delta   = air.gpu_exhaust - air.gpu_intake
-d.case_delta  = air.rear_exhaust - air.front_intake
-```
-
-`d.case_delta`だけで風量を決めず、GPU Intake、CPU/GPU温度、Fan状態と組み合わせて評価します。
+実機でしか確定できないのは、PWM→RPM、minimum stable PWM、Effective Airflow、Thermal Effectiveness、
+Safetyの最終閾値などのキャラクタライズ値です。
 
 ## ドキュメント
 
 | ファイル | 内容 |
 |---|---|
-| [`docs/requirements.md`](docs/requirements.md) | 詳細要件・既存設計 |
-| [`docs/api-contract.md`](docs/api-contract.md) | Core API契約 |
-| [`docs/spec-review.md`](docs/spec-review.md) | ハードウェア仕様レビュー |
-| [`docs/decisions/`](docs/decisions/) | ADR / 決定記録 |
-| [`ISSUES.md`](ISSUES.md) | Issue一覧・実機要件・着手順 |
-| [`issues/`](issues/) | 個別Issue仕様の正本 |
-| [`AGENTS.md`](AGENTS.md) | AIコーディングエージェント向け指示 |
+| [`docs/requirements.md`](docs/requirements.md) | 要件定義書。スコープ、ユースケース、アーキテクチャ、機能/非機能要件、フェーズ計画 |
+| [`docs/api-contract.md`](docs/api-contract.md) | **Personal AI Workspace との境界。**この契約だけが2リポジトリの接点 |
+| [`docs/spec-review.md`](docs/spec-review.md) | ハードウェア仕様のレビューと改訂提案 |
+| [`docs/decisions/`](docs/decisions/) | 決定記録。追記のみ。変更は新しい記録を作り `Supersedes` で参照する |
+| [`ISSUES.md`](ISSUES.md) | Issue一覧と着手順 |
+| [`issues/`](issues/) | GitHub登録用の個別Issue（フロントマター付き） |
+| [`prompts/claude-code.md`](prompts/claude-code.md) | **Claude Code 向けプロンプト集。**キックオフ、Issue実装テンプレート、レビュー用 |
+| [`AGENTS.md`](AGENTS.md) | AIコーディングエージェント向け指示の正本（Claude Code / Codex 共通） |
 
-## 現在の優先順
+## Issueの一括登録
 
-```text
-ESP32 / センサー実機確認
-  ↓
-Ubuntu本番化
-  ↓
-NVML / lm-sensors / hwmon / T_SENSOR / 3-zone Fan Telemetry
-  ↓
-3-zone Fan characterization / Airflow Model
-  ↓
-実測ベースライン
-  ↓
-Fan control safety ADR
-  ↓
-Front / Rear / Top 独立制御
+```bash
+gh auth login
+DRY_RUN=1 ./scripts/create_issues.sh   # 確認
+./scripts/create_issues.sh             # 実行
 ```
 
-## 将来拡張
+ラベルとマイルストーンも自動作成されます。
+登録後、本文中の `#番号` を実際のIssue番号に合わせて修正してください。
 
-既存のLLM Provider、read-only tools、レポート、Workspace連携等は削除しませんが、
-冷却制御v1とは分離して扱います。AI層がFan PWMを書き換える経路は作りません。
+## 最初にやること
+
+1. [`docs/requirements.md`](docs/requirements.md) を読み、設計の前提を把握する
+2. [`docs/decisions/`](docs/decisions/) で確定済みの方針を確認する
+3. `AGENTS.md` のControl PipelineとSafety境界を確認する
+4. Mock / Replay / simulated fan backendを使い、実機なしでControl Pipelineをテスト可能にする
+5. 実機ではAirflow CharacterizationとBaseline測定を先に行い、その後Dataset蓄積 → Thermal Model → Shadow Modeへ進む
+
+## スコープ外
+
+本リポジトリは**ソフトウェアとファームウェアのみ**を扱います。
+物理的な組み立て、部品調達、設置作業そのものは管理対象外です。
+ただし、それらがFan control、Safety、Airflow characterization、Acoustic Model等のソフトウェア要件に影響する場合は、
+`docs/spec-review.md` や設計文書・Issueの技術的前提として記述します。
 
 ## ライセンス
 

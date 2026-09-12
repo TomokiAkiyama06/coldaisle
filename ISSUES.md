@@ -1,196 +1,157 @@
 # Issue 一覧
 
-`issues/` 配下の個別ファイルが仕様の正本です。GitHub Issue への同期は `scripts/create_issues.sh` を使用します。
+`issues/` 配下の個別ファイルが本体です。GitHubへの一括登録は `scripts/create_issues.sh` を使用してください。
 
-GitHub の Issue / Pull Request は同じ番号空間を共有するため、**この文書の #番号は論理番号**です。同期スクリプトが本文中の依存関係を実際の GitHub Issue 番号へ変換します。
+各Issueのファイル冒頭にYAMLフロントマターで title / labels / milestone を記載しています。
 
-## v1 のスコープ
-
-現在のv1は **GPUサーバーの温度監視・ログ・安全なファン制御** に集中します。
-
-必須の完成範囲:
-- XIAO ESP32-S3 + DS18B20×5 + AM2320 の安定取得
-- NVML / lm-sensors / hwmon / T_SENSOR / Fan Telemetry
-- SQLite時系列保存とWeb UI
-- ルールベースの温度・センサー異常検知
-- **Front / Rear / Topを3系統で独立制御**
-- Front / Rearの通常換気と、必要時だけTopへケース排気要求を上乗せする制御
-- TopのCPU cooling demandをアプリ側で安全に管理
-- zone別PWM→RPM characterizationとAirflow Model
-- 冷却制御のフェイルセーフ
-
-AI / LLM、Personal AI Workspace、vLLM、Compute Modeアドバイザリ、Slack / LINE、日次AIレポート等は削除しませんが、**v1冷却制御の完成条件からは外し、将来拡張として扱います。**
-
-## 実機要件ラベル
-
-Issue の「コードを書けるか」ではなく、**受入基準を完了するために何が必要か**で分類します。
-
-| ラベル | 意味 |
-|---|---|
-| `requires:server` | GPUサーバー実機が完了条件に必要 |
-| `requires:sensor-module` | XIAO ESP32-S3 + DS18B20×5 + AM2320 の自作センサーモジュールが必要 |
-| `hardware-independent` | 上記実機なしで受入基準まで完了可能 |
-| `needs-decision` | 実装前に設計判断が必要 |
-| `blocked-by-design` | 安全設計/ADR承認まで実装開始しない |
-
-`blocked-by-hardware` は旧ラベルです。サーバー到着待ちとセンサーモジュール待ちを区別できないため、新規には使いません。
+> 本リポジトリの Issue は**ソフトウェアとファームウェアの実装**に限定します。
+> 部品調達・組み立て・設置作業は管理対象外です。
 
 ## マイルストーン
 
-| マイルストーン | 内容 |
-|---|---|
-| M0 基盤 | リポジトリ・CI・規約・スキーマ |
-| M1 データ基盤 | Mock/Replay・Store・API |
-| M2 実機接続 | ESP32ファーム・SerialSource・較正・Soak |
-| M3 UI | 開発用ダッシュボード |
-| M4 アラート | ルール・通知・実測閾値 |
-| M5 AI | Provider・read-only tools・レポート（将来拡張） |
-| M6 移行 | Ubuntu / systemd / udev |
-| M7 拡張 | 内部Telemetry・Airflow Model・ファン制御・その他統合 |
+| マイルストーン | 内容 | 実機依存 |
+|---|---|---|
+| M0 基盤 | リポジトリ・CI・規約・スキーマ確定 | なし |
+| M1 データ基盤 | Mock/Replayソース・ストレージ・API | **なし** |
+| M2 実機接続 | 本番ファーム・SerialSource・較正・長時間試験 | ESP32のみ |
+| M3 UI | ダッシュボード | なし |
+| M4 アラート | ルールエンジン・通知 | 閾値確定のみGPU必要 |
+| M5 AI | Provider抽象・ツール・レポート | なし |
+| M6 移行 | Ubuntu / systemd / udev / vLLM | **GPU機必要** |
+| M7 拡張 | 内部センサー統合・Workspace統合 | **GPU機必要** |
+| M8 Fan Control | 3系統Fan制御・Safety・Airflow Model | **GPU機必要** |
+| M9 Learned Control | Thermal Model・Learned MPC・Supervisor・Shadow/評価 | 学習は実機ログ必要 |
+| M10 Acoustic | Noise/Acoustic Cost Model・実測拡張 | 初期近似は不要、実測は実機推奨 |
 
 ## 一覧
 
-状態: ✅ completed / ⏳ open / ⛔ superseded
+| # | タイトル | マイルストーン | ラベル |
+|---:|---|---|---|
+| 1 | [リポジトリ雛形とツールチェーン整備](issues/01-repo-scaffold.md) | M0 基盤 | infra, priority:must |
+| 2 | [GitHub Actions CI（実機なしで完走すること）](issues/02-ci-pipeline.md) | M0 基盤 | infra, priority:must |
+| 3 | [ADR: メトリクス命名規約とDBスキーマ（ロング形式）の確定](issues/03-adr-metric-naming.md) | M0 基盤 | design, priority:must |
+| 4 | [ADR: デバイス出力JSONスキーマ v1 の確定](issues/04-adr-device-json-schema.md) | M0 基盤 | design, firmware, priority:must |
+| 5 | [コアデータモデルとSQLiteストレージ層](issues/05-core-models-storage.md) | M1 データ基盤 | core, priority:must |
+| 6 | [MockSource: 合成データ生成器（実機なし開発の要）](issues/06-mock-source.md) | M1 データ基盤 | core, priority:must |
+| 7 | [ReplaySource: 既存CSVのリプレイ](issues/07-replay-source.md) | M1 データ基盤 | core, priority:should |
+| 8 | [ingest daemon 骨格（シリアルポートの単一所有者）](issues/08-ingest-daemon.md) | M1 データ基盤 | core, priority:must |
+| 9 | [読み取り専用REST API + WebSocket](issues/09-read-api.md) | M1 データ基盤 | api, priority:must |
+| 10 | [1分ロールアップとリテンション](issues/10-rollup-retention.md) | M1 データ基盤 | core, priority:must |
+| 11 | [ESP32本番ファームウェア（JSON v1 / 非同期変換 / WDT）](issues/11-firmware-json-v1.md) | M2 実機接続 | firmware, priority:must |
+| 12 | [SerialSource（自動検出・再接続・非JSON行の無視）](issues/12-serial-source.md) | M2 実機接続 | core, priority:must |
+| 13 | [センサー較正手順と calibration.json](issues/13-calibration.md) | M2 実機接続 | hardware, priority:must |
+| 14 | [DS18B20 ROM IDによるプローブ同定と入れ替わり検出](issues/14-probe-identity.md) | M2 実機接続 | core, priority:should |
+| 15 | [24時間連続運転テストと欠測率の測定](issues/15-soak-test.md) | M2 実機接続 | qa, priority:must |
+| 17 | [Webダッシュボード刷新（API経由化）](issues/17-dashboard.md) | M3 UI | ui, priority:must |
+| 18 | [ルールエンジン（閾値・継続時間・ヒステリシス）](issues/18-rule-engine.md) | M4 アラート | core, priority:must, safety |
+| 19 | [ベースライン測定と閾値の確定](issues/19-baseline-measurement.md) | M4 アラート | qa, priority:must, blocked-by-hardware |
+| 20 | [Slack / LINE 通知](issues/20-notifications.md) | M4 アラート | integration, priority:should |
+| 21 | [LLM Provider抽象（Ollama ⇄ vLLM 切替）](issues/21-llm-provider.md) | M5 AI | ai, priority:must |
+| 22 | [ツール定義と実行ランタイム（読み取り専用）](issues/22-llm-tools.md) | M5 AI | ai, priority:must, safety |
+| 23 | [チャットUI](issues/23-chat-ui.md) | M5 AI | ai, ui, priority:must |
+| 24 | [アラート発生時のAI要約生成](issues/24-alert-explainer.md) | M5 AI | ai, priority:should |
+| 25 | [日次レポート生成](issues/25-daily-report.md) | M5 AI | ai, priority:should |
+| 26 | [Ubuntu移行（systemd / udev / 固定デバイス名）](issues/26-ubuntu-migration.md) | M6 移行 | infra, priority:must, blocked-by-hardware |
+| 27 | [vLLM + Qwen3.8-27B の停止可能な GPU AI Service 構成](issues/27-vllm-deployment.md) | M6 移行 | ai, infra, priority:must, blocked-by-hardware |
+| 28 | [GPU / CPU / VRM 内部センサーの統合](issues/28-internal-sensors.md) | M7 拡張 | core, priority:could, blocked-by-hardware |
+| 29 | [Personal AI Workspace の Server Health 統合](issues/29-workspace-integration.md) | M7 拡張 | integration, priority:could |
+| 30 | [【設計のみ】ファン制御の安全設計検討](issues/30-fan-control-design.md) | M7 拡張 | design, safety, priority:could |
+| 31 | [ADR: ローカルモデルの役割分担を確定する](issues/31-adr-model-roles.md) **← 決定記録 0005 で解決。クローズ可** | M0 基盤 | design, ai, priority:must |
+| 32 | [Core Service と GPU AI Service の分離（Compute Mode対応）](issues/32-core-gpu-service-split.md) | M6 移行 | infra, priority:must, safety |
+| 33 | [Docker Compose による3層分離](issues/33-docker-compose-layers.md) | M6 移行 | infra, priority:should, blocked-by-hardware |
+| 34 | [NVML / lm-sensors の統合（v1スコープへ格上げ）](issues/34-internal-sensors-nvml.md) | M7 拡張 | core, priority:must, blocked-by-hardware |
+| 35 | [Server Health API（Workspace連携の単一窓口）](issues/35-server-health-api.md) | M7 拡張 | api, integration, priority:must |
+| 36 | [GPU Mode イベントの記録とタイムライン注釈](issues/36-gpu-mode-events.md) | M7 拡張 | core, integration, priority:should |
+| 37 | [Compute Mode 切替時の環境条件アドバイザリ](issues/37-compute-mode-advisory.md) | M7 拡張 | core, safety, priority:should |
+| 38 | [アラート説明を Evidence 形式へ（#24 を全面改訂）](issues/38-evidence-based-alerts.md) | M5 AI | ai, priority:must |
+| 39 | [ハードウェア故障疑い時の Claude エスカレーション](issues/39-claude-escalation.md) | M5 AI | ai, safety, priority:should |
+| 40 | [Markdown Decision Memory への自動記録](issues/40-memory-writer.md) | M5 AI | integration, priority:should |
+| 41 | [秘匿情報の混入防止（.env / トークン / 環境固有情報）](issues/41-public-repo-hygiene.md) | M0 基盤 | infra, priority:must, safety |
+| 42 | [時刻ソースの注入（Clock 抽象）](issues/42-clock-injection.md) | M1 データ基盤 | core, priority:must |
 
-| 論理# | 状態 | タイトル | 実機要件 |
-|---:|:---:|---|---|
-| 1 | ✅ | [リポジトリ雛形とツールチェーン整備](issues/01-repo-scaffold.md) | なし |
-| 2 | ✅ | [GitHub Actions CI](issues/02-ci-pipeline.md) | なし |
-| 3 | ✅ | [ADR: メトリクス命名規約とDBスキーマ](issues/03-adr-metric-naming.md) | なし |
-| 4 | ✅ | [ADR: デバイス出力JSONスキーマ v1](issues/04-adr-device-json-schema.md) | なし |
-| 5 | ✅ | [コアデータモデルとSQLiteストレージ層](issues/05-core-models-storage.md) | なし |
-| 6 | ✅ | [MockSource](issues/06-mock-source.md) | なし |
-| 7 | ✅ | [ReplaySource](issues/07-replay-source.md) | なし |
-| 8 | ✅ | [ingest daemon](issues/08-ingest-daemon.md) | なし |
-| 9 | ✅ | [読み取り専用REST API + WebSocket](issues/09-read-api.md) | なし |
-| 10 | ✅ | [1分ロールアップとリテンション](issues/10-rollup-retention.md) | なし |
-| 11 | ⏳ | [ESP32本番ファームウェア](issues/11-firmware-json-v1.md) | センサーモジュール |
-| 12 | ⏳ | [SerialSource](issues/12-serial-source.md) | センサーモジュール |
-| 13 | ⏳ | [センサー較正](issues/13-calibration.md) | センサーモジュール |
-| 14 | ✅ | [DS18B20 ROM IDプローブ同定](issues/14-probe-identity.md) | センサーモジュール |
-| 15 | ⏳ | [24時間連続運転テスト](issues/15-soak-test.md) | センサーモジュール |
-| 17 | ⏳ | [Webダッシュボード刷新](issues/17-dashboard.md) | なし |
-| 18 | ✅ | [ルールエンジン](issues/18-rule-engine.md) | なし |
-| 19 | ⏳ | [ベースライン測定と閾値確定](issues/19-baseline-measurement.md) | サーバー + センサーモジュール |
-| 20 | ⏳ | [Slack / LINE通知](issues/20-notifications.md) | なし / 将来拡張 |
-| 21 | ✅ | [LLM Provider抽象](issues/21-llm-provider.md) | なし / 将来拡張 |
-| 22 | ✅ | [read-only LLM tools](issues/22-llm-tools.md) | なし / 将来拡張 |
-| 23 | ✅ | [チャットUI / Workspace向けツール公開](issues/23-chat-ui.md) | なし / 将来拡張 |
-| 24 | ⛔ | [旧AIアラート要約](issues/24-alert-explainer.md) | #38へ置換 |
-| 25 | ✅ | [日次レポート生成](issues/25-daily-report.md) | なし / 将来拡張 |
-| 26 | ⏳ | [Ubuntu移行](issues/26-ubuntu-migration.md) | サーバー + センサーモジュール |
-| 27 | ⏳ | [vLLM GPU AI Service](issues/27-vllm-deployment.md) | サーバー / 将来拡張 |
-| 28 | ⛔ | [旧内部センサー統合](issues/28-internal-sensors.md) | #34へ統合 |
-| 29 | ⏳ | [Personal AI Workspace Server Health統合](issues/29-workspace-integration.md) | なし / 将来拡張 |
-| 30 | ⏳ | [3系統Fan制御の安全設計](issues/30-fan-control-design.md) | サーバー |
-| 31 | ⛔ | [旧モデル役割分担ADR](issues/31-adr-model-roles.md) | 決定記録0005で解決 |
-| 32 | ⏳ | [Core / GPU AI Service分離](issues/32-core-gpu-service-split.md) | サーバー / 将来拡張 |
-| 33 | ⏳ | [Docker Compose 3層分離](issues/33-docker-compose-layers.md) | サーバー + センサーモジュール / 将来拡張 |
-| 34 | ⏳ | [NVML / lm-sensors / hwmon内部Telemetry](issues/34-internal-sensors-nvml.md) | サーバー |
-| 35 | ⏳ | [Server Health API](issues/35-server-health-api.md) | なし / 将来拡張 |
-| 36 | ⏳ | [GPU Modeイベント](issues/36-gpu-mode-events.md) | なし / 将来拡張 / `needs-decision` |
-| 37 | ⏳ | [Compute Mode環境条件アドバイザリ](issues/37-compute-mode-advisory.md) | サーバー + センサーモジュール / 将来拡張 |
-| 38 | ✅ | [Evidence形式アラート説明](issues/38-evidence-based-alerts.md) | なし / 将来拡張 |
-| 39 | ✅ | [Claudeエスカレーション](issues/39-claude-escalation.md) | なし / 将来拡張 |
-| 40 | ✅ | [Markdown Decision Memory](issues/40-memory-writer.md) | なし / 補助機能 |
-| 41 | ✅ | [秘匿情報の混入防止](issues/41-public-repo-hygiene.md) | なし |
-| 42 | ✅ | [Clock抽象](issues/42-clock-injection.md) | なし |
-| 43 | ⏳ | [3系統Fan制御daemon（Front / Rear独立・Top CPU優先）](issues/43-fan-control-daemon.md) | サーバー / `blocked-by-design` |
-| 44 | ⏳ | [3系統Fanの風量キャラクタライズとAirflow Model](issues/44-airflow-characterization.md) | サーバー + センサーモジュール |
-
-## v1 の推奨着手順
+## 着手順の推奨
 
 ```text
-センサーモジュール実機確認:
-  #11 → #12 → #13 → #15
-
-Web UI:
-  #17
-
-Ubuntu本番化:
-  #26
-
-内部Telemetry:
-  #34
-    ├─ NVML: GPU power / core / hotspot
-    ├─ CPU temperature / power
-    ├─ T_SENSOR（12V-2x6外装）
-    ├─ Front RPM / PWM
-    ├─ Rear RPM / PWM
-    └─ Top RPM / PWM
-
-Airflow characterization:
-  #44
-    ├─ Front / Rear / Top PWM→RPM
-    ├─ 起動 / 最低安定PWM
-    ├─ Airflow Index
-    └─ zone別 thermal effectiveness
-
-実測ベースライン:
-  #19
-    ├─ Front sweep
-    ├─ Rear sweep
-    ├─ Front / Rear combination
-    ├─ Top CPU cooling demand
-    └─ Top case auxiliary effect
-
-ファン制御:
-  #30（安全ADR）
-    ↓ 人間レビュー承認
-  #43（coldaisle-fand）
-    ├─ Front Intake独立制御
-    ├─ Rear Exhaust独立制御
-    └─ Top = max(CPU cooling, case auxiliary, safety floor)
+最初に:      #41                       秘匿情報の混入防止（初回コミット前）
+基盤:        #1 → #2 → #3 → #4 → #31   規約・CI・スキーマ・モデル役割
+★最優先:     #5 → #6                   MockSourceが完成した瞬間に全レイヤが解禁される
+データ基盤:  #8 → #9 → #10 → #17
+ファーム:    #11 → #12 → #13 → #14 → #15
+アラート:    #18 → #20                 （#19の閾値確定は実機到着後）
+AI:          #21 → #22 → #24 → #25
+実機到着後:  #26 → #27 → #19 → #34 → #35 → #36 → #37
 ```
 
-AI / Workspace / Compute Mode系は、上記v1が安定した後に再開します。
+**#6 (MockSource) が全体のクリティカルパスです。** これが完成すると、
+GPU機どころか ESP32 すら接続せずに #8〜#25 のすべてが開発・テストできます。
 
-## Fan topology と制御境界
 
-現在の前提:
+## 追加予定: Fan / ML Control（GitHub番号は採番時に確定）
 
-- Front Intake: **Noctua NF-A12x25 G2 ×3**
-- Rear Exhaust: **Antec FLUX 純正Rear Fan ×1**
-- Top Exhaust / CPU Radiator: **Cooler Master MasterLiquid Atmos II 360**
-- AIO Pump: **coldaisle制御外**
+> このファイルの既存番号と、現行GitHub上のIssue番号に差がある可能性があるため、
+> 以下は**番号を固定せず**slug / milestone / labelsで定義します。登録前にGitHub側の最新番号と照合してください。
 
-制御原則:
+| slug | タイトル | マイルストーン | ラベル | 実機依存 |
+|---|---|---|---|---|
+| `fan-control-architecture` | ADR: Supervisor + Learned MPC + Reactive Guard + Critical Safety の責務境界 | M8 | design, safety, priority:must | なし |
+| `fan-demand-schema` | Front / Rear / Top Requested/Effective Demand とreason schema | M8 | core, design, priority:must | なし |
+| `fan-hardware-backend` | Demand→PWM/RPM/Flow hardware profile + simulated backend | M8 | core, hardware, priority:must | 実測curveのみ必要 |
+| `critical-safety-layer` | Critical Safety Layer（floor/stall/telemetry loss/deadman/emergency Max） | M8 | core, safety, priority:must | 閾値確定に実機 |
+| `reactive-guard` | dT/dt / Power急変へのReactive Guard | M8 | core, safety, priority:must | 最終閾値に実機 |
+| `airflow-characterization` | Front / Rear / Top PWM→RPM・Effective Flow・Thermal Effectiveness測定 | M8 | qa, hardware, priority:must, blocked-by-hardware | **必要** |
+| `air-balance-model` | q_front / q_rear / q_top とAir Balance推定 | M8 | core, ml, priority:must | calibrationに実機 |
+| `control-logging` | requested/effective/override/reason/confidence/OODを含む制御ログ | M8 | core, priority:must | なし |
+| `thermal-dataset` | Thermal Model用Dataset schema・Window・horizon・データ収集 | M9 | ml, qa, priority:must | **必要** |
+| `thermal-model` | Multi-horizon / multi-output Learned Thermal Model | M9 | ml, priority:must | 学習ログ必要 |
+| `model-confidence-ood` | Model Confidence / OOD検知とAuthority制限 | M9 | ml, safety, priority:must | 一部実機ログ必要 |
+| `learned-mpc` | Learned MPC optimizer とhard constraints連携 | M9 | ml, core, priority:must | offlineは不要 / rolloutは必要 |
+| `workload-regime` | IDLE / TRANSIENT / SUSTAINED / COOLDOWN / UNKNOWN の推定 | M9 | ml, core, priority:should | 実ログ推奨 |
+| `supervisor-interface` | Supervisor interface + RulePolicy + RLPolicy + ShadowRLPolicy | M9 | ml, design, priority:must | なし |
+| `rl-supervisor` | RL Supervisor学習・目的関数重み/戦略の最適化 | M9 | ml, research, priority:should | learned simulator推奨 |
+| `control-shadow-mode` | MPC/RL Shadow Mode・counterfactual logging | M9 | ml, qa, safety, priority:must | rollout前に必要 |
+| `offline-evaluation` | Baseline vs MPC vs MPC+Guard vs Supervisor+MPC+Guard のoffline比較 | M9 | ml, qa, priority:must | dataset必要 |
+| `authority-rollout` | 0→制限付き→full authority の段階的Production rollout | M9 | safety, qa, priority:must | **必要** |
+| `fallback-controller` | ML停止/OOD/timeout時のBaseline / Fallback Controller | M8 | core, safety, priority:must | なし |
+| `drift-detection` | Thermal/airflow model drift検知と再学習条件 | M9 | ml, qa, priority:should | 長期ログ必要 |
+| `acoustic-cost-model` | Thermalと分離したZone別Acoustic Cost Model | M10 | ml, research, priority:should | 初期近似は不要 |
+| `acoustic-sensor-study` | SPL/マイク・周波数特性・annoyance scoreの実測方式検討 | M10 | design, hardware, research, priority:could | 実機推奨 |
 
-1. Front / Rear / Topを最初から別PWM系統にする
-2. RearはFront Hubから分離する
-3. 通常のケース換気はFront + Rearで管理するが、両者は独立して調整する
-4. TopもアプリがPWM管理する
-5. Topの最終要求は `max(cpu_cooling_demand, case_aux_exhaust_demand, safety_floor)`
-6. case auxiliary demandはFront + Rearだけで不足する場合のみ上げる
-7. CPU telemetry loss時はTopを安全側の高回転へ移行する
-8. AIO Pump / VRM Fanは初期版ではcoldaisleから制御しない
-9. AI/LLMをPWM制御ループへ入れない
-
-## 風量の扱い
-
-**ファン径 × RPMだけで絶対風量を決めない。**
-
-メーカー公称の最大風量・最大RPM・静圧はpriorとして使いますが、ケース前面やラジエーターの抵抗で実風量が変わります。
-
-#44でFront / Rear / Topごとに次を実測します。
+### Control系の推奨着手順
 
 ```text
-PWM -> RPM curve
-startup PWM
-minimum stable PWM / RPM
-measured max RPM
-Airflow Index 0..1
-thermal effectiveness
+設計:        fan-control-architecture
+              ↓
+基盤:        fan-demand-schema → fan-hardware-backend → control-logging
+              ↓
+安全:        critical-safety-layer → fallback-controller → reactive-guard
+              ↓
+実機特性:    airflow-characterization → air-balance-model
+              ↓
+Dataset:     thermal-dataset
+              ↓
+ML Model:    thermal-model → model-confidence-ood
+              ↓
+MPC:         learned-mpc
+              ↓
+Supervisor:  supervisor-interface → workload-regime → rl-supervisor
+              ↓
+評価:        control-shadow-mode → offline-evaluation
+              ↓
+本番:        authority-rollout → drift-detection
+              ↓
+騒音拡張:    acoustic-cost-model → acoustic-sensor-study
 ```
 
-さらに固定負荷でzone別の温度応答を比較し、概念的なresponse matrixを作ります。
+**重要:** アーキテクチャ自体は最初から4層構造で実装する。
+ただし、学習初期は `RulePolicy active + RLPolicy shadow`、Learned MPCもShadow/制限付きAuthorityから開始し、
+Confidence不足・OOD・timeout時はFallbackへ退避する。
 
-```text
-                  GPU Intake   case ΔT   GPU temp   CPU temp
-Front +Δ             ...         ...       ...        ...
-Rear  +Δ             ...         ...       ...        ...
-Top   +Δ             ...         ...       ...        ...
-```
+## ラベル定義
 
-これを使い、「どのFanを追加で回すのが最も効くか」を実機データで判断します。
-正確なCFM実測はv1の前提・受入条件にしません。
+| ラベル | 意味 |
+|---|---|
+| `priority:must` / `should` / `could` | MoSCoW |
+| `blocked-by-hardware` | 実機がないと着手できない |
+| `safety` | 安全性に関わる。人間のレビュー必須 |
+| `infra` `core` `api` `ui` `ai` `ml` `research` `hardware` `firmware` `qa` `design` `integration` | 領域 |
+
