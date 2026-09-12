@@ -1,6 +1,6 @@
 # 0026: Front / Rear / Topを独立Fan zoneとして制御する
 
-- Status: Accepted
+- Status: FINAL
 - Date: 2026-09-11
 - Renumbered: 0021 → 0026（番号の重複を解消。0021 は `0021-public-repo-hygiene` が先に使用していた）
 
