@@ -100,7 +100,7 @@ def test_stale_is_not_decided_here(rules):
 
 
 def test_rules_are_replaceable(rules):
-    """しきい値は設定から差し替える（AGENTS.md ルール6）。"""
+    """しきい値は設定から差し替える（AGENTS.md ルール9）。"""
     strict = rules.model_copy(update={"room_temp_min_c": 20.0, "room_temp_max_c": 28.0})
     assert classify("air.room", 30.0, strict) is Quality.SUSPECT
     assert classify("air.room", 30.0, rules) is Quality.OK
@@ -150,7 +150,7 @@ def test_missing_and_non_finite_apply_to_every_domain(metric, rules):
 
 
 def test_rules_come_from_the_config_file(rules):
-    """`config/quality.yaml` が唯一の情報源（AGENTS.md ルール6）。"""
+    """`config/quality.yaml` が唯一の情報源（AGENTS.md ルール9）。"""
     assert rules.stale_after_ms == 10_000  # 要件 §5.3「10秒以上」
 
 
