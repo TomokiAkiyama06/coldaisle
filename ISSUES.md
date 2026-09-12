@@ -68,6 +68,8 @@
 | 40 | [Markdown Decision Memory への自動記録](issues/40-memory-writer.md) | M5 AI | integration, priority:should |
 | 41 | [秘匿情報の混入防止（.env / トークン / 環境固有情報）](issues/41-public-repo-hygiene.md) | M0 基盤 | infra, priority:must, safety |
 | 42 | [時刻ソースの注入（Clock 抽象）](issues/42-clock-injection.md) | M1 データ基盤 | core, priority:must |
+| 43 | [3系統Fan制御daemon（Front / Rear独立・Top CPU優先）](issues/43-fan-control-daemon.md) | M7 拡張 | core, safety, priority:must |
+| 44 | [3系統Fanの風量キャラクタライズとAirflow Model](issues/44-airflow-characterization.md) | M7 拡張 | design, qa, priority:must |
 
 ## 着手順の推奨
 
@@ -78,7 +80,7 @@
 データ基盤:  #8 → #9 → #10 → #17
 ファーム:    #11 → #12 → #13 → #14 → #15
 アラート:    #18 → #20                 （#19の閾値確定は実機到着後）
-AI:          #21 → #22 → #24 → #25
+AI:          #21 → #22 → #38 → #25
 実機到着後:  #26 → #27 → #19 → #34 → #35 → #36 → #37
 ```
 
@@ -98,7 +100,7 @@ GPU機どころか ESP32 すら接続せずに #8〜#25 のすべてが開発・
 | `fan-hardware-backend` | Demand→PWM/RPM/Flow hardware profile + simulated backend | M8 | core, hardware, priority:must | 実測curveのみ必要 |
 | `critical-safety-layer` | Critical Safety Layer（floor/stall/telemetry loss/deadman/emergency Max） | M8 | core, safety, priority:must | 閾値確定に実機 |
 | `reactive-guard` | dT/dt / Power急変へのReactive Guard | M8 | core, safety, priority:must | 最終閾値に実機 |
-| `airflow-characterization` | Front / Rear / Top PWM→RPM・Effective Flow・Thermal Effectiveness測定 | M8 | qa, hardware, priority:must, blocked-by-hardware | **必要** |
+| #44（既存） | [3系統Fanの風量キャラクタライズとAirflow Model](issues/44-airflow-characterization.md)。**新規に起票しない**（同じ内容の issue が既にある） | M7（issue の記載） | design, qa, priority:must | **必要** |
 | `air-balance-model` | q_front / q_rear / q_top とAir Balance推定 | M8 | core, ml, priority:must | calibrationに実機 |
 | `control-logging` | requested/effective/override/reason/confidence/OODを含む制御ログ | M8 | core, priority:must | なし |
 | `thermal-dataset` | Thermal Model用Dataset schema・Window・horizon・データ収集 | M9 | ml, qa, priority:must | **必要** |
@@ -125,7 +127,7 @@ GPU機どころか ESP32 すら接続せずに #8〜#25 のすべてが開発・
               ↓
 安全:        critical-safety-layer → fallback-controller → reactive-guard
               ↓
-実機特性:    airflow-characterization → air-balance-model
+実機特性:    #44 → air-balance-model
               ↓
 Dataset:     thermal-dataset
               ↓

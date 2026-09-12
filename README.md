@@ -2,7 +2,7 @@
 
 GPUサーバーの温湿度・内部Telemetry監視 + 3系統Fan制御 + ローカルLLM（Qwen3.8-27B）による運用アシスタント。
 
-> リポジトリ名は変更可能です。`grep -rl coldaisle . | xargs sed -i '' 's/coldaisle/<新名称>/g'`（macOS）で一括置換できます。
+> リポジトリ名は変更できますが、`coldaisle` は Python パッケージ名でもあります（`src/coldaisle/`、`pyproject.toml` のエントリポイント、import）。**`grep | sed` による一括置換はしないでください。** `.git` や `.venv` まで書き換わり、ディレクトリ名とも食い違って起動できなくなります。改名はディレクトリの移動・`pyproject.toml`・import をまとめて行います。
 
 > **2026-09-12 設計更新**: Personal AI Workspace との統合に加え、Fan control / ML control の方針を反映しました。
 > 本システムは独立アプリではなく **Workspace の Core Service** です。
