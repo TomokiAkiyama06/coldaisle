@@ -1,7 +1,7 @@
 ---
 title: "3系統Fanの風量キャラクタライズとAirflow Model"
 labels: design, qa, priority:must
-milestone: "M7 拡張"
+milestone: "M8 Fan Control"
 ---
 
 ## 背景

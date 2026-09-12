@@ -1,7 +1,7 @@
 ---
 title: "【設計のみ】3系統Fan制御の安全設計検討"
 labels: design, safety, priority:must
-milestone: "M7 拡張"
+milestone: "M8 Fan Control"
 ---
 
 ## 背景
