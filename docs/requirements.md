@@ -74,12 +74,13 @@
 | S-10 | **NVML / lm-sensors からのGPU・CPU内部センサー収集**（v1.1→v1へ格上げ） |
 | S-11 | **Server Health API**（Personal AI Workspace のGPUパネルへ供給する単一エンドポイント） |
 | S-12 | **GPU Mode イベントの記録とタイムライン注釈**、Compute Mode切替時の環境条件アドバイザリ |
+| S-13 | **Front / Rear / Top の3系統Fan制御**（Supervisor + Learned MPC + Reactive Guard + Critical Safety。LLMは関与しない。決定記録 0026 / 0027） |
 
 ### 2.2 スコープ外（v1.0では実装しない）
 
 | # | 項目 | 理由 |
 |---|---|---|
-| N-01 | **ファン制御・自動シャットダウン等のアクチュエーション** | 安全系。BIOS Q-Fanを唯一の権威として残す。v2以降で別途安全設計 |
+| N-01 | **自動シャットダウン等のアクチュエーション（ファン制御を除く）** | 安全系。ファン制御は S-13 として v1 に含める（決定記録 0027）。それ以外は v2以降で別途安全設計 |
 | N-02 | **LLMによる任意のコマンド実行・設定変更** | ローカルモデルに高額ハードの制御権を渡さない |
 | N-03 | クラウド送信・外部公開 | ローカル完結。LAN内のみ |
 | N-04 | 複数サーバーのマルチノード監視 | 1台前提。ただしスキーマは `node_id` を予約しておく |
@@ -165,16 +166,17 @@ class Source(Protocol):
 **これが「サーバーが届く前にできること」を最大化する中核。**
 L1〜L4 は Source が何であるかを一切知らない。
 
-#### D-03: AIを安全系に入れない（3層の責務分離）
+#### D-03: AIを安全系に入れない（責務分離）
 
 | 層 | 責務 | AI関与 | 停止しても安全か |
 |---|---|---|---|
 | Safety-0 | BIOS Q-Fan / GPU自身のサーマルスロットリング | なし | — （最終防衛線） |
 | Safety-1 | ルールエンジンによる検知・通知 | **なし** | Yes（通知が止まるだけ） |
+| Control-1 | 3系統Fan制御（Supervisor / Learned MPC → Reactive Guard → Critical Safety） | 制御ML（Supervisor / Learned MPC）のみ。**LLMは不可**。Reactive Guard / Critical Safety は**なし** | Yes（ML停止時は Baseline / Fallback へ退避。制御デーモン自体の停止時の挙動は実機で確認（#43）） |
 | Advisory-2 | LLMによる説明・診断・要約・対話 | あり | Yes（説明が出ないだけ） |
 
 **LLMは一切のアクチュエーションを持たない。** 出力は常に「人間への提案」で終わる。
-将来ファン制御を実装する場合も、制御ロジックは Safety-1 に置き、AIは関与させない。
+ファン制御は Control-1 として実装する（決定記録 0027）。制御ML（Supervisor / Learned MPC）が出せるのは `requested_demand` までで、Reactive Guard と Critical Safety（決定論的・ML非依存）を必ず通る。**LLMと制御MLを混同しない。**
 
 #### D-04: 時系列テーブルはロング形式
 

@@ -96,3 +96,4 @@ docs/decisions/NNNN-<slug>.md      例: 0002-metric-naming.md
 | [0024](0024-calibration.md) | 較正の手順と記録 | Proposed |
 | [0025](0025-probe-identity.md) | プローブの同定 | Proposed |
 | [0026](0026-three-zone-fan-control.md) | Front / Rear / Top を独立Fan zoneとして制御する | FINAL |
+| [0027](0027-fan-control-architecture.md) | Fan 制御アーキテクチャ（Supervisor + Learned MPC + Reactive Guard + Critical Safety） | FINAL |
