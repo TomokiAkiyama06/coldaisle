@@ -146,7 +146,10 @@ for milestone in \
   "M4 アラート" \
   "M5 AI" \
   "M6 移行" \
-  "M7 拡張"; do
+  "M7 拡張" \
+  "M8 Fan Control" \
+  "M9 Learned Control" \
+  "M10 Acoustic"; do
   create_milestone "$milestone"
 done
 

@@ -1,7 +1,7 @@
 ---
 title: "ベースライン測定と閾値の確定"
 labels: qa, priority:must
-milestone: "M4 アラート"
+milestone: "M8 Fan Control"
 ---
 
 ## 背景

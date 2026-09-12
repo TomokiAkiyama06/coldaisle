@@ -1,7 +1,7 @@
 ---
 title: "3系統Fan制御daemon（Front / Rear独立・Top CPU優先）"
 labels: core, safety, priority:must
-milestone: "M7 拡張"
+milestone: "M8 Fan Control"
 ---
 
 ## 背景

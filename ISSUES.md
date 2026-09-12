@@ -44,7 +44,7 @@
 | 15 | [24時間連続運転テストと欠測率の測定](issues/15-soak-test.md) | M2 実機接続 | qa, priority:must |
 | 17 | [Webダッシュボード刷新（API経由化）](issues/17-dashboard.md) | M3 UI | ui, priority:must |
 | 18 | [ルールエンジン（閾値・継続時間・ヒステリシス）](issues/18-rule-engine.md) | M4 アラート | core, priority:must, safety |
-| 19 | [ベースライン測定と閾値の確定](issues/19-baseline-measurement.md) | M4 アラート | qa, priority:must, blocked-by-hardware |
+| 19 | [ベースライン測定と閾値の確定](issues/19-baseline-measurement.md) | M8 Fan Control | qa, priority:must, blocked-by-hardware |
 | 20 | [Slack / LINE 通知](issues/20-notifications.md) | M4 アラート | integration, priority:should |
 | 21 | [LLM Provider抽象（Ollama ⇄ vLLM 切替）](issues/21-llm-provider.md) | M5 AI | ai, priority:must |
 | 22 | [ツール定義と実行ランタイム（読み取り専用）](issues/22-llm-tools.md) | M5 AI | ai, priority:must, safety |
@@ -55,7 +55,7 @@
 | 27 | [vLLM + Qwen3.8-27B の停止可能な GPU AI Service 構成](issues/27-vllm-deployment.md) | M6 移行 | ai, infra, priority:must, blocked-by-hardware |
 | 28 | [GPU / CPU / VRM 内部センサーの統合](issues/28-internal-sensors.md) | M7 拡張 | core, priority:could, blocked-by-hardware |
 | 29 | [Personal AI Workspace の Server Health 統合](issues/29-workspace-integration.md) | M7 拡張 | integration, priority:could |
-| 30 | [【設計のみ】ファン制御の安全設計検討](issues/30-fan-control-design.md) | M7 拡張 | design, safety, priority:could |
+| 30 | [【設計のみ】ファン制御の安全設計検討](issues/30-fan-control-design.md) | M8 Fan Control | design, safety, priority:could |
 | 31 | [ADR: ローカルモデルの役割分担を確定する](issues/31-adr-model-roles.md) **← 決定記録 0005 で解決。クローズ可** | M0 基盤 | design, ai, priority:must |
 | 32 | [Core Service と GPU AI Service の分離（Compute Mode対応）](issues/32-core-gpu-service-split.md) | M6 移行 | infra, priority:must, safety |
 | 33 | [Docker Compose による3層分離](issues/33-docker-compose-layers.md) | M6 移行 | infra, priority:should, blocked-by-hardware |
@@ -68,8 +68,8 @@
 | 40 | [Markdown Decision Memory への自動記録](issues/40-memory-writer.md) | M5 AI | integration, priority:should |
 | 41 | [秘匿情報の混入防止（.env / トークン / 環境固有情報）](issues/41-public-repo-hygiene.md) | M0 基盤 | infra, priority:must, safety |
 | 42 | [時刻ソースの注入（Clock 抽象）](issues/42-clock-injection.md) | M1 データ基盤 | core, priority:must |
-| 43 | [3系統Fan制御daemon（Front / Rear独立・Top CPU優先）](issues/43-fan-control-daemon.md) | M7 拡張 | core, safety, priority:must |
-| 44 | [3系統Fanの風量キャラクタライズとAirflow Model](issues/44-airflow-characterization.md) | M7 拡張 | design, qa, priority:must |
+| 43 | [3系統Fan制御daemon（Front / Rear独立・Top CPU優先）](issues/43-fan-control-daemon.md) | M8 Fan Control | core, safety, priority:must |
+| 44 | [3系統Fanの風量キャラクタライズとAirflow Model](issues/44-airflow-characterization.md) | M8 Fan Control | design, qa, priority:must |
 
 ## 着手順の推奨
 
@@ -100,7 +100,7 @@ GPU機どころか ESP32 すら接続せずに #8〜#25 のすべてが開発・
 | `fan-hardware-backend` | Demand→PWM/RPM/Flow hardware profile + simulated backend | M8 | core, hardware, priority:must | 実測curveのみ必要 |
 | `critical-safety-layer` | Critical Safety Layer（floor/stall/telemetry loss/deadman/emergency Max） | M8 | core, safety, priority:must | 閾値確定に実機 |
 | `reactive-guard` | dT/dt / Power急変へのReactive Guard | M8 | core, safety, priority:must | 最終閾値に実機 |
-| #44（既存） | [3系統Fanの風量キャラクタライズとAirflow Model](issues/44-airflow-characterization.md)。**新規に起票しない**（同じ内容の issue が既にある） | M7（issue の記載） | design, qa, priority:must | **必要** |
+| #44（既存） | [3系統Fanの風量キャラクタライズとAirflow Model](issues/44-airflow-characterization.md)。**新規に起票しない**（同じ内容の issue が既にある） | M8（issue の記載） | design, qa, priority:must | **必要** |
 | `air-balance-model` | q_front / q_rear / q_top とAir Balance推定 | M8 | core, ml, priority:must | calibrationに実機 |
 | `control-logging` | requested/effective/override/reason/confidence/OODを含む制御ログ | M8 | core, priority:must | なし |
 | `thermal-dataset` | Thermal Model用Dataset schema・Window・horizon・データ収集 | M9 | ml, qa, priority:must | **必要** |
