@@ -25,7 +25,7 @@ DS18B20 ±0.5℃、AM2320 ±0.5℃。ΔT判定には最悪±1.0℃の系統誤�
 
 ## 2026-09-10 の実装（決定記録 0024）
 
-- `coldaisle-calibrate` を追加。**DB から読む**（シリアルは開かない。AGENTS.md ルール3）
+- `coldaisle-calibrate` を追加。**DB から読む**（シリアルは開かない。AGENTS.md ルール6）
 - **ばらつきが 2.0℃ を超えたら受け付けない**（本物の温度勾配を焼き付けない）
 - `calibrated_at` / `reference` / `samples` / `revalidate_after_days` を記録に残す
 - 未較正・期限切れはデーモン起動時に警告

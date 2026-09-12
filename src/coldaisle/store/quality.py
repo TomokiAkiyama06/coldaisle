@@ -60,7 +60,7 @@ class QualityRules(BaseModel):
 
     **既定値を持たない。** `config/quality.yaml` が唯一の情報源であり、
     省略した呼び出しが黙って安全側でないしきい値で動くことを防ぐ
-    （AGENTS.md ルール6、決定記録 0004 §2.12）。
+    （AGENTS.md ルール9、決定記録 0004 §2.12）。
     """
 
     model_config = ConfigDict(frozen=True, extra="forbid")

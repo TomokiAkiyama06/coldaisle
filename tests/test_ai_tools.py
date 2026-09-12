@@ -196,7 +196,7 @@ def test_query_series_is_downsampled(tools, store):
 
 
 def test_query_series_aggregates_even_short_windows(tools, store):
-    """**短い期間でも生の測定値を返さない**（AGENTS.md ルール5 / FR-504）。
+    """**短い期間でも生の測定値を返さない**（AGENTS.md ルール8 / FR-504）。
 
     点数の上限とは別の話。200点に切り詰めても、中身が個々の測定値なら
     「生の時系列」のままである。

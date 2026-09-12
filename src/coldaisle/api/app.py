@@ -93,7 +93,7 @@ ToolsFactory = Callable[[SqliteStore], Tools]
 
 @dataclass(frozen=True)
 class Config:
-    """API プロセスの設定。環境変数から作る（AGENTS.md ルール6）。
+    """API プロセスの設定。環境変数から作る（AGENTS.md ルール9）。
 
     `uvicorn coldaisle.api:app` には引数を渡せないため、CLI ではなく環境変数にする。
     """

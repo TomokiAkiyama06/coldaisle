@@ -199,7 +199,7 @@ def _finite_channels(obj: dict[str, Any]) -> dict[str, float | None]:
 class Source(Protocol):
     """デバイス出力の供給元。`serial` / `mock` / `replay` の3実装（FR-101）。
 
-    **シリアルポートを開いてよいのは `SerialSource` だけ**（AGENTS.md ルール3）。
+    **シリアルポートを開いてよいのは `SerialSource` だけ**（AGENTS.md ルール6）。
     後始末が必要な実装は `stream()` の内側（`try` / `finally`）で閉じる。
     呼び出し側に `close()` を強いると、閉じ忘れが取り込み停止として現れる。
     """

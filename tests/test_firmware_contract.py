@@ -161,7 +161,7 @@ def test_the_firmware_readme_repeats_the_reviewed_table():
 
     ピン番号はスケッチに直接書いてある（ファームウェアは `config/*.yaml` を
     読めない）。その代わり、**表と実装の一致を機械が見張る**ことで
-    AGENTS.md ルール6 の意図（唯一の情報源を持つ）を満たす。
+    AGENTS.md ルール9 の意図（唯一の情報源を持つ）を満たす。
     """
     readme = (ROOT / "firmware" / "README.md").read_text(encoding="utf-8")
     in_readme = {

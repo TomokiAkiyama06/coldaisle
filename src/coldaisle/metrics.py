@@ -2,7 +2,7 @@
 
 決定記録 0004 §5 の未決1（置き場所）をここに確定した。
 `config/metrics.yaml` が唯一の情報源で、コードに既定値を持たせない
-（AGENTS.md ルール6）。
+（AGENTS.md ルール9）。
 
 **API（L2）とルールエンジン（L2）の両方が使う。** ルールが HTTP 層を
 import することになるのを避けるため、`clock` や `channels` と同じく

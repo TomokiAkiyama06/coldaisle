@@ -394,7 +394,8 @@ def _weighted(points: Sequence[RollupPoint]) -> float | None:
 
 PREAMBLE = """> この資料は coldaisle が自動生成しました。**送信は行っていません。**
 > 内容を確認したうえで、必要と判断したら人が Claude へ渡してください。
-> coldaisle にファン制御・電源操作の手段はありません（AGENTS.md ルール2）。"""
+> この資料を作っても、ファン制御・電源操作は一切変わりません。
+> 引き上げるかどうかは人が判断します（決定記録 0019）。"""
 
 DERIVED_BASIS = "（派生値のため、1日平均どうしの差から算出）"
 

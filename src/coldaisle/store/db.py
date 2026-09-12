@@ -195,7 +195,7 @@ class SqliteStore:
         busy_timeout_ms: int = 5_000,
     ) -> None:
         # `rules` と `clock` は必須。既定へ黙って落ちると、設定やソースと違う
-        # しきい値・時刻で `stale` が判定される（AGENTS.md ルール6 / #42）。
+        # しきい値・時刻で `stale` が判定される（AGENTS.md ルール9 / #42）。
         # 特に時計は、取り込みが SimulatedClock で保存が実時計、という
         # 組み合わせが静かに成立すると、圧縮再生の結果が説明できなくなる
         self._rules = rules

@@ -1,6 +1,6 @@
 """L0 取り込み: Source 実装（serial / mock / replay）と正規化。
 
-**シリアルポートを開いてよいのはこの層の `SerialSource` だけ**（AGENTS.md ルール3）。
+**シリアルポートを開いてよいのはこの層の `SerialSource` だけ**（AGENTS.md ルール6）。
 API 層・UI 層・AI 層からデバイスを直接触らない。
 
 **この層は上位レイヤを import しない。** 取り込み・保存・ルールを束ねるのは

@@ -38,7 +38,7 @@ DAY_MS = 24 * 60 * 60 * 1_000
 
 
 class RetentionRules(BaseModel):
-    """保持とエクスポートの設定。既定値を持たない（AGENTS.md ルール6）。"""
+    """保持とエクスポートの設定。既定値を持たない（AGENTS.md ルール9）。"""
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 

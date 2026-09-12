@@ -50,7 +50,7 @@ COUNTER_UNIT = "count"
 """この単位を持つメトリクスは**積み上げ**として扱う（`config/metrics.yaml`）。
 
 `sys.queue_drops` のような数え上げに最低/平均/最高を出しても意味がない。
-メトリクス名で分岐しない（AGENTS.md「絶対に守るルール」6）。
+メトリクス名で分岐しない（AGENTS.md「絶対に守るルール」9）。
 """
 
 ALERT_SCAN_LIMIT = 2000

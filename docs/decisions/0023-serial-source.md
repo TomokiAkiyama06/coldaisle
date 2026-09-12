@@ -14,7 +14,7 @@
 
 ## 1. Context
 
-`SerialSource` は**シリアルポートを開いてよい唯一の場所**（AGENTS.md ルール3）。
+`SerialSource` は**シリアルポートを開いてよい唯一の場所**（AGENTS.md ルール6）。
 
 監視のソースとしての難しさは、値ではなく**繋がらない時間**の扱いにある。
 
@@ -108,7 +108,7 @@ json.loads(text, parse_constant=_reject_constant)
 
 ### 2.8 実機の抜き差しは `@pytest.mark.hardware`
 
-CI では回らない（AGENTS.md ルール4）。手元で `uv run pytest -m hardware`。
+CI では回らない（AGENTS.md ルール7）。手元で `uv run pytest -m hardware`。
 
 ---
 
