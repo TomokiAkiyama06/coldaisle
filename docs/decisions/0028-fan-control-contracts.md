@@ -1,7 +1,7 @@
 # 決定記録 0028: Fan 制御の層間契約（入出力・優先順位・状態遷移・周期・故障時の扱い・設定・承認点）
 
 - **種別**: Decision Record
-- **Status**: Proposed
+- **Status**: FINAL（2026-09-13、リポジトリ所有者が承認）
 - **Date**: 2026-09-13
 - **Supersedes**: なし
 - **関連**: [`0027-fan-control-architecture.md`](0027-fan-control-architecture.md) /
