@@ -1,0 +1,68 @@
+{
+  "schema_version": 1,
+  "tick_id": 42,
+  "ts_ms": 1787616000000,
+  "state": {
+    "operating_mode": "auto",
+    "authority_stage": "shadow",
+    "active_controller": "fallback",
+    "safety_state": "normal",
+    "fallback_active": true,
+    "fallback_reason": null,
+    "supervisor_policy": "rule_policy",
+    "model_version": null,
+    "model_confidence": null,
+    "model_ood": null
+  },
+  "zones": {
+    "front": {
+      "controller_reason": {"code": "gpu_power_feedforward", "detail": "GPU 電力に合わせて吸気を上げる"},
+      "demand": {
+        "requested": 0.4,
+        "effective": 0.4,
+        "bound_by": "requested",
+        "safety_floor": 0.2,
+        "forced_max": false,
+        "guard_floor": null,
+        "guard_ceiling": null,
+        "reasons": []
+      },
+      "airflow_index": 0.42,
+      "estimated_flow": null,
+      "hardware": {"pwm_raw": 102, "rpm": 780, "write_ok": true, "readback_ok": true}
+    },
+    "rear": {
+      "controller_reason": {"code": "case_delta_feedback", "detail": ""},
+      "demand": {
+        "requested": 0.3,
+        "effective": 0.35,
+        "bound_by": "safety_floor",
+        "safety_floor": 0.35,
+        "forced_max": false,
+        "guard_floor": null,
+        "guard_ceiling": null,
+        "reasons": [{"code": "zone_min_safe_demand", "detail": ""}]
+      },
+      "airflow_index": null,
+      "estimated_flow": null,
+      "hardware": {"pwm_raw": 89, "rpm": 650, "write_ok": true, "readback_ok": true}
+    },
+    "top": {
+      "controller_reason": {"code": "case_aux_exhaust_idle", "detail": ""},
+      "demand": {
+        "requested": 0.2,
+        "effective": 0.6,
+        "bound_by": "guard_floor",
+        "safety_floor": 0.5,
+        "forced_max": false,
+        "guard_floor": 0.6,
+        "guard_ceiling": null,
+        "reasons": [{"code": "cpu_power_step", "detail": "CPU 電力の急増に先回りする"}]
+      },
+      "airflow_index": null,
+      "estimated_flow": null,
+      "hardware": null
+    }
+  },
+  "faults": []
+}
