@@ -2,7 +2,11 @@
 title: "【設計のみ】3系統Fan制御の安全設計検討"
 labels: design, safety, priority:must
 milestone: "M8 Fan Control"
+moved_to: 61
 ---
+
+> **この定義は GitHub #61 へ移管しました。** M8 以降の Issue は GitHub の本文が正本です（2026-09-13）。
+> 以下は移管前の記録で、更新しません。`scripts/create_issues.sh` は作成・更新しません。
 
 ## 背景
 GPU高負荷時の排熱を安全に制御するため、Front / Rear / Topを最初から別系統として扱う。

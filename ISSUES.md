@@ -1,6 +1,9 @@
 # Issue 一覧
 
-`issues/` 配下の個別ファイルが本体です。GitHubへの一括登録は `scripts/create_issues.sh` を使用してください。
+**M0〜M7 の Issue** は `issues/` 配下の個別ファイルが本体です。GitHubへの一括登録は `scripts/create_issues.sh` を使用してください。
+
+> **M8 以降（Fan / ML 制御）は GitHub の Issue が正本です**（2026-09-13 決定）。一覧は下の「Fan / ML Control」を参照してください。
+> `issues/19` / `30` / `34` / `43` / `44` は GitHub の #50 / #61 / #65 / #74 / #75 へ移管済みで、同期スクリプトは作成・更新しません。
 
 各Issueのファイル冒頭にYAMLフロントマターで title / labels / milestone を記載しています。
 
@@ -44,7 +47,7 @@
 | 15 | [24時間連続運転テストと欠測率の測定](issues/15-soak-test.md) | M2 実機接続 | qa, priority:must |
 | 17 | [Webダッシュボード刷新（API経由化）](issues/17-dashboard.md) | M3 UI | ui, priority:must |
 | 18 | [ルールエンジン（閾値・継続時間・ヒステリシス）](issues/18-rule-engine.md) | M4 アラート | core, priority:must, safety |
-| 19 | [ベースライン測定と閾値の確定](issues/19-baseline-measurement.md) | M8 Fan Control | qa, priority:must, blocked-by-hardware |
+| 19 | [ベースライン測定と閾値の確定](issues/19-baseline-measurement.md) **← GitHub #50 へ移管** | M8 Fan Control | qa, priority:must, blocked-by-hardware |
 | 20 | [Slack / LINE 通知](issues/20-notifications.md) | M4 アラート | integration, priority:should |
 | 21 | [LLM Provider抽象（Ollama ⇄ vLLM 切替）](issues/21-llm-provider.md) | M5 AI | ai, priority:must |
 | 22 | [ツール定義と実行ランタイム（読み取り専用）](issues/22-llm-tools.md) | M5 AI | ai, priority:must, safety |
@@ -55,11 +58,11 @@
 | 27 | [vLLM + Qwen3.8-27B の停止可能な GPU AI Service 構成](issues/27-vllm-deployment.md) | M6 移行 | ai, infra, priority:must, blocked-by-hardware |
 | 28 | [GPU / CPU / VRM 内部センサーの統合](issues/28-internal-sensors.md) | M7 拡張 | core, priority:could, blocked-by-hardware |
 | 29 | [Personal AI Workspace の Server Health 統合](issues/29-workspace-integration.md) | M7 拡張 | integration, priority:could |
-| 30 | [【設計のみ】ファン制御の安全設計検討](issues/30-fan-control-design.md) | M8 Fan Control | design, safety, priority:could |
+| 30 | [【設計のみ】ファン制御の安全設計検討](issues/30-fan-control-design.md) **← GitHub #61 へ移管** | M8 Fan Control | design, safety, priority:could |
 | 31 | [ADR: ローカルモデルの役割分担を確定する](issues/31-adr-model-roles.md) **← 決定記録 0005 で解決。クローズ可** | M0 基盤 | design, ai, priority:must |
 | 32 | [Core Service と GPU AI Service の分離（Compute Mode対応）](issues/32-core-gpu-service-split.md) | M6 移行 | infra, priority:must, safety |
 | 33 | [Docker Compose による3層分離](issues/33-docker-compose-layers.md) | M6 移行 | infra, priority:should, blocked-by-hardware |
-| 34 | [NVML / lm-sensors の統合（v1スコープへ格上げ）](issues/34-internal-sensors-nvml.md) | M7 拡張 | core, priority:must, blocked-by-hardware |
+| 34 | [NVML / lm-sensors の統合（v1スコープへ格上げ）](issues/34-internal-sensors-nvml.md) **← GitHub #65 へ移管** | M7 拡張 | core, priority:must, blocked-by-hardware |
 | 35 | [Server Health API（Workspace連携の単一窓口）](issues/35-server-health-api.md) | M7 拡張 | api, integration, priority:must |
 | 36 | [GPU Mode イベントの記録とタイムライン注釈](issues/36-gpu-mode-events.md) | M7 拡張 | core, integration, priority:should |
 | 37 | [Compute Mode 切替時の環境条件アドバイザリ](issues/37-compute-mode-advisory.md) | M7 拡張 | core, safety, priority:should |
@@ -68,8 +71,8 @@
 | 40 | [Markdown Decision Memory への自動記録](issues/40-memory-writer.md) | M5 AI | integration, priority:should |
 | 41 | [秘匿情報の混入防止（.env / トークン / 環境固有情報）](issues/41-public-repo-hygiene.md) | M0 基盤 | infra, priority:must, safety |
 | 42 | [時刻ソースの注入（Clock 抽象）](issues/42-clock-injection.md) | M1 データ基盤 | core, priority:must |
-| 43 | [3系統Fan制御daemon（Front / Rear独立・Top CPU優先）](issues/43-fan-control-daemon.md) | M8 Fan Control | core, safety, priority:must |
-| 44 | [3系統Fanの風量キャラクタライズとAirflow Model](issues/44-airflow-characterization.md) | M8 Fan Control | design, qa, priority:must |
+| 43 | [3系統Fan制御daemon（Front / Rear独立・Top CPU優先）](issues/43-fan-control-daemon.md) **← GitHub #74 へ移管** | M8 Fan Control | core, safety, priority:must |
+| 44 | [3系統Fanの風量キャラクタライズとAirflow Model](issues/44-airflow-characterization.md) **← GitHub #75 へ移管** | M8 Fan Control | design, qa, priority:must |
 
 ## 着手順の推奨
 
@@ -88,61 +91,83 @@ AI:          #21 → #22 → #38 → #25
 GPU機どころか ESP32 すら接続せずに #8〜#25 のすべてが開発・テストできます。
 
 
-## 追加予定: Fan / ML Control（GitHub番号は採番時に確定）
+## Fan / ML Control（GitHub の Issue が正本）
 
-> このファイルの既存番号と、現行GitHub上のIssue番号に差がある可能性があるため、
-> 以下は**番号を固定せず**slug / milestone / labelsで定義します。登録前にGitHub側の最新番号と照合してください。
+> **M8 以降の Issue は GitHub の Issue 本文が正本です**（2026-09-13 決定）。
+> ここは番号と着手順の索引で、仕様・受入基準・依存は各 Issue を正とします。`issues/` にファイルは置きません。
+> 統合設計の出典: 統合メモ（2026-09-13）、決定記録 [0026](docs/decisions/0026-three-zone-fan-control.md) / [0027](docs/decisions/0027-fan-control-architecture.md) / [0028](docs/decisions/0028-fan-control-contracts.md)。
 
-| slug | タイトル | マイルストーン | ラベル | 実機依存 |
-|---|---|---|---|---|
-| `fan-control-architecture` | ADR: Supervisor + Learned MPC + Reactive Guard + Critical Safety の責務境界 | M8 | design, safety, priority:must | なし |
-| `fan-demand-schema` | Front / Rear / Top Requested/Effective Demand とreason schema | M8 | core, design, priority:must | なし |
-| `fan-hardware-backend` | Demand→PWM/RPM/Flow hardware profile + simulated backend | M8 | core, hardware, priority:must | 実測curveのみ必要 |
-| `critical-safety-layer` | Critical Safety Layer（floor/stall/telemetry loss/deadman/emergency Max） | M8 | core, safety, priority:must | 閾値確定に実機 |
-| `reactive-guard` | dT/dt / Power急変へのReactive Guard | M8 | core, safety, priority:must | 最終閾値に実機 |
-| #44（既存） | [3系統Fanの風量キャラクタライズとAirflow Model](issues/44-airflow-characterization.md)。**新規に起票しない**（同じ内容の issue が既にある） | M8（issue の記載） | design, qa, priority:must | **必要** |
-| `air-balance-model` | q_front / q_rear / q_top とAir Balance推定 | M8 | core, ml, priority:must | calibrationに実機 |
-| `control-logging` | requested/effective/override/reason/confidence/OODを含む制御ログ | M8 | core, priority:must | なし |
-| `thermal-dataset` | Thermal Model用Dataset schema・Window・horizon・データ収集 | M9 | ml, qa, priority:must | **必要** |
-| `thermal-model` | Multi-horizon / multi-output Learned Thermal Model | M9 | ml, priority:must | 学習ログ必要 |
-| `model-confidence-ood` | Model Confidence / OOD検知とAuthority制限 | M9 | ml, safety, priority:must | 一部実機ログ必要 |
-| `learned-mpc` | Learned MPC optimizer とhard constraints連携 | M9 | ml, core, priority:must | offlineは不要 / rolloutは必要 |
-| `workload-regime` | IDLE / TRANSIENT / SUSTAINED / COOLDOWN / UNKNOWN の推定 | M9 | ml, core, priority:should | 実ログ推奨 |
-| `supervisor-interface` | Supervisor interface + RulePolicy + RLPolicy + ShadowRLPolicy | M9 | ml, design, priority:must | なし |
-| `rl-supervisor` | RL Supervisor学習・目的関数重み/戦略の最適化 | M9 | ml, research, priority:should | learned simulator推奨 |
-| `control-shadow-mode` | MPC/RL Shadow Mode・counterfactual logging | M9 | ml, qa, safety, priority:must | rollout前に必要 |
-| `offline-evaluation` | Baseline vs MPC vs MPC+Guard vs Supervisor+MPC+Guard のoffline比較 | M9 | ml, qa, priority:must | dataset必要 |
-| `authority-rollout` | 0→制限付き→full authority の段階的Production rollout | M9 | safety, qa, priority:must | **必要** |
-| `fallback-controller` | ML停止/OOD/timeout時のBaseline / Fallback Controller | M8 | core, safety, priority:must | なし |
-| `drift-detection` | Thermal/airflow model drift検知と再学習条件 | M9 | ml, qa, priority:should | 長期ログ必要 |
-| `acoustic-cost-model` | Thermalと分離したZone別Acoustic Cost Model | M10 | ml, research, priority:should | 初期近似は不要 |
-| `acoustic-sensor-study` | SPL/マイク・周波数特性・annoyance scoreの実測方式検討 | M10 | design, hardware, research, priority:could | 実機推奨 |
+| GitHub | タイトル | マイルストーン | 状態 |
+|---|---|---|---|
+| #61 | ADR: Supervisor + Learned MPC + Reactive Guard + Critical Safety の責務境界 | M8 | 完了（決定記録 0027 / 0028） |
+| #76 | Front / Rear / Top Demand schema と制御reason schema | M8 | 完了（PR #101） |
+| #65 | NVML / lm-sensors / hwmon 内部Telemetry統合（Control/ML入力対応） | M7 | |
+| #102 | Runtime State Estimator: synchronized control snapshot / trend / thermal margin | M8 | |
+| #103 | Control Config schema / validation / versioning / safe reload | M8 | |
+| #77 | Fan Hardware Backend: Demand→PWM/RPM/Flow + simulated backend（Actuation privilege boundary を含む） | M8 | |
+| #78 | Critical Safety Layer: floor / stall / telemetry loss / deadman / emergency Max | M8 | |
+| #79 | Fallback Controller: ML停止 / OOD / timeout時のBaseline運転 | M8 | |
+| #80 | Reactive Guard: dT/dt / Power急変への即応制御 | M8 | |
+| #82 | Control Logging: requested / effective / override / confidence / OOD | M8 | |
+| #74 | 3系統Fan Control Engine / daemon（4層Pipeline + Demand abstraction） | M8 | |
+| #75 | 3系統Fanの風量キャラクタライズとEffective Airflow / Thermal Effectiveness Model | M8 | |
+| #81 | Air Balance Model: q_front / q_rear / q_top と協調制御 | M8 | |
+| #50 | ベースライン測定・Safety/Reactive閾値候補・Thermal Dataset初期収集 | M8 | |
+| #106 | Airflow / Fan Control 可視化 UI（ケース内の風の流れと制御状態） | M8 | |
+| #83 | Thermal Dataset schema: Window / Horizon / Fan action列とデータ収集 | M9 | |
+| #84 | Multi-horizon / multi-output Learned Thermal Model | M9 | |
+| #85 | Model Confidence / OOD検知とAuthority制限 | M9 | |
+| #104 | Control Model Registry: candidate / production / promotion / rollback | M9 | |
+| #86 | Learned MPC optimizer とHard Constraints連携 | M9 | |
+| #87 | Workload Regime推定: IDLE / TRANSIENT / SUSTAINED / COOLDOWN / UNKNOWN | M9 | |
+| #88 | Supervisor Interface: RulePolicy / RLPolicy / ShadowRLPolicy | M9 | |
+| #90 | Control Shadow Mode / Counterfactual logging | M9 | |
+| #91 | Offline Evaluation: Baseline vs MPC vs Guard vs Supervisor | M9 | |
+| #92 | Authority Rollout: Shadow → 制限付き → Full Authority | M9 | |
+| #105 | RL Supervisor学習基盤: learned simulator / offline RL environment | M9 | |
+| #89 | RL Supervisor: 戦略・目的関数weightの最適化 | M9 | |
+| #93 | Thermal / Airflow Model Drift Detection と再学習条件 | M9 | |
+| #107 | Workload Hint 連携: 負荷ヒントを Supervisor の prior にする | M9 | 将来 |
+| #94 | Zone別Acoustic Cost Model（Thermal Modelと分離） | M10 | |
+| #95 | Acoustic sensor study: SPL / 周波数特性 / annoyance scoreの実測方式 | M10 | |
 
 ### Control系の推奨着手順
 
 ```text
-設計:        fan-control-architecture
+設計:        #61（完了）
               ↓
-基盤:        fan-demand-schema → fan-hardware-backend → control-logging
+基盤:        #76（完了）→ #65 → #102 → #103 → #77
               ↓
-安全:        critical-safety-layer → fallback-controller → reactive-guard
+安全:        #78 → #79 → #80
               ↓
-実機特性:    #44 → air-balance-model
+記録・統合:  #82 → #74
               ↓
-Dataset:     thermal-dataset
+実機特性:    #75 → #81 → #50
               ↓
-ML Model:    thermal-model → model-confidence-ood
+可視化:      #106
               ↓
-MPC:         learned-mpc
+Dataset:     #83
               ↓
-Supervisor:  supervisor-interface → workload-regime → rl-supervisor
+ML Model:    #84 → #85 → #104
               ↓
-評価:        control-shadow-mode → offline-evaluation
+MPC:         #86
               ↓
-本番:        authority-rollout → drift-detection
+Supervisor:  #87 → #88
               ↓
-騒音拡張:    acoustic-cost-model → acoustic-sensor-study
+評価:        #90 → #91
+              ↓
+本番:        #92
+              ↓
+RL:          #105 → #89
+              ↓
+運用:        #93
+              ↓
+騒音拡張:    #94 → #95
+              ↓
+将来:        #107
 ```
+
+依存の無いものは並行できます。正確な依存は各 Issue の `Depends on` を正とします。
 
 **重要:** アーキテクチャ自体は最初から4層構造で実装する。
 ただし、学習初期は `RulePolicy active + RLPolicy shadow`、Learned MPCもShadow/制限付きAuthorityから開始し、

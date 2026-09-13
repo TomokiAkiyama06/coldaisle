@@ -6,6 +6,8 @@
 # - 論理 Issue 番号（ファイル名先頭）を実際の GitHub Issue 番号へ本文中で解決
 # - 完了済み / superseded の Issue を自動で close
 # - 実機要件ラベルを付与
+# - `moved_to:` を持つ定義ファイルは GitHub へ移管済み（M8 以降は GitHub が正本）。
+#   作成・更新せず、本文中の論理番号を GitHub 番号へ置き換える対応表にだけ使う
 #
 # 使い方:
 #   GH_TOKEN=... ./scripts/create_issues.sh
@@ -115,6 +117,11 @@ strip_frontmatter() {
   awk 'n>=2{print; next} /^---$/{n++}' "$1"
 }
 
+# 移管先の GitHub Issue 番号。移管していなければ空。
+moved_to() {
+  sed -n 's/^moved_to: *\([0-9][0-9]*\)$/\1/p' "$1" | head -1
+}
+
 echo "==> labels"
 create_label "priority:must"           "b60205" "必須"
 create_label "priority:should"         "d93f0b" "推奨"
@@ -159,6 +166,10 @@ if [ "$DRY_RUN" = "1" ]; then
     raw_id=$(basename "$f" | cut -d- -f1)
     spec_id=$((10#$raw_id))
     title=$(sed -n 's/^title: "\(.*\)"$/\1/p' "$f" | head -1)
+    if [ -n "$(moved_to "$f")" ]; then
+      echo "  spec#$spec_id -> GitHub #$(moved_to "$f") へ移管済み（作成・更新しない）"
+      continue
+    fi
     echo "  spec#$spec_id [$(issue_state "$spec_id")] $title"
     echo "    labels: $(issue_labels "$spec_id" "$f")"
   done
@@ -176,6 +187,15 @@ for f in "$ISSUE_DIR"/*.md; do
   title=$(sed -n 's/^title: "\(.*\)"$/\1/p' "$f" | head -1)
   labels=$(issue_labels "$spec_id" "$f")
   milestone=$(sed -n 's/^milestone: "\(.*\)"$/\1/p' "$f" | head -1)
+
+  moved=$(moved_to "$f")
+  if [ -n "$moved" ]; then
+    # 番号の対応だけ残す。ほかの定義ファイルの本文にある論理番号を正しく置き換えるため
+    ISSUE_NUM[$spec_id]="$moved"
+    printf '%s\t%s\n' "$spec_id" "$moved" >> "$map_file"
+    echo "  moved spec#$spec_id -> #$moved（GitHub が正本。作成・更新しない）"
+    continue
+  fi
 
   existing=$(gh issue list --state all --limit 500 --json number,title \
     --jq ".[] | select(.title == \"$title\") | .number" | head -1 || true)
@@ -201,6 +221,9 @@ echo "==> pass 2: update bodies / labels / state"
 for f in "$ISSUE_DIR"/*.md; do
   raw_id=$(basename "$f" | cut -d- -f1)
   spec_id=$((10#$raw_id))
+  if [ -n "$(moved_to "$f")" ]; then
+    continue
+  fi
   number="${ISSUE_NUM[$spec_id]}"
   title=$(sed -n 's/^title: "\(.*\)"$/\1/p' "$f" | head -1)
   labels=$(issue_labels "$spec_id" "$f")

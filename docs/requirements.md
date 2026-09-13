@@ -3,7 +3,7 @@
 **バージョン**: 0.2 (Draft)
 **作成日**: 2026-08-23
 **対象**: GPUサーバー環境監視 + ローカルAI運用アシスタント
-**前提ハードウェア**: NVIDIA RTX PRO 6000 Blackwell 96GB 搭載ワークステーション（導入前）
+**前提ハードウェア**: AMD Ryzen 9 9950X / NVIDIA RTX PRO 6000 Blackwell Workstation Edition（96GB）/ ASUS ProArt X870E-CREATOR WIFI / DDR5 128GB / Cooler Master MasterLiquid Atmos II 360 / Corsair FRAME 4000D WOOD RS / 1200W Platinum（ATX 3.1系）/ Ubuntu（導入済み。2026-09-13 時点）
 
 > 本書は `server_temperature_monitor_spec_2026-08-23.md`（ハードウェア仕様・アイデア段階）を
 > ソフトウェア要件として再構成し、ローカルLLM活用を統合したものです。
@@ -71,10 +71,10 @@
 | S-07 | 通知（Slack / LINE。既存の個人自動化基盤へ接続） |
 | S-08 | ローカルLLM（Qwen3.8-27B）による対話的分析・異常説明・日次レポート |
 | S-09 | Mac（開発）→ Ubuntu（本番）への移行手順とsystemd/udev設定 |
-| S-10 | **NVML / lm-sensors からのGPU・CPU内部センサー収集**（v1.1→v1へ格上げ） |
+| S-10 | **NVML / lm-sensors / hwmon からのGPU・CPU・Board・Fan 内部Telemetry収集**（v1.1→v1へ格上げ。ASUS T_SENSOR による 12V-2x6 コネクタ外装温度を含む。GitHub #65） |
 | S-11 | **Server Health API**（Personal AI Workspace のGPUパネルへ供給する単一エンドポイント） |
 | S-12 | **GPU Mode イベントの記録とタイムライン注釈**、Compute Mode切替時の環境条件アドバイザリ |
-| S-13 | **Front / Rear / Top の3系統Fan制御**（Supervisor + Learned MPC + Reactive Guard + Critical Safety。LLMは関与しない。決定記録 0026 / 0027） |
+| S-13 | **Front / Rear / Top の3系統Fan制御**（Supervisor + Learned MPC + Reactive Guard + Critical Safety。LLMは関与しない。決定記録 0026 / 0027 / 0028。GitHub #74） |
 
 ### 2.2 スコープ外（v1.0では実装しない）
 
@@ -89,7 +89,6 @@
 
 ### 2.3 段階的に取り込む（v1.1〜）
 
-- 12V-2x6 コネクタ温度（専用センサーの追加が必要）
 - `power.wall`（スマートプラグ経由の壁コンセント実測電力）
 - Prometheus / Grafana 連携
 - RAG（仕様書・作業ログの検索）
@@ -249,6 +248,8 @@ coldaisle が NVML / lm-sensors も収集し、`GET /api/v1/server-health` を�
 | `power.gpu.0` | W | NVML | ✅ |
 | `sys.gpu_mode` | enum | Workspace GPU Manager | ✅ |
 | `sys.cuda_processes` | count | NVML | ✅ |
+| 12V-2x6 コネクタ外装温度（名前は GitHub #65 で決める） | °C | ASUS T_SENSOR（外装に密着させた 10kΩ NTC） | ✅ |
+| Front / Rear / Top の RPM・PWM（名前は GitHub #65 で決める） | rpm / % | hwmon | ✅ |
 | `power.wall` | W | スマートプラグ | v1.1 |
 
 派生メトリクス（保存せず計算で出す）:
@@ -260,6 +261,8 @@ coldaisle が NVML / lm-sensors も収集し、`GET /api/v1/server-health` を�
 | `d.gpu_delta` | `air.gpu_exhaust - air.gpu_intake` | GPUが空気に与えた熱。風量低下で増大 |
 | `d.top_rise` | `air.top_exhaust - air.gpu_exhaust` | **GPU排気がトップラジエーターへ回り込んでいないかの指標**（spec-review I-04） |
 | `d.gpu_internal_delta` | `gpu.0.hotspot - gpu.0.core` | サーマルインターフェース劣化の指標 |
+| `d.case_delta` | `air.rear_exhaust - air.front_intake` | ケース全体での温度上昇。**温度差だけで判断せず、推定吸排気量（GitHub #81）とセットで評価する** |
+| `d.rear_rise` | `air.rear_exhaust - air.room` | 背面排気の室温からの上昇 |
 
 ### 5.2 デバイス出力 JSON スキーマ v1
 
@@ -604,8 +607,17 @@ Kaggle・研究でGPUを使う際は `--gpu-memory-utilization` による制限�
 | ID | 論点 | 判断の時期 |
 |---|---|---|
 | Q-16 | ライセンス（Apache-2.0 を推奨） | 公開前 |
-
 | Q-18 | センサー最終配置 | 実機で構成を確認後 |
+| Q-19 | 制御入力の欠測の分類（Critical / Degraded / Advisory） | 決定記録 0029（提案中） |
+| Q-20 | T_SENSOR の閾値の具体値 | GitHub #50 / #78 |
+| Q-21 | Learned Thermal Model の方式・履歴 window・予測 horizon | GitHub #83 / #84 |
+| Q-22 | MPC / Supervisor の周期、MPC 目的関数の重み | GitHub #86 / #88 / #103 |
+| Q-23 | Confidence / OOD の方式、Authority 昇格ゲートの閾値 | GitHub #85 / #92 |
+| Q-24 | Air Balance の最適な帯 | GitHub #81 |
+| Q-25 | 本番でオンライン学習を行うか | GitHub #93 / #104 |
+| Q-26 | 音響センサーのハードウェア | GitHub #95 |
+| Q-27 | Workload Hint を実装する時期 | GitHub #107 |
+| Q-28 | Airflow 可視化 UI の置き場所（coldaisle / Workspace） | GitHub #106 |
 
 ---
 
