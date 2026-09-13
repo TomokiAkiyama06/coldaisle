@@ -130,7 +130,7 @@ Safetyの最終閾値などのキャラクタライズ値です。
 | [`docs/spec-review.md`](docs/spec-review.md) | ハードウェア仕様のレビューと改訂提案 |
 | [`docs/decisions/`](docs/decisions/) | 決定記録。追記のみ。変更は新しい記録を作り `Supersedes` で参照する |
 | [`ISSUES.md`](ISSUES.md) | Issue一覧と着手順 |
-| [`issues/`](issues/) | M0〜M7 の個別Issue定義（フロントマター付き）。**M8 以降は GitHub の Issue が正本** |
+| [`issues/`](issues/) | 個別Issue定義（フロントマター付き）。**M8 以降と、`moved_to` を持つ定義（19 / 30 / 34 / 43 / 44）は GitHub の Issue が正本** |
 | [`prompts/claude-code.md`](prompts/claude-code.md) | **Claude Code 向けプロンプト集。**キックオフ、Issue実装テンプレート、レビュー用 |
 | [`AGENTS.md`](AGENTS.md) | AIコーディングエージェント向け指示の正本（Claude Code / Codex 共通） |
 

@@ -115,16 +115,19 @@ estimated_exhaust = q_rear + q_top
 balance_ratio = estimated_exhaust / estimated_intake
 ```
 
+- `q_front` / `q_rear` / `q_top` のどれかが欠測・stale のとき、または `q_front` が 0 以下のときは `balance_ratio` を**計算しない**（0 で割らない）。状態は `UNKNOWN` とし、Front の stall や入力の欠測そのものは Critical Safety（決定記録 0028 §2.7）と入力の分類（決定記録 0029、提案中）で扱う
 - **`balance_ratio = 1.0` を固定の正解にしない**
 - `d.case_delta`（`air.rear_exhaust - air.front_intake`）は温度差だけで判断せず、推定吸排気量とセットで評価する
-- 状態の候補（GitHub #81）: `BALANCED` / `INTAKE_HEAVY` / `EXHAUST_HEAVY` / `THERMALLY_LIMITED`
+- 状態の候補（GitHub #81）: `BALANCED` / `INTAKE_HEAVY` / `EXHAUST_HEAVY` / `THERMALLY_LIMITED` / `UNKNOWN`（比を計算できない）
 
 ## Top → Front make-up air
 
-Top の排気が強いと、CPU だけの負荷でも強い負圧になりうる。Front の最終要求は概念上次のとおりとし、具体的な関係は実測（GitHub #50 / #75）で決める。
+Top の排気が強いと、CPU だけの負荷でも強い負圧になりうる。Front の **requested** は概念上次のとおりとし、具体的な関係は実測（GitHub #50 / #75）で決める。
 
 ```text
-front_final_demand = max(gpu_or_case_front_demand, top_makeup_air_demand)
+front_requested_demand = max(gpu_or_case_front_demand, top_makeup_air_demand)
 ```
+
+これは制御器（Fallback / Learned MPC）が出す requested であり、**別の最終値ではない**。effective は通常どおり Reactive Guard と Critical Safety を通って決まる（決定記録 0028 §2.3 / §2.4）。
 
 Top の CPU 冷却の下限は Critical Safety が持つ（決定記録 0028 §2.4）。ケース換気の都合で CPU 冷却を下げない。

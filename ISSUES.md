@@ -1,9 +1,9 @@
 # Issue 一覧
 
-**M0〜M7 の Issue** は `issues/` 配下の個別ファイルが本体です。GitHubへの一括登録は `scripts/create_issues.sh` を使用してください。
+`issues/` 配下の個別ファイルが本体です（**ただし、フロントマターに `moved_to` を持つ定義は例外**。下記）。GitHubへの一括登録は `scripts/create_issues.sh` を使用してください。
 
 > **M8 以降（Fan / ML 制御）は GitHub の Issue が正本です**（2026-09-13 決定）。一覧は下の「Fan / ML Control」を参照してください。
-> `issues/19` / `30` / `34` / `43` / `44` は GitHub の #50 / #61 / #65 / #74 / #75 へ移管済みで、同期スクリプトは作成・更新しません。
+> `issues/19` / `30` / `34`（M7）/ `43` / `44` はフロントマターに `moved_to` があり、GitHub の #50 / #61 / #65 / #74 / #75 へ移管済みです。**これらのファイルを直しても GitHub へは反映されません**（同期スクリプトは作成・更新しない）。
 
 各Issueのファイル冒頭にYAMLフロントマターで title / labels / milestone を記載しています。
 
