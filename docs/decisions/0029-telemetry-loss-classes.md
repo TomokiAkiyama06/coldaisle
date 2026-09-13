@@ -36,6 +36,13 @@
 
 ## 2. Decision
 
+本記録で入力が**使えない**とは、その入力の品質（決定記録 0002 §2.5 / 要件 §5.3）が `ok` 以外、つまり `missing` / `suspect` / `stale` のいずれかであることを指す。
+
+- `missing` / `suspect` は、サンプルが届き続けていても付く（プローブの断線、センサーが返す番兵値、範囲外の値など。`src/coldaisle/store/quality.py`）
+- `stale` は、最後の更新から一定時間が過ぎたときに読み出し側で付く（`latest()`。決定記録 0004 §2.2）
+
+`stale` だけを見ると、プローブが外れて故障値を出し続けている間は欠測として扱われない。したがって、**以下の区分と 0028 §2.7 の「stale / missing」は、すべて「使えない」の意味で読む。**
+
 ### 2.1 3つの区分
 
 | 区分 | 意味 | 動作 | safety state |
@@ -51,8 +58,8 @@
 | CPU 温度（`cpu.package`） | Critical | Top を Max（0028 §2.7） |
 | GPU 温度（`gpu.0.core`） | Critical | Front / Rear を `fault_demand`（0028 §2.7） |
 | T_SENSOR（12V-2x6 外装温度） | Critical（**有効にした後**） | Front / Rear を `fault_demand`（0028 §2.7）。未設置の間は 2.4 |
-| DS18B20 の `air.*` が**すべて** stale（取り込みデーモンの停止を含む） | Critical | Front / Rear を `fault_demand`。**0028 §2.7 の「必須の `air.*` が stale」はこの場合を指す** |
-| DS18B20 の `air.*` の**一部**が stale（`front_intake` / `gpu_intake` / `gpu_exhaust` / `top_exhaust` / `rear_exhaust` のうち、すべてではない） | Degraded | 2.3 |
+| DS18B20 の `air.*` が**すべて**使えない（取り込みデーモンの停止を含む） | Critical | Front / Rear を `fault_demand`。**0028 §2.7 の「必須の `air.*` が stale」はこの場合を指す**（2. の冒頭の定義により `missing` / `suspect` を含む） |
+| DS18B20 の `air.*` の**一部**が使えない（`front_intake` / `gpu_intake` / `gpu_exhaust` / `top_exhaust` / `rear_exhaust` のうち、すべてではない） | Degraded | 2.3 |
 | `air.room`（AM2320 の温度） | Degraded | 室温を使う派生値（`d.intake_rise` / `d.rear_rise`）を外して運転を続ける |
 | CPU / GPU の Power（`power.gpu.0` など） | Degraded | feed-forward を外し、温度の feedback だけで計算する |
 | `air.room_humidity` | Advisory | 記録のみ |
@@ -73,13 +80,13 @@
 
 - `safety.yaml` で T_SENSOR を無効にできる。無効の間は Critical の入力として扱わず、decision trace と起動時のログに「無効（未設置）」と残す
 - **有効にするのは、設置と #50 の較正の確認の後。** 有効化は `safety.yaml` の変更なので、所有者の承認を要する（0028 §2.9 の承認点 2）
-- 有効にした後の断線・ありえない値・stale は Critical
+- 有効にした後に使えなくなったら（断線・ありえない値・stale）Critical
 
 ### 2.5 決定記録 0028 との関係
 
 - 0028 §2.7 の**対応**（何をどこまで上げるか）は変えない。本記録は「**どの入力の欠測がその対応を起こすか**」を決める
 - `fault_demand` の暫定値 1.0 はそのまま（Critical にだけ効く）。下げてよいかは 0028 の未決 4（#50）
-- #76 の `FaultCode.AIR_TELEMETRY_STALE` は「DS18B20 の `air.*` がすべて stale」を表す。一部の欠測は fault ではないので `FaultCode` にしない
+- #76 の `FaultCode.AIR_TELEMETRY_STALE` は「DS18B20 の `air.*` がすべて使えない」を表す（名前は stale だが `missing` / `suspect` を含む）。一部の欠測は fault ではないので `FaultCode` にしない
 
 ---
 
@@ -108,6 +115,7 @@
 | `air.*` をすべて Critical にする（1本の欠測でも `fault_demand`） | 統合メモ §14 に反する。センサー1本の不調でファンがうるさく回り続ける |
 | すべての入力を Degraded にする | CPU / GPU の温度が見えないまま運転を続けることになる |
 | #50 の実測まで分類を決めない | それまで「必須」が曖昧なまま #78 / #79 / #102 の実装が進む |
+| `stale` だけを欠測として扱う | サンプルが届き続けるプローブの断線（`missing` / `suspect`）を見逃し、5本すべて故障していても Critical にならない |
 | 一部の欠測を safety state の `DEGRADED` にする | `DEGRADED` は zone の fault で demand を上げている状態（0028 §2.5 (d)）。入力の品質と安全状態を混ぜると、記録から原因を読み違える |
 
 ---
