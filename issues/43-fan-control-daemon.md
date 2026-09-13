@@ -2,7 +2,11 @@
 title: "3系統Fan制御daemon（Front / Rear独立・Top CPU優先）"
 labels: core, safety, priority:must
 milestone: "M8 Fan Control"
+moved_to: 74
 ---
+
+> **この定義は GitHub #74 へ移管しました。** M8 以降の Issue は GitHub の本文が正本です（2026-09-13）。
+> 以下は移管前の記録で、更新しません。`scripts/create_issues.sh` は作成・更新しません。
 
 ## 背景
 GPU高負荷時のケース換気とCPU AIO冷却を安全に両立するため、Front / Rear / Topを3系統で独立制御する。

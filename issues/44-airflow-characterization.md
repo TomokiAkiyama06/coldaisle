@@ -2,7 +2,11 @@
 title: "3系統Fanの風量キャラクタライズとAirflow Model"
 labels: design, qa, priority:must
 milestone: "M8 Fan Control"
+moved_to: 75
 ---
+
+> **この定義は GitHub #75 へ移管しました。** M8 以降の Issue は GitHub の本文が正本です（2026-09-13）。
+> 以下は移管前の記録で、更新しません。`scripts/create_issues.sh` は作成・更新しません。
 
 ## 背景
 Front / Rear / Topを独立PWM制御するにあたり、ファン径やRPMだけから風量を推定すると誤差が大きい。
