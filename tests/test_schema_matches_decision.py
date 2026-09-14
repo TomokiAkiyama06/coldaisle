@@ -72,6 +72,8 @@ def test_migration_creates_exactly_the_decided_objects():
         ("table", "device_sensors"),
         ("table", "schema_version"),
         ("view", "v_latest"),
+        ("table", "control_traces"),
+        ("index", "ix_control_traces_tick"),
     }
 
 

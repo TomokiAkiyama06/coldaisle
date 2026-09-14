@@ -21,6 +21,7 @@ from coldaisle.clock import Clock
 from coldaisle.store import migrations
 from coldaisle.store.models import (
     AlertRecord,
+    ControlTraceRecord,
     DeviceRecord,
     LatestReading,
     Quality,
@@ -353,6 +354,28 @@ class SqliteStore:
                 ],
             )
 
+    def record_control_trace(
+        self, *, ts_ms: int, tick_id: int, schema_version: int, trace_json: str
+    ) -> bool:
+        """1 tickのdecision traceを追記し、新規に保存できたかを返す（#82）。
+
+        同じ ``(ts_ms, tick_id)`` を上書きしない。後から別の判断に置き換えると、
+        その時点の制御理由を再現できなくなるためである。
+        """
+        trace = ControlTraceRecord(
+            ts_ms=ts_ms,
+            tick_id=tick_id,
+            schema_version=schema_version,
+            trace_json=trace_json,
+        )
+        with self.transaction():
+            cursor = self._conn.execute(
+                "INSERT OR IGNORE INTO control_traces "
+                "(ts_ms, tick_id, schema_version, trace_json) VALUES (?, ?, ?, ?)",
+                (trace.ts_ms, trace.tick_id, trace.schema_version, trace.trace_json),
+            )
+        return cursor.rowcount == 1
+
     # ------------------------------------------------------------------ 読み出し
 
     def device(self, device_id: str) -> DeviceRecord | None:
@@ -420,6 +443,25 @@ class SqliteStore:
                 age_ms=age_ms,
             )
         return latest
+
+    def control_traces(self, start_ms: int, end_ms: int) -> tuple[ControlTraceRecord, ...]:
+        """指定した半開区間のdecision traceを時刻順に返す（#82）。"""
+        if start_ms < 0 or end_ms < start_ms:
+            raise ValueError("control traceの期間が不正")
+        rows = self._conn.execute(
+            "SELECT ts_ms, tick_id, schema_version, trace_json FROM control_traces "
+            "WHERE ts_ms >= ? AND ts_ms < ? ORDER BY ts_ms, tick_id",
+            (start_ms, end_ms),
+        ).fetchall()
+        return tuple(
+            ControlTraceRecord(
+                ts_ms=row["ts_ms"],
+                tick_id=row["tick_id"],
+                schema_version=row["schema_version"],
+                trace_json=row["trace_json"],
+            )
+            for row in rows
+        )
 
     def metrics(self) -> tuple[str, ...]:
         """保存済みのメトリクス名。走査量はメトリクス数に比例する（決定記録 0004 §2.11）。

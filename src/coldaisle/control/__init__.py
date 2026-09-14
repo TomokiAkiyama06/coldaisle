@@ -6,6 +6,7 @@
 Fan Demand を変えられるのは、定義済みの Control Pipeline を通った値だけ（AGENTS.md ルール2）。
 """
 
+from coldaisle.control.logging import ControlTraceLogger, ControlTraceSink
 from coldaisle.control.schema import (
     BOUND_BY_PRECEDENCE,
     EMERGENCY_FAULTS,
@@ -45,6 +46,8 @@ __all__ = [
     "BoundBy",
     "ControlState",
     "ControlTick",
+    "ControlTraceLogger",
+    "ControlTraceSink",
     "ControllerKind",
     "ControllerProposal",
     "Demand",
