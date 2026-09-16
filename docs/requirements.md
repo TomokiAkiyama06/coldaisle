@@ -595,6 +595,7 @@ Kaggle・研究でGPUを使う際は `--gpu-memory-utilization` による制限�
 | Q-13 | 利用者 | 単一利用者 → 127.0.0.1 バインド、認証不要 | 2026-08-23 |
 | Q-14 | 夜間通知 | 常時通知。ただし閾値確定までは critical のみに段階制限 | 2026-08-23 |
 | Q-15 | 通知先 | Slack / LINE ともに専用の宛先を使用 | 2026-08-23 |
+| Q-19 | 制御入力の欠測の分類 | Critical / Degraded / Advisory（[決定記録 0029](decisions/0029-telemetry-loss-classes.md)） | 2026-09-16 |
 
 ### 検証済み
 
