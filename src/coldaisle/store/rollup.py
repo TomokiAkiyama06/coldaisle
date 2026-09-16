@@ -45,6 +45,9 @@ class RetentionRules(BaseModel):
     raw_days: int = Field(gt=0)
     """生データの保持日数。1分・1時間は無期限（FR-204）。"""
 
+    control_trace_days: int = Field(gt=0)
+    """Control decision trace の保持日数。保存容量を無制限に増やさない。"""
+
     csv_dir: str
     """日次CSV（FR-205）の出力先。`~` を含んでよい。"""
 
@@ -59,6 +62,10 @@ class RetentionRules(BaseModel):
     def raw_retention_ms(self) -> int:
         return self.raw_days * DAY_MS
 
+    @property
+    def control_trace_retention_ms(self) -> int:
+        return self.control_trace_days * DAY_MS
+
 
 @dataclass(frozen=True)
 class Result:
@@ -69,6 +76,8 @@ class Result:
     deleted_rows: int = 0
     cutoff_ms: int | None = None
     """実際に削除の基準にした時刻。安全弁で手前に引き戻された場合はその値。"""
+    deleted_control_traces: int = 0
+    control_trace_cutoff_ms: int | None = None
 
 
 def rollup_minutes(store: SqliteStore) -> int:
@@ -231,8 +240,15 @@ def run(store: SqliteStore, rules: RetentionRules, *, now_ms: int) -> Result:
     minutes = rollup_minutes(store)
     hours = rollup_hours(store)
     deleted, cutoff = apply_retention(store, rules, now_ms=now_ms)
+    trace_cutoff = max(0, now_ms - rules.control_trace_retention_ms)
+    deleted_traces = store.delete_control_traces_before(trace_cutoff)
     return Result(
-        minute_buckets=minutes, hour_buckets=hours, deleted_rows=deleted, cutoff_ms=cutoff
+        minute_buckets=minutes,
+        hour_buckets=hours,
+        deleted_rows=deleted,
+        cutoff_ms=cutoff,
+        deleted_control_traces=deleted_traces,
+        control_trace_cutoff_ms=trace_cutoff,
     )
 
 
@@ -284,6 +300,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                     "deleted_rows": result.deleted_rows,
                     "cutoff_ms": result.cutoff_ms,
                     "raw_days": rules.raw_days,
+                    "deleted_control_traces": result.deleted_control_traces,
+                    "control_trace_cutoff_ms": result.control_trace_cutoff_ms,
+                    "control_trace_days": rules.control_trace_days,
                 }
             },
         )

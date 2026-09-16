@@ -13,7 +13,8 @@ CREATE TABLE control_traces (
     CHECK (ts_ms >= 0),
     CHECK (tick_id >= 0),
     CHECK (schema_version >= 1),
-    CHECK (json_valid(trace_json))
+    CHECK (json_valid(trace_json)),
+    CHECK (json_type(trace_json) = 'object')
 ) WITHOUT ROWID;
 
 CREATE INDEX ix_control_traces_tick ON control_traces (tick_id, ts_ms);

@@ -277,6 +277,23 @@ def test_every_metric_is_swept(store, rules_30d):
     assert deleted == 3
 
 
+def test_expired_control_traces_are_deleted_by_the_rollup_job(store, rules_30d):
+    assert store.record_control_trace(
+        ts_ms=1 * DAY_MS, tick_id=1, schema_version=1, trace_json="{}"
+    )
+    assert store.record_control_trace(
+        ts_ms=39 * DAY_MS, tick_id=2, schema_version=1, trace_json="{}"
+    )
+
+    result = run(store, rules_30d, now_ms=40 * DAY_MS)
+
+    assert result.deleted_control_traces == 1
+    assert result.control_trace_cutoff_ms == 10 * DAY_MS
+    assert [(trace.ts_ms, trace.tick_id) for trace in store.control_traces(0, 50 * DAY_MS)] == [
+        (39 * DAY_MS, 2)
+    ]
+
+
 # ---------------------------------------------------------------- 設定と CLI
 
 
@@ -290,7 +307,9 @@ def test_config_file_covers_every_field(rules_30d):
 
 def test_unknown_key_is_rejected(tmp_path):
     path = tmp_path / "retention.yaml"
-    path.write_text("raw_days: 30\ncsv_dir: x\nraw_day: 14\n", encoding="utf-8")
+    path.write_text(
+        "raw_days: 30\ncontrol_trace_days: 30\ncsv_dir: x\nraw_day: 14\n", encoding="utf-8"
+    )
     with pytest.raises(ValueError, match="raw_day"):
         RetentionRules.from_yaml(path)
 
@@ -323,7 +342,9 @@ def test_cli_runs_and_writes_csv(tmp_path, rules):
         write(store, "air.room", 1_787_616_000_000, 26.0)  # 2026-08-25 09:00 JST
 
     retention = tmp_path / "retention.yaml"
-    retention.write_text(f"raw_days: 30\ncsv_dir: {tmp_path / 'csv'}\n", encoding="utf-8")
+    retention.write_text(
+        f"raw_days: 30\ncontrol_trace_days: 30\ncsv_dir: {tmp_path / 'csv'}\n", encoding="utf-8"
+    )
     code = main(
         [
             f"--db={database}",
@@ -521,7 +542,9 @@ def test_five_minute_bucket_uses_its_whole_span(store):
 def test_cli_creates_the_database_directory(tmp_path):
     """`var/` は追跡されていない。既定のコマンドが素の checkout で動くこと。"""
     retention = tmp_path / "retention.yaml"
-    retention.write_text(f"raw_days: 30\ncsv_dir: {tmp_path / 'csv'}\n", encoding="utf-8")
+    retention.write_text(
+        f"raw_days: 30\ncontrol_trace_days: 30\ncsv_dir: {tmp_path / 'csv'}\n", encoding="utf-8"
+    )
     database = tmp_path / "var" / "coldaisle.db"
     assert not database.parent.exists()
 

@@ -376,6 +376,14 @@ class SqliteStore:
             )
         return cursor.rowcount == 1
 
+    def delete_control_traces_before(self, cutoff_ms: int) -> int:
+        """保持期間を過ぎた decision trace を削除して行数を返す。"""
+        if cutoff_ms < 0:
+            raise ValueError("control trace の削除基準時刻が不正")
+        with self.transaction():
+            cursor = self._conn.execute("DELETE FROM control_traces WHERE ts_ms < ?", (cutoff_ms,))
+        return int(cursor.rowcount)
+
     # ------------------------------------------------------------------ 読み出し
 
     def device(self, device_id: str) -> DeviceRecord | None:

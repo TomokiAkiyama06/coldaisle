@@ -1,6 +1,7 @@
 """Control Logging（#82）のdecision trace保存。"""
 
 import json
+import sqlite3
 from pathlib import Path
 
 import pytest
@@ -82,6 +83,16 @@ def test_trace_query_is_time_ordered_and_uses_a_half_open_interval(store):
 def test_trace_rejects_invalid_or_non_object_json(store, trace_json):
     with pytest.raises(ValidationError, match="decision trace"):
         store.record_control_trace(ts_ms=0, tick_id=0, schema_version=1, trace_json=trace_json)
+
+
+@pytest.mark.parametrize("trace_json", ["[]", '"text"', "0", "null"])
+def test_database_also_rejects_non_object_trace_json(store, trace_json):
+    with pytest.raises(sqlite3.IntegrityError):
+        store.connection.execute(
+            "INSERT INTO control_traces (ts_ms, tick_id, schema_version, trace_json) "
+            "VALUES (?, ?, ?, ?)",
+            (0, 0, 1, trace_json),
+        )
 
 
 def test_control_trace_record_is_immutable():

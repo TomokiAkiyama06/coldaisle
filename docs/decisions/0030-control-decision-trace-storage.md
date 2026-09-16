@@ -47,6 +47,9 @@ traceを書き換えられない。PWM・hwmon・NVMLへの書き込み経路は
 
 ## 5. 未決事項
 
-- traceの保持期間とSQLite外へのexportは #82 / #90 / #91 で決める
+- traceは `config/retention.yaml` の `control_trace_days`（初期値30日）を保持し、
+  `coldaisle-rollup` が期限を過ぎた record を削除する。これは設定必須項目であり、
+  コード側に既定値を持たない
+- SQLite外へのexportは #90 / #91 で決める
 - GPU Cooling SubsystemやVRM Fanを追加する場合のactuator固有フィールドは、責務境界を
   決める後続のDecision Recordでschema versionとともに定める
