@@ -608,7 +608,6 @@ Kaggle・研究でGPUを使う際は `--gpu-memory-utilization` による制限�
 |---|---|---|
 | Q-16 | ライセンス（Apache-2.0 を推奨） | 公開前 |
 | Q-18 | センサー最終配置 | 実機で構成を確認後 |
-| Q-19 | 制御入力の欠測の分類（Critical / Degraded / Advisory） | 決定記録 0029（提案中） |
 | Q-20 | T_SENSOR の閾値の具体値 | GitHub #50 / #78 |
 | Q-21 | Learned Thermal Model の方式・履歴 window・予測 horizon | GitHub #83 / #84 |
 | Q-22 | MPC / Supervisor の周期、MPC 目的関数の重み | GitHub #86 / #88 / #103 |
