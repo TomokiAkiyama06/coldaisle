@@ -115,7 +115,7 @@ estimated_exhaust = q_rear + q_top
 balance_ratio = estimated_exhaust / estimated_intake
 ```
 
-- `q_front` / `q_rear` / `q_top` のどれかが欠測・stale のとき、または `q_front` が 0 以下のときは `balance_ratio` を**計算しない**（0 で割らない）。状態は `UNKNOWN` とし、Front の stall や入力の欠測そのものは Critical Safety（決定記録 0028 §2.7）と入力の分類（決定記録 0029、提案中）で扱う
+- `q_front` / `q_rear` / `q_top` のどれかが欠測・stale のとき、または `q_front` が 0 以下のときは `balance_ratio` を**計算しない**（0 で割らない）。状態は `UNKNOWN` とし、Front の stall や入力の欠測そのものは Critical Safety（決定記録 0028 §2.7）と入力の分類（決定記録 0029）で扱う
 - **`balance_ratio = 1.0` を固定の正解にしない**
 - `d.case_delta`（`air.rear_exhaust - air.front_intake`）は温度差だけで判断せず、推定吸排気量とセットで評価する
 - 状態の候補（GitHub #81）: `BALANCED` / `INTAKE_HEAVY` / `EXHAUST_HEAVY` / `THERMALLY_LIMITED` / `UNKNOWN`（比を計算できない）

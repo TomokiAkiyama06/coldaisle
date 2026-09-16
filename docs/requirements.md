@@ -595,6 +595,7 @@ Kaggle・研究でGPUを使う際は `--gpu-memory-utilization` による制限�
 | Q-13 | 利用者 | 単一利用者 → 127.0.0.1 バインド、認証不要 | 2026-08-23 |
 | Q-14 | 夜間通知 | 常時通知。ただし閾値確定までは critical のみに段階制限 | 2026-08-23 |
 | Q-15 | 通知先 | Slack / LINE ともに専用の宛先を使用 | 2026-08-23 |
+| Q-19 | 制御入力の欠測の分類 | Critical / Degraded / Advisory（[決定記録 0029](decisions/0029-telemetry-loss-classes.md)） | 2026-09-16 |
 
 ### 検証済み
 
@@ -608,7 +609,6 @@ Kaggle・研究でGPUを使う際は `--gpu-memory-utilization` による制限�
 |---|---|---|
 | Q-16 | ライセンス（Apache-2.0 を推奨） | 公開前 |
 | Q-18 | センサー最終配置 | 実機で構成を確認後 |
-| Q-19 | 制御入力の欠測の分類（Critical / Degraded / Advisory） | 決定記録 0029（提案中） |
 | Q-20 | T_SENSOR の閾値の具体値 | GitHub #50 / #78 |
 | Q-21 | Learned Thermal Model の方式・履歴 window・予測 horizon | GitHub #83 / #84 |
 | Q-22 | MPC / Supervisor の周期、MPC 目的関数の重み | GitHub #86 / #88 / #103 |
