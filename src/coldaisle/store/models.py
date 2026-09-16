@@ -10,6 +10,7 @@ DB の CHECK 制約と二重に持たせている。取り込み層の不具合�
 
 from __future__ import annotations
 
+import json
 import re
 from enum import StrEnum
 
@@ -226,3 +227,29 @@ class AlertRecord(BaseModel):
     threshold: float | None = None
     """発火時に適用されていた閾値。**当時の閾値で解釈できないと履歴が読めない**（0002 §2.9）。"""
     detail: str | None = None
+
+
+class ControlTraceRecord(BaseModel):
+    """保存した1 control tickのdecision trace（#82）。
+
+    traceの意味は ``schema_version`` が決める。SQLite側にも JSON のCHECK制約を
+    持たせ、アプリ外からの不正な書き込みでも保存済みログを壊さない。
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    ts_ms: int = Field(ge=0)
+    tick_id: int = Field(ge=0)
+    schema_version: int = Field(ge=1)
+    trace_json: str
+
+    @field_validator("trace_json")
+    @classmethod
+    def _trace_is_a_json_object(cls, value: str) -> str:
+        try:
+            decoded = json.loads(value)
+        except json.JSONDecodeError as exc:
+            raise ValueError("decision trace はJSONでなければならない") from exc
+        if not isinstance(decoded, dict):
+            raise ValueError("decision trace はJSON objectでなければならない")
+        return value

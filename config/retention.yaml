@@ -6,6 +6,9 @@
 # 生データの保持日数。要件 §6.2 の「既定14日」は決定記録 0001 D-02 が
 # 30日へ上書きしている。1分・1時間のロールアップは無期限（FR-204）
 raw_days: 30
+# Control decision trace の保持日数。1秒周期でも保存容量を無制限に増やさない。
+# 値の根拠と変更手順は Decision Record 0030 を参照する。
+control_trace_days: 30
 
 # 日次CSV（FR-205）の出力先。`~` は展開する
 csv_dir: "~/server_sensor_logs"
