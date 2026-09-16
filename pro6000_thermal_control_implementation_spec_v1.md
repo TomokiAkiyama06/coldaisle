@@ -4,16 +4,22 @@
 
 ## 1. 目的
 
-RTX PRO 6000 Blackwell Workstation Edition 搭載GPUサーバーについて、これまで取得した実機データを基に、ケースファン・GPUファン・CPUラジエータファン・VRMファンを統合制御する。
+RTX PRO 6000 Blackwell Workstation Edition 搭載GPUサーバーについて、これまで取得した実機データを保存し、既存の制御契約に従う実装候補を整理する。
 
-最終構成は以下を基本とする。
+**本書より `docs/decisions/0026`〜`0029` と `AGENTS.md` の FINAL 契約を優先する。** 現在のアプリが操作できるアクチュエータは Front / Rear / Top の3 zoneだけである。GPU Fan と VRM Fan の直接操作は本書の実測対象ではあるが、責務境界・Safety・fault・Hardware Backend の契約を定める後続 Decision Record が承認されるまで実装しない。
+
+現在の制御経路は以下を基本とする。
 
 ```text
-Sensors / Telemetry
+Sensors / Telemetry Collector
         ↓
 Supervisor
         ↓
-Learned MPC
+Learned MPC（candidate）
+        ↓
+Confidence / OOD Gate
+        ↓
+Baseline / Fallback selection
         ↓
 Reactive Guard
         ↓
@@ -21,15 +27,15 @@ Critical Safety
         ↓
 Actuator Arbitration
         ↓
-nct6799 / NVML
+verified Front / Rear / Top Hardware Backend
 ```
 
 重要方針:
 
 - AIO Pumpは100%固定とし、アプリから通常制御しない。
 - Critical Safetyはすべての上位制御より優先する。
-- Learned MPCは最初から直接制御せず、Shadow Modeから開始する。
-- GPUは温度だけでなく Power / Utilization を使って先回り制御する。
+- Learned MPCは最初から直接制御せず、Shadow Modeから開始する。Confidence/OOD不成立、モデル未ロード、optimizer timeoutではBaseline / Fallbackを選び、MPC出力をReactive Guardへ直接渡さない。
+- GPUの温度・Power・UtilizationはTelemetry Collectorが取得する制御入力候補であり、`coldaisle-fand` がNVMLを直接呼び出す根拠にはしない。
 - CPU / GPU / VRM / ケース温度の絶対値に加えて、温度上昇速度 `dT/dt` を利用する。
 - 将来的には室温センサーを追加し、`ΔT = Component Temp - Room Temp` を主要特徴量にする。
 
@@ -101,9 +107,9 @@ pwm24付近で再始動
 
 ---
 
-## 5. GPUファン制御
+## 5. GPUファン制御の実測
 
-GPUファンはNVMLから直接制御可能。2基とも認識済み。
+GPUファンは手動実験ではNVMLから直接制御可能で、2基とも認識済みである。**これは実測結果であり、現在の `coldaisle-fand` の制御対象を増やすものではない。** `coldaisle-fand` はTelemetry Collectorのタイムスタンプ付き出力を消費し、NVMLを直接呼び出さない。GPU Fanを通常制御へ追加するには、専用のDecision Recordで単一owner、Safety、fault、異常終了時の扱い、Hardware Backend契約を承認する必要がある。
 
 ```text
 AUTO policy   = 0
@@ -441,6 +447,8 @@ dT/dt が小さい
 
 # 16. 初期アクチュエータポリシー
 
+以下の Front / Rear / Top は現在の3 zone契約における候補である。VRM Fan と GPU Fan の記載は実測に基づく将来候補であり、現行daemonの出力・Safety・fault契約には含めない。AIO Pumpは通常制御対象外である。
+
 ## IDLE_LOW
 
 ```text
@@ -475,7 +483,7 @@ VRM      pwm40〜温度依存
 AIO Pump 100%
 ```
 
-GPU Fan Feed-forward:
+GPU Fan Feed-forward（将来候補。現行daemonでは実行しない）:
 
 ```text
 GPU Power >= 300W → 70%
@@ -491,7 +499,7 @@ OR GPU Temp >= 83〜84°C
 → GPU Fan 100%
 ```
 
-Safety:
+Safety（将来候補。現行daemonではGPU Fanを操作しない）:
 
 ```text
 GPU Temp >= 85°C → 100%
@@ -531,7 +539,7 @@ Fan RPM
 Pump RPM
 ```
 
-ルール例:
+ルール例（GPU Fan / VRM Fanへの直接出力は将来候補であり、現行のReactive Guardは3 zoneにのみ出力する）:
 
 ```text
 GPU Power > 550W → GPU Fan 最低90%
@@ -546,7 +554,7 @@ VRM >= 75°C → VRM Fan増速
 
 # 18. Critical Safety
 
-初期Software Safety閾値:
+以下の数値は実測に基づく候補であり、Safety設定値を確定しない。正式値は既存の承認手順で設定する。
 
 ```text
 GPU >= 90°C
@@ -554,20 +562,11 @@ CPU >= 92°C
 VRM >= 85°C
 ```
 
-これはハードウェア破壊限界ではなく、実装上の保守的な安全閾値。
+現行の3 zone契約でCriticalになったときは、検証済みの Top / Rear / Front をMaxへ上げる。AIO Pumpは通常制御対象外であり、GPU Fan / VRM Fanをこのdaemonから直接操作しない。
 
-Critical時:
+テレメトリ欠測もCritical Safetyの入力である。品質が `ok` 以外（`missing` / `suspect` / `stale`）のとき、CPUテレメトリ欠測はTopをMaxへ、GPU・T_SENSOR・必須airテレメトリ欠測はFrontとRearを安全側へ上げる。全DS18B20が使用不能ならCritical、部分的な使用不能ならDegraded Guardとして扱う。
 
-```text
-GPU Fan 100%
-Top      100%
-VRM Fan  100%
-Rear     100%
-Front    100%
-AIO Pump 100%固定
-```
-
-追加Critical条件:
+追加Critical条件候補:
 
 ```text
 GPU SW Thermal Slowdown増加
@@ -644,7 +643,7 @@ GPU: Temp / Power / Util / Clock / Fan % / Thermal Slowdown / dT/dt
 VRM: Temp
 Case: Front Intake / GPU Intake / GPU Exhaust / Top Exhaust / Rear Exhaust
 Room: Room Temp / Humidity
-Actuators: Top / VRM / Rear / Front PWM / GPU Fan %
+Actuators: Top / Rear / Front Demand（current scope）; VRM / GPU Fan %（将来候補）
 ```
 
 将来追加:
@@ -658,6 +657,8 @@ fan response delay
 ```
 
 同じ600Wでも短時間と長時間で温度が大きく異なるため、`load duration` と温度履歴は重要な特徴量とする。
+
+MPCはcandidate proposalだけを出す。Confidence / OOD Gateで信頼できない入力・未ロード・timeoutを検出した場合は、Baseline / Fallbackを選んでからReactive Guardへ渡す。MPC出力を直接Reactive GuardやHardware Backendへ渡してはならない。
 
 ---
 
@@ -680,9 +681,9 @@ Base Profile
 例:
 
 ```text
-MPCがGPU Fan 70%を要求
-Reactive Guardが90%を要求
-→ 90%
+MPCがFront demand 0.70を要求
+Reactive Guardが0.90を要求
+→ 0.90
 
 MPCがTop 0を要求
 CPU High
@@ -706,14 +707,9 @@ Restart=always
 RestartSec=2
 ```
 
-Daemon異常終了時:
+Daemon異常終了時は、外部のsystemd watchdogと `ExecStopPost` のhandoffで、検証済みの Front / Rear / Top headerをMaxへ強制する。BIOS/Q-Fanへの復帰を安全handoffの代替にしない。GPU FanとVRM Fanは現行daemonの制御対象外であり、この経路でNVML操作やownerの引き継ぎを導入しない。
 
-```text
-GPU Fan → NVIDIA AUTO
-Motherboard Fans → BIOS/Q-Fanへ復帰
-```
-
-可能なら `ExecStopPost` / Watchdog / Heartbeat も実装する。
+`ExecStopPost` / Watchdog / Heartbeat は必須の安全設計として実装する。
 
 最重要要件:
 
@@ -766,7 +762,7 @@ Phase F — GUI / Monitoring
 Phase G — Learned MPC Shadow Mode
 ```
 
-自動制御を常時有効化するのはPhase C完了後。
+自動制御を常時有効化するのは、Critical SafetyとReactive Guardの両方（Phase CおよびPhase D）を完了し、3 zoneの安全経路を検証した後である。
 
 ---
 
@@ -830,7 +826,7 @@ thermal-control/
 10. MPC Active
 ```
 
-特に1〜4が完成するまでは、自動制御を常時有効化しない。
+特に1〜5が完成し、Critical SafetyとReactive Guardの両方を通ることを確認するまでは、自動制御を常時有効化しない。
 
 ---
 
