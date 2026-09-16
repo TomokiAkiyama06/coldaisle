@@ -1,7 +1,7 @@
 # 決定記録 0029: 制御入力の欠測の分類（Critical / Degraded / Advisory）
 
 - **種別**: Decision Record
-- **Status**: Proposed
+- **Status**: FINAL（2026-09-16、リポジトリ所有者が承認）
 - **Date**: 2026-09-13
 - **Supersedes**: なし（決定記録 0028 §2.7 の「必須の `air.*`」を具体化する補足。0028 の対応そのものは変えない）
 - **関連**: [`0028-fan-control-contracts.md`](0028-fan-control-contracts.md) /
@@ -30,7 +30,12 @@
 
 加えて、T_SENSOR（12V-2x6 外装温度）はまだ設置していない。0028 のままでは、設置までの間ずっと stale となり、Front / Rear が Max のままになる。
 
-2026-09-13、リポジトリ所有者が分類の案を選んだ。本記録はその内容を残す。
+2026-09-13、リポジトリ所有者が分類の案を選び、2026-09-16 に次の4点を確認して承認した。
+
+1. Critical の範囲は 2.2 の4つで足りる（ただし Telemetry 欠測の分類としてであり、ほかの経路の Critical は残す）
+2. DS18B20 は本数での中間の Critical を設けない
+3. CPU / GPU の Power の欠測は Degraded とし、温度の feedback で続ける
+4. Degraded のあいだも safety state は変えず、入力の品質を別の軸として持つ
 
 ---
 
@@ -65,12 +70,19 @@
 | `air.room_humidity` | Advisory | 記録のみ |
 | `gpu.0.hotspot` / `gpu.0.mem` / `gpu.0.vram_used` / GPU utilization / `sys.cuda_processes` / `cpu.vrm` / `chipset` / AIO Pump・VRM Fan の RPM | Advisory | 記録のみ（ML の confidence が下がりうる） |
 
-制御対象ファンの tach stall・書き込み失敗・読み戻し不一致は、入力の欠測ではなく**ファンの故障**であり、0028 §2.7「Fan / Hardware」の表のまま扱う（本記録の対象外）。
+**本記録が分類するのは Telemetry の欠測だけ**である。次は別の経路の Critical として、そのまま残す。
+
+- 制御対象ファンの tach stall・hwmon の書き込み失敗・読み戻し不一致（0028 §2.7「Fan / Hardware」）
+- deadman（systemd の watchdog）と tick の overrun（0028 §2.6 / §2.7）
+- Fallback Controller / Reactive Guard / Critical Safety 自体の異常（0028 §2.7「制御器・ループ」）
+- AIO Pump の異常。RPM が**読めない**ことは Advisory（2.2）だが、**読めた値が異常**（停止・低回転）なのは欠測ではない。扱いは未決 4
+
+また、**本数での中間の Critical は設けない。** 5本のうち2本が欠けても、どの2本か（例: `gpu_intake` と `rear_exhaust`）で意味が違う。まずは「一部 = Degraded / 全滅 = Critical」で運用し、必要になれば zone 単位のルールへ広げる（未決 7）。
 
 ### 2.3 Degraded のときの動作
 
-- **safety state は変えない（`NORMAL` のまま）。** fault ではなく**入力の品質**として、State Snapshot（#102）と decision trace（#82）に残す
-- Fallback Controller（#79）は、欠けた入力を使う項を外すか、代わりの入力へ切り替えて計算する。どの入力を何で代えるかは #79 が決め、#50 で確かめる
+- **safety state は変えない（`NORMAL` のまま）。** 代わりに `telemetry_health`（`NORMAL` / `DEGRADED`）を**別の軸**として持ち、State Snapshot（#102）と decision trace（#82）に残す。`safety_state` は「fault で demand を安全側へ強制している状態」を表すので、入力の品質と混ぜない
+- Fallback Controller（#79）は、欠けた入力を使う項を外すか、代わりの入力へ切り替えて計算する。どの入力を何で代えるかは #79 が決め、#50 で確かめる。CPU / GPU の Power が使えないときは、**feed-forward を無効にしたこと**を理由として記録する
 - Reactive Guard（#80）は、Degraded の入力があるあいだ、設定の保守側の閾値の組を使う
 - Learned MPC（#86）は、学習時に無かった欠測の組み合わせなら OOD として Fallback へ退避する（0028 §2.5 (c)）
 - 通知する（ルールエンジンのセンサー異常のルール）
@@ -97,6 +109,7 @@
 - センサー1本の欠測で Front / Rear が Max にならない（統合メモ §14 と一致する）
 - T_SENSOR を設置する前でも運転できる
 - 0028 の「必須の `air.*`」の曖昧さが消え、#78 / #79 / #102 が同じ区分で実装できる
+- 安全状態（`safety_state`）と入力の品質（`telemetry_health`）が別の軸になり、記録から原因を読み違えない
 
 ### 悪くなること・その緩和
 
@@ -116,6 +129,7 @@
 | すべての入力を Degraded にする | CPU / GPU の温度が見えないまま運転を続けることになる |
 | #50 の実測まで分類を決めない | それまで「必須」が曖昧なまま #78 / #79 / #102 の実装が進む |
 | `stale` だけを欠測として扱う | サンプルが届き続けるプローブの断線（`missing` / `suspect`）を見逃し、5本すべて故障していても Critical にならない |
+| 本数で中間の Critical を設ける（例: 2本欠けたら Critical） | どの2本かで意味が違う。zone 単位のルールが必要になったら別に決める（未決 7） |
 | 一部の欠測を safety state の `DEGRADED` にする | `DEGRADED` は zone の fault で demand を上げている状態（0028 §2.5 (d)）。入力の品質と安全状態を混ぜると、記録から原因を読み違える |
 
 ---
@@ -129,4 +143,5 @@
 | 3 | Reactive Guard の保守側の閾値の値 | #80 / #50 |
 | 4 | AIO Pump の RPM の低下をアラートにするか | ルールエンジン（#49 系） |
 | 5 | 制御対象ファンの RPM が読めない（stall と区別できない）ときの区分 | #77 / #78 |
-| 6 | 入力の品質を `ControlTick`（#76 の型）にどう載せるか | #82 / #102 |
+| 6 | `telemetry_health` と入力ごとの品質を `ControlTick`（#76 の型）にどう載せるか | #82 / #102 |
+| 7 | 本数ではなく zone 単位（どのプローブが欠けたか）で Critical を分ける必要が出るか | #50 / #78 |
