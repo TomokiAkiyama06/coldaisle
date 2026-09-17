@@ -98,11 +98,15 @@ class ControlInputContract(_Frozen):
         metrics = tuple(spec.metric for spec in self.signals)
         if len(set(metrics)) != len(metrics):
             raise ValueError("signal contract の metric は重複させない")
-        known = set(metrics)
+        specs_by_metric = {spec.metric: spec for spec in self.signals}
+        known = set(specs_by_metric)
         for group in self.critical_groups:
             unknown = set(group.metrics) - known
             if unknown:
                 raise ValueError(f"Critical group に未定義の signal がある: {sorted(unknown)}")
+            disabled = [metric for metric in group.metrics if not specs_by_metric[metric].enabled]
+            if disabled:
+                raise ValueError(f"Critical group の signal はすべて有効にする: {sorted(disabled)}")
         return self
 
 
@@ -167,6 +171,7 @@ class SnapshotSignal(_Frozen):
     value: FiniteFloat | None = None
     quality: Quality
     source_ts_ms: int | None = Field(default=None, ge=0)
+    last_changed_mono_ms: int | None = Field(default=None, ge=0)
     age_ms: int | None = Field(default=None, ge=0)
 
     @property
@@ -187,8 +192,8 @@ class Trend(_Frozen):
 
     metric: str
     per_second: FiniteFloat
-    from_source_ts_ms: int = Field(ge=0)
-    to_source_ts_ms: int = Field(ge=0)
+    from_mono_ms: int = Field(ge=0)
+    to_mono_ms: int = Field(ge=0)
 
 
 class ControlStateSnapshot(_Frozen):
@@ -295,6 +300,7 @@ class ControlStateEstimator:
             value=reading.value,
             quality=quality,
             source_ts_ms=reading.source_ts_ms,
+            last_changed_mono_ms=reading.last_changed_mono_ms,
             age_ms=age_ms,
         )
 
@@ -339,19 +345,19 @@ class ControlStateEstimator:
                 earlier is None
                 or not signal.available
                 or not earlier.available
-                or signal.source_ts_ms is None
-                or earlier.source_ts_ms is None
-                or signal.source_ts_ms <= earlier.source_ts_ms
+                or signal.last_changed_mono_ms is None
+                or earlier.last_changed_mono_ms is None
+                or signal.last_changed_mono_ms <= earlier.last_changed_mono_ms
             ):
                 continue
             assert signal.value is not None and earlier.value is not None
-            elapsed_s = (signal.source_ts_ms - earlier.source_ts_ms) / 1_000
+            elapsed_s = (signal.last_changed_mono_ms - earlier.last_changed_mono_ms) / 1_000
             trends.append(
                 Trend(
                     metric=signal.metric,
                     per_second=(signal.value - earlier.value) / elapsed_s,
-                    from_source_ts_ms=earlier.source_ts_ms,
-                    to_source_ts_ms=signal.source_ts_ms,
+                    from_mono_ms=earlier.last_changed_mono_ms,
+                    to_mono_ms=signal.last_changed_mono_ms,
                 )
             )
         return tuple(trends)
