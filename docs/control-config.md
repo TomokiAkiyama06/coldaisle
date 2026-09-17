@@ -22,6 +22,13 @@ T_SENSORのstale判定を持たず、`true` にするには `confirmed` と承�
 `authority_limits` には LIMITED / EXPANDED ごとの許可zone、Fallbackからの `limit_up` /
 `limit_down` を必須とし、後続のGate実装が設定外の定数に依存しないようにする。
 
+#79 で `fan-policy.yaml` の schema version は 2 になった。Fallback の温度入力は
+`fallback_temperature_inputs`、任意の Power feed-forward は
+`fallback_power_feedforward`、需要を下げる前の hysteresis / hold は
+`fallback_dynamics` に置く。温度・Powerのcurveを含め、実機で未確認の値をコード側の
+既定値で補わない。旧versionを新しい意味で黙って解釈せず、version 1 は読み込み時に拒否する。
+Power signalが未設定またはstale / missingならfeed-forward項だけを外し、温度feedbackを続ける。
+
 v1 は設定の live reload を行わない。設定変更は候補全体を別オブジェクトで検証したうえで
 **次回再起動時**にだけ反映する。これにより、変更後の設定も必ず `STARTUP` の Max を通る。
 `trace_metadata()` は、採用されたsource名・schema version・SHA-256を #82 の decision traceへ渡す。

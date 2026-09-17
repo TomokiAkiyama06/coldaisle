@@ -89,11 +89,40 @@ def valid_documents() -> dict[str, dict[str, object]]:
             "watchdog_timeout_ms": provisional(5000),
         },
         "fan-policy.yaml": {
-            "schema_version": 1,
+            "schema_version": 2,
             "fallback_curve": [
                 {"temperature_c": 25.0, "demand": 0.3},
                 {"temperature_c": 80.0, "demand": 1.0},
             ],
+            "fallback_temperature_inputs": {
+                "front": {"metrics": ["gpu.0.core"]},
+                "rear": {"metrics": ["gpu.0.core"]},
+                "top": {"metrics": ["cpu.package"]},
+            },
+            "fallback_power_feedforward": {
+                "front": {
+                    "metric": "power.gpu.0",
+                    "curve": [
+                        {"power_w": 0.0, "demand": 0.3},
+                        {"power_w": 600.0, "demand": 1.0},
+                    ],
+                },
+                "rear": {
+                    "metric": "power.gpu.0",
+                    "curve": [
+                        {"power_w": 0.0, "demand": 0.3},
+                        {"power_w": 600.0, "demand": 1.0},
+                    ],
+                },
+                "top": {
+                    "metric": "power.cpu.package",
+                    "curve": [
+                        {"power_w": 0.0, "demand": 0.3},
+                        {"power_w": 250.0, "demand": 1.0},
+                    ],
+                },
+            },
+            "fallback_dynamics": {"decrease_hysteresis": 0.05, "decrease_hold_ms": 2000},
             "reactive_guard": {
                 "floor": provisional(0.4),
                 "ceiling": provisional(1.0),
@@ -298,4 +327,35 @@ def test_mpc_and_supervisor_validity_windows_are_required_and_budget_is_bounded(
     documents["fan-policy.yaml"]["mpc"]["budget_ms"] = 2000
     write_documents(tmp_path, documents)
     with pytest.raises(ValidationError, match=r"mpc.budget_ms"):
+        ControlConfig.from_directory(tmp_path)
+
+
+def test_fallback_inputs_and_power_curves_are_validated(tmp_path: Path) -> None:
+    documents = valid_documents()
+    documents["fan-policy.yaml"]["fallback_temperature_inputs"]["front"]["metrics"] = [
+        "gpu.0.core",
+        "gpu.0.core",
+    ]
+    write_documents(tmp_path, documents)
+    with pytest.raises(ValidationError, match="重複"):
+        ControlConfig.from_directory(tmp_path)
+
+    documents = valid_documents()
+    documents["fan-policy.yaml"]["fallback_power_feedforward"]["front"]["curve"] = [
+        {"power_w": 200.0, "demand": 0.5},
+        {"power_w": 100.0, "demand": 0.6},
+    ]
+    write_documents(tmp_path, documents)
+    with pytest.raises(ValidationError, match="power_w"):
+        ControlConfig.from_directory(tmp_path)
+
+
+def test_old_fan_policy_schema_is_rejected_instead_of_silently_reinterpreted(
+    tmp_path: Path,
+) -> None:
+    documents = valid_documents()
+    documents["fan-policy.yaml"]["schema_version"] = 1
+    write_documents(tmp_path, documents)
+
+    with pytest.raises(ValidationError, match="schema_version"):
         ControlConfig.from_directory(tmp_path)

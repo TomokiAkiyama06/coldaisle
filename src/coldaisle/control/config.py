@@ -14,8 +14,9 @@ import yaml
 from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, model_validator
 
 from coldaisle.control.schema import AuthorityStage, Demand, PerZone, Zone
+from coldaisle.store.models import validate_metric
 
-CONTROL_CONFIG_VERSION: Literal[1] = 1
+CONTROL_CONFIG_VERSION: Literal[2] = 2
 CONFIG_FILENAMES = {
     "fan_hardware": "fan-hardware.yaml",
     "safety": "safety.yaml",
@@ -258,6 +259,61 @@ class FallbackPoint(_ConfigModel):
     demand: Demand
 
 
+class FallbackTemperatureInputs(_ConfigModel):
+    """1 zone の temperature feedback に使う Snapshot signal。"""
+
+    metrics: Annotated[
+        tuple[str, ...], BeforeValidator(_yaml_sequence_to_tuple), Field(min_length=1)
+    ]
+
+    @model_validator(mode="after")
+    def _metrics_are_unique_and_valid(self) -> Self:
+        if len(set(self.metrics)) != len(self.metrics):
+            raise ValueError("Fallback temperature metric は重複させない")
+        for metric in self.metrics:
+            validate_metric(metric)
+        return self
+
+
+class PowerDemandPoint(_ConfigModel):
+    """Power feed-forward の入力値と要求 demand。"""
+
+    power_w: Annotated[float, Field(ge=0.0, allow_inf_nan=False)]
+    demand: Demand
+
+
+class FallbackPowerCurve(_ConfigModel):
+    """1 zone の Power signal と demand curve。未設定なら feed-forward を使わない。"""
+
+    metric: str
+    curve: Annotated[
+        tuple[PowerDemandPoint, ...],
+        BeforeValidator(_yaml_sequence_to_tuple),
+        Field(min_length=2),
+    ]
+
+    @model_validator(mode="after")
+    def _curve_is_monotonic(self) -> Self:
+        validate_metric(self.metric)
+        previous_power: float | None = None
+        previous_demand: float | None = None
+        for point in self.curve:
+            if previous_power is not None and point.power_w <= previous_power:
+                raise ValueError("Fallback Power curve の power_w は単調増加にする")
+            if previous_demand is not None and point.demand < previous_demand:
+                raise ValueError("Fallback Power curve の demand は下げない")
+            previous_power = point.power_w
+            previous_demand = point.demand
+        return self
+
+
+class FallbackDynamics(_ConfigModel):
+    """Fallback 内で demand を下げる前の hysteresis / hold。"""
+
+    decrease_hysteresis: Demand
+    decrease_hold_ms: PositiveMilliseconds
+
+
 class ReactiveGuard(_ConfigModel):
     """Reactive Guard の閾値。値は全て安全設定と同様に追跡する。"""
 
@@ -309,10 +365,13 @@ class SupervisorTiming(_ConfigModel):
 
 
 class FanPolicyConfig(_ConfigModel):
-    schema_version: Literal[1]
+    schema_version: Literal[2]
     fallback_curve: Annotated[
         tuple[FallbackPoint, ...], BeforeValidator(_yaml_sequence_to_tuple), Field(min_length=2)
     ]
+    fallback_temperature_inputs: PerZone[FallbackTemperatureInputs]
+    fallback_power_feedforward: PerZone[FallbackPowerCurve] | None = None
+    fallback_dynamics: FallbackDynamics
     reactive_guard: ReactiveGuard
     mpc: MpcTiming
     supervisor: SupervisorTiming
@@ -341,7 +400,7 @@ class ConfigSource(_ConfigModel):
     """decision trace に残せる入力の版・名前・内容ハッシュ。絶対 path は残さない。"""
 
     name: Literal["fan-hardware.yaml", "safety.yaml", "fan-policy.yaml"]
-    schema_version: Literal[1]
+    schema_version: Literal[1, 2]
     sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
 
 
@@ -378,7 +437,7 @@ class ControlConfig(_ConfigModel):
                     name=cast(
                         Literal["fan-hardware.yaml", "safety.yaml", "fan-policy.yaml"], filename
                     ),
-                    schema_version=cast(Literal[1], schema_version),
+                    schema_version=cast(Literal[1, 2], schema_version),
                     sha256=sha256(text.encode("utf-8")).hexdigest(),
                 ),
             )
