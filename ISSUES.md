@@ -96,30 +96,33 @@ GPU機どころか ESP32 すら接続せずに #8〜#25 のすべてが開発・
 > **M8 以降の Issue は GitHub の Issue 本文が正本です**（2026-09-13 決定）。
 > ここは番号と着手順の索引で、仕様・受入基準・依存は各 Issue を正とします。`issues/` にファイルは置きません。
 > 統合設計の出典: 統合メモ（2026-09-13）、決定記録 [0026](docs/decisions/0026-three-zone-fan-control.md) / [0027](docs/decisions/0027-fan-control-architecture.md) / [0028](docs/decisions/0028-fan-control-contracts.md)。
+>
+> 状態の「レビュー中」は未完了を表す。実機確認が受入基準に含まれる Issue は、
+> software PR がマージされても実機確認が終わるまで「完了」にしない。
 
 | GitHub | タイトル | マイルストーン | 状態 |
 |---|---|---|---|
 | #61 | ADR: Supervisor + Learned MPC + Reactive Guard + Critical Safety の責務境界 | M8 | 完了（決定記録 0027 / 0028） |
 | #76 | Front / Rear / Top Demand schema と制御reason schema | M8 | 完了（PR #101） |
-| #65 | NVML / lm-sensors / hwmon 内部Telemetry統合（Control/ML入力対応） | M7 | |
-| #102 | Runtime State Estimator: synchronized control snapshot / trend / thermal margin | M8 | |
-| #103 | Control Config schema / validation / versioning / safe reload | M8 | |
-| #77 | Fan Hardware Backend: Demand→PWM/RPM/Flow + simulated backend（Actuation privilege boundary を含む） | M8 | |
-| #78 | Critical Safety Layer: floor / stall / telemetry loss / deadman / emergency Max | M8 | |
-| #79 | Fallback Controller: ML停止 / OOD / timeout時のBaseline運転 | M8 | |
-| #80 | Reactive Guard: dT/dt / Power急変への即応制御 | M8 | |
+| #65 | NVML / lm-sensors / hwmon 内部Telemetry統合（Control/ML入力対応） | M7 | 実装中（実機確認残） |
+| #102 | Runtime State Estimator: synchronized control snapshot / trend / thermal margin | M8 | 完了（PR #118） |
+| #103 | Control Config schema / validation / versioning / safe reload | M8 | 完了（PR #115） |
+| #77 | Fan Hardware Backend: Demand→PWM/RPM/Flow + simulated backend（Actuation privilege boundary を含む） | M8 | 完了（PR #119） |
+| #78 | Critical Safety Layer: floor / stall / telemetry loss / deadman / emergency Max | M8 | 実装中（人間のSafetyレビュー必須） |
+| #79 | Fallback Controller: ML停止 / OOD / timeout時のBaseline運転 | M8 | レビュー中（PR #125） |
+| #80 | Reactive Guard: dT/dt / Power急変への即応制御 | M8 | レビュー中（PR #126、実測閾値残） |
 | #82 | Control Logging: requested / effective / override / confidence / OOD | M8 | 完了（PR #110） |
 | #74 | 3系統Fan Control Engine / daemon（4層Pipeline + Demand abstraction） | M8 | |
 | #75 | 3系統Fanの風量キャラクタライズとEffective Airflow / Thermal Effectiveness Model | M8 | |
-| #81 | Air Balance Model: q_front / q_rear / q_top と協調制御 | M8 | |
+| #81 | Air Balance Model: q_front / q_rear / q_top と協調制御 | M8 | レビュー中（PR #122、実機校正残） |
 | #50 | ベースライン測定・Safety/Reactive閾値候補・Thermal Dataset初期収集 | M8 | |
 | #106 | Airflow / Fan Control 可視化 UI（ケース内の風の流れと制御状態） | M8 | |
-| #83 | Thermal Dataset schema: Window / Horizon / Fan action列とデータ収集 | M9 | |
+| #83 | Thermal Dataset schema: Window / Horizon / Fan action列とデータ収集 | M9 | 実装中（実データ収集残） |
 | #84 | Multi-horizon / multi-output Learned Thermal Model | M9 | |
 | #85 | Model Confidence / OOD検知とAuthority制限 | M9 | |
-| #104 | Control Model Registry: candidate / production / promotion / rollback | M9 | |
+| #104 | Control Model Registry: candidate / production / promotion / rollback | M9 | レビュー中（PR #123） |
 | #86 | Learned MPC optimizer とHard Constraints連携 | M9 | |
-| #87 | Workload Regime推定: IDLE / TRANSIENT / SUSTAINED / COOLDOWN / UNKNOWN | M9 | |
+| #87 | Workload Regime推定: IDLE / TRANSIENT / SUSTAINED / COOLDOWN / UNKNOWN | M9 | レビュー中（PR #124） |
 | #88 | Supervisor Interface: RulePolicy / RLPolicy / ShadowRLPolicy | M9 | |
 | #90 | Control Shadow Mode / Counterfactual logging | M9 | |
 | #91 | Offline Evaluation: Baseline vs MPC vs Guard vs Supervisor | M9 | |
@@ -128,7 +131,7 @@ GPU機どころか ESP32 すら接続せずに #8〜#25 のすべてが開発・
 | #89 | RL Supervisor: 戦略・目的関数weightの最適化 | M9 | |
 | #93 | Thermal / Airflow Model Drift Detection と再学習条件 | M9 | |
 | #107 | Workload Hint 連携: 負荷ヒントを Supervisor の prior にする | M9 | 将来 |
-| #94 | Zone別Acoustic Cost Model（Thermal Modelと分離） | M10 | |
+| #94 | Zone別Acoustic Cost Model（Thermal Modelと分離） | M10 | 完了（PR #120） |
 | #95 | Acoustic sensor study: SPL / 周波数特性 / annoyance scoreの実測方式 | M10 | |
 
 ### Control系の推奨着手順
@@ -181,4 +184,3 @@ Confidence不足・OOD・timeout時はFallbackへ退避する。
 | `blocked-by-hardware` | 実機がないと着手できない |
 | `safety` | 安全性に関わる。人間のレビュー必須 |
 | `infra` `core` `api` `ui` `ai` `ml` `research` `hardware` `firmware` `qa` `design` `integration` | 領域 |
-
