@@ -6,6 +6,13 @@
 Fan Demand を変えられるのは、定義済みの Control Pipeline を通った値だけ（AGENTS.md ルール2）。
 """
 
+from coldaisle.control.config import (
+    CONFIG_FILENAMES,
+    CONTROL_CONFIG_VERSION,
+    ConfigApprovalRequiredError,
+    ControlConfig,
+    ControlConfigManager,
+)
 from coldaisle.control.logging import ControlTraceLogger, ControlTraceSink
 from coldaisle.control.schema import (
     BOUND_BY_PRECEDENCE,
@@ -38,12 +45,17 @@ from coldaisle.control.schema import (
 
 __all__ = [
     "BOUND_BY_PRECEDENCE",
+    "CONFIG_FILENAMES",
+    "CONTROL_CONFIG_VERSION",
     "EMERGENCY_FAULTS",
     "SCHEMA_VERSION",
     "TOP_EMERGENCY_FAULTS",
     "ZONE_FAULTS",
     "AuthorityStage",
     "BoundBy",
+    "ConfigApprovalRequiredError",
+    "ControlConfig",
+    "ControlConfigManager",
     "ControlState",
     "ControlTick",
     "ControlTraceLogger",
