@@ -43,6 +43,8 @@ coldaisle-escalate = "coldaisle.escalate:main"
 coldaisle-memory = "coldaisle.memory:main"
 # 較正オフセットの算出。**既定では書かない**（#13）
 coldaisle-calibrate = "coldaisle.calibrate:main"
+# Thermal Datasetのwindow/horizonはCLIで必須指定し、実測前の候補を既定値にしない（#83）
+coldaisle-dataset = "coldaisle.dataset:main"
 
 [build-system]
 requires = ["hatchling"]
