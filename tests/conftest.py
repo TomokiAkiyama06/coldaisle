@@ -1,5 +1,6 @@
 """テスト共通の下ごしらえ。"""
 
+from collections.abc import Generator
 from pathlib import Path
 
 import pytest
@@ -15,6 +16,40 @@ CALIBRATION_PATH = CONFIG_DIR / "calibration.json"
 
 TEST_EPOCH_MS = 1_787_616_000_000
 """2026-08-25T00:00:00Z。テストを実時計に依存させないための固定の起点。"""
+
+_MARKER_SELECTION_SENTINEL = (
+    "tests/test_ci_test_selection.py::test_unmarked_hardware_named_case_runs_without_a_device"
+)
+
+
+@pytest.hookimpl(wrapper=True)
+def pytest_collection_modifyitems(
+    config: pytest.Config,
+    items: list[pytest.Item],
+) -> Generator[None]:
+    """通常 CI で test 名ではなく ``hardware`` marker だけが除外されることを検査する。"""
+    if config.getoption("markexpr") != "not hardware":
+        yield
+        return
+
+    collected_nodeids = {item.nodeid for item in items}
+    marked_nodeids = {
+        item.nodeid for item in items if item.get_closest_marker("hardware") is not None
+    }
+
+    yield
+
+    selected_nodeids = {item.nodeid for item in items}
+    if (
+        _MARKER_SELECTION_SENTINEL in collected_nodeids
+        and _MARKER_SELECTION_SENTINEL not in selected_nodeids
+    ):
+        raise pytest.UsageError("unmarked test was removed because its name contains hardware")
+    unexpectedly_selected = sorted(marked_nodeids & selected_nodeids)
+    if unexpectedly_selected:
+        raise pytest.UsageError(
+            f"hardware-marked tests were selected by the normal CI suite: {unexpectedly_selected}"
+        )
 
 
 @pytest.fixture(scope="session")
