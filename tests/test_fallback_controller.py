@@ -626,36 +626,53 @@ def test_human_mode_round_trip_resets_learned_state_and_requires_recovery_hold_a
     assert select(gate, now=3_000).active_controller is ControllerKind.LEARNED_MPC
 
 
-def test_max_mode_keeps_evaluating_the_underlying_auto_controller() -> None:
-    """MAXの実Fanは#78 forced_max。Gateは下のcontrollerをrequestedに記録する。"""
+def test_max_keeps_fallback_active_and_auto_return_requires_a_fresh_recovery_hold() -> None:
+    """MAXの実Fanは#78 forced_max。MLのcounterfactualはactive/holdに使わない。"""
     gate = ControllerGate(
-        policy(recovery_hold_ms=1),
+        policy(recovery_hold_ms=1_000),
         expected_model_version="thermal-v1",
     )
-    warming = gate.select(
+    in_max = gate.select(
         now_mono_ms=0,
         fallback=fallback_proposal(0.2),
         learned=healthy_status(),
         operating_mode=OperatingMode.MAX,
         safety_state=SafetyState.NORMAL,
     )
-    active = gate.select(
-        now_mono_ms=1,
+    still_max = gate.select(
+        now_mono_ms=1_000,
         fallback=fallback_proposal(0.2),
-        learned=healthy_status(received=1, proposal=learned_proposal(0.9)),
+        learned=healthy_status(received=1_000, proposal=learned_proposal(0.9)),
         operating_mode=OperatingMode.MAX,
         safety_state=SafetyState.NORMAL,
     )
     returned = gate.select(
-        now_mono_ms=2,
+        now_mono_ms=1_001,
         fallback=fallback_proposal(0.2),
-        learned=healthy_status(received=2, proposal=learned_proposal(0.9)),
+        learned=healthy_status(received=1_001, proposal=learned_proposal(0.9)),
+        operating_mode=OperatingMode.AUTO,
+        safety_state=SafetyState.NORMAL,
+    )
+    before_hold = gate.select(
+        now_mono_ms=2_000,
+        fallback=fallback_proposal(0.2),
+        learned=healthy_status(received=2_000, proposal=learned_proposal(0.9)),
+        operating_mode=OperatingMode.AUTO,
+        safety_state=SafetyState.NORMAL,
+    )
+    recovered = gate.select(
+        now_mono_ms=2_001,
+        fallback=fallback_proposal(0.2),
+        learned=healthy_status(received=2_001, proposal=learned_proposal(0.9)),
         operating_mode=OperatingMode.AUTO,
         safety_state=SafetyState.NORMAL,
     )
 
-    assert warming.active_controller is ControllerKind.FALLBACK
-    assert warming.fallback_reason.code == "ml_recovery_hold"
-    assert active.active_controller is ControllerKind.LEARNED_MPC
-    assert active.proposal.requested.front.demand == 0.9
-    assert returned.active_controller is ControllerKind.LEARNED_MPC
+    assert in_max.active_controller is ControllerKind.FALLBACK
+    assert in_max.fallback_reason is None
+    assert still_max.active_controller is ControllerKind.FALLBACK
+    assert still_max.recovery_healthy_since_mono_ms is None
+    assert returned.active_controller is ControllerKind.FALLBACK
+    assert returned.fallback_reason.code == "ml_recovery_hold"
+    assert before_hold.active_controller is ControllerKind.FALLBACK
+    assert recovered.active_controller is ControllerKind.LEARNED_MPC

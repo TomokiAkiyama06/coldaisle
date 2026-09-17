@@ -366,18 +366,17 @@ class ControlState(_Frozen):
         if self.fallback_reason is not None and not self.fallback_active:
             raise ValueError("Fallback でない tick に fallback_reason を付けない")
 
-        # MAX は AUTO の上に重ねる forced_max override。実Fanは全速のまま、下で
-        # 評価した controller を記録し続ける（0028 §2.5 (a)）。
+        # MAX は AUTO の上に重ねる forced_max overrideだが、0028 §2.5(c)で
+        # Learned MPCをactiveにできるmodeはAUTOだけ。MAX中のcounterfactualな
+        # Learned提案はactive controllerとは別に記録する。
         ml_could_run = (
-            self.operating_mode in {OperatingMode.AUTO, OperatingMode.MAX}
+            self.operating_mode is OperatingMode.AUTO
             and self.authority_stage is not AuthorityStage.SHADOW
             and self.safety_state is SafetyState.NORMAL
         )
         if self.active_controller is ControllerKind.LEARNED_MPC:
             if not ml_could_run:
-                raise ValueError(
-                    "ML を使えるのは AUTO/MAXの基礎制御・LIMITED 以上・NORMAL のときだけ"
-                )
+                raise ValueError("ML を使えるのは AUTO・LIMITED 以上・NORMAL のときだけ")
             if (
                 self.model_version is None
                 or self.model_confidence is None

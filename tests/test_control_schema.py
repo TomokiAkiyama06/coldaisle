@@ -389,19 +389,25 @@ def test_ml_cannot_be_active_outside_its_allowed_conditions(overrides):
         )
 
 
-def test_max_records_the_underlying_auto_controller_while_safety_forces_max():
-    state = ControlState(
+def test_max_cannot_mark_a_counterfactual_learned_proposal_as_active():
+    with pytest.raises(ValidationError, match="AUTO"):
+        ControlState(
+            operating_mode=OperatingMode.MAX,
+            authority_stage=AuthorityStage.LIMITED,
+            safety_state=SafetyState.NORMAL,
+            active_controller=ControllerKind.LEARNED_MPC,
+            fallback_active=False,
+            model_version="thermal-v1",
+            model_confidence=0.9,
+            model_ood=False,
+        )
+
+    state = fallback_state(
         operating_mode=OperatingMode.MAX,
         authority_stage=AuthorityStage.LIMITED,
-        safety_state=SafetyState.NORMAL,
-        active_controller=ControllerKind.LEARNED_MPC,
-        fallback_active=False,
-        model_version="thermal-v1",
-        model_confidence=0.9,
-        model_ood=False,
     )
-
-    assert state.active_controller is ControllerKind.LEARNED_MPC
+    assert state.active_controller is ControllerKind.FALLBACK
+    assert state.fallback_reason is None
 
 
 def test_fallback_while_ml_was_allowed_must_say_why():

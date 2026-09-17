@@ -138,10 +138,10 @@ class ControllerGate:
         self._fallback_transitions_mono_ms: deque[int] = deque()
 
     def set_operating_mode(self, operating_mode: OperatingMode, *, now_mono_ms: int) -> None:
-        """人が変えるmodeを観測し、MANUAL / CALIBRATIONとの往復でGate状態を捨てる。
+        """人が変えるmodeを観測し、AUTO外との往復でGate状態を捨てる。
 
         #74 はGateを呼ばず人のrequestedを使うmodeでも、このmethodで遷移を通知する。
-        AUTOとMAXは同じ基礎controllerを評価するため、その2 mode間では状態を保つ。
+        MAXの実Fan demandはSafetyが強制するが、active controllerはFallbackのままにする。
         """
         self._check_monotonic(now_mono_ms)
         self._observe_mode(operating_mode)
@@ -162,6 +162,13 @@ class ControllerGate:
 
         if operating_mode in {OperatingMode.MANUAL, OperatingMode.CALIBRATION}:
             raise ValueError("MANUAL / CALIBRATION の requested は Controller Gate が選ばない")
+
+        if operating_mode is OperatingMode.MAX:
+            # 0028 §2.5(c): Learned MPC をactiveにできるのはAUTOだけ。MAX中に
+            # counterfactualを評価しても復帰holdへは数えず、requestedはFallbackを使う。
+            # 実FanへのMaxは後段Safetyのforced_maxが所有する。
+            self._healthy_since_mono_ms = None
+            return self._remember(fallback, None, previous_controller)
 
         if self._policy.authority_stage is AuthorityStage.SHADOW:
             self._healthy_since_mono_ms = None
@@ -394,8 +401,12 @@ class ControllerGate:
     def _observe_mode(self, operating_mode: OperatingMode) -> None:
         if operating_mode is self._operating_mode:
             return
-        human_modes = {OperatingMode.MANUAL, OperatingMode.CALIBRATION}
-        if self._operating_mode in human_modes or operating_mode in human_modes:
+        non_auto_modes = {
+            OperatingMode.MANUAL,
+            OperatingMode.MAX,
+            OperatingMode.CALIBRATION,
+        }
+        if self._operating_mode in non_auto_modes or operating_mode in non_auto_modes:
             self._active_controller = None
             self._last_requested = None
             self._healthy_since_mono_ms = None
