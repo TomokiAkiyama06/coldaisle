@@ -6,6 +6,20 @@
 Fan Demand を変えられるのは、定義済みの Control Pipeline を通った値だけ（AGENTS.md ルール2）。
 """
 
+from coldaisle.control.acoustic import (
+    ACOUSTIC_CONFIG_FILENAME,
+    ACOUSTIC_CONFIG_VERSION,
+    AcousticCostEstimate,
+    AcousticCostMetadata,
+    AcousticCostModel,
+    AcousticInteraction,
+    AcousticModelConfig,
+    AcousticModelSource,
+    ConfiguredAcousticCostModel,
+    DisabledAcousticCostModel,
+    ZoneAcousticCurve,
+    load_acoustic_model,
+)
 from coldaisle.control.config import (
     CONFIG_FILENAMES,
     CONTROL_CONFIG_VERSION,
@@ -43,6 +57,8 @@ from coldaisle.control.schema import (
 )
 
 __all__ = [
+    "ACOUSTIC_CONFIG_FILENAME",
+    "ACOUSTIC_CONFIG_VERSION",
     "BOUND_BY_PRECEDENCE",
     "CONFIG_FILENAMES",
     "CONTROL_CONFIG_VERSION",
@@ -50,8 +66,15 @@ __all__ = [
     "SCHEMA_VERSION",
     "TOP_EMERGENCY_FAULTS",
     "ZONE_FAULTS",
+    "AcousticCostEstimate",
+    "AcousticCostMetadata",
+    "AcousticCostModel",
+    "AcousticInteraction",
+    "AcousticModelConfig",
+    "AcousticModelSource",
     "AuthorityStage",
     "BoundBy",
+    "ConfiguredAcousticCostModel",
     "ControlConfig",
     "ControlState",
     "ControlTick",
@@ -60,6 +83,7 @@ __all__ = [
     "ControllerKind",
     "ControllerProposal",
     "Demand",
+    "DisabledAcousticCostModel",
     "EffectiveZoneDemand",
     "Fault",
     "FaultCode",
@@ -73,6 +97,8 @@ __all__ = [
     "SafetyState",
     "SafetyZoneOutput",
     "Zone",
+    "ZoneAcousticCurve",
     "ZoneRecord",
     "ZoneRequest",
+    "load_acoustic_model",
 ]
