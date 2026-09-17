@@ -4,6 +4,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+import pytest
+from pydantic import ValidationError
+
 from coldaisle.internal_telemetry import NvmlAdapter, NvmlConfig, SourceStatus
 from coldaisle.store import Quality
 
@@ -82,18 +85,33 @@ def test_nvml_reads_direct_metrics_and_marks_optional_temperature_missing():
     assert readings["sys.cuda_processes"].value == 2.0
 
 
-def test_nvml_deduplicates_processes_across_gpus_and_initializes_once():
-    api = FakeNvml(count=2, processes={0: (10, 20), 1: (20, 30)})
-    adapter = NvmlAdapter(config(0, 1), api)
+def test_nvml_initializes_once_across_polls():
+    api = FakeNvml(processes={0: (10, 20)})
+    adapter = NvmlAdapter(config(0), api)
 
     first = by_metric(adapter)
     second = by_metric(adapter)
     adapter.close()
 
-    assert first["sys.cuda_processes"].value == 3.0
-    assert second["gpu.1.core"].value == 61.0
+    assert first["sys.cuda_processes"].value == 2.0
+    assert second["gpu.0.core"].value == 60.0
     assert api.initialized == 1
     assert api.shutdowns == 1
+
+
+def test_nvml_rejects_unstable_multi_gpu_enumeration_mapping():
+    with pytest.raises(ValidationError, match="単一 GPU"):
+        config(0, 1)
+
+
+def test_nvml_runtime_requires_exactly_one_physical_gpu():
+    adapter = NvmlAdapter(config(0), FakeNvml(count=2))
+
+    result = adapter.poll()
+
+    assert result.status is SourceStatus.UNAVAILABLE
+    assert result.detail == "unexpected_device_count:2"
+    assert {reading.quality for reading in result.readings} == {Quality.MISSING}
 
 
 def test_nvml_failure_is_explicit_missing_and_does_not_raise():

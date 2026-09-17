@@ -3,6 +3,8 @@
 from coldaisle.internal_telemetry.collector import CollectionCycle, InternalTelemetryCollector
 from coldaisle.internal_telemetry.config import (
     CONNECTOR_TEMPERATURE_METRIC,
+    ConfirmationEvidence,
+    ConfirmationStatus,
     HwmonConfig,
     HwmonMeasurement,
     HwmonSensorConfig,
@@ -17,6 +19,8 @@ __all__ = [
     "CONNECTOR_TEMPERATURE_METRIC",
     "AdapterResult",
     "CollectionCycle",
+    "ConfirmationEvidence",
+    "ConfirmationStatus",
     "HwmonAdapter",
     "HwmonConfig",
     "HwmonMeasurement",

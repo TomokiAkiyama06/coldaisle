@@ -139,7 +139,7 @@ def _gpu_metrics(index: int) -> tuple[str, ...]:
 
 
 class NvmlAdapter:
-    """複数 GPU を1回の NVML session から読み取る。"""
+    """単一 GPU を1回の NVML session から読み取る。"""
 
     name = "nvml"
 
@@ -167,6 +167,13 @@ class NvmlAdapter:
             count = self._api.device_count()
         except Exception as error:
             return self._unavailable(error)
+        if count != 1:
+            return AdapterResult(
+                source=self.name,
+                status=SourceStatus.UNAVAILABLE,
+                readings=tuple(_missing(metric) for metric in self.expected_metrics),
+                detail=f"unexpected_device_count:{count}",
+            )
 
         readings: list[Reading] = []
         process_ids: set[int] = set()

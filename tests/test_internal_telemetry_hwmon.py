@@ -8,6 +8,8 @@ import pytest
 from pydantic import ValidationError
 
 from coldaisle.internal_telemetry import (
+    ConfirmationEvidence,
+    ConfirmationStatus,
     HwmonAdapter,
     HwmonConfig,
     HwmonMeasurement,
@@ -34,6 +36,7 @@ def sensor(
     required: bool = False,
     minimum: float | None = None,
     maximum: float | None = None,
+    confirmed: bool = True,
 ) -> HwmonSensorConfig:
     return HwmonSensorConfig(
         metric=metric,
@@ -45,6 +48,15 @@ def sensor(
         required=required,
         minimum=minimum,
         maximum=maximum,
+        confirmation=(
+            ConfirmationEvidence(
+                status=ConfirmationStatus.CONFIRMED,
+                basis="fixture physical-input check and owner approval",
+            )
+            if confirmed
+            else None
+        ),
+        disabled_reason=None,
     )
 
 
@@ -112,6 +124,16 @@ def test_stable_channel_is_supported_when_driver_has_no_label(tmp_path: Path):
     assert result["fan.rear.pwm"].value == pytest.approx(64 / 255 * 100)
 
 
+def test_unconfirmed_physical_mapping_cannot_be_enabled():
+    with pytest.raises(ValidationError, match="物理入力の実機確認"):
+        sensor(
+            "fan.rear.rpm",
+            HwmonMeasurement.RPM,
+            channel="fan3",
+            confirmed=False,
+        )
+
+
 def test_ambiguous_or_missing_selector_is_not_guessed(tmp_path: Path):
     for number in (1, 8):
         device = tmp_path / f"hwmon{number}"
@@ -167,6 +189,10 @@ def test_stable_selector_rejects_hwmon_number_and_path():
             label="Package",
             channel="temp1",
             measurement=HwmonMeasurement.TEMPERATURE,
+            confirmation=ConfirmationEvidence(
+                status=ConfirmationStatus.CONFIRMED,
+                basis="fixture physical-input check and owner approval",
+            ),
         )
     with pytest.raises(ValidationError, match="hwmonN path"):
         HwmonConfig(enabled=True, root=Path("/sys/class/hwmon/hwmon2"))
@@ -175,6 +201,37 @@ def test_stable_selector_rejects_hwmon_number_and_path():
 def test_enabled_t_sensor_requires_calibrated_range():
     with pytest.raises(ValidationError, match="#50"):
         sensor("board.connector_12v2x6", HwmonMeasurement.TEMPERATURE)
+
+
+def test_enabled_t_sensor_requires_confirmed_measurement_and_owner_approval():
+    with pytest.raises(ValidationError, match="物理入力の実機確認"):
+        sensor(
+            "board.connector_12v2x6",
+            HwmonMeasurement.TEMPERATURE,
+            minimum=-20.0,
+            maximum=125.0,
+            confirmed=False,
+        )
+
+    with pytest.raises(ValidationError, match="basis"):
+        ConfirmationEvidence(status=ConfirmationStatus.CONFIRMED)
+
+
+def test_hwmon_poll_has_no_write_path(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    device = tmp_path / "hwmon1"
+    write(device / "name", "example_driver")
+    write(device / "temp1_label", "Example Label")
+    write(device / "temp1_input", "42000")
+    reader = adapter(tmp_path, sensor("cpu.package", HwmonMeasurement.TEMPERATURE))
+
+    def reject_write(*_args: object, **_kwargs: object) -> int:
+        raise AssertionError("read-only telemetry adapter attempted a write")
+
+    monkeypatch.setattr(Path, "write_text", reject_write)
+
+    result = reader.poll()
+
+    assert result.readings[0].value == 42.0
 
 
 def test_repository_config_keeps_uninstalled_t_sensor_disabled():
@@ -189,3 +246,5 @@ def test_repository_config_keeps_uninstalled_t_sensor_disabled():
     assert t_sensor.channel is None
     assert t_sensor.minimum is None
     assert t_sensor.maximum is None
+    assert t_sensor.confirmation is None
+    assert t_sensor.disabled_reason is not None

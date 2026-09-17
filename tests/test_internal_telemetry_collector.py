@@ -2,17 +2,25 @@
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from pathlib import Path
 
+from coldaisle import logs
 from coldaisle.clock import SimulatedClock
 from coldaisle.internal_telemetry import (
     AdapterResult,
     InternalTelemetryCollector,
+    InternalTelemetryConfig,
     SourceStatus,
 )
 from coldaisle.store import Quality, Reading, Sample, SqliteStore
-from coldaisle.telemetry_daemon import SOURCE_STATE_PREFIX, InternalTelemetryDaemon
+from coldaisle.telemetry_daemon import (
+    SOURCE_STATE_PREFIX,
+    InternalTelemetryDaemon,
+    _log_configuration,
+)
+from conftest import CONFIG_DIR
 
 
 @dataclass
@@ -98,3 +106,20 @@ def test_daemon_adds_internal_values_to_the_existing_air_timeline(tmp_path: Path
     assert latest["power.gpu.0"].quality is Quality.MISSING
     assert store.current_state(SOURCE_STATE_PREFIX + "nvml") == "degraded"
     assert adapter.closed
+
+
+def test_startup_audit_logs_disabled_reason_and_confirmation(caplog):
+    config = InternalTelemetryConfig.from_yaml(CONFIG_DIR / "internal-telemetry.yaml")
+
+    with caplog.at_level(logging.INFO, logger="coldaisle.internal_telemetry"):
+        _log_configuration(config)
+
+    hwmon_records = [
+        record for record in caplog.records if record.message == "hwmon input configuration"
+    ]
+    assert len(hwmon_records) == 1
+    fields = getattr(hwmon_records[0], logs.FIELDS_KEY)
+    assert fields["metric"] == "board.connector_12v2x6"
+    assert fields["enabled"] is False
+    assert fields["selector"] == "none"
+    assert fields["disabled_reason"].startswith("not installed")

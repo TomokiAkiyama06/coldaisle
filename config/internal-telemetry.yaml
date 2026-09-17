@@ -9,6 +9,8 @@ interval_ms: 2500
 
 nvml:
   enabled: true
+  # v1 は物理 GPU が1台だけの構成を検証し、その唯一の GPU を logical 0 とする。
+  # 複数 GPU を列挙順で永続 metric へ割り当てることは禁止する。
   gpu_indices: [0]
 
 hwmon:
@@ -26,3 +28,5 @@ hwmon:
       required: true
       minimum: null
       maximum: null
+      confirmation: null
+      disabled_reason: "not installed; enable only after #50 measurement and owner approval"

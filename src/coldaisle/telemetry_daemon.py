@@ -144,6 +144,7 @@ def build(
 ) -> InternalTelemetryDaemon:
     """設定を読み、実 adapter と既存 Store を1つの clock で束ねる。"""
     telemetry = InternalTelemetryConfig.from_yaml(config.telemetry)
+    _log_configuration(telemetry)
     used_clock = clock or WallClock()
     used_adapters = adapters or (
         NvmlAdapter(telemetry.nvml),
@@ -158,6 +159,46 @@ def build(
         interval_ms=telemetry.interval_ms,
         sleep=sleep,
     )
+
+
+def _log_configuration(config: InternalTelemetryConfig) -> None:
+    """入力の有効状態と実機確認根拠を起動時の監査ログへ残す。"""
+    LOGGER.info(
+        "NVML input configuration",
+        extra={
+            logs.FIELDS_KEY: {
+                "enabled": config.nvml.enabled,
+                "logical_gpu_indices": config.nvml.gpu_indices,
+                "identity_contract": "single_physical_gpu",
+            }
+        },
+    )
+    for sensor in config.hwmon.sensors:
+        if sensor.label is not None:
+            selector = "label"
+        elif sensor.channel is not None:
+            selector = "channel"
+        else:
+            selector = "none"
+        LOGGER.info(
+            "hwmon input configuration",
+            extra={
+                logs.FIELDS_KEY: {
+                    "metric": sensor.metric,
+                    "enabled": sensor.enabled,
+                    "selector": selector,
+                    "confirmation_status": (
+                        sensor.confirmation.status.value
+                        if sensor.confirmation is not None
+                        else None
+                    ),
+                    "confirmation_basis": (
+                        sensor.confirmation.basis if sensor.confirmation is not None else None
+                    ),
+                    "disabled_reason": sensor.disabled_reason,
+                }
+            },
+        )
 
 
 def build_parser() -> argparse.ArgumentParser:

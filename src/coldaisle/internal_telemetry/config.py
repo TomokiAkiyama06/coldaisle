@@ -20,8 +20,28 @@ class _ConfigModel(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
 
+class ConfirmationStatus(StrEnum):
+    """実機対応・較正の確認状態。confirmed は所有者承認済みを表す。"""
+
+    PROVISIONAL = "provisional"
+    CONFIRMED = "confirmed"
+
+
+class ConfirmationEvidence(_ConfigModel):
+    """実機での確認と所有者承認を追跡する証跡。"""
+
+    status: ConfirmationStatus
+    basis: str | None = Field(default=None, min_length=1, max_length=500)
+
+    @model_validator(mode="after")
+    def _confirmed_requires_a_basis(self) -> Self:
+        if self.status is ConfirmationStatus.CONFIRMED and self.basis is None:
+            raise ValueError("confirmed には測定記録と所有者承認の basis が必要")
+        return self
+
+
 class NvmlConfig(_ConfigModel):
-    """NVML adapter の設定。GPU index は NVML の列挙順。"""
+    """NVML adapter の設定。v1 は単一 GPU の論理 index 0 だけを扱う。"""
 
     enabled: bool
     gpu_indices: tuple[int, ...] = Field(min_length=1)
@@ -32,6 +52,11 @@ class NvmlConfig(_ConfigModel):
             raise ValueError("gpu_indices は 0 以上にする")
         if len(set(self.gpu_indices)) != len(self.gpu_indices):
             raise ValueError("gpu_indices は重複させない")
+        if self.gpu_indices != (0,):
+            raise ValueError(
+                "v1 は単一 GPU の logical index 0 だけを扱う; "
+                "複数 GPU には承認済みの物理 GPU 対応が必要"
+            )
         return self
 
 
@@ -60,12 +85,18 @@ class HwmonSensorConfig(_ConfigModel):
     required: bool = False
     minimum: float | None = None
     maximum: float | None = None
+    confirmation: ConfirmationEvidence | None = None
+    disabled_reason: str | None = Field(default=None, min_length=1, max_length=500)
 
     @model_validator(mode="after")
     def _has_a_stable_selector_and_valid_range(self) -> Self:
         validate_metric(self.metric)
         if self.enabled and not self.driver:
             raise ValueError("有効な hwmon sensor には driver が必要")
+        if self.enabled and self.disabled_reason is not None:
+            raise ValueError("有効な hwmon sensor に disabled_reason を指定しない")
+        if not self.enabled and self.disabled_reason is None:
+            raise ValueError("無効な hwmon sensor には disabled_reason が必要")
         if self.enabled and (self.label is None) == (self.channel is None):
             raise ValueError("有効な hwmon sensor は label または stable channel の片方を指定する")
         if self.driver is not None and (
@@ -80,6 +111,14 @@ class HwmonSensorConfig(_ConfigModel):
             raise ValueError("minimum は maximum より小さくする")
         if self.enabled and self.metric == CONNECTOR_TEMPERATURE_METRIC and self.minimum is None:
             raise ValueError("T_SENSOR を有効にするには #50 で確認した妥当範囲が必要")
+        if self.enabled and (
+            self.confirmation is None
+            or self.confirmation.status is not ConfirmationStatus.CONFIRMED
+        ):
+            raise ValueError(
+                "hwmon sensor を有効にするには、物理入力の実機確認を "
+                "confirmed の basis 付きで記録する"
+            )
         return self
 
 

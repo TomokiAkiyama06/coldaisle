@@ -13,6 +13,10 @@ NVML は `nvidia-smi` を起動せず `nvidia-ml-py` から直接読む。GPU �
 停止した、または optional な hotspot / memory temperature を公開しない場合も、値を
 0で補わず `missing` として記録し、他の source の収集を続ける。source health は
 `sys.telemetry_source.nvml` / `sys.telemetry_source.hwmon` の状態遷移として残る。
+v1 の `gpu.0` は「実機に1台だけある GPU」という論理 role であり、起動後の NVML
+列挙数が1以外なら source を `unavailable` にする。複数 GPU の列挙 index を永続 metric
+へ直結しない。複数 GPU 対応には、リポジトリ外で管理する承認済み UUID / PCI identity
+から logical index への対応を別途決める。
 
 ## hwmon の対応付け
 
@@ -21,6 +25,11 @@ NVML は `nvidia-smi` を起動せず `nvidia-ml-py` から直接読む。GPU �
 同じ物理入力を指すと確認した `channel`（`tempN` / `powerN` / `fanN`）を label の代わりに
 指定できる。`hwmonN` と絶対 target path は設定しない。collector は poll ごとに
 `hwmonN` を探索し直す。
+
+有効な sensor には `confirmation.status: confirmed` と、物理入力の実機確認・所有者承認を
+指す `confirmation.basis` が必須である。`channel` fallback も例外にしない。T_SENSOR の
+`basis` は #50 の測定・較正と所有者承認を含める。無効な sensor には
+`disabled_reason` を必須とし、有効状態・確認根拠とともに起動時の構造化ログへ残す。
 
 測定種別と保存単位は次のとおり。
 
@@ -44,6 +53,10 @@ repository には実機の `hwmonN` や個体識別子を追加しない。
   required: true
   minimum: null
   maximum: null
+  confirmation:
+    status: confirmed
+    basis: "実機確認記録と所有者承認への参照"
+  disabled_reason: null
 - metric: fan.front.rpm
   enabled: true
   driver: example_super_io
@@ -53,14 +66,20 @@ repository には実機の `hwmonN` や個体識別子を追加しない。
   required: false
   minimum: null
   maximum: null
+  confirmation:
+    status: confirmed
+    basis: "実機確認記録と所有者承認への参照"
+  disabled_reason: null
 ```
 
 同じ selector が複数見つかった場合は推測で選ばず `missing` にする。T_SENSOR の metric
 は決定記録0032（Proposed）で、取得端子名ではなく測定位置を表す
 `board.connector_12v2x6` を提案している。未設置の間は
 `enabled: false` のままなので Critical 入力には含めない。有効化には #50 で確認した
-`minimum` / `maximum` が必要で、範囲外は `suspect` になる。collector 自体が止まった
-場合は既存 Store の鮮度判定で最後の値が `stale` になる。
+`minimum` / `maximum` と #50 の測定・所有者承認を指す confirmed の `basis` が必要で、
+範囲外は `suspect` になる。collector 自体が止まった場合は既存 Store の鮮度判定で最後の
+値が `stale` になる。#102 はこの enable 状態から制御入力 contract を作り、#82 は
+T_SENSOR の無効理由を decision trace に引き継ぐ（collector 自身は制御判断を行わない）。
 
 ## 実機で残る確認
 

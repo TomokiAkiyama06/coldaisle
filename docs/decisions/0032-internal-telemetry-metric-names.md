@@ -35,9 +35,15 @@ T_SENSOR はマザーボード上の取得端子名であり、測定対象で�
 Dataset で比較しやすい `0..100 %` へ変換して保存する。制御層内部の `demand=0.0..1.0`
 とは別の、実際に読めた hardware telemetry である。
 
+v1 の `gpu.0` は NVML の列挙 index を永続 identity とする名前ではなく、**実機に1台だけ
+存在する GPU**という logical role とする。collector は NVML の device count が1以外なら
+収集を `unavailable` にし、推測で GPU を選ばない。複数 GPU を扱う場合は、承認済みの
+UUID / PCI identity（個体値はリポジトリ外）から logical index への対応を先に決める。
+
 T_SENSOR は未設置なので、本記録が FINAL になっても設置・#50 の較正・妥当範囲の承認が
 終わるまで本番設定を `enabled: false` に保つ。有効化前は欠測でも Critical としない
-（0029 §2.4）。現在の実装と設定はこの Proposed 名を受け付けるが、本番収集は無効である。
+（0029 §2.4）。有効化には #50 の測定・較正と所有者承認を `status: confirmed` / `basis`
+として残す。現在の実装と設定はこの Proposed 名を受け付けるが、本番収集は無効である。
 
 ## 3. Consequences
 
@@ -61,5 +67,6 @@ T_SENSOR は未設置なので、本記録が FINAL になっても設置・#50 
 
 - T_SENSOR の妥当範囲、断線時の実測値、較正誤差は #50 で測定し、人が承認する
 - 実機上の driver / label と物理 header の対応は #65 の実機確認として残す
+- 複数 GPU が必要になった場合の physical identity → logical index 対応
 - 複数の tach を持つ1 zoneを個別 fanへ分ける必要が出た場合の index 規則は、その時点で
   別の Decision Record にする
