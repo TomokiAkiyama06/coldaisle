@@ -99,7 +99,7 @@ class _ZoneRuntime:
     release_causes: tuple[str, ...] = ()
 
 
-_TRIGGERS: tuple[_TriggerSpec, ...] = (
+_STATIC_TRIGGERS: tuple[_TriggerSpec, ...] = (
     _TriggerSpec(
         code="cpu_temperature_rise",
         metric="cpu.package",
@@ -113,13 +113,6 @@ _TRIGGERS: tuple[_TriggerSpec, ...] = (
         source=GuardEvidenceSource.TREND,
         config_field="gpu_temperature_rate_c_per_s",
         zones=frozenset({Zone.FRONT, Zone.REAR}),
-    ),
-    _TriggerSpec(
-        code="cpu_power_rise",
-        metric="power.cpu.package",
-        source=GuardEvidenceSource.TREND,
-        config_field="cpu_power_rate_w_per_s",
-        zones=frozenset({Zone.TOP}),
     ),
     _TriggerSpec(
         code="gpu_power_rise",
@@ -150,7 +143,19 @@ class ReactiveGuard:
 
     def __init__(self, config: ReactiveGuardConfig) -> None:
         self._config = config
-        self._trigger_active = {trigger.code: False for trigger in _TRIGGERS}
+        triggers = list(_STATIC_TRIGGERS)
+        if config.cpu_power_metric is not None:
+            triggers.append(
+                _TriggerSpec(
+                    code="cpu_power_rise",
+                    metric=config.cpu_power_metric.value,
+                    source=GuardEvidenceSource.TREND,
+                    config_field="cpu_power_rate_w_per_s",
+                    zones=frozenset({Zone.TOP}),
+                )
+            )
+        self._triggers = tuple(triggers)
+        self._trigger_active = {trigger.code: False for trigger in self._triggers}
         self._zones = {zone: _ZoneRuntime() for zone in Zone}
         self._last_tick_id: int | None = None
         self._last_monotonic_ms: int | None = None
@@ -183,7 +188,7 @@ class ReactiveGuard:
         evidence: list[GuardEvidence] = []
         unavailable: set[str] = set()
 
-        for trigger in _TRIGGERS:
+        for trigger in self._triggers:
             value, is_unavailable = self._read_value(snapshot, trigger)
             was_active = self._trigger_active[trigger.code]
             if is_unavailable:
@@ -305,13 +310,16 @@ class ReactiveGuard:
         runtime = self._zones[zone]
         was_intervening = runtime.intervening
         events: list[GuardEvent] = []
-        if not trigger_codes and release_causes:
-            runtime.release_causes = release_causes
+        if release_causes:
+            runtime.release_causes = tuple(
+                sorted(set(runtime.release_causes).union(release_causes))
+            )
 
         if trigger_codes:
             runtime.hold_until_mono_ms = now_mono_ms + self._config.hold_ms.value
-            runtime.origin_trigger_codes = trigger_codes
-            runtime.release_causes = ()
+            runtime.origin_trigger_codes = tuple(
+                sorted(set(runtime.origin_trigger_codes).union(trigger_codes))
+            )
             reason = Reason(
                 code="reactive_guard_triggered",
                 detail=f"zone={zone.value}; triggers={','.join(trigger_codes)}",

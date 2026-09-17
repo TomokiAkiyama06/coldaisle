@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import pytest
+from pydantic import ValidationError
 
 from coldaisle.control.config import ReactiveGuardConfig
 from coldaisle.control.reactive import (
@@ -38,6 +39,10 @@ def provisional(value: float | int) -> dict[str, object]:
     return {"value": value, "status": "provisional"}
 
 
+def confirmed(value: str) -> dict[str, object]:
+    return {"value": value, "status": "confirmed", "basis": "approved metric contract"}
+
+
 def band(
     activate: float,
     clear: float,
@@ -52,11 +57,16 @@ def band(
     }
 
 
-def config(*, hold_ms: int = 5_000) -> ReactiveGuardConfig:
+def config(
+    *,
+    hold_ms: int = 5_000,
+    cpu_power_metric: str | None = None,
+) -> ReactiveGuardConfig:
     return ReactiveGuardConfig.model_validate(
         {
             "floor": provisional(0.6),
             "hold_ms": provisional(hold_ms),
+            "cpu_power_metric": (None if cpu_power_metric is None else confirmed(cpu_power_metric)),
             "cpu_temperature_rate_c_per_s": band(2.0, 1.0, 1.5, 0.5),
             "gpu_temperature_rate_c_per_s": band(2.0, 1.0, 1.5, 0.5),
             "cpu_power_rate_w_per_s": band(15.0, 5.0, 10.0, 2.5),
@@ -175,7 +185,7 @@ def test_cpu_temperature_rise_only_raises_the_top_floor() -> None:
 
 
 def test_cpu_power_step_raises_top_without_waiting_for_a_temperature_limit() -> None:
-    decision = ReactiveGuard(config()).evaluate(
+    decision = ReactiveGuard(config(cpu_power_metric="power.cpu.package")).evaluate(
         snapshot(
             tick=1,
             mono=2_000,
@@ -194,6 +204,28 @@ def test_cpu_power_step_raises_top_without_waiting_for_a_temperature_limit() -> 
     assert decision.zones.top.floor == pytest.approx(0.6)
     assert decision.zones.front == GuardZoneOutput()
     assert any(item.code == "cpu_power_rise" for item in decision.evidence)
+
+
+def test_unapproved_cpu_power_metric_keeps_the_trigger_disabled() -> None:
+    decision = ReactiveGuard(config()).evaluate(
+        snapshot(
+            tick=1,
+            mono=2_000,
+            signals=(signal("power.cpu.package", 180.0, changed=2_000),),
+            trends=(
+                Trend(
+                    metric="power.cpu.package",
+                    per_second=20.0,
+                    from_mono_ms=1_000,
+                    to_mono_ms=2_000,
+                ),
+            ),
+        )
+    )
+
+    assert decision.zones.top == GuardZoneOutput()
+    assert all(item.code != "cpu_power_rise" for item in decision.evidence)
+    assert "power.cpu.package" not in decision.unavailable_inputs
 
 
 @pytest.mark.parametrize(
@@ -289,6 +321,76 @@ def test_hysteresis_and_hold_prevent_hunting_and_record_release_reason() -> None
     assert release_event.reason.code == "reactive_guard_released"
     assert "causes=threshold_clear" in release_event.reason.detail
     assert release_event.trigger_codes == ("gpu_temperature_rise",)
+
+
+def test_overlapping_triggers_keep_all_origins_and_release_causes() -> None:
+    guard = ReactiveGuard(config(hold_ms=1_000))
+    first = guard.evaluate(temperature_snapshot(tick=1, mono=1_000, rate=3.0))
+    overlap = guard.evaluate(
+        snapshot(
+            tick=2,
+            mono=2_000,
+            signals=(
+                signal("gpu.0.core", None, quality=Quality.MISSING, changed=2_000),
+                signal("power.gpu.0", 200.0, changed=2_000),
+            ),
+            trends=(
+                Trend(
+                    metric="power.gpu.0",
+                    per_second=20.0,
+                    from_mono_ms=1_000,
+                    to_mono_ms=2_000,
+                ),
+            ),
+            health=TelemetryHealth.DEGRADED,
+        )
+    )
+    holding = guard.evaluate(
+        snapshot(
+            tick=3,
+            mono=2_500,
+            signals=(
+                signal("gpu.0.core", None, quality=Quality.MISSING, changed=2_500),
+                signal("power.gpu.0", 200.0, changed=2_500),
+            ),
+            trends=(
+                Trend(
+                    metric="power.gpu.0",
+                    per_second=1.0,
+                    from_mono_ms=2_000,
+                    to_mono_ms=2_500,
+                ),
+            ),
+            health=TelemetryHealth.DEGRADED,
+        )
+    )
+    released = guard.evaluate(
+        snapshot(
+            tick=4,
+            mono=3_000,
+            signals=(
+                signal("gpu.0.core", None, quality=Quality.MISSING, changed=3_000),
+                signal("power.gpu.0", 200.0, changed=3_000),
+            ),
+            trends=(
+                Trend(
+                    metric="power.gpu.0",
+                    per_second=1.0,
+                    from_mono_ms=2_500,
+                    to_mono_ms=3_000,
+                ),
+            ),
+            health=TelemetryHealth.DEGRADED,
+        )
+    )
+
+    assert first.events[0].trigger_codes == ("gpu_temperature_rise",)
+    assert overlap.zones.front.floor == pytest.approx(0.6)
+    assert holding.zones.front.reason is not None
+    assert "release_causes=input_unavailable,threshold_clear" in holding.zones.front.reason.detail
+    release_event = next(event for event in released.events if event.zone.value == "front")
+    assert release_event.trigger_codes == ("gpu_power_rise", "gpu_temperature_rise")
+    assert "causes=input_unavailable,threshold_clear" in release_event.reason.detail
 
 
 def test_fresh_signal_without_a_new_sample_keeps_the_latch_until_the_next_trend() -> None:
@@ -413,6 +515,36 @@ def test_guard_output_preserves_the_critical_safety_priority_protocol() -> None:
 
     assert safety_wins.effective == pytest.approx(0.8)
     assert forced_max_wins.effective == pytest.approx(1.0)
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"effective": 0.5, "safety_floor": 0.8},
+        {"effective": 0.5, "guard_floor": 0.6},
+        {
+            "effective": 0.9,
+            "forced_max": True,
+            "bound_by": BoundBy.FORCED_MAX,
+        },
+    ],
+)
+def test_schema_rejects_any_effective_demand_that_bypasses_guard_or_safety(
+    overrides: dict[str, object],
+) -> None:
+    values: dict[str, object] = {
+        "requested": 0.2,
+        "effective": 0.8,
+        "bound_by": BoundBy.SAFETY_FLOOR,
+        "safety_floor": 0.8,
+        "forced_max": False,
+        "guard_floor": 0.6,
+        "reasons": (Reason(code="safety_floor"),),
+    }
+    values.update(overrides)
+
+    with pytest.raises(ValidationError):
+        EffectiveZoneDemand.model_validate(values)
 
 
 def test_out_of_order_snapshot_cannot_rewind_hold_state() -> None:

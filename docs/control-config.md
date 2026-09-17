@@ -39,6 +39,12 @@ Power signalが未設定またはstale / missingならfeed-forward項だけを�
 Fallback Controllerの生成時に、temperature入力がMetric Catalog上の`C`、Power入力が`W`で
 あることも検証し、名前が正しくても単位が異なるpolicyは起動前に拒否する。
 
+#80 のv3への移行は自動補完しない。v2の Fallback フィールドはそのまま残し、
+`reactive_guard` の旧 `ceiling` / `intake_rise_threshold_c` /
+`gpu_hotspot_threshold_c` を削除して、六つの trigger それぞれに通常・Degradedの
+発火/解除閾値を明示する。`cpu_power_metric` は承認まで `null` とし、
+最後に `schema_version: 3` へ上げる。v2のまま、または新旧shapeが混ざった設定は拒否する。
+
 `gate_min_confidence` は `limited` / `expanded` / `full` ごとに持ち、高いauthority stageほど
 低いconfidenceで動かせないよう `limited <= expanded <= full` を検証する。ML→Fallbackの
 切替回数が `demote_window_ms` 内で `demote_after` に達した場合、Gateは降格推奨をtraceへ出す。

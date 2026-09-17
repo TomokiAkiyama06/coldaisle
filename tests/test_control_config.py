@@ -6,7 +6,7 @@ import pytest
 import yaml
 from pydantic import ValidationError
 
-from coldaisle.control.config import ControlConfig
+from coldaisle.control.config import CONTROL_CONFIG_VERSION, ControlConfig
 
 
 def provisional(value: float | int) -> dict[str, object]:
@@ -184,6 +184,7 @@ def load_config(tmp_path: Path) -> ControlConfig:
 def test_complete_config_has_traceable_sources_and_is_not_actuation_ready(tmp_path: Path) -> None:
     config = load_config(tmp_path)
 
+    assert CONTROL_CONFIG_VERSION == 3
     assert config.actuation_permitted is False
     metadata = config.trace_metadata()["control_config"]
     assert metadata["fan_hardware"]["name"] == "fan-hardware.yaml"
@@ -239,6 +240,34 @@ def test_cross_field_validation_rejects_unsafe_or_unstable_values(tmp_path: Path
     write_documents(tmp_path, documents)
     with pytest.raises(ValidationError, match="保守側"):
         ControlConfig.from_directory(tmp_path)
+
+
+def test_cpu_power_guard_metric_requires_confirmed_approval(tmp_path: Path) -> None:
+    documents = valid_documents()
+    documents["fan-policy.yaml"]["reactive_guard"]["cpu_power_metric"] = {
+        "value": "power.cpu.package",
+        "status": "provisional",
+    }
+    write_documents(tmp_path, documents)
+    with pytest.raises(ValidationError, match="confirmed"):
+        ControlConfig.from_directory(tmp_path)
+
+    documents["fan-policy.yaml"]["reactive_guard"]["cpu_power_metric"] = {
+        "value": "not-a-metric",
+        "status": "confirmed",
+        "basis": "approved metric contract",
+    }
+    write_documents(tmp_path, documents)
+    with pytest.raises(ValueError, match="metric"):
+        ControlConfig.from_directory(tmp_path)
+
+    documents["fan-policy.yaml"]["reactive_guard"]["cpu_power_metric"] = {
+        "value": "power.cpu.package",
+        "status": "confirmed",
+        "basis": "DR0032 FINAL and owner approval",
+    }
+    write_documents(tmp_path, documents)
+    assert ControlConfig.from_directory(tmp_path).policy.reactive_guard.cpu_power_metric is not None
 
 
 def test_unstable_hwmon_number_is_rejected(tmp_path: Path) -> None:
@@ -401,12 +430,16 @@ def test_confidence_thresholds_are_validated_per_authority_stage(tmp_path: Path)
         ControlConfig.from_directory(tmp_path)
 
 
-def test_old_fan_policy_schema_is_rejected_instead_of_silently_reinterpreted(
+def test_previous_fan_policy_schema_is_rejected_until_explicitly_migrated(
     tmp_path: Path,
 ) -> None:
     documents = valid_documents()
-    documents["fan-policy.yaml"]["schema_version"] = 1
+    documents["fan-policy.yaml"]["schema_version"] = 2
     write_documents(tmp_path, documents)
 
     with pytest.raises(ValidationError, match="schema_version"):
         ControlConfig.from_directory(tmp_path)
+
+    documents["fan-policy.yaml"]["schema_version"] = 3
+    write_documents(tmp_path, documents)
+    assert ControlConfig.from_directory(tmp_path).policy.schema_version == 3

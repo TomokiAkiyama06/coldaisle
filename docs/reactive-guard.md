@@ -10,7 +10,7 @@ Reactive Guard は、Learned MPC / Fallback が作った `requested_demand` と 
 |---|---|---|
 | CPU 温度上昇 | `cpu.package` の trend（℃/s） | Top |
 | GPU 温度上昇 | `gpu.0.core` の trend（℃/s） | Front / Rear |
-| CPU power 上昇 | `power.cpu.package` の trend（W/s） | Top |
+| CPU power 上昇 | 承認済み `cpu_power_metric` の trend（W/s） | Top |
 | GPU power 上昇 | `power.gpu.0` の trend（W/s） | Front / Rear |
 | 吸気温度上昇 | `d.intake_rise` | Front / Rear |
 | GPU hotspot 高温 | `gpu.0.hotspot` | Front / Rear |
@@ -48,7 +48,9 @@ hysteresis 状態を維持する。signal が `missing` / `suspect` / `stale` �
 Config はリポジトリに置いていない。#50 / #75 の実測が終わるまでは値を `confirmed` に
 せず、値の確定・緩和には決定記録 0028 §2.9 の所有者承認が必要である。
 
-CPU package power は #65 / 決定記録 0032（Proposed）が提案する
-metric 名 `power.cpu.package` を収集境界と共有する。
-実機の hwmon driver / label 対応が未確定の間も、Replay / Mock で同じ snapshot
-契約を使える。
+CPU package power は #65 / 決定記録 0032（Proposed）が metric 名
+`power.cpu.package` を提案中であり、まだ canonical とは確定しない。
+`cpu_power_metric` は未承認時は `null` にし、CPU Power trigger 自体を評価しない。
+有効化には metric 名と `status: confirmed` / `basis` を検証済み
+`ReactiveGuardConfig` から注入する。Replay / Mock の CPU Power 試験でも明示的な
+承認済み設定を使い、コード内の既定 metric には依存しない。
