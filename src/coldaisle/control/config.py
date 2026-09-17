@@ -8,7 +8,6 @@ from __future__ import annotations
 
 from hashlib import sha256
 from pathlib import Path
-from threading import RLock
 from typing import Annotated, Any, Literal, Self, cast
 
 import yaml
@@ -70,12 +69,6 @@ class ConfigApproval(_ConfigModel):
         if self.status == "confirmed" and self.basis is None:
             raise ValueError("confirmed の設定には basis が必要")
         return self
-
-
-class ConfigReloadApproval(_ConfigModel):
-    """安全設定の差し替えを許可した決定への参照。"""
-
-    reference: str = Field(min_length=1, max_length=500)
 
 
 class ProvisionalConfigValue(_ConfigModel):
@@ -146,9 +139,11 @@ class FanHeader(_ConfigModel):
     profile: FanProfile
 
     @model_validator(mode="after")
-    def _does_not_name_an_unstable_hwmon_number(self) -> Self:
+    def _targets_one_header_channel(self) -> Self:
         if "hwmon" in self.label.lower() or "hwmon" in self.driver.lower():
             raise ValueError("hwmonN の番号では header を特定しない")
+        if self.enable_attribute != f"{self.pwm_attribute}_enable":
+            raise ValueError("enable_attribute は pwm_attribute と同じ channel を指定する")
         return self
 
 
@@ -173,10 +168,27 @@ class TemperatureDemandPoint(_ConfigModel):
     demand: SafetyDemand
 
 
+class TSensorTelemetry(_ConfigModel):
+    """未設置を明示できる温度計モジュールの安全設定。"""
+
+    enabled: ConfigValue[bool]
+    stale_after_ms: SafetyMilliseconds | None = None
+
+    @model_validator(mode="after")
+    def _enabled_sensor_is_confirmed_and_timed(self) -> Self:
+        if self.enabled.value and self.enabled.status != "confirmed":
+            raise ValueError("T_SENSOR を有効化するには confirmed の承認が必要")
+        if self.enabled.value and self.stale_after_ms is None:
+            raise ValueError("有効な T_SENSOR には stale_after_ms が必要")
+        if not self.enabled.value and self.stale_after_ms is not None:
+            raise ValueError("無効な T_SENSOR に stale_after_ms は指定しない")
+        return self
+
+
 class TelemetryDelays(_ConfigModel):
     cpu_ms: SafetyMilliseconds
     gpu_ms: SafetyMilliseconds
-    t_sensor_ms: SafetyMilliseconds
+    t_sensor: TSensorTelemetry
     air_ms: SafetyMilliseconds
     air_sensor_period_ms: SafetyMilliseconds
 
@@ -299,19 +311,6 @@ class ConfigSources(_ConfigModel):
     policy: ConfigSource
 
 
-class ConfigReloadEvent(_ConfigModel):
-    """一括適用した設定変更を decision trace へ渡す不変イベント。"""
-
-    previous_sources: ConfigSources
-    current_sources: ConfigSources
-    changed_sections: tuple[str, ...]
-    approval: ConfigReloadApproval | None
-
-    def trace_metadata(self) -> dict[str, object]:
-        """#82 の trace payload に合成できる変更記録。"""
-        return {"control_config_reload": self.model_dump(mode="json")}
-
-
 class ControlConfig(_ConfigModel):
     """一括で検証済みの制御設定と、再現用の入力情報。"""
 
@@ -395,8 +394,15 @@ class ControlConfig(_ConfigModel):
         for index, point in enumerate(safety.cpu_cooling_floor):
             append("safety.yaml", f"cpu_cooling_floor[{index}].temperature_c", point.temperature_c)
             append("safety.yaml", f"cpu_cooling_floor[{index}].demand", point.demand)
-        for name in ("cpu_ms", "gpu_ms", "t_sensor_ms", "air_ms", "air_sensor_period_ms"):
+        for name in ("cpu_ms", "gpu_ms", "air_ms", "air_sensor_period_ms"):
             append("safety.yaml", f"telemetry.{name}", getattr(safety.telemetry, name))
+        append("safety.yaml", "telemetry.t_sensor.enabled", safety.telemetry.t_sensor.enabled)
+        if safety.telemetry.t_sensor.stale_after_ms is not None:
+            append(
+                "safety.yaml",
+                "telemetry.t_sensor.stale_after_ms",
+                safety.telemetry.t_sensor.stale_after_ms,
+            )
 
         guard = self.policy.reactive_guard
         append("fan-policy.yaml", "reactive_guard.floor", guard.floor)
@@ -419,60 +425,3 @@ class ControlConfig(_ConfigModel):
     def actuation_permitted(self) -> bool:
         """実測で確認済みの hardware mapping だけを後続の書込み層へ渡す。"""
         return self.fan_hardware.approval.status == "confirmed"
-
-    def approval_required_changes(self, candidate: Self) -> tuple[str, ...]:
-        """自動昇格できない変更を、監査可能な区分で返す。"""
-        changes: list[str] = []
-        if self.fan_hardware != candidate.fan_hardware:
-            changes.append("fan_hardware")
-        if self.safety != candidate.safety:
-            changes.append("safety")
-        if self.policy.reactive_guard != candidate.policy.reactive_guard:
-            changes.append("reactive_guard")
-        if self.policy.authority_stage != candidate.policy.authority_stage:
-            changes.append("authority_stage")
-        return tuple(changes)
-
-
-class ConfigApprovalRequiredError(ValueError):
-    """人の承認が要る設定変更を自動適用しようとした。"""
-
-
-class ControlConfigManager:
-    """有効設定を候補全体と原子的に入れ替える。Hot-reload の監視は持たない。"""
-
-    def __init__(self, active: ControlConfig) -> None:
-        self._active = active
-        self._last_reload_event: ConfigReloadEvent | None = None
-        self._lock = RLock()
-
-    @property
-    def active(self) -> ControlConfig:
-        with self._lock:
-            return self._active
-
-    @property
-    def last_reload_event(self) -> ConfigReloadEvent | None:
-        """直近の成功した差し替えを decision trace へ合成する。"""
-        with self._lock:
-            return self._last_reload_event
-
-    def reload_from_directory(
-        self, directory: Path, *, approval: ConfigReloadApproval | None = None
-    ) -> ControlConfig:
-        """候補を完全検証してから差し替え、監査イベントを残す。"""
-        candidate = ControlConfig.from_directory(directory)
-        with self._lock:
-            previous = self._active
-            changes = previous.approval_required_changes(candidate)
-            if changes and approval is None:
-                names = ", ".join(changes)
-                raise ConfigApprovalRequiredError(f"承認が必要な Control Config の変更: {names}")
-            self._active = candidate
-            self._last_reload_event = ConfigReloadEvent(
-                previous_sources=previous.sources,
-                current_sources=candidate.sources,
-                changed_sections=changes,
-                approval=approval,
-            )
-            return candidate

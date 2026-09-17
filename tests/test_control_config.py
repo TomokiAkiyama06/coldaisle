@@ -1,18 +1,12 @@
 from __future__ import annotations
 
-from copy import deepcopy
 from pathlib import Path
 
 import pytest
 import yaml
 from pydantic import ValidationError
 
-from coldaisle.control.config import (
-    ConfigApprovalRequiredError,
-    ConfigReloadApproval,
-    ControlConfig,
-    ControlConfigManager,
-)
+from coldaisle.control.config import ControlConfig
 
 
 def provisional(value: float | int) -> dict[str, object]:
@@ -83,7 +77,7 @@ def valid_documents() -> dict[str, dict[str, object]]:
             "telemetry": {
                 "cpu_ms": provisional(1000),
                 "gpu_ms": provisional(1000),
-                "t_sensor_ms": provisional(1000),
+                "t_sensor": {"enabled": provisional(False)},
                 "air_ms": provisional(1000),
                 "air_sensor_period_ms": provisional(500),
             },
@@ -195,38 +189,63 @@ def test_absolute_path_in_hardware_mapping_is_rejected(tmp_path: Path) -> None:
         ControlConfig.from_directory(tmp_path)
 
 
-def test_reload_is_atomic_and_safety_change_needs_explicit_approval(tmp_path: Path) -> None:
+def test_new_config_is_validated_separately_and_never_replaces_running_config(
+    tmp_path: Path,
+) -> None:
     active = load_config(tmp_path)
-    manager = ControlConfigManager(active)
-    candidate = valid_documents()
-    candidate["safety.yaml"]["fault_demand"] = provisional(0.9)
-    write_documents(tmp_path, candidate)
+    candidate_documents = valid_documents()
+    candidate_documents["safety.yaml"]["fault_demand"] = provisional(0.9)
+    write_documents(tmp_path, candidate_documents)
 
-    with pytest.raises(ConfigApprovalRequiredError, match="safety"):
-        manager.reload_from_directory(tmp_path)
-    assert manager.active is active
-    applied = manager.reload_from_directory(
-        tmp_path,
-        approval=ConfigReloadApproval(reference="docs/decisions/0028-fan-control-contracts.md"),
-    )
-    assert manager.active is applied
-    assert manager.last_reload_event is not None
-    assert manager.last_reload_event.approval is not None
-    assert manager.last_reload_event.trace_metadata()["control_config_reload"][
-        "changed_sections"
-    ] == ["safety"]
-    assert applied.safety.fault_demand.value == 0.9
+    candidate = ControlConfig.from_directory(tmp_path)
+    assert active.safety.fault_demand.value == 1.0
+    assert candidate.safety.fault_demand.value == 0.9
+    assert not hasattr(active, "reload_from_directory")
 
 
-def test_optimization_only_reload_can_swap_after_full_validation(tmp_path: Path) -> None:
+def test_disabled_t_sensor_has_no_stale_delay_and_enabled_sensor_needs_approval(
+    tmp_path: Path,
+) -> None:
+    config = load_config(tmp_path)
+    assert config.safety.telemetry.t_sensor.enabled.value is False
+    assert config.safety.telemetry.t_sensor.stale_after_ms is None
+
+    documents = valid_documents()
+    documents["safety.yaml"]["telemetry"]["t_sensor"] = {
+        "enabled": provisional(True),
+        "stale_after_ms": provisional(1000),
+    }
+    write_documents(tmp_path, documents)
+    with pytest.raises(ValidationError, match="confirmed"):
+        ControlConfig.from_directory(tmp_path)
+
+    documents["safety.yaml"]["telemetry"]["t_sensor"]["enabled"] = {
+        "value": True,
+        "status": "confirmed",
+        "basis": "docs/decisions/0029-t-sensor.md",
+    }
+    write_documents(tmp_path, documents)
+    assert ControlConfig.from_directory(tmp_path).safety.telemetry.t_sensor.enabled.value is True
+
+
+def test_enable_attribute_must_match_pwm_channel(tmp_path: Path) -> None:
+    documents = valid_documents()
+    documents["fan-hardware.yaml"]["zones"]["front"]["enable_attribute"] = "pwm2_enable"
+    write_documents(tmp_path, documents)
+
+    with pytest.raises(ValidationError, match="同じ channel"):
+        ControlConfig.from_directory(tmp_path)
+
+
+def test_invalid_candidate_is_rejected_without_changing_loaded_config(tmp_path: Path) -> None:
     active = load_config(tmp_path)
-    manager = ControlConfigManager(active)
-    candidate = deepcopy(valid_documents())
-    candidate["fan-policy.yaml"]["ml_budget_ms"] = 200
-    write_documents(tmp_path, candidate)
+    documents = valid_documents()
+    documents["safety.yaml"]["unknown"] = True
+    write_documents(tmp_path, documents)
 
-    applied = manager.reload_from_directory(tmp_path)
-    assert applied.policy.ml_budget_ms == 200
+    with pytest.raises(ValidationError):
+        ControlConfig.from_directory(tmp_path)
+    assert active.safety.fault_demand.value == 1.0
 
 
 def test_provisional_values_identify_safety_and_policy_without_exposing_values(
@@ -240,18 +259,6 @@ def test_provisional_values_identify_safety_and_policy_without_exposing_values(
         "fan-policy.yaml",
     }
     assert any(item.path == "fault_demand" for item in values)
+    assert any(item.path == "telemetry.t_sensor.enabled" for item in values)
     assert any(item.path == "reactive_guard.ceiling" for item in values)
     assert all("value" not in item.model_dump() for item in values)
-
-
-def test_invalid_reload_keeps_active_config_and_previous_event(tmp_path: Path) -> None:
-    active = load_config(tmp_path)
-    manager = ControlConfigManager(active)
-    candidate = valid_documents()
-    candidate["safety.yaml"]["unknown"] = True
-    write_documents(tmp_path, candidate)
-
-    with pytest.raises(ValidationError):
-        manager.reload_from_directory(tmp_path)
-    assert manager.active is active
-    assert manager.last_reload_event is None
