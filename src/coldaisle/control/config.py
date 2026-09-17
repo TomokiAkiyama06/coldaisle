@@ -354,6 +354,50 @@ class ConfigSource(_ConfigModel):
     sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
 
 
+class ValidatedFanHardwareDocument:
+    """同じ ``fan-hardware.yaml`` bytes から検証値と provenance を作った束。"""
+
+    __slots__ = ("_config", "_source")
+    _config: FanHardwareConfig
+    _source: ConfigSource
+
+    def __init__(self) -> None:
+        raise TypeError("ValidatedFanHardwareDocument は trusted loader からだけ取得する")
+
+    def __setattr__(self, name: str, value: object) -> None:
+        raise AttributeError("ValidatedFanHardwareDocument は不変")
+
+    @classmethod
+    def _from_bytes(cls, payload: bytes) -> ValidatedFanHardwareDocument:
+        try:
+            text = payload.decode("utf-8")
+        except UnicodeError as exc:
+            raise ValueError("fan-hardware.yaml はUTF-8にする") from exc
+        loaded: Any = yaml.safe_load(text)
+        if not isinstance(loaded, dict):
+            raise ValueError("制御設定が辞書ではない: fan-hardware.yaml")
+        config = FanHardwareConfig.model_validate(loaded)
+        source = ConfigSource(
+            name="fan-hardware.yaml",
+            schema_version=config.schema_version,
+            sha256=sha256(payload).hexdigest(),
+        )
+        document = object.__new__(cls)
+        object.__setattr__(document, "_config", config)
+        object.__setattr__(document, "_source", source)
+        return document
+
+    def _binding_material(self) -> tuple[FanHardwareConfig, ConfigSource]:
+        return self._config, self._source
+
+
+def load_fan_hardware_document(path: Path) -> ValidatedFanHardwareDocument:
+    """hardware-only fail-safe 起動用に、1回読んだ bytes を検証してhashする。"""
+    if path.name != CONFIG_FILENAMES["fan_hardware"]:
+        raise ValueError("emergency hardware source は fan-hardware.yaml に固定する")
+    return ValidatedFanHardwareDocument._from_bytes(path.read_bytes())
+
+
 class ConfigSources(_ConfigModel):
     fan_hardware: ConfigSource
     safety: ConfigSource

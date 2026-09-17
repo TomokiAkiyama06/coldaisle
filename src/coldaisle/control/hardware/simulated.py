@@ -13,7 +13,11 @@ from itertools import pairwise
 from typing import Protocol
 
 from coldaisle.control.config import FanHardwareConfig, FanProfile
-from coldaisle.control.safety.critical import ComposedDemands
+from coldaisle.control.safety.critical import (
+    _RUNTIME_BINDING_AUTHORITY,
+    ComposedDemands,
+    ControlRuntimeBinding,
+)
 from coldaisle.control.schema import (
     HWMON_PWM_MAX,
     Fault,
@@ -68,18 +72,33 @@ class SimulatedFanBackend:
     """
 
     config: FanHardwareConfig
+    runtime_binding: ControlRuntimeBinding
     fault_plan: SimulatedFaultPlan = field(default_factory=SimulatedFaultPlan)
     _running: set[Zone] = field(default_factory=set, init=False, repr=False)
     _last_tick_id: int | None = field(default=None, init=False, repr=False)
     _last_monotonic_ms: int | None = field(default=None, init=False, repr=False)
+    _runtime_config_payload: str = field(init=False, repr=False)
+    _runtime_lineage: object = field(init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        self._runtime_config_payload, self._runtime_lineage = self.runtime_binding._claim_backend(
+            self.config.model_dump_json(),
+            authority=_RUNTIME_BINDING_AUTHORITY,
+        )
 
     def apply(self, demands: ComposedDemands) -> PerZone[FanHardwareResult]:
         """3 zone の effective demand を個別に map する。実機 I/O は行わない。"""
-        zones, tick_id, monotonic_ms = demands._consume_for_hardware()
+        zones, tick_id, monotonic_ms, runtime_payload, runtime_lineage = demands._hardware_binding()
+        if (
+            runtime_payload != self._runtime_config_payload
+            or runtime_lineage is not self._runtime_lineage
+        ):
+            raise ValueError("active control runtime が発行していない command は適用できない")
         if self._last_tick_id is not None and tick_id <= self._last_tick_id:
             raise ValueError("Fan Hardware Backend に古い tick の command を適用できない")
         if self._last_monotonic_ms is not None and monotonic_ms <= self._last_monotonic_ms:
             raise ValueError("Fan Hardware Backend の command 時刻は前進させる")
+        demands._consume_for_hardware()
         self._last_tick_id = tick_id
         self._last_monotonic_ms = monotonic_ms
         return PerZone(

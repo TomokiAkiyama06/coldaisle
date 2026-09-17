@@ -8,9 +8,13 @@ manual mode ``1`` だけである。呼び出し側は、fan daemon の writer �
 
 from __future__ import annotations
 
+import errno
 import json
 import logging
+import os
 import re
+import stat
+from contextlib import ExitStack
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
@@ -20,6 +24,8 @@ HWMON_MANUAL_MODE = "1\n"
 HANDOFF_RECORD_PATH = Path("/run/coldaisle/fan-handoff.json")
 HWMON_ROOT = Path("/sys/class/hwmon")
 _ZONES = frozenset({"front", "rear", "top"})
+_MAX_RECORD_BYTES = 64 * 1024
+_MAX_ATTRIBUTE_BYTES = 4 * 1024
 _HEADER_FIELDS = frozenset(
     {
         "zone",
@@ -50,6 +56,30 @@ class _HeaderRecord:
     enable_path: str
     original_pwm: int
     original_enable: int
+
+
+@dataclass(frozen=True, slots=True)
+class _OpenedHeader:
+    record: _HeaderRecord
+    name_fd: int
+    label_fd: int
+    pwm_read_fd: int
+    pwm_write_fd: int
+    enable_read_fd: int
+    enable_write_fd: int
+    pwm_identity: tuple[int, int]
+    enable_identity: tuple[int, int]
+
+    @property
+    def fds(self) -> tuple[int, ...]:
+        return (
+            self.name_fd,
+            self.label_fd,
+            self.pwm_read_fd,
+            self.pwm_write_fd,
+            self.enable_read_fd,
+            self.enable_write_fd,
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -96,123 +126,133 @@ def emergency_handoff(record_path: Path, sysfs_root: Path) -> HandoffResult:
     header label が一致しない zone も書き込まない。一致した zone は PWM を先に
     Max へ上げ、その後 manual mode に切り替える。
     """
-    try:
-        record_path.stat()
-    except FileNotFoundError:
+    record_text = _read_record_once(record_path)
+    if record_text is None:
         return HandoffResult(record_found=False)
 
-    headers = _load_record(record_path)
-    root = sysfs_root.resolve(strict=True)
+    headers = _load_record(record_text)
     for header in headers:
         _validate_header_paths(header)
     _reject_duplicate_relative_targets(headers)
 
-    resolved: dict[str, tuple[Path, Path, Path, Path] | OSError] = {}
-    for header in headers:
-        try:
-            resolved[header.zone] = _resolve_header(header, root)
-        except HandoffRecordError:
-            # 不安全な path が1つでもあれば、一部を書く前に record 全体を拒否する。
-            raise
-        except OSError as exc:
-            resolved[header.zone] = exc
-    _reject_duplicate_targets(
-        tuple(paths for paths in resolved.values() if isinstance(paths, tuple))
-    )
+    root_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
+    with ExitStack() as stack:
+        root_fd = os.open(sysfs_root, root_flags)
+        stack.callback(os.close, root_fd)
+        opened: dict[str, _OpenedHeader | OSError] = {}
+        for header in headers:
+            try:
+                item = _open_header(header, root_fd)
+            except HandoffRecordError:
+                # 不安全な path が1つでもあれば、一部を書く前に record 全体を拒否する。
+                raise
+            except OSError as exc:
+                opened[header.zone] = exc
+            else:
+                opened[header.zone] = item
+                for fd in item.fds:
+                    stack.callback(os.close, fd)
+        _reject_duplicate_open_targets(
+            tuple(item for item in opened.values() if isinstance(item, _OpenedHeader))
+        )
 
-    results: list[HandoffZoneResult] = []
-    for header in headers:
-        paths = resolved[header.zone]
-        if isinstance(paths, OSError):
-            results.append(
-                HandoffZoneResult(
-                    zone=header.zone,
-                    status="io_error",
-                    phase="resolve",
-                    detail=type(paths).__name__,
+        results: list[HandoffZoneResult] = []
+        for header in headers:
+            opened_item = opened[header.zone]
+            if isinstance(opened_item, OSError):
+                results.append(
+                    HandoffZoneResult(
+                        zone=header.zone,
+                        status="io_error",
+                        phase="resolve",
+                        detail=type(opened_item).__name__,
+                    )
                 )
-            )
-            continue
-        name_path, label_path, pwm_path, enable_path = paths
-        try:
-            name = name_path.read_text(encoding="utf-8").strip()
-            label = label_path.read_text(encoding="utf-8").strip()
-        except OSError as exc:
-            results.append(
-                HandoffZoneResult(
-                    zone=header.zone,
-                    status="io_error",
-                    phase="identity",
-                    detail=type(exc).__name__,
-                )
-            )
-            continue
-        if name != header.expected_name or label != header.expected_label:
-            results.append(
-                HandoffZoneResult(
-                    zone=header.zone,
-                    status="identity_mismatch",
-                    phase="identity",
-                    detail="driver_or_label",
-                )
-            )
-            continue
-        # auto のまま PWM を Max にしてから manual に切り替えれば、途中で
-        # プロセスが止まっても一時的に冷却を下げる書き込みにはならない。
-        try:
-            pwm_path.write_text(HWMON_MAX_PWM, encoding="ascii")
-        except OSError as exc:
-            results.append(
-                HandoffZoneResult(
-                    zone=header.zone,
-                    status="io_error",
-                    phase="pwm",
-                    detail=type(exc).__name__,
-                )
-            )
-            continue
-        try:
-            enable_path.write_text(HWMON_MANUAL_MODE, encoding="ascii")
-        except OSError as exc:
-            results.append(
-                HandoffZoneResult(
-                    zone=header.zone,
-                    status="io_error",
-                    phase="enable",
-                    detail=type(exc).__name__,
-                )
-            )
-            continue
-        try:
-            pwm_readback = pwm_path.read_text(encoding="ascii").strip()
-            enable_readback = enable_path.read_text(encoding="ascii").strip()
-        except OSError as exc:
-            results.append(
-                HandoffZoneResult(
-                    zone=header.zone,
-                    status="io_error",
-                    phase="readback",
-                    detail=type(exc).__name__,
-                )
-            )
-            continue
-        mismatch = []
-        if pwm_readback != HWMON_MAX_PWM.strip():
-            mismatch.append("pwm")
-        if enable_readback != HWMON_MANUAL_MODE.strip():
-            mismatch.append("enable")
-        if mismatch:
-            results.append(
-                HandoffZoneResult(
-                    zone=header.zone,
-                    status="readback_mismatch",
-                    phase="readback",
-                    detail=",".join(mismatch),
-                )
-            )
-            continue
-        results.append(HandoffZoneResult(zone=header.zone, status="applied", phase="complete"))
-    return HandoffResult(record_found=True, zones=tuple(results))
+                continue
+            result = _apply_open_header(opened_item)
+            results.append(result)
+        return HandoffResult(record_found=True, zones=tuple(results))
+
+
+def _apply_open_header(item: _OpenedHeader) -> HandoffZoneResult:
+    header = item.record
+    try:
+        name = _read_fd_text(item.name_fd)
+        label = _read_fd_text(item.label_fd)
+    except (OSError, UnicodeError) as exc:
+        return HandoffZoneResult(
+            zone=header.zone,
+            status="io_error",
+            phase="identity",
+            detail=type(exc).__name__,
+        )
+    if name != header.expected_name or label != header.expected_label:
+        return HandoffZoneResult(
+            zone=header.zone,
+            status="identity_mismatch",
+            phase="identity",
+            detail="driver_or_label",
+        )
+
+    # auto のまま PWM を Max に上げ、readback=255 を確認してからだけ manual にする。
+    try:
+        _write_exact(item.pwm_write_fd, HWMON_MAX_PWM.encode("ascii"))
+    except OSError as exc:
+        return HandoffZoneResult(
+            zone=header.zone,
+            status="io_error",
+            phase="pwm",
+            detail=type(exc).__name__,
+        )
+    try:
+        pwm_readback = _read_fd_text(item.pwm_read_fd)
+    except (OSError, UnicodeError) as exc:
+        return HandoffZoneResult(
+            zone=header.zone,
+            status="io_error",
+            phase="readback",
+            detail=type(exc).__name__,
+        )
+    if pwm_readback != HWMON_MAX_PWM.strip():
+        return HandoffZoneResult(
+            zone=header.zone,
+            status="readback_mismatch",
+            phase="readback",
+            detail="pwm",
+        )
+
+    try:
+        _write_exact(item.enable_write_fd, HWMON_MANUAL_MODE.encode("ascii"))
+    except OSError as exc:
+        return HandoffZoneResult(
+            zone=header.zone,
+            status="io_error",
+            phase="enable",
+            detail=type(exc).__name__,
+        )
+    try:
+        final_pwm = _read_fd_text(item.pwm_read_fd)
+        enable_readback = _read_fd_text(item.enable_read_fd)
+    except (OSError, UnicodeError) as exc:
+        return HandoffZoneResult(
+            zone=header.zone,
+            status="io_error",
+            phase="readback",
+            detail=type(exc).__name__,
+        )
+    mismatch = []
+    if final_pwm != HWMON_MAX_PWM.strip():
+        mismatch.append("pwm")
+    if enable_readback != HWMON_MANUAL_MODE.strip():
+        mismatch.append("enable")
+    if mismatch:
+        return HandoffZoneResult(
+            zone=header.zone,
+            status="readback_mismatch",
+            phase="readback",
+            detail=",".join(mismatch),
+        )
+    return HandoffZoneResult(zone=header.zone, status="applied", phase="complete")
 
 
 def main() -> int:
@@ -274,11 +314,47 @@ def _json_event(payload: dict[str, Any]) -> str:
     )
 
 
-def _load_record(path: Path) -> tuple[_HeaderRecord, ...]:
+def _read_record_once(path: Path) -> str | None:
     try:
-        raw: Any = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        metadata = os.lstat(path)
+    except FileNotFoundError:
+        return None
+    if not stat.S_ISREG(metadata.st_mode):
+        raise HandoffRecordError("handoff record は通常ファイルにする")
+    flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK
+    try:
+        fd = os.open(path, flags)
+    except OSError as exc:
         raise HandoffRecordError("handoff record を読めない") from exc
+    try:
+        opened = os.fstat(fd)
+        if not stat.S_ISREG(opened.st_mode):
+            raise HandoffRecordError("handoff record は通常ファイルにする")
+        if (opened.st_dev, opened.st_ino) != (metadata.st_dev, metadata.st_ino):
+            raise HandoffRecordError("handoff record が検査中に置き換わった")
+        if opened.st_size > _MAX_RECORD_BYTES:
+            raise HandoffRecordError("handoff record が大きすぎる")
+        payload = bytearray()
+        while len(payload) <= _MAX_RECORD_BYTES:
+            chunk = os.read(fd, min(8192, _MAX_RECORD_BYTES + 1 - len(payload)))
+            if not chunk:
+                break
+            payload.extend(chunk)
+        if len(payload) > _MAX_RECORD_BYTES:
+            raise HandoffRecordError("handoff record が大きすぎる")
+        try:
+            return bytes(payload).decode("utf-8")
+        except UnicodeError as exc:
+            raise HandoffRecordError("handoff record をUTF-8として読めない") from exc
+    finally:
+        os.close(fd)
+
+
+def _load_record(text: str) -> tuple[_HeaderRecord, ...]:
+    try:
+        raw: Any = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise HandoffRecordError("handoff record をJSONとして読めない") from exc
     if not isinstance(raw, dict) or set(raw) != {"schema_version", "headers"}:
         raise HandoffRecordError("handoff record の top-level 形式が不正")
     if type(raw["schema_version"]) is not int or raw["schema_version"] != 1:
@@ -324,18 +400,6 @@ def _parse_header(raw: object) -> _HeaderRecord:
     )
 
 
-def _resolve_header(header: _HeaderRecord, root: Path) -> tuple[Path, Path, Path, Path]:
-    paths = (
-        _resolve_beneath(root, header.name_path),
-        _resolve_beneath(root, header.label_path),
-        _resolve_beneath(root, header.pwm_path),
-        _resolve_beneath(root, header.enable_path),
-    )
-    if len({path.parent for path in paths}) != 1:
-        raise HandoffRecordError("handoff header の解決先が同一 device ではない")
-    return paths
-
-
 def _validate_header_paths(header: _HeaderRecord) -> None:
     relative_paths = tuple(
         Path(value)
@@ -364,16 +428,80 @@ def _validate_header_paths(header: _HeaderRecord) -> None:
         raise HandoffRecordError("handoff header の enable path が PWM channel と一致しない")
 
 
-def _resolve_beneath(root: Path, relative: str) -> Path:
-    candidate = Path(relative)
-    class_entry = root / candidate.parts[0]
-    device_root = class_entry.resolve(strict=True)
-    resolved = (device_root / candidate.parts[1]).resolve(strict=True)
-    if not resolved.is_relative_to(device_root):
-        raise HandoffRecordError("handoff attribute が解決後の hwmon device 外を指している")
-    if resolved.name != candidate.name:
-        raise HandoffRecordError("handoff attribute の symlink で channel を変更できない")
-    return resolved
+def _open_header(header: _HeaderRecord, root_fd: int) -> _OpenedHeader:
+    class_entry = Path(header.name_path).parts[0]
+    directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC
+    device_fd = os.open(class_entry, directory_flags, dir_fd=root_fd)
+    opened: list[int] = []
+    try:
+        read_flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK
+        write_flags = os.O_WRONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK
+
+        def open_attribute(relative: str, flags: int) -> int:
+            name = Path(relative).name
+            try:
+                fd = os.open(name, flags, dir_fd=device_fd)
+            except OSError as exc:
+                if exc.errno == errno.ELOOP:
+                    raise HandoffRecordError("handoff attribute の symlink は許可しない") from exc
+                raise
+            opened.append(fd)
+            metadata = os.fstat(fd)
+            if not stat.S_ISREG(metadata.st_mode):
+                raise HandoffRecordError("handoff attribute は通常の sysfs file にする")
+            return fd
+
+        name_fd = open_attribute(header.name_path, read_flags)
+        label_fd = open_attribute(header.label_path, read_flags)
+        pwm_read_fd = open_attribute(header.pwm_path, read_flags)
+        pwm_write_fd = open_attribute(header.pwm_path, write_flags)
+        enable_read_fd = open_attribute(header.enable_path, read_flags)
+        enable_write_fd = open_attribute(header.enable_path, write_flags)
+        pwm_identity = _fd_identity(pwm_read_fd)
+        enable_identity = _fd_identity(enable_read_fd)
+        if pwm_identity != _fd_identity(pwm_write_fd):
+            raise HandoffRecordError("PWM の read/write target が一致しない")
+        if enable_identity != _fd_identity(enable_write_fd):
+            raise HandoffRecordError("enable の read/write target が一致しない")
+        if pwm_identity == enable_identity:
+            raise HandoffRecordError("PWM と enable は別の attribute にする")
+        return _OpenedHeader(
+            record=header,
+            name_fd=name_fd,
+            label_fd=label_fd,
+            pwm_read_fd=pwm_read_fd,
+            pwm_write_fd=pwm_write_fd,
+            enable_read_fd=enable_read_fd,
+            enable_write_fd=enable_write_fd,
+            pwm_identity=pwm_identity,
+            enable_identity=enable_identity,
+        )
+    except BaseException:
+        for fd in opened:
+            os.close(fd)
+        raise
+    finally:
+        os.close(device_fd)
+
+
+def _fd_identity(fd: int) -> tuple[int, int]:
+    metadata = os.fstat(fd)
+    return metadata.st_dev, metadata.st_ino
+
+
+def _read_fd_text(fd: int) -> str:
+    os.lseek(fd, 0, os.SEEK_SET)
+    payload = os.read(fd, _MAX_ATTRIBUTE_BYTES + 1)
+    if len(payload) > _MAX_ATTRIBUTE_BYTES:
+        raise OSError("hwmon attribute が大きすぎる")
+    return payload.decode("utf-8").strip()
+
+
+def _write_exact(fd: int, payload: bytes) -> None:
+    os.lseek(fd, 0, os.SEEK_SET)
+    written = os.write(fd, payload)
+    if written != len(payload):
+        raise OSError("hwmon attribute の書込みが途中で終わった")
 
 
 def _reject_duplicate_relative_targets(headers: tuple[_HeaderRecord, ...]) -> None:
@@ -382,8 +510,8 @@ def _reject_duplicate_relative_targets(headers: tuple[_HeaderRecord, ...]) -> No
         raise HandoffRecordError("handoff record で複数 zone が同じ header を指している")
 
 
-def _reject_duplicate_targets(headers: tuple[tuple[Path, Path, Path, Path], ...]) -> None:
-    targets = [(paths[2], paths[3]) for paths in headers]
+def _reject_duplicate_open_targets(headers: tuple[_OpenedHeader, ...]) -> None:
+    targets = [(header.pwm_identity, header.enable_identity) for header in headers]
     if len(set(targets)) != len(targets):
         raise HandoffRecordError("handoff record で複数 zone が同じ header を指している")
 

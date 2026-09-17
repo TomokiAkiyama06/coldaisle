@@ -221,7 +221,7 @@ def snapshot(
     telemetry_health: TelemetryHealth = TelemetryHealth.NORMAL,
 ) -> ControlStateSnapshot:
     unavailable_air = set(AIR_METRICS if AIR_TELEMETRY_GROUP in critical else missing_air)
-    signals = (
+    raw_signals = (
         signal(
             "cpu.package",
             cpu,
@@ -242,6 +242,17 @@ def snapshot(
             for metric in AIR_METRICS
         ),
         *extra_signals,
+    )
+    signals = tuple(
+        item.model_copy(
+            update={
+                "last_changed_mono_ms": mono - (item.age_ms or 0),
+                "source_ts_ms": mono,
+            }
+        )
+        if item.enabled and item.last_changed_mono_ms is not None
+        else item
+        for item in raw_signals
     )
     return ControlStateSnapshot(
         tick_id=tick,
@@ -498,21 +509,49 @@ def test_unknown_critical_input_is_not_silently_ignored() -> None:
         )
 
 
-def test_air_group_contract_is_required_and_all_missing_is_detected_defensively() -> None:
+def test_snapshot_schema_signal_identity_and_critical_markers_are_revalidated() -> None:
+    valid = snapshot(tick=1, mono=0)
+
+    invalid_snapshots = (
+        valid.model_copy(update={"schema_version": 999}),
+        valid.model_copy(update={"signals": (*valid.signals, valid.signals[0])}),
+        valid.model_copy(update={"critical_unavailable": ("cpu.package",)}),
+        snapshot(tick=1, mono=0, cpu=None),
+        valid.model_copy(update={"critical_unavailable": (AIR_TELEMETRY_GROUP,)}),
+    )
+
+    for invalid in invalid_snapshots:
+        with pytest.raises(ValueError):
+            critical_safety(safety_config()).evaluate(invalid, mode=OperatingMode.AUTO)
+
+
+def test_quality_ok_signal_cannot_hide_stale_future_or_inconsistent_age() -> None:
+    valid = snapshot(tick=1, mono=2_000)
+    cpu = valid.signals[0]
+    invalid_cpu_signals = (
+        cpu.model_copy(update={"age_ms": 1_001, "last_changed_mono_ms": 999}),
+        cpu.model_copy(update={"age_ms": 0, "last_changed_mono_ms": 2_001}),
+        cpu.model_copy(update={"age_ms": 1, "last_changed_mono_ms": 2_000}),
+    )
+
+    for invalid_cpu in invalid_cpu_signals:
+        malformed = valid.model_copy(update={"signals": (invalid_cpu, *valid.signals[1:])})
+        with pytest.raises(ValueError):
+            critical_safety(safety_config()).evaluate(malformed, mode=OperatingMode.AUTO)
+
+
+def test_air_group_contract_and_snapshot_marker_must_be_consistent() -> None:
     contract_without_group = input_contract().model_copy(update={"critical_groups": ()})
     with pytest.raises(ValueError, match="air_telemetry"):
         CriticalSafety(safety_config(), input_contract=contract_without_group)
 
     safety = critical_safety(safety_config(fault_demand=0.9))
     settle(safety)
-    result = safety.evaluate(
-        snapshot(tick=3, mono=2_000, missing_air=AIR_METRICS),
-        mode=OperatingMode.AUTO,
-    )
-
-    assert result.state is SafetyState.DEGRADED
-    assert result.faults[0].code is FaultCode.AIR_TELEMETRY_STALE
-    assert result.zones.front.floor == 0.9
+    with pytest.raises(ValueError, match="critical_unavailable"):
+        safety.evaluate(
+            snapshot(tick=3, mono=2_000, missing_air=AIR_METRICS),
+            mode=OperatingMode.AUTO,
+        )
 
 
 def test_input_contract_stale_limits_must_come_from_safety_config() -> None:
@@ -754,7 +793,7 @@ def test_top_stall_is_immediate_emergency_after_the_stall_window() -> None:
     "code",
     [FaultCode.WRITE_FAILURE, FaultCode.READBACK_MISMATCH, FaultCode.ENABLE_REVERTED],
 )
-def test_front_hardware_fault_retries_at_max_and_escalates_after_configured_count(
+def test_front_backend_fault_retries_at_max_and_escalates_after_configured_count(
     code: FaultCode,
 ) -> None:
     safety = critical_safety(safety_config(fault_demand=0.9, write_limit=3))
@@ -1058,7 +1097,7 @@ def test_composer_owns_previous_state_and_rejects_bypass_or_time_reuse() -> None
         )
 
 
-def test_serialized_or_directly_constructed_safety_decision_cannot_authorize_hardware() -> None:
+def test_serialized_or_directly_constructed_safety_decision_cannot_authorize_backend() -> None:
     issued = decision(tick=1, mono=0, forced=True, state=SafetyState.EMERGENCY)
     untrusted = CriticalSafetyDecision.model_validate(issued.model_dump(mode="python"))
     tampered = issued.model_copy(update={"tick_id": 99, "monotonic_ms": 99_000})

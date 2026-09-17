@@ -5,6 +5,7 @@ from __future__ import annotations
 import ast
 import json
 import logging
+import os
 import tomllib
 from pathlib import Path
 from typing import Any
@@ -223,7 +224,7 @@ def test_attribute_symlink_cannot_escape_resolved_hwmon_device(tmp_path: Path) -
     handoff = tmp_path / "handoff.json"
     write_record(handoff, record())
 
-    with pytest.raises(HandoffRecordError, match="device 外"):
+    with pytest.raises(HandoffRecordError, match="symlink"):
         emergency_handoff(handoff, sysfs)
 
     assert outside.read_text(encoding="ascii") == "do not change\n"
@@ -283,15 +284,18 @@ def test_ignored_write_is_a_structured_readback_failure_and_other_zones_continue
     create_sysfs(sysfs)
     handoff = tmp_path / "handoff.json"
     write_record(handoff, record())
-    ignored = sysfs / "hwmon1" / attribute
-    original_write_text = Path.write_text
+    target_payload = b"255\n" if attribute == "pwm1" else b"1\n"
+    original_write_exact = handoff_module._write_exact
+    ignored = False
 
-    def ignore_write(path: Path, data: str, *args: Any, **kwargs: Any) -> int:
-        if path == ignored:
-            return len(data)
-        return original_write_text(path, data, *args, **kwargs)
+    def ignore_write(fd: int, payload: bytes) -> None:
+        nonlocal ignored
+        if not ignored and payload == target_payload:
+            ignored = True
+            return
+        original_write_exact(fd, payload)
 
-    monkeypatch.setattr(Path, "write_text", ignore_write)
+    monkeypatch.setattr(handoff_module, "_write_exact", ignore_write)
 
     result = emergency_handoff(handoff, sysfs)
 
@@ -300,6 +304,90 @@ def test_ignored_write_is_a_structured_readback_failure_and_other_zones_continue
     assert result.zones[0].status == "readback_mismatch"
     assert result.zones[0].phase == "readback"
     assert result.zones[0].detail == detail
+    assert (sysfs / "hwmon1/pwm1_enable").read_text(encoding="ascii") == "2\n"
+
+
+def test_path_swap_after_identity_read_cannot_redirect_open_pwm_fd(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sysfs = tmp_path / "sysfs"
+    sysfs.mkdir()
+    create_sysfs(sysfs)
+    handoff = tmp_path / "handoff.json"
+    write_record(handoff, record())
+    pwm_path = sysfs / "hwmon1/pwm1"
+    outside = tmp_path / "outside"
+    outside.write_text("do not change\n", encoding="ascii")
+    original_read_fd_text = handoff_module._read_fd_text
+    reads = 0
+
+    def swap_after_identity(fd: int) -> str:
+        nonlocal reads
+        value = original_read_fd_text(fd)
+        reads += 1
+        if reads == 2:
+            pwm_path.unlink()
+            pwm_path.symlink_to(outside)
+        return value
+
+    monkeypatch.setattr(handoff_module, "_read_fd_text", swap_after_identity)
+
+    result = emergency_handoff(handoff, sysfs)
+
+    assert result.applied_zones == ("front", "rear", "top")
+    assert outside.read_text(encoding="ascii") == "do not change\n"
+
+
+@pytest.mark.parametrize("kind", ["dangling_symlink", "fifo", "oversize"])
+def test_nonregular_or_oversize_handoff_record_fails_without_blocking(
+    tmp_path: Path,
+    kind: str,
+) -> None:
+    sysfs = tmp_path / "sysfs"
+    sysfs.mkdir()
+    handoff = tmp_path / "handoff.json"
+    if kind == "dangling_symlink":
+        handoff.symlink_to("missing.json")
+    elif kind == "fifo":
+        os.mkfifo(handoff)
+    else:
+        handoff.write_bytes(b" " * (64 * 1024 + 1))
+
+    with pytest.raises(HandoffRecordError):
+        emergency_handoff(handoff, sysfs)
+
+
+def test_handoff_record_replacement_between_lstat_and_open_is_rejected(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sysfs = tmp_path / "sysfs"
+    sysfs.mkdir()
+    handoff = tmp_path / "handoff.json"
+    replacement = tmp_path / "replacement.json"
+    write_record(handoff, record())
+    write_record(replacement, record())
+    original_open = os.open
+    replaced = False
+
+    def replace_before_open(
+        path: str | bytes | os.PathLike[str],
+        flags: int,
+        mode: int = 0o777,
+        *,
+        dir_fd: int | None = None,
+    ) -> int:
+        nonlocal replaced
+        if not replaced and os.fspath(path) == str(handoff):
+            replaced = True
+            os.replace(replacement, handoff)
+        return original_open(path, flags, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(os, "open", replace_before_open)
+
+    with pytest.raises(HandoffRecordError, match="置き換わった"):
+        emergency_handoff(handoff, sysfs)
 
 
 def test_standalone_entrypoint_imports_only_the_standard_library() -> None:
@@ -315,11 +403,15 @@ def test_standalone_entrypoint_imports_only_the_standard_library() -> None:
     }
     assert imported_roots <= {
         "__future__",
+        "contextlib",
         "dataclasses",
+        "errno",
         "json",
         "logging",
+        "os",
         "pathlib",
         "re",
+        "stat",
         "typing",
     }
     project = tomllib.loads((project_root / "pyproject.toml").read_text(encoding="utf-8"))
@@ -338,15 +430,18 @@ def test_entrypoint_reports_partial_handoff_failure(
     create_sysfs(sysfs)
     handoff = tmp_path / "handoff.json"
     write_record(handoff, record())
-    original_write_text = Path.write_text
-    failed_enable = sysfs / "hwmon2/pwm2_enable"
+    original_write_exact = handoff_module._write_exact
+    enable_writes = 0
 
-    def fail_rear_enable(path: Path, *args: Any, **kwargs: Any) -> int:
-        if path == failed_enable:
+    def fail_rear_enable(fd: int, payload: bytes) -> None:
+        nonlocal enable_writes
+        if payload == b"1\n":
+            enable_writes += 1
+        if payload == b"1\n" and enable_writes == 2:
             raise OSError("injected enable failure")
-        return original_write_text(path, *args, **kwargs)
+        original_write_exact(fd, payload)
 
-    monkeypatch.setattr(Path, "write_text", fail_rear_enable)
+    monkeypatch.setattr(handoff_module, "_write_exact", fail_rear_enable)
     monkeypatch.setattr(handoff_module, "HANDOFF_RECORD_PATH", handoff)
     monkeypatch.setattr(handoff_module, "HWMON_ROOT", sysfs)
     caplog.set_level(logging.INFO, logger="coldaisle.safety_handoff")
@@ -413,7 +508,7 @@ def test_entrypoint_does_not_treat_a_record_symlink_loop_as_absent(
     assert payload["event"] == "safety_handoff_failed"
     assert payload["failure"] == {
         "phase": "record_or_root_validation",
-        "detail": "OSError",
+        "detail": "HandoffRecordError",
     }
 
 

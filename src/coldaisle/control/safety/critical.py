@@ -11,10 +11,18 @@ from __future__ import annotations
 from dataclasses import dataclass
 from itertools import pairwise
 from math import isfinite
+from pathlib import Path
 
 from pydantic import BaseModel, ConfigDict, Field, PrivateAttr
 
-from coldaisle.control.config import SafetyConfig
+from coldaisle.control.config import (
+    ConfigSource,
+    ControlConfig,
+    FanHardwareConfig,
+    SafetyConfig,
+    ValidatedFanHardwareDocument,
+    load_fan_hardware_document,
+)
 from coldaisle.control.schema import (
     BOUND_BY_PRECEDENCE,
     EMERGENCY_FAULTS,
@@ -32,9 +40,15 @@ from coldaisle.control.schema import (
     Zone,
     ZoneRequest,
 )
-from coldaisle.control.state import ControlInputContract, ControlStateSnapshot, TelemetryImportance
+from coldaisle.control.state import (
+    STATE_SNAPSHOT_SCHEMA_VERSION,
+    ControlInputContract,
+    ControlStateSnapshot,
+    SignalSpec,
+    TelemetryImportance,
+)
 from coldaisle.metrics import MetricCatalog
-from coldaisle.store.models import validate_metric
+from coldaisle.store.models import Quality, validate_metric
 
 CPU_TEMPERATURE_METRIC = "cpu.package"
 GPU_TEMPERATURE_METRIC = "gpu.0.core"
@@ -75,6 +89,145 @@ _FAN_FAULTS = _WRITE_FAULTS | {FaultCode.TACH_STALL}
 
 
 _SAFETY_DECISION_AUTHORITY = object()
+_RUNTIME_BINDING_AUTHORITY = object()
+
+
+class ControlRuntimeBinding:
+    """1つの validated ControlConfig から Safety と Backend を同じ session に束縛する。"""
+
+    __slots__ = (
+        "_backend_claimed",
+        "_control_config_payload",
+        "_emergency_only",
+        "_fan_hardware_payload",
+        "_lineage",
+        "_safety_claimed",
+        "_safety_payload",
+    )
+    _backend_claimed: bool
+    _control_config_payload: str
+    _emergency_only: bool
+    _fan_hardware_payload: str
+    _lineage: object
+    _safety_claimed: bool
+    _safety_payload: str | None
+
+    def __init__(self) -> None:
+        raise TypeError("ControlRuntimeBinding は validated ControlConfig から作る")
+
+    @classmethod
+    def _from_control_config(
+        cls,
+        config: ControlConfig,
+        *,
+        authority: object,
+    ) -> ControlRuntimeBinding:
+        if authority is not _RUNTIME_BINDING_AUTHORITY:
+            raise TypeError("runtime binding factory だけが binding を発行できる")
+        if not config.actuation_permitted:
+            raise ValueError("confirmed ではない fan hardware mapping を有効化できない")
+        binding = object.__new__(cls)
+        binding._control_config_payload = config.model_dump_json()
+        binding._safety_payload = config.safety.model_dump_json()
+        binding._fan_hardware_payload = config.fan_hardware.model_dump_json()
+        binding._lineage = object()
+        binding._emergency_only = False
+        binding._safety_claimed = False
+        binding._backend_claimed = False
+        return binding
+
+    @classmethod
+    def _from_fan_hardware(
+        cls,
+        document: ValidatedFanHardwareDocument,
+        *,
+        authority: object,
+    ) -> ControlRuntimeBinding:
+        if authority is not _RUNTIME_BINDING_AUTHORITY:
+            raise TypeError("runtime binding factory だけが binding を発行できる")
+        config, source = document._binding_material()
+        if config.approval.status != "confirmed":
+            raise ValueError("confirmed ではない fan hardware mapping を有効化できない")
+        binding = object.__new__(cls)
+        binding._control_config_payload = f"{config.model_dump_json()}\n{source.model_dump_json()}"
+        binding._safety_payload = None
+        binding._fan_hardware_payload = config.model_dump_json()
+        binding._lineage = object()
+        binding._emergency_only = True
+        binding._safety_claimed = False
+        binding._backend_claimed = False
+        return binding
+
+    def _claim_safety(
+        self,
+        safety_payload: str,
+        *,
+        authority: object,
+    ) -> tuple[str, object]:
+        if authority is not _RUNTIME_BINDING_AUTHORITY:
+            raise TypeError("CriticalSafety だけが runtime binding を取得できる")
+        if self._emergency_only:
+            raise ValueError("emergency runtime binding は通常の CriticalSafety に使えない")
+        if self._safety_claimed:
+            raise ValueError("同じ runtime binding に複数の CriticalSafety を作れない")
+        if safety_payload != self._safety_payload:
+            raise ValueError("runtime binding と SafetyConfig が一致しない")
+        self._safety_claimed = True
+        return self._control_config_payload, self._lineage
+
+    def _claim_backend(
+        self,
+        fan_hardware_payload: str,
+        *,
+        authority: object,
+    ) -> tuple[str, object]:
+        if authority is not _RUNTIME_BINDING_AUTHORITY:
+            raise TypeError("Fan Hardware Backend だけが runtime binding を取得できる")
+        if self._backend_claimed:
+            raise ValueError("同じ runtime binding に複数の Fan Hardware Backend を作れない")
+        if fan_hardware_payload != self._fan_hardware_payload:
+            raise ValueError("runtime binding と FanHardwareConfig が一致しない")
+        self._backend_claimed = True
+        return self._control_config_payload, self._lineage
+
+    def _emergency_binding(self, *, authority: object) -> tuple[str, object]:
+        if authority is not _RUNTIME_BINDING_AUTHORITY:
+            raise TypeError("invalid-config composer だけが emergency binding を取得できる")
+        if not self._emergency_only:
+            raise ValueError("通常 runtime binding では config-invalid 経路を発行できない")
+        return self._control_config_payload, self._lineage
+
+
+def create_control_runtime_binding(config: ControlConfig) -> ControlRuntimeBinding:
+    """validated full config/source metadata に一意な control session を発行する。"""
+    return ControlRuntimeBinding._from_control_config(
+        config,
+        authority=_RUNTIME_BINDING_AUTHORITY,
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class EmergencyControlRuntime:
+    """hardware-only loader が同じ bytes から作る config / source / capability。"""
+
+    fan_hardware: FanHardwareConfig
+    source: ConfigSource
+    binding: ControlRuntimeBinding
+
+
+def create_emergency_control_runtime(path: Path) -> EmergencyControlRuntime:
+    """Safety/Policy が不正でも、確認済み hardware へ Max だけを許す session。"""
+    document = load_fan_hardware_document(path)
+    fan_hardware, source = document._binding_material()
+    binding = ControlRuntimeBinding._from_fan_hardware(
+        document,
+        authority=_RUNTIME_BINDING_AUTHORITY,
+    )
+    return EmergencyControlRuntime(
+        fan_hardware=fan_hardware,
+        source=source,
+        binding=binding,
+    )
 
 
 class CriticalSafetyDecision(BaseModel):
@@ -94,6 +247,7 @@ class CriticalSafetyDecision(BaseModel):
     _config_payload: str | None = PrivateAttr(default=None)
     _issued_payload: str | None = PrivateAttr(default=None)
     _lineage: object | None = PrivateAttr(default=None)
+    _runtime_payload: str | None = PrivateAttr(default=None)
 
     def _mark_issued(
         self,
@@ -101,6 +255,7 @@ class CriticalSafetyDecision(BaseModel):
         *,
         config_payload: str | None,
         lineage: object,
+        runtime_payload: str | None,
     ) -> CriticalSafetyDecision:
         if authority is not _SAFETY_DECISION_AUTHORITY:
             raise TypeError("CriticalSafety だけが Safety 裁定を発行できる")
@@ -108,9 +263,10 @@ class CriticalSafetyDecision(BaseModel):
         self._config_payload = config_payload
         self._issued_payload = self.model_dump_json()
         self._lineage = lineage
+        self._runtime_payload = runtime_payload
         return self
 
-    def _binding(self, authority: object) -> tuple[str | None, object]:
+    def _binding(self, authority: object) -> tuple[str | None, object, str | None]:
         if (
             authority is not _SAFETY_DECISION_AUTHORITY
             or self._authority is not _SAFETY_DECISION_AUTHORITY
@@ -118,7 +274,7 @@ class CriticalSafetyDecision(BaseModel):
             or self._lineage is None
         ):
             raise ValueError("CriticalSafety が発行していない裁定は合成しない")
-        return self._config_payload, self._lineage
+        return self._config_payload, self._lineage, self._runtime_payload
 
 
 _COMPOSED_DEMAND_AUTHORITY = object()
@@ -132,10 +288,20 @@ class ComposedDemands:
     constructor/API から Safety 合成を省略した書込み command を作れない。
     """
 
-    __slots__ = ("_authority", "_consumed", "_monotonic_ms", "_tick_id", "_zones")
+    __slots__ = (
+        "_authority",
+        "_consumed",
+        "_monotonic_ms",
+        "_runtime_lineage",
+        "_runtime_payload",
+        "_tick_id",
+        "_zones",
+    )
     _authority: object
     _consumed: bool
     _monotonic_ms: int
+    _runtime_lineage: object | None
+    _runtime_payload: str | None
     _tick_id: int
     _zones: PerZone[EffectiveZoneDemand]
 
@@ -153,6 +319,8 @@ class ComposedDemands:
         authority: object,
         tick_id: int,
         monotonic_ms: int,
+        runtime_lineage: object | None,
+        runtime_payload: str | None,
     ) -> ComposedDemands:
         if authority is not _COMPOSED_DEMAND_AUTHORITY:
             raise TypeError("DemandComposer だけが command を発行できる")
@@ -162,15 +330,31 @@ class ComposedDemands:
         object.__setattr__(command, "_consumed", False)
         object.__setattr__(command, "_tick_id", tick_id)
         object.__setattr__(command, "_monotonic_ms", monotonic_ms)
+        object.__setattr__(command, "_runtime_lineage", runtime_lineage)
+        object.__setattr__(command, "_runtime_payload", runtime_payload)
         return command
 
-    def _consume_for_hardware(self) -> tuple[PerZone[EffectiveZoneDemand], int, int]:
+    def _hardware_binding(
+        self,
+    ) -> tuple[PerZone[EffectiveZoneDemand], int, int, str | None, object | None]:
+        if self._authority is not _COMPOSED_DEMAND_AUTHORITY:
+            raise TypeError("DemandComposer が発行していない command は適用できない")
+        if self._consumed:
+            raise ValueError("同じ fan command を再適用できない")
+        return (
+            self._zones,
+            self._tick_id,
+            self._monotonic_ms,
+            self._runtime_payload,
+            self._runtime_lineage,
+        )
+
+    def _consume_for_hardware(self) -> None:
         if self._authority is not _COMPOSED_DEMAND_AUTHORITY:
             raise TypeError("DemandComposer が発行していない command は適用できない")
         if self._consumed:
             raise ValueError("同じ fan command を再適用できない")
         object.__setattr__(self, "_consumed", True)
-        return self._zones, self._tick_id, self._monotonic_ms
 
     @property
     def front(self) -> EffectiveZoneDemand:
@@ -208,6 +392,7 @@ class CriticalSafety:
         config: SafetyConfig,
         *,
         input_contract: ControlInputContract,
+        runtime_binding: ControlRuntimeBinding | None = None,
         approved_t_sensor_metric: str | None = None,
         metric_catalog: MetricCatalog | None = None,
     ) -> None:
@@ -234,8 +419,18 @@ class CriticalSafety:
                 )
         self._config = config
         self._config_payload = config.model_dump_json()
-        self._lineage = object()
+        if runtime_binding is None:
+            self._runtime_payload = None
+            self._lineage = object()
+        else:
+            self._runtime_payload, self._lineage = runtime_binding._claim_safety(
+                self._config_payload,
+                authority=_RUNTIME_BINDING_AUTHORITY,
+            )
         self._validate_input_contract(config, input_contract, approved_t_sensor_metric)
+        self._signal_specs: dict[str, SignalSpec] = {
+            spec.metric: spec for spec in input_contract.signals
+        }
         self._required_snapshot_metrics = frozenset(
             spec.metric for spec in input_contract.signals if spec.enabled
         )
@@ -334,15 +529,8 @@ class CriticalSafety:
         ``external_faults`` は Hardware Backend や決定論的層が検出したものだけを
         受け取る。ML の失敗は Fallback の責務であり、Safety state を変えない。
         """
+        self._validate_snapshot(snapshot)
         self._check_tick_order(snapshot)
-        missing_contract_metrics = (
-            self._required_snapshot_metrics - snapshot.signals_by_metric.keys()
-        )
-        if missing_contract_metrics:
-            raise ValueError(
-                "Safety snapshot に contract の有効 signal が無い: "
-                f"{sorted(missing_contract_metrics)}"
-            )
         now_ms = snapshot.monotonic_ms
         if self._started_ms is None:
             self._started_ms = now_ms
@@ -397,7 +585,63 @@ class CriticalSafety:
             _SAFETY_DECISION_AUTHORITY,
             config_payload=self._config_payload,
             lineage=self._lineage,
+            runtime_payload=self._runtime_payload,
         )
+
+    def _validate_snapshot(self, snapshot: ControlStateSnapshot) -> None:
+        if snapshot.schema_version != STATE_SNAPSHOT_SCHEMA_VERSION:
+            raise ValueError(
+                f"Critical Safety が未対応の snapshot schema: {snapshot.schema_version}"
+            )
+        metrics = tuple(signal.metric for signal in snapshot.signals)
+        if len(set(metrics)) != len(metrics):
+            raise ValueError("Safety snapshot の signal metric が重複している")
+        signals = snapshot.signals_by_metric
+        missing_contract_metrics = self._required_snapshot_metrics - signals.keys()
+        if missing_contract_metrics:
+            raise ValueError(
+                "Safety snapshot に contract の有効 signal が無い: "
+                f"{sorted(missing_contract_metrics)}"
+            )
+
+        for metric in self._required_snapshot_metrics:
+            signal = signals[metric]
+            spec = self._signal_specs[metric]
+            if not signal.enabled or signal.importance is not spec.importance:
+                raise ValueError(f"Safety snapshot と input contract が一致しない: {metric}")
+            if signal.quality is Quality.OK:
+                if (
+                    signal.value is None
+                    or signal.last_changed_mono_ms is None
+                    or signal.age_ms is None
+                ):
+                    raise ValueError(f"quality=OK の Safety signal に値・時刻が無い: {metric}")
+                if signal.last_changed_mono_ms > snapshot.monotonic_ms:
+                    raise ValueError(f"future の Safety signal を受理しない: {metric}")
+                calculated_age = snapshot.monotonic_ms - signal.last_changed_mono_ms
+                if signal.age_ms != calculated_age:
+                    raise ValueError(f"Safety signal の age が単調時計と一致しない: {metric}")
+                assert spec.stale_after_ms is not None
+                if calculated_age > spec.stale_after_ms:
+                    raise ValueError(f"期限切れなのに quality=OK の Safety signal: {metric}")
+
+        expected_unavailable = {
+            spec.metric
+            for spec in self._signal_specs.values()
+            if spec.enabled
+            and spec.importance is TelemetryImportance.CRITICAL
+            and not signals[spec.metric].available
+        }
+        if all(not signals[metric].available for metric in AIR_TEMPERATURE_METRICS):
+            expected_unavailable.add(AIR_TELEMETRY_GROUP)
+        actual_unavailable = set(snapshot.critical_unavailable)
+        if len(actual_unavailable) != len(snapshot.critical_unavailable):
+            raise ValueError("Safety snapshot の critical_unavailable が重複している")
+        if actual_unavailable != expected_unavailable:
+            raise ValueError(
+                "Critical Safety snapshot の critical_unavailable と signal が矛盾する: "
+                f"expected={sorted(expected_unavailable)}, actual={sorted(actual_unavailable)}"
+            )
 
     def _check_tick_order(self, snapshot: ControlStateSnapshot) -> None:
         if self._last_tick_id is not None and snapshot.tick_id <= self._last_tick_id:
@@ -654,6 +898,7 @@ def invalid_config_decision(*, tick_id: int, monotonic_ms: int) -> CriticalSafet
         _SAFETY_DECISION_AUTHORITY,
         config_payload=None,
         lineage=object(),
+        runtime_payload=None,
     )
 
 
@@ -663,6 +908,7 @@ class DemandComposer:
     def __init__(self, config: SafetyConfig) -> None:
         self._config_payload: str | None = config.model_dump_json()
         self._lineage: object | None = None
+        self._runtime_payload: str | None = None
         self._ramp_down_per_s = config.ramp_down_per_s.value
         self._previous: PerZone[EffectiveZoneDemand] | None = None
         self._last_tick_id: int | None = None
@@ -670,12 +916,21 @@ class DemandComposer:
         self._invalid_config_only = False
 
     @classmethod
-    def for_invalid_config(cls) -> DemandComposer:
+    def for_invalid_config(
+        cls,
+        runtime_binding: ControlRuntimeBinding | None = None,
+    ) -> DemandComposer:
         """設定値を一切使わず、config-invalid Max だけを出せる composer。"""
         composer = cls.__new__(cls)
         # invalid-config 経路は forced Max だけなので、この値は需要を決めない。
         composer._config_payload = None
-        composer._lineage = object()
+        if runtime_binding is None:
+            composer._lineage = object()
+            composer._runtime_payload = None
+        else:
+            composer._runtime_payload, composer._lineage = runtime_binding._emergency_binding(
+                authority=_RUNTIME_BINDING_AUTHORITY
+            )
         composer._ramp_down_per_s = 0.0
         composer._previous = None
         composer._last_tick_id = None
@@ -694,15 +949,18 @@ class DemandComposer:
         """Safety 裁定の時刻だけを使って合成し、次 tick 用 effective を保持する。"""
         if self._invalid_config_only:
             raise ValueError("設定不正時は compose_invalid_config() だけを使う")
-        config_payload, lineage = safety._binding(_SAFETY_DECISION_AUTHORITY)
+        config_payload, lineage, runtime_payload = safety._binding(_SAFETY_DECISION_AUTHORITY)
         if not safety.config_validated:
             raise ValueError("config-invalid 裁定は専用 composer で合成する")
         if config_payload != self._config_payload:
             raise ValueError("Safety evaluator と DemandComposer の設定が一致しない")
         if self._lineage is None:
             self._lineage = lineage
+            self._runtime_payload = runtime_payload
         elif lineage is not self._lineage:
             raise ValueError("異なる CriticalSafety instance の裁定を混ぜない")
+        elif runtime_payload != self._runtime_payload:
+            raise ValueError("異なる control runtime の裁定を混ぜない")
         return self._compose_and_remember(
             requested=requested,
             guard=guard,
@@ -768,6 +1026,8 @@ class DemandComposer:
             authority=_COMPOSED_DEMAND_AUTHORITY,
             tick_id=safety.tick_id,
             monotonic_ms=safety.monotonic_ms,
+            runtime_lineage=self._lineage if self._runtime_payload is not None else None,
+            runtime_payload=self._runtime_payload,
         )
 
 

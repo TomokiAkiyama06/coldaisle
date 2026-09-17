@@ -19,7 +19,14 @@ fault demand、復帰 hold、overrun 数、ramp-down はすべて `SafetyConfig`
 設定不正時は `DemandComposer.for_invalid_config()` を使う。この専用 instance は
 `SafetyConfig` や rate を必要とせず、`config_validated=false` と `config_invalid` fault を
 伴う全 zone forced Max だけを初回も継続 tick も生成できる。通常の compose と混用できず、
-`config_is_provisional=false` を「確定済み」と読まないようにする。
+`config_is_provisional=false` を「確定済み」と読まないようにする。Safety / Policy の
+validation が失敗して full `ControlConfig` を作れない場合は、検証済み `FanHardwareConfig` と
+対応する `fan-hardware.yaml` source metadata だけから専用 emergency runtime binding を作る。
+caller が hash を自己申告する入口は持たず、trusted partial loader が同じファイル bytes を1回読み、
+YAML validation と SHA-256 生成を一体で行う。通常・emergency とも hardware approval が
+`confirmed` でなければ capability を発行しない。
+この binding は通常の `CriticalSafety` を構築できず、通常 binding も config-invalid composerへ
+切り替えられないため、同一 session で Max 後に通常の低 demand へ戻せない。
 
 T_SENSOR の metric 名は決定記録 0032（#65、Proposed）の
 `board.connector_12v2x6` 提案に依存する。Critical Safety はこの名前を既定値にせず、
@@ -33,10 +40,12 @@ T_SENSOR を有効化するときに `approved_t_sensor_metric` として承認�
 State Estimator が `critical_unavailable` に `air_telemetry` を出す全滅時だけ
 Front / Rear へ fault demand を適用する。Critical Safety の構築時に
 CPU / GPU / optional T_SENSOR の Critical signal と、5本の air signal および
-`air_telemetry` group が一致する `ControlInputContract` を必須にする。さらに snapshot 上でも
-5本すべてが unavailable なら group marker の有無にかかわらず全滅と判定し、contract の
-設定漏れで NORMAL を続けない。各 signal の stale limit も同じ `SafetyConfig.telemetry` の
-検証済み値との一致を要求し、別経路の緩い閾値を使わせない。
+`air_telemetry` group が一致する `ControlInputContract` を必須にする。さらに snapshot schema、
+signal の重複・欠落、`critical_unavailable` と signal availability、air 5本全滅 marker の整合を
+Safety 自身が再検証し、矛盾した snapshot を NORMAL として受理しない。`quality=OK` でも単調時計
+由来の age が contract の期限を超える、future である、または申告 age と一致しない signal は
+拒否する。各 signal の stale limit も同じ `SafetyConfig.telemetry` の検証済み値との一致を要求し、
+別経路の緩い閾値を使わせない。
 現行機は単一 GPU のため、Critical な GPU freshness と絶対温度上限は
 `gpu.0.core` / `gpu.0.hotspot` / `gpu.0.mem` に限定する。複数 GPU 対応は
 Collector / State Estimator と同時に contract を更新してから有効にする。
@@ -78,7 +87,10 @@ ramp-down や最新 Safety 判定を迂回できない。直接構築・serializ
 合成結果は constructor を公開しない `ComposedDemands` capability として返し、Hardware Backend
 はこの型だけを受理する。個別の `EffectiveZoneDemand` は decision trace の値 object として
 構築できるが、それを直接 Backend へ渡して Safety / composer を省略することはできない。
-command は Safety decision の tick / monotonic identity を保持する一回限りの値であり、Backend
+command は Safety decision の tick / monotonic identity を保持する一回限りの値である。full
+validated `ControlConfig`（source metadata を含む）から作る一意な runtime binding で Safety と
+Backend を同じ session に束縛し、別設定および同じ設定の別 runtime が作った command を
+consume/write 前に拒否する。Backend
 も strictly increasing な identity だけを受理する。保持していた古い低 demand を Emergency Max
 の後に replay して fan を下げることはできない。
 
@@ -93,14 +105,17 @@ handoff record は schema version 1 と Front / Rear / Top の3レコードを�
 sysfs root からの `name_path` / `label_path` / `pwm_path` / `enable_path`、期待する
 driver name / label、元の PWM / enable を持つ。実行部は次を検査する。
 
-- path は `hwmonN/<attribute>` 形式で、class entry の symlink 解決後も4属性が
-  同一 device 内にあり、属性自身の symlink で別 channel 名へ変わっていない
+- record は symlink や FIFO を許さず、`O_NOFOLLOW` で1回だけ open した通常ファイルを
+  上限サイズまで読む。欠損・不正形式・過大 record は構造化 failure と非0終了にする
+- path は `hwmonN/<attribute>` 形式で、実機の class entry symlink だけを辿る。device directory
+  FD から4属性を `O_NOFOLLOW` で先に開き、read/write FD の inode identity を検証・固定する
 - driver `name` と label が record と一致し、label と PWM の channel 番号も一致する
 - 3 zone が別の PWM / enable の組を指す
 
-一致した header には `pwmN=255` を先に書き、その後 `pwmN_enable=1` だけを
-書く。1 zone の I/O 失敗後も残り zone の Max を試み、全 zone の結果を構造化して
-書き込み後に PWM / enable を読み戻す。不一致・revert・I/O 失敗は phase 付きの
+一致した header には固定済み FD で `pwmN=255` を先に書き、その直後の PWM readback が
+255 のときだけ `pwmN_enable=1` を書く。これにより PWM write が無視された場合に旧値を
+manual 固定しない。enable 後にも PWM / enable を再確認する。1 zone の I/O 失敗後も残り
+zone の Max を試み、全 zone の結果を構造化する。不一致・revert・I/O 失敗は phase 付きの
 zone別 JSON log と非0終了で通知する。record が無いときは何もしない。
 
 このリポジトリにはまだ `watchdog_timeout_ms` の consumer、systemd `WatchdogSec` / heartbeat、
