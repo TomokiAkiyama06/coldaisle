@@ -245,8 +245,7 @@ class CriticalSafety:
             if (
                 fan.effective_demand is None
                 or fan.effective_demand < self._config.stall_check_min_demand.get(zone).value
-                or fan.rpm is None
-                or fan.rpm >= self._config.stall_min_rpm.get(zone).value
+                or (fan.rpm is not None and fan.rpm >= self._config.stall_min_rpm.get(zone).value)
             ):
                 self._stall_started_ms.pop(zone, None)
                 continue
@@ -257,7 +256,9 @@ class CriticalSafety:
                         code=FaultCode.TACH_STALL,
                         zone=zone,
                         detail=(
-                            f"rpm={fan.rpm}, demand={fan.effective_demand:g}, "
+                            "rpm="
+                            + ("unavailable" if fan.rpm is None else str(fan.rpm))
+                            + f", demand={fan.effective_demand:g}, "
                             f"window_ms={self._config.stall_window_ms.value}"
                         ),
                     )

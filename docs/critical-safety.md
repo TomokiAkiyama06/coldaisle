@@ -22,8 +22,9 @@ T_SENSOR は canonical metric `board.connector_12v2x6` とし、設定で無効�
 `telemetry_health=DEGRADED` になっても Safety state と demand を変えず、
 State Estimator が `critical_unavailable` に `air_telemetry` を出す全滅時だけ
 Front / Rear へ fault demand を適用する。
-制御対象 fan の RPM 自体が読めない場合は、stall と区別できないため現時点で
-新しい fault を作らない。区分は決定記録 0029 の未決事項 5 として実機確認後に決める。
+制御対象 fan の RPM 自体が読めない場合は、stall と区別できないため
+決定記録 0034 に従い、`stall_check_min_demand` 以上の間は同じ stall timer を
+進める。`stall_window_ms` 後は tach stall と同じ安全応答にする。
 
 ## 合成と復帰
 

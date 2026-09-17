@@ -100,3 +100,4 @@ docs/decisions/NNNN-<slug>.md      例: 0002-metric-naming.md
 | [0028](0028-fan-control-contracts.md) | Fan 制御の層間契約（入出力・優先順位・状態遷移・周期・故障時の扱い・設定・承認点） | FINAL |
 | [0029](0029-telemetry-loss-classes.md) | 制御入力の欠測の分類（Critical / Degraded / Advisory） | FINAL |
 | [0030](0030-control-decision-trace-storage.md) | Control decision trace の保存先 | Proposed |
+| [0034](0034-unavailable-fan-tach-safety.md) | 制御対象 Fan の tach 読み取り不能を Safety fault にする | Proposed |

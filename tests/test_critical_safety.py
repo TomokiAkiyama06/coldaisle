@@ -405,7 +405,7 @@ def test_front_stall_uses_monotonic_window_then_maxes_zone_and_raises_others() -
     assert stalled.zones.top.floor == 0.9
 
 
-def test_stall_is_not_counted_below_configured_demand_or_when_rpm_is_unavailable() -> None:
+def test_stall_is_not_counted_below_configured_demand() -> None:
     safety = CriticalSafety(safety_config())
     settle(safety)
 
@@ -425,13 +425,60 @@ def test_stall_is_not_counted_below_configured_demand_or_when_rpm_is_unavailable
         ),
         mode=OperatingMode.AUTO,
     )
-    rpm_unavailable = safety.evaluate(
-        snapshot(tick=5, mono=6_000, fan_state=fans(front_rpm=None)),
+    assert low_demand.state is SafetyState.NORMAL
+
+
+@pytest.mark.parametrize(
+    ("zone", "expected_state"),
+    [(Zone.FRONT, SafetyState.DEGRADED), (Zone.TOP, SafetyState.EMERGENCY)],
+)
+def test_unavailable_rpm_uses_the_stall_window_and_safe_response(
+    zone: Zone, expected_state: SafetyState
+) -> None:
+    safety = CriticalSafety(safety_config(fault_demand=0.9))
+    settle(safety)
+
+    def unavailable() -> PerZone[FanState]:
+        return fans(
+            front_rpm=None if zone is Zone.FRONT else 1_000,
+            top_rpm=None if zone is Zone.TOP else 1_000,
+        )
+
+    first = safety.evaluate(
+        snapshot(tick=3, mono=2_000, fan_state=unavailable()),
+        mode=OperatingMode.AUTO,
+    )
+    before_window = safety.evaluate(
+        snapshot(tick=4, mono=3_999, fan_state=unavailable()),
+        mode=OperatingMode.AUTO,
+    )
+    faulted = safety.evaluate(
+        snapshot(tick=5, mono=4_000, fan_state=unavailable()),
         mode=OperatingMode.AUTO,
     )
 
-    assert low_demand.state is SafetyState.NORMAL
-    assert rpm_unavailable.state is SafetyState.NORMAL
+    assert first.state is SafetyState.NORMAL
+    assert before_window.state is SafetyState.NORMAL
+    assert faulted.state is expected_state
+    assert faulted.faults[0].code is FaultCode.TACH_STALL
+    assert "rpm=unavailable" in faulted.faults[0].detail
+    assert faulted.zones.get(zone).forced_max
+
+
+def test_low_and_unavailable_rpm_share_one_continuous_stall_timer() -> None:
+    safety = CriticalSafety(safety_config())
+    settle(safety)
+    safety.evaluate(
+        snapshot(tick=3, mono=2_000, fan_state=fans(front_rpm=0)),
+        mode=OperatingMode.AUTO,
+    )
+    faulted = safety.evaluate(
+        snapshot(tick=4, mono=4_000, fan_state=fans(front_rpm=None)),
+        mode=OperatingMode.AUTO,
+    )
+
+    assert faulted.state is SafetyState.DEGRADED
+    assert faulted.faults[0].code is FaultCode.TACH_STALL
 
 
 def test_top_stall_is_immediate_emergency_after_the_stall_window() -> None:
