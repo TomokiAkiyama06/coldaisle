@@ -9,10 +9,9 @@ Model、Supervisor Policy、Feature Transform の artifact lifecycle をロー�
 
 - Registry は artifact を deserialize・import・execute しない。検証後も返すのは immutable
   `bytes` だけである。
-- 受理する形式名は JSON / ONNX / safetensors に限定する。pickle、joblib、Python objectを
-  含むframework固有checkpointは受理しない。
-- JSON artifact は構文とtop-levelの型も検証する。ONNX / safetensors の構造検証と推論は、
-  後続のformat固有consumerの責務である。
+- 現在受理する形式は、構文とtop-levelの型を非実行で検証できるJSONだけである。pickle、
+  joblib、Python objectを含むframework固有checkpointに加え、構造validator未導入のONNX /
+  safetensorsも`LOADED`にしない。binary形式は安全なvalidatorと一緒に将来schemaへ追加する。
 - artifact checksum、feature schema、target schema、authority compatibility のどれかが
   合わなければ `ArtifactLoadResult.fallback_required` は `True` になる。Registry 自身は
   Fan Demand、PWM、Authority Stageを変更しない。
@@ -36,10 +35,15 @@ Productionとして暗黙loadすることはない。`mark_validated()` はoffli
 1つのversioned snapshotとして持つ。更新はfilesystem lock内で一時ファイルをfsyncし、
 `os.replace()` で原子的に切り替える。管理操作には `expected_revision` を渡すため、同じ状態を
 見て行った二重promotionの一方は `ConcurrentUpdateError` になり、後勝ちで判断を上書きしない。
+root配下のdirectory・lock・snapshot・artifactは`openat`相当の`dir_fd`と`O_NOFOLLOW`で開き、
+symlinkまたは非regular fileを拒否する。artifact IDから組み立てたpathでroot外を読み書きしない。
 
 新しいProductionへのpromotion時、旧Productionは`retired`のknown-good rollback targetになる。
 Rollback前にも旧artifactのchecksumとschema互換性を再検証し、成功時はpointer、lifecycle、
 理由・時刻・human approvalの監査eventを同じsnapshotで原子的に更新する。
+`HumanApproval` はaction、target artifact ref、checksum、承認対象revisionへ固定し、別artifact・
+別操作・更新後snapshotへ再利用できない。snapshot読込時はauditを先頭から再生し、登録、検証、
+承認付きpromotion / rollbackを経ずに作られたProduction pointerを拒否する。
 
 ## 後続Issueとの接続
 

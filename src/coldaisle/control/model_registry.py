@@ -12,9 +12,10 @@ import json
 import math
 import os
 import re
-import tempfile
+import secrets
+import stat
 from collections.abc import Iterator
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from datetime import datetime
 from enum import StrEnum
 from fcntl import LOCK_EX, LOCK_UN, flock
@@ -58,14 +59,12 @@ class ArtifactKind(StrEnum):
 class ArtifactFormat(StrEnum):
     """Non-executable interchange formats accepted by the registry.
 
-    Pickle, joblib, and framework-native Python checkpoints are intentionally absent.  The
-    registry still does not parse ONNX or safetensors; a format-specific consumer must do that
-    after receiving verified bytes.
+    Pickle, joblib, framework-native Python checkpoints, and binary formats without an installed
+    structural validator are intentionally absent.  A future schema version may add ONNX or
+    safetensors together with a non-executing validator.
     """
 
     JSON = "json"
-    ONNX = "onnx"
-    SAFETENSORS = "safetensors"
 
 
 class ArtifactStatus(StrEnum):
@@ -85,6 +84,13 @@ class RegistryEventKind(StrEnum):
     PROMOTED = "promoted"
     ROLLED_BACK = "rolled_back"
     RETIRED = "retired"
+
+
+class ApprovalAction(StrEnum):
+    """Human decisions that cannot be reused across lifecycle operations."""
+
+    PROMOTE = "promote"
+    ROLLBACK = "rollback"
 
 
 class ArtifactLoadStatus(StrEnum):
@@ -182,6 +188,10 @@ class HumanApproval(_Frozen):
     """Explicit human approval attached to promotion or rollback."""
 
     decision: Literal["approved"] = "approved"
+    action: ApprovalAction
+    artifact: ArtifactRef
+    artifact_sha256: str = Field(pattern=_SHA256_PATTERN)
+    expected_revision: int = Field(ge=0)
     approver: str = Field(pattern=_IDENTIFIER_PATTERN, max_length=120)
     approved_at_ms: int = Field(ge=0)
     reason: str = Field(min_length=1, max_length=1000)
@@ -229,6 +239,16 @@ class RegistryAuditEvent(_Frozen):
         if self.approval is not None:
             if self.actor != self.approval.approver or self.reason != self.approval.reason:
                 raise ValueError("audit event と approval の actor / reason を一致させる")
+            expected_action = {
+                RegistryEventKind.PROMOTED: ApprovalAction.PROMOTE,
+                RegistryEventKind.ROLLED_BACK: ApprovalAction.ROLLBACK,
+            }[self.event]
+            if self.approval.action is not expected_action:
+                raise ValueError("audit event と approval action を一致させる")
+            if self.approval.artifact != self.artifact:
+                raise ValueError("audit event と approval target を一致させる")
+            if self.approval.expected_revision + 1 != self.revision:
+                raise ValueError("approval を対象 registry revision の直後にだけ使用する")
             if self.approval.approved_at_ms > self.occurred_at_ms:
                 raise ValueError("未来の approval は記録できない")
         return self
@@ -275,7 +295,86 @@ class RegistrySnapshot(_Frozen):
             raise ValueError("revision と audit event 数が一致しない")
         if any(event.revision != index for index, event in enumerate(self.audit, start=1)):
             raise ValueError("audit revision が連続していない")
+        self._audit_replays_to_current_state()
         return self
+
+    def _audit_replays_to_current_state(self) -> None:
+        """Reject snapshots whose lifecycle cannot be derived from their approval audit."""
+        statuses: dict[str, ArtifactStatus] = {}
+        production: dict[ArtifactKind, ProductionSlot] = {}
+        validated: set[str] = set()
+        promoted: set[str] = set()
+
+        for event in self.audit:
+            key = event.artifact.key
+            record = self.artifacts.get(key)
+            if record is None:
+                raise ValueError("audit event が未登録 artifact を参照している")
+            if event.approval is not None and (
+                event.approval.artifact_sha256 != record.metadata.sha256
+            ):
+                raise ValueError("approval checksum が artifact metadata と一致しない")
+
+            if event.event is RegistryEventKind.REGISTERED:
+                if key in statuses or event.previous_artifact is not None:
+                    raise ValueError("artifact registration audit が重複または不正")
+                statuses[key] = ArtifactStatus.CANDIDATE
+            elif event.event is RegistryEventKind.VALIDATED:
+                if statuses.get(key) is not ArtifactStatus.CANDIDATE:
+                    raise ValueError("validated audit は candidate の後にだけ置ける")
+                if record.metadata.offline_evaluation_ref is None:
+                    raise ValueError("validated artifact に offline evaluation がない")
+                statuses[key] = ArtifactStatus.VALIDATED
+                validated.add(key)
+            elif event.event is RegistryEventKind.PROMOTED:
+                if statuses.get(key) is not ArtifactStatus.VALIDATED:
+                    raise ValueError("promotion audit は validated の後にだけ置ける")
+                if (
+                    record.metadata.offline_evaluation_ref is None
+                    or record.metadata.shadow_evaluation_ref is None
+                ):
+                    raise ValueError("production artifact に evaluation refs が揃っていない")
+                current = production.get(event.artifact.kind)
+                expected_previous = current.active if current is not None else None
+                if event.previous_artifact != expected_previous:
+                    raise ValueError("promotion audit の previous production が一致しない")
+                if expected_previous is not None:
+                    statuses[expected_previous.key] = ArtifactStatus.RETIRED
+                statuses[key] = ArtifactStatus.PRODUCTION
+                production[event.artifact.kind] = ProductionSlot(
+                    active=event.artifact,
+                    previous=expected_previous,
+                )
+                promoted.add(key)
+            elif event.event is RegistryEventKind.ROLLED_BACK:
+                slot = production.get(event.artifact.kind)
+                if (
+                    slot is None
+                    or slot.previous != event.artifact
+                    or event.previous_artifact != slot.active
+                    or statuses.get(key) is not ArtifactStatus.RETIRED
+                ):
+                    raise ValueError("rollback audit が known-good pointer と一致しない")
+                statuses[slot.active.key] = ArtifactStatus.RETIRED
+                statuses[key] = ArtifactStatus.PRODUCTION
+                production[event.artifact.kind] = ProductionSlot(active=event.artifact)
+            elif event.event is RegistryEventKind.RETIRED:
+                if statuses.get(key) not in {
+                    ArtifactStatus.CANDIDATE,
+                    ArtifactStatus.VALIDATED,
+                }:
+                    raise ValueError("retire audit の遷移元が不正")
+                statuses[key] = ArtifactStatus.RETIRED
+
+        actual_statuses = {key: record.status for key, record in self.artifacts.items()}
+        if statuses != actual_statuses or production != self.production:
+            raise ValueError("audit から現在の lifecycle / production pointer を再現できない")
+        for key, record in self.artifacts.items():
+            metadata = record.metadata
+            if key not in validated and metadata.offline_evaluation_ref is not None:
+                raise ValueError("validation audit なしで offline evaluation が設定されている")
+            if key not in promoted and metadata.shadow_evaluation_ref is not None:
+                raise ValueError("promotion audit なしで shadow evaluation が設定されている")
 
 
 class VerifiedArtifact(_Frozen):
@@ -344,6 +443,10 @@ class RegistryCorruptError(ModelRegistryError):
     """The registry snapshot cannot be trusted."""
 
 
+class UnsafeRegistryPathError(ModelRegistryError):
+    """A symlink or non-regular registry path could escape the registry root."""
+
+
 class ArtifactAlreadyExistsError(ModelRegistryError):
     """The artifact identity was already registered."""
 
@@ -408,15 +511,15 @@ class ModelRegistry:
         digest = sha256(payload).hexdigest()
         if digest != metadata.sha256:
             raise ArtifactVerificationError("artifact checksum が metadata と一致しない")
-        self._validate_format(metadata.artifact_format, payload)
+        self._validate_format(payload)
 
-        with self._exclusive_lock():
-            snapshot = self._read_snapshot()
+        with self._exclusive_lock() as root_fd:
+            snapshot = self._read_snapshot(root_fd)
             ref = metadata.ref
             if ref.key in snapshot.artifacts:
                 raise ArtifactAlreadyExistsError(f"artifact は登録済み: {ref.key}")
 
-            self._atomic_write(self._artifact_path(ref), payload)
+            self._write_artifact(root_fd, ref, payload)
             artifacts = dict(snapshot.artifacts)
             artifacts[ref.key] = ArtifactRecord(
                 metadata=metadata,
@@ -431,7 +534,7 @@ class ModelRegistry:
                 actor=actor,
                 reason=reason,
             )
-            self._write_snapshot(updated)
+            self._write_snapshot(root_fd, updated)
             return ref
 
     def mark_validated(
@@ -446,13 +549,13 @@ class ModelRegistry:
         """Record successful offline evaluation and move candidate to validated."""
         self._validate_actor_reason(actor, reason)
         self._validate_reference(offline_evaluation_ref, "offline_evaluation_ref")
-        with self._exclusive_lock():
-            snapshot = self._read_snapshot()
+        with self._exclusive_lock() as root_fd:
+            snapshot = self._read_snapshot(root_fd)
             self._check_revision(snapshot, expected_revision)
             record = self._record(snapshot, ref)
             if record.status is not ArtifactStatus.CANDIDATE:
                 raise InvalidTransitionError("candidate だけを validated にできる")
-            self._verify(record, compatibility=None)
+            self._verify(root_fd, record, compatibility=None)
 
             metadata = record.metadata.model_copy(
                 update={"offline_evaluation_ref": offline_evaluation_ref}
@@ -471,7 +574,7 @@ class ModelRegistry:
                 actor=actor,
                 reason=reason,
             )
-            self._write_snapshot(updated)
+            self._write_snapshot(root_fd, updated)
             return updated.revision
 
     def promote(
@@ -485,18 +588,25 @@ class ModelRegistry:
     ) -> int:
         """Atomically promote one validated artifact after explicit human approval."""
         self._validate_reference(shadow_evaluation_ref, "shadow_evaluation_ref")
-        with self._exclusive_lock():
-            snapshot = self._read_snapshot()
+        with self._exclusive_lock() as root_fd:
+            snapshot = self._read_snapshot(root_fd)
             self._check_revision(snapshot, expected_revision)
             record = self._record(snapshot, ref)
             if record.status is not ArtifactStatus.VALIDATED:
                 raise InvalidTransitionError("validated artifact だけを production にできる")
             if record.metadata.offline_evaluation_ref is None:
                 raise InvalidTransitionError("offline evaluation の記録がない")
-            self._verify(record, compatibility)
+            self._verify(root_fd, record, compatibility)
 
             now_ms = self._clock.now_ms()
-            self._validate_approval(approval, now_ms)
+            self._validate_approval(
+                approval,
+                action=ApprovalAction.PROMOTE,
+                artifact=ref,
+                artifact_sha256=record.metadata.sha256,
+                expected_revision=expected_revision,
+                occurred_at_ms=now_ms,
+            )
             previous_slot = snapshot.production.get(ref.kind)
             previous_ref = previous_slot.active if previous_slot is not None else None
             artifacts = dict(snapshot.artifacts)
@@ -527,7 +637,7 @@ class ModelRegistry:
                 approval=approval,
                 occurred_at_ms=now_ms,
             )
-            self._write_snapshot(updated)
+            self._write_snapshot(root_fd, updated)
             return updated.revision
 
     def rollback(
@@ -539,8 +649,8 @@ class ModelRegistry:
         expected_revision: int,
     ) -> int:
         """Atomically restore the previous verified production artifact."""
-        with self._exclusive_lock():
-            snapshot = self._read_snapshot()
+        with self._exclusive_lock() as root_fd:
+            snapshot = self._read_snapshot(root_fd)
             self._check_revision(snapshot, expected_revision)
             slot = snapshot.production.get(kind)
             if slot is None or slot.previous is None:
@@ -549,10 +659,17 @@ class ModelRegistry:
             target = self._record(snapshot, slot.previous)
             if target.status is not ArtifactStatus.RETIRED:
                 raise InvalidTransitionError("rollback target が retired ではない")
-            self._verify(target, compatibility)
+            self._verify(root_fd, target, compatibility)
 
             now_ms = self._clock.now_ms()
-            self._validate_approval(approval, now_ms)
+            self._validate_approval(
+                approval,
+                action=ApprovalAction.ROLLBACK,
+                artifact=target.ref,
+                artifact_sha256=target.metadata.sha256,
+                expected_revision=expected_revision,
+                occurred_at_ms=now_ms,
+            )
             artifacts = dict(snapshot.artifacts)
             artifacts[current.ref.key] = ArtifactRecord(
                 metadata=current.metadata,
@@ -576,7 +693,7 @@ class ModelRegistry:
                 approval=approval,
                 occurred_at_ms=now_ms,
             )
-            self._write_snapshot(updated)
+            self._write_snapshot(root_fd, updated)
             return updated.revision
 
     def retire(
@@ -589,8 +706,8 @@ class ModelRegistry:
     ) -> int:
         """Retire a non-production candidate or validated artifact."""
         self._validate_actor_reason(actor, reason)
-        with self._exclusive_lock():
-            snapshot = self._read_snapshot()
+        with self._exclusive_lock() as root_fd:
+            snapshot = self._read_snapshot(root_fd)
             self._check_revision(snapshot, expected_revision)
             record = self._record(snapshot, ref)
             if record.status not in {ArtifactStatus.CANDIDATE, ArtifactStatus.VALIDATED}:
@@ -609,7 +726,7 @@ class ModelRegistry:
                 actor=actor,
                 reason=reason,
             )
-            self._write_snapshot(updated)
+            self._write_snapshot(root_fd, updated)
             return updated.revision
 
     def load_production(
@@ -665,7 +782,10 @@ class ModelRegistry:
     ) -> ArtifactLoadResult:
         record = snapshot.artifacts[ref.key]
         try:
-            artifact = self._verify(record, compatibility)
+            with self._open_root(create=False) as root_fd:
+                if root_fd is None:
+                    raise _ArtifactUnavailableError("registry root が存在しない")
+                artifact = self._verify(root_fd, record, compatibility)
         except _ArtifactUnavailableError:
             return self._load_failure(
                 ArtifactLoadStatus.ARTIFACT_UNAVAILABLE,
@@ -705,16 +825,17 @@ class ModelRegistry:
 
     def _verify(
         self,
+        root_fd: int,
         record: ArtifactRecord,
         compatibility: ModelCompatibility | None,
     ) -> VerifiedArtifact:
         try:
-            payload = self._artifact_path(record.ref).read_bytes()
-        except OSError as exc:
+            payload = self._read_artifact(root_fd, record.ref)
+        except (OSError, UnsafeRegistryPathError) as exc:
             raise _ArtifactUnavailableError("artifact bytes を読み取れない") from exc
         if sha256(payload).hexdigest() != record.metadata.sha256:
             raise _ChecksumMismatchError("artifact checksum mismatch")
-        self._validate_format(record.metadata.artifact_format, payload)
+        self._validate_format(payload)
         if compatibility is not None:
             if (
                 record.metadata.feature_schema_version != compatibility.feature_schema_version
@@ -726,10 +847,7 @@ class ModelRegistry:
         return VerifiedArtifact(metadata=record.metadata, payload=payload)
 
     @staticmethod
-    def _validate_format(artifact_format: ArtifactFormat, payload: bytes) -> None:
-        if artifact_format is not ArtifactFormat.JSON:
-            return
-
+    def _validate_format(payload: bytes) -> None:
         def reject_nonfinite(value: str) -> None:
             raise ValueError(f"非有限値はJSON artifactに使用できない: {value}")
 
@@ -740,57 +858,173 @@ class ModelRegistry:
         if not isinstance(decoded, (dict, list)):
             raise _InvalidArtifactFormatError("JSON artifact は object または array にする")
 
-    def _read_snapshot(self) -> RegistrySnapshot:
-        path = self._root / _STATE_FILENAME
-        if not path.exists():
-            return RegistrySnapshot(revision=0)
+    def _read_snapshot(self, root_fd: int | None = None) -> RegistrySnapshot:
+        if root_fd is None:
+            try:
+                with self._open_root(create=False) as opened_root_fd:
+                    if opened_root_fd is None:
+                        return RegistrySnapshot(revision=0)
+                    return self._read_snapshot(opened_root_fd)
+            except UnsafeRegistryPathError as exc:
+                raise RegistryCorruptError("registry root を安全に読み取れない") from exc
         try:
-            return RegistrySnapshot.model_validate_json(path.read_bytes())
-        except (OSError, ValidationError, ValueError) as exc:
+            payload = self._read_regular_file(root_fd, _STATE_FILENAME, missing_ok=True)
+            if payload is None:
+                return RegistrySnapshot(revision=0)
+            return RegistrySnapshot.model_validate_json(payload)
+        except (OSError, UnsafeRegistryPathError, ValidationError, ValueError) as exc:
             raise RegistryCorruptError("registry snapshot を検証できない") from exc
 
-    def _write_snapshot(self, snapshot: RegistrySnapshot) -> None:
+    def _write_snapshot(self, root_fd: int, snapshot: RegistrySnapshot) -> None:
         payload = snapshot.model_dump_json(indent=2).encode("utf-8") + b"\n"
-        self._atomic_write(self._root / _STATE_FILENAME, payload)
+        self._atomic_write(root_fd, _STATE_FILENAME, payload)
 
-    def _artifact_path(self, ref: ArtifactRef) -> Path:
-        return (
-            self._root
-            / "artifacts"
-            / ref.kind.value
-            / ref.model_id
-            / ref.version
-            / _ARTIFACT_FILENAME
+    def _read_artifact(self, root_fd: int, ref: ArtifactRef) -> bytes:
+        directory_fd = self._open_directory_chain(
+            root_fd,
+            ("artifacts", ref.kind.value, ref.model_id, ref.version),
+            create=False,
         )
+        try:
+            payload = self._read_regular_file(directory_fd, _ARTIFACT_FILENAME)
+            assert payload is not None
+            return payload
+        finally:
+            os.close(directory_fd)
+
+    def _write_artifact(self, root_fd: int, ref: ArtifactRef, payload: bytes) -> None:
+        directory_fd = self._open_directory_chain(
+            root_fd,
+            ("artifacts", ref.kind.value, ref.model_id, ref.version),
+            create=True,
+        )
+        try:
+            self._atomic_write(directory_fd, _ARTIFACT_FILENAME, payload)
+        finally:
+            os.close(directory_fd)
 
     @contextmanager
-    def _exclusive_lock(self) -> Iterator[None]:
-        self._root.mkdir(parents=True, exist_ok=True)
-        with (self._root / _LOCK_FILENAME).open("a+b") as lock_file:
-            flock(lock_file.fileno(), LOCK_EX)
+    def _open_root(self, *, create: bool) -> Iterator[int | None]:
+        if create:
             try:
-                yield
+                self._root.mkdir(parents=True, exist_ok=True)
+            except OSError as exc:
+                raise UnsafeRegistryPathError("registry root を作成できない") from exc
+        flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+        try:
+            root_fd = os.open(self._root, flags)
+        except FileNotFoundError:
+            if create:
+                raise UnsafeRegistryPathError("registry root を作成できない") from None
+            yield None
+            return
+        except OSError as exc:
+            raise UnsafeRegistryPathError("registry root がsymlinkまたはdirectoryではない") from exc
+        try:
+            yield root_fd
+        finally:
+            os.close(root_fd)
+
+    @contextmanager
+    def _exclusive_lock(self) -> Iterator[int]:
+        with self._open_root(create=True) as root_fd:
+            assert root_fd is not None
+            flags = os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW
+            try:
+                lock_fd = os.open(_LOCK_FILENAME, flags, 0o600, dir_fd=root_fd)
+            except OSError as exc:
+                raise UnsafeRegistryPathError("registry lock がsymlinkである") from exc
+            try:
+                if not stat.S_ISREG(os.fstat(lock_fd).st_mode):
+                    raise UnsafeRegistryPathError("registry lock がregular fileではない")
+                flock(lock_fd, LOCK_EX)
+                try:
+                    yield root_fd
+                finally:
+                    flock(lock_fd, LOCK_UN)
             finally:
-                flock(lock_file.fileno(), LOCK_UN)
+                os.close(lock_fd)
 
     @staticmethod
-    def _atomic_write(path: Path, payload: bytes) -> None:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        descriptor, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
-        temporary_path = Path(temporary_name)
+    def _open_directory_chain(root_fd: int, parts: tuple[str, ...], *, create: bool) -> int:
+        current_fd = os.dup(root_fd)
         try:
-            with os.fdopen(descriptor, "wb") as temporary:
-                temporary.write(payload)
-                temporary.flush()
-                os.fsync(temporary.fileno())
-            os.replace(temporary_path, path)
-            directory_fd = os.open(path.parent, os.O_RDONLY)
-            try:
-                os.fsync(directory_fd)
-            finally:
-                os.close(directory_fd)
+            for part in parts:
+                flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+                try:
+                    child_fd = os.open(part, flags, dir_fd=current_fd)
+                except FileNotFoundError:
+                    if not create:
+                        raise
+                    os.mkdir(part, 0o700, dir_fd=current_fd)
+                    child_fd = os.open(part, flags, dir_fd=current_fd)
+                except OSError as exc:
+                    raise UnsafeRegistryPathError(
+                        f"registry path component がsymlinkまたはdirectoryではない: {part}"
+                    ) from exc
+                os.close(current_fd)
+                current_fd = child_fd
+            return current_fd
+        except BaseException:
+            os.close(current_fd)
+            raise
+
+    @staticmethod
+    def _read_regular_file(
+        directory_fd: int,
+        name: str,
+        *,
+        missing_ok: bool = False,
+    ) -> bytes | None:
+        try:
+            file_fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=directory_fd)
+        except FileNotFoundError:
+            if missing_ok:
+                return None
+            raise
+        except OSError as exc:
+            raise UnsafeRegistryPathError(f"registry file がsymlinkである: {name}") from exc
+        try:
+            if not stat.S_ISREG(os.fstat(file_fd).st_mode):
+                raise UnsafeRegistryPathError(f"registry file がregular fileではない: {name}")
+            chunks: list[bytes] = []
+            while chunk := os.read(file_fd, 1024 * 1024):
+                chunks.append(chunk)
+            return b"".join(chunks)
         finally:
-            temporary_path.unlink(missing_ok=True)
+            os.close(file_fd)
+
+    @staticmethod
+    def _atomic_write(directory_fd: int, name: str, payload: bytes) -> None:
+        try:
+            existing = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            existing = None
+        if existing is not None and not stat.S_ISREG(existing.st_mode):
+            raise UnsafeRegistryPathError(f"registry destination がregular fileではない: {name}")
+
+        temporary_name = f".{name}.{secrets.token_hex(12)}.tmp"
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
+        temporary_fd = os.open(temporary_name, flags, 0o600, dir_fd=directory_fd)
+        try:
+            try:
+                remaining = memoryview(payload)
+                while remaining:
+                    written = os.write(temporary_fd, remaining)
+                    remaining = remaining[written:]
+                os.fsync(temporary_fd)
+            finally:
+                os.close(temporary_fd)
+            os.replace(
+                temporary_name,
+                name,
+                src_dir_fd=directory_fd,
+                dst_dir_fd=directory_fd,
+            )
+            os.fsync(directory_fd)
+        finally:
+            with suppress(FileNotFoundError):
+                os.unlink(temporary_name, dir_fd=directory_fd)
 
     def _append_event(
         self,
@@ -854,7 +1088,23 @@ class ModelRegistry:
             raise ValueError(f"{field_name} は1〜500文字にする")
 
     @staticmethod
-    def _validate_approval(approval: HumanApproval, occurred_at_ms: int) -> None:
+    def _validate_approval(
+        approval: HumanApproval,
+        *,
+        action: ApprovalAction,
+        artifact: ArtifactRef,
+        artifact_sha256: str,
+        expected_revision: int,
+        occurred_at_ms: int,
+    ) -> None:
+        if approval.action is not action:
+            raise ValueError("human approval action が操作と一致しない")
+        if approval.artifact != artifact:
+            raise ValueError("human approval target がartifactと一致しない")
+        if approval.artifact_sha256 != artifact_sha256:
+            raise ValueError("human approval checksum がartifactと一致しない")
+        if approval.expected_revision != expected_revision:
+            raise ValueError("human approval revision が操作対象と一致しない")
         if approval.approved_at_ms > occurred_at_ms:
             raise ValueError("未来の human approval は使用できない")
 

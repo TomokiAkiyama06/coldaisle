@@ -35,6 +35,7 @@ from coldaisle.control.hardware import (
 from coldaisle.control.logging import ControlTraceLogger, ControlTraceSink
 from coldaisle.control.model_registry import (
     MODEL_REGISTRY_SCHEMA_VERSION,
+    ApprovalAction,
     ArtifactAlreadyExistsError,
     ArtifactFormat,
     ArtifactKind,
@@ -57,6 +58,7 @@ from coldaisle.control.model_registry import (
     RegistryEventKind,
     RegistrySnapshot,
     UnknownArtifactError,
+    UnsafeRegistryPathError,
     VerifiedArtifact,
 )
 from coldaisle.control.schema import (
@@ -105,6 +107,7 @@ __all__ = [
     "AcousticInteraction",
     "AcousticModelConfig",
     "AcousticModelSource",
+    "ApprovalAction",
     "ArtifactAlreadyExistsError",
     "ArtifactFormat",
     "ArtifactKind",
@@ -155,6 +158,7 @@ __all__ = [
     "SimulatedFanBackend",
     "SimulatedFaultPlan",
     "UnknownArtifactError",
+    "UnsafeRegistryPathError",
     "VerifiedArtifact",
     "Zone",
     "ZoneAcousticCurve",
