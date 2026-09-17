@@ -44,6 +44,7 @@ def policy(
     recovery_hold_ms: int = 1_000,
     power_feedforward: bool = True,
     demote_after: int = 3,
+    demote_window_ms: int = 60_000,
 ) -> FanPolicyConfig:
     document: dict[str, object] = {
         "schema_version": 2,
@@ -85,7 +86,7 @@ def policy(
             },
         },
         "recovery_hold_ms": recovery_hold_ms,
-        "demote_window_ms": 60_000,
+        "demote_window_ms": demote_window_ms,
         "demote_after": demote_after,
     }
     if power_feedforward:
@@ -473,6 +474,17 @@ def test_every_fallback_condition_has_a_structured_reason(
     assert decision.trace_metadata()["fallback_reason"]["code"] == expected
 
 
+def test_unavailable_proposal_and_non_normal_safety_have_structured_reasons() -> None:
+    unavailable_gate = ControllerGate(policy(), expected_model_version="thermal-v1")
+    unavailable = select(unavailable_gate, now=0, learned=LearnedControlStatus())
+    assert unavailable.fallback_reason.code == "learned_proposal_unavailable"
+
+    safety_gate = ControllerGate(policy(), expected_model_version="thermal-v1")
+    unsafe = select(safety_gate, now=0, safety=SafetyState.DEGRADED)
+    assert unsafe.fallback_reason.code == "safety_not_normal"
+    assert unsafe.fallback_reason.detail == "state=degraded"
+
+
 def test_an_unhealthy_tick_resets_the_recovery_hold() -> None:
     gate = ControllerGate(policy(recovery_hold_ms=1_000), expected_model_version="thermal-v1")
     select(gate, now=0)
@@ -566,6 +578,25 @@ def test_repeated_ml_to_fallback_transitions_emit_a_demotion_signal_for_issue_92
     assert third.trace_metadata()["demotion_recommended"] is True
 
 
+def test_demotion_signal_clears_after_the_configured_window_expires() -> None:
+    gate = ControllerGate(
+        policy(recovery_hold_ms=1, demote_after=1, demote_window_ms=100),
+        expected_model_version="thermal-v1",
+    )
+    select(gate, now=0)
+    select(gate, now=1)
+    triggered = select(
+        gate,
+        now=2,
+        learned=healthy_status(received=2, proposal=learned_proposal(confidence=0.1)),
+    )
+    expired = select(gate, now=103)
+
+    assert triggered.demotion_recommended
+    assert expired.fallback_transitions_in_window == 0
+    assert not expired.demotion_recommended
+
+
 def test_gate_does_not_own_manual_or_calibration_requests() -> None:
     gate = ControllerGate(policy(), expected_model_version="thermal-v1")
     with pytest.raises(ValueError, match="MANUAL"):
@@ -578,12 +609,15 @@ def test_gate_does_not_own_manual_or_calibration_requests() -> None:
         )
 
 
-def test_manual_round_trip_resets_learned_state_and_requires_recovery_hold_again() -> None:
+@pytest.mark.parametrize("human_mode", [OperatingMode.MANUAL, OperatingMode.CALIBRATION])
+def test_human_mode_round_trip_resets_learned_state_and_requires_recovery_hold_again(
+    human_mode: OperatingMode,
+) -> None:
     gate = ControllerGate(policy(recovery_hold_ms=1_000), expected_model_version="thermal-v1")
     select(gate, now=0)
     assert select(gate, now=1_000).active_controller is ControllerKind.LEARNED_MPC
 
-    gate.set_operating_mode(OperatingMode.MANUAL, now_mono_ms=1_001)
+    gate.set_operating_mode(human_mode, now_mono_ms=1_001)
     gate.set_operating_mode(OperatingMode.AUTO, now_mono_ms=2_000)
     returned = select(gate, now=2_000)
 
