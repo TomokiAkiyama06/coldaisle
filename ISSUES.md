@@ -105,6 +105,7 @@ GPU機どころか ESP32 すら接続せずに #8〜#25 のすべてが開発・
 | #61 | ADR: Supervisor + Learned MPC + Reactive Guard + Critical Safety の責務境界 | M8 | 完了（決定記録 0027 / 0028） |
 | #76 | Front / Rear / Top Demand schema と制御reason schema | M8 | 完了（PR #101） |
 | #65 | NVML / lm-sensors / hwmon 内部Telemetry統合（Control/ML入力対応） | M7 | 実装中（実機確認残） |
+| #66 | Server Health API（Workspace連携の単一窓口） | M7 | 実装中（#65 stack、実機確認残） |
 | #102 | Runtime State Estimator: synchronized control snapshot / trend / thermal margin | M8 | 完了（PR #118） |
 | #103 | Control Config schema / validation / versioning / safe reload | M8 | 完了（PR #115） |
 | #77 | Fan Hardware Backend: Demand→PWM/RPM/Flow + simulated backend（Actuation privilege boundary を含む） | M8 | 完了（PR #119） |
@@ -118,12 +119,12 @@ GPU機どころか ESP32 すら接続せずに #8〜#25 のすべてが開発・
 | #50 | ベースライン測定・Safety/Reactive閾値候補・Thermal Dataset初期収集 | M8 | |
 | #106 | Airflow / Fan Control 可視化 UI（ケース内の風の流れと制御状態） | M8 | |
 | #83 | Thermal Dataset schema: Window / Horizon / Fan action列とデータ収集 | M9 | 実装中（実データ収集残） |
-| #84 | Multi-horizon / multi-output Learned Thermal Model | M9 | |
+| #84 | Multi-horizon / multi-output Learned Thermal Model | M9 | 実装中（実データ評価残） |
 | #85 | Model Confidence / OOD検知とAuthority制限 | M9 | |
 | #104 | Control Model Registry: candidate / production / promotion / rollback | M9 | レビュー中（PR #123） |
 | #86 | Learned MPC optimizer とHard Constraints連携 | M9 | |
 | #87 | Workload Regime推定: IDLE / TRANSIENT / SUSTAINED / COOLDOWN / UNKNOWN | M9 | レビュー中（PR #124） |
-| #88 | Supervisor Interface: RulePolicy / RLPolicy / ShadowRLPolicy | M9 | |
+| #88 | Supervisor Interface: RulePolicy / RLPolicy / ShadowRLPolicy | M9 | 実装中（#87 stack） |
 | #90 | Control Shadow Mode / Counterfactual logging | M9 | |
 | #91 | Offline Evaluation: Baseline vs MPC vs Guard vs Supervisor | M9 | |
 | #92 | Authority Rollout: Shadow → 制限付き → Full Authority | M9 | |
