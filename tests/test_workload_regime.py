@@ -43,14 +43,18 @@ def config() -> WorkloadRegimeConfig:
     )
 
 
-def signal(metric: str, value: float | None) -> SnapshotSignal:
-    quality = Quality.OK if value is not None else Quality.MISSING
+def signal(
+    metric: str,
+    value: float | None,
+    quality: Quality | None = None,
+) -> SnapshotSignal:
+    actual_quality = quality or (Quality.OK if value is not None else Quality.MISSING)
     return SnapshotSignal(
         metric=metric,
         importance=TelemetryImportance.DEGRADED,
         enabled=True,
         value=value,
-        quality=quality,
+        quality=actual_quality,
         source_ts_ms=BASE_TS_MS,
         last_changed_mono_ms=0,
         age_ms=0,
@@ -62,13 +66,17 @@ def snapshot(
     *,
     cpu_w: float | None,
     gpu_w: float | None,
+    cpu_quality: Quality | None = None,
+    gpu_quality: Quality | None = None,
 ) -> ControlStateSnapshot:
-    missing = cpu_w is None or gpu_w is None
+    cpu_signal = signal(CPU_METRIC, cpu_w, cpu_quality)
+    gpu_signal = signal(GPU_METRIC, gpu_w, gpu_quality)
+    missing = not cpu_signal.available or not gpu_signal.available
     return ControlStateSnapshot(
         tick_id=second,
         ts_ms=BASE_TS_MS + second * 1_000,
         monotonic_ms=second * 1_000,
-        signals=(signal(CPU_METRIC, cpu_w), signal(GPU_METRIC, gpu_w)),
+        signals=(cpu_signal, gpu_signal),
         derived=(),
         trends=(),
         telemetry_health=TelemetryHealth.DEGRADED if missing else TelemetryHealth.NORMAL,
@@ -101,6 +109,7 @@ def test_idle_requires_observation_and_minimum_transition_duration() -> None:
     confirmed = estimate(history)
 
     assert before_hold.regime is WorkloadRegime.UNKNOWN
+    assert before_hold.reason is RegimeReason.TRANSITION_PENDING
     assert confirmed.regime is WorkloadRegime.IDLE
     assert confirmed.confidence == pytest.approx(0.3)
 
@@ -128,6 +137,14 @@ def test_simultaneous_cpu_gpu_load_becomes_sustained_combined() -> None:
     history = [snapshot(second, cpu_w=90.0, gpu_w=180.0) for second in range(8)]
 
     assert estimate(history).regime is WorkloadRegime.SUSTAINED_CPU_GPU
+
+
+def test_simultaneous_burst_follows_the_dominant_axis_then_can_become_single_axis() -> None:
+    combined = [snapshot(second, cpu_w=90.0, gpu_w=180.0) for second in range(4)]
+    cpu_only = [snapshot(second, cpu_w=90.0, gpu_w=20.0) for second in range(4, 7)]
+
+    assert estimate(combined).regime is WorkloadRegime.TRANSIENT_GPU
+    assert estimate(combined + cpu_only).regime is WorkloadRegime.TRANSIENT_CPU
 
 
 def test_finished_burst_enters_cooldown_then_idle_without_predicting_its_future() -> None:
@@ -166,6 +183,41 @@ def test_gap_resets_history_and_requires_a_new_contiguous_observation() -> None:
         snapshot(9, cpu_w=90.0, gpu_w=20.0),
     ]
     assert estimate(recovered).regime is WorkloadRegime.TRANSIENT_CPU
+
+
+def test_missing_and_stale_inputs_recover_only_after_a_new_contiguous_history() -> None:
+    missing = [
+        snapshot(0, cpu_w=10.0, gpu_w=20.0),
+        snapshot(1, cpu_w=10.0, gpu_w=None),
+    ]
+    recovered = [
+        *missing,
+        *(snapshot(second, cpu_w=10.0, gpu_w=20.0) for second in range(2, 6)),
+    ]
+    stale = snapshot(
+        6,
+        cpu_w=10.0,
+        gpu_w=20.0,
+        gpu_quality=Quality.STALE,
+    )
+
+    assert estimate(recovered).regime is WorkloadRegime.IDLE
+    assert estimate([*recovered, stale]).regime is WorkloadRegime.UNKNOWN
+
+
+def test_threshold_and_gap_boundaries_are_inclusive() -> None:
+    exactly_idle = [snapshot(second, cpu_w=30.0, gpu_w=40.0) for second in range(4)]
+    exactly_active = [snapshot(second, cpu_w=60.0, gpu_w=40.0) for second in range(4)]
+    gap_at_limit = [
+        snapshot(0, cpu_w=30.0, gpu_w=40.0),
+        snapshot(1, cpu_w=30.0, gpu_w=40.0),
+        snapshot(2, cpu_w=30.0, gpu_w=40.0),
+        snapshot(3, cpu_w=30.0, gpu_w=40.0),
+    ]
+
+    assert estimate(exactly_idle).regime is WorkloadRegime.IDLE
+    assert estimate(exactly_active).regime is WorkloadRegime.TRANSIENT_CPU
+    assert estimate(gap_at_limit).regime is WorkloadRegime.IDLE
 
 
 def test_same_mock_replay_and_clock_produce_the_same_transition() -> None:

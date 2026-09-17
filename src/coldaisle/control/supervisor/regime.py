@@ -207,8 +207,8 @@ class WorkloadRegimeEstimator:
             confidence = 0.0
         else:
             confidence = min(1.0, observed_window_ms / self._config.confidence_full_window_ms)
-            if candidate is not None:
-                reason = RegimeReason.TRANSITION_PENDING
+        if candidate is not None:
+            reason = RegimeReason.TRANSITION_PENDING
         return WorkloadRegimeEstimate(
             regime=published,
             confidence=confidence,
