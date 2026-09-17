@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import ast
 import json
+import logging
+import tomllib
 from pathlib import Path
 from typing import Any
 
@@ -191,6 +194,22 @@ def test_record_cannot_target_an_arbitrary_hwmon_attribute(tmp_path: Path) -> No
     assert arbitrary.read_text(encoding="ascii") == "42000\n"
 
 
+def test_label_and_pwm_must_identify_the_same_channel(tmp_path: Path) -> None:
+    sysfs = tmp_path / "sysfs"
+    sysfs.mkdir()
+    create_sysfs(sysfs)
+    (sysfs / "hwmon1/fan2_label").write_text("front-header\n", encoding="utf-8")
+    payload = record()
+    payload["headers"][0]["label_path"] = "hwmon1/fan2_label"
+    handoff = tmp_path / "handoff.json"
+    write_record(handoff, payload)
+
+    with pytest.raises(HandoffRecordError, match="channel"):
+        emergency_handoff(handoff, sysfs)
+
+    assert (sysfs / "hwmon1/pwm1").read_text(encoding="ascii") == "64\n"
+
+
 def test_attribute_symlink_cannot_escape_resolved_hwmon_device(tmp_path: Path) -> None:
     sysfs = tmp_path / "sys" / "class" / "hwmon"
     sysfs.mkdir(parents=True)
@@ -224,23 +243,104 @@ def test_one_zone_io_failure_does_not_skip_remaining_max_attempts(tmp_path: Path
     assert result.applied_zones == ("rear", "top")
     assert result.failed_zones == ("front",)
     assert result.zones[0].status == "io_error"
+    assert result.zones[0].phase == "resolve"
     assert result.zones[0].detail == "FileNotFoundError"
     assert (sysfs / "hwmon2/pwm2").read_text(encoding="ascii") == "255\n"
     assert (sysfs / "hwmon3/pwm3").read_text(encoding="ascii") == "255\n"
 
 
-def test_entrypoint_reports_partial_handoff_failure(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize(
+    ("attribute", "detail"),
+    [("pwm1", "pwm"), ("pwm1_enable", "enable")],
+)
+def test_ignored_write_is_a_structured_readback_failure_and_other_zones_continue(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    attribute: str,
+    detail: str,
 ) -> None:
     sysfs = tmp_path / "sysfs"
     sysfs.mkdir()
     create_sysfs(sysfs)
-    (sysfs / "hwmon2/pwm2").unlink()
     handoff = tmp_path / "handoff.json"
     write_record(handoff, record())
+    ignored = sysfs / "hwmon1" / attribute
+    original_write_text = Path.write_text
+
+    def ignore_write(path: Path, data: str, *args: Any, **kwargs: Any) -> int:
+        if path == ignored:
+            return len(data)
+        return original_write_text(path, data, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "write_text", ignore_write)
+
+    result = emergency_handoff(handoff, sysfs)
+
+    assert result.applied_zones == ("rear", "top")
+    assert result.failed_zones == ("front",)
+    assert result.zones[0].status == "readback_mismatch"
+    assert result.zones[0].phase == "readback"
+    assert result.zones[0].detail == detail
+
+
+def test_standalone_entrypoint_imports_only_the_standard_library() -> None:
+    project_root = Path(__file__).parents[1]
+    source_path = project_root / "src/coldaisle/safety_handoff.py"
+    tree = ast.parse(source_path.read_text(encoding="utf-8"))
+    imported_roots = {
+        node.names[0].name.split(".", maxsplit=1)[0]
+        if isinstance(node, ast.Import)
+        else (node.module or "").split(".", maxsplit=1)[0]
+        for node in tree.body
+        if isinstance(node, (ast.Import, ast.ImportFrom))
+    }
+    assert imported_roots <= {
+        "__future__",
+        "dataclasses",
+        "json",
+        "logging",
+        "pathlib",
+        "re",
+        "typing",
+    }
+    project = tomllib.loads((project_root / "pyproject.toml").read_text(encoding="utf-8"))
+    assert project["project"]["scripts"]["coldaisle-safety-handoff"] == (
+        "coldaisle.safety_handoff:main"
+    )
+
+
+def test_entrypoint_reports_partial_handoff_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    sysfs = tmp_path / "sysfs"
+    sysfs.mkdir()
+    create_sysfs(sysfs)
+    handoff = tmp_path / "handoff.json"
+    write_record(handoff, record())
+    original_write_text = Path.write_text
+    failed_enable = sysfs / "hwmon2/pwm2_enable"
+
+    def fail_rear_enable(path: Path, *args: Any, **kwargs: Any) -> int:
+        if path == failed_enable:
+            raise OSError("injected enable failure")
+        return original_write_text(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "write_text", fail_rear_enable)
     monkeypatch.setattr(handoff_module, "HANDOFF_RECORD_PATH", handoff)
     monkeypatch.setattr(handoff_module, "HWMON_ROOT", sysfs)
+    caplog.set_level(logging.INFO, logger="coldaisle.safety_handoff")
 
     assert handoff_module.main() == 1
     assert (sysfs / "hwmon1/pwm1").read_text(encoding="ascii") == "255\n"
+    assert (sysfs / "hwmon2/pwm2").read_text(encoding="ascii") == "255\n"
     assert (sysfs / "hwmon3/pwm3").read_text(encoding="ascii") == "255\n"
+    payload = json.loads(caplog.records[-1].message)
+    assert payload["event"] == "safety_handoff_completed"
+    assert payload["success"] is False
+    assert payload["zones"] == [
+        {"zone": "front", "status": "applied", "phase": "complete", "detail": ""},
+        {"zone": "rear", "status": "io_error", "phase": "enable", "detail": "OSError"},
+        {"zone": "top", "status": "applied", "phase": "complete", "detail": ""},
+    ]

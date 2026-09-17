@@ -33,6 +33,8 @@ from coldaisle.control.schema import (
     ZoneRequest,
 )
 from coldaisle.control.state import ControlStateSnapshot
+from coldaisle.metrics import MetricCatalog
+from coldaisle.store.models import validate_metric
 
 CPU_TEMPERATURE_METRIC = "cpu.package"
 GPU_TEMPERATURE_METRIC = "gpu.0.core"
@@ -96,12 +98,29 @@ class CriticalSafety:
         config: SafetyConfig,
         *,
         approved_t_sensor_metric: str | None = None,
+        metric_catalog: MetricCatalog | None = None,
     ) -> None:
         t_sensor_enabled = config.telemetry.t_sensor.enabled.value
-        if t_sensor_enabled and approved_t_sensor_metric is None:
-            raise ValueError("T_SENSOR 有効化には承認済みの metric contract を注入する")
+        if t_sensor_enabled and (approved_t_sensor_metric is None or metric_catalog is None):
+            raise ValueError(
+                "T_SENSOR 有効化には承認済みの metric contract と MetricCatalog を注入する"
+            )
         if not t_sensor_enabled and approved_t_sensor_metric is not None:
             raise ValueError("T_SENSOR が無効のときは metric contract を注入しない")
+        if approved_t_sensor_metric is not None:
+            validate_metric(approved_t_sensor_metric)
+            if (
+                approved_t_sensor_metric in ABSOLUTE_TEMPERATURE_METRICS
+                or approved_t_sensor_metric == AIR_TELEMETRY_GROUP
+            ):
+                raise ValueError("T_SENSOR metric は既存の Safety 入力名と重複させない")
+            assert metric_catalog is not None
+            unit = metric_catalog.unit_for(approved_t_sensor_metric)
+            if unit != "C":
+                raise ValueError(
+                    "T_SENSOR metric は MetricCatalog に温度(C)として定義する: "
+                    f"metric={approved_t_sensor_metric}, unit={unit}"
+                )
         self._config = config
         self._t_sensor_metric = approved_t_sensor_metric
         self._disabled_inputs = (
@@ -120,6 +139,7 @@ class CriticalSafety:
         self._startup = True
         self._startup_tach_seen: set[Zone] = set()
         self._stall_started_ms: dict[Zone, int] = {}
+        self._last_effective_demand: dict[Zone, float] = {}
         self._write_failure_counts = {zone: 0 for zone in Zone}
         self._overrun_count = 0
         self._latched_faults: dict[tuple[FaultCode, Zone | None], _LatchedFault] = {}
@@ -260,16 +280,19 @@ class CriticalSafety:
                 self._startup_tach_seen.add(zone)
 
     def _stall_faults(self, snapshot: ControlStateSnapshot) -> tuple[Fault, ...]:
-        if snapshot.fans is None:
-            self._stall_started_ms.clear()
-            return ()
         faults: list[Fault] = []
         for zone in Zone:
-            fan = snapshot.fans.get(zone)
-            if (
-                fan.effective_demand is None
-                or fan.effective_demand < self._config.stall_check_min_demand.get(zone).value
-                or (fan.rpm is not None and fan.rpm >= self._config.stall_min_rpm.get(zone).value)
+            fan = None if snapshot.fans is None else snapshot.fans.get(zone)
+            if fan is not None and fan.effective_demand is not None:
+                self._last_effective_demand[zone] = fan.effective_demand
+            demand = (
+                fan.effective_demand
+                if fan is not None and fan.effective_demand is not None
+                else self._last_effective_demand.get(zone, 1.0)
+            )
+            rpm = None if fan is None else fan.rpm
+            if demand < self._config.stall_check_min_demand.get(zone).value or (
+                rpm is not None and rpm >= self._config.stall_min_rpm.get(zone).value
             ):
                 self._stall_started_ms.pop(zone, None)
                 continue
@@ -281,9 +304,10 @@ class CriticalSafety:
                         zone=zone,
                         detail=(
                             "rpm="
-                            + ("unavailable" if fan.rpm is None else str(fan.rpm))
-                            + f", demand={fan.effective_demand:g}, "
-                            f"window_ms={self._config.stall_window_ms.value}"
+                            + ("unavailable" if rpm is None else str(rpm))
+                            + f", demand={demand:g}, "
+                            + ("fan_readback=unavailable, " if fan is None else "")
+                            + f"window_ms={self._config.stall_window_ms.value}"
                         ),
                     )
                 )
@@ -440,7 +464,50 @@ def invalid_config_decision() -> CriticalSafetyDecision:
     )
 
 
-def compose_effective_demands(
+class DemandComposer:
+    """検証済み SafetyConfig と直前 effective を所有する唯一の合成経路。"""
+
+    def __init__(self, config: SafetyConfig) -> None:
+        self._ramp_down_per_s = config.ramp_down_per_s.value
+        self._previous: PerZone[EffectiveZoneDemand] | None = None
+        self._last_monotonic_ms: int | None = None
+
+    def compose(
+        self,
+        *,
+        requested: PerZone[ZoneRequest],
+        guard: PerZone[GuardZoneOutput],
+        safety: CriticalSafetyDecision,
+        mode: OperatingMode,
+        now_mono_ms: int,
+    ) -> PerZone[EffectiveZoneDemand]:
+        """0028 §2.4 の順序で合成し、次 tick 用 effective を内部保持する。"""
+        if now_mono_ms < 0:
+            raise ValueError("合成の単調時計は負にできない")
+        if self._last_monotonic_ms is None:
+            if not all(safety.zones.get(zone).forced_max for zone in Zone):
+                raise ValueError("最初の合成は STARTUP / EMERGENCY の forced Max にする")
+            elapsed_ms = 0
+        else:
+            if now_mono_ms <= self._last_monotonic_ms:
+                raise ValueError("合成の単調時計は tick ごとに前進させる")
+            elapsed_ms = now_mono_ms - self._last_monotonic_ms
+
+        effective = _compose_effective_demands(
+            requested=requested,
+            guard=guard,
+            safety=safety,
+            mode=mode,
+            previous=self._previous,
+            elapsed_ms=elapsed_ms,
+            ramp_down_per_s=self._ramp_down_per_s,
+        )
+        self._previous = effective
+        self._last_monotonic_ms = now_mono_ms
+        return effective
+
+
+def _compose_effective_demands(
     *,
     requested: PerZone[ZoneRequest],
     guard: PerZone[GuardZoneOutput],

@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import math
-
 import pytest
 
 from coldaisle.control.config import SafetyConfig
@@ -11,12 +9,11 @@ from coldaisle.control.safety import (
     AIR_TELEMETRY_GROUP,
     CriticalSafety,
     CriticalSafetyDecision,
-    compose_effective_demands,
+    DemandComposer,
     invalid_config_decision,
 )
 from coldaisle.control.schema import (
     BoundBy,
-    EffectiveZoneDemand,
     Fault,
     FaultCode,
     GuardZoneOutput,
@@ -35,6 +32,7 @@ from coldaisle.control.state import (
     TelemetryHealth,
     TelemetryImportance,
 )
+from coldaisle.metrics import MetricCatalog, MetricMeta
 from coldaisle.store.models import Quality
 
 PROPOSED_T_SENSOR_METRIC = "board.connector_12v2x6"
@@ -53,6 +51,7 @@ def safety_config(
     t_sensor_enabled: bool = False,
     fault_demand: float = 1.0,
     write_limit: int = 3,
+    ramp_down_per_s: float = 0.1,
 ) -> SafetyConfig:
     def value(raw: object) -> dict[str, object]:
         return tracked(raw, status)
@@ -67,7 +66,7 @@ def safety_config(
         t_sensor["stale_after_ms"] = value(1_000)
     return SafetyConfig.model_validate(
         {
-            "schema_version": 1,
+            "schema_version": 2,
             "absolute_temp_ceiling_c": value(85.0),
             "zone_min_demand": {
                 "front": value(0.4),
@@ -98,7 +97,7 @@ def safety_config(
                 "air_ms": value(3_000),
                 "air_sensor_period_ms": value(2_500),
             },
-            "ramp_down_per_s": value(0.1),
+            "ramp_down_per_s": value(ramp_down_per_s),
             "startup_settle_ms": value(1_000),
             "fault_clear_hold_ms": value(2_000),
             "tick_deadline_ms": value(500),
@@ -187,6 +186,10 @@ def settle(safety: CriticalSafety) -> CriticalSafetyDecision:
     return safety.evaluate(snapshot(tick=2, mono=1_000), mode=OperatingMode.AUTO)
 
 
+def t_sensor_catalog(metric: str = PROPOSED_T_SENSOR_METRIC, unit: str = "C") -> MetricCatalog:
+    return MetricCatalog(metrics={metric: MetricMeta(unit=unit, label="T_SENSOR")})
+
+
 def empty_guard() -> PerZone[GuardZoneOutput]:
     item = GuardZoneOutput()
     return PerZone(front=item, rear=item, top=item)
@@ -221,17 +224,6 @@ def decision(
         config_validated=True,
         config_is_provisional=True,
     )
-
-
-def previous(demand: float) -> PerZone[EffectiveZoneDemand]:
-    item = EffectiveZoneDemand(
-        requested=demand,
-        effective=demand,
-        bound_by=BoundBy.REQUESTED,
-        safety_floor=0.0,
-        forced_max=False,
-    )
-    return PerZone(front=item, rear=item, top=item)
 
 
 def test_startup_is_max_until_settle_and_all_tach_have_responded() -> None:
@@ -345,6 +337,7 @@ def test_t_sensor_disabled_is_ignored_but_enabled_loss_is_critical() -> None:
     enabled = CriticalSafety(
         safety_config(t_sensor_enabled=True, fault_demand=0.9),
         approved_t_sensor_metric=PROPOSED_T_SENSOR_METRIC,
+        metric_catalog=t_sensor_catalog(),
     )
     t_sensor = (signal(PROPOSED_T_SENSOR_METRIC, 60.0),)
     enabled.evaluate(
@@ -367,6 +360,29 @@ def test_t_sensor_disabled_is_ignored_but_enabled_loss_is_critical() -> None:
     assert enabled_result.state is SafetyState.DEGRADED
     assert enabled_result.faults[0].code is FaultCode.T_SENSOR_STALE
     assert enabled_result.zones.front.floor == 0.9
+
+
+@pytest.mark.parametrize(
+    "metric",
+    ["cpu.package", "gpu.0.hotspot", AIR_TELEMETRY_GROUP, "not a metric"],
+)
+def test_t_sensor_contract_rejects_reserved_or_noncanonical_metric(metric: str) -> None:
+    with pytest.raises(ValueError):
+        CriticalSafety(
+            safety_config(t_sensor_enabled=True),
+            approved_t_sensor_metric=metric,
+            metric_catalog=t_sensor_catalog(metric),
+        )
+
+
+@pytest.mark.parametrize(("unit", "catalog"), [("W", True), ("C", False)])
+def test_t_sensor_contract_requires_a_catalogued_celsius_metric(unit: str, catalog: bool) -> None:
+    with pytest.raises(ValueError, match=r"MetricCatalog|温度"):
+        CriticalSafety(
+            safety_config(t_sensor_enabled=True),
+            approved_t_sensor_metric=PROPOSED_T_SENSOR_METRIC,
+            metric_catalog=t_sensor_catalog(unit=unit) if catalog else None,
+        )
 
 
 def test_unknown_critical_input_is_not_silently_ignored() -> None:
@@ -517,6 +533,56 @@ def test_low_and_unavailable_rpm_share_one_continuous_stall_timer() -> None:
     assert faulted.faults[0].code is FaultCode.TACH_STALL
 
 
+def test_all_fan_readback_loss_uses_last_effective_demand_and_stalls() -> None:
+    safety = CriticalSafety(safety_config())
+    settle(safety)
+
+    started = safety.evaluate(
+        snapshot(tick=3, mono=2_000).model_copy(update={"fans": None}),
+        mode=OperatingMode.AUTO,
+    )
+    before_window = safety.evaluate(
+        snapshot(tick=4, mono=3_999).model_copy(update={"fans": None}),
+        mode=OperatingMode.AUTO,
+    )
+    stalled = safety.evaluate(
+        snapshot(tick=5, mono=4_000).model_copy(update={"fans": None}),
+        mode=OperatingMode.AUTO,
+    )
+
+    assert started.state is SafetyState.NORMAL
+    assert before_window.state is SafetyState.NORMAL
+    assert stalled.state is SafetyState.EMERGENCY
+    assert {(fault.code, fault.zone) for fault in stalled.faults} == {
+        (FaultCode.TACH_STALL, zone) for zone in Zone
+    }
+    assert all("fan_readback=unavailable" in fault.detail for fault in stalled.faults)
+
+
+def test_all_fan_readback_loss_does_not_invent_a_higher_last_demand() -> None:
+    safety = CriticalSafety(safety_config())
+    settle(safety)
+    safety.evaluate(
+        snapshot(
+            tick=3,
+            mono=2_000,
+            fan_state=fans(front_demand=0.3),
+        ),
+        mode=OperatingMode.AUTO,
+    )
+    safety.evaluate(
+        snapshot(tick=4, mono=3_000).model_copy(update={"fans": None}),
+        mode=OperatingMode.AUTO,
+    )
+    stalled = safety.evaluate(
+        snapshot(tick=5, mono=5_000).model_copy(update={"fans": None}),
+        mode=OperatingMode.AUTO,
+    )
+
+    tach_zones = {fault.zone for fault in stalled.faults if fault.code is FaultCode.TACH_STALL}
+    assert tach_zones == {Zone.REAR, Zone.TOP}
+
+
 def test_top_stall_is_immediate_emergency_after_the_stall_window() -> None:
     safety = CriticalSafety(safety_config())
     settle(safety)
@@ -647,23 +713,27 @@ def test_floor_wins_over_auto_guard_ceiling_and_tie_uses_safety_precedence() -> 
         top=GuardZoneOutput(),
     )
 
-    result = compose_effective_demands(
+    composer = DemandComposer(safety_config())
+    composer.compose(
+        requested=requests(0.2),
+        guard=empty_guard(),
+        safety=decision(floor=0.4, forced=True, state=SafetyState.EMERGENCY),
+        mode=OperatingMode.AUTO,
+        now_mono_ms=0,
+    )
+    result = composer.compose(
         requested=requests(0.8),
         guard=constrained_guard,
         safety=decision(floor=0.6),
         mode=OperatingMode.AUTO,
-        previous=None,
-        elapsed_ms=1_000,
-        ramp_down_per_s=0.1,
+        now_mono_ms=10_000,
     )
-    tie = compose_effective_demands(
+    tie = composer.compose(
         requested=requests(0.6),
         guard=empty_guard(),
         safety=decision(floor=0.6),
         mode=OperatingMode.AUTO,
-        previous=None,
-        elapsed_ms=1_000,
-        ramp_down_per_s=0.1,
+        now_mono_ms=20_000,
     )
 
     assert result.front.effective == 0.6
@@ -688,23 +758,27 @@ def test_manual_and_calibration_ignore_ceiling_but_keep_guard_and_safety_floors(
         top=GuardZoneOutput(),
     )
 
-    high = compose_effective_demands(
+    composer = DemandComposer(safety_config())
+    composer.compose(
+        requested=requests(0.2),
+        guard=empty_guard(),
+        safety=decision(floor=0.4, forced=True, state=SafetyState.EMERGENCY),
+        mode=mode,
+        now_mono_ms=0,
+    )
+    high = composer.compose(
         requested=requests(0.8),
         guard=guard,
         safety=decision(floor=0.4),
         mode=mode,
-        previous=None,
-        elapsed_ms=1_000,
-        ramp_down_per_s=0.1,
+        now_mono_ms=10_000,
     )
-    low = compose_effective_demands(
+    low = composer.compose(
         requested=requests(0.1),
         guard=guard,
         safety=decision(floor=0.6),
         mode=mode,
-        previous=None,
-        elapsed_ms=1_000,
-        ramp_down_per_s=0.1,
+        now_mono_ms=20_000,
     )
 
     assert high.front.effective == 0.8
@@ -714,25 +788,37 @@ def test_manual_and_calibration_ignore_ceiling_but_keep_guard_and_safety_floors(
 
 
 def test_ramp_down_is_limited_but_ramp_up_is_not() -> None:
-    down = compose_effective_demands(
+    composer = DemandComposer(safety_config())
+    composer.compose(
+        requested=requests(0.2),
+        guard=empty_guard(),
+        safety=decision(floor=0.0, forced=True, state=SafetyState.EMERGENCY),
+        mode=OperatingMode.AUTO,
+        now_mono_ms=0,
+    )
+    baseline = composer.compose(
+        requested=requests(0.8),
+        guard=empty_guard(),
+        safety=decision(floor=0.0),
+        mode=OperatingMode.AUTO,
+        now_mono_ms=2_000,
+    )
+    down = composer.compose(
         requested=requests(0.2),
         guard=empty_guard(),
         safety=decision(floor=0.0),
         mode=OperatingMode.AUTO,
-        previous=previous(0.8),
-        elapsed_ms=1_000,
-        ramp_down_per_s=0.1,
+        now_mono_ms=3_000,
     )
-    up = compose_effective_demands(
+    up = composer.compose(
         requested=requests(0.9),
         guard=empty_guard(),
         safety=decision(floor=0.0),
         mode=OperatingMode.AUTO,
-        previous=previous(0.4),
-        elapsed_ms=1_000,
-        ramp_down_per_s=0.1,
+        now_mono_ms=4_000,
     )
 
+    assert baseline.front.effective == pytest.approx(0.8)
     assert down.front.effective == pytest.approx(0.7)
     assert down.front.bound_by is BoundBy.RAMP_DOWN
     assert up.front.effective == 0.9
@@ -751,14 +837,12 @@ def test_forced_max_wins_over_every_constraint_and_is_structured() -> None:
         top=GuardZoneOutput(),
     )
 
-    result = compose_effective_demands(
+    result = DemandComposer(safety_config()).compose(
         requested=requests(0.2),
         guard=guard,
         safety=decision(floor=0.4, forced=True, state=SafetyState.EMERGENCY),
         mode=OperatingMode.AUTO,
-        previous=previous(0.5),
-        elapsed_ms=1_000,
-        ramp_down_per_s=0.1,
+        now_mono_ms=0,
     )
 
     assert result.front.effective == 1.0
@@ -766,27 +850,45 @@ def test_forced_max_wins_over_every_constraint_and_is_structured() -> None:
     assert result.front.reasons
 
 
-def test_composition_rejects_invalid_timing_values() -> None:
-    with pytest.raises(ValueError, match="elapsed_ms"):
-        compose_effective_demands(
+def test_composer_owns_previous_state_and_rejects_bypass_or_time_reuse() -> None:
+    composer = DemandComposer(safety_config())
+    with pytest.raises(ValueError, match="forced Max"):
+        composer.compose(
             requested=requests(0.5),
             guard=empty_guard(),
             safety=decision(),
             mode=OperatingMode.AUTO,
-            previous=None,
-            elapsed_ms=-1,
-            ramp_down_per_s=0.1,
+            now_mono_ms=0,
         )
-    with pytest.raises(ValueError, match="ramp_down_per_s"):
-        compose_effective_demands(
+    with pytest.raises(ValueError, match="負"):
+        composer.compose(
+            requested=requests(0.5),
+            guard=empty_guard(),
+            safety=decision(forced=True, state=SafetyState.EMERGENCY),
+            mode=OperatingMode.AUTO,
+            now_mono_ms=-1,
+        )
+    composer.compose(
+        requested=requests(0.5),
+        guard=empty_guard(),
+        safety=decision(forced=True, state=SafetyState.EMERGENCY),
+        mode=OperatingMode.AUTO,
+        now_mono_ms=0,
+    )
+    with pytest.raises(ValueError, match="前進"):
+        composer.compose(
             requested=requests(0.5),
             guard=empty_guard(),
             safety=decision(),
             mode=OperatingMode.AUTO,
-            previous=None,
-            elapsed_ms=1,
-            ramp_down_per_s=math.inf,
+            now_mono_ms=0,
         )
+
+
+def test_bare_stateless_composition_is_not_part_of_the_public_safety_api() -> None:
+    import coldaisle.control.safety as safety_api
+
+    assert not hasattr(safety_api, "compose_effective_demands")
 
 
 def test_tick_order_cannot_move_backwards_or_repeat() -> None:

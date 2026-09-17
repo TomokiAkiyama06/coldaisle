@@ -7,7 +7,7 @@ from coldaisle.control.safety.critical import (
     GPU_TEMPERATURE_METRIC,
     CriticalSafety,
     CriticalSafetyDecision,
-    compose_effective_demands,
+    DemandComposer,
     invalid_config_decision,
 )
 from coldaisle.safety_handoff import (
@@ -24,10 +24,10 @@ __all__ = [
     "GPU_TEMPERATURE_METRIC",
     "CriticalSafety",
     "CriticalSafetyDecision",
+    "DemandComposer",
     "HandoffRecordError",
     "HandoffResult",
     "HandoffZoneResult",
-    "compose_effective_demands",
     "emergency_handoff",
     "invalid_config_decision",
 ]

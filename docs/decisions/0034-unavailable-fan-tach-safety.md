@@ -20,6 +20,10 @@ stall の timer 対象外にすると、次の経路で冷却の帰還を失っ�
 3. 指令 demand が `stall_check_min_demand` 以上でも stall 判定が解除され、
    `NORMAL` のまま運転する
 
+同じ抜けは `ControlStateSnapshot.fans` 全体が `None` になった場合にも生じる。
+個別 RPM だけでなく Fan readback 自体を失っても、直前までの指令を Safety は
+冷却確認済みとみなせない。
+
 RPM の読み取り不能は「Fan が回っているが tach だけ読めない」と
 「Fan 停止や header 異常で読めない」をソフトウェアから区別できない。
 実機がない現在は、前者だと楽観して通常運転を続ける根拠がない。
@@ -32,6 +36,10 @@ RPM の読み取り不能は「Fan が回っているが tach だけ読めない
   - RPM が読み取れず `None`
 - 上の2状態が切り替わっても timer を reset しない。有効な RPM が
   `stall_min_rpm` 以上へ戻ったときだけ reset する。
+- `snapshot.fans` 全体が無い場合は、zone ごとに最後に観測できた
+  `FanState.effective_demand` を直前 command の記録として使い、RPM unavailable と同じ
+  timer を進める。最初の readback より前は STARTUP の command が Max であるため
+  demand `1.0` として扱う。値を0や閾値未満で補って判定を解除しない。
 - `stall_window_ms` が経過するまでは transient として fault にしない。値は
   `safety.yaml` の provisional / confirmed 状態をそのまま使い、別の固定値を持たない。
 - window 経過後は既存の `FaultCode.TACH_STALL` と同じ応答にする。
@@ -45,13 +53,19 @@ RPM の読み取り不能は「Fan が回っているが tach だけ読めない
 T_SENSOR の metric contract は、決定記録 0032（#65、Proposed）が提案する
 `board.connector_12v2x6` に依存する。Critical Safety は名前をハードコードせず、
 T_SENSOR 有効時に `approved_t_sensor_metric` として承認済み metric contract の注入を
-必須にする。0032 が FINAL になる前は本番設定で T_SENSOR を有効化しない。
+必須にし、Metric Catalog に単位 `C` で存在し、既存 Safety 入力名と衝突しないことを
+検証する。0032 が FINAL になる前は本番設定で T_SENSOR を有効化しない。
 0032 の名前がレビューで
 変わる場合は、#65 / #78 へ同じ承認済み名を渡す。
+
+本記録は #78 PR の人間による Safety review と merge を承認点とする。Status が
+Proposed の間は本番設定・サービスでこの制御を有効化しない。
 
 ## 3. Consequences
 
 - tach の帰還を失ったまま `NORMAL` で低い demand へ移る経路を閉じる
+- Fan readback 全体の喪失でも last effective command を基準に fault へ移り、timer を
+  消して `NORMAL` に戻る経路を閉じる
 - 一過性の読み取り失敗は `stall_window_ms` の間は fault にならない
 - tach 配線だけの断線で Fan が実際に回っていても、window 後に安全側へ移り
   騒音が増える。実機で原因を切り分けられるまで冷却側を優先する

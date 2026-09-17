@@ -56,7 +56,7 @@ def valid_documents() -> dict[str, dict[str, object]]:
             },
         },
         "safety.yaml": {
-            "schema_version": 1,
+            "schema_version": 2,
             "absolute_temp_ceiling_c": provisional(85.0),
             "zone_min_demand": {
                 "front": provisional(0.4),
@@ -142,7 +142,25 @@ def test_complete_config_has_traceable_sources_and_is_not_actuation_ready(tmp_pa
     assert config.actuation_permitted is False
     metadata = config.trace_metadata()["control_config"]
     assert metadata["fan_hardware"]["name"] == "fan-hardware.yaml"
+    assert metadata["safety"]["schema_version"] == 2
     assert len(metadata["safety"]["sha256"]) == 64
+
+
+def test_safety_v1_is_rejected_without_defaulting_new_safety_fields(tmp_path: Path) -> None:
+    documents = valid_documents()
+    documents["safety.yaml"]["schema_version"] = 1
+    write_documents(tmp_path, documents)
+
+    with pytest.raises(ValidationError, match="schema_version"):
+        ControlConfig.from_directory(tmp_path)
+
+
+def test_trace_source_version_must_match_the_validated_file_model(tmp_path: Path) -> None:
+    raw = load_config(tmp_path).model_dump(mode="python")
+    raw["sources"]["safety"]["schema_version"] = 1
+
+    with pytest.raises(ValidationError, match="ConfigSource"):
+        ControlConfig.model_validate(raw)
 
 
 def test_missing_or_unknown_config_is_rejected_before_activation(tmp_path: Path) -> None:

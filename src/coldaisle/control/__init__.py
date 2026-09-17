@@ -23,6 +23,7 @@ from coldaisle.control.acoustic import (
 from coldaisle.control.config import (
     CONFIG_FILENAMES,
     CONTROL_CONFIG_VERSION,
+    SAFETY_CONFIG_VERSION,
     ControlConfig,
     ProvisionalConfigValue,
 )
@@ -40,10 +41,10 @@ from coldaisle.control.safety import (
     GPU_TEMPERATURE_METRIC,
     CriticalSafety,
     CriticalSafetyDecision,
+    DemandComposer,
     HandoffRecordError,
     HandoffResult,
     HandoffZoneResult,
-    compose_effective_demands,
     emergency_handoff,
     invalid_config_decision,
 )
@@ -87,6 +88,7 @@ __all__ = [
     "CPU_TEMPERATURE_METRIC",
     "EMERGENCY_FAULTS",
     "GPU_TEMPERATURE_METRIC",
+    "SAFETY_CONFIG_VERSION",
     "SCHEMA_VERSION",
     "TOP_EMERGENCY_FAULTS",
     "ZONE_FAULTS",
@@ -109,6 +111,7 @@ __all__ = [
     "CriticalSafety",
     "CriticalSafetyDecision",
     "Demand",
+    "DemandComposer",
     "DisabledAcousticCostModel",
     "EffectiveZoneDemand",
     "FanHardwareBackend",
@@ -133,7 +136,6 @@ __all__ = [
     "ZoneAcousticCurve",
     "ZoneRecord",
     "ZoneRequest",
-    "compose_effective_demands",
     "emergency_handoff",
     "invalid_config_decision",
     "load_acoustic_model",

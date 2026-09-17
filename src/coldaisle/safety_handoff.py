@@ -9,6 +9,7 @@ manual mode ``1`` だけである。呼び出し側は、fan daemon の writer �
 from __future__ import annotations
 
 import json
+import logging
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -56,7 +57,8 @@ class HandoffZoneResult:
     """1 zone の Max handoff 結果。"""
 
     zone: str
-    status: Literal["applied", "identity_mismatch", "io_error"]
+    status: Literal["applied", "identity_mismatch", "io_error", "readback_mismatch"]
+    phase: Literal["resolve", "identity", "pwm", "enable", "readback", "complete"]
     detail: str = ""
 
 
@@ -79,8 +81,12 @@ class HandoffResult:
 
     @property
     def failed_zones(self) -> tuple[str, ...]:
-        """I/O 失敗のため handoff を完了できなかった zone。"""
-        return tuple(result.zone for result in self.zones if result.status == "io_error")
+        """I/O 失敗または readback 不一致で handoff を完了できなかった zone。"""
+        return tuple(
+            result.zone
+            for result in self.zones
+            if result.status in {"io_error", "readback_mismatch"}
+        )
 
 
 def emergency_handoff(record_path: Path, sysfs_root: Path) -> HandoffResult:
@@ -120,32 +126,90 @@ def emergency_handoff(record_path: Path, sysfs_root: Path) -> HandoffResult:
                 HandoffZoneResult(
                     zone=header.zone,
                     status="io_error",
+                    phase="resolve",
                     detail=type(paths).__name__,
                 )
             )
             continue
         name_path, label_path, pwm_path, enable_path = paths
         try:
-            if (
-                name_path.read_text(encoding="utf-8").strip() != header.expected_name
-                or label_path.read_text(encoding="utf-8").strip() != header.expected_label
-            ):
-                results.append(HandoffZoneResult(zone=header.zone, status="identity_mismatch"))
-                continue
-            # auto のまま PWM を Max にしてから manual に切り替えれば、途中で
-            # プロセスが止まっても一時的に冷却を下げる書き込みにはならない。
+            name = name_path.read_text(encoding="utf-8").strip()
+            label = label_path.read_text(encoding="utf-8").strip()
+        except OSError as exc:
+            results.append(
+                HandoffZoneResult(
+                    zone=header.zone,
+                    status="io_error",
+                    phase="identity",
+                    detail=type(exc).__name__,
+                )
+            )
+            continue
+        if name != header.expected_name or label != header.expected_label:
+            results.append(
+                HandoffZoneResult(
+                    zone=header.zone,
+                    status="identity_mismatch",
+                    phase="identity",
+                    detail="driver_or_label",
+                )
+            )
+            continue
+        # auto のまま PWM を Max にしてから manual に切り替えれば、途中で
+        # プロセスが止まっても一時的に冷却を下げる書き込みにはならない。
+        try:
             pwm_path.write_text(HWMON_MAX_PWM, encoding="ascii")
+        except OSError as exc:
+            results.append(
+                HandoffZoneResult(
+                    zone=header.zone,
+                    status="io_error",
+                    phase="pwm",
+                    detail=type(exc).__name__,
+                )
+            )
+            continue
+        try:
             enable_path.write_text(HWMON_MANUAL_MODE, encoding="ascii")
         except OSError as exc:
             results.append(
                 HandoffZoneResult(
                     zone=header.zone,
                     status="io_error",
+                    phase="enable",
                     detail=type(exc).__name__,
                 )
             )
             continue
-        results.append(HandoffZoneResult(zone=header.zone, status="applied"))
+        try:
+            pwm_readback = pwm_path.read_text(encoding="ascii").strip()
+            enable_readback = enable_path.read_text(encoding="ascii").strip()
+        except OSError as exc:
+            results.append(
+                HandoffZoneResult(
+                    zone=header.zone,
+                    status="io_error",
+                    phase="readback",
+                    detail=type(exc).__name__,
+                )
+            )
+            continue
+        mismatch = []
+        if pwm_readback != HWMON_MAX_PWM.strip():
+            mismatch.append("pwm")
+        if enable_readback != HWMON_MANUAL_MODE.strip():
+            mismatch.append("enable")
+        if mismatch:
+            results.append(
+                HandoffZoneResult(
+                    zone=header.zone,
+                    status="readback_mismatch",
+                    phase="readback",
+                    detail=",".join(mismatch),
+                )
+            )
+            continue
+        results.append(HandoffZoneResult(zone=header.zone, status="applied", phase="complete"))
     return HandoffResult(record_found=True, zones=tuple(results))
 
 
@@ -156,7 +220,31 @@ def main() -> int:
     mismatch は対象外 header へ書かず、非0で systemd へ通知する。
     """
     result = emergency_handoff(HANDOFF_RECORD_PATH, HWMON_ROOT)
-    return 1 if result.identity_mismatch_zones or result.failed_zones else 0
+    failed = bool(result.identity_mismatch_zones or result.failed_zones)
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
+    logging.getLogger("coldaisle.safety_handoff").log(
+        logging.ERROR if failed else logging.INFO,
+        json.dumps(
+            {
+                "event": "safety_handoff_completed",
+                "record_found": result.record_found,
+                "success": not failed,
+                "zones": [
+                    {
+                        "zone": zone.zone,
+                        "status": zone.status,
+                        "phase": zone.phase,
+                        "detail": zone.detail,
+                    }
+                    for zone in result.zones
+                ],
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ),
+    )
+    return 1 if failed else 0
 
 
 def _load_record(path: Path) -> tuple[_HeaderRecord, ...]:
@@ -237,13 +325,14 @@ def _validate_header_paths(header: _HeaderRecord) -> None:
     if len(class_entries) != 1 or re.fullmatch(r"hwmon[0-9]+", next(iter(class_entries))) is None:
         raise HandoffRecordError("handoff header は1つの hwmon class entry を指す")
     name_path, label_path, pwm_path, enable_path = relative_paths
-    if (
-        name_path.name != "name"
-        or re.fullmatch(r"(?:fan|pwm)[1-9][0-9]*_label", label_path.name) is None
-    ):
+    label_match = re.fullmatch(r"(?:fan|pwm)([1-9][0-9]*)_label", label_path.name)
+    if name_path.name != "name" or label_match is None:
         raise HandoffRecordError("handoff header の identity path が hwmon 形式ではない")
-    if re.fullmatch(r"pwm[1-9][0-9]*", pwm_path.name) is None:
+    pwm_match = re.fullmatch(r"pwm([1-9][0-9]*)", pwm_path.name)
+    if pwm_match is None:
         raise HandoffRecordError("handoff header の PWM path が hwmon 形式ではない")
+    if label_match.group(1) != pwm_match.group(1):
+        raise HandoffRecordError("handoff header の label と PWM channel が一致しない")
     if enable_path.name != f"{pwm_path.name}_enable":
         raise HandoffRecordError("handoff header の enable path が PWM channel と一致しない")
 

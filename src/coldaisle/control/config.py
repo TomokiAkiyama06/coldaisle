@@ -16,6 +16,7 @@ from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, model_valida
 from coldaisle.control.schema import AuthorityStage, Demand, PerZone, Zone
 
 CONTROL_CONFIG_VERSION: Literal[1] = 1
+SAFETY_CONFIG_VERSION: Literal[2] = 2
 CONFIG_FILENAMES = {
     "fan_hardware": "fan-hardware.yaml",
     "safety": "safety.yaml",
@@ -209,7 +210,7 @@ class TelemetryDelays(_ConfigModel):
 class SafetyConfig(_ConfigModel):
     """Critical Safety だけが所有する設定。全数値に status/basis を残す。"""
 
-    schema_version: Literal[1]
+    schema_version: Literal[2]
     absolute_temp_ceiling_c: SafetyFloat
     zone_min_demand: PerZone[SafetyDemand]
     cpu_cooling_floor: Annotated[
@@ -349,7 +350,7 @@ class ConfigSource(_ConfigModel):
     """decision trace に残せる入力の版・名前・内容ハッシュ。絶対 path は残さない。"""
 
     name: Literal["fan-hardware.yaml", "safety.yaml", "fan-policy.yaml"]
-    schema_version: Literal[1]
+    schema_version: Literal[1, 2]
     sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
 
 
@@ -366,6 +367,18 @@ class ControlConfig(_ConfigModel):
     safety: SafetyConfig
     policy: FanPolicyConfig
     sources: ConfigSources
+
+    @model_validator(mode="after")
+    def _source_metadata_matches_validated_documents(self) -> Self:
+        expected = (
+            (self.sources.fan_hardware, "fan-hardware.yaml", self.fan_hardware.schema_version),
+            (self.sources.safety, "safety.yaml", self.safety.schema_version),
+            (self.sources.policy, "fan-policy.yaml", self.policy.schema_version),
+        )
+        for source, name, version in expected:
+            if source.name != name or source.schema_version != version:
+                raise ValueError(f"ConfigSource が検証済み設定と一致しない: {name}")
+        return self
 
     @classmethod
     def from_directory(cls, directory: Path) -> ControlConfig:
@@ -386,7 +399,7 @@ class ControlConfig(_ConfigModel):
                     name=cast(
                         Literal["fan-hardware.yaml", "safety.yaml", "fan-policy.yaml"], filename
                     ),
-                    schema_version=cast(Literal[1], schema_version),
+                    schema_version=cast(Literal[1, 2], schema_version),
                     sha256=sha256(text.encode("utf-8")).hexdigest(),
                 ),
             )
