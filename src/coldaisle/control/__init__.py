@@ -12,6 +12,12 @@ from coldaisle.control.config import (
     ControlConfig,
     ProvisionalConfigValue,
 )
+from coldaisle.control.hardware import (
+    FanHardwareBackend,
+    FanHardwareResult,
+    SimulatedFanBackend,
+    SimulatedFaultPlan,
+)
 from coldaisle.control.logging import ControlTraceLogger, ControlTraceSink
 from coldaisle.control.schema import (
     BOUND_BY_PRECEDENCE,
@@ -61,6 +67,8 @@ __all__ = [
     "ControllerProposal",
     "Demand",
     "EffectiveZoneDemand",
+    "FanHardwareBackend",
+    "FanHardwareResult",
     "Fault",
     "FaultCode",
     "GuardZoneOutput",
@@ -72,6 +80,8 @@ __all__ = [
     "Reason",
     "SafetyState",
     "SafetyZoneOutput",
+    "SimulatedFanBackend",
+    "SimulatedFaultPlan",
     "Zone",
     "ZoneRecord",
     "ZoneRequest",
