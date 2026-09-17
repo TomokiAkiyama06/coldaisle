@@ -12,11 +12,14 @@ demand → Airflow Index → Effective Flow Unit (EFU)
 ```
 
 Airflow Index is meaningful only within its own zone. EFU is the common internal scale used for
-`q_front`, `q_rear`, and `q_top`; it is not CFM. The committed
-`config/air-balance.yaml` is explicitly `uncalibrated` and exists so Mock and Replay runs can
-exercise the completed interface. It must be replaced with #75 installed-system characterization
-before the model is given authority. The file hash and calibration status travel with every
-estimate.
+`q_front`, `q_rear`, and `q_top`; it is not CFM. Curves must cover demand and Airflow Index from
+0.0 through 1.0, so evaluation never silently extrapolates an uncovered candidate range.
+
+The committed example lives under `tests/fixtures/` rather than `config/`. It is explicitly
+`uncalibrated`, and constructing a model from it requires
+`allow_uncalibrated_for_testing=True`. The default path rejects it. This lets Mock and Replay
+exercise the interface without making provisional values usable by a production controller. The
+file hash and calibration status travel with every estimate.
 
 The configuration also owns the target balance ratio and accepted band. The implementation does
 not assume that `balance_ratio == 1.0` is correct.
@@ -32,7 +35,8 @@ balance_ratio     = estimated_exhaust / estimated_intake
 The ratio state is combined with GPU intake, case delta, CPU package, and GPU temperature. Crossing
 any configured non-safety thermal limit produces `THERMALLY_LIMITED`. A zero Front estimate cannot
 produce a ratio and is `UNKNOWN`; fan stall and stale telemetry remain responsibilities of Critical
-Safety and the telemetry input contract.
+Safety and the telemetry input contract. If Rear or Top exhaust is active in that state, coordination
+still raises Front make-up air rather than leaving Front at zero.
 
 ## Coordination and the Top boundary
 
@@ -47,3 +51,7 @@ Safety and the telemetry input contract.
 
 The model is pure and uses no hardware I/O, which lets Mock and Replay exercise all state changes
 without a sensor module.
+
+The model is not wired into `ControlConfig` or the runtime daemon. Decision record 0033 documents a
+proposed four-file atomic configuration boundary; decision record 0028's approved three-file
+boundary remains authoritative until that proposal is accepted.

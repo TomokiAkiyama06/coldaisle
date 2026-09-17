@@ -21,7 +21,6 @@ from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, model_valida
 from coldaisle.control.schema import Demand, PerZone, Reason, Zone
 
 AIR_BALANCE_CONFIG_VERSION: Literal[1] = 1
-AIR_BALANCE_CONFIG_FILENAME = "air-balance.yaml"
 
 FiniteFloat = Annotated[float, Field(allow_inf_nan=False)]
 EffectiveFlow = Annotated[float, Field(ge=0.0, allow_inf_nan=False)]
@@ -75,6 +74,14 @@ class ZoneFlowCurve(_Frozen):
 
     @model_validator(mode="after")
     def _points_are_monotonic(self) -> Self:
+        first = self.points[0]
+        last = self.points[-1]
+        if first.demand != 0.0 or last.demand != 1.0:
+            raise ValueError("風量曲線は demand=0.0 と demand=1.0 を両方含める")
+        if first.airflow_index != 0.0 or last.airflow_index != 1.0:
+            raise ValueError("風量曲線は airflow_index=0.0 と 1.0 を両方含める")
+        if first.effective_flow != 0.0:
+            raise ValueError("airflow_index=0.0 の effective_flow は 0.0 にする")
         previous: FlowCurvePoint | None = None
         for point in self.points:
             if previous is not None:
@@ -273,10 +280,24 @@ class AirBalanceModel(Protocol):
         """安全層より前の requested demand を提案する。"""
 
 
+class UncalibratedAirBalanceError(ValueError):
+    """未校正 characterization をproduction相当の経路で開こうとした。"""
+
+
 class ConfiguredAirBalanceModel:
     """設定した characterization と閾値だけを使う純粋な初期実装。"""
 
-    def __init__(self, config: AirBalanceConfig, config_sha256: str) -> None:
+    def __init__(
+        self,
+        config: AirBalanceConfig,
+        config_sha256: str,
+        *,
+        allow_uncalibrated_for_testing: bool = False,
+    ) -> None:
+        if config.source.status == "uncalibrated" and not allow_uncalibrated_for_testing:
+            raise UncalibratedAirBalanceError(
+                "未校正 Air Balance は Mock/Replay test の明示的な opt-in なしに使えない"
+            )
         self._config = config
         self._metadata = AirBalanceMetadata(
             model_id=config.model_id,
@@ -286,10 +307,19 @@ class ConfiguredAirBalanceModel:
         )
 
     @classmethod
-    def from_file(cls, path: Path) -> ConfiguredAirBalanceModel:
-        """YAML 設定から Air Balance Model を作る。"""
+    def from_file(
+        cls,
+        path: Path,
+        *,
+        allow_uncalibrated_for_testing: bool = False,
+    ) -> ConfiguredAirBalanceModel:
+        """YAMLからモデルを作る。未校正値はtest用途を明示した場合だけ許可する。"""
         config, config_sha256 = AirBalanceConfig.from_file(path)
-        return cls(config, config_sha256)
+        return cls(
+            config,
+            config_sha256,
+            allow_uncalibrated_for_testing=allow_uncalibrated_for_testing,
+        )
 
     def evaluate(
         self,
@@ -344,9 +374,18 @@ class ConfiguredAirBalanceModel:
         ratio = before.balance_ratio
         assert (ratio is None) == (before.state is AirBalanceState.UNKNOWN)
 
-        if ratio is not None and ratio > self._config.balance.maximum_ratio:
-            assert before.estimated_exhaust is not None
-            target_front_flow = before.estimated_exhaust / self._config.balance.target_ratio
+        zero_intake_with_exhaust = (
+            before.q_front == 0.0
+            and before.q_rear is not None
+            and before.q_top is not None
+            and before.q_rear + before.q_top > 0.0
+        )
+        if (ratio is not None and ratio > self._config.balance.maximum_ratio) or (
+            zero_intake_with_exhaust
+        ):
+            assert before.q_rear is not None and before.q_top is not None
+            exhaust_flow = before.q_rear + before.q_top
+            target_front_flow = exhaust_flow / self._config.balance.target_ratio
             front_demand = self._config.zones.front.demand_for_effective_flow(target_front_flow)
             requested = PerZone[Demand](
                 front=max(requested.front, front_demand),
@@ -357,7 +396,11 @@ class ConfiguredAirBalanceModel:
                 reasons.append(
                     Reason(
                         code="front_makeup_air",
-                        detail="Exhaust 過多のため Front make-up air を増やす",
+                        detail=(
+                            "Front 推定風量が0で排気が動作中のため make-up air を増やす"
+                            if zero_intake_with_exhaust
+                            else "Exhaust 過多のため Front make-up air を増やす"
+                        ),
                     )
                 )
         elif (
@@ -460,11 +503,6 @@ class ConfiguredAirBalanceModel:
             thermal_reasons=thermal_reasons,
             metadata=self._metadata,
         )
-
-
-def load_air_balance_model(directory: Path) -> ConfiguredAirBalanceModel:
-    """規定ファイル名の検証済み Air Balance Model を読み込む。"""
-    return ConfiguredAirBalanceModel.from_file(directory / AIR_BALANCE_CONFIG_FILENAME)
 
 
 def _interpolate_points(

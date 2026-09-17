@@ -21,7 +21,6 @@ from coldaisle.control.acoustic import (
     load_acoustic_model,
 )
 from coldaisle.control.air_balance import (
-    AIR_BALANCE_CONFIG_FILENAME,
     AIR_BALANCE_CONFIG_VERSION,
     AirBalanceConfig,
     AirBalanceCoordination,
@@ -35,9 +34,9 @@ from coldaisle.control.air_balance import (
     FlowCurvePoint,
     ThermalInputs,
     ThermalLimits,
+    UncalibratedAirBalanceError,
     ZoneFlowCurve,
     ZoneFlowEstimate,
-    load_air_balance_model,
 )
 from coldaisle.control.config import (
     CONFIG_FILENAMES,
@@ -84,7 +83,6 @@ from coldaisle.control.schema import (
 __all__ = [
     "ACOUSTIC_CONFIG_FILENAME",
     "ACOUSTIC_CONFIG_VERSION",
-    "AIR_BALANCE_CONFIG_FILENAME",
     "AIR_BALANCE_CONFIG_VERSION",
     "BOUND_BY_PRECEDENCE",
     "CONFIG_FILENAMES",
@@ -139,6 +137,7 @@ __all__ = [
     "SimulatedFaultPlan",
     "ThermalInputs",
     "ThermalLimits",
+    "UncalibratedAirBalanceError",
     "Zone",
     "ZoneAcousticCurve",
     "ZoneFlowCurve",
@@ -146,5 +145,4 @@ __all__ = [
     "ZoneRecord",
     "ZoneRequest",
     "load_acoustic_model",
-    "load_air_balance_model",
 ]

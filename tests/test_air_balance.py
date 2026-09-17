@@ -13,12 +13,14 @@ from pydantic import ValidationError
 
 from coldaisle.control import PerZone
 from coldaisle.control.air_balance import (
-    AIR_BALANCE_CONFIG_FILENAME,
+    AirBalanceConfig,
     AirBalanceState,
     ConfiguredAirBalanceModel,
     ThermalInputs,
-    load_air_balance_model,
+    UncalibratedAirBalanceError,
 )
+
+TEST_CONFIG_FILENAME = "air-balance.yaml"
 
 
 def document() -> dict[str, Any]:
@@ -69,13 +71,16 @@ def document() -> dict[str, Any]:
 
 
 def write_config(directory: Path, contents: dict[str, Any] | None = None) -> Path:
-    path = directory / AIR_BALANCE_CONFIG_FILENAME
+    path = directory / TEST_CONFIG_FILENAME
     path.write_text(yaml.safe_dump(contents or document()), encoding="utf-8")
     return path
 
 
 def model(tmp_path: Path) -> ConfiguredAirBalanceModel:
-    return ConfiguredAirBalanceModel.from_file(write_config(tmp_path))
+    return ConfiguredAirBalanceModel.from_file(
+        write_config(tmp_path),
+        allow_uncalibrated_for_testing=True,
+    )
 
 
 def cool() -> ThermalInputs:
@@ -104,9 +109,16 @@ def test_q_values_share_efu_scale_and_keep_uncalibrated_metadata(tmp_path: Path)
     assert len(estimate.metadata.config_sha256) == 64
 
 
-def test_committed_model_is_loadable_and_explicitly_uncalibrated() -> None:
-    config_dir = Path(__file__).parents[1] / "config"
-    estimate = load_air_balance_model(config_dir).evaluate(
+def test_committed_fixture_requires_explicit_test_only_uncalibrated_opt_in() -> None:
+    fixture = Path(__file__).parent / "fixtures" / "air_balance_uncalibrated.yaml"
+
+    with pytest.raises(UncalibratedAirBalanceError, match="opt-in"):
+        ConfiguredAirBalanceModel.from_file(fixture)
+
+    estimate = ConfiguredAirBalanceModel.from_file(
+        fixture,
+        allow_uncalibrated_for_testing=True,
+    ).evaluate(
         PerZone[float](front=0.5, rear=0.5, top=0.5),
         cool(),
     )
@@ -114,6 +126,7 @@ def test_committed_model_is_loadable_and_explicitly_uncalibrated() -> None:
     assert estimate.metadata.model_id == "provisional-air-balance"
     assert estimate.metadata.source.status == "uncalibrated"
     assert "replace" in estimate.metadata.source.basis.lower()
+    assert not (Path(__file__).parents[1] / "config" / TEST_CONFIG_FILENAME).exists()
 
 
 @pytest.mark.parametrize(
@@ -184,6 +197,20 @@ def test_exhaust_heavy_proposes_front_makeup_toward_configured_non_unity_target(
     assert proposal.requested.top == candidate.top
     assert proposal.projected.balance_ratio == pytest.approx(0.9)
     assert [reason.code for reason in proposal.reasons] == ["front_makeup_air"]
+
+
+def test_zero_front_with_active_exhaust_still_proposes_makeup_air(tmp_path: Path) -> None:
+    candidate = PerZone[float](front=0.0, rear=0.5, top=0.5)
+    proposal = model(tmp_path).coordinate(candidate, cool())
+
+    assert proposal.before.state is AirBalanceState.UNKNOWN
+    assert proposal.before.balance_ratio is None
+    assert proposal.requested.front > 0.0
+    assert proposal.requested.rear == candidate.rear
+    assert proposal.requested.top == candidate.top
+    assert proposal.projected.balance_ratio == pytest.approx(0.9)
+    assert proposal.reasons[0].code == "front_makeup_air"
+    assert "0" in proposal.reasons[0].detail
 
 
 def test_intake_heavy_with_heat_uses_rear_before_top(tmp_path: Path) -> None:
@@ -265,6 +292,14 @@ def test_characterization_can_be_replaced_without_code_changes(tmp_path: Path) -
             ),
             "finite number",
         ),
+        (
+            lambda data: data["zones"]["front"]["points"][0].__setitem__("demand", 0.1),
+            "demand=0.0",
+        ),
+        (
+            lambda data: data["zones"]["front"]["points"][-1].__setitem__("airflow_index", 0.9),
+            "airflow_index=0.0",
+        ),
     ],
 )
 def test_invalid_characterization_is_rejected(
@@ -277,7 +312,7 @@ def test_invalid_characterization_is_rejected(
     write_config(tmp_path, contents)
 
     with pytest.raises(ValidationError, match=message):
-        load_air_balance_model(tmp_path)
+        AirBalanceConfig.from_file(tmp_path / TEST_CONFIG_FILENAME)
 
 
 def imported_modules(source: str) -> set[str]:
