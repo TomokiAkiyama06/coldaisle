@@ -33,6 +33,7 @@ uv run coldaisle-memory             # 運用メモリの更新案（**既定で�
 uv run coldaisle-memory --apply --commit  # 確認してから書く
 uv run coldaisle-calibrate          # 較正オフセットの算出（**既定では書かない**）
 uv run coldaisle-calibrate --apply  # 確認してから書く。手順は docs/calibration.md
+uv run coldaisle-telemetry --once   # NVML / hwmon を1回収集（#65）
 COLDAISLE_DB=var/coldaisle.db uv run uvicorn coldaisle.api:app --host 127.0.0.1 --port 8000
 COLDAISLE_DB=var/coldaisle.db uv run uvicorn coldaisle.server:app --port 8000  # + AI ツールの窓口
 ```
