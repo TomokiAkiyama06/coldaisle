@@ -17,6 +17,10 @@ BIOS制御のまま終了、特定済みなら安全側へ引継ぎ）へ接続�
 `telemetry.t_sensor.enabled` は温度計モジュールの未設置を明示する。`false` のときは
 T_SENSORのstale判定を持たず、`true` にするには `confirmed` と承認根拠、および許容遅延が必要である。
 有効化も再起動時にだけ反映する。
+`fan-policy.yaml` は、MPCの `period_ms`・`budget_ms`・`valid_ms`、Supervisorの
+`period_ms`・`valid_ms` を持つ。期限は制御デーモンが受信時刻から単調時計で判定する。
+`authority_limits` には LIMITED / EXPANDED ごとの許可zone、Fallbackからの `limit_up` /
+`limit_down` を必須とし、後続のGate実装が設定外の定数に依存しないようにする。
 
 v1 は設定の live reload を行わない。設定変更は候補全体を別オブジェクトで検証したうえで
 **次回再起動時**にだけ反映する。これにより、変更後の設定も必ず `STARTUP` の Max を通る。

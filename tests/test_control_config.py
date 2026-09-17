@@ -101,13 +101,21 @@ def valid_documents() -> dict[str, dict[str, object]]:
                 "intake_rise_threshold_c": provisional(2.0),
                 "gpu_hotspot_threshold_c": provisional(85.0),
             },
-            "ml_period_ms": 1000,
-            "ml_budget_ms": 100,
-            "supervisor_period_ms": 1000,
+            "mpc": {"period_ms": 1000, "budget_ms": 100, "valid_ms": 2000},
+            "supervisor": {"period_ms": 1000, "valid_ms": 2000},
             "gate_min_confidence": provisional(0.0),
             "authority_stage": "shadow",
+            "authority_limits": {
+                "limited": {"permitted_zones": ["front"], "limit_up": 0.1, "limit_down": 0.1},
+                "expanded": {
+                    "permitted_zones": ["front", "rear", "top"],
+                    "limit_up": 0.2,
+                    "limit_down": 0.2,
+                },
+            },
             "recovery_hold_ms": 1000,
-            "demotion_after_failures": 3,
+            "demote_window_ms": 60000,
+            "demote_after": 3,
         },
     }
 
@@ -262,3 +270,32 @@ def test_provisional_values_identify_safety_and_policy_without_exposing_values(
     assert any(item.path == "telemetry.t_sensor.enabled" for item in values)
     assert any(item.path == "reactive_guard.ceiling" for item in values)
     assert all("value" not in item.model_dump() for item in values)
+
+
+def test_authority_limits_are_typed_per_stage_and_reject_empty_zone_set(tmp_path: Path) -> None:
+    config = load_config(tmp_path)
+    limited = config.policy.authority_limits.limited
+    assert limited.permitted_zones == {"front"}
+    assert limited.limit_up == 0.1
+
+    documents = valid_documents()
+    documents["fan-policy.yaml"]["authority_limits"]["limited"]["permitted_zones"] = []
+    write_documents(tmp_path, documents)
+    with pytest.raises(ValidationError, match="at least 1 item"):
+        ControlConfig.from_directory(tmp_path)
+
+
+def test_mpc_and_supervisor_validity_windows_are_required_and_budget_is_bounded(
+    tmp_path: Path,
+) -> None:
+    documents = valid_documents()
+    del documents["fan-policy.yaml"]["mpc"]["valid_ms"]
+    write_documents(tmp_path, documents)
+    with pytest.raises(ValidationError, match="valid_ms"):
+        ControlConfig.from_directory(tmp_path)
+
+    documents = valid_documents()
+    documents["fan-policy.yaml"]["mpc"]["budget_ms"] = 2000
+    write_documents(tmp_path, documents)
+    with pytest.raises(ValidationError, match=r"mpc.budget_ms"):
+        ControlConfig.from_directory(tmp_path)

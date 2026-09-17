@@ -38,6 +38,13 @@ def _yaml_authority_stage(value: object) -> object:
     return AuthorityStage(value) if isinstance(value, str) else value
 
 
+def _yaml_zones_to_frozenset(value: object) -> object:
+    """YAMLのzone配列を不変のZone集合に正規化する。"""
+    if isinstance(value, list):
+        return frozenset(Zone(item) if isinstance(item, str) else item for item in value)
+    return value
+
+
 class _ConfigModel(BaseModel):
     """設定を欠損・余分なキー・暗黙変換から守る共通基底。"""
 
@@ -267,24 +274,57 @@ class ReactiveGuard(_ConfigModel):
         return self
 
 
+class AuthorityLimit(_ConfigModel):
+    """Fallbackからの変化量と、MLを使ってよいzoneをstageごとに制限する。"""
+
+    permitted_zones: Annotated[
+        frozenset[Zone], BeforeValidator(_yaml_zones_to_frozenset), Field(min_length=1)
+    ]
+    limit_up: Demand
+    limit_down: Demand
+
+
+class AuthorityLimits(_ConfigModel):
+    """LIMITED / EXPANDED にだけ適用する、設定上のauthority上限。"""
+
+    limited: AuthorityLimit
+    expanded: AuthorityLimit
+
+
+class MpcTiming(_ConfigModel):
+    period_ms: PositiveMilliseconds
+    budget_ms: PositiveMilliseconds
+    valid_ms: PositiveMilliseconds
+
+    @model_validator(mode="after")
+    def _budget_fits_period(self) -> Self:
+        if self.budget_ms > self.period_ms:
+            raise ValueError("mpc.budget_ms は mpc.period_ms 以下にする")
+        return self
+
+
+class SupervisorTiming(_ConfigModel):
+    period_ms: PositiveMilliseconds
+    valid_ms: PositiveMilliseconds
+
+
 class FanPolicyConfig(_ConfigModel):
     schema_version: Literal[1]
     fallback_curve: Annotated[
         tuple[FallbackPoint, ...], BeforeValidator(_yaml_sequence_to_tuple), Field(min_length=2)
     ]
     reactive_guard: ReactiveGuard
-    ml_period_ms: PositiveMilliseconds
-    ml_budget_ms: PositiveMilliseconds
-    supervisor_period_ms: PositiveMilliseconds
+    mpc: MpcTiming
+    supervisor: SupervisorTiming
     gate_min_confidence: PolicyUnitInterval
     authority_stage: Annotated[AuthorityStage, BeforeValidator(_yaml_authority_stage)]
+    authority_limits: AuthorityLimits
     recovery_hold_ms: PositiveMilliseconds
-    demotion_after_failures: Annotated[int, Field(gt=0)]
+    demote_window_ms: PositiveMilliseconds
+    demote_after: Annotated[int, Field(gt=0)]
 
     @model_validator(mode="after")
-    def _policy_periods_and_curve_are_consistent(self) -> Self:
-        if self.ml_budget_ms > self.ml_period_ms:
-            raise ValueError("ml_budget_ms は ml_period_ms 以下にする")
+    def _policy_curve_is_consistent(self) -> Self:
         previous_temperature: float | None = None
         previous_demand: float | None = None
         for point in self.fallback_curve:
