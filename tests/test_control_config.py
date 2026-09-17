@@ -103,7 +103,7 @@ def valid_documents() -> dict[str, dict[str, object]]:
             "watchdog_timeout_ms": provisional(5000),
         },
         "fan-policy.yaml": {
-            "schema_version": 3,
+            "schema_version": 4,
             "fallback_curve": [
                 {"temperature_c": 25.0, "demand": 0.3},
                 {"temperature_c": 80.0, "demand": 1.0},
@@ -150,6 +150,26 @@ def valid_documents() -> dict[str, dict[str, object]]:
             },
             "mpc": {"period_ms": 1000, "budget_ms": 100, "valid_ms": 2000},
             "supervisor": {"period_ms": 1000, "valid_ms": 2000},
+            "workload_regime": {
+                "cpu_power": {
+                    "metric": "power.cpu.package",
+                    "idle_below_w": 30.0,
+                    "active_above_w": 60.0,
+                },
+                "gpu_power": {
+                    "metric": "power.gpu.0",
+                    "idle_below_w": 40.0,
+                    "active_above_w": 100.0,
+                },
+                "activity_window_ms": 2000,
+                "history_window_ms": 120000,
+                "minimum_observation_ms": 2000,
+                "sustained_after_ms": 60000,
+                "cooldown_ms": 30000,
+                "minimum_transition_ms": 1000,
+                "confidence_full_window_ms": 60000,
+                "max_snapshot_gap_ms": 1000,
+            },
             "gate_min_confidence": {
                 "limited": provisional(0.6),
                 "expanded": provisional(0.7),
@@ -184,11 +204,11 @@ def load_config(tmp_path: Path) -> ControlConfig:
 def test_complete_config_has_traceable_sources_and_is_not_actuation_ready(tmp_path: Path) -> None:
     config = load_config(tmp_path)
 
-    assert CONTROL_CONFIG_VERSION == 3
+    assert CONTROL_CONFIG_VERSION == 4
     assert config.actuation_permitted is False
     metadata = config.trace_metadata()["control_config"]
     assert metadata["fan_hardware"]["name"] == "fan-hardware.yaml"
-    assert metadata["policy"]["schema_version"] == 3
+    assert metadata["policy"]["schema_version"] == 4
     assert len(metadata["safety"]["sha256"]) == 64
 
 
@@ -430,16 +450,58 @@ def test_confidence_thresholds_are_validated_per_authority_stage(tmp_path: Path)
         ControlConfig.from_directory(tmp_path)
 
 
-def test_previous_fan_policy_schema_is_rejected_until_explicitly_migrated(
+def test_workload_regime_thresholds_and_windows_are_configured(tmp_path: Path) -> None:
+    config = load_config(tmp_path).policy.workload_regime
+
+    assert config.cpu_power.metric == "power.cpu.package"
+    assert config.gpu_power.active_above_w == 100.0
+
+    documents = valid_documents()
+    documents["fan-policy.yaml"]["workload_regime"]["cpu_power"]["idle_below_w"] = 70.0
+    write_documents(tmp_path, documents)
+    with pytest.raises(ValidationError, match="active_above_w"):
+        ControlConfig.from_directory(tmp_path)
+
+    documents = valid_documents()
+    documents["fan-policy.yaml"]["workload_regime"]["sustained_after_ms"] = 120001
+    write_documents(tmp_path, documents)
+    with pytest.raises(ValidationError, match="history_window_ms"):
+        ControlConfig.from_directory(tmp_path)
+
+    documents = valid_documents()
+    documents["fan-policy.yaml"]["workload_regime"]["history_window_ms"] = 62000
+    write_documents(tmp_path, documents)
+    with pytest.raises(ValidationError, match="観測・SUSTAINED判定"):
+        ControlConfig.from_directory(tmp_path)
+
+
+@pytest.mark.parametrize("old_version", [1, 2, 3])
+def test_previous_policy_versions_are_rejected_until_explicitly_migrated(
     tmp_path: Path,
+    old_version: int,
 ) -> None:
     documents = valid_documents()
-    documents["fan-policy.yaml"]["schema_version"] = 2
+    documents["fan-policy.yaml"]["schema_version"] = old_version
     write_documents(tmp_path, documents)
 
     with pytest.raises(ValidationError, match="schema_version"):
         ControlConfig.from_directory(tmp_path)
 
+
+def test_v3_to_v4_migration_requires_explicit_workload_regime_values(tmp_path: Path) -> None:
+    documents = valid_documents()
+    regime = documents["fan-policy.yaml"].pop("workload_regime")
     documents["fan-policy.yaml"]["schema_version"] = 3
     write_documents(tmp_path, documents)
-    assert ControlConfig.from_directory(tmp_path).policy.schema_version == 3
+    with pytest.raises(ValidationError, match="schema_version"):
+        ControlConfig.from_directory(tmp_path)
+
+    documents["fan-policy.yaml"]["workload_regime"] = regime
+    documents["fan-policy.yaml"]["schema_version"] = 4
+    write_documents(tmp_path, documents)
+    assert ControlConfig.from_directory(tmp_path).policy.schema_version == 4
+
+    del documents["fan-policy.yaml"]["workload_regime"]
+    write_documents(tmp_path, documents)
+    with pytest.raises(ValidationError, match="workload_regime"):
+        ControlConfig.from_directory(tmp_path)
