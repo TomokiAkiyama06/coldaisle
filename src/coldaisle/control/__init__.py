@@ -34,6 +34,7 @@ from coldaisle.control.hardware import (
 )
 from coldaisle.control.logging import ControlTraceLogger, ControlTraceSink
 from coldaisle.control.model_registry import (
+    MAX_ARTIFACT_BYTES,
     MODEL_REGISTRY_SCHEMA_VERSION,
     ApprovalAction,
     ArtifactAlreadyExistsError,
@@ -97,6 +98,7 @@ __all__ = [
     "CONFIG_FILENAMES",
     "CONTROL_CONFIG_VERSION",
     "EMERGENCY_FAULTS",
+    "MAX_ARTIFACT_BYTES",
     "MODEL_REGISTRY_SCHEMA_VERSION",
     "SCHEMA_VERSION",
     "TOP_EMERGENCY_FAULTS",

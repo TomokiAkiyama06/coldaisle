@@ -21,7 +21,7 @@ from enum import StrEnum
 from fcntl import LOCK_EX, LOCK_UN, flock
 from hashlib import sha256
 from pathlib import Path
-from typing import Literal, Self
+from typing import Final, Literal, Self
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 
@@ -29,9 +29,13 @@ from coldaisle.clock import Clock, WallClock
 from coldaisle.control.schema import AuthorityStage
 
 MODEL_REGISTRY_SCHEMA_VERSION: Literal[1] = 1
+MAX_ARTIFACT_BYTES: Final = 8 * 1024 * 1024
+"""Maximum artifact payload accepted or allocated by the registry."""
+
 _STATE_FILENAME = "registry.json"
 _LOCK_FILENAME = ".registry.lock"
 _ARTIFACT_FILENAME = "artifact.payload"
+_READ_CHUNK_BYTES = 1024 * 1024
 
 _IDENTIFIER_PATTERN = r"^[a-z][a-z0-9_.-]*$"
 _SEMVER_PATTERN = (
@@ -467,6 +471,10 @@ class ArtifactVerificationError(ModelRegistryError):
     """The artifact bytes or runtime compatibility cannot be verified."""
 
 
+class _RegistryFileReadError(ModelRegistryError):
+    """A pinned regular file changed size or exceeded its configured read bound."""
+
+
 class _ArtifactUnavailableError(ArtifactVerificationError):
     pass
 
@@ -511,6 +519,8 @@ class ModelRegistry:
     ) -> ArtifactRef:
         """Persist a checksum-matching candidate without interpreting its model contents."""
         self._validate_actor_reason(actor, reason)
+        if len(payload) > MAX_ARTIFACT_BYTES:
+            raise ArtifactVerificationError("artifact がsize上限を超えている")
         digest = sha256(payload).hexdigest()
         if digest != metadata.sha256:
             raise ArtifactVerificationError("artifact checksum が metadata と一致しない")
@@ -842,7 +852,7 @@ class ModelRegistry:
     ) -> VerifiedArtifact:
         try:
             payload = self._read_artifact(root_fd, record.ref)
-        except (OSError, UnsafeRegistryPathError) as exc:
+        except (OSError, UnsafeRegistryPathError, _RegistryFileReadError) as exc:
             raise _ArtifactUnavailableError("artifact bytes を読み取れない") from exc
         if sha256(payload).hexdigest() != record.metadata.sha256:
             raise _ChecksumMismatchError("artifact checksum mismatch")
@@ -883,7 +893,13 @@ class ModelRegistry:
             if payload is None:
                 return RegistrySnapshot(revision=0)
             return RegistrySnapshot.model_validate_json(payload)
-        except (OSError, UnsafeRegistryPathError, ValidationError, ValueError) as exc:
+        except (
+            OSError,
+            UnsafeRegistryPathError,
+            _RegistryFileReadError,
+            ValidationError,
+            ValueError,
+        ) as exc:
             raise RegistryCorruptError("registry snapshot を検証できない") from exc
 
     def _write_snapshot(self, root_fd: int, snapshot: RegistrySnapshot) -> None:
@@ -897,7 +913,11 @@ class ModelRegistry:
             create=False,
         )
         try:
-            payload = self._read_regular_file(directory_fd, _ARTIFACT_FILENAME)
+            payload = self._read_regular_file(
+                directory_fd,
+                _ARTIFACT_FILENAME,
+                max_bytes=MAX_ARTIFACT_BYTES,
+            )
             assert payload is not None
             return payload
         finally:
@@ -997,9 +1017,14 @@ class ModelRegistry:
         name: str,
         *,
         missing_ok: bool = False,
+        max_bytes: int | None = None,
     ) -> bytes | None:
         try:
-            file_fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=directory_fd)
+            file_fd = os.open(
+                name,
+                os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK,
+                dir_fd=directory_fd,
+            )
         except FileNotFoundError:
             if missing_ok:
                 return None
@@ -1007,12 +1032,24 @@ class ModelRegistry:
         except OSError as exc:
             raise UnsafeRegistryPathError(f"registry file がsymlinkである: {name}") from exc
         try:
-            if not stat.S_ISREG(os.fstat(file_fd).st_mode):
+            file_status = os.fstat(file_fd)
+            if not stat.S_ISREG(file_status.st_mode):
                 raise UnsafeRegistryPathError(f"registry file がregular fileではない: {name}")
-            chunks: list[bytes] = []
-            while chunk := os.read(file_fd, 1024 * 1024):
-                chunks.append(chunk)
-            return b"".join(chunks)
+            expected_size = file_status.st_size
+            if max_bytes is not None and expected_size > max_bytes:
+                raise _RegistryFileReadError(f"registry file がsize上限を超えている: {name}")
+
+            payload = bytearray()
+            remaining = expected_size
+            while remaining:
+                chunk = os.read(file_fd, min(_READ_CHUNK_BYTES, remaining))
+                if not chunk:
+                    raise _RegistryFileReadError(f"registry file が読取中に短縮された: {name}")
+                payload.extend(chunk)
+                remaining -= len(chunk)
+            if os.read(file_fd, 1):
+                raise _RegistryFileReadError(f"registry file が読取中に拡張された: {name}")
+            return bytes(payload)
         finally:
             os.close(file_fd)
 

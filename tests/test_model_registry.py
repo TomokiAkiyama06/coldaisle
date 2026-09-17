@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import multiprocessing
+import os
 from concurrent.futures import ThreadPoolExecutor
 from hashlib import sha256
 from pathlib import Path
@@ -12,8 +13,10 @@ from threading import Barrier, Event
 import pytest
 from pydantic import ValidationError
 
+import coldaisle.control.model_registry as registry_module
 from coldaisle.clock import SimulatedClock
 from coldaisle.control import (
+    MAX_ARTIFACT_BYTES,
     ApprovalAction,
     ArtifactFormat,
     ArtifactKind,
@@ -43,6 +46,15 @@ COMPATIBILITY = ModelCompatibility(
 
 def payload(version: str) -> bytes:
     return json.dumps({"model": version}, sort_keys=True).encode()
+
+
+def artifact_path(root: Path, version: str = "1.0.0") -> Path:
+    return root / "artifacts" / "thermal_model" / "rack-thermal" / version / "artifact.payload"
+
+
+def file_identity(path: Path) -> tuple[int, int]:
+    status = path.stat()
+    return status.st_dev, status.st_ino
 
 
 def metadata(
@@ -449,6 +461,25 @@ def test_invalid_json_artifact_is_never_registered(tmp_path: Path) -> None:
     assert registry.inspect().revision == 0
 
 
+def test_oversized_artifact_is_never_registered(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    body = b'{"model":"too-large"}'
+    registry = ModelRegistry(tmp_path / "registry", SimulatedClock(NOW_MS))
+    monkeypatch.setattr(registry_module, "MAX_ARTIFACT_BYTES", len(body) - 1)
+
+    with pytest.raises(ArtifactVerificationError, match="size"):
+        registry.register_candidate(
+            metadata("1.0.0", content=body),
+            body,
+            actor="trainer",
+            reason="training completed",
+        )
+
+    assert registry.inspect().revision == 0
+
+
 def test_malformed_registry_state_returns_fallback_instead_of_loading(tmp_path: Path) -> None:
     root = tmp_path / "registry"
     root.mkdir()
@@ -624,6 +655,151 @@ def test_symlink_or_nonregular_payload_is_not_read(tmp_path: Path) -> None:
     assert outside.read_bytes() == payload("1.0.0")
 
 
+def test_fifo_payload_is_rejected_without_blocking(tmp_path: Path) -> None:
+    root = tmp_path / "registry"
+    registry = ModelRegistry(root, SimulatedClock(NOW_MS))
+    register_and_validate(registry, "1.0.0")
+    promote(registry, "1.0.0")
+    stored = artifact_path(root)
+    stored.unlink()
+    os.mkfifo(stored)
+
+    result = registry.load_production(ArtifactKind.THERMAL_MODEL, COMPATIBILITY)
+
+    assert result.status is ArtifactLoadStatus.ARTIFACT_UNAVAILABLE
+
+
+def test_oversized_payload_is_rejected_by_fstat_before_any_artifact_read(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "registry"
+    registry = ModelRegistry(root, SimulatedClock(NOW_MS))
+    register_and_validate(registry, "1.0.0")
+    promote(registry, "1.0.0")
+    stored = artifact_path(root)
+    with stored.open("r+b") as handle:
+        handle.truncate(MAX_ARTIFACT_BYTES + 1)
+    target_identity = file_identity(stored)
+    original_read = registry_module.os.read
+    artifact_read = False
+
+    def reject_artifact_read(file_fd: int, count: int) -> bytes:
+        nonlocal artifact_read
+        status = os.fstat(file_fd)
+        if (status.st_dev, status.st_ino) == target_identity:
+            artifact_read = True
+            raise AssertionError("oversized artifact must be rejected before read")
+        return original_read(file_fd, count)
+
+    monkeypatch.setattr(registry_module.os, "read", reject_artifact_read)
+
+    result = registry.load_production(ArtifactKind.THERMAL_MODEL, COMPATIBILITY)
+
+    assert result.status is ArtifactLoadStatus.ARTIFACT_UNAVAILABLE
+    assert artifact_read is False
+
+
+def test_truncated_payload_is_rejected_against_pinned_fstat_size(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "registry"
+    registry = ModelRegistry(root, SimulatedClock(NOW_MS))
+    register_and_validate(registry, "1.0.0")
+    promote(registry, "1.0.0")
+    stored = artifact_path(root)
+    target_identity = file_identity(stored)
+    original_read = registry_module.os.read
+    truncated = False
+
+    def truncate_before_read(file_fd: int, count: int) -> bytes:
+        nonlocal truncated
+        status = os.fstat(file_fd)
+        if not truncated and (status.st_dev, status.st_ino) == target_identity:
+            with stored.open("r+b") as handle:
+                handle.truncate(1)
+            truncated = True
+        return original_read(file_fd, count)
+
+    monkeypatch.setattr(registry_module.os, "read", truncate_before_read)
+
+    result = registry.load_production(ArtifactKind.THERMAL_MODEL, COMPATIBILITY)
+
+    assert truncated is True
+    assert result.status is ArtifactLoadStatus.ARTIFACT_UNAVAILABLE
+
+
+def test_growing_payload_read_is_bounded_to_preflight_size_plus_one_byte(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "registry"
+    registry = ModelRegistry(root, SimulatedClock(NOW_MS))
+    register_and_validate(registry, "1.0.0")
+    promote(registry, "1.0.0")
+    stored = artifact_path(root)
+    target_identity = file_identity(stored)
+    preflight_size = stored.stat().st_size
+    original_read = registry_module.os.read
+    artifact_read_requests: list[int] = []
+    grown = False
+
+    def grow_before_read(file_fd: int, count: int) -> bytes:
+        nonlocal grown
+        status = os.fstat(file_fd)
+        if (status.st_dev, status.st_ino) == target_identity:
+            artifact_read_requests.append(count)
+            if not grown:
+                with stored.open("r+b") as handle:
+                    handle.truncate(MAX_ARTIFACT_BYTES + 1)
+                grown = True
+        return original_read(file_fd, count)
+
+    monkeypatch.setattr(registry_module.os, "read", grow_before_read)
+
+    result = registry.load_production(ArtifactKind.THERMAL_MODEL, COMPATIBILITY)
+
+    assert grown is True
+    assert result.status is ArtifactLoadStatus.ARTIFACT_UNAVAILABLE
+    assert sum(artifact_read_requests) == preflight_size + 1
+
+
+def test_payload_fd_remains_pinned_when_path_is_replaced_during_read(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "registry"
+    registry = ModelRegistry(root, SimulatedClock(NOW_MS))
+    register_and_validate(registry, "1.0.0")
+    promote(registry, "1.0.0")
+    stored = artifact_path(root)
+    displaced = tmp_path / "displaced.payload"
+    replacement = b'{"model":"replacement"}'
+    target_identity = file_identity(stored)
+    original_read = registry_module.os.read
+    replaced = False
+
+    def replace_path_before_read(file_fd: int, count: int) -> bytes:
+        nonlocal replaced
+        status = os.fstat(file_fd)
+        if not replaced and (status.st_dev, status.st_ino) == target_identity:
+            stored.rename(displaced)
+            stored.write_bytes(replacement)
+            replaced = True
+        return original_read(file_fd, count)
+
+    monkeypatch.setattr(registry_module.os, "read", replace_path_before_read)
+
+    result = registry.load_production(ArtifactKind.THERMAL_MODEL, COMPATIBILITY)
+
+    assert replaced is True
+    assert result.status is ArtifactLoadStatus.LOADED
+    assert result.artifact is not None
+    assert result.artifact.payload == payload("1.0.0")
+    assert stored.read_bytes() == replacement
+
+
 def test_symlink_registry_snapshot_is_not_trusted(tmp_path: Path) -> None:
     root = tmp_path / "registry"
     root.mkdir()
@@ -652,9 +828,15 @@ def test_load_pins_root_across_path_replacement(tmp_path: Path, monkeypatch) -> 
         name: str,
         *,
         missing_ok: bool = False,
+        max_bytes: int | None = None,
     ) -> bytes | None:
         nonlocal replaced
-        content = original_read(directory_fd, name, missing_ok=missing_ok)
+        content = original_read(
+            directory_fd,
+            name,
+            missing_ok=missing_ok,
+            max_bytes=max_bytes,
+        )
         if name == "registry.json" and not replaced:
             root.rename(displaced)
             root.symlink_to(outside, target_is_directory=True)

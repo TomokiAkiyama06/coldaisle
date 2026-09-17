@@ -9,6 +9,10 @@ Model、Supervisor Policy、Feature Transform の artifact lifecycle をロー�
 
 - Registry は artifact を deserialize・import・execute しない。検証後も返すのは immutable
   `bytes` だけである。
+- artifact payloadは8 MiBを上限とし、登録時と読込時の両方で拒否する。読込は
+  `open(O_NOFOLLOW | O_NONBLOCK)`した同じfdを`fstat()`してregular fileとsizeを先に確認し、
+  preflight時のsize分とgrowth検出用1 byteだけを読む。FIFOで停止せず、読込中の短縮・拡張や
+  path差替えから別のbytesを組み立てない。
 - 現在受理する形式は、構文とtop-levelの型を非実行で検証できるJSONだけである。pickle、
   joblib、Python objectを含むframework固有checkpointに加え、構造validator未導入のONNX /
   safetensorsも`LOADED`にしない。binary形式は安全なvalidatorと一緒に将来schemaへ追加する。
