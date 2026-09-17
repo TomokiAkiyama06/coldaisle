@@ -18,6 +18,7 @@ from types import FrameType
 from coldaisle import logs
 from coldaisle.clock import Clock, WallClock
 from coldaisle.internal_telemetry import (
+    SOURCE_STATE_PREFIX,
     HwmonAdapter,
     InternalTelemetryCollector,
     InternalTelemetryConfig,
@@ -34,7 +35,6 @@ DEFAULT_DB = Path("var/coldaisle.db")
 DEFAULT_CONFIG = Path("config/internal-telemetry.yaml")
 DEFAULT_QUALITY_RULES = Path("config/quality.yaml")
 DEFAULT_METRICS = Path("config/metrics.yaml")
-SOURCE_STATE_PREFIX = "sys.telemetry_source."
 
 
 @dataclass(frozen=True, slots=True)

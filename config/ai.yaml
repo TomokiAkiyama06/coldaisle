@@ -17,6 +17,10 @@ thinking_timeout_s: 120.0
 max_attempts: 2
 retry_backoff_s: 0.5
 
+# Server Health の任意要約に失敗したあと、バックグラウンド再試行まで待つ時間。
+# API 応答は待たずに固定テンプレートを返すため、この値は監視の可用性に影響しない
+health_summary_retry_s: 60.0
+
 # 生成の既定値。呼び出し側で上書きできる
 temperature: 0.2
 max_tokens: 1024

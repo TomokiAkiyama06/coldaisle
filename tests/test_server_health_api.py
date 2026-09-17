@@ -1,0 +1,603 @@
+"""Workspace 向け Server Health API の安全・契約テスト。#66"""
+
+from __future__ import annotations
+
+import ast
+import importlib
+import threading
+import time
+from pathlib import Path
+
+import pytest
+from fastapi.testclient import TestClient
+
+from coldaisle.ai import (
+    AiHealthSummarizer,
+    BackgroundHealthSummarizer,
+    ChatResult,
+    UnavailableProvider,
+)
+from coldaisle.api.app import Config, create_app
+from coldaisle.api.models import ComputeModeAdvisory, ServerHealthResponse
+from coldaisle.api.server_health import server_health_state
+from coldaisle.clock import SimulatedClock
+from coldaisle.internal_telemetry import SOURCE_STATE_PREFIX
+from coldaisle.store import Quality, Reading, Sample, SqliteStore
+from conftest import CONFIG_DIR, QUALITY_RULES_PATH
+
+NOW_MS = 1_787_616_000_000
+SRC = Path(__file__).resolve().parents[1] / "src" / "coldaisle"
+GREEN_TEMPLATE = "監視対象のTelemetryと情報源は正常です。"
+
+SENSOR_VALUES = {
+    "air.room": 26.0,
+    "air.room_humidity": 48.0,
+    "air.front_intake": 27.0,
+    "air.gpu_intake": 28.0,
+    "air.gpu_exhaust": 36.0,
+    "air.top_exhaust": 31.0,
+    "air.rear_exhaust": 32.0,
+}
+INTERNAL_VALUES = {
+    "gpu.0.core": 54.0,
+    "gpu.0.hotspot": 64.0,
+    "gpu.0.mem": 58.0,
+    "gpu.0.utilization": 42.0,
+    "gpu.0.vram_used": 8.0,
+    "power.gpu.0": 180.0,
+    "sys.cuda_processes": 2.0,
+    "cpu.package": 49.0,
+    "power.cpu.package": 72.0,
+    "cpu.vrm": 46.0,
+    "board.chipset": 44.0,
+}
+
+
+class FakeSummarizer:
+    def __init__(self, summary: str | None = "監視情報と各データ源は正常です。") -> None:
+        self.summary = summary
+        self.facts: list[str] = []
+
+    def summarize(self, facts: str) -> str | None:
+        self.facts.append(facts)
+        return self.summary
+
+
+class RaisingSummarizer:
+    def summarize(self, facts: str) -> str | None:
+        raise RuntimeError("local model stopped")
+
+
+class FakeProvider:
+    def __init__(self, text: str, *, available: bool = True) -> None:
+        self.text = text
+        self.available = available
+        self.messages = []
+        self.thinking = None
+        self.called = threading.Event()
+
+    def chat(self, messages, *, thinking=None, tools=None) -> ChatResult:
+        self.messages = messages
+        self.thinking = thinking
+        self.called.set()
+        return ChatResult(available=self.available, text=self.text)
+
+    def probe(self) -> ChatResult:
+        return ChatResult(available=self.available)
+
+
+def _populate(
+    path: Path,
+    rules,
+    *,
+    sensor_values: dict[str, float] | None = None,
+    internal_values: dict[str, float] | None = None,
+    sensor_qualities: dict[str, Quality] | None = None,
+    ts_ms: int = NOW_MS,
+) -> None:
+    sensors = SENSOR_VALUES if sensor_values is None else sensor_values
+    internals = INTERNAL_VALUES if internal_values is None else internal_values
+    with SqliteStore(path, rules=rules, clock=SimulatedClock(NOW_MS)) as store:
+        store.insert_sample(
+            Sample(
+                ts_ms=ts_ms,
+                readings=tuple(
+                    Reading(
+                        metric=name,
+                        value=value,
+                        quality=(sensor_qualities or {}).get(name, Quality.OK),
+                    )
+                    for name, value in sensors.items()
+                )
+                + tuple(
+                    Reading(metric=name, value=value, quality=Quality.OK)
+                    for name, value in internals.items()
+                ),
+            )
+        )
+        store.set_system_state("sys.ingest_source", "serial", at_ms=ts_ms)
+        store.set_system_state(SOURCE_STATE_PREFIX + "nvml", "ok", at_ms=ts_ms)
+        store.set_system_state(SOURCE_STATE_PREFIX + "hwmon", "ok", at_ms=ts_ms)
+        store.set_system_state("sys.gpu_mode", "ai", at_ms=ts_ms)
+
+
+def _app(
+    path: Path,
+    clock: SimulatedClock,
+    summarizer=None,
+    *,
+    hwmon_metrics=("cpu.package",),
+):
+    return create_app(
+        Config(
+            db=path,
+            quality_rules=QUALITY_RULES_PATH,
+            metrics=CONFIG_DIR / "metrics.yaml",
+            stream_poll_s=0.001,
+        ),
+        clock=clock,
+        health_summarizer=summarizer,
+        health_hwmon_metrics=hwmon_metrics,
+    )
+
+
+@pytest.fixture
+def healthy_db(tmp_path, rules) -> Path:
+    path = tmp_path / "server-health.db"
+    _populate(path, rules)
+    return path
+
+
+def test_complete_template_payload_is_green_when_monitoring_sources_are_healthy(
+    healthy_db,
+):
+    """AI停止は監視停止ではない。全フィールドを決定論的テンプレートで返す。"""
+    with TestClient(_app(healthy_db, SimulatedClock(NOW_MS))) as client:
+        response = client.get("/api/v1/server-health")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["schema_version"] == 1
+    assert body["generated_at_ms"] == NOW_MS
+    assert body["generated_at"].endswith("+00:00")
+    assert body["signal"] == "green"
+    assert body["summary_source"] == "template"
+    assert body["summary"]
+    assert body["gpu"]["mode"] == "ai"
+    assert body["gpu"]["metrics"]["gpu.0.core"] == {
+        "value": 54.0,
+        "unit": "C",
+        "quality": "ok",
+        "age_seconds": 0.0,
+    }
+    assert set(body["sources"]) == {"sensor_unit", "nvml", "lm_sensors", "ai_layer"}
+    assert body["sources"]["ai_layer"]["status"] == "stopped"
+    assert body["compute_mode_advisory"] == {
+        "safe": True,
+        "warnings": [],
+        "blocking": False,
+    }
+
+
+def test_missing_optional_gpu_values_keep_stable_keys_without_nvidia_smi(tmp_path, rules):
+    """Workspace は欠測も含む固定キーだけで描画し、別コマンドを必要としない。"""
+    path = tmp_path / "partial-gpu.db"
+    _populate(
+        path,
+        rules,
+        internal_values={
+            "gpu.0.core": 54.0,
+            "power.gpu.0": 180.0,
+            "cpu.package": 49.0,
+        },
+    )
+    with TestClient(_app(path, SimulatedClock(NOW_MS))) as client:
+        body = client.get("/api/v1/server-health").json()
+
+    assert body["signal"] == "green"
+    assert body["gpu"]["metrics"]["gpu.0.hotspot"]["value"] is None
+    assert body["gpu"]["metrics"]["gpu.0.hotspot"]["quality"] == "missing"
+    assert body["environment"]["metrics"]["board.connector_12v2x6"]["value"] is None
+
+    implementation = (SRC / "api" / "server_health.py").read_text(encoding="utf-8")
+    assert "nvidia-smi" not in implementation
+    assert "subprocess" not in implementation
+
+
+def test_ai_summary_can_only_replace_the_template(healthy_db):
+    summarizer = FakeSummarizer("監視情報と各データ源は正常です。")
+    with TestClient(_app(healthy_db, SimulatedClock(NOW_MS), summarizer)) as client:
+        ai = client.get("/api/v1/server-health").json()
+    with TestClient(_app(healthy_db, SimulatedClock(NOW_MS))) as client:
+        template = client.get("/api/v1/server-health").json()
+
+    assert ai["summary_source"] == "ai"
+    assert ai["sources"]["ai_layer"]["status"] == "ok"
+    assert summarizer.facts
+    for deterministic in (
+        "signal",
+        "gpu",
+        "environment",
+        "active_alerts",
+        "compute_mode_advisory",
+    ):
+        assert ai[deterministic] == template[deterministic]
+
+
+@pytest.mark.parametrize("summarizer", [FakeSummarizer(None), RaisingSummarizer()])
+def test_ai_unavailable_or_failed_uses_the_complete_template(healthy_db, summarizer):
+    with TestClient(_app(healthy_db, SimulatedClock(NOW_MS), summarizer)) as client:
+        body = client.get("/api/v1/server-health").json()
+
+    assert body["signal"] == "green"
+    assert body["summary_source"] == "template"
+    assert body["summary"]
+    assert body["sources"]["ai_layer"]["status"] == "stopped"
+    assert body["compute_mode_advisory"]["blocking"] is False
+
+
+def test_dead_sensor_unit_is_never_green(tmp_path, rules):
+    path = tmp_path / "dead-sensor.db"
+    _populate(path, rules, ts_ms=NOW_MS - 11_000)
+    with TestClient(_app(path, SimulatedClock(NOW_MS))) as client:
+        body = client.get("/api/v1/server-health").json()
+
+    assert body["signal"] == "red"
+    assert body["sources"]["sensor_unit"]["status"] == "unavailable"
+    assert "no fresh required sensor telemetry" in body["sources"]["sensor_unit"]["detail"]
+    assert body["environment"]["metrics"]["air.room"]["quality"] == "stale"
+    assert body["compute_mode_advisory"]["safe"] is False
+    assert body["compute_mode_advisory"]["blocking"] is False
+
+
+def test_one_suspect_sensor_is_yellow_not_green(tmp_path, rules):
+    path = tmp_path / "suspect-sensor.db"
+    _populate(path, rules, sensor_qualities={"air.gpu_intake": Quality.SUSPECT})
+    with TestClient(_app(path, SimulatedClock(NOW_MS))) as client:
+        body = client.get("/api/v1/server-health").json()
+
+    assert body["signal"] == "yellow"
+    assert body["sources"]["sensor_unit"]["status"] == "degraded"
+
+
+def test_one_stale_sensor_is_yellow_not_green(tmp_path, rules):
+    path = tmp_path / "one-stale-sensor.db"
+    fresh = {name: value for name, value in SENSOR_VALUES.items() if name != "air.gpu_intake"}
+    _populate(path, rules, sensor_values=fresh)
+    with SqliteStore(path, rules=rules, clock=SimulatedClock(NOW_MS)) as store:
+        store.insert_sample(
+            Sample(
+                ts_ms=NOW_MS - 11_000,
+                readings=(Reading(metric="air.gpu_intake", value=28.0, quality=Quality.OK),),
+            )
+        )
+
+    with TestClient(_app(path, SimulatedClock(NOW_MS))) as client:
+        body = client.get("/api/v1/server-health").json()
+
+    assert body["signal"] == "yellow"
+    assert body["sources"]["sensor_unit"]["status"] == "degraded"
+    assert "partial required sensor telemetry" in body["sources"]["sensor_unit"]["detail"]
+
+
+def test_lm_sensors_liveness_accepts_any_fresh_configurable_hwmon_metric(tmp_path, rules):
+    """#65 の hwmon mapping は設定駆動であり、CPU package 固定ではない。"""
+    path = tmp_path / "connector-only-hwmon.db"
+    _populate(
+        path,
+        rules,
+        internal_values={
+            "gpu.0.core": 54.0,
+            "power.gpu.0": 180.0,
+            "board.connector_12v2x6": 42.0,
+        },
+    )
+    with TestClient(
+        _app(
+            path,
+            SimulatedClock(NOW_MS),
+            hwmon_metrics=("board.connector_12v2x6",),
+        )
+    ) as client:
+        body = client.get("/api/v1/server-health").json()
+
+    assert body["sources"]["lm_sensors"]["status"] == "ok"
+    assert body["signal"] == "green"
+
+
+def test_lm_sensors_uses_the_actual_internal_telemetry_config(tmp_path, rules):
+    path = tmp_path / "configured-hwmon.db"
+    _populate(
+        path,
+        rules,
+        internal_values={
+            "gpu.0.core": 54.0,
+            "power.gpu.0": 180.0,
+            "board.connector_12v2x6": 42.0,
+        },
+    )
+    internal_config = tmp_path / "internal-telemetry.yaml"
+    internal_config.write_text(
+        """version: 1
+interval_ms: 2500
+nvml:
+  enabled: true
+  gpu_indices: [0]
+hwmon:
+  enabled: true
+  root: /sys/class/hwmon
+  sensors:
+    - metric: board.connector_12v2x6
+      enabled: true
+      driver: fixture-driver
+      label: T_SENSOR
+      measurement: temperature
+      required: true
+      minimum: 0.0
+      maximum: 125.0
+      confirmation:
+        status: confirmed
+        basis: fixture measurement and owner approval
+""",
+        encoding="utf-8",
+    )
+    app = create_app(
+        Config(
+            db=path,
+            quality_rules=QUALITY_RULES_PATH,
+            metrics=CONFIG_DIR / "metrics.yaml",
+            internal_telemetry=internal_config,
+        ),
+        clock=SimulatedClock(NOW_MS),
+    )
+
+    with TestClient(app) as client:
+        body = client.get("/api/v1/server-health").json()
+
+    assert body["sources"]["lm_sensors"]["status"] == "ok"
+    assert body["signal"] == "green"
+
+
+@pytest.mark.parametrize(("source", "state"), [("nvml", "unavailable"), ("hwmon", "disabled")])
+def test_failed_internal_source_is_red(healthy_db, rules, source, state):
+    with SqliteStore(healthy_db, rules=rules, clock=SimulatedClock(NOW_MS)) as store:
+        store.set_system_state(SOURCE_STATE_PREFIX + source, state, at_ms=NOW_MS + 1)
+
+    with TestClient(_app(healthy_db, SimulatedClock(NOW_MS + 1))) as client:
+        body = client.get("/api/v1/server-health").json()
+
+    assert body["signal"] == "red"
+    api_name = "lm_sensors" if source == "hwmon" else source
+    assert body["sources"][api_name]["status"] == state
+    assert body["compute_mode_advisory"]["safe"] is False
+    assert body["compute_mode_advisory"]["blocking"] is False
+
+
+@pytest.mark.parametrize(
+    ("severity", "expected_signal"), [("warning", "yellow"), ("critical", "red")]
+)
+def test_active_alert_changes_signal_deterministically(
+    healthy_db, rules, severity, expected_signal
+):
+    with SqliteStore(healthy_db, rules=rules, clock=SimulatedClock(NOW_MS)) as store:
+        alert_id = store.open_alert(
+            rule_id="TEST_ALERT",
+            severity=severity,
+            metric="air.room",
+            started_ms=NOW_MS - 1_000,
+            threshold=30.0,
+            trigger_value=31.0,
+        )
+        store.fire_alert(alert_id, fired_ms=NOW_MS, trigger_value=31.0)
+
+    with TestClient(_app(healthy_db, SimulatedClock(NOW_MS))) as client:
+        body = client.get("/api/v1/server-health").json()
+
+    assert body["signal"] == expected_signal
+    assert body["active_alerts"][0]["rule_id"] == "TEST_ALERT"
+    assert f"active alert: TEST_ALERT ({severity})" in body["compute_mode_advisory"]["warnings"]
+
+
+def test_empty_database_is_complete_and_red(tmp_path):
+    path = tmp_path / "empty.db"
+    with TestClient(_app(path, SimulatedClock(NOW_MS))) as client:
+        body = client.get("/api/v1/server-health").json()
+
+    assert body["signal"] == "red"
+    assert body["summary_source"] == "template"
+    assert all(
+        source["status"] == "stopped"
+        for name, source in body["sources"].items()
+        if name != "ai_layer"
+    )
+    assert body["gpu"]["mode"] == "unknown"
+    assert body["gpu"]["metrics"]["gpu.0.core"]["quality"] == "missing"
+    assert body["environment"]["metrics"]["air.room"]["quality"] == "missing"
+
+
+def test_event_metric_staleness_does_not_change_a_green_signal(healthy_db, rules):
+    """事象メトリクスは周期データではないため鮮度判定から外す（DR0009 §2.12）。"""
+    with SqliteStore(healthy_db, rules=rules, clock=SimulatedClock(NOW_MS)) as store:
+        store.insert_sample(
+            Sample(
+                ts_ms=NOW_MS - 60_000,
+                readings=(Reading(metric="sys.dropped_samples", value=1.0, quality=Quality.OK),),
+            )
+        )
+
+    with TestClient(_app(healthy_db, SimulatedClock(NOW_MS))) as client:
+        body = client.get("/api/v1/server-health").json()
+
+    assert body["signal"] == "green"
+
+
+def test_websocket_pushes_the_exact_rest_payload(healthy_db):
+    app = _app(healthy_db, SimulatedClock(NOW_MS))
+    with TestClient(app) as client:
+        rest = client.get("/api/v1/server-health").json()
+        with client.websocket_connect("/api/v1/server-health/stream") as websocket:
+            pushed = websocket.receive_json()
+
+    assert pushed == rest
+
+
+def test_websocket_state_ignores_clock_and_age_only_changes(healthy_db):
+    clock = SimulatedClock(NOW_MS)
+    with TestClient(_app(healthy_db, clock)) as client:
+        first = ServerHealthResponse.model_validate(client.get("/api/v1/server-health").json())
+        clock.advance_to_ms(NOW_MS + 1_000)
+        second = ServerHealthResponse.model_validate(client.get("/api/v1/server-health").json())
+
+    assert second.generated_at_ms != first.generated_at_ms
+    assert (
+        second.gpu.metrics["gpu.0.core"].age_seconds != first.gpu.metrics["gpu.0.core"].age_seconds
+    )
+    assert server_health_state(second) == server_health_state(first)
+
+
+def test_websocket_detects_disconnect_while_health_state_is_stable(healthy_db, monkeypatch):
+    api_module = importlib.import_module("coldaisle.api.app")
+
+    original = api_module.build_server_health
+    calls = 0
+
+    def counting_build(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(api_module, "build_server_health", counting_build)
+    with TestClient(_app(healthy_db, SimulatedClock(NOW_MS))) as client:
+        with client.websocket_connect("/api/v1/server-health/stream") as websocket:
+            websocket.receive_json()
+        calls_at_disconnect = calls
+        time.sleep(0.02)
+
+    assert calls <= calls_at_disconnect + 1
+
+
+def test_openapi_exposes_a_typed_read_only_contract(healthy_db):
+    with TestClient(_app(healthy_db, SimulatedClock(NOW_MS))) as client:
+        document = client.get("/openapi.json").json()
+
+    operation = document["paths"]["/api/v1/server-health"]["get"]
+    schema = operation["responses"]["200"]["content"]["application/json"]["schema"]
+    assert schema["$ref"].endswith("ServerHealthResponse")
+    methods = {method for operations in document["paths"].values() for method in operations}
+    assert methods == {"get"}
+
+
+def test_api_layer_still_does_not_import_the_ai_layer():
+    offending = []
+    for path in (SRC / "api").rglob("*.py"):
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom) and node.module:
+                names = [node.module]
+            elif isinstance(node, ast.Import):
+                names = [alias.name for alias in node.names]
+            else:
+                names = []
+            offending += [
+                f"{path.name}: {name}" for name in names if name.startswith("coldaisle.ai")
+            ]
+    assert offending == []
+
+
+def test_compute_mode_advisory_cannot_become_blocking():
+    with pytest.raises(ValueError):
+        ComputeModeAdvisory(safe=False, warnings=("hot",), blocking=True)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "GPU温度は54度で正常です。",
+        "ファン制御を変更しました。",
+        "正常なのでCompute Modeへの切替を推奨します。",
+        "正常なので処理を開始しても安全です。",
+        "監視対象は正常ではありません。",
+        "確認しましたが問題ありません。",
+        "異常はありません。",
+        "1行目\n2行目",
+        "x" * 10_000,
+        "   ",
+    ],
+)
+def test_ai_summary_rejects_numbers_actions_multiline_and_empty_text(text):
+    provider = FakeProvider(text)
+    assert AiHealthSummarizer(provider).summarize(GREEN_TEMPLATE) is None
+    assert provider.messages[0].role == "system"
+
+
+def test_ai_summary_accepts_only_an_allowed_paraphrase():
+    provider = FakeProvider("監視情報と各データ源は正常です。")
+    summary = AiHealthSummarizer(provider).summarize(GREEN_TEMPLATE)
+    assert summary == "監視情報と各データ源は正常です。"
+    assert provider.thinking is False
+
+
+def test_composition_root_injects_the_ai_summarizer(healthy_db, monkeypatch):
+    """L2→L3 の逆依存を作らず、server.py だけが AI 実体を合成する。"""
+    import coldaisle.server as server
+
+    provider = FakeProvider("必要な監視情報を取得できないか、重大な警告があります。")
+    monkeypatch.setattr(server, "provider_from_env", lambda settings: provider)
+    app = server.create_server(
+        Config(
+            db=healthy_db,
+            quality_rules=QUALITY_RULES_PATH,
+            metrics=CONFIG_DIR / "metrics.yaml",
+        ),
+        clock=SimulatedClock(NOW_MS),
+    )
+
+    with TestClient(app) as client:
+        first = client.get("/api/v1/server-health").json()
+        assert provider.called.wait(timeout=1)
+        for _ in range(100):
+            body = client.get("/api/v1/server-health").json()
+            if body["summary_source"] == "ai":
+                break
+            time.sleep(0.001)
+
+    assert first["summary_source"] == "template", "AI の完了を待たない"
+    assert body["summary_source"] == "ai"
+    assert body["sources"]["ai_layer"]["status"] == "ok"
+    assert provider.messages
+
+
+def test_unavailable_provider_causes_template_fallback_directly():
+    assert AiHealthSummarizer(UnavailableProvider()).summarize(GREEN_TEMPLATE) is None
+
+
+def test_background_ai_never_blocks_and_limits_concurrency():
+    class BlockingSummarizer:
+        def __init__(self):
+            self.entered = threading.Event()
+            self.release = threading.Event()
+            self.finished = threading.Event()
+            self.calls = 0
+
+        def summarize(self, template):
+            self.calls += 1
+            self.entered.set()
+            self.release.wait(timeout=1)
+            self.finished.set()
+            return "監視情報は正常です。"
+
+    delegate = BlockingSummarizer()
+    background = BackgroundHealthSummarizer(delegate, retry_s=60.0)
+
+    assert background.summarize(GREEN_TEMPLATE) is None
+    assert delegate.entered.wait(timeout=1)
+    assert background.summarize(GREEN_TEMPLATE) is None
+    assert delegate.calls == 1
+    delegate.release.set()
+    assert delegate.finished.wait(timeout=1)
+    for _ in range(100):
+        result = background.summarize(GREEN_TEMPLATE)
+        if result is not None:
+            break
+        time.sleep(0.001)
+    assert result == "監視情報は正常です。"

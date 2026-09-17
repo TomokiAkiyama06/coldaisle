@@ -33,12 +33,18 @@ from coldaisle.api.models import (
     SensorOut,
     SeriesPointOut,
     SeriesResponse,
+    ServerHealthResponse,
     StatsResponse,
     StreamMessage,
     ToolCallMeta,
     ToolCallResponse,
     ToolListResponse,
     iso,
+)
+from coldaisle.api.server_health import (
+    HealthSummarizer,
+    build_server_health,
+    server_health_state,
 )
 from coldaisle.channels import (
     CHANNEL_TO_METRIC,
@@ -47,6 +53,7 @@ from coldaisle.channels import (
     QUEUE_DROPS_METRIC,
 )
 from coldaisle.clock import Clock, WallClock
+from coldaisle.internal_telemetry import InternalTelemetryConfig
 from coldaisle.metrics import MetricCatalog, compute_derived
 from coldaisle.store import Aggregation, Quality, QualityRules, SqliteStore
 from coldaisle.store.db import FIVE_MINUTES_MS, HOUR_MS, MINUTE_MS
@@ -101,6 +108,7 @@ class Config:
     db: Path = Path("var/coldaisle.db")
     quality_rules: Path = Path("config/quality.yaml")
     metrics: Path = Path("config/metrics.yaml")
+    internal_telemetry: Path = Path("config/internal-telemetry.yaml")
     max_points: int = 2_000
     """1レスポンスの最大点数。超えるなら粗い粒度へ自動で落とす（受入基準）。"""
     stream_poll_s: float = 1.0
@@ -112,6 +120,9 @@ class Config:
             db=Path(os.environ.get("COLDAISLE_DB", str(cls.db))),
             quality_rules=Path(os.environ.get("COLDAISLE_QUALITY_RULES", str(cls.quality_rules))),
             metrics=Path(os.environ.get("COLDAISLE_METRICS", str(cls.metrics))),
+            internal_telemetry=Path(
+                os.environ.get("COLDAISLE_INTERNAL_TELEMETRY", str(cls.internal_telemetry))
+            ),
             max_points=int(os.environ.get("COLDAISLE_MAX_POINTS", cls.max_points)),
             stream_poll_s=float(os.environ.get("COLDAISLE_STREAM_POLL_S", cls.stream_poll_s)),
         )
@@ -186,9 +197,16 @@ def create_app(
     *,
     clock: Clock | None = None,
     tools: ToolsFactory | None = None,
+    health_summarizer: HealthSummarizer | None = None,
+    health_hwmon_metrics: tuple[str, ...] | None = None,
 ) -> FastAPI:
     settings = config or Config.from_env()
     catalog = MetricCatalog.from_yaml(settings.metrics)
+    if health_hwmon_metrics is None:
+        internal_telemetry = InternalTelemetryConfig.from_yaml(settings.internal_telemetry)
+        health_hwmon_metrics = tuple(
+            sensor.metric for sensor in internal_telemetry.hwmon.sensors if sensor.enabled
+        )
     provider = StoreProvider(settings, clock or WallClock())
 
     @asynccontextmanager
@@ -227,6 +245,15 @@ def create_app(
             },
             derived=compute_derived(readings, catalog),
             stale=_is_stale(readings),
+        )
+
+    def server_health_payload() -> ServerHealthResponse:
+        """REST と WS が共有する Server Health の完全な1スナップショット。"""
+        return build_server_health(
+            provider.get(),
+            catalog,
+            health_summarizer,
+            hwmon_metrics=health_hwmon_metrics,
         )
 
     @app.get("/api/v1/latest", response_model=LatestResponse, response_model_by_alias=True)
@@ -391,6 +418,11 @@ def create_app(
             queue_drops_1h=_queue_drops_1h(store, now_ms),
         )
 
+    @app.get("/api/v1/server-health", response_model=ServerHealthResponse)
+    def get_server_health() -> ServerHealthResponse:
+        """Workspace の Server Health パネル向け統合ビュー（FR-308 / #66）。"""
+        return server_health_payload()
+
     @app.websocket("/api/v1/stream")
     async def stream(websocket: WebSocket) -> None:
         """新しいサンプルと**品質の変化**を押し出す（FR-306）。
@@ -415,6 +447,29 @@ def create_app(
                         StreamMessage(latest=payload).model_dump(mode="json", by_alias=True)
                     )
                 await asyncio.sleep(settings.stream_poll_s)
+        except WebSocketDisconnect:  # pragma: no cover - 切断はクライアント都合
+            return
+
+    @app.websocket("/api/v1/server-health/stream")
+    async def stream_server_health(websocket: WebSocket) -> None:
+        """REST と同じ Server Health payload を定期的に push する（#66）。"""
+        await websocket.accept()
+        last_state: str | None = None
+        try:
+            while True:
+                payload = await asyncio.to_thread(server_health_payload)
+                state = server_health_state(payload)
+                if state != last_state:
+                    last_state = state
+                    await websocket.send_json(payload.model_dump(mode="json"))
+                try:
+                    message = await asyncio.wait_for(
+                        websocket.receive(), timeout=settings.stream_poll_s
+                    )
+                except TimeoutError:
+                    continue
+                if message["type"] == "websocket.disconnect":
+                    return
         except WebSocketDisconnect:  # pragma: no cover - 切断はクライアント都合
             return
 

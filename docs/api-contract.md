@@ -26,64 +26,105 @@
 | メソッド | パス | 用途 |
 |---|---|---|
 | GET | `/api/v1/health` | デーモンの稼働状態、最終受信時刻、ソース種別、欠損率 |
-| GET | `/api/v1/health/summary` | **パネル1枚分。Workspace が最も多く叩く** |
+| GET | `/api/v1/server-health` | **Server Health パネル1枚分。Workspace が最も多く叩く** |
 | GET | `/api/v1/latest` | 全メトリクスの最新値 + 派生値 + quality |
 | GET | `/api/v1/series` | 時系列。`metric` `from` `to` `agg` |
 | GET | `/api/v1/stats` | min/max/mean/p95/傾き/欠測率 |
 | GET | `/api/v1/alerts` | アラート一覧 |
 | GET | `/api/v1/gpu/processes` | CUDA プロセス一覧と VRAM 使用量 |
-| GET | `/api/v1/thermal-gate` | Compute 開始前の熱状態（signal + 理由） |
 | GET | `/api/v1/devices` | 記録されたセンサー構成（チャネル / メトリクス / ROM）（#14） |
 | GET | `/api/v1/tools` | **AI 向けツールの関数定義**と注意書き（#23） |
 | GET | `/api/v1/tools/{name}` | ツールを1つ実行し、結果と呼び出しの記録を返す（#23） |
 | WS | `/api/v1/stream` | 新サンプルの push |
+| WS | `/api/v1/server-health/stream` | GET `/server-health` と同一 payload の push |
 
 ---
 
 ## 3. Workspace が使う主要レスポンス
 
-### `GET /api/v1/health/summary`
+### `GET /api/v1/server-health`
 
 Server Health パネル1枚を描くのに必要な情報を、**1リクエストで**返します。
 Workspace 側で複数エンドポイントを叩いて組み立てさせないこと。
 
 ```json
 {
+  "schema_version": 1,
+  "generated_at_ms": 1787616000000,
+  "generated_at": "2026-08-25T00:00:00+00:00",
   "signal": "green",
-  "summary": "室温 26.4℃、GPU吸気 28.3℃。異常なし",
-  "gpu_mode": "ai",
-  "metrics": {
-    "air.room":         {"value": 26.42, "unit": "C",  "quality": "ok"},
-    "air.room_humidity":{"value": 48.20, "unit": "%RH","quality": "ok"},
-    "air.front_intake": {"value": 27.87, "unit": "C",  "quality": "ok"},
-    "air.gpu_intake":   {"value": 28.25, "unit": "C",  "quality": "ok"},
-    "air.gpu_exhaust":  {"value": 28.87, "unit": "C",  "quality": "ok"},
-    "air.top_exhaust":  {"value": 27.06, "unit": "C",  "quality": "ok"},
-    "air.rear_exhaust": {"value": 27.44, "unit": "C",  "quality": "ok"}
+  "summary": "監視対象のTelemetryと情報源は正常です。",
+  "summary_source": "template",
+  "gpu": {
+    "mode": "ai",
+    "metrics": {
+      "gpu.0.core":         {"value": 54.0,  "unit": "C",     "quality": "ok", "age_seconds": 0.4},
+      "gpu.0.hotspot":      {"value": null,  "unit": "C",     "quality": "missing", "age_seconds": null},
+      "gpu.0.mem":          {"value": null,  "unit": "C",     "quality": "missing", "age_seconds": null},
+      "gpu.0.utilization":  {"value": 42.0,  "unit": "%",     "quality": "ok", "age_seconds": 0.4},
+      "gpu.0.vram_used":    {"value": 8.0,   "unit": "GB",    "quality": "ok", "age_seconds": 0.4},
+      "power.gpu.0":        {"value": 180.0, "unit": "W",     "quality": "ok", "age_seconds": 0.4},
+      "sys.cuda_processes": {"value": 2.0,   "unit": "count", "quality": "ok", "age_seconds": 0.4}
+    }
   },
-  "derived": {
-    "d.intake_rise": 1.45,
-    "d.gpu_preheat": 0.38,
-    "d.gpu_delta":   0.62
+  "environment": {
+    "metrics": {
+      "air.room":             {"value": 26.4, "unit": "C",   "quality": "ok", "age_seconds": 0.4},
+      "air.room_humidity":    {"value": 48.2, "unit": "%RH", "quality": "ok", "age_seconds": 0.4},
+      "air.front_intake":     {"value": 27.9, "unit": "C",   "quality": "ok", "age_seconds": 0.4},
+      "air.gpu_intake":       {"value": 28.3, "unit": "C",   "quality": "ok", "age_seconds": 0.4},
+      "air.gpu_exhaust":      {"value": 35.0, "unit": "C",   "quality": "ok", "age_seconds": 0.4},
+      "air.top_exhaust":      {"value": 31.0, "unit": "C",   "quality": "ok", "age_seconds": 0.4},
+      "air.rear_exhaust":     {"value": 32.0, "unit": "C",   "quality": "ok", "age_seconds": 0.4},
+      "cpu.package":          {"value": 49.0, "unit": "C",   "quality": "ok", "age_seconds": 0.4},
+      "power.cpu.package":    {"value": 72.0, "unit": "W",   "quality": "ok", "age_seconds": 0.4},
+      "cpu.vrm":              {"value": 46.0, "unit": "C",   "quality": "ok", "age_seconds": 0.4},
+      "board.chipset":        {"value": 44.0, "unit": "C",   "quality": "ok", "age_seconds": 0.4},
+      "board.connector_12v2x6":{"value": null, "unit": "C",   "quality": "missing", "age_seconds": null}
+    }
   },
   "active_alerts": [],
-  "last_sample_at": "2026-08-23T12:34:56+09:00",
-  "data_age_seconds": 2.4,
-  "stale": false
+  "sources": {
+    "sensor_unit": {"status": "ok", "detail": "ingest_source=serial", "last_sample_ts_ms": 1787615999600, "last_sample_at": "2026-08-24T23:59:59.600000+00:00"},
+    "nvml":        {"status": "ok", "detail": "collector_state=ok", "last_sample_ts_ms": 1787615999600, "last_sample_at": "2026-08-24T23:59:59.600000+00:00"},
+    "lm_sensors":  {"status": "ok", "detail": "collector_state=ok", "last_sample_ts_ms": 1787615999600, "last_sample_at": "2026-08-24T23:59:59.600000+00:00"},
+    "ai_layer":    {"status": "stopped", "detail": "deterministic template used", "last_sample_ts_ms": null, "last_sample_at": null}
+  },
+  "compute_mode_advisory": {"safe": true, "warnings": [], "blocking": false}
 }
 ```
+
+`gpu.metrics` と `environment.metrics` のキーは値が取得できなくても省略しません。
+その場合は `value: null`、`quality: "missing"`、`age_seconds: null` です。
+Workspace はこの応答だけで GPU パネルを描き、`nvidia-smi` や hwmon を直接呼びません。
+
+`summary` だけは AI が**確定済みテンプレートと同じ signal の許可済み文面を選べます**。
+自由文は公開せず、完全一致する閉じた候補以外は不正出力として捨てます。生の測定値や
+Compute Mode の判断は AI へ渡しません。生成はバックグラウンドで行い、REST / WS は
+完了を待ちません。AI が未設定、生成中、停止中、不達、不正出力のいずれでも、固定
+テンプレートを即座に返して `summary_source: "template"`、
+`sources.ai_layer.status: "stopped"` とします。成功した言い換えは同じテンプレートの
+間だけ cache します。AI は `signal`、`sources`、`active_alerts`、
+`compute_mode_advisory` を変更せず、安全保証・切替推奨・操作実行も文面に書けません。
 
 **`signal` の判定規則**
 
 | 値 | 条件 |
 |---|---|
-| `green` | 発生中のアラートが無く、かつ `stale` が false |
-| `yellow` | warning のアラートが発生中、または一部メトリクスが `suspect` |
-| `red` | critical のアラートが発生中、またはデータが取得できていない |
+| `green` | sensor_unit / nvml / lm_sensors がすべて `ok`、発生中アラート無し、保存済みの周期メトリクスがすべて `quality=ok` |
+| `yellow` | 情報源が `degraded`、critical 以外のアラートが発生中、または周期メトリクスの一部が `suspect` / `missing` / `stale` |
+| `red` | 情報源が `unavailable` / `disabled` / `stopped`、critical アラートが発生中、または監視必須データが取得不能 |
 
 **データが古い場合に `green` を返してはいけません。**
 無音で古い値を表示するのが、監視システムの最悪の失敗です。
-`stale` が true のときは必ず `red` を返します。
+監視必須メトリクスが**すべて** `stale` または欠測のときは情報源が `unavailable` と
+なり、`red` を返します。一部だけなら `degraded` / `yellow` であり、green にはしません。
+発生時だけ記録する `sys.dropped_samples` 等はこの鮮度判定から
+外します（決定記録 0009 §2.12）。AI 停止は監視の停止ではないため signal 判定から
+外します。
+
+**`GET /api/v1/server-health` と `WS /api/v1/server-health/stream` の payload は同一です。**
+WebSocket 専用の封筒やフィールドは加えません。
 
 ### 時刻の表し方
 
@@ -98,17 +139,15 @@ Workspace 側で複数エンドポイントを叩いて組み立てさせない�
 API が返すオフセットは `+00:00` です。同じ瞬間を指すので解釈は変わりません。
 ローカル時刻への変換は Workspace 側で行ってください（決定記録 0009 §2.3）。
 
-### `GET /api/v1/thermal-gate`
+### `compute_mode_advisory`
 
 ```json
-{
-  "signal": "yellow",
-  "reasons": ["室温 31.2℃（通常時 +5℃）", "GPU吸気 34.8℃"],
-  "blocking": false
-}
+{"safe": false, "warnings": ["active alert: INTAKE_HIGH (warning)"], "blocking": false}
 ```
 
-`blocking` は**常に false** です。判断は人間が行います（決定 D-08）。
+`safe` は**現在の決定論的 signal が green か**だけを示し、将来の高負荷時の
+安全を保証しません。実測フルロード履歴との比較は #50 の測定完了後に追加します。
+`blocking` は型でも **常に false** です。判断は人間が行います（決定 D-08）。
 将来もこのフィールドを true にする実装を入れないでください。
 
 ### `GET /api/v1/devices`
