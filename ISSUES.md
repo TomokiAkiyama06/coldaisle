@@ -108,7 +108,7 @@ GPU機どころか ESP32 すら接続せずに #8〜#25 のすべてが開発・
 | #78 | Critical Safety Layer: floor / stall / telemetry loss / deadman / emergency Max | M8 | |
 | #79 | Fallback Controller: ML停止 / OOD / timeout時のBaseline運転 | M8 | |
 | #80 | Reactive Guard: dT/dt / Power急変への即応制御 | M8 | |
-| #82 | Control Logging: requested / effective / override / confidence / OOD | M8 | |
+| #82 | Control Logging: requested / effective / override / confidence / OOD | M8 | 完了（PR #110） |
 | #74 | 3系統Fan Control Engine / daemon（4層Pipeline + Demand abstraction） | M8 | |
 | #75 | 3系統Fanの風量キャラクタライズとEffective Airflow / Thermal Effectiveness Model | M8 | |
 | #81 | Air Balance Model: q_front / q_rear / q_top と協調制御 | M8 | |
