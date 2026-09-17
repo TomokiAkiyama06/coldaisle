@@ -314,6 +314,20 @@ class FallbackDynamics(_ConfigModel):
     decrease_hold_ms: PositiveMilliseconds
 
 
+class GateConfidenceThresholds(_ConfigModel):
+    """Authority stage ごとに Learned MPC へ要求する最低 confidence。"""
+
+    limited: PolicyUnitInterval
+    expanded: PolicyUnitInterval
+    full: PolicyUnitInterval
+
+    @model_validator(mode="after")
+    def _higher_authority_needs_at_least_as_much_confidence(self) -> Self:
+        if not (self.limited.value <= self.expanded.value <= self.full.value):
+            raise ValueError("gate_min_confidence は limited <= expanded <= full にする")
+        return self
+
+
 class ReactiveGuard(_ConfigModel):
     """Reactive Guard の閾値。値は全て安全設定と同様に追跡する。"""
 
@@ -375,7 +389,7 @@ class FanPolicyConfig(_ConfigModel):
     reactive_guard: ReactiveGuard
     mpc: MpcTiming
     supervisor: SupervisorTiming
-    gate_min_confidence: PolicyUnitInterval
+    gate_min_confidence: GateConfidenceThresholds
     authority_stage: Annotated[AuthorityStage, BeforeValidator(_yaml_authority_stage)]
     authority_limits: AuthorityLimits
     recovery_hold_ms: PositiveMilliseconds
@@ -517,7 +531,12 @@ class ControlConfig(_ConfigModel):
             "reactive_guard.gpu_hotspot_threshold_c",
             guard.gpu_hotspot_threshold_c,
         )
-        append("fan-policy.yaml", "gate_min_confidence", self.policy.gate_min_confidence)
+        for stage in ("limited", "expanded", "full"):
+            append(
+                "fan-policy.yaml",
+                f"gate_min_confidence.{stage}",
+                getattr(self.policy.gate_min_confidence, stage),
+            )
         return tuple(values)
 
     @property

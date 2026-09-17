@@ -32,6 +32,7 @@ from coldaisle.control.fallback import (
     FallbackCause,
     FallbackController,
     LearnedControlStatus,
+    LearnedFailure,
     SnapshotStatus,
 )
 from coldaisle.control.hardware import (
@@ -110,6 +111,7 @@ __all__ = [
     "GuardZoneOutput",
     "HardwareReadback",
     "LearnedControlStatus",
+    "LearnedFailure",
     "OperatingMode",
     "OptimizerStatus",
     "PerZone",

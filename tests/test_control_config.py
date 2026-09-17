@@ -132,7 +132,11 @@ def valid_documents() -> dict[str, dict[str, object]]:
             },
             "mpc": {"period_ms": 1000, "budget_ms": 100, "valid_ms": 2000},
             "supervisor": {"period_ms": 1000, "valid_ms": 2000},
-            "gate_min_confidence": provisional(0.0),
+            "gate_min_confidence": {
+                "limited": provisional(0.6),
+                "expanded": provisional(0.7),
+                "full": provisional(0.8),
+            },
             "authority_stage": "shadow",
             "authority_limits": {
                 "limited": {"permitted_zones": ["front"], "limit_up": 0.1, "limit_down": 0.1},
@@ -347,6 +351,22 @@ def test_fallback_inputs_and_power_curves_are_validated(tmp_path: Path) -> None:
     ]
     write_documents(tmp_path, documents)
     with pytest.raises(ValidationError, match="power_w"):
+        ControlConfig.from_directory(tmp_path)
+
+
+def test_confidence_thresholds_are_validated_per_authority_stage(tmp_path: Path) -> None:
+    config = load_config(tmp_path)
+    assert config.policy.gate_min_confidence.limited.value == 0.6
+    assert config.policy.gate_min_confidence.full.value == 0.8
+
+    documents = valid_documents()
+    documents["fan-policy.yaml"]["gate_min_confidence"] = {
+        "limited": provisional(0.9),
+        "expanded": provisional(0.7),
+        "full": provisional(0.8),
+    }
+    write_documents(tmp_path, documents)
+    with pytest.raises(ValidationError, match="limited <= expanded <= full"):
         ControlConfig.from_directory(tmp_path)
 
 

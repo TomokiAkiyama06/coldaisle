@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections import deque
 from enum import StrEnum
 from typing import Self
 
@@ -41,6 +42,7 @@ class FallbackCause(StrEnum):
     LEARNED_PROPOSAL_UNAVAILABLE = "learned_proposal_unavailable"
     OPTIMIZER_TIMEOUT = "optimizer_timeout"
     OPTIMIZER_ERROR = "optimizer_error"
+    OPTIMIZER_EXCEPTION = "optimizer_exception"
     LOW_CONFIDENCE = "low_confidence"
     OOD = "ood"
     SUPERVISOR_FAILURE = "supervisor_failure"
@@ -53,12 +55,19 @@ class FallbackCause(StrEnum):
     RECOVERY_HOLD = "ml_recovery_hold"
 
 
+class LearnedFailure(StrEnum):
+    """proposal を作れなかった worker の独立した失敗状態。"""
+
+    MODEL_LOAD_FAILURE = "model_load_failure"
+    OPTIMIZER_EXCEPTION = "optimizer_exception"
+
+
 class LearnedControlStatus(_Frozen):
     """worker 提案と、ループ側だけが知る受信・失敗状態。"""
 
     proposal: ControllerProposal | None = None
     received_at_mono_ms: int | None = Field(default=None, ge=0)
-    model_loaded: bool = True
+    failure: LearnedFailure | None = None
     supervisor_available: bool = True
     control_deadline_exceeded: bool = False
     snapshot_status: SnapshotStatus = SnapshotStatus.AVAILABLE
@@ -69,8 +78,8 @@ class LearnedControlStatus(_Frozen):
             raise ValueError("Learned proposal と受信単調時刻は一緒に指定する")
         if self.proposal is not None and self.proposal.controller is not ControllerKind.LEARNED_MPC:
             raise ValueError("LearnedControlStatus には Learned MPC の提案だけを入れる")
-        if not self.model_loaded and self.proposal is not None:
-            raise ValueError("モデル読込失敗時に Learned proposal は指定できない")
+        if self.failure is not None and self.proposal is not None:
+            raise ValueError("worker 失敗時に Learned proposal は指定できない")
         return self
 
 
@@ -81,6 +90,8 @@ class ControllerSelection(_Frozen):
     fallback_reason: Reason | None = None
     transitioned: bool
     recovery_healthy_since_mono_ms: int | None = Field(default=None, ge=0)
+    fallback_transitions_in_window: int = Field(default=0, ge=0)
+    demotion_recommended: bool = False
 
     @property
     def active_controller(self) -> ControllerKind:
@@ -102,6 +113,8 @@ class ControllerSelection(_Frozen):
                 if self.fallback_reason is None
                 else self.fallback_reason.model_dump(mode="json")
             ),
+            "fallback_transitions_in_window": self.fallback_transitions_in_window,
+            "demotion_recommended": self.demotion_recommended,
         }
 
 
@@ -121,6 +134,17 @@ class ControllerGate:
         self._last_requested: PerZone[ZoneRequest] | None = None
         self._healthy_since_mono_ms: int | None = None
         self._last_mono_ms: int | None = None
+        self._operating_mode = OperatingMode.AUTO
+        self._fallback_transitions_mono_ms: deque[int] = deque()
+
+    def set_operating_mode(self, operating_mode: OperatingMode, *, now_mono_ms: int) -> None:
+        """人が変えるmodeを観測し、MANUAL / CALIBRATIONとの往復でGate状態を捨てる。
+
+        #74 はGateを呼ばず人のrequestedを使うmodeでも、このmethodで遷移を通知する。
+        AUTOとMAXは同じ基礎controllerを評価するため、その2 mode間では状態を保つ。
+        """
+        self._check_monotonic(now_mono_ms)
+        self._observe_mode(operating_mode)
 
     def select(
         self,
@@ -132,15 +156,12 @@ class ControllerGate:
         safety_state: SafetyState,
     ) -> ControllerSelection:
         """この tick の制御器を選ぶ。安全でない側への復帰だけ hold する。"""
-        self._check_inputs(now_mono_ms, fallback, operating_mode)
+        self._check_inputs(now_mono_ms, fallback)
+        self._observe_mode(operating_mode)
         previous_controller = self._active_controller
 
-        if operating_mode is OperatingMode.MAX:
-            # MAX は requested の値ではなく #78 の forced_max override。ControlState は
-            # override の下で動く制御器を追跡するため、ここでは Fallback を返す
-            # （0028 §2.4 / §2.5 (a)）。Hardware は EffectiveZoneDemand しか受け取らない。
-            self._healthy_since_mono_ms = None
-            return self._remember(fallback, None, previous_controller)
+        if operating_mode in {OperatingMode.MANUAL, OperatingMode.CALIBRATION}:
+            raise ValueError("MANUAL / CALIBRATION の requested は Controller Gate が選ばない")
 
         if self._policy.authority_stage is AuthorityStage.SHADOW:
             self._healthy_since_mono_ms = None
@@ -188,8 +209,10 @@ class ControllerGate:
             return self._reason(FallbackCause.SAFETY_NOT_NORMAL, f"state={safety_state.value}")
         if not learned.supervisor_available:
             return self._reason(FallbackCause.SUPERVISOR_FAILURE)
-        if not learned.model_loaded:
+        if learned.failure is LearnedFailure.MODEL_LOAD_FAILURE:
             return self._reason(FallbackCause.MODEL_LOAD_FAILURE)
+        if learned.failure is LearnedFailure.OPTIMIZER_EXCEPTION:
+            return self._reason(FallbackCause.OPTIMIZER_EXCEPTION)
         proposal = learned.proposal
         if proposal is None:
             return self._reason(FallbackCause.LEARNED_PROPOSAL_UNAVAILABLE)
@@ -213,15 +236,25 @@ class ControllerGate:
         if proposal.ood:
             return self._reason(FallbackCause.OOD)
         assert proposal.confidence is not None
-        if proposal.confidence < self._policy.gate_min_confidence.value:
+        required_confidence = self._required_confidence()
+        if proposal.confidence < required_confidence:
             return self._reason(
                 FallbackCause.LOW_CONFIDENCE,
                 (
                     f"confidence={proposal.confidence:.6f}; "
-                    f"required={self._policy.gate_min_confidence.value:.6f}"
+                    f"required={required_confidence:.6f}; "
+                    f"stage={self._policy.authority_stage.value}"
                 ),
             )
         return None
+
+    def _required_confidence(self) -> float:
+        thresholds = self._policy.gate_min_confidence
+        return {
+            AuthorityStage.LIMITED: thresholds.limited.value,
+            AuthorityStage.EXPANDED: thresholds.expanded.value,
+            AuthorityStage.FULL: thresholds.full.value,
+        }[self._policy.authority_stage]
 
     def _apply_authority(
         self,
@@ -317,6 +350,17 @@ class ControllerGate:
         fallback_reason: Reason | None,
         previous_controller: ControllerKind | None,
     ) -> ControllerSelection:
+        assert self._last_mono_ms is not None
+        if (
+            previous_controller is ControllerKind.LEARNED_MPC
+            and proposal.controller is ControllerKind.FALLBACK
+        ):
+            self._fallback_transitions_mono_ms.append(self._last_mono_ms)
+        cutoff = self._last_mono_ms - self._policy.demote_window_ms
+        while self._fallback_transitions_mono_ms and self._fallback_transitions_mono_ms[0] < cutoff:
+            self._fallback_transitions_mono_ms.popleft()
+        transition_count = len(self._fallback_transitions_mono_ms)
+
         self._active_controller = proposal.controller
         self._last_requested = proposal.requested
         return ControllerSelection(
@@ -326,23 +370,36 @@ class ControllerGate:
                 previous_controller is not None and previous_controller is not proposal.controller
             ),
             recovery_healthy_since_mono_ms=self._healthy_since_mono_ms,
+            fallback_transitions_in_window=transition_count,
+            # #92 がこのsignalを受けてSHADOW降格を永続化する。Gateは設定を変更しない。
+            demotion_recommended=transition_count >= self._policy.demote_after,
         )
 
     def _check_inputs(
         self,
         now_mono_ms: int,
         fallback: ControllerProposal,
-        operating_mode: OperatingMode,
     ) -> None:
+        self._check_monotonic(now_mono_ms)
+        if fallback.controller is not ControllerKind.FALLBACK:
+            raise ValueError("fallback 引数には Fallback proposal を渡す")
+
+    def _check_monotonic(self, now_mono_ms: int) -> None:
         if now_mono_ms < 0:
             raise ValueError("Controller Gate の単調時計は負にできない")
         if self._last_mono_ms is not None and now_mono_ms < self._last_mono_ms:
             raise ValueError("Controller Gate の単調時計は巻き戻せない")
         self._last_mono_ms = now_mono_ms
-        if fallback.controller is not ControllerKind.FALLBACK:
-            raise ValueError("fallback 引数には Fallback proposal を渡す")
-        if operating_mode in {OperatingMode.MANUAL, OperatingMode.CALIBRATION}:
-            raise ValueError("MANUAL / CALIBRATION の requested は Controller Gate が選ばない")
+
+    def _observe_mode(self, operating_mode: OperatingMode) -> None:
+        if operating_mode is self._operating_mode:
+            return
+        human_modes = {OperatingMode.MANUAL, OperatingMode.CALIBRATION}
+        if self._operating_mode in human_modes or operating_mode in human_modes:
+            self._active_controller = None
+            self._last_requested = None
+            self._healthy_since_mono_ms = None
+        self._operating_mode = operating_mode
 
     @staticmethod
     def _reason(cause: FallbackCause, detail: str = "") -> Reason:

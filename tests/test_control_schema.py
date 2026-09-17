@@ -370,7 +370,6 @@ def test_fallback_in_shadow_needs_no_reason():
     [
         {"authority_stage": AuthorityStage.SHADOW},
         {"safety_state": SafetyState.DEGRADED},
-        {"operating_mode": OperatingMode.MAX},
     ],
 )
 def test_ml_cannot_be_active_outside_its_allowed_conditions(overrides):
@@ -388,6 +387,21 @@ def test_ml_cannot_be_active_outside_its_allowed_conditions(overrides):
             model_confidence=0.9,
             model_ood=False,
         )
+
+
+def test_max_records_the_underlying_auto_controller_while_safety_forces_max():
+    state = ControlState(
+        operating_mode=OperatingMode.MAX,
+        authority_stage=AuthorityStage.LIMITED,
+        safety_state=SafetyState.NORMAL,
+        active_controller=ControllerKind.LEARNED_MPC,
+        fallback_active=False,
+        model_version="thermal-v1",
+        model_confidence=0.9,
+        model_ood=False,
+    )
+
+    assert state.active_controller is ControllerKind.LEARNED_MPC
 
 
 def test_fallback_while_ml_was_allowed_must_say_why():

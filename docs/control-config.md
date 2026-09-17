@@ -28,6 +28,13 @@ T_SENSORのstale判定を持たず、`true` にするには `confirmed` と承�
 `fallback_dynamics` に置く。温度・Powerのcurveを含め、実機で未確認の値をコード側の
 既定値で補わない。旧versionを新しい意味で黙って解釈せず、version 1 は読み込み時に拒否する。
 Power signalが未設定またはstale / missingならfeed-forward項だけを外し、温度feedbackを続ける。
+Fallback Controllerの生成時に、temperature入力がMetric Catalog上の`C`、Power入力が`W`で
+あることも検証し、名前が正しくても単位が異なるpolicyは起動前に拒否する。
+
+`gate_min_confidence` は `limited` / `expanded` / `full` ごとに持ち、高いauthority stageほど
+低いconfidenceで動かせないよう `limited <= expanded <= full` を検証する。ML→Fallbackの
+切替回数が `demote_window_ms` 内で `demote_after` に達した場合、Gateは降格推奨をtraceへ出す。
+設定上のstageを`SHADOW`へ変更・永続化する責務は #92 に残す。
 
 v1 は設定の live reload を行わない。設定変更は候補全体を別オブジェクトで検証したうえで
 **次回再起動時**にだけ反映する。これにより、変更後の設定も必ず `STARTUP` の Max を通る。

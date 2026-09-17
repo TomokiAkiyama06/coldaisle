@@ -19,6 +19,7 @@ from coldaisle.control.schema import (
     ZoneRequest,
 )
 from coldaisle.control.state import ControlStateSnapshot, SnapshotSignal
+from coldaisle.metrics import MetricCatalog
 
 
 class FallbackController:
@@ -30,7 +31,8 @@ class FallbackController:
     この調整を真の風量比とは扱わない。
     """
 
-    def __init__(self, policy: FanPolicyConfig) -> None:
+    def __init__(self, policy: FanPolicyConfig, catalog: MetricCatalog) -> None:
+        self._validate_metric_units(policy, catalog)
         self._policy = policy
         self._last_demand: float | None = None
         self._decrease_since_mono_ms: int | None = None
@@ -236,6 +238,26 @@ class FallbackController:
         if self._last_mono_ms is not None and monotonic_ms < self._last_mono_ms:
             raise ValueError("Fallback Controller の単調時計は巻き戻せない")
         self._last_mono_ms = monotonic_ms
+
+    @staticmethod
+    def _validate_metric_units(policy: FanPolicyConfig, catalog: MetricCatalog) -> None:
+        for zone in Zone:
+            for metric in policy.fallback_temperature_inputs.get(zone).metrics:
+                unit = catalog.unit_for(metric)
+                if unit != "C":
+                    raise ValueError(
+                        f"Fallback temperature metric は既知の温度(C)にする: "
+                        f"zone={zone.value}, metric={metric}, unit={unit}"
+                    )
+            if policy.fallback_power_feedforward is None:
+                continue
+            power_metric = policy.fallback_power_feedforward.get(zone).metric
+            unit = catalog.unit_for(power_metric)
+            if unit != "W":
+                raise ValueError(
+                    f"Fallback Power metric は既知の電力(W)にする: "
+                    f"zone={zone.value}, metric={power_metric}, unit={unit}"
+                )
 
     @staticmethod
     def _available_values(

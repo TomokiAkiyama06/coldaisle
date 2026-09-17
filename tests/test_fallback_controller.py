@@ -9,6 +9,7 @@ from coldaisle.control.fallback import (
     ControllerGate,
     FallbackController,
     LearnedControlStatus,
+    LearnedFailure,
     SnapshotStatus,
 )
 from coldaisle.control.schema import (
@@ -29,6 +30,7 @@ from coldaisle.control.state import (
     TelemetryHealth,
     TelemetryImportance,
 )
+from coldaisle.metrics import MetricCatalog, MetricMeta
 from coldaisle.store.models import Quality
 
 
@@ -41,6 +43,7 @@ def policy(
     authority: str = "full",
     recovery_hold_ms: int = 1_000,
     power_feedforward: bool = True,
+    demote_after: int = 3,
 ) -> FanPolicyConfig:
     document: dict[str, object] = {
         "schema_version": 2,
@@ -63,7 +66,11 @@ def policy(
         },
         "mpc": {"period_ms": 1_000, "budget_ms": 100, "valid_ms": 2_000},
         "supervisor": {"period_ms": 1_000, "valid_ms": 2_000},
-        "gate_min_confidence": provisional(0.7),
+        "gate_min_confidence": {
+            "limited": provisional(0.6),
+            "expanded": provisional(0.7),
+            "full": provisional(0.8),
+        },
         "authority_stage": authority,
         "authority_limits": {
             "limited": {
@@ -79,7 +86,7 @@ def policy(
         },
         "recovery_hold_ms": recovery_hold_ms,
         "demote_window_ms": 60_000,
-        "demote_after": 3,
+        "demote_after": demote_after,
     }
     if power_feedforward:
         document["fallback_power_feedforward"] = {
@@ -106,6 +113,21 @@ def policy(
             },
         }
     return FanPolicyConfig.model_validate(document)
+
+
+def catalog() -> MetricCatalog:
+    return MetricCatalog(
+        metrics={
+            "gpu.0.core": MetricMeta(unit="C", label="gpu"),
+            "cpu.package": MetricMeta(unit="C", label="cpu"),
+            "power.gpu.0": MetricMeta(unit="W", label="gpu power"),
+            "power.cpu.package": MetricMeta(unit="W", label="cpu power"),
+        }
+    )
+
+
+def fallback_controller(config: FanPolicyConfig | None = None) -> FallbackController:
+    return FallbackController(config or policy(), catalog())
 
 
 def signal(
@@ -204,7 +226,7 @@ def select(
 
 
 def test_temperature_feedback_power_feedforward_and_minimum_coordination() -> None:
-    controller = FallbackController(policy())
+    controller = fallback_controller()
     proposal = controller.propose(
         snapshot(
             signal("gpu.0.core", 50.0),
@@ -223,8 +245,28 @@ def test_temperature_feedback_power_feedforward_and_minimum_coordination() -> No
     assert proposal.requested.top.reason.code == "fallback_coordinated_max"
 
 
+@pytest.mark.parametrize(
+    ("metric", "unit", "match"),
+    [
+        ("gpu.0.core", "W", "temperature metric"),
+        ("power.gpu.0", "C", "Power metric"),
+    ],
+)
+def test_policy_metrics_must_exist_in_the_catalog_with_the_expected_unit(
+    metric: str,
+    unit: str,
+    match: str,
+) -> None:
+    broken = catalog().model_copy(
+        update={"metrics": catalog().metrics | {metric: MetricMeta(unit=unit, label="wrong unit")}}
+    )
+
+    with pytest.raises(ValueError, match=match):
+        FallbackController(policy(), broken)
+
+
 def test_stale_or_missing_inputs_are_not_zero_filled_and_the_reason_is_logged() -> None:
-    controller = FallbackController(policy())
+    controller = fallback_controller()
     proposal = controller.propose(
         snapshot(
             signal("gpu.0.core", 50.0),
@@ -242,7 +284,7 @@ def test_stale_or_missing_inputs_are_not_zero_filled_and_the_reason_is_logged() 
 
 
 def test_missing_power_uses_temperature_only_and_records_disabled_feedforward() -> None:
-    proposal = FallbackController(policy()).propose(
+    proposal = fallback_controller().propose(
         snapshot(
             signal("gpu.0.core", 50.0),
             signal("cpu.package", 50.0),
@@ -254,7 +296,7 @@ def test_missing_power_uses_temperature_only_and_records_disabled_feedforward() 
 
 
 def test_power_degradation_remains_visible_when_coordination_raises_the_zone() -> None:
-    proposal = FallbackController(policy()).propose(
+    proposal = fallback_controller().propose(
         snapshot(
             signal("gpu.0.core", 20.0),
             signal("cpu.package", 80.0),
@@ -266,7 +308,7 @@ def test_power_degradation_remains_visible_when_coordination_raises_the_zone() -
 
 
 def test_ramp_up_is_immediate_and_decrease_waits_for_hysteresis_hold() -> None:
-    controller = FallbackController(policy(power_feedforward=False))
+    controller = fallback_controller(policy(power_feedforward=False))
     low = controller.propose(
         snapshot(signal("gpu.0.core", 20.0), signal("cpu.package", 20.0), mono=0)
     )
@@ -288,7 +330,7 @@ def test_ramp_up_is_immediate_and_decrease_waits_for_hysteresis_hold() -> None:
 
 
 def test_small_decrease_inside_hysteresis_is_held_without_starting_a_timer() -> None:
-    controller = FallbackController(policy(power_feedforward=False))
+    controller = fallback_controller(policy(power_feedforward=False))
     baseline = controller.propose(
         snapshot(signal("gpu.0.core", 50.0), signal("cpu.package", 50.0), mono=0)
     )
@@ -302,7 +344,7 @@ def test_small_decrease_inside_hysteresis_is_held_without_starting_a_timer() -> 
 
 
 def test_snapshot_unavailable_uses_configured_conservative_endpoint_without_decreasing() -> None:
-    controller = FallbackController(policy(power_feedforward=False))
+    controller = fallback_controller(policy(power_feedforward=False))
     hot = controller.propose(
         snapshot(signal("gpu.0.core", 80.0), signal("cpu.package", 80.0), mono=0)
     )
@@ -320,8 +362,8 @@ def test_mock_replay_is_deterministic() -> None:
         snapshot(signal("gpu.0.core", 30.0), signal("cpu.package", 30.0), tick=4, mono=4_000),
     )
 
-    first_controller = FallbackController(policy(power_feedforward=False))
-    second_controller = FallbackController(policy(power_feedforward=False))
+    first_controller = fallback_controller(policy(power_feedforward=False))
+    second_controller = fallback_controller(policy(power_feedforward=False))
     first = [first_controller.propose(item).model_dump() for item in replay]
     second = [second_controller.propose(item).model_dump() for item in replay]
 
@@ -368,7 +410,16 @@ def test_switch_to_fallback_is_immediate_and_does_not_lower_requested_demand() -
 @pytest.mark.parametrize(
     ("status", "now", "expected"),
     [
-        (LearnedControlStatus(model_loaded=False), 0, "model_load_failure"),
+        (
+            LearnedControlStatus(failure=LearnedFailure.MODEL_LOAD_FAILURE),
+            0,
+            "model_load_failure",
+        ),
+        (
+            LearnedControlStatus(failure=LearnedFailure.OPTIMIZER_EXCEPTION),
+            0,
+            "optimizer_exception",
+        ),
         (
             healthy_status(proposal=learned_proposal(optimizer=OptimizerStatus.TIMEOUT)),
             0,
@@ -449,6 +500,72 @@ def test_limited_authority_is_bounded_around_fallback_and_by_zone() -> None:
     assert selected.proposal.requested.top.demand == 0.4
 
 
+@pytest.mark.parametrize(
+    ("stage", "threshold"),
+    [
+        (AuthorityStage.LIMITED, 0.6),
+        (AuthorityStage.EXPANDED, 0.7),
+        (AuthorityStage.FULL, 0.8),
+    ],
+)
+def test_confidence_boundary_is_selected_by_authority_stage(
+    stage: AuthorityStage,
+    threshold: float,
+) -> None:
+    accepted_gate = ControllerGate(
+        policy(authority=stage.value, recovery_hold_ms=1),
+        expected_model_version="thermal-v1",
+    )
+    select(
+        accepted_gate,
+        now=0,
+        learned=healthy_status(proposal=learned_proposal(confidence=threshold)),
+    )
+    accepted = select(
+        accepted_gate,
+        now=1,
+        learned=healthy_status(received=1, proposal=learned_proposal(confidence=threshold)),
+    )
+    assert accepted.active_controller is ControllerKind.LEARNED_MPC
+
+    rejected_gate = ControllerGate(
+        policy(authority=stage.value, recovery_hold_ms=1),
+        expected_model_version="thermal-v1",
+    )
+    rejected = select(
+        rejected_gate,
+        now=0,
+        learned=healthy_status(proposal=learned_proposal(confidence=threshold - 0.01)),
+    )
+    assert rejected.fallback_reason.code == "low_confidence"
+    assert f"stage={stage.value}" in rejected.fallback_reason.detail
+
+
+def test_repeated_ml_to_fallback_transitions_emit_a_demotion_signal_for_issue_92() -> None:
+    gate = ControllerGate(
+        policy(recovery_hold_ms=1, demote_after=3),
+        expected_model_version="thermal-v1",
+    )
+    bad = learned_proposal(confidence=0.1)
+
+    select(gate, now=0)
+    select(gate, now=1)
+    first = select(gate, now=2, learned=healthy_status(received=2, proposal=bad))
+    select(gate, now=3)
+    select(gate, now=4)
+    second = select(gate, now=5, learned=healthy_status(received=5, proposal=bad))
+    select(gate, now=6)
+    select(gate, now=7)
+    third = select(gate, now=8, learned=healthy_status(received=8, proposal=bad))
+
+    assert first.fallback_transitions_in_window == 1
+    assert second.fallback_transitions_in_window == 2
+    assert not second.demotion_recommended
+    assert third.fallback_transitions_in_window == 3
+    assert third.demotion_recommended
+    assert third.trace_metadata()["demotion_recommended"] is True
+
+
 def test_gate_does_not_own_manual_or_calibration_requests() -> None:
     gate = ControllerGate(policy(), expected_model_version="thermal-v1")
     with pytest.raises(ValueError, match="MANUAL"):
@@ -461,17 +578,50 @@ def test_gate_does_not_own_manual_or_calibration_requests() -> None:
         )
 
 
-def test_max_mode_keeps_fallback_as_the_underlying_controller_not_as_the_override() -> None:
-    """MAX は #78 forced_max。Gate が requested=1.0 を偽装してSafetyを迂回しない。"""
-    gate = ControllerGate(policy(), expected_model_version="thermal-v1")
-    decision = gate.select(
+def test_manual_round_trip_resets_learned_state_and_requires_recovery_hold_again() -> None:
+    gate = ControllerGate(policy(recovery_hold_ms=1_000), expected_model_version="thermal-v1")
+    select(gate, now=0)
+    assert select(gate, now=1_000).active_controller is ControllerKind.LEARNED_MPC
+
+    gate.set_operating_mode(OperatingMode.MANUAL, now_mono_ms=1_001)
+    gate.set_operating_mode(OperatingMode.AUTO, now_mono_ms=2_000)
+    returned = select(gate, now=2_000)
+
+    assert returned.active_controller is ControllerKind.FALLBACK
+    assert returned.fallback_reason.code == "ml_recovery_hold"
+    assert select(gate, now=3_000).active_controller is ControllerKind.LEARNED_MPC
+
+
+def test_max_mode_keeps_evaluating_the_underlying_auto_controller() -> None:
+    """MAXの実Fanは#78 forced_max。Gateは下のcontrollerをrequestedに記録する。"""
+    gate = ControllerGate(
+        policy(recovery_hold_ms=1),
+        expected_model_version="thermal-v1",
+    )
+    warming = gate.select(
         now_mono_ms=0,
         fallback=fallback_proposal(0.2),
         learned=healthy_status(),
         operating_mode=OperatingMode.MAX,
         safety_state=SafetyState.NORMAL,
     )
+    active = gate.select(
+        now_mono_ms=1,
+        fallback=fallback_proposal(0.2),
+        learned=healthy_status(received=1, proposal=learned_proposal(0.9)),
+        operating_mode=OperatingMode.MAX,
+        safety_state=SafetyState.NORMAL,
+    )
+    returned = gate.select(
+        now_mono_ms=2,
+        fallback=fallback_proposal(0.2),
+        learned=healthy_status(received=2, proposal=learned_proposal(0.9)),
+        operating_mode=OperatingMode.AUTO,
+        safety_state=SafetyState.NORMAL,
+    )
 
-    assert decision.active_controller is ControllerKind.FALLBACK
-    assert decision.proposal.requested.front.demand == 0.2
-    assert decision.fallback_reason is None
+    assert warming.active_controller is ControllerKind.FALLBACK
+    assert warming.fallback_reason.code == "ml_recovery_hold"
+    assert active.active_controller is ControllerKind.LEARNED_MPC
+    assert active.proposal.requested.front.demand == 0.9
+    assert returned.active_controller is ControllerKind.LEARNED_MPC

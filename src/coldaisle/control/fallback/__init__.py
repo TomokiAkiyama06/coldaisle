@@ -6,6 +6,7 @@ from coldaisle.control.fallback.gate import (
     ControllerSelection,
     FallbackCause,
     LearnedControlStatus,
+    LearnedFailure,
     SnapshotStatus,
 )
 
@@ -15,5 +16,6 @@ __all__ = [
     "FallbackCause",
     "FallbackController",
     "LearnedControlStatus",
+    "LearnedFailure",
     "SnapshotStatus",
 ]
