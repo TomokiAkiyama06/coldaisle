@@ -16,6 +16,7 @@ CSV はローカル時刻でオフセットを持たない（決定記録 0008 �
 from __future__ import annotations
 
 import csv
+import hashlib
 import logging
 import time
 from collections.abc import Callable, Iterator
@@ -81,6 +82,23 @@ def csv_files(path: Path) -> list[Path]:
     return [path]
 
 
+def replay_sha256(path: Path) -> str:
+    """Replay対象のbasename・file境界・内容を順序付きでhashする。"""
+    return _csv_files_sha256(csv_files(path))
+
+
+def _csv_files_sha256(files: list[Path]) -> str:
+    digest = hashlib.sha256()
+    for csv_path in files:
+        encoded_name = csv_path.name.encode("utf-8")
+        content = csv_path.read_bytes()
+        digest.update(len(encoded_name).to_bytes(8, "big"))
+        digest.update(encoded_name)
+        digest.update(len(content).to_bytes(8, "big"))
+        digest.update(content)
+    return digest.hexdigest()
+
+
 class ReplaySource:
     """CSV から `RawMessage` を流す `Source` 実装（FR-101）。
 
@@ -117,11 +135,17 @@ class ReplaySource:
         self.dropped_rows = 0
         """時刻として読めずに捨てた行数。完全な再生かどうかの判断に使う。"""
         self._clock = SimulatedClock(self._first_timestamp_ms())
+        self._source_sha256 = _csv_files_sha256(self._files)
 
     @property
     def clock(self) -> SimulatedClock:
         """CSV の時刻で進む時計。取り込みと保存はこれを共有する（#42）。"""
         return self._clock
+
+    @property
+    def source_sha256(self) -> str:
+        """DB provenanceへ保存するReplay入力全体のSHA-256。"""
+        return self._source_sha256
 
     @property
     def hello(self) -> RawHello:

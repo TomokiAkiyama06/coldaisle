@@ -9,6 +9,7 @@ window / sampling period / horizon / target alignment tolerance は実測で決�
 
 from __future__ import annotations
 
+import hashlib
 from enum import StrEnum
 from typing import Annotated, Literal, Self
 
@@ -27,6 +28,8 @@ DATASET_SCHEMA_VERSION: Literal[1] = 1
 """Thermal dataset schema の版。フィールドの意味を変えたら上げる。"""
 
 MetricName = Annotated[str, Field(pattern=r"^[a-z][a-z0-9_]*(\.[a-z0-9_]+){1,3}$")]
+RunAlias = Annotated[str, Field(pattern=r"^run-[0-9a-f]{32}$")]
+SourceAlias = Annotated[str, Field(pattern=r"^source-[0-9a-f]{32}$")]
 
 
 class _Frozen(BaseModel):
@@ -86,25 +89,21 @@ class DatasetSpec(_Frozen):
 class SourceRun(_Frozen):
     """元データを一意に追跡するrun。
 
-    ``source_refs`` はファイル名や運転計画IDなどの公開可能な論理名だけを持つ。
-    ホストの絶対パスや実機識別子を artifact へ漏らさない。
+    ``run_id`` / ``source_refs`` は利用者が払い出した公開用の不透明aliasだけを持つ。
+    ファイル名、hostname、IP address、ROM code等の実機識別子はartifactへ入れない。
     """
 
-    run_id: str = Field(pattern=r"^[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}$")
+    run_id: RunAlias
     kind: DatasetSourceKind
     start_ms: int = Field(ge=0)
     end_ms: int = Field(gt=0)
-    source_refs: tuple[str, ...] = Field(min_length=1)
+    source_refs: tuple[SourceAlias, ...] = Field(min_length=1)
     source_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
 
     @model_validator(mode="after")
     def _valid_range_and_refs(self) -> Self:
         if self.end_ms <= self.start_ms:
             raise ValueError("source run の end_ms は start_ms より後でなければならない")
-        if any(
-            not ref or ref.startswith("~") or "/" in ref or "\\" in ref for ref in self.source_refs
-        ):
-            raise ValueError("source_refs にはパス区切り・ホーム表現・空文字列を入れない")
         if len(set(self.source_refs)) != len(self.source_refs):
             raise ValueError("source_refs が重複している")
         return self
@@ -143,7 +142,9 @@ class WindowFrame(_Frozen):
                 continue
             if quality is None:
                 raise ValueError("観測時刻を持つcellにはqualityが要る")
-            if missing != (value is None or quality is Quality.MISSING):
+            if (value is None) != (quality is Quality.MISSING):
+                raise ValueError("window cellのvalueとquality=missingが一致しない")
+            if missing != (quality is Quality.MISSING):
                 raise ValueError("window cellのmissing_maskがvalue/qualityと一致しない")
             if quality is Quality.STALE and not stale:
                 raise ValueError("quality=staleのcellはstale_maskを立てる")
@@ -175,7 +176,9 @@ class TargetFrame(_Frozen):
                 continue
             if quality is None:
                 raise ValueError("観測時刻を持つtargetにはqualityが要る")
-            if missing != (value is None or quality is Quality.MISSING):
+            if (value is None) != (quality is Quality.MISSING):
+                raise ValueError("target cellのvalueとquality=missingが一致しない")
+            if missing != (quality is Quality.MISSING):
                 raise ValueError("target cellのmissing_maskがvalue/qualityと一致しない")
         return self
 
@@ -259,6 +262,16 @@ class DatasetExample(_Frozen):
         return self
 
 
+def examples_jsonl_bytes(examples: tuple[DatasetExample, ...]) -> bytes:
+    """v1 artifactのcanonicalなexamples JSON Lines表現。"""
+    return b"".join((example.model_dump_json() + "\n").encode() for example in examples)
+
+
+def examples_sha256(examples: tuple[DatasetExample, ...]) -> str:
+    """manifestへ保存するcanonical examplesのSHA-256。"""
+    return hashlib.sha256(examples_jsonl_bytes(examples)).hexdigest()
+
+
 class DatasetManifest(_Frozen):
     """artifact 全体の再生成条件。"""
 
@@ -268,6 +281,7 @@ class DatasetManifest(_Frozen):
     source_runs: tuple[SourceRun, ...] = Field(min_length=1)
     telemetry_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     control_trace_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    examples_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     example_count: int = Field(ge=0)
 
 
@@ -320,7 +334,11 @@ class ThermalDataset(_Frozen):
             ):
                 raise ValueError("label_endがtarget探索範囲と一致しない")
             for frame in example.window:
+                if not run.start_ms <= frame.ts_ms < run.end_ms:
+                    raise ValueError("window frameがsource runの期間外にある")
                 for metric, source_ts in frame.source_ts_ms.items():
+                    if source_ts is not None and not run.start_ms <= source_ts < run.end_ms:
+                        raise ValueError("window観測時刻がsource runの期間外にある")
                     quality = frame.quality[metric]
                     expected_stale = source_ts is not None and (
                         quality is Quality.STALE or frame.ts_ms - source_ts >= spec.stale_after_ms
@@ -337,12 +355,17 @@ class ThermalDataset(_Frozen):
                 if any(set(mapping) != expected_features for mapping in mappings):
                     raise ValueError("window frame のmetric集合がspecと一致しない")
             for target in example.targets:
+                if not run.start_ms <= target.expected_ts_ms < run.end_ms:
+                    raise ValueError("target期待時刻がsource runの期間外にある")
                 if any(
                     source_ts is not None
-                    and abs(source_ts - target.expected_ts_ms) > spec.target_tolerance_ms
+                    and (
+                        not run.start_ms <= source_ts < run.end_ms
+                        or abs(source_ts - target.expected_ts_ms) > spec.target_tolerance_ms
+                    )
                     for source_ts in target.source_ts_ms.values()
                 ):
-                    raise ValueError("target観測が許容時刻差の外にある")
+                    raise ValueError("target観測がrun期間または許容時刻差の外にある")
                 target_mappings = (
                     target.values,
                     target.source_ts_ms,
@@ -351,6 +374,24 @@ class ThermalDataset(_Frozen):
                 )
                 if any(set(mapping) != expected_targets for mapping in target_mappings):
                     raise ValueError("target frame のmetric集合がspecと一致しない")
+            for metric in expected_features:
+                source_times = tuple(
+                    source_ts
+                    for frame in example.window
+                    if (source_ts := frame.source_ts_ms[metric]) is not None
+                )
+                if tuple(sorted(source_times)) != source_times:
+                    raise ValueError("window観測時刻がmetric内で逆行している")
+            for metric in expected_targets:
+                target_times = tuple(
+                    source_ts
+                    for target in example.targets
+                    if (source_ts := target.source_ts_ms[metric]) is not None
+                )
+                if tuple(sorted(target_times)) != target_times:
+                    raise ValueError("target観測時刻がmetric内で逆行している")
+        if self.manifest.examples_sha256 != examples_sha256(self.examples):
+            raise ValueError("manifest の examples_sha256 と実データが一致しない")
         return self
 
 

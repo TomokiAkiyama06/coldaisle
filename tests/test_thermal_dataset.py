@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import json
+import os
+import sqlite3
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import pytest
 from pydantic import ValidationError
 
+import coldaisle.dataset as dataset_module
 from coldaisle.control import ControlTick, ControlTraceLogger
 from coldaisle.control.model.dataset import (
     DatasetSourceKind,
@@ -26,6 +29,10 @@ from coldaisle.store import Quality, Reading, Sample, SqliteStore
 
 CONTROL_FIXTURE = Path(__file__).resolve().parent / "fixtures" / "control_tick_v1.json"
 SHA256 = "a" * 64
+RUN_ALIAS = "run-00000000000000000000000000000001"
+SOURCE_ALIAS = "source-00000000000000000000000000000001"
+ARTIFACT_ONE = "dataset-00000000000000000000000000000001"
+ARTIFACT_TWO = "dataset-00000000000000000000000000000002"
 
 
 def spec() -> DatasetSpec:
@@ -43,11 +50,11 @@ def spec() -> DatasetSpec:
 
 def source_run(*, start_ms: int = 0, end_ms: int = 12_000) -> SourceRun:
     return SourceRun(
-        run_id="replay-run-001",
+        run_id=RUN_ALIAS,
         kind=DatasetSourceKind.REPLAY,
         start_ms=start_ms,
         end_ms=end_ms,
-        source_refs=("sensors_example.csv",),
+        source_refs=(SOURCE_ALIAS,),
         source_sha256=SHA256,
     )
 
@@ -74,6 +81,13 @@ def reading_sample(ts_ms: int, **values: float | None) -> Sample:
 @pytest.fixture
 def dataset_store(tmp_path, rules, clock):
     with SqliteStore(tmp_path / "dataset.db", rules=rules, clock=clock) as store:
+        store.set_system_state("sys.ingest_source", "replay", at_ms=0)
+        store.bind_dataset_source_run(
+            run_alias=RUN_ALIAS,
+            source_kind="replay",
+            source_sha256=SHA256,
+            at_ms=0,
+        )
         store.insert_samples(
             (
                 reading_sample(
@@ -94,7 +108,7 @@ def test_window_action_and_multi_horizon_targets_share_the_time_base(dataset_sto
     dataset = ThermalDatasetBuilder(dataset_store).build(source_run=source_run(), spec=spec())
 
     assert dataset.manifest.schema_version == 1
-    assert dataset.manifest.source_runs[0].run_id == "replay-run-001"
+    assert dataset.manifest.source_runs[0].run_id == RUN_ALIAS
     assert len(dataset.manifest.telemetry_sha256) == 64
     assert len(dataset.manifest.control_trace_sha256) == 64
     example = dataset.examples[0]
@@ -160,6 +174,28 @@ def test_corrupt_masks_and_regime_context_are_rejected_when_loading_artifact(dat
     with pytest.raises(ValidationError, match="workload_regime"):
         ThermalDataset.model_validate_json(json.dumps(unknown_regime))
 
+    value_with_missing_quality = dataset.model_dump(mode="json")
+    value_with_missing_quality["examples"][0]["window"][1]["values"]["air.gpu_intake"] = 42.0
+    with pytest.raises(ValidationError, match="valueとquality=missing"):
+        ThermalDataset.model_validate_json(json.dumps(value_with_missing_quality))
+
+    missing_value_with_ok_quality = dataset.model_dump(mode="json")
+    missing_value_with_ok_quality["examples"][0]["targets"][0]["values"]["air.gpu_exhaust"] = None
+    with pytest.raises(ValidationError, match="valueとquality=missing"):
+        ThermalDataset.model_validate_json(json.dumps(missing_value_with_ok_quality))
+
+    outside_run = dataset.model_dump(mode="json")
+    outside_run["examples"][0]["window"][0]["source_ts_ms"]["air.room"] = -1
+    outside_run["examples"][0]["window"][0]["stale_mask"]["air.room"] = True
+    with pytest.raises(ValidationError, match="source runの期間外"):
+        ThermalDataset.model_validate_json(json.dumps(outside_run))
+
+    reversed_metric_time = dataset.model_dump(mode="json")
+    reversed_metric_time["examples"][0]["window"][3]["source_ts_ms"]["air.room"] = 1_000
+    reversed_metric_time["examples"][0]["window"][3]["stale_mask"]["air.room"] = True
+    with pytest.raises(ValidationError, match="逆行"):
+        ThermalDataset.model_validate_json(json.dumps(reversed_metric_time))
+
 
 def test_dataset_spec_has_no_window_or_horizon_defaults():
     with pytest.raises(ValidationError, match="window_ms"):
@@ -189,13 +225,34 @@ def test_dataset_spec_rejects_ambiguous_shapes(updates, match):
 
 
 def test_source_run_rejects_host_paths_and_tracks_a_digest():
-    with pytest.raises(ValidationError, match="パス区切り"):
+    with pytest.raises(ValidationError):
         SourceRun(
-            run_id="bad",
+            run_id=RUN_ALIAS,
             kind=DatasetSourceKind.REPLAY,
             start_ms=0,
             end_ms=1,
             source_refs=("/example/private.csv",),
+            source_sha256=SHA256,
+        )
+
+
+@pytest.mark.parametrize(
+    ("run_alias", "source_alias"),
+    [
+        ("coldaisle-rpi-01", SOURCE_ALIAS),
+        (RUN_ALIAS, ".".join(("192", "0", "2", "1"))),
+        (RUN_ALIAS, "28-00000abcdef0"),
+        (RUN_ALIAS, ":".join(("aa", "bb", "cc", "dd", "ee", "ff"))),
+    ],
+)
+def test_source_run_accepts_only_opaque_public_aliases(run_alias, source_alias):
+    with pytest.raises(ValidationError):
+        SourceRun(
+            run_id=run_alias,
+            kind=DatasetSourceKind.REPLAY,
+            start_ms=0,
+            end_ms=1,
+            source_refs=(source_alias,),
             source_sha256=SHA256,
         )
 
@@ -257,15 +314,266 @@ def test_temporal_split_purges_examples_whose_window_or_label_crosses_a_boundary
     assert split.purged == (examples[1], examples[3])
 
 
+def test_builder_rejects_a_database_reused_outside_the_source_run(dataset_store):
+    dataset_store.insert_sample(reading_sample(12_000, **{"air.room": 99.0}))
+
+    with pytest.raises(ValueError, match="専用DB"):
+        ThermalDatasetBuilder(dataset_store).build(source_run=source_run(), spec=spec())
+
+
+def test_builder_rejects_mixed_ingest_source_provenance(dataset_store):
+    dataset_store.set_system_state("sys.ingest_source", "serial", at_ms=1)
+
+    with pytest.raises(ValueError, match="ingest source"):
+        ThermalDatasetBuilder(dataset_store).build(source_run=source_run(), spec=spec())
+
+
+def test_builder_binds_replay_source_hash_to_database_provenance(dataset_store):
+    mismatched = source_run().model_copy(update={"source_sha256": "b" * 64})
+
+    with pytest.raises(ValueError, match="immutable provenance"):
+        ThermalDatasetBuilder(dataset_store).build(source_run=mismatched, spec=spec())
+
+
+def test_dataset_source_run_binding_is_immutable_even_at_the_same_timestamp(dataset_store):
+    with pytest.raises(ValueError, match="既に別のsource run"):
+        dataset_store.bind_dataset_source_run(
+            run_alias="run-00000000000000000000000000000002",
+            source_kind="replay",
+            source_sha256="b" * 64,
+            at_ms=0,
+        )
+
+    with pytest.raises(sqlite3.IntegrityError, match="immutable"):
+        dataset_store.connection.execute(
+            "UPDATE dataset_source_run SET source_sha256 = ? WHERE singleton = 1",
+            ("b" * 64,),
+        )
+
+
+def test_dataset_source_run_must_bind_before_any_source_rows(tmp_path, rules, clock):
+    with SqliteStore(tmp_path / "already-used.db", rules=rules, clock=clock) as store:
+        store.insert_sample(reading_sample(0, **{"air.room": 20.0}))
+        with pytest.raises(ValueError, match="空の専用DB"):
+            store.bind_dataset_source_run(
+                run_alias=RUN_ALIAS,
+                source_kind="replay",
+                source_sha256=SHA256,
+                at_ms=0,
+            )
+
+
+def test_bound_dataset_database_rejects_daemon_without_run_alias(dataset_store, tmp_path, rules):
+    csv_path = tmp_path / "second-replay.csv"
+    csv_path.write_text(
+        "timestamp,room_temp\n1970-01-01T00:00:00,99\n",
+        encoding="utf-8",
+    )
+    replay = ReplaySource(csv_path, tz=ZoneInfo("UTC"), bulk=True)
+    daemon = Daemon(
+        source=replay,
+        store=dataset_store,
+        normalizer=Normalizer(rules=rules, calibration=Calibration(), clock=replay.clock),
+        source_name="replay",
+    )
+
+    with pytest.raises(ValueError, match="run alias無し"):
+        daemon.run()
+
+
+def test_builder_reads_all_series_from_one_sqlite_snapshot(
+    dataset_store, rules, clock, monkeypatch
+):
+    database_path = Path(
+        dataset_store.connection.execute("PRAGMA database_list").fetchone()["file"]
+    )
+    original_series = dataset_store.series
+    injected = False
+    with SqliteStore(database_path, rules=rules, clock=clock) as writer:
+
+        def series_with_concurrent_ingest(metric, start_ms, end_ms, *, limit=None):
+            nonlocal injected
+            result = original_series(metric, start_ms, end_ms, limit=limit)
+            if not injected:
+                injected = True
+                writer.insert_sample(reading_sample(7_000, **{"air.gpu_exhaust": 99.0}))
+            return result
+
+        monkeypatch.setattr(dataset_store, "series", series_with_concurrent_ingest)
+        dataset = ThermalDatasetBuilder(dataset_store).build(source_run=source_run(), spec=spec())
+
+    assert injected is True
+    assert dataset.examples[0].targets[0].source_ts_ms["air.gpu_exhaust"] == 7_010
+    assert dataset.examples[0].targets[0].values["air.gpu_exhaust"] == pytest.approx(42.0)
+
+
 def test_artifact_writes_are_deterministic(dataset_store, tmp_path):
     dataset = ThermalDatasetBuilder(dataset_store).build(source_run=source_run(), spec=spec())
-    first = write_dataset(dataset, tmp_path / "first")
-    second = write_dataset(dataset, tmp_path / "second")
+    output_root = tmp_path / "artifacts"
+    first = write_dataset(dataset, output_root, ARTIFACT_ONE)
+    second = write_dataset(dataset, output_root, ARTIFACT_TWO)
 
     assert first[0].read_bytes() == second[0].read_bytes()
     assert first[1].read_bytes() == second[1].read_bytes()
     manifest = json.loads(first[0].read_text(encoding="utf-8"))
     assert manifest["source_runs"][0]["source_sha256"] == SHA256
+    assert (
+        manifest["examples_sha256"]
+        == dataset_module.hashlib.sha256(first[1].read_bytes()).hexdigest()
+    )
+
+
+def test_artifact_default_refuses_overwrite_and_force_replaces_only_valid_artifact(
+    dataset_store, tmp_path
+):
+    dataset = ThermalDatasetBuilder(dataset_store).build(source_run=source_run(), spec=spec())
+    output_root = tmp_path / "artifacts"
+    manifest_path, examples_path = write_dataset(dataset, output_root, ARTIFACT_ONE)
+    original = (manifest_path.read_bytes(), examples_path.read_bytes())
+
+    with pytest.raises(FileExistsError):
+        write_dataset(dataset, output_root, ARTIFACT_ONE)
+    assert (manifest_path.read_bytes(), examples_path.read_bytes()) == original
+
+    replacement = dataset.model_copy(
+        update={"manifest": dataset.manifest.model_copy(update={"telemetry_sha256": "b" * 64})}
+    )
+    write_dataset(replacement, output_root, ARTIFACT_ONE, force=True)
+    assert json.loads(manifest_path.read_text(encoding="utf-8"))["telemetry_sha256"] == "b" * 64
+
+
+def test_artifact_writer_revalidates_model_copy_updates(dataset_store, tmp_path):
+    dataset = ThermalDatasetBuilder(dataset_store).build(source_run=source_run(), spec=spec())
+    invalid = dataset.model_copy(
+        update={"manifest": dataset.manifest.model_copy(update={"example_count": 999})}
+    )
+
+    with pytest.raises(ValidationError, match="example_count"):
+        write_dataset(invalid, tmp_path / "artifacts", ARTIFACT_ONE)
+    assert not (tmp_path / "artifacts").exists()
+
+
+def test_force_refuses_corrupt_or_unknown_existing_artifact(dataset_store, tmp_path):
+    dataset = ThermalDatasetBuilder(dataset_store).build(source_run=source_run(), spec=spec())
+    output_root = tmp_path / "artifacts"
+    manifest_path, examples_path = write_dataset(dataset, output_root, ARTIFACT_ONE)
+    examples_path.write_bytes(examples_path.read_bytes() + b" ")
+    corrupt = (manifest_path.read_bytes(), examples_path.read_bytes())
+
+    with pytest.raises(ValueError, match="検証できない"):
+        write_dataset(dataset, output_root, ARTIFACT_ONE, force=True)
+    assert (manifest_path.read_bytes(), examples_path.read_bytes()) == corrupt
+
+    examples_path.write_bytes(dataset_module.examples_jsonl_bytes(dataset.examples))
+    extra = manifest_path.parent / "unexpected"
+    extra.write_text("keep", encoding="utf-8")
+    with pytest.raises(ValueError, match="だけを持つ"):
+        write_dataset(dataset, output_root, ARTIFACT_ONE, force=True)
+    assert extra.read_text(encoding="utf-8") == "keep"
+
+
+def test_artifact_publish_failure_keeps_old_version_and_removes_staging(
+    dataset_store, tmp_path, monkeypatch
+):
+    dataset = ThermalDatasetBuilder(dataset_store).build(source_run=source_run(), spec=spec())
+    output_root = tmp_path / "artifacts"
+    manifest_path, examples_path = write_dataset(dataset, output_root, ARTIFACT_ONE)
+    original = (manifest_path.read_bytes(), examples_path.read_bytes())
+
+    def fail_publish(_directory_fd, _source, _target, _flags):
+        raise OSError("injected publish failure")
+
+    monkeypatch.setattr(dataset_module, "_renameat2", fail_publish)
+    with pytest.raises(OSError, match="injected"):
+        write_dataset(dataset, output_root, ARTIFACT_TWO)
+    assert not (output_root / ARTIFACT_TWO).exists()
+    assert all(not path.name.startswith(".coldaisle-stage-") for path in output_root.iterdir())
+
+    with pytest.raises(OSError, match="injected"):
+        write_dataset(dataset, output_root, ARTIFACT_ONE, force=True)
+
+    assert (manifest_path.read_bytes(), examples_path.read_bytes()) == original
+    assert all(not path.name.startswith(".coldaisle-stage-") for path in output_root.iterdir())
+
+
+def test_atomic_no_replace_closes_the_publish_race(dataset_store, tmp_path, monkeypatch):
+    dataset = ThermalDatasetBuilder(dataset_store).build(source_run=source_run(), spec=spec())
+    output_root = tmp_path / "artifacts"
+    real_renameat2 = dataset_module._renameat2
+
+    def race_with_competing_directory(directory_fd, source, target, flags):
+        os.mkdir(target, mode=0o700, dir_fd=directory_fd)
+        real_renameat2(directory_fd, source, target, flags)
+
+    monkeypatch.setattr(dataset_module, "_renameat2", race_with_competing_directory)
+    with pytest.raises(FileExistsError):
+        write_dataset(dataset, output_root, ARTIFACT_ONE)
+
+    assert (output_root / ARTIFACT_ONE).is_dir()
+    assert list((output_root / ARTIFACT_ONE).iterdir()) == []
+    assert all(not path.name.startswith(".coldaisle-stage-") for path in output_root.iterdir())
+
+
+def test_artifact_writer_never_follows_root_final_or_component_links(dataset_store, tmp_path):
+    dataset = ThermalDatasetBuilder(dataset_store).build(source_run=source_run(), spec=spec())
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    sentinel = outside / "sentinel"
+    sentinel.write_text("unchanged", encoding="utf-8")
+
+    linked_root = tmp_path / "linked-root"
+    linked_root.symlink_to(outside, target_is_directory=True)
+    with pytest.raises(OSError):
+        write_dataset(dataset, linked_root, ARTIFACT_ONE)
+    assert sentinel.read_text(encoding="utf-8") == "unchanged"
+
+    output_root = tmp_path / "artifacts"
+    output_root.mkdir()
+    output_root.chmod(0o700)
+    (output_root / ARTIFACT_ONE).symlink_to(outside, target_is_directory=True)
+    with pytest.raises(FileExistsError):
+        write_dataset(dataset, output_root, ARTIFACT_ONE)
+    with pytest.raises(ValueError, match="symlink"):
+        write_dataset(dataset, output_root, ARTIFACT_ONE, force=True)
+    assert sentinel.read_text(encoding="utf-8") == "unchanged"
+
+
+def test_artifact_writer_rejects_fifo_without_blocking(dataset_store, tmp_path):
+    dataset = ThermalDatasetBuilder(dataset_store).build(source_run=source_run(), spec=spec())
+    output_root = tmp_path / "artifacts"
+    output_root.mkdir()
+    output_root.chmod(0o700)
+    os.mkfifo(output_root / ARTIFACT_ONE)
+
+    with pytest.raises(FileExistsError):
+        write_dataset(dataset, output_root, ARTIFACT_ONE)
+    with pytest.raises(ValueError, match="directory以外"):
+        write_dataset(dataset, output_root, ARTIFACT_ONE, force=True)
+
+
+def test_force_rejects_symlinked_artifact_component(dataset_store, tmp_path):
+    dataset = ThermalDatasetBuilder(dataset_store).build(source_run=source_run(), spec=spec())
+    output_root = tmp_path / "artifacts"
+    artifact = output_root / ARTIFACT_ONE
+    artifact.mkdir(parents=True)
+    output_root.chmod(0o700)
+    outside = tmp_path / "outside-manifest"
+    outside.write_text("do not touch", encoding="utf-8")
+    (artifact / "manifest.json").symlink_to(outside)
+    os.mkfifo(artifact / "examples.jsonl")
+
+    with pytest.raises(ValueError, match="regular file"):
+        write_dataset(dataset, output_root, ARTIFACT_ONE, force=True)
+    assert outside.read_text(encoding="utf-8") == "do not touch"
+
+    (artifact / "manifest.json").unlink()
+    (artifact / "examples.jsonl").unlink()
+    (artifact / "manifest.json").write_text(
+        dataset.manifest.model_dump_json(indent=2) + "\n", encoding="utf-8"
+    )
+    os.mkfifo(artifact / "examples.jsonl")
+    with pytest.raises(ValueError, match="regular file"):
+        write_dataset(dataset, output_root, ARTIFACT_ONE, force=True)
 
 
 def test_replay_fingerprint_depends_on_names_boundaries_and_contents(tmp_path):
@@ -274,12 +582,28 @@ def test_replay_fingerprint_depends_on_names_boundaries_and_contents(tmp_path):
     first = replay_dir / "sensors_2026-09-01.csv"
     first.write_text("timestamp,room_temp\n2026-09-01T00:00:00,20\n", encoding="utf-8")
 
-    refs_before, digest_before = replay_fingerprint(replay_dir)
+    digest_before = replay_fingerprint(replay_dir)
     first.write_text("timestamp,room_temp\n2026-09-01T00:00:00,21\n", encoding="utf-8")
-    refs_after, digest_after = replay_fingerprint(replay_dir)
+    digest_after = replay_fingerprint(replay_dir)
 
-    assert refs_before == refs_after == (first.name,)
     assert digest_before != digest_after
+
+
+def test_csv_basename_is_not_written_to_public_artifact(dataset_store, tmp_path):
+    private_name = "_".join(
+        (
+            "coldaisle-rpi-01",
+            ".".join(("192", "0", "2", "1")),
+            "-".join(("28", "00000abcdef0.csv")),
+        )
+    )
+    csv_path = tmp_path / private_name
+    csv_path.write_text("timestamp,room_temp\n1970-01-01T00:00:02,20\n", encoding="utf-8")
+    assert len(replay_fingerprint(csv_path)) == 64
+    dataset = ThermalDatasetBuilder(dataset_store).build(source_run=source_run(), spec=spec())
+    paths = write_dataset(dataset, tmp_path / "artifacts", ARTIFACT_ONE)
+
+    assert all(private_name.encode() not in path.read_bytes() for path in paths)
 
 
 def test_replay_can_regenerate_the_same_dataset_without_hardware(tmp_path, rules):
@@ -293,13 +617,13 @@ def test_replay_can_regenerate_the_same_dataset_without_hardware(tmp_path, rules
         "1970-01-01T00:00:09,23,34,44\n",
         encoding="utf-8",
     )
-    refs, digest = replay_fingerprint(csv_path)
+    digest = replay_fingerprint(csv_path)
     run = SourceRun(
-        run_id="replay-regeneration",
+        run_id=RUN_ALIAS,
         kind=DatasetSourceKind.REPLAY,
         start_ms=2_000,
         end_ms=11_000,
-        source_refs=refs,
+        source_refs=(SOURCE_ALIAS,),
         source_sha256=digest,
     )
 
@@ -311,6 +635,7 @@ def test_replay_can_regenerate_the_same_dataset_without_hardware(tmp_path, rules
                 store=store,
                 normalizer=Normalizer(rules=rules, calibration=Calibration(), clock=replay.clock),
                 source_name="replay",
+                dataset_run_alias=RUN_ALIAS,
             )
             daemon.run()
             ControlTraceLogger(store).record(fixture_tick(ts_ms=5_000))

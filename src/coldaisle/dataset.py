@@ -7,10 +7,17 @@
 from __future__ import annotations
 
 import argparse
+import ctypes
+import errno
 import hashlib
 import json
+import os
+import re
+import secrets
+import stat
 from bisect import bisect_left, bisect_right
 from collections.abc import Sequence
+from contextlib import suppress
 from pathlib import Path
 
 from pydantic import ValidationError
@@ -28,36 +35,32 @@ from coldaisle.control.model.dataset import (
     TargetFrame,
     ThermalDataset,
     WindowFrame,
+    examples_jsonl_bytes,
+    examples_sha256,
 )
 from coldaisle.control.schema import ControlTick, PerZone, Zone
-from coldaisle.ingest.replay import csv_files
+from coldaisle.ingest.replay import replay_sha256
 from coldaisle.store import Quality, QualityRules, SeriesPoint, SqliteStore
 from coldaisle.store.models import ControlTraceRecord
 
 MANIFEST_FILENAME = "manifest.json"
 EXAMPLES_FILENAME = "examples.jsonl"
+_ARTIFACT_ALIAS = re.compile(r"^dataset-[0-9a-f]{32}$")
+_DIRECTORY_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+_FILE_READ_FLAGS = os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK
+_FILE_WRITE_FLAGS = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC
+_RENAME_NOREPLACE = 1
+_RENAME_EXCHANGE = 2
 SeriesIndex = tuple[tuple[int, ...], tuple[SeriesPoint, ...]]
 
 
-def replay_fingerprint(path: Path) -> tuple[tuple[str, ...], str]:
-    """Replayが読むCSV集合の論理名とSHA-256を返す。
+def replay_fingerprint(path: Path) -> str:
+    """Replayが読むCSV集合のSHA-256を返す。
 
-    絶対パスはhashにもmanifestにも入れない。同名ファイルの順序と内容を長さ付きで
-    hashするため、ファイル境界が違う入力を同一runとして扱わない。
+    絶対パスはhashにもmanifestにも入れない。basenameはファイル境界を区別するhashの
+    入力にだけ使い、artifactには出さない。公開用source aliasは利用者が別途指定する。
     """
-    files = csv_files(path)
-    digest = hashlib.sha256()
-    refs: list[str] = []
-    for csv_path in files:
-        name = csv_path.name
-        content = csv_path.read_bytes()
-        encoded_name = name.encode("utf-8")
-        refs.append(name)
-        digest.update(len(encoded_name).to_bytes(8, "big"))
-        digest.update(encoded_name)
-        digest.update(len(content).to_bytes(8, "big"))
-        digest.update(content)
-    return tuple(refs), digest.hexdigest()
+    return replay_sha256(path)
 
 
 class ThermalDatasetBuilder:
@@ -73,30 +76,35 @@ class ThermalDatasetBuilder:
         持てない端のtickは採用しない。target観測そのものが無い場合は、行を捨てずに
         ``missing_mask`` を立てる。
         """
-        earliest_action_ms = source_run.start_ms + spec.window_ms
-        latest_label_margin_ms = spec.horizons_ms[-1] + spec.target_tolerance_ms
-        traces = self._store.control_traces(earliest_action_ms, source_run.end_ms)
-        eligible = tuple(
-            trace for trace in traces if trace.ts_ms + latest_label_margin_ms < source_run.end_ms
-        )
-        if not eligible:
-            raise ValueError("source run内に完全なwindow/targetを持つControlTickが無い")
+        with self._store.read_snapshot():
+            _validate_dedicated_source_db(self._store, source_run)
+            earliest_action_ms = source_run.start_ms + spec.window_ms
+            latest_label_margin_ms = spec.horizons_ms[-1] + spec.target_tolerance_ms
+            traces = self._store.control_traces(earliest_action_ms, source_run.end_ms)
+            eligible = tuple(
+                trace
+                for trace in traces
+                if trace.ts_ms + latest_label_margin_ms < source_run.end_ms
+            )
+            if not eligible:
+                raise ValueError("source run内に完全なwindow/targetを持つControlTickが無い")
 
-        metrics = tuple(dict.fromkeys((*spec.feature_metrics, *spec.target_metrics)))
-        points: dict[str, SeriesIndex] = {}
-        for metric in metrics:
-            metric_points = self._store.series(metric, source_run.start_ms, source_run.end_ms)
-            points[metric] = (tuple(point.ts_ms for point in metric_points), metric_points)
-        examples = tuple(
-            self._example(trace=trace, source_run=source_run, spec=spec, points=points)
-            for trace in eligible
-        )
+            metrics = tuple(dict.fromkeys((*spec.feature_metrics, *spec.target_metrics)))
+            points: dict[str, SeriesIndex] = {}
+            for metric in metrics:
+                metric_points = self._store.series(metric, source_run.start_ms, source_run.end_ms)
+                points[metric] = (tuple(point.ts_ms for point in metric_points), metric_points)
+            examples = tuple(
+                self._example(trace=trace, source_run=source_run, spec=spec, points=points)
+                for trace in eligible
+            )
         return ThermalDataset(
             manifest=DatasetManifest(
                 spec=spec,
                 source_runs=(source_run,),
                 telemetry_sha256=_telemetry_digest(metrics, points),
                 control_trace_sha256=_trace_digest(eligible),
+                examples_sha256=examples_sha256(examples),
                 example_count=len(examples),
             ),
             examples=examples,
@@ -159,6 +167,37 @@ class ThermalDatasetBuilder:
             context=context,
             targets=targets,
         )
+
+
+def _validate_dedicated_source_db(store: SqliteStore, source_run: SourceRun) -> None:
+    """1 run専用DBであることを、snapshot内の保存行とingest sourceから検証する。"""
+    connection = store.connection
+    outside_readings = int(
+        connection.execute(
+            "SELECT COUNT(*) FROM readings WHERE ts_ms < ? OR ts_ms >= ?",
+            (source_run.start_ms, source_run.end_ms),
+        ).fetchone()[0]
+    )
+    outside_traces = int(
+        connection.execute(
+            "SELECT COUNT(*) FROM control_traces WHERE ts_ms < ? OR ts_ms >= ?",
+            (source_run.start_ms, source_run.end_ms),
+        ).fetchone()[0]
+    )
+    if outside_readings or outside_traces:
+        raise ValueError("dataset生成DBはsource run期間だけを持つ専用DBでなければならない")
+    ingest_sources = tuple(
+        str(row[0])
+        for row in connection.execute(
+            "SELECT DISTINCT value FROM system_state WHERE key = 'sys.ingest_source' ORDER BY value"
+        ).fetchall()
+    )
+    if ingest_sources != (source_run.kind.value,):
+        raise ValueError("dataset生成DBのingest sourceがSourceRun.kindと一意に一致しない")
+    provenance = store.dataset_source_run()
+    expected = (source_run.run_id, source_run.kind.value, source_run.source_sha256)
+    if provenance != expected:
+        raise ValueError("SourceRunがDBのimmutable provenanceと一致しない")
 
 
 def _parse_tick(trace: ControlTraceRecord) -> tuple[ControlTick, dict[str, object]]:
@@ -344,17 +383,197 @@ def _action_zone(tick: ControlTick, zone: Zone) -> ActionZone:
     )
 
 
-def write_dataset(dataset: ThermalDataset, out_dir: Path) -> tuple[Path, Path]:
-    """manifest JSONと学習例JSON Linesを決定的な順序で書く。"""
-    out_dir.mkdir(parents=True, exist_ok=True)
-    manifest_path = out_dir / MANIFEST_FILENAME
-    examples_path = out_dir / EXAMPLES_FILENAME
-    manifest_path.write_text(dataset.manifest.model_dump_json(indent=2) + "\n", encoding="utf-8")
-    with examples_path.open("w", encoding="utf-8", newline="\n") as handle:
-        for example in dataset.examples:
-            handle.write(example.model_dump_json())
-            handle.write("\n")
-    return manifest_path, examples_path
+def _renameat2(directory_fd: int, source: str, target: str, flags: int) -> None:
+    """同じdirfd内でLinux renameat2を呼ぶ。安全でないfallbackはしない。"""
+    libc = ctypes.CDLL(None, use_errno=True)
+    renameat2 = getattr(libc, "renameat2", None)
+    if renameat2 is None:
+        raise RuntimeError("atomic artifact publishにはLinux renameat2が必要")
+    result = renameat2(
+        ctypes.c_int(directory_fd),
+        ctypes.c_char_p(os.fsencode(source)),
+        ctypes.c_int(directory_fd),
+        ctypes.c_char_p(os.fsencode(target)),
+        ctypes.c_uint(flags),
+    )
+    if result == 0:
+        return
+    error_number = ctypes.get_errno()
+    if error_number == errno.EEXIST:
+        raise FileExistsError(error_number, os.strerror(error_number), target)
+    raise OSError(error_number, os.strerror(error_number), target)
+
+
+def _open_output_root(output_root: Path) -> int:
+    """pathの各要素をsymlink非追従で開き、必要なdirectoryだけ作る。"""
+    if ".." in output_root.parts:
+        raise ValueError("output rootに '..' は使えない")
+    absolute = output_root if output_root.is_absolute() else Path.cwd() / output_root
+    directory_fd = os.open("/", _DIRECTORY_FLAGS)
+    try:
+        for component in absolute.parts[1:]:
+            if component in ("", "."):
+                continue
+            with suppress(FileExistsError):
+                os.mkdir(component, mode=0o700, dir_fd=directory_fd)
+            next_fd = os.open(component, _DIRECTORY_FLAGS, dir_fd=directory_fd)
+            os.close(directory_fd)
+            directory_fd = next_fd
+        root_stat = os.fstat(directory_fd)
+        if root_stat.st_uid != os.geteuid():
+            raise PermissionError("output rootは実行user所有でなければならない")
+        if root_stat.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+            raise PermissionError("output rootはgroup/world writableにできない")
+        return directory_fd
+    except BaseException:
+        os.close(directory_fd)
+        raise
+
+
+def _create_staging_directory(root_fd: int) -> tuple[str, int]:
+    for _attempt in range(16):
+        name = f".coldaisle-stage-{secrets.token_hex(16)}"
+        try:
+            os.mkdir(name, mode=0o700, dir_fd=root_fd)
+        except FileExistsError:
+            continue
+        return name, os.open(name, _DIRECTORY_FLAGS, dir_fd=root_fd)
+    raise FileExistsError("一意なdataset staging directoryを作れない")
+
+
+def _write_regular_file(directory_fd: int, name: str, payload: bytes) -> None:
+    file_fd = os.open(name, _FILE_WRITE_FLAGS, 0o600, dir_fd=directory_fd)
+    with os.fdopen(file_fd, "wb") as handle:
+        handle.write(payload)
+        handle.flush()
+        os.fsync(handle.fileno())
+
+
+def _read_regular_file(directory_fd: int, name: str) -> bytes:
+    path_stat = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+    if not stat.S_ISREG(path_stat.st_mode):
+        raise ValueError(f"既存artifactの{name}がregular fileではない")
+    file_fd = os.open(name, _FILE_READ_FLAGS, dir_fd=directory_fd)
+    try:
+        file_stat = os.fstat(file_fd)
+        if not stat.S_ISREG(file_stat.st_mode):
+            raise ValueError(f"既存artifactの{name}がregular fileではない")
+        with os.fdopen(file_fd, "rb", closefd=False) as handle:
+            return handle.read()
+    finally:
+        os.close(file_fd)
+
+
+def _validate_existing_artifact(directory_fd: int) -> None:
+    entries = set(os.listdir(directory_fd))
+    if entries != {MANIFEST_FILENAME, EXAMPLES_FILENAME}:
+        raise ValueError("既存artifactはmanifest.jsonとexamples.jsonlだけを持つ必要がある")
+    manifest_payload = _read_regular_file(directory_fd, MANIFEST_FILENAME)
+    examples_payload = _read_regular_file(directory_fd, EXAMPLES_FILENAME)
+    try:
+        manifest = DatasetManifest.model_validate_json(manifest_payload)
+        if hashlib.sha256(examples_payload).hexdigest() != manifest.examples_sha256:
+            raise ValueError("既存artifactのexamples checksumが一致しない")
+        examples = tuple(
+            DatasetExample.model_validate_json(line) for line in examples_payload.splitlines()
+        )
+        ThermalDataset(manifest=manifest, examples=examples)
+    except (ValidationError, ValueError) as exc:
+        raise ValueError("既存artifactを検証できないため上書きしない") from exc
+
+
+def _cleanup_staging(root_fd: int, name: str, directory_fd: int) -> None:
+    """自分で作った、または検証済みの2ファイルだけをunlinkする。"""
+    for filename in (MANIFEST_FILENAME, EXAMPLES_FILENAME):
+        with suppress(FileNotFoundError):
+            os.unlink(filename, dir_fd=directory_fd)
+    os.rmdir(name, dir_fd=root_fd)
+
+
+def write_dataset(
+    dataset: ThermalDataset,
+    output_root: Path,
+    artifact_name: str,
+    *,
+    force: bool = False,
+) -> tuple[Path, Path]:
+    """検証済み2ファイルをstagingから原子的に公開する。
+
+    既存artifactは既定で拒否する。``force``でも有効なdataset artifactだけを検証後に
+    atomic exchangeし、symlink / FIFO / regular fileや未知のentryは削除しない。
+    """
+    if _ARTIFACT_ALIAS.fullmatch(artifact_name) is None:
+        raise ValueError("artifact_nameは公開用の dataset-<32 hex> aliasにする")
+    # model_copy(update=...)等でvalidationを迂回したinstanceも書き出し境界で拒否する。
+    dataset = ThermalDataset.model_validate_json(dataset.model_dump_json())
+    examples_payload = examples_jsonl_bytes(dataset.examples)
+    if hashlib.sha256(examples_payload).hexdigest() != dataset.manifest.examples_sha256:
+        raise ValueError("manifestのexamples_sha256が書き出すbytesと一致しない")
+    manifest_payload = (dataset.manifest.model_dump_json(indent=2) + "\n").encode()
+
+    root_fd = _open_output_root(output_root)
+    existing_fd: int | None = None
+    staging_fd: int | None = None
+    staging_name: str | None = None
+    published = False
+    try:
+        if force:
+            try:
+                existing_fd = os.open(artifact_name, _DIRECTORY_FLAGS, dir_fd=root_fd)
+            except FileNotFoundError:
+                pass
+            except OSError as exc:
+                raise ValueError(
+                    "既存artifactがsymlinkまたはdirectory以外のため上書きしない"
+                ) from exc
+            if existing_fd is not None:
+                _validate_existing_artifact(existing_fd)
+        else:
+            try:
+                os.stat(artifact_name, dir_fd=root_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                pass
+            else:
+                raise FileExistsError("artifactは既に存在する。検証済み置換にはforceが必要")
+
+        staging_name, staging_fd = _create_staging_directory(root_fd)
+        _write_regular_file(staging_fd, EXAMPLES_FILENAME, examples_payload)
+        _write_regular_file(staging_fd, MANIFEST_FILENAME, manifest_payload)
+        os.fsync(staging_fd)
+        staging_path_stat = os.stat(staging_name, dir_fd=root_fd, follow_symlinks=False)
+        staging_opened_stat = os.fstat(staging_fd)
+        if (staging_path_stat.st_dev, staging_path_stat.st_ino) != (
+            staging_opened_stat.st_dev,
+            staging_opened_stat.st_ino,
+        ):
+            raise RuntimeError("書き出し後にstaging directoryが差し替えられたため中止した")
+
+        if existing_fd is None:
+            _renameat2(root_fd, staging_name, artifact_name, _RENAME_NOREPLACE)
+        else:
+            final_stat = os.stat(artifact_name, dir_fd=root_fd, follow_symlinks=False)
+            opened_stat = os.fstat(existing_fd)
+            if (final_stat.st_dev, final_stat.st_ino) != (opened_stat.st_dev, opened_stat.st_ino):
+                raise RuntimeError("検証後に既存artifactが差し替えられたため中止した")
+            _renameat2(root_fd, staging_name, artifact_name, _RENAME_EXCHANGE)
+        published = True
+        os.fsync(root_fd)
+
+        if existing_fd is not None:
+            _cleanup_staging(root_fd, staging_name, existing_fd)
+            os.fsync(root_fd)
+        artifact_dir = output_root / artifact_name
+        return artifact_dir / MANIFEST_FILENAME, artifact_dir / EXAMPLES_FILENAME
+    finally:
+        if staging_name is not None and staging_fd is not None and not published:
+            # 元の例外を優先する。0700かつ既知名のstaging以外は触らない。
+            with suppress(OSError):
+                _cleanup_staging(root_fd, staging_name, staging_fd)
+        if staging_fd is not None:
+            os.close(staging_fd)
+        if existing_fd is not None:
+            os.close(existing_fd)
+        os.close(root_fd)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -364,18 +583,16 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--db", type=Path, required=True)
     parser.add_argument("--quality-config", type=Path, required=True)
-    parser.add_argument("--output-dir", type=Path, required=True)
-    parser.add_argument("--run-id", required=True)
-    parser.add_argument(
-        "--source-kind", choices=[kind.value for kind in DatasetSourceKind], required=True
-    )
+    parser.add_argument("--output-root", type=Path, required=True)
+    parser.add_argument("--artifact-name", required=True)
+    parser.add_argument("--run-alias", required=True)
+    parser.add_argument("--source-kind", choices=[DatasetSourceKind.REPLAY.value], required=True)
     parser.add_argument(
         "--replay-path",
         type=Path,
-        help="source-kind=replayで必須。Replay対象から参照名とSHA-256を計算する",
+        help="source-kind=replayで必須。Replay対象からSHA-256を計算する",
     )
-    parser.add_argument("--source-ref", action="append")
-    parser.add_argument("--source-sha256")
+    parser.add_argument("--source-alias", action="append", required=True)
     parser.add_argument("--start-ms", type=int, required=True)
     parser.add_argument("--end-ms", type=int, required=True)
     parser.add_argument("--window-ms", type=int, required=True)
@@ -385,6 +602,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--stale-after-ms", type=int, required=True)
     parser.add_argument("--feature-metric", action="append", required=True)
     parser.add_argument("--target-metric", action="append", required=True)
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="検証済みの既存artifactだけをatomic exchangeで置換する",
+    )
     return parser
 
 
@@ -393,25 +615,15 @@ def main(argv: Sequence[str] | None = None) -> None:
     parser = build_parser()
     args = parser.parse_args(argv)
     source_kind = DatasetSourceKind(args.source_kind)
-    if source_kind is DatasetSourceKind.REPLAY:
-        if args.replay_path is None:
-            parser.error("source-kind=replay には --replay-path が要る")
-        if args.source_ref is not None or args.source_sha256 is not None:
-            parser.error("replayのsource-ref / SHA-256は--replay-pathから自動計算する")
-        source_refs, source_sha256 = replay_fingerprint(args.replay_path)
-    else:
-        if args.replay_path is not None:
-            parser.error("--replay-path は source-kind=replay だけで使える")
-        if args.source_ref is None or args.source_sha256 is None:
-            parser.error("replay以外は --source-ref と --source-sha256 が要る")
-        source_refs = tuple(args.source_ref)
-        source_sha256 = args.source_sha256
+    if args.replay_path is None:
+        parser.error("source-kind=replay には --replay-path が要る")
+    source_sha256 = replay_fingerprint(args.replay_path)
     source_run = SourceRun(
-        run_id=args.run_id,
+        run_id=args.run_alias,
         kind=source_kind,
         start_ms=args.start_ms,
         end_ms=args.end_ms,
-        source_refs=source_refs,
+        source_refs=tuple(args.source_alias),
         source_sha256=source_sha256,
     )
     spec = DatasetSpec(
@@ -426,7 +638,12 @@ def main(argv: Sequence[str] | None = None) -> None:
     rules = QualityRules.from_yaml(args.quality_config)
     with SqliteStore(args.db, rules=rules, clock=WallClock()) as store:
         dataset = ThermalDatasetBuilder(store).build(source_run=source_run, spec=spec)
-    write_dataset(dataset, args.output_dir)
+    write_dataset(
+        dataset,
+        args.output_root,
+        args.artifact_name,
+        force=args.force,
+    )
 
 
 if __name__ == "__main__":

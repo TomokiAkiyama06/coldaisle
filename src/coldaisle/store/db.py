@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import math
+import re
 import sqlite3
 import time
 from collections.abc import Iterable, Iterator, Sequence
@@ -98,6 +99,10 @@ SELECT metric FROM metrics WHERE metric IS NOT NULL
 
 _NO_UPPER_BOUND = 2**63 - 1
 """`latest()` に上限を設けないときの番人。SQLite の INTEGER の上限。"""
+
+_DATASET_RUN_ALIAS = re.compile(r"^run-[0-9a-f]{32}$")
+_SHA256 = re.compile(r"^[0-9a-f]{64}$")
+_DATASET_SOURCE_KINDS = frozenset({"serial", "replay", "mock", "import"})
 
 _LATEST_SQL = """
 WITH RECURSIVE metrics(metric) AS (
@@ -249,6 +254,22 @@ class SqliteStore:
         # BEGIN IMMEDIATE で最初から書き込みロックを取る。DEFERRED だと
         # 読んでから書く途中で昇格に失敗し、busy_timeout を待たずに落ちる
         self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            yield
+        except BaseException:
+            self._conn.execute("ROLLBACK")
+            raise
+        self._conn.execute("COMMIT")
+
+    @contextmanager
+    def read_snapshot(self) -> Iterator[None]:
+        """複数SELECTを同じSQLite snapshotから読む。
+
+        WALでは通常のSELECTごとに別のread transactionが始まり得る。dataset生成の
+        ように複数系列を順に読む処理では、途中の取り込みを一部の系列だけに混ぜない
+        ため、呼び出し側がこのcontextで一連のSELECTを囲む。
+        """
+        self._conn.execute("BEGIN")
         try:
             yield
         except BaseException:
@@ -514,6 +535,54 @@ class SqliteStore:
             "SELECT value FROM system_state WHERE key = ? ORDER BY ts_ms DESC LIMIT 1", (key,)
         ).fetchone()
         return None if row is None else str(row["value"])
+
+    def bind_dataset_source_run(
+        self,
+        *,
+        run_alias: str,
+        source_kind: str,
+        source_sha256: str,
+        at_ms: int,
+    ) -> None:
+        """このDBを1つのdataset source runへ、上書き不能で1回だけ結び付ける。"""
+        if _DATASET_RUN_ALIAS.fullmatch(run_alias) is None:
+            raise ValueError("dataset run aliasは run-<32 hex> でなければならない")
+        if source_kind not in _DATASET_SOURCE_KINDS:
+            raise ValueError("dataset source kindが不正")
+        if _SHA256.fullmatch(source_sha256) is None:
+            raise ValueError("dataset source SHA-256が不正")
+        if at_ms < 0:
+            raise ValueError("dataset source runのbind時刻が不正")
+        try:
+            with self.transaction():
+                if self.dataset_source_run() is not None:
+                    raise ValueError("dataset DBは既に別のsource runへbindされている")
+                source_rows = int(
+                    self._conn.execute(
+                        "SELECT (SELECT COUNT(*) FROM readings) "
+                        "+ (SELECT COUNT(*) FROM control_traces)"
+                    ).fetchone()[0]
+                )
+                if source_rows:
+                    raise ValueError("dataset source runは空の専用DBへ先にbindする")
+                self._conn.execute(
+                    "INSERT INTO dataset_source_run "
+                    "(singleton, run_alias, source_kind, source_sha256, bound_ms) "
+                    "VALUES (1, ?, ?, ?, ?)",
+                    (run_alias, source_kind, source_sha256, at_ms),
+                )
+        except sqlite3.IntegrityError as exc:
+            raise ValueError("dataset DBは既に別のsource runへbindされている") from exc
+
+    def dataset_source_run(self) -> tuple[str, str, str] | None:
+        """bind済みdataset source runの(run alias, kind, SHA-256)を返す。"""
+        row = self._conn.execute(
+            "SELECT run_alias, source_kind, source_sha256 FROM dataset_source_run "
+            "WHERE singleton = 1"
+        ).fetchone()
+        if row is None:
+            return None
+        return (str(row["run_alias"]), str(row["source_kind"]), str(row["source_sha256"]))
 
     def active_alert(self, rule_id: str, metric: str | None) -> AlertRecord | None:
         """未解決（`pending` / `firing`）のアラート。

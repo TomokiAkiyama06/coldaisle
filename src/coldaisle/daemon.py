@@ -133,6 +133,7 @@ class Daemon:
         store: SqliteStore,
         normalizer: Normalizer,
         source_name: str = "unknown",
+        dataset_run_alias: str | None = None,
         engine: Engine | None = None,
         notifier: Router | None = None,
         explainer_factory: Callable[[], Explainer] | None = None,
@@ -142,6 +143,7 @@ class Daemon:
         self._store = store
         self._normalizer = normalizer
         self._source_name = source_name
+        self._dataset_run_alias = dataset_run_alias
         self._engine = engine
         self._notifier = notifier
         self._explainer_factory = explainer_factory
@@ -190,6 +192,22 @@ class Daemon:
             "取り込みを開始する",
             extra={logs.FIELDS_KEY: {"max_samples": max_samples, "source": self._source_name}},
         )
+        # Dataset用Replayは、readingを1行も書く前に専用DBへ1回だけbindする。
+        # 既存runへの再投入は、同じ時刻の主キーがINSERT OR IGNOREされて混在するため拒否する。
+        bound_dataset_run = self._store.dataset_source_run()
+        if self._dataset_run_alias is None and bound_dataset_run is not None:
+            raise ValueError("dataset専用DBへrun alias無しで追加入力できない")
+        if self._dataset_run_alias is not None:
+            source_sha256 = getattr(self._source, "source_sha256", None)
+            if not isinstance(source_sha256, str):
+                raise ValueError("dataset run bindにはSHA-256を提供するsourceが必要")
+            self._store.bind_dataset_source_run(
+                run_alias=self._dataset_run_alias,
+                source_kind=self._source_name,
+                source_sha256=source_sha256,
+                at_ms=self._normalizer.clock.now_ms(),
+            )
+
         # API がソース種別を答えられるようにする（FR-305）。状態は変化時だけ書く
         self._store.set_system_state(
             INGEST_SOURCE_KEY, self._source_name, at_ms=self._normalizer.clock.now_ms()
@@ -534,6 +552,8 @@ class Config:
     """較正の方針（#13 / 決定記録 0024 §2.7）。記録とは別のファイル。"""
     csv: Path | None = None
     """`--source replay` の入力。ファイルかディレクトリ。"""
+    dataset_run_alias: str | None = None
+    """dataset専用DBへReplay入力を上書き不能でbindする公開run alias。"""
     port: str | None = None
     """`--source serial` のポート。`None` なら自動検出（#12）。"""
     baud: int = SERIAL_BAUD
@@ -555,6 +575,8 @@ def build(config: Config) -> Daemon:
     ここが唯一の組み立て場所であることが、`Clock` を型で縛れないぶんの担保になる。
     別々に作ると、取り込みはシナリオ時間・保存は実時計という組み合わせが成立する。
     """
+    if config.dataset_run_alias is not None and config.source != "replay":
+        raise SystemExit("--dataset-run-alias は --source replay だけで使える")
     source = _build_source(config)
     rules = QualityRules.from_yaml(config.quality_rules)
     calibration = _calibration_for(config)
@@ -566,6 +588,7 @@ def build(config: Config) -> Daemon:
         store=store,
         normalizer=Normalizer(rules=rules, calibration=calibration, clock=clock),
         source_name=config.source,
+        dataset_run_alias=config.dataset_run_alias,
         # ルールエンジンは**取り込みと同じプロセス・同じ時計**で動かす。
         # 継続時間の判定が実時間に依存すると、圧縮再生で検証できない
         # （決定記録 0007 §2.11 / §5 未決3）
@@ -685,6 +708,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--csv", type=Path, default=None, help="replay の入力（ファイル/ディレクトリ）"
     )
+    parser.add_argument(
+        "--dataset-run-alias",
+        default=None,
+        help="dataset専用Replay DBへbindする run-<32 hex> alias",
+    )
     parser.add_argument("--bulk", action="store_true", help="replay を待たずに流す（一括投入）")
     parser.add_argument("--timezone", default="Asia/Tokyo", help="CSV の時刻の解釈")
     parser.add_argument("--max-samples", type=int, default=None, help="試験用。件数で止める")
@@ -710,6 +738,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             ai=args.ai,
             metrics=args.metrics,
             csv=args.csv,
+            dataset_run_alias=args.dataset_run_alias,
             bulk=args.bulk,
             timezone=args.timezone,
             port=args.port,
