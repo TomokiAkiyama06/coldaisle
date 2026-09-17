@@ -18,11 +18,15 @@ from __future__ import annotations
 import csv
 import hashlib
 import logging
+import os
+import stat
+import tempfile
 import time
 from collections.abc import Callable, Iterator
 from datetime import datetime
 from itertools import islice
 from pathlib import Path
+from typing import BinaryIO
 from zoneinfo import ZoneInfo
 
 from coldaisle import logs
@@ -61,6 +65,8 @@ MAX_LOGGED_DROPS = 10
 """1ファイルあたり、個別に記録する破棄行の上限。総数は別に出す。"""
 
 LOGGER = logging.getLogger("coldaisle.ingest.replay")
+COPY_CHUNK_BYTES = 1024 * 1024
+"""dataset provenance用snapshotを定数memoryで作るchunk size。"""
 
 
 def normalize_column(name: str) -> str:
@@ -84,19 +90,67 @@ def csv_files(path: Path) -> list[Path]:
 
 def replay_sha256(path: Path) -> str:
     """Replay対象のbasename・file境界・内容を順序付きでhashする。"""
-    return _csv_files_sha256(csv_files(path))
+    _snapshots, digest = _snapshot_and_hash(csv_files(path), make_snapshot=False)
+    return digest
 
 
-def _csv_files_sha256(files: list[Path]) -> str:
+def _snapshot_and_hash(files: list[Path], *, make_snapshot: bool) -> tuple[list[BinaryIO], str]:
+    """CSVをchunk単位でhashし、指定時は同じbytesをprivate snapshotへ書く。"""
     digest = hashlib.sha256()
-    for csv_path in files:
-        encoded_name = csv_path.name.encode("utf-8")
-        content = csv_path.read_bytes()
-        digest.update(len(encoded_name).to_bytes(8, "big"))
-        digest.update(encoded_name)
-        digest.update(len(content).to_bytes(8, "big"))
-        digest.update(content)
-    return digest.hexdigest()
+    snapshots: list[BinaryIO] = []
+    try:
+        for csv_path in files:
+            encoded_name = csv_path.name.encode("utf-8")
+            source_fd = os.open(
+                csv_path,
+                os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW | os.O_CLOEXEC,
+            )
+            with os.fdopen(source_fd, "rb") as source:
+                before = os.fstat(source.fileno())
+                if not stat.S_ISREG(before.st_mode):
+                    raise ValueError(f"Replay入力はregular fileでなければならない: {csv_path}")
+                digest.update(len(encoded_name).to_bytes(8, "big"))
+                digest.update(encoded_name)
+                digest.update(before.st_size.to_bytes(8, "big"))
+                # dataset sourceの寿命まで保持し、各CSV parseでdupして再利用する。
+                snapshot = (
+                    tempfile.TemporaryFile(mode="w+b")  # noqa: SIM115
+                    if make_snapshot
+                    else None
+                )
+                copied = 0
+                try:
+                    while chunk := source.read(COPY_CHUNK_BYTES):
+                        copied += len(chunk)
+                        digest.update(chunk)
+                        if snapshot is not None:
+                            snapshot.write(chunk)
+                    if snapshot is not None:
+                        snapshot.flush()
+                        os.fsync(snapshot.fileno())
+                    after = os.fstat(source.fileno())
+                except BaseException:
+                    if snapshot is not None:
+                        snapshot.close()
+                    raise
+            identity_before = (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
+            identity_after = (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
+            if identity_before != identity_after or copied != before.st_size:
+                if snapshot is not None:
+                    snapshot.close()
+                raise ValueError(f"hash中にReplay CSVが変更された: {csv_path}")
+            if snapshot is not None:
+                try:
+                    snapshot.seek(0)
+                except BaseException:
+                    snapshot.close()
+                    raise
+                snapshots.append(snapshot)
+    except BaseException:
+        for opened in snapshots:
+            opened.close()
+        raise
+    return snapshots, digest.hexdigest()
 
 
 class ReplaySource:
@@ -122,12 +176,26 @@ class ReplaySource:
         speed: float = 1.0,
         bulk: bool = False,
         sleep: Callable[[float], None] = time.sleep,
+        dataset_provenance: bool = False,
     ) -> None:
         if speed <= 0:
             raise ValueError(f"speed は正の数（一括投入は bulk=True）: {speed}")
-        self._files = csv_files(path)
-        if not self._files:
+        source_files = csv_files(path)
+        if not source_files:
             raise ValueError(f"CSV が見つからない: {path}")
+        self._snapshot_files: list[BinaryIO] = []
+        self._source_sha256: str | None = None
+        if dataset_provenance:
+            try:
+                self._snapshot_files, self._source_sha256 = _snapshot_and_hash(
+                    source_files,
+                    make_snapshot=True,
+                )
+            except BaseException:
+                for snapshot in self._snapshot_files:
+                    snapshot.close()
+                raise
+        self._files = source_files
         self._tz = tz
         self._speed = speed
         self._bulk = bulk
@@ -135,7 +203,6 @@ class ReplaySource:
         self.dropped_rows = 0
         """時刻として読めずに捨てた行数。完全な再生かどうかの判断に使う。"""
         self._clock = SimulatedClock(self._first_timestamp_ms())
-        self._source_sha256 = _csv_files_sha256(self._files)
 
     @property
     def clock(self) -> SimulatedClock:
@@ -143,8 +210,8 @@ class ReplaySource:
         return self._clock
 
     @property
-    def source_sha256(self) -> str:
-        """DB provenanceへ保存するReplay入力全体のSHA-256。"""
+    def source_sha256(self) -> str | None:
+        """dataset snapshot有効時だけ、その同一bytesのSHA-256を返す。"""
         return self._source_sha256
 
     @property
@@ -185,9 +252,20 @@ class ReplaySource:
         取りこぼした再生を運用者が区別できない。`report=True` のときだけ
         記録する（起動バナーのための先読みで二重に数えないため）。
         """
-        for path in self._files:
+        for index, path in enumerate(self._files):
             dropped = 0
-            with path.open(encoding="utf-8-sig", newline="") as handle:
+            if self._snapshot_files:
+                snapshot_fd = os.dup(self._snapshot_files[index].fileno())
+                os.lseek(snapshot_fd, 0, os.SEEK_SET)
+                handle_context = os.fdopen(
+                    snapshot_fd,
+                    mode="r",
+                    encoding="utf-8-sig",
+                    newline="",
+                )
+            else:
+                handle_context = path.open(encoding="utf-8-sig", newline="")
+            with handle_context as handle:
                 reader = csv.DictReader(handle)
                 fields = [normalize_column(name) for name in reader.fieldnames or []]
                 stamp_column = next((name for name in TIMESTAMP_COLUMNS if name in fields), None)

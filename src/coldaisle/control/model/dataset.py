@@ -30,6 +30,7 @@ DATASET_SCHEMA_VERSION: Literal[1] = 1
 MetricName = Annotated[str, Field(pattern=r"^[a-z][a-z0-9_]*(\.[a-z0-9_]+){1,3}$")]
 RunAlias = Annotated[str, Field(pattern=r"^run-[0-9a-f]{32}$")]
 SourceAlias = Annotated[str, Field(pattern=r"^source-[0-9a-f]{32}$")]
+FiniteValue = Annotated[float, Field(allow_inf_nan=False)]
 
 
 class _Frozen(BaseModel):
@@ -113,7 +114,7 @@ class WindowFrame(_Frozen):
     """window 内の1時点。値は直近観測をas-ofで保持し、元時刻とmaskを併記する。"""
 
     ts_ms: int = Field(ge=0)
-    values: dict[str, float | None]
+    values: dict[str, FiniteValue | None]
     source_ts_ms: dict[str, int | None]
     quality: dict[str, Quality | None]
     missing_mask: dict[str, bool]
@@ -156,7 +157,7 @@ class TargetFrame(_Frozen):
 
     horizon_ms: int = Field(gt=0)
     expected_ts_ms: int = Field(ge=0)
-    values: dict[str, float | None]
+    values: dict[str, FiniteValue | None]
     source_ts_ms: dict[str, int | None]
     quality: dict[str, Quality | None]
     missing_mask: dict[str, bool]

@@ -7,8 +7,7 @@
 from __future__ import annotations
 
 import argparse
-import ctypes
-import errno
+import fcntl
 import hashlib
 import json
 import os
@@ -47,10 +46,9 @@ MANIFEST_FILENAME = "manifest.json"
 EXAMPLES_FILENAME = "examples.jsonl"
 _ARTIFACT_ALIAS = re.compile(r"^dataset-[0-9a-f]{32}$")
 _DIRECTORY_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
-_FILE_READ_FLAGS = os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK
 _FILE_WRITE_FLAGS = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC
-_RENAME_NOREPLACE = 1
-_RENAME_EXCHANGE = 2
+_LOCK_FLAGS = os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK
+_LOCK_FILENAME = ".coldaisle-dataset.lock"
 SeriesIndex = tuple[tuple[int, ...], tuple[SeriesPoint, ...]]
 
 
@@ -383,27 +381,6 @@ def _action_zone(tick: ControlTick, zone: Zone) -> ActionZone:
     )
 
 
-def _renameat2(directory_fd: int, source: str, target: str, flags: int) -> None:
-    """同じdirfd内でLinux renameat2を呼ぶ。安全でないfallbackはしない。"""
-    libc = ctypes.CDLL(None, use_errno=True)
-    renameat2 = getattr(libc, "renameat2", None)
-    if renameat2 is None:
-        raise RuntimeError("atomic artifact publishにはLinux renameat2が必要")
-    result = renameat2(
-        ctypes.c_int(directory_fd),
-        ctypes.c_char_p(os.fsencode(source)),
-        ctypes.c_int(directory_fd),
-        ctypes.c_char_p(os.fsencode(target)),
-        ctypes.c_uint(flags),
-    )
-    if result == 0:
-        return
-    error_number = ctypes.get_errno()
-    if error_number == errno.EEXIST:
-        raise FileExistsError(error_number, os.strerror(error_number), target)
-    raise OSError(error_number, os.strerror(error_number), target)
-
-
 def _open_output_root(output_root: Path) -> int:
     """pathの各要素をsymlink非追従で開き、必要なdirectoryだけ作る。"""
     if ".." in output_root.parts:
@@ -430,6 +407,25 @@ def _open_output_root(output_root: Path) -> int:
         raise
 
 
+def _lock_output_root(root_fd: int) -> int:
+    """全writerが共有する固定inodeをlockし、既存artifact確認とrenameを直列化する。"""
+    lock_fd = os.open(_LOCK_FILENAME, _LOCK_FLAGS, 0o600, dir_fd=root_fd)
+    try:
+        lock_stat = os.fstat(lock_fd)
+        if not stat.S_ISREG(lock_stat.st_mode) or lock_stat.st_uid != os.geteuid():
+            raise PermissionError("dataset writer lockは実行user所有のregular fileに限る")
+        if lock_stat.st_mode & (stat.S_IWGRP | stat.S_IWOTH) or lock_stat.st_nlink != 1:
+            raise PermissionError("dataset writer lockの権限またはlink数が安全でない")
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        path_stat = os.stat(_LOCK_FILENAME, dir_fd=root_fd, follow_symlinks=False)
+        if (path_stat.st_dev, path_stat.st_ino) != (lock_stat.st_dev, lock_stat.st_ino):
+            raise RuntimeError("dataset writer lockが取得中に差し替えられた")
+        return lock_fd
+    except BaseException:
+        os.close(lock_fd)
+        raise
+
+
 def _create_staging_directory(root_fd: int) -> tuple[str, int]:
     for _attempt in range(16):
         name = f".coldaisle-stage-{secrets.token_hex(16)}"
@@ -437,7 +433,12 @@ def _create_staging_directory(root_fd: int) -> tuple[str, int]:
             os.mkdir(name, mode=0o700, dir_fd=root_fd)
         except FileExistsError:
             continue
-        return name, os.open(name, _DIRECTORY_FLAGS, dir_fd=root_fd)
+        try:
+            return name, os.open(name, _DIRECTORY_FLAGS, dir_fd=root_fd)
+        except BaseException:
+            with suppress(OSError):
+                os.rmdir(name, dir_fd=root_fd)
+            raise
     raise FileExistsError("一意なdataset staging directoryを作れない")
 
 
@@ -449,41 +450,8 @@ def _write_regular_file(directory_fd: int, name: str, payload: bytes) -> None:
         os.fsync(handle.fileno())
 
 
-def _read_regular_file(directory_fd: int, name: str) -> bytes:
-    path_stat = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
-    if not stat.S_ISREG(path_stat.st_mode):
-        raise ValueError(f"既存artifactの{name}がregular fileではない")
-    file_fd = os.open(name, _FILE_READ_FLAGS, dir_fd=directory_fd)
-    try:
-        file_stat = os.fstat(file_fd)
-        if not stat.S_ISREG(file_stat.st_mode):
-            raise ValueError(f"既存artifactの{name}がregular fileではない")
-        with os.fdopen(file_fd, "rb", closefd=False) as handle:
-            return handle.read()
-    finally:
-        os.close(file_fd)
-
-
-def _validate_existing_artifact(directory_fd: int) -> None:
-    entries = set(os.listdir(directory_fd))
-    if entries != {MANIFEST_FILENAME, EXAMPLES_FILENAME}:
-        raise ValueError("既存artifactはmanifest.jsonとexamples.jsonlだけを持つ必要がある")
-    manifest_payload = _read_regular_file(directory_fd, MANIFEST_FILENAME)
-    examples_payload = _read_regular_file(directory_fd, EXAMPLES_FILENAME)
-    try:
-        manifest = DatasetManifest.model_validate_json(manifest_payload)
-        if hashlib.sha256(examples_payload).hexdigest() != manifest.examples_sha256:
-            raise ValueError("既存artifactのexamples checksumが一致しない")
-        examples = tuple(
-            DatasetExample.model_validate_json(line) for line in examples_payload.splitlines()
-        )
-        ThermalDataset(manifest=manifest, examples=examples)
-    except (ValidationError, ValueError) as exc:
-        raise ValueError("既存artifactを検証できないため上書きしない") from exc
-
-
 def _cleanup_staging(root_fd: int, name: str, directory_fd: int) -> None:
-    """自分で作った、または検証済みの2ファイルだけをunlinkする。"""
+    """自分で作ったstagingの既知2ファイルだけをunlinkする。"""
     for filename in (MANIFEST_FILENAME, EXAMPLES_FILENAME):
         with suppress(FileNotFoundError):
             os.unlink(filename, dir_fd=directory_fd)
@@ -494,13 +462,11 @@ def write_dataset(
     dataset: ThermalDataset,
     output_root: Path,
     artifact_name: str,
-    *,
-    force: bool = False,
 ) -> tuple[Path, Path]:
     """検証済み2ファイルをstagingから原子的に公開する。
 
-    既存artifactは既定で拒否する。``force``でも有効なdataset artifactだけを検証後に
-    atomic exchangeし、symlink / FIFO / regular fileや未知のentryは削除しない。
+    既存artifactは常に拒否する。全writerが同じparent lockを保持して不存在を確認し、
+    同じparent内のstaging directoryをmacOS / Ubuntu共通の``os.rename``で公開する。
     """
     if _ARTIFACT_ALIAS.fullmatch(artifact_name) is None:
         raise ValueError("artifact_nameは公開用の dataset-<32 hex> aliasにする")
@@ -512,29 +478,18 @@ def write_dataset(
     manifest_payload = (dataset.manifest.model_dump_json(indent=2) + "\n").encode()
 
     root_fd = _open_output_root(output_root)
-    existing_fd: int | None = None
+    lock_fd: int | None = None
     staging_fd: int | None = None
     staging_name: str | None = None
     published = False
     try:
-        if force:
-            try:
-                existing_fd = os.open(artifact_name, _DIRECTORY_FLAGS, dir_fd=root_fd)
-            except FileNotFoundError:
-                pass
-            except OSError as exc:
-                raise ValueError(
-                    "既存artifactがsymlinkまたはdirectory以外のため上書きしない"
-                ) from exc
-            if existing_fd is not None:
-                _validate_existing_artifact(existing_fd)
+        lock_fd = _lock_output_root(root_fd)
+        try:
+            os.stat(artifact_name, dir_fd=root_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            pass
         else:
-            try:
-                os.stat(artifact_name, dir_fd=root_fd, follow_symlinks=False)
-            except FileNotFoundError:
-                pass
-            else:
-                raise FileExistsError("artifactは既に存在する。検証済み置換にはforceが必要")
+            raise FileExistsError("artifactは既に存在するため上書きしない")
 
         staging_name, staging_fd = _create_staging_directory(root_fd)
         _write_regular_file(staging_fd, EXAMPLES_FILENAME, examples_payload)
@@ -548,20 +503,20 @@ def write_dataset(
         ):
             raise RuntimeError("書き出し後にstaging directoryが差し替えられたため中止した")
 
-        if existing_fd is None:
-            _renameat2(root_fd, staging_name, artifact_name, _RENAME_NOREPLACE)
+        try:
+            os.stat(artifact_name, dir_fd=root_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            pass
         else:
-            final_stat = os.stat(artifact_name, dir_fd=root_fd, follow_symlinks=False)
-            opened_stat = os.fstat(existing_fd)
-            if (final_stat.st_dev, final_stat.st_ino) != (opened_stat.st_dev, opened_stat.st_ino):
-                raise RuntimeError("検証後に既存artifactが差し替えられたため中止した")
-            _renameat2(root_fd, staging_name, artifact_name, _RENAME_EXCHANGE)
+            raise FileExistsError("publish直前にartifactが作られたため上書きしない")
+        os.rename(
+            staging_name,
+            artifact_name,
+            src_dir_fd=root_fd,
+            dst_dir_fd=root_fd,
+        )
         published = True
         os.fsync(root_fd)
-
-        if existing_fd is not None:
-            _cleanup_staging(root_fd, staging_name, existing_fd)
-            os.fsync(root_fd)
         artifact_dir = output_root / artifact_name
         return artifact_dir / MANIFEST_FILENAME, artifact_dir / EXAMPLES_FILENAME
     finally:
@@ -571,8 +526,8 @@ def write_dataset(
                 _cleanup_staging(root_fd, staging_name, staging_fd)
         if staging_fd is not None:
             os.close(staging_fd)
-        if existing_fd is not None:
-            os.close(existing_fd)
+        if lock_fd is not None:
+            os.close(lock_fd)
         os.close(root_fd)
 
 
@@ -602,11 +557,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--stale-after-ms", type=int, required=True)
     parser.add_argument("--feature-metric", action="append", required=True)
     parser.add_argument("--target-metric", action="append", required=True)
-    parser.add_argument(
-        "--force",
-        action="store_true",
-        help="検証済みの既存artifactだけをatomic exchangeで置換する",
-    )
     return parser
 
 
@@ -638,12 +588,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     rules = QualityRules.from_yaml(args.quality_config)
     with SqliteStore(args.db, rules=rules, clock=WallClock()) as store:
         dataset = ThermalDatasetBuilder(store).build(source_run=source_run, spec=spec)
-    write_dataset(
-        dataset,
-        args.output_root,
-        args.artifact_name,
-        force=args.force,
-    )
+    write_dataset(dataset, args.output_root, args.artifact_name)
 
 
 if __name__ == "__main__":

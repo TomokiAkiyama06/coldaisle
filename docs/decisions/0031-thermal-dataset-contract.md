@@ -75,6 +75,11 @@ Replayではreadingを1行も保存する前に、run alias、source kind、同�
 DELETEを拒否し、builderはSourceRunの3値との完全一致を要求する。これにより、同じ開始時刻の
 別Replayでmarkerだけを置換したり、別のCSVに付けた任意hashを同じDBのprovenanceとして
 扱ったりできない。既にbind済みのDBは、同じalias / CSVの再投入であっても拒否する。
+provenanceを有効にしたReplaySourceはconstructorでCSV集合を1回だけ列挙し、各regular fileを
+`O_NOFOLLOW`で開く。入力を定数memoryのchunkでunlink済み一時fileへcopyしながらhashし、
+先頭時刻の決定と全Replayはpathを再openせず同じsnapshot bytesを読む。通常のReplayは
+eager hash / snapshotを行わない。dataset CLIが後でlive pathを再hashしてsnapshot hashと
+異なれば、builderはDB provenance不一致としてfail closedにする。
 
 同一のTelemetryとControlTick traceをSQLiteへ入れれば、同じmanifest / examplesを
 生成する。旧来のセンサーCSVにはFan actionが無いため、CSV単体から過去のactionを
@@ -92,13 +97,14 @@ hashを仮置きして非Replayを通さない。
 出力rootは実行user所有かつgroup / world writableでないdirectoryに限定する。全path
 componentをdirectory file descriptorと`O_NOFOLLOW`で開き、symlinkやFIFOを追従しない。
 同じroot内の0700 staging directoryへ、`O_EXCL | O_NOFOLLOW`で2ファイルを書き、file /
-directoryをfsyncしてからLinux `renameat2(RENAME_NOREPLACE)`で公開する。
+directoryをfsyncする。root内の固定lock fileを`flock`し、lock保持中にartifactが存在しない
+ことを2回確認してから、同じparent内で`os.rename`して公開しparentをfsyncする。lock fileは
+unlinkせず、全writerが同じinodeで直列化されるようにする。この協調writer契約と、rootを
+所有user以外が変更できない権限をno-clobberの境界とする。
 
-既存artifactは既定で拒否する。明示的な`--force`でも、同じdirfdから読んだ2 regular file
-だけで構成され、schema・件数・examples checksumまで検証できたartifactに限り、
-`RENAME_EXCHANGE`でstagingと原子的に交換する。symlink、FIFO、通常ファイル、未知entry、
-破損artifactは削除しない。安全なrename flagが使えない環境では通常renameへfallbackせず
-生成を失敗させる。readerも将来、artifact directoryを一度dirfdで開き、同じdirfdから
+既存artifactは内容や種別を問わず常に拒否し、上書き機能は提供しない。publish後のparent
+fsyncが失敗した場合はartifactが既に見える可能性があるため、同じaliasで再実行せず存在と
+checksumを確認する。readerも将来、artifact directoryを一度dirfdで開き、同じdirfdから
 manifest / examplesを読みchecksum検証する。
 
 ### 2.5 time leakageを防ぐsplit
@@ -118,7 +124,7 @@ manifest / examplesを読みchecksum検証する。
 - actionと未来targetの対応、および欠測・staleを例単位で監査できる
 - Replayで実機なしにdataset builderとprovenance bindingを試験できる
 - runごとの専用DBが必要になるが、別runや並行ingestの混入をfail closedで防げる
-- artifactの公開にはLinux `renameat2`を必要とする
+- artifact公開はmacOS / Ubuntu共通の`flock` / `os.rename`だけを使う
 - split境界付近の例は減るが、同じ観測がtrainと評価へ重複することを防げる
 - JSON Linesは依存追加なしで検査できる一方、大規模学習の列指向形式より非効率である。
   実データ量を確認後、同じversioned schemaを保ったParquet変換を別Issueで検討する
@@ -134,6 +140,7 @@ manifest / examplesを読みchecksum検証する。
 | window / horizonに本番既定値を置く | 実データなしの候補を確定値として固定してしまう |
 | 複数runでSQLiteを再利用する | 同じ時刻の観測が主キー重複で無視され、source provenanceを証明できない |
 | 既存artifactへ2ファイルを直接truncateする | 途中失敗で版が混ざり、symlink経由でroot外のファイルを破壊し得る |
+| 既存artifactを`--force`で置換する | Issue要件外で、portableかつ原子的なno-clobber / exchange契約を複雑にする |
 
 ## 5. 未決事項
 

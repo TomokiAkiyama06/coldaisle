@@ -196,6 +196,16 @@ def test_corrupt_masks_and_regime_context_are_rejected_when_loading_artifact(dat
     with pytest.raises(ValidationError, match="逆行"):
         ThermalDataset.model_validate_json(json.dumps(reversed_metric_time))
 
+    nonfinite_window = dataset.model_dump()
+    nonfinite_window["examples"][0]["window"][0]["values"]["air.room"] = float("nan")
+    with pytest.raises(ValidationError, match="finite number"):
+        ThermalDataset.model_validate(nonfinite_window)
+
+    nonfinite_target = dataset.model_dump()
+    nonfinite_target["examples"][0]["targets"][0]["values"]["air.gpu_exhaust"] = float("inf")
+    with pytest.raises(ValidationError, match="finite number"):
+        ThermalDataset.model_validate(nonfinite_target)
+
 
 def test_dataset_spec_has_no_window_or_horizon_defaults():
     with pytest.raises(ValidationError, match="window_ms"):
@@ -349,6 +359,15 @@ def test_dataset_source_run_binding_is_immutable_even_at_the_same_timestamp(data
             "UPDATE dataset_source_run SET source_sha256 = ? WHERE singleton = 1",
             ("b" * 64,),
         )
+    with pytest.raises(sqlite3.IntegrityError, match="already bound"):
+        dataset_store.connection.execute(
+            "INSERT OR REPLACE INTO dataset_source_run "
+            "(singleton, run_alias, source_kind, source_sha256, bound_ms) "
+            "VALUES (1, ?, 'replay', ?, 0)",
+            ("run-00000000000000000000000000000002", "b" * 64),
+        )
+    with pytest.raises(sqlite3.IntegrityError, match="immutable"):
+        dataset_store.connection.execute("DELETE FROM dataset_source_run WHERE singleton = 1")
 
 
 def test_dataset_source_run_must_bind_before_any_source_rows(tmp_path, rules, clock):
@@ -423,9 +442,7 @@ def test_artifact_writes_are_deterministic(dataset_store, tmp_path):
     )
 
 
-def test_artifact_default_refuses_overwrite_and_force_replaces_only_valid_artifact(
-    dataset_store, tmp_path
-):
+def test_artifact_always_refuses_overwrite(dataset_store, tmp_path):
     dataset = ThermalDatasetBuilder(dataset_store).build(source_run=source_run(), spec=spec())
     output_root = tmp_path / "artifacts"
     manifest_path, examples_path = write_dataset(dataset, output_root, ARTIFACT_ONE)
@@ -434,12 +451,6 @@ def test_artifact_default_refuses_overwrite_and_force_replaces_only_valid_artifa
     with pytest.raises(FileExistsError):
         write_dataset(dataset, output_root, ARTIFACT_ONE)
     assert (manifest_path.read_bytes(), examples_path.read_bytes()) == original
-
-    replacement = dataset.model_copy(
-        update={"manifest": dataset.manifest.model_copy(update={"telemetry_sha256": "b" * 64})}
-    )
-    write_dataset(replacement, output_root, ARTIFACT_ONE, force=True)
-    assert json.loads(manifest_path.read_text(encoding="utf-8"))["telemetry_sha256"] == "b" * 64
 
 
 def test_artifact_writer_revalidates_model_copy_updates(dataset_store, tmp_path):
@@ -453,64 +464,64 @@ def test_artifact_writer_revalidates_model_copy_updates(dataset_store, tmp_path)
     assert not (tmp_path / "artifacts").exists()
 
 
-def test_force_refuses_corrupt_or_unknown_existing_artifact(dataset_store, tmp_path):
+def test_existing_corrupt_or_unknown_artifact_is_never_touched(dataset_store, tmp_path):
     dataset = ThermalDatasetBuilder(dataset_store).build(source_run=source_run(), spec=spec())
     output_root = tmp_path / "artifacts"
     manifest_path, examples_path = write_dataset(dataset, output_root, ARTIFACT_ONE)
     examples_path.write_bytes(examples_path.read_bytes() + b" ")
     corrupt = (manifest_path.read_bytes(), examples_path.read_bytes())
 
-    with pytest.raises(ValueError, match="検証できない"):
-        write_dataset(dataset, output_root, ARTIFACT_ONE, force=True)
+    with pytest.raises(FileExistsError):
+        write_dataset(dataset, output_root, ARTIFACT_ONE)
     assert (manifest_path.read_bytes(), examples_path.read_bytes()) == corrupt
 
-    examples_path.write_bytes(dataset_module.examples_jsonl_bytes(dataset.examples))
     extra = manifest_path.parent / "unexpected"
     extra.write_text("keep", encoding="utf-8")
-    with pytest.raises(ValueError, match="だけを持つ"):
-        write_dataset(dataset, output_root, ARTIFACT_ONE, force=True)
+    with pytest.raises(FileExistsError):
+        write_dataset(dataset, output_root, ARTIFACT_ONE)
     assert extra.read_text(encoding="utf-8") == "keep"
 
 
-def test_artifact_publish_failure_keeps_old_version_and_removes_staging(
-    dataset_store, tmp_path, monkeypatch
-):
+def test_artifact_publish_failure_removes_staging(dataset_store, tmp_path, monkeypatch):
     dataset = ThermalDatasetBuilder(dataset_store).build(source_run=source_run(), spec=spec())
     output_root = tmp_path / "artifacts"
-    manifest_path, examples_path = write_dataset(dataset, output_root, ARTIFACT_ONE)
-    original = (manifest_path.read_bytes(), examples_path.read_bytes())
 
-    def fail_publish(_directory_fd, _source, _target, _flags):
+    def fail_publish(_source, _target, *, src_dir_fd, dst_dir_fd):
         raise OSError("injected publish failure")
 
-    monkeypatch.setattr(dataset_module, "_renameat2", fail_publish)
+    monkeypatch.setattr(dataset_module.os, "rename", fail_publish)
     with pytest.raises(OSError, match="injected"):
-        write_dataset(dataset, output_root, ARTIFACT_TWO)
-    assert not (output_root / ARTIFACT_TWO).exists()
-    assert all(not path.name.startswith(".coldaisle-stage-") for path in output_root.iterdir())
-
-    with pytest.raises(OSError, match="injected"):
-        write_dataset(dataset, output_root, ARTIFACT_ONE, force=True)
-
-    assert (manifest_path.read_bytes(), examples_path.read_bytes()) == original
+        write_dataset(dataset, output_root, ARTIFACT_ONE)
+    assert not (output_root / ARTIFACT_ONE).exists()
     assert all(not path.name.startswith(".coldaisle-stage-") for path in output_root.iterdir())
 
 
-def test_atomic_no_replace_closes_the_publish_race(dataset_store, tmp_path, monkeypatch):
+def test_artifact_writers_share_a_persistent_parent_lock(dataset_store, tmp_path):
     dataset = ThermalDatasetBuilder(dataset_store).build(source_run=source_run(), spec=spec())
     output_root = tmp_path / "artifacts"
-    real_renameat2 = dataset_module._renameat2
+    write_dataset(dataset, output_root, ARTIFACT_ONE)
+    lock = output_root / ".coldaisle-dataset.lock"
+    first_inode = lock.stat().st_ino
+    write_dataset(dataset, output_root, ARTIFACT_TWO)
 
-    def race_with_competing_directory(directory_fd, source, target, flags):
-        os.mkdir(target, mode=0o700, dir_fd=directory_fd)
-        real_renameat2(directory_fd, source, target, flags)
+    assert lock.is_file()
+    assert lock.stat().st_ino == first_inode
 
-    monkeypatch.setattr(dataset_module, "_renameat2", race_with_competing_directory)
-    with pytest.raises(FileExistsError):
+
+def test_staging_open_failure_removes_created_directory(dataset_store, tmp_path, monkeypatch):
+    dataset = ThermalDatasetBuilder(dataset_store).build(source_run=source_run(), spec=spec())
+    output_root = tmp_path / "artifacts"
+    real_open = dataset_module.os.open
+
+    def fail_staging_open(path, flags, mode=0o777, *, dir_fd=None):
+        if isinstance(path, str) and path.startswith(".coldaisle-stage-"):
+            raise OSError("injected staging open failure")
+        return real_open(path, flags, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(dataset_module.os, "open", fail_staging_open)
+    with pytest.raises(OSError, match="injected staging"):
         write_dataset(dataset, output_root, ARTIFACT_ONE)
 
-    assert (output_root / ARTIFACT_ONE).is_dir()
-    assert list((output_root / ARTIFACT_ONE).iterdir()) == []
     assert all(not path.name.startswith(".coldaisle-stage-") for path in output_root.iterdir())
 
 
@@ -533,8 +544,6 @@ def test_artifact_writer_never_follows_root_final_or_component_links(dataset_sto
     (output_root / ARTIFACT_ONE).symlink_to(outside, target_is_directory=True)
     with pytest.raises(FileExistsError):
         write_dataset(dataset, output_root, ARTIFACT_ONE)
-    with pytest.raises(ValueError, match="symlink"):
-        write_dataset(dataset, output_root, ARTIFACT_ONE, force=True)
     assert sentinel.read_text(encoding="utf-8") == "unchanged"
 
 
@@ -547,11 +556,9 @@ def test_artifact_writer_rejects_fifo_without_blocking(dataset_store, tmp_path):
 
     with pytest.raises(FileExistsError):
         write_dataset(dataset, output_root, ARTIFACT_ONE)
-    with pytest.raises(ValueError, match="directory以外"):
-        write_dataset(dataset, output_root, ARTIFACT_ONE, force=True)
 
 
-def test_force_rejects_symlinked_artifact_component(dataset_store, tmp_path):
+def test_existing_artifact_components_are_not_inspected_or_touched(dataset_store, tmp_path):
     dataset = ThermalDatasetBuilder(dataset_store).build(source_run=source_run(), spec=spec())
     output_root = tmp_path / "artifacts"
     artifact = output_root / ARTIFACT_ONE
@@ -562,18 +569,9 @@ def test_force_rejects_symlinked_artifact_component(dataset_store, tmp_path):
     (artifact / "manifest.json").symlink_to(outside)
     os.mkfifo(artifact / "examples.jsonl")
 
-    with pytest.raises(ValueError, match="regular file"):
-        write_dataset(dataset, output_root, ARTIFACT_ONE, force=True)
+    with pytest.raises(FileExistsError):
+        write_dataset(dataset, output_root, ARTIFACT_ONE)
     assert outside.read_text(encoding="utf-8") == "do not touch"
-
-    (artifact / "manifest.json").unlink()
-    (artifact / "examples.jsonl").unlink()
-    (artifact / "manifest.json").write_text(
-        dataset.manifest.model_dump_json(indent=2) + "\n", encoding="utf-8"
-    )
-    os.mkfifo(artifact / "examples.jsonl")
-    with pytest.raises(ValueError, match="regular file"):
-        write_dataset(dataset, output_root, ARTIFACT_ONE, force=True)
 
 
 def test_replay_fingerprint_depends_on_names_boundaries_and_contents(tmp_path):
@@ -628,7 +626,12 @@ def test_replay_can_regenerate_the_same_dataset_without_hardware(tmp_path, rules
     )
 
     def regenerate(db_name: str):
-        replay = ReplaySource(csv_path, tz=ZoneInfo("UTC"), bulk=True)
+        replay = ReplaySource(
+            csv_path,
+            tz=ZoneInfo("UTC"),
+            bulk=True,
+            dataset_provenance=True,
+        )
         with SqliteStore(tmp_path / db_name, rules=rules, clock=replay.clock) as store:
             daemon = Daemon(
                 source=replay,

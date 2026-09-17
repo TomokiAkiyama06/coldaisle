@@ -61,6 +61,10 @@ Telemetry CSVは既存経路で同じ時刻のままSQLiteへ投入できる。D
 `sys.ingest_source`を検出すると拒否する。Replay入力のrun alias・source kind・SHA-256は
 取り込み開始前に上書き不能な`dataset_source_run`へbindされ、manifestへ渡すSourceRunとの
 完全一致も検証される。bind済みDBへの再投入は、同じ開始時刻・同じCSVでも拒否される。
+dataset用Replayはconstructorで入力を定数memoryのchunkごとにunlink済み一時fileへcopyし、
+copyと同時にhashする。先頭時刻と全sampleは同じsnapshot bytesから読み、元pathを再openしない。
+通常Replayはこのcopy / eager hashをしない。後のdataset生成時に元CSVが変わっていれば、CLIの
+再hashがDBのsnapshot hashと一致せず生成を拒否する。
 
 ```bash
 uv run coldaisle-daemon \
@@ -75,13 +79,13 @@ uv run coldaisle-daemon \
 旧センサーCSVはFan actionを記録していないため、CSVだけからactionを推測してはならない。
 Replay中にControl Engineが出したtrace、または保存済みtraceが必要になる。
 
-## artifactの公開と置換
+## artifactの公開
 
 生成物はoutput root内のstaging directoryへ先に書き、checksumを含む2ファイルをfsync後、
-artifact directoryとして原子的に公開する。path component・artifact・内部fileのsymlink / FIFO
-は追従しない。既存artifactは既定で拒否される。置換が必要な場合だけ`--force`を指定できるが、
-schema・件数・checksumまで検証できた既存artifact以外は削除しない。安全な原子的renameのため
-Linux `renameat2`が必要であり、利用できなければfail closedになる。
+固定parent lockでwriterを直列化し、同じparent内の`os.rename`でartifact directoryとして
+原子的に公開する。path componentのsymlink / FIFOは追従しない。既存artifactは種別や内容を
+問わず常に拒否し、上書き機能は提供しない。output rootは実行user所有・非group/world writable
+とし、この権限境界内の全writerが固定lockを使う。実装はmacOS / Ubuntu共通である。
 
 ## time leakageのないsplit
 

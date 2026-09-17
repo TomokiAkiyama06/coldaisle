@@ -9,6 +9,7 @@ CSV は**テストの中で書き出す。** `.gitignore` が `sensors_*.csv` �
 体裁は実ファイル（`~/server_sensor_logs/`）に合わせてある。
 """
 
+import os
 from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -16,7 +17,7 @@ from zoneinfo import ZoneInfo
 import pytest
 
 from coldaisle.ingest.protocol import RawHello, RawSample
-from coldaisle.ingest.replay import ReplaySource, normalize_column
+from coldaisle.ingest.replay import ReplaySource, normalize_column, replay_sha256
 from coldaisle.store import Quality, SqliteStore
 from coldaisle.store.rollup import rollup_minutes
 
@@ -88,6 +89,34 @@ def test_rows_become_samples(day_24):
     assert len(produced) == 4
     assert produced[0].channels["room_temp"] == 24.4
     assert produced[0].channels["rear_exhaust"] == 23.94
+
+
+def test_normal_replay_does_not_eagerly_hash_the_input(day_24):
+    replay = source(day_24)
+
+    assert replay.source_sha256 is None
+
+
+def test_dataset_replay_hashes_and_streams_the_same_private_snapshot(day_24):
+    expected_digest = replay_sha256(day_24)
+    replay = source(day_24, dataset_provenance=True)
+    day_24.write_text(
+        f"{HEADER}\n{DAY_24_ROWS.replace('24.4', '99.9')}",
+        encoding="utf-8",
+    )
+
+    produced = samples(replay)
+
+    assert replay.source_sha256 == expected_digest
+    assert produced[0].channels["room_temp"] == 24.4
+
+
+def test_replay_fingerprint_rejects_a_fifo_without_blocking(tmp_path):
+    fifo = tmp_path / "replay.csv"
+    os.mkfifo(fifo)
+
+    with pytest.raises(ValueError, match="regular file"):
+        replay_sha256(fifo)
 
 
 def test_blank_cells_are_missing(day_24):

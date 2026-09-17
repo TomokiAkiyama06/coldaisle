@@ -672,6 +672,7 @@ def _build_source(config: Config) -> Source:
                 tz=ZoneInfo(config.timezone),
                 speed=config.speed,
                 bulk=config.bulk,
+                dataset_provenance=config.dataset_run_alias is not None,
             )
         except ValueError as error:
             raise SystemExit(str(error)) from error
