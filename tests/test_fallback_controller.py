@@ -459,3 +459,19 @@ def test_gate_does_not_own_manual_or_calibration_requests() -> None:
             operating_mode=OperatingMode.MANUAL,
             safety_state=SafetyState.NORMAL,
         )
+
+
+def test_max_mode_keeps_fallback_as_the_underlying_controller_not_as_the_override() -> None:
+    """MAX は #78 forced_max。Gate が requested=1.0 を偽装してSafetyを迂回しない。"""
+    gate = ControllerGate(policy(), expected_model_version="thermal-v1")
+    decision = gate.select(
+        now_mono_ms=0,
+        fallback=fallback_proposal(0.2),
+        learned=healthy_status(),
+        operating_mode=OperatingMode.MAX,
+        safety_state=SafetyState.NORMAL,
+    )
+
+    assert decision.active_controller is ControllerKind.FALLBACK
+    assert decision.proposal.requested.front.demand == 0.2
+    assert decision.fallback_reason is None

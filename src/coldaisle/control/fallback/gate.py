@@ -136,6 +136,9 @@ class ControllerGate:
         previous_controller = self._active_controller
 
         if operating_mode is OperatingMode.MAX:
+            # MAX は requested の値ではなく #78 の forced_max override。ControlState は
+            # override の下で動く制御器を追跡するため、ここでは Fallback を返す
+            # （0028 §2.4 / §2.5 (a)）。Hardware は EffectiveZoneDemand しか受け取らない。
             self._healthy_since_mono_ms = None
             return self._remember(fallback, None, previous_controller)
 
