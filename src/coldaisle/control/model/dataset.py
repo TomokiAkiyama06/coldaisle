@@ -42,6 +42,19 @@ class DatasetSourceKind(StrEnum):
     IMPORT = "import"
 
 
+class DatasetWorkloadRegime(StrEnum):
+    """dataset v1が受け付ける観測済み負荷区分。#87のControlTick値と対応する。"""
+
+    IDLE = "idle"
+    TRANSIENT_CPU = "transient_cpu"
+    TRANSIENT_GPU = "transient_gpu"
+    SUSTAINED_CPU = "sustained_cpu"
+    SUSTAINED_GPU = "sustained_gpu"
+    SUSTAINED_CPU_GPU = "sustained_cpu_gpu"
+    COOLDOWN = "cooldown"
+    UNKNOWN = "unknown"
+
+
 class DatasetSpec(_Frozen):
     """1つの dataset artifact を組み立てるための明示的な設定。"""
 
@@ -107,6 +120,35 @@ class WindowFrame(_Frozen):
     missing_mask: dict[str, bool]
     stale_mask: dict[str, bool]
 
+    @model_validator(mode="after")
+    def _masks_match_cells(self) -> Self:
+        mappings = (
+            self.source_ts_ms,
+            self.quality,
+            self.missing_mask,
+            self.stale_mask,
+        )
+        if any(set(mapping) != set(self.values) for mapping in mappings):
+            raise ValueError("window cellのmetric集合が一致しない")
+        for metric, value in self.values.items():
+            source_ts = self.source_ts_ms[metric]
+            quality = self.quality[metric]
+            missing = self.missing_mask[metric]
+            stale = self.stale_mask[metric]
+            if source_ts is None:
+                if value is not None or quality is not None or not missing or stale:
+                    raise ValueError(
+                        "未観測cellはvalue/qualityなし・missing=true・stale=falseにする"
+                    )
+                continue
+            if quality is None:
+                raise ValueError("観測時刻を持つcellにはqualityが要る")
+            if missing != (value is None or quality is Quality.MISSING):
+                raise ValueError("window cellのmissing_maskがvalue/qualityと一致しない")
+            if quality is Quality.STALE and not stale:
+                raise ValueError("quality=staleのcellはstale_maskを立てる")
+        return self
+
 
 class TargetFrame(_Frozen):
     """action より後の1 horizon に対応する教師値。"""
@@ -117,6 +159,25 @@ class TargetFrame(_Frozen):
     source_ts_ms: dict[str, int | None]
     quality: dict[str, Quality | None]
     missing_mask: dict[str, bool]
+
+    @model_validator(mode="after")
+    def _mask_matches_cells(self) -> Self:
+        mappings = (self.source_ts_ms, self.quality, self.missing_mask)
+        if any(set(mapping) != set(self.values) for mapping in mappings):
+            raise ValueError("target cellのmetric集合が一致しない")
+        for metric, value in self.values.items():
+            source_ts = self.source_ts_ms[metric]
+            quality = self.quality[metric]
+            missing = self.missing_mask[metric]
+            if source_ts is None:
+                if value is not None or quality is not None or not missing:
+                    raise ValueError("未観測targetはvalue/qualityなし・missing=trueにする")
+                continue
+            if quality is None:
+                raise ValueError("観測時刻を持つtargetにはqualityが要る")
+            if missing != (value is None or quality is Quality.MISSING):
+                raise ValueError("target cellのmissing_maskがvalue/qualityと一致しない")
+        return self
 
 
 class ActionZone(_Frozen):
@@ -141,9 +202,15 @@ class ActionContext(_Frozen):
     safety_state: SafetyState
     fallback_active: bool
     supervisor_policy: str | None
-    workload_regime: str | None
+    workload_regime: DatasetWorkloadRegime | None
     regime_confidence: float | None = Field(default=None, ge=0.0, le=1.0, allow_inf_nan=False)
     fault_codes: tuple[str, ...]
+
+    @model_validator(mode="after")
+    def _regime_and_confidence_are_a_pair(self) -> Self:
+        if (self.workload_regime is None) != (self.regime_confidence is None):
+            raise ValueError("workload_regime と regime_confidence は一緒に記録する")
+        return self
 
 
 class DatasetExample(_Frozen):
@@ -253,6 +320,13 @@ class ThermalDataset(_Frozen):
             ):
                 raise ValueError("label_endがtarget探索範囲と一致しない")
             for frame in example.window:
+                for metric, source_ts in frame.source_ts_ms.items():
+                    quality = frame.quality[metric]
+                    expected_stale = source_ts is not None and (
+                        quality is Quality.STALE or frame.ts_ms - source_ts >= spec.stale_after_ms
+                    )
+                    if frame.stale_mask[metric] != expected_stale:
+                        raise ValueError("window cellのstale_maskがspecの鮮度と一致しない")
                 mappings = (
                     frame.values,
                     frame.source_ts_ms,

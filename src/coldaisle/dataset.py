@@ -23,12 +23,13 @@ from coldaisle.control.model.dataset import (
     DatasetManifest,
     DatasetSourceKind,
     DatasetSpec,
+    DatasetWorkloadRegime,
     SourceRun,
     TargetFrame,
     ThermalDataset,
     WindowFrame,
 )
-from coldaisle.control.schema import SCHEMA_VERSION, ControlTick, PerZone, Zone
+from coldaisle.control.schema import ControlTick, PerZone, Zone
 from coldaisle.ingest.replay import csv_files
 from coldaisle.store import Quality, QualityRules, SeriesPoint, SqliteStore
 from coldaisle.store.models import ControlTraceRecord
@@ -123,15 +124,16 @@ class ThermalDatasetBuilder:
             top=_action_zone(tick, Zone.TOP),
         )
         state_json = raw.get("state")
-        workload_regime: str | None = None
+        workload_regime: DatasetWorkloadRegime | None = None
         regime_confidence: float | None = None
         if isinstance(state_json, dict):
             raw_regime = state_json.get("workload_regime")
             raw_confidence = state_json.get("regime_confidence")
-            workload_regime = raw_regime if isinstance(raw_regime, str) else None
-            regime_confidence = (
-                float(raw_confidence) if isinstance(raw_confidence, (int, float)) else None
-            )
+            if raw_regime is not None or raw_confidence is not None:
+                if not isinstance(raw_regime, str) or not isinstance(raw_confidence, (int, float)):
+                    raise ValueError("workload_regime と regime_confidence のtrace表現が不正")
+                workload_regime = DatasetWorkloadRegime(raw_regime)
+                regime_confidence = float(raw_confidence)
         context = ActionContext(
             operating_mode=tick.state.operating_mode,
             authority_stage=tick.state.authority_stage,
@@ -160,13 +162,10 @@ class ThermalDatasetBuilder:
 
 
 def _parse_tick(trace: ControlTraceRecord) -> tuple[ControlTick, dict[str, object]]:
-    if trace.schema_version != SCHEMA_VERSION:
-        raise ValueError(
-            f"未対応のControlTick schema version: {trace.schema_version}（対応: {SCHEMA_VERSION}）"
-        )
     try:
         loaded = json.loads(trace.trace_json)
-        # strict modelでもJSON表現のenum / tupleを正しく復元する。
+        # 対応versionの判断はControlTickに委ねる。最新versionとの単純比較にすると、
+        # schema v2追加後に互換な保存済みv1 traceまで拒否してしまう。
         tick = ControlTick.model_validate_json(trace.trace_json)
     except (json.JSONDecodeError, ValidationError) as exc:
         raise ValueError("ControlTick decision traceを検証できない") from exc

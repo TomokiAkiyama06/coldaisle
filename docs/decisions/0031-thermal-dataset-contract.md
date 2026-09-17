@@ -30,7 +30,7 @@ Thermal Dataset v1は、1つのControlTickを基点とする次の構造にす�
 - `action`: Front / Rear / Topの`requested_demand`と、実際に適用した
   `effective_demand`を区別し、介入理由を持つ
 - `context`: mode、authority、active controller、safety state、fallback、fault、
-  workload regime（未接続なら明示的に`null`）
+  workload regimeとconfidence（未接続なら両方を明示的に`null`）
 - `targets`: actionより後の複数horizon。期待時刻と実際に採用した観測時刻、quality、
   `missing_mask`を持つ
 - `source_run_id`: 全例からmanifestの元runへ辿れる
@@ -38,6 +38,9 @@ Thermal Dataset v1は、1つのControlTickを基点とする次の構造にす�
 schemaの意味を変える場合は`schema_version`を上げ、既存artifactを新しい意味として
 読み替えない。artifactはmanifest JSONとexamples JSON Linesで保存する。SQLiteと
 ControlTickが正本であり、artifactは再生成物とする。
+
+maskは単なる補助列にせず、値・quality・元観測時刻との整合をschemaで検証する。
+未観測cellは値・quality・元時刻を持たず`missing=true`、`stale=false`とする。
 
 ### 2.2 時刻対応
 

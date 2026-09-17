@@ -131,6 +131,36 @@ def test_no_future_reading_enters_the_input_window(dataset_store):
         ThermalDataset.model_validate_json(json.dumps(invalid))
 
 
+def test_corrupt_masks_and_regime_context_are_rejected_when_loading_artifact(dataset_store):
+    dataset = ThermalDatasetBuilder(dataset_store).build(source_run=source_run(), spec=spec())
+
+    bad_missing = dataset.model_dump(mode="json")
+    bad_missing["examples"][0]["window"][1]["missing_mask"]["air.gpu_intake"] = False
+    with pytest.raises(ValidationError, match="missing_mask"):
+        ThermalDataset.model_validate_json(json.dumps(bad_missing))
+
+    bad_stale = dataset.model_dump(mode="json")
+    bad_stale["examples"][0]["window"][2]["stale_mask"]["air.room"] = False
+    with pytest.raises(ValidationError, match="stale_mask"):
+        ThermalDataset.model_validate_json(json.dumps(bad_stale))
+
+    bad_target = dataset.model_dump(mode="json")
+    bad_target["examples"][0]["targets"][1]["missing_mask"]["air.gpu_exhaust"] = False
+    with pytest.raises(ValidationError, match="未観測target"):
+        ThermalDataset.model_validate_json(json.dumps(bad_target))
+
+    unpaired_regime = dataset.model_dump(mode="json")
+    unpaired_regime["examples"][0]["context"]["workload_regime"] = "idle"
+    with pytest.raises(ValidationError, match="一緒に記録"):
+        ThermalDataset.model_validate_json(json.dumps(unpaired_regime))
+
+    unknown_regime = dataset.model_dump(mode="json")
+    unknown_regime["examples"][0]["context"]["workload_regime"] = "future_prediction"
+    unknown_regime["examples"][0]["context"]["regime_confidence"] = 0.5
+    with pytest.raises(ValidationError, match="workload_regime"):
+        ThermalDataset.model_validate_json(json.dumps(unknown_regime))
+
+
 def test_dataset_spec_has_no_window_or_horizon_defaults():
     with pytest.raises(ValidationError, match="window_ms"):
         DatasetSpec.model_validate(
