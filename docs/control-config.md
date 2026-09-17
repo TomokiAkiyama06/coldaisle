@@ -68,12 +68,24 @@ v3からv4へは `workload_regime` の全項目を実測根拠に基づいて追
 Workload Regime は履歴の単調時刻だけで duration と hysteresis を評価する。壁時計 `Clock` は
 推定結果の `computed_at_ms` を記録するためだけに使い、未来の残り実行時間は出力しない。
 
+#88 のv5で `supervisor` に active / shadow policy、RulePolicy version、regime別context、
+RL artifact version、出力許可範囲を追加する。各contextは strategy、GPU/CPU温度・Air Balance・
+Acoustic・変更量のweight、CPU/GPU temperature target bandを持つ。RL出力も同じ許可strategy、
+target band、weight範囲から外れた場合は採用しない。`UNKNOWN` にも専用contextを必須とし、
+通常負荷へ暗黙変換しない。
+
+v4からv5へは上記をすべて追加してから `schema_version: 5` へ上げる。v1〜v4は自動補完せず
+起動前に拒否する。RLPolicyをactiveまたはshadowにする場合は期待する `rl_version` を必須とする。
+active RLの停止・期限切れ・schema不一致時はRulePolicyへfallbackし、RulePolicyも失敗した場合は
+Supervisor contextなしで既存Fallback Controllerを継続する。期限はworkerの壁時計でなく、
+control loopがoutputを受信したローカル単調時刻から `supervisor.valid_ms` で判定する。
+
 `gate_min_confidence` は `limited` / `expanded` / `full` ごとに持ち、高いauthority stageほど
 低いconfidenceで動かせないよう `limited <= expanded <= full` を検証する。ML→Fallbackの
 切替回数が `demote_window_ms` 内で `demote_after` に達した場合、Gateは降格推奨をtraceへ出す。
 設定上のstageを`SHADOW`へ変更・永続化する責務は #92 に残す。
 
-現行 Control Config v4 は設定の live reload を行わない。設定変更は候補全体を別オブジェクトで検証したうえで
+現行 Control Config v5 は設定の live reload を行わない。設定変更は候補全体を別オブジェクトで検証したうえで
 **次回再起動時**にだけ反映する。これにより、変更後の設定も必ず `STARTUP` の Max を通る。
 `trace_metadata()` は、採用されたsource名・schema version・SHA-256を #82 の decision traceへ渡す。
 `provisional_values()` は起動時の構造化ログへ、暫定値そのものを露出せずに位置と根拠だけを渡す。
