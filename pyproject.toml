@@ -43,6 +43,9 @@ coldaisle-escalate = "coldaisle.escalate:main"
 coldaisle-memory = "coldaisle.memory:main"
 # 較正オフセットの算出。**既定では書かない**（#13）
 coldaisle-calibrate = "coldaisle.calibrate:main"
+# fan daemon 停止後にだけ systemd ExecStopPost から起動する。
+# 制御モデル・Safety Config・外部パッケージに依存せず Max しか書かない。
+coldaisle-safety-handoff = "coldaisle.safety_handoff:main"
 
 [build-system]
 requires = ["hatchling"]

@@ -218,8 +218,10 @@ class SafetyConfig(_ConfigModel):
         Field(min_length=2),
     ]
     fault_demand: SafetyDemand
+    stall_check_min_demand: PerZone[SafetyDemand]
     stall_min_rpm: PerZone[SafetyRpm]
     stall_window_ms: SafetyMilliseconds
+    write_fail_emergency_after: ConfigValue[Annotated[int, Field(gt=0)]]
     telemetry: TelemetryDelays
     ramp_down_per_s: SafetyFloat
     startup_settle_ms: SafetyMilliseconds
@@ -238,6 +240,12 @@ class SafetyConfig(_ConfigModel):
             raise ValueError("fault_demand は全 zone の最低安全 demand 以上にする")
         if self.ramp_down_per_s.value < 0:
             raise ValueError("ramp_down_per_s は 0 以上にする")
+        for zone in Zone:
+            if self.stall_check_min_demand.get(zone).value > self.zone_min_demand.get(zone).value:
+                raise ValueError(
+                    f"stall_check_min_demand.{zone.value} は "
+                    f"zone_min_demand.{zone.value} 以下にする"
+                )
         previous_temperature: float | None = None
         previous_demand: float | None = None
         for point in self.cpu_cooling_floor:
@@ -414,6 +422,11 @@ class ControlConfig(_ConfigModel):
         append("safety.yaml", "absolute_temp_ceiling_c", safety.absolute_temp_ceiling_c)
         append("safety.yaml", "fault_demand", safety.fault_demand)
         append("safety.yaml", "stall_window_ms", safety.stall_window_ms)
+        append(
+            "safety.yaml",
+            "write_fail_emergency_after",
+            safety.write_fail_emergency_after,
+        )
         append("safety.yaml", "ramp_down_per_s", safety.ramp_down_per_s)
         append("safety.yaml", "startup_settle_ms", safety.startup_settle_ms)
         append("safety.yaml", "fault_clear_hold_ms", safety.fault_clear_hold_ms)
@@ -425,6 +438,11 @@ class ControlConfig(_ConfigModel):
                 "safety.yaml",
                 f"zone_min_demand.{zone.value}",
                 safety.zone_min_demand.get(zone),
+            )
+            append(
+                "safety.yaml",
+                f"stall_check_min_demand.{zone.value}",
+                safety.stall_check_min_demand.get(zone),
             )
             append(
                 "safety.yaml",

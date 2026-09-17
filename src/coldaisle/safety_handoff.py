@@ -1,0 +1,199 @@
+"""fan daemon 停止後にだけ動かす emergency Max handoff。
+
+決定記録 0028 §2.7 に従い、このモジュールは標準ライブラリ以外に依存せず、
+Safety Config やモデルを読まない。書ける値は hwmon ABI の Max ``255`` と
+manual mode ``1`` だけである。呼び出し側は、fan daemon の writer が停止した
+ことを systemd で保証してから実行する。
+"""
+
+from __future__ import annotations
+
+import json
+import re
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+HWMON_MAX_PWM = "255\n"
+HWMON_MANUAL_MODE = "1\n"
+HANDOFF_RECORD_PATH = Path("/run/coldaisle/fan-handoff.json")
+HWMON_ROOT = Path("/sys/class/hwmon")
+_ZONES = frozenset({"front", "rear", "top"})
+_HEADER_FIELDS = frozenset(
+    {
+        "zone",
+        "name_path",
+        "expected_name",
+        "label_path",
+        "expected_label",
+        "pwm_path",
+        "enable_path",
+        "original_pwm",
+        "original_enable",
+    }
+)
+
+
+class HandoffRecordError(ValueError):
+    """handoff record が不正、または sysfs root 外を指している。"""
+
+
+@dataclass(frozen=True, slots=True)
+class _HeaderRecord:
+    zone: str
+    name_path: str
+    expected_name: str
+    label_path: str
+    expected_label: str
+    pwm_path: str
+    enable_path: str
+    original_pwm: int
+    original_enable: int
+
+
+@dataclass(frozen=True, slots=True)
+class HandoffResult:
+    """emergency handoff の実行結果。書き込み値そのものは受け取らない。"""
+
+    record_found: bool
+    applied_zones: tuple[str, ...] = ()
+    identity_mismatch_zones: tuple[str, ...] = ()
+
+
+def emergency_handoff(record_path: Path, sysfs_root: Path) -> HandoffResult:
+    """record で特定済みの header だけを Max の manual mode にする。
+
+    record が無ければ制御を取っていないため何もしない。driver ``name`` または
+    header label が一致しない zone も書き込まない。一致した zone は PWM を先に
+    Max へ上げ、その後 manual mode に切り替える。
+    """
+    if not record_path.exists():
+        return HandoffResult(record_found=False)
+
+    headers = _load_record(record_path)
+    root = sysfs_root.resolve(strict=True)
+    resolved = [(_resolve_header(header, root), header) for header in headers]
+    _reject_duplicate_targets(tuple(paths for paths, _ in resolved))
+
+    applied: list[str] = []
+    mismatched: list[str] = []
+    for paths, header in resolved:
+        name_path, label_path, pwm_path, enable_path = paths
+        if (
+            name_path.read_text(encoding="utf-8").strip() != header.expected_name
+            or label_path.read_text(encoding="utf-8").strip() != header.expected_label
+        ):
+            mismatched.append(header.zone)
+            continue
+        # auto のまま PWM を Max にしてから manual に切り替えれば、途中で
+        # プロセスが止まっても一時的に冷却を下げる書き込みにはならない。
+        pwm_path.write_text(HWMON_MAX_PWM, encoding="ascii")
+        enable_path.write_text(HWMON_MANUAL_MODE, encoding="ascii")
+        applied.append(header.zone)
+    return HandoffResult(
+        record_found=True,
+        applied_zones=tuple(applied),
+        identity_mismatch_zones=tuple(mismatched),
+    )
+
+
+def main() -> int:
+    """systemd ``ExecStopPost`` 向けの固定入力 entry point。
+
+    書き込む値や対象 root を引数で差し替える経路は持たない。identity
+    mismatch は対象外 header へ書かず、非0で systemd へ通知する。
+    """
+    result = emergency_handoff(HANDOFF_RECORD_PATH, HWMON_ROOT)
+    return 1 if result.identity_mismatch_zones else 0
+
+
+def _load_record(path: Path) -> tuple[_HeaderRecord, ...]:
+    try:
+        raw: Any = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise HandoffRecordError("handoff record を読めない") from exc
+    if not isinstance(raw, dict) or set(raw) != {"schema_version", "headers"}:
+        raise HandoffRecordError("handoff record の top-level 形式が不正")
+    if type(raw["schema_version"]) is not int or raw["schema_version"] != 1:
+        raise HandoffRecordError("handoff record の schema_version が不正")
+    entries = raw["headers"]
+    if not isinstance(entries, list) or len(entries) != len(_ZONES):
+        raise HandoffRecordError("handoff record に3 zoneすべてが必要")
+
+    headers = tuple(_parse_header(entry) for entry in entries)
+    zones = {header.zone for header in headers}
+    if zones != _ZONES:
+        raise HandoffRecordError("handoff record の zone は front/rear/top を1つずつにする")
+    return headers
+
+
+def _parse_header(raw: object) -> _HeaderRecord:
+    if not isinstance(raw, dict) or set(raw) != _HEADER_FIELDS:
+        raise HandoffRecordError("handoff header の欠落・未知フィールド")
+    for name in (
+        "zone",
+        "name_path",
+        "expected_name",
+        "label_path",
+        "expected_label",
+        "pwm_path",
+        "enable_path",
+    ):
+        if not isinstance(raw[name], str) or not raw[name] or len(raw[name]) > 500:
+            raise HandoffRecordError(f"handoff header.{name} が不正")
+    for name in ("original_pwm", "original_enable"):
+        if type(raw[name]) is not int or not 0 <= raw[name] <= 255:
+            raise HandoffRecordError(f"handoff header.{name} が不正")
+    return _HeaderRecord(
+        zone=raw["zone"],
+        name_path=raw["name_path"],
+        expected_name=raw["expected_name"],
+        label_path=raw["label_path"],
+        expected_label=raw["expected_label"],
+        pwm_path=raw["pwm_path"],
+        enable_path=raw["enable_path"],
+        original_pwm=raw["original_pwm"],
+        original_enable=raw["original_enable"],
+    )
+
+
+def _resolve_header(header: _HeaderRecord, root: Path) -> tuple[Path, Path, Path, Path]:
+    paths = (
+        _resolve_beneath(root, header.name_path),
+        _resolve_beneath(root, header.label_path),
+        _resolve_beneath(root, header.pwm_path),
+        _resolve_beneath(root, header.enable_path),
+    )
+    name_path, label_path, pwm_path, enable_path = paths
+    if len({path.parent for path in paths}) != 1:
+        raise HandoffRecordError("handoff header の identity と書き込み先は同一 header にする")
+    if (
+        name_path.name != "name"
+        or re.fullmatch(r"(?:fan|pwm)[1-9][0-9]*_label", label_path.name) is None
+    ):
+        raise HandoffRecordError("handoff header の identity path が hwmon 形式ではない")
+    if re.fullmatch(r"pwm[1-9][0-9]*", pwm_path.name) is None:
+        raise HandoffRecordError("handoff header の PWM path が hwmon 形式ではない")
+    if enable_path.name != f"{pwm_path.name}_enable":
+        raise HandoffRecordError("handoff header の enable path が PWM channel と一致しない")
+    return paths
+
+
+def _resolve_beneath(root: Path, relative: str) -> Path:
+    candidate = Path(relative)
+    if candidate.is_absolute():
+        raise HandoffRecordError("handoff record の path は sysfs root からの相対 path にする")
+    resolved = (root / candidate).resolve(strict=True)
+    if not resolved.is_relative_to(root):
+        raise HandoffRecordError("handoff record が sysfs root 外を指している")
+    return resolved
+
+
+def _reject_duplicate_targets(headers: tuple[tuple[Path, Path, Path, Path], ...]) -> None:
+    targets = [(paths[2], paths[3]) for paths in headers]
+    if len(set(targets)) != len(targets):
+        raise HandoffRecordError("handoff record で複数 zone が同じ header を指している")
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

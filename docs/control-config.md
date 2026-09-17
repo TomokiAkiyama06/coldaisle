@@ -17,6 +17,10 @@ BIOS制御のまま終了、特定済みなら安全側へ引継ぎ）へ接続�
 `telemetry.t_sensor.enabled` は温度計モジュールの未設置を明示する。`false` のときは
 T_SENSORのstale判定を持たず、`true` にするには `confirmed` と承認根拠、および許容遅延が必要である。
 有効化も再起動時にだけ反映する。
+`stall_check_min_demand` / `stall_min_rpm` / `stall_window_ms` と
+`write_fail_emergency_after` も `safety.yaml` の承認対象とし、stallや連続書き込み失敗の
+判定値をコードに埋め込まない。`stall_check_min_demand` は zone の最低安全 demand
+以下でなければ設定検証で拒否し、通常の安全 floor で回っている fan も監視対象にする。
 `fan-policy.yaml` は、MPCの `period_ms`・`budget_ms`・`valid_ms`、Supervisorの
 `period_ms`・`valid_ms` を持つ。期限は制御デーモンが受信時刻から単調時計で判定する。
 `authority_limits` には LIMITED / EXPANDED ごとの許可zone、Fallbackからの `limit_up` /

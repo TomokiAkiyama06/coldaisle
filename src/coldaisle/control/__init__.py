@@ -33,6 +33,20 @@ from coldaisle.control.hardware import (
     SimulatedFaultPlan,
 )
 from coldaisle.control.logging import ControlTraceLogger, ControlTraceSink
+from coldaisle.control.safety import (
+    ABSOLUTE_TEMPERATURE_METRICS,
+    AIR_TELEMETRY_GROUP,
+    CPU_TEMPERATURE_METRIC,
+    GPU_TEMPERATURE_METRIC,
+    T_SENSOR_TEMPERATURE_METRIC,
+    CriticalSafety,
+    CriticalSafetyDecision,
+    HandoffRecordError,
+    HandoffResult,
+    compose_effective_demands,
+    emergency_handoff,
+    invalid_config_decision,
+)
 from coldaisle.control.schema import (
     BOUND_BY_PRECEDENCE,
     EMERGENCY_FAULTS,
@@ -63,14 +77,19 @@ from coldaisle.control.schema import (
 )
 
 __all__ = [
+    "ABSOLUTE_TEMPERATURE_METRICS",
     "ACOUSTIC_CONFIG_FILENAME",
     "ACOUSTIC_CONFIG_VERSION",
+    "AIR_TELEMETRY_GROUP",
     "BOUND_BY_PRECEDENCE",
     "CONFIG_FILENAMES",
     "CONTROL_CONFIG_VERSION",
+    "CPU_TEMPERATURE_METRIC",
     "EMERGENCY_FAULTS",
+    "GPU_TEMPERATURE_METRIC",
     "SCHEMA_VERSION",
     "TOP_EMERGENCY_FAULTS",
+    "T_SENSOR_TEMPERATURE_METRIC",
     "ZONE_FAULTS",
     "AcousticCostEstimate",
     "AcousticCostMetadata",
@@ -88,6 +107,8 @@ __all__ = [
     "ControlTraceSink",
     "ControllerKind",
     "ControllerProposal",
+    "CriticalSafety",
+    "CriticalSafetyDecision",
     "Demand",
     "DisabledAcousticCostModel",
     "EffectiveZoneDemand",
@@ -96,6 +117,8 @@ __all__ = [
     "Fault",
     "FaultCode",
     "GuardZoneOutput",
+    "HandoffRecordError",
+    "HandoffResult",
     "HardwareReadback",
     "OperatingMode",
     "OptimizerStatus",
@@ -110,5 +133,8 @@ __all__ = [
     "ZoneAcousticCurve",
     "ZoneRecord",
     "ZoneRequest",
+    "compose_effective_demands",
+    "emergency_handoff",
+    "invalid_config_decision",
     "load_acoustic_model",
 ]

@@ -138,6 +138,7 @@ class FaultCode(StrEnum):
     GPU_TELEMETRY_STALE = "gpu_telemetry_stale"
     T_SENSOR_STALE = "t_sensor_stale"
     AIR_TELEMETRY_STALE = "air_telemetry_stale"
+    ABSOLUTE_TEMPERATURE_LIMIT = "absolute_temperature_limit"
     TACH_STALL = "tach_stall"
     WRITE_FAILURE = "write_failure"
     READBACK_MISMATCH = "readback_mismatch"
@@ -388,7 +389,12 @@ class ControlState(_Frozen):
 
 
 EMERGENCY_FAULTS: frozenset[FaultCode] = frozenset(
-    {FaultCode.CONFIG_INVALID, FaultCode.FALLBACK_EXCEPTION, FaultCode.GUARD_EXCEPTION}
+    {
+        FaultCode.ABSOLUTE_TEMPERATURE_LIMIT,
+        FaultCode.CONFIG_INVALID,
+        FaultCode.FALLBACK_EXCEPTION,
+        FaultCode.GUARD_EXCEPTION,
+    }
 )
 """起きたら無条件に `EMERGENCY` にする故障（設定不正・決定論的な層の例外。0028 §2.7）。"""
 

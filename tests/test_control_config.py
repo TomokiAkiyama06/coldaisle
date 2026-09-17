@@ -68,12 +68,18 @@ def valid_documents() -> dict[str, dict[str, object]]:
                 {"temperature_c": provisional(80.0), "demand": provisional(1.0)},
             ],
             "fault_demand": provisional(1.0),
+            "stall_check_min_demand": {
+                "front": provisional(0.4),
+                "rear": provisional(0.4),
+                "top": provisional(0.5),
+            },
             "stall_min_rpm": {
                 "front": provisional(400),
                 "rear": provisional(400),
                 "top": provisional(400),
             },
             "stall_window_ms": provisional(2000),
+            "write_fail_emergency_after": provisional(3),
             "telemetry": {
                 "cpu_ms": provisional(1000),
                 "gpu_ms": provisional(1000),
@@ -178,6 +184,12 @@ def test_cross_field_validation_rejects_unsafe_or_unstable_values(tmp_path: Path
     with pytest.raises(ValidationError, match="ceiling"):
         ControlConfig.from_directory(tmp_path)
 
+    documents = valid_documents()
+    documents["safety.yaml"]["stall_check_min_demand"]["front"] = provisional(0.5)
+    write_documents(tmp_path, documents)
+    with pytest.raises(ValidationError, match=r"stall_check_min_demand\.front"):
+        ControlConfig.from_directory(tmp_path)
+
 
 def test_unstable_hwmon_number_is_rejected(tmp_path: Path) -> None:
     documents = valid_documents()
@@ -267,6 +279,8 @@ def test_provisional_values_identify_safety_and_policy_without_exposing_values(
         "fan-policy.yaml",
     }
     assert any(item.path == "fault_demand" for item in values)
+    assert any(item.path == "stall_check_min_demand.front" for item in values)
+    assert any(item.path == "write_fail_emergency_after" for item in values)
     assert any(item.path == "telemetry.t_sensor.enabled" for item in values)
     assert any(item.path == "reactive_guard.ceiling" for item in values)
     assert all("value" not in item.model_dump() for item in values)
