@@ -19,6 +19,14 @@ T_SENSORのstale判定を持たず、`true` にするには `confirmed` と承�
 有効化も再起動時にだけ反映する。
 `fan-policy.yaml` は、MPCの `period_ms`・`budget_ms`・`valid_ms`、Supervisorの
 `period_ms`・`valid_ms` を持つ。期限は制御デーモンが受信時刻から単調時計で判定する。
+Fallback v2 の shape に Reactive Guard の閾値バンドを追加した
+`fan-policy.yaml` の schema version は 3 とする。
+Reactive Guard の `floor` / `hold_ms` と、温度・Power・吸気温度差の各 trigger は
+通常時と Degraded 時の `activate_above` / `clear_at_or_below` を持つ。これらは
+全て `status` / `basis` の追跡対象で、実測前は `provisional` のまま扱う。
+CPU Power trigger の metric 名は提案中の DR0032 に依存するため、
+`cpu_power_metric` は未承認時は `null` にして trigger を無効にする。
+DR0032 の確定後も、`confirmed` と承認根拠 `basis` が無ければ設定検証で拒否する。
 `authority_limits` には LIMITED / EXPANDED ごとの許可zone、Fallbackからの `limit_up` /
 `limit_down` を必須とし、後続のGate実装が設定外の定数に依存しないようにする。
 

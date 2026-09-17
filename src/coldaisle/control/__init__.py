@@ -23,8 +23,11 @@ from coldaisle.control.acoustic import (
 from coldaisle.control.config import (
     CONFIG_FILENAMES,
     CONTROL_CONFIG_VERSION,
+    FAN_POLICY_CONFIG_VERSION,
     ControlConfig,
+    GuardThresholdBand,
     ProvisionalConfigValue,
+    ReactiveGuardConfig,
 )
 from coldaisle.control.fallback import (
     ControllerGate,
@@ -42,6 +45,15 @@ from coldaisle.control.hardware import (
     SimulatedFaultPlan,
 )
 from coldaisle.control.logging import ControlTraceLogger, ControlTraceSink
+from coldaisle.control.reactive import (
+    GuardEvent,
+    GuardEvidence,
+    GuardEvidenceSource,
+    GuardThresholdProfile,
+    GuardTransition,
+    ReactiveGuard,
+    ReactiveGuardDecision,
+)
 from coldaisle.control.schema import (
     BOUND_BY_PRECEDENCE,
     EMERGENCY_FAULTS,
@@ -78,6 +90,7 @@ __all__ = [
     "CONFIG_FILENAMES",
     "CONTROL_CONFIG_VERSION",
     "EMERGENCY_FAULTS",
+    "FAN_POLICY_CONFIG_VERSION",
     "SCHEMA_VERSION",
     "TOP_EMERGENCY_FAULTS",
     "ZONE_FAULTS",
@@ -108,6 +121,12 @@ __all__ = [
     "FanHardwareResult",
     "Fault",
     "FaultCode",
+    "GuardEvent",
+    "GuardEvidence",
+    "GuardEvidenceSource",
+    "GuardThresholdBand",
+    "GuardThresholdProfile",
+    "GuardTransition",
     "GuardZoneOutput",
     "HardwareReadback",
     "LearnedControlStatus",
@@ -116,6 +135,9 @@ __all__ = [
     "OptimizerStatus",
     "PerZone",
     "ProvisionalConfigValue",
+    "ReactiveGuard",
+    "ReactiveGuardConfig",
+    "ReactiveGuardDecision",
     "Reason",
     "SafetyState",
     "SafetyZoneOutput",
