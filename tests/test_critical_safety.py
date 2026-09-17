@@ -9,7 +9,6 @@ import pytest
 from coldaisle.control.config import SafetyConfig
 from coldaisle.control.safety import (
     AIR_TELEMETRY_GROUP,
-    T_SENSOR_TEMPERATURE_METRIC,
     CriticalSafety,
     CriticalSafetyDecision,
     compose_effective_demands,
@@ -37,6 +36,8 @@ from coldaisle.control.state import (
     TelemetryImportance,
 )
 from coldaisle.store.models import Quality
+
+PROPOSED_T_SENSOR_METRIC = "board.connector_12v2x6"
 
 
 def tracked(value: object, status: str = "provisional") -> dict[str, object]:
@@ -191,7 +192,9 @@ def empty_guard() -> PerZone[GuardZoneOutput]:
     return PerZone(front=item, rear=item, top=item)
 
 
-def requests(front: float, rear: float | None = None, top: float | None = None):
+def requests(
+    front: float, rear: float | None = None, top: float | None = None
+) -> PerZone[ZoneRequest]:
     def item(demand: float) -> ZoneRequest:
         return ZoneRequest(demand=demand, reason=Reason(code="test_request"))
 
@@ -331,20 +334,36 @@ def test_t_sensor_disabled_is_ignored_but_enabled_loss_is_critical() -> None:
         snapshot(
             tick=3,
             mono=2_000,
-            critical=(T_SENSOR_TEMPERATURE_METRIC,),
+            extra_signals=(signal(PROPOSED_T_SENSOR_METRIC, 100.0),),
         ),
         mode=OperatingMode.AUTO,
     )
 
-    enabled = CriticalSafety(safety_config(t_sensor_enabled=True, fault_demand=0.9))
-    settle(enabled)
+    with pytest.raises(ValueError, match="metric contract"):
+        CriticalSafety(safety_config(t_sensor_enabled=True, fault_demand=0.9))
+
+    enabled = CriticalSafety(
+        safety_config(t_sensor_enabled=True, fault_demand=0.9),
+        approved_t_sensor_metric=PROPOSED_T_SENSOR_METRIC,
+    )
+    t_sensor = (signal(PROPOSED_T_SENSOR_METRIC, 60.0),)
+    enabled.evaluate(
+        snapshot(tick=1, mono=0, extra_signals=t_sensor),
+        mode=OperatingMode.AUTO,
+    )
+    healthy = enabled.evaluate(
+        snapshot(tick=2, mono=1_000, extra_signals=t_sensor),
+        mode=OperatingMode.AUTO,
+    )
     enabled_result = enabled.evaluate(
-        snapshot(tick=3, mono=2_000, critical=(T_SENSOR_TEMPERATURE_METRIC,)),
+        snapshot(tick=3, mono=2_000, critical=(PROPOSED_T_SENSOR_METRIC,)),
         mode=OperatingMode.AUTO,
     )
 
     assert disabled_result.state is SafetyState.NORMAL
     assert disabled_result.faults == ()
+    assert disabled_result.disabled_inputs[0].code == "t_sensor_disabled"
+    assert healthy.state is SafetyState.NORMAL
     assert enabled_result.state is SafetyState.DEGRADED
     assert enabled_result.faults[0].code is FaultCode.T_SENSOR_STALE
     assert enabled_result.zones.front.floor == 0.9
@@ -377,6 +396,23 @@ def test_absolute_temperature_limit_forces_emergency_max() -> None:
     assert result.state is SafetyState.EMERGENCY
     assert result.faults[0].code is FaultCode.ABSOLUTE_TEMPERATURE_LIMIT
     assert all(result.zones.get(zone).forced_max for zone in Zone)
+
+
+def test_deprecated_bare_chipset_name_is_not_treated_as_temperature() -> None:
+    safety = CriticalSafety(safety_config())
+    settle(safety)
+
+    result = safety.evaluate(
+        snapshot(
+            tick=3,
+            mono=2_000,
+            extra_signals=(signal("chipset", 100.0),),
+        ),
+        mode=OperatingMode.AUTO,
+    )
+
+    assert result.state is SafetyState.NORMAL
+    assert result.faults == ()
 
 
 def test_front_stall_uses_monotonic_window_then_maxes_zone_and_raises_others() -> None:

@@ -36,7 +36,6 @@ from coldaisle.control.state import ControlStateSnapshot
 
 CPU_TEMPERATURE_METRIC = "cpu.package"
 GPU_TEMPERATURE_METRIC = "gpu.0.core"
-T_SENSOR_TEMPERATURE_METRIC = "board.connector_12v2x6"
 AIR_TELEMETRY_GROUP = "air_telemetry"
 
 # これらは値ではなく、requirements と決定記録 0029 の canonical metric contract。
@@ -49,8 +48,6 @@ ABSOLUTE_TEMPERATURE_METRICS: frozenset[str] = frozenset(
         "gpu.0.mem",
         "cpu.vrm",
         "board.chipset",
-        "chipset",
-        T_SENSOR_TEMPERATURE_METRIC,
         "air.front_intake",
         "air.gpu_intake",
         "air.gpu_exhaust",
@@ -74,6 +71,7 @@ class CriticalSafetyDecision(BaseModel):
     state: SafetyState
     zones: PerZone[SafetyZoneOutput]
     faults: tuple[Fault, ...] = ()
+    disabled_inputs: tuple[Reason, ...] = ()
     config_validated: bool = True
     config_is_provisional: bool
 
@@ -93,8 +91,29 @@ class CriticalSafety:
     Safety の floor や fault を迂回できない。
     """
 
-    def __init__(self, config: SafetyConfig) -> None:
+    def __init__(
+        self,
+        config: SafetyConfig,
+        *,
+        approved_t_sensor_metric: str | None = None,
+    ) -> None:
+        t_sensor_enabled = config.telemetry.t_sensor.enabled.value
+        if t_sensor_enabled and approved_t_sensor_metric is None:
+            raise ValueError("T_SENSOR 有効化には承認済みの metric contract を注入する")
+        if not t_sensor_enabled and approved_t_sensor_metric is not None:
+            raise ValueError("T_SENSOR が無効のときは metric contract を注入しない")
         self._config = config
+        self._t_sensor_metric = approved_t_sensor_metric
+        self._disabled_inputs = (
+            ()
+            if t_sensor_enabled
+            else (
+                Reason(
+                    code="t_sensor_disabled",
+                    detail="installation, calibration, and metric contract are not approved",
+                ),
+            )
+        )
         self._started_ms: int | None = None
         self._last_tick_id: int | None = None
         self._last_monotonic_ms: int | None = None
@@ -171,6 +190,7 @@ class CriticalSafety:
             state=state,
             zones=self._zone_outputs(snapshot, state, mode, faults),
             faults=faults,
+            disabled_inputs=self._disabled_inputs,
             config_is_provisional=self._config_is_provisional,
         )
 
@@ -187,9 +207,10 @@ class CriticalSafety:
         known = {
             CPU_TEMPERATURE_METRIC,
             GPU_TEMPERATURE_METRIC,
-            T_SENSOR_TEMPERATURE_METRIC,
             AIR_TELEMETRY_GROUP,
         }
+        if self._t_sensor_metric is not None:
+            known.add(self._t_sensor_metric)
         unknown = unavailable - known
         if unknown:
             # 新しい Critical 入力を黙って無視するより、上位でプロセスを終了し
@@ -201,8 +222,8 @@ class CriticalSafety:
             faults.append(Fault(code=FaultCode.CPU_TELEMETRY_STALE))
         if not _signal_available(snapshot, GPU_TEMPERATURE_METRIC):
             faults.append(Fault(code=FaultCode.GPU_TELEMETRY_STALE))
-        if self._config.telemetry.t_sensor.enabled.value and not _signal_available(
-            snapshot, T_SENSOR_TEMPERATURE_METRIC
+        if self._t_sensor_metric is not None and not _signal_available(
+            snapshot, self._t_sensor_metric
         ):
             faults.append(Fault(code=FaultCode.T_SENSOR_STALE))
         if AIR_TELEMETRY_GROUP in unavailable:
@@ -214,7 +235,7 @@ class CriticalSafety:
         exceeded = sorted(
             (signal.metric, signal.value)
             for signal in snapshot.signals
-            if signal.metric in ABSOLUTE_TEMPERATURE_METRICS
+            if self._is_absolute_temperature_metric(signal.metric)
             and signal.available
             and signal.value is not None
             and signal.value >= ceiling
@@ -226,6 +247,9 @@ class CriticalSafety:
             code=FaultCode.ABSOLUTE_TEMPERATURE_LIMIT,
             detail=f"absolute ceiling {ceiling:g}C reached: {detail}",
         )
+
+    def _is_absolute_temperature_metric(self, metric: str) -> bool:
+        return metric in ABSOLUTE_TEMPERATURE_METRICS or metric == self._t_sensor_metric
 
     def _observe_startup_tach(self, snapshot: ControlStateSnapshot) -> None:
         if snapshot.fans is None:

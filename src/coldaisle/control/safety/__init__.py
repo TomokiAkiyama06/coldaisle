@@ -5,7 +5,6 @@ from coldaisle.control.safety.critical import (
     AIR_TELEMETRY_GROUP,
     CPU_TEMPERATURE_METRIC,
     GPU_TEMPERATURE_METRIC,
-    T_SENSOR_TEMPERATURE_METRIC,
     CriticalSafety,
     CriticalSafetyDecision,
     compose_effective_demands,
@@ -14,6 +13,7 @@ from coldaisle.control.safety.critical import (
 from coldaisle.safety_handoff import (
     HandoffRecordError,
     HandoffResult,
+    HandoffZoneResult,
     emergency_handoff,
 )
 
@@ -22,11 +22,11 @@ __all__ = [
     "AIR_TELEMETRY_GROUP",
     "CPU_TEMPERATURE_METRIC",
     "GPU_TEMPERATURE_METRIC",
-    "T_SENSOR_TEMPERATURE_METRIC",
     "CriticalSafety",
     "CriticalSafetyDecision",
     "HandoffRecordError",
     "HandoffResult",
+    "HandoffZoneResult",
     "compose_effective_demands",
     "emergency_handoff",
     "invalid_config_decision",

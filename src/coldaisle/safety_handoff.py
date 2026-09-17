@@ -12,7 +12,7 @@ import json
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 HWMON_MAX_PWM = "255\n"
 HWMON_MANUAL_MODE = "1\n"
@@ -52,12 +52,35 @@ class _HeaderRecord:
 
 
 @dataclass(frozen=True, slots=True)
+class HandoffZoneResult:
+    """1 zone の Max handoff 結果。"""
+
+    zone: str
+    status: Literal["applied", "identity_mismatch", "io_error"]
+    detail: str = ""
+
+
+@dataclass(frozen=True, slots=True)
 class HandoffResult:
-    """emergency handoff の実行結果。書き込み値そのものは受け取らない。"""
+    """emergency handoff の全 zone 結果。書き込み値は受け取らない。"""
 
     record_found: bool
-    applied_zones: tuple[str, ...] = ()
-    identity_mismatch_zones: tuple[str, ...] = ()
+    zones: tuple[HandoffZoneResult, ...] = ()
+
+    @property
+    def applied_zones(self) -> tuple[str, ...]:
+        """Max と manual mode の両方を書けた zone。"""
+        return tuple(result.zone for result in self.zones if result.status == "applied")
+
+    @property
+    def identity_mismatch_zones(self) -> tuple[str, ...]:
+        """driver name / label が record と一致しなかった zone。"""
+        return tuple(result.zone for result in self.zones if result.status == "identity_mismatch")
+
+    @property
+    def failed_zones(self) -> tuple[str, ...]:
+        """I/O 失敗のため handoff を完了できなかった zone。"""
+        return tuple(result.zone for result in self.zones if result.status == "io_error")
 
 
 def emergency_handoff(record_path: Path, sysfs_root: Path) -> HandoffResult:
@@ -72,29 +95,58 @@ def emergency_handoff(record_path: Path, sysfs_root: Path) -> HandoffResult:
 
     headers = _load_record(record_path)
     root = sysfs_root.resolve(strict=True)
-    resolved = [(_resolve_header(header, root), header) for header in headers]
-    _reject_duplicate_targets(tuple(paths for paths, _ in resolved))
+    for header in headers:
+        _validate_header_paths(header)
+    _reject_duplicate_relative_targets(headers)
 
-    applied: list[str] = []
-    mismatched: list[str] = []
-    for paths, header in resolved:
-        name_path, label_path, pwm_path, enable_path = paths
-        if (
-            name_path.read_text(encoding="utf-8").strip() != header.expected_name
-            or label_path.read_text(encoding="utf-8").strip() != header.expected_label
-        ):
-            mismatched.append(header.zone)
-            continue
-        # auto のまま PWM を Max にしてから manual に切り替えれば、途中で
-        # プロセスが止まっても一時的に冷却を下げる書き込みにはならない。
-        pwm_path.write_text(HWMON_MAX_PWM, encoding="ascii")
-        enable_path.write_text(HWMON_MANUAL_MODE, encoding="ascii")
-        applied.append(header.zone)
-    return HandoffResult(
-        record_found=True,
-        applied_zones=tuple(applied),
-        identity_mismatch_zones=tuple(mismatched),
+    resolved: dict[str, tuple[Path, Path, Path, Path] | OSError] = {}
+    for header in headers:
+        try:
+            resolved[header.zone] = _resolve_header(header, root)
+        except HandoffRecordError:
+            # 不安全な path が1つでもあれば、一部を書く前に record 全体を拒否する。
+            raise
+        except OSError as exc:
+            resolved[header.zone] = exc
+    _reject_duplicate_targets(
+        tuple(paths for paths in resolved.values() if isinstance(paths, tuple))
     )
+
+    results: list[HandoffZoneResult] = []
+    for header in headers:
+        paths = resolved[header.zone]
+        if isinstance(paths, OSError):
+            results.append(
+                HandoffZoneResult(
+                    zone=header.zone,
+                    status="io_error",
+                    detail=type(paths).__name__,
+                )
+            )
+            continue
+        name_path, label_path, pwm_path, enable_path = paths
+        try:
+            if (
+                name_path.read_text(encoding="utf-8").strip() != header.expected_name
+                or label_path.read_text(encoding="utf-8").strip() != header.expected_label
+            ):
+                results.append(HandoffZoneResult(zone=header.zone, status="identity_mismatch"))
+                continue
+            # auto のまま PWM を Max にしてから manual に切り替えれば、途中で
+            # プロセスが止まっても一時的に冷却を下げる書き込みにはならない。
+            pwm_path.write_text(HWMON_MAX_PWM, encoding="ascii")
+            enable_path.write_text(HWMON_MANUAL_MODE, encoding="ascii")
+        except OSError as exc:
+            results.append(
+                HandoffZoneResult(
+                    zone=header.zone,
+                    status="io_error",
+                    detail=type(exc).__name__,
+                )
+            )
+            continue
+        results.append(HandoffZoneResult(zone=header.zone, status="applied"))
+    return HandoffResult(record_found=True, zones=tuple(results))
 
 
 def main() -> int:
@@ -104,7 +156,7 @@ def main() -> int:
     mismatch は対象外 header へ書かず、非0で systemd へ通知する。
     """
     result = emergency_handoff(HANDOFF_RECORD_PATH, HWMON_ROOT)
-    return 1 if result.identity_mismatch_zones else 0
+    return 1 if result.identity_mismatch_zones or result.failed_zones else 0
 
 
 def _load_record(path: Path) -> tuple[_HeaderRecord, ...]:
@@ -164,9 +216,27 @@ def _resolve_header(header: _HeaderRecord, root: Path) -> tuple[Path, Path, Path
         _resolve_beneath(root, header.pwm_path),
         _resolve_beneath(root, header.enable_path),
     )
-    name_path, label_path, pwm_path, enable_path = paths
     if len({path.parent for path in paths}) != 1:
-        raise HandoffRecordError("handoff header の identity と書き込み先は同一 header にする")
+        raise HandoffRecordError("handoff header の解決先が同一 device ではない")
+    return paths
+
+
+def _validate_header_paths(header: _HeaderRecord) -> None:
+    relative_paths = tuple(
+        Path(value)
+        for value in (
+            header.name_path,
+            header.label_path,
+            header.pwm_path,
+            header.enable_path,
+        )
+    )
+    if any(path.is_absolute() or len(path.parts) != 2 for path in relative_paths):
+        raise HandoffRecordError("handoff path は hwmon class entry 直下の相対 path にする")
+    class_entries = {path.parts[0] for path in relative_paths}
+    if len(class_entries) != 1 or re.fullmatch(r"hwmon[0-9]+", next(iter(class_entries))) is None:
+        raise HandoffRecordError("handoff header は1つの hwmon class entry を指す")
+    name_path, label_path, pwm_path, enable_path = relative_paths
     if (
         name_path.name != "name"
         or re.fullmatch(r"(?:fan|pwm)[1-9][0-9]*_label", label_path.name) is None
@@ -176,17 +246,22 @@ def _resolve_header(header: _HeaderRecord, root: Path) -> tuple[Path, Path, Path
         raise HandoffRecordError("handoff header の PWM path が hwmon 形式ではない")
     if enable_path.name != f"{pwm_path.name}_enable":
         raise HandoffRecordError("handoff header の enable path が PWM channel と一致しない")
-    return paths
 
 
 def _resolve_beneath(root: Path, relative: str) -> Path:
     candidate = Path(relative)
-    if candidate.is_absolute():
-        raise HandoffRecordError("handoff record の path は sysfs root からの相対 path にする")
-    resolved = (root / candidate).resolve(strict=True)
-    if not resolved.is_relative_to(root):
-        raise HandoffRecordError("handoff record が sysfs root 外を指している")
+    class_entry = root / candidate.parts[0]
+    device_root = class_entry.resolve(strict=True)
+    resolved = (device_root / candidate.parts[1]).resolve(strict=True)
+    if not resolved.is_relative_to(device_root):
+        raise HandoffRecordError("handoff attribute が解決後の hwmon device 外を指している")
     return resolved
+
+
+def _reject_duplicate_relative_targets(headers: tuple[_HeaderRecord, ...]) -> None:
+    targets = {(header.pwm_path, header.enable_path) for header in headers}
+    if len(targets) != len(headers):
+        raise HandoffRecordError("handoff record で複数 zone が同じ header を指している")
 
 
 def _reject_duplicate_targets(headers: tuple[tuple[Path, Path, Path, Path], ...]) -> None:

@@ -42,10 +42,12 @@ RPM の読み取り不能は「Fan が回っているが tach だけ読めない
 - Startup の tach 応答確認は、従来どおり有効な RPM が `stall_min_rpm` 以上に
   なった zone だけを確認済みとする。
 
-T_SENSOR の canonical metric は、決定記録 0032（#65、Proposed）が提案する
-`board.connector_12v2x6` に依存する。0032 が FINAL になる前は本番設定で
-T_SENSOR を有効化しない。0032 の名前がレビューで変わる場合は、#65 / #78 を
-同じ名前へ揃えてからマージする。
+T_SENSOR の metric contract は、決定記録 0032（#65、Proposed）が提案する
+`board.connector_12v2x6` に依存する。Critical Safety は名前をハードコードせず、
+T_SENSOR 有効時に `approved_t_sensor_metric` として承認済み metric contract の注入を
+必須にする。0032 が FINAL になる前は本番設定で T_SENSOR を有効化しない。
+0032 の名前がレビューで
+変わる場合は、#65 / #78 へ同じ承認済み名を渡す。
 
 ## 3. Consequences
 
