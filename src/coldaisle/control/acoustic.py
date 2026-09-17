@@ -100,6 +100,7 @@ class AcousticInteraction(Protocol):
 class AcousticCostMetadata(_Frozen):
     """推定値ではないことと、再現に必要な入力情報を伝える metadata。"""
 
+    unit: Literal["unitless"] = "unitless"
     model_id: str = Field(pattern=r"^[a-z][a-z0-9_-]*$", max_length=120)
     source: AcousticModelSource
     config_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
@@ -189,9 +190,14 @@ class ConfiguredAcousticCostModel:
             rear=self._config.zones.rear.cost_at(demands.rear),
             top=self._config.zones.top.cost_at(demands.top),
         )
-        interaction_cost = sum(interaction.cost_for(demands) for interaction in self._interactions)
-        if interaction_cost < 0.0:
-            raise ValueError("Acoustic interaction は負のコストを返せない")
+        interaction_cost = 0.0
+        for interaction in self._interactions:
+            cost = interaction.cost_for(demands)
+            if cost < 0.0:
+                raise ValueError(
+                    f"Acoustic interaction {interaction.name!r} は負のコストを返せない"
+                )
+            interaction_cost += cost
         return AcousticCostEstimate(
             acoustic_cost=zone_costs.front + zone_costs.rear + zone_costs.top + interaction_cost,
             zone_costs=zone_costs,

@@ -18,4 +18,6 @@ subjective annoyance score が揃った後は、同じ zone 曲線の契約の�
 
 `AcousticInteraction` は `PerZone[Demand]` を受け、無単位の追加コストを返す読み取り専用契約である。
 Fan の組み合わせ、共振、周波数特性を扱う実測済みモデルは、この契約で後から追加できる。
-モデル出力には source、設定ハッシュ、適用した interaction 名を metadata として残す。
+モデル出力には `unit: unitless`、source、設定ハッシュ、適用した interaction 名を
+metadata として残す。`source.kind: measured` は曲線の根拠が実測済みであることだけを示し、
+出力値が dBA / SPL であることを意味しない。

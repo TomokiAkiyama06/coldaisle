@@ -78,6 +78,7 @@ def test_cost_metadata_keeps_source_and_configuration_hash(tmp_path: Path) -> No
     estimate = load_acoustic_model(tmp_path).estimate(PerZone[float](front=0.0, rear=0.0, top=0.0))
 
     assert estimate.metadata.model_id == "initial-zone-penalty"
+    assert estimate.metadata.unit == "unitless"
     assert len(estimate.metadata.config_sha256) == 64
     assert estimate.metadata.source.basis.startswith("No SPL")
 
@@ -100,6 +101,36 @@ def test_interactions_are_optional_and_recorded_in_metadata(tmp_path: Path) -> N
     assert estimate.interaction_cost == 0.25
     assert estimate.acoustic_cost == pytest.approx(2.05)
     assert estimate.metadata.interaction_names == ("front-top-interaction",)
+
+
+class NegativeInteraction:
+    """個別の負値を相殺させないことを確かめる interaction。"""
+
+    name = "invalid-negative"
+
+    def cost_for(self, demands: PerZone[float]) -> float:
+        del demands
+        return -0.25
+
+
+class OffsetInteraction:
+    """負値を相殺できても無効であることを確かめる interaction。"""
+
+    name = "positive-offset"
+
+    def cost_for(self, demands: PerZone[float]) -> float:
+        del demands
+        return 0.25
+
+
+def test_each_negative_interaction_is_rejected_before_summing(tmp_path: Path) -> None:
+    model = ConfiguredAcousticCostModel.from_file(
+        write_config(tmp_path),
+        interactions=(NegativeInteraction(), OffsetInteraction()),
+    )
+
+    with pytest.raises(ValueError, match="invalid-negative"):
+        model.estimate(PerZone[float](front=0.0, rear=0.0, top=0.0))
 
 
 def test_disabled_model_keeps_acoustic_optimization_optional() -> None:
@@ -153,11 +184,24 @@ def test_measured_source_is_backward_compatible_when_evidence_is_present(tmp_pat
     )
 
 
+def imported_modules(source: str) -> set[str]:
+    """Python source に書かれた絶対 import のモジュール名を返す。"""
+    imports: set[str] = set()
+    for node in ast.walk(ast.parse(source)):
+        if isinstance(node, ast.Import):
+            imports.update(alias.name for alias in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.module is not None:
+            imports.add(node.module)
+    return imports
+
+
 def test_no_control_path_imports_acoustic_hardware_or_safety() -> None:
-    source = Path(__file__).parents[1] / "src" / "coldaisle" / "control" / "acoustic.py"
-    imports = {
-        node.module
-        for node in ast.walk(ast.parse(source.read_text(encoding="utf-8")))
-        if isinstance(node, ast.ImportFrom) and node.module is not None
-    }
+    path = Path(__file__).parents[1] / "src" / "coldaisle" / "control" / "acoustic.py"
+    imports = imported_modules(path.read_text(encoding="utf-8"))
     assert all("hardware" not in module and "safety" not in module for module in imports)
+
+
+def test_import_guard_also_detects_plain_import_statements() -> None:
+    imports = imported_modules("import coldaisle.control.hardware as hardware")
+
+    assert "coldaisle.control.hardware" in imports
