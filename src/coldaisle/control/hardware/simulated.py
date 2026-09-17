@@ -125,6 +125,9 @@ class SimulatedFanBackend:
                 fault=Fault(code=FaultCode.TACH_STALL, zone=zone),
             )
 
+        # write/readback/tach の全てが成功して初めて、kick 済みとして扱う。失敗した
+        # write を起動済みにすると、復旧時に必要な startup demand を省略してしまう。
+        self._running.add(zone)
         return FanHardwareResult(
             target_rpm=target_rpm,
             airflow_index=airflow_index,
@@ -139,10 +142,10 @@ class SimulatedFanBackend:
     def _safe_demand(self, zone: Zone, effective: float, profile: FanProfile) -> float:
         # 停止を許す profile は未測定の危険な低 PWM へ落ちうるため、この backend
         # では表さない。初回だけ startup demand を使い、以後の最低値も profile の
-        # minimum stable demand に固定する（0028 §2.4 の kick の責務）。
+        # minimum stable demand に固定する（0028 §2.4 の kick の責務）。起動済み
+        # 状態への遷移は _apply_zone で write/readback/tach 成功後にだけ行う。
         stable_demand = max(effective, profile.minimum_stable_demand)
         if zone not in self._running:
-            self._running.add(zone)
             return max(stable_demand, profile.startup_demand)
         return stable_demand
 

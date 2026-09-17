@@ -95,6 +95,25 @@ def test_first_write_kicks_and_subsequent_write_never_uses_unsafe_low_pwm() -> N
     assert second.front.target_rpm == 600
 
 
+def test_failed_startup_write_is_retried_with_startup_kick() -> None:
+    backend = SimulatedFanBackend(
+        hardware_config(),
+        SimulatedFaultPlan(write_failure=frozenset({Zone.FRONT})),
+    )
+    demands = PerZone(front=effective(0.0), rear=effective(0.0), top=effective(0.0))
+
+    failed = backend.apply(demands)
+    backend.fault_plan = SimulatedFaultPlan()
+    recovered = backend.apply(demands)
+
+    # write 失敗は起動確認ではない。fault を解除した再試行も minimum stable
+    # demand ではなく startup kick を使うため、未起動 fan を楽観視しない。
+    assert failed.front.readback.write_ok is False
+    assert failed.front.readback.pwm_raw == 153
+    assert recovered.front.readback.write_ok is True
+    assert recovered.front.readback.pwm_raw == 153
+
+
 def test_simulated_failures_are_reported_as_zone_faults_for_critical_safety() -> None:
     backend = SimulatedFanBackend(
         hardware_config(),
