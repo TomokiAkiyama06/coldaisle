@@ -21,13 +21,15 @@ from coldaisle.control.schema import (
     PerZone,
     Reason,
     SafetyState,
-    SafetyZoneOutput,
     Zone,
     ZoneRequest,
 )
 from coldaisle.control.state import (
+    ControlInputContract,
     ControlStateSnapshot,
+    CriticalTelemetryGroup,
     FanState,
+    SignalSpec,
     SnapshotSignal,
     TelemetryHealth,
     TelemetryImportance,
@@ -36,6 +38,13 @@ from coldaisle.metrics import MetricCatalog, MetricMeta
 from coldaisle.store.models import Quality
 
 PROPOSED_T_SENSOR_METRIC = "board.connector_12v2x6"
+AIR_METRICS = (
+    "air.front_intake",
+    "air.gpu_intake",
+    "air.gpu_exhaust",
+    "air.top_exhaust",
+    "air.rear_exhaust",
+)
 
 
 def tracked(value: object, status: str = "provisional") -> dict[str, object]:
@@ -52,6 +61,7 @@ def safety_config(
     fault_demand: float = 1.0,
     write_limit: int = 3,
     ramp_down_per_s: float = 0.1,
+    uniform_zone_min: float | None = None,
 ) -> SafetyConfig:
     def value(raw: object) -> dict[str, object]:
         return tracked(raw, status)
@@ -64,25 +74,28 @@ def safety_config(
     }
     if t_sensor_enabled:
         t_sensor["stale_after_ms"] = value(1_000)
+    zone_min = (
+        {"front": 0.4, "rear": 0.4, "top": 0.5}
+        if uniform_zone_min is None
+        else {zone.value: uniform_zone_min for zone in Zone}
+    )
+    stall_check = (
+        {"front": 0.4, "rear": 0.4, "top": 0.5}
+        if uniform_zone_min is None
+        else {zone.value: min(0.4, uniform_zone_min) for zone in Zone}
+    )
+    curve_floor = 0.5 if uniform_zone_min is None else uniform_zone_min
     return SafetyConfig.model_validate(
         {
             "schema_version": 2,
             "absolute_temp_ceiling_c": value(85.0),
-            "zone_min_demand": {
-                "front": value(0.4),
-                "rear": value(0.4),
-                "top": value(0.5),
-            },
+            "zone_min_demand": {zone: value(demand) for zone, demand in zone_min.items()},
             "cpu_cooling_floor": [
-                {"temperature_c": value(40.0), "demand": value(0.5)},
+                {"temperature_c": value(40.0), "demand": value(curve_floor)},
                 {"temperature_c": value(80.0), "demand": value(1.0)},
             ],
             "fault_demand": value(fault_demand),
-            "stall_check_min_demand": {
-                "front": value(0.4),
-                "rear": value(0.4),
-                "top": value(0.5),
-            },
+            "stall_check_min_demand": {zone: value(demand) for zone, demand in stall_check.items()},
             "stall_min_rpm": {
                 "front": value(400),
                 "rear": value(400),
@@ -104,6 +117,58 @@ def safety_config(
             "overrun_consecutive_limit": value(3),
             "watchdog_timeout_ms": value(5_000),
         }
+    )
+
+
+def input_contract(*, t_sensor_metric: str | None = None) -> ControlInputContract:
+    specs = [
+        SignalSpec(
+            metric="cpu.package",
+            importance=TelemetryImportance.CRITICAL,
+            stale_after_ms=1_000,
+        ),
+        SignalSpec(
+            metric="gpu.0.core",
+            importance=TelemetryImportance.CRITICAL,
+            stale_after_ms=1_000,
+        ),
+        *(
+            [
+                SignalSpec(
+                    metric=t_sensor_metric,
+                    importance=TelemetryImportance.CRITICAL,
+                    stale_after_ms=1_000,
+                )
+            ]
+            if t_sensor_metric is not None
+            else []
+        ),
+        *(
+            SignalSpec(
+                metric=metric,
+                importance=TelemetryImportance.DEGRADED,
+                stale_after_ms=3_000,
+            )
+            for metric in AIR_METRICS
+        ),
+    ]
+    return ControlInputContract(
+        signals=tuple(specs),
+        critical_groups=(CriticalTelemetryGroup(code=AIR_TELEMETRY_GROUP, metrics=AIR_METRICS),),
+    )
+
+
+def critical_safety(
+    config: SafetyConfig,
+    *,
+    approved_t_sensor_metric: str | None = None,
+    metric_catalog: MetricCatalog | None = None,
+) -> CriticalSafety:
+    return CriticalSafety(
+        config,
+        input_contract=input_contract(t_sensor_metric=approved_t_sensor_metric),
+        approved_t_sensor_metric=approved_t_sensor_metric,
+        metric_catalog=metric_catalog,
     )
 
 
@@ -152,8 +217,10 @@ def snapshot(
     critical: tuple[str, ...] = (),
     fan_state: PerZone[FanState] | None = None,
     extra_signals: tuple[SnapshotSignal, ...] = (),
+    missing_air: tuple[str, ...] = (),
     telemetry_health: TelemetryHealth = TelemetryHealth.NORMAL,
 ) -> ControlStateSnapshot:
+    unavailable_air = set(AIR_METRICS if AIR_TELEMETRY_GROUP in critical else missing_air)
     signals = (
         signal(
             "cpu.package",
@@ -164,6 +231,15 @@ def snapshot(
             "gpu.0.core",
             gpu,
             quality=Quality.OK if gpu is not None else Quality.MISSING,
+        ),
+        *(
+            signal(
+                metric,
+                None if metric in unavailable_air else 25.0,
+                importance=TelemetryImportance.DEGRADED,
+                quality=Quality.MISSING if metric in unavailable_air else Quality.OK,
+            )
+            for metric in AIR_METRICS
         ),
         *extra_signals,
     )
@@ -210,24 +286,46 @@ def requests(
 
 def decision(
     *,
+    tick: int,
+    mono: int,
     floor: float = 0.4,
     forced: bool = False,
     state: SafetyState = SafetyState.NORMAL,
 ) -> CriticalSafetyDecision:
-    reason = Reason(code="test_safety")
-    item = SafetyZoneOutput(floor=floor, forced_max=forced, reason=reason)
-    faults = (Fault(code=FaultCode.CONFIG_INVALID),) if state is SafetyState.EMERGENCY else ()
-    return CriticalSafetyDecision(
-        state=state,
-        zones=PerZone(front=item, rear=item, top=item),
-        faults=faults,
-        config_validated=True,
-        config_is_provisional=True,
+    safety = critical_safety(safety_config(uniform_zone_min=floor))
+    if state is SafetyState.EMERGENCY:
+        return safety.evaluate(
+            snapshot(tick=tick, mono=mono, cpu=85.0),
+            mode=OperatingMode.AUTO,
+        )
+    if tick < 2 or mono < 1_000:
+        raise ValueError("NORMAL test decision は先行 STARTUP tick を表現できる時刻にする")
+    safety.evaluate(
+        snapshot(tick=tick - 1, mono=mono - 1_000, cpu=40.0),
+        mode=OperatingMode.AUTO,
+    )
+    return safety.evaluate(
+        snapshot(tick=tick, mono=mono, cpu=40.0),
+        mode=OperatingMode.MAX if forced else OperatingMode.AUTO,
+    )
+
+
+def issued_sequence(
+    config: SafetyConfig,
+    *points: tuple[int, int, OperatingMode],
+) -> tuple[CriticalSafetyDecision, ...]:
+    safety = critical_safety(config)
+    return tuple(
+        safety.evaluate(
+            snapshot(tick=tick, mono=mono, cpu=40.0),
+            mode=mode,
+        )
+        for tick, mono, mode in points
     )
 
 
 def test_startup_is_max_until_settle_and_all_tach_have_responded() -> None:
-    safety = CriticalSafety(safety_config())
+    safety = critical_safety(safety_config())
 
     initial = safety.evaluate(
         snapshot(tick=1, mono=0, fan_state=fans(rear_rpm=0)),
@@ -247,13 +345,13 @@ def test_startup_is_max_until_settle_and_all_tach_have_responded() -> None:
 
 
 def test_cpu_cooling_floor_is_interpolated_and_provisional_status_is_preserved() -> None:
-    safety = CriticalSafety(safety_config())
+    safety = critical_safety(safety_config())
     settled = settle(safety)
 
     assert settled.zones.top.floor == 0.75
     assert settled.zones.front.floor == 0.4
     assert settled.config_is_provisional is True
-    assert CriticalSafety(safety_config(status="confirmed")).config_is_provisional is False
+    assert critical_safety(safety_config(status="confirmed")).config_is_provisional is False
 
 
 @pytest.mark.parametrize(
@@ -280,7 +378,7 @@ def test_critical_telemetry_faults_apply_only_the_decided_response(
     forced_zones: set[Zone],
     fault_floor_zones: set[Zone],
 ) -> None:
-    safety = CriticalSafety(safety_config(fault_demand=0.9))
+    safety = critical_safety(safety_config(fault_demand=0.9))
     settle(safety)
     result = safety.evaluate(
         snapshot(
@@ -302,7 +400,7 @@ def test_critical_telemetry_faults_apply_only_the_decided_response(
 
 
 def test_partial_air_loss_changes_health_but_not_safety_state_or_demand() -> None:
-    safety = CriticalSafety(safety_config(fault_demand=0.9))
+    safety = critical_safety(safety_config(fault_demand=0.9))
     settle(safety)
 
     result = safety.evaluate(
@@ -320,7 +418,7 @@ def test_partial_air_loss_changes_health_but_not_safety_state_or_demand() -> Non
 
 
 def test_t_sensor_disabled_is_ignored_but_enabled_loss_is_critical() -> None:
-    disabled = CriticalSafety(safety_config(t_sensor_enabled=False, fault_demand=0.9))
+    disabled = critical_safety(safety_config(t_sensor_enabled=False, fault_demand=0.9))
     settle(disabled)
     disabled_result = disabled.evaluate(
         snapshot(
@@ -332,9 +430,9 @@ def test_t_sensor_disabled_is_ignored_but_enabled_loss_is_critical() -> None:
     )
 
     with pytest.raises(ValueError, match="metric contract"):
-        CriticalSafety(safety_config(t_sensor_enabled=True, fault_demand=0.9))
+        critical_safety(safety_config(t_sensor_enabled=True, fault_demand=0.9))
 
-    enabled = CriticalSafety(
+    enabled = critical_safety(
         safety_config(t_sensor_enabled=True, fault_demand=0.9),
         approved_t_sensor_metric=PROPOSED_T_SENSOR_METRIC,
         metric_catalog=t_sensor_catalog(),
@@ -349,7 +447,12 @@ def test_t_sensor_disabled_is_ignored_but_enabled_loss_is_critical() -> None:
         mode=OperatingMode.AUTO,
     )
     enabled_result = enabled.evaluate(
-        snapshot(tick=3, mono=2_000, critical=(PROPOSED_T_SENSOR_METRIC,)),
+        snapshot(
+            tick=3,
+            mono=2_000,
+            critical=(PROPOSED_T_SENSOR_METRIC,),
+            extra_signals=(signal(PROPOSED_T_SENSOR_METRIC, None, quality=Quality.MISSING),),
+        ),
         mode=OperatingMode.AUTO,
     )
 
@@ -368,7 +471,7 @@ def test_t_sensor_disabled_is_ignored_but_enabled_loss_is_critical() -> None:
 )
 def test_t_sensor_contract_rejects_reserved_or_noncanonical_metric(metric: str) -> None:
     with pytest.raises(ValueError):
-        CriticalSafety(
+        critical_safety(
             safety_config(t_sensor_enabled=True),
             approved_t_sensor_metric=metric,
             metric_catalog=t_sensor_catalog(metric),
@@ -378,7 +481,7 @@ def test_t_sensor_contract_rejects_reserved_or_noncanonical_metric(metric: str) 
 @pytest.mark.parametrize(("unit", "catalog"), [("W", True), ("C", False)])
 def test_t_sensor_contract_requires_a_catalogued_celsius_metric(unit: str, catalog: bool) -> None:
     with pytest.raises(ValueError, match=r"MetricCatalog|温度"):
-        CriticalSafety(
+        critical_safety(
             safety_config(t_sensor_enabled=True),
             approved_t_sensor_metric=PROPOSED_T_SENSOR_METRIC,
             metric_catalog=t_sensor_catalog(unit=unit) if catalog else None,
@@ -386,7 +489,7 @@ def test_t_sensor_contract_requires_a_catalogued_celsius_metric(unit: str, catal
 
 
 def test_unknown_critical_input_is_not_silently_ignored() -> None:
-    safety = CriticalSafety(safety_config())
+    safety = critical_safety(safety_config())
 
     with pytest.raises(ValueError, match="Critical Safety"):
         safety.evaluate(
@@ -395,8 +498,34 @@ def test_unknown_critical_input_is_not_silently_ignored() -> None:
         )
 
 
+def test_air_group_contract_is_required_and_all_missing_is_detected_defensively() -> None:
+    contract_without_group = input_contract().model_copy(update={"critical_groups": ()})
+    with pytest.raises(ValueError, match="air_telemetry"):
+        CriticalSafety(safety_config(), input_contract=contract_without_group)
+
+    safety = critical_safety(safety_config(fault_demand=0.9))
+    settle(safety)
+    result = safety.evaluate(
+        snapshot(tick=3, mono=2_000, missing_air=AIR_METRICS),
+        mode=OperatingMode.AUTO,
+    )
+
+    assert result.state is SafetyState.DEGRADED
+    assert result.faults[0].code is FaultCode.AIR_TELEMETRY_STALE
+    assert result.zones.front.floor == 0.9
+
+
+def test_input_contract_stale_limits_must_come_from_safety_config() -> None:
+    contract = input_contract()
+    mismatched_cpu = contract.signals[0].model_copy(update={"stale_after_ms": 60_000})
+    mismatched = contract.model_copy(update={"signals": (mismatched_cpu, *contract.signals[1:])})
+
+    with pytest.raises(ValueError, match="stale limit"):
+        CriticalSafety(safety_config(), input_contract=mismatched)
+
+
 def test_absolute_temperature_limit_forces_emergency_max() -> None:
-    safety = CriticalSafety(safety_config())
+    safety = critical_safety(safety_config())
     settle(safety)
     hotspot = signal(
         "gpu.0.hotspot",
@@ -415,7 +544,7 @@ def test_absolute_temperature_limit_forces_emergency_max() -> None:
 
 
 def test_deprecated_bare_chipset_name_is_not_treated_as_temperature() -> None:
-    safety = CriticalSafety(safety_config())
+    safety = critical_safety(safety_config())
     settle(safety)
 
     result = safety.evaluate(
@@ -432,7 +561,7 @@ def test_deprecated_bare_chipset_name_is_not_treated_as_temperature() -> None:
 
 
 def test_front_stall_uses_monotonic_window_then_maxes_zone_and_raises_others() -> None:
-    safety = CriticalSafety(safety_config(fault_demand=0.9))
+    safety = critical_safety(safety_config(fault_demand=0.9))
     settle(safety)
 
     first_low = safety.evaluate(
@@ -458,7 +587,7 @@ def test_front_stall_uses_monotonic_window_then_maxes_zone_and_raises_others() -
 
 
 def test_stall_is_not_counted_below_configured_demand() -> None:
-    safety = CriticalSafety(safety_config())
+    safety = critical_safety(safety_config())
     settle(safety)
 
     safety.evaluate(
@@ -487,7 +616,7 @@ def test_stall_is_not_counted_below_configured_demand() -> None:
 def test_unavailable_rpm_uses_the_stall_window_and_safe_response(
     zone: Zone, expected_state: SafetyState
 ) -> None:
-    safety = CriticalSafety(safety_config(fault_demand=0.9))
+    safety = critical_safety(safety_config(fault_demand=0.9))
     settle(safety)
 
     def unavailable() -> PerZone[FanState]:
@@ -518,7 +647,7 @@ def test_unavailable_rpm_uses_the_stall_window_and_safe_response(
 
 
 def test_low_and_unavailable_rpm_share_one_continuous_stall_timer() -> None:
-    safety = CriticalSafety(safety_config())
+    safety = critical_safety(safety_config())
     settle(safety)
     safety.evaluate(
         snapshot(tick=3, mono=2_000, fan_state=fans(front_rpm=0)),
@@ -533,8 +662,29 @@ def test_low_and_unavailable_rpm_share_one_continuous_stall_timer() -> None:
     assert faulted.faults[0].code is FaultCode.TACH_STALL
 
 
+def test_missing_effective_demand_keeps_the_existing_stall_timer() -> None:
+    safety = critical_safety(safety_config())
+    settle(safety)
+    safety.evaluate(
+        snapshot(tick=3, mono=2_000, fan_state=fans(front_rpm=0)),
+        mode=OperatingMode.AUTO,
+    )
+    missing_demand = fans(front_rpm=0).model_copy(
+        update={"front": FanState(effective_demand=None, rpm=0)}
+    )
+
+    faulted = safety.evaluate(
+        snapshot(tick=4, mono=4_000, fan_state=missing_demand),
+        mode=OperatingMode.AUTO,
+    )
+
+    assert faulted.state is SafetyState.DEGRADED
+    assert faulted.faults[0].code is FaultCode.TACH_STALL
+    assert "demand=0.6" in faulted.faults[0].detail
+
+
 def test_all_fan_readback_loss_uses_last_effective_demand_and_stalls() -> None:
-    safety = CriticalSafety(safety_config())
+    safety = critical_safety(safety_config())
     settle(safety)
 
     started = safety.evaluate(
@@ -560,7 +710,7 @@ def test_all_fan_readback_loss_uses_last_effective_demand_and_stalls() -> None:
 
 
 def test_all_fan_readback_loss_does_not_invent_a_higher_last_demand() -> None:
-    safety = CriticalSafety(safety_config())
+    safety = critical_safety(safety_config())
     settle(safety)
     safety.evaluate(
         snapshot(
@@ -584,7 +734,7 @@ def test_all_fan_readback_loss_does_not_invent_a_higher_last_demand() -> None:
 
 
 def test_top_stall_is_immediate_emergency_after_the_stall_window() -> None:
-    safety = CriticalSafety(safety_config())
+    safety = critical_safety(safety_config())
     settle(safety)
     safety.evaluate(
         snapshot(tick=3, mono=2_000, fan_state=fans(top_rpm=0)),
@@ -607,7 +757,7 @@ def test_top_stall_is_immediate_emergency_after_the_stall_window() -> None:
 def test_front_hardware_fault_retries_at_max_and_escalates_after_configured_count(
     code: FaultCode,
 ) -> None:
-    safety = CriticalSafety(safety_config(fault_demand=0.9, write_limit=3))
+    safety = critical_safety(safety_config(fault_demand=0.9, write_limit=3))
     settle(safety)
     fault = Fault(code=code, zone=Zone.FRONT)
 
@@ -635,9 +785,12 @@ def test_front_hardware_fault_retries_at_max_and_escalates_after_configured_coun
     assert all(third.zones.get(zone).forced_max for zone in Zone)
 
 
-@pytest.mark.parametrize("code", [FaultCode.WRITE_FAILURE, FaultCode.READBACK_MISMATCH])
+@pytest.mark.parametrize(
+    "code",
+    [FaultCode.WRITE_FAILURE, FaultCode.READBACK_MISMATCH, FaultCode.ENABLE_REVERTED],
+)
 def test_top_write_or_readback_failure_is_immediate_emergency(code: FaultCode) -> None:
-    safety = CriticalSafety(safety_config())
+    safety = critical_safety(safety_config())
     settle(safety)
 
     result = safety.evaluate(
@@ -651,7 +804,7 @@ def test_top_write_or_readback_failure_is_immediate_emergency(code: FaultCode) -
 
 
 def test_tick_overrun_escalates_only_after_configured_consecutive_count() -> None:
-    safety = CriticalSafety(safety_config())
+    safety = critical_safety(safety_config())
     settle(safety)
 
     first = safety.evaluate(
@@ -671,7 +824,7 @@ def test_tick_overrun_escalates_only_after_configured_consecutive_count() -> Non
 
 
 def test_fault_clear_hold_keeps_the_safer_state_until_full_monotonic_hold() -> None:
-    safety = CriticalSafety(safety_config(fault_demand=0.9))
+    safety = critical_safety(safety_config(fault_demand=0.9))
     settle(safety)
     missing = safety.evaluate(
         snapshot(tick=3, mono=2_000, gpu=None, critical=("gpu.0.core",)),
@@ -688,10 +841,10 @@ def test_fault_clear_hold_keeps_the_safer_state_until_full_monotonic_hold() -> N
 
 
 def test_manual_max_and_invalid_config_cannot_express_a_lower_demand() -> None:
-    safety = CriticalSafety(safety_config())
+    safety = critical_safety(safety_config())
     settle(safety)
     manual_max = safety.evaluate(snapshot(tick=3, mono=2_000), mode=OperatingMode.MAX)
-    invalid = invalid_config_decision()
+    invalid = invalid_config_decision(tick_id=3, monotonic_ms=2_000)
 
     assert all(manual_max.zones.get(zone).forced_max for zone in Zone)
     assert invalid.state is SafetyState.EMERGENCY
@@ -713,27 +866,31 @@ def test_floor_wins_over_auto_guard_ceiling_and_tie_uses_safety_precedence() -> 
         top=GuardZoneOutput(),
     )
 
-    composer = DemandComposer(safety_config())
+    config = safety_config(uniform_zone_min=0.6)
+    startup, normal, next_normal = issued_sequence(
+        config,
+        (1, 0, OperatingMode.AUTO),
+        (2, 10_000, OperatingMode.AUTO),
+        (3, 20_000, OperatingMode.AUTO),
+    )
+    composer = DemandComposer(config)
     composer.compose(
         requested=requests(0.2),
         guard=empty_guard(),
-        safety=decision(floor=0.4, forced=True, state=SafetyState.EMERGENCY),
+        safety=startup,
         mode=OperatingMode.AUTO,
-        now_mono_ms=0,
     )
     result = composer.compose(
         requested=requests(0.8),
         guard=constrained_guard,
-        safety=decision(floor=0.6),
+        safety=normal,
         mode=OperatingMode.AUTO,
-        now_mono_ms=10_000,
     )
     tie = composer.compose(
         requested=requests(0.6),
         guard=empty_guard(),
-        safety=decision(floor=0.6),
+        safety=next_normal,
         mode=OperatingMode.AUTO,
-        now_mono_ms=20_000,
     )
 
     assert result.front.effective == 0.6
@@ -758,27 +915,31 @@ def test_manual_and_calibration_ignore_ceiling_but_keep_guard_and_safety_floors(
         top=GuardZoneOutput(),
     )
 
-    composer = DemandComposer(safety_config())
+    config = safety_config(uniform_zone_min=0.6)
+    startup, normal, next_normal = issued_sequence(
+        config,
+        (1, 0, mode),
+        (2, 10_000, mode),
+        (3, 20_000, mode),
+    )
+    composer = DemandComposer(config)
     composer.compose(
         requested=requests(0.2),
         guard=empty_guard(),
-        safety=decision(floor=0.4, forced=True, state=SafetyState.EMERGENCY),
+        safety=startup,
         mode=mode,
-        now_mono_ms=0,
     )
     high = composer.compose(
         requested=requests(0.8),
         guard=guard,
-        safety=decision(floor=0.4),
+        safety=normal,
         mode=mode,
-        now_mono_ms=10_000,
     )
     low = composer.compose(
         requested=requests(0.1),
         guard=guard,
-        safety=decision(floor=0.6),
+        safety=next_normal,
         mode=mode,
-        now_mono_ms=20_000,
     )
 
     assert high.front.effective == 0.8
@@ -788,34 +949,38 @@ def test_manual_and_calibration_ignore_ceiling_but_keep_guard_and_safety_floors(
 
 
 def test_ramp_down_is_limited_but_ramp_up_is_not() -> None:
-    composer = DemandComposer(safety_config())
+    config = safety_config(uniform_zone_min=0.0)
+    startup, normal, next_normal, final_normal = issued_sequence(
+        config,
+        (1, 0, OperatingMode.AUTO),
+        (2, 2_000, OperatingMode.AUTO),
+        (3, 3_000, OperatingMode.AUTO),
+        (4, 4_000, OperatingMode.AUTO),
+    )
+    composer = DemandComposer(config)
     composer.compose(
         requested=requests(0.2),
         guard=empty_guard(),
-        safety=decision(floor=0.0, forced=True, state=SafetyState.EMERGENCY),
+        safety=startup,
         mode=OperatingMode.AUTO,
-        now_mono_ms=0,
     )
     baseline = composer.compose(
         requested=requests(0.8),
         guard=empty_guard(),
-        safety=decision(floor=0.0),
+        safety=normal,
         mode=OperatingMode.AUTO,
-        now_mono_ms=2_000,
     )
     down = composer.compose(
         requested=requests(0.2),
         guard=empty_guard(),
-        safety=decision(floor=0.0),
+        safety=next_normal,
         mode=OperatingMode.AUTO,
-        now_mono_ms=3_000,
     )
     up = composer.compose(
         requested=requests(0.9),
         guard=empty_guard(),
-        safety=decision(floor=0.0),
+        safety=final_normal,
         mode=OperatingMode.AUTO,
-        now_mono_ms=4_000,
     )
 
     assert baseline.front.effective == pytest.approx(0.8)
@@ -837,12 +1002,13 @@ def test_forced_max_wins_over_every_constraint_and_is_structured() -> None:
         top=GuardZoneOutput(),
     )
 
-    result = DemandComposer(safety_config()).compose(
+    config = safety_config()
+    (startup,) = issued_sequence(config, (1, 0, OperatingMode.AUTO))
+    result = DemandComposer(config).compose(
         requested=requests(0.2),
         guard=guard,
-        safety=decision(floor=0.4, forced=True, state=SafetyState.EMERGENCY),
+        safety=startup,
         mode=OperatingMode.AUTO,
-        now_mono_ms=0,
     )
 
     assert result.front.effective == 1.0
@@ -851,38 +1017,125 @@ def test_forced_max_wins_over_every_constraint_and_is_structured() -> None:
 
 
 def test_composer_owns_previous_state_and_rejects_bypass_or_time_reuse() -> None:
-    composer = DemandComposer(safety_config())
+    config = safety_config()
+    startup, normal = issued_sequence(
+        config,
+        (1, 0, OperatingMode.AUTO),
+        (2, 1_000, OperatingMode.AUTO),
+    )
     with pytest.raises(ValueError, match="forced Max"):
-        composer.compose(
+        DemandComposer(config).compose(
             requested=requests(0.5),
             guard=empty_guard(),
-            safety=decision(),
+            safety=normal,
             mode=OperatingMode.AUTO,
-            now_mono_ms=0,
         )
-    with pytest.raises(ValueError, match="負"):
-        composer.compose(
+    _, manual_max = issued_sequence(
+        config,
+        (1, 0, OperatingMode.AUTO),
+        (2, 1_000, OperatingMode.MAX),
+    )
+    with pytest.raises(ValueError, match="STARTUP / EMERGENCY"):
+        DemandComposer(config).compose(
             requested=requests(0.5),
             guard=empty_guard(),
-            safety=decision(forced=True, state=SafetyState.EMERGENCY),
+            safety=manual_max,
             mode=OperatingMode.AUTO,
-            now_mono_ms=-1,
         )
+    composer = DemandComposer(config)
     composer.compose(
         requested=requests(0.5),
         guard=empty_guard(),
-        safety=decision(forced=True, state=SafetyState.EMERGENCY),
+        safety=startup,
         mode=OperatingMode.AUTO,
-        now_mono_ms=0,
     )
-    with pytest.raises(ValueError, match="前進"):
+    with pytest.raises(ValueError, match="tick"):
         composer.compose(
             requested=requests(0.5),
             guard=empty_guard(),
-            safety=decision(),
+            safety=startup,
             mode=OperatingMode.AUTO,
-            now_mono_ms=0,
         )
+
+
+def test_serialized_or_directly_constructed_safety_decision_cannot_authorize_hardware() -> None:
+    issued = decision(tick=1, mono=0, forced=True, state=SafetyState.EMERGENCY)
+    untrusted = CriticalSafetyDecision.model_validate(issued.model_dump(mode="python"))
+    tampered = issued.model_copy(update={"tick_id": 99, "monotonic_ms": 99_000})
+
+    for rejected in (untrusted, tampered):
+        with pytest.raises(ValueError, match="発行していない"):
+            DemandComposer(safety_config()).compose(
+                requested=requests(0.0),
+                guard=empty_guard(),
+                safety=rejected,
+                mode=OperatingMode.AUTO,
+            )
+
+
+def test_composer_rejects_cross_config_and_cross_evaluator_decisions() -> None:
+    config = safety_config()
+    startup_a, _ = issued_sequence(
+        config,
+        (1, 0, OperatingMode.AUTO),
+        (2, 1_000, OperatingMode.AUTO),
+    )
+    _, normal_b = issued_sequence(
+        config,
+        (1, 0, OperatingMode.AUTO),
+        (2, 1_000, OperatingMode.AUTO),
+    )
+    composer = DemandComposer(config)
+    composer.compose(
+        requested=requests(0.5),
+        guard=empty_guard(),
+        safety=startup_a,
+        mode=OperatingMode.AUTO,
+    )
+    with pytest.raises(ValueError, match="異なる CriticalSafety"):
+        composer.compose(
+            requested=requests(0.5),
+            guard=empty_guard(),
+            safety=normal_b,
+            mode=OperatingMode.AUTO,
+        )
+
+    other_config = safety_config(ramp_down_per_s=0.9)
+    (other_startup,) = issued_sequence(other_config, (1, 0, OperatingMode.AUTO))
+    with pytest.raises(ValueError, match="設定が一致しない"):
+        DemandComposer(config).compose(
+            requested=requests(0.5),
+            guard=empty_guard(),
+            safety=other_startup,
+            mode=OperatingMode.AUTO,
+        )
+
+
+def test_invalid_config_composer_needs_no_config_and_can_only_repeat_forced_max() -> None:
+    composer = DemandComposer.for_invalid_config()
+
+    first = composer.compose_invalid_config(tick_id=1, monotonic_ms=0)
+    repeated = composer.compose_invalid_config(tick_id=2, monotonic_ms=100_000)
+
+    for output in (first, repeated):
+        assert all(output.get(zone).effective == 1.0 for zone in Zone)
+        assert all(output.get(zone).bound_by is BoundBy.FORCED_MAX for zone in Zone)
+    with pytest.raises(ValueError, match="compose_invalid_config"):
+        composer.compose(
+            requested=requests(0.0),
+            guard=empty_guard(),
+            safety=decision(tick=3, mono=100_001, forced=True, state=SafetyState.EMERGENCY),
+            mode=OperatingMode.AUTO,
+        )
+    with pytest.raises(ValueError, match="config-invalid"):
+        DemandComposer(safety_config()).compose(
+            requested=requests(0.0),
+            guard=empty_guard(),
+            safety=invalid_config_decision(tick_id=1, monotonic_ms=0),
+            mode=OperatingMode.AUTO,
+        )
+    with pytest.raises(ValueError, match="検証済み設定"):
+        DemandComposer(safety_config()).compose_invalid_config(tick_id=1, monotonic_ms=0)
 
 
 def test_bare_stateless_composition_is_not_part_of_the_public_safety_api() -> None:
@@ -892,7 +1145,7 @@ def test_bare_stateless_composition_is_not_part_of_the_public_safety_api() -> No
 
 
 def test_tick_order_cannot_move_backwards_or_repeat() -> None:
-    safety = CriticalSafety(safety_config())
+    safety = critical_safety(safety_config())
     safety.evaluate(snapshot(tick=1, mono=1_000), mode=OperatingMode.AUTO)
 
     with pytest.raises(ValueError, match="tick"):

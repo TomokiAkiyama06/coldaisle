@@ -399,7 +399,12 @@ EMERGENCY_FAULTS: frozenset[FaultCode] = frozenset(
 """起きたら無条件に `EMERGENCY` にする故障（設定不正・決定論的な層の例外。0028 §2.7）。"""
 
 TOP_EMERGENCY_FAULTS: frozenset[FaultCode] = frozenset(
-    {FaultCode.TACH_STALL, FaultCode.WRITE_FAILURE, FaultCode.READBACK_MISMATCH}
+    {
+        FaultCode.TACH_STALL,
+        FaultCode.WRITE_FAILURE,
+        FaultCode.READBACK_MISMATCH,
+        FaultCode.ENABLE_REVERTED,
+    }
 )
 """Top で起きたら無条件に `EMERGENCY` にする故障。Top は CPU の冷却を担う（0028 §2.7）。
 

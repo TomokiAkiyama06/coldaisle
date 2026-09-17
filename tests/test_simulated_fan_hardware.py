@@ -2,9 +2,39 @@
 
 from __future__ import annotations
 
-from coldaisle.control.config import FanHardwareConfig
+from typing import cast
+
+import pytest
+
+from coldaisle.control.config import FanHardwareConfig, SafetyConfig
 from coldaisle.control.hardware import SimulatedFanBackend, SimulatedFaultPlan
-from coldaisle.control.schema import BoundBy, EffectiveZoneDemand, FaultCode, PerZone, Zone
+from coldaisle.control.safety import (
+    AIR_TELEMETRY_GROUP,
+    AIR_TEMPERATURE_METRICS,
+    ComposedDemands,
+    CriticalSafety,
+    DemandComposer,
+)
+from coldaisle.control.schema import (
+    FaultCode,
+    GuardZoneOutput,
+    OperatingMode,
+    PerZone,
+    Reason,
+    Zone,
+    ZoneRequest,
+)
+from coldaisle.control.state import (
+    ControlInputContract,
+    ControlStateSnapshot,
+    CriticalTelemetryGroup,
+    FanState,
+    SignalSpec,
+    SnapshotSignal,
+    TelemetryHealth,
+    TelemetryImportance,
+)
+from coldaisle.store.models import Quality
 
 
 def hardware_config() -> FanHardwareConfig:
@@ -54,21 +84,149 @@ def hardware_config() -> FanHardwareConfig:
     )
 
 
-def effective(demand: float) -> EffectiveZoneDemand:
-    """Hardware Backend に渡せる、Safety 通過済み demand を作る。"""
-    return EffectiveZoneDemand(
-        requested=demand,
-        effective=demand,
-        bound_by=BoundBy.REQUESTED,
-        safety_floor=0.0,
-        forced_max=False,
+def safety_config() -> SafetyConfig:
+    def value(raw: object) -> dict[str, object]:
+        return {"value": raw, "status": "provisional"}
+
+    return SafetyConfig.model_validate(
+        {
+            "schema_version": 2,
+            "absolute_temp_ceiling_c": value(85.0),
+            "zone_min_demand": {zone.value: value(0.0) for zone in Zone},
+            "cpu_cooling_floor": [
+                {"temperature_c": value(40.0), "demand": value(0.0)},
+                {"temperature_c": value(80.0), "demand": value(1.0)},
+            ],
+            "fault_demand": value(1.0),
+            "stall_check_min_demand": {zone.value: value(0.0) for zone in Zone},
+            "stall_min_rpm": {zone.value: value(400) for zone in Zone},
+            "stall_window_ms": value(2_000),
+            "write_fail_emergency_after": value(3),
+            "telemetry": {
+                "cpu_ms": value(1_000),
+                "gpu_ms": value(1_000),
+                "t_sensor": {"enabled": value(False)},
+                "air_ms": value(3_000),
+                "air_sensor_period_ms": value(2_500),
+            },
+            "ramp_down_per_s": value(1.0),
+            "startup_settle_ms": value(1_000),
+            "fault_clear_hold_ms": value(2_000),
+            "tick_deadline_ms": value(500),
+            "overrun_consecutive_limit": value(3),
+            "watchdog_timeout_ms": value(5_000),
+        }
     )
+
+
+def composed_many(
+    front: float,
+    rear: float | None = None,
+    top: float | None = None,
+    *,
+    count: int = 1,
+) -> tuple[ComposedDemands, ...]:
+    def requests(value: float, rear_value: float, top_value: float) -> PerZone[ZoneRequest]:
+        return PerZone(
+            front=ZoneRequest(demand=value, reason=Reason(code="hardware_test")),
+            rear=ZoneRequest(demand=rear_value, reason=Reason(code="hardware_test")),
+            top=ZoneRequest(demand=top_value, reason=Reason(code="hardware_test")),
+        )
+
+    guard = GuardZoneOutput()
+    guards = PerZone(front=guard, rear=guard, top=guard)
+    air_metrics = tuple(sorted(AIR_TEMPERATURE_METRICS))
+    contract = ControlInputContract(
+        signals=(
+            SignalSpec(
+                metric="cpu.package",
+                importance=TelemetryImportance.CRITICAL,
+                stale_after_ms=1_000,
+            ),
+            SignalSpec(
+                metric="gpu.0.core",
+                importance=TelemetryImportance.CRITICAL,
+                stale_after_ms=1_000,
+            ),
+            *(
+                SignalSpec(
+                    metric=metric,
+                    importance=TelemetryImportance.DEGRADED,
+                    stale_after_ms=3_000,
+                )
+                for metric in air_metrics
+            ),
+        ),
+        critical_groups=(CriticalTelemetryGroup(code=AIR_TELEMETRY_GROUP, metrics=air_metrics),),
+    )
+
+    def snapshot(tick: int, mono: int) -> ControlStateSnapshot:
+        signals = tuple(
+            SnapshotSignal(
+                metric=spec.metric,
+                importance=spec.importance,
+                enabled=True,
+                value=40.0 if spec.metric == "cpu.package" else 25.0,
+                quality=Quality.OK,
+                source_ts_ms=mono,
+                last_changed_mono_ms=mono,
+                age_ms=0,
+            )
+            for spec in contract.signals
+        )
+        fan = FanState(effective_demand=1.0, rpm=1_000)
+        return ControlStateSnapshot(
+            tick_id=tick,
+            ts_ms=tick,
+            monotonic_ms=mono,
+            signals=signals,
+            derived=(),
+            trends=(),
+            telemetry_health=TelemetryHealth.NORMAL,
+            critical_unavailable=(),
+            fans=PerZone(front=fan, rear=fan, top=fan),
+        )
+
+    config = safety_config()
+    safety = CriticalSafety(config, input_contract=contract)
+    startup = safety.evaluate(snapshot(1, 0), mode=OperatingMode.AUTO)
+    composer = DemandComposer(config)
+    composer.compose(
+        requested=requests(1.0, 1.0, 1.0),
+        guard=guards,
+        safety=startup,
+        mode=OperatingMode.AUTO,
+    )
+    requested = requests(
+        front,
+        front if rear is None else rear,
+        front if top is None else top,
+    )
+    commands = []
+    for offset in range(count):
+        normal = safety.evaluate(
+            snapshot(2 + offset, 1_000 + offset * 1_000),
+            mode=OperatingMode.AUTO,
+        )
+        commands.append(
+            composer.compose(
+                requested=requested,
+                guard=guards,
+                safety=normal,
+                mode=OperatingMode.AUTO,
+            )
+        )
+    return tuple(commands)
+
+
+def composed(front: float, rear: float | None = None, top: float | None = None) -> ComposedDemands:
+    return composed_many(front, rear, top)[0]
 
 
 def test_simulated_backend_controls_three_zones_independently() -> None:
     backend = SimulatedFanBackend(hardware_config())
 
-    results = backend.apply(PerZone(front=effective(0.4), rear=effective(0.7), top=effective(1.0)))
+    results = backend.apply(composed(0.4, 0.7, 1.0))
 
     # 初回は kick のため Front が startup demand まで上がるが、Rear / Top は
     # それぞれの effective demand に対応する。各 zone は同じ Interface で独立する。
@@ -83,10 +241,10 @@ def test_simulated_backend_controls_three_zones_independently() -> None:
 
 def test_first_write_kicks_and_subsequent_write_never_uses_unsafe_low_pwm() -> None:
     backend = SimulatedFanBackend(hardware_config())
-    demands = PerZone(front=effective(0.0), rear=effective(0.0), top=effective(0.0))
+    first_command, second_command = composed_many(0.0, count=2)
 
-    first = backend.apply(demands)
-    second = backend.apply(demands)
+    first = backend.apply(first_command)
+    second = backend.apply(second_command)
 
     # profile の 0.3（minimum stable）未満を backend が生成しない。初回は 0.6 の kick。
     assert first.front.readback.pwm_raw == 153
@@ -100,11 +258,11 @@ def test_failed_startup_write_is_retried_with_startup_kick() -> None:
         hardware_config(),
         SimulatedFaultPlan(write_failure=frozenset({Zone.FRONT})),
     )
-    demands = PerZone(front=effective(0.0), rear=effective(0.0), top=effective(0.0))
+    failed_command, recovery_command = composed_many(0.0, count=2)
 
-    failed = backend.apply(demands)
+    failed = backend.apply(failed_command)
     backend.fault_plan = SimulatedFaultPlan()
-    recovered = backend.apply(demands)
+    recovered = backend.apply(recovery_command)
 
     # write 失敗は起動確認ではない。fault を解除した再試行も minimum stable
     # demand ではなく startup kick を使うため、未起動 fan を楽観視しない。
@@ -124,7 +282,7 @@ def test_simulated_failures_are_reported_as_zone_faults_for_critical_safety() ->
         ),
     )
 
-    results = backend.apply(PerZone(front=effective(0.7), rear=effective(0.7), top=effective(0.7)))
+    results = backend.apply(composed(0.7))
 
     assert results.front.fault is not None
     assert results.front.fault.code is FaultCode.WRITE_FAILURE
@@ -145,3 +303,27 @@ def test_backend_exposes_no_arbitrary_header_or_hwmon_write_api() -> None:
     # 向ける経路を作れない。
     assert not hasattr(backend, "write_header")
     assert not hasattr(backend, "write_path")
+
+
+def test_backend_rejects_a_demand_that_did_not_pass_the_composer() -> None:
+    backend = SimulatedFanBackend(hardware_config())
+
+    with pytest.raises((AttributeError, TypeError)):
+        backend.apply(cast(ComposedDemands, PerZone(front=0.0, rear=0.0, top=0.0)))
+    with pytest.raises(TypeError, match="DemandComposer"):
+        ComposedDemands()
+
+
+def test_backend_rejects_replayed_and_out_of_order_composed_commands() -> None:
+    older, newer = composed_many(0.2, count=2)
+    backend = SimulatedFanBackend(hardware_config())
+
+    backend.apply(newer)
+    with pytest.raises(ValueError, match="古い tick"):
+        backend.apply(older)
+
+    single = composed(0.2)
+    another_backend = SimulatedFanBackend(hardware_config())
+    another_backend.apply(single)
+    with pytest.raises(ValueError, match="再適用"):
+        another_backend.apply(single)

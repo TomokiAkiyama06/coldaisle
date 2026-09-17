@@ -230,6 +230,25 @@ def test_attribute_symlink_cannot_escape_resolved_hwmon_device(tmp_path: Path) -
     assert (devices / "device2/hwmon/hwmon2/pwm2").read_text(encoding="ascii") == "64\n"
 
 
+def test_attribute_symlink_cannot_switch_channels_inside_the_device(tmp_path: Path) -> None:
+    sysfs = tmp_path / "sysfs"
+    sysfs.mkdir()
+    create_sysfs(sysfs)
+    alternate = sysfs / "hwmon1/pwm4"
+    alternate.write_text("32\n", encoding="ascii")
+    pwm = sysfs / "hwmon1/pwm1"
+    pwm.unlink()
+    pwm.symlink_to(alternate)
+    handoff = tmp_path / "handoff.json"
+    write_record(handoff, record())
+
+    with pytest.raises(HandoffRecordError, match="symlink"):
+        emergency_handoff(handoff, sysfs)
+
+    assert alternate.read_text(encoding="ascii") == "32\n"
+    assert (sysfs / "hwmon2/pwm2").read_text(encoding="ascii") == "64\n"
+
+
 def test_one_zone_io_failure_does_not_skip_remaining_max_attempts(tmp_path: Path) -> None:
     sysfs = tmp_path / "sysfs"
     sysfs.mkdir()
@@ -344,3 +363,67 @@ def test_entrypoint_reports_partial_handoff_failure(
         {"zone": "rear", "status": "io_error", "phase": "enable", "detail": "OSError"},
         {"zone": "top", "status": "applied", "phase": "complete", "detail": ""},
     ]
+
+
+def test_entrypoint_reports_record_validation_failure_as_structured_json(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    sysfs = tmp_path / "sysfs"
+    sysfs.mkdir()
+    create_sysfs(sysfs)
+    handoff = tmp_path / "handoff.json"
+    handoff.write_text("not-json", encoding="utf-8")
+    monkeypatch.setattr(handoff_module, "HANDOFF_RECORD_PATH", handoff)
+    monkeypatch.setattr(handoff_module, "HWMON_ROOT", sysfs)
+    caplog.set_level(logging.INFO, logger="coldaisle.safety_handoff")
+
+    assert handoff_module.main() == 1
+
+    payload = json.loads(caplog.records[-1].message)
+    assert payload == {
+        "event": "safety_handoff_failed",
+        "record_found": None,
+        "success": False,
+        "failure": {
+            "phase": "record_or_root_validation",
+            "detail": "HandoffRecordError",
+        },
+        "zones": [],
+    }
+
+
+def test_entrypoint_does_not_treat_a_record_symlink_loop_as_absent(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    sysfs = tmp_path / "sysfs"
+    sysfs.mkdir()
+    handoff = tmp_path / "handoff.json"
+    handoff.symlink_to(handoff.name)
+    monkeypatch.setattr(handoff_module, "HANDOFF_RECORD_PATH", handoff)
+    monkeypatch.setattr(handoff_module, "HWMON_ROOT", sysfs)
+    caplog.set_level(logging.INFO, logger="coldaisle.safety_handoff")
+
+    assert handoff_module.main() == 1
+
+    payload = json.loads(caplog.records[-1].message)
+    assert payload["event"] == "safety_handoff_failed"
+    assert payload["failure"] == {
+        "phase": "record_or_root_validation",
+        "detail": "OSError",
+    }
+
+
+def test_entrypoint_does_not_hide_unexpected_programming_errors(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def unexpected(_record: Path, _root: Path) -> handoff_module.HandoffResult:
+        raise RuntimeError("injected bug")
+
+    monkeypatch.setattr(handoff_module, "emergency_handoff", unexpected)
+
+    with pytest.raises(RuntimeError, match="injected bug"):
+        handoff_module.main()

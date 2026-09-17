@@ -350,7 +350,7 @@ class ConfigSource(_ConfigModel):
     """decision trace に残せる入力の版・名前・内容ハッシュ。絶対 path は残さない。"""
 
     name: Literal["fan-hardware.yaml", "safety.yaml", "fan-policy.yaml"]
-    schema_version: Literal[1, 2]
+    schema_version: Annotated[int, Field(gt=0)]
     sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
 
 
@@ -399,7 +399,7 @@ class ControlConfig(_ConfigModel):
                     name=cast(
                         Literal["fan-hardware.yaml", "safety.yaml", "fan-policy.yaml"], filename
                     ),
-                    schema_version=cast(Literal[1, 2], schema_version),
+                    schema_version=schema_version,
                     sha256=sha256(text.encode("utf-8")).hexdigest(),
                 ),
             )

@@ -16,7 +16,9 @@ fault demand、復帰 hold、overrun 数、ramp-down はすべて `SafetyConfig`
 `provisional` の値も保守側の制約として適用するが、判定の
 `config_is_provisional` を true にし、確定値と混同しない。実運用値の設定ファイルは
 #50 / #75 の実測と所有者の承認までリポジトリに置かない。
-設定不正時の Max 裁定は `config_validated=false` と `config_invalid` fault を残し、
+設定不正時は `DemandComposer.for_invalid_config()` を使う。この専用 instance は
+`SafetyConfig` や rate を必要とせず、`config_validated=false` と `config_invalid` fault を
+伴う全 zone forced Max だけを初回も継続 tick も生成できる。通常の compose と混用できず、
 `config_is_provisional=false` を「確定済み」と読まないようにする。
 
 T_SENSOR の metric 名は決定記録 0032（#65、Proposed）の
@@ -29,7 +31,12 @@ T_SENSOR を有効化するときに `approved_t_sensor_metric` として承認�
 `disabled_inputs` に理由を残す。有効化後だけ Critical とする。DS18B20 は一部欠測で
 `telemetry_health=DEGRADED` になっても Safety state と demand を変えず、
 State Estimator が `critical_unavailable` に `air_telemetry` を出す全滅時だけ
-Front / Rear へ fault demand を適用する。
+Front / Rear へ fault demand を適用する。Critical Safety の構築時に
+CPU / GPU / optional T_SENSOR の Critical signal と、5本の air signal および
+`air_telemetry` group が一致する `ControlInputContract` を必須にする。さらに snapshot 上でも
+5本すべてが unavailable なら group marker の有無にかかわらず全滅と判定し、contract の
+設定漏れで NORMAL を続けない。各 signal の stale limit も同じ `SafetyConfig.telemetry` の
+検証済み値との一致を要求し、別経路の緩い閾値を使わせない。
 現行機は単一 GPU のため、Critical な GPU freshness と絶対温度上限は
 `gpu.0.core` / `gpu.0.hotspot` / `gpu.0.mem` に限定する。複数 GPU 対応は
 Collector / State Estimator と同時に contract を更新してから有効にする。
@@ -59,9 +66,21 @@ Manual / Calibration で Guard ceiling は使わないが、Guard floor と Safe
 
 `DemandComposer` は検証済み `SafetyConfig.ramp_down_per_s` と直前の effective を内部に
 保持し、呼び出し側から rate / previous / elapsed を受け取らない。最初の合成は
-STARTUP または EMERGENCY の全 zone forced Max だけを許し、以後は単調時計の前進から
-elapsed を計算する。stateless な合成関数は public API に公開しないため、#74 の loop が
-previous を省略したり任意の rate で ramp-down を迂回できない。
+STARTUP または EMERGENCY の全 zone forced Max だけを許し、以後は
+`CriticalSafetyDecision` 自身の `tick_id` / `monotonic_ms` の前進から elapsed を計算する。
+呼び出し側から時刻を注入する引数はなく、同じ裁定の再利用も拒否する。stateless な合成関数は
+public API に公開しないため、#74 の loop が previous を省略したり任意の rate・未来時刻で
+ramp-down や最新 Safety 判定を迂回できない。直接構築・serialize round-trip・`model_copy` で
+改変した Safety decision は発行時 payload と一致しないため合成を拒否する。composer は
+最初の裁定を発行した `CriticalSafety` instance と SafetyConfig に束縛し、別設定・別 evaluator の
+裁定を途中へ差し込めない。
+
+合成結果は constructor を公開しない `ComposedDemands` capability として返し、Hardware Backend
+はこの型だけを受理する。個別の `EffectiveZoneDemand` は decision trace の値 object として
+構築できるが、それを直接 Backend へ渡して Safety / composer を省略することはできない。
+command は Safety decision の tick / monotonic identity を保持する一回限りの値であり、Backend
+も strictly increasing な identity だけを受理する。保持していた古い低 demand を Emergency Max
+の後に replay して fan を下げることはできない。
 
 ## deadman / 異常停止
 
@@ -75,7 +94,7 @@ sysfs root からの `name_path` / `label_path` / `pwm_path` / `enable_path`、�
 driver name / label、元の PWM / enable を持つ。実行部は次を検査する。
 
 - path は `hwmonN/<attribute>` 形式で、class entry の symlink 解決後も4属性が
-  同一 device 内にある
+  同一 device 内にあり、属性自身の symlink で別 channel 名へ変わっていない
 - driver `name` と label が record と一致し、label と PWM の channel 番号も一致する
 - 3 zone が別の PWM / enable の組を指す
 
@@ -89,3 +108,8 @@ zone別 JSON log と非0終了で通知する。record が無いときは何も�
 deadman は完成しない。#74 / #57 でこれらを接続し、startup / restart / shutdown / kill / hang
 を実機検証することを、本番サービスを有効にする統合 PR の merge 条件とする。この #78 PR の
 merge だけでは #78 を完了扱いにせず、それまではサービスで Fan 制御を有効化しない。
+
+同じ統合 PR では #82 の保存済み `ControlTick` v1 互換を壊さず schema migration を用意し、
+`CriticalSafetyDecision.disabled_inputs` と `config_is_provisional` を decision trace と起動ログへ
+永続化する。現状は Safety 裁定には両方が入るが `ControlTick` v1 には field が無いため、
+この配線も本番有効化の blocker とする。

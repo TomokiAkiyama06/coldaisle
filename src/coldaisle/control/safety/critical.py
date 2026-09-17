@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from itertools import pairwise
 from math import isfinite
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field, PrivateAttr
 
 from coldaisle.control.config import SafetyConfig
 from coldaisle.control.schema import (
@@ -32,13 +32,22 @@ from coldaisle.control.schema import (
     Zone,
     ZoneRequest,
 )
-from coldaisle.control.state import ControlStateSnapshot
+from coldaisle.control.state import ControlInputContract, ControlStateSnapshot, TelemetryImportance
 from coldaisle.metrics import MetricCatalog
 from coldaisle.store.models import validate_metric
 
 CPU_TEMPERATURE_METRIC = "cpu.package"
 GPU_TEMPERATURE_METRIC = "gpu.0.core"
 AIR_TELEMETRY_GROUP = "air_telemetry"
+AIR_TEMPERATURE_METRICS: frozenset[str] = frozenset(
+    {
+        "air.front_intake",
+        "air.gpu_intake",
+        "air.gpu_exhaust",
+        "air.top_exhaust",
+        "air.rear_exhaust",
+    }
+)
 
 # これらは値ではなく、requirements と決定記録 0029 の canonical metric contract。
 # Power / utilization / humidity / VRAM 容量に温度上限を誤適用しないため明示する。
@@ -65,17 +74,118 @@ _WRITE_FAULTS = frozenset(
 _FAN_FAULTS = _WRITE_FAULTS | {FaultCode.TACH_STALL}
 
 
+_SAFETY_DECISION_AUTHORITY = object()
+
+
 class CriticalSafetyDecision(BaseModel):
     """1 tick の Safety 最終裁定。decision trace へそのまま記録できる。"""
 
     model_config = ConfigDict(frozen=True, extra="forbid", strict=True)
 
+    tick_id: int = Field(ge=0)
+    monotonic_ms: int = Field(ge=0)
     state: SafetyState
     zones: PerZone[SafetyZoneOutput]
     faults: tuple[Fault, ...] = ()
     disabled_inputs: tuple[Reason, ...] = ()
     config_validated: bool = True
     config_is_provisional: bool
+    _authority: object | None = PrivateAttr(default=None)
+    _config_payload: str | None = PrivateAttr(default=None)
+    _issued_payload: str | None = PrivateAttr(default=None)
+    _lineage: object | None = PrivateAttr(default=None)
+
+    def _mark_issued(
+        self,
+        authority: object,
+        *,
+        config_payload: str | None,
+        lineage: object,
+    ) -> CriticalSafetyDecision:
+        if authority is not _SAFETY_DECISION_AUTHORITY:
+            raise TypeError("CriticalSafety だけが Safety 裁定を発行できる")
+        self._authority = authority
+        self._config_payload = config_payload
+        self._issued_payload = self.model_dump_json()
+        self._lineage = lineage
+        return self
+
+    def _binding(self, authority: object) -> tuple[str | None, object]:
+        if (
+            authority is not _SAFETY_DECISION_AUTHORITY
+            or self._authority is not _SAFETY_DECISION_AUTHORITY
+            or self._issued_payload != self.model_dump_json()
+            or self._lineage is None
+        ):
+            raise ValueError("CriticalSafety が発行していない裁定は合成しない")
+        return self._config_payload, self._lineage
+
+
+_COMPOSED_DEMAND_AUTHORITY = object()
+
+
+class ComposedDemands:
+    """DemandComposer だけが発行できる Hardware Backend 向け command。
+
+    ``EffectiveZoneDemand`` 自体は decision trace の値 object として公開する一方、
+    Backend の入力にはこの capability envelope を要求する。これにより通常の
+    constructor/API から Safety 合成を省略した書込み command を作れない。
+    """
+
+    __slots__ = ("_authority", "_consumed", "_monotonic_ms", "_tick_id", "_zones")
+    _authority: object
+    _consumed: bool
+    _monotonic_ms: int
+    _tick_id: int
+    _zones: PerZone[EffectiveZoneDemand]
+
+    def __init__(self) -> None:
+        raise TypeError("ComposedDemands は DemandComposer からだけ取得する")
+
+    def __setattr__(self, name: str, value: object) -> None:
+        raise AttributeError("ComposedDemands は不変")
+
+    @classmethod
+    def _from_composer(
+        cls,
+        zones: PerZone[EffectiveZoneDemand],
+        *,
+        authority: object,
+        tick_id: int,
+        monotonic_ms: int,
+    ) -> ComposedDemands:
+        if authority is not _COMPOSED_DEMAND_AUTHORITY:
+            raise TypeError("DemandComposer だけが command を発行できる")
+        command = object.__new__(cls)
+        object.__setattr__(command, "_zones", zones)
+        object.__setattr__(command, "_authority", _COMPOSED_DEMAND_AUTHORITY)
+        object.__setattr__(command, "_consumed", False)
+        object.__setattr__(command, "_tick_id", tick_id)
+        object.__setattr__(command, "_monotonic_ms", monotonic_ms)
+        return command
+
+    def _consume_for_hardware(self) -> tuple[PerZone[EffectiveZoneDemand], int, int]:
+        if self._authority is not _COMPOSED_DEMAND_AUTHORITY:
+            raise TypeError("DemandComposer が発行していない command は適用できない")
+        if self._consumed:
+            raise ValueError("同じ fan command を再適用できない")
+        object.__setattr__(self, "_consumed", True)
+        return self._zones, self._tick_id, self._monotonic_ms
+
+    @property
+    def front(self) -> EffectiveZoneDemand:
+        return self._zones.front
+
+    @property
+    def rear(self) -> EffectiveZoneDemand:
+        return self._zones.rear
+
+    @property
+    def top(self) -> EffectiveZoneDemand:
+        return self._zones.top
+
+    def get(self, zone: Zone) -> EffectiveZoneDemand:
+        return self._zones.get(zone)
 
 
 @dataclass(slots=True)
@@ -97,6 +207,7 @@ class CriticalSafety:
         self,
         config: SafetyConfig,
         *,
+        input_contract: ControlInputContract,
         approved_t_sensor_metric: str | None = None,
         metric_catalog: MetricCatalog | None = None,
     ) -> None:
@@ -122,6 +233,12 @@ class CriticalSafety:
                     f"metric={approved_t_sensor_metric}, unit={unit}"
                 )
         self._config = config
+        self._config_payload = config.model_dump_json()
+        self._lineage = object()
+        self._validate_input_contract(config, input_contract, approved_t_sensor_metric)
+        self._required_snapshot_metrics = frozenset(
+            spec.metric for spec in input_contract.signals if spec.enabled
+        )
         self._t_sensor_metric = approved_t_sensor_metric
         self._disabled_inputs = (
             ()
@@ -145,6 +262,60 @@ class CriticalSafety:
         self._latched_faults: dict[tuple[FaultCode, Zone | None], _LatchedFault] = {}
         self._config_is_provisional = _contains_provisional(config.model_dump(mode="python"))
 
+    @staticmethod
+    def _validate_input_contract(
+        config: SafetyConfig,
+        contract: ControlInputContract,
+        approved_t_sensor_metric: str | None,
+    ) -> None:
+        specs = {spec.metric: spec for spec in contract.signals}
+        critical_metrics = {
+            spec.metric
+            for spec in contract.signals
+            if spec.enabled and spec.importance is TelemetryImportance.CRITICAL
+        }
+        expected_critical = {CPU_TEMPERATURE_METRIC, GPU_TEMPERATURE_METRIC}
+        if approved_t_sensor_metric is not None:
+            expected_critical.add(approved_t_sensor_metric)
+        if critical_metrics != expected_critical:
+            raise ValueError(
+                "Critical Safety の CRITICAL signal contract が一致しない: "
+                f"expected={sorted(expected_critical)}, actual={sorted(critical_metrics)}"
+            )
+        expected_stale_ms = {
+            CPU_TEMPERATURE_METRIC: config.telemetry.cpu_ms.value,
+            GPU_TEMPERATURE_METRIC: config.telemetry.gpu_ms.value,
+            **{metric: config.telemetry.air_ms.value for metric in AIR_TEMPERATURE_METRICS},
+        }
+        if approved_t_sensor_metric is not None:
+            stale_after_ms = config.telemetry.t_sensor.stale_after_ms
+            assert stale_after_ms is not None
+            expected_stale_ms[approved_t_sensor_metric] = stale_after_ms.value
+        stale_mismatch = sorted(
+            metric
+            for metric, expected in expected_stale_ms.items()
+            if metric not in specs or specs[metric].stale_after_ms != expected
+        )
+        if stale_mismatch:
+            raise ValueError(
+                "Safety signal contract の stale limit が SafetyConfig と一致しない: "
+                f"{stale_mismatch}"
+            )
+        invalid_air = sorted(
+            metric
+            for metric in AIR_TEMPERATURE_METRICS
+            if metric not in specs
+            or not specs[metric].enabled
+            or specs[metric].importance is not TelemetryImportance.DEGRADED
+        )
+        if invalid_air:
+            raise ValueError(f"air telemetry contract が不正: {invalid_air}")
+        if len(contract.critical_groups) != 1:
+            raise ValueError("air_telemetry Critical group は承認済み5 signal全体に固定する")
+        group = contract.critical_groups[0]
+        if group.code != AIR_TELEMETRY_GROUP or frozenset(group.metrics) != AIR_TEMPERATURE_METRICS:
+            raise ValueError("air_telemetry Critical group は承認済み5 signal全体に固定する")
+
     @property
     def config_is_provisional(self) -> bool:
         """安全値に未確定の項目があることを返す。値そのものは変えない。"""
@@ -164,6 +335,14 @@ class CriticalSafety:
         受け取る。ML の失敗は Fallback の責務であり、Safety state を変えない。
         """
         self._check_tick_order(snapshot)
+        missing_contract_metrics = (
+            self._required_snapshot_metrics - snapshot.signals_by_metric.keys()
+        )
+        if missing_contract_metrics:
+            raise ValueError(
+                "Safety snapshot に contract の有効 signal が無い: "
+                f"{sorted(missing_contract_metrics)}"
+            )
         now_ms = snapshot.monotonic_ms
         if self._started_ms is None:
             self._started_ms = now_ms
@@ -207,11 +386,17 @@ class CriticalSafety:
         emergency = any(item.emergency for item in self._latched_faults.values())
         state = self._next_state(snapshot, emergency, bool(faults))
         return CriticalSafetyDecision(
+            tick_id=snapshot.tick_id,
+            monotonic_ms=snapshot.monotonic_ms,
             state=state,
             zones=self._zone_outputs(snapshot, state, mode, faults),
             faults=faults,
             disabled_inputs=self._disabled_inputs,
             config_is_provisional=self._config_is_provisional,
+        )._mark_issued(
+            _SAFETY_DECISION_AUTHORITY,
+            config_payload=self._config_payload,
+            lineage=self._lineage,
         )
 
     def _check_tick_order(self, snapshot: ControlStateSnapshot) -> None:
@@ -246,7 +431,9 @@ class CriticalSafety:
             snapshot, self._t_sensor_metric
         ):
             faults.append(Fault(code=FaultCode.T_SENSOR_STALE))
-        if AIR_TELEMETRY_GROUP in unavailable:
+        if AIR_TELEMETRY_GROUP in unavailable or all(
+            not _signal_available(snapshot, metric) for metric in AIR_TEMPERATURE_METRICS
+        ):
             faults.append(Fault(code=FaultCode.AIR_TELEMETRY_STALE))
         return tuple(faults)
 
@@ -446,7 +633,7 @@ class CriticalSafety:
         )
 
 
-def invalid_config_decision() -> CriticalSafetyDecision:
+def invalid_config_decision(*, tick_id: int, monotonic_ms: int) -> CriticalSafetyDecision:
     """ハードウェア特定済みで Safety/Policy 設定が不正な場合の Max 裁定。
 
     hardware mapping も不正な場合はこの関数を使わず、BIOS 制御のまま
@@ -456,11 +643,17 @@ def invalid_config_decision() -> CriticalSafetyDecision:
     reason = Reason(code="config_invalid_max")
     zone = SafetyZoneOutput(floor=1.0, forced_max=True, reason=reason)
     return CriticalSafetyDecision(
+        tick_id=tick_id,
+        monotonic_ms=monotonic_ms,
         state=SafetyState.EMERGENCY,
         zones=PerZone(front=zone, rear=zone, top=zone),
         faults=(fault,),
         config_validated=False,
         config_is_provisional=False,
+    )._mark_issued(
+        _SAFETY_DECISION_AUTHORITY,
+        config_payload=None,
+        lineage=object(),
     )
 
 
@@ -468,9 +661,27 @@ class DemandComposer:
     """検証済み SafetyConfig と直前 effective を所有する唯一の合成経路。"""
 
     def __init__(self, config: SafetyConfig) -> None:
+        self._config_payload: str | None = config.model_dump_json()
+        self._lineage: object | None = None
         self._ramp_down_per_s = config.ramp_down_per_s.value
         self._previous: PerZone[EffectiveZoneDemand] | None = None
+        self._last_tick_id: int | None = None
         self._last_monotonic_ms: int | None = None
+        self._invalid_config_only = False
+
+    @classmethod
+    def for_invalid_config(cls) -> DemandComposer:
+        """設定値を一切使わず、config-invalid Max だけを出せる composer。"""
+        composer = cls.__new__(cls)
+        # invalid-config 経路は forced Max だけなので、この値は需要を決めない。
+        composer._config_payload = None
+        composer._lineage = object()
+        composer._ramp_down_per_s = 0.0
+        composer._previous = None
+        composer._last_tick_id = None
+        composer._last_monotonic_ms = None
+        composer._invalid_config_only = True
+        return composer
 
     def compose(
         self,
@@ -479,18 +690,65 @@ class DemandComposer:
         guard: PerZone[GuardZoneOutput],
         safety: CriticalSafetyDecision,
         mode: OperatingMode,
-        now_mono_ms: int,
-    ) -> PerZone[EffectiveZoneDemand]:
-        """0028 §2.4 の順序で合成し、次 tick 用 effective を内部保持する。"""
-        if now_mono_ms < 0:
-            raise ValueError("合成の単調時計は負にできない")
+    ) -> ComposedDemands:
+        """Safety 裁定の時刻だけを使って合成し、次 tick 用 effective を保持する。"""
+        if self._invalid_config_only:
+            raise ValueError("設定不正時は compose_invalid_config() だけを使う")
+        config_payload, lineage = safety._binding(_SAFETY_DECISION_AUTHORITY)
+        if not safety.config_validated:
+            raise ValueError("config-invalid 裁定は専用 composer で合成する")
+        if config_payload != self._config_payload:
+            raise ValueError("Safety evaluator と DemandComposer の設定が一致しない")
+        if self._lineage is None:
+            self._lineage = lineage
+        elif lineage is not self._lineage:
+            raise ValueError("異なる CriticalSafety instance の裁定を混ぜない")
+        return self._compose_and_remember(
+            requested=requested,
+            guard=guard,
+            safety=safety,
+            mode=mode,
+        )
+
+    def compose_invalid_config(
+        self,
+        *,
+        tick_id: int,
+        monotonic_ms: int,
+    ) -> ComposedDemands:
+        """設定が壊れていても表現できる、全 zone forced Max の専用経路。"""
+        if not self._invalid_config_only:
+            raise ValueError("検証済み設定の composer では config-invalid 経路を使わない")
+        request = ZoneRequest(demand=1.0, reason=Reason(code="config_invalid_max"))
+        guard = GuardZoneOutput()
+        return self._compose_and_remember(
+            requested=PerZone(front=request, rear=request, top=request),
+            guard=PerZone(front=guard, rear=guard, top=guard),
+            safety=invalid_config_decision(tick_id=tick_id, monotonic_ms=monotonic_ms),
+            mode=OperatingMode.AUTO,
+        )
+
+    def _compose_and_remember(
+        self,
+        *,
+        requested: PerZone[ZoneRequest],
+        guard: PerZone[GuardZoneOutput],
+        safety: CriticalSafetyDecision,
+        mode: OperatingMode,
+    ) -> ComposedDemands:
+        now_mono_ms = safety.monotonic_ms
         if self._last_monotonic_ms is None:
-            if not all(safety.zones.get(zone).forced_max for zone in Zone):
+            if safety.state not in {SafetyState.STARTUP, SafetyState.EMERGENCY} or not all(
+                safety.zones.get(zone).forced_max for zone in Zone
+            ):
                 raise ValueError("最初の合成は STARTUP / EMERGENCY の forced Max にする")
             elapsed_ms = 0
         else:
+            assert self._last_tick_id is not None
+            if safety.tick_id <= self._last_tick_id:
+                raise ValueError("Safety 裁定の tick は合成ごとに前進させる")
             if now_mono_ms <= self._last_monotonic_ms:
-                raise ValueError("合成の単調時計は tick ごとに前進させる")
+                raise ValueError("Safety 裁定の単調時計は合成ごとに前進させる")
             elapsed_ms = now_mono_ms - self._last_monotonic_ms
 
         effective = _compose_effective_demands(
@@ -503,8 +761,14 @@ class DemandComposer:
             ramp_down_per_s=self._ramp_down_per_s,
         )
         self._previous = effective
+        self._last_tick_id = safety.tick_id
         self._last_monotonic_ms = now_mono_ms
-        return effective
+        return ComposedDemands._from_composer(
+            effective,
+            authority=_COMPOSED_DEMAND_AUTHORITY,
+            tick_id=safety.tick_id,
+            monotonic_ms=safety.monotonic_ms,
+        )
 
 
 def _compose_effective_demands(

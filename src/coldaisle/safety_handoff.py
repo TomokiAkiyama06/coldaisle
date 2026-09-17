@@ -96,7 +96,9 @@ def emergency_handoff(record_path: Path, sysfs_root: Path) -> HandoffResult:
     header label が一致しない zone も書き込まない。一致した zone は PWM を先に
     Max へ上げ、その後 manual mode に切り替える。
     """
-    if not record_path.exists():
+    try:
+        record_path.stat()
+    except FileNotFoundError:
         return HandoffResult(record_found=False)
 
     headers = _load_record(record_path)
@@ -219,12 +221,31 @@ def main() -> int:
     書き込む値や対象 root を引数で差し替える経路は持たない。identity
     mismatch は対象外 header へ書かず、非0で systemd へ通知する。
     """
-    result = emergency_handoff(HANDOFF_RECORD_PATH, HWMON_ROOT)
-    failed = bool(result.identity_mismatch_zones or result.failed_zones)
     logging.basicConfig(level=logging.INFO, format="%(message)s")
-    logging.getLogger("coldaisle.safety_handoff").log(
+    logger = logging.getLogger("coldaisle.safety_handoff")
+    try:
+        result = emergency_handoff(HANDOFF_RECORD_PATH, HWMON_ROOT)
+    except (HandoffRecordError, OSError) as exc:
+        logger.error(
+            _json_event(
+                {
+                    "event": "safety_handoff_failed",
+                    "record_found": None,
+                    "success": False,
+                    "failure": {
+                        "phase": "record_or_root_validation",
+                        "detail": type(exc).__name__,
+                    },
+                    "zones": [],
+                }
+            )
+        )
+        return 1
+
+    failed = bool(result.identity_mismatch_zones or result.failed_zones)
+    logger.log(
         logging.ERROR if failed else logging.INFO,
-        json.dumps(
+        _json_event(
             {
                 "event": "safety_handoff_completed",
                 "record_found": result.record_found,
@@ -239,12 +260,18 @@ def main() -> int:
                     for zone in result.zones
                 ],
             },
-            ensure_ascii=False,
-            separators=(",", ":"),
-            sort_keys=True,
         ),
     )
     return 1 if failed else 0
+
+
+def _json_event(payload: dict[str, Any]) -> str:
+    return json.dumps(
+        payload,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
 
 
 def _load_record(path: Path) -> tuple[_HeaderRecord, ...]:
@@ -344,6 +371,8 @@ def _resolve_beneath(root: Path, relative: str) -> Path:
     resolved = (device_root / candidate.parts[1]).resolve(strict=True)
     if not resolved.is_relative_to(device_root):
         raise HandoffRecordError("handoff attribute が解決後の hwmon device 外を指している")
+    if resolved.name != candidate.name:
+        raise HandoffRecordError("handoff attribute の symlink で channel を変更できない")
     return resolved
 
 

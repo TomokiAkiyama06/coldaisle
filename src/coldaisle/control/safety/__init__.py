@@ -3,8 +3,10 @@
 from coldaisle.control.safety.critical import (
     ABSOLUTE_TEMPERATURE_METRICS,
     AIR_TELEMETRY_GROUP,
+    AIR_TEMPERATURE_METRICS,
     CPU_TEMPERATURE_METRIC,
     GPU_TEMPERATURE_METRIC,
+    ComposedDemands,
     CriticalSafety,
     CriticalSafetyDecision,
     DemandComposer,
@@ -20,8 +22,10 @@ from coldaisle.safety_handoff import (
 __all__ = [
     "ABSOLUTE_TEMPERATURE_METRICS",
     "AIR_TELEMETRY_GROUP",
+    "AIR_TEMPERATURE_METRICS",
     "CPU_TEMPERATURE_METRIC",
     "GPU_TEMPERATURE_METRIC",
+    "ComposedDemands",
     "CriticalSafety",
     "CriticalSafetyDecision",
     "DemandComposer",

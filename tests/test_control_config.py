@@ -6,7 +6,7 @@ import pytest
 import yaml
 from pydantic import ValidationError
 
-from coldaisle.control.config import ControlConfig
+from coldaisle.control.config import ConfigSource, ControlConfig
 
 
 def provisional(value: float | int) -> dict[str, object]:
@@ -161,6 +161,16 @@ def test_trace_source_version_must_match_the_validated_file_model(tmp_path: Path
 
     with pytest.raises(ValidationError, match="ConfigSource"):
         ControlConfig.model_validate(raw)
+
+
+def test_config_source_can_record_future_subconfig_versions_without_weakening_models() -> None:
+    source = ConfigSource(
+        name="fan-policy.yaml",
+        schema_version=3,
+        sha256="0" * 64,
+    )
+
+    assert source.schema_version == 3
 
 
 def test_missing_or_unknown_config_is_rejected_before_activation(tmp_path: Path) -> None:

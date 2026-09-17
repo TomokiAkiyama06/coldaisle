@@ -1,6 +1,6 @@
 """実機へ書き込まない Fan Hardware Backend。#77
 
-ここで扱う入力は Critical Safety が合成した ``EffectiveZoneDemand`` だけである。
+ここで扱う入力は Critical Safety が合成した ``ComposedDemands`` だけである。
 PWM の raw 値はこのモジュール内でしか作らず、simulated backend は sysfs、
 subprocess、ネットワークを一切使わない。実機 backend は #57 の OS 権限・
 handoff 条件と #75 の測定結果が揃ってから、この Protocol を実装する。
@@ -13,9 +13,9 @@ from itertools import pairwise
 from typing import Protocol
 
 from coldaisle.control.config import FanHardwareConfig, FanProfile
+from coldaisle.control.safety.critical import ComposedDemands
 from coldaisle.control.schema import (
     HWMON_PWM_MAX,
-    EffectiveZoneDemand,
     Fault,
     FaultCode,
     HardwareReadback,
@@ -41,7 +41,7 @@ class FanHardwareResult:
 class FanHardwareBackend(Protocol):
     """実機・simulated backend が共有する、唯一の書込み境界。"""
 
-    def apply(self, demands: PerZone[EffectiveZoneDemand]) -> PerZone[FanHardwareResult]:
+    def apply(self, demands: ComposedDemands) -> PerZone[FanHardwareResult]:
         """effective demand を3 zone 独立に反映し、readback と fault を返す。"""
 
 
@@ -70,18 +70,27 @@ class SimulatedFanBackend:
     config: FanHardwareConfig
     fault_plan: SimulatedFaultPlan = field(default_factory=SimulatedFaultPlan)
     _running: set[Zone] = field(default_factory=set, init=False, repr=False)
+    _last_tick_id: int | None = field(default=None, init=False, repr=False)
+    _last_monotonic_ms: int | None = field(default=None, init=False, repr=False)
 
-    def apply(self, demands: PerZone[EffectiveZoneDemand]) -> PerZone[FanHardwareResult]:
+    def apply(self, demands: ComposedDemands) -> PerZone[FanHardwareResult]:
         """3 zone の effective demand を個別に map する。実機 I/O は行わない。"""
+        zones, tick_id, monotonic_ms = demands._consume_for_hardware()
+        if self._last_tick_id is not None and tick_id <= self._last_tick_id:
+            raise ValueError("Fan Hardware Backend に古い tick の command を適用できない")
+        if self._last_monotonic_ms is not None and monotonic_ms <= self._last_monotonic_ms:
+            raise ValueError("Fan Hardware Backend の command 時刻は前進させる")
+        self._last_tick_id = tick_id
+        self._last_monotonic_ms = monotonic_ms
         return PerZone(
-            front=self._apply_zone(Zone.FRONT, demands.front),
-            rear=self._apply_zone(Zone.REAR, demands.rear),
-            top=self._apply_zone(Zone.TOP, demands.top),
+            front=self._apply_zone(Zone.FRONT, zones.front.effective),
+            rear=self._apply_zone(Zone.REAR, zones.rear.effective),
+            top=self._apply_zone(Zone.TOP, zones.top.effective),
         )
 
-    def _apply_zone(self, zone: Zone, demand: EffectiveZoneDemand) -> FanHardwareResult:
+    def _apply_zone(self, zone: Zone, demand: float) -> FanHardwareResult:
         profile = self.config.zones.get(zone).profile
-        mapped_demand = self._safe_demand(zone, demand.effective, profile)
+        mapped_demand = self._safe_demand(zone, demand, profile)
         target_rpm = _interpolate_rpm(profile, mapped_demand)
         airflow_index = _interpolate_airflow_index(profile, mapped_demand)
         pwm_raw = _demand_to_raw_pwm(mapped_demand)
