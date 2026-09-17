@@ -196,7 +196,7 @@ class ReactiveGuard:
             band = self._band(trigger)
             activate, clear = self._thresholds(band, profile)
             if value is not None:
-                active = value > clear if was_active else value >= activate
+                active = value > clear if was_active else value > activate
                 self._trigger_active[trigger.code] = active
                 if was_active and not active:
                     for zone in trigger.zones:

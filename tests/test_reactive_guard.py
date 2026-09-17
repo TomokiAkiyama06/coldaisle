@@ -354,6 +354,18 @@ def test_degraded_snapshot_uses_the_configured_conservative_threshold_set() -> N
     assert gpu_evidence.activate_above == pytest.approx(1.5)
 
 
+def test_activation_requires_strictly_exceeding_the_configured_threshold() -> None:
+    at_threshold = ReactiveGuard(config()).evaluate(
+        temperature_snapshot(tick=1, mono=1_000, rate=2.0)
+    )
+    above_threshold = ReactiveGuard(config()).evaluate(
+        temperature_snapshot(tick=1, mono=1_000, rate=2.001)
+    )
+
+    assert at_threshold.zones.front == GuardZoneOutput()
+    assert above_threshold.zones.front.floor == pytest.approx(0.6)
+
+
 def test_hold_uses_monotonic_time_and_same_snapshot_evaluation_is_idempotent() -> None:
     guard = ReactiveGuard(config(hold_ms=1_000))
     first_snapshot = temperature_snapshot(

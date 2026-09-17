@@ -27,7 +27,8 @@ hysteresis 状態を維持する。signal が `missing` / `suspect` / `stale` �
 
 ## Hysteresis / hold / trace
 
-各 trigger は `activate_above` で発火し、発火後は `clear_at_or_below` 以下になるまで残る。
+各 trigger は値が `activate_above` を超えると発火し、発火後は
+`clear_at_or_below` 以下になるまで残る。
 解除条件に入っても、最後に発火していた単調時計時刻から `hold_ms` までは floor を維持する。
 壁時計の時刻合わせは hold に影響しない。
 
@@ -47,6 +48,7 @@ hysteresis 状態を維持する。signal が `missing` / `suspect` / `stale` �
 Config はリポジトリに置いていない。#50 / #75 の実測が終わるまでは値を `confirmed` に
 せず、値の確定・緩和には決定記録 0028 §2.9 の所有者承認が必要である。
 
-CPU package power の canonical metric `power.cpu.package` は #65 の収集境界と共有する。
+CPU package power は #65 / 決定記録 0032（Proposed）が提案する
+metric 名 `power.cpu.package` を収集境界と共有する。
 実機の hwmon driver / label 対応が未確定の間も、Replay / Mock で同じ snapshot
 契約を使える。
