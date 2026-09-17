@@ -9,6 +9,7 @@ from pydantic import ValidationError
 
 from coldaisle.control.config import (
     ConfigApprovalRequiredError,
+    ConfigReloadApproval,
     ControlConfig,
     ControlConfigManager,
 )
@@ -204,9 +205,16 @@ def test_reload_is_atomic_and_safety_change_needs_explicit_approval(tmp_path: Pa
     with pytest.raises(ConfigApprovalRequiredError, match="safety"):
         manager.reload_from_directory(tmp_path)
     assert manager.active is active
-
-    applied = manager.reload_from_directory(tmp_path, approved=True)
+    applied = manager.reload_from_directory(
+        tmp_path,
+        approval=ConfigReloadApproval(reference="docs/decisions/0028-fan-control-contracts.md"),
+    )
     assert manager.active is applied
+    assert manager.last_reload_event is not None
+    assert manager.last_reload_event.approval is not None
+    assert manager.last_reload_event.trace_metadata()["control_config_reload"][
+        "changed_sections"
+    ] == ["safety"]
     assert applied.safety.fault_demand.value == 0.9
 
 
@@ -219,3 +227,31 @@ def test_optimization_only_reload_can_swap_after_full_validation(tmp_path: Path)
 
     applied = manager.reload_from_directory(tmp_path)
     assert applied.policy.ml_budget_ms == 200
+
+
+def test_provisional_values_identify_safety_and_policy_without_exposing_values(
+    tmp_path: Path,
+) -> None:
+    values = load_config(tmp_path).provisional_values()
+
+    assert {item.source for item in values} == {
+        "fan-hardware.yaml",
+        "safety.yaml",
+        "fan-policy.yaml",
+    }
+    assert any(item.path == "fault_demand" for item in values)
+    assert any(item.path == "reactive_guard.ceiling" for item in values)
+    assert all("value" not in item.model_dump() for item in values)
+
+
+def test_invalid_reload_keeps_active_config_and_previous_event(tmp_path: Path) -> None:
+    active = load_config(tmp_path)
+    manager = ControlConfigManager(active)
+    candidate = valid_documents()
+    candidate["safety.yaml"]["unknown"] = True
+    write_documents(tmp_path, candidate)
+
+    with pytest.raises(ValidationError):
+        manager.reload_from_directory(tmp_path)
+    assert manager.active is active
+    assert manager.last_reload_event is None

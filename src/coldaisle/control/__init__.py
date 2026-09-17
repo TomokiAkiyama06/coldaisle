@@ -10,8 +10,11 @@ from coldaisle.control.config import (
     CONFIG_FILENAMES,
     CONTROL_CONFIG_VERSION,
     ConfigApprovalRequiredError,
+    ConfigReloadApproval,
+    ConfigReloadEvent,
     ControlConfig,
     ControlConfigManager,
+    ProvisionalConfigValue,
 )
 from coldaisle.control.logging import ControlTraceLogger, ControlTraceSink
 from coldaisle.control.schema import (
@@ -54,6 +57,8 @@ __all__ = [
     "AuthorityStage",
     "BoundBy",
     "ConfigApprovalRequiredError",
+    "ConfigReloadApproval",
+    "ConfigReloadEvent",
     "ControlConfig",
     "ControlConfigManager",
     "ControlState",
@@ -71,6 +76,7 @@ __all__ = [
     "OperatingMode",
     "OptimizerStatus",
     "PerZone",
+    "ProvisionalConfigValue",
     "Reason",
     "SafetyState",
     "SafetyZoneOutput",

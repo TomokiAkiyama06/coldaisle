@@ -72,6 +72,20 @@ class ConfigApproval(_ConfigModel):
         return self
 
 
+class ConfigReloadApproval(_ConfigModel):
+    """安全設定の差し替えを許可した決定への参照。"""
+
+    reference: str = Field(min_length=1, max_length=500)
+
+
+class ProvisionalConfigValue(_ConfigModel):
+    """起動ログへ出す、値を含めない暫定設定の位置。"""
+
+    source: Literal["fan-hardware.yaml", "safety.yaml", "fan-policy.yaml"]
+    path: str = Field(min_length=1, max_length=500)
+    basis: str | None
+
+
 SafetyDemand = ConfigValue[Demand]
 SafetyMilliseconds = ConfigValue[PositiveMilliseconds]
 SafetyRpm = ConfigValue[PositiveRpm]
@@ -285,6 +299,19 @@ class ConfigSources(_ConfigModel):
     policy: ConfigSource
 
 
+class ConfigReloadEvent(_ConfigModel):
+    """一括適用した設定変更を decision trace へ渡す不変イベント。"""
+
+    previous_sources: ConfigSources
+    current_sources: ConfigSources
+    changed_sections: tuple[str, ...]
+    approval: ConfigReloadApproval | None
+
+    def trace_metadata(self) -> dict[str, object]:
+        """#82 の trace payload に合成できる変更記録。"""
+        return {"control_config_reload": self.model_dump(mode="json")}
+
+
 class ControlConfig(_ConfigModel):
     """一括で検証済みの制御設定と、再現用の入力情報。"""
 
@@ -331,6 +358,63 @@ class ControlConfig(_ConfigModel):
         """#82 の decision trace payload へ足せる再現情報。"""
         return {"control_config": self.sources.model_dump(mode="json")}
 
+    def provisional_values(self) -> tuple[ProvisionalConfigValue, ...]:
+        """起動ログ用に、確認前の設定位置だけを返す。"""
+        values: list[ProvisionalConfigValue] = []
+
+        def append(
+            source: Literal["fan-hardware.yaml", "safety.yaml", "fan-policy.yaml"],
+            path: str,
+            value: ConfigApproval | ConfigValue[Any],
+        ) -> None:
+            if value.status == "provisional":
+                values.append(ProvisionalConfigValue(source=source, path=path, basis=value.basis))
+
+        safety = self.safety
+        append("fan-hardware.yaml", "approval", self.fan_hardware.approval)
+        append("safety.yaml", "absolute_temp_ceiling_c", safety.absolute_temp_ceiling_c)
+        append("safety.yaml", "fault_demand", safety.fault_demand)
+        append("safety.yaml", "stall_window_ms", safety.stall_window_ms)
+        append("safety.yaml", "ramp_down_per_s", safety.ramp_down_per_s)
+        append("safety.yaml", "startup_settle_ms", safety.startup_settle_ms)
+        append("safety.yaml", "fault_clear_hold_ms", safety.fault_clear_hold_ms)
+        append("safety.yaml", "tick_deadline_ms", safety.tick_deadline_ms)
+        append("safety.yaml", "overrun_consecutive_limit", safety.overrun_consecutive_limit)
+        append("safety.yaml", "watchdog_timeout_ms", safety.watchdog_timeout_ms)
+        for zone in Zone:
+            append(
+                "safety.yaml",
+                f"zone_min_demand.{zone.value}",
+                safety.zone_min_demand.get(zone),
+            )
+            append(
+                "safety.yaml",
+                f"stall_min_rpm.{zone.value}",
+                safety.stall_min_rpm.get(zone),
+            )
+        for index, point in enumerate(safety.cpu_cooling_floor):
+            append("safety.yaml", f"cpu_cooling_floor[{index}].temperature_c", point.temperature_c)
+            append("safety.yaml", f"cpu_cooling_floor[{index}].demand", point.demand)
+        for name in ("cpu_ms", "gpu_ms", "t_sensor_ms", "air_ms", "air_sensor_period_ms"):
+            append("safety.yaml", f"telemetry.{name}", getattr(safety.telemetry, name))
+
+        guard = self.policy.reactive_guard
+        append("fan-policy.yaml", "reactive_guard.floor", guard.floor)
+        append("fan-policy.yaml", "reactive_guard.ceiling", guard.ceiling)
+        append("fan-policy.yaml", "reactive_guard.hold_ms", guard.hold_ms)
+        append(
+            "fan-policy.yaml",
+            "reactive_guard.intake_rise_threshold_c",
+            guard.intake_rise_threshold_c,
+        )
+        append(
+            "fan-policy.yaml",
+            "reactive_guard.gpu_hotspot_threshold_c",
+            guard.gpu_hotspot_threshold_c,
+        )
+        append("fan-policy.yaml", "gate_min_confidence", self.policy.gate_min_confidence)
+        return tuple(values)
+
     @property
     def actuation_permitted(self) -> bool:
         """実測で確認済みの hardware mapping だけを後続の書込み層へ渡す。"""
@@ -359,6 +443,7 @@ class ControlConfigManager:
 
     def __init__(self, active: ControlConfig) -> None:
         self._active = active
+        self._last_reload_event: ConfigReloadEvent | None = None
         self._lock = RLock()
 
     @property
@@ -366,13 +451,28 @@ class ControlConfigManager:
         with self._lock:
             return self._active
 
-    def reload_from_directory(self, directory: Path, *, approved: bool = False) -> ControlConfig:
-        """候補を完全検証してから差し替える。危険な変更は明示承認を要する。"""
+    @property
+    def last_reload_event(self) -> ConfigReloadEvent | None:
+        """直近の成功した差し替えを decision trace へ合成する。"""
+        with self._lock:
+            return self._last_reload_event
+
+    def reload_from_directory(
+        self, directory: Path, *, approval: ConfigReloadApproval | None = None
+    ) -> ControlConfig:
+        """候補を完全検証してから差し替え、監査イベントを残す。"""
         candidate = ControlConfig.from_directory(directory)
         with self._lock:
-            changes = self._active.approval_required_changes(candidate)
-            if changes and not approved:
+            previous = self._active
+            changes = previous.approval_required_changes(candidate)
+            if changes and approval is None:
                 names = ", ".join(changes)
                 raise ConfigApprovalRequiredError(f"承認が必要な Control Config の変更: {names}")
             self._active = candidate
+            self._last_reload_event = ConfigReloadEvent(
+                previous_sources=previous.sources,
+                current_sources=candidate.sources,
+                changed_sections=changes,
+                approval=approval,
+            )
             return candidate
