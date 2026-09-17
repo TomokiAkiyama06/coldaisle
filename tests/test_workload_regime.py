@@ -13,6 +13,7 @@ from coldaisle.control.state import (
     TelemetryImportance,
 )
 from coldaisle.control.supervisor import RegimeReason, WorkloadRegimeEstimator
+from coldaisle.metrics import MetricCatalog, MetricMeta
 from coldaisle.store.models import Quality
 
 BASE_TS_MS = 1_800_000_000_000
@@ -40,6 +41,15 @@ def config() -> WorkloadRegimeConfig:
         minimum_transition_ms=1_000,
         confidence_full_window_ms=10_000,
         max_snapshot_gap_ms=1_000,
+    )
+
+
+def catalog(*, cpu_unit: str = "W", gpu_unit: str = "W") -> MetricCatalog:
+    return MetricCatalog(
+        metrics={
+            CPU_METRIC: MetricMeta(unit=cpu_unit, label="CPU package power"),
+            GPU_METRIC: MetricMeta(unit=gpu_unit, label="GPU power"),
+        }
     )
 
 
@@ -86,7 +96,7 @@ def snapshot(
 
 def estimate(history: list[ControlStateSnapshot]):
     clock = SimulatedClock(history[-1].ts_ms if history else BASE_TS_MS)
-    return WorkloadRegimeEstimator(config(), clock).estimate(history)
+    return WorkloadRegimeEstimator(config(), catalog(), clock).estimate(history)
 
 
 def test_missing_or_short_history_is_unknown_instead_of_normal_load() -> None:
@@ -166,6 +176,31 @@ def test_deadband_hysteresis_does_not_flip_an_active_axis_to_idle() -> None:
     assert result.reason is RegimeReason.OBSERVED_HISTORY
 
 
+def test_unconfirmed_second_axis_spike_does_not_reset_sustained_cpu_age() -> None:
+    cpu_load = [snapshot(second, cpu_w=90.0, gpu_w=20.0) for second in range(8)]
+    gpu_spike = snapshot(8, cpu_w=90.0, gpu_w=180.0)
+    cpu_again = [snapshot(second, cpu_w=90.0, gpu_w=20.0) for second in range(9, 12)]
+
+    assert estimate(cpu_load).regime is WorkloadRegime.SUSTAINED_CPU
+    assert estimate([*cpu_load, gpu_spike]).regime is WorkloadRegime.SUSTAINED_CPU
+    assert all(
+        estimate([*cpu_load, gpu_spike, *cpu_again[:end]]).regime is WorkloadRegime.SUSTAINED_CPU
+        for end in range(1, len(cpu_again) + 1)
+    )
+
+
+def test_unconfirmed_idle_dip_does_not_reset_sustained_cpu_age() -> None:
+    cpu_load = [snapshot(second, cpu_w=90.0, gpu_w=20.0) for second in range(8)]
+    idle_dip = snapshot(8, cpu_w=10.0, gpu_w=20.0)
+    cpu_again = [snapshot(second, cpu_w=90.0, gpu_w=20.0) for second in range(9, 12)]
+
+    assert estimate([*cpu_load, idle_dip]).regime is WorkloadRegime.SUSTAINED_CPU
+    assert all(
+        estimate([*cpu_load, idle_dip, *cpu_again[:end]]).regime is WorkloadRegime.SUSTAINED_CPU
+        for end in range(1, len(cpu_again) + 1)
+    )
+
+
 def test_gap_resets_history_and_requires_a_new_contiguous_observation() -> None:
     old = [snapshot(second, cpu_w=90.0, gpu_w=20.0) for second in range(4)]
     after_gap = snapshot(6, cpu_w=90.0, gpu_w=20.0)
@@ -225,14 +260,14 @@ def test_same_mock_replay_and_clock_produce_the_same_transition() -> None:
     first_clock = SimulatedClock(history[-1].ts_ms)
     second_clock = SimulatedClock(history[-1].ts_ms)
 
-    first = WorkloadRegimeEstimator(config(), first_clock).estimate(history)
-    second = WorkloadRegimeEstimator(config(), second_clock).estimate(tuple(history))
+    first = WorkloadRegimeEstimator(config(), catalog(), first_clock).estimate(history)
+    second = WorkloadRegimeEstimator(config(), catalog(), second_clock).estimate(tuple(history))
     first_transitions = [
-        WorkloadRegimeEstimator(config(), first_clock).estimate(history[:end]).regime
+        WorkloadRegimeEstimator(config(), catalog(), first_clock).estimate(history[:end]).regime
         for end in range(1, len(history) + 1)
     ]
     second_transitions = [
-        WorkloadRegimeEstimator(config(), second_clock).estimate(history[:end]).regime
+        WorkloadRegimeEstimator(config(), catalog(), second_clock).estimate(history[:end]).regime
         for end in range(1, len(history) + 1)
     ]
 
@@ -249,7 +284,7 @@ def test_wall_clock_is_only_recorded_and_never_used_for_elapsed_time() -> None:
     history = [snapshot(second, cpu_w=10.0, gpu_w=20.0) for second in range(4)]
     clock = SimulatedClock(BASE_TS_MS - 1)
 
-    result = WorkloadRegimeEstimator(config(), clock).estimate(history)
+    result = WorkloadRegimeEstimator(config(), catalog(), clock).estimate(history)
 
     assert result.regime is WorkloadRegime.IDLE
     assert result.computed_at_ms == BASE_TS_MS - 1
@@ -261,4 +296,23 @@ def test_out_of_order_monotonic_history_is_rejected() -> None:
         snapshot(0, cpu_w=10.0, gpu_w=20.0),
     ]
     with pytest.raises(ValueError, match="monotonic_ms"):
-        WorkloadRegimeEstimator(config(), SimulatedClock(BASE_TS_MS + 1_000)).estimate(history)
+        WorkloadRegimeEstimator(config(), catalog(), SimulatedClock(BASE_TS_MS + 1_000)).estimate(
+            history
+        )
+
+
+def test_power_metrics_must_be_distinct_known_watt_signals() -> None:
+    with pytest.raises(ValueError, match=r"CPU workload Power metric.*電力\(W\)"):
+        WorkloadRegimeEstimator(
+            config(),
+            catalog(cpu_unit="C"),
+            SimulatedClock(BASE_TS_MS),
+        )
+
+    missing_cpu = MetricCatalog(metrics={GPU_METRIC: MetricMeta(unit="W", label="GPU power")})
+    with pytest.raises(ValueError, match=r"CPU workload Power metric.*unit=None"):
+        WorkloadRegimeEstimator(
+            config(),
+            missing_cpu,
+            SimulatedClock(BASE_TS_MS),
+        )

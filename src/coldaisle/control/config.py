@@ -447,6 +447,8 @@ class WorkloadRegimeConfig(_ConfigModel):
 
     @model_validator(mode="after")
     def _windows_support_every_duration(self) -> Self:
+        if self.cpu_power.metric == self.gpu_power.metric:
+            raise ValueError("CPU / GPU workload Power metric は別々にする")
         bounded = {
             "activity_window_ms": self.activity_window_ms,
             "minimum_observation_ms": self.minimum_observation_ms,
@@ -467,6 +469,11 @@ class WorkloadRegimeConfig(_ConfigModel):
         )
         if required_for_sustained > self.history_window_ms:
             raise ValueError("history_window_ms は観測・SUSTAINED判定・遷移確認の合計以上にする")
+        required_for_cooldown = (
+            self.minimum_observation_ms + self.cooldown_ms + self.minimum_transition_ms
+        )
+        if required_for_cooldown > self.history_window_ms:
+            raise ValueError("history_window_ms は観測・COOLDOWN判定・遷移確認の合計以上にする")
         return self
 
 

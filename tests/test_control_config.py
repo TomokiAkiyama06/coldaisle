@@ -474,6 +474,21 @@ def test_workload_regime_thresholds_and_windows_are_configured(tmp_path: Path) -
     with pytest.raises(ValidationError, match="観測・SUSTAINED判定"):
         ControlConfig.from_directory(tmp_path)
 
+    documents = valid_documents()
+    documents["fan-policy.yaml"]["workload_regime"]["history_window_ms"] = 32000
+    documents["fan-policy.yaml"]["workload_regime"]["sustained_after_ms"] = 1000
+    documents["fan-policy.yaml"]["workload_regime"]["confidence_full_window_ms"] = 30000
+    write_documents(tmp_path, documents)
+    with pytest.raises(ValidationError, match="観測・COOLDOWN判定"):
+        ControlConfig.from_directory(tmp_path)
+
+    documents = valid_documents()
+    cpu_metric = documents["fan-policy.yaml"]["workload_regime"]["cpu_power"]["metric"]
+    documents["fan-policy.yaml"]["workload_regime"]["gpu_power"]["metric"] = cpu_metric
+    write_documents(tmp_path, documents)
+    with pytest.raises(ValidationError, match="別々"):
+        ControlConfig.from_directory(tmp_path)
+
 
 @pytest.mark.parametrize("old_version", [1, 2, 3])
 def test_previous_policy_versions_are_rejected_until_explicitly_migrated(

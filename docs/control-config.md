@@ -50,6 +50,8 @@ Schmitt trigger 閾値、平滑化・履歴窓、SUSTAINED / COOLDOWN / 遷移�
 confidence が満値になる観測期間をすべて明示する。これらは実測前にコードへ埋め込まず、検証済み
 config と checksum を Replay と decision trace へ渡す。Power が欠測・stale の間と、gap 後に
 連続履歴が再び揃うまでは Workload Regime を `UNKNOWN` とする。
+CPU / GPU metric は別々の既知の `W` signal に限定する。履歴窓は、観測期間に加えて
+SUSTAINED または COOLDOWN と遷移確認期間を Replay できる長さを必須にする。
 
 v3からv4へは `workload_regime` の全項目を実測根拠に基づいて追加し、最後に
 `schema_version: 4` へ上げる。v1 / v2 / v3をv4として自動補完すると未確認の閾値を作るため、

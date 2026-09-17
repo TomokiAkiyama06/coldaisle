@@ -17,6 +17,7 @@ from coldaisle.clock import Clock
 from coldaisle.control.config import WorkloadPowerBand, WorkloadRegimeConfig
 from coldaisle.control.schema import WorkloadRegime
 from coldaisle.control.state import ControlStateSnapshot
+from coldaisle.metrics import MetricCatalog
 
 FiniteFloat = Annotated[float, Field(allow_inf_nan=False)]
 
@@ -80,7 +81,8 @@ class _Axis:
 class WorkloadRegimeEstimator:
     """履歴を先頭から再生して、呼出し頻度に依存しない Regime 遷移を返す。"""
 
-    def __init__(self, config: WorkloadRegimeConfig, clock: Clock) -> None:
+    def __init__(self, config: WorkloadRegimeConfig, catalog: MetricCatalog, clock: Clock) -> None:
+        self._validate_metric_units(config, catalog)
         self._config = config
         self._clock = clock
 
@@ -110,8 +112,10 @@ class WorkloadRegimeEstimator:
         published = WorkloadRegime.UNKNOWN
         candidate: WorkloadRegime | None = None
         candidate_since_ms: int | None = None
-        active_combination: tuple[bool, bool] | None = None
-        active_since_ms: int | None = None
+        cpu_active_since_ms: int | None = None
+        gpu_active_since_ms: int | None = None
+        cpu_inactive_since_ms: int | None = None
+        gpu_inactive_since_ms: int | None = None
         last_active_ms: int | None = None
         valid_since_ms: int | None = None
         previous_mono_ms: int | None = None
@@ -131,8 +135,10 @@ class WorkloadRegimeEstimator:
                 published = WorkloadRegime.UNKNOWN
                 candidate = None
                 candidate_since_ms = None
-                active_combination = None
-                active_since_ms = None
+                cpu_active_since_ms = None
+                gpu_active_since_ms = None
+                cpu_inactive_since_ms = None
+                gpu_inactive_since_ms = None
                 last_active_ms = None
                 valid_since_ms = None
                 cpu_axis = _Axis(self._config.cpu_power)
@@ -169,14 +175,26 @@ class WorkloadRegimeEstimator:
                 raw = WorkloadRegime.UNKNOWN
                 reason = RegimeReason.INSUFFICIENT_HISTORY
             else:
-                raw, active_combination, active_since_ms, last_active_ms = self._raw_regime(
+                cpu_active_since_ms, cpu_inactive_since_ms = self._axis_timing(
+                    mono_ms=mono_ms,
+                    active=cpu_active,
+                    active_since_ms=cpu_active_since_ms,
+                    inactive_since_ms=cpu_inactive_since_ms,
+                )
+                gpu_active_since_ms, gpu_inactive_since_ms = self._axis_timing(
+                    mono_ms=mono_ms,
+                    active=gpu_active,
+                    active_since_ms=gpu_active_since_ms,
+                    inactive_since_ms=gpu_inactive_since_ms,
+                )
+                raw, last_active_ms = self._raw_regime(
                     mono_ms=mono_ms,
                     cpu_active=cpu_active,
                     gpu_active=gpu_active,
                     cpu_mean_w=cpu_mean_w,
                     gpu_mean_w=gpu_mean_w,
-                    active_combination=active_combination,
-                    active_since_ms=active_since_ms,
+                    cpu_active_since_ms=cpu_active_since_ms,
+                    gpu_active_since_ms=gpu_active_since_ms,
                     last_active_ms=last_active_ms,
                 )
                 reason = RegimeReason.OBSERVED_HISTORY
@@ -230,23 +248,27 @@ class WorkloadRegimeEstimator:
         gpu_active: bool,
         cpu_mean_w: float,
         gpu_mean_w: float,
-        active_combination: tuple[bool, bool] | None,
-        active_since_ms: int | None,
+        cpu_active_since_ms: int | None,
+        gpu_active_since_ms: int | None,
         last_active_ms: int | None,
-    ) -> tuple[
-        WorkloadRegime,
-        tuple[bool, bool] | None,
-        int | None,
-        int | None,
-    ]:
+    ) -> tuple[WorkloadRegime, int | None]:
         combination = (cpu_active, gpu_active)
         if any(combination):
-            if combination != active_combination:
-                active_combination = combination
-                active_since_ms = mono_ms
-            assert active_since_ms is not None
             last_active_ms = mono_ms
-            sustained = mono_ms - active_since_ms >= self._config.sustained_after_ms
+            active_since = tuple(
+                since
+                for active, since in (
+                    (cpu_active, cpu_active_since_ms),
+                    (gpu_active, gpu_active_since_ms),
+                )
+                if active
+            )
+            assert active_since and all(since is not None for since in active_since)
+            sustained = all(
+                mono_ms - since >= self._config.sustained_after_ms
+                for since in active_since
+                if since is not None
+            )
             if cpu_active and gpu_active:
                 if sustained:
                     regime = WorkloadRegime.SUSTAINED_CPU_GPU
@@ -263,13 +285,30 @@ class WorkloadRegimeEstimator:
                 regime = WorkloadRegime.SUSTAINED_CPU if sustained else WorkloadRegime.TRANSIENT_CPU
             else:
                 regime = WorkloadRegime.SUSTAINED_GPU if sustained else WorkloadRegime.TRANSIENT_GPU
-            return regime, active_combination, active_since_ms, last_active_ms
+            return regime, last_active_ms
 
-        active_combination = None
-        active_since_ms = None
         if last_active_ms is not None and mono_ms - last_active_ms < self._config.cooldown_ms:
-            return WorkloadRegime.COOLDOWN, active_combination, active_since_ms, last_active_ms
-        return WorkloadRegime.IDLE, active_combination, active_since_ms, last_active_ms
+            return WorkloadRegime.COOLDOWN, last_active_ms
+        return WorkloadRegime.IDLE, last_active_ms
+
+    def _axis_timing(
+        self,
+        *,
+        mono_ms: int,
+        active: bool,
+        active_since_ms: int | None,
+        inactive_since_ms: int | None,
+    ) -> tuple[int | None, int | None]:
+        """未確定の短い停止では、継続中の active duration を失わない。"""
+        if active:
+            return active_since_ms if active_since_ms is not None else mono_ms, None
+        if active_since_ms is None:
+            return None, None
+        if inactive_since_ms is None:
+            return active_since_ms, mono_ms
+        if mono_ms - inactive_since_ms >= self._config.minimum_transition_ms:
+            return None, None
+        return active_since_ms, inactive_since_ms
 
     @staticmethod
     def _power(snapshot: ControlStateSnapshot, metric: str) -> float | None:
@@ -281,6 +320,16 @@ class WorkloadRegimeEstimator:
     @staticmethod
     def _relative_activity(value: float, band: WorkloadPowerBand) -> float:
         return (value - band.idle_below_w) / (band.active_above_w - band.idle_below_w)
+
+    @staticmethod
+    def _validate_metric_units(config: WorkloadRegimeConfig, catalog: MetricCatalog) -> None:
+        for axis, band in (("CPU", config.cpu_power), ("GPU", config.gpu_power)):
+            unit = catalog.unit_for(band.metric)
+            if unit != "W":
+                raise ValueError(
+                    f"{axis} workload Power metric は既知の電力(W)にする: "
+                    f"metric={band.metric}, unit={unit}"
+                )
 
     @staticmethod
     def _validate_history(snapshots: tuple[ControlStateSnapshot, ...]) -> None:
