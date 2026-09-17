@@ -491,7 +491,10 @@ class ModelRegistry:
     """Manage immutable local artifacts through an atomic registry snapshot."""
 
     def __init__(self, root: Path, clock: Clock | None = None) -> None:
-        self._root = root
+        # Bind relative roots to the construction-time working directory without resolving
+        # symlinks.  Each component is opened with O_NOFOLLOW below, so an ancestor symlink
+        # cannot silently move the registry outside the configured path.
+        self._root = Path(os.path.abspath(root))
         self._clock = clock or WallClock()
 
     def inspect(self) -> RegistrySnapshot:
@@ -736,21 +739,26 @@ class ModelRegistry:
     ) -> ArtifactLoadResult:
         """Read and verify production, returning a Fallback result instead of raising."""
         try:
-            snapshot = self._read_snapshot()
-        except RegistryCorruptError:
+            with self._open_root(create=False) as root_fd:
+                if root_fd is None:
+                    snapshot = RegistrySnapshot(revision=0)
+                else:
+                    snapshot = self._read_snapshot(root_fd)
+                slot = snapshot.production.get(kind)
+                if slot is None:
+                    return self._load_failure(
+                        ArtifactLoadStatus.NO_PRODUCTION,
+                        snapshot.revision,
+                        "production artifact が登録されていない",
+                    )
+                assert root_fd is not None
+                return self._load_record(root_fd, snapshot, slot.active, compatibility)
+        except (RegistryCorruptError, UnsafeRegistryPathError):
             return self._load_failure(
                 ArtifactLoadStatus.INVALID_REGISTRY,
                 0,
                 "registry snapshot を検証できない",
             )
-        slot = snapshot.production.get(kind)
-        if slot is None:
-            return self._load_failure(
-                ArtifactLoadStatus.NO_PRODUCTION,
-                snapshot.revision,
-                "production artifact が登録されていない",
-            )
-        return self._load_record(snapshot, slot.active, compatibility)
 
     def load_version(
         self,
@@ -759,33 +767,36 @@ class ModelRegistry:
     ) -> ArtifactLoadResult:
         """Load an explicitly pinned version for Replay or Offline Evaluation."""
         try:
-            snapshot = self._read_snapshot()
-        except RegistryCorruptError:
+            with self._open_root(create=False) as root_fd:
+                if root_fd is None:
+                    snapshot = RegistrySnapshot(revision=0)
+                else:
+                    snapshot = self._read_snapshot(root_fd)
+                if ref.key not in snapshot.artifacts:
+                    return self._load_failure(
+                        ArtifactLoadStatus.UNKNOWN_ARTIFACT,
+                        snapshot.revision,
+                        "指定された artifact version が登録されていない",
+                    )
+                assert root_fd is not None
+                return self._load_record(root_fd, snapshot, ref, compatibility)
+        except (RegistryCorruptError, UnsafeRegistryPathError):
             return self._load_failure(
                 ArtifactLoadStatus.INVALID_REGISTRY,
                 0,
                 "registry snapshot を検証できない",
             )
-        if ref.key not in snapshot.artifacts:
-            return self._load_failure(
-                ArtifactLoadStatus.UNKNOWN_ARTIFACT,
-                snapshot.revision,
-                "指定された artifact version が登録されていない",
-            )
-        return self._load_record(snapshot, ref, compatibility)
 
     def _load_record(
         self,
+        root_fd: int,
         snapshot: RegistrySnapshot,
         ref: ArtifactRef,
         compatibility: ModelCompatibility,
     ) -> ArtifactLoadResult:
         record = snapshot.artifacts[ref.key]
         try:
-            with self._open_root(create=False) as root_fd:
-                if root_fd is None:
-                    raise _ArtifactUnavailableError("registry root が存在しない")
-                artifact = self._verify(root_fd, record, compatibility)
+            artifact = self._verify(root_fd, record, compatibility)
         except _ArtifactUnavailableError:
             return self._load_failure(
                 ArtifactLoadStatus.ARTIFACT_UNAVAILABLE,
@@ -905,21 +916,29 @@ class ModelRegistry:
 
     @contextmanager
     def _open_root(self, *, create: bool) -> Iterator[int | None]:
-        if create:
-            try:
-                self._root.mkdir(parents=True, exist_ok=True)
-            except OSError as exc:
-                raise UnsafeRegistryPathError("registry root を作成できない") from exc
         flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
         try:
-            root_fd = os.open(self._root, flags)
-        except FileNotFoundError:
-            if create:
-                raise UnsafeRegistryPathError("registry root を作成できない") from None
-            yield None
-            return
+            anchor_fd = os.open(self._root.anchor, flags)
         except OSError as exc:
-            raise UnsafeRegistryPathError("registry root がsymlinkまたはdirectoryではない") from exc
+            raise UnsafeRegistryPathError("registry root のanchorを開けない") from exc
+        try:
+            try:
+                root_fd = self._open_directory_chain(
+                    anchor_fd,
+                    tuple(self._root.parts[1:]),
+                    create=create,
+                )
+            except FileNotFoundError:
+                if create:
+                    raise UnsafeRegistryPathError("registry root を作成できない") from None
+                yield None
+                return
+            except OSError as exc:
+                raise UnsafeRegistryPathError(
+                    "registry root のcomponentがsymlinkまたはdirectoryではない"
+                ) from exc
+        finally:
+            os.close(anchor_fd)
         try:
             yield root_fd
         finally:
@@ -956,7 +975,10 @@ class ModelRegistry:
                 except FileNotFoundError:
                     if not create:
                         raise
-                    os.mkdir(part, 0o700, dir_fd=current_fd)
+                    # Another registry process may have created this component.  The
+                    # no-follow open below still decides whether it is safe to use.
+                    with suppress(FileExistsError):
+                        os.mkdir(part, 0o700, dir_fd=current_fd)
                     child_fd = os.open(part, flags, dir_fd=current_fd)
                 except OSError as exc:
                     raise UnsafeRegistryPathError(

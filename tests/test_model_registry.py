@@ -542,6 +542,44 @@ def test_symlink_artifact_component_cannot_escape_registry_root(tmp_path: Path) 
     assert not (root / "registry.json").exists()
 
 
+def test_symlink_registry_ancestor_cannot_escape_trusted_anchor(tmp_path: Path) -> None:
+    safe = tmp_path / "safe"
+    outside = tmp_path / "outside"
+    safe.mkdir()
+    outside.mkdir()
+    (safe / "linked-parent").symlink_to(outside, target_is_directory=True)
+    registry = ModelRegistry(safe / "linked-parent" / "registry", SimulatedClock(NOW_MS))
+
+    with pytest.raises(UnsafeRegistryPathError, match="symlink"):
+        registry.register_candidate(
+            metadata("1.0.0"),
+            payload("1.0.0"),
+            actor="trainer",
+            reason="training completed",
+        )
+
+    assert tuple(outside.iterdir()) == ()
+
+
+def test_symlink_registry_ancestor_is_not_read(tmp_path: Path) -> None:
+    safe = tmp_path / "safe"
+    outside = tmp_path / "outside"
+    safe.mkdir()
+    outside_registry = ModelRegistry(outside / "registry", SimulatedClock(NOW_MS))
+    register_and_validate(outside_registry, "1.0.0")
+    promote(outside_registry, "1.0.0")
+    revision = outside_registry.inspect().revision
+    (safe / "linked-parent").symlink_to(outside, target_is_directory=True)
+
+    result = ModelRegistry(safe / "linked-parent" / "registry").load_production(
+        ArtifactKind.THERMAL_MODEL,
+        COMPATIBILITY,
+    )
+
+    assert result.status is ArtifactLoadStatus.INVALID_REGISTRY
+    assert outside_registry.inspect().revision == revision
+
+
 def test_symlink_payload_cannot_overwrite_file_outside_registry(tmp_path: Path) -> None:
     root = tmp_path / "registry"
     artifact_directory = root / "artifacts" / "thermal_model" / "rack-thermal" / "1.0.0"
@@ -596,6 +634,42 @@ def test_symlink_registry_snapshot_is_not_trusted(tmp_path: Path) -> None:
     result = ModelRegistry(root).load_production(ArtifactKind.THERMAL_MODEL, COMPATIBILITY)
 
     assert result.status is ArtifactLoadStatus.INVALID_REGISTRY
+
+
+def test_load_pins_root_across_path_replacement(tmp_path: Path, monkeypatch) -> None:
+    root = tmp_path / "registry"
+    displaced = tmp_path / "displaced-registry"
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    registry = ModelRegistry(root, SimulatedClock(NOW_MS))
+    register_and_validate(registry, "1.0.0")
+    promote(registry, "1.0.0")
+    original_read = registry._read_regular_file
+    replaced = False
+
+    def read_then_replace_root(
+        directory_fd: int,
+        name: str,
+        *,
+        missing_ok: bool = False,
+    ) -> bytes | None:
+        nonlocal replaced
+        content = original_read(directory_fd, name, missing_ok=missing_ok)
+        if name == "registry.json" and not replaced:
+            root.rename(displaced)
+            root.symlink_to(outside, target_is_directory=True)
+            replaced = True
+        return content
+
+    monkeypatch.setattr(registry, "_read_regular_file", read_then_replace_root)
+
+    result = registry.load_production(ArtifactKind.THERMAL_MODEL, COMPATIBILITY)
+
+    assert replaced is True
+    assert result.status is ArtifactLoadStatus.LOADED
+    assert result.artifact is not None
+    assert result.artifact.payload == payload("1.0.0")
+    assert tuple(outside.iterdir()) == ()
 
 
 def test_loaded_trace_metadata_has_version_checksum_and_schema(tmp_path: Path) -> None:
