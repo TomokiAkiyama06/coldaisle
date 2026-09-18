@@ -449,3 +449,50 @@ def test_the_catalog_note_clears_on_its_own():
     assert "catalogNote" not in history, "履歴の側から表示名の注記を消さない"
     assert "historyNote = " in history and "renderNote()" in history
     assert script.count('getElementById("chart-note")') == 1, "注記欄に書くのは renderNote だけ"
+
+
+# ---------------------------------------------------------------- 遅れて返る応答（#48 のレビュー）
+
+
+def _body(script: str, signature: str) -> str:
+    body = script[script.index(signature) :]
+    return body[: body.index("\n}\n")]
+
+
+def test_only_one_catalog_request_at_a_time():
+    """表示名の表の取得は**同時に1件だけ**。古い失敗が新しい成功を上書きしない。"""
+    script = SCRIPT.read_text(encoding="utf-8")
+    load = _body(script, "async function loadCatalog()")
+    assert "if (catalogInFlight || catalog !== null) return;" in load
+    assert "catalogInFlight = false" in load[load.index("finally") :]
+    assert load.count("if (seq !== catalogSeq) return;") == 2, "成功・失敗の両方で古い応答を捨てる"
+
+
+def test_a_late_refresh_does_not_overwrite_a_newer_one():
+    """遅れて返った定期更新で、新しい結果（成功・失敗とも）を上書きしない。
+
+    **実行中なら飛ばす方式にはしない。** 応答が返らないまま固まった1件が、
+    以後の更新を全部止めてしまう。
+    """
+    script = SCRIPT.read_text(encoding="utf-8")
+    refresh = _body(script, "async function refresh()")
+    assert "const seq = ++refreshSeq;" in refresh
+    assert refresh.count("if (seq !== refreshSeq) return;") == 2
+    assert "InFlight" not in refresh, "定期更新は実行中でも次を出す"
+
+
+def test_a_refresh_does_not_undo_a_newer_stream_update():
+    """WebSocket がより新しい最新値を届けていたら、定期更新の古い最新値で戻さない。"""
+    script = SCRIPT.read_text(encoding="utf-8")
+    refresh = _body(script, "async function refresh()")
+    assert "const streamAtStart = streamVersion;" in refresh
+    assert "if (streamVersion === streamAtStart) applyLatest(latest);" in refresh
+    assert "streamVersion += 1;" in script[script.index("socket.onmessage") :]
+
+
+def test_a_late_history_response_does_not_overwrite_the_selected_range():
+    """期間を切り替えたあとに、前の期間の応答でグラフを描き直さない。"""
+    script = SCRIPT.read_text(encoding="utf-8")
+    history = _body(script, "async function loadHistory()")
+    assert "const seq = ++historySeq;" in history
+    assert history.count("if (seq !== historySeq) return;") == 2

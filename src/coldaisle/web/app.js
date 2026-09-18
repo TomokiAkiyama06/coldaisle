@@ -348,7 +348,21 @@ async function fetchJson(path, params) {
   return response.json();
 }
 
+/**
+ * 周期的な読み込みの**古い応答を捨てる**ための通し番号。
+ *
+ * fetch にはタイムアウトが無く、遅い応答は次の周期や期間切替のあとに返ってくる。
+ * 後から返った古い応答で新しい表示（期間・品質・赤帯）を上書きしない。
+ * 「実行中なら飛ばす」だけにしないのは、**応答が返らないまま固まった1件が
+ * 以後の更新を全部止めてしまう**ため（refresh と履歴。表示名の表は下の loadCatalog）。
+ */
+let historySeq = 0;
+let refreshSeq = 0;
+// WebSocket で最新値を受け取った回数。定期更新の最新値がこれより古ければ使わない
+let streamVersion = 0;
+
 async function loadHistory() {
+  const seq = ++historySeq; // 期間を切り替えたら、前の期間の応答は捨てる
   const metrics = Object.keys(lastLatest ? lastLatest.metrics : {}).filter((m) => m.startsWith("air."));
   const temps = metrics.filter((m) => !m.endsWith("_humidity"));
   const humidity = metrics.filter((m) => m.endsWith("_humidity"));
@@ -363,6 +377,7 @@ async function loadHistory() {
 
   try {
     const [tempSeries, humiditySeries] = await Promise.all([load(temps), load(humidity)]);
+    if (seq !== historySeq) return;
     lastSeries = { temp: tempSeries, humidity: humiditySeries };
     drawCharts();
     const used = tempSeries[0] || humiditySeries[0];
@@ -370,6 +385,7 @@ async function loadHistory() {
       ? `粒度 ${used.agg}${used.downsampled ? "（点数の上限に合わせて粗くしました）" : ""}`
       : "";
   } catch (error) {
+    if (seq !== historySeq) return;
     historyNote = `履歴を取得できません: ${error.message}`;
   }
   renderNote();
@@ -420,14 +436,31 @@ function applyLatest(latest) {
   renderBanner(); // カードが stale になったら、同じ応答で赤帯も出す（staleFromLatest）
 }
 
-/** 表示名の表を取る。失敗は握りつぶさず注記に出し、次の定期更新で取り直す。 */
+let catalogInFlight = false;
+let catalogSeq = 0;
+
+/**
+ * 表示名の表を取る。失敗は握りつぶさず注記に出し、次の定期更新で取り直す。
+ *
+ * **同時に1件だけ。** 重なると、古い失敗が新しい成功のあとに返って
+ * 「表示名を取得できません」を戻してしまう。念のため通し番号でも古い応答を捨てる。
+ * 実行中に固まっても表示名が内部名に戻るだけで、値と赤帯は refresh が出し続ける。
+ */
 async function loadCatalog() {
+  if (catalogInFlight || catalog !== null) return;
+  catalogInFlight = true;
+  const seq = ++catalogSeq;
   try {
-    catalog = await fetchJson("/api/v1/metrics");
+    const body = await fetchJson("/api/v1/metrics");
+    if (seq !== catalogSeq) return;
+    catalog = body;
     catalogNote = ""; // 取れたらその場で消す。履歴の注記は触らない
     rerenderAll(); // 取れた時点で、内部名を出していた箇所をすべて表示名に置き換える
   } catch (error) {
+    if (seq !== catalogSeq) return;
     catalogNote = `表示名を取得できません: ${error.message}`;
+  } finally {
+    catalogInFlight = false;
   }
   renderNote();
 }
@@ -446,6 +479,9 @@ async function refresh() {
   // **待たない。** 表の取得に失敗しても最新値・health・アラートの更新を止めない
   // （止めると赤帯が出なくなる）。取れるまでは labelOf が名前そのものに戻る
   if (catalog === null) loadCatalog();
+  // 後から返った古い定期更新で、新しい定期更新の結果（成功・失敗とも）を上書きしない
+  const seq = ++refreshSeq;
+  const streamAtStart = streamVersion;
   try {
     const [latest, health, alerts, devices] = await Promise.all([
       fetchJson("/api/v1/latest"),
@@ -453,7 +489,11 @@ async function refresh() {
       fetchJson("/api/v1/alerts", { limit: 20 }),
       fetchJson("/api/v1/devices"),
     ]);
-    applyLatest(latest);
+    if (seq !== refreshSeq) return;
+    // 待っている間に WebSocket がより新しい最新値を届けていたら、そちらを残す。
+    // 古い `ok` で新しい `stale` を上書きすると、品質が変わるまで WebSocket は
+    // 押し直さないため（stream_state）、次の定期更新まで赤帯が消える
+    if (streamVersion === streamAtStart) applyLatest(latest);
     lastHealth = health;
     lastFetchError = null; // 4つとも取れたときだけ消す
     lastAlerts = alerts.alerts;
@@ -466,6 +506,7 @@ async function refresh() {
       loadHistory();
     }
   } catch (error) {
+    if (seq !== refreshSeq) return;
     // 赤帯そのものには書かず、状態として残す。直接書くと、次の WebSocket の更新で消える
     lastFetchError = error.message;
     renderBanner();
@@ -485,7 +526,10 @@ function connect() {
   };
   socket.onmessage = (event) => {
     const message = JSON.parse(event.data);
-    if (message.type === "latest") applyLatest(message.latest);
+    if (message.type === "latest") {
+      streamVersion += 1;
+      applyLatest(message.latest);
+    }
   };
   socket.onclose = () => {
     conn.textContent = `切断（${Math.round(retryDelayMs / 1000)}秒後に再接続）`;
