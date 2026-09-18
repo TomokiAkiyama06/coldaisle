@@ -203,7 +203,9 @@ def create_app(
     settings = config or Config.from_env()
     catalog = MetricCatalog.from_yaml(settings.metrics)
     if health_hwmon_metrics is None:
-        internal_telemetry = InternalTelemetryConfig.from_yaml(settings.internal_telemetry)
+        internal_telemetry = InternalTelemetryConfig.from_yaml(
+            settings.internal_telemetry, catalog=catalog
+        )
         health_hwmon_metrics = tuple(
             sensor.metric for sensor in internal_telemetry.hwmon.sensors if sensor.enabled
         )
