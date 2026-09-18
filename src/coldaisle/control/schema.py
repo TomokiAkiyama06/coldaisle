@@ -22,7 +22,7 @@ from typing import Annotated, Literal, Self
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-SCHEMA_VERSION: Literal[1] = 1
+SCHEMA_VERSION: Literal[2] = 2
 """`ControlTick` の形の版。**フィールドの名前や意味を変えたら上げる。**
 
 #82 が保存したデータを読み違えないため。
@@ -107,6 +107,21 @@ class OptimizerStatus(StrEnum):
     OK = "ok"
     TIMEOUT = "timeout"
     ERROR = "error"
+
+
+class WorkloadRegime(StrEnum):
+    """観測済み Telemetry から推定する現在の負荷区分。#87。"""
+
+    IDLE = "idle"
+    TRANSIENT_CPU = "transient_cpu"
+    TRANSIENT_GPU = "transient_gpu"
+    TRANSIENT_CPU_GPU = "transient_cpu_gpu"
+    """CPU と GPU の両軸が active で、少なくとも一方が SUSTAINED 未満（決定記録 0036）。"""
+    SUSTAINED_CPU = "sustained_cpu"
+    SUSTAINED_GPU = "sustained_gpu"
+    SUSTAINED_CPU_GPU = "sustained_cpu_gpu"
+    COOLDOWN = "cooldown"
+    UNKNOWN = "unknown"
 
 
 class BoundBy(StrEnum):
@@ -352,12 +367,24 @@ class ControlState(_Frozen):
     fallback_reason: Reason | None = None
     """ML を使えたはずの状況で Fallback にした理由（0028 §2.5 (c)）。"""
     supervisor_policy: str | None = None
+    workload_regime: WorkloadRegime | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
+    regime_confidence: float | None = Field(
+        default=None,
+        ge=0.0,
+        le=1.0,
+        allow_inf_nan=False,
+        exclude_if=lambda value: value is None,
+    )
     model_version: str | None = None
     model_confidence: float | None = Field(default=None, ge=0.0, le=1.0, allow_inf_nan=False)
     model_ood: bool | None = None
 
     @model_validator(mode="after")
     def _ml_is_used_only_when_allowed(self) -> Self:
+        if (self.workload_regime is None) != (self.regime_confidence is None):
+            raise ValueError("workload_regime と regime_confidence は一緒に記録する")
         set_by_people = self.operating_mode in {OperatingMode.MANUAL, OperatingMode.CALIBRATION}
         if set_by_people != (self.active_controller is None):
             raise ValueError("active_controller を持たないのは MANUAL / CALIBRATION のときだけ")
@@ -408,7 +435,7 @@ Critical Safety（#78）が数えるので、ここでは検査しない。
 class ControlTick(_Frozen):
     """1 tick の判断の記録（decision trace。0028 §2.3）。#82 が保存し、#90 / #91 が読む。"""
 
-    schema_version: Literal[1] = SCHEMA_VERSION
+    schema_version: Literal[1, 2] = SCHEMA_VERSION
     tick_id: int = Field(ge=0)
     ts_ms: int = Field(ge=0)
     """記録の時刻（壁時計。0028 §2.6）。"""
@@ -424,6 +451,8 @@ class ControlTick(_Frozen):
     @model_validator(mode="after")
     def _state_matches_zones_and_faults(self) -> Self:
         state = self.state
+        if self.schema_version == 1 and state.workload_regime is not None:
+            raise ValueError("workload regime を記録する ControlTick は schema version 2 にする")
         all_max = state.safety_state in {SafetyState.STARTUP, SafetyState.EMERGENCY} or (
             state.operating_mode is OperatingMode.MAX
         )
