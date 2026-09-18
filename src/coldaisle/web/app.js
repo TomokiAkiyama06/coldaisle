@@ -352,6 +352,16 @@ function applyLatest(latest) {
   renderDerived(latest);
 }
 
+/** 表示名の表を取る。失敗は握りつぶさず注記に出し、次の定期更新で取り直す。 */
+async function loadCatalog() {
+  try {
+    catalog = await fetchJson("/api/v1/metrics");
+    if (lastLatest) applyLatest(lastLatest); // 取れた時点で内部名を表示名に置き換える
+  } catch (error) {
+    document.getElementById("chart-note").textContent = `表示名を取得できません: ${error.message}`;
+  }
+}
+
 /**
  * 定期更新。**最新値もここで取り直す。**
  *
@@ -361,10 +371,12 @@ function applyLatest(latest) {
  * **赤帯が出ているのにカードは「正常」のまま**という自己矛盾した画面になる。
  */
 async function refresh() {
+  // 表示名の表は設定から来るので一度取れば足りる。**取れるまで毎回試す**
+  // （起動直後に API が落ちていても、回復後に内部名のまま残らないように）。
+  // **待たない。** 表の取得に失敗しても最新値・health・アラートの更新を止めない
+  // （止めると赤帯が出なくなる）。取れるまでは labelOf が名前そのものに戻る
+  if (catalog === null) loadCatalog();
   try {
-    // 表示名の表は設定から来るので一度取れば足りる。**取れるまで毎回試す**
-    // （起動直後に API が落ちていても、回復後に内部名のまま残らないように）
-    if (catalog === null) catalog = await fetchJson("/api/v1/metrics");
     const [latest, health, alerts, devices] = await Promise.all([
       fetchJson("/api/v1/latest"),
       fetchJson("/api/v1/health"),

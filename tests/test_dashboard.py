@@ -341,8 +341,28 @@ def test_the_catalog_is_retried_until_it_loads():
     """起動直後に API が落ちていても、回復後に内部名のまま残らない。"""
     script = SCRIPT.read_text(encoding="utf-8")
     refresh = script[script.index("async function refresh()") : script.index("function connect()")]
-    assert "if (catalog === null)" in refresh
-    assert '"/api/v1/metrics"' in refresh
+    assert "if (catalog === null) loadCatalog();" in refresh
+    assert '"/api/v1/metrics"' in script[script.index("async function loadCatalog()") :]
+
+
+def test_a_catalog_failure_does_not_stop_the_refresh():
+    """**表の取得に失敗しても、最新値・health の更新を止めない。**
+
+    `await` で待つと、失敗した時点で赤帯もカードも更新されなくなる。
+    """
+    script = SCRIPT.read_text(encoding="utf-8")
+    refresh = script[script.index("async function refresh()") : script.index("function connect()")]
+    assert "await loadCatalog" not in refresh
+    assert 'await fetchJson("/api/v1/metrics")' not in refresh
+    assert refresh.index("loadCatalog()") < refresh.index("try {")
+
+
+def test_every_derived_operand_has_a_label():
+    """派生値の式に内部名が出ないこと（`gpu.0.hotspot − gpu.0.core` にならない）。"""
+    catalog = MetricCatalog.from_yaml(METRICS_PATH)
+    for name, meta in catalog.derived.items():
+        for operand in (meta.minuend, meta.subtrahend):
+            assert operand in catalog.metrics, f"{name} の {operand} に表示名が無い"
 
 
 def test_alerts_are_a_table_with_state_and_severity_in_words():
