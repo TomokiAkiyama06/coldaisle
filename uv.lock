@@ -160,7 +160,7 @@ dev = [
 requires-dist = [
     { name = "fastapi" },
     { name = "httpx" },
-    { name = "pydantic", specifier = ">=2" },
+    { name = "pydantic", specifier = ">=2.12" },
     { name = "pyserial" },
     { name = "pyyaml" },
     { name = "uvicorn", extras = ["standard"] },
