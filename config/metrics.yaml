@@ -20,7 +20,7 @@ metrics:
   gpu.0.utilization:   {unit: "%",   label: "GPU使用率"}
   gpu.0.vram_used:     {unit: "GB",  label: "GPU VRAM使用量"}
   power.gpu.0:         {unit: "W",   label: "GPU消費電力"}
-  # 決定記録 0043（Proposed）。NVML の T.Limit margin・fan speed・clock event reason
+  # 決定記録 0043（FINAL）。NVML の T.Limit margin・fan speed・clock event reason
   gpu.0.tlimit_margin: {unit: "C",   label: "GPU T.Limit までの余裕"}
   gpu.0.fan_speed:     {unit: "%",   label: "GPU Fan速度（NVMLの目標値）"}
   # 0/1。ロールアップの平均は「その区間で reason が立っていた割合」になる
@@ -31,7 +31,7 @@ metrics:
   gpu.0.throttle.sw_power_cap:   {unit: "flag", label: "GPU SW Power Cap"}
   sys.cuda_processes:  {unit: "count", label: "CUDAプロセス数"}
   cpu.package:         {unit: "C",   label: "CPU Package温度"}
-  # 決定記録 0043（Proposed）。k10temp の Tctl / Tccd1 / Tccd2
+  # 決定記録 0043（FINAL）。k10temp の Tctl / Tccd1 / Tccd2
   cpu.tctl:            {unit: "C",   label: "CPU Tctl"}
   cpu.ccd1:            {unit: "C",   label: "CPU CCD1温度"}
   cpu.ccd2:            {unit: "C",   label: "CPU CCD2温度"}

@@ -51,7 +51,7 @@ Rear 743 / Front 690 RPM で、上表と整合する。
 | `asusec` | `CPU Package` | `cpu.package` | 有効 | 49 °C |
 | `asusec` | `VRM` | `cpu.vrm` | 有効 | 48 °C |
 | `nct6799` | `PCH_CHIP_TEMP` | `board.chipset` | **無効** | 0 °C |
-| `k10temp` | `Tctl` | `cpu.tctl` | 有効（名前は決定記録 0043 で承認待ち） | 44 °C |
+| `k10temp` | `Tctl` | `cpu.tctl` | 有効（名前は決定記録 0043 で承認済み） | 44 °C |
 | `k10temp` | `Tccd1` | `cpu.ccd1` | 有効（同上） | 43.6 °C |
 | `k10temp` | `Tccd2` | `cpu.ccd2` | 有効（同上） | 36.5 °C |
 
