@@ -48,8 +48,9 @@ hysteresis 状態を維持する。signal が `missing` / `suspect` / `stale` �
 Config はリポジトリに置いていない。#50 / #75 の実測が終わるまでは値を `confirmed` に
 せず、値の確定・緩和には決定記録 0028 §2.9 の所有者承認が必要である。
 
-CPU package power は #65 / 決定記録 0032（Proposed）が metric 名
-`power.cpu.package` を提案中であり、まだ canonical とは確定しない。
+CPU package power の metric 名は、#65 の PR #128 で提案中の決定記録 0032
+（内部Telemetryのメトリクス名。未マージ）が `power.cpu.package` を案として挙げている
+段階であり、まだ canonical とは確定しない。
 `cpu_power_metric` は未承認時は `null` にし、CPU Power trigger 自体を評価しない。
 有効化には metric 名と `status: confirmed` / `basis` を検証済み
 `ReactiveGuardConfig` から注入する。Replay / Mock の CPU Power 試験でも明示的な

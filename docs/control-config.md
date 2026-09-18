@@ -24,9 +24,10 @@ Fallback v2 の shape に Reactive Guard の閾値バンドを追加した
 Reactive Guard の `floor` / `hold_ms` と、温度・Power・吸気温度差の各 trigger は
 通常時と Degraded 時の `activate_above` / `clear_at_or_below` を持つ。これらは
 全て `status` / `basis` の追跡対象で、実測前は `provisional` のまま扱う。
-CPU Power trigger の metric 名は提案中の DR0032 に依存するため、
+CPU Power trigger の metric 名は、PR #128 で提案中の決定記録 0032
+（内部Telemetryのメトリクス名。未マージ）に依存するため、
 `cpu_power_metric` は未承認時は `null` にして trigger を無効にする。
-DR0032 の確定後も、`confirmed` と承認根拠 `basis` が無ければ設定検証で拒否する。
+その決定記録の確定後も、`confirmed` と承認根拠 `basis` が無ければ設定検証で拒否する。
 `power` ドメイン（決定記録 0002 §2.1）以外の metric も拒否し、Reactive Guard の生成時に
 Metric Catalog 上の単位が `W` であることを検証する。
 `authority_limits` には LIMITED / EXPANDED ごとの許可zone、Fallbackからの `limit_up` /
