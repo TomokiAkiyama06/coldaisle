@@ -54,6 +54,8 @@ class AiSettings(BaseModel):
     thinking_timeout_s: float = Field(gt=0)
     max_attempts: int = Field(ge=1)
     retry_backoff_s: float = Field(ge=0)
+    health_summary_retry_s: float = Field(gt=0)
+    """Server Health のバックグラウンド要約を失敗後に再試行する間隔。"""
     temperature: float = Field(ge=0)
     max_tokens: int = Field(gt=0)
     thinking: bool
