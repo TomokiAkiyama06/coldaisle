@@ -104,6 +104,7 @@ hwmon:
       driver: asusec
       label: "CPU Package"
       measurement: temperature
+      required: true
       confirmation:
         status: confirmed
         basis: "2026-09-18に実機サーバーでhwmonのdriverとlabelを読み取って対応を確認。同日に所有者が承認"
