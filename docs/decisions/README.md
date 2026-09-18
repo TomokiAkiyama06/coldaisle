@@ -105,3 +105,4 @@ docs/decisions/NNNN-<slug>.md      例: 0002-metric-naming.md
 | [0036](0036-transient-cpu-gpu-regime.md) | Workload Regime に TRANSIENT_CPU_GPU を加える | FINAL |
 | [0037](0037-model-registry-rollback-target.md) | Model Registry の promotion 時の rollback target | Proposed |
 | [0038](0038-internal-telemetry-outage-counting.md) | Internal Telemetry の欠測の数え方（有効な間の停止は欠測、無効期間は数えない） | FINAL |
+| [0041](0041-supervisor-proposal-freshness.md) | 非同期 RL Supervisor 提案の有効性（期限の起点と Regime の一致） | FINAL |
