@@ -14,6 +14,26 @@ metrics:
   air.gpu_exhaust:     {unit: "C",   label: "GPU排気"}
   air.top_exhaust:     {unit: "C",   label: "トップ排気"}
   air.rear_exhaust:    {unit: "C",   label: "リア排気"}
+  gpu.0.core:          {unit: "C",   label: "GPUコア温度"}
+  gpu.0.hotspot:       {unit: "C",   label: "GPUホットスポット温度"}
+  gpu.0.mem:           {unit: "C",   label: "GPUメモリ温度"}
+  gpu.0.utilization:   {unit: "%",   label: "GPU使用率"}
+  gpu.0.vram_used:     {unit: "GB",  label: "GPU VRAM使用量"}
+  power.gpu.0:         {unit: "W",   label: "GPU消費電力"}
+  sys.cuda_processes:  {unit: "count", label: "CUDAプロセス数"}
+  cpu.package:         {unit: "C",   label: "CPU Package温度"}
+  power.cpu.package:   {unit: "W",   label: "CPU Package消費電力"}
+  cpu.vrm:             {unit: "C",   label: "CPU VRM温度"}
+  board.chipset:       {unit: "C",   label: "Chipset温度"}
+  board.connector_12v2x6: {unit: "C", label: "12V-2x6コネクタ外装温度"}
+  fan.front.rpm:       {unit: "rpm", label: "Front Fan回転数"}
+  fan.front.pwm:       {unit: "%",   label: "Front Fan PWM"}
+  fan.rear.rpm:        {unit: "rpm", label: "Rear Fan回転数"}
+  fan.rear.pwm:        {unit: "%",   label: "Rear Fan PWM"}
+  fan.top.rpm:         {unit: "rpm", label: "Top Fan回転数"}
+  fan.top.pwm:         {unit: "%",   label: "Top Fan PWM"}
+  fan.aio_pump.rpm:    {unit: "rpm", label: "AIO Pump回転数（参照のみ）"}
+  fan.vrm.rpm:         {unit: "rpm", label: "VRM Fan回転数（参照のみ）"}
   sys.dropped_samples: {unit: "count", label: "取りこぼし"}
   sys.device_restarts: {unit: "count", label: "デバイス再起動"}
   sys.queue_drops:     {unit: "count", label: "取り込みの取りこぼし（待ち行列）"}
@@ -52,3 +72,13 @@ derived:
     label: "GPU内部の温度差"
     minuend: gpu.0.hotspot
     subtrahend: gpu.0.core
+  d.case_delta:
+    unit: "C"
+    label: "ケース全体の温度上昇"
+    minuend: air.rear_exhaust
+    subtrahend: air.front_intake
+  d.connector_rise:
+    unit: "C"
+    label: "12V-2x6コネクタ外装温度の室温差"
+    minuend: board.connector_12v2x6
+    subtrahend: air.room

@@ -576,3 +576,245 @@ def test_absent_minutes_are_not_filled_before_the_first_observation(store):
         "SELECT bucket_ms FROM readings_1m WHERE metric = 'air.gpu_intake' ORDER BY bucket_ms"
     ).fetchall()
     assert [row["bucket_ms"] for row in rows] == [10 * MINUTE_MS]
+
+
+# ---------------------------------------------------------------- 周期メトリクス（#65）
+
+
+def test_periodic_internal_metric_keeps_an_outage_after_raw_retention(store, rules_30d):
+    """Internal Telemetry daemon の停止区間が、生データを消したあとも欠測として残る。"""
+    for minute in (0, 3):
+        for index in range(24):
+            write(store, "gpu.0.core", minute * MINUTE_MS + index * 2_500, 55.0)
+    intervals = {"gpu.0.core": 2_500}
+
+    rollup_minutes(store, periodic_intervals_ms=intervals)
+    rows = store.connection.execute(
+        "SELECT bucket_ms, row_count, expected_count FROM readings_1m "
+        "WHERE metric = 'gpu.0.core' ORDER BY bucket_ms"
+    ).fetchall()
+    assert [tuple(row) for row in rows] == [
+        (0, 24, 24),
+        (MINUTE_MS, 0, 24),
+        (2 * MINUTE_MS, 0, 24),
+        (3 * MINUTE_MS, 24, 24),
+    ]
+
+    rollup_hours(store)
+    write(store, "gpu.0.core", 40 * DAY_MS, 55.0)
+    run(store, rules_30d, now_ms=40 * DAY_MS, periodic_intervals_ms=intervals)
+    hour = store.connection.execute(
+        "SELECT row_count, expected_count FROM readings_1h "
+        "WHERE metric = 'gpu.0.core' AND bucket_ms = 0"
+    ).fetchone()
+    assert len(store.series("gpu.0.core", 0, HOUR_MS)) == 0, "生データは保持期間で消えた"
+    assert tuple(hour) == (48, 60 * 24), "停止した分は期待値にだけ数えられて残る"
+
+
+def test_unregistered_internal_metric_has_no_expectation(store):
+    """周期を登録しないメトリクスは従来どおり事象扱い（期待値 NULL）。"""
+    write(store, "gpu.0.core", 0, 55.0)
+    write(store, "gpu.0.core", 3 * MINUTE_MS, 55.0)
+    rollup_minutes(store)
+    rows = store.connection.execute(
+        "SELECT expected_count FROM readings_1m WHERE metric = 'gpu.0.core'"
+    ).fetchall()
+    assert [row[0] for row in rows] == [None, None]
+
+
+@pytest.mark.parametrize(
+    "intervals",
+    [{"air.room": 2_500}, {"gpu.0.core": 0}, {"gpu.0.core": MINUTE_MS + 1}, {"gpu.0.core": 7_000}],
+)
+def test_invalid_periodic_intervals_are_rejected(store, intervals):
+    write(store, "gpu.0.core", 0, 55.0)
+    with pytest.raises(ValueError):
+        rollup_minutes(store, periodic_intervals_ms=intervals)
+
+
+def test_periodic_metric_outage_continues_after_its_raw_rows_are_gone(store):
+    """停止した collector の生データが全部消えても、以降の分を欠測として埋め続ける。"""
+    intervals = {"gpu.0.core": 2_500}
+    write(store, "gpu.0.core", 0, 55.0)
+    write(store, "air.room", 0, 26.0)
+    rollup_minutes(store, periodic_intervals_ms=intervals)
+    # 保持期間の削除で gpu.0.core の生データが無くなった状態
+    store.connection.execute("DELETE FROM readings WHERE metric = 'gpu.0.core'")
+    write(store, "air.room", 5 * MINUTE_MS, 26.0)
+
+    rollup_minutes(store, periodic_intervals_ms=intervals)
+
+    rows = store.connection.execute(
+        "SELECT bucket_ms, row_count, expected_count FROM readings_1m "
+        "WHERE metric = 'gpu.0.core' ORDER BY bucket_ms"
+    ).fetchall()
+    assert [tuple(row) for row in rows] == [(0, 1, 24)] + [
+        (minute * MINUTE_MS, 0, 24) for minute in range(1, 6)
+    ]
+
+
+def test_registered_metric_never_observed_is_not_filled(store):
+    """一度も観測していない登録メトリクスには期待値を作らない（設置前は欠測ではない）。"""
+    write(store, "air.room", 0, 26.0)
+    write(store, "air.room", 5 * MINUTE_MS, 26.0)
+    rollup_minutes(store, periodic_intervals_ms={"gpu.0.core": 2_500})
+    count = store.connection.execute(
+        "SELECT COUNT(*) FROM readings_1m WHERE metric = 'gpu.0.core'"
+    ).fetchone()[0]
+    assert count == 0
+
+
+def _outage(first_minute: int, end_minute: int) -> list[tuple]:
+    """``[first_minute, end_minute)`` の0行バケット（2.5秒周期の期待値 24）。"""
+    return [(minute * MINUTE_MS, 0, 24) for minute in range(first_minute, end_minute)]
+
+
+def _minute_rows(store, metric: str) -> list[tuple]:
+    return [
+        tuple(row)
+        for row in store.connection.execute(
+            "SELECT bucket_ms, row_count, expected_count FROM readings_1m "
+            "WHERE metric = ? ORDER BY bucket_ms",
+            (metric,),
+        )
+    ]
+
+
+def test_periodic_outage_is_filled_up_to_the_last_completed_minute(store):
+    """collector と ingest がともに止まっても、ジョブの時計で完了した分まで欠測を残す。"""
+    from coldaisle.store import DeviceRecord
+
+    store.record_hello(DeviceRecord(device_id="dev", interval_ms=2_500), [], at_ms=0)
+    intervals = {"gpu.0.core": 2_500}
+    write(store, "gpu.0.core", 0, 55.0)
+    write(store, "air.room", 0, 26.0)
+
+    rollup_minutes(store, periodic_intervals_ms=intervals, now_ms=10 * MINUTE_MS + 30_000)
+
+    # 10分目は進行中なので欠測に数えない
+    assert _minute_rows(store, "gpu.0.core") == [(0, 1, 24)] + [
+        (minute * MINUTE_MS, 0, 24) for minute in range(1, 10)
+    ]
+    # air.* は決定記録 0008 §2.1.1 のとおり、最新の生データの分までしか埋めない
+    assert _minute_rows(store, "air.room") == [(0, 1, 24)]
+
+
+def test_periodic_outage_is_filled_after_every_raw_row_is_gone(store):
+    """生データが1行も無くなっても、観測済みの周期メトリクスは完了した分まで埋める。"""
+    intervals = {"gpu.0.core": 2_500}
+    write(store, "gpu.0.core", 0, 55.0)
+    rollup_minutes(store, periodic_intervals_ms=intervals, now_ms=MINUTE_MS)
+    store.connection.execute("DELETE FROM readings")
+
+    rollup_minutes(store, periodic_intervals_ms=intervals, now_ms=4 * MINUTE_MS)
+
+    assert _minute_rows(store, "gpu.0.core") == [(0, 1, 24)] + [
+        (minute * MINUTE_MS, 0, 24) for minute in range(1, 4)
+    ]
+
+
+def test_without_a_clock_the_fill_stops_at_the_newest_raw_row(store):
+    """時刻を渡さない呼び出しは従来どおり、最新の生データの分までを上限にする。"""
+    intervals = {"gpu.0.core": 2_500}
+    write(store, "gpu.0.core", 0, 55.0)
+
+    rollup_minutes(store, periodic_intervals_ms=intervals)
+
+    assert _minute_rows(store, "gpu.0.core") == [(0, 1, 24)]
+
+
+def test_disabled_period_is_not_an_outage_after_re_enabling(store):
+    """無効化していた期間は欠測にしない。再有効化後に最初に観測した分から埋める。"""
+    intervals = {"gpu.0.core": 2_500}
+    write(store, "gpu.0.core", 0, 55.0)
+    write(store, "air.room", 2 * MINUTE_MS, 26.0)
+    # 登録中の停止（1〜2分目）は欠測として埋まる
+    rollup_minutes(store, periodic_intervals_ms=intervals, now_ms=3 * MINUTE_MS)
+    # 無効化を検出した実行。前回から検出時点（完了した10分目）までは、無効化の前の
+    # 停止かもしれないので欠測として埋める（設定変更の正確な時刻は分からない）
+    write(store, "air.room", 10 * MINUTE_MS, 26.0)
+    rollup_minutes(store, periodic_intervals_ms={}, now_ms=11 * MINUTE_MS)
+    # 再有効化。検出後の無効期間と、再開前の分は埋めない
+    write(store, "gpu.0.core", 20 * MINUTE_MS, 55.0)
+    write(store, "air.room", 20 * MINUTE_MS, 26.0)
+
+    rollup_minutes(store, periodic_intervals_ms=intervals, now_ms=23 * MINUTE_MS + 5_000)
+
+    assert _minute_rows(store, "gpu.0.core") == (
+        [(0, 1, 24), *_outage(1, 11), (20 * MINUTE_MS, 1, 24), *_outage(21, 23)]
+    )
+
+
+def test_re_enabled_metric_is_not_filled_before_it_is_observed_again(store):
+    """再有効化しても、まだ観測が無ければ埋めない。"""
+    intervals = {"gpu.0.core": 2_500}
+    write(store, "gpu.0.core", 0, 55.0)
+    write(store, "air.room", MINUTE_MS, 26.0)
+    rollup_minutes(store, periodic_intervals_ms=intervals, now_ms=2 * MINUTE_MS)
+    write(store, "air.room", 10 * MINUTE_MS, 26.0)
+    rollup_minutes(store, periodic_intervals_ms={}, now_ms=11 * MINUTE_MS)
+
+    rollup_minutes(store, periodic_intervals_ms=intervals, now_ms=15 * MINUTE_MS)
+
+    # 無効化を検出した10分目までだけ。再有効化後は観測が無いので埋めない
+    assert _minute_rows(store, "gpu.0.core") == [(0, 1, 24), *_outage(1, 11)]
+
+
+def test_quiet_disabled_period_is_not_an_outage_after_re_enabling(store):
+    """無効の間に全 source が静かでも、再有効化後に無効期間を欠測にしない。"""
+    intervals = {"gpu.0.core": 2_500}
+    write(store, "gpu.0.core", 0, 55.0)
+    rollup_minutes(store, periodic_intervals_ms=intervals, now_ms=MINUTE_MS)
+    # 無効化を検出した実行（検出時点の4分目までは埋まる）。生データは1行も増えない
+    rollup_minutes(store, periodic_intervals_ms={}, now_ms=5 * MINUTE_MS)
+    write(store, "gpu.0.core", 10 * MINUTE_MS, 55.0)
+
+    rollup_minutes(store, periodic_intervals_ms=intervals, now_ms=13 * MINUTE_MS)
+
+    # 検出後の無効期間（5〜9分目）は埋まらない
+    assert _minute_rows(store, "gpu.0.core") == (
+        [(0, 1, 24), *_outage(1, 5), (10 * MINUTE_MS, 1, 24), *_outage(11, 13)]
+    )
+    state = store.connection.execute(
+        "SELECT registered, active_from_ms FROM periodic_metric_registrations "
+        "WHERE metric = 'gpu.0.core'"
+    ).fetchone()
+    assert tuple(state) == (1, 10 * MINUTE_MS)
+
+
+def test_re_enabled_metric_waits_for_its_first_new_observation(store):
+    """再有効化の直後に観測が無ければ埋めず、次の実行で最初の観測から埋める。"""
+    intervals = {"gpu.0.core": 2_500}
+    write(store, "gpu.0.core", 0, 55.0)
+    rollup_minutes(store, periodic_intervals_ms=intervals, now_ms=MINUTE_MS)
+    rollup_minutes(store, periodic_intervals_ms={}, now_ms=5 * MINUTE_MS)
+    rollup_minutes(store, periodic_intervals_ms=intervals, now_ms=8 * MINUTE_MS)
+    assert _minute_rows(store, "gpu.0.core") == [(0, 1, 24), *_outage(1, 5)]
+
+    write(store, "gpu.0.core", 9 * MINUTE_MS, 55.0)
+    rollup_minutes(store, periodic_intervals_ms=intervals, now_ms=12 * MINUTE_MS)
+
+    assert _minute_rows(store, "gpu.0.core") == (
+        [(0, 1, 24), *_outage(1, 5), (9 * MINUTE_MS, 1, 24), *_outage(10, 12)]
+    )
+
+
+def test_outage_before_disabling_is_filled_when_the_disable_is_detected(store):
+    """前回登録中 → collector 停止 → 無効化、の順でも、無効化を検出した実行で
+    検出時点（完了した分）までを前回の周期で埋めてから登録を外す。"""
+    intervals = {"gpu.0.core": 2_500}
+    write(store, "gpu.0.core", 0, 55.0)
+    rollup_minutes(store, periodic_intervals_ms=intervals, now_ms=MINUTE_MS)
+
+    rollup_minutes(store, periodic_intervals_ms={}, now_ms=6 * MINUTE_MS + 5_000)
+    # 外れたあとの実行では、もう埋めない
+    rollup_minutes(store, periodic_intervals_ms={}, now_ms=10 * MINUTE_MS)
+
+    assert _minute_rows(store, "gpu.0.core") == [(0, 1, 24)] + [
+        (minute * MINUTE_MS, 0, 24) for minute in range(1, 6)
+    ]
+    state = store.connection.execute(
+        "SELECT registered, changed_ms FROM periodic_metric_registrations "
+        "WHERE metric = 'gpu.0.core'"
+    ).fetchone()
+    assert tuple(state) == (0, 6 * MINUTE_MS + 5_000)
