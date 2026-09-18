@@ -9,6 +9,7 @@
 5. オフラインで見える・API の文字列を HTML として解釈しない
 """
 
+import json
 import re
 import shutil
 import subprocess
@@ -34,7 +35,8 @@ PAGE = WEB_ROOT / "airflow.html"
 SCRIPT = WEB_ROOT / "airflow.js"
 MOCK = WEB_ROOT / "airflow-mock.js"
 STYLES = WEB_ROOT / "airflow.css"
-ASSETS = [PAGE, SCRIPT, MOCK, STYLES]
+STATUS = WEB_ROOT / "airflow-status.js"
+ASSETS = [PAGE, SCRIPT, MOCK, STATUS, STYLES]
 
 ALLOWED_URLS = {"http://www.w3.org/2000/svg"}
 URL_PATTERN = re.compile(r"https?://[^\s\"'()]+")
@@ -237,7 +239,7 @@ def test_every_metric_the_page_reads_exists():
     """誤記したメトリクスは常に「未取得」に見え、黙って表示から外れる。"""
     catalog = yaml.safe_load(_text(METRICS_PATH))
     known = set(catalog["metrics"]) | set(catalog["derived"])
-    used = set(METRIC_LITERAL.findall(_text(SCRIPT))) | set(
+    used = set(METRIC_LITERAL.findall(_text(SCRIPT) + _text(STATUS))) | set(
         re.findall(r'data-air="([a-z_.]+)"', _text(PAGE))
     )
     assert used, "メトリクスを1つも参照していない"
@@ -286,23 +288,137 @@ def test_no_external_references(asset):
     assert not found, f"{asset.name} が外部を参照している: {sorted(found)}"
 
 
-@pytest.mark.parametrize("asset", [SCRIPT, MOCK])
+@pytest.mark.parametrize("asset", [SCRIPT, MOCK, STATUS])
 def test_script_does_not_use_inner_html(asset):
     text = _text(asset)
     for dangerous in ("innerHTML", "outerHTML", "insertAdjacentHTML", "document.write", "eval("):
         assert dangerous not in text, f"{asset.name} が {dangerous} を使っている"
 
 
-def test_throttle_hook_exists_but_shows_nothing_yet():
-    """GPU スロットリング表示の差し込み口（決定記録 0046 §2.6）。**まだ何も表示しない。**"""
+# ---------------------------------------------------------------- GPU スロットリング（案1）
+
+THROTTLE_FLAGS = (
+    "gpu.0.throttle.hw_thermal",
+    "gpu.0.throttle.sw_thermal",
+    "gpu.0.throttle.hw_power_brake",
+    "gpu.0.throttle.sw_power_cap",
+    "gpu.0.throttle.hw_slowdown",
+)
+
+
+def _node() -> str:
+    """`node` の場所。無い手元では飛ばす（CI に Node を入れる判断は PR #134 / その決定記録）。"""
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node が無い")
+    return node
+
+
+def _throttle(metrics: dict[str, dict[str, object]]) -> object:
+    """airflow-status.js の `gpuThrottleStatus` を node で実行した結果。"""
+    code = (
+        "const s = require(process.argv[1]);"
+        "console.log(JSON.stringify(s.gpuThrottleStatus(JSON.parse(process.argv[2]))));"
+    )
+    done = subprocess.run(
+        [_node(), "-e", code, str(STATUS), json.dumps({"metrics": metrics})],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return json.loads(done.stdout)
+
+
+def _flags(on: tuple[str, ...] = (), quality: str = "ok") -> dict[str, dict[str, object]]:
+    return {
+        metric: {"value": 1.0 if metric in on else 0.0, "unit": "flag", "quality": quality}
+        for metric in THROTTLE_FLAGS
+    }
+
+
+def test_thermal_throttling_is_red():
+    status = _throttle(_flags(on=("gpu.0.throttle.hw_thermal",)))
+    assert status == {
+        "text": "熱による制限",
+        "tone": "bad",
+        "reason": "理由：熱による制限（ハードウェア）",
+    }
+
+
+def test_thermal_wins_over_power():
+    status = _throttle(_flags(on=("gpu.0.throttle.sw_thermal", "gpu.0.throttle.sw_power_cap")))
+    assert status["tone"] == "bad"
+    assert status["reason"] == "理由：熱による制限（ソフトウェア）"
+
+
+@pytest.mark.parametrize("flag", ["gpu.0.throttle.hw_power_brake", "gpu.0.throttle.sw_power_cap"])
+def test_power_throttling_is_amber(flag):
+    status = _throttle(_flags(on=(flag,)))
+    assert status["text"] == "電力による制限"
+    assert status["tone"] == "warn"
+
+
+def test_hw_slowdown_alone_is_amber():
+    status = _throttle(_flags(on=("gpu.0.throttle.hw_slowdown",)))
+    assert status == {
+        "text": "ハードウェアによる減速",
+        "tone": "warn",
+        "reason": "理由：ハードウェアによる減速",
+    }
+
+
+@pytest.mark.parametrize(
+    "metrics",
+    [
+        {},
+        _flags(),
+        {m: {"value": None, "unit": "flag", "quality": "missing"} for m in THROTTLE_FLAGS},
+        _flags(on=THROTTLE_FLAGS, quality="stale"),
+        _flags(on=THROTTLE_FLAGS, quality="suspect"),
+    ],
+    ids=["absent", "all-zero", "missing", "stale", "suspect"],
+)
+def test_unknown_or_clear_shows_nothing(metrics):
+    """値が無い・古いものは「分からない」。**何も出さない**（「制限なし」とも言わない）。"""
+    assert _throttle(metrics) is None
+
+
+def test_the_gpu_source_is_wired_to_the_status():
+    """GPU は `sourceStatus()` 経由で状態を出す。CPU は状態を持たない。"""
     script = _text(SCRIPT)
+    sources = script[script.index("const HEAT_SOURCES") : script.index("const STATUS_COLOR")]
+    assert "gpuThrottleStatus(latest)" in sources
+    assert sources.count("status: null") == 1
     assert "function sourceStatus(source)" in script
-    sources = script[script.index("const HEAT_SOURCES") : script.index("function sourceStatus")]
-    assert sources.count("status: null") == 2
-    assert "throttle." not in script
+    page = _text(PAGE)
+    assert page.index('src="airflow-status.js"') < page.index('src="airflow.js"')
 
 
-@pytest.mark.parametrize("asset", [SCRIPT, MOCK])
+def test_no_throttling_is_never_claimed():
+    for asset in (SCRIPT, STATUS):
+        text = _text(asset)
+        assert '"制限なし"' not in text
+        assert '"スロットリングなし"' not in text
+
+
+def test_tlimit_margin_is_not_shown():
+    """T.Limit までの余裕は案3（採用されていない）。"""
+    for asset in (SCRIPT, STATUS, MOCK):
+        assert '"gpu.0.tlimit_margin"' not in _text(asset)
+
+
+def test_throttle_flags_exist_in_the_catalog():
+    catalog = yaml.safe_load(_text(METRICS_PATH))
+    assert set(THROTTLE_FLAGS) <= set(catalog["metrics"])
+
+
+def test_the_throttle_mock_is_selectable():
+    script = _text(SCRIPT)
+    assert 'throttle: "throttle"' in script
+    assert '"gpu.0.throttle.hw_thermal": 1' in _text(MOCK)
+
+
+@pytest.mark.parametrize("asset", [SCRIPT, MOCK, STATUS])
 def test_script_parses(asset):
     node = shutil.which("node")
     if node is None:
@@ -317,3 +433,73 @@ def test_history_reads_the_range_the_api_returns(client):
     script = _text(SCRIPT)
     assert "results[0].body.from;" in script
     assert "results[0].body.to;" in script
+
+
+# ---------------------------------------------------------------- データの出どころ（Codex P2）
+
+
+def _source_label(source: object) -> dict[str, object]:
+    code = (
+        "const s = require(process.argv[1]);"
+        "console.log(JSON.stringify(s.ingestSourceLabel(JSON.parse(process.argv[2]))));"
+    )
+    done = subprocess.run(
+        [_node(), "-e", code, str(STATUS), json.dumps(source)],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    loaded: dict[str, object] = json.loads(done.stdout)
+    return loaded
+
+
+@pytest.mark.parametrize(
+    ("source", "text", "live"),
+    [
+        ("serial", "実機データ", True),
+        ("mock", "模擬データ（MockSource）", False),
+        ("replay", "再生データ（過去の記録）", False),
+        (None, "出どころ不明（実機のライブ値とは限りません）", False),
+        ("something-new", "出どころ不明（実機のライブ値とは限りません）", False),
+        ("toString", "出どころ不明（実機のライブ値とは限りません）", False),
+    ],
+)
+def test_the_source_label_follows_health_source(source, text, live):
+    """**`?mock=` が無いことを「実機」とみなさない**（決定記録 0046 §2.7）。"""
+    assert _source_label(source) == {"text": text, "live": live}
+
+
+def test_the_page_reads_the_source_from_health():
+    script = _text(SCRIPT)
+    health = script[script.index("function renderHealth(health)") :][:400]
+    assert "page.ingestSource = health.source" in health
+    render = script[
+        script.index("function renderSource()") : script.index("function renderControl()")
+    ]
+    assert "ingestSourceLabel(page.ingestSource)" in render
+    assert '"実機データ"' not in script, "実機かどうかは health.source から決める"
+    assert "実機データ" not in _text(PAGE)
+
+
+def test_health_reports_the_ingest_source(tmp_path, rules):
+    """画面が頼る `health.source` が API から届くこと（デーモンが書く `sys.ingest_source`）。"""
+    path = tmp_path / "src.db"
+    with SqliteStore(path, rules=rules, clock=SimulatedClock(NOW_MS)) as store:
+        store.insert_sample(
+            Sample(
+                ts_ms=NOW_MS,
+                readings=(Reading(metric="fan.front.rpm", value=1.0, quality=Quality.OK),),
+            )
+        )
+        store.set_system_state("sys.ingest_source", "replay", at_ms=NOW_MS)
+    app = create_app(
+        Config(
+            db=path,
+            quality_rules=QUALITY_RULES_PATH,
+            metrics=METRICS_PATH,
+            airflow_ui=AIRFLOW_UI_PATH,
+        ),
+        clock=SimulatedClock(NOW_MS),
+    )
+    with TestClient(app) as opened:
+        assert opened.get("/api/v1/health").json()["source"] == "replay"

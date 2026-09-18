@@ -3,7 +3,7 @@
 // 原則:
 //   1. **書き込まない。** 叩くのは GET だけ（api-contract §1）。モード変更の入り口は
 //      coldaisle-fand のローカル Unix ソケットだけで、この画面には置かない（決定記録 0028 §2.2）
-//   2. **実データと模擬データを混ぜない。** 模擬は `?mock=normal|override` のときだけ
+//   2. **実データと模擬データを混ぜない。** 模擬は `?mock=normal|override|throttle` のときだけ
 //      別ファイル（airflow-mock.js）を読み、そのときは実データを1件も取りに行かない。
 //      画面全体の帯で「模擬データ」と言う
 //   3. **未接続・未取得・古い値を正常値のように見せない。** 制御の判断記録（#74 / #82）は
@@ -13,7 +13,13 @@
 //   6. **色の区切りをコードに書かない。** `GET /api/v1/airflow/config`（config/airflow-ui.yaml）から読む
 "use strict";
 
-const MOCK_SCENARIOS = { "1": "normal", normal: "normal", override: "override" };
+const MOCK_SCENARIOS = { "1": "normal", normal: "normal", override: "override", throttle: "throttle" };
+
+const MOCK_LABELS = {
+  normal: "模擬データ（通常）",
+  override: "模擬データ（異常時）",
+  throttle: "模擬データ（GPU の熱による制限）",
+};
 
 const RANGES = [
   { label: "1h", window: "1h", agg: "raw" },
@@ -57,20 +63,27 @@ const ZONES = [
 
 // CPU の使用率はまだ計測していない（取得する入力が無い）。`null` は「未計測」と出す
 //
-// `status` は熱源の状態表示の差し込み口。**GPU のスロットリング表示のために空けてある**
-// （表示案は所有者が検討中。元になる GPU の throttle reason・T.Limit margin は #65 / 決定記録 0043 で収集済み）。
-// いまはどの熱源も `null` で、何も表示しない。
+// `status` は熱源の状態（決定記録 0046 §2.6）。GPU はスロットリングの状態を返す（案1）。
+// 判定は airflow-status.js（DOM に触らない関数）が持つ。CPU は状態を持たない
 const HEAT_SOURCES = [
   { name: "CPU", util: null, temp: "cpu.package", power: "power.cpu.package", status: null, chip: { x: 204, y: 200, w: 104 } },
-  { name: "GPU", util: "gpu.0.utilization", temp: "gpu.0.core", power: "power.gpu.0", status: null, chip: { x: 196, y: 292, w: 112 } },
+  {
+    name: "GPU", util: "gpu.0.utilization", temp: "gpu.0.core", power: "power.gpu.0",
+    status: (latest) => window.ColdaisleAirflowStatus.gpuThrottleStatus(latest),
+    block: "gpu-block",
+    chip: { x: 196, y: 292, w: 112 },
+  },
 ];
 
+const STATUS_COLOR = { bad: "#e25c5c", warn: "#e3a63b" };
+const STATUS_FILL = { bad: "#3a1d1f", warn: "#33291a" };
+
 /**
- * 熱源の状態（例: GPU のスロットリング）。**未実装の差し込み口。**
+ * 熱源の状態（GPU のスロットリング。決定記録 0046 §2.6 の案1）。
  *
- * `source.status` に関数を入れると `{ text, tone }`（tone は "warn" / "bad"）を返せるようにしてある。
- * 返り値があれば、側面図の札の見出しと枠の色、「熱源」パネルに出る。
- * `null` を返すあいだは何も出さない（**「スロットリングなし」とも言わない**。表示の設計が未定で値を読んでいないため）。
+ * `{ text, tone, reason }`（tone は "bad" = 赤 / "warn" = 琥珀）か null。
+ * 返り値があれば、側面図の GPU の枠と札が色付きになり、小さな札（text）と理由の行（reason）が出る。
+ * `null` のあいだは何も出さない（**「スロットリングなし」とも言わない**。値が無い・古いときと区別できないため）。
  */
 function sourceStatus(source) {
   return typeof source.status === "function" ? source.status(page.latest) : null;
@@ -140,6 +153,8 @@ const page = {
   latest: null,
   control: null, // 実データでは常に null（未接続）
   zone: "top", // 「なぜこの回転数か」で見ている系統
+  ingestSource: undefined, // health.source。undefined = まだ届いていない
+  pageNote: null,
   refreshing: false,
 };
 
@@ -258,6 +273,7 @@ function showBanner(id, text) {
 /** データが古い・無い・未来のときは画面全体で言う（決定記録 0011 §2.5 と同じ）。 */
 function renderHealth(health) {
   const age = document.getElementById("age-label");
+  page.ingestSource = health.source; // serial / mock / replay / null
   if (health.last_sample_ts_ms === null) {
     showBanner("banner", "データが1件も届いていません。取り込みデーモンを確認してください。");
   } else if (health.data_age_seconds < 0) {
@@ -280,14 +296,19 @@ function renderSource() {
   const source = document.getElementById("source-label");
   const decision = document.getElementById("decision-label");
   if (page.mockName) {
-    source.textContent = page.mockName === "override" ? "模擬データ（異常時）" : "模擬データ（通常）";
+    source.textContent = MOCK_LABELS[page.mockName] || "模擬データ";
     source.classList.add("mock");
     showBanner(
       "mock-banner",
-      "模擬データを表示中 — 実機の値でも実際の制御の状態でもありません（URL から ?mock= を外すと実機データ）"
+      "模擬データを表示中 — 実機の値でも実際の制御の状態でもありません（URL から ?mock= を外すと API のデータ）"
     );
+  } else if (page.ingestSource === undefined) {
+    source.textContent = "出どころを確認中…"; // health が届くまで「実機」と言わない
   } else {
-    source.textContent = "実機データ";
+    // **`?mock=` が無いことを「実機」とみなさない。** health.source で決める（決定記録 0046 §2.7）
+    const label = window.ColdaisleAirflowStatus.ingestSourceLabel(page.ingestSource);
+    source.textContent = page.pageNote ? `${label.text}（${page.pageNote}）` : label.text;
+    source.classList.toggle("mock", !label.live);
   }
   decision.textContent = page.control && page.control.decision_id ? `判断 ${page.control.decision_id}` : "";
 }
@@ -429,17 +450,57 @@ function renderDiagram() {
 
   for (const source of HEAT_SOURCES) {
     const status = sourceStatus(source);
-    drawTag(labels, {
-      x: source.chip.x, y: source.chip.y, w: source.chip.w, h: 54,
-      title: status ? `${source.name} ${status.text}` : source.name,
-      tone: status && status.tone === "bad" ? "bad" : null,
-      lines: [
-        { ...lineFor(reading(source.util, 0, "%"), "使用率 "), small: true },
-        { ...lineFor(reading(source.temp, 0, "℃"), "温度 "), small: true },
-      ],
-      color: status ? (status.tone === "bad" ? "#e25c5c" : "#e3a63b") : "#c3cad4",
-    });
+    if (source.block) paintBlock(source.block, status);
+    const util = { ...lineFor(reading(source.util, 0, "%"), "使用率 "), small: true };
+    const temp = { ...lineFor(reading(source.temp, 0, "℃"), "温度 "), small: true };
+    if (!status) {
+      drawTag(labels, {
+        x: source.chip.x, y: source.chip.y, w: source.chip.w, h: 54,
+        title: source.name, lines: [util, temp], color: "#c3cad4",
+      });
+      continue;
+    }
+    drawStatusTag(labels, source, status, [util, temp]);
   }
+}
+
+/** 熱源の枠（GPU のブロック）を状態の色にする。状態が無ければ元の色に戻す。 */
+function paintBlock(id, status) {
+  const block = document.getElementById(id);
+  if (!block) return;
+  if (!block.dataset.stroke) {
+    block.dataset.stroke = block.getAttribute("stroke");
+    block.dataset.fill = block.getAttribute("fill");
+  }
+  block.setAttribute("stroke", status ? STATUS_COLOR[status.tone] : block.dataset.stroke);
+  block.setAttribute("fill", status ? STATUS_FILL[status.tone] : block.dataset.fill);
+  block.setAttribute("stroke-width", status ? 2.5 : 2);
+}
+
+/**
+ * 状態付きの札（案1）。見出しの下に小さく理由、右に小さな札（「熱による制限」など）。
+ * 札を下へ伸ばすと GPU 吸気の札に重なるので、行の間隔を詰めて高さを保つ。
+ */
+function drawStatusTag(parent, source, status, lines) {
+  const color = STATUS_COLOR[status.tone];
+  const x = source.chip.x;
+  const y = source.chip.y - 4;
+  // 理由の行（9px）が収まる幅にする。左端は固定（GPU 吸気の札とは高さで避けている）
+  const w = Math.max(source.chip.w + 50, status.reason.length * 9 + 16);
+  const group = svgNode("g", {}, parent);
+  svgNode("rect", { x, y, width: w, height: 60, rx: 6, fill: "rgba(15, 18, 22, 0.94)", stroke: color, "stroke-width": 2 }, group);
+  svgText(group, x + 8, y + 13, source.name, { "font-size": 11, "font-weight": 700, fill: color });
+  svgText(group, x + 8, y + 26, status.reason, { "font-size": 9, fill: "#c3cad4" });
+  lines.forEach((line, index) => {
+    svgText(group, x + 8, y + 41 + index * 14, line.text, {
+      "font-size": 11, "font-weight": 600, class: "num", fill: line.muted ? "#7d8794" : "#e6e9ee",
+    });
+  });
+  const pillWidth = status.text.length * 10 + 14;
+  svgNode("rect", { x: x + w + 6, y: y + 2, width: pillWidth, height: 16, rx: 8, fill: color }, group);
+  svgText(group, x + w + 6 + pillWidth / 2, y + 14, status.text, {
+    "text-anchor": "middle", "font-size": 10, "font-weight": 700, fill: "#0f1216",
+  });
 }
 
 function renderLegend() {
@@ -654,8 +715,11 @@ function renderHeat() {
     block.appendChild(kvRow("使用率", reading(source.util, 0, "%")));
     block.appendChild(kvRow("温度", reading(source.temp, 1, "℃")));
     block.appendChild(kvRow("消費電力", reading(source.power, 0, " W")));
-    const status = sourceStatus(source); // スロットリング表示の差し込み口（いまは常に null）
-    if (status) block.appendChild(el("span", `bb ${status.tone || ""}`.trim(), status.text));
+    const status = sourceStatus(source); // GPU のスロットリング（案1）。null なら何も出さない
+    if (status) {
+      block.appendChild(el("span", `bb ${status.tone}`, status.text));
+      block.appendChild(el("span", "note", status.reason));
+    }
     container.appendChild(block);
   }
 }
@@ -1152,9 +1216,8 @@ async function start() {
     return;
   }
   if (requested !== null) {
-    // 帯（#banner）は健全性の表示で上書きされるので、出どころの表示に残す
-    document.getElementById("source-label").textContent =
-      `実機データ（模擬シナリオ「${requested}」は無いため。normal / override）`;
+    // 帯（#banner）は健全性の表示で上書きされるので、出どころの表示に添える
+    page.pageNote = `模擬シナリオ「${requested}」は無いため API のデータを表示。normal / override / throttle`;
   }
 
   setInterval(refresh, REFRESH_MS);

@@ -311,3 +311,5 @@ body {
 .readout-body .group { font-size: 11px; color: var(--faint); margin-top: 6px; }
 .readout-body .row { display: flex; justify-content: space-between; gap: 8px; font-size: 13px; }
 .readout-body .row .name { display: inline-flex; align-items: center; gap: 8px; }
+.heat .src .bb { align-self: flex-start; }
+.heat .src .note { margin: 0; }

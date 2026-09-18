@@ -1,6 +1,6 @@
 // エアフロー画面の**模擬データ**（#106 / 決定記録 0046）。
 //
-// **実機の値でも実際の制御の状態でもない。** `airflow.html?mock=normal|override` のときだけ
+// **実機の値でも実際の制御の状態でもない。** `airflow.html?mock=normal|override|throttle` のときだけ
 // airflow.js がこのファイルを読み込む。実データの表示ではこのファイルを読まない。
 // 制御の状態（運転モード・決め手・推定風量など）は、制御の判断記録（#74 / #82）を読める
 // ようになるまで画面の確認に使うための仮の値。値はデザイン（Airflow / Airflow-Override）に合わせた。
@@ -57,6 +57,27 @@
     },
   };
 
+  // 模擬の GPU スロットリング（決定記録 0046 §2.6）。0 / 1 のフラグ
+  const NO_THROTTLE = {
+    "gpu.0.throttle.hw_thermal": 0,
+    "gpu.0.throttle.sw_thermal": 0,
+    "gpu.0.throttle.hw_power_brake": 0,
+    "gpu.0.throttle.sw_power_cap": 0,
+    "gpu.0.throttle.hw_slowdown": 0,
+  };
+  Object.assign(BASE.normal, NO_THROTTLE);
+  Object.assign(BASE.override, NO_THROTTLE);
+  // 熱による制限（ハードウェア）がかかっている通常運転
+  BASE.throttle = {
+    ...BASE.normal,
+    "air.gpu_intake": 29.1,
+    "air.gpu_exhaust": 30.4,
+    "gpu.0.core": 86,
+    "gpu.0.utilization": 99,
+    "power.gpu.0": 210,
+    "gpu.0.throttle.hw_thermal": 1,
+  };
+
   const UNITS = { rpm: "rpm", pwm: "%", utilization: "%" };
 
   function latest(name) {
@@ -64,7 +85,8 @@
     const metrics = {};
     for (const [metric, value] of Object.entries(values)) {
       const suffix = metric.split(".").pop();
-      metrics[metric] = { value, unit: UNITS[suffix] || "C", quality: "ok", age_seconds: 0.8 };
+      const unit = metric.includes(".throttle.") ? "flag" : UNITS[suffix] || "C";
+      metrics[metric] = { value, unit, quality: "ok", age_seconds: 0.8 };
     }
     return {
       metrics,
