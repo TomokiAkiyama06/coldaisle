@@ -61,7 +61,7 @@ def policy(
     demote_window_ms: int = 60_000,
 ) -> FanPolicyConfig:
     document: dict[str, object] = {
-        "schema_version": 3,
+        "schema_version": 4,
         "fallback_curve": [
             {"temperature_c": 20.0, "demand": 0.2},
             {"temperature_c": 80.0, "demand": 0.8},
@@ -85,6 +85,26 @@ def policy(
         },
         "mpc": {"period_ms": 1_000, "budget_ms": 100, "valid_ms": 2_000},
         "supervisor": {"period_ms": 1_000, "valid_ms": 2_000},
+        "workload_regime": {
+            "cpu_power": {
+                "metric": "power.cpu.package",
+                "idle_below_w": 30.0,
+                "active_above_w": 60.0,
+            },
+            "gpu_power": {
+                "metric": "power.gpu.0",
+                "idle_below_w": 40.0,
+                "active_above_w": 100.0,
+            },
+            "activity_window_ms": 1_000,
+            "history_window_ms": 120_000,
+            "minimum_observation_ms": 10_000,
+            "sustained_after_ms": 30_000,
+            "cooldown_ms": 20_000,
+            "minimum_transition_ms": 2_000,
+            "confidence_full_window_ms": 60_000,
+            "max_snapshot_gap_ms": 1_000,
+        },
         "gate_min_confidence": {
             "limited": provisional(0.6),
             "expanded": provisional(0.7),

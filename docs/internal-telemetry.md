@@ -99,7 +99,8 @@ T_SENSOR の無効理由を decision trace に引き継ぐ（collector 自身は
 
 ## 実機で残る確認
 
-- CPU Package / CPU Power / VRM / chipset / T_SENSOR の driver と label
+- CPU Power / chipset（実値を返す入力）/ T_SENSOR の driver と label。CPU Package と VRM は
+  2026-09-18 に確認済み（[`fan-header-mapping.md`](fan-header-mapping.md) の「温度」）
 - Front / Rear / Top、AIO Pump、VRM Fan の label と RPM/PWM の物理対応
 - GPU driver が hotspot / memory temperature を NVML で公開するか
 - T_SENSOR の断線時の値と #50 の較正に基づく妥当範囲
