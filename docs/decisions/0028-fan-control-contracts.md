@@ -93,13 +93,13 @@ Telemetry Collector の出力を受け渡す経路と供給周期は未決（5. 
 | Reactive Guard | state、`requested` | zone ごとの `floor` / `ceiling` / `hold_until_mono_ms` / `reason` | `hold_until_mono_ms` まで |
 | Critical Safety | snapshot、Hardware の状態、運転モード、`requested`、Guard の出力 | zone ごとの `floor` / `forced_max` / `faults` / `reason`、全体の `safety_state` | その tick だけ |
 | 合成（2.4） | 上の3つ | zone ごとの `requested` / `effective` / `bound_by` / `reasons` | その tick だけ |
+| Hardware Backend | `effective` | zone ごとの `pwm_raw` / `write_ok` / `readback_ok` / `rpm` / `fault` | その tick だけ |
 
 > **Superseded by**
 >
 > - 上表の Supervisor 行の有効期限（受け取ってから `supervisor.valid_ms`）→
 >   [`0041-supervisor-proposal-freshness.md`](0041-supervisor-proposal-freshness.md)
 >   （元 snapshot の単調時刻から `supervisor.valid_ms`。受信時刻も trace に残す）
-| Hardware Backend | `effective` | zone ごとの `pwm_raw` / `write_ok` / `readback_ok` / `rpm` / `fault` | その tick だけ |
 
 **型で経路を縛る。**
 
