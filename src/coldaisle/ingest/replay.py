@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import csv
 import hashlib
+import io
 import logging
 import os
 import stat
@@ -26,13 +27,16 @@ from collections.abc import Callable, Iterator
 from datetime import datetime
 from itertools import islice
 from pathlib import Path
-from typing import BinaryIO
+from typing import TYPE_CHECKING, BinaryIO, TextIO
 from zoneinfo import ZoneInfo
 
 from coldaisle import logs
 from coldaisle.channels import SAMPLE_CHANNELS
 from coldaisle.clock import SimulatedClock
 from coldaisle.ingest.protocol import RawHello, RawMessage, RawSample, RawSensor
+
+if TYPE_CHECKING:
+    from _typeshed import WriteableBuffer
 
 TIMESTAMP_COLUMNS = ("timestamp", "ts", "time", "datetime")
 """時刻列の呼ばれ方。**先に見つかったものを使う。**"""
@@ -90,14 +94,49 @@ def csv_files(path: Path) -> list[Path]:
 
 def replay_sha256(path: Path) -> str:
     """Replay対象のbasename・file境界・内容を順序付きでhashする。"""
-    _snapshots, digest = _snapshot_and_hash(csv_files(path), make_snapshot=False)
+    _snapshot, _segments, digest = _snapshot_and_hash(csv_files(path), make_snapshot=False)
     return digest
 
 
-def _snapshot_and_hash(files: list[Path], *, make_snapshot: bool) -> tuple[list[BinaryIO], str]:
-    """CSVをchunk単位でhashし、指定時は同じbytesをprivate snapshotへ書く。"""
+class _SnapshotSegment(io.RawIOBase):
+    """共有snapshotの1区間だけを`pread`で読むview。
+
+    CSVごとにfileを持つとdirectory replayでdescriptorがCSV数だけ増えEMFILEになり得る。
+    1つのspool fileを位置非依存の`pread`で読めば、何本CSVがあっても保持するfdは1つで済む。
+    """
+
+    def __init__(self, fd: int, start: int, length: int) -> None:
+        super().__init__()
+        self._fd = fd
+        self._position = start
+        self._end = start + length
+
+    def readable(self) -> bool:
+        return True
+
+    def readinto(self, buffer: WriteableBuffer) -> int:
+        view = memoryview(buffer).cast("B")
+        size = min(len(view), self._end - self._position)
+        if size <= 0:
+            return 0
+        chunk = os.pread(self._fd, size, self._position)
+        view[: len(chunk)] = chunk
+        self._position += len(chunk)
+        return len(chunk)
+
+
+def _snapshot_and_hash(
+    files: list[Path], *, make_snapshot: bool
+) -> tuple[BinaryIO | None, list[tuple[int, int]], str]:
+    """CSVをchunk単位でhashし、指定時は同じbytesを1つのprivate snapshotへ連結して書く。
+
+    返す区間は各CSVのsnapshot内`(開始offset, 長さ)`。
+    """
     digest = hashlib.sha256()
-    snapshots: list[BinaryIO] = []
+    segments: list[tuple[int, int]] = []
+    # dataset sourceの寿命まで保持し、各CSVは区間viewで読む。
+    snapshot = tempfile.TemporaryFile(mode="w+b") if make_snapshot else None  # noqa: SIM115
+    offset = 0
     try:
         for csv_path in files:
             encoded_name = csv_path.name.encode("utf-8")
@@ -112,45 +151,27 @@ def _snapshot_and_hash(files: list[Path], *, make_snapshot: bool) -> tuple[list[
                 digest.update(len(encoded_name).to_bytes(8, "big"))
                 digest.update(encoded_name)
                 digest.update(before.st_size.to_bytes(8, "big"))
-                # dataset sourceの寿命まで保持し、各CSV parseでdupして再利用する。
-                snapshot = (
-                    tempfile.TemporaryFile(mode="w+b")  # noqa: SIM115
-                    if make_snapshot
-                    else None
-                )
                 copied = 0
-                try:
-                    while chunk := source.read(COPY_CHUNK_BYTES):
-                        copied += len(chunk)
-                        digest.update(chunk)
-                        if snapshot is not None:
-                            snapshot.write(chunk)
+                while chunk := source.read(COPY_CHUNK_BYTES):
+                    copied += len(chunk)
+                    digest.update(chunk)
                     if snapshot is not None:
-                        snapshot.flush()
-                        os.fsync(snapshot.fileno())
-                    after = os.fstat(source.fileno())
-                except BaseException:
-                    if snapshot is not None:
-                        snapshot.close()
-                    raise
+                        snapshot.write(chunk)
+                after = os.fstat(source.fileno())
             identity_before = (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
             identity_after = (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
             if identity_before != identity_after or copied != before.st_size:
-                if snapshot is not None:
-                    snapshot.close()
                 raise ValueError(f"hash中にReplay CSVが変更された: {csv_path}")
-            if snapshot is not None:
-                try:
-                    snapshot.seek(0)
-                except BaseException:
-                    snapshot.close()
-                    raise
-                snapshots.append(snapshot)
+            segments.append((offset, copied))
+            offset += copied
+        if snapshot is not None:
+            snapshot.flush()
+            os.fsync(snapshot.fileno())
     except BaseException:
-        for opened in snapshots:
-            opened.close()
+        if snapshot is not None:
+            snapshot.close()
         raise
-    return snapshots, digest.hexdigest()
+    return snapshot, segments, digest.hexdigest()
 
 
 class ReplaySource:
@@ -183,18 +204,14 @@ class ReplaySource:
         source_files = csv_files(path)
         if not source_files:
             raise ValueError(f"CSV が見つからない: {path}")
-        self._snapshot_files: list[BinaryIO] = []
+        self._snapshot: BinaryIO | None = None
+        self._snapshot_segments: list[tuple[int, int]] = []
         self._source_sha256: str | None = None
         if dataset_provenance:
-            try:
-                self._snapshot_files, self._source_sha256 = _snapshot_and_hash(
-                    source_files,
-                    make_snapshot=True,
-                )
-            except BaseException:
-                for snapshot in self._snapshot_files:
-                    snapshot.close()
-                raise
+            self._snapshot, self._snapshot_segments, self._source_sha256 = _snapshot_and_hash(
+                source_files,
+                make_snapshot=True,
+            )
         self._files = source_files
         self._tz = tz
         self._speed = speed
@@ -254,12 +271,13 @@ class ReplaySource:
         """
         for index, path in enumerate(self._files):
             dropped = 0
-            if self._snapshot_files:
-                snapshot_fd = os.dup(self._snapshot_files[index].fileno())
-                os.lseek(snapshot_fd, 0, os.SEEK_SET)
-                handle_context = os.fdopen(
-                    snapshot_fd,
-                    mode="r",
+            handle_context: TextIO
+            if self._snapshot is not None:
+                segment_start, segment_length = self._snapshot_segments[index]
+                handle_context = io.TextIOWrapper(
+                    io.BufferedReader(
+                        _SnapshotSegment(self._snapshot.fileno(), segment_start, segment_length)
+                    ),
                     encoding="utf-8-sig",
                     newline="",
                 )

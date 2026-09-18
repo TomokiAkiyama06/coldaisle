@@ -63,6 +63,8 @@ Telemetry CSVは既存経路で同じ時刻のままSQLiteへ投入できる。D
 完全一致も検証される。bind済みDBへの再投入は、同じ開始時刻・同じCSVでも拒否される。
 dataset用Replayはconstructorで入力を定数memoryのchunkごとにunlink済み一時fileへcopyし、
 copyと同時にhashする。先頭時刻と全sampleは同じsnapshot bytesから読み、元pathを再openしない。
+CSVが何本あってもsnapshotは1つの一時fileに連結し、保持するfile descriptorは1つにする。
+`--dataset-run-alias`付きのReplayは`--bulk`でも待ち行列が溢れたsampleを捨てず、空くまで待つ（backpressure）。`--max-samples`での途中停止も拒否する。DBがCSVの一部だけになると、provenanceの全体hashと食い違うためである。
 通常Replayはこのcopy / eager hashをしない。後のdataset生成時に元CSVが変わっていれば、CLIの
 再hashがDBのsnapshot hashと一致せず生成を拒否する。
 

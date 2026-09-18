@@ -11,6 +11,7 @@ from zoneinfo import ZoneInfo
 import pytest
 from pydantic import ValidationError
 
+import coldaisle.daemon as daemon_module
 import coldaisle.dataset as dataset_module
 from coldaisle.control import ControlTick, ControlTraceLogger
 from coldaisle.control.model.dataset import (
@@ -645,3 +646,52 @@ def test_replay_can_regenerate_the_same_dataset_without_hardware(tmp_path, rules
             return ThermalDatasetBuilder(store).build(source_run=run, spec=spec())
 
     assert regenerate("first.db").model_dump() == regenerate("second.db").model_dump()
+
+
+def _long_replay_csv(path: Path, rows: int) -> None:
+    lines = ["timestamp,room_temp,gpu_intake,gpu_exhaust"]
+    lines += [
+        f"1970-01-01T{i // 3600:02d}:{i // 60 % 60:02d}:{i % 60:02d},20,30,40" for i in range(rows)
+    ]
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def test_dataset_replay_applies_backpressure_instead_of_dropping(tmp_path, rules, monkeypatch):
+    """bulkのdataset Replayで待ち行列が溢れても、1件も捨てずに全行を保存する。
+
+    捨てるとDBはCSVの一部になり、provenanceに記録した全体のhashと食い違う。
+    """
+    monkeypatch.setattr(daemon_module, "QUEUE_SIZE", 1)
+    rows = 500
+    csv_path = tmp_path / "replay.csv"
+    _long_replay_csv(csv_path, rows)
+    replay = ReplaySource(csv_path, tz=ZoneInfo("UTC"), bulk=True, dataset_provenance=True)
+    with SqliteStore(tmp_path / "run.db", rules=rules, clock=replay.clock) as store:
+        daemon = Daemon(
+            source=replay,
+            store=store,
+            normalizer=Normalizer(rules=rules, calibration=Calibration(), clock=replay.clock),
+            source_name="replay",
+            dataset_run_alias=RUN_ALIAS,
+        )
+        stats = daemon.run()
+
+    assert stats.queue_drops == 0
+    assert stats.samples == rows
+
+
+def test_dataset_replay_rejects_partial_runs(tmp_path, rules):
+    csv_path = tmp_path / "replay.csv"
+    _long_replay_csv(csv_path, 3)
+    replay = ReplaySource(csv_path, tz=ZoneInfo("UTC"), bulk=True, dataset_provenance=True)
+    with SqliteStore(tmp_path / "run.db", rules=rules, clock=replay.clock) as store:
+        daemon = Daemon(
+            source=replay,
+            store=store,
+            normalizer=Normalizer(rules=rules, calibration=Calibration(), clock=replay.clock),
+            source_name="replay",
+            dataset_run_alias=RUN_ALIAS,
+        )
+        with pytest.raises(ValueError, match="max_samples"):
+            daemon.run(max_samples=1)
+        assert store.dataset_source_run() is None

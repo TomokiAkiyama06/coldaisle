@@ -198,6 +198,9 @@ class Daemon:
         if self._dataset_run_alias is None and bound_dataset_run is not None:
             raise ValueError("dataset専用DBへrun alias無しで追加入力できない")
         if self._dataset_run_alias is not None:
+            if max_samples is not None:
+                # 途中で止めるとDBはCSVの一部だけになり、全体のhashと食い違う
+                raise ValueError("dataset run bindではmax_samplesで途中停止できない")
             source_sha256 = getattr(self._source, "source_sha256", None)
             if not isinstance(source_sha256, str):
                 raise ValueError("dataset run bindにはSHA-256を提供するsourceが必要")
@@ -271,6 +274,13 @@ class Daemon:
                 if self._stop:
                     break
                 received = (self._source.clock.now_ms(), message)
+                if self._dataset_run_alias is not None:
+                    # **dataset用Replayは捨てずに待つ（backpressure）。** provenanceは
+                    # CSV全体のhashなので、取りこぼすとDBとhashが別物になる。
+                    # 実時間の監視ではないため、直近優先で古い側を捨てる理由も無い
+                    if not self._put_blocking(inbox, received):
+                        break
+                    continue
                 try:
                     inbox.put_nowait(received)
                 except queue.Full:
@@ -284,6 +294,23 @@ class Daemon:
             inbox.put(error)
         else:
             inbox.put(None)
+
+    def _put_blocking(
+        self,
+        inbox: queue.Queue[tuple[int, RawMessage] | BaseException | None],
+        received: tuple[int, RawMessage],
+    ) -> bool:
+        """空きが出るまで待って詰める。停止要求で諦めたら `False`。
+
+        待ち続けると停止要求に応じられないため、刻みで `_stop` を見直す。
+        """
+        while not self._stop:
+            try:
+                inbox.put(received, timeout=self._tick_s)
+            except queue.Full:
+                continue
+            return True
+        return False
 
     def _with_queue_drops(self, sample: Sample) -> Sample:
         """待ち行列の取りこぼしを、次のサンプルに乗せて記録する。

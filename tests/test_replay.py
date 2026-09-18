@@ -111,6 +111,28 @@ def test_dataset_replay_hashes_and_streams_the_same_private_snapshot(day_24):
     assert produced[0].channels["room_temp"] == 24.4
 
 
+def test_dataset_replay_holds_one_descriptor_regardless_of_csv_count(tmp_path):
+    """CSVごとにsnapshotを開いたままにすると、長いarchiveでEMFILEになる。"""
+    directory = tmp_path / "archive"
+    directory.mkdir()
+    days = 64
+    for day in range(days):
+        stamp = f"2026-08-24T{day // 60:02d}:{day % 60:02d}:00"
+        (directory / f"sensors_{day:03d}.csv").write_text(
+            f"{HEADER}\n{stamp},24.4,56.2,24.12,24.94,23.56,23.75,23.94\n",
+            encoding="utf-8",
+        )
+    before = len(os.listdir("/dev/fd"))
+
+    replay = source(directory, dataset_provenance=True)
+    held = len(os.listdir("/dev/fd")) - before
+    produced = samples(replay)
+
+    assert held <= 1
+    assert len(produced) == days
+    assert replay.source_sha256 == replay_sha256(directory)
+
+
 def test_replay_fingerprint_rejects_a_fifo_without_blocking(tmp_path):
     fifo = tmp_path / "replay.csv"
     os.mkfifo(fifo)
