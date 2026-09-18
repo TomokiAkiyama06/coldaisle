@@ -366,6 +366,9 @@ class ControlState(_Frozen):
         if self.fallback_reason is not None and not self.fallback_active:
             raise ValueError("Fallback でない tick に fallback_reason を付けない")
 
+        # MAX は AUTO の上に重ねる forced_max overrideだが、0028 §2.5(c)で
+        # Learned MPCをactiveにできるmodeはAUTOだけ。MAX中のcounterfactualな
+        # Learned提案はactive controllerとは別に記録する。
         ml_could_run = (
             self.operating_mode is OperatingMode.AUTO
             and self.authority_stage is not AuthorityStage.SHADOW

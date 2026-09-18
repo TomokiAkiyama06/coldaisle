@@ -11,7 +11,7 @@ CIがそれを強制する。
 ## やること
 - [ ] `.github/workflows/ci.yml`
 - [ ] Python 3.12 / uv セットアップ
-- [ ] `ruff check` → `ruff format --check` → `mypy src` → `pytest -k "not hardware"`
+- [ ] `ruff check` → `ruff format --check` → `mypy src` → `pytest -m "not hardware"`
 - [ ] カバレッジ計測（`pytest-cov`）と70%閾値
 - [ ] PRに対してのみ実行、`main` へのpushでも実行
 
