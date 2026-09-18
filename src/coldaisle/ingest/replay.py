@@ -397,13 +397,15 @@ class ReplaySource:
 
 
 def _header_collisions(fields: list[str]) -> int:
-    """読む列（channelと時刻）のうち、同じ名前へ正規化される見出しの余剰数。
+    """読む列（channelと時刻）のうち、1つの値へ潰れる見出しの余剰数。
 
+    同じ名前へ正規化される見出しに加え、`timestamp,ts`のように時刻の別名が複数ある
+    場合も数える。時刻は先に見つかった1列だけを使うため、残りの列は黙って失われる。
     対応表に無い列同士の重複は値を読まないため失うものが無く、数えない。
     """
-    relevant = set(SAMPLE_CHANNELS) | set(TIMESTAMP_COLUMNS)
-    names = [name for name in fields if name in relevant]
-    return len(names) - len(set(names))
+    channels = [name for name in fields if name in SAMPLE_CHANNELS]
+    stamps = [name for name in fields if name in TIMESTAMP_COLUMNS]
+    return (len(channels) - len(set(channels))) + max(len(stamps) - 1, 0)
 
 
 def _to_float(value: str | None) -> float | None:

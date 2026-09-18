@@ -483,6 +483,8 @@ def test_malformed_rows_and_unparsed_cells_are_counted_but_streamed(tmp_path):
         "timestamp,room,room_temp,gpu_intake",
         "timestamp,room_temp,room_temp,gpu_intake",
         "timestamp,Room Temp,room-temp,gpu_intake",
+        "timestamp,ts,room_temp,gpu_intake",
+        "Time,datetime,room_temp,gpu_intake",
     ],
 )
 def test_header_collisions_are_counted_once_per_file(tmp_path, header):

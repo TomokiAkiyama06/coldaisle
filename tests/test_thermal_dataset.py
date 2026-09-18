@@ -1232,3 +1232,21 @@ def test_builder_accepts_every_control_tick_schema_version(dataset_store, versio
         assert example.context.regime_confidence == pytest.approx(0.75)
     else:
         assert example.context.workload_regime is None
+
+
+def test_second_timestamp_alias_marks_the_dataset_replay_incomplete(tmp_path, rules):
+    """`timestamp,ts`では先の1列だけを時刻に使い、もう1列を黙って捨てる。"""
+    lines = [
+        "timestamp,ts,room_temp,gpu_intake,gpu_exhaust",
+        *[
+            f"1970-01-01T00:00:{second:02d},1970-01-01T00:01:{second:02d},20,30,40"
+            for second in range(5)
+        ],
+    ]
+    store, stats = _ingest_dataset_replay(tmp_path, rules, lines)
+    try:
+        assert stats.samples == 5, "取り込みは続ける"
+        assert stats.dataset_incomplete
+        assert not store.dataset_source_run_completed()
+    finally:
+        store.close()

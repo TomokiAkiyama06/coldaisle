@@ -78,7 +78,7 @@ source → normalizer → storeの各段で、CSVにあったのにDBへ届か�
 | Replay | 時刻が空・読めない行（`dropped_rows`） | 数える |
 | Replay | 列数がheaderと合わない行（`malformed_rows`。余りは捨て、不足は欠測） | 数える |
 | Replay | 空欄でないのに数値として読めないcell（`unparsed_cells`） | 数える |
-| Replay | 同じ列へ正規化される見出し（例: `room`と`room_temp`。後の列だけが残る。`header_collisions`） | 数える |
+| Replay | 同じ列へ正規化される見出し（例: `room`と`room_temp`。後の列だけが残る）と、複数の時刻列（例: `timestamp,ts`。先の1列だけを使う）。`header_collisions` | 数える |
 | daemon | 待ち行列の溢れ（`queue_drops`。dataset modeはbackpressureで起きない） | 数える |
 | daemon | 正規化・保存の例外で捨てたsample（`discarded`） | 数える |
 | normalizer | 対応表に無いchannel（`unknown_channels`） | 数える |
