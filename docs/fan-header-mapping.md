@@ -43,3 +43,18 @@ Rear 743 / Front 690 RPM で、上表と整合する。
 
 下限候補は #75 / #77 の profile と `safety.yaml` の最低安全 Demand の検討材料であり、
 承認済みの Safety 値ではない。
+
+## 温度（2026-09-18 に実機で読み取り、同日に所有者が承認）
+
+| driver | label | metric | 状態 | 2026-09-18 の読み取り値 |
+|---|---|---|---|---:|
+| `asusec` | `CPU Package` | `cpu.package` | 有効 | 49 °C |
+| `asusec` | `VRM` | `cpu.vrm` | 有効 | 48 °C |
+| `nct6799` | `PCH_CHIP_TEMP` | `board.chipset` | **無効** | 0 °C |
+
+温度は label で指定する（`hwmonN` と `tempN` の番号は使わない）。
+
+`board.chipset` の対応は所有者が承認したが、`nct6799` の `PCH_CHIP_TEMP` は
+`PCH_CHIP_CPU_MAX_TEMP` / `PCH_CPU_TEMP` と同じく常に 0 °C を返した。未配線か driver の未対応とみられる。
+有効にすると 0 °C が `ok` として保存されるため（取得不能値を 0 で正常値扱いしない原則）、
+実値を返す入力が確認できるまで無効にしている。
