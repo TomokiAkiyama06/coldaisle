@@ -37,7 +37,8 @@ Productionとして暗黙loadすることはない。`mark_validated()` はoffli
 
 `registry.json` はartifact本体と分離したProduction pointer、全artifactのlifecycle、監査eventを
 1つのversioned snapshotとして持つ。更新はfilesystem lock内で一時ファイルをfsyncし、
-`os.replace()` で原子的に切り替える。管理操作には `expected_revision` を渡すため、同じ状態を
+`os.replace()` で原子的に切り替える。registry root・artifact directoryを新規作成した場合も、
+配下へ進む前に親directoryをfsyncし、crash後にdirectory entryだけが失われないようにする。管理操作には `expected_revision` を渡すため、同じ状態を
 見て行った二重promotionの一方は `ConcurrentUpdateError` になり、後勝ちで判断を上書きしない。
 root配下のdirectory・lock・snapshot・artifactは`openat`相当の`dir_fd`と`O_NOFOLLOW`で開き、
 symlinkまたは非regular fileを拒否する。artifact IDから組み立てたpathでroot外を読み書きしない。

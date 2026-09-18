@@ -446,6 +446,49 @@ def test_pickle_and_framework_native_formats_are_not_in_the_schema() -> None:
             ArtifactMetadata.model_validate(invalid)
 
 
+def test_each_created_directory_is_fsynced_in_its_parent_before_descending(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[tuple[str, int, str]] = []
+    real_mkdir = os.mkdir
+    real_fsync = os.fsync
+
+    def recording_mkdir(path: str, mode: int = 0o777, *, dir_fd: int | None = None) -> None:
+        assert dir_fd is not None
+        real_mkdir(path, mode, dir_fd=dir_fd)
+        events.append(("mkdir", os.fstat(dir_fd).st_ino, path))
+
+    def recording_fsync(fd: int) -> None:
+        real_fsync(fd)
+        events.append(("fsync", os.fstat(fd).st_ino, ""))
+
+    monkeypatch.setattr(registry_module.os, "mkdir", recording_mkdir)
+    monkeypatch.setattr(registry_module.os, "fsync", recording_fsync)
+    registry = ModelRegistry(tmp_path / "new-parent" / "registry", SimulatedClock(NOW_MS))
+
+    registry.register_candidate(
+        metadata("1.0.0"),
+        payload("1.0.0"),
+        actor="trainer",
+        reason="training completed",
+    )
+
+    created = [name for kind, _, name in events if kind == "mkdir"]
+    assert created == [
+        "new-parent",
+        "registry",
+        "artifacts",
+        "thermal_model",
+        "rack-thermal",
+        "1.0.0",
+    ]
+    for index, (kind, parent_inode, _) in enumerate(events):
+        if kind == "mkdir":
+            # The new entry must be durable in its parent before anything is created inside.
+            assert events[index + 1] == ("fsync", parent_inode, "")
+
+
 def test_invalid_json_artifact_is_never_registered(tmp_path: Path) -> None:
     body = b"not-json"
     registry = ModelRegistry(tmp_path / "registry", SimulatedClock(NOW_MS))

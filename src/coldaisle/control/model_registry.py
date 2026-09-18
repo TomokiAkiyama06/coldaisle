@@ -997,8 +997,14 @@ class ModelRegistry:
                         raise
                     # Another registry process may have created this component.  The
                     # no-follow open below still decides whether it is safe to use.
-                    with suppress(FileExistsError):
+                    try:
                         os.mkdir(part, 0o700, dir_fd=current_fd)
+                    except FileExistsError:
+                        pass
+                    else:
+                        # The directory entry lives in the parent; without this fsync a
+                        # crash can drop it even after an artifact / snapshot fsync inside.
+                        os.fsync(current_fd)
                     child_fd = os.open(part, flags, dir_fd=current_fd)
                 except OSError as exc:
                     raise UnsafeRegistryPathError(
