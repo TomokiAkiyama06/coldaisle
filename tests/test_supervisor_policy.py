@@ -576,7 +576,8 @@ def test_decision_can_be_embedded_in_v3_control_trace_with_shadow_output() -> No
         supervisor=decision,
     )
 
-    assert tick.schema_version == 3
+    # v3 で Supervisor decision を追加した。以後の版（v4: #78 の fault code）でもそのまま載る。
+    assert tick.schema_version >= 3
     assert tick.supervisor is decision
     assert tick.supervisor.shadow is not None
     with pytest.raises(ValidationError, match="schema version 3"):

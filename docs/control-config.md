@@ -21,6 +21,10 @@ BIOS制御のまま終了、特定済みなら安全側へ引継ぎ）へ接続�
 `telemetry.t_sensor.enabled` は温度計モジュールの未設置を明示する。`false` のときは
 T_SENSORのstale判定を持たず、`true` にするには `confirmed` と承認根拠、および許容遅延が必要である。
 有効化も再起動時にだけ反映する。
+`stall_check_min_demand` / `stall_min_rpm` / `stall_window_ms` と
+`write_fail_emergency_after` も `safety.yaml` の承認対象とし、stallや連続書き込み失敗の
+判定値をコードに埋め込まない。`stall_check_min_demand` は zone の最低安全 demand
+以下でなければ設定検証で拒否し、通常の安全 floor で回っている fan も監視対象にする。
 `fan-policy.yaml` は、MPCの `period_ms`・`budget_ms`・`valid_ms`、Supervisorの
 `period_ms`・`valid_ms` を持つ。期限は制御デーモンが受信時刻から単調時計で判定する。
 Fallback v2 の shape に Reactive Guard の閾値バンドを追加した
@@ -89,6 +93,12 @@ control loopがworkerへ渡した元snapshotのローカル単調時刻から `s
 現行 Control Config v5 は設定の live reload を行わない。設定変更は候補全体を別オブジェクトで検証したうえで
 **次回再起動時**にだけ反映する。これにより、変更後の設定も必ず `STARTUP` の Max を通る。
 `trace_metadata()` は、採用されたsource名・schema version・SHA-256を #82 の decision traceへ渡す。
+
+#78 で Safety Config に `stall_check_min_demand`・`write_fail_emergency_after`・
+`cpu_power_cooling_floor`（`power_w` / `demand` の曲線）・`telemetry.cpu_power_ms` を
+必須追加したため、`safety.yaml` は schema version 2 とする。
+version 1 を version 2 の意味で読まず、起動時に明示的に拒否する。安全値に default を
+補う migration は行わず、全項目を provisional / confirmed の根拠付きで設定してから再起動する。
 `provisional_values()` は起動時の構造化ログへ、暫定値そのものを露出せずに位置と根拠だけを渡す。
 
 数値の確定や実機での書き込み許可は決定記録 0028 §2.8–2.9 に従い、所有者の承認を要する。

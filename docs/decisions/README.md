@@ -103,6 +103,7 @@ docs/decisions/NNNN-<slug>.md      例: 0002-metric-naming.md
 | [0031](0031-thermal-dataset-contract.md) | Thermal Dataset v1 の時刻対応と再生成契約 | FINAL |
 | [0032](0032-internal-telemetry-metric-names.md) | Internal Telemetry のメトリクス名 | FINAL |
 | [0033](0033-air-balance-config-boundary.md) | Air Balance characterization の設定境界 | FINAL |
+| [0034](0034-unavailable-fan-tach-safety.md) | 制御対象 Fan の tach 読み取り不能を Safety fault にする | FINAL |
 | [0036](0036-transient-cpu-gpu-regime.md) | Workload Regime に TRANSIENT_CPU_GPU を加える | FINAL |
 | [0037](0037-model-registry-rollback-target.md) | Model Registry の promotion 時の rollback target | Proposed |
 | [0038](0038-internal-telemetry-outage-counting.md) | Internal Telemetry の欠測の数え方（有効な間の停止は欠測、無効期間は数えない） | FINAL |
