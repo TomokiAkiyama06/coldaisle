@@ -290,7 +290,8 @@ def _window_frame(
         values[metric] = point.value
         source_times[metric] = point.ts_ms
         qualities[metric] = point.quality
-        missing[metric] = point.value is None or point.quality is Quality.MISSING
+        # 値の無いsuspect（非有限値）もmissingと同じく使えない観測としてmaskする
+        missing[metric] = point.value is None
         stale[metric] = point.quality is Quality.STALE or ts_ms - point.ts_ms >= spec.stale_after_ms
     return WindowFrame(
         ts_ms=ts_ms,
@@ -332,7 +333,8 @@ def _target_frame(
         values[metric] = point.value
         source_times[metric] = point.ts_ms
         qualities[metric] = point.quality
-        missing[metric] = point.value is None or point.quality is Quality.MISSING
+        # 値の無いsuspect（非有限値）もmissingと同じく使えない観測としてmaskする
+        missing[metric] = point.value is None
     return TargetFrame(
         horizon_ms=horizon_ms,
         expected_ts_ms=expected_ts_ms,

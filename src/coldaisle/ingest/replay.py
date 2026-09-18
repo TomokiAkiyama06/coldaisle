@@ -223,6 +223,8 @@ class ReplaySource:
         """列数がheaderと合わない行数。**行は流す**が、欠けた列は欠測・余った列は捨てている。"""
         self.unparsed_cells = 0
         """空欄ではないのに数値として読めず欠測にしたcell数。"""
+        self.header_collisions = 0
+        """同じ列名に正規化される見出しの重複数（fileごとに1回数える）。後の列だけが残る。"""
         self._clock = SimulatedClock(self._first_timestamp_ms())
 
     @property
@@ -248,6 +250,7 @@ class ReplaySource:
             "dropped_rows": self.dropped_rows,
             "malformed_rows": self.malformed_rows,
             "unparsed_cells": self.unparsed_cells,
+            "header_collisions": self.header_collisions,
         }
 
     @property
@@ -308,6 +311,15 @@ class ReplaySource:
                 stamp_column = next((name for name in TIMESTAMP_COLUMNS if name in fields), None)
                 if stamp_column is None:
                     raise ValueError(f"時刻の列が見つからない: {path}（候補: {TIMESTAMP_COLUMNS}）")
+                collisions = _header_collisions(fields)
+                if report and collisions:
+                    # `room`と`room_temp`のように同じ列へ正規化される見出しは、dictにすると
+                    # 後の列だけが残り前の列の値を黙って失う。取り込みは続け、数えて記録する
+                    self.header_collisions += collisions
+                    LOGGER.warning(
+                        "同じ列に正規化される見出しが重複している。後の列だけを使う",
+                        extra={logs.FIELDS_KEY: {"file": path.name, "collisions": collisions}},
+                    )
                 for line, raw_row in enumerate(reader, start=2):
                     # DictReaderは余った列をkey None、足りない列をvalue Noneで表す。
                     # 空欄（""）とは区別できるので、書式の壊れた行として数える
@@ -382,6 +394,16 @@ class ReplaySource:
         if len(stamps) < 2 or stamps[1] <= stamps[0]:
             return NOMINAL_INTERVAL_MS
         return stamps[1] - stamps[0]
+
+
+def _header_collisions(fields: list[str]) -> int:
+    """読む列（channelと時刻）のうち、同じ名前へ正規化される見出しの余剰数。
+
+    対応表に無い列同士の重複は値を読まないため失うものが無く、数えない。
+    """
+    relevant = set(SAMPLE_CHANNELS) | set(TIMESTAMP_COLUMNS)
+    names = [name for name in fields if name in relevant]
+    return len(names) - len(set(names))
 
 
 def _to_float(value: str | None) -> float | None:

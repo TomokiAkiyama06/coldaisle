@@ -469,4 +469,45 @@ def test_malformed_rows_and_unparsed_cells_are_counted_but_streamed(tmp_path):
     produced = samples(replay)
 
     assert len(produced) == 3
-    assert replay.losses == {"dropped_rows": 0, "malformed_rows": 2, "unparsed_cells": 1}
+    assert replay.losses == {
+        "dropped_rows": 0,
+        "malformed_rows": 2,
+        "unparsed_cells": 1,
+        "header_collisions": 0,
+    }
+
+
+@pytest.mark.parametrize(
+    "header",
+    [
+        "timestamp,room,room_temp,gpu_intake",
+        "timestamp,room_temp,room_temp,gpu_intake",
+        "timestamp,Room Temp,room-temp,gpu_intake",
+    ],
+)
+def test_header_collisions_are_counted_once_per_file(tmp_path, header):
+    """同じ列へ正規化される見出しは、後の列だけが残る。流しつつ数える。"""
+    path = tmp_path / "collide.csv"
+    path.write_text(
+        f"{header}\n2026-08-24T00:00:00,19,20,30\n2026-08-24T00:00:03,19,21,31\n",
+        encoding="utf-8",
+    )
+    replay = ReplaySource(path, tz=JST, sleep=no_sleep)
+
+    produced = samples(replay)
+
+    assert [sample.channels["room_temp"] for sample in produced] == [20.0, 21.0]
+    assert replay.header_collisions == 1
+
+
+def test_unmapped_duplicate_headers_are_not_collisions(tmp_path):
+    path = tmp_path / "unmapped.csv"
+    path.write_text(
+        "timestamp,room_temp,vrm,vrm\n2026-08-24T00:00:00,20,1,2\n",
+        encoding="utf-8",
+    )
+    replay = ReplaySource(path, tz=JST, sleep=no_sleep)
+
+    samples(replay)
+
+    assert replay.header_collisions == 0

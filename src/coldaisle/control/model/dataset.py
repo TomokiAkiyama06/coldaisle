@@ -110,6 +110,28 @@ class SourceRun(_Frozen):
         return self
 
 
+VALUELESS_QUALITIES = frozenset({Quality.MISSING, Quality.SUSPECT})
+"""観測時刻を持つのに値が無くてよいquality。
+
+`missing`は欠測。`suspect`は非有限値（`inf`等）のように値を保存できない疑わしい観測で、
+決定記録 0003 §2.8により値は落としqualityだけを残す。どちらも学習には使えないため
+`missing_mask=true`とする。値のある`suspect`（範囲外等）は`missing_mask=false`のまま。
+"""
+
+
+def _check_observed_cell(value: float | None, quality: Quality, missing: bool, where: str) -> None:
+    """観測時刻を持つcellの value / quality / missing_mask の整合を検証する。
+
+    `missing_mask`は「値が使えない」ことを表し、`value is None`と同値にする。
+    """
+    if missing != (value is None):
+        raise ValueError(f"{where}のmissing_maskはvalue=nullと一致しなければならない")
+    if value is None and quality not in VALUELESS_QUALITIES:
+        raise ValueError(f"{where}でvalue=nullにできるのはquality=missing/suspectだけ")
+    if quality is Quality.MISSING and value is not None:
+        raise ValueError(f"{where}のquality=missingはvalue=nullでなければならない")
+
+
 class WindowFrame(_Frozen):
     """window 内の1時点。値は直近観測をas-ofで保持し、元時刻とmaskを併記する。"""
 
@@ -143,10 +165,7 @@ class WindowFrame(_Frozen):
                 continue
             if quality is None:
                 raise ValueError("観測時刻を持つcellにはqualityが要る")
-            if (value is None) != (quality is Quality.MISSING):
-                raise ValueError("window cellのvalueとquality=missingが一致しない")
-            if missing != (quality is Quality.MISSING):
-                raise ValueError("window cellのmissing_maskがvalue/qualityと一致しない")
+            _check_observed_cell(value, quality, missing, "window cell")
             if quality is Quality.STALE and not stale:
                 raise ValueError("quality=staleのcellはstale_maskを立てる")
         return self
@@ -177,10 +196,7 @@ class TargetFrame(_Frozen):
                 continue
             if quality is None:
                 raise ValueError("観測時刻を持つtargetにはqualityが要る")
-            if (value is None) != (quality is Quality.MISSING):
-                raise ValueError("target cellのvalueとquality=missingが一致しない")
-            if missing != (quality is Quality.MISSING):
-                raise ValueError("target cellのmissing_maskがvalue/qualityと一致しない")
+            _check_observed_cell(value, quality, missing, "target cell")
         return self
 
 

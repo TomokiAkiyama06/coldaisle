@@ -42,7 +42,11 @@ schemaの意味を変える場合は`schema_version`を上げ、既存artifact�
 
 maskは単なる補助列にせず、値・quality・元観測時刻との整合をschemaで検証する。
 未観測cellは値・quality・元時刻を持たず`missing=true`、`stale=false`とする。
-観測時刻があるcellでは`quality=missing`と`value=null`が同値でなければならない。
+観測時刻があるcellでは、`missing_mask`は「値が使えない」ことを表し`value=null`と同値にする。
+`value=null`を許すqualityは`missing`（欠測）と`suspect`（`inf`等の非有限値。決定記録
+0003 §2.8により値を落としqualityだけ残す）に限り、`quality=missing`なら必ず`value=null`とする。
+値のある`suspect`（範囲外等）は`missing_mask=false`のまま残す。builderは値の無いsuspectを、
+windowではmaskしたcellとして保持し、targetでは欠測と同じく使えない教師値として扱う。
 各metricの元観測時刻はwindow / target内で逆行させず、frame、期待時刻、元観測時刻を
 すべてsource run期間内に限定する。
 
@@ -89,7 +93,7 @@ INSERT / UPDATE / DELETEを拒否する完了の印`dataset_source_run_complete`
 （bind前のINSERTも拒否する）。SIGTERM / SIGINT等で途中停止したrun、および1件でも取りこぼしの
 あったrunには印を付けず、`coldaisle-daemon`は非0で終了する。1件の失敗で取り込みループを
 落とさない方針は変えず、完了の判定だけで弾く。取りこぼしとして数えるのは、Replayの
-時刻が読めない行・列数の合わない行・数値として読めない非空cell、daemonの待ち行列溢れと
+時刻が読めない行・列数の合わない行・数値として読めない非空cell・同じ列へ正規化される見出しの重複、daemonの待ち行列溢れと
 例外で捨てたsample、normalizerの未知channelとseqの飛び、storeの重複で書かなかった行である。
 header行・空行・空欄（欠測として保存）・対応表に無い列・非有限値（qualityとして保存）は
 入力hashに含まれ同じbytesから同じDBになるため数えない（一覧は`docs/thermal-dataset.md`）。

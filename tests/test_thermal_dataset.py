@@ -179,14 +179,25 @@ def test_corrupt_masks_and_regime_context_are_rejected_when_loading_artifact(dat
     with pytest.raises(ValidationError, match="workload_regime"):
         ThermalDataset.model_validate_json(json.dumps(unknown_regime))
 
+    value_with_missing_mask = dataset.model_dump(mode="json")
+    value_with_missing_mask["examples"][0]["window"][1]["values"]["air.gpu_intake"] = 42.0
+    with pytest.raises(ValidationError, match="missing_maskはvalue=null"):
+        ThermalDataset.model_validate_json(json.dumps(value_with_missing_mask))
+
     value_with_missing_quality = dataset.model_dump(mode="json")
-    value_with_missing_quality["examples"][0]["window"][1]["values"]["air.gpu_intake"] = 42.0
-    with pytest.raises(ValidationError, match="valueとquality=missing"):
+    window_cell = value_with_missing_quality["examples"][0]["window"][1]
+    window_cell["values"]["air.gpu_intake"] = 42.0
+    window_cell["missing_mask"]["air.gpu_intake"] = False
+    with pytest.raises(ValidationError, match="quality=missingはvalue=null"):
         ThermalDataset.model_validate_json(json.dumps(value_with_missing_quality))
 
     missing_value_with_ok_quality = dataset.model_dump(mode="json")
-    missing_value_with_ok_quality["examples"][0]["targets"][0]["values"]["air.gpu_exhaust"] = None
-    with pytest.raises(ValidationError, match="valueとquality=missing"):
+    target_cell = missing_value_with_ok_quality["examples"][0]["targets"][0]
+    target_cell["values"]["air.gpu_exhaust"] = None
+    with pytest.raises(ValidationError, match="missing_maskはvalue=null"):
+        ThermalDataset.model_validate_json(json.dumps(missing_value_with_ok_quality))
+    target_cell["missing_mask"]["air.gpu_exhaust"] = True
+    with pytest.raises(ValidationError, match="missing/suspectだけ"):
         ThermalDataset.model_validate_json(json.dumps(missing_value_with_ok_quality))
 
     outside_run = dataset.model_dump(mode="json")
@@ -1002,3 +1013,56 @@ def test_daemon_cli_exits_non_zero_when_a_replay_row_is_dropped(tmp_path):
     )
 
     assert code == 1
+
+
+def test_non_finite_cells_survive_replay_and_build_as_masked_suspect(tmp_path, rules):
+    """`inf`は値を落として`quality=suspect`で保存される。1件でbuild全体を落とさない。
+
+    windowでは値の無いsuspect cellとしてmaskし、targetでは欠測と同じく使えない値とする。
+    """
+    rows = [f"1970-01-01T00:00:{second:02d},20,30,40" for second in range(13)]
+    rows[4] = "1970-01-01T00:00:04,inf,30,40"
+    rows[7] = "1970-01-01T00:00:07,20,30,-inf"
+    store, stats = _ingest_dataset_replay(tmp_path, rules, [_CLEAN_HEADER, *rows])
+    try:
+        assert not stats.dataset_incomplete, "非有限値は取りこぼしではない"
+        ControlTraceLogger(store).record(fixture_tick(ts_ms=5_000))
+        run = SourceRun(
+            run_id=RUN_ALIAS,
+            kind=DatasetSourceKind.REPLAY,
+            start_ms=0,
+            end_ms=13_000,
+            source_refs=(SOURCE_ALIAS,),
+            source_sha256=replay_fingerprint(tmp_path / "replay.csv"),
+        )
+        dataset = ThermalDatasetBuilder(store).build(source_run=run, spec=spec())
+    finally:
+        store.close()
+
+    (example,) = dataset.examples
+    window_cell = next(frame for frame in example.window if frame.ts_ms == 4_000)
+    assert window_cell.values["air.room"] is None
+    assert window_cell.quality["air.room"] is Quality.SUSPECT
+    assert window_cell.missing_mask["air.room"] is True
+    target = next(frame for frame in example.targets if frame.horizon_ms == 2_000)
+    assert target.source_ts_ms["air.gpu_exhaust"] == 7_000
+    assert target.values["air.gpu_exhaust"] is None
+    assert target.quality["air.gpu_exhaust"] is Quality.SUSPECT
+    assert target.missing_mask["air.gpu_exhaust"] is True
+    # artifactとして読み戻しても同じ検証を通る
+    assert ThermalDataset.model_validate_json(dataset.model_dump_json()) == dataset
+
+
+def test_header_collision_marks_the_dataset_replay_incomplete(tmp_path, rules):
+    """`room`と`room_temp`は同じ列になり、前の列の値を黙って失う。"""
+    lines = [
+        "timestamp,room,room_temp,gpu_intake,gpu_exhaust",
+        *[f"1970-01-01T00:00:{second:02d},19,20,30,40" for second in range(5)],
+    ]
+    store, stats = _ingest_dataset_replay(tmp_path, rules, lines)
+    try:
+        assert stats.samples == 5, "取り込みは続ける"
+        assert stats.dataset_incomplete
+        assert not store.dataset_source_run_completed()
+    finally:
+        store.close()

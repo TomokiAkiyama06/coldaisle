@@ -78,6 +78,7 @@ source → normalizer → storeの各段で、CSVにあったのにDBへ届か�
 | Replay | 時刻が空・読めない行（`dropped_rows`） | 数える |
 | Replay | 列数がheaderと合わない行（`malformed_rows`。余りは捨て、不足は欠測） | 数える |
 | Replay | 空欄でないのに数値として読めないcell（`unparsed_cells`） | 数える |
+| Replay | 同じ列へ正規化される見出し（例: `room`と`room_temp`。後の列だけが残る。`header_collisions`） | 数える |
 | daemon | 待ち行列の溢れ（`queue_drops`。dataset modeはbackpressureで起きない） | 数える |
 | daemon | 正規化・保存の例外で捨てたsample（`discarded`） | 数える |
 | normalizer | 対応表に無いchannel（`unknown_channels`） | 数える |
@@ -92,7 +93,8 @@ source → normalizer → storeの各段で、CSVにあったのにDBへ届か�
 - 対応表に無い列（例: `vrm_temp`）: dataset契約の外。Replayは既知channelだけを読む
   （決定記録 0010）
 - 非有限値: `nan`は欠測（`quality=missing`）、`inf`は値を保存せず`quality=suspect`として残る
-  （決定記録 0003 §2.8）
+  （決定記録 0003 §2.8）。datasetでは`value=null`・`missing_mask=true`のsuspect cellになる
+- 対応表に無い列同士の見出し重複: その列は読まないため失う値が無い
 
 ```bash
 uv run coldaisle-daemon \
