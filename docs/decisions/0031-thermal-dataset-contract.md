@@ -81,6 +81,14 @@ provenanceを有効にしたReplaySourceはconstructorでCSV集合を1回だけ�
 eager hash / snapshotを行わない。dataset CLIが後でlive pathを再hashしてsnapshot hashと
 異なれば、builderはDB provenance不一致としてfail closedにする。
 
+bindは入力全体のhashを取り込み開始前に固定するため、途中で止まったrunのDBは入力の
+先頭だけを持つ。そこでdataset Replayは、待ち行列が溢れてもsampleを捨てずに待ち
+（backpressure）、`max_samples`による途中停止を拒否する。入力をEOFまで取り込めたときだけ、
+singletonかつtriggerで2回目のINSERT / UPDATE / DELETEを拒否する完了の印
+`dataset_source_run_complete`をDBへ記録する（bind前のINSERTも拒否する）。SIGTERM / SIGINT等で
+途中停止したrunには印を付けず、`coldaisle-daemon`は非0で終了する。builderは完了の印が無い
+DBを拒否する。途中停止したDBは破棄し、新しいDBで取り込み直す。
+
 同一のTelemetryとControlTick traceをSQLiteへ入れれば、同じmanifest / examplesを
 生成する。旧来のセンサーCSVにはFan actionが無いため、CSV単体から過去のactionを
 復元できるとはみなさない。Control EngineがReplay中に生成したtrace、または同じrunで
