@@ -1,0 +1,41 @@
+schema_version: 1
+model_id: provisional-air-balance
+source:
+  status: uncalibrated
+  basis: >-
+    Software-only EFU shape for Mock/Replay validation. Replace every curve, balance band,
+    and thermal limit with the installed-system characterization from #75 before authority.
+flow_unit: efu
+
+# Values below are deliberately unitless, provisional EFU values. They are neither
+# manufacturer CFM nor measurements of the installed case.
+zones:
+  front:
+    points:
+      - {demand: 0.0, airflow_index: 0.0, effective_flow: 0.0}
+      - {demand: 0.5, airflow_index: 0.4, effective_flow: 2.0}
+      - {demand: 1.0, airflow_index: 1.0, effective_flow: 5.0}
+  rear:
+    points:
+      - {demand: 0.0, airflow_index: 0.0, effective_flow: 0.0}
+      - {demand: 0.5, airflow_index: 0.45, effective_flow: 1.35}
+      - {demand: 1.0, airflow_index: 1.0, effective_flow: 3.0}
+  top:
+    points:
+      - {demand: 0.0, airflow_index: 0.0, effective_flow: 0.0}
+      - {demand: 0.5, airflow_index: 0.35, effective_flow: 1.4}
+      - {demand: 1.0, airflow_index: 1.0, effective_flow: 4.0}
+
+# The target is configurable and intentionally not fixed at 1.0. These values are
+# uncalibrated software-validation inputs covered by source.status above.
+balance:
+  target_ratio: 0.9
+  minimum_ratio: 0.8
+  maximum_ratio: 1.05
+
+# These are state-classification limits, not Critical Safety ceilings.
+thermal_limits:
+  gpu_intake_c: 35.0
+  case_delta_c: 12.0
+  cpu_package_c: 80.0
+  gpu_temperature_c: 78.0
