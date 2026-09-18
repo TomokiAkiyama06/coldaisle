@@ -27,8 +27,11 @@ Model、Supervisor Policy、Feature Transform の artifact lifecycle をロー�
   正当なsnapshotは約18 byte/token、約52 token/audit eventで、token上限より先にbyte上限
   （約4,000 event）に達する。
 - 壊れたsnapshotの検証で、Pydanticが要素ごとにerrorを積み上げないようにする。error objectは
-  JSON tokenよりはるかに大きいためである。`audit` は `FailFast`、`artifacts` / `production` /
-  `hyperparameters` は最初の不正な要素で止まるvalidatorを通すので、error数は要素数に比例しない。
+  JSON tokenよりはるかに大きいためである。`RegistrySnapshot` から到達できるsequence / mapping
+  fieldはすべて、最初の不正な要素で止める。`audit` / `source_runs` / `authority_compatibility` は
+  `FailFast`、`artifacts` / `production` / `hyperparameters` はfail-fastのvalidatorを通すため、
+  error数は要素数に比例しない。新しいcontainer fieldを追加すると、model treeを走査するテストが
+  fail-fastの確認対象に加えるよう求める。
 - artifact payloadは `max_artifact_bytes`（現在8 MiB）を上限とし、登録時と読込時の両方で拒否する。読込は
   `open(O_NOFOLLOW | O_NONBLOCK)`した同じfdを`fstat()`してregular fileとsizeを先に確認し、
   preflight時のsize分とgrowth検出用1 byteだけを読む。FIFOで停止せず、読込中の短縮・拡張や

@@ -9,9 +9,10 @@ from concurrent.futures import ThreadPoolExecutor
 from hashlib import sha256
 from pathlib import Path
 from threading import Barrier, Event
+from typing import get_args, get_origin
 
 import pytest
-from pydantic import ValidationError
+from pydantic import BaseModel, ValidationError
 
 import coldaisle.control.model_registry as registry_module
 from coldaisle.clock import SimulatedClock
@@ -838,28 +839,72 @@ def test_snapshot_with_many_tiny_containers_is_rejected_before_pydantic(
             registry.inspect()
 
 
-@pytest.mark.parametrize(
-    "document",
-    [
-        snapshot_document(audit=[{}] * 1000),
-        snapshot_document(artifacts={f"k{i}": {} for i in range(1000)}),
-        snapshot_document(production={f"k{i}": {} for i in range(1000)}),
-        snapshot_document(
-            artifacts={
-                metadata("1.0.0").ref.key: {
-                    "metadata": metadata("1.0.0").model_dump(mode="json")
-                    | {"hyperparameters": {f"k{i}": {} for i in range(1000)}},
-                    "status": "candidate",
-                }
-            }
-        ),
-    ],
-    ids=["audit", "artifacts", "production", "hyperparameters"],
-)
-def test_corrupt_snapshot_reports_a_bounded_number_of_errors(document: bytes) -> None:
+def metadata_document(**overrides: object) -> bytes:
+    return json.dumps(metadata("1.0.0").model_dump(mode="json") | overrides).encode()
+
+
+BAD_MEMBERS = 1000
+# Every sequence / mapping field reachable from RegistrySnapshot, each filled with
+# BAD_MEMBERS invalid members and validated through the model that owns it.  Owning
+# models are validated directly: a parent that collapses a member's errors would still
+# have materialized all of them first.
+CONTAINER_FIELD_CASES: dict[str, tuple[type[BaseModel], bytes]] = {
+    "RegistrySnapshot.audit": (RegistrySnapshot, snapshot_document(audit=[{}] * BAD_MEMBERS)),
+    "RegistrySnapshot.artifacts": (
+        RegistrySnapshot,
+        snapshot_document(artifacts={f"k{i}": {} for i in range(BAD_MEMBERS)}),
+    ),
+    "RegistrySnapshot.production": (
+        RegistrySnapshot,
+        snapshot_document(production={f"k{i}": {} for i in range(BAD_MEMBERS)}),
+    ),
+    "ArtifactMetadata.source_runs": (
+        ArtifactMetadata,
+        metadata_document(source_runs=[1] * BAD_MEMBERS),
+    ),
+    "ArtifactMetadata.hyperparameters": (
+        ArtifactMetadata,
+        metadata_document(hyperparameters={f"k{i}": {} for i in range(BAD_MEMBERS)}),
+    ),
+    "ArtifactMetadata.authority_compatibility": (
+        ArtifactMetadata,
+        metadata_document(authority_compatibility=["bogus"] * BAD_MEMBERS),
+    ),
+}
+
+
+def reachable_container_fields() -> set[str]:
+    """Walk the snapshot model tree and name every sequence / mapping field."""
+    found: set[str] = set()
+    seen: set[type[BaseModel]] = set()
+    pending: list[type[BaseModel]] = [RegistrySnapshot]
+    while pending:
+        model = pending.pop()
+        if model in seen:
+            continue
+        seen.add(model)
+        for name, field in model.model_fields.items():
+            for annotation in (field.annotation, *get_args(field.annotation)):
+                for candidate in (annotation, *get_args(annotation)):
+                    if get_origin(candidate) in (tuple, list, dict, set, frozenset):
+                        found.add(f"{model.__name__}.{name}")
+                    for inner in (candidate, *get_args(candidate)):
+                        if isinstance(inner, type) and issubclass(inner, BaseModel):
+                            pending.append(inner)
+    return found
+
+
+def test_fail_fast_cases_cover_every_reachable_container_field() -> None:
+    assert reachable_container_fields() == set(CONTAINER_FIELD_CASES)
+
+
+@pytest.mark.parametrize("field_path", sorted(CONTAINER_FIELD_CASES))
+def test_corrupt_container_reports_a_bounded_number_of_errors(field_path: str) -> None:
     # Error objects cost far more than the JSON tokens; the count must not scale with them.
+    model, document = CONTAINER_FIELD_CASES[field_path]
+
     with pytest.raises(ValidationError) as caught:
-        RegistrySnapshot.model_validate_json(document)
+        model.model_validate_json(document)
 
     assert caught.value.error_count() <= 20
 

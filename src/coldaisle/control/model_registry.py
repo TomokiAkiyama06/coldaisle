@@ -155,7 +155,9 @@ class ArtifactMetadata(_Frozen):
     version: str = Field(pattern=_SEMVER_PATTERN, max_length=80)
     created_at: str = Field(min_length=1, max_length=64)
     training_dataset_version: str = Field(min_length=1, max_length=200)
-    source_runs: tuple[str, ...] = Field(min_length=1)
+    # Every sequence / mapping reachable from RegistrySnapshot stops at its first bad
+    # member (FailFast or a fail-fast validator); see RegistrySnapshot.audit.
+    source_runs: Annotated[tuple[str, ...], FailFast()] = Field(min_length=1)
     feature_schema_version: str = Field(min_length=1, max_length=120)
     target_schema_version: str = Field(min_length=1, max_length=120)
     code_commit: str | None = Field(default=None, min_length=7, max_length=100)
@@ -164,7 +166,7 @@ class ArtifactMetadata(_Frozen):
     hyperparameters: dict[str, HyperparameterValue]
     offline_evaluation_ref: str | None = Field(default=None, min_length=1, max_length=500)
     shadow_evaluation_ref: str | None = Field(default=None, min_length=1, max_length=500)
-    authority_compatibility: tuple[AuthorityStage, ...] = Field(min_length=1)
+    authority_compatibility: Annotated[tuple[AuthorityStage, ...], FailFast()] = Field(min_length=1)
 
     @field_validator("hyperparameters", mode="before")
     @classmethod
