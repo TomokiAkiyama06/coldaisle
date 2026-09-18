@@ -3,9 +3,13 @@
 - **種別**: Decision Record
 - **Status**: FINAL（2026-09-18、リポジトリ所有者が承認）
 - **Date**: 2026-09-18
-- **Supersedes**: [`0040-server-health-api.md`](0040-server-health-api.md) §2.4 のうち、
-  判定対象の metric・quality の扱い・source 状態の導出に関する部分のみ。§2.4 の
-  green / yellow / red の3段階、AI 停止と事象メトリクスの扱い、および 0040 の他の節は有効
+- **Supersedes**: [`0040-server-health-api.md`](0040-server-health-api.md) の次の部分のみ。
+  (1) §2.4 のうち、判定対象の metric・quality の扱い・source 状態の導出。§2.4 の
+  green / yellow / red の3段階、AI 停止と事象メトリクスの扱いは有効。
+  (2) §2.6 のうち、signal の判定対象を `config/server-health.yaml` だけで決めるとも読める
+  部分。判定対象には `config/internal-telemetry.yaml` で有効な入力も加わる（本記録 §2.2）。
+  監視必須 metric・パネル・`missing_tolerated` を `config/server-health.yaml` に置くことと、
+  §2.6 の他の項目は有効。0040 の他の節も有効
 - **関連**: [`0040-server-health-api.md`](0040-server-health-api.md) §2.4〜§2.6 /
   [`0009-read-api.md`](0009-read-api.md) §2.12 /
   [`0004-storage-read-contract.md`](0004-storage-read-contract.md) §2.8 /
@@ -57,8 +61,8 @@ metric の一覧であり、signal の判定対象を決めない。入力が無
 
 ### 2.4 source 状態の導出
 
-collector が報告した状態（`sys.telemetry_source.*`、sensor_unit は `sys.ingest_source`）を
-先に見る。
+nvml / lm_sensors は、collector が報告した状態（`sys.telemetry_source.nvml` /
+`sys.telemetry_source.hwmon`）を先に見る。
 
 | 報告状態 | 導出 |
 |---|---|
@@ -66,6 +70,13 @@ collector が報告した状態（`sys.telemetry_source.*`、sensor_unit は `sy
 | `unavailable` / `disabled` / `stopped` / 不正な値 | そのまま（不正な値は `unavailable`）。red |
 | `ok` / `degraded` で、有効な入力が1つも無い | 報告状態をそのまま使う |
 | `ok` / `degraded` で、入力がある | 下記の quality 規則 |
+
+**sensor_unit は例外とする。** `sys.ingest_source` は状態ではなく取り込み元の種別
+（`serial` / `mock` / `replay` など）であり、上の表の「不正な値」の規則を当てない。
+
+- `sys.ingest_source` が未記録または空文字 → `stopped`（red）
+- 空でない値が記録されていれば、値が何であっても報告状態 `ok` とみなし、下記の
+  quality 規則で監視必須 metric（`sources.sensor_unit.required`。設定で1本以上が必須）を評価する
 
 quality 規則では、`ok` と `suspect` を「値が届いている」、`stale` / `missing` / 未保存を
 「届いていない」とする。
