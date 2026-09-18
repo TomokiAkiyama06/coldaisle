@@ -372,3 +372,39 @@ def test_alerts_are_a_table_with_state_and_severity_in_words():
     assert '"alert-table"' in body
     assert "ALERT_STATE_LABEL" in body and "SEVERITY_LABEL" in body
     assert ".alert-table" in STYLES.read_text(encoding="utf-8")
+
+
+def test_the_banner_follows_stale_cards_from_the_stream():
+    """**WebSocket でカードが stale になったら、同じ応答で赤帯も出す。**
+
+    health の問い合わせは5秒ごと。health だけで赤帯を決めると、
+    赤いカードがあるのに文言が無い時間ができる（決定記録 0039 §2.3 は文言を赤帯に任せる）。
+    """
+    script = SCRIPT.read_text(encoding="utf-8")
+    apply = script[script.index("function applyLatest(") :]
+    apply = apply[: apply.index("\n}\n")]
+    assert "renderBanner()" in apply
+    banner = script[script.index("function renderBanner(") :]
+    banner = banner[: banner.index("\n}\n")]
+    assert "staleFromLatest(lastLatest)" in banner
+    helper = script[script.index("function staleFromLatest(") :]
+    assert 'item.quality === "stale"' in helper[: helper.index("\n}\n")]
+
+
+def test_a_late_catalog_rerenders_every_labelled_part():
+    """表示名の表が後から届いたら、**内部名を出していた箇所をすべて**描き直す。
+
+    カードと派生値だけだと、アラート・センサー構成・凡例に内部名が残る。
+    """
+    script = SCRIPT.read_text(encoding="utf-8")
+    load = script[script.index("async function loadCatalog()") :]
+    assert "rerenderAll()" in load[: load.index("\n}\n")]
+    rerender = script[script.index("function rerenderAll()") :]
+    rerender = rerender[: rerender.index("\n}\n")]
+    for call in (
+        "applyLatest(lastLatest)",
+        "renderAlerts(lastAlerts)",
+        "renderDevices(lastDevices)",
+    ):
+        assert call in rerender, f"{call} を描き直していない"
+    assert "drawCharts()" in rerender, "凡例（グラフ）を描き直していない"

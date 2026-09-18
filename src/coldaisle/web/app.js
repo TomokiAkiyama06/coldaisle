@@ -100,27 +100,54 @@ function renderDerived(latest) {
 }
 
 /**
+ * 最新値から見た「古さ」。**WebSocket で届いた品質と赤帯を食い違わせない。**
+ *
+ * カードは WebSocket（1秒ごと）で `stale` になるが、health の問い合わせは5秒ごと。
+ * health だけで赤帯を決めると、最大5秒「赤いカードがあるのに文言が無い」画面になる
+ * （決定記録 0039 §2.3 は、stale の文言を赤帯に任せている）。
+ * `stale` の判定は API 側で health と同じ（`_is_stale`）なので、新しいほうを使えばよい。
+ */
+function staleFromLatest(latest) {
+  const stale = latest.stale || Object.values(latest.metrics).some((item) => item.quality === "stale");
+  if (!stale) return { stale: false, seconds: null };
+  // 経過秒は温湿度の中でいちばん新しいもの。事象メトリクス（sys.*）は起きたときにしか書かれない
+  const ages = Object.entries(latest.metrics)
+    .filter(([metric]) => isCardMetric(metric))
+    .map(([, item]) => item.age_seconds)
+    .filter((age) => typeof age === "number" && age >= 0);
+  return { stale: true, seconds: ages.length ? Math.min(...ages) : null };
+}
+
+/**
  * 画面全体の警告。**データが古いときに黙らない。**
  * デーモンが止まっていることが一目で分かる状態にする（受入基準）。
+ *
+ * 「1件も無い」「未来」は health から、「古い」は**新しいほうの最新値**から決める。
+ * 最新値は WebSocket で health より先に届くため（staleFromLatest）。
  */
-function renderBanner(health) {
+function renderBanner() {
+  const health = lastHealth;
   const banner = document.getElementById("banner");
   const age = document.getElementById("age");
-  if (health.last_sample_ts_ms === null) {
+  const fromLatest = lastLatest ? staleFromLatest(lastLatest) : null;
+  const stale = fromLatest ? fromLatest.stale : Boolean(health && health.stale);
+  if (health && health.last_sample_ts_ms === null) {
     banner.textContent = "データが1件も届いていません。取り込みデーモンを確認してください。";
     banner.classList.remove("hidden");
-  } else if (health.data_age_seconds < 0) {
+  } else if (health && health.data_age_seconds < 0) {
     // 受信時刻が未来。時計のずれか、圧縮再生中の DB を見ている（決定記録 0007 §2.11）
     banner.textContent =
       "受信時刻が未来です。時計がずれているか、時間圧縮で再生中の DB を見ています。";
     banner.classList.remove("hidden");
-  } else if (health.stale) {
-    const seconds = Math.round(health.data_age_seconds);
-    banner.textContent = `データが古い（最終受信から ${seconds} 秒）。取り込みが止まっている可能性があります。`;
+  } else if (stale) {
+    const measured = fromLatest && fromLatest.seconds !== null ? fromLatest.seconds : health && health.data_age_seconds;
+    const seconds = typeof measured === "number" ? `（最終受信から ${Math.round(measured)} 秒）` : "";
+    banner.textContent = `データが古い${seconds}。取り込みが止まっている可能性があります。`;
     banner.classList.remove("hidden");
-  } else {
+  } else if (health) {
     banner.classList.add("hidden");
   }
+  if (!health) return;
   const source = health.source ? ` / ${health.source}` : "";
   if (health.data_age_seconds === null) age.textContent = "";
   else if (health.data_age_seconds < 0) age.textContent = `最終受信 未来${source}`;
@@ -332,8 +359,8 @@ async function loadHistory() {
 
   try {
     const [tempSeries, humiditySeries] = await Promise.all([load(temps), load(humidity)]);
-    drawChart("chart-temp", "legend-temp", tempSeries);
-    drawChart("chart-humidity", "legend-humidity", humiditySeries);
+    lastSeries = { temp: tempSeries, humidity: humiditySeries };
+    drawCharts();
     const used = tempSeries[0] || humiditySeries[0];
     note.textContent = used
       ? `粒度 ${used.agg}${used.downsampled ? "（点数の上限に合わせて粗くしました）" : ""}`
@@ -343,20 +370,43 @@ async function loadHistory() {
   }
 }
 
+// 最後に受け取った応答。**表示名の表が後から届いたときに描き直すため**に持つ
 let lastLatest = null;
+let lastHealth = null;
+let lastAlerts = null;
+let lastDevices = null;
+let lastSeries = null;
 let historyLoaded = false;
+
+function drawCharts() {
+  if (!lastSeries) return;
+  drawChart("chart-temp", "legend-temp", lastSeries.temp);
+  drawChart("chart-humidity", "legend-humidity", lastSeries.humidity);
+}
+
+/**
+ * 手元にある応答で全部を描き直す。表示名の表が届いた時点で呼ぶ。
+ * カードだけ描き直すと、**アラート・センサー構成・凡例に内部名が残る。**
+ */
+function rerenderAll() {
+  if (lastLatest) applyLatest(lastLatest);
+  if (lastAlerts) renderAlerts(lastAlerts);
+  if (lastDevices) renderDevices(lastDevices);
+  drawCharts();
+}
 
 function applyLatest(latest) {
   lastLatest = latest;
   renderCards(latest);
   renderDerived(latest);
+  renderBanner(); // カードが stale になったら、同じ応答で赤帯も出す（staleFromLatest）
 }
 
 /** 表示名の表を取る。失敗は握りつぶさず注記に出し、次の定期更新で取り直す。 */
 async function loadCatalog() {
   try {
     catalog = await fetchJson("/api/v1/metrics");
-    if (lastLatest) applyLatest(lastLatest); // 取れた時点で内部名を表示名に置き換える
+    rerenderAll(); // 取れた時点で、内部名を出していた箇所をすべて表示名に置き換える
   } catch (error) {
     document.getElementById("chart-note").textContent = `表示名を取得できません: ${error.message}`;
   }
@@ -384,9 +434,12 @@ async function refresh() {
       fetchJson("/api/v1/devices"),
     ]);
     applyLatest(latest);
-    renderBanner(health);
-    renderAlerts(alerts.alerts);
-    renderDevices(devices.devices);
+    lastHealth = health;
+    lastAlerts = alerts.alerts;
+    lastDevices = devices.devices;
+    renderBanner();
+    renderAlerts(lastAlerts);
+    renderDevices(lastDevices);
     if (!historyLoaded) {
       historyLoaded = true;
       loadHistory();
