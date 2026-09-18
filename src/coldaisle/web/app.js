@@ -122,12 +122,15 @@ function renderDerived(latest) {
  */
 function staleFromLatest(latest) {
   if (!latest.stale) return { stale: false, seconds: null };
-  // 経過秒も周期メトリクス（カードの air.*）から。事象メトリクスの経過は受信の古さではない
+  // 経過秒は **stale のカードの中でいちばん古いもの**。全カードの最小を取ると、
+  // 1枚だけ止まったときに正常なカードの「0 秒」が出て、止まっていないように読める。
+  // stale のカードが無い（カード外の周期メトリクスが原因）ときは秒数を出さない。
+  // 事象メトリクスの経過は受信の古さではないので使わない
   const ages = Object.entries(latest.metrics)
-    .filter(([metric]) => isCardMetric(metric))
+    .filter(([metric, item]) => isCardMetric(metric) && item.quality === "stale")
     .map(([, item]) => item.age_seconds)
     .filter((age) => typeof age === "number" && age >= 0);
-  return { stale: true, seconds: ages.length ? Math.min(...ages) : null };
+  return { stale: true, seconds: ages.length ? Math.max(...ages) : null };
 }
 
 /**
@@ -154,7 +157,9 @@ function renderBanner() {
     // 受信時刻が未来。時計のずれか、圧縮再生中の DB を見ている（決定記録 0007 §2.11）
     messages.push("受信時刻が未来です。時計がずれているか、時間圧縮で再生中の DB を見ています。");
   } else if (stale) {
-    const measured = fromLatest && fromLatest.seconds !== null ? fromLatest.seconds : health && health.data_age_seconds;
+    // 秒数は stale のカードからだけ出す（staleFromLatest）。health の経過秒は
+    // **いちばん新しい**サンプルの経過で、一部だけ止まったときの古さを表さないので使わない
+    const measured = fromLatest ? fromLatest.seconds : null;
     const seconds = typeof measured === "number" ? `（最終受信から ${Math.round(measured)} 秒）` : "";
     messages.push(`データが古い${seconds}。取り込みが止まっている可能性があります。`);
   }

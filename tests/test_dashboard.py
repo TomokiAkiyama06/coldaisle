@@ -554,7 +554,7 @@ def test_event_metrics_do_not_keep_the_banner_up():
     script = SCRIPT.read_text(encoding="utf-8")
     helper = _body(script, "function staleFromLatest(")
     assert "if (!latest.stale) return" in helper
-    assert "item.quality" not in helper, "各メトリクスの品質から古さを判定しない"
+    assert "latest.metrics).some(" not in helper, "各メトリクスの品質から古さを判定しない"
     assert "isCardMetric(metric)" in helper, "経過秒も周期メトリクス（カードの air.*）から"
 
 
@@ -582,3 +582,22 @@ def test_the_server_stale_flag_ignores_event_metrics(tmp_path, rules):
         latest = opened.get("/api/v1/latest").json()
     assert latest["metrics"]["sys.dropped_samples"]["quality"] == "stale"
     assert latest["stale"] is False
+
+
+def test_the_banner_age_comes_from_the_stale_cards_only():
+    """赤帯の秒数は **stale のカードの中でいちばん古いもの**。
+
+    全カードの最小を取ると、1枚だけ止まったときに正常なカードの「0 秒」が出る。
+    stale のカードが無い（カード外の周期メトリクスが原因）ときは秒数を出さない。
+    health の `data_age_seconds`（いちばん新しいサンプルの経過）にも戻らない。
+    """
+    script = SCRIPT.read_text(encoding="utf-8")
+    helper = _body(script, "function staleFromLatest(")
+    assert 'isCardMetric(metric) && item.quality === "stale"' in helper
+    assert "Math.max(...ages)" in helper
+    assert "Math.min" not in helper
+    assert "ages.length ? Math.max(...ages) : null" in helper, "stale のカードが無ければ秒数なし"
+    banner = _body(script, "function renderBanner(")
+    assert "const measured = fromLatest ? fromLatest.seconds : null;" in banner
+    stale_branch = banner[banner.index("} else if (stale) {") :]
+    assert "data_age_seconds" not in stale_branch[: stale_branch.index("messages.push")]
