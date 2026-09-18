@@ -460,25 +460,46 @@ def _body(script: str, signature: str) -> str:
 
 
 def test_only_one_catalog_request_at_a_time():
-    """表示名の表の取得は**同時に1件だけ**。古い失敗が新しい成功を上書きしない。"""
+    """表示名の表の取得は**同時に1件だけ**。古い失敗が新しい成功を上書きしない。
+
+    固まったまま次を止めないよう、打ち切りの上限も持つ。
+    """
     script = SCRIPT.read_text(encoding="utf-8")
     load = _body(script, "async function loadCatalog()")
     assert "if (catalogInFlight || catalog !== null) return;" in load
     assert "catalogInFlight = false" in load[load.index("finally") :]
-    assert load.count("if (seq !== catalogSeq) return;") == 2, "成功・失敗の両方で古い応答を捨てる"
+    assert "withTimeout(REFRESH_TIMEOUT_MS" in load
 
 
-def test_a_late_refresh_does_not_overwrite_a_newer_one():
-    """遅れて返った定期更新で、新しい結果（成功・失敗とも）を上書きしない。
+def test_a_slow_but_eventually_successful_refresh_is_applied():
+    """**遅いだけの応答を捨て続けない。**
 
-    **実行中なら飛ばす方式にはしない。** 応答が返らないまま固まった1件が、
-    以後の更新を全部止めてしまう。
+    「最後に開始した番号」と比べると、周期より遅いエンドポイントは毎回次の要求に
+    追い越されて一度も表示されない。**最後に適用した番号**と比べ、
+    より新しい応答が先に適用されていない限り使う。
     """
     script = SCRIPT.read_text(encoding="utf-8")
     refresh = _body(script, "async function refresh()")
-    assert "const seq = ++refreshSeq;" in refresh
-    assert refresh.count("if (seq !== refreshSeq) return;") == 2
-    assert "InFlight" not in refresh, "定期更新は実行中でも次を出す"
+    assert refresh.count("if (seq <= refreshAppliedSeq) return;") == 2, "成功・失敗とも"
+    assert refresh.count("refreshAppliedSeq = seq;") == 2
+    assert "seq !== refreshSeq" not in refresh, "開始した番号と比べると遅い応答が飢える"
+
+
+def test_refresh_is_single_flight_with_a_timeout():
+    """定期更新は同時に1件。**返らない要求は打ち切る**（次の更新を止め続けない）。"""
+    script = SCRIPT.read_text(encoding="utf-8")
+    refresh = _body(script, "async function refresh()")
+    assert "if (refreshInFlight) return;" in refresh
+    assert "refreshInFlight = false" in refresh[refresh.index("finally") :]
+    assert "withTimeout(REFRESH_TIMEOUT_MS" in refresh
+    assert refresh.count(", signal)") == 4, "4つの要求すべてを打ち切れること"
+    helper = _body(script, "async function withTimeout(")
+    assert "new AbortController()" in helper and "controller.abort()" in helper
+    assert "clearTimeout(timer)" in helper
+    # 上限は周期から決める。別の設定を増やさない
+    assert "const REFRESH_TIMEOUT_MS = REFRESH_INTERVAL_MS" in script
+    assert "setInterval(refresh, REFRESH_INTERVAL_MS)" in script
+    assert "{ signal }" in _body(script, "async function fetchJson(")
 
 
 def test_a_refresh_does_not_undo_a_newer_stream_update():
@@ -490,9 +511,16 @@ def test_a_refresh_does_not_undo_a_newer_stream_update():
     assert "streamVersion += 1;" in script[script.index("socket.onmessage") :]
 
 
-def test_a_late_history_response_does_not_overwrite_the_selected_range():
-    """期間を切り替えたあとに、前の期間の応答でグラフを描き直さない。"""
+def test_history_applies_the_newest_response_for_the_selected_range():
+    """履歴も「適用済みより新しい応答だけ」。加えて**いま選ばれている期間**の応答に限る。
+
+    期間を切り替えたあとに前の期間の応答で描き直さない。同じ期間の遅い応答は使う。
+    """
     script = SCRIPT.read_text(encoding="utf-8")
     history = _body(script, "async function loadHistory()")
-    assert "const seq = ++historySeq;" in history
-    assert history.count("if (seq !== historySeq) return;") == 2
+    assert "const range = currentRange;" in history
+    assert "seq > historyAppliedSeq && range === currentRange" in history
+    assert history.count("if (!usable()) return;") == 2
+    assert history.count("historyAppliedSeq = seq;") == 2
+    assert "withTimeout(HISTORY_TIMEOUT_MS" in history
+    assert "window: range.window" in history, "要求も開始時の期間で出す"

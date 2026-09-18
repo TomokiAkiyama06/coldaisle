@@ -18,6 +18,14 @@ const RANGES = [
 const QUALITY_LABEL = { ok: "正常", missing: "欠測", suspect: "疑わしい" };
 
 // 集計の粒度ごとのバケット幅。生データは観測から推定する
+// 周期（ミリ秒）。タイムアウトもここから決める（別の設定を増やさない）
+const REFRESH_INTERVAL_MS = 5000;
+const HISTORY_INTERVAL_MS = 60000;
+// 定期更新が返るのを待つ上限。**周期の2倍。** 1周期ぶんの遅れは許し、
+// それを超えて返らない要求は打ち切る（返らないまま次の更新を止め続けないように）
+const REFRESH_TIMEOUT_MS = REFRESH_INTERVAL_MS * 2;
+const HISTORY_TIMEOUT_MS = HISTORY_INTERVAL_MS;
+
 const STEP_MS = { "1m": 60000, "5m": 300000, "1h": 3600000 };
 const GAP_FACTOR = 2; // この倍以上空いたら「測れていない区間」とみなす
 
@@ -340,44 +348,70 @@ function text(x, y, content, anchor) {
   return node;
 }
 
-async function fetchJson(path, params) {
+async function fetchJson(path, params, signal) {
   const url = new URL(path, window.location.origin);
   for (const [key, value] of Object.entries(params || {})) url.searchParams.set(key, value);
-  const response = await fetch(url);
+  const response = await fetch(url, signal ? { signal } : undefined);
   if (!response.ok) throw new Error(`${path}: ${response.status}`);
   return response.json();
 }
 
 /**
- * 周期的な読み込みの**古い応答を捨てる**ための通し番号。
+ * 周期的な読み込みの順序づけ。**「適用済みより新しい応答だけを適用する」。**
  *
- * fetch にはタイムアウトが無く、遅い応答は次の周期や期間切替のあとに返ってくる。
- * 後から返った古い応答で新しい表示（期間・品質・赤帯）を上書きしない。
- * 「実行中なら飛ばす」だけにしないのは、**応答が返らないまま固まった1件が
- * 以後の更新を全部止めてしまう**ため（refresh と履歴。表示名の表は下の loadCatalog）。
+ * 要求ごとに開始時の通し番号を持たせ、**最後に適用した番号**より大きいときだけ使う。
+ * 「最後に開始した番号」と比べると、周期より遅いエンドポイントは毎回次の要求に
+ * 追い越されて一度も表示されない（遅いだけで正しい応答が捨てられ続ける）。
+ * この規則なら、遅い応答も、より新しい応答が先に適用されていない限り使われる。
+ *
+ * 返らないまま固まる要求は AbortController で打ち切る（fetch にはタイムアウトが無い）。
  */
 let historySeq = 0;
+let historyAppliedSeq = 0;
 let refreshSeq = 0;
+let refreshAppliedSeq = 0;
+let refreshInFlight = false;
 // WebSocket で最新値を受け取った回数。定期更新の最新値がこれより古ければ使わない
 let streamVersion = 0;
 
+/** 打ち切り付きの要求。`run(signal)` を呼び、上限を過ぎたら中断する。 */
+async function withTimeout(timeoutMs, run) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await run(controller.signal);
+  } catch (error) {
+    if (controller.signal.aborted) throw new Error(`${Math.round(timeoutMs / 1000)}秒以内に応答がありません`);
+    throw error;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 async function loadHistory() {
-  const seq = ++historySeq; // 期間を切り替えたら、前の期間の応答は捨てる
+  const seq = ++historySeq;
+  const range = currentRange; // 要求した期間。**選び直されていたら使わない**
   const metrics = Object.keys(lastLatest ? lastLatest.metrics : {}).filter((m) => m.startsWith("air."));
   const temps = metrics.filter((m) => !m.endsWith("_humidity"));
   const humidity = metrics.filter((m) => m.endsWith("_humidity"));
 
-  const load = (list) =>
+  const load = (list, signal) =>
     Promise.all(
       list.map((metric) =>
-        fetchJson("/api/v1/series", { metric, window: currentRange.window, agg: currentRange.agg })
+        fetchJson("/api/v1/series", { metric, window: range.window, agg: range.agg }, signal)
           .then((body) => ({ metric, points: body.points, agg: body.agg, downsampled: body.downsampled }))
       )
     );
+  // 適用済みより新しく、かつ**いま選ばれている期間**の応答だけを使う。
+  // 期間が違う応答は、番号が新しくても画面と食い違う
+  const usable = () => seq > historyAppliedSeq && range === currentRange;
 
   try {
-    const [tempSeries, humiditySeries] = await Promise.all([load(temps), load(humidity)]);
-    if (seq !== historySeq) return;
+    const [tempSeries, humiditySeries] = await withTimeout(HISTORY_TIMEOUT_MS, (signal) =>
+      Promise.all([load(temps, signal), load(humidity, signal)])
+    );
+    if (!usable()) return;
+    historyAppliedSeq = seq;
     lastSeries = { temp: tempSeries, humidity: humiditySeries };
     drawCharts();
     const used = tempSeries[0] || humiditySeries[0];
@@ -385,7 +419,8 @@ async function loadHistory() {
       ? `粒度 ${used.agg}${used.downsampled ? "（点数の上限に合わせて粗くしました）" : ""}`
       : "";
   } catch (error) {
-    if (seq !== historySeq) return;
+    if (!usable()) return;
+    historyAppliedSeq = seq;
     historyNote = `履歴を取得できません: ${error.message}`;
   }
   renderNote();
@@ -437,27 +472,24 @@ function applyLatest(latest) {
 }
 
 let catalogInFlight = false;
-let catalogSeq = 0;
 
 /**
  * 表示名の表を取る。失敗は握りつぶさず注記に出し、次の定期更新で取り直す。
  *
- * **同時に1件だけ。** 重なると、古い失敗が新しい成功のあとに返って
- * 「表示名を取得できません」を戻してしまう。念のため通し番号でも古い応答を捨てる。
- * 実行中に固まっても表示名が内部名に戻るだけで、値と赤帯は refresh が出し続ける。
+ * **同時に1件だけ**（重なると、古い失敗が新しい成功のあとに返って
+ * 「表示名を取得できません」を戻してしまう）。1件だけなので順序の問題は起きない。
+ * 固まったまま次を止めないよう、定期更新と同じ上限で打ち切る。
  */
 async function loadCatalog() {
   if (catalogInFlight || catalog !== null) return;
   catalogInFlight = true;
-  const seq = ++catalogSeq;
   try {
-    const body = await fetchJson("/api/v1/metrics");
-    if (seq !== catalogSeq) return;
-    catalog = body;
+    catalog = await withTimeout(REFRESH_TIMEOUT_MS, (signal) =>
+      fetchJson("/api/v1/metrics", undefined, signal)
+    );
     catalogNote = ""; // 取れたらその場で消す。履歴の注記は触らない
     rerenderAll(); // 取れた時点で、内部名を出していた箇所をすべて表示名に置き換える
   } catch (error) {
-    if (seq !== catalogSeq) return;
     catalogNote = `表示名を取得できません: ${error.message}`;
   } finally {
     catalogInFlight = false;
@@ -479,17 +511,23 @@ async function refresh() {
   // **待たない。** 表の取得に失敗しても最新値・health・アラートの更新を止めない
   // （止めると赤帯が出なくなる）。取れるまでは labelOf が名前そのものに戻る
   if (catalog === null) loadCatalog();
-  // 後から返った古い定期更新で、新しい定期更新の結果（成功・失敗とも）を上書きしない
+  // **同時に1件だけ。** 実行中なら今回は見送る（固まった要求は上限で打ち切られ、
+  // 次の周期で再開する）。適用の可否は「適用済みより新しいか」で決める
+  if (refreshInFlight) return;
+  refreshInFlight = true;
   const seq = ++refreshSeq;
   const streamAtStart = streamVersion;
   try {
-    const [latest, health, alerts, devices] = await Promise.all([
-      fetchJson("/api/v1/latest"),
-      fetchJson("/api/v1/health"),
-      fetchJson("/api/v1/alerts", { limit: 20 }),
-      fetchJson("/api/v1/devices"),
-    ]);
-    if (seq !== refreshSeq) return;
+    const [latest, health, alerts, devices] = await withTimeout(REFRESH_TIMEOUT_MS, (signal) =>
+      Promise.all([
+        fetchJson("/api/v1/latest", undefined, signal),
+        fetchJson("/api/v1/health", undefined, signal),
+        fetchJson("/api/v1/alerts", { limit: 20 }, signal),
+        fetchJson("/api/v1/devices", undefined, signal),
+      ])
+    );
+    if (seq <= refreshAppliedSeq) return;
+    refreshAppliedSeq = seq;
     // 待っている間に WebSocket がより新しい最新値を届けていたら、そちらを残す。
     // 古い `ok` で新しい `stale` を上書きすると、品質が変わるまで WebSocket は
     // 押し直さないため（stream_state）、次の定期更新まで赤帯が消える
@@ -506,10 +544,13 @@ async function refresh() {
       loadHistory();
     }
   } catch (error) {
-    if (seq !== refreshSeq) return;
+    if (seq <= refreshAppliedSeq) return;
+    refreshAppliedSeq = seq;
     // 赤帯そのものには書かず、状態として残す。直接書くと、次の WebSocket の更新で消える
     lastFetchError = error.message;
     renderBanner();
+  } finally {
+    refreshInFlight = false;
   }
 }
 
@@ -563,8 +604,8 @@ function renderRanges() {
 function start() {
   renderRanges();
   connect();
-  setInterval(refresh, 5000);
-  setInterval(loadHistory, 60000);
+  setInterval(refresh, REFRESH_INTERVAL_MS);
+  setInterval(loadHistory, HISTORY_INTERVAL_MS);
   refresh(); // 失敗しても内側で赤帯にして返る
 }
 
