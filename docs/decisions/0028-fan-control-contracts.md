@@ -331,6 +331,11 @@ effective demand の型を通らないため、次の制約で**冷却を弱め�
 
 ### 2.8 設定の境界
 
+> **Superseded by**
+>
+> - **3ファイル境界** → [`0033-air-balance-config-boundary.md`](0033-air-balance-config-boundary.md)
+>   （`air-balance.yaml` を4つ目の Control Config とし、4ファイルを一括検証・一括採用する）
+
 AGENTS.md の「ファイル構成」にある3つのファイルへ分ける。
 
 | ファイル | 中身 | 読む層 | 変更に要るもの |

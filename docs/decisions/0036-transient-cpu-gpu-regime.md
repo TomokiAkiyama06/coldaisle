@@ -1,7 +1,7 @@
 # 決定記録 0036: Workload Regime に TRANSIENT_CPU_GPU を加える
 
 - **種別**: Decision Record
-- **Status**: Proposed
+- **Status**: FINAL（2026-09-18、リポジトリ所有者が承認）
 - **Date**: 2026-09-18
 - **Supersedes**: なし
 - **関連**: [`0027-fan-control-architecture.md`](0027-fan-control-architecture.md) §2、

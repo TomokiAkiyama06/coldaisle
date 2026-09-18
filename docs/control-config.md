@@ -10,6 +10,10 @@
 #78 はこの例外を Critical Safety の config-invalid failure semantics（書込み対象を特定できなければ
 BIOS制御のまま終了、特定済みなら安全側へ引継ぎ）へ接続するconsumerである。
 
+決定記録 0033（FINAL）により、`air-balance.yaml` を4つ目の Control Config として加え、
+4ファイルを一括検証・一括採用する（0028 §2.8 の3ファイル境界を置き換える）。
+4ファイルの読み込みはまだ実装していないため、それまで Air Balance Model は runtime に接続しない。
+
 `fan-hardware.yaml` の `approval.status` が `confirmed` かつ根拠 `basis` を持つまで、
 `actuation_permitted` は false になる。実機の header 対応・Fan profile は #75 の測定記録を
 根拠として確認する。`hwmonN`、絶対パス、個体識別子は設定に書かない。
