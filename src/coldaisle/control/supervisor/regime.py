@@ -2,12 +2,17 @@
 
 予測 horizon や expected duration は入力にも出力にも持たない。Power の有効な連続履歴だけを
 使い、欠測・stale・大きな sampling gap の後は ``UNKNOWN`` から再評価する。
+
+推定は不変な ``WorkloadRegimeState`` を snapshot 1件ずつ進める純関数 ``step`` で行う。
+状態には平滑化窓より古い sample を持たないので、1 tick あたりの計算量と状態の大きさは
+稼働時間に依存しない。履歴を窓で切り詰めないため、確定済みの Regime・Schmitt latch・
+遷移確認・COOLDOWN の起点も失わない。
 """
 
 from __future__ import annotations
 
-from collections import deque
 from collections.abc import Sequence
+from dataclasses import dataclass, field, replace
 from enum import StrEnum
 from typing import Annotated
 
@@ -63,180 +68,196 @@ class WorkloadRegimeEstimate(_Frozen):
         }
 
 
-class _Axis:
-    """Power signal 1本の平滑化窓と Schmitt trigger 状態。"""
+@dataclass(frozen=True, slots=True)
+class _AxisState:
+    """Power signal 1本の平滑化窓・Schmitt latch・active 継続時間。"""
 
-    def __init__(self, band: WorkloadPowerBand, activity_window_ms: int) -> None:
-        self._band = band
-        self._activity_window_ms = activity_window_ms
-        self._samples: deque[tuple[int, float]] = deque()
-        self.active: bool | None = None
-        self.mean_w: float | None = None
+    samples: tuple[tuple[int, float], ...] = ()
+    """``activity_window_ms`` 以内の (monotonic_ms, W)。これより古い sample は持たない。"""
+    active: bool | None = None
+    active_since_ms: int | None = None
+    inactive_since_ms: int | None = None
 
-    def update(self, mono_ms: int, power_w: float) -> bool | None:
-        self._samples.append((mono_ms, power_w))
-        smoothing_cutoff = mono_ms - self._activity_window_ms
-        while self._samples and self._samples[0][0] < smoothing_cutoff:
-            self._samples.popleft()
-        mean_w = sum(value for _, value in self._samples) / len(self._samples)
-        self.mean_w = mean_w
-        if mean_w >= self._band.active_above_w:
-            self.active = True
-        elif mean_w <= self._band.idle_below_w:
-            self.active = False
-        return self.active
+    @property
+    def mean_w(self) -> float | None:
+        if not self.samples:
+            return None
+        return sum(value for _, value in self.samples) / len(self.samples)
+
+    def observe(
+        self, mono_ms: int, power_w: float, band: WorkloadPowerBand, activity_window_ms: int
+    ) -> _AxisState:
+        smoothing_cutoff = mono_ms - activity_window_ms
+        appended = (*self.samples, (mono_ms, power_w))
+        samples = tuple(sample for sample in appended if sample[0] >= smoothing_cutoff)
+        mean_w = sum(value for _, value in samples) / len(samples)
+        active = self.active
+        if mean_w >= band.active_above_w:
+            active = True
+        elif mean_w <= band.idle_below_w:
+            active = False
+        return replace(self, samples=samples, active=active)
+
+
+@dataclass(frozen=True, slots=True)
+class WorkloadRegimeState:
+    """Workload Regime 推定の checkpoint。不変で、次の snapshot だけで先へ進められる。
+
+    欠測・gap の後は初期状態に戻る。フィールドは実装の内部表現で、保存形式ではない。
+    """
+
+    previous_mono_ms: int | None = None
+    cpu: _AxisState = field(default_factory=_AxisState)
+    gpu: _AxisState = field(default_factory=_AxisState)
+    published: WorkloadRegime = WorkloadRegime.UNKNOWN
+    candidate: WorkloadRegime | None = None
+    candidate_since_ms: int | None = None
+    last_active_ms: int | None = None
+    valid_since_ms: int | None = None
 
 
 class WorkloadRegimeEstimator:
-    """履歴を先頭から再生して、呼出し頻度に依存しない Regime 遷移を返す。"""
+    """snapshot を1件ずつ進め、呼出し頻度に依存しない Regime 遷移を返す。"""
 
     def __init__(self, config: WorkloadRegimeConfig, catalog: MetricCatalog, clock: Clock) -> None:
         self._validate_metric_units(config, catalog)
         self._config = config
         self._clock = clock
 
+    @staticmethod
+    def initial_state() -> WorkloadRegimeState:
+        """履歴が無い状態。"""
+        return WorkloadRegimeState()
+
+    def step(
+        self, state: WorkloadRegimeState, snapshot: ControlStateSnapshot
+    ) -> tuple[WorkloadRegimeState, WorkloadRegimeEstimate]:
+        """checkpoint を snapshot 1件だけ進め、次の checkpoint とその tick の推定を返す。
+
+        同じ state と snapshot からは常に同じ結果になる（壁時計は ``computed_at_ms`` のみ）。
+        """
+        return self._advance(state, snapshot, self._clock.now_ms())
+
     def estimate(self, history: Sequence[ControlStateSnapshot]) -> WorkloadRegimeEstimate:
-        """単調時刻順の snapshot 履歴から、最後の tick の現在状態を推定する。"""
+        """単調時刻順の snapshot 列を初期状態から ``step`` で畳み込み、最後の推定を返す。
+
+        Replay・テスト用の簡便関数。実行時は ``step`` で checkpoint を持ち回る。
+        """
         computed_at_ms = self._clock.now_ms()
-        snapshots = tuple(history)
-        if not snapshots:
+        if not history:
             return self._unknown(computed_at_ms, RegimeReason.NO_HISTORY)
-        self._validate_history(snapshots)
+        state = self.initial_state()
+        result: WorkloadRegimeEstimate | None = None
+        for snapshot in history:
+            state, result = self._advance(state, snapshot, computed_at_ms)
+        assert result is not None
+        return result
 
-        # 渡された履歴は切り詰めずに全体を再生する。窓で切ると、窓より前に確定した
-        # Schmitt latch・公開中の Regime・遷移確認中の候補・active 継続時間・COOLDOWN の
-        # 起点・連続観測の開始がすべて失われ、同じ連続 Telemetry でも UNKNOWN や
-        # 誤った TRANSIENT に戻ってしまう。欠測・gap による再評価は ``_replay`` が行う。
-        # ``history_window_ms`` は呼出し側が最低限保持すべき履歴の長さ（config で検証）。
-        return self._replay(snapshots, computed_at_ms)
-
-    def _new_axes(self) -> tuple[_Axis, _Axis]:
-        return (
-            _Axis(self._config.cpu_power, self._config.activity_window_ms),
-            _Axis(self._config.gpu_power, self._config.activity_window_ms),
-        )
-
-    def _replay(
+    def _advance(
         self,
-        snapshots: tuple[ControlStateSnapshot, ...],
+        state: WorkloadRegimeState,
+        snapshot: ControlStateSnapshot,
         computed_at_ms: int,
-    ) -> WorkloadRegimeEstimate:
-        cpu_axis, gpu_axis = self._new_axes()
-        previous_mono_ms: int | None = None
+    ) -> tuple[WorkloadRegimeState, WorkloadRegimeEstimate]:
+        mono_ms = snapshot.monotonic_ms
+        if state.previous_mono_ms is not None and mono_ms <= state.previous_mono_ms:
+            raise ValueError("snapshot history は monotonic_ms の昇順にする")
+        cpu_power = self._power(snapshot, self._config.cpu_power.metric)
+        gpu_power = self._power(snapshot, self._config.gpu_power.metric)
+        gap = (
+            state.previous_mono_ms is not None
+            and mono_ms - state.previous_mono_ms > self._config.max_snapshot_gap_ms
+        )
+        if cpu_power is None or gpu_power is None or gap:
+            state = WorkloadRegimeState(previous_mono_ms=mono_ms)
+            if cpu_power is None or gpu_power is None:
+                return state, self._estimate(
+                    state, snapshot, computed_at_ms, RegimeReason.MISSING_SIGNALS
+                )
+        else:
+            state = replace(state, previous_mono_ms=mono_ms)
 
-        published = WorkloadRegime.UNKNOWN
-        candidate: WorkloadRegime | None = None
-        candidate_since_ms: int | None = None
-        cpu_active_since_ms: int | None = None
-        gpu_active_since_ms: int | None = None
-        cpu_inactive_since_ms: int | None = None
-        gpu_inactive_since_ms: int | None = None
-        last_active_ms: int | None = None
-        valid_since_ms: int | None = None
-        cpu_mean_w: float | None = None
-        gpu_mean_w: float | None = None
-        reason = RegimeReason.INSUFFICIENT_HISTORY
-
-        for snapshot in snapshots:
-            cpu_power = self._power(snapshot, self._config.cpu_power.metric)
-            gpu_power = self._power(snapshot, self._config.gpu_power.metric)
-            gap = (
-                previous_mono_ms is not None
-                and snapshot.monotonic_ms - previous_mono_ms > self._config.max_snapshot_gap_ms
+        valid_since_ms = state.valid_since_ms if state.valid_since_ms is not None else mono_ms
+        cpu = state.cpu.observe(
+            mono_ms, cpu_power, self._config.cpu_power, self._config.activity_window_ms
+        )
+        gpu = state.gpu.observe(
+            mono_ms, gpu_power, self._config.gpu_power, self._config.activity_window_ms
+        )
+        last_active_ms = state.last_active_ms
+        observed_ms = mono_ms - valid_since_ms
+        if cpu.active is None or gpu.active is None:
+            raw = WorkloadRegime.UNKNOWN
+            reason = RegimeReason.AMBIGUOUS_POWER
+        elif observed_ms < self._config.minimum_observation_ms:
+            raw = WorkloadRegime.UNKNOWN
+            reason = RegimeReason.INSUFFICIENT_HISTORY
+        else:
+            cpu = self._axis_timing(mono_ms, cpu)
+            gpu = self._axis_timing(mono_ms, gpu)
+            raw, last_active_ms = self._raw_regime(
+                mono_ms=mono_ms, cpu=cpu, gpu=gpu, last_active_ms=last_active_ms
             )
-            previous_mono_ms = snapshot.monotonic_ms
-            if cpu_power is None or gpu_power is None or gap:
-                published = WorkloadRegime.UNKNOWN
-                candidate = None
-                candidate_since_ms = None
-                cpu_active_since_ms = None
-                gpu_active_since_ms = None
-                cpu_inactive_since_ms = None
-                gpu_inactive_since_ms = None
-                last_active_ms = None
-                valid_since_ms = None
-                cpu_axis, gpu_axis = self._new_axes()
-                cpu_mean_w = None
-                gpu_mean_w = None
-                if cpu_power is None or gpu_power is None:
-                    reason = RegimeReason.MISSING_SIGNALS
-                    continue
-                reason = RegimeReason.INSUFFICIENT_HISTORY
+            reason = RegimeReason.OBSERVED_HISTORY
 
-            mono_ms = snapshot.monotonic_ms
-            if valid_since_ms is None:
-                valid_since_ms = mono_ms
-            cpu_active = cpu_axis.update(mono_ms, cpu_power)
-            gpu_active = gpu_axis.update(mono_ms, gpu_power)
-            cpu_mean_w = cpu_axis.mean_w
-            gpu_mean_w = gpu_axis.mean_w
-            observed_ms = mono_ms - valid_since_ms
-            if cpu_active is None or gpu_active is None:
-                raw = WorkloadRegime.UNKNOWN
-                reason = RegimeReason.AMBIGUOUS_POWER
-            elif observed_ms < self._config.minimum_observation_ms:
-                raw = WorkloadRegime.UNKNOWN
-                reason = RegimeReason.INSUFFICIENT_HISTORY
-            else:
-                cpu_active_since_ms, cpu_inactive_since_ms = self._axis_timing(
-                    mono_ms=mono_ms,
-                    active=cpu_active,
-                    active_since_ms=cpu_active_since_ms,
-                    inactive_since_ms=cpu_inactive_since_ms,
-                )
-                gpu_active_since_ms, gpu_inactive_since_ms = self._axis_timing(
-                    mono_ms=mono_ms,
-                    active=gpu_active,
-                    active_since_ms=gpu_active_since_ms,
-                    inactive_since_ms=gpu_inactive_since_ms,
-                )
-                raw, last_active_ms = self._raw_regime(
-                    mono_ms=mono_ms,
-                    cpu_active=cpu_active,
-                    gpu_active=gpu_active,
-                    cpu_active_since_ms=cpu_active_since_ms,
-                    gpu_active_since_ms=gpu_active_since_ms,
-                    last_active_ms=last_active_ms,
-                )
-                reason = RegimeReason.OBSERVED_HISTORY
+        published = state.published
+        candidate = state.candidate
+        candidate_since_ms = state.candidate_since_ms
+        if raw is WorkloadRegime.UNKNOWN:
+            published = WorkloadRegime.UNKNOWN
+            candidate = None
+            candidate_since_ms = None
+        elif raw is published:
+            candidate = None
+            candidate_since_ms = None
+        elif raw is not candidate:
+            candidate = raw
+            candidate_since_ms = mono_ms
+        elif (
+            candidate_since_ms is not None
+            and mono_ms - candidate_since_ms >= self._config.minimum_transition_ms
+        ):
+            published = raw
+            candidate = None
+            candidate_since_ms = None
 
-            if raw is WorkloadRegime.UNKNOWN:
-                published = WorkloadRegime.UNKNOWN
-                candidate = None
-                candidate_since_ms = None
-                continue
-            if raw is published:
-                candidate = None
-                candidate_since_ms = None
-                continue
-            if raw is not candidate:
-                candidate = raw
-                candidate_since_ms = mono_ms
-            elif (
-                candidate_since_ms is not None
-                and mono_ms - candidate_since_ms >= self._config.minimum_transition_ms
-            ):
-                published = raw
-                candidate = None
-                candidate_since_ms = None
+        state = replace(
+            state,
+            cpu=cpu,
+            gpu=gpu,
+            published=published,
+            candidate=candidate,
+            candidate_since_ms=candidate_since_ms,
+            last_active_ms=last_active_ms,
+            valid_since_ms=valid_since_ms,
+        )
+        if candidate is not None:
+            reason = RegimeReason.TRANSITION_PENDING
+        return state, self._estimate(state, snapshot, computed_at_ms, reason)
 
-        latest = snapshots[-1]
-        observed_window_ms = 0 if valid_since_ms is None else latest.monotonic_ms - valid_since_ms
-        if published is WorkloadRegime.UNKNOWN:
+    def _estimate(
+        self,
+        state: WorkloadRegimeState,
+        snapshot: ControlStateSnapshot,
+        computed_at_ms: int,
+        reason: RegimeReason,
+    ) -> WorkloadRegimeEstimate:
+        observed_window_ms = (
+            0 if state.valid_since_ms is None else snapshot.monotonic_ms - state.valid_since_ms
+        )
+        if state.published is WorkloadRegime.UNKNOWN:
             confidence = 0.0
         else:
             confidence = min(1.0, observed_window_ms / self._config.confidence_full_window_ms)
-        if candidate is not None:
-            reason = RegimeReason.TRANSITION_PENDING
         return WorkloadRegimeEstimate(
-            regime=published,
+            regime=state.published,
             confidence=confidence,
             reason=reason,
-            as_of_tick_id=latest.tick_id,
+            as_of_tick_id=snapshot.tick_id,
             computed_at_ms=computed_at_ms,
             evidence=RegimeEvidence(
-                cpu_power_mean_w=cpu_mean_w,
-                gpu_power_mean_w=gpu_mean_w,
+                cpu_power_mean_w=state.cpu.mean_w,
+                gpu_power_mean_w=state.gpu.mean_w,
                 observed_window_ms=observed_window_ms,
             ),
         )
@@ -245,30 +266,21 @@ class WorkloadRegimeEstimator:
         self,
         *,
         mono_ms: int,
-        cpu_active: bool,
-        gpu_active: bool,
-        cpu_active_since_ms: int | None,
-        gpu_active_since_ms: int | None,
+        cpu: _AxisState,
+        gpu: _AxisState,
         last_active_ms: int | None,
     ) -> tuple[WorkloadRegime, int | None]:
-        combination = (cpu_active, gpu_active)
-        if any(combination):
-            last_active_ms = mono_ms
-            active_since = tuple(
-                since
-                for active, since in (
-                    (cpu_active, cpu_active_since_ms),
-                    (gpu_active, gpu_active_since_ms),
-                )
-                if active
-            )
-            assert active_since and all(since is not None for since in active_since)
+        if cpu.active or gpu.active:
+            active_since = [
+                axis.active_since_ms
+                for axis in (cpu, gpu)
+                if axis.active and axis.active_since_ms is not None
+            ]
+            assert len(active_since) == [cpu.active, gpu.active].count(True)
             sustained = all(
-                mono_ms - since >= self._config.sustained_after_ms
-                for since in active_since
-                if since is not None
+                mono_ms - since >= self._config.sustained_after_ms for since in active_since
             )
-            if cpu_active and gpu_active:
+            if cpu.active and gpu.active:
                 # 片方の軸を捨てると同時 burst と単独 burst が trace で区別できなくなる
                 # ため、両軸 active は常に組み合わせの値で残す（決定記録 0036）。
                 regime = (
@@ -276,34 +288,31 @@ class WorkloadRegimeEstimator:
                     if sustained
                     else WorkloadRegime.TRANSIENT_CPU_GPU
                 )
-            elif cpu_active:
+            elif cpu.active:
                 regime = WorkloadRegime.SUSTAINED_CPU if sustained else WorkloadRegime.TRANSIENT_CPU
             else:
                 regime = WorkloadRegime.SUSTAINED_GPU if sustained else WorkloadRegime.TRANSIENT_GPU
-            return regime, last_active_ms
+            return regime, mono_ms
 
         if last_active_ms is not None and mono_ms - last_active_ms < self._config.cooldown_ms:
             return WorkloadRegime.COOLDOWN, last_active_ms
         return WorkloadRegime.IDLE, last_active_ms
 
-    def _axis_timing(
-        self,
-        *,
-        mono_ms: int,
-        active: bool,
-        active_since_ms: int | None,
-        inactive_since_ms: int | None,
-    ) -> tuple[int | None, int | None]:
+    def _axis_timing(self, mono_ms: int, axis: _AxisState) -> _AxisState:
         """未確定の短い停止では、継続中の active duration を失わない。"""
-        if active:
-            return active_since_ms if active_since_ms is not None else mono_ms, None
-        if active_since_ms is None:
-            return None, None
-        if inactive_since_ms is None:
-            return active_since_ms, mono_ms
-        if mono_ms - inactive_since_ms >= self._config.minimum_transition_ms:
-            return None, None
-        return active_since_ms, inactive_since_ms
+        active_since_ms = axis.active_since_ms
+        inactive_since_ms = axis.inactive_since_ms
+        if axis.active:
+            active_since_ms = active_since_ms if active_since_ms is not None else mono_ms
+            inactive_since_ms = None
+        elif active_since_ms is None:
+            inactive_since_ms = None
+        elif inactive_since_ms is None:
+            inactive_since_ms = mono_ms
+        elif mono_ms - inactive_since_ms >= self._config.minimum_transition_ms:
+            active_since_ms = None
+            inactive_since_ms = None
+        return replace(axis, active_since_ms=active_since_ms, inactive_since_ms=inactive_since_ms)
 
     @staticmethod
     def _power(snapshot: ControlStateSnapshot, metric: str) -> float | None:
@@ -321,14 +330,6 @@ class WorkloadRegimeEstimator:
                     f"{axis} workload Power metric は既知の電力(W)にする: "
                     f"metric={band.metric}, unit={unit}"
                 )
-
-    @staticmethod
-    def _validate_history(snapshots: tuple[ControlStateSnapshot, ...]) -> None:
-        previous_mono_ms: int | None = None
-        for snapshot in snapshots:
-            if previous_mono_ms is not None and snapshot.monotonic_ms <= previous_mono_ms:
-                raise ValueError("snapshot history は monotonic_ms の昇順にする")
-            previous_mono_ms = snapshot.monotonic_ms
 
     @staticmethod
     def _unknown(computed_at_ms: int, reason: RegimeReason) -> WorkloadRegimeEstimate:

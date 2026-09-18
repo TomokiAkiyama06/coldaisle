@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import random
+
 import pytest
 
 from coldaisle.clock import SimulatedClock
@@ -12,7 +14,11 @@ from coldaisle.control.state import (
     TelemetryHealth,
     TelemetryImportance,
 )
-from coldaisle.control.supervisor import RegimeReason, WorkloadRegimeEstimator
+from coldaisle.control.supervisor import (
+    RegimeReason,
+    WorkloadRegimeEstimate,
+    WorkloadRegimeEstimator,
+)
 from coldaisle.metrics import MetricCatalog, MetricMeta
 from coldaisle.store.models import Quality
 
@@ -390,3 +396,99 @@ def test_confirmed_regime_survives_short_spikes_longer_than_history_window() -> 
         estimate([*cpu_load, *spikes[:end]]).regime is WorkloadRegime.SUSTAINED_CPU
         for end in range(1, len(spikes) + 1)
     )
+
+
+def step_all(
+    history: list[ControlStateSnapshot], regime_config: WorkloadRegimeConfig | None = None
+) -> list[WorkloadRegimeEstimate]:
+    estimator = WorkloadRegimeEstimator(
+        regime_config or config(), catalog(), SimulatedClock(BASE_TS_MS)
+    )
+    state = estimator.initial_state()
+    results = []
+    for item in history:
+        state, result = estimator.step(state, item)
+        results.append(result)
+    return results
+
+
+def random_history(length: int, seed: int) -> list[ControlStateSnapshot]:
+    """負荷・deadband・欠測・gap を混ぜた決定論的な長い系列。"""
+    rng = random.Random(seed)
+    levels_cpu = (10.0, 45.0, 90.0)
+    levels_gpu = (20.0, 70.0, 180.0)
+    history: list[ControlStateSnapshot] = []
+    second = 0
+    cpu_w, gpu_w = levels_cpu[0], levels_gpu[0]
+    while len(history) < length:
+        if rng.random() < 0.08:
+            cpu_w = rng.choice(levels_cpu)
+        if rng.random() < 0.08:
+            gpu_w = rng.choice(levels_gpu)
+        roll = rng.random()
+        if roll < 0.005:
+            second += 3  # max_snapshot_gap_ms を超える gap
+        if roll > 0.995:
+            history.append(snapshot(second, cpu_w=cpu_w, gpu_w=None))
+        elif rng.random() < 0.1:
+            # 1 tick だけの spike（minimum_transition_ms 未満）
+            history.append(snapshot(second, cpu_w=cpu_w, gpu_w=levels_gpu[2]))
+        else:
+            history.append(snapshot(second, cpu_w=cpu_w, gpu_w=gpu_w))
+        second += 1
+    return history
+
+
+def test_incremental_steps_equal_folding_the_whole_history() -> None:
+    history = random_history(3_000, seed=87)
+    estimator = WorkloadRegimeEstimator(config(), catalog(), SimulatedClock(BASE_TS_MS))
+    stepped = step_all(history)
+
+    for end in range(0, len(history), 97):
+        assert stepped[end] == estimator.estimate(history[: end + 1])
+    assert stepped[-1] == estimator.estimate(history)
+    assert {result.regime for result in stepped} >= {
+        WorkloadRegime.UNKNOWN,
+        WorkloadRegime.IDLE,
+        WorkloadRegime.COOLDOWN,
+        WorkloadRegime.SUSTAINED_CPU,
+    }
+
+
+def test_checkpoint_size_is_bounded_by_the_smoothing_window() -> None:
+    wide = config().model_copy(update={"activity_window_ms": 3_000})
+    estimator = WorkloadRegimeEstimator(wide, catalog(), SimulatedClock(BASE_TS_MS))
+    state = estimator.initial_state()
+    longest = 0
+    for second in range(10_000):
+        cpu_w = 90.0 if (second // 500) % 2 else 10.0
+        state, _ = estimator.step(state, snapshot(second, cpu_w=cpu_w, gpu_w=20.0))
+        longest = max(longest, len(state.cpu.samples), len(state.gpu.samples))
+
+    # 1s 周期で activity_window_ms=3s なら窓内は最大4 sample。稼働時間では増えない。
+    assert longest == 4
+    assert all(sample[0] >= 9_999_000 - 3_000 for sample in state.cpu.samples)
+
+
+def test_step_rejects_out_of_order_snapshots() -> None:
+    estimator = WorkloadRegimeEstimator(config(), catalog(), SimulatedClock(BASE_TS_MS))
+    state, _ = estimator.step(estimator.initial_state(), snapshot(5, cpu_w=10.0, gpu_w=20.0))
+
+    with pytest.raises(ValueError, match="monotonic_ms"):
+        estimator.step(state, snapshot(5, cpu_w=10.0, gpu_w=20.0))
+
+
+def test_latch_published_and_cooldown_survive_past_the_window_when_stepping() -> None:
+    crossing = [snapshot(second, cpu_w=90.0, gpu_w=20.0) for second in range(8)]
+    # history_window_ms=30s より長い deadband と 1 tick の GPU spike。
+    held = [
+        snapshot(second, cpu_w=45.0, gpu_w=180.0 if second % 2 else 20.0) for second in range(8, 60)
+    ]
+    released = [snapshot(second, cpu_w=10.0, gpu_w=20.0) for second in range(60, 66)]
+
+    results = step_all(crossing + held + released)
+
+    assert results[7].regime is WorkloadRegime.SUSTAINED_CPU
+    assert all(result.regime is WorkloadRegime.SUSTAINED_CPU for result in results[8:60])
+    assert results[60 + 2].regime is WorkloadRegime.COOLDOWN
+    assert results[-1].regime is WorkloadRegime.IDLE

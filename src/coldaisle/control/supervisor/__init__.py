@@ -5,6 +5,7 @@ from coldaisle.control.supervisor.regime import (
     RegimeReason,
     WorkloadRegimeEstimate,
     WorkloadRegimeEstimator,
+    WorkloadRegimeState,
 )
 
 __all__ = [
@@ -12,4 +13,5 @@ __all__ = [
     "RegimeReason",
     "WorkloadRegimeEstimate",
     "WorkloadRegimeEstimator",
+    "WorkloadRegimeState",
 ]

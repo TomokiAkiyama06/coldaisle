@@ -123,6 +123,7 @@ from coldaisle.control.supervisor import (
     RegimeReason,
     WorkloadRegimeEstimate,
     WorkloadRegimeEstimator,
+    WorkloadRegimeState,
 )
 
 __all__ = [
@@ -223,6 +224,7 @@ __all__ = [
     "WorkloadRegimeConfig",
     "WorkloadRegimeEstimate",
     "WorkloadRegimeEstimator",
+    "WorkloadRegimeState",
     "Zone",
     "ZoneAcousticCurve",
     "ZoneRecord",
