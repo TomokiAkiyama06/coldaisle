@@ -352,7 +352,6 @@ async function loadHistory() {
   const metrics = Object.keys(lastLatest ? lastLatest.metrics : {}).filter((m) => m.startsWith("air."));
   const temps = metrics.filter((m) => !m.endsWith("_humidity"));
   const humidity = metrics.filter((m) => m.endsWith("_humidity"));
-  const note = document.getElementById("chart-note");
 
   const load = (list) =>
     Promise.all(
@@ -367,12 +366,24 @@ async function loadHistory() {
     lastSeries = { temp: tempSeries, humidity: humiditySeries };
     drawCharts();
     const used = tempSeries[0] || humiditySeries[0];
-    note.textContent = used
+    historyNote = used
       ? `粒度 ${used.agg}${used.downsampled ? "（点数の上限に合わせて粗くしました）" : ""}`
       : "";
   } catch (error) {
-    note.textContent = `履歴を取得できません: ${error.message}`;
+    historyNote = `履歴を取得できません: ${error.message}`;
   }
+  renderNote();
+}
+
+// グラフ下の注記。**履歴と表示名の状態を別々に持つ。** 1つの欄を両方が上書きすると、
+// 表示名が取れたあとも「表示名を取得できません」が次の履歴更新（60秒）まで残る
+let historyNote = "";
+let catalogNote = "";
+
+function renderNote() {
+  document.getElementById("chart-note").textContent = [historyNote, catalogNote]
+    .filter(Boolean)
+    .join(" / ");
 }
 
 // 最後に受け取った応答。**表示名の表が後から届いたときに描き直すため**に持つ
@@ -413,10 +424,12 @@ function applyLatest(latest) {
 async function loadCatalog() {
   try {
     catalog = await fetchJson("/api/v1/metrics");
+    catalogNote = ""; // 取れたらその場で消す。履歴の注記は触らない
     rerenderAll(); // 取れた時点で、内部名を出していた箇所をすべて表示名に置き換える
   } catch (error) {
-    document.getElementById("chart-note").textContent = `表示名を取得できません: ${error.message}`;
+    catalogNote = `表示名を取得できません: ${error.message}`;
   }
+  renderNote();
 }
 
 /**

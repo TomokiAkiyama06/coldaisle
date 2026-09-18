@@ -429,3 +429,23 @@ def test_a_stream_update_does_not_hide_an_api_failure():
     success = refresh[: refresh.index("catch (error)")]
     assert "lastFetchError = null" in success
     assert success.index("Promise.all") < success.index("lastFetchError = null")
+
+
+def test_the_catalog_note_clears_on_its_own():
+    """表示名が取れたら「表示名を取得できません」をその場で消す。
+
+    履歴と表示名が同じ注記欄を上書きし合うと、表示名が取れたあとも
+    次の履歴更新（60秒）まで古い失敗が残る。**状態を別々に持つ。**
+    """
+    script = SCRIPT.read_text(encoding="utf-8")
+    load = script[script.index("async function loadCatalog()") :]
+    load = load[: load.index("\n}\n")]
+    success = load[: load.index("catch (error)")]
+    assert 'catalogNote = ""' in success
+    assert "historyNote" not in load, "表示名の側から履歴の注記を消さない"
+    assert "renderNote()" in load
+    history = script[script.index("async function loadHistory()") :]
+    history = history[: history.index("\n}\n")]
+    assert "catalogNote" not in history, "履歴の側から表示名の注記を消さない"
+    assert "historyNote = " in history and "renderNote()" in history
+    assert script.count('getElementById("chart-note")') == 1, "注記欄に書くのは renderNote だけ"
