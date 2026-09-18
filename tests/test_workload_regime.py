@@ -375,3 +375,18 @@ def test_latch_is_not_carried_across_a_gap_before_the_history_window() -> None:
 
     assert result.regime is WorkloadRegime.UNKNOWN
     assert result.reason is RegimeReason.AMBIGUOUS_POWER
+
+
+def test_confirmed_regime_survives_short_spikes_longer_than_history_window() -> None:
+    cpu_load = [snapshot(second, cpu_w=90.0, gpu_w=20.0) for second in range(8)]
+    # minimum_transition_ms=1s 未満で終わる1 tick の GPU spike を history_window_ms=30s より
+    # 長く繰り返す。確定済み Regime・候補・active 継続時間を窓で失わないこと。
+    spikes = [
+        snapshot(second, cpu_w=90.0, gpu_w=180.0 if second % 2 else 20.0) for second in range(8, 50)
+    ]
+
+    assert estimate(cpu_load).regime is WorkloadRegime.SUSTAINED_CPU
+    assert all(
+        estimate([*cpu_load, *spikes[:end]]).regime is WorkloadRegime.SUSTAINED_CPU
+        for end in range(1, len(spikes) + 1)
+    )

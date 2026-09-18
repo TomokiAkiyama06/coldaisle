@@ -103,11 +103,12 @@ class WorkloadRegimeEstimator:
             return self._unknown(computed_at_ms, RegimeReason.NO_HISTORY)
         self._validate_history(snapshots)
 
-        end_mono_ms = snapshots[-1].monotonic_ms
-        cutoff_ms = max(0, end_mono_ms - self._config.history_window_ms)
-        prefix = tuple(snapshot for snapshot in snapshots if snapshot.monotonic_ms < cutoff_ms)
-        window = tuple(snapshot for snapshot in snapshots if snapshot.monotonic_ms >= cutoff_ms)
-        return self._replay(window, computed_at_ms, seed=self._seed_axes(prefix))
+        # 渡された履歴は切り詰めずに全体を再生する。窓で切ると、窓より前に確定した
+        # Schmitt latch・公開中の Regime・遷移確認中の候補・active 継続時間・COOLDOWN の
+        # 起点・連続観測の開始がすべて失われ、同じ連続 Telemetry でも UNKNOWN や
+        # 誤った TRANSIENT に戻ってしまう。欠測・gap による再評価は ``_replay`` が行う。
+        # ``history_window_ms`` は呼出し側が最低限保持すべき履歴の長さ（config で検証）。
+        return self._replay(snapshots, computed_at_ms)
 
     def _new_axes(self) -> tuple[_Axis, _Axis]:
         return (
@@ -115,43 +116,13 @@ class WorkloadRegimeEstimator:
             _Axis(self._config.gpu_power, self._config.activity_window_ms),
         )
 
-    def _seed_axes(
-        self, prefix: tuple[ControlStateSnapshot, ...]
-    ) -> tuple[_Axis, _Axis, int | None]:
-        """窓より前の履歴から Schmitt latch と平滑化窓だけを引き継ぐ。
-
-        deadband に留まる時間が ``history_window_ms`` を超えると閾値を跨いだ sample が
-        窓から落ち、latch が ``None`` に戻って ``UNKNOWN`` が続いてしまう。窓より前の
-        sample は latch の復元にだけ使い、duration・遷移・confidence の評価には使わない。
-        欠測・gap の扱いは ``_replay`` と同じで、連続していない latch は引き継がない。
-        """
-        cpu_axis, gpu_axis = self._new_axes()
-        previous_mono_ms: int | None = None
-        for snapshot in prefix:
-            cpu_power = self._power(snapshot, self._config.cpu_power.metric)
-            gpu_power = self._power(snapshot, self._config.gpu_power.metric)
-            gap = (
-                previous_mono_ms is not None
-                and snapshot.monotonic_ms - previous_mono_ms > self._config.max_snapshot_gap_ms
-            )
-            previous_mono_ms = snapshot.monotonic_ms
-            if cpu_power is None or gpu_power is None or gap:
-                cpu_axis, gpu_axis = self._new_axes()
-                if cpu_power is None or gpu_power is None:
-                    continue
-            cpu_axis.update(snapshot.monotonic_ms, cpu_power)
-            gpu_axis.update(snapshot.monotonic_ms, gpu_power)
-        return cpu_axis, gpu_axis, previous_mono_ms
-
     def _replay(
         self,
         snapshots: tuple[ControlStateSnapshot, ...],
         computed_at_ms: int,
-        *,
-        seed: tuple[_Axis, _Axis, int | None],
     ) -> WorkloadRegimeEstimate:
-        # seed の最後の時刻を前回時刻として扱い、窓の境界にある gap も通常どおり検出する。
-        cpu_axis, gpu_axis, previous_mono_ms = seed
+        cpu_axis, gpu_axis = self._new_axes()
+        previous_mono_ms: int | None = None
 
         published = WorkloadRegime.UNKNOWN
         candidate: WorkloadRegime | None = None
