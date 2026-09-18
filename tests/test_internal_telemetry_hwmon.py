@@ -252,3 +252,42 @@ def test_repository_config_keeps_uninstalled_t_sensor_disabled():
     assert t_sensor.maximum is None
     assert t_sensor.confirmation is None
     assert t_sensor.disabled_reason is not None
+
+
+def test_k10temp_labels_resolve_to_cpu_die_metrics(tmp_path: Path):
+    """k10temp は Tctl / Tccd* を label で公開する。番号（temp1 / temp3）には依存しない。"""
+    device = tmp_path / "hwmon3"
+    write(device / "name", "k10temp\n")
+    write(device / "temp1_label", "Tctl\n")
+    write(device / "temp1_input", "44000\n")
+    write(device / "temp3_label", "Tccd1\n")
+    write(device / "temp3_input", "43625\n")
+    write(device / "temp4_label", "Tccd2\n")
+    write(device / "temp4_input", "36500\n")
+    reader = adapter(
+        tmp_path,
+        sensor("cpu.tctl", HwmonMeasurement.TEMPERATURE, driver="k10temp", label="Tctl"),
+        sensor("cpu.ccd1", HwmonMeasurement.TEMPERATURE, driver="k10temp", label="Tccd1"),
+        sensor("cpu.ccd2", HwmonMeasurement.TEMPERATURE, driver="k10temp", label="Tccd2"),
+    )
+
+    readings = {reading.metric: reading.value for reading in reader.poll().readings}
+
+    assert readings == {"cpu.tctl": 44.0, "cpu.ccd1": 43.625, "cpu.ccd2": 36.5}
+
+
+def test_production_config_enables_k10temp_as_advisory_inputs():
+    """所有者承認（2026-09-18）の k10temp 入力が有効で、Critical 扱いの required ではない。"""
+    config = InternalTelemetryConfig.from_yaml(
+        CONFIG_DIR / "internal-telemetry.yaml",
+        catalog=MetricCatalog.from_yaml(CONFIG_DIR / "metrics.yaml"),
+    )
+    by_metric = {sensor.metric: sensor for sensor in config.hwmon.sensors}
+
+    for metric, label in (("cpu.tctl", "Tctl"), ("cpu.ccd1", "Tccd1"), ("cpu.ccd2", "Tccd2")):
+        entry = by_metric[metric]
+        assert entry.enabled
+        assert (entry.driver, entry.label) == ("k10temp", label)
+        assert not entry.required
+        assert entry.confirmation is not None
+        assert entry.confirmation.status is ConfirmationStatus.CONFIRMED

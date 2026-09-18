@@ -18,12 +18,20 @@ from coldaisle.internal_telemetry.models import (
     SourceStatus,
     TelemetryAdapter,
 )
-from coldaisle.internal_telemetry.nvml import NvmlAdapter, NvmlApi, PynvmlApi
+from coldaisle.internal_telemetry.nvml import (
+    THROTTLE_REASON_BITS,
+    ClockEventReasons,
+    NvmlAdapter,
+    NvmlApi,
+    PynvmlApi,
+)
 
 __all__ = [
     "CONNECTOR_TEMPERATURE_METRIC",
     "SOURCE_STATE_PREFIX",
+    "THROTTLE_REASON_BITS",
     "AdapterResult",
+    "ClockEventReasons",
     "CollectionCycle",
     "ConfirmationEvidence",
     "ConfirmationStatus",
