@@ -131,18 +131,23 @@ def build_server_health(
     nvml_metrics: tuple[str, ...],
 ) -> ServerHealthResponse:
     """DB の同じ current view から REST / WS 共通 payload を作る。"""
-    readings = store.latest()
-    # 一覧は新しい順に打ち切るため、重大度は件数上限の無い集計から判定する
-    alerts = list(store.alerts(state="firing", limit=settings.active_alerts_limit))
-    firing = store.alert_severity_counts(state="firing")
-    sources = _monitoring_sources(store, readings, settings, hwmon_metrics)
+    # payload 全体を DB の1時点から作る。文ごとに読むと、間に resolve や新しい
+    # サンプルが入ったとき一覧・件数・値・source 状態が食い違う。AI 要約は
+    # スナップショットの外で行い、読み取りトランザクションを長く保持しない
+    with store.read_snapshot():
+        readings = store.latest()
+        # 一覧は新しい順に打ち切るため、重大度は件数上限の無い集計から判定する
+        alerts = list(store.alerts(state="firing", limit=settings.active_alerts_limit))
+        firing = store.alert_severity_counts(state="firing")
+        sources = _monitoring_sources(store, readings, settings, hwmon_metrics)
+        gpu_mode = store.current_state("sys.gpu_mode") or "unknown"
     # 無効化・撤去した入力の最後の行は store.latest() に残り続け、やがて stale になる。
     # 監視していない metric で signal を下げないよう、必須 metric と現在有効な入力だけを
     # 見る。パネルは表示専用で、入力が無効なら値が古くても signal に影響させない
     monitored = settings.required_metrics() | frozenset((*hwmon_metrics, *nvml_metrics))
     signal = _signal(sources, readings, firing, settings.missing_tolerated, sorted(monitored))
     gpu = ServerGpuHealth(
-        mode=store.current_state("sys.gpu_mode") or "unknown",
+        mode=gpu_mode,
         metrics=_metrics(settings.panels.gpu, readings, catalog),
     )
     environment = ServerEnvironmentHealth(

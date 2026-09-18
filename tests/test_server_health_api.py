@@ -978,3 +978,55 @@ def test_old_critical_alert_beyond_the_list_limit_is_still_red(healthy_db, rules
     assert body["signal"] == "red"
     assert body["compute_mode_advisory"]["safe"] is False
     assert "more active alerts not listed: critical=1" in body["compute_mode_advisory"]["warnings"]
+
+
+def test_alert_resolved_between_reads_does_not_split_the_payload(healthy_db, rules, monkeypatch):
+    """一覧を読んだ直後に別プロセスが resolve しても、件数は同じ時点のものを使う。"""
+    with SqliteStore(healthy_db, rules=rules, clock=SimulatedClock(NOW_MS)) as store:
+        alert_id = store.open_alert(
+            rule_id="RESOLVED_MEANWHILE",
+            severity="critical",
+            metric="air.room",
+            started_ms=NOW_MS - 1_000,
+            threshold=30.0,
+            trigger_value=31.0,
+        )
+        store.fire_alert(alert_id, fired_ms=NOW_MS, trigger_value=31.0)
+
+    original = SqliteStore.alerts
+    resolved = []
+
+    def alerts_then_resolve_elsewhere(self, **kwargs):
+        listed = original(self, **kwargs)
+        if not resolved:
+            # ルールエンジン（別接続）が、一覧と件数の読み出しの間に resolve する
+            with SqliteStore(healthy_db, rules=rules, clock=SimulatedClock(NOW_MS)) as writer:
+                writer.resolve_alert(alert_id, resolved_ms=NOW_MS)
+            resolved.append(alert_id)
+        return listed
+
+    monkeypatch.setattr(SqliteStore, "alerts", alerts_then_resolve_elsewhere)
+    with TestClient(_app(healthy_db, SimulatedClock(NOW_MS))) as client:
+        during = client.get("/api/v1/server-health").json()
+        after = client.get("/api/v1/server-health").json()
+
+    assert resolved == [alert_id]
+    # resolve 前の1時点: 一覧に載る critical が signal にも反映される
+    assert [alert["rule_id"] for alert in during["active_alerts"]] == ["RESOLVED_MEANWHILE"]
+    assert during["signal"] == "red"
+    assert "more active alerts not listed" not in " ".join(
+        during["compute_mode_advisory"]["warnings"]
+    )
+    # 次の取得では resolve 後の1時点になる
+    assert after["active_alerts"] == []
+    assert after["signal"] == "green"
+
+
+def test_read_snapshot_is_read_only_and_closes_on_error(healthy_db, rules):
+    with SqliteStore(healthy_db, rules=rules, clock=SimulatedClock(NOW_MS)) as store:
+        with pytest.raises(RuntimeError), store.read_snapshot():
+            store.latest()
+            raise RuntimeError("boom")
+        # トランザクションが閉じていれば、続けて書き込める
+        store.set_system_state("sys.gpu_mode", "compute", at_ms=NOW_MS + 1)
+        assert store.current_state("sys.gpu_mode") == "compute"

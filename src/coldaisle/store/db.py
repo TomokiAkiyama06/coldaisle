@@ -257,6 +257,22 @@ class SqliteStore:
             raise
         self._conn.execute("COMMIT")
 
+    @contextmanager
+    def read_snapshot(self) -> Iterator[None]:
+        """ブロック内の読み出しを1つのスナップショットにそろえる（読み取り専用）。
+
+        autocommit では文ごとに別の時点を読むため、間に書き込みが入ると
+        「一覧にはあるのに件数には無い」ような食い違いが生じる。WAL では
+        読み取りトランザクションは書き込みを妨げず、最初の読み出し時点の
+        内容を最後まで見続ける。ブロック内で書き込まないこと。
+        """
+        self._conn.execute("BEGIN DEFERRED")
+        try:
+            yield
+        finally:
+            # 読み取りだけなので、例外時も COMMIT で閉じてよい（取り消す変更が無い）
+            self._conn.execute("COMMIT")
+
     # ------------------------------------------------------------------ 書き込み
 
     def insert_sample(self, sample: Sample) -> int:
