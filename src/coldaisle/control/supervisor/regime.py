@@ -64,13 +64,22 @@ class WorkloadRegimeEstimate(_Frozen):
 
 
 class _Axis:
-    """Power signal 1本の Schmitt trigger 状態。"""
+    """Power signal 1本の平滑化窓と Schmitt trigger 状態。"""
 
-    def __init__(self, band: WorkloadPowerBand) -> None:
+    def __init__(self, band: WorkloadPowerBand, activity_window_ms: int) -> None:
         self._band = band
+        self._activity_window_ms = activity_window_ms
+        self._samples: deque[tuple[int, float]] = deque()
         self.active: bool | None = None
+        self.mean_w: float | None = None
 
-    def update(self, mean_w: float) -> bool | None:
+    def update(self, mono_ms: int, power_w: float) -> bool | None:
+        self._samples.append((mono_ms, power_w))
+        smoothing_cutoff = mono_ms - self._activity_window_ms
+        while self._samples and self._samples[0][0] < smoothing_cutoff:
+            self._samples.popleft()
+        mean_w = sum(value for _, value in self._samples) / len(self._samples)
+        self.mean_w = mean_w
         if mean_w >= self._band.active_above_w:
             self.active = True
         elif mean_w <= self._band.idle_below_w:
@@ -96,18 +105,53 @@ class WorkloadRegimeEstimator:
 
         end_mono_ms = snapshots[-1].monotonic_ms
         cutoff_ms = max(0, end_mono_ms - self._config.history_window_ms)
+        prefix = tuple(snapshot for snapshot in snapshots if snapshot.monotonic_ms < cutoff_ms)
         window = tuple(snapshot for snapshot in snapshots if snapshot.monotonic_ms >= cutoff_ms)
-        return self._replay(window, computed_at_ms)
+        return self._replay(window, computed_at_ms, seed=self._seed_axes(prefix))
+
+    def _new_axes(self) -> tuple[_Axis, _Axis]:
+        return (
+            _Axis(self._config.cpu_power, self._config.activity_window_ms),
+            _Axis(self._config.gpu_power, self._config.activity_window_ms),
+        )
+
+    def _seed_axes(
+        self, prefix: tuple[ControlStateSnapshot, ...]
+    ) -> tuple[_Axis, _Axis, int | None]:
+        """窓より前の履歴から Schmitt latch と平滑化窓だけを引き継ぐ。
+
+        deadband に留まる時間が ``history_window_ms`` を超えると閾値を跨いだ sample が
+        窓から落ち、latch が ``None`` に戻って ``UNKNOWN`` が続いてしまう。窓より前の
+        sample は latch の復元にだけ使い、duration・遷移・confidence の評価には使わない。
+        欠測・gap の扱いは ``_replay`` と同じで、連続していない latch は引き継がない。
+        """
+        cpu_axis, gpu_axis = self._new_axes()
+        previous_mono_ms: int | None = None
+        for snapshot in prefix:
+            cpu_power = self._power(snapshot, self._config.cpu_power.metric)
+            gpu_power = self._power(snapshot, self._config.gpu_power.metric)
+            gap = (
+                previous_mono_ms is not None
+                and snapshot.monotonic_ms - previous_mono_ms > self._config.max_snapshot_gap_ms
+            )
+            previous_mono_ms = snapshot.monotonic_ms
+            if cpu_power is None or gpu_power is None or gap:
+                cpu_axis, gpu_axis = self._new_axes()
+                if cpu_power is None or gpu_power is None:
+                    continue
+            cpu_axis.update(snapshot.monotonic_ms, cpu_power)
+            gpu_axis.update(snapshot.monotonic_ms, gpu_power)
+        return cpu_axis, gpu_axis, previous_mono_ms
 
     def _replay(
         self,
         snapshots: tuple[ControlStateSnapshot, ...],
         computed_at_ms: int,
+        *,
+        seed: tuple[_Axis, _Axis, int | None],
     ) -> WorkloadRegimeEstimate:
-        cpu_axis = _Axis(self._config.cpu_power)
-        gpu_axis = _Axis(self._config.gpu_power)
-        cpu_window: deque[tuple[int, float]] = deque()
-        gpu_window: deque[tuple[int, float]] = deque()
+        # seed の最後の時刻を前回時刻として扱い、窓の境界にある gap も通常どおり検出する。
+        cpu_axis, gpu_axis, previous_mono_ms = seed
 
         published = WorkloadRegime.UNKNOWN
         candidate: WorkloadRegime | None = None
@@ -118,7 +162,6 @@ class WorkloadRegimeEstimator:
         gpu_inactive_since_ms: int | None = None
         last_active_ms: int | None = None
         valid_since_ms: int | None = None
-        previous_mono_ms: int | None = None
         cpu_mean_w: float | None = None
         gpu_mean_w: float | None = None
         reason = RegimeReason.INSUFFICIENT_HISTORY
@@ -141,10 +184,7 @@ class WorkloadRegimeEstimator:
                 gpu_inactive_since_ms = None
                 last_active_ms = None
                 valid_since_ms = None
-                cpu_axis = _Axis(self._config.cpu_power)
-                gpu_axis = _Axis(self._config.gpu_power)
-                cpu_window.clear()
-                gpu_window.clear()
+                cpu_axis, gpu_axis = self._new_axes()
                 cpu_mean_w = None
                 gpu_mean_w = None
                 if cpu_power is None or gpu_power is None:
@@ -155,18 +195,10 @@ class WorkloadRegimeEstimator:
             mono_ms = snapshot.monotonic_ms
             if valid_since_ms is None:
                 valid_since_ms = mono_ms
-            cpu_window.append((mono_ms, cpu_power))
-            gpu_window.append((mono_ms, gpu_power))
-            smoothing_cutoff = mono_ms - self._config.activity_window_ms
-            while cpu_window and cpu_window[0][0] < smoothing_cutoff:
-                cpu_window.popleft()
-            while gpu_window and gpu_window[0][0] < smoothing_cutoff:
-                gpu_window.popleft()
-            cpu_mean_w = sum(value for _, value in cpu_window) / len(cpu_window)
-            gpu_mean_w = sum(value for _, value in gpu_window) / len(gpu_window)
-
-            cpu_active = cpu_axis.update(cpu_mean_w)
-            gpu_active = gpu_axis.update(gpu_mean_w)
+            cpu_active = cpu_axis.update(mono_ms, cpu_power)
+            gpu_active = gpu_axis.update(mono_ms, gpu_power)
+            cpu_mean_w = cpu_axis.mean_w
+            gpu_mean_w = gpu_axis.mean_w
             observed_ms = mono_ms - valid_since_ms
             if cpu_active is None or gpu_active is None:
                 raw = WorkloadRegime.UNKNOWN

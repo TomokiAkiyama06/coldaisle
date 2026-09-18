@@ -343,3 +343,35 @@ def test_power_metrics_must_be_distinct_known_watt_signals() -> None:
             missing_cpu,
             SimulatedClock(BASE_TS_MS),
         )
+
+
+@pytest.mark.parametrize(
+    ("crossing_cpu_w", "latched"),
+    [
+        (90.0, WorkloadRegime.SUSTAINED_CPU),
+        (10.0, WorkloadRegime.IDLE),
+    ],
+)
+def test_schmitt_latch_survives_deadband_longer_than_history_window(
+    crossing_cpu_w: float, latched: WorkloadRegime
+) -> None:
+    crossing = [snapshot(second, cpu_w=crossing_cpu_w, gpu_w=20.0) for second in range(2)]
+    # history_window_ms=30s を超えて deadband に留まり、閾値を跨いだ sample は窓から落ちる。
+    deadband = [snapshot(second, cpu_w=45.0, gpu_w=20.0) for second in range(2, 45)]
+
+    result = estimate(crossing + deadband)
+
+    assert result.regime is latched
+    assert result.reason is RegimeReason.OBSERVED_HISTORY
+    assert result.confidence == pytest.approx(1.0)
+
+
+def test_latch_is_not_carried_across_a_gap_before_the_history_window() -> None:
+    crossing = [snapshot(second, cpu_w=90.0, gpu_w=20.0) for second in range(2)]
+    # 5s の gap（max_snapshot_gap_ms=1s 超）の後は、跨いだ latch を引き継がない。
+    deadband = [snapshot(second, cpu_w=45.0, gpu_w=20.0) for second in range(7, 50)]
+
+    result = estimate(crossing + deadband)
+
+    assert result.regime is WorkloadRegime.UNKNOWN
+    assert result.reason is RegimeReason.AMBIGUOUS_POWER
