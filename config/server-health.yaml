@@ -1,0 +1,60 @@
+# Server Health API（GET /api/v1/server-health）の監視対象（#66 / 決定記録 0040）
+#
+# 閾値ではなく「どの metric を見るか」の宣言です。signal の判定規則そのものは
+# docs/api-contract.md §3 と決定記録 0040 にあります。
+
+version: 1
+
+# source ごとの監視必須 metric。すべて quality=ok なら ok、一部なら degraded、
+# 全滅なら unavailable（signal は red）。
+sources:
+  sensor_unit:
+    required:
+      - air.room
+      - air.room_humidity
+      - air.front_intake
+      - air.gpu_intake
+      - air.gpu_exhaust
+      - air.top_exhaust
+      - air.rear_exhaust
+  # NVML adapter が source 状態の判定に使う critical metric（core 温度と電力）と揃える。
+  nvml:
+    required:
+      - gpu.0.core
+      - power.gpu.0
+
+# payload に常に載せる metric（値が無くてもキーを省略しない）。表示専用で、
+# signal は監視必須 metric と internal-telemetry.yaml で有効な入力だけで判定する。
+panels:
+  gpu:
+    - gpu.0.core
+    - gpu.0.hotspot
+    - gpu.0.mem
+    - gpu.0.utilization
+    - gpu.0.vram_used
+    - power.gpu.0
+    - sys.cuda_processes
+  environment:
+    - air.room
+    - air.room_humidity
+    - air.front_intake
+    - air.gpu_intake
+    - air.gpu_exhaust
+    - air.top_exhaust
+    - air.rear_exhaust
+    - cpu.package
+    - power.cpu.package
+    - cpu.vrm
+    - board.chipset
+    - board.connector_12v2x6
+
+# active_alerts に載せる件数の上限（新しい順）。signal の判定と compute_mode_advisory の
+# 件数は、この上限に関係なく発生中の全件から数える。
+active_alerts_limit: 100
+
+# GPU / driver によっては公開されない metric。collector は毎回 quality=missing で
+# 保存するため、missing だけは signal を下げない（suspect / stale は下げる）。
+# RTX PRO 6000 は NVML で hotspot / memory 温度を返さないことを実機で確認済み。
+missing_tolerated:
+  - gpu.0.hotspot
+  - gpu.0.mem

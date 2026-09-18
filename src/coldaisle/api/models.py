@@ -9,7 +9,8 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
-from typing import Any
+from enum import StrEnum
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -135,6 +136,102 @@ class HealthResponse(BaseModel):
 
     **0 でない日は原因を追う。** 保存が取り込みに追いつけていない。
     """
+
+
+class ServerSignal(StrEnum):
+    """Workspace がそのまま描画できる決定論的な信号色。"""
+
+    GREEN = "green"
+    YELLOW = "yellow"
+    RED = "red"
+
+
+class HealthSourceStatus(StrEnum):
+    """Server Health が公開する情報源の状態。"""
+
+    OK = "ok"
+    DEGRADED = "degraded"
+    UNAVAILABLE = "unavailable"
+    DISABLED = "disabled"
+    STOPPED = "stopped"
+
+
+class HealthSource(BaseModel):
+    """1つの情報源の生死と最後に見えた測定時刻。"""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    status: HealthSourceStatus
+    detail: str
+    last_sample_ts_ms: int | None
+    last_sample_at: str | None
+
+
+class HealthSources(BaseModel):
+    """Issue #66 が固定する4つの情報源。"""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    sensor_unit: HealthSource
+    nvml: HealthSource
+    lm_sensors: HealthSource
+    ai_layer: HealthSource
+
+
+class ServerHealthMetric(BaseModel):
+    """Server Health 内の現在値。未取得でもキーを残す。"""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    value: float | None
+    unit: str | None
+    quality: Quality
+    age_seconds: float | None
+
+
+class ServerGpuHealth(BaseModel):
+    """Workspace が ``nvidia-smi`` 無しで描画する GPU 状態。"""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    mode: str
+    metrics: dict[str, ServerHealthMetric]
+
+
+class ServerEnvironmentHealth(BaseModel):
+    """外気・ケース・CPU/Board の現在値。"""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    metrics: dict[str, ServerHealthMetric]
+
+
+class ComputeModeAdvisory(BaseModel):
+    """Compute Mode 切替の判断材料。制御や拒否には使わない。"""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    safe: bool
+    warnings: tuple[str, ...]
+    blocking: Literal[False] = False
+
+
+class ServerHealthResponse(BaseModel):
+    """``GET /api/v1/server-health`` と対応 WebSocket の共通 payload。"""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    schema_version: Literal[1] = 1
+    generated_at_ms: int
+    generated_at: str
+    signal: ServerSignal
+    summary: str
+    summary_source: Literal["ai", "template"]
+    gpu: ServerGpuHealth
+    environment: ServerEnvironmentHealth
+    active_alerts: list[AlertRecord]
+    sources: HealthSources
+    compute_mode_advisory: ComputeModeAdvisory
 
 
 class SensorOut(BaseModel):

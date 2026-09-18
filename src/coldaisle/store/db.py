@@ -21,6 +21,7 @@ from coldaisle.clock import Clock
 from coldaisle.store import migrations
 from coldaisle.store.models import (
     AlertRecord,
+    AlertSeverity,
     ControlTraceRecord,
     DeviceRecord,
     LatestReading,
@@ -255,6 +256,22 @@ class SqliteStore:
             self._conn.execute("ROLLBACK")
             raise
         self._conn.execute("COMMIT")
+
+    @contextmanager
+    def read_snapshot(self) -> Iterator[None]:
+        """ブロック内の読み出しを1つのスナップショットにそろえる（読み取り専用）。
+
+        autocommit では文ごとに別の時点を読むため、間に書き込みが入ると
+        「一覧にはあるのに件数には無い」ような食い違いが生じる。WAL では
+        読み取りトランザクションは書き込みを妨げず、最初の読み出し時点の
+        内容を最後まで見続ける。ブロック内で書き込まないこと。
+        """
+        self._conn.execute("BEGIN DEFERRED")
+        try:
+            yield
+        finally:
+            # 読み取りだけなので、例外時も COMMIT で閉じてよい（取り消す変更が無い）
+            self._conn.execute("COMMIT")
 
     # ------------------------------------------------------------------ 書き込み
 
@@ -629,6 +646,18 @@ class SqliteStore:
             (*params, limit),
         ).fetchall()
         return tuple(AlertRecord.model_validate(dict(row)) for row in rows)
+
+    def alert_severity_counts(self, *, state: str) -> dict[AlertSeverity, int]:
+        """``state`` のアラートを severity ごとに数える（件数上限なし）。
+
+        一覧（``alerts()``）は新しい順に件数で打ち切るため、古い critical を
+        見落とす。重大度の判定は一覧ではなくこちらで行う（#66）。
+        """
+        rows = self._conn.execute(
+            "SELECT severity, COUNT(*) AS n FROM alerts WHERE state = ? GROUP BY severity",
+            (state,),
+        ).fetchall()
+        return {AlertSeverity(row["severity"]): int(row["n"]) for row in rows}
 
     def fired_alerts(
         self, *, start_ms: int, end_ms: int, limit: int = 100

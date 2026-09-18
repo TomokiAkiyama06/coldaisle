@@ -4,6 +4,7 @@
 - **Status**: Proposed（本 PR のマージをもって FINAL）
 - **Date**: 2026-08-25
 - **Supersedes**: なし
+- **Superseded by**: [0040](0040-server-health-api.md)（§5 未決事項1 のみ。他の節は有効）
 - **関連**: [`0002-metric-naming.md`](0002-metric-naming.md) §2.2 / §2.6 /
   [`0004-storage-read-contract.md`](0004-storage-read-contract.md) §2.1 / §2.3 / §2.9 / §5 /
   [`0007-ingest-pipeline.md`](0007-ingest-pipeline.md) §2.11 /

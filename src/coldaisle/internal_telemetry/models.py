@@ -13,6 +13,9 @@ from pydantic import BaseModel, ConfigDict
 
 from coldaisle.store import Reading
 
+SOURCE_STATE_PREFIX = "sys.telemetry_source."
+"""Internal Telemetry source の現在状態を保存する ``system_state`` key prefix。"""
+
 
 class SourceStatus(StrEnum):
     """1回の poll における情報源の状態。"""

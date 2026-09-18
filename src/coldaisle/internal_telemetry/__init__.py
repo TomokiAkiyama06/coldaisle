@@ -12,11 +12,17 @@ from coldaisle.internal_telemetry.config import (
     NvmlConfig,
 )
 from coldaisle.internal_telemetry.hwmon import HwmonAdapter
-from coldaisle.internal_telemetry.models import AdapterResult, SourceStatus, TelemetryAdapter
+from coldaisle.internal_telemetry.models import (
+    SOURCE_STATE_PREFIX,
+    AdapterResult,
+    SourceStatus,
+    TelemetryAdapter,
+)
 from coldaisle.internal_telemetry.nvml import NvmlAdapter, NvmlApi, PynvmlApi
 
 __all__ = [
     "CONNECTOR_TEMPERATURE_METRIC",
+    "SOURCE_STATE_PREFIX",
     "AdapterResult",
     "CollectionCycle",
     "ConfirmationEvidence",
