@@ -18,6 +18,11 @@ v1 の `gpu.0` は「実機に1台だけある GPU」という論理 role であ
 へ直結しない。複数 GPU 対応には、リポジトリ外で管理する承認済み UUID / PCI identity
 から logical index への対応を別途決める。
 
+`coldaisle-rollup` は `config/internal-telemetry.yaml`（`--internal-telemetry` で変更可）の
+`interval_ms` と有効な入力から、各 metric の1分あたり期待サンプル数を出す。collector が
+止まった分は0行の1分バケットとして残り、生データの保持期間を過ぎても欠測として追える。
+無効な入力（未設置の T_SENSOR など）には期待値を作らない。
+
 ## hwmon の対応付け
 
 `config/internal-telemetry.yaml` の `sensors` は、実機で確認した driver の `name` と

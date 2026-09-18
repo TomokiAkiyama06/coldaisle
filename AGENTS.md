@@ -222,6 +222,7 @@ src/coldaisle/
   escalate.py # 合成の起点: 故障疑いの案件資料（AI非依存・送信しない）。#39
   memory.py   # 合成の起点: 運用メモリの記録（確認を経由する）。#40
   calibrate.py# 合成の起点: 較正オフセットの算出（確認を経由する）。#13
+  rollup_job.py # 合成の起点: `coldaisle-rollup` の入口（周期メトリクスを Store へ渡す）。#65
   store/      # L1: SQLite、ロールアップ、CSVエクスポート
   api/        # L2: FastAPI、WebSocket
   rules/      # L2: アラート用ルールエンジン（決定論的。LLM非依存）

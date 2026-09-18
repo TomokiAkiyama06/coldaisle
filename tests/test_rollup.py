@@ -576,3 +576,57 @@ def test_absent_minutes_are_not_filled_before_the_first_observation(store):
         "SELECT bucket_ms FROM readings_1m WHERE metric = 'air.gpu_intake' ORDER BY bucket_ms"
     ).fetchall()
     assert [row["bucket_ms"] for row in rows] == [10 * MINUTE_MS]
+
+
+# ---------------------------------------------------------------- 周期メトリクス（#65）
+
+
+def test_periodic_internal_metric_keeps_an_outage_after_raw_retention(store, rules_30d):
+    """Internal Telemetry daemon の停止区間が、生データを消したあとも欠測として残る。"""
+    for minute in (0, 3):
+        for index in range(24):
+            write(store, "gpu.0.core", minute * MINUTE_MS + index * 2_500, 55.0)
+    intervals = {"gpu.0.core": 2_500}
+
+    rollup_minutes(store, periodic_intervals_ms=intervals)
+    rows = store.connection.execute(
+        "SELECT bucket_ms, row_count, expected_count FROM readings_1m "
+        "WHERE metric = 'gpu.0.core' ORDER BY bucket_ms"
+    ).fetchall()
+    assert [tuple(row) for row in rows] == [
+        (0, 24, 24),
+        (MINUTE_MS, 0, 24),
+        (2 * MINUTE_MS, 0, 24),
+        (3 * MINUTE_MS, 24, 24),
+    ]
+
+    rollup_hours(store)
+    write(store, "gpu.0.core", 40 * DAY_MS, 55.0)
+    run(store, rules_30d, now_ms=40 * DAY_MS, periodic_intervals_ms=intervals)
+    hour = store.connection.execute(
+        "SELECT row_count, expected_count FROM readings_1h "
+        "WHERE metric = 'gpu.0.core' AND bucket_ms = 0"
+    ).fetchone()
+    assert len(store.series("gpu.0.core", 0, HOUR_MS)) == 0, "生データは保持期間で消えた"
+    assert tuple(hour) == (48, 60 * 24), "停止した分は期待値にだけ数えられて残る"
+
+
+def test_unregistered_internal_metric_has_no_expectation(store):
+    """周期を登録しないメトリクスは従来どおり事象扱い（期待値 NULL）。"""
+    write(store, "gpu.0.core", 0, 55.0)
+    write(store, "gpu.0.core", 3 * MINUTE_MS, 55.0)
+    rollup_minutes(store)
+    rows = store.connection.execute(
+        "SELECT expected_count FROM readings_1m WHERE metric = 'gpu.0.core'"
+    ).fetchall()
+    assert [row[0] for row in rows] == [None, None]
+
+
+@pytest.mark.parametrize(
+    "intervals",
+    [{"air.room": 2_500}, {"gpu.0.core": 0}, {"gpu.0.core": MINUTE_MS + 1}],
+)
+def test_invalid_periodic_intervals_are_rejected(store, intervals):
+    write(store, "gpu.0.core", 0, 55.0)
+    with pytest.raises(ValueError):
+        rollup_minutes(store, periodic_intervals_ms=intervals)

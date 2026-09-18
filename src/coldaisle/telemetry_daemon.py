@@ -135,6 +135,23 @@ class InternalTelemetryDaemon:
         return self.stats
 
 
+def periodic_metric_intervals(config: InternalTelemetryConfig) -> dict[str, int]:
+    """有効な入力ごとの収集周期。ロールアップの期待サンプル数に使う。
+
+    daemon が止まった区間を、生データの保持期間を過ぎても欠測として残すため
+    （``coldaisle.store.rollup.rollup_minutes``）。対象は build() と同じ adapter の
+    ``expected_metrics`` から出し、metric 一覧を二重管理しない。adapter は構築時に
+    NVML / sysfs を開かない。
+    """
+    adapters: tuple[TelemetryAdapter, ...] = (
+        NvmlAdapter(config.nvml),
+        HwmonAdapter(config.hwmon),
+    )
+    return {
+        metric: config.interval_ms for adapter in adapters for metric in adapter.expected_metrics
+    }
+
+
 def build(
     config: Config,
     *,

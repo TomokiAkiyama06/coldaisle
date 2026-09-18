@@ -6,7 +6,7 @@ import logging
 from dataclasses import dataclass
 from pathlib import Path
 
-from coldaisle import logs
+from coldaisle import logs, rollup_job
 from coldaisle.clock import SimulatedClock
 from coldaisle.internal_telemetry import (
     AdapterResult,
@@ -19,6 +19,7 @@ from coldaisle.telemetry_daemon import (
     SOURCE_STATE_PREFIX,
     InternalTelemetryDaemon,
     _log_configuration,
+    periodic_metric_intervals,
 )
 from conftest import CONFIG_DIR
 
@@ -123,3 +124,55 @@ def test_startup_audit_logs_disabled_reason_and_confirmation(caplog):
     assert fields["enabled"] is False
     assert fields["selector"] == "none"
     assert fields["disabled_reason"].startswith("not installed")
+
+
+def test_periodic_metric_intervals_follow_the_configured_interval():
+    """ロールアップへ渡す周期は設定の interval_ms と有効な入力だけから作る。"""
+    config = InternalTelemetryConfig.from_yaml(CONFIG_DIR / "internal-telemetry.yaml")
+
+    intervals = periodic_metric_intervals(config)
+
+    assert intervals["gpu.0.core"] == config.interval_ms
+    assert intervals["sys.cuda_processes"] == config.interval_ms
+    # 無効な T_SENSOR には期待値を作らない（未設置は欠測ではない）
+    assert "board.connector_12v2x6" not in intervals
+
+
+def test_rollup_entry_point_registers_internal_metrics(tmp_path: Path, rules):
+    """`coldaisle-rollup` が Internal Telemetry の周期を Store のロールアップへ渡す。"""
+    database = tmp_path / "rollup.db"
+    with SqliteStore(database, rules=rules, clock=SimulatedClock(0)) as store:
+        for ts_ms in (0, 3 * 60_000):
+            store.insert_sample(
+                Sample(
+                    ts_ms=ts_ms,
+                    readings=(Reading(metric="gpu.0.core", value=55.0, quality=Quality.OK),),
+                )
+            )
+    retention = tmp_path / "retention.yaml"
+    retention.write_text(
+        f"raw_days: 30\ncontrol_trace_days: 30\ncsv_dir: {tmp_path / 'csv'}\n", encoding="utf-8"
+    )
+    telemetry = tmp_path / "internal-telemetry.yaml"
+    telemetry.write_text(
+        "version: 1\ninterval_ms: 5000\n"
+        "nvml: {enabled: true, gpu_indices: [0]}\n"
+        "hwmon: {enabled: false, root: /sys/class/hwmon, sensors: []}\n",
+        encoding="utf-8",
+    )
+
+    code = rollup_job.main(
+        [
+            f"--db={database}",
+            f"--retention={retention}",
+            f"--quality-rules={CONFIG_DIR / 'quality.yaml'}",
+            f"--internal-telemetry={telemetry}",
+        ]
+    )
+
+    assert code == 0
+    with SqliteStore(database, rules=rules, clock=SimulatedClock(0)) as store:
+        expected = store.connection.execute(
+            "SELECT expected_count FROM readings_1m WHERE metric = 'gpu.0.core'"
+        ).fetchall()
+    assert [row[0] for row in expected] == [12, 12, 12, 12]

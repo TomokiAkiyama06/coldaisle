@@ -15,7 +15,7 @@ from __future__ import annotations
 import argparse
 import logging
 import sqlite3
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
@@ -80,8 +80,15 @@ class Result:
     control_trace_cutoff_ms: int | None = None
 
 
-def rollup_minutes(store: SqliteStore) -> int:
+def rollup_minutes(
+    store: SqliteStore, *, periodic_intervals_ms: Mapping[str, int] | None = None
+) -> int:
     """生データを1分バケットへ集計する（FR-202）。書いたバケット数を返す。
+
+    ``periodic_intervals_ms`` は外付けデバイス以外で**周期的に届く**メトリクスと
+    その収集周期（Internal Telemetry など。#65）。ここに載ったメトリクスも
+    期待サンプル数を持ち、1件も届かなかった分が0行のバケットとして残る。
+    Store は上位の設定を読まない（レイヤは一方向）ので、周期は呼び出し側が渡す。
 
     **未集計の範囲だけを見る。** 毎回すべてを数え直すと、保持期間ぶんの行を
     走査することになる。ただし前回の最終バケットは**必ず数え直す**。
@@ -104,13 +111,14 @@ def rollup_minutes(store: SqliteStore) -> int:
         start = _floor(int(oldest), MINUTE_MS)
     newest_bucket = _floor(int(newest), MINUTE_MS)
     expected = _expected_per_minute(conn)
+    periodic = _periodic_expected_per_minute(periodic_intervals_ms or {})
 
     written = 0
     for metric in store.metrics():
         # 期待サンプル数は**周期的に届くメトリクスにだけ**意味がある。
         # `sys.dropped_samples` は起きたときしか書かない（決定記録 0007 §2.4）ので、
         # 期待値を持たせると欠測率が無意味な値になる
-        metric_expected = expected if metric in METRIC_TO_CHANNEL else None
+        metric_expected = expected if metric in METRIC_TO_CHANNEL else periodic.get(metric)
         with store.transaction():
             cursor = conn.execute(
                 "INSERT OR REPLACE INTO readings_1m "
@@ -166,6 +174,22 @@ def _fill_absent_minutes(
         (fill_from, newest_bucket, metric, expected),
     )
     return int(cursor.rowcount)
+
+
+def _periodic_expected_per_minute(intervals_ms: Mapping[str, int]) -> dict[str, int]:
+    """呼び出し側が登録した周期から、1分あたりの期待サンプル数を出す。
+
+    外付けデバイスのチャネルは起動バナーの周期が正本なので、二重登録を拒否する。
+    1分より長い周期は1分バケットの期待値が0以下になり欠測率が定義できないため拒否する。
+    """
+    result: dict[str, int] = {}
+    for metric, interval_ms in intervals_ms.items():
+        if metric in METRIC_TO_CHANNEL:
+            raise ValueError(f"デバイスのチャネルは周期を登録できない: {metric}")
+        if interval_ms <= 0 or interval_ms > MINUTE_MS:
+            raise ValueError(f"周期は 1..{MINUTE_MS} ms にする: {metric}={interval_ms}")
+        result[metric] = MINUTE_MS // interval_ms
+    return result
 
 
 def _floor(value: int, unit: int) -> int:
@@ -235,9 +259,15 @@ def vacuum(store: SqliteStore) -> None:
     store.connection.execute("VACUUM")
 
 
-def run(store: SqliteStore, rules: RetentionRules, *, now_ms: int) -> Result:
+def run(
+    store: SqliteStore,
+    rules: RetentionRules,
+    *,
+    now_ms: int,
+    periodic_intervals_ms: Mapping[str, int] | None = None,
+) -> Result:
     """ロールアップ → 削除の順で実行する。"""
-    minutes = rollup_minutes(store)
+    minutes = rollup_minutes(store, periodic_intervals_ms=periodic_intervals_ms)
     hours = rollup_hours(store)
     deleted, cutoff = apply_retention(store, rules, now_ms=now_ms)
     trace_cutoff = max(0, now_ms - rules.control_trace_retention_ms)
@@ -267,8 +297,15 @@ def _expected_per_minute(conn: sqlite3.Connection) -> int | None:
     return MINUTE_MS // int(row[0])
 
 
-def main(argv: Sequence[str] | None = None) -> int:
-    """`coldaisle-rollup`。cron / systemd タイマーから1日1回呼ぶ想定。
+def main(
+    argv: Sequence[str] | None = None,
+    *,
+    periodic_intervals_ms: Mapping[str, int] | None = None,
+) -> int:
+    """ロールアップの CLI 本体。cron / systemd タイマーから1日1回呼ぶ想定。
+
+    入口の `coldaisle-rollup` は `coldaisle.rollup_job` で、Internal Telemetry の設定から
+    周期メトリクスを組み立ててここへ渡す（Store は上位の設定を import しない）。
 
     取り込みデーモンの中では動かさない。`VACUUM` が書き込みを止めるうえ、
     集計中に取り込みが遅れる理由を増やしたくない（取り込みは止めない、が優先）。
@@ -290,7 +327,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     args.db.parent.mkdir(parents=True, exist_ok=True)
     store = SqliteStore(args.db, rules=QualityRules.from_yaml(args.quality_rules), clock=clock)
     try:
-        result = run(store, rules, now_ms=clock.now_ms())
+        result = run(
+            store, rules, now_ms=clock.now_ms(), periodic_intervals_ms=periodic_intervals_ms
+        )
         LOGGER.info(
             "ロールアップと削除を実行した",
             extra={
