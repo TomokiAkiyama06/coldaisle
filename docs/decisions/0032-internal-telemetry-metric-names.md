@@ -42,10 +42,10 @@ v1 の `gpu.0` は NVML の列挙 index を永続 identity とする名前では
 収集を `unavailable` にし、推測で GPU を選ばない。複数 GPU を扱う場合は、承認済みの
 UUID / PCI identity（個体値はリポジトリ外）から logical index への対応を先に決める。
 
-T_SENSOR は未設置なので、本記録が FINAL になっても設置・#50 の較正・妥当範囲の承認が
+T_SENSOR は未設置なので、本記録が FINAL であっても、設置・#50 の較正・妥当範囲の承認が
 終わるまで本番設定を `enabled: false` に保つ。有効化前は欠測でも Critical としない
 （0029 §2.4）。有効化には #50 の測定・較正と所有者承認を `status: confirmed` / `basis`
-として残す。現在の実装と設定はこの Proposed 名を受け付けるが、本番収集は無効である。
+として残す。実装と設定はこれらの名前を受け付けるが、T_SENSOR の本番収集は無効である。
 
 ## 3. Consequences
 
