@@ -1,7 +1,7 @@
 # 決定記録 0047: CPU 使用率のメトリクス名（`cpu.utilization`）
 
 - **種別**: Decision Record
-- **Status**: Proposed（名前は 2026-09-18 に所有者が承認。FINAL への変更は所有者が行う）
+- **Status**: FINAL（2026-09-18、リポジトリ所有者が承認）
 - **Date**: 2026-09-18
 - **Supersedes**: なし（決定記録 0032 / 0043 は変えない。0002 §2.1 の文法で名前を足す）
 - **関連**: [`0002-metric-naming.md`](0002-metric-naming.md) §2.1 /
@@ -19,7 +19,7 @@ GPU には `gpu.0.utilization`（0032）があるが、CPU の負荷を表す値
 
 2026-09-18、リポジトリ所有者がセッション内で、CPU 使用率を `cpu.utilization`（単位 %、
 Advisory、`/proc/stat` から全 CPU を合わせて計算）として収集することと、その名前を承認した
-（コーディネーター経由で伝達）。本記録は Proposed とし、FINAL への変更は所有者が行う。
+（セッション内で所有者が直接回答）。
 
 ## 2. Decision
 
