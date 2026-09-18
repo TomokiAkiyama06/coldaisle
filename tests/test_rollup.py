@@ -756,3 +756,44 @@ def test_re_enabled_metric_is_not_filled_before_it_is_observed_again(store):
     rollup_minutes(store, periodic_intervals_ms=intervals, now_ms=15 * MINUTE_MS)
 
     assert _minute_rows(store, "gpu.0.core") == [(0, 1, 24), (MINUTE_MS, 0, 24)]
+
+
+def test_quiet_disabled_period_is_not_an_outage_after_re_enabling(store):
+    """無効の間に全 source が静かでも、再有効化後に無効期間を欠測にしない。"""
+    intervals = {"gpu.0.core": 2_500}
+    write(store, "gpu.0.core", 0, 55.0)
+    rollup_minutes(store, periodic_intervals_ms=intervals, now_ms=MINUTE_MS)
+    # 無効化中のロールアップ。生データは1行も増えない
+    rollup_minutes(store, periodic_intervals_ms={}, now_ms=5 * MINUTE_MS)
+    write(store, "gpu.0.core", 10 * MINUTE_MS, 55.0)
+
+    rollup_minutes(store, periodic_intervals_ms=intervals, now_ms=13 * MINUTE_MS)
+
+    assert _minute_rows(store, "gpu.0.core") == [
+        (0, 1, 24),
+        (10 * MINUTE_MS, 1, 24),
+        (11 * MINUTE_MS, 0, 24),
+        (12 * MINUTE_MS, 0, 24),
+    ]
+    state = store.connection.execute(
+        "SELECT registered, active_from_ms FROM periodic_metric_registrations "
+        "WHERE metric = 'gpu.0.core'"
+    ).fetchone()
+    assert tuple(state) == (1, 10 * MINUTE_MS)
+
+
+def test_re_enabled_metric_waits_for_its_first_new_observation(store):
+    """再有効化の直後に観測が無ければ埋めず、次の実行で最初の観測から埋める。"""
+    intervals = {"gpu.0.core": 2_500}
+    write(store, "gpu.0.core", 0, 55.0)
+    rollup_minutes(store, periodic_intervals_ms=intervals, now_ms=MINUTE_MS)
+    rollup_minutes(store, periodic_intervals_ms={}, now_ms=5 * MINUTE_MS)
+    rollup_minutes(store, periodic_intervals_ms=intervals, now_ms=8 * MINUTE_MS)
+    assert _minute_rows(store, "gpu.0.core") == [(0, 1, 24)]
+
+    write(store, "gpu.0.core", 9 * MINUTE_MS, 55.0)
+    rollup_minutes(store, periodic_intervals_ms=intervals, now_ms=12 * MINUTE_MS)
+
+    assert _minute_rows(store, "gpu.0.core") == [(0, 1, 24)] + [
+        (minute * MINUTE_MS, 1 if minute == 9 else 0, 24) for minute in (9, 10, 11)
+    ]

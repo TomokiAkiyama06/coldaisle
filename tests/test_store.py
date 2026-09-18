@@ -67,7 +67,7 @@ def sample(ts_ms: int, **values: float | None) -> Sample:
 
 def test_open_applies_migrations(store):
     applied = store.connection.execute("SELECT version FROM schema_version").fetchall()
-    assert [row["version"] for row in applied] == [1, 2]
+    assert [row["version"] for row in applied] == [1, 2, 3]
 
 
 def test_reopen_does_not_reapply(db_path, rules):
@@ -76,7 +76,11 @@ def test_reopen_does_not_reapply(db_path, rules):
     with SqliteStore(db_path, rules=rules, clock=SimulatedClock(222)) as second:
         query = "SELECT version, applied_ms FROM schema_version"
         rows = second.connection.execute(query).fetchall()
-        assert [(row["version"], row["applied_ms"]) for row in rows] == [(1, 111), (2, 111)]
+        assert [(row["version"], row["applied_ms"]) for row in rows] == [
+            (1, 111),
+            (2, 111),
+            (3, 111),
+        ]
         # 適用済みの DB を開き直してもデータは残る
         assert second.latest(at_ms=1_000)["air.room"].value == 26.0
 
@@ -442,7 +446,7 @@ def test_concurrent_open_does_not_break(tmp_path, rules):
         futures = [pool.submit(open_store) for _ in range(2)]
         counts = [future.result(timeout=30) for future in futures]
 
-    assert counts == [2, 2], "どちらの接続から見ても全マイグレーションが1回ずつ適用される"
+    assert counts == [3, 3], "どちらの接続から見ても全マイグレーションが1回ずつ適用される"
 
 
 def test_version_is_rechecked_after_taking_the_lock(tmp_path, rules, monkeypatch):
@@ -474,7 +478,7 @@ def test_version_is_rechecked_after_taking_the_lock(tmp_path, rules, monkeypatch
     monkeypatch.setattr(mig, "_pending", pending_then_lose_the_race)
     try:
         assert mig.apply_pending(conn, now_ms=0) == (), "適用済みを検出してやり直さない"
-        assert conn.execute("SELECT COUNT(*) FROM schema_version").fetchone()[0] == 2
+        assert conn.execute("SELECT COUNT(*) FROM schema_version").fetchone()[0] == 3
     finally:
         conn.close()
 

@@ -13,9 +13,10 @@
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import sqlite3
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
@@ -98,7 +99,8 @@ def rollup_minutes(
     区間が記録されないため。進行中の分は欠測に数えない。外付けデバイスの ``air.*``
     には適用しない（決定記録 0008 §2.1.1「停止後にまで期待値を作らない」。デバイスの
     撤去と通信断をロールアップからは区別できない）。周期メトリクスは設定で有効な
-    間だけ登録されるので、登録中の停止は欠測として扱ってよい。
+    間だけ登録されるので、登録中の停止は欠測として扱い、無効だった期間は欠測に
+    しない。登録状態は ``periodic_metric_registrations`` に保存する（決定記録 0038）。
 
     **未集計の範囲だけを見る。** 毎回すべてを数え直すと、保持期間ぶんの行を
     走査することになる。ただし前回の最終バケットは**必ず数え直す**。
@@ -118,6 +120,11 @@ def rollup_minutes(
     )
     newest = conn.execute("SELECT MAX(ts_ms) FROM readings").fetchone()[0]
     start = conn.execute("SELECT MAX(bucket_ms) FROM readings_1m").fetchone()[0]
+    # 登録状態は早期 return より前に記録する。何も集計しない実行でも、
+    # 「この時点で無効だった」ことを残さないと再有効化を見分けられない
+    run_ms = now_ms if now_ms is not None else int(newest) if newest is not None else 0
+    with store.transaction():
+        active_from = _sync_registrations(conn, periodic.keys(), run_ms)
     if newest is None:
         # 生データが全部消えても、観測済みの周期メトリクスの欠測は埋め続ける
         if start is None or completed_bucket is None:
@@ -136,15 +143,14 @@ def rollup_minutes(
     written = 0
     # 登録済みの周期メトリクスは、生データが1行も残っていなくても回す。
     # 停止した collector の最後の生データが保持期間で消えると `store.metrics()`
-    # から外れ、以降の日に0行バケットが作られなくなるため。穴埋めの範囲は
-    # `_fill_absent_minutes()` が「1分ロールアップに現れて以降」へ限定する
+    # から外れ、以降の日に0行バケットが作られなくなるため。穴埋めは保存した
+    # 登録状態の「欠測を数え始める時刻」以降に限る（決定記録 0038）
     metrics = sorted(set(store.metrics()) | periodic.keys())
     for metric in metrics:
         # 期待サンプル数は**周期的に届くメトリクスにだけ**意味がある。
         # `sys.dropped_samples` は起きたときしか書かない（決定記録 0007 §2.4）ので、
         # 期待値を持たせると欠測率が無意味な値になる
         metric_expected = expected if metric in METRIC_TO_CHANNEL else periodic.get(metric)
-        resume_from = _periodic_resume_point(conn, metric, start) if metric in periodic else None
         with store.transaction():
             cursor = conn.execute(
                 "INSERT OR REPLACE INTO readings_1m "
@@ -162,42 +168,80 @@ def rollup_minutes(
             )
             written += int(cursor.rowcount)
             if metric in periodic:
-                if resume_from is not None:
+                metric_from = active_from.get(metric)
+                if metric_from is not None:
                     written += _fill_absent_minutes(
-                        conn, metric, resume_from, periodic_until, metric_expected
+                        conn,
+                        metric,
+                        max(start, _floor(metric_from, MINUTE_MS)),
+                        periodic_until,
+                        metric_expected,
                     )
             else:
                 written += _fill_absent_minutes(conn, metric, start, newest_bucket, metric_expected)
     return written
 
 
-def _periodic_resume_point(conn: sqlite3.Connection, metric: str, start: int) -> int | None:
-    """周期メトリクスの穴埋めを始める分。``None`` なら今回は埋めない。
+def _sync_registrations(
+    conn: sqlite3.Connection, registered: Iterable[str], run_ms: int
+) -> dict[str, int | None]:
+    """周期メトリクスの登録状態を保存し、欠測を数え始める時刻を返す（決定記録 0038）。
 
-    **前回のロールアップで登録されていたか**を、そのメトリクス自身の最終バケットで
-    判定する。登録中の周期メトリクスは毎回 ``periodic_until``（= 実行後の
-    ``readings_1m`` 全体の最終バケット）まで埋まるので、最終バケットが今回の
-    ``start`` に届いていれば前回から途切れず登録されていた。そのまま ``start`` から
-    埋め、停止区間を欠測として残す。
+    - 今回登録されていない既存の行は ``registered = 0`` にし、その時刻を残す
+    - 初めて登録された、または無効から戻ったメトリクスは、その区間の
+      **最初の観測**から欠測を数える。無効だった期間と、再開後の最初の観測より前は
+      欠測にしない。まだ観測が無ければ ``None``（今回は埋めない）
 
-    届いていなければ、前回は無効化されていた（設定から外れて登録されなかった）か、
-    まだ一度も観測していない。無効の間は欠測ではないので、今回の窓で**再開後に
-    最初に観測した分**から埋める。観測が無ければ埋めない。
-
-    制約: 登録状態はロールアップの実行時にしか見えない。2回の実行の間に無効化と
-    再有効化の両方が起きた場合、その無効期間は欠測として残る。
+    登録状態を readings から推測しないのは、全 source が静かな期間には痕跡が残らず、
+    無効期間と停止を区別できないため。登録はロールアップの実行時にしか見えないので、
+    2回の実行の間に無効化と再有効化の両方が起きた場合、その期間は欠測として残る。
     """
-    last = conn.execute(
-        "SELECT MAX(bucket_ms) FROM readings_1m WHERE metric = ?", (metric,)
+    wanted = set(registered)
+    conn.execute(
+        "UPDATE periodic_metric_registrations SET registered = 0, changed_ms = ? "
+        "WHERE registered = 1 AND metric NOT IN (SELECT value FROM json_each(?))",
+        (run_ms, json.dumps(sorted(wanted))),
+    )
+    result: dict[str, int | None] = {}
+    for metric in sorted(wanted):
+        row = conn.execute(
+            "SELECT registered, since_ms, active_from_ms, changed_ms "
+            "FROM periodic_metric_registrations WHERE metric = ?",
+            (metric,),
+        ).fetchone()
+        if row is None:
+            since, changed = 0, run_ms
+            active: int | None = _first_observation_since(conn, metric, since)
+        elif int(row[0]) == 0:
+            # 無効から戻った。無効にしたと記録した時刻より後の観測だけを見る
+            since, changed = int(row[3]), run_ms
+            active = _first_observation_since(conn, metric, since)
+        else:
+            since, changed = int(row[1]), int(row[3])
+            active = (
+                int(row[2]) if row[2] is not None else _first_observation_since(conn, metric, since)
+            )
+        conn.execute(
+            "INSERT OR REPLACE INTO periodic_metric_registrations "
+            "(metric, registered, since_ms, active_from_ms, changed_ms) VALUES (?, 1, ?, ?, ?)",
+            (metric, since, active, changed),
+        )
+        result[metric] = active
+    return result
+
+
+def _first_observation_since(conn: sqlite3.Connection, metric: str, since_ms: int) -> int | None:
+    """``since_ms`` 以降の最初の観測時刻。生データが消えた範囲は1分ロールアップで見る。"""
+    raw = conn.execute(
+        "SELECT MIN(ts_ms) FROM readings WHERE metric = ? AND ts_ms >= ?", (metric, since_ms)
     ).fetchone()[0]
-    if last is not None and int(last) >= start:
-        return start
-    resumed = conn.execute(
-        "SELECT MIN(ts_ms) FROM readings WHERE metric = ? AND ts_ms >= ?", (metric, start)
+    rolled = conn.execute(
+        "SELECT MIN(bucket_ms) FROM readings_1m "
+        "WHERE metric = ? AND bucket_ms >= ? AND row_count > 0",
+        (metric, since_ms),
     ).fetchone()[0]
-    if resumed is None:
-        return None
-    return _floor(int(resumed), MINUTE_MS)
+    candidates = [int(value) for value in (raw, rolled) if value is not None]
+    return min(candidates) if candidates else None
 
 
 def _fill_absent_minutes(
