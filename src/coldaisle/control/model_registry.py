@@ -228,9 +228,25 @@ class RegistryAuditEvent(_Frozen):
     event: RegistryEventKind
     artifact: ArtifactRef
     previous_artifact: ArtifactRef | None = None
+    # Promotion only: the artifact that passed checksum + format re-verification and
+    # became the rollback target (decision record 0037). It can differ from
+    # ``previous_artifact`` when the outgoing production artifact is already corrupt.
+    rollback_target: ArtifactRef | None = None
     actor: str = Field(pattern=_IDENTIFIER_PATTERN, max_length=120)
     reason: str = Field(min_length=1, max_length=1000)
     approval: HumanApproval | None = None
+
+    @model_validator(mode="after")
+    def _rollback_target_belongs_to_promotion(self) -> Self:
+        if self.rollback_target is None:
+            return self
+        if self.event is not RegistryEventKind.PROMOTED:
+            raise ValueError("rollback_target は promotion audit だけが持つ")
+        if self.rollback_target.kind is not self.artifact.kind:
+            raise ValueError("rollback_target の kind が一致しない")
+        if self.rollback_target == self.artifact:
+            raise ValueError("promotion 対象自身を rollback_target にできない")
+        return self
 
     @model_validator(mode="after")
     def _human_decisions_have_approval(self) -> Self:
@@ -342,12 +358,20 @@ class RegistrySnapshot(_Frozen):
                 expected_previous = current.active if current is not None else None
                 if event.previous_artifact != expected_previous:
                     raise ValueError("promotion audit の previous production が一致しない")
+                # The outgoing production (verified) or the retained older rollback
+                # target (outgoing one failed verification) may become the new target;
+                # None when neither verified. Nothing else can be introduced here.
+                allowed_targets = {None, expected_previous}
+                if current is not None:
+                    allowed_targets.add(current.previous)
+                if event.rollback_target not in allowed_targets:
+                    raise ValueError("promotion audit の rollback_target が不正")
                 if expected_previous is not None:
                     statuses[expected_previous.key] = ArtifactStatus.RETIRED
                 statuses[key] = ArtifactStatus.PRODUCTION
                 production[event.artifact.kind] = ProductionSlot(
                     active=event.artifact,
-                    previous=expected_previous,
+                    previous=event.rollback_target,
                 )
                 promoted.add(key)
             elif event.event is RegistryEventKind.ROLLED_BACK:
@@ -622,6 +646,7 @@ class ModelRegistry:
             )
             previous_slot = snapshot.production.get(ref.kind)
             previous_ref = previous_slot.active if previous_slot is not None else None
+            rollback_target = self._select_rollback_target(root_fd, snapshot, previous_slot)
             artifacts = dict(snapshot.artifacts)
             if previous_ref is not None:
                 previous_record = self._record(snapshot, previous_ref)
@@ -637,7 +662,7 @@ class ModelRegistry:
                 status=ArtifactStatus.PRODUCTION,
             )
             production = dict(snapshot.production)
-            production[ref.kind] = ProductionSlot(active=ref, previous=previous_ref)
+            production[ref.kind] = ProductionSlot(active=ref, previous=rollback_target)
             updated = self._append_event(
                 snapshot,
                 artifacts=artifacts,
@@ -645,6 +670,7 @@ class ModelRegistry:
                 event=RegistryEventKind.PROMOTED,
                 artifact=ref,
                 previous_artifact=previous_ref,
+                rollback_target=rollback_target,
                 actor=approval.approver,
                 reason=approval.reason,
                 approval=approval,
@@ -652,6 +678,30 @@ class ModelRegistry:
             )
             self._write_snapshot(root_fd, updated)
             return updated.revision
+
+    def _select_rollback_target(
+        self,
+        root_fd: int,
+        snapshot: RegistrySnapshot,
+        slot: ProductionSlot | None,
+    ) -> ArtifactRef | None:
+        """Pick the rollback target that survives a promotion (decision record 0037).
+
+        Only checksum + format are re-verified here: compatibility is judged against
+        the runtime contract at rollback time, so a schema change must not silently
+        discard an intact known-good artifact.
+        """
+        if slot is None:
+            return None
+        for candidate in (slot.active, slot.previous):
+            if candidate is None:
+                continue
+            try:
+                self._verify(root_fd, self._record(snapshot, candidate), None)
+            except ArtifactVerificationError:
+                continue
+            return candidate
+        return None
 
     def rollback(
         self,
@@ -1102,6 +1152,7 @@ class ModelRegistry:
         actor: str,
         reason: str,
         previous_artifact: ArtifactRef | None = None,
+        rollback_target: ArtifactRef | None = None,
         approval: HumanApproval | None = None,
         occurred_at_ms: int | None = None,
     ) -> RegistrySnapshot:
@@ -1112,6 +1163,7 @@ class ModelRegistry:
             event=event,
             artifact=artifact,
             previous_artifact=previous_artifact,
+            rollback_target=rollback_target,
             actor=actor,
             reason=reason,
             approval=approval,

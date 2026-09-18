@@ -38,12 +38,15 @@ Productionとして暗黙loadすることはない。`mark_validated()` はoffli
 `registry.json` はartifact本体と分離したProduction pointer、全artifactのlifecycle、監査eventを
 1つのversioned snapshotとして持つ。更新はfilesystem lock内で一時ファイルをfsyncし、
 `os.replace()` で原子的に切り替える。registry root・artifact directoryを新規作成した場合も、
-配下へ進む前に親directoryをfsyncし、crash後にdirectory entryだけが失われないようにする。管理操作には `expected_revision` を渡すため、同じ状態を
-見て行った二重promotionの一方は `ConcurrentUpdateError` になり、後勝ちで判断を上書きしない。
+配下へ進む前に親directoryをfsyncし、crash後にdirectory entryだけが失われないようにする。
+管理操作には `expected_revision` を渡すため、同じ状態を見て行った二重promotionの一方は `ConcurrentUpdateError` になり、後勝ちで判断を上書きしない。
 root配下のdirectory・lock・snapshot・artifactは`openat`相当の`dir_fd`と`O_NOFOLLOW`で開き、
 symlinkまたは非regular fileを拒否する。artifact IDから組み立てたpathでroot外を読み書きしない。
 
-新しいProductionへのpromotion時、旧Productionは`retired`のknown-good rollback targetになる。
+新しいProductionへのpromotion時、旧Productionは`retired`になる。rollback targetには、旧Production、
+それまでのrollback targetの順に、checksumとformatの再検証を通った最初のartifactを残す。どちらも
+通らなければtargetは無く（`None`）、promotion自体は続行する。選ばれたtargetはpromotion auditの
+`rollback_target`に記録する（決定記録0037）。互換性はここでは判定せず、rollback実行時に検証する。
 Rollback前にも旧artifactのchecksumとschema互換性を再検証し、成功時はpointer、lifecycle、
 理由・時刻・human approvalの監査eventを同じsnapshotで原子的に更新する。
 `HumanApproval` はaction、target artifact ref、checksum、承認対象revisionへ固定し、別artifact・

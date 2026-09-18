@@ -331,6 +331,139 @@ def test_corrupt_known_good_cannot_replace_current_production(tmp_path: Path) ->
     assert snapshot.production[ArtifactKind.THERMAL_MODEL].active.version == "2.0.0"
 
 
+def rollback_approval(version: str, revision: int) -> HumanApproval:
+    return approval(
+        version,
+        revision,
+        action=ApprovalAction.ROLLBACK,
+        reason="production residual regressed",
+    )
+
+
+def test_promotion_over_corrupt_production_keeps_verified_older_rollback_target(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "registry"
+    registry = ModelRegistry(root, SimulatedClock(NOW_MS))
+    for version in ("1.0.0", "2.0.0"):
+        register_and_validate(registry, version)
+        promote(registry, version)
+    assert registry.inspect().audit[-1].rollback_target == metadata("1.0.0").ref
+    artifact_path(root, "2.0.0").write_bytes(b"corrupt")
+    register_and_validate(registry, "3.0.0")
+
+    promote(registry, "3.0.0")
+
+    snapshot = registry.inspect()
+    slot = snapshot.production[ArtifactKind.THERMAL_MODEL]
+    event = snapshot.audit[-1]
+    assert slot.active == metadata("3.0.0").ref
+    assert slot.previous == metadata("1.0.0").ref
+    assert event.previous_artifact == metadata("2.0.0").ref
+    assert event.rollback_target == metadata("1.0.0").ref
+    assert snapshot.artifacts[metadata("2.0.0").ref.key].status is ArtifactStatus.RETIRED
+
+    revision = snapshot.revision
+    registry.rollback(
+        ArtifactKind.THERMAL_MODEL,
+        COMPATIBILITY,
+        approval=rollback_approval("1.0.0", revision),
+        expected_revision=revision,
+    )
+
+    loaded = registry.load_production(ArtifactKind.THERMAL_MODEL, COMPATIBILITY)
+    assert loaded.artifact is not None
+    assert loaded.artifact.model_version == "rack-thermal@1.0.0"
+
+
+def test_promotion_drops_rollback_target_when_no_candidate_verifies(tmp_path: Path) -> None:
+    root = tmp_path / "registry"
+    registry = ModelRegistry(root, SimulatedClock(NOW_MS))
+    for version in ("1.0.0", "2.0.0"):
+        register_and_validate(registry, version)
+        promote(registry, version)
+    artifact_path(root, "1.0.0").write_bytes(b"corrupt")
+    artifact_path(root, "2.0.0").unlink()
+    register_and_validate(registry, "3.0.0")
+
+    promote(registry, "3.0.0")
+
+    snapshot = registry.inspect()
+    assert snapshot.production[ArtifactKind.THERMAL_MODEL].previous is None
+    assert snapshot.audit[-1].previous_artifact == metadata("2.0.0").ref
+    assert snapshot.audit[-1].rollback_target is None
+    with pytest.raises(InvalidTransitionError):
+        registry.rollback(
+            ArtifactKind.THERMAL_MODEL,
+            COMPATIBILITY,
+            approval=rollback_approval("2.0.0", snapshot.revision),
+            expected_revision=snapshot.revision,
+        )
+
+
+def test_rollback_target_is_checked_for_integrity_not_runtime_compatibility(
+    tmp_path: Path,
+) -> None:
+    registry = ModelRegistry(tmp_path / "registry", SimulatedClock(NOW_MS))
+    old = metadata("1.0.0", feature_schema_version="thermal-features-v0")
+    registry.register_candidate(old, payload("1.0.0"), actor="trainer", reason="trained")
+    registry.mark_validated(
+        old.ref,
+        offline_evaluation_ref="evaluation/offline/1.0.0",
+        actor="evaluator",
+        reason="offline gates passed",
+        expected_revision=registry.inspect().revision,
+    )
+    revision = registry.inspect().revision
+    registry.promote(
+        old.ref,
+        COMPATIBILITY.model_copy(update={"feature_schema_version": "thermal-features-v0"}),
+        shadow_evaluation_ref="evaluation/shadow/1.0.0",
+        approval=approval("1.0.0", revision).model_copy(update={"artifact_sha256": old.sha256}),
+        expected_revision=revision,
+    )
+    register_and_validate(registry, "2.0.0")
+
+    promote(registry, "2.0.0")
+
+    assert registry.inspect().production[ArtifactKind.THERMAL_MODEL].previous == old.ref
+
+
+def test_snapshot_cannot_forge_unrelated_rollback_target(tmp_path: Path) -> None:
+    root = tmp_path / "registry"
+    registry = ModelRegistry(root, SimulatedClock(NOW_MS))
+    register_and_validate(registry, "0.9.0")
+    registry.retire(
+        metadata("0.9.0").ref,
+        actor="evaluator",
+        reason="superseded",
+        expected_revision=registry.inspect().revision,
+    )
+    for version in ("1.0.0", "2.0.0"):
+        register_and_validate(registry, version)
+        promote(registry, version)
+    document = json.loads((root / "registry.json").read_text())
+    forged = metadata("0.9.0").ref.model_dump(mode="json")
+    document["audit"][-1]["rollback_target"] = forged
+    document["production"]["thermal_model"]["previous"] = forged
+
+    with pytest.raises(ValidationError, match="rollback_target"):
+        RegistrySnapshot.model_validate_json(json.dumps(document))
+
+
+def test_rollback_target_is_rejected_outside_promotion_audit() -> None:
+    with pytest.raises(ValidationError, match="rollback_target"):
+        registry_module.RegistryAuditEvent(
+            revision=1,
+            occurred_at_ms=NOW_MS,
+            event=RegistryEventKind.REGISTERED,
+            artifact=metadata("2.0.0").ref,
+            rollback_target=metadata("1.0.0").ref,
+            actor="trainer",
+            reason="training completed",
+        )
+
+
 def test_two_concurrent_promotions_with_same_revision_cannot_clobber_each_other(
     tmp_path: Path,
 ) -> None:
