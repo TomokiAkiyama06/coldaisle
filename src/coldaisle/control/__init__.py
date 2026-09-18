@@ -34,7 +34,7 @@ from coldaisle.control.hardware import (
 )
 from coldaisle.control.logging import ControlTraceLogger, ControlTraceSink
 from coldaisle.control.model_registry import (
-    MAX_ARTIFACT_BYTES,
+    MODEL_REGISTRY_CONFIG_FILENAME,
     MODEL_REGISTRY_SCHEMA_VERSION,
     ApprovalAction,
     ArtifactAlreadyExistsError,
@@ -53,14 +53,17 @@ from coldaisle.control.model_registry import (
     ModelCompatibility,
     ModelRegistry,
     ModelRegistryError,
+    ModelRegistryLimits,
     ProductionSlot,
     RegistryAuditEvent,
+    RegistryCapacityError,
     RegistryCorruptError,
     RegistryEventKind,
     RegistrySnapshot,
     UnknownArtifactError,
     UnsafeRegistryPathError,
     VerifiedArtifact,
+    load_model_registry_limits,
 )
 from coldaisle.control.schema import (
     BOUND_BY_PRECEDENCE,
@@ -98,7 +101,7 @@ __all__ = [
     "CONFIG_FILENAMES",
     "CONTROL_CONFIG_VERSION",
     "EMERGENCY_FAULTS",
-    "MAX_ARTIFACT_BYTES",
+    "MODEL_REGISTRY_CONFIG_FILENAME",
     "MODEL_REGISTRY_SCHEMA_VERSION",
     "SCHEMA_VERSION",
     "TOP_EMERGENCY_FAULTS",
@@ -145,6 +148,7 @@ __all__ = [
     "ModelCompatibility",
     "ModelRegistry",
     "ModelRegistryError",
+    "ModelRegistryLimits",
     "OperatingMode",
     "OptimizerStatus",
     "PerZone",
@@ -152,6 +156,7 @@ __all__ = [
     "ProvisionalConfigValue",
     "Reason",
     "RegistryAuditEvent",
+    "RegistryCapacityError",
     "RegistryCorruptError",
     "RegistryEventKind",
     "RegistrySnapshot",
@@ -167,4 +172,5 @@ __all__ = [
     "ZoneRecord",
     "ZoneRequest",
     "load_acoustic_model",
+    "load_model_registry_limits",
 ]

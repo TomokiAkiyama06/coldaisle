@@ -1,0 +1,14 @@
+# Control Model Registry の読込・確保の上限（#104 / docs/model-registry.md）
+#
+# **ここが唯一の情報源です。** コードに既定値を持たせないでください
+# （AGENTS.md「絶対に守るルール」9）。
+schema_version: 1
+
+# artifact payload の上限（byte）。登録時と読込時の両方で、これを超えるものを拒否する。
+# 8 MiB。現在受理する JSON artifact の想定規模に対する余裕を持たせた暫定値
+max_artifact_bytes: 8388608
+
+# registry.json（全 artifact の lifecycle と監査 event の snapshot）の上限（byte）。
+# 超えた snapshot は読まずに INVALID_REGISTRY として Fallback させ、書き込みも拒否する。
+# 16 MiB。1 event / record あたり数 KB として数千件の履歴を収められる暫定値
+max_snapshot_bytes: 16777216

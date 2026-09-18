@@ -9,7 +9,13 @@ Model、Supervisor Policy、Feature Transform の artifact lifecycle をロー�
 
 - Registry は artifact を deserialize・import・execute しない。検証後も返すのは immutable
   `bytes` だけである。
-- artifact payloadは8 MiBを上限とし、登録時と読込時の両方で拒否する。読込は
+- 読込・確保の上限は `config/model-registry.yaml` にだけ置き、コードに既定値を持たない
+  （AGENTS.md ルール9）。`ModelRegistry(root, clock, limits=load_model_registry_limits(Path("config")))`
+  のように必ず渡す。
+- `registry.json` は `max_snapshot_bytes`（現在16 MiB）を上限とし、artifactと同じくfstatでsizeを
+  確認してから読む。超えたsnapshotは確保せずに `INVALID_REGISTRY` としてFallbackさせる。
+  上限を超えるsnapshotは書き込みも `RegistryCapacityError` で拒否し、自分で読めない状態を作らない。
+- artifact payloadは `max_artifact_bytes`（現在8 MiB）を上限とし、登録時と読込時の両方で拒否する。読込は
   `open(O_NOFOLLOW | O_NONBLOCK)`した同じfdを`fstat()`してregular fileとsizeを先に確認し、
   preflight時のsize分とgrowth検出用1 byteだけを読む。FIFOで停止せず、読込中の短縮・拡張や
   path差替えから別のbytesを組み立てない。

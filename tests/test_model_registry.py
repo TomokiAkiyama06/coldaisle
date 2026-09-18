@@ -16,7 +16,6 @@ from pydantic import ValidationError
 import coldaisle.control.model_registry as registry_module
 from coldaisle.clock import SimulatedClock
 from coldaisle.control import (
-    MAX_ARTIFACT_BYTES,
     ApprovalAction,
     ArtifactFormat,
     ArtifactKind,
@@ -30,12 +29,18 @@ from coldaisle.control import (
     InvalidTransitionError,
     ModelCompatibility,
     ModelRegistry,
+    ModelRegistryLimits,
+    RegistryCapacityError,
+    RegistryCorruptError,
     RegistryEventKind,
     RegistrySnapshot,
     UnsafeRegistryPathError,
+    load_model_registry_limits,
 )
 
 NOW_MS = 1_800_000_000_000
+CONFIG_DIR = Path(__file__).resolve().parents[1] / "config"
+LIMITS = load_model_registry_limits(CONFIG_DIR)
 ACTOR = "model-operator"
 COMPATIBILITY = ModelCompatibility(
     feature_schema_version="thermal-features-v1",
@@ -136,7 +141,7 @@ def promote_in_process(
 ) -> None:
     """Process worker proving that the filesystem lock and revision CAS are cross-process."""
     barrier.wait()
-    registry = ModelRegistry(Path(root), SimulatedClock(NOW_MS))
+    registry = ModelRegistry(Path(root), SimulatedClock(NOW_MS), limits=LIMITS)
     try:
         registry.promote(
             metadata(version).ref,
@@ -154,7 +159,9 @@ def promote_in_process(
 def test_no_production_returns_read_only_fallback_result(tmp_path: Path) -> None:
     root = tmp_path / "registry-does-not-exist"
 
-    result = ModelRegistry(root).load_production(ArtifactKind.THERMAL_MODEL, COMPATIBILITY)
+    result = ModelRegistry(root, limits=LIMITS).load_production(
+        ArtifactKind.THERMAL_MODEL, COMPATIBILITY
+    )
 
     assert result.status is ArtifactLoadStatus.NO_PRODUCTION
     assert result.fallback_required is True
@@ -165,7 +172,7 @@ def test_no_production_returns_read_only_fallback_result(tmp_path: Path) -> None
 def test_candidate_and_production_coexist_and_candidate_is_not_implicitly_loaded(
     tmp_path: Path,
 ) -> None:
-    registry = ModelRegistry(tmp_path / "registry", SimulatedClock(NOW_MS))
+    registry = ModelRegistry(tmp_path / "registry", SimulatedClock(NOW_MS), limits=LIMITS)
     register_and_validate(registry, "1.0.0")
     promote(registry, "1.0.0")
     candidate = registry.register_candidate(
@@ -191,7 +198,7 @@ def test_candidate_and_production_coexist_and_candidate_is_not_implicitly_loaded
 
 def test_corrupt_production_is_rejected_without_mutating_registry(tmp_path: Path) -> None:
     root = tmp_path / "registry"
-    registry = ModelRegistry(root, SimulatedClock(NOW_MS))
+    registry = ModelRegistry(root, SimulatedClock(NOW_MS), limits=LIMITS)
     register_and_validate(registry, "1.0.0")
     promote(registry, "1.0.0")
     revision = registry.inspect().revision
@@ -208,7 +215,7 @@ def test_corrupt_production_is_rejected_without_mutating_registry(tmp_path: Path
 
 
 def test_schema_mismatch_returns_fallback_and_trace_metadata(tmp_path: Path) -> None:
-    registry = ModelRegistry(tmp_path / "registry", SimulatedClock(NOW_MS))
+    registry = ModelRegistry(tmp_path / "registry", SimulatedClock(NOW_MS), limits=LIMITS)
     register_and_validate(registry, "1.0.0")
     promote(registry, "1.0.0")
     incompatible = ModelCompatibility(
@@ -230,7 +237,7 @@ def test_schema_mismatch_returns_fallback_and_trace_metadata(tmp_path: Path) -> 
 
 
 def test_authority_compatibility_is_checked_independently(tmp_path: Path) -> None:
-    registry = ModelRegistry(tmp_path / "registry", SimulatedClock(NOW_MS))
+    registry = ModelRegistry(tmp_path / "registry", SimulatedClock(NOW_MS), limits=LIMITS)
     register_and_validate(registry, "1.0.0")
     promote(registry, "1.0.0")
     full_authority = COMPATIBILITY.model_copy(update={"authority_stage": AuthorityStage.FULL})
@@ -242,7 +249,7 @@ def test_authority_compatibility_is_checked_independently(tmp_path: Path) -> Non
 
 
 def test_promotion_requires_validated_state_and_does_not_raise_authority(tmp_path: Path) -> None:
-    registry = ModelRegistry(tmp_path / "registry", SimulatedClock(NOW_MS))
+    registry = ModelRegistry(tmp_path / "registry", SimulatedClock(NOW_MS), limits=LIMITS)
     ref = registry.register_candidate(
         metadata("1.0.0"),
         payload("1.0.0"),
@@ -263,7 +270,7 @@ def test_promotion_requires_validated_state_and_does_not_raise_authority(tmp_pat
 
 
 def test_atomic_rollback_restores_known_good_and_audits_human_reason(tmp_path: Path) -> None:
-    registry = ModelRegistry(tmp_path / "registry", SimulatedClock(NOW_MS))
+    registry = ModelRegistry(tmp_path / "registry", SimulatedClock(NOW_MS), limits=LIMITS)
     register_and_validate(registry, "1.0.0")
     promote(registry, "1.0.0")
     register_and_validate(registry, "2.0.0")
@@ -304,7 +311,7 @@ def test_atomic_rollback_restores_known_good_and_audits_human_reason(tmp_path: P
 
 def test_corrupt_known_good_cannot_replace_current_production(tmp_path: Path) -> None:
     root = tmp_path / "registry"
-    registry = ModelRegistry(root, SimulatedClock(NOW_MS))
+    registry = ModelRegistry(root, SimulatedClock(NOW_MS), limits=LIMITS)
     register_and_validate(registry, "1.0.0")
     promote(registry, "1.0.0")
     register_and_validate(registry, "2.0.0")
@@ -344,7 +351,7 @@ def test_promotion_over_corrupt_production_keeps_verified_older_rollback_target(
     tmp_path: Path,
 ) -> None:
     root = tmp_path / "registry"
-    registry = ModelRegistry(root, SimulatedClock(NOW_MS))
+    registry = ModelRegistry(root, SimulatedClock(NOW_MS), limits=LIMITS)
     for version in ("1.0.0", "2.0.0"):
         register_and_validate(registry, version)
         promote(registry, version)
@@ -378,7 +385,7 @@ def test_promotion_over_corrupt_production_keeps_verified_older_rollback_target(
 
 def test_promotion_drops_rollback_target_when_no_candidate_verifies(tmp_path: Path) -> None:
     root = tmp_path / "registry"
-    registry = ModelRegistry(root, SimulatedClock(NOW_MS))
+    registry = ModelRegistry(root, SimulatedClock(NOW_MS), limits=LIMITS)
     for version in ("1.0.0", "2.0.0"):
         register_and_validate(registry, version)
         promote(registry, version)
@@ -404,7 +411,7 @@ def test_promotion_drops_rollback_target_when_no_candidate_verifies(tmp_path: Pa
 def test_rollback_target_is_checked_for_integrity_not_runtime_compatibility(
     tmp_path: Path,
 ) -> None:
-    registry = ModelRegistry(tmp_path / "registry", SimulatedClock(NOW_MS))
+    registry = ModelRegistry(tmp_path / "registry", SimulatedClock(NOW_MS), limits=LIMITS)
     old = metadata("1.0.0", feature_schema_version="thermal-features-v0")
     registry.register_candidate(old, payload("1.0.0"), actor="trainer", reason="trained")
     registry.mark_validated(
@@ -431,7 +438,7 @@ def test_rollback_target_is_checked_for_integrity_not_runtime_compatibility(
 
 def test_snapshot_cannot_forge_unrelated_rollback_target(tmp_path: Path) -> None:
     root = tmp_path / "registry"
-    registry = ModelRegistry(root, SimulatedClock(NOW_MS))
+    registry = ModelRegistry(root, SimulatedClock(NOW_MS), limits=LIMITS)
     register_and_validate(registry, "0.9.0")
     registry.retire(
         metadata("0.9.0").ref,
@@ -467,7 +474,7 @@ def test_rollback_target_is_rejected_outside_promotion_audit() -> None:
 def test_two_concurrent_promotions_with_same_revision_cannot_clobber_each_other(
     tmp_path: Path,
 ) -> None:
-    registry = ModelRegistry(tmp_path / "registry", SimulatedClock(NOW_MS))
+    registry = ModelRegistry(tmp_path / "registry", SimulatedClock(NOW_MS), limits=LIMITS)
     register_and_validate(registry, "1.0.0")
     register_and_validate(registry, "2.0.0")
     expected_revision = registry.inspect().revision
@@ -507,7 +514,7 @@ def test_two_concurrent_promotions_with_same_revision_cannot_clobber_each_other(
 
 def test_processes_cannot_promote_over_the_same_revision(tmp_path: Path) -> None:
     root = tmp_path / "registry"
-    registry = ModelRegistry(root, SimulatedClock(NOW_MS))
+    registry = ModelRegistry(root, SimulatedClock(NOW_MS), limits=LIMITS)
     register_and_validate(registry, "1.0.0")
     register_and_validate(registry, "2.0.0")
     expected_revision = registry.inspect().revision
@@ -537,7 +544,7 @@ def test_processes_cannot_promote_over_the_same_revision(tmp_path: Path) -> None
 
 
 def test_readers_never_observe_unavailable_model_during_promotions(tmp_path: Path) -> None:
-    registry = ModelRegistry(tmp_path / "registry", SimulatedClock(NOW_MS))
+    registry = ModelRegistry(tmp_path / "registry", SimulatedClock(NOW_MS), limits=LIMITS)
     register_and_validate(registry, "1.0.0")
     promote(registry, "1.0.0")
     versions = tuple(f"{major}.0.0" for major in range(2, 12))
@@ -598,7 +605,9 @@ def test_each_created_directory_is_fsynced_in_its_parent_before_descending(
 
     monkeypatch.setattr(registry_module.os, "mkdir", recording_mkdir)
     monkeypatch.setattr(registry_module.os, "fsync", recording_fsync)
-    registry = ModelRegistry(tmp_path / "new-parent" / "registry", SimulatedClock(NOW_MS))
+    registry = ModelRegistry(
+        tmp_path / "new-parent" / "registry", SimulatedClock(NOW_MS), limits=LIMITS
+    )
 
     registry.register_candidate(
         metadata("1.0.0"),
@@ -624,7 +633,7 @@ def test_each_created_directory_is_fsynced_in_its_parent_before_descending(
 
 def test_invalid_json_artifact_is_never_registered(tmp_path: Path) -> None:
     body = b"not-json"
-    registry = ModelRegistry(tmp_path / "registry", SimulatedClock(NOW_MS))
+    registry = ModelRegistry(tmp_path / "registry", SimulatedClock(NOW_MS), limits=LIMITS)
 
     with pytest.raises(ArtifactVerificationError):
         registry.register_candidate(
@@ -637,13 +646,10 @@ def test_invalid_json_artifact_is_never_registered(tmp_path: Path) -> None:
     assert registry.inspect().revision == 0
 
 
-def test_oversized_artifact_is_never_registered(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_oversized_artifact_is_never_registered(tmp_path: Path) -> None:
     body = b'{"model":"too-large"}'
-    registry = ModelRegistry(tmp_path / "registry", SimulatedClock(NOW_MS))
-    monkeypatch.setattr(registry_module, "MAX_ARTIFACT_BYTES", len(body) - 1)
+    limits = LIMITS.model_copy(update={"max_artifact_bytes": len(body) - 1})
+    registry = ModelRegistry(tmp_path / "registry", SimulatedClock(NOW_MS), limits=limits)
 
     with pytest.raises(ArtifactVerificationError, match="size"):
         registry.register_candidate(
@@ -656,19 +662,89 @@ def test_oversized_artifact_is_never_registered(
     assert registry.inspect().revision == 0
 
 
+def test_registry_limits_come_from_config_without_code_defaults(tmp_path: Path) -> None:
+    assert LIMITS.max_artifact_bytes > 0
+    assert LIMITS.max_snapshot_bytes > 0
+    (tmp_path / "model-registry.yaml").write_text("schema_version: 1\nmax_artifact_bytes: 10\n")
+
+    with pytest.raises(ValidationError, match="max_snapshot_bytes"):
+        load_model_registry_limits(tmp_path)
+    with pytest.raises(TypeError):
+        ModelRegistry(tmp_path / "registry")  # type: ignore[call-arg]
+    with pytest.raises(ValidationError):
+        ModelRegistryLimits.model_validate(
+            {"schema_version": 1, "max_artifact_bytes": 0, "max_snapshot_bytes": 1}
+        )
+
+
+def test_oversized_snapshot_is_rejected_by_fstat_as_invalid_registry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "registry"
+    registry = ModelRegistry(root, SimulatedClock(NOW_MS), limits=LIMITS)
+    register_and_validate(registry, "1.0.0")
+    promote(registry, "1.0.0")
+    state = root / "registry.json"
+    with state.open("r+b") as handle:
+        handle.truncate(LIMITS.max_snapshot_bytes + 1)
+    state_identity = file_identity(state)
+    original_read = registry_module.os.read
+
+    def reject_state_read(file_fd: int, count: int) -> bytes:
+        status = os.fstat(file_fd)
+        if (status.st_dev, status.st_ino) == state_identity:
+            raise AssertionError("oversized snapshot must be rejected before read")
+        return original_read(file_fd, count)
+
+    monkeypatch.setattr(registry_module.os, "read", reject_state_read)
+
+    result = registry.load_production(ArtifactKind.THERMAL_MODEL, COMPATIBILITY)
+
+    assert result.status is ArtifactLoadStatus.INVALID_REGISTRY
+    assert result.fallback_required is True
+    with pytest.raises(RegistryCorruptError):
+        registry.inspect()
+
+
+def test_snapshot_exceeding_the_bound_is_never_written(tmp_path: Path) -> None:
+    root = tmp_path / "registry"
+    registry = ModelRegistry(root, SimulatedClock(NOW_MS), limits=LIMITS)
+    register_and_validate(registry, "1.0.0")
+    size = (root / "registry.json").stat().st_size
+    tight = ModelRegistry(
+        root,
+        SimulatedClock(NOW_MS),
+        limits=LIMITS.model_copy(update={"max_snapshot_bytes": size}),
+    )
+
+    with pytest.raises(RegistryCapacityError):
+        tight.retire(
+            metadata("1.0.0").ref,
+            actor="evaluator",
+            reason="superseded",
+            expected_revision=tight.inspect().revision,
+        )
+
+    assert tight.inspect().revision == 2
+    assert (root / "registry.json").stat().st_size == size
+
+
 def test_malformed_registry_state_returns_fallback_instead_of_loading(tmp_path: Path) -> None:
     root = tmp_path / "registry"
     root.mkdir()
     (root / "registry.json").write_text('{"schema_version": 999}', encoding="utf-8")
 
-    result = ModelRegistry(root).load_production(ArtifactKind.THERMAL_MODEL, COMPATIBILITY)
+    result = ModelRegistry(root, limits=LIMITS).load_production(
+        ArtifactKind.THERMAL_MODEL, COMPATIBILITY
+    )
 
     assert result.status is ArtifactLoadStatus.INVALID_REGISTRY
     assert result.fallback_required is True
 
 
 def test_human_approval_cannot_be_postdated(tmp_path: Path) -> None:
-    registry = ModelRegistry(tmp_path / "registry", SimulatedClock(NOW_MS))
+    registry = ModelRegistry(tmp_path / "registry", SimulatedClock(NOW_MS), limits=LIMITS)
     register_and_validate(registry, "1.0.0")
     revision = registry.inspect().revision
     future = approval("1.0.0", revision).model_copy(update={"approved_at_ms": NOW_MS + 1})
@@ -700,7 +776,7 @@ def test_human_approval_is_bound_to_exact_operation_artifact_and_revision(
     message: str,
     tmp_path: Path,
 ) -> None:
-    registry = ModelRegistry(tmp_path / "registry", SimulatedClock(NOW_MS))
+    registry = ModelRegistry(tmp_path / "registry", SimulatedClock(NOW_MS), limits=LIMITS)
     register_and_validate(registry, "1.0.0")
     revision = registry.inspect().revision
     mismatched = approval("1.0.0", revision).model_copy(update={field: value})
@@ -718,7 +794,7 @@ def test_human_approval_is_bound_to_exact_operation_artifact_and_revision(
 
 
 def test_snapshot_cannot_forge_production_without_promotion_approval(tmp_path: Path) -> None:
-    registry = ModelRegistry(tmp_path / "registry", SimulatedClock(NOW_MS))
+    registry = ModelRegistry(tmp_path / "registry", SimulatedClock(NOW_MS), limits=LIMITS)
     register_and_validate(registry, "1.0.0")
     promote(registry, "1.0.0")
     document = registry.inspect().model_dump(mode="json")
@@ -735,7 +811,7 @@ def test_symlink_artifact_component_cannot_escape_registry_root(tmp_path: Path) 
     root.mkdir()
     outside.mkdir()
     (root / "artifacts").symlink_to(outside, target_is_directory=True)
-    registry = ModelRegistry(root, SimulatedClock(NOW_MS))
+    registry = ModelRegistry(root, SimulatedClock(NOW_MS), limits=LIMITS)
 
     with pytest.raises(UnsafeRegistryPathError, match="symlink"):
         registry.register_candidate(
@@ -755,7 +831,9 @@ def test_symlink_registry_ancestor_cannot_escape_trusted_anchor(tmp_path: Path) 
     safe.mkdir()
     outside.mkdir()
     (safe / "linked-parent").symlink_to(outside, target_is_directory=True)
-    registry = ModelRegistry(safe / "linked-parent" / "registry", SimulatedClock(NOW_MS))
+    registry = ModelRegistry(
+        safe / "linked-parent" / "registry", SimulatedClock(NOW_MS), limits=LIMITS
+    )
 
     with pytest.raises(UnsafeRegistryPathError, match="symlink"):
         registry.register_candidate(
@@ -772,13 +850,13 @@ def test_symlink_registry_ancestor_is_not_read(tmp_path: Path) -> None:
     safe = tmp_path / "safe"
     outside = tmp_path / "outside"
     safe.mkdir()
-    outside_registry = ModelRegistry(outside / "registry", SimulatedClock(NOW_MS))
+    outside_registry = ModelRegistry(outside / "registry", SimulatedClock(NOW_MS), limits=LIMITS)
     register_and_validate(outside_registry, "1.0.0")
     promote(outside_registry, "1.0.0")
     revision = outside_registry.inspect().revision
     (safe / "linked-parent").symlink_to(outside, target_is_directory=True)
 
-    result = ModelRegistry(safe / "linked-parent" / "registry").load_production(
+    result = ModelRegistry(safe / "linked-parent" / "registry", limits=LIMITS).load_production(
         ArtifactKind.THERMAL_MODEL,
         COMPATIBILITY,
     )
@@ -794,7 +872,7 @@ def test_symlink_payload_cannot_overwrite_file_outside_registry(tmp_path: Path) 
     outside = tmp_path / "outside.payload"
     outside.write_bytes(b"keep-me")
     (artifact_directory / "artifact.payload").symlink_to(outside)
-    registry = ModelRegistry(root, SimulatedClock(NOW_MS))
+    registry = ModelRegistry(root, SimulatedClock(NOW_MS), limits=LIMITS)
 
     with pytest.raises(UnsafeRegistryPathError, match="regular file"):
         registry.register_candidate(
@@ -810,7 +888,7 @@ def test_symlink_payload_cannot_overwrite_file_outside_registry(tmp_path: Path) 
 
 def test_symlink_or_nonregular_payload_is_not_read(tmp_path: Path) -> None:
     root = tmp_path / "registry"
-    registry = ModelRegistry(root, SimulatedClock(NOW_MS))
+    registry = ModelRegistry(root, SimulatedClock(NOW_MS), limits=LIMITS)
     register_and_validate(registry, "1.0.0")
     promote(registry, "1.0.0")
     artifact_path = (
@@ -833,7 +911,7 @@ def test_symlink_or_nonregular_payload_is_not_read(tmp_path: Path) -> None:
 
 def test_fifo_payload_is_rejected_without_blocking(tmp_path: Path) -> None:
     root = tmp_path / "registry"
-    registry = ModelRegistry(root, SimulatedClock(NOW_MS))
+    registry = ModelRegistry(root, SimulatedClock(NOW_MS), limits=LIMITS)
     register_and_validate(registry, "1.0.0")
     promote(registry, "1.0.0")
     stored = artifact_path(root)
@@ -850,12 +928,12 @@ def test_oversized_payload_is_rejected_by_fstat_before_any_artifact_read(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     root = tmp_path / "registry"
-    registry = ModelRegistry(root, SimulatedClock(NOW_MS))
+    registry = ModelRegistry(root, SimulatedClock(NOW_MS), limits=LIMITS)
     register_and_validate(registry, "1.0.0")
     promote(registry, "1.0.0")
     stored = artifact_path(root)
     with stored.open("r+b") as handle:
-        handle.truncate(MAX_ARTIFACT_BYTES + 1)
+        handle.truncate(LIMITS.max_artifact_bytes + 1)
     target_identity = file_identity(stored)
     original_read = registry_module.os.read
     artifact_read = False
@@ -881,7 +959,7 @@ def test_truncated_payload_is_rejected_against_pinned_fstat_size(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     root = tmp_path / "registry"
-    registry = ModelRegistry(root, SimulatedClock(NOW_MS))
+    registry = ModelRegistry(root, SimulatedClock(NOW_MS), limits=LIMITS)
     register_and_validate(registry, "1.0.0")
     promote(registry, "1.0.0")
     stored = artifact_path(root)
@@ -911,7 +989,7 @@ def test_growing_payload_read_is_bounded_to_preflight_size_plus_one_byte(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     root = tmp_path / "registry"
-    registry = ModelRegistry(root, SimulatedClock(NOW_MS))
+    registry = ModelRegistry(root, SimulatedClock(NOW_MS), limits=LIMITS)
     register_and_validate(registry, "1.0.0")
     promote(registry, "1.0.0")
     stored = artifact_path(root)
@@ -928,7 +1006,7 @@ def test_growing_payload_read_is_bounded_to_preflight_size_plus_one_byte(
             artifact_read_requests.append(count)
             if not grown:
                 with stored.open("r+b") as handle:
-                    handle.truncate(MAX_ARTIFACT_BYTES + 1)
+                    handle.truncate(LIMITS.max_artifact_bytes + 1)
                 grown = True
         return original_read(file_fd, count)
 
@@ -946,7 +1024,7 @@ def test_payload_fd_remains_pinned_when_path_is_replaced_during_read(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     root = tmp_path / "registry"
-    registry = ModelRegistry(root, SimulatedClock(NOW_MS))
+    registry = ModelRegistry(root, SimulatedClock(NOW_MS), limits=LIMITS)
     register_and_validate(registry, "1.0.0")
     promote(registry, "1.0.0")
     stored = artifact_path(root)
@@ -983,7 +1061,9 @@ def test_symlink_registry_snapshot_is_not_trusted(tmp_path: Path) -> None:
     outside.write_text('{"schema_version": 1, "revision": 0}', encoding="utf-8")
     (root / "registry.json").symlink_to(outside)
 
-    result = ModelRegistry(root).load_production(ArtifactKind.THERMAL_MODEL, COMPATIBILITY)
+    result = ModelRegistry(root, limits=LIMITS).load_production(
+        ArtifactKind.THERMAL_MODEL, COMPATIBILITY
+    )
 
     assert result.status is ArtifactLoadStatus.INVALID_REGISTRY
 
@@ -993,7 +1073,7 @@ def test_load_pins_root_across_path_replacement(tmp_path: Path, monkeypatch) -> 
     displaced = tmp_path / "displaced-registry"
     outside = tmp_path / "outside"
     outside.mkdir()
-    registry = ModelRegistry(root, SimulatedClock(NOW_MS))
+    registry = ModelRegistry(root, SimulatedClock(NOW_MS), limits=LIMITS)
     register_and_validate(registry, "1.0.0")
     promote(registry, "1.0.0")
     original_read = registry._read_regular_file
@@ -1031,7 +1111,7 @@ def test_load_pins_root_across_path_replacement(tmp_path: Path, monkeypatch) -> 
 
 
 def test_loaded_trace_metadata_has_version_checksum_and_schema(tmp_path: Path) -> None:
-    registry = ModelRegistry(tmp_path / "registry", SimulatedClock(NOW_MS))
+    registry = ModelRegistry(tmp_path / "registry", SimulatedClock(NOW_MS), limits=LIMITS)
     register_and_validate(registry, "1.0.0")
     promote(registry, "1.0.0")
 

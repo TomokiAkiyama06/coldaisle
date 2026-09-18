@@ -21,16 +21,16 @@ from enum import StrEnum
 from fcntl import LOCK_EX, LOCK_UN, flock
 from hashlib import sha256
 from pathlib import Path
-from typing import Final, Literal, Self
+from typing import Any, Literal, Self
 
+import yaml
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 
 from coldaisle.clock import Clock, WallClock
 from coldaisle.control.schema import AuthorityStage
 
 MODEL_REGISTRY_SCHEMA_VERSION: Literal[1] = 1
-MAX_ARTIFACT_BYTES: Final = 8 * 1024 * 1024
-"""Maximum artifact payload accepted or allocated by the registry."""
+MODEL_REGISTRY_CONFIG_FILENAME = "model-registry.yaml"
 
 _STATE_FILENAME = "registry.json"
 _LOCK_FILENAME = ".registry.lock"
@@ -463,6 +463,30 @@ class ArtifactLoadResult(_Frozen):
         return {"model_registry": trace}
 
 
+class ModelRegistryLimits(_Frozen):
+    """Read / allocation bounds from ``config/model-registry.yaml`` (AGENTS.md rule 9).
+
+    There are deliberately no code defaults: the YAML is the single source of truth.
+    """
+
+    schema_version: Literal[1]
+    max_artifact_bytes: int = Field(gt=0)
+    max_snapshot_bytes: int = Field(gt=0)
+
+    @classmethod
+    def from_file(cls, path: Path) -> ModelRegistryLimits:
+        """Read and validate the registry limits YAML."""
+        loaded: Any = yaml.safe_load(path.read_text(encoding="utf-8"))
+        if not isinstance(loaded, dict):
+            raise ValueError(f"model registry 設定が辞書ではない: {path.name}")
+        return cls.model_validate(loaded)
+
+
+def load_model_registry_limits(directory: Path) -> ModelRegistryLimits:
+    """Load the registry limits from the conventional file name in ``directory``."""
+    return ModelRegistryLimits.from_file(directory / MODEL_REGISTRY_CONFIG_FILENAME)
+
+
 class ModelRegistryError(Exception):
     """Base class for administrative registry operation failures."""
 
@@ -495,6 +519,10 @@ class ArtifactVerificationError(ModelRegistryError):
     """The artifact bytes or runtime compatibility cannot be verified."""
 
 
+class RegistryCapacityError(ModelRegistryError):
+    """The next registry snapshot would exceed the configured snapshot bound."""
+
+
 class _RegistryFileReadError(ModelRegistryError):
     """A pinned regular file changed size or exceeded its configured read bound."""
 
@@ -522,12 +550,19 @@ class _InvalidArtifactFormatError(ArtifactVerificationError):
 class ModelRegistry:
     """Manage immutable local artifacts through an atomic registry snapshot."""
 
-    def __init__(self, root: Path, clock: Clock | None = None) -> None:
+    def __init__(
+        self,
+        root: Path,
+        clock: Clock | None = None,
+        *,
+        limits: ModelRegistryLimits,
+    ) -> None:
         # Bind relative roots to the construction-time working directory without resolving
         # symlinks.  Each component is opened with O_NOFOLLOW below, so an ancestor symlink
         # cannot silently move the registry outside the configured path.
         self._root = Path(os.path.abspath(root))
         self._clock = clock or WallClock()
+        self._limits = limits
 
     def inspect(self) -> RegistrySnapshot:
         """Read the current snapshot without changing filesystem state."""
@@ -543,7 +578,7 @@ class ModelRegistry:
     ) -> ArtifactRef:
         """Persist a checksum-matching candidate without interpreting its model contents."""
         self._validate_actor_reason(actor, reason)
-        if len(payload) > MAX_ARTIFACT_BYTES:
+        if len(payload) > self._limits.max_artifact_bytes:
             raise ArtifactVerificationError("artifact がsize上限を超えている")
         digest = sha256(payload).hexdigest()
         if digest != metadata.sha256:
@@ -939,7 +974,12 @@ class ModelRegistry:
             except UnsafeRegistryPathError as exc:
                 raise RegistryCorruptError("registry root を安全に読み取れない") from exc
         try:
-            payload = self._read_regular_file(root_fd, _STATE_FILENAME, missing_ok=True)
+            payload = self._read_regular_file(
+                root_fd,
+                _STATE_FILENAME,
+                missing_ok=True,
+                max_bytes=self._limits.max_snapshot_bytes,
+            )
             if payload is None:
                 return RegistrySnapshot(revision=0)
             return RegistrySnapshot.model_validate_json(payload)
@@ -954,6 +994,9 @@ class ModelRegistry:
 
     def _write_snapshot(self, root_fd: int, snapshot: RegistrySnapshot) -> None:
         payload = snapshot.model_dump_json(indent=2).encode("utf-8") + b"\n"
+        if len(payload) > self._limits.max_snapshot_bytes:
+            # Writing it would make every later read fail as INVALID_REGISTRY.
+            raise RegistryCapacityError("registry snapshot がsize上限を超える")
         self._atomic_write(root_fd, _STATE_FILENAME, payload)
 
     def _read_artifact(self, root_fd: int, ref: ArtifactRef) -> bytes:
@@ -966,7 +1009,7 @@ class ModelRegistry:
             payload = self._read_regular_file(
                 directory_fd,
                 _ARTIFACT_FILENAME,
-                max_bytes=MAX_ARTIFACT_BYTES,
+                max_bytes=self._limits.max_artifact_bytes,
             )
             assert payload is not None
             return payload
