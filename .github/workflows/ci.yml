@@ -33,5 +33,11 @@ jobs:
       - run: uv run ruff format --check .
       - run: uv run mypy src
 
+      # ダッシュボードの JS を実行するテストのためだけに使う（決定記録 0044）。
+      # ビルドやバンドラには使わない。CI では node が無いとそのテストは失敗する
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "24"
+
       # 実機必須のテストは登録済み marker で除外する（AGENTS.md ルール7）
       - run: uv run pytest -m "not hardware" --cov --cov-report=term-missing --cov-fail-under=70

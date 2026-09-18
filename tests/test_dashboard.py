@@ -12,6 +12,7 @@
 
 import itertools
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -26,6 +27,22 @@ from coldaisle.store import Quality, Reading, Sample, SqliteStore
 from conftest import CONFIG_DIR, QUALITY_RULES_PATH
 
 METRICS_PATH = CONFIG_DIR / "metrics.yaml"
+
+
+def _require_node() -> str:
+    """`node` の場所。**CI では無ければ失敗、手元では飛ばす**（決定記録 0044）。
+
+    CI で黙って飛ばすと、画面の振る舞いのテストが走っていないことに気づけない。
+    GitHub Actions は `CI=true` を設定する。
+    """
+    node = shutil.which("node")
+    if node is not None:
+        return node
+    if os.environ.get("CI"):
+        pytest.fail("CI では node が必須（決定記録 0044。ci.yml の setup-node を確認）")
+    pytest.skip("node が無い（手元では飛ばす。CI では必須）")
+
+
 NOW_MS = 1_787_616_000_000
 
 INDEX = WEB_ROOT / "index.html"
@@ -149,12 +166,9 @@ def test_future_timestamps_are_explained_not_shown_as_negative():
 def test_script_parses(asset):
     """構文エラーで真っ白な画面にならないこと。
 
-    `node` が無い環境では飛ばす。CI に Node を足すほどの依存ではない
-    （Issue の「作り込まない」に対して釣り合わない）。
+    `node` が無い手元では飛ばし、CI では必須（決定記録 0044）。
     """
-    node = shutil.which("node")
-    if node is None:
-        pytest.skip("node が無い")
+    node = _require_node()
     assert subprocess.run([node, "--check", str(asset)], capture_output=True).returncode == 0
 
 
@@ -732,12 +746,10 @@ def test_the_banner_shows_exactly_the_applicable_messages(tmp_path):
     どれかが else-if で別の条件を隠していないこと、成り立つものだけが
     **重い順**に並ぶこと、何も無ければ帯が隠れることを確かめる。
 
-    `node` が無い環境では飛ばす（`test_script_parses` と同じ。CI に Node を足すほどの
-    依存ではない）。文字列の検査では、条件どうしの組み合わせは確かめられない。
+    `node` が無い手元では飛ばし、CI では必須（決定記録 0044）。
+    文字列の検査では、条件どうしの組み合わせは確かめられない。
     """
-    node = shutil.which("node")
-    if node is None:
-        pytest.skip("node が無い")
+    node = _require_node()
     order = list(BANNER_EXPECTED)
     combos = list(itertools.product([False, True], repeat=4))
     states = tmp_path / "states.json"
@@ -832,9 +844,7 @@ def test_health_applies_while_alerts_fails(tmp_path):
     固まる。エンドポイントごとに適用し、失敗しているものだけを赤帯に出す。
     成功したら、そのエンドポイントの失敗だけが消える。
     """
-    node = shutil.which("node")
-    if node is None:
-        pytest.skip("node が無い")
+    node = _require_node()
     latest = {
         "stale": False,
         "metrics": {"air.room": {"value": 26.0, "unit": "C", "quality": "ok", "age_seconds": 1.0}},
