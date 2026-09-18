@@ -47,11 +47,17 @@ class DatasetSourceKind(StrEnum):
 
 
 class DatasetWorkloadRegime(StrEnum):
-    """dataset v1が受け付ける観測済み負荷区分。#87のControlTick値と対応する。"""
+    """dataset v1が受け付ける観測済み負荷区分。#87のControlTick値と対応する。
+
+    dataset schemaはcontrolの型から独立に版管理するため別のenumに持つ。ただし
+    `WorkloadRegime`と値の集合を一致させることをテストで固定し、controlへ区分が
+    増えたのにdatasetだけが読めない、というずれを起こさない。
+    """
 
     IDLE = "idle"
     TRANSIENT_CPU = "transient_cpu"
     TRANSIENT_GPU = "transient_gpu"
+    TRANSIENT_CPU_GPU = "transient_cpu_gpu"
     SUSTAINED_CPU = "sustained_cpu"
     SUSTAINED_GPU = "sustained_gpu"
     SUSTAINED_CPU_GPU = "sustained_cpu_gpu"

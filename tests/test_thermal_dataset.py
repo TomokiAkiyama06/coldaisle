@@ -7,6 +7,7 @@ import os
 import sqlite3
 from collections.abc import Callable, Iterator
 from pathlib import Path
+from typing import get_args
 from zoneinfo import ZoneInfo
 
 import pytest
@@ -19,10 +20,12 @@ from coldaisle.control import ControlTick, ControlTraceLogger
 from coldaisle.control.model.dataset import (
     DatasetSourceKind,
     DatasetSpec,
+    DatasetWorkloadRegime,
     SourceRun,
     ThermalDataset,
     split_temporally,
 )
+from coldaisle.control.schema import WorkloadRegime
 from coldaisle.daemon import Daemon
 from coldaisle.dataset import ThermalDatasetBuilder, replay_fingerprint, write_dataset
 from coldaisle.ingest.calibration import Calibration
@@ -1189,3 +1192,43 @@ def test_internal_telemetry_refuses_to_start_on_a_dataset_bound_db(dataset_store
                 metrics=QUALITY_RULES_PATH.parent / "metrics.yaml",
             )
         )
+
+
+def test_dataset_workload_regime_matches_the_control_enum():
+    """controlへ区分が増えたら、dataset側も揃えないとこのテストが落ちる。"""
+    assert {member.value for member in DatasetWorkloadRegime} == {
+        member.value for member in WorkloadRegime
+    }
+
+
+def _tick_for_schema_version(version: int, *, ts_ms: int, tick_id: int) -> ControlTick:
+    """保存済みv1 fixtureを、各schema versionで有効な形へ最小限だけ変える。"""
+    raw = json.loads(CONTROL_FIXTURE.read_text(encoding="utf-8"))
+    raw.update(schema_version=version, ts_ms=ts_ms, tick_id=tick_id)
+    if version >= 2:
+        raw["state"]["workload_regime"] = WorkloadRegime.TRANSIENT_CPU_GPU.value
+        raw["state"]["regime_confidence"] = 0.75
+    if version >= 3:
+        # v3以降はsupervisor_policyにSupervisor decisionを要求する。無い形で記録する
+        raw["state"]["supervisor_policy"] = None
+    return ControlTick.model_validate_json(json.dumps(raw))
+
+
+@pytest.mark.parametrize("version", get_args(ControlTick.model_fields["schema_version"].annotation))
+def test_builder_accepts_every_control_tick_schema_version(dataset_store, version):
+    """ControlTickの現行の全schema versionからdatasetを作れる。
+
+    版の一覧は`ControlTick`の型から取るため、v5が増えれば自動でここに入る。
+    """
+    tick = _tick_for_schema_version(version, ts_ms=6_000, tick_id=100 + version)
+    ControlTraceLogger(dataset_store).record(tick)
+
+    dataset = ThermalDatasetBuilder(dataset_store).build(source_run=source_run(), spec=spec())
+
+    (example,) = (item for item in dataset.examples if item.control_tick_id == 100 + version)
+    assert example.control_schema_version == version
+    if version >= 2:
+        assert example.context.workload_regime is DatasetWorkloadRegime.TRANSIENT_CPU_GPU
+        assert example.context.regime_confidence == pytest.approx(0.75)
+    else:
+        assert example.context.workload_regime is None
