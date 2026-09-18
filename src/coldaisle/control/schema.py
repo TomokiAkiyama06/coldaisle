@@ -115,6 +115,8 @@ class WorkloadRegime(StrEnum):
     IDLE = "idle"
     TRANSIENT_CPU = "transient_cpu"
     TRANSIENT_GPU = "transient_gpu"
+    TRANSIENT_CPU_GPU = "transient_cpu_gpu"
+    """CPU と GPU の両軸が active で、少なくとも一方が SUSTAINED 未満（決定記録 0036）。"""
     SUSTAINED_CPU = "sustained_cpu"
     SUSTAINED_GPU = "sustained_gpu"
     SUSTAINED_CPU_GPU = "sustained_cpu_gpu"

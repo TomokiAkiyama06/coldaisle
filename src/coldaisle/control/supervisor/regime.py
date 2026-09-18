@@ -191,8 +191,6 @@ class WorkloadRegimeEstimator:
                     mono_ms=mono_ms,
                     cpu_active=cpu_active,
                     gpu_active=gpu_active,
-                    cpu_mean_w=cpu_mean_w,
-                    gpu_mean_w=gpu_mean_w,
                     cpu_active_since_ms=cpu_active_since_ms,
                     gpu_active_since_ms=gpu_active_since_ms,
                     last_active_ms=last_active_ms,
@@ -246,8 +244,6 @@ class WorkloadRegimeEstimator:
         mono_ms: int,
         cpu_active: bool,
         gpu_active: bool,
-        cpu_mean_w: float,
-        gpu_mean_w: float,
         cpu_active_since_ms: int | None,
         gpu_active_since_ms: int | None,
         last_active_ms: int | None,
@@ -270,17 +266,13 @@ class WorkloadRegimeEstimator:
                 if since is not None
             )
             if cpu_active and gpu_active:
-                if sustained:
-                    regime = WorkloadRegime.SUSTAINED_CPU_GPU
-                else:
-                    cpu_activity = self._relative_activity(cpu_mean_w, self._config.cpu_power)
-                    gpu_activity = self._relative_activity(gpu_mean_w, self._config.gpu_power)
-                    # TRANSIENT_CPU_GPU は schema に無いため、閾値超過が大きい側を残す。
-                    regime = (
-                        WorkloadRegime.TRANSIENT_CPU
-                        if cpu_activity >= gpu_activity
-                        else WorkloadRegime.TRANSIENT_GPU
-                    )
+                # 片方の軸を捨てると同時 burst と単独 burst が trace で区別できなくなる
+                # ため、両軸 active は常に組み合わせの値で残す（決定記録 0036）。
+                regime = (
+                    WorkloadRegime.SUSTAINED_CPU_GPU
+                    if sustained
+                    else WorkloadRegime.TRANSIENT_CPU_GPU
+                )
             elif cpu_active:
                 regime = WorkloadRegime.SUSTAINED_CPU if sustained else WorkloadRegime.TRANSIENT_CPU
             else:
@@ -316,10 +308,6 @@ class WorkloadRegimeEstimator:
         if signal is None or not signal.available:
             return None
         return signal.value
-
-    @staticmethod
-    def _relative_activity(value: float, band: WorkloadPowerBand) -> float:
-        return (value - band.idle_below_w) / (band.active_above_w - band.idle_below_w)
 
     @staticmethod
     def _validate_metric_units(config: WorkloadRegimeConfig, catalog: MetricCatalog) -> None:

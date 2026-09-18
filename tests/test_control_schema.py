@@ -696,6 +696,19 @@ def test_v2_trace_stores_workload_regime_and_confidence_together():
         )
 
 
+def test_v2_trace_keeps_simultaneous_transient_load_distinct():
+    state = fallback_state(
+        workload_regime=WorkloadRegime.TRANSIENT_CPU_GPU,
+        regime_confidence=0.4,
+    )
+    recorded = ControlTick(tick_id=1, ts_ms=NOW_MS, state=state, zones=zones(passthrough()))
+
+    payload = json.loads(recorded.model_dump_json())
+    assert payload["state"]["workload_regime"] == "transient_cpu_gpu"
+    restored = ControlTick.model_validate_json(recorded.model_dump_json())
+    assert restored.state.workload_regime is WorkloadRegime.TRANSIENT_CPU_GPU
+
+
 def test_fallback_trace_remains_valid_when_regime_is_not_available():
     recorded = ControlTick(
         tick_id=1,

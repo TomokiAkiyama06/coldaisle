@@ -149,11 +149,38 @@ def test_simultaneous_cpu_gpu_load_becomes_sustained_combined() -> None:
     assert estimate(history).regime is WorkloadRegime.SUSTAINED_CPU_GPU
 
 
-def test_simultaneous_burst_follows_the_dominant_axis_then_can_become_single_axis() -> None:
+@pytest.mark.parametrize(
+    ("cpu_w", "gpu_w"),
+    [
+        (200.0, 101.0),  # CPU の閾値超過が大きくても片方に丸めない
+        (61.0, 180.0),  # GPU の閾値超過が大きくても片方に丸めない
+    ],
+)
+def test_simultaneous_burst_keeps_both_axes_as_transient_combined(
+    cpu_w: float, gpu_w: float
+) -> None:
+    combined = [snapshot(second, cpu_w=cpu_w, gpu_w=gpu_w) for second in range(4)]
+
+    result = estimate(combined)
+
+    assert result.regime is WorkloadRegime.TRANSIENT_CPU_GPU
+    assert result.trace_fields()["workload_regime"] is WorkloadRegime.TRANSIENT_CPU_GPU
+
+
+def test_simultaneous_burst_becomes_sustained_combined_then_single_axis() -> None:
+    combined = [snapshot(second, cpu_w=90.0, gpu_w=180.0) for second in range(8)]
+    cpu_only = [snapshot(second, cpu_w=90.0, gpu_w=20.0) for second in range(8, 11)]
+
+    assert estimate(combined[:4]).regime is WorkloadRegime.TRANSIENT_CPU_GPU
+    assert estimate(combined).regime is WorkloadRegime.SUSTAINED_CPU_GPU
+    assert estimate(combined + cpu_only).regime is WorkloadRegime.SUSTAINED_CPU
+
+
+def test_short_combined_burst_can_become_single_axis_transient() -> None:
     combined = [snapshot(second, cpu_w=90.0, gpu_w=180.0) for second in range(4)]
     cpu_only = [snapshot(second, cpu_w=90.0, gpu_w=20.0) for second in range(4, 7)]
 
-    assert estimate(combined).regime is WorkloadRegime.TRANSIENT_GPU
+    assert estimate(combined).regime is WorkloadRegime.TRANSIENT_CPU_GPU
     assert estimate(combined + cpu_only).regime is WorkloadRegime.TRANSIENT_CPU
 
 
