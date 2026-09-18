@@ -12,3 +12,12 @@ max_artifact_bytes: 8388608
 # 超えた snapshot は読まずに INVALID_REGISTRY として Fallback させ、書き込みも拒否する。
 # 16 MiB。1 event / record あたり数 KB として数千件の履歴を収められる暫定値
 max_snapshot_bytes: 16777216
+
+# JSON artifact の構造上限。json.loads() が object graph を作る前に、1 pass の走査で検査する。
+# byte 上限内でも、細かい container を大量に並べると数百 MB の Python object になるため。
+# 超えた artifact は INVALID_ARTIFACT_FORMAT として Fallback させる（登録も拒否する）。
+# 入れ子の深さ。表形式の係数や小さな木構造には十分な、保守的な暫定値
+max_json_nesting_depth: 32
+# 値の数（object の key、scalar、container を含む。区切りと閉じ括弧は数えない）。
+# 数万個の係数を持つモデルを収めつつ、object graph を数十 MB 以下に抑える暫定値
+max_json_tokens: 250000

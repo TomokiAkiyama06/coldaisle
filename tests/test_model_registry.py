@@ -646,6 +646,90 @@ def test_invalid_json_artifact_is_never_registered(tmp_path: Path) -> None:
     assert registry.inspect().revision == 0
 
 
+def register_raw(registry: ModelRegistry, body: bytes) -> None:
+    registry.register_candidate(
+        metadata("1.0.0", content=body),
+        body,
+        actor="trainer",
+        reason="training completed",
+    )
+
+
+def test_json_nesting_depth_is_bounded_by_config(tmp_path: Path) -> None:
+    depth = LIMITS.max_json_nesting_depth
+    registry = ModelRegistry(tmp_path / "registry", SimulatedClock(NOW_MS), limits=LIMITS)
+
+    with pytest.raises(ArtifactVerificationError):
+        register_raw(registry, b"[" * (depth + 1) + b"]" * (depth + 1))
+    assert registry.inspect().revision == 0
+
+    register_raw(registry, b"[" * depth + b"]" * depth)
+    assert registry.inspect().revision == 1
+
+
+def test_many_tiny_containers_are_rejected_before_building_the_object_graph(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    body = b"[" + b",".join([b"[]"] * LIMITS.max_json_tokens) + b"]"
+    assert len(body) <= LIMITS.max_artifact_bytes
+    registry = ModelRegistry(tmp_path / "registry", SimulatedClock(NOW_MS), limits=LIMITS)
+
+    def refuse_parse(*args: object, **kwargs: object) -> object:
+        raise AssertionError("over-bound artifact must not reach json.loads")
+
+    monkeypatch.setattr(registry_module.json, "loads", refuse_parse)
+
+    with pytest.raises(ArtifactVerificationError):
+        register_raw(registry, body)
+    with pytest.raises(ArtifactVerificationError):
+        register_raw(registry, b"[" + b",".join([b"{}"] * LIMITS.max_json_tokens) + b"]")
+    with pytest.raises(ArtifactVerificationError):
+        register_raw(registry, b"[" + b",".join([b"0"] * LIMITS.max_json_tokens) + b"]")
+
+
+def test_brackets_and_escaped_quotes_inside_json_strings_are_not_structure(
+    tmp_path: Path,
+) -> None:
+    depth = LIMITS.max_json_nesting_depth
+    text = "[" * (depth * 4) + '\\" {{' + "]" * (depth * 4)
+    body = json.dumps({"note": text, "items": [text] * 3}).encode()
+    registry = ModelRegistry(tmp_path / "registry", SimulatedClock(NOW_MS), limits=LIMITS)
+
+    register_raw(registry, body)
+
+    assert registry.inspect().revision == 1
+
+
+def test_unterminated_string_is_rejected_in_a_single_linear_pass(tmp_path: Path) -> None:
+    # Many escaped quotes after an unterminated string: a naive tokenizer rescans the
+    # remaining input from every quote (quadratic).  This must be rejected promptly.
+    body = b'["' + b'a\\"' * 500_000
+    registry = ModelRegistry(tmp_path / "registry", SimulatedClock(NOW_MS), limits=LIMITS)
+
+    with pytest.raises(ArtifactVerificationError):
+        register_raw(registry, body)
+    with pytest.raises(ArtifactVerificationError):
+        register_raw(registry, b'["trailing backslash\\')
+
+
+def test_loaded_artifact_over_json_bounds_returns_invalid_format(tmp_path: Path) -> None:
+    root = tmp_path / "registry"
+    registry = ModelRegistry(root, SimulatedClock(NOW_MS), limits=LIMITS)
+    register_and_validate(registry, "1.0.0")
+    promote(registry, "1.0.0")
+    tight = ModelRegistry(
+        root,
+        SimulatedClock(NOW_MS),
+        limits=LIMITS.model_copy(update={"max_json_tokens": 1}),
+    )
+
+    result = tight.load_production(ArtifactKind.THERMAL_MODEL, COMPATIBILITY)
+
+    assert result.status is ArtifactLoadStatus.INVALID_ARTIFACT_FORMAT
+    assert result.fallback_required is True
+
+
 def test_oversized_artifact_is_never_registered(tmp_path: Path) -> None:
     body = b'{"model":"too-large"}'
     limits = LIMITS.model_copy(update={"max_artifact_bytes": len(body) - 1})
@@ -672,9 +756,7 @@ def test_registry_limits_come_from_config_without_code_defaults(tmp_path: Path) 
     with pytest.raises(TypeError):
         ModelRegistry(tmp_path / "registry")  # type: ignore[call-arg]
     with pytest.raises(ValidationError):
-        ModelRegistryLimits.model_validate(
-            {"schema_version": 1, "max_artifact_bytes": 0, "max_snapshot_bytes": 1}
-        )
+        ModelRegistryLimits.model_validate(LIMITS.model_dump() | {"max_json_nesting_depth": 0})
 
 
 def test_oversized_snapshot_is_rejected_by_fstat_as_invalid_registry(

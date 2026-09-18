@@ -19,6 +19,13 @@ Model、Supervisor Policy、Feature Transform の artifact lifecycle をロー�
   `open(O_NOFOLLOW | O_NONBLOCK)`した同じfdを`fstat()`してregular fileとsizeを先に確認し、
   preflight時のsize分とgrowth検出用1 byteだけを読む。FIFOで停止せず、読込中の短縮・拡張や
   path差替えから別のbytesを組み立てない。
+- JSON artifactは`json.loads()`でobject graphを作る前に、bytesを1 passで走査する。文字列
+  （escapeを含む）内の括弧は構造として数えず、入れ子の深さ（`max_json_nesting_depth`、
+  現在32）と値の数（`max_json_tokens`、objectのkey・scalar・containerを含む。現在250,000）を
+  上限とする。byte上限内でも細かいcontainerを大量に並べて数百MBのobjectを作らせ、
+  MemoryErrorで制御processを落とす経路を塞ぐ。閉じていない文字列は末尾まで1回で読んで拒否し、
+  走査を入力長に対して線形に保つ。超えたartifactは登録を拒否し、読込時は
+  `INVALID_ARTIFACT_FORMAT`としてFallbackさせる。
 - 現在受理する形式は、構文とtop-levelの型を非実行で検証できるJSONだけである。pickle、
   joblib、Python objectを含むframework固有checkpointに加え、構造validator未導入のONNX /
   safetensorsも`LOADED`にしない。binary形式は安全なvalidatorと一緒に将来schemaへ追加する。

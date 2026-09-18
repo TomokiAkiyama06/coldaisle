@@ -36,6 +36,15 @@ _STATE_FILENAME = "registry.json"
 _LOCK_FILENAME = ".registry.lock"
 _ARTIFACT_FILENAME = "artifact.payload"
 _READ_CHUNK_BYTES = 1024 * 1024
+# One JSON lexical unit relevant to structure: a string, a bracket, or a scalar run.
+# The string branch always matches (possessively) up to its closing quote *or* the end
+# of input, and group 1 is empty when unterminated.  Otherwise a failed string match
+# would be retried at every later quote, making the scan quadratic.
+# Commas, colons and whitespace are skipped; json.loads() still checks full syntax.
+_JSON_STRUCTURE_TOKEN = re.compile(
+    rb'"[^"\\]*+(?:\\.[^"\\]*+)*+("?)|[\[\]{}]|[^\s\[\]{},:"]++',
+    re.DOTALL,
+)
 
 _IDENTIFIER_PATTERN = r"^[a-z][a-z0-9_.-]*$"
 _SEMVER_PATTERN = (
@@ -472,6 +481,8 @@ class ModelRegistryLimits(_Frozen):
     schema_version: Literal[1]
     max_artifact_bytes: int = Field(gt=0)
     max_snapshot_bytes: int = Field(gt=0)
+    max_json_nesting_depth: int = Field(gt=0)
+    max_json_tokens: int = Field(gt=0)
 
     @classmethod
     def from_file(cls, path: Path) -> ModelRegistryLimits:
@@ -952,8 +963,12 @@ class ModelRegistry:
                 raise _AuthorityIncompatibleError("authority stage incompatible")
         return VerifiedArtifact(metadata=record.metadata, payload=payload)
 
-    @staticmethod
-    def _validate_format(payload: bytes) -> None:
+    def _validate_format(self, payload: bytes) -> None:
+        # Bound the object graph *before* json.loads(): a payload under the byte limit
+        # can still hold millions of tiny containers whose Python objects would take
+        # hundreds of MB, and a MemoryError must not take down the control process.
+        self._check_json_structure_bounds(payload)
+
         def reject_nonfinite(value: str) -> None:
             raise ValueError(f"非有限値はJSON artifactに使用できない: {value}")
 
@@ -963,6 +978,29 @@ class ModelRegistry:
             raise _InvalidArtifactFormatError("JSON artifact が不正") from exc
         if not isinstance(decoded, (dict, list)):
             raise _InvalidArtifactFormatError("JSON artifact は object または array にする")
+
+    def _check_json_structure_bounds(self, payload: bytes) -> None:
+        """Single pass over the bytes enforcing configured depth / token bounds."""
+        max_depth = self._limits.max_json_nesting_depth
+        max_tokens = self._limits.max_json_tokens
+        depth = 0
+        tokens = 0
+        for match in _JSON_STRUCTURE_TOKEN.finditer(payload):
+            first = match.group()[:1]
+            if first == b'"' and not match.group(1):
+                raise _InvalidArtifactFormatError("JSON artifact の文字列が閉じていない")
+            if first in (b"]", b"}"):
+                depth -= 1
+                if depth < 0:
+                    raise _InvalidArtifactFormatError("JSON artifact の括弧が対応していない")
+                continue
+            tokens += 1
+            if tokens > max_tokens:
+                raise _InvalidArtifactFormatError("JSON artifact の token 数が上限を超えている")
+            if first in (b"[", b"{"):
+                depth += 1
+                if depth > max_depth:
+                    raise _InvalidArtifactFormatError("JSON artifact の nesting が上限を超えている")
 
     def _read_snapshot(self, root_fd: int | None = None) -> RegistrySnapshot:
         if root_fd is None:
