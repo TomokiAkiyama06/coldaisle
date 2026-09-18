@@ -7,7 +7,9 @@
 
 from __future__ import annotations
 
+import hashlib
 import math
+import re
 import sqlite3
 import time
 from collections.abc import Iterable, Iterator, Sequence
@@ -100,6 +102,10 @@ SELECT metric FROM metrics WHERE metric IS NOT NULL
 
 _NO_UPPER_BOUND = 2**63 - 1
 """`latest()` に上限を設けないときの番人。SQLite の INTEGER の上限。"""
+
+_DATASET_RUN_ALIAS = re.compile(r"^run-[0-9a-f]{32}$")
+_SHA256 = re.compile(r"^[0-9a-f]{64}$")
+_DATASET_SOURCE_KINDS = frozenset({"serial", "replay", "mock", "import"})
 
 _LATEST_SQL = """
 WITH RECURSIVE metrics(metric) AS (
@@ -203,6 +209,8 @@ class SqliteStore:
         # 組み合わせが静かに成立すると、圧縮再生の結果が説明できなくなる
         self._rules = rules
         self._clock = clock
+        self._dataset_writer = False
+        """このインスタンスがdataset source runをbindした取り込みか（#83）。"""
         self._conn = sqlite3.connect(str(path), isolation_level=None)
         self._conn.row_factory = sqlite3.Row
         # busy_timeout を最初に設定する。WAL への切り替えは一瞬だけ排他ロックを取るため、
@@ -303,6 +311,8 @@ class SqliteStore:
         if not rows:
             return 0
         with self.transaction():
+            # 書き込みロック（BEGIN IMMEDIATE）の中で確かめるので、bindとの競合も無い
+            self._refuse_foreign_dataset_writer()
             cursor = self._conn.executemany(
                 "INSERT OR IGNORE INTO readings (metric, ts_ms, value, quality) "
                 "VALUES (?, ?, ?, ?)",
@@ -608,6 +618,123 @@ class SqliteStore:
             "SELECT value FROM system_state WHERE key = ? ORDER BY ts_ms DESC LIMIT 1", (key,)
         ).fetchone()
         return None if row is None else str(row["value"])
+
+    def bind_dataset_source_run(
+        self,
+        *,
+        run_alias: str,
+        source_kind: str,
+        source_sha256: str,
+        at_ms: int,
+    ) -> None:
+        """このDBを1つのdataset source runへ、上書き不能で1回だけ結び付ける。"""
+        if _DATASET_RUN_ALIAS.fullmatch(run_alias) is None:
+            raise ValueError("dataset run aliasは run-<32 hex> でなければならない")
+        if source_kind not in _DATASET_SOURCE_KINDS:
+            raise ValueError("dataset source kindが不正")
+        if _SHA256.fullmatch(source_sha256) is None:
+            raise ValueError("dataset source SHA-256が不正")
+        if at_ms < 0:
+            raise ValueError("dataset source runのbind時刻が不正")
+        try:
+            with self.transaction():
+                if self.dataset_source_run() is not None:
+                    raise ValueError("dataset DBは既に別のsource runへbindされている")
+                source_rows = int(
+                    self._conn.execute(
+                        "SELECT (SELECT COUNT(*) FROM readings) "
+                        "+ (SELECT COUNT(*) FROM control_traces)"
+                    ).fetchone()[0]
+                )
+                if source_rows:
+                    raise ValueError("dataset source runは空の専用DBへ先にbindする")
+                self._conn.execute(
+                    "INSERT INTO dataset_source_run "
+                    "(singleton, run_alias, source_kind, source_sha256, bound_ms) "
+                    "VALUES (1, ?, ?, ?, ?)",
+                    (run_alias, source_kind, source_sha256, at_ms),
+                )
+        except sqlite3.IntegrityError as exc:
+            raise ValueError("dataset DBは既に別のsource runへbindされている") from exc
+        # bindに成功したこのインスタンスだけが、以後readingsを書ける
+        self._dataset_writer = True
+
+    def _refuse_foreign_dataset_writer(self) -> None:
+        """dataset source runへbind済みのDBには、bindした取り込み以外からreadingsを書かせない。
+
+        完了の印より前（取り込み中）にも、並行する`coldaisle-telemetry`等の別writerが
+        readingsを足すと、入力全体のhashの下に入力外の行が混ざり、完了時の封印にも
+        含まれてしまう。bindは取り込み開始前の1回だけなので、bindしたStoreインスタンス
+        （同じ接続）だけを正当なwriterとする。別プロセス・別接続は拒否する。
+        """
+        if self._dataset_writer:
+            return
+        if self.dataset_source_run() is not None:
+            raise ValueError(
+                "dataset source runへbind済みのDBには、bindしたReplay取り込み以外は書けない（#83）"
+            )
+
+    def dataset_source_run(self) -> tuple[str, str, str] | None:
+        """bind済みdataset source runの(run alias, kind, SHA-256)を返す。"""
+        row = self._conn.execute(
+            "SELECT run_alias, source_kind, source_sha256 FROM dataset_source_run "
+            "WHERE singleton = 1"
+        ).fetchone()
+        if row is None:
+            return None
+        return (str(row["run_alias"]), str(row["source_kind"]), str(row["source_sha256"]))
+
+    def complete_dataset_source_run(self, *, at_ms: int) -> None:
+        """bind済みrunが入力を最後まで取り込んだことを、上書き不能で1回だけ記録する。
+
+        bindは入力全体のhashを先に固定するため、途中停止したrunと区別する印が要る。
+        印にはその時点のreadings件数とdigestを封印として持たせる。印の存在だけを
+        信じると、完了後に別のwriterが追記・削除したDBも通ってしまう。
+        """
+        if at_ms < 0:
+            raise ValueError("dataset source runの完了時刻が不正")
+        try:
+            with self.transaction():
+                count, digest = self.readings_digest()
+                self._conn.execute(
+                    "INSERT INTO dataset_source_run_complete "
+                    "(singleton, completed_ms, readings_count, readings_sha256) "
+                    "VALUES (1, ?, ?, ?)",
+                    (at_ms, count, digest),
+                )
+        except sqlite3.IntegrityError as exc:
+            raise ValueError("dataset source runを完了として記録できない") from exc
+
+    def dataset_source_run_completed(self) -> bool:
+        """bind済みrunが入力を最後まで取り込み終えているか。"""
+        return self.dataset_readings_seal() is not None
+
+    def dataset_readings_seal(self) -> tuple[int, str] | None:
+        """完了時に封印したreadingsの(件数, SHA-256)。未完了なら`None`。"""
+        row = self._conn.execute(
+            "SELECT readings_count, readings_sha256 FROM dataset_source_run_complete "
+            "WHERE singleton = 1"
+        ).fetchone()
+        if row is None:
+            return None
+        return int(row["readings_count"]), str(row["readings_sha256"])
+
+    def readings_digest(self) -> tuple[int, str]:
+        """readings全行の(件数, SHA-256)。主キー順に1行ずつ流してhashする。
+
+        値は`repr`で表す。Pythonのfloat reprは往復可能で決定的なため、同じ行集合なら
+        同じdigestになる。
+        """
+        digest = hashlib.sha256()
+        count = 0
+        cursor = self._conn.execute(
+            "SELECT metric, ts_ms, value, quality FROM readings ORDER BY metric, ts_ms"
+        )
+        for metric, ts_ms, value, quality in cursor:
+            digest.update(repr((metric, ts_ms, value, quality)).encode("utf-8"))
+            digest.update(b"\n")
+            count += 1
+        return count, digest.hexdigest()
 
     def active_alert(self, rule_id: str, metric: str | None) -> AlertRecord | None:
         """未解決（`pending` / `firing`）のアラート。

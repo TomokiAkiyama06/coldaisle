@@ -9,6 +9,7 @@ CSV は**テストの中で書き出す。** `.gitignore` が `sensors_*.csv` �
 体裁は実ファイル（`~/server_sensor_logs/`）に合わせてある。
 """
 
+import os
 from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -16,7 +17,7 @@ from zoneinfo import ZoneInfo
 import pytest
 
 from coldaisle.ingest.protocol import RawHello, RawSample
-from coldaisle.ingest.replay import ReplaySource, normalize_column
+from coldaisle.ingest.replay import ReplaySource, normalize_column, replay_sha256
 from coldaisle.store import Quality, SqliteStore
 from coldaisle.store.rollup import rollup_minutes
 
@@ -88,6 +89,56 @@ def test_rows_become_samples(day_24):
     assert len(produced) == 4
     assert produced[0].channels["room_temp"] == 24.4
     assert produced[0].channels["rear_exhaust"] == 23.94
+
+
+def test_normal_replay_does_not_eagerly_hash_the_input(day_24):
+    replay = source(day_24)
+
+    assert replay.source_sha256 is None
+
+
+def test_dataset_replay_hashes_and_streams_the_same_private_snapshot(day_24):
+    expected_digest = replay_sha256(day_24)
+    replay = source(day_24, dataset_provenance=True)
+    day_24.write_text(
+        f"{HEADER}\n{DAY_24_ROWS.replace('24.4', '99.9')}",
+        encoding="utf-8",
+    )
+
+    produced = samples(replay)
+
+    assert replay.source_sha256 == expected_digest
+    assert produced[0].channels["room_temp"] == 24.4
+
+
+def test_dataset_replay_holds_one_descriptor_regardless_of_csv_count(tmp_path):
+    """CSVごとにsnapshotを開いたままにすると、長いarchiveでEMFILEになる。"""
+    directory = tmp_path / "archive"
+    directory.mkdir()
+    days = 64
+    for day in range(days):
+        stamp = f"2026-08-24T{day // 60:02d}:{day % 60:02d}:00"
+        (directory / f"sensors_{day:03d}.csv").write_text(
+            f"{HEADER}\n{stamp},24.4,56.2,24.12,24.94,23.56,23.75,23.94\n",
+            encoding="utf-8",
+        )
+    before = len(os.listdir("/dev/fd"))
+
+    replay = source(directory, dataset_provenance=True)
+    held = len(os.listdir("/dev/fd")) - before
+    produced = samples(replay)
+
+    assert held <= 1
+    assert len(produced) == days
+    assert replay.source_sha256 == replay_sha256(directory)
+
+
+def test_replay_fingerprint_rejects_a_fifo_without_blocking(tmp_path):
+    fifo = tmp_path / "replay.csv"
+    os.mkfifo(fifo)
+
+    with pytest.raises(ValueError, match="regular file"):
+        replay_sha256(fifo)
 
 
 def test_blank_cells_are_missing(day_24):
@@ -401,3 +452,64 @@ def test_interval_estimation_reads_only_two_rows(logs, monkeypatch):
     monkeypatch.setattr(ReplaySource, "_parse_row", counting)
     assert replay.hello.interval_ms == 3_000
     assert parsed <= 3, f"{parsed} 行も読んでいる"
+
+
+def test_malformed_rows_and_unparsed_cells_are_counted_but_streamed(tmp_path):
+    """列数の合わない行と読めない数値は流すが、datasetの完了判定のために数える。"""
+    path = tmp_path / "broken.csv"
+    path.write_text(
+        f"{HEADER}\n"
+        "2026-08-24T00:00:00,24.4,56.2,24.12,24.94,23.56,23.75,23.94,EXTRA\n"
+        "2026-08-24T00:00:03,24.4,56.1\n"
+        "2026-08-24T00:00:06,ERR,,24.19,25.00,23.62,23.81,24.00\n",
+        encoding="utf-8",
+    )
+    replay = ReplaySource(path, tz=JST, sleep=no_sleep)
+
+    produced = samples(replay)
+
+    assert len(produced) == 3
+    assert replay.losses == {
+        "dropped_rows": 0,
+        "malformed_rows": 2,
+        "unparsed_cells": 1,
+        "header_collisions": 0,
+    }
+
+
+@pytest.mark.parametrize(
+    "header",
+    [
+        "timestamp,room,room_temp,gpu_intake",
+        "timestamp,room_temp,room_temp,gpu_intake",
+        "timestamp,Room Temp,room-temp,gpu_intake",
+        "timestamp,ts,room_temp,gpu_intake",
+        "Time,datetime,room_temp,gpu_intake",
+    ],
+)
+def test_header_collisions_are_counted_once_per_file(tmp_path, header):
+    """同じ列へ正規化される見出しは、後の列だけが残る。流しつつ数える。"""
+    path = tmp_path / "collide.csv"
+    path.write_text(
+        f"{header}\n2026-08-24T00:00:00,19,20,30\n2026-08-24T00:00:03,19,21,31\n",
+        encoding="utf-8",
+    )
+    replay = ReplaySource(path, tz=JST, sleep=no_sleep)
+
+    produced = samples(replay)
+
+    assert [sample.channels["room_temp"] for sample in produced] == [20.0, 21.0]
+    assert replay.header_collisions == 1
+
+
+def test_unmapped_duplicate_headers_are_not_collisions(tmp_path):
+    path = tmp_path / "unmapped.csv"
+    path.write_text(
+        "timestamp,room_temp,vrm,vrm\n2026-08-24T00:00:00,20,1,2\n",
+        encoding="utf-8",
+    )
+    replay = ReplaySource(path, tz=JST, sleep=no_sleep)
+
+    samples(replay)
+
+    assert replay.header_collisions == 0

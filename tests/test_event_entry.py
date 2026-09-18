@@ -304,10 +304,10 @@ def test_events_query_keeps_the_newest_side_and_filters_kind(tmp_path, rules):
 
 
 def test_the_decision_ddl_is_the_migration():
-    """決定記録 0045 §2.5 の SQL と 0004 のマイグレーションを片方だけ直させない。"""
+    """決定記録 0045 §2.5 の SQL と 0006 のマイグレーションを片方だけ直させない。"""
     block = re.search(r"```sql\n(.*?)```", DECISION.read_text(encoding="utf-8"), re.DOTALL)
     assert block is not None
-    migration = (store_migrations.MIGRATIONS_DIR / "0004_events.sql").read_text(encoding="utf-8")
+    migration = (store_migrations.MIGRATIONS_DIR / "0006_events.sql").read_text(encoding="utf-8")
 
     def normalize(sql: str) -> str:
         return re.sub(r"\s+", " ", sql).strip()

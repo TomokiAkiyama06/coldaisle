@@ -381,6 +381,7 @@ def apply_retention(store: SqliteStore, rules: RetentionRules, *, now_ms: int) -
     メトリクスごとにループするのは主キー `(metric, ts_ms)` を使うため
     （決定記録 0002 §2.4）。1本の `DELETE ... WHERE ts_ms < ?` は全走査になる。
     """
+    _refuse_dataset_db(store)
     conn = store.connection
     cutoff = now_ms - rules.raw_retention_ms
     rolled = conn.execute("SELECT MAX(bucket_ms) FROM readings_1m").fetchone()[0]
@@ -397,6 +398,17 @@ def apply_retention(store: SqliteStore, rules: RetentionRules, *, now_ms: int) -
             )
             deleted += int(cursor.rowcount)
     return deleted, cutoff
+
+
+def _refuse_dataset_db(store: SqliteStore) -> None:
+    """dataset専用DB（#83）には保持期間を適用しない。
+
+    dataset DBはsource run 1本の凍結された記録で、readingsは完了時に封印される。
+    保持期間で生データやControlTickを消すと、datasetの再生成が黙って別物になる。
+    削除0件でもControlTickは消え得るため、triggerに任せず入口で拒否する。
+    """
+    if store.dataset_source_run() is not None:
+        raise ValueError("dataset専用DBにはロールアップ・保持期間を適用しない（#83）")
 
 
 def vacuum(store: SqliteStore) -> None:
@@ -418,6 +430,7 @@ def run(
     periodic_intervals_ms: Mapping[str, int] | None = None,
 ) -> Result:
     """ロールアップ → 削除の順で実行する。"""
+    _refuse_dataset_db(store)
     minutes = rollup_minutes(store, periodic_intervals_ms=periodic_intervals_ms, now_ms=now_ms)
     hours = rollup_hours(store)
     deleted, cutoff = apply_retention(store, rules, now_ms=now_ms)
