@@ -78,5 +78,4 @@ Critical Safety / Reactive Guard / Fallback Controller の入力にはしない�
 
 ## 5. 未決事項
 
-- FINAL への変更（所有者）
 - コアごと・CCD ごとの使用率が必要になった場合の名前
