@@ -19,6 +19,7 @@ from fastapi.testclient import TestClient
 
 from coldaisle.api.app import WEB_ROOT, Config, create_app
 from coldaisle.clock import SimulatedClock
+from coldaisle.metrics import MetricCatalog
 from coldaisle.store import Quality, Reading, Sample, SqliteStore
 from conftest import CONFIG_DIR, QUALITY_RULES_PATH
 
@@ -112,6 +113,7 @@ def test_script_reads_only_documented_endpoints():
     script = SCRIPT.read_text(encoding="utf-8")
     used = set(re.findall(r'"(/api/v1/[a-z]+)"', script))
     assert used == {
+        "/api/v1/metrics",
         "/api/v1/latest",
         "/api/v1/series",
         "/api/v1/health",
@@ -236,3 +238,117 @@ def test_the_current_rom_is_shown():
 def test_the_rom_is_monospaced():
     """ROM は目で突き合わせるもの。**等幅で並べる。**"""
     assert "td.rom" in (WEB_ROOT / "styles.css").read_text(encoding="utf-8")
+
+
+# ---------------------------------------------------------------- 表示名と式（#48 / 決定記録 0039）
+
+
+def test_the_catalog_endpoint_returns_labels_and_formulas(client):
+    """表示名と派生値の式は `config/metrics.yaml` そのまま（決定記録 0039 §2.1）。"""
+    body = client.get("/api/v1/metrics").json()
+    catalog = MetricCatalog.from_yaml(METRICS_PATH)
+    assert body["metrics"]["air.room"] == {"unit": "C", "label": catalog.metrics["air.room"].label}
+    assert set(body["metrics"]) == set(catalog.metrics)
+    rise = body["derived"]["d.intake_rise"]
+    assert rise["minuend"] == "air.front_intake"
+    assert rise["subtrahend"] == "air.room"
+    assert rise["label"] == catalog.derived["d.intake_rise"].label
+
+
+def test_the_catalog_does_not_need_data(tmp_path):
+    """**取り込みが止まっていても表示名は引ける。** DB が空でも 200。"""
+    app = create_app(
+        Config(db=tmp_path / "empty.db", quality_rules=QUALITY_RULES_PATH, metrics=METRICS_PATH),
+        clock=SimulatedClock(NOW_MS),
+    )
+    with TestClient(app) as opened:
+        response = opened.get("/api/v1/metrics")
+    assert response.status_code == 200
+    assert "air.room" in response.json()["metrics"]
+
+
+def test_every_card_metric_has_a_label():
+    """カードに出す7つには表示名がある。**無いと内部名が画面に出る。**"""
+    catalog = MetricCatalog.from_yaml(METRICS_PATH)
+    air = [name for name in catalog.metrics if name.startswith("air.")]
+    assert len(air) == 7
+    assert all(catalog.metrics[name].label for name in air)
+
+
+def test_internal_metric_names_are_not_rendered_as_labels():
+    """`air.room` のような内部名を見出しにしない（決定記録 0039 §2.2）。"""
+    script = SCRIPT.read_text(encoding="utf-8")
+    assert 'el("div", "label", metric)' not in script
+    assert 'el("div", "label", name)' not in script
+    assert 'el("div", "label", labelOf(metric))' in script
+    assert 'el("div", "label", labelOf(name))' in script
+    assert "labelOf(entry.metric)" in script, "凡例も表示名"
+    assert "labelOf(sensor.metric)" in script, "センサー構成も表示名"
+    assert "labelOf(alert.metric)" in script, "アラートの対象も表示名"
+
+
+def test_derived_cards_show_the_formula():
+    """派生値には「何から何を引いたか」を添える。"""
+    script = SCRIPT.read_text(encoding="utf-8")
+    assert "formulaOf(name)" in script
+    assert "entry.minuend" in script and "entry.subtrahend" in script
+    assert ".formula" in STYLES.read_text(encoding="utf-8")
+
+
+def test_stale_cards_carry_no_badge_text():
+    """カードに「古い」を出さない。古さは画面全体の赤帯が言う（決定記録 0039 §2.3）。
+
+    **見た目は残す。** 赤い左辺が無いと、古いカードが正常と同じに見える。
+    """
+    script = SCRIPT.read_text(encoding="utf-8")
+    labels = script[
+        script.index("const QUALITY_LABEL") : script.index(
+            "};", script.index("const QUALITY_LABEL")
+        )
+    ]
+    assert "stale" not in labels
+    assert "古い" not in labels
+    for quality in (Quality.OK, Quality.MISSING, Quality.SUSPECT):
+        assert f"{quality.value}:" in labels, f"{quality.value} の文言が無い"
+    assert ".q-stale" in STYLES.read_text(encoding="utf-8")
+
+
+def test_a_stale_metric_always_raises_the_banner(tmp_path, rules):
+    """カードから文言を外してよい根拠。**stale のカードがあれば赤帯も必ず出る。**
+
+    どれか1つのメトリクスが `stale` なら health も `stale`（赤帯の条件）。
+    """
+    path = tmp_path / "stale.db"
+    with SqliteStore(path, rules=rules, clock=SimulatedClock(NOW_MS)) as store:
+        store.insert_sample(
+            Sample(
+                ts_ms=NOW_MS,
+                readings=(Reading(metric="air.room", value=26.0, quality=Quality.OK),),
+            )
+        )
+    app = create_app(
+        Config(db=path, quality_rules=QUALITY_RULES_PATH, metrics=METRICS_PATH),
+        clock=SimulatedClock(NOW_MS + 600_000),
+    )
+    with TestClient(app) as opened:
+        latest = opened.get("/api/v1/latest").json()
+        health = opened.get("/api/v1/health").json()
+    assert latest["metrics"]["air.room"]["quality"] == "stale"
+    assert health["stale"] is True
+
+
+def test_the_catalog_is_retried_until_it_loads():
+    """起動直後に API が落ちていても、回復後に内部名のまま残らない。"""
+    script = SCRIPT.read_text(encoding="utf-8")
+    refresh = script[script.index("async function refresh()") : script.index("function connect()")]
+    assert "if (catalog === null)" in refresh
+    assert '"/api/v1/metrics"' in refresh
+
+
+def test_alerts_are_a_table_with_state_and_severity_in_words():
+    """アラート一覧は表。状態と重大度は色だけでなく文言でも出す（0011 §2.4 と同じ理由）。"""
+    script = SCRIPT.read_text(encoding="utf-8")
+    body = script[script.index("function renderAlerts") :]
+    assert '"alert-table"' in body
+    assert "ALERT_STATE_LABEL" in body and "SEVERITY_LABEL" in body
+    assert ".alert-table" in STYLES.read_text(encoding="utf-8")

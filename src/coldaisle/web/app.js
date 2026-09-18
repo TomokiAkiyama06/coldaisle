@@ -12,7 +12,10 @@ const RANGES = [
   { label: "7d", window: "7d", agg: "1h" },
 ];
 
-const QUALITY_LABEL = { ok: "正常", missing: "欠測", suspect: "疑わしい", stale: "古い" };
+// `stale` には文言を置かない（決定記録 0039 §2.3）。古さは画面全体の赤帯が言う。
+// `stale` のメトリクスが1つでもあれば health も `stale` になり、赤帯が必ず出る
+// （API の `_is_stale`）。7枚のカードに同じ「古い」を並べても読み手に何も足さない
+const QUALITY_LABEL = { ok: "正常", missing: "欠測", suspect: "疑わしい" };
 
 // 集計の粒度ごとのバケット幅。生データは観測から推定する
 const STEP_MS = { "1m": 60000, "5m": 300000, "1h": 3600000 };
@@ -23,12 +26,35 @@ const SERIES_COLORS = [
 ];
 
 let currentRange = RANGES[0];
+// 表示名の表（`GET /api/v1/metrics`）。**内部のメトリクス名を画面に出さない**（決定記録 0039 §2.2）
+let catalog = null;
 let socket = null;
 let retryDelayMs = 1000;
 
 /** 数値を桁をそろえて出す。null は「—」。 */
 function fmt(value, digits = 2) {
   return value === null || value === undefined ? "—" : Number(value).toFixed(digits);
+}
+
+/**
+ * メトリクス名 → 表示名。**`air.room` のような内部名を画面に出さない。**
+ * 表が取れていない・設定に無いときだけ名前そのものに戻る（空欄より誤読が少ない）。
+ */
+function labelOf(metric) {
+  if (!metric) return "—";
+  const entry = catalog && (catalog.metrics[metric] || catalog.derived[metric]);
+  return entry ? entry.label : metric;
+}
+
+/** 派生値の式。「GPU吸気 − 室温」。何から何を引いた値かを添える。 */
+function formulaOf(name) {
+  const entry = catalog && catalog.derived[name];
+  return entry ? `${labelOf(entry.minuend)} − ${labelOf(entry.subtrahend)}` : "";
+}
+
+/** 現在値カードに出すメトリクス。温湿度の7つ（Issue の「7メトリクス」）。 */
+function isCardMetric(metric) {
+  return metric.startsWith("air.");
 }
 
 function el(tag, className, text) {
@@ -43,12 +69,14 @@ function renderCards(latest) {
   const container = document.getElementById("cards");
   container.replaceChildren();
   for (const [metric, item] of Object.entries(latest.metrics)) {
+    if (!isCardMetric(metric)) continue;
     const card = el("div", `card q-${item.quality}`);
-    card.appendChild(el("div", "label", metric));
+    card.appendChild(el("div", "label", labelOf(metric)));
     const value = el("div", "value", fmt(item.value));
     if (item.unit) value.appendChild(el("span", "unit", item.unit));
     card.appendChild(value);
-    card.appendChild(el("span", "badge", QUALITY_LABEL[item.quality] || item.quality));
+    const badge = QUALITY_LABEL[item.quality];
+    if (badge) card.appendChild(el("span", "badge", badge));
     container.appendChild(card);
   }
 }
@@ -58,10 +86,15 @@ function renderDerived(latest) {
   container.replaceChildren();
   for (const [name, value] of Object.entries(latest.derived)) {
     const card = el("div", "card");
-    card.appendChild(el("div", "label", name));
+    card.appendChild(el("div", "label", labelOf(name)));
     const shown = el("div", "value", fmt(value));
-    shown.appendChild(el("span", "unit", "C"));
+    const unit = catalog && catalog.derived[name] ? catalog.derived[name].unit : "C";
+    shown.appendChild(el("span", "unit", unit));
     card.appendChild(shown);
+    // 計算できないとき（入力のどちらかが ok でない。決定記録 0009 §2.2）も式は出す。
+    // 「—」だけだと、何が足りないのかを辿れない
+    const formula = formulaOf(name);
+    if (formula) card.appendChild(el("div", "formula", formula));
     container.appendChild(card);
   }
 }
@@ -94,21 +127,36 @@ function renderBanner(health) {
   else age.textContent = `最終受信 ${fmt(health.data_age_seconds, 1)} 秒前${source}`;
 }
 
+const ALERT_STATE_LABEL = { pending: "判定中", firing: "発生中", resolved: "解消" };
+const SEVERITY_LABEL = { info: "情報", warning: "警告", critical: "重大" };
+
+/** アラート一覧（FIRING / RESOLVED）。表にして、状態と重大度を文言でも出す。 */
 function renderAlerts(alerts) {
   const container = document.getElementById("alerts");
   container.replaceChildren();
   if (alerts.length === 0) {
-    container.appendChild(el("p", "empty", "発生中のアラートはありません。"));
+    container.appendChild(el("p", "empty", "アラートはありません。"));
     return;
   }
-  for (const alert of alerts) {
-    const node = el("div", `alert sev-${alert.severity} state-${alert.state}`);
-    node.appendChild(el("div", "title", `${alert.rule_id}${alert.metric ? ` — ${alert.metric}` : ""}`));
-    const started = new Date(alert.started_ms).toLocaleString();
-    const detail = alert.detail ? ` / ${alert.detail}` : "";
-    node.appendChild(el("div", "meta", `${alert.state} · ${started}${detail}`));
-    container.appendChild(node);
+  const table = document.createElement("table");
+  table.className = "alert-table";
+  const head = document.createElement("tr");
+  for (const label of ["状態", "重大度", "ルール", "対象", "開始", "詳細"]) {
+    head.appendChild(el("th", "", label));
   }
+  table.appendChild(head);
+  for (const alert of alerts) {
+    const row = document.createElement("tr");
+    row.className = `sev-${alert.severity} state-${alert.state}`;
+    row.appendChild(el("td", "state", ALERT_STATE_LABEL[alert.state] || alert.state));
+    row.appendChild(el("td", "severity", SEVERITY_LABEL[alert.severity] || alert.severity));
+    row.appendChild(el("td", "", alert.rule_id));
+    row.appendChild(el("td", "", alert.metric ? labelOf(alert.metric) : "—"));
+    row.appendChild(el("td", "", new Date(alert.started_ms).toLocaleString()));
+    row.appendChild(el("td", "", alert.detail || ""));
+    table.appendChild(row);
+  }
+  container.appendChild(table);
 }
 
 /**
@@ -142,7 +190,7 @@ function renderDevices(devices) {
     const table = document.createElement("table");
     table.className = "sensors";
     const head = document.createElement("tr");
-    for (const label of ["チャネル", "メトリクス", "種別", "GPIO", "記録された ROM", "いまの ROM"]) {
+    for (const label of ["チャネル", "計測点", "種別", "GPIO", "記録された ROM", "いまの ROM"]) {
       head.appendChild(el("th", "", label));
     }
     table.appendChild(head);
@@ -150,7 +198,7 @@ function renderDevices(devices) {
       const row = document.createElement("tr");
       if (sensor.changed) row.className = "changed";
       row.appendChild(el("td", "", sensor.channel));
-      row.appendChild(el("td", "", sensor.metric || "—"));
+      row.appendChild(el("td", "", labelOf(sensor.metric)));
       row.appendChild(el("td", "", sensor.kind));
       row.appendChild(el("td", "", sensor.gpio === null ? "—" : String(sensor.gpio)));
       row.appendChild(el("td", "rom", sensor.rom || "—"));
@@ -235,7 +283,7 @@ function drawChart(svgId, legendId, series) {
     const swatch = el("i");
     swatch.style.background = color;
     item.appendChild(swatch);
-    item.appendChild(document.createTextNode(entry.metric));
+    item.appendChild(document.createTextNode(labelOf(entry.metric)));
     legend.appendChild(item);
   });
 }
@@ -314,6 +362,9 @@ function applyLatest(latest) {
  */
 async function refresh() {
   try {
+    // 表示名の表は設定から来るので一度取れば足りる。**取れるまで毎回試す**
+    // （起動直後に API が落ちていても、回復後に内部名のまま残らないように）
+    if (catalog === null) catalog = await fetchJson("/api/v1/metrics");
     const [latest, health, alerts, devices] = await Promise.all([
       fetchJson("/api/v1/latest"),
       fetchJson("/api/v1/health"),

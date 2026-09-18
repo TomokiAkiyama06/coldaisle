@@ -101,3 +101,4 @@ docs/decisions/NNNN-<slug>.md      例: 0002-metric-naming.md
 | [0029](0029-telemetry-loss-classes.md) | 制御入力の欠測の分類（Critical / Degraded / Advisory） | FINAL |
 | [0030](0030-control-decision-trace-storage.md) | Control decision trace の保存先 | Proposed |
 | [0037](0037-model-registry-rollback-target.md) | Model Registry の promotion 時の rollback target | Proposed |
+| [0039](0039-dashboard-labels-and-catalog.md) | ダッシュボードの表示名と `GET /api/v1/metrics` | Proposed |

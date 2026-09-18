@@ -46,6 +46,43 @@ class LatestResponse(BaseModel):
     stale: bool
 
 
+class MetricLabelOut(BaseModel):
+    """保存されるメトリクス1つ分の表示情報（`config/metrics.yaml`）。"""
+
+    model_config = ConfigDict(frozen=True)
+
+    unit: str
+    label: str
+
+
+class DerivedLabelOut(BaseModel):
+    """派生値1つ分の表示情報と**式**（被減数 − 減数）。
+
+    式を返すのは、画面が「何から何を引いた値か」を示せるようにするため
+    （決定記録 0039 §2.2）。**計算はしない。** 値は `/latest` の `derived`。
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    unit: str
+    label: str
+    minuend: str
+    subtrahend: str
+
+
+class MetricsCatalogResponse(BaseModel):
+    """`GET /api/v1/metrics`（決定記録 0039 §2.1）。
+
+    メトリクス名から人間向けの表示名を引く表。**値は含まない。**
+    表示名は変えてよく（決定記録 0009 §2.1）、機械はメトリクス名で参照する。
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    metrics: dict[str, MetricLabelOut]
+    derived: dict[str, DerivedLabelOut]
+
+
 class SeriesPointOut(BaseModel):
     """時系列の1点。`agg` によって埋まる項目が変わる。
 
