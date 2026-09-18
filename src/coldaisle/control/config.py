@@ -6,18 +6,28 @@
 
 from __future__ import annotations
 
+import re
 from hashlib import sha256
 from pathlib import Path
 from typing import Annotated, Any, Literal, Self, cast
 
 import yaml
-from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, model_validator
+from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, field_validator, model_validator
 
-from coldaisle.control.schema import AuthorityStage, Demand, PerZone, Zone
+from coldaisle.control.schema import (
+    AuthorityStage,
+    Demand,
+    PerZone,
+    SupervisorObjectiveWeights,
+    SupervisorPolicyKind,
+    SupervisorTargetBand,
+    WorkloadRegime,
+    Zone,
+)
 from coldaisle.store.models import validate_metric
 
-CONTROL_CONFIG_VERSION: Literal[3] = 3
-FAN_POLICY_CONFIG_VERSION: Literal[3] = 3
+CONTROL_CONFIG_VERSION: Literal[5] = 5
+FAN_POLICY_CONFIG_VERSION: Literal[5] = 5
 CONFIG_FILENAMES = {
     "fan_hardware": "fan-hardware.yaml",
     "safety": "safety.yaml",
@@ -38,6 +48,11 @@ def _yaml_sequence_to_tuple(value: object) -> object:
 def _yaml_authority_stage(value: object) -> object:
     """YAML文字列を列挙値に正規化し、未知の stage は拒否する。"""
     return AuthorityStage(value) if isinstance(value, str) else value
+
+
+def _yaml_supervisor_policy(value: object) -> object:
+    """YAML文字列を Supervisor policy 列挙値へ正規化する。"""
+    return SupervisorPolicyKind(value) if isinstance(value, str) else value
 
 
 def _yaml_zones_to_frozenset(value: object) -> object:
@@ -418,13 +433,212 @@ class MpcTiming(_ConfigModel):
         return self
 
 
-class SupervisorTiming(_ConfigModel):
+class SupervisorWeightRange(_ConfigModel):
+    """RL action を validated config 内へ閉じ込める weight の範囲。"""
+
+    minimum: UnitInterval
+    maximum: UnitInterval
+
+    @model_validator(mode="after")
+    def _minimum_does_not_exceed_maximum(self) -> Self:
+        if self.minimum > self.maximum:
+            raise ValueError("Supervisor weight range は minimum <= maximum にする")
+        return self
+
+    def contains(self, value: float) -> bool:
+        """weight が設定済みの閉区間にあるか返す。"""
+        return self.minimum <= value <= self.maximum
+
+
+class SupervisorWeightBounds(_ConfigModel):
+    """#89 が変更できる各 objective weight の範囲。"""
+
+    gpu_temperature: SupervisorWeightRange
+    cpu_temperature: SupervisorWeightRange
+    balance: SupervisorWeightRange
+    acoustic: SupervisorWeightRange
+    change: SupervisorWeightRange
+
+
+class SupervisorOutputBounds(_ConfigModel):
+    """Rule / RL の出力を検証済み戦略・target・weightへ制限する。"""
+
+    strategies: Annotated[
+        tuple[str, ...], BeforeValidator(_yaml_sequence_to_tuple), Field(min_length=1)
+    ]
+    target_bands: Annotated[
+        tuple[SupervisorTargetBand, ...],
+        BeforeValidator(_yaml_sequence_to_tuple),
+        Field(min_length=1),
+    ]
+    weights: SupervisorWeightBounds
+
+    @model_validator(mode="after")
+    def _choices_are_unique_and_well_formed(self) -> Self:
+        if len(set(self.strategies)) != len(self.strategies):
+            raise ValueError("Supervisor strategy は重複させない")
+        for strategy in self.strategies:
+            if not re.fullmatch(r"[a-z][a-z0-9_]{0,63}", strategy):
+                raise ValueError(f"Supervisor strategy の形式が不正: {strategy!r}")
+        serialized_bands = [band.model_dump_json() for band in self.target_bands]
+        if len(set(serialized_bands)) != len(serialized_bands):
+            raise ValueError("Supervisor target band は重複させない")
+        return self
+
+    def validate_context(
+        self,
+        *,
+        strategy: str,
+        weights: SupervisorObjectiveWeights,
+        target_band: SupervisorTargetBand,
+    ) -> None:
+        """policy context が config の許可範囲外なら拒否する。"""
+        if strategy not in self.strategies:
+            raise ValueError(f"Supervisor strategy は設定済み候補から選ぶ: {strategy}")
+        if target_band not in self.target_bands:
+            raise ValueError("Supervisor target band は設定済み候補から選ぶ")
+        for name in ("gpu_temperature", "cpu_temperature", "balance", "acoustic", "change"):
+            if not getattr(self.weights, name).contains(getattr(weights, name)):
+                raise ValueError(f"Supervisor weight が設定範囲外: {name}")
+
+
+class SupervisorPolicyContext(_ConfigModel):
+    """RulePolicy が1 workload regimeに対応づける運転戦略。"""
+
+    strategy: str = Field(pattern=r"^[a-z][a-z0-9_]*$", max_length=64)
+    weights: SupervisorObjectiveWeights
+    target_band: SupervisorTargetBand
+
+
+class WorkloadPolicyContexts(_ConfigModel):
+    """UNKNOWNを通常状態に倒さず、全 regime の Rule context を必須にする。"""
+
+    idle: SupervisorPolicyContext
+    transient_cpu: SupervisorPolicyContext
+    transient_gpu: SupervisorPolicyContext
+    transient_cpu_gpu: SupervisorPolicyContext
+    """CPU / GPU 同時 burst（決定記録 0036）。値は config で与え、既定値は持たない。"""
+    sustained_cpu: SupervisorPolicyContext
+    sustained_gpu: SupervisorPolicyContext
+    sustained_cpu_gpu: SupervisorPolicyContext
+    cooldown: SupervisorPolicyContext
+    unknown: SupervisorPolicyContext
+
+    def get(self, regime: WorkloadRegime) -> SupervisorPolicyContext:
+        """列挙値に対応する設定を返す。"""
+        return cast(SupervisorPolicyContext, getattr(self, regime.value))
+
+
+class RulePolicyConfig(_ConfigModel):
+    """決定論的な初期 active / RL fallback policy。"""
+
+    version: str = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9_.-]*$", max_length=120)
+    contexts: WorkloadPolicyContexts
+
+
+class SupervisorConfig(_ConfigModel):
+    """Supervisor timing・selection・出力範囲を一括で検証する。"""
+
     period_ms: PositiveMilliseconds
     valid_ms: PositiveMilliseconds
+    active_policy: Annotated[SupervisorPolicyKind, BeforeValidator(_yaml_supervisor_policy)]
+    shadow_policy: Annotated[SupervisorPolicyKind | None, BeforeValidator(_yaml_supervisor_policy)]
+    rl_version: str | None = Field(
+        default=None,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9_.-]*$",
+        max_length=120,
+    )
+    output_bounds: SupervisorOutputBounds
+    rule_policy: RulePolicyConfig
+
+    @model_validator(mode="after")
+    def _selection_and_contexts_are_consistent(self) -> Self:
+        if self.valid_ms < self.period_ms:
+            raise ValueError("supervisor.valid_ms は period_ms 以上にする")
+        if self.shadow_policy is not None and self.shadow_policy is not SupervisorPolicyKind.RL:
+            raise ValueError("shadow policy に指定できるのは RLPolicy だけ")
+        if self.shadow_policy is self.active_policy:
+            raise ValueError("active と shadow に同じ Supervisor policy を指定しない")
+        uses_rl = self.active_policy is SupervisorPolicyKind.RL or self.shadow_policy is not None
+        if uses_rl and self.rl_version is None:
+            raise ValueError("RLPolicy を使う設定には rl_version が必要")
+        for regime in WorkloadRegime:
+            context = self.rule_policy.contexts.get(regime)
+            self.output_bounds.validate_context(
+                strategy=context.strategy,
+                weights=context.weights,
+                target_band=context.target_band,
+            )
+        return self
+
+
+class WorkloadPowerBand(_ConfigModel):
+    """Workload activity の Schmitt trigger を signal ごとに設定する。"""
+
+    metric: str
+    idle_below_w: Annotated[float, Field(ge=0.0, allow_inf_nan=False)]
+    active_above_w: Annotated[float, Field(gt=0.0, allow_inf_nan=False)]
+
+    @field_validator("metric")
+    @classmethod
+    def _metric_is_stored_telemetry(cls, value: str) -> str:
+        return validate_metric(value)
+
+    @model_validator(mode="after")
+    def _activity_has_a_deadband(self) -> Self:
+        if self.active_above_w <= self.idle_below_w:
+            raise ValueError("active_above_w は idle_below_w より大きくする")
+        return self
+
+
+class WorkloadRegimeConfig(_ConfigModel):
+    """#87 の観測窓・遷移時間・Power 閾値。将来時間の予測値は持たない。"""
+
+    cpu_power: WorkloadPowerBand
+    gpu_power: WorkloadPowerBand
+    activity_window_ms: PositiveMilliseconds
+    history_window_ms: PositiveMilliseconds
+    minimum_observation_ms: PositiveMilliseconds
+    sustained_after_ms: PositiveMilliseconds
+    cooldown_ms: PositiveMilliseconds
+    minimum_transition_ms: PositiveMilliseconds
+    confidence_full_window_ms: PositiveMilliseconds
+    max_snapshot_gap_ms: PositiveMilliseconds
+
+    @model_validator(mode="after")
+    def _windows_support_every_duration(self) -> Self:
+        if self.cpu_power.metric == self.gpu_power.metric:
+            raise ValueError("CPU / GPU workload Power metric は別々にする")
+        bounded = {
+            "activity_window_ms": self.activity_window_ms,
+            "minimum_observation_ms": self.minimum_observation_ms,
+            "sustained_after_ms": self.sustained_after_ms,
+            "cooldown_ms": self.cooldown_ms,
+            "minimum_transition_ms": self.minimum_transition_ms,
+            "confidence_full_window_ms": self.confidence_full_window_ms,
+        }
+        too_long = [name for name, value in bounded.items() if value > self.history_window_ms]
+        if too_long:
+            raise ValueError(
+                f"workload regime の期間は history_window_ms 以下にする: {sorted(too_long)}"
+            )
+        if self.max_snapshot_gap_ms > self.minimum_observation_ms:
+            raise ValueError("max_snapshot_gap_ms は minimum_observation_ms 以下にする")
+        required_for_sustained = (
+            self.minimum_observation_ms + self.sustained_after_ms + self.minimum_transition_ms
+        )
+        if required_for_sustained > self.history_window_ms:
+            raise ValueError("history_window_ms は観測・SUSTAINED判定・遷移確認の合計以上にする")
+        required_for_cooldown = (
+            self.minimum_observation_ms + self.cooldown_ms + self.minimum_transition_ms
+        )
+        if required_for_cooldown > self.history_window_ms:
+            raise ValueError("history_window_ms は観測・COOLDOWN判定・遷移確認の合計以上にする")
+        return self
 
 
 class FanPolicyConfig(_ConfigModel):
-    schema_version: Literal[3]
+    schema_version: Literal[5]
     fallback_curve: Annotated[
         tuple[FallbackPoint, ...], BeforeValidator(_yaml_sequence_to_tuple), Field(min_length=2)
     ]
@@ -433,7 +647,8 @@ class FanPolicyConfig(_ConfigModel):
     fallback_dynamics: FallbackDynamics
     reactive_guard: ReactiveGuardConfig
     mpc: MpcTiming
-    supervisor: SupervisorTiming
+    supervisor: SupervisorConfig
+    workload_regime: WorkloadRegimeConfig
     gate_min_confidence: GateConfidenceThresholds
     authority_stage: Annotated[AuthorityStage, BeforeValidator(_yaml_authority_stage)]
     authority_limits: AuthorityLimits

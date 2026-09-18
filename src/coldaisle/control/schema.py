@@ -12,7 +12,7 @@
 
 合成の計算そのもの（0028 §2.4）は Critical Safety（#78）が持つ。
 ここは結果が満たすべき条件だけを検査する。
-Supervisor の出力（#88）と Telemetry snapshot（#65 / #74）の型は、それぞれの Issue で足す。
+Supervisor の出力は #88 で本moduleに追加した。Telemetry snapshot は #102 の独立moduleが持つ。
 """
 
 from __future__ import annotations
@@ -22,7 +22,7 @@ from typing import Annotated, Literal, Self
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-SCHEMA_VERSION: Literal[1] = 1
+SCHEMA_VERSION: Literal[3] = 3
 """`ControlTick` の形の版。**フィールドの名前や意味を変えたら上げる。**
 
 #82 が保存したデータを読み違えないため。
@@ -107,6 +107,187 @@ class OptimizerStatus(StrEnum):
     OK = "ok"
     TIMEOUT = "timeout"
     ERROR = "error"
+
+
+class WorkloadRegime(StrEnum):
+    """観測済み Telemetry から推定する現在の負荷区分。#87。"""
+
+    IDLE = "idle"
+    TRANSIENT_CPU = "transient_cpu"
+    TRANSIENT_GPU = "transient_gpu"
+    TRANSIENT_CPU_GPU = "transient_cpu_gpu"
+    """CPU と GPU の両軸が active で、少なくとも一方が SUSTAINED 未満（決定記録 0036）。"""
+    SUSTAINED_CPU = "sustained_cpu"
+    SUSTAINED_GPU = "sustained_gpu"
+    SUSTAINED_CPU_GPU = "sustained_cpu_gpu"
+    COOLDOWN = "cooldown"
+    UNKNOWN = "unknown"
+
+
+class SupervisorPolicyKind(StrEnum):
+    """Supervisor の実装種別。旧 trace の文字列表現も維持する。"""
+
+    RULE = "rule_policy"
+    RL = "rl_policy"
+
+
+SupervisorWeight = Annotated[float, Field(ge=0.0, le=1.0, allow_inf_nan=False)]
+TemperatureC = Annotated[float, Field(allow_inf_nan=False)]
+
+
+class SupervisorObjectiveWeights(_Frozen):
+    """Learned MPC が任意 context として使う、多目的最適化の相対 weight。"""
+
+    gpu_temperature: SupervisorWeight
+    cpu_temperature: SupervisorWeight
+    balance: SupervisorWeight
+    acoustic: SupervisorWeight
+    change: SupervisorWeight
+
+    @model_validator(mode="after")
+    def _at_least_one_objective_is_enabled(self) -> Self:
+        if not any(
+            value > 0.0
+            for value in (
+                self.gpu_temperature,
+                self.cpu_temperature,
+                self.balance,
+                self.acoustic,
+                self.change,
+            )
+        ):
+            raise ValueError("Supervisor objective weight は少なくとも1つを正にする")
+        return self
+
+
+class TemperatureTarget(_Frozen):
+    """安全上限ではない、Supervisor が選ぶ運転上の温度 target band。"""
+
+    lower_c: TemperatureC
+    upper_c: TemperatureC
+
+    @model_validator(mode="after")
+    def _lower_is_below_upper(self) -> Self:
+        if self.lower_c >= self.upper_c:
+            raise ValueError("target band は lower_c < upper_c にする")
+        return self
+
+
+class SupervisorTargetBand(_Frozen):
+    """CPU / GPU 双方の運転 target。Critical Safety の閾値とは独立。"""
+
+    cpu_temperature: TemperatureTarget
+    gpu_temperature: TemperatureTarget
+
+
+class SupervisorOutput(_Frozen):
+    """Supervisor の versioned output。Demand / PWM / hardware 指令は表現できない。"""
+
+    schema_version: Literal[1] = 1
+    snapshot_schema_version: int = Field(ge=1)
+    tick_id: int = Field(ge=0)
+    ts_ms: int = Field(ge=0)
+    policy: SupervisorPolicyKind
+    version: str = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9_.-]*$", max_length=120)
+    regime: WorkloadRegime
+    regime_confidence: float = Field(ge=0.0, le=1.0, allow_inf_nan=False)
+    weights: SupervisorObjectiveWeights
+    strategy: str = Field(pattern=r"^[a-z][a-z0-9_]*$", max_length=64)
+    target_band: SupervisorTargetBand
+    computed_at_ms: int = Field(ge=0)
+
+
+class SupervisorPolicyEvaluation(_Frozen):
+    """1 policy の成功出力または構造化された失敗を decision trace に残す。"""
+
+    policy: SupervisorPolicyKind
+    output: SupervisorOutput | None = None
+    error: Reason | None = None
+    received_monotonic_ms: int | None = Field(default=None, ge=0)
+    source_monotonic_ms: int | None = Field(default=None, ge=0)
+    """RL output の元 snapshot の単調時刻（control loop 自身の時計）。鮮度はここから数える。"""
+
+    @model_validator(mode="after")
+    def _contains_exactly_one_result(self) -> Self:
+        if (self.output is None) == (self.error is None):
+            raise ValueError("Supervisor evaluation は output または error の片方だけを持つ")
+        if self.output is not None and self.output.policy is not self.policy:
+            raise ValueError("Supervisor evaluation の policy と output が一致しない")
+        if self.policy is SupervisorPolicyKind.RULE and (
+            self.received_monotonic_ms is not None or self.source_monotonic_ms is not None
+        ):
+            raise ValueError("inline RulePolicy に worker の受信時刻・元 snapshot 時刻を付けない")
+        if self.policy is SupervisorPolicyKind.RL and self.output is not None:
+            if self.received_monotonic_ms is None:
+                raise ValueError("RLPolicy output には control loop の受信単調時刻が必要")
+            if self.source_monotonic_ms is None:
+                raise ValueError("RLPolicy output には元 snapshot の単調時刻が必要")
+        if (
+            self.received_monotonic_ms is not None
+            and self.source_monotonic_ms is not None
+            and self.source_monotonic_ms > self.received_monotonic_ms
+        ):
+            raise ValueError("元 snapshot の単調時刻を受信単調時刻より後にしない")
+        return self
+
+
+class SupervisorDecision(_Frozen):
+    """active / shadow と Rule fallback を同じ入力単位で記録する。"""
+
+    schema_version: Literal[1] = 1
+    tick_id: int = Field(ge=0)
+    ts_ms: int = Field(ge=0)
+    snapshot_schema_version: int = Field(ge=1)
+    active: SupervisorPolicyEvaluation
+    fallback: SupervisorPolicyEvaluation | None = None
+    shadow: SupervisorPolicyEvaluation | None = None
+
+    @property
+    def selected_output(self) -> SupervisorOutput | None:
+        """MPC が optional context として使える active または Rule fallback 出力。"""
+        if self.active.output is not None:
+            return self.active.output
+        if self.fallback is not None:
+            return self.fallback.output
+        return None
+
+    @model_validator(mode="after")
+    def _runs_share_one_state_and_shadow_never_becomes_active(self) -> Self:
+        active_failed = self.active.output is None
+        if self.active.policy is SupervisorPolicyKind.RL and active_failed:
+            if self.fallback is None or self.fallback.policy is not SupervisorPolicyKind.RULE:
+                raise ValueError("active RLPolicy の失敗時は RulePolicy fallback を記録する")
+        elif self.fallback is not None:
+            raise ValueError("Rule fallback は active RLPolicy が失敗したときだけ記録する")
+        if self.shadow is not None and self.shadow.policy is self.active.policy:
+            raise ValueError("active と shadow に同じ Supervisor policy を指定しない")
+
+        outputs = tuple(
+            evaluation.output
+            for evaluation in (self.active, self.fallback, self.shadow)
+            if evaluation is not None and evaluation.output is not None
+        )
+        for output in outputs:
+            # RL は worker で非同期に推論するため、元 snapshot が過去の tick でもよい（0028 §2.2）。
+            # 元 tick の識別子はそのまま残し、未来の tick だけを拒否する。
+            if output.tick_id > self.tick_id:
+                raise ValueError("Supervisor output の tick_id を decision より未来にしない")
+            if output.policy is SupervisorPolicyKind.RULE and output.tick_id != self.tick_id:
+                raise ValueError("inline RulePolicy output の tick_id を decision と揃える")
+            if output.tick_id == self.tick_id and output.ts_ms != self.ts_ms:
+                raise ValueError("Supervisor output の ts_ms を decision と揃える")
+            if output.snapshot_schema_version != self.snapshot_schema_version:
+                raise ValueError("Supervisor output の snapshot schema version を揃える")
+        if outputs:
+            first = outputs[0]
+            if any(output.regime is not first.regime for output in outputs[1:]):
+                raise ValueError("active / fallback / shadow は同じ workload regime を使う")
+            current = [output for output in outputs if output.tick_id == self.tick_id]
+            if any(
+                output.regime_confidence != current[0].regime_confidence for output in current[1:]
+            ):
+                raise ValueError("同じ tick の Supervisor output は同じ workload regime を使う")
+        return self
 
 
 class BoundBy(StrEnum):
@@ -351,13 +532,27 @@ class ControlState(_Frozen):
     fallback_active: bool
     fallback_reason: Reason | None = None
     """ML を使えたはずの状況で Fallback にした理由（0028 §2.5 (c)）。"""
+    # v1/v2 traceでは実装固有の自由文字列だったため、外側のControlTick versionを見ずに
+    # enumへ狭めると保存済みrecordを読めなくなる。v3の許可値・decision整合はControlTickで検証する。
     supervisor_policy: str | None = None
+    workload_regime: WorkloadRegime | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
+    regime_confidence: float | None = Field(
+        default=None,
+        ge=0.0,
+        le=1.0,
+        allow_inf_nan=False,
+        exclude_if=lambda value: value is None,
+    )
     model_version: str | None = None
     model_confidence: float | None = Field(default=None, ge=0.0, le=1.0, allow_inf_nan=False)
     model_ood: bool | None = None
 
     @model_validator(mode="after")
     def _ml_is_used_only_when_allowed(self) -> Self:
+        if (self.workload_regime is None) != (self.regime_confidence is None):
+            raise ValueError("workload_regime と regime_confidence は一緒に記録する")
         set_by_people = self.operating_mode in {OperatingMode.MANUAL, OperatingMode.CALIBRATION}
         if set_by_people != (self.active_controller is None):
             raise ValueError("active_controller を持たないのは MANUAL / CALIBRATION のときだけ")
@@ -408,12 +603,15 @@ Critical Safety（#78）が数えるので、ここでは検査しない。
 class ControlTick(_Frozen):
     """1 tick の判断の記録（decision trace。0028 §2.3）。#82 が保存し、#90 / #91 が読む。"""
 
-    schema_version: Literal[1] = SCHEMA_VERSION
+    schema_version: Literal[1, 2, 3] = SCHEMA_VERSION
     tick_id: int = Field(ge=0)
     ts_ms: int = Field(ge=0)
     """記録の時刻（壁時計。0028 §2.6）。"""
     state: ControlState
     zones: PerZone[ZoneRecord]
+    supervisor: SupervisorDecision | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
     faults: tuple[Fault, ...] = ()
     """いま有効な故障。
 
@@ -424,6 +622,45 @@ class ControlTick(_Frozen):
     @model_validator(mode="after")
     def _state_matches_zones_and_faults(self) -> Self:
         state = self.state
+        if self.schema_version == 1 and state.workload_regime is not None:
+            raise ValueError("workload regime を記録する ControlTick は schema version 2 にする")
+        if self.schema_version < 3 and self.supervisor is not None:
+            raise ValueError(
+                "Supervisor decision を記録する ControlTick は schema version 3 にする"
+            )
+        if (
+            self.schema_version == 3
+            and self.supervisor is None
+            and state.supervisor_policy is not None
+        ):
+            raise ValueError("v3 の supervisor_policy には Supervisor decision が必要")
+        if self.supervisor is not None:
+            if self.supervisor.tick_id != self.tick_id:
+                raise ValueError("Supervisor decision の tick_id を ControlTick と揃える")
+            if self.supervisor.ts_ms != self.ts_ms:
+                raise ValueError("Supervisor decision の ts_ms を ControlTick と揃える")
+            selected = self.supervisor.selected_output
+            selected_policy = None if selected is None else selected.policy.value
+            if state.supervisor_policy != selected_policy:
+                raise ValueError("ControlState の supervisor_policy を選択された出力と揃える")
+            successful_outputs = tuple(
+                evaluation.output
+                for evaluation in (
+                    self.supervisor.active,
+                    self.supervisor.fallback,
+                    self.supervisor.shadow,
+                )
+                if evaluation is not None and evaluation.output is not None
+            )
+            if any(
+                state.workload_regime is not output.regime
+                or (
+                    output.tick_id == self.tick_id
+                    and state.regime_confidence != output.regime_confidence
+                )
+                for output in successful_outputs
+            ):
+                raise ValueError("ControlState と Supervisor output の workload regime を揃える")
         all_max = state.safety_state in {SafetyState.STARTUP, SafetyState.EMERGENCY} or (
             state.operating_mode is OperatingMode.MAX
         )

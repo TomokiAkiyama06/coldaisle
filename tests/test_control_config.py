@@ -27,6 +27,70 @@ def guard_band(
     }
 
 
+def supervisor_config() -> dict[str, object]:
+    target_band = {
+        "cpu_temperature": {"lower_c": 45.0, "upper_c": 75.0},
+        "gpu_temperature": {"lower_c": 45.0, "upper_c": 78.0},
+    }
+    balanced = {
+        "strategy": "balanced",
+        "weights": {
+            "gpu_temperature": 0.8,
+            "cpu_temperature": 0.8,
+            "balance": 0.5,
+            "acoustic": 0.4,
+            "change": 0.3,
+        },
+        "target_band": target_band,
+    }
+    conservative = {
+        "strategy": "conservative",
+        "weights": {
+            "gpu_temperature": 1.0,
+            "cpu_temperature": 1.0,
+            "balance": 0.7,
+            "acoustic": 0.1,
+            "change": 0.5,
+        },
+        "target_band": target_band,
+    }
+    return {
+        "period_ms": 1000,
+        "valid_ms": 2000,
+        "active_policy": "rule_policy",
+        "shadow_policy": "rl_policy",
+        "rl_version": "rl-test-v1",
+        "output_bounds": {
+            "strategies": ["balanced", "conservative"],
+            "target_bands": [target_band],
+            "weights": {
+                name: {"minimum": 0.0, "maximum": 1.0}
+                for name in (
+                    "gpu_temperature",
+                    "cpu_temperature",
+                    "balance",
+                    "acoustic",
+                    "change",
+                )
+            },
+        },
+        "rule_policy": {
+            "version": "rule-test-v1",
+            "contexts": {
+                "idle": balanced,
+                "transient_cpu": balanced,
+                "transient_gpu": balanced,
+                "transient_cpu_gpu": balanced,
+                "sustained_cpu": balanced,
+                "sustained_gpu": balanced,
+                "sustained_cpu_gpu": balanced,
+                "cooldown": balanced,
+                "unknown": conservative,
+            },
+        },
+    }
+
+
 def valid_documents() -> dict[str, dict[str, object]]:
     profile = {
         "startup_demand": 0.5,
@@ -103,7 +167,7 @@ def valid_documents() -> dict[str, dict[str, object]]:
             "watchdog_timeout_ms": provisional(5000),
         },
         "fan-policy.yaml": {
-            "schema_version": 3,
+            "schema_version": 5,
             "fallback_curve": [
                 {"temperature_c": 25.0, "demand": 0.3},
                 {"temperature_c": 80.0, "demand": 1.0},
@@ -149,7 +213,27 @@ def valid_documents() -> dict[str, dict[str, object]]:
                 "gpu_hotspot_c": guard_band(85.0, 80.0, 82.0, 78.0),
             },
             "mpc": {"period_ms": 1000, "budget_ms": 100, "valid_ms": 2000},
-            "supervisor": {"period_ms": 1000, "valid_ms": 2000},
+            "supervisor": supervisor_config(),
+            "workload_regime": {
+                "cpu_power": {
+                    "metric": "power.cpu.package",
+                    "idle_below_w": 30.0,
+                    "active_above_w": 60.0,
+                },
+                "gpu_power": {
+                    "metric": "power.gpu.0",
+                    "idle_below_w": 40.0,
+                    "active_above_w": 100.0,
+                },
+                "activity_window_ms": 2000,
+                "history_window_ms": 120000,
+                "minimum_observation_ms": 2000,
+                "sustained_after_ms": 60000,
+                "cooldown_ms": 30000,
+                "minimum_transition_ms": 1000,
+                "confidence_full_window_ms": 60000,
+                "max_snapshot_gap_ms": 1000,
+            },
             "gate_min_confidence": {
                 "limited": provisional(0.6),
                 "expanded": provisional(0.7),
@@ -184,11 +268,11 @@ def load_config(tmp_path: Path) -> ControlConfig:
 def test_complete_config_has_traceable_sources_and_is_not_actuation_ready(tmp_path: Path) -> None:
     config = load_config(tmp_path)
 
-    assert CONTROL_CONFIG_VERSION == 3
+    assert CONTROL_CONFIG_VERSION == 5
     assert config.actuation_permitted is False
     metadata = config.trace_metadata()["control_config"]
     assert metadata["fan_hardware"]["name"] == "fan-hardware.yaml"
-    assert metadata["policy"]["schema_version"] == 3
+    assert metadata["policy"]["schema_version"] == 5
     assert len(metadata["safety"]["sha256"]) == 64
 
 
@@ -439,16 +523,109 @@ def test_confidence_thresholds_are_validated_per_authority_stage(tmp_path: Path)
         ControlConfig.from_directory(tmp_path)
 
 
-def test_previous_fan_policy_schema_is_rejected_until_explicitly_migrated(
+def test_workload_regime_thresholds_and_windows_are_configured(tmp_path: Path) -> None:
+    config = load_config(tmp_path).policy.workload_regime
+
+    assert config.cpu_power.metric == "power.cpu.package"
+    assert config.gpu_power.active_above_w == 100.0
+
+    documents = valid_documents()
+    documents["fan-policy.yaml"]["workload_regime"]["cpu_power"]["idle_below_w"] = 70.0
+    write_documents(tmp_path, documents)
+    with pytest.raises(ValidationError, match="active_above_w"):
+        ControlConfig.from_directory(tmp_path)
+
+    documents = valid_documents()
+    documents["fan-policy.yaml"]["workload_regime"]["sustained_after_ms"] = 120001
+    write_documents(tmp_path, documents)
+    with pytest.raises(ValidationError, match="history_window_ms"):
+        ControlConfig.from_directory(tmp_path)
+
+    documents = valid_documents()
+    documents["fan-policy.yaml"]["workload_regime"]["history_window_ms"] = 62000
+    write_documents(tmp_path, documents)
+    with pytest.raises(ValidationError, match="観測・SUSTAINED判定"):
+        ControlConfig.from_directory(tmp_path)
+
+    documents = valid_documents()
+    documents["fan-policy.yaml"]["workload_regime"]["history_window_ms"] = 32000
+    documents["fan-policy.yaml"]["workload_regime"]["sustained_after_ms"] = 1000
+    documents["fan-policy.yaml"]["workload_regime"]["confidence_full_window_ms"] = 30000
+    write_documents(tmp_path, documents)
+    with pytest.raises(ValidationError, match="観測・COOLDOWN判定"):
+        ControlConfig.from_directory(tmp_path)
+
+    documents = valid_documents()
+    cpu_metric = documents["fan-policy.yaml"]["workload_regime"]["cpu_power"]["metric"]
+    documents["fan-policy.yaml"]["workload_regime"]["gpu_power"]["metric"] = cpu_metric
+    write_documents(tmp_path, documents)
+    with pytest.raises(ValidationError, match="別々"):
+        ControlConfig.from_directory(tmp_path)
+
+
+def test_supervisor_selection_and_output_bounds_are_validated(tmp_path: Path) -> None:
+    config = load_config(tmp_path).policy.supervisor
+    assert config.active_policy.value == "rule_policy"
+    assert config.shadow_policy is not None and config.shadow_policy.value == "rl_policy"
+
+    documents = valid_documents()
+    supervisor = documents["fan-policy.yaml"]["supervisor"]
+    supervisor["active_policy"] = "rl_policy"
+    supervisor["shadow_policy"] = None
+    write_documents(tmp_path, documents)
+    assert (
+        ControlConfig.from_directory(tmp_path).policy.supervisor.active_policy.value == "rl_policy"
+    )
+
+    documents = valid_documents()
+    documents["fan-policy.yaml"]["supervisor"]["active_policy"] = "rl_policy"
+    write_documents(tmp_path, documents)
+    with pytest.raises(ValidationError, match="active と shadow"):
+        ControlConfig.from_directory(tmp_path)
+
+    documents = valid_documents()
+    documents["fan-policy.yaml"]["supervisor"]["rl_version"] = None
+    write_documents(tmp_path, documents)
+    with pytest.raises(ValidationError, match="rl_version"):
+        ControlConfig.from_directory(tmp_path)
+
+    documents = valid_documents()
+    documents["fan-policy.yaml"]["supervisor"]["rule_policy"]["contexts"]["unknown"]["strategy"] = (
+        "unconfigured"
+    )
+    write_documents(tmp_path, documents)
+    with pytest.raises(ValidationError, match="設定済み候補"):
+        ControlConfig.from_directory(tmp_path)
+
+
+@pytest.mark.parametrize("old_version", [1, 2, 3, 4])
+def test_previous_policy_versions_are_rejected_until_explicitly_migrated(
     tmp_path: Path,
+    old_version: int,
 ) -> None:
     documents = valid_documents()
-    documents["fan-policy.yaml"]["schema_version"] = 2
+    documents["fan-policy.yaml"]["schema_version"] = old_version
     write_documents(tmp_path, documents)
 
     with pytest.raises(ValidationError, match="schema_version"):
         ControlConfig.from_directory(tmp_path)
 
-    documents["fan-policy.yaml"]["schema_version"] = 3
+
+def test_v4_to_v5_migration_requires_explicit_supervisor_policy_values(tmp_path: Path) -> None:
+    documents = valid_documents()
+    supervisor = supervisor_config()
+    documents["fan-policy.yaml"]["supervisor"] = {"period_ms": 1000, "valid_ms": 2000}
+    documents["fan-policy.yaml"]["schema_version"] = 4
     write_documents(tmp_path, documents)
-    assert ControlConfig.from_directory(tmp_path).policy.schema_version == 3
+    with pytest.raises(ValidationError, match="schema_version"):
+        ControlConfig.from_directory(tmp_path)
+
+    documents["fan-policy.yaml"]["supervisor"] = supervisor
+    documents["fan-policy.yaml"]["schema_version"] = 5
+    write_documents(tmp_path, documents)
+    assert ControlConfig.from_directory(tmp_path).policy.schema_version == 5
+
+    del documents["fan-policy.yaml"]["supervisor"]["active_policy"]
+    write_documents(tmp_path, documents)
+    with pytest.raises(ValidationError, match="active_policy"):
+        ControlConfig.from_directory(tmp_path)

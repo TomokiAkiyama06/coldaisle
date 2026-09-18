@@ -11,7 +11,7 @@ dependencies = [
     "uvicorn[standard]",
     "pyserial",
     # 要件 §9 は Pydantic v2 の API を前提にしている
-    "pydantic>=2",
+    "pydantic>=2.12",  # Field(exclude_if=...) を使う（control/schema.py）
     "pyyaml",
     "httpx",
     # GPU Telemetry は nvidia-smi を spawn せず NVML を直接読む（#65）

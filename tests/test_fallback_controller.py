@@ -52,6 +52,62 @@ def guard_band(
     }
 
 
+def supervisor_config() -> dict[str, object]:
+    target_band = {
+        "cpu_temperature": {"lower_c": 45.0, "upper_c": 75.0},
+        "gpu_temperature": {"lower_c": 45.0, "upper_c": 78.0},
+    }
+    context = {
+        "strategy": "balanced",
+        "weights": {
+            "gpu_temperature": 0.8,
+            "cpu_temperature": 0.8,
+            "balance": 0.5,
+            "acoustic": 0.4,
+            "change": 0.3,
+        },
+        "target_band": target_band,
+    }
+    return {
+        "period_ms": 1_000,
+        "valid_ms": 2_000,
+        "active_policy": "rule_policy",
+        "shadow_policy": None,
+        "rl_version": None,
+        "output_bounds": {
+            "strategies": ["balanced"],
+            "target_bands": [target_band],
+            "weights": {
+                name: {"minimum": 0.0, "maximum": 1.0}
+                for name in (
+                    "gpu_temperature",
+                    "cpu_temperature",
+                    "balance",
+                    "acoustic",
+                    "change",
+                )
+            },
+        },
+        "rule_policy": {
+            "version": "rule-test-v1",
+            "contexts": {
+                regime: context
+                for regime in (
+                    "idle",
+                    "transient_cpu",
+                    "transient_gpu",
+                    "transient_cpu_gpu",
+                    "sustained_cpu",
+                    "sustained_gpu",
+                    "sustained_cpu_gpu",
+                    "cooldown",
+                    "unknown",
+                )
+            },
+        },
+    }
+
+
 def policy(
     *,
     authority: str = "full",
@@ -61,7 +117,7 @@ def policy(
     demote_window_ms: int = 60_000,
 ) -> FanPolicyConfig:
     document: dict[str, object] = {
-        "schema_version": 3,
+        "schema_version": 5,
         "fallback_curve": [
             {"temperature_c": 20.0, "demand": 0.2},
             {"temperature_c": 80.0, "demand": 0.8},
@@ -84,7 +140,27 @@ def policy(
             "gpu_hotspot_c": guard_band(85.0, 80.0, 82.0, 78.0),
         },
         "mpc": {"period_ms": 1_000, "budget_ms": 100, "valid_ms": 2_000},
-        "supervisor": {"period_ms": 1_000, "valid_ms": 2_000},
+        "supervisor": supervisor_config(),
+        "workload_regime": {
+            "cpu_power": {
+                "metric": "power.cpu.package",
+                "idle_below_w": 30.0,
+                "active_above_w": 60.0,
+            },
+            "gpu_power": {
+                "metric": "power.gpu.0",
+                "idle_below_w": 40.0,
+                "active_above_w": 100.0,
+            },
+            "activity_window_ms": 1_000,
+            "history_window_ms": 120_000,
+            "minimum_observation_ms": 10_000,
+            "sustained_after_ms": 30_000,
+            "cooldown_ms": 20_000,
+            "minimum_transition_ms": 2_000,
+            "confidence_full_window_ms": 60_000,
+            "max_snapshot_gap_ms": 1_000,
+        },
         "gate_min_confidence": {
             "limited": provisional(0.6),
             "expanded": provisional(0.7),

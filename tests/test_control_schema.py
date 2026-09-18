@@ -36,6 +36,7 @@ from coldaisle.control import (
     Reason,
     SafetyState,
     SafetyZoneOutput,
+    WorkloadRegime,
     Zone,
     ZoneRecord,
     ZoneRequest,
@@ -666,8 +667,97 @@ def test_the_stored_v1_record_still_loads_unchanged():
     """
     stored = FIXTURE.read_text(encoding="utf-8")
     tick = ControlTick.model_validate_json(stored)
-    assert tick.schema_version == SCHEMA_VERSION == 1
+    assert tick.schema_version == 1
+    assert SCHEMA_VERSION == 3
     assert json.loads(tick.model_dump_json()) == json.loads(stored)
+
+
+def test_current_trace_stores_workload_regime_and_confidence_together():
+    state = fallback_state(
+        workload_regime=WorkloadRegime.SUSTAINED_GPU,
+        regime_confidence=0.85,
+    )
+    recorded = ControlTick(tick_id=1, ts_ms=NOW_MS, state=state, zones=zones(passthrough()))
+
+    payload = json.loads(recorded.model_dump_json())
+    assert recorded.schema_version == 3
+    assert payload["state"]["workload_regime"] == "sustained_gpu"
+    assert payload["state"]["regime_confidence"] == 0.85
+
+    with pytest.raises(ValidationError, match="一緒に記録"):
+        fallback_state(workload_regime=WorkloadRegime.UNKNOWN)
+    with pytest.raises(ValidationError, match="schema version 2"):
+        ControlTick(
+            schema_version=1,
+            tick_id=1,
+            ts_ms=NOW_MS,
+            state=state,
+            zones=zones(passthrough()),
+        )
+
+
+def test_v2_trace_keeps_simultaneous_transient_load_distinct():
+    state = fallback_state(
+        workload_regime=WorkloadRegime.TRANSIENT_CPU_GPU,
+        regime_confidence=0.4,
+    )
+    recorded = ControlTick(tick_id=1, ts_ms=NOW_MS, state=state, zones=zones(passthrough()))
+
+    payload = json.loads(recorded.model_dump_json())
+    assert payload["state"]["workload_regime"] == "transient_cpu_gpu"
+    restored = ControlTick.model_validate_json(recorded.model_dump_json())
+    assert restored.state.workload_regime is WorkloadRegime.TRANSIENT_CPU_GPU
+
+
+def test_fallback_trace_remains_valid_when_regime_is_not_available():
+    recorded = ControlTick(
+        tick_id=1,
+        ts_ms=NOW_MS,
+        state=fallback_state(),
+        zones=zones(passthrough()),
+    )
+
+    assert recorded.schema_version == 3
+    assert recorded.state.workload_regime is None
+
+
+def test_stored_v2_trace_without_supervisor_decision_remains_valid():
+    recorded = ControlTick(
+        schema_version=2,
+        tick_id=1,
+        ts_ms=NOW_MS,
+        state=fallback_state(
+            workload_regime=WorkloadRegime.SUSTAINED_GPU,
+            regime_confidence=0.85,
+        ),
+        zones=zones(passthrough()),
+    )
+
+    payload = json.loads(recorded.model_dump_json())
+    assert payload["schema_version"] == 2
+    assert "supervisor" not in payload
+
+
+@pytest.mark.parametrize("schema_version", [1, 2])
+def test_legacy_trace_preserves_free_form_supervisor_policy(schema_version: int):
+    stored = json.loads(FIXTURE.read_text(encoding="utf-8"))
+    stored["schema_version"] = schema_version
+    stored["state"]["supervisor_policy"] = "legacy_rule_v1"
+
+    tick = ControlTick.model_validate_json(json.dumps(stored))
+
+    assert tick.state.supervisor_policy == "legacy_rule_v1"
+    assert json.loads(tick.model_dump_json()) == stored
+
+
+def test_v3_supervisor_policy_requires_a_matching_decision():
+    with pytest.raises(ValidationError, match="Supervisor decision"):
+        ControlTick(
+            tick_id=1,
+            ts_ms=NOW_MS,
+            state=fallback_state(supervisor_policy="legacy_rule_v1"),
+            zones=zones(passthrough()),
+        )
 
 
 def test_the_stored_record_explains_every_changed_zone():
