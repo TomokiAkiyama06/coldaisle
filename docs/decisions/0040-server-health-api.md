@@ -1,7 +1,7 @@
 # 決定記録 0040: Server Health API の契約
 
 - **種別**: Decision Record
-- **Status**: Proposed
+- **Status**: FINAL（2026-09-18、リポジトリ所有者が承認）
 - **Date**: 2026-09-18
 - **Supersedes**: [`0009-read-api.md`](0009-read-api.md) §5 未決事項1 のみ（0009 の他の節は有効）
 - **関連**: [`0009-read-api.md`](0009-read-api.md) §2.9 / §2.12 /
@@ -29,6 +29,8 @@ api-contract.md の旧記述（`/health/summary` と `/thermal-gate` の2本立�
 機種が公開しない値と、動いていたが止まった値を区別する必要がある。
 
 ## 2. Decision
+
+2026-09-18、リポジトリ所有者が本記録の内容どおりに承認した（PR #135 のレビュー）。
 
 ### 2.1 `GET /api/v1/server-health` が `/api/v1/health/summary` を置き換える
 
@@ -112,11 +114,13 @@ api-contract.md の旧記述（`/health/summary` と `/thermal-gate` の2本立�
 | internal-telemetry.yaml の NVML 設定に optional フラグを足す | collector の設定（何を読むか）と表示の判定（何を問題とみなすか）が混ざる |
 | AI に summary を自由に書かせる | 数値の捏造や「安全です」の断言を防げない |
 
-## 5. 未決事項（所有者の判断が必要）
+## 5. 未決事項
+
+以下は本決定の対象外とし、実測のあとで所有者が決める。決まるまでは §2 の規則で運用する。
 
 | # | 内容 | 決める場所 |
 |---|---|---|
-| 1 | lm_sensors source の判定。現状は有効な hwmon sensor の**いずれか1つ**が ok なら ok（`require_all=False`）。有効な sensor は現在ほぼファン rpm / pwm で、1系統の入力が読めなくなっても source は ok のまま（その metric が missing になれば周期メトリクスの規則で yellow にはなる。回転数 0 の実測値は quality ok のため signal には出ない。tach stall は Critical Safety 側の責務）。T_SENSOR 設置後に `required: true` の sensor だけは全件必須にするか | #66 レビュー / #50 |
-| 2 | 監視必須 metric の選び方。sensor_unit は外付けデバイスの `air.*` 7本すべて、nvml は NVML adapter が source 状態の判定に使う core 温度と電力の2本（adapter と一致させるため）。utilization / VRAM / CUDA プロセス数を必須にするか | #66 レビュー |
+| 1 | lm_sensors source の判定。現状は有効な hwmon sensor の**いずれか1つ**が ok なら ok（`require_all=False`）。有効な sensor は現在ほぼファン rpm / pwm で、1系統の入力が読めなくなっても source は ok のまま（その metric が missing になれば周期メトリクスの規則で yellow にはなる。回転数 0 の実測値は quality ok のため signal には出ない。tach stall は Critical Safety 側の責務）。T_SENSOR 設置後に `required: true` の sensor だけは全件必須にするか | #50 の測定後 |
+| 2 | 監視必須 metric の選び方。sensor_unit は外付けデバイスの `air.*` 7本すべて、nvml は NVML adapter が source 状態の判定に使う core 温度と電力の2本（adapter と一致させるため）。utilization / VRAM / CUDA プロセス数を必須にするか | #50 の測定後 |
 | 3 | パネルに載せる metric。gpu は 0032 の GPU 系7本、environment は `air.*` と CPU / board 系。ファン回転数（`fan.*.rpm`）をパネルに載せるか | #48 / Workspace 側 |
 | 4 | `compute_mode_advisory` にフルロード履歴との比較を加える時期と形 | #68（#50 の測定後） |
