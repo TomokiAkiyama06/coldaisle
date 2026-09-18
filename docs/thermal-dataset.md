@@ -65,9 +65,34 @@ dataset用Replayはconstructorで入力を定数memoryのchunkごとにunlink済
 copyと同時にhashする。先頭時刻と全sampleは同じsnapshot bytesから読み、元pathを再openしない。
 CSVが何本あってもsnapshotは1つの一時fileに連結し、保持するfile descriptorは1つにする。
 `--dataset-run-alias`付きのReplayは`--bulk`でも待ち行列が溢れたsampleを捨てず、空くまで待つ（backpressure）。`--max-samples`での途中停止も拒否する。DBがCSVの一部だけになると、provenanceの全体hashと食い違うためである。
-入力をEOFまで取り込め、かつ正規化・保存の失敗で捨てたsampleが1件も無いときだけ、上書き不能な完了の印（`dataset_source_run_complete`）をDBへ記録する。SIGTERM / SIGINTなどで途中停止したrun、またはsampleを捨てたrunには印を付けず、`coldaisle-daemon`は終了コード1を返す（取り込みループ自体は1件の失敗で落ちずに最後まで進む）。builderは完了の印が無いDBを拒否する。そのDBは破棄し、新しいDBで取り込み直す。
+入力をEOFまで取り込め、かつ下表の取りこぼしが1件も無いときだけ、上書き不能な完了の印（`dataset_source_run_complete`）をDBへ記録する。SIGTERM / SIGINTなどで途中停止したrun、または取りこぼしのあったrunには印を付けず、`coldaisle-daemon`は終了コード1を返す（取り込みループ自体は1件の失敗で落ちずに最後まで進む）。builderは完了の印が無いDBを拒否する。そのDBは破棄し、新しいDBで取り込み直す。
 通常Replayはこのcopy / eager hashをしない。後のdataset生成時に元CSVが変わっていれば、CLIの
 再hashがDBのsnapshot hashと一致せず生成を拒否する。
+
+source → normalizer → storeの各段で、CSVにあったのにDBへ届かないものは次のとおり。
+取り込みは止めずに数え、dataset用Replayではどれか1件でもあれば未完了とする。
+時刻の逆行とUTF-8として読めないbytesはsourceが例外で止まるため、完了の印は付かない。
+
+| 段 | 取りこぼし | 完了判定 |
+|---|---|---|
+| Replay | 時刻が空・読めない行（`dropped_rows`） | 数える |
+| Replay | 列数がheaderと合わない行（`malformed_rows`。余りは捨て、不足は欠測） | 数える |
+| Replay | 空欄でないのに数値として読めないcell（`unparsed_cells`） | 数える |
+| daemon | 待ち行列の溢れ（`queue_drops`。dataset modeはbackpressureで起きない） | 数える |
+| daemon | 正規化・保存の例外で捨てたsample（`discarded`） | 数える |
+| normalizer | 対応表に無いchannel（`unknown_channels`） | 数える |
+| normalizer | seqの飛び（`dropped_samples`。Replayは連番を合成する） | 数える |
+| store | 既にある`(metric, ts_ms)`として書かなかった行（`duplicates`） | 数える |
+
+次は取りこぼしではないため数えない。どれも入力hashに含まれ、同じbytesからは同じDBになる。
+
+- header行: 列名でありsampleではない
+- 空行: `csv.DictReader`が飛ばす。値を持たない
+- 空欄のcell: 欠測（`quality=missing`）として保存される
+- 対応表に無い列（例: `vrm_temp`）: dataset契約の外。Replayは既知channelだけを読む
+  （決定記録 0010）
+- 非有限値: `nan`は欠測（`quality=missing`）、`inf`は値を保存せず`quality=suspect`として残る
+  （決定記録 0003 §2.8）
 
 ```bash
 uv run coldaisle-daemon \

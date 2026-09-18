@@ -452,3 +452,21 @@ def test_interval_estimation_reads_only_two_rows(logs, monkeypatch):
     monkeypatch.setattr(ReplaySource, "_parse_row", counting)
     assert replay.hello.interval_ms == 3_000
     assert parsed <= 3, f"{parsed} 行も読んでいる"
+
+
+def test_malformed_rows_and_unparsed_cells_are_counted_but_streamed(tmp_path):
+    """列数の合わない行と読めない数値は流すが、datasetの完了判定のために数える。"""
+    path = tmp_path / "broken.csv"
+    path.write_text(
+        f"{HEADER}\n"
+        "2026-08-24T00:00:00,24.4,56.2,24.12,24.94,23.56,23.75,23.94,EXTRA\n"
+        "2026-08-24T00:00:03,24.4,56.1\n"
+        "2026-08-24T00:00:06,ERR,,24.19,25.00,23.62,23.81,24.00\n",
+        encoding="utf-8",
+    )
+    replay = ReplaySource(path, tz=JST, sleep=no_sleep)
+
+    produced = samples(replay)
+
+    assert len(produced) == 3
+    assert replay.losses == {"dropped_rows": 0, "malformed_rows": 2, "unparsed_cells": 1}

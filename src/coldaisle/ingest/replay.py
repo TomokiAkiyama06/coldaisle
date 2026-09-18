@@ -219,6 +219,10 @@ class ReplaySource:
         self._sleep = sleep
         self.dropped_rows = 0
         """時刻として読めずに捨てた行数。完全な再生かどうかの判断に使う。"""
+        self.malformed_rows = 0
+        """列数がheaderと合わない行数。**行は流す**が、欠けた列は欠測・余った列は捨てている。"""
+        self.unparsed_cells = 0
+        """空欄ではないのに数値として読めず欠測にしたcell数。"""
         self._clock = SimulatedClock(self._first_timestamp_ms())
 
     @property
@@ -230,6 +234,21 @@ class ReplaySource:
     def source_sha256(self) -> str | None:
         """dataset snapshot有効時だけ、その同一bytesのSHA-256を返す。"""
         return self._source_sha256
+
+    @property
+    def losses(self) -> dict[str, int]:
+        """CSVにあったのにsampleへ届かなかったものの件数（#83 dataset完了判定）。
+
+        どれも取り込みは止めずに続ける（1行の書式違いで再生全体を止めない）。
+        dataset用Replayでは1件でもあればDBは入力の一部しか持たないため、
+        daemonは完了の印を付けない。数えないもの（header行、空行、対応表に無い列）
+        は理由を`docs/thermal-dataset.md`に記す。
+        """
+        return {
+            "dropped_rows": self.dropped_rows,
+            "malformed_rows": self.malformed_rows,
+            "unparsed_cells": self.unparsed_cells,
+        }
 
     @property
     def hello(self) -> RawHello:
@@ -290,6 +309,9 @@ class ReplaySource:
                 if stamp_column is None:
                     raise ValueError(f"時刻の列が見つからない: {path}（候補: {TIMESTAMP_COLUMNS}）")
                 for line, raw_row in enumerate(reader, start=2):
+                    # DictReaderは余った列をkey None、足りない列をvalue Noneで表す。
+                    # 空欄（""）とは区別できるので、書式の壊れた行として数える
+                    malformed = None in raw_row or any(value is None for value in raw_row.values())
                     row = {
                         normalize_column(key): value
                         for key, value in raw_row.items()
@@ -297,7 +319,11 @@ class ReplaySource:
                     }
                     parsed = self._parse_row(row, stamp_column)
                     if parsed is not None:
-                        yield parsed
+                        row_ms, values, unparsed = parsed
+                        if report:
+                            self.malformed_rows += int(malformed)
+                            self.unparsed_cells += unparsed
+                        yield row_ms, values
                         continue
                     dropped += 1
                     if report:
@@ -322,7 +348,8 @@ class ReplaySource:
 
     def _parse_row(
         self, row: dict[str, str | None], stamp_column: str
-    ) -> tuple[int, dict[str, float | None]] | None:
+    ) -> tuple[int, dict[str, float | None], int] | None:
+        """行を`(時刻, 値, 数値として読めなかった非空cell数)`にする。時刻が無ければ`None`。"""
         stamp = row.get(stamp_column)
         if not stamp:
             return None
@@ -333,11 +360,15 @@ class ReplaySource:
         if when.tzinfo is None:
             when = when.replace(tzinfo=self._tz)
         values: dict[str, float | None] = {}
+        unparsed = 0
         for channel in SAMPLE_CHANNELS:
             if channel not in row:
                 continue
-            values[channel] = _to_float(row[channel])
-        return int(when.timestamp() * 1000), values
+            raw_value = row[channel]
+            values[channel] = _to_float(raw_value)
+            if values[channel] is None and raw_value is not None and raw_value.strip():
+                unparsed += 1
+        return int(when.timestamp() * 1000), values, unparsed
 
     def _first_timestamp_ms(self) -> int:
         for row_ms, _ in self._rows():

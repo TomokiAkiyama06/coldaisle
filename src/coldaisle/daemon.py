@@ -209,6 +209,9 @@ class Daemon:
             source_sha256 = getattr(self._source, "source_sha256", None)
             if not isinstance(source_sha256, str):
                 raise ValueError("dataset run bindにはSHA-256を提供するsourceが必要")
+            if not isinstance(getattr(self._source, "losses", None), dict):
+                # 取りこぼしを報告できないsourceでは、完了を判定できない
+                raise ValueError("dataset run bindには取りこぼし件数を報告するsourceが必要")
             self._store.bind_dataset_source_run(
                 run_alias=self._dataset_run_alias,
                 source_kind=self._source_name,
@@ -316,21 +319,40 @@ class Daemon:
         EOFまで届いても、正規化・保存に失敗して捨てたsampleがあればDBは入力の一部に
         なるため同じく未完了とする（取り込みループ自体は1件の失敗で落とさない）。
         """
-        lost = self.stats.discarded + self.stats.queue_drops
-        if reached_eof and lost == 0:
+        losses = self._dataset_losses()
+        if reached_eof and not any(losses.values()):
             self._store.complete_dataset_source_run(at_ms=self._normalizer.clock.now_ms())
             return
         self.stats.dataset_incomplete = True
         LOGGER.error(
             "dataset用Replayが入力を欠けなく取り込めなかった。このDBからdatasetは作れない",
-            extra={
-                logs.FIELDS_KEY: {
-                    "reached_eof": reached_eof,
-                    "discarded": self.stats.discarded,
-                    "queue_drops": self.stats.queue_drops,
-                }
-            },
+            extra={logs.FIELDS_KEY: {"reached_eof": reached_eof, **losses}},
         )
+
+    def _dataset_losses(self) -> dict[str, int]:
+        """source → normalizer → store の各段で、入力にあったのにDBへ届かなかった件数。
+
+        どの段も取り込みは止めずに数えるだけにしている。dataset用Replayでは
+        1件でもあればDBは入力全体のhashと食い違うため、完了の判定で弾く。
+        数えない段とその理由は`docs/thermal-dataset.md`にまとめる。
+        """
+        source_losses = getattr(self._source, "losses", None)
+        if not isinstance(source_losses, dict):
+            # 損失を報告できないsourceは、欠けが無いことを示せない
+            raise ValueError("dataset用sourceは取りこぼし件数（losses）を報告しなければならない")
+        return {
+            **{f"source_{name}": int(count) for name, count in source_losses.items()},
+            # 正規化・保存で例外になり捨てたsample（hello含む）
+            "discarded": self.stats.discarded,
+            # 待ち行列の溢れ（dataset modeはbackpressureで0のはず。保険として数える）
+            "queue_drops": self.stats.queue_drops,
+            # 同じ(metric, ts_ms)が既にありINSERT OR IGNOREで書かなかった行
+            "duplicates": self.stats.duplicates,
+            # seqの飛び。Replayは連番を合成するので0のはず
+            "dropped_samples": self.stats.dropped_samples,
+            # 対応表に無くnormalizerが捨てたchannel
+            "unknown_channels": len(self.stats.unknown_channels),
+        }
 
     def _put_blocking(
         self,

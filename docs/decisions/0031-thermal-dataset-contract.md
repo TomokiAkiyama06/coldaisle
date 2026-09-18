@@ -84,12 +84,16 @@ eager hash / snapshotを行わない。dataset CLIが後でlive pathを再hash�
 bindは入力全体のhashを取り込み開始前に固定するため、途中で止まったrunのDBは入力の
 先頭だけを持つ。そこでdataset Replayは、待ち行列が溢れてもsampleを捨てずに待ち
 （backpressure）、`max_samples`による途中停止を拒否する。入力をEOFまで取り込め、かつ
-正規化・保存の失敗で捨てたsampleが1件も無いときだけ、singletonかつtriggerで2回目の
+source → normalizer → storeのどの段でも取りこぼしが無いときだけ、singletonかつtriggerで2回目の
 INSERT / UPDATE / DELETEを拒否する完了の印`dataset_source_run_complete`をDBへ記録する
-（bind前のINSERTも拒否する）。SIGTERM / SIGINT等で途中停止したrun、および1件でもsampleを
-捨てたrunには印を付けず、`coldaisle-daemon`は非0で終了する。1件の失敗で取り込みループを
-落とさない方針は変えず、完了の判定だけで弾く。builderは完了の印が無いDBを拒否する。
-そのDBは破棄し、新しいDBで取り込み直す。
+（bind前のINSERTも拒否する）。SIGTERM / SIGINT等で途中停止したrun、および1件でも取りこぼしの
+あったrunには印を付けず、`coldaisle-daemon`は非0で終了する。1件の失敗で取り込みループを
+落とさない方針は変えず、完了の判定だけで弾く。取りこぼしとして数えるのは、Replayの
+時刻が読めない行・列数の合わない行・数値として読めない非空cell、daemonの待ち行列溢れと
+例外で捨てたsample、normalizerの未知channelとseqの飛び、storeの重複で書かなかった行である。
+header行・空行・空欄（欠測として保存）・対応表に無い列・非有限値（qualityとして保存）は
+入力hashに含まれ同じbytesから同じDBになるため数えない（一覧は`docs/thermal-dataset.md`）。
+builderは完了の印が無いDBを拒否する。そのDBは破棄し、新しいDBで取り込み直す。
 
 同一のTelemetryとControlTick traceをSQLiteへ入れれば、同じmanifest / examplesを
 生成する。旧来のセンサーCSVにはFan actionが無いため、CSV単体から過去のactionを

@@ -199,7 +199,7 @@ def _validate_dedicated_source_db(store: SqliteStore, source_run: SourceRun) -> 
     if not store.dataset_source_run_completed():
         # 途中停止・sample破棄のあったrunは入力の一部だけを持つ。全体hashの下で公開しない
         raise ValueError(
-            "dataset source runが欠けなく最後まで取り込まれていない（途中停止またはsample破棄）"
+            "dataset source runが欠けなく最後まで取り込まれていない（途中停止または取りこぼし）"
         )
 
 

@@ -885,3 +885,120 @@ def test_daemon_cli_exits_non_zero_when_a_dataset_sample_is_discarded(tmp_path, 
     )
 
     assert code == 1
+
+
+_CLEAN_HEADER = "timestamp,room_temp,gpu_intake,gpu_exhaust"
+
+
+def _clean_rows(count: int) -> list[str]:
+    return [f"1970-01-01T00:00:{second:02d},20,30,40" for second in range(count)]
+
+
+def _ingest_dataset_replay(tmp_path: Path, rules, lines: list[str]):
+    csv_path = tmp_path / "replay.csv"
+    csv_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    replay = ReplaySource(csv_path, tz=ZoneInfo("UTC"), bulk=True, dataset_provenance=True)
+    store = SqliteStore(tmp_path / "run.db", rules=rules, clock=replay.clock)
+    daemon = Daemon(
+        source=replay,
+        store=store,
+        normalizer=Normalizer(rules=rules, calibration=Calibration(), clock=replay.clock),
+        source_name="replay",
+        dataset_run_alias=RUN_ALIAS,
+    )
+    return store, daemon.run()
+
+
+@pytest.mark.parametrize(
+    ("defect", "loss"),
+    [
+        ("not-a-timestamp,20,30,40", "source_dropped_rows"),
+        (",20,30,40", "source_dropped_rows"),
+        ("1970-01-01T00:00:30,20,30,40,99", "source_malformed_rows"),
+        ("1970-01-01T00:00:30,20,30", "source_malformed_rows"),
+        ("1970-01-01T00:00:30,20,ERR,40", "source_unparsed_cells"),
+        ("1970-01-01T00:00:09,20,30,40", "duplicates"),
+    ],
+)
+def test_every_ingest_loss_marks_the_dataset_replay_incomplete(tmp_path, rules, defect, loss):
+    """source → normalizer → store のどこで欠けても、完了の印を付けない。
+
+    取り込み自体は壊れた行を飛ばして最後まで進む。
+    """
+    lines = [_CLEAN_HEADER, *_clean_rows(10), defect, "1970-01-01T00:00:40,21,31,41"]
+    store, stats = _ingest_dataset_replay(tmp_path, rules, lines)
+    try:
+        assert stats.samples >= 11, "壊れた行の後も取り込みを続ける"
+        assert stats.dataset_incomplete, loss
+        assert not store.dataset_source_run_completed()
+    finally:
+        store.close()
+
+
+def test_dropped_timestamp_row_makes_builder_refuse(tmp_path, rules):
+    lines = [_CLEAN_HEADER, *_clean_rows(10), "garbage,20,30,40"]
+    store, _stats = _ingest_dataset_replay(tmp_path, rules, lines)
+    try:
+        ControlTraceLogger(store).record(fixture_tick(ts_ms=5_000))
+        run = SourceRun(
+            run_id=RUN_ALIAS,
+            kind=DatasetSourceKind.REPLAY,
+            start_ms=0,
+            end_ms=20_000,
+            source_refs=(SOURCE_ALIAS,),
+            source_sha256=replay_fingerprint(tmp_path / "replay.csv"),
+        )
+        with pytest.raises(ValueError, match="途中停止"):
+            ThermalDatasetBuilder(store).build(source_run=run, spec=spec())
+    finally:
+        store.close()
+
+
+def test_intentional_exclusions_do_not_mark_the_replay_incomplete(tmp_path, rules):
+    """空欄（欠測）、空行、対応表に無い列は取りこぼしではない。
+
+    どれも入力hashに含まれ、同じbytesからは同じDBになる。空欄は欠測として保存され、
+    空行はデータを持たず、対応表に無い列はdataset契約の外（決定記録 0010）。
+    """
+    lines = [
+        f"{_CLEAN_HEADER},vrm_temp",
+        "1970-01-01T00:00:00,20,30,40,55",
+        "",
+        "1970-01-01T00:00:01,,30,40,55",
+        "1970-01-01T00:00:02,20, ,40,",
+    ]
+    store, stats = _ingest_dataset_replay(tmp_path, rules, lines)
+    try:
+        assert not stats.dataset_incomplete
+        assert store.dataset_source_run_completed()
+    finally:
+        store.close()
+
+
+def test_daemon_cli_exits_non_zero_when_a_replay_row_is_dropped(tmp_path):
+    (tmp_path / "replay.csv").write_text(
+        "\n".join([_CLEAN_HEADER, *_clean_rows(10), "garbage,20,30,40"]) + "\n",
+        encoding="utf-8",
+    )
+
+    code = daemon_module.main(
+        [
+            "--source",
+            "replay",
+            "--csv",
+            str(tmp_path / "replay.csv"),
+            "--bulk",
+            "--timezone",
+            "UTC",
+            "--dataset-run-alias",
+            RUN_ALIAS,
+            "--db",
+            str(tmp_path / "cli.db"),
+            "--quality-rules",
+            str(QUALITY_RULES_PATH),
+            "--calibration",
+            str(CALIBRATION_PATH),
+        ]
+    )
+
+    assert code == 1
