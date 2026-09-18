@@ -1,7 +1,7 @@
 # 決定記録 0038: Internal Telemetry の欠測の数え方
 
 - **種別**: Decision Record
-- **Status**: Proposed
+- **Status**: FINAL（2026-09-18、リポジトリ所有者が承認）
 - **Date**: 2026-09-18
 - **Supersedes**: なし（決定記録 0008 §2.1.1 を Internal Telemetry の周期メトリクスへ拡張する。`air.*` の扱いは変えない）
 - **関連**: [`0008-rollup-and-retention.md`](0008-rollup-and-retention.md) §2.1.1・§2.1.2 /
@@ -27,6 +27,8 @@ Internal Telemetry collector（`coldaisle-telemetry`）は外付けデバイス�
 痕跡がまったく残らないためである。
 
 ## 2. Decision
+
+2026-09-18、リポジトリ所有者が本記録の内容どおりに承認した（PR #128 のレビュー）。
 
 Internal Telemetry の周期メトリクス（`config/internal-telemetry.yaml` で有効な入力）について、
 欠測を次のように数える。

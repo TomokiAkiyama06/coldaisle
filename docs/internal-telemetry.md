@@ -21,7 +21,7 @@ v1 の `gpu.0` は「実機に1台だけある GPU」という論理 role であ
 `coldaisle-rollup` は `config/internal-telemetry.yaml`（`--internal-telemetry` で変更可）の
 `interval_ms` と有効な入力から、各 metric の1分あたり期待サンプル数を出す。collector が
 止まった分は0行の1分バケットとして残り、生データの保持期間を過ぎても欠測として追える。
-欠測の数え方は決定記録 0038（Proposed）による。
+欠測の数え方は決定記録 0038（FINAL）による。
 
 - **有効な間の停止は欠測**とする。ingest も同時に止まっていても、ジョブの時計で最後に
   完了した分まで埋める（進行中の分は数えない）
