@@ -74,6 +74,7 @@ def test_migration_creates_exactly_the_decided_objects():
         ("view", "v_latest"),
         ("table", "control_traces"),
         ("index", "ix_control_traces_tick"),
+        ("table", "periodic_metric_registrations"),
     }
 
 

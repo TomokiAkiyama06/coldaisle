@@ -28,7 +28,12 @@ REQUIRED_METRICS = [
     "cpu.package",
     "cpu.vrm",
     "board.chipset",
+    "board.connector_12v2x6",
     "power.gpu.0",
+    "power.cpu.package",
+    "gpu.0.utilization",
+    "fan.front.rpm",
+    "fan.front.pwm",
     "power.wall",
     "sys.cuda_processes",
 ]
