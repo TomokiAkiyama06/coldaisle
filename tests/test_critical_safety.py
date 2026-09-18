@@ -605,6 +605,84 @@ def test_absolute_temperature_limit_forces_emergency_max() -> None:
     assert all(result.zones.get(zone).forced_max for zone in Zone)
 
 
+@pytest.mark.parametrize("quality", [Quality.STALE, Quality.MISSING, None])
+def test_absolute_temperature_limit_does_not_clear_while_the_reading_is_unavailable(
+    quality: Quality | None,
+) -> None:
+    # 上限を超えた metric が stale / missing / 消失になっても解消とみなさない。
+    # fresh な上限未満の値が fault_clear_hold_ms の間続いてから解除する。
+    safety = critical_safety(safety_config())
+    settle(safety)
+
+    def hotspot(value: float | None, q: Quality = Quality.OK) -> tuple[SnapshotSignal, ...]:
+        return (signal("gpu.0.hotspot", value, importance=TelemetryImportance.ADVISORY, quality=q),)
+
+    unavailable = () if quality is None else hotspot(None, quality)
+    hot = safety.evaluate(
+        snapshot(tick=3, mono=2_000, extra_signals=hotspot(85.0)),
+        mode=OperatingMode.AUTO,
+    )
+    held = [
+        safety.evaluate(
+            snapshot(tick=tick, mono=mono, extra_signals=unavailable),
+            mode=OperatingMode.AUTO,
+        )
+        for tick, mono in ((4, 3_000), (5, 10_000), (6, 20_000))
+    ]
+    fresh_below = safety.evaluate(
+        snapshot(tick=7, mono=21_000, extra_signals=hotspot(60.0)),
+        mode=OperatingMode.AUTO,
+    )
+    before_hold = safety.evaluate(
+        snapshot(tick=8, mono=22_999, extra_signals=hotspot(60.0)),
+        mode=OperatingMode.AUTO,
+    )
+    cleared = safety.evaluate(
+        snapshot(tick=9, mono=23_000, extra_signals=hotspot(60.0)),
+        mode=OperatingMode.AUTO,
+    )
+
+    assert hot.state is SafetyState.EMERGENCY
+    for decision in held:
+        assert decision.state is SafetyState.EMERGENCY
+        assert decision.faults[0].code is FaultCode.ABSOLUTE_TEMPERATURE_LIMIT
+        assert "gpu.0.hotspot" in decision.faults[0].detail
+    assert fresh_below.state is SafetyState.EMERGENCY
+    assert before_hold.state is SafetyState.EMERGENCY
+    assert cleared.state is SafetyState.NORMAL
+    assert not cleared.faults
+
+
+def test_absolute_temperature_clear_hold_restarts_if_the_reading_becomes_unavailable() -> None:
+    safety = critical_safety(safety_config())
+    settle(safety)
+
+    def hotspot(value: float | None, q: Quality = Quality.OK) -> tuple[SnapshotSignal, ...]:
+        return (signal("gpu.0.hotspot", value, importance=TelemetryImportance.ADVISORY, quality=q),)
+
+    safety.evaluate(
+        snapshot(tick=3, mono=2_000, extra_signals=hotspot(85.0)), mode=OperatingMode.AUTO
+    )
+    safety.evaluate(
+        snapshot(tick=4, mono=3_000, extra_signals=hotspot(60.0)), mode=OperatingMode.AUTO
+    )
+    safety.evaluate(
+        snapshot(tick=5, mono=4_000, extra_signals=hotspot(None, Quality.STALE)),
+        mode=OperatingMode.AUTO,
+    )
+    still = safety.evaluate(
+        snapshot(tick=6, mono=5_000, extra_signals=hotspot(60.0)), mode=OperatingMode.AUTO
+    )
+    cleared = safety.evaluate(
+        snapshot(tick=7, mono=7_000, extra_signals=hotspot(60.0)), mode=OperatingMode.AUTO
+    )
+
+    # tick 4 から hold を数えると tick 6 で解除されるが、tick 5 の stale で hold が
+    # やり直しになるため、tick 6 の fresh 値から fault_clear_hold_ms 後に解除する。
+    assert still.state is SafetyState.EMERGENCY
+    assert cleared.state is SafetyState.NORMAL
+
+
 def test_deprecated_bare_chipset_name_is_not_treated_as_temperature() -> None:
     safety = critical_safety(safety_config())
     settle(safety)

@@ -103,6 +103,7 @@ class ControlRuntimeBinding:
         "_lineage",
         "_safety_claimed",
         "_safety_payload",
+        "_takeover_acknowledged",
     )
     _backend_claimed: bool
     _control_config_payload: str
@@ -111,6 +112,7 @@ class ControlRuntimeBinding:
     _lineage: object
     _safety_claimed: bool
     _safety_payload: str | None
+    _takeover_acknowledged: bool
 
     def __init__(self) -> None:
         raise TypeError("ControlRuntimeBinding は validated ControlConfig から作る")
@@ -134,6 +136,7 @@ class ControlRuntimeBinding:
         binding._emergency_only = False
         binding._safety_claimed = False
         binding._backend_claimed = False
+        binding._takeover_acknowledged = False
         return binding
 
     @classmethod
@@ -156,6 +159,7 @@ class ControlRuntimeBinding:
         binding._emergency_only = True
         binding._safety_claimed = False
         binding._backend_claimed = False
+        binding._takeover_acknowledged = False
         return binding
 
     def _claim_safety(
@@ -189,6 +193,21 @@ class ControlRuntimeBinding:
             raise ValueError("runtime binding と FanHardwareConfig が一致しない")
         self._backend_claimed = True
         return self._control_config_payload, self._lineage
+
+    def _acknowledge_takeover(self, *, authority: object) -> None:
+        """Backend が takeover 後の最初の全 zone Max を書いたことを Safety へ伝える。"""
+        if authority is not _RUNTIME_BINDING_AUTHORITY:
+            raise TypeError("Fan Hardware Backend だけが takeover を確認できる")
+        if not self._backend_claimed:
+            raise ValueError(
+                "Fan Hardware Backend が無い runtime binding は takeover を確認できない"
+            )
+        self._takeover_acknowledged = True
+
+    def _takeover_is_acknowledged(self, *, authority: object) -> bool:
+        if authority is not _RUNTIME_BINDING_AUTHORITY:
+            raise TypeError("CriticalSafety だけが takeover の確認を読める")
+        return self._takeover_acknowledged
 
     def _emergency_binding(self, *, authority: object) -> tuple[str, object]:
         if authority is not _RUNTIME_BINDING_AUTHORITY:
@@ -419,6 +438,7 @@ class CriticalSafety:
                 )
         self._config = config
         self._config_payload = config.model_dump_json()
+        self._runtime_binding = runtime_binding
         if runtime_binding is None:
             self._runtime_payload = None
             self._lineage = object()
@@ -454,6 +474,9 @@ class CriticalSafety:
         self._last_effective_demand: dict[Zone, float] = {}
         self._write_failure_counts = {zone: 0 for zone in Zone}
         self._overrun_count = 0
+        # 絶対温度上限を超えた metric。latch が hold を経て外れるまで保持し、これらの
+        # fresh な上限未満の値が揃わない tick は「解消」に数えない。
+        self._over_temperature_metrics: set[str] = set()
         self._latched_faults: dict[tuple[FaultCode, Zone | None], _LatchedFault] = {}
         self._config_is_provisional = _contains_provisional(config.model_dump(mode="python"))
 
@@ -511,6 +534,11 @@ class CriticalSafety:
         if group.code != AIR_TELEMETRY_GROUP or frozenset(group.metrics) != AIR_TEMPERATURE_METRICS:
             raise ValueError("air_telemetry Critical group は承認済み5 signal全体に固定する")
 
+    def _takeover_acknowledged(self) -> bool:
+        if self._runtime_binding is None:
+            return True
+        return self._runtime_binding._takeover_is_acknowledged(authority=_RUNTIME_BINDING_AUTHORITY)
+
     @property
     def config_is_provisional(self) -> bool:
         """安全値に未確定の項目があることを返す。値そのものは変えない。"""
@@ -532,8 +560,16 @@ class CriticalSafety:
         self._validate_snapshot(snapshot)
         self._check_tick_order(snapshot)
         now_ms = snapshot.monotonic_ms
-        if self._started_ms is None:
+        # 0028 §2.7 / §2.5 (d): STARTUP の settle と tach 応答の確認は、Backend が
+        # takeover 後の全 zone Max を実際に書いた後から数える。確認前の裁定は常に
+        # STARTUP（全 zone Max）なので、先に合成しておいた command を後で渡しても
+        # Max の保持を飛ばせない。binding が無い evaluator は Backend を駆動できない
+        # （runtime の不一致で拒否される）ため、最初の評価から数える。
+        takeover_started_this_tick = False
+        if self._started_ms is None and self._takeover_acknowledged():
             self._started_ms = now_ms
+            self._startup_tach_seen.clear()
+            takeover_started_this_tick = True
 
         # tach stall は 0028 §2.7 / 0034 §2 で「stall_window_ms の間」続いたときだけの
         # fault と定義されている。Backend の TACH_STALL は1回の帰還にすぎないため直接
@@ -548,7 +584,10 @@ class CriticalSafety:
         )
         # Backend が stall を報告した zone は同じ tick の RPM が閾値以上でも
         # startup の tach 応答確認に数えない（確認は一度付くと消えないため）。
-        self._observe_startup_tach(snapshot, backend_stall_zones)
+        # takeover を確認した tick の snapshot は Max を書く前に読んだ可能性があるため、
+        # tach 応答の確認には次の tick 以降だけを使う。
+        if self._started_ms is not None and not takeover_started_this_tick:
+            self._observe_startup_tach(snapshot, backend_stall_zones)
         self._update_write_failure_counts(external_faults)
         self._overrun_count = self._overrun_count + 1 if tick_overrun else 0
 
@@ -578,6 +617,8 @@ class CriticalSafety:
             )
 
         self._update_latched_faults(observed, now_ms)
+        if (FaultCode.ABSOLUTE_TEMPERATURE_LIMIT, None) not in self._latched_faults:
+            self._over_temperature_metrics.clear()
         faults = tuple(
             item.fault
             for _, item in sorted(
@@ -705,12 +746,29 @@ class CriticalSafety:
             and signal.value is not None
             and signal.value >= ceiling
         )
-        if not exceeded:
+        if exceeded:
+            self._over_temperature_metrics.update(metric for metric, _ in exceeded)
+            detail = ", ".join(f"{metric}={value:g}C" for metric, value in exceeded)
+            return Fault(
+                code=FaultCode.ABSOLUTE_TEMPERATURE_LIMIT,
+                detail=f"absolute ceiling {ceiling:g}C reached: {detail}",
+            )
+        # 上限を超えた metric が stale / missing になっても、温度が下がった証拠ではない。
+        # fresh な上限未満の値を観測するまで fault を観測し続け、clear hold を始めない。
+        unconfirmed = sorted(
+            metric
+            for metric in self._over_temperature_metrics
+            if not _signal_available(snapshot, metric)
+            or snapshot.signals_by_metric[metric].value is None
+        )
+        if not unconfirmed:
             return None
-        detail = ", ".join(f"{metric}={value:g}C" for metric, value in exceeded)
         return Fault(
             code=FaultCode.ABSOLUTE_TEMPERATURE_LIMIT,
-            detail=f"absolute ceiling {ceiling:g}C reached: {detail}",
+            detail=(
+                f"absolute ceiling {ceiling:g}C reached; no fresh reading below the "
+                f"ceiling yet: {', '.join(unconfirmed)}"
+            ),
         )
 
     def _is_absolute_temperature_metric(self, metric: str) -> bool:
@@ -829,7 +887,8 @@ class CriticalSafety:
     ) -> SafetyState:
         if emergency:
             return SafetyState.EMERGENCY
-        assert self._started_ms is not None
+        if self._started_ms is None:
+            return SafetyState.STARTUP
         startup_ready = (
             snapshot.monotonic_ms - self._started_ms >= self._config.startup_settle_ms.value
             and _signal_available(snapshot, CPU_TEMPERATURE_METRIC)

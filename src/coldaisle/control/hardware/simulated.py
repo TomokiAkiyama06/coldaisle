@@ -107,13 +107,19 @@ class SimulatedFanBackend:
         if self._last_monotonic_ms is not None and monotonic_ms <= self._last_monotonic_ms:
             raise ValueError("Fan Hardware Backend の command 時刻は前進させる")
         demands._consume_for_hardware()
+        first_write = self._last_tick_id is None
         self._last_tick_id = tick_id
         self._last_monotonic_ms = monotonic_ms
-        return PerZone(
+        results = PerZone(
             front=self._apply_zone(Zone.FRONT, zones.front.effective),
             rear=self._apply_zone(Zone.REAR, zones.rear.effective),
             top=self._apply_zone(Zone.TOP, zones.top.effective),
         )
+        if first_write:
+            # Safety は この確認の後から STARTUP の settle と tach 応答を数える。
+            # zone ごとの書き込み失敗は fault として別に Safety へ渡る。
+            self.runtime_binding._acknowledge_takeover(authority=_RUNTIME_BINDING_AUTHORITY)
+        return results
 
     def _apply_zone(self, zone: Zone, demand: float) -> FanHardwareResult:
         profile = self.config.zones.get(zone).profile

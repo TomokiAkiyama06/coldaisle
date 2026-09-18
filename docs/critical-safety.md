@@ -78,6 +78,9 @@ floor は ceiling に勝ち、forced Max はすべてに勝つ。上げる速さ
 Manual / Calibration で Guard ceiling は使わないが、Guard floor と Safety は外れない。
 安全側の状態遷移は即時、復帰は単調時計で `fault_clear_hold_ms` の間
 連続して fault が解消した後だけ行う。
+絶対温度上限の fault は、上限を超えた metric の fresh（品質 `ok`）な上限未満の値を観測するまで
+解消に数えない。stale / missing / 消失の tick は温度が下がった証拠ではないため、fault を
+観測し続け、`fault_clear_hold_ms` の hold もやり直しにする。
 
 `DemandComposer` は検証済み `SafetyConfig.ramp_down_per_s` と直前の effective を内部に
 保持し、呼び出し側から rate / previous / elapsed を受け取らない。最初の合成は
@@ -101,6 +104,11 @@ consume/write 前に拒否する。Backend
 の後に replay して fan を下げることはできない。
 Backend が最初に受理する command は全 zone forced Max（STARTUP、設定不正時は EMERGENCY）
 だけで、STARTUP の command を捨てて NORMAL を最初に渡すと consume 前に拒否する（0028 §2.7）。
+Backend は最初の Max を書くと runtime binding を通じて takeover を確認する。Critical Safety は
+この確認より前の裁定を常に STARTUP（全 zone Max）とし、確認後の最初の tick から
+`startup_settle_ms` を数え、tach 応答もその次の tick 以降の snapshot だけで確認する。
+STARTUP の command を遅らせても、その間に合成した command は Max のままなので、
+Max を物理的に書いてから settle と tach 応答を経るまで demand を下げられない。
 
 ## deadman / 異常停止
 

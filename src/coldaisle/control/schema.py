@@ -22,10 +22,13 @@ from typing import Annotated, Literal, Self
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-SCHEMA_VERSION: Literal[1] = 1
+SCHEMA_VERSION: Literal[2] = 2
 """`ControlTick` の形の版。**フィールドの名前や意味を変えたら上げる。**
 
 #82 が保存したデータを読み違えないため。
+
+- v2（#78）: fault code `absolute_temperature_limit` を追加し、Top の `enable_reverted` を
+  無条件の `EMERGENCY` にした。保存済みの v1 は v1 の規則のまま読める
 """
 
 Demand = Annotated[float, Field(ge=0.0, le=1.0, allow_inf_nan=False)]
@@ -413,10 +416,14 @@ Critical Safety（#78）が数えるので、ここでは検査しない。
 """
 
 
+_FAULTS_ADDED_IN_V2: frozenset[FaultCode] = frozenset({FaultCode.ABSOLUTE_TEMPERATURE_LIMIT})
+"""schema version 2 で追加した fault code。v1 の reader は知らないため v1 には記録しない。"""
+
+
 class ControlTick(_Frozen):
     """1 tick の判断の記録（decision trace。0028 §2.3）。#82 が保存し、#90 / #91 が読む。"""
 
-    schema_version: Literal[1] = SCHEMA_VERSION
+    schema_version: Literal[1, 2] = SCHEMA_VERSION
     tick_id: int = Field(ge=0)
     ts_ms: int = Field(ge=0)
     """記録の時刻（壁時計。0028 §2.6）。"""
@@ -432,6 +439,12 @@ class ControlTick(_Frozen):
     @model_validator(mode="after")
     def _state_matches_zones_and_faults(self) -> Self:
         state = self.state
+        if self.schema_version == 1 and any(
+            fault.code in _FAULTS_ADDED_IN_V2 for fault in self.faults
+        ):
+            raise ValueError(
+                "absolute_temperature_limit を記録する ControlTick は schema version 2 にする"
+            )
         all_max = state.safety_state in {SafetyState.STARTUP, SafetyState.EMERGENCY} or (
             state.operating_mode is OperatingMode.MAX
         )
@@ -458,8 +471,15 @@ class ControlTick(_Frozen):
 
     def _check_fault_response(self, fault: Fault) -> None:
         """0028 §2.7 の無条件の対応を満たしているか。"""
+        # v1 の記録は v1 の規則で読む。v1 では Top の enable_reverted は DEGRADED でも
+        # 有効だったため、v2 の規則で検証すると保存済みの記録を読めなくなる。
+        top_emergency = (
+            TOP_EMERGENCY_FAULTS
+            if self.schema_version >= 2
+            else TOP_EMERGENCY_FAULTS - {FaultCode.ENABLE_REVERTED}
+        )
         emergency = fault.code in EMERGENCY_FAULTS or (
-            fault.zone is Zone.TOP and fault.code in TOP_EMERGENCY_FAULTS
+            fault.zone is Zone.TOP and fault.code in top_emergency
         )
         if emergency and self.state.safety_state is not SafetyState.EMERGENCY:
             raise ValueError(f"{fault.code.value} は EMERGENCY にする（0028 §2.7）")

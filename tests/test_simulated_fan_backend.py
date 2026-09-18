@@ -34,6 +34,7 @@ from coldaisle.control.schema import (
     OperatingMode,
     PerZone,
     Reason,
+    SafetyState,
     Zone,
     ZoneRequest,
 )
@@ -216,6 +217,35 @@ def input_contract() -> ControlInputContract:
     )
 
 
+def ready_snapshot(contract: ControlInputContract, tick: int, mono: int) -> ControlStateSnapshot:
+    """全 signal が fresh で、全 fan の tach が応答している snapshot。"""
+    signals = tuple(
+        SnapshotSignal(
+            metric=spec.metric,
+            importance=spec.importance,
+            enabled=True,
+            value=40.0 if spec.metric == "cpu.package" else 25.0,
+            quality=Quality.OK,
+            source_ts_ms=mono,
+            last_changed_mono_ms=mono,
+            age_ms=0,
+        )
+        for spec in contract.signals
+    )
+    fan = FanState(effective_demand=1.0, rpm=1_000)
+    return ControlStateSnapshot(
+        tick_id=tick,
+        ts_ms=tick,
+        monotonic_ms=mono,
+        signals=signals,
+        derived=(),
+        trends=(),
+        telemetry_health=TelemetryHealth.NORMAL,
+        critical_unavailable=(),
+        fans=PerZone(front=fan, rear=fan, top=fan),
+    )
+
+
 def write_hardware_document(path: Path, config: FanHardwareConfig) -> bytes:
     payload = yaml.safe_dump(config.model_dump(mode="json")).encode("utf-8")
     path.write_bytes(payload)
@@ -230,13 +260,12 @@ def runtime(
     count: int = 1,
     config: ControlConfig | None = None,
     startup_fault_plan: SimulatedFaultPlan | None = None,
-    apply_startup: bool = True,
 ) -> tuple[SimulatedFanBackend, tuple[ComposedDemands, ...]]:
-    """STARTUP の全 zone Max を backend に適用した後の、通常 command 列を返す。
+    """STARTUP の全 zone Max を backend に適用した後の、未適用の通常 command 列を返す。
 
-    ``apply_startup=False`` のときは STARTUP command を適用せず、先頭に入れて返す。
-    STARTUP を捨てて NORMAL だけを backend へ渡すと、takeover の Max を飛ばして
-    しまうため（0028 §2.7）。
+    STARTUP を捨てて NORMAL だけを backend へ渡すと takeover の Max を飛ばしてしまう
+    （0028 §2.7）ため、fixture も STARTUP の command を必ず backend へ適用する。
+    ``startup_fault_plan`` は STARTUP の間の書き込みだけに適用する。
     """
 
     def requests(value: float, rear_value: float, top_value: float) -> PerZone[ZoneRequest]:
@@ -250,33 +279,6 @@ def runtime(
     guards = PerZone(front=guard, rear=guard, top=guard)
     contract = input_contract()
 
-    def snapshot(tick: int, mono: int) -> ControlStateSnapshot:
-        signals = tuple(
-            SnapshotSignal(
-                metric=spec.metric,
-                importance=spec.importance,
-                enabled=True,
-                value=40.0 if spec.metric == "cpu.package" else 25.0,
-                quality=Quality.OK,
-                source_ts_ms=mono,
-                last_changed_mono_ms=mono,
-                age_ms=0,
-            )
-            for spec in contract.signals
-        )
-        fan = FanState(effective_demand=1.0, rpm=1_000)
-        return ControlStateSnapshot(
-            tick_id=tick,
-            ts_ms=tick,
-            monotonic_ms=mono,
-            signals=signals,
-            derived=(),
-            trends=(),
-            telemetry_health=TelemetryHealth.NORMAL,
-            critical_unavailable=(),
-            fans=PerZone(front=fan, rear=fan, top=fan),
-        )
-
     active_config = config or control_config()
     binding = create_control_runtime_binding(active_config)
     safety = CriticalSafety(
@@ -285,7 +287,7 @@ def runtime(
         runtime_binding=binding,
     )
     backend = SimulatedFanBackend(active_config.fan_hardware, binding)
-    startup = safety.evaluate(snapshot(1, 0), mode=OperatingMode.AUTO)
+    startup = safety.evaluate(ready_snapshot(contract, 1, 0), mode=OperatingMode.AUTO)
     composer = DemandComposer(active_config.safety)
     startup_command = composer.compose(
         requested=requests(1.0, 1.0, 1.0),
@@ -293,32 +295,36 @@ def runtime(
         safety=startup,
         mode=OperatingMode.AUTO,
     )
-    commands: list[ComposedDemands] = []
-    if apply_startup:
-        if startup_fault_plan is not None:
-            backend.fault_plan = startup_fault_plan
-        backend.apply(startup_command)
-        backend.fault_plan = SimulatedFaultPlan()
-    else:
-        commands.append(startup_command)
+    # 実際の loop と同じく evaluate → compose → apply を順に行う。Safety は Backend が
+    # takeover の Max を書いたことを確認してから settle と tach 応答を数えるため、
+    # STARTUP の間の command もすべて Backend に適用する。
+    backend.fault_plan = startup_fault_plan or SimulatedFaultPlan()
+    backend.apply(startup_command)
     requested = requests(
         front,
         front if rear is None else rear,
         front if top is None else top,
     )
-    for offset in range(count):
-        normal = safety.evaluate(
-            snapshot(2 + offset, 1_000 + offset * 1_000),
+    commands: list[ComposedDemands] = []
+    tick = 2
+    while len(commands) < count:
+        decision = safety.evaluate(
+            ready_snapshot(contract, tick, (tick - 1) * 1_000),
             mode=OperatingMode.AUTO,
         )
-        commands.append(
-            composer.compose(
-                requested=requested,
-                guard=guards,
-                safety=normal,
-                mode=OperatingMode.AUTO,
-            )
+        command = composer.compose(
+            requested=requested,
+            guard=guards,
+            safety=decision,
+            mode=OperatingMode.AUTO,
         )
+        if decision.state is SafetyState.STARTUP:
+            assert not commands
+            backend.apply(command)
+        else:
+            commands.append(command)
+        tick += 1
+    backend.fault_plan = SimulatedFaultPlan()
     return backend, tuple(commands)
 
 
@@ -349,16 +355,54 @@ def test_startup_max_then_normal_write_never_uses_unsafe_low_pwm() -> None:
     assert result.front.target_rpm == 600
 
 
-def test_first_command_must_be_all_zone_forced_max() -> None:
-    backend, (startup_command, normal_command) = runtime(0.5, apply_startup=False)
+def test_delayed_startup_command_cannot_be_followed_by_a_precomposed_normal() -> None:
+    # 0028 §2.7 / §2.5 (d): takeover の Max を Backend が書くまで Safety は STARTUP の
+    # settle も tach 確認も始めない。STARTUP の command を遅らせても、その間に合成した
+    # command は Max のままで、Max を書いてから settle と tach 応答を経て初めて下げられる。
+    active_config = control_config()
+    binding = create_control_runtime_binding(active_config)
+    contract = input_contract()
+    safety = CriticalSafety(active_config.safety, input_contract=contract, runtime_binding=binding)
+    backend = SimulatedFanBackend(active_config.fan_hardware, binding)
+    composer = DemandComposer(active_config.safety)
+    guard = GuardZoneOutput()
+    guards = PerZone(front=guard, rear=guard, top=guard)
+    low = PerZone(
+        front=ZoneRequest(demand=0.2, reason=Reason(code="hardware_test")),
+        rear=ZoneRequest(demand=0.2, reason=Reason(code="hardware_test")),
+        top=ZoneRequest(demand=0.2, reason=Reason(code="hardware_test")),
+    )
 
-    # STARTUP を捨てて NORMAL を最初に渡すと、consume せずに拒否する。
-    with pytest.raises(ValueError, match="最初の command は全 zone forced Max"):
-        backend.apply(normal_command)
+    def step(tick: int, mono: int) -> tuple[SafetyState, ComposedDemands]:
+        decision = safety.evaluate(ready_snapshot(contract, tick, mono), mode=OperatingMode.AUTO)
+        command = composer.compose(
+            requested=low, guard=guards, safety=decision, mode=OperatingMode.AUTO
+        )
+        return decision.state, command
 
-    startup = backend.apply(startup_command)
+    _, delayed_startup = step(1, 0)
+    # settle 時間が過ぎ tach も見えているが、Backend はまだ Max を書いていない。
+    precomposed = [step(tick, (tick - 1) * 1_000) for tick in (2, 3, 4)]
+    assert all(state is SafetyState.STARTUP for state, _ in precomposed)
+
+    startup = backend.apply(delayed_startup)
     assert all(startup.get(zone).readback.pwm_raw == 255 for zone in Zone)
-    # STARTUP の Max を書いた後は、拒否された NORMAL も前進した tick として適用できる。
+    for _, command in precomposed:
+        applied = backend.apply(command)
+        assert all(applied.get(zone).readback.pwm_raw == 255 for zone in Zone)
+
+    # Max を書いた後の最初の tick で settle を始め、その tick の tach は数えない。
+    ack_tick_state, ack_tick_command = step(5, 4_000)
+    assert ack_tick_state is SafetyState.STARTUP
+    backend.apply(ack_tick_command)
+    before_settle_state, before_settle_command = step(6, 4_999)
+    assert before_settle_state is SafetyState.STARTUP
+    backend.apply(before_settle_command)
+    normal_state, normal_command = step(7, 5_000)
+    assert normal_state is SafetyState.NORMAL
+    # ramp-down で少しずつ下がる。Max を書いてから settle を経た後で初めて Max を外れる。
+    assert not any(normal_command.get(zone).forced_max for zone in Zone)
+    assert normal_command.front.effective < 1.0
     assert backend.apply(normal_command).front.readback.write_ok is True
 
 

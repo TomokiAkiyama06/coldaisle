@@ -646,8 +646,57 @@ def test_the_stored_v1_record_still_loads_unchanged():
     """
     stored = FIXTURE.read_text(encoding="utf-8")
     tick = ControlTick.model_validate_json(stored)
-    assert tick.schema_version == SCHEMA_VERSION == 1
+    assert tick.schema_version == 1
+    assert SCHEMA_VERSION == 2
     assert json.loads(tick.model_dump_json()) == json.loads(stored)
+
+
+def test_v2_trace_records_the_absolute_temperature_limit():
+    recorded = tick(
+        forced(),
+        faults=(Fault(code=FaultCode.ABSOLUTE_TEMPERATURE_LIMIT),),
+        safety_state=SafetyState.EMERGENCY,
+    )
+
+    assert recorded.schema_version == 2
+    restored = ControlTick.model_validate_json(recorded.model_dump_json())
+    assert restored.faults[0].code is FaultCode.ABSOLUTE_TEMPERATURE_LIMIT
+    with pytest.raises(ValidationError, match="EMERGENCY"):
+        tick(
+            forced(),
+            faults=(Fault(code=FaultCode.ABSOLUTE_TEMPERATURE_LIMIT),),
+            safety_state=SafetyState.DEGRADED,
+        )
+
+
+def test_v1_trace_cannot_carry_a_fault_code_added_in_v2():
+    with pytest.raises(ValidationError, match="schema version 2"):
+        ControlTick(
+            schema_version=1,
+            tick_id=1,
+            ts_ms=NOW_MS,
+            state=fallback_state(safety_state=SafetyState.EMERGENCY),
+            zones=zones(forced()),
+            faults=(Fault(code=FaultCode.ABSOLUTE_TEMPERATURE_LIMIT),),
+        )
+
+
+def test_top_enable_revert_is_emergency_in_v2_but_v1_records_still_load():
+    top_revert = (Fault(code=FaultCode.ENABLE_REVERTED, zone=Zone.TOP),)
+    with pytest.raises(ValidationError, match="EMERGENCY"):
+        tick(forced(), faults=top_revert, safety_state=SafetyState.DEGRADED)
+
+    stored_v1 = ControlTick(
+        schema_version=1,
+        tick_id=1,
+        ts_ms=NOW_MS,
+        state=fallback_state(safety_state=SafetyState.DEGRADED),
+        zones=zones(forced()),
+        faults=top_revert,
+    )
+    restored = ControlTick.model_validate_json(stored_v1.model_dump_json())
+    assert restored.schema_version == 1
+    assert restored.state.safety_state is SafetyState.DEGRADED
 
 
 def test_the_stored_record_explains_every_changed_zone():
