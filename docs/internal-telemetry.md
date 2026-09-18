@@ -78,8 +78,8 @@ repository には実機の `hwmonN` や個体識別子を追加しない。
 ```
 
 同じ selector が複数見つかった場合は推測で選ばず `missing` にする。T_SENSOR の metric
-は決定記録0032（Proposed）で、取得端子名ではなく測定位置を表す
-`board.connector_12v2x6` を提案している。未設置の間は
+は決定記録0032（FINAL）で、取得端子名ではなく測定位置を表す
+`board.connector_12v2x6` とした。未設置の間は
 `enabled: false` のままなので Critical 入力には含めない。有効化には #50 で確認した
 `minimum` / `maximum` と #50 の測定・所有者承認を指す confirmed の `basis` が必要で、
 範囲外は `suspect` になる。collector 自体が止まった場合は既存 Store の鮮度判定で最後の

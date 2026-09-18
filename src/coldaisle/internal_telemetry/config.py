@@ -13,7 +13,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 from coldaisle.store.models import validate_metric
 
 CONNECTOR_TEMPERATURE_METRIC = "board.connector_12v2x6"
-"""ASUS T_SENSOR で測る 12V-2x6 コネクタ外装温度の提案名（決定記録0032）。"""
+"""ASUS T_SENSOR で測る 12V-2x6 コネクタ外装温度のメトリクス名（決定記録0032）。"""
 
 
 class _ConfigModel(BaseModel):
