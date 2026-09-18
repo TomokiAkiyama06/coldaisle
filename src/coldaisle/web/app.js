@@ -150,7 +150,7 @@ const BANNER_TEXT = {
  *
  * | 条件 | 入力 | 消えるとき |
  * |---|---|---|
- * | API の失敗 | lastFetchError（適用された定期更新の失敗） | 定期更新が丸ごと成功したとき |
+ * | API の失敗 | lastFetchError（定期更新で失敗しているエンドポイント） | そのエンドポイントが次に成功したとき |
  * | データなし | health.last_sample_ts_ms === null | 次の health |
  * | 未来の時刻 | health.data_age_seconds < 0、またはカードの age_seconds < 0 | 両方が正になったとき |
  * | 古い | health.stale、または latest.stale（WebSocket を含む） | 両方が false になったとき |
@@ -408,7 +408,8 @@ async function fetchJson(path, params, signal) {
 let historySeq = 0;
 let historyAppliedSeq = 0;
 let refreshSeq = 0;
-let refreshAppliedSeq = 0;
+// 定期更新の4つは**エンドポイントごとに**適用済みの番号を持つ（1つの失敗で残りを捨てない）
+const refreshAppliedSeq = { latest: 0, health: 0, alerts: 0, devices: 0 };
 let refreshInFlight = false;
 // WebSocket で最新値を受け取った回数。定期更新の最新値がこれより古ければ使わない
 let streamVersion = 0;
@@ -491,8 +492,38 @@ function renderNote() {
 // 最後に受け取った応答。**表示名の表が後から届いたときに描き直すため**に持つ
 let lastLatest = null;
 let lastHealth = null;
-// 直近の定期更新の失敗。**定期更新が丸ごと成功するまで残す**（赤帯を WebSocket で消さない）
+// 定期更新でいま失敗しているエンドポイントの文言。**そのエンドポイントが次に成功するまで残す**
+// （赤帯を WebSocket で消さない）
 let lastFetchError = null;
+// エンドポイントごとの直近の失敗。lastFetchError はこれを並べたもの
+const fetchErrors = {};
+
+// 定期更新で読む4つと、それぞれの適用のしかた
+const REFRESH_ENDPOINTS = [
+  { key: "latest", path: "/api/v1/latest" },
+  { key: "health", path: "/api/v1/health" },
+  { key: "alerts", path: "/api/v1/alerts", params: { limit: 20 } },
+  { key: "devices", path: "/api/v1/devices" },
+];
+const APPLY_ENDPOINT = {
+  // 待っている間に WebSocket がより新しい最新値を届けていたら、そちらを残す。
+  // 古い `ok` で新しい `stale` を上書きすると、品質が変わるまで WebSocket は
+  // 押し直さないため（stream_state）、次の定期更新まで赤帯が消える
+  latest: (body, streamAtStart) => {
+    if (streamVersion === streamAtStart) applyLatest(body);
+  },
+  health: (body) => {
+    lastHealth = body;
+  },
+  alerts: (body) => {
+    lastAlerts = body.alerts;
+    renderAlerts(lastAlerts);
+  },
+  devices: (body) => {
+    lastDevices = body.devices;
+    renderDevices(lastDevices);
+  },
+};
 let lastAlerts = null;
 let lastDevices = null;
 let lastSeries = null;
@@ -569,37 +600,38 @@ async function refresh() {
   const seq = ++refreshSeq;
   const streamAtStart = streamVersion;
   try {
-    const [latest, health, alerts, devices] = await withTimeout(REFRESH_TIMEOUT_MS, (signal) =>
-      Promise.all([
-        fetchJson("/api/v1/latest", undefined, signal),
-        fetchJson("/api/v1/health", undefined, signal),
-        fetchJson("/api/v1/alerts", { limit: 20 }, signal),
-        fetchJson("/api/v1/devices", undefined, signal),
-      ])
+    // **allSettled。** Promise.all だと /alerts の失敗で、取れていた /health まで捨て、
+    // health（赤帯の入力）が失敗が続く間ずっと固まる。取れたものはそれぞれ使う
+    const { results, timedOut } = await withTimeout(REFRESH_TIMEOUT_MS, (signal) =>
+      Promise.allSettled(
+        REFRESH_ENDPOINTS.map((endpoint) => fetchJson(endpoint.path, endpoint.params, signal))
+      ).then((settled) => ({ results: settled, timedOut: signal.aborted }))
     );
-    if (seq <= refreshAppliedSeq) return;
-    refreshAppliedSeq = seq;
-    // 待っている間に WebSocket がより新しい最新値を届けていたら、そちらを残す。
-    // 古い `ok` で新しい `stale` を上書きすると、品質が変わるまで WebSocket は
-    // 押し直さないため（stream_state）、次の定期更新まで赤帯が消える
-    if (streamVersion === streamAtStart) applyLatest(latest);
-    lastHealth = health;
-    lastFetchError = null; // 4つとも取れたときだけ消す
-    lastAlerts = alerts.alerts;
-    lastDevices = devices.devices;
+    REFRESH_ENDPOINTS.forEach((endpoint, index) => {
+      const { key } = endpoint;
+      // 適用済みより新しい応答だけを使う（エンドポイントごと。失敗も同じ扱い）
+      if (seq <= refreshAppliedSeq[key]) return;
+      refreshAppliedSeq[key] = seq;
+      const result = results[index];
+      if (result.status === "fulfilled") {
+        delete fetchErrors[key];
+        APPLY_ENDPOINT[key](result.value, streamAtStart);
+      } else {
+        // 打ち切りと言い換えるのは、上限に達して中断された要求だけ。元の失敗は変えない
+        const aborted = timedOut && result.reason && result.reason.name === "AbortError";
+        fetchErrors[key] = aborted
+          ? `${endpoint.path}: ${Math.round(REFRESH_TIMEOUT_MS / 1000)}秒以内に応答がありません`
+          : result.reason.message;
+      }
+    });
+    // 赤帯には、いま失敗しているエンドポイントをすべて出す（定義の順）
+    const failures = REFRESH_ENDPOINTS.map(({ key }) => fetchErrors[key]).filter(Boolean);
+    lastFetchError = failures.length > 0 ? failures.join(", ") : null;
     renderBanner();
-    renderAlerts(lastAlerts);
-    renderDevices(lastDevices);
-    if (!historyLoaded) {
+    if (!historyLoaded && lastLatest) {
       historyLoaded = true;
       loadHistory();
     }
-  } catch (error) {
-    if (seq <= refreshAppliedSeq) return;
-    refreshAppliedSeq = seq;
-    // 赤帯そのものには書かず、状態として残す。直接書くと、次の WebSocket の更新で消える
-    lastFetchError = error.message;
-    renderBanner();
   } finally {
     refreshInFlight = false;
   }

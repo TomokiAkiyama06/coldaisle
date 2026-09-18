@@ -166,9 +166,13 @@ def test_periodic_refresh_also_reloads_current_values():
     カードは「正常」のままになる。
     """
     script = SCRIPT.read_text(encoding="utf-8")
-    refresh = script[script.index("async function refresh()") : script.index("function connect()")]
-    assert "/api/v1/latest" in refresh, "定期更新で最新値を取り直していない"
-    assert "applyLatest" in refresh
+    endpoints = script[script.index("const REFRESH_ENDPOINTS") :]
+    endpoints = endpoints[: endpoints.index("];")]
+    assert '"/api/v1/latest"' in endpoints, "定期更新で最新値を取り直していない"
+    appliers = script[script.index("const APPLY_ENDPOINT") :]
+    assert "applyLatest(body)" in appliers[: appliers.index("\n};")]
+    refresh = _body(script, "async function refresh()")
+    assert "REFRESH_ENDPOINTS.map(" in refresh and "APPLY_ENDPOINT[key](" in refresh
 
 
 def test_chart_breaks_lines_across_gaps():
@@ -417,7 +421,7 @@ def test_a_stream_update_does_not_hide_an_api_failure():
 
     定期更新（`/alerts` や `/devices`）が失敗していても、WebSocket は届き続けることがある。
     失敗を赤帯に直接書くと、次の `applyLatest → renderBanner` で上書きされて消える。
-    失敗は `lastFetchError` に残し、定期更新が丸ごと成功したときだけ消す。
+    失敗はエンドポイントごとに `fetchErrors` に残し、そのエンドポイントが次に成功したときだけ消す。
     """
     script = SCRIPT.read_text(encoding="utf-8")
     banner = script[script.index("function bannerMessages(") :]
@@ -425,12 +429,12 @@ def test_a_stream_update_does_not_hide_an_api_failure():
     assert "const failed = Boolean(lastFetchError);" in banner
     assert "messages.join(" in _body(script, "function renderBanner("), "成り立つ警告をすべて出す"
     refresh = script[script.index("async function refresh()") : script.index("function connect()")]
-    failure = refresh[refresh.index("catch (error)") :]
-    assert "lastFetchError = error.message" in failure
-    assert "banner.textContent" not in failure, "赤帯に直接書くと WebSocket の更新で消える"
-    success = refresh[: refresh.index("catch (error)")]
-    assert "lastFetchError = null" in success
-    assert success.index("Promise.all") < success.index("lastFetchError = null")
+    assert "banner.textContent" not in refresh, "赤帯に直接書くと WebSocket の更新で消える"
+    assert "delete fetchErrors[key];" in refresh, "成功したエンドポイントの失敗だけを消す"
+    assert "fetchErrors[key] = aborted" in refresh
+    assert 'lastFetchError = failures.length > 0 ? failures.join(", ") : null;' in refresh, (
+        "いま失敗しているエンドポイントをすべて出す"
+    )
 
 
 def test_the_catalog_note_clears_on_its_own():
@@ -482,8 +486,11 @@ def test_a_slow_but_eventually_successful_refresh_is_applied():
     """
     script = SCRIPT.read_text(encoding="utf-8")
     refresh = _body(script, "async function refresh()")
-    assert refresh.count("if (seq <= refreshAppliedSeq) return;") == 2, "成功・失敗とも"
-    assert refresh.count("refreshAppliedSeq = seq;") == 2
+    assert refresh.count("if (seq <= refreshAppliedSeq[key]) return;") == 1, "成功・失敗とも"
+    assert refresh.count("refreshAppliedSeq[key] = seq;") == 1
+    assert refresh.index("refreshAppliedSeq[key] = seq;") < refresh.index(
+        'result.status === "fulfilled"'
+    )
     assert "seq !== refreshSeq" not in refresh, "開始した番号と比べると遅い応答が飢える"
 
 
@@ -494,7 +501,10 @@ def test_refresh_is_single_flight_with_a_timeout():
     assert "if (refreshInFlight) return;" in refresh
     assert "refreshInFlight = false" in refresh[refresh.index("finally") :]
     assert "withTimeout(REFRESH_TIMEOUT_MS" in refresh
-    assert refresh.count(", signal)") == 4, "4つの要求すべてを打ち切れること"
+    assert (
+        "REFRESH_ENDPOINTS.map((endpoint) => fetchJson(endpoint.path, endpoint.params, signal))"
+        in refresh
+    ), "4つの要求すべてを打ち切れること"
     helper = _body(script, "async function withTimeout(")
     assert "new AbortController()" in helper and "controller.abort()" in helper
     assert "clearTimeout(timer)" in helper
@@ -509,7 +519,9 @@ def test_a_refresh_does_not_undo_a_newer_stream_update():
     script = SCRIPT.read_text(encoding="utf-8")
     refresh = _body(script, "async function refresh()")
     assert "const streamAtStart = streamVersion;" in refresh
-    assert "if (streamVersion === streamAtStart) applyLatest(latest);" in refresh
+    assert "APPLY_ENDPOINT[key](result.value, streamAtStart)" in refresh
+    appliers = script[script.index("const APPLY_ENDPOINT") :]
+    assert "if (streamVersion === streamAtStart) applyLatest(body);" in appliers
     assert "streamVersion += 1;" in script[script.index("socket.onmessage") :]
 
 
@@ -619,9 +631,9 @@ def test_the_banner_is_stale_if_either_latest_or_health_says_so():
     assert "fromLatest ? fromLatest.stale :" not in banner, "片方だけを信じない"
     # health の側を書き換えるのは、適用された定期更新だけ（WebSocket では消えない）
     assert script.count("lastHealth = ") == 2, "宣言と定期更新の2か所だけ"
+    assert "lastHealth = body;" in script[script.index("const APPLY_ENDPOINT") :]
     refresh = _body(script, "async function refresh()")
-    assert "lastHealth = health;" in refresh
-    assert refresh.index("refreshAppliedSeq = seq;") < refresh.index("lastHealth = health;")
+    assert refresh.index("refreshAppliedSeq[key] = seq;") < refresh.index("APPLY_ENDPOINT[key](")
     assert "lastHealth" not in script[script.index("socket.onmessage") :].split("};")[0]
 
 
@@ -744,3 +756,141 @@ def test_the_banner_shows_exactly_the_applicable_messages(tmp_path):
         for part, name in zip(parts, wanted, strict=True):
             assert part.startswith(BANNER_EXPECTED[name]), f"{combo}: {name} の位置に {part!r}"
         assert result["hidden"] is (not wanted), f"{combo}: 帯の表示が食い違う"
+
+
+# ---------------------------------------------------------------- 定期更新の部分的な失敗
+
+
+REFRESH_HARNESS = r"""
+const fs = require("fs");
+const vm = require("vm");
+class Node {
+  constructor() {
+    this.children = []; this.className = ""; this.textContent = ""; this.style = {};
+    this.hidden = true;
+    this.viewBox = { baseVal: { width: 800, height: 260 } };
+    const self = this;
+    this.classList = {
+      add(c) { if (c === "hidden") self.hidden = true; },
+      remove(c) { if (c === "hidden") self.hidden = false; },
+    };
+  }
+  appendChild(c) { this.children.push(c); return c; }
+  replaceChildren() { this.children = []; }
+  setAttribute() {}
+  addEventListener() {}
+}
+const nodes = {};
+const get = (id) => nodes[id] || (nodes[id] = new Node());
+const phases = JSON.parse(fs.readFileSync(process.argv[3], "utf8"));
+let phase = 0;
+const context = {
+  console, Math, Date, Number, Object, URL, JSON, Promise, Infinity, Boolean, Error,
+  AbortController,
+  document: {
+    getElementById: get,
+    createElement: () => new Node(),
+    createElementNS: () => new Node(),
+    createTextNode: (t) => { const n = new Node(); n.textContent = t; return n; },
+  },
+  window: { location: { origin: "http://127.0.0.1", protocol: "http:", host: "127.0.0.1" } },
+  WebSocket: function () {},
+  setInterval() {}, setTimeout() {}, clearTimeout() {},
+  fetch: async (url) => {
+    const answer = phases[phase][url.pathname];
+    if (answer === undefined || answer === null) return { ok: false, status: 500 };
+    return { ok: true, json: async () => answer };
+  },
+};
+vm.createContext(context);
+vm.runInContext(
+  fs.readFileSync(process.argv[2], "utf8") +
+    "\n;this.__refresh = refresh;" +
+    " this.__state = () => ({ health: lastHealth, alerts: lastAlerts, error: lastFetchError," +
+    " banner: document.getElementById('banner').textContent });",
+  context,
+);
+const settle = () => new Promise((resolve) => setImmediate(resolve));
+(async () => {
+  const states = [];
+  await settle(); await settle();
+  states.push(context.__state()); // 起動時の定期更新（phase 0）
+  for (phase = 1; phase < phases.length; phase += 1) {
+    await context.__refresh();
+    await settle();
+    states.push(context.__state());
+  }
+  process.stdout.write(JSON.stringify(states));
+})();
+"""
+
+
+def test_health_applies_while_alerts_fails(tmp_path):
+    """**/alerts が失敗していても、取れた /health は使う。**
+
+    `Promise.all` だと1つの失敗で残りを捨て、health（赤帯の入力）が失敗の続く間
+    固まる。エンドポイントごとに適用し、失敗しているものだけを赤帯に出す。
+    成功したら、そのエンドポイントの失敗だけが消える。
+    """
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node が無い")
+    latest = {
+        "stale": False,
+        "metrics": {"air.room": {"value": 26.0, "unit": "C", "quality": "ok", "age_seconds": 1.0}},
+        "derived": {},
+    }
+    health = {
+        "last_sample_ts_ms": NOW_MS,
+        "data_age_seconds": 1.0,
+        "stale": False,
+        "source": "mock",
+    }
+    stale_health = dict(health, stale=True)
+    alerts = {
+        "alerts": [
+            {
+                "rule_id": "R",
+                "severity": "warning",
+                "state": "firing",
+                "metric": "air.room",
+                "started_ms": NOW_MS,
+            }
+        ]
+    }
+    devices = {"devices": []}
+    catalog = {"metrics": {}, "derived": {}}
+
+    def phase(health_body, alerts_body):
+        return {
+            "/api/v1/metrics": catalog,
+            "/api/v1/latest": latest,
+            "/api/v1/health": health_body,
+            "/api/v1/alerts": alerts_body,
+            "/api/v1/devices": devices,
+            "/api/v1/series": {"points": [], "agg": "raw"},
+        }
+
+    phases = [
+        phase(health, alerts),  # 0: すべて成功
+        phase(stale_health, None),  # 1: /alerts だけ失敗、health は古いと言う
+        phase(health, alerts),  # 2: 回復
+    ]
+    spec = tmp_path / "phases.json"
+    spec.write_text(json.dumps(phases), encoding="utf-8")
+    harness = tmp_path / "refresh.js"
+    harness.write_text(REFRESH_HARNESS, encoding="utf-8")
+    run = subprocess.run(
+        [node, str(harness), str(SCRIPT), str(spec)], capture_output=True, text=True, check=True
+    )
+    first, failing, recovered = json.loads(run.stdout)
+
+    assert first["error"] is None
+    assert failing["health"]["stale"] is True, "/alerts の失敗で /health を捨てている"
+    assert failing["alerts"] == alerts["alerts"], "失敗したエンドポイントは前の値を残す"
+    assert failing["error"] == "/api/v1/alerts: 500", "失敗しているエンドポイントだけを出す"
+    assert failing["banner"].startswith("API に接続できません: /api/v1/alerts: 500")
+    assert "データが古い" in failing["banner"], "取れた health の stale も同時に出す"
+    assert recovered["error"] is None, "成功したら、そのエンドポイントの失敗は消える"
+    assert recovered["health"]["stale"] is False
+    assert recovered["banner"] == ""
