@@ -6,11 +6,25 @@ import pytest
 import yaml
 from pydantic import ValidationError
 
-from coldaisle.control.config import ControlConfig
+from coldaisle.control.config import CONTROL_CONFIG_VERSION, ControlConfig
 
 
 def provisional(value: float | int) -> dict[str, object]:
     return {"value": value, "status": "provisional"}
+
+
+def guard_band(
+    activate: float,
+    clear: float,
+    degraded_activate: float,
+    degraded_clear: float,
+) -> dict[str, object]:
+    return {
+        "activate_above": provisional(activate),
+        "clear_at_or_below": provisional(clear),
+        "degraded_activate_above": provisional(degraded_activate),
+        "degraded_clear_at_or_below": provisional(degraded_clear),
+    }
 
 
 def valid_documents() -> dict[str, dict[str, object]]:
@@ -89,7 +103,7 @@ def valid_documents() -> dict[str, dict[str, object]]:
             "watchdog_timeout_ms": provisional(5000),
         },
         "fan-policy.yaml": {
-            "schema_version": 2,
+            "schema_version": 3,
             "fallback_curve": [
                 {"temperature_c": 25.0, "demand": 0.3},
                 {"temperature_c": 80.0, "demand": 1.0},
@@ -124,11 +138,15 @@ def valid_documents() -> dict[str, dict[str, object]]:
             },
             "fallback_dynamics": {"decrease_hysteresis": 0.05, "decrease_hold_ms": 2000},
             "reactive_guard": {
-                "floor": provisional(0.4),
-                "ceiling": provisional(1.0),
+                "floor": provisional(0.6),
                 "hold_ms": provisional(1000),
-                "intake_rise_threshold_c": provisional(2.0),
-                "gpu_hotspot_threshold_c": provisional(85.0),
+                "cpu_power_metric": None,
+                "cpu_temperature_rate_c_per_s": guard_band(2.0, 0.5, 1.5, 0.25),
+                "gpu_temperature_rate_c_per_s": guard_band(2.0, 0.5, 1.5, 0.25),
+                "cpu_power_rate_w_per_s": guard_band(100.0, 20.0, 75.0, 10.0),
+                "gpu_power_rate_w_per_s": guard_band(100.0, 20.0, 75.0, 10.0),
+                "intake_rise_c": guard_band(2.0, 1.0, 1.5, 0.5),
+                "gpu_hotspot_c": guard_band(85.0, 80.0, 82.0, 78.0),
             },
             "mpc": {"period_ms": 1000, "budget_ms": 100, "valid_ms": 2000},
             "supervisor": {"period_ms": 1000, "valid_ms": 2000},
@@ -166,9 +184,11 @@ def load_config(tmp_path: Path) -> ControlConfig:
 def test_complete_config_has_traceable_sources_and_is_not_actuation_ready(tmp_path: Path) -> None:
     config = load_config(tmp_path)
 
+    assert CONTROL_CONFIG_VERSION == 3
     assert config.actuation_permitted is False
     metadata = config.trace_metadata()["control_config"]
     assert metadata["fan_hardware"]["name"] == "fan-hardware.yaml"
+    assert metadata["policy"]["schema_version"] == 3
     assert len(metadata["safety"]["sha256"]) == 64
 
 
@@ -206,10 +226,57 @@ def test_cross_field_validation_rejects_unsafe_or_unstable_values(tmp_path: Path
         ControlConfig.from_directory(tmp_path)
 
     documents = valid_documents()
-    documents["fan-policy.yaml"]["reactive_guard"]["ceiling"] = provisional(0.2)
+    documents["fan-policy.yaml"]["reactive_guard"]["gpu_hotspot_c"]["clear_at_or_below"] = (
+        provisional(90.0)
+    )
     write_documents(tmp_path, documents)
-    with pytest.raises(ValidationError, match="ceiling"):
+    with pytest.raises(ValidationError, match="解除閾値"):
         ControlConfig.from_directory(tmp_path)
+
+    documents = valid_documents()
+    documents["fan-policy.yaml"]["reactive_guard"]["gpu_hotspot_c"]["degraded_activate_above"] = (
+        provisional(90.0)
+    )
+    write_documents(tmp_path, documents)
+    with pytest.raises(ValidationError, match="保守側"):
+        ControlConfig.from_directory(tmp_path)
+
+
+def test_cpu_power_guard_metric_requires_confirmed_approval(tmp_path: Path) -> None:
+    documents = valid_documents()
+    documents["fan-policy.yaml"]["reactive_guard"]["cpu_power_metric"] = {
+        "value": "power.cpu.package",
+        "status": "provisional",
+    }
+    write_documents(tmp_path, documents)
+    with pytest.raises(ValidationError, match="confirmed"):
+        ControlConfig.from_directory(tmp_path)
+
+    documents["fan-policy.yaml"]["reactive_guard"]["cpu_power_metric"] = {
+        "value": "not-a-metric",
+        "status": "confirmed",
+        "basis": "approved metric contract",
+    }
+    write_documents(tmp_path, documents)
+    with pytest.raises(ValueError, match="metric"):
+        ControlConfig.from_directory(tmp_path)
+
+    documents["fan-policy.yaml"]["reactive_guard"]["cpu_power_metric"] = {
+        "value": "gpu.0.core",
+        "status": "confirmed",
+        "basis": "approved metric contract",
+    }
+    write_documents(tmp_path, documents)
+    with pytest.raises(ValidationError, match="power ドメイン"):
+        ControlConfig.from_directory(tmp_path)
+
+    documents["fan-policy.yaml"]["reactive_guard"]["cpu_power_metric"] = {
+        "value": "power.cpu.package",
+        "status": "confirmed",
+        "basis": "DR0032 FINAL and owner approval",
+    }
+    write_documents(tmp_path, documents)
+    assert ControlConfig.from_directory(tmp_path).policy.reactive_guard.cpu_power_metric is not None
 
 
 def test_unstable_hwmon_number_is_rejected(tmp_path: Path) -> None:
@@ -301,7 +368,9 @@ def test_provisional_values_identify_safety_and_policy_without_exposing_values(
     }
     assert any(item.path == "fault_demand" for item in values)
     assert any(item.path == "telemetry.t_sensor.enabled" for item in values)
-    assert any(item.path == "reactive_guard.ceiling" for item in values)
+    assert any(
+        item.path == "reactive_guard.gpu_temperature_rate_c_per_s.activate_above" for item in values
+    )
     assert all("value" not in item.model_dump() for item in values)
 
 
@@ -370,12 +439,16 @@ def test_confidence_thresholds_are_validated_per_authority_stage(tmp_path: Path)
         ControlConfig.from_directory(tmp_path)
 
 
-def test_old_fan_policy_schema_is_rejected_instead_of_silently_reinterpreted(
+def test_previous_fan_policy_schema_is_rejected_until_explicitly_migrated(
     tmp_path: Path,
 ) -> None:
     documents = valid_documents()
-    documents["fan-policy.yaml"]["schema_version"] = 1
+    documents["fan-policy.yaml"]["schema_version"] = 2
     write_documents(tmp_path, documents)
 
     with pytest.raises(ValidationError, match="schema_version"):
         ControlConfig.from_directory(tmp_path)
+
+    documents["fan-policy.yaml"]["schema_version"] = 3
+    write_documents(tmp_path, documents)
+    assert ControlConfig.from_directory(tmp_path).policy.schema_version == 3

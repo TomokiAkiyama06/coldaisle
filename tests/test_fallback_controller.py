@@ -38,6 +38,20 @@ def provisional(value: float) -> dict[str, object]:
     return {"value": value, "status": "provisional"}
 
 
+def guard_band(
+    activate: float,
+    clear: float,
+    degraded_activate: float,
+    degraded_clear: float,
+) -> dict[str, object]:
+    return {
+        "activate_above": provisional(activate),
+        "clear_at_or_below": provisional(clear),
+        "degraded_activate_above": provisional(degraded_activate),
+        "degraded_clear_at_or_below": provisional(degraded_clear),
+    }
+
+
 def policy(
     *,
     authority: str = "full",
@@ -47,7 +61,7 @@ def policy(
     demote_window_ms: int = 60_000,
 ) -> FanPolicyConfig:
     document: dict[str, object] = {
-        "schema_version": 2,
+        "schema_version": 3,
         "fallback_curve": [
             {"temperature_c": 20.0, "demand": 0.2},
             {"temperature_c": 80.0, "demand": 0.8},
@@ -60,10 +74,14 @@ def policy(
         "fallback_dynamics": {"decrease_hysteresis": 0.05, "decrease_hold_ms": 2_000},
         "reactive_guard": {
             "floor": provisional(0.2),
-            "ceiling": provisional(1.0),
             "hold_ms": provisional(1_000),
-            "intake_rise_threshold_c": provisional(2.0),
-            "gpu_hotspot_threshold_c": provisional(85.0),
+            "cpu_power_metric": None,
+            "cpu_temperature_rate_c_per_s": guard_band(2.0, 0.5, 1.5, 0.25),
+            "gpu_temperature_rate_c_per_s": guard_band(2.0, 0.5, 1.5, 0.25),
+            "cpu_power_rate_w_per_s": guard_band(100.0, 20.0, 75.0, 10.0),
+            "gpu_power_rate_w_per_s": guard_band(100.0, 20.0, 75.0, 10.0),
+            "intake_rise_c": guard_band(2.0, 1.0, 1.5, 0.5),
+            "gpu_hotspot_c": guard_band(85.0, 80.0, 82.0, 78.0),
         },
         "mpc": {"period_ms": 1_000, "budget_ms": 100, "valid_ms": 2_000},
         "supervisor": {"period_ms": 1_000, "valid_ms": 2_000},

@@ -16,7 +16,8 @@ from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, model_valida
 from coldaisle.control.schema import AuthorityStage, Demand, PerZone, Zone
 from coldaisle.store.models import validate_metric
 
-CONTROL_CONFIG_VERSION: Literal[2] = 2
+CONTROL_CONFIG_VERSION: Literal[3] = 3
+FAN_POLICY_CONFIG_VERSION: Literal[3] = 3
 CONFIG_FILENAMES = {
     "fan_hardware": "fan-hardware.yaml",
     "safety": "safety.yaml",
@@ -92,6 +93,7 @@ SafetyMilliseconds = ConfigValue[PositiveMilliseconds]
 SafetyRpm = ConfigValue[PositiveRpm]
 SafetyFloat = ConfigValue[FiniteFloat]
 PolicyDemand = ConfigValue[Demand]
+PolicyFloat = ConfigValue[FiniteFloat]
 PolicyMilliseconds = ConfigValue[PositiveMilliseconds]
 PolicyUnitInterval = ConfigValue[UnitInterval]
 
@@ -328,19 +330,62 @@ class GateConfidenceThresholds(_ConfigModel):
         return self
 
 
-class ReactiveGuard(_ConfigModel):
-    """Reactive Guard の閾値。値は全て安全設定と同様に追跡する。"""
+_POWER_DOMAIN = "power"
+"""消費電力の metric domain（決定記録 0002 §2.1）。命名規約であり調整値ではない。"""
 
-    floor: PolicyDemand
-    ceiling: PolicyDemand
-    hold_ms: PolicyMilliseconds
-    intake_rise_threshold_c: ConfigValue[FiniteFloat]
-    gpu_hotspot_threshold_c: ConfigValue[FiniteFloat]
+
+class GuardThresholdBand(_ConfigModel):
+    """1つの Guard trigger の発火・解除閾値。
+
+    ``degraded_*`` は決定記録 0029 が求める保守側の閾値組である。
+    実測前の値をコードに隠さないよう、4値とも追跡可能にする。
+    """
+
+    activate_above: PolicyFloat
+    clear_at_or_below: PolicyFloat
+    degraded_activate_above: PolicyFloat
+    degraded_clear_at_or_below: PolicyFloat
 
     @model_validator(mode="after")
-    def _ceiling_is_not_below_floor(self) -> Self:
-        if self.ceiling.value < self.floor.value:
-            raise ValueError("Reactive Guard の ceiling は floor 以上にする")
+    def _has_hysteresis_and_a_conservative_profile(self) -> Self:
+        if self.clear_at_or_below.value >= self.activate_above.value:
+            raise ValueError("Guard の解除閾値は発火閾値より低くする")
+        if self.degraded_clear_at_or_below.value >= self.degraded_activate_above.value:
+            raise ValueError("Degraded Guard の解除閾値は発火閾値より低くする")
+        if self.degraded_activate_above.value > self.activate_above.value:
+            raise ValueError("Degraded Guard の発火閾値は通常より保守側にする")
+        if self.degraded_clear_at_or_below.value > self.clear_at_or_below.value:
+            raise ValueError("Degraded Guard の解除閾値は通常より保守側にする")
+        return self
+
+
+class ReactiveGuardConfig(_ConfigModel):
+    """Reactive Guard の暫定 floor・hold・trigger 閾値。"""
+
+    floor: PolicyDemand
+    hold_ms: PolicyMilliseconds
+    cpu_power_metric: ConfigValue[str] | None
+    cpu_temperature_rate_c_per_s: GuardThresholdBand
+    gpu_temperature_rate_c_per_s: GuardThresholdBand
+    cpu_power_rate_w_per_s: GuardThresholdBand
+    gpu_power_rate_w_per_s: GuardThresholdBand
+    intake_rise_c: GuardThresholdBand
+    gpu_hotspot_c: GuardThresholdBand
+
+    @model_validator(mode="after")
+    def _cpu_power_metric_requires_approval(self) -> Self:
+        if self.cpu_power_metric is None:
+            return self
+        metric = validate_metric(self.cpu_power_metric.value)
+        # 閾値は W/s なので、温度など別ドメインの metric を黙って比較させない。
+        # 単位の最終確認は Metric Catalog を持つ ReactiveGuard の生成時に行う。
+        if metric.split(".", 1)[0] != _POWER_DOMAIN:
+            raise ValueError(
+                "CPU Power trigger の metric は power ドメイン（決定記録 0002 §2.1）にする: "
+                f"{metric}"
+            )
+        if self.cpu_power_metric.status != "confirmed":
+            raise ValueError("CPU Power trigger の metric は confirmed 承認を必須にする")
         return self
 
 
@@ -379,14 +424,14 @@ class SupervisorTiming(_ConfigModel):
 
 
 class FanPolicyConfig(_ConfigModel):
-    schema_version: Literal[2]
+    schema_version: Literal[3]
     fallback_curve: Annotated[
         tuple[FallbackPoint, ...], BeforeValidator(_yaml_sequence_to_tuple), Field(min_length=2)
     ]
     fallback_temperature_inputs: PerZone[FallbackTemperatureInputs]
     fallback_power_feedforward: PerZone[FallbackPowerCurve] | None = None
     fallback_dynamics: FallbackDynamics
-    reactive_guard: ReactiveGuard
+    reactive_guard: ReactiveGuardConfig
     mpc: MpcTiming
     supervisor: SupervisorTiming
     gate_min_confidence: GateConfidenceThresholds
@@ -414,7 +459,7 @@ class ConfigSource(_ConfigModel):
     """decision trace に残せる入力の版・名前・内容ハッシュ。絶対 path は残さない。"""
 
     name: Literal["fan-hardware.yaml", "safety.yaml", "fan-policy.yaml"]
-    schema_version: Literal[1, 2]
+    schema_version: int = Field(ge=1)
     sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
 
 
@@ -451,7 +496,7 @@ class ControlConfig(_ConfigModel):
                     name=cast(
                         Literal["fan-hardware.yaml", "safety.yaml", "fan-policy.yaml"], filename
                     ),
-                    schema_version=cast(Literal[1, 2], schema_version),
+                    schema_version=schema_version,
                     sha256=sha256(text.encode("utf-8")).hexdigest(),
                 ),
             )
@@ -519,18 +564,27 @@ class ControlConfig(_ConfigModel):
 
         guard = self.policy.reactive_guard
         append("fan-policy.yaml", "reactive_guard.floor", guard.floor)
-        append("fan-policy.yaml", "reactive_guard.ceiling", guard.ceiling)
         append("fan-policy.yaml", "reactive_guard.hold_ms", guard.hold_ms)
-        append(
-            "fan-policy.yaml",
-            "reactive_guard.intake_rise_threshold_c",
-            guard.intake_rise_threshold_c,
-        )
-        append(
-            "fan-policy.yaml",
-            "reactive_guard.gpu_hotspot_threshold_c",
-            guard.gpu_hotspot_threshold_c,
-        )
+        for trigger_name in (
+            "cpu_temperature_rate_c_per_s",
+            "gpu_temperature_rate_c_per_s",
+            "cpu_power_rate_w_per_s",
+            "gpu_power_rate_w_per_s",
+            "intake_rise_c",
+            "gpu_hotspot_c",
+        ):
+            band = getattr(guard, trigger_name)
+            for threshold_name in (
+                "activate_above",
+                "clear_at_or_below",
+                "degraded_activate_above",
+                "degraded_clear_at_or_below",
+            ):
+                append(
+                    "fan-policy.yaml",
+                    f"reactive_guard.{trigger_name}.{threshold_name}",
+                    getattr(band, threshold_name),
+                )
         for stage in ("limited", "expanded", "full"):
             append(
                 "fan-policy.yaml",
