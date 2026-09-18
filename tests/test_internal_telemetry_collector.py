@@ -19,6 +19,7 @@ from coldaisle.telemetry_daemon import (
     SOURCE_STATE_PREFIX,
     InternalTelemetryDaemon,
     _log_configuration,
+    main,
     periodic_metric_intervals,
 )
 from conftest import CONFIG_DIR
@@ -176,3 +177,98 @@ def test_rollup_entry_point_registers_internal_metrics(tmp_path: Path, rules):
             "SELECT expected_count FROM readings_1m WHERE metric = 'gpu.0.core'"
         ).fetchall()
     assert [row[0] for row in expected] == [12, 12, 12, 12]
+
+
+@dataclass
+class TimedAdapter:
+    """poll に処理時間がかかる adapter。SimulatedClock を進めて再現する。"""
+
+    clock: SimulatedClock
+    work_ms: int
+    name: str = "nvml"
+    expected_metrics: tuple[str, ...] = ("gpu.0.core",)
+    closed: bool = False
+
+    def poll(self) -> AdapterResult:
+        self.clock.advance_to_ms(self.clock.now_ms() + self.work_ms)
+        return AdapterResult(
+            source=self.name,
+            status=SourceStatus.OK,
+            readings=(Reading(metric="gpu.0.core", value=55.0, quality=Quality.OK),),
+        )
+
+    def close(self) -> None:
+        self.closed = True
+
+
+def _paced_daemon(tmp_path: Path, rules, work_ms: int):
+    clock = SimulatedClock(0)
+    sleeps: list[float] = []
+
+    def sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+        clock.advance_to_ms(clock.now_ms() + round(seconds * 1_000))
+
+    store = SqliteStore(tmp_path / "paced.db", rules=rules, clock=clock)
+    daemon = InternalTelemetryDaemon(
+        collector=InternalTelemetryCollector((TimedAdapter(clock, work_ms),), clock),
+        store=store,
+        interval_ms=2_500,
+        sleep=sleep,
+        monotonic_ms=clock.now_ms,
+    )
+    return daemon, store, sleeps
+
+
+def _poll_starts(store) -> list[int]:
+    # collector は poll の前に timestamp を取る
+    return [point.ts_ms for point in store.series("gpu.0.core", 0, 60_000)]
+
+
+def test_poll_period_subtracts_the_work_time(tmp_path: Path, rules):
+    """処理時間ぶん待ち時間を減らし、実周期を interval_ms に保つ。"""
+    daemon, store, sleeps = _paced_daemon(tmp_path, rules, work_ms=300)
+
+    daemon.run(max_cycles=4)
+
+    assert _poll_starts(store) == [0, 2_500, 5_000, 7_500]
+    assert sleeps == [2.2, 2.2, 2.2]
+    assert daemon.stats.skipped_slots == 0
+
+
+def test_overrun_skips_missed_slots_without_bursting(tmp_path: Path, rules):
+    """周期を超えたら過ぎた枠を飛ばす。遅れを取り戻す連続収集をしない。"""
+    daemon, store, sleeps = _paced_daemon(tmp_path, rules, work_ms=3_000)
+
+    daemon.run(max_cycles=3)
+
+    assert _poll_starts(store) == [0, 5_000, 10_000]
+    assert all(seconds > 0 for seconds in sleeps), "待ち時間0の連続収集をしない"
+    assert daemon.stats.skipped_slots == 2
+
+
+def test_once_creates_the_database_directory(tmp_path: Path, monkeypatch):
+    """`var/` は追跡されていない。素の checkout で `--once` が動くこと。"""
+    # main() が pytest 自身の SIGINT / SIGTERM ハンドラを置き換えないようにする
+    monkeypatch.setattr("coldaisle.telemetry_daemon.signal.signal", lambda *_: None)
+    telemetry = tmp_path / "internal-telemetry.yaml"
+    telemetry.write_text(
+        "version: 1\ninterval_ms: 2500\n"
+        "nvml: {enabled: false, gpu_indices: [0]}\n"
+        "hwmon: {enabled: false, root: /sys/class/hwmon, sensors: []}\n",
+        encoding="utf-8",
+    )
+    database = tmp_path / "var" / "coldaisle.db"
+    assert not database.parent.exists()
+
+    code = main(
+        [
+            "--once",
+            f"--db={database}",
+            f"--config={telemetry}",
+            f"--quality-rules={CONFIG_DIR / 'quality.yaml'}",
+        ]
+    )
+
+    assert code == 0
+    assert database.exists()

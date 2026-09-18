@@ -52,6 +52,8 @@ class TelemetryStats:
     readings: int = 0
     duplicates: int = 0
     unavailable_cycles: int = 0
+    skipped_slots: int = 0
+    """処理が周期を超えて飛ばした収集枠の数。追いつくために連続で収集しない。"""
 
     def as_fields(self) -> dict[str, int]:
         return {
@@ -59,7 +61,12 @@ class TelemetryStats:
             "readings": self.readings,
             "duplicates": self.duplicates,
             "unavailable_cycles": self.unavailable_cycles,
+            "skipped_slots": self.skipped_slots,
         }
+
+
+def _monotonic_ms() -> int:
+    return time.monotonic_ns() // 1_000_000
 
 
 class InternalTelemetryDaemon:
@@ -72,19 +79,52 @@ class InternalTelemetryDaemon:
         store: SqliteStore,
         interval_ms: int,
         sleep: Callable[[float], None] = time.sleep,
+        monotonic_ms: Callable[[], int] = _monotonic_ms,
     ) -> None:
+        """``monotonic_ms`` は周期の計測だけに使う。
+
+        保存する timestamp は collector の ``Clock``（Unix ms）が決める。周期の計測に
+        実時計を使うと、NTP の補正で時刻が跳んだときに待ち時間が狂うため分けている。
+        試験では ``SimulatedClock.now_ms`` を渡して処理時間を再現する。
+        """
         if interval_ms <= 0:
             raise ValueError("interval_ms は正にする")
         self._collector = collector
         self._store = store
         self._interval_ms = interval_ms
         self._sleep = sleep
+        self._monotonic_ms = monotonic_ms
         self._stop = False
         self.stats = TelemetryStats()
 
     @property
     def store(self) -> SqliteStore:
         return self._store
+
+    def _next_deadline(self, previous: int) -> int:
+        """次の収集予定時刻。処理時間を差し引き、周期が後ろへずれ続けないようにする。
+
+        処理が周期を超えた場合は、過ぎた枠をまとめて飛ばして次の枠へ進める。
+        遅れを取り戻すために連続で収集すると、同じ状態を短い間隔で重複記録し、
+        NVML / sysfs への負荷も一時的に跳ね上がるため。
+        """
+        deadline = previous + self._interval_ms
+        now = self._monotonic_ms()
+        if now < deadline:
+            return deadline
+        skipped = (now - deadline) // self._interval_ms + 1
+        self.stats.skipped_slots += skipped
+        LOGGER.warning(
+            "Internal Telemetry の収集が周期を超えた",
+            extra={
+                logs.FIELDS_KEY: {
+                    "interval_ms": self._interval_ms,
+                    "overrun_ms": now - previous - self._interval_ms,
+                    "skipped_slots": skipped,
+                }
+            },
+        )
+        return deadline + skipped * self._interval_ms
 
     def request_stop(self) -> None:
         """現在の poll を保存し終えてから停止する。"""
@@ -96,6 +136,7 @@ class InternalTelemetryDaemon:
             "Internal Telemetry の収集を開始する",
             extra={logs.FIELDS_KEY: {"interval_ms": self._interval_ms}},
         )
+        deadline = self._monotonic_ms()
         try:
             while not self._stop:
                 cycle = self._collector.collect()
@@ -125,7 +166,10 @@ class InternalTelemetryDaemon:
                         )
                 if max_cycles is not None and self.stats.cycles >= max_cycles:
                     break
-                self._sleep(self._interval_ms / 1_000.0)
+                deadline = self._next_deadline(deadline)
+                remaining_ms = deadline - self._monotonic_ms()
+                if remaining_ms > 0:
+                    self._sleep(remaining_ms / 1_000.0)
         finally:
             self._collector.close()
         LOGGER.info(
@@ -168,6 +212,8 @@ def build(
         HwmonAdapter(telemetry.hwmon),
     )
     rules = QualityRules.from_yaml(config.quality_rules)
+    # 既定の `var/` は追跡されていない。ingest daemon / rollup と同じく、無ければ作る
+    config.db.parent.mkdir(parents=True, exist_ok=True)
     store = SqliteStore(config.db, rules=rules, clock=used_clock)
     collector = InternalTelemetryCollector(used_adapters, used_clock)
     return InternalTelemetryDaemon(

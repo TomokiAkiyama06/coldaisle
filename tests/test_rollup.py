@@ -630,3 +630,35 @@ def test_invalid_periodic_intervals_are_rejected(store, intervals):
     write(store, "gpu.0.core", 0, 55.0)
     with pytest.raises(ValueError):
         rollup_minutes(store, periodic_intervals_ms=intervals)
+
+
+def test_periodic_metric_outage_continues_after_its_raw_rows_are_gone(store):
+    """停止した collector の生データが全部消えても、以降の分を欠測として埋め続ける。"""
+    intervals = {"gpu.0.core": 2_500}
+    write(store, "gpu.0.core", 0, 55.0)
+    write(store, "air.room", 0, 26.0)
+    rollup_minutes(store, periodic_intervals_ms=intervals)
+    # 保持期間の削除で gpu.0.core の生データが無くなった状態
+    store.connection.execute("DELETE FROM readings WHERE metric = 'gpu.0.core'")
+    write(store, "air.room", 5 * MINUTE_MS, 26.0)
+
+    rollup_minutes(store, periodic_intervals_ms=intervals)
+
+    rows = store.connection.execute(
+        "SELECT bucket_ms, row_count, expected_count FROM readings_1m "
+        "WHERE metric = 'gpu.0.core' ORDER BY bucket_ms"
+    ).fetchall()
+    assert [tuple(row) for row in rows] == [(0, 1, 24)] + [
+        (minute * MINUTE_MS, 0, 24) for minute in range(1, 6)
+    ]
+
+
+def test_registered_metric_never_observed_is_not_filled(store):
+    """一度も観測していない登録メトリクスには期待値を作らない（設置前は欠測ではない）。"""
+    write(store, "air.room", 0, 26.0)
+    write(store, "air.room", 5 * MINUTE_MS, 26.0)
+    rollup_minutes(store, periodic_intervals_ms={"gpu.0.core": 2_500})
+    count = store.connection.execute(
+        "SELECT COUNT(*) FROM readings_1m WHERE metric = 'gpu.0.core'"
+    ).fetchone()[0]
+    assert count == 0

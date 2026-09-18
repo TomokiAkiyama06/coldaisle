@@ -114,7 +114,12 @@ def rollup_minutes(
     periodic = _periodic_expected_per_minute(periodic_intervals_ms or {})
 
     written = 0
-    for metric in store.metrics():
+    # 登録済みの周期メトリクスは、生データが1行も残っていなくても回す。
+    # 停止した collector の最後の生データが保持期間で消えると `store.metrics()`
+    # から外れ、以降の日に0行バケットが作られなくなるため。穴埋めの範囲は
+    # `_fill_absent_minutes()` が「1分ロールアップに現れて以降」へ限定する
+    metrics = sorted(set(store.metrics()) | periodic.keys())
+    for metric in metrics:
         # 期待サンプル数は**周期的に届くメトリクスにだけ**意味がある。
         # `sys.dropped_samples` は起きたときしか書かない（決定記録 0007 §2.4）ので、
         # 期待値を持たせると欠測率が無意味な値になる
