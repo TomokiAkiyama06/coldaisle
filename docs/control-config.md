@@ -78,7 +78,8 @@ v4からv5へは上記をすべて追加してから `schema_version: 5` へ上�
 起動前に拒否する。RLPolicyをactiveまたはshadowにする場合は期待する `rl_version` を必須とする。
 active RLの停止・期限切れ・schema不一致時はRulePolicyへfallbackし、RulePolicyも失敗した場合は
 Supervisor contextなしで既存Fallback Controllerを継続する。期限はworkerの壁時計でなく、
-control loopがoutputを受信したローカル単調時刻から `supervisor.valid_ms` で判定する。
+control loopがworkerへ渡した元snapshotのローカル単調時刻から `supervisor.valid_ms` で判定する
+（決定記録 0041。受信時刻もtraceに残す）。
 
 `gate_min_confidence` は `limited` / `expanded` / `full` ごとに持ち、高いauthority stageほど
 低いconfidenceで動かせないよう `limited <= expanded <= full` を検証する。ML→Fallbackの
