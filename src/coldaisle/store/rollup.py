@@ -27,7 +27,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from coldaisle import logs
 from coldaisle.channels import METRIC_TO_CHANNEL
-from coldaisle.clock import WallClock
+from coldaisle.clock import Clock, WallClock
 from coldaisle.store.csv_export import export_day
 from coldaisle.store.db import HOUR_MS, MINUTE_MS, SqliteStore, combine_minutes_sql
 from coldaisle.store.quality import QualityRules
@@ -81,7 +81,10 @@ class Result:
 
 
 def rollup_minutes(
-    store: SqliteStore, *, periodic_intervals_ms: Mapping[str, int] | None = None
+    store: SqliteStore,
+    *,
+    periodic_intervals_ms: Mapping[str, int] | None = None,
+    now_ms: int | None = None,
 ) -> int:
     """生データを1分バケットへ集計する（FR-202）。書いたバケット数を返す。
 
@@ -89,6 +92,13 @@ def rollup_minutes(
     その収集周期（Internal Telemetry など。#65）。ここに載ったメトリクスも
     期待サンプル数を持ち、1件も届かなかった分が0行のバケットとして残る。
     Store は上位の設定を読まない（レイヤは一方向）ので、周期は呼び出し側が渡す。
+
+    ``now_ms`` を渡すと、周期メトリクスの穴埋めを**ジョブの時計で最後に完了した分**まで
+    進める。生データの最新時刻を上限にすると、collector と ingest がともに止まった
+    区間が記録されないため。進行中の分は欠測に数えない。外付けデバイスの ``air.*``
+    には適用しない（決定記録 0008 §2.1.1「停止後にまで期待値を作らない」。デバイスの
+    撤去と通信断をロールアップからは区別できない）。周期メトリクスは設定で有効な
+    間だけ登録されるので、登録中の停止は欠測として扱ってよい。
 
     **未集計の範囲だけを見る。** 毎回すべてを数え直すと、保持期間ぶんの行を
     走査することになる。ただし前回の最終バケットは**必ず数え直す**。
@@ -101,17 +111,27 @@ def rollup_minutes(
     取り込みの書き込みロック待ちを短く保つ。
     """
     conn = store.connection
+    periodic = _periodic_expected_per_minute(periodic_intervals_ms or {})
+    # 最後に完了した分。進行中の分はまだ届く途中なので欠測に数えない
+    completed_bucket = (
+        _floor(now_ms, MINUTE_MS) - MINUTE_MS if now_ms is not None and periodic else None
+    )
     newest = conn.execute("SELECT MAX(ts_ms) FROM readings").fetchone()[0]
-    if newest is None:
-        return 0
     start = conn.execute("SELECT MAX(bucket_ms) FROM readings_1m").fetchone()[0]
-    if start is None:
+    if newest is None:
+        # 生データが全部消えても、観測済みの周期メトリクスの欠測は埋め続ける
+        if start is None or completed_bucket is None:
+            return 0
+        newest = -1
+    elif start is None:
         # 初回。エポックから数えると欠測の穴埋めが天文学的な件数になる
         oldest = conn.execute("SELECT MIN(ts_ms) FROM readings").fetchone()[0]
         start = _floor(int(oldest), MINUTE_MS)
     newest_bucket = _floor(int(newest), MINUTE_MS)
+    periodic_until = (
+        newest_bucket if completed_bucket is None else max(newest_bucket, completed_bucket)
+    )
     expected = _expected_per_minute(conn)
-    periodic = _periodic_expected_per_minute(periodic_intervals_ms or {})
 
     written = 0
     # 登録済みの周期メトリクスは、生データが1行も残っていなくても回す。
@@ -140,7 +160,8 @@ def rollup_minutes(
                 (metric, metric_expected, metric, start, newest),
             )
             written += int(cursor.rowcount)
-            written += _fill_absent_minutes(conn, metric, start, newest_bucket, metric_expected)
+            fill_until = periodic_until if metric in periodic else newest_bucket
+            written += _fill_absent_minutes(conn, metric, start, fill_until, metric_expected)
     return written
 
 
@@ -274,7 +295,7 @@ def run(
     periodic_intervals_ms: Mapping[str, int] | None = None,
 ) -> Result:
     """ロールアップ → 削除の順で実行する。"""
-    minutes = rollup_minutes(store, periodic_intervals_ms=periodic_intervals_ms)
+    minutes = rollup_minutes(store, periodic_intervals_ms=periodic_intervals_ms, now_ms=now_ms)
     hours = rollup_hours(store)
     deleted, cutoff = apply_retention(store, rules, now_ms=now_ms)
     trace_cutoff = max(0, now_ms - rules.control_trace_retention_ms)
@@ -308,6 +329,7 @@ def main(
     argv: Sequence[str] | None = None,
     *,
     periodic_intervals_ms: Mapping[str, int] | None = None,
+    clock: Clock | None = None,
 ) -> int:
     """ロールアップの CLI 本体。cron / systemd タイマーから1日1回呼ぶ想定。
 
@@ -329,13 +351,13 @@ def main(
 
     logs.configure(args.log_level)
     rules = RetentionRules.from_yaml(args.retention)
-    clock = WallClock()
+    used_clock: Clock = clock or WallClock()
     # 既定の `var/` は追跡されていない。デーモンと同じく、無ければ作る
     args.db.parent.mkdir(parents=True, exist_ok=True)
-    store = SqliteStore(args.db, rules=QualityRules.from_yaml(args.quality_rules), clock=clock)
+    store = SqliteStore(args.db, rules=QualityRules.from_yaml(args.quality_rules), clock=used_clock)
     try:
         result = run(
-            store, rules, now_ms=clock.now_ms(), periodic_intervals_ms=periodic_intervals_ms
+            store, rules, now_ms=used_clock.now_ms(), periodic_intervals_ms=periodic_intervals_ms
         )
         LOGGER.info(
             "ロールアップと削除を実行した",

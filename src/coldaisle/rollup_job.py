@@ -11,12 +11,13 @@ import argparse
 from collections.abc import Sequence
 from pathlib import Path
 
+from coldaisle.clock import Clock
 from coldaisle.internal_telemetry import InternalTelemetryConfig
 from coldaisle.store import rollup
 from coldaisle.telemetry_daemon import DEFAULT_CONFIG, periodic_metric_intervals
 
 
-def main(argv: Sequence[str] | None = None) -> int:
+def main(argv: Sequence[str] | None = None, *, clock: Clock | None = None) -> int:
     """``--internal-telemetry`` だけをここで読み、残りの引数は Store の CLI へ渡す。"""
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument("--internal-telemetry", type=Path, default=DEFAULT_CONFIG)
@@ -24,7 +25,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     intervals = periodic_metric_intervals(
         InternalTelemetryConfig.from_yaml(known.internal_telemetry)
     )
-    return rollup.main(rest, periodic_intervals_ms=intervals)
+    return rollup.main(rest, periodic_intervals_ms=intervals, clock=clock)
 
 
 if __name__ == "__main__":  # pragma: no cover

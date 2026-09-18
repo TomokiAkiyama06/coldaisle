@@ -662,3 +662,57 @@ def test_registered_metric_never_observed_is_not_filled(store):
         "SELECT COUNT(*) FROM readings_1m WHERE metric = 'gpu.0.core'"
     ).fetchone()[0]
     assert count == 0
+
+
+def _minute_rows(store, metric: str) -> list[tuple]:
+    return [
+        tuple(row)
+        for row in store.connection.execute(
+            "SELECT bucket_ms, row_count, expected_count FROM readings_1m "
+            "WHERE metric = ? ORDER BY bucket_ms",
+            (metric,),
+        )
+    ]
+
+
+def test_periodic_outage_is_filled_up_to_the_last_completed_minute(store):
+    """collector と ingest がともに止まっても、ジョブの時計で完了した分まで欠測を残す。"""
+    from coldaisle.store import DeviceRecord
+
+    store.record_hello(DeviceRecord(device_id="dev", interval_ms=2_500), [], at_ms=0)
+    intervals = {"gpu.0.core": 2_500}
+    write(store, "gpu.0.core", 0, 55.0)
+    write(store, "air.room", 0, 26.0)
+
+    rollup_minutes(store, periodic_intervals_ms=intervals, now_ms=10 * MINUTE_MS + 30_000)
+
+    # 10分目は進行中なので欠測に数えない
+    assert _minute_rows(store, "gpu.0.core") == [(0, 1, 24)] + [
+        (minute * MINUTE_MS, 0, 24) for minute in range(1, 10)
+    ]
+    # air.* は決定記録 0008 §2.1.1 のとおり、最新の生データの分までしか埋めない
+    assert _minute_rows(store, "air.room") == [(0, 1, 24)]
+
+
+def test_periodic_outage_is_filled_after_every_raw_row_is_gone(store):
+    """生データが1行も無くなっても、観測済みの周期メトリクスは完了した分まで埋める。"""
+    intervals = {"gpu.0.core": 2_500}
+    write(store, "gpu.0.core", 0, 55.0)
+    rollup_minutes(store, periodic_intervals_ms=intervals, now_ms=MINUTE_MS)
+    store.connection.execute("DELETE FROM readings")
+
+    rollup_minutes(store, periodic_intervals_ms=intervals, now_ms=4 * MINUTE_MS)
+
+    assert _minute_rows(store, "gpu.0.core") == [(0, 1, 24)] + [
+        (minute * MINUTE_MS, 0, 24) for minute in range(1, 4)
+    ]
+
+
+def test_without_a_clock_the_fill_stops_at_the_newest_raw_row(store):
+    """時刻を渡さない呼び出しは従来どおり、最新の生データの分までを上限にする。"""
+    intervals = {"gpu.0.core": 2_500}
+    write(store, "gpu.0.core", 0, 55.0)
+
+    rollup_minutes(store, periodic_intervals_ms=intervals)
+
+    assert _minute_rows(store, "gpu.0.core") == [(0, 1, 24)]

@@ -171,7 +171,9 @@ def test_rollup_entry_point_registers_internal_metrics(tmp_path: Path, rules):
             f"--retention={retention}",
             f"--quality-rules={CONFIG_DIR / 'quality.yaml'}",
             f"--internal-telemetry={telemetry}",
-        ]
+        ],
+        # ジョブの時計で6分目の途中。完了した5分目までを欠測として埋める
+        clock=SimulatedClock(6 * 60_000 + 10_000),
     )
 
     assert code == 0
@@ -179,7 +181,7 @@ def test_rollup_entry_point_registers_internal_metrics(tmp_path: Path, rules):
         expected = store.connection.execute(
             "SELECT expected_count FROM readings_1m WHERE metric = 'gpu.0.core'"
         ).fetchall()
-    assert [row[0] for row in expected] == [12, 12, 12, 12]
+    assert [row[0] for row in expected] == [12] * 6
 
 
 @dataclass
