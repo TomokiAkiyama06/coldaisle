@@ -4,6 +4,7 @@
 - **Status**: FINAL（2026-09-18、リポジトリ所有者が承認）
 - **Date**: 2026-09-18
 - **Supersedes**: [`0009-read-api.md`](0009-read-api.md) §5 未決事項1 のみ（0009 の他の節は有効）
+- **Superseded by**: [0042](0042-server-health-signal-rules.md)（§2.4 のうち判定対象の metric・quality の扱い・source 状態の導出のみ。他の節は有効）
 - **関連**: [`0009-read-api.md`](0009-read-api.md) §2.9 / §2.12 /
   [`0032-internal-telemetry-metric-names.md`](0032-internal-telemetry-metric-names.md) /
   [`0006-gpu-mode-and-mixed-state.md`](0006-gpu-mode-and-mixed-state.md) /

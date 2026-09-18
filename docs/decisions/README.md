@@ -107,3 +107,4 @@ docs/decisions/NNNN-<slug>.md      例: 0002-metric-naming.md
 | [0038](0038-internal-telemetry-outage-counting.md) | Internal Telemetry の欠測の数え方（有効な間の停止は欠測、無効期間は数えない） | FINAL |
 | [0040](0040-server-health-api.md) | Server Health API の契約（`/server-health` への一本化、signal 規則、機種が公開しない metric の扱い） | FINAL |
 | [0041](0041-supervisor-proposal-freshness.md) | 非同期 RL Supervisor 提案の有効性（期限の起点と Regime の一致） | FINAL |
+| [0042](0042-server-health-signal-rules.md) | Server Health の signal 判定規則の詳細（パネルは表示専用、監視対象と quality・source 状態の導出、アラート全件、1スナップショット） | FINAL |
