@@ -113,12 +113,16 @@ function renderDerived(latest) {
  * カードは WebSocket（1秒ごと）で `stale` になるが、health の問い合わせは5秒ごと。
  * health だけで赤帯を決めると、最大5秒「赤いカードがあるのに文言が無い」画面になる
  * （決定記録 0039 §2.3 は、stale の文言を赤帯に任せている）。
- * `stale` の判定は API 側で health と同じ（`_is_stale`）なので、新しいほうを使えばよい。
+ *
+ * **判定はサーバの `latest.stale` だけを使う。** 各メトリクスの品質を自分で見ると、
+ * 事象メトリクス（`sys.dropped_samples` など。起きたときにしか書かれない）の
+ * `stale` まで拾い、**一度でも取りこぼしがあれば赤帯が消えなくなる。**
+ * `latest.stale` は health と同じ規則（`_is_stale`。周期メトリクスだけを見る）で、
+ * カードに出す `air.*` はすべて周期メトリクスなので、stale のカードがあれば必ず立つ。
  */
 function staleFromLatest(latest) {
-  const stale = latest.stale || Object.values(latest.metrics).some((item) => item.quality === "stale");
-  if (!stale) return { stale: false, seconds: null };
-  // 経過秒は温湿度の中でいちばん新しいもの。事象メトリクス（sys.*）は起きたときにしか書かれない
+  if (!latest.stale) return { stale: false, seconds: null };
+  // 経過秒も周期メトリクス（カードの air.*）から。事象メトリクスの経過は受信の古さではない
   const ages = Object.entries(latest.metrics)
     .filter(([metric]) => isCardMetric(metric))
     .map(([, item]) => item.age_seconds)

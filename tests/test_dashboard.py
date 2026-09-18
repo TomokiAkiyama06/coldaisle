@@ -388,7 +388,7 @@ def test_the_banner_follows_stale_cards_from_the_stream():
     banner = banner[: banner.index("\n}\n")]
     assert "staleFromLatest(lastLatest)" in banner
     helper = script[script.index("function staleFromLatest(") :]
-    assert 'item.quality === "stale"' in helper[: helper.index("\n}\n")]
+    assert "latest.stale" in helper[: helper.index("\n}\n")]
 
 
 def test_a_late_catalog_rerenders_every_labelled_part():
@@ -542,3 +542,43 @@ def test_sibling_requests_are_aborted_once_the_group_settles():
     assert "if (timedOut)" in failure, "決着後の abort を打ち切りと取り違えない"
     assert "controller.signal.aborted" not in failure
     assert "throw error;" in failure, "元の失敗をそのまま投げ直す"
+
+
+def test_event_metrics_do_not_keep_the_banner_up():
+    """事象メトリクスの `stale` で赤帯を出さない（health と同じ規則。決定記録 0009 §2.12）。
+
+    `sys.dropped_samples` などは起きたときにしか書かれない。各メトリクスの品質を
+    画面側で見ると、**一度でも取りこぼしがあれば赤帯が消えなくなる。**
+    判定はサーバの `latest.stale`（周期メトリクスだけを見る）に任せる。
+    """
+    script = SCRIPT.read_text(encoding="utf-8")
+    helper = _body(script, "function staleFromLatest(")
+    assert "if (!latest.stale) return" in helper
+    assert "item.quality" not in helper, "各メトリクスの品質から古さを判定しない"
+    assert "isCardMetric(metric)" in helper, "経過秒も周期メトリクス（カードの air.*）から"
+
+
+def test_the_server_stale_flag_ignores_event_metrics(tmp_path, rules):
+    """画面が頼る `latest.stale` は、事象メトリクスだけが古いときに立たない。"""
+    path = tmp_path / "events.db"
+    with SqliteStore(path, rules=rules, clock=SimulatedClock(NOW_MS)) as store:
+        store.insert_sample(
+            Sample(
+                ts_ms=NOW_MS - 600_000,
+                readings=(Reading(metric="sys.dropped_samples", value=1, quality=Quality.OK),),
+            )
+        )
+        store.insert_sample(
+            Sample(
+                ts_ms=NOW_MS,
+                readings=(Reading(metric="air.room", value=26.0, quality=Quality.OK),),
+            )
+        )
+    app = create_app(
+        Config(db=path, quality_rules=QUALITY_RULES_PATH, metrics=METRICS_PATH),
+        clock=SimulatedClock(NOW_MS),
+    )
+    with TestClient(app) as opened:
+        latest = opened.get("/api/v1/latest").json()
+    assert latest["metrics"]["sys.dropped_samples"]["quality"] == "stale"
+    assert latest["stale"] is False
