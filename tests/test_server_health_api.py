@@ -203,10 +203,11 @@ def test_missing_optional_gpu_values_keep_stable_keys_without_nvidia_smi(tmp_pat
     _populate(
         path,
         rules,
+        # 機種が公開しない hotspot / mem（missing_tolerated）は一度も保存されていない
         internal_values={
-            "gpu.0.core": 54.0,
-            "power.gpu.0": 180.0,
-            "cpu.package": 49.0,
+            name: value
+            for name, value in INTERNAL_VALUES.items()
+            if name not in {"gpu.0.hotspot", "gpu.0.mem"}
         },
     )
     with TestClient(_app(path, SimulatedClock(NOW_MS))) as client:
@@ -305,8 +306,7 @@ def test_lm_sensors_liveness_accepts_any_fresh_configurable_hwmon_metric(tmp_pat
         path,
         rules,
         internal_values={
-            "gpu.0.core": 54.0,
-            "power.gpu.0": 180.0,
+            **{name: INTERNAL_VALUES[name] for name in NVML_METRICS},
             "board.connector_12v2x6": 42.0,
         },
     )
@@ -329,8 +329,7 @@ def test_lm_sensors_uses_the_actual_internal_telemetry_config(tmp_path, rules):
         path,
         rules,
         internal_values={
-            "gpu.0.core": 54.0,
-            "power.gpu.0": 180.0,
+            **{name: INTERNAL_VALUES[name] for name in NVML_METRICS},
             "board.connector_12v2x6": 42.0,
         },
     )
@@ -824,3 +823,128 @@ def test_panel_metric_with_disabled_input_is_display_only(tmp_path, rules, enabl
 
     assert body["environment"]["metrics"]["board.chipset"]["quality"] == "stale"
     assert body["signal"] == expected
+
+
+# --- signal の真理値表（docs/api-contract.md §3 / 決定記録 0040 §2.4〜§2.6）---
+#
+# 各 metric の状態: ok / suspect / missing（missing として保存）/ stale（古い行だけ）/
+# absent（一度も保存されていない）。suspect は「値は届いている」、stale / missing /
+# absent は「届いていない」。
+STATES = ("ok", "suspect", "missing", "stale", "absent")
+TABLE_HWMON = ("cpu.package", "cpu.vrm")
+_ALL_TABLE_METRICS = {**SENSOR_VALUES, **INTERNAL_VALUES, "board.chipset": 44.0}
+
+
+def _table_db(path: Path, rules, states: dict[str, str], *, nvml_state: str | None = "ok"):
+    """``states`` 以外の metric は現在時刻に ok で届いている DB を作る。"""
+    old = NOW_MS - 60_000  # stale の閾値より十分古い
+    with SqliteStore(path, rules=rules, clock=SimulatedClock(NOW_MS)) as store:
+        store.insert_sample(
+            Sample(
+                ts_ms=old,
+                readings=tuple(
+                    Reading(metric=name, value=value, quality=Quality.OK)
+                    for name, value in _ALL_TABLE_METRICS.items()
+                    if states.get(name) != "absent"
+                ),
+            )
+        )
+        current = []
+        for name, value in _ALL_TABLE_METRICS.items():
+            state = states.get(name, "ok")
+            if name == "board.chipset" and name not in states:
+                continue  # 入力が無効な panel metric。古い行だけが残る
+            if state in {"stale", "absent"}:
+                continue
+            if state == "missing":
+                current.append(Reading(metric=name, value=None, quality=Quality.MISSING))
+            else:
+                current.append(Reading(metric=name, value=value, quality=Quality(state)))
+        store.insert_sample(Sample(ts_ms=NOW_MS, readings=tuple(current)))
+        store.set_system_state("sys.ingest_source", "serial", at_ms=NOW_MS)
+        if nvml_state is not None:
+            store.set_system_state(SOURCE_STATE_PREFIX + "nvml", nvml_state, at_ms=NOW_MS)
+        store.set_system_state(SOURCE_STATE_PREFIX + "hwmon", "ok", at_ms=NOW_MS)
+
+
+# (metric 群, その区分, 状態ごとの期待 signal: ok, suspect, missing, stale, absent)
+TRUTH_TABLE = [
+    # 監視必須（sensor_unit）の1本だけ: 一部欠ければ source degraded
+    (("air.room",), "required-one", ("green", "yellow", "yellow", "yellow", "yellow")),
+    # 監視必須のすべて: 値が1本も届かなければ unavailable / red。suspect は届いている
+    (tuple(SENSOR_VALUES), "required-all", ("green", "yellow", "red", "red", "red")),
+    # NVML の監視必須（core / power）
+    (("gpu.0.core",), "nvml-required-one", ("green", "yellow", "yellow", "yellow", "yellow")),
+    (("gpu.0.core", "power.gpu.0"), "nvml-required-all", ("green", "yellow", "red", "red", "red")),
+    # 有効な入力だが必須ではない（NVML の utilization）
+    (("gpu.0.utilization",), "enabled-optional", ("green", "yellow", "yellow", "yellow", "yellow")),
+    # 機種が公開しない値（missing_tolerated）: missing / 未保存だけは下げない
+    (("gpu.0.hotspot",), "tolerated", ("green", "yellow", "green", "yellow", "green")),
+    # 有効な hwmon 入力の1本: lm_sensors はいずれか1本届けば ok、metric 単位で yellow
+    (("cpu.vrm",), "hwmon-one", ("green", "yellow", "yellow", "yellow", "yellow")),
+    # 有効な hwmon 入力のすべて: 1本も届かなければ lm_sensors unavailable / red
+    (TABLE_HWMON, "hwmon-all", ("green", "yellow", "red", "red", "red")),
+    # 入力が無効な panel metric: 表示専用で signal に影響しない
+    (("board.chipset",), "panel-disabled", ("green", "green", "green", "green", "green")),
+    # 事象メトリクスは鮮度判定から外す（0009 §2.12）。監視対象でもない
+    (("sys.dropped_samples",), "event", ("green", "green", "green", "green", "green")),
+]
+
+
+@pytest.mark.parametrize(
+    ("metrics", "state", "expected"),
+    [
+        pytest.param(metrics, state, expected[index], id=f"{kind}-{state}")
+        for metrics, kind, expected in TRUTH_TABLE
+        for index, state in enumerate(STATES)
+    ],
+)
+def test_signal_truth_table(tmp_path, rules, metrics, state, expected):
+    path = tmp_path / "truth-table.db"
+    if metrics == ("sys.dropped_samples",):
+        _table_db(path, rules, {})
+        if state != "absent":
+            with SqliteStore(path, rules=rules, clock=SimulatedClock(NOW_MS)) as store:
+                ts = NOW_MS - 60_000 if state == "stale" else NOW_MS
+                quality = Quality.OK if state == "stale" else Quality(state)
+                value = None if quality is Quality.MISSING else 1.0
+                store.insert_sample(
+                    Sample(
+                        ts_ms=ts,
+                        readings=(
+                            Reading(metric="sys.dropped_samples", value=value, quality=quality),
+                        ),
+                    )
+                )
+    else:
+        _table_db(path, rules, dict.fromkeys(metrics, state))
+    with TestClient(_app(path, SimulatedClock(NOW_MS), hwmon_metrics=TABLE_HWMON)) as client:
+        body = client.get("/api/v1/server-health").json()
+
+    assert body["signal"] == expected
+    assert body["compute_mode_advisory"]["safe"] is (expected == "green")
+
+
+@pytest.mark.parametrize(
+    ("reported", "expected_status", "expected_signal"),
+    [
+        ("ok", "ok", "green"),
+        ("degraded", "degraded", "yellow"),
+        ("unavailable", "unavailable", "red"),
+        ("disabled", "disabled", "red"),
+        ("stopped", "stopped", "red"),
+        ("not-a-status", "unavailable", "red"),
+        (None, "stopped", "red"),  # collector の状態が一度も記録されていない
+    ],
+)
+def test_reported_source_state_truth_table(
+    tmp_path, rules, reported, expected_status, expected_signal
+):
+    """collector が報告した source 状態は、metric が揃っていても優先する。"""
+    path = tmp_path / "reported-state.db"
+    _table_db(path, rules, {}, nvml_state=reported)
+    with TestClient(_app(path, SimulatedClock(NOW_MS), hwmon_metrics=TABLE_HWMON)) as client:
+        body = client.get("/api/v1/server-health").json()
+
+    assert body["sources"]["nvml"]["status"] == expected_status
+    assert body["signal"] == expected_signal

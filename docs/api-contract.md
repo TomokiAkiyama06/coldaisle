@@ -112,20 +112,24 @@ Compute Mode の判断は AI へ渡しません。生成はバックグラウン
 | 値 | 条件 |
 |---|---|
 | `green` | sensor_unit / nvml / lm_sensors がすべて `ok`、発生中アラート無し、監視対象の周期メトリクスがすべて `quality=ok`（`missing_tolerated` の `missing` は除く） |
-| `yellow` | 情報源が `degraded`、critical 以外のアラートが発生中、または周期メトリクスの一部が `suspect` / `missing` / `stale` |
+| `yellow` | 情報源が `degraded`、critical 以外のアラートが発生中、または監視対象の周期メトリクスの一部が `suspect` / `missing` / `stale` / 未保存 |
 | `red` | 情報源が `unavailable` / `disabled` / `stopped`、critical アラートが発生中、または監視必須データが取得不能 |
 
 **データが古い場合に `green` を返してはいけません。**
 無音で古い値を表示するのが、監視システムの最悪の失敗です。
-監視必須メトリクスが**すべて** `stale` または欠測のときは情報源が `unavailable` と
-なり、`red` を返します。一部だけなら `degraded` / `yellow` であり、green にはしません。
+監視必須メトリクスが**すべて** `stale` または欠測（`missing`、または一度も保存されて
+いない）のときは情報源が `unavailable` となり、`red` を返します。一部だけなら
+`degraded` / `yellow` であり、green にはしません。`suspect` は値が届いているため、
+すべてが `suspect` でも `degraded` / `yellow` です（`red` にはしません）。
+lm_sensors は有効な hwmon 入力の**いずれか1本**が届いていれば `ok` で、届かない
+入力は metric 単位の規則で `yellow` になります（決定記録 0040 §5 未決1）。
 発生時だけ記録する `sys.dropped_samples` 等はこの鮮度判定から
 外します（決定記録 0009 §2.12）。AI 停止は監視の停止ではないため signal 判定から
 外します。
 
 `config/server-health.yaml` の `missing_tolerated` に挙げた metric（GPU / driver が
 公開しない `gpu.0.hotspot` / `gpu.0.mem` など）は、`missing` だけを signal 判定から
-外します。`suspect` / `stale` は外しません。監視必須 metric と監視対象の一覧も同じ
+外します（一度も保存されていない場合も同じ）。`suspect` / `stale` は外しません。監視必須 metric と監視対象の一覧も同じ
 ファイルにあります（決定記録 0040）。
 
 signal が見る周期メトリクスは**現在の監視対象**に限ります。`config/server-health.yaml`

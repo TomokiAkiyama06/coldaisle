@@ -35,6 +35,8 @@ from coldaisle.store.models import AlertRecord, LatestReading
 
 LOGGER = logging.getLogger("coldaisle.api.server_health")
 
+_CURRENT_QUALITIES = frozenset({Quality.OK, Quality.SUSPECT})
+"""いま値が届いている quality。stale / missing / 未保存は届いていない。"""
 _BAD_SOURCE_STATES = {
     HealthSourceStatus.UNAVAILABLE,
     HealthSourceStatus.DISABLED,
@@ -133,7 +135,7 @@ def build_server_health(
     # 監視していない metric で signal を下げないよう、必須 metric と現在有効な入力だけを
     # 見る。パネルは表示専用で、入力が無効なら値が古くても signal に影響させない
     monitored = settings.required_metrics() | frozenset((*hwmon_metrics, *nvml_metrics))
-    signal = _signal(sources, readings, alerts, settings.missing_tolerated, monitored)
+    signal = _signal(sources, readings, alerts, settings.missing_tolerated, sorted(monitored))
     gpu = ServerGpuHealth(
         mode=store.current_state("sys.gpu_mode") or "unknown",
         metrics=_metrics(settings.panels.gpu, readings, catalog),
@@ -259,12 +261,16 @@ def _source_from_metrics(
         status = HealthSourceStatus.STOPPED
     elif reported in _BAD_SOURCE_STATES:
         status = reported
+    elif not required:
+        # 有効な入力が1つも無い source には、取得不能になりうる必須データが無い
+        status = reported
     else:
-        available = sum(
-            metric in readings and readings[metric].quality is Quality.OK for metric in required
-        )
-        partial_required = require_all and available != len(required)
-        if available == 0:
+        qualities = [_current_quality(readings, metric) for metric in required]
+        # suspect は「値は届いているが疑わしい」。取得できている以上、情報源の停止
+        # （unavailable / red）ではなく劣化（degraded / yellow）として扱う
+        current = sum(quality in _CURRENT_QUALITIES for quality in qualities)
+        partial_required = require_all and any(quality is not Quality.OK for quality in qualities)
+        if current == 0:
             status = HealthSourceStatus.UNAVAILABLE
             detail = f"{detail}; no fresh {metric_role} telemetry"
         elif partial_required or reported is HealthSourceStatus.DEGRADED:
@@ -307,7 +313,7 @@ def _signal(
     readings: Mapping[str, LatestReading],
     alerts: list[AlertRecord],
     missing_tolerated: frozenset[str],
-    monitored: frozenset[str],
+    monitored: list[str],
 ) -> ServerSignal:
     monitoring = (sources.sensor_unit, sources.nvml, sources.lm_sensors)
     if any(source.status in _BAD_SOURCE_STATES for source in monitoring):
@@ -317,26 +323,29 @@ def _signal(
     if any(source.status is HealthSourceStatus.DEGRADED for source in monitoring):
         return ServerSignal.YELLOW
     if alerts or any(
-        _degrades_signal(metric, reading, missing_tolerated)
-        for metric, reading in readings.items()
-        if metric in monitored
+        _degrades_signal(metric, _current_quality(readings, metric), missing_tolerated)
+        for metric in monitored
     ):
         return ServerSignal.YELLOW
     return ServerSignal.GREEN
 
 
-def _degrades_signal(
-    metric: str, reading: LatestReading, missing_tolerated: frozenset[str]
-) -> bool:
+def _current_quality(readings: Mapping[str, LatestReading], metric: str) -> Quality:
+    """一度も保存されていない監視対象は、保存済みの missing と同じに扱う。"""
+    reading = readings.get(metric)
+    return Quality.MISSING if reading is None else reading.quality
+
+
+def _degrades_signal(metric: str, quality: Quality, missing_tolerated: frozenset[str]) -> bool:
     if metric in EVENT_METRICS:
         # 発生時だけ記録する metric は鮮度で判定しない（決定記録 0009 §2.12）
         return False
-    if metric in missing_tolerated and reading.quality is Quality.MISSING:
+    if metric in missing_tolerated and quality is Quality.MISSING:
         # 機種が公開しない値は collector が毎回 missing で保存する。これで yellow に
         # すると signal が恒常的に下がり、本当の劣化と区別できなくなる。
         # suspect / stale は「値はあるが疑わしい・古い」なので従来どおり下げる
         return False
-    return reading.quality is not Quality.OK
+    return quality is not Quality.OK
 
 
 def _compute_mode_advisory(
