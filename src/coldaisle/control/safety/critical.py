@@ -51,6 +51,8 @@ from coldaisle.metrics import MetricCatalog
 from coldaisle.store.models import Quality, validate_metric
 
 CPU_TEMPERATURE_METRIC = "cpu.package"
+# 決定記録 0032（FINAL）の CPU Package power。0028 §2.4 の cpu_cooling_floor の Power 項。
+CPU_POWER_METRIC = "power.cpu.package"
 GPU_TEMPERATURE_METRIC = "gpu.0.core"
 AIR_TELEMETRY_GROUP = "air_telemetry"
 AIR_TEMPERATURE_METRICS: frozenset[str] = frozenset(
@@ -502,6 +504,7 @@ class CriticalSafety:
             )
         expected_stale_ms = {
             CPU_TEMPERATURE_METRIC: config.telemetry.cpu_ms.value,
+            CPU_POWER_METRIC: config.telemetry.cpu_power_ms.value,
             GPU_TEMPERATURE_METRIC: config.telemetry.gpu_ms.value,
             **{metric: config.telemetry.air_ms.value for metric in AIR_TEMPERATURE_METRICS},
         }
@@ -528,6 +531,15 @@ class CriticalSafety:
         )
         if invalid_air:
             raise ValueError(f"air telemetry contract が不正: {invalid_air}")
+        # 0029 §2.2: CPU Power の欠測は Degraded。Critical にすると欠測で Top を Max にし、
+        # 契約から外すと Power 項が黙って消えるため、有効な DEGRADED signal に固定する。
+        power_spec = specs.get(CPU_POWER_METRIC)
+        if (
+            power_spec is None
+            or not power_spec.enabled
+            or power_spec.importance is not TelemetryImportance.DEGRADED
+        ):
+            raise ValueError(f"{CPU_POWER_METRIC} は有効な DEGRADED signal として契約に含める")
         if len(contract.critical_groups) != 1:
             raise ValueError("air_telemetry Critical group は承認済み5 signal全体に固定する")
         group = contract.critical_groups[0]
@@ -908,12 +920,36 @@ class CriticalSafety:
     ) -> PerZone[SafetyZoneOutput]:
         floors = {zone: self._config.zone_min_demand.get(zone).value for zone in Zone}
         floor_codes = {zone: "minimum_safe_demand" for zone in Zone}
+        floor_details = {zone: "" for zone in Zone}
+        # 0028 §2.4: top の safety_floor =
+        #   max(最低安全 demand, cpu_cooling_floor(CPU 温度, CPU Power))。
+        # 温度と Power の各曲線の大きい方を取る。Power が使えないときは 0029 §2.2 / §2.3 の
+        # Degraded として Power 項だけを外し、温度で続ける（safety state も floor も上げない）。
+        cpu_floor: float | None = None
         cpu = snapshot.signals_by_metric.get(CPU_TEMPERATURE_METRIC)
         if cpu is not None and cpu.available and cpu.value is not None:
-            cpu_floor = _interpolate_cpu_floor(self._config, cpu.value)
-            if cpu_floor > floors[Zone.TOP]:
-                floors[Zone.TOP] = cpu_floor
-                floor_codes[Zone.TOP] = "cpu_cooling_floor"
+            cpu_floor = _interpolate_floor(
+                tuple(
+                    (point.temperature_c.value, point.demand.value)
+                    for point in self._config.cpu_cooling_floor
+                ),
+                cpu.value,
+            )
+        power = snapshot.signals_by_metric.get(CPU_POWER_METRIC)
+        if power is not None and power.available and power.value is not None:
+            power_floor = _interpolate_floor(
+                tuple(
+                    (point.power_w.value, point.demand.value)
+                    for point in self._config.cpu_power_cooling_floor
+                ),
+                power.value,
+            )
+            cpu_floor = power_floor if cpu_floor is None else max(cpu_floor, power_floor)
+        else:
+            floor_details[Zone.TOP] = "cpu_power_unavailable: power term omitted"
+        if cpu_floor is not None and cpu_floor > floors[Zone.TOP]:
+            floors[Zone.TOP] = cpu_floor
+            floor_codes[Zone.TOP] = "cpu_cooling_floor"
 
         forced_by_fault: dict[Zone, Fault] = {}
         for fault in faults:
@@ -953,7 +989,7 @@ class CriticalSafety:
                     detail=f"{forced_fault.code.value}:{zone.value}",
                 )
             else:
-                reason = Reason(code=floor_codes[zone])
+                reason = Reason(code=floor_codes[zone], detail=floor_details[zone])
             return SafetyZoneOutput(floor=floors[zone], forced_max=forced_max, reason=reason)
 
         return PerZone(
@@ -1221,18 +1257,16 @@ def _signal_available(snapshot: ControlStateSnapshot, metric: str) -> bool:
     return signal is not None and signal.available
 
 
-def _interpolate_cpu_floor(config: SafetyConfig, temperature_c: float) -> float:
-    points = config.cpu_cooling_floor
-    if temperature_c <= points[0].temperature_c.value:
-        return points[0].demand.value
-    if temperature_c >= points[-1].temperature_c.value:
-        return points[-1].demand.value
-    for lower, upper in pairwise(points):
-        if temperature_c <= upper.temperature_c.value:
-            fraction = (temperature_c - lower.temperature_c.value) / (
-                upper.temperature_c.value - lower.temperature_c.value
-            )
-            return lower.demand.value + fraction * (upper.demand.value - lower.demand.value)
+def _interpolate_floor(points: tuple[tuple[float, float], ...], x: float) -> float:
+    """検証済みの単調増加の曲線を線形補間する。曲線の外側は端点で飽和する。"""
+    if x <= points[0][0]:
+        return points[0][1]
+    if x >= points[-1][0]:
+        return points[-1][1]
+    for (lower_x, lower_demand), (upper_x, upper_demand) in pairwise(points):
+        if x <= upper_x:
+            fraction = (x - lower_x) / (upper_x - lower_x)
+            return lower_demand + fraction * (upper_demand - lower_demand)
     raise AssertionError("検証済み CPU cooling floor の補間範囲に到達できなかった")
 
 

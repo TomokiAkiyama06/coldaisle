@@ -176,6 +176,11 @@ class TemperatureDemandPoint(_ConfigModel):
     demand: SafetyDemand
 
 
+class PowerDemandPoint(_ConfigModel):
+    power_w: SafetyFloat
+    demand: SafetyDemand
+
+
 class TSensorTelemetry(_ConfigModel):
     """未設置を明示できる温度計モジュールの安全設定。"""
 
@@ -195,6 +200,7 @@ class TSensorTelemetry(_ConfigModel):
 
 class TelemetryDelays(_ConfigModel):
     cpu_ms: SafetyMilliseconds
+    cpu_power_ms: SafetyMilliseconds
     gpu_ms: SafetyMilliseconds
     t_sensor: TSensorTelemetry
     air_ms: SafetyMilliseconds
@@ -218,6 +224,12 @@ class SafetyConfig(_ConfigModel):
         BeforeValidator(_yaml_sequence_to_tuple),
         Field(min_length=2),
     ]
+    cpu_power_cooling_floor: Annotated[
+        tuple[PowerDemandPoint, ...],
+        BeforeValidator(_yaml_sequence_to_tuple),
+        Field(min_length=2),
+    ]
+    """CPU Power から Top の floor を決める曲線（0028 §2.4 の cpu_cooling_floor の Power 項）。"""
     fault_demand: SafetyDemand
     stall_check_min_demand: PerZone[SafetyDemand]
     stall_min_rpm: PerZone[SafetyRpm]
@@ -259,6 +271,15 @@ class SafetyConfig(_ConfigModel):
                 raise ValueError("cpu_cooling_floor の demand は下げない")
             previous_temperature = point.temperature_c.value
             previous_demand = point.demand.value
+        previous_power: float | None = None
+        previous_demand = None
+        for power_point in self.cpu_power_cooling_floor:
+            if previous_power is not None and power_point.power_w.value <= previous_power:
+                raise ValueError("cpu_power_cooling_floor の Power は単調増加にする")
+            if previous_demand is not None and power_point.demand.value < previous_demand:
+                raise ValueError("cpu_power_cooling_floor の demand は下げない")
+            previous_power = power_point.power_w.value
+            previous_demand = power_point.demand.value
         return self
 
 
@@ -509,7 +530,10 @@ class ControlConfig(_ConfigModel):
         for index, point in enumerate(safety.cpu_cooling_floor):
             append("safety.yaml", f"cpu_cooling_floor[{index}].temperature_c", point.temperature_c)
             append("safety.yaml", f"cpu_cooling_floor[{index}].demand", point.demand)
-        for name in ("cpu_ms", "gpu_ms", "air_ms", "air_sensor_period_ms"):
+        for index, power_point in enumerate(safety.cpu_power_cooling_floor):
+            append("safety.yaml", f"cpu_power_cooling_floor[{index}].power_w", power_point.power_w)
+            append("safety.yaml", f"cpu_power_cooling_floor[{index}].demand", power_point.demand)
+        for name in ("cpu_ms", "cpu_power_ms", "gpu_ms", "air_ms", "air_sensor_period_ms"):
             append("safety.yaml", f"telemetry.{name}", getattr(safety.telemetry, name))
         append("safety.yaml", "telemetry.t_sensor.enabled", safety.telemetry.t_sensor.enabled)
         if safety.telemetry.t_sensor.stale_after_ms is not None:

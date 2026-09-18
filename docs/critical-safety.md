@@ -11,7 +11,7 @@ optimizer、Supervisor はいずれにも依存しない。
 Safety の数値にコード上の既定値はない。必須項目を追加した Safety Config は
 schema version 2 とし、v1 は安全値を補完せず明示的に拒否する。
 `absolute_temp_ceiling_c`、
-zone floor、CPU cooling curve、stall の demand / RPM / window、連続書き込み失敗数、
+zone floor、CPU cooling curve（温度と CPU Power の2本）、stall の demand / RPM / window、連続書き込み失敗数、
 fault demand、復帰 hold、overrun 数、ramp-down はすべて `SafetyConfig` から受け取る。
 `provisional` の値も保守側の制約として適用するが、判定の
 `config_is_provisional` を true にし、確定値と混同しない。実運用値の設定ファイルは
@@ -46,6 +46,14 @@ Safety 自身が再検証し、矛盾した snapshot を NORMAL として受理�
 由来の age が contract の期限を超える、future である、または申告 age と一致しない signal は
 拒否する。各 signal の stale limit も同じ `SafetyConfig.telemetry` の検証済み値との一致を要求し、
 別経路の緩い閾値を使わせない。
+Top の safety floor は 0028 §2.4 の
+`max(最低安全 demand, cpu_cooling_floor(CPU 温度, CPU Power))` とし、温度の曲線
+（`cpu_cooling_floor`）と Power の曲線（`cpu_power_cooling_floor`）をそれぞれ線形補間して
+大きい方を取る。Power は決定記録 0032（FINAL）の `power.cpu.package` を、
+`telemetry.cpu_power_ms` を stale limit とする DEGRADED signal として契約に必須にする。
+Power が使えない（`ok` 以外）ときは 0029 §2.2 / §2.3 の Degraded として、fault にも
+`fault_demand` にもせず、safety state も変えずに Power 項だけを外して温度の曲線で続け、
+Top の理由に `cpu_power_unavailable` を残す。
 現行機は単一 GPU のため、Critical な GPU freshness と絶対温度上限は
 `gpu.0.core` / `gpu.0.hotspot` / `gpu.0.mem` に限定する。複数 GPU 対応は
 Collector / State Estimator と同時に contract を更新してから有効にする。

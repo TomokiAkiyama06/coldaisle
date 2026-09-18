@@ -118,6 +118,10 @@ def safety_config(*, zone_min: float = 0.0) -> SafetyConfig:
                 {"temperature_c": value(40.0), "demand": value(zone_min)},
                 {"temperature_c": value(80.0), "demand": value(1.0)},
             ],
+            "cpu_power_cooling_floor": [
+                {"power_w": value(65.0), "demand": value(zone_min)},
+                {"power_w": value(250.0), "demand": value(1.0)},
+            ],
             "fault_demand": value(1.0),
             "stall_check_min_demand": {zone.value: value(zone_min) for zone in Zone},
             "stall_min_rpm": {zone.value: value(400) for zone in Zone},
@@ -125,6 +129,7 @@ def safety_config(*, zone_min: float = 0.0) -> SafetyConfig:
             "write_fail_emergency_after": value(3),
             "telemetry": {
                 "cpu_ms": value(1_000),
+                "cpu_power_ms": value(1_000),
                 "gpu_ms": value(1_000),
                 "t_sensor": {"enabled": value(False)},
                 "air_ms": value(3_000),
@@ -205,6 +210,11 @@ def input_contract() -> ControlInputContract:
             SignalSpec(
                 metric="gpu.0.core",
                 importance=TelemetryImportance.CRITICAL,
+                stale_after_ms=1_000,
+            ),
+            SignalSpec(
+                metric="power.cpu.package",
+                importance=TelemetryImportance.DEGRADED,
                 stale_after_ms=1_000,
             ),
             *(

@@ -67,6 +67,10 @@ def valid_documents() -> dict[str, dict[str, object]]:
                 {"temperature_c": provisional(35.0), "demand": provisional(0.5)},
                 {"temperature_c": provisional(80.0), "demand": provisional(1.0)},
             ],
+            "cpu_power_cooling_floor": [
+                {"power_w": provisional(65.0), "demand": provisional(0.5)},
+                {"power_w": provisional(250.0), "demand": provisional(1.0)},
+            ],
             "fault_demand": provisional(1.0),
             "stall_check_min_demand": {
                 "front": provisional(0.4),
@@ -82,6 +86,7 @@ def valid_documents() -> dict[str, dict[str, object]]:
             "write_fail_emergency_after": provisional(3),
             "telemetry": {
                 "cpu_ms": provisional(1000),
+                "cpu_power_ms": provisional(1000),
                 "gpu_ms": provisional(1000),
                 "t_sensor": {"enabled": provisional(False)},
                 "air_ms": provisional(1000),
@@ -218,6 +223,30 @@ def test_cross_field_validation_rejects_unsafe_or_unstable_values(tmp_path: Path
     with pytest.raises(ValidationError, match=r"stall_check_min_demand\.front"):
         ControlConfig.from_directory(tmp_path)
 
+    documents = valid_documents()
+    documents["safety.yaml"]["cpu_power_cooling_floor"] = [
+        {"power_w": provisional(250.0), "demand": provisional(1.0)},
+        {"power_w": provisional(65.0), "demand": provisional(0.5)},
+    ]
+    write_documents(tmp_path, documents)
+    with pytest.raises(ValidationError, match="cpu_power_cooling_floor の Power は単調増加"):
+        ControlConfig.from_directory(tmp_path)
+
+    documents = valid_documents()
+    documents["safety.yaml"]["cpu_power_cooling_floor"] = [
+        {"power_w": provisional(65.0), "demand": provisional(1.0)},
+        {"power_w": provisional(250.0), "demand": provisional(0.5)},
+    ]
+    write_documents(tmp_path, documents)
+    with pytest.raises(ValidationError, match="cpu_power_cooling_floor の demand は下げない"):
+        ControlConfig.from_directory(tmp_path)
+
+    documents = valid_documents()
+    del documents["safety.yaml"]["cpu_power_cooling_floor"]
+    write_documents(tmp_path, documents)
+    with pytest.raises(ValidationError, match="cpu_power_cooling_floor"):
+        ControlConfig.from_directory(tmp_path)
+
 
 def test_unstable_hwmon_number_is_rejected(tmp_path: Path) -> None:
     documents = valid_documents()
@@ -310,6 +339,8 @@ def test_provisional_values_identify_safety_and_policy_without_exposing_values(
     assert any(item.path == "stall_check_min_demand.front" for item in values)
     assert any(item.path == "write_fail_emergency_after" for item in values)
     assert any(item.path == "telemetry.t_sensor.enabled" for item in values)
+    assert any(item.path == "cpu_power_cooling_floor[0].power_w" for item in values)
+    assert any(item.path == "telemetry.cpu_power_ms" for item in values)
     assert any(item.path == "reactive_guard.ceiling" for item in values)
     assert all("value" not in item.model_dump() for item in values)
 

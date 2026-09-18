@@ -30,8 +30,9 @@ v1 は設定の live reload を行わない。設定変更は候補全体を別�
 **次回再起動時**にだけ反映する。これにより、変更後の設定も必ず `STARTUP` の Max を通る。
 `trace_metadata()` は、採用されたsource名・schema version・SHA-256を #82 の decision traceへ渡す。
 
-#78 で Safety Config に `stall_check_min_demand` と
-`write_fail_emergency_after` を必須追加したため、`safety.yaml` は schema version 2 とする。
+#78 で Safety Config に `stall_check_min_demand`・`write_fail_emergency_after`・
+`cpu_power_cooling_floor`（`power_w` / `demand` の曲線）・`telemetry.cpu_power_ms` を
+必須追加したため、`safety.yaml` は schema version 2 とする。
 version 1 を version 2 の意味で読まず、起動時に明示的に拒否する。安全値に default を
 補う migration は行わず、全項目を provisional / confirmed の根拠付きで設定してから再起動する。
 `provisional_values()` は起動時の構造化ログへ、暫定値そのものを露出せずに位置と根拠だけを渡す。

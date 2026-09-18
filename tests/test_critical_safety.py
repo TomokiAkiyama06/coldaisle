@@ -94,6 +94,10 @@ def safety_config(
                 {"temperature_c": value(40.0), "demand": value(curve_floor)},
                 {"temperature_c": value(80.0), "demand": value(1.0)},
             ],
+            "cpu_power_cooling_floor": [
+                {"power_w": value(65.0), "demand": value(curve_floor)},
+                {"power_w": value(250.0), "demand": value(1.0)},
+            ],
             "fault_demand": value(fault_demand),
             "stall_check_min_demand": {zone: value(demand) for zone, demand in stall_check.items()},
             "stall_min_rpm": {
@@ -105,6 +109,7 @@ def safety_config(
             "write_fail_emergency_after": value(write_limit),
             "telemetry": {
                 "cpu_ms": value(1_000),
+                "cpu_power_ms": value(1_000),
                 "gpu_ms": value(1_000),
                 "t_sensor": t_sensor,
                 "air_ms": value(3_000),
@@ -130,6 +135,11 @@ def input_contract(*, t_sensor_metric: str | None = None) -> ControlInputContrac
         SignalSpec(
             metric="gpu.0.core",
             importance=TelemetryImportance.CRITICAL,
+            stale_after_ms=1_000,
+        ),
+        SignalSpec(
+            metric="power.cpu.package",
+            importance=TelemetryImportance.DEGRADED,
             stale_after_ms=1_000,
         ),
         *(
@@ -214,6 +224,7 @@ def snapshot(
     mono: int,
     cpu: float | None = 60.0,
     gpu: float | None = 60.0,
+    cpu_power: float | None = 50.0,
     critical: tuple[str, ...] = (),
     fan_state: PerZone[FanState] | None = None,
     extra_signals: tuple[SnapshotSignal, ...] = (),
@@ -231,6 +242,12 @@ def snapshot(
             "gpu.0.core",
             gpu,
             quality=Quality.OK if gpu is not None else Quality.MISSING,
+        ),
+        signal(
+            "power.cpu.package",
+            cpu_power,
+            importance=TelemetryImportance.DEGRADED,
+            quality=Quality.OK if cpu_power is not None else Quality.MISSING,
         ),
         *(
             signal(
@@ -386,6 +403,101 @@ def test_cpu_cooling_floor_is_interpolated_and_provisional_status_is_preserved()
     assert settled.zones.front.floor == 0.4
     assert settled.config_is_provisional is True
     assert critical_safety(safety_config(status="confirmed")).config_is_provisional is False
+
+
+@pytest.mark.parametrize(("cpu_power", "expected_top_floor"), [(157.5, 0.75), (250.0, 1.0)])
+def test_cpu_power_jump_raises_the_top_floor_even_when_the_cpu_is_cool(
+    cpu_power: float, expected_top_floor: float
+) -> None:
+    # 0028 §2.4: cpu_cooling_floor(CPU 温度, CPU Power)。温度が上がる前の Power の立ち上がりで
+    # Top の floor を上げる。温度曲線（40C → 0.5）と Power 曲線の大きい方を取る。
+    safety = critical_safety(safety_config())
+    settle(safety)
+
+    cool_idle = safety.evaluate(
+        snapshot(tick=3, mono=2_000, cpu=40.0, cpu_power=50.0), mode=OperatingMode.AUTO
+    )
+    cool_loaded = safety.evaluate(
+        snapshot(tick=4, mono=3_000, cpu=40.0, cpu_power=cpu_power), mode=OperatingMode.AUTO
+    )
+
+    assert cool_idle.zones.top.floor == 0.5
+    assert cool_loaded.zones.top.floor == pytest.approx(expected_top_floor)
+    assert cool_loaded.zones.top.reason is not None
+    assert cool_loaded.zones.top.reason.code == "cpu_cooling_floor"
+    assert cool_loaded.state is SafetyState.NORMAL
+    assert cool_loaded.zones.front.floor == 0.4
+
+
+def test_hot_cpu_keeps_the_temperature_floor_when_power_is_low() -> None:
+    safety = critical_safety(safety_config())
+    settle(safety)
+
+    result = safety.evaluate(
+        snapshot(tick=3, mono=2_000, cpu=80.0, cpu_power=10.0), mode=OperatingMode.AUTO
+    )
+
+    assert result.zones.top.floor == 1.0
+
+
+@pytest.mark.parametrize("quality", [Quality.MISSING, Quality.STALE, Quality.SUSPECT])
+def test_unavailable_cpu_power_is_degraded_and_only_drops_the_power_term(
+    quality: Quality,
+) -> None:
+    # 0029 §2.2 / §2.3: CPU Power の欠測は Degraded。fault_demand にせず safety state も
+    # 変えず、Power 項を外して温度の曲線だけで Top の floor を決める。
+    safety = critical_safety(safety_config())
+    settle(safety)
+    unavailable_power = signal(
+        "power.cpu.package",
+        None,
+        importance=TelemetryImportance.DEGRADED,
+        quality=quality,
+    )
+    base = snapshot(
+        tick=3,
+        mono=2_000,
+        cpu=60.0,
+        telemetry_health=TelemetryHealth.DEGRADED,
+    )
+    degraded = base.model_copy(
+        update={
+            "signals": tuple(
+                unavailable_power if item.metric == "power.cpu.package" else item
+                for item in base.signals
+            )
+        }
+    )
+
+    result = safety.evaluate(degraded, mode=OperatingMode.AUTO)
+
+    assert result.state is SafetyState.NORMAL
+    assert not result.faults
+    assert result.zones.top.floor == 0.75
+    assert not result.zones.top.forced_max
+    assert result.zones.front.floor == 0.4
+    assert result.zones.top.reason is not None
+    assert "cpu_power_unavailable" in result.zones.top.reason.detail
+
+
+@pytest.mark.parametrize(
+    "importance", [None, TelemetryImportance.CRITICAL, TelemetryImportance.ADVISORY]
+)
+def test_cpu_power_must_be_a_degraded_signal_in_the_input_contract(
+    importance: TelemetryImportance | None,
+) -> None:
+    contract = input_contract()
+    signals = tuple(
+        spec
+        if spec.metric != "power.cpu.package"
+        else spec.model_copy(update={"importance": importance})
+        for spec in contract.signals
+        if importance is not None or spec.metric != "power.cpu.package"
+    )
+    with pytest.raises(ValueError, match=r"CRITICAL signal contract|power\.cpu\.package"):
+        CriticalSafety(
+            safety_config(), input_contract=contract.model_copy(update={"signals": signals})
+        )
 
 
 @pytest.mark.parametrize(
