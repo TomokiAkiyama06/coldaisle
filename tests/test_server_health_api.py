@@ -19,9 +19,15 @@ from coldaisle.ai import (
 )
 from coldaisle.api.app import Config, create_app
 from coldaisle.api.models import ComputeModeAdvisory, ServerHealthResponse
-from coldaisle.api.server_health import server_health_state
+from coldaisle.api.server_health import ServerHealthSettings, server_health_state
 from coldaisle.clock import SimulatedClock
-from coldaisle.internal_telemetry import SOURCE_STATE_PREFIX
+from coldaisle.internal_telemetry import (
+    SOURCE_STATE_PREFIX,
+    InternalTelemetryCollector,
+    NvmlAdapter,
+    NvmlConfig,
+)
+from coldaisle.metrics import MetricCatalog
 from coldaisle.store import Quality, Reading, Sample, SqliteStore
 from conftest import CONFIG_DIR, QUALITY_RULES_PATH
 
@@ -601,3 +607,150 @@ def test_background_ai_never_blocks_and_limits_concurrency():
             break
         time.sleep(0.001)
     assert result == "監視情報は正常です。"
+
+
+class UnsupportedTemperaturesNvml:
+    """hotspot / memory 温度を公開しない GPU を模した NVML API（実機で観測した形）。"""
+
+    def initialize(self) -> None:
+        pass
+
+    def shutdown(self) -> None:
+        pass
+
+    def device_count(self) -> int:
+        return 1
+
+    def handle(self, index: int) -> object:
+        return index
+
+    def core_temperature_c(self, handle: object) -> float:
+        return 54.0
+
+    def hotspot_temperature_c(self, handle: object) -> float | None:
+        return None
+
+    def memory_temperature_c(self, handle: object) -> float | None:
+        return None
+
+    def power_w(self, handle: object) -> float:
+        return 180.0
+
+    def utilization_pct(self, handle: object) -> float:
+        return 42.0
+
+    def vram_used_gb(self, handle: object) -> float:
+        return 8.0
+
+    def compute_process_ids(self, handle: object) -> tuple[int, ...]:
+        return (10, 20)
+
+
+def _store_collector_cycle(path: Path, rules, api) -> None:
+    """telemetry daemon と同じ経路（collector → insert_sample → source state）で保存する。"""
+    clock = SimulatedClock(NOW_MS)
+    collector = InternalTelemetryCollector(
+        (NvmlAdapter(NvmlConfig(enabled=True, gpu_indices=(0,)), api),), clock
+    )
+    cycle = collector.collect()
+    with SqliteStore(path, rules=rules, clock=clock) as store:
+        store.insert_sample(cycle.sample)
+        for source in cycle.sources:
+            store.set_system_state(
+                SOURCE_STATE_PREFIX + source.source, source.status.value, at_ms=NOW_MS
+            )
+
+
+def test_hardware_unsupported_nvml_temperatures_saved_as_missing_stay_green(tmp_path, rules):
+    """RTX PRO 6000 は hotspot / mem を返さず、collector は毎回 missing を保存する。
+
+    これで yellow に固定されると本当の劣化と見分けられないため、設定で宣言した
+    metric の missing だけは signal を下げない（決定記録 0040）。
+    """
+    path = tmp_path / "unsupported-nvml.db"
+    _populate(path, rules, internal_values={"cpu.package": 49.0})
+    _store_collector_cycle(path, rules, UnsupportedTemperaturesNvml())
+
+    with TestClient(_app(path, SimulatedClock(NOW_MS))) as client:
+        body = client.get("/api/v1/server-health").json()
+
+    assert body["gpu"]["metrics"]["gpu.0.hotspot"]["quality"] == "missing"
+    assert body["gpu"]["metrics"]["gpu.0.hotspot"]["age_seconds"] == 0.0
+    assert body["gpu"]["metrics"]["gpu.0.mem"]["quality"] == "missing"
+    assert body["sources"]["nvml"]["status"] == "ok"
+    assert body["signal"] == "green"
+    assert body["compute_mode_advisory"]["safe"] is True
+
+
+@pytest.mark.parametrize("quality", [Quality.SUSPECT, Quality.STALE])
+def test_tolerated_metric_that_is_suspect_or_stale_still_degrades(tmp_path, rules, quality):
+    """許容するのは missing だけ。値があるのに疑わしい・古いなら従来どおり下げる。"""
+    path = tmp_path / "suspect-hotspot.db"
+    _populate(path, rules)
+    with SqliteStore(path, rules=rules, clock=SimulatedClock(NOW_MS)) as store:
+        store.insert_sample(
+            Sample(
+                ts_ms=NOW_MS + 1,
+                readings=(Reading(metric="gpu.0.hotspot", value=64.0, quality=quality),),
+            )
+        )
+
+    with TestClient(_app(path, SimulatedClock(NOW_MS + 1))) as client:
+        body = client.get("/api/v1/server-health").json()
+
+    assert body["signal"] == "yellow"
+
+
+def test_missing_metric_that_is_not_tolerated_still_degrades(tmp_path, rules):
+    path = tmp_path / "missing-utilization.db"
+    _populate(path, rules)
+    with SqliteStore(path, rules=rules, clock=SimulatedClock(NOW_MS)) as store:
+        store.insert_sample(
+            Sample(
+                ts_ms=NOW_MS + 1,
+                readings=(
+                    Reading(metric="gpu.0.utilization", value=None, quality=Quality.MISSING),
+                ),
+            )
+        )
+
+    with TestClient(_app(path, SimulatedClock(NOW_MS + 1))) as client:
+        body = client.get("/api/v1/server-health").json()
+
+    assert body["signal"] == "yellow"
+
+
+def _settings_yaml(tmp_path: Path, body: str) -> Path:
+    path = tmp_path / "server-health.yaml"
+    path.write_text(body, encoding="utf-8")
+    return path
+
+
+_BASE_SETTINGS = """version: 1
+sources:
+  sensor_unit: {required: [air.room]}
+  nvml: {required: [gpu.0.core]}
+panels:
+  gpu: [gpu.0.core]
+  environment: [air.room]
+"""
+
+
+def test_server_health_settings_reject_unknown_metrics(tmp_path):
+    catalog = MetricCatalog.from_yaml(CONFIG_DIR / "metrics.yaml")
+    path = _settings_yaml(tmp_path, _BASE_SETTINGS + "missing_tolerated: [gpu.0.hotpsot]\n")
+    with pytest.raises(ValueError, match=r"gpu\.0\.hotpsot"):
+        ServerHealthSettings.from_yaml(path, catalog=catalog)
+
+
+def test_server_health_settings_reject_tolerating_a_required_metric(tmp_path):
+    catalog = MetricCatalog.from_yaml(CONFIG_DIR / "metrics.yaml")
+    path = _settings_yaml(tmp_path, _BASE_SETTINGS + "missing_tolerated: [gpu.0.core]\n")
+    with pytest.raises(ValueError, match="missing_tolerated"):
+        ServerHealthSettings.from_yaml(path, catalog=catalog)
+
+
+def test_repository_server_health_settings_load():
+    catalog = MetricCatalog.from_yaml(CONFIG_DIR / "metrics.yaml")
+    settings = ServerHealthSettings.from_yaml(CONFIG_DIR / "server-health.yaml", catalog=catalog)
+    assert settings.missing_tolerated == {"gpu.0.hotspot", "gpu.0.mem"}

@@ -103,3 +103,4 @@ docs/decisions/NNNN-<slug>.md      例: 0002-metric-naming.md
 | [0032](0032-internal-telemetry-metric-names.md) | Internal Telemetry のメトリクス名 | FINAL |
 | [0037](0037-model-registry-rollback-target.md) | Model Registry の promotion 時の rollback target | Proposed |
 | [0038](0038-internal-telemetry-outage-counting.md) | Internal Telemetry の欠測の数え方（有効な間の停止は欠測、無効期間は数えない） | FINAL |
+| [0040](0040-server-health-api.md) | Server Health API の契約（`/server-health` への一本化、signal 規則、機種が公開しない metric の扱い） | Proposed |

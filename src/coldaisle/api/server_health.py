@@ -9,7 +9,11 @@ from __future__ import annotations
 import json
 import logging
 from collections.abc import Mapping
-from typing import Literal, Protocol
+from pathlib import Path
+from typing import Any, Literal, Protocol
+
+import yaml
+from pydantic import BaseModel, ConfigDict, Field
 
 from coldaisle.api.models import (
     ComputeModeAdvisory,
@@ -31,33 +35,6 @@ from coldaisle.store.models import AlertRecord, LatestReading
 
 LOGGER = logging.getLogger("coldaisle.api.server_health")
 
-SENSOR_METRICS = (
-    "air.room",
-    "air.room_humidity",
-    "air.front_intake",
-    "air.gpu_intake",
-    "air.gpu_exhaust",
-    "air.top_exhaust",
-    "air.rear_exhaust",
-)
-GPU_METRICS = (
-    "gpu.0.core",
-    "gpu.0.hotspot",
-    "gpu.0.mem",
-    "gpu.0.utilization",
-    "gpu.0.vram_used",
-    "power.gpu.0",
-    "sys.cuda_processes",
-)
-ENVIRONMENT_METRICS = (
-    *SENSOR_METRICS,
-    "cpu.package",
-    "power.cpu.package",
-    "cpu.vrm",
-    "board.chipset",
-    "board.connector_12v2x6",
-)
-_NVML_REQUIRED = ("gpu.0.core", "power.gpu.0")
 _BAD_SOURCE_STATES = {
     HealthSourceStatus.UNAVAILABLE,
     HealthSourceStatus.DISABLED,
@@ -68,6 +45,64 @@ _TEMPLATES = {
     ServerSignal.YELLOW: "一部のTelemetryまたはアラートに注意が必要です。",
     ServerSignal.RED: "監視に必要なTelemetryを取得できないか、重大なアラートがあります。",
 }
+
+
+class _SettingsModel(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+
+class RequiredMetrics(_SettingsModel):
+    """1つの source が監視必須とする metric。"""
+
+    required: tuple[str, ...] = Field(min_length=1)
+
+
+class HealthSourcesSettings(_SettingsModel):
+    sensor_unit: RequiredMetrics
+    nvml: RequiredMetrics
+
+
+class HealthPanels(_SettingsModel):
+    gpu: tuple[str, ...]
+    environment: tuple[str, ...]
+
+
+class ServerHealthSettings(_SettingsModel):
+    """``config/server-health.yaml``。監視対象 metric の宣言で、閾値は持たない。"""
+
+    version: Literal[1]
+    sources: HealthSourcesSettings
+    panels: HealthPanels
+    missing_tolerated: frozenset[str] = frozenset()
+    """機種が公開しない metric。``missing`` だけは signal を下げない。"""
+
+    @classmethod
+    def from_yaml(cls, path: Path, *, catalog: MetricCatalog) -> ServerHealthSettings:
+        """YAML を厳格に読み、metrics.yaml に無い metric 名を起動前に拒否する。"""
+        loaded: Any = yaml.safe_load(path.read_text(encoding="utf-8"))
+        if not isinstance(loaded, dict):
+            raise ValueError(f"Server Health 設定が辞書ではない: {path}")
+        settings = cls.model_validate(loaded)
+        settings.validate_metrics(catalog)
+        return settings
+
+    def validate_metrics(self, catalog: MetricCatalog) -> None:
+        """誤記した metric は常に missing に見え、黙って監視から外れるため拒否する。"""
+        names = {
+            *self.sources.sensor_unit.required,
+            *self.sources.nvml.required,
+            *self.panels.gpu,
+            *self.panels.environment,
+            *self.missing_tolerated,
+        }
+        unknown = sorted(name for name in names if name not in catalog.metrics)
+        if unknown:
+            raise ValueError(f"metrics.yaml に定義の無い metric: {', '.join(unknown)}")
+        required = {*self.sources.sensor_unit.required, *self.sources.nvml.required}
+        overlap = sorted(required & self.missing_tolerated)
+        if overlap:
+            # 必須 metric の欠測を許すと、source が止まっても signal が下がらない
+            raise ValueError(f"監視必須 metric を missing_tolerated にできない: {overlap}")
 
 
 class HealthSummarizer(Protocol):
@@ -82,18 +117,21 @@ def build_server_health(
     catalog: MetricCatalog,
     summarizer: HealthSummarizer | None = None,
     *,
+    settings: ServerHealthSettings,
     hwmon_metrics: tuple[str, ...],
 ) -> ServerHealthResponse:
     """DB の同じ current view から REST / WS 共通 payload を作る。"""
     readings = store.latest()
     alerts = list(store.alerts(state="firing", limit=100))
-    sources = _monitoring_sources(store, readings, hwmon_metrics)
-    signal = _signal(sources, readings, alerts)
+    sources = _monitoring_sources(store, readings, settings, hwmon_metrics)
+    signal = _signal(sources, readings, alerts, settings.missing_tolerated)
     gpu = ServerGpuHealth(
         mode=store.current_state("sys.gpu_mode") or "unknown",
-        metrics=_metrics(GPU_METRICS, readings, catalog),
+        metrics=_metrics(settings.panels.gpu, readings, catalog),
     )
-    environment = ServerEnvironmentHealth(metrics=_metrics(ENVIRONMENT_METRICS, readings, catalog))
+    environment = ServerEnvironmentHealth(
+        metrics=_metrics(settings.panels.environment, readings, catalog)
+    )
     advisory = _compute_mode_advisory(signal, sources, alerts)
 
     summary = None
@@ -146,12 +184,13 @@ def build_server_health(
 def _monitoring_sources(
     store: SqliteStore,
     readings: Mapping[str, LatestReading],
+    settings: ServerHealthSettings,
     hwmon_metrics: tuple[str, ...],
 ) -> HealthSources:
     ingest_source = store.current_state("sys.ingest_source")
     sensor_unit = _source_from_metrics(
         HealthSourceStatus.OK if ingest_source else None,
-        SENSOR_METRICS,
+        settings.sources.sensor_unit.required,
         readings,
         detail=f"ingest_source={ingest_source}" if ingest_source else "ingest source not observed",
         metric_role="required sensor",
@@ -159,7 +198,7 @@ def _monitoring_sources(
     nvml_state = _source_status(store.current_state(SOURCE_STATE_PREFIX + "nvml"))
     nvml = _source_from_metrics(
         nvml_state,
-        _NVML_REQUIRED,
+        settings.sources.nvml.required,
         readings,
         detail=f"collector_state={nvml_state.value}" if nvml_state else "collector state missing",
         metric_role="required NVML",
@@ -258,6 +297,7 @@ def _signal(
     sources: HealthSources,
     readings: Mapping[str, LatestReading],
     alerts: list[AlertRecord],
+    missing_tolerated: frozenset[str],
 ) -> ServerSignal:
     monitoring = (sources.sensor_unit, sources.nvml, sources.lm_sensors)
     if any(source.status in _BAD_SOURCE_STATES for source in monitoring):
@@ -266,10 +306,25 @@ def _signal(
         return ServerSignal.RED
     if any(source.status is HealthSourceStatus.DEGRADED for source in monitoring):
         return ServerSignal.YELLOW
-    periodic = (reading for metric, reading in readings.items() if metric not in EVENT_METRICS)
-    if alerts or any(reading.quality is not Quality.OK for reading in periodic):
+    if alerts or any(
+        _degrades_signal(metric, reading, missing_tolerated) for metric, reading in readings.items()
+    ):
         return ServerSignal.YELLOW
     return ServerSignal.GREEN
+
+
+def _degrades_signal(
+    metric: str, reading: LatestReading, missing_tolerated: frozenset[str]
+) -> bool:
+    if metric in EVENT_METRICS:
+        # 発生時だけ記録する metric は鮮度で判定しない（決定記録 0009 §2.12）
+        return False
+    if metric in missing_tolerated and reading.quality is Quality.MISSING:
+        # 機種が公開しない値は collector が毎回 missing で保存する。これで yellow に
+        # すると signal が恒常的に下がり、本当の劣化と区別できなくなる。
+        # suspect / stale は「値はあるが疑わしい・古い」なので従来どおり下げる
+        return False
+    return reading.quality is not Quality.OK
 
 
 def _compute_mode_advisory(

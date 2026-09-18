@@ -43,6 +43,7 @@ from coldaisle.api.models import (
 )
 from coldaisle.api.server_health import (
     HealthSummarizer,
+    ServerHealthSettings,
     build_server_health,
     server_health_state,
 )
@@ -109,6 +110,7 @@ class Config:
     quality_rules: Path = Path("config/quality.yaml")
     metrics: Path = Path("config/metrics.yaml")
     internal_telemetry: Path = Path("config/internal-telemetry.yaml")
+    server_health: Path = Path("config/server-health.yaml")
     max_points: int = 2_000
     """1レスポンスの最大点数。超えるなら粗い粒度へ自動で落とす（受入基準）。"""
     stream_poll_s: float = 1.0
@@ -123,6 +125,7 @@ class Config:
             internal_telemetry=Path(
                 os.environ.get("COLDAISLE_INTERNAL_TELEMETRY", str(cls.internal_telemetry))
             ),
+            server_health=Path(os.environ.get("COLDAISLE_SERVER_HEALTH", str(cls.server_health))),
             max_points=int(os.environ.get("COLDAISLE_MAX_POINTS", cls.max_points)),
             stream_poll_s=float(os.environ.get("COLDAISLE_STREAM_POLL_S", cls.stream_poll_s)),
         )
@@ -202,6 +205,7 @@ def create_app(
 ) -> FastAPI:
     settings = config or Config.from_env()
     catalog = MetricCatalog.from_yaml(settings.metrics)
+    health_settings = ServerHealthSettings.from_yaml(settings.server_health, catalog=catalog)
     if health_hwmon_metrics is None:
         internal_telemetry = InternalTelemetryConfig.from_yaml(
             settings.internal_telemetry, catalog=catalog
@@ -255,6 +259,7 @@ def create_app(
             provider.get(),
             catalog,
             health_summarizer,
+            settings=health_settings,
             hwmon_metrics=health_hwmon_metrics,
         )
 

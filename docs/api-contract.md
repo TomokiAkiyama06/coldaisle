@@ -111,7 +111,7 @@ Compute Mode の判断は AI へ渡しません。生成はバックグラウン
 
 | 値 | 条件 |
 |---|---|
-| `green` | sensor_unit / nvml / lm_sensors がすべて `ok`、発生中アラート無し、保存済みの周期メトリクスがすべて `quality=ok` |
+| `green` | sensor_unit / nvml / lm_sensors がすべて `ok`、発生中アラート無し、保存済みの周期メトリクスがすべて `quality=ok`（`missing_tolerated` の `missing` は除く） |
 | `yellow` | 情報源が `degraded`、critical 以外のアラートが発生中、または周期メトリクスの一部が `suspect` / `missing` / `stale` |
 | `red` | 情報源が `unavailable` / `disabled` / `stopped`、critical アラートが発生中、または監視必須データが取得不能 |
 
@@ -122,6 +122,11 @@ Compute Mode の判断は AI へ渡しません。生成はバックグラウン
 発生時だけ記録する `sys.dropped_samples` 等はこの鮮度判定から
 外します（決定記録 0009 §2.12）。AI 停止は監視の停止ではないため signal 判定から
 外します。
+
+`config/server-health.yaml` の `missing_tolerated` に挙げた metric（GPU / driver が
+公開しない `gpu.0.hotspot` / `gpu.0.mem` など）は、`missing` だけを signal 判定から
+外します。`suspect` / `stale` は外しません。監視必須 metric と監視対象の一覧も同じ
+ファイルにあります（決定記録 0040）。
 
 **`GET /api/v1/server-health` と `WS /api/v1/server-health/stream` の payload は同一です。**
 WebSocket 専用の封筒やフィールドは加えません。
