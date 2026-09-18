@@ -59,7 +59,7 @@
 | 28 | [GPU / CPU / VRM 内部センサーの統合](issues/28-internal-sensors.md) | M7 拡張 | core, priority:could, blocked-by-hardware |
 | 29 | [Personal AI Workspace の Server Health 統合](issues/29-workspace-integration.md) | M7 拡張 | integration, priority:could |
 | 30 | [【設計のみ】ファン制御の安全設計検討](issues/30-fan-control-design.md) **← GitHub #61 へ移管** | M8 Fan Control | design, safety, priority:could |
-| 31 | [ADR: ローカルモデルの役割分担を確定する](issues/31-adr-model-roles.md) **← 決定記録 0005 で解決。クローズ可** | M0 基盤 | design, ai, priority:must |
+| 31 | [ADR: ローカルモデルの役割分担を確定する](issues/31-adr-model-roles.md) **← 決定記録 0005 で解決（GitHub #62 クローズ済み）** | M0 基盤 | design, ai, priority:must |
 | 32 | [Core Service と GPU AI Service の分離（Compute Mode対応）](issues/32-core-gpu-service-split.md) | M6 移行 | infra, priority:must, safety |
 | 33 | [Docker Compose による3層分離](issues/33-docker-compose-layers.md) | M6 移行 | infra, priority:should, blocked-by-hardware |
 | 34 | [NVML / lm-sensors の統合（v1スコープへ格上げ）](issues/34-internal-sensors-nvml.md) **← GitHub #65 へ移管** | M7 拡張 | core, priority:must, blocked-by-hardware |
@@ -97,6 +97,7 @@ GPU機どころか ESP32 すら接続せずに #8〜#25 のすべてが開発・
 > ここは番号と着手順の索引で、仕様・受入基準・依存は各 Issue を正とします。`issues/` にファイルは置きません。
 > 統合設計の出典: 統合メモ（2026-09-13）、決定記録 [0026](docs/decisions/0026-three-zone-fan-control.md) / [0027](docs/decisions/0027-fan-control-architecture.md) / [0028](docs/decisions/0028-fan-control-contracts.md)。
 >
+> 状態は 2026-09-18 時点の GitHub（PR / Issue）と照合したもの。
 > 状態の「レビュー中」は未完了を表す。実機確認が受入基準に含まれる Issue は、
 > software PR がマージされても実機確認が終わるまで「完了」にしない。
 
@@ -104,27 +105,27 @@ GPU機どころか ESP32 すら接続せずに #8〜#25 のすべてが開発・
 |---|---|---|---|
 | #61 | ADR: Supervisor + Learned MPC + Reactive Guard + Critical Safety の責務境界 | M8 | 完了（決定記録 0027 / 0028） |
 | #76 | Front / Rear / Top Demand schema と制御reason schema | M8 | 完了（PR #101） |
-| #65 | NVML / lm-sensors / hwmon 内部Telemetry統合（Control/ML入力対応） | M7 | 実装中（実機確認残） |
-| #66 | Server Health API（Workspace連携の単一窓口） | M7 | 実装中（#65 stack、実機確認残） |
+| #65 | NVML / lm-sensors / hwmon 内部Telemetry統合（Control/ML入力対応） | M7 | 実装中（PR #128 レビュー中・main と競合。Fan header 対応は 2026-09-18 に所有者が実機確認済み＝`docs/fan-header-mapping.md`。CPU / VRM / T_SENSOR 等の実機確認残） |
+| #66 | Server Health API（Workspace連携の単一窓口） | M7 | 実装中（PR 未作成、#65 stack） |
 | #102 | Runtime State Estimator: synchronized control snapshot / trend / thermal margin | M8 | 完了（PR #118） |
 | #103 | Control Config schema / validation / versioning / safe reload | M8 | 完了（PR #115） |
 | #77 | Fan Hardware Backend: Demand→PWM/RPM/Flow + simulated backend（Actuation privilege boundary を含む） | M8 | 完了（PR #119） |
-| #78 | Critical Safety Layer: floor / stall / telemetry loss / deadman / emergency Max | M8 | 実装中（人間のSafetyレビュー必須） |
-| #79 | Fallback Controller: ML停止 / OOD / timeout時のBaseline運転 | M8 | レビュー中（PR #125） |
-| #80 | Reactive Guard: dT/dt / Power急変への即応制御 | M8 | レビュー中（PR #126、実測閾値残） |
+| #78 | Critical Safety Layer: floor / stall / telemetry loss / deadman / emergency Max | M8 | レビュー中（PR #131・main と競合、人間のSafetyレビュー必須） |
+| #79 | Fallback Controller: ML停止 / OOD / timeout時のBaseline運転 | M8 | 完了（PR #125） |
+| #80 | Reactive Guard: dT/dt / Power急変への即応制御 | M8 | software マージ済み（PR #126 → #125 経由で main）。実測閾値残のため Issue は open |
 | #82 | Control Logging: requested / effective / override / confidence / OOD | M8 | 完了（PR #110） |
 | #74 | 3系統Fan Control Engine / daemon（4層Pipeline + Demand abstraction） | M8 | |
 | #75 | 3系統Fanの風量キャラクタライズとEffective Airflow / Thermal Effectiveness Model | M8 | |
-| #81 | Air Balance Model: q_front / q_rear / q_top と協調制御 | M8 | レビュー中（PR #122、実機校正残） |
+| #81 | Air Balance Model: q_front / q_rear / q_top と協調制御 | M8 | レビュー中（PR #122、実機校正は #75 待ち） |
 | #50 | ベースライン測定・Safety/Reactive閾値候補・Thermal Dataset初期収集 | M8 | |
 | #106 | Airflow / Fan Control 可視化 UI（ケース内の風の流れと制御状態） | M8 | |
-| #83 | Thermal Dataset schema: Window / Horizon / Fan action列とデータ収集 | M9 | 実装中（実データ収集残） |
-| #84 | Multi-horizon / multi-output Learned Thermal Model | M9 | 実装中（実データ評価残） |
+| #83 | Thermal Dataset schema: Window / Horizon / Fan action列とデータ収集 | M9 | レビュー中（PR #129、実データ収集残） |
+| #84 | Multi-horizon / multi-output Learned Thermal Model | M9 | 実装中（PR 未作成、#83 stack。実データ評価残） |
 | #85 | Model Confidence / OOD検知とAuthority制限 | M9 | |
-| #104 | Control Model Registry: candidate / production / promotion / rollback | M9 | レビュー中（PR #123） |
+| #104 | Control Model Registry: candidate / production / promotion / rollback | M9 | Registry 本体はマージ済み（PR #123）。loader / rollout 等の consumer が残るため Issue は open |
 | #86 | Learned MPC optimizer とHard Constraints連携 | M9 | |
-| #87 | Workload Regime推定: IDLE / TRANSIENT / SUSTAINED / COOLDOWN / UNKNOWN | M9 | レビュー中（PR #124） |
-| #88 | Supervisor Interface: RulePolicy / RLPolicy / ShadowRLPolicy | M9 | 実装中（#87 stack） |
+| #87 | Workload Regime推定: IDLE / TRANSIENT / SUSTAINED / COOLDOWN / UNKNOWN | M9 | **未反映**: PR #124 は stacked base `feat/80-reactive-guard` へ、同 branch が main に入った後にマージされたため main に届いていない。main への再適用が必要 |
+| #88 | Supervisor Interface: RulePolicy / RLPolicy / ShadowRLPolicy | M9 | 実装中（PR 未作成、#87 の main 反映待ち） |
 | #90 | Control Shadow Mode / Counterfactual logging | M9 | |
 | #91 | Offline Evaluation: Baseline vs MPC vs Guard vs Supervisor | M9 | |
 | #92 | Authority Rollout: Shadow → 制限付き → Full Authority | M9 | |
@@ -138,12 +139,12 @@ GPU機どころか ESP32 すら接続せずに #8〜#25 のすべてが開発・
 ### Control系の推奨着手順
 
 ```text
-内部Telemetry/API:  #65 → #66
-安全:               #78
-Control stack:       #79 → #80 → #87 → #88
+内部Telemetry/API:  #65（PR #128）→ #66
+安全:               #78（PR #131）
+Control stack:       #79 ✓ → #80 ✓（実測閾値残）→ #87（main へ再適用）→ #88
 Air Balance:         #81（実機校正は #75 待ち）
-Dataset / Model:     #83 → #84 → #85
-Model registry:      #104
+Dataset / Model:     #83（PR #129）→ #84 → #85
+Model registry:      #104（本体マージ済み、consumer は #84 / #85 / #89 / #90 / #91 / #92）
 
 上記合流後:         #74 ∥ #86 → #90 → #91 → #92
 実機測定:             #75 → #50
@@ -163,7 +164,7 @@ Simulated backend E2Eまで進め、systemd watchdogと実hwmon有効化は #57 
 ```text
 温度計モジュール:  #43 → #44 → #45 → #47 → #57
 GPU server:            #57 → #63 → (#58 ∥ #64)
-測定・校正:             #65実機確認 → #75 → #50
+測定・校正:             #65実機確認（Fan header 対応は確認済み）→ #75 → #50
 外部サービス:           #51（Slack / LINE）、#60（Workspace）
 所有者判断:             #67、#92、#106、#107
 ```
