@@ -58,6 +58,16 @@ INTERNAL_VALUES = {
     "board.chipset": 44.0,
 }
 
+NVML_METRICS = (
+    "gpu.0.core",
+    "gpu.0.hotspot",
+    "gpu.0.mem",
+    "gpu.0.utilization",
+    "gpu.0.vram_used",
+    "power.gpu.0",
+    "sys.cuda_processes",
+)
+
 
 class FakeSummarizer:
     def __init__(self, summary: str | None = "監視情報と各データ源は正常です。") -> None:
@@ -133,6 +143,7 @@ def _app(
     summarizer=None,
     *,
     hwmon_metrics=("cpu.package",),
+    nvml_metrics=NVML_METRICS,
 ):
     return create_app(
         Config(
@@ -144,6 +155,7 @@ def _app(
         clock=clock,
         health_summarizer=summarizer,
         health_hwmon_metrics=hwmon_metrics,
+        health_nvml_metrics=nvml_metrics,
     )
 
 
@@ -778,3 +790,37 @@ def test_stale_row_of_a_removed_input_does_not_degrade_the_signal(tmp_path, rule
     assert removed["compute_mode_advisory"]["safe"] is True
     # 同じ行でも、まだ有効な入力なら従来どおり signal を下げる
     assert still_configured["signal"] == "yellow"
+
+
+@pytest.mark.parametrize(
+    ("enabled_hwmon", "expected"),
+    [
+        # 実機の現状: board.chipset は 0 °C を返すため無効。cpu.vrm も未有効化
+        (("cpu.package",), "green"),
+        # cpu.package / cpu.vrm を有効化した後も、無効のままの board.chipset は影響しない
+        (("cpu.package", "cpu.vrm"), "green"),
+        # 入力を有効にしたパネル metric が古くなれば、従来どおり signal を下げる
+        (("cpu.package", "cpu.vrm", "board.chipset"), "yellow"),
+    ],
+)
+def test_panel_metric_with_disabled_input_is_display_only(tmp_path, rules, enabled_hwmon, expected):
+    """パネルは表示専用。入力が無効な metric の古い行で signal を下げない。"""
+    path = tmp_path / "panel-disabled.db"
+    _populate(path, rules)  # cpu.vrm / board.chipset も一度は保存されていた
+    later = NOW_MS + 3_600_000
+    # board.chipset は以後届かない（無効化、または有効なのに止まった）。cpu.vrm は
+    # 有効なときだけ届き続ける
+    current = {
+        name: value
+        for name, value in INTERNAL_VALUES.items()
+        if name != "board.chipset" and (name != "cpu.vrm" or name in enabled_hwmon)
+    }
+    _populate(path, rules, internal_values=current, ts_ms=later)
+
+    with SqliteStore(path, rules=rules, clock=SimulatedClock(later)) as store:
+        assert store.latest()["board.chipset"].quality is Quality.STALE
+    with TestClient(_app(path, SimulatedClock(later), hwmon_metrics=enabled_hwmon)) as client:
+        body = client.get("/api/v1/server-health").json()
+
+    assert body["environment"]["metrics"]["board.chipset"]["quality"] == "stale"
+    assert body["signal"] == expected

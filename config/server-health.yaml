@@ -23,7 +23,8 @@ sources:
       - gpu.0.core
       - power.gpu.0
 
-# payload に常に載せる metric（値が無くてもキーを省略しない）。
+# payload に常に載せる metric（値が無くてもキーを省略しない）。表示専用で、
+# signal は監視必須 metric と internal-telemetry.yaml で有効な入力だけで判定する。
 panels:
   gpu:
     - gpu.0.core

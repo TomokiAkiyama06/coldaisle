@@ -129,8 +129,10 @@ Compute Mode の判断は AI へ渡しません。生成はバックグラウン
 ファイルにあります（決定記録 0040）。
 
 signal が見る周期メトリクスは**現在の監視対象**に限ります。`config/server-health.yaml`
-に挙げた metric と、`config/internal-telemetry.yaml` で有効な hwmon 入力です。無効化・
-撤去した入力の最後の行は DB に残って `stale` になりますが、signal には影響しません。
+の source ごとの監視必須 metric と、`config/internal-telemetry.yaml` で有効な入力
+（NVML と hwmon）です。パネル（`panels`）は表示専用で、入力が無効な metric は値が
+古くても signal に影響しません。無効化・撤去した入力の最後の行は DB に残って
+`stale` になり、パネルにはそのまま `stale` と表示されます。
 
 **`GET /api/v1/server-health` と `WS /api/v1/server-health/stream` の payload は同一です。**
 WebSocket 専用の封筒やフィールドは加えません。

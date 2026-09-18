@@ -54,7 +54,7 @@ from coldaisle.channels import (
     QUEUE_DROPS_METRIC,
 )
 from coldaisle.clock import Clock, WallClock
-from coldaisle.internal_telemetry import InternalTelemetryConfig
+from coldaisle.internal_telemetry import InternalTelemetryConfig, NvmlAdapter
 from coldaisle.metrics import MetricCatalog, compute_derived
 from coldaisle.store import Aggregation, Quality, QualityRules, SqliteStore
 from coldaisle.store.db import FIVE_MINUTES_MS, HOUR_MS, MINUTE_MS
@@ -202,17 +202,24 @@ def create_app(
     tools: ToolsFactory | None = None,
     health_summarizer: HealthSummarizer | None = None,
     health_hwmon_metrics: tuple[str, ...] | None = None,
+    health_nvml_metrics: tuple[str, ...] | None = None,
 ) -> FastAPI:
     settings = config or Config.from_env()
     catalog = MetricCatalog.from_yaml(settings.metrics)
     health_settings = ServerHealthSettings.from_yaml(settings.server_health, catalog=catalog)
-    if health_hwmon_metrics is None:
+    if health_hwmon_metrics is None or health_nvml_metrics is None:
         internal_telemetry = InternalTelemetryConfig.from_yaml(
             settings.internal_telemetry, catalog=catalog
         )
-        health_hwmon_metrics = tuple(
-            sensor.metric for sensor in internal_telemetry.hwmon.sensors if sensor.enabled
-        )
+        if health_hwmon_metrics is None:
+            health_hwmon_metrics = tuple(
+                sensor.metric
+                for sensor in internal_telemetry.hwmon.sensors
+                if internal_telemetry.hwmon.enabled and sensor.enabled
+            )
+        if health_nvml_metrics is None:
+            # adapter を作るだけでは NVML を初期化しない（初回 poll まで遅延する）
+            health_nvml_metrics = NvmlAdapter(internal_telemetry.nvml).expected_metrics
     provider = StoreProvider(settings, clock or WallClock())
 
     @asynccontextmanager
@@ -261,6 +268,7 @@ def create_app(
             health_summarizer,
             settings=health_settings,
             hwmon_metrics=health_hwmon_metrics,
+            nvml_metrics=health_nvml_metrics,
         )
 
     @app.get("/api/v1/latest", response_model=LatestResponse, response_model_by_alias=True)

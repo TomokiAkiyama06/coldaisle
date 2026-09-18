@@ -86,16 +86,9 @@ class ServerHealthSettings(_SettingsModel):
         settings.validate_metrics(catalog)
         return settings
 
-    def monitored_metrics(self) -> frozenset[str]:
-        """本設定が監視対象として宣言する metric。"""
-        return frozenset(
-            {
-                *self.sources.sensor_unit.required,
-                *self.sources.nvml.required,
-                *self.panels.gpu,
-                *self.panels.environment,
-            }
-        )
+    def required_metrics(self) -> frozenset[str]:
+        """source ごとの監視必須 metric。パネルは表示用で、ここに含めない。"""
+        return frozenset({*self.sources.sensor_unit.required, *self.sources.nvml.required})
 
     def validate_metrics(self, catalog: MetricCatalog) -> None:
         """誤記した metric は常に missing に見え、黙って監視から外れるため拒否する。"""
@@ -130,14 +123,16 @@ def build_server_health(
     *,
     settings: ServerHealthSettings,
     hwmon_metrics: tuple[str, ...],
+    nvml_metrics: tuple[str, ...],
 ) -> ServerHealthResponse:
     """DB の同じ current view から REST / WS 共通 payload を作る。"""
     readings = store.latest()
     alerts = list(store.alerts(state="firing", limit=100))
     sources = _monitoring_sources(store, readings, settings, hwmon_metrics)
     # 無効化・撤去した入力の最後の行は store.latest() に残り続け、やがて stale になる。
-    # 監視していない metric で signal を下げないよう、現在の監視対象だけを見る
-    monitored = settings.monitored_metrics() | frozenset(hwmon_metrics)
+    # 監視していない metric で signal を下げないよう、必須 metric と現在有効な入力だけを
+    # 見る。パネルは表示専用で、入力が無効なら値が古くても signal に影響させない
+    monitored = settings.required_metrics() | frozenset((*hwmon_metrics, *nvml_metrics))
     signal = _signal(sources, readings, alerts, settings.missing_tolerated, monitored)
     gpu = ServerGpuHealth(
         mode=store.current_state("sys.gpu_mode") or "unknown",
