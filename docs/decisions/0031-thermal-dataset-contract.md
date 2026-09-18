@@ -98,6 +98,12 @@ INSERT / UPDATE / DELETEを拒否する完了の印`dataset_source_run_complete`
 header行・空行・空欄（欠測として保存）・対応表に無い列・非有限値（qualityとして保存）は
 入力hashに含まれ同じbytesから同じDBになるため数えない（一覧は`docs/thermal-dataset.md`）。
 builderは完了の印が無いDBを拒否する。そのDBは破棄し、新しいDBで取り込み直す。
+完了の印はその時点のreadingsの件数とSHA-256（主キー順の全行）を封印として持つ。完了後は
+triggerがreadingsへのINSERT / UPDATE / DELETEを拒否し、`coldaisle-telemetry`の追記は失敗する。
+`coldaisle-rollup`はbind済みのdataset DBではロールアップと保持期間の適用自体を拒否する
+（削除0件でもControlTickは消え得るため）。builderは印の存在だけを信じず、封印したdigestを
+再計算して照合し、triggerを外したDB等で完了後にreadingsが変わっていれば拒否する。
+ControlTickは取り込み完了後に記録するため封印せず、manifestの`control_trace_sha256`で追跡する。
 
 同一のTelemetryとControlTick traceをSQLiteへ入れれば、同じmanifest / examplesを
 生成する。旧来のセンサーCSVにはFan actionが無いため、CSV単体から過去のactionを

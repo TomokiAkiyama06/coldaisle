@@ -29,6 +29,8 @@ from coldaisle.ingest.normalize import Normalizer
 from coldaisle.ingest.protocol import RawMessage
 from coldaisle.ingest.replay import ReplaySource
 from coldaisle.store import Quality, Reading, Sample, SqliteStore
+from coldaisle.store import rollup as rollup_module
+from coldaisle.store.rollup import RetentionRules
 from conftest import CALIBRATION_PATH, QUALITY_RULES_PATH
 
 CONTROL_FIXTURE = Path(__file__).resolve().parent / "fixtures" / "control_tick_v1.json"
@@ -341,6 +343,7 @@ def test_temporal_split_purges_examples_whose_window_or_label_crosses_a_boundary
 
 
 def test_builder_rejects_a_database_reused_outside_the_source_run(dataset_store):
+    _drop_seal_triggers(dataset_store)  # 封印より先に期間外の検査で拒否されることを見る
     dataset_store.insert_sample(reading_sample(12_000, **{"air.room": 99.0}))
 
     with pytest.raises(ValueError, match="専用DB"):
@@ -424,6 +427,8 @@ def test_builder_reads_all_series_from_one_sqlite_snapshot(
     )
     original_series = dataset_store.series
     injected = False
+    # 並行ingestを模すため封印triggerを外す。snapshot内のdigest検査は注入前の状態を見る
+    _drop_seal_triggers(dataset_store)
     with SqliteStore(database_path, rules=rules, clock=clock) as writer:
 
         def series_with_concurrent_ingest(metric, start_ms, end_ms, *, limit=None):
@@ -1066,3 +1071,59 @@ def test_header_collision_marks_the_dataset_replay_incomplete(tmp_path, rules):
         assert not store.dataset_source_run_completed()
     finally:
         store.close()
+
+
+def _drop_seal_triggers(store: SqliteStore) -> None:
+    """triggerを外したDB（手作業・旧版・別ツール）でも、digestで変更を検出できることを試す。"""
+    for action in ("insert", "update", "delete"):
+        store.connection.execute(f"DROP TRIGGER readings_sealed_no_{action}")
+
+
+def test_sealed_readings_refuse_writes_after_completion(dataset_store):
+    """完了後に別のwriter（telemetry追記・retention削除）が黙って書き換えられない。"""
+    with pytest.raises(sqlite3.IntegrityError, match="sealed"):
+        dataset_store.insert_sample(reading_sample(10_000, **{"air.room": 99.0}))
+    with pytest.raises(sqlite3.IntegrityError, match="sealed"):
+        dataset_store.connection.execute("DELETE FROM readings WHERE ts_ms = 2000")
+    with pytest.raises(sqlite3.IntegrityError, match="sealed"):
+        dataset_store.connection.execute("UPDATE readings SET value = 0 WHERE ts_ms = 2000")
+
+    assert ThermalDatasetBuilder(dataset_store).build(source_run=source_run(), spec=spec())
+
+
+def test_builder_refuses_readings_appended_after_completion(dataset_store):
+    _drop_seal_triggers(dataset_store)
+    dataset_store.insert_sample(reading_sample(10_000, **{"air.room": 99.0}))
+
+    with pytest.raises(ValueError, match="完了後にreadingsが変更"):
+        ThermalDatasetBuilder(dataset_store).build(source_run=source_run(), spec=spec())
+
+
+def test_builder_refuses_readings_deleted_after_completion(dataset_store):
+    _drop_seal_triggers(dataset_store)
+    dataset_store.connection.execute("DELETE FROM readings WHERE ts_ms = 9500")
+
+    with pytest.raises(ValueError, match="完了後にreadingsが変更"):
+        ThermalDatasetBuilder(dataset_store).build(source_run=source_run(), spec=spec())
+
+
+def test_builder_refuses_readings_updated_after_completion(dataset_store):
+    _drop_seal_triggers(dataset_store)
+    dataset_store.connection.execute("UPDATE readings SET value = 41.0 WHERE ts_ms = 7010")
+
+    with pytest.raises(ValueError, match="完了後にreadingsが変更"):
+        ThermalDatasetBuilder(dataset_store).build(source_run=source_run(), spec=spec())
+
+
+def test_rollup_and_retention_are_refused_on_a_dataset_db(dataset_store):
+    """保持期間でreadingsやControlTickを消すと、datasetの再生成が黙って別物になる。"""
+    retention = RetentionRules.from_yaml(QUALITY_RULES_PATH.parent / "retention.yaml")
+    traces_before = dataset_store.control_traces(0, 20_000)
+
+    with pytest.raises(ValueError, match="dataset専用DB"):
+        rollup_module.run(dataset_store, retention, now_ms=10**13)
+    with pytest.raises(ValueError, match="dataset専用DB"):
+        rollup_module.apply_retention(dataset_store, retention, now_ms=10**13)
+
+    assert dataset_store.control_traces(0, 20_000) == traces_before
+    assert ThermalDatasetBuilder(dataset_store).build(source_run=source_run(), spec=spec())

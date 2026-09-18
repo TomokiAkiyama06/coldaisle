@@ -201,6 +201,10 @@ def _validate_dedicated_source_db(store: SqliteStore, source_run: SourceRun) -> 
         raise ValueError(
             "dataset source runが欠けなく最後まで取り込まれていない（途中停止または取りこぼし）"
         )
+    # 印の存在だけを信じない。完了後に別のwriterがreadingsを追記・削除していれば
+    # 封印したdigestと一致しない（triggerを外したDB等も含めて検出する）
+    if store.readings_digest() != store.dataset_readings_seal():
+        raise ValueError("dataset source runの完了後にreadingsが変更されている")
 
 
 def _parse_tick(trace: ControlTraceRecord) -> tuple[ControlTick, dict[str, object]]:

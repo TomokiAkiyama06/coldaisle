@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import math
 import re
 import sqlite3
@@ -588,25 +589,53 @@ class SqliteStore:
         """bind済みrunが入力を最後まで取り込んだことを、上書き不能で1回だけ記録する。
 
         bindは入力全体のhashを先に固定するため、途中停止したrunと区別する印が要る。
+        印にはその時点のreadings件数とdigestを封印として持たせる。印の存在だけを
+        信じると、完了後に別のwriterが追記・削除したDBも通ってしまう。
         """
         if at_ms < 0:
             raise ValueError("dataset source runの完了時刻が不正")
         try:
             with self.transaction():
+                count, digest = self.readings_digest()
                 self._conn.execute(
-                    "INSERT INTO dataset_source_run_complete (singleton, completed_ms) "
-                    "VALUES (1, ?)",
-                    (at_ms,),
+                    "INSERT INTO dataset_source_run_complete "
+                    "(singleton, completed_ms, readings_count, readings_sha256) "
+                    "VALUES (1, ?, ?, ?)",
+                    (at_ms, count, digest),
                 )
         except sqlite3.IntegrityError as exc:
             raise ValueError("dataset source runを完了として記録できない") from exc
 
     def dataset_source_run_completed(self) -> bool:
         """bind済みrunが入力を最後まで取り込み終えているか。"""
+        return self.dataset_readings_seal() is not None
+
+    def dataset_readings_seal(self) -> tuple[int, str] | None:
+        """完了時に封印したreadingsの(件数, SHA-256)。未完了なら`None`。"""
         row = self._conn.execute(
-            "SELECT 1 FROM dataset_source_run_complete WHERE singleton = 1"
+            "SELECT readings_count, readings_sha256 FROM dataset_source_run_complete "
+            "WHERE singleton = 1"
         ).fetchone()
-        return row is not None
+        if row is None:
+            return None
+        return int(row["readings_count"]), str(row["readings_sha256"])
+
+    def readings_digest(self) -> tuple[int, str]:
+        """readings全行の(件数, SHA-256)。主キー順に1行ずつ流してhashする。
+
+        値は`repr`で表す。Pythonのfloat reprは往復可能で決定的なため、同じ行集合なら
+        同じdigestになる。
+        """
+        digest = hashlib.sha256()
+        count = 0
+        cursor = self._conn.execute(
+            "SELECT metric, ts_ms, value, quality FROM readings ORDER BY metric, ts_ms"
+        )
+        for metric, ts_ms, value, quality in cursor:
+            digest.update(repr((metric, ts_ms, value, quality)).encode("utf-8"))
+            digest.update(b"\n")
+            count += 1
+        return count, digest.hexdigest()
 
     def active_alert(self, rule_id: str, metric: str | None) -> AlertRecord | None:
         """未解決（`pending` / `firing`）のアラート。
