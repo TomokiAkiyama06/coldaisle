@@ -75,6 +75,10 @@ def test_migration_creates_exactly_the_decided_objects():
         ("table", "control_traces"),
         ("index", "ix_control_traces_tick"),
         ("table", "periodic_metric_registrations"),
+        ("table", "events"),
+        ("index", "ix_events_ts"),
+        ("trigger", "events_no_update"),
+        ("trigger", "events_no_delete"),
     }
 
 

@@ -178,7 +178,7 @@ function expectedStep(entry) {
 }
 
 /** 依存の無い折れ線。Chart.js を読み込まない（オフラインでも見えるようにするため）。 */
-function drawChart(svgId, legendId, series) {
+function drawChart(svgId, legendId, series, annotations = []) {
   const svg = document.getElementById(svgId);
   const legend = document.getElementById(legendId);
   svg.replaceChildren();
@@ -211,6 +211,16 @@ function drawChart(svgId, legendId, series) {
   svg.appendChild(text(pad.left, box.height - 5, new Date(minX).toLocaleTimeString(), "start"));
   svg.appendChild(text(box.width - pad.right, box.height - 5, new Date(maxX).toLocaleTimeString(), "end"));
 
+  // GPU Mode の切り替え（#67）を縦線で重ねる。温度の変化と原因を同じ時間軸で見るため
+  for (const event of annotations) {
+    if (event.ts_ms < minX || event.ts_ms > maxX) continue;
+    const x = sx(event.ts_ms);
+    const mark = line(x, pad.top, x, box.height - pad.bottom, "#d2a8ff");
+    mark.setAttribute("stroke-dasharray", "4 3");
+    svg.appendChild(mark);
+    svg.appendChild(text(x + 3, pad.top + 10, annotationLabel(event), "start"));
+  }
+
   series.forEach((entry, index) => {
     const color = SERIES_COLORS[index % SERIES_COLORS.length];
     // 欠測で線をつながない。つなぐと「その間も測れていた」ように見える。
@@ -238,6 +248,14 @@ function drawChart(svgId, legendId, series) {
     item.appendChild(document.createTextNode(entry.metric));
     legend.appendChild(item);
   });
+}
+
+/** 注釈の文言。**API の文字列は textContent でだけ使う**（要件 §7.4）。 */
+function annotationLabel(event) {
+  if (event.kind === "gpu_mode" && event.payload && typeof event.payload.mode === "string") {
+    return `GPU ${event.payload.mode}`;
+  }
+  return event.kind;
 }
 
 function svgNode(name, attrs) {
@@ -282,10 +300,16 @@ async function loadHistory() {
       )
     );
 
+  // 注釈が取れなくてもグラフは描く。注釈は補助であり、無いことで履歴を隠さない
+  const loadEvents = () =>
+    fetchJson("/api/v1/events", { window: currentRange.window, kind: "gpu_mode" })
+      .then((body) => body.events)
+      .catch(() => []);
+
   try {
-    const [tempSeries, humiditySeries] = await Promise.all([load(temps), load(humidity)]);
-    drawChart("chart-temp", "legend-temp", tempSeries);
-    drawChart("chart-humidity", "legend-humidity", humiditySeries);
+    const [tempSeries, humiditySeries, events] = await Promise.all([load(temps), load(humidity), loadEvents()]);
+    drawChart("chart-temp", "legend-temp", tempSeries, events);
+    drawChart("chart-humidity", "legend-humidity", humiditySeries, events);
     const used = tempSeries[0] || humiditySeries[0];
     note.textContent = used
       ? `粒度 ${used.agg}${used.downsampled ? "（点数の上限に合わせて粗くしました）" : ""}`

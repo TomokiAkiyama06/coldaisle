@@ -117,6 +117,8 @@ def test_script_reads_only_documented_endpoints():
         "/api/v1/health",
         "/api/v1/alerts",
         "/api/v1/devices",
+        # GPU Mode の切り替えの縦線（#67）。読み取り専用
+        "/api/v1/events",
     }
     assert "/api/v1/stream" in script, "WebSocket を使う（FR-306）"
 

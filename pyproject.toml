@@ -50,6 +50,10 @@ coldaisle-calibrate = "coldaisle.calibrate:main"
 coldaisle-safety-handoff = "coldaisle.safety_handoff:main"
 # NVML / hwmon を既存 readings timeline へ収集する読み取り専用 daemon（#65）
 coldaisle-telemetry = "coldaisle.telemetry_daemon:main"
+# 書き込み専用のローカル Unix ソケット入口。読み取り API とは別（#67 / 決定記録 0045）
+coldaisle-eventd = "coldaisle.event_entry.server:main"
+# 上の入口へ1件送るクライアント（例: coldaisle-event gpu-mode compute）
+coldaisle-event = "coldaisle.event_entry.client:main"
 
 [build-system]
 requires = ["hatchling"]
