@@ -21,10 +21,18 @@ from enum import StrEnum
 from fcntl import LOCK_EX, LOCK_UN, flock
 from hashlib import sha256
 from pathlib import Path
-from typing import Any, Literal, Self
+from typing import Annotated, Any, Literal, Self
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    FailFast,
+    Field,
+    ValidationError,
+    field_validator,
+    model_validator,
+)
 
 from coldaisle.clock import Clock, WallClock
 from coldaisle.control.schema import AuthorityStage
@@ -121,6 +129,7 @@ class ArtifactLoadStatus(StrEnum):
 
 
 HyperparameterValue = str | int | float | bool | None
+_HYPERPARAMETER_TYPES = (str, int, float, bool, type(None))
 
 
 class ArtifactRef(_Frozen):
@@ -156,6 +165,17 @@ class ArtifactMetadata(_Frozen):
     offline_evaluation_ref: str | None = Field(default=None, min_length=1, max_length=500)
     shadow_evaluation_ref: str | None = Field(default=None, min_length=1, max_length=500)
     authority_compatibility: tuple[AuthorityStage, ...] = Field(min_length=1)
+
+    @field_validator("hyperparameters", mode="before")
+    @classmethod
+    def _hyperparameters_fail_fast(cls, value: object) -> object:
+        # Pydantic reports every failing union member of every value; on a corrupt
+        # snapshot that is several error objects per JSON token.  Stop at the first.
+        if isinstance(value, dict):
+            for item in value.values():
+                if not isinstance(item, _HYPERPARAMETER_TYPES):
+                    raise ValueError("hyperparameter はscalarにする")
+        return value
 
     @field_validator("created_at")
     @classmethod
@@ -246,6 +266,15 @@ class RegistryAuditEvent(_Frozen):
     approval: HumanApproval | None = None
 
     @model_validator(mode="after")
+    def _previous_artifact_belongs_to_pointer_change(self) -> Self:
+        # Only promotion / rollback move a production pointer, so only they can name
+        # the artifact they replaced.  Anything else would be unreplayed state.
+        pointer_changes = {RegistryEventKind.PROMOTED, RegistryEventKind.ROLLED_BACK}
+        if self.previous_artifact is not None and self.event not in pointer_changes:
+            raise ValueError("previous_artifact は promotion / rollback audit だけが持つ")
+        return self
+
+    @model_validator(mode="after")
     def _rollback_target_belongs_to_promotion(self) -> Self:
         if self.rollback_target is None:
             return self
@@ -283,6 +312,16 @@ class RegistryAuditEvent(_Frozen):
         return self
 
 
+def _validate_member[ModelT: BaseModel](model: type[ModelT], value: object) -> ModelT:
+    """Validate one container member, collapsing its errors into a single ValueError."""
+    if isinstance(value, model):
+        return value
+    try:
+        return model.model_validate_json(json.dumps(value))
+    except (TypeError, ValueError):
+        raise ValueError(f"{model.__name__} を検証できない") from None
+
+
 class RegistrySnapshot(_Frozen):
     """Atomically replaced complete registry state."""
 
@@ -290,7 +329,35 @@ class RegistrySnapshot(_Frozen):
     revision: int = Field(ge=0)
     artifacts: dict[str, ArtifactRecord] = Field(default_factory=dict)
     production: dict[ArtifactKind, ProductionSlot] = Field(default_factory=dict)
-    audit: tuple[RegistryAuditEvent, ...] = ()
+    # FailFast / the fail-fast validators below keep a corrupt snapshot from producing
+    # one ValidationError entry per element, which would cost far more memory than the
+    # structure-bounded JSON itself (decision in docs/model-registry.md).
+    audit: Annotated[tuple[RegistryAuditEvent, ...], FailFast()] = ()
+
+    @field_validator("artifacts", mode="before")
+    @classmethod
+    def _artifacts_fail_fast(cls, value: object) -> object:
+        # A "before" validator makes Pydantic hand over plain Python values, so each
+        # record is validated here (with the snapshot's JSON semantics) and returned as
+        # a model instance.  Stopping at the first bad record bounds the error count.
+        if not isinstance(value, dict):
+            return value
+        return {key: _validate_member(ArtifactRecord, record) for key, record in value.items()}
+
+    @field_validator("production", mode="before")
+    @classmethod
+    def _production_fail_fast(cls, value: object) -> object:
+        if not isinstance(value, dict):
+            return value
+        if len(value) > len(ArtifactKind):
+            raise ValueError("production pointer が artifact kind の数を超えている")
+        try:
+            return {
+                ArtifactKind(kind): _validate_member(ProductionSlot, slot)
+                for kind, slot in value.items()
+            }
+        except ValueError:
+            raise ValueError("production pointer を検証できない") from None
 
     @model_validator(mode="after")
     def _pointers_and_lifecycle_agree(self) -> Self:
@@ -483,6 +550,8 @@ class ModelRegistryLimits(_Frozen):
     max_snapshot_bytes: int = Field(gt=0)
     max_json_nesting_depth: int = Field(gt=0)
     max_json_tokens: int = Field(gt=0)
+    max_snapshot_json_nesting_depth: int = Field(gt=0)
+    max_snapshot_json_tokens: int = Field(gt=0)
 
     @classmethod
     def from_file(cls, path: Path) -> ModelRegistryLimits:
@@ -556,6 +625,36 @@ class _AuthorityIncompatibleError(ArtifactVerificationError):
 
 class _InvalidArtifactFormatError(ArtifactVerificationError):
     pass
+
+
+class _JsonStructureError(ValueError):
+    """JSON bytes exceed a configured structure bound or are lexically unbalanced."""
+
+
+def _scan_json_structure(payload: bytes, *, max_depth: int, max_tokens: int) -> None:
+    """Single linear pass over JSON bytes enforcing depth / token bounds.
+
+    Runs before any parser materializes the object graph, so a small file made of
+    millions of tiny containers is rejected without allocating per-element objects.
+    """
+    depth = 0
+    tokens = 0
+    for match in _JSON_STRUCTURE_TOKEN.finditer(payload):
+        first = match.group()[:1]
+        if first == b'"' and not match.group(1):
+            raise _JsonStructureError("文字列が閉じていない")
+        if first in (b"]", b"}"):
+            depth -= 1
+            if depth < 0:
+                raise _JsonStructureError("括弧が対応していない")
+            continue
+        tokens += 1
+        if tokens > max_tokens:
+            raise _JsonStructureError("token 数が上限を超えている")
+        if first in (b"[", b"{"):
+            depth += 1
+            if depth > max_depth:
+                raise _JsonStructureError("nesting が上限を超えている")
 
 
 class ModelRegistry:
@@ -980,27 +1079,21 @@ class ModelRegistry:
             raise _InvalidArtifactFormatError("JSON artifact は object または array にする")
 
     def _check_json_structure_bounds(self, payload: bytes) -> None:
-        """Single pass over the bytes enforcing configured depth / token bounds."""
-        max_depth = self._limits.max_json_nesting_depth
-        max_tokens = self._limits.max_json_tokens
-        depth = 0
-        tokens = 0
-        for match in _JSON_STRUCTURE_TOKEN.finditer(payload):
-            first = match.group()[:1]
-            if first == b'"' and not match.group(1):
-                raise _InvalidArtifactFormatError("JSON artifact の文字列が閉じていない")
-            if first in (b"]", b"}"):
-                depth -= 1
-                if depth < 0:
-                    raise _InvalidArtifactFormatError("JSON artifact の括弧が対応していない")
-                continue
-            tokens += 1
-            if tokens > max_tokens:
-                raise _InvalidArtifactFormatError("JSON artifact の token 数が上限を超えている")
-            if first in (b"[", b"{"):
-                depth += 1
-                if depth > max_depth:
-                    raise _InvalidArtifactFormatError("JSON artifact の nesting が上限を超えている")
+        try:
+            _scan_json_structure(
+                payload,
+                max_depth=self._limits.max_json_nesting_depth,
+                max_tokens=self._limits.max_json_tokens,
+            )
+        except _JsonStructureError as exc:
+            raise _InvalidArtifactFormatError(f"JSON artifact: {exc}") from exc
+
+    def _check_snapshot_structure_bounds(self, payload: bytes) -> None:
+        _scan_json_structure(
+            payload,
+            max_depth=self._limits.max_snapshot_json_nesting_depth,
+            max_tokens=self._limits.max_snapshot_json_tokens,
+        )
 
     def _read_snapshot(self, root_fd: int | None = None) -> RegistrySnapshot:
         if root_fd is None:
@@ -1020,6 +1113,8 @@ class ModelRegistry:
             )
             if payload is None:
                 return RegistrySnapshot(revision=0)
+            # Bound the parsed graph before Pydantic materializes it (same as artifacts).
+            self._check_snapshot_structure_bounds(payload)
             return RegistrySnapshot.model_validate_json(payload)
         except (
             OSError,
@@ -1035,6 +1130,10 @@ class ModelRegistry:
         if len(payload) > self._limits.max_snapshot_bytes:
             # Writing it would make every later read fail as INVALID_REGISTRY.
             raise RegistryCapacityError("registry snapshot がsize上限を超える")
+        try:
+            self._check_snapshot_structure_bounds(payload)
+        except _JsonStructureError as exc:
+            raise RegistryCapacityError(f"registry snapshot が構造上限を超える: {exc}") from exc
         self._atomic_write(root_fd, _STATE_FILENAME, payload)
 
     def _read_artifact(self, root_fd: int, ref: ArtifactRef) -> bytes:

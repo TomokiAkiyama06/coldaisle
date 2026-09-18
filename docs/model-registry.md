@@ -12,9 +12,16 @@ Model、Supervisor Policy、Feature Transform の artifact lifecycle をロー�
 - 読込・確保の上限は `config/model-registry.yaml` にだけ置き、コードに既定値を持たない
   （AGENTS.md ルール9）。`ModelRegistry(root, clock, limits=load_model_registry_limits(Path("config")))`
   のように必ず渡す。
-- `registry.json` は `max_snapshot_bytes`（現在16 MiB）を上限とし、artifactと同じくfstatでsizeを
-  確認してから読む。超えたsnapshotは確保せずに `INVALID_REGISTRY` としてFallbackさせる。
+- `registry.json` は `max_snapshot_bytes`（現在4 MiB）を上限とし、artifactと同じくfstatでsizeを
+  確認してから読む。さらにPydanticが検証する前に、artifactと同じ1 passの走査で入れ子の深さ
+  （`max_snapshot_json_nesting_depth`、現在16）と値の数（`max_snapshot_json_tokens`、現在250,000）を
+  検査する。どれかを超えたsnapshotは確保せずに `INVALID_REGISTRY` としてFallbackさせる。
   上限を超えるsnapshotは書き込みも `RegistryCapacityError` で拒否し、自分で読めない状態を作らない。
+  正当なsnapshotは約18 byte/token、約52 token/audit eventで、token上限より先にbyte上限
+  （約4,000 event）に達する。
+- 壊れたsnapshotの検証で、Pydanticが要素ごとにerrorを積み上げないようにする。error objectは
+  JSON tokenよりはるかに大きいためである。`audit` は `FailFast`、`artifacts` / `production` /
+  `hyperparameters` は最初の不正な要素で止まるvalidatorを通すので、error数は要素数に比例しない。
 - artifact payloadは `max_artifact_bytes`（現在8 MiB）を上限とし、登録時と読込時の両方で拒否する。読込は
   `open(O_NOFOLLOW | O_NONBLOCK)`した同じfdを`fstat()`してregular fileとsizeを先に確認し、
   preflight時のsize分とgrowth検出用1 byteだけを読む。FIFOで停止せず、読込中の短縮・拡張や
@@ -65,6 +72,7 @@ Rollback前にも旧artifactのchecksumとschema互換性を再検証し、成�
 `HumanApproval` はaction、target artifact ref、checksum、承認対象revisionへ固定し、別artifact・
 別操作・更新後snapshotへ再利用できない。snapshot読込時はauditを先頭から再生し、登録、検証、
 承認付きpromotion / rollbackを経ずに作られたProduction pointerを拒否する。
+`previous_artifact` はpointerを動かすpromotion / rollbackのauditだけが持てる。
 
 ## 後続Issueとの接続
 

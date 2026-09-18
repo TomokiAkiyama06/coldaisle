@@ -789,6 +789,158 @@ def test_oversized_snapshot_is_rejected_by_fstat_as_invalid_registry(
         registry.inspect()
 
 
+def snapshot_document(**overrides: object) -> bytes:
+    document: dict[str, object] = {
+        "schema_version": 1,
+        "revision": 0,
+        "artifacts": {},
+        "production": {},
+        "audit": [],
+    }
+    document.update(overrides)
+    return json.dumps(document).encode()
+
+
+def json_token_count(payload: bytes) -> int:
+    closers = (b"]", b"}")
+    return sum(
+        1
+        for match in registry_module._JSON_STRUCTURE_TOKEN.finditer(payload)
+        if match.group()[:1] not in closers
+    )
+
+
+def test_snapshot_with_many_tiny_containers_is_rejected_before_pydantic(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "registry"
+    registry = ModelRegistry(root, SimulatedClock(NOW_MS), limits=LIMITS)
+    register_and_validate(registry, "1.0.0")
+    tiny = b"[" + b",".join([b"[]"] * LIMITS.max_snapshot_json_tokens) + b"]"
+    assert len(tiny) <= LIMITS.max_snapshot_bytes
+    deep = b"[" * (LIMITS.max_snapshot_json_nesting_depth + 1)
+    deep += b"]" * (LIMITS.max_snapshot_json_nesting_depth + 1)
+
+    def refuse_parse(*args: object, **kwargs: object) -> object:
+        raise AssertionError("over-bound snapshot must not reach Pydantic")
+
+    monkeypatch.setattr(RegistrySnapshot, "model_validate_json", refuse_parse)
+    for body in (tiny, deep):
+        (root / "registry.json").write_bytes(body)
+
+        result = registry.load_production(ArtifactKind.THERMAL_MODEL, COMPATIBILITY)
+
+        assert result.status is ArtifactLoadStatus.INVALID_REGISTRY
+        assert result.fallback_required is True
+        with pytest.raises(RegistryCorruptError):
+            registry.inspect()
+
+
+@pytest.mark.parametrize(
+    "document",
+    [
+        snapshot_document(audit=[{}] * 1000),
+        snapshot_document(artifacts={f"k{i}": {} for i in range(1000)}),
+        snapshot_document(production={f"k{i}": {} for i in range(1000)}),
+        snapshot_document(
+            artifacts={
+                metadata("1.0.0").ref.key: {
+                    "metadata": metadata("1.0.0").model_dump(mode="json")
+                    | {"hyperparameters": {f"k{i}": {} for i in range(1000)}},
+                    "status": "candidate",
+                }
+            }
+        ),
+    ],
+    ids=["audit", "artifacts", "production", "hyperparameters"],
+)
+def test_corrupt_snapshot_reports_a_bounded_number_of_errors(document: bytes) -> None:
+    # Error objects cost far more than the JSON tokens; the count must not scale with them.
+    with pytest.raises(ValidationError) as caught:
+        RegistrySnapshot.model_validate_json(document)
+
+    assert caught.value.error_count() <= 20
+
+
+def test_legitimate_history_reaches_the_byte_bound_before_the_token_bound(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "registry"
+    registry = ModelRegistry(root, SimulatedClock(NOW_MS), limits=LIMITS)
+    for index in range(20):
+        version = f"1.0.{index}"
+        register_and_validate(registry, version)
+        promote(registry, version)
+    payload = (root / "registry.json").read_bytes()
+    tokens_per_byte = json_token_count(payload) / len(payload)
+
+    assert tokens_per_byte * LIMITS.max_snapshot_bytes < LIMITS.max_snapshot_json_tokens
+
+
+def test_snapshot_exceeding_the_token_bound_is_never_written(tmp_path: Path) -> None:
+    root = tmp_path / "registry"
+    registry = ModelRegistry(root, SimulatedClock(NOW_MS), limits=LIMITS)
+    register_and_validate(registry, "1.0.0")
+    before = (root / "registry.json").read_bytes()
+    tight = ModelRegistry(
+        root,
+        SimulatedClock(NOW_MS),
+        limits=LIMITS.model_copy(update={"max_snapshot_json_tokens": json_token_count(before)}),
+    )
+
+    with pytest.raises(RegistryCapacityError):
+        tight.retire(
+            metadata("1.0.0").ref,
+            actor="evaluator",
+            reason="superseded",
+            expected_revision=tight.inspect().revision,
+        )
+
+    assert (root / "registry.json").read_bytes() == before
+
+
+@pytest.mark.parametrize(
+    "event",
+    [RegistryEventKind.REGISTERED, RegistryEventKind.VALIDATED, RegistryEventKind.RETIRED],
+)
+def test_previous_artifact_is_rejected_outside_pointer_changes(
+    event: RegistryEventKind,
+) -> None:
+    with pytest.raises(ValidationError, match="previous_artifact"):
+        registry_module.RegistryAuditEvent(
+            revision=1,
+            occurred_at_ms=NOW_MS,
+            event=event,
+            artifact=metadata("2.0.0").ref,
+            previous_artifact=metadata("1.0.0").ref,
+            actor="trainer",
+            reason="lifecycle change",
+        )
+
+
+def test_snapshot_cannot_smuggle_previous_artifact_into_validation_audit(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "registry"
+    registry = ModelRegistry(root, SimulatedClock(NOW_MS), limits=LIMITS)
+    register_and_validate(registry, "1.0.0")
+    register_and_validate(registry, "2.0.0")
+    registry.retire(
+        metadata("2.0.0").ref,
+        actor="evaluator",
+        reason="superseded",
+        expected_revision=registry.inspect().revision,
+    )
+    document = json.loads((root / "registry.json").read_text())
+    for index in (1, 4):  # VALIDATED 1.0.0, RETIRED 2.0.0
+        forged = json.loads(json.dumps(document))
+        forged["audit"][index]["previous_artifact"] = metadata("1.0.0").ref.model_dump(mode="json")
+
+        with pytest.raises(ValidationError, match="previous_artifact"):
+            RegistrySnapshot.model_validate_json(json.dumps(forged))
+
+
 def test_snapshot_exceeding_the_bound_is_never_written(tmp_path: Path) -> None:
     root = tmp_path / "registry"
     registry = ModelRegistry(root, SimulatedClock(NOW_MS), limits=LIMITS)
