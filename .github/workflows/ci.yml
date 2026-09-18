@@ -33,5 +33,5 @@ jobs:
       - run: uv run ruff format --check .
       - run: uv run mypy src
 
-      # 実機必須のテストは除外する（AGENTS.md ルール4）
-      - run: uv run pytest -k "not hardware" --cov --cov-report=term-missing --cov-fail-under=70
+      # 実機必須のテストは登録済み marker で除外する（AGENTS.md ルール7）
+      - run: uv run pytest -m "not hardware" --cov --cov-report=term-missing --cov-fail-under=70
