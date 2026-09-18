@@ -98,23 +98,26 @@ hwmon:
       confirmation:
         status: confirmed
         basis: "2026-09-12頃に実機でnct6799のfanN/pwmNと物理ファン位置を突き合わせ（所有者の記録 pro6000_fan_pwm_mapping_v14）。2026-09-18に所有者が対応を確認"
-    # 温度の候補（label は再起動で変わらない）。所有者の確認待ちのため無効。
+    # 温度（label は再起動で変わらない）。2026-09-18 に実機で読み取り、同日に所有者が承認。
     - metric: cpu.package
-      enabled: false
+      enabled: true
       driver: asusec
       label: "CPU Package"
       measurement: temperature
+      required: true
       confirmation:
-        status: provisional
-      disabled_reason: "2026-09-18 に実機の hwmon label を読み取って候補にした。所有者の確認後に enabled と confirmed にする"
+        status: confirmed
+        basis: "2026-09-18に実機サーバーでhwmonのdriverとlabelを読み取って対応を確認。同日に所有者が承認"
     - metric: cpu.vrm
-      enabled: false
+      enabled: true
       driver: asusec
       label: VRM
       measurement: temperature
       confirmation:
-        status: provisional
-      disabled_reason: "2026-09-18 に実機の hwmon label を読み取って候補にした。所有者の確認後に enabled と confirmed にする"
+        status: confirmed
+        basis: "2026-09-18に実機サーバーでhwmonのdriverとlabelを読み取って対応を確認。同日に所有者が承認"
+    # board.chipset は所有者承認済みだが、2026-09-18 の実機読み取りで PCH_CHIP_TEMP が
+    # 常に 0 °C（PCH_* の3入力すべて 0）だったため無効のまま。0 を ok として保存しないため。
     - metric: board.chipset
       enabled: false
       driver: nct6799
@@ -122,4 +125,4 @@ hwmon:
       measurement: temperature
       confirmation:
         status: provisional
-      disabled_reason: "2026-09-18 に実機の hwmon label を読み取って候補にした。所有者の確認後に enabled と confirmed にする"
+      disabled_reason: "2026-09-18の実機読み取りでPCH_CHIP_TEMPが常に0 °C（未配線または未対応とみられる）。0を正常値として保存しないため、実値を返す入力の確認まで無効"
