@@ -116,6 +116,31 @@ hwmon:
       confirmation:
         status: confirmed
         basis: "2026-09-18に実機サーバーでhwmonのdriverとlabelを読み取って対応を確認。同日に所有者が承認"
+    # k10temp（AMD Ryzen の CPU 内蔵センサー）。決定記録 0043。Advisory（0029）なので required にしない。
+    - metric: cpu.tctl
+      enabled: true
+      driver: k10temp
+      label: Tctl
+      measurement: temperature
+      confirmation:
+        status: confirmed
+        basis: "2026-09-18に実機サーバーでk10tempのlabel（Tctl / Tccd1 / Tccd2）を読み取って対応を確認。同日に所有者がセッション内で有効化を承認（メトリクス名は決定記録0043で同日に承認）"
+    - metric: cpu.ccd1
+      enabled: true
+      driver: k10temp
+      label: Tccd1
+      measurement: temperature
+      confirmation:
+        status: confirmed
+        basis: "2026-09-18に実機サーバーでk10tempのlabel（Tctl / Tccd1 / Tccd2）を読み取って対応を確認。同日に所有者がセッション内で有効化を承認（メトリクス名は決定記録0043で同日に承認）"
+    - metric: cpu.ccd2
+      enabled: true
+      driver: k10temp
+      label: Tccd2
+      measurement: temperature
+      confirmation:
+        status: confirmed
+        basis: "2026-09-18に実機サーバーでk10tempのlabel（Tctl / Tccd1 / Tccd2）を読み取って対応を確認。同日に所有者がセッション内で有効化を承認（メトリクス名は決定記録0043で同日に承認）"
     # board.chipset は所有者承認済みだが、2026-09-18 の実機読み取りで PCH_CHIP_TEMP が
     # 常に 0 °C（PCH_* の3入力すべて 0）だったため無効のまま。0 を ok として保存しないため。
     - metric: board.chipset
