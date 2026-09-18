@@ -106,7 +106,8 @@ class Stats:
     """後追いで送った Evidence 形式の説明の数（#38）。"""
     unknown_channels: set[str] = field(default_factory=set)
     dataset_incomplete: bool = False
-    """dataset用Replayが入力の最後まで届かずに止まった（#83）。完了の印は付けない。"""
+    """dataset用Replayが入力の最後まで届かずに止まった、または途中のsampleを捨てた（#83）。
+    完了の印は付けない。"""
 
     def as_fields(self) -> dict[str, object]:
         return {
@@ -312,12 +313,24 @@ class Daemon:
 
         bindは入力全体のhashを先に固定する。停止要求で途中終了したDBに完了の印を
         付けると、先頭だけのdatasetが全体のprovenanceで公開されてしまう。
+        EOFまで届いても、正規化・保存に失敗して捨てたsampleがあればDBは入力の一部に
+        なるため同じく未完了とする（取り込みループ自体は1件の失敗で落とさない）。
         """
-        if reached_eof:
+        lost = self.stats.discarded + self.stats.queue_drops
+        if reached_eof and lost == 0:
             self._store.complete_dataset_source_run(at_ms=self._normalizer.clock.now_ms())
             return
         self.stats.dataset_incomplete = True
-        LOGGER.error("dataset用Replayが途中で止まった。このDBからdatasetは作れない")
+        LOGGER.error(
+            "dataset用Replayが入力を欠けなく取り込めなかった。このDBからdatasetは作れない",
+            extra={
+                logs.FIELDS_KEY: {
+                    "reached_eof": reached_eof,
+                    "discarded": self.stats.discarded,
+                    "queue_drops": self.stats.queue_drops,
+                }
+            },
+        )
 
     def _put_blocking(
         self,

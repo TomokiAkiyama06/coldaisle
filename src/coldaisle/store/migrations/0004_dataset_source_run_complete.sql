@@ -1,7 +1,8 @@
 -- 0004_dataset_source_run_complete: #83 のdataset Replayが入力を最後まで取り込んだ印。
 --
 -- dataset_source_run は取り込み開始前に入力全体のSHA-256をbindする。途中で停止した
--- runではDBが入力の先頭だけになるため、EOFまで取り込めたときだけ1回INSERTする。
+-- runやsampleを捨てたrunではDBが入力の一部になるため、EOFまで欠けなく取り込めたときだけ
+-- 1回INSERTする。
 -- builderはこの行が無いDBを拒否する。0003と同じくsingletonで上書き不能にする。
 
 CREATE TABLE dataset_source_run_complete (

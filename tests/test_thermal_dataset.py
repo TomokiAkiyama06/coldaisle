@@ -818,3 +818,70 @@ def test_daemon_cli_exits_non_zero_when_dataset_replay_is_interrupted(
     )
 
     assert code == expected_code
+
+
+def _fail_one_insert(monkeypatch: pytest.MonkeyPatch, *, at_call: int) -> None:
+    """保存の失敗を1件だけ起こす。取り込みループは捨てて継続する。"""
+    original = SqliteStore.insert_sample
+    calls = {"n": 0}
+
+    def insert_sample(self: SqliteStore, sample: Sample) -> int:
+        calls["n"] += 1
+        if calls["n"] == at_call:
+            raise sqlite3.OperationalError("disk I/O error")
+        return original(self, sample)
+
+    monkeypatch.setattr(SqliteStore, "insert_sample", insert_sample)
+
+
+def test_dataset_replay_with_a_discarded_sample_is_not_complete(tmp_path, rules, monkeypatch):
+    """EOFまで届いても、途中で1件捨てたDBは入力の一部しか持たない。"""
+    run = _replay_run(tmp_path, 20)
+    _fail_one_insert(monkeypatch, at_call=3)
+    replay = ReplaySource(
+        tmp_path / "replay.csv", tz=ZoneInfo("UTC"), bulk=True, dataset_provenance=True
+    )
+    with SqliteStore(tmp_path / "run.db", rules=rules, clock=replay.clock) as store:
+        daemon = Daemon(
+            source=replay,
+            store=store,
+            normalizer=Normalizer(rules=rules, calibration=Calibration(), clock=replay.clock),
+            source_name="replay",
+            dataset_run_alias=RUN_ALIAS,
+        )
+        stats = daemon.run()
+        ControlTraceLogger(store).record(fixture_tick(ts_ms=5_000))
+
+        assert stats.discarded == 1
+        assert stats.samples == 19, "1件の失敗で取り込みループは落ちない"
+        assert stats.dataset_incomplete
+        assert not store.dataset_source_run_completed()
+        with pytest.raises(ValueError, match="途中停止"):
+            ThermalDatasetBuilder(store).build(source_run=run, spec=spec())
+
+
+def test_daemon_cli_exits_non_zero_when_a_dataset_sample_is_discarded(tmp_path, monkeypatch):
+    _long_replay_csv(tmp_path / "replay.csv", 20)
+    _fail_one_insert(monkeypatch, at_call=3)
+
+    code = daemon_module.main(
+        [
+            "--source",
+            "replay",
+            "--csv",
+            str(tmp_path / "replay.csv"),
+            "--bulk",
+            "--timezone",
+            "UTC",
+            "--dataset-run-alias",
+            RUN_ALIAS,
+            "--db",
+            str(tmp_path / "cli.db"),
+            "--quality-rules",
+            str(QUALITY_RULES_PATH),
+            "--calibration",
+            str(CALIBRATION_PATH),
+        ]
+    )
+
+    assert code == 1
