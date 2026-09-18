@@ -241,6 +241,17 @@ def test_poll_period_subtracts_the_work_time(tmp_path: Path, rules):
     assert daemon.stats.skipped_slots == 0
 
 
+def test_work_ending_exactly_on_the_deadline_is_not_an_overrun(tmp_path: Path, rules):
+    """処理が周期ちょうどで終わった場合は枠を飛ばさず、すぐ次を収集する。"""
+    daemon, store, sleeps = _paced_daemon(tmp_path, rules, work_ms=2_500)
+
+    daemon.run(max_cycles=3)
+
+    assert _poll_starts(store) == [0, 2_500, 5_000]
+    assert sleeps == []
+    assert daemon.stats.skipped_slots == 0
+
+
 def test_overrun_skips_missed_slots_without_bursting(tmp_path: Path, rules):
     """周期を超えたら過ぎた枠を飛ばす。遅れを取り戻す連続収集をしない。"""
     daemon, store, sleeps = _paced_daemon(tmp_path, rules, work_ms=3_000)

@@ -110,7 +110,7 @@ class InternalTelemetryDaemon:
         """
         deadline = previous + self._interval_ms
         now = self._monotonic_ms()
-        if now < deadline:
+        if now <= deadline:
             return deadline
         skipped = (now - deadline) // self._interval_ms + 1
         self.stats.skipped_slots += skipped
