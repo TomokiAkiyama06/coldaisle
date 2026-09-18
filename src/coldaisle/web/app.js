@@ -137,15 +137,20 @@ function staleFromLatest(latest) {
  * 画面全体の警告。**データが古いときに黙らない。**
  * デーモンが止まっていることが一目で分かる状態にする（受入基準）。
  *
- * 「1件も無い」「未来」は health から、「古い」は**新しいほうの最新値**から決める。
- * 最新値は WebSocket で health より先に届くため（staleFromLatest）。
+ * 「1件も無い」「未来」は health から決める。
+ *
+ * 「古い」は**どちらか一方でも古ければ出す**（安全側）。最新値（`/latest` と WebSocket。
+ * staleFromLatest）と health を、それぞれ最後に適用した応答で見る。
+ * WebSocket の新しい最新値が消せるのは最新値の側だけで、health の側は
+ * 次の health の応答まで残る。片方だけを信じると、もう片方が古いと言っているのに
+ * 赤帯が消える（決定記録 0039 §2.3 は、stale の文言を赤帯に任せている）。
  */
 function renderBanner() {
   const health = lastHealth;
   const banner = document.getElementById("banner");
   const age = document.getElementById("age");
   const fromLatest = lastLatest ? staleFromLatest(lastLatest) : null;
-  const stale = fromLatest ? fromLatest.stale : Boolean(health && health.stale);
+  const stale = Boolean(fromLatest && fromLatest.stale) || Boolean(health && health.stale);
   // **重いものから順に、成り立つものをすべて出す。** 1つだけ選ぶと、WebSocket の
   // 更新（applyLatest → ここ）が API の失敗の文言を消してしまう。失敗は
   // lastFetchError に残り、定期更新が丸ごと成功するまで消えない

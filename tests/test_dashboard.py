@@ -601,3 +601,25 @@ def test_the_banner_age_comes_from_the_stale_cards_only():
     assert "const measured = fromLatest ? fromLatest.seconds : null;" in banner
     stale_branch = banner[banner.index("} else if (stale) {") :]
     assert "data_age_seconds" not in stale_branch[: stale_branch.index("messages.push")]
+
+
+def test_the_banner_is_stale_if_either_latest_or_health_says_so():
+    """「古い」は `/latest` と health の**どちらか一方でも**古ければ出す（安全側）。
+
+    片方だけを信じると、もう片方が古いと言っているのに赤帯が消える。
+    WebSocket の新しい最新値が消せるのは最新値の側だけで、health の側は
+    次の health の応答（`lastHealth` を書くのは適用された定期更新だけ）まで残る。
+    """
+    script = SCRIPT.read_text(encoding="utf-8")
+    banner = _body(script, "function renderBanner(")
+    assert (
+        "const stale = Boolean(fromLatest && fromLatest.stale) || Boolean(health && health.stale);"
+        in banner
+    )
+    assert "fromLatest ? fromLatest.stale :" not in banner, "片方だけを信じない"
+    # health の側を書き換えるのは、適用された定期更新だけ（WebSocket では消えない）
+    assert script.count("lastHealth = ") == 2, "宣言と定期更新の2か所だけ"
+    refresh = _body(script, "async function refresh()")
+    assert "lastHealth = health;" in refresh
+    assert refresh.index("refreshAppliedSeq = seq;") < refresh.index("lastHealth = health;")
+    assert "lastHealth" not in script[script.index("socket.onmessage") :].split("};")[0]
