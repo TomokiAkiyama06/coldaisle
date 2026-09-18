@@ -105,6 +105,9 @@ class Stats:
     explanations: int = 0
     """後追いで送った Evidence 形式の説明の数（#38）。"""
     unknown_channels: set[str] = field(default_factory=set)
+    dataset_incomplete: bool = False
+    """dataset用Replayが入力の最後まで届かずに止まった、または途中のsampleを捨てた（#83）。
+    完了の印は付けない。"""
 
     def as_fields(self) -> dict[str, object]:
         return {
@@ -120,6 +123,7 @@ class Stats:
             "notifications": self.notifications,
             "explanations": self.explanations,
             "unknown_channels": sorted(self.unknown_channels),
+            "dataset_incomplete": self.dataset_incomplete,
         }
 
 
@@ -133,6 +137,7 @@ class Daemon:
         store: SqliteStore,
         normalizer: Normalizer,
         source_name: str = "unknown",
+        dataset_run_alias: str | None = None,
         engine: Engine | None = None,
         notifier: Router | None = None,
         explainer_factory: Callable[[], Explainer] | None = None,
@@ -142,6 +147,7 @@ class Daemon:
         self._store = store
         self._normalizer = normalizer
         self._source_name = source_name
+        self._dataset_run_alias = dataset_run_alias
         self._engine = engine
         self._notifier = notifier
         self._explainer_factory = explainer_factory
@@ -150,6 +156,7 @@ class Daemon:
         self._tick_s = tick_s
         self._latest_values: dict[str, float | None] = {}
         self._stop = False
+        self._source_exhausted = False
         self._device_id: str | None = None
         self._reported_drops = 0
         self.stats = Stats()
@@ -190,6 +197,28 @@ class Daemon:
             "取り込みを開始する",
             extra={logs.FIELDS_KEY: {"max_samples": max_samples, "source": self._source_name}},
         )
+        # Dataset用Replayは、readingを1行も書く前に専用DBへ1回だけbindする。
+        # 既存runへの再投入は、同じ時刻の主キーがINSERT OR IGNOREされて混在するため拒否する。
+        bound_dataset_run = self._store.dataset_source_run()
+        if self._dataset_run_alias is None and bound_dataset_run is not None:
+            raise ValueError("dataset専用DBへrun alias無しで追加入力できない")
+        if self._dataset_run_alias is not None:
+            if max_samples is not None:
+                # 途中で止めるとDBはCSVの一部だけになり、全体のhashと食い違う
+                raise ValueError("dataset run bindではmax_samplesで途中停止できない")
+            source_sha256 = getattr(self._source, "source_sha256", None)
+            if not isinstance(source_sha256, str):
+                raise ValueError("dataset run bindにはSHA-256を提供するsourceが必要")
+            if not isinstance(getattr(self._source, "losses", None), dict):
+                # 取りこぼしを報告できないsourceでは、完了を判定できない
+                raise ValueError("dataset run bindには取りこぼし件数を報告するsourceが必要")
+            self._store.bind_dataset_source_run(
+                run_alias=self._dataset_run_alias,
+                source_kind=self._source_name,
+                source_sha256=source_sha256,
+                at_ms=self._normalizer.clock.now_ms(),
+            )
+
         # API がソース種別を答えられるようにする（FR-305）。状態は変化時だけ書く
         self._store.set_system_state(
             INGEST_SOURCE_KEY, self._source_name, at_ms=self._normalizer.clock.now_ms()
@@ -212,6 +241,7 @@ class Daemon:
         )
         reader = threading.Thread(target=self._read_into, args=(inbox,), daemon=True)
         reader.start()
+        reached_eof = False
         while True:
             if self._stop:
                 LOGGER.info("停止要求を受けた")
@@ -222,7 +252,9 @@ class Daemon:
                 self._tick()
                 continue
             if received is None:
-                break  # ソースが尽きた
+                # 読み取りスレッドは停止要求で抜けたときも None を送る。尽きたのかを区別する
+                reached_eof = self._source_exhausted
+                break
             if isinstance(received, BaseException):
                 # **ソースが落ちたことを正常終了と区別する。** 同じに扱うと、
                 # 途中で死んだ監視をサービス管理（systemd）が再起動できない。
@@ -232,6 +264,8 @@ class Daemon:
             self._handle(*received)
             if max_samples is not None and self.stats.samples >= max_samples:
                 break
+        if self._dataset_run_alias is not None:
+            self._finish_dataset_run(reached_eof=reached_eof)
         if self._explain_thread is not None:
             self._explain_queue.put(None)
             self._explain_thread.join(timeout=5.0)
@@ -253,6 +287,13 @@ class Daemon:
                 if self._stop:
                     break
                 received = (self._source.clock.now_ms(), message)
+                if self._dataset_run_alias is not None:
+                    # **dataset用Replayは捨てずに待つ（backpressure）。** provenanceは
+                    # CSV全体のhashなので、取りこぼすとDBとhashが別物になる。
+                    # 実時間の監視ではないため、直近優先で古い側を捨てる理由も無い
+                    if not self._put_blocking(inbox, received):
+                        break
+                    continue
                 try:
                     inbox.put_nowait(received)
                 except queue.Full:
@@ -262,10 +303,73 @@ class Daemon:
                         inbox.get_nowait()
                     self.stats.queue_drops += 1
                     inbox.put(received)
+            else:
+                # break せずに抜けた＝ソースを最後まで読んだ。None より先に立てる
+                self._source_exhausted = True
         except Exception as error:
             inbox.put(error)
         else:
             inbox.put(None)
+
+    def _finish_dataset_run(self, *, reached_eof: bool) -> None:
+        """dataset用Replayを、EOFまで取り込めたときだけ完了として記録する。
+
+        bindは入力全体のhashを先に固定する。停止要求で途中終了したDBに完了の印を
+        付けると、先頭だけのdatasetが全体のprovenanceで公開されてしまう。
+        EOFまで届いても、正規化・保存に失敗して捨てたsampleがあればDBは入力の一部に
+        なるため同じく未完了とする（取り込みループ自体は1件の失敗で落とさない）。
+        """
+        losses = self._dataset_losses()
+        if reached_eof and not any(losses.values()):
+            self._store.complete_dataset_source_run(at_ms=self._normalizer.clock.now_ms())
+            return
+        self.stats.dataset_incomplete = True
+        LOGGER.error(
+            "dataset用Replayが入力を欠けなく取り込めなかった。このDBからdatasetは作れない",
+            extra={logs.FIELDS_KEY: {"reached_eof": reached_eof, **losses}},
+        )
+
+    def _dataset_losses(self) -> dict[str, int]:
+        """source → normalizer → store の各段で、入力にあったのにDBへ届かなかった件数。
+
+        どの段も取り込みは止めずに数えるだけにしている。dataset用Replayでは
+        1件でもあればDBは入力全体のhashと食い違うため、完了の判定で弾く。
+        数えない段とその理由は`docs/thermal-dataset.md`にまとめる。
+        """
+        source_losses = getattr(self._source, "losses", None)
+        if not isinstance(source_losses, dict):
+            # 損失を報告できないsourceは、欠けが無いことを示せない
+            raise ValueError("dataset用sourceは取りこぼし件数（losses）を報告しなければならない")
+        return {
+            **{f"source_{name}": int(count) for name, count in source_losses.items()},
+            # 正規化・保存で例外になり捨てたsample（hello含む）
+            "discarded": self.stats.discarded,
+            # 待ち行列の溢れ（dataset modeはbackpressureで0のはず。保険として数える）
+            "queue_drops": self.stats.queue_drops,
+            # 同じ(metric, ts_ms)が既にありINSERT OR IGNOREで書かなかった行
+            "duplicates": self.stats.duplicates,
+            # seqの飛び。Replayは連番を合成するので0のはず
+            "dropped_samples": self.stats.dropped_samples,
+            # 対応表に無くnormalizerが捨てたchannel
+            "unknown_channels": len(self.stats.unknown_channels),
+        }
+
+    def _put_blocking(
+        self,
+        inbox: queue.Queue[tuple[int, RawMessage] | BaseException | None],
+        received: tuple[int, RawMessage],
+    ) -> bool:
+        """空きが出るまで待って詰める。停止要求で諦めたら `False`。
+
+        待ち続けると停止要求に応じられないため、刻みで `_stop` を見直す。
+        """
+        while not self._stop:
+            try:
+                inbox.put(received, timeout=self._tick_s)
+            except queue.Full:
+                continue
+            return True
+        return False
 
     def _with_queue_drops(self, sample: Sample) -> Sample:
         """待ち行列の取りこぼしを、次のサンプルに乗せて記録する。
@@ -534,6 +638,8 @@ class Config:
     """較正の方針（#13 / 決定記録 0024 §2.7）。記録とは別のファイル。"""
     csv: Path | None = None
     """`--source replay` の入力。ファイルかディレクトリ。"""
+    dataset_run_alias: str | None = None
+    """dataset専用DBへReplay入力を上書き不能でbindする公開run alias。"""
     port: str | None = None
     """`--source serial` のポート。`None` なら自動検出（#12）。"""
     baud: int = SERIAL_BAUD
@@ -555,6 +661,8 @@ def build(config: Config) -> Daemon:
     ここが唯一の組み立て場所であることが、`Clock` を型で縛れないぶんの担保になる。
     別々に作ると、取り込みはシナリオ時間・保存は実時計という組み合わせが成立する。
     """
+    if config.dataset_run_alias is not None and config.source != "replay":
+        raise SystemExit("--dataset-run-alias は --source replay だけで使える")
     source = _build_source(config)
     rules = QualityRules.from_yaml(config.quality_rules)
     calibration = _calibration_for(config)
@@ -566,6 +674,7 @@ def build(config: Config) -> Daemon:
         store=store,
         normalizer=Normalizer(rules=rules, calibration=calibration, clock=clock),
         source_name=config.source,
+        dataset_run_alias=config.dataset_run_alias,
         # ルールエンジンは**取り込みと同じプロセス・同じ時計**で動かす。
         # 継続時間の判定が実時間に依存すると、圧縮再生で検証できない
         # （決定記録 0007 §2.11 / §5 未決3）
@@ -649,6 +758,7 @@ def _build_source(config: Config) -> Source:
                 tz=ZoneInfo(config.timezone),
                 speed=config.speed,
                 bulk=config.bulk,
+                dataset_provenance=config.dataset_run_alias is not None,
             )
         except ValueError as error:
             raise SystemExit(str(error)) from error
@@ -685,6 +795,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--csv", type=Path, default=None, help="replay の入力（ファイル/ディレクトリ）"
     )
+    parser.add_argument(
+        "--dataset-run-alias",
+        default=None,
+        help="dataset専用Replay DBへbindする run-<32 hex> alias",
+    )
     parser.add_argument("--bulk", action="store_true", help="replay を待たずに流す（一括投入）")
     parser.add_argument("--timezone", default="Asia/Tokyo", help="CSV の時刻の解釈")
     parser.add_argument("--max-samples", type=int, default=None, help="試験用。件数で止める")
@@ -710,6 +825,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             ai=args.ai,
             metrics=args.metrics,
             csv=args.csv,
+            dataset_run_alias=args.dataset_run_alias,
             bulk=args.bulk,
             timezone=args.timezone,
             port=args.port,
@@ -733,10 +849,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     signal.signal(signal.SIGTERM, _stop)
     signal.signal(signal.SIGINT, _stop)
     try:
-        daemon.run(max_samples=args.max_samples)
+        stats = daemon.run(max_samples=args.max_samples)
     finally:
         daemon.store.close()
-    return 0
+    # 途中停止したdataset Replayを成功として終えると、後段が完了済みと誤認する
+    return 1 if stats.dataset_incomplete else 0
 
 
 if __name__ == "__main__":  # pragma: no cover - `python -m coldaisle.daemon`
