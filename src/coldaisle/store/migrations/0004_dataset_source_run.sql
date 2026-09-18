@@ -1,4 +1,4 @@
--- 0003_dataset_source_run: #83 の1 run専用dataset DB provenance。
+-- 0004_dataset_source_run: #83 の1 run専用dataset DB provenance。
 --
 -- singleton=1 の1行だけを INSERT し、UPDATE / REPLACE はStore APIから提供しない。
 -- 同じ開始時刻の別Replayが system_state を置換し、旧readingへ新しいsource hashを

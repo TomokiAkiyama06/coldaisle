@@ -1,0 +1,33 @@
+# Control Model Registry の読込・確保の上限（#104 / docs/model-registry.md）
+#
+# **ここが唯一の情報源です。** コードに既定値を持たせないでください
+# （AGENTS.md「絶対に守るルール」9）。
+schema_version: 1
+
+# artifact payload の上限（byte）。登録時と読込時の両方で、これを超えるものを拒否する。
+# 8 MiB。現在受理する JSON artifact の想定規模に対する余裕を持たせた暫定値
+max_artifact_bytes: 8388608
+
+# registry.json（全 artifact の lifecycle と監査 event の snapshot）の上限（byte）。
+# 超えた snapshot は読まずに INVALID_REGISTRY として Fallback させ、書き込みも拒否する。
+# 4 MiB。実測で約18 byte/token・約52 token/event のため、約4,000 audit event
+# （登録→検証→昇格で約1,300回分）を収める暫定値。下の max_snapshot_json_tokens と
+# 組にして、正当な履歴では byte 上限のほうが先に効くようにしている
+max_snapshot_bytes: 4194304
+
+# JSON artifact の構造上限。json.loads() が object graph を作る前に、1 pass の走査で検査する。
+# byte 上限内でも、細かい container を大量に並べると数百 MB の Python object になるため。
+# 超えた artifact は INVALID_ARTIFACT_FORMAT として Fallback させる（登録も拒否する）。
+# 入れ子の深さ。表形式の係数や小さな木構造には十分な、保守的な暫定値
+max_json_nesting_depth: 32
+# 値の数（object の key、scalar、container を含む。区切りと閉じ括弧は数えない）。
+# 数万個の係数を持つモデルを収めつつ、object graph を数十 MB 以下に抑える暫定値
+max_json_tokens: 250000
+
+# registry.json の構造上限。Pydantic が snapshot を検証する前に同じ 1 pass 走査で検査し、
+# 超えたものは INVALID_REGISTRY として Fallback させる。上限を超える snapshot は書き込まない。
+# 実際の snapshot の入れ子は5段。余裕を持たせた暫定値
+max_snapshot_json_nesting_depth: 16
+# 正当な snapshot は max_snapshot_bytes（4 MiB）で約23万 token。不正な snapshot の検証で
+# 作られる Python object は 1 token あたり最大約700 byte だったため、最悪でも約170 MB に収まる暫定値
+max_snapshot_json_tokens: 250000
