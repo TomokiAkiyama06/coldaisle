@@ -6,7 +6,7 @@ import pytest
 import yaml
 from pydantic import ValidationError
 
-from coldaisle.control.config import CONTROL_CONFIG_VERSION, ControlConfig
+from coldaisle.control.config import CONTROL_CONFIG_VERSION, ConfigSource, ControlConfig
 
 
 def provisional(value: float | int) -> dict[str, object]:
@@ -134,7 +134,7 @@ def valid_documents() -> dict[str, dict[str, object]]:
             },
         },
         "safety.yaml": {
-            "schema_version": 1,
+            "schema_version": 2,
             "absolute_temp_ceiling_c": provisional(85.0),
             "zone_min_demand": {
                 "front": provisional(0.4),
@@ -145,15 +145,26 @@ def valid_documents() -> dict[str, dict[str, object]]:
                 {"temperature_c": provisional(35.0), "demand": provisional(0.5)},
                 {"temperature_c": provisional(80.0), "demand": provisional(1.0)},
             ],
+            "cpu_power_cooling_floor": [
+                {"power_w": provisional(65.0), "demand": provisional(0.5)},
+                {"power_w": provisional(250.0), "demand": provisional(1.0)},
+            ],
             "fault_demand": provisional(1.0),
+            "stall_check_min_demand": {
+                "front": provisional(0.4),
+                "rear": provisional(0.4),
+                "top": provisional(0.5),
+            },
             "stall_min_rpm": {
                 "front": provisional(400),
                 "rear": provisional(400),
                 "top": provisional(400),
             },
             "stall_window_ms": provisional(2000),
+            "write_fail_emergency_after": provisional(3),
             "telemetry": {
                 "cpu_ms": provisional(1000),
+                "cpu_power_ms": provisional(1000),
                 "gpu_ms": provisional(1000),
                 "t_sensor": {"enabled": provisional(False)},
                 "air_ms": provisional(1000),
@@ -272,8 +283,36 @@ def test_complete_config_has_traceable_sources_and_is_not_actuation_ready(tmp_pa
     assert config.actuation_permitted is False
     metadata = config.trace_metadata()["control_config"]
     assert metadata["fan_hardware"]["name"] == "fan-hardware.yaml"
+    assert metadata["safety"]["schema_version"] == 2
     assert metadata["policy"]["schema_version"] == 5
     assert len(metadata["safety"]["sha256"]) == 64
+
+
+def test_safety_v1_is_rejected_without_defaulting_new_safety_fields(tmp_path: Path) -> None:
+    documents = valid_documents()
+    documents["safety.yaml"]["schema_version"] = 1
+    write_documents(tmp_path, documents)
+
+    with pytest.raises(ValidationError, match="schema_version"):
+        ControlConfig.from_directory(tmp_path)
+
+
+def test_trace_source_version_must_match_the_validated_file_model(tmp_path: Path) -> None:
+    raw = load_config(tmp_path).model_dump(mode="python")
+    raw["sources"]["safety"]["schema_version"] = 1
+
+    with pytest.raises(ValidationError, match="ConfigSource"):
+        ControlConfig.model_validate(raw)
+
+
+def test_config_source_can_record_future_subconfig_versions_without_weakening_models() -> None:
+    source = ConfigSource(
+        name="fan-policy.yaml",
+        schema_version=3,
+        sha256="0" * 64,
+    )
+
+    assert source.schema_version == 3
 
 
 def test_missing_or_unknown_config_is_rejected_before_activation(tmp_path: Path) -> None:
@@ -315,6 +354,36 @@ def test_cross_field_validation_rejects_unsafe_or_unstable_values(tmp_path: Path
     )
     write_documents(tmp_path, documents)
     with pytest.raises(ValidationError, match="解除閾値"):
+        ControlConfig.from_directory(tmp_path)
+
+    documents = valid_documents()
+    documents["safety.yaml"]["stall_check_min_demand"]["front"] = provisional(0.5)
+    write_documents(tmp_path, documents)
+    with pytest.raises(ValidationError, match=r"stall_check_min_demand\.front"):
+        ControlConfig.from_directory(tmp_path)
+
+    documents = valid_documents()
+    documents["safety.yaml"]["cpu_power_cooling_floor"] = [
+        {"power_w": provisional(250.0), "demand": provisional(1.0)},
+        {"power_w": provisional(65.0), "demand": provisional(0.5)},
+    ]
+    write_documents(tmp_path, documents)
+    with pytest.raises(ValidationError, match="cpu_power_cooling_floor の Power は単調増加"):
+        ControlConfig.from_directory(tmp_path)
+
+    documents = valid_documents()
+    documents["safety.yaml"]["cpu_power_cooling_floor"] = [
+        {"power_w": provisional(65.0), "demand": provisional(1.0)},
+        {"power_w": provisional(250.0), "demand": provisional(0.5)},
+    ]
+    write_documents(tmp_path, documents)
+    with pytest.raises(ValidationError, match="cpu_power_cooling_floor の demand は下げない"):
+        ControlConfig.from_directory(tmp_path)
+
+    documents = valid_documents()
+    del documents["safety.yaml"]["cpu_power_cooling_floor"]
+    write_documents(tmp_path, documents)
+    with pytest.raises(ValidationError, match="cpu_power_cooling_floor"):
         ControlConfig.from_directory(tmp_path)
 
     documents = valid_documents()
@@ -451,7 +520,11 @@ def test_provisional_values_identify_safety_and_policy_without_exposing_values(
         "fan-policy.yaml",
     }
     assert any(item.path == "fault_demand" for item in values)
+    assert any(item.path == "stall_check_min_demand.front" for item in values)
+    assert any(item.path == "write_fail_emergency_after" for item in values)
     assert any(item.path == "telemetry.t_sensor.enabled" for item in values)
+    assert any(item.path == "cpu_power_cooling_floor[0].power_w" for item in values)
+    assert any(item.path == "telemetry.cpu_power_ms" for item in values)
     assert any(
         item.path == "reactive_guard.gpu_temperature_rate_c_per_s.activate_above" for item in values
     )

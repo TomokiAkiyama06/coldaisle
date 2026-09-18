@@ -668,8 +668,60 @@ def test_the_stored_v1_record_still_loads_unchanged():
     stored = FIXTURE.read_text(encoding="utf-8")
     tick = ControlTick.model_validate_json(stored)
     assert tick.schema_version == 1
-    assert SCHEMA_VERSION == 3
+    assert SCHEMA_VERSION == 4
     assert json.loads(tick.model_dump_json()) == json.loads(stored)
+
+
+def test_v4_trace_records_the_absolute_temperature_limit():
+    recorded = tick(
+        forced(),
+        faults=(Fault(code=FaultCode.ABSOLUTE_TEMPERATURE_LIMIT),),
+        safety_state=SafetyState.EMERGENCY,
+    )
+
+    assert recorded.schema_version == 4
+    restored = ControlTick.model_validate_json(recorded.model_dump_json())
+    assert restored.faults[0].code is FaultCode.ABSOLUTE_TEMPERATURE_LIMIT
+    with pytest.raises(ValidationError, match="EMERGENCY"):
+        tick(
+            forced(),
+            faults=(Fault(code=FaultCode.ABSOLUTE_TEMPERATURE_LIMIT),),
+            safety_state=SafetyState.DEGRADED,
+        )
+
+
+@pytest.mark.parametrize("schema_version", [1, 2, 3])
+def test_legacy_trace_cannot_carry_a_fault_code_added_in_v4(schema_version: int):
+    with pytest.raises(ValidationError, match="schema version 4"):
+        ControlTick(
+            schema_version=schema_version,
+            tick_id=1,
+            ts_ms=NOW_MS,
+            state=fallback_state(safety_state=SafetyState.EMERGENCY),
+            zones=zones(forced()),
+            faults=(Fault(code=FaultCode.ABSOLUTE_TEMPERATURE_LIMIT),),
+        )
+
+
+@pytest.mark.parametrize("schema_version", [1, 2, 3])
+def test_top_enable_revert_is_emergency_in_v4_but_legacy_records_still_load(
+    schema_version: int,
+):
+    top_revert = (Fault(code=FaultCode.ENABLE_REVERTED, zone=Zone.TOP),)
+    with pytest.raises(ValidationError, match="EMERGENCY"):
+        tick(forced(), faults=top_revert, safety_state=SafetyState.DEGRADED)
+
+    stored = ControlTick(
+        schema_version=schema_version,
+        tick_id=1,
+        ts_ms=NOW_MS,
+        state=fallback_state(safety_state=SafetyState.DEGRADED),
+        zones=zones(forced()),
+        faults=top_revert,
+    )
+    restored = ControlTick.model_validate_json(stored.model_dump_json())
+    assert restored.schema_version == schema_version
+    assert restored.state.safety_state is SafetyState.DEGRADED
 
 
 def test_current_trace_stores_workload_regime_and_confidence_together():
@@ -680,7 +732,7 @@ def test_current_trace_stores_workload_regime_and_confidence_together():
     recorded = ControlTick(tick_id=1, ts_ms=NOW_MS, state=state, zones=zones(passthrough()))
 
     payload = json.loads(recorded.model_dump_json())
-    assert recorded.schema_version == 3
+    assert recorded.schema_version == 4
     assert payload["state"]["workload_regime"] == "sustained_gpu"
     assert payload["state"]["regime_confidence"] == 0.85
 
@@ -717,7 +769,7 @@ def test_fallback_trace_remains_valid_when_regime_is_not_available():
         zones=zones(passthrough()),
     )
 
-    assert recorded.schema_version == 3
+    assert recorded.schema_version == 4
     assert recorded.state.workload_regime is None
 
 
