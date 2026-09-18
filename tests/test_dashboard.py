@@ -10,6 +10,8 @@
 見た目そのものの確認は人間が行う。ここは「壊れていたら気づける」線を引く。
 """
 
+import itertools
+import json
 import re
 import shutil
 import subprocess
@@ -384,7 +386,7 @@ def test_the_banner_follows_stale_cards_from_the_stream():
     apply = script[script.index("function applyLatest(") :]
     apply = apply[: apply.index("\n}\n")]
     assert "renderBanner()" in apply
-    banner = script[script.index("function renderBanner(") :]
+    banner = script[script.index("function bannerMessages(") :]
     banner = banner[: banner.index("\n}\n")]
     assert "staleFromLatest(lastLatest)" in banner
     helper = script[script.index("function staleFromLatest(") :]
@@ -418,10 +420,10 @@ def test_a_stream_update_does_not_hide_an_api_failure():
     失敗は `lastFetchError` に残し、定期更新が丸ごと成功したときだけ消す。
     """
     script = SCRIPT.read_text(encoding="utf-8")
-    banner = script[script.index("function renderBanner(") :]
+    banner = script[script.index("function bannerMessages(") :]
     banner = banner[: banner.index("\n}\n")]
-    assert "if (lastFetchError)" in banner
-    assert "messages.join(" in banner, "成り立つ警告をすべて出す"
+    assert "const failed = Boolean(lastFetchError);" in banner
+    assert "messages.join(" in _body(script, "function renderBanner("), "成り立つ警告をすべて出す"
     refresh = script[script.index("async function refresh()") : script.index("function connect()")]
     failure = refresh[refresh.index("catch (error)") :]
     assert "lastFetchError = error.message" in failure
@@ -597,10 +599,8 @@ def test_the_banner_age_comes_from_the_stale_cards_only():
     assert "Math.max(...ages)" in helper
     assert "Math.min" not in helper
     assert "ages.length ? Math.max(...ages) : null" in helper, "stale のカードが無ければ秒数なし"
-    banner = _body(script, "function renderBanner(")
-    assert "const measured = fromLatest ? fromLatest.seconds : null;" in banner
-    stale_branch = banner[banner.index("} else if (stale) {") :]
-    assert "data_age_seconds" not in stale_branch[: stale_branch.index("messages.push")]
+    banner = _body(script, "function bannerMessages(")
+    assert "BANNER_TEXT.stale(fromLatest ? fromLatest.seconds : null)" in banner
 
 
 def test_the_banner_is_stale_if_either_latest_or_health_says_so():
@@ -611,7 +611,7 @@ def test_the_banner_is_stale_if_either_latest_or_health_says_so():
     次の health の応答（`lastHealth` を書くのは適用された定期更新だけ）まで残る。
     """
     script = SCRIPT.read_text(encoding="utf-8")
-    banner = _body(script, "function renderBanner(")
+    banner = _body(script, "function bannerMessages(")
     assert (
         "const stale = Boolean(fromLatest && fromLatest.stale) || Boolean(health && health.stale);"
         in banner
@@ -623,3 +623,124 @@ def test_the_banner_is_stale_if_either_latest_or_health_says_so():
     assert "lastHealth = health;" in refresh
     assert refresh.index("refreshAppliedSeq = seq;") < refresh.index("lastHealth = health;")
     assert "lastHealth" not in script[script.index("socket.onmessage") :].split("};")[0]
+
+
+# ---------------------------------------------------------------- 赤帯の組み合わせ（表駆動）
+
+BANNER_HARNESS = r"""
+const fs = require("fs");
+const vm = require("vm");
+class Node {
+  constructor() {
+    this.children = []; this.className = ""; this.textContent = ""; this.style = {};
+    this.hidden = true;
+    const self = this;
+    this.classList = {
+      add(c) { if (c === "hidden") self.hidden = true; },
+      remove(c) { if (c === "hidden") self.hidden = false; },
+    };
+  }
+  appendChild(c) { this.children.push(c); return c; }
+  replaceChildren() { this.children = []; }
+  setAttribute() {}
+  addEventListener() {}
+}
+const nodes = {};
+const get = (id) => nodes[id] || (nodes[id] = new Node());
+const context = {
+  console, Math, Date, Number, Object, URL, JSON, Promise, Infinity, Boolean, Error,
+  AbortController,
+  document: {
+    getElementById: get,
+    createElement: () => new Node(),
+    createElementNS: () => new Node(),
+    createTextNode: (t) => { const n = new Node(); n.textContent = t; return n; },
+  },
+  window: { location: { origin: "http://127.0.0.1", protocol: "http:", host: "127.0.0.1" } },
+  WebSocket: function () {},
+  setInterval() {}, setTimeout() {}, clearTimeout() {},
+  fetch: () => new Promise(() => {}), // 起動時の読み込みは返さない（状態は下で直接与える）
+};
+vm.createContext(context);
+vm.runInContext(
+  fs.readFileSync(process.argv[2], "utf8") +
+    "\n;this.__set = (s) => { lastFetchError = s.fetchError; lastHealth = s.health;" +
+    " lastLatest = s.latest; renderBanner(); };",
+  context,
+);
+const results = [];
+for (const state of JSON.parse(fs.readFileSync(process.argv[3], "utf8"))) {
+  context.__set(state);
+  const banner = get("banner");
+  results.push({ text: banner.textContent, hidden: banner.hidden });
+}
+process.stdout.write(JSON.stringify(results));
+"""
+
+BANNER_EXPECTED = {
+    "fetch_error": "API に接続できません: /api/v1/alerts: 500",
+    "no_data": "データが1件も届いていません。",
+    "future": "受信時刻が未来です。",
+    "stale": "データが古い",
+}
+
+
+def _banner_state(fetch_error: bool, no_data: bool, future: bool, stale: bool) -> dict:
+    """4つの条件を**それぞれ独立に**立てた入力。
+
+    「データなし」と「未来」は health だけでは同時に表せない（経過秒が null になる）
+    ため、未来は最新値の側（カードの `age_seconds < 0`）で立てる。古さは health の側。
+    """
+    return {
+        "fetchError": "/api/v1/alerts: 500" if fetch_error else None,
+        "health": {
+            "last_sample_ts_ms": None if no_data else NOW_MS,
+            "data_age_seconds": None if no_data else 1.0,
+            "stale": stale,
+            "source": "mock",
+        },
+        "latest": {
+            "stale": False,
+            "metrics": {
+                "air.room": {
+                    "value": 26.0,
+                    "unit": "C",
+                    "quality": "ok",
+                    "age_seconds": -30.0 if future else 1.0,
+                }
+            },
+            "derived": {},
+        },
+    }
+
+
+def test_the_banner_shows_exactly_the_applicable_messages(tmp_path):
+    """赤帯の4条件（API の失敗・データなし・未来の時刻・古い）の**全16通り**。
+
+    どれかが else-if で別の条件を隠していないこと、成り立つものだけが
+    **重い順**に並ぶこと、何も無ければ帯が隠れることを確かめる。
+
+    `node` が無い環境では飛ばす（`test_script_parses` と同じ。CI に Node を足すほどの
+    依存ではない）。文字列の検査では、条件どうしの組み合わせは確かめられない。
+    """
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node が無い")
+    order = list(BANNER_EXPECTED)
+    combos = list(itertools.product([False, True], repeat=4))
+    states = tmp_path / "states.json"
+    states.write_text(json.dumps([_banner_state(*combo) for combo in combos]), encoding="utf-8")
+    harness = tmp_path / "harness.js"
+    harness.write_text(BANNER_HARNESS, encoding="utf-8")
+    run = subprocess.run(
+        [node, str(harness), str(SCRIPT), str(states)], capture_output=True, text=True, check=True
+    )
+    results = json.loads(run.stdout)
+    assert len(results) == 16
+    for combo, result in zip(combos, results, strict=True):
+        wanted = [name for name, on in zip(order, combo, strict=True) if on]
+        parts = result["text"].split(" / ") if result["text"] else []
+        assert len(parts) == len(wanted), f"{combo}: {result['text']!r}"
+        for part, name in zip(parts, wanted, strict=True):
+            assert part.startswith(BANNER_EXPECTED[name]), f"{combo}: {name} の位置に {part!r}"
+        assert result["hidden"] is (not wanted), f"{combo}: 帯の表示が食い違う"

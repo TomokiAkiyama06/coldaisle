@@ -133,47 +133,72 @@ function staleFromLatest(latest) {
   return { stale: true, seconds: ages.length ? Math.max(...ages) : null };
 }
 
+// 赤帯の文言。**重い順**（並べる順もこの順）
+const BANNER_TEXT = {
+  fetchError: (message) => `API に接続できません: ${message}`,
+  noData: "データが1件も届いていません。取り込みデーモンを確認してください。",
+  future: "受信時刻が未来です。時計がずれているか、時間圧縮で再生中の DB を見ています。",
+  stale: (seconds) =>
+    `データが古い${seconds === null ? "" : `（最終受信から ${Math.round(seconds)} 秒）`}。取り込みが止まっている可能性があります。`,
+};
+
+/**
+ * 赤帯に出す文言の一覧。**4つの条件をそれぞれ独立に判定し、成り立つものをすべて出す。**
+ *
+ * どれかを else-if でつなぐと、先の条件が後の条件を隠す（例: 未来の時刻が出ていると
+ * 古さの警告が消える）。入力は、それぞれ**最後に適用した応答**だけ。
+ *
+ * | 条件 | 入力 | 消えるとき |
+ * |---|---|---|
+ * | API の失敗 | lastFetchError（適用された定期更新の失敗） | 定期更新が丸ごと成功したとき |
+ * | データなし | health.last_sample_ts_ms === null | 次の health |
+ * | 未来の時刻 | health.data_age_seconds < 0、またはカードの age_seconds < 0 | 両方が正になったとき |
+ * | 古い | health.stale、または latest.stale（WebSocket を含む） | 両方が false になったとき |
+ *
+ * 片方の入力だけを信じない（安全側）。WebSocket が消せるのは最新値の側だけで、
+ * health の側は次の health の応答まで残る。
+ */
+function bannerMessages() {
+  const health = lastHealth;
+  const fromLatest = lastLatest ? staleFromLatest(lastLatest) : null;
+
+  const failed = Boolean(lastFetchError);
+  const noData = Boolean(health && health.last_sample_ts_ms === null);
+  // 受信時刻が未来。時計のずれか、圧縮再生中の DB を見ている（決定記録 0007 §2.11）。
+  // health より先に WebSocket の最新値で分かることがあるので、両方を見る
+  const futureHealth = Boolean(health && typeof health.data_age_seconds === "number" && health.data_age_seconds < 0);
+  const futureLatest = Boolean(
+    lastLatest &&
+      Object.entries(lastLatest.metrics).some(
+        ([metric, item]) => isCardMetric(metric) && typeof item.age_seconds === "number" && item.age_seconds < 0
+      )
+  );
+  const stale = Boolean(fromLatest && fromLatest.stale) || Boolean(health && health.stale);
+
+  const messages = [];
+  if (failed) messages.push(BANNER_TEXT.fetchError(lastFetchError));
+  if (noData) messages.push(BANNER_TEXT.noData);
+  if (futureHealth || futureLatest) messages.push(BANNER_TEXT.future);
+  // 秒数は stale のカードからだけ出す（staleFromLatest）。health の経過秒は
+  // **いちばん新しい**サンプルの経過で、一部だけ止まったときの古さを表さないので使わない
+  if (stale) messages.push(BANNER_TEXT.stale(fromLatest ? fromLatest.seconds : null));
+  return messages;
+}
+
 /**
  * 画面全体の警告。**データが古いときに黙らない。**
  * デーモンが止まっていることが一目で分かる状態にする（受入基準）。
- *
- * 「1件も無い」「未来」は health から決める。
- *
- * 「古い」は**どちらか一方でも古ければ出す**（安全側）。最新値（`/latest` と WebSocket。
- * staleFromLatest）と health を、それぞれ最後に適用した応答で見る。
- * WebSocket の新しい最新値が消せるのは最新値の側だけで、health の側は
- * 次の health の応答まで残る。片方だけを信じると、もう片方が古いと言っているのに
- * 赤帯が消える（決定記録 0039 §2.3 は、stale の文言を赤帯に任せている）。
+ * 何を出すかは bannerMessages が決める。ここは描くだけ。
  */
 function renderBanner() {
-  const health = lastHealth;
   const banner = document.getElementById("banner");
+  const messages = bannerMessages();
+  banner.textContent = messages.join(" / ");
+  if (messages.length > 0) banner.classList.remove("hidden");
+  else banner.classList.add("hidden");
+
+  const health = lastHealth;
   const age = document.getElementById("age");
-  const fromLatest = lastLatest ? staleFromLatest(lastLatest) : null;
-  const stale = Boolean(fromLatest && fromLatest.stale) || Boolean(health && health.stale);
-  // **重いものから順に、成り立つものをすべて出す。** 1つだけ選ぶと、WebSocket の
-  // 更新（applyLatest → ここ）が API の失敗の文言を消してしまう。失敗は
-  // lastFetchError に残り、定期更新が丸ごと成功するまで消えない
-  const messages = [];
-  if (lastFetchError) messages.push(`API に接続できません: ${lastFetchError}`);
-  if (health && health.last_sample_ts_ms === null) {
-    messages.push("データが1件も届いていません。取り込みデーモンを確認してください。");
-  } else if (health && health.data_age_seconds < 0) {
-    // 受信時刻が未来。時計のずれか、圧縮再生中の DB を見ている（決定記録 0007 §2.11）
-    messages.push("受信時刻が未来です。時計がずれているか、時間圧縮で再生中の DB を見ています。");
-  } else if (stale) {
-    // 秒数は stale のカードからだけ出す（staleFromLatest）。health の経過秒は
-    // **いちばん新しい**サンプルの経過で、一部だけ止まったときの古さを表さないので使わない
-    const measured = fromLatest ? fromLatest.seconds : null;
-    const seconds = typeof measured === "number" ? `（最終受信から ${Math.round(measured)} 秒）` : "";
-    messages.push(`データが古い${seconds}。取り込みが止まっている可能性があります。`);
-  }
-  if (messages.length > 0) {
-    banner.textContent = messages.join(" / ");
-    banner.classList.remove("hidden");
-  } else if (health) {
-    banner.classList.add("hidden");
-  }
   if (!health) return;
   const source = health.source ? ` / ${health.source}` : "";
   if (health.data_age_seconds === null) age.textContent = "";
