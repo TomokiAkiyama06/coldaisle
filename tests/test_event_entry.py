@@ -490,6 +490,79 @@ def test_cli_client_reports_an_unreachable_entry(short_dir, capsys):
 
 
 @needs_peercred
+def test_cli_client_with_socket_works_outside_the_checkout(
+    running, capsys, tmp_path, monkeypatch, db, rules
+):
+    """`--socket` を渡せば設定ファイルを読まない（Workspace はリポジトリの外から呼ぶ）。"""
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    monkeypatch.chdir(elsewhere)
+    assert not (elsewhere / "config").exists()
+    path = str(running.settings.socket.path)
+    assert event_client.main(["--socket", path, "--timeout", "3", "gpu-mode", "ai"]) == 0
+    assert json.loads(capsys.readouterr().out)["ok"] is True
+    assert len(stored_events(db, rules)) == 1
+
+
+def test_cli_client_without_socket_reports_a_missing_config(tmp_path, monkeypatch, capsys):
+    """`--socket` が無く設定も無ければ、例外ではなく理由の分かる失敗にする。"""
+    monkeypatch.chdir(tmp_path)
+    assert event_client.main(["gpu-mode", "ai"]) == 2
+    error = json.loads(capsys.readouterr().err)
+    assert error["ok"] is False
+    assert "設定ファイルが無い" in error["error"]
+    assert "--socket" in error["error"]
+
+
+def test_cli_client_reports_an_unreadable_config(tmp_path, capsys):
+    broken = tmp_path / "event-entry.yaml"
+    broken.write_text("socket: [", encoding="utf-8")
+    assert event_client.main(["--config", str(broken), "gpu-mode", "ai"]) == 2
+    assert "設定ファイルを読めない" in json.loads(capsys.readouterr().err)["error"]
+
+
+@needs_peercred
+def test_cli_client_reads_the_socket_from_config_when_not_given(running, capsys, tmp_path):
+    config = tmp_path / "event-entry.yaml"
+    config.write_text(
+        CONFIG_PATH.read_text(encoding="utf-8").replace(
+            "path: var/run/coldaisle-events.sock", f"path: {running.settings.socket.path}"
+        ),
+        encoding="utf-8",
+    )
+    assert event_client.main(["--config", str(config), "gpu-mode", "compute"]) == 0
+    assert json.loads(capsys.readouterr().out)["ok"] is True
+
+
+def test_cli_client_timeout_comes_from_flag_then_env_then_default(monkeypatch):
+    monkeypatch.delenv(event_client.TIMEOUT_ENV, raising=False)
+    assert event_client._timeout(None) == event_client.DEFAULT_TIMEOUT_S
+    monkeypatch.setenv(event_client.TIMEOUT_ENV, "1.5")
+    assert event_client._timeout(None) == 1.5
+    assert event_client._timeout(0.25) == 0.25
+
+
+@pytest.mark.parametrize(
+    ("argv", "env"),
+    [
+        (["--timeout", "0", "gpu-mode", "ai"], None),
+        (["--timeout", "-1", "gpu-mode", "ai"], None),
+        (["--timeout", "inf", "gpu-mode", "ai"], None),
+        (["gpu-mode", "ai"], "soon"),
+        (["gpu-mode", "ai"], "nan"),
+    ],
+)
+def test_cli_client_rejects_bad_timeouts(argv, env, monkeypatch, short_dir):
+    if env is None:
+        monkeypatch.delenv(event_client.TIMEOUT_ENV, raising=False)
+    else:
+        monkeypatch.setenv(event_client.TIMEOUT_ENV, env)
+    with pytest.raises(SystemExit) as excinfo:
+        event_client.main(["--socket", str(short_dir / "none.sock"), *argv])
+    assert excinfo.value.code == 2
+
+
+@needs_peercred
 def test_server_main_serves_until_stopped(short_dir, tmp_path):
     config = tmp_path / "event-entry.yaml"
     socket_path = short_dir / "main.sock"
