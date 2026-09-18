@@ -878,6 +878,97 @@ def test_legitimate_history_reaches_the_byte_bound_before_the_token_bound(
     assert tokens_per_byte * LIMITS.max_snapshot_bytes < LIMITS.max_snapshot_json_tokens
 
 
+def version_dir(root: Path, version: str) -> Path:
+    return root / "artifacts" / "thermal_model" / "rack-thermal" / version
+
+
+@pytest.mark.parametrize("bound", ["max_snapshot_bytes", "max_snapshot_json_tokens"])
+def test_full_registry_rejects_registration_before_writing_the_artifact(
+    tmp_path: Path,
+    bound: str,
+) -> None:
+    root = tmp_path / "registry"
+    registry = ModelRegistry(root, SimulatedClock(NOW_MS), limits=LIMITS)
+    register_and_validate(registry, "1.0.0")
+    before = (root / "registry.json").read_bytes()
+    current = len(before) if bound == "max_snapshot_bytes" else json_token_count(before)
+    full = ModelRegistry(
+        root,
+        SimulatedClock(NOW_MS),
+        limits=LIMITS.model_copy(update={bound: current}),
+    )
+
+    with pytest.raises(RegistryCapacityError):
+        register_raw_version(full, "2.0.0")
+
+    assert not version_dir(root, "2.0.0").exists()
+    assert (root / "registry.json").read_bytes() == before
+
+
+def register_raw_version(registry: ModelRegistry, version: str) -> None:
+    registry.register_candidate(
+        metadata(version),
+        payload(version),
+        actor="trainer",
+        reason="training completed",
+    )
+
+
+def test_failed_snapshot_commit_removes_the_orphaned_artifact(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "registry"
+    registry = ModelRegistry(root, SimulatedClock(NOW_MS), limits=LIMITS)
+    register_and_validate(registry, "1.0.0")
+    before = (root / "registry.json").read_bytes()
+    original_write = ModelRegistry._atomic_write
+
+    def fail_snapshot_write(directory_fd: int, name: str, body: bytes) -> None:
+        if name == "registry.json":
+            assert artifact_path(root, "2.0.0").exists()  # artifact is written first
+            raise OSError("disk full")
+        original_write(directory_fd, name, body)
+
+    monkeypatch.setattr(ModelRegistry, "_atomic_write", staticmethod(fail_snapshot_write))
+
+    with pytest.raises(OSError, match="disk full"):
+        register_raw_version(registry, "2.0.0")
+
+    assert not version_dir(root, "2.0.0").exists()
+    assert artifact_path(root, "1.0.0").exists()
+    assert (root / "registry.json").read_bytes() == before
+
+
+def test_orphan_cleanup_does_not_follow_a_swapped_in_symlink(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "registry"
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "artifact.payload").write_bytes(b"do not delete")
+    registry = ModelRegistry(root, SimulatedClock(NOW_MS), limits=LIMITS)
+    original_write = ModelRegistry._atomic_write
+
+    def swap_then_fail(directory_fd: int, name: str, body: bytes) -> None:
+        if name == "registry.json":
+            target = version_dir(root, "1.0.0")
+            (target / "artifact.payload").unlink()
+            target.rmdir()
+            target.symlink_to(outside, target_is_directory=True)
+            raise OSError("disk full")
+        original_write(directory_fd, name, body)
+
+    monkeypatch.setattr(ModelRegistry, "_atomic_write", staticmethod(swap_then_fail))
+
+    with pytest.raises(OSError, match="disk full"):
+        register_raw_version(registry, "1.0.0")
+
+    assert (outside / "artifact.payload").read_bytes() == b"do not delete"
+    assert outside.is_dir()
+
+
 def test_snapshot_exceeding_the_token_bound_is_never_written(tmp_path: Path) -> None:
     root = tmp_path / "registry"
     registry = ModelRegistry(root, SimulatedClock(NOW_MS), limits=LIMITS)

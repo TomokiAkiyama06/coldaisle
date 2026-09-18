@@ -701,7 +701,6 @@ class ModelRegistry:
             if ref.key in snapshot.artifacts:
                 raise ArtifactAlreadyExistsError(f"artifact は登録済み: {ref.key}")
 
-            self._write_artifact(root_fd, ref, payload)
             artifacts = dict(snapshot.artifacts)
             artifacts[ref.key] = ArtifactRecord(
                 metadata=metadata,
@@ -716,7 +715,17 @@ class ModelRegistry:
                 actor=actor,
                 reason=reason,
             )
-            self._write_snapshot(root_fd, updated)
+            # Check the capacity bounds before touching the filesystem, so a full
+            # registry never leaves an unreferenced artifact behind.  The write order
+            # stays artifact first, snapshot second: a crash in between leaves only
+            # an orphan, never a snapshot pointing at missing bytes.
+            snapshot_payload = self._encode_snapshot(updated)
+            self._write_artifact(root_fd, ref, payload)
+            try:
+                self._atomic_write(root_fd, _STATE_FILENAME, snapshot_payload)
+            except BaseException:
+                self._remove_unreferenced_artifact(root_fd, ref)
+                raise
             return ref
 
     def mark_validated(
@@ -1126,6 +1135,10 @@ class ModelRegistry:
             raise RegistryCorruptError("registry snapshot を検証できない") from exc
 
     def _write_snapshot(self, root_fd: int, snapshot: RegistrySnapshot) -> None:
+        self._atomic_write(root_fd, _STATE_FILENAME, self._encode_snapshot(snapshot))
+
+    def _encode_snapshot(self, snapshot: RegistrySnapshot) -> bytes:
+        """Serialize a snapshot, refusing one that later reads would reject."""
         payload = snapshot.model_dump_json(indent=2).encode("utf-8") + b"\n"
         if len(payload) > self._limits.max_snapshot_bytes:
             # Writing it would make every later read fail as INVALID_REGISTRY.
@@ -1134,7 +1147,34 @@ class ModelRegistry:
             self._check_snapshot_structure_bounds(payload)
         except _JsonStructureError as exc:
             raise RegistryCapacityError(f"registry snapshot が構造上限を超える: {exc}") from exc
-        self._atomic_write(root_fd, _STATE_FILENAME, payload)
+        return payload
+
+    def _remove_unreferenced_artifact(self, root_fd: int, ref: ArtifactRef) -> None:
+        """Best-effort removal of an artifact whose registration was not committed.
+
+        Called under the registry lock for a ref absent from the committed snapshot.
+        Every component is opened with O_NOFOLLOW relative to the pinned root, and
+        unlink / rmdir act on names inside those fds, so a swapped-in symlink makes the
+        cleanup fail closed instead of deleting anything outside the registry.
+        """
+        with suppress(OSError, UnsafeRegistryPathError):
+            parent_fd = self._open_directory_chain(
+                root_fd,
+                ("artifacts", ref.kind.value, ref.model_id),
+                create=False,
+            )
+            try:
+                version_fd = self._open_directory_chain(parent_fd, (ref.version,), create=False)
+                try:
+                    with suppress(FileNotFoundError):
+                        os.unlink(_ARTIFACT_FILENAME, dir_fd=version_fd)
+                finally:
+                    os.close(version_fd)
+                # Fails (and is ignored) if anything else is left in the directory.
+                os.rmdir(ref.version, dir_fd=parent_fd)
+                os.fsync(parent_fd)
+            finally:
+                os.close(parent_fd)
 
     def _read_artifact(self, root_fd: int, ref: ArtifactRef) -> bytes:
         directory_fd = self._open_directory_chain(

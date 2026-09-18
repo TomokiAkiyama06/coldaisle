@@ -17,6 +17,10 @@ Model、Supervisor Policy、Feature Transform の artifact lifecycle をロー�
   （`max_snapshot_json_nesting_depth`、現在16）と値の数（`max_snapshot_json_tokens`、現在250,000）を
   検査する。どれかを超えたsnapshotは確保せずに `INVALID_REGISTRY` としてFallbackさせる。
   上限を超えるsnapshotは書き込みも `RegistryCapacityError` で拒否し、自分で読めない状態を作らない。
+  登録時は、更新後のsnapshotが上限に収まることをartifactを書く前に確認する。書き込み順は
+  artifact → snapshotのまま（途中でcrashしても、残るのは参照されないartifactだけ）とし、
+  snapshotの確定に失敗した場合は、`O_NOFOLLOW` で開いたdirectory fd内でだけ、その
+  artifactとversion directoryをbest-effortで削除する。
   正当なsnapshotは約18 byte/token、約52 token/audit eventで、token上限より先にbyte上限
   （約4,000 event）に達する。
 - 壊れたsnapshotの検証で、Pydanticが要素ごとにerrorを積み上げないようにする。error objectは
