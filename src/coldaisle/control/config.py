@@ -28,6 +28,7 @@ from coldaisle.store.models import validate_metric
 
 CONTROL_CONFIG_VERSION: Literal[5] = 5
 FAN_POLICY_CONFIG_VERSION: Literal[5] = 5
+SAFETY_CONFIG_VERSION: Literal[2] = 2
 CONFIG_FILENAMES = {
     "fan_hardware": "fan-hardware.yaml",
     "safety": "safety.yaml",
@@ -193,6 +194,13 @@ class TemperatureDemandPoint(_ConfigModel):
     demand: SafetyDemand
 
 
+class SafetyPowerDemandPoint(_ConfigModel):
+    """Critical Safety の CPU Power 曲線の1点。値ごとに provisional / confirmed を持つ。"""
+
+    power_w: SafetyFloat
+    demand: SafetyDemand
+
+
 class TSensorTelemetry(_ConfigModel):
     """未設置を明示できる温度計モジュールの安全設定。"""
 
@@ -212,6 +220,7 @@ class TSensorTelemetry(_ConfigModel):
 
 class TelemetryDelays(_ConfigModel):
     cpu_ms: SafetyMilliseconds
+    cpu_power_ms: SafetyMilliseconds
     gpu_ms: SafetyMilliseconds
     t_sensor: TSensorTelemetry
     air_ms: SafetyMilliseconds
@@ -227,7 +236,7 @@ class TelemetryDelays(_ConfigModel):
 class SafetyConfig(_ConfigModel):
     """Critical Safety だけが所有する設定。全数値に status/basis を残す。"""
 
-    schema_version: Literal[1]
+    schema_version: Literal[2]
     absolute_temp_ceiling_c: SafetyFloat
     zone_min_demand: PerZone[SafetyDemand]
     cpu_cooling_floor: Annotated[
@@ -235,9 +244,17 @@ class SafetyConfig(_ConfigModel):
         BeforeValidator(_yaml_sequence_to_tuple),
         Field(min_length=2),
     ]
+    cpu_power_cooling_floor: Annotated[
+        tuple[SafetyPowerDemandPoint, ...],
+        BeforeValidator(_yaml_sequence_to_tuple),
+        Field(min_length=2),
+    ]
+    """CPU Power から Top の floor を決める曲線（0028 §2.4 の cpu_cooling_floor の Power 項）。"""
     fault_demand: SafetyDemand
+    stall_check_min_demand: PerZone[SafetyDemand]
     stall_min_rpm: PerZone[SafetyRpm]
     stall_window_ms: SafetyMilliseconds
+    write_fail_emergency_after: ConfigValue[Annotated[int, Field(gt=0)]]
     telemetry: TelemetryDelays
     ramp_down_per_s: SafetyFloat
     startup_settle_ms: SafetyMilliseconds
@@ -256,6 +273,12 @@ class SafetyConfig(_ConfigModel):
             raise ValueError("fault_demand は全 zone の最低安全 demand 以上にする")
         if self.ramp_down_per_s.value < 0:
             raise ValueError("ramp_down_per_s は 0 以上にする")
+        for zone in Zone:
+            if self.stall_check_min_demand.get(zone).value > self.zone_min_demand.get(zone).value:
+                raise ValueError(
+                    f"stall_check_min_demand.{zone.value} は "
+                    f"zone_min_demand.{zone.value} 以下にする"
+                )
         previous_temperature: float | None = None
         previous_demand: float | None = None
         for point in self.cpu_cooling_floor:
@@ -268,6 +291,15 @@ class SafetyConfig(_ConfigModel):
                 raise ValueError("cpu_cooling_floor の demand は下げない")
             previous_temperature = point.temperature_c.value
             previous_demand = point.demand.value
+        previous_power: float | None = None
+        previous_demand = None
+        for power_point in self.cpu_power_cooling_floor:
+            if previous_power is not None and power_point.power_w.value <= previous_power:
+                raise ValueError("cpu_power_cooling_floor の Power は単調増加にする")
+            if previous_demand is not None and power_point.demand.value < previous_demand:
+                raise ValueError("cpu_power_cooling_floor の demand は下げない")
+            previous_power = power_point.power_w.value
+            previous_demand = power_point.demand.value
         return self
 
 
@@ -678,6 +710,50 @@ class ConfigSource(_ConfigModel):
     sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
 
 
+class ValidatedFanHardwareDocument:
+    """同じ ``fan-hardware.yaml`` bytes から検証値と provenance を作った束。"""
+
+    __slots__ = ("_config", "_source")
+    _config: FanHardwareConfig
+    _source: ConfigSource
+
+    def __init__(self) -> None:
+        raise TypeError("ValidatedFanHardwareDocument は trusted loader からだけ取得する")
+
+    def __setattr__(self, name: str, value: object) -> None:
+        raise AttributeError("ValidatedFanHardwareDocument は不変")
+
+    @classmethod
+    def _from_bytes(cls, payload: bytes) -> ValidatedFanHardwareDocument:
+        try:
+            text = payload.decode("utf-8")
+        except UnicodeError as exc:
+            raise ValueError("fan-hardware.yaml はUTF-8にする") from exc
+        loaded: Any = yaml.safe_load(text)
+        if not isinstance(loaded, dict):
+            raise ValueError("制御設定が辞書ではない: fan-hardware.yaml")
+        config = FanHardwareConfig.model_validate(loaded)
+        source = ConfigSource(
+            name="fan-hardware.yaml",
+            schema_version=config.schema_version,
+            sha256=sha256(payload).hexdigest(),
+        )
+        document = object.__new__(cls)
+        object.__setattr__(document, "_config", config)
+        object.__setattr__(document, "_source", source)
+        return document
+
+    def _binding_material(self) -> tuple[FanHardwareConfig, ConfigSource]:
+        return self._config, self._source
+
+
+def load_fan_hardware_document(path: Path) -> ValidatedFanHardwareDocument:
+    """hardware-only fail-safe 起動用に、1回読んだ bytes を検証してhashする。"""
+    if path.name != CONFIG_FILENAMES["fan_hardware"]:
+        raise ValueError("emergency hardware source は fan-hardware.yaml に固定する")
+    return ValidatedFanHardwareDocument._from_bytes(path.read_bytes())
+
+
 class ConfigSources(_ConfigModel):
     fan_hardware: ConfigSource
     safety: ConfigSource
@@ -691,6 +767,18 @@ class ControlConfig(_ConfigModel):
     safety: SafetyConfig
     policy: FanPolicyConfig
     sources: ConfigSources
+
+    @model_validator(mode="after")
+    def _source_metadata_matches_validated_documents(self) -> Self:
+        expected = (
+            (self.sources.fan_hardware, "fan-hardware.yaml", self.fan_hardware.schema_version),
+            (self.sources.safety, "safety.yaml", self.safety.schema_version),
+            (self.sources.policy, "fan-policy.yaml", self.policy.schema_version),
+        )
+        for source, name, version in expected:
+            if source.name != name or source.schema_version != version:
+                raise ValueError(f"ConfigSource が検証済み設定と一致しない: {name}")
+        return self
 
     @classmethod
     def from_directory(cls, directory: Path) -> ControlConfig:
@@ -747,6 +835,11 @@ class ControlConfig(_ConfigModel):
         append("safety.yaml", "absolute_temp_ceiling_c", safety.absolute_temp_ceiling_c)
         append("safety.yaml", "fault_demand", safety.fault_demand)
         append("safety.yaml", "stall_window_ms", safety.stall_window_ms)
+        append(
+            "safety.yaml",
+            "write_fail_emergency_after",
+            safety.write_fail_emergency_after,
+        )
         append("safety.yaml", "ramp_down_per_s", safety.ramp_down_per_s)
         append("safety.yaml", "startup_settle_ms", safety.startup_settle_ms)
         append("safety.yaml", "fault_clear_hold_ms", safety.fault_clear_hold_ms)
@@ -761,13 +854,21 @@ class ControlConfig(_ConfigModel):
             )
             append(
                 "safety.yaml",
+                f"stall_check_min_demand.{zone.value}",
+                safety.stall_check_min_demand.get(zone),
+            )
+            append(
+                "safety.yaml",
                 f"stall_min_rpm.{zone.value}",
                 safety.stall_min_rpm.get(zone),
             )
         for index, point in enumerate(safety.cpu_cooling_floor):
             append("safety.yaml", f"cpu_cooling_floor[{index}].temperature_c", point.temperature_c)
             append("safety.yaml", f"cpu_cooling_floor[{index}].demand", point.demand)
-        for name in ("cpu_ms", "gpu_ms", "air_ms", "air_sensor_period_ms"):
+        for index, power_point in enumerate(safety.cpu_power_cooling_floor):
+            append("safety.yaml", f"cpu_power_cooling_floor[{index}].power_w", power_point.power_w)
+            append("safety.yaml", f"cpu_power_cooling_floor[{index}].demand", power_point.demand)
+        for name in ("cpu_ms", "cpu_power_ms", "gpu_ms", "air_ms", "air_sensor_period_ms"):
             append("safety.yaml", f"telemetry.{name}", getattr(safety.telemetry, name))
         append("safety.yaml", "telemetry.t_sensor.enabled", safety.telemetry.t_sensor.enabled)
         if safety.telemetry.t_sensor.stale_after_ms is not None:
