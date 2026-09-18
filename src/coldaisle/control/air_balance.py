@@ -250,6 +250,9 @@ class AirBalanceCoordination(_Frozen):
     candidate: PerZone[Demand]
     requested: PerZone[Demand]
     top_request_role: Literal["case_aux_exhaust"] = "case_aux_exhaust"
+    # 後段の Critical Safety が Top に掛けると見込まれる floor（CPU cooling floor を含む）。
+    # 風量の見積もりにだけ使い、requested.top には含めない。所有者は Critical Safety のまま。
+    projected_top_floor: Demand | None = None
     before: AirBalanceEstimate
     projected: AirBalanceEstimate
     reasons: tuple[Reason, ...]
@@ -276,6 +279,8 @@ class AirBalanceModel(Protocol):
         self,
         demands: PerZone[Demand],
         thermal: ThermalInputs,
+        *,
+        projected_top_floor: Demand | None = None,
     ) -> AirBalanceCoordination:
         """安全層より前の requested demand を提案する。"""
 
@@ -366,9 +371,20 @@ class ConfiguredAirBalanceModel:
         self,
         demands: PerZone[Demand],
         thermal: ThermalInputs,
+        *,
+        projected_top_floor: Demand | None = None,
     ) -> AirBalanceCoordination:
-        """Exhaust 過多なら Front、熱を伴う Intake 過多なら Rear→Top を上げる。"""
-        before = self.evaluate(demands, thermal)
+        """Exhaust 過多なら Front、熱を伴う Intake 過多なら Rear→Top を上げる。
+
+        ``projected_top_floor`` は後段の Critical Safety が Top に掛けると見込まれる
+        floor（CPU cooling floor を含む）で、呼び出し側が ``safety.yaml`` を制約として
+        読んで渡す（決定記録 0028 §2.4 / §2.8）。Top の実際の排気は
+        ``max(case_aux_exhaust, safety_floor)`` になるため、風量の評価はその値で行う。
+        requested.top へは入れず、floor の所有者は Critical Safety のまま。
+        """
+        if projected_top_floor is not None and not 0.0 <= projected_top_floor <= 1.0:
+            raise ValueError("projected_top_floor は 0.0..1.0 の demand で渡す")
+        before = self.evaluate(self._airflow_demands(demands, projected_top_floor), thermal)
         requested = demands
         reasons: list[Reason] = []
         ratio = before.balance_ratio
@@ -413,9 +429,24 @@ class ConfiguredAirBalanceModel:
         return AirBalanceCoordination(
             candidate=demands,
             requested=requested,
+            projected_top_floor=projected_top_floor,
             before=before,
-            projected=self.evaluate(requested, thermal),
+            projected=self.evaluate(self._airflow_demands(requested, projected_top_floor), thermal),
             reasons=tuple(reasons),
+        )
+
+    @staticmethod
+    def _airflow_demands(
+        demands: PerZone[Demand],
+        projected_top_floor: Demand | None,
+    ) -> PerZone[Demand]:
+        """後段の Top floor を反映した、風量見積もり用の demand を返す。"""
+        if projected_top_floor is None or projected_top_floor <= demands.top:
+            return demands
+        return PerZone[Demand](
+            front=demands.front,
+            rear=demands.rear,
+            top=projected_top_floor,
         )
 
     def _increase_exhaust(

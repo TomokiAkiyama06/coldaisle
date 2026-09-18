@@ -242,9 +242,66 @@ def test_top_proposal_is_case_aux_only_and_cannot_lower_cpu_floor(tmp_path: Path
 
     assert proposal.top_request_role == "case_aux_exhaust"
     assert proposal.requested.top >= candidate.top
-    # CPU floor は Air Balance の入力・出力ではない。後段の Critical Safety の max が
+    # CPU floor は Air Balance の出力ではない。後段の Critical Safety の max が
     # case auxiliary より強い floor をそのまま保持する。
     assert max(proposal.requested.top, cpu_cooling_floor) == cpu_cooling_floor
+
+
+def test_projected_top_floor_counts_toward_exhaust_and_triggers_makeup_air(
+    tmp_path: Path,
+) -> None:
+    candidate = PerZone[float](front=0.5, rear=0.5, top=0.1)
+    without_floor = model(tmp_path).coordinate(candidate, cool())
+    with_floor = model(tmp_path).coordinate(candidate, cool(), projected_top_floor=0.6)
+
+    assert without_floor.before.state is AirBalanceState.BALANCED
+    assert without_floor.requested == candidate
+    # CPU cooling floor で Top が上がると排気過多になるため、Front make-up air を足す。
+    assert with_floor.before.state is AirBalanceState.EXHAUST_HEAVY
+    assert with_floor.before.q_top == pytest.approx(1.92)
+    assert with_floor.requested.front > candidate.front
+    assert with_floor.projected.balance_ratio == pytest.approx(0.9)
+    assert [reason.code for reason in with_floor.reasons] == ["front_makeup_air"]
+    # floor は風量の見積もりにだけ使い、requested.top（case aux）へは入れない。
+    assert with_floor.requested.top == candidate.top
+    assert with_floor.projected_top_floor == 0.6
+    assert with_floor.top_request_role == "case_aux_exhaust"
+
+
+def test_projected_top_floor_below_candidate_top_changes_nothing(tmp_path: Path) -> None:
+    candidate = PerZone[float](front=0.5, rear=0.5, top=0.5)
+    baseline = model(tmp_path).coordinate(candidate, cool())
+    floored = model(tmp_path).coordinate(candidate, cool(), projected_top_floor=0.2)
+
+    assert floored.requested == baseline.requested
+    assert floored.before == baseline.before
+    assert floored.projected == baseline.projected
+
+
+def test_projected_top_floor_airflow_covers_top_case_aux_shortfall(tmp_path: Path) -> None:
+    thermal = ThermalInputs(case_delta_c=15.0)
+    candidate = PerZone[float](front=1.0, rear=0.0, top=0.0)
+    without_floor = model(tmp_path).coordinate(candidate, thermal)
+    with_floor = model(tmp_path).coordinate(candidate, thermal, projected_top_floor=0.8)
+
+    assert without_floor.requested.top > 0.0
+    assert without_floor.requested.top < 0.8
+    # floor 分の Top 排気を見込むので、Rear の不足分だけで足り、case aux の追加要求は出さない。
+    assert without_floor.requested.rear == 1.0
+    assert candidate.rear < with_floor.requested.rear < 1.0
+    assert with_floor.requested.top == candidate.top
+    assert with_floor.projected.balance_ratio == pytest.approx(0.9)
+    assert [reason.code for reason in with_floor.reasons] == ["rear_thermal_exhaust"]
+
+
+@pytest.mark.parametrize("floor", [-0.1, 1.1, float("nan")])
+def test_projected_top_floor_must_be_a_demand(tmp_path: Path, floor: float) -> None:
+    with pytest.raises(ValueError, match="projected_top_floor"):
+        model(tmp_path).coordinate(
+            PerZone[float](front=0.5, rear=0.5, top=0.5),
+            cool(),
+            projected_top_floor=floor,
+        )
 
 
 def test_intake_heavy_without_thermal_accumulation_does_not_raise_exhaust(tmp_path: Path) -> None:

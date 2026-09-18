@@ -53,6 +53,14 @@ still raises Front make-up air rather than leaving Front at zero.
   not contain a safety floor. Critical Safety still computes
   `max(case_aux_exhaust, cpu_cooling_floor)` later in the fixed pipeline, so this model has no path
   that can lower the CPU floor.
+- Because Top actually runs at `max(case_aux_exhaust, safety_floor)`, `coordinate()` accepts an
+  optional `projected_top_floor`: the Top floor the caller expects Critical Safety to apply,
+  derived by reading `safety.yaml` as a constraint (decision record 0028 §2.4 / §2.8). It is used
+  only to estimate `q_top` for `before` and `projected`, so a floor that makes the case
+  exhaust-heavy still triggers Front make-up air (`docs/airflow-model.md` "Top → Front make-up
+  air"), and floor airflow counts toward any Top case-auxiliary shortfall. It is never copied
+  into `requested.top`; ownership of the floor stays with Critical Safety, and omitting it keeps
+  the previous behaviour.
 
 The model is pure and uses no hardware I/O, which lets Mock and Replay exercise all state changes
 without a sensor module.
