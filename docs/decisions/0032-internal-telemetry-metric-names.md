@@ -1,7 +1,7 @@
 # 決定記録 0032: Internal Telemetry のメトリクス名
 
 - **種別**: Decision Record
-- **Status**: Proposed
+- **Status**: FINAL（2026-09-18、リポジトリ所有者が承認）
 - **Date**: 2026-09-18
 - **Supersedes**: なし（決定記録 0002 §2.1 の命名規約を具体化する）
 - **関連**: [`0002-metric-naming.md`](0002-metric-naming.md) / `docs/requirements.md` §5.1 /
@@ -18,6 +18,8 @@ T_SENSOR はマザーボード上の取得端子名であり、測定対象で�
 プローブを接続できるため、`t_sensor` だけでは保存済みデータの物理的な意味が分からない。
 
 ## 2. Decision
+
+2026-09-18、リポジトリ所有者が本記録の内容どおりに承認した（PR #128 のレビュー）。
 
 次の名前を提案する。すべて決定記録 0002 の `<domain>.<name>` 文法に従う。
 
