@@ -19,8 +19,11 @@ Model、Supervisor Policy、Feature Transform の artifact lifecycle をロー�
   上限を超えるsnapshotは書き込みも `RegistryCapacityError` で拒否し、自分で読めない状態を作らない。
   登録時は、更新後のsnapshotが上限に収まることをartifactを書く前に確認する。書き込み順は
   artifact → snapshotのまま（途中でcrashしても、残るのは参照されないartifactだけ）とし、
-  snapshotの確定に失敗した場合は、`O_NOFOLLOW` で開いたdirectory fd内でだけ、その
-  artifactとversion directoryをbest-effortで削除する。
+  artifactまたはsnapshotの書き込みに失敗した場合は、lock内でsnapshotを読み直し、そのartifactが
+  参照されていないと確認できたときだけ、`O_NOFOLLOW` で開いたdirectory fd内でartifactと
+  version directoryをbest-effortで削除する（snapshotを読めなければ削除しない）。
+  `os.replace()` の後のdirectory fsyncだけが失敗した場合は `RegistryDurabilityError` を返す。
+  このとき内容はすでに置換済みであるため、snapshotなら登録は確定しているとみなし、削除しない。
   正当なsnapshotは約18 byte/token、約52 token/audit eventで、token上限より先にbyte上限
   （約4,000 event）に達する。
 - 壊れたsnapshotの検証で、Pydanticが要素ごとにerrorを積み上げないようにする。error objectは

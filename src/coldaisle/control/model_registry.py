@@ -599,6 +599,14 @@ class ArtifactVerificationError(ModelRegistryError):
     """The artifact bytes or runtime compatibility cannot be verified."""
 
 
+class RegistryDurabilityError(ModelRegistryError):
+    """The file was atomically replaced, but its directory entry was not fsynced.
+
+    The new content is already visible (committed for this process and readers);
+    only its durability across a crash is uncertain.  Callers must not undo it.
+    """
+
+
 class RegistryCapacityError(ModelRegistryError):
     """The next registry snapshot would exceed the configured snapshot bound."""
 
@@ -720,11 +728,16 @@ class ModelRegistry:
             # stays artifact first, snapshot second: a crash in between leaves only
             # an orphan, never a snapshot pointing at missing bytes.
             snapshot_payload = self._encode_snapshot(updated)
-            self._write_artifact(root_fd, ref, payload)
+            snapshot_attempted = False
             try:
+                self._write_artifact(root_fd, ref, payload)
+                snapshot_attempted = True
                 self._atomic_write(root_fd, _STATE_FILENAME, snapshot_payload)
-            except BaseException:
-                self._remove_unreferenced_artifact(root_fd, ref)
+            except BaseException as exc:
+                # A durability error after the snapshot replace means the registration
+                # is committed and the artifact is referenced: never delete it.
+                if not (snapshot_attempted and isinstance(exc, RegistryDurabilityError)):
+                    self._remove_artifact_if_unreferenced(root_fd, ref)
                 raise
             return ref
 
@@ -1149,14 +1162,22 @@ class ModelRegistry:
             raise RegistryCapacityError(f"registry snapshot が構造上限を超える: {exc}") from exc
         return payload
 
-    def _remove_unreferenced_artifact(self, root_fd: int, ref: ArtifactRef) -> None:
+    def _remove_artifact_if_unreferenced(self, root_fd: int, ref: ArtifactRef) -> None:
         """Best-effort removal of an artifact whose registration was not committed.
 
-        Called under the registry lock for a ref absent from the committed snapshot.
-        Every component is opened with O_NOFOLLOW relative to the pinned root, and
+        The failure may have happened on either side of the snapshot replace (e.g. an
+        interrupt right after the rename), so the snapshot is re-read under the still
+        held lock and the artifact is removed only when it is provably unreferenced.
+        An unreadable snapshot is ambiguous and keeps the artifact.  Every component
+        is opened with O_NOFOLLOW relative to the pinned root, and
         unlink / rmdir act on names inside those fds, so a swapped-in symlink makes the
         cleanup fail closed instead of deleting anything outside the registry.
         """
+        try:
+            if ref.key in self._read_snapshot(root_fd).artifacts:
+                return
+        except RegistryCorruptError:
+            return
         with suppress(OSError, UnsafeRegistryPathError):
             parent_fd = self._open_directory_chain(
                 root_fd,
@@ -1356,7 +1377,14 @@ class ModelRegistry:
                 src_dir_fd=directory_fd,
                 dst_dir_fd=directory_fd,
             )
-            os.fsync(directory_fd)
+            try:
+                os.fsync(directory_fd)
+            except OSError as exc:
+                # Report that the replace already happened, so callers do not treat
+                # this like a failure before the new content became visible.
+                raise RegistryDurabilityError(
+                    f"registry file は置換済みだがdirectoryをfsyncできない: {name}"
+                ) from exc
         finally:
             with suppress(FileNotFoundError):
                 os.unlink(temporary_name, dir_fd=directory_fd)

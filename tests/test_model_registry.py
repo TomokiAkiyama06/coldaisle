@@ -32,6 +32,7 @@ from coldaisle.control import (
     ModelRegistryLimits,
     RegistryCapacityError,
     RegistryCorruptError,
+    RegistryDurabilityError,
     RegistryEventKind,
     RegistrySnapshot,
     UnsafeRegistryPathError,
@@ -938,6 +939,112 @@ def test_failed_snapshot_commit_removes_the_orphaned_artifact(
     assert not version_dir(root, "2.0.0").exists()
     assert artifact_path(root, "1.0.0").exists()
     assert (root / "registry.json").read_bytes() == before
+
+
+def fail_after_replace(
+    monkeypatch: pytest.MonkeyPatch,
+    target: str,
+    failure: BaseException | None = None,
+) -> None:
+    """Let ``os.replace`` onto ``target`` succeed, then fail its directory fsync.
+
+    With ``failure`` the exception is raised right after the rename instead, like
+    an interrupt arriving between the replace and the fsync.
+    """
+    original_replace = os.replace
+    original_fsync = os.fsync
+    replaced = False
+
+    def replace(src: str, dst: str, **kwargs: int) -> None:
+        nonlocal replaced
+        original_replace(src, dst, **kwargs)
+        if dst == target:
+            if failure is not None:
+                raise failure
+            replaced = True
+
+    def fsync(fd: int) -> None:
+        nonlocal replaced
+        if replaced:
+            replaced = False
+            raise OSError("fsync failed after replace")
+        original_fsync(fd)
+
+    monkeypatch.setattr(registry_module.os, "replace", replace)
+    monkeypatch.setattr(registry_module.os, "fsync", fsync)
+
+
+def test_artifact_directory_fsync_failure_after_replace_leaves_no_orphan(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "registry"
+    registry = ModelRegistry(root, SimulatedClock(NOW_MS), limits=LIMITS)
+    register_and_validate(registry, "1.0.0")
+    before = (root / "registry.json").read_bytes()
+    fail_after_replace(monkeypatch, "artifact.payload")
+
+    with pytest.raises(RegistryDurabilityError):
+        register_raw_version(registry, "2.0.0")
+
+    assert not version_dir(root, "2.0.0").exists()
+    assert (root / "registry.json").read_bytes() == before
+
+
+def test_snapshot_fsync_failure_after_replace_keeps_the_committed_artifact(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "registry"
+    registry = ModelRegistry(root, SimulatedClock(NOW_MS), limits=LIMITS)
+    fail_after_replace(monkeypatch, "registry.json")
+
+    with pytest.raises(RegistryDurabilityError):
+        register_raw_version(registry, "1.0.0")
+    monkeypatch.undo()
+
+    assert metadata("1.0.0").ref.key in registry.inspect().artifacts
+    loaded = registry.load_version(metadata("1.0.0").ref, COMPATIBILITY)
+    assert loaded.status is ArtifactLoadStatus.LOADED
+
+
+def test_interrupt_after_snapshot_replace_keeps_the_committed_artifact(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "registry"
+    registry = ModelRegistry(root, SimulatedClock(NOW_MS), limits=LIMITS)
+    fail_after_replace(monkeypatch, "registry.json", KeyboardInterrupt())
+
+    with pytest.raises(KeyboardInterrupt):
+        register_raw_version(registry, "1.0.0")
+    monkeypatch.undo()
+
+    assert metadata("1.0.0").ref.key in registry.inspect().artifacts
+    assert artifact_path(root, "1.0.0").exists()
+
+
+def test_interrupt_before_snapshot_replace_removes_the_artifact(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "registry"
+    registry = ModelRegistry(root, SimulatedClock(NOW_MS), limits=LIMITS)
+    original_replace = os.replace
+
+    def interrupt_snapshot_replace(src: str, dst: str, **kwargs: int) -> None:
+        if dst == "registry.json":
+            raise KeyboardInterrupt
+        original_replace(src, dst, **kwargs)
+
+    monkeypatch.setattr(registry_module.os, "replace", interrupt_snapshot_replace)
+
+    with pytest.raises(KeyboardInterrupt):
+        register_raw_version(registry, "1.0.0")
+    monkeypatch.undo()
+
+    assert not version_dir(root, "1.0.0").exists()
+    assert registry.inspect().revision == 0
 
 
 def test_orphan_cleanup_does_not_follow_a_swapped_in_symlink(
