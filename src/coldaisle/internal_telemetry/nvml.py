@@ -6,13 +6,34 @@ import importlib
 import math
 from collections.abc import Callable
 from types import ModuleType
-from typing import Any, Protocol, cast
+from typing import Any, NamedTuple, Protocol, cast
 
 from coldaisle.internal_telemetry.config import NvmlConfig
 from coldaisle.internal_telemetry.models import AdapterResult, SourceStatus
 from coldaisle.store import Quality, Reading
 
 GIB = 1024**3
+
+THROTTLE_REASON_BITS: dict[str, int] = {
+    "hw_slowdown": 0x8,
+    "hw_thermal": 0x40,
+    "sw_thermal": 0x20,
+    "hw_power_brake": 0x80,
+    "sw_power_cap": 0x4,
+}
+"""記録する clock event reason と NVML ABI のビット（決定記録 0043）。
+
+値は ``nvml.h`` の ``nvmlClocksEventReason*`` と同じで、運用で調整する値ではない。
+pynvml の定数名は版で変わってきた（``ClocksThrottle`` → ``ClocksEvent``）ため、
+名前ではなく ABI のビット値に固定する。
+"""
+
+
+class ClockEventReasons(NamedTuple):
+    """現在の clock event reason と、この GPU が報告しうる reason のビット集合。"""
+
+    active: int
+    supported: int
 
 
 class NvmlApi(Protocol):
@@ -39,6 +60,12 @@ class NvmlApi(Protocol):
     def vram_used_gb(self, handle: object) -> float: ...
 
     def compute_process_ids(self, handle: object) -> tuple[int, ...]: ...
+
+    def tlimit_margin_c(self, handle: object) -> float | None: ...
+
+    def clock_event_reasons(self, handle: object) -> ClockEventReasons | None: ...
+
+    def fan_speed_pct(self, handle: object) -> float | None: ...
 
 
 class PynvmlApi:
@@ -126,6 +153,43 @@ class PynvmlApi:
             return tuple(int(process.pid) for process in processes)
         raise NotImplementedError("NVML が compute process API を公開していない")
 
+    def tlimit_margin_c(self, handle: object) -> float | None:
+        # nvidia-smi の ``temperature.gpu.tlimit``。slowdown までの残り温度（°C）で、
+        # 超えれば負になる。古い driver / binding は API 自体を持たない
+        function = getattr(self._load(), "nvmlDeviceGetMarginTemperature", None)
+        if not callable(function):
+            return None
+        return float(cast(Callable[[object], Any], function)(handle))
+
+    def clock_event_reasons(self, handle: object) -> ClockEventReasons | None:
+        module = self._load()
+        active = _first_callable(
+            module,
+            "nvmlDeviceGetCurrentClocksEventReasons",
+            "nvmlDeviceGetCurrentClocksThrottleReasons",
+        )
+        supported = _first_callable(
+            module,
+            "nvmlDeviceGetSupportedClocksEventReasons",
+            "nvmlDeviceGetSupportedClocksThrottleReasons",
+        )
+        if active is None or supported is None:
+            return None
+        return ClockEventReasons(active=int(active(handle)), supported=int(supported(handle)))
+
+    def fan_speed_pct(self, handle: object) -> float | None:
+        # NVML の fan speed は「意図した回転数」の最大比で、tach の実測ではない。
+        # 冷却ファンを持たない GPU では NotSupported が返り、呼び出し側で欠測にする
+        return float(self._load().nvmlDeviceGetFanSpeed(handle))
+
+
+def _first_callable(module: ModuleType, *names: str) -> Callable[[object], Any] | None:
+    for name in names:
+        function = getattr(module, name, None)
+        if callable(function):
+            return cast(Callable[[object], Any], function)
+    return None
+
 
 def _gpu_metrics(index: int) -> tuple[str, ...]:
     return (
@@ -135,6 +199,9 @@ def _gpu_metrics(index: int) -> tuple[str, ...]:
         f"gpu.{index}.utilization",
         f"gpu.{index}.vram_used",
         f"power.gpu.{index}",
+        f"gpu.{index}.tlimit_margin",
+        f"gpu.{index}.fan_speed",
+        *(f"gpu.{index}.throttle.{reason}" for reason in THROTTLE_REASON_BITS),
     )
 
 
@@ -203,6 +270,9 @@ class NvmlAdapter:
             utilization = self._read(self._api.utilization_pct, handle)
             vram = self._read(self._api.vram_used_gb, handle)
             power = self._read(self._api.power_w, handle)
+            margin = self._read(self._api.tlimit_margin_c, handle)
+            fan = self._read(self._api.fan_speed_pct, handle)
+            throttle = _throttle_flags(self._api, handle)
             readings.extend(
                 (
                     _reading(f"gpu.{index}.core", core),
@@ -211,12 +281,29 @@ class NvmlAdapter:
                     _reading(f"gpu.{index}.utilization", utilization),
                     _reading(f"gpu.{index}.vram_used", vram),
                     _reading(f"power.gpu.{index}", power),
+                    _reading(f"gpu.{index}.tlimit_margin", margin),
+                    _reading(f"gpu.{index}.fan_speed", fan),
+                    *(
+                        _reading(f"gpu.{index}.throttle.{reason}", flag)
+                        for reason, flag in throttle.items()
+                    ),
                 )
             )
             critical_available &= core is not None
             power_available &= power is not None
             any_available |= any(
-                value is not None for value in (core, hotspot, memory, utilization, vram, power)
+                value is not None
+                for value in (
+                    core,
+                    hotspot,
+                    memory,
+                    utilization,
+                    vram,
+                    power,
+                    margin,
+                    fan,
+                    *throttle.values(),
+                )
             )
             try:
                 process_ids.update(self._api.compute_process_ids(handle))
@@ -264,6 +351,24 @@ class NvmlAdapter:
             return
         self._api.shutdown()
         self._initialized = False
+
+
+def _throttle_flags(api: NvmlApi, handle: object) -> dict[str, float | None]:
+    """reason ごとの 0/1。報告されない reason は 0 ではなく欠測にする。
+
+    GPU が報告しない reason のビットは常に 0 で、「起きていない」と区別できない。
+    supported に無いビットを 0 として保存すると、誤った安心を生む。
+    """
+    try:
+        reasons = api.clock_event_reasons(handle)
+    except Exception:
+        reasons = None
+    if reasons is None:
+        return dict.fromkeys(THROTTLE_REASON_BITS)
+    return {
+        reason: (float(bool(reasons.active & bit)) if reasons.supported & bit else None)
+        for reason, bit in THROTTLE_REASON_BITS.items()
+    }
 
 
 def _reading(metric: str, value: float | None) -> Reading:
