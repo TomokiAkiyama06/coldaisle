@@ -10,6 +10,7 @@ from typing import Any, Literal, Self
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from coldaisle.metrics import MetricCatalog
 from coldaisle.store.db import MINUTE_MS
 from coldaisle.store.models import validate_metric
 
@@ -68,6 +69,15 @@ class HwmonMeasurement(StrEnum):
     POWER = "power"
     RPM = "rpm"
     PWM = "pwm"
+
+
+MEASUREMENT_UNITS: dict[HwmonMeasurement, str] = {
+    HwmonMeasurement.TEMPERATURE: "C",
+    HwmonMeasurement.POWER: "W",
+    HwmonMeasurement.RPM: "rpm",
+    HwmonMeasurement.PWM: "%",
+}
+"""hwmon adapter が変換して保存する単位。運用で変える値ではなく adapter の変換と対になる。"""
 
 
 class HwmonSensorConfig(_ConfigModel):
@@ -157,9 +167,29 @@ class InternalTelemetryConfig(_ConfigModel):
         return self
 
     @classmethod
-    def from_yaml(cls, path: Path) -> InternalTelemetryConfig:
-        """YAML を厳格に読み、未知キーや不足を起動前に拒否する。"""
+    def from_yaml(cls, path: Path, *, catalog: MetricCatalog) -> InternalTelemetryConfig:
+        """YAML を厳格に読み、未知キーや不足・単位の不一致を起動前に拒否する。"""
         loaded: Any = yaml.safe_load(path.read_text(encoding="utf-8"))
         if not isinstance(loaded, dict):
             raise ValueError(f"Internal Telemetry 設定が辞書ではない: {path}")
-        return cls.model_validate(loaded)
+        config = cls.model_validate(loaded)
+        config.validate_units(catalog)
+        return config
+
+    def validate_units(self, catalog: MetricCatalog) -> None:
+        """hwmon の各 sensor について、metric の定義単位と measurement の単位を照合する。
+
+        温度の label を ``fan.front.rpm`` に割り当てるような誤設定は、値が妥当な数値の
+        まま別の意味で保存され、あとから見分けられない。無効な sensor も対象にする
+        （有効化の時点で初めて気づくことを避ける）。
+        """
+        for sensor in self.hwmon.sensors:
+            unit = catalog.metrics[sensor.metric].unit if sensor.metric in catalog.metrics else None
+            if unit is None:
+                raise ValueError(f"metrics.yaml に定義の無い metric: {sensor.metric}")
+            expected = MEASUREMENT_UNITS[sensor.measurement]
+            if unit != expected:
+                raise ValueError(
+                    f"{sensor.metric} の単位 {unit!r} が measurement "
+                    f"{sensor.measurement.value} の単位 {expected!r} と一致しない"
+                )

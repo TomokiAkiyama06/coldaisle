@@ -716,3 +716,43 @@ def test_without_a_clock_the_fill_stops_at_the_newest_raw_row(store):
     rollup_minutes(store, periodic_intervals_ms=intervals)
 
     assert _minute_rows(store, "gpu.0.core") == [(0, 1, 24)]
+
+
+def test_disabled_period_is_not_an_outage_after_re_enabling(store):
+    """無効化していた期間は欠測にしない。再有効化後に最初に観測した分から埋める。"""
+    intervals = {"gpu.0.core": 2_500}
+    write(store, "gpu.0.core", 0, 55.0)
+    write(store, "air.room", 2 * MINUTE_MS, 26.0)
+    # 登録中の停止（1〜2分目）は欠測として埋まる
+    rollup_minutes(store, periodic_intervals_ms=intervals, now_ms=3 * MINUTE_MS)
+    # 無効化中のロールアップ（登録されない）
+    write(store, "air.room", 10 * MINUTE_MS, 26.0)
+    rollup_minutes(store, periodic_intervals_ms={}, now_ms=11 * MINUTE_MS)
+    # 再有効化。無効の間に登録されていなかった分と、再開前の分は埋めない
+    write(store, "gpu.0.core", 20 * MINUTE_MS, 55.0)
+    write(store, "air.room", 20 * MINUTE_MS, 26.0)
+
+    rollup_minutes(store, periodic_intervals_ms=intervals, now_ms=23 * MINUTE_MS + 5_000)
+
+    assert _minute_rows(store, "gpu.0.core") == [
+        (0, 1, 24),
+        (MINUTE_MS, 0, 24),
+        (2 * MINUTE_MS, 0, 24),
+        (20 * MINUTE_MS, 1, 24),
+        (21 * MINUTE_MS, 0, 24),
+        (22 * MINUTE_MS, 0, 24),
+    ]
+
+
+def test_re_enabled_metric_is_not_filled_before_it_is_observed_again(store):
+    """再有効化しても、まだ観測が無ければ埋めない。"""
+    intervals = {"gpu.0.core": 2_500}
+    write(store, "gpu.0.core", 0, 55.0)
+    write(store, "air.room", MINUTE_MS, 26.0)
+    rollup_minutes(store, periodic_intervals_ms=intervals, now_ms=2 * MINUTE_MS)
+    write(store, "air.room", 10 * MINUTE_MS, 26.0)
+    rollup_minutes(store, periodic_intervals_ms={}, now_ms=11 * MINUTE_MS)
+
+    rollup_minutes(store, periodic_intervals_ms=intervals, now_ms=15 * MINUTE_MS)
+
+    assert _minute_rows(store, "gpu.0.core") == [(0, 1, 24), (MINUTE_MS, 0, 24)]

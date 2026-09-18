@@ -25,6 +25,7 @@ from coldaisle.internal_telemetry import (
     SourceStatus,
     TelemetryAdapter,
 )
+from coldaisle.metrics import MetricCatalog
 from coldaisle.store import QualityRules, SqliteStore
 
 LOGGER = logging.getLogger("coldaisle.internal_telemetry")
@@ -32,6 +33,7 @@ LOGGER = logging.getLogger("coldaisle.internal_telemetry")
 DEFAULT_DB = Path("var/coldaisle.db")
 DEFAULT_CONFIG = Path("config/internal-telemetry.yaml")
 DEFAULT_QUALITY_RULES = Path("config/quality.yaml")
+DEFAULT_METRICS = Path("config/metrics.yaml")
 SOURCE_STATE_PREFIX = "sys.telemetry_source."
 
 
@@ -42,6 +44,7 @@ class Config:
     db: Path = DEFAULT_DB
     telemetry: Path = DEFAULT_CONFIG
     quality_rules: Path = DEFAULT_QUALITY_RULES
+    metrics: Path = DEFAULT_METRICS
 
 
 @dataclass(slots=True)
@@ -112,7 +115,9 @@ class InternalTelemetryDaemon:
         now = self._monotonic_ms()
         if now <= deadline:
             return deadline
-        skipped = (now - deadline) // self._interval_ms + 1
+        # 遅れを切り上げた枠数だけ進める。遅れがちょうど周期の倍数なら、進めた先の
+        # 枠が現在時刻と一致し、その枠はまだ間に合うので飛ばさない
+        skipped = -(-(now - deadline) // self._interval_ms)
         self.stats.skipped_slots += skipped
         LOGGER.warning(
             "Internal Telemetry の収集が周期を超えた",
@@ -204,7 +209,9 @@ def build(
     sleep: Callable[[float], None] = time.sleep,
 ) -> InternalTelemetryDaemon:
     """設定を読み、実 adapter と既存 Store を1つの clock で束ねる。"""
-    telemetry = InternalTelemetryConfig.from_yaml(config.telemetry)
+    telemetry = InternalTelemetryConfig.from_yaml(
+        config.telemetry, catalog=MetricCatalog.from_yaml(config.metrics)
+    )
     _log_configuration(telemetry)
     used_clock = clock or WallClock()
     used_adapters = adapters or (
@@ -269,6 +276,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--db", type=Path, default=DEFAULT_DB)
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
     parser.add_argument("--quality-rules", type=Path, default=DEFAULT_QUALITY_RULES)
+    parser.add_argument("--metrics", type=Path, default=DEFAULT_METRICS)
     parser.add_argument("--once", action="store_true", help="1回収集して終了する")
     parser.add_argument("--log-level", default="INFO")
     return parser
@@ -283,6 +291,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             db=args.db,
             telemetry=args.config,
             quality_rules=args.quality_rules,
+            metrics=args.metrics,
         )
     )
 

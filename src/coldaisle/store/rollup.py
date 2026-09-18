@@ -144,6 +144,7 @@ def rollup_minutes(
         # `sys.dropped_samples` は起きたときしか書かない（決定記録 0007 §2.4）ので、
         # 期待値を持たせると欠測率が無意味な値になる
         metric_expected = expected if metric in METRIC_TO_CHANNEL else periodic.get(metric)
+        resume_from = _periodic_resume_point(conn, metric, start) if metric in periodic else None
         with store.transaction():
             cursor = conn.execute(
                 "INSERT OR REPLACE INTO readings_1m "
@@ -160,9 +161,43 @@ def rollup_minutes(
                 (metric, metric_expected, metric, start, newest),
             )
             written += int(cursor.rowcount)
-            fill_until = periodic_until if metric in periodic else newest_bucket
-            written += _fill_absent_minutes(conn, metric, start, fill_until, metric_expected)
+            if metric in periodic:
+                if resume_from is not None:
+                    written += _fill_absent_minutes(
+                        conn, metric, resume_from, periodic_until, metric_expected
+                    )
+            else:
+                written += _fill_absent_minutes(conn, metric, start, newest_bucket, metric_expected)
     return written
+
+
+def _periodic_resume_point(conn: sqlite3.Connection, metric: str, start: int) -> int | None:
+    """周期メトリクスの穴埋めを始める分。``None`` なら今回は埋めない。
+
+    **前回のロールアップで登録されていたか**を、そのメトリクス自身の最終バケットで
+    判定する。登録中の周期メトリクスは毎回 ``periodic_until``（= 実行後の
+    ``readings_1m`` 全体の最終バケット）まで埋まるので、最終バケットが今回の
+    ``start`` に届いていれば前回から途切れず登録されていた。そのまま ``start`` から
+    埋め、停止区間を欠測として残す。
+
+    届いていなければ、前回は無効化されていた（設定から外れて登録されなかった）か、
+    まだ一度も観測していない。無効の間は欠測ではないので、今回の窓で**再開後に
+    最初に観測した分**から埋める。観測が無ければ埋めない。
+
+    制約: 登録状態はロールアップの実行時にしか見えない。2回の実行の間に無効化と
+    再有効化の両方が起きた場合、その無効期間は欠測として残る。
+    """
+    last = conn.execute(
+        "SELECT MAX(bucket_ms) FROM readings_1m WHERE metric = ?", (metric,)
+    ).fetchone()[0]
+    if last is not None and int(last) >= start:
+        return start
+    resumed = conn.execute(
+        "SELECT MIN(ts_ms) FROM readings WHERE metric = ? AND ts_ms >= ?", (metric, start)
+    ).fetchone()[0]
+    if resumed is None:
+        return None
+    return _floor(int(resumed), MINUTE_MS)
 
 
 def _fill_absent_minutes(

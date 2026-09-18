@@ -17,6 +17,7 @@ from coldaisle.internal_telemetry import (
     InternalTelemetryConfig,
     SourceStatus,
 )
+from coldaisle.metrics import MetricCatalog
 from coldaisle.store import Quality
 from conftest import CONFIG_DIR
 
@@ -235,7 +236,10 @@ def test_hwmon_poll_has_no_write_path(tmp_path: Path, monkeypatch: pytest.Monkey
 
 
 def test_repository_config_keeps_uninstalled_t_sensor_disabled():
-    config = InternalTelemetryConfig.from_yaml(CONFIG_DIR / "internal-telemetry.yaml")
+    config = InternalTelemetryConfig.from_yaml(
+        CONFIG_DIR / "internal-telemetry.yaml",
+        catalog=MetricCatalog.from_yaml(CONFIG_DIR / "metrics.yaml"),
+    )
     t_sensor = next(
         item for item in config.hwmon.sensors if item.metric == "board.connector_12v2x6"
     )

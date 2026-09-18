@@ -13,17 +13,21 @@ from pathlib import Path
 
 from coldaisle.clock import Clock
 from coldaisle.internal_telemetry import InternalTelemetryConfig
+from coldaisle.metrics import MetricCatalog
 from coldaisle.store import rollup
-from coldaisle.telemetry_daemon import DEFAULT_CONFIG, periodic_metric_intervals
+from coldaisle.telemetry_daemon import DEFAULT_CONFIG, DEFAULT_METRICS, periodic_metric_intervals
 
 
 def main(argv: Sequence[str] | None = None, *, clock: Clock | None = None) -> int:
-    """``--internal-telemetry`` だけをここで読み、残りの引数は Store の CLI へ渡す。"""
+    """``--internal-telemetry`` / ``--metrics`` をここで読み、残りは Store の CLI へ渡す。"""
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument("--internal-telemetry", type=Path, default=DEFAULT_CONFIG)
+    parser.add_argument("--metrics", type=Path, default=DEFAULT_METRICS)
     known, rest = parser.parse_known_args(argv)
     intervals = periodic_metric_intervals(
-        InternalTelemetryConfig.from_yaml(known.internal_telemetry)
+        InternalTelemetryConfig.from_yaml(
+            known.internal_telemetry, catalog=MetricCatalog.from_yaml(known.metrics)
+        )
     )
     return rollup.main(rest, periodic_intervals_ms=intervals, clock=clock)
 
