@@ -355,6 +355,9 @@ interval_ms: 2500
 nvml:
   enabled: true
   gpu_indices: [0]
+proc_stat:
+  enabled: false
+  path: /proc/stat
 hwmon:
   enabled: true
   root: /sys/class/hwmon
@@ -582,6 +585,9 @@ interval_ms: 2500
 nvml:
   enabled: true
   gpu_indices: [0]
+proc_stat:
+  enabled: false
+  path: /proc/stat
 hwmon:
   enabled: true
   root: /sys/class/hwmon

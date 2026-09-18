@@ -150,6 +150,13 @@ class HwmonConfig(_ConfigModel):
         return self
 
 
+class ProcStatConfig(_ConfigModel):
+    """``/proc/stat`` から CPU 使用率を読む設定（決定記録 0047）。"""
+
+    enabled: bool
+    path: Path
+
+
 class InternalTelemetryConfig(_ConfigModel):
     """collector 全体の設定。既定値をコードに持たない。"""
 
@@ -157,6 +164,7 @@ class InternalTelemetryConfig(_ConfigModel):
     interval_ms: int = Field(gt=0)
     nvml: NvmlConfig
     hwmon: HwmonConfig
+    proc_stat: ProcStatConfig
 
     @model_validator(mode="after")
     def _interval_divides_a_minute(self) -> Self:

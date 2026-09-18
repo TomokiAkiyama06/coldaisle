@@ -23,6 +23,7 @@ from coldaisle.internal_telemetry import (
     InternalTelemetryCollector,
     InternalTelemetryConfig,
     NvmlAdapter,
+    ProcStatAdapter,
     SourceStatus,
     TelemetryAdapter,
 )
@@ -195,6 +196,7 @@ def periodic_metric_intervals(config: InternalTelemetryConfig) -> dict[str, int]
     adapters: tuple[TelemetryAdapter, ...] = (
         NvmlAdapter(config.nvml),
         HwmonAdapter(config.hwmon),
+        ProcStatAdapter(config.proc_stat),
     )
     return {
         metric: config.interval_ms for adapter in adapters for metric in adapter.expected_metrics
@@ -217,6 +219,7 @@ def build(
     used_adapters = adapters or (
         NvmlAdapter(telemetry.nvml),
         HwmonAdapter(telemetry.hwmon),
+        ProcStatAdapter(telemetry.proc_stat),
     )
     rules = QualityRules.from_yaml(config.quality_rules)
     # 既定の `var/` は追跡されていない。ingest daemon / rollup と同じく、無ければ作る
