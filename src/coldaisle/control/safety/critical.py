@@ -535,7 +535,6 @@ class CriticalSafety:
         if self._started_ms is None:
             self._started_ms = now_ms
 
-        self._observe_startup_tach(snapshot)
         # tach stall は 0028 §2.7 / 0034 §2 で「stall_window_ms の間」続いたときだけの
         # fault と定義されている。Backend の TACH_STALL は1回の帰還にすぎないため直接
         # latch せず、その zone の tach が有効な応答を返していない証拠として同じ timer に渡す。
@@ -547,6 +546,9 @@ class CriticalSafety:
         external_faults = tuple(
             fault for fault in external_faults if fault.code is not FaultCode.TACH_STALL
         )
+        # Backend が stall を報告した zone は同じ tick の RPM が閾値以上でも
+        # startup の tach 応答確認に数えない（確認は一度付くと消えないため）。
+        self._observe_startup_tach(snapshot, backend_stall_zones)
         self._update_write_failure_counts(external_faults)
         self._overrun_count = self._overrun_count + 1 if tick_overrun else 0
 
@@ -714,10 +716,14 @@ class CriticalSafety:
     def _is_absolute_temperature_metric(self, metric: str) -> bool:
         return metric in ABSOLUTE_TEMPERATURE_METRICS or metric == self._t_sensor_metric
 
-    def _observe_startup_tach(self, snapshot: ControlStateSnapshot) -> None:
+    def _observe_startup_tach(
+        self, snapshot: ControlStateSnapshot, backend_stall_zones: frozenset[Zone]
+    ) -> None:
         if snapshot.fans is None:
             return
         for zone in Zone:
+            if zone in backend_stall_zones:
+                continue
             rpm = snapshot.fans.get(zone).rpm
             if rpm is not None and rpm >= self._config.stall_min_rpm.get(zone).value:
                 self._startup_tach_seen.add(zone)

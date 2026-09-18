@@ -59,6 +59,7 @@ Hardware Backend が `external_faults` で報告する `TACH_STALL` も直接 la
 その tick の zone の tach が有効な応答を返していない証拠として同じ timer に渡す
 （readback の RPM が閾値以上でも timer を reset しない）。`stall_check_min_demand`
 未満では数えず、window 経過後に通常の tach stall と同じ応答にする。
+同じ tick は Startup の tach 応答確認にも数えない（確認は一度付くと消えないため）。
 
 ## 合成と復帰
 

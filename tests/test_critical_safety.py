@@ -355,6 +355,29 @@ def test_startup_is_max_until_settle_and_all_tach_have_responded() -> None:
     assert not any(normal.zones.get(zone).forced_max for zone in Zone)
 
 
+def test_backend_tach_stall_does_not_confirm_startup_tach_even_with_normal_rpm() -> None:
+    # readback の RPM が閾値以上でも Backend が stall を報告した tick は tach 応答の
+    # 確認に数えない。確認は消えないため、ここで数えると STARTUP を抜けてしまう。
+    safety = critical_safety(safety_config())
+    backend_fault = (Fault(code=FaultCode.TACH_STALL, zone=Zone.REAR),)
+
+    initial = safety.evaluate(
+        snapshot(tick=1, mono=0),
+        mode=OperatingMode.AUTO,
+        external_faults=backend_fault,
+    )
+    after_settle = safety.evaluate(
+        snapshot(tick=2, mono=1_000, fan_state=fans(rear_rpm=0)),
+        mode=OperatingMode.AUTO,
+    )
+    confirmed = safety.evaluate(snapshot(tick=3, mono=2_000), mode=OperatingMode.AUTO)
+
+    assert initial.state is SafetyState.STARTUP
+    assert after_settle.state is SafetyState.STARTUP
+    assert all(after_settle.zones.get(zone).forced_max for zone in Zone)
+    assert confirmed.state is SafetyState.NORMAL
+
+
 def test_cpu_cooling_floor_is_interpolated_and_provisional_status_is_preserved() -> None:
     safety = critical_safety(safety_config())
     settled = settle(safety)
