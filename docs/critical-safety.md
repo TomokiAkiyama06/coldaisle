@@ -99,6 +99,8 @@ Backend を同じ session に束縛し、別設定および同じ設定の別 ru
 consume/write 前に拒否する。Backend
 も strictly increasing な identity だけを受理する。保持していた古い低 demand を Emergency Max
 の後に replay して fan を下げることはできない。
+Backend が最初に受理する command は全 zone forced Max（STARTUP、設定不正時は EMERGENCY）
+だけで、STARTUP の command を捨てて NORMAL を最初に渡すと consume 前に拒否する（0028 §2.7）。
 
 ## deadman / 異常停止
 

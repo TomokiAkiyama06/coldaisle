@@ -94,6 +94,14 @@ class SimulatedFanBackend:
             or runtime_lineage is not self._runtime_lineage
         ):
             raise ValueError("active control runtime が発行していない command は適用できない")
+        # 0028 §2.7: takeover 後の最初の書き込みは STARTUP（設定不正時は EMERGENCY）の
+        # 全 zone Max。STARTUP の command を捨てて NORMAL を最初に渡すと、profile の
+        # startup kick だけで制御を取ってしまうため、consume する前に拒否する。
+        if self._last_tick_id is None and not all(zones.get(zone).forced_max for zone in Zone):
+            raise ValueError(
+                "Fan Hardware Backend の最初の command は全 zone forced Max"
+                "（STARTUP / EMERGENCY）にする"
+            )
         if self._last_tick_id is not None and tick_id <= self._last_tick_id:
             raise ValueError("Fan Hardware Backend に古い tick の command を適用できない")
         if self._last_monotonic_ms is not None and monotonic_ms <= self._last_monotonic_ms:
