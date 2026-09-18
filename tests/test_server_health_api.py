@@ -554,32 +554,59 @@ def test_ai_summary_accepts_only_an_allowed_paraphrase():
     assert provider.thinking is False
 
 
-def test_composition_root_injects_the_ai_summarizer(healthy_db, monkeypatch):
+def test_composition_root_injects_the_ai_summarizer(healthy_db, tmp_path, monkeypatch):
     """L2→L3 の逆依存を作らず、server.py だけが AI 実体を合成する。"""
     import coldaisle.server as server
 
-    provider = FakeProvider("必要な監視情報を取得できないか、重大な警告があります。")
+    # リポジトリの internal-telemetry.yaml に依存させない。有効な入力が変わると
+    # signal（= AI に渡すテンプレート）が変わり、固定の言い換えが不正出力になる
+    internal_config = tmp_path / "internal-telemetry.yaml"
+    internal_config.write_text(
+        """version: 1
+interval_ms: 2500
+nvml:
+  enabled: true
+  gpu_indices: [0]
+hwmon:
+  enabled: true
+  root: /sys/class/hwmon
+  sensors:
+    - metric: cpu.package
+      enabled: true
+      driver: fixture-driver
+      label: Tctl
+      measurement: temperature
+      confirmation:
+        status: confirmed
+        basis: fixture
+""",
+        encoding="utf-8",
+    )
+    provider = FakeProvider("監視情報と各データ源は正常です。")
     monkeypatch.setattr(server, "provider_from_env", lambda settings: provider)
     app = server.create_server(
         Config(
             db=healthy_db,
             quality_rules=QUALITY_RULES_PATH,
             metrics=CONFIG_DIR / "metrics.yaml",
+            internal_telemetry=internal_config,
         ),
         clock=SimulatedClock(NOW_MS),
     )
 
     with TestClient(app) as client:
         first = client.get("/api/v1/server-health").json()
-        assert provider.called.wait(timeout=1)
-        for _ in range(100):
+        # provider の呼び出しではなく、cache された要約が API に現れるまでを待つ
+        deadline = time.monotonic() + 5.0
+        body = first
+        while body["summary_source"] != "ai" and time.monotonic() < deadline:
+            time.sleep(0.01)
             body = client.get("/api/v1/server-health").json()
-            if body["summary_source"] == "ai":
-                break
-            time.sleep(0.001)
 
+    assert first["signal"] == "green"
     assert first["summary_source"] == "template", "AI の完了を待たない"
     assert body["summary_source"] == "ai"
+    assert body["summary"] == "監視情報と各データ源は正常です。"
     assert body["sources"]["ai_layer"]["status"] == "ok"
     assert provider.messages
 
