@@ -105,7 +105,7 @@ GPU機どころか ESP32 すら接続せずに #8〜#25 のすべてが開発・
 |---|---|---|---|
 | #61 | ADR: Supervisor + Learned MPC + Reactive Guard + Critical Safety の責務境界 | M8 | 完了（決定記録 0027 / 0028） |
 | #76 | Front / Rear / Top Demand schema と制御reason schema | M8 | 完了（PR #101） |
-| #65 | NVML / lm-sensors / hwmon 内部Telemetry統合（Control/ML入力対応） | M7 | 実装中（PR #128 レビュー中・main と競合。Fan header 対応は 2026-09-18 に所有者が実機確認済み＝`docs/fan-header-mapping.md`。CPU / VRM / T_SENSOR 等の実機確認残） |
+| #65 | NVML / lm-sensors / hwmon 内部Telemetry統合（Control/ML入力対応） | M7 | 実装中（PR #128 レビュー中・main と競合。Fan header 対応は 2026-09-18 に所有者が実機確認済み（PR #128 で追加する `docs/fan-header-mapping.md`。PR は未マージ）。CPU / VRM / T_SENSOR 等の実機確認残） |
 | #66 | Server Health API（Workspace連携の単一窓口） | M7 | 実装中（PR 未作成、#65 stack） |
 | #102 | Runtime State Estimator: synchronized control snapshot / trend / thermal margin | M8 | 完了（PR #118） |
 | #103 | Control Config schema / validation / versioning / safe reload | M8 | 完了（PR #115） |
@@ -124,8 +124,8 @@ GPU機どころか ESP32 すら接続せずに #8〜#25 のすべてが開発・
 | #85 | Model Confidence / OOD検知とAuthority制限 | M9 | |
 | #104 | Control Model Registry: candidate / production / promotion / rollback | M9 | Registry 本体はマージ済み（PR #123）。loader / rollout 等の consumer が残るため Issue は open |
 | #86 | Learned MPC optimizer とHard Constraints連携 | M9 | |
-| #87 | Workload Regime推定: IDLE / TRANSIENT / SUSTAINED / COOLDOWN / UNKNOWN | M9 | **未反映**: PR #124 は stacked base `feat/80-reactive-guard` へ、同 branch が main に入った後にマージされたため main に届いていない。main への再適用が必要 |
-| #88 | Supervisor Interface: RulePolicy / RLPolicy / ShadowRLPolicy | M9 | 実装中（PR 未作成、#87 の main 反映待ち） |
+| #87 | Workload Regime推定: IDLE / TRANSIENT / SUSTAINED / COOLDOWN / UNKNOWN | M9 | **未反映**: PR #124 は stacked base `feat/80-reactive-guard` へ、同 branch が main に入った後にマージされたため main に届いていない。main への取り込みは PR #133（レビュー中） |
+| #88 | Supervisor Interface: RulePolicy / RLPolicy / ShadowRLPolicy | M9 | 実装中（PR 未作成、#87 の main 反映（PR #133）待ち） |
 | #90 | Control Shadow Mode / Counterfactual logging | M9 | |
 | #91 | Offline Evaluation: Baseline vs MPC vs Guard vs Supervisor | M9 | |
 | #92 | Authority Rollout: Shadow → 制限付き → Full Authority | M9 | |
@@ -141,7 +141,7 @@ GPU機どころか ESP32 すら接続せずに #8〜#25 のすべてが開発・
 ```text
 内部Telemetry/API:  #65（PR #128）→ #66
 安全:               #78（PR #131）
-Control stack:       #79 ✓ → #80 ✓（実測閾値残）→ #87（main へ再適用）→ #88
+Control stack:       #79 ✓ → #80 ✓（実測閾値残）→ #87（PR #133 で main へ取り込み中）→ #88
 Air Balance:         #81（実機校正は #75 待ち）
 Dataset / Model:     #83（PR #129）→ #84 → #85
 Model registry:      #104（本体マージ済み、consumer は #84 / #85 / #89 / #90 / #91 / #92）
