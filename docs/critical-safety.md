@@ -102,9 +102,12 @@ Backend を同じ session に束縛し、別設定および同じ設定の別 ru
 consume/write 前に拒否する。Backend
 も strictly increasing な identity だけを受理する。保持していた古い低 demand を Emergency Max
 の後に replay して fan を下げることはできない。
-Backend が最初に受理する command は全 zone forced Max（STARTUP、設定不正時は EMERGENCY）
-だけで、STARTUP の command を捨てて NORMAL を最初に渡すと consume 前に拒否する（0028 §2.7）。
-Backend は最初の Max を書くと runtime binding を通じて takeover を確認する。Critical Safety は
+Backend は takeover を確認するまで全 zone forced Max（STARTUP、設定不正時は EMERGENCY）の
+command だけを受理し、STARTUP の command を捨てて NORMAL を渡すと consume 前に拒否する（0028 §2.7）。
+Backend は全 zone の Max の書き込みと読み戻しが成功したときだけ runtime binding を通じて
+takeover を確認する。失敗した zone は確認に数えず、失敗は fault として Safety へ渡るため、
+Top は即 EMERGENCY、Front / Rear は `write_fail_emergency_after` 回の連続で EMERGENCY に
+昇格し、STARTUP のまま黙って留まらない。Critical Safety は
 この確認より前の裁定を常に STARTUP（全 zone Max）とし、確認後の最初の tick から
 `startup_settle_ms` を数え、tach 応答もその次の tick 以降の snapshot だけで確認する。
 STARTUP の command を遅らせても、その間に合成した command は Max のままなので、

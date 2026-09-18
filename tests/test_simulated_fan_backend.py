@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from hashlib import sha256
 from pathlib import Path
 from typing import cast
@@ -18,17 +19,19 @@ from coldaisle.control.config import (
     FanPolicyConfig,
     SafetyConfig,
 )
-from coldaisle.control.hardware import SimulatedFanBackend, SimulatedFaultPlan
+from coldaisle.control.hardware import FanHardwareResult, SimulatedFanBackend, SimulatedFaultPlan
 from coldaisle.control.safety import (
     AIR_TELEMETRY_GROUP,
     AIR_TEMPERATURE_METRICS,
     ComposedDemands,
     CriticalSafety,
+    CriticalSafetyDecision,
     DemandComposer,
     create_control_runtime_binding,
     create_emergency_control_runtime,
 )
 from coldaisle.control.schema import (
+    Fault,
     FaultCode,
     GuardZoneOutput,
     OperatingMode,
@@ -265,7 +268,7 @@ def runtime(
 
     STARTUP を捨てて NORMAL だけを backend へ渡すと takeover の Max を飛ばしてしまう
     （0028 §2.7）ため、fixture も STARTUP の command を必ず backend へ適用する。
-    ``startup_fault_plan`` は STARTUP の間の書き込みだけに適用する。
+    ``startup_fault_plan`` は最初の STARTUP の書き込みだけに適用する。
     """
 
     def requests(value: float, rear_value: float, top_value: float) -> PerZone[ZoneRequest]:
@@ -300,6 +303,7 @@ def runtime(
     # STARTUP の間の command もすべて Backend に適用する。
     backend.fault_plan = startup_fault_plan or SimulatedFaultPlan()
     backend.apply(startup_command)
+    backend.fault_plan = SimulatedFaultPlan()
     requested = requests(
         front,
         front if rear is None else rear,
@@ -308,6 +312,7 @@ def runtime(
     commands: list[ComposedDemands] = []
     tick = 2
     while len(commands) < count:
+        assert tick < 20, "fixture が STARTUP を抜けない"
         decision = safety.evaluate(
             ready_snapshot(contract, tick, (tick - 1) * 1_000),
             mode=OperatingMode.AUTO,
@@ -406,19 +411,117 @@ def test_delayed_startup_command_cannot_be_followed_by_a_precomposed_normal() ->
     assert backend.apply(normal_command).front.readback.write_ok is True
 
 
-def test_failed_startup_write_is_retried_with_startup_kick() -> None:
-    backend, (recovery_command,) = runtime(
-        0.0,
-        startup_fault_plan=SimulatedFaultPlan(write_failure=frozenset({Zone.FRONT})),
-    )
+def pipeline(
+    requested: float = 0.2,
+) -> tuple[SimulatedFanBackend, Callable[..., tuple[CriticalSafetyDecision, ComposedDemands]]]:
+    """Safety → composer → Backend を同じ runtime で束ねる。step は1 tick を評価する。"""
+    active_config = control_config()
+    binding = create_control_runtime_binding(active_config)
+    contract = input_contract()
+    safety = CriticalSafety(active_config.safety, input_contract=contract, runtime_binding=binding)
+    backend = SimulatedFanBackend(active_config.fan_hardware, binding)
+    composer = DemandComposer(active_config.safety)
+    guard = GuardZoneOutput()
+    guards = PerZone(front=guard, rear=guard, top=guard)
+    item = ZoneRequest(demand=requested, reason=Reason(code="hardware_test"))
+    requests = PerZone(front=item, rear=item, top=item)
 
-    recovered = backend.apply(recovery_command)
+    def step(
+        tick: int, mono: int, faults: tuple[Fault, ...] = ()
+    ) -> tuple[CriticalSafetyDecision, ComposedDemands]:
+        decision = safety.evaluate(
+            ready_snapshot(contract, tick, mono),
+            mode=OperatingMode.AUTO,
+            external_faults=faults,
+        )
+        command = composer.compose(
+            requested=requests, guard=guards, safety=decision, mode=OperatingMode.AUTO
+        )
+        return decision, command
 
-    # STARTUP の Max の write 失敗は起動確認ではない。次の command も minimum stable
-    # demand ではなく startup kick を使うため、未起動 fan を楽観視しない。
-    assert recovered.front.readback.write_ok is True
-    assert recovered.front.readback.pwm_raw == 153
-    assert recovered.rear.readback.pwm_raw == 76
+    return backend, step
+
+
+def zone_faults(results: PerZone[FanHardwareResult]) -> tuple[Fault, ...]:
+    return tuple(fault for zone in Zone if (fault := results.get(zone).fault) is not None)
+
+
+def test_failed_startup_max_write_does_not_start_the_settle_period() -> None:
+    # 0028 §2.7 / §2.5 (d): 全 zone の Max の書き込みと読み戻しが成功するまで takeover を
+    # 確認しない。失敗した試行から settle を数えると、最初に成功した Max を
+    # startup_settle_ms の間保持しないまま下げてしまう。
+    backend, step = pipeline()
+    _, startup = step(1, 0)
+    backend.fault_plan = SimulatedFaultPlan(write_failure=frozenset({Zone.FRONT}))
+    failed = backend.apply(startup)
+    backend.fault_plan = SimulatedFaultPlan()
+    assert failed.front.readback.write_ok is False
+
+    # 失敗の後、settle 時間が過ぎても STARTUP のまま Max を出し続ける。
+    retry, retry_command = step(2, 5_000, zone_faults(failed))
+    assert retry.state is SafetyState.STARTUP
+    assert all(retry_command.get(zone).forced_max for zone in Zone)
+    succeeded = backend.apply(retry_command)
+    assert all(succeeded.get(zone).readback.pwm_raw == 255 for zone in Zone)
+
+    # 成功した Max の後の最初の tick から settle を数える。
+    ack_tick, ack_command = step(3, 6_000)
+    assert ack_tick.state is SafetyState.STARTUP
+    backend.apply(ack_command)
+    before_settle, before_command = step(4, 6_999)
+    assert before_settle.state is SafetyState.STARTUP
+    backend.apply(before_command)
+    settled, settled_command = step(5, 7_000)
+    # STARTUP は抜けるが、Front の write failure は fault_clear_hold_ms の間残る（0028 §2.5 (d)）。
+    assert settled.state is SafetyState.DEGRADED
+    backend.apply(settled_command)
+    recovered, _ = step(6, 8_000)
+    assert recovered.state is SafetyState.NORMAL
+
+
+def test_readback_mismatch_on_startup_max_does_not_acknowledge_takeover() -> None:
+    backend, step = pipeline()
+    _, startup = step(1, 0)
+    backend.fault_plan = SimulatedFaultPlan(readback_mismatch=frozenset({Zone.REAR}))
+    mismatched = backend.apply(startup)
+    backend.fault_plan = SimulatedFaultPlan()
+
+    after, _ = step(2, 5_000, zone_faults(mismatched))
+    later, _ = step(3, 10_000)
+
+    assert after.state is SafetyState.STARTUP
+    assert later.state is SafetyState.STARTUP
+
+
+def test_top_startup_max_write_failure_escalates_to_emergency_immediately() -> None:
+    backend, step = pipeline()
+    _, startup = step(1, 0)
+    backend.fault_plan = SimulatedFaultPlan(write_failure=frozenset({Zone.TOP}))
+    failed = backend.apply(startup)
+
+    decision, command = step(2, 1_000, zone_faults(failed))
+
+    assert decision.state is SafetyState.EMERGENCY
+    assert all(command.get(zone).forced_max for zone in Zone)
+
+
+def test_permanently_failing_front_escalates_instead_of_silently_staying_in_startup() -> None:
+    # takeover を確認できない間も write failure は Safety へ届き、連続回数で
+    # EMERGENCY へ昇格する。STARTUP のまま黙って Max を出し続けるだけにしない。
+    backend, step = pipeline()
+    backend.fault_plan = SimulatedFaultPlan(write_failure=frozenset({Zone.FRONT}))
+    _, command = step(1, 0)
+    states = []
+    for tick in range(2, 6):
+        results = backend.apply(command)
+        decision, command = step(tick, (tick - 1) * 1_000, zone_faults(results))
+        states.append(decision.state)
+        assert all(command.get(zone).forced_max for zone in Zone)
+
+    # write_fail_emergency_after=3。1〜2回目は STARTUP、3回目から EMERGENCY。
+    assert states[:2] == [SafetyState.STARTUP, SafetyState.STARTUP]
+    assert states[2:] == [SafetyState.EMERGENCY, SafetyState.EMERGENCY]
+    assert SafetyState.NORMAL not in states
 
 
 def test_simulated_failures_are_reported_as_zone_faults_for_critical_safety() -> None:
