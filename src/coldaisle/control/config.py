@@ -11,13 +11,13 @@ from pathlib import Path
 from typing import Annotated, Any, Literal, Self, cast
 
 import yaml
-from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, model_validator
+from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, field_validator, model_validator
 
 from coldaisle.control.schema import AuthorityStage, Demand, PerZone, Zone
 from coldaisle.store.models import validate_metric
 
-CONTROL_CONFIG_VERSION: Literal[3] = 3
-FAN_POLICY_CONFIG_VERSION: Literal[3] = 3
+CONTROL_CONFIG_VERSION: Literal[4] = 4
+FAN_POLICY_CONFIG_VERSION: Literal[4] = 4
 CONFIG_FILENAMES = {
     "fan_hardware": "fan-hardware.yaml",
     "safety": "safety.yaml",
@@ -423,8 +423,73 @@ class SupervisorTiming(_ConfigModel):
     valid_ms: PositiveMilliseconds
 
 
+class WorkloadPowerBand(_ConfigModel):
+    """Workload activity の Schmitt trigger を signal ごとに設定する。"""
+
+    metric: str
+    idle_below_w: Annotated[float, Field(ge=0.0, allow_inf_nan=False)]
+    active_above_w: Annotated[float, Field(gt=0.0, allow_inf_nan=False)]
+
+    @field_validator("metric")
+    @classmethod
+    def _metric_is_stored_telemetry(cls, value: str) -> str:
+        return validate_metric(value)
+
+    @model_validator(mode="after")
+    def _activity_has_a_deadband(self) -> Self:
+        if self.active_above_w <= self.idle_below_w:
+            raise ValueError("active_above_w は idle_below_w より大きくする")
+        return self
+
+
+class WorkloadRegimeConfig(_ConfigModel):
+    """#87 の観測窓・遷移時間・Power 閾値。将来時間の予測値は持たない。"""
+
+    cpu_power: WorkloadPowerBand
+    gpu_power: WorkloadPowerBand
+    activity_window_ms: PositiveMilliseconds
+    history_window_ms: PositiveMilliseconds
+    minimum_observation_ms: PositiveMilliseconds
+    sustained_after_ms: PositiveMilliseconds
+    cooldown_ms: PositiveMilliseconds
+    minimum_transition_ms: PositiveMilliseconds
+    confidence_full_window_ms: PositiveMilliseconds
+    max_snapshot_gap_ms: PositiveMilliseconds
+
+    @model_validator(mode="after")
+    def _windows_support_every_duration(self) -> Self:
+        if self.cpu_power.metric == self.gpu_power.metric:
+            raise ValueError("CPU / GPU workload Power metric は別々にする")
+        bounded = {
+            "activity_window_ms": self.activity_window_ms,
+            "minimum_observation_ms": self.minimum_observation_ms,
+            "sustained_after_ms": self.sustained_after_ms,
+            "cooldown_ms": self.cooldown_ms,
+            "minimum_transition_ms": self.minimum_transition_ms,
+            "confidence_full_window_ms": self.confidence_full_window_ms,
+        }
+        too_long = [name for name, value in bounded.items() if value > self.history_window_ms]
+        if too_long:
+            raise ValueError(
+                f"workload regime の期間は history_window_ms 以下にする: {sorted(too_long)}"
+            )
+        if self.max_snapshot_gap_ms > self.minimum_observation_ms:
+            raise ValueError("max_snapshot_gap_ms は minimum_observation_ms 以下にする")
+        required_for_sustained = (
+            self.minimum_observation_ms + self.sustained_after_ms + self.minimum_transition_ms
+        )
+        if required_for_sustained > self.history_window_ms:
+            raise ValueError("history_window_ms は観測・SUSTAINED判定・遷移確認の合計以上にする")
+        required_for_cooldown = (
+            self.minimum_observation_ms + self.cooldown_ms + self.minimum_transition_ms
+        )
+        if required_for_cooldown > self.history_window_ms:
+            raise ValueError("history_window_ms は観測・COOLDOWN判定・遷移確認の合計以上にする")
+        return self
+
+
 class FanPolicyConfig(_ConfigModel):
-    schema_version: Literal[3]
+    schema_version: Literal[4]
     fallback_curve: Annotated[
         tuple[FallbackPoint, ...], BeforeValidator(_yaml_sequence_to_tuple), Field(min_length=2)
     ]
@@ -434,6 +499,7 @@ class FanPolicyConfig(_ConfigModel):
     reactive_guard: ReactiveGuardConfig
     mpc: MpcTiming
     supervisor: SupervisorTiming
+    workload_regime: WorkloadRegimeConfig
     gate_min_confidence: GateConfidenceThresholds
     authority_stage: Annotated[AuthorityStage, BeforeValidator(_yaml_authority_stage)]
     authority_limits: AuthorityLimits

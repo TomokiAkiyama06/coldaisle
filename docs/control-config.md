@@ -20,7 +20,7 @@ T_SENSORのstale判定を持たず、`true` にするには `confirmed` と承�
 `fan-policy.yaml` は、MPCの `period_ms`・`budget_ms`・`valid_ms`、Supervisorの
 `period_ms`・`valid_ms` を持つ。期限は制御デーモンが受信時刻から単調時計で判定する。
 Fallback v2 の shape に Reactive Guard の閾値バンドを追加した
-`fan-policy.yaml` の schema version は 3 とする。
+`fan-policy.yaml` の schema version 3 を土台とする。
 Reactive Guard の `floor` / `hold_ms` と、温度・Power・吸気温度差の各 trigger は
 通常時と Degraded 時の `activate_above` / `clear_at_or_below` を持つ。これらは
 全て `status` / `basis` の追跡対象で、実測前は `provisional` のまま扱う。
@@ -48,12 +48,28 @@ Fallback Controllerの生成時に、temperature入力がMetric Catalog上の`C`
 発火/解除閾値を明示する。`cpu_power_metric` は承認まで `null` とし、
 最後に `schema_version: 3` へ上げる。v2のまま、または新旧shapeが混ざった設定は拒否する。
 
+さらに #87 のv4で `workload_regime` を追加する。CPU / GPU Power の metric 名、idle / active の
+Schmitt trigger 閾値、平滑化・履歴窓、SUSTAINED / COOLDOWN / 遷移確認の各期間、許容 sample gap、
+confidence が満値になる観測期間をすべて明示する。これらは実測前にコードへ埋め込まず、検証済み
+config と checksum を Replay と decision trace へ渡す。Power が欠測・stale の間と、gap 後に
+連続履歴が再び揃うまでは Workload Regime を `UNKNOWN` とする。
+CPU / GPU metric は別々の既知の `W` signal に限定する。履歴窓は、観測期間に加えて
+SUSTAINED または COOLDOWN と遷移確認期間を Replay できる長さを必須にする。
+
+v3からv4へは `workload_regime` の全項目を実測根拠に基づいて追加し、最後に
+`schema_version: 4` へ上げる。v1 / v2 / v3をv4として自動補完すると未確認の閾値を作るため、
+旧versionと `workload_regime` を欠くv4は起動前に拒否する。v1→v2→v3の既存手順を飛ばさず、
+各段階のshapeを揃えてからv4へ移行する。
+
+Workload Regime は履歴の単調時刻だけで duration と hysteresis を評価する。壁時計 `Clock` は
+推定結果の `computed_at_ms` を記録するためだけに使い、未来の残り実行時間は出力しない。
+
 `gate_min_confidence` は `limited` / `expanded` / `full` ごとに持ち、高いauthority stageほど
 低いconfidenceで動かせないよう `limited <= expanded <= full` を検証する。ML→Fallbackの
 切替回数が `demote_window_ms` 内で `demote_after` に達した場合、Gateは降格推奨をtraceへ出す。
 設定上のstageを`SHADOW`へ変更・永続化する責務は #92 に残す。
 
-v1 は設定の live reload を行わない。設定変更は候補全体を別オブジェクトで検証したうえで
+現行 Control Config v4 は設定の live reload を行わない。設定変更は候補全体を別オブジェクトで検証したうえで
 **次回再起動時**にだけ反映する。これにより、変更後の設定も必ず `STARTUP` の Max を通る。
 `trace_metadata()` は、採用されたsource名・schema version・SHA-256を #82 の decision traceへ渡す。
 `provisional_values()` は起動時の構造化ログへ、暫定値そのものを露出せずに位置と根拠だけを渡す。

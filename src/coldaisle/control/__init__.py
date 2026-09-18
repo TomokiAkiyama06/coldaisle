@@ -28,6 +28,8 @@ from coldaisle.control.config import (
     GuardThresholdBand,
     ProvisionalConfigValue,
     ReactiveGuardConfig,
+    WorkloadPowerBand,
+    WorkloadRegimeConfig,
 )
 from coldaisle.control.fallback import (
     ControllerGate,
@@ -78,9 +80,16 @@ from coldaisle.control.schema import (
     Reason,
     SafetyState,
     SafetyZoneOutput,
+    WorkloadRegime,
     Zone,
     ZoneRecord,
     ZoneRequest,
+)
+from coldaisle.control.supervisor import (
+    RegimeEvidence,
+    RegimeReason,
+    WorkloadRegimeEstimate,
+    WorkloadRegimeEstimator,
 )
 
 __all__ = [
@@ -139,11 +148,18 @@ __all__ = [
     "ReactiveGuardConfig",
     "ReactiveGuardDecision",
     "Reason",
+    "RegimeEvidence",
+    "RegimeReason",
     "SafetyState",
     "SafetyZoneOutput",
     "SimulatedFanBackend",
     "SimulatedFaultPlan",
     "SnapshotStatus",
+    "WorkloadPowerBand",
+    "WorkloadRegime",
+    "WorkloadRegimeConfig",
+    "WorkloadRegimeEstimate",
+    "WorkloadRegimeEstimator",
     "Zone",
     "ZoneAcousticCurve",
     "ZoneRecord",
