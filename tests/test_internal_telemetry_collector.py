@@ -127,12 +127,19 @@ def test_startup_audit_logs_disabled_reason_and_confirmation(caplog):
     hwmon_records = [
         record for record in caplog.records if record.message == "hwmon input configuration"
     ]
-    assert len(hwmon_records) == 1
-    fields = getattr(hwmon_records[0], logs.FIELDS_KEY)
+    assert len(hwmon_records) == len(config.hwmon.sensors)
+    by_metric = {
+        getattr(record, logs.FIELDS_KEY)["metric"]: getattr(record, logs.FIELDS_KEY)
+        for record in hwmon_records
+    }
+    fields = by_metric["board.connector_12v2x6"]
     assert fields["metric"] == "board.connector_12v2x6"
     assert fields["enabled"] is False
     assert fields["selector"] == "none"
     assert fields["disabled_reason"].startswith("not installed")
+    confirmed = by_metric["fan.front.rpm"]
+    assert confirmed["enabled"] is True
+    assert confirmed["confirmation_status"] == "confirmed"
 
 
 def test_periodic_metric_intervals_follow_the_configured_interval():
