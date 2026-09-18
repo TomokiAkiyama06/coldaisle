@@ -204,6 +204,8 @@ class SupervisorPolicyEvaluation(_Frozen):
     output: SupervisorOutput | None = None
     error: Reason | None = None
     received_monotonic_ms: int | None = Field(default=None, ge=0)
+    source_monotonic_ms: int | None = Field(default=None, ge=0)
+    """RL output の元 snapshot の単調時刻（control loop 自身の時計）。鮮度はここから数える。"""
 
     @model_validator(mode="after")
     def _contains_exactly_one_result(self) -> Self:
@@ -211,14 +213,21 @@ class SupervisorPolicyEvaluation(_Frozen):
             raise ValueError("Supervisor evaluation は output または error の片方だけを持つ")
         if self.output is not None and self.output.policy is not self.policy:
             raise ValueError("Supervisor evaluation の policy と output が一致しない")
-        if self.policy is SupervisorPolicyKind.RULE and self.received_monotonic_ms is not None:
-            raise ValueError("inline RulePolicy に worker の受信時刻を付けない")
-        if (
-            self.policy is SupervisorPolicyKind.RL
-            and self.output is not None
-            and self.received_monotonic_ms is None
+        if self.policy is SupervisorPolicyKind.RULE and (
+            self.received_monotonic_ms is not None or self.source_monotonic_ms is not None
         ):
-            raise ValueError("RLPolicy output には control loop の受信単調時刻が必要")
+            raise ValueError("inline RulePolicy に worker の受信時刻・元 snapshot 時刻を付けない")
+        if self.policy is SupervisorPolicyKind.RL and self.output is not None:
+            if self.received_monotonic_ms is None:
+                raise ValueError("RLPolicy output には control loop の受信単調時刻が必要")
+            if self.source_monotonic_ms is None:
+                raise ValueError("RLPolicy output には元 snapshot の単調時刻が必要")
+        if (
+            self.received_monotonic_ms is not None
+            and self.source_monotonic_ms is not None
+            and self.source_monotonic_ms > self.received_monotonic_ms
+        ):
+            raise ValueError("元 snapshot の単調時刻を受信単調時刻より後にしない")
         return self
 
 
@@ -259,19 +268,25 @@ class SupervisorDecision(_Frozen):
             if evaluation is not None and evaluation.output is not None
         )
         for output in outputs:
-            if output.tick_id != self.tick_id:
-                raise ValueError("Supervisor output の tick_id を decision と揃える")
-            if output.ts_ms != self.ts_ms:
+            # RL は worker で非同期に推論するため、元 snapshot が過去の tick でもよい（0028 §2.2）。
+            # 元 tick の識別子はそのまま残し、未来の tick だけを拒否する。
+            if output.tick_id > self.tick_id:
+                raise ValueError("Supervisor output の tick_id を decision より未来にしない")
+            if output.policy is SupervisorPolicyKind.RULE and output.tick_id != self.tick_id:
+                raise ValueError("inline RulePolicy output の tick_id を decision と揃える")
+            if output.tick_id == self.tick_id and output.ts_ms != self.ts_ms:
                 raise ValueError("Supervisor output の ts_ms を decision と揃える")
             if output.snapshot_schema_version != self.snapshot_schema_version:
                 raise ValueError("Supervisor output の snapshot schema version を揃える")
         if outputs:
             first = outputs[0]
-            if any(
-                (output.regime, output.regime_confidence) != (first.regime, first.regime_confidence)
-                for output in outputs[1:]
-            ):
+            if any(output.regime is not first.regime for output in outputs[1:]):
                 raise ValueError("active / fallback / shadow は同じ workload regime を使う")
+            current = [output for output in outputs if output.tick_id == self.tick_id]
+            if any(
+                output.regime_confidence != current[0].regime_confidence for output in current[1:]
+            ):
+                raise ValueError("同じ tick の Supervisor output は同じ workload regime を使う")
         return self
 
 
@@ -637,9 +652,13 @@ class ControlTick(_Frozen):
                 )
                 if evaluation is not None and evaluation.output is not None
             )
-            if successful_outputs and (
-                state.workload_regime is not successful_outputs[0].regime
-                or state.regime_confidence != successful_outputs[0].regime_confidence
+            if any(
+                state.workload_regime is not output.regime
+                or (
+                    output.tick_id == self.tick_id
+                    and state.regime_confidence != output.regime_confidence
+                )
+                for output in successful_outputs
             ):
                 raise ValueError("ControlState と Supervisor output の workload regime を揃える")
         all_max = state.safety_state in {SafetyState.STARTUP, SafetyState.EMERGENCY} or (

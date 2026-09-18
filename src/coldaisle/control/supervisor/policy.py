@@ -69,10 +69,22 @@ class SupervisorInput(_Frozen):
 
 
 class ReceivedSupervisorOutput(_Frozen):
-    """worker output と、control loop が受け取ったローカル単調時刻。"""
+    """worker output と、control loop 自身の単調時計で記録した元 snapshot 時刻・受信時刻。
+
+    RL 推論は非同期なので ``output`` は通常、過去の tick の snapshot から作られる。
+    ``source_monotonic_ms`` は control loop が worker へ渡した snapshot の ``monotonic_ms`` で、
+    鮮度（``supervisor.valid_ms``）はここから数える。worker の時計とは比べない（0028 §2.3）。
+    """
 
     output: SupervisorOutput
+    source_monotonic_ms: int = Field(ge=0)
     received_monotonic_ms: int = Field(ge=0)
+
+    @model_validator(mode="after")
+    def _source_precedes_receipt(self) -> Self:
+        if self.source_monotonic_ms > self.received_monotonic_ms:
+            raise ValueError("元 snapshot の単調時刻を受信単調時刻より後にしない")
+        return self
 
 
 class SupervisorPolicy(Protocol):
@@ -232,6 +244,7 @@ class SupervisorCoordinator:
                 or Reason(code="supervisor_unavailable", detail="RLPolicy output が未受信"),
             )
         received = candidate.received_monotonic_ms
+        source = candidate.source_monotonic_ms
         if received > now_monotonic_ms:
             return SupervisorPolicyEvaluation(
                 policy=SupervisorPolicyKind.RL,
@@ -240,26 +253,36 @@ class SupervisorCoordinator:
                     detail="RLPolicy output の受信単調時刻が現在より未来",
                 ),
                 received_monotonic_ms=received,
+                source_monotonic_ms=source,
             )
-        if now_monotonic_ms - received > self._config.valid_ms:
+        # 受信時刻より厳しい元 snapshot 時刻から数える。受信が遅れた古い提案を新鮮と扱わない。
+        if now_monotonic_ms - source > self._config.valid_ms:
             return SupervisorPolicyEvaluation(
                 policy=SupervisorPolicyKind.RL,
                 error=Reason(code="supervisor_expired", detail="RLPolicy output の有効期限切れ"),
                 received_monotonic_ms=received,
+                source_monotonic_ms=source,
             )
         try:
-            self._validate_output(candidate.output, policy_input, SupervisorPolicyKind.RL)
+            self._validate_output(
+                candidate.output,
+                policy_input,
+                SupervisorPolicyKind.RL,
+                source_monotonic_ms=source,
+            )
         except Exception as exc:
             return self._failure(
                 SupervisorPolicyKind.RL,
                 "supervisor_output_invalid",
                 exc,
                 received_monotonic_ms=received,
+                source_monotonic_ms=source,
             )
         return SupervisorPolicyEvaluation(
             policy=SupervisorPolicyKind.RL,
             output=candidate.output,
             received_monotonic_ms=received,
+            source_monotonic_ms=source,
         )
 
     def _validate_output(
@@ -267,21 +290,35 @@ class SupervisorCoordinator:
         output: SupervisorOutput,
         policy_input: SupervisorInput,
         expected_policy: SupervisorPolicyKind,
+        *,
+        source_monotonic_ms: int | None = None,
     ) -> None:
         SupervisorOutput.model_validate(output.model_dump())
         if output.policy is not expected_policy:
             raise ValueError("Supervisor output の policy が configured slot と一致しない")
-        if output.tick_id != policy_input.snapshot.tick_id:
-            raise ValueError("Supervisor output の tick_id が input と一致しない")
-        if output.ts_ms != policy_input.snapshot.ts_ms:
-            raise ValueError("Supervisor output の ts_ms が input と一致しない")
-        if output.snapshot_schema_version != policy_input.snapshot.schema_version:
+        current = policy_input.snapshot
+        if output.snapshot_schema_version != current.schema_version:
             raise ValueError("Supervisor output の snapshot schema version が input と一致しない")
-        if (output.regime, output.regime_confidence) != (
-            policy_input.workload.regime,
-            policy_input.workload.confidence,
-        ):
-            raise ValueError("Supervisor output の workload regime が input と一致しない")
+        if output.tick_id > current.tick_id:
+            raise ValueError("Supervisor output の元 tick が現在より未来")
+        if output.tick_id == current.tick_id:
+            if output.ts_ms != current.ts_ms:
+                raise ValueError("Supervisor output の ts_ms が input と一致しない")
+            if source_monotonic_ms is not None and source_monotonic_ms != current.monotonic_ms:
+                raise ValueError("同じ tick の元 snapshot 単調時刻が input と一致しない")
+            if (output.regime, output.regime_confidence) != (
+                policy_input.workload.regime,
+                policy_input.workload.confidence,
+            ):
+                raise ValueError("Supervisor output の workload regime が input と一致しない")
+        else:
+            if expected_policy is SupervisorPolicyKind.RULE or source_monotonic_ms is None:
+                raise ValueError("inline RulePolicy output の tick_id が input と一致しない")
+            if source_monotonic_ms >= current.monotonic_ms:
+                raise ValueError("過去 tick の元 snapshot 単調時刻が現在以降")
+            # 過去 tick の提案でも、その後に Regime が変わっていれば古い戦略を使わず Rule へ戻す。
+            if output.regime is not policy_input.workload.regime:
+                raise ValueError("過去 tick の Supervisor output の workload regime が現在と異なる")
         expected_version = (
             self._config.rule_policy.version
             if expected_policy is SupervisorPolicyKind.RULE
@@ -302,10 +339,12 @@ class SupervisorCoordinator:
         error: Exception,
         *,
         received_monotonic_ms: int | None = None,
+        source_monotonic_ms: int | None = None,
     ) -> SupervisorPolicyEvaluation:
         detail = f"{type(error).__name__}: {error}"[:500]
         return SupervisorPolicyEvaluation(
             policy=policy,
             error=Reason(code=code, detail=detail),
             received_monotonic_ms=received_monotonic_ms,
+            source_monotonic_ms=source_monotonic_ms,
         )

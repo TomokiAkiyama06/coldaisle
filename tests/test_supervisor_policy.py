@@ -148,9 +148,17 @@ def workload(
 def policy_input(
     *,
     regime: WorkloadRegime = WorkloadRegime.SUSTAINED_GPU,
+    tick: int = 7,
+    mono: int = 10_000,
+    confidence: float = 0.8,
 ) -> SupervisorInput:
-    current = snapshot()
-    return SupervisorInput(snapshot=current, workload=workload(current, regime))
+    current = snapshot(tick=tick, mono=mono)
+    return SupervisorInput(snapshot=current, workload=workload(current, regime, confidence))
+
+
+def earlier_input(*, tick: int, mono: int, confidence: float = 0.6) -> SupervisorInput:
+    """非同期 RL worker が推論に使った、現在より前の tick の input。"""
+    return policy_input(tick=tick, mono=mono, confidence=confidence)
 
 
 class FakeRLPolicy:
@@ -176,10 +184,18 @@ class FakeRLPolicy:
         )
 
 
-def rl_candidate(current: SupervisorInput, received_mono: int = 10_000) -> ReceivedSupervisorOutput:
+def rl_candidate(
+    current: SupervisorInput,
+    received_mono: int = 10_000,
+    *,
+    source: SupervisorInput | None = None,
+) -> ReceivedSupervisorOutput:
+    """``source``（既定は現在）の snapshot から作った RL 提案を、受信済みの形にする。"""
+    origin = source or current
     shadow = ShadowRLPolicy(FakeRLPolicy(SimulatedClock(BASE_TS_MS)))
     return ReceivedSupervisorOutput(
-        output=shadow.propose(current),
+        output=shadow.propose(origin),
+        source_monotonic_ms=origin.snapshot.monotonic_ms,
         received_monotonic_ms=received_mono,
     )
 
@@ -244,6 +260,7 @@ def test_rule_active_and_rl_shadow_are_recorded_for_the_same_state() -> None:
 @pytest.mark.parametrize("age_ms", [0, 2_000])
 def test_rl_candidate_is_valid_at_the_monotonic_freshness_boundary(age_ms: int) -> None:
     current = policy_input()
+    source = current if age_ms == 0 else earlier_input(tick=5, mono=10_000 - age_ms)
     coordinator = SupervisorCoordinator(
         config(active="rl_policy", shadow=None),
         SimulatedClock(BASE_TS_MS),
@@ -251,12 +268,120 @@ def test_rl_candidate_is_valid_at_the_monotonic_freshness_boundary(age_ms: int) 
     decision = coordinator.evaluate(
         current,
         now_monotonic_ms=10_000,
-        rl_candidate=rl_candidate(current, received_mono=10_000 - age_ms),
+        rl_candidate=rl_candidate(current, received_mono=10_000, source=source),
     )
 
     assert decision.active.output is not None
     assert decision.active.output.policy is SupervisorPolicyKind.RL
+    assert decision.active.source_monotonic_ms == 10_000 - age_ms
     assert decision.fallback is None
+
+
+@pytest.mark.parametrize(("active", "shadow"), [("rl_policy", None), ("rule_policy", "rl_policy")])
+def test_older_but_fresh_rl_proposal_keeps_its_source_identity(
+    active: str, shadow: str | None
+) -> None:
+    # 0028 §2.2: RL は worker で非同期に推論し、ループは最新の提案を読むだけ。
+    current = policy_input()
+    source = earlier_input(tick=5, mono=8_500)
+    decision = SupervisorCoordinator(
+        config(active=active, shadow=shadow),
+        SimulatedClock(BASE_TS_MS),
+    ).evaluate(
+        current,
+        now_monotonic_ms=10_000,
+        rl_candidate=rl_candidate(current, received_mono=9_900, source=source),
+    )
+
+    rl = decision.active if active == "rl_policy" else decision.shadow
+    assert rl is not None and rl.output is not None
+    assert rl.output.policy is SupervisorPolicyKind.RL
+    assert (rl.output.tick_id, rl.output.regime_confidence) == (5, 0.6)
+    assert (rl.source_monotonic_ms, rl.received_monotonic_ms) == (8_500, 9_900)
+    assert decision.tick_id == current.snapshot.tick_id
+    if active == "rl_policy":
+        assert decision.selected_output is rl.output
+        assert decision.fallback is None
+    else:
+        assert decision.selected_output is decision.active.output
+
+    tick = control_tick(decision, current)
+    assert tick.supervisor is decision
+
+
+@pytest.mark.parametrize("active", ["rl_policy", "rule_policy"])
+def test_rl_proposal_older_than_valid_ms_from_its_source_is_rejected(active: str) -> None:
+    # 受信は新しくても、元 snapshot から valid_ms を超えていれば期限切れ。
+    current = policy_input()
+    source = earlier_input(tick=4, mono=7_999)
+    decision = SupervisorCoordinator(
+        config(active=active, shadow=None if active == "rl_policy" else "rl_policy"),
+        SimulatedClock(BASE_TS_MS),
+    ).evaluate(
+        current,
+        now_monotonic_ms=10_000,
+        rl_candidate=rl_candidate(current, received_mono=9_999, source=source),
+    )
+
+    rl = decision.active if active == "rl_policy" else decision.shadow
+    assert rl is not None and rl.output is None
+    assert rl.error is not None and rl.error.code == "supervisor_expired"
+    assert rl.source_monotonic_ms == 7_999
+    assert decision.selected_output is not None
+    assert decision.selected_output.policy is SupervisorPolicyKind.RULE
+
+
+@pytest.mark.parametrize("active", ["rl_policy", "rule_policy"])
+def test_rl_proposal_from_a_future_tick_is_rejected(active: str) -> None:
+    current = policy_input()
+    future = rl_candidate(current).output.model_copy(update={"tick_id": 8})
+    decision = SupervisorCoordinator(
+        config(active=active, shadow=None if active == "rl_policy" else "rl_policy"),
+        SimulatedClock(BASE_TS_MS),
+    ).evaluate(
+        current,
+        now_monotonic_ms=10_000,
+        rl_candidate=ReceivedSupervisorOutput(
+            output=future,
+            source_monotonic_ms=10_000,
+            received_monotonic_ms=10_000,
+        ),
+    )
+
+    rl = decision.active if active == "rl_policy" else decision.shadow
+    assert rl is not None and rl.output is None
+    assert rl.error is not None and rl.error.code == "supervisor_output_invalid"
+    assert "未来" in rl.error.detail
+    assert decision.selected_output is not None
+    assert decision.selected_output.policy is SupervisorPolicyKind.RULE
+
+
+def test_older_rl_proposal_is_rejected_when_the_regime_has_changed_since() -> None:
+    current = policy_input(regime=WorkloadRegime.SUSTAINED_GPU)
+    source = policy_input(regime=WorkloadRegime.IDLE, tick=5, mono=9_000)
+    decision = SupervisorCoordinator(
+        config(active="rl_policy", shadow=None),
+        SimulatedClock(BASE_TS_MS),
+    ).evaluate(
+        current,
+        now_monotonic_ms=10_000,
+        rl_candidate=rl_candidate(current, received_mono=9_500, source=source),
+    )
+
+    assert decision.active.error is not None
+    assert decision.active.error.code == "supervisor_output_invalid"
+    assert decision.selected_output is not None
+    assert decision.selected_output.policy is SupervisorPolicyKind.RULE
+
+
+def test_source_snapshot_cannot_be_later_than_receipt() -> None:
+    current = policy_input()
+    with pytest.raises(ValidationError, match="受信単調時刻より後"):
+        ReceivedSupervisorOutput(
+            output=rl_candidate(current).output,
+            source_monotonic_ms=10_001,
+            received_monotonic_ms=10_000,
+        )
 
 
 def test_expired_or_stopped_rl_falls_back_to_rule_without_using_wall_clock() -> None:
@@ -265,7 +390,8 @@ def test_expired_or_stopped_rl_falls_back_to_rule_without_using_wall_clock() -> 
         config(active="rl_policy", shadow=None),
         SimulatedClock(BASE_TS_MS),
     )
-    expired_output = rl_candidate(current, received_mono=7_999).output.model_copy(
+    source = earlier_input(tick=4, mono=7_999)
+    expired_output = rl_candidate(current, source=source).output.model_copy(
         update={"computed_at_ms": BASE_TS_MS + 10_000_000}
     )
     expired = coordinator.evaluate(
@@ -273,6 +399,7 @@ def test_expired_or_stopped_rl_falls_back_to_rule_without_using_wall_clock() -> 
         now_monotonic_ms=10_000,
         rl_candidate=ReceivedSupervisorOutput(
             output=expired_output,
+            source_monotonic_ms=7_999,
             received_monotonic_ms=7_999,
         ),
     )
@@ -297,6 +424,7 @@ def test_invalid_shadow_output_is_recorded_but_never_selected() -> None:
         now_monotonic_ms=10_000,
         rl_candidate=ReceivedSupervisorOutput(
             output=wrong_tick,
+            source_monotonic_ms=10_000,
             received_monotonic_ms=10_000,
         ),
     )
@@ -354,6 +482,7 @@ def test_rl_output_is_limited_to_configured_strategy_weights_and_target(
         now_monotonic_ms=10_000,
         rl_candidate=ReceivedSupervisorOutput(
             output=invalid,
+            source_monotonic_ms=10_000,
             received_monotonic_ms=10_000,
         ),
     )
@@ -381,6 +510,36 @@ def test_rule_failure_returns_no_context_instead_of_stopping_the_control_loop() 
     assert decision.active.error is not None
     assert decision.active.error.code == "supervisor_policy_exception"
     assert decision.selected_output is None
+
+
+def control_tick(decision: SupervisorDecision, current: SupervisorInput) -> ControlTick:
+    """decision を現在 tick の v3 trace に載せる（元 tick の識別子は output 側に残る）。"""
+    request = EffectiveZoneDemand(
+        requested=0.4,
+        effective=0.4,
+        bound_by=BoundBy.REQUESTED,
+        safety_floor=0.0,
+        forced_max=False,
+    )
+    zone = ZoneRecord(controller_reason=Reason(code="fallback_curve"), demand=request)
+    selected = decision.selected_output
+    state = ControlState(
+        operating_mode=OperatingMode.AUTO,
+        authority_stage=AuthorityStage.SHADOW,
+        active_controller=ControllerKind.FALLBACK,
+        safety_state=SafetyState.NORMAL,
+        fallback_active=True,
+        supervisor_policy=None if selected is None else selected.policy.value,
+        workload_regime=current.workload.regime,
+        regime_confidence=current.workload.confidence,
+    )
+    return ControlTick(
+        tick_id=current.snapshot.tick_id,
+        ts_ms=current.snapshot.ts_ms,
+        state=state,
+        zones=PerZone[ZoneRecord](front=zone, rear=zone, top=zone),
+        supervisor=decision,
+    )
 
 
 def test_decision_can_be_embedded_in_v3_control_trace_with_shadow_output() -> None:
