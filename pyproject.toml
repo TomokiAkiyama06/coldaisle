@@ -14,6 +14,8 @@ dependencies = [
     "pydantic>=2.12",  # Field(exclude_if=...) を使う（control/schema.py）
     "pyyaml",
     "httpx",
+    # GPU Telemetry は nvidia-smi を spawn せず NVML を直接読む（#65）
+    "nvidia-ml-py>=13",
 ]
 
 [dependency-groups]
@@ -34,7 +36,7 @@ dev = [
 # 実機なしで起動できること（AGENTS.md のコマンド一覧）
 coldaisle-daemon = "coldaisle.daemon:main"
 # ロールアップと削除。cron / systemd タイマーから呼ぶ（#10）
-coldaisle-rollup = "coldaisle.store.rollup:main"
+coldaisle-rollup = "coldaisle.rollup_job:main"
 # 日次レポート。cron から毎朝、ロールアップのあとに呼ぶ（#25）
 coldaisle-report = "coldaisle.report:main"
 # 故障疑いの案件資料。**送信はしない**（#39）
@@ -43,6 +45,8 @@ coldaisle-escalate = "coldaisle.escalate:main"
 coldaisle-memory = "coldaisle.memory:main"
 # 較正オフセットの算出。**既定では書かない**（#13）
 coldaisle-calibrate = "coldaisle.calibrate:main"
+# NVML / hwmon を既存 readings timeline へ収集する読み取り専用 daemon（#65）
+coldaisle-telemetry = "coldaisle.telemetry_daemon:main"
 
 [build-system]
 requires = ["hatchling"]
