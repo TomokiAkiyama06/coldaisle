@@ -111,7 +111,7 @@ Compute Mode の判断は AI へ渡しません。生成はバックグラウン
 
 | 値 | 条件 |
 |---|---|
-| `green` | sensor_unit / nvml / lm_sensors がすべて `ok`、発生中アラート無し、保存済みの周期メトリクスがすべて `quality=ok`（`missing_tolerated` の `missing` は除く） |
+| `green` | sensor_unit / nvml / lm_sensors がすべて `ok`、発生中アラート無し、監視対象の周期メトリクスがすべて `quality=ok`（`missing_tolerated` の `missing` は除く） |
 | `yellow` | 情報源が `degraded`、critical 以外のアラートが発生中、または周期メトリクスの一部が `suspect` / `missing` / `stale` |
 | `red` | 情報源が `unavailable` / `disabled` / `stopped`、critical アラートが発生中、または監視必須データが取得不能 |
 
@@ -127,6 +127,10 @@ Compute Mode の判断は AI へ渡しません。生成はバックグラウン
 公開しない `gpu.0.hotspot` / `gpu.0.mem` など）は、`missing` だけを signal 判定から
 外します。`suspect` / `stale` は外しません。監視必須 metric と監視対象の一覧も同じ
 ファイルにあります（決定記録 0040）。
+
+signal が見る周期メトリクスは**現在の監視対象**に限ります。`config/server-health.yaml`
+に挙げた metric と、`config/internal-telemetry.yaml` で有効な hwmon 入力です。無効化・
+撤去した入力の最後の行は DB に残って `stale` になりますが、signal には影響しません。
 
 **`GET /api/v1/server-health` と `WS /api/v1/server-health/stream` の payload は同一です。**
 WebSocket 専用の封筒やフィールドは加えません。

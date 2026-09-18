@@ -86,6 +86,17 @@ class ServerHealthSettings(_SettingsModel):
         settings.validate_metrics(catalog)
         return settings
 
+    def monitored_metrics(self) -> frozenset[str]:
+        """本設定が監視対象として宣言する metric。"""
+        return frozenset(
+            {
+                *self.sources.sensor_unit.required,
+                *self.sources.nvml.required,
+                *self.panels.gpu,
+                *self.panels.environment,
+            }
+        )
+
     def validate_metrics(self, catalog: MetricCatalog) -> None:
         """誤記した metric は常に missing に見え、黙って監視から外れるため拒否する。"""
         names = {
@@ -124,7 +135,10 @@ def build_server_health(
     readings = store.latest()
     alerts = list(store.alerts(state="firing", limit=100))
     sources = _monitoring_sources(store, readings, settings, hwmon_metrics)
-    signal = _signal(sources, readings, alerts, settings.missing_tolerated)
+    # 無効化・撤去した入力の最後の行は store.latest() に残り続け、やがて stale になる。
+    # 監視していない metric で signal を下げないよう、現在の監視対象だけを見る
+    monitored = settings.monitored_metrics() | frozenset(hwmon_metrics)
+    signal = _signal(sources, readings, alerts, settings.missing_tolerated, monitored)
     gpu = ServerGpuHealth(
         mode=store.current_state("sys.gpu_mode") or "unknown",
         metrics=_metrics(settings.panels.gpu, readings, catalog),
@@ -298,6 +312,7 @@ def _signal(
     readings: Mapping[str, LatestReading],
     alerts: list[AlertRecord],
     missing_tolerated: frozenset[str],
+    monitored: frozenset[str],
 ) -> ServerSignal:
     monitoring = (sources.sensor_unit, sources.nvml, sources.lm_sensors)
     if any(source.status in _BAD_SOURCE_STATES for source in monitoring):
@@ -307,7 +322,9 @@ def _signal(
     if any(source.status is HealthSourceStatus.DEGRADED for source in monitoring):
         return ServerSignal.YELLOW
     if alerts or any(
-        _degrades_signal(metric, reading, missing_tolerated) for metric, reading in readings.items()
+        _degrades_signal(metric, reading, missing_tolerated)
+        for metric, reading in readings.items()
+        if metric in monitored
     ):
         return ServerSignal.YELLOW
     return ServerSignal.GREEN

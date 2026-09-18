@@ -754,3 +754,27 @@ def test_repository_server_health_settings_load():
     catalog = MetricCatalog.from_yaml(CONFIG_DIR / "metrics.yaml")
     settings = ServerHealthSettings.from_yaml(CONFIG_DIR / "server-health.yaml", catalog=catalog)
     assert settings.missing_tolerated == {"gpu.0.hotspot", "gpu.0.mem"}
+
+
+def test_stale_row_of_a_removed_input_does_not_degrade_the_signal(tmp_path, rules):
+    """撤去した入力（例: 外したファン）の最後の行は残って stale になるが、監視対象外。"""
+    path = tmp_path / "removed-input.db"
+    # 撤去前に fan.vrm.rpm も hwmon から保存されていた
+    _populate(path, rules, internal_values={**INTERNAL_VALUES, "fan.vrm.rpm": 900.0})
+    later = NOW_MS + 3_600_000
+    # 撤去後: 設定から外れた fan.vrm.rpm 以外は新しい値が届き続けている
+    _populate(path, rules, ts_ms=later)
+
+    with SqliteStore(path, rules=rules, clock=SimulatedClock(later)) as store:
+        assert store.latest()["fan.vrm.rpm"].quality is Quality.STALE
+    with TestClient(_app(path, SimulatedClock(later), hwmon_metrics=("cpu.package",))) as client:
+        removed = client.get("/api/v1/server-health").json()
+    with TestClient(
+        _app(path, SimulatedClock(later), hwmon_metrics=("cpu.package", "fan.vrm.rpm"))
+    ) as client:
+        still_configured = client.get("/api/v1/server-health").json()
+
+    assert removed["signal"] == "green"
+    assert removed["compute_mode_advisory"]["safe"] is True
+    # 同じ行でも、まだ有効な入力なら従来どおり signal を下げる
+    assert still_configured["signal"] == "yellow"
