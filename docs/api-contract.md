@@ -32,6 +32,7 @@
 | GET | `/api/v1/stats` | min/max/mean/p95/傾き/欠測率 |
 | GET | `/api/v1/alerts` | アラート一覧 |
 | GET | `/api/v1/gpu/processes` | CUDA プロセス一覧と VRAM 使用量 |
+| GET | `/api/v1/airflow/config` | エアフロー画面の表示設定（空気の温度の色分けの区切り）。測定値は含まない（#106 / 決定記録 0044） |
 | GET | `/api/v1/devices` | 記録されたセンサー構成（チャネル / メトリクス / ROM）（#14） |
 | GET | `/api/v1/tools` | **AI 向けツールの関数定義**と注意書き（#23） |
 | GET | `/api/v1/tools/{name}` | ツールを1つ実行し、結果と呼び出しの記録を返す（#23） |
@@ -208,6 +209,25 @@ API が返すオフセットは `+00:00` です。同じ瞬間を指すので解
 **記録の側は人が較正をやり直すまで動きません**（決定記録 0012 §2.6）。
 
 起動バナーを受け取る前は `devices` が空です。推測で埋めません。
+
+### `GET /api/v1/airflow/config`
+
+coldaisle のエアフロー画面（`/airflow.html`、#106）が使う**表示設定**です。
+`config/airflow-ui.yaml` をそのまま返します（決定記録 0044）。
+
+```json
+{
+  "schema_version": 1,
+  "air_temperature": {"unit": "C", "thresholds_c": [27.0, 28.0, 29.0, 30.0], "provisional": true}
+}
+```
+
+`thresholds_c` は空気の温度を5段階（青→琥珀→赤）に色分けする境目で、狭義の昇順に
+4つです。境目ちょうどの値は上の段に入ります。`provisional: true` の間は区切りが
+仮の値であることを凡例に出してください。
+
+**制御・アラートの閾値ではありません。** Fan 制御やアラートの判定には使われず、
+変えても色の付き方が変わるだけです。測定値は含みません（`/latest` と `/series` を使う）。
 
 ### `GET /api/v1/tools` と `GET /api/v1/tools/{name}`
 
