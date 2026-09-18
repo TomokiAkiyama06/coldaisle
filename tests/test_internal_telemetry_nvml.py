@@ -145,6 +145,37 @@ def test_unavailable_process_api_is_missing_not_a_false_zero():
     assert readings["sys.cuda_processes"].quality is Quality.MISSING
 
 
+@dataclass
+class ScalarlessNvml(FakeNvml):
+    """温度・電力などの scalar がすべて失敗し、process 一覧だけ取れる driver。"""
+
+    def core_temperature_c(self, handle: object) -> float:
+        raise RuntimeError("unsupported")
+
+    def memory_temperature_c(self, handle: object) -> float | None:
+        raise RuntimeError("unsupported")
+
+    def power_w(self, handle: object) -> float:
+        raise RuntimeError("unsupported")
+
+    def utilization_pct(self, handle: object) -> float:
+        raise RuntimeError("unsupported")
+
+    def vram_used_gb(self, handle: object) -> float:
+        raise RuntimeError("unsupported")
+
+
+def test_cuda_process_count_is_valid_when_only_scalars_fail():
+    """process 一覧が取れていれば、scalar が全滅しても件数は ok で記録する。"""
+    adapter = NvmlAdapter(config(0), ScalarlessNvml(processes={0: (10, 20, 30)}))
+
+    readings = by_metric(adapter)
+
+    assert readings["gpu.0.core"].quality is Quality.MISSING
+    assert readings["sys.cuda_processes"].value == 3.0
+    assert readings["sys.cuda_processes"].quality is Quality.OK
+
+
 def test_disabled_nvml_has_no_expected_or_missing_metrics():
     adapter = NvmlAdapter(config(0, enabled=False), FakeNvml(fail_init=True))
 

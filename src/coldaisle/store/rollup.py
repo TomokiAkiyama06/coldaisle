@@ -185,14 +185,16 @@ def _periodic_expected_per_minute(intervals_ms: Mapping[str, int]) -> dict[str, 
     """呼び出し側が登録した周期から、1分あたりの期待サンプル数を出す。
 
     外付けデバイスのチャネルは起動バナーの周期が正本なので、二重登録を拒否する。
-    1分より長い周期は1分バケットの期待値が0以下になり欠測率が定義できないため拒否する。
+    周期は1分を割り切る値に限る。割り切れない周期（例: 7000 ms）では1分に届く件数が
+    8件と9件で揺れ、固定の期待値では欠測率が負になりうる。1分より長い周期も
+    期待値が0になり欠測率が定義できないので、同じ条件で拒否される。
     """
     result: dict[str, int] = {}
     for metric, interval_ms in intervals_ms.items():
         if metric in METRIC_TO_CHANNEL:
             raise ValueError(f"デバイスのチャネルは周期を登録できない: {metric}")
-        if interval_ms <= 0 or interval_ms > MINUTE_MS:
-            raise ValueError(f"周期は 1..{MINUTE_MS} ms にする: {metric}={interval_ms}")
+        if interval_ms <= 0 or MINUTE_MS % interval_ms != 0:
+            raise ValueError(f"周期は {MINUTE_MS} ms を割り切る値にする: {metric}={interval_ms}")
         result[metric] = MINUTE_MS // interval_ms
     return result
 

@@ -10,6 +10,7 @@ from typing import Any, Literal, Self
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from coldaisle.store.db import MINUTE_MS
 from coldaisle.store.models import validate_metric
 
 CONNECTOR_TEMPERATURE_METRIC = "board.connector_12v2x6"
@@ -146,6 +147,14 @@ class InternalTelemetryConfig(_ConfigModel):
     interval_ms: int = Field(gt=0)
     nvml: NvmlConfig
     hwmon: HwmonConfig
+
+    @model_validator(mode="after")
+    def _interval_divides_a_minute(self) -> Self:
+        # ロールアップは1分あたりの期待サンプル数を 60000 // interval_ms で固定する。
+        # 割り切れない周期では実際の件数が分ごとに揺れ、欠測率が負になりうる
+        if MINUTE_MS % self.interval_ms != 0:
+            raise ValueError(f"interval_ms は {MINUTE_MS} を割り切る値にする")
+        return self
 
     @classmethod
     def from_yaml(cls, path: Path) -> InternalTelemetryConfig:

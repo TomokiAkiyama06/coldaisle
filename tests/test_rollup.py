@@ -624,7 +624,7 @@ def test_unregistered_internal_metric_has_no_expectation(store):
 
 @pytest.mark.parametrize(
     "intervals",
-    [{"air.room": 2_500}, {"gpu.0.core": 0}, {"gpu.0.core": MINUTE_MS + 1}],
+    [{"air.room": 2_500}, {"gpu.0.core": 0}, {"gpu.0.core": MINUTE_MS + 1}, {"gpu.0.core": 7_000}],
 )
 def test_invalid_periodic_intervals_are_rejected(store, intervals):
     write(store, "gpu.0.core", 0, 55.0)

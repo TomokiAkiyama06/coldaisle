@@ -226,10 +226,10 @@ class NvmlAdapter:
         readings.append(
             Reading(
                 metric="sys.cuda_processes",
-                value=float(len(process_ids)) if any_available and process_info_complete else None,
-                quality=(
-                    Quality.OK if any_available and process_info_complete else Quality.MISSING
-                ),
+                # 温度・電力などの scalar とは独立に取れる。scalar が全滅しても、
+                # process 一覧が全 GPU ぶん取れていれば件数は正しい
+                value=float(len(process_ids)) if process_info_complete else None,
+                quality=Quality.OK if process_info_complete else Quality.MISSING,
             )
         )
         if not any_available:

@@ -6,6 +6,9 @@ import logging
 from dataclasses import dataclass
 from pathlib import Path
 
+import pytest
+from pydantic import ValidationError
+
 from coldaisle import logs, rollup_job
 from coldaisle.clock import SimulatedClock
 from coldaisle.internal_telemetry import (
@@ -272,3 +275,17 @@ def test_once_creates_the_database_directory(tmp_path: Path, monkeypatch):
 
     assert code == 0
     assert database.exists()
+
+
+def test_interval_that_does_not_divide_a_minute_fails_at_load(tmp_path: Path):
+    """1分を割り切らない周期は欠測率が負になりうるため、設定の読み込みで拒否する。"""
+    telemetry = tmp_path / "internal-telemetry.yaml"
+    telemetry.write_text(
+        "version: 1\ninterval_ms: 7000\n"
+        "nvml: {enabled: false, gpu_indices: [0]}\n"
+        "hwmon: {enabled: false, root: /sys/class/hwmon, sensors: []}\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValidationError, match="割り切る"):
+        InternalTelemetryConfig.from_yaml(telemetry)
