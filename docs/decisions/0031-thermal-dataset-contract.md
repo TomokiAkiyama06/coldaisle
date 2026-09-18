@@ -105,6 +105,9 @@ triggerがreadingsへのINSERT / UPDATE / DELETEを拒否し、`coldaisle-teleme
 `coldaisle-rollup`はbind済みのdataset DBではロールアップと保持期間の適用自体を拒否する
 （削除0件でもControlTickは消え得るため）。builderは印の存在だけを信じず、封印したdigestを
 再計算して照合し、triggerを外したDB等で完了後にreadingsが変わっていれば拒否する。
+完了の印より前（取り込み中）も、bind済みのDBへreadingsを書けるのはbindしたReplay取り込みの
+Store（同じ接続）だけとし、別プロセス・別接続の書き込みは書き込みロック内で拒否する。
+`coldaisle-telemetry`はbind済みのDBでは起動を拒否する。
 ControlTickは取り込み完了後に記録するため封印せず、manifestの`control_trace_sha256`で追跡する。
 
 同一のTelemetryとControlTick traceをSQLiteへ入れれば、同じmanifest / examplesを

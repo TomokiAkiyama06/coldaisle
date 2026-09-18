@@ -14,6 +14,7 @@ from pydantic import ValidationError
 
 import coldaisle.daemon as daemon_module
 import coldaisle.dataset as dataset_module
+import coldaisle.telemetry_daemon as telemetry_daemon
 from coldaisle.control import ControlTick, ControlTraceLogger
 from coldaisle.control.model.dataset import (
     DatasetSourceKind,
@@ -436,7 +437,10 @@ def test_builder_reads_all_series_from_one_sqlite_snapshot(
             result = original_series(metric, start_ms, end_ms, limit=limit)
             if not injected:
                 injected = True
-                writer.insert_sample(reading_sample(7_000, **{"air.gpu_exhaust": 99.0}))
+                # Storeは別writerを拒否するため、生SQLで並行書き込みを模す
+                writer.connection.execute(
+                    "INSERT INTO readings VALUES ('air.gpu_exhaust', 7000, 99.0, 'ok')"
+                )
             return result
 
         monkeypatch.setattr(dataset_store, "series", series_with_concurrent_ingest)
@@ -1127,3 +1131,61 @@ def test_rollup_and_retention_are_refused_on_a_dataset_db(dataset_store):
 
     assert dataset_store.control_traces(0, 20_000) == traces_before
     assert ThermalDatasetBuilder(dataset_store).build(source_run=source_run(), spec=spec())
+
+
+def test_foreign_writer_is_refused_while_the_dataset_run_is_bound_but_incomplete(
+    tmp_path, rules, monkeypatch
+):
+    """取り込み中（完了の印の前）でも、並行する別writerのreadingsは入れない。
+
+    bindしたReplay取り込みは最後まで書け、完了の印が付く。
+    """
+    _long_replay_csv(tmp_path / "replay.csv", 20)
+    database = tmp_path / "run.db"
+    refused: list[Exception] = []
+
+    class _ConcurrentTelemetry(ReplaySource):
+        def stream(self) -> Iterator[RawMessage]:
+            for index, message in enumerate(super().stream()):
+                if index == 5:
+                    with SqliteStore(database, rules=rules, clock=self.clock) as telemetry:
+                        try:
+                            telemetry.insert_sample(reading_sample(5_500, **{"air.room": 99.0}))
+                        except ValueError as error:
+                            refused.append(error)
+                yield message
+
+    replay = _ConcurrentTelemetry(
+        tmp_path / "replay.csv", tz=ZoneInfo("UTC"), bulk=True, dataset_provenance=True
+    )
+    with SqliteStore(database, rules=rules, clock=replay.clock) as store:
+        daemon = Daemon(
+            source=replay,
+            store=store,
+            normalizer=Normalizer(rules=rules, calibration=Calibration(), clock=replay.clock),
+            source_name="replay",
+            dataset_run_alias=RUN_ALIAS,
+        )
+        stats = daemon.run()
+
+        assert len(refused) == 1
+        assert "bind" in str(refused[0])
+        assert stats.samples == 20
+        assert not stats.dataset_incomplete
+        assert store.dataset_source_run_completed()
+        assert store.series("air.room", 0, 30_000)[-1].value == 20.0
+        assert all(point.ts_ms != 5_500 for point in store.series("air.room", 0, 30_000))
+
+
+def test_internal_telemetry_refuses_to_start_on_a_dataset_bound_db(dataset_store, tmp_path):
+    database = Path(dataset_store.connection.execute("PRAGMA database_list").fetchone()["file"])
+
+    with pytest.raises(SystemExit, match="bind済み"):
+        telemetry_daemon.build(
+            telemetry_daemon.Config(
+                db=database,
+                telemetry=QUALITY_RULES_PATH.parent / "internal-telemetry.yaml",
+                quality_rules=QUALITY_RULES_PATH,
+                metrics=QUALITY_RULES_PATH.parent / "metrics.yaml",
+            )
+        )

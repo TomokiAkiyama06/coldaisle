@@ -208,6 +208,8 @@ class SqliteStore:
         # 組み合わせが静かに成立すると、圧縮再生の結果が説明できなくなる
         self._rules = rules
         self._clock = clock
+        self._dataset_writer = False
+        """このインスタンスがdataset source runをbindした取り込みか（#83）。"""
         self._conn = sqlite3.connect(str(path), isolation_level=None)
         self._conn.row_factory = sqlite3.Row
         # busy_timeout を最初に設定する。WAL への切り替えは一瞬だけ排他ロックを取るため、
@@ -308,6 +310,8 @@ class SqliteStore:
         if not rows:
             return 0
         with self.transaction():
+            # 書き込みロック（BEGIN IMMEDIATE）の中で確かめるので、bindとの競合も無い
+            self._refuse_foreign_dataset_writer()
             cursor = self._conn.executemany(
                 "INSERT OR IGNORE INTO readings (metric, ts_ms, value, quality) "
                 "VALUES (?, ?, ?, ?)",
@@ -575,6 +579,23 @@ class SqliteStore:
                 )
         except sqlite3.IntegrityError as exc:
             raise ValueError("dataset DBは既に別のsource runへbindされている") from exc
+        # bindに成功したこのインスタンスだけが、以後readingsを書ける
+        self._dataset_writer = True
+
+    def _refuse_foreign_dataset_writer(self) -> None:
+        """dataset source runへbind済みのDBには、bindした取り込み以外からreadingsを書かせない。
+
+        完了の印より前（取り込み中）にも、並行する`coldaisle-telemetry`等の別writerが
+        readingsを足すと、入力全体のhashの下に入力外の行が混ざり、完了時の封印にも
+        含まれてしまう。bindは取り込み開始前の1回だけなので、bindしたStoreインスタンス
+        （同じ接続）だけを正当なwriterとする。別プロセス・別接続は拒否する。
+        """
+        if self._dataset_writer:
+            return
+        if self.dataset_source_run() is not None:
+            raise ValueError(
+                "dataset source runへbind済みのDBには、bindしたReplay取り込み以外は書けない（#83）"
+            )
 
     def dataset_source_run(self) -> tuple[str, str, str] | None:
         """bind済みdataset source runの(run alias, kind, SHA-256)を返す。"""
