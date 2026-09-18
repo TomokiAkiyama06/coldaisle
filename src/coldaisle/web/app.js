@@ -131,18 +131,23 @@ function renderBanner() {
   const age = document.getElementById("age");
   const fromLatest = lastLatest ? staleFromLatest(lastLatest) : null;
   const stale = fromLatest ? fromLatest.stale : Boolean(health && health.stale);
+  // **重いものから順に、成り立つものをすべて出す。** 1つだけ選ぶと、WebSocket の
+  // 更新（applyLatest → ここ）が API の失敗の文言を消してしまう。失敗は
+  // lastFetchError に残り、定期更新が丸ごと成功するまで消えない
+  const messages = [];
+  if (lastFetchError) messages.push(`API に接続できません: ${lastFetchError}`);
   if (health && health.last_sample_ts_ms === null) {
-    banner.textContent = "データが1件も届いていません。取り込みデーモンを確認してください。";
-    banner.classList.remove("hidden");
+    messages.push("データが1件も届いていません。取り込みデーモンを確認してください。");
   } else if (health && health.data_age_seconds < 0) {
     // 受信時刻が未来。時計のずれか、圧縮再生中の DB を見ている（決定記録 0007 §2.11）
-    banner.textContent =
-      "受信時刻が未来です。時計がずれているか、時間圧縮で再生中の DB を見ています。";
-    banner.classList.remove("hidden");
+    messages.push("受信時刻が未来です。時計がずれているか、時間圧縮で再生中の DB を見ています。");
   } else if (stale) {
     const measured = fromLatest && fromLatest.seconds !== null ? fromLatest.seconds : health && health.data_age_seconds;
     const seconds = typeof measured === "number" ? `（最終受信から ${Math.round(measured)} 秒）` : "";
-    banner.textContent = `データが古い${seconds}。取り込みが止まっている可能性があります。`;
+    messages.push(`データが古い${seconds}。取り込みが止まっている可能性があります。`);
+  }
+  if (messages.length > 0) {
+    banner.textContent = messages.join(" / ");
     banner.classList.remove("hidden");
   } else if (health) {
     banner.classList.add("hidden");
@@ -373,6 +378,8 @@ async function loadHistory() {
 // 最後に受け取った応答。**表示名の表が後から届いたときに描き直すため**に持つ
 let lastLatest = null;
 let lastHealth = null;
+// 直近の定期更新の失敗。**定期更新が丸ごと成功するまで残す**（赤帯を WebSocket で消さない）
+let lastFetchError = null;
 let lastAlerts = null;
 let lastDevices = null;
 let lastSeries = null;
@@ -435,6 +442,7 @@ async function refresh() {
     ]);
     applyLatest(latest);
     lastHealth = health;
+    lastFetchError = null; // 4つとも取れたときだけ消す
     lastAlerts = alerts.alerts;
     lastDevices = devices.devices;
     renderBanner();
@@ -445,9 +453,9 @@ async function refresh() {
       loadHistory();
     }
   } catch (error) {
-    const banner = document.getElementById("banner");
-    banner.textContent = `API に接続できません: ${error.message}`;
-    banner.classList.remove("hidden");
+    // 赤帯そのものには書かず、状態として残す。直接書くと、次の WebSocket の更新で消える
+    lastFetchError = error.message;
+    renderBanner();
   }
 }
 

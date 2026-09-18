@@ -408,3 +408,24 @@ def test_a_late_catalog_rerenders_every_labelled_part():
     ):
         assert call in rerender, f"{call} を描き直していない"
     assert "drawCharts()" in rerender, "凡例（グラフ）を描き直していない"
+
+
+def test_a_stream_update_does_not_hide_an_api_failure():
+    """WebSocket の更新で、**API の失敗を知らせる赤帯を消さない。**
+
+    定期更新（`/alerts` や `/devices`）が失敗していても、WebSocket は届き続けることがある。
+    失敗を赤帯に直接書くと、次の `applyLatest → renderBanner` で上書きされて消える。
+    失敗は `lastFetchError` に残し、定期更新が丸ごと成功したときだけ消す。
+    """
+    script = SCRIPT.read_text(encoding="utf-8")
+    banner = script[script.index("function renderBanner(") :]
+    banner = banner[: banner.index("\n}\n")]
+    assert "if (lastFetchError)" in banner
+    assert "messages.join(" in banner, "成り立つ警告をすべて出す"
+    refresh = script[script.index("async function refresh()") : script.index("function connect()")]
+    failure = refresh[refresh.index("catch (error)") :]
+    assert "lastFetchError = error.message" in failure
+    assert "banner.textContent" not in failure, "赤帯に直接書くと WebSocket の更新で消える"
+    success = refresh[: refresh.index("catch (error)")]
+    assert "lastFetchError = null" in success
+    assert success.index("Promise.all") < success.index("lastFetchError = null")
