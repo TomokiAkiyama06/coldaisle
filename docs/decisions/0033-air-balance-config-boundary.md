@@ -1,10 +1,10 @@
 # 決定記録 0033: Air Balance characterization の設定境界
 
 - **種別**: Decision Record
-- **Status**: Proposed
+- **Status**: FINAL（2026-09-18、リポジトリ所有者が承認）
 - **Date**: 2026-09-18
 - **Supersedes**: [`0028-fan-control-contracts.md`](0028-fan-control-contracts.md) §2.8 の
-  3ファイル境界（本記録がFINALになった場合）
+  3ファイル境界
 - **関連**: [`0026-three-zone-fan-control.md`](0026-three-zone-fan-control.md)、
   [`docs/airflow-model.md`](../airflow-model.md)、GitHub #75 / #81 / #103
 - **対象 Issue**: #81
@@ -21,7 +21,7 @@ characterization、目標balance ratio、熱状態の判定条件を必要とす
 
 ## 2. Decision
 
-次を**提案**する。StatusがFINALになるまでは0028の3ファイル境界を変更しない。
+2026-09-18、リポジトリ所有者が本記録を承認した。次のとおり決める。
 
 - `air-balance.yaml`を4つ目のControl Configとして追加し、#103の`ControlConfig`が4ファイル
   すべてを検証できたときだけ一括採用する
@@ -34,8 +34,7 @@ characterization、目標balance ratio、熱状態の判定条件を必要とす
 - 設定のlive reloadは行わず、変更は再起動後の`STARTUP`を経て反映する
 
 本Issueの実装はformatと純粋モデルまでに留める。runtimeの`config/`にはファイルを置かず、
-未校正例は`tests/fixtures/`だけに置く。4ファイル一括読み込みは、本記録の承認と#103との統合後に
-実装する。
+未校正例は`tests/fixtures/`だけに置く。4ファイル一括読み込みは、#103との統合で実装する。
 
 ## 3. Consequences
 
@@ -55,7 +54,6 @@ characterization、目標balance ratio、熱状態の判定条件を必要とす
 
 ## 5. 未決事項
 
-- 本記録をFINALにする所有者レビュー
 - #103の4ファイル一括schema versionと移行方法
 - #75 dataset / measurement recordを`basis`から機械的に照合する形式
 - Air Balanceの推定結果を#82 decision traceへ格納するschema

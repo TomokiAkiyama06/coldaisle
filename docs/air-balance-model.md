@@ -65,6 +65,6 @@ still raises Front make-up air rather than leaving Front at zero.
 The model is pure and uses no hardware I/O, which lets Mock and Replay exercise all state changes
 without a sensor module.
 
-The model is not wired into `ControlConfig` or the runtime daemon. Decision record 0033 documents a
-proposed four-file atomic configuration boundary; decision record 0028's approved three-file
-boundary remains authoritative until that proposal is accepted.
+The model is not wired into `ControlConfig` or the runtime daemon yet. Decision record 0033 (FINAL)
+makes `air-balance.yaml` the fourth Control Config, validated and adopted atomically with the other
+three files; that four-file loader is implemented together with #103.
