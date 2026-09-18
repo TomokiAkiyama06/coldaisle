@@ -117,7 +117,7 @@ class Config:
     internal_telemetry: Path = Path("config/internal-telemetry.yaml")
     server_health: Path = Path("config/server-health.yaml")
     airflow_ui: Path = Path("config/airflow-ui.yaml")
-    """エアフロー画面の表示設定（#106 / 決定記録 0044）。"""
+    """エアフロー画面の表示設定（#106 / 決定記録 0046）。"""
     max_points: int = 2_000
     """1レスポンスの最大点数。超えるなら粗い粒度へ自動で落とす（受入基準）。"""
     stream_poll_s: float = 1.0
@@ -449,7 +449,7 @@ def create_app(
 
     @app.get("/api/v1/airflow/config", response_model=AirflowConfigResponse)
     def get_airflow_config() -> AirflowConfigResponse:
-        """エアフロー画面の表示設定（#106 / 決定記録 0044）。**測定値は含まない。**
+        """エアフロー画面の表示設定（#106 / 決定記録 0046）。**測定値は含まない。**
 
         空気の温度の色分けの区切りを画面に書かないために返す（AGENTS.md ルール9）。
         制御・アラートの閾値ではない。

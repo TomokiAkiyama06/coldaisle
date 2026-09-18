@@ -1,4 +1,4 @@
-// エアフロー / ファン制御の可視化（#106 / 決定記録 0044）。**表示専用。**
+// エアフロー / ファン制御の可視化（#106 / 決定記録 0046）。**表示専用。**
 //
 // 原則:
 //   1. **書き込まない。** 叩くのは GET だけ（api-contract §1）。モード変更の入り口は
@@ -58,7 +58,7 @@ const ZONES = [
 // CPU の使用率はまだ計測していない（取得する入力が無い）。`null` は「未計測」と出す
 //
 // `status` は熱源の状態表示の差し込み口。**GPU のスロットリング表示のために空けてある**
-// （表示案は所有者が検討中。throttle 系のメトリクスは #65 / PR #139 で追加予定）。
+// （表示案は所有者が検討中。元になる GPU の throttle reason・T.Limit margin は #65 / 決定記録 0043 で収集済み）。
 // いまはどの熱源も `null` で、何も表示しない。
 const HEAT_SOURCES = [
   { name: "CPU", util: null, temp: "cpu.package", power: "power.cpu.package", status: null, chip: { x: 204, y: 200, w: 104 } },
@@ -70,7 +70,7 @@ const HEAT_SOURCES = [
  *
  * `source.status` に関数を入れると `{ text, tone }`（tone は "warn" / "bad"）を返せるようにしてある。
  * 返り値があれば、側面図の札の見出しと枠の色、「熱源」パネルに出る。
- * `null` を返すあいだは何も出さない（**「スロットリングなし」とも言わない**。測っていないため）。
+ * `null` を返すあいだは何も出さない（**「スロットリングなし」とも言わない**。表示の設計が未定で値を読んでいないため）。
  */
 function sourceStatus(source) {
   return typeof source.status === "function" ? source.status(page.latest) : null;

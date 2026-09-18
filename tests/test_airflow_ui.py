@@ -1,4 +1,4 @@
-"""エアフロー / ファン制御の画面（#106 / 決定記録 0044）。
+"""エアフロー / ファン制御の画面（#106 / 決定記録 0046）。
 
 見た目そのものの確認は人間が行う（決定記録 0011 と同じ）。ここは「壊れていたら気づける」線を引く。
 
@@ -136,7 +136,7 @@ def test_the_page_says_it_is_read_only():
 
 @pytest.mark.parametrize("asset", ASSETS)
 def test_no_write_paths(asset):
-    """フォーム・送信・POST を持たない（決定記録 0028 §2.2 / 0044 §2.2）。"""
+    """フォーム・送信・POST を持たない（決定記録 0028 §2.2 / 0046 §2.2）。"""
     text = _text(asset)
     for forbidden in (
         "<form",
@@ -294,7 +294,7 @@ def test_script_does_not_use_inner_html(asset):
 
 
 def test_throttle_hook_exists_but_shows_nothing_yet():
-    """GPU スロットリング表示の差し込み口（決定記録 0044 §2.6）。**まだ何も表示しない。**"""
+    """GPU スロットリング表示の差し込み口（決定記録 0046 §2.6）。**まだ何も表示しない。**"""
     script = _text(SCRIPT)
     assert "function sourceStatus(source)" in script
     sources = script[script.index("const HEAT_SOURCES") : script.index("function sourceStatus")]

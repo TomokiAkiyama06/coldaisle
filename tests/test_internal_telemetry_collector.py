@@ -152,6 +152,10 @@ def test_periodic_metric_intervals_follow_the_configured_interval():
 
     assert intervals["gpu.0.core"] == config.interval_ms
     assert intervals["sys.cuda_processes"] == config.interval_ms
+    # 決定記録 0043 の入力も欠測を数える対象にする
+    for metric in ("cpu.tctl", "cpu.ccd1", "cpu.ccd2", "gpu.0.tlimit_margin", "gpu.0.fan_speed"):
+        assert intervals[metric] == config.interval_ms
+    assert intervals["gpu.0.throttle.hw_thermal"] == config.interval_ms
     # 無効な T_SENSOR には期待値を作らない（未設置は欠測ではない）
     assert "board.connector_12v2x6" not in intervals
 
