@@ -1,7 +1,7 @@
 # 決定記録 0031: Thermal Dataset v1 の時刻対応と再生成契約
 
 - **種別**: Decision Record
-- **Status**: Proposed
+- **Status**: FINAL（2026-09-18、リポジトリ所有者が承認）
 - **Date**: 2026-09-18
 - **Supersedes**: なし
 - **関連**: [`0010-csv-replay.md`](0010-csv-replay.md)、
@@ -20,6 +20,8 @@ window、sampling period、horizon、target許容誤差は実データで評価�
 外付けセンサーモジュールが無い現時点で、本番値を既定値として固定してはならない。
 
 ## 2. Decision
+
+2026-09-18、リポジトリ所有者が本記録の内容どおりに承認した（PR #129 のレビュー。完了の印と封印の規則を含む）。
 
 ### 2.1 versioned schema
 
@@ -110,7 +112,7 @@ ControlTickは取り込み完了後に記録するため封印せず、manifest�
 復元できるとはみなさない。Control EngineがReplay中に生成したtrace、または同じrunで
 保存済みのtraceが必要である。
 
-このPRで提供するCLIの自動bind経路は、入力bytesを開始前にhashできるReplayに限定する。
+v1のCLIが提供する自動bind経路は、入力bytesを開始前にhashできるReplayに限定する。
 schemaは`serial` / `mock` / `import`のsource kindを区別できるが、それらのraw source hashを
 いつ確定しimmutableにbindするかは、実収集・生成経路を接続する際に別途決める。未確定の
 hashを仮置きして非Replayを通さない。
