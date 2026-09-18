@@ -28,6 +28,7 @@
 | GET | `/api/v1/health` | デーモンの稼働状態、最終受信時刻、ソース種別、欠損率 |
 | GET | `/api/v1/server-health` | **Server Health パネル1枚分。Workspace が最も多く叩く** |
 | GET | `/api/v1/latest` | 全メトリクスの最新値 + 派生値 + quality |
+| GET | `/api/v1/metrics` | メトリクスの表示名・単位と派生値の式（値は含まない）（決定記録 0039） |
 | GET | `/api/v1/series` | 時系列。`metric` `from` `to` `agg` |
 | GET | `/api/v1/stats` | min/max/mean/p95/傾き/欠測率 |
 | GET | `/api/v1/alerts` | アラート一覧 |
@@ -228,6 +229,26 @@ coldaisle のエアフロー画面（`/airflow.html`、#106）が使う**表示�
 
 **制御・アラートの閾値ではありません。** Fan 制御やアラートの判定には使われず、
 変えても色の付き方が変わるだけです。測定値は含みません（`/latest` と `/series` を使う）。
+
+### `GET /api/v1/metrics`
+
+メトリクス名から**人間向けの表示名**を引く表です（決定記録 0039）。
+`config/metrics.yaml` をそのまま返し、値は含みません（値は `/latest`）。
+
+```json
+{
+  "metrics": {"air.room": {"unit": "C", "label": "室温"}},
+  "derived": {
+    "d.intake_rise": {
+      "unit": "C", "label": "吸気上昇（再循環の指標）",
+      "minuend": "air.front_intake", "subtrahend": "air.room"
+    }
+  }
+}
+```
+
+**機械はメトリクス名で参照してください。** 表示名は変わることがあります（決定記録 0009 §2.1）。
+派生値は `minuend − subtrahend` です。DB を読まないため、取り込みが止まっていても返ります。
 
 ### `GET /api/v1/tools` と `GET /api/v1/tools/{name}`
 

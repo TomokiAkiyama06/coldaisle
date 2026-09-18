@@ -16,18 +16,27 @@ CSV はローカル時刻でオフセットを持たない（決定記録 0008 �
 from __future__ import annotations
 
 import csv
+import hashlib
+import io
 import logging
+import os
+import stat
+import tempfile
 import time
 from collections.abc import Callable, Iterator
 from datetime import datetime
 from itertools import islice
 from pathlib import Path
+from typing import TYPE_CHECKING, BinaryIO, TextIO
 from zoneinfo import ZoneInfo
 
 from coldaisle import logs
 from coldaisle.channels import SAMPLE_CHANNELS
 from coldaisle.clock import SimulatedClock
 from coldaisle.ingest.protocol import RawHello, RawMessage, RawSample, RawSensor
+
+if TYPE_CHECKING:
+    from _typeshed import WriteableBuffer
 
 TIMESTAMP_COLUMNS = ("timestamp", "ts", "time", "datetime")
 """時刻列の呼ばれ方。**先に見つかったものを使う。**"""
@@ -60,6 +69,8 @@ MAX_LOGGED_DROPS = 10
 """1ファイルあたり、個別に記録する破棄行の上限。総数は別に出す。"""
 
 LOGGER = logging.getLogger("coldaisle.ingest.replay")
+COPY_CHUNK_BYTES = 1024 * 1024
+"""dataset provenance用snapshotを定数memoryで作るchunk size。"""
 
 
 def normalize_column(name: str) -> str:
@@ -79,6 +90,88 @@ def csv_files(path: Path) -> list[Path]:
     if not path.exists():
         raise ValueError(f"CSV が見つからない: {path}")
     return [path]
+
+
+def replay_sha256(path: Path) -> str:
+    """Replay対象のbasename・file境界・内容を順序付きでhashする。"""
+    _snapshot, _segments, digest = _snapshot_and_hash(csv_files(path), make_snapshot=False)
+    return digest
+
+
+class _SnapshotSegment(io.RawIOBase):
+    """共有snapshotの1区間だけを`pread`で読むview。
+
+    CSVごとにfileを持つとdirectory replayでdescriptorがCSV数だけ増えEMFILEになり得る。
+    1つのspool fileを位置非依存の`pread`で読めば、何本CSVがあっても保持するfdは1つで済む。
+    """
+
+    def __init__(self, fd: int, start: int, length: int) -> None:
+        super().__init__()
+        self._fd = fd
+        self._position = start
+        self._end = start + length
+
+    def readable(self) -> bool:
+        return True
+
+    def readinto(self, buffer: WriteableBuffer) -> int:
+        view = memoryview(buffer).cast("B")
+        size = min(len(view), self._end - self._position)
+        if size <= 0:
+            return 0
+        chunk = os.pread(self._fd, size, self._position)
+        view[: len(chunk)] = chunk
+        self._position += len(chunk)
+        return len(chunk)
+
+
+def _snapshot_and_hash(
+    files: list[Path], *, make_snapshot: bool
+) -> tuple[BinaryIO | None, list[tuple[int, int]], str]:
+    """CSVをchunk単位でhashし、指定時は同じbytesを1つのprivate snapshotへ連結して書く。
+
+    返す区間は各CSVのsnapshot内`(開始offset, 長さ)`。
+    """
+    digest = hashlib.sha256()
+    segments: list[tuple[int, int]] = []
+    # dataset sourceの寿命まで保持し、各CSVは区間viewで読む。
+    snapshot = tempfile.TemporaryFile(mode="w+b") if make_snapshot else None  # noqa: SIM115
+    offset = 0
+    try:
+        for csv_path in files:
+            encoded_name = csv_path.name.encode("utf-8")
+            source_fd = os.open(
+                csv_path,
+                os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW | os.O_CLOEXEC,
+            )
+            with os.fdopen(source_fd, "rb") as source:
+                before = os.fstat(source.fileno())
+                if not stat.S_ISREG(before.st_mode):
+                    raise ValueError(f"Replay入力はregular fileでなければならない: {csv_path}")
+                digest.update(len(encoded_name).to_bytes(8, "big"))
+                digest.update(encoded_name)
+                digest.update(before.st_size.to_bytes(8, "big"))
+                copied = 0
+                while chunk := source.read(COPY_CHUNK_BYTES):
+                    copied += len(chunk)
+                    digest.update(chunk)
+                    if snapshot is not None:
+                        snapshot.write(chunk)
+                after = os.fstat(source.fileno())
+            identity_before = (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
+            identity_after = (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
+            if identity_before != identity_after or copied != before.st_size:
+                raise ValueError(f"hash中にReplay CSVが変更された: {csv_path}")
+            segments.append((offset, copied))
+            offset += copied
+        if snapshot is not None:
+            snapshot.flush()
+            os.fsync(snapshot.fileno())
+    except BaseException:
+        if snapshot is not None:
+            snapshot.close()
+        raise
+    return snapshot, segments, digest.hexdigest()
 
 
 class ReplaySource:
@@ -104,24 +197,61 @@ class ReplaySource:
         speed: float = 1.0,
         bulk: bool = False,
         sleep: Callable[[float], None] = time.sleep,
+        dataset_provenance: bool = False,
     ) -> None:
         if speed <= 0:
             raise ValueError(f"speed は正の数（一括投入は bulk=True）: {speed}")
-        self._files = csv_files(path)
-        if not self._files:
+        source_files = csv_files(path)
+        if not source_files:
             raise ValueError(f"CSV が見つからない: {path}")
+        self._snapshot: BinaryIO | None = None
+        self._snapshot_segments: list[tuple[int, int]] = []
+        self._source_sha256: str | None = None
+        if dataset_provenance:
+            self._snapshot, self._snapshot_segments, self._source_sha256 = _snapshot_and_hash(
+                source_files,
+                make_snapshot=True,
+            )
+        self._files = source_files
         self._tz = tz
         self._speed = speed
         self._bulk = bulk
         self._sleep = sleep
         self.dropped_rows = 0
         """時刻として読めずに捨てた行数。完全な再生かどうかの判断に使う。"""
+        self.malformed_rows = 0
+        """列数がheaderと合わない行数。**行は流す**が、欠けた列は欠測・余った列は捨てている。"""
+        self.unparsed_cells = 0
+        """空欄ではないのに数値として読めず欠測にしたcell数。"""
+        self.header_collisions = 0
+        """同じ列名に正規化される見出しの重複数（fileごとに1回数える）。後の列だけが残る。"""
         self._clock = SimulatedClock(self._first_timestamp_ms())
 
     @property
     def clock(self) -> SimulatedClock:
         """CSV の時刻で進む時計。取り込みと保存はこれを共有する（#42）。"""
         return self._clock
+
+    @property
+    def source_sha256(self) -> str | None:
+        """dataset snapshot有効時だけ、その同一bytesのSHA-256を返す。"""
+        return self._source_sha256
+
+    @property
+    def losses(self) -> dict[str, int]:
+        """CSVにあったのにsampleへ届かなかったものの件数（#83 dataset完了判定）。
+
+        どれも取り込みは止めずに続ける（1行の書式違いで再生全体を止めない）。
+        dataset用Replayでは1件でもあればDBは入力の一部しか持たないため、
+        daemonは完了の印を付けない。数えないもの（header行、空行、対応表に無い列）
+        は理由を`docs/thermal-dataset.md`に記す。
+        """
+        return {
+            "dropped_rows": self.dropped_rows,
+            "malformed_rows": self.malformed_rows,
+            "unparsed_cells": self.unparsed_cells,
+            "header_collisions": self.header_collisions,
+        }
 
     @property
     def hello(self) -> RawHello:
@@ -161,15 +291,39 @@ class ReplaySource:
         取りこぼした再生を運用者が区別できない。`report=True` のときだけ
         記録する（起動バナーのための先読みで二重に数えないため）。
         """
-        for path in self._files:
+        for index, path in enumerate(self._files):
             dropped = 0
-            with path.open(encoding="utf-8-sig", newline="") as handle:
+            handle_context: TextIO
+            if self._snapshot is not None:
+                segment_start, segment_length = self._snapshot_segments[index]
+                handle_context = io.TextIOWrapper(
+                    io.BufferedReader(
+                        _SnapshotSegment(self._snapshot.fileno(), segment_start, segment_length)
+                    ),
+                    encoding="utf-8-sig",
+                    newline="",
+                )
+            else:
+                handle_context = path.open(encoding="utf-8-sig", newline="")
+            with handle_context as handle:
                 reader = csv.DictReader(handle)
                 fields = [normalize_column(name) for name in reader.fieldnames or []]
                 stamp_column = next((name for name in TIMESTAMP_COLUMNS if name in fields), None)
                 if stamp_column is None:
                     raise ValueError(f"時刻の列が見つからない: {path}（候補: {TIMESTAMP_COLUMNS}）")
+                collisions = _header_collisions(fields)
+                if report and collisions:
+                    # `room`と`room_temp`のように同じ列へ正規化される見出しは、dictにすると
+                    # 後の列だけが残り前の列の値を黙って失う。取り込みは続け、数えて記録する
+                    self.header_collisions += collisions
+                    LOGGER.warning(
+                        "同じ列に正規化される見出しが重複している。後の列だけを使う",
+                        extra={logs.FIELDS_KEY: {"file": path.name, "collisions": collisions}},
+                    )
                 for line, raw_row in enumerate(reader, start=2):
+                    # DictReaderは余った列をkey None、足りない列をvalue Noneで表す。
+                    # 空欄（""）とは区別できるので、書式の壊れた行として数える
+                    malformed = None in raw_row or any(value is None for value in raw_row.values())
                     row = {
                         normalize_column(key): value
                         for key, value in raw_row.items()
@@ -177,7 +331,11 @@ class ReplaySource:
                     }
                     parsed = self._parse_row(row, stamp_column)
                     if parsed is not None:
-                        yield parsed
+                        row_ms, values, unparsed = parsed
+                        if report:
+                            self.malformed_rows += int(malformed)
+                            self.unparsed_cells += unparsed
+                        yield row_ms, values
                         continue
                     dropped += 1
                     if report:
@@ -202,7 +360,8 @@ class ReplaySource:
 
     def _parse_row(
         self, row: dict[str, str | None], stamp_column: str
-    ) -> tuple[int, dict[str, float | None]] | None:
+    ) -> tuple[int, dict[str, float | None], int] | None:
+        """行を`(時刻, 値, 数値として読めなかった非空cell数)`にする。時刻が無ければ`None`。"""
         stamp = row.get(stamp_column)
         if not stamp:
             return None
@@ -213,11 +372,15 @@ class ReplaySource:
         if when.tzinfo is None:
             when = when.replace(tzinfo=self._tz)
         values: dict[str, float | None] = {}
+        unparsed = 0
         for channel in SAMPLE_CHANNELS:
             if channel not in row:
                 continue
-            values[channel] = _to_float(row[channel])
-        return int(when.timestamp() * 1000), values
+            raw_value = row[channel]
+            values[channel] = _to_float(raw_value)
+            if values[channel] is None and raw_value is not None and raw_value.strip():
+                unparsed += 1
+        return int(when.timestamp() * 1000), values, unparsed
 
     def _first_timestamp_ms(self) -> int:
         for row_ms, _ in self._rows():
@@ -231,6 +394,18 @@ class ReplaySource:
         if len(stamps) < 2 or stamps[1] <= stamps[0]:
             return NOMINAL_INTERVAL_MS
         return stamps[1] - stamps[0]
+
+
+def _header_collisions(fields: list[str]) -> int:
+    """読む列（channelと時刻）のうち、1つの値へ潰れる見出しの余剰数。
+
+    同じ名前へ正規化される見出しに加え、`timestamp,ts`のように時刻の別名が複数ある
+    場合も数える。時刻は先に見つかった1列だけを使うため、残りの列は黙って失われる。
+    対応表に無い列同士の重複は値を読まないため失うものが無く、数えない。
+    """
+    channels = [name for name in fields if name in SAMPLE_CHANNELS]
+    stamps = [name for name in fields if name in TIMESTAMP_COLUMNS]
+    return (len(channels) - len(set(channels))) + max(len(stamps) - 1, 0)
 
 
 def _to_float(value: str | None) -> float | None:

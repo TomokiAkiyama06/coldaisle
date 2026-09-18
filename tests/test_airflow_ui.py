@@ -10,6 +10,7 @@
 """
 
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -307,11 +308,13 @@ THROTTLE_FLAGS = (
 
 
 def _node() -> str:
-    """`node` の場所。無い手元では飛ばす（CI に Node を入れる判断は PR #134 / その決定記録）。"""
+    """`node` の場所。**CI では無ければ失敗、手元では飛ばす**（決定記録 0044）。"""
     node = shutil.which("node")
-    if node is None:
-        pytest.skip("node が無い")
-    return node
+    if node is not None:
+        return node
+    if os.environ.get("CI"):
+        pytest.fail("CI では node が必須（決定記録 0044。ci.yml の setup-node を確認）")
+    pytest.skip("node が無い（手元では飛ばす。CI では必須）")
 
 
 def _throttle(metrics: dict[str, dict[str, object]]) -> object:
@@ -420,10 +423,8 @@ def test_the_throttle_mock_is_selectable():
 
 @pytest.mark.parametrize("asset", [SCRIPT, MOCK, STATUS])
 def test_script_parses(asset):
-    node = shutil.which("node")
-    if node is None:
-        pytest.skip("node が無い")
-    assert subprocess.run([node, "--check", str(asset)], capture_output=True).returncode == 0
+    """構文エラーで真っ白な画面にならないこと。"""
+    assert subprocess.run([_node(), "--check", str(asset)], capture_output=True).returncode == 0
 
 
 def test_history_reads_the_range_the_api_returns(client):
