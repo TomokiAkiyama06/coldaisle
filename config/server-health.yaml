@@ -48,6 +48,10 @@ panels:
     - board.chipset
     - board.connector_12v2x6
 
+# active_alerts に載せる件数の上限（新しい順）。signal の判定と compute_mode_advisory の
+# 件数は、この上限に関係なく発生中の全件から数える。
+active_alerts_limit: 100
+
 # GPU / driver によっては公開されない metric。collector は毎回 quality=missing で
 # 保存するため、missing だけは signal を下げない（suspect / stale は下げる）。
 # RTX PRO 6000 は NVML で hotspot / memory 温度を返さないことを実機で確認済み。

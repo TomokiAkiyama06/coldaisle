@@ -138,6 +138,11 @@ signal が見る周期メトリクスは**現在の監視対象**に限ります
 古くても signal に影響しません。無効化・撤去した入力の最後の行は DB に残って
 `stale` になり、パネルにはそのまま `stale` と表示されます。
 
+`active_alerts` は新しい順に `config/server-health.yaml` の `active_alerts_limit` 件
+（既定 100）までです。signal の判定は件数上限に関係なく発生中の**全件**で行い、
+一覧から外れたアラートは `compute_mode_advisory.warnings` に severity ごとの件数
+（例: `more active alerts not listed: critical=1`）として残します。
+
 **`GET /api/v1/server-health` と `WS /api/v1/server-health/stream` の payload は同一です。**
 WebSocket 専用の封筒やフィールドは加えません。
 

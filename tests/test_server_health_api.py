@@ -28,7 +28,7 @@ from coldaisle.internal_telemetry import (
     NvmlConfig,
 )
 from coldaisle.metrics import MetricCatalog
-from coldaisle.store import Quality, Reading, Sample, SqliteStore
+from coldaisle.store import AlertSeverity, Quality, Reading, Sample, SqliteStore
 from conftest import CONFIG_DIR, QUALITY_RULES_PATH
 
 NOW_MS = 1_787_616_000_000
@@ -744,6 +744,7 @@ sources:
 panels:
   gpu: [gpu.0.core]
   environment: [air.room]
+active_alerts_limit: 100
 """
 
 
@@ -948,3 +949,32 @@ def test_reported_source_state_truth_table(
 
     assert body["sources"]["nvml"]["status"] == expected_status
     assert body["signal"] == expected_signal
+
+
+def test_old_critical_alert_beyond_the_list_limit_is_still_red(healthy_db, rules):
+    """一覧は新しい 100 件で打ち切るが、重大度の判定は発生中の全件で行う。"""
+    with SqliteStore(healthy_db, rules=rules, clock=SimulatedClock(NOW_MS)) as store:
+        for index in range(101):
+            alert_id = store.open_alert(
+                rule_id="OLD_CRITICAL" if index == 0 else f"WARNING_{index}",
+                severity="critical" if index == 0 else "warning",
+                metric="air.room",
+                # index 0 がいちばん古い
+                started_ms=NOW_MS - 1_000_000 + index,
+                threshold=30.0,
+                trigger_value=31.0,
+            )
+            store.fire_alert(alert_id, fired_ms=NOW_MS, trigger_value=31.0)
+        assert store.alert_severity_counts(state="firing") == {
+            AlertSeverity.CRITICAL: 1,
+            AlertSeverity.WARNING: 100,
+        }
+
+    with TestClient(_app(healthy_db, SimulatedClock(NOW_MS))) as client:
+        body = client.get("/api/v1/server-health").json()
+
+    assert len(body["active_alerts"]) == 100
+    assert "OLD_CRITICAL" not in {alert["rule_id"] for alert in body["active_alerts"]}
+    assert body["signal"] == "red"
+    assert body["compute_mode_advisory"]["safe"] is False
+    assert "more active alerts not listed: critical=1" in body["compute_mode_advisory"]["warnings"]

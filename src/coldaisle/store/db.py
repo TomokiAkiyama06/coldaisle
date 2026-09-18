@@ -21,6 +21,7 @@ from coldaisle.clock import Clock
 from coldaisle.store import migrations
 from coldaisle.store.models import (
     AlertRecord,
+    AlertSeverity,
     ControlTraceRecord,
     DeviceRecord,
     LatestReading,
@@ -629,6 +630,18 @@ class SqliteStore:
             (*params, limit),
         ).fetchall()
         return tuple(AlertRecord.model_validate(dict(row)) for row in rows)
+
+    def alert_severity_counts(self, *, state: str) -> dict[AlertSeverity, int]:
+        """``state`` のアラートを severity ごとに数える（件数上限なし）。
+
+        一覧（``alerts()``）は新しい順に件数で打ち切るため、古い critical を
+        見落とす。重大度の判定は一覧ではなくこちらで行う（#66）。
+        """
+        rows = self._conn.execute(
+            "SELECT severity, COUNT(*) AS n FROM alerts WHERE state = ? GROUP BY severity",
+            (state,),
+        ).fetchall()
+        return {AlertSeverity(row["severity"]): int(row["n"]) for row in rows}
 
     def fired_alerts(
         self, *, start_ms: int, end_ms: int, limit: int = 100

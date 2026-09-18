@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import logging
+from collections import Counter
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any, Literal, Protocol
@@ -77,6 +78,8 @@ class ServerHealthSettings(_SettingsModel):
     panels: HealthPanels
     missing_tolerated: frozenset[str] = frozenset()
     """機種が公開しない metric。``missing`` だけは signal を下げない。"""
+    active_alerts_limit: int = Field(gt=0)
+    """``active_alerts`` に載せる件数の上限。signal の判定は上限に関係なく全件で行う。"""
 
     @classmethod
     def from_yaml(cls, path: Path, *, catalog: MetricCatalog) -> ServerHealthSettings:
@@ -129,13 +132,15 @@ def build_server_health(
 ) -> ServerHealthResponse:
     """DB の同じ current view から REST / WS 共通 payload を作る。"""
     readings = store.latest()
-    alerts = list(store.alerts(state="firing", limit=100))
+    # 一覧は新しい順に打ち切るため、重大度は件数上限の無い集計から判定する
+    alerts = list(store.alerts(state="firing", limit=settings.active_alerts_limit))
+    firing = store.alert_severity_counts(state="firing")
     sources = _monitoring_sources(store, readings, settings, hwmon_metrics)
     # 無効化・撤去した入力の最後の行は store.latest() に残り続け、やがて stale になる。
     # 監視していない metric で signal を下げないよう、必須 metric と現在有効な入力だけを
     # 見る。パネルは表示専用で、入力が無効なら値が古くても signal に影響させない
     monitored = settings.required_metrics() | frozenset((*hwmon_metrics, *nvml_metrics))
-    signal = _signal(sources, readings, alerts, settings.missing_tolerated, sorted(monitored))
+    signal = _signal(sources, readings, firing, settings.missing_tolerated, sorted(monitored))
     gpu = ServerGpuHealth(
         mode=store.current_state("sys.gpu_mode") or "unknown",
         metrics=_metrics(settings.panels.gpu, readings, catalog),
@@ -143,7 +148,7 @@ def build_server_health(
     environment = ServerEnvironmentHealth(
         metrics=_metrics(settings.panels.environment, readings, catalog)
     )
-    advisory = _compute_mode_advisory(signal, sources, alerts)
+    advisory = _compute_mode_advisory(signal, sources, alerts, firing)
 
     summary = None
     if summarizer is not None:
@@ -311,18 +316,18 @@ def _metrics(
 def _signal(
     sources: HealthSources,
     readings: Mapping[str, LatestReading],
-    alerts: list[AlertRecord],
+    firing: Mapping[AlertSeverity, int],
     missing_tolerated: frozenset[str],
     monitored: list[str],
 ) -> ServerSignal:
     monitoring = (sources.sensor_unit, sources.nvml, sources.lm_sensors)
     if any(source.status in _BAD_SOURCE_STATES for source in monitoring):
         return ServerSignal.RED
-    if any(alert.severity is AlertSeverity.CRITICAL for alert in alerts):
+    if firing.get(AlertSeverity.CRITICAL, 0) > 0:
         return ServerSignal.RED
     if any(source.status is HealthSourceStatus.DEGRADED for source in monitoring):
         return ServerSignal.YELLOW
-    if alerts or any(
+    if sum(firing.values()) > 0 or any(
         _degrades_signal(metric, _current_quality(readings, metric), missing_tolerated)
         for metric in monitored
     ):
@@ -352,6 +357,7 @@ def _compute_mode_advisory(
     signal: ServerSignal,
     sources: HealthSources,
     alerts: list[AlertRecord],
+    firing: Mapping[AlertSeverity, int],
 ) -> ComputeModeAdvisory:
     warnings = [
         f"{name} source is {source.status.value}"
@@ -363,6 +369,16 @@ def _compute_mode_advisory(
         if source.status is not HealthSourceStatus.OK
     ]
     warnings.extend(f"active alert: {alert.rule_id} ({alert.severity.value})" for alert in alerts)
+    listed = Counter(alert.severity for alert in alerts)
+    unlisted = {
+        severity: firing.get(severity, 0) - listed.get(severity, 0) for severity in AlertSeverity
+    }
+    if any(count > 0 for count in unlisted.values()):
+        # 一覧から外れた古いアラートも、件数と重大度だけは警告に残す
+        detail = ", ".join(
+            f"{severity.value}={count}" for severity, count in unlisted.items() if count > 0
+        )
+        warnings.append(f"more active alerts not listed: {detail}")
     if signal is not ServerSignal.GREEN and not warnings:
         warnings.append("one or more telemetry values are not quality=ok")
     return ComputeModeAdvisory(
