@@ -77,6 +77,15 @@ def config(
     )
 
 
+def catalog() -> MetricCatalog:
+    return MetricCatalog(
+        metrics={
+            "power.cpu.package": MetricMeta(unit="W", label="cpu power"),
+            "power.cpu.cores": MetricMeta(unit="C", label="wrong unit"),
+        }
+    )
+
+
 def signal(
     metric: str,
     value: float | None,
@@ -150,7 +159,9 @@ def temperature_snapshot(
 
 
 def test_gpu_temperature_rise_raises_front_and_rear_in_the_same_snapshot_tick() -> None:
-    decision = ReactiveGuard(config()).evaluate(temperature_snapshot(tick=7, mono=10_000, rate=2.5))
+    decision = ReactiveGuard(config(), catalog()).evaluate(
+        temperature_snapshot(tick=7, mono=10_000, rate=2.5)
+    )
 
     assert decision.tick_id == 7
     assert decision.monotonic_ms == 10_000
@@ -163,7 +174,7 @@ def test_gpu_temperature_rise_raises_front_and_rear_in_the_same_snapshot_tick() 
 
 
 def test_cpu_temperature_rise_only_raises_the_top_floor() -> None:
-    decision = ReactiveGuard(config()).evaluate(
+    decision = ReactiveGuard(config(), catalog()).evaluate(
         snapshot(
             tick=1,
             mono=2_000,
@@ -185,7 +196,7 @@ def test_cpu_temperature_rise_only_raises_the_top_floor() -> None:
 
 
 def test_cpu_power_step_raises_top_without_waiting_for_a_temperature_limit() -> None:
-    decision = ReactiveGuard(config(cpu_power_metric="power.cpu.package")).evaluate(
+    decision = ReactiveGuard(config(cpu_power_metric="power.cpu.package"), catalog()).evaluate(
         snapshot(
             tick=1,
             mono=2_000,
@@ -207,7 +218,7 @@ def test_cpu_power_step_raises_top_without_waiting_for_a_temperature_limit() -> 
 
 
 def test_unapproved_cpu_power_metric_keeps_the_trigger_disabled() -> None:
-    decision = ReactiveGuard(config()).evaluate(
+    decision = ReactiveGuard(config(), catalog()).evaluate(
         snapshot(
             tick=1,
             mono=2_000,
@@ -240,7 +251,7 @@ def test_absolute_snapshot_triggers_raise_the_gpu_airflow_zones(
     derived: tuple[DerivedSignal, ...],
     evidence_code: str,
 ) -> None:
-    decision = ReactiveGuard(config()).evaluate(
+    decision = ReactiveGuard(config(), catalog()).evaluate(
         snapshot(tick=1, mono=1_000, signals=signals, derived=derived)
     )
 
@@ -259,8 +270,8 @@ def test_power_slope_uses_the_actual_sample_interval_not_the_control_tick_interv
             ),
         )
     )
-    catalog = MetricCatalog(metrics={"power.gpu.0": MetricMeta(unit="W", label="GPU power")})
-    estimator = ControlStateEstimator(contract, catalog)
+    power_catalog = MetricCatalog(metrics={"power.gpu.0": MetricMeta(unit="W", label="GPU power")})
+    estimator = ControlStateEstimator(contract, power_catalog)
     previous = estimator.build(
         ControlInputFrame(
             tick_id=1,
@@ -296,13 +307,13 @@ def test_power_slope_uses_the_actual_sample_interval_not_the_control_tick_interv
     )
 
     assert current.trends[0].per_second == pytest.approx(20.0)
-    decision = ReactiveGuard(config()).evaluate(current)
+    decision = ReactiveGuard(config(), catalog()).evaluate(current)
     assert decision.zones.front.floor == pytest.approx(0.6)
     assert next(item for item in decision.evidence if item.code == "gpu_power_rise").value == 20
 
 
 def test_hysteresis_and_hold_prevent_hunting_and_record_release_reason() -> None:
-    guard = ReactiveGuard(config(hold_ms=5_000))
+    guard = ReactiveGuard(config(hold_ms=5_000), catalog())
 
     started = guard.evaluate(temperature_snapshot(tick=1, mono=1_000, rate=3.0))
     hysteresis = guard.evaluate(temperature_snapshot(tick=2, mono=2_000, rate=1.5))
@@ -324,7 +335,7 @@ def test_hysteresis_and_hold_prevent_hunting_and_record_release_reason() -> None
 
 
 def test_overlapping_triggers_keep_all_origins_and_release_causes() -> None:
-    guard = ReactiveGuard(config(hold_ms=1_000))
+    guard = ReactiveGuard(config(hold_ms=1_000), catalog())
     first = guard.evaluate(temperature_snapshot(tick=1, mono=1_000, rate=3.0))
     overlap = guard.evaluate(
         snapshot(
@@ -394,7 +405,7 @@ def test_overlapping_triggers_keep_all_origins_and_release_causes() -> None:
 
 
 def test_fresh_signal_without_a_new_sample_keeps_the_latch_until_the_next_trend() -> None:
-    guard = ReactiveGuard(config(hold_ms=1_000))
+    guard = ReactiveGuard(config(hold_ms=1_000), catalog())
     started = guard.evaluate(temperature_snapshot(tick=1, mono=1_000, rate=3.0))
     no_new_sample = guard.evaluate(temperature_snapshot(tick=2, mono=1_500, rate=None))
 
@@ -406,7 +417,7 @@ def test_fresh_signal_without_a_new_sample_keeps_the_latch_until_the_next_trend(
 
 
 def test_missing_or_stale_input_is_not_treated_as_a_number_and_releases_after_hold() -> None:
-    guard = ReactiveGuard(config(hold_ms=1_000))
+    guard = ReactiveGuard(config(hold_ms=1_000), catalog())
     guard.evaluate(temperature_snapshot(tick=1, mono=1_000, rate=3.0))
 
     holding = guard.evaluate(
@@ -437,8 +448,10 @@ def test_missing_or_stale_input_is_not_treated_as_a_number_and_releases_after_ho
 
 
 def test_degraded_snapshot_uses_the_configured_conservative_threshold_set() -> None:
-    normal = ReactiveGuard(config()).evaluate(temperature_snapshot(tick=1, mono=1_000, rate=1.6))
-    conservative = ReactiveGuard(config()).evaluate(
+    normal = ReactiveGuard(config(), catalog()).evaluate(
+        temperature_snapshot(tick=1, mono=1_000, rate=1.6)
+    )
+    conservative = ReactiveGuard(config(), catalog()).evaluate(
         temperature_snapshot(
             tick=1,
             mono=1_000,
@@ -457,10 +470,10 @@ def test_degraded_snapshot_uses_the_configured_conservative_threshold_set() -> N
 
 
 def test_activation_requires_strictly_exceeding_the_configured_threshold() -> None:
-    at_threshold = ReactiveGuard(config()).evaluate(
+    at_threshold = ReactiveGuard(config(), catalog()).evaluate(
         temperature_snapshot(tick=1, mono=1_000, rate=2.0)
     )
-    above_threshold = ReactiveGuard(config()).evaluate(
+    above_threshold = ReactiveGuard(config(), catalog()).evaluate(
         temperature_snapshot(tick=1, mono=1_000, rate=2.001)
     )
 
@@ -469,7 +482,7 @@ def test_activation_requires_strictly_exceeding_the_configured_threshold() -> No
 
 
 def test_hold_uses_monotonic_time_and_same_snapshot_evaluation_is_idempotent() -> None:
-    guard = ReactiveGuard(config(hold_ms=1_000))
+    guard = ReactiveGuard(config(hold_ms=1_000), catalog())
     first_snapshot = temperature_snapshot(
         tick=1,
         mono=1_000,
@@ -489,7 +502,9 @@ def test_hold_uses_monotonic_time_and_same_snapshot_evaluation_is_idempotent() -
 def test_guard_output_preserves_the_critical_safety_priority_protocol() -> None:
     """#78 の compose 境界: safety floor と forced Max は Guard より強い。"""
     guard_output: PerZone[GuardZoneOutput] = (
-        ReactiveGuard(config()).evaluate(temperature_snapshot(tick=1, mono=1_000, rate=3.0)).zones
+        ReactiveGuard(config(), catalog())
+        .evaluate(temperature_snapshot(tick=1, mono=1_000, rate=3.0))
+        .zones
     )
     front = guard_output.front
     assert front.floor == pytest.approx(0.6)
@@ -548,10 +563,21 @@ def test_schema_rejects_any_effective_demand_that_bypasses_guard_or_safety(
 
 
 def test_out_of_order_snapshot_cannot_rewind_hold_state() -> None:
-    guard = ReactiveGuard(config())
+    guard = ReactiveGuard(config(), catalog())
     guard.evaluate(temperature_snapshot(tick=2, mono=2_000, rate=3.0))
 
     with pytest.raises(ValueError, match="tick_id"):
         guard.evaluate(temperature_snapshot(tick=1, mono=3_000, rate=3.0))
     with pytest.raises(ValueError, match="単調時計"):
         guard.evaluate(temperature_snapshot(tick=3, mono=2_000, rate=3.0))
+
+
+@pytest.mark.parametrize("metric", ["power.cpu.cores", "power.cpu.unknown"])
+def test_cpu_power_metric_must_be_a_known_watt_metric_in_the_catalog(metric: str) -> None:
+    with pytest.raises(ValueError, match="電力"):
+        ReactiveGuard(config(cpu_power_metric=metric), catalog())
+
+
+def test_cpu_power_metric_outside_the_power_domain_is_rejected_by_config() -> None:
+    with pytest.raises(ValidationError, match="power ドメイン"):
+        config(cpu_power_metric="gpu.0.core")

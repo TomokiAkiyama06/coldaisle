@@ -16,6 +16,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from coldaisle.control.config import GuardThresholdBand, ReactiveGuardConfig
 from coldaisle.control.schema import GuardZoneOutput, PerZone, Reason, Zone
 from coldaisle.control.state import ControlStateSnapshot, TelemetryHealth
+from coldaisle.metrics import MetricCatalog
 
 FiniteFloat = Annotated[float, Field(allow_inf_nan=False)]
 
@@ -99,6 +100,9 @@ class _ZoneRuntime:
     release_causes: tuple[str, ...] = ()
 
 
+_POWER_UNIT = "W"
+"""Metric Catalog 上の電力の単位。Fallback Controller の Power 入力検証と同じ。"""
+
 _STATIC_TRIGGERS: tuple[_TriggerSpec, ...] = (
     _TriggerSpec(
         code="cpu_temperature_rise",
@@ -141,10 +145,21 @@ _STATIC_TRIGGERS: tuple[_TriggerSpec, ...] = (
 class ReactiveGuard:
     """急な熱負荷へ floor を上げ、hysteresis と単調時計 hold で遅く解除する。"""
 
-    def __init__(self, config: ReactiveGuardConfig) -> None:
+    def __init__(self, config: ReactiveGuardConfig, catalog: MetricCatalog) -> None:
+        """Metric Catalog で設定由来の trigger metric の単位を検証してから組み立てる。
+
+        W/s の閾値に温度など別単位の trend を比べると、Guard が誤って発火・解除する。
+        Fallback Controller と同じく、名前が正しくても単位が違う設定は起動前に拒否する。
+        """
         self._config = config
         triggers = list(_STATIC_TRIGGERS)
         if config.cpu_power_metric is not None:
+            unit = catalog.unit_for(config.cpu_power_metric.value)
+            if unit != _POWER_UNIT:
+                raise ValueError(
+                    "CPU Power trigger の metric は既知の電力(W)にする: "
+                    f"metric={config.cpu_power_metric.value}, unit={unit}"
+                )
             triggers.append(
                 _TriggerSpec(
                     code="cpu_power_rise",

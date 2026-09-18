@@ -27,6 +27,8 @@ Reactive Guard の `floor` / `hold_ms` と、温度・Power・吸気温度差の
 CPU Power trigger の metric 名は提案中の DR0032 に依存するため、
 `cpu_power_metric` は未承認時は `null` にして trigger を無効にする。
 DR0032 の確定後も、`confirmed` と承認根拠 `basis` が無ければ設定検証で拒否する。
+`power` ドメイン（決定記録 0002 §2.1）以外の metric も拒否し、Reactive Guard の生成時に
+Metric Catalog 上の単位が `W` であることを検証する。
 `authority_limits` には LIMITED / EXPANDED ごとの許可zone、Fallbackからの `limit_up` /
 `limit_down` を必須とし、後続のGate実装が設定外の定数に依存しないようにする。
 

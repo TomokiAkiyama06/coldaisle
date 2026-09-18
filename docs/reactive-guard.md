@@ -54,3 +54,6 @@ CPU package power は #65 / 決定記録 0032（Proposed）が metric 名
 有効化には metric 名と `status: confirmed` / `basis` を検証済み
 `ReactiveGuardConfig` から注入する。Replay / Mock の CPU Power 試験でも明示的な
 承認済み設定を使い、コード内の既定 metric には依存しない。
+閾値は W/s なので、`cpu_power_metric` は設定検証で `power` ドメイン（決定記録 0002 §2.1）に
+限り、`ReactiveGuard` の生成時には Metric Catalog 上の単位が `W` であることも確かめる。
+温度など別単位の metric を指定した設定は起動前に拒否する。

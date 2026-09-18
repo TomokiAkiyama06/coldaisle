@@ -262,6 +262,15 @@ def test_cpu_power_guard_metric_requires_confirmed_approval(tmp_path: Path) -> N
         ControlConfig.from_directory(tmp_path)
 
     documents["fan-policy.yaml"]["reactive_guard"]["cpu_power_metric"] = {
+        "value": "gpu.0.core",
+        "status": "confirmed",
+        "basis": "approved metric contract",
+    }
+    write_documents(tmp_path, documents)
+    with pytest.raises(ValidationError, match="power ドメイン"):
+        ControlConfig.from_directory(tmp_path)
+
+    documents["fan-policy.yaml"]["reactive_guard"]["cpu_power_metric"] = {
         "value": "power.cpu.package",
         "status": "confirmed",
         "basis": "DR0032 FINAL and owner approval",

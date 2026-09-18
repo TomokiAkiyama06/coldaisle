@@ -330,6 +330,10 @@ class GateConfidenceThresholds(_ConfigModel):
         return self
 
 
+_POWER_DOMAIN = "power"
+"""消費電力の metric domain（決定記録 0002 §2.1）。命名規約であり調整値ではない。"""
+
+
 class GuardThresholdBand(_ConfigModel):
     """1つの Guard trigger の発火・解除閾値。
 
@@ -372,7 +376,14 @@ class ReactiveGuardConfig(_ConfigModel):
     def _cpu_power_metric_requires_approval(self) -> Self:
         if self.cpu_power_metric is None:
             return self
-        validate_metric(self.cpu_power_metric.value)
+        metric = validate_metric(self.cpu_power_metric.value)
+        # 閾値は W/s なので、温度など別ドメインの metric を黙って比較させない。
+        # 単位の最終確認は Metric Catalog を持つ ReactiveGuard の生成時に行う。
+        if metric.split(".", 1)[0] != _POWER_DOMAIN:
+            raise ValueError(
+                "CPU Power trigger の metric は power ドメイン（決定記録 0002 §2.1）にする: "
+                f"{metric}"
+            )
         if self.cpu_power_metric.status != "confirmed":
             raise ValueError("CPU Power trigger の metric は confirmed 承認を必須にする")
         return self
