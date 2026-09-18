@@ -1,6 +1,6 @@
 """実機へ書き込まない Fan Hardware Backend。#77
 
-ここで扱う入力は Critical Safety が合成した ``EffectiveZoneDemand`` だけである。
+ここで扱う入力は Critical Safety が合成した ``ComposedDemands`` だけである。
 PWM の raw 値はこのモジュール内でしか作らず、simulated backend は sysfs、
 subprocess、ネットワークを一切使わない。実機 backend は #57 の OS 権限・
 handoff 条件と #75 の測定結果が揃ってから、この Protocol を実装する。
@@ -13,6 +13,11 @@ from itertools import pairwise
 from typing import Protocol
 
 from coldaisle.control.config import FanHardwareConfig, FanProfile
+from coldaisle.control.safety.critical import (
+    _RUNTIME_BINDING_AUTHORITY,
+    ComposedDemands,
+    ControlRuntimeBinding,
+)
 from coldaisle.control.schema import (
     HWMON_PWM_MAX,
     EffectiveZoneDemand,
@@ -41,7 +46,7 @@ class FanHardwareResult:
 class FanHardwareBackend(Protocol):
     """実機・simulated backend が共有する、唯一の書込み境界。"""
 
-    def apply(self, demands: PerZone[EffectiveZoneDemand]) -> PerZone[FanHardwareResult]:
+    def apply(self, demands: ComposedDemands) -> PerZone[FanHardwareResult]:
         """effective demand を3 zone 独立に反映し、readback と fault を返す。"""
 
 
@@ -68,20 +73,76 @@ class SimulatedFanBackend:
     """
 
     config: FanHardwareConfig
+    runtime_binding: ControlRuntimeBinding
     fault_plan: SimulatedFaultPlan = field(default_factory=SimulatedFaultPlan)
     _running: set[Zone] = field(default_factory=set, init=False, repr=False)
+    _last_tick_id: int | None = field(default=None, init=False, repr=False)
+    _takeover_max_written: set[Zone] = field(default_factory=set, init=False, repr=False)
+    _takeover_acknowledged: bool = field(default=False, init=False, repr=False)
+    _last_monotonic_ms: int | None = field(default=None, init=False, repr=False)
+    _runtime_config_payload: str = field(init=False, repr=False)
+    _runtime_lineage: object = field(init=False, repr=False)
 
-    def apply(self, demands: PerZone[EffectiveZoneDemand]) -> PerZone[FanHardwareResult]:
-        """3 zone の effective demand を個別に map する。実機 I/O は行わない。"""
-        return PerZone(
-            front=self._apply_zone(Zone.FRONT, demands.front),
-            rear=self._apply_zone(Zone.REAR, demands.rear),
-            top=self._apply_zone(Zone.TOP, demands.top),
+    def __post_init__(self) -> None:
+        self._runtime_config_payload, self._runtime_lineage = self.runtime_binding._claim_backend(
+            self.config.model_dump_json(),
+            authority=_RUNTIME_BINDING_AUTHORITY,
         )
 
-    def _apply_zone(self, zone: Zone, demand: EffectiveZoneDemand) -> FanHardwareResult:
+    def apply(self, demands: ComposedDemands) -> PerZone[FanHardwareResult]:
+        """3 zone の effective demand を個別に map する。実機 I/O は行わない。"""
+        zones, tick_id, monotonic_ms, runtime_payload, runtime_lineage = demands._hardware_binding()
+        if (
+            runtime_payload != self._runtime_config_payload
+            or runtime_lineage is not self._runtime_lineage
+        ):
+            raise ValueError("active control runtime が発行していない command は適用できない")
+        # 0028 §2.7: takeover 後は STARTUP（設定不正時は EMERGENCY）の全 zone Max を書く。
+        # 全 zone の Max の書き込みを確認するまでは、それ以外の command を consume する前に
+        # 拒否する。STARTUP を捨てて NORMAL を渡すと startup kick だけで制御を取るため。
+        if not self._takeover_acknowledged and not all(zones.get(zone).forced_max for zone in Zone):
+            raise ValueError(
+                "Fan Hardware Backend は takeover を確認するまで全 zone forced Max"
+                "（STARTUP / EMERGENCY）の command だけを受理する"
+            )
+        if self._last_tick_id is not None and tick_id <= self._last_tick_id:
+            raise ValueError("Fan Hardware Backend に古い tick の command を適用できない")
+        if self._last_monotonic_ms is not None and monotonic_ms <= self._last_monotonic_ms:
+            raise ValueError("Fan Hardware Backend の command 時刻は前進させる")
+        demands._consume_for_hardware()
+        self._last_tick_id = tick_id
+        self._last_monotonic_ms = monotonic_ms
+        results = PerZone(
+            front=self._apply_zone(Zone.FRONT, zones.front.effective),
+            rear=self._apply_zone(Zone.REAR, zones.rear.effective),
+            top=self._apply_zone(Zone.TOP, zones.top.effective),
+        )
+        if not self._takeover_acknowledged:
+            self._record_takeover_max(zones, results)
+        return results
+
+    def _record_takeover_max(
+        self,
+        zones: PerZone[EffectiveZoneDemand],
+        results: PerZone[FanHardwareResult],
+    ) -> None:
+        # Safety はこの確認の後から STARTUP の settle と tach 応答を数える。write や
+        # readback に失敗した zone は Max が効いている保証が無いため確認に数えず、
+        # 失敗した zone は確認済みから外す。失敗は fault として Safety へ渡り、Top は
+        # 即 EMERGENCY、Front / Rear は連続回数で EMERGENCY へ昇格する（0028 §2.7）。
+        for zone in Zone:
+            readback = results.get(zone).readback
+            if zones.get(zone).forced_max and readback.write_ok and readback.readback_ok:
+                self._takeover_max_written.add(zone)
+            else:
+                self._takeover_max_written.discard(zone)
+        if self._takeover_max_written == set(Zone):
+            self._takeover_acknowledged = True
+            self.runtime_binding._acknowledge_takeover(authority=_RUNTIME_BINDING_AUTHORITY)
+
+    def _apply_zone(self, zone: Zone, demand: float) -> FanHardwareResult:
         profile = self.config.zones.get(zone).profile
-        mapped_demand = self._safe_demand(zone, demand.effective, profile)
+        mapped_demand = self._safe_demand(zone, demand, profile)
         target_rpm = _interpolate_rpm(profile, mapped_demand)
         airflow_index = _interpolate_airflow_index(profile, mapped_demand)
         pwm_raw = _demand_to_raw_pwm(mapped_demand)
