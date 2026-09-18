@@ -524,3 +524,21 @@ def test_history_applies_the_newest_response_for_the_selected_range():
     assert history.count("historyAppliedSeq = seq;") == 2
     assert "withTimeout(HISTORY_TIMEOUT_MS" in history
     assert "window: range.window" in history, "要求も開始時の期間で出す"
+
+
+def test_sibling_requests_are_aborted_once_the_group_settles():
+    """1件が先に失敗しても、**残りの要求を走らせ続けない。**
+
+    `Promise.all` は最初の失敗で決着するが、ほかの fetch は止まらない。
+    決着したら必ず abort する。ただし**元の失敗の文言は変えない**
+    （「N秒以内に応答がありません」と言い換えるのは、上限に達したときだけ）。
+    """
+    script = SCRIPT.read_text(encoding="utf-8")
+    helper = _body(script, "async function withTimeout(")
+    cleanup = helper[helper.index("finally") :]
+    assert "controller.abort()" in cleanup, "決着後に中断していない"
+    assert "clearTimeout(timer)" in cleanup
+    failure = helper[helper.index("catch (error)") : helper.index("finally")]
+    assert "if (timedOut)" in failure, "決着後の abort を打ち切りと取り違えない"
+    assert "controller.signal.aborted" not in failure
+    assert "throw error;" in failure, "元の失敗をそのまま投げ直す"

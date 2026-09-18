@@ -374,17 +374,29 @@ let refreshInFlight = false;
 // WebSocket で最新値を受け取った回数。定期更新の最新値がこれより古ければ使わない
 let streamVersion = 0;
 
-/** 打ち切り付きの要求。`run(signal)` を呼び、上限を過ぎたら中断する。 */
+/**
+ * 打ち切り付きの要求。`run(signal)` を呼び、上限を過ぎたら中断する。
+ *
+ * **終わったら必ず中断する。** `Promise.all` の1件が先に失敗すると、残りの要求は
+ * 走り続ける（結果は誰も使わない）。成功・失敗どちらでも、決着したあとに abort する。
+ * 決着後の abort は無害で、**元の失敗の文言は変えない**（打ち切りと言い換えるのは、
+ * 上限に達して中断したときだけ）。
+ */
 async function withTimeout(timeoutMs, run) {
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  let timedOut = false;
+  const timer = setTimeout(() => {
+    timedOut = true;
+    controller.abort();
+  }, timeoutMs);
   try {
     return await run(controller.signal);
   } catch (error) {
-    if (controller.signal.aborted) throw new Error(`${Math.round(timeoutMs / 1000)}秒以内に応答がありません`);
+    if (timedOut) throw new Error(`${Math.round(timeoutMs / 1000)}秒以内に応答がありません`);
     throw error;
   } finally {
     clearTimeout(timer);
+    controller.abort(); // 残っている兄弟の要求を止める
   }
 }
 
