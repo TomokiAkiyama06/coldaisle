@@ -536,6 +536,17 @@ class CriticalSafety:
             self._started_ms = now_ms
 
         self._observe_startup_tach(snapshot)
+        # tach stall は 0028 §2.7 / 0034 §2 で「stall_window_ms の間」続いたときだけの
+        # fault と定義されている。Backend の TACH_STALL は1回の帰還にすぎないため直接
+        # latch せず、その zone の tach が有効な応答を返していない証拠として同じ timer に渡す。
+        backend_stall_zones = frozenset(
+            fault.zone
+            for fault in external_faults
+            if fault.code is FaultCode.TACH_STALL and fault.zone is not None
+        )
+        external_faults = tuple(
+            fault for fault in external_faults if fault.code is not FaultCode.TACH_STALL
+        )
         self._update_write_failure_counts(external_faults)
         self._overrun_count = self._overrun_count + 1 if tick_overrun else 0
 
@@ -546,7 +557,8 @@ class CriticalSafety:
             observed.append((temperature_fault, True))
         observed.extend(self._classify_external_fault(fault) for fault in external_faults)
         observed.extend(
-            (fault, self._fault_is_emergency(fault)) for fault in self._stall_faults(snapshot)
+            (fault, self._fault_is_emergency(fault))
+            for fault in self._stall_faults(snapshot, backend_stall_zones)
         )
 
         if self._overrun_count >= self._config.overrun_consecutive_limit.value:
@@ -710,7 +722,9 @@ class CriticalSafety:
             if rpm is not None and rpm >= self._config.stall_min_rpm.get(zone).value:
                 self._startup_tach_seen.add(zone)
 
-    def _stall_faults(self, snapshot: ControlStateSnapshot) -> tuple[Fault, ...]:
+    def _stall_faults(
+        self, snapshot: ControlStateSnapshot, backend_stall_zones: frozenset[Zone]
+    ) -> tuple[Fault, ...]:
         faults: list[Fault] = []
         for zone in Zone:
             fan = None if snapshot.fans is None else snapshot.fans.get(zone)
@@ -722,9 +736,15 @@ class CriticalSafety:
                 else self._last_effective_demand.get(zone, 1.0)
             )
             rpm = None if fan is None else fan.rpm
-            if demand < self._config.stall_check_min_demand.get(zone).value or (
-                rpm is not None and rpm >= self._config.stall_min_rpm.get(zone).value
-            ):
+            backend_stall = zone in backend_stall_zones
+            # Backend が stall を報告した tick は、readback の RPM が閾値以上でも
+            # 有効な応答とみなさない（楽観側で timer を reset しない）。
+            tach_ok = (
+                not backend_stall
+                and rpm is not None
+                and rpm >= self._config.stall_min_rpm.get(zone).value
+            )
+            if demand < self._config.stall_check_min_demand.get(zone).value or tach_ok:
                 self._stall_started_ms.pop(zone, None)
                 continue
             started_ms = self._stall_started_ms.setdefault(zone, snapshot.monotonic_ms)
@@ -738,6 +758,7 @@ class CriticalSafety:
                             + ("unavailable" if rpm is None else str(rpm))
                             + f", demand={demand:g}, "
                             + ("fan_readback=unavailable, " if fan is None else "")
+                            + ("backend_tach_stall=true, " if backend_stall else "")
                             + f"window_ms={self._config.stall_window_ms.value}"
                         ),
                     )

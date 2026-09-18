@@ -685,6 +685,88 @@ def test_unavailable_rpm_uses_the_stall_window_and_safe_response(
     assert faulted.zones.get(zone).forced_max
 
 
+@pytest.mark.parametrize(
+    ("zone", "expected_state"),
+    [(Zone.FRONT, SafetyState.DEGRADED), (Zone.TOP, SafetyState.EMERGENCY)],
+)
+def test_backend_tach_stall_fault_waits_for_the_stall_window(
+    zone: Zone, expected_state: SafetyState
+) -> None:
+    # 0028 §2.7 / 0034 §2: stall は window の間続いたときだけ fault。Backend の
+    # TACH_STALL 1回で即 DEGRADED / EMERGENCY にしない。
+    safety = critical_safety(safety_config(fault_demand=0.9))
+    settle(safety)
+    backend_fault = (Fault(code=FaultCode.TACH_STALL, zone=zone),)
+    rpm_zero = fans(
+        front_rpm=0 if zone is Zone.FRONT else 1_000,
+        top_rpm=0 if zone is Zone.TOP else 1_000,
+    )
+
+    first = safety.evaluate(
+        snapshot(tick=3, mono=2_000, fan_state=rpm_zero),
+        mode=OperatingMode.AUTO,
+        external_faults=backend_fault,
+    )
+    before_window = safety.evaluate(
+        snapshot(tick=4, mono=3_999, fan_state=rpm_zero),
+        mode=OperatingMode.AUTO,
+        external_faults=backend_fault,
+    )
+    faulted = safety.evaluate(
+        snapshot(tick=5, mono=4_000, fan_state=rpm_zero),
+        mode=OperatingMode.AUTO,
+        external_faults=backend_fault,
+    )
+
+    assert first.state is SafetyState.NORMAL
+    assert not first.faults
+    assert before_window.state is SafetyState.NORMAL
+    assert not before_window.faults
+    assert faulted.state is expected_state
+    assert [fault.code for fault in faulted.faults] == [FaultCode.TACH_STALL]
+    assert "backend_tach_stall=true" in faulted.faults[0].detail
+    assert faulted.zones.get(zone).forced_max
+
+
+def test_backend_tach_stall_keeps_the_timer_even_if_readback_rpm_looks_normal() -> None:
+    # Backend が stall を報告した tick は readback RPM を楽観的に信じて timer を消さない。
+    safety = critical_safety(safety_config())
+    settle(safety)
+    backend_fault = (Fault(code=FaultCode.TACH_STALL, zone=Zone.FRONT),)
+
+    safety.evaluate(
+        snapshot(tick=3, mono=2_000, fan_state=fans(front_rpm=0)),
+        mode=OperatingMode.AUTO,
+    )
+    safety.evaluate(
+        snapshot(tick=4, mono=3_000, fan_state=fans(front_rpm=1_000)),
+        mode=OperatingMode.AUTO,
+        external_faults=backend_fault,
+    )
+    faulted = safety.evaluate(
+        snapshot(tick=5, mono=4_000, fan_state=fans(front_rpm=0)),
+        mode=OperatingMode.AUTO,
+    )
+
+    assert faulted.state is SafetyState.DEGRADED
+    assert faulted.faults[0].code is FaultCode.TACH_STALL
+
+
+def test_backend_tach_stall_below_check_demand_is_not_a_fault() -> None:
+    safety = critical_safety(safety_config())
+    settle(safety)
+    backend_fault = (Fault(code=FaultCode.TACH_STALL, zone=Zone.FRONT),)
+
+    for tick, mono in ((3, 2_000), (4, 5_000)):
+        decision = safety.evaluate(
+            snapshot(tick=tick, mono=mono, fan_state=fans(front_rpm=0, front_demand=0.3)),
+            mode=OperatingMode.AUTO,
+            external_faults=backend_fault,
+        )
+    assert decision.state is SafetyState.NORMAL
+    assert not decision.faults
+
+
 def test_low_and_unavailable_rpm_share_one_continuous_stall_timer() -> None:
     safety = critical_safety(safety_config())
     settle(safety)

@@ -54,6 +54,11 @@ Collector / State Estimator と同時に contract を更新してから有効に
 進める。Fan readback 全体が無い場合も最後の effective demand（最初の readback 前は
 STARTUP Max command）を使って timer を継続する。`stall_window_ms` 後は tach stall と
 同じ安全応答にする。
+Hardware Backend が `external_faults` で報告する `TACH_STALL` も直接 latch しない。
+0028 §2.7 / 0034 §2 の stall は「window の間続いた」ことを含む定義のため、
+その tick の zone の tach が有効な応答を返していない証拠として同じ timer に渡す
+（readback の RPM が閾値以上でも timer を reset しない）。`stall_check_min_demand`
+未満では数えず、window 経過後に通常の tach stall と同じ応答にする。
 
 ## 合成と復帰
 
