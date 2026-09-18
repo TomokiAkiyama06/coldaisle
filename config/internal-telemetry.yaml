@@ -30,3 +30,96 @@ hwmon:
       maximum: null
       confirmation: null
       disabled_reason: "not installed; enable only after #50 measurement and owner approval"
+
+    # --- 2026-09-18 所有者確認済みの対応（ASUS ProArt X870E-CREATOR WIFI）---
+    # nct6799 のファン入力には label が無いため、driver 内の channel で指定する。
+    # fan2=Top(ラジエータ) / fan4=Water Block VRM Fan / fan5=Rear / fan6=Front / fan7=AIO Pump
+    - metric: fan.top.rpm
+      enabled: true
+      driver: nct6799
+      channel: fan2
+      measurement: rpm
+      confirmation:
+        status: confirmed
+        basis: "2026-09-12頃に実機でnct6799のfanN/pwmNと物理ファン位置を突き合わせ（所有者の記録 pro6000_fan_pwm_mapping_v14）。2026-09-18に所有者が対応を確認"
+    - metric: fan.top.pwm
+      enabled: true
+      driver: nct6799
+      channel: fan2
+      measurement: pwm
+      confirmation:
+        status: confirmed
+        basis: "2026-09-12頃に実機でnct6799のfanN/pwmNと物理ファン位置を突き合わせ（所有者の記録 pro6000_fan_pwm_mapping_v14）。2026-09-18に所有者が対応を確認"
+    - metric: fan.rear.rpm
+      enabled: true
+      driver: nct6799
+      channel: fan5
+      measurement: rpm
+      confirmation:
+        status: confirmed
+        basis: "2026-09-12頃に実機でnct6799のfanN/pwmNと物理ファン位置を突き合わせ（所有者の記録 pro6000_fan_pwm_mapping_v14）。2026-09-18に所有者が対応を確認"
+    - metric: fan.rear.pwm
+      enabled: true
+      driver: nct6799
+      channel: fan5
+      measurement: pwm
+      confirmation:
+        status: confirmed
+        basis: "2026-09-12頃に実機でnct6799のfanN/pwmNと物理ファン位置を突き合わせ（所有者の記録 pro6000_fan_pwm_mapping_v14）。2026-09-18に所有者が対応を確認"
+    - metric: fan.front.rpm
+      enabled: true
+      driver: nct6799
+      channel: fan6
+      measurement: rpm
+      confirmation:
+        status: confirmed
+        basis: "2026-09-12頃に実機でnct6799のfanN/pwmNと物理ファン位置を突き合わせ（所有者の記録 pro6000_fan_pwm_mapping_v14）。2026-09-18に所有者が対応を確認"
+    - metric: fan.front.pwm
+      enabled: true
+      driver: nct6799
+      channel: fan6
+      measurement: pwm
+      confirmation:
+        status: confirmed
+        basis: "2026-09-12頃に実機でnct6799のfanN/pwmNと物理ファン位置を突き合わせ（所有者の記録 pro6000_fan_pwm_mapping_v14）。2026-09-18に所有者が対応を確認"
+    - metric: fan.vrm.rpm
+      enabled: true
+      driver: nct6799
+      channel: fan4
+      measurement: rpm
+      confirmation:
+        status: confirmed
+        basis: "2026-09-12頃に実機でnct6799のfanN/pwmNと物理ファン位置を突き合わせ（所有者の記録 pro6000_fan_pwm_mapping_v14）。2026-09-18に所有者が対応を確認"
+    - metric: fan.aio_pump.rpm
+      enabled: true
+      driver: nct6799
+      channel: fan7
+      measurement: rpm
+      confirmation:
+        status: confirmed
+        basis: "2026-09-12頃に実機でnct6799のfanN/pwmNと物理ファン位置を突き合わせ（所有者の記録 pro6000_fan_pwm_mapping_v14）。2026-09-18に所有者が対応を確認"
+    # 温度の候補（label は再起動で変わらない）。所有者の確認待ちのため無効。
+    - metric: cpu.package
+      enabled: false
+      driver: asusec
+      label: "CPU Package"
+      measurement: temperature
+      confirmation:
+        status: provisional
+      disabled_reason: "2026-09-18 に実機の hwmon label を読み取って候補にした。所有者の確認後に enabled と confirmed にする"
+    - metric: cpu.vrm
+      enabled: false
+      driver: asusec
+      label: VRM
+      measurement: temperature
+      confirmation:
+        status: provisional
+      disabled_reason: "2026-09-18 に実機の hwmon label を読み取って候補にした。所有者の確認後に enabled と confirmed にする"
+    - metric: board.chipset
+      enabled: false
+      driver: nct6799
+      label: PCH_CHIP_TEMP
+      measurement: temperature
+      confirmation:
+        status: provisional
+      disabled_reason: "2026-09-18 に実機の hwmon label を読み取って候補にした。所有者の確認後に enabled と confirmed にする"
