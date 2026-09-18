@@ -16,7 +16,7 @@ GPUサーバーの温湿度・内部Telemetry監視 + 3系統Fan制御 + ロー�
 uvx pre-commit install               # 秘匿情報チェックの導入（clone 後1回だけ）
 uv sync                              # 依存解決
 uv run pytest                        # テスト
-uv run pytest -k "not hardware"      # 実機不要のテストのみ（CIと同じ）
+uv run pytest -m "not hardware"      # 実機不要のテストのみ（CIと同じ）
 uv run ruff check . && uv run ruff format --check .
 uv run mypy src
 export UV_ENV_FILE=.env              # .env を読ませる（自動では読まれない）
@@ -62,7 +62,7 @@ API の設定は環境変数（`COLDAISLE_DB` / `COLDAISLE_METRICS` / `COLDAISLE
 6. **シリアルポートを開くのは ingest daemon だけ。** API層・UI層・AI層・control層から
    `serial.Serial(...)` を呼ぶコードを書かない。
 7. **実機がなくてもテストが通ること。** 実機必須のテストには `@pytest.mark.hardware` を付ける。
-   CIは `-k "not hardware"` で走る。Control系も Mock / Replay / simulated backend で検証できること。
+   CIは `-m "not hardware"` で走る。Control系も Mock / Replay / simulated backend で検証できること。
 8. **生の時系列をLLMのプロンプトに直接入れない。** 必ず集計してから渡す（FR-504）。
    ただし制御用MLモデルは時系列Windowを直接扱ってよい。LLMと制御MLを混同しない。
 9. 閾値・ピン番号・保持期間・Safety floor・Ramp・目的関数重みなどの定数をコードにハードコードしない。
