@@ -105,8 +105,8 @@ GPU機どころか ESP32 すら接続せずに #8〜#25 のすべてが開発・
 |---|---|---|---|
 | #61 | ADR: Supervisor + Learned MPC + Reactive Guard + Critical Safety の責務境界 | M8 | 完了（決定記録 0027 / 0028） |
 | #76 | Front / Rear / Top Demand schema と制御reason schema | M8 | 完了（PR #101） |
-| #65 | NVML / lm-sensors / hwmon 内部Telemetry統合（Control/ML入力対応） | M7 | 実装中（PR #128 レビュー中・main と競合。Fan header 対応は 2026-09-18 に所有者が実機確認済み（PR #128 で追加する `docs/fan-header-mapping.md`。PR は未マージ）。CPU / VRM / T_SENSOR 等の実機確認残） |
-| #66 | Server Health API（Workspace連携の単一窓口） | M7 | 実装中（PR 未作成、#65 stack） |
+| #65 | NVML / lm-sensors / hwmon 内部Telemetry統合（Control/ML入力対応） | M7 | software マージ済み（PR #128、Issue はクローズ）。Fan header 対応は 2026-09-18 に所有者が実機確認済み（[`docs/fan-header-mapping.md`](docs/fan-header-mapping.md)）。CPU / VRM / T_SENSOR 等の実機確認残 |
+| #66 | Server Health API（Workspace連携の単一窓口） | M7 | 実装中（PR 未作成。#65 はマージ済み） |
 | #102 | Runtime State Estimator: synchronized control snapshot / trend / thermal margin | M8 | 完了（PR #118） |
 | #103 | Control Config schema / validation / versioning / safe reload | M8 | 完了（PR #115） |
 | #77 | Fan Hardware Backend: Demand→PWM/RPM/Flow + simulated backend（Actuation privilege boundary を含む） | M8 | 完了（PR #119） |
@@ -139,14 +139,15 @@ GPU機どころか ESP32 すら接続せずに #8〜#25 のすべてが開発・
 ### Control系の推奨着手順
 
 ```text
-内部Telemetry/API:  #65（PR #128）→ #66
+内部Telemetry/API:  #65 ✓（実機確認残）→ #66
 安全:               #78（PR #131）
 Control stack:       #79 ✓ → #80 ✓（実測閾値残）→ #87（PR #133 で main へ取り込み中）→ #88
 Air Balance:         #81（実機校正は #75 待ち）
 Dataset / Model:     #83（PR #129）→ #84 → #85
 Model registry:      #104（本体マージ済み、consumer は #84 / #85 / #89 / #90 / #91 / #92）
 
-上記合流後:         #74 ∥ #86 → #90 → #91 → #92
+#65/#78/#79/#80 合流後: #74（Simulated backend E2E まで）
+Control・Model lane 合流後: #86 → #90 → #91 → #92
 実機測定:             #75 → #50
 RL / 運用:             #105 → #89 → #93
 可視化:               #106
