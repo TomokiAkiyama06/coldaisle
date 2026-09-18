@@ -6,7 +6,8 @@ Issue #84のうち、実機datasetなしで検証できるartifact・学習・�
 
 ## 対応範囲
 
-- Thermal Dataset v1のwindowを、metric / 時刻 / value / missing / stale / suspectの固定順で入力する
+- Thermal Dataset v1のwindowを、metric / 時刻 / value / missing / stale / suspectの固定順で入力する。
+  値の無いsuspect（`inf`等）はmissingとして入力し、`suspect_mask`は値のあるsuspectだけに立てる
 - Front / Rear / Topの実際の`effective_demand`をFan action featureにする
 - horizon × target metricの全組み合わせを同時に返す
 - trainだけで欠測補完・標準化・ridge fitを行い、validation / testの未来情報を使わない

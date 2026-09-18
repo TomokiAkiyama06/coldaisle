@@ -41,6 +41,9 @@ missing / stale / suspectな値はtrain集合の同じ列の平均へ置換し�
 `source_ts_ms`は数値featureにしないが入力metadataとして保ち、各frameより未来でないこと、
 metric内で逆行しないこと、ageがstale閾値以上ならstale maskが立つことを推論時にも検証する。
 staleは鮮度の独立軸なのでmissing / suspectとの併存を許し、missingとsuspectだけを排他にする。
+`suspect_mask`は「値はあるが疑わしい」を表す。Dataset v1で値の無いsuspect（`inf`等。
+決定記録 0031 §2.1で`value=null`・`quality=suspect`・`missing_mask=true`）はmissingとして入力し、
+`suspect_mask`は立てない。
 
 Dataset v1はaction時点のControlTickだけを持ち、各label時刻までの後続Fan action列を持たない。
 そのためv1 baselineのcapabilityは`observational_replay`、authority compatibilityは`SHADOW`

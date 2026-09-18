@@ -359,6 +359,33 @@ def test_missing_stale_and_suspect_values_are_mean_imputed_with_separate_masks()
     assert missing_and_stale.window[0].stale_mask[FEATURES[1]] is True
 
 
+def test_valueless_suspect_cell_from_the_dataset_is_treated_as_missing():
+    """datasetは`inf`等をvalue=null・quality=suspect・missing_mask=trueで持つ（決定記録 0031）。
+
+    推論入力ではmissingとして扱い、missingとsuspectを同時に立てない。
+    """
+    source = thermal_dataset().examples[0]
+    frame = source.window[1]
+    valueless_suspect = frame.model_copy(
+        update={
+            "values": {**frame.values, FEATURES[0]: None},
+            "quality": {**frame.quality, FEATURES[0]: Quality.SUSPECT},
+            "missing_mask": {**frame.missing_mask, FEATURES[0]: True},
+        }
+    )
+    # model_copyは検証しないので、dataset schemaとして通ることを確かめ直す
+    valueless_suspect = WindowFrame.model_validate_json(valueless_suspect.model_dump_json())
+    changed = source.model_copy(update={"window": (source.window[0], valueless_suspect)})
+
+    observed = ObservedThermalInput.from_example(changed)
+
+    assert observed.window[1].values[FEATURES[0]] is None
+    assert observed.window[1].missing_mask[FEATURES[0]] is True
+    assert observed.window[1].suspect_mask[FEATURES[0]] is False
+    prediction = OfflineRidgeThermalModel.from_artifact(trained_artifact()).predict(observed)
+    assert prediction.targets
+
+
 def test_training_and_artifact_bytes_are_deterministic():
     dataset = thermal_dataset()
     split = temporal_split(dataset)
@@ -996,10 +1023,14 @@ def test_registry_constructor_is_closed_and_offline_model_is_explicit():
 def test_registry_metadata_rejects_huge_integer_before_serialization(monkeypatch):
     artifact = trained_artifact()
     body = canonical_artifact_bytes(artifact)
-    metadata = registry_metadata(artifact, body).model_copy(
-        update={"hyperparameters": {"huge": 1 << 100_000}}
-    )
     registry_module = _registry_module_for_test()
+    metadata = registry_metadata(artifact, body)
+    registry_metadata_type = getattr(registry_module, "ArtifactMetadata", None)
+    if registry_metadata_type is not None:
+        # 実Registryの型へ正規の値で変換してから差し替える。巨大な整数を含めてJSONを経由すると、
+        # 検証したいthermal側の拒否より先にint→strの桁数上限で落ちてしまう
+        metadata = registry_metadata_type.model_validate_json(metadata.model_dump_json())
+    metadata = metadata.model_copy(update={"hyperparameters": {"huge": 1 << 100_000}})
     verified_type = registry_module.VerifiedArtifact  # type: ignore[attr-defined]
     verified = verified_type(metadata=metadata, payload=body)
 

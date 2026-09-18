@@ -277,8 +277,13 @@ class ObservedThermalInput(_Frozen):
                     source_ts_ms=frame.source_ts_ms,
                     missing_mask=frame.missing_mask,
                     stale_mask=frame.stale_mask,
+                    # suspect maskは「値はあるが疑わしい」を表す。値の無いsuspect
+                    # （inf等。決定記録 0031 §2.1）はdataset側でmissing_maskが立つため、
+                    # ここではmissingとして扱い、missingとsuspectを同時に立てない
                     suspect_mask={
-                        metric: frame.quality[metric] is Quality.SUSPECT for metric in frame.values
+                        metric: frame.quality[metric] is Quality.SUSPECT
+                        and frame.values[metric] is not None
+                        for metric in frame.values
                     },
                 )
                 for frame in example.window
