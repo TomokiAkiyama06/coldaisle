@@ -8,6 +8,7 @@
 """
 
 from coldaisle.ai.explain import Evidence, Explainer, Explanation
+from coldaisle.ai.health import AiHealthSummarizer, BackgroundHealthSummarizer
 from coldaisle.ai.provider import (
     AiSettings,
     ChatMessage,
@@ -21,7 +22,9 @@ from coldaisle.ai.tools import DEFINITIONS, ToolRegistry, as_data
 
 __all__ = [
     "DEFINITIONS",
+    "AiHealthSummarizer",
     "AiSettings",
+    "BackgroundHealthSummarizer",
     "ChatMessage",
     "ChatResult",
     "Evidence",

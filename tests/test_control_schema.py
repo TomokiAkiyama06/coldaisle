@@ -36,6 +36,7 @@ from coldaisle.control import (
     Reason,
     SafetyState,
     SafetyZoneOutput,
+    WorkloadRegime,
     Zone,
     ZoneRecord,
     ZoneRequest,
@@ -370,7 +371,6 @@ def test_fallback_in_shadow_needs_no_reason():
     [
         {"authority_stage": AuthorityStage.SHADOW},
         {"safety_state": SafetyState.DEGRADED},
-        {"operating_mode": OperatingMode.MAX},
     ],
 )
 def test_ml_cannot_be_active_outside_its_allowed_conditions(overrides):
@@ -388,6 +388,27 @@ def test_ml_cannot_be_active_outside_its_allowed_conditions(overrides):
             model_confidence=0.9,
             model_ood=False,
         )
+
+
+def test_max_cannot_mark_a_counterfactual_learned_proposal_as_active():
+    with pytest.raises(ValidationError, match="AUTO"):
+        ControlState(
+            operating_mode=OperatingMode.MAX,
+            authority_stage=AuthorityStage.LIMITED,
+            safety_state=SafetyState.NORMAL,
+            active_controller=ControllerKind.LEARNED_MPC,
+            fallback_active=False,
+            model_version="thermal-v1",
+            model_confidence=0.9,
+            model_ood=False,
+        )
+
+    state = fallback_state(
+        operating_mode=OperatingMode.MAX,
+        authority_stage=AuthorityStage.LIMITED,
+    )
+    assert state.active_controller is ControllerKind.FALLBACK
+    assert state.fallback_reason is None
 
 
 def test_fallback_while_ml_was_allowed_must_say_why():
@@ -647,18 +668,18 @@ def test_the_stored_v1_record_still_loads_unchanged():
     stored = FIXTURE.read_text(encoding="utf-8")
     tick = ControlTick.model_validate_json(stored)
     assert tick.schema_version == 1
-    assert SCHEMA_VERSION == 2
+    assert SCHEMA_VERSION == 4
     assert json.loads(tick.model_dump_json()) == json.loads(stored)
 
 
-def test_v2_trace_records_the_absolute_temperature_limit():
+def test_v4_trace_records_the_absolute_temperature_limit():
     recorded = tick(
         forced(),
         faults=(Fault(code=FaultCode.ABSOLUTE_TEMPERATURE_LIMIT),),
         safety_state=SafetyState.EMERGENCY,
     )
 
-    assert recorded.schema_version == 2
+    assert recorded.schema_version == 4
     restored = ControlTick.model_validate_json(recorded.model_dump_json())
     assert restored.faults[0].code is FaultCode.ABSOLUTE_TEMPERATURE_LIMIT
     with pytest.raises(ValidationError, match="EMERGENCY"):
@@ -669,10 +690,11 @@ def test_v2_trace_records_the_absolute_temperature_limit():
         )
 
 
-def test_v1_trace_cannot_carry_a_fault_code_added_in_v2():
-    with pytest.raises(ValidationError, match="schema version 2"):
+@pytest.mark.parametrize("schema_version", [1, 2, 3])
+def test_legacy_trace_cannot_carry_a_fault_code_added_in_v4(schema_version: int):
+    with pytest.raises(ValidationError, match="schema version 4"):
         ControlTick(
-            schema_version=1,
+            schema_version=schema_version,
             tick_id=1,
             ts_ms=NOW_MS,
             state=fallback_state(safety_state=SafetyState.EMERGENCY),
@@ -681,22 +703,113 @@ def test_v1_trace_cannot_carry_a_fault_code_added_in_v2():
         )
 
 
-def test_top_enable_revert_is_emergency_in_v2_but_v1_records_still_load():
+@pytest.mark.parametrize("schema_version", [1, 2, 3])
+def test_top_enable_revert_is_emergency_in_v4_but_legacy_records_still_load(
+    schema_version: int,
+):
     top_revert = (Fault(code=FaultCode.ENABLE_REVERTED, zone=Zone.TOP),)
     with pytest.raises(ValidationError, match="EMERGENCY"):
         tick(forced(), faults=top_revert, safety_state=SafetyState.DEGRADED)
 
-    stored_v1 = ControlTick(
-        schema_version=1,
+    stored = ControlTick(
+        schema_version=schema_version,
         tick_id=1,
         ts_ms=NOW_MS,
         state=fallback_state(safety_state=SafetyState.DEGRADED),
         zones=zones(forced()),
         faults=top_revert,
     )
-    restored = ControlTick.model_validate_json(stored_v1.model_dump_json())
-    assert restored.schema_version == 1
+    restored = ControlTick.model_validate_json(stored.model_dump_json())
+    assert restored.schema_version == schema_version
     assert restored.state.safety_state is SafetyState.DEGRADED
+
+
+def test_current_trace_stores_workload_regime_and_confidence_together():
+    state = fallback_state(
+        workload_regime=WorkloadRegime.SUSTAINED_GPU,
+        regime_confidence=0.85,
+    )
+    recorded = ControlTick(tick_id=1, ts_ms=NOW_MS, state=state, zones=zones(passthrough()))
+
+    payload = json.loads(recorded.model_dump_json())
+    assert recorded.schema_version == 4
+    assert payload["state"]["workload_regime"] == "sustained_gpu"
+    assert payload["state"]["regime_confidence"] == 0.85
+
+    with pytest.raises(ValidationError, match="一緒に記録"):
+        fallback_state(workload_regime=WorkloadRegime.UNKNOWN)
+    with pytest.raises(ValidationError, match="schema version 2"):
+        ControlTick(
+            schema_version=1,
+            tick_id=1,
+            ts_ms=NOW_MS,
+            state=state,
+            zones=zones(passthrough()),
+        )
+
+
+def test_v2_trace_keeps_simultaneous_transient_load_distinct():
+    state = fallback_state(
+        workload_regime=WorkloadRegime.TRANSIENT_CPU_GPU,
+        regime_confidence=0.4,
+    )
+    recorded = ControlTick(tick_id=1, ts_ms=NOW_MS, state=state, zones=zones(passthrough()))
+
+    payload = json.loads(recorded.model_dump_json())
+    assert payload["state"]["workload_regime"] == "transient_cpu_gpu"
+    restored = ControlTick.model_validate_json(recorded.model_dump_json())
+    assert restored.state.workload_regime is WorkloadRegime.TRANSIENT_CPU_GPU
+
+
+def test_fallback_trace_remains_valid_when_regime_is_not_available():
+    recorded = ControlTick(
+        tick_id=1,
+        ts_ms=NOW_MS,
+        state=fallback_state(),
+        zones=zones(passthrough()),
+    )
+
+    assert recorded.schema_version == 4
+    assert recorded.state.workload_regime is None
+
+
+def test_stored_v2_trace_without_supervisor_decision_remains_valid():
+    recorded = ControlTick(
+        schema_version=2,
+        tick_id=1,
+        ts_ms=NOW_MS,
+        state=fallback_state(
+            workload_regime=WorkloadRegime.SUSTAINED_GPU,
+            regime_confidence=0.85,
+        ),
+        zones=zones(passthrough()),
+    )
+
+    payload = json.loads(recorded.model_dump_json())
+    assert payload["schema_version"] == 2
+    assert "supervisor" not in payload
+
+
+@pytest.mark.parametrize("schema_version", [1, 2])
+def test_legacy_trace_preserves_free_form_supervisor_policy(schema_version: int):
+    stored = json.loads(FIXTURE.read_text(encoding="utf-8"))
+    stored["schema_version"] = schema_version
+    stored["state"]["supervisor_policy"] = "legacy_rule_v1"
+
+    tick = ControlTick.model_validate_json(json.dumps(stored))
+
+    assert tick.state.supervisor_policy == "legacy_rule_v1"
+    assert json.loads(tick.model_dump_json()) == stored
+
+
+def test_v3_supervisor_policy_requires_a_matching_decision():
+    with pytest.raises(ValidationError, match="Supervisor decision"):
+        ControlTick(
+            tick_id=1,
+            ts_ms=NOW_MS,
+            state=fallback_state(supervisor_policy="legacy_rule_v1"),
+            zones=zones(passthrough()),
+        )
 
 
 def test_the_stored_record_explains_every_changed_zone():

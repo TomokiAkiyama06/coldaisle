@@ -1,12 +1,12 @@
 # 決定記録 0034: 制御対象 Fan の tach 読み取り不能を Safety fault にする
 
 - **種別**: Decision Record
-- **Status**: Proposed
+- **Status**: FINAL（2026-09-18、リポジトリ所有者が承認）
 - **Date**: 2026-09-18
 - **Supersedes**: なし（決定記録 0029 §5 の未決事項 5 を具体化する）
 - **関連**: [`0028-fan-control-contracts.md`](0028-fan-control-contracts.md) §2.5〜2.8 /
   [`0029-telemetry-loss-classes.md`](0029-telemetry-loss-classes.md) §2.2・§5 /
-  決定記録 0032（#65、Proposed） / #50 / #75
+  [`0032-internal-telemetry-metric-names.md`](0032-internal-telemetry-metric-names.md)（FINAL） / #50 / #75
 - **対象 Issue**: #78
 
 ## 1. Context
@@ -50,16 +50,16 @@ RPM の読み取り不能は「Fan が回っているが tach だけ読めない
 - Startup の tach 応答確認は、従来どおり有効な RPM が `stall_min_rpm` 以上に
   なった zone だけを確認済みとする。
 
-T_SENSOR の metric contract は、決定記録 0032（#65、Proposed）が提案する
-`board.connector_12v2x6` に依存する。Critical Safety は名前をハードコードせず、
-T_SENSOR 有効時に `approved_t_sensor_metric` として承認済み metric contract の注入を
-必須にし、Metric Catalog に単位 `C` で存在し、既存 Safety 入力名と衝突しないことを
-検証する。0032 が FINAL になる前は本番設定で T_SENSOR を有効化しない。
-0032 の名前がレビューで
-変わる場合は、#65 / #78 へ同じ承認済み名を渡す。
+T_SENSOR の metric 名は決定記録 0032（FINAL）の `board.connector_12v2x6` とする。
+Critical Safety は名前をハードコードせず、T_SENSOR 有効時に `approved_t_sensor_metric`
+として承認済み metric contract の注入を必須にし、Metric Catalog に単位 `C` で存在し、
+既存 Safety 入力名と衝突しないことを検証する。T_SENSOR の本番有効化は、0029 §2.4 と
+0032 のとおり設置・#50 の較正・所有者承認の後に行う。
 
-本記録は #78 PR の人間による Safety review と merge を承認点とする。Status が
-Proposed の間は本番設定・サービスでこの制御を有効化しない。
+**承認**: 2026-09-18、リポジトリ所有者が #78 PR（#131）の Safety review で本記録を承認した。
+`stall_check_min_demand` / `stall_min_rpm` / `stall_window_ms` などの閾値は本記録の対象外で、
+#50 / #75 の実測後に別の PR で本番の `safety.yaml` として確定する。それまでテストの値は
+provisional のまま扱う。
 
 ## 3. Consequences
 

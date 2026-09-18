@@ -52,6 +52,7 @@ from coldaisle.control.state import (
     TelemetryImportance,
 )
 from coldaisle.store.models import Quality
+from test_control_config import valid_documents
 
 
 def hardware_config(*, confirmed: bool = True) -> FanHardwareConfig:
@@ -150,45 +151,15 @@ def control_config(
     safety: SafetyConfig | None = None,
     fan_hardware: FanHardwareConfig | None = None,
 ) -> ControlConfig:
-    policy = FanPolicyConfig.model_validate(
-        {
-            "schema_version": 1,
-            "fallback_curve": [
-                {"temperature_c": 25.0, "demand": 0.3},
-                {"temperature_c": 80.0, "demand": 1.0},
-            ],
-            "reactive_guard": {
-                "floor": {"value": 0.4, "status": "provisional"},
-                "ceiling": {"value": 1.0, "status": "provisional"},
-                "hold_ms": {"value": 1_000, "status": "provisional"},
-                "intake_rise_threshold_c": {"value": 2.0, "status": "provisional"},
-                "gpu_hotspot_threshold_c": {"value": 85.0, "status": "provisional"},
-            },
-            "mpc": {"period_ms": 1_000, "budget_ms": 100, "valid_ms": 2_000},
-            "supervisor": {"period_ms": 1_000, "valid_ms": 2_000},
-            "gate_min_confidence": {"value": 0.0, "status": "provisional"},
-            "authority_stage": "shadow",
-            "authority_limits": {
-                "limited": {
-                    "permitted_zones": ["front"],
-                    "limit_up": 0.1,
-                    "limit_down": 0.1,
-                },
-                "expanded": {
-                    "permitted_zones": ["front", "rear", "top"],
-                    "limit_up": 0.2,
-                    "limit_down": 0.2,
-                },
-            },
-            "recovery_hold_ms": 1_000,
-            "demote_window_ms": 60_000,
-            "demote_after": 3,
-        }
-    )
+    # fan-policy は #78 の対象外。main の検証済み policy fixture をそのまま使い、
+    # policy の schema 変更にこの test が追従漏れしないようにする。
+    policy = FanPolicyConfig.model_validate(valid_documents()["fan-policy.yaml"])
     sources = ConfigSources(
         fan_hardware=ConfigSource(name="fan-hardware.yaml", schema_version=1, sha256="1" * 64),
         safety=ConfigSource(name="safety.yaml", schema_version=2, sha256="2" * 64),
-        policy=ConfigSource(name="fan-policy.yaml", schema_version=1, sha256="3" * 64),
+        policy=ConfigSource(
+            name="fan-policy.yaml", schema_version=policy.schema_version, sha256="3" * 64
+        ),
     )
     return ControlConfig(
         fan_hardware=fan_hardware or hardware_config(),

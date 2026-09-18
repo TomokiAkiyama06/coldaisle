@@ -1,0 +1,128 @@
+# NVML / lm-sensors / hwmon Internal Telemetry Collector（#65）
+#
+# `hwmonN`、`tempN_input`、`fanN_input` の番号や実機固有 path は書きません。
+# `name`（driver）と `*_label` の組を実機上で確認してから sensors に追加します。
+# 未確認の対応を有効化すると、別の header を同じ zone と誤認するためです。
+
+version: 1
+interval_ms: 2500
+
+nvml:
+  enabled: true
+  # v1 は物理 GPU が1台だけの構成を検証し、その唯一の GPU を logical 0 とする。
+  # 複数 GPU を列挙順で永続 metric へ割り当てることは禁止する。
+  gpu_indices: [0]
+
+hwmon:
+  enabled: true
+  root: /sys/class/hwmon
+  sensors:
+    # T_SENSOR は未設置のため無効。設置と #50 の較正後に driver / label と
+    # 妥当範囲を記録し、人の承認を経て enabled にします（決定記録 0029 §2.4）。
+    - metric: board.connector_12v2x6
+      enabled: false
+      driver: null
+      label: null
+      channel: null
+      measurement: temperature
+      required: true
+      minimum: null
+      maximum: null
+      confirmation: null
+      disabled_reason: "not installed; enable only after #50 measurement and owner approval"
+
+    # --- 2026-09-18 所有者確認済みの対応（ASUS ProArt X870E-CREATOR WIFI）---
+    # nct6799 のファン入力には label が無いため、driver 内の channel で指定する。
+    # fan2=Top(ラジエータ) / fan4=Water Block VRM Fan / fan5=Rear / fan6=Front / fan7=AIO Pump
+    - metric: fan.top.rpm
+      enabled: true
+      driver: nct6799
+      channel: fan2
+      measurement: rpm
+      confirmation:
+        status: confirmed
+        basis: "2026-09-12頃に実機でnct6799のfanN/pwmNと物理ファン位置を突き合わせ（所有者の記録 pro6000_fan_pwm_mapping_v14）。2026-09-18に所有者が対応を確認"
+    - metric: fan.top.pwm
+      enabled: true
+      driver: nct6799
+      channel: fan2
+      measurement: pwm
+      confirmation:
+        status: confirmed
+        basis: "2026-09-12頃に実機でnct6799のfanN/pwmNと物理ファン位置を突き合わせ（所有者の記録 pro6000_fan_pwm_mapping_v14）。2026-09-18に所有者が対応を確認"
+    - metric: fan.rear.rpm
+      enabled: true
+      driver: nct6799
+      channel: fan5
+      measurement: rpm
+      confirmation:
+        status: confirmed
+        basis: "2026-09-12頃に実機でnct6799のfanN/pwmNと物理ファン位置を突き合わせ（所有者の記録 pro6000_fan_pwm_mapping_v14）。2026-09-18に所有者が対応を確認"
+    - metric: fan.rear.pwm
+      enabled: true
+      driver: nct6799
+      channel: fan5
+      measurement: pwm
+      confirmation:
+        status: confirmed
+        basis: "2026-09-12頃に実機でnct6799のfanN/pwmNと物理ファン位置を突き合わせ（所有者の記録 pro6000_fan_pwm_mapping_v14）。2026-09-18に所有者が対応を確認"
+    - metric: fan.front.rpm
+      enabled: true
+      driver: nct6799
+      channel: fan6
+      measurement: rpm
+      confirmation:
+        status: confirmed
+        basis: "2026-09-12頃に実機でnct6799のfanN/pwmNと物理ファン位置を突き合わせ（所有者の記録 pro6000_fan_pwm_mapping_v14）。2026-09-18に所有者が対応を確認"
+    - metric: fan.front.pwm
+      enabled: true
+      driver: nct6799
+      channel: fan6
+      measurement: pwm
+      confirmation:
+        status: confirmed
+        basis: "2026-09-12頃に実機でnct6799のfanN/pwmNと物理ファン位置を突き合わせ（所有者の記録 pro6000_fan_pwm_mapping_v14）。2026-09-18に所有者が対応を確認"
+    - metric: fan.vrm.rpm
+      enabled: true
+      driver: nct6799
+      channel: fan4
+      measurement: rpm
+      confirmation:
+        status: confirmed
+        basis: "2026-09-12頃に実機でnct6799のfanN/pwmNと物理ファン位置を突き合わせ（所有者の記録 pro6000_fan_pwm_mapping_v14）。2026-09-18に所有者が対応を確認"
+    - metric: fan.aio_pump.rpm
+      enabled: true
+      driver: nct6799
+      channel: fan7
+      measurement: rpm
+      confirmation:
+        status: confirmed
+        basis: "2026-09-12頃に実機でnct6799のfanN/pwmNと物理ファン位置を突き合わせ（所有者の記録 pro6000_fan_pwm_mapping_v14）。2026-09-18に所有者が対応を確認"
+    # 温度（label は再起動で変わらない）。2026-09-18 に実機で読み取り、同日に所有者が承認。
+    - metric: cpu.package
+      enabled: true
+      driver: asusec
+      label: "CPU Package"
+      measurement: temperature
+      required: true
+      confirmation:
+        status: confirmed
+        basis: "2026-09-18に実機サーバーでhwmonのdriverとlabelを読み取って対応を確認。同日に所有者が承認"
+    - metric: cpu.vrm
+      enabled: true
+      driver: asusec
+      label: VRM
+      measurement: temperature
+      confirmation:
+        status: confirmed
+        basis: "2026-09-18に実機サーバーでhwmonのdriverとlabelを読み取って対応を確認。同日に所有者が承認"
+    # board.chipset は所有者承認済みだが、2026-09-18 の実機読み取りで PCH_CHIP_TEMP が
+    # 常に 0 °C（PCH_* の3入力すべて 0）だったため無効のまま。0 を ok として保存しないため。
+    - metric: board.chipset
+      enabled: false
+      driver: nct6799
+      label: PCH_CHIP_TEMP
+      measurement: temperature
+      confirmation:
+        status: provisional
+      disabled_reason: "2026-09-18の実機読み取りでPCH_CHIP_TEMPが常に0 °C（未配線または未対応とみられる）。0を正常値として保存しないため、実値を返す入力の確認まで無効"

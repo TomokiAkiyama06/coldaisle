@@ -6,11 +6,89 @@ import pytest
 import yaml
 from pydantic import ValidationError
 
-from coldaisle.control.config import ConfigSource, ControlConfig
+from coldaisle.control.config import CONTROL_CONFIG_VERSION, ConfigSource, ControlConfig
 
 
 def provisional(value: float | int) -> dict[str, object]:
     return {"value": value, "status": "provisional"}
+
+
+def guard_band(
+    activate: float,
+    clear: float,
+    degraded_activate: float,
+    degraded_clear: float,
+) -> dict[str, object]:
+    return {
+        "activate_above": provisional(activate),
+        "clear_at_or_below": provisional(clear),
+        "degraded_activate_above": provisional(degraded_activate),
+        "degraded_clear_at_or_below": provisional(degraded_clear),
+    }
+
+
+def supervisor_config() -> dict[str, object]:
+    target_band = {
+        "cpu_temperature": {"lower_c": 45.0, "upper_c": 75.0},
+        "gpu_temperature": {"lower_c": 45.0, "upper_c": 78.0},
+    }
+    balanced = {
+        "strategy": "balanced",
+        "weights": {
+            "gpu_temperature": 0.8,
+            "cpu_temperature": 0.8,
+            "balance": 0.5,
+            "acoustic": 0.4,
+            "change": 0.3,
+        },
+        "target_band": target_band,
+    }
+    conservative = {
+        "strategy": "conservative",
+        "weights": {
+            "gpu_temperature": 1.0,
+            "cpu_temperature": 1.0,
+            "balance": 0.7,
+            "acoustic": 0.1,
+            "change": 0.5,
+        },
+        "target_band": target_band,
+    }
+    return {
+        "period_ms": 1000,
+        "valid_ms": 2000,
+        "active_policy": "rule_policy",
+        "shadow_policy": "rl_policy",
+        "rl_version": "rl-test-v1",
+        "output_bounds": {
+            "strategies": ["balanced", "conservative"],
+            "target_bands": [target_band],
+            "weights": {
+                name: {"minimum": 0.0, "maximum": 1.0}
+                for name in (
+                    "gpu_temperature",
+                    "cpu_temperature",
+                    "balance",
+                    "acoustic",
+                    "change",
+                )
+            },
+        },
+        "rule_policy": {
+            "version": "rule-test-v1",
+            "contexts": {
+                "idle": balanced,
+                "transient_cpu": balanced,
+                "transient_gpu": balanced,
+                "transient_cpu_gpu": balanced,
+                "sustained_cpu": balanced,
+                "sustained_gpu": balanced,
+                "sustained_cpu_gpu": balanced,
+                "cooldown": balanced,
+                "unknown": conservative,
+            },
+        },
+    }
 
 
 def valid_documents() -> dict[str, dict[str, object]]:
@@ -100,21 +178,78 @@ def valid_documents() -> dict[str, dict[str, object]]:
             "watchdog_timeout_ms": provisional(5000),
         },
         "fan-policy.yaml": {
-            "schema_version": 1,
+            "schema_version": 5,
             "fallback_curve": [
                 {"temperature_c": 25.0, "demand": 0.3},
                 {"temperature_c": 80.0, "demand": 1.0},
             ],
+            "fallback_temperature_inputs": {
+                "front": {"metrics": ["gpu.0.core"]},
+                "rear": {"metrics": ["gpu.0.core"]},
+                "top": {"metrics": ["cpu.package"]},
+            },
+            "fallback_power_feedforward": {
+                "front": {
+                    "metric": "power.gpu.0",
+                    "curve": [
+                        {"power_w": 0.0, "demand": 0.3},
+                        {"power_w": 600.0, "demand": 1.0},
+                    ],
+                },
+                "rear": {
+                    "metric": "power.gpu.0",
+                    "curve": [
+                        {"power_w": 0.0, "demand": 0.3},
+                        {"power_w": 600.0, "demand": 1.0},
+                    ],
+                },
+                "top": {
+                    "metric": "power.cpu.package",
+                    "curve": [
+                        {"power_w": 0.0, "demand": 0.3},
+                        {"power_w": 250.0, "demand": 1.0},
+                    ],
+                },
+            },
+            "fallback_dynamics": {"decrease_hysteresis": 0.05, "decrease_hold_ms": 2000},
             "reactive_guard": {
-                "floor": provisional(0.4),
-                "ceiling": provisional(1.0),
+                "floor": provisional(0.6),
                 "hold_ms": provisional(1000),
-                "intake_rise_threshold_c": provisional(2.0),
-                "gpu_hotspot_threshold_c": provisional(85.0),
+                "cpu_power_metric": None,
+                "cpu_temperature_rate_c_per_s": guard_band(2.0, 0.5, 1.5, 0.25),
+                "gpu_temperature_rate_c_per_s": guard_band(2.0, 0.5, 1.5, 0.25),
+                "cpu_power_rate_w_per_s": guard_band(100.0, 20.0, 75.0, 10.0),
+                "gpu_power_rate_w_per_s": guard_band(100.0, 20.0, 75.0, 10.0),
+                "intake_rise_c": guard_band(2.0, 1.0, 1.5, 0.5),
+                "gpu_hotspot_c": guard_band(85.0, 80.0, 82.0, 78.0),
             },
             "mpc": {"period_ms": 1000, "budget_ms": 100, "valid_ms": 2000},
-            "supervisor": {"period_ms": 1000, "valid_ms": 2000},
-            "gate_min_confidence": provisional(0.0),
+            "supervisor": supervisor_config(),
+            "workload_regime": {
+                "cpu_power": {
+                    "metric": "power.cpu.package",
+                    "idle_below_w": 30.0,
+                    "active_above_w": 60.0,
+                },
+                "gpu_power": {
+                    "metric": "power.gpu.0",
+                    "idle_below_w": 40.0,
+                    "active_above_w": 100.0,
+                },
+                "activity_window_ms": 2000,
+                "history_window_ms": 120000,
+                "minimum_observation_ms": 2000,
+                "sustained_after_ms": 60000,
+                "cooldown_ms": 30000,
+                "minimum_transition_ms": 1000,
+                "confidence_full_window_ms": 60000,
+                "max_snapshot_gap_ms": 1000,
+            },
+            "gate_min_confidence": {
+                "limited": provisional(0.6),
+                "expanded": provisional(0.7),
+                "full": provisional(0.8),
+            },
             "authority_stage": "shadow",
             "authority_limits": {
                 "limited": {"permitted_zones": ["front"], "limit_up": 0.1, "limit_down": 0.1},
@@ -144,10 +279,12 @@ def load_config(tmp_path: Path) -> ControlConfig:
 def test_complete_config_has_traceable_sources_and_is_not_actuation_ready(tmp_path: Path) -> None:
     config = load_config(tmp_path)
 
+    assert CONTROL_CONFIG_VERSION == 5
     assert config.actuation_permitted is False
     metadata = config.trace_metadata()["control_config"]
     assert metadata["fan_hardware"]["name"] == "fan-hardware.yaml"
     assert metadata["safety"]["schema_version"] == 2
+    assert metadata["policy"]["schema_version"] == 5
     assert len(metadata["safety"]["sha256"]) == 64
 
 
@@ -212,9 +349,11 @@ def test_cross_field_validation_rejects_unsafe_or_unstable_values(tmp_path: Path
         ControlConfig.from_directory(tmp_path)
 
     documents = valid_documents()
-    documents["fan-policy.yaml"]["reactive_guard"]["ceiling"] = provisional(0.2)
+    documents["fan-policy.yaml"]["reactive_guard"]["gpu_hotspot_c"]["clear_at_or_below"] = (
+        provisional(90.0)
+    )
     write_documents(tmp_path, documents)
-    with pytest.raises(ValidationError, match="ceiling"):
+    with pytest.raises(ValidationError, match="解除閾値"):
         ControlConfig.from_directory(tmp_path)
 
     documents = valid_documents()
@@ -246,6 +385,51 @@ def test_cross_field_validation_rejects_unsafe_or_unstable_values(tmp_path: Path
     write_documents(tmp_path, documents)
     with pytest.raises(ValidationError, match="cpu_power_cooling_floor"):
         ControlConfig.from_directory(tmp_path)
+
+    documents = valid_documents()
+    documents["fan-policy.yaml"]["reactive_guard"]["gpu_hotspot_c"]["degraded_activate_above"] = (
+        provisional(90.0)
+    )
+    write_documents(tmp_path, documents)
+    with pytest.raises(ValidationError, match="保守側"):
+        ControlConfig.from_directory(tmp_path)
+
+
+def test_cpu_power_guard_metric_requires_confirmed_approval(tmp_path: Path) -> None:
+    documents = valid_documents()
+    documents["fan-policy.yaml"]["reactive_guard"]["cpu_power_metric"] = {
+        "value": "power.cpu.package",
+        "status": "provisional",
+    }
+    write_documents(tmp_path, documents)
+    with pytest.raises(ValidationError, match="confirmed"):
+        ControlConfig.from_directory(tmp_path)
+
+    documents["fan-policy.yaml"]["reactive_guard"]["cpu_power_metric"] = {
+        "value": "not-a-metric",
+        "status": "confirmed",
+        "basis": "approved metric contract",
+    }
+    write_documents(tmp_path, documents)
+    with pytest.raises(ValueError, match="metric"):
+        ControlConfig.from_directory(tmp_path)
+
+    documents["fan-policy.yaml"]["reactive_guard"]["cpu_power_metric"] = {
+        "value": "gpu.0.core",
+        "status": "confirmed",
+        "basis": "approved metric contract",
+    }
+    write_documents(tmp_path, documents)
+    with pytest.raises(ValidationError, match="power ドメイン"):
+        ControlConfig.from_directory(tmp_path)
+
+    documents["fan-policy.yaml"]["reactive_guard"]["cpu_power_metric"] = {
+        "value": "power.cpu.package",
+        "status": "confirmed",
+        "basis": "DR0032 FINAL and owner approval",
+    }
+    write_documents(tmp_path, documents)
+    assert ControlConfig.from_directory(tmp_path).policy.reactive_guard.cpu_power_metric is not None
 
 
 def test_unstable_hwmon_number_is_rejected(tmp_path: Path) -> None:
@@ -341,7 +525,9 @@ def test_provisional_values_identify_safety_and_policy_without_exposing_values(
     assert any(item.path == "telemetry.t_sensor.enabled" for item in values)
     assert any(item.path == "cpu_power_cooling_floor[0].power_w" for item in values)
     assert any(item.path == "telemetry.cpu_power_ms" for item in values)
-    assert any(item.path == "reactive_guard.ceiling" for item in values)
+    assert any(
+        item.path == "reactive_guard.gpu_temperature_rate_c_per_s.activate_above" for item in values
+    )
     assert all("value" not in item.model_dump() for item in values)
 
 
@@ -371,4 +557,148 @@ def test_mpc_and_supervisor_validity_windows_are_required_and_budget_is_bounded(
     documents["fan-policy.yaml"]["mpc"]["budget_ms"] = 2000
     write_documents(tmp_path, documents)
     with pytest.raises(ValidationError, match=r"mpc.budget_ms"):
+        ControlConfig.from_directory(tmp_path)
+
+
+def test_fallback_inputs_and_power_curves_are_validated(tmp_path: Path) -> None:
+    documents = valid_documents()
+    documents["fan-policy.yaml"]["fallback_temperature_inputs"]["front"]["metrics"] = [
+        "gpu.0.core",
+        "gpu.0.core",
+    ]
+    write_documents(tmp_path, documents)
+    with pytest.raises(ValidationError, match="重複"):
+        ControlConfig.from_directory(tmp_path)
+
+    documents = valid_documents()
+    documents["fan-policy.yaml"]["fallback_power_feedforward"]["front"]["curve"] = [
+        {"power_w": 200.0, "demand": 0.5},
+        {"power_w": 100.0, "demand": 0.6},
+    ]
+    write_documents(tmp_path, documents)
+    with pytest.raises(ValidationError, match="power_w"):
+        ControlConfig.from_directory(tmp_path)
+
+
+def test_confidence_thresholds_are_validated_per_authority_stage(tmp_path: Path) -> None:
+    config = load_config(tmp_path)
+    assert config.policy.gate_min_confidence.limited.value == 0.6
+    assert config.policy.gate_min_confidence.full.value == 0.8
+
+    documents = valid_documents()
+    documents["fan-policy.yaml"]["gate_min_confidence"] = {
+        "limited": provisional(0.9),
+        "expanded": provisional(0.7),
+        "full": provisional(0.8),
+    }
+    write_documents(tmp_path, documents)
+    with pytest.raises(ValidationError, match="limited <= expanded <= full"):
+        ControlConfig.from_directory(tmp_path)
+
+
+def test_workload_regime_thresholds_and_windows_are_configured(tmp_path: Path) -> None:
+    config = load_config(tmp_path).policy.workload_regime
+
+    assert config.cpu_power.metric == "power.cpu.package"
+    assert config.gpu_power.active_above_w == 100.0
+
+    documents = valid_documents()
+    documents["fan-policy.yaml"]["workload_regime"]["cpu_power"]["idle_below_w"] = 70.0
+    write_documents(tmp_path, documents)
+    with pytest.raises(ValidationError, match="active_above_w"):
+        ControlConfig.from_directory(tmp_path)
+
+    documents = valid_documents()
+    documents["fan-policy.yaml"]["workload_regime"]["sustained_after_ms"] = 120001
+    write_documents(tmp_path, documents)
+    with pytest.raises(ValidationError, match="history_window_ms"):
+        ControlConfig.from_directory(tmp_path)
+
+    documents = valid_documents()
+    documents["fan-policy.yaml"]["workload_regime"]["history_window_ms"] = 62000
+    write_documents(tmp_path, documents)
+    with pytest.raises(ValidationError, match="観測・SUSTAINED判定"):
+        ControlConfig.from_directory(tmp_path)
+
+    documents = valid_documents()
+    documents["fan-policy.yaml"]["workload_regime"]["history_window_ms"] = 32000
+    documents["fan-policy.yaml"]["workload_regime"]["sustained_after_ms"] = 1000
+    documents["fan-policy.yaml"]["workload_regime"]["confidence_full_window_ms"] = 30000
+    write_documents(tmp_path, documents)
+    with pytest.raises(ValidationError, match="観測・COOLDOWN判定"):
+        ControlConfig.from_directory(tmp_path)
+
+    documents = valid_documents()
+    cpu_metric = documents["fan-policy.yaml"]["workload_regime"]["cpu_power"]["metric"]
+    documents["fan-policy.yaml"]["workload_regime"]["gpu_power"]["metric"] = cpu_metric
+    write_documents(tmp_path, documents)
+    with pytest.raises(ValidationError, match="別々"):
+        ControlConfig.from_directory(tmp_path)
+
+
+def test_supervisor_selection_and_output_bounds_are_validated(tmp_path: Path) -> None:
+    config = load_config(tmp_path).policy.supervisor
+    assert config.active_policy.value == "rule_policy"
+    assert config.shadow_policy is not None and config.shadow_policy.value == "rl_policy"
+
+    documents = valid_documents()
+    supervisor = documents["fan-policy.yaml"]["supervisor"]
+    supervisor["active_policy"] = "rl_policy"
+    supervisor["shadow_policy"] = None
+    write_documents(tmp_path, documents)
+    assert (
+        ControlConfig.from_directory(tmp_path).policy.supervisor.active_policy.value == "rl_policy"
+    )
+
+    documents = valid_documents()
+    documents["fan-policy.yaml"]["supervisor"]["active_policy"] = "rl_policy"
+    write_documents(tmp_path, documents)
+    with pytest.raises(ValidationError, match="active と shadow"):
+        ControlConfig.from_directory(tmp_path)
+
+    documents = valid_documents()
+    documents["fan-policy.yaml"]["supervisor"]["rl_version"] = None
+    write_documents(tmp_path, documents)
+    with pytest.raises(ValidationError, match="rl_version"):
+        ControlConfig.from_directory(tmp_path)
+
+    documents = valid_documents()
+    documents["fan-policy.yaml"]["supervisor"]["rule_policy"]["contexts"]["unknown"]["strategy"] = (
+        "unconfigured"
+    )
+    write_documents(tmp_path, documents)
+    with pytest.raises(ValidationError, match="設定済み候補"):
+        ControlConfig.from_directory(tmp_path)
+
+
+@pytest.mark.parametrize("old_version", [1, 2, 3, 4])
+def test_previous_policy_versions_are_rejected_until_explicitly_migrated(
+    tmp_path: Path,
+    old_version: int,
+) -> None:
+    documents = valid_documents()
+    documents["fan-policy.yaml"]["schema_version"] = old_version
+    write_documents(tmp_path, documents)
+
+    with pytest.raises(ValidationError, match="schema_version"):
+        ControlConfig.from_directory(tmp_path)
+
+
+def test_v4_to_v5_migration_requires_explicit_supervisor_policy_values(tmp_path: Path) -> None:
+    documents = valid_documents()
+    supervisor = supervisor_config()
+    documents["fan-policy.yaml"]["supervisor"] = {"period_ms": 1000, "valid_ms": 2000}
+    documents["fan-policy.yaml"]["schema_version"] = 4
+    write_documents(tmp_path, documents)
+    with pytest.raises(ValidationError, match="schema_version"):
+        ControlConfig.from_directory(tmp_path)
+
+    documents["fan-policy.yaml"]["supervisor"] = supervisor
+    documents["fan-policy.yaml"]["schema_version"] = 5
+    write_documents(tmp_path, documents)
+    assert ControlConfig.from_directory(tmp_path).policy.schema_version == 5
+
+    del documents["fan-policy.yaml"]["supervisor"]["active_policy"]
+    write_documents(tmp_path, documents)
+    with pytest.raises(ValidationError, match="active_policy"):
         ControlConfig.from_directory(tmp_path)

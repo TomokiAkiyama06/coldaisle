@@ -21,6 +21,12 @@ from pathlib import Path
 
 from fastapi import FastAPI
 
+from coldaisle.ai import (
+    AiHealthSummarizer,
+    AiSettings,
+    BackgroundHealthSummarizer,
+    provider_from_env,
+)
 from coldaisle.ai.tools import ToolRegistry
 from coldaisle.api.app import Config, Tools, create_app
 from coldaisle.clock import Clock, WallClock
@@ -29,6 +35,7 @@ from coldaisle.rules import RuleSet
 from coldaisle.store import SqliteStore
 
 DEFAULT_RULES = Path("config/rules.yaml")
+DEFAULT_AI_CONFIG = Path("config/ai.yaml")
 
 
 def create_server(config: Config | None = None, *, clock: Clock | None = None) -> FastAPI:
@@ -36,13 +43,29 @@ def create_server(config: Config | None = None, *, clock: Clock | None = None) -
     settings = config or Config.from_env()
     catalog = MetricCatalog.from_yaml(settings.metrics)
     rules = RuleSet.from_yaml(Path(os.environ.get("COLDAISLE_RULES", str(DEFAULT_RULES))))
+    ai_settings = AiSettings.from_yaml(
+        Path(os.environ.get("COLDAISLE_AI_CONFIG", str(DEFAULT_AI_CONFIG)))
+    )
+    ai_provider = provider_from_env(ai_settings)
+    health_summarizer = (
+        None
+        if ai_provider is None
+        else BackgroundHealthSummarizer(
+            AiHealthSummarizer(ai_provider), retry_s=ai_settings.health_summary_retry_s
+        )
+    )
     ticking = clock or WallClock()
 
     def tools(store: SqliteStore) -> Tools:
         # **接続はスレッドごと**（決定記録 0004 §2.8）。渡された接続をそのまま使う
         return ToolRegistry(store=store, catalog=catalog, rules=rules, clock=ticking)
 
-    return create_app(settings, clock=ticking, tools=tools)
+    return create_app(
+        settings,
+        clock=ticking,
+        tools=tools,
+        health_summarizer=health_summarizer,
+    )
 
 
 app = create_server()

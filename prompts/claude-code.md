@@ -64,7 +64,7 @@ issues/{N}-*.md を実装してください。
 完了条件:
   uv run ruff check . && uv run ruff format --check .
   uv run mypy src
-  uv run pytest -k "not hardware"
+  uv run pytest -m "not hardware"
   これらが全て通ること。通らない状態で「完了しました」と言わないこと。
 
 守ること:
@@ -97,7 +97,7 @@ issues/41-public-repo-hygiene.md を実装してください。
 3. #2 — GitHub Actions
 
 重要:
-- pytest の markers に "hardware" を登録し、CI では -k "not hardware" で走らせること
+- pytest の markers に "hardware" を登録し、CI では -m "not hardware" で走らせること
 - この時点ではまだ実装が無いので、ダミーのテストを1つ置いて CI が緑になることを確認する
 - LICENSE は Apache-2.0 で配置（要件 Q-16 で推奨。異論があれば指摘して）
 

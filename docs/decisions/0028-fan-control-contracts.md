@@ -95,6 +95,12 @@ Telemetry Collector の出力を受け渡す経路と供給周期は未決（5. 
 | 合成（2.4） | 上の3つ | zone ごとの `requested` / `effective` / `bound_by` / `reasons` | その tick だけ |
 | Hardware Backend | `effective` | zone ごとの `pwm_raw` / `write_ok` / `readback_ok` / `rpm` / `fault` | その tick だけ |
 
+> **Superseded by**
+>
+> - 上表の Supervisor 行の有効期限（受け取ってから `supervisor.valid_ms`）→
+>   [`0041-supervisor-proposal-freshness.md`](0041-supervisor-proposal-freshness.md)
+>   （元 snapshot の単調時刻から `supervisor.valid_ms`。受信時刻も trace に残す）
+
 **型で経路を縛る。**
 
 - PWM の生値は Hardware Backend のモジュールの中でしか作れない型にする
@@ -223,6 +229,11 @@ M8 には ML が無いため、active controller は常に Fallback になる。
 - 壁時計は時刻合わせで前後に飛ぶ。期限の判定に使うと、時計が戻ったときに古い提案が有効なまま残り、stall や stale の timer が満了しなくなる。tick は回り続けるので watchdog も介入しない
 - **期限は `coldaisle-fand` 自身の単調時計だけで数え、ほかのプロセスの時計の値と比べない。**
   worker の提案と Supervisor の出力は、`coldaisle-fand` が受け取った時刻（単調時計）から `mpc.valid_ms` / `supervisor.valid_ms` で期限切れにする
+
+  > **Superseded by**（Supervisor の出力の期限の起点のみ。`mpc.valid_ms` は変えない）→
+  > [`0041-supervisor-proposal-freshness.md`](0041-supervisor-proposal-freshness.md)
+  > （元 snapshot の単調時刻から `supervisor.valid_ms`）
+
 - **Telemetry の経過時間に `now_ms - ts_ms` を使わない。** `ts_ms` はホスト受信時刻の壁時計（決定 D-05）だからである。
   `coldaisle-fand` は metric ごとに「`ts_ms` が**変わったことを観測した**単調時計の時刻」を持ち、`age_ms = 単調時計の現在 - 最後に変化を観測した時刻` とする。
   起動してからまだ変化を観測していない metric は stale とみなす（`STARTUP` の Max の間に揃う）
@@ -330,6 +341,11 @@ effective demand の型を通らないため、次の制約で**冷却を弱め�
   チップがどう振る舞うかは #74 で実機確認する
 
 ### 2.8 設定の境界
+
+> **Superseded by**
+>
+> - **3ファイル境界** → [`0033-air-balance-config-boundary.md`](0033-air-balance-config-boundary.md)
+>   （`air-balance.yaml` を4つ目の Control Config とし、4ファイルを一括検証・一括採用する）
 
 AGENTS.md の「ファイル構成」にある3つのファイルへ分ける。
 

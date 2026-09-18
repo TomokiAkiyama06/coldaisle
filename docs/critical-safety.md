@@ -28,8 +28,8 @@ YAML validation と SHA-256 生成を一体で行う。通常・emergency とも
 この binding は通常の `CriticalSafety` を構築できず、通常 binding も config-invalid composerへ
 切り替えられないため、同一 session で Max 後に通常の低 demand へ戻せない。
 
-T_SENSOR の metric 名は決定記録 0032（#65、Proposed）の
-`board.connector_12v2x6` 提案に依存する。Critical Safety はこの名前を既定値にせず、
+T_SENSOR の metric 名は決定記録 0032（FINAL）の
+`board.connector_12v2x6` とする。Critical Safety はこの名前を既定値にせず、
 T_SENSOR を有効化するときに `approved_t_sensor_metric` として承認済み metric contract
 の注入を必須にする。注入名は canonical metric 文法を満たし、既存の Critical / 絶対温度
 入力名と衝突せず、同時に注入する検証済み Metric Catalog に単位 `C` で存在することも
@@ -151,7 +151,10 @@ deadman は完成しない。#74 / #57 でこれらを接続し、startup / rest
 を実機検証することを、本番サービスを有効にする統合 PR の merge 条件とする。この #78 PR の
 merge だけでは #78 を完了扱いにせず、それまではサービスで Fan 制御を有効化しない。
 
-同じ統合 PR では #82 の保存済み `ControlTick` v1 互換を壊さず schema migration を用意し、
+同じ統合 PR では #82 の保存済み `ControlTick` v1〜v4 互換を壊さず schema migration を用意し、
 `CriticalSafetyDecision.disabled_inputs` と `config_is_provisional` を decision trace と起動ログへ
-永続化する。現状は Safety 裁定には両方が入るが `ControlTick` v1 には field が無いため、
+永続化する。現状は Safety 裁定には両方が入るが `ControlTick` v4 には field が無いため、
 この配線も本番有効化の blocker とする。
+
+`ControlTick` は #78 で schema version 4 とした（fault code `absolute_temperature_limit` と Top の
+`enable_reverted` の無条件 `EMERGENCY`）。保存済みの v1〜v3 は当時の規則のまま読める。
