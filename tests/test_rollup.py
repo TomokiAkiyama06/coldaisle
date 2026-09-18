@@ -664,6 +664,11 @@ def test_registered_metric_never_observed_is_not_filled(store):
     assert count == 0
 
 
+def _outage(first_minute: int, end_minute: int) -> list[tuple]:
+    """``[first_minute, end_minute)`` の0行バケット（2.5秒周期の期待値 24）。"""
+    return [(minute * MINUTE_MS, 0, 24) for minute in range(first_minute, end_minute)]
+
+
 def _minute_rows(store, metric: str) -> list[tuple]:
     return [
         tuple(row)
@@ -725,23 +730,19 @@ def test_disabled_period_is_not_an_outage_after_re_enabling(store):
     write(store, "air.room", 2 * MINUTE_MS, 26.0)
     # 登録中の停止（1〜2分目）は欠測として埋まる
     rollup_minutes(store, periodic_intervals_ms=intervals, now_ms=3 * MINUTE_MS)
-    # 無効化中のロールアップ（登録されない）
+    # 無効化を検出した実行。前回から検出時点（完了した10分目）までは、無効化の前の
+    # 停止かもしれないので欠測として埋める（設定変更の正確な時刻は分からない）
     write(store, "air.room", 10 * MINUTE_MS, 26.0)
     rollup_minutes(store, periodic_intervals_ms={}, now_ms=11 * MINUTE_MS)
-    # 再有効化。無効の間に登録されていなかった分と、再開前の分は埋めない
+    # 再有効化。検出後の無効期間と、再開前の分は埋めない
     write(store, "gpu.0.core", 20 * MINUTE_MS, 55.0)
     write(store, "air.room", 20 * MINUTE_MS, 26.0)
 
     rollup_minutes(store, periodic_intervals_ms=intervals, now_ms=23 * MINUTE_MS + 5_000)
 
-    assert _minute_rows(store, "gpu.0.core") == [
-        (0, 1, 24),
-        (MINUTE_MS, 0, 24),
-        (2 * MINUTE_MS, 0, 24),
-        (20 * MINUTE_MS, 1, 24),
-        (21 * MINUTE_MS, 0, 24),
-        (22 * MINUTE_MS, 0, 24),
-    ]
+    assert _minute_rows(store, "gpu.0.core") == (
+        [(0, 1, 24), *_outage(1, 11), (20 * MINUTE_MS, 1, 24), *_outage(21, 23)]
+    )
 
 
 def test_re_enabled_metric_is_not_filled_before_it_is_observed_again(store):
@@ -755,7 +756,8 @@ def test_re_enabled_metric_is_not_filled_before_it_is_observed_again(store):
 
     rollup_minutes(store, periodic_intervals_ms=intervals, now_ms=15 * MINUTE_MS)
 
-    assert _minute_rows(store, "gpu.0.core") == [(0, 1, 24), (MINUTE_MS, 0, 24)]
+    # 無効化を検出した10分目までだけ。再有効化後は観測が無いので埋めない
+    assert _minute_rows(store, "gpu.0.core") == [(0, 1, 24), *_outage(1, 11)]
 
 
 def test_quiet_disabled_period_is_not_an_outage_after_re_enabling(store):
@@ -763,18 +765,16 @@ def test_quiet_disabled_period_is_not_an_outage_after_re_enabling(store):
     intervals = {"gpu.0.core": 2_500}
     write(store, "gpu.0.core", 0, 55.0)
     rollup_minutes(store, periodic_intervals_ms=intervals, now_ms=MINUTE_MS)
-    # 無効化中のロールアップ。生データは1行も増えない
+    # 無効化を検出した実行（検出時点の4分目までは埋まる）。生データは1行も増えない
     rollup_minutes(store, periodic_intervals_ms={}, now_ms=5 * MINUTE_MS)
     write(store, "gpu.0.core", 10 * MINUTE_MS, 55.0)
 
     rollup_minutes(store, periodic_intervals_ms=intervals, now_ms=13 * MINUTE_MS)
 
-    assert _minute_rows(store, "gpu.0.core") == [
-        (0, 1, 24),
-        (10 * MINUTE_MS, 1, 24),
-        (11 * MINUTE_MS, 0, 24),
-        (12 * MINUTE_MS, 0, 24),
-    ]
+    # 検出後の無効期間（5〜9分目）は埋まらない
+    assert _minute_rows(store, "gpu.0.core") == (
+        [(0, 1, 24), *_outage(1, 5), (10 * MINUTE_MS, 1, 24), *_outage(11, 13)]
+    )
     state = store.connection.execute(
         "SELECT registered, active_from_ms FROM periodic_metric_registrations "
         "WHERE metric = 'gpu.0.core'"
@@ -789,11 +789,32 @@ def test_re_enabled_metric_waits_for_its_first_new_observation(store):
     rollup_minutes(store, periodic_intervals_ms=intervals, now_ms=MINUTE_MS)
     rollup_minutes(store, periodic_intervals_ms={}, now_ms=5 * MINUTE_MS)
     rollup_minutes(store, periodic_intervals_ms=intervals, now_ms=8 * MINUTE_MS)
-    assert _minute_rows(store, "gpu.0.core") == [(0, 1, 24)]
+    assert _minute_rows(store, "gpu.0.core") == [(0, 1, 24), *_outage(1, 5)]
 
     write(store, "gpu.0.core", 9 * MINUTE_MS, 55.0)
     rollup_minutes(store, periodic_intervals_ms=intervals, now_ms=12 * MINUTE_MS)
 
+    assert _minute_rows(store, "gpu.0.core") == (
+        [(0, 1, 24), *_outage(1, 5), (9 * MINUTE_MS, 1, 24), *_outage(10, 12)]
+    )
+
+
+def test_outage_before_disabling_is_filled_when_the_disable_is_detected(store):
+    """前回登録中 → collector 停止 → 無効化、の順でも、無効化を検出した実行で
+    検出時点（完了した分）までを前回の周期で埋めてから登録を外す。"""
+    intervals = {"gpu.0.core": 2_500}
+    write(store, "gpu.0.core", 0, 55.0)
+    rollup_minutes(store, periodic_intervals_ms=intervals, now_ms=MINUTE_MS)
+
+    rollup_minutes(store, periodic_intervals_ms={}, now_ms=6 * MINUTE_MS + 5_000)
+    # 外れたあとの実行では、もう埋めない
+    rollup_minutes(store, periodic_intervals_ms={}, now_ms=10 * MINUTE_MS)
+
     assert _minute_rows(store, "gpu.0.core") == [(0, 1, 24)] + [
-        (minute * MINUTE_MS, 1 if minute == 9 else 0, 24) for minute in (9, 10, 11)
+        (minute * MINUTE_MS, 0, 24) for minute in range(1, 6)
     ]
+    state = store.connection.execute(
+        "SELECT registered, changed_ms FROM periodic_metric_registrations "
+        "WHERE metric = 'gpu.0.core'"
+    ).fetchone()
+    assert tuple(state) == (0, 6 * MINUTE_MS + 5_000)

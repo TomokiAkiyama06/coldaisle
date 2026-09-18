@@ -13,10 +13,9 @@
 from __future__ import annotations
 
 import argparse
-import json
 import logging
 import sqlite3
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
@@ -113,18 +112,48 @@ def rollup_minutes(
     取り込みの書き込みロック待ちを短く保つ。
     """
     conn = store.connection
-    periodic = _periodic_expected_per_minute(periodic_intervals_ms or {})
+    _periodic_expected_per_minute(periodic_intervals_ms or {})  # 周期の検証だけ先に行う
+    newest = conn.execute("SELECT MAX(ts_ms) FROM readings").fetchone()[0]
+    start = conn.execute("SELECT MAX(bucket_ms) FROM readings_1m").fetchone()[0]
+    run_ms = now_ms if now_ms is not None else int(newest) if newest is not None else 0
+    with store.transaction():
+        registrations = _sync_registrations(conn, periodic_intervals_ms or {}, run_ms)
+    # 今回外れた metric（前回は登録中）も、この実行では前回の周期で埋める。
+    # 前回から今回までの停止は、無効にされる前の停止かもしれないため（決定記録 0038）
+    retiring = {
+        metric
+        for metric, state in registrations.items()
+        if metric not in (periodic_intervals_ms or {})
+    }
+    periodic = _periodic_expected_per_minute(
+        {metric: state.interval_ms for metric, state in registrations.items()}
+    )
+    try:
+        return _rollup_minutes(store, periodic, registrations, newest, start, now_ms)
+    finally:
+        # 穴埋めのあとで外す。途中で失敗しても、次の実行で同じ区間を埋め直せる
+        if retiring:
+            with store.transaction():
+                conn.executemany(
+                    "UPDATE periodic_metric_registrations SET registered = 0, changed_ms = ? "
+                    "WHERE metric = ?",
+                    [(run_ms, metric) for metric in sorted(retiring)],
+                )
+
+
+def _rollup_minutes(
+    store: SqliteStore,
+    periodic: Mapping[str, int],
+    registrations: Mapping[str, _Registration],
+    newest: int | None,
+    start: int | None,
+    now_ms: int | None,
+) -> int:
+    conn = store.connection
     # 最後に完了した分。進行中の分はまだ届く途中なので欠測に数えない
     completed_bucket = (
         _floor(now_ms, MINUTE_MS) - MINUTE_MS if now_ms is not None and periodic else None
     )
-    newest = conn.execute("SELECT MAX(ts_ms) FROM readings").fetchone()[0]
-    start = conn.execute("SELECT MAX(bucket_ms) FROM readings_1m").fetchone()[0]
-    # 登録状態は早期 return より前に記録する。何も集計しない実行でも、
-    # 「この時点で無効だった」ことを残さないと再有効化を見分けられない
-    run_ms = now_ms if now_ms is not None else int(newest) if newest is not None else 0
-    with store.transaction():
-        active_from = _sync_registrations(conn, periodic.keys(), run_ms)
     if newest is None:
         # 生データが全部消えても、観測済みの周期メトリクスの欠測は埋め続ける
         if start is None or completed_bucket is None:
@@ -168,7 +197,7 @@ def rollup_minutes(
             )
             written += int(cursor.rowcount)
             if metric in periodic:
-                metric_from = active_from.get(metric)
+                metric_from = registrations[metric].active_from_ms
                 if metric_from is not None:
                     written += _fill_absent_minutes(
                         conn,
@@ -182,28 +211,42 @@ def rollup_minutes(
     return written
 
 
-def _sync_registrations(
-    conn: sqlite3.Connection, registered: Iterable[str], run_ms: int
-) -> dict[str, int | None]:
-    """周期メトリクスの登録状態を保存し、欠測を数え始める時刻を返す（決定記録 0038）。
+@dataclass(frozen=True)
+class _Registration:
+    """この実行で周期メトリクスとして扱う metric の状態。"""
 
-    - 今回登録されていない既存の行は ``registered = 0`` にし、その時刻を残す
+    interval_ms: int
+    active_from_ms: int | None
+    """欠測を数え始める時刻。再開後にまだ観測が無ければ ``None``。"""
+
+
+def _sync_registrations(
+    conn: sqlite3.Connection, intervals_ms: Mapping[str, int], run_ms: int
+) -> dict[str, _Registration]:
+    """周期メトリクスの登録状態を保存し、この実行で扱う metric を返す（決定記録 0038）。
+
     - 初めて登録された、または無効から戻ったメトリクスは、その区間の
       **最初の観測**から欠測を数える。無効だった期間と、再開後の最初の観測より前は
-      欠測にしない。まだ観測が無ければ ``None``（今回は埋めない）
+      欠測にしない。まだ観測が無ければ ``active_from_ms = None``（今回は埋めない）
+    - 前回登録中で今回外れた metric も、保存した周期で返す。呼び出し側はこの実行の
+      上限まで埋めてから ``registered = 0`` にする。設定を変えた正確な時刻は分からない
+      ため、前回の実行から今回の検出までの停止は欠測として残す
 
     登録状態を readings から推測しないのは、全 source が静かな期間には痕跡が残らず、
     無効期間と停止を区別できないため。登録はロールアップの実行時にしか見えないので、
     2回の実行の間に無効化と再有効化の両方が起きた場合、その期間は欠測として残る。
     """
-    wanted = set(registered)
-    conn.execute(
-        "UPDATE periodic_metric_registrations SET registered = 0, changed_ms = ? "
-        "WHERE registered = 1 AND metric NOT IN (SELECT value FROM json_each(?))",
-        (run_ms, json.dumps(sorted(wanted))),
-    )
-    result: dict[str, int | None] = {}
-    for metric in sorted(wanted):
+    result: dict[str, _Registration] = {}
+    for row in conn.execute(
+        "SELECT metric, interval_ms, active_from_ms FROM periodic_metric_registrations "
+        "WHERE registered = 1"
+    ).fetchall():
+        if row[0] not in intervals_ms:
+            result[str(row[0])] = _Registration(
+                interval_ms=int(row[1]),
+                active_from_ms=None if row[2] is None else int(row[2]),
+            )
+    for metric in sorted(intervals_ms):
         row = conn.execute(
             "SELECT registered, since_ms, active_from_ms, changed_ms "
             "FROM periodic_metric_registrations WHERE metric = ?",
@@ -223,10 +266,11 @@ def _sync_registrations(
             )
         conn.execute(
             "INSERT OR REPLACE INTO periodic_metric_registrations "
-            "(metric, registered, since_ms, active_from_ms, changed_ms) VALUES (?, 1, ?, ?, ?)",
-            (metric, since, active, changed),
+            "(metric, registered, interval_ms, since_ms, active_from_ms, changed_ms) "
+            "VALUES (?, 1, ?, ?, ?, ?)",
+            (metric, intervals_ms[metric], since, active, changed),
         )
-        result[metric] = active
+        result[metric] = _Registration(interval_ms=intervals_ms[metric], active_from_ms=active)
     return result
 
 
