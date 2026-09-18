@@ -42,7 +42,12 @@ still raises Front make-up air rather than leaving Front at zero.
 
 - Exhaust-heavy candidates raise Front make-up air toward the configured target ratio.
 - Intake-heavy candidates raise Rear only when a thermal limit is active. Rear is exhausted first;
-  Top receives only the remaining case-auxiliary request.
+  Top receives only the remaining case-auxiliary request. This order is not a policy introduced by
+  this model: decision record 0026 (FINAL) states that normal case ventilation uses Front + Rear
+  and that Top `case_aux_exhaust_demand` rises only when Front + Rear are insufficient, and #81
+  repeats it. Selecting the exhaust zone from the #75 response matrix
+  (`docs/airflow-model.md` "Thermal effectiveness") would change that approved order and therefore
+  requires a new decision record that supersedes 0026 first.
 - A coordination proposal never lowers any candidate demand.
 - `requested.top` is explicitly tagged `case_aux_exhaust`. It is not CPU cooling demand and it does
   not contain a safety floor. Critical Safety still computes

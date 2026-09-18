@@ -423,6 +423,9 @@ class ConfiguredAirBalanceModel:
         demands: PerZone[Demand],
         estimate: AirBalanceEstimate,
     ) -> tuple[PerZone[Demand], list[Reason]]:
+        # Rear を先に使い切り、不足分だけ Top を上げる順序は決定記録 0026（FINAL）の
+        # 「通常のケース換気は Front + Rear、Top の case_aux_exhaust_demand は不足時のみ」に従う。
+        # response matrix による zone 選択へ変えるなら、0026 を置き換える決定記録が先に要る。
         assert estimate.q_front is not None
         assert estimate.q_rear is not None
         assert estimate.q_top is not None
