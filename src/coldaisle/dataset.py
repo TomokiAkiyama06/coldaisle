@@ -196,6 +196,9 @@ def _validate_dedicated_source_db(store: SqliteStore, source_run: SourceRun) -> 
     expected = (source_run.run_id, source_run.kind.value, source_run.source_sha256)
     if provenance != expected:
         raise ValueError("SourceRunがDBのimmutable provenanceと一致しない")
+    if not store.dataset_source_run_completed():
+        # 途中停止したrunは入力の先頭だけを持つ。全体hashの下で公開してはならない
+        raise ValueError("dataset source runが最後まで取り込まれていない（途中停止）")
 
 
 def _parse_tick(trace: ControlTraceRecord) -> tuple[ControlTick, dict[str, object]]:

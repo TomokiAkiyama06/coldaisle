@@ -65,6 +65,7 @@ dataset用Replayはconstructorで入力を定数memoryのchunkごとにunlink済
 copyと同時にhashする。先頭時刻と全sampleは同じsnapshot bytesから読み、元pathを再openしない。
 CSVが何本あってもsnapshotは1つの一時fileに連結し、保持するfile descriptorは1つにする。
 `--dataset-run-alias`付きのReplayは`--bulk`でも待ち行列が溢れたsampleを捨てず、空くまで待つ（backpressure）。`--max-samples`での途中停止も拒否する。DBがCSVの一部だけになると、provenanceの全体hashと食い違うためである。
+入力をEOFまで取り込めたときだけ、上書き不能な完了の印（`dataset_source_run_complete`）をDBへ記録する。SIGTERM / SIGINTなどで途中停止したrunには印を付けず、`coldaisle-daemon`は終了コード1を返す。builderは完了の印が無いDBを拒否する。途中停止したDBは破棄し、新しいDBで取り込み直す。
 通常Replayはこのcopy / eager hashをしない。後のdataset生成時に元CSVが変わっていれば、CLIの
 再hashがDBのsnapshot hashと一致せず生成を拒否する。
 

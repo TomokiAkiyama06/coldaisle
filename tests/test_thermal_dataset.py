@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -25,8 +26,10 @@ from coldaisle.daemon import Daemon
 from coldaisle.dataset import ThermalDatasetBuilder, replay_fingerprint, write_dataset
 from coldaisle.ingest.calibration import Calibration
 from coldaisle.ingest.normalize import Normalizer
+from coldaisle.ingest.protocol import RawMessage
 from coldaisle.ingest.replay import ReplaySource
 from coldaisle.store import Quality, Reading, Sample, SqliteStore
+from conftest import CALIBRATION_PATH, QUALITY_RULES_PATH
 
 CONTROL_FIXTURE = Path(__file__).resolve().parent / "fixtures" / "control_tick_v1.json"
 SHA256 = "a" * 64
@@ -102,6 +105,7 @@ def dataset_store(tmp_path, rules, clock):
             )
         )
         ControlTraceLogger(store).record(fixture_tick(ts_ms=5_000))
+        store.complete_dataset_source_run(at_ms=12_000)
         yield store
 
 
@@ -695,3 +699,122 @@ def test_dataset_replay_rejects_partial_runs(tmp_path, rules):
         with pytest.raises(ValueError, match="max_samples"):
             daemon.run(max_samples=1)
         assert store.dataset_source_run() is None
+
+
+class _InterruptedReplay(ReplaySource):
+    """数件流したところで停止要求（SIGTERM相当）を出すReplay。"""
+
+    on_interrupt: Callable[[], None] = staticmethod(lambda: None)
+
+    def stream(self) -> Iterator[RawMessage]:
+        for index, message in enumerate(super().stream()):
+            if index == 5:
+                self.on_interrupt()
+            yield message
+
+
+def _replay_run(tmp_path: Path, rows: int) -> SourceRun:
+    csv_path = tmp_path / "replay.csv"
+    _long_replay_csv(csv_path, rows)
+    return SourceRun(
+        run_id=RUN_ALIAS,
+        kind=DatasetSourceKind.REPLAY,
+        start_ms=0,
+        end_ms=rows * 1_000,
+        source_refs=(SOURCE_ALIAS,),
+        source_sha256=replay_fingerprint(csv_path),
+    )
+
+
+def test_interrupted_dataset_replay_is_not_marked_complete_and_cannot_build(tmp_path, rules):
+    """途中停止したDBは入力の先頭だけを持つ。全体hashのprovenanceで公開させない。"""
+    run = _replay_run(tmp_path, 200)
+    replay = _InterruptedReplay(
+        tmp_path / "replay.csv", tz=ZoneInfo("UTC"), bulk=True, dataset_provenance=True
+    )
+    with SqliteStore(tmp_path / "run.db", rules=rules, clock=replay.clock) as store:
+        daemon = Daemon(
+            source=replay,
+            store=store,
+            normalizer=Normalizer(rules=rules, calibration=Calibration(), clock=replay.clock),
+            source_name="replay",
+            dataset_run_alias=RUN_ALIAS,
+        )
+        replay.on_interrupt = daemon.request_stop
+        stats = daemon.run()
+        ControlTraceLogger(store).record(fixture_tick(ts_ms=5_000))
+
+        assert stats.dataset_incomplete
+        assert stats.samples < 200
+        assert not store.dataset_source_run_completed()
+        with pytest.raises(ValueError, match="途中停止"):
+            ThermalDatasetBuilder(store).build(source_run=run, spec=spec())
+
+
+def test_complete_dataset_replay_is_marked_complete_and_builds(tmp_path, rules):
+    run = _replay_run(tmp_path, 20)
+    replay = ReplaySource(
+        tmp_path / "replay.csv", tz=ZoneInfo("UTC"), bulk=True, dataset_provenance=True
+    )
+    with SqliteStore(tmp_path / "run.db", rules=rules, clock=replay.clock) as store:
+        daemon = Daemon(
+            source=replay,
+            store=store,
+            normalizer=Normalizer(rules=rules, calibration=Calibration(), clock=replay.clock),
+            source_name="replay",
+            dataset_run_alias=RUN_ALIAS,
+        )
+        stats = daemon.run()
+        ControlTraceLogger(store).record(fixture_tick(ts_ms=5_000))
+
+        assert not stats.dataset_incomplete
+        assert store.dataset_source_run_completed()
+        assert ThermalDatasetBuilder(store).build(source_run=run, spec=spec()).examples
+
+
+def test_completion_marker_is_immutable_and_requires_a_bind(dataset_store, tmp_path, rules, clock):
+    with pytest.raises(ValueError, match="完了"):
+        dataset_store.complete_dataset_source_run(at_ms=13_000)
+    with pytest.raises(sqlite3.IntegrityError, match="immutable"):
+        dataset_store.connection.execute("DELETE FROM dataset_source_run_complete")
+    with (
+        SqliteStore(tmp_path / "unbound.db", rules=rules, clock=clock) as store,
+        pytest.raises(ValueError, match="完了"),
+    ):
+        store.complete_dataset_source_run(at_ms=0)
+
+
+@pytest.mark.parametrize(("interrupt", "expected_code"), [(True, 1), (False, 0)])
+def test_daemon_cli_exits_non_zero_when_dataset_replay_is_interrupted(
+    tmp_path, monkeypatch, interrupt, expected_code
+):
+    _long_replay_csv(tmp_path / "replay.csv", 20)
+    original_run = Daemon.run
+
+    def run(self: Daemon, *, max_samples: int | None = None):
+        if interrupt:
+            self.request_stop()  # 取り込み中のSIGTERMと同じ経路
+        return original_run(self, max_samples=max_samples)
+
+    monkeypatch.setattr(Daemon, "run", run)
+    code = daemon_module.main(
+        [
+            "--source",
+            "replay",
+            "--csv",
+            str(tmp_path / "replay.csv"),
+            "--bulk",
+            "--timezone",
+            "UTC",
+            "--dataset-run-alias",
+            RUN_ALIAS,
+            "--db",
+            str(tmp_path / "cli.db"),
+            "--quality-rules",
+            str(QUALITY_RULES_PATH),
+            "--calibration",
+            str(CALIBRATION_PATH),
+        ]
+    )
+
+    assert code == expected_code

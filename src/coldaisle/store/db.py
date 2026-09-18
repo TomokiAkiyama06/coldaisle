@@ -584,6 +584,30 @@ class SqliteStore:
             return None
         return (str(row["run_alias"]), str(row["source_kind"]), str(row["source_sha256"]))
 
+    def complete_dataset_source_run(self, *, at_ms: int) -> None:
+        """bind済みrunが入力を最後まで取り込んだことを、上書き不能で1回だけ記録する。
+
+        bindは入力全体のhashを先に固定するため、途中停止したrunと区別する印が要る。
+        """
+        if at_ms < 0:
+            raise ValueError("dataset source runの完了時刻が不正")
+        try:
+            with self.transaction():
+                self._conn.execute(
+                    "INSERT INTO dataset_source_run_complete (singleton, completed_ms) "
+                    "VALUES (1, ?)",
+                    (at_ms,),
+                )
+        except sqlite3.IntegrityError as exc:
+            raise ValueError("dataset source runを完了として記録できない") from exc
+
+    def dataset_source_run_completed(self) -> bool:
+        """bind済みrunが入力を最後まで取り込み終えているか。"""
+        row = self._conn.execute(
+            "SELECT 1 FROM dataset_source_run_complete WHERE singleton = 1"
+        ).fetchone()
+        return row is not None
+
     def active_alert(self, rule_id: str, metric: str | None) -> AlertRecord | None:
         """未解決（`pending` / `firing`）のアラート。
 

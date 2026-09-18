@@ -78,6 +78,11 @@ def test_migration_creates_exactly_the_decided_objects():
         ("trigger", "dataset_source_run_no_second_insert"),
         ("trigger", "dataset_source_run_no_update"),
         ("trigger", "dataset_source_run_no_delete"),
+        ("table", "dataset_source_run_complete"),
+        ("trigger", "dataset_source_run_complete_requires_bind"),
+        ("trigger", "dataset_source_run_complete_no_second_insert"),
+        ("trigger", "dataset_source_run_complete_no_update"),
+        ("trigger", "dataset_source_run_complete_no_delete"),
     }
 
 

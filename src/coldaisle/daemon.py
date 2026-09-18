@@ -105,6 +105,8 @@ class Stats:
     explanations: int = 0
     """後追いで送った Evidence 形式の説明の数（#38）。"""
     unknown_channels: set[str] = field(default_factory=set)
+    dataset_incomplete: bool = False
+    """dataset用Replayが入力の最後まで届かずに止まった（#83）。完了の印は付けない。"""
 
     def as_fields(self) -> dict[str, object]:
         return {
@@ -120,6 +122,7 @@ class Stats:
             "notifications": self.notifications,
             "explanations": self.explanations,
             "unknown_channels": sorted(self.unknown_channels),
+            "dataset_incomplete": self.dataset_incomplete,
         }
 
 
@@ -152,6 +155,7 @@ class Daemon:
         self._tick_s = tick_s
         self._latest_values: dict[str, float | None] = {}
         self._stop = False
+        self._source_exhausted = False
         self._device_id: str | None = None
         self._reported_drops = 0
         self.stats = Stats()
@@ -233,6 +237,7 @@ class Daemon:
         )
         reader = threading.Thread(target=self._read_into, args=(inbox,), daemon=True)
         reader.start()
+        reached_eof = False
         while True:
             if self._stop:
                 LOGGER.info("停止要求を受けた")
@@ -243,7 +248,9 @@ class Daemon:
                 self._tick()
                 continue
             if received is None:
-                break  # ソースが尽きた
+                # 読み取りスレッドは停止要求で抜けたときも None を送る。尽きたのかを区別する
+                reached_eof = self._source_exhausted
+                break
             if isinstance(received, BaseException):
                 # **ソースが落ちたことを正常終了と区別する。** 同じに扱うと、
                 # 途中で死んだ監視をサービス管理（systemd）が再起動できない。
@@ -253,6 +260,8 @@ class Daemon:
             self._handle(*received)
             if max_samples is not None and self.stats.samples >= max_samples:
                 break
+        if self._dataset_run_alias is not None:
+            self._finish_dataset_run(reached_eof=reached_eof)
         if self._explain_thread is not None:
             self._explain_queue.put(None)
             self._explain_thread.join(timeout=5.0)
@@ -290,10 +299,25 @@ class Daemon:
                         inbox.get_nowait()
                     self.stats.queue_drops += 1
                     inbox.put(received)
+            else:
+                # break せずに抜けた＝ソースを最後まで読んだ。None より先に立てる
+                self._source_exhausted = True
         except Exception as error:
             inbox.put(error)
         else:
             inbox.put(None)
+
+    def _finish_dataset_run(self, *, reached_eof: bool) -> None:
+        """dataset用Replayを、EOFまで取り込めたときだけ完了として記録する。
+
+        bindは入力全体のhashを先に固定する。停止要求で途中終了したDBに完了の印を
+        付けると、先頭だけのdatasetが全体のprovenanceで公開されてしまう。
+        """
+        if reached_eof:
+            self._store.complete_dataset_source_run(at_ms=self._normalizer.clock.now_ms())
+            return
+        self.stats.dataset_incomplete = True
+        LOGGER.error("dataset用Replayが途中で止まった。このDBからdatasetは作れない")
 
     def _put_blocking(
         self,
@@ -790,10 +814,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     signal.signal(signal.SIGTERM, _stop)
     signal.signal(signal.SIGINT, _stop)
     try:
-        daemon.run(max_samples=args.max_samples)
+        stats = daemon.run(max_samples=args.max_samples)
     finally:
         daemon.store.close()
-    return 0
+    # 途中停止したdataset Replayを成功として終えると、後段が完了済みと誤認する
+    return 1 if stats.dataset_incomplete else 0
 
 
 if __name__ == "__main__":  # pragma: no cover - `python -m coldaisle.daemon`
