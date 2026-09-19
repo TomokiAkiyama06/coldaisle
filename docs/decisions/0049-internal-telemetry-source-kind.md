@@ -9,6 +9,7 @@
   [`0040-server-health-api.md`](0040-server-health-api.md) /
   [`0046-airflow-ui.md`](0046-airflow-ui.md) §2.7 /
   [`0047-cpu-utilization-metric.md`](0047-cpu-utilization-metric.md) /
+  [`0051-airflow-cpu-utilization-display.md`](0051-airflow-cpu-utilization-display.md) §2.1 /
   #106 / PR #140 / PR #146
 - **対象 Issue**: #147
 
@@ -120,6 +121,10 @@
   `null` になり、今と同じ「読み取り値」に留まる
 - データの鮮度（古い・未来）は従来どおり health の `stale` / 各値の quality で別に言う（§2.6）
 - 札と注記の語は画面側（`airflow-status.js`）に持つ。`air.*` 用の `INGEST_KINDS` と同じ扱い
+- **0051 §2.1 の「内部テレメトリの『読み取り値』」も、CPU 使用率のいまの値については
+  本記録の札に従う。** 0051 の「未計測 / 未取得」の判断（`cpu_utilization.measured`、
+  `sys.telemetry_source.proc_stat` の状態から決める）は変えない。**値があるかどうか**は 0051、
+  **その値の出どころ**は本記録で、別の軸として扱う
 - 判定は純粋関数にし、既存の JS テスト（0044）で DB 無しに検証する
 
 ### 2.6 受け入れる限界（仕組みで防がない）
