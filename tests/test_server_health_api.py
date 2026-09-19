@@ -1082,3 +1082,55 @@ def test_read_snapshot_is_read_only_and_closes_on_error(healthy_db, rules):
         # トランザクションが閉じていれば、続けて書き込める
         store.set_system_state("sys.gpu_mode", "compute", at_ms=NOW_MS + 1)
         assert store.current_state("sys.gpu_mode") == "compute"
+
+
+@pytest.mark.parametrize("reported", ["ok", "degraded"])
+def test_nvml_without_enabled_inputs_keeps_the_reported_state(tmp_path, rules, reported):
+    """有効な NVML 入力が無ければ、必須 metric が古くても報告状態を使う（0042 §2.4）。"""
+    path = tmp_path / "nvml-no-inputs.db"
+    _table_db(
+        path,
+        rules,
+        {"gpu.0.core": "stale", "power.gpu.0": "stale"},
+        nvml_state=reported,
+    )
+    with TestClient(
+        _app(path, SimulatedClock(NOW_MS), hwmon_metrics=TABLE_HWMON, nvml_metrics=())
+    ) as client:
+        body = client.get("/api/v1/server-health").json()
+
+    assert body["sources"]["nvml"]["status"] == reported
+    assert "no fresh" not in body["sources"]["nvml"]["detail"]
+    # 監視必須 metric は signal の判定対象に残る（0042 §2.2）。stale なので yellow
+    assert body["signal"] == "yellow"
+
+
+@pytest.mark.parametrize("reported", ["ok", "degraded"])
+def test_nvml_without_enabled_inputs_and_fresh_values_follows_the_report(tmp_path, rules, reported):
+    path = tmp_path / "nvml-no-inputs-fresh.db"
+    _table_db(path, rules, {}, nvml_state=reported)
+    with TestClient(
+        _app(path, SimulatedClock(NOW_MS), hwmon_metrics=TABLE_HWMON, nvml_metrics=())
+    ) as client:
+        body = client.get("/api/v1/server-health").json()
+
+    assert body["sources"]["nvml"]["status"] == reported
+    assert body["signal"] == ("green" if reported == "ok" else "yellow")
+
+
+@pytest.mark.parametrize("reported", ["ok", "degraded"])
+def test_nvml_with_enabled_inputs_still_applies_quality_rules(tmp_path, rules, reported):
+    """有効な入力があれば、必須 metric が1本も届かないとき unavailable（red）。"""
+    path = tmp_path / "nvml-inputs-stale.db"
+    _table_db(
+        path,
+        rules,
+        {"gpu.0.core": "stale", "power.gpu.0": "stale"},
+        nvml_state=reported,
+    )
+    with TestClient(_app(path, SimulatedClock(NOW_MS), hwmon_metrics=TABLE_HWMON)) as client:
+        body = client.get("/api/v1/server-health").json()
+
+    assert body["sources"]["nvml"]["status"] == "unavailable"
+    assert "no fresh required NVML telemetry" in body["sources"]["nvml"]["detail"]
+    assert body["signal"] == "red"

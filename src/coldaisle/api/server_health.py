@@ -139,7 +139,7 @@ def build_server_health(
         # 一覧は新しい順に打ち切るため、重大度は件数上限の無い集計から判定する
         alerts = list(store.alerts(state="firing", limit=settings.active_alerts_limit))
         firing = store.alert_severity_counts(state="firing")
-        sources = _monitoring_sources(store, readings, settings, hwmon_metrics)
+        sources = _monitoring_sources(store, readings, settings, hwmon_metrics, nvml_metrics)
         gpu_mode = store.current_state("sys.gpu_mode") or "unknown"
     # 無効化・撤去した入力の最後の行は store.latest() に残り続け、やがて stale になる。
     # 監視していない metric で signal を下げないよう、必須 metric と現在有効な入力だけを
@@ -207,6 +207,7 @@ def _monitoring_sources(
     readings: Mapping[str, LatestReading],
     settings: ServerHealthSettings,
     hwmon_metrics: tuple[str, ...],
+    nvml_metrics: tuple[str, ...],
 ) -> HealthSources:
     ingest_source = store.current_state("sys.ingest_source")
     sensor_unit = _source_from_metrics(
@@ -217,9 +218,12 @@ def _monitoring_sources(
         metric_role="required sensor",
     )
     nvml_state = _source_status(store.current_state(SOURCE_STATE_PREFIX + "nvml"))
+    # 有効な NVML 入力（adapter の expected metrics）が無いときは、lm_sensors と同じく
+    # 評価する metric を空にし、報告状態をそのまま使う（決定記録 0042 §2.4）。
+    # 入力があるときの quality 規則は、従来どおり監視必須 metric で評価する
     nvml = _source_from_metrics(
         nvml_state,
-        settings.sources.nvml.required,
+        settings.sources.nvml.required if nvml_metrics else (),
         readings,
         detail=f"collector_state={nvml_state.value}" if nvml_state else "collector state missing",
         metric_role="required NVML",
