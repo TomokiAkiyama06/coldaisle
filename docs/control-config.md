@@ -116,6 +116,8 @@ v1〜v5は自動補完せず起動前に拒否する。
 現行 Control Config v6 は設定の live reload を行わない。設定変更は候補全体を別オブジェクトで検証したうえで
 **次回再起動時**にだけ反映する。これにより、変更後の設定も必ず `STARTUP` の Max を通る。
 `trace_metadata()` は、採用されたsource名・schema version・SHA-256を #82 の decision traceへ渡す。
+Confidence / OOD の判断（`model_gate`）には検証済み assessment の値だけを書き、裏付けの無い tick は
+`attested: false` として confidence / ood を残さない（決定記録 0050 §2.6）。
 
 #78 で Safety Config に `stall_check_min_demand`・`write_fail_emergency_after`・
 `cpu_power_cooling_floor`（`power_w` / `demand` の曲線）・`telemetry.cpu_power_ms` を

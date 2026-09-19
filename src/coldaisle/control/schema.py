@@ -452,8 +452,18 @@ class ModelGateDecision(_Frozen):
     model_version: str = Field(min_length=1, max_length=120)
     inference_id: str = Field(pattern=r"^[0-9a-f]{64}$")
     """判定した推論（入力と予測）の識別子。提案の ``inference_id`` と同じ。"""
-    confidence: float = Field(ge=0.0, le=1.0, allow_inf_nan=False)
-    ood: bool
+    attested: bool
+    """検証済み assessment に裏付けられた記録か。
+
+    **裏付けの無い提案の数値を trace に書かない。** 後から評価（#90 / #91）や stage の判断（#92）が
+    読むため、提案が自称した confidence / ood をそのまま残すと、OOD の推論が HIGH に見えてしまう。
+    """
+    confidence: float | None = Field(default=None, ge=0.0, le=1.0, allow_inf_nan=False)
+    """検証済み assessment の confidence。``attested`` でなければ None。"""
+    ood: bool | None = None
+    """検証済み assessment の ood。``attested`` でなければ None。"""
+    proposal_mismatch: Reason | None = None
+    """assessment は検証できたが、提案の自称値がそれと違ったときの理由。"""
     confidence_level: ConfidenceLevel
     authority_stage: AuthorityStage
     learned_selected: bool
@@ -467,9 +477,20 @@ class ModelGateDecision(_Frozen):
     def _authority_matches_confidence(self) -> Self:
         if len(set(self.limits)) != len(self.limits):
             raise ValueError("authority limit の根拠を重複させない")
+        if self.attested != (self.confidence is not None):
+            raise ValueError("attested な記録だけが confidence を持つ")
+        if (self.confidence is None) != (self.ood is None):
+            raise ValueError("model_gate の confidence と ood は一緒に記録する")
+        if not self.attested:
+            if self.confidence_level is not ConfidenceLevel.LOW:
+                raise ValueError("裏付けの無い記録の confidence level は LOW にする")
+            if self.proposal_mismatch is not None:
+                raise ValueError("assessment を検証できていない記録に不一致の理由を付けない")
         if self.ood and self.confidence_level is not ConfidenceLevel.LOW:
             raise ValueError("OOD の confidence level は LOW にする")
         if self.learned_selected:
+            if not self.attested:
+                raise ValueError("裏付けの無い提案を active controller にしない")
             if self.confidence_level is ConfidenceLevel.LOW:
                 raise ValueError("LOW confidence の Learned MPC を選ばない（0050 §2.4）")
             if self.authority_stage is AuthorityStage.SHADOW:
@@ -812,6 +833,7 @@ class ControlTick(_Frozen):
             gate.confidence,
             gate.ood,
         ):
+            # 裏付けの無い tick では gate 側が None なので、ControlState にも数値を残さない。
             raise ValueError(
                 "ControlState の model_version / confidence / ood を model_gate と揃える"
             )

@@ -212,8 +212,16 @@ model_confidence:
 
 `ControlTick` の schema version を 5 に上げ、`model_gate`（`ModelGateDecision`）を追加する。
 
-- 中身: model version、推論の識別子（`inference_id`）、confidence、ood、confidence level、authority stage、Learned MPC を選んだか、
+- 中身: model version、推論の識別子（`inference_id`）、裏付けの有無（`attested`）、confidence、ood、
+  提案の自称値との不一致（`proposal_mismatch`）、confidence level、authority stage、Learned MPC を選んだか、
   適用した制限（`stage_band` / `stage_zone` / `medium_confidence_band`）、構成要素ごとの理由（最大16件）
+- **記録するのは検証できた値だけ。** confidence / ood は検証済み assessment の値を書く。提案が自称した値は
+  書かない。assessment が無い・束縛できない tick は `attested: false` とし、confidence / ood / 理由を
+  空のまま残す（level は LOW）。提案の自称値が assessment と違えば、assessment の値を書いたうえで
+  `proposal_mismatch` に差分を残す。後から評価（#90 / #91）と stage の判断（#92）が読むため、
+  OOD の推論が HIGH に見える記録を作らない
+- `ControlState` の `model_confidence` / `model_ood` も同じ値にする。`attested: false` の tick では
+  どちらも `null` にする
 - **demand を持たない。** requested / effective は従来どおり zone の記録に残る
 - v5 で Learned MPC を active にした tick には `model_gate` を必須とし、`ControlState` の
   `model_version` / `model_confidence` / `model_ood` / `authority_stage` / `active_controller` と一致させる

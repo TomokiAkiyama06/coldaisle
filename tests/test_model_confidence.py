@@ -851,6 +851,7 @@ def test_v5_trace_requires_consistent_model_gate_for_learned_ticks() -> None:
         ModelGateDecision(
             model_version="thermal-v1",
             inference_id="c" * 64,
+            attested=True,
             confidence=0.0,
             ood=True,
             confidence_level=ConfidenceLevel.MEDIUM,
@@ -861,6 +862,7 @@ def test_v5_trace_requires_consistent_model_gate_for_learned_ticks() -> None:
         ModelGateDecision(
             model_version="thermal-v1",
             inference_id="c" * 64,
+            attested=True,
             confidence=0.8,
             ood=False,
             confidence_level=ConfidenceLevel.MEDIUM,
@@ -1378,3 +1380,99 @@ def test_confidence_layer_stays_upstream_of_guard_and_safety() -> None:
     # Gate が返せるのは requested までで、effective / PWM を表す型を持たない
     assert "effective" not in set(ControllerSelection.model_fields)
     assert set(ControllerProposal.model_fields) & {"effective", "pwm", "pwm_raw"} == set()
+
+
+def _assessed(trained, *, ood_input: bool):
+    """Registry 検証済みの assessment と、その推論に対する素の提案を作る。"""
+    _data, parts, model, profile = trained
+    base = ObservedThermalInput.from_example(parts.test[7])
+    observed = shifted(base, air=35.0) if ood_input else base
+    assessment = _deployed(
+        assessor(profile).assess(
+            observed,
+            model.predict(observed),
+            evidence(profile, 1.0, at=observed.action_ts_ms),
+        )
+    )
+    assert assessment.ood is ood_input
+    return assessment
+
+
+def test_trace_records_the_verified_assessment_not_the_proposal_claim(trained) -> None:
+    """不変条件 T1: trace には検証できた値だけを残す（OOD を HIGH に見せない）。"""
+    assessment = _assessed(trained, ood_input=True)
+    # 提案は「OOD ではない・高 confidence」と自称する
+    liar = learned_proposal(0.9, confidence=0.99, ood=False, inference_id=assessment.inference_id)
+    gate = _active_gate(AuthorityStage.FULL)
+    selected = _select(gate, 1, liar, assessment)
+
+    assert selected.active_controller is ControllerKind.FALLBACK
+    assert selected.fallback_reason is not None and selected.fallback_reason.code == "ood"
+    record = selected.model_gate
+    assert record is not None
+    assert record.attested is True
+    assert (record.confidence, record.ood) == (assessment.confidence, assessment.ood)
+    assert record.confidence_level is ConfidenceLevel.LOW
+    assert record.proposal_mismatch is not None
+    assert "proposal_confidence=0.99" in record.proposal_mismatch.detail
+    assert record.assessment == assessment.trace_reasons()
+
+
+def test_trace_keeps_the_assessed_confidence_when_the_proposal_inflates_it(trained) -> None:
+    assessment = _assessed(trained, ood_input=False)
+    inflated = learned_proposal(0.9, confidence=1.0, inference_id=assessment.inference_id)
+    gate = _active_gate(AuthorityStage.FULL)
+    selected = _select(gate, 1, inflated, assessment)
+
+    assert selected.fallback_reason is not None
+    assert selected.fallback_reason.code == "confidence_unattested"
+    record = selected.model_gate
+    assert record is not None
+    assert record.confidence == assessment.confidence != 1.0
+    assert record.proposal_mismatch is not None
+    assert record.learned_selected is False
+
+
+def test_trace_marks_a_proposal_without_an_assessment_as_unattested(trained) -> None:
+    assessment = _assessed(trained, ood_input=False)
+    proposal = learned_proposal(0.9, confidence=0.99, inference_id=assessment.inference_id)
+    gate = _active_gate(AuthorityStage.FULL)
+    selected = _select(gate, 1, proposal, None)
+
+    record = selected.model_gate
+    assert record is not None
+    assert record.attested is False
+    assert (record.confidence, record.ood, record.assessment) == (None, None, ())
+    assert record.confidence_level is ConfidenceLevel.LOW
+    assert record.proposal_mismatch is None
+    # 裏付けの無い tick では ControlState にも数値を残さない
+    tick = _trace_tick(selected)
+    payload = json.loads(tick.model_dump_json())
+    assert payload["state"]["model_confidence"] is None
+    assert payload["model_gate"]["attested"] is False
+    payload["state"]["model_confidence"] = 0.99
+    with pytest.raises(ValidationError, match="揃える"):
+        ControlTick.model_validate_json(json.dumps(payload))
+
+
+def test_trace_rejects_recording_numbers_without_attestation() -> None:
+    with pytest.raises(ValidationError, match="attested"):
+        ModelGateDecision(
+            model_version="thermal-v1",
+            inference_id="c" * 64,
+            attested=False,
+            confidence=0.9,
+            ood=False,
+            confidence_level=ConfidenceLevel.LOW,
+            authority_stage=AuthorityStage.FULL,
+            learned_selected=False,
+        )
+    with pytest.raises(ValidationError, match="裏付けの無い提案"):
+        ModelGateDecision(
+            model_version="thermal-v1",
+            inference_id="c" * 64,
+            attested=False,
+            confidence_level=ConfidenceLevel.LOW,
+            authority_stage=AuthorityStage.FULL,
+            learned_selected=True,
+        )

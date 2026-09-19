@@ -480,30 +480,56 @@ class ControllerGate:
         selected: ControllerProposal,
         limits: tuple[AuthorityLimitSource, ...],
     ) -> ModelGateDecision | None:
+        """この tick の判断を trace へ残す。**検証できた値だけ**を記録する。"""
         proposal = learned.proposal
         if proposal is None:
             return None
         assert proposal.model_version is not None
-        assert proposal.confidence is not None and proposal.ood is not None
-        stage = self._policy.authority_stage
         assert proposal.inference_id is not None
+        stage = self._policy.authority_stage
+        learned_selected = selected.controller is ControllerKind.LEARNED_MPC
+        assessment = learned.assessment
+        if assessment is None or self._attestation_failure(proposal, assessment) is not None:
+            # 提案が自称した confidence / ood は残さない。評価と stage の判断が誤読するため。
+            return ModelGateDecision(
+                model_version=proposal.model_version,
+                inference_id=proposal.inference_id,
+                attested=False,
+                confidence_level=ConfidenceLevel.LOW,
+                authority_stage=stage,
+                learned_selected=False,
+                # 束縛できない assessment の理由も残さない。別の推論の理由を、この tick の
+                # 判断の根拠として読まれるため。
+                assessment=(),
+            )
+        mismatch = None
+        if (proposal.confidence, proposal.ood) != (assessment.confidence, assessment.ood):
+            mismatch = Reason(
+                code="proposal_mismatch",
+                detail=(
+                    f"proposal_confidence={proposal.confidence}; "
+                    f"proposal_ood={proposal.ood}; "
+                    f"assessed_confidence={assessment.confidence:.6f}; "
+                    f"assessed_ood={assessment.ood}"
+                ),
+            )
         return ModelGateDecision(
             model_version=proposal.model_version,
             inference_id=proposal.inference_id,
-            confidence=proposal.confidence,
-            ood=proposal.ood,
+            attested=True,
+            confidence=assessment.confidence,
+            ood=assessment.ood,
+            proposal_mismatch=mismatch,
             confidence_level=classify_confidence(
-                self._policy, confidence=proposal.confidence, ood=proposal.ood, stage=stage
+                self._policy,
+                confidence=assessment.confidence,
+                ood=assessment.ood,
+                stage=stage,
             ),
             authority_stage=stage,
-            learned_selected=selected.controller is ControllerKind.LEARNED_MPC,
+            learned_selected=learned_selected,
             limits=limits,
-            assessment=(
-                ()
-                if learned.assessment is None
-                or learned.assessment.inference_id != proposal.inference_id
-                else learned.assessment.trace_reasons()
-            ),
+            assessment=assessment.trace_reasons(),
         )
 
     def _remember(
