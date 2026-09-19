@@ -15,6 +15,9 @@
 
 const MOCK_SCENARIOS = { "1": "normal", normal: "normal", override: "override", throttle: "throttle" };
 
+// 見出しの出どころ（health.source）は空気の温度（取り込み経路）だけのもの。そう明記する
+const AIR_SOURCE_PREFIX = "空気の温度：";
+
 const MOCK_LABELS = {
   normal: "模擬データ（通常）",
   override: "模擬データ（異常時）",
@@ -319,13 +322,18 @@ function renderSource() {
       "模擬データを表示中 — 実機の値でも実際の制御の状態でもありません（URL から ?mock= を外すと API のデータ）"
     );
   } else if (page.ingestSource === undefined) {
-    source.textContent = "出どころを確認中…"; // health が届くまで「実機」と言わない
+    source.textContent = `${AIR_SOURCE_PREFIX}出どころを確認中…`; // health が届くまで「実機」と言わない
   } else {
     // **`?mock=` が無いことを「実機」とみなさない。** health.source で決める（決定記録 0046 §2.7）
+    // health.source は取り込み経路（空気の温度）だけの出どころなので、そう書く（Codex P2）
     const label = window.ColdaisleAirflowStatus.ingestSourceLabel(page.ingestSource);
-    source.textContent = page.pageNote ? `${label.text}（${page.pageNote}）` : label.text;
+    source.textContent = `${AIR_SOURCE_PREFIX}${page.pageNote ? `${label.text}（${page.pageNote}）` : label.text}`;
     source.classList.toggle("mock", !label.live);
   }
+  // 内部テレメトリの出どころ。見出しに置き、グラフのタブでも見えるようにする
+  const telemetry = document.getElementById("telemetry-label");
+  telemetry.textContent = `回転数・PWM・CPU・GPU：${valueKind("fan.front.pwm")}`;
+  telemetry.classList.toggle("mock", Boolean(page.mockName));
   document.getElementById("value-kind-key").textContent =
     `空気の温度＝${valueKind("air.room")}、回転数・PWM・CPU・GPU＝${valueKind("fan.front.pwm")}`;
   decision.textContent = page.control && page.control.decision_id ? `判断 ${page.control.decision_id}` : "";

@@ -658,3 +658,25 @@ def test_the_page_has_no_fixed_measured_wording():
     ]
     assert 'getElementById("value-kind-key")' in render
     assert 'id="value-kind-key"' in _text(PAGE)
+
+
+def test_the_header_names_each_provenance_on_both_tabs():
+    """見出しは経路ごとに出す。**health.source は空気の温度の出どころとして書く**（Codex P2）。"""
+    page = _text(PAGE)
+    header = page[page.index('<header class="af-header">') : page.index("</header>")]
+    assert 'id="source-label"' in header
+    assert "空気の温度：" in header
+    assert 'id="telemetry-label"' in header
+    # 見出しはタブの外（どちらのタブでも見える）
+    assert page.index("</header>") < page.index('<main id="view-now"')
+    assert page.index("</header>") < page.index('<main id="view-graph"')
+
+    script = _text(SCRIPT)
+    assert 'const AIR_SOURCE_PREFIX = "空気の温度：";' in script
+    render = script[
+        script.index("function renderSource()") : script.index("function renderControl()")
+    ]
+    assert "`${AIR_SOURCE_PREFIX}出どころを確認中…`" in render
+    assert "`${AIR_SOURCE_PREFIX}${" in render
+    assert 'getElementById("telemetry-label")' in render
+    assert 'valueKind("fan.front.pwm")' in render
