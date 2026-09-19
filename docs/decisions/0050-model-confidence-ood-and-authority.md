@@ -1,7 +1,7 @@
 # 決定記録 0050: Model Confidence / OOD の判定方式と confidence に応じた Authority 制限
 
 - **種別**: Decision Record
-- **Status**: Proposed
+- **Status**: FINAL（2026-09-20、リポジトリ所有者が承認）
 - **Date**: 2026-09-19
 - **Supersedes**: なし
 - **関連**: [`0027-fan-control-architecture.md`](0027-fan-control-architecture.md) /
@@ -145,6 +145,13 @@ Gate は tick ごとに confidence を3つに分ける。
   帯なしの authority を得てしまう
 - `cap_before_residual_evidence < high_min_confidence` を設定検証で強制する。予測が当たっている証拠が
   無い間に HIGH（帯なし）へ届かせない
+- **`cap_without_uncertainty` は設定のままとし、上限をコードで強制しない**（2026-09-20、所有者の判断）。
+  uncertainty を出さないモデルを構造的に HIGH から締め出すのではなく、**学習が進むにつれて設定で
+  authority を広げる**。学習期間は保守的な暫定値（2.5）で MEDIUM に留め、#90 / #91 の評価で証拠が
+  積み上がった段階で所有者が値を広げる。
+  危険温度への対応は confidence に依存しない。Reactive Guard（#80）と Critical Safety（#78）が
+  決定論的に floor / forced Max を掛ける（0028 §2.4）。Confidence / OOD が動かせるのは
+  **その前段の `requested` だけ**である（2.3）
 - SHADOW の tick も記録用に level を付ける（最も緩い LIMITED の下限で分ける）。requested は Fallback のまま
 - 昇格は引き続き人だけが行う（0028 §2.9 承認点 5）。confidence は stage を**上げない**。下げる向き（帯を狭める・Fallback）にだけ働く
 
@@ -171,6 +178,32 @@ model_confidence:
   cap_without_uncertainty: {value: ..., status: provisional}
   cap_before_residual_evidence: {value: ..., status: provisional}
 ```
+
+**学習期間の暫定値**（2026-09-20、所有者の方針。値は実データの評価で広げる）。
+`status: provisional` のまま運用し、`basis` に評価の記録を付けて広げていく。
+
+```yaml
+model_confidence:
+  high_min_confidence: {value: 0.90, status: provisional}
+  medium_limit:
+    limit_up: {value: 0.10, status: provisional}
+    limit_down: {value: 0.05, status: provisional}
+  range_margin: {value: 0.05, status: provisional}
+  min_support_count: {value: 5, status: provisional}
+  full_support_count: {value: 50, status: provisional}
+  min_missing_pattern_count: {value: 5, status: provisional}
+  residual_window: {value: 50, status: provisional}
+  residual_min_samples: {value: 20, status: provisional}
+  residual_match_tolerance_ms: {value: 1000, status: provisional}   # 最短 horizon より小さくする
+  residual_max_age_ms: {value: 900000, status: provisional}
+  residual_drift_ood_ratio: {value: 2.0, status: provisional}
+  cap_without_uncertainty: {value: 0.85, status: provisional}
+  cap_before_residual_evidence: {value: 0.70, status: provisional}
+```
+
+この組み合わせでは、uncertainty を出さない Thermal Model v1 は MEDIUM までに留まり、Fallback 近傍の
+帯の中で動く。`cap_without_uncertainty` を `high_min_confidence` 以上へ広げるのは設定の変更であり、
+**コードの上限ではない**。広げる根拠は #90 / #91 の評価とし、変更は所有者が承認する。
 
 すべて `status` / `basis` の追跡対象とし、`provisional_values()` の起動ログに出す。
 **本記録は値を決めない。** 値は #90 / #91 の offline / shadow 評価を根拠に、所有者の承認で `confirmed` にする。
@@ -199,15 +232,24 @@ true / false positive / negative、FP 率・FN 率、構成要素ごとの OOD �
   どれか1つでも崩れれば、その tick で Fallback へ退避する
 - MEDIUM でも ML を完全には止めず、Fallback 近傍に閉じ込めて shadow と同じ条件の実績を積める
 - 判定は決定論的で、合成・Replay の入力だけで試験できる。実機は要らない
-- Thermal Model v1 は uncertainty を出さないため、`cap_without_uncertainty` を HIGH の下限未満に設定すれば
-  v1 は HIGH にならない。uncertainty を持つ予測 schema を足すときは version を上げて構成要素を拡張する
+- Thermal Model v1 は uncertainty を出さない。学習期間の暫定値（2.5）では `cap_without_uncertainty` が
+  HIGH の下限未満なので v1 は MEDIUM までだが、これは**設定であり、コードの上限ではない**。
+  条件をまたいだ実績が積み上がれば、所有者が設定で authority を広げられる。
+  uncertainty を持つ予測 schema を足すときは version を上げて構成要素を拡張する
+- **危険温度の扱いは confidence から独立している。** Confidence / OOD Gate が出せるのは requested までで
+  （`ControllerSelection` は effective / PWM を持たない）、`DemandComposer.compose()`
+  （`src/coldaisle/control/safety/critical.py`）が Guard の floor / ceiling、Critical Safety の
+  最低安全 demand・CPU cooling floor・下げる速さの制限・forced Max を必ず後段で掛ける。
+  `confidence.py` / `gate.py` は hardware / safety / reactive のどの module も import しない
+  （`tests/test_model_confidence.py::test_confidence_layer_stays_upstream_of_guard_and_safety`)
 - `fan-policy.yaml` と `ControlTick` の schema version が上がる。v5 以前の設定は起動前に拒否される
 
 | トレードオフ | 緩和策 |
 |---|---|
 | support cell は軸を増やすと組み合わせが急増し、学習件数が薄くなる | 軸と bin は Profile 作成時に明示し、軸数・cell 数に構造上の上限を置く。評価（2.7）で FP 率を確かめる |
 | 箱型の範囲と格子の support は、学習点の間の「穴」を見逃しうる | residual drift と support 件数の score で補う。方式の置き換えは Profile の schema version を上げて行う |
-| 起動直後は residual の証拠が無く confidence が抑えられる | 安全側を優先する。上限値は設定で調整できる |
+| 起動直後は residual の証拠が無く confidence が抑えられる | 安全側を優先する。上限値は設定で調整でき、証拠が積み上がれば所有者が広げる |
+| 同一プロセス内で形の整った assessment を偽造されれば、Gate は見破れない | **受け入れる**（2026-09-20、所有者の判断）。LLM 層には制御権も書き込み権も無く（AGENTS.md ルール1）、`coldaisle-fand` の中で動く制御コード自体が敵対的である場合は本記録の想定範囲外とする。Gate は内部整合・推論への束縛・Registry 検証を確かめ、偶発的な迂回（`apply_to()` を呼び忘れる、古い判定を使い回す）を塞ぐ |
 | 暫定値のままでは FP / FN の水準が分からない | 本記録は値を確定しない。#90 / #91 の評価で確定し、所有者が承認する |
 
 ## 4. 却下した代替案
@@ -219,6 +261,7 @@ true / false positive / negative、FP 率・FN 率、構成要素ごとの OOD �
 | residual の基準を train の in-sample 誤差にする | 楽観的すぎて、通常の誤差でも drift と判定しやすい |
 | 構成要素の重み付き平均で confidence を作る | 1つの要素が大きく崩れても平均で隠れる。最小値なら崩れた要素がそのまま効く |
 | uncertainty が無いモデルは判定を諦めて常に OOD にする | v1 baseline が shadow の実績すら積めなくなる。上限で抑える |
+| `cap_without_uncertainty < high_min_confidence` をコードで強制する | authority の広げ方を設定と評価ではなくコードで固定してしまう（2026-09-20、所有者の判断）。危険温度は Guard / Critical Safety が決定論的に見る |
 | MEDIUM で stage の帯を置き換える | stage は人が承認した上限（0028 §2.5 (b)）。confidence で広がってはならないので共通部分を採る |
 | confidence が高ければ stage を自動で上げる | 昇格は人だけ（0028 §2.9） |
 | 判定を Gate（制御ループ）の中で行う | 推論と同じ入力が要り、ループの tick を重くする。worker で判定し、ループは結果だけを消費する（0028 §2.2） |
@@ -235,4 +278,6 @@ true / false positive / negative、FP 率・FN 率、構成要素ごとの OOD �
 | 5 | Learned MPC worker（#86）が判定・residual の照合を呼ぶ配線 | #86 |
 | 6 | `model_gate` を読む評価（#90 / #91）と降格（#92）での利用 | #90 / #91 / #92 |
 
-本記録は Proposed である。**方式・設定の形・trace の形の承認**を求めるもので、閾値の値や authority の昇格の承認ではない。
+本記録は 2026-09-20 にリポジトリ所有者が承認して FINAL になった。承認の対象は**方式・設定の形・trace の形・
+authority の不変条件**であり、閾値の値の確定（承認点 2）や authority stage の昇格（0028 §2.9 承認点 5）は
+含まない。2.5 の暫定値は学習期間の出発点であり、#90 / #91 の評価を根拠に所有者が広げる。

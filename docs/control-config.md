@@ -90,7 +90,7 @@ control loopがworkerへ渡した元snapshotのローカル単調時刻から `s
 切替回数が `demote_window_ms` 内で `demote_after` に達した場合、Gateは降格推奨をtraceへ出す。
 設定上のstageを`SHADOW`へ変更・永続化する責務は #92 に残す。
 
-#85 のv6で `model_confidence` を追加する（決定記録 0050。Proposed）。HIGH の下限
+#85 のv6で `model_confidence` を追加する（決定記録 0050。FINAL）。HIGH の下限
 `high_min_confidence`、MEDIUM で Learned MPC を Fallback 近傍へ閉じ込める `medium_limit`
 （`limit_up` / `limit_down`。`limit_down` は最低 demand の制限を兼ねる）、OOD 判定の
 `range_margin`・`min_support_count`・`full_support_count`・`min_missing_pattern_count`、
@@ -104,6 +104,12 @@ MEDIUM の下限は stage ごとの `gate_min_confidence` で、`high_min_confid
 と、証拠が無い間に HIGH へ届かないよう `cap_before_residual_evidence < high_min_confidence`、
 `residual_max_age_ms > residual_match_tolerance_ms` を検証する。`residual_match_tolerance_ms` は Profile の最短 horizon 未満でなければならず、horizon は
 Profile 側にあるため residual monitor の生成時に検証する。MEDIUM 帯は stage の帯との共通部分を採り、confidence が authority を広げることはない。
+`cap_without_uncertainty` にコード側の上限は置かない。uncertainty を出さないモデルを構造的に締め出すのではなく、
+学習期間は保守的な暫定値に留め、評価（#90 / #91）で証拠が積み上がったら所有者が設定で広げる方針である
+（決定記録 0050 §2.4 / §3）。学習期間の暫定値の目安は決定記録 0050 §2.5 に置き、`status: provisional` のまま運用する。
+危険温度への対応は confidence に依存せず、Reactive Guard（#80）と Critical Safety（#78）が決定論的に行う。
+Confidence / OOD が動かせるのはその前段の `requested` だけである。
+
 v5からv6へは `model_confidence` を実データの評価根拠とともに追加してから `schema_version: 6` へ上げる。
 v1〜v5は自動補完せず起動前に拒否する。
 

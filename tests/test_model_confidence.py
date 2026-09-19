@@ -9,8 +9,11 @@ from tempfile import TemporaryDirectory
 import pytest
 from pydantic import ValidationError
 
+import coldaisle.control.fallback.gate as gate_module
+import coldaisle.control.model.confidence as confidence_module
 from coldaisle.control.fallback import (
     ControllerGate,
+    ControllerSelection,
     LearnedControlStatus,
     classify_confidence,
 )
@@ -64,6 +67,7 @@ from coldaisle.control.schema import (
     BoundBy,
     ConfidenceLevel,
     ControllerKind,
+    ControllerProposal,
     ControlState,
     ControlTick,
     EffectiveZoneDemand,
@@ -1349,3 +1353,28 @@ def test_c1_residual_age_must_exceed_the_match_tolerance(tmp_path) -> None:
         tuned(residual_max_age_ms=500).model_validate(
             tuned(residual_max_age_ms=500).model_dump(mode="python")
         )
+
+
+def test_confidence_layer_stays_upstream_of_guard_and_safety() -> None:
+    """Confidence / OOD は requested までで、Guard・Critical Safety を迂回しない。
+
+    危険温度への対応は confidence に関係なく Reactive Guard（#80）と Critical Safety（#78）が
+    決定論的に行う（決定記録 0050 §2.3 / 0028 §2.4）。ここでは静的な依存で確かめる。
+    """
+    sources = {
+        name: (Path(module.__file__).read_text(encoding="utf-8"))
+        for name, module in (
+            ("confidence", confidence_module),
+            ("gate", gate_module),
+        )
+        if module.__file__ is not None
+    }
+    forbidden = ("control.hardware", "control.safety", "control.reactive", "hwmon", "pwm")
+    for name, source in sources.items():
+        for token in forbidden:
+            assert f"import {token}" not in source, (name, token)
+            assert f"from coldaisle.{token}" not in source, (name, token)
+
+    # Gate が返せるのは requested までで、effective / PWM を表す型を持たない
+    assert "effective" not in set(ControllerSelection.model_fields)
+    assert set(ControllerProposal.model_fields) & {"effective", "pwm", "pwm_raw"} == set()
