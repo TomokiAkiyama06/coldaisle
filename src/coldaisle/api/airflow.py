@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, FiniteFloat, field_validator
 
 AIR_TEMPERATURE_BANDS = 5
 """色の段数（青→琥珀→赤）。区切りはこれより1つ少ない。
@@ -26,10 +26,14 @@ class AirTemperatureScale(BaseModel):
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
-    thresholds_c: tuple[float, ...] = Field(
+    thresholds_c: tuple[FiniteFloat, ...] = Field(
         min_length=AIR_TEMPERATURE_BANDS - 1, max_length=AIR_TEMPERATURE_BANDS - 1
     )
-    """段の境目（℃）。狭義の昇順。`t < thresholds_c[0]` が最も低い段。"""
+    """段の境目（℃）。有限の値で狭義の昇順。`t < thresholds_c[0]` が最も低い段。
+
+    **NaN・無限大は各要素の型（FiniteFloat）で昇順の判定より前に弾く。** NaN はどの比較も
+    偽になり昇順の判定を素通りし、応答の JSON 化で初めて落ちるため（Codex P2）。
+    """
     provisional: bool
     """区切りが仮の値か。画面の凡例に「区切りは仮」と出す。"""
 

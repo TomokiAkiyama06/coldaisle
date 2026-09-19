@@ -127,6 +127,24 @@ def test_bad_thresholds_are_rejected(thresholds):
         )
 
 
+@pytest.mark.parametrize("bad", [".nan", ".inf", "-.inf"])
+@pytest.mark.parametrize("position", [0, 1, 3])
+def test_non_finite_thresholds_are_rejected(tmp_path, bad, position):
+    """YAML の `.nan` / `.inf` は起動時に落とす。**昇順の判定を素通りし、JSON 化で落ちるため。**"""
+    thresholds = ["27.0", "28.0", "29.0", "30.0"]
+    thresholds[position] = bad
+    path = tmp_path / "airflow-ui.yaml"
+    path.write_text(
+        "version: 1\n"
+        "air_temperature:\n"
+        f"  thresholds_c: [{', '.join(thresholds)}]\n"
+        "  provisional: true\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ValidationError, match="finite"):
+        AirflowUiSettings.from_yaml(path)
+
+
 def test_the_shipped_config_loads():
     AirflowUiSettings.from_yaml(AIRFLOW_UI_PATH)
 
