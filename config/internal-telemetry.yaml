@@ -13,6 +13,12 @@ nvml:
   # 複数 GPU を列挙順で永続 metric へ割り当てることは禁止する。
   gpu_indices: [0]
 
+# /proc/stat の全 CPU 合計の使用率（cpu.utilization。決定記録 0047）。
+# 前回 poll との差分で計算するため、起動直後の1回目は missing になる。Linux 以外は missing。
+proc_stat:
+  enabled: true
+  path: /proc/stat
+
 hwmon:
   enabled: true
   root: /sys/class/hwmon

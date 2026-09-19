@@ -179,6 +179,7 @@ def test_rollup_entry_point_registers_internal_metrics(tmp_path: Path, rules):
     telemetry.write_text(
         "version: 1\ninterval_ms: 5000\n"
         "nvml: {enabled: true, gpu_indices: [0]}\n"
+        "proc_stat: {enabled: false, path: /proc/stat}\n"
         "hwmon: {enabled: false, root: /sys/class/hwmon, sensors: []}\n",
         encoding="utf-8",
     )
@@ -309,6 +310,7 @@ def test_once_creates_the_database_directory(tmp_path: Path, monkeypatch):
     telemetry.write_text(
         "version: 1\ninterval_ms: 2500\n"
         "nvml: {enabled: false, gpu_indices: [0]}\n"
+        "proc_stat: {enabled: false, path: /proc/stat}\n"
         "hwmon: {enabled: false, root: /sys/class/hwmon, sensors: []}\n",
         encoding="utf-8",
     )
@@ -335,6 +337,7 @@ def test_interval_that_does_not_divide_a_minute_fails_at_load(tmp_path: Path):
     telemetry.write_text(
         "version: 1\ninterval_ms: 7000\n"
         "nvml: {enabled: false, gpu_indices: [0]}\n"
+        "proc_stat: {enabled: false, path: /proc/stat}\n"
         "hwmon: {enabled: false, root: /sys/class/hwmon, sensors: []}\n",
         encoding="utf-8",
     )
@@ -348,6 +351,7 @@ def _hwmon_config(tmp_path: Path, metric: str, measurement: str) -> Path:
     telemetry.write_text(
         "version: 1\ninterval_ms: 2500\n"
         "nvml: {enabled: false, gpu_indices: [0]}\n"
+        "proc_stat: {enabled: false, path: /proc/stat}\n"
         "hwmon:\n  enabled: true\n  root: /sys/class/hwmon\n  sensors:\n"
         f"    - {{metric: {metric}, enabled: false, measurement: {measurement},\n"
         "       disabled_reason: test}\n",
