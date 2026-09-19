@@ -305,7 +305,7 @@ function expectedStep(entry) {
 }
 
 /** 依存の無い折れ線。Chart.js を読み込まない（オフラインでも見えるようにするため）。 */
-function drawChart(svgId, legendId, series) {
+function drawChart(svgId, legendId, series, annotations = []) {
   const svg = document.getElementById(svgId);
   const legend = document.getElementById(legendId);
   svg.replaceChildren();
@@ -338,6 +338,16 @@ function drawChart(svgId, legendId, series) {
   svg.appendChild(text(pad.left, box.height - 5, new Date(minX).toLocaleTimeString(), "start"));
   svg.appendChild(text(box.width - pad.right, box.height - 5, new Date(maxX).toLocaleTimeString(), "end"));
 
+  // GPU Mode の切り替え（#67）を縦線で重ねる。温度の変化と原因を同じ時間軸で見るため
+  for (const event of annotations) {
+    if (event.ts_ms < minX || event.ts_ms > maxX) continue;
+    const x = sx(event.ts_ms);
+    const mark = line(x, pad.top, x, box.height - pad.bottom, "#d2a8ff");
+    mark.setAttribute("stroke-dasharray", "4 3");
+    svg.appendChild(mark);
+    svg.appendChild(text(x + 3, pad.top + 10, annotationLabel(event), "start"));
+  }
+
   series.forEach((entry, index) => {
     const color = SERIES_COLORS[index % SERIES_COLORS.length];
     // 欠測で線をつながない。つなぐと「その間も測れていた」ように見える。
@@ -365,6 +375,14 @@ function drawChart(svgId, legendId, series) {
     item.appendChild(document.createTextNode(labelOf(entry.metric)));
     legend.appendChild(item);
   });
+}
+
+/** 注釈の文言。**API の文字列は textContent でだけ使う**（要件 §7.4）。 */
+function annotationLabel(event) {
+  if (event.kind === "gpu_mode" && event.payload && typeof event.payload.mode === "string") {
+    return `GPU ${event.payload.mode}`;
+  }
+  return event.kind;
 }
 
 function svgNode(name, attrs) {
@@ -457,14 +475,27 @@ async function loadHistory() {
   // 適用済みより新しく、かつ**いま選ばれている期間**の応答だけを使う。
   // 期間が違う応答は、番号が新しくても画面と食い違う
   const usable = () => seq > historyAppliedSeq && range === currentRange;
+  // 注釈が取れなくてもグラフは描く。注釈は補助であり、無いことで履歴を隠さない。
+  // ただし**失敗は失敗として残す。** 空の一覧に読み替えるだけでは「切り替えが無かった」と
+  // 見分けがつかない
+  const loadEvents = (signal) =>
+    fetchJson("/api/v1/events", { window: range.window, kind: "gpu_mode" }, signal)
+      .then((body) => ({ events: body.events, truncated: body.truncated === true, error: null }))
+      .catch((error) => ({ events: [], truncated: false, error }));
 
   try {
-    const [tempSeries, humiditySeries] = await withTimeout(HISTORY_TIMEOUT_MS, (signal) =>
-      Promise.all([load(temps, signal), load(humidity, signal)])
+    const [tempSeries, humiditySeries, eventResult] = await withTimeout(HISTORY_TIMEOUT_MS, (signal) =>
+      Promise.all([load(temps, signal), load(humidity, signal), loadEvents(signal)])
     );
     if (!usable()) return;
     historyAppliedSeq = seq;
-    lastSeries = { temp: tempSeries, humidity: humiditySeries };
+    lastSeries = { temp: tempSeries, humidity: humiditySeries, events: eventResult.events };
+    // 上限を超えると新しい側だけが返る。古い側の切り替えが「無かった」ように見せない
+    eventsNote = eventResult.error
+      ? `GPU Mode の記録を取得できませんでした: ${eventResult.error.message}`
+      : eventResult.truncated
+        ? "GPU Mode の記録が多いため、古い切り替えは表示していません"
+        : "";
     drawCharts();
     const used = tempSeries[0] || humiditySeries[0];
     historyNote = used
@@ -482,9 +513,11 @@ async function loadHistory() {
 // 表示名が取れたあとも「表示名を取得できません」が次の履歴更新（60秒）まで残る
 let historyNote = "";
 let catalogNote = "";
+// GPU Mode の注釈の取得失敗。**描いたグラフと同じ応答で決める**（成功したら消す）
+let eventsNote = "";
 
 function renderNote() {
-  document.getElementById("chart-note").textContent = [historyNote, catalogNote]
+  document.getElementById("chart-note").textContent = [historyNote, eventsNote, catalogNote]
     .filter(Boolean)
     .join(" / ");
 }
@@ -531,8 +564,8 @@ let historyLoaded = false;
 
 function drawCharts() {
   if (!lastSeries) return;
-  drawChart("chart-temp", "legend-temp", lastSeries.temp);
-  drawChart("chart-humidity", "legend-humidity", lastSeries.humidity);
+  drawChart("chart-temp", "legend-temp", lastSeries.temp, lastSeries.events);
+  drawChart("chart-humidity", "legend-humidity", lastSeries.humidity, lastSeries.events);
 }
 
 /**

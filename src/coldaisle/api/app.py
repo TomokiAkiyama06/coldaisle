@@ -18,7 +18,7 @@ from collections.abc import AsyncIterator, Callable, Mapping
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Annotated, Any, Protocol
 
 from fastapi import FastAPI, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
 from fastapi.staticfiles import StaticFiles
@@ -33,6 +33,8 @@ from coldaisle.api.models import (
     DerivedLabelOut,
     DeviceOut,
     DevicesResponse,
+    EventOut,
+    EventsResponse,
     HealthResponse,
     LatestResponse,
     MetricLabelOut,
@@ -66,7 +68,7 @@ from coldaisle.internal_telemetry import InternalTelemetryConfig, NvmlAdapter
 from coldaisle.metrics import MetricCatalog, compute_derived
 from coldaisle.store import Aggregation, Quality, QualityRules, SqliteStore
 from coldaisle.store.db import FIVE_MINUTES_MS, HOUR_MS, MINUTE_MS
-from coldaisle.store.models import LatestReading, validate_metric
+from coldaisle.store.models import EVENT_KIND_PATTERN, LatestReading, validate_metric
 
 WEB_ROOT = Path(__file__).resolve().parents[1] / "web"
 """ダッシュボードの静的アセット（L4）。**外部への参照を持たない**（オフラインでも見える）。"""
@@ -405,6 +407,43 @@ def create_app(
         store = provider.get()
         return AlertsResponse(
             alerts=list(store.alerts(state=state, start_ms=from_ms, end_ms=to_ms, limit=limit))
+        )
+
+    @app.get("/api/v1/events", response_model=EventsResponse, response_model_by_alias=True)
+    def get_events(
+        from_ms: int | None = Query(default=None, alias="from"),
+        to_ms: int | None = Query(default=None, alias="to"),
+        window: str | None = None,
+        kind: Annotated[list[str] | None, Query()] = None,
+        limit: int = Query(default=500, ge=1, le=5_000),
+    ) -> EventsResponse:
+        """記録された事象（#67）。GPU Mode の切り替えをグラフへ重ねるために使う。
+
+        **読み取り専用。** 書き込みは別プロセスの Unix ソケットだけが受ける（決定記録 0045）。
+        上限を超えるときは新しい側を残し、`truncated` で伝える（0009 §2.4 と同じ）。
+        """
+        for name in kind or ():
+            if not EVENT_KIND_PATTERN.match(name):
+                raise HTTPException(422, f"kind の書式が不正: {name!r}")
+        store = provider.get()
+        start, end = _resolve_range(store, from_ms, to_ms, window)
+        records = store.events(start, end, kinds=kind, limit=limit + 1)
+        truncated = len(records) > limit
+        kept = records[1:] if truncated else records
+        return EventsResponse(
+            from_ms=start,
+            to_ms=end,
+            truncated=truncated,
+            events=[
+                EventOut(
+                    id=record.id or 0,
+                    ts_ms=record.ts_ms,
+                    ts=iso(record.ts_ms),
+                    kind=record.kind,
+                    payload=json.loads(record.payload_json),
+                )
+                for record in kept
+            ],
         )
 
     @app.get("/api/v1/devices", response_model=DevicesResponse)

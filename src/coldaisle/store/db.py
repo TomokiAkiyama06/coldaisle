@@ -26,6 +26,7 @@ from coldaisle.store.models import (
     AlertSeverity,
     ControlTraceRecord,
     DeviceRecord,
+    EventRecord,
     LatestReading,
     Quality,
     RollupPoint,
@@ -411,6 +412,42 @@ class SqliteStore:
             cursor = self._conn.execute("DELETE FROM control_traces WHERE ts_ms < ?", (cutoff_ms,))
         return int(cursor.rowcount)
 
+    def record_event(
+        self,
+        event: EventRecord,
+        *,
+        state: tuple[str, str] | None = None,
+    ) -> EventRecord:
+        """外部から届いた事象を追記し、採番済みの記録を返す（#67 / 決定記録 0045 §2.5）。
+
+        ``state`` を渡すと、同じトランザクションで ``system_state`` を**変化時だけ**書く
+        （0002 §2.6）。イベントだけ残って状態が古いまま、という食い違いを作らない。
+
+        **追記のみ。** ``events`` の更新・削除は DB のトリガが拒否する。
+        """
+        if event.id is not None:
+            raise ValueError("採番前の event を渡す（id は保存時に決まる）")
+        with self.transaction():
+            cursor = self._conn.execute(
+                "INSERT INTO events (ts_ms, kind, payload, peer_uid) VALUES (?, ?, ?, ?)",
+                (event.ts_ms, event.kind, event.payload_json, event.peer_uid),
+            )
+            if state is not None:
+                key, value = state
+                row = self._conn.execute(
+                    "SELECT value FROM system_state WHERE key = ? ORDER BY ts_ms DESC LIMIT 1",
+                    (key,),
+                ).fetchone()
+                if row is None or str(row["value"]) != value:
+                    self._conn.execute(
+                        "INSERT OR REPLACE INTO system_state (ts_ms, key, value) VALUES (?, ?, ?)",
+                        (event.ts_ms, key, value),
+                    )
+        event_id = cursor.lastrowid
+        if event_id is None:
+            raise RuntimeError("event の採番に失敗した")
+        return event.model_copy(update={"id": int(event_id)})
+
     # ------------------------------------------------------------------ 読み出し
 
     def device(self, device_id: str) -> DeviceRecord | None:
@@ -494,6 +531,46 @@ class SqliteStore:
                 tick_id=row["tick_id"],
                 schema_version=row["schema_version"],
                 trace_json=row["trace_json"],
+            )
+            for row in rows
+        )
+
+    def events(
+        self,
+        start_ms: int,
+        end_ms: int,
+        *,
+        kinds: Sequence[str] | None = None,
+        limit: int = 1_000,
+    ) -> tuple[EventRecord, ...]:
+        """半開区間 ``[start_ms, end_ms)`` の事象を時刻順に返す（#67）。
+
+        ``limit`` を超えるときは**新しい側を残す**（決定記録 0009 §2.4 と同じ理由）。
+        """
+        self._check_range(start_ms, end_ms)
+        if limit <= 0:
+            raise ValueError("limit は正にする")
+        where = "ts_ms >= ? AND ts_ms < ?"
+        params: list[object] = [start_ms, end_ms]
+        if kinds is not None:
+            if not kinds:
+                return ()
+            where += f" AND kind IN ({', '.join('?' for _ in kinds)})"
+            params.extend(kinds)
+        rows = self._conn.execute(
+            "SELECT id, ts_ms, kind, payload, peer_uid FROM ("
+            f"SELECT id, ts_ms, kind, payload, peer_uid FROM events WHERE {where} "
+            "ORDER BY ts_ms DESC, id DESC LIMIT ?"
+            ") ORDER BY ts_ms, id",
+            (*params, limit),
+        ).fetchall()
+        return tuple(
+            EventRecord(
+                id=row["id"],
+                ts_ms=row["ts_ms"],
+                kind=row["kind"],
+                payload_json=row["payload"],
+                peer_uid=row["peer_uid"],
             )
             for row in rows
         )

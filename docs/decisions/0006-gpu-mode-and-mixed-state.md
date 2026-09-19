@@ -4,6 +4,7 @@
 - **Status**: FINAL（2026-08-24 承認）
 - **Date**: 2026-08-24
 - **Supersedes**: [`0001-initial-project-decisions.md`](0001-initial-project-decisions.md) D-19
+- **Superseded by**: [0045](0045-local-socket-write-entry.md)（§2.1 の「coldaisle のデータモデルには現れない」の一文のみ。他の節は有効）
 - **関連**: [`0002-metric-naming.md`](0002-metric-naming.md) §2.6 / #36 / #37
 - **対象 Issue**: #36
 

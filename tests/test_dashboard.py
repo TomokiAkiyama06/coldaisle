@@ -138,6 +138,8 @@ def test_script_reads_only_documented_endpoints():
         "/api/v1/health",
         "/api/v1/alerts",
         "/api/v1/devices",
+        # GPU Mode の切り替えの縦線（#67）。読み取り専用
+        "/api/v1/events",
     }
     assert "/api/v1/stream" in script, "WebSocket を使う（FR-306）"
 
@@ -469,6 +471,43 @@ def test_the_catalog_note_clears_on_its_own():
     assert "catalogNote" not in history, "履歴の側から表示名の注記を消さない"
     assert "historyNote = " in history and "renderNote()" in history
     assert script.count('getElementById("chart-note")') == 1, "注記欄に書くのは renderNote だけ"
+
+
+def test_an_events_failure_is_shown_apart_from_no_transitions():
+    """注釈の取得に失敗しても履歴は描くが、失敗は注記に残す（#141 のレビュー）。
+
+    空の一覧に読み替えるだけでは「GPU Mode の切り替えが無かった」と見分けがつかない。
+    """
+    script = SCRIPT.read_text(encoding="utf-8")
+    history = script[script.index("async function loadHistory()") :]
+    history = history[: history.index("\n}\n")]
+    events = history[history.index("const loadEvents") :]
+    events = events[: events.index(";\n")]
+    assert ".catch(() => [])" not in events, "失敗を黙って空の一覧にしない"
+    assert "error" in events
+    assert "GPU Mode の記録を取得できませんでした" in history
+    assert "eventsNote = eventResult.error" in history
+    note = script[script.index("function renderNote()") :]
+    note = note[: note.index("\n}\n")]
+    assert "eventsNote" in note, "注釈の失敗も注記欄に出す"
+    load = script[script.index("async function loadCatalog()") :]
+    load = load[: load.index("\n}\n")]
+    assert "eventsNote" not in load, "表示名の側から注釈の注記を消さない"
+
+
+def test_truncated_events_are_noted():
+    """注釈が上限で打ち切られたら、古い切り替えを出していないことを注記する（#141 のレビュー）。
+
+    `/api/v1/events` は上限を超えると新しい側だけを返し `truncated` で伝える。
+    これを落とすと、古い側の切り替えが「無かった」ように見える。
+    """
+    script = SCRIPT.read_text(encoding="utf-8")
+    history = _body(script, "async function loadHistory()")
+    events = history[history.index("const loadEvents") :]
+    events = events[: events.index(";\n")]
+    assert "body.truncated" in events, "応答の truncated を落とさない"
+    assert "eventResult.truncated" in history
+    assert "GPU Mode の記録が多いため、古い切り替えは表示していません" in history
 
 
 # ---------------------------------------------------------------- 遅れて返る応答（#48 のレビュー）

@@ -253,3 +253,42 @@ class ControlTraceRecord(BaseModel):
         if not isinstance(decoded, dict):
             raise ValueError("decision trace はJSON objectでなければならない")
         return value
+
+
+EVENT_KIND_PATTERN = re.compile(r"^[a-z][a-z0-9_]*$")
+"""`events.kind` の形（決定記録 0045 §2.5）。許可リストは書き込みの入口が持つ。"""
+
+
+class EventRecord(BaseModel):
+    """外部から届いた1件の事象（#67 / 決定記録 0045 §2.5）。
+
+    書き込みの入口（`coldaisle.event_entry`）が検証済みの内容だけを渡す。
+    ここでは保存の形（kind の書式・JSON object）だけを縛り、どの kind を受理するかは
+    入口の許可リストに任せる。種類を足すたびに保存層を直さないため。
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    id: int | None = None
+    ts_ms: int = Field(ge=0)
+    kind: str
+    payload_json: str
+    peer_uid: int | None = None
+
+    @field_validator("kind")
+    @classmethod
+    def _kind_has_the_stored_shape(cls, value: str) -> str:
+        if not EVENT_KIND_PATTERN.match(value):
+            raise ValueError(f"event kind の書式が不正: {value!r}")
+        return value
+
+    @field_validator("payload_json")
+    @classmethod
+    def _payload_is_a_json_object(cls, value: str) -> str:
+        try:
+            decoded = json.loads(value)
+        except json.JSONDecodeError as exc:
+            raise ValueError("event payload はJSONでなければならない") from exc
+        if not isinstance(decoded, dict):
+            raise ValueError("event payload はJSON objectでなければならない")
+        return value
