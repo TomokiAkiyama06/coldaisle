@@ -3,6 +3,7 @@
 - **種別**: Decision Record
 - **Status**: FINAL（2026-09-18、リポジトリ所有者が承認）
 - **Date**: 2026-09-18
+- **Superseded by**: [0051](0051-airflow-cpu-utilization-display.md)（§2.5 の表の「CPU 使用率」の行と §5 未決事項 #3 のみ。他の節は有効）
 - **Supersedes**: なし（[`0011-dashboard.md`](0011-dashboard.md) の「作り込まない」は既存ダッシュボードの方針として残す。本記録は別画面を足す）
 - **関連**: [`0009-read-api.md`](0009-read-api.md)、[`0011-dashboard.md`](0011-dashboard.md)、
   [`0028-fan-control-contracts.md`](0028-fan-control-contracts.md) §2.2、

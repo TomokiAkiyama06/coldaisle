@@ -110,6 +110,7 @@ docs/decisions/NNNN-<slug>.md      例: 0002-metric-naming.md
 | [0039](0039-dashboard-labels-and-catalog.md) | ダッシュボードの表示名と `GET /api/v1/metrics` | FINAL |
 | [0040](0040-server-health-api.md) | Server Health API の契約（`/server-health` への一本化、signal 規則、機種が公開しない metric の扱い） | FINAL |
 | [0041](0041-supervisor-proposal-freshness.md) | 非同期 RL Supervisor 提案の有効性（期限の起点と Regime の一致） | FINAL |
+| [0042](0042-server-health-signal-rules.md) | Server Health の signal 判定規則の詳細（パネルは表示専用、監視対象と quality・source 状態の導出、アラート全件、1スナップショット） | FINAL |
 | [0043](0043-cpu-die-and-gpu-throttle-metrics.md) | CPU die 温度（k10temp）と GPU の T.Limit margin・throttle reason・fan speed のメトリクス名 | FINAL |
 | [0044](0044-node-in-ci-for-dashboard-tests.md) | ダッシュボードの JS テストのために CI へ Node を入れる（テスト専用。ビルドには使わない） | FINAL |
 | [0045](0045-local-socket-write-entry.md) | 書き込み専用のローカル Unix ソケット入口（GPU Mode イベント / Workload Hint） | FINAL |
@@ -117,3 +118,4 @@ docs/decisions/NNNN-<slug>.md      例: 0002-metric-naming.md
 | [0047](0047-cpu-utilization-metric.md) | CPU 使用率のメトリクス名（`cpu.utilization`） | FINAL |
 | [0048](0048-thermal-model-artifact-and-inference.md) | Thermal Model v1 artifactと読み取り専用推論境界 | Proposed |
 | [0050](0050-model-confidence-ood-and-authority.md) | Model Confidence / OOD の判定方式と confidence に応じた Authority 制限 | FINAL |
+| [0051](0051-airflow-cpu-utilization-display.md) | エアフロー画面の CPU 使用率の表示（`cpu.utilization` と「未計測」の判断） | FINAL |
