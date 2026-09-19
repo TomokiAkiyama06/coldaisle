@@ -19,7 +19,9 @@
   （PR #138 のレビュー指摘）。「有効な入力が1つも無ければ報告状態をそのまま使う」例外を
   lm_sensors に限り、NVML は監視必須 metric で評価することを明記した。同じ理由で、
   入力を無効にした metric が signal に影響しないという記述（§2.1 / §2.2 / §3）を、
-  監視必須でない metric に限った
+  監視必須でない metric に限った。さらに、proc_stat（`cpu.utilization`）が判定対象に
+  含まれないこと（§2.2）と、パネル表示による緩和が `panels` に載る metric に限られること
+  （§3）を明記した
 
 ## 1. Context
 
@@ -49,13 +51,17 @@ metric の一覧であり、signal の判定対象を決めない。入力が無
 パネルに `stale` と表示されるだけで signal に影響しない。ただし監視必須 metric
 （`sources.*.required`）は入力の有効・無効にかかわらず判定対象に残る（§2.2 / §2.4）。
 
-### 2.2 signal が見るのは監視必須 metric と有効な入力だけ
+### 2.2 signal が見るのは監視必須 metric と、NVML / hwmon の有効な入力だけ
 
 判定対象は次の和とする。
 
 - `config/server-health.yaml` の source ごとの監視必須 metric（`sources.*.required`）
-- `config/internal-telemetry.yaml` で有効な入力。NVML が有効なら NVML adapter の
-  expected metrics、hwmon が有効ならそのうち `enabled: true` の sensor
+- `config/internal-telemetry.yaml` で有効な NVML / hwmon の入力。NVML が有効なら
+  NVML adapter の expected metrics、hwmon が有効ならそのうち `enabled: true` の sensor
+
+**proc_stat（`cpu.utilization`）は本記録では signal の判定対象に含めない。**
+`config/internal-telemetry.yaml` で有効でも、判定対象に加わるのは上の NVML / hwmon だけ
+である。proc_stat を判定対象に加えるかどうかは、必要になったときに別の決定記録で決める。
 
 監視必須 metric は `internal-telemetry.yaml` で入力を無効にしても判定対象から外れない。
 入力の無効化で判定対象から外れるのは、監視必須でない入力（任意の hwmon sensor や、
@@ -137,7 +143,9 @@ WAL のため取り込み・ルールエンジンの書き込みは妨げない�
 ### 悪くなること・その緩和
 
 - 入力を無効にした metric のうち監視必須でないもの（例: 無効にした任意の hwmon sensor）は、
-  値が異常でも signal に出ない。緩和: パネルには値と quality がそのまま表示される。無効化は
+  値が異常でも signal に出ない。緩和: `config/server-health.yaml` の `panels` に載っている
+  metric なら、パネルに値と quality がそのまま表示される。`panels` に無い metric
+  （例: `fan.vrm.rpm`）は Server Health には表示されない。どちらの場合も、無効化は
   `internal-telemetry.yaml` の変更としてリポジトリの履歴に残る
 - 監視必須 metric は入力を無効にしても判定対象に残る。NVML を無効にすると、報告状態が
   `disabled` なら nvml は red、`ok` / `degraded` が残っていても監視必須 metric が届かず
