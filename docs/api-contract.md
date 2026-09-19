@@ -223,7 +223,8 @@ coldaisle のエアフロー画面（`/airflow.html`、#106）が使う**表示�
 ```json
 {
   "schema_version": 1,
-  "air_temperature": {"unit": "C", "thresholds_c": [27.0, 28.0, 29.0, 30.0], "provisional": true}
+  "air_temperature": {"unit": "C", "thresholds_c": [27.0, 28.0, 29.0, 30.0], "provisional": true},
+  "cpu_utilization": {"measured": true}
 }
 ```
 
@@ -233,6 +234,12 @@ coldaisle のエアフロー画面（`/airflow.html`、#106）が使う**表示�
 
 **制御・アラートの閾値ではありません。** Fan 制御やアラートの判定には使われず、
 変えても色の付き方が変わるだけです。測定値は含みません（`/latest` と `/series` を使う）。
+
+`cpu_utilization.measured` は CPU 使用率（`cpu.utilization`。決定記録 0047 / 0051）を collector が
+収集しているかで、collector が保存した `sys.telemetry_source.proc_stat` の直近の状態から決まります
+（#145）。`disabled` → `false`、`ok` / `degraded` → `true`、`unavailable`・状態なし → `null`（分からない）。
+`false` のとき画面は CPU 使用率を「未計測」と出します。無効にする前の行が `/latest` に残りうるため、
+行の有無では判断しません。API 側の設定ファイルや OS からは決めません（collector は別の設定で動きうる）。
 
 ### `GET /api/v1/events`
 

@@ -65,12 +65,21 @@ const ZONES = [
   { key: "top", name: "トップ", role: "排気（CPU ラジエータ）", rpm: "fan.top.rpm", pwm: "fan.top.pwm", chip: { x: 356, y: 104 } },
 ];
 
-// CPU の使用率はまだ計測していない（取得する入力が無い）。`null` は「未計測」と出す
+// `util: null` は「未計測」と出す（そもそも取得していない）。
+// CPU 使用率（`cpu.utilization`。決定記録 0047）は収集を無効にできる（`proc_stat.enabled`）ほか、
+// Linux 以外では値を持たない。そのとき collector は `missing` の行を保存しうるし、無効にする前の
+// 行も残るので、**行の有無では判断しない。** `/api/v1/airflow/config` の
+// `cpu_utilization.measured`（collector が保存した proc_stat の状態から決まる）が偽なら「未計測」と出す
+// （`measured`。決定記録 0051）。ページを開いたときに1回読む
 //
 // `status` は熱源の状態（決定記録 0046 §2.6）。GPU はスロットリングの状態を返す（案1）。
 // 判定は airflow-status.js（DOM に触らない関数）が持つ。CPU は状態を持たない
 const HEAT_SOURCES = [
-  { name: "CPU", util: null, temp: "cpu.package", power: "power.cpu.package", status: null, chip: { x: 204, y: 200, w: 104 } },
+  {
+    name: "CPU", util: "cpu.utilization", measured: () => page.cpuMeasured, temp: "cpu.package", power: "power.cpu.package",
+    status: null,
+    chip: { x: 204, y: 200, w: 104 },
+  },
   {
     name: "GPU", util: "gpu.0.utilization", temp: "gpu.0.core", power: "power.gpu.0",
     status: (latest) => window.ColdaisleAirflowStatus.gpuThrottleStatus(latest),
@@ -116,7 +125,7 @@ const GROUPS = [
   {
     name: "CPU",
     items: [
-      { key: "cpu_util", label: "CPU使用率", metric: null, kind: "band", color: "#c792ea", on: true },
+      { key: "cpu_util", label: "CPU使用率", metric: "cpu.utilization", kind: "band", color: "#c792ea", on: true },
       { key: "cpu_temp", label: "CPU温度", metric: "cpu.package", kind: "temp", color: "#c792ea", on: true },
     ],
   },
@@ -154,6 +163,7 @@ const page = {
   mockName: null, // null なら実データ
   mock: null, // 模擬データの提供元（airflow-mock.js）
   scale: null, // { thresholds_c, provisional }。読めなければ null（色を付けない）
+  cpuMeasured: null, // airflow/config の cpu_utilization.measured。読めなければ null（分からない）
   latest: null,
   control: null, // 実データでは常に null（未接続）
   zone: "top", // 「なぜこの回転数か」で見ている系統
@@ -220,6 +230,17 @@ function reading(metric, digits, unit) {
     value: item.value,
     tag: QUALITY_TAG[item.quality],
   };
+}
+
+/**
+ * 熱源の使用率。collector が収集していない（`measured()` が false）なら、保存済みの行があっても「未計測」。
+ * 設定を読めない（null）ときは決めつけず、値の有無で表示する。模擬データは設定に左右されない。
+ */
+function utilReading(source) {
+  if (!page.mockName && typeof source.measured === "function" && source.measured() === false) {
+    return reading(null, 0, "%");
+  }
+  return reading(source.util, 0, "%");
 }
 
 function derivedValue(name) {
@@ -479,7 +500,7 @@ function renderDiagram() {
   for (const source of HEAT_SOURCES) {
     const status = sourceStatus(source);
     if (source.block) paintBlock(source.block, status);
-    const util = { ...lineFor(reading(source.util, 0, "%"), "使用率 "), small: true };
+    const util = { ...lineFor(utilReading(source), "使用率 "), small: true };
     const temp = { ...lineFor(reading(source.temp, 0, "℃"), "温度 "), small: true };
     if (!status) {
       drawTag(labels, {
@@ -740,7 +761,7 @@ function renderHeat() {
   for (const source of [...HEAT_SOURCES].reverse()) {
     const block = el("div", "src");
     block.appendChild(el("span", "src-name", source.name));
-    block.appendChild(kvRow("使用率", reading(source.util, 0, "%")));
+    block.appendChild(kvRow("使用率", utilReading(source)));
     block.appendChild(kvRow("温度", reading(source.temp, 1, "℃")));
     block.appendChild(kvRow("消費電力", reading(source.power, 0, " W")));
     const status = sourceStatus(source); // GPU のスロットリング（案1）。null なら何も出さない
@@ -812,8 +833,11 @@ async function loadScale() {
   try {
     const body = await fetchJson("/api/v1/airflow/config");
     page.scale = body.air_temperature;
+    const cpu = body.cpu_utilization;
+    page.cpuMeasured = cpu && typeof cpu.measured === "boolean" ? cpu.measured : null;
   } catch (error) {
     page.scale = null; // 色を付けない。凡例で「読み込めません」と言う
+    page.cpuMeasured = null;
   }
 }
 
