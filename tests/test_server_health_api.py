@@ -23,6 +23,7 @@ from coldaisle.api.server_health import ServerHealthSettings, server_health_stat
 from coldaisle.clock import SimulatedClock
 from coldaisle.internal_telemetry import (
     SOURCE_STATE_PREFIX,
+    ClockEventReasons,
     InternalTelemetryCollector,
     NvmlAdapter,
     NvmlConfig,
@@ -52,6 +53,13 @@ INTERNAL_VALUES = {
     "gpu.0.vram_used": 8.0,
     "power.gpu.0": 180.0,
     "sys.cuda_processes": 2.0,
+    "gpu.0.tlimit_margin": 62.0,
+    "gpu.0.fan_speed": 30.0,
+    "gpu.0.throttle.hw_slowdown": 0.0,
+    "gpu.0.throttle.hw_thermal": 0.0,
+    "gpu.0.throttle.sw_thermal": 0.0,
+    "gpu.0.throttle.hw_power_brake": 0.0,
+    "gpu.0.throttle.sw_power_cap": 0.0,
     "cpu.package": 49.0,
     "power.cpu.package": 72.0,
     "cpu.vrm": 46.0,
@@ -66,6 +74,13 @@ NVML_METRICS = (
     "gpu.0.vram_used",
     "power.gpu.0",
     "sys.cuda_processes",
+    "gpu.0.tlimit_margin",
+    "gpu.0.fan_speed",
+    "gpu.0.throttle.hw_slowdown",
+    "gpu.0.throttle.hw_thermal",
+    "gpu.0.throttle.sw_thermal",
+    "gpu.0.throttle.hw_power_brake",
+    "gpu.0.throttle.sw_power_cap",
 )
 
 
@@ -682,6 +697,16 @@ class UnsupportedTemperaturesNvml:
 
     def compute_process_ids(self, handle: object) -> tuple[int, ...]:
         return (10, 20)
+
+    # margin / reason / fan speed は同じ GPU が公開する（2026-09-18 に実機で確認）
+    def tlimit_margin_c(self, handle: object) -> float | None:
+        return 62.0
+
+    def clock_event_reasons(self, handle: object) -> ClockEventReasons | None:
+        return ClockEventReasons(active=0, supported=0x1FF)
+
+    def fan_speed_pct(self, handle: object) -> float | None:
+        return 30.0
 
 
 def _store_collector_cycle(path: Path, rules, api) -> None:
