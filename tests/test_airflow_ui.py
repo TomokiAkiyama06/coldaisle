@@ -227,7 +227,7 @@ def test_control_state_is_unconnected_on_real_data():
 
 def test_missing_values_are_named():
     script = _text(SCRIPT)
-    assert '"未計測"' in script  # 入力が無い（CPU 使用率）
+    assert '"未計測"' in script  # 取得していない（/latest に CPU 使用率のキーが無い等）
     assert '"未取得"' in script  # 入力はあるが値が無い（air.* など）
     for quality in Quality:
         assert f".q-{quality.value}" in _text(STYLES), f"{quality.value} の見た目が無い"
@@ -643,7 +643,15 @@ def test_the_ingest_metrics_match_the_channel_table():
 
 @pytest.mark.parametrize("source", ["serial", "mock", "replay", None, "something-new"])
 @pytest.mark.parametrize(
-    "metric", ["fan.front.pwm", "fan.top.rpm", "cpu.package", "gpu.0.core", "gpu.0.utilization"]
+    "metric",
+    [
+        "fan.front.pwm",
+        "fan.top.rpm",
+        "cpu.package",
+        "cpu.utilization",
+        "gpu.0.core",
+        "gpu.0.utilization",
+    ],
 )
 def test_internal_telemetry_is_not_labelled_by_the_ingest_source(metric, source):
     """内部テレメトリは別の経路。health.source で「実測」「模擬」「再生」と言わない。"""
@@ -782,3 +790,95 @@ def test_changing_the_range_clears_the_graph_before_loading():
     assert "graph.range = range;" in click
     assert click.index("clearGraph();") < click.index("loadHistory();")
     assert click.index("読み込み中…") < click.index("loadHistory();")
+
+
+# ------------------------------------------------------- CPU 使用率（#145 / 決定記録 0047）
+
+
+def test_cpu_utilization_is_wired():
+    """熱源の CPU とグラフの「CPU使用率」は `cpu.utilization` を読む（「未計測」固定ではない）。"""
+    script = _text(SCRIPT)
+    sources = script[script.index("const HEAT_SOURCES") : script.index("const STATUS_COLOR")]
+    cpu = sources[sources.index('name: "CPU"') : sources.index('name: "GPU"')]
+    assert 'util: "cpu.utilization"' in cpu
+    assert 'utilAbsent: "未計測"' in cpu, "収集していないときは「未計測」と出す"
+    assert "util: null" not in sources
+    assert script.count('reading(source.util, 0, "%", source.utilAbsent)') == 2
+    groups = script[script.index("const GROUPS") : script.index("const FAN_SERIES")]
+    assert re.search(r'key: "cpu_util", label: "CPU使用率", metric: "cpu\.utilization"', groups)
+
+
+def test_mock_has_cpu_utilization():
+    """模擬データ（通常・異常時。throttle は通常から作る）にも CPU 使用率がある。"""
+    assert _text(MOCK).count('"cpu.utilization":') == 2
+
+
+def _reading(latest: object, *args: object) -> dict[str, object]:
+    """airflow.js の `reading()` を、`page.latest` を差し替えて node で実行した結果。"""
+    script = _text(SCRIPT)
+    start = script.index("function fmt(")
+    end = script.index("function derivedValue(")
+    tag = script[script.index("const QUALITY_TAG") :]
+    tag = tag[: tag.index(";") + 1]
+    code = (
+        f"{tag}\n{script[start:end]}\n"
+        "const page = { latest: JSON.parse(process.argv[1]) };"
+        "console.log(JSON.stringify(reading(...JSON.parse(process.argv[2]))));"
+    )
+    done = subprocess.run(
+        [_node(), "-e", code, json.dumps(latest), json.dumps(list(args))],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    result: dict[str, object] = json.loads(done.stdout)
+    return result
+
+
+def _cpu(value: float | None, quality: str) -> dict[str, object]:
+    return {
+        "metrics": {
+            "cpu.utilization": {
+                "value": value,
+                "unit": "%",
+                "quality": quality,
+                "age_seconds": 0.4,
+            }
+        }
+    }
+
+
+def test_cpu_utilization_reading_ok():
+    result = _reading(_cpu(29.4, "ok"), "cpu.utilization", 0, "%", "未計測")
+    assert result["text"] == "29%"
+    assert result["quality"] == "ok"
+    assert "tag" not in result or result["tag"] is None
+
+
+@pytest.mark.parametrize(("quality", "tag"), [("stale", "古い"), ("suspect", "疑わしい")])
+def test_cpu_utilization_reading_marks_quality(quality, tag):
+    result = _reading(_cpu(29.0, quality), "cpu.utilization", 0, "%", "未計測")
+    assert result["text"] == "29%"
+    assert result["tag"] == tag
+
+
+def test_absent_cpu_utilization_is_unmeasured():
+    """`/latest` にキーが無い（収集が無効・Linux 以外）→ 「未計測」。0 % とは言わない。"""
+    result = _reading({"metrics": {}}, "cpu.utilization", 0, "%", "未計測")
+    assert result == {"text": "未計測", "quality": "missing", "value": None}
+
+
+def test_missing_cpu_utilization_is_not_acquired():
+    """キーはあるが値が無い（起動直後の1サンプル等。0047 §2.2）→ 「未取得」。"""
+    result = _reading(_cpu(None, "missing"), "cpu.utilization", 0, "%", "未計測")
+    assert result["text"] == "未取得"
+
+
+def test_before_the_first_response_values_are_not_acquired():
+    """応答が届く前はキーが無いとは言えない。「未計測」ではなく「未取得」。"""
+    assert _reading(None, "cpu.utilization", 0, "%", "未計測")["text"] == "未取得"
+
+
+def test_other_absent_metrics_stay_not_acquired():
+    """空気の温度など、既定では従来どおり「未取得」（決定記録 0046 §2.3）。"""
+    assert _reading({"metrics": {}}, "air.room", 1, "℃")["text"] == "未取得"

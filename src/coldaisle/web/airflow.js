@@ -65,12 +65,19 @@ const ZONES = [
   { key: "top", name: "トップ", role: "排気（CPU ラジエータ）", rpm: "fan.top.rpm", pwm: "fan.top.pwm", chip: { x: 356, y: 104 } },
 ];
 
-// CPU の使用率はまだ計測していない（取得する入力が無い）。`null` は「未計測」と出す
+// `util: null` は「未計測」と出す（そもそも取得していない）。
+// CPU 使用率（`cpu.utilization`。決定記録 0047）は収集を無効にできる（`proc_stat.enabled`）ほか、
+// Linux 以外では記録されない。そのため `/latest` に**キーが無い**ときは「未計測」と出す
+// （`utilAbsent`）。キーはあるが値が無い・`missing` のときは他の値と同じく「未取得」
 //
 // `status` は熱源の状態（決定記録 0046 §2.6）。GPU はスロットリングの状態を返す（案1）。
 // 判定は airflow-status.js（DOM に触らない関数）が持つ。CPU は状態を持たない
 const HEAT_SOURCES = [
-  { name: "CPU", util: null, temp: "cpu.package", power: "power.cpu.package", status: null, chip: { x: 204, y: 200, w: 104 } },
+  {
+    name: "CPU", util: "cpu.utilization", utilAbsent: "未計測", temp: "cpu.package", power: "power.cpu.package",
+    status: null,
+    chip: { x: 204, y: 200, w: 104 },
+  },
   {
     name: "GPU", util: "gpu.0.utilization", temp: "gpu.0.core", power: "power.gpu.0",
     status: (latest) => window.ColdaisleAirflowStatus.gpuThrottleStatus(latest),
@@ -116,7 +123,7 @@ const GROUPS = [
   {
     name: "CPU",
     items: [
-      { key: "cpu_util", label: "CPU使用率", metric: null, kind: "band", color: "#c792ea", on: true },
+      { key: "cpu_util", label: "CPU使用率", metric: "cpu.utilization", kind: "band", color: "#c792ea", on: true },
       { key: "cpu_temp", label: "CPU温度", metric: "cpu.package", kind: "temp", color: "#c792ea", on: true },
     ],
   },
@@ -205,12 +212,15 @@ function fmt(value, digits) {
 /**
  * 1つの測定値を表示用にする。**値が無いものを 0 や「—」だけで済ませない。**
  * - metric が null → 「未計測」（そもそも取得していない）
+ * - `/latest` にキーが無い → `absent`（既定は「未取得」。収集しないことがある値は「未計測」）
  * - 値が無い → 「未取得」
  * - 古い / 疑わしい → 値に印を付ける
  */
-function reading(metric, digits, unit) {
+function reading(metric, digits, unit, absent = "未取得") {
   if (metric === null) return { text: "未計測", quality: "missing", value: null };
   const item = page.latest && page.latest.metrics ? page.latest.metrics[metric] : undefined;
+  // 実データの応答が届く前（page.latest が null）は「未取得」。キーが無いと言えるのは応答があるときだけ
+  if (page.latest && page.latest.metrics && item === undefined) return { text: absent, quality: "missing", value: null };
   if (!item || item.value === null || item.value === undefined || item.quality === "missing") {
     return { text: "未取得", quality: "missing", value: null };
   }
@@ -479,7 +489,7 @@ function renderDiagram() {
   for (const source of HEAT_SOURCES) {
     const status = sourceStatus(source);
     if (source.block) paintBlock(source.block, status);
-    const util = { ...lineFor(reading(source.util, 0, "%"), "使用率 "), small: true };
+    const util = { ...lineFor(reading(source.util, 0, "%", source.utilAbsent), "使用率 "), small: true };
     const temp = { ...lineFor(reading(source.temp, 0, "℃"), "温度 "), small: true };
     if (!status) {
       drawTag(labels, {
@@ -740,7 +750,7 @@ function renderHeat() {
   for (const source of [...HEAT_SOURCES].reverse()) {
     const block = el("div", "src");
     block.appendChild(el("span", "src-name", source.name));
-    block.appendChild(kvRow("使用率", reading(source.util, 0, "%")));
+    block.appendChild(kvRow("使用率", reading(source.util, 0, "%", source.utilAbsent)));
     block.appendChild(kvRow("温度", reading(source.temp, 1, "℃")));
     block.appendChild(kvRow("消費電力", reading(source.power, 0, " W")));
     const status = sourceStatus(source); // GPU のスロットリング（案1）。null なら何も出さない
