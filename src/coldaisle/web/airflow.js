@@ -69,7 +69,7 @@ const ZONES = [
 // CPU 使用率（`cpu.utilization`。決定記録 0047）は収集を無効にできる（`proc_stat.enabled`）ほか、
 // Linux 以外では値を持たない。そのとき collector は `missing` の行を保存しうるし、無効にする前の
 // 行も残るので、**行の有無では判断しない。** `/api/v1/airflow/config` の
-// `cpu_utilization.measured`（設定と実行環境から決まる）が偽なら「未計測」と出す（`measured`）
+// `cpu_utilization.measured`（設定と実行環境から決まる）が偽なら「未計測」と出す（`measured`。決定記録 0051）
 //
 // `status` は熱源の状態（決定記録 0046 §2.6）。GPU はスロットリングの状態を返す（案1）。
 // 判定は airflow-status.js（DOM に触らない関数）が持つ。CPU は状態を持たない
