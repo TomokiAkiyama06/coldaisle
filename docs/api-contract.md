@@ -112,6 +112,9 @@ Compute Mode の判断は AI へ渡しません。生成はバックグラウン
 
 **`signal` の判定規則**
 
+判定規則の詳細（判定対象の metric、quality と source 状態の導出、アラートの数え方、
+読み出しの時点）は[決定記録 0042](decisions/0042-server-health-signal-rules.md)にあります。
+
 | 値 | 条件 |
 |---|---|
 | `green` | sensor_unit / nvml / lm_sensors がすべて `ok`、発生中アラート無し、監視対象の周期メトリクスがすべて `quality=ok`（`missing_tolerated` の `missing` は除く） |
