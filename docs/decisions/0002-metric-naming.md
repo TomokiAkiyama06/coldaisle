@@ -4,6 +4,7 @@
 - **Status**: FINAL（2026-08-24 マージ）
 - **Date**: 2026-08-24
 - **Supersedes**: なし
+- **Superseded by**: [0045](0045-local-socket-write-entry.md)（§2.6「用語の区別」の GPU Mode 行の「coldaisle が知る必要: なし」のみ。GPU Mode を記録するが閾値・制御には使わない。他の節は有効）
 - **関連**: [`0001-initial-project-decisions.md`](0001-initial-project-decisions.md) D-02 /
   `docs/requirements.md` §5.1 / §5.3 / D-04 / `docs/spec-review.md` C-02
 - **対象 Issue**: #3

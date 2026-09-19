@@ -33,6 +33,8 @@ uv run coldaisle-memory             # 運用メモリの更新案（**既定で�
 uv run coldaisle-memory --apply --commit  # 確認してから書く
 uv run coldaisle-calibrate          # 較正オフセットの算出（**既定では書かない**）
 uv run coldaisle-calibrate --apply  # 確認してから書く。手順は docs/calibration.md
+uv run coldaisle-eventd             # 書き込み専用の Unix ソケット入口（決定記録 0045。API とは別）
+uv run coldaisle-event gpu-mode compute  # GPU Mode の切り替えを記録する（#67）
 uv run coldaisle-telemetry --once   # NVML / hwmon を1回収集（#65）
 COLDAISLE_DB=var/coldaisle.db uv run uvicorn coldaisle.api:app --host 127.0.0.1 --port 8000
 COLDAISLE_DB=var/coldaisle.db uv run uvicorn coldaisle.server:app --port 8000  # + AI ツールの窓口
@@ -222,6 +224,7 @@ src/coldaisle/
   escalate.py # 合成の起点: 故障疑いの案件資料（AI非依存・送信しない）。#39
   memory.py   # 合成の起点: 運用メモリの記録（確認を経由する）。#40
   calibrate.py# 合成の起点: 較正オフセットの算出（確認を経由する）。#13
+  event_entry/ # 合成の起点: 書き込み専用の Unix ソケット入口。AI 層・API から import しない。#67
   rollup_job.py # 合成の起点: `coldaisle-rollup` の入口（周期メトリクスを Store へ渡す）。#65
   store/      # L1: SQLite、ロールアップ、CSVエクスポート
   api/        # L2: FastAPI、WebSocket

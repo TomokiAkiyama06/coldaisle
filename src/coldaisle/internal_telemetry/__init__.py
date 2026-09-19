@@ -10,6 +10,7 @@ from coldaisle.internal_telemetry.config import (
     HwmonSensorConfig,
     InternalTelemetryConfig,
     NvmlConfig,
+    ProcStatConfig,
 )
 from coldaisle.internal_telemetry.hwmon import HwmonAdapter
 from coldaisle.internal_telemetry.models import (
@@ -25,9 +26,16 @@ from coldaisle.internal_telemetry.nvml import (
     NvmlApi,
     PynvmlApi,
 )
+from coldaisle.internal_telemetry.proc_stat import (
+    CPU_UTILIZATION_METRIC,
+    CpuTimes,
+    ProcStatAdapter,
+    parse_cpu_times,
+)
 
 __all__ = [
     "CONNECTOR_TEMPERATURE_METRIC",
+    "CPU_UTILIZATION_METRIC",
     "SOURCE_STATE_PREFIX",
     "THROTTLE_REASON_BITS",
     "AdapterResult",
@@ -35,6 +43,7 @@ __all__ = [
     "CollectionCycle",
     "ConfirmationEvidence",
     "ConfirmationStatus",
+    "CpuTimes",
     "HwmonAdapter",
     "HwmonConfig",
     "HwmonMeasurement",
@@ -44,7 +53,10 @@ __all__ = [
     "NvmlAdapter",
     "NvmlApi",
     "NvmlConfig",
+    "ProcStatAdapter",
+    "ProcStatConfig",
     "PynvmlApi",
     "SourceStatus",
     "TelemetryAdapter",
+    "parse_cpu_times",
 ]

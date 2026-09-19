@@ -113,3 +113,7 @@ docs/decisions/NNNN-<slug>.md      例: 0002-metric-naming.md
 | [0042](0042-server-health-signal-rules.md) | Server Health の signal 判定規則の詳細（パネルは表示専用、監視対象と quality・source 状態の導出、アラート全件、1スナップショット） | FINAL |
 | [0043](0043-cpu-die-and-gpu-throttle-metrics.md) | CPU die 温度（k10temp）と GPU の T.Limit margin・throttle reason・fan speed のメトリクス名 | FINAL |
 | [0044](0044-node-in-ci-for-dashboard-tests.md) | ダッシュボードの JS テストのために CI へ Node を入れる（テスト専用。ビルドには使わない） | FINAL |
+| [0045](0045-local-socket-write-entry.md) | 書き込み専用のローカル Unix ソケット入口（GPU Mode イベント / Workload Hint） | FINAL |
+| [0046](0046-airflow-ui.md) | エアフロー / ファン制御の可視化画面（置き場所・模擬データの分離・色分けの設定） | FINAL |
+| [0047](0047-cpu-utilization-metric.md) | CPU 使用率のメトリクス名（`cpu.utilization`） | FINAL |
+| [0048](0048-thermal-model-artifact-and-inference.md) | Thermal Model v1 artifactと読み取り専用推論境界 | Proposed |

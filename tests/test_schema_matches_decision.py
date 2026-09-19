@@ -87,6 +87,10 @@ def test_migration_creates_exactly_the_decided_objects():
         ("trigger", "readings_sealed_no_insert"),
         ("trigger", "readings_sealed_no_update"),
         ("trigger", "readings_sealed_no_delete"),
+        ("table", "events"),
+        ("index", "ix_events_ts"),
+        ("trigger", "events_no_update"),
+        ("trigger", "events_no_delete"),
     }
 
 

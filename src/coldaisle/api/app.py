@@ -18,16 +18,23 @@ from collections.abc import AsyncIterator, Callable, Mapping
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Annotated, Any, Protocol
 
 from fastapi import FastAPI, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
 from fastapi.staticfiles import StaticFiles
 
+from coldaisle.api.airflow import (
+    AirflowConfigResponse,
+    AirflowUiSettings,
+    airflow_config_payload,
+)
 from coldaisle.api.models import (
     AlertsResponse,
     DerivedLabelOut,
     DeviceOut,
     DevicesResponse,
+    EventOut,
+    EventsResponse,
     HealthResponse,
     LatestResponse,
     MetricLabelOut,
@@ -61,7 +68,7 @@ from coldaisle.internal_telemetry import InternalTelemetryConfig, NvmlAdapter
 from coldaisle.metrics import MetricCatalog, compute_derived
 from coldaisle.store import Aggregation, Quality, QualityRules, SqliteStore
 from coldaisle.store.db import FIVE_MINUTES_MS, HOUR_MS, MINUTE_MS
-from coldaisle.store.models import LatestReading, validate_metric
+from coldaisle.store.models import EVENT_KIND_PATTERN, LatestReading, validate_metric
 
 WEB_ROOT = Path(__file__).resolve().parents[1] / "web"
 """ダッシュボードの静的アセット（L4）。**外部への参照を持たない**（オフラインでも見える）。"""
@@ -114,6 +121,8 @@ class Config:
     metrics: Path = Path("config/metrics.yaml")
     internal_telemetry: Path = Path("config/internal-telemetry.yaml")
     server_health: Path = Path("config/server-health.yaml")
+    airflow_ui: Path = Path("config/airflow-ui.yaml")
+    """エアフロー画面の表示設定（#106 / 決定記録 0046）。"""
     max_points: int = 2_000
     """1レスポンスの最大点数。超えるなら粗い粒度へ自動で落とす（受入基準）。"""
     stream_poll_s: float = 1.0
@@ -129,6 +138,7 @@ class Config:
                 os.environ.get("COLDAISLE_INTERNAL_TELEMETRY", str(cls.internal_telemetry))
             ),
             server_health=Path(os.environ.get("COLDAISLE_SERVER_HEALTH", str(cls.server_health))),
+            airflow_ui=Path(os.environ.get("COLDAISLE_AIRFLOW_UI", str(cls.airflow_ui))),
             max_points=int(os.environ.get("COLDAISLE_MAX_POINTS", cls.max_points)),
             stream_poll_s=float(os.environ.get("COLDAISLE_STREAM_POLL_S", cls.stream_poll_s)),
         )
@@ -210,6 +220,7 @@ def create_app(
     settings = config or Config.from_env()
     catalog = MetricCatalog.from_yaml(settings.metrics)
     health_settings = ServerHealthSettings.from_yaml(settings.server_health, catalog=catalog)
+    airflow_ui = AirflowUiSettings.from_yaml(settings.airflow_ui)
     if health_hwmon_metrics is None or health_nvml_metrics is None:
         internal_telemetry = InternalTelemetryConfig.from_yaml(
             settings.internal_telemetry, catalog=catalog
@@ -398,6 +409,43 @@ def create_app(
             alerts=list(store.alerts(state=state, start_ms=from_ms, end_ms=to_ms, limit=limit))
         )
 
+    @app.get("/api/v1/events", response_model=EventsResponse, response_model_by_alias=True)
+    def get_events(
+        from_ms: int | None = Query(default=None, alias="from"),
+        to_ms: int | None = Query(default=None, alias="to"),
+        window: str | None = None,
+        kind: Annotated[list[str] | None, Query()] = None,
+        limit: int = Query(default=500, ge=1, le=5_000),
+    ) -> EventsResponse:
+        """記録された事象（#67）。GPU Mode の切り替えをグラフへ重ねるために使う。
+
+        **読み取り専用。** 書き込みは別プロセスの Unix ソケットだけが受ける（決定記録 0045）。
+        上限を超えるときは新しい側を残し、`truncated` で伝える（0009 §2.4 と同じ）。
+        """
+        for name in kind or ():
+            if not EVENT_KIND_PATTERN.match(name):
+                raise HTTPException(422, f"kind の書式が不正: {name!r}")
+        store = provider.get()
+        start, end = _resolve_range(store, from_ms, to_ms, window)
+        records = store.events(start, end, kinds=kind, limit=limit + 1)
+        truncated = len(records) > limit
+        kept = records[1:] if truncated else records
+        return EventsResponse(
+            from_ms=start,
+            to_ms=end,
+            truncated=truncated,
+            events=[
+                EventOut(
+                    id=record.id or 0,
+                    ts_ms=record.ts_ms,
+                    ts=iso(record.ts_ms),
+                    kind=record.kind,
+                    payload=json.loads(record.payload_json),
+                )
+                for record in kept
+            ],
+        )
+
     @app.get("/api/v1/devices", response_model=DevicesResponse)
     def get_devices() -> DevicesResponse:
         """記録されたセンサー構成（#14 / FR-403）。
@@ -463,6 +511,15 @@ def create_app(
     def get_server_health() -> ServerHealthResponse:
         """Workspace の Server Health パネル向け統合ビュー（FR-308 / #66）。"""
         return server_health_payload()
+
+    @app.get("/api/v1/airflow/config", response_model=AirflowConfigResponse)
+    def get_airflow_config() -> AirflowConfigResponse:
+        """エアフロー画面の表示設定（#106 / 決定記録 0046）。**測定値は含まない。**
+
+        空気の温度の色分けの区切りを画面に書かないために返す（AGENTS.md ルール9）。
+        制御・アラートの閾値ではない。
+        """
+        return airflow_config_payload(airflow_ui)
 
     @app.websocket("/api/v1/stream")
     async def stream(websocket: WebSocket) -> None:
