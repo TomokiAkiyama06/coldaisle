@@ -495,6 +495,21 @@ def test_an_events_failure_is_shown_apart_from_no_transitions():
     assert "eventsNote" not in load, "表示名の側から注釈の注記を消さない"
 
 
+def test_truncated_events_are_noted():
+    """注釈が上限で打ち切られたら、古い切り替えを出していないことを注記する（#141 のレビュー）。
+
+    `/api/v1/events` は上限を超えると新しい側だけを返し `truncated` で伝える。
+    これを落とすと、古い側の切り替えが「無かった」ように見える。
+    """
+    script = SCRIPT.read_text(encoding="utf-8")
+    history = _body(script, "async function loadHistory()")
+    events = history[history.index("const loadEvents") :]
+    events = events[: events.index(";\n")]
+    assert "body.truncated" in events, "応答の truncated を落とさない"
+    assert "eventResult.truncated" in history
+    assert "GPU Mode の記録が多いため、古い切り替えは表示していません" in history
+
+
 # ---------------------------------------------------------------- 遅れて返る応答（#48 のレビュー）
 
 

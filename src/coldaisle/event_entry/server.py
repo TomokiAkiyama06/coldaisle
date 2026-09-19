@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import fcntl
 import grp
 import json
 import logging
@@ -105,9 +106,38 @@ def _umask(mask: int) -> Iterator[None]:
         os.umask(previous)
 
 
-def _prepare_path(path: Path) -> None:
-    """親ディレクトリと既存のソケットを確かめる。危ないものは消さずに止まる。"""
-    parent = path.parent
+def _lock_path(path: Path) -> Path:
+    return path.with_name(path.name + ".lock")
+
+
+def _acquire_lock(path: Path) -> int:
+    """ソケットの隣の `<socket>.lock` を排他ロックし、その fd を返す。
+
+    **古いソケットの掃除から bind までを直列にするため。** 同時に起動した2つが
+    どちらも古いソケットを「誰も待ち受けていない」と見ると、先に bind した側の
+    ソケットを後の側が消してしまう。ロックは待ち受けている間ずっと持ち、取れなければ
+    待たずに止まる。ロックファイル自体は消さない（消すと別の inode をロックする
+    プロセスが現れ、直列にならない）。
+    """
+    lock = _lock_path(path)
+    flags = os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC
+    try:
+        fd = os.open(lock, flags, 0o600)
+    except OSError as exc:
+        raise EntryStartupError(f"ロックファイルを開けない: {lock}") from exc
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError as exc:
+        os.close(fd)
+        raise EntryStartupError(f"別の coldaisle-eventd が起動している: {lock}") from exc
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
+
+
+def _prepare_parent(parent: Path) -> None:
+    """ソケットの親ディレクトリを作り、他人に差し替えられないことを確かめる。"""
     if not parent.exists():
         with _umask(0o077):
             parent.mkdir(parents=True, mode=PARENT_DIR_MODE)
@@ -119,6 +149,12 @@ def _prepare_path(path: Path) -> None:
         # other が書けるディレクトリでは、他人がソケットを消して差し替えられる
         raise EntryStartupError(f"ソケットの親ディレクトリを other が書ける: {parent}")
 
+
+def _prepare_path(path: Path) -> None:
+    """既存のソケットを確かめる。危ないものは消さずに止まる。
+
+    **`_acquire_lock()` を持ってから呼ぶ。** 古いソケットの判定と削除を直列にするため。
+    """
     try:
         existing = os.lstat(path)
     except FileNotFoundError:
@@ -131,8 +167,9 @@ def _prepare_path(path: Path) -> None:
         probe.settimeout(1.0)
         probe.connect(str(path))
     except (ConnectionRefusedError, FileNotFoundError):
-        # 前回の停止で消し損ねたソケット。誰も待ち受けていないので消してよい
-        path.unlink(missing_ok=True)
+        # 前回の停止で消し損ねたソケット。誰も待ち受けていないので消してよい。
+        # 確かめたものと同じ場合だけ消す（ロックの外から差し替えられても触らない）
+        _unlink_if_same(path, _identity(existing))
         return
     finally:
         probe.close()
@@ -190,6 +227,8 @@ class EventEntryServer:
         self._listener: socket.socket | None = None
         # 自分が bind したソケットの (st_dev, st_ino)。消してよいのはこれと一致するものだけ
         self._bound: tuple[int, int] | None = None
+        # `<socket>.lock` の排他ロック。待ち受けている間ずっと持つ
+        self._lock_fd: int | None = None
         self._stop = False
         self.accepted = 0
         self.rejected = 0
@@ -200,6 +239,16 @@ class EventEntryServer:
 
     def bind(self) -> None:
         """ソケットを作り、権限を設定して待ち受けを始める。"""
+        _prepare_parent(self._path.parent)
+        lock_fd = _acquire_lock(self._path)
+        try:
+            self._bind_locked()
+        except BaseException:
+            os.close(lock_fd)
+            raise
+        self._lock_fd = lock_fd
+
+    def _bind_locked(self) -> None:
         _prepare_path(self._path)
         listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         bound: tuple[int, int] | None = None
@@ -259,6 +308,10 @@ class EventEntryServer:
             self._listener = None
         _unlink_if_same(self._path, self._bound)
         self._bound = None
+        # ソケットを消してから手放す。逆だと次の起動が消す前のソケットを見る
+        if self._lock_fd is not None:
+            os.close(self._lock_fd)
+            self._lock_fd = None
 
     def handle(self, conn: socket.socket) -> None:
         """1接続を処理する。**1接続の失敗で入口を落とさない**（ログして継続）。"""

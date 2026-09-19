@@ -480,8 +480,8 @@ async function loadHistory() {
   // 見分けがつかない
   const loadEvents = (signal) =>
     fetchJson("/api/v1/events", { window: range.window, kind: "gpu_mode" }, signal)
-      .then((body) => ({ events: body.events, error: null }))
-      .catch((error) => ({ events: [], error }));
+      .then((body) => ({ events: body.events, truncated: body.truncated === true, error: null }))
+      .catch((error) => ({ events: [], truncated: false, error }));
 
   try {
     const [tempSeries, humiditySeries, eventResult] = await withTimeout(HISTORY_TIMEOUT_MS, (signal) =>
@@ -490,9 +490,12 @@ async function loadHistory() {
     if (!usable()) return;
     historyAppliedSeq = seq;
     lastSeries = { temp: tempSeries, humidity: humiditySeries, events: eventResult.events };
+    // 上限を超えると新しい側だけが返る。古い側の切り替えが「無かった」ように見せない
     eventsNote = eventResult.error
       ? `GPU Mode の記録を取得できませんでした: ${eventResult.error.message}`
-      : "";
+      : eventResult.truncated
+        ? "GPU Mode の記録が多いため、古い切り替えは表示していません"
+        : "";
     drawCharts();
     const used = tempSeries[0] || humiditySeries[0];
     historyNote = used

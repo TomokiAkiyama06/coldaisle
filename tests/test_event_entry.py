@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import ast
 import errno
+import fcntl
 import json
 import os
 import re
@@ -465,6 +466,10 @@ def test_losing_a_concurrent_start_leaves_the_winner_socket(running, db, rules, 
     """同時起動で両方が `_prepare_path()` を通り、負けた側が EADDRINUSE になる場合。"""
     path = running.settings.socket.path
     before = os.lstat(path)
+    # ロックと古いソケットの確認を両方すり抜けた場合の、最後の防御を確かめる
+    monkeypatch.setattr(
+        event_server, "_acquire_lock", lambda _path: os.open(os.devnull, os.O_RDONLY)
+    )
     monkeypatch.setattr(event_server, "_prepare_path", lambda _path: None)
     with pytest.raises(OSError) as excinfo:
         RunningServer(running.settings, db, rules)
@@ -472,6 +477,46 @@ def test_losing_a_concurrent_start_leaves_the_winner_socket(running, db, rules, 
     after = os.lstat(path)
     assert (after.st_dev, after.st_ino) == (before.st_dev, before.st_ino)
     assert running.send(encode_gpu_mode("ai"))["ok"] is True
+
+
+@needs_peercred
+def test_stale_cleanup_waits_for_the_lock(short_dir, db, rules):
+    """古いソケットが残る中で2つが同時に起動しても、掃除と bind は1つずつ（#141 のレビュー）。
+
+    ロックを持つ側（ここではテスト）がいる間、後から来た側は古いソケットに触らず止まる。
+    """
+    path = short_dir / "events.sock"
+    stale = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    stale.bind(str(path))
+    stale.close()
+    before = os.lstat(path)
+    holder = os.open(short_dir / "events.sock.lock", os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(holder, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        with pytest.raises(EntryStartupError, match="別の"):
+            RunningServer(settings_for(path), db, rules)
+        after = os.lstat(path)
+        assert (after.st_dev, after.st_ino) == (before.st_dev, before.st_ino)
+    finally:
+        os.close(holder)
+    # ロックが空けば、古いソケットを片付けて起動できる
+    entry = RunningServer(settings_for(path), db, rules)
+    assert entry.send(encode_gpu_mode("ai"))["ok"] is True
+    entry.stop()
+
+
+@needs_peercred
+def test_the_lock_is_released_on_close(short_dir, db, rules):
+    path = short_dir / "events.sock"
+    RunningServer(settings_for(path), db, rules).stop()
+    entry = RunningServer(settings_for(path), db, rules)
+    assert entry.send(encode_gpu_mode("ai"))["ok"] is True
+    entry.stop()
+    lock = os.open(short_dir / "events.sock.lock", os.O_RDWR)
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    finally:
+        os.close(lock)
 
 
 @needs_peercred
