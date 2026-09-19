@@ -48,6 +48,7 @@ from coldaisle.control.model.thermal import (
     replay_predictions,
 )
 from coldaisle.control.model.training import (
+    IneffectiveRidgeLambdaError,
     RidgeTrainingSpec,
     VerifiedTrainingDatasetArtifact,
     train_ridge_baseline,
@@ -69,6 +70,7 @@ __all__ = [
     "DatasetSpec",
     "DatasetSplit",
     "DatasetWorkloadRegime",
+    "IneffectiveRidgeLambdaError",
     "InferenceCapability",
     "ObservedFanAction",
     "ObservedThermalInput",

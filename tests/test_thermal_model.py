@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import sys
 from pathlib import Path
@@ -55,6 +56,7 @@ from coldaisle.control.model.thermal import (
     replay_predictions,
 )
 from coldaisle.control.model.training import (
+    IneffectiveRidgeLambdaError,
     RidgeTrainingSpec,
     VerifiedTrainingDatasetArtifact,
     _fit_ridge,
@@ -411,6 +413,23 @@ def test_head_specific_ridge_centers_selected_features_for_the_intercept():
 
     assert coefficients == pytest.approx((0.5,))
     assert intercept == pytest.approx(0.5)
+
+
+def test_ridge_lambda_below_gram_diagonal_ulp_fails_with_minimum_effective_lambda():
+    # Two identical normalized columns make X^T X singular; 1e-20 rounds away on a diagonal of 2.
+    rows = ((-1.0, -1.0), (1.0, 1.0))
+    labels = (0.0, 2.0)
+
+    with pytest.raises(IneffectiveRidgeLambdaError) as excinfo:
+        _fit_ridge(rows, labels, ridge_lambda=1e-20)
+
+    minimum = excinfo.value.minimum_effective_lambda
+    assert excinfo.value.ridge_lambda == 1e-20
+    assert 1e-20 < minimum < 1e-12
+    assert "minimum_effective_lambda" in str(excinfo.value)
+    # The reported minimum is actually sufficient: the same rows then solve without error.
+    intercept, coefficients = _fit_ridge(rows, labels, ridge_lambda=minimum)
+    assert all(map(math.isfinite, (intercept, *coefficients)))
 
 
 def test_stale_threshold_is_part_of_feature_schema_identity():

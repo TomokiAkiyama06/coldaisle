@@ -8,6 +8,7 @@ import math
 import os
 import re
 import stat
+import sys
 from datetime import datetime
 from pathlib import Path
 
@@ -65,6 +66,25 @@ _DATASET_ARTIFACT_ALIAS = re.compile(r"^dataset-[0-9a-f]{32}$")
 _DATASET_MANIFEST_FILENAME = "manifest.json"
 _DATASET_EXAMPLES_FILENAME = "examples.jsonl"
 _DATASET_BINDING_TOKEN = object()
+# Numerical-precision constant, not a tunable: one ULP of 1.0 for IEEE-754 binary64.
+_FLOAT_EPSILON = sys.float_info.epsilon
+
+
+class IneffectiveRidgeLambdaError(ValueError):
+    """``ridge_lambda`` is too small to survive floating-point addition to the Gram diagonal.
+
+    The user's lambda is never silently raised; callers choose a value at or above
+    ``minimum_effective_lambda`` explicitly.
+    """
+
+    def __init__(self, *, ridge_lambda: float, minimum_effective_lambda: float) -> None:
+        self.ridge_lambda = ridge_lambda
+        self.minimum_effective_lambda = minimum_effective_lambda
+        super().__init__(
+            "ridge_lambdaがGram行列の対角スケールに対して小さすぎ、浮動小数点の丸めで消える: "
+            f"ridge_lambda={ridge_lambda!r}, "
+            f"minimum_effective_lambda={minimum_effective_lambda!r}"
+        )
 
 
 class _Frozen(BaseModel):
@@ -701,13 +721,12 @@ def _fit_ridge(
     centered_labels = tuple(label - label_mean for label in labels)
     try:
         gram = [
-            [
-                math.fsum(row[left] * row[right] for row in centered_rows)
-                + (ridge_lambda if left == right else 0.0)
-                for right in range(width)
-            ]
+            [math.fsum(row[left] * row[right] for row in centered_rows) for right in range(width)]
             for left in range(width)
         ]
+        _require_effective_ridge_lambda(gram, ridge_lambda)
+        for index in range(width):
+            gram[index][index] += ridge_lambda
         rhs = [
             math.fsum(
                 row[column] * label
@@ -726,6 +745,29 @@ def _fit_ridge(
     ):
         raise ValueError("ridge parameterが非有限になった")
     return intercept, coefficients
+
+
+def _minimum_effective_ridge_lambda(gram: list[list[float]]) -> float:
+    """Smallest lambda that dominates rounding in the Gram matrix and its elimination.
+
+    Rounding error in forming and eliminating an ``n``-column Gram matrix is bounded by roughly
+    ``n * eps * max(diag)``.  A lambda below that cannot guarantee a numerically
+    positive-definite system (e.g. duplicate normalized columns with ``1e-20``).  The bound is
+    data-scale dependent (the diagonal grows with the number of train rows), so it is checked
+    here rather than in ``RidgeTrainingSpec``.
+    """
+    width = len(gram)
+    max_diagonal = max((abs(gram[index][index]) for index in range(width)), default=0.0)
+    return width * _FLOAT_EPSILON * max_diagonal
+
+
+def _require_effective_ridge_lambda(gram: list[list[float]], ridge_lambda: float) -> None:
+    minimum = _minimum_effective_ridge_lambda(gram)
+    if ridge_lambda <= minimum:
+        raise IneffectiveRidgeLambdaError(
+            ridge_lambda=ridge_lambda,
+            minimum_effective_lambda=math.nextafter(minimum, math.inf),
+        )
 
 
 def _solve_linear_system(matrix: list[list[float]], values: list[float]) -> tuple[float, ...]:
