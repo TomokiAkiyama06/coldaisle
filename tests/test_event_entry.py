@@ -559,6 +559,31 @@ def test_group_traversal_follows_symlinks_to_the_real_ancestors(short_dir, db, r
 
 
 @needs_peercred
+def test_group_traversal_also_checks_the_path_as_written(short_dir, db, rules):
+    """リンク先が通れても、字面の途中が通れなければ止まる（#141 のレビュー）。
+
+    書き手は設定どおりの字面のパスで接続するため、リンクを置いたディレクトリも通る。
+    """
+    os.chmod(short_dir, 0o711)
+    real = short_dir / "open" / "run"
+    real.mkdir(parents=True)
+    os.chmod(short_dir / "open", 0o711)
+    os.chmod(real, 0o750)
+    blocked = short_dir / "blocked"
+    blocked.mkdir()
+    os.chmod(blocked, 0o700)  # グループも other も通れない
+    link = blocked / "link"
+    link.symlink_to(real, target_is_directory=True)
+    settings = settings_with_group(link / "events.sock")
+    with pytest.raises(EntryStartupError, match="たどれない") as excinfo:
+        RunningServer(settings, db, rules)
+    assert str(blocked) in str(excinfo.value)
+
+    os.chmod(blocked, 0o711)
+    RunningServer(settings, db, rules).stop()
+
+
+@needs_peercred
 def test_does_not_delete_a_non_socket_file(short_dir, db, rules):
     victim = short_dir / "events.sock"
     victim.write_text("keep me", encoding="utf-8")

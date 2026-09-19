@@ -182,10 +182,13 @@ def _check_group_can_traverse(parent: Path, group_gid: int) -> None:
     ルートから親までのどのディレクトリも「グループが一致して g+x」か「o+x」でなければ
     ならない。満たさなければ起動しない（書き手が EACCES になるだけの状態で待ち受けない）。
     """
-    # 字面のパスではなく実体をたどる。シンボリックリンクがあると、書き手が実際に
-    # 通るのはリンク先の祖先で、字面の祖先を見ても EACCES を見逃す
+    # 字面の祖先と実体の祖先の**両方**を見る。書き手は設定どおりの字面のパスで
+    # 接続するので、途中のディレクトリをすべて通る必要がある。シンボリックリンクが
+    # あれば、さらにリンク先の祖先も通る。片方だけでは EACCES を見逃す
+    lexical = parent.absolute()
     physical = Path(os.path.realpath(parent))
-    for directory in (physical, *physical.parents):
+    candidates = (lexical, *lexical.parents, physical, *physical.parents)
+    for directory in dict.fromkeys(candidates):  # 順序を保って重複を除く
         st = os.stat(directory)
         if st.st_mode & stat.S_IXOTH:
             continue
