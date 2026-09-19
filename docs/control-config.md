@@ -95,7 +95,9 @@ control loopがworkerへ渡した元snapshotのローカル単調時刻から `s
 （`limit_up` / `limit_down`。`limit_down` は最低 demand の制限を兼ねる）、OOD 判定の
 `range_margin`・`min_support_count`・`full_support_count`・`min_missing_pattern_count`、
 residual drift の `residual_window`・`residual_min_samples`・`residual_match_tolerance_ms`・
-`residual_drift_ood_ratio`、uncertainty や residual の証拠が無い間の confidence 上限
+`residual_drift_ood_ratio`（`residual_window` / `residual_min_samples` の単位は照合し終えた予測（forecast）の
+件数で、出力の数ではない。照合は期待時刻の前後 `residual_match_tolerance_ms` 以内の最も近い観測で、
+同距離なら過去側）、uncertainty や residual の証拠が無い間の confidence 上限
 `cap_without_uncertainty`・`cap_before_residual_evidence` をすべて `status` / `basis` 付きで明示する。
 MEDIUM の下限は stage ごとの `gate_min_confidence` で、`high_min_confidence >= gate_min_confidence.full`
 を検証する。MEDIUM 帯は stage の帯との共通部分を採り、confidence が authority を広げることはない。

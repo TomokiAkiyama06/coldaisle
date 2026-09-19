@@ -54,8 +54,8 @@ MAX_SUPPORT_AXES = 8
 MAX_AXIS_EDGES = 64
 MAX_SUPPORT_CELLS = 100_000
 MAX_MISSING_PATTERNS = 4_096
-MAX_PENDING_TARGETS = 65_536
-"""照合待ちの予測値の上限。これを超えたら古い順に捨て、捨てた件数を数える。"""
+MAX_PENDING_FORECASTS = 4_096
+"""照合待ちの予測の上限。これを超えたら古い順に捨て、捨てた件数を数える。"""
 MAX_EVALUATION_CASES = 100_000
 MAX_EVALUATION_MISSES = 100
 """評価レポートに名前を残す誤判定の件数の上限。"""
@@ -355,42 +355,88 @@ def fit_confidence_profile(
 
 
 class ResidualEvidence(_Frozen):
-    """直近の照合済み予測から見た residual drift の状態。"""
+    """直近の照合済み**予測（forecast）**から見た residual drift の状態。
 
-    samples: int = Field(ge=0)
+    件数の単位は forecast。1回の予測が持つ horizon × metric の出力の数では数えない。
+    出力の数で数えると、多出力の予測1回だけで ``residual_min_samples`` を満たし、
+    証拠が無い間の confidence 上限が外れてしまうため（決定記録 0050 §2.2）。
+    """
+
+    profile_sha256: Sha256
+    """この証拠を数えた Profile。別のモデルの証拠で confidence 上限を外さないために照合する。"""
+    forecasts: int = Field(ge=0)
+    """window に入っている、全出力を照合し終えた forecast の件数。"""
     ratio: FiniteFloat | None = Field(default=None, ge=0.0)
-    """正規化 residual の RMS。validation と同じ誤差なら 1 前後になる。"""
-    expired_targets: int = Field(ge=0)
-    dropped_targets: int = Field(ge=0)
+    """forecast ごとの正規化 residual の二乗平均を、forecast で平均した値の平方根。
+
+    validation と同じ誤差なら 1 前後になる。
+    """
+    expired_forecasts: int = Field(ge=0)
+    """許容幅の中で観測が揃わず、証拠に数えなかった forecast の件数（累計）。"""
+    dropped_forecasts: int = Field(ge=0)
+    """照合待ちの上限を超えて捨てた forecast の件数（累計）。"""
 
     @model_validator(mode="after")
-    def _ratio_needs_samples(self) -> Self:
-        if (self.samples == 0) != (self.ratio is None):
-            raise ValueError("residual の件数と ratio の有無を一致させる")
+    def _ratio_needs_forecasts(self) -> Self:
+        if (self.forecasts == 0) != (self.ratio is None):
+            raise ValueError("residual の forecast 件数と ratio の有無を一致させる")
         return self
 
 
-class ResidualDriftMonitor:
-    """過去の予測を後から届いた観測と照合し、予測誤差の drift を数える。
+class _PendingForecast:
+    """照合待ちの1回の予測。出力ごとに、いまの最良の観測候補を持つ。"""
 
-    時刻は **予測と同じ時間軸**（``expected_ts_ms`` と観測の ``ts_ms``）で比べる。
-    照合の許容幅を過ぎても観測が無かった予測は捨て、件数だけを残す。
+    __slots__ = ("action_ts_ms", "best", "finalized", "targets")
+
+    def __init__(self, prediction: ThermalPrediction) -> None:
+        self.action_ts_ms = prediction.input_action_ts_ms
+        self.targets: dict[tuple[int, str], tuple[int, float]] = {
+            (target.horizon_ms, metric): (target.expected_ts_ms, value)
+            for target in prediction.targets
+            for metric, value in target.values.items()
+        }
+        self.best: dict[tuple[int, str], tuple[int, int, float]] = {}
+        """出力 → (期待時刻からの距離, 観測時刻, 観測値)。"""
+        self.finalized: set[tuple[int, str]] = set()
+
+
+class ResidualDriftMonitor:
+    """過去の予測を後から届いた観測と照合し、予測誤差の drift を forecast 単位で数える。
+
+    照合は Dataset の target 選択（決定記録 0031 §2.2）と同じ規則にする。
+
+    - 期待時刻 ``expected_ts_ms`` に**最も近い**観測を、``±residual_match_tolerance_ms`` の
+      中でだけ採る。前後どちら側でもよい。**同距離なら過去側**を採る
+    - 観測は action より後に限る
+    - metric ごとに、その metric の値がある観測だけを候補にする
+
+    観測は時刻順に届く。期待時刻以降に値のある観測が来るか、許容幅を過ぎたら、その出力の
+    候補は確定する（それより近い観測はもう来ない）。1回の予測の全出力が確定し、**全出力に観測が
+    あった**ときだけ、その予測を1件の証拠として window に入れる。1つでも観測が無い予測は
+    証拠に数えない（``expired_forecasts``）。
     """
 
     def __init__(self, profile: ModelConfidenceProfile, policy: ModelConfidencePolicy) -> None:
-        self._profile = profile
+        self._profile = ModelConfidenceProfile.model_validate(profile.model_dump(mode="python"))
+        self._profile_sha256 = self._profile.sha256()
         self._scales = {
             (scale.horizon_ms, scale.metric): scale.scale for scale in profile.residual_scales
         }
         self._tolerance_ms = policy.residual_match_tolerance_ms.value
-        self._residuals: deque[float] = deque(maxlen=policy.residual_window.value)
-        self._pending: deque[tuple[int, int, str, float]] = deque()
+        self._forecast_errors: deque[float] = deque(maxlen=policy.residual_window.value)
+        """forecast ごとの正規化 residual の二乗平均。"""
+        self._pending: deque[_PendingForecast] = deque()
+        self._last_action_ms: int | None = None
         self._last_observed_ms: int | None = None
         self._expired = 0
         self._dropped = 0
 
     def record(self, prediction: ThermalPrediction) -> None:
-        """照合待ちに予測を加える。Profile と別のモデルの予測は受け付けない。"""
+        """照合待ちに予測を加える。
+
+        Profile と別のモデルの予測は受け付けない。同じ action を2回数えないよう、
+        action 時刻は狭義単調増加に限る（重複した予測で証拠の件数を水増ししない）。
+        """
         binding = self._profile.binding
         if (prediction.model_id, prediction.model_version, prediction.artifact_sha256) != (
             binding.model_id,
@@ -398,49 +444,82 @@ class ResidualDriftMonitor:
             binding.artifact_sha256,
         ):
             raise ValueError("Profile と別のモデルの予測を drift の照合に混ぜない")
-        for target in prediction.targets:
-            for metric, value in sorted(target.values.items()):
-                self._pending.append((target.expected_ts_ms, target.horizon_ms, metric, value))
-        while len(self._pending) > MAX_PENDING_TARGETS:
+        if self._last_action_ms is not None and prediction.input_action_ts_ms <= (
+            self._last_action_ms
+        ):
+            raise ValueError("drift の照合に入れる予測の action 時刻は狭義単調増加にする")
+        forecast = _PendingForecast(prediction)
+        if set(forecast.targets) != set(self._scales):
+            raise ValueError("予測の出力が Profile の target schema と一致しない")
+        self._last_action_ms = prediction.input_action_ts_ms
+        self._pending.append(forecast)
+        while len(self._pending) > MAX_PENDING_FORECASTS:
             self._pending.popleft()
             self._dropped += 1
 
     def observe(self, ts_ms: int, values: Mapping[str, float | None]) -> None:
-        """観測を1つ受け取り、許容幅に入った予測と照合する。時刻は巻き戻せない。"""
+        """観測を1つ受け取り、照合待ちの予測の候補を更新する。時刻は巻き戻せない。"""
         if ts_ms < 0:
             raise ValueError("観測時刻は負にできない")
         if self._last_observed_ms is not None and ts_ms < self._last_observed_ms:
             raise ValueError("residual の観測時刻は巻き戻せない")
         self._last_observed_ms = ts_ms
-        remaining: deque[tuple[int, int, str, float]] = deque()
-        for expected_ts_ms, horizon_ms, metric, predicted in self._pending:
-            if ts_ms < expected_ts_ms:
-                remaining.append((expected_ts_ms, horizon_ms, metric, predicted))
+        remaining: deque[_PendingForecast] = deque()
+        for forecast in self._pending:
+            self._update(forecast, ts_ms, values)
+            if len(forecast.finalized) == len(forecast.targets):
+                self._complete(forecast)
+            else:
+                remaining.append(forecast)
+        self._pending = remaining
+
+    def _update(
+        self, forecast: _PendingForecast, ts_ms: int, values: Mapping[str, float | None]
+    ) -> None:
+        for key, (expected_ts_ms, _predicted) in forecast.targets.items():
+            if key in forecast.finalized:
                 continue
             if ts_ms - expected_ts_ms > self._tolerance_ms:
-                self._expired += 1
+                # 許容幅を過ぎた。これより近い観測はもう来ない。
+                forecast.finalized.add(key)
                 continue
-            actual = values.get(metric)
-            if actual is None or not math.isfinite(actual):
-                remaining.append((expected_ts_ms, horizon_ms, metric, predicted))
+            actual = values.get(key[1])
+            if (
+                actual is None
+                or not math.isfinite(actual)
+                or ts_ms <= forecast.action_ts_ms
+                or expected_ts_ms - ts_ms > self._tolerance_ms
+            ):
                 continue
-            scale = self._scales[(horizon_ms, metric)]
-            self._residuals.append((actual - predicted) / scale)
-        self._pending = remaining
+            distance = abs(ts_ms - expected_ts_ms)
+            best = forecast.best.get(key)
+            # 観測は時刻順に届くので、同距離なら先に来た（過去側の）候補を残す。
+            if best is None or distance < best[0]:
+                forecast.best[key] = (distance, ts_ms, actual)
+            if ts_ms >= expected_ts_ms:
+                # 期待時刻以降の値が来た。以降の観測はこれより遠いか同距離の未来側。
+                forecast.finalized.add(key)
+
+    def _complete(self, forecast: _PendingForecast) -> None:
+        if len(forecast.best) != len(forecast.targets):
+            self._expired += 1
+            return
+        squared = [
+            ((forecast.best[key][2] - predicted) / self._scales[key]) ** 2
+            for key, (_expected, predicted) in sorted(forecast.targets.items())
+        ]
+        self._forecast_errors.append(math.fsum(squared) / len(squared))
 
     def evidence(self) -> ResidualEvidence:
         """いまの drift の状態。"""
-        samples = len(self._residuals)
-        ratio = (
-            None
-            if samples == 0
-            else math.sqrt(math.fsum(value * value for value in self._residuals) / samples)
-        )
+        forecasts = len(self._forecast_errors)
+        ratio = None if forecasts == 0 else math.sqrt(math.fsum(self._forecast_errors) / forecasts)
         return ResidualEvidence(
-            samples=samples,
+            profile_sha256=self._profile_sha256,
+            forecasts=forecasts,
             ratio=ratio,
-            expired_targets=self._expired,
-            dropped_targets=self._dropped,
+            expired_forecasts=self._expired,
+            dropped_forecasts=self._dropped,
         )
 
 
@@ -705,19 +784,22 @@ class ConfidenceAssessor:
         )
 
     def _residual_drift(self, residual: ResidualEvidence | None) -> ComponentResult:
+        if residual is not None and residual.profile_sha256 != self._profile_sha256:
+            # 別のモデル・Profile の証拠で上限を外すと、照合していないモデルに authority を渡す。
+            raise ValueError("residual の証拠が assessment の Profile と一致しない")
         minimum = self._policy.residual_min_samples.value
-        samples = 0 if residual is None else residual.samples
-        if residual is None or residual.ratio is None or samples < minimum:
+        forecasts = 0 if residual is None else residual.forecasts
+        if residual is None or residual.ratio is None or forecasts < minimum:
             return ComponentResult(
                 component=ConfidenceComponent.RESIDUAL_DRIFT,
                 score=None,
                 cap=self._policy.cap_before_residual_evidence.value,
                 ood=False,
-                detail=f"samples={samples}; min={minimum}",
+                detail=f"forecasts={forecasts}; min={minimum}",
             )
         ood_ratio = self._policy.residual_drift_ood_ratio.value
         ratio = residual.ratio
-        detail = f"ratio={ratio:.6f}; samples={samples}"
+        detail = f"ratio={ratio:.6f}; forecasts={forecasts}"
         if ratio >= ood_ratio:
             return ComponentResult(
                 component=ConfidenceComponent.RESIDUAL_DRIFT,

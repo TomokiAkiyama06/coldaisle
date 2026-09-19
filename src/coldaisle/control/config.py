@@ -487,11 +487,14 @@ class ModelConfidencePolicy(_ConfigModel):
     min_missing_pattern_count: ConfigValue[PositiveCount]
     """欠測の組み合わせの学習件数がこれ未満なら OOD。"""
     residual_window: ConfigValue[PositiveCount]
-    """residual drift を見る直近の照合済み予測の件数。"""
+    """residual drift を見る直近の照合済み**予測（forecast）**の件数。出力の数ではない。"""
     residual_min_samples: ConfigValue[PositiveCount]
-    """residual drift を評価に使う最低件数。未満の間は ``cap_before_residual_evidence``。"""
+    """residual drift を評価に使う最低 forecast 件数。
+
+    未満の間は ``cap_before_residual_evidence`` で confidence を抑える。
+    """
     residual_match_tolerance_ms: ConfigValue[NonNegativeMilliseconds]
-    """予測時刻と観測時刻の照合の許容幅。"""
+    """期待時刻の前後それぞれに許す照合の幅（決定記録 0031 §2.2 と同じ最近傍・同距離は過去側）。"""
     residual_drift_ood_ratio: ConfigValue[DriftRatio]
     """正規化 residual の RMS が validation 基準のこの倍率以上なら OOD。"""
     cap_without_uncertainty: PolicyUnitInterval

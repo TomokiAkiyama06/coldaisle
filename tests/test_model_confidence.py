@@ -121,7 +121,11 @@ def frame(ts_ms: int, index: int, *, offset: float) -> WindowFrame:
     )
 
 
-def example(index: int) -> DatasetExample:
+def example(
+    index: int,
+    horizons: tuple[int, ...] = (1_000,),
+    targets: tuple[str, ...] = TARGETS,
+) -> DatasetExample:
     action_ts = 10_000 + index * STEP_MS
     fan = fan_value(index)
     zone = ActionZone(
@@ -134,12 +138,17 @@ def example(index: int) -> DatasetExample:
     # 決定論的な小さな揺らぎ。validation の residual を 0 にしない。
     wobble = ((index * 7) % 5 - 2) * 0.1
     label = 0.8 * gpu_value(index) + 0.3 * air_value(index) - 5.0 * fan + wobble
+
+    def target_value(horizon: int, metric: str) -> float:
+        offset = 0.0 if metric == GPU else -20.0
+        return label + offset + 0.5 * (horizon / 1_000 - 1)
+
     return DatasetExample(
         example_id=f"{RUN_ID}:{action_ts}:{index}",
         source_run_id=RUN_ID,
         history_start_ms=action_ts - 1_000,
         action_ts_ms=action_ts,
-        label_end_ms=action_ts + 1_000,
+        label_end_ms=action_ts + horizons[-1],
         control_tick_id=index,
         control_schema_version=5,
         window=(frame(action_ts - 1_000, index, offset=-0.5), frame(action_ts, index, offset=0.0)),
@@ -155,31 +164,35 @@ def example(index: int) -> DatasetExample:
             regime_confidence=None,
             fault_codes=(),
         ),
-        targets=(
+        targets=tuple(
             TargetFrame(
-                horizon_ms=1_000,
-                expected_ts_ms=action_ts + 1_000,
-                values={GPU: label},
-                source_ts_ms={GPU: action_ts + 1_000},
-                quality={GPU: Quality.OK},
-                missing_mask={GPU: False},
-            ),
+                horizon_ms=horizon,
+                expected_ts_ms=action_ts + horizon,
+                values={metric: target_value(horizon, metric) for metric in targets},
+                source_ts_ms={metric: action_ts + horizon for metric in targets},
+                quality={metric: Quality.OK for metric in targets},
+                missing_mask={metric: False for metric in targets},
+            )
+            for horizon in horizons
         ),
     )
 
 
-def dataset() -> ThermalDataset:
-    items = tuple(example(index) for index in range(EXAMPLES))
+def dataset(
+    horizons: tuple[int, ...] = (1_000,),
+    targets: tuple[str, ...] = TARGETS,
+) -> ThermalDataset:
+    items = tuple(example(index, horizons, targets) for index in range(EXAMPLES))
     return ThermalDataset(
         manifest=DatasetManifest(
             spec=DatasetSpec(
                 window_ms=1_000,
                 sample_period_ms=1_000,
-                horizons_ms=(1_000,),
+                horizons_ms=horizons,
                 target_tolerance_ms=0,
                 stale_after_ms=5_000,
                 feature_metrics=FEATURES,
-                target_metrics=TARGETS,
+                target_metrics=targets,
             ),
             source_runs=(
                 SourceRun(
@@ -289,8 +302,16 @@ def with_missing(observed: ObservedThermalInput, metric: str) -> ObservedThermal
     return observed.model_copy(update={"window": (missing, *observed.window[1:])})
 
 
-def evidence(ratio: float, samples: int = 10) -> ResidualEvidence:
-    return ResidualEvidence(samples=samples, ratio=ratio, expired_targets=0, dropped_targets=0)
+def evidence(
+    profile: ModelConfidenceProfile, ratio: float, forecasts: int = 10
+) -> ResidualEvidence:
+    return ResidualEvidence(
+        profile_sha256=profile.sha256(),
+        forecasts=forecasts,
+        ratio=ratio,
+        expired_forecasts=0,
+        dropped_forecasts=0,
+    )
 
 
 def component(assessment: ConfidenceAssessment, name: ConfidenceComponent):
@@ -361,8 +382,8 @@ def test_in_distribution_replay_is_not_ood_and_assessment_is_deterministic(train
     observed = ObservedThermalInput.from_example(parts.test[0])
     prediction = model.predict(observed)
 
-    first = judge.assess(observed, prediction, evidence(1.0))
-    assert first == judge.assess(observed, prediction, evidence(1.0))
+    first = judge.assess(observed, prediction, evidence(profile, 1.0))
+    assert first == judge.assess(observed, prediction, evidence(profile, 1.0))
     assert first.ood is False
     assert first.profile_sha256 == profile.sha256()
     # uncertainty が無い間は cap_without_uncertainty（0.9）で抑える
@@ -397,7 +418,7 @@ def test_synthetic_out_of_training_inputs_are_ood(
     }[case]()
     prediction = model.predict(observed)
 
-    result = assessor(profile).assess(observed, prediction, evidence(1.0))
+    result = assessor(profile).assess(observed, prediction, evidence(profile, 1.0))
 
     assert result.ood is True
     assert result.confidence == 0.0
@@ -424,7 +445,7 @@ def test_small_excursion_inside_margin_lowers_confidence_without_ood(trained) ->
     # air の学習範囲は 19.5..27.0（幅 7.5）。margin 0.1 = 0.75 まではみ出しを許す
     # test[7] は cycle 7（air 27 / gpu 54 / fan 0.65）。support cell は学習済みのまま
     observed = shifted(ObservedThermalInput.from_example(parts.test[7]), air=27.375)
-    result = assessor(profile).assess(observed, model.predict(observed), evidence(1.0))
+    result = assessor(profile).assess(observed, model.predict(observed), evidence(profile, 1.0))
 
     assert result.ood is False
     range_score = component(result, ConfidenceComponent.FEATURE_RANGE).score
@@ -437,7 +458,9 @@ def test_model_version_mismatch_is_ood(trained) -> None:
     other_model = train(data, parts, version="0.2.0")
     observed = ObservedThermalInput.from_example(parts.test[0])
 
-    result = assessor(profile).assess(observed, other_model.predict(observed), evidence(1.0))
+    result = assessor(profile).assess(
+        observed, other_model.predict(observed), evidence(profile, 1.0)
+    )
 
     assert result.ood is True
     detail = component(result, ConfidenceComponent.MODEL_BINDING).detail
@@ -460,8 +483,8 @@ def test_confidence_is_capped_until_residual_evidence_exists(trained) -> None:
     judge = assessor(profile)
 
     no_history = judge.assess(observed, prediction, None)
-    few = judge.assess(observed, prediction, evidence(1.0, samples=4))
-    enough = judge.assess(observed, prediction, evidence(1.0, samples=5))
+    few = judge.assess(observed, prediction, evidence(profile, 1.0, forecasts=4))
+    enough = judge.assess(observed, prediction, evidence(profile, 1.0, forecasts=5))
 
     assert no_history.confidence == pytest.approx(0.7)
     assert few.confidence == pytest.approx(0.7)
@@ -477,7 +500,7 @@ def test_residual_drift_is_scored_against_the_validation_scale(
 ) -> None:
     _data, parts, model, profile = trained
     observed = ObservedThermalInput.from_example(parts.test[0])
-    result = assessor(profile).assess(observed, model.predict(observed), evidence(ratio))
+    result = assessor(profile).assess(observed, model.predict(observed), evidence(profile, ratio))
 
     drift = component(result, ConfidenceComponent.RESIDUAL_DRIFT)
     assert drift.ood is ood
@@ -494,11 +517,11 @@ def test_residual_drift_monitor_matches_predictions_with_later_observations(trai
         prediction = model.predict(observed)
         monitor.record(prediction)
         predicted = prediction.targets[0].values[GPU]
-        # 許容幅（500ms）の中で、validation の3倍の誤差で観測された
+        # 許容幅（±500ms）の中で、validation の3倍の誤差で観測された
         monitor.observe(prediction.targets[0].expected_ts_ms + 200, {GPU: predicted + 3 * scale})
 
     state = monitor.evidence()
-    assert state.samples == 5
+    assert state.forecasts == 5
     assert state.ratio == pytest.approx(3.0)
     observed = ObservedThermalInput.from_example(parts.test[5])
     result = assessor(profile).assess(observed, model.predict(observed), state)
@@ -507,7 +530,7 @@ def test_residual_drift_monitor_matches_predictions_with_later_observations(trai
     late = model.predict(ObservedThermalInput.from_example(parts.test[6]))
     monitor.record(late)
     monitor.observe(late.targets[0].expected_ts_ms + 501, {GPU: 0.0})
-    assert monitor.evidence().expired_targets == 1
+    assert monitor.evidence().expired_forecasts == 1
     with pytest.raises(ValueError, match="巻き戻せない"):
         monitor.observe(0, {GPU: 0.0})
 
@@ -639,7 +662,7 @@ def test_ood_assessment_switches_to_fallback_immediately_and_is_traced(trained) 
     assert active.active_controller is ControllerKind.LEARNED_MPC
 
     observed = shifted(ObservedThermalInput.from_example(parts.test[0]), air=35.0)
-    assessment = judge.assess(observed, model.predict(observed), evidence(1.0))
+    assessment = judge.assess(observed, model.predict(observed), evidence(profile, 1.0))
     # Registry を通った artifact の判定として提案へ付ける（offline のままでは付けられない）
     deployed = assessment.model_copy(
         update={
@@ -765,3 +788,182 @@ def _trace_tick(selection) -> ControlTick:
         zones=PerZone(**zones),
         model_gate=gate,
     )
+
+
+# ------------------------------------------------ Residual の数え方と照合（#149 review）
+
+
+@pytest.fixture(scope="module")
+def multi_output():
+    """2 horizon × 2 metric = 4 出力のモデル。"""
+    data = dataset(horizons=(1_000, 2_000), targets=(GPU, AIR))
+    parts = split(data)
+    model = train(data, parts)
+    profile = fit_confidence_profile(model, data, parts, profile_spec())
+    return parts, model, profile
+
+
+def at_action(observed: ObservedThermalInput, action_ts_ms: int) -> ObservedThermalInput:
+    """同じ観測を別の action 時刻へずらした入力（forecast を何件も作るため）。"""
+    delta = action_ts_ms - observed.action_ts_ms
+    frames = tuple(
+        frame.model_copy(
+            update={
+                "ts_ms": frame.ts_ms + delta,
+                "source_ts_ms": {
+                    metric: None if ts is None else ts + delta
+                    for metric, ts in frame.source_ts_ms.items()
+                },
+            }
+        )
+        for frame in observed.window
+    )
+    return ObservedThermalInput.model_validate(
+        observed.model_copy(update={"window": frames, "action_ts_ms": action_ts_ms}).model_dump(
+            mode="python"
+        )
+    )
+
+
+def complete_forecast(monitor: ResidualDriftMonitor, prediction, *, error: float = 0.0) -> None:
+    """全出力を期待時刻ちょうどに観測する。"""
+    for target in prediction.targets:
+        monitor.observe(
+            target.expected_ts_ms,
+            {metric: value + error for metric, value in target.values.items()},
+        )
+
+
+def test_one_multi_output_forecast_counts_once_and_keeps_the_cap(multi_output) -> None:
+    parts, model, profile = multi_output
+    assert len(profile.residual_scales) == 4
+    policy_ = confidence_policy()
+    assert policy_.residual_min_samples.value == 5
+    monitor = ResidualDriftMonitor(profile, policy_)
+    base = ObservedThermalInput.from_example(parts.test[0])
+
+    prediction = model.predict(base)
+    monitor.record(prediction)
+    complete_forecast(monitor, prediction)
+    state = monitor.evidence()
+    # 4出力を照合しても forecast は1件。5件に達しないので上限は外れない
+    assert state.forecasts == 1
+    result = assessor(profile).assess(base, prediction, state)
+    assert result.confidence == pytest.approx(policy_.cap_before_residual_evidence.value)
+    assert component(result, ConfidenceComponent.RESIDUAL_DRIFT).cap is not None
+
+    for step in range(1, 5):
+        shifted_input = at_action(base, base.action_ts_ms + step * 10_000)
+        later = model.predict(shifted_input)
+        monitor.record(later)
+        complete_forecast(monitor, later)
+    assert monitor.evidence().forecasts == 5
+    lifted = assessor(profile).assess(base, prediction, monitor.evidence())
+    assert component(lifted, ConfidenceComponent.RESIDUAL_DRIFT).cap is None
+
+
+def test_residual_window_is_measured_in_forecasts(multi_output) -> None:
+    parts, model, profile = multi_output
+    policy_ = confidence_policy()
+    window = policy_.residual_window.value
+    monitor = ResidualDriftMonitor(profile, policy_)
+    base = ObservedThermalInput.from_example(parts.test[0])
+    scale = {(item.horizon_ms, item.metric): item.scale for item in profile.residual_scales}
+
+    for step in range(window + 5):
+        prediction = model.predict(at_action(base, base.action_ts_ms + step * 10_000))
+        monitor.record(prediction)
+        # 古い5件だけ大きく外す。window が forecast 単位なら、その5件は押し出される
+        factor = 10.0 if step < 5 else 1.0
+        for target in prediction.targets:
+            monitor.observe(
+                target.expected_ts_ms,
+                {
+                    metric: value + factor * scale[(target.horizon_ms, metric)]
+                    for metric, value in target.values.items()
+                },
+            )
+
+    state = monitor.evidence()
+    assert state.forecasts == window
+    assert state.ratio == pytest.approx(1.0)
+
+
+def test_a_forecast_with_an_unmatched_output_is_not_evidence(multi_output) -> None:
+    parts, model, profile = multi_output
+    monitor = ResidualDriftMonitor(profile, confidence_policy())
+    prediction = model.predict(ObservedThermalInput.from_example(parts.test[0]))
+    monitor.record(prediction)
+    first, second = prediction.targets
+    monitor.observe(first.expected_ts_ms, dict(first.values))
+    # 2つ目の horizon は GPU だけ観測し、AIR は許容幅を過ぎても来ない
+    monitor.observe(second.expected_ts_ms, {GPU: second.values[GPU]})
+    monitor.observe(second.expected_ts_ms + 501, {})
+
+    state = monitor.evidence()
+    assert (state.forecasts, state.expired_forecasts) == (0, 1)
+
+
+def _single_target(trained):
+    _data, parts, model, profile = trained
+    monitor = ResidualDriftMonitor(profile, confidence_policy())
+    prediction = model.predict(ObservedThermalInput.from_example(parts.test[0]))
+    monitor.record(prediction)
+    target = prediction.targets[0]
+    scale = profile.residual_scales[0].scale
+    return monitor, target.expected_ts_ms, target.values[GPU], scale
+
+
+@pytest.mark.parametrize(
+    ("observations", "expected_ratio"),
+    [
+        # 期待時刻の前（-100）が後（+300）より近い → 前を採る
+        (((-100, 2.0), (300, 0.0)), 2.0),
+        # 後（+100）が前（-400）より近い → 後を採る
+        (((-400, 0.0), (100, 2.0)), 2.0),
+        # 同距離（-200 / +200）→ 過去側（決定記録 0031 §2.2）
+        (((-200, 2.0), (200, 0.0)), 2.0),
+        # 後ろ側で値の無い観測は候補にせず、次の値のある観測を比べる
+        (((-400, 0.0), (100, None), (200, 2.0)), 2.0),
+    ],
+)
+def test_nearest_observation_within_tolerance_on_both_sides(
+    trained, observations, expected_ratio: float
+) -> None:
+    monitor, expected_ts, predicted, scale = _single_target(trained)
+    for offset, error in observations:
+        monitor.observe(
+            expected_ts + offset, {GPU: None if error is None else predicted + error * scale}
+        )
+    monitor.observe(expected_ts + 501, {})
+
+    state = monitor.evidence()
+    assert state.forecasts == 1
+    assert state.ratio == pytest.approx(expected_ratio)
+
+
+def test_observations_outside_the_tolerance_expire_the_forecast(trained) -> None:
+    monitor, expected_ts, predicted, _scale = _single_target(trained)
+    monitor.observe(expected_ts - 501, {GPU: predicted})
+    monitor.observe(expected_ts + 501, {GPU: predicted})
+
+    state = monitor.evidence()
+    assert (state.forecasts, state.expired_forecasts) == (0, 1)
+    assert state.ratio is None
+
+
+def test_the_same_action_cannot_be_counted_twice(trained) -> None:
+    _data, parts, model, profile = trained
+    monitor = ResidualDriftMonitor(profile, confidence_policy())
+    prediction = model.predict(ObservedThermalInput.from_example(parts.test[0]))
+    monitor.record(prediction)
+    with pytest.raises(ValueError, match="狭義単調増加"):
+        monitor.record(prediction)
+
+
+def test_residual_evidence_from_another_profile_cannot_lift_the_cap(trained, multi_output) -> None:
+    _data, parts, model, profile = trained
+    _parts, _model, other_profile = multi_output
+    observed = ObservedThermalInput.from_example(parts.test[0])
+    with pytest.raises(ValueError, match="Profile と一致しない"):
+        assessor(profile).assess(observed, model.predict(observed), evidence(other_profile, 1.0))

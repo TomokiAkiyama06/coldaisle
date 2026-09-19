@@ -72,12 +72,22 @@ Registry（#104）の `confidence_model` artifact としての登録・昇格は
 | residual drift | 直近 `residual_window` 件の正規化 residual の RMS が `residual_drift_ood_ratio` 以上 | 1（比 ≤ 1）から比が OOD 倍率で 0 になる線形 |
 
 - **confidence は構成要素の score と上限の最小値**とする。1つでも OOD なら `ood = true`、confidence は 0
-- residual の照合件数が `residual_min_samples` に満たない間は、confidence に上限
+- residual の証拠は **forecast（1回の予測）単位**で数える。1回の予測が持つ horizon × metric の
+  出力の数では数えない。出力の数で数えると、多出力の予測1回だけで最低件数を満たしてしまう。
+  `residual_window` / `residual_min_samples` の単位も forecast とする
+- 全出力を照合し終え、**全出力に観測があった** forecast だけを証拠に数える。forecast の誤差は
+  出力ごとの正規化 residual の二乗平均とし、drift の比は window 内の forecast の誤差の平均の平方根とする
+- 照合済みの forecast が `residual_min_samples` に満たない間は、confidence に上限
   `cap_before_residual_evidence` を課す。**予測が当たっている証拠が無い状態を満点にしない**
+- residual の証拠は Profile の SHA-256 を持ち、別の Profile の証拠は assessment が拒否する
+  （モデルを差し替えた直後に、旧モデルの証拠で上限を外さない）。同じ action の予測を2回数えない
 - 入力の形が feature schema と合わない場合は判定を作らず例外にする（予測自体も失敗する）。
   worker はこれを `LearnedFailure` として Gate へ渡し、Fallback になる（0028 §2.7）
-- residual の照合は予測と同じ時間軸（`expected_ts_ms` と観測の時刻）で行い、許容幅
-  `residual_match_tolerance_ms` を過ぎた予測は捨てて件数だけ残す。照合待ちは構造上の上限を持つ
+- residual の照合は予測と同じ時間軸（`expected_ts_ms` と観測の時刻）で、Dataset の target 選択
+  （0031 §2.2）と同じ規則で行う。期待時刻に**最も近い**観測を `±residual_match_tolerance_ms` の中でだけ採り
+  （前後どちら側でもよい）、**同距離なら過去側**を採る。観測は action より後に限り、metric ごとに値のある
+  観測だけを候補にする。許容幅の中で観測が揃わなかった forecast は証拠に数えず件数だけ残す。
+  照合待ちは構造上の上限を持つ
 
 ### 2.3 判定は worker、切替は Gate
 
