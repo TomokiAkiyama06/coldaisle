@@ -348,8 +348,9 @@ coldaisle が NVML / lm-sensors も収集し、`GET /api/v1/server-health` を�
 | FR-305 | `GET /api/v1/health` | デーモン稼働・最終受信時刻・ソース種別 |
 | FR-306 | `WS  /api/v1/stream` | 新サンプルをpush |
 | FR-308 | `GET /api/v1/server-health` | **Workspace GPUパネル向けの統合ビュー**。signal / summary / gpu / environment / alerts / sources / compute_mode_advisory（スキーマは `docs/api-contract.md`） |
-| FR-309 | `POST /api/v1/events` | **唯一の書き込み系**。Workspace の GPU Manager が Mode 変更を通知するためだけに存在する（localhost限定） |
-| FR-307 | 上記 FR-309 を除き、全エンドポイントは **読み取り専用** |
+| FR-309 | `GET /api/v1/events?from=&to=&window=&kind=&limit=` | 記録された事象（GPU Mode の切り替え）の一覧。タイムライン注釈用（読み取り専用。スキーマは `docs/api-contract.md`） |
+| FR-310 | Unix ソケット `coldaisle-eventd`（HTTP ではない） | **GPU Mode イベントの唯一の書き込み経路**。Workspace の GPU Manager が Mode 変更を通知するためだけに存在する。読み取り API とは別プロセスの書き込み専用入口で、ファイル権限と `SO_PEERCRED` で接続相手を限定し、`events` 表へ追記するだけ（決定記録 [0045](decisions/0045-local-socket-write-entry.md)） |
+| FR-307 | HTTP API の全エンドポイントは **読み取り専用**（例外なし）。書き込みは FR-310 の Unix ソケットだけが受ける |
 
 ### 6.4 FR-4xx: ルールエンジン
 

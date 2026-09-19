@@ -149,6 +149,37 @@ class AlertsResponse(BaseModel):
     alerts: list[AlertRecord]
 
 
+class EventOut(BaseModel):
+    """記録された1件の事象（#67 / 決定記録 0045 §2.7）。
+
+    書き込んだ接続の uid（`peer_uid`）は監査のために DB に残すが、ここには出さない。
+    読み取りに要らない情報を広げない。
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    id: int
+    ts_ms: int
+    ts: str
+    kind: str
+    payload: dict[str, Any]
+
+
+class EventsResponse(BaseModel):
+    """`GET /api/v1/events`。タイムライン注釈の元（#67）。
+
+    **書き込みは読み取り API では受けない。** 入口は別プロセスの Unix ソケット
+    （`coldaisle-eventd`。決定記録 0045）。
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    from_ms: int = Field(serialization_alias="from")
+    to_ms: int = Field(serialization_alias="to")
+    events: list[EventOut]
+    truncated: bool
+
+
 class HealthResponse(BaseModel):
     """`GET /api/v1/health`（FR-305）。
 
