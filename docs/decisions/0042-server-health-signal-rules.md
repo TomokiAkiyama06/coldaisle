@@ -17,7 +17,9 @@
 - **対象 Issue**: #66（PR #135）
 - **マージ前の訂正**: 2026-09-19、リポジトリ所有者の承認を得て §2.4 を実装に合わせて訂正した
   （PR #138 のレビュー指摘）。「有効な入力が1つも無ければ報告状態をそのまま使う」例外を
-  lm_sensors に限り、NVML は監視必須 metric で評価することを明記した
+  lm_sensors に限り、NVML は監視必須 metric で評価することを明記した。同じ理由で、
+  入力を無効にした metric が signal に影響しないという記述（§2.1 / §2.2 / §3）を、
+  監視必須でない metric に限った
 
 ## 1. Context
 
@@ -44,7 +46,8 @@ source 状態を「必須 metric が全滅なら unavailable、一部なら degr
 
 `config/server-health.yaml` の `panels.gpu` / `panels.environment` は payload に載せる
 metric の一覧であり、signal の判定対象を決めない。入力が無効な metric は、値が古くても
-パネルに `stale` と表示されるだけで signal に影響しない。
+パネルに `stale` と表示されるだけで signal に影響しない。ただし監視必須 metric
+（`sources.*.required`）は入力の有効・無効にかかわらず判定対象に残る（§2.2 / §2.4）。
 
 ### 2.2 signal が見るのは監視必須 metric と有効な入力だけ
 
@@ -53,6 +56,10 @@ metric の一覧であり、signal の判定対象を決めない。入力が無
 - `config/server-health.yaml` の source ごとの監視必須 metric（`sources.*.required`）
 - `config/internal-telemetry.yaml` で有効な入力。NVML が有効なら NVML adapter の
   expected metrics、hwmon が有効ならそのうち `enabled: true` の sensor
+
+監視必須 metric は `internal-telemetry.yaml` で入力を無効にしても判定対象から外れない。
+入力の無効化で判定対象から外れるのは、監視必須でない入力（任意の hwmon sensor や、
+`sources.nvml.required` に無い NVML の expected metrics）だけである。
 
 事象メトリクス（`sys.dropped_samples` 等）は鮮度判定から外す（0009 §2.12 のまま）。
 
@@ -122,15 +129,20 @@ WAL のため取り込み・ルールエンジンの書き込みは妨げない�
 
 ### 良くなること
 
-- yellow が「いま監視している何かが劣化した」を意味し続ける。撤去済みの入力や機種差で
-  恒常的に下がらない
+- yellow が「いま監視している何かが劣化した」を意味し続ける。監視必須でない入力を
+  撤去・無効化しても、その古い行や機種差で恒常的に下がらない
 - 監視対象の取りこぼし（未保存）と、古い critical の見落としが無くなる
 - REST / WS の1回の応答の中で、一覧・件数・signal が食い違わない
 
 ### 悪くなること・その緩和
 
-- 入力を無効にした metric は、値が異常でも signal に出ない。緩和: パネルには値と quality が
-  そのまま表示される。無効化は `internal-telemetry.yaml` の変更としてリポジトリの履歴に残る
+- 入力を無効にした metric のうち監視必須でないもの（例: 無効にした任意の hwmon sensor）は、
+  値が異常でも signal に出ない。緩和: パネルには値と quality がそのまま表示される。無効化は
+  `internal-telemetry.yaml` の変更としてリポジトリの履歴に残る
+- 監視必須 metric は入力を無効にしても判定対象に残る。NVML を無効にすると、報告状態が
+  `disabled` なら nvml は red、`ok` / `degraded` が残っていても監視必須 metric が届かず
+  `unavailable`（red）になる。`sources.nvml.required` は設定で1本以上が必須のため、
+  NVML を外した運用で red を避ける手段は本記録では定めない
 - すべて `suspect` の source は red にならない。緩和: yellow にはなり、`compute_mode_advisory.safe`
   は false になる
 
