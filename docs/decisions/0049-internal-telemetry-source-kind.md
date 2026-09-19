@@ -109,21 +109,25 @@
 
 ### 2.5 画面: **いまの値**にだけ札を付ける。過去の値の出どころは出さない
 
-**札が付くのは「いま届いている値」だけ。** 値ごとに `/api/v1/latest` の `quality` を見て、
-`ok` または `suspect`（値が届いている）のときだけ種類の札を付ける。`stale` / `missing`・
-キーが無い値は**中立な「読み取り値」**のままにする。
+**札が付くのは「いま届いている値」だけ。** 値ごとに `/api/v1/latest` を見て、
+**`value` が `null` でなく**、かつ `quality` が `ok` または `suspect` のときだけ種類の札を付ける。
+`value` が `null`・`stale` / `missing`・キーが無い値は**中立な「読み取り値」**のままにする。
 
 - **鮮度の規則は既存のものを使う**（新しい定数を作らない）。`latest()` は
   `config/quality.yaml` の `stale_after_ms` 以上古い値を `stale` に落とす（0004 §2.2）。
   「`ok` / `suspect` は届いている、`stale` / `missing` / 未保存は届いていない」という切り方も、
   Server Health の規則（0042 §2.4）と同じにする
-- `/latest` は値ごとに `quality` と `age_seconds` を持つ。画面は `quality` で判定する
-  （`age_seconds` は表示用。しきい値を画面側で持たないため）
+- `/latest` は値ごとに `value` / `quality` / `age_seconds` を持つ。画面は `value` と `quality` で
+  判定する（`age_seconds` は表示用。しきい値を画面側で持たないため）
+- **`quality` だけでは足りない。** `HwmonAdapter._read_sensor()` は有限でない読み値を
+  `value: null` / `quality: suspect` で保存し、`/latest` は新しいうちそのまま返す。画面は
+  値が無いので「未取得」と出す（`airflow.js` の `reading()`）。ここに出どころの札を付けると、
+  表示の無い値に「実測」が付く
 
 | 表示 | 札 |
 |---|---|
-| いまの値のうち **届いている**もの（`quality` が `ok` / `suspect`） | `hardware` → **実測** / `mock` → **模擬** / `null`・知らない値 → **読み取り値** |
-| いまの値のうち **届いていない**もの（`stale` / `missing` / 値が無い） | **読み取り値**（今と同じ。従来の `stale` / 未取得の札はそのまま） |
+| いまの値のうち **届いている**もの（`value` が非 `null` かつ `quality` が `ok` / `suspect`） | `hardware` → **実測** / `mock` → **模擬** / `null`・知らない値 → **読み取り値** |
+| いまの値のうち **届いていない**もの（`value` が `null`、`stale` / `missing`、キーが無い） | **読み取り値**（今と同じ。従来の `stale` / 未取得の札はそのまま） |
 | グラフ・履歴の点（`/series` 由来） | **読み取り値**（今の文言のまま。変えない） |
 | `/api/v1/health` がまだ届いていない | 確認中（今と同じ。実測とは言わない） |
 | `?mock=` で模擬データを表示中 | 模擬（今と同じ） |
@@ -149,7 +153,8 @@
   `sys.telemetry_source.proc_stat` の状態から決める）は変えない。**値があるかどうか**は 0051、
   **その値の出どころ**は本記録で、別の軸として扱う
 - 判定は純粋関数にし、既存の JS テスト（0044）で DB 無しに検証する。
-  `stale` の値・`missing` の値・種類が `null` の場合を必ず試す
+  `stale` の値・`missing` の値・**`value: null` かつ `quality: suspect` の行**・
+  種類が `null` の場合を必ず試す
 
 ### 2.6 受け入れる限界（仕組みで防がない）
 
