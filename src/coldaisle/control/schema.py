@@ -486,8 +486,21 @@ class ModelGateDecision(_Frozen):
                 raise ValueError("裏付けの無い記録の confidence level は LOW にする")
             if self.proposal_mismatch is not None:
                 raise ValueError("assessment を検証できていない記録に不一致の理由を付けない")
-        if self.ood and self.confidence_level is not ConfidenceLevel.LOW:
-            raise ValueError("OOD の confidence level は LOW にする")
+            if self.assessment:
+                # 束縛できていない assessment の理由は、別の推論のものかもしれない。
+                raise ValueError("裏付けの無い記録に assessment の理由を残さない")
+        elif not self.assessment:
+            raise ValueError("裏付けのある記録には assessment の理由が要る")
+        if self.ood:
+            if self.confidence_level is not ConfidenceLevel.LOW:
+                raise ValueError("OOD の confidence level は LOW にする")
+            if self.confidence != 0.0:
+                raise ValueError("OOD の confidence は 0 にする（決定記録 0050 §2.2）")
+        if (
+            AuthorityLimitSource.STAGE_ZONE in self.limits
+            and AuthorityLimitSource.STAGE_BAND not in self.limits
+        ):
+            raise ValueError("zone の制限は stage の帯と一緒にしか掛からない")
         if self.learned_selected:
             if not self.attested:
                 raise ValueError("裏付けの無い提案を active controller にしない")
@@ -495,11 +508,14 @@ class ModelGateDecision(_Frozen):
                 raise ValueError("LOW confidence の Learned MPC を選ばない（0050 §2.4）")
             if self.authority_stage is AuthorityStage.SHADOW:
                 raise ValueError("SHADOW で Learned MPC を選ばない")
-            if (
-                self.confidence_level is ConfidenceLevel.MEDIUM
-                and AuthorityLimitSource.MEDIUM_CONFIDENCE_BAND not in self.limits
+            if (self.confidence_level is ConfidenceLevel.MEDIUM) != (
+                AuthorityLimitSource.MEDIUM_CONFIDENCE_BAND in self.limits
             ):
-                raise ValueError("MEDIUM confidence では MEDIUM 帯を掛ける")
+                raise ValueError("MEDIUM 帯を掛けるのは MEDIUM confidence のときだけ")
+            if (self.authority_stage is not AuthorityStage.FULL) != (
+                AuthorityLimitSource.STAGE_BAND in self.limits
+            ):
+                raise ValueError("FULL 未満の stage では必ず stage の帯を掛ける")
         elif self.limits:
             raise ValueError("Learned MPC を選ばない tick に authority limit を付けない")
         return self
@@ -823,8 +839,20 @@ class ControlTick(_Frozen):
         state = self.state
         gate = self.model_gate
         if gate is None:
-            if self.schema_version >= 5 and state.active_controller is ControllerKind.LEARNED_MPC:
-                raise ValueError("v5 以降で Learned MPC を使った tick には model_gate が要る")
+            if self.schema_version >= 5:
+                if state.active_controller is ControllerKind.LEARNED_MPC:
+                    raise ValueError("v5 以降で Learned MPC を使った tick には model_gate が要る")
+                if (state.model_version, state.model_confidence, state.model_ood) != (
+                    None,
+                    None,
+                    None,
+                ):
+                    # 裏付けの記録が無いのに ML の数値だけが残ると、評価（#90 / #91）と
+                    # stage の判断（#92）が根拠の無い値を読む。
+                    raise ValueError(
+                        "v5 で model_gate の無い tick に ML の model_version / confidence / ood "
+                        "を残さない"
+                    )
             return
         if self.schema_version < 5:
             raise ValueError("model_gate を記録する ControlTick は schema version 5 にする")
@@ -841,6 +869,9 @@ class ControlTick(_Frozen):
             raise ValueError("ControlState と model_gate の authority stage を揃える")
         if gate.learned_selected != (state.active_controller is ControllerKind.LEARNED_MPC):
             raise ValueError("model_gate.learned_selected と active_controller が食い違っている")
+        if state.operating_mode in {OperatingMode.MANUAL, OperatingMode.CALIBRATION}:
+            # 人が requested を決める mode では Gate が動かない（0028 §2.5 (a)）。
+            raise ValueError("MANUAL / CALIBRATION の tick に model_gate を残さない")
 
     def _check_fault_response(self, fault: Fault) -> None:
         """0028 §2.7 の無条件の対応を満たしているか。"""

@@ -74,6 +74,7 @@ from coldaisle.control.schema import (
     ModelGateDecision,
     OperatingMode,
     PerZone,
+    Reason,
     SafetyState,
     ZoneRecord,
 )
@@ -847,6 +848,7 @@ def test_v5_trace_requires_consistent_model_gate_for_learned_ticks() -> None:
     with pytest.raises(ValidationError, match="揃える"):
         ControlTick.model_validate_json(json.dumps(payload))
 
+    reason = (Reason(code="model_binding", detail="score=1.000000"),)
     with pytest.raises(ValidationError, match="LOW"):
         ModelGateDecision(
             model_version="thermal-v1",
@@ -857,6 +859,7 @@ def test_v5_trace_requires_consistent_model_gate_for_learned_ticks() -> None:
             confidence_level=ConfidenceLevel.MEDIUM,
             authority_stage=AuthorityStage.FULL,
             learned_selected=False,
+            assessment=reason,
         )
     with pytest.raises(ValidationError, match="MEDIUM 帯"):
         ModelGateDecision(
@@ -868,6 +871,7 @@ def test_v5_trace_requires_consistent_model_gate_for_learned_ticks() -> None:
             confidence_level=ConfidenceLevel.MEDIUM,
             authority_stage=AuthorityStage.FULL,
             learned_selected=True,
+            assessment=reason,
         )
 
 
@@ -1476,3 +1480,161 @@ def test_trace_rejects_recording_numbers_without_attestation() -> None:
             authority_stage=AuthorityStage.FULL,
             learned_selected=True,
         )
+
+
+# --------------------------- Gate が作れない組み合わせは schema が拒む（#149 review 5回目）
+#
+# trace は Gate の外（保存済み JSON の読み込み、将来の別実装）からも組み立てられる。
+# schema を最後の防波堤として、Gate が決して出さない組み合わせを型で拒む。
+
+REASONS = (Reason(code="model_binding", detail="score=1.000000"),)
+
+
+def gate_record(**changes: object) -> ModelGateDecision:
+    """Gate が実際に出す形の記録（既定は裏付けのある HIGH / FULL）。"""
+    fields: dict[str, object] = {
+        "model_version": "thermal-v1",
+        "inference_id": "c" * 64,
+        "attested": True,
+        "confidence": 0.9,
+        "ood": False,
+        "confidence_level": ConfidenceLevel.HIGH,
+        "authority_stage": AuthorityStage.FULL,
+        "learned_selected": False,
+        "assessment": REASONS,
+    }
+    fields.update(changes)
+    return ModelGateDecision.model_validate(fields)
+
+
+@pytest.mark.parametrize(
+    ("changes", "match"),
+    [
+        # 裏付けが無いのに、別の推論の理由が残っている
+        (
+            {
+                "attested": False,
+                "confidence": None,
+                "ood": None,
+                "confidence_level": ConfidenceLevel.LOW,
+                "assessment": REASONS,
+            },
+            "assessment の理由を残さない",
+        ),
+        # 裏付けがあるのに理由が無い（Gate は必ず構成要素ごとの理由を書く）
+        ({"assessment": ()}, "assessment の理由が要る"),
+        # OOD なのに confidence が 0 でない
+        (
+            {"confidence": 0.5, "ood": True, "confidence_level": ConfidenceLevel.LOW},
+            "confidence は 0",
+        ),
+        # zone の制限だけが立っている（stage の帯なしには起きない）
+        (
+            {"learned_selected": True, "limits": (AuthorityLimitSource.STAGE_ZONE,)},
+            "stage の帯と一緒",
+        ),
+        # FULL なのに stage の帯が掛かっている / FULL 未満なのに掛かっていない
+        ({"learned_selected": True, "limits": (AuthorityLimitSource.STAGE_BAND,)}, "stage の帯"),
+        (
+            {"authority_stage": AuthorityStage.LIMITED, "learned_selected": True, "limits": ()},
+            "stage の帯",
+        ),
+        # HIGH なのに MEDIUM 帯が掛かっている
+        (
+            {"learned_selected": True, "limits": (AuthorityLimitSource.MEDIUM_CONFIDENCE_BAND,)},
+            "MEDIUM 帯",
+        ),
+        # 裏付けが無いのに Learned MPC を選んだ / 数値だけが残っている
+        (
+            {
+                "attested": False,
+                "confidence": None,
+                "ood": None,
+                "confidence_level": ConfidenceLevel.LOW,
+                "assessment": (),
+                "learned_selected": True,
+            },
+            "裏付けの無い提案",
+        ),
+        (
+            {"attested": False, "confidence_level": ConfidenceLevel.LOW, "assessment": ()},
+            "attested",
+        ),
+    ],
+)
+def test_model_gate_rejects_combinations_the_gate_never_produces(
+    changes: dict[str, object], match: str
+) -> None:
+    with pytest.raises(ValidationError, match=match):
+        gate_record(**changes)
+
+
+def test_model_gate_accepts_the_shapes_the_gate_produces() -> None:
+    assert gate_record().attested is True
+    assert (
+        gate_record(
+            attested=False,
+            confidence=None,
+            ood=None,
+            confidence_level=ConfidenceLevel.LOW,
+            assessment=(),
+        ).confidence
+        is None
+    )
+    assert gate_record(learned_selected=True).learned_selected is True
+    assert (
+        gate_record(
+            authority_stage=AuthorityStage.LIMITED,
+            confidence_level=ConfidenceLevel.MEDIUM,
+            confidence=0.7,
+            learned_selected=True,
+            limits=(
+                AuthorityLimitSource.STAGE_BAND,
+                AuthorityLimitSource.MEDIUM_CONFIDENCE_BAND,
+                AuthorityLimitSource.STAGE_ZONE,
+            ),
+        ).learned_selected
+        is True
+    )
+
+
+def _fallback_tick(**state_changes: object) -> dict[str, object]:
+    gate = _active_gate(AuthorityStage.FULL)
+    selection = _select(gate, 1, learned_proposal(0.7, confidence=0.9), None)
+    tick = _trace_tick(selection)
+    payload = json.loads(tick.model_dump_json())
+    payload["state"].update(state_changes)
+    return payload
+
+
+@pytest.mark.parametrize(
+    ("state_changes", "match"),
+    [
+        ({"model_confidence": 0.99, "model_ood": False}, "残さない"),
+        ({"model_version": "thermal-v1"}, "残さない"),
+    ],
+)
+def test_v5_tick_without_a_model_gate_cannot_keep_ml_numbers(
+    state_changes: dict[str, object], match: str
+) -> None:
+    payload = _fallback_tick(**state_changes)
+    del payload["model_gate"]
+    with pytest.raises(ValidationError, match=match):
+        ControlTick.model_validate_json(json.dumps(payload))
+
+    without = _fallback_tick()
+    del without["model_gate"]
+    without["state"]["model_version"] = None
+    without["state"]["model_confidence"] = None
+    without["state"]["model_ood"] = None
+    assert ControlTick.model_validate_json(json.dumps(without)).model_gate is None
+
+
+def test_v5_tick_in_a_human_mode_cannot_carry_a_model_gate() -> None:
+    payload = _fallback_tick()
+    payload["state"]["operating_mode"] = "manual"
+    payload["state"]["active_controller"] = None
+    payload["state"]["fallback_active"] = False
+    payload["state"]["fallback_reason"] = None
+    with pytest.raises(ValidationError, match="MANUAL / CALIBRATION"):
+        ControlTick.model_validate_json(json.dumps(payload))
