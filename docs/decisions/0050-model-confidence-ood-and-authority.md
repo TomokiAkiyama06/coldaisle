@@ -226,7 +226,9 @@ model_confidence:
 - **schema を最後の防波堤にする。** trace は保存済み JSON からも組み立てられるため、Gate が決して
   出さない組み合わせは型で拒む。裏付けの無い記録に理由・数値・authority を持たせない、裏付けのある
   記録には理由を必須にする、OOD の confidence は 0、stage の帯と zone の制限・MEDIUM 帯の対応、
-  `MANUAL` / `CALIBRATION` の tick に `model_gate` を残さない、など
+  **不一致（`proposal_mismatch`）のある提案を active controller にしない**、
+  `MANUAL` / `CALIBRATION` の tick に `model_gate` を残さない、など。
+  Gate の分岐から到達できる組み合わせを field ごとに数え上げ、到達しないものを型で拒む
 - **demand を持たない。** requested / effective は従来どおり zone の記録に残る
 - v5 で Learned MPC を active にした tick には `model_gate` を必須とし、`ControlState` の
   `model_version` / `model_confidence` / `model_ood` / `authority_stage` / `active_controller` と一致させる

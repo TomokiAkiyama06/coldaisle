@@ -1560,6 +1560,42 @@ def gate_record(**changes: object) -> ModelGateDecision:
             {"attested": False, "confidence_level": ConfidenceLevel.LOW, "assessment": ()},
             "attested",
         ),
+        # 自称値が assessment と違う提案は、Gate がその tick で Fallback へ落とす
+        (
+            {
+                "learned_selected": True,
+                "proposal_mismatch": Reason(code="proposal_mismatch", detail="claimed 1.0"),
+            },
+            "食い違う提案",
+        ),
+        # 裏付けがあるのに数値が欠けている / confidence と ood が揃っていない
+        ({"confidence": None}, "attested"),
+        ({"ood": None}, "一緒に記録"),
+        # 同じ制限の根拠を2回書く
+        (
+            {
+                "learned_selected": True,
+                "confidence": 0.7,
+                "confidence_level": ConfidenceLevel.MEDIUM,
+                "limits": (
+                    AuthorityLimitSource.MEDIUM_CONFIDENCE_BAND,
+                    AuthorityLimitSource.MEDIUM_CONFIDENCE_BAND,
+                ),
+            },
+            "重複させない",
+        ),
+        # MEDIUM なのに MEDIUM 帯が無い
+        (
+            {
+                "learned_selected": True,
+                "confidence": 0.7,
+                "confidence_level": ConfidenceLevel.MEDIUM,
+                "limits": (),
+            },
+            "MEDIUM 帯",
+        ),
+        # SHADOW で Learned MPC を選ぶ
+        ({"authority_stage": AuthorityStage.SHADOW, "learned_selected": True}, "SHADOW"),
     ],
 )
 def test_model_gate_rejects_combinations_the_gate_never_produces(
@@ -1638,3 +1674,16 @@ def test_v5_tick_in_a_human_mode_cannot_carry_a_model_gate() -> None:
     payload["state"]["fallback_reason"] = None
     with pytest.raises(ValidationError, match="MANUAL / CALIBRATION"):
         ControlTick.model_validate_json(json.dumps(payload))
+
+
+def test_gate_never_emits_a_selected_proposal_with_a_mismatch(trained) -> None:
+    """Gate 側でも、不一致のある提案は必ず Fallback になる（表の 8 行目の裏取り）。"""
+    assessment = _assessed(trained, ood_input=False)
+    inflated = learned_proposal(0.9, confidence=1.0, inference_id=assessment.inference_id)
+    gate = _active_gate(AuthorityStage.FULL)
+    selected = _select(gate, 1, inflated, assessment)
+    record = selected.model_gate
+    assert record is not None
+    assert record.proposal_mismatch is not None
+    assert record.learned_selected is False
+    assert selected.active_controller is ControllerKind.FALLBACK

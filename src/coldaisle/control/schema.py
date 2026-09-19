@@ -504,6 +504,9 @@ class ModelGateDecision(_Frozen):
         if self.learned_selected:
             if not self.attested:
                 raise ValueError("裏付けの無い提案を active controller にしない")
+            if self.proposal_mismatch is not None:
+                # 自称値が assessment と違う提案は、Gate がその tick で Fallback へ落とす。
+                raise ValueError("assessment と食い違う提案を active controller にしない")
             if self.confidence_level is ConfidenceLevel.LOW:
                 raise ValueError("LOW confidence の Learned MPC を選ばない（0050 §2.4）")
             if self.authority_stage is AuthorityStage.SHADOW:
