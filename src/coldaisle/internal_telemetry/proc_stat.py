@@ -36,8 +36,12 @@ def parse_cpu_times(text: str) -> CpuTimes:
         if not fields or fields[0] != "cpu":
             continue
         values = [int(field) for field in fields[1 : 1 + _BUSY_FIELDS]]
-        if len(values) <= _IOWAIT_INDEX or any(value < 0 for value in values):
+        # 8列に満たない行で total を作ると irq / softirq / steal が抜け、使用率が
+        # 決定記録 0047 の定義からずれる。途中で切れた行は読み取り失敗として扱う
+        if len(values) < _BUSY_FIELDS:
             raise ValueError("/proc/stat の cpu 行の列が足りない")
+        if any(value < 0 for value in values):
+            raise ValueError("/proc/stat の cpu 行に負の値がある")
         return CpuTimes(total=sum(values), idle=values[_IDLE_INDEX] + values[_IOWAIT_INDEX])
     raise ValueError("/proc/stat に cpu 集計行が無い")
 

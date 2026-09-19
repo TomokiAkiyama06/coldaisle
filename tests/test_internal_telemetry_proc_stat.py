@@ -50,12 +50,49 @@ def test_parse_counts_iowait_as_idle_and_ignores_guest_columns():
 
 @pytest.mark.parametrize(
     "text",
-    ["", "intr 1 2\n", "cpu  1 2 3\n", "cpu  a b c d e f g h\n", "cpu  1 2 3 -4 5 0 0 0\n"],
-    ids=["empty", "no-cpu-line", "too-few-columns", "not-numbers", "negative"],
+    [
+        "",
+        "intr 1 2\n",
+        "cpu  1 2 3\n",
+        "cpu  1 2 3 4 5\n",
+        "cpu  1 2 3 4 5 6 7\n",
+        "cpu  a b c d e f g h\n",
+        "cpu  1 2 3 -4 5 0 0 0\n",
+    ],
+    ids=[
+        "empty",
+        "no-cpu-line",
+        "too-few-columns",
+        "truncated-5-columns",
+        "truncated-7-columns",
+        "not-numbers",
+        "negative",
+    ],
 )
 def test_parse_rejects_malformed_content(text: str):
     with pytest.raises(ValueError):
         parse_cpu_times(text)
+
+
+def test_parse_accepts_exactly_eight_columns():
+    # 古い kernel は guest 列を出さない。8列あれば 0047 の total が作れる
+    times = parse_cpu_times("cpu  100 10 50 800 40 5 5 0\n")
+
+    assert times == CpuTimes(total=1010, idle=840)
+
+
+def test_truncated_cpu_line_is_a_read_failure(tmp_path: Path):
+    path = tmp_path / "stat"
+    path.write_text(stat(100, 0, 0, 900, 0), encoding="utf-8")
+    source = adapter(path)
+    source.poll()
+    path.write_text("cpu  200 0 0 1800 0 0 0\n", encoding="utf-8")
+
+    result = source.poll()
+
+    assert result.status is SourceStatus.UNAVAILABLE
+    assert result.detail == "ValueError"
+    assert value_of(result) == (None, Quality.MISSING)
 
 
 def test_first_poll_is_missing_not_zero(tmp_path: Path):
