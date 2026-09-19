@@ -15,6 +15,9 @@
   [`0004-storage-read-contract.md`](0004-storage-read-contract.md) §2.8 /
   `docs/api-contract.md` §3 / `config/server-health.yaml`
 - **対象 Issue**: #66（PR #135）
+- **マージ前の訂正**: 2026-09-19、リポジトリ所有者の承認を得て §2.4 を実装に合わせて訂正した
+  （PR #138 のレビュー指摘）。「有効な入力が1つも無ければ報告状態をそのまま使う」例外を
+  lm_sensors に限り、NVML は監視必須 metric で評価することを明記した
 
 ## 1. Context
 
@@ -29,7 +32,7 @@ source 状態を「必須 metric が全滅なら unavailable、一部なら degr
 - 監視対象なのに一度も保存されていない metric は「行が無い」ため判定から漏れる
 - 監視必須 metric がすべて `suspect` の source が `unavailable`（red）になる。値は届いて
   いるので、停止ではなく劣化である
-- 有効な入力が1つも無い source が、必須データが無いのに常に `unavailable` になる
+- 有効な hwmon 入力が1つも無い lm_sensors が、必須データが無いのに常に `unavailable` になる
 - アラート一覧は新しい順に件数で打ち切るため、それより古い critical を見落とす
 - 一覧・件数・最新値を別々の文で読むため、間に resolve が入ると payload が食い違う
 
@@ -68,8 +71,17 @@ nvml / lm_sensors は、collector が報告した状態（`sys.telemetry_source.
 |---|---|
 | 未記録 | `stopped`（red） |
 | `unavailable` / `disabled` / `stopped` / 不正な値 | そのまま（不正な値は `unavailable`）。red |
-| `ok` / `degraded` で、有効な入力が1つも無い | 報告状態をそのまま使う |
-| `ok` / `degraded` で、入力がある | 下記の quality 規則 |
+| `ok` / `degraded` で、有効な hwmon 入力が1つも無い（**lm_sensors のみ**） | 報告状態をそのまま使う |
+| 上記以外の `ok` / `degraded` | 下記の quality 規則 |
+
+**評価する metric は source ごとに異なる。**
+
+- nvml: `config/server-health.yaml` の監視必須 metric（`sources.nvml.required`。設定で
+  1本以上が必須）。`config/internal-telemetry.yaml` で NVML を無効にしていても、
+  保存済みの報告状態が `ok` / `degraded` のまま残っていれば、この監視必須 metric を評価する。
+  1本も届いていなければ `unavailable`（red）になる。報告状態をそのまま使う例外は当てない
+- lm_sensors: `config/internal-telemetry.yaml` で `enabled: true` の hwmon sensor。
+  1本も無いときだけ上の表の例外で報告状態をそのまま使う
 
 **sensor_unit は例外とする。** `sys.ingest_source` は状態ではなく取り込み元の種別
 （`serial` / `mock` / `replay` など）であり、上の表の「不正な値」の規則を当てない。
@@ -129,7 +141,7 @@ WAL のため取り込み・ルールエンジンの書き込みは妨げない�
 | パネルの metric も判定対象にする | 無効な入力の古い行で signal が恒常的に下がる（実機の `board.chipset`） |
 | 保存済みの行だけを判定する | 一度も届かない監視対象を見落とす |
 | `suspect` を「届いていない」に数える | 値は届いており、停止と劣化の区別が失われる |
-| 有効な入力が無い source を常に `unavailable` にする | 取得不能になりうる必須データが無いのに red になる |
+| 有効な hwmon 入力が無い lm_sensors を常に `unavailable` にする | 取得不能になりうる必須データが無いのに red になる |
 | 総件数フィールドを payload に追加する | 公開契約（schema_version 1）の変更になる。warnings で足りる |
 | 読み出しごとに別の文で読む（従来） | 間の書き込みで payload が食い違う |
 
