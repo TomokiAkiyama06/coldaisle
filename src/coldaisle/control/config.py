@@ -506,6 +506,11 @@ class ModelConfidencePolicy(_ConfigModel):
     def _counts_are_ordered(self) -> Self:
         if self.full_support_count.value < self.min_support_count.value:
             raise ValueError("model_confidence.full_support_count は min_support_count 以上にする")
+        if self.cap_before_residual_evidence.value >= self.high_min_confidence.value:
+            # 予測が当たっている証拠が無い間に HIGH（帯なしの authority）へ届かせない。
+            raise ValueError(
+                "model_confidence.cap_before_residual_evidence は high_min_confidence 未満にする"
+            )
         if self.residual_min_samples.value > self.residual_window.value:
             raise ValueError("model_confidence.residual_min_samples は residual_window 以下にする")
         return self

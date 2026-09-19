@@ -79,8 +79,11 @@ Registry（#104）の `confidence_model` artifact としての登録・昇格は
   出力ごとの正規化 residual の二乗平均とし、drift の比は window 内の forecast の誤差の平均の平方根とする
 - 照合済みの forecast が `residual_min_samples` に満たない間は、confidence に上限
   `cap_before_residual_evidence` を課す。**予測が当たっている証拠が無い状態を満点にしない**
-- residual の証拠は Profile の SHA-256 を持ち、別の Profile の証拠は assessment が拒否する
-  （モデルを差し替えた直後に、旧モデルの証拠で上限を外さない）。同じ action の予測を2回数えない
+- residual の証拠は Profile の SHA-256 と、数えた monitor の window・許容幅を持つ。assessment は
+  別の Profile の証拠や別の設定で数えた証拠を拒否する（モデルを差し替えた直後に、旧モデルの証拠で
+  上限を外さない）。同じ action の予測を2回数えない
+- 照合の許容幅は Profile の最短 horizon より小さくなければならない（DatasetSpec の
+  `target_tolerance_ms` と同じ不変条件）。horizon は Profile にあるため、monitor の生成時に検証する
 - 入力の形が feature schema と合わない場合は判定を作らず例外にする（予測自体も失敗する）。
   worker はこれを `LearnedFailure` として Gate へ渡し、Fallback になる（0028 §2.7）
 - residual の照合は予測と同じ時間軸（`expected_ts_ms` と観測の時刻）で、Dataset の target 選択
@@ -94,6 +97,10 @@ Registry（#104）の `confidence_model` artifact としての登録・昇格は
 - 判定（`ConfidenceAssessor`）は Learned MPC と同じ worker 側で動く。出すのは提案に付ける
   `confidence` / `ood` と理由だけで、**demand / PWM / authority を出さない**
 - Registry を通っていない artifact（`offline_unverified`）の判定は制御の提案に付けられない（0048 §2.4）
+- **判定は1回の推論に束縛する。** 入力と予測の canonical JSON の SHA-256 を推論の識別子
+  （`inference_id`）とし、Learned MPC の提案と assessment の両方が持つ。識別子が違う判定は提案に
+  付けられない（同じ model version でも、以前の in-distribution な判定を別の入力の提案へ付け替えさせない）。
+  Gate へ渡す理由も同じ識別子を持ち、提案と違えば拒否する
 - Fallback への切替、confidence level、authority の帯は #79 の Controller Gate が決める。
   出せるのは requested までで、**Reactive Guard と Critical Safety は後段で常に掛かる**（0028 §2.4）。
   OOD の間も Critical Safety はそのまま有効である
@@ -112,6 +119,8 @@ Gate は tick ごとに confidence を3つに分ける。
 - `limit_down` は「Fallback からどこまで下げてよいか」なので、**最低 Demand の制限を兼ねる**
 - `high_min_confidence >= gate_min_confidence.full` を設定検証で強制する。これより低いと、Fallback 境界の直上で
   帯なしの authority を得てしまう
+- `cap_before_residual_evidence < high_min_confidence` を設定検証で強制する。予測が当たっている証拠が
+  無い間に HIGH（帯なし）へ届かせない
 - SHADOW の tick も記録用に level を付ける（最も緩い LIMITED の下限で分ける）。requested は Fallback のまま
 - 昇格は引き続き人だけが行う（0028 §2.9 承認点 5）。confidence は stage を**上げない**。下げる向き（帯を狭める・Fallback）にだけ働く
 
@@ -145,7 +154,7 @@ model_confidence:
 
 `ControlTick` の schema version を 5 に上げ、`model_gate`（`ModelGateDecision`）を追加する。
 
-- 中身: model version、confidence、ood、confidence level、authority stage、Learned MPC を選んだか、
+- 中身: model version、推論の識別子（`inference_id`）、confidence、ood、confidence level、authority stage、Learned MPC を選んだか、
   適用した制限（`stage_band` / `stage_zone` / `medium_confidence_band`）、構成要素ごとの理由（最大16件）
 - **demand を持たない。** requested / effective は従来どおり zone の記録に残る
 - v5 で Learned MPC を active にした tick には `model_gate` を必須とし、`ControlState` の

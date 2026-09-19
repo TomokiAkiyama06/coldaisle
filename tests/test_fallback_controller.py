@@ -293,6 +293,7 @@ def learned_proposal(
     ood: bool = False,
     version: str = "thermal-v1",
     optimizer: OptimizerStatus = OptimizerStatus.OK,
+    inference_id: str = "c" * 64,
 ) -> ControllerProposal:
     return ControllerProposal(
         controller=ControllerKind.LEARNED_MPC,
@@ -304,6 +305,7 @@ def learned_proposal(
         ood=ood,
         optimizer_status=optimizer,
         latency_ms=10,
+        inference_id=inference_id,
     )
 
 

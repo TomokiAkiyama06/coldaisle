@@ -15,6 +15,7 @@ from coldaisle.control.model.confidence import (
     SupportAxis,
     evaluate_ood_detection,
     fit_confidence_profile,
+    inference_id,
     replay_cases,
 )
 from coldaisle.control.model.dataset import (
@@ -129,6 +130,7 @@ __all__ = [
     "evaluate_ood_detection",
     "expectation_from_registry_metadata",
     "fit_confidence_profile",
+    "inference_id",
     "registry_metadata",
     "registry_metadata_json_bytes",
     "replay_cases",

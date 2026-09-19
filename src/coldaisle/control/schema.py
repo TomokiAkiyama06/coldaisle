@@ -387,6 +387,12 @@ class ControllerProposal(_Frozen):
     ood: bool | None = None
     optimizer_status: OptimizerStatus | None = None
     latency_ms: int | None = Field(default=None, ge=0)
+    inference_id: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    """提案の元になった1回の推論（入力と予測）の識別子（#85）。
+
+    confidence / ood はこの推論に対する判定でなければならない。別の入力の判定を付け替えて
+    authority を得ないよう、assessment 側も同じ識別子を持ち、一致しなければ付けられない。
+    """
 
     @model_validator(mode="after")
     def _learned_fields_match_controller(self) -> Self:
@@ -396,12 +402,13 @@ class ControllerProposal(_Frozen):
             self.ood,
             self.optimizer_status,
             self.latency_ms,
+            self.inference_id,
         )
         if self.controller is ControllerKind.LEARNED_MPC:
             if any(value is None for value in learned):
                 raise ValueError(
                     "Learned MPC の提案には model_version / confidence / ood / "
-                    "optimizer_status / latency_ms が要る（Gate が判定に使う）"
+                    "optimizer_status / latency_ms / inference_id が要る（Gate が判定に使う）"
                 )
         elif any(value is not None for value in learned):
             raise ValueError("Fallback の提案に ML の項目を入れない")
@@ -443,6 +450,8 @@ class ModelGateDecision(_Frozen):
 
     schema_version: Literal[1] = 1
     model_version: str = Field(min_length=1, max_length=120)
+    inference_id: str = Field(pattern=r"^[0-9a-f]{64}$")
+    """判定した推論（入力と予測）の識別子。提案の ``inference_id`` と同じ。"""
     confidence: float = Field(ge=0.0, le=1.0, allow_inf_nan=False)
     ood: bool
     confidence_level: ConfidenceLevel

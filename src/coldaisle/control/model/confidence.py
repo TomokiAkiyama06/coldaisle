@@ -351,6 +351,28 @@ def fit_confidence_profile(
     )
 
 
+def inference_id(observed: ObservedThermalInput, prediction: ThermalPrediction) -> str:
+    """1回の推論（入力と予測）の識別子。
+
+    Learned MPC の提案と assessment の両方に付け、同じ推論の判定だけを提案へ付けられるようにする。
+    入力と予測の canonical JSON（artifact SHA-256 を含む）の SHA-256 なので、同じ model version の
+    別の入力・別の artifact とは必ず違う値になる。
+    """
+    if observed.action_ts_ms != prediction.input_action_ts_ms:
+        raise ValueError("推論の識別子は同じ入力の予測からだけ作る")
+    payload = json.dumps(
+        {
+            "observed": observed.model_dump(mode="json"),
+            "prediction": prediction.model_dump(mode="json"),
+        },
+        ensure_ascii=False,
+        allow_nan=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
 # ---------------------------------------------------------------- Residual drift
 
 
@@ -364,6 +386,10 @@ class ResidualEvidence(_Frozen):
 
     profile_sha256: Sha256
     """この証拠を数えた Profile。別のモデルの証拠で confidence 上限を外さないために照合する。"""
+    residual_window: int = Field(gt=0)
+    """証拠を数えた monitor の window（forecast 件数）。assessment の設定と一致させる。"""
+    match_tolerance_ms: int = Field(ge=0)
+    """証拠を数えた monitor の照合の許容幅。assessment の設定と一致させる。"""
     forecasts: int = Field(ge=0)
     """window に入っている、全出力を照合し終えた forecast の件数。"""
     ratio: FiniteFloat | None = Field(default=None, ge=0.0)
@@ -380,6 +406,8 @@ class ResidualEvidence(_Frozen):
     def _ratio_needs_forecasts(self) -> Self:
         if (self.forecasts == 0) != (self.ratio is None):
             raise ValueError("residual の forecast 件数と ratio の有無を一致させる")
+        if self.forecasts > self.residual_window:
+            raise ValueError("residual の forecast 件数は window を超えない")
         return self
 
 
@@ -423,6 +451,14 @@ class ResidualDriftMonitor:
             (scale.horizon_ms, scale.metric): scale.scale for scale in profile.residual_scales
         }
         self._tolerance_ms = policy.residual_match_tolerance_ms.value
+        shortest_horizon_ms = self._profile.target_schema.horizons_ms[0]
+        if self._tolerance_ms >= shortest_horizon_ms:
+            # DatasetSpec と同じ不変条件（target_tolerance_ms < 最短 horizon）。許容幅が action に
+            # 届くと、予測より前の観測を「予測が当たった証拠」に数えてしまう。
+            raise ValueError(
+                "residual_match_tolerance_ms は Profile の最短 horizon より小さくなければならない"
+            )
+        self._window = policy.residual_window.value
         self._forecast_errors: deque[float] = deque(maxlen=policy.residual_window.value)
         """forecast ごとの正規化 residual の二乗平均。"""
         self._pending: deque[_PendingForecast] = deque()
@@ -516,6 +552,8 @@ class ResidualDriftMonitor:
         ratio = None if forecasts == 0 else math.sqrt(math.fsum(self._forecast_errors) / forecasts)
         return ResidualEvidence(
             profile_sha256=self._profile_sha256,
+            residual_window=self._window,
+            match_tolerance_ms=self._tolerance_ms,
             forecasts=forecasts,
             ratio=ratio,
             expired_forecasts=self._expired,
@@ -564,6 +602,8 @@ class ConfidenceAssessment(_Frozen):
     artifact_verification: ArtifactVerification
     profile_sha256: Sha256
     input_action_ts_ms: int = Field(ge=0)
+    inference_id: Sha256
+    """判定した推論（入力と予測）。提案の ``inference_id`` と一致したときだけ提案へ付けられる。"""
     confidence: UnitInterval
     ood: bool
     components: tuple[ComponentResult, ...] = Field(
@@ -608,7 +648,15 @@ class ConfidenceAssessment(_Frozen):
             raise ValueError("Registry 検証済みでないモデルの判定を制御の提案に付けない")
         if proposal.model_version != self.model_version:
             raise ValueError("提案と assessment の model_version が一致しない")
+        if proposal.inference_id != self.inference_id:
+            # 同じ model version でも、別の入力（OOD かもしれない）への提案に、以前の
+            # in-distribution な判定を付け替えさせない。付けられなければ提案は使えない。
+            raise ValueError("提案と assessment が別の推論のもの")
         return proposal.model_copy(update={"confidence": self.confidence, "ood": self.ood})
+
+    def trace_binding(self) -> tuple[tuple[Reason, ...], str]:
+        """``LearnedControlStatus`` へ渡す理由と、それを出した推論の識別子。"""
+        return self.trace_reasons(), self.inference_id
 
 
 class ConfidenceAssessor:
@@ -658,6 +706,7 @@ class ConfidenceAssessor:
             artifact_verification=prediction.artifact_verification,
             profile_sha256=self._profile_sha256,
             input_action_ts_ms=observed.action_ts_ms,
+            inference_id=inference_id(observed, prediction),
             confidence=_combine(components),
             ood=any(item.ood for item in components),
             components=components,
@@ -787,6 +836,14 @@ class ConfidenceAssessor:
         if residual is not None and residual.profile_sha256 != self._profile_sha256:
             # 別のモデル・Profile の証拠で上限を外すと、照合していないモデルに authority を渡す。
             raise ValueError("residual の証拠が assessment の Profile と一致しない")
+        if residual is not None and (residual.residual_window, residual.match_tolerance_ms) != (
+            self._policy.residual_window.value,
+            self._policy.residual_match_tolerance_ms.value,
+        ):
+            # 別の設定で数えた証拠は、最低件数や照合の意味が違う。
+            raise ValueError(
+                "residual の証拠が assessment の設定と別の window / 許容幅で数えられた"
+            )
         minimum = self._policy.residual_min_samples.value
         forecasts = 0 if residual is None else residual.forecasts
         if residual is None or residual.ratio is None or forecasts < minimum:

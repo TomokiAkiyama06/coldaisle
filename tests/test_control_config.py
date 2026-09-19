@@ -748,6 +748,8 @@ def test_model_confidence_values_are_cross_validated(tmp_path: Path) -> None:
         ("residual_drift_ood_ratio", provisional(1.0), "residual_drift_ood_ratio"),
         ("range_margin", provisional(-0.1), "range_margin"),
         ("cap_without_uncertainty", provisional(1.5), "cap_without_uncertainty"),
+        # 証拠が無い間に HIGH（帯なし）へ届く組み合わせは拒否する
+        ("cap_before_residual_evidence", provisional(0.85), "cap_before_residual_evidence"),
     ]
     for name, value, match in cases:
         documents = valid_documents()

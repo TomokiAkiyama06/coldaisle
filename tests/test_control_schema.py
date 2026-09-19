@@ -322,6 +322,7 @@ def test_a_complete_learned_proposal_is_accepted():
         ood=False,
         optimizer_status=OptimizerStatus.OK,
         latency_ms=340,
+        inference_id="c" * 64,
     )
     assert proposal.requested.get(Zone.TOP).demand == 0.55
 

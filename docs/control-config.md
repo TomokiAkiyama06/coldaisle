@@ -100,7 +100,9 @@ residual drift の `residual_window`・`residual_min_samples`・`residual_match_
 同距離なら過去側）、uncertainty や residual の証拠が無い間の confidence 上限
 `cap_without_uncertainty`・`cap_before_residual_evidence` をすべて `status` / `basis` 付きで明示する。
 MEDIUM の下限は stage ごとの `gate_min_confidence` で、`high_min_confidence >= gate_min_confidence.full`
-を検証する。MEDIUM 帯は stage の帯との共通部分を採り、confidence が authority を広げることはない。
+と、証拠が無い間に HIGH へ届かないよう `cap_before_residual_evidence < high_min_confidence`
+を検証する。`residual_match_tolerance_ms` は Profile の最短 horizon 未満でなければならず、horizon は
+Profile 側にあるため residual monitor の生成時に検証する。MEDIUM 帯は stage の帯との共通部分を採り、confidence が authority を広げることはない。
 v5からv6へは `model_confidence` を実データの評価根拠とともに追加してから `schema_version: 6` へ上げる。
 v1〜v5は自動補完せず起動前に拒否する。
 

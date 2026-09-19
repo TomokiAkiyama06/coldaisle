@@ -116,6 +116,8 @@ class LearnedControlStatus(_Frozen):
     snapshot_status: SnapshotStatus = SnapshotStatus.AVAILABLE
     confidence_reasons: tuple[Reason, ...] = Field(default=(), max_length=MAX_MODEL_GATE_REASONS)
     """worker の Confidence / OOD assessment の理由（#85）。trace へそのまま残す。"""
+    confidence_inference_id: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    """``confidence_reasons`` を出した推論。提案の ``inference_id`` と一致しなければ拒否する。"""
 
     @model_validator(mode="after")
     def _proposal_and_receipt_match(self) -> Self:
@@ -123,6 +125,15 @@ class LearnedControlStatus(_Frozen):
             raise ValueError("Learned proposal と受信単調時刻は一緒に指定する")
         if self.proposal is None and self.confidence_reasons:
             raise ValueError("Learned proposal が無いときに confidence の理由を付けない")
+        if (self.confidence_inference_id is None) != (not self.confidence_reasons):
+            raise ValueError("confidence の理由と、それを出した推論の識別子は一緒に指定する")
+        if (
+            self.proposal is not None
+            and self.confidence_inference_id is not None
+            and self.confidence_inference_id != self.proposal.inference_id
+        ):
+            # 別の推論の理由を trace に残すと、判断の根拠を取り違える。
+            raise ValueError("confidence の理由が提案と別の推論のもの")
         if self.proposal is not None and self.proposal.controller is not ControllerKind.LEARNED_MPC:
             raise ValueError("LearnedControlStatus には Learned MPC の提案だけを入れる")
         if self.failure is not None and self.proposal is not None:
@@ -452,8 +463,10 @@ class ControllerGate:
         assert proposal.model_version is not None
         assert proposal.confidence is not None and proposal.ood is not None
         stage = self._policy.authority_stage
+        assert proposal.inference_id is not None
         return ModelGateDecision(
             model_version=proposal.model_version,
+            inference_id=proposal.inference_id,
             confidence=proposal.confidence,
             ood=proposal.ood,
             confidence_level=classify_confidence(

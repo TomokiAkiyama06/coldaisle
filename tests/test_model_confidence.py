@@ -26,6 +26,7 @@ from coldaisle.control.model.confidence import (
     SupportAxis,
     evaluate_ood_detection,
     fit_confidence_profile,
+    inference_id,
     replay_cases,
 )
 from coldaisle.control.model.dataset import (
@@ -305,8 +306,11 @@ def with_missing(observed: ObservedThermalInput, metric: str) -> ObservedThermal
 def evidence(
     profile: ModelConfidenceProfile, ratio: float, forecasts: int = 10
 ) -> ResidualEvidence:
+    settings = confidence_policy()
     return ResidualEvidence(
         profile_sha256=profile.sha256(),
+        residual_window=settings.residual_window.value,
+        match_tolerance_ms=settings.residual_match_tolerance_ms.value,
         forecasts=forecasts,
         ratio=ratio,
         expired_forecasts=0,
@@ -602,12 +606,21 @@ def _active_gate(stage: AuthorityStage) -> ControllerGate:
     return gate
 
 
-def _select(gate: ControllerGate, now: int, proposal, reasons: tuple[Reason, ...] = ()):
+def _select(
+    gate: ControllerGate,
+    now: int,
+    proposal,
+    reasons: tuple[Reason, ...] = (),
+    reasons_from: str | None = None,
+):
     return gate.select(
         now_mono_ms=now,
         fallback=fallback_proposal(0.4),
         learned=LearnedControlStatus(
-            proposal=proposal, received_at_mono_ms=now, confidence_reasons=reasons
+            proposal=proposal,
+            received_at_mono_ms=now,
+            confidence_reasons=reasons,
+            confidence_inference_id=reasons_from,
         ),
         operating_mode=OperatingMode.AUTO,
         safety_state=SafetyState.NORMAL,
@@ -670,8 +683,9 @@ def test_ood_assessment_switches_to_fallback_immediately_and_is_traced(trained) 
             "model_version": "thermal-v1",
         }
     )
-    proposal = deployed.apply_to(learned_proposal(0.1))
-    selected = _select(gate, 2, proposal, deployed.trace_reasons())
+    proposal = deployed.apply_to(learned_proposal(0.1, inference_id=deployed.inference_id))
+    reasons, reasons_from = deployed.trace_binding()
+    selected = _select(gate, 2, proposal, reasons, reasons_from)
 
     assert selected.active_controller is ControllerKind.FALLBACK
     assert selected.fallback_reason is not None and selected.fallback_reason.code == "ood"
@@ -680,6 +694,7 @@ def test_ood_assessment_switches_to_fallback_immediately_and_is_traced(trained) 
     gate_record = selected.model_gate
     assert gate_record is not None
     assert gate_record.ood is True and gate_record.learned_selected is False
+    assert gate_record.inference_id == deployed.inference_id
     assert gate_record.confidence_level is ConfidenceLevel.LOW
     assert "ood_feature_range" in {reason.code for reason in gate_record.assessment}
 
@@ -696,15 +711,69 @@ def test_offline_or_mismatched_assessment_cannot_be_attached_to_a_control_propos
     _data, parts, model, profile = trained
     observed = ObservedThermalInput.from_example(parts.test[0])
     assessment = assessor(profile).assess(observed, model.predict(observed), None)
+    matched = assessment.inference_id
     with pytest.raises(ValueError, match="Registry"):
-        assessment.apply_to(learned_proposal())
+        assessment.apply_to(learned_proposal(inference_id=matched))
     deployed = assessment.model_copy(
-        update={"artifact_verification": ArtifactVerification.REGISTRY_VERIFIED}
+        update={
+            "artifact_verification": ArtifactVerification.REGISTRY_VERIFIED,
+            "model_version": "thermal-v1",
+        }
     )
     with pytest.raises(ValueError, match="model_version"):
-        deployed.apply_to(learned_proposal(version="other"))
+        deployed.apply_to(learned_proposal(version="other", inference_id=matched))
     with pytest.raises(ValueError, match="Learned MPC"):
         deployed.apply_to(fallback_proposal())
+    accepted = deployed.apply_to(learned_proposal(confidence=0.0, inference_id=matched))
+    assert accepted.confidence == deployed.confidence
+
+
+def test_an_assessment_cannot_be_moved_to_a_proposal_from_another_inference(trained) -> None:
+    """同じ model version でも、以前の in-distribution な判定を別の入力の提案に付けられない。"""
+    _data, parts, model, profile = trained
+    judge = assessor(profile)
+    safe_input = ObservedThermalInput.from_example(parts.test[0])
+    ood_input = shifted(safe_input, air=35.0)
+    safe = judge.assess(safe_input, model.predict(safe_input), None)
+    ood = judge.assess(ood_input, model.predict(ood_input), None)
+    assert safe.ood is False and ood.ood is True
+    assert safe.inference_id != ood.inference_id
+    # 同じ action 時刻・同じ model でも、入力が違えば識別子が違う
+    assert safe.input_action_ts_ms == ood.input_action_ts_ms
+
+    deployed_safe = safe.model_copy(
+        update={
+            "artifact_verification": ArtifactVerification.REGISTRY_VERIFIED,
+            "model_version": "thermal-v1",
+        }
+    )
+    proposal_for_ood_input = learned_proposal(0.1, confidence=0.0, inference_id=ood.inference_id)
+    with pytest.raises(ValueError, match="別の推論"):
+        deployed_safe.apply_to(proposal_for_ood_input)
+
+    # 理由だけを別の推論から持ち込むことも拒否する
+    reasons, reasons_from = safe.trace_binding()
+    with pytest.raises(ValidationError, match="別の推論"):
+        LearnedControlStatus(
+            proposal=proposal_for_ood_input,
+            received_at_mono_ms=0,
+            confidence_reasons=reasons,
+            confidence_inference_id=reasons_from,
+        )
+    with pytest.raises(ValidationError, match="一緒に指定"):
+        LearnedControlStatus(
+            proposal=proposal_for_ood_input, received_at_mono_ms=0, confidence_reasons=reasons
+        )
+
+
+def test_inference_id_is_deterministic_and_input_bound(trained) -> None:
+    _data, parts, model, _profile = trained
+    first = ObservedThermalInput.from_example(parts.test[0])
+    second = ObservedThermalInput.from_example(parts.test[1])
+    prediction = model.predict(first)
+    assert inference_id(first, prediction) == inference_id(first, model.predict(first))
+    with pytest.raises(ValueError, match="同じ入力"):
+        inference_id(second, prediction)
 
 
 def test_confidence_types_cannot_carry_demand_or_pwm() -> None:
@@ -738,6 +807,7 @@ def test_v5_trace_requires_consistent_model_gate_for_learned_ticks() -> None:
     with pytest.raises(ValidationError, match="LOW"):
         ModelGateDecision(
             model_version="thermal-v1",
+            inference_id="c" * 64,
             confidence=0.0,
             ood=True,
             confidence_level=ConfidenceLevel.MEDIUM,
@@ -747,6 +817,7 @@ def test_v5_trace_requires_consistent_model_gate_for_learned_ticks() -> None:
     with pytest.raises(ValidationError, match="MEDIUM 帯"):
         ModelGateDecision(
             model_version="thermal-v1",
+            inference_id="c" * 64,
             confidence=0.8,
             ood=False,
             confidence_level=ConfidenceLevel.MEDIUM,
@@ -967,3 +1038,38 @@ def test_residual_evidence_from_another_profile_cannot_lift_the_cap(trained, mul
     observed = ObservedThermalInput.from_example(parts.test[0])
     with pytest.raises(ValueError, match="Profile と一致しない"):
         assessor(profile).assess(observed, model.predict(observed), evidence(other_profile, 1.0))
+
+
+@pytest.mark.parametrize(("tolerance", "accepted"), [(999, True), (1_000, False), (1_500, False)])
+def test_residual_tolerance_must_stay_below_the_shortest_horizon(
+    trained, tolerance: int, accepted: bool
+) -> None:
+    """DatasetSpec と同じく、許容幅が action 時刻に届く設定を拒否する。"""
+    _data, _parts, _model, profile = trained
+    assert profile.target_schema.horizons_ms[0] == 1_000
+    base = confidence_policy()
+    window = base.residual_match_tolerance_ms.model_copy(update={"value": tolerance})
+    settings = base.model_copy(update={"residual_match_tolerance_ms": window})
+    if accepted:
+        ResidualDriftMonitor(profile, settings)
+    else:
+        with pytest.raises(ValueError, match="最短 horizon"):
+            ResidualDriftMonitor(profile, settings)
+
+
+def test_residual_evidence_counted_with_other_settings_is_rejected(trained) -> None:
+    _data, parts, model, profile = trained
+    observed = ObservedThermalInput.from_example(parts.test[0])
+    other = evidence(profile, 1.0).model_copy(update={"residual_window": 50})
+    with pytest.raises(ValueError, match="window / 許容幅"):
+        assessor(profile).assess(observed, model.predict(observed), other)
+    with pytest.raises(ValidationError, match="window を超えない"):
+        ResidualEvidence(
+            profile_sha256=profile.sha256(),
+            residual_window=3,
+            match_tolerance_ms=500,
+            forecasts=4,
+            ratio=1.0,
+            expired_forecasts=0,
+            dropped_forecasts=0,
+        )
