@@ -292,7 +292,10 @@ def examples_jsonl_bytes(examples: tuple[DatasetExample, ...]) -> bytes:
 
 def examples_sha256(examples: tuple[DatasetExample, ...]) -> str:
     """manifestへ保存するcanonical examplesのSHA-256。"""
-    return hashlib.sha256(examples_jsonl_bytes(examples)).hexdigest()
+    digest = hashlib.sha256()
+    for example in examples:
+        digest.update((example.model_dump_json() + "\n").encode())
+    return digest.hexdigest()
 
 
 class DatasetManifest(_Frozen):
