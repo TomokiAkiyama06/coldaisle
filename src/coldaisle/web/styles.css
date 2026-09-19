@@ -81,10 +81,13 @@ main { padding: 0 20px 40px; }
 .q-missing .badge { background: rgba(154, 164, 178, 0.2); color: var(--muted); }
 .q-suspect { border-left-color: var(--warn); }
 .q-suspect .badge { background: rgba(217, 154, 43, 0.22); color: var(--warn); }
+/* stale は文言のバッジを出さない（決定記録 0039 §2.3）。文言は画面全体の赤帯が担う。
+   カード側は赤い左辺と、値を薄くして「いまの値ではない」ことを示す */
 .q-stale { border-left-color: var(--bad); }
-.q-stale .badge { background: rgba(207, 75, 75, 0.22); color: var(--bad); }
+.q-stale .value { color: var(--muted); }
 
 .derived .card { border-left-color: var(--info); }
+.derived .formula { font-size: 11px; color: var(--muted); margin-top: 4px; }
 
 .ranges { display: flex; gap: 6px; }
 .ranges button {
@@ -111,20 +114,18 @@ main { padding: 0 20px 40px; }
 .legend i { display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 5px; }
 .note { color: var(--muted); font-size: 12px; margin-top: 8px; }
 
-.alerts { display: flex; flex-direction: column; gap: 8px; margin-top: 8px; }
-.alert {
-  background: var(--panel);
-  border: 1px solid var(--line);
-  border-left-width: 4px;
-  border-radius: 6px;
-  padding: 8px 12px;
-  font-size: 13px;
-}
-.alert .meta { color: var(--muted); font-size: 12px; margin-top: 4px; }
-.sev-info { border-left-color: var(--info); }
-.sev-warning { border-left-color: var(--warn); }
-.sev-critical { border-left-color: var(--bad); }
+.alerts { margin-top: 8px; }
+.alert-table { border-collapse: collapse; width: 100%; font-size: 13px; background: var(--panel); }
+.alert-table th, .alert-table td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--line); }
+.alert-table th { color: var(--muted); font-weight: 500; }
+.alert-table tr td:first-child { border-left: 4px solid transparent; }
+.sev-info td:first-child { border-left-color: var(--info); }
+.sev-warning td:first-child { border-left-color: var(--warn); }
+.sev-critical td:first-child { border-left-color: var(--bad); }
+.sev-critical td.severity { color: var(--bad); font-weight: 600; }
+.sev-warning td.severity { color: var(--warn); }
 .state-resolved { opacity: 0.55; }
+.alerts, .device { overflow-x: auto; }
 .empty { color: var(--muted); font-size: 13px; }
 
 /* センサー構成（#14）。ROM は等幅で並べて、目で突き合わせられるようにする */

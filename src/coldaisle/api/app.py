@@ -25,10 +25,13 @@ from fastapi.staticfiles import StaticFiles
 
 from coldaisle.api.models import (
     AlertsResponse,
+    DerivedLabelOut,
     DeviceOut,
     DevicesResponse,
     HealthResponse,
     LatestResponse,
+    MetricLabelOut,
+    MetricsCatalogResponse,
     MetricValue,
     SensorOut,
     SeriesPointOut,
@@ -275,6 +278,29 @@ def create_app(
     def get_latest() -> LatestResponse:
         """全メトリクスの最新値・派生値・品質（FR-301）。"""
         return latest_payload()
+
+    @app.get("/api/v1/metrics", response_model=MetricsCatalogResponse)
+    def get_metrics() -> MetricsCatalogResponse:
+        """メトリクスの表示名・単位と派生値の式（決定記録 0039）。
+
+        `config/metrics.yaml` をそのまま返す。**DB を読まない**ため、取り込みが
+        止まっていても表示名は引ける。
+        """
+        return MetricsCatalogResponse(
+            metrics={
+                name: MetricLabelOut(unit=meta.unit, label=meta.label)
+                for name, meta in catalog.metrics.items()
+            },
+            derived={
+                name: DerivedLabelOut(
+                    unit=meta.unit,
+                    label=meta.label,
+                    minuend=meta.minuend,
+                    subtrahend=meta.subtrahend,
+                )
+                for name, meta in catalog.derived.items()
+            },
+        )
 
     @app.get("/api/v1/series", response_model=SeriesResponse, response_model_by_alias=True)
     def get_series(

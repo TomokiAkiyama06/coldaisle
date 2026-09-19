@@ -225,6 +225,11 @@ def build(
     # 既定の `var/` は追跡されていない。ingest daemon / rollup と同じく、無ければ作る
     config.db.parent.mkdir(parents=True, exist_ok=True)
     store = SqliteStore(config.db, rules=rules, clock=used_clock)
+    if store.dataset_source_run() is not None:
+        # dataset専用DBは1本のReplay取り込みだけの記録。Storeも書き込みを拒否するが、
+        # 周期ごとに失敗させるより起動時に止めるほうが原因が分かりやすい（#83）
+        store.close()
+        raise SystemExit("dataset source runへbind済みのDBにはInternal Telemetryを書かない")
     collector = InternalTelemetryCollector(used_adapters, used_clock)
     return InternalTelemetryDaemon(
         collector=collector,
