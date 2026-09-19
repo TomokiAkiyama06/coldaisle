@@ -31,7 +31,7 @@
   </div>
   <div class="meta">
     <!-- 出どころは経路ごと（Codex P2）。どちらのタブでも見えるよう見出しに置く -->
-    <span id="source-label" class="source">空気の温度：出どころを確認中…</span>
+    <span id="source-label" class="source">空気の温度（現在の取り込み元）：出どころを確認中…</span>
     <span id="telemetry-label" class="source">回転数・PWM・CPU・GPU：読み取り値</span>
     <span id="decision-label"></span>
     <span id="age-label"></span>
@@ -159,6 +159,8 @@
     <span id="graph-agg" class="note"></span>
   </div>
   <div id="toggles" class="toggles" role="group" aria-label="表示する系列"></div>
+  <!-- 点ごとの出どころは API に無い。見出しは「いまの」取り込み元だけを表す（Codex P2） -->
+  <p id="graph-source-note" class="note">見出しの出どころは現在の取り込み元です。過去の点は、取り込み元を切り替えていれば別の出どころの値のことがあります。</p>
 
   <div class="graph-layout">
     <div class="graph-main">

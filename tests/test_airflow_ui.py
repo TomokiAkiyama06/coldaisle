@@ -665,14 +665,14 @@ def test_the_header_names_each_provenance_on_both_tabs():
     page = _text(PAGE)
     header = page[page.index('<header class="af-header">') : page.index("</header>")]
     assert 'id="source-label"' in header
-    assert "空気の温度：" in header
+    assert "空気の温度（現在の取り込み元）：" in header
     assert 'id="telemetry-label"' in header
     # 見出しはタブの外（どちらのタブでも見える）
     assert page.index("</header>") < page.index('<main id="view-now"')
     assert page.index("</header>") < page.index('<main id="view-graph"')
 
     script = _text(SCRIPT)
-    assert 'const AIR_SOURCE_PREFIX = "空気の温度：";' in script
+    assert 'const AIR_SOURCE_PREFIX = "空気の温度（現在の取り込み元）：";' in script
     render = script[
         script.index("function renderSource()") : script.index("function renderControl()")
     ]
@@ -680,3 +680,15 @@ def test_the_header_names_each_provenance_on_both_tabs():
     assert "`${AIR_SOURCE_PREFIX}${" in render
     assert 'getElementById("telemetry-label")' in render
     assert 'valueKind("fan.front.pwm")' in render
+
+
+def test_the_graph_says_history_may_come_from_another_source():
+    """履歴の点ごとの出どころは API に無い。グラフのタブで「現在の取り込み元」だけだと言う。"""
+    page = _text(PAGE)
+    graph = page[page.index('<main id="view-graph"') :]
+    graph = graph[: graph.index("</main>")]
+    note = graph[graph.index('id="graph-source-note"') :]
+    note = note[: note.index("</p>")]
+    assert "現在の取り込み元" in note
+    assert "過去の点" in note
+    assert "実測" not in note

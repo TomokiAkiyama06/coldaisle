@@ -15,8 +15,9 @@
 
 const MOCK_SCENARIOS = { "1": "normal", normal: "normal", override: "override", throttle: "throttle" };
 
-// 見出しの出どころ（health.source）は空気の温度（取り込み経路）だけのもの。そう明記する
-const AIR_SOURCE_PREFIX = "空気の温度：";
+// 見出しの出どころ（health.source）は空気の温度（取り込み経路）の、**いま動いている**取り込みだけのもの。
+// 履歴には切り替え前の出どころの点が混ざりうる（点ごとの出どころは API に無い）ので、そう明記する
+const AIR_SOURCE_PREFIX = "空気の温度（現在の取り込み元）：";
 
 const MOCK_LABELS = {
   normal: "模擬データ（通常）",
