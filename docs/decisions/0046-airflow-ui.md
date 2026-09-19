@@ -4,6 +4,9 @@
 - **Status**: FINAL（2026-09-18、リポジトリ所有者が承認）
 - **Date**: 2026-09-18
 - **Superseded by**: [0051](0051-airflow-cpu-utilization-display.md)（§2.5 の表の「CPU 使用率」の行と §5 未決事項 #3 のみ。他の節は有効）
+- **Superseded by**: [0049](0049-internal-telemetry-source-kind.md)（§2.5 の表の「PWM」の行のうち、
+  札を `PWM（実測） 48%` と固定する部分のみ。札の語は出どころ（`sys.telemetry_kind`）と鮮度で
+  決まる。同じ行の他の内容と §2.7 を含む他の節は有効）
 - **Supersedes**: なし（[`0011-dashboard.md`](0011-dashboard.md) の「作り込まない」は既存ダッシュボードの方針として残す。本記録は別画面を足す）
 - **関連**: [`0009-read-api.md`](0009-read-api.md)、[`0011-dashboard.md`](0011-dashboard.md)、
   [`0028-fan-control-contracts.md`](0028-fan-control-contracts.md) §2.2、
