@@ -749,3 +749,36 @@ def test_a_late_response_cannot_overwrite_a_newer_range():
     assert "const token = ++graph.token;" in load
     success = load[: load.index("} catch (error) {")]
     assert success.index("if (token !== graph.token) return;") < success.index("graph.data = ")
+
+
+def _function(script: str, signature: str) -> str:
+    body = script[script.index(signature) :]
+    return body[: body.index("\n}\n")]
+
+
+def test_latest_and_health_are_applied_independently():
+    """/latest と /health の片方が失敗しても、もう片方は反映する。失敗は別々に言う（Codex P2）。"""
+    refresh = _function(_text(SCRIPT), "async function refresh()")
+    assert "Promise.allSettled([" in refresh
+    assert "Promise.all(" not in refresh
+    assert 'latest.status === "fulfilled"' in refresh
+    assert 'health.status === "fulfilled"' in refresh
+    assert "renderHealth(health.value)" in refresh
+    assert "page.latest = latest.value" in refresh
+    # 失敗した側は古い表示を残さない（値は未取得、出どころは不明、鮮度の表示は消す）
+    assert "page.latest = null;" in refresh
+    assert "page.ingestSource = null;" in refresh
+    assert "/api/v1/latest）を取得できません" in refresh
+    assert "/api/v1/health）を取得できません" in refresh
+    assert 'showBanner("api-banner"' in refresh
+    assert refresh.index('showBanner("api-banner"') < refresh.index("renderNow();")
+    assert 'id="api-banner"' in _text(PAGE)
+
+
+def test_changing_the_range_clears_the_graph_before_loading():
+    """新しい期間の応答が届くまで、前の期間のグラフを出さない（Codex P2）。"""
+    ranges = _function(_text(SCRIPT), "function renderRanges()")
+    click = ranges[ranges.index('addEventListener("click"') :]
+    assert "graph.range = range;" in click
+    assert click.index("clearGraph();") < click.index("loadHistory();")
+    assert click.index("読み込み中…") < click.index("loadHistory();")

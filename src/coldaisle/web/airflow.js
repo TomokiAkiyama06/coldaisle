@@ -780,12 +780,29 @@ async function refresh() {
   if (page.mockName || page.refreshing) return;
   page.refreshing = true;
   try {
-    const [latest, health] = await Promise.all([fetchJson("/api/v1/latest"), fetchJson("/api/v1/health")]);
-    page.latest = latest;
-    renderHealth(health);
+    // **片方の失敗でもう片方の応答を捨てない**（Codex P2）。それぞれを別々に反映し、失敗は別々に言う
+    const [latest, health] = await Promise.allSettled([fetchJson("/api/v1/latest"), fetchJson("/api/v1/health")]);
+    const errors = [];
+    if (latest.status === "fulfilled") {
+      page.latest = latest.value;
+    } else {
+      // 前回の値を「いまの値」として出し続けない。全部「未取得」にする
+      page.latest = null;
+      errors.push(`最新値（/api/v1/latest）を取得できません: ${latest.reason.message}`);
+    }
+    if (health.status === "fulfilled") {
+      renderHealth(health.value);
+    } else {
+      // 鮮度も出どころも確かめられない。前回の health の表示（古い・未来・最終受信）を残さない
+      page.ingestSource = null;
+      showBanner("banner", null);
+      document.getElementById("age-label").textContent = "";
+      errors.push(`状態（/api/v1/health）を取得できません — データの新しさと出どころを確認できません: ${health.reason.message}`);
+    }
+    showBanner("api-banner", errors.join(" / ") || null);
     renderNow();
   } catch (error) {
-    showBanner("banner", `API に接続できません: ${error.message}`);
+    showBanner("api-banner", `画面を更新できません: ${error.message}`);
   } finally {
     page.refreshing = false;
   }
@@ -822,6 +839,9 @@ function renderRanges() {
     button.addEventListener("click", () => {
       graph.range = range;
       renderRanges();
+      // **新しい期間の応答が届くまで、前の期間の線・軸・値を出さない**（Codex P2）
+      clearGraph();
+      document.getElementById("graph-note").textContent = "読み込み中…";
       loadHistory();
     });
     container.appendChild(button);
