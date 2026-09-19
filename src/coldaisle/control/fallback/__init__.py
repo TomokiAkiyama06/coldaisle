@@ -8,6 +8,7 @@ from coldaisle.control.fallback.gate import (
     LearnedControlStatus,
     LearnedFailure,
     SnapshotStatus,
+    classify_confidence,
 )
 
 __all__ = [
@@ -18,4 +19,5 @@ __all__ = [
     "LearnedControlStatus",
     "LearnedFailure",
     "SnapshotStatus",
+    "classify_confidence",
 ]
