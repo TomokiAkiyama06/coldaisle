@@ -504,3 +504,94 @@ def test_health_reports_the_ingest_source(tmp_path, rules):
     )
     with TestClient(app) as opened:
         assert opened.get("/api/v1/health").json()["source"] == "replay"
+
+
+# ------------------------------------------------------- グラフの品質・値の注記（Codex P2）
+
+
+def _status_call(function: str, *args: object) -> object:
+    """airflow-status.js の関数を node で実行した結果（引数・戻り値は JSON）。"""
+    code = (
+        "const s = require(process.argv[1]);"
+        f"const out = s.{function}(...JSON.parse(process.argv[2]));"
+        "console.log(JSON.stringify(out === undefined ? null : out));"
+    )
+    done = subprocess.run(
+        [_node(), "-e", code, str(STATUS), json.dumps(list(args))],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return json.loads(done.stdout)
+
+
+def test_raw_points_that_are_not_ok_become_gaps():
+    """raw の suspect（DS18B20 の -127 など）・missing は値なしにする。ts は残す。"""
+    points = [
+        {"ts_ms": 1, "value": 24.5, "quality": "ok"},
+        {"ts_ms": 2, "value": -127.0, "quality": "suspect"},
+        {"ts_ms": 3, "value": None, "quality": "missing"},
+        {"ts_ms": 4, "value": 25.0, "quality": "stale"},
+        {"ts_ms": 5, "value": 25.5},
+        {"ts_ms": 6, "value": 26.0, "quality": "ok"},
+    ]
+    assert [p["value"] for p in _status_call("usablePoints", points, "raw")] == [
+        24.5,
+        None,
+        None,
+        None,
+        None,
+        26.0,
+    ]
+
+
+@pytest.mark.parametrize("agg", ["1m", "5m", "1h"])
+def test_aggregate_points_are_used_as_they_are(agg):
+    """集計済みの点は ok の行だけで作られている（rollup）ので、quality が無くても使う。"""
+    points = [{"ts_ms": 1, "value": 24.5, "min": 24.0, "max": 25.0, "ok_count": 60}]
+    assert _status_call("usablePoints", points, agg) == points
+
+
+def test_the_graph_reads_only_usable_points():
+    script = _text(SCRIPT)
+    load = script[script.index("graph.data = new Map(") - 200 :][:600]
+    assert "usablePoints" in load
+    assert "usable(body.points, body.agg)" in load
+
+
+@pytest.mark.parametrize(
+    ("source", "expected", "measured"),
+    [
+        ("serial", "実機の実測値です", True),
+        ("mock", "模擬データ（MockSource）", False),
+        ("replay", "過去の記録の再生", False),
+        (None, "出どころは不明", False),
+        ("something-new", "出どころは不明", False),
+        ("toString", "出どころは不明", False),
+    ],
+)
+def test_the_measured_note_follows_health_source(source, expected, measured):
+    """**serial のときだけ「実測値です」と言い切る**（見出しの表示と同じ判断）。"""
+    note = _status_call("measuredNote", source)
+    assert isinstance(note, str)
+    assert expected in note
+    assert ("実測値です" in note) is measured
+
+
+def test_the_measured_note_waits_for_health():
+    code = (
+        "const s = require(process.argv[1]);console.log(JSON.stringify(s.measuredNote(undefined)));"
+    )
+    done = subprocess.run(
+        [_node(), "-e", code, str(STATUS)], capture_output=True, text=True, check=True
+    )
+    note = json.loads(done.stdout)
+    assert "確認中" in note
+    assert "実測値です" not in note
+
+
+def test_the_control_note_does_not_claim_measured_values():
+    script = _text(SCRIPT)
+    control = script[script.index("function renderControl()") :][:1500]
+    assert "measuredNote(page.ingestSource)" in control
+    assert "使用率は実測値です" not in script

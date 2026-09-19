@@ -330,7 +330,8 @@ function renderControl() {
   }
   document.getElementById("control-note").textContent = control
     ? "制御の状態は模擬データです。実際の制御とは関係ありません。"
-    : "制御の状態は未接続です。制御デーモンの判断記録（#74 / #82）を読む API がまだ無いため表示していません。回転数・PWM・温度・使用率は実測値です。";
+    : "制御の状態は未接続です。制御デーモンの判断記録（#74 / #82）を読む API がまだ無いため表示していません。" +
+      window.ColdaisleAirflowStatus.measuredNote(page.ingestSource);
 
   const alert = control && control.alert;
   const box = document.getElementById("control-alert");
@@ -1144,7 +1145,11 @@ async function loadHistory() {
       toMs = results[0].body.to;
     }
     if (token !== graph.token) return;
-    graph.data = new Map(results.map(({ key, body }) => [key, { points: body.points, agg: body.agg, downsampled: body.downsampled }]));
+    // 生データの suspect / missing は値なしにしてから持つ（線・帯・読み取り値の全部で欠けとして扱う）
+    const usable = window.ColdaisleAirflowStatus.usablePoints;
+    graph.data = new Map(
+      results.map(({ key, body }) => [key, { points: usable(body.points, body.agg), agg: body.agg, downsampled: body.downsampled }])
+    );
     graph.fromMs = fromMs;
     graph.toMs = toMs;
     graph.loaded = true;

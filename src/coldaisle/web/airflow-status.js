@@ -69,9 +69,40 @@
     return Object.prototype.hasOwnProperty.call(SOURCE_LABELS, source) ? SOURCE_LABELS[source] : UNKNOWN_SOURCE;
   }
 
+  // 回転数・PWM・温度・使用率の出どころの注記。見出し（ingestSourceLabel）と同じ判断で書く。
+  // **health.source が serial のときだけ「実測」と言う**（Codex P2 / 決定記録 0046 §2.7）
+  const VALUES = "回転数・PWM・温度・使用率";
+  const MEASURED_NOTES = {
+    serial: `${VALUES}は実機の実測値です。`,
+    mock: `${VALUES}は模擬データ（MockSource）の値です。実機の実測値ではありません。`,
+    replay: `${VALUES}は過去の記録の再生です。いまの実機の値ではありません。`,
+  };
+
+  /** `health.source` に合わせた値の注記。undefined は health 待ち、null・未知の値は出どころ不明。 */
+  function measuredNote(source) {
+    if (source === undefined) return `${VALUES}の出どころを確認中です。`;
+    return Object.prototype.hasOwnProperty.call(MEASURED_NOTES, source)
+      ? MEASURED_NOTES[source]
+      : `${VALUES}の出どころは不明です（実機の実測値とは限りません）。`;
+  }
+
+  /**
+   * グラフに使える点へ直す。**生データ（agg=raw）では quality が ok 以外の点を値なし（null）にする**。
+   * `/api/v1/series` の raw は suspect の値（DS18B20 の -127 など）をそのまま返すため、
+   * 線・帯・読み取り値のどれにも出さず、欠けた区間として扱う（ダッシュボードのカードと同じく
+   * ok 以外を正常な値として見せない）。集計済みの点は ok の行だけで作られているのでそのまま使う。
+   */
+  function usablePoints(points, agg) {
+    if (!Array.isArray(points)) return [];
+    if (agg !== "raw") return points;
+    return points.map((point) => (point.quality === "ok" ? point : { ...point, value: null }));
+  }
+
   const api = {
     gpuThrottleStatus,
     ingestSourceLabel,
+    measuredNote,
+    usablePoints,
     GPU_THROTTLE_METRICS: [...THERMAL, ...POWER, ...SLOWDOWN].map(([metric]) => metric),
   };
   if (typeof module !== "undefined" && module.exports) module.exports = api;
