@@ -24,6 +24,7 @@ from pydantic import ValidationError
 
 from coldaisle.api.airflow import AirflowUiSettings
 from coldaisle.api.app import WEB_ROOT, Config, create_app
+from coldaisle.channels import CHANNEL_TO_METRIC
 from coldaisle.clock import SimulatedClock
 from coldaisle.store import Quality, Reading, Sample, SqliteStore
 from conftest import CONFIG_DIR, QUALITY_RULES_PATH
@@ -608,9 +609,39 @@ def test_the_control_note_does_not_claim_measured_values():
         ("toString", "出どころ不明"),
     ],
 )
-def test_the_value_kind_follows_health_source(source, kind):
-    """凡例・PWM の札も **serial のときだけ「実測」**（measuredNote と同じ判断）。"""
-    assert _status_call("valueKind", source) == kind
+def test_the_ingest_kind_follows_health_source(source, kind):
+    """取り込み経路の札は **serial のときだけ「実測」**（measuredNote と同じ判断）。"""
+    assert _status_call("ingestKind", source) == kind
+    assert _status_call("metricKind", "air.room", source, False) == kind
+
+
+def test_the_ingest_metrics_match_the_channel_table():
+    """health.source が当てはまるのは取り込みデーモンが書く air.* だけ（channels.py）。"""
+    script = _text(STATUS)
+    listed = re.findall(r'"(air\.[a-z_]+)"', script)
+    assert sorted(listed) == sorted(CHANNEL_TO_METRIC.values())
+
+
+@pytest.mark.parametrize("source", ["serial", "mock", "replay", None, "something-new"])
+@pytest.mark.parametrize(
+    "metric", ["fan.front.pwm", "fan.top.rpm", "cpu.package", "gpu.0.core", "gpu.0.utilization"]
+)
+def test_internal_telemetry_is_not_labelled_by_the_ingest_source(metric, source):
+    """内部テレメトリは別の経路。health.source で「実測」「模擬」「再生」と言わない。"""
+    assert _status_call("metricKind", metric, source, False) == "読み取り値"
+
+
+@pytest.mark.parametrize("metric", ["air.room", "fan.front.pwm", "gpu.0.core"])
+def test_mock_query_makes_every_value_mock(metric):
+    assert _status_call("metricKind", metric, "serial", True) == "模擬"
+
+
+@pytest.mark.parametrize("source", ["serial", "mock", "replay", None])
+def test_the_measured_note_separates_internal_telemetry(source):
+    note = _status_call("measuredNote", source)
+    assert isinstance(note, str)
+    assert "空気の温度" in note
+    assert "内部テレメトリの読み取り値" in note
 
 
 def test_the_page_has_no_fixed_measured_wording():
@@ -621,7 +652,7 @@ def test_the_page_has_no_fixed_measured_wording():
     assert not [text for text in literals if "実測" in text]
     script = _text(SCRIPT)
     assert 'page.mockName ? "mock" : page.ingestSource' in script
-    assert "PWM（${valueKind()}）" in script
+    assert "PWM（${valueKind(zone.pwm)}）" in script
     render = script[
         script.index("function renderSource()") : script.index("function renderControl()")
     ]

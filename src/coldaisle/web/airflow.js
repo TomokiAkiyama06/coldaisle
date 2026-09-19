@@ -300,9 +300,12 @@ function displaySource() {
   return page.mockName ? "mock" : page.ingestSource;
 }
 
-/** 値の札に付ける語（実測 / 模擬 / 再生 / 出どころ不明 / 確認中）。 */
-function valueKind() {
-  return window.ColdaisleAirflowStatus.valueKind(displaySource());
+/**
+ * そのメトリクスの値の札に付ける語。**取り込み経路（air.*）だけ health.source で決める**。
+ * 内部テレメトリ（回転数・PWM・CPU・GPU）は「読み取り値」。`?mock=` のときは全部「模擬」。
+ */
+function valueKind(metric) {
+  return window.ColdaisleAirflowStatus.metricKind(metric, page.ingestSource, Boolean(page.mockName));
 }
 
 function renderSource() {
@@ -323,7 +326,8 @@ function renderSource() {
     source.textContent = page.pageNote ? `${label.text}（${page.pageNote}）` : label.text;
     source.classList.toggle("mock", !label.live);
   }
-  document.getElementById("value-kind-key").textContent = `${valueKind()}（温度・回転数・使用率）`;
+  document.getElementById("value-kind-key").textContent =
+    `空気の温度＝${valueKind("air.room")}、回転数・PWM・CPU・GPU＝${valueKind("fan.front.pwm")}`;
   decision.textContent = page.control && page.control.decision_id ? `判断 ${page.control.decision_id}` : "";
 }
 
@@ -565,7 +569,7 @@ function renderZones() {
     big.appendChild(valueNode(reading(zone.rpm, 0, ""), "rpm"));
     big.appendChild(el("span", "unit", "rpm"));
     const pwm = reading(zone.pwm, 0, "%");
-    const pwmNode = el("span", "pwm", `PWM（${valueKind()}） `);
+    const pwmNode = el("span", "pwm", `PWM（${valueKind(zone.pwm)}） `);
     pwmNode.appendChild(valueNode(pwm));
     big.appendChild(pwmNode);
     panel.appendChild(big);
