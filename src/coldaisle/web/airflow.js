@@ -67,14 +67,15 @@ const ZONES = [
 
 // `util: null` は「未計測」と出す（そもそも取得していない）。
 // CPU 使用率（`cpu.utilization`。決定記録 0047）は収集を無効にできる（`proc_stat.enabled`）ほか、
-// Linux 以外では記録されない。そのため `/latest` に**キーが無い**ときは「未計測」と出す
-// （`utilAbsent`）。キーはあるが値が無い・`missing` のときは他の値と同じく「未取得」
+// Linux 以外では値を持たない。そのとき collector は `missing` の行を保存しうるし、無効にする前の
+// 行も残るので、**行の有無では判断しない。** `/api/v1/airflow/config` の
+// `cpu_utilization.measured`（設定と実行環境から決まる）が偽なら「未計測」と出す（`measured`）
 //
 // `status` は熱源の状態（決定記録 0046 §2.6）。GPU はスロットリングの状態を返す（案1）。
 // 判定は airflow-status.js（DOM に触らない関数）が持つ。CPU は状態を持たない
 const HEAT_SOURCES = [
   {
-    name: "CPU", util: "cpu.utilization", utilAbsent: "未計測", temp: "cpu.package", power: "power.cpu.package",
+    name: "CPU", util: "cpu.utilization", measured: () => page.cpuMeasured, temp: "cpu.package", power: "power.cpu.package",
     status: null,
     chip: { x: 204, y: 200, w: 104 },
   },
@@ -161,6 +162,7 @@ const page = {
   mockName: null, // null なら実データ
   mock: null, // 模擬データの提供元（airflow-mock.js）
   scale: null, // { thresholds_c, provisional }。読めなければ null（色を付けない）
+  cpuMeasured: null, // airflow/config の cpu_utilization.measured。読めなければ null（分からない）
   latest: null,
   control: null, // 実データでは常に null（未接続）
   zone: "top", // 「なぜこの回転数か」で見ている系統
@@ -212,15 +214,12 @@ function fmt(value, digits) {
 /**
  * 1つの測定値を表示用にする。**値が無いものを 0 や「—」だけで済ませない。**
  * - metric が null → 「未計測」（そもそも取得していない）
- * - `/latest` にキーが無い → `absent`（既定は「未取得」。収集しないことがある値は「未計測」）
  * - 値が無い → 「未取得」
  * - 古い / 疑わしい → 値に印を付ける
  */
-function reading(metric, digits, unit, absent = "未取得") {
+function reading(metric, digits, unit) {
   if (metric === null) return { text: "未計測", quality: "missing", value: null };
   const item = page.latest && page.latest.metrics ? page.latest.metrics[metric] : undefined;
-  // 実データの応答が届く前（page.latest が null）は「未取得」。キーが無いと言えるのは応答があるときだけ
-  if (page.latest && page.latest.metrics && item === undefined) return { text: absent, quality: "missing", value: null };
   if (!item || item.value === null || item.value === undefined || item.quality === "missing") {
     return { text: "未取得", quality: "missing", value: null };
   }
@@ -230,6 +229,17 @@ function reading(metric, digits, unit, absent = "未取得") {
     value: item.value,
     tag: QUALITY_TAG[item.quality],
   };
+}
+
+/**
+ * 熱源の使用率。設定で計測していない（`measured()` が false）なら、保存済みの行があっても「未計測」。
+ * 設定を読めない（null）ときは決めつけず、値の有無で表示する。模擬データは設定に左右されない。
+ */
+function utilReading(source) {
+  if (!page.mockName && typeof source.measured === "function" && source.measured() === false) {
+    return reading(null, 0, "%");
+  }
+  return reading(source.util, 0, "%");
 }
 
 function derivedValue(name) {
@@ -489,7 +499,7 @@ function renderDiagram() {
   for (const source of HEAT_SOURCES) {
     const status = sourceStatus(source);
     if (source.block) paintBlock(source.block, status);
-    const util = { ...lineFor(reading(source.util, 0, "%", source.utilAbsent), "使用率 "), small: true };
+    const util = { ...lineFor(utilReading(source), "使用率 "), small: true };
     const temp = { ...lineFor(reading(source.temp, 0, "℃"), "温度 "), small: true };
     if (!status) {
       drawTag(labels, {
@@ -750,7 +760,7 @@ function renderHeat() {
   for (const source of [...HEAT_SOURCES].reverse()) {
     const block = el("div", "src");
     block.appendChild(el("span", "src-name", source.name));
-    block.appendChild(kvRow("使用率", reading(source.util, 0, "%", source.utilAbsent)));
+    block.appendChild(kvRow("使用率", utilReading(source)));
     block.appendChild(kvRow("温度", reading(source.temp, 1, "℃")));
     block.appendChild(kvRow("消費電力", reading(source.power, 0, " W")));
     const status = sourceStatus(source); // GPU のスロットリング（案1）。null なら何も出さない
@@ -822,8 +832,11 @@ async function loadScale() {
   try {
     const body = await fetchJson("/api/v1/airflow/config");
     page.scale = body.air_temperature;
+    const cpu = body.cpu_utilization;
+    page.cpuMeasured = cpu && typeof cpu.measured === "boolean" ? cpu.measured : null;
   } catch (error) {
     page.scale = null; // 色を付けない。凡例で「読み込めません」と言う
+    page.cpuMeasured = null;
   }
 }
 

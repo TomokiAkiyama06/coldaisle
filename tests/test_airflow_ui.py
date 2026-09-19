@@ -9,6 +9,7 @@
 5. オフラインで見える・API の文字列を HTML として解釈しない
 """
 
+import importlib
 import json
 import os
 import re
@@ -26,6 +27,7 @@ from coldaisle.api.airflow import AirflowUiSettings
 from coldaisle.api.app import WEB_ROOT, Config, create_app
 from coldaisle.channels import CHANNEL_TO_METRIC
 from coldaisle.clock import SimulatedClock
+from coldaisle.internal_telemetry import ProcStatAdapter
 from coldaisle.store import Quality, Reading, Sample, SqliteStore
 from conftest import CONFIG_DIR, QUALITY_RULES_PATH
 
@@ -67,6 +69,7 @@ def client(tmp_path, rules):
             airflow_ui=AIRFLOW_UI_PATH,
         ),
         clock=SimulatedClock(NOW_MS),
+        cpu_utilization_measured=True,
     )
     with TestClient(app) as opened:
         yield opened
@@ -94,6 +97,7 @@ def test_the_config_endpoint_returns_the_thresholds_from_yaml(client):
             "thresholds_c": expected["thresholds_c"],
             "provisional": expected["provisional"],
         },
+        "cpu_utilization": {"measured": True},
     }
 
 
@@ -801,11 +805,13 @@ def test_cpu_utilization_is_wired():
     sources = script[script.index("const HEAT_SOURCES") : script.index("const STATUS_COLOR")]
     cpu = sources[sources.index('name: "CPU"') : sources.index('name: "GPU"')]
     assert 'util: "cpu.utilization"' in cpu
-    assert 'utilAbsent: "未計測"' in cpu, "収集していないときは「未計測」と出す"
+    assert "measured: () => page.cpuMeasured" in cpu, "計測していない設定では「未計測」と出す"
     assert "util: null" not in sources
-    assert script.count('reading(source.util, 0, "%", source.utilAbsent)') == 2
+    assert script.count("utilReading(source)") == 3  # 定義 + 側面図 + 熱源パネル
+    assert "reading(source.util" not in script.replace("return reading(source.util", "")
     groups = script[script.index("const GROUPS") : script.index("const FAN_SERIES")]
     assert re.search(r'key: "cpu_util", label: "CPU使用率", metric: "cpu\.utilization"', groups)
+    assert "page.cpuMeasured = cpu && typeof cpu.measured" in script
 
 
 def test_mock_has_cpu_utilization():
@@ -813,8 +819,12 @@ def test_mock_has_cpu_utilization():
     assert _text(MOCK).count('"cpu.utilization":') == 2
 
 
-def _reading(latest: object, *args: object) -> dict[str, object]:
-    """airflow.js の `reading()` を、`page.latest` を差し替えて node で実行した結果。"""
+def _util(page: dict[str, object], source: dict[str, object] | None = None) -> dict[str, object]:
+    """airflow.js の `utilReading()` を、`page` を差し替えて node で実行した結果。
+
+    CPU の熱源は `measured: () => page.cpuMeasured`。`source` に `"measured": null` を渡すと
+    `measured` を持たない熱源（GPU）として試す。
+    """
     script = _text(SCRIPT)
     start = script.index("function fmt(")
     end = script.index("function derivedValue(")
@@ -822,11 +832,15 @@ def _reading(latest: object, *args: object) -> dict[str, object]:
     tag = tag[: tag.index(";") + 1]
     code = (
         f"{tag}\n{script[start:end]}\n"
-        "const page = { latest: JSON.parse(process.argv[1]) };"
-        "console.log(JSON.stringify(reading(...JSON.parse(process.argv[2]))));"
+        "const page = JSON.parse(process.argv[1]);"
+        "const spec = JSON.parse(process.argv[2]);"
+        "const source = { util: spec.util };"
+        "if (spec.measured !== null) source.measured = () => page.cpuMeasured;"
+        "console.log(JSON.stringify(utilReading(source)));"
     )
+    spec = {"util": "cpu.utilization", "measured": True, **(source or {})}
     done = subprocess.run(
-        [_node(), "-e", code, json.dumps(latest), json.dumps(list(args))],
+        [_node(), "-e", code, json.dumps(page), json.dumps(spec)],
         capture_output=True,
         text=True,
         check=True,
@@ -838,47 +852,115 @@ def _reading(latest: object, *args: object) -> dict[str, object]:
 def _cpu(value: float | None, quality: str) -> dict[str, object]:
     return {
         "metrics": {
-            "cpu.utilization": {
-                "value": value,
-                "unit": "%",
-                "quality": quality,
-                "age_seconds": 0.4,
-            }
+            "cpu.utilization": {"value": value, "unit": "%", "quality": quality, "age_seconds": 0.4}
         }
     }
 
 
+UNMEASURED = {"text": "未計測", "quality": "missing", "value": None}
+
+
 def test_cpu_utilization_reading_ok():
-    result = _reading(_cpu(29.4, "ok"), "cpu.utilization", 0, "%", "未計測")
+    result = _util({"latest": _cpu(29.4, "ok"), "cpuMeasured": True, "mockName": None})
     assert result["text"] == "29%"
     assert result["quality"] == "ok"
-    assert "tag" not in result or result["tag"] is None
+    assert result.get("tag") is None
 
 
 @pytest.mark.parametrize(("quality", "tag"), [("stale", "古い"), ("suspect", "疑わしい")])
 def test_cpu_utilization_reading_marks_quality(quality, tag):
-    result = _reading(_cpu(29.0, quality), "cpu.utilization", 0, "%", "未計測")
+    result = _util({"latest": _cpu(29.0, quality), "cpuMeasured": True, "mockName": None})
     assert result["text"] == "29%"
     assert result["tag"] == tag
 
 
-def test_absent_cpu_utilization_is_unmeasured():
-    """`/latest` にキーが無い（収集が無効・Linux 以外）→ 「未計測」。0 % とは言わない。"""
-    result = _reading({"metrics": {}}, "cpu.utilization", 0, "%", "未計測")
-    assert result == {"text": "未計測", "quality": "missing", "value": None}
+@pytest.mark.parametrize(
+    "latest",
+    [
+        _cpu(None, "missing"),  # proc_stat 有効・Linux 以外で保存される missing の行（Codex P2）
+        _cpu(31.0, "ok"),  # 無効にする前に保存された行
+        {"metrics": {}},
+        None,
+    ],
+)
+def test_unmeasured_cpu_utilization_ignores_stored_rows(latest):
+    """設定で計測していないなら、`/latest` の行の有無・値に関わらず「未計測」。"""
+    assert _util({"latest": latest, "cpuMeasured": False, "mockName": None}) == UNMEASURED
 
 
-def test_missing_cpu_utilization_is_not_acquired():
-    """キーはあるが値が無い（起動直後の1サンプル等。0047 §2.2）→ 「未取得」。"""
-    result = _reading(_cpu(None, "missing"), "cpu.utilization", 0, "%", "未計測")
-    assert result["text"] == "未取得"
+def test_missing_cpu_utilization_is_not_acquired_while_measured():
+    """計測する設定で値が無い（起動直後の1サンプル等。0047 §2.2）→ 「未取得」。"""
+    page = {"latest": _cpu(None, "missing"), "cpuMeasured": True, "mockName": None}
+    assert _util(page)["text"] == "未取得"
+    assert _util({**page, "latest": {"metrics": {}}})["text"] == "未取得"
 
 
-def test_before_the_first_response_values_are_not_acquired():
-    """応答が届く前はキーが無いとは言えない。「未計測」ではなく「未取得」。"""
-    assert _reading(None, "cpu.utilization", 0, "%", "未計測")["text"] == "未取得"
+def test_unknown_config_does_not_claim_unmeasured():
+    """設定を読めない（null）ときは「未計測」と決めつけず、値の有無で出す。"""
+    assert _util({"latest": _cpu(29.0, "ok"), "cpuMeasured": None, "mockName": None})["text"] == (
+        "29%"
+    )
+    assert _util({"latest": None, "cpuMeasured": None, "mockName": None})["text"] == "未取得"
 
 
-def test_other_absent_metrics_stay_not_acquired():
-    """空気の温度など、既定では従来どおり「未取得」（決定記録 0046 §2.3）。"""
-    assert _reading({"metrics": {}}, "air.room", 1, "℃")["text"] == "未取得"
+def test_mock_data_is_not_gated_by_the_host_config():
+    """模擬データは画面側の値。API のホストの設定で「未計測」にしない。"""
+    page = {"latest": _cpu(29.0, "ok"), "cpuMeasured": False, "mockName": "normal"}
+    assert _util(page)["text"] == "29%"
+
+
+def test_sources_without_the_flag_read_the_value():
+    """GPU など `measured` を持たない熱源は従来どおり。"""
+    page = {
+        "latest": {"metrics": {"gpu.0.utilization": {"value": 93, "unit": "%", "quality": "ok"}}},
+        "cpuMeasured": False,
+        "mockName": None,
+    }
+    assert _util(page, {"util": "gpu.0.utilization", "measured": None})["text"] == "93%"
+
+
+# ------------------------------------------------------- airflow/config の cpu_utilization（#145）
+
+
+def _config_client(tmp_path, rules, **kwargs):
+    path = tmp_path / "cfg.db"
+    with SqliteStore(path, rules=rules, clock=SimulatedClock(NOW_MS)):
+        pass
+    return TestClient(
+        create_app(
+            Config(
+                db=path,
+                quality_rules=QUALITY_RULES_PATH,
+                metrics=METRICS_PATH,
+                airflow_ui=AIRFLOW_UI_PATH,
+                **kwargs,
+            ),
+            clock=SimulatedClock(NOW_MS),
+            health_hwmon_metrics=(),
+            health_nvml_metrics=(),
+        )
+    )
+
+
+@pytest.mark.parametrize(
+    ("enabled", "platform", "measured"),
+    [(True, "linux", True), (False, "linux", False), (True, "darwin", False)],
+)
+def test_cpu_utilization_measured_follows_config_and_platform(
+    tmp_path, rules, monkeypatch, enabled, platform, measured
+):
+    """`proc_stat.enabled` かつ Linux のときだけ measured。値の行の有無には依らない。"""
+    loaded = yaml.safe_load((CONFIG_DIR / "internal-telemetry.yaml").read_text(encoding="utf-8"))
+    loaded["proc_stat"]["enabled"] = enabled
+    telemetry = tmp_path / "internal-telemetry.yaml"
+    telemetry.write_text(yaml.safe_dump(loaded, allow_unicode=True), encoding="utf-8")
+    # platform は adapter の引数の既定値（sys.platform）で決まる。API が作る adapter を差し替える
+    # `coldaisle.api.app` は属性としては FastAPI の app を指すため、モジュールを直接取る
+    monkeypatch.setattr(
+        importlib.import_module("coldaisle.api.app"),
+        "ProcStatAdapter",
+        lambda config: ProcStatAdapter(config, platform=platform),
+    )
+    with _config_client(tmp_path, rules, internal_telemetry=telemetry) as opened:
+        body = opened.get("/api/v1/airflow/config").json()
+    assert body["cpu_utilization"] == {"measured": measured}

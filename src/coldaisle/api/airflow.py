@@ -71,18 +71,32 @@ class AirTemperatureScaleOut(BaseModel):
     provisional: bool
 
 
+class CpuUtilizationOut(BaseModel):
+    """`GET /api/v1/airflow/config` の `cpu_utilization`（#145 / 決定記録 0047）。"""
+
+    measured: bool
+    """CPU 使用率を収集する設定か（`proc_stat.enabled` かつ Linux）。偽なら画面は「未計測」。
+
+    測定値ではなく設定と実行環境から決まる値。collector の現在の状態ではない。
+    """
+
+
 class AirflowConfigResponse(BaseModel):
     """`GET /api/v1/airflow/config`。**値（測定値）は含まない。**"""
 
     schema_version: Literal[1] = 1
     air_temperature: AirTemperatureScaleOut
+    cpu_utilization: CpuUtilizationOut
 
 
-def airflow_config_payload(settings: AirflowUiSettings) -> AirflowConfigResponse:
+def airflow_config_payload(
+    settings: AirflowUiSettings, *, cpu_utilization_measured: bool
+) -> AirflowConfigResponse:
     """設定をそのまま応答の形にする。"""
     return AirflowConfigResponse(
         air_temperature=AirTemperatureScaleOut(
             thresholds_c=list(settings.air_temperature.thresholds_c),
             provisional=settings.air_temperature.provisional,
-        )
+        ),
+        cpu_utilization=CpuUtilizationOut(measured=cpu_utilization_measured),
     )

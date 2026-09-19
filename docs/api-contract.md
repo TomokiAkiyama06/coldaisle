@@ -220,7 +220,8 @@ coldaisle のエアフロー画面（`/airflow.html`、#106）が使う**表示�
 ```json
 {
   "schema_version": 1,
-  "air_temperature": {"unit": "C", "thresholds_c": [27.0, 28.0, 29.0, 30.0], "provisional": true}
+  "air_temperature": {"unit": "C", "thresholds_c": [27.0, 28.0, 29.0, 30.0], "provisional": true},
+  "cpu_utilization": {"measured": true}
 }
 ```
 
@@ -230,6 +231,13 @@ coldaisle のエアフロー画面（`/airflow.html`、#106）が使う**表示�
 
 **制御・アラートの閾値ではありません。** Fan 制御やアラートの判定には使われず、
 変えても色の付き方が変わるだけです。測定値は含みません（`/latest` と `/series` を使う）。
+
+`cpu_utilization.measured` は CPU 使用率（`cpu.utilization`。決定記録 0047）を収集する設定か
+（`config/internal-telemetry.yaml` の `proc_stat.enabled` かつ Linux）です（#145）。
+`false` のとき画面は CPU 使用率を「未計測」と出します。収集が無効・Linux 以外でも
+`missing` の行や無効にする前の行が `/latest` に残りうるため、行の有無では判断しません。
+API と collector は同じ SQLite を使うため、同じホストで動く前提で API のホストから決めます。
+collector の現在の状態（取得に失敗しているか）ではありません。
 
 ### `GET /api/v1/events`
 
