@@ -115,9 +115,12 @@ def policy(
     power_feedforward: bool = True,
     demote_after: int = 3,
     demote_window_ms: int = 60_000,
+    high_min_confidence: float = 0.85,
+    medium_limit_up: float = 0.1,
+    medium_limit_down: float = 0.05,
 ) -> FanPolicyConfig:
     document: dict[str, object] = {
-        "schema_version": 5,
+        "schema_version": 6,
         "fallback_curve": [
             {"temperature_c": 20.0, "demand": 0.2},
             {"temperature_c": 80.0, "demand": 0.8},
@@ -165,6 +168,23 @@ def policy(
             "limited": provisional(0.6),
             "expanded": provisional(0.7),
             "full": provisional(0.8),
+        },
+        "model_confidence": {
+            "high_min_confidence": provisional(high_min_confidence),
+            "medium_limit": {
+                "limit_up": provisional(medium_limit_up),
+                "limit_down": provisional(medium_limit_down),
+            },
+            "range_margin": provisional(0.1),
+            "min_support_count": provisional(1),
+            "full_support_count": provisional(5),
+            "min_missing_pattern_count": provisional(1),
+            "residual_window": provisional(20),
+            "residual_min_samples": provisional(5),
+            "residual_match_tolerance_ms": provisional(500),
+            "residual_drift_ood_ratio": provisional(3.0),
+            "cap_without_uncertainty": provisional(0.9),
+            "cap_before_residual_evidence": provisional(0.7),
         },
         "authority_stage": authority,
         "authority_limits": {

@@ -22,7 +22,7 @@ from typing import Annotated, Literal, Self
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-SCHEMA_VERSION: Literal[4] = 4
+SCHEMA_VERSION: Literal[5] = 5
 """`ControlTick` の形の版。**フィールドの名前や意味を変えたら上げる。**
 
 #82 が保存したデータを読み違えないため。
@@ -31,6 +31,8 @@ SCHEMA_VERSION: Literal[4] = 4
 - v3（#88 / #137）: Supervisor decision
 - v4（#78）: fault code `absolute_temperature_limit` を追加し、Top の `enable_reverted` を
   無条件の `EMERGENCY` にした。保存済みの v1〜v3 は v3 までの規則のまま読める
+- v5（#85）: Model Confidence / OOD と authority の判断（`model_gate`）。Learned MPC を
+  active にした tick には必須。保存済みの v1〜v4 はそのまま読める
 """
 
 Demand = Annotated[float, Field(ge=0.0, le=1.0, allow_inf_nan=False)]
@@ -406,6 +408,73 @@ class ControllerProposal(_Frozen):
         return self
 
 
+class ConfidenceLevel(StrEnum):
+    """Gate が confidence から決める tick ごとの authority 区分（決定記録 0050 §2.4）。"""
+
+    HIGH = "high"
+    """設定上の authority stage の範囲で Learned MPC を使う。"""
+    MEDIUM = "medium"
+    """stage の範囲に加え、Fallback を中心とした MEDIUM 帯で変更幅と最低 demand を絞る。"""
+    LOW = "low"
+    """Fallback へ退避する。OOD は常にここに入る。"""
+
+
+class AuthorityLimitSource(StrEnum):
+    """Learned MPC の requested を狭めた設定上の根拠。"""
+
+    STAGE_BAND = "stage_band"
+    """LIMITED / EXPANDED の `authority_limits` 帯。"""
+    STAGE_ZONE = "stage_zone"
+    """stage が許可していない zone を Fallback の値にした。"""
+    MEDIUM_CONFIDENCE_BAND = "medium_confidence_band"
+    """MEDIUM confidence の `model_confidence.medium_limit` 帯。"""
+
+
+MAX_MODEL_GATE_REASONS = 16
+"""1 tick に残す assessment の理由の上限。trace の大きさを抑える構造上の上限で、調整値ではない。"""
+
+
+class ModelGateDecision(_Frozen):
+    """Confidence / OOD Gate の1 tick の判断（決定記録 0050 §2.5）。
+
+    **demand を持たない。** requested は ``ControllerProposal`` と zone の記録に残り、
+    この型は「なぜ ML をその範囲で使った / 使わなかったか」だけを残す。
+    """
+
+    schema_version: Literal[1] = 1
+    model_version: str = Field(min_length=1, max_length=120)
+    confidence: float = Field(ge=0.0, le=1.0, allow_inf_nan=False)
+    ood: bool
+    confidence_level: ConfidenceLevel
+    authority_stage: AuthorityStage
+    learned_selected: bool
+    """この tick の requested を Learned MPC が作ったか。"""
+    limits: tuple[AuthorityLimitSource, ...] = ()
+    """Learned MPC の requested を狭めた根拠。選ばれなかった tick では空。"""
+    assessment: tuple[Reason, ...] = Field(default=(), max_length=MAX_MODEL_GATE_REASONS)
+    """Confidence / OOD の構成要素ごとの理由（worker の assessment）。"""
+
+    @model_validator(mode="after")
+    def _authority_matches_confidence(self) -> Self:
+        if len(set(self.limits)) != len(self.limits):
+            raise ValueError("authority limit の根拠を重複させない")
+        if self.ood and self.confidence_level is not ConfidenceLevel.LOW:
+            raise ValueError("OOD の confidence level は LOW にする")
+        if self.learned_selected:
+            if self.confidence_level is ConfidenceLevel.LOW:
+                raise ValueError("LOW confidence の Learned MPC を選ばない（0050 §2.4）")
+            if self.authority_stage is AuthorityStage.SHADOW:
+                raise ValueError("SHADOW で Learned MPC を選ばない")
+            if (
+                self.confidence_level is ConfidenceLevel.MEDIUM
+                and AuthorityLimitSource.MEDIUM_CONFIDENCE_BAND not in self.limits
+            ):
+                raise ValueError("MEDIUM confidence では MEDIUM 帯を掛ける")
+        elif self.limits:
+            raise ValueError("Learned MPC を選ばない tick に authority limit を付けない")
+        return self
+
+
 class GuardZoneOutput(_Frozen):
     """Reactive Guard の zone ごとの出力（0028 §2.3）。介入していなければすべて None。
 
@@ -626,7 +695,7 @@ v1〜v3 の reader は知らないため v3 以前には記録しない。
 class ControlTick(_Frozen):
     """1 tick の判断の記録（decision trace。0028 §2.3）。#82 が保存し、#90 / #91 が読む。"""
 
-    schema_version: Literal[1, 2, 3, 4] = SCHEMA_VERSION
+    schema_version: Literal[1, 2, 3, 4, 5] = SCHEMA_VERSION
     tick_id: int = Field(ge=0)
     ts_ms: int = Field(ge=0)
     """記録の時刻（壁時計。0028 §2.6）。"""
@@ -635,6 +704,10 @@ class ControlTick(_Frozen):
     supervisor: SupervisorDecision | None = Field(
         default=None, exclude_if=lambda value: value is None
     )
+    model_gate: ModelGateDecision | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
+    """Confidence / OOD Gate の判断（v5。#85）。Learned MPC の提案が無い tick では None。"""
     faults: tuple[Fault, ...] = ()
     """いま有効な故障。
 
@@ -663,6 +736,7 @@ class ControlTick(_Frozen):
             and state.supervisor_policy is not None
         ):
             raise ValueError("v3 以降の supervisor_policy には Supervisor decision が必要")
+        self._check_model_gate()
         if self.supervisor is not None:
             if self.supervisor.tick_id != self.tick_id:
                 raise ValueError("Supervisor decision の tick_id を ControlTick と揃える")
@@ -713,6 +787,29 @@ class ControlTick(_Frozen):
             if demand.bound_by is BoundBy.REQUESTED and demand.requested > demand.guard_ceiling:
                 raise ValueError(f"{zone.value}: AUTO なのに Guard の ceiling を掛けていない")
         return self
+
+    def _check_model_gate(self) -> None:
+        """v5 の ``model_gate`` が ControlState と同じ判断を指しているか。"""
+        state = self.state
+        gate = self.model_gate
+        if gate is None:
+            if self.schema_version >= 5 and state.active_controller is ControllerKind.LEARNED_MPC:
+                raise ValueError("v5 以降で Learned MPC を使った tick には model_gate が要る")
+            return
+        if self.schema_version < 5:
+            raise ValueError("model_gate を記録する ControlTick は schema version 5 にする")
+        if (state.model_version, state.model_confidence, state.model_ood) != (
+            gate.model_version,
+            gate.confidence,
+            gate.ood,
+        ):
+            raise ValueError(
+                "ControlState の model_version / confidence / ood を model_gate と揃える"
+            )
+        if state.authority_stage is not gate.authority_stage:
+            raise ValueError("ControlState と model_gate の authority stage を揃える")
+        if gate.learned_selected != (state.active_controller is ControllerKind.LEARNED_MPC):
+            raise ValueError("model_gate.learned_selected と active_controller が食い違っている")
 
     def _check_fault_response(self, fault: Fault) -> None:
         """0028 §2.7 の無条件の対応を満たしているか。"""

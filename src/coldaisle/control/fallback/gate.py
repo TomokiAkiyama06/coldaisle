@@ -8,11 +8,15 @@ from typing import Self
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from coldaisle.control.config import AuthorityLimit, FanPolicyConfig
+from coldaisle.control.config import FanPolicyConfig
 from coldaisle.control.schema import (
+    MAX_MODEL_GATE_REASONS,
+    AuthorityLimitSource,
     AuthorityStage,
+    ConfidenceLevel,
     ControllerKind,
     ControllerProposal,
+    ModelGateDecision,
     OperatingMode,
     OptimizerStatus,
     PerZone,
@@ -55,6 +59,45 @@ class FallbackCause(StrEnum):
     RECOVERY_HOLD = "ml_recovery_hold"
 
 
+def classify_confidence(
+    policy: FanPolicyConfig,
+    *,
+    confidence: float,
+    ood: bool,
+    stage: AuthorityStage,
+) -> ConfidenceLevel:
+    """confidence を HIGH / MEDIUM / LOW に分ける（決定記録 0050 §2.4）。
+
+    MEDIUM の下限は stage ごとの ``gate_min_confidence``、HIGH の下限は
+    ``model_confidence.high_min_confidence``。OOD は値によらず LOW。
+    SHADOW は記録用の counterfactual なので、最も緩い LIMITED の下限で分ける。
+    """
+    if ood:
+        return ConfidenceLevel.LOW
+    thresholds = policy.gate_min_confidence
+    medium_min = {
+        AuthorityStage.SHADOW: thresholds.limited.value,
+        AuthorityStage.LIMITED: thresholds.limited.value,
+        AuthorityStage.EXPANDED: thresholds.expanded.value,
+        AuthorityStage.FULL: thresholds.full.value,
+    }[stage]
+    if confidence < medium_min:
+        return ConfidenceLevel.LOW
+    if confidence < policy.model_confidence.high_min_confidence.value:
+        return ConfidenceLevel.MEDIUM
+    return ConfidenceLevel.HIGH
+
+
+class _Band(BaseModel):
+    """Fallback を中心とした1つの authority 帯。"""
+
+    model_config = ConfigDict(frozen=True, extra="forbid", strict=True)
+
+    source: AuthorityLimitSource
+    limit_up: float
+    limit_down: float
+
+
 class LearnedFailure(StrEnum):
     """proposal を作れなかった worker の独立した失敗状態。"""
 
@@ -71,11 +114,15 @@ class LearnedControlStatus(_Frozen):
     supervisor_available: bool = True
     control_deadline_exceeded: bool = False
     snapshot_status: SnapshotStatus = SnapshotStatus.AVAILABLE
+    confidence_reasons: tuple[Reason, ...] = Field(default=(), max_length=MAX_MODEL_GATE_REASONS)
+    """worker の Confidence / OOD assessment の理由（#85）。trace へそのまま残す。"""
 
     @model_validator(mode="after")
     def _proposal_and_receipt_match(self) -> Self:
         if (self.proposal is None) != (self.received_at_mono_ms is None):
             raise ValueError("Learned proposal と受信単調時刻は一緒に指定する")
+        if self.proposal is None and self.confidence_reasons:
+            raise ValueError("Learned proposal が無いときに confidence の理由を付けない")
         if self.proposal is not None and self.proposal.controller is not ControllerKind.LEARNED_MPC:
             raise ValueError("LearnedControlStatus には Learned MPC の提案だけを入れる")
         if self.failure is not None and self.proposal is not None:
@@ -92,6 +139,8 @@ class ControllerSelection(_Frozen):
     recovery_healthy_since_mono_ms: int | None = Field(default=None, ge=0)
     fallback_transitions_in_window: int = Field(default=0, ge=0)
     demotion_recommended: bool = False
+    model_gate: ModelGateDecision | None = None
+    """Learned proposal があった tick の confidence / authority の判断（#85）。"""
 
     @property
     def active_controller(self) -> ControllerKind:
@@ -115,14 +164,19 @@ class ControllerSelection(_Frozen):
             ),
             "fallback_transitions_in_window": self.fallback_transitions_in_window,
             "demotion_recommended": self.demotion_recommended,
+            "model_gate": (
+                None if self.model_gate is None else self.model_gate.model_dump(mode="json")
+            ),
         }
 
 
 class ControllerGate:
     """ML の不健全を即時に退避し、連続健全 hold 後だけ復帰させる。
 
-    Confidence / OOD 自体の算出は #85 の責務。この Gate は提案に付いた判定と
-    worker / loop の状態を消費し、Fallback への切替だけを決める。
+    Confidence / OOD 自体の算出は worker 側（``coldaisle.control.model.confidence``。#85）。
+    この Gate は提案に付いた判定と worker / loop の状態を消費し、Fallback への切替と
+    confidence level に応じた authority の帯を決める。出せるのは requested までで、
+    Reactive Guard と Critical Safety は後段で常に掛かる。
     """
 
     def __init__(self, policy: FanPolicyConfig, *, expected_model_version: str) -> None:
@@ -168,11 +222,11 @@ class ControllerGate:
             # counterfactualを評価しても復帰holdへは数えず、requestedはFallbackを使う。
             # 実FanへのMaxは後段Safetyのforced_maxが所有する。
             self._healthy_since_mono_ms = None
-            return self._remember(fallback, None, previous_controller)
+            return self._remember(fallback, None, previous_controller, learned)
 
         if self._policy.authority_stage is AuthorityStage.SHADOW:
             self._healthy_since_mono_ms = None
-            return self._remember(fallback, None, previous_controller)
+            return self._remember(fallback, None, previous_controller, learned)
 
         reason = self._unhealthy_reason(now_mono_ms, learned, safety_state)
         if reason is not None:
@@ -180,7 +234,7 @@ class ControllerGate:
             selected = fallback
             if previous_controller is ControllerKind.LEARNED_MPC:
                 selected = self._prevent_transition_drop(fallback)
-            return self._remember(selected, reason, previous_controller)
+            return self._remember(selected, reason, previous_controller, learned)
 
         assert learned.proposal is not None
         if previous_controller is not ControllerKind.LEARNED_MPC:
@@ -194,11 +248,11 @@ class ControllerGate:
                         f"healthy_for_ms={elapsed_ms}; required_ms={self._policy.recovery_hold_ms}"
                     ),
                 )
-                return self._remember(fallback, reason, previous_controller)
+                return self._remember(fallback, reason, previous_controller, learned)
 
-        selected = self._apply_authority(learned.proposal, fallback)
+        selected, limits = self._apply_authority(learned.proposal, fallback)
         self._healthy_since_mono_ms = None
-        return self._remember(selected, None, previous_controller)
+        return self._remember(selected, None, previous_controller, learned, limits)
 
     def _unhealthy_reason(
         self,
@@ -267,17 +321,48 @@ class ControllerGate:
         self,
         learned: ControllerProposal,
         fallback: ControllerProposal,
-    ) -> ControllerProposal:
+    ) -> tuple[ControllerProposal, tuple[AuthorityLimitSource, ...]]:
+        """stage の帯と MEDIUM の帯を重ね、最も狭い範囲に収める（決定記録 0050 §2.4）。"""
         stage = self._policy.authority_stage
-        if stage is AuthorityStage.FULL:
-            return learned
-        limit = (
-            self._policy.authority_limits.limited
-            if stage is AuthorityStage.LIMITED
-            else self._policy.authority_limits.expanded
+        assert learned.confidence is not None and learned.ood is not None
+        level = classify_confidence(
+            self._policy, confidence=learned.confidence, ood=learned.ood, stage=stage
         )
-        requests = {zone: self._limited_request(zone, learned, fallback, limit) for zone in Zone}
-        return learned.model_copy(
+        bands: list[_Band] = []
+        permitted_zones = frozenset(Zone)
+        if stage is not AuthorityStage.FULL:
+            limit = (
+                self._policy.authority_limits.limited
+                if stage is AuthorityStage.LIMITED
+                else self._policy.authority_limits.expanded
+            )
+            bands.append(
+                _Band(
+                    source=AuthorityLimitSource.STAGE_BAND,
+                    limit_up=limit.limit_up,
+                    limit_down=limit.limit_down,
+                )
+            )
+            permitted_zones = limit.permitted_zones
+        if level is ConfidenceLevel.MEDIUM:
+            medium = self._policy.model_confidence.medium_limit
+            bands.append(
+                _Band(
+                    source=AuthorityLimitSource.MEDIUM_CONFIDENCE_BAND,
+                    limit_up=medium.limit_up.value,
+                    limit_down=medium.limit_down.value,
+                )
+            )
+        limits = tuple(band.source for band in bands)
+        if permitted_zones != frozenset(Zone):
+            limits += (AuthorityLimitSource.STAGE_ZONE,)
+        if not bands and permitted_zones == frozenset(Zone):
+            return learned, limits
+        requests = {
+            zone: self._limited_request(zone, learned, fallback, tuple(bands), permitted_zones)
+            for zone in Zone
+        }
+        limited = learned.model_copy(
             update={
                 "requested": PerZone(
                     front=requests[Zone.FRONT],
@@ -286,17 +371,19 @@ class ControllerGate:
                 )
             }
         )
+        return limited, limits
 
     @staticmethod
     def _limited_request(
         zone: Zone,
         learned: ControllerProposal,
         fallback: ControllerProposal,
-        limit: AuthorityLimit,
+        bands: tuple[_Band, ...],
+        permitted_zones: frozenset[Zone],
     ) -> ZoneRequest:
         baseline = fallback.requested.get(zone).demand
         candidate = learned.requested.get(zone)
-        if zone not in limit.permitted_zones:
+        if zone not in permitted_zones:
             return ZoneRequest(
                 demand=baseline,
                 reason=Reason(
@@ -304,18 +391,20 @@ class ControllerGate:
                     detail=f"zone={zone.value}; stage does not permit Learned MPC",
                 ),
             )
-        lower = max(0.0, baseline - limit.limit_down)
-        upper = min(1.0, baseline + limit.limit_up)
+        # どの帯も Fallback の値を含むので、重ねた範囲は空にならない。
+        lower = max(0.0, *(baseline - band.limit_down for band in bands))
+        upper = min(1.0, *(baseline + band.limit_up for band in bands))
         bounded = min(max(candidate.demand, lower), upper)
         if bounded == candidate.demand:
             return candidate
+        sources = ",".join(band.source.value for band in bands)
         return ZoneRequest(
             demand=bounded,
             reason=Reason(
                 code="authority_bounded",
                 detail=(
                     f"zone={zone.value}; candidate={candidate.demand:.6f}; "
-                    f"lower={lower:.6f}; upper={upper:.6f}"
+                    f"lower={lower:.6f}; upper={upper:.6f}; limits={sources}"
                 ),
             ),
         )
@@ -351,11 +440,38 @@ class ControllerGate:
             }
         )
 
+    def _model_gate(
+        self,
+        learned: LearnedControlStatus,
+        selected: ControllerProposal,
+        limits: tuple[AuthorityLimitSource, ...],
+    ) -> ModelGateDecision | None:
+        proposal = learned.proposal
+        if proposal is None:
+            return None
+        assert proposal.model_version is not None
+        assert proposal.confidence is not None and proposal.ood is not None
+        stage = self._policy.authority_stage
+        return ModelGateDecision(
+            model_version=proposal.model_version,
+            confidence=proposal.confidence,
+            ood=proposal.ood,
+            confidence_level=classify_confidence(
+                self._policy, confidence=proposal.confidence, ood=proposal.ood, stage=stage
+            ),
+            authority_stage=stage,
+            learned_selected=selected.controller is ControllerKind.LEARNED_MPC,
+            limits=limits,
+            assessment=learned.confidence_reasons,
+        )
+
     def _remember(
         self,
         proposal: ControllerProposal,
         fallback_reason: Reason | None,
         previous_controller: ControllerKind | None,
+        learned: LearnedControlStatus,
+        limits: tuple[AuthorityLimitSource, ...] = (),
     ) -> ControllerSelection:
         assert self._last_mono_ms is not None
         if (
@@ -380,6 +496,7 @@ class ControllerGate:
             fallback_transitions_in_window=transition_count,
             # #92 がこのsignalを受けてSHADOW降格を永続化する。Gateは設定を変更しない。
             demotion_recommended=transition_count >= self._policy.demote_after,
+            model_gate=self._model_gate(learned, proposal, limits),
         )
 
     def _check_inputs(

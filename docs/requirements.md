@@ -613,7 +613,7 @@ Kaggle・研究でGPUを使う際は `--gpu-memory-utilization` による制限�
 | Q-20 | T_SENSOR の閾値の具体値 | GitHub #50 / #78 |
 | Q-21 | Learned Thermal Model の方式・履歴 window・予測 horizon | GitHub #83 / #84 |
 | Q-22 | MPC / Supervisor の周期、MPC 目的関数の重み | GitHub #86 / #88 / #103 |
-| Q-23 | Confidence / OOD の方式、Authority 昇格ゲートの閾値 | GitHub #85 / #92 |
+| Q-23 | Confidence / OOD の方式、Authority 昇格ゲートの閾値 | GitHub #85 / #92（方式は決定記録 0050 で提案中。閾値は未決） |
 | Q-24 | Air Balance の最適な帯 | GitHub #81 |
 | Q-25 | 本番でオンライン学習を行うか | GitHub #93 / #104 |
 | Q-26 | 音響センサーのハードウェア | GitHub #95 |

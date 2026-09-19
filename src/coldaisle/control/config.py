@@ -26,8 +26,8 @@ from coldaisle.control.schema import (
 )
 from coldaisle.store.models import validate_metric
 
-CONTROL_CONFIG_VERSION: Literal[5] = 5
-FAN_POLICY_CONFIG_VERSION: Literal[5] = 5
+CONTROL_CONFIG_VERSION: Literal[6] = 6
+FAN_POLICY_CONFIG_VERSION: Literal[6] = 6
 SAFETY_CONFIG_VERSION: Literal[2] = 2
 CONFIG_FILENAMES = {
     "fan_hardware": "fan-hardware.yaml",
@@ -453,6 +453,61 @@ class AuthorityLimits(_ConfigModel):
     expanded: AuthorityLimit
 
 
+PositiveCount = Annotated[int, Field(gt=0)]
+NonNegativeFiniteFloat = Annotated[float, Field(ge=0.0, allow_inf_nan=False)]
+NonNegativeMilliseconds = Annotated[int, Field(ge=0)]
+DriftRatio = Annotated[float, Field(gt=1.0, allow_inf_nan=False)]
+
+
+class ConfidenceAuthorityBand(_ConfigModel):
+    """MEDIUM confidence で Learned MPC に許す Fallback 中心の帯（決定記録 0050 §2.4）。
+
+    ``limit_down`` は「Fallback からどこまで下げてよいか」なので、最低 demand の制限を兼ねる。
+    """
+
+    limit_up: PolicyDemand
+    limit_down: PolicyDemand
+
+
+class ModelConfidencePolicy(_ConfigModel):
+    """Model Confidence / OOD の判定閾値と MEDIUM の authority 帯（#85 / 決定記録 0050）。
+
+    値はすべて実データの評価前の暫定値として扱い、コードに既定値を置かない。
+    """
+
+    high_min_confidence: PolicyUnitInterval
+    """これ以上を HIGH とする。MEDIUM の下限は stage ごとの ``gate_min_confidence``。"""
+    medium_limit: ConfidenceAuthorityBand
+    range_margin: ConfigValue[NonNegativeFiniteFloat]
+    """学習範囲の幅に対する、範囲外へのはみ出しの許容比。超えたら OOD。"""
+    min_support_count: ConfigValue[PositiveCount]
+    """support cell（室温・Power・Fan state の組）の学習件数がこれ未満なら OOD。"""
+    full_support_count: ConfigValue[PositiveCount]
+    """support cell の件数がこれ以上なら support の score を満値にする。"""
+    min_missing_pattern_count: ConfigValue[PositiveCount]
+    """欠測の組み合わせの学習件数がこれ未満なら OOD。"""
+    residual_window: ConfigValue[PositiveCount]
+    """residual drift を見る直近の照合済み予測の件数。"""
+    residual_min_samples: ConfigValue[PositiveCount]
+    """residual drift を評価に使う最低件数。未満の間は ``cap_before_residual_evidence``。"""
+    residual_match_tolerance_ms: ConfigValue[NonNegativeMilliseconds]
+    """予測時刻と観測時刻の照合の許容幅。"""
+    residual_drift_ood_ratio: ConfigValue[DriftRatio]
+    """正規化 residual の RMS が validation 基準のこの倍率以上なら OOD。"""
+    cap_without_uncertainty: PolicyUnitInterval
+    """モデルが uncertainty を出さないときの confidence の上限。"""
+    cap_before_residual_evidence: PolicyUnitInterval
+    """residual の照合件数が足りない間の confidence の上限。"""
+
+    @model_validator(mode="after")
+    def _counts_are_ordered(self) -> Self:
+        if self.full_support_count.value < self.min_support_count.value:
+            raise ValueError("model_confidence.full_support_count は min_support_count 以上にする")
+        if self.residual_min_samples.value > self.residual_window.value:
+            raise ValueError("model_confidence.residual_min_samples は residual_window 以下にする")
+        return self
+
+
 class MpcTiming(_ConfigModel):
     period_ms: PositiveMilliseconds
     budget_ms: PositiveMilliseconds
@@ -670,7 +725,7 @@ class WorkloadRegimeConfig(_ConfigModel):
 
 
 class FanPolicyConfig(_ConfigModel):
-    schema_version: Literal[5]
+    schema_version: Literal[6]
     fallback_curve: Annotated[
         tuple[FallbackPoint, ...], BeforeValidator(_yaml_sequence_to_tuple), Field(min_length=2)
     ]
@@ -682,6 +737,7 @@ class FanPolicyConfig(_ConfigModel):
     supervisor: SupervisorConfig
     workload_regime: WorkloadRegimeConfig
     gate_min_confidence: GateConfidenceThresholds
+    model_confidence: ModelConfidencePolicy
     authority_stage: Annotated[AuthorityStage, BeforeValidator(_yaml_authority_stage)]
     authority_limits: AuthorityLimits
     recovery_hold_ms: PositiveMilliseconds
@@ -699,6 +755,12 @@ class FanPolicyConfig(_ConfigModel):
                 raise ValueError("fallback_curve の demand は下げない")
             previous_temperature = point.temperature_c
             previous_demand = point.demand
+        if self.model_confidence.high_min_confidence.value < self.gate_min_confidence.full.value:
+            # HIGH の下限が stage の最低 confidence より低いと、MEDIUM を経ずに
+            # Fallback 境界の直上で帯なしの authority を得てしまう。
+            raise ValueError(
+                "model_confidence.high_min_confidence は gate_min_confidence.full 以上にする"
+            )
         return self
 
 
@@ -907,6 +969,31 @@ class ControlConfig(_ConfigModel):
                 f"gate_min_confidence.{stage}",
                 getattr(self.policy.gate_min_confidence, stage),
             )
+        confidence = self.policy.model_confidence
+        for name in (
+            "high_min_confidence",
+            "range_margin",
+            "min_support_count",
+            "full_support_count",
+            "min_missing_pattern_count",
+            "residual_window",
+            "residual_min_samples",
+            "residual_match_tolerance_ms",
+            "residual_drift_ood_ratio",
+            "cap_without_uncertainty",
+            "cap_before_residual_evidence",
+        ):
+            append("fan-policy.yaml", f"model_confidence.{name}", getattr(confidence, name))
+        append(
+            "fan-policy.yaml",
+            "model_confidence.medium_limit.limit_up",
+            confidence.medium_limit.limit_up,
+        )
+        append(
+            "fan-policy.yaml",
+            "model_confidence.medium_limit.limit_down",
+            confidence.medium_limit.limit_down,
+        )
         return tuple(values)
 
     @property
