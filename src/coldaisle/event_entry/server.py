@@ -136,18 +136,60 @@ def _acquire_lock(path: Path) -> int:
     return fd
 
 
-def _prepare_parent(parent: Path) -> None:
-    """ソケットの親ディレクトリを作り、他人に差し替えられないことを確かめる。"""
-    if not parent.exists():
+def _prepare_parent(parent: Path, group_gid: int | None) -> None:
+    """ソケットの親ディレクトリを作り、他人に差し替えられないことを確かめる。
+
+    `socket.group` が決まっているときは、**そのグループが親までたどれること**も確かめる。
+    ソケットを 0660 + グループにしても、途中のディレクトリを通れなければ書き手は
+    EACCES で接続できない。作るディレクトリは 0750 のままグループだけを合わせ、
+    既にあるディレクトリの権限は広げない（足りなければ止まって直し方を示す）。
+    """
+    missing: list[Path] = []
+    cursor = parent
+    while not cursor.exists():
+        missing.append(cursor)
+        cursor = cursor.parent
+    for directory in reversed(missing):
+        # parents=True は途中のディレクトリを umask のまま作る。1段ずつ作って揃える
         with _umask(0o077):
-            parent.mkdir(parents=True, mode=PARENT_DIR_MODE)
-        os.chmod(parent, PARENT_DIR_MODE)
+            directory.mkdir(mode=PARENT_DIR_MODE)
+        os.chmod(directory, PARENT_DIR_MODE)
+        if group_gid is not None:
+            try:
+                os.chown(directory, -1, group_gid)
+            except OSError as exc:
+                raise EntryStartupError(
+                    f"作ったディレクトリのグループを socket.group に変えられない: {directory}"
+                    "（coldaisle-eventd の実行ユーザーがそのグループに属している必要がある）"
+                ) from exc
     parent_mode = os.stat(parent).st_mode
     if not stat.S_ISDIR(parent_mode):
         raise EntryStartupError(f"ソケットの親がディレクトリではない: {parent}")
     if parent_mode & stat.S_IWOTH:
         # other が書けるディレクトリでは、他人がソケットを消して差し替えられる
         raise EntryStartupError(f"ソケットの親ディレクトリを other が書ける: {parent}")
+    if group_gid is not None:
+        _check_group_can_traverse(parent, group_gid)
+
+
+def _check_group_can_traverse(parent: Path, group_gid: int) -> None:
+    """`socket.group` の利用者が親ディレクトリまでたどれることを確かめる。
+
+    ルートから親までのどのディレクトリも「グループが一致して g+x」か「o+x」でなければ
+    ならない。満たさなければ起動しない（書き手が EACCES になるだけの状態で待ち受けない）。
+    """
+    absolute = parent.absolute()
+    for directory in (absolute, *absolute.parents):
+        st = os.stat(directory)
+        if st.st_mode & stat.S_IXOTH:
+            continue
+        if st.st_gid == group_gid and st.st_mode & stat.S_IXGRP:
+            continue
+        raise EntryStartupError(
+            f"socket.group の利用者がソケットの親までたどれない: {directory}"
+            "（このディレクトリのグループを socket.group にして g+x を付けるか、"
+            "o+x を付ける必要がある）"
+        )
 
 
 def _prepare_path(path: Path) -> None:
@@ -239,7 +281,7 @@ class EventEntryServer:
 
     def bind(self) -> None:
         """ソケットを作り、権限を設定して待ち受けを始める。"""
-        _prepare_parent(self._path.parent)
+        _prepare_parent(self._path.parent, self._authorizer.group_gid)
         lock_fd = _acquire_lock(self._path)
         try:
             self._bind_locked()

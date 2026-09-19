@@ -14,6 +14,7 @@ from __future__ import annotations
 import ast
 import errno
 import fcntl
+import grp
 import json
 import os
 import re
@@ -444,6 +445,80 @@ def test_refuses_a_world_writable_parent(short_dir, db, rules):
     os.chmod(parent, 0o777)
     with pytest.raises(EntryStartupError, match="other"):
         RunningServer(settings_for(parent / "events.sock"), db, rules)
+
+
+def settings_with_group(path: Path) -> EventEntrySettings:
+    """`socket.group` を自分の主グループにする（自分が属していることが確実なグループ）。"""
+    base = settings_for(path)
+    group = grp.getgrgid(os.getgid()).gr_name
+    return base.model_copy(update={"socket": base.socket.model_copy(update={"group": group})})
+
+
+@needs_peercred
+def test_created_parents_get_the_socket_group(short_dir, db, rules, monkeypatch):
+    """作った親ディレクトリは 0750 のまま socket.group にする（#141 のレビュー）。
+
+    主グループのままだと、書き手のグループがたどれず EACCES になる。
+    """
+    os.chmod(short_dir, 0o711)  # テストの外側は other が通れるだけ
+    parent = short_dir / "a" / "b"
+    chowned: list[tuple[str, int]] = []
+    real_chown = os.chown
+
+    def recording_chown(target: str | os.PathLike[str], uid: int, gid: int) -> None:
+        chowned.append((str(target), gid))
+        real_chown(target, uid, gid)
+
+    monkeypatch.setattr(event_server.os, "chown", recording_chown)
+    entry = RunningServer(settings_with_group(parent / "events.sock"), db, rules)
+    try:
+        for directory in (short_dir / "a", parent):
+            st = os.stat(directory)
+            assert stat.S_IMODE(st.st_mode) == 0o750
+            assert st.st_gid == os.getgid()
+            assert (str(directory), os.getgid()) in chowned
+    finally:
+        entry.stop()
+
+
+@needs_peercred
+def test_parent_chown_failure_is_reported(short_dir, db, rules, monkeypatch):
+    os.chmod(short_dir, 0o711)
+
+    def failing_chown(target: object, uid: int, gid: int) -> None:
+        raise PermissionError("not a member")
+
+    monkeypatch.setattr(event_server.os, "chown", failing_chown)
+    with pytest.raises(EntryStartupError, match="に変えられない"):
+        RunningServer(settings_with_group(short_dir / "new" / "events.sock"), db, rules)
+
+
+@needs_peercred
+def test_existing_parent_must_be_traversable_by_the_group(short_dir, db, rules):
+    """既存の親は広げずに確かめ、たどれなければ直し方を示して止まる。"""
+    os.chmod(short_dir, 0o711)
+    parent = short_dir / "run"
+    parent.mkdir(mode=0o700)
+    os.chmod(parent, 0o700)
+    settings = settings_with_group(parent / "events.sock")
+    with pytest.raises(EntryStartupError, match="たどれない") as excinfo:
+        RunningServer(settings, db, rules)
+    assert "g+x" in str(excinfo.value)
+    assert stat.S_IMODE(os.stat(parent).st_mode) == 0o700, "既存の権限を勝手に広げない"
+    assert not (parent / "events.sock").exists()
+
+    os.chmod(parent, 0o750)  # グループが一致して g+x
+    RunningServer(settings, db, rules).stop()
+
+
+@needs_peercred
+def test_group_traversal_checks_every_ancestor(short_dir, db, rules):
+    os.chmod(short_dir, 0o700)  # 親は通れても、その上で止まる
+    parent = short_dir / "run"
+    parent.mkdir()
+    os.chmod(parent, 0o750)
+    with pytest.raises(EntryStartupError, match="たどれない"):
+        RunningServer(settings_with_group(parent / "events.sock"), db, rules)
 
 
 @needs_peercred
