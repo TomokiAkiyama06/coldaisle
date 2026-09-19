@@ -139,6 +139,22 @@ def _prepare_path(path: Path) -> None:
     raise EntryStartupError(f"別の coldaisle-eventd が待ち受けている: {path}")
 
 
+def _identity(st: os.stat_result) -> tuple[int, int]:
+    return (st.st_dev, st.st_ino)
+
+
+def _unlink_if_same(path: Path, bound: tuple[int, int] | None) -> None:
+    """`bound` と同じファイルがまだ `path` にある場合だけ消す。
+
+    自分が作っていない（`bound is None`）か、別のものに置き換わっていれば触らない。
+    """
+    if bound is None:
+        return
+    with contextlib.suppress(FileNotFoundError):
+        if _identity(os.lstat(path)) == bound:
+            path.unlink()
+
+
 class EventEntryServer:
     """ソケットで待ち受け、検証済みのイベントを `events` へ追記する。"""
 
@@ -172,7 +188,8 @@ class EventEntryServer:
         )
         self._path = settings.socket.path
         self._listener: socket.socket | None = None
-        self._inode: int | None = None
+        # 自分が bind したソケットの (st_dev, st_ino)。消してよいのはこれと一致するものだけ
+        self._bound: tuple[int, int] | None = None
         self._stop = False
         self.accepted = 0
         self.rejected = 0
@@ -185,10 +202,13 @@ class EventEntryServer:
         """ソケットを作り、権限を設定して待ち受けを始める。"""
         _prepare_path(self._path)
         listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        bound: tuple[int, int] | None = None
         try:
             # 作った瞬間から所有者以外に開かない。権限は直後に設定値へ広げる
             with _umask(0o177):
                 listener.bind(str(self._path))
+            # bind に成功した直後に同一性を控える。失敗時の後始末はこれと一致するものだけ消す
+            bound = _identity(os.lstat(self._path))
             if self._authorizer.group_gid is not None:
                 os.chown(self._path, -1, self._authorizer.group_gid)
             os.chmod(self._path, self._settings.socket.mode_bits)
@@ -196,10 +216,12 @@ class EventEntryServer:
             listener.settimeout(ACCEPT_POLL_S)
         except BaseException:
             listener.close()
-            self._path.unlink(missing_ok=True)
+            # bind で負けた（EADDRINUSE 等）場合、そこにあるのは同時に起動した
+            # 別プロセスのソケット。自分が作ったものでなければ消さない
+            _unlink_if_same(self._path, bound)
             raise
         self._listener = listener
-        self._inode = os.lstat(self._path).st_ino
+        self._bound = bound
         LOGGER.info(
             "書き込み入口で待ち受ける",
             extra={
@@ -235,10 +257,8 @@ class EventEntryServer:
         if self._listener is not None:
             self._listener.close()
             self._listener = None
-        with contextlib.suppress(FileNotFoundError):
-            if self._inode is not None and os.lstat(self._path).st_ino == self._inode:
-                self._path.unlink()
-        self._inode = None
+        _unlink_if_same(self._path, self._bound)
+        self._bound = None
 
     def handle(self, conn: socket.socket) -> None:
         """1接続を処理する。**1接続の失敗で入口を落とさない**（ログして継続）。"""

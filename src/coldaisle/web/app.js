@@ -475,19 +475,24 @@ async function loadHistory() {
   // 適用済みより新しく、かつ**いま選ばれている期間**の応答だけを使う。
   // 期間が違う応答は、番号が新しくても画面と食い違う
   const usable = () => seq > historyAppliedSeq && range === currentRange;
-  // 注釈が取れなくてもグラフは描く。注釈は補助であり、無いことで履歴を隠さない
+  // 注釈が取れなくてもグラフは描く。注釈は補助であり、無いことで履歴を隠さない。
+  // ただし**失敗は失敗として残す。** 空の一覧に読み替えるだけでは「切り替えが無かった」と
+  // 見分けがつかない
   const loadEvents = (signal) =>
     fetchJson("/api/v1/events", { window: range.window, kind: "gpu_mode" }, signal)
-      .then((body) => body.events)
-      .catch(() => []);
+      .then((body) => ({ events: body.events, error: null }))
+      .catch((error) => ({ events: [], error }));
 
   try {
-    const [tempSeries, humiditySeries, events] = await withTimeout(HISTORY_TIMEOUT_MS, (signal) =>
+    const [tempSeries, humiditySeries, eventResult] = await withTimeout(HISTORY_TIMEOUT_MS, (signal) =>
       Promise.all([load(temps, signal), load(humidity, signal), loadEvents(signal)])
     );
     if (!usable()) return;
     historyAppliedSeq = seq;
-    lastSeries = { temp: tempSeries, humidity: humiditySeries, events };
+    lastSeries = { temp: tempSeries, humidity: humiditySeries, events: eventResult.events };
+    eventsNote = eventResult.error
+      ? `GPU Mode の記録を取得できませんでした: ${eventResult.error.message}`
+      : "";
     drawCharts();
     const used = tempSeries[0] || humiditySeries[0];
     historyNote = used
@@ -505,9 +510,11 @@ async function loadHistory() {
 // 表示名が取れたあとも「表示名を取得できません」が次の履歴更新（60秒）まで残る
 let historyNote = "";
 let catalogNote = "";
+// GPU Mode の注釈の取得失敗。**描いたグラフと同じ応答で決める**（成功したら消す）
+let eventsNote = "";
 
 function renderNote() {
-  document.getElementById("chart-note").textContent = [historyNote, catalogNote]
+  document.getElementById("chart-note").textContent = [historyNote, eventsNote, catalogNote]
     .filter(Boolean)
     .join(" / ");
 }

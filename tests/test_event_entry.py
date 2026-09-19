@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import ast
+import errno
 import json
 import os
 import re
@@ -457,6 +458,33 @@ def test_does_not_delete_a_non_socket_file(short_dir, db, rules):
 def test_refuses_to_start_twice(running, db, rules):
     with pytest.raises(EntryStartupError, match="別の"):
         RunningServer(running.settings, db, rules)
+
+
+@needs_peercred
+def test_losing_a_concurrent_start_leaves_the_winner_socket(running, db, rules, monkeypatch):
+    """同時起動で両方が `_prepare_path()` を通り、負けた側が EADDRINUSE になる場合。"""
+    path = running.settings.socket.path
+    before = os.lstat(path)
+    monkeypatch.setattr(event_server, "_prepare_path", lambda _path: None)
+    with pytest.raises(OSError) as excinfo:
+        RunningServer(running.settings, db, rules)
+    assert excinfo.value.errno == errno.EADDRINUSE
+    after = os.lstat(path)
+    assert (after.st_dev, after.st_ino) == (before.st_dev, before.st_ino)
+    assert running.send(encode_gpu_mode("ai"))["ok"] is True
+
+
+@needs_peercred
+def test_failure_after_bind_removes_only_its_own_socket(short_dir, db, rules, monkeypatch):
+    path = short_dir / "events.sock"
+
+    def failing_chmod(target: object, mode: int) -> None:
+        raise PermissionError("chmod failed")
+
+    monkeypatch.setattr(event_server.os, "chmod", failing_chmod)
+    with pytest.raises(PermissionError):
+        RunningServer(settings_for(path), db, rules)
+    assert not path.exists()
 
 
 @needs_peercred

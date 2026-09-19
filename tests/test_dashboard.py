@@ -473,6 +473,28 @@ def test_the_catalog_note_clears_on_its_own():
     assert script.count('getElementById("chart-note")') == 1, "注記欄に書くのは renderNote だけ"
 
 
+def test_an_events_failure_is_shown_apart_from_no_transitions():
+    """注釈の取得に失敗しても履歴は描くが、失敗は注記に残す（#141 のレビュー）。
+
+    空の一覧に読み替えるだけでは「GPU Mode の切り替えが無かった」と見分けがつかない。
+    """
+    script = SCRIPT.read_text(encoding="utf-8")
+    history = script[script.index("async function loadHistory()") :]
+    history = history[: history.index("\n}\n")]
+    events = history[history.index("const loadEvents") :]
+    events = events[: events.index(";\n")]
+    assert ".catch(() => [])" not in events, "失敗を黙って空の一覧にしない"
+    assert "error" in events
+    assert "GPU Mode の記録を取得できませんでした" in history
+    assert "eventsNote = eventResult.error" in history
+    note = script[script.index("function renderNote()") :]
+    note = note[: note.index("\n}\n")]
+    assert "eventsNote" in note, "注釈の失敗も注記欄に出す"
+    load = script[script.index("async function loadCatalog()") :]
+    load = load[: load.index("\n}\n")]
+    assert "eventsNote" not in load, "表示名の側から注釈の注記を消さない"
+
+
 # ---------------------------------------------------------------- 遅れて返る応答（#48 のレビュー）
 
 
