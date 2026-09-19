@@ -56,8 +56,12 @@ PARENT_DIR_MODE = 0o750
 ACCEPT_POLL_S = 0.5
 """停止要求を確かめる間隔。待ち受けをこの間隔で起こす。"""
 
-_PEERCRED = struct.Struct("3i")
-"""`struct ucred { pid_t pid; uid_t uid; gid_t gid; }`（Linux）。"""
+_PEERCRED = struct.Struct("iII")
+"""`struct ucred { pid_t pid; uid_t uid; gid_t gid; }`（Linux）。
+
+pid_t は符号付き、uid_t / gid_t は符号なし。`i` で読むと 2**31 以上の uid が負になり、
+認可の比較を誤る。
+"""
 
 
 class EntryStartupError(RuntimeError):
@@ -178,8 +182,10 @@ def _check_group_can_traverse(parent: Path, group_gid: int) -> None:
     ルートから親までのどのディレクトリも「グループが一致して g+x」か「o+x」でなければ
     ならない。満たさなければ起動しない（書き手が EACCES になるだけの状態で待ち受けない）。
     """
-    absolute = parent.absolute()
-    for directory in (absolute, *absolute.parents):
+    # 字面のパスではなく実体をたどる。シンボリックリンクがあると、書き手が実際に
+    # 通るのはリンク先の祖先で、字面の祖先を見ても EACCES を見逃す
+    physical = Path(os.path.realpath(parent))
+    for directory in (physical, *physical.parents):
         st = os.stat(directory)
         if st.st_mode & stat.S_IXOTH:
             continue

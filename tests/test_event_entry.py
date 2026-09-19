@@ -22,6 +22,7 @@ import shutil
 import socket
 import sqlite3
 import stat
+import struct
 import subprocess
 import sys
 import tempfile
@@ -418,6 +419,21 @@ def test_same_user_is_rejected_when_not_allowed(short_dir, db, rules):
         entry.stop()
 
 
+@needs_peercred
+def test_peer_credentials_decode_uid_as_unsigned():
+    """uid_t / gid_t は符号なし。2**31 以上の uid を負に読まない（#141 のレビュー）。"""
+    big_uid = 2**32 - 2
+    raw = struct.pack("iII", -1, big_uid, 2**31 + 5)
+
+    class FakeConn:
+        def getsockopt(self, level: int, option: int, size: int) -> bytes:
+            assert (level, option) == (socket.SOL_SOCKET, socket.SO_PEERCRED)
+            assert size == len(raw)
+            return raw
+
+    assert event_server.peer_uid(FakeConn()) == big_uid  # type: ignore[arg-type]
+
+
 def test_group_membership_authorizes_other_users():
     """グループの判定は主グループと補助グループの両方を見る。root を暗黙に認めない。"""
     import grp
@@ -519,6 +535,27 @@ def test_group_traversal_checks_every_ancestor(short_dir, db, rules):
     os.chmod(parent, 0o750)
     with pytest.raises(EntryStartupError, match="たどれない"):
         RunningServer(settings_with_group(parent / "events.sock"), db, rules)
+
+
+@needs_peercred
+def test_group_traversal_follows_symlinks_to_the_real_ancestors(short_dir, db, rules):
+    """字面の祖先ではなく、リンク先の祖先を確かめる（#141 のレビュー）。"""
+    os.chmod(short_dir, 0o711)
+    hidden = short_dir / "hidden"
+    hidden.mkdir()
+    os.chmod(hidden, 0o700)  # グループも other も通れない
+    real = hidden / "run"
+    real.mkdir()
+    os.chmod(real, 0o750)
+    link = short_dir / "link"
+    link.symlink_to(real, target_is_directory=True)
+    settings = settings_with_group(link / "events.sock")
+    with pytest.raises(EntryStartupError, match="たどれない") as excinfo:
+        RunningServer(settings, db, rules)
+    assert str(hidden) in str(excinfo.value)
+
+    os.chmod(hidden, 0o711)
+    RunningServer(settings, db, rules).stop()
 
 
 @needs_peercred
