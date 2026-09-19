@@ -538,49 +538,42 @@ def test_group_traversal_checks_every_ancestor(short_dir, db, rules):
 
 
 @needs_peercred
-def test_group_traversal_follows_symlinks_to_the_real_ancestors(short_dir, db, rules):
-    """字面の祖先ではなく、リンク先の祖先を確かめる（#141 のレビュー）。"""
+def test_symlinked_parent_is_rejected_when_a_group_is_set(short_dir, db, rules):
+    """socket.group を指定したら、親がリンクなら止まる（#141 のレビュー）。
+
+    多段のリンクを経由すると、書き手が通るディレクトリを確かめきれない。
+    リンクを追わず、実体のパスを設定させる。
+    """
     os.chmod(short_dir, 0o711)
-    hidden = short_dir / "hidden"
-    hidden.mkdir()
-    os.chmod(hidden, 0o700)  # グループも other も通れない
-    real = hidden / "run"
+    real = short_dir / "run"
     real.mkdir()
     os.chmod(real, 0o750)
     link = short_dir / "link"
     link.symlink_to(real, target_is_directory=True)
-    settings = settings_with_group(link / "events.sock")
-    with pytest.raises(EntryStartupError, match="たどれない") as excinfo:
-        RunningServer(settings, db, rules)
-    assert str(hidden) in str(excinfo.value)
+    with pytest.raises(EntryStartupError, match="シンボリックリンク") as excinfo:
+        RunningServer(settings_with_group(link / "events.sock"), db, rules)
+    assert str(link) in str(excinfo.value)
+    assert "実体のパス" in str(excinfo.value)
+    assert not (real / "events.sock").exists()
 
-    os.chmod(hidden, 0o711)
-    RunningServer(settings, db, rules).stop()
+    RunningServer(settings_with_group(real / "events.sock"), db, rules).stop()
+    # グループを指定しない開発用の設定は、従来どおりリンクを通してよい
+    RunningServer(settings_for(link / "events.sock"), db, rules).stop()
 
 
 @needs_peercred
-def test_group_traversal_also_checks_the_path_as_written(short_dir, db, rules):
-    """リンク先が通れても、字面の途中が通れなければ止まる（#141 のレビュー）。
-
-    書き手は設定どおりの字面のパスで接続するため、リンクを置いたディレクトリも通る。
-    """
+def test_symlink_in_an_ancestor_is_rejected_before_creating_anything(short_dir, db, rules):
+    """途中の祖先がリンクでも止まり、リンク先にディレクトリを作らない。"""
     os.chmod(short_dir, 0o711)
-    real = short_dir / "open" / "run"
-    real.mkdir(parents=True)
-    os.chmod(short_dir / "open", 0o711)
-    os.chmod(real, 0o750)
-    blocked = short_dir / "blocked"
-    blocked.mkdir()
-    os.chmod(blocked, 0o700)  # グループも other も通れない
-    link = blocked / "link"
+    real = short_dir / "real"
+    real.mkdir()
+    os.chmod(real, 0o711)
+    link = short_dir / "link"
     link.symlink_to(real, target_is_directory=True)
-    settings = settings_with_group(link / "events.sock")
-    with pytest.raises(EntryStartupError, match="たどれない") as excinfo:
-        RunningServer(settings, db, rules)
-    assert str(blocked) in str(excinfo.value)
-
-    os.chmod(blocked, 0o711)
-    RunningServer(settings, db, rules).stop()
+    with pytest.raises(EntryStartupError, match="シンボリックリンク") as excinfo:
+        RunningServer(settings_with_group(link / "new" / "events.sock"), db, rules)
+    assert str(link) in str(excinfo.value)
+    assert not (real / "new").exists()
 
 
 @needs_peercred

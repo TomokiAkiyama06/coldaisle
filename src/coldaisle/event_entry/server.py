@@ -148,6 +148,9 @@ def _prepare_parent(parent: Path, group_gid: int | None) -> None:
     EACCES で接続できない。作るディレクトリは 0750 のままグループだけを合わせ、
     既にあるディレクトリの権限は広げない（足りなければ止まって直し方を示す）。
     """
+    if group_gid is not None:
+        # 作る前に確かめる。リンク先に勝手にディレクトリを作らない
+        _reject_symlink_components(parent)
     missing: list[Path] = []
     cursor = parent
     while not cursor.exists():
@@ -176,20 +179,42 @@ def _prepare_parent(parent: Path, group_gid: int | None) -> None:
         _check_group_can_traverse(parent, group_gid)
 
 
+def _lexical_ancestors(parent: Path) -> tuple[Path, ...]:
+    """設定どおりの字面のパスで、親からルートまでのディレクトリ（書き手が通る順の逆）。"""
+    absolute = parent.absolute()
+    return (absolute, *absolute.parents)
+
+
+def _reject_symlink_components(parent: Path) -> None:
+    """親までの途中にシンボリックリンクがあれば起動しない。
+
+    リンク（や多段のリンク）を経由すると、書き手が実際に通るディレクトリが
+    字面からは決まらず、たどれるかを確かめきれない。追いかけずに**実体のパスを
+    設定させる**。まだ無い段（これから作る段）は対象外。
+    """
+    for component in _lexical_ancestors(parent):
+        try:
+            mode = os.lstat(component).st_mode
+        except FileNotFoundError:
+            continue
+        if stat.S_ISLNK(mode):
+            raise EntryStartupError(
+                f"ソケットの親までのパスにシンボリックリンクがある: {component}"
+                "（socket.group を指定するときは、リンクを含まない実体のパスを "
+                "socket.path に設定する必要がある）"
+            )
+
+
 def _check_group_can_traverse(parent: Path, group_gid: int) -> None:
     """`socket.group` の利用者が親ディレクトリまでたどれることを確かめる。
 
     ルートから親までのどのディレクトリも「グループが一致して g+x」か「o+x」でなければ
     ならない。満たさなければ起動しない（書き手が EACCES になるだけの状態で待ち受けない）。
+    途中にリンクが無いことは `_reject_symlink_components` で確かめてあるので、
+    字面の祖先だけを見れば足りる。
     """
-    # 字面の祖先と実体の祖先の**両方**を見る。書き手は設定どおりの字面のパスで
-    # 接続するので、途中のディレクトリをすべて通る必要がある。シンボリックリンクが
-    # あれば、さらにリンク先の祖先も通る。片方だけでは EACCES を見逃す
-    lexical = parent.absolute()
-    physical = Path(os.path.realpath(parent))
-    candidates = (lexical, *lexical.parents, physical, *physical.parents)
-    for directory in dict.fromkeys(candidates):  # 順序を保って重複を除く
-        st = os.stat(directory)
+    for directory in _lexical_ancestors(parent):
+        st = os.lstat(directory)
         if st.st_mode & stat.S_IXOTH:
             continue
         if st.st_gid == group_gid and st.st_mode & stat.S_IXGRP:
