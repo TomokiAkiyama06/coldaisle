@@ -62,6 +62,7 @@ from coldaisle.control.model.training import (
     verify_training_dataset_artifact,
 )
 from coldaisle.control.schema import (
+    MODEL_GATE_ASSESSMENT_COMPONENTS,
     AuthorityLimitSource,
     AuthorityStage,
     BoundBy,
@@ -848,7 +849,8 @@ def test_v5_trace_requires_consistent_model_gate_for_learned_ticks() -> None:
     with pytest.raises(ValidationError, match="揃える"):
         ControlTick.model_validate_json(json.dumps(payload))
 
-    reason = (Reason(code="model_binding", detail="score=1.000000"),)
+    reason = reasons(ConfidenceComponent.MODEL_BINDING)
+    plain = reasons()
     with pytest.raises(ValidationError, match="LOW"):
         ModelGateDecision(
             model_version="thermal-v1",
@@ -871,7 +873,7 @@ def test_v5_trace_requires_consistent_model_gate_for_learned_ticks() -> None:
             confidence_level=ConfidenceLevel.MEDIUM,
             authority_stage=AuthorityStage.FULL,
             learned_selected=True,
-            assessment=reason,
+            assessment=plain,
         )
 
 
@@ -1487,7 +1489,19 @@ def test_trace_rejects_recording_numbers_without_attestation() -> None:
 # trace は Gate の外（保存済み JSON の読み込み、将来の別実装）からも組み立てられる。
 # schema を最後の防波堤として、Gate が決して出さない組み合わせを型で拒む。
 
-REASONS = (Reason(code="model_binding", detail="score=1.000000"),)
+
+def reasons(*ood_components: ConfidenceComponent) -> tuple[Reason, ...]:
+    """Gate が書く形（構成要素ごとに1つ）の理由。指定した構成要素だけ OOD にする。"""
+    return tuple(
+        Reason(
+            code=(f"ood_{component.value}" if component in ood_components else component.value),
+            detail="score=1.000000",
+        )
+        for component in ConfidenceComponent
+    )
+
+
+REASONS = reasons()
 
 
 def gate_record(**changes: object) -> ModelGateDecision:
@@ -1525,7 +1539,12 @@ def gate_record(**changes: object) -> ModelGateDecision:
         ({"assessment": ()}, "assessment の理由が要る"),
         # OOD なのに confidence が 0 でない
         (
-            {"confidence": 0.5, "ood": True, "confidence_level": ConfidenceLevel.LOW},
+            {
+                "confidence": 0.5,
+                "ood": True,
+                "confidence_level": ConfidenceLevel.LOW,
+                "assessment": "ood_feature_range",
+            },
             "confidence は 0",
         ),
         # zone の制限だけが立っている（stage の帯なしには起きない）
@@ -1601,8 +1620,12 @@ def gate_record(**changes: object) -> ModelGateDecision:
 def test_model_gate_rejects_combinations_the_gate_never_produces(
     changes: dict[str, object], match: str
 ) -> None:
+    prepared = dict(changes)
+    marker = prepared.get("assessment")
+    if marker == "ood_feature_range":
+        prepared["assessment"] = reasons(ConfidenceComponent.FEATURE_RANGE)
     with pytest.raises(ValidationError, match=match):
-        gate_record(**changes)
+        gate_record(**prepared)
 
 
 def test_model_gate_accepts_the_shapes_the_gate_produces() -> None:
@@ -1687,3 +1710,69 @@ def test_gate_never_emits_a_selected_proposal_with_a_mismatch(trained) -> None:
     assert record.proposal_mismatch is not None
     assert record.learned_selected is False
     assert selected.active_controller is ControllerKind.FALLBACK
+
+
+# ----------------- assessment の理由の集合を判定と突き合わせる（#149 review 6回目）
+
+
+def test_schema_component_names_match_the_assessment_components() -> None:
+    """schema 側の構成要素名は ConfidenceComponent と同じ集合にする。"""
+    assert set(MODEL_GATE_ASSESSMENT_COMPONENTS) == {
+        component.value for component in ConfidenceComponent
+    }
+    assert len(MODEL_GATE_ASSESSMENT_COMPONENTS) == len(ConfidenceComponent)
+
+
+@pytest.mark.parametrize(
+    ("assessment", "ood", "match"),
+    [
+        # 構成要素が足りない
+        (reasons()[:-1], False, "足りない構成要素"),
+        # 同じ構成要素を2回書く
+        ((*reasons()[:-1], reasons()[0]), False, "構成要素ごとに1つ"),
+        # 知らない code
+        (
+            (*reasons()[:-1], Reason(code="made_up_check", detail="")),
+            False,
+            "未知の構成要素",
+        ),
+        # ood_ の理由があるのに ood ではない
+        (reasons(ConfidenceComponent.SUPPORT), False, "食い違って"),
+        # ood なのに ood_ の理由が無い
+        (reasons(), True, "食い違って"),
+    ],
+)
+def test_attested_trace_rejects_reason_sets_that_do_not_match_the_verdict(
+    assessment: tuple[Reason, ...], ood: bool, match: str
+) -> None:
+    with pytest.raises(ValidationError, match=match):
+        gate_record(
+            assessment=assessment,
+            ood=ood,
+            confidence=0.0 if ood else 0.9,
+            confidence_level=ConfidenceLevel.LOW if ood else ConfidenceLevel.HIGH,
+        )
+
+
+def test_attested_trace_accepts_the_reason_set_the_gate_writes(trained) -> None:
+    """Gate が実際に書く理由の集合は通る（OOD のときは ood_* を含む）。"""
+    assert gate_record(assessment=reasons()).ood is False
+    ood_record = gate_record(
+        assessment=reasons(ConfidenceComponent.FEATURE_RANGE),
+        ood=True,
+        confidence=0.0,
+        confidence_level=ConfidenceLevel.LOW,
+    )
+    assert ood_record.ood is True
+
+    # Gate が本物の assessment から書いた記録も同じ規則を満たす
+    assessment = _assessed(trained, ood_input=True)
+    liar = learned_proposal(0.9, confidence=0.99, ood=False, inference_id=assessment.inference_id)
+    gate = _active_gate(AuthorityStage.FULL)
+    record = _select(gate, 1, liar, assessment).model_gate
+    assert record is not None
+    codes = {reason.code for reason in record.assessment}
+    assert codes == {
+        f"ood_{component.value}" if component in assessment.ood_components else component.value
+        for component in ConfidenceComponent
+    }

@@ -225,7 +225,8 @@ model_confidence:
   `model_ood` をすべて `null` にする**（裏付けの記録が無いのに ML の数値だけが残らないようにする）
 - **schema を最後の防波堤にする。** trace は保存済み JSON からも組み立てられるため、Gate が決して
   出さない組み合わせは型で拒む。裏付けの無い記録に理由・数値・authority を持たせない、裏付けのある
-  記録には理由を必須にする、OOD の confidence は 0、stage の帯と zone の制限・MEDIUM 帯の対応、
+  記録には理由を必須にする、**理由は構成要素ごとに1つずつ揃え、`ood_*` の理由と `ood` の判定を一致させる**、
+  OOD の confidence は 0、stage の帯と zone の制限・MEDIUM 帯の対応、
   **不一致（`proposal_mismatch`）のある提案を active controller にしない**、
   `MANUAL` / `CALIBRATION` の tick に `model_gate` を残さない、など。
   Gate の分岐から到達できる組み合わせを field ごとに数え上げ、到達しないものを型で拒む
@@ -264,7 +265,7 @@ true / false positive / negative、FP 率・FN 率、構成要素ごとの OOD �
 | support cell は軸を増やすと組み合わせが急増し、学習件数が薄くなる | 軸と bin は Profile 作成時に明示し、軸数・cell 数に構造上の上限を置く。評価（2.7）で FP 率を確かめる |
 | 箱型の範囲と格子の support は、学習点の間の「穴」を見逃しうる | residual drift と support 件数の score で補う。方式の置き換えは Profile の schema version を上げて行う |
 | 起動直後は residual の証拠が無く confidence が抑えられる | 安全側を優先する。上限値は設定で調整でき、証拠が積み上がれば所有者が広げる |
-| 同一プロセス内で形の整った assessment を偽造されれば、Gate は見破れない | **受け入れる**（2026-09-20、所有者の判断）。LLM 層には制御権も書き込み権も無く（AGENTS.md ルール1）、`coldaisle-fand` の中で動く制御コード自体が敵対的である場合は本記録の想定範囲外とする。Gate は内部整合・推論への束縛・Registry 検証を確かめ、偶発的な迂回（`apply_to()` を呼び忘れる、古い判定を使い回す）を塞ぐ |
+| 同一プロセス内で `ConfidenceAssessor` を通さずに組み立てた assessment でも、**構成要素・confidence・ood・inference_id・Registry 検証の表示が構造的に整っていれば Gate の再検証を通る**（Gate が持つのは「この形が正しいか」だけで、「本当に assessor が出したか」を示す証明ではない） | **受け入れる**（2026-09-20、所有者の判断）。LLM 層には制御権も書き込み権も無く（AGENTS.md ルール1）、`coldaisle-fand` の中で動く制御コード自体が敵対的である場合は本記録の想定範囲外とする。Gate が塞ぐのは偶発的な迂回（`apply_to()` を呼び忘れる、古い判定や別の推論の判定を使い回す、未検証 artifact の判定を使う、理由と判定が噛み合わない記録を残す）であり、発行元の証明（token や署名）は導入しない |
 | 暫定値のままでは FP / FN の水準が分からない | 本記録は値を確定しない。#90 / #91 の評価で確定し、所有者が承認する |
 
 ## 4. 却下した代替案

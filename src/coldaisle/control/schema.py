@@ -440,6 +440,24 @@ class AuthorityLimitSource(StrEnum):
 MAX_MODEL_GATE_REASONS = 16
 """1 tick に残す assessment の理由の上限。trace の大きさを抑える構造上の上限で、調整値ではない。"""
 
+MODEL_GATE_ASSESSMENT_COMPONENTS: tuple[str, ...] = (
+    "model_binding",
+    "feature_range",
+    "fan_state_range",
+    "support",
+    "missing_pattern",
+    "uncertainty",
+    "residual_drift",
+)
+"""Confidence / OOD の構成要素（#85）。
+
+`coldaisle.control.model.confidence.ConfidenceComponent` と同じ集合で、trace の理由を検証するために
+ここに持つ（下位の schema から ML の module を import しないため。一致は試験で確かめる）。
+"""
+
+OOD_REASON_PREFIX = "ood_"
+"""OOD と判定した構成要素の理由に付く接頭辞。"""
+
 
 class ModelGateDecision(_Frozen):
     """Confidence / OOD Gate の1 tick の判断（決定記録 0050 §2.5）。
@@ -491,6 +509,8 @@ class ModelGateDecision(_Frozen):
                 raise ValueError("裏付けの無い記録に assessment の理由を残さない")
         elif not self.assessment:
             raise ValueError("裏付けのある記録には assessment の理由が要る")
+        else:
+            self._check_assessment_reasons()
         if self.ood:
             if self.confidence_level is not ConfidenceLevel.LOW:
                 raise ValueError("OOD の confidence level は LOW にする")
@@ -522,6 +542,27 @@ class ModelGateDecision(_Frozen):
         elif self.limits:
             raise ValueError("Learned MPC を選ばない tick に authority limit を付けない")
         return self
+
+    def _check_assessment_reasons(self) -> None:
+        """理由の集合が判定と噛み合っているか（Gate は構成要素ごとに1つずつ書く）。"""
+        seen: list[str] = []
+        ood_components: list[str] = []
+        for reason in self.assessment:
+            code = reason.code
+            is_ood = code.startswith(OOD_REASON_PREFIX)
+            component = code.removeprefix(OOD_REASON_PREFIX) if is_ood else code
+            if component not in MODEL_GATE_ASSESSMENT_COMPONENTS:
+                raise ValueError(f"assessment に未知の構成要素の理由がある: {code}")
+            seen.append(component)
+            if is_ood:
+                ood_components.append(component)
+        if len(set(seen)) != len(seen):
+            raise ValueError("assessment の理由は構成要素ごとに1つにする")
+        if set(seen) != set(MODEL_GATE_ASSESSMENT_COMPONENTS):
+            missing = sorted(set(MODEL_GATE_ASSESSMENT_COMPONENTS) - set(seen))
+            raise ValueError(f"assessment の理由に足りない構成要素がある: {missing}")
+        if bool(ood_components) != bool(self.ood):
+            raise ValueError("assessment の ood_* の理由と ood の判定が食い違っている")
 
 
 class GuardZoneOutput(_Frozen):
