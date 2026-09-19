@@ -21,7 +21,9 @@
   入力を無効にした metric が signal に影響しないという記述（§2.1 / §2.2 / §3）を、
   監視必須でない metric に限った。さらに、proc_stat（`cpu.utilization`）が判定対象に
   含まれないこと（§2.2）と、パネル表示による緩和が `panels` に載る metric に限られること
-  （§3）を明記した
+  （§3）を明記した。また §2.4 の quality 規則を sensor_unit / nvml と lm_sensors に分け、
+  lm_sensors は1本でも届いていれば一部の入力が `ok` 以外でも source 状態が `ok` のままで
+  あることを明記した
 
 ## 1. Context
 
@@ -104,17 +106,29 @@ nvml / lm_sensors は、collector が報告した状態（`sys.telemetry_source.
   quality 規則で監視必須 metric（`sources.sensor_unit.required`。設定で1本以上が必須）を評価する
 
 quality 規則では、`ok` と `suspect` を「値が届いている」、`stale` / `missing` / 未保存を
-「届いていない」とする。
+「届いていない」とする。source 状態の導出では `missing_tolerated` を参照しない
+（`missing_tolerated` が効くのは §2.3 の metric 単位の判定だけ）。
 
-- 監視必須 metric が**1本も届いていない**（すべて `stale` / `missing` / 未保存）→ `unavailable`（red）
-- 一部が `ok` 以外（`suspect` を含む）、または報告状態が `degraded` → `degraded`（yellow）
+**sensor_unit / nvml**（評価する metric のすべてを求める）:
+
+- 評価する metric が**1本も届いていない**（すべて `stale` / `missing` / 未保存）→ `unavailable`（red）
+- 1本でも `ok` 以外（`suspect` / `stale` / `missing` / 未保存）、または報告状態が
+  `degraded` → `degraded`（yellow）
 - それ以外 → `ok`
 
-**すべてが `suspect` でも `degraded`（yellow）であり、red にはしない。** red は必須データが
-取得できていないときに限る。
+すべてが `suspect` でも `degraded`（yellow）であり、red にはしない。
 
-lm_sensors は有効な hwmon 入力の**いずれか1本**が届いていれば `ok` とし、届かない入力は
-§2.2〜§2.3 の metric 単位の規則で yellow にする（0040 §5 未決1 のまま）。
+**lm_sensors は例外とする**（有効な hwmon 入力の**いずれか1本**が届けばよい。
+0040 §5 未決1 のまま）:
+
+- 有効な hwmon 入力が**1本も届いていない** → `unavailable`（red）
+- 報告状態が `degraded` → `degraded`（yellow）
+- それ以外 → `ok`。**一部の入力が `suspect` / `stale` / `missing` / 未保存でも、
+  すべてが `suspect` でも、source 状態は `ok` のまま**とする。それらの入力は §2.2〜§2.3 の
+  metric 単位の規則で signal を yellow にする（`missing_tolerated` の `missing` / 未保存を除く）
+
+どの source でも、red にするのは評価する metric が1本も届いていないときと、報告状態が
+red のときに限る。
 
 ### 2.5 アラートの重大度は発生中の全件から数える
 
@@ -151,8 +165,9 @@ WAL のため取り込み・ルールエンジンの書き込みは妨げない�
   `disabled` なら nvml は red、`ok` / `degraded` が残っていても監視必須 metric が届かず
   `unavailable`（red）になる。`sources.nvml.required` は設定で1本以上が必須のため、
   NVML を外した運用で red を避ける手段は本記録では定めない
-- すべて `suspect` の source は red にならない。緩和: yellow にはなり、`compute_mode_advisory.safe`
-  は false になる
+- 評価する metric がすべて `suspect` の source は red にならない（lm_sensors は source 状態も
+  `ok` のまま）。緩和: signal は yellow になり（sensor_unit / nvml は source 状態の
+  `degraded`、lm_sensors は metric 単位の規則による）、`compute_mode_advisory.safe` は false になる
 
 ## 4. 却下した代替案
 
