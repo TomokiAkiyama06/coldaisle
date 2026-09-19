@@ -35,6 +35,8 @@ metrics:
   cpu.tctl:            {unit: "C",   label: "CPU Tctl"}
   cpu.ccd1:            {unit: "C",   label: "CPU CCD1温度"}
   cpu.ccd2:            {unit: "C",   label: "CPU CCD2温度"}
+  # 決定記録 0047。/proc/stat の全 CPU 合計の使用率
+  cpu.utilization:     {unit: "%",   label: "CPU使用率"}
   power.cpu.package:   {unit: "W",   label: "CPU Package消費電力"}
   cpu.vrm:             {unit: "C",   label: "CPU VRM温度"}
   board.chipset:       {unit: "C",   label: "Chipset温度"}
