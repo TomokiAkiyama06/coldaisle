@@ -593,5 +593,37 @@ def test_the_measured_note_waits_for_health():
 def test_the_control_note_does_not_claim_measured_values():
     script = _text(SCRIPT)
     control = script[script.index("function renderControl()") :][:1500]
-    assert "measuredNote(page.ingestSource)" in control
+    assert "measuredNote(displaySource())" in control
     assert "使用率は実測値です" not in script
+
+
+@pytest.mark.parametrize(
+    ("source", "kind"),
+    [
+        ("serial", "実測"),
+        ("mock", "模擬"),
+        ("replay", "再生"),
+        (None, "出どころ不明"),
+        ("something-new", "出どころ不明"),
+        ("toString", "出どころ不明"),
+    ],
+)
+def test_the_value_kind_follows_health_source(source, kind):
+    """凡例・PWM の札も **serial のときだけ「実測」**（measuredNote と同じ判断）。"""
+    assert _status_call("valueKind", source) == kind
+
+
+def test_the_page_has_no_fixed_measured_wording():
+    """「実測」を固定の文言で出さない。札は valueKind から、`?mock=` は mock とみなす。"""
+    page_text = re.sub(r"<!--.*?-->", "", _text(PAGE), flags=re.S)
+    assert "実測" not in page_text
+    literals = re.findall(r"\"[^\"\n]*\"|`[^`\n]*`|'[^'\n]*'", _text(SCRIPT))
+    assert not [text for text in literals if "実測" in text]
+    script = _text(SCRIPT)
+    assert 'page.mockName ? "mock" : page.ingestSource' in script
+    assert "PWM（${valueKind()}）" in script
+    render = script[
+        script.index("function renderSource()") : script.index("function renderControl()")
+    ]
+    assert 'getElementById("value-kind-key")' in render
+    assert 'id="value-kind-key"' in _text(PAGE)

@@ -292,6 +292,19 @@ function renderHealth(health) {
   else age.textContent = `最終受信 ${fmt(health.data_age_seconds, 1)} 秒前`;
 }
 
+/**
+ * 表示中の値の出どころ。**`?mock=` のときは API の health に関係なく "mock"**。
+ * 値の札（実測・模擬・再生）と注記はすべてここから決める（Codex P2）。
+ */
+function displaySource() {
+  return page.mockName ? "mock" : page.ingestSource;
+}
+
+/** 値の札に付ける語（実測 / 模擬 / 再生 / 出どころ不明 / 確認中）。 */
+function valueKind() {
+  return window.ColdaisleAirflowStatus.valueKind(displaySource());
+}
+
 function renderSource() {
   const source = document.getElementById("source-label");
   const decision = document.getElementById("decision-label");
@@ -310,6 +323,7 @@ function renderSource() {
     source.textContent = page.pageNote ? `${label.text}（${page.pageNote}）` : label.text;
     source.classList.toggle("mock", !label.live);
   }
+  document.getElementById("value-kind-key").textContent = `${valueKind()}（温度・回転数・使用率）`;
   decision.textContent = page.control && page.control.decision_id ? `判断 ${page.control.decision_id}` : "";
 }
 
@@ -331,7 +345,7 @@ function renderControl() {
   document.getElementById("control-note").textContent = control
     ? "制御の状態は模擬データです。実際の制御とは関係ありません。"
     : "制御の状態は未接続です。制御デーモンの判断記録（#74 / #82）を読む API がまだ無いため表示していません。" +
-      window.ColdaisleAirflowStatus.measuredNote(page.ingestSource);
+      window.ColdaisleAirflowStatus.measuredNote(displaySource());
 
   const alert = control && control.alert;
   const box = document.getElementById("control-alert");
@@ -551,7 +565,7 @@ function renderZones() {
     big.appendChild(valueNode(reading(zone.rpm, 0, ""), "rpm"));
     big.appendChild(el("span", "unit", "rpm"));
     const pwm = reading(zone.pwm, 0, "%");
-    const pwmNode = el("span", "pwm", "PWM（実測） ");
+    const pwmNode = el("span", "pwm", `PWM（${valueKind()}） `);
     pwmNode.appendChild(valueNode(pwm));
     big.appendChild(pwmNode);
     panel.appendChild(big);

@@ -86,6 +86,15 @@
       : `${VALUES}の出どころは不明です（実機の実測値とは限りません）。`;
   }
 
+  // 値の札（凡例・各ゾーンの PWM）に付ける短い語。**serial のときだけ「実測」**（Codex P2）
+  const VALUE_KINDS = { serial: "実測", mock: "模擬", replay: "再生" };
+
+  /** `health.source`（`?mock=` のときは "mock"）に合わせた値の種類。undefined は health 待ち。 */
+  function valueKind(source) {
+    if (source === undefined) return "確認中";
+    return Object.prototype.hasOwnProperty.call(VALUE_KINDS, source) ? VALUE_KINDS[source] : "出どころ不明";
+  }
+
   /**
    * グラフに使える点へ直す。**生データ（agg=raw）では quality が ok 以外の点を値なし（null）にする**。
    * `/api/v1/series` の raw は suspect の値（DS18B20 の -127 など）をそのまま返すため、
@@ -102,6 +111,7 @@
     gpuThrottleStatus,
     ingestSourceLabel,
     measuredNote,
+    valueKind,
     usablePoints,
     GPU_THROTTLE_METRICS: [...THERMAL, ...POWER, ...SLOWDOWN].map(([metric]) => metric),
   };
