@@ -1147,6 +1147,25 @@ function drawGraph() {
   renderReadout();
 }
 
+/**
+ * 履歴を捨て、グラフ・軸・読み取り値を空にする。**取得に失敗した期間の下に、
+ * 前の期間の線・軸・値を残さない**（Codex P2）。注記（graph-note）は呼び出し側が書く。
+ */
+function clearGraph() {
+  graph.data = new Map();
+  graph.fromMs = null;
+  graph.toMs = null;
+  graph.cursorMs = null;
+  graph.loaded = false;
+  cursors.length = 0;
+  for (const id of ["chart-temp", "chart-fan", "util-rows", "readout", "fan-legend"]) {
+    document.getElementById(id).replaceChildren();
+  }
+  document.getElementById("readout-time").textContent = "";
+  document.getElementById("graph-agg").textContent = "";
+  renderToggles();
+}
+
 /** 履歴。**最後に頼んだ期間の応答だけを使う**（切り替え直後に古い期間の応答で上書きしない）。 */
 async function loadHistory() {
   const token = ++graph.token;
@@ -1187,7 +1206,8 @@ async function loadHistory() {
     note.textContent = "線が途切れている区間は測れていません。";
     drawGraph();
   } catch (error) {
-    if (token !== graph.token) return;
+    if (token !== graph.token) return; // 新しい期間を頼んだあとに届いた古い失敗は無視する
+    clearGraph();
     note.textContent = `履歴を取得できません: ${error.message}`;
   }
 }

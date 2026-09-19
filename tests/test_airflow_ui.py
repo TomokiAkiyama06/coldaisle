@@ -573,7 +573,8 @@ def test_aggregate_points_are_used_as_they_are(agg):
 
 def test_the_graph_reads_only_usable_points():
     script = _text(SCRIPT)
-    load = script[script.index("graph.data = new Map(") - 200 :][:600]
+    load = script[script.index("async function loadHistory()") :]
+    load = load[: load.index("} catch (error) {")]
     assert "usablePoints" in load
     assert "usable(body.points, body.agg)" in load
 
@@ -710,3 +711,41 @@ def test_the_graph_says_history_may_come_from_another_source():
     assert "現在の取り込み元" in note
     assert "過去の点" in note
     assert "実測" not in note
+
+
+def test_a_failed_range_load_clears_the_old_graph():
+    """取得に失敗した期間の下に、前の期間の線・軸・読み取り値を残さない（Codex P2）。"""
+    script = _text(SCRIPT)
+    clear = script[script.index("function clearGraph()") :]
+    clear = clear[: clear.index("\n}\n")]
+    for reset in (
+        "graph.data = new Map();",
+        "graph.fromMs = null;",
+        "graph.toMs = null;",
+        "graph.cursorMs = null;",
+        "graph.loaded = false;",
+        "cursors.length = 0;",
+    ):
+        assert reset in clear, reset
+    for element in ("chart-temp", "chart-fan", "util-rows", "readout", "fan-legend"):
+        assert f'"{element}"' in clear, element
+    assert 'getElementById("graph-agg").textContent = ""' in clear
+    # 描き直しは fromMs が null なら何もしない（失敗後にリサイズ等で古い軸が戻らない）
+    draw = script[script.index("function drawGraph()") :][:120]
+    assert "if (graph.fromMs === null) return;" in draw
+
+    load = script[script.index("async function loadHistory()") :]
+    load = load[: load.index("\n}\n")]
+    failure = load[load.index("} catch (error) {") :]
+    # 古い要求の失敗で新しい期間を消さない → 消してから注記を書く
+    assert failure.index("if (token !== graph.token) return;") < failure.index("clearGraph();")
+    assert failure.index("clearGraph();") < failure.index("履歴を取得できません")
+
+
+def test_a_late_response_cannot_overwrite_a_newer_range():
+    script = _text(SCRIPT)
+    load = script[script.index("async function loadHistory()") :]
+    load = load[: load.index("\n}\n")]
+    assert "const token = ++graph.token;" in load
+    success = load[: load.index("} catch (error) {")]
+    assert success.index("if (token !== graph.token) return;") < success.index("graph.data = ")
