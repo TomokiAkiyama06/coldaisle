@@ -23,6 +23,11 @@ from typing import Annotated, Any, Protocol
 from fastapi import FastAPI, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
 from fastapi.staticfiles import StaticFiles
 
+from coldaisle.api.airflow import (
+    AirflowConfigResponse,
+    AirflowUiSettings,
+    airflow_config_payload,
+)
 from coldaisle.api.models import (
     AlertsResponse,
     DerivedLabelOut,
@@ -116,6 +121,8 @@ class Config:
     metrics: Path = Path("config/metrics.yaml")
     internal_telemetry: Path = Path("config/internal-telemetry.yaml")
     server_health: Path = Path("config/server-health.yaml")
+    airflow_ui: Path = Path("config/airflow-ui.yaml")
+    """エアフロー画面の表示設定（#106 / 決定記録 0046）。"""
     max_points: int = 2_000
     """1レスポンスの最大点数。超えるなら粗い粒度へ自動で落とす（受入基準）。"""
     stream_poll_s: float = 1.0
@@ -131,6 +138,7 @@ class Config:
                 os.environ.get("COLDAISLE_INTERNAL_TELEMETRY", str(cls.internal_telemetry))
             ),
             server_health=Path(os.environ.get("COLDAISLE_SERVER_HEALTH", str(cls.server_health))),
+            airflow_ui=Path(os.environ.get("COLDAISLE_AIRFLOW_UI", str(cls.airflow_ui))),
             max_points=int(os.environ.get("COLDAISLE_MAX_POINTS", cls.max_points)),
             stream_poll_s=float(os.environ.get("COLDAISLE_STREAM_POLL_S", cls.stream_poll_s)),
         )
@@ -212,6 +220,7 @@ def create_app(
     settings = config or Config.from_env()
     catalog = MetricCatalog.from_yaml(settings.metrics)
     health_settings = ServerHealthSettings.from_yaml(settings.server_health, catalog=catalog)
+    airflow_ui = AirflowUiSettings.from_yaml(settings.airflow_ui)
     if health_hwmon_metrics is None or health_nvml_metrics is None:
         internal_telemetry = InternalTelemetryConfig.from_yaml(
             settings.internal_telemetry, catalog=catalog
@@ -502,6 +511,15 @@ def create_app(
     def get_server_health() -> ServerHealthResponse:
         """Workspace の Server Health パネル向け統合ビュー（FR-308 / #66）。"""
         return server_health_payload()
+
+    @app.get("/api/v1/airflow/config", response_model=AirflowConfigResponse)
+    def get_airflow_config() -> AirflowConfigResponse:
+        """エアフロー画面の表示設定（#106 / 決定記録 0046）。**測定値は含まない。**
+
+        空気の温度の色分けの区切りを画面に書かないために返す（AGENTS.md ルール9）。
+        制御・アラートの閾値ではない。
+        """
+        return airflow_config_payload(airflow_ui)
 
     @app.websocket("/api/v1/stream")
     async def stream(websocket: WebSocket) -> None:

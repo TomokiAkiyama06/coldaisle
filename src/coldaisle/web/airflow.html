@@ -1,0 +1,202 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>エアフロー / ファン制御 — coldaisle</title>
+<link rel="stylesheet" href="airflow.css">
+</head>
+<body>
+<!--
+  エアフロー / ファン制御の可視化（#106 / 決定記録 0046）。**表示専用。**
+  - 書き込み系の操作を置かない。フォーム・送信ボタン・書き込みのリクエストを持たない
+    （モード変更の入り口は coldaisle-fand のローカル Unix ソケットだけ。決定記録 0028 §2.2）
+  - 外部への参照を持たない（オフラインでも見える。決定記録 0011 §2.1）
+  - 模擬データは `?mock=normal` / `?mock=override` のときだけ別ファイルから読み、画面全体で言う
+-->
+<div id="mock-banner" class="mock-banner hidden" role="status"></div>
+<div id="banner" class="banner hidden" role="alert"></div>
+<div id="api-banner" class="banner hidden" role="alert"></div>
+<div id="control-alert" class="control-alert hidden" role="alert">
+  <span id="control-alert-text"></span>
+  <span id="control-alert-note" class="control-alert-note"></span>
+</div>
+
+<header class="af-header">
+  <div class="title">
+    <h1>エアフロー / ファン制御</h1>
+    <span class="lock">
+      <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="4" y="11" width="16" height="10" rx="2"></rect><path d="M8 11V7a4 4 0 0 1 8 0v4"></path></svg>
+      表示専用 — ここからは何も変更できません
+    </span>
+  </div>
+  <div class="meta">
+    <!-- 出どころは経路ごと（Codex P2）。どちらのタブでも見えるよう見出しに置く -->
+    <span id="source-label" class="source">空気の温度（現在の取り込み元）：出どころを確認中…</span>
+    <span id="telemetry-label" class="source">回転数・PWM・CPU・GPU：読み取り値</span>
+    <span id="decision-label"></span>
+    <span id="age-label"></span>
+    <a href="./" class="back">ダッシュボードへ</a>
+  </div>
+</header>
+
+<nav class="tabs" aria-label="表示の切り替え">
+  <a id="tab-now" class="tab" href="#now">現在の状態</a>
+  <a id="tab-graph" class="tab" href="#graph">グラフ</a>
+</nav>
+
+<!-- ============================================================ 現在の状態 -->
+<main id="view-now" class="view">
+  <section aria-label="制御の状態">
+    <div id="control-chips" class="chips"></div>
+    <p id="control-note" class="note"></p>
+  </section>
+
+  <div class="layout">
+    <div class="col-main">
+      <section class="panel" aria-label="ケース内の風の流れ">
+        <div class="panel-head">
+          <h2>ケース内の風の流れ（側面）</h2>
+          <div class="keys">
+            <span class="key"><i class="key-box"></i><span id="value-kind-key">値（温度・回転数・使用率）</span>。枠の色＝温度</span>
+            <span class="key"><i class="key-flow"></i>風の流れ（向きは構成から。風量は測っていません）。色＝空気の温度</span>
+          </div>
+        </div>
+        <svg id="diagram" class="diagram" viewBox="0 0 826 470" role="img" aria-label="ケース側面の図。左が背面（排気）、右が前面（吸気）">
+          <defs>
+            <pattern id="af-mesh" width="8" height="8" patternUnits="userSpaceOnUse"><rect width="8" height="8" fill="#15191e"></rect><circle cx="4" cy="4" r="1.6" fill="#2e3642"></circle></pattern>
+            <pattern id="af-fins" width="4" height="18" patternUnits="userSpaceOnUse"><rect width="4" height="18" fill="#252c35"></rect><rect width="1.4" height="18" fill="#3e4855"></rect></pattern>
+            <symbol id="af-fan" viewBox="0 0 100 100"><rect x="3" y="3" width="94" height="94" rx="10" fill="#1a1f26" stroke="#56606d" stroke-width="3"></rect><circle cx="50" cy="50" r="44" fill="#0c0f13" stroke="#3a4450" stroke-width="2"></circle><circle cx="50" cy="50" r="12" fill="#2a323d" stroke="#56606d" stroke-width="2"></circle></symbol>
+            <!-- 矢印の先端（色ごと）は airflow.js が配色から作る -->
+          </defs>
+          <!-- ケース（左が背面、右が前面） -->
+          <rect x="80" y="36" width="650" height="408" rx="16" fill="#101418" stroke="#4a5563" stroke-width="3"></rect>
+          <rect x="684" y="36" width="46" height="408" rx="14" fill="url(#af-mesh)" stroke="#4a5563" stroke-width="3"></rect>
+          <rect x="106" y="104" width="420" height="262" rx="4" fill="#141a20" stroke="#262e37" stroke-width="1.5"></rect>
+          <text x="114" y="360" fill="#4c5663" font-size="10">マザーボード</text>
+          <rect x="88" y="382" width="534" height="54" rx="4" fill="#171c22" stroke="#2a323d" stroke-width="1.5"></rect>
+          <text x="106" y="428" fill="#4c5663" font-size="10">電源カバー</text>
+          <!-- AIO のホース（右側）とラジエータ（上面） -->
+          <path d="M292 216 C 380 204, 548 156, 566 70" fill="none" stroke="#2a323d" stroke-width="7" stroke-linecap="round"></path>
+          <path d="M292 238 C 392 226, 566 166, 580 70" fill="none" stroke="#2a323d" stroke-width="7" stroke-linecap="round"></path>
+          <rect x="182" y="46" width="408" height="22" rx="3" fill="url(#af-fins)" stroke="#56606d" stroke-width="1.5"></rect>
+          <!-- CPU と GPU -->
+          <rect x="220" y="206" width="72" height="44" rx="8" fill="#222a33" stroke="#6b7684" stroke-width="1.5"></rect>
+          <rect id="gpu-block" x="186" y="286" width="440" height="62" rx="8" fill="#1e252e" stroke="#7a8594" stroke-width="2"></rect>
+          <text x="470" y="316" fill="#e6e9ee" font-size="13" font-weight="600" text-anchor="middle">GPU</text>
+          <text x="470" y="334" fill="#7d8794" font-size="10" text-anchor="middle">下面から吸気 → 上面へ排気</text>
+          <!-- ファン（回さない。回転数は数字で出す） -->
+          <use href="#af-fan" x="630" y="82" width="92" height="92"></use>
+          <use href="#af-fan" x="630" y="190" width="92" height="92"></use>
+          <use href="#af-fan" x="630" y="298" width="92" height="92"></use>
+          <use href="#af-fan" x="474" y="70" width="104" height="104"></use>
+          <use href="#af-fan" x="344" y="70" width="104" height="104"></use>
+          <use href="#af-fan" x="214" y="70" width="104" height="104"></use>
+          <use id="rear-fan" href="#af-fan" x="88" y="152" width="88" height="88"></use>
+          <rect id="rear-fan-fault" class="hidden" x="88" y="152" width="88" height="88" rx="9" fill="none" stroke="#e25c5c" stroke-width="3"></rect>
+          <!-- 風の流れ。data-air はその区間の空気の温度として使う測定点 -->
+          <g id="flows" fill="none" stroke-width="2" stroke-dasharray="6 5">
+            <path class="flow" data-air="air.room" d="M818 128 L 758 128"></path>
+            <path class="flow" data-air="air.room" d="M818 236 L 758 236"></path>
+            <path class="flow" data-air="air.room" d="M818 344 L 758 344"></path>
+            <path class="flow" data-air="air.front_intake" d="M628 128 Q 600 150, 590 184"></path>
+            <path class="flow" data-air="air.front_intake" d="M628 236 Q 580 244, 568 270"></path>
+            <path class="flow" data-air="air.gpu_intake" d="M628 344 Q 540 372, 470 362"></path>
+            <path class="flow" data-air="air.gpu_exhaust" d="M406 282 L 406 214"></path>
+            <path class="flow" data-air="air.gpu_exhaust" d="M526 282 L 526 214"></path>
+            <path class="flow" data-air="air.gpu_exhaust" d="M286 282 Q 220 280, 186 234"></path>
+            <path class="flow" data-air="air.top_exhaust" d="M526 42 L 526 10"></path>
+            <path class="flow" data-air="air.top_exhaust" d="M396 42 L 396 10"></path>
+            <path class="flow" data-air="air.top_exhaust" d="M266 42 L 266 10"></path>
+            <path class="flow" data-air="air.rear_exhaust" d="M82 196 L 20 196"></path>
+          </g>
+          <text x="707" y="462" fill="#9aa5b3" font-size="11" text-anchor="middle">前面（吸気）</text>
+          <text x="80" y="462" fill="#9aa5b3" font-size="11" text-anchor="middle">背面（排気）</text>
+          <!-- 測定点・ファン・熱源の札は airflow.js が描く -->
+          <g id="labels"></g>
+        </svg>
+        <div id="air-legend" class="air-legend"></div>
+      </section>
+
+      <div id="zones" class="zones"></div>
+    </div>
+
+    <div class="col-side">
+      <section class="panel" aria-label="なぜこの回転数か">
+        <div class="panel-head">
+          <h2>なぜこの回転数か</h2>
+          <div id="trace-tabs" class="seg" role="group" aria-label="系統"></div>
+        </div>
+        <div id="trace" class="trace"></div>
+      </section>
+
+      <section class="panel" aria-label="吸気と排気のバランス">
+        <div class="panel-head">
+          <h2>吸気と排気のバランス</h2>
+          <span id="balance-state" class="pill"></span>
+        </div>
+        <div id="balance" class="balance"></div>
+      </section>
+
+      <section class="panel" aria-label="熱源">
+        <h2>熱源</h2>
+        <div id="heat" class="heat"></div>
+      </section>
+
+      <section class="panel" aria-label="参照のみ">
+        <div class="panel-head">
+          <h2>参照のみ（制御対象外）</h2>
+        </div>
+        <div id="reference" class="kvs"></div>
+      </section>
+    </div>
+  </div>
+</main>
+
+<!-- ============================================================ グラフ -->
+<main id="view-graph" class="view hidden">
+  <div class="graph-controls">
+    <div id="ranges" class="seg" role="group" aria-label="期間"></div>
+    <span id="graph-agg" class="note"></span>
+  </div>
+  <div id="toggles" class="toggles" role="group" aria-label="表示する系列"></div>
+  <!-- 点ごとの出どころは API に無い。見出しは「いまの」取り込み元だけを表す（Codex P2） -->
+  <p id="graph-source-note" class="note">見出しの出どころは現在の取り込み元です。過去の点は、取り込み元を切り替えていれば別の出どころの値のことがあります。</p>
+
+  <div class="graph-layout">
+    <div class="graph-main">
+      <section class="panel">
+        <div class="panel-head">
+          <h2>温度 <span class="sub">（背景の濃さ＝使用率）</span></h2>
+        </div>
+        <svg id="chart-temp" class="chart" height="320" aria-label="温度の推移"></svg>
+      </section>
+      <section class="panel">
+        <div class="panel-head">
+          <h2>使用率 <span class="sub">（濃いほど高い）</span></h2>
+        </div>
+        <div id="util-rows" class="util-rows"></div>
+      </section>
+      <section class="panel">
+        <div class="panel-head">
+          <h2>ファン回転数</h2>
+          <div id="fan-legend" class="keys"></div>
+        </div>
+        <svg id="chart-fan" class="chart" height="140" aria-label="ファン回転数の推移"></svg>
+      </section>
+      <p id="graph-note" class="note"></p>
+    </div>
+    <aside class="panel readout" aria-label="カーソル位置の値">
+      <div class="panel-head">
+        <h2 id="readout-title">カーソル位置の値</h2>
+        <span id="readout-time" class="mono"></span>
+      </div>
+      <div id="readout" class="readout-body"></div>
+    </aside>
+  </div>
+</main>
+
+<script src="airflow-status.js"></script>
+<script src="airflow.js"></script>
+</body>
+</html>
