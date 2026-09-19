@@ -9,7 +9,6 @@
 5. オフラインで見える・API の文字列を HTML として解釈しない
 """
 
-import importlib
 import json
 import os
 import re
@@ -27,7 +26,7 @@ from coldaisle.api.airflow import AirflowUiSettings
 from coldaisle.api.app import WEB_ROOT, Config, create_app
 from coldaisle.channels import CHANNEL_TO_METRIC
 from coldaisle.clock import SimulatedClock
-from coldaisle.internal_telemetry import ProcStatAdapter
+from coldaisle.internal_telemetry import SOURCE_STATE_PREFIX
 from coldaisle.store import Quality, Reading, Sample, SqliteStore
 from conftest import CONFIG_DIR, QUALITY_RULES_PATH
 
@@ -69,7 +68,6 @@ def client(tmp_path, rules):
             airflow_ui=AIRFLOW_UI_PATH,
         ),
         clock=SimulatedClock(NOW_MS),
-        cpu_utilization_measured=True,
     )
     with TestClient(app) as opened:
         yield opened
@@ -97,7 +95,7 @@ def test_the_config_endpoint_returns_the_thresholds_from_yaml(client):
             "thresholds_c": expected["thresholds_c"],
             "provisional": expected["provisional"],
         },
-        "cpu_utilization": {"measured": True},
+        "cpu_utilization": {"measured": None},  # collector の状態が無い = 分からない
     }
 
 
@@ -922,45 +920,52 @@ def test_sources_without_the_flag_read_the_value():
 # ------------------------------------------------------- airflow/config の cpu_utilization（#145）
 
 
-def _config_client(tmp_path, rules, **kwargs):
-    path = tmp_path / "cfg.db"
-    with SqliteStore(path, rules=rules, clock=SimulatedClock(NOW_MS)):
-        pass
-    return TestClient(
-        create_app(
-            Config(
-                db=path,
-                quality_rules=QUALITY_RULES_PATH,
-                metrics=METRICS_PATH,
-                airflow_ui=AIRFLOW_UI_PATH,
-                **kwargs,
-            ),
-            clock=SimulatedClock(NOW_MS),
-            health_hwmon_metrics=(),
-            health_nvml_metrics=(),
-        )
-    )
-
-
 @pytest.mark.parametrize(
-    ("enabled", "platform", "measured"),
-    [(True, "linux", True), (False, "linux", False), (True, "darwin", False)],
+    ("state", "measured"),
+    [
+        ("disabled", False),  # proc_stat.enabled: false
+        ("ok", True),
+        ("degraded", True),
+        ("unavailable", None),  # Linux 以外と一時的な読み取り失敗を区別できない（0047 §2.2）
+        ("something-new", None),
+        (None, None),  # collector が一度も状態を書いていない
+    ],
 )
-def test_cpu_utilization_measured_follows_config_and_platform(
-    tmp_path, rules, monkeypatch, enabled, platform, measured
-):
-    """`proc_stat.enabled` かつ Linux のときだけ measured。値の行の有無には依らない。"""
-    loaded = yaml.safe_load((CONFIG_DIR / "internal-telemetry.yaml").read_text(encoding="utf-8"))
-    loaded["proc_stat"]["enabled"] = enabled
-    telemetry = tmp_path / "internal-telemetry.yaml"
-    telemetry.write_text(yaml.safe_dump(loaded, allow_unicode=True), encoding="utf-8")
-    # platform は adapter の引数の既定値（sys.platform）で決まる。API が作る adapter を差し替える
-    # `coldaisle.api.app` は属性としては FastAPI の app を指すため、モジュールを直接取る
-    monkeypatch.setattr(
-        importlib.import_module("coldaisle.api.app"),
-        "ProcStatAdapter",
-        lambda config: ProcStatAdapter(config, platform=platform),
+def test_cpu_utilization_measured_follows_the_collector_state(tmp_path, rules, state, measured):
+    """collector が保存した proc_stat の状態で決める（API 側の設定・OS は見ない）。"""
+    path = tmp_path / "state.db"
+    with SqliteStore(path, rules=rules, clock=SimulatedClock(NOW_MS)) as store:
+        if state is not None:
+            store.set_system_state(SOURCE_STATE_PREFIX + "proc_stat", state, at_ms=NOW_MS)
+    app = create_app(
+        Config(
+            db=path,
+            quality_rules=QUALITY_RULES_PATH,
+            metrics=METRICS_PATH,
+            airflow_ui=AIRFLOW_UI_PATH,
+        ),
+        clock=SimulatedClock(NOW_MS),
     )
-    with _config_client(tmp_path, rules, internal_telemetry=telemetry) as opened:
+    with TestClient(app) as opened:
         body = opened.get("/api/v1/airflow/config").json()
     assert body["cpu_utilization"] == {"measured": measured}
+
+
+def test_cpu_utilization_measured_ignores_the_api_side_config(tmp_path, rules):
+    """API の設定で proc_stat が有効でも、collector が disabled なら未計測（Codex P2）。"""
+    loaded = yaml.safe_load((CONFIG_DIR / "internal-telemetry.yaml").read_text(encoding="utf-8"))
+    assert loaded["proc_stat"]["enabled"] is True
+    path = tmp_path / "other.db"
+    with SqliteStore(path, rules=rules, clock=SimulatedClock(NOW_MS)) as store:
+        store.set_system_state(SOURCE_STATE_PREFIX + "proc_stat", "disabled", at_ms=NOW_MS)
+    app = create_app(
+        Config(
+            db=path,
+            quality_rules=QUALITY_RULES_PATH,
+            metrics=METRICS_PATH,
+            airflow_ui=AIRFLOW_UI_PATH,
+        ),
+        clock=SimulatedClock(NOW_MS),
+    )
+    with TestClient(app) as opened:
+        assert opened.get("/api/v1/airflow/config").json()["cpu_utilization"]["measured"] is False

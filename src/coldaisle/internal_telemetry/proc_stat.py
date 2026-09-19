@@ -65,15 +65,6 @@ class ProcStatAdapter:
     def expected_metrics(self) -> tuple[str, ...]:
         return (CPU_UTILIZATION_METRIC,) if self._config.enabled else ()
 
-    @property
-    def measures(self) -> bool:
-        """設定で有効かつ Linux か。偽なら ``cpu.utilization`` は値を持ちえない（未計測）。
-
-        無効・Linux 以外でも ``missing`` の行が保存されうる（``_unavailable``）ため、
-        表示側は行の有無ではなくこれで「計測していない」を判断する（#145）。
-        """
-        return self._config.enabled and self._supported
-
     def poll(self) -> AdapterResult:
         """現在の累積値を読み、前回との差分で使用率を計算する。"""
         if not self._config.enabled:

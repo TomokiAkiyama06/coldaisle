@@ -27,6 +27,7 @@ from coldaisle.api.airflow import (
     AirflowConfigResponse,
     AirflowUiSettings,
     airflow_config_payload,
+    cpu_utilization_measured,
 )
 from coldaisle.api.models import (
     AlertsResponse,
@@ -64,7 +65,12 @@ from coldaisle.channels import (
     QUEUE_DROPS_METRIC,
 )
 from coldaisle.clock import Clock, WallClock
-from coldaisle.internal_telemetry import InternalTelemetryConfig, NvmlAdapter, ProcStatAdapter
+from coldaisle.internal_telemetry import (
+    SOURCE_STATE_PREFIX,
+    InternalTelemetryConfig,
+    NvmlAdapter,
+    ProcStatAdapter,
+)
 from coldaisle.metrics import MetricCatalog, compute_derived
 from coldaisle.store import Aggregation, Quality, QualityRules, SqliteStore
 from coldaisle.store.db import FIVE_MINUTES_MS, HOUR_MS, MINUTE_MS
@@ -216,17 +222,12 @@ def create_app(
     health_summarizer: HealthSummarizer | None = None,
     health_hwmon_metrics: tuple[str, ...] | None = None,
     health_nvml_metrics: tuple[str, ...] | None = None,
-    cpu_utilization_measured: bool | None = None,
 ) -> FastAPI:
     settings = config or Config.from_env()
     catalog = MetricCatalog.from_yaml(settings.metrics)
     health_settings = ServerHealthSettings.from_yaml(settings.server_health, catalog=catalog)
     airflow_ui = AirflowUiSettings.from_yaml(settings.airflow_ui)
-    if (
-        health_hwmon_metrics is None
-        or health_nvml_metrics is None
-        or cpu_utilization_measured is None
-    ):
+    if health_hwmon_metrics is None or health_nvml_metrics is None:
         internal_telemetry = InternalTelemetryConfig.from_yaml(
             settings.internal_telemetry, catalog=catalog
         )
@@ -239,10 +240,6 @@ def create_app(
         if health_nvml_metrics is None:
             # adapter を作るだけでは NVML を初期化しない（初回 poll まで遅延する）
             health_nvml_metrics = NvmlAdapter(internal_telemetry.nvml).expected_metrics
-        if cpu_utilization_measured is None:
-            # API と collector は同じ SQLite を読み書きするため同じホストで動く前提（#145）
-            cpu_utilization_measured = ProcStatAdapter(internal_telemetry.proc_stat).measures
-    cpu_measured: bool = bool(cpu_utilization_measured)
     provider = StoreProvider(settings, clock or WallClock())
 
     @asynccontextmanager
@@ -528,7 +525,12 @@ def create_app(
         空気の温度の色分けの区切りを画面に書かないために返す（AGENTS.md ルール9）。
         制御・アラートの閾値ではない。
         """
-        return airflow_config_payload(airflow_ui, cpu_utilization_measured=cpu_measured)
+        # collector が保存した proc_stat の状態から決める。API 側の設定・OS からは決めない
+        # （collector は別の設定で動きうる。決定記録 0051）
+        state = provider.get().current_state(SOURCE_STATE_PREFIX + ProcStatAdapter.name)
+        return airflow_config_payload(
+            airflow_ui, cpu_utilization_measured=cpu_utilization_measured(state)
+        )
 
     @app.websocket("/api/v1/stream")
     async def stream(websocket: WebSocket) -> None:

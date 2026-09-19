@@ -183,12 +183,3 @@ def test_production_config_enables_it_and_registers_the_rollup_period():
     assert periodic_metric_intervals(config)[CPU_UTILIZATION_METRIC] == config.interval_ms
     catalog = MetricCatalog.from_yaml(CONFIG_DIR / "metrics.yaml")
     assert catalog.unit_for(CPU_UTILIZATION_METRIC) == "%"
-
-
-@pytest.mark.parametrize(
-    ("enabled", "platform", "measures"),
-    [(True, "linux", True), (False, "linux", False), (True, "darwin", False)],
-)
-def test_measures_requires_enabled_and_linux(tmp_path, enabled, platform, measures):
-    """エアフロー画面の「未計測」の根拠（#145）。missing の行が保存される場合と区別する。"""
-    assert adapter(tmp_path / "stat", enabled=enabled, platform=platform).measures is measures

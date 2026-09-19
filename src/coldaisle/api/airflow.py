@@ -14,6 +14,8 @@ from typing import Any, Literal
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, FiniteFloat, field_validator
 
+from coldaisle.internal_telemetry import SourceStatus
+
 AIR_TEMPERATURE_BANDS = 5
 """色の段数（青→琥珀→赤）。区切りはこれより1つ少ない。
 
@@ -74,10 +76,11 @@ class AirTemperatureScaleOut(BaseModel):
 class CpuUtilizationOut(BaseModel):
     """`GET /api/v1/airflow/config` の `cpu_utilization`（#145 / 決定記録 0047）。"""
 
-    measured: bool
-    """CPU 使用率を収集する設定か（`proc_stat.enabled` かつ Linux）。偽なら画面は「未計測」。
+    measured: bool | None
+    """collector が CPU 使用率を収集しているか。偽なら画面は「未計測」、null は分からない。
 
-    測定値ではなく設定と実行環境から決まる値。collector の現在の状態ではない。
+    collector が保存した `sys.telemetry_source.proc_stat` の状態から決める（決定記録 0051）。
+    測定値ではない。
     """
 
 
@@ -89,8 +92,24 @@ class AirflowConfigResponse(BaseModel):
     cpu_utilization: CpuUtilizationOut
 
 
+def cpu_utilization_measured(state: str | None) -> bool | None:
+    """collector が保存した proc_stat の状態 → `cpu_utilization.measured`（決定記録 0051）。
+
+    - `disabled`（`proc_stat.enabled: false`）→ False（未計測）
+    - `ok` / `degraded` → True（収集している。値が無ければ画面は「未取得」）
+    - `unavailable`・状態が無い・知らない値 → None（分からない）。`unavailable` は
+      Linux 以外（決定記録 0047 §2.2）と一時的な読み取り失敗の両方で、
+      保存された状態からは区別できない
+    """
+    if state == SourceStatus.DISABLED:
+        return False
+    if state in (SourceStatus.OK, SourceStatus.DEGRADED):
+        return True
+    return None
+
+
 def airflow_config_payload(
-    settings: AirflowUiSettings, *, cpu_utilization_measured: bool
+    settings: AirflowUiSettings, *, cpu_utilization_measured: bool | None
 ) -> AirflowConfigResponse:
     """設定をそのまま応答の形にする。"""
     return AirflowConfigResponse(
