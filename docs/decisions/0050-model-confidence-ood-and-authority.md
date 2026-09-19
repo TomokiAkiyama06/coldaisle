@@ -75,21 +75,28 @@ Registry（#104）の `confidence_model` artifact としての登録・昇格は
 - residual の証拠は **forecast（1回の予測）単位**で数える。1回の予測が持つ horizon × metric の
   出力の数では数えない。出力の数で数えると、多出力の予測1回だけで最低件数を満たしてしまう。
   `residual_window` / `residual_min_samples` の単位も forecast とする
-- 全出力を照合し終え、**全出力に観測があった** forecast だけを証拠に数える。forecast の誤差は
-  出力ごとの正規化 residual の二乗平均とし、drift の比は window 内の forecast の誤差の平均の平方根とする
+- 全出力を照合し終え、**全出力に OK の観測があった** forecast（matched）だけを証拠に数える。forecast の誤差は
+  出力ごとの正規化 residual の二乗平均とし、drift の比は証拠に数えた forecast の誤差の平均の平方根とする
+- **window は解決した forecast を順に数える。** matched だけでなく、許容幅の中で観測が揃わなかった
+  forecast（expired）と照合待ちの上限で捨てた forecast（dropped）も window の枠を占める。照合できない
+  forecast が続けば、古い「当たっていた」証拠は押し出される
+- **証拠は鮮度を持つ。** 解決から `residual_max_age_ms` を過ぎた matched は数えない。証拠を読む時点で
+  許容幅を過ぎた照合待ちも expired にするので、観測が止まっても古い証拠は残らない
+  （Telemetry の stale で Safety が働くことを前提にしない）
 - 照合済みの forecast が `residual_min_samples` に満たない間は、confidence に上限
   `cap_before_residual_evidence` を課す。**予測が当たっている証拠が無い状態を満点にしない**
-- residual の証拠は Profile の SHA-256 と、数えた monitor の window・許容幅を持つ。assessment は
-  別の Profile の証拠や別の設定で数えた証拠を拒否する（モデルを差し替えた直後に、旧モデルの証拠で
-  上限を外さない）。同じ action の予測を2回数えない
+- residual の証拠は Profile の SHA-256、数えた monitor の window・許容幅・鮮度、証拠を見た時刻
+  （`as_of_ts_ms`）を持つ。assessment は別の Profile・別の設定の証拠と、**この推論の action 時刻以外で
+  見た証拠**を拒否する（モデルを差し替えた直後や、以前に見た証拠の使い回しで上限を外さない）。
+  同じ action の予測を2回数えない
 - 照合の許容幅は Profile の最短 horizon より小さくなければならない（DatasetSpec の
   `target_tolerance_ms` と同じ不変条件）。horizon は Profile にあるため、monitor の生成時に検証する
 - 入力の形が feature schema と合わない場合は判定を作らず例外にする（予測自体も失敗する）。
   worker はこれを `LearnedFailure` として Gate へ渡し、Fallback になる（0028 §2.7）
 - residual の照合は予測と同じ時間軸（`expected_ts_ms` と観測の時刻）で、Dataset の target 選択
   （0031 §2.2）と同じ規則で行う。期待時刻に**最も近い**観測を `±residual_match_tolerance_ms` の中でだけ採り
-  （前後どちら側でもよい）、**同距離なら過去側**を採る。観測は action より後に限り、metric ごとに値のある
-  観測だけを候補にする。許容幅の中で観測が揃わなかった forecast は証拠に数えず件数だけ残す。
+  （前後どちら側でもよい）、**同距離なら過去側**を採る。観測は action より後に限り、metric ごとに
+  **品質が OK の値**だけを候補にする（Profile の residual 基準も OK の label だけから作るため）。許容幅の中で観測が揃わなかった forecast は証拠に数えず件数だけ残す。
   照合待ちは構造上の上限を持つ
 
 ### 2.3 判定は worker、切替は Gate
@@ -99,11 +106,28 @@ Registry（#104）の `confidence_model` artifact としての登録・昇格は
 - Registry を通っていない artifact（`offline_unverified`）の判定は制御の提案に付けられない（0048 §2.4）
 - **判定は1回の推論に束縛する。** 入力と予測の canonical JSON の SHA-256 を推論の識別子
   （`inference_id`）とし、Learned MPC の提案と assessment の両方が持つ。識別子が違う判定は提案に
-  付けられない（同じ model version でも、以前の in-distribution な判定を別の入力の提案へ付け替えさせない）。
-  Gate へ渡す理由も同じ識別子を持ち、提案と違えば拒否する
+  付けられない（同じ model version でも、以前の in-distribution な判定を別の入力の提案へ付け替えさせない）
+- **Gate は提案の値を信用しない。** Learned MPC の提案は assessment そのものと一緒に Gate へ渡す。Gate は
+  assessment を検証し直し、Registry 検証済み・同じ推論・同じ model version・提案と同じ confidence / ood で
+  なければ `confidence_unattested` として Fallback にする。assessment の無い提案も同じ
 - Fallback への切替、confidence level、authority の帯は #79 の Controller Gate が決める。
   出せるのは requested までで、**Reactive Guard と Critical Safety は後段で常に掛かる**（0028 §2.4）。
   OOD の間も Critical Safety はそのまま有効である
+
+### 2.3.1 authority の不変条件
+
+Fallback より上の authority（Learned MPC の requested）は、次を**すべて**満たすときだけ与える。
+試験は不変条件ごとに、破る入力を与えて Fallback になる（または入力自体が作れない）ことを確かめる。
+
+| # | 不変条件 | 担う箇所 |
+|---|---|---|
+| A1 | 提案の confidence / ood は、この推論（`inference_id`）の Registry 検証済み assessment と一致する | Gate（`confidence_unattested`）、`apply_to()` |
+| A2 | assessment は OOD でなく、confidence が stage の下限以上。モード AUTO・stage LIMITED 以上・Safety NORMAL・復帰 hold（0028 §2.5 (c)） | Gate |
+| R1 | HIGH（帯なし）には、鮮度のある residual 証拠が `residual_min_samples` 件以上要る。無ければ confidence は `cap_before_residual_evidence`（< `high_min_confidence`）に抑えられる | Assessor、設定検証 |
+| R2 | window は解決した forecast を順に数え、照合できなかった forecast も枠を占める。解決から `residual_max_age_ms` を過ぎた証拠は数えない | Monitor |
+| R3 | 証拠は同じ Profile・同じ設定で、この推論の action 時刻に見たもの | Assessor |
+| R4 | 照合は OK の値だけ・±許容幅の最近傍（同距離は過去側）・許容幅 < 最短 horizon・同じ action を2回数えない | Monitor |
+| C1 | `high_min_confidence >= gate_min_confidence.full`、`cap_before_residual_evidence < high_min_confidence`、`residual_min_samples <= residual_window`、`full_support_count >= min_support_count`、`residual_max_age_ms > residual_match_tolerance_ms` | 設定検証 |
 
 ### 2.4 confidence level と authority
 
@@ -142,6 +166,7 @@ model_confidence:
   residual_window: {value: ..., status: provisional}
   residual_min_samples: {value: ..., status: provisional}
   residual_match_tolerance_ms: {value: ..., status: provisional}
+  residual_max_age_ms: {value: ..., status: provisional}
   residual_drift_ood_ratio: {value: ..., status: provisional}
   cap_without_uncertainty: {value: ..., status: provisional}
   cap_before_residual_evidence: {value: ..., status: provisional}

@@ -9,8 +9,9 @@ from typing import Self
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from coldaisle.control.config import FanPolicyConfig
+from coldaisle.control.model.confidence import ConfidenceAssessment
+from coldaisle.control.model.thermal import ArtifactVerification
 from coldaisle.control.schema import (
-    MAX_MODEL_GATE_REASONS,
     AuthorityLimitSource,
     AuthorityStage,
     ConfidenceLevel,
@@ -51,6 +52,8 @@ class FallbackCause(StrEnum):
     OOD = "ood"
     SUPERVISOR_FAILURE = "supervisor_failure"
     MODEL_VERSION_MISMATCH = "model_version_mismatch"
+    CONFIDENCE_UNATTESTED = "confidence_unattested"
+    """提案の confidence / ood が、この推論の検証済み assessment と照合できない（#85）。"""
     CONTROL_DEADLINE_EXCEEDED = "control_deadline_exceeded"
     SNAPSHOT_UNAVAILABLE = "state_snapshot_unavailable"
     SNAPSHOT_INVALID = "state_snapshot_invalid"
@@ -114,26 +117,18 @@ class LearnedControlStatus(_Frozen):
     supervisor_available: bool = True
     control_deadline_exceeded: bool = False
     snapshot_status: SnapshotStatus = SnapshotStatus.AVAILABLE
-    confidence_reasons: tuple[Reason, ...] = Field(default=(), max_length=MAX_MODEL_GATE_REASONS)
-    """worker の Confidence / OOD assessment の理由（#85）。trace へそのまま残す。"""
-    confidence_inference_id: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
-    """``confidence_reasons`` を出した推論。提案の ``inference_id`` と一致しなければ拒否する。"""
+    assessment: ConfidenceAssessment | None = None
+    """提案の confidence / ood を出した assessment そのもの（#85）。
+
+    Gate は提案の値を信用せず、この assessment と照合する。無い・合わない提案は Fallback にする。
+    """
 
     @model_validator(mode="after")
     def _proposal_and_receipt_match(self) -> Self:
         if (self.proposal is None) != (self.received_at_mono_ms is None):
             raise ValueError("Learned proposal と受信単調時刻は一緒に指定する")
-        if self.proposal is None and self.confidence_reasons:
-            raise ValueError("Learned proposal が無いときに confidence の理由を付けない")
-        if (self.confidence_inference_id is None) != (not self.confidence_reasons):
-            raise ValueError("confidence の理由と、それを出した推論の識別子は一緒に指定する")
-        if (
-            self.proposal is not None
-            and self.confidence_inference_id is not None
-            and self.confidence_inference_id != self.proposal.inference_id
-        ):
-            # 別の推論の理由を trace に残すと、判断の根拠を取り違える。
-            raise ValueError("confidence の理由が提案と別の推論のもの")
+        if self.proposal is None and self.assessment is not None:
+            raise ValueError("Learned proposal が無いときに assessment を付けない")
         if self.proposal is not None and self.proposal.controller is not ControllerKind.LEARNED_MPC:
             raise ValueError("LearnedControlStatus には Learned MPC の提案だけを入れる")
         if self.failure is not None and self.proposal is not None:
@@ -305,19 +300,47 @@ class ControllerGate:
                 FallbackCause.MODEL_VERSION_MISMATCH,
                 f"expected={self._expected_model_version}; actual={proposal.model_version}",
             )
-        if proposal.ood:
+        unattested = self._attestation_failure(proposal, learned.assessment)
+        if unattested is not None:
+            return self._reason(FallbackCause.CONFIDENCE_UNATTESTED, unattested)
+        assessment = learned.assessment
+        assert assessment is not None
+        if assessment.ood or proposal.ood:
             return self._reason(FallbackCause.OOD)
-        assert proposal.confidence is not None
+        if (proposal.confidence, proposal.ood) != (assessment.confidence, assessment.ood):
+            return self._reason(
+                FallbackCause.CONFIDENCE_UNATTESTED, "proposal confidence/ood != assessment"
+            )
         required_confidence = self._required_confidence()
-        if proposal.confidence < required_confidence:
+        if assessment.confidence < required_confidence:
             return self._reason(
                 FallbackCause.LOW_CONFIDENCE,
                 (
-                    f"confidence={proposal.confidence:.6f}; "
+                    f"confidence={assessment.confidence:.6f}; "
                     f"required={required_confidence:.6f}; "
                     f"stage={self._policy.authority_stage.value}"
                 ),
             )
+        return None
+
+    @staticmethod
+    def _attestation_failure(
+        proposal: ControllerProposal, assessment: ConfidenceAssessment | None
+    ) -> str | None:
+        """提案がこの推論の検証済み assessment に裏付けられていなければ理由を返す。
+
+        提案の ``confidence`` / ``ood`` は誰でも書ける値なので、それだけで authority を与えない。
+        """
+        if assessment is None:
+            return "assessment is missing"
+        # model_copy(update=...) は検証を通らないため、Gate でも検証し直す。
+        verified = ConfidenceAssessment.model_validate(assessment.model_dump(mode="python"))
+        if verified.artifact_verification is not ArtifactVerification.REGISTRY_VERIFIED:
+            return "assessment is not registry verified"
+        if verified.inference_id != proposal.inference_id:
+            return "assessment is for another inference"
+        if verified.model_version != proposal.model_version:
+            return "assessment is for another model version"
         return None
 
     def _required_confidence(self) -> float:
@@ -475,7 +498,12 @@ class ControllerGate:
             authority_stage=stage,
             learned_selected=selected.controller is ControllerKind.LEARNED_MPC,
             limits=limits,
-            assessment=learned.confidence_reasons,
+            assessment=(
+                ()
+                if learned.assessment is None
+                or learned.assessment.inference_id != proposal.inference_id
+                else learned.assessment.trace_reasons()
+            ),
         )
 
     def _remember(

@@ -263,6 +263,7 @@ def valid_documents() -> dict[str, dict[str, object]]:
                 "residual_window": provisional(20),
                 "residual_min_samples": provisional(5),
                 "residual_match_tolerance_ms": provisional(500),
+                "residual_max_age_ms": provisional(60_000),
                 "residual_drift_ood_ratio": provisional(3.0),
                 "cap_without_uncertainty": provisional(0.9),
                 "cap_before_residual_evidence": provisional(0.7),

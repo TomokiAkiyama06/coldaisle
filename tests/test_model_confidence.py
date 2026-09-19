@@ -23,6 +23,7 @@ from coldaisle.control.model.confidence import (
     OodEvaluationCase,
     ResidualDriftMonitor,
     ResidualEvidence,
+    ResidualObservation,
     SupportAxis,
     evaluate_ood_detection,
     fit_confidence_profile,
@@ -69,12 +70,12 @@ from coldaisle.control.schema import (
     ModelGateDecision,
     OperatingMode,
     PerZone,
-    Reason,
     SafetyState,
     ZoneRecord,
 )
 from coldaisle.store.models import Quality
 from test_fallback_controller import (
+    assessment_for,
     fallback_proposal,
     learned_proposal,
     policy,
@@ -304,18 +305,51 @@ def with_missing(observed: ObservedThermalInput, metric: str) -> ObservedThermal
 
 
 def evidence(
-    profile: ModelConfidenceProfile, ratio: float, forecasts: int = 10
+    profile: ModelConfidenceProfile, ratio: float, forecasts: int = 10, *, at: int
 ) -> ResidualEvidence:
     settings = confidence_policy()
     return ResidualEvidence(
         profile_sha256=profile.sha256(),
         residual_window=settings.residual_window.value,
         match_tolerance_ms=settings.residual_match_tolerance_ms.value,
+        max_age_ms=settings.residual_max_age_ms.value,
+        as_of_ts_ms=at,
         forecasts=forecasts,
+        unmatched=0,
         ratio=ratio,
-        expired_forecasts=0,
-        dropped_forecasts=0,
     )
+
+
+def tuned(**values: int | float):
+    """設定の一部だけを変えた model_confidence（値の検証は元の型が持つ）。"""
+    base = confidence_policy()
+    updates = {
+        name: getattr(base, name).model_copy(update={"value": value})
+        for name, value in values.items()
+    }
+    return base.model_copy(update=updates)
+
+
+def feed(
+    monitor: ResidualDriftMonitor,
+    ts_ms: int,
+    values: dict[str, float | None],
+    quality: Quality = Quality.OK,
+) -> None:
+    monitor.observe(
+        ts_ms,
+        {
+            metric: ResidualObservation(value=value, quality=quality)
+            for metric, value in values.items()
+        },
+    )
+
+
+def latest(monitor: ResidualDriftMonitor) -> ResidualEvidence:
+    """最後に観測した時刻で見た証拠。"""
+    clock = monitor._clock_ms
+    assert clock is not None
+    return monitor.evidence(clock)
 
 
 def component(assessment: ConfidenceAssessment, name: ConfidenceComponent):
@@ -386,8 +420,10 @@ def test_in_distribution_replay_is_not_ood_and_assessment_is_deterministic(train
     observed = ObservedThermalInput.from_example(parts.test[0])
     prediction = model.predict(observed)
 
-    first = judge.assess(observed, prediction, evidence(profile, 1.0))
-    assert first == judge.assess(observed, prediction, evidence(profile, 1.0))
+    first = judge.assess(observed, prediction, evidence(profile, 1.0, at=observed.action_ts_ms))
+    assert first == judge.assess(
+        observed, prediction, evidence(profile, 1.0, at=observed.action_ts_ms)
+    )
     assert first.ood is False
     assert first.profile_sha256 == profile.sha256()
     # uncertainty が無い間は cap_without_uncertainty（0.9）で抑える
@@ -422,7 +458,9 @@ def test_synthetic_out_of_training_inputs_are_ood(
     }[case]()
     prediction = model.predict(observed)
 
-    result = assessor(profile).assess(observed, prediction, evidence(profile, 1.0))
+    result = assessor(profile).assess(
+        observed, prediction, evidence(profile, 1.0, at=observed.action_ts_ms)
+    )
 
     assert result.ood is True
     assert result.confidence == 0.0
@@ -449,7 +487,9 @@ def test_small_excursion_inside_margin_lowers_confidence_without_ood(trained) ->
     # air の学習範囲は 19.5..27.0（幅 7.5）。margin 0.1 = 0.75 まではみ出しを許す
     # test[7] は cycle 7（air 27 / gpu 54 / fan 0.65）。support cell は学習済みのまま
     observed = shifted(ObservedThermalInput.from_example(parts.test[7]), air=27.375)
-    result = assessor(profile).assess(observed, model.predict(observed), evidence(profile, 1.0))
+    result = assessor(profile).assess(
+        observed, model.predict(observed), evidence(profile, 1.0, at=observed.action_ts_ms)
+    )
 
     assert result.ood is False
     range_score = component(result, ConfidenceComponent.FEATURE_RANGE).score
@@ -463,7 +503,7 @@ def test_model_version_mismatch_is_ood(trained) -> None:
     observed = ObservedThermalInput.from_example(parts.test[0])
 
     result = assessor(profile).assess(
-        observed, other_model.predict(observed), evidence(profile, 1.0)
+        observed, other_model.predict(observed), evidence(profile, 1.0, at=observed.action_ts_ms)
     )
 
     assert result.ood is True
@@ -487,8 +527,12 @@ def test_confidence_is_capped_until_residual_evidence_exists(trained) -> None:
     judge = assessor(profile)
 
     no_history = judge.assess(observed, prediction, None)
-    few = judge.assess(observed, prediction, evidence(profile, 1.0, forecasts=4))
-    enough = judge.assess(observed, prediction, evidence(profile, 1.0, forecasts=5))
+    few = judge.assess(
+        observed, prediction, evidence(profile, 1.0, forecasts=4, at=observed.action_ts_ms)
+    )
+    enough = judge.assess(
+        observed, prediction, evidence(profile, 1.0, forecasts=5, at=observed.action_ts_ms)
+    )
 
     assert no_history.confidence == pytest.approx(0.7)
     assert few.confidence == pytest.approx(0.7)
@@ -504,7 +548,9 @@ def test_residual_drift_is_scored_against_the_validation_scale(
 ) -> None:
     _data, parts, model, profile = trained
     observed = ObservedThermalInput.from_example(parts.test[0])
-    result = assessor(profile).assess(observed, model.predict(observed), evidence(profile, ratio))
+    result = assessor(profile).assess(
+        observed, model.predict(observed), evidence(profile, ratio, at=observed.action_ts_ms)
+    )
 
     drift = component(result, ConfidenceComponent.RESIDUAL_DRIFT)
     assert drift.ood is ood
@@ -522,21 +568,21 @@ def test_residual_drift_monitor_matches_predictions_with_later_observations(trai
         monitor.record(prediction)
         predicted = prediction.targets[0].values[GPU]
         # 許容幅（±500ms）の中で、validation の3倍の誤差で観測された
-        monitor.observe(prediction.targets[0].expected_ts_ms + 200, {GPU: predicted + 3 * scale})
+        feed(monitor, prediction.targets[0].expected_ts_ms + 200, {GPU: predicted + 3 * scale})
 
-    state = monitor.evidence()
+    observed = ObservedThermalInput.from_example(parts.test[5])
+    state = monitor.evidence(observed.action_ts_ms)
     assert state.forecasts == 5
     assert state.ratio == pytest.approx(3.0)
-    observed = ObservedThermalInput.from_example(parts.test[5])
     result = assessor(profile).assess(observed, model.predict(observed), state)
     assert ConfidenceComponent.RESIDUAL_DRIFT in result.ood_components
 
     late = model.predict(ObservedThermalInput.from_example(parts.test[6]))
     monitor.record(late)
-    monitor.observe(late.targets[0].expected_ts_ms + 501, {GPU: 0.0})
-    assert monitor.evidence().expired_forecasts == 1
+    feed(monitor, late.targets[0].expected_ts_ms + 501, {GPU: 0.0})
+    assert latest(monitor).unmatched == 1
     with pytest.raises(ValueError, match="巻き戻せない"):
-        monitor.observe(0, {GPU: 0.0})
+        feed(monitor, 0, {GPU: 0.0})
 
 
 def test_residual_drift_monitor_rejects_predictions_from_another_model(trained) -> None:
@@ -606,21 +652,19 @@ def _active_gate(stage: AuthorityStage) -> ControllerGate:
     return gate
 
 
-def _select(
-    gate: ControllerGate,
-    now: int,
-    proposal,
-    reasons: tuple[Reason, ...] = (),
-    reasons_from: str | None = None,
-):
+_ATTACH = object()
+
+
+def _select(gate: ControllerGate, now: int, proposal, assessment: object = _ATTACH):
+    """提案を Gate へ渡す。既定では同じ推論の assessment を付ける。"""
+    attached = assessment_for(proposal) if assessment is _ATTACH else assessment
     return gate.select(
         now_mono_ms=now,
         fallback=fallback_proposal(0.4),
         learned=LearnedControlStatus(
             proposal=proposal,
             received_at_mono_ms=now,
-            confidence_reasons=reasons,
-            confidence_inference_id=reasons_from,
+            assessment=attached,  # type: ignore[arg-type]
         ),
         operating_mode=OperatingMode.AUTO,
         safety_state=SafetyState.NORMAL,
@@ -675,7 +719,9 @@ def test_ood_assessment_switches_to_fallback_immediately_and_is_traced(trained) 
     assert active.active_controller is ControllerKind.LEARNED_MPC
 
     observed = shifted(ObservedThermalInput.from_example(parts.test[0]), air=35.0)
-    assessment = judge.assess(observed, model.predict(observed), evidence(profile, 1.0))
+    assessment = judge.assess(
+        observed, model.predict(observed), evidence(profile, 1.0, at=observed.action_ts_ms)
+    )
     # Registry を通った artifact の判定として提案へ付ける（offline のままでは付けられない）
     deployed = assessment.model_copy(
         update={
@@ -684,8 +730,7 @@ def test_ood_assessment_switches_to_fallback_immediately_and_is_traced(trained) 
         }
     )
     proposal = deployed.apply_to(learned_proposal(0.1, inference_id=deployed.inference_id))
-    reasons, reasons_from = deployed.trace_binding()
-    selected = _select(gate, 2, proposal, reasons, reasons_from)
+    selected = _select(gate, 2, proposal, deployed)
 
     assert selected.active_controller is ControllerKind.FALLBACK
     assert selected.fallback_reason is not None and selected.fallback_reason.code == "ood"
@@ -751,19 +796,13 @@ def test_an_assessment_cannot_be_moved_to_a_proposal_from_another_inference(trai
     with pytest.raises(ValueError, match="別の推論"):
         deployed_safe.apply_to(proposal_for_ood_input)
 
-    # 理由だけを別の推論から持ち込むことも拒否する
-    reasons, reasons_from = safe.trace_binding()
-    with pytest.raises(ValidationError, match="別の推論"):
-        LearnedControlStatus(
-            proposal=proposal_for_ood_input,
-            received_at_mono_ms=0,
-            confidence_reasons=reasons,
-            confidence_inference_id=reasons_from,
-        )
-    with pytest.raises(ValidationError, match="一緒に指定"):
-        LearnedControlStatus(
-            proposal=proposal_for_ood_input, received_at_mono_ms=0, confidence_reasons=reasons
-        )
+    # 別の推論の assessment を Gate へ渡しても authority は得られない
+    gate = _active_gate(AuthorityStage.FULL)
+    selected = _select(gate, 1, proposal_for_ood_input, deployed_safe)
+    assert selected.active_controller is ControllerKind.FALLBACK
+    assert selected.fallback_reason is not None
+    assert selected.fallback_reason.code == "confidence_unattested"
+    assert selected.model_gate is not None and selected.model_gate.assessment == ()
 
 
 def test_inference_id_is_deterministic_and_input_bound(trained) -> None:
@@ -899,7 +938,8 @@ def at_action(observed: ObservedThermalInput, action_ts_ms: int) -> ObservedTher
 def complete_forecast(monitor: ResidualDriftMonitor, prediction, *, error: float = 0.0) -> None:
     """全出力を期待時刻ちょうどに観測する。"""
     for target in prediction.targets:
-        monitor.observe(
+        feed(
+            monitor,
             target.expected_ts_ms,
             {metric: value + error for metric, value in target.values.items()},
         )
@@ -916,10 +956,11 @@ def test_one_multi_output_forecast_counts_once_and_keeps_the_cap(multi_output) -
     prediction = model.predict(base)
     monitor.record(prediction)
     complete_forecast(monitor, prediction)
-    state = monitor.evidence()
+    probe = at_action(base, base.action_ts_ms + 5_000)
+    state = monitor.evidence(probe.action_ts_ms)
     # 4出力を照合しても forecast は1件。5件に達しないので上限は外れない
     assert state.forecasts == 1
-    result = assessor(profile).assess(base, prediction, state)
+    result = assessor(profile).assess(probe, model.predict(probe), state)
     assert result.confidence == pytest.approx(policy_.cap_before_residual_evidence.value)
     assert component(result, ConfidenceComponent.RESIDUAL_DRIFT).cap is not None
 
@@ -928,14 +969,17 @@ def test_one_multi_output_forecast_counts_once_and_keeps_the_cap(multi_output) -
         later = model.predict(shifted_input)
         monitor.record(later)
         complete_forecast(monitor, later)
-    assert monitor.evidence().forecasts == 5
-    lifted = assessor(profile).assess(base, prediction, monitor.evidence())
+    probe = at_action(base, base.action_ts_ms + 45_000)
+    state = monitor.evidence(probe.action_ts_ms)
+    assert state.forecasts == 5
+    lifted = assessor(profile).assess(probe, model.predict(probe), state)
     assert component(lifted, ConfidenceComponent.RESIDUAL_DRIFT).cap is None
 
 
 def test_residual_window_is_measured_in_forecasts(multi_output) -> None:
     parts, model, profile = multi_output
-    policy_ = confidence_policy()
+    # 鮮度で落ちないよう max_age を長くし、window の効果だけを見る
+    policy_ = tuned(residual_max_age_ms=10_000_000)
     window = policy_.residual_window.value
     monitor = ResidualDriftMonitor(profile, policy_)
     base = ObservedThermalInput.from_example(parts.test[0])
@@ -947,7 +991,8 @@ def test_residual_window_is_measured_in_forecasts(multi_output) -> None:
         # 古い5件だけ大きく外す。window が forecast 単位なら、その5件は押し出される
         factor = 10.0 if step < 5 else 1.0
         for target in prediction.targets:
-            monitor.observe(
+            feed(
+                monitor,
                 target.expected_ts_ms,
                 {
                     metric: value + factor * scale[(target.horizon_ms, metric)]
@@ -955,7 +1000,7 @@ def test_residual_window_is_measured_in_forecasts(multi_output) -> None:
                 },
             )
 
-    state = monitor.evidence()
+    state = latest(monitor)
     assert state.forecasts == window
     assert state.ratio == pytest.approx(1.0)
 
@@ -966,13 +1011,13 @@ def test_a_forecast_with_an_unmatched_output_is_not_evidence(multi_output) -> No
     prediction = model.predict(ObservedThermalInput.from_example(parts.test[0]))
     monitor.record(prediction)
     first, second = prediction.targets
-    monitor.observe(first.expected_ts_ms, dict(first.values))
+    feed(monitor, first.expected_ts_ms, dict(first.values))
     # 2つ目の horizon は GPU だけ観測し、AIR は許容幅を過ぎても来ない
-    monitor.observe(second.expected_ts_ms, {GPU: second.values[GPU]})
-    monitor.observe(second.expected_ts_ms + 501, {})
+    feed(monitor, second.expected_ts_ms, {GPU: second.values[GPU]})
+    feed(monitor, second.expected_ts_ms + 501, {})
 
-    state = monitor.evidence()
-    assert (state.forecasts, state.expired_forecasts) == (0, 1)
+    state = latest(monitor)
+    assert (state.forecasts, state.unmatched) == (0, 1)
 
 
 def _single_target(trained):
@@ -1003,23 +1048,25 @@ def test_nearest_observation_within_tolerance_on_both_sides(
 ) -> None:
     monitor, expected_ts, predicted, scale = _single_target(trained)
     for offset, error in observations:
-        monitor.observe(
-            expected_ts + offset, {GPU: None if error is None else predicted + error * scale}
+        feed(
+            monitor,
+            expected_ts + offset,
+            {GPU: None if error is None else predicted + error * scale},
         )
-    monitor.observe(expected_ts + 501, {})
+    feed(monitor, expected_ts + 501, {})
 
-    state = monitor.evidence()
+    state = latest(monitor)
     assert state.forecasts == 1
     assert state.ratio == pytest.approx(expected_ratio)
 
 
 def test_observations_outside_the_tolerance_expire_the_forecast(trained) -> None:
     monitor, expected_ts, predicted, _scale = _single_target(trained)
-    monitor.observe(expected_ts - 501, {GPU: predicted})
-    monitor.observe(expected_ts + 501, {GPU: predicted})
+    feed(monitor, expected_ts - 501, {GPU: predicted})
+    feed(monitor, expected_ts + 501, {GPU: predicted})
 
-    state = monitor.evidence()
-    assert (state.forecasts, state.expired_forecasts) == (0, 1)
+    state = latest(monitor)
+    assert (state.forecasts, state.unmatched) == (0, 1)
     assert state.ratio is None
 
 
@@ -1037,7 +1084,11 @@ def test_residual_evidence_from_another_profile_cannot_lift_the_cap(trained, mul
     _parts, _model, other_profile = multi_output
     observed = ObservedThermalInput.from_example(parts.test[0])
     with pytest.raises(ValueError, match="Profile と一致しない"):
-        assessor(profile).assess(observed, model.predict(observed), evidence(other_profile, 1.0))
+        assessor(profile).assess(
+            observed,
+            model.predict(observed),
+            evidence(other_profile, 1.0, at=observed.action_ts_ms),
+        )
 
 
 @pytest.mark.parametrize(("tolerance", "accepted"), [(999, True), (1_000, False), (1_500, False)])
@@ -1058,18 +1109,243 @@ def test_residual_tolerance_must_stay_below_the_shortest_horizon(
 
 
 def test_residual_evidence_counted_with_other_settings_is_rejected(trained) -> None:
+    """不変条件 R3: 証拠は同じ Profile・同じ window / 許容幅 / 鮮度で数えたものだけ。"""
     _data, parts, model, profile = trained
     observed = ObservedThermalInput.from_example(parts.test[0])
-    other = evidence(profile, 1.0).model_copy(update={"residual_window": 50})
-    with pytest.raises(ValueError, match="window / 許容幅"):
-        assessor(profile).assess(observed, model.predict(observed), other)
+    fresh = evidence(profile, 1.0, at=observed.action_ts_ms)
+    for name, value in (("residual_window", 50), ("match_tolerance_ms", 400), ("max_age_ms", 1)):
+        other = fresh.model_copy(update={name: value})
+        with pytest.raises(ValueError, match="window / 許容幅 / 鮮度"):
+            assessor(profile).assess(observed, model.predict(observed), other)
     with pytest.raises(ValidationError, match="window を超えない"):
         ResidualEvidence(
             profile_sha256=profile.sha256(),
             residual_window=3,
             match_tolerance_ms=500,
-            forecasts=4,
+            max_age_ms=60_000,
+            as_of_ts_ms=0,
+            forecasts=3,
+            unmatched=1,
             ratio=1.0,
-            expired_forecasts=0,
-            dropped_forecasts=0,
+        )
+
+
+# ------------------------------------------------ authority の不変条件（#149 review 3回目）
+#
+# Fallback より上の authority（Learned MPC の requested）には、次をすべて満たす必要がある。
+# A1 提案の confidence / ood は、この推論（inference_id）の Registry 検証済み assessment と一致する
+# A2 assessment は OOD でなく、confidence が stage の下限以上
+# R1 HIGH（帯なし）には、鮮度のある residual 証拠（OK の観測と照合できた forecast）が
+#    residual_min_samples 件以上要る。無ければ confidence は cap_before_residual_evidence
+#    （< high_min_confidence）に抑えられる
+# R2 window は解決した forecast を順に数える。照合できなかった forecast も枠を占める。
+#    解決から residual_max_age_ms を過ぎた証拠は数えない
+# R3 証拠は同じ Profile・設定で、この推論の action 時刻に見たもの
+# R4 照合は OK の値だけ・±許容幅の最近傍・許容幅 < 最短 horizon・同じ action を2回数えない
+# C1 設定の相互条件（high >= gate full、cap_before < high、min <= window、max_age > 許容幅）
+
+
+def _good_forecasts(monitor, model, base, count: int, start_step: int = 0) -> int:
+    """誤差 0 で照合できる forecast を count 件作り、最後の観測時刻を返す。"""
+    last = 0
+    for step in range(start_step, start_step + count):
+        prediction = model.predict(at_action(base, base.action_ts_ms + step * 10_000))
+        monitor.record(prediction)
+        for target in prediction.targets:
+            feed(monitor, target.expected_ts_ms, dict(target.values))
+            last = target.expected_ts_ms
+    return last
+
+
+def test_r2_unmatched_forecasts_push_old_good_evidence_out_of_the_window(trained) -> None:
+    _data, parts, model, profile = trained
+    settings = tuned(residual_window=5, residual_max_age_ms=10_000_000)
+    monitor = ResidualDriftMonitor(profile, settings)
+    base = ObservedThermalInput.from_example(parts.test[0])
+    last = _good_forecasts(monitor, model, base, 5)
+    assert monitor.evidence(last).forecasts == 5
+
+    # 以後の5件は target が来ない（許容幅を過ぎる）
+    for step in range(5, 10):
+        prediction = model.predict(at_action(base, base.action_ts_ms + step * 10_000))
+        monitor.record(prediction)
+        last = prediction.targets[0].expected_ts_ms + 501
+        feed(monitor, last, {})
+    state = monitor.evidence(last)
+    assert (state.forecasts, state.unmatched, state.ratio) == (0, 5, None)
+
+
+def test_r2_evidence_expires_by_age_even_without_new_forecasts(trained) -> None:
+    _data, parts, model, profile = trained
+    settings = tuned(residual_max_age_ms=60_000)
+    monitor = ResidualDriftMonitor(profile, settings)
+    base = ObservedThermalInput.from_example(parts.test[0])
+    last = _good_forecasts(monitor, model, base, 5)
+    assert monitor.evidence(last + 60_000).forecasts >= 1
+    stale = monitor.evidence(last + 60_001)
+    assert stale.forecasts < 5
+    probe = at_action(base, last + 200_000)
+    aged = monitor.evidence(probe.action_ts_ms)
+    assert aged.forecasts == 0
+    result = assessor(profile).assess(probe, model.predict(probe), aged)
+    assert component(result, ConfidenceComponent.RESIDUAL_DRIFT).cap is not None
+
+
+def test_r2_pending_forecasts_past_the_tolerance_expire_when_evidence_is_read(trained) -> None:
+    _data, parts, model, profile = trained
+    monitor = ResidualDriftMonitor(profile, confidence_policy())
+    prediction = model.predict(ObservedThermalInput.from_example(parts.test[0]))
+    monitor.record(prediction)
+    # 観測が止まっても、証拠を読んだ時点で許容幅を過ぎた forecast は expired になる
+    state = monitor.evidence(prediction.targets[0].expected_ts_ms + 501)
+    assert (state.forecasts, state.unmatched) == (0, 1)
+
+
+@pytest.mark.parametrize("quality", [Quality.STALE, Quality.SUSPECT, Quality.MISSING])
+def test_r4_only_ok_observations_count_as_evidence(trained, quality: Quality) -> None:
+    monitor, expected_ts, predicted, _scale = _single_target(trained)
+    feed(monitor, expected_ts, {GPU: predicted}, quality=quality)
+    state = monitor.evidence(expected_ts + 501)
+    assert (state.forecasts, state.unmatched) == (0, 1)
+
+
+def test_r3_evidence_must_be_read_at_this_inference_action_time(trained) -> None:
+    _data, parts, model, profile = trained
+    monitor = ResidualDriftMonitor(profile, confidence_policy())
+    base = ObservedThermalInput.from_example(parts.test[0])
+    last = _good_forecasts(monitor, model, base, 5)
+    old_state = monitor.evidence(last)
+    later = at_action(base, last + 5_000)
+    with pytest.raises(ValueError, match="action 時刻"):
+        assessor(profile).assess(later, model.predict(later), old_state)
+    with pytest.raises(ValueError, match="巻き戻せない"):
+        monitor.evidence(last - 1)
+
+
+def test_r1_no_high_confidence_without_fresh_residual_evidence(trained) -> None:
+    _data, parts, model, profile = trained
+    config = policy()
+    observed = ObservedThermalInput.from_example(parts.test[7])
+    result = assessor(profile).assess(observed, model.predict(observed), None)
+    assert result.confidence < config.model_confidence.high_min_confidence.value
+    level = classify_confidence(
+        config, confidence=result.confidence, ood=result.ood, stage=AuthorityStage.FULL
+    )
+    assert level is not ConfidenceLevel.HIGH
+
+
+def _deployed(assessment: ConfidenceAssessment) -> ConfidenceAssessment:
+    return ConfidenceAssessment.model_validate(
+        assessment.model_copy(
+            update={
+                "artifact_verification": ArtifactVerification.REGISTRY_VERIFIED,
+                "model_version": "thermal-v1",
+            }
+        ).model_dump(mode="python")
+    )
+
+
+@pytest.mark.parametrize(
+    "violation",
+    [
+        "missing_assessment",
+        "another_inference",
+        "offline_artifact",
+        "another_model_version",
+        "proposal_confidence_raised",
+        "proposal_hides_ood",
+        "forged_components",
+    ],
+)
+def test_a1_learned_confidence_requires_a_matching_verified_assessment(
+    trained, violation: str
+) -> None:
+    """不変条件 A1: 提案の値だけでは authority を得られない。どの違反も Fallback になる。"""
+    _data, parts, model, profile = trained
+    base = ObservedThermalInput.from_example(parts.test[7])
+    observed = base
+    prediction = model.predict(observed)
+    assessment = _deployed(
+        assessor(profile).assess(
+            observed, prediction, evidence(profile, 1.0, at=observed.action_ts_ms)
+        )
+    )
+    assert assessment.ood is False and assessment.confidence >= 0.6
+    proposal = learned_proposal(
+        0.9, confidence=assessment.confidence, inference_id=assessment.inference_id
+    )
+    attached: object = assessment
+    if violation == "missing_assessment":
+        attached = None
+    elif violation == "another_inference":
+        other = at_action(observed, observed.action_ts_ms + 1_000)
+        attached = _deployed(
+            assessor(profile).assess(
+                other, model.predict(other), evidence(profile, 1.0, at=other.action_ts_ms)
+            )
+        )
+    elif violation == "offline_artifact":
+        attached = assessment.model_copy(
+            update={"artifact_verification": ArtifactVerification.OFFLINE_UNVERIFIED}
+        )
+    elif violation == "another_model_version":
+        proposal = proposal.model_copy(update={"model_version": "thermal-v1"})
+        attached = assessment.model_copy(update={"model_version": "thermal-v0"})
+    elif violation == "proposal_confidence_raised":
+        proposal = proposal.model_copy(update={"confidence": 1.0})
+    elif violation == "proposal_hides_ood":
+        ood_input = shifted(observed, air=35.0)
+        ood_assessment = _deployed(
+            assessor(profile).assess(ood_input, model.predict(ood_input), None)
+        )
+        proposal = learned_proposal(0.9, confidence=0.95, inference_id=ood_assessment.inference_id)
+        attached = ood_assessment
+    elif violation == "forged_components":
+        # 検証を通らない形で値だけ書き換えた assessment は、Gate へ渡す status を作れない
+        forged = assessment.model_copy(update={"confidence": 1.0})
+        with pytest.raises(ValidationError, match="最小値"):
+            LearnedControlStatus(
+                proposal=proposal.model_copy(update={"confidence": 1.0}),
+                received_at_mono_ms=0,
+                assessment=forged,
+            )
+        return
+
+    gate = ControllerGate(
+        policy(authority="full", recovery_hold_ms=1), expected_model_version="thermal-v1"
+    )
+    first = _select(gate, 0, proposal, attached)
+    second = _select(gate, 1, proposal, attached)
+    for selected in (first, second):
+        assert selected.active_controller is ControllerKind.FALLBACK, violation
+        assert selected.fallback_reason is not None
+        assert selected.fallback_reason.code in {"confidence_unattested", "ood"}
+
+
+def test_a1_matching_assessment_is_accepted(trained) -> None:
+    _data, parts, model, profile = trained
+    observed = ObservedThermalInput.from_example(parts.test[7])
+    assessment = _deployed(
+        assessor(profile).assess(
+            observed, model.predict(observed), evidence(profile, 1.0, at=observed.action_ts_ms)
+        )
+    )
+    proposal = assessment.apply_to(
+        learned_proposal(0.9, confidence=0.0, inference_id=assessment.inference_id)
+    )
+    gate = ControllerGate(
+        policy(authority="limited", recovery_hold_ms=1), expected_model_version="thermal-v1"
+    )
+    _select(gate, 0, proposal, assessment)
+    selected = _select(gate, 1, proposal, assessment)
+    assert selected.active_controller is ControllerKind.LEARNED_MPC
+    assert selected.model_gate is not None
+    assert selected.model_gate.assessment == assessment.trace_reasons()
+
+
+def test_c1_residual_age_must_exceed_the_match_tolerance(tmp_path) -> None:
+    del tmp_path
+    with pytest.raises(ValidationError, match="residual_max_age_ms"):
+        tuned(residual_max_age_ms=500).model_validate(
+            tuned(residual_max_age_ms=500).model_dump(mode="python")
         )

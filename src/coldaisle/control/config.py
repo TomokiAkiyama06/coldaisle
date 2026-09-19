@@ -495,6 +495,8 @@ class ModelConfidencePolicy(_ConfigModel):
     """
     residual_match_tolerance_ms: ConfigValue[NonNegativeMilliseconds]
     """期待時刻の前後それぞれに許す照合の幅（決定記録 0031 §2.2 と同じ最近傍・同距離は過去側）。"""
+    residual_max_age_ms: ConfigValue[PositiveMilliseconds]
+    """解決からこれを過ぎた forecast は residual の証拠に数えない（古い証拠で上限を外さない）。"""
     residual_drift_ood_ratio: ConfigValue[DriftRatio]
     """正規化 residual の RMS が validation 基準のこの倍率以上なら OOD。"""
     cap_without_uncertainty: PolicyUnitInterval
@@ -510,6 +512,10 @@ class ModelConfidencePolicy(_ConfigModel):
             # 予測が当たっている証拠が無い間に HIGH（帯なしの authority）へ届かせない。
             raise ValueError(
                 "model_confidence.cap_before_residual_evidence は high_min_confidence 未満にする"
+            )
+        if self.residual_max_age_ms.value <= self.residual_match_tolerance_ms.value:
+            raise ValueError(
+                "model_confidence.residual_max_age_ms は residual_match_tolerance_ms より長くする"
             )
         if self.residual_min_samples.value > self.residual_window.value:
             raise ValueError("model_confidence.residual_min_samples は residual_window 以下にする")
@@ -987,6 +993,7 @@ class ControlConfig(_ConfigModel):
             "residual_window",
             "residual_min_samples",
             "residual_match_tolerance_ms",
+            "residual_max_age_ms",
             "residual_drift_ood_ratio",
             "cap_without_uncertainty",
             "cap_before_residual_evidence",

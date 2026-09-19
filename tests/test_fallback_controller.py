@@ -12,6 +12,12 @@ from coldaisle.control.fallback import (
     LearnedFailure,
     SnapshotStatus,
 )
+from coldaisle.control.model.confidence import (
+    ComponentResult,
+    ConfidenceAssessment,
+    ConfidenceComponent,
+)
+from coldaisle.control.model.thermal import ArtifactVerification
 from coldaisle.control.schema import (
     AuthorityStage,
     ControllerKind,
@@ -182,6 +188,7 @@ def policy(
             "residual_window": provisional(20),
             "residual_min_samples": provisional(5),
             "residual_match_tolerance_ms": provisional(500),
+            "residual_max_age_ms": provisional(60_000),
             "residual_drift_ood_ratio": provisional(3.0),
             "cap_without_uncertainty": provisional(0.9),
             "cap_before_residual_evidence": provisional(0.7),
@@ -318,10 +325,51 @@ def fallback_proposal(demand: float = 0.4) -> ControllerProposal:
     )
 
 
+def assessment_for(proposal: ControllerProposal) -> ConfidenceAssessment:
+    """提案と同じ推論・値を持つ、Registry 検証済みの assessment（Gate の試験用）。"""
+    assert proposal.confidence is not None and proposal.inference_id is not None
+    assert proposal.model_version is not None
+    components = tuple(
+        ComponentResult(component=component, score=1.0, ood=False)
+        for component in ConfidenceComponent
+    )
+    if proposal.ood:
+        components = (
+            ComponentResult(component=ConfidenceComponent.MODEL_BINDING, score=0.0, ood=True),
+            *components[1:],
+        )
+    else:
+        components = (
+            ComponentResult(
+                component=ConfidenceComponent.MODEL_BINDING,
+                score=proposal.confidence,
+                ood=False,
+            ),
+            *components[1:],
+        )
+    return ConfidenceAssessment(
+        model_id="rack-thermal",
+        model_version=proposal.model_version,
+        artifact_sha256="a" * 64,
+        artifact_verification=ArtifactVerification.REGISTRY_VERIFIED,
+        profile_sha256="d" * 64,
+        input_action_ts_ms=10_000,
+        inference_id=proposal.inference_id,
+        confidence=0.0 if proposal.ood else proposal.confidence,
+        ood=proposal.ood,
+        components=components,
+    )
+
+
 def healthy_status(*, received: int = 0, proposal: ControllerProposal | None = None):
+    selected = proposal or learned_proposal()
+    if selected.ood:
+        # OOD の assessment の confidence は 0。提案も同じ値にする
+        selected = selected.model_copy(update={"confidence": 0.0})
     return LearnedControlStatus(
-        proposal=proposal or learned_proposal(),
+        proposal=selected,
         received_at_mono_ms=received,
+        assessment=assessment_for(selected),
     )
 
 
