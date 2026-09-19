@@ -3,7 +3,10 @@
 - **種別**: Decision Record
 - **Status**: FINAL（2026-09-20、リポジトリ所有者が承認）
 - **Date**: 2026-09-20
-- **Supersedes**: なし（決定記録 0046 §2.7 は変えない。内部テレメトリの札の決め方を足す）
+- **Supersedes**: [0051](0051-airflow-cpu-utilization-display.md) §2.1 のうち、CPU 使用率の
+  **いまの値**の札を「内部テレメトリの『読み取り値』」に固定する部分のみ（§2.5）。
+  0051 の「未計測 / 未取得」の判断（`cpu_utilization.measured`）、§2.3 の過去の値の扱い、
+  その他の節は有効。決定記録 0046 §2.7（取り込み経路 `air.*` の札）も変えない
 - **関連**: [`0002-metric-naming.md`](0002-metric-naming.md) §2.6 /
   [`0009-read-api.md`](0009-read-api.md) §2.8 /
   [`0040-server-health-api.md`](0040-server-health-api.md) /
