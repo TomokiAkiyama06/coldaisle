@@ -61,8 +61,18 @@
 「加算だから互換」と言えるのは列挙が開いているときだけで、ここは閉じている。
 版を上げることで「この snapshot は新しい読み手が要る」を宣言する。
 
-`coldaisle.control.model.thermal.ThermalRegistryMetadata` は #104 metadata の写しなので、
-**版を lockstep で上げる**。thermal model 側の欄は何も変わっていない。
+**ただし v2 の registry は読む。** 読めないことにすると、v2 で動いている既存の
+production artifact（thermal model）がすべて `INVALID_REGISTRY` になり Fallback へ落ちる。
+v3 の差は列挙の値が1つ増えただけで、v2 の snapshot は新しい列挙でそのまま復号できる。
+
+- **読める版は 2 と 3**（`MODEL_REGISTRY_READABLE_SCHEMA_VERSIONS`）。書き出す版は 3
+- **v2 は次の書き込みで v3 へ上がる。** 読むだけでは snapshot を書き換えない
+- 2 と 3 以外（未知の版）は従来どおり **fail closed**（`INVALID_REGISTRY`）
+- `coldaisle.control.model.thermal.ThermalRegistryMetadata` は #104 metadata の写しなので
+  同じく 2 と 3 を受け付け、書き出しは 3。**封筒の版は artifact が決める値ではない**ので、
+  artifact との照合（`_registry_contract`）には入れない。入れると、v2 で登録済みの
+  thermal artifact が snapshot は読めるのに束縛で落ちる
+- `RegistryHealthReport.supported_schema_version`（#104 / 0062）は書き出す版の 3 に揃える
 
 良くなること。
 
@@ -201,7 +211,7 @@ shadow:   { minimum_ticks, minimum_paired_fraction }
 **「反実仮想の裏づけを要求するか」は設定に出さない。** 設定で切れる安全条件は設定次第で
 破れる（0052 §4 (c) と同じ理由）。`for_active` がコードとして常に要求する。
 
-### 2.6 Shadow の集計は 0055 と同じ重複規則・版束縛・fail closed
+### 2.6 Shadow の集計は 0055 と同じ重複規則・完全な識別の束縛・fail closed
 
 `SupervisorShadowLedger` は同じ tick の Rule（active）と RL（shadow）の提案を突き合わせる。
 制御へ戻る経路は持たない。
@@ -211,8 +221,20 @@ shadow:   { minimum_ticks, minimum_paired_fraction }
   消えるので、照合器が選ばない
 - **片方しか無い tick を一致として数えない。** RL の提案が無い tick は `Reason.code` ごとに
   数え、対になった tick だけを比較の母数にする
-- **版を名指しする。** Rule / RL の policy version を台帳が束縛し、違う版の提案を同じ表に
-  混ぜない
+- **Rule は版、RL は artifact の完全な識別を束縛する。** `SupervisorOutput.version` は
+  semantic version だけで、同じ版を名乗る別の model ID・別の bytes を区別できない。
+  そこで `SupervisorPolicyIdentity`（model ID・版・artifact bytes の SHA-256）を作り、
+  次のように運ぶ
+  - `RegimeTableRlPolicy.identity`: Registry を通した instance は attestation の値、
+    `offline` は canonical bytes から導いた値（同じ artifact なら同じ値）
+  - `deliver()` が `ReceivedSupervisorOutput.identity` へ写す。呼び出し側が選べない
+  - `SupervisorCoordinator` は `expected_rl_identity` を受け取り、**完全一致しない提案・
+    identity の無い提案を `supervisor_identity_mismatch` で拒む**（active / shadow どちらの
+    slot でも）。成功した提案の識別は `SupervisorPolicyEvaluation.policy_identity` として
+    trace に残す（**trace の加算的な追加**。成功した RL 出力にだけ付けられる）
+  - `SupervisorShadowLedger` は `rl_identity` を束縛し、完全一致しない・識別の無い提案を
+    数えずに拒む。`SupervisorShadowSummary` も識別を持つので、別 artifact の集計と
+    digest（= `shadow_evaluation_ref`）が混ざらない
 - **時刻は観測した decision から取る**（壁時計を読まない。0054 §2.7）
 - `minimum_ticks` と `minimum_paired_fraction` を満たさない集計は `usable=False` で、
   **「差が無かった」と読めない**（fail closed）
@@ -318,6 +340,11 @@ Baseline の欄が `output_bounds` の外にあれば**丸めず拒む**。
 | 未知の capability を前方互換に復号する（版は据え置く） | 復号だけ通しても、再書き出しで未知の値が失われる。#104 の内部表現を変える話になり、本記録の範囲を超える。版を上げるほうが意図を正しく伝える |
 | 束縛の用途を `SupervisorOutput` の欄にする | #88 / 0028 §2.3 の出力 schema を広げることになる。用途は「誰が作ったか」であって提案の内容ではないので、worker→loop の carrier（`ReceivedSupervisorOutput`）が持つ |
 | shadow slot でも `active_binding` 以外を拒む | 昇格前の候補を観測できなくなる。shadow は MPC にも Fan にも届かないので、用途を問う必要がない |
+| registry の読みも v3 だけにする（v2 を `INVALID_REGISTRY` にする） | v2 で動いている既存の production artifact がすべて使えなくなり Fallback へ落ちる。書き出しだけ v3 にして読みは v2 も受け付ければ、移行で使えなくなるものが無い |
+| v2 → v3 の移行を専用の書き換え操作にする | 読みが v2 を受け付けるので不要。次の通常の書き込みで v3 になる。読むだけで snapshot を書き換えない |
+| thermal の照合に封筒の schema version を入れ続ける | 封筒の版は artifact が決める値ではない。入れると v2 で登録済みの artifact が束縛で落ちる |
+| shadow 証拠の識別を semantic version だけで持つ | 同じ版を名乗る別の model ID・別の bytes を区別できず、別 artifact の集計を同じ証拠として読める |
+| 識別の照合を台帳だけにする（Coordinator は版だけ） | 同じ版を名乗る別 artifact の提案が Coordinator を通って trace に残り、台帳で初めて落ちる。運ぶ側と数える側の両方で照合する |
 | Baseline の表を `supervisor.rule_policy.contexts` から作る | 版だけ同じで context の違う policy を渡されると、報告の Baseline arm と `baseline` 候補の表が別物になる。表は評価する policy そのものに聞く |
 | 候補ごとに「Baseline と揃えた長さ」で採点し、その平均を並べる | 候補ごとに長さの違う平均を同じ表に並べることになり、途中で終わった候補が有利になる（0058 §2.6） |
 | 束縛時に照合する Registry metadata の欄を手で並べる | あとから足した欄が照合から漏れる。正しい bytes に別の metadata を付けた登録が通る |
@@ -336,8 +363,8 @@ Baseline の欄が `output_bounds` の外にあれば**丸めず拒む**。
 ## 5. 未決事項
 
 - **本記録は `Proposed` で、所有者の承認が要る。** とくに §2.1 は #104 の公開契約を広げ、
-  **registry の schema 版を 2 から 3 へ上げる**（`ThermalRegistryMetadata` も lockstep）。
-  進行中の #104（PR #162）も v2 を前提にしているので、**どちらを先に入れるかの判断が要る**
+  **registry の書き出し版を 2 から 3 へ上げる**（v2 は読み、次の書き込みで v3 へ上がる）。
+  #104（PR #162 / 決定記録 0062）は main に入り、`RegistryHealthReport` の版を 3 に揃えた
 - **`for_active` を開く条件が未決**（§2.4）。何をもって「反実仮想の裏づけ」とみなし、
   誰がその証拠を発行するか。候補は (a) 環境が封をした `DynamicsEvidence` の系譜を
   policy 側へ運べる形にする、(b) 学習で束縛した反実仮想 thermal artifact の
