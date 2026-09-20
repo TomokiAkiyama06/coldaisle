@@ -56,6 +56,24 @@ action から demand への写像は環境が持たない。`LearnedMpcControlle
 `ControllerGate`（#79 / #85）をそのまま通し、**環境が demand を作る API は存在しない**。
 その結果、低 Confidence / OOD の tick は環境の中でも Fallback になり、step の記録に残る。
 
+#### Learned MPC を束縛できない runtime を、そのまま表す
+
+`LearnedMpcController` を作るには `MpcModelBinding` が要り、それには反実仮想能力を申告した
+artifact が要る。**いまは1つも無い**（§2.3）。環境が controller を必須にすると、
+記録済み trajectory を回すためだけに**偽の attestation を用意する**ことになり、
+0052 §2.1 の規律をこちら側で崩してしまう。
+
+そこで環境は `mpc=None` と「束縛できなかった理由」を受け取れる。その場合、理由は運転時と
+同じ `LearnedFailure.MODEL_LOAD_FAILURE` として `ControllerGate` へ渡り、requested は
+Fallback が作る。**新しい失敗経路を足していない。** 運転時に model 読込が失敗したときと
+同じ経路をそのまま通す（AGENTS.md ルール4）。
+
+**その episode では Supervisor action が demand に一切効かない。** 結果は
+`learned_controller_available=false` を必ず持ち、`promotable` にはできない。
+`PolicyComparison` は arm 間でこの値が揃っていることを要求する。片方だけ controller が
+居る比較は policy の差を測っていないためで、両方 `false` の比較は「差が無かった」ではなく
+**「action が効いていない条件で回した」**と読む。
+
 ### 2.2 dynamics の出どころを3つに分け、step ごとに残す
 
 | provenance | 出どころ | 昇格の根拠にできるか |
@@ -68,10 +86,14 @@ action から demand への写像は環境が持たない。`LearnedMpcControlle
 hybrid は step ごとに provenance を残し、**近似の step が1つでも混ざった episode は
 `promotable=False`** にする。混ぜたまま平均すると、実測の裏づけが近似の外挿で薄まる。
 
-`logged` では、要求 demand が記録と `shadow.applied_demand_tolerance`（#90 の設定。
-評価用に別の幅を持たない。0054 §2.6）の範囲で一致しない step を `supported=False` として数え、
-**観測も reward も作らない**。別の action が掛かっていた区間の実測をその提案の成果にしない、
-という 0053 §2.3 / 0054 §2.2 の帰属規則をそのまま使う。
+`logged` では、要求 demand が記録と `shadow.applied_demand_tolerance` の範囲で一致しない
+step を `supported=False` として数え、**観測も reward も作らない**。別の action が掛かって
+いた区間の実測をその提案の成果にしない、という 0053 §2.3 / 0054 §2.2 の帰属規則をそのまま使う。
+
+**許容幅は呼び出し側から受け取らない。** `LoggedTrajectoryDynamics` は検証済みの
+`ShadowConfig`（`config/fan-policy.yaml` の `shadow`）を受け取り、そこから幅を読む。
+scalar で受け取れると、記録された coverage と意味の違う幅で照合した結果を同じ表に
+並べられてしまう（0054 §2.6 と同じ規則）。
 
 ### 2.3 近似 simulator は Registry の証拠を名乗れない（0052 の規律を環境にも置く）
 
@@ -85,6 +107,18 @@ hybrid は step ごとに provenance を残し、**近似の step が1つでも�
 `counterfactual_action` であること、モデルの自称 identity と schema version が attestation と
 一致することを要求する。**現行の artifact はすべて `observational_replay` なので、この経路は
 決定論的にすべて拒む。** 0052 §2.1 と同じで、拒否は不具合ではなく意図した振る舞いである。
+
+**昇格の判断は identity の文字列を見ない。** `DynamicsIdentity` はただの値なので、
+`registry_attested` と `artifact_sha256` を並べた identity は誰でも組み立てられる。
+`attested_evidence()` は `EnvironmentDynamics.attestation`（`ArtifactAttestation` object）を
+要求し、その `kind` / `capability` / `model_id` / 版 / artifact hash が identity と一致する
+ことまで確かめる。`ArtifactAttestation` は Registry の検証経路だけが発行するので、
+近似 simulator はこれを用意できない。`DynamicsIdentity.claims_evidence` は**自称**であり、
+昇格の判断には使わない。
+
+**step ごとの provenance も自称である。** `EnvironmentDynamics` は「自分が出しうる出どころ」
+（`provenances`）を宣言し、環境はその集合に無い step を受け取らず `DYNAMICS_UNUSABLE` として
+終端する。近似 simulator が「記録から来た」と名乗る step を返す経路を塞ぐ。
 
 `production_active` は**要求しない**。0052 §2.1 が「Replay / offline 評価は production でない
 attestation をそのまま使う」としているためで、ここは制御経路ではない。代わりに、
@@ -120,6 +154,10 @@ attestation をそのまま使う」としているためで、ここは制御�
 | 観測が `safety.absolute_temp_ceiling_c` を超えた | `ceiling_exceedances` を数え、`SAFETY_VIOLATION` で終端 |
 | action が `supervisor.output_bounds` の外 | `invalid_actions` を数え、`INVALID_ACTION` で終端 |
 
+**screen は `reset` の時点でも掛ける。** 初期 window が既に上限を超えていたり、初期 demand が
+floor を下回っていたりする episode を「まだ1 step も進んでいないから安全」として agent へ
+見せない。違反している初期 state の episode は、1 step も進まずに `SAFETY_VIOLATION` で終わる。
+
 **違反したら探索を止める。** 運転時は #78 が引き上げるが、環境がそれを模すと
 「Safety が直してくれる」前提の policy を学習させてしまう。
 `EpisodeResult` は、違反を持つ結果を `HORIZON` で終わったことにできないよう型で縛る。
@@ -129,9 +167,16 @@ floor を下回らせない）。起きたら設定か Baseline が壊れてい�
 
 ### 2.6 再現性と比較の鍵
 
-- seed・workload trace・初期 window・初期 demand・dynamics の identity・reward 版・
-  設定 bytes の hash・authority stage・期待 model 版・安全 screen・coverage 下限・
-  action 空間を `conditions_sha256` が覆う（0054 §2.7 と同じ考え方）
+- `conditions_sha256` は **結果に効く依存をすべて覆う**（0054 §2.7 と同じ考え方）。
+  seed・workload trace・初期 window・初期 demand・reward 版・`rl-training.yaml` の hash・
+  **`fan-policy.yaml` と `safety.yaml` を丸ごと hash した値**（mpc.optimizer・authority stage・
+  gate 閾値・復帰 hold・shadow の許容幅を欄ごとに数え落とさないため）・期待 model 版・
+  Learned MPC の有無・安全 screen・coverage 下限・action 空間を入れる
+- **`dynamics.identity` ではなく `dynamics.conditions()` を入れる。** 照合の許容幅や、
+  hybrid が内側に持つ記録は identity に現れないのに結果を変える
+- **注入した依存は呼び出し側が名指しする。** Baseline の factory も Acoustic Model も
+  hash できないので、`DependencyIdentity`（名前・版・設定 hash）を**必須**で受け取り、
+  条件へ入れる。名指しの無い依存は受け取らない
 - **policy は条件に入れない。** Rule と RL を同じ条件で比べる鍵にするためである
 - episode ごとに条件は違う（識別子も seed も違う）ので、arm の比較では
   **(episode_id, 条件 hash) の並び**を突き合わせ、違えば受け取らない
@@ -139,6 +184,12 @@ floor を下回らせない）。起きたら設定か Baseline が壊れてい�
   設定した刻みから来る）
 - coverage（採点できた step 数・割合・できなかった理由の内訳）は一級の出力で、
   下限に満たない episode は `usable_for_comparison=False` として**比較に使わない**（fail closed）
+- **arm ごとに落ちた episode を捨てない。** `PolicyComparison` は、比較に使える episode の
+  識別子の並びが arm 間で一致することを要求する。捨てると arm ごとに母集団が変わり、
+  都合の悪い episode が消えた arm が勝ってしまう
+- **長さの違う episode の総和を並べない。** 途中で終わった episode は負の reward を積む
+  回数が少ないので、総和で比べると「早く壊れたほうが良い」になる。比較は episode ごとに
+  **すべての arm が採点できた step 数（最小）**まで揃えたうえで行う
 
 ### 2.7 設定は `config/rl-training.yaml`（schema v1。値はすべて暫定）
 
@@ -161,11 +212,17 @@ simulator: { model_id, model_version, responses: [...] }
 
 | やりたいこと | いまできるか |
 |---|---|
-| 記録済み trajectory からの offline RL | **できる。** ただし記録と同じ action の区間だけ採点でき、残りは coverage に出る |
+| 記録済み trajectory からの offline RL データ収集 | **できる。** 記録と同じ action の区間だけ採点でき、残りは coverage に出る |
+| Learned MPC を通した action の評価 | **できない。** `MpcModelBinding` を作れる artifact が1つも無いので、環境は `learned_controller_available=false` で回る |
 | Registry 検証済みの learned simulator での policy 評価 | **できない。** 反実仮想能力を申告した artifact が1つも無い |
 | 近似 simulator での探索 | **研究用途に限り回せる。** 結果は `promotable=false` で、昇格の根拠にできない |
-| Rule / RL を同じ episode 群で比較 | できる。ただし上の裏づけの区別はそのまま結果に残る |
+| Rule / RL を同じ episode 群で比較 | 仕組みはある。ただし **controller が無い間は両 arm の requested が同一になり、差は出ない**（`learned_controller_available=false` が結果に残る） |
 | #91 Offline Evaluation への出力 | episode 結果を arm として渡せる形にしたが、**gate への接続は #91 / #92 側で決める**（§5） |
+
+**いちばん重要な帰結**: 反実仮想 artifact が揃うまで、この環境で意味のある学習・比較ができるのは
+「記録済み trajectory のデータ収集」までである。**action が demand に効く形で policy を比べる
+ことは、まだできない。** 環境はその事実を `learned_controller_available` として毎回の結果に残し、
+`promotable` を立てない。
 
 良くなること。
 
@@ -190,6 +247,15 @@ simulator: { model_id, model_version, responses: [...] }
 
 | 案 | 却下理由 |
 |---|---|
+| 記録済み trajectory を回すために、試験用の attestation を production へ昇格させる | 0052 §2.1 の promotion の規律をこちら側で崩す。`mpc=None` の経路を持てば偽の証拠は要らない |
+| `identity.provenance` が `registry_attested` なら裏づけありとみなす | provenance も hash もただの値。近似 simulator でも名乗れる。`ArtifactAttestation` object を要求する |
+| step ごとの provenance をそのまま信じる | 近似 simulator が「記録から来た」と名乗れる。出しうる出どころを宣言させ、外れた step を拒む |
+| 呼び出し側が渡した設定 hash だけを条件に入れる | 中身と食い違う hash を渡せる。検証済み設定 object からの hash も併せて入れる |
+| 記録照合の許容幅を呼び出し側から scalar で受け取る | 記録された coverage と意味の違う幅で照合した結果を、同じ表に並べられる（0054 §2.6） |
+| Baseline / Acoustic を条件 hash に載せない（factory は hash できないから） | 依存の差が policy の差に見える。名指しを必須にすれば載せられる |
+| arm ごとに coverage 不足の episode を落として平均する | arm ごとに母集団が変わる。都合の悪い episode が消えた arm が勝つ |
+| 長さの違う episode の割引総和をそのまま平均する | 早く終わった episode ほど負の reward が少ない。「早く壊れたほうが良い」になる |
+| 初期 state に screen を掛けない（1 step 進んでから見る） | 上限を超えた state を agent に見せ、そこから探索を始めてしまう |
 | agent に Fan Demand を直接探索させ、あとで Guard / Safety を掛ける | #89 の action 定義（0027 / 0028 §2.3）と違う。MPC を通さない demand を学習させることになる |
 | 近似 simulator に `registry_attested` を名乗らせ、pipeline を「完成」に見せる | 0048 §2.1 / 0052 §2.1 が禁じている読み替えそのもの。裏づけの無い予測から出た policy が昇格の根拠に混ざる |
 | 反実仮想 artifact が無いので、環境そのものを作らない | 記録済み trajectory からの offline RL は**いまでもできる**。環境の interface（#89 の利用者）も先に固められる |

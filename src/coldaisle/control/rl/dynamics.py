@@ -27,6 +27,7 @@ from typing import Protocol, Self
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from coldaisle.control.config import ShadowConfig
 from coldaisle.control.model.thermal import (
     ObservedFanAction,
     ObservedThermalInput,
@@ -101,8 +102,14 @@ class DynamicsIdentity(_Frozen):
         return self
 
     @property
-    def evidence_backed(self) -> bool:
-        """実測または Registry の証拠に裏づけられているか。"""
+    def claims_evidence(self) -> bool:
+        """**自称**として実測 / Registry の裏づけを名乗っているか。
+
+        **これを昇格の判断に使わない。** provenance も hash も、ただの値なので
+        `registry_attested` を名乗る identity は誰でも組み立てられる。裏づけの判断は
+        `attested_evidence()` が `ArtifactAttestation` そのものを見て行う
+        （決定記録 0058 §2.3）。
+        """
         return self.provenance is not DynamicsProvenance.SIMULATED_PROVISIONAL
 
 
@@ -179,7 +186,35 @@ class EnvironmentDynamics(Protocol):
 
     @property
     def identity(self) -> DynamicsIdentity:
-        """この dynamics の出どころ。"""
+        """この dynamics の出どころ。**自称であって証拠ではない。**"""
+        ...
+
+    @property
+    def attestation(self) -> ArtifactAttestation | None:
+        """Registry が発行した証拠そのもの。持たない dynamics は `None` を返す。
+
+        **昇格の判断はこの object を見る。** `identity.provenance` は文字列なので、
+        近似 simulator でも `registry_attested` を名乗る値を組み立てられてしまう
+        （決定記録 0058 §2.3）。`ArtifactAttestation` は Registry の検証経路だけが
+        発行するので、自称では用意できない。
+        """
+        ...
+
+    @property
+    def provenances(self) -> frozenset[DynamicsProvenance]:
+        """この dynamics が出しうる step の出どころ。
+
+        **step ごとの provenance も自称である。** 環境はこの集合に無い出どころの step を
+        受け取らず、`DYNAMICS_UNUSABLE` として episode を終端する。hybrid だけが2つを持つ。
+        """
+        ...
+
+    def conditions(self) -> dict[str, object]:
+        """条件 hash へ載せる、この dynamics の**結果に効くすべて**。
+
+        identity だけでは足りない。照合の許容幅や、hybrid が内側に持つ記録は
+        identity に現れないのに結果を変える（決定記録 0058 §2.6）。
+        """
         ...
 
     def advance(self, request: DynamicsRequest, *, rng: Random) -> DynamicsStep:
@@ -250,6 +285,20 @@ class SimulatedThermalDynamics:
     def identity(self) -> DynamicsIdentity:
         """近似 simulator であることを明示する identity。"""
         return self._identity
+
+    @property
+    def attestation(self) -> ArtifactAttestation | None:
+        """**常に `None`。** 近似 simulator は Registry の証拠を持たない。"""
+        return None
+
+    @property
+    def provenances(self) -> frozenset[DynamicsProvenance]:
+        """近似の step しか出さない。"""
+        return frozenset({DynamicsProvenance.SIMULATED_PROVISIONAL})
+
+    def conditions(self) -> dict[str, object]:
+        """条件 hash へ載せる値。設定 bytes の hash が応答の中身を覆う。"""
+        return {"identity": self._identity.model_dump(mode="json")}
 
     def advance(self, request: DynamicsRequest, *, rng: Random) -> DynamicsStep:
         """設定した平衡温度へ1次遅れで近づける。同じ seed からは同じ列になる。"""
@@ -324,11 +373,14 @@ class LoggedTrajectoryDynamics:
 
     __slots__ = ("_identity", "_tolerance", "_trajectory")
 
-    def __init__(self, trajectory: LoggedTrajectory, *, applied_demand_tolerance: float) -> None:
-        if not 0.0 <= applied_demand_tolerance < 1.0:
-            raise DynamicsUnusableError("applied_demand_tolerance は 0.0 以上 1.0 未満にする")
+    def __init__(self, trajectory: LoggedTrajectory, *, shadow: ShadowConfig) -> None:
+        """照合の許容幅は**検証済み設定から取る**（呼び出し側の写しを受け取らない）。
+
+        評価側が独自の幅を持たないのと同じ理由である（決定記録 0054 §2.6）。別の幅で
+        照合した結果を、同じ coverage として並べられないようにする。
+        """
         self._trajectory = trajectory
-        self._tolerance = applied_demand_tolerance
+        self._tolerance = shadow.applied_demand_tolerance.value
         self._identity = DynamicsIdentity(
             provenance=DynamicsProvenance.LOGGED_TRAJECTORY,
             model_id=trajectory.trajectory_id,
@@ -340,6 +392,28 @@ class LoggedTrajectoryDynamics:
     def identity(self) -> DynamicsIdentity:
         """記録再生であることを明示する identity。"""
         return self._identity
+
+    @property
+    def attestation(self) -> ArtifactAttestation | None:
+        """**常に `None`。** 記録再生は artifact ではない。"""
+        return None
+
+    @property
+    def provenances(self) -> frozenset[DynamicsProvenance]:
+        """記録再生の step しか出さない。"""
+        return frozenset({DynamicsProvenance.LOGGED_TRAJECTORY})
+
+    @property
+    def applied_demand_tolerance(self) -> float:
+        """記録と同じ action とみなす幅（`fan-policy.yaml` の `shadow` から取った値）。"""
+        return self._tolerance
+
+    def conditions(self) -> dict[str, object]:
+        """条件 hash へ載せる値。**許容幅も入れる**（coverage が変わるため）。"""
+        return {
+            "identity": self._identity.model_dump(mode="json"),
+            "applied_demand_tolerance": self._tolerance,
+        }
 
     def advance(self, request: DynamicsRequest, *, rng: Random) -> DynamicsStep:
         """記録された次の観測を返す。記録と違う action なら観測を作らない。"""
@@ -401,9 +475,26 @@ class HybridDynamics:
         return self._identity
 
     @property
+    def attestation(self) -> ArtifactAttestation | None:
+        """**常に `None`。** 近似を含む以上、Registry の証拠は名乗れない。"""
+        return None
+
+    @property
+    def provenances(self) -> frozenset[DynamicsProvenance]:
+        """記録と近似の両方を出す。**step ごとにどちらかが残る。**"""
+        return self._logged.provenances | self._simulated.provenances
+
+    @property
     def logged_identity(self) -> DynamicsIdentity:
         """記録側の identity（条件 hash に入れる）。"""
         return self._logged.identity
+
+    def conditions(self) -> dict[str, object]:
+        """**内側の2つを両方載せる。** identity だけでは記録側が条件から消える。"""
+        return {
+            "logged": self._logged.conditions(),
+            "simulated": self._simulated.conditions(),
+        }
 
     def advance(self, request: DynamicsRequest, *, rng: Random) -> DynamicsStep:
         """記録で説明できればそちらを、できなければ近似を使う。"""
@@ -506,8 +597,20 @@ class AttestedThermalDynamics:
 
     @property
     def attestation(self) -> ArtifactAttestation:
-        """束ねたときの Registry の証拠。"""
+        """束ねたときの Registry の証拠。**昇格の判断はこれを見る。**"""
         return self._attestation
+
+    @property
+    def provenances(self) -> frozenset[DynamicsProvenance]:
+        """Registry の証拠に裏づけられた step しか出さない。"""
+        return frozenset({DynamicsProvenance.REGISTRY_ATTESTED})
+
+    def conditions(self) -> dict[str, object]:
+        """条件 hash へ載せる値。Registry の証拠をそのまま覆う。"""
+        return {
+            "identity": self._identity.model_dump(mode="json"),
+            "attestation": self._attestation.trace_metadata(),
+        }
 
     def advance(self, request: DynamicsRequest, *, rng: Random) -> DynamicsStep:
         """1 step 分の反実仮想予測を次の観測として使う。"""
@@ -528,3 +631,32 @@ class AttestedThermalDynamics:
             ),
             values=values,
         )
+
+
+def attested_evidence(dynamics: EnvironmentDynamics) -> bool:
+    """この dynamics が**証拠に裏づけられた**遷移を作るかを返す。
+
+    `identity.provenance` の文字列だけを見ない。`registry_attested` を名乗る dynamics には
+    `ArtifactAttestation` を要求し、その中身（kind / capability / model ID / 版 / artifact hash）が
+    identity と一致することまで確かめる。`ArtifactAttestation` は Registry の検証経路だけが
+    発行するので、近似 simulator はこれを用意できない（決定記録 0052 §2.1 / 0058 §2.3）。
+
+    **同一プロセス内の悪意ある偽造までは防げない**（決定記録 0050 §3）。狙いは、裏づけの無い
+    dynamics が「検証済み」を名乗って昇格の根拠へ混ざる**配線の誤り**を止めることである。
+    """
+    identity = dynamics.identity
+    attestation = dynamics.attestation
+    if identity.provenance is DynamicsProvenance.LOGGED_TRAJECTORY:
+        # 記録再生は artifact ではない。証拠は記録そのもので、trace digest が identity にある。
+        return attestation is None
+    if identity.provenance is not DynamicsProvenance.REGISTRY_ATTESTED:
+        return False
+    if attestation is None:
+        return False
+    return (
+        attestation.kind is ArtifactKind.THERMAL_MODEL
+        and attestation.capability is ArtifactCapability.COUNTERFACTUAL_ACTION
+        and attestation.model_id == identity.model_id
+        and attestation.version == identity.model_version
+        and attestation.artifact_sha256 == identity.artifact_sha256
+    )

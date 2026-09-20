@@ -42,11 +42,13 @@ from coldaisle.control.model_registry import ArtifactCapability
 from coldaisle.control.rl import (
     ActionSpace,
     AttestedThermalDynamics,
+    DependencyIdentity,
     DynamicsIdentity,
     DynamicsProvenance,
     DynamicsStep,
     DynamicsUnusableError,
     EnvironmentUsageError,
+    EpisodeResult,
     EpisodeSpec,
     HybridDynamics,
     InvalidSupervisorActionError,
@@ -63,6 +65,7 @@ from coldaisle.control.rl import (
     TrainingMode,
     WorkloadSample,
     WorkloadTrace,
+    attested_evidence,
 )
 from coldaisle.control.schema import (
     ConfidenceLevel,
@@ -310,6 +313,20 @@ def episode_spec(
     )
 
 
+def baseline_identity(demand: float) -> DependencyIdentity:
+    """Baseline を条件 hash へ載せるための名指し。"""
+    return DependencyIdentity(
+        name="constant-baseline",
+        version="1",
+        digest=sha256(f"{demand:.6f}".encode()).hexdigest(),
+    )
+
+
+def shadow_config(authority: str = "limited"):
+    """記録照合の許容幅を持つ検証済み設定（**呼び出し側の写しを使わない**）。"""
+    return _mpc_policy(authority).shadow
+
+
 def build_environment(
     trained,
     *,
@@ -317,13 +334,26 @@ def build_environment(
     dynamics: Any = None,
     baseline_demand: float = 0.4,
     authority: str = "limited",
+    with_mpc: bool = True,
 ) -> tuple[SupervisorTrainingEnvironment, RlTrainingConfig, FanPolicyConfig, SafetyConfig]:
-    """束縛済みの MPC controller を含む環境一式を組み立てる。"""
+    """束縛済みの MPC controller を含む環境一式を組み立てる。
+
+    `with_mpc=False` にすると、**反実仮想 artifact が無くて束縛できなかった runtime** を作る。
+    """
     config, config_sha = rl_config(**(config_overrides or {}))
     _model, _profile, attestation = trained
-    controller, _planning, settings = build_controller(
-        trained, policy_config=_mpc_policy(authority), clock=ScriptedClock(0)
-    )
+    settings = _mpc_policy(authority)
+    controller = None
+    unavailable = None
+    if with_mpc:
+        controller, _planning, settings = build_controller(
+            trained, policy_config=settings, clock=ScriptedClock(0)
+        )
+    else:
+        unavailable = Reason(
+            code="counterfactual_model_unavailable",
+            detail="反実仮想能力を申告した artifact が Registry に無い",
+        )
     safety = mpc_safety()
     engine = dynamics or SimulatedThermalDynamics(config.simulator, config_sha256=config_sha)
     environment = SupervisorTrainingEnvironment(
@@ -333,7 +363,9 @@ def build_environment(
         safety=safety,
         dynamics=engine,
         mpc=controller,
+        mpc_unavailable=unavailable,
         baseline=lambda: ConstantBaseline(baseline_demand),
+        baseline_identity=baseline_identity(baseline_demand),
         expected_model_version=attestation.version,
     )
     return environment, config, settings, safety
@@ -510,6 +542,7 @@ def test_invariant_3_c_the_real_fallback_controller_satisfies_the_baseline_contr
         dynamics=SimulatedThermalDynamics(config.simulator, config_sha256=config_sha),
         mpc=controller,
         baseline=lambda: FallbackController(settings, catalog()),
+        baseline_identity=DependencyIdentity(name="fallback-controller", version="1"),
         expected_model_version=attestation.version,
     )
     result = run_all(environment, episode_spec(max_steps=3))
@@ -651,7 +684,9 @@ def test_invariant_6_b_the_configured_simulator_is_always_provisional() -> None:
 
     assert simulator.identity.provenance is DynamicsProvenance.SIMULATED_PROVISIONAL
     assert simulator.identity.artifact_sha256 is None
-    assert not simulator.identity.evidence_backed
+    assert not simulator.identity.claims_evidence
+    assert simulator.attestation is None
+    assert not attested_evidence(simulator)
 
 
 def test_invariant_6_c_todays_artifacts_cannot_be_a_learned_simulator(trained, tmp_path) -> None:
@@ -715,7 +750,7 @@ def run_all(environment: SupervisorTrainingEnvironment, spec: EpisodeSpec):
 
 def test_invariant_7_a_a_logged_episode_scores_only_the_recorded_action(trained) -> None:
     """**記録と違う action の結果を作らない**（決定記録 0053 §2.3 / 0054 §2.2）。"""
-    logged = LoggedTrajectoryDynamics(logged_trajectory(0.31), applied_demand_tolerance=0.02)
+    logged = LoggedTrajectoryDynamics(logged_trajectory(0.31), shadow=shadow_config())
     environment, *_ = build_environment(
         trained, dynamics=logged, baseline_demand=0.8, authority="shadow"
     )
@@ -748,7 +783,7 @@ def test_invariant_7_b_a_logged_step_cannot_carry_fabricated_values() -> None:
 
 def test_invariant_7_c_a_matching_logged_action_is_scored(trained) -> None:
     """記録と同じ action が掛かった区間は、実測として採点できる。"""
-    logged = LoggedTrajectoryDynamics(logged_trajectory(0.8), applied_demand_tolerance=0.02)
+    logged = LoggedTrajectoryDynamics(logged_trajectory(0.8), shadow=shadow_config())
     environment, *_ = build_environment(
         trained, dynamics=logged, baseline_demand=0.8, authority="shadow"
     )
@@ -764,7 +799,7 @@ def test_invariant_7_d_hybrid_keeps_the_origin_of_every_step(trained) -> None:
     """hybrid では step ごとに出どころが残り、近似が混ざれば昇格の根拠にしない。"""
     config, config_sha = rl_config()
     hybrid = HybridDynamics(
-        LoggedTrajectoryDynamics(logged_trajectory(0.31), applied_demand_tolerance=0.02),
+        LoggedTrajectoryDynamics(logged_trajectory(0.31), shadow=shadow_config()),
         SimulatedThermalDynamics(config.simulator, config_sha256=config_sha),
     )
     environment, *_ = build_environment(
@@ -782,7 +817,7 @@ def test_invariant_7_d_hybrid_keeps_the_origin_of_every_step(trained) -> None:
 
 def test_invariant_8_a_an_episode_below_the_coverage_floor_is_not_comparable(trained) -> None:
     """**採点できた step が少ない episode の reward を比較に使わない**（fail closed）。"""
-    logged = LoggedTrajectoryDynamics(logged_trajectory(0.31), applied_demand_tolerance=0.02)
+    logged = LoggedTrajectoryDynamics(logged_trajectory(0.31), shadow=shadow_config())
     environment, *_ = build_environment(
         trained, dynamics=logged, baseline_demand=0.8, authority="shadow"
     )
@@ -837,7 +872,7 @@ def test_invariant_9_c_changing_the_reward_or_dynamics_changes_the_conditions(tr
     assert changed_reward.conditions_sha256 != base.conditions_sha256
 
     config, config_sha = rl_config()
-    logged = LoggedTrajectoryDynamics(logged_trajectory(0.4), applied_demand_tolerance=0.02)
+    logged = LoggedTrajectoryDynamics(logged_trajectory(0.4), shadow=shadow_config())
     changed_dynamics = run_all(
         build_environment(trained, dynamics=logged, authority="shadow")[0],
         episode_spec(mode=TrainingMode.LOGGED),
@@ -909,25 +944,41 @@ def test_invariant_10_b_arms_built_under_different_conditions_are_refused(traine
 
 
 def test_invariant_12_a_safety_ranks_before_reward(trained) -> None:
-    """**安全側の違反は reward で覆らない**（辞書式。決定記録 0054 §2.4 と同じ構造）。"""
+    """**安全側の違反は reward で覆らない**（辞書式。決定記録 0054 §2.4 と同じ構造）。
+
+    reward で勝っている arm に、同じ条件のまま安全違反だけを持たせて比べる。
+    """
     environment, _config, settings, _safety = build_environment(trained)
     rule = RulePolicy(settings.supervisor.rule_policy, SimulatedClock(ACTION_TS_MS))
     clean = environment.run_policy(rule, (episode_spec(episode_id="pr105-a"),))
 
-    violating_env, *_ = build_environment(trained, baseline_demand=0.1, authority="shadow")
-    violating = violating_env.run_policy(
-        StubRlPolicy(
-            SupervisorObjectiveWeights(
-                gpu_temperature=1.0, cpu_temperature=0.1, balance=0.0, acoustic=0.0, change=0.0
-            )
+    # **条件は同じまま**、安全側の台帳と終端理由だけを違反へ差し替えた arm を作る。
+    violating = PolicyArm(
+        policy=SupervisorPolicyKind.RL,
+        policy_version="rl-test-1",
+        episodes=(
+            EpisodeResult.model_validate(
+                clean.episodes[0].model_dump(mode="python")
+                | {
+                    "policy": SupervisorPolicyKind.RL,
+                    "policy_version": "rl-test-1",
+                    "termination": TerminationReason.SAFETY_VIOLATION,
+                    "termination_reason": Reason(code="absolute_ceiling_exceeded"),
+                    "safety": clean.episodes[0].safety.model_dump(mode="python")
+                    | {"ceiling_exceedances": 1},
+                    "promotable": False,
+                }
+            ),
         ),
-        (episode_spec(episode_id="pr105-a"),),
     )
 
     assert violating.safety_violations > 0
     assert clean.safety_violations == 0
+
+    comparison = SupervisorTrainingEnvironment.compare([violating, clean])
     # reward がどれだけ良くても、違反のある arm が先には来ない。
-    assert sorted([violating, clean], key=PolicyArm.ranking_key)[0] is clean
+    assert comparison.ranked[0] is clean
+    assert comparison.ranking_key(violating)[0] > comparison.ranking_key(clean)[0]
 
 
 def test_invariant_12_b_reward_cannot_carry_a_safety_term() -> None:
@@ -1000,3 +1051,334 @@ def test_the_initial_window_is_unchanged_by_running_an_episode(trained) -> None:
     assert isinstance(spec.initial_window, ObservedThermalInput)
     assert ArtifactVerification.REGISTRY_VERIFIED.value == "registry_verified"
     assert STEP_MS == 1_000
+
+
+# ---------------- codex レビュー（PR #158）で塞いだ穴。**同じ形を作れないことを試す。**
+
+
+def hot_window(value: float) -> ObservedThermalInput:
+    """全 frame の温度を差し替えた観測 window（絶対上限を超える初期状態を作る）。"""
+    base = observed_input(0.4)
+    frames = tuple(
+        frame.model_copy(update={"values": dict.fromkeys(frame.values, value)})
+        for frame in base.window
+    )
+    return ObservedThermalInput.model_validate(
+        base.model_copy(update={"window": frames}).model_dump(mode="python")
+    )
+
+
+class ForgedAttestedDynamics:
+    """`registry_attested` を**自称するだけ**の dynamics。証拠 object を持たない。
+
+    provenance も artifact hash もただの値なので、この形は誰でも組み立てられる。
+    **それが昇格の根拠にならないこと**を試すために置く。
+    """
+
+    def __init__(self, inner: SimulatedThermalDynamics) -> None:
+        self._inner = inner
+        self._identity = DynamicsIdentity(
+            provenance=DynamicsProvenance.REGISTRY_ATTESTED,
+            model_id="rack-thermal",
+            model_version="0.1.0",
+            artifact_sha256="a" * 64,
+        )
+
+    @property
+    def identity(self) -> DynamicsIdentity:
+        return self._identity
+
+    @property
+    def attestation(self) -> None:
+        return None
+
+    @property
+    def provenances(self) -> frozenset[DynamicsProvenance]:
+        return frozenset({DynamicsProvenance.REGISTRY_ATTESTED})
+
+    def conditions(self) -> dict[str, object]:
+        return {"identity": self._identity.model_dump(mode="json")}
+
+    def advance(self, request, *, rng):
+        step = self._inner.advance(request, rng=rng)
+        return DynamicsStep.model_validate(
+            step.model_dump(mode="python") | {"provenance": DynamicsProvenance.REGISTRY_ATTESTED}
+        )
+
+
+def test_invariant_14_a_the_environment_runs_without_a_counterfactual_model(trained) -> None:
+    """**反実仮想 artifact が無くても環境は回る**（偽の attestation を作らない）。
+
+    束縛できなかった事実は運転時と同じ `LearnedFailure.MODEL_LOAD_FAILURE` として Gate へ渡り、
+    requested はすべて Fallback が作る（決定記録 0058 §2.1）。
+    """
+    environment, *_ = build_environment(trained, with_mpc=False)
+    assert not environment.learned_controller_available
+    result = run_all(environment, episode_spec(max_steps=4))
+
+    assert result.termination is TerminationReason.HORIZON
+    assert result.coverage.supported_steps == 4
+    assert all(step.active_controller is ControllerKind.FALLBACK for step in result.steps)
+    assert all(step.fallback_reason is not None for step in result.steps)
+    assert not result.learned_controller_available
+    assert not result.promotable
+
+
+def test_invariant_14_b_an_episode_without_a_controller_cannot_be_promotable(trained) -> None:
+    """action が demand に効いていない episode を、昇格の根拠にできない（型で拒む）。"""
+    environment, *_ = build_environment(trained, with_mpc=False)
+    result = run_all(environment, episode_spec(max_steps=4))
+
+    with pytest.raises(ValidationError):
+        EpisodeResult.model_validate(result.model_dump(mode="python") | {"promotable": True})
+
+
+def test_invariant_14_c_the_controller_state_must_be_stated_exactly_once(trained) -> None:
+    """controller と「使えない理由」を両方 / どちらも渡さない、は受け取らない。"""
+    config, config_sha = rl_config()
+    _model, _profile, attestation = trained
+    controller, _planning, settings = build_controller(
+        trained, policy_config=_mpc_policy("limited"), clock=ScriptedClock(0)
+    )
+    common: dict[str, Any] = {
+        "config_sha256": config_sha,
+        "policy": settings,
+        "safety": mpc_safety(),
+        "dynamics": SimulatedThermalDynamics(config.simulator, config_sha256=config_sha),
+        "baseline": lambda: ConstantBaseline(0.4),
+        "baseline_identity": baseline_identity(0.4),
+        "expected_model_version": attestation.version,
+    }
+    with pytest.raises(EnvironmentUsageError, match="どちらか一方"):
+        SupervisorTrainingEnvironment(config, **common)
+    with pytest.raises(EnvironmentUsageError, match="どちらか一方"):
+        SupervisorTrainingEnvironment(
+            config, mpc=controller, mpc_unavailable=Reason(code="x"), **common
+        )
+
+
+def test_invariant_6_f_a_self_declared_registry_provenance_grants_nothing(trained) -> None:
+    """**自称の `registry_attested` では裏づけにならない。**
+
+    昇格の判断は `ArtifactAttestation` object そのものを見る。Registry の検証経路だけが
+    発行するので、近似 simulator はこれを用意できない（決定記録 0058 §2.3）。
+    """
+    config, config_sha = rl_config()
+    forged = ForgedAttestedDynamics(
+        SimulatedThermalDynamics(config.simulator, config_sha256=config_sha)
+    )
+
+    assert forged.identity.claims_evidence  # 自称はできてしまう
+    assert not attested_evidence(forged)  # 証拠が無いので裏づけにならない
+
+    environment, *_ = build_environment(trained, dynamics=forged)
+    result = run_all(environment, episode_spec(max_steps=3))
+    assert not result.promotable
+
+
+def test_invariant_6_g_an_attested_binding_is_the_only_source_of_evidence(trained) -> None:
+    """Registry の証拠に裏づけられた dynamics だけが `attested_evidence` を満たす。"""
+    _model, _profile, attestation = trained
+    base, _p, _a = trained
+    dynamics = AttestedThermalDynamics.bind(PlanningModel(base), attestation=attestation)
+
+    assert dynamics.attestation is attestation
+    assert attested_evidence(dynamics)
+    assert dynamics.identity.artifact_sha256 == attestation.artifact_sha256
+
+
+def test_invariant_7_e_the_logged_tolerance_comes_from_the_validated_policy() -> None:
+    """**照合の許容幅を呼び出し側から受け取らない**（決定記録 0054 §2.6 と同じ規則）。"""
+    shadow = shadow_config()
+    dynamics = LoggedTrajectoryDynamics(logged_trajectory(0.4), shadow=shadow)
+
+    assert dynamics.applied_demand_tolerance == shadow.applied_demand_tolerance.value
+    with pytest.raises(TypeError):
+        LoggedTrajectoryDynamics(  # type: ignore[call-arg]
+            logged_trajectory(0.4), applied_demand_tolerance=0.5
+        )
+
+
+def test_invariant_9_e_conditions_cover_every_injected_dependency(trained) -> None:
+    """**注入した依存が変われば条件 hash が変わる。**
+
+    変わらないと、`compare()` が依存の差を policy の差として並べてしまう。
+    """
+    base = run_all(build_environment(trained)[0], episode_spec())
+
+    # Baseline の中身が変われば条件も変わる。
+    other_baseline = run_all(build_environment(trained, baseline_demand=0.5)[0], episode_spec())
+    assert other_baseline.conditions_sha256 != base.conditions_sha256
+
+    # 制御器の設定（authority stage / mpc.optimizer / gate 閾値）が変われば条件も変わる。
+    other_policy = run_all(build_environment(trained, authority="expanded")[0], episode_spec())
+    assert other_policy.conditions_sha256 != base.conditions_sha256
+
+    # Learned MPC の有無も条件の一部。
+    without = run_all(build_environment(trained, with_mpc=False)[0], episode_spec())
+    assert without.conditions_sha256 != base.conditions_sha256
+
+
+def test_invariant_9_f_hybrid_conditions_include_the_logged_side(trained) -> None:
+    """hybrid の identity は近似側だが、**条件には記録側と許容幅も入る。**"""
+    config, config_sha = rl_config()
+    simulated = SimulatedThermalDynamics(config.simulator, config_sha256=config_sha)
+    left = HybridDynamics(
+        LoggedTrajectoryDynamics(logged_trajectory(0.4), shadow=shadow_config()), simulated
+    )
+    right = HybridDynamics(
+        LoggedTrajectoryDynamics(logged_trajectory(0.6), shadow=shadow_config()), simulated
+    )
+
+    assert left.identity == right.identity  # identity だけでは見分けられない
+    assert left.conditions() != right.conditions()  # 条件は見分けられる
+
+    first = run_all(
+        build_environment(trained, dynamics=left, baseline_demand=0.8, authority="shadow")[0],
+        episode_spec(mode=TrainingMode.HYBRID, demand=0.8),
+    )
+    second = run_all(
+        build_environment(trained, dynamics=right, baseline_demand=0.8, authority="shadow")[0],
+        episode_spec(mode=TrainingMode.HYBRID, demand=0.8),
+    )
+    assert first.conditions_sha256 != second.conditions_sha256
+
+
+def test_invariant_5_e_the_initial_state_is_screened_before_any_step(trained) -> None:
+    """**最初の state にも screen を掛ける。** 上限超えの初期 window から探索を始めない。"""
+    environment, *_ = build_environment(trained)
+    spec = EpisodeSpec(
+        episode_id="pr105-hot",
+        seed=1,
+        mode=TrainingMode.LEARNED_SIMULATOR,
+        trace=workload_trace(),
+        initial_window=hot_window(120.0),
+        initial_demands=PerZone[Demand](front=0.4, rear=0.4, top=0.4),
+        max_steps=4,
+    )
+    environment.reset(spec)
+    result = environment.episode_result()
+
+    assert result.termination is TerminationReason.SAFETY_VIOLATION
+    assert result.termination_reason.code == "initial_ceiling_exceeded"
+    assert result.steps == ()
+    assert not result.promotable
+    with pytest.raises(EnvironmentUsageError, match="終わった"):
+        environment.step(default_action())
+
+
+def test_invariant_5_f_initial_demands_below_the_floor_are_screened(trained) -> None:
+    """初期 demand が最低安全 demand を下回っていれば、1 step も進めない。"""
+    environment, *_ = build_environment(trained)
+    environment.reset(episode_spec(demand=0.1))
+    result = environment.episode_result()
+
+    assert result.termination is TerminationReason.SAFETY_VIOLATION
+    assert result.termination_reason.code == "initial_floor_shortfall"
+    assert result.safety.floor_shortfalls == len(Zone)
+
+
+def test_invariant_10_c_arms_with_different_comparable_episodes_are_refused(trained) -> None:
+    """**arm ごとに落ちた episode を捨てない。** 捨てると母集団が arm ごとに変わる。"""
+    environment, _config, settings, _safety = build_environment(trained)
+    rule = RulePolicy(settings.supervisor.rule_policy, SimulatedClock(ACTION_TS_MS))
+    clean = environment.run_policy(rule, (episode_spec(episode_id="pr105-a"),))
+
+    dropped = PolicyArm(
+        policy=SupervisorPolicyKind.RL,
+        policy_version="rl-test-1",
+        episodes=(
+            EpisodeResult.model_validate(
+                clean.episodes[0].model_dump(mode="python")
+                | {
+                    "policy": SupervisorPolicyKind.RL,
+                    "policy_version": "rl-test-1",
+                    "usable_for_comparison": False,
+                    "promotable": False,
+                }
+            ),
+        ),
+    )
+
+    with pytest.raises(EnvironmentUsageError, match="比較できる episode 群"):
+        SupervisorTrainingEnvironment.compare([clean, dropped])
+
+
+def test_invariant_10_d_a_truncated_episode_cannot_win_on_reward(trained) -> None:
+    """**長さの違う episode の総和を並べない。** 早く終わった arm が勝ってしまう。"""
+    environment, _config, settings, _safety = build_environment(trained)
+    rule = RulePolicy(settings.supervisor.rule_policy, SimulatedClock(ACTION_TS_MS))
+    full = environment.run_policy(rule, (episode_spec(episode_id="pr105-a", max_steps=6),))
+    long_episode = full.episodes[0]
+    assert len(long_episode.supported_steps) == 6
+
+    truncated_steps = long_episode.steps[:4]
+    truncated = PolicyArm(
+        policy=SupervisorPolicyKind.RL,
+        policy_version="rl-test-1",
+        episodes=(
+            EpisodeResult.model_validate(
+                long_episode.model_dump(mode="python")
+                | {
+                    "policy": SupervisorPolicyKind.RL,
+                    "policy_version": "rl-test-1",
+                    "steps": tuple(step.model_dump(mode="python") for step in truncated_steps),
+                    "coverage": {"steps": 4, "supported_steps": 4, "unsupported": {}},
+                }
+            ),
+        ),
+    )
+
+    # 総和で比べれば、短いほうが「良い」ことになってしまう。
+    assert truncated.episodes[0].discounted_reward > long_episode.discounted_reward
+
+    comparison = SupervisorTrainingEnvironment.compare([full, truncated])
+    assert comparison.matched_steps() == {"pr105-a": 4}
+    # 揃えた長さの上では同じ episode なので、差は付かない。
+    assert comparison.mean_matched_reward(full) == comparison.mean_matched_reward(truncated)
+    assert comparison.ranking_key(full)[2] == comparison.ranking_key(truncated)[2]
+
+
+def test_invariant_10_e_a_comparison_records_whether_a_controller_was_present(trained) -> None:
+    """**Learned MPC の有無が違う arm を混ぜない。** 混ぜると policy の差を測れない。"""
+    environment, _config, settings, _safety = build_environment(trained)
+    without, _c, settings_without, _s = build_environment(trained, with_mpc=False)
+    rule = RulePolicy(settings.supervisor.rule_policy, SimulatedClock(ACTION_TS_MS))
+    rule_without = RulePolicy(settings_without.supervisor.rule_policy, SimulatedClock(ACTION_TS_MS))
+    spec = episode_spec()
+
+    with_controller = environment.run_policy(rule, (spec,))
+    no_controller = without.run_policy(rule_without, (spec,))
+
+    assert with_controller.learned_controller_available
+    assert not no_controller.learned_controller_available
+    # 条件 hash が既に違うので、compare はそこで落ちる（混ぜられない）。
+    with pytest.raises(EnvironmentUsageError, match="条件 hash"):
+        SupervisorTrainingEnvironment.compare([with_controller, no_controller])
+
+
+def test_invariant_6_h_a_step_cannot_claim_an_uncontracted_provenance(trained) -> None:
+    """**step ごとの provenance も自称である。** 契約した出どころの外を受け取らない。
+
+    近似 simulator が「記録から来た」と名乗る step を返せると、実測の裏づけが無い遷移が
+    `promotable` な側へ紛れ込む。
+    """
+
+    class MislabelingDynamics(SimulatedThermalDynamics):
+        def advance(self, request, *, rng):
+            step = super().advance(request, rng=rng)
+            return DynamicsStep.model_validate(
+                step.model_dump(mode="python")
+                | {"provenance": DynamicsProvenance.LOGGED_TRAJECTORY}
+            )
+
+    config, config_sha = rl_config()
+    environment, *_ = build_environment(
+        trained,
+        dynamics=MislabelingDynamics(config.simulator, config_sha256=config_sha),
+    )
+    result = run_all(environment, episode_spec(max_steps=3))
+
+    assert result.termination is TerminationReason.DYNAMICS_UNUSABLE
+    assert result.termination_reason.code == "provenance_unexpected"
+    assert not result.promotable

@@ -23,7 +23,7 @@ Workload 擾乱 → Control State → Supervisor action（strategy / weights / t
 from __future__ import annotations
 
 import json
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from hashlib import sha256
 from random import Random
 from typing import Protocol
@@ -32,7 +32,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from coldaisle.control.acoustic import AcousticCostModel
 from coldaisle.control.config import FanPolicyConfig, SafetyConfig
-from coldaisle.control.fallback.gate import ControllerGate
+from coldaisle.control.fallback.gate import ControllerGate, LearnedControlStatus, LearnedFailure
 from coldaisle.control.model.thermal import ObservedThermalInput, canonical_sha256
 from coldaisle.control.mpc import LearnedMpcController
 from coldaisle.control.rl.action import (
@@ -48,6 +48,7 @@ from coldaisle.control.rl.dynamics import (
     EnvironmentDynamics,
     WorkloadSample,
     WorkloadTrace,
+    attested_evidence,
 )
 from coldaisle.control.rl.episode import (
     EPISODE_SCHEMA_VERSION,
@@ -104,12 +105,46 @@ class _Frozen(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid", strict=True)
 
 
+def _frame_values(window: ObservedThermalInput) -> dict[str, float]:
+    """window の最後の frame の、値のある metric だけを返す。"""
+    return {
+        metric: value for metric, value in window.window[-1].values.items() if value is not None
+    }
+
+
+def _config_digest(config: BaseModel) -> str:
+    """検証済み設定そのものの SHA-256。**欄を数え上げずに全体を覆う。**"""
+    payload = json.dumps(
+        config.model_dump(mode="json"),
+        ensure_ascii=False,
+        allow_nan=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return sha256(payload).hexdigest()
+
+
 class EnvironmentUsageError(RuntimeError):
     """環境の使い方が間違っている（reset していない、終わった episode を進めた、など）。
 
     **これは episode の終端理由にしない。** agent の action の善し悪しではなく、
     呼び出し側の誤りなので、そのまま例外として出す。
     """
+
+
+class DependencyIdentity(_Frozen):
+    """注入した依存を条件 hash へ載せるための、安定した識別子。
+
+    **factory も model object も hash できない。** それでも Baseline の設定や Acoustic の
+    曲線が違えば結果は変わるので、比較したときに「依存の差」が「policy の差」に見えてしまう。
+    呼び出し側に名指しを**必須**で求めることで、その取り違えを作れなくする
+    （決定記録 0058 §2.6）。
+    """
+
+    name: str = Field(pattern=r"^[a-z][a-z0-9_.-]*$", max_length=120)
+    version: str = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9_.-]*$", max_length=120)
+    digest: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    """設定 bytes などの hash。持てるなら必ず入れる。"""
 
 
 class BaselineProposer(Protocol):
@@ -210,23 +245,42 @@ class SupervisorTrainingEnvironment:
         policy: FanPolicyConfig,
         safety: SafetyConfig,
         dynamics: EnvironmentDynamics,
-        mpc: LearnedMpcController,
         baseline: Callable[[], BaselineProposer],
+        baseline_identity: DependencyIdentity,
         expected_model_version: str,
+        mpc: LearnedMpcController | None = None,
+        mpc_unavailable: Reason | None = None,
         acoustic: AcousticCostModel | None = None,
+        acoustic_identity: DependencyIdentity | None = None,
     ) -> None:
-        """設定と依存を束ねる。**噛み合わなければ生成時に落とす。**"""
+        """設定と依存を束ねる。**噛み合わなければ生成時に落とす。**
+
+        `mpc` を省くと、**Learned MPC を束縛できなかった runtime** として動く。反実仮想能力を
+        申告した artifact が1つも無い現状ではこちらが既定で（決定記録 0048 §2.1 / 0052 §2.1）、
+        `mpc_unavailable` の理由を `LearnedFailure.MODEL_LOAD_FAILURE` として Gate（#79）へ渡し、
+        Fallback で episode を回す。**偽の attestation を作らないための経路である。**
+        """
         if not expected_model_version:
             raise EnvironmentUsageError("expected_model_version は空にできない")
+        if (mpc is None) == (mpc_unavailable is None):
+            raise EnvironmentUsageError(
+                "Learned MPC controller か、束縛できなかった理由のどちらか一方を渡す"
+            )
+        if (acoustic is None) != (acoustic_identity is None):
+            # 条件 hash に載らない依存を黙って受け取らない。
+            raise EnvironmentUsageError("Acoustic Model と その identity は一緒に渡す")
         self._config = config
         self._config_sha256 = config_sha256
         self._policy = policy
         self._safety = safety
         self._dynamics = dynamics
         self._mpc = mpc
+        self._mpc_unavailable = mpc_unavailable
         # **episode ごとに作り直す。** Fallback は復帰 hold などの状態を持つので、
         # 前の episode の履歴を次へ持ち越すと同じ seed でも結果が変わる。
         self._baseline_factory = baseline
+        self._baseline_identity = baseline_identity
+        self._acoustic_identity = acoustic_identity
         self._baseline: BaselineProposer | None = None
         self._expected_model_version = expected_model_version
         self._action_space = ActionSpace(policy.supervisor.output_bounds)
@@ -251,6 +305,15 @@ class SupervisorTrainingEnvironment:
     def safety_model(self) -> SafetyModel:
         """環境が持っている安全の表現。**Critical Safety そのものではない。**"""
         return SafetyModel.CONFIGURED_MINIMUM_ONLY
+
+    @property
+    def learned_controller_available(self) -> bool:
+        """Learned MPC を束縛できているか。
+
+        **`False` のとき、Supervisor action は demand に一切効かない**（requested はすべて
+        Fallback が作る）。反実仮想 artifact が無い間はこちらが既定である。
+        """
+        return self._mpc is not None
 
     # ------------------------------------------------------------------ episode 単位
 
@@ -284,7 +347,52 @@ class SupervisorTrainingEnvironment:
         self._gate = ControllerGate(
             self._policy, expected_model_version=self._expected_model_version
         )
+        # **最初の state にも screen を掛ける。** 掛けないと、上限を超えた初期 window を
+        # 「まだ1 step も進んでいないから安全」として agent へ見せ、そこから探索を始めてしまう。
+        self._screen_initial_state(self._episode)
         return self.observation()
+
+    def _screen_initial_state(self, state: _EpisodeState) -> None:
+        """episode の開始時点で既に違反している state を、探索の入口で終端する。"""
+        shortfalls = tuple(
+            zone
+            for zone in Zone
+            if state.applied.get(zone) < self._floor.get(zone) - DEMAND_EPSILON
+        )
+        if shortfalls:
+            state.floor_shortfalls += len(shortfalls)
+            detail = "; ".join(
+                f"{zone.value}: initial={state.applied.get(zone):.6f}; "
+                f"floor={self._floor.get(zone):.6f}"
+                for zone in shortfalls
+            )
+            self._end(state, TerminationReason.SAFETY_VIOLATION, "initial_floor_shortfall", detail)
+        exceedances, margin = self._screen_temperatures(_frame_values(state.window))
+        if margin is not None:
+            state.minimum_margin_c = (
+                margin if state.minimum_margin_c is None else min(state.minimum_margin_c, margin)
+            )
+        if exceedances:
+            state.ceiling_exceedances += exceedances
+            self._end(
+                state,
+                TerminationReason.SAFETY_VIOLATION,
+                "initial_ceiling_exceeded",
+                f"ceiling={self._safety.absolute_temp_ceiling_c.value:.3f}; "
+                f"exceedances={exceedances}",
+            )
+
+    def _screen_temperatures(self, values: Mapping[str, float]) -> tuple[int, float | None]:
+        """screen の metric を絶対上限と突き合わせ、(超過数, 最小余裕) を返す。"""
+        ceiling = self._safety.absolute_temp_ceiling_c.value
+        screened = [
+            values[metric]
+            for metric in self._config.safety_screen.temperature_metrics
+            if metric in values
+        ]
+        if not screened:
+            return 0, None
+        return sum(1 for value in screened if value > ceiling), ceiling - max(screened)
 
     def observation(self) -> SupervisorInput:
         """いまの state を policy が読む形で返す。**Demand の指令経路は持たない。**"""
@@ -334,6 +442,8 @@ class SupervisorTrainingEnvironment:
         simulated = any(
             step.provenance is DynamicsProvenance.SIMULATED_PROVISIONAL for step in state.steps
         )
+        # **自称の provenance では立てない。** Registry の証拠 object そのものを確かめる。
+        attested = attested_evidence(self._dynamics)
         return EpisodeResult(
             episode_id=state.spec.episode_id,
             seed=state.spec.seed,
@@ -351,12 +461,14 @@ class SupervisorTrainingEnvironment:
             safety=safety,
             conditions_sha256=state.conditions_sha256,
             usable_for_comparison=usable,
+            learned_controller_available=self.learned_controller_available,
             promotable=(
                 usable
                 and not safety.violated
                 and safety.invalid_actions == 0
-                and self._dynamics.identity.evidence_backed
+                and attested
                 and not simulated
+                and self.learned_controller_available
             ),
         )
 
@@ -391,6 +503,10 @@ class SupervisorTrainingEnvironment:
         expected = arms[0].conditions
         if any(arm.conditions != expected for arm in arms):
             raise EnvironmentUsageError("条件 hash の違う arm を同じ比較に入れない")
+        comparable = arms[0].comparable_episode_ids
+        if any(arm.comparable_episode_ids != comparable for arm in arms):
+            # arm ごとに落ちた episode を捨てると、違う母集団の平均を並べることになる。
+            raise EnvironmentUsageError("arm ごとに比較できる episode 群が違う")
         return PolicyComparison(conditions_sha256=conditions_digest(expected), arms=tuple(arms))
 
     # ------------------------------------------------------------------ 1 step の中身
@@ -485,6 +601,23 @@ class SupervisorTrainingEnvironment:
                 facts=proposal_facts,
             )
 
+        if outcome.provenance not in self._dynamics.provenances:
+            # **step ごとの provenance も自称である。** 契約した出どころの外を受け取らない。
+            detail = (
+                f"provenance={outcome.provenance.value}; "
+                f"allowed={sorted(item.value for item in self._dynamics.provenances)}"
+            )
+            self._end(state, TerminationReason.DYNAMICS_UNUSABLE, "provenance_unexpected", detail)
+            return self._unsupported_record(
+                state,
+                action,
+                snapshot,
+                "provenance_unexpected",
+                detail,
+                requested=requested,
+                facts=proposal_facts,
+            )
+
         if not outcome.supported:
             assert outcome.reason is not None
             # 記録に無い action の結果は作らない（決定記録 0053 §2.3 / 0054 §2.2）。
@@ -506,13 +639,7 @@ class SupervisorTrainingEnvironment:
 
         assert outcome.window is not None
         ceiling = self._safety.absolute_temp_ceiling_c.value
-        screened = [
-            outcome.values[metric]
-            for metric in self._config.safety_screen.temperature_metrics
-            if metric in outcome.values
-        ]
-        exceedances = sum(1 for value in screened if value > ceiling)
-        margin = None if not screened else ceiling - max(screened)
+        exceedances, margin = self._screen_temperatures(outcome.values)
         if margin is not None:
             state.minimum_margin_c = (
                 margin if state.minimum_margin_c is None else min(state.minimum_margin_c, margin)
@@ -560,9 +687,7 @@ class SupervisorTrainingEnvironment:
         state.tick_id += 1
         if exceedances:
             state.ceiling_exceedances += exceedances
-            detail = (
-                f"ceiling={ceiling:.3f}; observed_max={max(screened):.3f}; metrics={len(screened)}"
-            )
+            detail = f"ceiling={ceiling:.3f}; exceedances={exceedances}"
             self._end(
                 state, TerminationReason.SAFETY_VIOLATION, "absolute_ceiling_exceeded", detail
             )
@@ -579,30 +704,43 @@ class SupervisorTrainingEnvironment:
     ) -> tuple[PerZone[Demand] | None, _ProposalFacts]:
         """action を MPC と Gate に通して requested を得る。**環境は demand を作らない。**"""
         assert self._gate is not None and self._baseline is not None
+        ood: bool | None = None
         try:
             baseline = self._baseline.propose(snapshot)
             if baseline.controller is not ControllerKind.FALLBACK:
                 raise EnvironmentUsageError("baseline には Fallback の提案を渡す")
-            supervisor = action.to_output(
-                snapshot_schema_version=snapshot.schema_version,
-                tick_id=snapshot.tick_id,
-                ts_ms=snapshot.ts_ms,
-                regime=workload.regime,
-                regime_confidence=workload.regime_confidence,
-                policy=self._policy_kind,
-                version=self._policy_version,
-            )
-            proposal = self._mpc.propose(
-                snapshot=snapshot,
-                observed=state.window,
-                supervisor=supervisor,
-                baseline=baseline,
-                safety_floor=self._floor,
-            )
+            if self._mpc is None:
+                # **偽の attestation を作らない。** 束縛できなかった事実を、運転時と同じ
+                # `LearnedFailure.MODEL_LOAD_FAILURE` として Gate へ渡し、Fallback で回す
+                # （決定記録 0052 §2.1 / 0058 §2.1）。
+                assert self._mpc_unavailable is not None
+                learned = LearnedControlStatus(
+                    failure=LearnedFailure.MODEL_LOAD_FAILURE,
+                    failure_reason=self._mpc_unavailable,
+                )
+            else:
+                supervisor = action.to_output(
+                    snapshot_schema_version=snapshot.schema_version,
+                    tick_id=snapshot.tick_id,
+                    ts_ms=snapshot.ts_ms,
+                    regime=workload.regime,
+                    regime_confidence=workload.regime_confidence,
+                    policy=self._policy_kind,
+                    version=self._policy_version,
+                )
+                proposal = self._mpc.propose(
+                    snapshot=snapshot,
+                    observed=state.window,
+                    supervisor=supervisor,
+                    baseline=baseline,
+                    safety_floor=self._floor,
+                )
+                ood = proposal.assessment.ood if proposal.assessment is not None else None
+                learned = proposal.to_status(received_at_mono_ms=snapshot.monotonic_ms)
             selection = self._gate.select(
                 now_mono_ms=snapshot.monotonic_ms,
                 fallback=baseline,
-                learned=proposal.to_status(received_at_mono_ms=snapshot.monotonic_ms),
+                learned=learned,
                 operating_mode=OperatingMode.AUTO,
                 safety_state=SafetyState.NORMAL,
             )
@@ -628,7 +766,7 @@ class SupervisorTrainingEnvironment:
                 confidence=None
                 if selection.model_gate is None
                 else selection.model_gate.confidence_level,
-                ood=proposal.assessment.ood if proposal.assessment is not None else None,
+                ood=ood,
                 detail="",
             ),
         )
@@ -776,6 +914,9 @@ class SupervisorTrainingEnvironment:
             "episode_schema_version": EPISODE_SCHEMA_VERSION,
             "reward_schema_version": REWARD_SCHEMA_VERSION,
             "rl_training_config_sha256": self._config_sha256,
+            # 渡された hash が中身と食い違っていても、**検証済み設定そのものの hash** で
+            # 条件が割れる（呼び出し側の写しだけを信じない）。
+            "rl_training_config_digest": _config_digest(self._config),
             "reward_version": self._config.reward.version,
             "discount": self._config.reward.discount.value,
             "episode_id": spec.episode_id,
@@ -784,16 +925,31 @@ class SupervisorTrainingEnvironment:
             "max_steps": max_steps,
             "step_ms": self._config.episode.step_ms.value,
             "recent_history_steps": self._config.episode.recent_history_steps,
-            "dynamics": self._dynamics.identity.model_dump(mode="json"),
+            # **identity だけでは足りない。** 照合の許容幅や hybrid の内側は identity に
+            # 現れないのに結果を変える（決定記録 0058 §2.6）。
+            "dynamics": self._dynamics.conditions(),
             "workload_trace": spec.trace.digest(),
             "initial_window": canonical_sha256(spec.initial_window),
             "initial_demands": spec.initial_demands.model_dump(mode="json"),
-            "authority_stage": self._policy.authority_stage.value,
+            # 制御器の設定は**設定全体の hash で覆う**。mpc.optimizer・authority_limits・
+            # gate 閾値・復帰 hold・shadow の許容幅まで、欄を数え落とさずに入る。
+            "fan_policy_sha256": _config_digest(self._policy),
+            "safety_sha256": _config_digest(self._safety),
             "expected_model_version": self._expected_model_version,
+            "learned_controller_available": self.learned_controller_available,
+            "mpc_unavailable": (
+                None
+                if self._mpc_unavailable is None
+                else self._mpc_unavailable.model_dump(mode="json")
+            ),
+            # 注入した依存は呼び出し側が名指しする。名前が無い依存は受け取らない。
+            "baseline": self._baseline_identity.model_dump(mode="json"),
+            "acoustic": (
+                None
+                if self._acoustic_identity is None
+                else self._acoustic_identity.model_dump(mode="json")
+            ),
             "safety_model": self.safety_model.value,
-            "absolute_temp_ceiling_c": self._safety.absolute_temp_ceiling_c.value,
-            "zone_min_demand": self._floor.model_dump(mode="json"),
-            "action_space": self._policy.supervisor.output_bounds.model_dump(mode="json"),
             "safety_screen": list(self._config.safety_screen.temperature_metrics),
             "coverage": self._config.coverage.model_dump(mode="json"),
         }

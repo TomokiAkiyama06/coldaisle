@@ -194,8 +194,19 @@ class EpisodeResult(_Frozen):
     """policy 以外のすべての条件を覆う hash。**arm を比べる鍵になる。**"""
     usable_for_comparison: bool
     """coverage の下限を満たしたか。満たさない episode の reward は比較に使わない。"""
+    learned_controller_available: bool
+    """Learned MPC を束縛できたか（決定記録 0058 §2.1）。
+
+    **`False` の episode では Supervisor action が demand に一切効かない。** 反実仮想 artifact が
+    無い間はこちらが既定で、requested はすべて Fallback が作る。policy の比較を「差が出なかった」
+    と読まないために、結果に必ず残す。
+    """
     promotable: bool
-    """この結果を昇格 / rollout の根拠にしてよいか。"""
+    """この結果を昇格 / rollout の根拠にしてよいか。
+
+    **環境が `attested_evidence()` で Registry の証拠 object を確かめてから立てる。**
+    `dynamics.provenance` の自称では立たない（決定記録 0058 §2.3）。
+    """
 
     @model_validator(mode="after")
     def _evidence_matches_the_claims(self) -> Self:
@@ -214,8 +225,11 @@ class EpisodeResult(_Frozen):
                 raise ValueError("安全側の違反がある episode を昇格の根拠にしない")
             if not self.usable_for_comparison:
                 raise ValueError("coverage 不足の episode を昇格の根拠にしない")
-            if not self.dynamics.evidence_backed:
+            if not self.dynamics.claims_evidence:
                 raise ValueError("裏づけの無い simulator の episode を昇格の根拠にしない")
+            if not self.learned_controller_available:
+                # action が demand に効いていない episode は、policy の根拠になりえない。
+                raise ValueError("Learned MPC を束縛できなかった episode を昇格の根拠にしない")
             if any(
                 step.provenance is DynamicsProvenance.SIMULATED_PROVISIONAL for step in self.steps
             ):
@@ -237,13 +251,32 @@ class EpisodeResult(_Frozen):
             if step.reward is not None
         )
 
-    def ranking_key(self) -> tuple[int, int, float]:
-        """辞書式の比較鍵。**安全側が先に立ち、reward では覆らない。**
+    @property
+    def supported_steps(self) -> tuple[StepRecord, ...]:
+        """採点できた step だけを、起きた順に返す。"""
+        return tuple(step for step in self.steps if step.reward is not None)
 
-        小さいほど良い。(安全違反の数, 範囲外 action の数, 割引後 reward の符号反転)。
+    @property
+    def violations(self) -> int:
+        """安全側の違反の総数。"""
+        return self.safety.ceiling_exceedances + self.safety.floor_shortfalls
+
+    def discounted_reward_over(self, steps: int) -> float:
+        """**最初の `steps` 個の採点できた step だけ**で割り引いた reward。
+
+        長さの違う episode の総和を並べない（決定記録 0058 §2.6）。途中で終わった episode は
+        負の reward を積む回数が少ないので、総和で比べると「早く壊れたほうが良い」になる。
+        割引は step の位置ではなく**採点できた順番**で掛ける。採点できない step を挟んだ
+        episode だけ割引が重くなるのを避けるためである。
         """
-        violations = self.safety.ceiling_exceedances + self.safety.floor_shortfalls
-        return (violations, self.safety.invalid_actions, -self.discounted_reward)
+        if steps < 0:
+            raise ValueError("比較に使う step 数を負にしない")
+        usable = self.supported_steps[:steps]
+        return math.fsum(
+            self.discount**index * step.reward.reward
+            for index, step in enumerate(usable)
+            if step.reward is not None
+        )
 
     def digest(self) -> str:
         """この結果そのものを表す SHA-256。"""
@@ -295,30 +328,23 @@ class PolicyArm(_Frozen):
         return sum(episode.safety.invalid_actions for episode in self.episodes)
 
     @property
-    def comparable_episodes(self) -> tuple[EpisodeResult, ...]:
-        """coverage の下限を満たした episode だけ。"""
-        return tuple(episode for episode in self.episodes if episode.usable_for_comparison)
+    def comparable_episode_ids(self) -> tuple[str, ...]:
+        """coverage の下限を満たした episode の識別子。"""
+        return tuple(
+            episode.episode_id for episode in self.episodes if episode.usable_for_comparison
+        )
 
     @property
-    def mean_discounted_reward(self) -> float | None:
-        """比較に使える episode の平均 reward。1つも無ければ `None`。"""
-        usable = self.comparable_episodes
-        if not usable:
-            return None
-        return math.fsum(episode.discounted_reward for episode in usable) / len(usable)
+    def learned_controller_available(self) -> bool:
+        """この arm のすべての episode で Learned MPC を束縛できたか。"""
+        return all(episode.learned_controller_available for episode in self.episodes)
 
-    def ranking_key(self) -> tuple[int, int, float]:
-        """arm の辞書式比較鍵。小さいほど良い。
-
-        比較に使える episode が1つも無い arm は、reward で勝てないように
-        `inf` を置く（**判定できないことを合格にしない**）。
-        """
-        mean = self.mean_discounted_reward
-        return (
-            self.safety_violations,
-            self.invalid_actions,
-            math.inf if mean is None else -mean,
-        )
+    def episode(self, episode_id: str) -> EpisodeResult:
+        """識別子で episode を引く。無ければ `KeyError`。"""
+        for item in self.episodes:
+            if item.episode_id == episode_id:
+                return item
+        raise KeyError(episode_id)
 
 
 class PolicyComparison(_Frozen):
@@ -329,12 +355,24 @@ class PolicyComparison(_Frozen):
     arms: tuple[PolicyArm, ...] = Field(min_length=2, max_length=8)
 
     @model_validator(mode="after")
-    def _arms_share_the_same_conditions(self) -> Self:
+    def _arms_share_the_same_conditions_and_evidence(self) -> Self:
         expected = self.arms[0].conditions
+        comparable = self.arms[0].comparable_episode_ids
+        learned = self.arms[0].learned_controller_available
         for arm in self.arms:
             if arm.conditions != expected:
                 # 条件の違う結果を同じ表に並べると、差が policy の差に見えてしまう。
                 raise ValueError("条件の違う episode 群を同じ比較に入れない")
+            if arm.comparable_episode_ids != comparable:
+                # **arm ごとに落ちた episode を捨てない。** 捨てると、arm ごとに違う
+                # 母集団の平均を並べることになり、都合の悪い episode が消えた arm が勝つ。
+                raise ValueError("arm ごとに比較できる episode 群が違う")
+            if arm.learned_controller_available != learned:
+                # 片方だけ Learned MPC が居る比較は、policy の差を測っていない。
+                raise ValueError("arm ごとに Learned MPC の有無が違う")
+        if not comparable:
+            # 比較できる episode が1つも無い表は、「差が無かった」と読めてしまう。
+            raise ValueError("比較できる episode が1つも無い比較を作らない")
         if conditions_digest(expected) != self.conditions_sha256:
             raise ValueError("比較の条件 hash が arm の条件と一致しない")
         policies = tuple((arm.policy, arm.policy_version) for arm in self.arms)
@@ -343,6 +381,57 @@ class PolicyComparison(_Frozen):
         return self
 
     @property
+    def comparable_episode_ids(self) -> tuple[str, ...]:
+        """すべての arm で比較に使える episode の識別子（arm 間で同一であることは検証済み）。"""
+        return self.arms[0].comparable_episode_ids
+
+    @property
+    def learned_controller_available(self) -> bool:
+        """比較した episode 群で Learned MPC を束縛できたか。
+
+        **`False` なら、この比較は policy の差を測っていない**（requested はすべて Fallback）。
+        読む側がそれを見落とさないよう、表そのものに載せる。
+        """
+        return self.arms[0].learned_controller_available
+
+    def matched_steps(self) -> dict[str, int]:
+        """episode ごとに、**すべての arm が採点できた step 数**（最小）を返す。
+
+        長さの違う episode の総和を並べると、早く終わった arm が「良い」ことになる。
+        揃えた長さの上でだけ reward を比べる（決定記録 0058 §2.6）。
+        """
+        return {
+            episode_id: min(len(arm.episode(episode_id).supported_steps) for arm in self.arms)
+            for episode_id in self.comparable_episode_ids
+        }
+
+    def mean_matched_reward(self, arm: PolicyArm) -> float | None:
+        """揃えた長さで割り引いた reward の、比較できる episode にわたる平均。
+
+        1つでも揃えた長さが 0 の episode があれば `None`（**判定できないことを合格にしない**）。
+        """
+        matched = self.matched_steps()
+        if not matched or any(steps == 0 for steps in matched.values()):
+            return None
+        return math.fsum(
+            arm.episode(episode_id).discounted_reward_over(steps)
+            for episode_id, steps in matched.items()
+        ) / len(matched)
+
+    def ranking_key(self, arm: PolicyArm) -> tuple[int, int, float]:
+        """arm の辞書式比較鍵。小さいほど良い。
+
+        **安全が先に立ち、reward では覆らない。** reward を出せない arm は
+        `inf` を置いて勝てないようにする。
+        """
+        mean = self.mean_matched_reward(arm)
+        return (
+            arm.safety_violations,
+            arm.invalid_actions,
+            math.inf if mean is None else -mean,
+        )
+
+    @property
     def ranked(self) -> tuple[PolicyArm, ...]:
         """辞書式に並べた arm。**安全が先、次に範囲外 action、最後に reward。**"""
-        return tuple(sorted(self.arms, key=lambda arm: arm.ranking_key()))
+        return tuple(sorted(self.arms, key=self.ranking_key))
