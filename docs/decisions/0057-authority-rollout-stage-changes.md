@@ -4,7 +4,7 @@
 - **Status**: FINAL（2026-09-20、リポジトリ所有者が承認）
 - **Date**: 2026-09-20
 - **Supersedes**: なし
-- **Superseded by**: [0059](0059-decision-trace-model-artifact.md)（§2.4 の「適用側の arm は昇格の根拠にできない」、§3 の「適用側（factual）の実績では昇格できない」、§5 の「decision trace へ、適用した tick の model artifact を記録すること（GitHub #159）」のみ。他の節は有効）
+- **Superseded by**: [0059](0059-decision-trace-model-artifact.md)（§3 の帰結「適用側（factual）の実績では昇格できない」の項と、§5 の未決事項「decision trace へ、適用した tick の model artifact を記録すること（GitHub #159）」の項のみ。§2.4 の「適用側・counterfactual 側のどちらの名前空間でもよい」という許可は有効で、0059 はそこへ適用側だけの追加条件を足す。他の節は有効）
 - **関連**: [`0027-fan-control-architecture.md`](0027-fan-control-architecture.md)、
   [`0028-fan-control-contracts.md`](0028-fan-control-contracts.md) §2.5 / §2.8 / §2.9、
   [`0030-control-decision-trace-storage.md`](0030-control-decision-trace-storage.md)、

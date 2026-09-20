@@ -376,8 +376,14 @@ def fallback_proposal(demand: float = 0.4) -> ControllerProposal:
     )
 
 
-def assessment_for(proposal: ControllerProposal) -> ConfidenceAssessment:
-    """提案と同じ推論・値を持つ、Registry 検証済みの assessment（Gate の試験用）。"""
+def assessment_for(
+    proposal: ControllerProposal, *, artifact_sha256: str = "a" * 64
+) -> ConfidenceAssessment:
+    """提案と同じ推論・値を持つ、Registry 検証済みの assessment（Gate の試験用）。
+
+    `artifact_sha256` は Gate が束縛した artifact と揃える（#159）。揃っていなければ
+    Gate は `model_artifact_mismatch` で Fallback にする。
+    """
     assert proposal.confidence is not None and proposal.inference_id is not None
     assert proposal.model_version is not None
     components = tuple(
@@ -401,7 +407,7 @@ def assessment_for(proposal: ControllerProposal) -> ConfidenceAssessment:
     return ConfidenceAssessment(
         model_id="rack-thermal",
         model_version=proposal.model_version,
-        artifact_sha256="a" * 64,
+        artifact_sha256=artifact_sha256,
         artifact_verification=ArtifactVerification.REGISTRY_VERIFIED,
         profile_sha256="d" * 64,
         input_action_ts_ms=10_000,
@@ -431,16 +437,29 @@ def healthy_status(
     )
 
 
-def gate_for(settings: FanPolicyConfig, *, expected_model_version: str) -> ControllerGate:
+TEST_ARTIFACT_SHA256 = "a" * 64
+"""`assessment_for` が作る assessment の artifact。**仮の値である**（AGENTS.md ルール10）。"""
+
+
+def gate_for(
+    settings: FanPolicyConfig,
+    *,
+    expected_model_version: str,
+    expected_artifact_sha256: str | None = TEST_ARTIFACT_SHA256,
+) -> ControllerGate:
     """**試験用**に、設定の stage をそのまま実効 stage にする Gate を作る。
 
     本番の配線ではない。runtime は `AuthorityRuntime` を渡し、journal が stage を決める
     （#92 / 決定記録 0057 §2.2）。`ControllerGate` が `authority` を必須にしているのは、
     配線を忘れた起動が設定の**上限**をそのまま制御権にしないためである。
+
+    `expected_artifact_sha256` は本番では `ArtifactAttestation.artifact_sha256` から来る
+    （#159 / 決定記録 0059）。ここでは `assessment_for` が作る artifact を既定にする。
     """
     return ControllerGate(
         settings,
         expected_model_version=expected_model_version,
+        expected_artifact_sha256=expected_artifact_sha256,
         authority=StaticAuthorityStage(settings.authority_stage),
     )
 
@@ -973,6 +992,83 @@ def test_an_assessment_the_registry_did_not_verify_leaves_the_artifact_unknown()
     assert selected.model_gate is not None
     assert selected.model_gate.attested is False
     assert selected.model_gate.artifact_sha256 is None
+
+
+def test_a_forged_artifact_field_is_not_recorded_as_attested() -> None:
+    """**検証し直すだけでは足りない**（codex #4057191721）。
+
+    artifact B の正しい assessment を `model_copy(update={"artifact_sha256": A})` で
+    書き換えたものは、`REGISTRY_VERIFIED` も同じ推論 ID も版も confidence もそのまま通る。
+    形の検証だけで信じると、**B の判定を A の実績として trace に書いてしまう。**
+    Gate は配線時に束縛した attestation の hash と照らし、合わなければ artifact を残さない。
+    """
+    gate = gate_for(policy(), expected_model_version="thermal-v1")
+    proposal = learned_proposal()
+    forged = assessment_for(proposal).model_copy(update={"artifact_sha256": "b" * 64})
+    # **形は完全に正しい。** 検証し直しても通る（だから形の検証では止まらない）。
+    assert ConfidenceAssessment.model_validate(forged.model_dump(mode="python")) == forged
+
+    selected = gate.select(
+        now_mono_ms=0,
+        fallback=fallback_proposal(0.4),
+        learned=LearnedControlStatus(
+            proposal=proposal,
+            received_at_mono_ms=0,
+            assessment=forged,
+            binding_authority_stage=AuthorityStage.FULL,
+        ),
+        operating_mode=OperatingMode.AUTO,
+        safety_state=SafetyState.NORMAL,
+    )
+
+    assert selected.active_controller is ControllerKind.FALLBACK
+    assert selected.fallback_reason is not None
+    assert selected.fallback_reason.code == "model_artifact_mismatch"
+    assert selected.model_gate is not None
+    assert selected.model_gate.attested is False
+    assert selected.model_gate.artifact_sha256 is None, "束縛できない artifact を残さない"
+
+
+def test_a_gate_without_a_bound_artifact_never_records_one() -> None:
+    """**Learned MPC を束縛できていない runtime は、どの提案も採らない**（#159）。
+
+    `expected_artifact_sha256=None` は「照らす相手が無い」という明示であって、
+    「何でも通す」ではない。fail closed にする。
+    """
+    gate = gate_for(policy(), expected_model_version="thermal-v1", expected_artifact_sha256=None)
+    selected = gate.select(
+        now_mono_ms=0,
+        fallback=fallback_proposal(0.4),
+        learned=healthy_status(),
+        operating_mode=OperatingMode.AUTO,
+        safety_state=SafetyState.NORMAL,
+    )
+
+    assert selected.active_controller is ControllerKind.FALLBACK
+    assert selected.fallback_reason is not None
+    assert selected.fallback_reason.code == "model_artifact_mismatch"
+    assert selected.model_gate is not None
+    assert selected.model_gate.artifact_sha256 is None
+
+
+def test_the_gate_requires_an_explicit_expected_artifact() -> None:
+    """**配線の抜けが「何にも照らさない」Gate を作らない**（0057 §2.2 と同じ理由）。
+
+    既定値を置かず、必須の引数にする。形の違う値も受け取らない。
+    """
+    with pytest.raises(TypeError):
+        ControllerGate(  # type: ignore[call-arg]
+            policy(),
+            expected_model_version="thermal-v1",
+            authority=StaticAuthorityStage(AuthorityStage.FULL),
+        )
+    with pytest.raises(ValueError, match="sha256 の16進表現"):
+        ControllerGate(
+            policy(),
+            expected_model_version="thermal-v1",
+            expected_artifact_sha256="NOT-A-HASH",
+            authority=StaticAuthorityStage(AuthorityStage.FULL),
+        )
 
 
 def test_an_assessment_for_another_inference_cannot_lend_its_artifact() -> None:

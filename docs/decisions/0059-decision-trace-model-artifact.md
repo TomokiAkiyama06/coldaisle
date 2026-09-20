@@ -4,11 +4,15 @@
 - **Status**: Proposed
 - **Date**: 2026-09-20
 - **Supersedes**: [`0057-authority-rollout-stage-changes.md`](0057-authority-rollout-stage-changes.md)
-  の **§2.4 の「適用側の arm は昇格の根拠にできない」**、**§3 の
-  「適用側（factual）の実績では昇格できない」**、**§5 の「decision trace へ、適用した
-  tick の model artifact を記録すること（GitHub #159）」**。
+  の **§3 の帰結「適用側（factual）の実績では昇格できない」の項**と、
+  **§5 の未決事項「decision trace へ、適用した tick の model artifact を記録すること
+  （GitHub #159）」の項**だけ。
+  **§2.4 は置き換えない。** §2.4 は「名指した arm は**適用側・counterfactual 側の
+  どちらの名前空間でもよい**が、制御器で判断する」と決めており、本記録はその許可を
+  そのまま使う。足すのは**適用側の arm にだけ掛かる追加条件**（artifact の束縛。§2.4 の
+  条件一覧への**追記**であって、既存の条件の置き換えではない）である。
   0057 のそれ以外の決定（stage の正本・承認の束縛・1段ずつ・自動降格・設定は上限・
-  lock の順序）は**そのまま有効である**
+  lock の順序・証拠の完全性と新しさ）は**すべてそのまま有効である**
 - **関連**: [`0030-control-decision-trace-storage.md`](0030-control-decision-trace-storage.md) §2、
   [`0048-thermal-model-artifact-and-inference.md`](0048-thermal-model-artifact-and-inference.md) §2.4、
   [`0050-model-confidence-ood-and-authority.md`](0050-model-confidence-ood-and-authority.md) §2.5、
@@ -68,6 +72,22 @@ counterfactual に残り `artifact_sha256` が付く）が、**LIMITED 以降は
   出した」と名乗る経路を型として無くす（自己申告を受け取らない）
 - Gate は `ConfidenceAssessment` を `model_validate` で**検証し直してから**写す。
   `model_copy(update=...)` は検証を通らないため（#85 と同じ扱い）
+- **検証し直すだけでは足りない**（codex #4057191721）。`artifact_sha256` は assessment の
+  ただの欄で、`model_validate` が見るのは形だけである。artifact B の正しい assessment を
+  `model_copy(update={"artifact_sha256": A})` で書き換えたものは、`REGISTRY_VERIFIED` も
+  同じ推論 ID も版も confidence もそのまま通り、**A の実績として記録できてしまう。**
+  だから Gate は **配線時に束縛した attestation の hash** と照らす。
+  `ControllerGate.__init__` は `expected_artifact_sha256` を**必須の引数**にする
+  （`ArtifactAttestation.artifact_sha256`。`expected_model_version` と同じ立場）。
+  一致しなければ `model_artifact_mismatch` で Fallback にし、**artifact を記録しない**。
+  Learned MPC を束縛できなかった runtime は `None` を**明示的に**渡し、その場合は
+  どの Learned 提案も採らない（既定値を置かないのは、渡し忘れが「何にも照らさない」
+  状態を作らないためである。0057 §2.2 の `authority` と同じ理由）
+- 0050 §3 が受け入れたとおり、**同一 process 内の悪意ある偽造は防げない。**
+  ここで塞ぐのはそれではなく、**何とも照らされていない欄**があることである
+- **counterfactual 側（`ShadowCounterfactual.artifact_sha256`）も同じ値にする。**
+  記録側（#90）は assessment の欄ではなく **Gate が照合し終えた artifact** を写す。
+  同じ tick の2つの記録が違う artifact を名乗ることは `ControlTick` が拒む（§2.2）
 - 裏づけの無い判断（`attested` でない）には**付けない**。付けられると、別の推論の artifact が
   この tick の実績として読まれる
 
@@ -118,14 +138,21 @@ gate の段（§2.4）も同じである。
 （`()` / `0`）として読まれる。0057 §2.4 が `last_attested_ts_ms` を足したときと同じ扱いで、
 **古い報告では適用側の arm が昇格の根拠にならない**（判断は fail closed のまま）。
 
-### 2.4 適用側の arm を昇格の根拠にできるようにする（0057 §2.4 / §3 の置き換え）
+### 2.4 適用側の arm を昇格の根拠にできるようにする（0057 §3 の帰結の置き換え）
 
-`_check_learned_arms()` の「適用側の arm は根拠にできない」を外す。外すかわりに、
-**適用側の arm には次をすべて要求する。**
+0057 §2.4 は「名指した arm は適用側・counterfactual 側のどちらの名前空間でもよい」と
+**既に許している。** 使えなくしていたのは §3 の帰結（「適用側（factual）の実績では昇格
+できない」）を写した `_check_learned_arms()` の拒否である。**その拒否を外す。**
+外すかわりに、§2.4 の条件一覧へ次を**足す**。
 
-- `unbound_attested_ticks` が **0**（artifact を言えない tick が1つも無い）
-- `model_artifacts` が**空でない**（旧 version だけで回した区間を通さない）
-- `model_artifacts` が **いま Production の artifact ちょうど1つ**である
+**（a）報告に現れた Learned MPC の arm すべてについて**、`unbound_attested_ticks` が **0**
+（artifact を言えない適用 tick が1つも無い）。**名指した arm だけを見ない。**
+名指した arm だけを見ると、同じ holdout に v1〜v6 の tick を含む別の適用 arm が残っていても
+昇格できてしまう（codex #4057191724）。gate の判定をすべての Learned arm に要求するのと
+同じ理由である。
+
+**（b）名指した arm が適用側なら**、`model_artifacts` が**空でなく**（旧 version だけで
+回した区間を通さない）、**いま Production の artifact ちょうど1つ**である。
 
 **artifact と「不明」の数は segment をまたいで足し合わせる。** 新しいほうの segment だけを
 残すと、別の artifact で回した区間や、artifact の欄を持たない古い trace の区間が束縛の
@@ -172,6 +199,9 @@ gate の段（§2.4）も同じである。
 | `ControlState` に `artifact_sha256` を持たせる | どの tick にもある欄になり、裏づけのある推論が無い tick にも artifact を書ける。`ControlState` は attestation を持たないので、束縛の根拠が型から消える（§2.1） |
 | `ControllerProposal` に artifact の欄を足し、Gate がそれを写す | **自己申告を受け取ることになる。** 提案の `confidence` / `ood` を信用しないのと同じ理由で、artifact も信用しない（#85） |
 | 適用 arm の**鍵**（`arm_key`）に artifact を入れる | artifact を入れ替えるたびに arm が別物になり、同じ構成の運転実績が分断される。鍵は「どう回したか」で、artifact は「何で回したか」である |
+| assessment の `artifact_sha256` を、形の検証だけで信じる | `model_validate` は形しか見ない。artifact B の assessment を A に書き換えたものが素通りする（codex #4057191721）。**何とも照らされていない欄を記録しない** |
+| `ControllerGate` の `expected_artifact_sha256` に既定値を置く | 渡し忘れた配線が「何にも照らさない」Gate を作る。0057 §2.2 が `authority` を必須にしたのと同じ理由で、必須の引数にする |
+| 「artifact を言えない適用 tick が無いこと」を、名指した arm だけに求める | 同じ holdout に v1〜v6 の tick を含む別の適用 arm が残っていても昇格できる（codex #4057191724）。gate の判定と同じく、報告に現れた Learned MPC の arm すべてに求める |
 | `ControlTick` の version を上げず、欄だけ足す | 0030 §2 が「schema の意味を変える場合は version を上げ、既存 trace を新しい意味として解釈しない」と決めている。上げないと、欄の無い v6 を「artifact 不明」ではなく「まだ書いていないだけ」と読める |
 | 欄の無い古い tick を、同じ区間の別の tick の artifact で埋める | 推測である。**記録から言えないことを言わない**（0054 §2.2 と同じ向き） |
 | `unbound_attested_ticks` を持たず、artifact の集合だけを見る | 新旧の trace が混ざった区間で、残った tick の artifact が区間全体の実績に見える。部分的な束縛が完全なものとして通る |
@@ -182,7 +212,8 @@ gate の段（§2.4）も同じである。
 
 ## 5. 未決事項
 
-- **所有者の承認が要る。** 本記録は 0057（`FINAL`）の §2.4 / §3 / §5 を置き換える。
+- **所有者の承認が要る。** 本記録は 0057（`FINAL`）の §3 の帰結1項と §5 の未決1項を
+  置き換え、§2.4 の条件一覧へ追記する。
   安全系・制御系の設計変更は人間レビューが必須である（AGENTS.md）。承認までは `Proposed`
 - **適用された Learned MPC の optimizer 実績を trace に残すか**（0054 §5 / 0057 §3）。
   本記録では扱わない。`ControlTick` の追加が要るので、必要になったときに別の記録で決める

@@ -423,8 +423,10 @@ def _check_learned_arms(
     - その arm の stage が、いま上げようとしている遷移元と同じである
     - **報告に現れた Learned MPC の arm すべて**に gate があり、すべて `pass` である
       （良い arm だけを選んで、落ちた構成を残したまま上げられないようにする）
-    - **適用側の arm なら、その arm が適用した artifact がいま Production のちょうど1つで、
-      artifact を言えない tick が1つも無い**（#159 / 決定記録 0059）
+    - **報告に現れた Learned MPC の arm すべて**に「artifact を言えない適用 tick」が
+      1つも無い（#159 / 決定記録 0059。名指した arm だけを見ない）
+    - 名指した arm が適用側なら、その arm が適用した artifact が
+      **いま Production のちょうど1つ**である
 
     返すのは名指した arm の実績で、呼び出し側が**その arm の新しさ**を測るのに使う。
     """
@@ -445,16 +447,8 @@ def _check_learned_arms(
         )
     if isinstance(named.arm, AppliedArm):
         # **適用側の arm は、その arm 自身が適用した artifact へ束縛してから受け入れる**
-        # （#159 / 決定記録 0059 が 0057 §2.4 / §3 の制限を置き換える）。
+        # （#159 / 決定記録 0059 が 0057 §3 の禁止を置き換える）。
         # 報告全体の `model_artifacts` の照合（呼び出し側）と合わせて**2箇所**で見る。
-        if named.unbound_attested_ticks:
-            # 欄を持たない v1〜v6 の trace が混ざっている。**部分的な束縛を完全として
-            # 扱わない**（残りの tick の artifact で区間全体を語らせない）。
-            raise AuthorityEvidenceError(
-                "artifact を言えない適用 tick が混ざった arm を根拠にできない"
-                f"（arm={approval.evidence.arm_key}; "
-                f"unknown_ticks={named.unbound_attested_ticks}）"
-            )
         artifacts = set(named.model_artifacts)
         if not artifacts:
             # trace に artifact が無い（旧 version だけの区間）。**推測で埋めない。**
@@ -478,6 +472,15 @@ def _check_learned_arms(
     for key, evidence in sorted(arms.items()):
         if evidence.arm.controller is not ControllerKind.LEARNED_MPC:
             continue
+        if evidence.unbound_attested_ticks:
+            # **名指した arm だけでなく、報告に現れた Learned MPC の適用 arm すべて**が
+            # 束縛できていなければならない（codex #4057191724）。名指した arm だけを見ると、
+            # 同じ holdout に v1〜v6 の tick を含む別の適用 arm が残っていても昇格できる。
+            # 欄を持たない tick が1件でもあれば、その区間は「artifact 不明」である。
+            raise AuthorityEvidenceError(
+                "artifact を言えない適用 tick が混ざった arm がある"
+                f"（arm={key}; unknown_ticks={evidence.unbound_attested_ticks}）"
+            )
         results = outcomes.get(key, [])
         if not results:
             # 判定していないことを合格にしない（0054 の fail closed と同じ向き）。

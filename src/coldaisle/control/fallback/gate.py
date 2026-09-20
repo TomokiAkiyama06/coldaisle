@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from collections import deque
 from enum import StrEnum
 from typing import Self
@@ -35,6 +36,10 @@ class _Frozen(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid", strict=True)
 
 
+_SHA256_HEX = re.compile(r"^[0-9a-f]{64}$")
+"""束縛した artifact の hash の形。`coldaisle.control.schema.Sha256Hex` と同じ。"""
+
+
 class SnapshotStatus(StrEnum):
     """Gate が受け取った State Snapshot の状態。"""
 
@@ -55,6 +60,13 @@ class FallbackCause(StrEnum):
     OOD = "ood"
     SUPERVISOR_FAILURE = "supervisor_failure"
     MODEL_VERSION_MISMATCH = "model_version_mismatch"
+    MODEL_ARTIFACT_MISMATCH = "model_artifact_mismatch"
+    """assessment が名乗る artifact が、Gate が束縛した production の artifact と違う（#159）。
+
+    `artifact_sha256` は assessment の**ただの欄**なので、形を検証し直すだけでは
+    「別の artifact の判定を、この artifact の実績として記録する」ことを止められない
+    （codex #4057191721）。**配線時に束縛した attestation の hash と照らす。**
+    """
     CONFIDENCE_UNATTESTED = "confidence_unattested"
     """提案の confidence / ood が、この推論の検証済み assessment と照合できない（#85）。"""
     CONTROL_DEADLINE_EXCEEDED = "control_deadline_exceeded"
@@ -250,6 +262,7 @@ class ControllerGate:
         policy: FanPolicyConfig,
         *,
         expected_model_version: str,
+        expected_artifact_sha256: str | None,
         authority: AuthorityStageSource,
     ) -> None:
         """**`authority` は必須である**（#92 / 決定記録 0057 §2.2）。
@@ -259,11 +272,22 @@ class ControllerGate:
         Shadow のはずが、`authority_stage: full` の設定だけで Learned MPC が実 Fan を握る。
         **配線の抜けが authority を増やす形にしない。** 試験や移行で stage を固定したい
         ときは `StaticAuthorityStage` を明示的に渡す。
+
+        **`expected_artifact_sha256` も必須の引数にする**（#159 / 決定記録 0059）。
+        `ArtifactAttestation.artifact_sha256`、すなわち Registry が検証した束縛の hash を
+        渡す。Learned MPC を束縛できなかった runtime では `None` を**明示的に**渡す。
+        その場合、Learned MPC の提案はどれも採らず、artifact も記録しない（fail closed）。
+        既定値を置かないのは、渡し忘れが「何にも照らさない」状態を作らないためである。
         """
         if not expected_model_version:
             raise ValueError("expected_model_version は空にできない")
+        if expected_artifact_sha256 is not None and not _SHA256_HEX.fullmatch(
+            expected_artifact_sha256
+        ):
+            raise ValueError("expected_artifact_sha256 は sha256 の16進表現にする")
         self._policy = policy
         self._expected_model_version = expected_model_version
+        self._expected_artifact_sha256 = expected_artifact_sha256
         self._authority = authority
         self._active_controller: ControllerKind | None = None
         self._last_requested: PerZone[ZoneRequest] | None = None
@@ -395,7 +419,7 @@ class ControllerGate:
             )
         assessment, unattested = self._attested_assessment(proposal, learned.assessment)
         if unattested is not None:
-            return self._reason(FallbackCause.CONFIDENCE_UNATTESTED, unattested)
+            return unattested
         assert assessment is not None
         # 自称値の照合を先に行う。ここを後に回すと、assessment が OOD でないのに提案だけが
         # OOD を名乗った tick を「OOD」として記録し、trace の理由と判定が食い違う。
@@ -422,26 +446,46 @@ class ControllerGate:
             )
         return None
 
-    @staticmethod
     def _attested_assessment(
-        proposal: ControllerProposal, assessment: ConfidenceAssessment | None
-    ) -> tuple[ConfidenceAssessment | None, str | None]:
+        self, proposal: ControllerProposal, assessment: ConfidenceAssessment | None
+    ) -> tuple[ConfidenceAssessment | None, Reason | None]:
         """この推論に束縛できた **検証し直した** assessment と、できなかった理由を返す。
 
         提案の ``confidence`` / ``ood`` は誰でも書ける値なので、それだけで authority を
         与えない。**trace へ写す値（confidence / ood / artifact の hash）も、渡された
         object ではなくここで返した検証済みの assessment から取る**（#159）。
         `model_copy(update=...)` は検証を通らないため、Gate でも検証し直す。
+
+        **検証し直すだけでは足りない**（codex #4057191721）。`model_validate` が見るのは
+        形だけなので、artifact B の正しい assessment を `model_copy` で
+        `artifact_sha256=A` に書き換えたものは、`REGISTRY_VERIFIED` も同じ推論 ID も版も
+        confidence もそのまま通り、**A の実績として記録できてしまう。**
+        だから artifact は、配線時に束縛した attestation の hash と照らす。
         """
         if assessment is None:
-            return None, "assessment is missing"
+            return None, self._reason(FallbackCause.CONFIDENCE_UNATTESTED, "assessment is missing")
         verified = ConfidenceAssessment.model_validate(assessment.model_dump(mode="python"))
         if verified.artifact_verification is not ArtifactVerification.REGISTRY_VERIFIED:
-            return None, "assessment is not registry verified"
+            return None, self._reason(
+                FallbackCause.CONFIDENCE_UNATTESTED, "assessment is not registry verified"
+            )
         if verified.inference_id != proposal.inference_id:
-            return None, "assessment is for another inference"
+            return None, self._reason(
+                FallbackCause.CONFIDENCE_UNATTESTED, "assessment is for another inference"
+            )
         if verified.model_version != proposal.model_version:
-            return None, "assessment is for another model version"
+            return None, self._reason(
+                FallbackCause.CONFIDENCE_UNATTESTED, "assessment is for another model version"
+            )
+        expected = self._expected_artifact_sha256
+        if expected is None:
+            # Learned MPC を束縛できていない runtime。どの artifact の判定も受け取らない。
+            return None, self._reason(FallbackCause.MODEL_ARTIFACT_MISMATCH, "no bound artifact")
+        if verified.artifact_sha256 != expected:
+            return None, self._reason(
+                FallbackCause.MODEL_ARTIFACT_MISMATCH,
+                f"expected={expected}; actual={verified.artifact_sha256}",
+            )
         return verified, None
 
     def _required_confidence(self, stage: AuthorityStage) -> float:
@@ -589,7 +633,8 @@ class ControllerGate:
         assert proposal.model_version is not None
         assert proposal.inference_id is not None
         learned_selected = selected.controller is ControllerKind.LEARNED_MPC
-        # **trace へ写す値は、検証し直した assessment からだけ取る**（#85 / #159）。
+        # **trace へ写す値は、束縛できた assessment からだけ取る**（#85 / #159）。
+        # 束縛には、配線時の attestation との artifact の照合も含む（codex #4057191721）。
         assessment, _ = self._attested_assessment(proposal, learned.assessment)
         if assessment is None:
             # 提案が自称した confidence / ood は残さない。評価と stage の判断が誤読するため。

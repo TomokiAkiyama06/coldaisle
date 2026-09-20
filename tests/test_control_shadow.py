@@ -1832,3 +1832,37 @@ def other_plan(plan):
 
 def zero_cost(cost):
     return cost.model_copy(update={"total": cost.total + 1.0})
+
+
+def test_the_counterfactual_artifact_comes_from_the_gate_not_the_assessment() -> None:
+    """**counterfactual の artifact も、Gate が照合し終えた値にする**（#159 / 決定記録 0059）。
+
+    assessment の欄をそのまま写すと、Gate が束縛した attestation と照らしていない値が
+    counterfactual 側にだけ残る（codex #4057191721 と同じ型の穴）。同じ tick の
+    `model_gate` と食い違う artifact を `ControlTick` は拒むので、trace 全体で1つになる。
+    """
+    proposal = shadow_proposal(0.9)
+    selection, state, record = recorded(learned=mpc_result(proposal))
+
+    assert record is not None
+    assert selection.model_gate is not None
+    assert selection.model_gate.attested is True
+    item = next(
+        counterfactual
+        for counterfactual in record.counterfactuals
+        if counterfactual.controller is ControllerKind.LEARNED_MPC
+    )
+    assert item.attested is True
+    assert item.artifact_sha256 == selection.model_gate.artifact_sha256
+
+    # 同じ tick に2つの artifact を書けないことを、schema の側でも確かめる。
+    tick = ControlTick(
+        tick_id=7,
+        ts_ms=TICK_TS_MS,
+        state=state,
+        zones=zone_records(0.4),
+        model_gate=selection.model_gate,
+        shadow=record,
+    )
+    assert tick.model_gate is not None
+    assert tick.model_gate.artifact_sha256 == item.artifact_sha256

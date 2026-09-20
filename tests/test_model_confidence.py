@@ -81,6 +81,7 @@ from coldaisle.control.schema import (
 )
 from coldaisle.store.models import Quality
 from test_fallback_controller import (
+    TEST_ARTIFACT_SHA256,
     assessment_for,
     fallback_proposal,
     gate_for,
@@ -651,20 +652,32 @@ def test_confidence_level_follows_stage_thresholds_and_ood() -> None:
     )
 
 
-def _active_gate(stage: AuthorityStage) -> ControllerGate:
+def _active_gate(stage: AuthorityStage, *, artifact: str = TEST_ARTIFACT_SHA256) -> ControllerGate:
+    """**束縛した artifact も渡す**（#159）。Gate はこれと assessment の artifact を照らす。"""
     gate = gate_for(
-        policy(authority=stage.value, recovery_hold_ms=1), expected_model_version="thermal-v1"
+        policy(authority=stage.value, recovery_hold_ms=1),
+        expected_model_version="thermal-v1",
+        expected_artifact_sha256=artifact,
     )
-    _select(gate, 0, learned_proposal(0.7))
+    _select(gate, 0, learned_proposal(0.7), artifact=artifact)
     return gate
 
 
 _ATTACH = object()
 
 
-def _select(gate: ControllerGate, now: int, proposal, assessment: object = _ATTACH):
+def _select(
+    gate: ControllerGate,
+    now: int,
+    proposal,
+    assessment: object = _ATTACH,
+    *,
+    artifact: str = TEST_ARTIFACT_SHA256,
+):
     """提案を Gate へ渡す。既定では同じ推論の assessment を付ける。"""
-    attached = assessment_for(proposal) if assessment is _ATTACH else assessment
+    attached = (
+        assessment_for(proposal, artifact_sha256=artifact) if assessment is _ATTACH else assessment
+    )
     return gate.select(
         now_mono_ms=now,
         fallback=fallback_proposal(0.4),
@@ -731,12 +744,7 @@ def test_ood_assessment_switches_to_fallback_immediately_and_is_traced(trained) 
         observed, model.predict(observed), evidence(profile, 1.0, at=observed.action_ts_ms)
     )
     # Registry を通った artifact の判定として提案へ付ける（offline のままでは付けられない）
-    deployed = assessment.model_copy(
-        update={
-            "artifact_verification": ArtifactVerification.REGISTRY_VERIFIED,
-            "model_version": "thermal-v1",
-        }
-    )
+    deployed = _deployed(assessment)
     proposal = deployed.apply_to(learned_proposal(0.1, inference_id=deployed.inference_id))
     selected = _select(gate, 2, proposal, deployed)
 
@@ -1249,11 +1257,18 @@ def test_r1_no_high_confidence_without_fresh_residual_evidence(trained) -> None:
 
 
 def _deployed(assessment: ConfidenceAssessment) -> ConfidenceAssessment:
+    """offline で作った判定を、**配線した production の束縛のもの**として扱う。
+
+    `artifact_sha256` も Gate が束縛した artifact に揃える（#159）。揃えないと Gate は
+    `model_artifact_mismatch` で退ける。揃えるのはここが「production へ配線した」
+    状況を作る helper だからで、**Gate 側の照合そのものは別の試験で破りにいく**。
+    """
     return ConfidenceAssessment.model_validate(
         assessment.model_copy(
             update={
                 "artifact_verification": ArtifactVerification.REGISTRY_VERIFIED,
                 "model_version": "thermal-v1",
+                "artifact_sha256": TEST_ARTIFACT_SHA256,
             }
         ).model_dump(mode="python")
     )

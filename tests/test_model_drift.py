@@ -69,7 +69,7 @@ from coldaisle.control.shadow import (
     ShadowOutcome,
     ShadowOutcomeMatcher,
 )
-from test_fallback_controller import learned_proposal
+from test_fallback_controller import TEST_ARTIFACT_SHA256, learned_proposal
 from test_model_confidence import (
     AIR,
     GPU,
@@ -442,6 +442,9 @@ def test_runtime_drift_still_reaches_the_authority_gate_through_confidence(train
         update={
             "artifact_verification": ArtifactVerification.REGISTRY_VERIFIED,
             "model_version": "thermal-v1",
+            # Gate が束縛した artifact に揃える（#159）。揃えないと artifact の不一致で
+            # 先に落ち、ここで見たい OOD の理由が出ない。
+            "artifact_sha256": TEST_ARTIFACT_SHA256,
         }
     )
     gate = _active_gate(AuthorityStage.FULL)

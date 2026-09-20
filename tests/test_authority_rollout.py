@@ -102,6 +102,7 @@ from test_critical_safety import (
     snapshot as safety_snapshot,
 )
 from test_fallback_controller import (
+    TEST_ARTIFACT_SHA256,
     fallback_proposal,
     healthy_status,
     learned_proposal,
@@ -1208,6 +1209,40 @@ def test_invariant_5_w_unknown_artifact_ticks_are_summed_across_segments(
         raise_stage(authority, approval=approval, document=document)
 
 
+def test_invariant_5_x_a_sibling_applied_arm_with_unknown_artifacts_blocks_the_promotion(
+    tmp_path: Path,
+) -> None:
+    """**名指した arm だけを束縛しても足りない**（codex #4057191724）。
+
+    同じ holdout に、artifact を言えない適用 tick を含む別の Learned MPC の arm が
+    残っていれば、その報告は「どの artifact の実績か」を全体としては言えていない。
+    gate の判定を Learned MPC の arm すべてに求めるのと同じ向きで、束縛も全部に求める。
+    """
+    authority = store(tmp_path)
+    first = report_document()
+    raise_stage(authority, approval=approval_for(first), document=first)
+
+    named = learned_arm(AuthorityStage.LIMITED)
+    document = report_document(
+        # 名指すのは counterfactual の arm。**こちらは完全に束縛できている。**
+        arm=named.key,
+        stages=(AuthorityStage.LIMITED.value,),
+        arm_stage=AuthorityStage.LIMITED,
+        # 同じ holdout に、artifact を言えない tick を含む適用 arm が残っている。
+        with_applied_learned=True,
+        applied_unbound_ticks=4,
+    )
+    approval = approval_for(
+        document,
+        from_stage=AuthorityStage.LIMITED,
+        revision=1,
+        evidence=evidence_for(document, arm=named.key),
+    )
+
+    with pytest.raises(AuthorityEvidenceError, match="artifact を言えない適用 tick"):
+        raise_stage(authority, approval=approval, document=document)
+
+
 def test_invariant_5_n_a_blocked_sibling_learned_arm_blocks_the_promotion(
     tmp_path: Path,
 ) -> None:
@@ -1734,7 +1769,12 @@ def test_invariant_7_c_the_gate_never_uses_a_stage_above_the_configured_ceiling(
             return AuthorityStage.FULL
 
     settings = policy(authority="limited", recovery_hold_ms=1)
-    gate = ControllerGate(settings, expected_model_version="thermal-v1", authority=Lying())
+    gate = ControllerGate(
+        settings,
+        expected_model_version="thermal-v1",
+        expected_artifact_sha256=TEST_ARTIFACT_SHA256,
+        authority=Lying(),
+    )
 
     first = gate.select(
         now_mono_ms=0,
@@ -1763,7 +1803,12 @@ def test_invariant_7_d_a_lowered_stage_puts_the_gate_back_on_fallback() -> None:
     """**stage を Shadow へ下げたら、次の tick から実 Fan は Fallback が作る。**"""
     settings = policy(authority="full", recovery_hold_ms=1)
     source = StaticAuthorityStage(AuthorityStage.FULL)
-    gate = ControllerGate(settings, expected_model_version="thermal-v1", authority=source)
+    gate = ControllerGate(
+        settings,
+        expected_model_version="thermal-v1",
+        expected_artifact_sha256=TEST_ARTIFACT_SHA256,
+        authority=source,
+    )
     gate.select(
         now_mono_ms=0,
         fallback=fallback_proposal(0.4),
@@ -1783,6 +1828,7 @@ def test_invariant_7_d_a_lowered_stage_puts_the_gate_back_on_fallback() -> None:
     lowered = ControllerGate(
         settings,
         expected_model_version="thermal-v1",
+        expected_artifact_sha256=TEST_ARTIFACT_SHA256,
         authority=StaticAuthorityStage(AuthorityStage.SHADOW),
     )
     selection = lowered.select(
@@ -1807,12 +1853,18 @@ def test_invariant_7_e_a_proposal_made_before_a_promotion_is_not_used_after_it(
     """
     settings = policy(authority="full", recovery_hold_ms=1)
     source = StaticAuthorityStage(AuthorityStage.SHADOW)
-    gate = ControllerGate(settings, expected_model_version="thermal-v1", authority=source)
+    gate = ControllerGate(
+        settings,
+        expected_model_version="thermal-v1",
+        expected_artifact_sha256=TEST_ARTIFACT_SHA256,
+        authority=source,
+    )
     shadow_status = healthy_status(received=0, binding_stage=AuthorityStage.SHADOW)
 
     raised = ControllerGate(
         settings,
         expected_model_version="thermal-v1",
+        expected_artifact_sha256=TEST_ARTIFACT_SHA256,
         authority=StaticAuthorityStage(AuthorityStage.LIMITED),
     )
     raised.select(
@@ -2058,6 +2110,7 @@ def test_invariant_9_a_the_stage_is_recorded_on_a_tick_without_any_model() -> No
     gate = ControllerGate(
         policy(authority="full"),
         expected_model_version="thermal-v1",
+        expected_artifact_sha256=TEST_ARTIFACT_SHA256,
         authority=StaticAuthorityStage(AuthorityStage.EXPANDED),
     )
 
@@ -2085,6 +2138,7 @@ def test_invariant_9_b_the_recorded_stage_does_not_follow_the_model_version() ->
         gate = ControllerGate(
             settings,
             expected_model_version=version,
+            expected_artifact_sha256=TEST_ARTIFACT_SHA256,
             authority=StaticAuthorityStage(AuthorityStage.LIMITED),
         )
         gate.select(
@@ -2112,6 +2166,7 @@ def test_invariant_9_c_a_selection_cannot_claim_two_different_stages() -> None:
     gate = ControllerGate(
         policy(authority="full", recovery_hold_ms=1),
         expected_model_version="thermal-v1",
+        expected_artifact_sha256=TEST_ARTIFACT_SHA256,
         authority=StaticAuthorityStage(AuthorityStage.LIMITED),
     )
     gate.select(
@@ -2184,6 +2239,7 @@ def test_invariant_10_b_the_safety_floor_is_identical_at_every_stage() -> None:
         gate = ControllerGate(
             settings,
             expected_model_version="thermal-v1",
+            expected_artifact_sha256=TEST_ARTIFACT_SHA256,
             authority=StaticAuthorityStage(stage),
         )
         for tick in (0, 1):
@@ -2272,7 +2328,13 @@ def test_the_first_promotion_can_actually_be_walked(tmp_path: Path, trained) -> 
     assert shadow_result.proposal is not None, "Shadow 期間の提案が作れないと証拠が貯まらない"
 
     # 2. Gate は SHADOW。実 Fan は Fallback が作る。
-    gate = ControllerGate(settings, expected_model_version=attestation.version, authority=control)
+    gate = ControllerGate(
+        settings,
+        expected_model_version=attestation.version,
+        # **束縛した attestation の hash をそのまま渡す**（#159）。
+        expected_artifact_sha256=attestation.artifact_sha256,
+        authority=control,
+    )
     shadow_tick = gate.select(
         now_mono_ms=0,
         fallback=fallback_proposal(0.4),
