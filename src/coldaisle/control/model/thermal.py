@@ -725,7 +725,11 @@ class RidgeThermalModel(_RidgeThermalModelBase):
         *,
         authority_stage: AuthorityStage,
     ) -> RidgeThermalModel:
-        """Load the exact payload and metadata returned by #104 ``VerifiedArtifact``."""
+        """Load the exact payload and metadata returned by #104 ``VerifiedArtifact``.
+
+        ``authority_stage`` is the **effective** stage the caller will run at
+        (#92 / decision record 0057 §2.2), not the configured ceiling.
+        """
         try:
             registry_module = importlib.import_module("coldaisle.control.model_registry")
             verified_artifact_type = registry_module.VerifiedArtifact

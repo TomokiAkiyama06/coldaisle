@@ -37,13 +37,22 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_valida
 
 from coldaisle.clock import Clock
 from coldaisle.control.config import FanPolicyConfig
-from coldaisle.control.evaluation.model import EvaluationReport, GateOutcome
+from coldaisle.control.evaluation.model import (
+    AppliedArm,
+    CounterfactualArm,
+    EvaluationReport,
+    GateOutcome,
+    GateResult,
+    GroupKind,
+    SegmentRole,
+)
 from coldaisle.control.schema import (
     BASELINE_STAGE,
     STAGE_ORDER,
     AuthorityStage,
     AuthorityStageSource,
     ConfidenceLevel,
+    ControllerKind,
     Reason,
     SafetyState,
     Sha256Hex,
@@ -298,6 +307,78 @@ class AuthorityJournal(_Frozen):
         }
 
 
+def _holdout_arms(report: EvaluationReport) -> dict[str, AppliedArm | CounterfactualArm]:
+    """holdout の `overall` group に**実際に現れた** arm を、鍵から引けるようにする。
+
+    gate の行は `arm_key` という文字列しか持たない。文字列だけで照合すると、
+    「どの制御器の実績か」を確かめないまま合格を読むことになる（codex #4056864033）。
+    報告の中の arm object へ結び直してから判断する。
+    """
+    arms: dict[str, AppliedArm | CounterfactualArm] = {}
+    for segment in report.segments:
+        if segment.role is not SegmentRole.HOLDOUT:
+            continue
+        for group in segment.groups:
+            if group.kind is not GroupKind.OVERALL:
+                continue
+            for applied in group.applied:
+                arms[applied.arm_key] = applied.arm
+            for counterfactual in group.counterfactual:
+                arms[counterfactual.arm_key] = counterfactual.arm
+    return arms
+
+
+def _check_learned_arms(report: EvaluationReport, approval: StageApproval) -> None:
+    """昇格の根拠を **Learned MPC の arm** に束縛する（0057 §2.4）。
+
+    `arm_key` の一致だけで gate を読むと、承認者が**適用された Fallback の arm**を
+    名指すだけで、肝心の Learned MPC の counterfactual arm が `blocked` のまま昇格できる。
+    次のすべてを確かめる。
+
+    - 名指した arm が holdout の報告に実在し、その制御器が Learned MPC である
+    - その arm の stage が、いま上げようとしている遷移元と同じである
+    - **報告に現れた Learned MPC の arm すべて**に gate があり、すべて `pass` である
+      （良い arm だけを選んで、落ちた構成を残したまま上げられないようにする）
+    """
+    arms = _holdout_arms(report)
+    if not arms:
+        raise AuthorityEvidenceError("holdout の arm 実績が無い報告では昇格できない")
+    named = arms.get(approval.evidence.arm_key)
+    if named is None:
+        raise AuthorityEvidenceError(
+            f"名指した arm が holdout の報告に無い（arm={approval.evidence.arm_key}）"
+        )
+    if named.controller is not ControllerKind.LEARNED_MPC:
+        raise AuthorityEvidenceError(
+            "Learned MPC 以外の arm を昇格の根拠にできない"
+            f"（arm={approval.evidence.arm_key}; "
+            f"controller={'none' if named.controller is None else named.controller.value}）"
+        )
+    if named.authority_stage is not approval.from_stage:
+        raise AuthorityEvidenceError(
+            "名指した arm の authority stage が、いまの stage と違う"
+            f"（arm={named.authority_stage.value}; now={approval.from_stage.value}）"
+        )
+    outcomes: dict[str, list[GateResult]] = {}
+    for gate in report.gates:
+        outcomes.setdefault(gate.arm_key, []).append(gate)
+    for key, arm in sorted(arms.items()):
+        if arm.controller is not ControllerKind.LEARNED_MPC:
+            continue
+        results = outcomes.get(key, [])
+        if not results:
+            # 判定していないことを合格にしない（0054 の fail closed と同じ向き）。
+            raise AuthorityEvidenceError(f"gate の判定が無い（arm={key}）")
+        blocked = tuple(item for item in results if item.outcome is not GateOutcome.PASS)
+        if blocked:
+            stages_text = ",".join(
+                item.blocking_stage.value for item in blocked if item.blocking_stage is not None
+            )
+            raise AuthorityEvidenceError(
+                f"rollout gate を通っていない（arm={key}; blocked={stages_text}）"
+            )
+
+
 class AuthorityStore:
     """journal を1つの JSON file として持つ、排他・原子置換つきの保管庫。
 
@@ -503,15 +584,7 @@ class AuthorityStore:
         limit_ms = policy.authority_rollout.evidence_max_age_ms.value
         if age_ms > limit_ms:
             raise AuthorityEvidenceError(f"証拠が古い（age_ms={age_ms}; max_ms={limit_ms}）")
-        gates = tuple(gate for gate in report.gates if gate.arm_key == evidence.arm_key)
-        if not gates:
-            raise AuthorityEvidenceError(f"gate の判定が無い（arm={evidence.arm_key}）")
-        blocked = tuple(gate for gate in gates if gate.outcome is not GateOutcome.PASS)
-        if blocked:
-            stages_text = ",".join(
-                gate.blocking_stage.value for gate in blocked if gate.blocking_stage is not None
-            )
-            raise AuthorityEvidenceError(f"rollout gate を通っていない（blocked={stages_text}）")
+        _check_learned_arms(report, approval)
 
     def _append(
         self, root_fd: int, journal: AuthorityJournal, event: AuthorityEvent

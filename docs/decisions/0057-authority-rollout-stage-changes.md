@@ -70,6 +70,22 @@ rollback できてしまうため）。
 **設定を編集するだけで制御権が増えることはない。** Controller Gate 側でも同じ上限を
 掛ける（配線の誤りを1箇所だけで止めない）。
 
+**`ControllerGate` と `LearnedMpcController` は stage の供給元を必須の引数にする。**
+既定値を置いて「渡されなければ設定の stage」にすると、journal を配線し忘れた起動が
+設定の上限をそのまま制御権にしてしまう。journal の無い初回起動は Shadow のはずが、
+`authority_stage: full` の設定だけで Learned MPC が実 Fan を握る。
+**配線の抜けが authority を増やす形にしない**（codex #4056864027）。
+
+**Registry の互換 stage との照合も、上限ではなく実効 stage と行う。**
+`MpcModelBinding.authority_stage` は Registry が「この stage で使ってよい」と検証した
+stage である。実効 stage が**それを超えたら**拒み、**下回るぶんは通す。** ここを
+「一致」にすると、journal が SHADOW・上限が LIMITED という初日の形で SHADOW 互換の
+artifact が拒まれ、**新しい設定での証拠を1件も集められず最初の昇格が永久に来ない**
+（codex #4056864031）。照合は生成時だけでなく tick ごとに行う（昇格のあとに worker が
+作り直されないまま、束縛の覆っていない stage で提案を出し続けないため）。
+`ModelRegistry.load_production()` / `MpcModelBinding.for_control()` /
+`RidgeThermalModel.from_verified_artifact()` へ渡す stage も**実効 stage**である。
+
 ### 2.3 stage を上げられるのは人の承認だけ。**Model promotion は stage を動かさない**
 
 `StageApproval` は「上げる」ためだけの型で、**降格の承認は型として存在しない。**
@@ -100,7 +116,13 @@ rollback できてしまうため）。
 - 報告に現れた authority stage が、**いまの stage 以下**で、かつ**いまの stage を含む**
 - 証拠の新しさは**報告の run の `end_ms` の最大**で測り、`evidence_max_age_ms` 以内である。
   0054 §2.7 により報告は生成時刻を持たないので、**自己申告ではなく中に記録された観測時刻**を使う
-- その arm の gate 判定が**存在し、すべて `pass`** である（判定していないことを合格にしない）
+- 名指した arm が**holdout の `overall` group に実在し**、その**制御器が Learned MPC**である。
+  `arm_key` の一致だけで gate を読むと、承認者が適用された Fallback の arm を名指すだけで、
+  肝心の Learned MPC が `blocked` のまま昇格できる（codex #4056864033）。
+  適用側・counterfactual 側のどちらの名前空間でもよいが、**制御器で判断する**
+- 名指した arm の `authority_stage` が、いま上げようとしている遷移元と同じである
+- **報告に現れた Learned MPC の arm すべて**に gate 判定が存在し、すべて `pass` である。
+  判定していないことを合格にせず、良い arm だけを選んで落ちた構成を残したまま上げない
 
 `approval_max_age_ms <= evidence_max_age_ms` を設定検証で強制する。承認のほうが
 長生きすると、承認だけ取って書き込みを遅らせることで期限切れの証拠での昇格が通る。

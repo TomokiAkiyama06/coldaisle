@@ -83,6 +83,7 @@ from coldaisle.store.models import Quality
 from test_fallback_controller import (
     assessment_for,
     fallback_proposal,
+    gate_for,
     learned_proposal,
     policy,
 )
@@ -651,7 +652,7 @@ def test_confidence_level_follows_stage_thresholds_and_ood() -> None:
 
 
 def _active_gate(stage: AuthorityStage) -> ControllerGate:
-    gate = ControllerGate(
+    gate = gate_for(
         policy(authority=stage.value, recovery_hold_ms=1), expected_model_version="thermal-v1"
     )
     _select(gate, 0, learned_proposal(0.7))
@@ -1323,7 +1324,7 @@ def test_a1_learned_confidence_requires_a_matching_verified_assessment(
             )
         return
 
-    gate = ControllerGate(
+    gate = gate_for(
         policy(authority="full", recovery_hold_ms=1), expected_model_version="thermal-v1"
     )
     first = _select(gate, 0, proposal, attached)
@@ -1345,7 +1346,7 @@ def test_a1_matching_assessment_is_accepted(trained) -> None:
     proposal = assessment.apply_to(
         learned_proposal(0.9, confidence=0.0, inference_id=assessment.inference_id)
     )
-    gate = ControllerGate(
+    gate = gate_for(
         policy(authority="limited", recovery_hold_ms=1), expected_model_version="thermal-v1"
     )
     _select(gate, 0, proposal, assessment)

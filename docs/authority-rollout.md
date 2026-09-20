@@ -28,6 +28,16 @@ SHADOW  →  LIMITED  →  EXPANDED  →  FULL
 
 実効 stage は3つのうち**もっとも低いもの**である。`ControllerGate` 側でも上限を掛ける。
 
+`ControllerGate` と `LearnedMpcController` は stage の供給元（`AuthorityStageSource`）を
+**必須の引数**にしている。既定値を置くと、配線を忘れた起動が設定の**上限**を
+そのまま制御権にしてしまうためである。試験や移行で固定したいときは
+`StaticAuthorityStage` を明示的に渡す。
+
+Registry の互換 stage（`MpcModelBinding.authority_stage`）との照合も**実効 stage**と行う。
+実効 stage がそれを超えたら拒み、下回るぶんは通す。`load_production()` /
+`MpcModelBinding.for_control()` へ渡す stage も実効 stage である（上限を渡すと、
+journal がまだ SHADOW の初日に SHADOW 互換の artifact が拒まれ、昇格の証拠を集められない）。
+
 ## 上げる（人の承認が要る）
 
 ```python
@@ -52,7 +62,10 @@ store.raise_stage(
 - 報告に現れた artifact が、いま Production の artifact ちょうど1つでない
 - 報告に現れた authority stage が、いまの stage より高い / いまの stage を含まない
 - 報告の run の最終観測が `evidence_max_age_ms` より古い
-- その arm の rollout gate 判定が無い、または1つでも `blocked` である
+- 名指した arm が holdout の実績に無い、または**制御器が Learned MPC でない**
+  （適用された Fallback の arm を名指して昇格できない）
+- 名指した arm の stage が、いまの stage と違う
+- 報告に現れた **Learned MPC の arm のどれか**に gate 判定が無い、または1つでも `blocked` である
 
 同じ承認は2回使えない（`expected_revision` に束縛する）。
 

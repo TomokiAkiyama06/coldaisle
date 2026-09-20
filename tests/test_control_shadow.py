@@ -27,7 +27,6 @@ from pydantic import ValidationError
 
 from coldaisle.control.config import ShadowConfig
 from coldaisle.control.fallback import (
-    ControllerGate,
     ControllerSelection,
     LearnedControlStatus,
     LearnedFailure,
@@ -80,6 +79,7 @@ from coldaisle.store.models import ControlTraceRecord, Quality
 from test_fallback_controller import (
     assessment_for,
     fallback_proposal,
+    gate_for,
     learned_proposal,
     policy,
 )
@@ -143,7 +143,7 @@ def gate_selection(
 ):
     """設定した authority stage で選ばせる。復帰 hold を満たすため健全なまま2 tick 進める。"""
     settings = policy(authority=stage, recovery_hold_ms=1)
-    gate = ControllerGate(settings, expected_model_version="thermal-v1")
+    gate = gate_for(settings, expected_model_version="thermal-v1")
     selection = None
     for now_mono_ms in (0, settings.recovery_hold_ms):
         selection = gate.select(

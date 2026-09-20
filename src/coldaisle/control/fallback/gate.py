@@ -236,13 +236,20 @@ class ControllerGate:
         policy: FanPolicyConfig,
         *,
         expected_model_version: str,
-        authority: AuthorityStageSource | None = None,
+        authority: AuthorityStageSource,
     ) -> None:
+        """**`authority` は必須である**（#92 / 決定記録 0057 §2.2）。
+
+        既定値を置いて「渡されなければ設定の stage」にすると、journal を配線し忘れた
+        起動が設定の**上限**をそのまま制御権にしてしまう。journal がまだ無い初回起動なら
+        Shadow のはずが、`authority_stage: full` の設定だけで Learned MPC が実 Fan を握る。
+        **配線の抜けが authority を増やす形にしない。** 試験や移行で stage を固定したい
+        ときは `StaticAuthorityStage` を明示的に渡す。
+        """
         if not expected_model_version:
             raise ValueError("expected_model_version は空にできない")
         self._policy = policy
         self._expected_model_version = expected_model_version
-        # #92 の Authority Rollout。渡されなければ設定の stage をそのまま使う。
         self._authority = authority
         self._active_controller: ControllerKind | None = None
         self._last_requested: PerZone[ZoneRequest] | None = None
@@ -322,10 +329,7 @@ class ControllerGate:
         Rollout の状態がどう壊れても、設定が許した以上の制御権は出さない。#92 の
         runtime も同じ上限を掛けるが、Gate 側でも掛ける（配線の誤りを1箇所で止めない）。
         """
-        ceiling = self._policy.authority_stage
-        if self._authority is None:
-            return ceiling
-        return lowest_stage(self._authority.current_stage(), ceiling)
+        return lowest_stage(self._authority.current_stage(), self._policy.authority_stage)
 
     def _unhealthy_reason(
         self,

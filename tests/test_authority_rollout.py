@@ -55,18 +55,28 @@ from coldaisle.control import (
     SafetyState,
     StageApproval,
     StaticAuthorityStage,
+    SupervisorPolicyKind,
     lowest_stage,
     stage_above,
     stage_below,
     stage_rank,
 )
 from coldaisle.control.evaluation.model import (
+    AppliedArm,
+    AppliedArmReport,
+    CountedReason,
+    CounterfactualArm,
+    CounterfactualArmReport,
+    CoverageReport,
     EvaluationProvenance,
     EvaluationReport,
     GateCondition,
     GateOutcome,
     GateResult,
     GateStage,
+    GroupKind,
+    GroupReport,
+    InterventionReport,
     ObservedVersions,
     RunProvenance,
     SegmentReport,
@@ -74,6 +84,8 @@ from coldaisle.control.evaluation.model import (
     WorstCase,
     WorstCaseKind,
 )
+from coldaisle.control.model.confidence import ConfidenceAssessor
+from coldaisle.control.mpc import LearnedMpcController, MpcModelBinding
 from test_critical_safety import (
     critical_safety,
     empty_guard,
@@ -87,6 +99,16 @@ from test_fallback_controller import (
     healthy_status,
     learned_proposal,
     policy,
+)
+from test_learned_mpc import (
+    PlanningModel,
+    ScriptedClock,
+    mpc_policy,
+    propose,
+    trained,  # noqa: F401 （pytest fixture として使う）
+)
+from test_learned_mpc import (
+    safety as mpc_safety,
 )
 from test_model_registry import (
     LIMITS,
@@ -103,7 +125,6 @@ NOW_MS = 1_800_000_000_000
 """固定の壁時計。**実時計に依存させない。**"""
 
 APPROVER = "rack-owner"
-ARM = "learned_mpc|rule_policy|shadow"
 POLICY_SHA = "1" * 64
 SAFETY_SHA = "2" * 64
 CONDITIONS_SHA = "3" * 64
@@ -116,9 +137,72 @@ def store(tmp_path: Path) -> AuthorityStore:
     return AuthorityStore(tmp_path / "authority")
 
 
+def learned_arm(stage: AuthorityStage = AuthorityStage.SHADOW) -> CounterfactualArm:
+    """Shadow で回している Learned MPC の counterfactual arm（0054 §2.1）。"""
+    return CounterfactualArm(
+        controller=ControllerKind.LEARNED_MPC,
+        supervisor_policy=SupervisorPolicyKind.RULE,
+        authority_stage=stage,
+    )
+
+
+def applied_fallback_arm(stage: AuthorityStage = AuthorityStage.SHADOW) -> AppliedArm:
+    """実 Fan を作っていた Fallback の arm。**昇格の根拠にはできない側。**"""
+    return AppliedArm(
+        controller=ControllerKind.FALLBACK,
+        supervisor_policy=SupervisorPolicyKind.RULE,
+        authority_stage=stage,
+        operating_mode=OperatingMode.AUTO,
+    )
+
+
+ARM = learned_arm().key
+"""既定の比較対象: Shadow で回していた Learned MPC の counterfactual arm。"""
+
+FALLBACK_ARM = applied_fallback_arm().key
+"""実 Fan を作っていた Fallback の arm。**昇格の根拠にはできない。**"""
+
+
+def counterfactual_report(arm: CounterfactualArm, *, end_ms: int) -> CounterfactualArmReport:
+    return CounterfactualArmReport(
+        arm=arm,
+        arm_key=arm.key,
+        ticks=1_000,
+        first_ts_ms=end_ms - 3_600_000,
+        last_ts_ms=end_ms,
+        proposals=1_000,
+        safety_floor_shortfalls=0,
+        maximum_floor_shortfall=0.0,
+        coverage=CoverageReport(
+            outcomes=1_000,
+            scored=900,
+            unidentifiable=100,
+            identifiable_fraction=0.9,
+            outputs=900,
+            matched_outputs=900,
+            scored_outputs=900,
+            sufficient=True,
+        ),
+    )
+
+
+def applied_report(arm: AppliedArm, *, end_ms: int) -> AppliedArmReport:
+    return AppliedArmReport(
+        arm=arm,
+        arm_key=arm.key,
+        ticks=1_000,
+        first_ts_ms=end_ms - 3_600_000,
+        last_ts_ms=end_ms,
+        interventions=InterventionReport(
+            ticks=1_000,
+            safety_states=(CountedReason(code="normal", count=1_000),),
+        ),
+    )
+
+
 def report_document(
     *,
-    arm: str = ARM,
+    arm: str | None = None,
     outcome: GateOutcome = GateOutcome.PASS,
     artifacts: tuple[str, ...] = (ARTIFACT_SHA,),
     stages: tuple[str, ...] = (AuthorityStage.SHADOW.value,),
@@ -126,15 +210,40 @@ def report_document(
     policy_sha: str = POLICY_SHA,
     safety_sha: str = SAFETY_SHA,
     conditions_sha: str = CONDITIONS_SHA,
+    arm_stage: AuthorityStage = AuthorityStage.SHADOW,
+    with_applied_fallback: bool = False,
+    extra_learned: CounterfactualArm | None = None,
+    extra_outcome: GateOutcome = GateOutcome.PASS,
 ) -> bytes:
-    """最小の Offline Evaluation 報告（#91）。**gate と素性だけを持つ。**"""
-    condition = GateCondition(
-        stage=GateStage.SAFETY,
-        name="ceiling_exceedances",
-        outcome=outcome,
-        limit=0.0,
-        observed=0.0 if outcome is GateOutcome.PASS else 1.0,
-    )
+    """最小の Offline Evaluation 報告（#91）。**arm の実績と gate を持つ。**"""
+    learned = learned_arm(arm_stage)
+    arm = arm if arm is not None else learned.key
+    fallback = applied_fallback_arm(arm_stage)
+
+    def gate(key: str, result: GateOutcome) -> GateResult:
+        return GateResult(
+            arm_key=key,
+            outcome=result,
+            blocking_stage=None if result is GateOutcome.PASS else GateStage.SAFETY,
+            conditions=(
+                GateCondition(
+                    stage=GateStage.SAFETY,
+                    name="ceiling_exceedances",
+                    outcome=result,
+                    limit=0.0,
+                    observed=0.0 if result is GateOutcome.PASS else 1.0,
+                ),
+            ),
+        )
+
+    counterfactual_arms = [counterfactual_report(learned, end_ms=end_ms)]
+    gates = [gate(arm, outcome)]
+    if arm != learned.key:
+        gates.append(gate(learned.key, GateOutcome.PASS))
+    if extra_learned is not None:
+        counterfactual_arms.append(counterfactual_report(extra_learned, end_ms=end_ms))
+        gates.append(gate(extra_learned.key, extra_outcome))
+    applied_arms = [applied_report(fallback, end_ms=end_ms)] if with_applied_fallback else []
     report = EvaluationReport(
         provenance=EvaluationProvenance(
             evaluation_config_sha256="5" * 64,
@@ -169,6 +278,14 @@ def report_document(
                 end_ms=end_ms,
                 ticks=1_000,
                 purged_outcomes=0,
+                groups=(
+                    GroupReport(
+                        kind=GroupKind.OVERALL,
+                        value="overall",
+                        applied=tuple(applied_arms),
+                        counterfactual=tuple(counterfactual_arms),
+                    ),
+                ),
             ),
         ),
         worst_cases=(
@@ -182,14 +299,7 @@ def report_document(
                 value=78.0,
             ),
         ),
-        gates=(
-            GateResult(
-                arm_key=arm,
-                outcome=outcome,
-                blocking_stage=None if outcome is GateOutcome.PASS else GateStage.SAFETY,
-                conditions=(condition,),
-            ),
-        ),
+        gates=tuple(gates),
     )
     return report.model_dump_json().encode("utf-8")
 
@@ -271,14 +381,14 @@ def runtime(
     document = report_document()
     current = BASELINE_STAGE
     while current is not stage:
-        document = report_document(stages=(current.value,))
+        document = report_document(stages=(current.value,), arm_stage=current)
         raise_stage(
             authority,
             approval=approval_for(
                 document,
                 from_stage=current,
                 revision=stage_rank(current),
-                evidence=evidence_for(document),
+                evidence=evidence_for(document, arm=learned_arm(current).key),
             ),
             document=document,
         )
@@ -663,11 +773,116 @@ def test_invariant_5_i_evidence_without_the_current_stage_is_refused(tmp_path: P
 
 
 def test_invariant_5_j_a_missing_gate_for_the_arm_is_refused(tmp_path: Path) -> None:
-    """**判定していないことを合格にしない**（0054 の fail closed と同じ向き）。"""
-    document = report_document(arm="another_arm")
-    approval = approval_for(document, evidence=evidence_for(document, arm=ARM))
+    """**判定していないことを合格にしない**（0054 の fail closed と同じ向き）。
+
+    報告に実績はあるのに gate 行が無い Learned MPC の arm が1つでもあれば通さない。
+    """
+    other = CounterfactualArm(
+        controller=ControllerKind.LEARNED_MPC,
+        supervisor_policy=SupervisorPolicyKind.RL,
+        authority_stage=AuthorityStage.SHADOW,
+    )
+    document = report_document(extra_learned=other)
+    payload = json.loads(document)
+    payload["gates"] = [gate for gate in payload["gates"] if gate["arm_key"] != other.key]
+    document = json.dumps(payload).encode("utf-8")
+    approval = approval_for(document, evidence=evidence_for(document))
 
     with pytest.raises(AuthorityEvidenceError, match="gate の判定が無い"):
+        raise_stage(store(tmp_path), approval=approval, document=document)
+
+
+def test_invariant_5_l_a_gate_row_without_an_arm_report_is_refused(tmp_path: Path) -> None:
+    """**holdout の実績に無い arm を名指せない。** 行だけの gate で昇格しない。"""
+    document = report_document(arm="counterfactual:learned_mpc+rule_policy@full")
+    approval = approval_for(
+        document,
+        evidence=evidence_for(document, arm="counterfactual:learned_mpc+rule_policy@full"),
+    )
+
+    with pytest.raises(AuthorityEvidenceError, match="holdout の報告に無い"):
+        raise_stage(store(tmp_path), approval=approval, document=document)
+
+
+def test_invariant_5_m_an_applied_fallback_arm_cannot_justify_a_promotion(
+    tmp_path: Path,
+) -> None:
+    """**Fallback の arm を名指して、落ちた Learned MPC のまま上げられない**（codex #4056864033）。
+
+    `arm_key` の一致だけで gate を読むと、実 Fan を作っていた Fallback の合格で
+    昇格でき、肝心の Learned MPC が `blocked` のまま authority が増える。
+    """
+    document = report_document(
+        arm=FALLBACK_ARM,
+        outcome=GateOutcome.PASS,
+        with_applied_fallback=True,
+    )
+    payload = json.loads(document)
+    for gate in payload["gates"]:
+        if gate["arm_key"] != FALLBACK_ARM:
+            gate["outcome"] = "blocked"
+            gate["blocking_stage"] = "safety"
+            gate["conditions"][0]["outcome"] = "blocked"
+            gate["conditions"][0]["observed"] = 1.0
+    document = json.dumps(payload).encode("utf-8")
+    approval = approval_for(document, evidence=evidence_for(document, arm=FALLBACK_ARM))
+
+    with pytest.raises(AuthorityEvidenceError, match="Learned MPC 以外の arm"):
+        raise_stage(store(tmp_path), approval=approval, document=document)
+
+
+def test_invariant_5_o_an_applied_learned_arm_can_justify_a_promotion(tmp_path: Path) -> None:
+    """**LIMITED 以降は、適用された Learned MPC の arm が根拠になる。**
+
+    Shadow では Learned は counterfactual 側にしか現れないが、制御権を持ったあとは
+    適用側に現れる。どちらの名前空間でも「制御器が Learned MPC か」で判断する。
+    """
+    authority = store(tmp_path)
+    first = report_document()
+    raise_stage(authority, approval=approval_for(first), document=first)
+
+    applied_learned = AppliedArm(
+        controller=ControllerKind.LEARNED_MPC,
+        supervisor_policy=SupervisorPolicyKind.RULE,
+        authority_stage=AuthorityStage.LIMITED,
+        operating_mode=OperatingMode.AUTO,
+    )
+    document = report_document(
+        arm=applied_learned.key,
+        stages=(AuthorityStage.LIMITED.value,),
+        arm_stage=AuthorityStage.LIMITED,
+    )
+    payload = json.loads(document)
+    groups = payload["segments"][0]["groups"][0]
+    groups["applied"] = [
+        json.loads(applied_report(applied_learned, end_ms=EVIDENCE_END_MS).model_dump_json())
+    ]
+    document = json.dumps(payload).encode("utf-8")
+    approval = approval_for(
+        document,
+        from_stage=AuthorityStage.LIMITED,
+        revision=1,
+        evidence=evidence_for(document, arm=applied_learned.key),
+    )
+
+    journal = raise_stage(authority, approval=approval, document=document)
+
+    assert journal.stage is AuthorityStage.EXPANDED
+
+
+def test_invariant_5_n_a_blocked_sibling_learned_arm_blocks_the_promotion(
+    tmp_path: Path,
+) -> None:
+    """**良い arm だけを選んで上げられない。** 落ちた Learned MPC が残っていれば通さない。"""
+    other = CounterfactualArm(
+        controller=ControllerKind.LEARNED_MPC,
+        supervisor_policy=SupervisorPolicyKind.RL,
+        authority_stage=AuthorityStage.SHADOW,
+    )
+    document = report_document(extra_learned=other, extra_outcome=GateOutcome.BLOCKED)
+    approval = approval_for(document, evidence=evidence_for(document))
+
+    with pytest.raises(AuthorityEvidenceError, match="rollout gate を通っていない"):
         raise_stage(store(tmp_path), approval=approval, document=document)
 
 
@@ -1209,3 +1424,89 @@ def test_invariant_10_b_the_safety_floor_is_identical_at_every_stage() -> None:
     assert effective[AuthorityStage.FULL] == (0.6, 0.6, 0.8)
     # stage は requested の幅を変える。変わらないなら、この試験は何も言っていない。
     assert requested[AuthorityStage.SHADOW] != requested[AuthorityStage.FULL]
+
+
+# --- 初回昇格を実際に歩けること -------------------------------------------------
+
+
+def test_the_first_promotion_can_actually_be_walked(tmp_path: Path, trained) -> None:  # noqa: F811
+    """**SHADOW → LIMITED を、いまの設定で集めた証拠で最後まで歩ける**（codex #4056864031）。
+
+    初日の形はこうである。journal はまだ無い（＝SHADOW）、設定の上限は LIMITED、
+    Registry の artifact は SHADOW 互換だけ。どこかが「上限」と「実効 stage」を
+    取り違えていると、**worker を作れず、証拠を1件も集められず、最初の昇格が永久に来ない。**
+
+    1. SHADOW 互換の束縛で worker を作れる
+    2. Gate は SHADOW なので実 Fan を Fallback に置く（提案は counterfactual）
+    3. その区間の証拠で LIMITED へ上げられる
+    4. 上げたあと、Gate が LIMITED の帯で Learned MPC を採る
+    """
+    base, profile, attestation = trained
+    settings = mpc_policy(authority="limited")
+    authority = store(tmp_path)
+    control = AuthorityRuntime(authority, settings, clock=SimulatedClock(NOW_MS))
+
+    assert control.configured_ceiling is AuthorityStage.LIMITED
+    assert control.current_stage() is AuthorityStage.SHADOW, "journal が無ければ Baseline"
+
+    # 1. 上限が LIMITED でも、実効 stage が SHADOW なら SHADOW 互換の artifact で動かせる。
+    binding = MpcModelBinding.for_control(
+        PlanningModel(base),
+        attestation=attestation,
+        authority_stage=AuthorityStage.SHADOW,
+        expected_model_version=attestation.version,
+    )
+    controller = LearnedMpcController(
+        binding,
+        settings,
+        mpc_safety(),
+        assessor=ConfidenceAssessor(profile, settings.model_confidence),
+        monotonic_ms=ScriptedClock(0),
+        authority=control,
+    )
+    result = propose(controller)
+    assert result.proposal is not None, "Shadow 期間の提案が作れないと証拠が貯まらない"
+
+    # 2. Gate は SHADOW。実 Fan は Fallback が作る。
+    gate = ControllerGate(settings, expected_model_version=attestation.version, authority=control)
+    shadow_tick = gate.select(
+        now_mono_ms=0,
+        fallback=fallback_proposal(0.4),
+        learned=result.to_status(received_at_mono_ms=0),
+        operating_mode=OperatingMode.AUTO,
+        safety_state=SafetyState.NORMAL,
+    )
+    assert shadow_tick.authority_stage is AuthorityStage.SHADOW
+    assert shadow_tick.active_controller is ControllerKind.FALLBACK
+
+    # 3. その区間の証拠で昇格する。証拠はいまの設定・いまの artifact のものである。
+    document = report_document()
+    journal = raise_stage(
+        authority,
+        approval=approval_for(document),
+        document=document,
+        settings=settings,
+        artifact=ARTIFACT_SHA,
+    )
+    assert journal.stage is AuthorityStage.LIMITED
+
+    # 4. 読み直すと LIMITED。Gate は帯の中で Learned MPC を採る。
+    control.reload()
+    assert control.current_stage() is AuthorityStage.LIMITED
+    gate.select(
+        now_mono_ms=1_000,
+        fallback=fallback_proposal(0.4),
+        learned=result.to_status(received_at_mono_ms=1_000),
+        operating_mode=OperatingMode.AUTO,
+        safety_state=SafetyState.NORMAL,
+    )
+    limited_tick = gate.select(
+        now_mono_ms=2_000,
+        fallback=fallback_proposal(0.4),
+        learned=result.to_status(received_at_mono_ms=2_000),
+        operating_mode=OperatingMode.AUTO,
+        safety_state=SafetyState.NORMAL,
+    )
+
+    assert limited_tick.authority_stage is AuthorityStage.LIMITED
+    assert limited_tick.active_controller is ControllerKind.LEARNED_MPC

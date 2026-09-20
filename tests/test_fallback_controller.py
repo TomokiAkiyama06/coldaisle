@@ -27,6 +27,7 @@ from coldaisle.control.schema import (
     PerZone,
     Reason,
     SafetyState,
+    StaticAuthorityStage,
     Zone,
     ZoneRequest,
 )
@@ -423,6 +424,20 @@ def healthy_status(*, received: int = 0, proposal: ControllerProposal | None = N
     )
 
 
+def gate_for(settings: FanPolicyConfig, *, expected_model_version: str) -> ControllerGate:
+    """**試験用**に、設定の stage をそのまま実効 stage にする Gate を作る。
+
+    本番の配線ではない。runtime は `AuthorityRuntime` を渡し、journal が stage を決める
+    （#92 / 決定記録 0057 §2.2）。`ControllerGate` が `authority` を必須にしているのは、
+    配線を忘れた起動が設定の**上限**をそのまま制御権にしないためである。
+    """
+    return ControllerGate(
+        settings,
+        expected_model_version=expected_model_version,
+        authority=StaticAuthorityStage(settings.authority_stage),
+    )
+
+
 def select(
     gate: ControllerGate,
     *,
@@ -586,7 +601,7 @@ def test_mock_replay_is_deterministic() -> None:
 
 
 def test_ml_recovery_requires_a_continuously_healthy_hold() -> None:
-    gate = ControllerGate(policy(recovery_hold_ms=1_000), expected_model_version="thermal-v1")
+    gate = gate_for(policy(recovery_hold_ms=1_000), expected_model_version="thermal-v1")
 
     assert select(gate, now=0).fallback_reason.code == "ml_recovery_hold"
     assert select(gate, now=999).active_controller is ControllerKind.FALLBACK
@@ -597,7 +612,7 @@ def test_ml_recovery_requires_a_continuously_healthy_hold() -> None:
 
 
 def test_switch_to_fallback_is_immediate_and_does_not_lower_requested_demand() -> None:
-    gate = ControllerGate(policy(recovery_hold_ms=1), expected_model_version="thermal-v1")
+    gate = gate_for(policy(recovery_hold_ms=1), expected_model_version="thermal-v1")
     select(gate, now=0, learned=healthy_status(received=0, proposal=learned_proposal(0.9)))
     assert (
         select(
@@ -679,7 +694,7 @@ def test_every_fallback_condition_has_a_structured_reason(
     now: int,
     expected: str,
 ) -> None:
-    gate = ControllerGate(policy(), expected_model_version="thermal-v1")
+    gate = gate_for(policy(), expected_model_version="thermal-v1")
     decision = select(gate, now=now, learned=status)
 
     assert decision.active_controller is ControllerKind.FALLBACK
@@ -689,18 +704,18 @@ def test_every_fallback_condition_has_a_structured_reason(
 
 
 def test_unavailable_proposal_and_non_normal_safety_have_structured_reasons() -> None:
-    unavailable_gate = ControllerGate(policy(), expected_model_version="thermal-v1")
+    unavailable_gate = gate_for(policy(), expected_model_version="thermal-v1")
     unavailable = select(unavailable_gate, now=0, learned=LearnedControlStatus())
     assert unavailable.fallback_reason.code == "learned_proposal_unavailable"
 
-    safety_gate = ControllerGate(policy(), expected_model_version="thermal-v1")
+    safety_gate = gate_for(policy(), expected_model_version="thermal-v1")
     unsafe = select(safety_gate, now=0, safety=SafetyState.DEGRADED)
     assert unsafe.fallback_reason.code == "safety_not_normal"
     assert unsafe.fallback_reason.detail == "state=degraded"
 
 
 def test_an_unhealthy_tick_resets_the_recovery_hold() -> None:
-    gate = ControllerGate(policy(recovery_hold_ms=1_000), expected_model_version="thermal-v1")
+    gate = gate_for(policy(recovery_hold_ms=1_000), expected_model_version="thermal-v1")
     select(gate, now=0)
     select(gate, now=900, learned=healthy_status(received=900, proposal=learned_proposal(ood=True)))
     select(gate, now=1_000)
@@ -710,7 +725,7 @@ def test_an_unhealthy_tick_resets_the_recovery_hold() -> None:
 
 
 def test_limited_authority_is_bounded_around_fallback_and_by_zone() -> None:
-    gate = ControllerGate(
+    gate = gate_for(
         policy(authority=AuthorityStage.LIMITED.value, recovery_hold_ms=1),
         expected_model_version="thermal-v1",
     )
@@ -738,7 +753,7 @@ def test_confidence_boundary_is_selected_by_authority_stage(
     stage: AuthorityStage,
     threshold: float,
 ) -> None:
-    accepted_gate = ControllerGate(
+    accepted_gate = gate_for(
         policy(authority=stage.value, recovery_hold_ms=1),
         expected_model_version="thermal-v1",
     )
@@ -754,7 +769,7 @@ def test_confidence_boundary_is_selected_by_authority_stage(
     )
     assert accepted.active_controller is ControllerKind.LEARNED_MPC
 
-    rejected_gate = ControllerGate(
+    rejected_gate = gate_for(
         policy(authority=stage.value, recovery_hold_ms=1),
         expected_model_version="thermal-v1",
     )
@@ -768,7 +783,7 @@ def test_confidence_boundary_is_selected_by_authority_stage(
 
 
 def test_repeated_ml_to_fallback_transitions_emit_a_demotion_signal_for_issue_92() -> None:
-    gate = ControllerGate(
+    gate = gate_for(
         policy(recovery_hold_ms=1, demote_after=3),
         expected_model_version="thermal-v1",
     )
@@ -793,7 +808,7 @@ def test_repeated_ml_to_fallback_transitions_emit_a_demotion_signal_for_issue_92
 
 
 def test_demotion_signal_clears_after_the_configured_window_expires() -> None:
-    gate = ControllerGate(
+    gate = gate_for(
         policy(recovery_hold_ms=1, demote_after=1, demote_window_ms=100),
         expected_model_version="thermal-v1",
     )
@@ -812,7 +827,7 @@ def test_demotion_signal_clears_after_the_configured_window_expires() -> None:
 
 
 def test_gate_does_not_own_manual_or_calibration_requests() -> None:
-    gate = ControllerGate(policy(), expected_model_version="thermal-v1")
+    gate = gate_for(policy(), expected_model_version="thermal-v1")
     with pytest.raises(ValueError, match="MANUAL"):
         gate.select(
             now_mono_ms=0,
@@ -827,7 +842,7 @@ def test_gate_does_not_own_manual_or_calibration_requests() -> None:
 def test_human_mode_round_trip_resets_learned_state_and_requires_recovery_hold_again(
     human_mode: OperatingMode,
 ) -> None:
-    gate = ControllerGate(policy(recovery_hold_ms=1_000), expected_model_version="thermal-v1")
+    gate = gate_for(policy(recovery_hold_ms=1_000), expected_model_version="thermal-v1")
     select(gate, now=0)
     assert select(gate, now=1_000).active_controller is ControllerKind.LEARNED_MPC
 
@@ -842,7 +857,7 @@ def test_human_mode_round_trip_resets_learned_state_and_requires_recovery_hold_a
 
 def test_max_keeps_fallback_active_and_auto_return_requires_a_fresh_recovery_hold() -> None:
     """MAXの実Fanは#78 forced_max。MLのcounterfactualはactive/holdに使わない。"""
-    gate = ControllerGate(
+    gate = gate_for(
         policy(recovery_hold_ms=1_000),
         expected_model_version="thermal-v1",
     )

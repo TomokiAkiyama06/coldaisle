@@ -236,6 +236,14 @@ class ModelCompatibility(_Frozen):
     feature_schema_version: str = Field(min_length=1, max_length=120)
     target_schema_version: str = Field(min_length=1, max_length=120)
     authority_stage: AuthorityStage
+    """The authority stage the caller intends to RUN at.
+
+    **This is the effective stage (#92 / decision record 0057 §2.2), not the configured
+    ceiling.** Since `fan-policy.yaml` v9 `authority_stage` is only an upper bound; the
+    stage actually granted lives in the Authority journal. Asking here with the ceiling
+    rejects a SHADOW-only artifact while the journal still says SHADOW, which is exactly
+    the state the first promotion has to be collected in.
+    """
 
 
 class HumanApproval(_Frozen):
