@@ -1341,6 +1341,60 @@ def test_invariant_6_n_an_unpersisted_demotion_still_survives_a_promotion(
     assert control.current_stage() is BASELINE_STAGE, "記録の無い降格は読み直しで外れない"
 
 
+def test_invariant_6_o_a_demotion_takes_effect_before_it_is_persisted(tmp_path: Path) -> None:
+    """**安全側の変更は、disk も他 process の lock も待たない**（codex #4056992239）。
+
+    `lower_stage()` は flock と fsync を待つ。別 process が昇格で lock を握っていれば
+    その間ずっと待つ。**書き始める前にもう下がっている**ことを確かめる。
+    """
+    seen: list[AuthorityStage] = []
+    holder: list[AuthorityRuntime] = []
+
+    class WatchingStore(AuthorityStore):
+        """書き始める瞬間の実効 stage を記録する store。"""
+
+        __slots__ = ()
+
+        def lower_stage(self, **kwargs: object) -> AuthorityJournal:  # type: ignore[override]
+            seen.append(holder[0].current_stage())
+            return super().lower_stage(**kwargs)  # type: ignore[arg-type]
+
+    runtime(tmp_path, stage=AuthorityStage.FULL)
+    control = AuthorityRuntime(
+        WatchingStore(tmp_path / "authority", SimulatedClock(NOW_MS)),
+        policy(authority="full"),
+    )
+    holder.append(control)
+    assert control.current_stage() is AuthorityStage.FULL
+
+    demotion = control.observe(safety_state=SafetyState.EMERGENCY, now_mono_ms=0)
+
+    assert demotion is not None
+    assert demotion.persisted is True
+    assert seen == [BASELINE_STAGE], "書き始める前にもう下がっている"
+
+
+def test_invariant_6_p_an_unexpected_persist_failure_still_lowers(tmp_path: Path) -> None:
+    """**下げたことを、例外の種類に依存させない。** 想定外の失敗でも下がったままにする。"""
+
+    class ExplodingStore(AuthorityStore):
+        __slots__ = ()
+
+        def lower_stage(self, **kwargs: object) -> AuthorityJournal:  # type: ignore[override]
+            raise RuntimeError("想定していない失敗")
+
+    runtime(tmp_path, stage=AuthorityStage.FULL)
+    control = AuthorityRuntime(
+        ExplodingStore(tmp_path / "authority", SimulatedClock(NOW_MS)),
+        policy(authority="full"),
+    )
+
+    with pytest.raises(RuntimeError):
+        control.observe(safety_state=SafetyState.EMERGENCY, now_mono_ms=0)
+
+    assert control.current_stage() is BASELINE_STAGE
+
+
 # --- 不変条件 7: 設定は上限 ----------------------------------------------------
 
 
@@ -1650,6 +1704,29 @@ def test_invariant_8_i_lowering_never_waits_for_the_registry(tmp_path: Path) -> 
         journal = authority.rollback_to_baseline(actor="operator", reason="異音の切り分け")
 
     assert journal.stage is BASELINE_STAGE
+
+
+def test_invariant_8_j_an_authority_failure_is_not_reported_as_a_registry_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """**どの部品が落ちたのかを、その部品の理由で残す**（codex #4056992240）。
+
+    Registry を pin する context manager の `yield` を `try` の中に置くと、
+    authority 側の I/O 失敗まで「Registry を読めない」として報告してしまう。
+    """
+    registry, sha = production_registry(tmp_path, version="1.0.0", name="registry")
+    document = report_document(artifacts=(sha,))
+    approval = approval_for(document, evidence=evidence_for(document, artifact=sha))
+
+    def exploding_append(self, root_fd, journal, event):  # type: ignore[no-untyped-def]
+        raise OSError("authority journal を書けない")
+
+    monkeypatch.setattr(AuthorityStore, "_append", exploding_append)
+    with pytest.raises(OSError) as refusal:
+        raise_stage(store(tmp_path), approval=approval, document=document, registry=registry)
+
+    assert not isinstance(refusal.value, AuthorityEvidenceError)
+    assert "Registry" not in str(refusal.value)
 
 
 def test_invariant_8_c_the_registry_cannot_write_the_authority_journal() -> None:

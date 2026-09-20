@@ -26,7 +26,7 @@ import secrets
 import stat
 from collections import deque
 from collections.abc import Iterator
-from contextlib import contextmanager, suppress
+from contextlib import ExitStack, contextmanager, suppress
 from enum import StrEnum
 from fcntl import LOCK_EX, LOCK_UN, flock
 from hashlib import sha256
@@ -581,12 +581,17 @@ class AuthorityStore:
         降格（`lower_stage`）はこの経路を通らないため、registry が使えなくても
         安全側へは常に動ける。
         """
-        try:
-            with registry.pinned() as snapshot:
-                yield self._production_of(snapshot, artifact_kind)
-        except (OSError, ValueError, ModelRegistryError) as error:
-            # Registry を読めないことを「production が無い」と読み替えない。止める。
-            raise AuthorityEvidenceError("Model Registry の状態を読めない") from error
+        with ExitStack() as pin:
+            try:
+                snapshot = pin.enter_context(registry.pinned())
+                production = self._production_of(snapshot, artifact_kind)
+            except (OSError, ValueError, ModelRegistryError) as error:
+                # Registry を読めないことを「production が無い」と読み替えない。止める。
+                raise AuthorityEvidenceError("Model Registry の状態を読めない") from error
+            # **yield を try の外に置く。** 中に入れると、authority 側の OSError まで
+            # 「Registry を読めない」として報告してしまう（codex #4056992240）。
+            # どの部品が落ちたのかを、その部品の理由で残す。
+            yield production
 
     @staticmethod
     def _read_production(
@@ -1078,6 +1083,11 @@ class AuthorityRuntime:
         """
         code = cause.value if cause is not None else "manual_rollback"
         reason = Reason(code=code, detail=detail[:500])
+        # **先に下げる。** 安全側の変更を、disk にも他 process の lock にも待たせない
+        # （codex #4056992239）。`lower_stage()` は flock と fsync を待つので、ここを
+        # 例外の枝に置くと、待っている間ずっと前の stage のまま回ってしまう。
+        # 例外の種類にも依存させない（`BaseException` で抜けても下がったままにする）。
+        self._unpersisted_ceiling = lowest_stage(self._unpersisted_ceiling, to_stage)
         self._low_confidence.clear()
         self._ood.clear()
         persist_failure: Reason | None = None
@@ -1089,12 +1099,16 @@ class AuthorityRuntime:
                 trigger=trigger,
                 cause=cause,
             )
-            self._persist_failure = None
         except (AuthorityError, OSError) as error:
-            # **書き残せなくても下げる。** 記録の無い降格を memory 上の上限として持つ。
-            self._unpersisted_ceiling = lowest_stage(self._unpersisted_ceiling, to_stage)
+            # 書き残せなかった。上の上限をそのまま持ち続ける（`reload()` でも外れない）。
             persist_failure = Reason(code="authority_persist_failed", detail=str(error)[:500])
             self._persist_failure = persist_failure
+        else:
+            self._persist_failure = None
+            # 書けた降格は journal が表すので、memory 上の上限は手放す。持ち続けると、
+            # あとから承認された昇格が再起動まで効かない（codex #4056968495）。
+            # `to_stage` は必ずいまの上限以下なので、手放しても authority は上がらない。
+            self._unpersisted_ceiling = AuthorityStage.FULL
         return AuthorityDemotion(
             from_stage=from_stage,
             to_stage=to_stage,
