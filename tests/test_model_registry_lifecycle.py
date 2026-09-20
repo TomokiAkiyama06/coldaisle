@@ -25,6 +25,7 @@ from coldaisle.control import (
     ArtifactLoadStatus,
     ArtifactMetadata,
     ArtifactStatus,
+    ArtifactVerificationError,
     AuthorityStage,
     HumanApproval,
     ModelCompatibility,
@@ -239,6 +240,7 @@ def test_feature_schema_mismatch_names_the_kind_that_must_fall_back(tmp_path: Pa
             }
         ],
         "fallback_kinds": ["thermal_model"],
+        "unchecked_kinds": [],
     }
 
 
@@ -797,3 +799,187 @@ def test_cli_audit_can_be_narrowed_to_pointer_changes(
         "validated",
         "promoted",
     ]
+
+
+# --------------------------------------------------------------------------------------
+# Codex review (PR #162): contract の取りこぼし・壊れた YAML・上限より先の確保
+# --------------------------------------------------------------------------------------
+
+
+def tiny_limits(directory: Path, *, max_artifact_bytes: int) -> Path:
+    """artifact の上限だけを小さくした設定ディレクトリを作る。"""
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / "model-registry.yaml").write_text(
+        "schema_version: 1\n"
+        f"max_artifact_bytes: {max_artifact_bytes}\n"
+        "max_snapshot_bytes: 4194304\n"
+        "max_json_nesting_depth: 32\n"
+        "max_json_tokens: 250000\n"
+        "max_snapshot_json_nesting_depth: 16\n"
+        "max_snapshot_json_tokens: 250000\n",
+        encoding="utf-8",
+    )
+    return directory
+
+
+def contract_file(path: Path, kinds: tuple[str, ...]) -> Path:
+    body = ["schema_version: 1", "contracts:"]
+    if not kinds:
+        body = ["schema_version: 1", "contracts: {}"]
+    for kind in kinds:
+        body += [
+            f"  {kind}:",
+            f"    feature_schema_version: {FEATURE_SCHEMA}",
+            f"    target_schema_version: {TARGET_SCHEMA}",
+            "    authority_stage: shadow",
+        ]
+    path.write_text("\n".join(body) + "\n", encoding="utf-8")
+    return path
+
+
+def test_the_report_names_the_kinds_that_were_checked_without_a_contract(tmp_path: Path) -> None:
+    """**contract を当てなかった kind を `ok` の陰に隠さない。**"""
+    root = tmp_path / "registry"
+    registry = production_registry(root)
+    assert registry.verify().unchecked_kinds() == (ArtifactKind.THERMAL_MODEL,)
+    assert registry.verify(CONTRACTS).unchecked_kinds() == ()
+    traced: Any = registry.verify().trace_metadata()["model_registry_health"]
+    assert traced["unchecked_kinds"] == ["thermal_model"]
+
+
+@pytest.mark.parametrize("covered", [(), ("supervisor_policy",)])
+def test_cli_verify_fails_closed_when_a_contract_misses_a_production_kind(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], covered: tuple[str, ...]
+) -> None:
+    """contract を渡したのに覆っていない production kind があれば、判定を出さずに失敗する。
+
+    checksum と format だけで `loaded` になり、schema や authority が合っていなくても
+    総合判定が `ok` になってしまうため。
+    """
+    root = tmp_path / "registry"
+    production_registry(root, versions=("1.0.0", "1.1.0"))
+    contract = contract_file(tmp_path / "contract.yaml", covered)
+
+    code = cli.main(["verify", "--contract", str(contract), *base_args(root)])
+    captured = capsys.readouterr()
+    assert code == cli.EXIT_FAILED
+    assert captured.out == ""
+    assert "thermal_model" in captured.err
+
+
+def test_cli_verify_accepts_a_contract_that_covers_every_production_kind(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """覆っていれば通る。取りこぼしの検査が正常系を塞がないことを確かめる。"""
+    root = tmp_path / "registry"
+    production_registry(root, versions=("1.0.0", "1.1.0"))
+    contract = contract_file(tmp_path / "contract.yaml", ("thermal_model",))
+
+    assert cli.main(["verify", "--contract", str(contract), *base_args(root)]) == cli.EXIT_OK
+    assert stdout_json(capsys)["model_registry_health"]["unchecked_kinds"] == []
+
+
+@pytest.mark.parametrize("target", ["contract", "limits"])
+def test_cli_reports_a_malformed_yaml_as_a_failed_operation(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], target: str
+) -> None:
+    """壊れた YAML で traceback を出さない。**記録された失敗**として終了コードで返す。"""
+    root = tmp_path / "registry"
+    production_registry(root)
+    broken = "schema_version: 1\ncontracts: [unbalanced\n"
+
+    if target == "contract":
+        path = tmp_path / "contract.yaml"
+        path.write_text(broken, encoding="utf-8")
+        argv = ["verify", "--contract", str(path), *base_args(root)]
+    else:
+        limits = tmp_path / "limits"
+        limits.mkdir()
+        (limits / "model-registry.yaml").write_text(broken, encoding="utf-8")
+        argv = ["verify", "--root", str(root), "--limits", str(limits)]
+
+    assert cli.main(argv) == cli.EXIT_FAILED
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "Model Registry の操作に失敗した" in captured.err
+
+
+def test_bounded_read_never_asks_for_more_than_the_limit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """**読んでから大きさを判断しない。** 上限＋1 byte しか要求しない。"""
+    path = tmp_path / "oversized.json"
+    path.write_bytes(b"x" * 5000)
+    requested: list[int] = []
+    real_open = Path.open
+
+    class _Spy:
+        def __init__(self, handle: Any) -> None:
+            self._handle = handle
+
+        def read(self, size: int = -1) -> bytes:
+            requested.append(size)
+            result: bytes = self._handle.read(size)
+            return result
+
+        def __enter__(self) -> _Spy:
+            return self
+
+        def __exit__(self, *exc: object) -> None:
+            self._handle.close()
+
+    def spy_open(self: Path, *args: Any, **kwargs: Any) -> Any:
+        return _Spy(real_open(self, *args, **kwargs))
+
+    monkeypatch.setattr(Path, "open", spy_open)
+    with pytest.raises(ArtifactVerificationError):
+        cli.read_bounded(path, 64)
+    assert requested == [65]
+
+
+def test_cli_register_refuses_an_oversized_payload_before_reading_it(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """上限を超える artifact で管理 process を落とさない。registry も作らない。"""
+    root = tmp_path / "registry"
+    record = metadata("1.0.0")
+    metadata_path = write_json(tmp_path / "metadata.json", json.loads(record.model_dump_json()))
+    payload_path = tmp_path / "artifact.json"
+    payload_path.write_bytes(b"x" * 4096)
+    limits = tiny_limits(tmp_path / "limits", max_artifact_bytes=64)
+
+    code = cli.main(
+        [
+            "register",
+            "--root",
+            str(root),
+            "--limits",
+            str(limits),
+            "--metadata",
+            str(metadata_path),
+            "--payload",
+            str(payload_path),
+            "--actor",
+            "trainer",
+            "--reason",
+            "training completed",
+        ]
+    )
+    capsys.readouterr()
+    assert code == cli.EXIT_FAILED
+    assert not root.exists()
+
+
+def test_cli_status_reports_a_corrupt_registry_as_a_failed_operation(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """読み取りの問い合わせも、壊れた snapshot で traceback を出さない。"""
+    root = tmp_path / "registry"
+    production_registry(root)
+    (root / "registry.json").write_bytes(b"{ broken")
+
+    for command in ("status", "audit"):
+        assert cli.main([command, *base_args(root)]) == cli.EXIT_FAILED
+        captured = capsys.readouterr()
+        assert captured.out == ""
+        assert "Model Registry の操作に失敗した" in captured.err

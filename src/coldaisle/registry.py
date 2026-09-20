@@ -49,10 +49,12 @@ from coldaisle.control.model_registry import (
     ArtifactKind,
     ArtifactMetadata,
     ArtifactRef,
+    ArtifactVerificationError,
     HumanApproval,
     ModelCompatibility,
     ModelRegistry,
     ModelRegistryError,
+    ModelRegistryLimits,
     RegistryHealth,
     RegistryHealthReport,
     load_model_registry_limits,
@@ -115,11 +117,11 @@ class RuntimeContracts(_Manifest):
     contracts: dict[ArtifactKind, KindContract]
 
     @classmethod
-    def from_file(cls, path: Path) -> RuntimeContracts:
-        """Read and validate the runtime contract manifest."""
-        loaded = yaml.safe_load(path.read_text(encoding="utf-8"))
+    def from_bytes(cls, payload: bytes) -> RuntimeContracts:
+        """Validate the runtime contract manifest that was already read under a bound."""
+        loaded = yaml.safe_load(payload.decode("utf-8"))
         if not isinstance(loaded, dict):
-            raise ValueError(f"runtime contract が辞書ではない: {path.name}")
+            raise ValueError("runtime contract が辞書ではない")
         contracts = loaded.get("contracts")
         if isinstance(contracts, dict):
             # YAML の kind と stage は文字列で来る。**ここで明示的に写す。**
@@ -158,8 +160,28 @@ def emit(payload: object) -> None:
     print(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))  # noqa: T201
 
 
-def _registry(args: argparse.Namespace) -> ModelRegistry:
-    return ModelRegistry(args.root, limits=load_model_registry_limits(args.limits))
+def _limits(args: argparse.Namespace) -> ModelRegistryLimits:
+    return load_model_registry_limits(args.limits)
+
+
+def _registry(args: argparse.Namespace, limits: ModelRegistryLimits | None = None) -> ModelRegistry:
+    return ModelRegistry(args.root, limits=_limits(args) if limits is None else limits)
+
+
+def read_bounded(path: Path, max_bytes: int) -> bytes:
+    """上限まで**だけ**読む。読んでから大きさを判断しない。
+
+    運用者が間違えて数 GB のファイルを指したときに、管理 process を MemoryError で
+    落とさないようにする。`fstat` の大きさを信じずに上限＋1 byte を読むので、読取中に
+    伸びたファイルも拒否できる（決定記録 0062 §2.1）。
+    """
+    with path.open("rb") as handle:
+        payload = handle.read(max_bytes + 1)
+    if len(payload) > max_bytes:
+        raise ArtifactVerificationError(
+            f"ファイルが上限 {max_bytes} byte を超えている: {path.name}"
+        )
+    return payload
 
 
 def _compatibility(args: argparse.Namespace) -> ModelCompatibility:
@@ -170,9 +192,9 @@ def _compatibility(args: argparse.Namespace) -> ModelCompatibility:
     )
 
 
-def _approval(path: Path) -> HumanApproval:
+def _approval(path: Path, limits: ModelRegistryLimits) -> HumanApproval:
     """人が書いた承認をそのまま読む。**CLI は中身を作らない・直さない。**"""
-    return HumanApproval.model_validate_json(path.read_bytes())
+    return HumanApproval.model_validate_json(read_bounded(path, limits.max_snapshot_bytes))
 
 
 def run_status(args: argparse.Namespace) -> int:
@@ -227,10 +249,18 @@ def run_audit(args: argparse.Namespace) -> int:
 
 def run_verify(args: argparse.Namespace) -> int:
     """起動時検証を実行する。**registry を書き換えない。**"""
+    limits = _limits(args)
     contracts: dict[ArtifactKind, ModelCompatibility] = {}
     if args.contract is not None:
-        contracts = RuntimeContracts.from_file(args.contract).compatibility()
-    report = _registry(args).verify(contracts)
+        payload = read_bounded(args.contract, limits.max_snapshot_bytes)
+        contracts = RuntimeContracts.from_bytes(payload).compatibility()
+    report = _registry(args, limits).verify(contracts)
+    if args.contract is not None and report.unchecked_kinds():
+        # **contract を渡したなら、いま production の kind を全部覆う。** 欠けた kind は
+        # checksum と format だけで `loaded` になり、schema や authority が合っていなくても
+        # 総合判定が `ok` になる。判定を出さずに失敗させる（決定記録 0062 §2.4）。
+        missing = ", ".join(kind.value for kind in report.unchecked_kinds())
+        raise ValueError(f"runtime contract に production の kind がない: {missing}")
     emit(report.trace_metadata())
     _log_health(report)
     return _VERIFY_EXIT[report.health]
@@ -254,10 +284,15 @@ def _log_health(report: RegistryHealthReport) -> None:
 
 def run_register(args: argparse.Namespace) -> int:
     """candidate を登録する。**production にはしない。**"""
-    metadata = ArtifactMetadata.model_validate_json(args.metadata.read_bytes())
-    ref = _registry(args).register_candidate(
+    limits = _limits(args)
+    metadata = ArtifactMetadata.model_validate_json(
+        read_bounded(args.metadata, limits.max_snapshot_bytes)
+    )
+    # artifact 本体は**読む前に**上限で切る。registry 側の検査は bytes を作ったあとに走る。
+    payload = read_bounded(args.payload, limits.max_artifact_bytes)
+    ref = _registry(args, limits).register_candidate(
         metadata,
-        args.payload.read_bytes(),
+        payload,
         actor=args.actor,
         reason=args.reason,
     )
@@ -288,8 +323,9 @@ def run_validate(args: argparse.Namespace) -> int:
 
 def run_promote(args: argparse.Namespace) -> int:
     """人が署名した承認で、validated artifact を production にする。"""
-    approval = _approval(args.approval)
-    revision = _registry(args).promote(
+    limits = _limits(args)
+    approval = _approval(args.approval, limits)
+    revision = _registry(args, limits).promote(
         approval.artifact,
         _compatibility(args),
         shadow_evaluation_ref=args.shadow_evaluation_ref,
@@ -309,8 +345,9 @@ def run_promote(args: argparse.Namespace) -> int:
 
 def run_rollback(args: argparse.Namespace) -> int:
     """人が署名した承認で、known-good な artifact へ戻す。"""
-    approval = _approval(args.approval)
-    revision = _registry(args).rollback(
+    limits = _limits(args)
+    approval = _approval(args.approval, limits)
+    revision = _registry(args, limits).rollback(
         ArtifactKind(args.kind),
         _compatibility(args),
         approval=approval,
@@ -487,7 +524,13 @@ def main(argv: list[str] | None = None) -> int:
     logs.configure(args.log_level)
     try:
         exit_code: int = args.handler(args)
-    except (ModelRegistryError, ValidationError, ValueError, OSError) as exc:
+    except (
+        ModelRegistryError,
+        ValidationError,
+        ValueError,
+        OSError,
+        yaml.YAMLError,
+    ) as exc:
         # 握りつぶさない。操作は行われなかったことを、理由とともに残す。
         LOGGER.error(
             "Model Registry の操作に失敗した",

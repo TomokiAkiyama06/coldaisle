@@ -900,6 +900,18 @@ class RegistryHealthReport(_Frozen):
         """Return the kinds whose production artifact cannot be used as it stands."""
         return tuple(entry.kind for entry in self.productions if entry.fallback_required)
 
+    def unchecked_kinds(self) -> tuple[ArtifactKind, ...]:
+        """runtime contract を当てずに checksum / format だけで通した kind を返す。
+
+        **`ok` だけを見て「互換性も確かめた」と読まないための欄。** 互換性まで確かめる
+        つもりで検証したのに contract を渡し忘れた kind は、schema や authority が合って
+        いなくても `loaded` になる。互換性を見る立場の呼び出し側は、ここが空であることを
+        確かめてから `ok` を信じる（決定記録 0062 §2.4）。
+        """
+        return tuple(
+            entry.kind for entry in self.productions if not entry.active.compatibility_checked
+        )
+
     def trace_metadata(self) -> dict[str, object]:
         """#82 の decision trace へ載せられる、path を含まない起動時検証の要約。"""
         return {
@@ -923,6 +935,7 @@ class RegistryHealthReport(_Frozen):
                     for entry in self.productions
                 ],
                 "fallback_kinds": [kind.value for kind in self.fallback_kinds()],
+                "unchecked_kinds": [kind.value for kind in self.unchecked_kinds()],
             }
         }
 

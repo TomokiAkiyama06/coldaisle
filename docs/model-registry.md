@@ -101,8 +101,14 @@ kindごとのruntime contractが渡されていればfeature / target schemaとa
 戻り先の検証は checksum と format だけにする。互換性はrollback実行時のその時点のruntime contractで
 判断するため、schemaを更新しただけで健全な戻り先を失わない（決定記録0037 §2）。
 `ArtifactHealth.compatibility_checked` は**既定値の無い必須項目**で、contractを渡さずに得た
-`loaded` を「互換性も確かめた」と読み違えさせない。`RegistryHealthReport` は、個別の検証結果と
-食い違う総合判定（失敗があるのに `ok`、何も検証していないのに `ok`）を受け付けない。
+`loaded` を「互換性も確かめた」と読み違えさせない。`RegistryHealthReport.unchecked_kinds()` は、
+contractを当てずにchecksum / formatだけで通したkindを返す。**`ok` だけを見て「互換性も確かめた」と
+読まない。** `RegistryHealthReport` は、個別の検証結果と食い違う総合判定（失敗があるのに `ok`、
+何も検証していないのに `ok`）を受け付けない。
+
+CLIは、`--contract` を渡したのにいまproductionのkindを覆っていなければ、**判定を出さずに失敗する**
+（終了コード1）。欠けたkindはchecksumとformatだけで `loaded` になり、schemaやauthorityが合って
+いなくても総合判定が `ok` になるためである。
 
 ## 運用（`coldaisle-registry`）
 
@@ -160,6 +166,12 @@ contracts:
     target_schema_version: thermal-targets-v1
     authority_stage: shadow
 ```
+
+CLIが読むファイル（artifact本体・metadata・承認・contract）は、**読む前に上限で切る**。
+artifact本体は `max_artifact_bytes`、それ以外は `max_snapshot_bytes` を上限とし、上限＋1 byteだけを
+読んで超えていれば拒否する。運用者が間違えて巨大なファイルを指したときに、管理processを
+MemoryErrorで落とさないためである。壊れたYAML・JSONやファイルの読み取り失敗は、tracebackではなく
+構造化ログと終了コード1で返す。
 
 このCLIはartifactをdeserializeも実行もせず、Fan Demand・PWM・Authority Stageへ届く経路を持たない。
 

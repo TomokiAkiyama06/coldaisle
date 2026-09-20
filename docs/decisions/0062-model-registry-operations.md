@@ -44,6 +44,12 @@
   書けると、他者の判断を後勝ちで潰せる
 - 読み取り API（#23）にも AI ツール（#22 / #23）にもこの操作を出さない。
   **LLM は registry を書き換えられない**（AGENTS.md ルール1）
+- CLI が読むファイル（artifact 本体・metadata・承認・contract）は、**読む前に上限で切る**。
+  artifact 本体は `max_artifact_bytes`、それ以外は `max_snapshot_bytes` を上限とし、
+  上限＋1 byte だけを読んで超えていれば拒否する。読んでから大きさを判断しない。運用者が
+  間違えて巨大なファイルを指したときに、管理 process を MemoryError で落とさない
+- 壊れた YAML / JSON、読み取り失敗は traceback ではなく、構造化ログと終了コード 1 で返す。
+  **握りつぶさない**（AGENTS.md コード規約）が、運用者が読める形にする
 
 ### 2.2 promotion / rollback の human approval はファイルで渡す。CLI は合成しない
 
@@ -82,6 +88,12 @@ Fan Demand・PWM・hwmon・Authority Stage へ届く経路を持たない（AGEN
 - `verify` が使う runtime contract は kind ごとの YAML（`schema_version: 1`）で渡す。
   未知の kind / stage は黙って落とさず拒否する。**検査したつもりの kind を検査しない**
   状態を作らない
+- **`--contract` を渡したなら、いま production の kind を全部覆う。** 覆っていない kind が
+  あれば、CLI は判定を出さずに失敗する（終了コード 1）。欠けた kind は checksum と format
+  だけで `loaded` になり、schema や authority が合っていなくても総合判定が `ok` になる。
+  `RegistryHealthReport.unchecked_kinds()` がその kind を返すので、CLI 以外の呼び出し側
+  （#74 の起動経路など）も同じ確認ができる。contract を渡さない整合性だけの検証は、
+  それと分かる形（全 kind が `compatibility_checked: false`）のまま残す
 
 ### 2.5 lifecycle 監査の正本は `registry.json` の audit にする
 
@@ -114,6 +126,8 @@ Rule Engine / Notification（#18 / #20）への接続は引き続き別 Issue �
   報告本文（`health`）で分岐する
 - 承認をファイルにしたため、`artifact_sha256` と `expected_revision` を人が写す手間が増える。
   緩和策: `status` が両方を出す。写し間違いは registry が拒否する（黙って通らない）
+- `--contract` を渡す運用では、production の kind が増えるたびに contract の更新が要る。
+  緩和策: 更新を忘れると `verify` が失敗し、名前を挙げて知らせる（黙って `ok` にしない）
 - registry の lifecycle が SQLite の decision trace に入らない期間が続く。緩和策:
   `audit --pointer-changes` が同じ内容を JSON で出せる
 
@@ -127,6 +141,8 @@ Rule Engine / Notification（#18 / #20）への接続は引き続き別 Issue �
 | 起動時検証で例外を投げ、制御の起動を止める | production が無い・壊れている場合こそ #79 Fallback で運転を続けなければならない（AGENTS.md ルール4） |
 | registry event に tick_id を合成して 0030 の decision trace へ書く | tick に対応しない記録へ、束縛していない識別子を与えることになる（#159 のレビューで繰り返し指摘された失敗の型） |
 | 戻り先も runtime contract で検証する | schema 更新の直後に、健全な戻り先を `degraded` 扱いで失う。0037 §2 の決定と食い違う |
+| `--contract` が覆っていない kind を、整合性だけ検証して `ok` に含める | 互換性まで確かめるつもりで渡した contract の取りこぼしが、`ok` と区別できなくなる（PR #162 codex review 4057584854） |
+| 読んでからファイルの大きさを判断する | 上限を超える入力で、判断する前に管理 process が落ちる（同 4057584857） |
 
 ## 5. 未決事項
 
