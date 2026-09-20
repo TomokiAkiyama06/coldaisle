@@ -67,6 +67,7 @@ from coldaisle.control.shadow import (
     OutcomeObservation,
     OutcomeStatus,
     ShadowExportRow,
+    ShadowObservationConflictError,
     ShadowOutcomeMatcher,
     ShadowOutcomeUnusableError,
     ShadowRecorder,
@@ -807,11 +808,16 @@ def test_invariant_3_h_the_indexed_match_equals_the_naive_one() -> None:
         for metric in metrics
         for ts_ms in range(99_000, 106_000, 137)
     ]
-    # 同じ時刻に2つ、action より前、許容幅の外なども混ぜる。
+    # 期待時刻ちょうど、action より前、許容幅の外、**同じ値の重複**なども混ぜる。
     observations.append(
         OutcomeObservation(metric=GPU, ts_ms=101_000, value=1.0, quality=Quality.OK)
     )
-    observations.append(OutcomeObservation(metric=GPU, ts_ms=99_000, value=2.0, quality=Quality.OK))
+    observations.append(
+        # 生成済みの 99_000 と**まったく同じ観測**（食い違う重複は受け取らない。0055 §2.1）。
+        OutcomeObservation(
+            metric=GPU, ts_ms=99_000, value=float(99_000 % 97) / 3.0, quality=Quality.OK
+        )
+    )
     matcher = outcome_matcher(match_tolerance_ms=400)
     index = ObservationIndex(observations)
 
@@ -827,6 +833,60 @@ def test_invariant_3_h_the_indexed_match_equals_the_naive_one() -> None:
             (item.offset_ms, item.metric, item.observed_ts_ms, item.observed)
             for item in from_index.matches
         ] == expected
+
+
+def test_invariant_3_i_contradictory_duplicate_observations_are_refused() -> None:
+    """**同じ metric・同じ時刻の食い違う観測を、照合が選ばない**（決定記録 0055 §2.1）。
+
+    誤差は `実測 - 予測` なので、小さいほうを採ると **underprediction（冷却が足りない向きの
+    外し方）が実際より小さく見える**。大きいほうを採れば予測の当たりが消える。どちらを
+    選んでも片方の事実が消えるので、入力の誤りとして受け取らない。
+    """
+    cooler = observation(101_000, 50.5)
+    hotter = observation(101_000, 80.5)
+
+    with pytest.raises(ShadowObservationConflictError, match="食い違う観測"):
+        ObservationIndex([cooler, hotter])
+    # 順序を入れ替えても同じ。**「先に来たほうが勝つ」規則も置かない。**
+    with pytest.raises(ShadowObservationConflictError, match="食い違う観測"):
+        ObservationIndex([hotter, cooler])
+    # 観測を直接渡す入口も同じ契約（索引を外から作るかどうかで変わらない）。
+    with pytest.raises(ShadowObservationConflictError, match="食い違う観測"):
+        match_outcome(outcome_matcher(), [cooler, hotter])
+
+
+def test_invariant_3_j_the_same_observation_twice_changes_nothing() -> None:
+    """同じ値が2度届くのは冪等な取り込みで起きる。**それは食い違いではない。**
+
+    1つに畳むので、件数も突き合わせ結果も「何回渡したか」に依存しない（0055 §2.1）。
+    """
+    matcher = outcome_matcher()
+    observations = [observation(101_000, 50.5), observation(102_000, 51.5)]
+
+    once = match_outcome(matcher, observations)
+    twice = match_outcome(matcher, [*observations, observations[0], observations[1]])
+
+    assert twice == once
+    assert once.complete is True
+
+
+def test_invariant_3_k_a_conflict_among_unusable_values_is_not_a_conflict() -> None:
+    """証拠に使わない値（stale / suspect / missing）の食い違いでは止めない。
+
+    索引に入らない値は誤差にも件数にも効かない。**証拠にならない値の不一致で
+    照合そのものを落とすと、採点できたはずの予測まで巻き込む。**
+    """
+    outcome = match_outcome(
+        outcome_matcher(),
+        [
+            observation(101_000, 50.5),
+            observation(101_000, 80.5, quality=Quality.STALE),
+            observation(102_000, 51.5),
+        ],
+    )
+
+    assert outcome.matches[0].observed == 50.5
+    assert outcome.complete is True
 
 
 # ------------------------------------- 不変条件 4: 裏づけの無い数値を残さない
