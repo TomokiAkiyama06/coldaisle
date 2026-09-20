@@ -20,7 +20,7 @@ from __future__ import annotations
 import hashlib
 import json
 from enum import StrEnum
-from typing import Annotated, Literal, Self
+from typing import Annotated, Literal, Protocol, Self, runtime_checkable
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -95,6 +95,68 @@ class AuthorityStage(StrEnum):
     LIMITED = "limited"
     EXPANDED = "expanded"
     FULL = "full"
+
+
+STAGE_ORDER: tuple[AuthorityStage, ...] = (
+    AuthorityStage.SHADOW,
+    AuthorityStage.LIMITED,
+    AuthorityStage.EXPANDED,
+    AuthorityStage.FULL,
+)
+"""低い順。**昇格は隣へ1段ずつ**（#92 / 決定記録 0057 §2.5）。"""
+
+BASELINE_STAGE = AuthorityStage.SHADOW
+"""rollback で戻る先。実 Fan は Fallback が作る（0028 §2.5 (c)）。"""
+
+
+def stage_rank(stage: AuthorityStage) -> int:
+    """stage の高さ。比較にだけ使う。"""
+    return STAGE_ORDER.index(stage)
+
+
+def lowest_stage(*stages: AuthorityStage) -> AuthorityStage:
+    """もっとも低い stage を返す。**上限を重ねるときは必ずこれを通す。**"""
+    if not stages:
+        raise ValueError("stage を1つ以上渡す")
+    return min(stages, key=stage_rank)
+
+
+def stage_above(stage: AuthorityStage) -> AuthorityStage | None:
+    """1段上の stage。`FULL` の上は無い。"""
+    rank = stage_rank(stage)
+    return STAGE_ORDER[rank + 1] if rank + 1 < len(STAGE_ORDER) else None
+
+
+def stage_below(stage: AuthorityStage) -> AuthorityStage | None:
+    """1段下の stage。`SHADOW` の下は無い。"""
+    rank = stage_rank(stage)
+    return STAGE_ORDER[rank - 1] if rank else None
+
+
+@runtime_checkable
+class AuthorityStageSource(Protocol):
+    """Gate へ「いまの stage」を渡す読み取り専用の窓口（#92）。
+
+    **契約の型なのでここに置く。** journal と自動降格の実装は
+    `coldaisle.control.authority` にあり、Gate はそちらを import しない。
+    """
+
+    def current_stage(self) -> AuthorityStage:
+        """この tick に与えてよい制御権。"""
+        ...
+
+
+class StaticAuthorityStage:
+    """設定の stage をそのまま使う source（journal を持たない試験・移行用）。"""
+
+    __slots__ = ("_stage",)
+
+    def __init__(self, stage: AuthorityStage) -> None:
+        self._stage = stage
+
+    def current_stage(self) -> AuthorityStage:
+        """設定された stage を返す。"""
+        return self._stage
 
 
 class ControllerKind(StrEnum):

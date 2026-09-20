@@ -150,13 +150,15 @@ def policy(
     power_feedforward: bool = True,
     demote_after: int = 3,
     demote_window_ms: int = 60_000,
+    low_confidence_after: int = 10,
+    ood_after: int = 5,
     high_min_confidence: float = 0.85,
     medium_limit_up: float = 0.1,
     medium_limit_down: float = 0.05,
     mpc: dict[str, object] | None = None,
 ) -> FanPolicyConfig:
     document: dict[str, object] = {
-        "schema_version": 8,
+        "schema_version": 9,
         "fallback_curve": [
             {"temperature_c": 20.0, "demand": 0.2},
             {"temperature_c": 80.0, "demand": 0.8},
@@ -241,6 +243,13 @@ def policy(
                 "limit_up": 0.2,
                 "limit_down": 0.2,
             },
+        },
+        "authority_rollout": {
+            "approval_max_age_ms": provisional(3_600_000),
+            "evidence_max_age_ms": provisional(604_800_000),
+            "unhealthy_window_ms": provisional(600_000),
+            "low_confidence_after": provisional(low_confidence_after),
+            "ood_after": provisional(ood_after),
         },
         "shadow": {
             "enabled": True,

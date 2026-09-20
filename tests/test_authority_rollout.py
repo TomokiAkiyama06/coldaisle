@@ -1,0 +1,1211 @@
+"""Authority Rollout（#92 / 決定記録 0057）。**実機は要らない。**
+
+この module は不変条件ごとに1つの試験を持ち、**それを破ろうとする**。
+「通る道」だけを確かめる試験は、#85 / #90 / #91 のレビューで繰り返し漏れを出した型である。
+
+守る不変条件:
+
+1. 既定は Shadow。壊れた journal を Shadow と読み替えない
+2. stage を上げられるのは人の承認だけ
+3. 承認は使い回せない（revision・遷移・時刻・設定・証拠・artifact に束縛する）
+4. 昇格は1段ずつで、設定の上限を超えない
+5. 昇格の証拠は**完全・新鮮・束縛済み**でなければならない
+6. 降格に承認は要らず、書き残せなくても効く
+7. 設定は上限として働き、上げても journal は上がらない
+8. Model promotion は authority を動かさない
+9. stage は model version と独立に trace へ残る
+10. Critical Safety は全 stage で同一
+"""
+
+from __future__ import annotations
+
+import json
+from hashlib import sha256
+from pathlib import Path
+from typing import Any
+
+import pytest
+from pydantic import ValidationError
+
+from coldaisle.clock import SimulatedClock
+from coldaisle.control import (
+    BASELINE_STAGE,
+    STAGE_ORDER,
+    ArtifactKind,
+    AuthorityApprovalError,
+    AuthorityChangeKind,
+    AuthorityEvent,
+    AuthorityEvidenceError,
+    AuthorityJournal,
+    AuthorityRuntime,
+    AuthorityStage,
+    AuthorityStateError,
+    AuthorityStore,
+    AuthorityStoreError,
+    AuthorityTrigger,
+    AutomaticCause,
+    ConfidenceLevel,
+    ControllerGate,
+    ControllerKind,
+    ControllerSelection,
+    DemandComposer,
+    ModelRegistry,
+    OperatingMode,
+    RolloutEvidence,
+    SafetyState,
+    StageApproval,
+    StaticAuthorityStage,
+    lowest_stage,
+    stage_above,
+    stage_below,
+    stage_rank,
+)
+from coldaisle.control.evaluation.model import (
+    EvaluationProvenance,
+    EvaluationReport,
+    GateCondition,
+    GateOutcome,
+    GateResult,
+    GateStage,
+    ObservedVersions,
+    RunProvenance,
+    SegmentReport,
+    SegmentRole,
+    WorstCase,
+    WorstCaseKind,
+)
+from test_critical_safety import (
+    critical_safety,
+    empty_guard,
+    safety_config,
+)
+from test_critical_safety import (
+    snapshot as safety_snapshot,
+)
+from test_fallback_controller import (
+    fallback_proposal,
+    healthy_status,
+    learned_proposal,
+    policy,
+)
+from test_model_registry import (
+    LIMITS,
+    register_and_validate,
+)
+from test_model_registry import (
+    metadata as artifact_metadata,
+)
+from test_model_registry import (
+    promote as promote_artifact,
+)
+
+NOW_MS = 1_800_000_000_000
+"""固定の壁時計。**実時計に依存させない。**"""
+
+APPROVER = "rack-owner"
+ARM = "learned_mpc|rule_policy|shadow"
+POLICY_SHA = "1" * 64
+SAFETY_SHA = "2" * 64
+CONDITIONS_SHA = "3" * 64
+ARTIFACT_SHA = "4" * 64
+EVIDENCE_END_MS = NOW_MS - 3_600_000
+"""証拠の最後の観測は1時間前。既定の `evidence_max_age_ms`（7日）の中に収まる。"""
+
+
+def store(tmp_path: Path) -> AuthorityStore:
+    return AuthorityStore(tmp_path / "authority")
+
+
+def report_document(
+    *,
+    arm: str = ARM,
+    outcome: GateOutcome = GateOutcome.PASS,
+    artifacts: tuple[str, ...] = (ARTIFACT_SHA,),
+    stages: tuple[str, ...] = (AuthorityStage.SHADOW.value,),
+    end_ms: int = EVIDENCE_END_MS,
+    policy_sha: str = POLICY_SHA,
+    safety_sha: str = SAFETY_SHA,
+    conditions_sha: str = CONDITIONS_SHA,
+) -> bytes:
+    """最小の Offline Evaluation 報告（#91）。**gate と素性だけを持つ。**"""
+    condition = GateCondition(
+        stage=GateStage.SAFETY,
+        name="ceiling_exceedances",
+        outcome=outcome,
+        limit=0.0,
+        observed=0.0 if outcome is GateOutcome.PASS else 1.0,
+    )
+    report = EvaluationReport(
+        provenance=EvaluationProvenance(
+            evaluation_config_sha256="5" * 64,
+            fan_hardware_config_sha256="6" * 64,
+            safety_config_sha256=safety_sha,
+            fan_policy_config_sha256=policy_sha,
+            metric_catalog_sha256="7" * 64,
+            absolute_temp_ceiling_c=95.0,
+            outcome_match_tolerance_ms=500,
+            applied_demand_tolerance=0.01,
+            shadow_export_schema_version=1,
+            runs=(
+                RunProvenance(
+                    run_id="run-001",
+                    start_ms=end_ms - 86_400_000,
+                    end_ms=end_ms,
+                    traces=1_000,
+                    observations=1_000,
+                    trace_sha256="8" * 64,
+                    observation_sha256="9" * 64,
+                ),
+            ),
+            versions=ObservedVersions(model_artifacts=artifacts, authority_stages=stages),
+            conditions_sha256=conditions_sha,
+        ),
+        segments=(
+            SegmentReport(
+                run_id="run-001",
+                index=0,
+                role=SegmentRole.HOLDOUT,
+                start_ms=end_ms - 3_600_000,
+                end_ms=end_ms,
+                ticks=1_000,
+                purged_outcomes=0,
+            ),
+        ),
+        worst_cases=(
+            WorstCase(
+                kind=WorstCaseKind.MAXIMUM_TEMPERATURE,
+                run_id="run-001",
+                segment_index=0,
+                role=SegmentRole.HOLDOUT,
+                arm_key=arm,
+                metric="gpu.0.core",
+                value=78.0,
+            ),
+        ),
+        gates=(
+            GateResult(
+                arm_key=arm,
+                outcome=outcome,
+                blocking_stage=None if outcome is GateOutcome.PASS else GateStage.SAFETY,
+                conditions=(condition,),
+            ),
+        ),
+    )
+    return report.model_dump_json().encode("utf-8")
+
+
+def evidence_for(
+    document: bytes,
+    *,
+    arm: str = ARM,
+    artifact: str = ARTIFACT_SHA,
+    end_ms: int = EVIDENCE_END_MS,
+    policy_sha: str = POLICY_SHA,
+    safety_sha: str = SAFETY_SHA,
+    conditions_sha: str = CONDITIONS_SHA,
+) -> RolloutEvidence:
+    return RolloutEvidence(
+        report_sha256=sha256(document).hexdigest(),
+        conditions_sha256=conditions_sha,
+        arm_key=arm,
+        artifact_sha256=artifact,
+        evidence_end_ms=end_ms,
+        fan_policy_config_sha256=policy_sha,
+        safety_config_sha256=safety_sha,
+    )
+
+
+def approval_for(
+    document: bytes,
+    *,
+    from_stage: AuthorityStage = AuthorityStage.SHADOW,
+    revision: int = 0,
+    approved_at_ms: int = NOW_MS,
+    reason: str = "shadow で7日運転し、gate をすべて通した",
+    evidence: RolloutEvidence | None = None,
+) -> StageApproval:
+    target = stage_above(from_stage)
+    assert target is not None
+    return StageApproval(
+        from_stage=from_stage,
+        to_stage=target,
+        expected_revision=revision,
+        approver=APPROVER,
+        approved_at_ms=approved_at_ms,
+        reason=reason,
+        evidence=evidence if evidence is not None else evidence_for(document),
+    )
+
+
+def raise_stage(
+    authority: AuthorityStore,
+    *,
+    approval: StageApproval,
+    document: bytes,
+    settings: Any = None,
+    artifact: str = ARTIFACT_SHA,
+    now_ms: int = NOW_MS,
+    policy_sha: str = POLICY_SHA,
+    safety_sha: str = SAFETY_SHA,
+) -> AuthorityJournal:
+    return authority.raise_stage(
+        approval=approval,
+        evaluation_report=document,
+        policy=settings if settings is not None else policy(authority="full"),
+        fan_policy_config_sha256=policy_sha,
+        safety_config_sha256=safety_sha,
+        production_artifact_sha256=artifact,
+        now_ms=now_ms,
+    )
+
+
+def runtime(
+    tmp_path: Path,
+    *,
+    stage: AuthorityStage = AuthorityStage.FULL,
+    ceiling: str = "full",
+    settings: Any = None,
+) -> AuthorityRuntime:
+    """`stage` まで上げた journal を持つ runtime。昇格はすべて承認を経由する。"""
+    authority = store(tmp_path)
+    document = report_document()
+    current = BASELINE_STAGE
+    while current is not stage:
+        document = report_document(stages=(current.value,))
+        raise_stage(
+            authority,
+            approval=approval_for(
+                document,
+                from_stage=current,
+                revision=stage_rank(current),
+                evidence=evidence_for(document),
+            ),
+            document=document,
+        )
+        next_stage = stage_above(current)
+        assert next_stage is not None
+        current = next_stage
+    return AuthorityRuntime(
+        authority,
+        settings if settings is not None else policy(authority=ceiling),
+        clock=SimulatedClock(NOW_MS),
+    )
+
+
+class UnwritableStore(AuthorityStore):
+    """読めるが書けない store。**降格の適用が永続化に依存しない**ことを確かめる。"""
+
+    __slots__ = ()
+
+    def lower_stage(self, **_: object) -> AuthorityJournal:  # type: ignore[override]
+        raise AuthorityStoreError("disk full")
+
+
+def unwritable_runtime(tmp_path: Path) -> AuthorityRuntime:
+    """FULL まで上げた journal を読み、以後は書けなくなった runtime。"""
+    runtime(tmp_path, stage=AuthorityStage.FULL)
+    return AuthorityRuntime(
+        UnwritableStore(tmp_path / "authority"),
+        policy(authority="full"),
+        clock=SimulatedClock(NOW_MS),
+    )
+
+
+# --- 不変条件 1: 既定は Shadow --------------------------------------------------
+
+
+def test_invariant_1_a_an_absent_journal_starts_at_shadow(tmp_path: Path) -> None:
+    """**記録が無いときに与える制御権は Baseline。** 初回起動で ML が実 Fan を握らない。"""
+    authority = store(tmp_path)
+
+    journal = authority.read()
+
+    assert journal.stage is AuthorityStage.SHADOW
+    assert journal.revision == 0
+    assert journal.events == ()
+    assert not (tmp_path / "authority").exists(), "読むだけで store を作らない"
+
+
+def test_invariant_1_b_a_corrupt_journal_is_not_read_as_shadow(tmp_path: Path) -> None:
+    """**壊すだけで「記録の無い状態」へ移せない。** 読み替えは静かな rollback になる。"""
+    root = tmp_path / "authority"
+    root.mkdir()
+    (root / "authority.json").write_text('{"schema_version": 1, "revision": 99}', encoding="utf-8")
+
+    with pytest.raises(AuthorityStateError):
+        store(tmp_path).read()
+
+
+def test_invariant_1_c_a_journal_that_does_not_replay_is_refused() -> None:
+    """**event から再現できない stage を読まない。** 書き換えた stage だけが効かない。"""
+    with pytest.raises(ValidationError, match="再現できない"):
+        AuthorityJournal(revision=0, stage=AuthorityStage.FULL)
+
+
+def test_invariant_1_d_the_store_refuses_a_relative_root() -> None:
+    """**相対 path の store を作らない。** 作業 directory で指す先が変わる。"""
+    with pytest.raises(AuthorityStoreError, match="絶対 path"):
+        AuthorityStore(Path("var/authority"))
+
+
+# --- 不変条件 2: 上げられるのは人だけ -------------------------------------------
+
+
+def test_invariant_2_a_a_human_approval_raises_one_stage_with_a_reason_and_time(
+    tmp_path: Path,
+) -> None:
+    """昇格は**承認者・理由・時刻**とともに残る（受入基準「理由と時刻を記録する」）。"""
+    authority = store(tmp_path)
+    document = report_document()
+
+    journal = raise_stage(authority, approval=approval_for(document), document=document)
+
+    assert journal.stage is AuthorityStage.LIMITED
+    assert journal.revision == 1
+    event = journal.events[-1]
+    assert event.kind is AuthorityChangeKind.RAISED
+    assert event.trigger is AuthorityTrigger.HUMAN
+    assert event.actor == APPROVER
+    assert event.reason
+    assert event.occurred_at_ms == NOW_MS
+    assert event.approval is not None
+    assert authority.read() == journal, "journal は読み直しても同じ"
+
+
+def test_invariant_2_b_the_journal_cannot_record_a_raise_without_an_approval() -> None:
+    """**承認の無い昇格は、書ける形にしない。**"""
+    with pytest.raises(ValidationError, match="承認が要る"):
+        AuthorityEvent(
+            revision=1,
+            occurred_at_ms=NOW_MS,
+            kind=AuthorityChangeKind.RAISED,
+            trigger=AuthorityTrigger.HUMAN,
+            from_stage=AuthorityStage.SHADOW,
+            to_stage=AuthorityStage.LIMITED,
+            actor=APPROVER,
+            reason="上げたい",
+        )
+
+
+def test_invariant_2_c_an_automatic_trigger_cannot_raise_the_stage() -> None:
+    """**系が自分で上げる経路を作らない。**"""
+    document = report_document()
+    with pytest.raises(ValidationError, match="上げられるのは人だけ"):
+        AuthorityEvent(
+            revision=1,
+            occurred_at_ms=NOW_MS,
+            kind=AuthorityChangeKind.RAISED,
+            trigger=AuthorityTrigger.AUTOMATIC,
+            from_stage=AuthorityStage.SHADOW,
+            to_stage=AuthorityStage.LIMITED,
+            actor=APPROVER,
+            reason="良さそうなので",
+            approval=approval_for(document),
+        )
+
+
+def test_invariant_2_d_the_control_runtime_has_no_way_to_raise_the_stage(tmp_path: Path) -> None:
+    """**制御ループから昇格を呼べない。** 呼べる名前が生えたらここで落ちる。"""
+    control = runtime(tmp_path, stage=AuthorityStage.LIMITED)
+
+    raising = [
+        name
+        for name in dir(control)
+        if not name.startswith("_") and any(word in name for word in ("raise", "promote", "grant"))
+    ]
+
+    assert raising == []
+
+
+def test_invariant_2_e_the_approval_actor_and_reason_cannot_disagree_with_the_event() -> None:
+    """**承認の名前と理由を、別の文言で記録できない。**"""
+    document = report_document()
+    with pytest.raises(ValidationError, match="actor / reason"):
+        AuthorityEvent(
+            revision=1,
+            occurred_at_ms=NOW_MS,
+            kind=AuthorityChangeKind.RAISED,
+            trigger=AuthorityTrigger.HUMAN,
+            from_stage=AuthorityStage.SHADOW,
+            to_stage=AuthorityStage.LIMITED,
+            actor="someone.else",
+            reason="別の理由",
+            approval=approval_for(document),
+        )
+
+
+# --- 不変条件 3: 承認は使い回せない ---------------------------------------------
+
+
+def test_invariant_3_a_an_approval_cannot_be_replayed(tmp_path: Path) -> None:
+    """**同じ承認で2回上げない。** revision に束縛する。"""
+    authority = store(tmp_path)
+    document = report_document()
+    approval = approval_for(document)
+    raise_stage(authority, approval=approval, document=document)
+
+    with pytest.raises(AuthorityApprovalError, match="使い回せない"):
+        raise_stage(authority, approval=approval, document=document)
+
+
+def test_invariant_3_b_an_approval_is_void_once_the_journal_moved(tmp_path: Path) -> None:
+    """**承認のあとに何か起きたら、その承認は使えない。**"""
+    authority = store(tmp_path)
+    document = report_document()
+    approval = approval_for(document, from_stage=AuthorityStage.SHADOW, revision=0)
+    # 承認を取ったあとに別の変更（ここでは人の rollback）が入る。
+    authority.lower_stage(
+        to_stage=AuthorityStage.SHADOW,
+        actor="operator",
+        reason="noop",
+        now_ms=NOW_MS,
+    )
+    raise_stage(authority, approval=approval, document=document)
+    authority.rollback_to_baseline(actor="operator", reason="様子を見る", now_ms=NOW_MS)
+
+    with pytest.raises(AuthorityApprovalError, match="使い回せない"):
+        raise_stage(authority, approval=approval, document=document)
+
+
+def test_invariant_3_c_a_stale_approval_is_refused(tmp_path: Path) -> None:
+    """**承認を貯めて後から使えない。** 古い承認は期限切れにする。"""
+    settings = policy(authority="full")
+    limit_ms = settings.authority_rollout.approval_max_age_ms.value
+    document = report_document()
+    approval = approval_for(document, approved_at_ms=NOW_MS - limit_ms - 1)
+
+    with pytest.raises(AuthorityApprovalError, match="承認が古い"):
+        raise_stage(store(tmp_path), approval=approval, document=document, settings=settings)
+
+
+def test_invariant_3_d_a_future_approval_is_refused(tmp_path: Path) -> None:
+    """**未来の承認を受け取らない。** 時刻をずらして期限切れを回避させない。"""
+    document = report_document()
+    approval = approval_for(document, approved_at_ms=NOW_MS + 1)
+
+    with pytest.raises(AuthorityApprovalError, match="未来の承認"):
+        raise_stage(store(tmp_path), approval=approval, document=document)
+
+
+def test_invariant_3_e_an_approval_for_another_transition_is_refused(tmp_path: Path) -> None:
+    """**別の遷移の承認を流用できない。**"""
+    authority = store(tmp_path)
+    document = report_document()
+    raise_stage(authority, approval=approval_for(document), document=document)
+    # いまは LIMITED。SHADOW→LIMITED の承認を revision だけ合わせて出し直す。
+    stale = approval_for(document, from_stage=AuthorityStage.SHADOW, revision=1)
+
+    with pytest.raises(AuthorityApprovalError, match="遷移元"):
+        raise_stage(authority, approval=stale, document=document)
+
+
+# --- 不変条件 4: 1段ずつ、設定の上限まで ----------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("from_stage", "to_stage"),
+    [
+        (AuthorityStage.SHADOW, AuthorityStage.EXPANDED),
+        (AuthorityStage.SHADOW, AuthorityStage.FULL),
+        (AuthorityStage.LIMITED, AuthorityStage.FULL),
+        (AuthorityStage.LIMITED, AuthorityStage.SHADOW),
+        (AuthorityStage.FULL, AuthorityStage.FULL),
+    ],
+)
+def test_invariant_4_a_an_approval_cannot_skip_or_reverse_a_stage(
+    from_stage: AuthorityStage, to_stage: AuthorityStage
+) -> None:
+    """**Shadow から Full へ飛ばない。** 承認の型そのものが1段しか表現できない。"""
+    document = report_document()
+    with pytest.raises(ValidationError, match="1段ずつ"):
+        StageApproval(
+            from_stage=from_stage,
+            to_stage=to_stage,
+            expected_revision=0,
+            approver=APPROVER,
+            approved_at_ms=NOW_MS,
+            reason="まとめて上げたい",
+            evidence=evidence_for(document),
+        )
+
+
+def test_invariant_4_b_an_approval_above_the_configured_ceiling_is_refused(
+    tmp_path: Path,
+) -> None:
+    """**設定が許していない stage は、承認があっても与えない**（#103 が上限を持つ）。"""
+    document = report_document()
+
+    with pytest.raises(AuthorityApprovalError, match="上限"):
+        raise_stage(
+            store(tmp_path),
+            approval=approval_for(document),
+            document=document,
+            settings=policy(authority="shadow"),
+        )
+
+
+def test_invariant_4_c_the_stage_order_has_no_gaps() -> None:
+    """stage の並びが4段で、上下が噛み合っていること。"""
+    assert STAGE_ORDER == (
+        AuthorityStage.SHADOW,
+        AuthorityStage.LIMITED,
+        AuthorityStage.EXPANDED,
+        AuthorityStage.FULL,
+    )
+    assert stage_below(AuthorityStage.SHADOW) is None
+    assert stage_above(AuthorityStage.FULL) is None
+    assert lowest_stage(AuthorityStage.FULL, AuthorityStage.LIMITED) is AuthorityStage.LIMITED
+
+
+# --- 不変条件 5: 証拠は完全・新鮮・束縛済み -------------------------------------
+
+
+def test_invariant_5_a_a_blocked_gate_does_not_raise_the_stage(tmp_path: Path) -> None:
+    """**gate を通っていない証拠では上げない**（0054 の判定をそのまま使う）。"""
+    document = report_document(outcome=GateOutcome.BLOCKED)
+
+    with pytest.raises(AuthorityEvidenceError, match="gate を通っていない"):
+        raise_stage(store(tmp_path), approval=approval_for(document), document=document)
+
+
+def test_invariant_5_b_evidence_pointing_at_another_report_is_refused(tmp_path: Path) -> None:
+    """**承認が指した報告と、渡された報告が同じであること。**"""
+    approved = report_document()
+    swapped = report_document(end_ms=EVIDENCE_END_MS - 1_000)
+
+    with pytest.raises(AuthorityEvidenceError, match="渡された報告が違う"):
+        raise_stage(store(tmp_path), approval=approval_for(approved), document=swapped)
+
+
+def test_invariant_5_c_evidence_for_another_artifact_is_refused(tmp_path: Path) -> None:
+    """**いま Production の artifact の実績でなければ使えない。**"""
+    other = "b" * 64
+    document = report_document(artifacts=(other,))
+    approval = approval_for(document, evidence=evidence_for(document, artifact=other))
+
+    with pytest.raises(AuthorityEvidenceError, match="Production の artifact"):
+        raise_stage(store(tmp_path), approval=approval, document=document)
+
+
+def test_invariant_5_d_a_report_mixing_artifacts_is_refused(tmp_path: Path) -> None:
+    """**借りた証拠で上げない。** 別 artifact が混ざった報告では帰属が決まらない。"""
+    document = report_document(artifacts=(ARTIFACT_SHA, "b" * 64))
+
+    with pytest.raises(AuthorityEvidenceError, match="Production 以外の artifact"):
+        raise_stage(store(tmp_path), approval=approval_for(document), document=document)
+
+
+def test_invariant_5_e_stale_evidence_is_refused(tmp_path: Path) -> None:
+    """**古い証拠で上げない。** 新しさは報告の run の終了時刻で測る。"""
+    settings = policy(authority="full")
+    limit_ms = settings.authority_rollout.evidence_max_age_ms.value
+    end_ms = NOW_MS - limit_ms - 1
+    document = report_document(end_ms=end_ms)
+    approval = approval_for(document, evidence=evidence_for(document, end_ms=end_ms))
+
+    with pytest.raises(AuthorityEvidenceError, match="証拠が古い"):
+        raise_stage(store(tmp_path), approval=approval, document=document, settings=settings)
+
+
+def test_invariant_5_f_a_declared_evidence_time_that_differs_from_the_report_is_refused(
+    tmp_path: Path,
+) -> None:
+    """**自己申告の時刻で新しさを名乗れない。** 報告の中の時刻と一致させる。"""
+    document = report_document()
+    approval = approval_for(document, evidence=evidence_for(document, end_ms=NOW_MS))
+
+    with pytest.raises(AuthorityEvidenceError, match="最終観測時刻"):
+        raise_stage(store(tmp_path), approval=approval, document=document)
+
+
+@pytest.mark.parametrize("field", ["fan_policy_config_sha256", "safety_config_sha256"])
+def test_invariant_5_g_evidence_from_another_configuration_is_refused(
+    tmp_path: Path, field: str
+) -> None:
+    """**別の設定で取った証拠は使えない。** 閾値が違えば実績の意味も違う。"""
+    other = "c" * 64
+    document = report_document(
+        policy_sha=other if field == "fan_policy_config_sha256" else POLICY_SHA,
+        safety_sha=other if field == "safety_config_sha256" else SAFETY_SHA,
+    )
+    approval = approval_for(
+        document,
+        evidence=evidence_for(
+            document,
+            policy_sha=other if field == "fan_policy_config_sha256" else POLICY_SHA,
+            safety_sha=other if field == "safety_config_sha256" else SAFETY_SHA,
+        ),
+    )
+
+    with pytest.raises(AuthorityEvidenceError, match="いまの"):
+        raise_stage(store(tmp_path), approval=approval, document=document)
+
+
+def test_invariant_5_h_evidence_taken_at_a_higher_authority_is_refused(tmp_path: Path) -> None:
+    """**上の stage で取った実績で、下から上げない。** 降格後の再昇格が素通りする。"""
+    document = report_document(stages=(AuthorityStage.FULL.value,))
+
+    with pytest.raises(AuthorityEvidenceError, match="高い authority"):
+        raise_stage(store(tmp_path), approval=approval_for(document), document=document)
+
+
+def test_invariant_5_i_evidence_without_the_current_stage_is_refused(tmp_path: Path) -> None:
+    """**いまの stage で運転した実績が要る。** 昇格は1段ぶんの経験で判断する。"""
+    authority = store(tmp_path)
+    first = report_document()
+    raise_stage(authority, approval=approval_for(first), document=first)
+    # いまは LIMITED だが、証拠は SHADOW の区間しか含まない。
+    document = report_document(stages=(AuthorityStage.SHADOW.value,))
+    approval = approval_for(document, from_stage=AuthorityStage.LIMITED, revision=1)
+
+    with pytest.raises(AuthorityEvidenceError, match="いまの stage で運転した証拠"):
+        raise_stage(authority, approval=approval, document=document)
+
+
+def test_invariant_5_j_a_missing_gate_for_the_arm_is_refused(tmp_path: Path) -> None:
+    """**判定していないことを合格にしない**（0054 の fail closed と同じ向き）。"""
+    document = report_document(arm="another_arm")
+    approval = approval_for(document, evidence=evidence_for(document, arm=ARM))
+
+    with pytest.raises(AuthorityEvidenceError, match="gate の判定が無い"):
+        raise_stage(store(tmp_path), approval=approval, document=document)
+
+
+def test_invariant_5_k_evidence_from_another_comparison_is_refused(tmp_path: Path) -> None:
+    """**同じ条件で比べた報告であること**（`conditions_sha256`。0054 §2.7）。"""
+    document = report_document(conditions_sha="d" * 64)
+    approval = approval_for(document, evidence=evidence_for(document))
+
+    with pytest.raises(AuthorityEvidenceError, match="比較条件"):
+        raise_stage(store(tmp_path), approval=approval, document=document)
+
+
+# --- 不変条件 6: 降格に承認は要らない ------------------------------------------
+
+
+def test_invariant_6_a_repeated_fallback_lowers_the_stage_without_an_approval(
+    tmp_path: Path,
+) -> None:
+    """**Gate の降格推奨（#79）を、承認なしで stage へ反映できる。**"""
+    control = runtime(tmp_path, stage=AuthorityStage.FULL)
+
+    demotion = control.observe(
+        safety_state=SafetyState.NORMAL,
+        demotion_recommended=True,
+        now_mono_ms=1_000,
+    )
+
+    assert demotion is not None
+    assert demotion.cause is AutomaticCause.REPEATED_FALLBACK
+    assert demotion.to_stage is AuthorityStage.EXPANDED
+    assert demotion.persisted is True
+    assert control.current_stage() is AuthorityStage.EXPANDED
+    event = control.journal.events[-1]
+    assert event.trigger is AuthorityTrigger.AUTOMATIC
+    assert event.approval is None
+    assert event.reason
+
+
+def test_invariant_6_b_persistent_low_confidence_and_ood_lower_the_stage(
+    tmp_path: Path,
+) -> None:
+    """**低 confidence / OOD が続いたら自動で下げる**（Issue の原則）。"""
+    settings = policy(authority="full", low_confidence_after=3, ood_after=2)
+    control = runtime(tmp_path, stage=AuthorityStage.FULL, settings=settings)
+
+    assert (
+        control.observe(
+            safety_state=SafetyState.NORMAL,
+            confidence_level=ConfidenceLevel.LOW,
+            now_mono_ms=0,
+        )
+        is None
+    )
+    assert (
+        control.observe(
+            safety_state=SafetyState.NORMAL,
+            confidence_level=ConfidenceLevel.LOW,
+            now_mono_ms=1,
+        )
+        is None
+    )
+    demotion = control.observe(
+        safety_state=SafetyState.NORMAL,
+        confidence_level=ConfidenceLevel.LOW,
+        now_mono_ms=2,
+    )
+
+    assert demotion is not None
+    assert demotion.cause is AutomaticCause.PERSISTENT_LOW_CONFIDENCE
+    assert control.current_stage() is AuthorityStage.EXPANDED
+
+    ood = control.observe(safety_state=SafetyState.NORMAL, ood=True, now_mono_ms=3)
+    assert ood is None, "数え直しは降格のたびに始める"
+    second = control.observe(safety_state=SafetyState.NORMAL, ood=True, now_mono_ms=4)
+    assert second is not None
+    assert second.cause is AutomaticCause.PERSISTENT_OOD
+    assert control.current_stage() is AuthorityStage.LIMITED
+
+
+def test_invariant_6_c_old_unhealthy_ticks_fall_out_of_the_window(tmp_path: Path) -> None:
+    """**窓の外の不健全を数え続けない。** 何日か回せば必ず下がる、にはしない。"""
+    settings = policy(authority="full", low_confidence_after=2)
+    window_ms = settings.authority_rollout.unhealthy_window_ms.value
+    control = runtime(tmp_path, stage=AuthorityStage.FULL, settings=settings)
+
+    control.observe(
+        safety_state=SafetyState.NORMAL, confidence_level=ConfidenceLevel.LOW, now_mono_ms=0
+    )
+    late = control.observe(
+        safety_state=SafetyState.NORMAL,
+        confidence_level=ConfidenceLevel.LOW,
+        now_mono_ms=window_ms + 1,
+    )
+
+    assert late is None
+    assert control.current_stage() is AuthorityStage.FULL
+
+
+def test_invariant_6_d_an_emergency_rolls_back_to_baseline(tmp_path: Path) -> None:
+    """**Safety の EMERGENCY は1手で Baseline へ戻す。** 段階を下りない。"""
+    control = runtime(tmp_path, stage=AuthorityStage.FULL)
+
+    demotion = control.observe(safety_state=SafetyState.EMERGENCY, now_mono_ms=0)
+
+    assert demotion is not None
+    assert demotion.cause is AutomaticCause.SAFETY_EMERGENCY
+    assert demotion.to_stage is BASELINE_STAGE
+    assert control.current_stage() is BASELINE_STAGE
+
+
+def test_invariant_6_e_a_demotion_applies_even_when_it_cannot_be_persisted(
+    tmp_path: Path,
+) -> None:
+    """**書き残せなくても下げる。** disk が一杯な間ほど高い authority で回らせない。"""
+    control = unwritable_runtime(tmp_path)
+
+    demotion = control.observe(safety_state=SafetyState.EMERGENCY, now_mono_ms=0)
+
+    assert demotion is not None
+    assert demotion.persisted is False
+    assert demotion.persist_failure is not None
+    assert control.current_stage() is BASELINE_STAGE
+    assert control.persist_failure is not None
+
+
+def test_invariant_6_f_reloading_does_not_undo_a_demotion(tmp_path: Path) -> None:
+    """**読み直しで authority が戻らない。** 戻れば降格を「読むだけ」で取り消せる。"""
+    control = unwritable_runtime(tmp_path)
+
+    control.observe(safety_state=SafetyState.EMERGENCY, now_mono_ms=0)
+    control.reload()
+    assert control.journal.stage is AuthorityStage.FULL, "journal には書けていない"
+
+    assert control.current_stage() is BASELINE_STAGE
+
+
+def test_invariant_6_g_rollback_to_baseline_is_one_step(tmp_path: Path) -> None:
+    """**Rollback は1手で実行できる**（受入基準「Rollback で Baseline へ戻れる」）。"""
+    control = runtime(tmp_path, stage=AuthorityStage.FULL)
+
+    demotion = control.rollback_to_baseline(actor="operator", reason="異音の切り分け")
+
+    assert demotion is not None
+    assert demotion.to_stage is BASELINE_STAGE
+    assert control.current_stage() is BASELINE_STAGE
+    event = control.journal.events[-1]
+    assert event.trigger is AuthorityTrigger.HUMAN
+    assert event.cause is None
+    assert event.approval is None
+
+
+def test_invariant_6_h_a_demotion_cannot_carry_an_approval() -> None:
+    """**降格に承認を付けない。** 付けられると「承認が要る」実装が書けてしまう。"""
+    document = report_document()
+    with pytest.raises(ValidationError, match="降格に承認を付けない"):
+        AuthorityEvent(
+            revision=1,
+            occurred_at_ms=NOW_MS,
+            kind=AuthorityChangeKind.LOWERED,
+            trigger=AuthorityTrigger.HUMAN,
+            from_stage=AuthorityStage.LIMITED,
+            to_stage=AuthorityStage.SHADOW,
+            actor=APPROVER,
+            reason="下げる",
+            approval=approval_for(document),
+        )
+
+
+def test_invariant_6_i_recovering_after_an_automatic_demotion_needs_a_new_approval(
+    tmp_path: Path,
+) -> None:
+    """**自動で下がったあとに、自動では戻らない。** 戻すのは人の承認だけ。"""
+    authority = store(tmp_path)
+    document = report_document()
+    raise_stage(authority, approval=approval_for(document), document=document)
+    control = AuthorityRuntime(authority, policy(authority="full"), clock=SimulatedClock(NOW_MS))
+    control.observe(safety_state=SafetyState.EMERGENCY, now_mono_ms=0)
+    assert control.current_stage() is BASELINE_STAGE
+
+    for tick in range(100):
+        assert control.observe(safety_state=SafetyState.NORMAL, now_mono_ms=tick + 1) is None
+    control.reload()
+
+    assert control.current_stage() is BASELINE_STAGE
+    assert authority.read().stage is BASELINE_STAGE
+
+
+def test_invariant_6_j_a_rewound_clock_does_not_block_a_demotion(tmp_path: Path) -> None:
+    """**壁時計が巻き戻っても降格は書ける。** 書けなくなるのは安全側の壊れ方ではない。"""
+    authority = store(tmp_path)
+    document = report_document()
+    raise_stage(authority, approval=approval_for(document), document=document)
+
+    journal = authority.rollback_to_baseline(
+        actor="operator", reason="時計が巻き戻った", now_ms=NOW_MS - 60_000
+    )
+
+    assert journal.stage is BASELINE_STAGE
+    assert journal.events[-1].occurred_at_ms == NOW_MS
+
+
+# --- 不変条件 7: 設定は上限 ----------------------------------------------------
+
+
+def test_invariant_7_a_the_configured_ceiling_caps_the_effective_stage(tmp_path: Path) -> None:
+    """**設定を下げれば、journal が高くても実効 stage が下がる。**"""
+    control = runtime(tmp_path, stage=AuthorityStage.FULL, ceiling="limited")
+
+    assert control.journal.stage is AuthorityStage.FULL
+    assert control.configured_ceiling is AuthorityStage.LIMITED
+    assert control.current_stage() is AuthorityStage.LIMITED
+
+
+def test_invariant_7_b_raising_the_configured_ceiling_does_not_raise_the_journal(
+    tmp_path: Path,
+) -> None:
+    """**設定を上げただけでは制御権は増えない。** 昇格は承認の記録が要る。"""
+    authority = store(tmp_path)
+
+    control = AuthorityRuntime(authority, policy(authority="full"), clock=SimulatedClock(NOW_MS))
+
+    assert control.configured_ceiling is AuthorityStage.FULL
+    assert control.current_stage() is BASELINE_STAGE
+    assert authority.read().revision == 0
+
+
+def test_invariant_7_c_the_gate_never_uses_a_stage_above_the_configured_ceiling() -> None:
+    """**Gate 側でも上限を掛ける。** 嘘の stage を渡しても設定を超えない。"""
+
+    class Lying:
+        def current_stage(self) -> AuthorityStage:
+            return AuthorityStage.FULL
+
+    settings = policy(authority="limited", recovery_hold_ms=1)
+    gate = ControllerGate(settings, expected_model_version="thermal-v1", authority=Lying())
+
+    first = gate.select(
+        now_mono_ms=0,
+        fallback=fallback_proposal(0.4),
+        learned=healthy_status(received=0, proposal=learned_proposal(0.9)),
+        operating_mode=OperatingMode.AUTO,
+        safety_state=SafetyState.NORMAL,
+    )
+    selection = gate.select(
+        now_mono_ms=1,
+        fallback=fallback_proposal(0.4),
+        learned=healthy_status(received=1, proposal=learned_proposal(0.9)),
+        operating_mode=OperatingMode.AUTO,
+        safety_state=SafetyState.NORMAL,
+    )
+
+    assert first.authority_stage is AuthorityStage.LIMITED
+    assert selection.authority_stage is AuthorityStage.LIMITED
+    assert selection.active_controller is ControllerKind.LEARNED_MPC
+    # LIMITED は front だけを許し、Fallback から limit_up=0.1 までしか上げられない。
+    assert selection.proposal.requested.front.demand == pytest.approx(0.5)
+    assert selection.proposal.requested.rear.demand == pytest.approx(0.4)
+
+
+def test_invariant_7_d_a_lowered_stage_puts_the_gate_back_on_fallback() -> None:
+    """**stage を Shadow へ下げたら、次の tick から実 Fan は Fallback が作る。**"""
+    settings = policy(authority="full", recovery_hold_ms=1)
+    source = StaticAuthorityStage(AuthorityStage.FULL)
+    gate = ControllerGate(settings, expected_model_version="thermal-v1", authority=source)
+    gate.select(
+        now_mono_ms=0,
+        fallback=fallback_proposal(0.4),
+        learned=healthy_status(received=0),
+        operating_mode=OperatingMode.AUTO,
+        safety_state=SafetyState.NORMAL,
+    )
+    using_ml = gate.select(
+        now_mono_ms=1,
+        fallback=fallback_proposal(0.4),
+        learned=healthy_status(received=1),
+        operating_mode=OperatingMode.AUTO,
+        safety_state=SafetyState.NORMAL,
+    )
+    assert using_ml.active_controller is ControllerKind.LEARNED_MPC
+
+    lowered = ControllerGate(
+        settings,
+        expected_model_version="thermal-v1",
+        authority=StaticAuthorityStage(AuthorityStage.SHADOW),
+    )
+    selection = lowered.select(
+        now_mono_ms=2,
+        fallback=fallback_proposal(0.4),
+        learned=healthy_status(received=2),
+        operating_mode=OperatingMode.AUTO,
+        safety_state=SafetyState.NORMAL,
+    )
+
+    assert selection.active_controller is ControllerKind.FALLBACK
+    assert selection.authority_stage is AuthorityStage.SHADOW
+
+
+# --- 不変条件 8: Model promotion は authority を動かさない ----------------------
+
+
+def test_invariant_8_a_promoting_a_model_does_not_change_the_authority_stage(
+    tmp_path: Path,
+) -> None:
+    """**Production への昇格で制御権は増えない**（受入基準・#104 との境界）。"""
+    authority = store(tmp_path)
+    document = report_document()
+    raise_stage(authority, approval=approval_for(document), document=document)
+    before = authority.read()
+
+    registry = ModelRegistry(tmp_path / "registry", SimulatedClock(NOW_MS), limits=LIMITS)
+    register_and_validate(registry, "1.0.0")
+    promote_artifact(registry, "1.0.0")
+
+    after = authority.read()
+    assert after == before
+    assert after.stage is AuthorityStage.LIMITED
+    assert registry.inspect().production[ArtifactKind.THERMAL_MODEL].active.version == "1.0.0"
+    control = AuthorityRuntime(authority, policy(authority="full"), clock=SimulatedClock(NOW_MS))
+    assert control.current_stage() is AuthorityStage.LIMITED
+
+
+def test_invariant_8_b_an_approval_for_the_retired_artifact_is_refused_after_promotion(
+    tmp_path: Path,
+) -> None:
+    """**artifact が入れ替わったら、前の artifact の証拠は使えない。**"""
+    registry = ModelRegistry(tmp_path / "registry", SimulatedClock(NOW_MS), limits=LIMITS)
+    register_and_validate(registry, "1.0.0")
+    promote_artifact(registry, "1.0.0")
+    old_sha = artifact_metadata("1.0.0").sha256
+    document = report_document(artifacts=(old_sha,))
+    approval = approval_for(document, evidence=evidence_for(document, artifact=old_sha))
+
+    register_and_validate(registry, "1.1.0")
+    promote_artifact(registry, "1.1.0")
+    new_sha = artifact_metadata("1.1.0").sha256
+
+    with pytest.raises(AuthorityEvidenceError, match="Production の artifact"):
+        raise_stage(store(tmp_path), approval=approval, document=document, artifact=new_sha)
+
+
+def test_invariant_8_c_the_registry_cannot_write_the_authority_journal() -> None:
+    """**Model Registry は authority の状態を触らない。** 名前でも参照しない。"""
+    source = Path("src/coldaisle/control/model_registry.py").read_text(encoding="utf-8")
+
+    assert "AuthorityStore" not in source
+    assert "authority.json" not in source
+    assert "AuthorityJournal" not in source
+
+
+def test_invariant_8_d_the_two_states_live_in_separate_files(tmp_path: Path) -> None:
+    """**同じ file に同居させない。** revision を共有すると片方が片方を動かす。"""
+    authority = store(tmp_path)
+    document = report_document()
+    raise_stage(authority, approval=approval_for(document), document=document)
+    registry = ModelRegistry(tmp_path / "registry", SimulatedClock(NOW_MS), limits=LIMITS)
+    register_and_validate(registry, "1.0.0")
+
+    written = sorted(path.name for path in (tmp_path / "authority").iterdir())
+
+    assert "authority.json" in written
+    assert not (tmp_path / "authority" / "registry.json").exists()
+    assert not (tmp_path / "registry" / "authority.json").exists()
+
+
+# --- 不変条件 9: stage は model version と独立に残る ---------------------------
+
+
+def test_invariant_9_a_the_stage_is_recorded_on_a_tick_without_any_model() -> None:
+    """**model が無い tick にも stage を残す**（受入基準「独立して #82 へ記録できる」）。"""
+    gate = ControllerGate(
+        policy(authority="full"),
+        expected_model_version="thermal-v1",
+        authority=StaticAuthorityStage(AuthorityStage.EXPANDED),
+    )
+
+    selection = gate.select(
+        now_mono_ms=0,
+        fallback=fallback_proposal(0.4),
+        learned=healthy_status(received=0).model_copy(
+            update={"proposal": None, "received_at_mono_ms": None, "assessment": None}
+        ),
+        operating_mode=OperatingMode.AUTO,
+        safety_state=SafetyState.NORMAL,
+    )
+
+    trace = selection.trace_metadata()
+    assert selection.model_gate is None
+    assert trace["authority_stage"] == AuthorityStage.EXPANDED.value
+    assert "model_version" not in trace
+
+
+def test_invariant_9_b_the_recorded_stage_does_not_follow_the_model_version() -> None:
+    """**model version が変わっても stage は動かない。**"""
+    settings = policy(authority="full", recovery_hold_ms=1)
+    stages = []
+    for version in ("thermal-v1", "thermal-v1"):
+        gate = ControllerGate(
+            settings,
+            expected_model_version=version,
+            authority=StaticAuthorityStage(AuthorityStage.LIMITED),
+        )
+        gate.select(
+            now_mono_ms=0,
+            fallback=fallback_proposal(0.4),
+            learned=healthy_status(received=0, proposal=learned_proposal(version=version)),
+            operating_mode=OperatingMode.AUTO,
+            safety_state=SafetyState.NORMAL,
+        )
+        selection = gate.select(
+            now_mono_ms=1,
+            fallback=fallback_proposal(0.4),
+            learned=healthy_status(received=1, proposal=learned_proposal(version=version)),
+            operating_mode=OperatingMode.AUTO,
+            safety_state=SafetyState.NORMAL,
+        )
+        assert selection.model_gate is not None
+        stages.append(selection.authority_stage)
+
+    assert stages == [AuthorityStage.LIMITED, AuthorityStage.LIMITED]
+
+
+def test_invariant_9_c_a_selection_cannot_claim_two_different_stages() -> None:
+    """**2つの欄が別の stage を名乗れない。** 読む側がどちらを信じるか決められなくなる。"""
+    gate = ControllerGate(
+        policy(authority="full", recovery_hold_ms=1),
+        expected_model_version="thermal-v1",
+        authority=StaticAuthorityStage(AuthorityStage.LIMITED),
+    )
+    gate.select(
+        now_mono_ms=0,
+        fallback=fallback_proposal(0.4),
+        learned=healthy_status(received=0),
+        operating_mode=OperatingMode.AUTO,
+        safety_state=SafetyState.NORMAL,
+    )
+    selection = gate.select(
+        now_mono_ms=1,
+        fallback=fallback_proposal(0.4),
+        learned=healthy_status(received=1),
+        operating_mode=OperatingMode.AUTO,
+        safety_state=SafetyState.NORMAL,
+    )
+    assert selection.model_gate is not None
+
+    with pytest.raises(ValidationError, match="authority stage を一致させる"):
+        ControllerSelection(
+            proposal=selection.proposal,
+            authority_stage=AuthorityStage.FULL,
+            transitioned=False,
+            model_gate=selection.model_gate,
+        )
+
+
+def test_invariant_9_d_the_runtime_trace_carries_the_stage_but_no_model_version(
+    tmp_path: Path,
+) -> None:
+    """runtime の trace は stage・上限・直近の変更を残し、**model を名指さない**。"""
+    control = runtime(tmp_path, stage=AuthorityStage.LIMITED, ceiling="full")
+
+    trace = control.trace_metadata()
+
+    assert trace["authority_stage"] == AuthorityStage.LIMITED.value
+    assert trace["authority_config_ceiling"] == AuthorityStage.FULL.value
+    assert trace["authority_revision"] == 1
+    last = trace["authority_last_change"]
+    assert isinstance(last, dict)
+    assert last["actor"] == APPROVER
+    assert last["occurred_at_ms"] == NOW_MS
+    serialized = json.dumps(trace, ensure_ascii=False)
+    assert "model" not in serialized, "stage の記録は model version を持ち込まない"
+
+
+# --- 不変条件 10: Critical Safety は全 stage で同一 ----------------------------
+
+
+def test_invariant_10_a_critical_safety_never_reads_the_authority_stage() -> None:
+    """**Safety は stage を読まない。** 読めば「stage ごとの安全」が生まれる。"""
+    for path in sorted(Path("src/coldaisle/control/safety").glob("*.py")):
+        source = path.read_text(encoding="utf-8")
+        assert "AuthorityStage" not in source, path
+        assert "authority_stage" not in source, path
+        assert "AuthorityStore" not in source, path
+
+
+def test_invariant_10_b_the_safety_floor_is_identical_at_every_stage() -> None:
+    """**どの stage でも同じ floor・同じ最終裁定になる。**
+
+    stage は `requested` の幅だけを変える。Learned MPC が floor を下回る値を出しても、
+    4つの stage すべてで同じ effective demand に収束する（0028 §2.4、AGENTS.md ルール3）。
+    """
+    settings = policy(authority="full", recovery_hold_ms=1)
+    floors: dict[AuthorityStage, tuple[float, ...]] = {}
+    effective: dict[AuthorityStage, tuple[float, ...]] = {}
+    requested: dict[AuthorityStage, float] = {}
+    for stage in AuthorityStage:
+        gate = ControllerGate(
+            settings,
+            expected_model_version="thermal-v1",
+            authority=StaticAuthorityStage(stage),
+        )
+        for tick in (0, 1):
+            selection = gate.select(
+                now_mono_ms=tick,
+                fallback=fallback_proposal(0.2),
+                learned=healthy_status(received=tick, proposal=learned_proposal(0.1)),
+                operating_mode=OperatingMode.AUTO,
+                safety_state=SafetyState.NORMAL,
+            )
+
+        config = safety_config(uniform_zone_min=0.6)
+        safety = critical_safety(config)
+        composer = DemandComposer(config)
+        startup = safety.evaluate(safety_snapshot(tick=1, mono=0), mode=OperatingMode.AUTO)
+        composer.compose(
+            requested=selection.proposal.requested,
+            guard=empty_guard(),
+            safety=startup,
+            mode=OperatingMode.AUTO,
+        )
+        normal = safety.evaluate(safety_snapshot(tick=2, mono=10_000), mode=OperatingMode.AUTO)
+        composed = composer.compose(
+            requested=selection.proposal.requested,
+            guard=empty_guard(),
+            safety=normal,
+            mode=OperatingMode.AUTO,
+        )
+
+        assert normal.state is SafetyState.NORMAL
+        requested[stage] = selection.proposal.requested.front.demand
+        floors[stage] = tuple(
+            zone.safety_floor for zone in (composed.front, composed.rear, composed.top)
+        )
+        effective[stage] = tuple(
+            zone.effective for zone in (composed.front, composed.rear, composed.top)
+        )
+
+    assert len(set(floors.values())) == 1, floors
+    assert len(set(effective.values())) == 1, effective
+    assert effective[AuthorityStage.FULL] == (0.6, 0.6, 0.8)
+    # stage は requested の幅を変える。変わらないなら、この試験は何も言っていない。
+    assert requested[AuthorityStage.SHADOW] != requested[AuthorityStage.FULL]

@@ -156,7 +156,24 @@ metric 名の長さ）は**写し元の契約と同じ値**にする。設定と
 v7からv8へは `shadow` を追加してから `schema_version: 8` へ上げる。
 v1〜v7は自動補完せず起動前に拒否する。
 
-現行 Control Config v8 は設定の live reload を行わない。設定変更は候補全体を別オブジェクトで検証したうえで
+#92 のv9で `authority_rollout` を追加する（決定記録 0057。Proposed）。
+昇格の承認の有効期限 `approval_max_age_ms`、rollout gate の証拠の有効期限
+`evidence_max_age_ms`、自動降格のために不健全な tick を数える窓 `unhealthy_window_ms`、
+その窓の中で降格に至る件数 `low_confidence_after` / `ood_after` を `status` / `basis` 付きで
+明示する。`approval_max_age_ms` は `evidence_max_age_ms` 以下にする（承認のほうが長生きすると、
+承認だけ取って書き込みを遅らせることで期限切れの証拠での昇格が通ってしまう）。
+
+v9 から `authority_stage` の意味が変わる。**いまの stage ではなく、設定が許す上限である。**
+実際に与えている制御権は `authority.json`（`AuthorityStore` の journal）が持ち、実効 stage は
+journal・設定の上限・その process が自分で下げた上限の**もっとも低いもの**になる。
+設定を下げれば再起動後に実効 stage が下がり、**設定を上げても journal は上がらない。**
+stage を上げられるのは、revision・遷移・設定・証拠・artifact に束縛した人の承認だけである。
+Model を Production へ昇格させても authority は動かない（#104 と #92 の境界。0057 §2.3）。
+
+v8からv9へは `authority_rollout` を追加してから `schema_version: 9` へ上げる。
+v1〜v8は自動補完せず起動前に拒否する。
+
+現行 Control Config v9 は設定の live reload を行わない。設定変更は候補全体を別オブジェクトで検証したうえで
 **次回再起動時**にだけ反映する。これにより、変更後の設定も必ず `STARTUP` の Max を通る。
 `trace_metadata()` は、採用されたsource名・schema version・SHA-256を #82 の decision traceへ渡す。
 Confidence / OOD の判断（`model_gate`）には検証済み assessment の値だけを書き、裏付けの無い tick は

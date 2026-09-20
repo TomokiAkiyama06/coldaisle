@@ -14,6 +14,7 @@ from coldaisle.control.model.thermal import ArtifactVerification
 from coldaisle.control.schema import (
     AuthorityLimitSource,
     AuthorityStage,
+    AuthorityStageSource,
     ConfidenceLevel,
     ControllerKind,
     ControllerProposal,
@@ -25,6 +26,7 @@ from coldaisle.control.schema import (
     SafetyState,
     Zone,
     ZoneRequest,
+    lowest_stage,
 )
 
 
@@ -157,6 +159,13 @@ class ControllerSelection(_Frozen):
 
     proposal: ControllerProposal
     fallback_reason: Reason | None = None
+    authority_stage: AuthorityStage
+    """この tick に効いていた制御権（#92）。
+
+    **model が無い tick にも残す。** `model_gate` は提案があった tick にしか出ないため、
+    そこにだけ stage を書くと「Fallback で回っていた区間の stage」が trace から消える。
+    model version とは独立した欄である（決定記録 0057 §2.7）。
+    """
     transitioned: bool
     recovery_healthy_since_mono_ms: int | None = Field(default=None, ge=0)
     fallback_transitions_in_window: int = Field(default=0, ge=0)
@@ -176,6 +185,12 @@ class ControllerSelection(_Frozen):
         if self.candidate_digest is not None and self.model_gate is None:
             # 候補を評価していない tick に、候補の識別子だけが残ることはない。
             raise ValueError("候補を評価していない tick に worker 結果の識別子を付けない")
+        if (
+            self.model_gate is not None
+            and self.model_gate.authority_stage is not self.authority_stage
+        ):
+            # 2つの欄が別の stage を名乗ると、あとから読む側がどちらを信じるか決められない。
+            raise ValueError("model_gate と selection の authority stage を一致させる")
         return self
 
     @property
@@ -192,6 +207,7 @@ class ControllerSelection(_Frozen):
         """#82 の ControlState / structured log にそのまま載せられる値を返す。"""
         return {
             "active_controller": self.active_controller.value,
+            "authority_stage": self.authority_stage.value,
             "fallback_active": self.fallback_active,
             "fallback_reason": (
                 None
@@ -215,11 +231,19 @@ class ControllerGate:
     Reactive Guard と Critical Safety は後段で常に掛かる。
     """
 
-    def __init__(self, policy: FanPolicyConfig, *, expected_model_version: str) -> None:
+    def __init__(
+        self,
+        policy: FanPolicyConfig,
+        *,
+        expected_model_version: str,
+        authority: AuthorityStageSource | None = None,
+    ) -> None:
         if not expected_model_version:
             raise ValueError("expected_model_version は空にできない")
         self._policy = policy
         self._expected_model_version = expected_model_version
+        # #92 の Authority Rollout。渡されなければ設定の stage をそのまま使う。
+        self._authority = authority
         self._active_controller: ControllerKind | None = None
         self._last_requested: PerZone[ZoneRequest] | None = None
         self._healthy_since_mono_ms: int | None = None
@@ -249,6 +273,8 @@ class ControllerGate:
         self._check_inputs(now_mono_ms, fallback)
         self._observe_mode(operating_mode)
         previous_controller = self._active_controller
+        # **この tick の stage は1回だけ読む。** 判定・帯・記録で別の値を使わない。
+        stage = self._effective_stage()
 
         if operating_mode in {OperatingMode.MANUAL, OperatingMode.CALIBRATION}:
             raise ValueError("MANUAL / CALIBRATION の requested は Controller Gate が選ばない")
@@ -258,19 +284,19 @@ class ControllerGate:
             # counterfactualを評価しても復帰holdへは数えず、requestedはFallbackを使う。
             # 実FanへのMaxは後段Safetyのforced_maxが所有する。
             self._healthy_since_mono_ms = None
-            return self._remember(fallback, None, previous_controller, learned)
+            return self._remember(fallback, None, previous_controller, learned, stage)
 
-        if self._policy.authority_stage is AuthorityStage.SHADOW:
+        if stage is AuthorityStage.SHADOW:
             self._healthy_since_mono_ms = None
-            return self._remember(fallback, None, previous_controller, learned)
+            return self._remember(fallback, None, previous_controller, learned, stage)
 
-        reason = self._unhealthy_reason(now_mono_ms, learned, safety_state)
+        reason = self._unhealthy_reason(now_mono_ms, learned, safety_state, stage)
         if reason is not None:
             self._healthy_since_mono_ms = None
             selected = fallback
             if previous_controller is ControllerKind.LEARNED_MPC:
                 selected = self._prevent_transition_drop(fallback)
-            return self._remember(selected, reason, previous_controller, learned)
+            return self._remember(selected, reason, previous_controller, learned, stage)
 
         assert learned.proposal is not None
         if previous_controller is not ControllerKind.LEARNED_MPC:
@@ -284,17 +310,29 @@ class ControllerGate:
                         f"healthy_for_ms={elapsed_ms}; required_ms={self._policy.recovery_hold_ms}"
                     ),
                 )
-                return self._remember(fallback, reason, previous_controller, learned)
+                return self._remember(fallback, reason, previous_controller, learned, stage)
 
-        selected, limits = self._apply_authority(learned.proposal, fallback)
+        selected, limits = self._apply_authority(learned.proposal, fallback, stage)
         self._healthy_since_mono_ms = None
-        return self._remember(selected, None, previous_controller, learned, limits)
+        return self._remember(selected, None, previous_controller, learned, stage, limits)
+
+    def _effective_stage(self) -> AuthorityStage:
+        """いまの authority stage（#92）。**検証済み設定の上限を超えない。**
+
+        Rollout の状態がどう壊れても、設定が許した以上の制御権は出さない。#92 の
+        runtime も同じ上限を掛けるが、Gate 側でも掛ける（配線の誤りを1箇所で止めない）。
+        """
+        ceiling = self._policy.authority_stage
+        if self._authority is None:
+            return ceiling
+        return lowest_stage(self._authority.current_stage(), ceiling)
 
     def _unhealthy_reason(
         self,
         now_mono_ms: int,
         learned: LearnedControlStatus,
         safety_state: SafetyState,
+        stage: AuthorityStage,
     ) -> Reason | None:
         if learned.snapshot_status is SnapshotStatus.UNAVAILABLE:
             return self._reason(FallbackCause.SNAPSHOT_UNAVAILABLE)
@@ -348,14 +386,14 @@ class ControllerGate:
             )
         if assessment.ood:
             return self._reason(FallbackCause.OOD)
-        required_confidence = self._required_confidence()
+        required_confidence = self._required_confidence(stage)
         if assessment.confidence < required_confidence:
             return self._reason(
                 FallbackCause.LOW_CONFIDENCE,
                 (
                     f"confidence={assessment.confidence:.6f}; "
                     f"required={required_confidence:.6f}; "
-                    f"stage={self._policy.authority_stage.value}"
+                    f"stage={stage.value}"
                 ),
             )
         return None
@@ -380,21 +418,21 @@ class ControllerGate:
             return "assessment is for another model version"
         return None
 
-    def _required_confidence(self) -> float:
+    def _required_confidence(self, stage: AuthorityStage) -> float:
         thresholds = self._policy.gate_min_confidence
         return {
             AuthorityStage.LIMITED: thresholds.limited.value,
             AuthorityStage.EXPANDED: thresholds.expanded.value,
             AuthorityStage.FULL: thresholds.full.value,
-        }[self._policy.authority_stage]
+        }[stage]
 
     def _apply_authority(
         self,
         learned: ControllerProposal,
         fallback: ControllerProposal,
+        stage: AuthorityStage,
     ) -> tuple[ControllerProposal, tuple[AuthorityLimitSource, ...]]:
         """stage の帯と MEDIUM の帯を重ね、最も狭い範囲に収める（決定記録 0050 §2.4）。"""
-        stage = self._policy.authority_stage
         assert learned.confidence is not None and learned.ood is not None
         level = classify_confidence(
             self._policy, confidence=learned.confidence, ood=learned.ood, stage=stage
@@ -516,6 +554,7 @@ class ControllerGate:
         learned: LearnedControlStatus,
         selected: ControllerProposal,
         limits: tuple[AuthorityLimitSource, ...],
+        stage: AuthorityStage,
     ) -> ModelGateDecision | None:
         """この tick の判断を trace へ残す。**検証できた値だけ**を記録する。"""
         proposal = learned.proposal
@@ -523,7 +562,6 @@ class ControllerGate:
             return None
         assert proposal.model_version is not None
         assert proposal.inference_id is not None
-        stage = self._policy.authority_stage
         learned_selected = selected.controller is ControllerKind.LEARNED_MPC
         assessment = learned.assessment
         if assessment is None or self._attestation_failure(proposal, assessment) is not None:
@@ -575,6 +613,7 @@ class ControllerGate:
         fallback_reason: Reason | None,
         previous_controller: ControllerKind | None,
         learned: LearnedControlStatus,
+        stage: AuthorityStage,
         limits: tuple[AuthorityLimitSource, ...] = (),
     ) -> ControllerSelection:
         assert self._last_mono_ms is not None
@@ -593,6 +632,7 @@ class ControllerGate:
         return ControllerSelection(
             proposal=proposal,
             fallback_reason=fallback_reason,
+            authority_stage=stage,
             transitioned=(
                 previous_controller is not None and previous_controller is not proposal.controller
             ),
@@ -600,7 +640,7 @@ class ControllerGate:
             fallback_transitions_in_window=transition_count,
             # #92 がこのsignalを受けてSHADOW降格を永続化する。Gateは設定を変更しない。
             demotion_recommended=transition_count >= self._policy.demote_after,
-            model_gate=self._model_gate(learned, proposal, limits),
+            model_gate=self._model_gate(learned, proposal, limits, stage),
             # **Gate が受け取った worker 結果そのもの**を識別する。authority で値を狭めたあとの
             # 提案でも、記録側が「退けられたのはどれか」を元の結果で照合できる。
             candidate_digest=learned.result_digest,

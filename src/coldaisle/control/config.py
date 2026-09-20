@@ -26,8 +26,8 @@ from coldaisle.control.schema import (
 )
 from coldaisle.store.models import validate_metric
 
-CONTROL_CONFIG_VERSION: Literal[8] = 8
-FAN_POLICY_CONFIG_VERSION: Literal[8] = 8
+CONTROL_CONFIG_VERSION: Literal[9] = 9
+FAN_POLICY_CONFIG_VERSION: Literal[9] = 9
 SAFETY_CONFIG_VERSION: Literal[2] = 2
 CONFIG_FILENAMES = {
     "fan_hardware": "fan-hardware.yaml",
@@ -459,6 +459,41 @@ NonNegativeMilliseconds = Annotated[int, Field(ge=0)]
 DriftRatio = Annotated[float, Field(gt=1.0, allow_inf_nan=False)]
 
 
+class AuthorityRolloutConfig(_ConfigModel):
+    """Authority stage の昇格条件と自動降格の条件（#92 / 決定記録 0057）。
+
+    **stage そのものはここに置かない。** `authority_stage` は設定が許す**上限**で、
+    いま与えている制御権は `AuthorityStore` の journal が持つ（0057 §2.2）。
+    この型が持つのは「人の承認と証拠をどこまで新しいものに限るか」と
+    「どれだけ不健全が続いたら自動で下げるか」だけである。
+    """
+
+    approval_max_age_ms: PolicyMilliseconds
+    """承認からこれを過ぎたら昇格に使えない。**承認を貯めて後から使わせない。**"""
+    evidence_max_age_ms: PolicyMilliseconds
+    """証拠の最後の観測時刻からこれを過ぎたら昇格に使えない。
+
+    証拠の「新しさ」は報告書の自己申告ではなく、**中に記録された run の終了時刻**で測る
+    （決定記録 0054 §2.7 が生成時刻を持たないため。0057 §2.4）。
+    """
+    unhealthy_window_ms: PolicyMilliseconds
+    """自動降格のために、低 confidence / OOD の tick を数える直近の窓。"""
+    low_confidence_after: ConfigValue[PositiveCount]
+    """窓の中で LOW confidence がこの件数に達したら1段下げる。"""
+    ood_after: ConfigValue[PositiveCount]
+    """窓の中で OOD がこの件数に達したら1段下げる。"""
+
+    @model_validator(mode="after")
+    def _approval_does_not_outlive_its_evidence(self) -> Self:
+        if self.approval_max_age_ms.value > self.evidence_max_age_ms.value:
+            # 承認のほうが長生きすると、承認だけ取って書き込みを遅らせることで
+            # 期限切れの証拠での昇格が通ってしまう。
+            raise ValueError(
+                "authority_rollout.approval_max_age_ms は evidence_max_age_ms 以下にする"
+            )
+        return self
+
+
 class ConfidenceAuthorityBand(_ConfigModel):
     """MEDIUM confidence で Learned MPC に許す Fallback 中心の帯（決定記録 0050 §2.4）。
 
@@ -888,7 +923,7 @@ class ShadowConfig(_ConfigModel):
 
 
 class FanPolicyConfig(_ConfigModel):
-    schema_version: Literal[8]
+    schema_version: Literal[9]
     fallback_curve: Annotated[
         tuple[FallbackPoint, ...], BeforeValidator(_yaml_sequence_to_tuple), Field(min_length=2)
     ]
@@ -902,7 +937,13 @@ class FanPolicyConfig(_ConfigModel):
     gate_min_confidence: GateConfidenceThresholds
     model_confidence: ModelConfidencePolicy
     authority_stage: Annotated[AuthorityStage, BeforeValidator(_yaml_authority_stage)]
+    """設定が許す authority の**上限**（#92 / 決定記録 0057 §2.2）。
+
+    v9 より前は「いまの stage」だったが、実効 stage は journal が持つようになった。
+    ここを下げれば実効 stage は次の tick から下がり、上げても journal は上がらない。
+    """
     authority_limits: AuthorityLimits
+    authority_rollout: AuthorityRolloutConfig
     shadow: ShadowConfig
     recovery_hold_ms: PositiveMilliseconds
     demote_window_ms: PositiveMilliseconds
@@ -1183,6 +1224,15 @@ class ControlConfig(_ConfigModel):
                 f"mpc.optimizer.cost_scales.{name}",
                 getattr(optimizer.cost_scales, name),
             )
+        rollout = self.policy.authority_rollout
+        for name in (
+            "approval_max_age_ms",
+            "evidence_max_age_ms",
+            "unhealthy_window_ms",
+            "low_confidence_after",
+            "ood_after",
+        ):
+            append("fan-policy.yaml", f"authority_rollout.{name}", getattr(rollout, name))
         append(
             "fan-policy.yaml",
             "shadow.outcome_match_tolerance_ms",
