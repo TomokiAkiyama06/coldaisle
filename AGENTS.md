@@ -38,6 +38,7 @@ uv run coldaisle-drift --evidence var/drift-evidence.yaml --profile var/confiden
 uv run coldaisle-eventd             # 書き込み専用の Unix ソケット入口（決定記録 0045。API とは別）
 uv run coldaisle-event gpu-mode compute  # GPU Mode の切り替えを記録する（#67）
 uv run coldaisle-telemetry --once   # NVML / hwmon を1回収集（#65）
+uv run coldaisle-fand --max-ticks 5 # 3系統Fan制御デーモン（simulated backend。#74 / 決定記録 0028）
 COLDAISLE_DB=var/coldaisle.db uv run uvicorn coldaisle.api:app --host 127.0.0.1 --port 8000
 COLDAISLE_DB=var/coldaisle.db uv run uvicorn coldaisle.server:app --port 8000  # + AI ツールの窓口
 ```
@@ -229,10 +230,12 @@ src/coldaisle/
   evaluate.py # 合成の起点: Controller構成の比較レポート（読み取りのみ）。#91
   event_entry/ # 合成の起点: 書き込み専用の Unix ソケット入口。AI 層・API から import しない。#67
   rollup_job.py # 合成の起点: `coldaisle-rollup` の入口（周期メトリクスを Store へ渡す）。#65
+  control_daemon.py # 合成の起点: Fan制御デーモン。**hwmonへ書くのはこのプロセスだけ**。#74
   store/      # L1: SQLite、ロールアップ、CSVエクスポート
   api/        # L2: FastAPI、WebSocket
   rules/      # L2: アラート用ルールエンジン（決定論的。LLM非依存）
   control/    # Fan制御。Supervisor / MPC / Guard / Safety / Fallback / hardware mapping
+    loop.py     # 1 tickの順序・期限・例外の翻訳（閾値もdemandの計算も持たない）。#74
     supervisor/ # RulePolicy / RLPolicy / Workload Regime
     model/      # Learned Thermal Model、Confidence / OOD
     mpc/        # Optimizer / horizon制御

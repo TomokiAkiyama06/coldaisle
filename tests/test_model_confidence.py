@@ -753,7 +753,7 @@ def test_ood_assessment_switches_to_fallback_immediately_and_is_traced(trained) 
 
     tick = _trace_tick(selected)
     restored = ControlTick.model_validate_json(tick.model_dump_json())
-    assert restored.schema_version == 6
+    assert restored.schema_version == 8
     assert restored.model_gate == gate_record
     assert json.loads(tick.model_dump_json())["state"]["model_ood"] is True
 

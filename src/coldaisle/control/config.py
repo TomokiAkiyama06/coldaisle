@@ -26,9 +26,9 @@ from coldaisle.control.schema import (
 )
 from coldaisle.store.models import validate_metric
 
-CONTROL_CONFIG_VERSION: Literal[9] = 9
+CONTROL_CONFIG_VERSION: Literal[10] = 10
 FAN_POLICY_CONFIG_VERSION: Literal[9] = 9
-SAFETY_CONFIG_VERSION: Literal[2] = 2
+SAFETY_CONFIG_VERSION: Literal[3] = 3
 CONFIG_FILENAMES = {
     "fan_hardware": "fan-hardware.yaml",
     "safety": "safety.yaml",
@@ -236,7 +236,7 @@ class TelemetryDelays(_ConfigModel):
 class SafetyConfig(_ConfigModel):
     """Critical Safety だけが所有する設定。全数値に status/basis を残す。"""
 
-    schema_version: Literal[2]
+    schema_version: Literal[3]
     absolute_temp_ceiling_c: SafetyFloat
     zone_min_demand: PerZone[SafetyDemand]
     cpu_cooling_floor: Annotated[
@@ -259,6 +259,12 @@ class SafetyConfig(_ConfigModel):
     ramp_down_per_s: SafetyFloat
     startup_settle_ms: SafetyMilliseconds
     fault_clear_hold_ms: SafetyMilliseconds
+    tick_ms: SafetyMilliseconds
+    """control loop の周期（決定記録 0028 §2.6 / 0060 §2.1）。
+
+    **締め切りと同じファイルに置く。** 周期だけを別の設定へ置くと、`tick_deadline_ms`
+    より短い周期が検証されないまま採用され、毎 tick が overrun になる。
+    """
     tick_deadline_ms: SafetyMilliseconds
     overrun_consecutive_limit: ConfigValue[Annotated[int, Field(gt=0)]]
     watchdog_timeout_ms: SafetyMilliseconds
@@ -273,6 +279,12 @@ class SafetyConfig(_ConfigModel):
             raise ValueError("fault_demand は全 zone の最低安全 demand 以上にする")
         if self.ramp_down_per_s.value < 0:
             raise ValueError("ramp_down_per_s は 0 以上にする")
+        if self.tick_deadline_ms.value > self.tick_ms.value:
+            # 締め切りが周期より長いと、超過を検出したときには次の tick が始まっている。
+            raise ValueError("tick_deadline_ms は tick_ms 以下にする")
+        if self.watchdog_timeout_ms.value <= self.tick_ms.value:
+            # 1 周期ぶんの遅れで watchdog が落ちると、健全な運転でも再起動を繰り返す。
+            raise ValueError("watchdog_timeout_ms は tick_ms より長くする")
         for zone in Zone:
             if self.stall_check_min_demand.get(zone).value > self.zone_min_demand.get(zone).value:
                 raise ValueError(
@@ -1116,6 +1128,7 @@ class ControlConfig(_ConfigModel):
         append("safety.yaml", "ramp_down_per_s", safety.ramp_down_per_s)
         append("safety.yaml", "startup_settle_ms", safety.startup_settle_ms)
         append("safety.yaml", "fault_clear_hold_ms", safety.fault_clear_hold_ms)
+        append("safety.yaml", "tick_ms", safety.tick_ms)
         append("safety.yaml", "tick_deadline_ms", safety.tick_deadline_ms)
         append("safety.yaml", "overrun_consecutive_limit", safety.overrun_consecutive_limit)
         append("safety.yaml", "watchdog_timeout_ms", safety.watchdog_timeout_ms)

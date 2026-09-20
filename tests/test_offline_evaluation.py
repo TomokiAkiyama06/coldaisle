@@ -1119,7 +1119,7 @@ def test_invariant_8_c_the_report_records_the_versions_and_configs_it_used(
     assert provenance.evaluation_config_sha256 == context.config_sha256
     assert provenance.versions.model_versions == ("thermal-v1",)
     assert provenance.versions.model_artifacts == ("a" * 64,)
-    assert provenance.versions.control_schema_versions == (6,)
+    assert provenance.versions.control_schema_versions == (8,)
     assert provenance.outcome_match_tolerance_ms == (
         context.control.policy.shadow.outcome_match_tolerance_ms.value
     )
