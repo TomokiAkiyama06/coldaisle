@@ -15,15 +15,18 @@ from __future__ import annotations
 
 import argparse
 import logging
+import sqlite3
+from collections.abc import Iterator
+from contextlib import contextmanager
 from hashlib import sha256
 from pathlib import Path
 from typing import Annotated, Any, Literal, Self
+from urllib.parse import quote
 
 import yaml
 from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, model_validator
 
 from coldaisle import logs
-from coldaisle.clock import WallClock
 from coldaisle.control.acoustic import ConfiguredAcousticCostModel
 from coldaisle.control.config import ControlConfig
 from coldaisle.control.evaluation import (
@@ -36,8 +39,8 @@ from coldaisle.control.evaluation import (
 from coldaisle.control.schema import ControlTick
 from coldaisle.control.shadow import OutcomeObservation, read_shadow_jsonl
 from coldaisle.metrics import MetricCatalog
-from coldaisle.store import QualityRules, SqliteStore
-from coldaisle.store.models import ControlTraceRecord
+from coldaisle.store import migrations
+from coldaisle.store.models import ControlTraceRecord, Quality, SeriesPoint, validate_metric
 
 LOGGER = logging.getLogger("coldaisle.evaluate")
 
@@ -96,8 +99,125 @@ class RunsManifest(_Manifest):
         return cls.model_validate(loaded)
 
 
+EVIDENCE_MIGRATION = "control_traces"
+"""評価が読む表が揃う migration の slug（`NNNN_<slug>.sql`）。
+
+`readings`（0001）と `control_traces`（0002）の両方が要る。**版を数字で写さず、
+migration の名前から引く**（写し元と食い違う上限を置かないため。0054 §2.6 と同じ規則）。
+"""
+
+
+def required_schema_version() -> int:
+    """評価に必要な最小の schema 版。**migration の並びから引く。**"""
+    for migration in migrations.discover():
+        if migration.path.stem.endswith(EVIDENCE_MIGRATION):
+            return migration.version
+    raise RuntimeError(f"{EVIDENCE_MIGRATION} の migration が見つからない")
+
+
+class EvidenceDatabaseError(RuntimeError):
+    """証拠の DB を読めない（存在しない・スキーマが古い / 新しい）。"""
+
+
+class EvidenceDatabase:
+    """評価が読む decision trace と観測。**読み取り専用で開く。**
+
+    `SqliteStore` は開くだけで WAL を設定し、未適用の migration を当て、path が
+    無ければ**作る**。証拠として読む DB をそれで開くと、評価が証拠を書き換えてしまう
+    （古い run の DB を開いた瞬間にスキーマが上がる）。ここでは sqlite の
+    `mode=ro` で開き、**版を確かめるだけで何も変えない**。
+    """
+
+    __slots__ = ("_conn", "_version")
+
+    def __init__(self, path: Path) -> None:
+        if not path.is_file():
+            # `mode=ro` は作らないが、理由が分かるメッセージで落とす。
+            raise EvidenceDatabaseError(f"証拠の DB が無い: {path}")
+        uri = f"file:{quote(str(path.resolve()))}?mode=ro"
+        try:
+            self._conn = sqlite3.connect(uri, uri=True, isolation_level=None)
+        except sqlite3.Error as exc:
+            raise EvidenceDatabaseError(f"証拠の DB を読み取り専用で開けない: {path}") from exc
+        self._conn.row_factory = sqlite3.Row
+        self._version = migrations.current_version(self._conn)
+        required = required_schema_version()
+        known = len(migrations.discover())
+        if self._version < required:
+            self.close()
+            raise EvidenceDatabaseError(
+                f"証拠の DB のスキーマが古い（version={self._version}; "
+                f"評価には {required} 以上が要る）。**評価は DB を書き換えないので、"
+                f"必要なら別の手段で移行する**: {path}"
+            )
+        if self._version > known:
+            self.close()
+            raise EvidenceDatabaseError(
+                f"証拠の DB がこのコードより新しい（version={self._version}; 既知={known}）: {path}"
+            )
+
+    @property
+    def schema_version(self) -> int:
+        """開いた時点の適用済み版。**変えていない。**"""
+        return self._version
+
+    @contextmanager
+    def snapshot(self) -> Iterator[None]:
+        """複数の読み出しを1つの読み取りトランザクションにまとめる。"""
+        self._conn.execute("BEGIN")
+        try:
+            yield
+        finally:
+            self._conn.execute("COMMIT")
+
+    def control_traces(self, start_ms: int, end_ms: int) -> tuple[ControlTraceRecord, ...]:
+        """`[start_ms, end_ms)` の decision trace（`SqliteStore` と同じ並び）。"""
+        if start_ms < 0 or end_ms < start_ms:
+            raise ValueError("control trace の期間が不正")
+        rows = self._conn.execute(
+            "SELECT ts_ms, tick_id, schema_version, trace_json FROM control_traces "
+            "WHERE ts_ms >= ? AND ts_ms < ? ORDER BY ts_ms, tick_id",
+            (start_ms, end_ms),
+        ).fetchall()
+        return tuple(
+            ControlTraceRecord(
+                ts_ms=row["ts_ms"],
+                tick_id=row["tick_id"],
+                schema_version=row["schema_version"],
+                trace_json=row["trace_json"],
+            )
+            for row in rows
+        )
+
+    def series(self, metric: str, start_ms: int, end_ms: int) -> tuple[SeriesPoint, ...]:
+        """`[start_ms, end_ms)` の生データ。**品質は保存された値をそのまま読む。**"""
+        validate_metric(metric)
+        if start_ms < 0 or end_ms < start_ms:
+            raise ValueError("観測の期間が不正")
+        rows = self._conn.execute(
+            "SELECT ts_ms, value, quality FROM readings "
+            "WHERE metric = ? AND ts_ms >= ? AND ts_ms < ? ORDER BY ts_ms",
+            (metric, start_ms, end_ms),
+        ).fetchall()
+        return tuple(
+            SeriesPoint(
+                ts_ms=int(row["ts_ms"]), value=row["value"], quality=Quality(row["quality"])
+            )
+            for row in rows
+        )
+
+    def close(self) -> None:
+        self._conn.close()
+
+    def __enter__(self) -> EvidenceDatabase:
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self.close()
+
+
 def load_run(
-    store: SqliteStore, spec: RunSpec, *, context: EvaluationContext, base: Path
+    store: EvidenceDatabase, spec: RunSpec, *, context: EvaluationContext, base: Path
 ) -> EvaluationRun:
     """1つの run の trace と観測を読む。**必要な metric は記録から決める。**
 
@@ -200,7 +320,6 @@ def build_parser() -> argparse.ArgumentParser:
         help="fan-hardware.yaml / safety.yaml / fan-policy.yaml のあるディレクトリ",
     )
     parser.add_argument("--metrics", type=Path, default=Path("config/metrics.yaml"))
-    parser.add_argument("--quality-rules", type=Path, default=Path("config/quality.yaml"))
     parser.add_argument(
         "--acoustic",
         type=Path,
@@ -223,17 +342,12 @@ def main(argv: list[str] | None = None) -> int:
         metrics_path=args.metrics,
         acoustic_path=args.acoustic,
     )
-    store = SqliteStore(
-        args.db, rules=QualityRules.from_yaml(args.quality_rules), clock=WallClock()
-    )
-    try:
-        with store.read_snapshot():
-            runs = [
-                load_run(store, spec, context=context, base=args.runs.parent)
-                for spec in manifest.runs
-            ]
-    finally:
-        store.close()
+    # **証拠の DB は読み取り専用で開く。** `SqliteStore` は開くだけで WAL を設定し、
+    # 未適用の migration を当て、path が無ければ作る。
+    with EvidenceDatabase(args.db) as store, store.snapshot():
+        runs = [
+            load_run(store, spec, context=context, base=args.runs.parent) for spec in manifest.runs
+        ]
 
     report = evaluate(runs, context=context)
     path = write(report, args.out)
@@ -245,6 +359,7 @@ def main(argv: list[str] | None = None) -> int:
                 "runs": len(report.provenance.runs),
                 "segments": len(report.segments),
                 "conditions_sha256": report.provenance.conditions_sha256,
+                "db_schema_version": store.schema_version,
                 "gates": {gate.arm_key: gate.outcome.value for gate in report.gates},
             }
         },

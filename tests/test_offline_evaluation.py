@@ -1437,8 +1437,6 @@ def test_the_cli_writes_a_deterministic_report(tmp_path: Path) -> None:
         str(directory),
         "--metrics",
         str(METRICS_YAML),
-        "--quality-rules",
-        str(ROOT / "config" / "quality.yaml"),
         "--out",
         str(out),
     ]
@@ -2078,3 +2076,111 @@ def test_invariant_14_e_thin_temperature_evidence_blocks_the_gate(
     coverage = next(item for item in gate.conditions if item.name == "temperature_sample_coverage")
     assert coverage.outcome is GateOutcome.BLOCKED
     assert gate.blocking_stage is GateStage.EVIDENCE
+
+
+# ------- 不変条件 15: 証拠の無い run と、証拠の DB の書き換え（Codex レビュー第4回）
+
+
+def test_invariant_15_a_a_run_without_any_tick_is_refused(
+    context: EvaluationContext,
+) -> None:
+    """**decision trace が1つも無い run を黙って通さない**（決定記録 0054 §2.5）。
+
+    segment も gate も作られないので、その run は報告のどこにも現れず、ほかの run
+    だけで `pass` が出てしまう（tick の無い segment を拒むのと同じ理由）。
+    """
+    traces, observations = plan_following_run(ticks=3)
+    with pytest.raises(EvaluationInputError, match="decision trace が1つも無い"):
+        evaluate(
+            [
+                run_of(traces, observations, run_id="pr91-has-ticks"),
+                run_of([], [], run_id="pr91-empty"),
+            ],
+            context=context,
+        )
+
+
+def _evidence_db(path: Path, *, versions: int | None = None) -> None:
+    """指定した版まで migration を当てた DB を作る（評価の入口を試すため）。"""
+    import shutil
+    import sqlite3
+
+    from coldaisle.store import migrations
+
+    directory = path.parent / f"pr91-migrations-{path.stem}"
+    directory.mkdir(parents=True, exist_ok=True)
+    for migration in migrations.discover():
+        if versions is not None and migration.version > versions:
+            break
+        shutil.copy(migration.path, directory / migration.path.name)
+    conn = sqlite3.connect(path, isolation_level=None)
+    try:
+        migrations.apply_pending(conn, now_ms=TICK_TS_MS, directory=directory)
+    finally:
+        conn.close()
+
+
+def test_invariant_15_b_an_old_schema_evidence_db_is_not_migrated(tmp_path: Path) -> None:
+    """**証拠の DB を開くだけで書き換えない。** 古ければ理由を言って落とす。"""
+    import sqlite3
+
+    from coldaisle.evaluate import (
+        EvidenceDatabase,
+        EvidenceDatabaseError,
+        required_schema_version,
+    )
+    from coldaisle.store import migrations
+
+    db = tmp_path / "pr91-old.db"
+    _evidence_db(db, versions=required_schema_version() - 1)
+    before = db.read_bytes()
+
+    with pytest.raises(EvidenceDatabaseError, match="スキーマが古い"):
+        EvidenceDatabase(db)
+
+    conn = sqlite3.connect(db)
+    try:
+        assert migrations.current_version(conn) == required_schema_version() - 1
+    finally:
+        conn.close()
+    assert db.read_bytes() == before, "開いただけで DB を書き換えない"
+
+
+def test_invariant_15_c_a_missing_evidence_db_is_not_created(tmp_path: Path) -> None:
+    """**path が無ければ作らずに落とす。** 空の DB を作って「証拠が無い」にしない。"""
+    from coldaisle.evaluate import EvidenceDatabase, EvidenceDatabaseError
+
+    missing = tmp_path / "pr91-missing.db"
+    with pytest.raises(EvidenceDatabaseError, match="証拠の DB が無い"):
+        EvidenceDatabase(missing)
+    assert not missing.exists()
+
+
+def test_invariant_15_d_the_evidence_database_cannot_write(tmp_path: Path) -> None:
+    """読み取り専用で開く。**書き込みは sqlite が拒む。**"""
+    import sqlite3
+
+    from coldaisle.evaluate import EvidenceDatabase
+
+    db = tmp_path / "pr91-ro.db"
+    _evidence_db(db)
+    with EvidenceDatabase(db) as store, pytest.raises(sqlite3.OperationalError):
+        store._conn.execute(
+            "INSERT INTO readings (metric, ts_ms, value, quality) VALUES (?, ?, ?, ?)",
+            ("air.room", TICK_TS_MS, 24.0, "ok"),
+        )
+
+
+def test_the_required_schema_version_is_read_from_the_migrations(tmp_path: Path) -> None:
+    """**必要な版を数字で写さない。** migration の名前から引く。"""
+    from coldaisle.evaluate import EVIDENCE_MIGRATION, required_schema_version
+    from coldaisle.store import migrations
+
+    named = [
+        migration
+        for migration in migrations.discover()
+        if migration.path.stem.endswith(EVIDENCE_MIGRATION)
+    ]
+    assert len(named) == 1
+    assert required_schema_version() == named[0].version
+    del tmp_path

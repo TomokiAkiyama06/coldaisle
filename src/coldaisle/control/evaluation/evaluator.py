@@ -460,7 +460,13 @@ def _segments(
 ) -> tuple[_Segment, ...]:
     """run を順序付き・重ならない segment に切る（0054 §2.5）。**最後が holdout。**"""
     if not ticks:
-        return ()
+        # **tick が1つも無い run を黙って通さない。** segment も gate も作られないので、
+        # その run は報告のどこにも現れず、ほかの run だけで `pass` が出てしまう
+        # （tick の無い segment を拒むのと同じ理由）。
+        raise EvaluationInputError(
+            f"{run.run_id}: 指定した期間に decision trace が1つも無い"
+            f"（評価する証拠が無い run を、黙って落とさない）"
+        )
     start_ms = ticks[0].ts_ms
     end_ms = ticks[-1].ts_ms + 1
     boundaries = tuple(sorted(set(run.split_boundaries_ms)))
