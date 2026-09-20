@@ -170,6 +170,7 @@ class LearnedMpcController:
         tick ごとに失敗させない。呼び出し側（runtime）はこれを
         ``LearnedFailure.MODEL_LOAD_FAILURE`` として Gate へ渡し、Fallback で運転を続ける。
         """
+        self._check_binding_matches_policy(binding, policy, assessor)
         self._binding = binding
         self._policy = policy
         self._safety = safety
@@ -182,6 +183,46 @@ class LearnedMpcController:
             budget_ms=policy.mpc.budget_ms,
             monotonic_ms=monotonic_ms,
         )
+
+    @staticmethod
+    def _check_binding_matches_policy(
+        binding: MpcModelBinding,
+        policy: FanPolicyConfig,
+        assessor: ConfidenceAssessor,
+    ) -> None:
+        """束縛・判定器・運転設定が**同じ前提で作られているか**を生成時に確かめる。
+
+        束縛を検証したときの authority stage と、いま動かす policy の stage が違うと、
+        Registry が SHADOW だけを許した artifact が FULL の経路へ入ってしまう。
+        `MpcModelBinding.authority_stage` が誰にも読まれないままだと、この食い違いは
+        「復帰 hold のあとに authority を得る」形で表に出る。
+        """
+        if binding.authority_stage is not policy.authority_stage:
+            raise MpcModelUnusableError(
+                "束縛時と運転中の authority stage が違う"
+                f"（binding={binding.authority_stage.value}; "
+                f"policy={policy.authority_stage.value}）"
+            )
+        if assessor.policy != policy.model_confidence:
+            # 別の設定で作った判定器を渡されると、閾値だけがすり替わる。
+            raise MpcModelUnusableError("Confidence 判定器が runtime と別の設定で作られている")
+        attestation = binding.attestation
+        profile = assessor.profile.binding
+        mismatches = [
+            name
+            for name, attested, fitted in (
+                ("model_id", attestation.model_id, profile.model_id),
+                ("model_version", attestation.version, profile.model_version),
+                ("artifact_sha256", attestation.artifact_sha256, profile.artifact_sha256),
+            )
+            if attested != fitted
+        ]
+        if mismatches:
+            # Profile は特定の artifact に対して作る。別の artifact のものを使うと、
+            # 学習範囲も residual の基準も違う値で confidence を出してしまう。
+            raise MpcModelUnusableError(
+                f"Confidence Profile が束縛した artifact のものではない: {','.join(mismatches)}"
+            )
 
     def propose(
         self,
@@ -300,6 +341,9 @@ class LearnedMpcController:
             for name, expected, actual in (
                 ("model_id", attestation.model_id, anchor.model_id),
                 ("model_version", attestation.version, anchor.model_version),
+                # **中身の hash まで見る。** ID と版が同じでも別の bytes へ委譲していれば、
+                # Registry が承認していない artifact が production の証拠の下で提案を出せる。
+                ("artifact_sha256", attestation.artifact_sha256, anchor.artifact_sha256),
                 ("input_action_ts_ms", observed.action_ts_ms, anchor.input_action_ts_ms),
             )
             if expected != actual

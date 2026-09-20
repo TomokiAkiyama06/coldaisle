@@ -65,6 +65,7 @@ from coldaisle.control.model.thermal import (
     ThermalFeatureSchema,
     ThermalPrediction,
     ThermalTargetSchema,
+    canonical_artifact_bytes,
 )
 from coldaisle.control.model_registry import (
     ApprovalAction,
@@ -163,6 +164,7 @@ class PlanningModel:
         forged_anchor_id: str | None = None,
         forged_offsets: tuple[int, ...] | None = None,
         forged_artifact_sha256: str | None = None,
+        forged_anchor_sha256: str | None = None,
         stale_plan: ActionPlan | None = None,
     ) -> None:
         self._base = base
@@ -179,6 +181,7 @@ class PlanningModel:
         self._forged_anchor_id = forged_anchor_id
         self._forged_offsets = forged_offsets
         self._forged_artifact_sha256 = forged_artifact_sha256
+        self._forged_anchor_sha256 = forged_anchor_sha256
         self._stale_plan = stale_plan
         self.plan_calls = 0
 
@@ -200,9 +203,11 @@ class PlanningModel:
     def predict(self, observed: ObservedThermalInput) -> ThermalPrediction:
         """anchor 推論。artifact の出どころだけ identity に合わせる。"""
         prediction = self._base.predict(observed)  # type: ignore[attr-defined]
-        return ThermalPrediction.model_validate(
-            prediction.model_dump(mode="python") | {"artifact_verification": self._verification}
-        )
+        overrides: dict[str, object] = {"artifact_verification": self._verification}
+        if self._forged_anchor_sha256 is not None:
+            # 「同じ ID / 版だが別の bytes へ委譲する model」の代役。
+            overrides["artifact_sha256"] = self._forged_anchor_sha256
+        return ThermalPrediction.model_validate(prediction.model_dump(mode="python") | overrides)
 
     def predict_plan(self, planned: PlannedThermalInput) -> PlanPrediction:
         """候補 action 列に対する単調な応答を返す。"""
@@ -286,6 +291,7 @@ def issue_attestation(
     kind: ArtifactKind = ArtifactKind.THERMAL_MODEL,
     stage: AuthorityStage = AuthorityStage.FULL,
     promoted: bool = True,
+    payload: bytes | None = None,
 ) -> ArtifactAttestation:
     """**本物の Model Registry（#104）に登録し、検証経路から attestation を受け取る。**
 
@@ -293,7 +299,9 @@ def issue_attestation(
     #84 に入るまでの置き換えとしての最小の JSON payload で、`ArtifactMetadata` の identity と
     schema version だけが #86 の束縛に効く。
     """
-    payload = json.dumps({"model": model_id, "version": version}, sort_keys=True).encode()
+    payload = (
+        payload or json.dumps({"model": model_id, "version": version}, sort_keys=True).encode()
+    )
     metadata = ArtifactMetadata(
         kind=kind,
         artifact_format=ArtifactFormat.JSON,
@@ -357,6 +365,9 @@ def trained(tmp_path_factory: pytest.TempPathFactory) -> Trained:
         tmp_path_factory.mktemp("pr151-registry") / "registry",
         model_id=model.manifest.model_id,
         version=model.manifest.model_version,
+        # **実際の #84 artifact bytes を登録する。** attestation の artifact hash が
+        # anchor 推論と Confidence Profile の hash と一致することまで試験で通す。
+        payload=canonical_artifact_bytes(model._artifact),
     )
     return model, profile, attestation
 
@@ -1772,18 +1783,44 @@ def test_an_expired_tick_never_spends_another_model_evaluation(trained) -> None:
     assert model.plan_calls == 0
 
 
-def test_an_anchor_prediction_from_another_model_is_refused(trained, tmp_path: Path) -> None:
-    """**anchor 推論も Registry の証拠へ束ねる。**
+def test_a_model_delegating_to_other_bytes_is_refused(trained) -> None:
+    """**ID と版が同じでも、別の bytes へ委譲する model の推論は使わない**（codex #4055635586）。
 
-    #85 は予測を Confidence Profile の binding と照合するが、Registry の証拠とは突き合わせない。
-    ここを見ないと、別の artifact が返した予測に今の tick の判定を付けてしまう。
+    Registry が承認したのは特定の bytes である。ID と版と schema version だけを合わせた
+    別 artifact が、production の証拠の下で提案を出せてはならない。
     """
+    base, _profile, attestation = trained
+    controller, _model, settings = build_controller(
+        trained, model=PlanningModel(base, forged_anchor_sha256="c" * 64)
+    )
+
+    result = propose(controller)
+
+    assert result.proposal is None
+    assert result.failure is LearnedFailure.OPTIMIZER_EXCEPTION
+    assert result.failure_reason is not None
+    assert "artifact_sha256" in result.failure_reason.detail
+
+    gate = ControllerGate(settings, expected_model_version=attestation.version)
+    selection = gate.select(
+        now_mono_ms=0,
+        fallback=fallback_proposal(0.4),
+        learned=result.to_status(received_at_mono_ms=0),
+        operating_mode=OperatingMode.AUTO,
+        safety_state=SafetyState.NORMAL,
+    )
+    assert selection.active_controller is ControllerKind.FALLBACK
+    assert "artifact_sha256" in selection.fallback_reason.detail  # type: ignore[union-attr]
+
+
+def test_an_anchor_from_another_model_version_is_refused(trained, tmp_path: Path) -> None:
+    """anchor の model 版が Registry の証拠と違えば、判定を付ける前に落とす。"""
     base, profile, _attestation = trained
-    # identity と attestation は 0.2.0 で揃うが、委譲先の #84 model は 0.1.0 を返す。
     attestation = issue_attestation(
         tmp_path / "other-version",
         model_id=base.manifest.model_id,
         version="0.2.0",
+        payload=canonical_artifact_bytes(base._artifact),
     )
     binding = MpcModelBinding.for_control(
         PlanningModel(base, model_version="0.2.0"),
@@ -1792,18 +1829,148 @@ def test_an_anchor_prediction_from_another_model_is_refused(trained, tmp_path: P
         expected_model_version=attestation.version,
     )
     settings = mpc_policy()
+    # Profile は 0.1.0 に対して作ったので、生成時の照合で落ちる（tick ごとに失敗させない）。
+    with pytest.raises(MpcModelUnusableError, match="Confidence Profile"):
+        LearnedMpcController(
+            binding,
+            settings,
+            safety(),
+            cost_model=MpcCostModel(settings.mpc.optimizer),
+            assessor=ConfidenceAssessor(profile, settings.model_confidence),
+            monotonic_ms=ScriptedClock(0),
+        )
+
+
+def test_the_binding_authority_must_match_the_running_policy(trained) -> None:
+    """**Registry が SHADOW だけを許した artifact を FULL の経路へ入れない**（codex #4055635582）。
+
+    束縛時の stage が誰にも読まれないままだと、食い違いは「復帰 hold のあとに authority を
+    得る」形でしか表に出ない。生成時に拒む。
+    """
+    base, profile, attestation = trained
+    shadow_binding = MpcModelBinding.for_control(
+        PlanningModel(base),
+        attestation=attestation,
+        authority_stage=AuthorityStage.SHADOW,
+        expected_model_version=attestation.version,
+    )
+    full_policy = mpc_policy(authority="full")
+
+    with pytest.raises(MpcModelUnusableError, match="authority stage"):
+        LearnedMpcController(
+            shadow_binding,
+            full_policy,
+            safety(),
+            cost_model=MpcCostModel(full_policy.mpc.optimizer),
+            assessor=ConfidenceAssessor(profile, full_policy.model_confidence),
+            monotonic_ms=ScriptedClock(0),
+        )
+
+    # 揃っていれば通る。
+    shadow_policy = mpc_policy(authority="shadow")
     controller = LearnedMpcController(
-        binding,
-        settings,
+        shadow_binding,
+        shadow_policy,
         safety(),
-        cost_model=MpcCostModel(settings.mpc.optimizer),
-        assessor=ConfidenceAssessor(profile, settings.model_confidence),
+        cost_model=MpcCostModel(shadow_policy.mpc.optimizer),
+        assessor=ConfidenceAssessor(profile, shadow_policy.model_confidence),
         monotonic_ms=ScriptedClock(0),
     )
+    assert propose(controller).proposal is not None
 
-    result = propose(controller)
 
-    assert result.proposal is None
-    assert result.failure is LearnedFailure.OPTIMIZER_EXCEPTION
-    assert result.failure_reason is not None
-    assert "model_version" in result.failure_reason.detail
+def test_a_confidence_assessor_from_another_policy_is_refused(trained) -> None:
+    """閾値だけがすり替わった判定器を受け取らない（同じ種類の取り違え）。"""
+    base, profile, attestation = trained
+    settings = mpc_policy()
+    other = settings.model_confidence.model_copy(
+        update={
+            "high_min_confidence": settings.model_confidence.high_min_confidence.model_copy(
+                update={"value": 0.99}
+            )
+        }
+    )
+    binding = MpcModelBinding.for_control(
+        PlanningModel(base),
+        attestation=attestation,
+        authority_stage=settings.authority_stage,
+        expected_model_version=attestation.version,
+    )
+
+    with pytest.raises(MpcModelUnusableError, match="Confidence 判定器"):
+        LearnedMpcController(
+            binding,
+            settings,
+            safety(),
+            cost_model=MpcCostModel(settings.mpc.optimizer),
+            assessor=ConfidenceAssessor(profile, other),
+            monotonic_ms=ScriptedClock(0),
+        )
+
+
+ATTESTATION_FIELD_CHECKS: dict[str, str] = {
+    "kind": "for_control: thermal_model 以外を拒む",
+    "model_id": "for_control: identity と照合 / _check_anchor: anchor と照合",
+    "version": "for_control: identity と期待版 / _check_anchor / _check_prediction",
+    "artifact_sha256": "_check_anchor: anchor と照合 / 生成時: Confidence Profile と照合",
+    "feature_schema_version": "for_control: model.feature_schema と照合",
+    "target_schema_version": "for_control: model.target_schema と照合",
+    "authority_compatibility": "for_control: 要求 stage が含まれるか",
+    "status": "for_control: production_active と一緒に判断",
+    "production_active": "for_control: production pointer 以外を拒む",
+    "model_version": "trace 用の派生値（model_id@version）。個別の照合は上の2つ",
+    "registry_revision": "trace のみ。推論時に対応する申告が無い",
+    "trace_metadata": "trace 出力（#82）",
+}
+"""attestation が持つ値ごとに、**どこで模型の申告と突き合わせているか**。
+
+新しい値を #104 が足したときに、照合を書き忘れたまま通らないようにする。
+"""
+
+
+def test_every_attested_value_has_a_place_where_it_is_compared() -> None:
+    """**証拠に載っている値を、照合しないまま増やさない。**
+
+    attestation の公開項目が増えたらこの試験が落ちる。落ちたら、その値を推論時の申告と
+    突き合わせる場所を決めてから表に足す（決定記録 0052 §2.1）。
+    """
+    public = {name for name in dir(ArtifactAttestation) if not name.startswith("_")}
+
+    assert public == set(ATTESTATION_FIELD_CHECKS)
+
+
+def test_the_policy_values_with_a_binding_counterpart_are_compared(trained) -> None:
+    """運転設定と束縛の対応を、生成時にすべて突き合わせていること。
+
+    - `authority_stage` ↔ `binding.authority_stage`
+    - `model_confidence` ↔ 判定器の設定
+    - `mpc.optimizer` の horizon / step / cost_metrics ↔ model の target schema
+    """
+    base, profile, attestation = trained
+    settings = mpc_policy()
+    binding = MpcModelBinding.for_control(
+        PlanningModel(base),
+        attestation=attestation,
+        authority_stage=settings.authority_stage,
+        expected_model_version=attestation.version,
+    )
+
+    def build(policy_config: FanPolicyConfig) -> LearnedMpcController:
+        return LearnedMpcController(
+            binding,
+            policy_config,
+            safety(),
+            cost_model=MpcCostModel(policy_config.mpc.optimizer),
+            assessor=ConfidenceAssessor(profile, policy_config.model_confidence),
+            monotonic_ms=ScriptedClock(0),
+        )
+
+    assert build(settings) is not None
+    with pytest.raises(MpcModelUnusableError, match="authority stage"):
+        build(mpc_policy(authority="expanded"))
+    with pytest.raises(MpcModelUnusableError, match="horizon"):
+        build(mpc_policy(step_ms=_provisional(7_000), horizon_ms=_provisional(7_000)))
+    with pytest.raises(MpcModelUnusableError, match="metric"):
+        build(
+            mpc_policy(cost_metrics={"cpu_temperature": "air.front_intake", "gpu_temperature": GPU})
+        )

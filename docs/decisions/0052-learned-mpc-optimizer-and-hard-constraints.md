@@ -72,6 +72,40 @@ attestation を必須の項目として持つため、**検証経路の外では
 （決定記録 0050 §3）。狙いは、検証していない artifact や別の artifact を取り違えて制御経路へ
 渡す**配線の誤り**を、レビューではなく型で止めることである。
 
+#### 証拠に載っている値は、推論時の申告と必ず突き合わせる
+
+証拠だけを持っていても、その証拠が**いま動かしているモデルのものか**は別の問題である。
+attestation の各項目に対して、突き合わせる場所を決める。
+
+| attestation の値 | どこで突き合わせるか |
+|---|---|
+| `kind` | `for_control`: `thermal_model` 以外を拒む |
+| `model_id` | `for_control`: モデルの申告と照合 / `_check_anchor`: anchor 推論と照合 |
+| `version` | `for_control`: 申告と runtime の期待 / `_check_anchor` / `_check_prediction` / Gate |
+| `artifact_sha256` | `_check_anchor`: anchor 推論と照合 / 生成時: Confidence Profile の binding と照合 |
+| `feature_schema_version` | `for_control`: `model.feature_schema` と照合 |
+| `target_schema_version` | `for_control`: `model.target_schema` と照合 |
+| `authority_compatibility` | `for_control`: 要求 stage が含まれるか |
+| `status` / `production_active` | `for_control`: production pointer 以外を拒む |
+| `registry_revision` | 記録のみ（推論時に対応する申告が無い） |
+
+**ID と版だけの一致では足りない。** 同じ ID と版で別の bytes へ委譲するモデルは、production の
+証拠の下で提案を出せてしまう。anchor 推論の `artifact_sha256` まで突き合わせ、合わなければ
+判定を付ける前に落とす。Confidence Profile も特定の artifact に対して作るものなので、束縛した
+artifact のものであることを**生成時に**確かめる（学習範囲も residual の基準も artifact ごとに違う）。
+
+#### 束縛と運転設定は同じ前提で作る
+
+`MpcModelBinding` は authority stage を指定して検証する。その stage と、いま動かす
+`FanPolicyConfig.authority_stage` が違うと、Registry が SHADOW だけを許した artifact が FULL の
+経路へ入る。**`LearnedMpcController` の生成時に両者の一致を要求する。** 同じ理由で、
+Confidence 判定器が runtime と同じ `model_confidence` 設定で作られていることも確かめる。
+
+`ControllerGate`（#79）は束縛を受け取らない（`control/fallback` が `control/mpc` を import すると
+循環する）。したがって stage の一致は束縛と設定の両方が揃っている controller 側で担保し、
+runtime は**検証済みの `ControlConfig.policy` を controller と Gate の両方へ同じものとして渡す**。
+Gate へ渡す `expected_model_version` も `MpcModelBinding.model_version`（= attestation の版）から取る。
+
 `capability` だけは #104 の `ArtifactMetadata` がまだ持たないため、いまはモデルの申告を読む。
 現行の artifact 形式は `observational_replay` しか表現できず active 制御へ届かないので、実害は
 無い。反実仮想 artifact を #84 が定義するときに #104 の metadata へ capability を持たせ、
