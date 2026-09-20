@@ -1,7 +1,7 @@
 # 決定記録 0056: Thermal Model の drift 検知の置き場所と再学習の条件
 
 - **種別**: Decision Record
-- **Status**: Proposed
+- **Status**: FINAL（2026-09-20、リポジトリ所有者が承認）
 - **Date**: 2026-09-20
 - **Supersedes**: [`0053-control-shadow-mode-and-counterfactual-logging.md`](0053-control-shadow-mode-and-counterfactual-logging.md)
   §2.3 のうち、**照合結果（`ShadowOutcome`）に残す照合条件の範囲だけ**。0053 は時刻の許容幅
@@ -240,7 +240,9 @@ missing_pattern: { warning_fraction: {...}, degraded_fraction: {...} }
   識別したのか分からない結果が「運用の幅で作られた」ものとして通る
 - export 1行の版を **1 → 2** に上げる。v1 の行は読み込みで落ちる
 
-**この節の変更は #90 / #91 の記録の形に触れる。** 0056 の承認と**一緒に所有者の承認が要る**。
+**この節の変更は #90 / #91 の記録の形に触れる。** 本記録の承認（2026-09-20）に
+**この節も含まれている**（所有者が、識別の許容幅の記録・export の版 1 → 2・古い形の記録を
+受け取らないことを承認した）。
 
 ## 3. Consequences
 
@@ -287,5 +289,12 @@ missing_pattern: { warning_fraction: {...}, degraded_fraction: {...} }
 | 5 | drift の判定を降格（authority stage を下げる）の根拠に使うか | #92 |
 | 6 | `DeclaredChange` を運用メモリ（`memory/`）や event 入口（0045）から読む配線 | 別 issue |
 
+本記録は 2026-09-20 にリポジトリ所有者が承認して FINAL になった。承認の対象は
+**層の分離（runtime は 0050 のまま）・証拠の規則・coverage の扱い・再学習の条件**、および
+**2.9 の記録内容の拡張**（0053 §2.3 の照合条件の範囲だけを置き換える）である。
+
 **本記録は値を決めない。** 2.8 の設定値は出発点であり、確定には基準となる測定と
-**リポジトリ所有者の承認**が要る。安全系・制御系の設計変更は人間レビューを必須とする（AGENTS.md）。
+**所有者の承認**が要る（上の未決事項 1）。上の未決事項と provisional な設定値は、
+**確定するまで開いたままである**。安全系・制御系の設計変更は、実装担当モデルに関係なく
+人間レビューを必須とする（AGENTS.md）。**§2 の決定が変わるときは、書き換えずに新しい記録を
+作る**（`docs/decisions/README.md`「追記のみ」）。
