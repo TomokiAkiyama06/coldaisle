@@ -17,6 +17,7 @@ from coldaisle.control.shadow.export import (
 )
 from coldaisle.control.shadow.outcome import (
     AppliedActionTimeline,
+    AppliedInterval,
     ObservationIndex,
     OutcomeMatch,
     OutcomeObservation,
@@ -30,6 +31,7 @@ from coldaisle.control.shadow.record import ShadowRecorder, shadow_plan, shadow_
 __all__ = [
     "SHADOW_EXPORT_SCHEMA_VERSION",
     "AppliedActionTimeline",
+    "AppliedInterval",
     "ControlTraceRow",
     "ObservationIndex",
     "OutcomeMatch",

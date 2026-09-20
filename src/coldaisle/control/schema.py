@@ -420,6 +420,23 @@ class ControllerProposal(_Frozen):
         return self
 
 
+def proposal_digest(proposal: ControllerProposal) -> str:
+    """1つの提案そのものを表す SHA-256。
+
+    **推論の識別子では提案を特定できない。** 同じ anchor 推論（同じ入力・同じ予測）からは、
+    別の候補 demand を持つ提案をいくつでも作れる。Gate が評価した提案と、記録しようとしている
+    提案が同じものかを照らすために、提案の canonical JSON 全体で識別する（#90 / 決定記録 0053）。
+    """
+    payload = json.dumps(
+        proposal.model_dump(mode="json"),
+        ensure_ascii=False,
+        allow_nan=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
 class ConfidenceLevel(StrEnum):
     """Gate が confidence から決める tick ごとの authority 区分（決定記録 0050 §2.4）。"""
 

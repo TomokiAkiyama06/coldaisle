@@ -39,6 +39,7 @@ from coldaisle.control.schema import (
     ShadowRecord,
     SupervisorOutput,
     Zone,
+    proposal_digest,
 )
 
 
@@ -149,6 +150,7 @@ class ShadowRecorder:
 
         counterfactuals: list[ShadowCounterfactual] = []
         if learned is not None and applied is not ControllerKind.LEARNED_MPC:
+            self._check_candidate(learned, selection)
             counterfactuals.append(self._learned(learned, selection.model_gate))
         if applied is ControllerKind.LEARNED_MPC:
             # Learned MPC が active の tick では、Baseline のほうが counterfactual になる。
@@ -170,6 +172,23 @@ class ShadowRecorder:
             counterfactuals=tuple(counterfactuals),
             supervisor=supervisor,
         )
+
+    @staticmethod
+    def _check_candidate(learned: MpcProposal, selection: ControllerSelection) -> None:
+        """記録しようとしている提案が、**Gate が評価した候補そのもの**か確かめる。
+
+        推論の識別子だけでは足りない。同じ anchor 推論からは別の候補 demand を持つ提案を
+        いくつでも作れるので、それだけで照合すると「Gate が退けたのはこの提案」と言えない。
+        Gate が残した候補の識別子（``ControllerSelection.candidate_digest``）と突き合わせる。
+        """
+        if learned.proposal is None:
+            if selection.candidate_digest is not None:
+                raise ValueError("Gate は候補を評価しているのに、記録側は提案を持っていない")
+            return
+        if selection.candidate_digest is None:
+            raise ValueError("Gate が評価した候補の識別子が無い提案は記録しない")
+        if proposal_digest(learned.proposal) != selection.candidate_digest:
+            raise ValueError("Gate が評価した候補と別の提案を counterfactual にしようとしている")
 
     @staticmethod
     def _learned(learned: MpcProposal, gate: ModelGateDecision | None) -> ShadowCounterfactual:

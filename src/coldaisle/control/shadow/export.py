@@ -164,10 +164,16 @@ def _outcomes(
 
 
 def write_shadow_jsonl(rows: Iterable[ShadowExportRow], stream: TextIO) -> int:
-    """JSON Lines として書き出し、行数を返す。同じ入力からは同じ bytes になる。"""
+    """JSON Lines として書き出し、行数を返す。同じ入力からは同じ bytes になる。
+
+    **無い値は書かない**（``exclude_none``）。採点していない結果に ``"error": null`` を
+    書くと、0 と区別できない形で「誤差の欄がある」ように見えてしまう。値があることが
+    そのまま意味になるよう、None の欄は出力から落とす（決定記録 0053 §2.4）。
+    省略された欄は既定値（None）として読み戻せる。
+    """
     written = 0
     for row in rows:
-        stream.write(row.model_dump_json())
+        stream.write(row.model_dump_json(exclude_none=True))
         stream.write("\n")
         written += 1
     return written

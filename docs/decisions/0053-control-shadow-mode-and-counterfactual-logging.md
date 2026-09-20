@@ -52,7 +52,7 @@ authority stage が `SHADOW` の間、Learned MPC と RL Supervisor の提案は
 | 記録 | 出どころ | 決して使わないもの |
 |---|---|---|
 | 適用した controller / effective demand | Critical Safety の合成結果 | 制御器の requested |
-| MPC の requested demand | `ControllerProposal`（Gate が選ばなかったもの） | — |
+| MPC の requested demand | `ControllerProposal`（**Gate が評価した候補そのもの**） | 同じ推論から作った別の候補 |
 | Supervisor の strategy / weights / target band | **その tick の `SupervisorDecision` に実在する** `SupervisorOutput` | 別 tick の戦略 |
 | 評価した候補 plan | `MpcSolution.plan`（step ごとの demand をそのまま） | 要求値からの復元 |
 | 予測した future | `MpcSolution.prediction`（`plan_digest` と `inference_id` 付き） | 記録時に引き直した予測 |
@@ -61,6 +61,13 @@ authority stage が `SHADOW` の間、Learned MPC と RL Supervisor の提案は
 | worker の失敗（model 読込・例外） | `LearnedFailure` と worker の理由 | 省略 |
 
 裏づけの無い（`attested=False`）記録には confidence も ood も**書かない**（0050 §2.5 と同じ規則）。
+
+**記録する提案は「Gate が評価した候補そのもの」に束ねる。** 推論の識別子（`inference_id`）は
+入力と予測を指すだけで、そこから作れる候補 demand は1つではない。それだけで照合すると、
+同じ anchor 推論から作った**別の提案**を「Gate が退けたのはこれ」として残せてしまう。
+Gate は評価した候補の canonical JSON の SHA-256（`proposal_digest`）を選択結果に残し、記録側は
+それと一致しない提案を**記録しない**（fail closed）。この照合は記録を作る時点で行う。保存後の
+trace から数え直せる形ではないため、同一プロセス内の偽造までは防げない（0050 §3 と同じ境界）。
 
 **予測は「どの候補 action に対するものか」まで束ねる。** 版・推論・artifact が合っていても、
 それだけでは plan A の要求に plan B の予測を貼れてしまう（同じ tick の候補は step の刻みが同じ）。
@@ -88,8 +95,12 @@ Safety が決めた別の値）が掛かっていた区間の実測と引き算�
   action 時刻）。その区間に**記録がある tick** の effective demand を見る
 - zone ごとに `|適用値 - plan の値| <= shadow.applied_demand_tolerance` なら、その step は
   「plan どおり実行された」とみなす
-- 区間に tick の記録が1つも無ければ `applied_action_unknown`、1つでも違えば
-  `applied_action_differs` として **`unidentifiable`** にする
+- **demand は次の tick まで掛かり続ける。** 区間の先頭が tick と揃っていなければ、最初の記録
+  までは直前の tick の値が掛かっている。この**持ち越し分も同じ規則で照らす**（区間の中の記録
+  だけを見ると、前の step の demand が効いていた前半を取りこぼす）
+- 区間に tick の記録が1つも無ければ `applied_action_unknown`（制御ループが回っていた証拠が
+  無い区間を「plan どおり」と決めつけない）、1つでも違えば `applied_action_differs` として
+  **`unidentifiable`** にする
 - `unidentifiable` でも**実測は残す**。誤差だけを出さない
 
 適用値は既存の記録から取る。`ControlTick` は zone ごとの effective demand を必ず持つので
@@ -107,6 +118,9 @@ Safety が決めた別の値）が掛かっていた区間の実測と引き算�
 - 突き合わせは3つの状態を**区別して**書く。`status: scored`（採点した）、
   `status: unidentifiable` + 理由（実測はあるが誤差を出さない）、出力ごとの `unmatched` + 理由
   （実測が無い）。採点していない結果に `error` は入らない
+- **値の無い欄は書かない**（`exclude_none`）。`"error": null` を書くと、0 と区別できない形で
+  「誤差の欄がある」ように見える。欄があること自体が意味になるようにし、省略した欄は既定値
+  （`null`）として読み戻せる。保存する decision trace の形（0030）は変えない。**export だけの規則**である
 - 採点の可否は**渡された trace の適用 demand だけ**で決める。horizon を覆う tick が範囲外なら
   `unidentifiable`（範囲を跨いで推定しない）
 - 入力は保存済み trace と観測で、**読み取りのみ**。同じ入力からは同じ bytes を出す
@@ -163,6 +177,9 @@ shadow:
 | 適用 action を問わず、予測と実測の差を「予測誤差」として残す | 制御器の違いとモデル誤差が混ざる。Shadow の提案は実行されていないので、その差は当たり外れではない |
 | 別の action の実測から反実仮想を推定して採点する | 因果推定はこの記録の範囲外。学習中のモデルの評価に、検証していない推定を重ねない |
 | 採点できない予測を export から落とす | 「予測が無かった」と「採点できなかった」を区別できなくなる。実測は残して区分で示す |
+| 区間の中の記録だけで適用 action を判定する | demand は次の tick まで掛かり続けるので、区間の前半に効いていた前の step の値を取りこぼす |
+| 記録する提案を `inference_id` だけで Gate の判断と結び付ける | 同じ推論から別の候補 demand の提案を作れる。「退けられたのはこれ」と言えない |
+| 採点していない欄に `null` を書く | 0 と区別できない形で誤差の欄が見える。無い値は書かない |
 | shadow 専用に confidence を計算し直す | #85 と二重になり、どちらが本物か分からなくなる。Gate の判定だけを写す |
 | 記録した予測を、あとで plan から引き直す | 探索に使った予測と別のものを記録しうる。採用した解と対で持つ |
 | 候補 plan を残さず、要求と offset から plan を組み直して digest を数える | v1 の「horizon 全体で同じ demand」に依存する。step ごとに違う demand を探索する版が入った瞬間、正しい記録まで閉じる |

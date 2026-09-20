@@ -19,13 +19,19 @@ from __future__ import annotations
 
 import ast
 import io
+import json
 from pathlib import Path
 
 import pytest
 from pydantic import ValidationError
 
 from coldaisle.control.config import ShadowConfig
-from coldaisle.control.fallback import ControllerGate, LearnedControlStatus, LearnedFailure
+from coldaisle.control.fallback import (
+    ControllerGate,
+    ControllerSelection,
+    LearnedControlStatus,
+    LearnedFailure,
+)
 from coldaisle.control.model.confidence import fit_confidence_profile
 from coldaisle.control.model.thermal import canonical_artifact_bytes
 from coldaisle.control.mpc import MpcProposal
@@ -60,6 +66,7 @@ from coldaisle.control.shadow import (
     ObservationIndex,
     OutcomeObservation,
     OutcomeStatus,
+    ShadowExportRow,
     ShadowOutcomeMatcher,
     ShadowOutcomeUnusableError,
     ShadowRecorder,
@@ -1451,3 +1458,171 @@ def test_invariant_10_g_identity_cannot_be_judged_with_another_plan() -> None:
             plan=other,
             applied=applied_for(other),
         )
+
+
+def varied_plan() -> ShadowActionPlan:
+    """step ごとに demand が変わる候補 plan（持ち越しの取りこぼしを試すため）。"""
+    return ShadowActionPlan(
+        step_ms=1_000,
+        steps=(
+            ShadowPlanStep(offset_ms=1_000, demands=demands(0.8)),
+            ShadowPlanStep(offset_ms=2_000, demands=demands(0.4)),
+        ),
+    )
+
+
+def varied_export(*, follow_up_ts_ms: int):
+    """step1=0.8 / step2=0.4 の plan を、後続 tick の時刻だけ変えて export する。"""
+    plan = varied_plan()
+    counterfactual = ShadowCounterfactual(
+        **solved_counterfactual(
+            plan=plan,
+            requested=plan.first,
+            prediction=prediction(plan=plan, action_ts_ms=SCORED_ACTION_TS_MS),
+        )
+    )
+    anchor = solved_shadow_tick(applied=0.8)
+    anchor = anchor.model_copy(
+        update={"shadow": anchor.shadow.model_copy(update={"counterfactuals": (counterfactual,)})}
+    )
+    ticks = (
+        ControlTick.model_validate(anchor.model_dump(mode="python")),
+        follow_up_tick(tick_id=2, ts_ms=follow_up_ts_ms, applied=0.4),
+    )
+    rows = list(
+        shadow_rows(
+            trace_rows(*ticks),
+            observations=[
+                observation(SCORED_ACTION_TS_MS + 1_000, 50.5),
+                observation(SCORED_ACTION_TS_MS + 2_000, 51.5),
+            ],
+            matcher=outcome_matcher(),
+        )
+    )
+    (row,) = rows
+    (outcome,) = row.outcomes
+    return outcome
+
+
+def test_invariant_10_h_the_demand_carried_into_an_interval_is_checked() -> None:
+    """**demand は次の tick まで掛かり続ける。** 区間の中の記録だけを見ると取りこぼす。
+
+    step1=0.8 / step2=0.4 の plan で、記録が 0ms(0.8) と 1500ms(0.4) しか無い場合、
+    step2 の前半（1000〜1500ms）に掛かっていたのは 0.8 である。区間の中だけを見ると
+    「0.4 が掛かっていた」と読めてしまうので、持ち越し分も照らす。
+    """
+    assert varied_export(follow_up_ts_ms=SCORED_ACTION_TS_MS + 1_500).status is (
+        OutcomeStatus.UNIDENTIFIABLE
+    )
+    # 区間の先頭に記録があれば、その値が先頭から掛かっている（持ち越しは置き換わる）。
+    assert varied_export(follow_up_ts_ms=SCORED_ACTION_TS_MS + 1_000).status is (
+        OutcomeStatus.SCORED
+    )
+
+
+def test_invariant_2_g_the_recorded_candidate_must_be_the_one_the_gate_saw() -> None:
+    """**同じ anchor 推論の別の提案**を、Gate が退けた候補として記録できない。
+
+    推論の識別子だけで照合すると、同じ入力・同じ予測から作った別の候補 demand の提案を
+    「Gate が退けたのはこれ」として残せてしまう。
+    """
+    evaluated = shadow_proposal(0.9)
+    selection = gate_selection(learned=learned_status(evaluated))
+    state = control_state(selection)
+    # 同じ推論・同じ assessment だが、要求した demand が違う提案。
+    another = shadow_proposal(0.5)
+    assert another.inference_id == evaluated.inference_id
+
+    with pytest.raises(ValueError, match="別の提案"):
+        ShadowRecorder(SHADOW_CONFIG).record(
+            tick_id=7,
+            ts_ms=TICK_TS_MS,
+            state=state,
+            effective=demands(0.4),
+            selection=selection,
+            baseline=fallback_proposal(0.4),
+            learned=mpc_result(another),
+        )
+
+    # Gate が見た候補そのものなら記録できる。
+    record = ShadowRecorder(SHADOW_CONFIG).record(
+        tick_id=7,
+        ts_ms=TICK_TS_MS,
+        state=state,
+        effective=demands(0.4),
+        selection=selection,
+        baseline=fallback_proposal(0.4),
+        learned=mpc_result(evaluated),
+    )
+    assert record is not None
+
+
+def test_invariant_2_h_a_selection_without_the_candidate_identity_is_refused() -> None:
+    """Gate の識別子を落とした選択結果では記録しない（fail closed）。"""
+    evaluated = shadow_proposal(0.9)
+    selection = gate_selection(learned=learned_status(evaluated))
+    state = control_state(selection)
+    stripped = ControllerSelection.model_validate(
+        selection.model_dump(mode="python") | {"candidate_digest": None, "model_gate": None}
+    )
+
+    with pytest.raises(ValueError, match="識別子が無い"):
+        ShadowRecorder(SHADOW_CONFIG).record(
+            tick_id=7,
+            ts_ms=TICK_TS_MS,
+            state=state,
+            effective=demands(0.4),
+            selection=stripped,
+            baseline=fallback_proposal(0.4),
+            learned=mpc_result(evaluated),
+        )
+
+
+def test_invariant_7_g_the_jsonl_omits_the_fields_that_have_no_value() -> None:
+    """**採点していない結果に `"error": null` を書かない。** 値があることが意味になる形にする。
+
+    scored / unidentifiable / unmatched の3状態が、欄の有無で読み分けられることを確かめる。
+    """
+    scored = _jsonl_outcome(applied=0.8)
+    assert scored["status"] == "scored"
+    assert "unidentifiable" not in scored
+    assert all("error" in match and "unmatched" not in match for match in scored["matches"])
+
+    unidentifiable = _jsonl_outcome(applied=0.4)
+    assert unidentifiable["status"] == "unidentifiable"
+    assert unidentifiable["unidentifiable"]["code"] == "applied_action_differs"
+    assert all("observed" in match and "error" not in match for match in unidentifiable["matches"])
+
+    unmatched = _jsonl_outcome(applied=0.8, observations=[])
+    assert all(
+        "observed" not in match and "error" not in match and "unmatched" in match
+        for match in unmatched["matches"]
+    )
+
+
+def _jsonl_outcome(*, applied: float, observations=None) -> dict:
+    """1行だけ書き出し、その行の outcome を JSON として返す（読み戻しも確かめる）。"""
+    ticks = (
+        solved_shadow_tick(applied=applied),
+        follow_up_tick(tick_id=2, ts_ms=SCORED_ACTION_TS_MS + 1_000, applied=applied),
+    )
+    rows = list(
+        shadow_rows(
+            trace_rows(*ticks),
+            observations=[
+                observation(SCORED_ACTION_TS_MS + 1_000, 50.5),
+                observation(SCORED_ACTION_TS_MS + 2_000, 51.5),
+            ]
+            if observations is None
+            else observations,
+            matcher=outcome_matcher(),
+        )
+    )
+    stream = io.StringIO()
+    assert write_shadow_jsonl(rows, stream) == 1
+    line = stream.getvalue().strip()
+    # 省略した欄は既定値として読み戻せる（意味を失わない）。
+    assert ShadowExportRow.model_validate_json(line) == rows[0]
+    payload = json.loads(line)
+    (outcome,) = payload["outcomes"]
+    return outcome

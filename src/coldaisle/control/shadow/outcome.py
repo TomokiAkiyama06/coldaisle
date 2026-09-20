@@ -148,11 +148,35 @@ class ShadowOutcome(_Frozen):
         return self.matched == len(self.matches)
 
 
+class AppliedInterval(_Frozen):
+    """ある区間に**掛かっていた** effective demand の全体。
+
+    demand は次の tick まで掛かり続けるので、区間の中の記録だけを見ると取りこぼす。
+    区間の先頭が tick と揃っていなければ、そこから最初の記録までは**直前の tick の値**が
+    掛かっている（``carried_in``）。
+    """
+
+    carried_in: tuple[int, PerZone[Demand]] | None = None
+    """区間の直前に記録された適用値（時刻付き）。区間の先頭まで掛かり続けていたもの。"""
+    inside: tuple[tuple[int, PerZone[Demand]], ...] = ()
+    """区間 ``[start, end)`` の中に記録がある適用値（時刻順）。"""
+
+    def in_force(self, *, start_ms: int) -> tuple[tuple[int, PerZone[Demand]], ...] | None:
+        """区間に掛かっていた値を時刻順に返す。先頭の値が分からなければ None。"""
+        if self.inside and self.inside[0][0] == start_ms:
+            # 区間の先頭に記録がある。直前の値はそこで置き換わっている。
+            return self.inside
+        if self.carried_in is None:
+            return None
+        return (self.carried_in, *self.inside)
+
+
 class AppliedActionTimeline:
     """各 tick で**実際に掛かった** effective demand の列（#82 の decision trace から作る）。
 
     counterfactual の予測を採点してよいかは、この列だけで決める。推定も補間もしない。
-    「その時刻に掛かっていた値」は、その区間に記録がある tick の effective demand そのものである。
+    ただし **demand は次の tick まで掛かり続ける**ので、区間の中の記録だけでなく、
+    直前の tick から持ち越された値も合わせて見る（``AppliedInterval``）。
     """
 
     __slots__ = ("_applied", "_timestamps")
@@ -162,11 +186,14 @@ class AppliedActionTimeline:
         self._applied = points
         self._timestamps = [ts_ms for ts_ms, _demands in points]
 
-    def covering(self, *, start_ms: int, end_ms: int) -> tuple[tuple[int, PerZone[Demand]], ...]:
-        """半開区間 ``[start, end)`` に記録がある tick の適用値を時刻順に返す。"""
+    def covering(self, *, start_ms: int, end_ms: int) -> AppliedInterval:
+        """半開区間 ``[start, end)`` に掛かっていた適用値を、持ち越し分とともに返す。"""
         low = bisect_left(self._timestamps, start_ms)
         high = bisect_left(self._timestamps, end_ms)
-        return tuple(self._applied[low:high])
+        return AppliedInterval(
+            carried_in=self._applied[low - 1] if low > 0 else None,
+            inside=tuple(self._applied[low:high]),
+        )
 
 
 class ObservationIndex:
@@ -311,6 +338,8 @@ class ShadowOutcomeMatcher:
         値と許容幅の中で一致していれば、その step は「plan どおり実行された」とみなす。
 
         - 区間に tick の記録が1つも無ければ、実行されたと**言えない**（採点しない）
+        - 区間の先頭が tick と揃っていなければ、最初の記録までは**直前の tick の demand**が
+          掛かっている。持ち越し分も同じ規則で照らす（区間の中だけを見ると取りこぼす）
         - 1つでも違う値が掛かっていれば、その差は制御器の違いであってモデル誤差ではない
         """
         action_ts_ms = prediction.input_action_ts_ms
@@ -319,13 +348,20 @@ class ShadowOutcomeMatcher:
             start_ms = action_ts_ms + previous_offset_ms
             end_ms = action_ts_ms + step.offset_ms
             previous_offset_ms = step.offset_ms
-            covering = applied.covering(start_ms=start_ms, end_ms=end_ms)
-            if not covering:
+            interval = applied.covering(start_ms=start_ms, end_ms=end_ms)
+            if not interval.inside:
+                # 区間の中に記録が無い。制御ループが回っていた証拠が無いので採点しない。
                 return Reason(
                     code="applied_action_unknown",
                     detail=f"[{start_ms}, {end_ms}) に適用 demand の記録が無い",
                 )
-            for ts_ms, demands in covering:
+            in_force = interval.in_force(start_ms=start_ms)
+            if in_force is None:
+                return Reason(
+                    code="applied_action_unknown",
+                    detail=f"{start_ms} の時点で掛かっていた demand の記録が無い",
+                )
+            for ts_ms, demands in in_force:
                 for zone in Zone:
                     planned = step.demands.get(zone)
                     actual = demands.get(zone)
@@ -334,6 +370,7 @@ class ShadowOutcomeMatcher:
                             code="applied_action_differs",
                             detail=(
                                 f"zone={zone.value}; ts_ms={ts_ms}; "
+                                f"carried_in={ts_ms < start_ms}; "
                                 f"applied={actual:.6f}; planned={planned:.6f}; "
                                 f"tolerance={self._demand_tolerance:.6f}"
                             ),
