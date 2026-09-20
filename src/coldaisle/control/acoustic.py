@@ -149,6 +149,15 @@ class AcousticModelConfig(_Frozen):
 class AcousticCostModel(Protocol):
     """MPC が optional に依存できる、demand を変更しない音響コスト API。"""
 
+    @property
+    def metadata(self) -> AcousticCostMetadata | None:
+        """再現に必要な出どころ（model ID・設定 hash）。無効な実装は ``None``。
+
+        任意依存を差し替えたことが offline 評価（#91 / #105）の条件 hash に出るように、
+        契約として公開する。値そのものは推定結果にも載る（``AcousticCostEstimate``）。
+        """
+        ...
+
     def estimate(self, demands: PerZone[Demand]) -> AcousticCostEstimate | None:
         """コストが利用可能なら返し、無効時は ``None`` を返す。"""
 
@@ -171,6 +180,11 @@ class ConfiguredAcousticCostModel:
             config_sha256=config_sha256,
             interaction_names=tuple(interaction.name for interaction in interactions),
         )
+
+    @property
+    def metadata(self) -> AcousticCostMetadata | None:
+        """設定から作った出どころ。条件 hash と推定結果の両方に載る。"""
+        return self._metadata
 
     @classmethod
     def from_file(
@@ -208,6 +222,11 @@ class ConfiguredAcousticCostModel:
 
 class DisabledAcousticCostModel:
     """音響コストを目的関数へ入れない場合の明示的な optional 実装。"""
+
+    @property
+    def metadata(self) -> AcousticCostMetadata | None:
+        """無効な実装なので出どころを持たない。"""
+        return None
 
     def estimate(self, demands: PerZone[Demand]) -> None:
         """モデルが無効なので常に ``None`` を返す。"""

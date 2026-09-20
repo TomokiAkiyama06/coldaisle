@@ -95,6 +95,40 @@ step を `supported=False` として数え、**観測も reward も作らない*
 scalar で受け取れると、記録された coverage と意味の違う幅で照合した結果を同じ表に
 並べられてしまう（0054 §2.6 と同じ規則）。
 
+#### 記録の再生が再現するもの／しないもの
+
+**再生は記録を作り直さない。** `LoggedFrame` は観測を `ObservedWindowFrame` として丸ごと持ち、
+再生はそれをそのまま window へ置く。
+
+| 記録された性質 | 再生が再現するか |
+|---|---|
+| 観測値 | **する。** 値を作り直さない |
+| 観測時刻（`ts_ms`）と metric ごとの `source_ts_ms` | **する。** 生成時刻で上書きしない |
+| `missing` / `stale` / `suspect` の mask | **する。** `OK` に倒さない |
+| 掛かっていた demand（`applied`） | **する。** 次の state も reward もこの値を使う |
+| 要求と記録の差（許容幅の中） | **しない。** 記録側が掛かっていた事実なので、要求は `requested` として別に残す |
+| 記録に無い action の結果 | **しない。** `supported=False` として数え、観測を作らない |
+| 記録に品質が無い場合 | **再現できないので受け取らない。** `LoggedFrame` の mask と `source_ts_ms` は必須で、既定値を持たない |
+| 読めていない cell（mask が立っている） | **採点に使わない。** reward が作れず、その step は `reward_unusable` で終端する |
+
+最後の2行が規則の要点である。**再現できないものは既定値で埋めず、拒否する。**
+品質の分からない記録を `Quality.OK` として再生すると、再生1 step 目から
+「実測の裏づけがある健全な観測」に見えてしまう。
+
+**観測の出どころは window ひとつだけ。** `DynamicsStep` は値の欄を持たず、環境は window の
+最後の frame から**使える cell だけ**を読む。値を別の欄でも返せると、mask と食い違う値を
+渡せてしまう。
+
+**掛かっていた action も window から取る。** 記録再生では要求が許容幅の分だけ記録と違いうる
+ので、要求をそのまま次の state にすると「掛かっている action」が2つになる。
+`StepRecord` は `requested`（MPC / Gate の出力）と `applied`（観測 window の action）を
+別の欄として持ち、**reward と次の state は `applied` を使う**（0052 §2.4 と同じ理由）。
+
+#### 学習 mode は dynamics が名乗る
+
+`TrainingMode` は `EpisodeSpec` の欄ではなく `EnvironmentDynamics.mode` から derive する。
+欄として持つと、記録再生を `learned_simulator` と書いた結果を作れてしまう。
+
 ### 2.3 近似 simulator は Registry の証拠を名乗れない（0052 の規律を環境にも置く）
 
 `DynamicsIdentity` の不変条件で、
@@ -136,7 +170,10 @@ scalar で受け取れると、記録された coverage と意味の違う幅で
 6. その証拠の `identity` が、いま dynamics が名乗っている identity と一致する
    （借りた証拠を別の identity に付けさせない）。`registry_attested` ならさらに
    `ArtifactAttestation` の kind / capability / model ID / 版 / artifact hash が identity と一致する
-7. **記録したすべての step の出どころが、その証拠が裏づける唯一の出どころと等しい**
+7. **記録したすべての step が採点でき（`supported`）、その出どころが、証拠が裏づける
+   唯一の出どころと等しい**。step が1つも無い episode も根拠にしない。
+   採点できなかった終端 step（記録が尽きた・controller が使えなかった）を飛ばして
+   「全部裏づけあり」と読まない
 
 #### step が持ちうる出どころは、すべて環境が検証済み入力から作ったものへ辿れる
 
@@ -216,10 +253,15 @@ floor を下回らせない）。起きたら設定か Baseline が壊れてい�
 ### 2.6 再現性と比較の鍵
 
 - `conditions_sha256` は **結果に効く依存をすべて覆う**（0054 §2.7 と同じ考え方）。
-  seed・workload trace・初期 window・初期 demand・reward 版・`rl-training.yaml` の hash・
+  seed・workload trace・初期 window・reward 版・`rl-training.yaml` の hash・
   **`fan-policy.yaml` と `safety.yaml` を丸ごと hash した値**（mpc.optimizer・authority stage・
   gate 閾値・復帰 hold・shadow の許容幅を欄ごとに数え落とさないため）・期待 model 版・
-  Learned MPC の有無・安全 screen・coverage 下限・action 空間を入れる
+  Learned MPC の有無・学習 mode・安全 screen・coverage 下限・action 空間を入れる
+- **controller は「期待する版」では特定できない。** 束縛した artifact の attestation
+  （model ID・版・artifact hash・lifecycle 状態・registry revision）、Confidence Profile の
+  hash と判定設定、任意依存（#94 Acoustic / #81 Air Balance）の出どころまでを
+  `LearnedMpcController.conditions()` から取って入れる。同じ版を名乗る別の artifact も、
+  別の Profile も、別の任意依存も、同じ入力から違う提案を作る
 - **`dynamics.identity` ではなく `dynamics.conditions()` を入れる。** 照合の許容幅や、
   hybrid が内側に持つ記録は identity に現れないのに結果を変える
 - **注入した依存は呼び出し側が名指しする。** Baseline の factory も Acoustic Model も
@@ -303,6 +345,12 @@ simulator: { model_id, model_version, responses: [...] }
 | 初期 demand を `EpisodeSpec` の欄として持つ | window の action と食い違う2つ目の「掛かっている action」ができ、片方だけが screen を通る |
 | Snapshot へ写すときに品質を `OK` へ丸める | 本物の Fallback が「使えない」とする値を環境だけが使い、環境と運転で別の demand が出る |
 | `history[-recent_history_steps:]` をそのまま使う | 0 のとき履歴が全件返る。0 は「渡さない」である |
+| 採点できなかった終端 step を出どころの照合から外す | 記録が尽きた区間を飛ばして「全部裏づけあり」と読める |
+| 記録と僅かに違う要求を、そのまま次の state の掛かっている action にする | window の action と食い違う2つ目の applied ができる |
+| 再生時に観測の時刻と品質 mask を作り直す | 1 step 目から stale / suspect が `OK` に見える。記録が品質を持たないなら受け取らない |
+| `DynamicsStep` に window とは別の値の欄を持たせる | mask と食い違う値を渡せる。観測の出どころは window ひとつにする |
+| `TrainingMode` を `EpisodeSpec` の欄にする | 記録再生を `learned_simulator` と書いた結果を作れる |
+| controller を `expected_model_version` だけで条件へ入れる | 同じ版の別 artifact・別 Profile・別の任意依存が、policy の差に見える |
 | 呼び出し側が渡した設定 hash だけを条件に入れる | 中身と食い違う hash を渡せる。検証済み設定 object からの hash も併せて入れる |
 | 記録照合の許容幅を呼び出し側から scalar で受け取る | 記録された coverage と意味の違う幅で照合した結果を、同じ表に並べられる（0054 §2.6） |
 | Baseline / Acoustic を条件 hash に載せない（factory は hash できないから） | 依存の差が policy の差に見える。名指しを必須にすれば載せられる |

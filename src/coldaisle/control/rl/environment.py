@@ -63,7 +63,6 @@ from coldaisle.control.rl.episode import (
     SafetyModel,
     StepRecord,
     TerminationReason,
-    TrainingMode,
     conditions_digest,
 )
 from coldaisle.control.rl.reward import (
@@ -141,6 +140,20 @@ def _snapshot_signal(metric: str, frame: ObservedWindowFrame, *, ts_ms: int) -> 
         source_ts_ms=source_ts,
         last_changed_mono_ms=source_ts,
         age_ms=max(0, ts_ms - source_ts) if source_ts is not None else None,
+    )
+
+
+def _window_demands(window: ObservedThermalInput) -> PerZone[Demand]:
+    """観測 window の action（= **実際に掛かっていた** demand）を返す。
+
+    #84 の観測 window は「その action が実際に掛かった結果の観測」なので、掛かっている
+    action の出どころはここしかない（決定記録 0052 §2.4）。
+    """
+    action = window.action
+    return PerZone[Demand](
+        front=action.front.effective_demand,
+        rear=action.rear.effective_demand,
+        top=action.top.effective_demand,
     )
 
 
@@ -224,11 +237,14 @@ class EpisodeSpec(_Frozen):
 
     **seed・dataset / model 版・workload trace・reward 版をすべて固定する**（#105 受入基準）。
     reward 版と model 版は環境が持ち、ここには episode ごとに変わるものだけを置く。
+
+    **学習 mode は欄として持たない。** 注入した dynamics（`EnvironmentDynamics.mode`）から
+    derive する。欄として持つと、記録再生を `learned_simulator` と書いた結果を作れてしまう
+    （決定記録 0058 §2.2）。
     """
 
     episode_id: str = Field(pattern=r"^[a-z0-9][a-z0-9_.-]*$", max_length=120)
     seed: int = Field(ge=0)
-    mode: TrainingMode
     trace: WorkloadTrace
     initial_window: ObservedThermalInput
     max_steps: int | None = Field(default=None, ge=1)
@@ -509,15 +525,19 @@ class SupervisorTrainingEnvironment:
         evidence = attested_evidence(self._dynamics)
         # すべての step が、その証拠が裏づける唯一の出どころから来ていること。
         # 近似の step を `logged_trajectory` と名乗らせても、証拠が無ければここで落ちる。
-        every_step_is_backed = evidence is not None and all(
-            step.provenance is evidence.provenance
-            for step in state.steps
-            if step.provenance is not None
+        # **採点できなかった step を飛ばさない。** 終端の1 step だけが採点できていない
+        # episode を「全部裏づけあり」と読むと、記録が尽きた区間が根拠に混ざる。
+        every_step_is_backed = (
+            evidence is not None
+            and bool(state.steps)
+            and all(
+                step.supported and step.provenance is evidence.provenance for step in state.steps
+            )
         )
         return EpisodeResult(
             episode_id=state.spec.episode_id,
             seed=state.spec.seed,
-            mode=state.spec.mode,
+            mode=self._dynamics.mode,
             safety_model=self.safety_model,
             policy=self._policy_kind,
             policy_version=self._policy_version,
@@ -707,8 +727,10 @@ class SupervisorTrainingEnvironment:
             )
 
         assert outcome.window is not None
+        # **観測の出どころは window ひとつ。** 使える cell だけを読む（mask を無視しない）。
+        observed = _frame_values(outcome.window)
         ceiling = self._safety.absolute_temp_ceiling_c.value
-        exceedances, margin = self._screen_temperatures(outcome.values)
+        exceedances, margin = self._screen_temperatures(observed)
         if margin is not None:
             state.minimum_margin_c = (
                 margin if state.minimum_margin_c is None else min(state.minimum_margin_c, margin)
@@ -716,10 +738,12 @@ class SupervisorTrainingEnvironment:
         safety_entry = SafetyLedgerEntry(
             ceiling_exceedances=exceedances, floor_shortfalls=0, margin_c=margin
         )
+        # **実際に掛かっていた action は、観測 window の action から取る。** 記録再生では
+        # 許容幅の分だけ要求と違いうるので、要求をそのまま次の state にすると「掛かっている
+        # action」が2つになる（決定記録 0052 §2.4 / 0058 §2.2）。
+        applied = _window_demands(outcome.window)
         try:
-            reward = self._reward.evaluate(
-                values=outcome.values, demands=requested, previous=state.applied
-            )
+            reward = self._reward.evaluate(values=observed, demands=applied, previous=state.applied)
         except RewardUnusableError as error:
             detail = f"{type(error).__name__}: {error}"
             self._end(state, TerminationReason.DYNAMICS_UNUSABLE, "reward_unusable", detail)
@@ -740,6 +764,7 @@ class SupervisorTrainingEnvironment:
             action=action,
             regime=workload.regime,
             requested=requested,
+            applied=applied,
             active_controller=proposal_facts.controller,
             fallback_reason=proposal_facts.fallback_reason,
             optimizer_status=proposal_facts.optimizer_status,
@@ -747,12 +772,12 @@ class SupervisorTrainingEnvironment:
             ood=proposal_facts.ood,
             provenance=outcome.provenance,
             supported=True,
-            observed=dict(outcome.values),
+            observed=dict(observed),
             reward=reward,
             safety=safety_entry,
         )
         state.window = outcome.window
-        state.applied = requested
+        state.applied = applied
         state.tick_id += 1
         if exceedances:
             state.ceiling_exceedances += exceedances
@@ -978,7 +1003,7 @@ class SupervisorTrainingEnvironment:
             "discount": self._config.reward.discount.value,
             "episode_id": spec.episode_id,
             "seed": spec.seed,
-            "mode": spec.mode.value,
+            "mode": self._dynamics.mode.value,
             "max_steps": max_steps,
             "step_ms": self._config.episode.step_ms.value,
             "recent_history_steps": self._config.episode.recent_history_steps,
@@ -994,6 +1019,9 @@ class SupervisorTrainingEnvironment:
             "safety_sha256": _config_digest(self._safety),
             "expected_model_version": self._expected_model_version,
             "learned_controller_available": self.learned_controller_available,
+            # **期待する版だけでは足りない。** 同じ版を名乗る別の artifact、別の Confidence
+            # Profile、別の任意依存（#94 / #81）は、同じ入力から違う提案を作る。
+            "controller": None if self._mpc is None else self._mpc.conditions(),
             "mpc_unavailable": (
                 None
                 if self._mpc_unavailable is None

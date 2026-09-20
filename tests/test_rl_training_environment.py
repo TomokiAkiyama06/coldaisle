@@ -24,6 +24,7 @@ import ast
 import json
 from hashlib import sha256
 from pathlib import Path
+from random import Random
 from typing import Any
 
 import pytest
@@ -36,6 +37,7 @@ from coldaisle.control.model.thermal import (
     ArtifactVerification,
     InferenceCapability,
     ObservedThermalInput,
+    ObservedWindowFrame,
     canonical_artifact_bytes,
 )
 from coldaisle.control.model_registry import ArtifactCapability
@@ -46,6 +48,7 @@ from coldaisle.control.rl import (
     DynamicsEvidence,
     DynamicsIdentity,
     DynamicsProvenance,
+    DynamicsRequest,
     DynamicsStep,
     DynamicsUnusableError,
     EnvironmentUsageError,
@@ -298,7 +301,6 @@ def episode_spec(
     *,
     episode_id: str = "pr105-a",
     seed: int = 7,
-    mode: TrainingMode = TrainingMode.LEARNED_SIMULATOR,
     steps: int = 8,
     max_steps: int | None = 4,
     demand: float = 0.4,
@@ -307,7 +309,6 @@ def episode_spec(
     return EpisodeSpec(
         episode_id=episode_id,
         seed=seed,
-        mode=mode,
         trace=workload_trace(steps, load=load),
         # 掛かっている demand は **観測 window の action から derive** される。
         initial_window=observed_input(demand),
@@ -379,16 +380,33 @@ def _mpc_policy(authority: str) -> FanPolicyConfig:
     return mpc_policy(authority=authority)
 
 
-def logged_trajectory(demand: float, *, steps: int = 6) -> LoggedTrajectory:
+def recorded_frame(ts_ms: int, values: dict[str, float], **masks: dict[str, bool]):
+    """記録済みの観測 frame。**品質 mask と source 時刻を必ず持つ。**"""
+    metrics = tuple(values)
+    return ObservedWindowFrame(
+        ts_ms=ts_ms,
+        values=dict(values),
+        source_ts_ms=dict.fromkeys(metrics, ts_ms),
+        missing_mask=masks.get("missing_mask") or dict.fromkeys(metrics, False),
+        stale_mask=masks.get("stale_mask") or dict.fromkeys(metrics, False),
+        suspect_mask=masks.get("suspect_mask") or dict.fromkeys(metrics, False),
+    )
+
+
+def logged_trajectory(demand: float, *, steps: int = 6, stale: bool = False) -> LoggedTrajectory:
     """`observed_input(demand)` の続きとして成立する記録。"""
     frames = []
     for index in range(steps):
         ts_ms = ACTION_TS_MS + (index + 1) * 1_000
+        values = {AIR: 23.0 + 0.1 * index, GPU: 46.0 + 0.2 * index}
         frames.append(
             LoggedFrame(
-                ts_ms=ts_ms,
                 applied=PerZone[Demand](front=demand, rear=demand, top=demand),
-                values={AIR: 23.0 + 0.1 * index, GPU: 46.0 + 0.2 * index},
+                observed=recorded_frame(
+                    ts_ms,
+                    values,
+                    stale_mask={AIR: stale, GPU: False},
+                ),
             )
         )
     return LoggedTrajectory(trajectory_id="pr105-log", frames=tuple(frames))
@@ -756,7 +774,7 @@ def test_invariant_7_a_a_logged_episode_scores_only_the_recorded_action(trained)
     environment, *_ = build_environment(
         trained, dynamics=logged, baseline_demand=0.8, authority="shadow"
     )
-    environment.reset(episode_spec(mode=TrainingMode.LOGGED))
+    environment.reset(episode_spec())
     record = environment.step(default_action())
 
     assert not record.supported
@@ -776,11 +794,21 @@ def test_invariant_7_b_a_logged_step_cannot_carry_fabricated_values() -> None:
         DynamicsStep(
             provenance=DynamicsProvenance.LOGGED_TRAJECTORY,
             supported=False,
-            values={GPU: 45.0},
+            window=observed_input(0.4),
             reason=Reason(code="applied_action_differs"),
         )
     with pytest.raises(ValidationError):
         DynamicsStep(provenance=DynamicsProvenance.LOGGED_TRAJECTORY, supported=False)
+    # 観測の出どころは window ひとつ。別の欄で値を渡す口は無い。
+    with pytest.raises(ValidationError):
+        DynamicsStep.model_validate(
+            {
+                "provenance": DynamicsProvenance.LOGGED_TRAJECTORY,
+                "supported": True,
+                "window": observed_input(0.4),
+                "values": {GPU: 45.0},
+            }
+        )
 
 
 def test_invariant_7_c_a_matching_logged_action_is_scored(trained) -> None:
@@ -789,7 +817,7 @@ def test_invariant_7_c_a_matching_logged_action_is_scored(trained) -> None:
     environment, *_ = build_environment(
         trained, dynamics=logged, baseline_demand=0.8, authority="shadow"
     )
-    environment.reset(episode_spec(mode=TrainingMode.LOGGED, demand=0.8))
+    environment.reset(episode_spec(demand=0.8))
     record = environment.step(default_action())
 
     assert record.supported
@@ -807,7 +835,7 @@ def test_invariant_7_d_hybrid_keeps_the_origin_of_every_step(trained) -> None:
     environment, *_ = build_environment(
         trained, dynamics=hybrid, baseline_demand=0.8, authority="shadow"
     )
-    result = run_all(environment, episode_spec(mode=TrainingMode.HYBRID, demand=0.8))
+    result = run_all(environment, episode_spec(demand=0.8))
 
     provenances = {step.provenance for step in result.steps if step.supported}
     assert DynamicsProvenance.SIMULATED_PROVISIONAL in provenances
@@ -823,7 +851,7 @@ def test_invariant_8_a_an_episode_below_the_coverage_floor_is_not_comparable(tra
     environment, *_ = build_environment(
         trained, dynamics=logged, baseline_demand=0.8, authority="shadow"
     )
-    result = run_all(environment, episode_spec(mode=TrainingMode.LOGGED, demand=0.8))
+    result = run_all(environment, episode_spec(demand=0.8))
 
     assert result.coverage.supported_steps == 0
     assert result.coverage.supported_fraction == 0.0
@@ -877,7 +905,7 @@ def test_invariant_9_c_changing_the_reward_or_dynamics_changes_the_conditions(tr
     logged = LoggedTrajectoryDynamics(logged_trajectory(0.4), shadow=shadow_config())
     changed_dynamics = run_all(
         build_environment(trained, dynamics=logged, authority="shadow")[0],
-        episode_spec(mode=TrainingMode.LOGGED),
+        episode_spec(),
     )
     assert changed_dynamics.conditions_sha256 != base.conditions_sha256
     del config, config_sha
@@ -1091,6 +1119,10 @@ class ForgedAttestedDynamics:
         return self._identity
 
     @property
+    def mode(self) -> TrainingMode:
+        return TrainingMode.LEARNED_SIMULATOR
+
+    @property
     def evidence(self) -> None:
         """**封をした証拠は作れない。** 自称できるのは identity と provenances だけ。"""
         return None
@@ -1242,11 +1274,11 @@ def test_invariant_9_f_hybrid_conditions_include_the_logged_side(trained) -> Non
 
     first = run_all(
         build_environment(trained, dynamics=left, baseline_demand=0.8, authority="shadow")[0],
-        episode_spec(mode=TrainingMode.HYBRID, demand=0.8),
+        episode_spec(demand=0.8),
     )
     second = run_all(
         build_environment(trained, dynamics=right, baseline_demand=0.8, authority="shadow")[0],
-        episode_spec(mode=TrainingMode.HYBRID, demand=0.8),
+        episode_spec(demand=0.8),
     )
     assert first.conditions_sha256 != second.conditions_sha256
 
@@ -1257,7 +1289,6 @@ def test_invariant_5_e_the_initial_state_is_screened_before_any_step(trained) ->
     spec = EpisodeSpec(
         episode_id="pr105-hot",
         seed=1,
-        mode=TrainingMode.LEARNED_SIMULATOR,
         trace=workload_trace(),
         initial_window=hot_window(120.0),
         max_steps=4,
@@ -1414,6 +1445,10 @@ class ForgedLoggedDynamics:
         return self._identity
 
     @property
+    def mode(self) -> TrainingMode:
+        return TrainingMode.LOGGED
+
+    @property
     def evidence(self) -> None:
         return None
 
@@ -1481,6 +1516,7 @@ def test_invariant_6_k_borrowed_evidence_cannot_be_attached_to_another_identity(
             trace_digest="b" * 64,
         )
         provenances = frozenset({DynamicsProvenance.LOGGED_TRAJECTORY})
+        mode = TrainingMode.LOGGED
 
         @property
         def evidence(self):
@@ -1548,7 +1584,6 @@ def test_invariant_15_a_snapshot_quality_and_timestamps_are_faithful(trained) ->
     spec = EpisodeSpec(
         episode_id="pr105-masked",
         seed=1,
-        mode=TrainingMode.LEARNED_SIMULATOR,
         trace=workload_trace(),
         initial_window=masked_window(stale=AIR, missing=GPU),
         max_steps=2,
@@ -1570,7 +1605,6 @@ def test_invariant_15_b_unusable_cells_do_not_feed_the_safety_screen(trained) ->
     spec = EpisodeSpec(
         episode_id="pr105-hot-stale",
         seed=1,
-        mode=TrainingMode.LEARNED_SIMULATOR,
         trace=workload_trace(),
         # 上限を大きく超える値だが stale。**証拠として使わない。**
         initial_window=masked_window(stale=AIR, stale_value=120.0),
@@ -1591,7 +1625,6 @@ def test_invariant_15_b_unusable_cells_do_not_feed_the_safety_screen(trained) ->
         EpisodeSpec(
             episode_id="pr105-hot-ok",
             seed=1,
-            mode=TrainingMode.LEARNED_SIMULATOR,
             trace=workload_trace(),
             initial_window=hot_window(120.0),
             max_steps=2,
@@ -1626,3 +1659,166 @@ def test_invariant_15_d_a_zero_history_window_gives_no_history(trained) -> None:
     environment.step(default_action())
 
     assert environment.observation().recent_history == ()
+
+
+# ---------------- codex レビュー 3巡目（PR #158 / 03ae787）で塞いだ穴
+
+
+def loose_coverage() -> dict[str, object]:
+    """採点できた step が少なくても `usable` になる設定（昇格条件だけを試すため）。"""
+    return {
+        "minimum_supported_fraction": provisional(0.5),
+        "minimum_steps": provisional(1),
+    }
+
+
+def test_invariant_16_a_an_unsupported_final_step_blocks_promotion(trained) -> None:
+    """**採点できなかった step を飛ばして「全部裏づけあり」と読まない。**
+
+    記録が尽きた終端 step は `provenance=None` なので、出どころの照合から漏れていた。
+    """
+    logged = LoggedTrajectoryDynamics(logged_trajectory(0.8, steps=2), shadow=shadow_config())
+    environment, *_ = build_environment(
+        trained,
+        dynamics=logged,
+        baseline_demand=0.8,
+        authority="shadow",
+        config_overrides={"coverage": loose_coverage()},
+    )
+    result = run_all(environment, episode_spec(demand=0.8, max_steps=4))
+
+    assert result.termination is TerminationReason.UNSUPPORTED_ACTION
+    assert result.coverage.supported_steps == 2
+    assert result.coverage.unsupported == {"logged_trajectory_exhausted": 1}
+    assert result.usable_for_comparison  # coverage は緩めてある
+    assert not result.promotable
+    with pytest.raises(ValidationError):
+        EpisodeResult.model_validate(result.model_dump(mode="python") | {"promotable": True})
+
+
+def test_invariant_16_b_the_recorded_action_becomes_the_next_state(trained) -> None:
+    """**記録と僅かに違う要求を、そのまま次の state にしない。**
+
+    許容幅の中で採点するのだから、掛かっていたのは記録の action である。要求を state へ
+    持ち越すと「掛かっている action」が2つになる（決定記録 0052 §2.4 / 0058 §2.2）。
+    """
+    shadow = shadow_config()
+    recorded = 0.8 - shadow.applied_demand_tolerance.value / 2
+    logged = LoggedTrajectoryDynamics(logged_trajectory(recorded), shadow=shadow)
+    environment, *_ = build_environment(
+        trained, dynamics=logged, baseline_demand=0.8, authority="shadow"
+    )
+    environment.reset(episode_spec(demand=0.8, max_steps=3))
+    first = environment.step(default_action())
+
+    assert first.supported
+    assert first.applied is not None
+    assert first.requested.front == pytest.approx(0.8)
+    assert first.applied.front == pytest.approx(recorded)
+    # 次の state の「掛かっている action」も記録側。
+    assert environment.observation().snapshot.fans is not None
+    assert environment.observation().snapshot.fans.front.effective_demand == pytest.approx(recorded)
+
+
+def test_invariant_16_c_conditions_cover_the_bound_controller(trained) -> None:
+    """**期待する版だけでは controller を特定できない。**
+
+    別の artifact・別の Confidence Profile・別の任意依存は、同じ入力から違う提案を作る。
+    """
+    _model, _profile, attestation = trained
+    config, config_sha = rl_config()
+    plain, *_ = build_environment(trained)
+
+    controller, _planning, settings = build_controller(
+        trained, policy_config=_mpc_policy("limited"), clock=ScriptedClock(0), acoustic=True
+    )
+    with_acoustic = SupervisorTrainingEnvironment(
+        config,
+        config_sha256=config_sha,
+        policy=settings,
+        safety=mpc_safety(),
+        dynamics=SimulatedThermalDynamics(config.simulator, config_sha256=config_sha),
+        mpc=controller,
+        baseline=lambda: ConstantBaseline(0.4),
+        baseline_identity=baseline_identity(0.4),
+        expected_model_version=attestation.version,
+    )
+
+    conditions = controller.conditions()
+    assert conditions["binding"]["artifact_sha256"] == attestation.artifact_sha256
+    assert conditions["acoustic"] is not None
+    assert isinstance(conditions["confidence_profile_sha256"], str)
+
+    first = run_all(plain, episode_spec())
+    second = run_all(with_acoustic, episode_spec())
+    assert first.conditions_sha256 != second.conditions_sha256
+
+
+def test_invariant_16_d_replay_keeps_the_recorded_quality_and_timestamps(trained) -> None:
+    """**再生で品質を作り直さない。** 記録が stale なら、再生後も stale のままである。"""
+    logged = LoggedTrajectoryDynamics(logged_trajectory(0.8, stale=True), shadow=shadow_config())
+    environment, *_ = build_environment(
+        trained, dynamics=logged, baseline_demand=0.8, authority="shadow"
+    )
+    environment.reset(episode_spec(demand=0.8, max_steps=3))
+    record = environment.step(default_action())
+
+    # 読めていない cell は採点に使えないので、その step は reward を作れずに終端する。
+    assert not record.supported
+    assert record.unsupported_reason is not None
+    assert record.unsupported_reason.code == "reward_unusable"
+
+    # 再生された frame は、記録の mask と source 時刻をそのまま持っている。
+    outcome = logged.advance(
+        DynamicsRequest(
+            window=observed_input(0.8),
+            applied=PerZone[Demand](front=0.8, rear=0.8, top=0.8),
+            workload=workload_trace().samples[0],
+            step_ms=1_000,
+            step_index=0,
+        ),
+        rng=Random(0),
+    )
+    assert outcome.window is not None
+    replayed = outcome.window.window[-1]
+    recorded = logged_trajectory(0.8, stale=True).frames[0].observed
+    assert replayed == recorded
+    assert replayed.stale_mask[AIR] is True
+    assert replayed.source_ts_ms[AIR] == recorded.ts_ms
+
+
+def test_invariant_16_e_a_recorded_frame_without_quality_is_rejected() -> None:
+    """**品質の分からない記録を `OK` に倒さない。** mask も source 時刻も必須である。"""
+    with pytest.raises(ValidationError):
+        LoggedFrame.model_validate(
+            {
+                "applied": {"front": 0.4, "rear": 0.4, "top": 0.4},
+                "observed": {"ts_ms": 1_000, "values": {GPU: 45.0}},
+            }
+        )
+    with pytest.raises(ValidationError):
+        LoggedFrame.model_validate(
+            {
+                "ts_ms": 1_000,
+                "applied": {"front": 0.4, "rear": 0.4, "top": 0.4},
+                "values": {GPU: 45.0},
+            }
+        )
+
+
+def test_invariant_16_f_the_mode_comes_from_the_dynamics(trained) -> None:
+    """**記録再生を `learned_simulator` と書けない。** mode は dynamics が名乗る。"""
+    with pytest.raises(ValidationError):
+        EpisodeSpec.model_validate(
+            episode_spec().model_dump(mode="python") | {"mode": TrainingMode.LOGGED.value}
+        )
+
+    simulated, *_ = build_environment(trained)
+    assert run_all(simulated, episode_spec(max_steps=2)).mode is TrainingMode.LEARNED_SIMULATOR
+
+    logged_dynamics = LoggedTrajectoryDynamics(logged_trajectory(0.8), shadow=shadow_config())
+    logged, *_ = build_environment(
+        trained, dynamics=logged_dynamics, baseline_demand=0.8, authority="shadow"
+    )
+    assert run_all(logged, episode_spec(demand=0.8, max_steps=2)).mode is TrainingMode.LOGGED
+    assert logged_dynamics.mode is TrainingMode.LOGGED

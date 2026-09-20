@@ -20,7 +20,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from coldaisle.control.model.thermal import ThermalMetricName, canonical_sha256
 from coldaisle.control.rl.action import SupervisorAction
-from coldaisle.control.rl.dynamics import DynamicsIdentity, DynamicsProvenance
+from coldaisle.control.rl.dynamics import DynamicsIdentity, DynamicsProvenance, TrainingMode
 from coldaisle.control.rl.reward import RewardBreakdown, SafetyLedgerEntry
 from coldaisle.control.schema import (
     ConfidenceLevel,
@@ -59,17 +59,6 @@ def conditions_digest(conditions: Sequence[tuple[str, str]]) -> str:
     return sha256(payload).hexdigest()
 
 
-class TrainingMode(StrEnum):
-    """何から遷移を作るか。**結果の型でも混ぜない**（決定記録 0058 §2.2）。"""
-
-    LOGGED = "logged"
-    """記録済み trajectory だけ。実測の裏づけがあるが、記録と同じ action しか採点できない。"""
-    LEARNED_SIMULATOR = "learned_simulator"
-    """learned / 近似 simulator。任意の action を試せるが、裏づけは simulator の妥当性まで。"""
-    HYBRID = "hybrid"
-    """記録で説明できる step は記録から、残りは simulator から。step ごとに出どころが残る。"""
-
-
 class TerminationReason(StrEnum):
     """episode が終わった理由。"""
 
@@ -102,7 +91,14 @@ class StepRecord(_Frozen):
     action: SupervisorAction
     regime: WorkloadRegime
     requested: PerZone[Demand]
-    """この step で掛けた demand。**Supervisor action からではなく MPC / Gate から来る。**"""
+    """この step で要求した demand。**Supervisor action からではなく MPC / Gate から来る。**"""
+    applied: PerZone[Demand] | None = None
+    """**実際に掛かっていた** demand（観測 window の action）。
+
+    記録再生では、要求が `applied_demand_tolerance` の範囲で一致していれば採点するので、
+    要求と実際が僅かに違いうる。reward と次の state は**こちら**を使う。掛かっていない
+    action の成果を採点しないためで、採点できない step では `None`。
+    """
     active_controller: ControllerKind
     fallback_reason: Reason | None = None
     optimizer_status: OptimizerStatus | None = None
@@ -123,9 +119,13 @@ class StepRecord(_Frozen):
                 raise ValueError("採点できた step に未対応の理由を付けない")
             if self.reward is None or self.provenance is None or not self.observed:
                 raise ValueError("採点できた step には観測・出どころ・reward が要る")
+            if self.applied is None:
+                raise ValueError("採点できた step には実際に掛かっていた demand が要る")
             return self
         if self.unsupported_reason is None:
             raise ValueError("採点できない step には理由を残す")
+        if self.applied is not None:
+            raise ValueError("採点できない step に実際の demand を書かない")
         if self.reward is not None or self.observed or self.provenance is not None:
             # 採点できない step に結果を作ると、「記録に無い action の成果」が生える。
             raise ValueError("採点できない step に観測・reward を作らない")
@@ -238,6 +238,12 @@ class EpisodeResult(_Frozen):
             if not self.learned_controller_available:
                 # action が demand に効いていない episode は、policy の根拠になりえない。
                 raise ValueError("Learned MPC を束縛できなかった episode を昇格の根拠にしない")
+            if not self.steps:
+                raise ValueError("step の無い episode を昇格の根拠にしない")
+            if any(not step.supported for step in self.steps):
+                # **採点できなかった step が1つでもあれば根拠にしない。** 終端の1 step だけが
+                # 採点できていない episode を、欠けた分を飛ばして「全部裏づけあり」と読まない。
+                raise ValueError("採点できない step を含む episode を昇格の根拠にしない")
             provenances = {step.provenance for step in self.steps if step.provenance is not None}
             if provenances - {self.dynamics.provenance}:
                 # hybrid で1 step でも別の出どころが混ざれば、その episode は根拠にできない。

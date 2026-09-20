@@ -51,6 +51,21 @@ class _Frozen(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid", strict=True)
 
 
+class TrainingMode(StrEnum):
+    """何から遷移を作るか。**結果の型でも混ぜない**（決定記録 0058 §2.2）。
+
+    **`EpisodeSpec` の欄ではなく dynamics が名乗る。** 呼び出し側が別に持つと、記録再生を
+    `learned_simulator` と書いた結果を作れてしまう（0058 §2.2）。
+    """
+
+    LOGGED = "logged"
+    """記録済み trajectory だけ。実測の裏づけがあるが、記録と同じ action しか採点できない。"""
+    LEARNED_SIMULATOR = "learned_simulator"
+    """learned / 近似 simulator。任意の action を試せるが、裏づけは simulator の妥当性まで。"""
+    HYBRID = "hybrid"
+    """記録で説明できる step は記録から、残りは simulator から。step ごとに出どころが残る。"""
+
+
 class DynamicsProvenance(StrEnum):
     """1 step の遷移がどこから来たか。**混ぜて集計しない。**"""
 
@@ -226,23 +241,27 @@ class DynamicsRequest(_Frozen):
 
 
 class DynamicsStep(_Frozen):
-    """1 step の遷移。**採点できないときは値を作らない。**"""
+    """1 step の遷移。**採点できないときは観測を作らない。**
+
+    **観測の出どころは `window` ひとつだけ。** 値を別の欄でも返せると、window の品質 mask と
+    食い違う値を渡せてしまう。環境は `window` の最後の frame から、**使える cell だけ**を
+    読む（決定記録 0058 §2.2）。
+    """
 
     provenance: DynamicsProvenance
     supported: bool
     window: ObservedThermalInput | None = None
-    values: dict[ThermalMetricName, float] = Field(default_factory=dict)
     reason: Reason | None = None
 
     @model_validator(mode="after")
-    def _unsupported_steps_carry_no_values(self) -> Self:
+    def _unsupported_steps_carry_no_observation(self) -> Self:
         if self.supported:
-            if self.window is None or not self.values:
+            if self.window is None:
                 raise ValueError("採点できる step には次の観測が要る")
             if self.reason is not None:
                 raise ValueError("採点できた step に失敗の理由を付けない")
             return self
-        if self.window is not None or self.values:
+        if self.window is not None:
             # 「記録に無い action の結果」を作ってはならない（決定記録 0053 §2.3 / 0054 §2.2）。
             raise ValueError("採点できない step に観測を作らない")
         if self.reason is None:
@@ -273,6 +292,11 @@ class EnvironmentDynamics(Protocol):
         ...
 
     @property
+    def mode(self) -> TrainingMode:
+        """この dynamics が表す学習 mode。**episode 側からは指定できない。**"""
+        ...
+
+    @property
     def provenances(self) -> frozenset[DynamicsProvenance]:
         """この dynamics が出しうる step の出どころ。
 
@@ -298,11 +322,10 @@ def _mean_demand(demands: PerZone[Demand]) -> float:
     return sum(demands.get(zone) for zone in Zone) / len(Zone)
 
 
-def _next_window(
+def _advance_window(
     window: ObservedThermalInput,
     *,
-    ts_ms: int,
-    values: Mapping[ThermalMetricName, float],
+    frame: ObservedWindowFrame,
     applied: PerZone[Demand],
 ) -> ObservedThermalInput:
     """観測 window を1 frame 進める。**長さは変えない。**
@@ -310,26 +333,43 @@ def _next_window(
     `ObservedThermalInput` は「window が action 時刻で終わる」ことを不変条件にしているので、
     新しい frame の時刻がそのまま次の anchor 時刻になる（#84）。
     """
-    metrics = tuple(window.window[-1].values)
-    missing = sorted(set(metrics) - set(values))
-    if missing:
-        raise DynamicsUnusableError(f"dynamics が window の metric を埋めていない: {missing}")
-    frame = ObservedWindowFrame(
-        ts_ms=ts_ms,
-        values={metric: values[metric] for metric in metrics},
-        source_ts_ms=dict.fromkeys(metrics, ts_ms),
-        missing_mask=dict.fromkeys(metrics, False),
-        stale_mask=dict.fromkeys(metrics, False),
-        suspect_mask=dict.fromkeys(metrics, False),
-    )
+    metrics = set(window.window[-1].values)
+    if set(frame.values) != metrics:
+        raise DynamicsUnusableError(
+            f"dynamics の frame が window の metric 集合と一致しない: {sorted(frame.values)}"
+        )
+    if frame.ts_ms <= window.window[-1].ts_ms:
+        raise DynamicsUnusableError("dynamics の frame 時刻が window より過去になっている")
     return ObservedThermalInput(
-        action_ts_ms=ts_ms,
+        action_ts_ms=frame.ts_ms,
         window=(*window.window[1:], frame),
         action=PerZone[ObservedFanAction](
             front=ObservedFanAction(effective_demand=applied.front),
             rear=ObservedFanAction(effective_demand=applied.rear),
             top=ObservedFanAction(effective_demand=applied.top),
         ),
+    )
+
+
+def _synthesized_frame(
+    window: ObservedThermalInput, *, ts_ms: int, values: Mapping[ThermalMetricName, float]
+) -> ObservedWindowFrame:
+    """**生成した**観測の frame。品質 mask はすべて偽で、source 時刻は生成時刻である。
+
+    近似 simulator と learned simulator は、値を**その場で作る**。欠測も stale も無いのは
+    偽装ではなく事実である。記録を再生するときはこの関数を使わない（決定記録 0058 §2.2）。
+    """
+    metrics = tuple(window.window[-1].values)
+    missing = sorted(set(metrics) - set(values))
+    if missing:
+        raise DynamicsUnusableError(f"dynamics が window の metric を埋めていない: {missing}")
+    return ObservedWindowFrame(
+        ts_ms=ts_ms,
+        values={metric: values[metric] for metric in metrics},
+        source_ts_ms=dict.fromkeys(metrics, ts_ms),
+        missing_mask=dict.fromkeys(metrics, False),
+        stale_mask=dict.fromkeys(metrics, False),
+        suspect_mask=dict.fromkeys(metrics, False),
     )
 
 
@@ -362,6 +402,11 @@ class SimulatedThermalDynamics:
     def evidence(self) -> DynamicsEvidence | None:
         """**常に `None`。** 近似 simulator に証拠は無い。"""
         return None
+
+    @property
+    def mode(self) -> TrainingMode:
+        """この dynamics が表す学習 mode。"""
+        return TrainingMode.LEARNED_SIMULATOR
 
     @property
     def provenances(self) -> frozenset[DynamicsProvenance]:
@@ -402,19 +447,29 @@ class SimulatedThermalDynamics:
         return DynamicsStep(
             provenance=DynamicsProvenance.SIMULATED_PROVISIONAL,
             supported=True,
-            window=_next_window(
-                request.window, ts_ms=ts_ms, values=values, applied=request.applied
+            window=_advance_window(
+                request.window,
+                frame=_synthesized_frame(request.window, ts_ms=ts_ms, values=values),
+                applied=request.applied,
             ),
-            values=values,
         )
 
 
 class LoggedFrame(_Frozen):
-    """記録済み運転の1 step。**掛かっていた demand と、その後の観測を対で持つ。**"""
+    """記録済み運転の1 step。**掛かっていた demand と、その後の観測を対で持つ。**
 
-    ts_ms: int = Field(ge=0)
+    観測は `ObservedWindowFrame` をそのまま持つ。値だけでなく **source 時刻と
+    missing / stale / suspect の mask も記録から来る**（決定記録 0058 §2.2）。
+    どれも必須で、既定値を持たない。**品質の分からない記録は受け取らない**（`OK` に倒さない）。
+    """
+
     applied: PerZone[Demand]
-    values: dict[ThermalMetricName, float] = Field(min_length=1)
+    observed: ObservedWindowFrame
+
+    @property
+    def ts_ms(self) -> int:
+        """この記録の観測時刻。"""
+        return self.observed.ts_ms
 
 
 class LoggedTrajectory(_Frozen):
@@ -477,6 +532,11 @@ class LoggedTrajectoryDynamics:
         return self._evidence
 
     @property
+    def mode(self) -> TrainingMode:
+        """この dynamics が表す学習 mode。"""
+        return TrainingMode.LOGGED
+
+    @property
     def provenances(self) -> frozenset[DynamicsProvenance]:
         """記録再生の step しか出さない。"""
         return frozenset({DynamicsProvenance.LOGGED_TRAJECTORY})
@@ -510,13 +570,8 @@ class LoggedTrajectoryDynamics:
         return DynamicsStep(
             provenance=DynamicsProvenance.LOGGED_TRAJECTORY,
             supported=True,
-            window=_next_window(
-                request.window,
-                ts_ms=frame.ts_ms,
-                values=frame.values,
-                applied=frame.applied,
-            ),
-            values=dict(frame.values),
+            # **記録した frame をそのまま置く。** 時刻も品質 mask も作り直さない。
+            window=_advance_window(request.window, frame=frame.observed, applied=frame.applied),
         )
 
     @staticmethod
@@ -560,6 +615,11 @@ class HybridDynamics:
         分けて数え直すより、`promotable=False` で閉じるほうが取り違えが起きない。
         """
         return None
+
+    @property
+    def mode(self) -> TrainingMode:
+        """この dynamics が表す学習 mode。"""
+        return TrainingMode.HYBRID
 
     @property
     def provenances(self) -> frozenset[DynamicsProvenance]:
@@ -696,6 +756,11 @@ class AttestedThermalDynamics:
         return self._evidence
 
     @property
+    def mode(self) -> TrainingMode:
+        """この dynamics が表す学習 mode。"""
+        return TrainingMode.LEARNED_SIMULATOR
+
+    @property
     def provenances(self) -> frozenset[DynamicsProvenance]:
         """Registry の証拠に裏づけられた step しか出さない。"""
         return frozenset({DynamicsProvenance.REGISTRY_ATTESTED})
@@ -721,10 +786,11 @@ class AttestedThermalDynamics:
         return DynamicsStep(
             provenance=DynamicsProvenance.REGISTRY_ATTESTED,
             supported=True,
-            window=_next_window(
-                request.window, ts_ms=ts_ms, values=values, applied=request.applied
+            window=_advance_window(
+                request.window,
+                frame=_synthesized_frame(request.window, ts_ms=ts_ms, values=values),
+                applied=request.applied,
             ),
-            values=values,
         )
 
 

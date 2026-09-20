@@ -56,6 +56,7 @@ from coldaisle.control.rl.dynamics import (
     LoggedTrajectory,
     LoggedTrajectoryDynamics,
     SimulatedThermalDynamics,
+    TrainingMode,
     WorkloadSample,
     WorkloadTrace,
     attested_evidence,
@@ -77,7 +78,6 @@ from coldaisle.control.rl.episode import (
     SafetyModel,
     StepRecord,
     TerminationReason,
-    TrainingMode,
 )
 from coldaisle.control.rl.reward import (
     REWARD_SCHEMA_VERSION,
