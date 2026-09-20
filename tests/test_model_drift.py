@@ -31,6 +31,7 @@ from coldaisle.control.drift import (
     DeclaredChange,
     DriftConfig,
     DriftConfigError,
+    DriftCoverage,
     DriftDetector,
     DriftEvidence,
     DriftInputError,
@@ -536,22 +537,49 @@ def test_a_metric_that_is_never_scored_blocks_sufficiency(trained) -> None:
     残りの metric だけで「悪化していない」と言えてしまう。
     """
     _data, _parts, _model, profile = trained
-    gpu_only = tuple(row(profile, index, ratio=1.0, metrics=(GPU,)) for index in range(6))
+    # AIR がどの outcome でも照合できない。GPU だけなら「悪化していない」と言えてしまう。
     never_scored = tuple(
-        row(profile, index, ratio=1.0, unmatched_metrics=(AIR,)) for index in range(6, 8)
+        row(profile, index, ratio=1.0, unmatched_metrics=(AIR,)) for index in range(8)
     )
-    report = detector(profile).detect(DriftEvidence(shadow=(*gpu_only, *never_scored)))
+    report = detector(profile).detect(DriftEvidence(shadow=never_scored))
 
     coverage = report.residual.coverage
-    assert coverage.counted == 6
+    assert coverage.counted == 0
     assert coverage.predicted_metrics == tuple(sorted(TARGETS))
-    assert coverage.unscored_metrics == (AIR,)
+    assert coverage.unscored_metrics == tuple(sorted(TARGETS))
     assert coverage.sufficient is False
     assert report.residual.ratio is None
     assert report.residual.verdict is DriftVerdict.INSUFFICIENT_EVIDENCE
     assert report.verdict is DriftVerdict.INSUFFICIENT_EVIDENCE
     assert report.recommendation.required is False
     assert DriftSignalKind.RESIDUAL in report.recommendation.inconclusive_signals
+
+    # 型の側でも閉じる（採点できていない metric があれば `sufficient` にできない）。
+    with pytest.raises(ValidationError, match="採点できていない metric"):
+        DriftCoverage(
+            outcomes=8,
+            scored=8,
+            counted=8,
+            unidentifiable=0,
+            identifiable_fraction=1.0,
+            outputs=8,
+            matched_outputs=8,
+            counted_outputs=8,
+            predicted_metrics=tuple(sorted(TARGETS)),
+            unscored_metrics=(AIR,),
+            sufficient=True,
+        )
+
+
+def test_a_prediction_that_drops_a_metric_is_refused(trained) -> None:
+    """**予測の出力は Profile の target schema と過不足なく一致する。**
+
+    足りない出力を認めると、記録から metric を落とすだけでその誤差が分母ごと消える
+    （候補 plan の digest は offset 列しか覆わない）。
+    """
+    _data, _parts, _model, profile = trained
+    with pytest.raises(DriftInputError, match="足りない"):
+        detector(profile).detect(DriftEvidence(shadow=(row(profile, 0, metrics=(GPU,)),)))
 
 
 def test_evidence_from_another_model_is_not_counted_as_this_model_drift(trained) -> None:
@@ -1324,3 +1352,62 @@ def test_declaring_too_many_changes_is_an_input_error(trained) -> None:
     )
     with pytest.raises(DriftInputError, match="構造上限"):
         detector(profile).detect(DriftEvidence(changes=changes))
+
+
+# ---------------------------------------------------------------- 15. 落として良く見せられない
+
+
+def test_dropping_the_outcome_of_a_bad_forecast_is_refused(trained) -> None:
+    """**候補と outcome は1対1**（0056 §2.3）。
+
+    数えないだけにすると、悪い forecast の outcome を落とすだけで、その forecast が
+    residual からも coverage の分母からも消え、残りだけで `ok` に届いてしまう。
+    """
+    _data, _parts, _model, profile = trained
+    healthy = rows(profile, 6, ratio=1.0)
+    degraded = tuple(row(profile, index, ratio=3.0) for index in range(6, 12))
+    honest = detector(profile).detect(DriftEvidence(shadow=(*healthy, *degraded)))
+    assert honest.residual.verdict is DriftVerdict.DEGRADED
+
+    # 悪いほうの outcome だけを落とす（記録の型は通る）。
+    hollowed = tuple(item.model_copy(update={"outcomes": ()}) for item in degraded)
+    with pytest.raises(DriftInputError, match="対応する outcome が無い"):
+        detector(profile).detect(DriftEvidence(shadow=(*healthy, *hollowed)))
+
+
+def test_an_export_without_matching_is_refused(trained) -> None:
+    """照合していない export（`matcher` 無しで作った行）を証拠にしない。"""
+    _data, _parts, _model, profile = trained
+    unmatched = tuple(item.model_copy(update={"outcomes": ()}) for item in rows(profile, 6))
+    with pytest.raises(DriftInputError, match="照合済みの export"):
+        detector(profile).detect(DriftEvidence(shadow=unmatched))
+
+
+def test_the_evidence_digest_does_not_depend_on_the_caller_order(trained) -> None:
+    """**同じ証拠なら同じ digest。** 並べ替えただけで違う条件を名乗らせない。"""
+    _data, parts, _model, profile = trained
+    shadow = rows(profile, 6, ratio=1.0)
+    inputs = tuple(ObservedThermalInput.from_example(item) for item in parts.test)
+    forward = detector(profile).detect(DriftEvidence(shadow=shadow, inputs=inputs))
+    backward = detector(profile).detect(
+        DriftEvidence(shadow=tuple(reversed(shadow)), inputs=tuple(reversed(inputs)))
+    )
+
+    assert forward.provenance.evidence_sha256 == backward.provenance.evidence_sha256
+    assert forward.canonical_bytes() == backward.canonical_bytes()
+
+    # 行の中の並び（照合結果の順）も digest を変えない。
+    shuffled = tuple(
+        item.model_copy(
+            update={
+                "outcomes": (
+                    item.outcomes[0].model_copy(
+                        update={"matches": tuple(reversed(item.outcomes[0].matches))}
+                    ),
+                )
+            }
+        )
+        for item in shadow
+    )
+    inside = detector(profile).detect(DriftEvidence(shadow=shuffled, inputs=inputs))
+    assert inside.provenance.evidence_sha256 == forward.provenance.evidence_sha256

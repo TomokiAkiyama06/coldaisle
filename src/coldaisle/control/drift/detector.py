@@ -258,6 +258,17 @@ class DriftDetector:
                         f"fan-policy={self._match_tolerance_ms}）"
                     )
                 self._tally_outcome(tally, outcome, counterfactual, cutoff_ms)
+            covered = {(item.inference_id, item.plan_digest) for item in row.outcomes}
+            uncovered = sorted(key[0] for key in set(candidates) - covered)
+            if uncovered:
+                # **候補と outcome は1対1にする**（0056 §2.3）。数えないだけにすると、
+                # 悪い forecast の outcome を落とすだけで、その forecast が residual からも
+                # coverage の分母からも消え、残りだけで `ok` に届いてしまう。
+                # 照合していない export（`matcher` 無しで作った行）もここで閉じる。
+                raise DriftInputError(
+                    f"counterfactual に対応する outcome が無い: {uncovered}"
+                    f"（tick={row.tick_id}/{row.ts_ms}）。照合済みの export を渡す"
+                )
         return tally
 
     def _tally_outcome(
@@ -290,11 +301,17 @@ class DriftDetector:
             for target in prediction.targets
             for metric, value in target.values.items()
         }
-        unknown = sorted(key for key in predicted_by_key if key not in self._scales)
-        if unknown:
-            # binding が一致しているのに出力が Profile の target schema に無い。
-            # 記録か Profile のどちらかが壊れている。**採点するより前に閉じる。**
-            raise DriftInputError(f"予測の出力が Profile の target schema に無い: {unknown}")
+        if set(predicted_by_key) != set(self._scales):
+            # **Profile の target schema と過不足なく一致すること。** 足りない出力を
+            # 認めると、記録から metric を落とすだけでその誤差が分母ごと消える
+            # （plan の digest は offset 列しか覆わない）。多い出力は、記録が別の推論を
+            # 抱えている証拠である。**採点するより前に閉じる。**
+            missing_outputs = sorted(set(self._scales) - set(predicted_by_key))
+            extra_outputs = sorted(set(predicted_by_key) - set(self._scales))
+            raise DriftInputError(
+                "予測の出力が Profile の target schema と一致しない"
+                f"（足りない={missing_outputs}; 余分={extra_outputs}）"
+            )
         expected = set(predicted_by_key)
         actual = {(match.offset_ms, match.metric) for match in outcome.matches}
         if len(actual) != len(outcome.matches):
@@ -795,16 +812,55 @@ def _pattern_name(pattern: tuple[str, ...]) -> str:
     return joined[: MAX_DRIFT_SOURCE_LENGTH - len(suffix)] + suffix
 
 
+def _canonical_row(row: ShadowExportRow) -> dict[str, object]:
+    """1行を、**並びに依らない形**へ直す。
+
+    記録の中の「順序に意味がない並び」（counterfactual・outcome・出力の照合結果）は、
+    渡された順のまま数えると digest が呼び出し側の並べ方で変わる。識別子で並べ直す。
+    """
+    payload = row.model_dump(mode="json")
+    shadow = payload["shadow"]
+    assert isinstance(shadow, dict)
+    counterfactuals = shadow["counterfactuals"]
+    assert isinstance(counterfactuals, list)
+    # `ShadowRecord` は1 tick に同じ制御器の counterfactual を2つ持てない（全順序になる）。
+    shadow["counterfactuals"] = sorted(counterfactuals, key=lambda item: str(item["controller"]))
+    outcomes = payload["outcomes"]
+    assert isinstance(outcomes, list)
+    normalized: list[dict[str, object]] = []
+    for outcome in outcomes:
+        matches = outcome["matches"]
+        assert isinstance(matches, list)
+        normalized.append(
+            {
+                **outcome,
+                # 出力は (offset, metric) で一意（重複は検知器が拒む）。
+                "matches": sorted(matches, key=lambda item: (item["offset_ms"], item["metric"])),
+            }
+        )
+    payload["outcomes"] = sorted(
+        normalized, key=lambda item: (str(item["inference_id"]), str(item["plan_digest"]))
+    )
+    return payload
+
+
 def _evidence_sha256(evidence: DriftEvidence, changes: Sequence[DeclaredChange]) -> str:
     """数えた証拠そのものの digest。**同じ証拠なら同じ値**になる。
 
-    宣言された変更は**畳んで並べ直したもの**を数える。渡された順や重複で digest が
-    変わると、同じ証拠の報告が違う条件を名乗ることになる。
+    行・推論入力・宣言された変更は、**識別子で並べ直してから**数える。渡された順や
+    重複で digest が変わると、**同じ証拠の報告が違う条件を名乗る**ことになる
+    （識別子の一意性は、ここへ来るまでに検知器が確かめている）。
     """
     payload = json.dumps(
         {
-            "shadow": [row.model_dump(mode="json") for row in evidence.shadow],
-            "inputs": [observed.model_dump(mode="json") for observed in evidence.inputs],
+            "shadow": [
+                _canonical_row(row)
+                for row in sorted(evidence.shadow, key=lambda item: (item.ts_ms, item.tick_id))
+            ],
+            "inputs": [
+                observed.model_dump(mode="json")
+                for observed in sorted(evidence.inputs, key=lambda item: item.action_ts_ms)
+            ],
             "changes": [change.model_dump(mode="json") for change in changes],
             "window": [evidence.window_start_ms, evidence.window_end_ms],
         },

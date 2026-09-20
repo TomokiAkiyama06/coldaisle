@@ -93,6 +93,13 @@
   Profile の binding と一致するものだけを数える。別のモデルの区間は `foreign_model` として
   数え、混ぜない。outcome は `inference_id` + `plan_digest` で counterfactual に結び直し、
   **結べなければ受け取らない**（0054 §2.6）
+- **候補と outcome は1対1にする。** 予測を持つ counterfactual に対応する outcome が無い行は
+  受け取らない。「数えないだけ」にすると、**悪い forecast の outcome を落とすだけで**、その
+  forecast が residual からも coverage の分母からも消え、残りだけで `ok` に届く。
+  照合していない export（`matcher` 無しで作った行）もこの規則で閉じる
+- **予測の出力は Profile の target schema と過不足なく一致する。** 足りない出力を認めると、
+  記録から metric を落とすだけでその誤差が分母ごと消える（候補 plan の digest は offset 列しか
+  覆わない）。多い出力は、記録が別の推論を抱えている証拠である
 - **同じ証拠を2回数えない。** 同じ `(tick_id, ts_ms)` の行、同じ `(inference_id, plan_digest)` の
   outcome が2度現れたら**入力の誤りとして拒む**。「数えないだけ」にすると、行を複製するだけで
   coverage の下限を満たせる。**入力分布の側も同じ**で、同じ action 時刻の推論入力を2度は数えない
@@ -111,6 +118,9 @@
   そのまま通せる。呼び出し側に残るのは、**渡された export を trace と観測から数え直して
   照らすこと**と Dataset artifact の bytes の整合だけで、これは検知器が trace も観測も
   持たないためである（持たせると #90 / #91 と二重の収集経路になる）
+- **digest は並べ方に依らない。** 行・推論入力・宣言された変更・行の中の並び
+  （counterfactual・outcome・出力）を識別子で並べ直してから数える。渡された順で digest が
+  変わると、**同じ証拠の報告が違う条件を名乗る**
 - **証拠の時刻は証拠自身から決める。** outcome の時刻は照合に使った観測のうち最も新しい時刻、
   1つも照合できなければ照合期限（最後の期待時刻 + 許容幅）とする（0050 §2.2 と同じ）
 - 予測の出力が Profile の target schema に無ければ**例外で閉じる**。binding が一致している以上、
