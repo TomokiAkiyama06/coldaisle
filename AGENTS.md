@@ -241,6 +241,7 @@ src/coldaisle/
     fallback/   # Baseline / degraded運転
     hardware/   # Demand→PWM/RPM/flow mapping、mock backendを含む
     acoustic/   # 独立Acoustic Cost Model（初期は近似、将来実測対応）
+    rl/         # RL Supervisorの学習・評価環境（#105 / 決定記録 0058）。**制御権を持たない**
     shadow/     # 適用しなかった提案の記録と突き合わせ（制御へ届かない）。#90
     evaluation/ # Offline Evaluation（読み取り専用。制御へ届かない）。#91
     drift/      # Model Drift 検知と再学習の推奨（読み取り専用。制御へ届かない）。#93
@@ -249,7 +250,7 @@ src/coldaisle/
   ai/         # L3: LLM Provider抽象、ツール、プロンプト。制御権限を持たない
   web/        # L4: 静的アセット
 firmware/     # ESP32-S3 Arduino スケッチ。**コンパイルは人の手**（#11 / 決定記録 0022 §2.9）
-config/       # rules.yaml, calibration.json, coldaisle.toml, fan-policy.yaml, fan-hardware.yaml, safety.yaml, evaluation.yaml, drift.yaml
+config/       # rules.yaml, calibration.json, coldaisle.toml, fan-policy.yaml, fan-hardware.yaml, safety.yaml, evaluation.yaml, drift.yaml, rl-training.yaml
 memory/       # 運用メモリ（いまの閾値・較正値）。`coldaisle-memory` が更新案を出す
 docs/         # 要件定義、仕様レビュー、ADR
 tests/
