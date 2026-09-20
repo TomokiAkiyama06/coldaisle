@@ -89,6 +89,14 @@ class InferenceCapability(StrEnum):
     """Scientific claim supported by an artifact, not its deployment lifecycle state."""
 
     OBSERVATIONAL_REPLAY = "observational_replay"
+    COUNTERFACTUAL_ACTION = "counterfactual_action"
+    """Prediction under a candidate future fan-action trajectory (#86).
+
+    No Dataset v1 artifact can declare it: ``ThermalModelManifest.capability`` and
+    ``ThermalPrediction.capability`` are pinned to ``OBSERVATIONAL_REPLAY`` because v1 has no
+    post-anchor action trajectory (decision record 0048 §2.1).  The member exists so that #86
+    can name the capability it requires and refuse every current artifact deterministically.
+    """
 
 
 class ArtifactVerification(StrEnum):

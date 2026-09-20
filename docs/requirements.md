@@ -612,7 +612,7 @@ Kaggle・研究でGPUを使う際は `--gpu-memory-utilization` による制限�
 | Q-18 | センサー最終配置 | 実機で構成を確認後 |
 | Q-20 | T_SENSOR の閾値の具体値 | GitHub #50 / #78 |
 | Q-21 | Learned Thermal Model の方式・履歴 window・予測 horizon | GitHub #83 / #84 |
-| Q-22 | MPC / Supervisor の周期、MPC 目的関数の重み | GitHub #86 / #88 / #103 |
+| Q-22 | MPC / Supervisor の周期、MPC 目的関数の重み | optimizer の内部モデル要件・探索方式・Hard Constraints の扱いは決定記録 0052（Proposed、所有者承認待ち）。**horizon / step / 周期 / 重みの値**は実測後に GitHub #86 / #88 / #103 |
 | Q-23 | Confidence / OOD の方式、Authority 昇格ゲートの閾値 | 方式は決定記録 0050（FINAL、2026-09-20 所有者承認）で決定。**閾値の値**は GitHub #85 / #90 / #91、**stage の昇格**は #92 で未決 |
 | Q-24 | Air Balance の最適な帯 | GitHub #81 |
 | Q-25 | 本番でオンライン学習を行うか | GitHub #93 / #104 |

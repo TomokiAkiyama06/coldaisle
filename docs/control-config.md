@@ -113,7 +113,24 @@ Confidence / OOD が動かせるのはその前段の `requested` だけであ�
 v5からv6へは `model_confidence` を実データの評価根拠とともに追加してから `schema_version: 6` へ上げる。
 v1〜v5は自動補完せず起動前に拒否する。
 
-現行 Control Config v6 は設定の live reload を行わない。設定変更は候補全体を別オブジェクトで検証したうえで
+#86 のv7で `mpc.optimizer` を追加する（決定記録 0052。Proposed）。
+Learned MPC の `horizon_ms` / `step_ms`、探索の `candidate_levels` / `sweeps` / `max_evaluations`、
+変化幅の `max_step_up` / `max_step_down`、zone ごとの探索範囲 `zone_bounds`、
+目的関数の基準量 `cost_scales`、コストに使う予測 metric 名 `cost_metrics`、
+Air Balance の比を推定できない step のコスト `unknown_balance_cost` をすべて
+`status` / `basis` 付きで明示する。`horizon_ms` は `step_ms` の整数倍で、control step 数は
+構造上限 64、1 tick の内部モデル評価は 4,096 回までとする（資源枯渇を防ぐ境界であり、調整値ではない）。
+`cost_metrics` の metric を内部モデルの target schema が覆うことと、control step のすべての
+offset が target horizon にあることは、tick ごとではなく optimizer の**生成時**に照合する。
+`mpc.valid_ms` は `mpc.period_ms` 以上にする（再計算の周期より短い有効期限では、
+健全な提案でも毎 tick 期限切れになる）。Air Balance の目標比は `air-balance.yaml`（決定記録 0033）が
+所有し、`mpc.optimizer` へ写さない。値はすべて実測前の暫定値で、horizon / step / 重みの確定値は
+実測と deadline の評価で決める（`docs/requirements.md` Q-22）。
+
+v6からv7へは `mpc.optimizer` を追加してから `schema_version: 7` へ上げる。
+v1〜v6は自動補完せず起動前に拒否する。
+
+現行 Control Config v7 は設定の live reload を行わない。設定変更は候補全体を別オブジェクトで検証したうえで
 **次回再起動時**にだけ反映する。これにより、変更後の設定も必ず `STARTUP` の Max を通る。
 `trace_metadata()` は、採用されたsource名・schema version・SHA-256を #82 の decision traceへ渡す。
 Confidence / OOD の判断（`model_gate`）には検証済み assessment の値だけを書き、裏付けの無い tick は
