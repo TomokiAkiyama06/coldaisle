@@ -19,6 +19,8 @@ from typing import Self
 
 from pydantic import BaseModel, ConfigDict, model_validator
 
+from coldaisle.control.acoustic import AcousticCostModel
+from coldaisle.control.air_balance import AirBalanceModel, BalanceBand
 from coldaisle.control.config import FanPolicyConfig, SafetyConfig
 from coldaisle.control.fallback.gate import LearnedControlStatus, LearnedFailure, SnapshotStatus
 from coldaisle.control.model.confidence import (
@@ -161,9 +163,11 @@ class LearnedMpcController:
         policy: FanPolicyConfig,
         safety: SafetyConfig,
         *,
-        cost_model: MpcCostModel,
         assessor: ConfidenceAssessor,
         monotonic_ms: Callable[[], int],
+        acoustic: AcousticCostModel | None = None,
+        air_balance: AirBalanceModel | None = None,
+        balance_band: BalanceBand | None = None,
     ) -> None:
         """設定とモデルが噛み合わなければ ``MpcModelUnusableError`` で**生成時に**失敗する。
 
@@ -171,6 +175,14 @@ class LearnedMpcController:
         ``LearnedFailure.MODEL_LOAD_FAILURE`` として Gate へ渡し、Fallback で運転を続ける。
         """
         self._check_binding_matches_policy(binding, policy, assessor)
+        # **目的関数を外から受け取らない。** 別の設定で作った cost model を渡されると、
+        # 重みや基準量だけが運転設定とずれる。任意依存（#94 / #81）だけを受け取る。
+        cost_model = MpcCostModel(
+            policy.mpc.optimizer,
+            acoustic=acoustic,
+            air_balance=air_balance,
+            balance_band=balance_band,
+        )
         self._binding = binding
         self._policy = policy
         self._safety = safety

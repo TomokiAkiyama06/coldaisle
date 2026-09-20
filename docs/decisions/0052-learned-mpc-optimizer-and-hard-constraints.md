@@ -46,7 +46,7 @@ MPC の内部モデルには `InferenceCapability.COUNTERFACTUAL_ACTION` を要�
 1. `ArtifactAttestation` を伴っていること（= #104 の検証経路を通った bytes であること）
 2. attestation の `kind` が `thermal_model`
 3. attestation の `production_active` が真（= その kind の**いまの production pointer そのもの**）
-4. `capability` が `counterfactual_action`
+4. **attestation の** `capability` が `counterfactual_action`（モデルの自称は照合にだけ使う）
 5. 要求する authority stage が **attestation の** `authority_compatibility` に含まれる
 6. **attestation の** `version` が runtime の期待と一致する
 7. モデルの申告（`model_id` / `model_version`）と、公開している feature / target schema version が
@@ -80,6 +80,7 @@ attestation の各項目に対して、突き合わせる場所を決める。
 | attestation の値 | どこで突き合わせるか |
 |---|---|
 | `kind` | `for_control`: `thermal_model` 以外を拒む |
+| `capability` | `for_control`: 反実仮想を申告していない artifact を拒む / 自称と照合 |
 | `model_id` | `for_control`: モデルの申告と照合 / `_check_anchor`: anchor 推論と照合 |
 | `version` | `for_control`: 申告と runtime の期待 / `_check_anchor` / `_check_prediction` / Gate |
 | `artifact_sha256` | `_check_anchor`: anchor 推論と照合 / 生成時: Confidence Profile の binding と照合 |
@@ -96,6 +97,9 @@ artifact のものであることを**生成時に**確かめる（学習範囲�
 
 #### 束縛と運転設定は同じ前提で作る
 
+目的関数は controller が `policy.mpc.optimizer` から**自分で組み立てる**。外から渡せると、
+重みや基準量だけが運転設定とずれる。任意依存（#94 Acoustic / #81 Air Balance）だけを受け取る。
+
 `MpcModelBinding` は authority stage を指定して検証する。その stage と、いま動かす
 `FanPolicyConfig.authority_stage` が違うと、Registry が SHADOW だけを許した artifact が FULL の
 経路へ入る。**`LearnedMpcController` の生成時に両者の一致を要求する。** 同じ理由で、
@@ -106,10 +110,29 @@ Confidence 判定器が runtime と同じ `model_confidence` 設定で作られ�
 runtime は**検証済みの `ControlConfig.policy` を controller と Gate の両方へ同じものとして渡す**。
 Gate へ渡す `expected_model_version` も `MpcModelBinding.model_version`（= attestation の版）から取る。
 
-`capability` だけは #104 の `ArtifactMetadata` がまだ持たないため、いまはモデルの申告を読む。
-現行の artifact 形式は `observational_replay` しか表現できず active 制御へ届かないので、実害は
-無い。反実仮想 artifact を #84 が定義するときに #104 の metadata へ capability を持たせ、
-ここも attestation 側から取る（§5）。
+#### capability は登録時の申告から取る
+
+`ArtifactMetadata` に `capability` を必須項目として足し、Registry の schema version を 2 へ上げた
+（既定値を補うと、能力を申告していない artifact が「反実仮想もできる」側へ倒れる）。
+`ThermalRegistryMetadata`（#84 の登録用 metadata）も manifest の capability をそのまま写す。
+attestation はこの値を載せ、**`for_control` は attestation の capability だけを見る。**
+推論器が自分で名乗った値は「attested と食い違っていないか」の照合にしか使わない。
+
+現行の #84 artifact は manifest の capability が `observational_replay` に固定されているため、
+登録される capability も必ず `observational_replay` になり、**すべての artifact が拒否される。**
+これは想定どおりの結果である。重要なのは、その拒否が推論器の自称ではなく**登録済みのデータ**から
+出ていることである。
+
+**将来の反実仮想 artifact が登録時に申告すべきこと**（#83 / #84 が形式を定めるときの条件）:
+
+- `ThermalModelManifest.capability` を `counterfactual_action` にできる artifact 形式
+  （anchor action 以降の Fan action 列を持つ Dataset 版から学習したもの）
+- `ThermalRegistryMetadata.capability` / `ArtifactMetadata.capability` に同じ値を載せて登録する
+- その artifact 専用の Confidence Profile（`profile.binding` が同じ artifact hash を指すこと）
+- `authority_compatibility` に、実測評価で裏づけた stage を入れる（`SHADOW` から順に）
+- 推論器は **Registry の loader が検証済み bytes から作った型**だけにする。#84 の
+  `RidgeThermalModel.from_verified_artifact` と同じく、公開 constructor を持たせない
+  （この最後の条件はまだ実装していない。§5）
 
 `ThermalModelManifest.capability` と `ThermalPrediction.capability` は
 `Literal[observational_replay]` に固定されているため、**現行のどの artifact も条件 2 を満たせない。**
@@ -146,6 +169,10 @@ Gate（#79 / #85）へ渡す。制御は Fallback で走り続ける（AGENTS.md
 
 ### 2.3 探索は Baseline を出発点にした決定論的な座標降下
 
+- **上限**: control step 数の構造上限は 32 とし、#84 の `MAX_TARGET_HORIZONS` に合わせる。
+  内部モデルの target schema と plan prediction が 32 horizon までしか表現できないため、
+  設定だけがそれより多い step を許すと、検証に通っても決して動かない組み合わせを作れてしまう。
+  **設定の上限を予測の契約へ合わせる**（逆に契約を広げない）。
 - **plan の形**: 1つの demand を horizon 全体で保持する（move blocking = 1）。
   次 tick で必ず再計算する receding horizon なので、初版は step ごとに別の値を探索しない。
 - **出発点**: Fallback（#79）の requested を制約へ収めた値。したがって incumbent は常に Baseline で、
@@ -315,7 +342,7 @@ replay の再現性は seed だけでは守れない。決定論的な探索と�
 
 | 論点 | どこで決めるか |
 |---|---|
-| #104 の `ArtifactMetadata` へ `capability` を持たせる | 反実仮想 artifact 形式を定める #84 と同時に #104 |
+| 反実仮想モデルを Registry の loader だけが作れる型にする（公開 constructor を持たせない） | 反実仮想 artifact 形式を定める #84 |
 | Acoustic / Air Balance の推定に、要求との対応づけ（どの demand への推定か）を持たせるか | #81 / #94。いまは設定済みの純粋な model だけを繋ぐ前提 |
 | モデル object と検証済み bytes の byte 一致（#84 の `from_verified_artifact` 相当を反実仮想側にも） | #84 / #104 |
 | horizon / step / 目的関数の重み・基準量の確定値 | 実測後に #103 の設定と後続の決定記録（Q-22） |

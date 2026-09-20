@@ -18,6 +18,7 @@ import coldaisle.control.model_registry as registry_module
 from coldaisle.clock import SimulatedClock
 from coldaisle.control import (
     ApprovalAction,
+    ArtifactCapability,
     ArtifactFormat,
     ArtifactKind,
     ArtifactLoadStatus,
@@ -69,11 +70,13 @@ def metadata(
     *,
     content: bytes | None = None,
     feature_schema_version: str = "thermal-features-v1",
+    capability: ArtifactCapability = ArtifactCapability.OBSERVATIONAL_REPLAY,
 ) -> ArtifactMetadata:
     body = payload(version) if content is None else content
     return ArtifactMetadata(
         kind=ArtifactKind.THERMAL_MODEL,
         artifact_format=ArtifactFormat.JSON,
+        capability=capability,
         model_id="rack-thermal",
         version=version,
         created_at="2026-09-18T10:00:00+09:00",

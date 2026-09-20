@@ -94,6 +94,12 @@ offline / shadow evaluation referenceとpromotion / rollbackは#104が管理し�
 渡す配線の誤りを型で止めることである。artifact読み込みの8 MiB上限をallocation前に適用することは
 引き続きblockerとして残る。
 
+**更新（#86 / 決定記録 0052 §2.1）**: `ThermalRegistryMetadata` に `capability` を足し、manifestの
+capabilityをそのまま#104へ申告する（Registry schema version 2）。#86 はRegistryが発行した
+attestationのcapabilityだけを見て内部モデルの可否を決める。v1 artifactのcapabilityは
+`observational_replay`固定なので、**登録されるcapabilityも必ずそれになり、#86 は常に拒否する**。
+反実仮想artifactを定義するときに満たすべき条件は決定記録 0052 §2.1 に列挙した。
+
 （元の記述）現行#104の`VerifiedArtifact`はpublic constructorを持つため、`registry_verified`は
 「そのnominal typeとchecksum / metadata / payloadの整合を#84が再検証した」ことだけを表す。
 Registry lifecycle、promotion、production authorizationの証明には使わない。

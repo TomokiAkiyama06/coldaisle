@@ -522,11 +522,15 @@ class ModelConfidencePolicy(_ConfigModel):
         return self
 
 
-MAX_MPC_HORIZON_STEPS = 64
+MAX_MPC_HORIZON_STEPS = 32
 """1 plan に置ける control step 数の構造上限（#86）。
 
 worker 1回の計算量と trace の大きさを抑えるための境界で、調整値ではない。
 horizon / step の実運用値は設定に置く。
+
+**#84 の ``MAX_TARGET_HORIZONS`` を超えない。** 内部モデルの target schema と plan prediction が
+32 horizon までしか表現できないため、それより多い step 数の設定は検証を通っても決して動かない。
+設定の上限を予測の契約へ合わせる（逆に契約を広げない）。一致は試験で確かめる。
 """
 
 MAX_MPC_EVALUATIONS = 4_096

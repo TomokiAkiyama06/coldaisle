@@ -37,7 +37,7 @@ from pydantic import (
 from coldaisle.clock import Clock, WallClock
 from coldaisle.control.schema import AuthorityStage
 
-MODEL_REGISTRY_SCHEMA_VERSION: Literal[1] = 1
+MODEL_REGISTRY_SCHEMA_VERSION: Literal[2] = 2
 MODEL_REGISTRY_CONFIG_FILENAME = "model-registry.yaml"
 
 _STATE_FILENAME = "registry.json"
@@ -75,6 +75,19 @@ class ArtifactKind(StrEnum):
     CONFIDENCE_MODEL = "confidence_model"
     SUPERVISOR_POLICY = "supervisor_policy"
     FEATURE_TRANSFORM = "feature_transform"
+
+
+class ArtifactCapability(StrEnum):
+    """artifact が主張できる科学的な能力。deployment lifecycle の状態とは別（#84 / #86）。
+
+    **登録時に申告する。** 推論器が自分で名乗る値ではなく、Registry の metadata が持ち、
+    検証経路が発行する attestation に載る。#86 はこの値だけを見て内部モデルの可否を決める。
+    """
+
+    OBSERVATIONAL_REPLAY = "observational_replay"
+    """観測の再生だけ。**反実仮想予測は主張しない**（決定記録 0048 §2.1）。"""
+    COUNTERFACTUAL_ACTION = "counterfactual_action"
+    """候補 Fan action 列に対する将来観測の予測。#86 が要求する（決定記録 0052 §2.1）。"""
 
 
 class ArtifactFormat(StrEnum):
@@ -148,9 +161,15 @@ class ArtifactRef(_Frozen):
 class ArtifactMetadata(_Frozen):
     """Training, compatibility, evaluation, and integrity metadata."""
 
-    schema_version: Literal[1] = MODEL_REGISTRY_SCHEMA_VERSION
+    schema_version: Literal[2] = MODEL_REGISTRY_SCHEMA_VERSION
     kind: ArtifactKind
     artifact_format: ArtifactFormat
+    capability: ArtifactCapability
+    """この artifact が主張する能力。**登録時に申告し、既定値を持たない。**
+
+    v1 の metadata には無かったため schema version を 2 へ上げる。既定値を補って読むと、
+    能力を申告していない artifact が「反実仮想もできる」側に倒れる余地を残してしまう。
+    """
     model_id: str = Field(pattern=_IDENTIFIER_PATTERN, max_length=120)
     version: str = Field(pattern=_SEMVER_PATTERN, max_length=80)
     created_at: str = Field(min_length=1, max_length=64)
@@ -327,7 +346,7 @@ def _validate_member[ModelT: BaseModel](model: type[ModelT], value: object) -> M
 class RegistrySnapshot(_Frozen):
     """Atomically replaced complete registry state."""
 
-    schema_version: Literal[1] = MODEL_REGISTRY_SCHEMA_VERSION
+    schema_version: Literal[2] = MODEL_REGISTRY_SCHEMA_VERSION
     revision: int = Field(ge=0)
     artifacts: dict[str, ArtifactRecord] = Field(default_factory=dict)
     production: dict[ArtifactKind, ProductionSlot] = Field(default_factory=dict)
@@ -503,6 +522,7 @@ class ArtifactAttestation:
     __slots__ = (
         "_artifact_sha256",
         "_authority_compatibility",
+        "_capability",
         "_feature_schema_version",
         "_kind",
         "_model_id",
@@ -513,6 +533,7 @@ class ArtifactAttestation:
         "_version",
     )
     _kind: ArtifactKind
+    _capability: ArtifactCapability
     _model_id: str
     _version: str
     _artifact_sha256: str
@@ -548,6 +569,7 @@ class ArtifactAttestation:
         object.__setattr__(attestation, "_status", status)
         object.__setattr__(attestation, "_production_active", production_active)
         object.__setattr__(attestation, "_kind", metadata.kind)
+        object.__setattr__(attestation, "_capability", metadata.capability)
         object.__setattr__(attestation, "_model_id", metadata.model_id)
         object.__setattr__(attestation, "_version", metadata.version)
         object.__setattr__(attestation, "_artifact_sha256", metadata.sha256)
@@ -563,6 +585,14 @@ class ArtifactAttestation:
     def kind(self) -> ArtifactKind:
         """検証した artifact の役割。"""
         return self._kind
+
+    @property
+    def capability(self) -> ArtifactCapability:
+        """**登録時に申告した能力。** 推論器の自称ではない。
+
+        #86 はこの値だけを見て内部モデルの可否を決める（決定記録 0052 §2.1）。
+        """
+        return self._capability
 
     @property
     def model_id(self) -> str:
@@ -623,6 +653,7 @@ class ArtifactAttestation:
         """#82 の decision trace へ載せられる、path を含まない情報。"""
         return {
             "artifact_kind": self._kind.value,
+            "artifact_capability": self._capability.value,
             "model_id": self._model_id,
             "model_version": self._version,
             "artifact_sha256": self._artifact_sha256,

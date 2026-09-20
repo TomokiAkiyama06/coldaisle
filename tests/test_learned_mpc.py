@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import ast
 import json
+import tempfile
 from collections.abc import Sequence
 from functools import cache
 from hashlib import sha256
@@ -44,7 +45,7 @@ from coldaisle.control.air_balance import (
     CharacterizationSource,
     ThermalInputs,
 )
-from coldaisle.control.config import FanPolicyConfig, SafetyConfig
+from coldaisle.control.config import MAX_MPC_HORIZON_STEPS, FanPolicyConfig, SafetyConfig
 from coldaisle.control.fallback import (
     ControllerGate,
     FallbackCause,
@@ -59,6 +60,7 @@ from coldaisle.control.model.confidence import (
     inference_id,
 )
 from coldaisle.control.model.thermal import (
+    MAX_TARGET_HORIZONS,
     ArtifactVerification,
     InferenceCapability,
     ObservedThermalInput,
@@ -70,6 +72,7 @@ from coldaisle.control.model.thermal import (
 from coldaisle.control.model_registry import (
     ApprovalAction,
     ArtifactAttestation,
+    ArtifactCapability,
     ArtifactFormat,
     ArtifactKind,
     ArtifactMetadata,
@@ -292,6 +295,7 @@ def issue_attestation(
     stage: AuthorityStage = AuthorityStage.FULL,
     promoted: bool = True,
     payload: bytes | None = None,
+    capability: ArtifactCapability = ArtifactCapability.COUNTERFACTUAL_ACTION,
 ) -> ArtifactAttestation:
     """**本物の Model Registry（#104）に登録し、検証経路から attestation を受け取る。**
 
@@ -305,6 +309,7 @@ def issue_attestation(
     metadata = ArtifactMetadata(
         kind=kind,
         artifact_format=ArtifactFormat.JSON,
+        capability=capability,
         model_id=model_id,
         version=version,
         created_at="2026-09-20T10:00:00+09:00",
@@ -511,17 +516,13 @@ def build_controller(
         authority_stage=settings.authority_stage,
         expected_model_version=attestation.version,
     )
-    cost = MpcCostModel(
-        settings.mpc.optimizer,
-        acoustic=acoustic_model() if acoustic else None,
-    )
     controller = LearnedMpcController(
         binding,
         settings,
         safety(),
-        cost_model=cost,
         assessor=ConfidenceAssessor(profile, settings.model_confidence),
         monotonic_ms=clock or ScriptedClock(0),
+        acoustic=acoustic_model() if acoustic else None,
     )
     return controller, planning, settings
 
@@ -576,16 +577,26 @@ def test_invariant_2_a_dataset_v1_artifact_is_refused_as_the_internal_model(trai
     いま存在する artifact は manifest の capability が `observational_replay` に固定されている。
     束縛を許すと、後続 action 列を学習していない係数を Fan action の因果効果として使ってしまう。
     """
-    base, _profile, attestation = trained
+    base, _profile, _attestation = trained
     identity = CounterfactualModelIdentity.from_manifest(base.manifest)
-
     assert identity.capability is InferenceCapability.OBSERVATIONAL_REPLAY
-    with pytest.raises(MpcModelUnusableError, match="反実仮想"):
+
+    # 実際に Registry へ登録できるのは、いまは observational_replay だけである。
+    observational = issue_attestation(
+        Path(tempfile.mkdtemp(prefix="pr151-observational")) / "registry",
+        model_id=base.manifest.model_id,
+        version=base.manifest.model_version,
+        capability=ArtifactCapability.OBSERVATIONAL_REPLAY,
+        payload=canonical_artifact_bytes(base._artifact),
+    )
+
+    assert observational.capability is ArtifactCapability.OBSERVATIONAL_REPLAY
+    with pytest.raises(MpcModelUnusableError, match="反実仮想予測を申告していない"):
         MpcModelBinding.for_control(
             PlanningModel(base, capability=identity.capability),
-            attestation=attestation,
+            attestation=observational,
             authority_stage=AuthorityStage.FULL,
-            expected_model_version=attestation.version,
+            expected_model_version=observational.version,
         )
 
 
@@ -703,20 +714,27 @@ def test_invariant_2_f_a_version_mismatch_is_refused_before_any_inference(traine
 
 def test_invariant_2_g_a_refused_model_degrades_to_fallback_without_stopping(trained) -> None:
     """束縛できないモデルでも**運転は止まらない**。Gate は理由付きで Fallback にする。"""
-    base, _profile, attestation = trained
+    base, _profile, _attestation = trained
     settings = mpc_policy()
+    observational = issue_attestation(
+        Path(tempfile.mkdtemp(prefix="pr151-degrade")) / "registry",
+        model_id=base.manifest.model_id,
+        version=base.manifest.model_version,
+        capability=ArtifactCapability.OBSERVATIONAL_REPLAY,
+        payload=canonical_artifact_bytes(base._artifact),
+    )
     with pytest.raises(MpcModelUnusableError) as refusal:
         MpcModelBinding.for_control(
             PlanningModel(base, capability=InferenceCapability.OBSERVATIONAL_REPLAY),
-            attestation=attestation,
+            attestation=observational,
             authority_stage=settings.authority_stage,
-            expected_model_version=attestation.version,
+            expected_model_version=observational.version,
         )
     status = MpcProposal(
         failure=LearnedFailure.MODEL_LOAD_FAILURE,
         failure_reason=Reason(code="model_unusable", detail=str(refusal.value)),
     ).to_status(received_at_mono_ms=0)
-    gate = ControllerGate(settings, expected_model_version=attestation.version)
+    gate = ControllerGate(settings, expected_model_version=observational.version)
 
     selection = gate.select(
         now_mono_ms=0,
@@ -1835,7 +1853,6 @@ def test_an_anchor_from_another_model_version_is_refused(trained, tmp_path: Path
             binding,
             settings,
             safety(),
-            cost_model=MpcCostModel(settings.mpc.optimizer),
             assessor=ConfidenceAssessor(profile, settings.model_confidence),
             monotonic_ms=ScriptedClock(0),
         )
@@ -1861,7 +1878,6 @@ def test_the_binding_authority_must_match_the_running_policy(trained) -> None:
             shadow_binding,
             full_policy,
             safety(),
-            cost_model=MpcCostModel(full_policy.mpc.optimizer),
             assessor=ConfidenceAssessor(profile, full_policy.model_confidence),
             monotonic_ms=ScriptedClock(0),
         )
@@ -1872,7 +1888,6 @@ def test_the_binding_authority_must_match_the_running_policy(trained) -> None:
         shadow_binding,
         shadow_policy,
         safety(),
-        cost_model=MpcCostModel(shadow_policy.mpc.optimizer),
         assessor=ConfidenceAssessor(profile, shadow_policy.model_confidence),
         monotonic_ms=ScriptedClock(0),
     )
@@ -1902,7 +1917,6 @@ def test_a_confidence_assessor_from_another_policy_is_refused(trained) -> None:
             binding,
             settings,
             safety(),
-            cost_model=MpcCostModel(settings.mpc.optimizer),
             assessor=ConfidenceAssessor(profile, other),
             monotonic_ms=ScriptedClock(0),
         )
@@ -1910,6 +1924,7 @@ def test_a_confidence_assessor_from_another_policy_is_refused(trained) -> None:
 
 ATTESTATION_FIELD_CHECKS: dict[str, str] = {
     "kind": "for_control: thermal_model 以外を拒む",
+    "capability": "for_control: 反実仮想を申告していない artifact を拒む / 自称と照合",
     "model_id": "for_control: identity と照合 / _check_anchor: anchor と照合",
     "version": "for_control: identity と期待版 / _check_anchor / _check_prediction",
     "artifact_sha256": "_check_anchor: anchor と照合 / 生成時: Confidence Profile と照合",
@@ -1960,7 +1975,6 @@ def test_the_policy_values_with_a_binding_counterpart_are_compared(trained) -> N
             binding,
             policy_config,
             safety(),
-            cost_model=MpcCostModel(policy_config.mpc.optimizer),
             assessor=ConfidenceAssessor(profile, policy_config.model_confidence),
             monotonic_ms=ScriptedClock(0),
         )
@@ -1973,4 +1987,75 @@ def test_the_policy_values_with_a_binding_counterpart_are_compared(trained) -> N
     with pytest.raises(MpcModelUnusableError, match="metric"):
         build(
             mpc_policy(cost_metrics={"cpu_temperature": "air.front_intake", "gpu_temperature": GPU})
+        )
+
+
+def test_the_capability_comes_from_the_registry_not_from_the_model(trained, tmp_path: Path) -> None:
+    """**自称の capability では束縛できない**（codex #4055686513）。
+
+    #104 の metadata と attestation が capability を持つようになったので、推論器がいくら
+    `counterfactual_action` を名乗っても、登録時の申告が `observational_replay` なら拒否される。
+    現行の #84 artifact はすべてこちらなので、**いまは常に拒否されるのが期待どおりの結果**である。
+    """
+    base, _profile, _attestation = trained
+    observational = issue_attestation(
+        tmp_path / "observational",
+        model_id=base.manifest.model_id,
+        version=base.manifest.model_version,
+        capability=ArtifactCapability.OBSERVATIONAL_REPLAY,
+        payload=canonical_artifact_bytes(base._artifact),
+    )
+
+    # 自称だけ counterfactual に書き換えても通らない。
+    with pytest.raises(MpcModelUnusableError, match="反実仮想予測を申告していない"):
+        MpcModelBinding.for_control(
+            PlanningModel(base, capability=InferenceCapability.COUNTERFACTUAL_ACTION),
+            attestation=observational,
+            authority_stage=AuthorityStage.FULL,
+            expected_model_version=observational.version,
+        )
+
+
+def test_a_model_contradicting_the_attested_capability_is_refused(trained, tmp_path: Path) -> None:
+    """attested と自称が食い違う model も拒む（どちらが正かを黙って決めない）。"""
+    base, _profile, _attestation = trained
+    counterfactual = issue_attestation(
+        tmp_path / "counterfactual",
+        model_id=base.manifest.model_id,
+        version=base.manifest.model_version,
+        capability=ArtifactCapability.COUNTERFACTUAL_ACTION,
+        payload=canonical_artifact_bytes(base._artifact),
+    )
+
+    with pytest.raises(MpcModelUnusableError, match="食い違っている"):
+        MpcModelBinding.for_control(
+            PlanningModel(base, capability=InferenceCapability.OBSERVATIONAL_REPLAY),
+            attestation=counterfactual,
+            authority_stage=AuthorityStage.FULL,
+            expected_model_version=counterfactual.version,
+        )
+
+
+def test_the_configured_step_limit_cannot_exceed_the_prediction_contract() -> None:
+    """**設定の上限を、予測の契約より大きくしない**（codex #4055686520）。
+
+    内部モデルの target schema と plan prediction は 32 horizon までしか表現できない。
+    設定だけが 64 step を通すと、検証に通っても決して動かない組み合わせを作れてしまう。
+    """
+    assert MAX_MPC_HORIZON_STEPS <= MAX_TARGET_HORIZONS
+    assert MAX_MPC_HORIZON_STEPS == 32
+
+    at_limit = mpc_policy(
+        step_ms=_provisional(1_000),
+        horizon_ms=_provisional(1_000 * MAX_MPC_HORIZON_STEPS),
+    )
+    assert at_limit.mpc.optimizer.steps == MAX_MPC_HORIZON_STEPS
+    assert len(ActionPlan.held(demands(0.4), step_ms=1_000, steps=MAX_MPC_HORIZON_STEPS).steps) == (
+        MAX_MPC_HORIZON_STEPS
+    )
+
+    with pytest.raises(ValidationError, match="control step"):
+        mpc_policy(
+            step_ms=_provisional(1_000),
+            horizon_ms=_provisional(1_000 * (MAX_MPC_HORIZON_STEPS + 1)),
         )

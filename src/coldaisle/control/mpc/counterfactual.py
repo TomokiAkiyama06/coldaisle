@@ -29,7 +29,11 @@ from coldaisle.control.model.thermal import (
     ThermalPrediction,
     ThermalTargetSchema,
 )
-from coldaisle.control.model_registry import ArtifactAttestation, ArtifactKind
+from coldaisle.control.model_registry import (
+    ArtifactAttestation,
+    ArtifactCapability,
+    ArtifactKind,
+)
 from coldaisle.control.mpc.plan import ActionPlan
 from coldaisle.control.schema import AuthorityStage
 
@@ -38,10 +42,10 @@ FiniteFloat = Annotated[float, Field(allow_inf_nan=False)]
 TimestampMs = Annotated[int, Field(ge=0)]
 PositiveDurationMs = Annotated[int, Field(gt=0)]
 
-COUNTERFACTUAL_CAPABILITIES: frozenset[InferenceCapability] = frozenset(
-    {InferenceCapability.COUNTERFACTUAL_ACTION}
+COUNTERFACTUAL_CAPABILITIES: frozenset[ArtifactCapability] = frozenset(
+    {ArtifactCapability.COUNTERFACTUAL_ACTION}
 )
-"""MPC の内部モデルにできる capability。
+"""MPC の内部モデルにできる、**Registry へ登録時に申告された** capability。
 
 ``observational_replay`` は入っていない。**現行の artifact はすべてそちら**なので、後続
 action 列を持つ Dataset 版と実測評価が揃うまで、active 制御に使える内部モデルは存在しない。
@@ -63,11 +67,10 @@ class CounterfactualModelIdentity(_Frozen):
     model_id: str = Field(min_length=1, max_length=120)
     model_version: str = Field(min_length=1, max_length=120)
     capability: InferenceCapability
-    """#104 の metadata がまだ持たない唯一の項目（決定記録 0052 §2.1 / §5）。
+    """モデル自身の申告。**可否の判断には使わない。**
 
-    現行の artifact 形式は ``observational_replay`` しか表現できないため、いまは自称でも
-    active 制御へ届かない。反実仮想 artifact を #84 が定義するときに、#104 の metadata へ
-    capability を持たせ、ここも attestation 側から取る。
+    束縛は Registry が発行した attestation の capability だけを見る。この値は
+    「自称が attested と食い違っていないか」の照合にだけ使う（決定記録 0052 §2.1）。
     """
 
     @classmethod
@@ -131,7 +134,7 @@ class PlanPrediction(_Frozen):
 
     @model_validator(mode="after")
     def _targets_follow_the_plan(self) -> Self:
-        if self.capability not in COUNTERFACTUAL_CAPABILITIES:
+        if self.capability is not InferenceCapability.COUNTERFACTUAL_ACTION:
             raise ValueError("反実仮想を主張しない capability で plan prediction を作らない")
         offsets = tuple(target.offset_ms for target in self.targets)
         if tuple(sorted(set(offsets))) != offsets:
@@ -243,10 +246,16 @@ class MpcModelBinding:
                 "production pointer でない artifact に制御権を渡さない"
                 f"（status={attestation.status.value}）"
             )
-        if identity.capability not in COUNTERFACTUAL_CAPABILITIES:
+        if attestation.capability not in COUNTERFACTUAL_CAPABILITIES:
+            # **登録時に申告された能力だけを見る。** 推論器の自称では判断しない。
             raise MpcModelUnusableError(
-                "反実仮想予測を主張しない model を MPC の内部モデルにしない"
-                f"（capability={identity.capability.value}。決定記録 0048 §2.1）"
+                "反実仮想予測を申告していない artifact を MPC の内部モデルにしない"
+                f"（attested capability={attestation.capability.value}。決定記録 0048 §2.1）"
+            )
+        if identity.capability.value != attestation.capability.value:
+            raise MpcModelUnusableError(
+                "model の自称 capability が Registry の申告と食い違っている"
+                f"（model={identity.capability.value}; attested={attestation.capability.value}）"
             )
         if authority_stage not in attestation.authority_compatibility:
             raise MpcModelUnusableError(
@@ -339,6 +348,11 @@ class MpcModelBinding:
     def artifact_verification(self) -> ArtifactVerification:
         """Registry の証拠に裏づけられた検証状態。**自称値は使わない。**"""
         return ArtifactVerification.REGISTRY_VERIFIED
+
+    @property
+    def capability(self) -> ArtifactCapability:
+        """Registry へ登録時に申告された能力。"""
+        return self._attestation.capability
 
     def trace_metadata(self) -> dict[str, object]:
         """#82 の decision trace へ載せられる、束縛の出どころ。"""
