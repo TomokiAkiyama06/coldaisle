@@ -27,10 +27,10 @@ from coldaisle.control.model.confidence import (
     ResidualEvidence,
 )
 from coldaisle.control.model.thermal import ObservedThermalInput
-from coldaisle.control.mpc.cost import MpcCostModel, MpcCostUnusableError, PlanCost
+from coldaisle.control.mpc.cost import MpcCostModel, PlanCost
 from coldaisle.control.mpc.counterfactual import MpcModelBinding, MpcModelUnusableError
 from coldaisle.control.mpc.optimizer import LearnedMpcOptimizer, MpcSolution
-from coldaisle.control.mpc.plan import HardConstraintSet, InfeasiblePlanError
+from coldaisle.control.mpc.plan import HardConstraintSet
 from coldaisle.control.schema import (
     ControllerKind,
     ControllerProposal,
@@ -77,6 +77,9 @@ class MpcProposal(_Frozen):
             if self.solution is not None:
                 raise ValueError("失敗した tick に解を残さない")
             return self
+        if self.failure_reason is not None:
+            # 提案のある tick に失敗の理由だけが残ると、trace を読んだ側が取り違える。
+            raise ValueError("失敗していない結果に failure_reason を付けない")
         assert self.proposal is not None and self.assessment is not None
         if self.proposal.controller is not ControllerKind.LEARNED_MPC:
             raise ValueError("MpcProposal には Learned MPC の提案だけを入れる")
@@ -120,6 +123,9 @@ class MpcProposal(_Frozen):
         if self.proposal is None:
             return LearnedControlStatus(
                 failure=self.failure,
+                # **理由をここで落とさない。** Gate が trace へ書く理由が
+                # `model_load_failure` だけになると、何が起きたのか後から読めない。
+                failure_reason=self.failure_reason,
                 supervisor_available=supervisor_available,
                 control_deadline_exceeded=control_deadline_exceeded,
                 snapshot_status=snapshot_status,
@@ -159,6 +165,11 @@ class LearnedMpcController:
         assessor: ConfidenceAssessor,
         monotonic_ms: Callable[[], int],
     ) -> None:
+        """設定とモデルが噛み合わなければ ``MpcModelUnusableError`` で**生成時に**失敗する。
+
+        tick ごとに失敗させない。呼び出し側（runtime）はこれを
+        ``LearnedFailure.MODEL_LOAD_FAILURE`` として Gate へ渡し、Fallback で運転を続ける。
+        """
         self._binding = binding
         self._policy = policy
         self._safety = safety
@@ -183,11 +194,17 @@ class LearnedMpcController:
         current_demand: PerZone[Demand],
         residual: ResidualEvidence | None = None,
     ) -> MpcProposal:
-        """この tick の提案を作る。**失敗しても例外にしない。**"""
+        """この tick の提案を作る。**失敗しても例外を外へ出さない。**
+
+        ここが worker の境界である。推論・判定・最適化・依存 model のどれが何を投げても、
+        制御ループを落とさずに Fallback へ渡す（AGENTS.md ルール4）。取り込みループと同じく、
+        ここだけは例外を握らずに**構造化した失敗へ翻訳して**記録する。
+        ``KeyboardInterrupt`` / ``SystemExit`` などの ``BaseException`` は素通しする。
+        """
         started_ms = self._monotonic_ms()
-        if baseline.controller is not ControllerKind.FALLBACK:
-            raise ValueError("baseline には Fallback の提案を渡す")
         try:
+            if baseline.controller is not ControllerKind.FALLBACK:
+                raise ValueError("baseline には Fallback の提案を渡す")
             return self._propose(
                 snapshot=snapshot,
                 observed=observed,
@@ -200,8 +217,9 @@ class LearnedMpcController:
             )
         except MpcModelUnusableError as error:
             return self._failed(LearnedFailure.MODEL_LOAD_FAILURE, "model_unusable", str(error))
-        except (InfeasiblePlanError, MpcCostUnusableError, ValueError) as error:
-            # 推論・判定・制約の失敗は worker 側の失敗として渡す。制御は Fallback で続く。
+        except Exception as error:
+            # 想定した ValueError 系だけを捕まえると、例えば #84 が内部の feature layout 異常に
+            # 使う RuntimeError が素通りして制御ループごと死ぬ。種類で選ばず、翻訳する。
             return self._failed(
                 LearnedFailure.OPTIMIZER_EXCEPTION, type(error).__name__, str(error)
             )
@@ -233,11 +251,14 @@ class LearnedMpcController:
         )
         outcome = self._optimizer.solve(
             observed=observed,
+            anchor=anchor,
             anchor_inference_id=assessment.inference_id,
             constraints=constraints,
             weights=supervisor.weights,
             target_band=supervisor.target_band,
             baseline=_demands(baseline),
+            # anchor 推論と Confidence 判定に使った時間も予算に含める。
+            budget_started_mono_ms=started_ms,
         )
         if outcome.solution is None:
             # timeout / 実行不能でも、anchor 推論とその判定は残っている。理由の付いた提案を

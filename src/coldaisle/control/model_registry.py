@@ -483,11 +483,151 @@ class RegistrySnapshot(_Frozen):
                 raise ValueError("promotion audit なしで shadow evaluation が設定されている")
 
 
+_ATTESTATION_ISSUE_TOKEN = object()
+
+
+class ArtifactAttestation:
+    """Registry 自身が検証を終えたときにだけ発行する、artifact を名指しする証拠。
+
+    **公開 constructor を持たない。** ``VerifiedArtifact`` は誰でも組み立てられる形だったため、
+    その型であること自体は Registry を通った証明にならなかった（決定記録 0048 §2.4 が
+    「sealed / opaque な発行境界」を #85 / #86 統合前の条件として挙げている）。この値は
+    ``ModelRegistry`` の検証経路だけが発行し、受け取った側は「Registry を通った」事実を
+    自称ではなく型で確かめられる。
+
+    **暗号的な保証ではない。** 同一プロセス内の悪意ある偽造を防げないことは所有者が
+    受け入れている（決定記録 0050 §3）。狙いは、検証していない artifact や別の artifact を
+    取り違えて制御経路へ渡す**配線の誤り**を、レビューではなく型で止めることである。
+    """
+
+    __slots__ = (
+        "_artifact_sha256",
+        "_authority_compatibility",
+        "_feature_schema_version",
+        "_kind",
+        "_model_id",
+        "_registry_revision",
+        "_target_schema_version",
+        "_version",
+    )
+    _kind: ArtifactKind
+    _model_id: str
+    _version: str
+    _artifact_sha256: str
+    _feature_schema_version: str
+    _target_schema_version: str
+    _authority_compatibility: tuple[AuthorityStage, ...]
+    _registry_revision: int
+
+    def __init__(self) -> None:
+        raise TypeError("ArtifactAttestation は Model Registry の検証経路からだけ得られる")
+
+    def __setattr__(self, name: str, value: object) -> None:
+        """発行後に差し替えられないようにする。"""
+        raise AttributeError("ArtifactAttestation は不変")
+
+    @classmethod
+    def _issue(
+        cls,
+        metadata: ArtifactMetadata,
+        registry_revision: int,
+        *,
+        _token: object | None = None,
+    ) -> ArtifactAttestation:
+        if _token is not _ATTESTATION_ISSUE_TOKEN:
+            raise TypeError("ArtifactAttestation は Registry の検証経路だけが発行できる")
+        attestation = object.__new__(cls)
+        object.__setattr__(attestation, "_kind", metadata.kind)
+        object.__setattr__(attestation, "_model_id", metadata.model_id)
+        object.__setattr__(attestation, "_version", metadata.version)
+        object.__setattr__(attestation, "_artifact_sha256", metadata.sha256)
+        object.__setattr__(attestation, "_feature_schema_version", metadata.feature_schema_version)
+        object.__setattr__(attestation, "_target_schema_version", metadata.target_schema_version)
+        object.__setattr__(
+            attestation, "_authority_compatibility", metadata.authority_compatibility
+        )
+        object.__setattr__(attestation, "_registry_revision", registry_revision)
+        return attestation
+
+    @property
+    def kind(self) -> ArtifactKind:
+        """検証した artifact の役割。"""
+        return self._kind
+
+    @property
+    def model_id(self) -> str:
+        """検証した artifact の model ID。"""
+        return self._model_id
+
+    @property
+    def version(self) -> str:
+        """検証した artifact の version。"""
+        return self._version
+
+    @property
+    def artifact_sha256(self) -> str:
+        """検証した bytes の SHA-256。"""
+        return self._artifact_sha256
+
+    @property
+    def feature_schema_version(self) -> str:
+        """検証した artifact の feature schema version。"""
+        return self._feature_schema_version
+
+    @property
+    def target_schema_version(self) -> str:
+        """検証した artifact の target schema version。"""
+        return self._target_schema_version
+
+    @property
+    def authority_compatibility(self) -> tuple[AuthorityStage, ...]:
+        """Registry metadata が許した authority stage。"""
+        return self._authority_compatibility
+
+    @property
+    def registry_revision(self) -> int:
+        """発行時の registry revision。"""
+        return self._registry_revision
+
+    @property
+    def model_version(self) -> str:
+        """``ControlState.model_version`` に使える一意な値。"""
+        return f"{self._model_id}@{self._version}"
+
+    def trace_metadata(self) -> dict[str, object]:
+        """#82 の decision trace へ載せられる、path を含まない情報。"""
+        return {
+            "artifact_kind": self._kind.value,
+            "model_id": self._model_id,
+            "model_version": self._version,
+            "artifact_sha256": self._artifact_sha256,
+            "registry_revision": self._registry_revision,
+        }
+
+
 class VerifiedArtifact(_Frozen):
     """Checksum-verified immutable artifact bytes; no deserialization has occurred."""
 
+    # 外から発行できない ``ArtifactAttestation`` を必須にすることで、この型そのものが
+    # Registry の検証経路の外では組み立てられなくなる（決定記録 0048 §2.4 / 0052 §2.1）。
+    model_config = ConfigDict(
+        frozen=True, extra="forbid", strict=True, arbitrary_types_allowed=True
+    )
+
     metadata: ArtifactMetadata
     payload: bytes
+    attestation: ArtifactAttestation
+
+    @model_validator(mode="after")
+    def _attestation_names_this_artifact(self) -> Self:
+        if (
+            self.attestation.kind is not self.metadata.kind
+            or self.attestation.model_id != self.metadata.model_id
+            or self.attestation.version != self.metadata.version
+            or self.attestation.artifact_sha256 != self.metadata.sha256
+        ):
+            raise ValueError("attestation が別の artifact を指している")
+        return self
 
     @property
     def ref(self) -> ArtifactRef:
@@ -1025,7 +1165,7 @@ class ModelRegistry:
     ) -> ArtifactLoadResult:
         record = snapshot.artifacts[ref.key]
         try:
-            artifact = self._verify(root_fd, record, compatibility)
+            artifact = self._verify(root_fd, record, compatibility, snapshot.revision)
         except _ArtifactUnavailableError:
             return self._load_failure(
                 ArtifactLoadStatus.ARTIFACT_UNAVAILABLE,
@@ -1068,6 +1208,7 @@ class ModelRegistry:
         root_fd: int,
         record: ArtifactRecord,
         compatibility: ModelCompatibility | None,
+        registry_revision: int = 0,
     ) -> VerifiedArtifact:
         try:
             payload = self._read_artifact(root_fd, record.ref)
@@ -1084,7 +1225,17 @@ class ModelRegistry:
                 raise _SchemaMismatchError("artifact schema mismatch")
             if compatibility.authority_stage not in record.metadata.authority_compatibility:
                 raise _AuthorityIncompatibleError("authority stage incompatible")
-        return VerifiedArtifact(metadata=record.metadata, payload=payload)
+        # attestation はこの検証経路だけが発行する。呼び出し側が「Registry を通った」ことを
+        # 自称ではなく型で示せるようにする（決定記録 0052 §2.1）。
+        return VerifiedArtifact(
+            metadata=record.metadata,
+            payload=payload,
+            attestation=ArtifactAttestation._issue(
+                record.metadata,
+                registry_revision,
+                _token=_ATTESTATION_ISSUE_TOKEN,
+            ),
+        )
 
     def _validate_format(self, payload: bytes) -> None:
         # Bound the object graph *before* json.loads(): a payload under the byte limit

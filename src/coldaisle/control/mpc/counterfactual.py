@@ -29,6 +29,7 @@ from coldaisle.control.model.thermal import (
     ThermalPrediction,
     ThermalTargetSchema,
 )
+from coldaisle.control.model_registry import ArtifactAttestation, ArtifactKind
 from coldaisle.control.mpc.plan import ActionPlan
 from coldaisle.control.schema import AuthorityStage
 
@@ -52,29 +53,25 @@ class _Frozen(BaseModel):
 
 
 class CounterfactualModelIdentity(_Frozen):
-    """内部モデルが自分について主張する、束縛の判断に必要な事実だけ。"""
+    """内部モデルが自分について主張する事実。
+
+    **これは自称であって証拠ではない。** ``MpcModelBinding.for_control`` は、Registry（#104）が
+    発行した ``ArtifactAttestation`` と突き合わせ、食い違えば束縛しない。
+    verification / authority / model 版は attestation 側を正とし、自称値は照合にだけ使う。
+    """
 
     model_id: str = Field(min_length=1, max_length=120)
     model_version: str = Field(min_length=1, max_length=120)
     capability: InferenceCapability
-    artifact_verification: ArtifactVerification
-    authority_compatibility: Annotated[
-        tuple[AuthorityStage, ...], Field(min_length=1, max_length=len(AuthorityStage))
-    ]
+    """#104 の metadata がまだ持たない唯一の項目（決定記録 0052 §2.1 / §5）。
 
-    @model_validator(mode="after")
-    def _authority_list_is_a_set(self) -> Self:
-        if len(set(self.authority_compatibility)) != len(self.authority_compatibility):
-            raise ValueError("authority_compatibility を重複させない")
-        return self
+    現行の artifact 形式は ``observational_replay`` しか表現できないため、いまは自称でも
+    active 制御へ届かない。反実仮想 artifact を #84 が定義するときに、#104 の metadata へ
+    capability を持たせ、ここも attestation 側から取る。
+    """
 
     @classmethod
-    def from_manifest(
-        cls,
-        manifest: ThermalModelManifest,
-        *,
-        artifact_verification: ArtifactVerification,
-    ) -> CounterfactualModelIdentity:
+    def from_manifest(cls, manifest: ThermalModelManifest) -> CounterfactualModelIdentity:
         """#84 の manifest をそのまま写す。**capability を書き換えない。**
 
         v1 artifact は必ず ``observational_replay`` になるので、この identity で
@@ -84,8 +81,6 @@ class CounterfactualModelIdentity(_Frozen):
             model_id=manifest.model_id,
             model_version=manifest.model_version,
             capability=manifest.capability,
-            artifact_verification=artifact_verification,
-            authority_compatibility=manifest.authority_compatibility,
         )
 
 
@@ -185,15 +180,19 @@ class MpcModelUnusableError(RuntimeError):
 
 
 class MpcModelBinding:
-    """検証済みの内部モデルと、それを使ってよい authority の束（#86）。
+    """Registry の証拠で裏づけた内部モデルと、それを使ってよい authority の束（#86）。
 
     optimizer と controller は **この型を通してしか** モデルに触れない。生成時に一度だけ
     検査し、以後 tick ごとに条件が変わらないようにする。
+
+    **verification / authority / 版・schema は ``ArtifactAttestation`` から取る。**
+    モデル objectの自称値は照合のためだけに読み、食い違えば束縛しない。
     """
 
-    __slots__ = ("_authority_stage", "_identity", "_model")
+    __slots__ = ("_attestation", "_authority_stage", "_identity", "_model")
     _model: CounterfactualThermalModel
     _identity: CounterfactualModelIdentity
+    _attestation: ArtifactAttestation
     _authority_stage: AuthorityStage
 
     def __init__(self) -> None:
@@ -204,10 +203,15 @@ class MpcModelBinding:
         cls,
         model: CounterfactualThermalModel,
         *,
+        attestation: ArtifactAttestation,
         authority_stage: AuthorityStage,
         expected_model_version: str,
     ) -> MpcModelBinding:
         """制御へ提案を出すための束を作る。条件を1つでも欠けば拒む。
+
+        ``attestation`` は Model Registry（#104）の検証経路だけが発行する。呼び出し側が
+        作れないため、**検証していない artifact を取り違えて渡す配線ミスは型で止まる。**
+        同一プロセス内の悪意ある偽造までは防げない（決定記録 0050 §3 / 0052 §2.1）。
 
         **暗黙の降格はしない。** 条件を満たせないモデルは「弱い権限で使う」のではなく使わない。
         """
@@ -215,31 +219,68 @@ class MpcModelBinding:
         identity = CounterfactualModelIdentity.model_validate(
             model.identity.model_dump(mode="python")
         )
-        if identity.artifact_verification is not ArtifactVerification.REGISTRY_VERIFIED:
+        if attestation.kind is not ArtifactKind.THERMAL_MODEL:
             raise MpcModelUnusableError(
-                "Registry 検証済みでない artifact を MPC の内部モデルにしない"
-                f"（verification={identity.artifact_verification.value}）"
+                f"thermal model 以外の artifact を MPC の内部モデルにしない"
+                f"（kind={attestation.kind.value}）"
             )
         if identity.capability not in COUNTERFACTUAL_CAPABILITIES:
             raise MpcModelUnusableError(
                 "反実仮想予測を主張しない model を MPC の内部モデルにしない"
                 f"（capability={identity.capability.value}。決定記録 0048 §2.1）"
             )
-        if authority_stage not in identity.authority_compatibility:
+        if authority_stage not in attestation.authority_compatibility:
             raise MpcModelUnusableError(
-                f"model が要求 authority stage と互換でない（stage={authority_stage.value}）"
+                "Registry が検証した artifact は要求 authority stage と互換でない"
+                f"（stage={authority_stage.value}）"
             )
-        if identity.model_version != expected_model_version:
+        if attestation.version != expected_model_version:
             # Gate も照合するが、版違いの提案を作る前に止める（無駄な推論と誤配を避ける）。
             raise MpcModelUnusableError(
                 "内部モデルの版が runtime の期待と違う"
-                f"（expected={expected_model_version}; actual={identity.model_version}）"
+                f"（expected={expected_model_version}; attested={attestation.version}）"
             )
+        cls._check_model_matches_attestation(model, identity, attestation)
         binding = object.__new__(cls)
         object.__setattr__(binding, "_model", model)
         object.__setattr__(binding, "_identity", identity)
+        object.__setattr__(binding, "_attestation", attestation)
         object.__setattr__(binding, "_authority_stage", authority_stage)
         return binding
+
+    @staticmethod
+    def _check_model_matches_attestation(
+        model: CounterfactualThermalModel,
+        identity: CounterfactualModelIdentity,
+        attestation: ArtifactAttestation,
+    ) -> None:
+        """モデル object が、検証された artifact そのものを表しているか確かめる。
+
+        別の artifact を包んだ wrapper が attestation だけを借りて authority を得ないように、
+        model ID・版・feature / target schema version を突き合わせる。
+        """
+        mismatches = [
+            name
+            for name, attested, declared in (
+                ("model_id", attestation.model_id, identity.model_id),
+                ("model_version", attestation.version, identity.model_version),
+                (
+                    "feature_schema_version",
+                    attestation.feature_schema_version,
+                    model.feature_schema.schema_version,
+                ),
+                (
+                    "target_schema_version",
+                    attestation.target_schema_version,
+                    model.target_schema.schema_version,
+                ),
+            )
+            if attested != declared
+        ]
+        if mismatches:
+            raise MpcModelUnusableError(
+                f"model が検証済み artifact と一致しない: {','.join(mismatches)}"
+            )
 
     def __setattr__(self, name: str, value: object) -> None:
         """束を後から差し替えられないようにする。"""
@@ -252,8 +293,13 @@ class MpcModelBinding:
 
     @property
     def identity(self) -> CounterfactualModelIdentity:
-        """束縛したときに検証した identity。"""
+        """束縛したときに検証した、モデル自身の申告。"""
         return self._identity
+
+    @property
+    def attestation(self) -> ArtifactAttestation:
+        """Registry が発行した証拠。"""
+        return self._attestation
 
     @property
     def authority_stage(self) -> AuthorityStage:
@@ -262,5 +308,19 @@ class MpcModelBinding:
 
     @property
     def model_version(self) -> str:
-        """提案に載せる model 版。"""
-        return self._identity.model_version
+        """提案に載せる model 版。**attestation 側の値を使う。**"""
+        return self._attestation.version
+
+    @property
+    def artifact_sha256(self) -> str:
+        """検証された artifact bytes の SHA-256。予測の出どころの照合に使う。"""
+        return self._attestation.artifact_sha256
+
+    @property
+    def artifact_verification(self) -> ArtifactVerification:
+        """Registry の証拠に裏づけられた検証状態。**自称値は使わない。**"""
+        return ArtifactVerification.REGISTRY_VERIFIED
+
+    def trace_metadata(self) -> dict[str, object]:
+        """#82 の decision trace へ載せられる、束縛の出どころ。"""
+        return {"mpc_model_binding": self._attestation.trace_metadata()}

@@ -40,12 +40,35 @@ Confidence / OOD（#85）はこの取り違えを検出できない。判定し�
 ### 2.1 内部モデルの要件（capability を別の軸として要求する）
 
 MPC の内部モデルには `InferenceCapability.COUNTERFACTUAL_ACTION` を要求する。
-`MpcModelBinding.for_control` は次の4つをすべて満たすモデルだけを束縛する。
+`MpcModelBinding.for_control` は、**Registry（#104）が発行した `ArtifactAttestation` と**
+モデルの申告を突き合わせ、次をすべて満たすときだけ束縛する。
 
-1. `artifact_verification` が `registry_verified`（#104 の checksum 検証を通った bytes）
-2. `capability` が `counterfactual_action`
-3. 要求する authority stage が `authority_compatibility` に含まれる
-4. `model_version` が runtime の期待と一致する
+1. `ArtifactAttestation` を伴っていること（= #104 の検証経路を通った bytes であること）
+2. attestation の `kind` が `thermal_model`
+3. `capability` が `counterfactual_action`
+4. 要求する authority stage が **attestation の** `authority_compatibility` に含まれる
+5. **attestation の** `version` が runtime の期待と一致する
+6. モデルの申告（`model_id` / `model_version`）と、公開している feature / target schema version が
+   attestation と一致する
+
+**verification・authority・版・schema は attestation を正とし、モデルの自称値は照合にだけ使う。**
+自称値だけで判断すると、別の artifact を包んだ wrapper が `registry_verified` を名乗って
+FULL authority を得られてしまう。
+
+#104 側には、この束縛のために最小限の発行境界を足した。`ArtifactAttestation` は公開
+constructor を持たず、`ModelRegistry` の検証経路だけが発行する。`VerifiedArtifact` は
+attestation を必須の項目として持つため、**検証経路の外では組み立てられない**。
+これは決定記録 0048 §2.4 が #85 / #86 統合前の条件として挙げていた
+「sealed / opaque な発行境界」にあたる。
+
+**暗号的な保証ではない。** 同一プロセス内の悪意ある偽造を防げないことは所有者が受け入れている
+（決定記録 0050 §3）。狙いは、検証していない artifact や別の artifact を取り違えて制御経路へ
+渡す**配線の誤り**を、レビューではなく型で止めることである。
+
+`capability` だけは #104 の `ArtifactMetadata` がまだ持たないため、いまはモデルの申告を読む。
+現行の artifact 形式は `observational_replay` しか表現できず active 制御へ届かないので、実害は
+無い。反実仮想 artifact を #84 が定義するときに #104 の metadata へ capability を持たせ、
+ここも attestation 側から取る（§5）。
 
 `ThermalModelManifest.capability` と `ThermalPrediction.capability` は
 `Literal[observational_replay]` に固定されているため、**現行のどの artifact も条件 2 を満たせない。**
@@ -113,6 +136,9 @@ optimizer が従う制約は3つを重ねた最も狭い範囲とする。
 - **どれも範囲を狭める向きにしか働かない。** 満たせる値が無ければ緩めず、実行不能として扱う。
 - **Safety floor は上げ幅の制限に勝つ。** floor が直前の値より上にある tick では上げ幅の制限を外す。
   制限を優先すると、冷却を強めるべき瞬間に弱いまま留まる。
+- **ceiling は緩めない。** 直前の値が ceiling より上（forced Max の直後など）で、下げ幅の制限の
+  ために1 step では ceiling まで下げきれないときは、ceiling の上へ範囲を広げず**実行不能**とする。
+  広げてしまうと、設定した探索上限を MPC 自身が上書きしたことになる。
 
 **この制約は安全上の保証ではない。** 最終裁定は後段の Reactive Guard（#80）と
 Critical Safety（#78）が毎 tick 決定論的に行う（0028 §2.4）。ここで狭めるのは
@@ -131,6 +157,10 @@ optimizer 内部の打ち切りは2つ持つ。
 
 評価回数の上限は**時計に依存しない決定論的な打ち切り**で、replay で同じ結果を得るために持つ。
 
+計算時間は **anchor 推論と Confidence 判定を含めて**数える。探索だけを測ると、推論が遅い tick で
+予算を超えたまま `ok` を返してしまう。経過時間は**各モデル評価の前と後**に見る。Baseline の評価
+だけで予算を使い切る場合や、最後の候補で越える場合を `ok` にしないためである。
+
 - `timeout` / 実行不能（`error`）のとき、optimizer は**解を返さない**。
   中途半端な探索結果を制御に使わない。
 - それでも anchor 推論とその判定は残っているので、controller は理由と
@@ -139,6 +169,13 @@ optimizer 内部の打ち切りは2つ持つ。
   **「なぜ使わなかったか」を trace に残すため**に、提案そのものは作る。
 - 推論・判定・制約の組み立て自体が失敗したときは提案を作らず、
   `LearnedFailure.OPTIMIZER_EXCEPTION` として渡す。次 tick は通常どおり動く。
+- **worker 境界では例外の種類で選ばない。** 推論・判定・最適化・任意依存の model が何を投げても
+  構造化した失敗へ翻訳する。特定の例外型だけを捕まえると、例えば #84 が内部の feature layout
+  異常に使う `RuntimeError` が素通りして制御ループごと死ぬ。`KeyboardInterrupt` /
+  `SystemExit` などの `BaseException` は停止の合図なので素通しする。
+- **失敗の理由を Gate の手前で落とさない。** `LearnedControlStatus` に `failure_reason` を持たせ、
+  Gate は Fallback の理由の `detail` へ載せる。`model_load_failure` としか残らなければ、
+  decision trace から原因を追えない。
 
 1 tick 全体の締め切り（#74）は optimizer の所有ではない。ループ側が
 `control_deadline_exceeded` として Gate へ渡す（#79 で実装済み）。
@@ -231,6 +268,8 @@ replay の再現性は seed だけでは守れない。決定論的な探索と�
 
 | 論点 | どこで決めるか |
 |---|---|
+| #104 の `ArtifactMetadata` へ `capability` を持たせる | 反実仮想 artifact 形式を定める #84 と同時に #104 |
+| モデル object と検証済み bytes の byte 一致（#84 の `from_verified_artifact` 相当を反実仮想側にも） | #84 / #104 |
 | horizon / step / 目的関数の重み・基準量の確定値 | 実測後に #103 の設定と後続の決定記録（Q-22） |
 | 反実仮想を扱える Dataset / Model 形式（後続 action 列） | #83 / #84 / #105 |
 | Fan power のコスト項（取得方法と近似の根拠） | #75 / #94 の実測後 |

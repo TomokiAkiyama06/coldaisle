@@ -1600,3 +1600,55 @@ def test_loaded_trace_metadata_has_version_checksum_and_schema(tmp_path: Path) -
     assert trace["artifact_sha256"] == metadata("1.0.0").sha256
     assert trace["feature_schema_version"] == "thermal-features-v1"
     assert "authority_stage" not in trace, "Model Promotion と Authority Rollout を混同しない"
+
+
+def test_only_the_verification_path_issues_an_artifact_attestation(tmp_path: Path) -> None:
+    """**Registry を通った事実を、型で示せるようにする**（決定記録 0048 §2.4 / 0052 §2.1）。
+
+    `VerifiedArtifact` は誰でも組み立てられたため、その型であること自体は証明にならなかった。
+    発行できない `ArtifactAttestation` を必須にして、検証していない artifact を取り違えて
+    制御経路へ渡す配線ミスを止める。暗号的な保証ではない（決定記録 0050 §3）。
+    """
+    root = tmp_path / "registry"
+    registry = ModelRegistry(root, SimulatedClock(NOW_MS), limits=LIMITS)
+    register_and_validate(registry, "1.0.0")
+    promote(registry, "1.0.0")
+
+    loaded = registry.load_production(ArtifactKind.THERMAL_MODEL, COMPATIBILITY)
+
+    assert loaded.artifact is not None
+    attestation = loaded.artifact.attestation
+    assert attestation.model_id == "rack-thermal"
+    assert attestation.version == "1.0.0"
+    assert attestation.artifact_sha256 == metadata("1.0.0").sha256
+    assert attestation.kind is ArtifactKind.THERMAL_MODEL
+    assert attestation.authority_compatibility == (AuthorityStage.SHADOW, AuthorityStage.LIMITED)
+    assert attestation.registry_revision == registry.inspect().revision
+    assert attestation.trace_metadata()["artifact_sha256"] == metadata("1.0.0").sha256
+
+    with pytest.raises(TypeError, match="検証経路"):
+        registry_module.ArtifactAttestation()
+    with pytest.raises(TypeError, match="Registry の検証経路"):
+        registry_module.ArtifactAttestation._issue(metadata("1.0.0"), 0)
+    with pytest.raises(AttributeError, match="不変"):
+        attestation._model_id = "other"
+
+
+def test_a_verified_artifact_cannot_be_assembled_without_an_attestation(tmp_path: Path) -> None:
+    """証拠なしでは `VerifiedArtifact` を作れず、別 artifact の証拠も付け替えられない。"""
+    root = tmp_path / "registry"
+    registry = ModelRegistry(root, SimulatedClock(NOW_MS), limits=LIMITS)
+    register_and_validate(registry, "1.0.0")
+    register_and_validate(registry, "1.1.0")
+    promote(registry, "1.0.0")
+    loaded = registry.load_production(ArtifactKind.THERMAL_MODEL, COMPATIBILITY)
+    assert loaded.artifact is not None
+
+    with pytest.raises(ValidationError, match="attestation"):
+        registry_module.VerifiedArtifact(metadata=metadata("1.0.0"), payload=payload("1.0.0"))
+    with pytest.raises(ValidationError, match="別の artifact"):
+        registry_module.VerifiedArtifact(
+            metadata=metadata("1.1.0"),
+            payload=payload("1.1.0"),
+            attestation=loaded.artifact.attestation,
+        )

@@ -17,7 +17,7 @@ from typing import Annotated, Self
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from coldaisle.control.config import MpcOptimizerConfig
-from coldaisle.control.model.thermal import ObservedThermalInput
+from coldaisle.control.model.thermal import ObservedThermalInput, ThermalPrediction
 from coldaisle.control.mpc.cost import MpcCostModel, MpcCostUnusableError, PlanCost
 from coldaisle.control.mpc.counterfactual import (
     MpcModelBinding,
@@ -142,20 +142,31 @@ class LearnedMpcOptimizer:
         self,
         *,
         observed: ObservedThermalInput,
+        anchor: ThermalPrediction,
         anchor_inference_id: str,
         constraints: HardConstraintSet,
         weights: SupervisorObjectiveWeights,
         target_band: SupervisorTargetBand,
         baseline: PerZone[Demand],
+        budget_started_mono_ms: int | None = None,
     ) -> OptimizerOutcome:
-        """この tick の requested を探す。**解けなければ解を返さない。**"""
-        started_ms = self._monotonic_ms()
+        """この tick の requested を探す。**解けなければ解を返さない。**
+
+        ``budget_started_mono_ms`` を渡すと、その時刻から ``budget_ms`` を数える。
+        呼び出し側は anchor 推論と Confidence 判定に使った時間も予算に含められる。
+        """
+        started_ms = (
+            self._monotonic_ms() if budget_started_mono_ms is None else budget_started_mono_ms
+        )
         evaluations = 0
         try:
+            # 格子の算出も制約の交わりを読むので、実行不能はここで捕まえる。
+            levels = {zone: self._levels(constraints, zone) for zone in _ZONE_ORDER}
             baseline_requested = self._clamped(constraints, baseline)
             baseline_cost = self._evaluate(
                 baseline_requested,
                 observed,
+                anchor,
                 anchor_inference_id,
                 constraints,
                 weights,
@@ -168,27 +179,25 @@ class LearnedMpcOptimizer:
         evaluations += 1
         incumbent = baseline_requested
         best_cost = baseline_cost
+        # Baseline の評価だけで予算を使い切ることもある。**評価のあとにも必ず見る。**
+        if self._out_of_budget(started_ms):
+            return self._timed_out(started_ms, evaluations)
 
         max_evaluations = self._config.max_evaluations.value
         for _sweep in range(self._config.sweeps.value):
             improved = False
             for zone in _ZONE_ORDER:
-                for candidate_demand in self._levels(constraints, zone):
+                for candidate_demand in levels[zone]:
                     candidate = self._with_zone(incumbent, zone, candidate_demand)
                     if candidate == incumbent:
                         continue
                     if evaluations >= max_evaluations or self._out_of_budget(started_ms):
-                        return self._failed(
-                            OptimizerStatus.TIMEOUT,
-                            "optimizer_budget_exhausted",
-                            f"evaluations={evaluations}; budget_ms={self._budget_ms}",
-                            started_ms,
-                            evaluations,
-                        )
+                        return self._timed_out(started_ms, evaluations)
                     try:
                         cost = self._evaluate(
                             candidate,
                             observed,
+                            anchor,
                             anchor_inference_id,
                             constraints,
                             weights,
@@ -218,6 +227,9 @@ class LearnedMpcOptimizer:
                         best_cost = cost
                         incumbent = candidate
                         improved = True
+                    # 最後の候補で予算を越えたまま OK を返さない。
+                    if self._out_of_budget(started_ms):
+                        return self._timed_out(started_ms, evaluations)
             if not improved:
                 break
 
@@ -258,10 +270,21 @@ class LearnedMpcOptimizer:
             demands, step_ms=self._config.step_ms.value, steps=self._config.steps
         )
 
+    def _timed_out(self, started_ms: int, evaluations: int) -> OptimizerOutcome:
+        """予算切れの結果を返す。**解は付けない。**"""
+        return self._failed(
+            OptimizerStatus.TIMEOUT,
+            "optimizer_budget_exhausted",
+            f"evaluations={evaluations}; budget_ms={self._budget_ms}",
+            started_ms,
+            evaluations,
+        )
+
     def _evaluate(
         self,
         demands: PerZone[Demand],
         observed: ObservedThermalInput,
+        anchor: ThermalPrediction,
         anchor_inference_id: str,
         constraints: HardConstraintSet,
         weights: SupervisorObjectiveWeights,
@@ -274,7 +297,7 @@ class LearnedMpcOptimizer:
         prediction = self._binding.model.predict_plan(
             PlannedThermalInput(observed=observed, plan=plan)
         )
-        self._check_prediction(prediction, anchor_inference_id)
+        self._check_prediction(prediction, anchor, anchor_inference_id)
         return self._cost_model.evaluate(
             plan=plan,
             prediction=prediction,
@@ -283,15 +306,27 @@ class LearnedMpcOptimizer:
             previous=constraints.current,
         )
 
-    def _check_prediction(self, prediction: PlanPrediction, anchor_inference_id: str) -> None:
-        """予測が束縛したモデルと anchor 推論に属しているか確かめる。
+    def _check_prediction(
+        self,
+        prediction: PlanPrediction,
+        anchor: ThermalPrediction,
+        anchor_inference_id: str,
+    ) -> None:
+        """予測が束縛した artifact と anchor 推論に属しているか確かめる。
 
-        別の推論・別のモデルの予測を混ぜると、#85 の判定が別の入力に付け替わる。
+        別の推論・別の artifact の予測を混ぜると、#85 の判定が別の入力に付け替わる。
+        版と artifact hash は Registry の証拠（``MpcModelBinding``）を正として照合する。
         """
         if prediction.anchor_inference_id != anchor_inference_id:
             raise MpcCostUnusableError("予測が別の anchor 推論に属している")
         if prediction.model_version != self._binding.model_version:
             raise MpcCostUnusableError("予測が別の model 版に属している")
+        if prediction.artifact_sha256 != anchor.artifact_sha256:
+            raise MpcCostUnusableError("予測が anchor と別の artifact に属している")
+        if prediction.input_action_ts_ms != anchor.input_action_ts_ms:
+            raise MpcCostUnusableError("予測が anchor と別の時刻の入力に属している")
+        if prediction.artifact_verification is not self._binding.artifact_verification:
+            raise MpcCostUnusableError("予測の artifact 検証状態が束縛と食い違っている")
 
     @staticmethod
     def _with_zone(demands: PerZone[Demand], zone: Zone, value: float) -> PerZone[Demand]:

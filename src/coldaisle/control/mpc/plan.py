@@ -151,7 +151,7 @@ class HardConstraintSet(_Frozen):
             bounds[zone] = ZoneBound(floor=floor, ceiling=ceiling)
         step_s = optimizer.step_ms.value / 1000.0
         max_step_down = min(optimizer.max_step_down.value, safety.ramp_down_per_s.value * step_s)
-        return cls(
+        built = cls(
             bounds=PerZone[ZoneBound](
                 front=bounds[Zone.FRONT], rear=bounds[Zone.REAR], top=bounds[Zone.TOP]
             ),
@@ -159,21 +159,35 @@ class HardConstraintSet(_Frozen):
             max_step_up=optimizer.max_step_up.value,
             max_step_down=max(0.0, min(1.0, max_step_down)),
         )
+        for zone in Zone:
+            # 交わりが空なら、ここで気づいて Fallback へ落とす（後段の window で緩めない）。
+            built.window(zone)
+        return built
 
     def window(self, zone: Zone) -> tuple[float, float]:
         """その zone で許される demand の下限・上限を返す。
 
-        Safety floor が直前の値より上にある tick では、**上げる向きの制限を外す**。
-        制限を優先すると、冷却を強める必要があるときに弱いまま留まってしまう。
+        交わりが空になる原因は2つあり、**扱いを取り違えない**。
+
+        - Safety floor が「直前 + 上げ幅」より上にある: floor が勝ち、上げる向きの制限を外す。
+          制限を優先すると、冷却を強める必要があるときに弱いまま留まってしまう。
+        - 「直前 - 下げ幅」が ceiling より上にある（forced Max の直後など）: 1 step では
+          ceiling まで下げきれない。ここで ceiling の上へ広げると、設定した探索上限を
+          MPC 自身が緩めたことになる。**実行不能として扱い、Fallback へ渡す。**
         """
         bound = self.bounds.get(zone)
         previous = self.current.get(zone)
         lower = max(bound.floor, previous - self.max_step_down)
         upper = min(bound.ceiling, previous + self.max_step_up)
-        if upper < lower:
-            # 起点が floor より下（Safety floor が上がった直後）。floor に合わせる。
-            upper = lower
-        return lower, upper
+        if upper >= lower:
+            return lower, upper
+        if previous - self.max_step_down > bound.ceiling:
+            raise InfeasiblePlanError(
+                f"{zone.value}: 下げ幅の下限={previous - self.max_step_down:.6f} が "
+                f"探索 ceiling={bound.ceiling:.6f} を超える（current={previous:.6f}）"
+            )
+        # 残るのは floor が上げ幅に勝つ場合だけ。build() が floor <= ceiling を保証している。
+        return bound.floor, bound.floor
 
     def clamp(self, zone: Zone, demand: float) -> Demand:
         """候補をその zone の許容範囲へ収める。"""

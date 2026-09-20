@@ -93,6 +93,10 @@ Rollback前にも旧artifactのchecksumとschema互換性を再検証し、成�
   の時刻、理由、approvalは `RegistrySnapshot.audit` から追跡できる。
 - #84 / #85 / #89: 各format固有loaderと推論interfaceを実装し、`VerifiedArtifact.payload` だけを
   入力にする。Registry内に任意コード実行経路を追加しない。
+- #86 Learned MPC: `VerifiedArtifact.attestation`（`ArtifactAttestation`）を内部モデルの束縛に使う。
+  この値はpublic constructorを持たず、Registryの検証経路だけが発行する。受け取った側は
+  verification / authority / 版 / schema versionをモデルの自称ではなくこの値から読む
+  （決定記録 0052 §2.1）。暗号的な保証ではなく、配線の誤りを型で止めるためのものである。
 - #90 / #91: `load_version()` でcandidate / validated / retiredを含む明示versionを固定できる。
   `load_production()` と混ぜず、評価対象のversionを暗黙に変えない。
 - #92 Authority Rollout: `ModelCompatibility.authority_stage` で互換性だけを検査する。モデルの

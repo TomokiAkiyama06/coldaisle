@@ -123,7 +123,8 @@ Air Balance の比を推定できない step のコスト `unknown_balance_cost`
 `cost_metrics` の metric を内部モデルの target schema が覆うことと、control step のすべての
 offset が target horizon にあることは、tick ごとではなく optimizer の**生成時**に照合する。
 `mpc.valid_ms` は `mpc.period_ms` 以上にする（再計算の周期より短い有効期限では、
-健全な提案でも毎 tick 期限切れになる）。Air Balance の目標比は `air-balance.yaml`（決定記録 0033）が
+健全な提案でも毎 tick 期限切れになる）。`mpc.budget_ms` は anchor 推論と Confidence 判定を
+含めた worker の計算時間に掛かり、各モデル評価の前と後に確認する。Air Balance の目標比は `air-balance.yaml`（決定記録 0033）が
 所有し、`mpc.optimizer` へ写さない。値はすべて実測前の暫定値で、horizon / step / 重みの確定値は
 実測と deadline の評価で決める（`docs/requirements.md` Q-22）。
 

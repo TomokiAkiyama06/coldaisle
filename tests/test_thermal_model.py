@@ -137,7 +137,22 @@ def load_registry_model(payload: bytes, *, expected):
     registry_metadata_type = getattr(registry_module, "ArtifactMetadata", None)
     if registry_metadata_type is not None:
         metadata = registry_metadata_type.model_validate_json(metadata.model_dump_json())
-    verified = verified_type(metadata=metadata, payload=payload)
+    issue = getattr(registry_module, "ArtifactAttestation", None)
+    if issue is None:
+        verified = verified_type(metadata=metadata, payload=payload)
+    else:
+        # 本番では #104 の検証経路だけが attestation を発行する（決定記録 0052 §2.1）。
+        # ここは #84 loader 自身の checksum / 同一性の検査を試すため、意図して
+        # Registry を通さずに発行する。**production の経路はこの private API を呼ばない。**
+        verified = verified_type(
+            metadata=metadata,
+            payload=payload,
+            attestation=issue._issue(
+                metadata,
+                0,
+                _token=registry_module._ATTESTATION_ISSUE_TOKEN,
+            ),
+        )
     return RidgeThermalModel.from_verified_artifact(
         verified,
         authority_stage=expected.authority_stage,
@@ -1051,7 +1066,17 @@ def test_registry_metadata_rejects_huge_integer_before_serialization(monkeypatch
         metadata = registry_metadata_type.model_validate_json(metadata.model_dump_json())
     metadata = metadata.model_copy(update={"hyperparameters": {"huge": 1 << 100_000}})
     verified_type = registry_module.VerifiedArtifact  # type: ignore[attr-defined]
-    verified = verified_type(metadata=metadata, payload=body)
+    issue = getattr(registry_module, "ArtifactAttestation", None)
+    extra = (
+        {}
+        if issue is None
+        else {
+            "attestation": issue._issue(
+                metadata, 0, _token=registry_module._ATTESTATION_ISSUE_TOKEN
+            )
+        }
+    )
+    verified = verified_type(metadata=metadata, payload=body, **extra)
 
     def unexpected_serialization(*args, **kwargs):
         raise AssertionError("unbounded integer must be rejected before JSON serialization")
