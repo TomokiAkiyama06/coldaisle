@@ -707,6 +707,50 @@ def test_invariant_3_c_a_stale_approval_is_refused(tmp_path: Path) -> None:
         raise_stage(store(tmp_path), approval=approval, document=document)
 
 
+class WaitingClock:
+    """1回目の読み取りのあと、lock を待っている間に時間が進む時計。"""
+
+    def __init__(self, first_ms: int, after_ms: int) -> None:
+        self._times = [first_ms, after_ms]
+
+    def now_ms(self) -> int:
+        return self._times.pop(0) if len(self._times) > 1 else self._times[0]
+
+
+def test_invariant_3_f_an_approval_that_expires_while_waiting_for_the_locks_is_refused(
+    tmp_path: Path,
+) -> None:
+    """**lock を待っている間に切れた承認で昇格しない**（codex #4057064071）。
+
+    `raise_stage()` は registry と authority の lock を待つ。時計を lock の前に1回だけ
+    読むと、待っている間に期限が切れた承認・証拠でも通ってしまう。期限の判断は
+    **両方の lock を取ったあとの時刻**で行う。
+    """
+    limit_ms = DEFAULT_CONFIG.policy.authority_rollout.approval_max_age_ms.value
+    document = report_document()
+    approval = approval_for(document, approved_at_ms=NOW_MS - limit_ms)
+    authority = AuthorityStore(tmp_path / "authority", WaitingClock(NOW_MS, NOW_MS + limit_ms + 1))
+
+    with pytest.raises(AuthorityApprovalError, match="承認が古い"):
+        raise_stage(authority, approval=approval, document=document)
+
+
+def test_invariant_3_g_evidence_that_expires_while_waiting_for_the_locks_is_refused(
+    tmp_path: Path,
+) -> None:
+    """**証拠の新しさも、lock を取ったあとの時刻で判断する。**"""
+    rollout = DEFAULT_CONFIG.policy.authority_rollout
+    evidence_limit_ms = rollout.evidence_max_age_ms.value
+    document = report_document(end_ms=NOW_MS - evidence_limit_ms)
+    approval = approval_for(
+        document, evidence=evidence_for(document, end_ms=NOW_MS - evidence_limit_ms)
+    )
+    authority = AuthorityStore(tmp_path / "authority", WaitingClock(NOW_MS, NOW_MS + 60_000))
+
+    with pytest.raises(AuthorityEvidenceError, match="証拠が古い"):
+        raise_stage(authority, approval=approval, document=document)
+
+
 def test_invariant_3_d_a_future_approval_is_refused(tmp_path: Path) -> None:
     """**未来の承認を受け取らない。** 時刻をずらして期限切れを回避させない。"""
     document = report_document()
@@ -949,11 +993,16 @@ def test_invariant_5_m_an_applied_fallback_arm_cannot_justify_a_promotion(
         raise_stage(store(tmp_path), approval=approval, document=document)
 
 
-def test_invariant_5_o_an_applied_learned_arm_can_justify_a_promotion(tmp_path: Path) -> None:
-    """**LIMITED 以降は、適用された Learned MPC の arm が根拠になる。**
+def test_invariant_5_o_an_applied_learned_arm_cannot_justify_a_promotion(
+    tmp_path: Path,
+) -> None:
+    """**適用側の arm は artifact へ束縛できないので根拠にできない**（codex #4057064074）。
 
-    Shadow では Learned は counterfactual 側にしか現れないが、制御権を持ったあとは
-    適用側に現れる。どちらの名前空間でも「制御器が Learned MPC か」で判断する。
+    `ModelGateDecision` は artifact の hash を持たず、適用 arm の鍵にも model の identity が
+    入らない。`provenance.model_artifacts` は counterfactual の `artifact_sha256` からしか
+    集まらないので、「B の適用実績 + A の counterfactual」という報告が {A} の照合を通る。
+    **束縛できない証拠は使わない**（fail closed）。trace が tick ごとの artifact を記録
+    するようになったら開ける（0057 §5）。
     """
     authority = store(tmp_path)
     first = report_document()
@@ -983,9 +1032,8 @@ def test_invariant_5_o_an_applied_learned_arm_can_justify_a_promotion(tmp_path: 
         evidence=evidence_for(document, arm=applied_learned.key),
     )
 
-    journal = raise_stage(authority, approval=approval, document=document)
-
-    assert journal.stage is AuthorityStage.EXPANDED
+    with pytest.raises(AuthorityEvidenceError, match="適用側の arm"):
+        raise_stage(authority, approval=approval, document=document)
 
 
 def test_invariant_5_n_a_blocked_sibling_learned_arm_blocks_the_promotion(

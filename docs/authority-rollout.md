@@ -80,6 +80,8 @@ lock を手放す `inspect()` だけでは、A の証拠を持ったまま B が
   Fallback だけで回した続きや、いまの読み込み失敗を足しても新鮮にならない）
 - 名指した arm が holdout の実績に無い、または**制御器が Learned MPC でない**
   （適用された Fallback の arm を名指して昇格できない）
+- 名指した arm が**適用側**である。trace が tick ごとの artifact を記録するまで、
+  適用側の実績は artifact へ束縛できないので根拠にできない（0057 §2.4 / §3 / §5）
 - 名指した arm の stage が、いまの stage と違う
 - 報告に現れた **Learned MPC の arm のどれか**に gate 判定が無い、または1つでも `blocked` である
 
@@ -115,6 +117,8 @@ lock を手放す `inspect()` だけでは、A の証拠を持ったまま B が
 
 ## まだ無いもの
 
+- **decision trace への、適用した tick の model artifact の記録。** これが無い間は
+  適用側の実績で昇格できないため、**LIMITED 以降の昇格の証拠を作れない**（別 Issue）
 - 昇格・rollback の管理操作の入口（CLI / ソケット）。読み取り API（#23）は制御を変えない
 - 各段に必要な運転期間の下限
 - 実機での rollout。GPU サーバーが要る（#92 の `requires:server`）

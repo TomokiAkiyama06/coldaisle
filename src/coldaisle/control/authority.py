@@ -401,6 +401,17 @@ def _check_learned_arms(report: EvaluationReport, approval: StageApproval) -> _A
             f"（arm={approval.evidence.arm_key}; "
             f"controller={'none' if controller is None else controller.value}）"
         )
+    if not isinstance(named.arm, CounterfactualArm):
+        # **適用側の arm を artifact へ束縛できない**（codex #4057064074）。
+        # `ModelGateDecision` は artifact の hash を持たず、適用 arm の鍵にも model の
+        # identity が入らない。`provenance.model_artifacts` は counterfactual の
+        # `artifact_sha256` からしか集まらないので、「B の適用実績 + A の counterfactual」という
+        # 報告が {A} の照合を通ってしまう。**束縛できない証拠は使わない**（fail closed）。
+        # trace が tick ごとの artifact を記録するようになったら、ここを開ける（0057 §5）。
+        raise AuthorityEvidenceError(
+            "適用側の arm は、trace が tick ごとの artifact を記録するまで根拠にできない"
+            f"（arm={approval.evidence.arm_key}）"
+        )
     if named.arm.authority_stage is not approval.from_stage:
         raise AuthorityEvidenceError(
             "名指した arm の authority stage が、いまの stage と違う"
@@ -485,10 +496,8 @@ class AuthorityStore:
         安全側（stage を下げる）へは常に動ける。
         """
         policy = config.policy
-        now_ms = self._clock.now_ms()
-        if now_ms < 0:
-            raise AuthorityStoreError("authority の時刻は負にできない")
-        self._check_approval_freshness(approval, policy, now_ms)
+        # lock を待たせる前に、明らかに駄目なものは弾く。**判断はこれではない**（下を見る）。
+        self._check_approval_freshness(approval, policy, self._clock.now_ms())
         if stage_rank(approval.to_stage) > stage_rank(policy.authority_stage):
             raise AuthorityApprovalError(
                 "設定が許す上限を超える stage は承認できない"
@@ -509,6 +518,13 @@ class AuthorityStore:
                         "承認した遷移元といまの stage が違う"
                         f"（approved_from={approval.from_stage.value}; now={journal.stage.value}）"
                     )
+                # **lock を取ってから時計を読み直す**（codex #4057064071）。registry と
+                # authority の lock を待っている間に期限が切れた承認・証拠で昇格させない。
+                # 期限の判断は、必ずこの時刻で行う。
+                now_ms = self._clock.now_ms()
+                if now_ms < 0:
+                    raise AuthorityStoreError("authority の時刻は負にできない")
+                self._check_approval_freshness(approval, policy, now_ms)
                 self._check_production(approval, production)
                 self._check_evidence(
                     approval,

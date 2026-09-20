@@ -178,7 +178,10 @@ authority の lock も disk も待たない（§2.6）。
 - `expected_revision` が journal のいまの revision と一致する（**使い回せない**）
 - `from_stage` が journal のいまの stage と一致する
 - `approver` / `reason` / `approved_at_ms` を持ち、journal の event と一致する
-- `approved_at_ms` が未来でなく、`authority_rollout.approval_max_age_ms` 以内である
+- `approved_at_ms` が未来でなく、`authority_rollout.approval_max_age_ms` 以内である。
+  **期限の判断は、registry と authority の lock を両方取ったあとに読み直した時刻で行う**
+  （codex #4057064071）。lock の前に1回だけ読むと、待っている間に切れた承認で昇格できる。
+  証拠の新しさも同じ時刻で判断する
 - `to_stage` が設定の上限（2.2）を超えない
 
 `ModelRegistry` は `AuthorityStore` を参照しない。Production の入れ替えは journal を
@@ -290,6 +293,14 @@ v8 からの移行は自動補完せず、v1〜v8 は起動前に拒否する。
 
 悪くなること。
 
+- **適用側（factual）の実績では昇格できない。** decision trace が適用した tick の artifact を
+  記録していないので、どの artifact の実績か言えないためである（§2.4）。Shadow の間は
+  Learned の提案が counterfactual に残るので影響しないが、**LIMITED 以降は Learned が
+  適用側に出る**ので、そのままでは EXPANDED / FULL への昇格に使える証拠が作れない。
+  塞ぐには decision trace が tick ごとに artifact の hash を記録する必要がある
+  （#82 / 0030 の拡張。別 Issue を立てる。§5）。**推測で埋めない**という判断であり、
+  塞ぐまでは「上げられない」側に倒れる
+
 - `raise_stage()` が Model Registry を読み、その lock を commit まで握るようになり、
   authority の昇格が registry の可用性に依存する。握っている間は registry の promotion が
   待たされる（どちらも人が行う管理操作なので、待たせてよい）。緩和として、読めないことは
@@ -338,6 +349,10 @@ v8 からの移行は自動補完せず、v1〜v8 は起動前に拒否する。
   構築時と `reload()` のときだけ journal を読む。管理操作の入口（下記）を決めるときに、
   下げたことを走っているループへ伝える手（tick ごとの読み直し、signal、socket のいずれか）を
   一緒に決める。いまは in-process の降格だけなので穴になっていない
+- **decision trace へ、適用した tick の model artifact を記録すること。** これが無い限り、
+  適用側の実績を artifact へ束縛できず、LIMITED 以降の昇格の証拠を作れない（§3）。
+  `ModelGateDecision` に artifact の hash を足すか、`ControlState` に持たせるかを含め、
+  #82 / 0030 の側で決める。**別 Issue にする。**
 - **管理操作の入口。** いまは `AuthorityStore` の API だけで、CLI も API も無い。
   読み取り API（#23）は制御を変えられないので、昇格・rollback の入口を
   どこに置くか（CLI か、0045 の書き込み専用ソケットか）は別 Issue で決める

@@ -349,6 +349,11 @@ class AppliedArmReport(_Frozen):
 
     裏づけのある提案が1つも無ければ `None`。**0054 の帰属規則は変えない。**
     記録から言える事実を1つ増やしただけで、どの実測をどの arm に帰属させるかは同じ。
+
+    **この欄は artifact へ束縛できない。** `ModelGateDecision` は artifact の hash を持たず、
+    適用 arm の鍵にも model の identity が入らないので、「どの artifact の実績か」は
+    記録から言えない。Authority Rollout（#92）は適用側の arm を昇格の根拠にしない
+    （決定記録 0057 §2.4 / §5）。
     """
     gaps: tuple[CountedReason, ...] = ()
     """出せなかった指標と、その理由。**欄を埋め合わせない。**"""
