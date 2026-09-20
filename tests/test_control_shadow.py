@@ -162,6 +162,7 @@ def learned_status(proposal: ControllerProposal, *, attested: bool = True) -> Le
         proposal=proposal,
         received_at_mono_ms=0,
         assessment=assessment_for(proposal) if attested else None,
+        binding_authority_stage=AuthorityStage.FULL,
     )
 
 
@@ -188,7 +189,11 @@ def mpc_result(
             failure_reason=Reason(code="model_unusable", detail="capability mismatch"),
         )
     assert proposal is not None
-    return MpcProposal(proposal=proposal, assessment=assessment or assessment_for(proposal))
+    return MpcProposal(
+        proposal=proposal,
+        assessment=assessment or assessment_for(proposal),
+        binding_authority_stage=AuthorityStage.FULL,
+    )
 
 
 def worker_status(result: MpcProposal) -> LearnedControlStatus:

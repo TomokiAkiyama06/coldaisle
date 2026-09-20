@@ -71,6 +71,12 @@ class MpcProposal(_Frozen):
     failure_reason: Reason | None = None
     solution: MpcSolution | None = None
     """採用した解。記録と評価（#90 / #91）のためで、demand の権限は持たない。"""
+    binding_authority_stage: AuthorityStage | None = None
+    """この結果を作った束縛が Registry に検証された authority stage（#92 / 0057 §2.2）。
+
+    **識別子（`result_digest`）に覆われる。** worker の照合結果を Gate まで運び、
+    worker が走ってから選ばれるまでの間に昇格が起きた提案を採らせない。
+    """
 
     @model_validator(mode="after")
     def _proposal_is_bound_to_its_own_assessment(self) -> Self:
@@ -110,6 +116,9 @@ class MpcProposal(_Frozen):
                 raise ValueError("提案の requested が解の最初の step と一致しない")
         elif self.proposal.optimizer_status is OptimizerStatus.OK:
             raise ValueError("optimizer_status=ok の提案には解が要る")
+        if self.binding_authority_stage is None:
+            # 束縛の stage を持たない結果は、どの authority まで検証されたのか言えない。
+            raise ValueError("Learned MPC の提案には束縛の authority stage を添える")
         return self
 
     def result_digest(self) -> str:
@@ -159,6 +168,7 @@ class MpcProposal(_Frozen):
             supervisor_available=supervisor_available,
             control_deadline_exceeded=control_deadline_exceeded,
             snapshot_status=snapshot_status,
+            binding_authority_stage=self.binding_authority_stage,
             # Gate はこの識別子をそのまま選択結果へ残す。記録側（#90）は、自分が持っている
             # worker 結果を数え直して照らし、別の結果を記録しない。
             result_digest=self.result_digest(),
@@ -391,6 +401,8 @@ class LearnedMpcController:
             proposal=proposal,
             assessment=assessment,
             solution=outcome.solution,
+            # **照合した stage を結果に結び付ける。** Gate が選ぶ瞬間まで運ぶ（#92）。
+            binding_authority_stage=self._binding.authority_stage,
         )
 
     def _check_anchor(self, anchor: ThermalPrediction, observed: ObservedThermalInput) -> None:

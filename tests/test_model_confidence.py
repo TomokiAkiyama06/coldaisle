@@ -672,6 +672,7 @@ def _select(gate: ControllerGate, now: int, proposal, assessment: object = _ATTA
             proposal=proposal,
             received_at_mono_ms=now,
             assessment=attached,  # type: ignore[arg-type]
+            binding_authority_stage=AuthorityStage.FULL,
         ),
         operating_mode=OperatingMode.AUTO,
         safety_state=SafetyState.NORMAL,
@@ -1321,6 +1322,7 @@ def test_a1_learned_confidence_requires_a_matching_verified_assessment(
                 proposal=proposal.model_copy(update={"confidence": 1.0}),
                 received_at_mono_ms=0,
                 assessment=forged,
+                binding_authority_stage=AuthorityStage.FULL,
             )
         return
 

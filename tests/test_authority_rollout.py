@@ -22,6 +22,7 @@ from __future__ import annotations
 import json
 from hashlib import sha256
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from typing import Any
 
 import pytest
@@ -49,6 +50,7 @@ from coldaisle.control import (
     ControllerKind,
     ControllerSelection,
     DemandComposer,
+    FallbackCause,
     ModelRegistry,
     OperatingMode,
     RolloutEvidence,
@@ -61,6 +63,7 @@ from coldaisle.control import (
     stage_below,
     stage_rank,
 )
+from coldaisle.control.config import ControlConfig
 from coldaisle.control.evaluation.model import (
     AppliedArm,
     AppliedArmReport,
@@ -85,7 +88,9 @@ from coldaisle.control.evaluation.model import (
     WorstCaseKind,
 )
 from coldaisle.control.model.confidence import ConfidenceAssessor
+from coldaisle.control.model_registry import ArtifactAttestation
 from coldaisle.control.mpc import LearnedMpcController, MpcModelBinding
+from test_control_config import valid_documents, write_documents
 from test_critical_safety import (
     critical_safety,
     empty_guard,
@@ -101,8 +106,10 @@ from test_fallback_controller import (
     policy,
 )
 from test_learned_mpc import (
+    ALL_STAGES,
     PlanningModel,
     ScriptedClock,
+    issue_attestation,
     mpc_policy,
     propose,
     trained,  # noqa: F401 （pytest fixture として使う）
@@ -115,9 +122,6 @@ from test_model_registry import (
     register_and_validate,
 )
 from test_model_registry import (
-    metadata as artifact_metadata,
-)
-from test_model_registry import (
     promote as promote_artifact,
 )
 
@@ -125,16 +129,49 @@ NOW_MS = 1_800_000_000_000
 """固定の壁時計。**実時計に依存させない。**"""
 
 APPROVER = "rack-owner"
-POLICY_SHA = "1" * 64
-SAFETY_SHA = "2" * 64
 CONDITIONS_SHA = "3" * 64
-ARTIFACT_SHA = "4" * 64
 EVIDENCE_END_MS = NOW_MS - 3_600_000
 """証拠の最後の観測は1時間前。既定の `evidence_max_age_ms`（7日）の中に収まる。"""
 
 
-def store(tmp_path: Path) -> AuthorityStore:
-    return AuthorityStore(tmp_path / "authority")
+def store(tmp_path: Path, *, now_ms: int = NOW_MS) -> AuthorityStore:
+    return AuthorityStore(tmp_path / "authority", SimulatedClock(now_ms))
+
+
+_FIXTURES = TemporaryDirectory(prefix="pr92-authority-")
+"""module 全体で使う既定の検証済み設定と attestation の置き場。"""
+
+
+def control_config(tmp_path: Path, *, ceiling: str = "full", **rollout: int) -> ControlConfig:
+    """**実ファイルから検証した** ControlConfig。checksum が中身と結び付いている。
+
+    昇格は設定の checksum を証拠と突き合わせるので、試験でも「検証済みの束」から取る
+    （承認者が sha を持ち込めないようにした側と同じ経路を通す。codex #4056903570）。
+    """
+    documents = valid_documents()
+    policy_document = documents["fan-policy.yaml"]
+    policy_document["authority_stage"] = ceiling
+    for name, value in rollout.items():
+        policy_document["authority_rollout"][name] = {
+            "value": value,
+            "status": "provisional",
+            "basis": None,
+        }
+    root = tmp_path / f"config-{ceiling}-{'-'.join(f'{k}{v}' for k, v in sorted(rollout.items()))}"
+    root.mkdir(parents=True, exist_ok=True)
+    write_documents(root, documents)
+    return ControlConfig.from_directory(root)
+
+
+def production_attestation(tmp_path: Path, *, version: str = "1.0.0") -> ArtifactAttestation:
+    """**本物の Registry の検証経路が発行した** production attestation（#104）。"""
+    return issue_attestation(
+        tmp_path / f"registry-{version}",
+        model_id="rack-thermal",
+        version=version,
+        authority=ALL_STAGES,
+        stage=AuthorityStage.SHADOW,
+    )
 
 
 def learned_arm(stage: AuthorityStage = AuthorityStage.SHADOW) -> CounterfactualArm:
@@ -200,6 +237,18 @@ def applied_report(arm: AppliedArm, *, end_ms: int) -> AppliedArmReport:
     )
 
 
+DEFAULT_CONFIG = control_config(Path(_FIXTURES.name), ceiling="full")
+"""既定の検証済み ControlConfig。**checksum は実ファイルから来る。**"""
+
+POLICY_SHA = DEFAULT_CONFIG.sources.policy.sha256
+SAFETY_SHA = DEFAULT_CONFIG.sources.safety.sha256
+
+PRODUCTION = production_attestation(Path(_FIXTURES.name))
+"""既定の production attestation。**Registry の検証経路が発行したもの。**"""
+
+ARTIFACT_SHA = PRODUCTION.artifact_sha256
+
+
 def report_document(
     *,
     arm: str | None = None,
@@ -214,6 +263,7 @@ def report_document(
     with_applied_fallback: bool = False,
     extra_learned: CounterfactualArm | None = None,
     extra_outcome: GateOutcome = GateOutcome.PASS,
+    fresh_fallback_end_ms: int | None = None,
 ) -> bytes:
     """最小の Offline Evaluation 報告（#91）。**arm の実績と gate を持つ。**"""
     learned = learned_arm(arm_stage)
@@ -244,6 +294,27 @@ def report_document(
         counterfactual_arms.append(counterfactual_report(extra_learned, end_ms=end_ms))
         gates.append(gate(extra_learned.key, extra_outcome))
     applied_arms = [applied_report(fallback, end_ms=end_ms)] if with_applied_fallback else []
+    # **Learned の実績が無い、新しいだけの区間。** 新しさの測り方を試すために足す。
+    fresh_segments: list[SegmentReport] = []
+    if fresh_fallback_end_ms is not None:
+        fresh_segments.append(
+            SegmentReport(
+                run_id="run-001",
+                index=1,
+                role=SegmentRole.HOLDOUT,
+                start_ms=fresh_fallback_end_ms - 3_600_000,
+                end_ms=fresh_fallback_end_ms,
+                ticks=1_000,
+                purged_outcomes=0,
+                groups=(
+                    GroupReport(
+                        kind=GroupKind.OVERALL,
+                        value="overall",
+                        applied=(applied_report(fallback, end_ms=fresh_fallback_end_ms),),
+                    ),
+                ),
+            )
+        )
     report = EvaluationReport(
         provenance=EvaluationProvenance(
             evaluation_config_sha256="5" * 64,
@@ -259,7 +330,7 @@ def report_document(
                 RunProvenance(
                     run_id="run-001",
                     start_ms=end_ms - 86_400_000,
-                    end_ms=end_ms,
+                    end_ms=end_ms if fresh_fallback_end_ms is None else fresh_fallback_end_ms,
                     traces=1_000,
                     observations=1_000,
                     trace_sha256="8" * 64,
@@ -287,6 +358,7 @@ def report_document(
                     ),
                 ),
             ),
+            *fresh_segments,
         ),
         worst_cases=(
             WorstCase(
@@ -352,20 +424,14 @@ def raise_stage(
     *,
     approval: StageApproval,
     document: bytes,
-    settings: Any = None,
-    artifact: str = ARTIFACT_SHA,
-    now_ms: int = NOW_MS,
-    policy_sha: str = POLICY_SHA,
-    safety_sha: str = SAFETY_SHA,
+    config: ControlConfig | None = None,
+    production: ArtifactAttestation | None = None,
 ) -> AuthorityJournal:
     return authority.raise_stage(
         approval=approval,
         evaluation_report=document,
-        policy=settings if settings is not None else policy(authority="full"),
-        fan_policy_config_sha256=policy_sha,
-        safety_config_sha256=safety_sha,
-        production_artifact_sha256=artifact,
-        now_ms=now_ms,
+        config=config if config is not None else DEFAULT_CONFIG,
+        production=production if production is not None else PRODUCTION,
     )
 
 
@@ -398,7 +464,6 @@ def runtime(
     return AuthorityRuntime(
         authority,
         settings if settings is not None else policy(authority=ceiling),
-        clock=SimulatedClock(NOW_MS),
     )
 
 
@@ -415,9 +480,8 @@ def unwritable_runtime(tmp_path: Path) -> AuthorityRuntime:
     """FULL まで上げた journal を読み、以後は書けなくなった runtime。"""
     runtime(tmp_path, stage=AuthorityStage.FULL)
     return AuthorityRuntime(
-        UnwritableStore(tmp_path / "authority"),
+        UnwritableStore(tmp_path / "authority", SimulatedClock(NOW_MS)),
         policy(authority="full"),
-        clock=SimulatedClock(NOW_MS),
     )
 
 
@@ -564,14 +628,9 @@ def test_invariant_3_b_an_approval_is_void_once_the_journal_moved(tmp_path: Path
     document = report_document()
     approval = approval_for(document, from_stage=AuthorityStage.SHADOW, revision=0)
     # 承認を取ったあとに別の変更（ここでは人の rollback）が入る。
-    authority.lower_stage(
-        to_stage=AuthorityStage.SHADOW,
-        actor="operator",
-        reason="noop",
-        now_ms=NOW_MS,
-    )
+    authority.lower_stage(to_stage=AuthorityStage.SHADOW, actor="operator", reason="noop")
     raise_stage(authority, approval=approval, document=document)
-    authority.rollback_to_baseline(actor="operator", reason="様子を見る", now_ms=NOW_MS)
+    authority.rollback_to_baseline(actor="operator", reason="様子を見る")
 
     with pytest.raises(AuthorityApprovalError, match="使い回せない"):
         raise_stage(authority, approval=approval, document=document)
@@ -579,13 +638,12 @@ def test_invariant_3_b_an_approval_is_void_once_the_journal_moved(tmp_path: Path
 
 def test_invariant_3_c_a_stale_approval_is_refused(tmp_path: Path) -> None:
     """**承認を貯めて後から使えない。** 古い承認は期限切れにする。"""
-    settings = policy(authority="full")
-    limit_ms = settings.authority_rollout.approval_max_age_ms.value
+    limit_ms = DEFAULT_CONFIG.policy.authority_rollout.approval_max_age_ms.value
     document = report_document()
     approval = approval_for(document, approved_at_ms=NOW_MS - limit_ms - 1)
 
     with pytest.raises(AuthorityApprovalError, match="承認が古い"):
-        raise_stage(store(tmp_path), approval=approval, document=document, settings=settings)
+        raise_stage(store(tmp_path), approval=approval, document=document)
 
 
 def test_invariant_3_d_a_future_approval_is_refused(tmp_path: Path) -> None:
@@ -650,7 +708,7 @@ def test_invariant_4_b_an_approval_above_the_configured_ceiling_is_refused(
             store(tmp_path),
             approval=approval_for(document),
             document=document,
-            settings=policy(authority="shadow"),
+            config=control_config(tmp_path, ceiling="shadow"),
         )
 
 
@@ -707,14 +765,13 @@ def test_invariant_5_d_a_report_mixing_artifacts_is_refused(tmp_path: Path) -> N
 
 def test_invariant_5_e_stale_evidence_is_refused(tmp_path: Path) -> None:
     """**古い証拠で上げない。** 新しさは報告の run の終了時刻で測る。"""
-    settings = policy(authority="full")
-    limit_ms = settings.authority_rollout.evidence_max_age_ms.value
+    limit_ms = DEFAULT_CONFIG.policy.authority_rollout.evidence_max_age_ms.value
     end_ms = NOW_MS - limit_ms - 1
     document = report_document(end_ms=end_ms)
     approval = approval_for(document, evidence=evidence_for(document, end_ms=end_ms))
 
     with pytest.raises(AuthorityEvidenceError, match="証拠が古い"):
-        raise_stage(store(tmp_path), approval=approval, document=document, settings=settings)
+        raise_stage(store(tmp_path), approval=approval, document=document)
 
 
 def test_invariant_5_f_a_declared_evidence_time_that_differs_from_the_report_is_refused(
@@ -895,6 +952,37 @@ def test_invariant_5_k_evidence_from_another_comparison_is_refused(tmp_path: Pat
         raise_stage(store(tmp_path), approval=approval, document=document)
 
 
+def test_invariant_5_p_a_fresh_fallback_only_run_does_not_refresh_stale_evidence(
+    tmp_path: Path,
+) -> None:
+    """**Fallback だけの新しい区間を足しても、古い Learned の実績は新鮮にならない**
+    （codex #4056903573）。
+
+    新しさは報告全体の最新 run ではなく、**名指した arm の実績が実在する最後の区間**で測る。
+    """
+    limit_ms = DEFAULT_CONFIG.policy.authority_rollout.evidence_max_age_ms.value
+    stale_end_ms = NOW_MS - limit_ms - 1
+    document = report_document(end_ms=stale_end_ms, fresh_fallback_end_ms=NOW_MS - 60_000)
+
+    # 報告全体の最新 run は新しい。それを名乗ると、arm の実績と食い違うので拒まれる。
+    with pytest.raises(AuthorityEvidenceError, match="名指した arm の実績と違う"):
+        raise_stage(
+            store(tmp_path),
+            approval=approval_for(
+                document, evidence=evidence_for(document, end_ms=NOW_MS - 60_000)
+            ),
+            document=document,
+        )
+
+    # arm の実績の時刻を正しく名乗れば、こんどは「古い」として拒まれる。
+    with pytest.raises(AuthorityEvidenceError, match="証拠が古い"):
+        raise_stage(
+            store(tmp_path),
+            approval=approval_for(document, evidence=evidence_for(document, end_ms=stale_end_ms)),
+            document=document,
+        )
+
+
 # --- 不変条件 6: 降格に承認は要らない ------------------------------------------
 
 
@@ -1058,7 +1146,7 @@ def test_invariant_6_i_recovering_after_an_automatic_demotion_needs_a_new_approv
     authority = store(tmp_path)
     document = report_document()
     raise_stage(authority, approval=approval_for(document), document=document)
-    control = AuthorityRuntime(authority, policy(authority="full"), clock=SimulatedClock(NOW_MS))
+    control = AuthorityRuntime(authority, policy(authority="full"))
     control.observe(safety_state=SafetyState.EMERGENCY, now_mono_ms=0)
     assert control.current_stage() is BASELINE_STAGE
 
@@ -1076,15 +1164,60 @@ def test_invariant_6_j_a_rewound_clock_does_not_block_a_demotion(tmp_path: Path)
     document = report_document()
     raise_stage(authority, approval=approval_for(document), document=document)
 
-    journal = authority.rollback_to_baseline(
-        actor="operator", reason="時計が巻き戻った", now_ms=NOW_MS - 60_000
+    journal = store(tmp_path, now_ms=NOW_MS - 60_000).rollback_to_baseline(
+        actor="operator", reason="時計が巻き戻った"
     )
 
     assert journal.stage is BASELINE_STAGE
     assert journal.events[-1].occurred_at_ms == NOW_MS
 
 
+def test_invariant_6_k_one_threshold_crossing_lowers_exactly_one_stage(tmp_path: Path) -> None:
+    """**1回の閾値超えで1段だけ下げる**（codex #4056903574）。
+
+    Gate の降格推奨は自分の窓の間ずっと立ったままなので、毎 tick 消費すると
+    FULL → EXPANDED → LIMITED → SHADOW と連鎖してしまう。立ち上がりだけを消費する。
+    """
+    control = runtime(tmp_path, stage=AuthorityStage.FULL)
+
+    first = control.observe(
+        safety_state=SafetyState.NORMAL, demotion_recommended=True, now_mono_ms=0
+    )
+    assert first is not None
+    assert control.current_stage() is AuthorityStage.EXPANDED
+
+    for tick in range(1, 6):
+        assert (
+            control.observe(
+                safety_state=SafetyState.NORMAL, demotion_recommended=True, now_mono_ms=tick
+            )
+            is None
+        ), "推奨が立ったままの間は下げ続けない"
+    assert control.current_stage() is AuthorityStage.EXPANDED
+
+    # いちど収まり、もういちど超えたら、もう1段だけ下がる。
+    assert (
+        control.observe(safety_state=SafetyState.NORMAL, demotion_recommended=False, now_mono_ms=6)
+        is None
+    )
+    second = control.observe(
+        safety_state=SafetyState.NORMAL, demotion_recommended=True, now_mono_ms=7
+    )
+
+    assert second is not None
+    assert control.current_stage() is AuthorityStage.LIMITED
+
+
 # --- 不変条件 7: 設定は上限 ----------------------------------------------------
+
+
+def test_invariant_6_l_a_rewound_monotonic_clock_is_refused(tmp_path: Path) -> None:
+    """**巻き戻った単調時刻を受け取らない。** 窓の外へ出た不健全が数え直される。"""
+    control = runtime(tmp_path, stage=AuthorityStage.FULL)
+    control.observe(safety_state=SafetyState.NORMAL, now_mono_ms=1_000)
+
+    with pytest.raises(ValueError, match="巻き戻せない"):
+        control.observe(safety_state=SafetyState.NORMAL, now_mono_ms=999)
 
 
 def test_invariant_7_a_the_configured_ceiling_caps_the_effective_stage(tmp_path: Path) -> None:
@@ -1102,7 +1235,7 @@ def test_invariant_7_b_raising_the_configured_ceiling_does_not_raise_the_journal
     """**設定を上げただけでは制御権は増えない。** 昇格は承認の記録が要る。"""
     authority = store(tmp_path)
 
-    control = AuthorityRuntime(authority, policy(authority="full"), clock=SimulatedClock(NOW_MS))
+    control = AuthorityRuntime(authority, policy(authority="full"))
 
     assert control.configured_ceiling is AuthorityStage.FULL
     assert control.current_stage() is BASELINE_STAGE
@@ -1180,6 +1313,54 @@ def test_invariant_7_d_a_lowered_stage_puts_the_gate_back_on_fallback() -> None:
     assert selection.authority_stage is AuthorityStage.SHADOW
 
 
+def test_invariant_7_e_a_proposal_made_before_a_promotion_is_not_used_after_it(
+    tmp_path: Path,
+) -> None:
+    """**worker の照合を、提案が使われる瞬間まで運ぶ**（codex #4056903566）。
+
+    worker は自分が走った時刻の実効 stage しか見られない。そこから Gate が選ぶまでの間に
+    昇格が起きると、SHADOW だけ検証された束縛の提案が LIMITED で採られてしまう。
+    """
+    settings = policy(authority="full", recovery_hold_ms=1)
+    source = StaticAuthorityStage(AuthorityStage.SHADOW)
+    gate = ControllerGate(settings, expected_model_version="thermal-v1", authority=source)
+    shadow_status = healthy_status(received=0, binding_stage=AuthorityStage.SHADOW)
+
+    raised = ControllerGate(
+        settings,
+        expected_model_version="thermal-v1",
+        authority=StaticAuthorityStage(AuthorityStage.LIMITED),
+    )
+    raised.select(
+        now_mono_ms=0,
+        fallback=fallback_proposal(0.4),
+        learned=shadow_status,
+        operating_mode=OperatingMode.AUTO,
+        safety_state=SafetyState.NORMAL,
+    )
+    selection = raised.select(
+        now_mono_ms=1,
+        fallback=fallback_proposal(0.4),
+        learned=healthy_status(received=1, binding_stage=AuthorityStage.SHADOW),
+        operating_mode=OperatingMode.AUTO,
+        safety_state=SafetyState.NORMAL,
+    )
+
+    assert selection.active_controller is ControllerKind.FALLBACK
+    assert selection.fallback_reason is not None
+    assert selection.fallback_reason.code == FallbackCause.AUTHORITY_NOT_COVERED.value
+
+    # 同じ提案でも、束縛が覆っている stage なら使える。
+    gate.select(
+        now_mono_ms=0,
+        fallback=fallback_proposal(0.4),
+        learned=shadow_status,
+        operating_mode=OperatingMode.AUTO,
+        safety_state=SafetyState.NORMAL,
+    )
+    assert gate is not None
+
+
 # --- 不変条件 8: Model promotion は authority を動かさない ----------------------
 
 
@@ -1200,27 +1381,80 @@ def test_invariant_8_a_promoting_a_model_does_not_change_the_authority_stage(
     assert after == before
     assert after.stage is AuthorityStage.LIMITED
     assert registry.inspect().production[ArtifactKind.THERMAL_MODEL].active.version == "1.0.0"
-    control = AuthorityRuntime(authority, policy(authority="full"), clock=SimulatedClock(NOW_MS))
+    control = AuthorityRuntime(authority, policy(authority="full"))
     assert control.current_stage() is AuthorityStage.LIMITED
 
 
 def test_invariant_8_b_an_approval_for_the_retired_artifact_is_refused_after_promotion(
     tmp_path: Path,
 ) -> None:
-    """**artifact が入れ替わったら、前の artifact の証拠は使えない。**"""
-    registry = ModelRegistry(tmp_path / "registry", SimulatedClock(NOW_MS), limits=LIMITS)
-    register_and_validate(registry, "1.0.0")
-    promote_artifact(registry, "1.0.0")
-    old_sha = artifact_metadata("1.0.0").sha256
-    document = report_document(artifacts=(old_sha,))
-    approval = approval_for(document, evidence=evidence_for(document, artifact=old_sha))
+    """**artifact が入れ替わったら、前の artifact の証拠は使えない。**
 
-    register_and_validate(registry, "1.1.0")
-    promote_artifact(registry, "1.1.0")
-    new_sha = artifact_metadata("1.1.0").sha256
+    承認者は artifact の hash を持ち込めない（codex #4056903570）。Production の
+    identity は Registry の検証経路が発行した attestation から取るので、
+    「A の実績で承認し、B に制御権を与える」が成立しない。
+    """
+    old_production = production_attestation(tmp_path, version="1.0.0")
+    document = report_document(artifacts=(old_production.artifact_sha256,))
+    approval = approval_for(
+        document,
+        evidence=evidence_for(document, artifact=old_production.artifact_sha256),
+    )
+    new_production = production_attestation(tmp_path, version="1.1.0")
 
+    assert new_production.artifact_sha256 != old_production.artifact_sha256
     with pytest.raises(AuthorityEvidenceError, match="Production の artifact"):
-        raise_stage(store(tmp_path), approval=approval, document=document, artifact=new_sha)
+        raise_stage(
+            store(tmp_path),
+            approval=approval,
+            document=document,
+            production=new_production,
+        )
+
+
+def test_invariant_8_e_the_approver_cannot_supply_the_production_identity(
+    tmp_path: Path,
+) -> None:
+    """**production でない artifact の attestation では上げられない**（codex #4056903570）。
+
+    `raise_stage()` は artifact の hash を文字列で受け取らない。受け取るのは Registry の
+    検証経路だけが発行する封をした attestation で、production pointer が指しているかも
+    その中の値で見る。
+    """
+    candidate = issue_attestation(
+        tmp_path / "registry-candidate",
+        model_id="rack-thermal",
+        version="2.0.0",
+        authority=ALL_STAGES,
+        stage=AuthorityStage.SHADOW,
+        promoted=False,
+    )
+    document = report_document(artifacts=(candidate.artifact_sha256,))
+    approval = approval_for(
+        document, evidence=evidence_for(document, artifact=candidate.artifact_sha256)
+    )
+
+    assert candidate.production_active is False
+    with pytest.raises(AuthorityEvidenceError, match="Production pointer"):
+        raise_stage(store(tmp_path), approval=approval, document=document, production=candidate)
+
+
+def test_invariant_8_f_a_stage_the_registry_did_not_allow_is_refused(tmp_path: Path) -> None:
+    """**Registry が許していない stage へ、authority の側から上げない**（#104 の境界）。"""
+    shadow_only = issue_attestation(
+        tmp_path / "registry-shadow-only",
+        model_id="rack-thermal",
+        version="3.0.0",
+        authority=(AuthorityStage.SHADOW,),
+        stage=AuthorityStage.SHADOW,
+    )
+    document = report_document(artifacts=(shadow_only.artifact_sha256,))
+    approval = approval_for(
+        document, evidence=evidence_for(document, artifact=shadow_only.artifact_sha256)
+    )
+
+    with pytest.raises(AuthorityApprovalError, match="Registry が許していない"):
+        raise_stage(store(tmp_path), approval=approval, document=document, production=shadow_only)
 
 
 def test_invariant_8_c_the_registry_cannot_write_the_authority_journal() -> None:
@@ -1439,40 +1673,41 @@ def test_the_first_promotion_can_actually_be_walked(tmp_path: Path, trained) -> 
     1. SHADOW 互換の束縛で worker を作れる
     2. Gate は SHADOW なので実 Fan を Fallback に置く（提案は counterfactual）
     3. その区間の証拠で LIMITED へ上げられる
-    4. 上げたあと、Gate が LIMITED の帯で Learned MPC を採る
+    4. **昇格前に作った提案は、そのままでは LIMITED で使えない**（codex #4056903566）
+    5. LIMITED を覆う束縛で worker を作り直すと、帯の中で Learned MPC を採る
     """
     base, profile, attestation = trained
     settings = mpc_policy(authority="limited")
     authority = store(tmp_path)
-    control = AuthorityRuntime(authority, settings, clock=SimulatedClock(NOW_MS))
+    control = AuthorityRuntime(authority, settings)
 
     assert control.configured_ceiling is AuthorityStage.LIMITED
     assert control.current_stage() is AuthorityStage.SHADOW, "journal が無ければ Baseline"
 
     # 1. 上限が LIMITED でも、実効 stage が SHADOW なら SHADOW 互換の artifact で動かせる。
-    binding = MpcModelBinding.for_control(
+    shadow_binding = MpcModelBinding.for_control(
         PlanningModel(base),
         attestation=attestation,
         authority_stage=AuthorityStage.SHADOW,
         expected_model_version=attestation.version,
     )
-    controller = LearnedMpcController(
-        binding,
+    shadow_worker = LearnedMpcController(
+        shadow_binding,
         settings,
         mpc_safety(),
         assessor=ConfidenceAssessor(profile, settings.model_confidence),
         monotonic_ms=ScriptedClock(0),
         authority=control,
     )
-    result = propose(controller)
-    assert result.proposal is not None, "Shadow 期間の提案が作れないと証拠が貯まらない"
+    shadow_result = propose(shadow_worker)
+    assert shadow_result.proposal is not None, "Shadow 期間の提案が作れないと証拠が貯まらない"
 
     # 2. Gate は SHADOW。実 Fan は Fallback が作る。
     gate = ControllerGate(settings, expected_model_version=attestation.version, authority=control)
     shadow_tick = gate.select(
         now_mono_ms=0,
         fallback=fallback_proposal(0.4),
-        learned=result.to_status(received_at_mono_ms=0),
+        learned=shadow_result.to_status(received_at_mono_ms=0),
         operating_mode=OperatingMode.AUTO,
         safety_state=SafetyState.NORMAL,
     )
@@ -1480,30 +1715,71 @@ def test_the_first_promotion_can_actually_be_walked(tmp_path: Path, trained) -> 
     assert shadow_tick.active_controller is ControllerKind.FALLBACK
 
     # 3. その区間の証拠で昇格する。証拠はいまの設定・いまの artifact のものである。
-    document = report_document()
+    config = control_config(tmp_path, ceiling="limited")
+    production = production_attestation(tmp_path, version="9.0.0")
+    document = report_document(
+        artifacts=(production.artifact_sha256,),
+        policy_sha=config.sources.policy.sha256,
+        safety_sha=config.sources.safety.sha256,
+    )
     journal = raise_stage(
         authority,
-        approval=approval_for(document),
+        approval=approval_for(
+            document,
+            evidence=evidence_for(
+                document,
+                artifact=production.artifact_sha256,
+                policy_sha=config.sources.policy.sha256,
+                safety_sha=config.sources.safety.sha256,
+            ),
+        ),
         document=document,
-        settings=settings,
-        artifact=ARTIFACT_SHA,
+        config=config,
+        production=production,
     )
     assert journal.stage is AuthorityStage.LIMITED
-
-    # 4. 読み直すと LIMITED。Gate は帯の中で Learned MPC を採る。
     control.reload()
     assert control.current_stage() is AuthorityStage.LIMITED
-    gate.select(
+
+    # 4. **昇格前の提案は、そのまま LIMITED では使えない。** 束縛が覆っていない。
+    stale_tick = gate.select(
         now_mono_ms=1_000,
         fallback=fallback_proposal(0.4),
-        learned=result.to_status(received_at_mono_ms=1_000),
+        learned=shadow_result.to_status(received_at_mono_ms=1_000),
+        operating_mode=OperatingMode.AUTO,
+        safety_state=SafetyState.NORMAL,
+    )
+    assert stale_tick.active_controller is ControllerKind.FALLBACK
+    assert stale_tick.fallback_reason is not None
+    assert stale_tick.fallback_reason.code == FallbackCause.AUTHORITY_NOT_COVERED.value
+
+    # 5. LIMITED を覆う束縛で作り直せば、帯の中で Learned MPC を採る。
+    limited_worker = LearnedMpcController(
+        MpcModelBinding.for_control(
+            PlanningModel(base),
+            attestation=attestation,
+            authority_stage=AuthorityStage.LIMITED,
+            expected_model_version=attestation.version,
+        ),
+        settings,
+        mpc_safety(),
+        assessor=ConfidenceAssessor(profile, settings.model_confidence),
+        monotonic_ms=ScriptedClock(0),
+        authority=control,
+    )
+    limited_result = propose(limited_worker)
+    assert limited_result.proposal is not None
+    gate.select(
+        now_mono_ms=2_000,
+        fallback=fallback_proposal(0.4),
+        learned=limited_result.to_status(received_at_mono_ms=2_000),
         operating_mode=OperatingMode.AUTO,
         safety_state=SafetyState.NORMAL,
     )
     limited_tick = gate.select(
-        now_mono_ms=2_000,
+        now_mono_ms=3_000,
         fallback=fallback_proposal(0.4),
-        learned=result.to_status(received_at_mono_ms=2_000),
+        learned=limited_result.to_status(received_at_mono_ms=3_000),
         operating_mode=OperatingMode.AUTO,
         safety_state=SafetyState.NORMAL,
     )

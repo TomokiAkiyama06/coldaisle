@@ -35,8 +35,8 @@ from typing import Literal, Self
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
-from coldaisle.clock import Clock
-from coldaisle.control.config import FanPolicyConfig
+from coldaisle.clock import Clock, WallClock
+from coldaisle.control.config import ControlConfig, FanPolicyConfig
 from coldaisle.control.evaluation.model import (
     AppliedArm,
     CounterfactualArm,
@@ -46,6 +46,7 @@ from coldaisle.control.evaluation.model import (
     GroupKind,
     SegmentRole,
 )
+from coldaisle.control.model_registry import ArtifactAttestation
 from coldaisle.control.schema import (
     BASELINE_STAGE,
     STAGE_ORDER,
@@ -307,14 +308,32 @@ class AuthorityJournal(_Frozen):
         }
 
 
-def _holdout_arms(report: EvaluationReport) -> dict[str, AppliedArm | CounterfactualArm]:
+class _ArmEvidence(_Frozen):
+    """1つの arm が holdout に現れた事実と、**その arm が現れた最後の時刻**。"""
+
+    arm: AppliedArm | CounterfactualArm
+    last_segment_end_ms: int = Field(ge=0)
+
+
+def _holdout_arms(report: EvaluationReport) -> dict[str, _ArmEvidence]:
     """holdout の `overall` group に**実際に現れた** arm を、鍵から引けるようにする。
 
     gate の行は `arm_key` という文字列しか持たない。文字列だけで照合すると、
     「どの制御器の実績か」を確かめないまま合格を読むことになる（codex #4056864033）。
     報告の中の arm object へ結び直してから判断する。
+
+    **その arm が現れた segment の終了時刻も持つ。** 証拠の新しさは報告全体の run では
+    なく、**その arm の実績が実在する区間**で測る（codex #4056903573）。報告全体の
+    最新 run で測ると、Fallback だけで回した新しい run を足すだけで、古い Learned MPC の
+    実績が「新鮮」に見えてしまう。
     """
-    arms: dict[str, AppliedArm | CounterfactualArm] = {}
+    arms: dict[str, _ArmEvidence] = {}
+
+    def observe(key: str, arm: AppliedArm | CounterfactualArm, end_ms: int) -> None:
+        current = arms.get(key)
+        if current is None or end_ms > current.last_segment_end_ms:
+            arms[key] = _ArmEvidence(arm=arm, last_segment_end_ms=end_ms)
+
     for segment in report.segments:
         if segment.role is not SegmentRole.HOLDOUT:
             continue
@@ -322,13 +341,13 @@ def _holdout_arms(report: EvaluationReport) -> dict[str, AppliedArm | Counterfac
             if group.kind is not GroupKind.OVERALL:
                 continue
             for applied in group.applied:
-                arms[applied.arm_key] = applied.arm
+                observe(applied.arm_key, applied.arm, segment.end_ms)
             for counterfactual in group.counterfactual:
-                arms[counterfactual.arm_key] = counterfactual.arm
+                observe(counterfactual.arm_key, counterfactual.arm, segment.end_ms)
     return arms
 
 
-def _check_learned_arms(report: EvaluationReport, approval: StageApproval) -> None:
+def _check_learned_arms(report: EvaluationReport, approval: StageApproval) -> _ArmEvidence:
     """昇格の根拠を **Learned MPC の arm** に束縛する（0057 §2.4）。
 
     `arm_key` の一致だけで gate を読むと、承認者が**適用された Fallback の arm**を
@@ -339,6 +358,8 @@ def _check_learned_arms(report: EvaluationReport, approval: StageApproval) -> No
     - その arm の stage が、いま上げようとしている遷移元と同じである
     - **報告に現れた Learned MPC の arm すべて**に gate があり、すべて `pass` である
       （良い arm だけを選んで、落ちた構成を残したまま上げられないようにする）
+
+    返すのは名指した arm の実績で、呼び出し側が**その arm の新しさ**を測るのに使う。
     """
     arms = _holdout_arms(report)
     if not arms:
@@ -348,22 +369,23 @@ def _check_learned_arms(report: EvaluationReport, approval: StageApproval) -> No
         raise AuthorityEvidenceError(
             f"名指した arm が holdout の報告に無い（arm={approval.evidence.arm_key}）"
         )
-    if named.controller is not ControllerKind.LEARNED_MPC:
+    if named.arm.controller is not ControllerKind.LEARNED_MPC:
+        controller = named.arm.controller
         raise AuthorityEvidenceError(
             "Learned MPC 以外の arm を昇格の根拠にできない"
             f"（arm={approval.evidence.arm_key}; "
-            f"controller={'none' if named.controller is None else named.controller.value}）"
+            f"controller={'none' if controller is None else controller.value}）"
         )
-    if named.authority_stage is not approval.from_stage:
+    if named.arm.authority_stage is not approval.from_stage:
         raise AuthorityEvidenceError(
             "名指した arm の authority stage が、いまの stage と違う"
-            f"（arm={named.authority_stage.value}; now={approval.from_stage.value}）"
+            f"（arm={named.arm.authority_stage.value}; now={approval.from_stage.value}）"
         )
     outcomes: dict[str, list[GateResult]] = {}
     for gate in report.gates:
         outcomes.setdefault(gate.arm_key, []).append(gate)
-    for key, arm in sorted(arms.items()):
-        if arm.controller is not ControllerKind.LEARNED_MPC:
+    for key, evidence in sorted(arms.items()):
+        if evidence.arm.controller is not ControllerKind.LEARNED_MPC:
             continue
         results = outcomes.get(key, [])
         if not results:
@@ -377,6 +399,7 @@ def _check_learned_arms(report: EvaluationReport, approval: StageApproval) -> No
             raise AuthorityEvidenceError(
                 f"rollout gate を通っていない（arm={key}; blocked={stages_text}）"
             )
+    return named
 
 
 class AuthorityStore:
@@ -387,12 +410,18 @@ class AuthorityStore:
     状態を動かせてしまう（0057 §2.3）。
     """
 
-    __slots__ = ("_root",)
+    __slots__ = ("_clock", "_root")
 
-    def __init__(self, root: Path) -> None:
+    def __init__(self, root: Path, clock: Clock | None = None) -> None:
+        """**時刻は store が持つ時計から取る。**
+
+        操作のたびに `now_ms` を受け取ると、期限の判定に使う「いま」を呼び出し側が
+        決められる（承認の期限も証拠の新しさも、渡す値ひとつで外せる）。
+        """
         if not root.is_absolute():
             raise AuthorityStoreError("authority store の root は絶対 path にする")
         self._root = root
+        self._clock = clock if clock is not None else WallClock()
 
     def read(self) -> AuthorityJournal:
         """いまの journal。file が無ければ Baseline から始まったものとして返す。"""
@@ -406,17 +435,22 @@ class AuthorityStore:
         *,
         approval: StageApproval,
         evaluation_report: bytes,
-        policy: FanPolicyConfig,
-        fan_policy_config_sha256: str,
-        safety_config_sha256: str,
-        production_artifact_sha256: str,
-        now_ms: int,
+        config: ControlConfig,
+        production: ArtifactAttestation,
     ) -> AuthorityJournal:
         """人の承認と rollout gate の証拠を検証してから、stage を1段上げる。
 
         **判定できないことを合格にしない。** 欠けている・古い・別の対象を指す証拠は
         すべて拒む（0054 の gate と同じ向き。0057 §2.4）。
+
+        **承認者が値を持ち込む余地を残さない**（codex #4056903570）。設定の checksum は
+        検証済みの `ControlConfig` から、artifact の identity は Model Registry の
+        検証経路だけが発行する `ArtifactAttestation` から取る。文字列で受け取ると、
+        production が入れ替わったあとに古い artifact の hash を渡すだけで、
+        A の実績で B に制御権を与えられる。
         """
+        policy = config.policy
+        now_ms = self._clock.now_ms()
         if now_ms < 0:
             raise AuthorityStoreError("authority の時刻は負にできない")
         self._check_approval_freshness(approval, policy, now_ms)
@@ -425,13 +459,14 @@ class AuthorityStore:
                 "設定が許す上限を超える stage は承認できない"
                 f"（ceiling={policy.authority_stage.value}; to={approval.to_stage.value}）"
             )
+        self._check_production(approval, production)
         self._check_evidence(
             approval,
             evaluation_report,
             policy=policy,
-            fan_policy_config_sha256=fan_policy_config_sha256,
-            safety_config_sha256=safety_config_sha256,
-            production_artifact_sha256=production_artifact_sha256,
+            fan_policy_config_sha256=config.sources.policy.sha256,
+            safety_config_sha256=config.sources.safety.sha256,
+            production_artifact_sha256=production.artifact_sha256,
             now_ms=now_ms,
         )
         with self._exclusive_lock() as root_fd:
@@ -465,7 +500,6 @@ class AuthorityStore:
         to_stage: AuthorityStage,
         actor: str,
         reason: str,
-        now_ms: int,
         trigger: AuthorityTrigger = AuthorityTrigger.AUTOMATIC,
         cause: AutomaticCause | None = None,
     ) -> AuthorityJournal:
@@ -473,6 +507,7 @@ class AuthorityStore:
 
         すでに `to_stage` 以下なら何もせず、いまの journal をそのまま返す。
         """
+        now_ms = self._clock.now_ms()
         if now_ms < 0:
             raise AuthorityStoreError("authority の時刻は負にできない")
         with self._exclusive_lock() as root_fd:
@@ -492,15 +527,30 @@ class AuthorityStore:
             )
             return self._append(root_fd, journal, event)
 
-    def rollback_to_baseline(self, *, actor: str, reason: str, now_ms: int) -> AuthorityJournal:
+    def rollback_to_baseline(self, *, actor: str, reason: str) -> AuthorityJournal:
         """1手で Baseline（Shadow）へ戻す。**承認も段階も経由しない。**"""
         return self.lower_stage(
             to_stage=BASELINE_STAGE,
             actor=actor,
             reason=reason,
-            now_ms=now_ms,
             trigger=AuthorityTrigger.HUMAN,
         )
+
+    @staticmethod
+    def _check_production(approval: StageApproval, production: ArtifactAttestation) -> None:
+        """**いま Production である artifact そのもの**へ制御権を渡すことを確かめる。"""
+        if not production.production_active:
+            raise AuthorityEvidenceError(
+                "Production pointer が指していない artifact へ authority を渡さない"
+                f"（status={production.status.value}）"
+            )
+        if approval.to_stage not in production.authority_compatibility:
+            # Registry が許していない stage を、authority の側から与えない（#104 の境界）。
+            raise AuthorityApprovalError(
+                "Registry が許していない stage へ上げようとしている"
+                f"（to={approval.to_stage.value}; "
+                f"compatibility={[stage.value for stage in production.authority_compatibility]}）"
+            )
 
     @staticmethod
     def _last_ms(journal: AuthorityJournal) -> int:
@@ -575,16 +625,22 @@ class AuthorityStore:
             raise AuthorityEvidenceError("いまより高い authority で取った証拠は使えない")
         if approval.from_stage not in observed:
             raise AuthorityEvidenceError("いまの stage で運転した証拠が無い")
-        end_ms = max(run.end_ms for run in provenance.runs)
+        named = _check_learned_arms(report, approval)
+        # **新しさは「その arm の実績が実在する最後の区間」で測る**（codex #4056903573）。
+        # 報告全体の最新 run で測ると、Fallback だけで回した新しい run を足すだけで、
+        # 古い Learned MPC の実績が「新鮮」に見えてしまう。
+        end_ms = named.last_segment_end_ms
         if evidence.evidence_end_ms != end_ms:
-            raise AuthorityEvidenceError("証拠の最終観測時刻が報告と違う")
+            raise AuthorityEvidenceError(
+                "証拠の最終観測時刻が、名指した arm の実績と違う"
+                f"（declared={evidence.evidence_end_ms}; arm={end_ms}）"
+            )
         if end_ms > now_ms:
             raise AuthorityEvidenceError("未来の観測を証拠にできない")
         age_ms = now_ms - end_ms
         limit_ms = policy.authority_rollout.evidence_max_age_ms.value
         if age_ms > limit_ms:
             raise AuthorityEvidenceError(f"証拠が古い（age_ms={age_ms}; max_ms={limit_ms}）")
-        _check_learned_arms(report, approval)
 
     def _append(
         self, root_fd: int, journal: AuthorityJournal, event: AuthorityEvent
@@ -770,8 +826,9 @@ class AuthorityRuntime:
 
     __slots__ = (
         "_applied_ceiling",
-        "_clock",
+        "_demotion_consumed",
         "_journal",
+        "_last_mono_ms",
         "_low_confidence",
         "_ood",
         "_persist_failure",
@@ -779,13 +836,16 @@ class AuthorityRuntime:
         "_store",
     )
 
-    def __init__(self, store: AuthorityStore, policy: FanPolicyConfig, *, clock: Clock) -> None:
+    def __init__(self, store: AuthorityStore, policy: FanPolicyConfig) -> None:
+        """**時計は持たない。** 記録の時刻は store が自分の時計で決める。"""
         self._store = store
         self._policy = policy
-        self._clock = clock
         self._journal = store.read()
         # この process が下げた上限。**永続化できなくても保持する**（0057 §2.6）。
         self._applied_ceiling = AuthorityStage.FULL
+        # Gate の降格推奨を、立ち下がるまで1回だけ消費するための記憶。
+        self._demotion_consumed = False
+        self._last_mono_ms: int | None = None
         self._low_confidence: deque[int] = deque()
         self._ood: deque[int] = deque()
         self._persist_failure: Reason | None = None
@@ -833,11 +893,20 @@ class AuthorityRuntime:
         """
         if now_mono_ms < 0:
             raise ValueError("単調時計は負にできない")
+        if self._last_mono_ms is not None and now_mono_ms < self._last_mono_ms:
+            # 巻き戻った時刻を受け取ると、窓の外へ出たはずの不健全が数え直されてしまう。
+            raise ValueError("Authority Runtime の単調時計は巻き戻せない")
+        self._last_mono_ms = now_mono_ms
         self._expire(now_mono_ms)
         if confidence_level is ConfidenceLevel.LOW:
             self._low_confidence.append(now_mono_ms)
         if ood:
             self._ood.append(now_mono_ms)
+        # **推奨は「立ち上がり」だけを消費する**（codex #4056903574）。Gate の推奨は
+        # 自分の窓（`demote_window_ms`）の間ずっと立ったままなので、毎 tick 消費すると
+        # 1回の閾値超えが FULL → EXPANDED → LIMITED → SHADOW と連鎖する。
+        rising_edge = demotion_recommended and not self._demotion_consumed
+        self._demotion_consumed = demotion_recommended
 
         stage = self.current_stage()
         if stage is BASELINE_STAGE:
@@ -849,7 +918,7 @@ class AuthorityRuntime:
         rollout = self._policy.authority_rollout
         if safety_state is SafetyState.EMERGENCY:
             return self._demote(stage, BASELINE_STAGE, AutomaticCause.SAFETY_EMERGENCY, "")
-        if demotion_recommended:
+        if rising_edge:
             return self._demote(
                 stage,
                 self._one_below(stage),
@@ -934,7 +1003,6 @@ class AuthorityRuntime:
                 to_stage=to_stage,
                 actor=actor,
                 reason=f"{code}: {detail}" if detail else code,
-                now_ms=self._clock.now_ms(),
                 trigger=trigger,
                 cause=cause,
             )

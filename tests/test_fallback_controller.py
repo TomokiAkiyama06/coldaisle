@@ -412,7 +412,13 @@ def assessment_for(proposal: ControllerProposal) -> ConfidenceAssessment:
     )
 
 
-def healthy_status(*, received: int = 0, proposal: ControllerProposal | None = None):
+def healthy_status(
+    *,
+    received: int = 0,
+    proposal: ControllerProposal | None = None,
+    binding_stage: AuthorityStage = AuthorityStage.FULL,
+):
+    """**束縛が覆う stage も添える**（#92）。既定は「どの stage でも使える artifact」。"""
     selected = proposal or learned_proposal()
     if selected.ood:
         # OOD の assessment の confidence は 0。提案も同じ値にする
@@ -421,6 +427,7 @@ def healthy_status(*, received: int = 0, proposal: ControllerProposal | None = N
         proposal=selected,
         received_at_mono_ms=received,
         assessment=assessment_for(selected),
+        binding_authority_stage=binding_stage,
     )
 
 

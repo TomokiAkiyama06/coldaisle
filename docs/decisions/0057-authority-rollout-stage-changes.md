@@ -86,10 +86,34 @@ artifact が拒まれ、**新しい設定での証拠を1件も集められず�
 `ModelRegistry.load_production()` / `MpcModelBinding.for_control()` /
 `RidgeThermalModel.from_verified_artifact()` へ渡す stage も**実効 stage**である。
 
+**照合した stage は worker の結果に結び付けて Gate まで運ぶ。** worker は自分が走った
+時刻の実効 stage しか見られないので、そこから Gate が選ぶまでの間に昇格が起きると、
+SHADOW だけ検証された束縛の提案が LIMITED で採られる（codex #4056903566）。
+`MpcProposal.binding_authority_stage`（`result_digest` に覆われる）を
+`LearnedControlStatus` へ運び、**Gate はこの tick の stage がそれを覆っていなければ
+Fallback にする**（`binding_authority_not_covered`）。昇格後に提案を使いたければ、
+その stage を覆う束縛で worker を作り直す。
+
 ### 2.3 stage を上げられるのは人の承認だけ。**Model promotion は stage を動かさない**
 
 `StageApproval` は「上げる」ためだけの型で、**降格の承認は型として存在しない。**
 型を作らないことで「降格にも承認が要る」実装を書けないようにする。
+
+**承認者が値を持ち込む余地を残さない。** `raise_stage()` は artifact の hash も設定の
+checksum も「いまの時刻」も文字列や数値で受け取らない。受け取るのは次の4つだけである。
+
+| 入力 | 出どころ |
+|---|---|
+| `approval` | 人の承認そのもの |
+| `evaluation_report` | 報告の bytes（承認の digest と突き合わせる） |
+| `config` | 検証済み `ControlConfig`（#103）。設定の checksum はここから取る |
+| `production` | Registry の検証経路だけが発行する `ArtifactAttestation`（#104） |
+
+「いま」は `AuthorityStore` 自身の時計から取る。hash を文字列で受け取ると、production が
+入れ替わったあとに古い artifact の hash を渡すだけで、**A の実績で B に制御権を与えられる**
+（codex #4056903570）。あわせて、`production.production_active` が立っていること（pointer が
+本当にそれを指していること）と、`approval.to_stage` が
+`production.authority_compatibility` に含まれることも確かめる。
 
 承認は次のすべてに束縛する。1つでも合わなければ昇格は通らない。
 
@@ -114,8 +138,11 @@ artifact が拒まれ、**新しい設定での証拠を1件も集められず�
 - 報告に現れた model artifact が、**いま Production の artifact ちょうど1つ**である
   （複数混ざった報告は帰属が決まらないので使わない）
 - 報告に現れた authority stage が、**いまの stage 以下**で、かつ**いまの stage を含む**
-- 証拠の新しさは**報告の run の `end_ms` の最大**で測り、`evidence_max_age_ms` 以内である。
-  0054 §2.7 により報告は生成時刻を持たないので、**自己申告ではなく中に記録された観測時刻**を使う
+- 証拠の新しさは、**名指した arm の実績が実在する最後の holdout segment の `end_ms`** で測り、
+  `evidence_max_age_ms` 以内である。0054 §2.7 により報告は生成時刻を持たないので、
+  自己申告ではなく中に記録された観測時刻を使う。**報告全体の最新 run では測らない。**
+  Fallback だけで回した新しい run を足すだけで、古い Learned MPC の実績が「新鮮」に
+  見えてしまうためである（codex #4056903573）
 - 名指した arm が**holdout の `overall` group に実在し**、その**制御器が Learned MPC**である。
   `arm_key` の一致だけで gate を読むと、承認者が適用された Fallback の arm を名指すだけで、
   肝心の Learned MPC が `blocked` のまま昇格できる（codex #4056864033）。
@@ -144,6 +171,11 @@ artifact が拒まれ、**新しい設定での証拠を1件も集められず�
 | `unhealthy_window_ms` の中で OOD が `ood_after` 件（`persistent_ood`） | 1段下 |
 | 同じ窓で LOW confidence が `low_confidence_after` 件（`persistent_low_confidence`） | 1段下 |
 | 人の rollback（`rollback_to_baseline`） | `SHADOW` |
+
+**Gate の降格推奨は「立ち上がり」だけを消費する**（codex #4056903574）。推奨は Gate 自身の
+窓（`demote_window_ms`）の間ずっと立ったままなので、毎 tick 消費すると1回の閾値超えが
+FULL → EXPANDED → LIMITED → SHADOW と連鎖する。**1回の超えで1段だけ下げる。**
+OOD / 低 confidence の件数は降格のたびに数え直すので、同じ理由で連鎖しない。
 
 **適用は永続化の成否に依存しない。** 先に in-memory の上限を下げ、そのあとで journal へ
 書く。書けなくても下げたままにして、失敗の理由を trace と runtime の状態に残す。
@@ -221,6 +253,11 @@ v8 からの移行は自動補完せず、v1〜v8 は起動前に拒否する。
   残すだけで、起動時に「前回書けなかった」を知る手段が無い。#82 の decision trace から
   読み取って起動時に Baseline から始める案があるが、trace の保存先（0030）が Proposed の
   ままなので、そちらの確定後に別の記録で決める
+- **`ArtifactAttestation` は発行時点の registry の写しである。** 発行から `raise_stage()` の
+  間に production pointer が動く余地は残る（`registry_revision` は載っているが、authority 側から
+  registry を読み直す経路は持たせていない）。Registry と Authority を別の状態にした以上、
+  片方がもう片方をロックする形にはしない。実運用の手順（昇格の直前に attestation を取り直す）で
+  埋めるか、`registry_revision` の下限を承認に持たせるかは、管理操作の入口を決めるときに一緒に決める
 - **管理操作の入口。** いまは `AuthorityStore` の API だけで、CLI も API も無い。
   読み取り API（#23）は制御を変えられないので、昇格・rollback の入口を
   どこに置くか（CLI か、0045 の書き込み専用ソケットか）は別 Issue で決める

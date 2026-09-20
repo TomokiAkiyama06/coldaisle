@@ -27,6 +27,7 @@ from coldaisle.control.schema import (
     Zone,
     ZoneRequest,
     lowest_stage,
+    stage_rank,
 )
 
 
@@ -62,6 +63,8 @@ class FallbackCause(StrEnum):
     PROPOSAL_EXPIRED = "learned_proposal_expired"
     SAFETY_NOT_NORMAL = "safety_not_normal"
     RECOVERY_HOLD = "ml_recovery_hold"
+    AUTHORITY_NOT_COVERED = "binding_authority_not_covered"
+    """提案を作った束縛が、この tick の実効 stage を覆っていない（#92）。"""
 
 
 def classify_confidence(
@@ -130,6 +133,14 @@ class LearnedControlStatus(_Frozen):
     `failure` だけでは `model_load_failure` としか残らず、何が起きたのかを後から読めない。
     Gate はこれを Fallback の理由の detail に載せる。
     """
+    binding_authority_stage: AuthorityStage | None = None
+    """提案を作った束縛が Registry に検証された authority stage（#92 / 0057 §2.2）。
+
+    **worker の照合を、この提案を使う瞬間まで運ぶ。** worker は自分が走った時刻の実効
+    stage しか見られないので、そこから Gate が選ぶまでの間に昇格が起きると、SHADOW だけ
+    検証された束縛の提案が LIMITED で採られてしまう（codex #4056903566）。Gate は
+    **この tick の stage** をこの値と照らし、覆っていなければ Fallback にする。
+    """
     result_digest: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
     """この状態の元になった **worker 結果そのもの**の識別子（``MpcProposal.result_digest()``）。
 
@@ -147,6 +158,9 @@ class LearnedControlStatus(_Frozen):
             raise ValueError("Learned proposal と受信単調時刻は一緒に指定する")
         if self.proposal is None and self.assessment is not None:
             raise ValueError("Learned proposal が無いときに assessment を付けない")
+        if (self.proposal is None) != (self.binding_authority_stage is None):
+            # 束縛の stage を持たない提案は、どの authority まで検証されたのか言えない。
+            raise ValueError("Learned proposal と束縛の authority stage は一緒に指定する")
         if self.proposal is not None and self.proposal.controller is not ControllerKind.LEARNED_MPC:
             raise ValueError("LearnedControlStatus には Learned MPC の提案だけを入れる")
         if self.failure is not None and self.proposal is not None:
@@ -367,6 +381,13 @@ class ControllerGate:
             return self._reason(FallbackCause.OPTIMIZER_TIMEOUT)
         if proposal.optimizer_status is OptimizerStatus.ERROR:
             return self._reason(FallbackCause.OPTIMIZER_ERROR)
+        assert learned.binding_authority_stage is not None
+        if stage_rank(stage) > stage_rank(learned.binding_authority_stage):
+            # worker が走ったあとに昇格した。**古い提案へ新しい制御権を渡さない。**
+            return self._reason(
+                FallbackCause.AUTHORITY_NOT_COVERED,
+                f"binding={learned.binding_authority_stage.value}; effective={stage.value}",
+            )
         if proposal.model_version != self._expected_model_version:
             return self._reason(
                 FallbackCause.MODEL_VERSION_MISMATCH,
