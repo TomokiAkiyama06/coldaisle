@@ -1652,3 +1652,43 @@ def test_a_verified_artifact_cannot_be_assembled_without_an_attestation(tmp_path
             payload=payload("1.1.0"),
             attestation=loaded.artifact.attestation,
         )
+
+
+def test_the_attestation_records_lifecycle_and_production_provenance(tmp_path: Path) -> None:
+    """**明示 version の読み込みを、そのまま制御へ配線できないようにする**（#86 / 0052 §2.1）。
+
+    `load_version()` は Replay / offline 評価のために候補・検証済み・引退も返す。attestation に
+    lifecycle と production pointer を載せ、active 制御側（#86）が要求できるようにする。
+    """
+    root = tmp_path / "registry"
+    registry = ModelRegistry(root, SimulatedClock(NOW_MS), limits=LIMITS)
+    register_and_validate(registry, "1.0.0")
+    register_and_validate(registry, "1.1.0")
+    promote(registry, "1.0.0")
+
+    production = registry.load_production(ArtifactKind.THERMAL_MODEL, COMPATIBILITY)
+    pinned_production = registry.load_version(metadata("1.0.0").ref, COMPATIBILITY)
+    pinned_validated = registry.load_version(metadata("1.1.0").ref, COMPATIBILITY)
+
+    assert production.artifact is not None
+    assert production.artifact.attestation.status is ArtifactStatus.PRODUCTION
+    assert production.artifact.attestation.production_active is True
+    # production pointer そのものを version 指定で読んだ場合も production として扱う。
+    assert pinned_production.artifact is not None
+    assert pinned_production.artifact.attestation.production_active is True
+    # promotion を経ていない artifact は、version を固定しても production にならない。
+    assert pinned_validated.artifact is not None
+    assert pinned_validated.artifact.attestation.status is ArtifactStatus.VALIDATED
+    assert pinned_validated.artifact.attestation.production_active is False
+    trace = pinned_validated.artifact.attestation.trace_metadata()
+    assert trace["artifact_status"] == "validated"
+    assert trace["production_active"] is False
+
+    with pytest.raises(ValueError, match="production pointer"):
+        registry_module.ArtifactAttestation._issue(
+            metadata("1.1.0"),
+            0,
+            status=ArtifactStatus.VALIDATED,
+            production_active=True,
+            _token=registry_module._ATTESTATION_ISSUE_TOKEN,
+        )

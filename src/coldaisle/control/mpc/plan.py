@@ -8,6 +8,8 @@ Reactive Guard（#80）と Critical Safety（#78）を呼ぶ経路も作らな�
 
 from __future__ import annotations
 
+import hashlib
+import json
 from typing import Annotated, Self
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -73,6 +75,22 @@ class ActionPlan(_Frozen):
     def offsets_ms(self) -> tuple[int, ...]:
         """各 step の予測時刻（action からの相対）。"""
         return tuple(step.offset_ms for step in self.steps)
+
+    def digest(self) -> str:
+        """この plan を一意に表す SHA-256。
+
+        **どの候補に対する予測かを予測側へ書き戻させるために使う。** 同じ tick の候補は
+        step の刻みが同じなので、時刻だけでは「別の候補の予測」を見分けられない
+        （決定記録 0052 §2.2）。
+        """
+        payload = json.dumps(
+            self.model_dump(mode="json"),
+            ensure_ascii=False,
+            allow_nan=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+        return hashlib.sha256(payload).hexdigest()
 
     @classmethod
     def held(cls, demands: PerZone[Demand], *, step_ms: int, steps: int) -> ActionPlan:

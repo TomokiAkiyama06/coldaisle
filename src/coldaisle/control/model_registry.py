@@ -506,7 +506,9 @@ class ArtifactAttestation:
         "_feature_schema_version",
         "_kind",
         "_model_id",
+        "_production_active",
         "_registry_revision",
+        "_status",
         "_target_schema_version",
         "_version",
     )
@@ -517,6 +519,8 @@ class ArtifactAttestation:
     _feature_schema_version: str
     _target_schema_version: str
     _authority_compatibility: tuple[AuthorityStage, ...]
+    _status: ArtifactStatus
+    _production_active: bool
     _registry_revision: int
 
     def __init__(self) -> None:
@@ -532,11 +536,17 @@ class ArtifactAttestation:
         metadata: ArtifactMetadata,
         registry_revision: int,
         *,
+        status: ArtifactStatus = ArtifactStatus.CANDIDATE,
+        production_active: bool = False,
         _token: object | None = None,
     ) -> ArtifactAttestation:
         if _token is not _ATTESTATION_ISSUE_TOKEN:
             raise TypeError("ArtifactAttestation は Registry の検証経路だけが発行できる")
+        if production_active and status is not ArtifactStatus.PRODUCTION:
+            raise ValueError("production pointer でない artifact を production として発行しない")
         attestation = object.__new__(cls)
+        object.__setattr__(attestation, "_status", status)
+        object.__setattr__(attestation, "_production_active", production_active)
         object.__setattr__(attestation, "_kind", metadata.kind)
         object.__setattr__(attestation, "_model_id", metadata.model_id)
         object.__setattr__(attestation, "_version", metadata.version)
@@ -585,6 +595,21 @@ class ArtifactAttestation:
         return self._authority_compatibility
 
     @property
+    def status(self) -> ArtifactStatus:
+        """発行時の lifecycle 状態。"""
+        return self._status
+
+    @property
+    def production_active(self) -> bool:
+        """この artifact が、その kind の**いまの production pointer そのもの**か。
+
+        明示 version を固定した読み込み（Replay / offline 評価）でも、指した先が production で
+        なければ false になる。**active 制御の束縛はこれを要求する**（決定記録 0052 §2.1）。
+        promotion には人の承認が要るので、承認を経ていない artifact に制御権を渡さない。
+        """
+        return self._production_active
+
+    @property
     def registry_revision(self) -> int:
         """発行時の registry revision。"""
         return self._registry_revision
@@ -601,6 +626,8 @@ class ArtifactAttestation:
             "model_id": self._model_id,
             "model_version": self._version,
             "artifact_sha256": self._artifact_sha256,
+            "artifact_status": self._status.value,
+            "production_active": self._production_active,
             "registry_revision": self._registry_revision,
         }
 
@@ -1164,8 +1191,18 @@ class ModelRegistry:
         compatibility: ModelCompatibility,
     ) -> ArtifactLoadResult:
         record = snapshot.artifacts[ref.key]
+        slot = snapshot.production.get(ref.kind)
+        # 明示 version を固定した読み込みでも、production pointer そのものなら production と
+        # して発行する。指した先が候補・検証済み・引退なら false のままにする。
+        production_active = slot is not None and slot.active == ref
         try:
-            artifact = self._verify(root_fd, record, compatibility, snapshot.revision)
+            artifact = self._verify(
+                root_fd,
+                record,
+                compatibility,
+                snapshot.revision,
+                production_active=production_active,
+            )
         except _ArtifactUnavailableError:
             return self._load_failure(
                 ArtifactLoadStatus.ARTIFACT_UNAVAILABLE,
@@ -1209,6 +1246,7 @@ class ModelRegistry:
         record: ArtifactRecord,
         compatibility: ModelCompatibility | None,
         registry_revision: int = 0,
+        production_active: bool = False,
     ) -> VerifiedArtifact:
         try:
             payload = self._read_artifact(root_fd, record.ref)
@@ -1233,6 +1271,8 @@ class ModelRegistry:
             attestation=ArtifactAttestation._issue(
                 record.metadata,
                 registry_revision,
+                status=record.status,
+                production_active=production_active,
                 _token=_ATTESTATION_ISSUE_TOKEN,
             ),
         )

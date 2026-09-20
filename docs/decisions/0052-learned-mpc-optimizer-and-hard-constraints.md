@@ -45,11 +45,18 @@ MPC の内部モデルには `InferenceCapability.COUNTERFACTUAL_ACTION` を要�
 
 1. `ArtifactAttestation` を伴っていること（= #104 の検証経路を通った bytes であること）
 2. attestation の `kind` が `thermal_model`
-3. `capability` が `counterfactual_action`
-4. 要求する authority stage が **attestation の** `authority_compatibility` に含まれる
-5. **attestation の** `version` が runtime の期待と一致する
-6. モデルの申告（`model_id` / `model_version`）と、公開している feature / target schema version が
+3. attestation の `production_active` が真（= その kind の**いまの production pointer そのもの**）
+4. `capability` が `counterfactual_action`
+5. 要求する authority stage が **attestation の** `authority_compatibility` に含まれる
+6. **attestation の** `version` が runtime の期待と一致する
+7. モデルの申告（`model_id` / `model_version`）と、公開している feature / target schema version が
    attestation と一致する
+
+3 は **promotion の承認を迂回させない**ための条件である。#104 の `load_version()` は Replay や
+offline 評価のために候補・検証済み・引退の artifact も返す。その結果をそのまま controller へ
+配線できると、人の承認を経ていないモデルが active authority を得てしまう。attestation は
+lifecycle 状態と production pointer かどうかを載せ、active 制御はそれを要求する。
+Replay / offline 評価は production でない attestation をそのまま使う。
 
 **verification・authority・版・schema は attestation を正とし、モデルの自称値は照合にだけ使う。**
 自称値だけで判断すると、別の artifact を包んだ wrapper が `registry_verified` を名乗って
@@ -92,8 +99,12 @@ Gate（#79 / #85）へ渡す。制御は Fallback で走り続ける（AGENTS.md
 3. 候補 action 列の評価（`predict_plan`）と探索
 4. 同じ `inference_id` を持つ `ControllerProposal` の生成
 
-`predict_plan` が返す `PlanPrediction` は `anchor_inference_id` を持ち、optimizer は
-それが手元の anchor と一致しない予測でコストを測らない。`MpcProposal` は型の不変条件として
+`predict_plan` が返す `PlanPrediction` は `anchor_inference_id` と、**評価した候補 plan の識別子**
+（`plan_digest` = `ActionPlan.digest()`）を持つ。optimizer は、手元の anchor と候補 plan の
+両方に一致しない予測でコストを測らない。同じ tick の候補は step の刻みが同じなので、時刻だけでは
+「別の候補（別の demand）の予測」を見分けられない。取り違えたまま採点すると、別の温度予測に
+今の音響・風量・変化コストを足して選んでしまう。anchor 推論そのものも、Registry の証拠
+（model ID・版）とこの tick の入力時刻へ突き合わせる。`MpcProposal` は型の不変条件として
 提案・assessment・解の `inference_id` と `model_version` の一致を要求し、
 **判定の付いていない提案や、別の推論の判定を付けた提案を worker が作れないようにする。**
 提案に入れる `confidence` / `ood` は `ConfidenceAssessment.apply_to` を必ず通す
@@ -158,8 +169,10 @@ optimizer 内部の打ち切りは2つ持つ。
 評価回数の上限は**時計に依存しない決定論的な打ち切り**で、replay で同じ結果を得るために持つ。
 
 計算時間は **anchor 推論と Confidence 判定を含めて**数える。探索だけを測ると、推論が遅い tick で
-予算を超えたまま `ok` を返してしまう。経過時間は**各モデル評価の前と後**に見る。Baseline の評価
-だけで予算を使い切る場合や、最後の候補で越える場合を `ok` にしないためである。
+予算を超えたまま `ok` を返してしまう。経過時間は**探索の入口と、各モデル評価の前と後**に見る。
+入口で見るのは、推論と判定だけで予算を使い切った tick にさらに1回まるごとモデルを回させない
+ためである（予測は高価になりうる）。前後の両方で見るのは、Baseline の評価だけで使い切る場合や、
+最後の候補で越える場合を `ok` にしないためである。
 
 - `timeout` / 実行不能（`error`）のとき、optimizer は**解を返さない**。
   中途半端な探索結果を制御に使わない。
@@ -269,6 +282,7 @@ replay の再現性は seed だけでは守れない。決定論的な探索と�
 | 論点 | どこで決めるか |
 |---|---|
 | #104 の `ArtifactMetadata` へ `capability` を持たせる | 反実仮想 artifact 形式を定める #84 と同時に #104 |
+| Acoustic / Air Balance の推定に、要求との対応づけ（どの demand への推定か）を持たせるか | #81 / #94。いまは設定済みの純粋な model だけを繋ぐ前提 |
 | モデル object と検証済み bytes の byte 一致（#84 の `from_verified_artifact` 相当を反実仮想側にも） | #84 / #104 |
 | horizon / step / 目的関数の重み・基準量の確定値 | 実測後に #103 の設定と後続の決定記録（Q-22） |
 | 反実仮想を扱える Dataset / Model 形式（後続 action 列） | #83 / #84 / #105 |

@@ -26,8 +26,8 @@ from coldaisle.control.model.confidence import (
     ConfidenceAssessor,
     ResidualEvidence,
 )
-from coldaisle.control.model.thermal import ObservedThermalInput
-from coldaisle.control.mpc.cost import MpcCostModel, PlanCost
+from coldaisle.control.model.thermal import ObservedThermalInput, ThermalPrediction
+from coldaisle.control.mpc.cost import MpcCostModel, MpcCostUnusableError, PlanCost
 from coldaisle.control.mpc.counterfactual import MpcModelBinding, MpcModelUnusableError
 from coldaisle.control.mpc.optimizer import LearnedMpcOptimizer, MpcSolution
 from coldaisle.control.mpc.plan import HardConstraintSet
@@ -242,6 +242,7 @@ class LearnedMpcController:
                 f"（window={observed.action_ts_ms}; snapshot={snapshot.ts_ms}）"
             )
         anchor = self._binding.model.predict(observed)
+        self._check_anchor(anchor, observed)
         assessment = self._assessor.assess(observed, anchor, residual)
         constraints = HardConstraintSet.build(
             optimizer=self._policy.mpc.optimizer,
@@ -286,6 +287,27 @@ class LearnedMpcController:
             assessment=assessment,
             solution=outcome.solution,
         )
+
+    def _check_anchor(self, anchor: ThermalPrediction, observed: ObservedThermalInput) -> None:
+        """anchor 推論が、束縛した artifact とこの tick の入力に属しているか確かめる。
+
+        #85 は予測を Profile の binding と照合するが、**Registry の証拠との一致は見ない**。
+        ここで見ないと、別の model が返した予測に今の tick の判定を付けてしまう。
+        """
+        attestation = self._binding.attestation
+        mismatches = [
+            name
+            for name, expected, actual in (
+                ("model_id", attestation.model_id, anchor.model_id),
+                ("model_version", attestation.version, anchor.model_version),
+                ("input_action_ts_ms", observed.action_ts_ms, anchor.input_action_ts_ms),
+            )
+            if expected != actual
+        ]
+        if mismatches:
+            raise MpcCostUnusableError(
+                f"anchor 推論が束縛した artifact / 入力と一致しない: {','.join(mismatches)}"
+            )
 
     @staticmethod
     def _requests(demands: PerZone[Demand], reason: Reason) -> PerZone[ZoneRequest]:

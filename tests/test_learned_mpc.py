@@ -72,6 +72,8 @@ from coldaisle.control.model_registry import (
     ArtifactFormat,
     ArtifactKind,
     ArtifactMetadata,
+    ArtifactRef,
+    ArtifactStatus,
     HumanApproval,
     ModelCompatibility,
     ModelRegistry,
@@ -161,6 +163,7 @@ class PlanningModel:
         forged_anchor_id: str | None = None,
         forged_offsets: tuple[int, ...] | None = None,
         forged_artifact_sha256: str | None = None,
+        stale_plan: ActionPlan | None = None,
     ) -> None:
         self._base = base
         self._identity = CounterfactualModelIdentity(
@@ -176,6 +179,7 @@ class PlanningModel:
         self._forged_anchor_id = forged_anchor_id
         self._forged_offsets = forged_offsets
         self._forged_artifact_sha256 = forged_artifact_sha256
+        self._stale_plan = stale_plan
         self.plan_calls = 0
 
     @property
@@ -205,22 +209,28 @@ class PlanningModel:
         self.plan_calls += 1
         if self._plan_error is not None:
             raise self._plan_error
-        anchor = self.predict(planned.observed)
+        # 別の候補の予測を返す（キャッシュの取り違えの再現）。
+        scored = (
+            planned
+            if self._stale_plan is None
+            else PlannedThermalInput(observed=planned.observed, plan=self._stale_plan)
+        )
+        anchor = self.predict(scored.observed)
         anchor_mean = _mean(
-            tuple(planned.observed.action.get(zone).effective_demand for zone in Zone)
+            tuple(scored.observed.action.get(zone).effective_demand for zone in Zone)
         )
         by_offset = {target.horizon_ms: target.values for target in anchor.targets}
-        offsets = self._forged_offsets or planned.plan.offsets_ms
+        offsets = self._forged_offsets or scored.plan.offsets_ms
         targets = []
-        for index, step in enumerate(planned.plan.steps):
+        for index, step in enumerate(scored.plan.steps):
             offset = offsets[index]
             delta = _mean(tuple(step.demands.get(zone) for zone in Zone)) - anchor_mean
-            weight = (index + 1) / len(planned.plan.steps)
+            weight = (index + 1) / len(scored.plan.steps)
             base_values = by_offset[step.offset_ms]
             targets.append(
                 PlannedTarget(
                     offset_ms=offset,
-                    expected_ts_ms=planned.observed.action_ts_ms + offset,
+                    expected_ts_ms=scored.observed.action_ts_ms + offset,
                     values={
                         metric: value - self._gain * delta * weight
                         for metric, value in base_values.items()
@@ -233,8 +243,10 @@ class PlanningModel:
             artifact_sha256=self._forged_artifact_sha256 or anchor.artifact_sha256,
             artifact_verification=anchor.artifact_verification,
             capability=InferenceCapability.COUNTERFACTUAL_ACTION,
-            anchor_inference_id=(self._forged_anchor_id or inference_id(planned.observed, anchor)),
+            anchor_inference_id=(self._forged_anchor_id or inference_id(scored.observed, anchor)),
             input_action_ts_ms=anchor.input_action_ts_ms,
+            # **評価した plan そのもの**の識別子を返す。取り違えれば呼び出し側が弾く。
+            plan_digest=scored.plan.digest(),
             targets=tuple(targets),
         )
 
@@ -273,6 +285,7 @@ def issue_attestation(
     target_schema_version: str = "thermal-targets-v1",
     kind: ArtifactKind = ArtifactKind.THERMAL_MODEL,
     stage: AuthorityStage = AuthorityStage.FULL,
+    promoted: bool = True,
 ) -> ArtifactAttestation:
     """**本物の Model Registry（#104）に登録し、検証経路から attestation を受け取る。**
 
@@ -311,22 +324,23 @@ def issue_attestation(
         target_schema_version=target_schema_version,
         authority_stage=stage,
     )
-    revision = registry.inspect().revision
-    registry.promote(
-        metadata.ref,
-        compatibility,
-        shadow_evaluation_ref="evaluation/shadow/86",
-        approval=HumanApproval(
-            action=ApprovalAction.PROMOTE,
-            artifact=metadata.ref,
-            artifact_sha256=metadata.sha256,
+    if promoted:
+        revision = registry.inspect().revision
+        registry.promote(
+            metadata.ref,
+            compatibility,
+            shadow_evaluation_ref="evaluation/shadow/86",
+            approval=HumanApproval(
+                action=ApprovalAction.PROMOTE,
+                artifact=metadata.ref,
+                artifact_sha256=metadata.sha256,
+                expected_revision=revision,
+                approver="model-operator",
+                approved_at_ms=1_700_000_000_000,
+                reason="shadow evaluation passed",
+            ),
             expected_revision=revision,
-            approver="model-operator",
-            approved_at_ms=1_700_000_000_000,
-            reason="shadow evaluation passed",
-        ),
-        expected_revision=revision,
-    )
+        )
     result = registry.load_version(metadata.ref, compatibility)
     assert result.artifact is not None, result.detail
     return result.artifact.attestation
@@ -1602,3 +1616,194 @@ def test_a_plan_prediction_from_another_artifact_is_rejected(trained) -> None:
     assert result.solution is None
     assert result.proposal is not None
     assert result.proposal.optimizer_status is OptimizerStatus.ERROR
+
+
+@pytest.mark.parametrize("promoted", [False, True])
+def test_only_the_production_pointer_can_be_bound_for_active_control(
+    trained, tmp_path: Path, promoted: bool
+) -> None:
+    """**promotion を経ていない artifact に制御権を渡さない**（codex #4055572072）。
+
+    `load_version()` は Replay / offline 評価のために候補・検証済み・引退も返す。その結果を
+    そのまま controller へ配線できると、人の承認を経ずに active authority を得てしまう。
+    """
+    base, _profile, _attestation = trained
+    attestation = issue_attestation(
+        tmp_path / ("promoted" if promoted else "pinned"),
+        model_id=base.manifest.model_id,
+        version=base.manifest.model_version,
+        promoted=promoted,
+    )
+
+    assert attestation.production_active is promoted
+    if promoted:
+        assert attestation.status is ArtifactStatus.PRODUCTION
+        binding = MpcModelBinding.for_control(
+            PlanningModel(base),
+            attestation=attestation,
+            authority_stage=AuthorityStage.FULL,
+            expected_model_version=attestation.version,
+        )
+        assert binding.attestation.production_active is True
+        return
+
+    assert attestation.status is ArtifactStatus.VALIDATED
+    with pytest.raises(MpcModelUnusableError, match="production pointer"):
+        MpcModelBinding.for_control(
+            PlanningModel(base),
+            attestation=attestation,
+            authority_stage=AuthorityStage.FULL,
+            expected_model_version=attestation.version,
+        )
+
+
+def test_a_retired_artifact_pinned_by_version_is_refused(trained, tmp_path: Path) -> None:
+    """rollback などで引退した artifact も、version 固定で制御へ戻せない。"""
+    base, _profile, _attestation = trained
+    root = tmp_path / "retired"
+    old = issue_attestation(
+        root,
+        model_id=base.manifest.model_id,
+        version=base.manifest.model_version,
+    )
+    assert old.production_active is True
+
+    # 次の版を promote すると、前の版は production pointer ではなくなる。
+    newer = issue_attestation(
+        root,
+        model_id=base.manifest.model_id,
+        version="0.2.0",
+    )
+    registry = ModelRegistry(root, limits=REGISTRY_LIMITS)
+    stale = registry.load_version(
+        ArtifactRef(
+            kind=ArtifactKind.THERMAL_MODEL,
+            model_id=base.manifest.model_id,
+            version=base.manifest.model_version,
+        ),
+        ModelCompatibility(
+            feature_schema_version="thermal-features-v1",
+            target_schema_version="thermal-targets-v1",
+            authority_stage=AuthorityStage.FULL,
+        ),
+    )
+
+    assert newer.production_active is True
+    assert stale.artifact is not None
+    assert stale.artifact.attestation.production_active is False
+    with pytest.raises(MpcModelUnusableError, match="production pointer"):
+        MpcModelBinding.for_control(
+            PlanningModel(base),
+            attestation=stale.artifact.attestation,
+            authority_stage=AuthorityStage.FULL,
+            expected_model_version=base.manifest.model_version,
+        )
+
+
+def test_a_prediction_for_another_candidate_is_rejected(trained) -> None:
+    """**別の候補の予測を今の候補のコストに使わせない**（codex #4055572075）。
+
+    同じ tick の候補は step の刻みが同じなので、時刻だけでは見分けられない。別の demand の
+    温度予測に、今の候補の音響・風量・変化コストを足して選ばせてしまう。
+    """
+    base, _profile, _attestation = trained
+    stale = ActionPlan.held(demands(0.95), step_ms=STEP_MS, steps=len(HORIZONS))
+    controller, _model, settings = build_controller(
+        trained, model=PlanningModel(base, stale_plan=stale)
+    )
+
+    result = propose(controller)
+
+    assert result.solution is None
+    assert result.proposal is not None
+    assert result.proposal.optimizer_status is OptimizerStatus.ERROR
+
+    gate = ControllerGate(settings, expected_model_version=_attestation.version)
+    selection = gate.select(
+        now_mono_ms=0,
+        fallback=fallback_proposal(0.4),
+        learned=result.to_status(received_at_mono_ms=0),
+        operating_mode=OperatingMode.AUTO,
+        safety_state=SafetyState.NORMAL,
+    )
+    assert selection.active_controller is ControllerKind.FALLBACK
+
+
+def test_the_plan_digest_covers_the_per_zone_demands() -> None:
+    """plan の識別子は zone ごとの demand まで含む（offset だけでは足りない）。"""
+    first = ActionPlan.held(demands(0.4), step_ms=STEP_MS, steps=2)
+    second = ActionPlan.held(demands(0.5), step_ms=STEP_MS, steps=2)
+    zoned = ActionPlan(
+        step_ms=STEP_MS,
+        steps=tuple(
+            PlanStep(
+                offset_ms=STEP_MS * (index + 1),
+                demands=PerZone[Demand](front=0.4, rear=0.4, top=0.5),
+            )
+            for index in range(2)
+        ),
+    )
+
+    assert first.offsets_ms == second.offsets_ms == zoned.offsets_ms
+    assert len({first.digest(), second.digest(), zoned.digest()}) == 3
+    assert first.digest() == ActionPlan.held(demands(0.4), step_ms=STEP_MS, steps=2).digest()
+
+
+def test_an_expired_tick_never_spends_another_model_evaluation(trained) -> None:
+    """**予算を使い切った tick で、さらに1回モデルを回さない**（codex #4055572079）。
+
+    anchor 推論と Confidence 判定だけで予算を越えた場合、`predict_plan()` を1度も呼ばずに
+    `TIMEOUT` を返す。
+    """
+    base, _profile, _attestation = trained
+    model = PlanningModel(base)
+    controller, _model, _settings = build_controller(
+        trained,
+        model=model,
+        clock=ScriptedClock(0, 10_000),
+        policy_config=mpc_policy(budget_ms=10),
+    )
+
+    result = propose(controller)
+
+    assert result.solution is None
+    assert result.proposal is not None
+    assert result.proposal.optimizer_status is OptimizerStatus.TIMEOUT
+    assert model.plan_calls == 0
+
+
+def test_an_anchor_prediction_from_another_model_is_refused(trained, tmp_path: Path) -> None:
+    """**anchor 推論も Registry の証拠へ束ねる。**
+
+    #85 は予測を Confidence Profile の binding と照合するが、Registry の証拠とは突き合わせない。
+    ここを見ないと、別の artifact が返した予測に今の tick の判定を付けてしまう。
+    """
+    base, profile, _attestation = trained
+    # identity と attestation は 0.2.0 で揃うが、委譲先の #84 model は 0.1.0 を返す。
+    attestation = issue_attestation(
+        tmp_path / "other-version",
+        model_id=base.manifest.model_id,
+        version="0.2.0",
+    )
+    binding = MpcModelBinding.for_control(
+        PlanningModel(base, model_version="0.2.0"),
+        attestation=attestation,
+        authority_stage=AuthorityStage.FULL,
+        expected_model_version=attestation.version,
+    )
+    settings = mpc_policy()
+    controller = LearnedMpcController(
+        binding,
+        settings,
+        safety(),
+        cost_model=MpcCostModel(settings.mpc.optimizer),
+        assessor=ConfidenceAssessor(profile, settings.model_confidence),
+        monotonic_ms=ScriptedClock(0),
+    )
+
+    result = propose(controller)
+
+    assert result.proposal is None
+    assert result.failure is LearnedFailure.OPTIMIZER_EXCEPTION
+    assert result.failure_reason is not None
+    assert "model_version" in result.failure_reason.detail

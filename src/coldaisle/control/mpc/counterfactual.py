@@ -118,6 +118,13 @@ class PlanPrediction(_Frozen):
     得ないよう、optimizer は最後まで同じ識別子で束ねる。
     """
     input_action_ts_ms: TimestampMs
+    plan_digest: Sha256
+    """予測した候補 plan の識別子（``ActionPlan.digest()``）。
+
+    **どの候補に対する予測かを、時刻ではなく plan そのもので突き合わせる。** 同じ tick の候補は
+    step の刻みが同じなので、offset だけでは別の候補（別の demand）の予測を見分けられない。
+    取り違えたまま採点すると、別の温度予測に対して今の音響・風量・変化コストを足してしまう。
+    """
     targets: Annotated[
         tuple[PlannedTarget, ...], Field(min_length=1, max_length=MAX_TARGET_HORIZONS)
     ]
@@ -137,7 +144,12 @@ class PlanPrediction(_Frozen):
         return self
 
     def matches(self, plan: ActionPlan) -> bool:
-        """予測が渡した plan と同じ step 列に対応しているか返す。"""
+        """予測がこの候補 plan そのものに対応しているか返す。
+
+        step の刻みだけでなく **plan の識別子**（zone ごとの demand を含む）を突き合わせる。
+        """
+        if self.plan_digest != plan.digest():
+            return False
         return tuple(target.offset_ms for target in self.targets) == plan.offsets_ms
 
 
@@ -223,6 +235,13 @@ class MpcModelBinding:
             raise MpcModelUnusableError(
                 f"thermal model 以外の artifact を MPC の内部モデルにしない"
                 f"（kind={attestation.kind.value}）"
+            )
+        if not attestation.production_active:
+            # 明示 version を固定した読み込み（Replay / offline 評価）の結果を、そのまま
+            # 制御へ配線できないようにする。promotion には人の承認が要る（#104 / 0052 §2.1）。
+            raise MpcModelUnusableError(
+                "production pointer でない artifact に制御権を渡さない"
+                f"（status={attestation.status.value}）"
             )
         if identity.capability not in COUNTERFACTUAL_CAPABILITIES:
             raise MpcModelUnusableError(

@@ -159,10 +159,17 @@ class LearnedMpcOptimizer:
             self._monotonic_ms() if budget_started_mono_ms is None else budget_started_mono_ms
         )
         evaluations = 0
+        # 入口で見る。anchor 推論と Confidence 判定だけで予算を使い切った tick に、
+        # さらに1回まるごとモデルを回させない（予測は高価になりうる）。
+        if self._out_of_budget(started_ms):
+            return self._timed_out(started_ms, evaluations)
         try:
             # 格子の算出も制約の交わりを読むので、実行不能はここで捕まえる。
             levels = {zone: self._levels(constraints, zone) for zone in _ZONE_ORDER}
             baseline_requested = self._clamped(constraints, baseline)
+            if self._out_of_budget(started_ms):
+                # 制約の組み立てで越えた場合も、モデルを呼ぶ前に止める。
+                return self._timed_out(started_ms, evaluations)
             baseline_cost = self._evaluate(
                 baseline_requested,
                 observed,
