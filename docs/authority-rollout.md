@@ -74,9 +74,10 @@ lock を手放す `inspect()` だけでは、A の証拠を持ったまま B が
 - `to_stage` が Registry の `authority_compatibility` に含まれない
 - 報告に現れた artifact が、いま Production の artifact ちょうど1つでない
 - 報告に現れた authority stage が、いまの stage より高い / いまの stage を含まない
-- **名指した arm 自身の `last_ts_ms`** が `evidence_max_age_ms` より古い
-  （報告全体の run でも segment の終わりでも測らない。Fallback だけで回した続きを
-  足しても新鮮にならない）
+- **名指した arm の `last_attested_ts_ms`**（裏づけのある提案を最後に出した時刻）が
+  `evidence_max_age_ms` より古い、または裏づけのある提案が1つも無い
+  （報告全体の run でも、segment の終わりでも、arm の `last_ts_ms` でも測らない。
+  Fallback だけで回した続きや、いまの読み込み失敗を足しても新鮮にならない）
 - 名指した arm が holdout の実績に無い、または**制御器が Learned MPC でない**
   （適用された Fallback の arm を名指して昇格できない）
 - 名指した arm の stage が、いまの stage と違う

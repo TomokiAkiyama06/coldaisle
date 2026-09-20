@@ -147,6 +147,21 @@ authority の lock も disk も待たない（§2.6）。
 `yield` を `try` の中に置くと、authority 側の I/O 失敗まで「Registry を読めない」として
 報告してしまう（codex #4056992240）。`try` は registry の読み取りだけに掛ける。
 
+#### 0054 への追記（`last_attested_ts_ms`）
+
+`AppliedArmReport` / `CounterfactualArmReport` に `last_attested_ts_ms` を足した。
+その arm が**裏づけ（`attested`）のある提案を最後に出した tick の時刻**で、無ければ `None`。
+
+**0054 の帰属規則は変えない。** 記録から言える事実を1つ増やしただけで、どの実測をどの arm へ
+帰属させるか（§2.1 / §2.2）も、coverage の扱い（§2.3）も、gate の段（§2.4）も同じである。
+`last_ts_ms` は区間の最後の tick で、提案を作れなかった tick も含むため、
+**区間の新しさ**と**証拠の新しさ**を分ける欄が要る。報告の schema version は上げていない
+（既存の欄の意味は変わらず、古い報告は欄が無い＝`None` として読まれ、昇格には使えない。
+判断は fail closed のまま）。
+
+**どの artifact の提案かは、報告全体で1つに絞ってある**（`model_artifacts` の照合）。
+その上での「最後の裏づけのある提案の時刻」なので、いま production の artifact の実績の時刻になる。
+
 #### #104 と #92 の境界
 
 **#92 は #104 の state を読む。書かない。** これは Issue #92 が引いた境界そのもの
@@ -181,12 +196,14 @@ authority の lock も disk も待たない（§2.6）。
 - 報告に現れた model artifact が、**いま Production の artifact ちょうど1つ**である
   （複数混ざった報告は帰属が決まらないので使わない）
 - 報告に現れた authority stage が、**いまの stage 以下**で、かつ**いまの stage を含む**
-- 証拠の新しさは、**名指した arm 自身の `last_ts_ms`**（`AppliedArmReport` /
-  `CounterfactualArmReport` が持つ、その arm が最後に動いた時刻）で測り、
-  `evidence_max_age_ms` 以内である。0054 §2.7 により報告は生成時刻を持たないので、
-  自己申告ではなく中に記録された観測時刻を使う。**報告全体の run でも segment の終わりでも
-  測らない。** どちらも、Fallback だけで回した続きを足すだけで古い Learned MPC の実績を
-  「新鮮」にできてしまう（codex #4056903573 / #4056942799）
+- 証拠の新しさは、**名指した arm が裏づけのある提案を最後に出した時刻**
+  （`last_attested_ts_ms`）で測り、`evidence_max_age_ms` 以内である。
+  0054 §2.7 により報告は生成時刻を持たないので、自己申告ではなく中に記録された観測時刻を使う。
+  **報告全体の run でも、segment の終わりでも、arm の `last_ts_ms` でも測らない。**
+  それぞれ、Fallback だけで回した続きや、**提案を作れなかった tick（model の読み込み失敗）**を
+  1つ足すだけで、古い Learned MPC の実績を「新鮮」にできてしまう
+  （codex #4056903573 / #4056942799 / #4057035287）。
+  裏づけのある提案が1つも無い arm は根拠にできない（fail closed）
 - 名指した arm が**holdout の `overall` group に実在し**、その**制御器が Learned MPC**である。
   `arm_key` の一致だけで gate を読むと、承認者が適用された Fallback の arm を名指すだけで、
   肝心の Learned MPC が `blocked` のまま昇格できる（codex #4056864033）。

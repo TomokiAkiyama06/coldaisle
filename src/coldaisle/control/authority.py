@@ -319,12 +319,13 @@ class _ArmEvidence(_Frozen):
     """1つの arm が holdout に現れた事実と、**その arm が現れた最後の時刻**。"""
 
     arm: AppliedArm | CounterfactualArm
-    last_ts_ms: int = Field(ge=0)
-    """**その arm 自身の最後の tick の時刻**（`AppliedArmReport` / `CounterfactualArmReport`）。
+    last_attested_ts_ms: int | None = Field(default=None, ge=0)
+    """**その arm が、裏づけのある提案を最後に出した時刻**（`last_attested_ts_ms`）。
 
-    segment の `end_ms` ではない。同じ segment の続きを Fallback だけで回しても
-    segment は伸びるので、そちらで測ると古い Learned MPC の実績が新鮮に見える
-    （codex #4056942799）。
+    segment の `end_ms` でも arm の `last_ts_ms` でもない。`last_ts_ms` は区間の最後の
+    tick で、**提案を作れなかった tick（model の読み込み失敗など）も含む**ので、
+    いまの失敗を1つ足すだけで古い実績が「新鮮」に見えてしまう（codex #4057035287）。
+    裏づけ（`attested`）のある提案が実在した時刻だけを新しさに使う。
     """
 
 
@@ -342,10 +343,17 @@ def _holdout_arms(report: EvaluationReport) -> dict[str, _ArmEvidence]:
     """
     arms: dict[str, _ArmEvidence] = {}
 
-    def observe(key: str, arm: AppliedArm | CounterfactualArm, last_ts_ms: int) -> None:
+    def observe(
+        key: str, arm: AppliedArm | CounterfactualArm, last_attested_ts_ms: int | None
+    ) -> None:
         current = arms.get(key)
-        if current is None or last_ts_ms > current.last_ts_ms:
-            arms[key] = _ArmEvidence(arm=arm, last_ts_ms=last_ts_ms)
+        if current is None:
+            arms[key] = _ArmEvidence(arm=arm, last_attested_ts_ms=last_attested_ts_ms)
+            return
+        if last_attested_ts_ms is None:
+            return
+        if current.last_attested_ts_ms is None or last_attested_ts_ms > current.last_attested_ts_ms:
+            arms[key] = _ArmEvidence(arm=arm, last_attested_ts_ms=last_attested_ts_ms)
 
     for segment in report.segments:
         if segment.role is not SegmentRole.HOLDOUT:
@@ -354,9 +362,13 @@ def _holdout_arms(report: EvaluationReport) -> dict[str, _ArmEvidence]:
             if group.kind is not GroupKind.OVERALL:
                 continue
             for applied in group.applied:
-                observe(applied.arm_key, applied.arm, applied.last_ts_ms)
+                observe(applied.arm_key, applied.arm, applied.last_attested_ts_ms)
             for counterfactual in group.counterfactual:
-                observe(counterfactual.arm_key, counterfactual.arm, counterfactual.last_ts_ms)
+                observe(
+                    counterfactual.arm_key,
+                    counterfactual.arm,
+                    counterfactual.last_attested_ts_ms,
+                )
     return arms
 
 
@@ -709,10 +721,18 @@ class AuthorityStore:
         if approval.from_stage not in observed:
             raise AuthorityEvidenceError("いまの stage で運転した証拠が無い")
         named = _check_learned_arms(report, approval)
-        # **新しさは「その arm が最後に動いた時刻」で測る**（codex #4056903573 / #4056942799）。
-        # 報告全体の run でも segment の終わりでもない。どちらも、Fallback だけで回した
-        # 続きを足すだけで、古い Learned MPC の実績を「新鮮」にできてしまう。
-        end_ms = named.last_ts_ms
+        # **新しさは「裏づけのある提案が最後に実在した時刻」で測る**
+        # （codex #4056903573 / #4056942799 / #4057035287）。報告全体の run でも、
+        # segment の終わりでも、arm の最後の tick でもない。どれも、Fallback だけで回した
+        # 続きや、いまの読み込み失敗を1つ足すだけで「新鮮」にできてしまう。
+        #
+        # **どの artifact の提案かは、報告全体で1つに絞ってある**（上の `model_artifacts`
+        # の照合）。だからこの時刻は、いま production の artifact の提案の時刻である。
+        end_ms = named.last_attested_ts_ms
+        if end_ms is None:
+            raise AuthorityEvidenceError(
+                f"裏づけのある提案が1つも無い arm を根拠にできない（arm={evidence.arm_key}）"
+            )
         if evidence.evidence_end_ms != end_ms:
             raise AuthorityEvidenceError(
                 "証拠の最終観測時刻が、名指した arm の実績と違う"

@@ -218,14 +218,25 @@ FALLBACK_ARM = applied_fallback_arm().key
 
 
 def counterfactual_report(
-    arm: CounterfactualArm, *, end_ms: int, last_ts_ms: int | None = None
+    arm: CounterfactualArm,
+    *,
+    end_ms: int,
+    last_ts_ms: int | None = None,
+    last_attested_ts_ms: int | None = None,
 ) -> CounterfactualArmReport:
+    attested_ts_ms = (
+        last_attested_ts_ms
+        if last_attested_ts_ms is not None
+        else (end_ms if last_ts_ms is None else last_ts_ms)
+    )
     return CounterfactualArmReport(
         arm=arm,
         arm_key=arm.key,
         ticks=1_000,
-        first_ts_ms=min(end_ms, last_ts_ms if last_ts_ms is not None else end_ms) - 3_600_000,
+        first_ts_ms=min(end_ms, last_ts_ms or end_ms, attested_ts_ms) - 3_600_000,
         last_ts_ms=end_ms if last_ts_ms is None else last_ts_ms,
+        last_attested_ts_ms=attested_ts_ms,
+        attested_ticks=1_000,
         proposals=1_000,
         safety_floor_shortfalls=0,
         maximum_floor_shortfall=0.0,
@@ -242,13 +253,21 @@ def counterfactual_report(
     )
 
 
-def applied_report(arm: AppliedArm, *, end_ms: int) -> AppliedArmReport:
+def applied_report(
+    arm: AppliedArm, *, end_ms: int, last_attested_ts_ms: int | None = None
+) -> AppliedArmReport:
+    attested = (
+        last_attested_ts_ms
+        if last_attested_ts_ms is not None
+        else (end_ms if arm.controller is ControllerKind.LEARNED_MPC else None)
+    )
     return AppliedArmReport(
         arm=arm,
         arm_key=arm.key,
         ticks=1_000,
-        first_ts_ms=end_ms - 3_600_000,
+        first_ts_ms=min(end_ms, attested if attested is not None else end_ms) - 3_600_000,
         last_ts_ms=end_ms,
+        last_attested_ts_ms=attested,
         interventions=InterventionReport(
             ticks=1_000,
             safety_states=(CountedReason(code="normal", count=1_000),),
@@ -295,6 +314,7 @@ def report_document(
     extra_outcome: GateOutcome = GateOutcome.PASS,
     fresh_fallback_end_ms: int | None = None,
     learned_last_ts_ms: int | None = None,
+    learned_last_attested_ts_ms: int | None = None,
     start_ms: int | None = None,
 ) -> bytes:
     """最小の Offline Evaluation 報告（#91）。**arm の実績と gate を持つ。**"""
@@ -319,7 +339,12 @@ def report_document(
         )
 
     counterfactual_arms = [
-        counterfactual_report(learned, end_ms=end_ms, last_ts_ms=learned_last_ts_ms)
+        counterfactual_report(
+            learned,
+            end_ms=end_ms,
+            last_ts_ms=learned_last_ts_ms,
+            last_attested_ts_ms=learned_last_attested_ts_ms,
+        )
     ]
     gates = [gate(arm, outcome)]
     if arm != learned.key:
@@ -1054,6 +1079,58 @@ def test_invariant_5_q_a_fallback_only_continuation_does_not_refresh_the_same_se
             approval=approval_for(document, evidence=evidence_for(document, end_ms=stale_ts_ms)),
             document=document,
         )
+
+
+def test_invariant_5_r_a_current_failure_does_not_refresh_stale_evidence(
+    tmp_path: Path,
+) -> None:
+    """**いまの読み込み失敗を1つ足しても、古い実績は新鮮にならない**（codex #4057035287）。
+
+    counterfactual の `last_ts_ms` には、提案を作れなかった tick（model の読み込み失敗など）も
+    入る。そちらで測ると、gate の集計は何も変わらないまま新しさだけが更新できてしまう。
+    新しさは**裏づけのある提案が実在した時刻**（`last_attested_ts_ms`）で測る。
+    """
+    limit_ms = DEFAULT_CONFIG.policy.authority_rollout.evidence_max_age_ms.value
+    stale_ts_ms = NOW_MS - limit_ms - 1
+    document = report_document(
+        end_ms=NOW_MS - 60_000,
+        learned_last_attested_ts_ms=stale_ts_ms,
+        start_ms=stale_ts_ms - 3_600_000,
+    )
+
+    # arm の最後の tick（失敗だけの新しい tick）を名乗ると、実績と食い違う。
+    with pytest.raises(AuthorityEvidenceError, match="名指した arm の実績と違う"):
+        raise_stage(
+            store(tmp_path),
+            approval=approval_for(
+                document, evidence=evidence_for(document, end_ms=NOW_MS - 60_000)
+            ),
+            document=document,
+        )
+
+    # 裏づけのある提案の時刻を名乗れば、こんどは「古い」として拒まれる。
+    with pytest.raises(AuthorityEvidenceError, match="証拠が古い"):
+        raise_stage(
+            store(tmp_path),
+            approval=approval_for(document, evidence=evidence_for(document, end_ms=stale_ts_ms)),
+            document=document,
+        )
+
+
+def test_invariant_5_s_an_arm_without_any_attested_proposal_cannot_justify_a_promotion(
+    tmp_path: Path,
+) -> None:
+    """**裏づけのある提案が1つも無い arm を根拠にできない。** 判定できないことを通さない。"""
+    document = report_document()
+    payload = json.loads(document)
+    arm_report = payload["segments"][0]["groups"][0]["counterfactual"][0]
+    arm_report["last_attested_ts_ms"] = None
+    arm_report["attested_ticks"] = 0
+    document = json.dumps(payload).encode("utf-8")
+    approval = approval_for(document, evidence=evidence_for(document))
+
+    with pytest.raises(AuthorityEvidenceError, match="裏づけのある提案が1つも無い"):
+        raise_stage(store(tmp_path), approval=approval, document=document)
 
 
 # --- 不変条件 6: 降格に承認は要らない ------------------------------------------

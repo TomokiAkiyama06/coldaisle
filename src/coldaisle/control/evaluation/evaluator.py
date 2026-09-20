@@ -845,8 +845,24 @@ def _applied_report(bucket: _AppliedBucket, context: EvaluationContext) -> Appli
         rpm=rpm,
         acoustic_cost=acoustic,
         interventions=_interventions(ticks),
+        last_attested_ts_ms=_last_attested_ts_ms(ticks),
         gaps=_counted(gaps),
     )
+
+
+def _last_attested_ts_ms(ticks: Sequence[ControlTick]) -> int | None:
+    """**裏づけのある Learned 提案が、実際に適用された**最後の tick の時刻。
+
+    区間の最後（`last_ts_ms`）とは別物である。model を読めなかった tick を1つ足すだけで
+    古い実績を「新しい」ことにできないよう、記録から言える形で分けて持つ（0057 §2.4）。
+    """
+    found: int | None = None
+    for tick in ticks:
+        gate = tick.model_gate
+        if gate is None or not gate.attested or not gate.learned_selected:
+            continue
+        found = tick.ts_ms if found is None else max(found, tick.ts_ms)
+    return found
 
 
 def _rpm_of(tick: ControlTick, zone: Zone) -> float | None:
@@ -1023,6 +1039,7 @@ def _counterfactual_report(
     attested = ood = proposals = shortfalls = 0
     worst_shortfall = 0.0
 
+    last_attested_ts_ms: int | None = None
     for tick, counterfactual in bucket.entries:
         ts_ms = tick.ts_ms
         if counterfactual.failure is not None:
@@ -1061,6 +1078,12 @@ def _counterfactual_report(
             )
         if counterfactual.attested:
             attested += 1
+            if counterfactual.requested is not None:
+                # **提案が実在して、裏づけもある tick だけ**を「証拠の新しさ」に数える。
+                # 失敗の tick で区間だけ伸ばしても、この時刻は動かない（0057 §2.4）。
+                last_attested_ts_ms = (
+                    ts_ms if last_attested_ts_ms is None else max(last_attested_ts_ms, ts_ms)
+                )
             if counterfactual.confidence is not None:
                 confidences.append(counterfactual.confidence)
             if counterfactual.ood:
@@ -1124,6 +1147,7 @@ def _counterfactual_report(
         confidence=confidence,
         coverage=coverage,
         predictions=predictions,
+        last_attested_ts_ms=last_attested_ts_ms,
         gaps=_counted(gaps),
     )
 
