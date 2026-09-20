@@ -88,6 +88,15 @@ class ArtifactCapability(StrEnum):
     """観測の再生だけ。**反実仮想予測は主張しない**（決定記録 0048 §2.1）。"""
     COUNTERFACTUAL_ACTION = "counterfactual_action"
     """候補 Fan action 列に対する将来観測の予測。#86 が要求する（決定記録 0052 §2.1）。"""
+    SUPERVISOR_STRATEGY = "supervisor_strategy"
+    """`WorkloadRegime` から Supervisor の戦略・目的関数 weight・target band への写像（#89）。
+
+    **thermal model の能力ではない。** 将来観測を1つも予測しないので、#86 の
+    `COUNTERFACTUAL_CAPABILITIES` にも `AttestedThermalDynamics.bind` の要求にも入らず、
+    この能力を申告した artifact が MPC の内部モデルや学習 dynamics として束縛される経路は
+    無い。逆に #89 の束縛はこの能力だけを受け付けるので、thermal artifact を
+    `supervisor_policy` として取り違えて渡す配線ミスも型で止まる（決定記録 0061 §2.1）。
+    """
 
 
 class ArtifactFormat(StrEnum):

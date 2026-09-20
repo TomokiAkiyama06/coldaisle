@@ -1,0 +1,282 @@
+# 決定記録 0061: RL Supervisor policy の artifact 形式・束縛・昇格の規律
+
+- **種別**: Decision Record
+- **Status**: Proposed（**リポジトリ所有者の承認が必要**。§2.1 は #104 の契約を広げる）
+- **Date**: 2026-09-21
+- **Supersedes**: なし
+- **関連**: [0027](0027-fan-control-architecture.md) / [0028](0028-fan-control-contracts.md) §2.3 /
+  [0048](0048-thermal-model-artifact-and-inference.md) §2.1 /
+  [0050](0050-model-confidence-ood-and-authority.md) §3 /
+  [0052](0052-learned-mpc-optimizer-and-hard-constraints.md) §2.1 /
+  [0053](0053-control-shadow-mode-and-counterfactual-logging.md) §2.3 /
+  [0054](0054-offline-evaluation-attribution-and-gates.md) §2.4 / §2.6 / §2.7 /
+  [0055](0055-shadow-duplicate-observation-rule.md) §2.1 /
+  [0057](0057-authority-rollout-stage-changes.md) §2.2 /
+  [0058](0058-rl-supervisor-training-environment.md)（**全体**）/
+  GitHub #88 / #89 / #104 / #105
+- **対象 Issue**: #89（依存 #84 / #87 / #88 / #90 / #91 / #102 / #104 / #105）
+
+## 1. Context
+
+0058 は **学習環境**の契約を決めた。action は Supervisor の戦略まで、安全は reward の項に
+しない、封をした証拠を持つ episode だけが昇格の根拠になる、そして
+
+> 反実仮想 artifact が揃うまで、この環境で意味のある学習・比較ができるのは
+> 「記録済み trajectory のデータ収集」までである（0058 §3）
+
+という状態がそのまま続いている。0058 §5 は **policy artifact（#104）と episode 結果の
+対応づけを #89 の範囲**として送った。#89 はその続きで、環境の外側にある次の5点が未決だった。
+
+1. policy artifact は #104 へ**どの能力**を申告するのか。`ArtifactCapability` は
+   `observational_replay` / `counterfactual_action` しか持たず、どちらも thermal model の
+   能力である。policy にどちらかを名乗らせるのは**偽の申告**になる
+2. policy artifact の**形式と family**。何を固定すれば「同じ policy」と言えるのか
+3. 探索と shadow 比較の**設定はどこが持つ**のか。`rl-training.yaml`（0058 §2.7、schema v1）に
+   足すのか、別の設定にするのか
+4. policy を**運転の active slot へ束縛してよい条件**は何か
+5. Shadow で集めた Rule / RL の提案を、**どう数えれば証拠になる**のか
+
+さらに、#89 の受入基準のうち「RulePolicy より offline 指標を改善できるか比較できる」は、
+**いまの世界の状態では判定できない**。0058 §2.1 のとおり `MpcModelBinding` を作れる artifact が
+1つも無く、環境は `learned_controller_available=false` で回る。その条件では
+**すべての arm の requested demand が同一になる**ので、候補間に差が出ない。
+差が出ないことを「差が無かった」と読ませないことが、この記録の目的の半分である。
+
+## 2. Decision
+
+### 2.1 `ArtifactCapability.SUPERVISOR_STRATEGY` を足す（**所有者の承認が要る契約変更**）
+
+#104 の `ArtifactCapability` に、thermal model とは別の能力を1つ足す。
+
+| capability | 何を主張するか | 誰が要求するか |
+|---|---|---|
+| `observational_replay` | 観測の再生だけ | Replay / offline 評価 |
+| `counterfactual_action` | 候補 Fan action 列に対する将来観測の予測 | #86 の内部モデル / #105 の `registry_attested` dynamics |
+| **`supervisor_strategy`**（新） | `WorkloadRegime` から戦略・目的関数 weight・target band への写像 | **#89 の policy 束縛だけ** |
+
+**これは加算的な変更で、`MODEL_REGISTRY_SCHEMA_VERSION` を上げない。** 既存の値はそのまま
+読め、新しい値を名乗れるのは登録時に申告した artifact だけである。
+
+良くなること。
+
+- policy artifact が「観測を再生する」「反実仮想を予測する」と**偽って名乗る必要が無くなる**
+- 将来観測を1つも予測しない artifact が #86 の `COUNTERFACTUAL_CAPABILITIES` にも
+  `AttestedThermalDynamics.bind` の要求にも入らないので、**MPC の内部モデルにも
+  学習 dynamics にもなれない**
+- 逆向きも塞がる。#89 の束縛は `supervisor_strategy` だけを受け付けるので、
+  thermal artifact を `kind=supervisor_policy` として取り違えて渡しても拒まれる
+
+**この1項目だけは #104 の公開契約を広げるので、所有者の承認を要する。**
+
+### 2.2 artifact は `regime_table_v1`。全 regime を1つずつ覆い、Demand を表現できない
+
+`SupervisorPolicyArtifact`（schema `coldaisle.supervisor_policy` v1）は manifest と
+`RegimeTablePayload` からなる **非実行の canonical JSON** で、payload は
+`WorkloadRegime` → `(strategy, weights, target_band)` の表だけを持つ。
+
+- **`Demand` / `EffectiveZoneDemand` / PWM を鍵として受け付けない**（`extra="forbid"`）。
+  action から demand への写像は Learned MPC と Controller Gate にしか無い（0027 / 0028 §2.3）
+- **全 regime を値の昇順で1つずつ**持つ。既定の欄や部分的な表を許さない。許すと
+  `UNKNOWN` や新しい regime が「通常時の戦略」へ落ちる（AGENTS.md ルール4）。
+  並びも1つに固定する。同じ表が2通りの bytes を持つと hash が policy を特定できない
+- manifest は `payload_sha256` で**自分の payload だけ**を名指しする。表だけ差し替えた
+  artifact を同じ identity のまま読み込ませない
+- manifest は `action_space_sha256`（学習時の `supervisor.output_bounds` の hash）・
+  `rl_training_config_sha256`・`rl_policy_config_sha256`・`reward_version`・
+  学習 episode の識別子を持つ
+
+表にしているのは、**反実仮想モデルが無い以上、より複雑な関数近似を測れない**（0058 §3）
+ためである。表なら JSON に封じられ、pickle も任意コードも読み込まずに済み（#104 の制約）、
+Rule policy（#88 の `WorkloadPolicyContexts`）と同じ鍵なので同じ episode 群で直接比べられる。
+より豊かな state を使う family を足すときは、`policy_family` を増やして版で分ける。
+
+### 2.3 manifest の training 欄は**自称**である。型が縛るのは自称どうしの整合だけ
+
+「どの episode で選んだか」「反実仮想の裏づけがあったか」は artifact が自分で書いた値で、
+証拠ではない。証拠は次の3つだけである。
+
+- Registry（#104）が発行する `ArtifactAttestation`（bytes・identity・lifecycle）
+- 学習時の `EpisodeResult.promotable`（封をした `DynamicsEvidence` から**環境だけ**が立てる。0058 §2.3）
+- 人の承認（promotion は #104 が `HumanApproval` を要求する）
+
+そのうえで、自称が**自分自身と矛盾する**ことは型で塞ぐ。
+
+1. `counterfactual_backed` を名乗るには、`learned_controller_available` と
+   「全 episode が promotable」と「Baseline を上回った」の**3つすべて**が要る
+2. `counterfactual_backed` でない artifact は、**`SHADOW` 以外の authority を名乗れない**
+3. `total_episodes` は**名指しした識別子の数**と一致する。識別子は重複なし昇順なので、
+   同じ episode を2度名指しして数を膨らませられない
+
+**同一プロセス内の悪意ある偽造までは防げない**（0050 §3 / 0052 §2.1 と同じ残余リスク）。
+狙いは配線の誤りを型で止めることである。
+
+### 2.4 束縛は shadow と active を分ける。active は**いま必ず拒否される**
+
+`SupervisorPolicyBinding` は公開 constructor を持たず、`for_shadow` / `for_active` だけが
+発行する。どちらも #104 の `VerifiedArtifact`（nominal 型の照合つき）を要求し、
+
+- `kind` が `supervisor_policy`、`capability` が `supervisor_strategy`
+- attestation と manifest の identity（model ID / 版）が一致
+- attestation の feature / target schema version が manifest の state / action schema version と一致
+- 版が設定の `supervisor.rl_version`（期待する版）と一致
+- **runtime の `supervisor.output_bounds` の hash が `action_space_sha256` と一致し、
+  表の全欄がその範囲内**（範囲外は**丸めず拒む**。0058 §2.1 と同じ規律）
+- 要求 stage が attestation の `authority_compatibility` に入っている
+- bytes が canonical JSON で、checksum が attestation と一致し、Registry metadata と
+  artifact の identity が食い違わない
+
+を確かめる。そのうえで用途ごとに違う条件を置く。
+
+| 用途 | `production_active` | 反実仮想の裏づけ | 理由 |
+|---|---|---|---|
+| `for_shadow` | **要求しない** | 要求しない | shadow の出力は MPC にも Fan にも届かない（0053 §2.3）。昇格前の candidate を回せないと、昇格に要る証拠をそもそも集められない |
+| `for_active` | **要求する** | **要求する** | 人の承認を経ていない artifact に制御権を渡さない（0052 §2.1）。action が demand に効かない条件で選ばれた戦略を運転へ出さない |
+
+**したがって、いま active authority を得られる RL policy は存在しない。**
+反実仮想能力を申告した thermal artifact が1つも無い以上（0048 §2.1 / 0052 §2.1 / 0058 §3）、
+`counterfactual_backed` を正直に名乗れる artifact は作れない。拒否は不具合ではなく
+意図した振る舞いである。
+
+**RL 停止時の fallback は #88 の `SupervisorCoordinator` がすでに持つ**（RL candidate が
+未受信・期限切れ・不正なら Rule へ戻る）。本記録は新しい失敗経路を足さない。
+
+### 2.5 探索と shadow の設定は `config/rl-policy.yaml`（schema v1。値はすべて暫定）
+
+```yaml
+schema_version: 1
+artifact: { model_id }                       # 版は探索のたびに呼び出し側が明示する
+search:   { family, seed, max_candidate_tables, minimum_reward_improvement, weight_candidates }
+shadow:   { minimum_ticks, minimum_paired_fraction }
+```
+
+**`config/rl-training.yaml` へ足さない。** 0058 §2.7 は環境の設定を schema v1 として
+確定させており、FINAL の記録が決めた形をこちら側の都合で広げない。所有も分かれる
+（環境の契約は #105、探索と昇格の判断材料は #89）。
+
+**ほかの契約が持つ値を写さない**（0054 §2.6 と同じ規則）。action の許容範囲は
+`fan-policy.yaml`、episode / reward / coverage は `rl-training.yaml`、絶対上限と
+最低安全 demand は `safety.yaml` から取る。
+
+**「反実仮想の裏づけを要求するか」は設定に出さない。** 設定で切れる安全条件は設定次第で
+破れる（0052 §4 (c) と同じ理由）。`for_active` がコードとして常に要求する。
+
+### 2.6 Shadow の集計は 0055 と同じ重複規則・版束縛・fail closed
+
+`SupervisorShadowLedger` は同じ tick の Rule（active）と RL（shadow）の提案を突き合わせる。
+制御へ戻る経路は持たない。
+
+- **同じ tick を2度渡しても数が増えない。** 内容が同じなら畳み、**食い違えば受け取らない**
+  （`SupervisorShadowConflictError`）。0055 §2.1 と同じ契約で、どちらを採っても片方の事実が
+  消えるので、照合器が選ばない
+- **片方しか無い tick を一致として数えない。** RL の提案が無い tick は `Reason.code` ごとに
+  数え、対になった tick だけを比較の母数にする
+- **版を名指しする。** Rule / RL の policy version を台帳が束縛し、違う版の提案を同じ表に
+  混ぜない
+- **時刻は観測した decision から取る**（壁時計を読まない。0054 §2.7）
+- `minimum_ticks` と `minimum_paired_fraction` を満たさない集計は `usable=False` で、
+  **「差が無かった」と読めない**（fail closed）
+- 集計の digest は #104 の `shadow_evaluation_ref` にそのまま渡せる
+
+違う regime を前提にした提案どうしの比較は、**`SupervisorDecision` の段階で作れない**
+（同じ tick の active / shadow は同じ regime を使う。#88）。台帳側で読み替えもしない。
+
+### 2.7 探索は `per_regime_coordinate_v1`。決定論的で、評価順に依らない
+
+Baseline（Rule policy の設定をそのまま表にしたもの）を起点に、**regime を1つだけ**
+候補 action へ差し替えた表をすべて並べる。候補 action は
+`supervisor.output_bounds` の strategy × target band × `rl-policy.yaml` の weight 候補である。
+
+- **上限を超えたら切り詰めず落とす。** 黙って切ると、報告に出ない候補が生まれ
+  「全候補を比べた」と読めてしまう
+- 設定した weight 候補が範囲外なら**落とさず拒む**。黙って落とすと、設定した候補が
+  評価されていないことに気づけない
+- 評価順は seed で決めるが、**選択は順序に依らない**。並び替えの鍵は
+  `(安全側の違反, 範囲外 action, -reward, 識別子)` で、同点は識別子で決める
+- **比べられない候補は勝たない。** 条件や母集団が揃わず `PolicyComparison` を作れない
+  候補は理由付きで記録し、改善扱いにしない（0058 §2.6）
+- 改善の判定は #105 の辞書式比較をそのまま使う。安全側が同点のときだけ、
+  揃えた長さの reward 平均の差が `minimum_reward_improvement` 以上かを見る
+- **どの候補も Baseline を上回らなければ、Baseline の表が選ばれる。** 上回っていないのに
+  別の表を出さないためで、その artifact は「Rule の戦略を RL artifact として表したもの」になる。
+  shadow の配線を確かめるには十分で、戦略は何も変わらない
+- `authority_compatibility` の既定は `(SHADOW,)` だけ。authority の拡大は人の判断
+  （#92 / 0057）であり、探索の結果として自動で広がってはならない
+
+## 3. Consequences
+
+**いま何ができて、何ができないか**（これを曖昧にしない）。
+
+| #89 の受入基準 | いま満たせるか |
+|---|---|
+| policy artifact / version を固定できる | **できる。** canonical JSON + manifest hash + Registry 登録まで往復する |
+| #88 Interface に適合する | **できる。** `RegimeTableRlPolicy` は `RLPolicy` をそのまま満たす |
+| Shadow で MPC 結果へ影響させず評価可能 | **提案の生成と集計はできる。** 運転中に decision を台帳へ流す配線は control loop（#74）側 |
+| RL 停止時に RulePolicy へ即 fallback 可能 | **できる。** #88 の Coordinator がすでに持ち、本記録は新しい失敗経路を足さない |
+| training / evaluation が実 Fan への write 無しで完結する | **できる。** `control/rl` の import 禁止をそのまま引き継ぐ（試験で走査する） |
+| #104 へ登録可能な artifact metadata を出力する | **できる。** `policy_registry_metadata()` が `ArtifactMetadata` と1対1に写る |
+| **RulePolicy より offline 指標を改善できるか比較できる** | **できない。** `MpcModelBinding` を作れる artifact が1つも無いので、すべての arm の requested が同一になる。仕組みはあるが**判定できない** |
+
+**いちばん重要な帰結**: 反実仮想 artifact が揃うまで、#89 でできるのは
+**「policy を固定し、shadow で比べる土台を用意すること」**までである。
+**どの戦略が良いかを決めることは、まだできない。** 報告は
+`learned_controller_available` と `promotable` にその事実を毎回残し、出力する artifact は
+`SHADOW` 互換だけになる。
+
+良くなること。
+
+- policy が Fan Demand を表現する道が**構造的に塞がる**（artifact の型・action 空間・束縛）
+- 反実仮想の裏づけの無い policy が active authority を得る道が、型の不変条件で塞がる
+- 学習に使った action 空間・設定・reward 版・episode が artifact に固定され、
+  別の範囲で学習した policy を読み込めない
+- shadow の集計が、重複した入力でも版違いでも部分的な証拠でも膨らまない
+
+悪くなること（と緩和策）。
+
+- **`regime_table_v1` は state を regime へ潰している。** #89 が挙げた state 候補
+  （recent history / room conditions / acoustic context）を使っていない。緩和策は
+  `policy_family` を版で分け、反実仮想モデルが揃って**差を測れるようになってから**
+  豊かな family を足すこと。測れないうちに複雑にしても、良し悪しを判定できない
+- 探索を回しても、いまは Baseline の表が選ばれ続ける。緩和策は、その事実を
+  `improved_over_baseline=False` と `learned_controller_available=False` として
+  報告と artifact の両方に残すこと
+- `ArtifactCapability` を1つ足すので、#104 の公開契約が広がる。緩和策は加算的に留め、
+  新しい値を要求するのは #89 の束縛だけにすること
+
+## 4. 却下した代替案
+
+| 案 | 却下理由 |
+|---|---|
+| policy artifact に `observational_replay` を名乗らせ、`ArtifactCapability` を触らない | 偽の申告になる。policy は観測を1つも再生しない。読む側が registry を見て誤解する |
+| policy artifact に `counterfactual_action` を名乗らせる | 0052 §2.1 の要求を満たさない artifact が「反実仮想できる」側に混ざる。いちばん危ない読み替えそのもの |
+| `kind=supervisor_policy` だけで判定し、capability を見ない | thermal artifact を取り違えて渡す配線ミスが型で止まらない |
+| 探索の設定を `config/rl-training.yaml` へ足す | 0058 §2.7 が schema v1 として確定させた形を、こちら側の都合で広げることになる。所有も分かれる |
+| 「反実仮想の裏づけを要求するか」を設定に出す | 設定で切れる安全条件は設定次第で破れる（0052 §4 (c)） |
+| `for_shadow` にも `production_active` を要求する | 昇格前の candidate を shadow で回せなくなり、昇格に要る証拠をそもそも集められない |
+| `for_active` で `production_active` だけを要求する | 人の承認は「registry の手続きを踏んだ」ことしか保証しない。action が demand に効かない条件で選ばれた戦略でも通ってしまう |
+| 探索の結果として `authority_compatibility` を自動で広げる | authority の拡大は人の判断（#92 / 0057 §2.2）。探索が自分で権限を増やす経路を作らない |
+| 範囲外の候補・範囲外の表を範囲内へ丸める | 丸めると罰が無くなり、運転時に拒否される戦略を学び続ける（0058 §2.1 と同じ） |
+| 候補が上限を超えたら切り詰めて続ける | 報告に出ない候補が生まれ、「全候補を比べた」と読めてしまう |
+| 比べられなかった候補を「差が無かった」として並べる | 条件や母集団の揃わない結果を同じ表に載せることになる（0058 §2.6） |
+| Baseline を上回らないときに、最も reward の高い候補を出す | 「上回っていない」と「最良」を混同する。上回らないなら戦略を変えない |
+| shadow の集計で、同じ tick の重複を「最後に来たもの」で上書きする | 何回・どの順で渡したかで結果が変わる。0055 §2.1 が同じ理由で退けている |
+| shadow の集計で、RL の提案が無い tick を母数から外す | 母数が縮み、少ない対から高い一致率が出る。欠落は理由別に数えて母数に残す |
+| 学習の `created_at` を壁時計から作る | 同じ入力から同じ bytes が出なくなり、再現性の判定に使えない（0054 §2.7） |
+| より豊かな state（history / room / acoustic）を使う policy family を先に作る | 反実仮想モデルが無い間は、複雑にしても良し悪しを**測れない**（0058 §3）。測れるようになってから版で足す |
+| artifact の training 欄を昇格の根拠として読む | 自称である。根拠は Registry の attestation と環境が立てた `promotable`、そして人の承認 |
+| RL policy を `SupervisorCoordinator` の active slot へ直接渡せるようにする | #88 は受信済みの candidate を受け取る形で、鮮度も版も control loop 側が判定する。policy object を差し込む経路を作ると、その判定を迂回できる |
+
+## 5. 未決事項
+
+- **本記録は `Proposed` で、所有者の承認が要る。** とくに §2.1（`ArtifactCapability` の追加）は
+  #104 の公開契約を広げる
+- `config/rl-policy.yaml` の値（seed・候補 weight・候補上限・改善の下限・shadow の下限）は
+  **すべて実測前の暫定値**。確定には shadow の実運用データが要る
+- 運転中の `SupervisorDecision` を `SupervisorShadowLedger` へ流す配線（どこで観測し、
+  どこへ保存するか）は control loop 側（#74 / 決定記録 0060）で決める
+- 学習の入口を CLI（`coldaisle-rl-*`）にするか。**いまは作らない。** 反実仮想モデルが
+  無い間、CLI があると「回せば policy が良くなる」と読めてしまう。記録済み trajectory の
+  収集経路（#83 / #84）が揃ってから決める
+- episode 結果を #91 の `EvaluationReport` の arm として載せる形（0058 §5 が #91 / #92 側へ
+  送った未決事項）。本記録も踏み込まない
+- `policy_family` を増やす条件。反実仮想 artifact が揃い、候補間の差を実際に測れるように
+  なってから、どの state を足すかを新しい記録で決める

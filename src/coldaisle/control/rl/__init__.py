@@ -87,16 +87,27 @@ from coldaisle.control.rl.reward import (
     RewardUnusableError,
     SafetyLedgerEntry,
 )
+from coldaisle.control.rl.training import (
+    BASELINE_CANDIDATE_ID,
+    TRAINING_REPORT_SCHEMA_VERSION,
+    CandidateOutcome,
+    SupervisorPolicyTrainer,
+    SupervisorPolicyTrainingError,
+    SupervisorPolicyTrainingReport,
+)
 
 __all__ = [
+    "BASELINE_CANDIDATE_ID",
     "EPISODE_SCHEMA_VERSION",
     "MAX_EPISODE_STEPS",
     "REWARD_SCHEMA_VERSION",
     "RL_TRAINING_CONFIG_FILENAME",
     "RL_TRAINING_CONFIG_VERSION",
+    "TRAINING_REPORT_SCHEMA_VERSION",
     "ActionSpace",
     "AttestedThermalDynamics",
     "BaselineProposer",
+    "CandidateOutcome",
     "CoverageConfig",
     "DependencyIdentity",
     "DynamicsEvidence",
@@ -136,6 +147,9 @@ __all__ = [
     "SimulatorResponse",
     "StepRecord",
     "SupervisorAction",
+    "SupervisorPolicyTrainer",
+    "SupervisorPolicyTrainingError",
+    "SupervisorPolicyTrainingReport",
     "SupervisorTrainingEnvironment",
     "TerminationReason",
     "TrainingMode",

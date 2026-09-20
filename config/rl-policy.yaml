@@ -1,0 +1,45 @@
+# RL Supervisor の探索と shadow 比較の設定（#89 / 決定記録 0061 §2.5）
+#
+# **すべて実測前の暫定値（provisional）。** コード側に既定値は無いので、ここを消すと
+# 探索は動かない（AGENTS.md ルール9）。
+#
+# **ほかの契約が持つ値をここへ写さない**（決定記録 0054 §2.6 と同じ規則）。
+#   - action の許容範囲         : config/fan-policy.yaml の supervisor.output_bounds
+#   - episode / reward / coverage : config/rl-training.yaml（#105 / 決定記録 0058 §2.7）
+#   - 絶対温度上限・最低安全 demand : config/safety.yaml
+#
+# **「反実仮想の裏づけを要求するか」はここに無い。** 設定で切れる安全条件は設定次第で
+# 破れるので、コードが常に要求する（決定記録 0061 §2.4）。
+#
+# **いまこの設定で回しても、Baseline を上回る候補は選ばれない。** 反実仮想能力を申告した
+# thermal artifact が1つも無く、環境は learned_controller_available=false で回るため、
+# すべての候補の requested demand が同一になる（決定記録 0058 §3 / 0061 §3）。
+
+schema_version: 1
+
+artifact:
+  # 出力する policy artifact の model ID。**版は探索のたびに呼び出し側が明示する。**
+  model_id: rl-supervisor-provisional
+
+search:
+  # Baseline（Rule policy）の表から regime を1つだけ差し替えた表をすべて並べる。
+  family: per_regime_coordinate_v1
+  # 候補の評価順を決める種。**選択は順序に依らない**（試験で確かめる）。
+  seed: {value: 20260921, status: provisional}
+  # 並べてよい候補表の上限。超えたら切り詰めずに落とす。
+  max_candidate_tables: 512
+  # Baseline より良いと見なすために要る、揃えた長さの reward 平均の差。
+  # 0.0 でも「同点では勝たせない」規則は変わらない。
+  minimum_reward_improvement: {value: 0.0, status: provisional}
+  # 試す目的関数 weight。strategy と target band は supervisor.output_bounds から取る。
+  weight_candidates:
+    - {gpu_temperature: 1.0, cpu_temperature: 0.2, balance: 0.2, acoustic: 0.2, change: 0.1}
+    - {gpu_temperature: 0.8, cpu_temperature: 0.8, balance: 0.5, acoustic: 0.4, change: 0.3}
+    - {gpu_temperature: 1.0, cpu_temperature: 0.5, balance: 0.2, acoustic: 0.6, change: 0.3}
+    - {gpu_temperature: 0.6, cpu_temperature: 0.6, balance: 0.3, acoustic: 0.2, change: 0.6}
+
+shadow:
+  # 対で観測できた tick の下限。満たさない集計は usable=false（fail closed）。
+  minimum_ticks: {value: 500, status: provisional}
+  # 観測した tick のうち、Rule と RL の両方の提案が揃っていた割合の下限。
+  minimum_paired_fraction: {value: 0.9, status: provisional}
