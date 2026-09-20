@@ -608,6 +608,44 @@ class ResidualDriftMonitor:
         )
 
 
+# ---------------------------------------------------------------- Profile coverage
+
+
+class ProfileCoverage(_Frozen):
+    """1つの入力を Profile と照らした結果。**判定の素材で、判定そのものではない。**
+
+    ``ConfidenceAssessor`` の feature range / fan state range / support / missing pattern は
+    すべてこの値から作られる。offline の drift 検知（#93 / 決定記録 0055 §2.2）も同じものを
+    読む。**同じ問いに2つの実装を置かない**ための共有点である。
+    """
+
+    worst_feature_excess: float = Field(ge=0.0)
+    """feature metric の学習範囲からの、幅で正規化したはみ出しの最大。範囲内なら 0。
+
+    学習で一度も usable でなかった信号に値が来た場合と、学習で幅 0 だった信号が
+    外れた場合は ``inf``（比べる基準が無い）。
+    """
+    worst_feature_source: str = Field(default="", max_length=120)
+    """はみ出しが最大だった metric。はみ出しが無ければ空。"""
+    worst_fan_excess: float = Field(ge=0.0)
+    """Fan の effective demand の学習範囲からのはみ出しの最大。"""
+    worst_fan_source: str = Field(default="", max_length=120)
+    support_bins: tuple[int, ...] | None
+    """action 時点の値が落ちた support cell。軸の値が usable でなければ None。"""
+    support_count: int = Field(ge=0)
+    """その cell の学習件数。cell を決められなければ 0。"""
+    missing_pattern: tuple[str, ...]
+    """window 内で usable でない cell を含んだ metric の組み合わせ（重複なし昇順）。"""
+    missing_pattern_count: int = Field(ge=0)
+    """その組み合わせの学習件数。学習時に無ければ 0。"""
+
+    @model_validator(mode="after")
+    def _support_count_needs_a_cell(self) -> Self:
+        if self.support_bins is None and self.support_count != 0:
+            raise ValueError("support cell を決められない入力に学習件数を付けない")
+        return self
+
+
 # ---------------------------------------------------------------- Assessment
 
 
@@ -742,12 +780,21 @@ class ConfidenceAssessor:
         """
         observed = ObservedThermalInput.model_validate(observed.model_dump(mode="python"))
         _check_window_shape(observed, self._profile.feature_schema)
+        coverage = self._coverage(observed)
         components = (
             self._model_binding(observed, prediction),
-            self._feature_range(observed),
-            self._fan_state_range(observed),
-            self._support(observed),
-            self._missing_pattern(observed),
+            self._range_result(
+                ConfidenceComponent.FEATURE_RANGE,
+                coverage.worst_feature_excess,
+                coverage.worst_feature_source,
+            ),
+            self._range_result(
+                ConfidenceComponent.FAN_STATE_RANGE,
+                coverage.worst_fan_excess,
+                coverage.worst_fan_source,
+            ),
+            self._support(coverage),
+            self._missing_pattern(coverage),
             self._uncertainty(prediction),
             self._residual_drift(residual, observed.action_ts_ms),
         )
@@ -787,9 +834,21 @@ class ConfidenceAssessor:
             )
         return ComponentResult(component=ConfidenceComponent.MODEL_BINDING, score=1.0, ood=False)
 
-    def _feature_range(self, observed: ObservedThermalInput) -> ComponentResult:
-        worst = 0.0
-        worst_source = ""
+    def coverage(self, observed: ObservedThermalInput) -> ProfileCoverage:
+        """入力を Profile と照らす。**判定はせず、素材だけを返す。**
+
+        offline の drift 検知（#93）が同じ照合を使うための入口である。判定器を通さずに
+        自前で範囲・support を数え直すと、runtime と offline が別の規則で動く。
+        入力の形が feature schema と合わなければ ``assess`` と同じく例外にする。
+        """
+        observed = ObservedThermalInput.model_validate(observed.model_dump(mode="python"))
+        _check_window_shape(observed, self._profile.feature_schema)
+        return self._coverage(observed)
+
+    def _coverage(self, observed: ObservedThermalInput) -> ProfileCoverage:
+        """検証済みの入力を Profile と照らす。"""
+        worst_feature = 0.0
+        worst_feature_source = ""
         for metric in self._profile.feature_schema.metrics:
             known = self._ranges[metric]
             for frame in observed.window:
@@ -797,19 +856,27 @@ class ConfidenceAssessor:
                 if value is None:
                     continue
                 excess = _excess(known, value)
-                if excess > worst:
-                    worst, worst_source = excess, metric
-        return self._range_result(ConfidenceComponent.FEATURE_RANGE, worst, worst_source)
-
-    def _fan_state_range(self, observed: ObservedThermalInput) -> ComponentResult:
-        worst = 0.0
-        worst_source = ""
+                if excess > worst_feature:
+                    worst_feature, worst_feature_source = excess, metric
+        worst_fan = 0.0
+        worst_fan_source = ""
         for zone in _ZONE_ORDER:
             known = self._profile.fan_ranges.get(zone)
             excess = _excess(known, observed.action.get(zone).effective_demand)
-            if excess > worst:
-                worst, worst_source = excess, known.source
-        return self._range_result(ConfidenceComponent.FAN_STATE_RANGE, worst, worst_source)
+            if excess > worst_fan:
+                worst_fan, worst_fan_source = excess, known.source
+        cell = _support_cell(observed, self._profile.spec.support_axes)
+        pattern = _missing_pattern(observed, self._profile.feature_schema)
+        return ProfileCoverage(
+            worst_feature_excess=worst_feature,
+            worst_feature_source=worst_feature_source,
+            worst_fan_excess=worst_fan,
+            worst_fan_source=worst_fan_source,
+            support_bins=cell,
+            support_count=0 if cell is None else self._cells.get(cell, 0),
+            missing_pattern=pattern,
+            missing_pattern_count=self._patterns.get(pattern, 0),
+        )
 
     def _range_result(
         self, component: ConfidenceComponent, worst: float, source: str
@@ -827,8 +894,8 @@ class ConfidenceAssessor:
         detail = "" if worst == 0.0 else f"source={source}; excess={worst:.6f}"
         return ComponentResult(component=component, score=score, ood=False, detail=detail)
 
-    def _support(self, observed: ObservedThermalInput) -> ComponentResult:
-        cell = _support_cell(observed, self._profile.spec.support_axes)
+    def _support(self, coverage: ProfileCoverage) -> ComponentResult:
+        cell = coverage.support_bins
         if cell is None:
             return ComponentResult(
                 component=ConfidenceComponent.SUPPORT,
@@ -836,7 +903,7 @@ class ConfidenceAssessor:
                 ood=True,
                 detail="support axis value is unavailable",
             )
-        count = self._cells.get(cell, 0)
+        count = coverage.support_count
         minimum = self._policy.min_support_count.value
         full = self._policy.full_support_count.value
         detail = f"cell={list(cell)}; count={count}"
@@ -854,9 +921,9 @@ class ConfidenceAssessor:
             detail=detail,
         )
 
-    def _missing_pattern(self, observed: ObservedThermalInput) -> ComponentResult:
-        pattern = _missing_pattern(observed, self._profile.feature_schema)
-        count = self._patterns.get(pattern, 0)
+    def _missing_pattern(self, coverage: ProfileCoverage) -> ComponentResult:
+        pattern = coverage.missing_pattern
+        count = coverage.missing_pattern_count
         minimum = self._policy.min_missing_pattern_count.value
         detail = f"unavailable={','.join(pattern) or '-'}; count={count}"
         if count < minimum:
