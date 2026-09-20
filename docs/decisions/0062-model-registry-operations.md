@@ -50,6 +50,11 @@
   間違えて巨大なファイルを指したときに、管理 process を MemoryError で落とさない
 - 壊れた YAML / JSON、読み取り失敗は traceback ではなく、構造化ログと終了コード 1 で返す。
   **握りつぶさない**（AGENTS.md コード規約）が、運用者が読める形にする
+- **parser の再帰も設定の誤りとして扱う。** 深く入れ子にした YAML は byte 上限に収まって
+  いても PyYAML の再帰を尽くし、`RecursionError`（`ValueError` でも `yaml.YAMLError` でも
+  ない）を投げる。深さを先に測って弾く方式は採らない。YAML は flow・block・alias で入れ子を
+  作れるので、片方だけを数える走査は、持っていない上限を持っていると主張することになる。
+  parser に測らせ、その結果を設定の誤りへ寄せる（PR #162 codex review 4057748805）
 
 ### 2.2 promotion / rollback の human approval はファイルで渡す。CLI は合成しない
 
@@ -143,6 +148,7 @@ Rule Engine / Notification（#18 / #20）への接続は引き続き別 Issue �
 | 戻り先も runtime contract で検証する | schema 更新の直後に、健全な戻り先を `degraded` 扱いで失う。0037 §2 の決定と食い違う |
 | `--contract` が覆っていない kind を、整合性だけ検証して `ok` に含める | 互換性まで確かめるつもりで渡した contract の取りこぼしが、`ok` と区別できなくなる（PR #162 codex review 4057584854） |
 | 読んでからファイルの大きさを判断する | 上限を超える入力で、判断する前に管理 process が落ちる（同 4057584857） |
+| YAML の入れ子の深さを自前の走査で先に測る | flow・block・alias のどれか1つしか数えられず、持っていない上限を持っていると主張することになる（同 4057748805） |
 
 ## 5. 未決事項
 

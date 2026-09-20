@@ -38,6 +38,8 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Literal
 
@@ -161,11 +163,34 @@ def emit(payload: object) -> None:
 
 
 def _limits(args: argparse.Namespace) -> ModelRegistryLimits:
-    return load_model_registry_limits(args.limits)
+    directory: Path = args.limits
+    with as_configuration_error(directory.name):
+        return load_model_registry_limits(directory)
 
 
 def _registry(args: argparse.Namespace, limits: ModelRegistryLimits | None = None) -> ModelRegistry:
     return ModelRegistry(args.root, limits=_limits(args) if limits is None else limits)
+
+
+@contextmanager
+def as_configuration_error(name: str) -> Iterator[None]:
+    """設定 parser の再帰を、**記録される設定の誤り**へ寄せる。
+
+    深く入れ子にした YAML は、byte 上限に収まっていても PyYAML の再帰を尽くし、
+    `RecursionError` を投げる。これは `ValueError` でも `yaml.YAMLError` でもないため、
+    そのままでは traceback で終わり、終了コード 1 と構造化ログという約束が破れる
+    （決定記録 0062 §2.1）。
+
+    **深さを先に測って弾く方式は採らない。** YAML は flow（`[[[`）と block（字下げ）と
+    alias で入れ子を作れるので、片方だけを数える走査は、持っていない上限を持っていると
+    主張することになる。ここでは parser に測らせ、結果を設定の誤りとして扱う。
+    `RecursionError` が伝播する時点で stack は巻き戻っているため、このあとのログ出力は
+    再び深さを尽くさない。
+    """
+    try:
+        yield
+    except RecursionError as exc:
+        raise ValueError(f"設定の入れ子が深すぎる: {name}") from exc
 
 
 def read_bounded(path: Path, max_bytes: int) -> bytes:
@@ -253,7 +278,8 @@ def run_verify(args: argparse.Namespace) -> int:
     contracts: dict[ArtifactKind, ModelCompatibility] = {}
     if args.contract is not None:
         payload = read_bounded(args.contract, limits.max_snapshot_bytes)
-        contracts = RuntimeContracts.from_bytes(payload).compatibility()
+        with as_configuration_error(args.contract.name):
+            contracts = RuntimeContracts.from_bytes(payload).compatibility()
     report = _registry(args, limits).verify(contracts)
     if args.contract is not None and report.unchecked_kinds():
         # **contract を渡したなら、いま production の kind を全部覆う。** 欠けた kind は

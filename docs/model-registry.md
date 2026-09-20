@@ -171,7 +171,9 @@ CLIが読むファイル（artifact本体・metadata・承認・contract）は�
 artifact本体は `max_artifact_bytes`、それ以外は `max_snapshot_bytes` を上限とし、上限＋1 byteだけを
 読んで超えていれば拒否する。運用者が間違えて巨大なファイルを指したときに、管理processを
 MemoryErrorで落とさないためである。壊れたYAML・JSONやファイルの読み取り失敗は、tracebackではなく
-構造化ログと終了コード1で返す。
+構造化ログと終了コード1で返す。深く入れ子にしたYAMLがparserの再帰を尽くした場合（`RecursionError`）も
+同じ扱いにする。深さを先に測って弾く方式は採らない（YAMLはflow・block・aliasで入れ子を作れるため、
+片方だけを数える走査は持っていない上限を主張することになる）。
 
 このCLIはartifactをdeserializeも実行もせず、Fan Demand・PWM・Authority Stageへ届く経路を持たない。
 

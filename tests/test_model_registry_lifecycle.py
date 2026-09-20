@@ -983,3 +983,136 @@ def test_cli_status_reports_a_corrupt_registry_as_a_failed_operation(
         captured = capsys.readouterr()
         assert captured.out == ""
         assert "Model Registry の操作に失敗した" in captured.err
+
+
+def deep_flow_yaml(depth: int) -> str:
+    """byte 数は小さいまま、入れ子だけを深くした YAML。"""
+    return "schema_version: 1\ncontracts: " + "[" * depth + "]" * depth + "\n"
+
+
+@pytest.mark.parametrize("target", ["contract", "limits"])
+def test_cli_reports_deeply_nested_yaml_as_a_failed_operation(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], target: str
+) -> None:
+    """**小さくても深い YAML で traceback を出さない。**
+
+    byte 上限に収まっていても PyYAML の再帰を尽くす。`RecursionError` は `ValueError`
+    でも `yaml.YAMLError` でもないため、寄せておかないと終了コード 1 と構造化ログという
+    約束が破れる（決定記録 0062 §2.1）。
+    """
+    root = tmp_path / "registry"
+    production_registry(root)
+    body = deep_flow_yaml(60_000)
+    assert len(body.encode()) < LIMITS.max_snapshot_bytes
+
+    if target == "contract":
+        path = tmp_path / "contract.yaml"
+        path.write_text(body, encoding="utf-8")
+        argv = ["verify", "--contract", str(path), *base_args(root)]
+    else:
+        limits = tmp_path / "limits"
+        limits.mkdir()
+        (limits / "model-registry.yaml").write_text(body, encoding="utf-8")
+        argv = ["verify", "--root", str(root), "--limits", str(limits)]
+
+    assert cli.main(argv) == cli.EXIT_FAILED
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "入れ子が深すぎる" in captured.err
+
+
+def test_cli_reports_a_recursive_yaml_alias_as_a_failed_operation(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """自分を指す alias が作る循環構造も、設定の誤りとして返す。"""
+    root = tmp_path / "registry"
+    production_registry(root)
+    contract = tmp_path / "contract.yaml"
+    contract.write_text("schema_version: 1\ncontracts: &loop\n  thermal_model: *loop\n", "utf-8")
+
+    assert cli.main(["verify", "--contract", str(contract), *base_args(root)]) == cli.EXIT_FAILED
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "Model Registry の操作に失敗した" in captured.err
+
+
+@pytest.mark.parametrize("argument", ["metadata", "payload"])
+def test_cli_reports_undecodable_input_as_a_failed_operation(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], argument: str
+) -> None:
+    """UTF-8 として読めない入力も traceback にしない（`register` の2つの入口）。"""
+    root = tmp_path / "registry"
+    record = metadata("1.0.0")
+    metadata_path = write_json(tmp_path / "metadata.json", json.loads(record.model_dump_json()))
+    payload_path = tmp_path / "artifact.json"
+    payload_path.write_bytes(payload("1.0.0"))
+    {"metadata": metadata_path, "payload": payload_path}[argument].write_bytes(b"\xff\xfe\x00")
+
+    code = cli.main(
+        [
+            "register",
+            *base_args(root),
+            "--metadata",
+            str(metadata_path),
+            "--payload",
+            str(payload_path),
+            "--actor",
+            "trainer",
+            "--reason",
+            "training completed",
+        ]
+    )
+    captured = capsys.readouterr()
+    assert code == cli.EXIT_FAILED
+    assert captured.out == ""
+    assert "Model Registry の操作に失敗した" in captured.err
+
+
+@pytest.mark.parametrize("argument", ["metadata", "approval"])
+def test_cli_reports_deeply_nested_json_as_a_failed_operation(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], argument: str
+) -> None:
+    """深く入れ子にした JSON（metadata / 承認）も、記録される失敗として返す。"""
+    root = tmp_path / "registry"
+    registry = make_registry(root)
+    register_and_validate(registry, "1.0.0")
+    revision = registry.inspect().revision
+    deep = ("[" * 100_000 + "]" * 100_000).encode()
+
+    if argument == "metadata":
+        metadata_path = tmp_path / "metadata.json"
+        metadata_path.write_bytes(deep)
+        payload_path = tmp_path / "artifact.json"
+        payload_path.write_bytes(payload("1.1.0"))
+        argv = [
+            "register",
+            *base_args(root),
+            "--metadata",
+            str(metadata_path),
+            "--payload",
+            str(payload_path),
+            "--actor",
+            "trainer",
+            "--reason",
+            "training completed",
+        ]
+    else:
+        approval_path = tmp_path / "approval.json"
+        approval_path.write_bytes(deep)
+        argv = [
+            "promote",
+            *base_args(root),
+            "--approval",
+            str(approval_path),
+            "--shadow-evaluation-ref",
+            "evaluation/shadow/1.0.0",
+            *contract_args(),
+            "--expected-revision",
+            str(revision),
+        ]
+
+    assert cli.main(argv) == cli.EXIT_FAILED
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "Model Registry の操作に失敗した" in captured.err
+    assert registry.inspect().revision == revision
