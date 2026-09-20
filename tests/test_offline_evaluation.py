@@ -1,0 +1,1459 @@
+"""#91 Offline Evaluation: Baseline vs MPC vs Guard vs Supervisor。実機不要。
+
+**ここでは「守れているか」ではなく「破れないか」を試す。** 評価が満たしていなければ
+ならない不変条件を並べ、1つずつ破ろうとする。
+
+1. 評価は **Fan へ届く経路を持たず、時計も持たない**（決定記録 0054 §2.7）
+2. 実測の成果は**適用された構成にしか帰属しない**。counterfactual の型に温度の欄が無い（§2.2）
+3. 採点してよいのは `scored` な outcome だけ。`unidentifiable` / `unmatched` は
+   **coverage として**数え、予測誤差に入れない（§2.2 / §2.3）
+4. **coverage が足りなければ予測指標を出さず、gate も通さない**（§2.3。0053 §5 を閉じる）
+5. **Safety 違反は、ほかの改善で相殺されない**（§2.4）
+6. 時系列 split に**未来が漏れない**。境界を跨ぐ outcome は `purged`（§2.5）
+7. 契約と**食い違う記録を通さない**（照合の許容幅・索引と本文・識別子。§2.6）
+8. **同じ入力からは同じ bytes**。生成時刻を持たない（§2.7）
+9. 設定の**既定値をコードに置かない**。写した上限が契約と食い違わない（§2.8）
+10. **worst-case を必ず載せる**（平均に埋もれさせない）
+"""
+
+from __future__ import annotations
+
+import ast
+import json
+from pathlib import Path
+from typing import Any
+
+import pytest
+import yaml
+from pydantic import ValidationError
+
+from coldaisle.control.config import ControlConfig
+from coldaisle.control.evaluation import (
+    EvaluationConfig,
+    EvaluationContext,
+    EvaluationInputError,
+    EvaluationReport,
+    EvaluationRun,
+    GateOutcome,
+    GateStage,
+    GroupKind,
+    SegmentRole,
+    WorstCaseKind,
+    evaluate,
+)
+from coldaisle.control.evaluation.model import (
+    AppliedArm,
+    AppliedArmReport,
+    CountedReason,
+    CounterfactualArm,
+    CounterfactualArmReport,
+    CoverageReport,
+    GateCondition,
+    GateResult,
+    GroupReport,
+    InterventionReport,
+    PredictionReport,
+    TemperatureReport,
+)
+from coldaisle.control.evaluation.stats import MetricSummary, shape_of, summarize
+from coldaisle.control.schema import (
+    MAX_SHADOW_PREDICTION_METRICS,
+    AuthorityStage,
+    BoundBy,
+    ControllerKind,
+    ControlState,
+    ControlTick,
+    EffectiveZoneDemand,
+    HardwareReadback,
+    OperatingMode,
+    OptimizerStatus,
+    PerZone,
+    Reason,
+    SafetyState,
+    ShadowActionPlan,
+    ShadowCounterfactual,
+    ShadowPlanStep,
+    ShadowPredictedTarget,
+    ShadowPrediction,
+    ShadowRecord,
+    WorkloadRegime,
+    Zone,
+    ZoneRecord,
+)
+from coldaisle.control.shadow import (
+    OutcomeObservation,
+    ShadowExportRow,
+    read_shadow_jsonl,
+    shadow_rows,
+    write_shadow_jsonl,
+)
+from coldaisle.evaluate import RunsManifest, build_context, main, render
+from coldaisle.metrics import MetricCatalog
+from coldaisle.store.models import ControlTraceRecord, Quality
+from test_control_config import valid_documents, write_documents
+
+ROOT = Path(__file__).resolve().parents[1]
+EVALUATION_PACKAGE = ROOT / "src" / "coldaisle" / "control" / "evaluation"
+METRICS_YAML = ROOT / "config" / "metrics.yaml"
+EVALUATION_YAML = ROOT / "config" / "evaluation.yaml"
+
+GPU = "gpu.0.core"
+ROOM = "air.room"
+TICK_TS_MS = 1_787_616_000_000
+STEP_MS = 10_000
+"""`valid_documents()` の `mpc.optimizer.step_ms`。照合の許容幅より大きい。"""
+
+
+# ---------------------------------------------------------------- 組み立ての補助
+
+
+def demands(value: float) -> PerZone[float]:
+    return PerZone[float](front=value, rear=value, top=value)
+
+
+def zone_records(
+    *,
+    requested: float,
+    effective: float,
+    safety_floor: float = 0.0,
+    bound_by: BoundBy = BoundBy.REQUESTED,
+    guard_floor: float | None = None,
+    rpm: int | None = 1200,
+    flow: float | None = None,
+) -> PerZone[ZoneRecord]:
+    record = ZoneRecord(
+        controller_reason=Reason(code="fallback_curve"),
+        demand=EffectiveZoneDemand(
+            requested=requested,
+            effective=effective,
+            bound_by=bound_by,
+            safety_floor=safety_floor,
+            forced_max=bound_by is BoundBy.FORCED_MAX,
+            guard_floor=guard_floor,
+            reasons=() if bound_by is BoundBy.REQUESTED else (Reason(code="guard_floor"),),
+        ),
+        estimated_flow=flow,
+        hardware=(
+            None
+            if rpm is None
+            else HardwareReadback(pwm_raw=128, rpm=rpm, write_ok=True, readback_ok=True)
+        ),
+    )
+    return PerZone[ZoneRecord](front=record, rear=record, top=record)
+
+
+def control_state(
+    *,
+    regime: WorkloadRegime = WorkloadRegime.SUSTAINED_GPU,
+    safety_state: SafetyState = SafetyState.NORMAL,
+) -> ControlState:
+    """SHADOW stage の AUTO 運転。ML は requested を作れないので Fallback が active。"""
+    return ControlState(
+        operating_mode=OperatingMode.AUTO,
+        authority_stage=AuthorityStage.SHADOW,
+        active_controller=ControllerKind.FALLBACK,
+        safety_state=safety_state,
+        fallback_active=True,
+        workload_regime=regime,
+        regime_confidence=0.9,
+    )
+
+
+def plan_for(
+    demand: float = 0.8, *, offsets: tuple[int, ...] = (STEP_MS, 2 * STEP_MS)
+) -> ShadowActionPlan:
+    return ShadowActionPlan(
+        step_ms=offsets[0],
+        steps=tuple(
+            ShadowPlanStep(offset_ms=offset, demands=demands(demand)) for offset in offsets
+        ),
+    )
+
+
+def prediction_for(
+    plan: ShadowActionPlan,
+    *,
+    action_ts_ms: int,
+    values: tuple[float, ...],
+    inference: str,
+    metric: str = GPU,
+) -> ShadowPrediction:
+    return ShadowPrediction(
+        model_id="rack-thermal",
+        model_version="thermal-v1",
+        artifact_sha256="a" * 64,
+        inference_id=inference,
+        plan_digest=plan.digest(),
+        input_action_ts_ms=action_ts_ms,
+        targets=tuple(
+            ShadowPredictedTarget(
+                offset_ms=offset, expected_ts_ms=action_ts_ms + offset, values={metric: value}
+            )
+            for offset, value in zip(plan.offsets_ms, values, strict=True)
+        ),
+    )
+
+
+def counterfactual(
+    *,
+    action_ts_ms: int,
+    demand: float = 0.8,
+    values: tuple[float, ...] = (50.0, 51.0),
+    inference: str | None = None,
+    status: OptimizerStatus = OptimizerStatus.OK,
+    latency_ms: int = 120,
+) -> ShadowCounterfactual:
+    """解を持つ Learned MPC の counterfactual（同じ tick では適用されていない）。"""
+    plan = plan_for(demand)
+    identifier = inference or f"{action_ts_ms:064x}"
+    if status is not OptimizerStatus.OK:
+        return ShadowCounterfactual(
+            controller=ControllerKind.LEARNED_MPC,
+            requested=plan.first,
+            reason=Reason(code="optimizer_timeout"),
+            optimizer_status=status,
+            latency_ms=latency_ms,
+            model_version="thermal-v1",
+            inference_id=identifier,
+            artifact_sha256="a" * 64,
+        )
+    return ShadowCounterfactual(
+        controller=ControllerKind.LEARNED_MPC,
+        requested=plan.first,
+        reason=Reason(code="optimizer_ok"),
+        optimizer_status=status,
+        latency_ms=latency_ms,
+        evaluations=64,
+        model_version="thermal-v1",
+        inference_id=identifier,
+        artifact_sha256="a" * 64,
+        plan=plan,
+        prediction=prediction_for(
+            plan, action_ts_ms=action_ts_ms, values=values, inference=identifier
+        ),
+        cost_total=1.0,
+        baseline_cost_total=2.0,
+    )
+
+
+def tick_at(
+    ts_ms: int,
+    tick_id: int,
+    *,
+    applied: float = 0.8,
+    requested: float | None = None,
+    shadow: bool = True,
+    state: ControlState | None = None,
+    safety_floor: float = 0.0,
+    bound_by: BoundBy = BoundBy.REQUESTED,
+    guard_floor: float | None = None,
+    flow: float | None = 1.0,
+    rpm: int | None = 1200,
+    faults: tuple[Any, ...] = (),
+    cf: ShadowCounterfactual | None = None,
+) -> ControlTick:
+    """1 tick。**適用は Fallback、counterfactual は Learned MPC**（重ならない）。"""
+    zones = zone_records(
+        requested=applied if requested is None else requested,
+        effective=applied,
+        safety_floor=safety_floor,
+        bound_by=bound_by,
+        guard_floor=guard_floor,
+        rpm=rpm,
+        flow=flow,
+    )
+    record = None
+    if shadow:
+        record = ShadowRecord(
+            tick_id=tick_id,
+            ts_ms=ts_ms,
+            authority_stage=AuthorityStage.SHADOW,
+            applied_controller=ControllerKind.FALLBACK,
+            applied_effective=demands(applied),
+            counterfactuals=(cf or counterfactual(action_ts_ms=ts_ms),),
+        )
+    return ControlTick(
+        tick_id=tick_id,
+        ts_ms=ts_ms,
+        state=state or control_state(),
+        zones=zones,
+        shadow=record,
+        faults=faults,
+    )
+
+
+def trace_of(tick: ControlTick) -> ControlTraceRecord:
+    return ControlTraceRecord(
+        ts_ms=tick.ts_ms,
+        tick_id=tick.tick_id,
+        schema_version=tick.schema_version,
+        trace_json=tick.model_dump_json(),
+    )
+
+
+def observation(metric: str, ts_ms: int, value: float, *, quality: Quality = Quality.OK):
+    return OutcomeObservation(metric=metric, ts_ms=ts_ms, value=value, quality=quality)
+
+
+@pytest.fixture
+def context(tmp_path: Path) -> EvaluationContext:
+    """試験用の設定一式。**評価設定はリポジトリの実物を使う**（設定漏れも一緒に試す）。"""
+    directory = tmp_path / "pr91-config"
+    directory.mkdir()
+    write_documents(directory, valid_documents())
+    config, config_sha256 = EvaluationConfig.from_file(EVALUATION_YAML)
+    return EvaluationContext.build(
+        config=config,
+        config_sha256=config_sha256,
+        control=ControlConfig.from_directory(directory),
+        catalog=MetricCatalog.from_yaml(METRICS_YAML),
+        catalog_sha256="b" * 64,
+    )
+
+
+def plan_following_run(
+    *, ticks: int = 6, demand: float = 0.8, start_ms: int = TICK_TS_MS
+) -> tuple[list[ControlTraceRecord], list[OutcomeObservation]]:
+    """**counterfactual の plan どおりに適用された** run（採点できる区間ができる）。"""
+    traces = [
+        trace_of(tick_at(start_ms + index * STEP_MS, index, applied=demand))
+        for index in range(ticks)
+    ]
+    observations = [
+        observation(GPU, start_ms + index * STEP_MS, 50.0 + index * 0.1)
+        for index in range(ticks + 4)
+    ]
+    observations.extend(
+        observation(ROOM, start_ms + index * STEP_MS, 24.0) for index in range(ticks)
+    )
+    return traces, observations
+
+
+def run_of(
+    traces: list[ControlTraceRecord],
+    observations: list[OutcomeObservation],
+    *,
+    run_id: str = "pr91-run",
+    boundaries: tuple[int, ...] = (),
+    shadow: tuple[ShadowExportRow, ...] | None = None,
+) -> EvaluationRun:
+    return EvaluationRun(
+        run_id=run_id,
+        traces=tuple(traces),
+        observations=tuple(observations),
+        split_boundaries_ms=boundaries,
+        shadow=shadow,
+    )
+
+
+def overall(report: EvaluationReport, index: int = 0) -> GroupReport:
+    group = next(item for item in report.segments[index].groups if item.kind is GroupKind.OVERALL)
+    return group
+
+
+# --------------------------------------- 不変条件 1: 評価は制御にも時計にも触れない
+
+
+FORBIDDEN_MODULES = (
+    "coldaisle.control.hardware",
+    "coldaisle.control.safety",
+    "coldaisle.control.reactive",
+    "serial",
+    "subprocess",
+)
+"""評価 package が import してはいけない module（AGENTS.md ルール1 / 2 / 6）。"""
+
+
+def _imported_modules(path: Path) -> list[str]:
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    names: list[str] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            names.extend(alias.name for alias in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.module is not None:
+            names.append(node.module)
+    return names
+
+
+def test_invariant_1_a_the_evaluation_package_cannot_reach_the_actuation_path() -> None:
+    """**Guard / Safety / Hardware へ触れられる評価を作らない。**
+
+    触れられるようになった瞬間、「評価は読み取りだけ」が設計上の約束ではなくなる。
+    """
+    offenders = [
+        f"{path.name}: {name}"
+        for path in sorted(EVALUATION_PACKAGE.glob("*.py"))
+        for name in _imported_modules(path)
+        if any(
+            name == forbidden or name.startswith(f"{forbidden}.") for forbidden in FORBIDDEN_MODULES
+        )
+    ]
+    assert offenders == []
+
+
+def test_invariant_1_b_the_evaluation_package_never_names_pwm_or_effective_demand() -> None:
+    """評価の型に **PWM も `EffectiveZoneDemand` も現れない**（決定記録 0028 §2.3）。"""
+    offenders = []
+    for path in sorted(EVALUATION_PACKAGE.glob("*.py")):
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        names = {node.id for node in ast.walk(tree) if isinstance(node, ast.Name)} | {
+            node.attr for node in ast.walk(tree) if isinstance(node, ast.Attribute)
+        }
+        offenders.extend(
+            f"{path.name}: {name}"
+            for name in sorted(names)
+            if "pwm" in name.lower() or name == "EffectiveZoneDemand"
+        )
+    assert offenders == []
+
+
+def test_invariant_1_c_the_evaluation_package_has_no_clock() -> None:
+    """**処理した時刻を使わない。** 時計を持てば、あとから都合よく切り出せる。"""
+    for path in sorted(EVALUATION_PACKAGE.glob("*.py")):
+        imported = set(_imported_modules(path))
+        assert not (imported & {"time", "datetime", "coldaisle.clock"}), path.name
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        names = {node.attr for node in ast.walk(tree) if isinstance(node, ast.Attribute)} | {
+            node.id for node in ast.walk(tree) if isinstance(node, ast.Name)
+        }
+        assert not ({"monotonic", "now_ms", "now", "monotonic_ms", "time_ns"} & names), path.name
+
+
+def test_invariant_1_d_the_report_has_no_generation_timestamp() -> None:
+    """報告に**生成時刻の欄を作らない**。入ると同じ入力から同じ bytes が出なくなる。"""
+    stamped = [
+        name
+        for name in EvaluationReport.model_fields
+        if "generated" in name or name in {"created_at", "now_ms", "at_ms"}
+    ]
+    assert stamped == []
+
+
+# ------------------------- 不変条件 2: 実測の成果は適用された構成にしか帰属しない
+
+
+def test_invariant_2_a_counterfactual_reports_cannot_carry_measured_outcomes() -> None:
+    """適用されなかった提案に、温度・ΔT・Air Balance・RPM の欄を**作らない**（0054 §2.2）。"""
+    forbidden = {
+        "temperatures",
+        "deltas",
+        "air_balance",
+        "rpm",
+        "effective_demand",
+        "interventions",
+    }
+    assert not (forbidden & set(CounterfactualArmReport.model_fields))
+
+
+def test_invariant_2_b_a_measured_field_cannot_be_grafted_onto_a_counterfactual() -> None:
+    """あとから温度の欄を足そうとしても、型が拒む（`extra="forbid"`）。"""
+    with pytest.raises(ValidationError):
+        CounterfactualArmReport(
+            arm=CounterfactualArm(
+                controller=ControllerKind.LEARNED_MPC,
+                supervisor_policy=None,
+                authority_stage=AuthorityStage.SHADOW,
+            ),
+            arm_key="counterfactual:learned_mpc+none@shadow",
+            ticks=1,
+            first_ts_ms=0,
+            last_ts_ms=0,
+            proposals=0,
+            coverage=CoverageReport(outcomes=0, scored=0, unidentifiable=0, sufficient=False),
+            temperatures=(),  # type: ignore[call-arg]
+        )
+
+
+def test_invariant_2_c_applied_and_counterfactual_arms_stay_in_separate_namespaces(
+    context: EvaluationContext,
+) -> None:
+    """適用実績と「使わなかった提案」を**同じ行として読めない**ようにする。"""
+    traces, observations = plan_following_run()
+    report = evaluate([run_of(traces, observations)], context=context)
+    group = overall(report)
+
+    assert group.applied and group.counterfactual
+    assert all(item.arm_key.startswith("applied:") for item in group.applied)
+    assert all(item.arm_key.startswith("counterfactual:") for item in group.counterfactual)
+    assert not {item.arm_key for item in group.applied} & {
+        item.arm_key for item in group.counterfactual
+    }
+
+
+def _no_intervention(ticks: int = 1) -> InterventionReport:
+    return InterventionReport(
+        ticks=ticks,
+        forced_max_ticks=0,
+        safety_floor_ticks=0,
+        guard_floor_ticks=0,
+        guard_ceiling_ticks=0,
+        ramp_down_ticks=0,
+        guard_active_ticks=0,
+        fallback_ticks=0,
+        emergency_ticks=0,
+        degraded_ticks=0,
+        fault_ticks=0,
+        safety_states=(CountedReason(code="normal", count=ticks),),
+    )
+
+
+def test_invariant_2_d_a_group_rejects_the_same_key_on_both_sides() -> None:
+    """名前空間が重なる報告は**作れない**。"""
+    applied = AppliedArmReport(
+        arm=AppliedArm(
+            controller=ControllerKind.FALLBACK,
+            supervisor_policy=None,
+            authority_stage=AuthorityStage.SHADOW,
+            operating_mode=OperatingMode.AUTO,
+        ),
+        arm_key="applied:fallback+none@shadow/auto",
+        ticks=1,
+        first_ts_ms=0,
+        last_ts_ms=0,
+        interventions=_no_intervention(),
+    )
+    duplicate = applied.model_copy(update={"arm_key": applied.arm_key})
+    with pytest.raises(ValidationError, match="同じ arm を1つの group に2回"):
+        GroupReport(kind=GroupKind.OVERALL, value="overall", applied=(applied, duplicate))
+
+
+# ------------------- 不変条件 3: 採点していない結果をモデル誤差として数えない
+
+
+def test_invariant_3_a_unidentifiable_outcomes_never_become_prediction_error(
+    context: EvaluationContext,
+) -> None:
+    """**掛かっていた action が plan と違う区間の差は、モデル誤差ではない**（0053 §2.3）。
+
+    適用値を plan からずらすと、実測が予測から大きく外れていても予測指標は出ず、
+    その分は coverage の `unidentifiable` として残る。
+    """
+    aside = [
+        trace_of(
+            tick_at(
+                TICK_TS_MS + index * STEP_MS,
+                index,
+                applied=0.2,  # plan は 0.8。別の値が掛かっていた
+                cf=counterfactual(action_ts_ms=TICK_TS_MS + index * STEP_MS),
+            )
+        )
+        for index in range(6)
+    ]
+    far_off = [observation(GPU, TICK_TS_MS + index * STEP_MS, 90.0) for index in range(10)]
+    far_off.extend(observation(ROOM, TICK_TS_MS + index * STEP_MS, 24.0) for index in range(6))
+
+    report = evaluate([run_of(aside, far_off)], context=context)
+    shadow_arm = overall(report).counterfactual[0]
+
+    assert shadow_arm.coverage.outcomes > 0
+    assert shadow_arm.coverage.scored == 0
+    assert shadow_arm.coverage.unidentifiable == shadow_arm.coverage.outcomes
+    assert shadow_arm.coverage.unidentifiable_reasons[0].code == "applied_action_differs"
+    assert shadow_arm.predictions == ()
+    assert shadow_arm.coverage.scored_outputs == 0
+
+
+def test_invariant_3_b_only_scored_outputs_feed_the_error_statistics() -> None:
+    """採点した出力の数を、coverage が数えた採点数より多くできない。"""
+    coverage = CoverageReport(
+        outcomes=1,
+        scored=1,
+        unidentifiable=0,
+        identifiable_fraction=1.0,
+        outputs=2,
+        matched_outputs=1,
+        scored_outputs=1,
+        sufficient=True,
+    )
+    with pytest.raises(ValidationError, match="coverage の採点数を超えている"):
+        CounterfactualArmReport(
+            arm=CounterfactualArm(
+                controller=ControllerKind.LEARNED_MPC,
+                supervisor_policy=None,
+                authority_stage=AuthorityStage.SHADOW,
+            ),
+            arm_key="counterfactual:learned_mpc+none@shadow",
+            ticks=1,
+            first_ts_ms=0,
+            last_ts_ms=0,
+            proposals=1,
+            safety_floor_shortfalls=0,
+            maximum_floor_shortfall=0.0,
+            coverage=coverage,
+            predictions=(
+                PredictionReport(
+                    metric=GPU,
+                    scored_outputs=5,
+                    error=summarize([0.5]) or _never(),
+                    absolute_error=summarize([0.5]) or _never(),
+                    underprediction_outputs=5,
+                    underprediction_rate=1.0,
+                    maximum_underprediction=0.5,
+                ),
+            ),
+        )
+
+
+def _never() -> MetricSummary:  # pragma: no cover - 到達しない
+    raise AssertionError("summarize は値があれば必ず返す")
+
+
+def test_invariant_3_c_unmatched_outputs_are_counted_with_their_reason(
+    context: EvaluationContext,
+) -> None:
+    """実測が無い出力を「誤差 0」にしない。**理由付きで数える。**"""
+    traces, _observations = plan_following_run()
+    room_only = [observation(ROOM, TICK_TS_MS + index * STEP_MS, 24.0) for index in range(6)]
+
+    report = evaluate([run_of(traces, room_only)], context=context)
+    shadow_arm = overall(report).counterfactual[0]
+
+    assert shadow_arm.coverage.matched_outputs == 0
+    assert shadow_arm.coverage.unmatched_reasons[0].code == "no_usable_observation"
+    assert shadow_arm.predictions == ()
+
+
+# ------------------- 不変条件 4: coverage は一級の出力で、足りなければ通さない
+
+
+def test_invariant_4_a_a_report_cannot_show_predictions_without_enough_coverage() -> None:
+    """**少数の採点区間の平均を、全体の予測精度に見せない。**"""
+    coverage = CoverageReport(
+        outcomes=10,
+        scored=1,
+        unidentifiable=9,
+        identifiable_fraction=0.1,
+        outputs=20,
+        matched_outputs=2,
+        scored_outputs=2,
+        sufficient=False,
+    )
+    with pytest.raises(ValidationError, match="coverage が足りない"):
+        CounterfactualArmReport(
+            arm=CounterfactualArm(
+                controller=ControllerKind.LEARNED_MPC,
+                supervisor_policy=None,
+                authority_stage=AuthorityStage.SHADOW,
+            ),
+            arm_key="counterfactual:learned_mpc+none@shadow",
+            ticks=1,
+            first_ts_ms=0,
+            last_ts_ms=0,
+            proposals=1,
+            safety_floor_shortfalls=0,
+            maximum_floor_shortfall=0.0,
+            coverage=coverage,
+            predictions=(
+                PredictionReport(
+                    metric=GPU,
+                    scored_outputs=2,
+                    error=summarize([0.5, 0.6]) or _never(),
+                    absolute_error=summarize([0.5, 0.6]) or _never(),
+                    underprediction_outputs=2,
+                    underprediction_rate=1.0,
+                    maximum_underprediction=0.6,
+                ),
+            ),
+        )
+
+
+def test_invariant_4_b_no_outcomes_means_no_identifiable_fraction() -> None:
+    """outcome が1つも無いことを `1.0`（全部採点できた）に見せない。"""
+    with pytest.raises(ValidationError, match="identifiable_fraction を付けない"):
+        CoverageReport(
+            outcomes=0,
+            scored=0,
+            unidentifiable=0,
+            identifiable_fraction=1.0,
+            sufficient=False,
+        )
+
+
+def test_invariant_4_c_zero_scored_outcomes_can_never_be_sufficient() -> None:
+    """採点できた outcome が1つも無い coverage を「足りている」にしない。"""
+    with pytest.raises(ValidationError, match="scored が 0"):
+        CoverageReport(
+            outcomes=5,
+            scored=0,
+            unidentifiable=5,
+            identifiable_fraction=0.0,
+            sufficient=True,
+        )
+
+
+def test_invariant_4_d_insufficient_coverage_blocks_the_gate(
+    context: EvaluationContext,
+) -> None:
+    """**採点できた区間が少なければ rollout を通さない**（0053 §5 をここで閉じた）。"""
+    traces, observations = plan_following_run()
+    report = evaluate([run_of(traces, observations)], context=context)
+    gate = next(item for item in report.gates if item.arm_key.startswith("counterfactual:"))
+
+    assert gate.outcome is GateOutcome.BLOCKED
+    assert gate.blocking_stage in {GateStage.SAFETY, GateStage.EVIDENCE}
+    evidence = [item for item in gate.conditions if item.stage is GateStage.EVIDENCE]
+    assert any(item.outcome is GateOutcome.BLOCKED for item in evidence)
+    shadow_arm = overall(report).counterfactual[0]
+    assert shadow_arm.coverage.sufficient is False
+    assert any(gap.code == "insufficient_coverage" for gap in shadow_arm.gaps)
+
+
+# ----------------- 不変条件 5: Safety 違反は、ほかの改善で相殺されない
+
+
+def test_invariant_5_a_a_failed_condition_always_blocks_the_whole_gate() -> None:
+    """cost がどれだけ良くても、Safety が落ちていれば `pass` にできない。"""
+    conditions = (
+        GateCondition(
+            stage=GateStage.SAFETY,
+            name="ceiling_exceedances",
+            outcome=GateOutcome.BLOCKED,
+            limit=0.0,
+            observed=3.0,
+        ),
+        GateCondition(
+            stage=GateStage.COST,
+            name="underprediction_c",
+            outcome=GateOutcome.PASS,
+            limit=3.0,
+            observed=0.0,
+        ),
+    )
+    with pytest.raises(ValidationError, match="落ちた条件が1つでもあれば"):
+        GateResult(
+            arm_key="applied:fallback+none@shadow/auto",
+            outcome=GateOutcome.PASS,
+            blocking_stage=GateStage.SAFETY,
+            conditions=conditions,
+        )
+
+
+def test_invariant_5_b_the_blocking_stage_is_the_earliest_failure() -> None:
+    """cost の失敗を blocking として書いて、Safety の失敗を隠せない。"""
+    conditions = (
+        GateCondition(
+            stage=GateStage.SAFETY,
+            name="emergency_ticks",
+            outcome=GateOutcome.BLOCKED,
+            limit=0.0,
+            observed=2.0,
+        ),
+        GateCondition(
+            stage=GateStage.COST,
+            name="underprediction_c",
+            outcome=GateOutcome.BLOCKED,
+            limit=3.0,
+            observed=9.0,
+        ),
+    )
+    with pytest.raises(ValidationError, match="blocking_stage"):
+        GateResult(
+            arm_key="applied:fallback+none@shadow/auto",
+            outcome=GateOutcome.BLOCKED,
+            blocking_stage=GateStage.COST,
+            conditions=conditions,
+        )
+
+
+def test_invariant_5_c_an_undecidable_condition_is_blocked_not_passed() -> None:
+    """**判定できないことを合格にしない**（fail closed）。"""
+    with pytest.raises(ValidationError, match="観測値の無い gate 条件は blocked"):
+        GateCondition(
+            stage=GateStage.SAFETY,
+            name="threshold_margin_c",
+            outcome=GateOutcome.PASS,
+            limit=5.0,
+            reason=CountedReason(code="no_temperature_evidence", count=1),
+        )
+
+
+def test_invariant_5_d_a_safety_violation_blocks_even_with_perfect_cost_metrics(
+    context: EvaluationContext,
+) -> None:
+    """実際の評価でも、絶対上限を超えた run は `blocked` になる。"""
+    traces, observations = plan_following_run()
+    ceiling = context.control.safety.absolute_temp_ceiling_c.value
+    hot = [
+        item if item.metric != GPU else observation(item.metric, item.ts_ms, ceiling + 5.0)
+        for item in observations
+    ]
+    report = evaluate([run_of(traces, hot)], context=context)
+    gate = next(item for item in report.gates if item.arm_key.startswith("applied:"))
+
+    assert gate.outcome is GateOutcome.BLOCKED
+    assert gate.blocking_stage is GateStage.SAFETY
+    exceeded = next(item for item in gate.conditions if item.name == "ceiling_exceedances")
+    assert exceeded.observed is not None and exceeded.observed > 0
+    assert exceeded.worst_case is not None
+
+
+def test_invariant_5_e_a_proposal_below_the_recorded_safety_floor_is_counted(
+    context: EvaluationContext,
+) -> None:
+    """**記録された Critical Safety floor を下回る要求**を、安全側の指標として数える。"""
+    traces = [
+        trace_of(
+            tick_at(
+                TICK_TS_MS + index * STEP_MS,
+                index,
+                applied=0.9,
+                safety_floor=0.9,
+                cf=counterfactual(action_ts_ms=TICK_TS_MS + index * STEP_MS, demand=0.2),
+            )
+        )
+        for index in range(4)
+    ]
+    report = evaluate([run_of(traces, [])], context=context)
+    shadow_arm = overall(report).counterfactual[0]
+
+    assert shadow_arm.safety_floor_shortfalls == 4 * len(Zone)
+    assert shadow_arm.maximum_floor_shortfall == pytest.approx(0.7)
+    gate = next(item for item in report.gates if item.arm_key.startswith("counterfactual:"))
+    shortfall = next(item for item in gate.conditions if item.name == "safety_floor_shortfalls")
+    assert shortfall.outcome is GateOutcome.BLOCKED
+    assert gate.blocking_stage is GateStage.SAFETY
+
+
+# ----------------------------- 不変条件 6: 時系列 split に未来が漏れない
+
+
+def test_invariant_6_a_appending_future_data_does_not_change_an_earlier_segment(
+    context: EvaluationContext,
+) -> None:
+    """**segment の報告は `end_ms` 以降の入力に依存しない**（0054 §2.5）。"""
+    traces, observations = plan_following_run(ticks=6)
+    boundary = TICK_TS_MS + 3 * STEP_MS
+    short_traces = traces[:4]
+    short_observations = [item for item in observations if item.ts_ms <= traces[3].ts_ms]
+    shorter = evaluate(
+        [run_of(short_traces, short_observations, boundaries=(boundary,))], context=context
+    )
+    longer = evaluate([run_of(traces, observations, boundaries=(boundary,))], context=context)
+
+    early = longer.segments[0]
+    assert early.role is SegmentRole.CALIBRATION
+    assert longer.segments[-1].role is SegmentRole.HOLDOUT
+    assert early.start_ms == shorter.segments[0].start_ms
+    assert early.end_ms == boundary
+    # **あとから未来のデータを足しても、前の segment の bytes は変わらない。**
+    assert early.model_dump_json() == shorter.segments[0].model_dump_json()
+
+
+def test_invariant_6_b_outcomes_that_straddle_the_boundary_are_purged(
+    context: EvaluationContext,
+) -> None:
+    """境界を跨ぐ outcome は**どの segment にも入れず、数えて残す**。"""
+    traces, observations = plan_following_run(ticks=6)
+    boundary = TICK_TS_MS + 3 * STEP_MS
+    report = evaluate([run_of(traces, observations, boundaries=(boundary,))], context=context)
+
+    assert sum(segment.purged_outcomes for segment in report.segments) > 0
+
+
+def test_invariant_6_c_a_boundary_outside_the_run_is_rejected(
+    context: EvaluationContext,
+) -> None:
+    """run の外の境界で、存在しない区間を作らせない。"""
+    traces, observations = plan_following_run()
+    with pytest.raises(EvaluationInputError, match="split の境界"):
+        evaluate([run_of(traces, observations, boundaries=(1,))], context=context)
+
+
+def test_invariant_6_d_the_gate_reads_only_the_holdout_segment(
+    context: EvaluationContext,
+) -> None:
+    """gate は**最後の区間**だけで判定する（未来で較正しない）。"""
+    ceiling = context.control.safety.absolute_temp_ceiling_c.value
+    traces, observations = plan_following_run(ticks=6)
+    boundary = TICK_TS_MS + 3 * STEP_MS
+    hot_early = [
+        observation(item.metric, item.ts_ms, ceiling + 5.0)
+        if item.metric == GPU and item.ts_ms < boundary
+        else item
+        for item in observations
+    ]
+    report = evaluate([run_of(traces, hot_early, boundaries=(boundary,))], context=context)
+    gate = next(item for item in report.gates if item.arm_key.startswith("applied:"))
+    exceeded = next(item for item in gate.conditions if item.name == "ceiling_exceedances")
+
+    # 前半の超過は holdout の判定には入らない。**worst-case 一覧には残る。**
+    assert exceeded.observed == 0.0
+    assert any(
+        case.kind is WorstCaseKind.CEILING_EXCEEDANCES and case.value > 0
+        for case in report.worst_cases
+    )
+
+
+# ------------------- 不変条件 7: 契約と食い違う記録を通さない
+
+
+def test_invariant_7_a_a_shadow_export_matched_with_another_tolerance_is_refused(
+    context: EvaluationContext,
+) -> None:
+    """**違う許容幅で照合された結果を、同じ coverage として並べない**（0054 §2.6）。"""
+    traces, observations = plan_following_run()
+    rows = tuple(shadow_rows(traces, observations=observations, matcher=context.matcher()))
+    widened = tuple(
+        row.model_copy(
+            update={
+                "outcomes": tuple(
+                    outcome.model_copy(
+                        update={"match_tolerance_ms": context.matcher().match_tolerance_ms + 1}
+                    )
+                    for outcome in row.outcomes
+                )
+            }
+        )
+        for row in rows
+    )
+    with pytest.raises(EvaluationInputError, match="照合許容幅が設定と違う"):
+        evaluate([run_of(traces, observations, shadow=widened)], context=context)
+
+
+def test_invariant_7_b_a_trace_whose_index_disagrees_with_its_body_is_refused(
+    context: EvaluationContext,
+) -> None:
+    """索引と中身が食い違う trace を、そのまま評価へ流さない。"""
+    traces, observations = plan_following_run()
+    broken = traces[0].model_copy(update={"tick_id": traces[0].tick_id + 100})
+    with pytest.raises(EvaluationInputError, match="index と JSON 本文"):
+        evaluate([run_of([broken, *traces[1:]], observations)], context=context)
+
+
+def test_invariant_7_c_a_shadow_export_row_must_match_the_stored_trace(
+    context: EvaluationContext,
+) -> None:
+    """別の記録を貼り替えた export を、その tick の実績として読まない。"""
+    traces, observations = plan_following_run()
+    rows = list(shadow_rows(traces, observations=observations, matcher=context.matcher()))
+    swapped = rows[0].model_copy(update={"shadow": rows[1].shadow})
+    with pytest.raises(EvaluationInputError, match="trace と一致しない"):
+        evaluate([run_of(traces, observations, shadow=(swapped, *rows[1:]))], context=context)
+
+
+def test_invariant_7_d_an_outcome_from_another_inference_is_not_counted(
+    context: EvaluationContext,
+) -> None:
+    """outcome は `inference_id` と `plan_digest` で結び直す。**結べなければ数えない。**"""
+    traces, observations = plan_following_run()
+    rows = list(shadow_rows(traces, observations=observations, matcher=context.matcher()))
+    relabelled = tuple(
+        row.model_copy(
+            update={
+                "outcomes": tuple(
+                    outcome.model_copy(update={"inference_id": "f" * 64})
+                    for outcome in row.outcomes
+                )
+            }
+        )
+        for row in rows
+    )
+    report = evaluate([run_of(traces, observations, shadow=relabelled)], context=context)
+    shadow_arm = overall(report).counterfactual[0]
+
+    assert shadow_arm.coverage.outcomes == 0
+    assert shadow_arm.coverage.identifiable_fraction is None
+
+
+def test_invariant_7_e_the_shadow_export_round_trips(context: EvaluationContext) -> None:
+    """#90 の export（JSON Lines）を、そのまま評価へ取り込める（受入基準）。"""
+    traces, observations = plan_following_run()
+    rows = tuple(shadow_rows(traces, observations=observations, matcher=context.matcher()))
+    stream = _StringIO()
+    write_shadow_jsonl(rows, stream)
+    restored = read_shadow_jsonl(_StringIO(stream.getvalue()))
+
+    assert restored == rows
+    from_file = evaluate([run_of(traces, observations, shadow=restored)], context=context)
+    computed = evaluate([run_of(traces, observations)], context=context)
+    assert render(from_file) == render(computed)
+
+
+def _StringIO(text: str = ""):
+    import io
+
+    return io.StringIO(text)
+
+
+# ------------------------------ 不変条件 8: 同じ入力からは同じ bytes
+
+
+def test_invariant_8_a_the_same_input_produces_the_same_report(
+    context: EvaluationContext,
+) -> None:
+    """再現できない比較は、条件の違いと制御の違いを分けられない。"""
+    traces, observations = plan_following_run()
+    first = evaluate([run_of(traces, observations)], context=context)
+    second = evaluate([run_of(traces, observations)], context=context)
+
+    assert render(first) == render(second)
+    assert first.provenance.conditions_sha256 == second.provenance.conditions_sha256
+
+
+def test_invariant_8_b_the_input_order_does_not_change_the_report(
+    context: EvaluationContext,
+) -> None:
+    """並び順で結果が変わると、同じ条件かどうかを digest で確かめられない。"""
+    traces, observations = plan_following_run()
+    ordered = evaluate([run_of(traces, observations)], context=context)
+    shuffled = evaluate(
+        [run_of(list(reversed(traces)), list(reversed(observations)))], context=context
+    )
+
+    assert render(ordered) == render(shuffled)
+
+
+def test_invariant_8_c_the_report_records_the_versions_and_configs_it_used(
+    context: EvaluationContext,
+) -> None:
+    """**controller / model / config の版を記録する**（#91 の受入基準）。"""
+    traces, observations = plan_following_run()
+    report = evaluate([run_of(traces, observations)], context=context)
+    provenance = report.provenance
+
+    assert provenance.safety_config_sha256 == context.control.sources.safety.sha256
+    assert provenance.fan_policy_config_sha256 == context.control.sources.policy.sha256
+    assert provenance.evaluation_config_sha256 == context.config_sha256
+    assert provenance.versions.model_versions == ("thermal-v1",)
+    assert provenance.versions.model_artifacts == ("a" * 64,)
+    assert provenance.versions.control_schema_versions == (6,)
+    assert provenance.outcome_match_tolerance_ms == (
+        context.control.policy.shadow.outcome_match_tolerance_ms.value
+    )
+    assert provenance.absolute_temp_ceiling_c == (
+        context.control.safety.absolute_temp_ceiling_c.value
+    )
+    assert provenance.runs[0].trace_sha256 != provenance.runs[0].observation_sha256
+
+
+# ---------------------- 不変条件 9: 設定の既定値をコードに置かない
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        ("percentiles",),
+        ("worst_case_count",),
+        ("hunting",),
+        ("observation_match_tolerance_ms",),
+        ("room_temperature_bands",),
+        ("gate",),
+        ("temperature_metrics",),
+        ("room_temperature_metric",),
+    ],
+)
+def test_invariant_9_a_every_setting_is_required(path: tuple[str, ...]) -> None:
+    """設定を1つ抜くと読み込みで落ちる。**コード側の既定値で埋めない**（AGENTS.md ルール9）。"""
+    document = yaml.safe_load(EVALUATION_YAML.read_text(encoding="utf-8"))
+    del document[path[0]]
+    with pytest.raises(ValidationError):
+        EvaluationConfig.model_validate(document)
+
+
+def test_invariant_9_b_the_copied_metric_limit_matches_the_contract_it_copies() -> None:
+    """**写した上限が、元の契約と食い違わない。** 狭いと記録できた予測を評価できない。"""
+    from coldaisle.control.evaluation.config import MAX_EVALUATION_METRICS
+
+    assert MAX_EVALUATION_METRICS == MAX_SHADOW_PREDICTION_METRICS
+
+
+def test_invariant_9_c_shipped_values_are_marked_provisional() -> None:
+    """実測前の値を `confirmed` として出荷しない。"""
+    document = yaml.safe_load(EVALUATION_YAML.read_text(encoding="utf-8"))
+    statuses = []
+
+    def walk(node: object) -> None:
+        if isinstance(node, dict):
+            if "status" in node:
+                statuses.append(node["status"])
+            for value in node.values():
+                walk(value)
+        elif isinstance(node, list):
+            for value in node:
+                walk(value)
+
+    walk(document)
+    assert statuses and set(statuses) == {"provisional"}
+
+
+def test_invariant_9_d_delta_formulas_come_from_the_metric_catalog(tmp_path: Path) -> None:
+    """ΔT の式を評価設定へ写させない。**`config/metrics.yaml` に無い名前は拒む。**"""
+    directory = tmp_path / "pr91-config-delta"
+    directory.mkdir()
+    write_documents(directory, valid_documents())
+    document = yaml.safe_load(EVALUATION_YAML.read_text(encoding="utf-8"))
+    document["delta_metrics"] = ["d.not_in_the_catalog"]
+    with pytest.raises(EvaluationInputError, match="派生値"):
+        EvaluationContext.build(
+            config=EvaluationConfig.model_validate(document),
+            config_sha256="c" * 64,
+            control=ControlConfig.from_directory(directory),
+            catalog=MetricCatalog.from_yaml(METRICS_YAML),
+            catalog_sha256="b" * 64,
+        )
+
+
+def test_invariant_9_e_a_band_without_an_upper_bound_must_come_last() -> None:
+    """帯の並びが崩れると、その先の室温が黙ってどこにも入らない。"""
+    document = yaml.safe_load(EVALUATION_YAML.read_text(encoding="utf-8"))
+    document["room_temperature_bands"] = [
+        {"name": "any"},
+        {"name": "cool", "below_c": {"value": 20.0, "status": "provisional"}},
+    ]
+    with pytest.raises(ValidationError, match="上限のない室温帯は最後"):
+        EvaluationConfig.model_validate(document)
+
+
+# ------------------------------ 不変条件 10: worst-case を必ず載せる
+
+
+def test_invariant_10_a_a_report_with_ticks_must_carry_worst_cases(
+    context: EvaluationContext,
+) -> None:
+    """平均だけを見て「問題なかった」と読ませない。"""
+    traces, observations = plan_following_run()
+    report = evaluate([run_of(traces, observations)], context=context)
+
+    assert report.worst_cases
+    stripped = report.model_dump()
+    stripped["worst_cases"] = ()
+    with pytest.raises(ValidationError, match="worst-case を必ず載せる"):
+        EvaluationReport.model_validate(stripped)
+
+
+def test_invariant_10_b_the_worst_run_surfaces_even_next_to_good_runs(
+    context: EvaluationContext,
+) -> None:
+    """1つ悪い run があれば、良い run の数で薄まらずに出てくる。"""
+    ceiling = context.control.safety.absolute_temp_ceiling_c.value
+    good_traces, good_observations = plan_following_run()
+    bad_traces, bad_observations = plan_following_run(start_ms=TICK_TS_MS + 10 * STEP_MS)
+    bad_observations = [
+        observation(item.metric, item.ts_ms, ceiling + 9.0) if item.metric == GPU else item
+        for item in bad_observations
+    ]
+    report = evaluate(
+        [
+            run_of(good_traces, good_observations, run_id="pr91-good"),
+            run_of(bad_traces, bad_observations, run_id="pr91-bad"),
+        ],
+        context=context,
+    )
+    worst = next(
+        case for case in report.worst_cases if case.kind is WorstCaseKind.MINIMUM_THRESHOLD_MARGIN
+    )
+
+    assert worst.run_id == "pr91-bad"
+    assert worst.value < 0.0
+
+
+# ------------------ 不変条件 11: Guard / Safety の効きは「分解」として出す
+
+
+def test_invariant_11_a_guard_and_safety_show_up_as_interventions_not_as_arms(
+    context: EvaluationContext,
+) -> None:
+    """**「Guard 無し MPC」という arm を作らない**（0054 §2.1）。
+
+    Guard / Safety の効きは、同じ arm の `requested` と `effective` の差と介入回数で見る。
+    """
+    traces = [
+        trace_of(
+            tick_at(
+                TICK_TS_MS + index * STEP_MS,
+                index,
+                applied=0.9,
+                requested=0.3,
+                bound_by=BoundBy.GUARD_FLOOR,
+                guard_floor=0.9,
+            )
+        )
+        for index in range(4)
+    ]
+    report = evaluate([run_of(traces, [])], context=context)
+    applied = overall(report).applied[0]
+
+    assert applied.interventions.guard_floor_ticks == 4
+    assert applied.interventions.guard_active_ticks == 4
+    assert applied.effective_demand[0].shape.level.mean == pytest.approx(0.9)
+    assert applied.requested_demand[0].shape.level.mean == pytest.approx(0.3)
+    assert "guard" not in applied.arm_key
+
+
+def test_invariant_11_b_missing_evidence_is_recorded_as_a_gap_not_as_zero(
+    context: EvaluationContext,
+) -> None:
+    """**欄を埋め合わせない。** 出せなかった指標は理由付きで残す。"""
+    traces = [
+        trace_of(tick_at(TICK_TS_MS + index * STEP_MS, index, rpm=None, flow=None))
+        for index in range(3)
+    ]
+    report = evaluate([run_of(traces, [])], context=context)
+    applied = overall(report).applied[0]
+
+    assert applied.rpm == ()
+    assert applied.air_balance is None
+    assert applied.acoustic_cost is None
+    codes = {gap.code for gap in applied.gaps}
+    assert {"no_rpm_readback", "no_estimated_flow", "no_acoustic_model"} <= codes
+    assert applied.temperatures == ()
+
+
+# ------------------------------ 集計の切り口と要約統計
+
+
+def test_groups_cover_workload_regime_and_room_temperature_band(
+    context: EvaluationContext,
+) -> None:
+    """**workload regime / 室温帯ごとに評価する**（Issue の評価原則）。"""
+    traces = [
+        trace_of(
+            tick_at(
+                TICK_TS_MS + index * STEP_MS,
+                index,
+                state=control_state(
+                    regime=WorkloadRegime.IDLE if index < 2 else WorkloadRegime.SUSTAINED_GPU
+                ),
+            )
+        )
+        for index in range(4)
+    ]
+    observations = [
+        observation(ROOM, TICK_TS_MS + index * STEP_MS, 20.0 if index < 2 else 30.0)
+        for index in range(4)
+    ]
+    report = evaluate([run_of(traces, observations)], context=context)
+    groups = {(group.kind, group.value) for group in report.segments[0].groups}
+
+    assert (GroupKind.WORKLOAD_REGIME, "idle") in groups
+    assert (GroupKind.WORKLOAD_REGIME, "sustained_gpu") in groups
+    assert (GroupKind.ROOM_TEMPERATURE_BAND, "cool") in groups
+    assert (GroupKind.ROOM_TEMPERATURE_BAND, "warm") in groups
+
+
+def test_ticks_without_a_room_observation_land_in_the_unknown_band(
+    context: EvaluationContext,
+) -> None:
+    """室温が読めない tick を**黙って落とさない**。"""
+    traces, _observations = plan_following_run(ticks=3)
+    report = evaluate([run_of(traces, [])], context=context)
+    bands = {
+        group.value
+        for group in report.segments[0].groups
+        if group.kind is GroupKind.ROOM_TEMPERATURE_BAND
+    }
+
+    assert bands == {"unknown"}
+
+
+def test_percentiles_use_nearest_rank_and_never_invent_a_value() -> None:
+    """percentile は入力に**実在する値**を返す（補間すると足し算の順序で揺れる）。"""
+    summary = summarize([1.0, 2.0, 3.0, 4.0], quantiles=(0.95, 0.99))
+    assert summary is not None
+    assert [item.value for item in summary.percentiles] == [4.0, 4.0]
+    assert summary.minimum == 1.0 and summary.maximum == 4.0
+
+
+def test_hunting_ignores_changes_inside_the_deadband() -> None:
+    """不感帯の中の揺れを「向きの反転」に数えない。"""
+    noisy = [(0, 0.50), (1_000, 0.505), (2_000, 0.50), (3_000, 0.505)]
+    swinging = [(0, 0.2), (1_000, 0.8), (2_000, 0.2), (3_000, 0.8)]
+
+    assert (shape_of(noisy, deadband=0.02) or _never_shape()).reversals == 0
+    assert (shape_of(swinging, deadband=0.02) or _never_shape()).reversals == 2
+
+
+def _never_shape():  # pragma: no cover - 到達しない
+    raise AssertionError("shape_of は点があれば必ず返す")
+
+
+def test_a_single_sample_has_no_hunting_rate() -> None:
+    """時間の幅が 0 のときに、0 除算を大きな数で埋め合わせない。"""
+    shape = shape_of([(0, 0.5)], deadband=0.01)
+    assert shape is not None
+    assert shape.reversals_per_hour is None and shape.step is None
+
+
+def test_optimizer_latency_and_timeout_rate_come_from_the_record(
+    context: EvaluationContext,
+) -> None:
+    """optimizer の latency / timeout を**記録から**数える（受入基準の指標）。"""
+    traces = [
+        trace_of(
+            tick_at(
+                TICK_TS_MS + index * STEP_MS,
+                index,
+                cf=counterfactual(
+                    action_ts_ms=TICK_TS_MS + index * STEP_MS,
+                    status=OptimizerStatus.TIMEOUT if index == 3 else OptimizerStatus.OK,
+                    latency_ms=100 + index,
+                ),
+            )
+        )
+        for index in range(4)
+    ]
+    report = evaluate([run_of(traces, [])], context=context)
+    optimizer = overall(report).counterfactual[0].optimizer
+
+    assert optimizer is not None
+    assert optimizer.samples == 4 and optimizer.timeout == 1
+    assert optimizer.timeout_rate == pytest.approx(0.25)
+    assert optimizer.latency_ms is not None and optimizer.latency_ms.maximum == 103.0
+
+
+def test_air_balance_uses_the_same_ratio_as_the_air_balance_model(
+    context: EvaluationContext,
+) -> None:
+    """吸排気比の定義を `AirBalanceEstimate.balance_ratio` と揃える。"""
+    traces = [
+        trace_of(tick_at(TICK_TS_MS + index * STEP_MS, index, flow=2.0)) for index in range(3)
+    ]
+    report = evaluate([run_of(traces, [])], context=context)
+    balance = overall(report).applied[0].air_balance
+
+    assert balance is not None
+    # 3 zone とも同じ推定風量なので (rear + top) / front = 2.0
+    assert balance.ratio.mean == pytest.approx(2.0)
+    assert balance.ticks_without_ratio == 0
+
+
+def test_underprediction_is_the_direction_where_reality_is_hotter(
+    context: EvaluationContext,
+) -> None:
+    """`error = 実測 - 予測`。**正の側**が冷却の足りない外し方である。"""
+    traces, observations = plan_following_run(ticks=6)
+    hot = [
+        observation(item.metric, item.ts_ms, 60.0) if item.metric == GPU else item
+        for item in observations
+    ]
+    rows = tuple(shadow_rows(traces, observations=hot, matcher=context.matcher()))
+    scored = [outcome for row in rows for outcome in row.outcomes if outcome.scored]
+
+    assert scored, "plan どおりに適用された区間があれば採点できる"
+    assert all(match.error is not None and match.error > 0 for match in scored[0].matches)
+
+
+# ------------------------------------------------- 1コマンドで再現できる
+
+
+def test_the_cli_writes_a_deterministic_report(tmp_path: Path) -> None:
+    """**1コマンド/再現可能な設定で比較レポートを生成できる**（受入基準）。"""
+    from coldaisle.clock import SimulatedClock
+    from coldaisle.store import QualityRules, SqliteStore
+    from coldaisle.store.models import Reading, Sample
+
+    directory = tmp_path / "pr91-cli-config"
+    directory.mkdir()
+    write_documents(directory, valid_documents())
+    db = tmp_path / "pr91.db"
+    traces, observations = plan_following_run(ticks=6)
+    clock = SimulatedClock(TICK_TS_MS + 100 * STEP_MS)
+    with SqliteStore(
+        db, rules=QualityRules.from_yaml(ROOT / "config" / "quality.yaml"), clock=clock
+    ) as store:
+        for trace in traces:
+            store.record_control_trace(
+                ts_ms=trace.ts_ms,
+                tick_id=trace.tick_id,
+                schema_version=trace.schema_version,
+                trace_json=trace.trace_json,
+            )
+        by_time: dict[int, list[Reading]] = {}
+        for item in observations:
+            by_time.setdefault(item.ts_ms, []).append(
+                Reading(metric=item.metric, value=item.value, quality=item.quality)
+            )
+        store.insert_samples(
+            Sample(ts_ms=ts_ms, readings=tuple(readings))
+            for ts_ms, readings in sorted(by_time.items())
+        )
+
+    manifest = tmp_path / "pr91-runs.yaml"
+    manifest.write_text(
+        yaml.safe_dump(
+            {
+                "schema_version": 1,
+                "runs": [
+                    {
+                        "run_id": "pr91-cli",
+                        "start_ms": TICK_TS_MS,
+                        "end_ms": TICK_TS_MS + 20 * STEP_MS,
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    out = tmp_path / "pr91-report.json"
+    argv = [
+        "--runs",
+        str(manifest),
+        "--db",
+        str(db),
+        "--config",
+        str(EVALUATION_YAML),
+        "--control-config",
+        str(directory),
+        "--metrics",
+        str(METRICS_YAML),
+        "--quality-rules",
+        str(ROOT / "config" / "quality.yaml"),
+        "--out",
+        str(out),
+    ]
+
+    assert main(argv) == 0
+    first = out.read_text(encoding="utf-8")
+    assert main(argv) == 0
+    assert out.read_text(encoding="utf-8") == first
+
+    document = json.loads(first)
+    assert document["schema_version"] == 1
+    assert document["segments"][0]["run_id"] == "pr91-cli"
+    assert "generated_at" not in document
+
+
+def test_the_run_manifest_refuses_an_inverted_window(tmp_path: Path) -> None:
+    """時刻の向きが逆の run を受け取らない。"""
+    path = tmp_path / "pr91-bad-runs.yaml"
+    path.write_text(
+        yaml.safe_dump(
+            {
+                "schema_version": 1,
+                "runs": [{"run_id": "pr91", "start_ms": 10, "end_ms": 5}],
+            }
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(ValidationError, match="start_ms < end_ms"):
+        RunsManifest.from_file(path)
+
+
+def test_build_context_reads_the_shipped_configuration(tmp_path: Path) -> None:
+    """出荷している `config/evaluation.yaml` と `config/metrics.yaml` で組み立てられる。"""
+    directory = tmp_path / "pr91-shipped"
+    directory.mkdir()
+    write_documents(directory, valid_documents())
+    built = build_context(
+        config_path=EVALUATION_YAML,
+        control_dir=directory,
+        metrics_path=METRICS_YAML,
+        acoustic_path=None,
+    )
+
+    assert built.deltas and all(delta.minuend for delta in built.deltas)
+    assert built.config.schema_version == 1
+
+
+def test_temperature_and_margin_come_from_the_safety_contract(
+    context: EvaluationContext,
+) -> None:
+    """threshold margin の閾値は `safety.yaml` の値そのもの（評価設定に写さない）。"""
+    traces, observations = plan_following_run(ticks=4)
+    report = evaluate([run_of(traces, observations)], context=context)
+    temperature: TemperatureReport = overall(report).applied[0].temperatures[0]
+    ceiling = context.control.safety.absolute_temp_ceiling_c.value
+
+    assert temperature.threshold_c == ceiling
+    assert temperature.margin.minimum == pytest.approx(ceiling - temperature.values.maximum)
+    assert temperature.exceedances == 0

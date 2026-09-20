@@ -127,7 +127,7 @@ GPU機どころか ESP32 すら接続せずに #8〜#25 のすべてが開発・
 | #87 | Workload Regime推定: IDLE / TRANSIENT / SUSTAINED / COOLDOWN / UNKNOWN | M9 | **未反映**: PR #124 は stacked base `feat/80-reactive-guard` へ、同 branch が main に入った後にマージされたため main に届いていない。main への取り込みは PR #133（レビュー中） |
 | #88 | Supervisor Interface: RulePolicy / RLPolicy / ShadowRLPolicy | M9 | 実装中（PR 未作成、#87 の main 反映（PR #133）待ち） |
 | #90 | Control Shadow Mode / Counterfactual logging | M9 | |
-| #91 | Offline Evaluation: Baseline vs MPC vs Guard vs Supervisor | M9 | |
+| #91 | Offline Evaluation: Baseline vs MPC vs Guard vs Supervisor | M9 | レビュー中（決定記録 0054 は Proposed。所有者の承認待ち。RL 比較は #89 後） |
 | #92 | Authority Rollout: Shadow → 制限付き → Full Authority | M9 | |
 | #105 | RL Supervisor学習基盤: learned simulator / offline RL environment | M9 | |
 | #89 | RL Supervisor: 戦略・目的関数weightの最適化 | M9 | |

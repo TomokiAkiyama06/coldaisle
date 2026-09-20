@@ -1,0 +1,68 @@
+# Offline Evaluation の設定（#91 / 決定記録 0054 §2.8）
+#
+# **すべて実測前の暫定値（provisional）。** 確定には基準となる測定が要る。
+# コード側に既定値は無いので、ここを消すと評価は動かない（AGENTS.md ルール9）。
+#
+# **ほかの契約が持つ値をここへ写さない**（0054 §2.6）。
+#   - 絶対温度上限  : config/safety.yaml の absolute_temp_ceiling_c
+#   - ΔT の式       : config/metrics.yaml の derived
+#   - 照合の許容幅  : config/fan-policy.yaml の shadow
+
+schema_version: 1
+
+# 平均・percentile・最大と threshold margin を出す温度。閾値は safety.yaml から取る。
+temperature_metrics:
+  - gpu.0.core
+  - gpu.0.hotspot
+  - cpu.package
+
+# ΔT（GPU 吸気 / ケース内予熱）。名前だけを書き、式は config/metrics.yaml から引く。
+delta_metrics:
+  - d.intake_rise
+  - d.gpu_preheat
+  - d.gpu_delta
+
+# 室温帯を決める metric。
+room_temperature_metric: air.room
+
+# 観測を tick へ結び付けるときの許容幅。1つの規則をすべての metric に使う。
+observation_match_tolerance_ms:
+  value: 15000
+  status: provisional
+
+# 出力する上位 percentile（nearest-rank）。
+percentiles: [0.95, 0.99]
+
+# 室温の帯。**最後の帯だけ上限を持たない。**
+room_temperature_bands:
+  - name: cool
+    below_c: {value: 22.0, status: provisional}
+  - name: mild
+    below_c: {value: 27.0, status: provisional}
+  - name: warm
+    below_c: {value: 32.0, status: provisional}
+  - name: hot
+
+# ハンチング（向きの反転）を数えるときの不感帯。
+hunting:
+  demand_deadband: {value: 0.02, status: provisional}
+  rpm_deadband: {value: 40.0, status: provisional}
+
+# worst-case として必ず並べる件数。
+worst_case_count: 3
+
+# rollout gate。**Safety が先に立ち、ほかの段では覆らない**（0054 §2.4）。
+gate:
+  safety:
+    maximum_ceiling_exceedances: {value: 0, status: provisional}
+    maximum_emergency_ticks: {value: 0, status: provisional}
+    maximum_fault_ticks: {value: 0, status: provisional}
+    minimum_threshold_margin_c: {value: 5.0, status: provisional}
+    maximum_floor_shortfalls: {value: 0, status: provisional}
+  evidence:
+    minimum_identifiable_fraction: {value: 0.2, status: provisional}
+    minimum_scored_outcomes: {value: 50, status: provisional}
+  cost:
+    maximum_underprediction_c: {value: 3.0, status: provisional}
+    maximum_optimizer_timeout_rate: {value: 0.02, status: provisional}
+    maximum_optimizer_latency_ms: {value: 400, status: provisional}

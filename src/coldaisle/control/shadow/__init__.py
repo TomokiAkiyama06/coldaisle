@@ -12,6 +12,7 @@ from coldaisle.control.shadow.export import (
     ShadowExportRow,
     applied_action_timeline,
     counterfactual_controllers,
+    read_shadow_jsonl,
     shadow_rows,
     write_shadow_jsonl,
 )
@@ -44,6 +45,7 @@ __all__ = [
     "ShadowRecorder",
     "applied_action_timeline",
     "counterfactual_controllers",
+    "read_shadow_jsonl",
     "shadow_plan",
     "shadow_prediction",
     "shadow_rows",
