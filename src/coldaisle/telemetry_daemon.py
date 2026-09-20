@@ -241,26 +241,40 @@ def build(
     設定ファイルには申告させない。``NvmlAdapter(api=...)`` のように実クラスのまま中身を
     差し替えられるため、クラスでは判別できないため。
 
-    - ``adapters`` を渡さない（CLI からの通常の起動）→ ``hardware``
+    - ``adapters`` を渡さない（``None``。CLI からの通常の起動）→ ``hardware``
     - ``adapters`` を渡す → 呼び出し側が ``source_kind`` を**必ず明示する**。
       既定を ``hardware`` にすると、試験の偽 adapter が黙って「実機」を名乗る
+
+    **``None`` と空の tuple を同じに扱わない。** 空で渡されたときに実 adapter へ
+    落とすと、``source_kind="mock"`` のまま実機の値を記録してしまう。収集対象が
+    無い daemon は書くものが無く、入力を止めたいなら設定側の ``enabled`` を使うので、
+    空の ``adapters`` は拒否する。
     """
     if adapters is None:
         if source_kind is not None:
             # 実 adapter を組むのはこの関数自身なので、種類を外から名乗らせない
             raise ValueError("adapters を渡さないときの source_kind は build が決める")
         source_kind = TelemetrySourceKind.HARDWARE
-    elif source_kind is None:
-        raise ValueError("adapters を渡すときは source_kind を明示する")
+    else:
+        if source_kind is None:
+            raise ValueError("adapters を渡すときは source_kind を明示する")
+        if not adapters:
+            raise ValueError("adapters を空で渡さない（無効化は設定の enabled で行う）")
     telemetry = InternalTelemetryConfig.from_yaml(
         config.telemetry, catalog=MetricCatalog.from_yaml(config.metrics)
     )
     _log_configuration(telemetry)
     used_clock = clock or WallClock()
-    used_adapters = adapters or (
-        NvmlAdapter(telemetry.nvml),
-        HwmonAdapter(telemetry.hwmon),
-        ProcStatAdapter(telemetry.proc_stat),
+    # `adapters or (...)` にしない。空の tuple が実 adapter へ落ちると、
+    # 名乗った種類（mock）と実際に読む先が食い違う
+    used_adapters = (
+        (
+            NvmlAdapter(telemetry.nvml),
+            HwmonAdapter(telemetry.hwmon),
+            ProcStatAdapter(telemetry.proc_stat),
+        )
+        if adapters is None
+        else adapters
     )
     rules = QualityRules.from_yaml(config.quality_rules)
     # 既定の `var/` は追跡されていない。ingest daemon / rollup と同じく、無ければ作る

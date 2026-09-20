@@ -250,6 +250,27 @@ def test_building_with_adapters_uses_the_given_source_kind(tmp_path: Path):
         daemon.store.close()
 
 
+def test_an_empty_adapter_set_is_rejected(tmp_path: Path):
+    """空の tuple を「渡していない」扱いにしない（Codex P2）。
+
+    `adapters or (...)` だと空の tuple が実 adapter へ落ち、`mock` と名乗ったまま
+    実機の NVML / hwmon / /proc/stat を読んだ値を記録してしまう。
+    """
+    with pytest.raises(ValueError, match="空"):
+        build(
+            _telemetry_config(tmp_path),
+            clock=SimulatedClock(0),
+            adapters=(),
+            source_kind=TelemetrySourceKind.MOCK,
+        )
+
+
+def test_an_empty_adapter_set_is_rejected_before_the_kind_is_checked(tmp_path: Path):
+    """空の tuple は `source_kind` の有無に関わらず実 adapter へ落とさない。"""
+    with pytest.raises(ValueError, match="source_kind"):
+        build(_telemetry_config(tmp_path), clock=SimulatedClock(0), adapters=())
+
+
 def test_the_source_kind_of_the_real_adapters_is_not_named_from_outside(tmp_path: Path):
     """実 adapter を組むのは build 自身。外から種類を名乗らせない。"""
     with pytest.raises(ValueError, match="source_kind"):

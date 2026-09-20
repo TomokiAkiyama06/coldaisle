@@ -157,6 +157,18 @@ const FAN_SERIES = [
 
 const ALL_SERIES = [...GROUPS.flatMap((group) => group.items), ...FAN_SERIES];
 
+// 見出し・凡例の札の対象にする、**内部テレメトリ（coldaisle-telemetry）が書く**値。
+// **新しい表を作らない。** 上の表から組み立て、取り込み経路（air.*）は
+// airflow-status.js が除く。`/api/v1/latest` を丸ごと走査すると、取り込みデーモンが書く
+// `sys.device_restarts` のような値だけで「実測」と言ってしまう（決定記録 0049 §2.5）
+const TELEMETRY_METRICS = [
+  ...ZONES.flatMap((zone) => [zone.rpm, zone.pwm]),
+  ...HEAT_SOURCES.flatMap((source) => [source.util, source.temp, source.power]),
+  ...REFERENCE.map((item) => item.metric),
+  ...ALL_SERIES.map((series) => series.metric),
+  ...window.ColdaisleAirflowStatus.GPU_THROTTLE_METRICS,
+].filter((metric) => typeof metric === "string");
+
 // ---------------------------------------------------------------- 状態
 
 const page = {
@@ -348,7 +360,8 @@ function telemetryKind() {
   return window.ColdaisleAirflowStatus.telemetrySummaryKind(
     page.telemetrySource,
     page.latest,
-    Boolean(page.mockName)
+    Boolean(page.mockName),
+    TELEMETRY_METRICS
   );
 }
 
@@ -398,7 +411,12 @@ function renderControl() {
   document.getElementById("control-note").textContent = control
     ? "制御の状態は模擬データです。実際の制御とは関係ありません。"
     : "制御の状態は未接続です。制御デーモンの判断記録（#74 / #82）を読む API がまだ無いため表示していません。" +
-      window.ColdaisleAirflowStatus.measuredNote(displaySource(), page.telemetrySource, page.latest);
+      window.ColdaisleAirflowStatus.measuredNote(
+        displaySource(),
+        page.telemetrySource,
+        page.latest,
+        TELEMETRY_METRICS
+      );
 
   const alert = control && control.alert;
   const box = document.getElementById("control-alert");

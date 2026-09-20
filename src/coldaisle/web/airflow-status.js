@@ -84,11 +84,15 @@
     "air.top_exhaust",
     "air.rear_exhaust",
   ];
+  // 取り込みデーモンが書く数え上げ（channels.py の DROPPED_SAMPLES / DEVICE_RESTART /
+  // QUEUE_DROPS_METRIC）。この画面は出していないが、`/api/v1/latest` には並ぶ。
+  // **内部テレメトリの値として数えない**（新しい行1つで「実測」と言わないため）
+  const INGEST_COUNTERS = ["sys.dropped_samples", "sys.device_restarts", "sys.queue_drops"];
   const TELEMETRY_KIND = "読み取り値";
 
   /** 取り込みデーモン（health.source の経路）が書くメトリクスか。 */
   function isIngestMetric(metric) {
-    return INGEST_METRICS.includes(metric);
+    return INGEST_METRICS.includes(metric) || INGEST_COUNTERS.includes(metric);
   }
 
   // 内部テレメトリの**いま届いている値**に付ける短い語（決定記録 0049 §2.5）。
@@ -133,14 +137,19 @@
   /**
    * 見出し・凡例に出す内部テレメトリの札。**いま届いている値の出どころ**として書く。
    * 届いている内部テレメトリの値が1つも無ければ「読み取り値」、health 未着なら「確認中」。
+   *
+   * **`metrics` は内部テレメトリが書くメトリクスだけを渡す**（呼び出し側の表から組み立てる。
+   * airflow.js の `TELEMETRY_METRICS`）。`/api/v1/latest` を丸ごと走査すると、取り込み
+   * デーモンが書く `sys.device_restarts` などの新しい行だけで「実測」と言ってしまう。
+   * 渡されなかった場合は何も届いていない扱い（安全側。「実測」とは言わない）。
    */
-  function telemetrySummaryKind(telemetrySource, latest, mock) {
+  function telemetrySummaryKind(telemetrySource, latest, mock, metrics) {
     if (mock) return "模擬";
     if (telemetrySource === undefined) return "確認中";
-    const metrics = (latest && latest.metrics) || {};
-    for (const metric of Object.keys(metrics)) {
-      if (isIngestMetric(metric)) continue;
-      if (delivered(metrics[metric])) return telemetryKind(telemetrySource, metrics[metric]);
+    for (const metric of Array.isArray(metrics) ? metrics : []) {
+      if (isIngestMetric(metric)) continue; // 取り込み経路の値は health.source の札
+      const item = latestItem(latest, metric);
+      if (delivered(item)) return telemetryKind(telemetrySource, item);
     }
     return TELEMETRY_KIND;
   }
@@ -178,8 +187,8 @@
   const TELEMETRY_HISTORY_NOTE = "古い値とグラフの過去の値の出どころは表示しません。";
 
   /** 内部テレメトリの注記。**いま届いている値**についてだけ出どころを言う。 */
-  function telemetryNote(telemetrySource, latest) {
-    const kind = telemetrySummaryKind(telemetrySource, latest, false);
+  function telemetryNote(telemetrySource, latest, metrics) {
+    const kind = telemetrySummaryKind(telemetrySource, latest, false, metrics);
     if (kind === "実測") {
       return `${TELEMETRY}のいま届いている値は実機の読み取り値です。${TELEMETRY_HISTORY_NOTE}`;
     }
@@ -193,12 +202,12 @@
   }
 
   /** 値の出どころの注記（実データ表示のとき）。経路ごとに書き分ける。 */
-  function measuredNote(source, telemetrySource, latest) {
+  function measuredNote(source, telemetrySource, latest, metrics) {
     let air;
     if (source === undefined) air = `${AIR}の出どころを確認中です。`;
     else if (Object.prototype.hasOwnProperty.call(AIR_NOTES, source)) air = AIR_NOTES[source];
     else air = `${AIR}の出どころは不明です（実機の実測値とは限りません）。`;
-    return `${air}${telemetryNote(telemetrySource, latest)}`;
+    return `${air}${telemetryNote(telemetrySource, latest, metrics)}`;
   }
 
   /**
@@ -223,6 +232,7 @@
     telemetrySummaryKind,
     metricKind,
     INGEST_METRICS,
+    INGEST_COUNTERS,
     usablePoints,
     GPU_THROTTLE_METRICS: [...THERMAL, ...POWER, ...SLOWDOWN].map(([metric]) => metric),
   };

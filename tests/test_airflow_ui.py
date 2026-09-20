@@ -24,7 +24,12 @@ from pydantic import ValidationError
 
 from coldaisle.api.airflow import AirflowUiSettings
 from coldaisle.api.app import WEB_ROOT, Config, create_app
-from coldaisle.channels import CHANNEL_TO_METRIC
+from coldaisle.channels import (
+    CHANNEL_TO_METRIC,
+    DEVICE_RESTART_METRIC,
+    DROPPED_SAMPLES_METRIC,
+    QUEUE_DROPS_METRIC,
+)
 from coldaisle.clock import SimulatedClock
 from coldaisle.internal_telemetry import (
     SOURCE_STATE_PREFIX,
@@ -619,7 +624,9 @@ def test_the_measured_note_waits_for_health():
 def test_the_control_note_does_not_claim_measured_values():
     script = _text(SCRIPT)
     control = script[script.index("function renderControl()") :][:1500]
-    assert "measuredNote(displaySource(), page.telemetrySource, page.latest)" in control
+    assert "measuredNote(" in control
+    for argument in ("displaySource()", "page.telemetrySource", "page.latest", "TELEMETRY_METRICS"):
+        assert argument in control
     assert "使用率は実測値です" not in script
 
 
@@ -645,6 +652,23 @@ def test_the_ingest_metrics_match_the_channel_table():
     script = _text(STATUS)
     listed = re.findall(r'"(air\.[a-z_]+)"', script)
     assert sorted(listed) == sorted(CHANNEL_TO_METRIC.values())
+
+
+def test_the_ingest_counters_match_the_channel_table():
+    """`sys.*` の数え上げも取り込み経路。名前は channels.py（正本）を写す。"""
+    listed = re.findall(r'"(sys\.[a-z_]+)"', _text(STATUS))
+    assert sorted(listed) == sorted(INGEST_COUNTERS)
+
+
+@pytest.mark.parametrize(
+    "metric", sorted({DROPPED_SAMPLES_METRIC, DEVICE_RESTART_METRIC, QUEUE_DROPS_METRIC})
+)
+def test_the_ingest_counters_are_not_labelled_as_internal_telemetry(metric):
+    """取り込みの数え上げに内部テレメトリの札を付けない（経路が違う）。"""
+    latest = _latest({metric: _ok(1.0)})
+    assert _status_call("metricKind", metric, "serial", False, "hardware", latest) == "実測"
+    assert _status_call("metricKind", metric, "mock", False, "hardware", latest) == "模擬"
+    assert _status_call("metricKind", metric, None, False, "hardware", latest) == "出どころ不明"
 
 
 @pytest.mark.parametrize("source", ["serial", "mock", "replay", None, "something-new"])
@@ -682,7 +706,9 @@ def test_mock_query_makes_every_value_mock(metric):
 
 @pytest.mark.parametrize("source", ["serial", "mock", "replay", None])
 def test_the_measured_note_separates_internal_telemetry(source):
-    note = _status_call("measuredNote", source, None, _latest({"fan.front.pwm": _ok(48.0)}))
+    note = _status_call(
+        "measuredNote", source, None, _latest({"fan.front.pwm": _ok(48.0)}), [TELEMETRY_METRIC]
+    )
     assert isinstance(note, str)
     assert "空気の温度" in note
     assert "内部テレメトリの読み取り値" in note
@@ -739,6 +765,12 @@ def _latest(metrics: dict[str, dict[str, object]]) -> dict[str, object]:
 
 
 TELEMETRY_METRIC = "fan.front.pwm"
+
+# 取り込みデーモン（`coldaisle-daemon`）が書くメトリクス。**出どころの札の経路が違う。**
+# 名前は channels.py（正本）から取る
+INGEST_METRICS = set(CHANNEL_TO_METRIC.values())
+INGEST_COUNTERS = {DROPPED_SAMPLES_METRIC, DEVICE_RESTART_METRIC, QUEUE_DROPS_METRIC}
+INGEST_COUNTER = DEVICE_RESTART_METRIC
 
 
 @pytest.mark.parametrize(
@@ -800,32 +832,126 @@ def test_a_stale_telemetry_value_is_not_labelled_by_the_current_kind():
     )
 
 
+TELEMETRY_METRICS = [TELEMETRY_METRIC, "gpu.0.core"]
+
+
 def test_the_heading_label_follows_the_delivered_values():
     """見出し・凡例は「いま届いている値の出どころ」。1つも届いていなければ中立。"""
     delivered = _latest({TELEMETRY_METRIC: _ok(48.0)})
-    assert _status_call("telemetrySummaryKind", "hardware", delivered, False) == "実測"
-    assert _status_call("telemetrySummaryKind", "mock", delivered, False) == "模擬"
-    assert _status_call("telemetrySummaryKind", None, delivered, False) == "読み取り値"
+    for kind, label in [("hardware", "実測"), ("mock", "模擬"), (None, "読み取り値")]:
+        assert _status_call("telemetrySummaryKind", kind, delivered, False, TELEMETRY_METRICS) == (
+            label
+        )
 
     nothing = _latest({TELEMETRY_METRIC: {"value": 48.0, "quality": "stale"}})
-    assert _status_call("telemetrySummaryKind", "hardware", nothing, False) == "読み取り値"
-    assert _status_call("telemetrySummaryKind", "hardware", _latest({}), False) == "読み取り値"
+    assert _status_call("telemetrySummaryKind", "hardware", nothing, False, TELEMETRY_METRICS) == (
+        "読み取り値"
+    )
+    assert _status_call(
+        "telemetrySummaryKind", "hardware", _latest({}), False, TELEMETRY_METRICS
+    ) == ("読み取り値")
 
 
 def test_the_heading_label_ignores_the_ingest_metrics():
     """空気の温度が届いていても、内部テレメトリの札にはしない（経路が違う）。"""
     air_only = _latest({"air.room": _ok(24.5)})
-    assert _status_call("telemetrySummaryKind", "hardware", air_only, False) == "読み取り値"
+    assert (
+        _status_call(
+            "telemetrySummaryKind", "hardware", air_only, False, [*TELEMETRY_METRICS, "air.room"]
+        )
+        == "読み取り値"
+    )
+
+
+def test_the_heading_label_ignores_metrics_the_ingest_daemon_writes():
+    """取り込みデーモンの数え上げ（`sys.device_restarts` など）で「実測」と言わない（Codex P2）。
+
+    `/api/v1/latest` は取り込み経路の行も持つ。丸ごと走査すると、内部テレメトリが
+    すべて古くても、新しい `sys.*` の行1つで見出しが「実測」になってしまう。
+    """
+    latest = _latest(
+        {
+            INGEST_COUNTER: _ok(1.0),
+            TELEMETRY_METRIC: {"value": 48.0, "quality": "stale"},
+        }
+    )
+    assert _status_call("telemetrySummaryKind", "hardware", latest, False, TELEMETRY_METRICS) == (
+        "読み取り値"
+    )
+    assert "実測" not in str(_status_call("telemetryNote", "hardware", latest, TELEMETRY_METRICS))
+
+
+def test_the_heading_label_needs_the_metric_list():
+    """一覧を渡されなければ「届いていない」扱い（安全側。実測とは言わない）。"""
+    delivered = _latest({TELEMETRY_METRIC: _ok(48.0)})
+    assert _status_call("telemetrySummaryKind", "hardware", delivered, False, None) == "読み取り値"
+
+
+def _page_telemetry_metrics() -> list[str]:
+    """airflow.js の `TELEMETRY_METRICS` を node で**実際に組み立てて**取り出す。
+
+    文字列の検査ではなく評価する。表から組み立てる式を壊したときに気づけるようにするため。
+    """
+    code = (
+        "const fs = require('fs');const vm = require('vm');"
+        "const src = fs.readFileSync(process.argv[2], 'utf8');"
+        "const start = src.indexOf('const TELEMETRY_METRICS');"
+        "const end = src.indexOf(');', src.indexOf('.filter(', start)) + 2;"
+        "const context = { window: { ColdaisleAirflowStatus: require(process.argv[1]) }, console };"
+        "vm.runInNewContext("
+        "  src.slice(0, end) + ';console.log(JSON.stringify(TELEMETRY_METRICS));', context);"
+    )
+    done = subprocess.run(
+        [_node(), "-e", code, str(STATUS), str(SCRIPT)],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    metrics: list[str] = json.loads(done.stdout)
+    return metrics
+
+
+def test_the_page_counts_only_internal_telemetry_metrics():
+    """見出しの対象は内部テレメトリが書く値だけ。取り込みデーモンが書く値を混ぜない。"""
+    counted = set(_page_telemetry_metrics()) - set(INGEST_METRICS)
+    assert counted, "対象が空だと見出しが常に「読み取り値」になる"
+    assert counted.isdisjoint(INGEST_METRICS)
+    assert counted.isdisjoint(INGEST_COUNTERS)
+    # 画面が内部テレメトリとして読んでいる代表例が入っていること
+    assert {"fan.front.pwm", "fan.top.rpm", "cpu.utilization", "gpu.0.core"} <= counted
+
+
+def test_the_page_builds_the_metric_list_from_its_own_tables():
+    """**新しい表を作らない。** 一覧はメトリクス名を直接書かず、上の表から組み立てる。"""
+    script = _text(SCRIPT)
+    block = script[script.index("const TELEMETRY_METRICS") :]
+    block = block[: block.index(".filter(")]
+    assert not METRIC_LITERAL.findall(block), "メトリクス名を並べ直さない（表から組み立てる）"
+    for table in ("ZONES", "HEAT_SOURCES", "REFERENCE", "ALL_SERIES"):
+        assert table in block
+    render = script[
+        script.index("function renderSource()") : script.index("function renderControl()")
+    ]
+    assert "telemetryKind()" in render
+    assert "TELEMETRY_METRICS" in script[script.index("function telemetryKind()") :][:400]
 
 
 def test_the_heading_label_waits_for_health():
     code = (
         "const s = require(process.argv[1]);"
         "const latest = JSON.parse(process.argv[2]);"
-        "console.log(JSON.stringify(s.telemetrySummaryKind(undefined, latest, false)));"
+        "const metrics = JSON.parse(process.argv[3]);"
+        "console.log(JSON.stringify(s.telemetrySummaryKind(undefined, latest, false, metrics)));"
     )
     done = subprocess.run(
-        [_node(), "-e", code, str(STATUS), json.dumps(_latest({TELEMETRY_METRIC: _ok(48.0)}))],
+        [
+            _node(),
+            "-e",
+            code,
+            str(STATUS),
+            json.dumps(_latest({TELEMETRY_METRIC: _ok(48.0)})),
+            json.dumps(TELEMETRY_METRICS),
+        ],
         capture_output=True,
         text=True,
         check=True,
@@ -835,7 +961,7 @@ def test_the_heading_label_waits_for_health():
 
 def test_the_mock_query_wins_over_the_source_kind():
     delivered = _latest({TELEMETRY_METRIC: _ok(48.0)})
-    assert _status_call("telemetrySummaryKind", "hardware", delivered, True) == "模擬"
+    assert _status_call("telemetrySummaryKind", "hardware", delivered, True, []) == "模擬"
 
 
 @pytest.mark.parametrize(
@@ -847,7 +973,9 @@ def test_the_mock_query_wins_over_the_source_kind():
     ],
 )
 def test_the_telemetry_note_speaks_only_about_delivered_values(kind, expected):
-    note = _status_call("telemetryNote", kind, _latest({TELEMETRY_METRIC: _ok(48.0)}))
+    note = _status_call(
+        "telemetryNote", kind, _latest({TELEMETRY_METRIC: _ok(48.0)}), TELEMETRY_METRICS
+    )
     assert isinstance(note, str)
     assert expected in note
     # **過去の値の出どころは表示しない**（模擬の adapter で書いた区間が履歴に混ざりうる）
@@ -856,7 +984,9 @@ def test_the_telemetry_note_speaks_only_about_delivered_values(kind, expected):
 
 def test_the_telemetry_note_does_not_claim_the_past():
     """グラフの点を「実測値」と言い切らない（決定記録 0049 が 0051 §2.3 の文言を置き換える）。"""
-    note = _status_call("telemetryNote", "hardware", _latest({TELEMETRY_METRIC: _ok(48.0)}))
+    note = _status_call(
+        "telemetryNote", "hardware", _latest({TELEMETRY_METRIC: _ok(48.0)}), TELEMETRY_METRICS
+    )
     assert "実測値" not in note
     assert "過去" in note
 
