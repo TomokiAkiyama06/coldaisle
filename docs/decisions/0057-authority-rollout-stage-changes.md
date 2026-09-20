@@ -116,16 +116,31 @@ checksum も「いまの時刻」も文字列や数値で受け取らない。�
 **発行済みの `ArtifactAttestation` も受け取らない**（codex #4056942797）。
 `production_active` は attestation を発行した瞬間の写しでしかないので、A の attestation と
 A の報告を持っていれば、B が production になったあとでも昇格できてしまう。
-`raise_stage()` は **exclusive lock の中で** `ModelRegistry.inspect()` を読み、
+`inspect()` は戻るときに registry の lock を手放すので、**読んでから書くまでの間に
+別 process が promote できる**（codex #4056968492）。`raise_stage()` は
+`ModelRegistry.pinned()` で **registry の lock を握ったまま**次を行う。
 
 1. その kind の production pointer が指す artifact の metadata を取り、
-2. 承認・証拠の検証をすべて済ませ、
-3. **書き込む直前にもう一度読んで** registry revision と artifact が動いていないことを確かめる
+2. authority の lock を取って journal を読み、
+3. 承認・証拠の検証をすべて済ませ、
+4. lock を握ったまま読み直して registry revision と artifact が動いていないことを確かめ、
+5. journal を書く
 
-という順で進む。検証の途中で production が動いていたら、その昇格はもう「いまの
-production」についての判断ではないので拒む（やり直す）。
+`pinned()` を抜けるまで production は動かないので、「この artifact が production である」は
+**書いた瞬間に真**である。4 は lock が効いていることの確認で、動いていたら書かずに止める。
 あわせて `approval.to_stage` が、その artifact の `authority_compatibility` に
 含まれることも確かめる。
+
+#### lock の順序
+
+**必ず Registry → Authority の順で取る。** 逆順で取る経路はどこにも無い
+（Registry は authority の lock を一切取らず、authority が registry の lock を取るのは
+`raise_stage()` のこの1箇所だけで、そこでは authority の lock をまだ持っていない）。
+順序が全順序なので deadlock しない。
+
+**降格は registry の lock を取らない。** `lower_stage()` / `rollback_to_baseline()` は
+registry を一切見ないので、registry が壊れていても、誰かが握っていても、
+**安全側へは常に動ける**（試験で確かめる）。
 
 #### #104 と #92 の境界
 
@@ -201,10 +216,14 @@ production」についての判断ではないので拒む（やり直す）。
 FULL → EXPANDED → LIMITED → SHADOW と連鎖する。**1回の超えで1段だけ下げる。**
 OOD / 低 confidence の件数は降格のたびに数え直すので、同じ理由で連鎖しない。
 
-**適用は永続化の成否に依存しない。** 先に in-memory の上限を下げ、そのあとで journal へ
-書く。書けなくても下げたままにして、失敗の理由を trace と runtime の状態に残す。
-書けなかったら元へ戻す実装だと、disk が一杯な間ほど高い authority で回り続ける。
-**読み直し（`reload()`）でも戻らない。** 戻るなら、降格を「読むだけ」で取り消せてしまう。
+**適用は永続化の成否に依存しない。** 書けた降格は journal がそのまま表し、
+**書けなかった降格だけ**を in-memory の上限として持つ。書けなかったら元へ戻す実装だと、
+disk が一杯な間ほど高い authority で回り続ける。記録の無い上限は
+**読み直し（`reload()`）でも外れない。** 外れるなら、降格を「読むだけ」で取り消せてしまう。
+
+**in-memory の上限を、書けた降格にまで持たせない**（codex #4056968495）。二重に持つと、
+記録に残った降格のあとで承認された昇格が、process を作り直すまで効かなくなる。
+書けた降格は journal にあるので、`reload()` がそのまま正しい stage を返す。
 
 下がったあとに自動で戻る経路は無い。戻すには 2.3 の承認が要る。
 
@@ -242,10 +261,11 @@ v8 からの移行は自動補完せず、v1〜v8 は起動前に拒否する。
 
 悪くなること。
 
-- `raise_stage()` が Model Registry を読むようになり、authority の昇格が registry の
-  可用性に依存する。緩和として、読めないことは「production が無い」と読み替えず
-  `AuthorityEvidenceError` で止める（fail closed）。**降格は registry を読まない**ので、
-  registry が壊れていても安全側へは常に動ける
+- `raise_stage()` が Model Registry を読み、その lock を commit まで握るようになり、
+  authority の昇格が registry の可用性に依存する。握っている間は registry の promotion が
+  待たされる（どちらも人が行う管理操作なので、待たせてよい）。緩和として、読めないことは
+  「production が無い」と読み替えず `AuthorityEvidenceError` で止める（fail closed）。
+  **降格は registry を読まない**ので、registry が壊れていても安全側へは常に動ける
 
 - **書き残せなかった降格は、再起動で戻る。** in-memory の上限は process の寿命しか
   持たない。緩和として、永続化の失敗は `persist_failure` として trace と runtime に残し、
@@ -285,6 +305,10 @@ v8 からの移行は自動補完せず、v1〜v8 は起動前に拒否する。
   残すだけで、起動時に「前回書けなかった」を知る手段が無い。#82 の decision trace から
   読み取って起動時に Baseline から始める案があるが、trace の保存先（0030）が Proposed の
   ままなので、そちらの確定後に別の記録で決める
+- **外の process が下げたことを、動いている制御ループがいつ知るか。** `AuthorityRuntime` は
+  構築時と `reload()` のときだけ journal を読む。管理操作の入口（下記）を決めるときに、
+  下げたことを走っているループへ伝える手（tick ごとの読み直し、signal、socket のいずれか）を
+  一緒に決める。いまは in-process の降格だけなので穴になっていない
 - **管理操作の入口。** いまは `AuthorityStore` の API だけで、CLI も API も無い。
   読み取り API（#23）は制御を変えられないので、昇格・rollback の入口を
   どこに置くか（CLI か、0045 の書き込み専用ソケットか）は別 Issue で決める

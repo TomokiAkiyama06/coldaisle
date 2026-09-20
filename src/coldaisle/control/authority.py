@@ -52,6 +52,7 @@ from coldaisle.control.model_registry import (
     ArtifactStatus,
     ModelRegistry,
     ModelRegistryError,
+    RegistrySnapshot,
 )
 from coldaisle.control.schema import (
     BASELINE_STAGE,
@@ -460,11 +461,16 @@ class AuthorityStore:
         検証済みの `ControlConfig` から、artifact の identity は Model Registry の
         **いまの production pointer** から取る。
 
-        **Registry は書き込む直前に読み直す**（codex #4056942797）。発行済みの
-        attestation は「発行した時点で production だった」としか言わないので、それを
-        受け取るだけだと、A の attestation と A の報告で、B が production になった
-        あとに昇格できてしまう。読むのは #104 の state で、**書くことはない**
-        （境界は 0057 §2.3）。
+        **Registry の lock を、authority の commit が終わるまで握る**
+        （codex #4056942797 / #4056968492）。発行済みの attestation は「発行した時点で
+        production だった」としか言わないし、`inspect()` は戻るときに lock を手放すので、
+        読んでから書くまでの間に別 process が B へ promote できてしまう。
+        **lock は必ず Registry → Authority の順**で取る（逆順で取る経路は無いので、
+        この順序は全順序であり deadlock しない）。読むのは #104 の state で、
+        **書くことはない**（境界は 0057 §2.3）。
+
+        **降格は Registry の lock を取らない。** registry が壊れていても、使えなくても、
+        安全側（stage を下げる）へは常に動ける。
         """
         policy = config.policy
         now_ms = self._clock.now_ms()
@@ -476,49 +482,51 @@ class AuthorityStore:
                 "設定が許す上限を超える stage は承認できない"
                 f"（ceiling={policy.authority_stage.value}; to={approval.to_stage.value}）"
             )
-        with self._exclusive_lock() as root_fd:
-            journal = self._read(root_fd)
-            if approval.expected_revision != journal.revision:
-                raise AuthorityApprovalError(
-                    "承認した時点の revision と一致しない（承認は使い回せない）"
-                    f"（approved_for={approval.expected_revision}; now={journal.revision}）"
+        # **Registry を先に pin する。** この with を抜けるまで production は動かない。
+        with self._pinned_production(registry, artifact_kind) as pinned:
+            production, registry_revision = pinned
+            with self._exclusive_lock() as root_fd:
+                journal = self._read(root_fd)
+                if approval.expected_revision != journal.revision:
+                    raise AuthorityApprovalError(
+                        "承認した時点の revision と一致しない（承認は使い回せない）"
+                        f"（approved_for={approval.expected_revision}; now={journal.revision}）"
+                    )
+                if approval.from_stage is not journal.stage:
+                    raise AuthorityApprovalError(
+                        "承認した遷移元といまの stage が違う"
+                        f"（approved_from={approval.from_stage.value}; now={journal.stage.value}）"
+                    )
+                self._check_production(approval, production)
+                self._check_evidence(
+                    approval,
+                    evaluation_report,
+                    policy=policy,
+                    fan_policy_config_sha256=config.sources.policy.sha256,
+                    safety_config_sha256=config.sources.safety.sha256,
+                    production_artifact_sha256=production.sha256,
+                    now_ms=now_ms,
                 )
-            if approval.from_stage is not journal.stage:
-                raise AuthorityApprovalError(
-                    "承認した遷移元といまの stage が違う"
-                    f"（approved_from={approval.from_stage.value}; now={journal.stage.value}）"
+                # **lock を握ったまま読み直す。** 値が動いていたら lock が効いていない
+                # ということなので、昇格を書かずに止める。
+                current, current_revision = self._read_production(registry, artifact_kind)
+                if current_revision != registry_revision or current.sha256 != production.sha256:
+                    raise AuthorityEvidenceError(
+                        "検証中に Model Registry の production が動いた（やり直す）"
+                        f"（revision={registry_revision}→{current_revision}）"
+                    )
+                event = AuthorityEvent(
+                    revision=journal.revision + 1,
+                    occurred_at_ms=max(now_ms, self._last_ms(journal)),
+                    kind=AuthorityChangeKind.RAISED,
+                    trigger=AuthorityTrigger.HUMAN,
+                    from_stage=journal.stage,
+                    to_stage=approval.to_stage,
+                    actor=approval.approver,
+                    reason=approval.reason,
+                    approval=approval,
                 )
-            production, registry_revision = self._resolve_production(registry, artifact_kind)
-            self._check_production(approval, production)
-            self._check_evidence(
-                approval,
-                evaluation_report,
-                policy=policy,
-                fan_policy_config_sha256=config.sources.policy.sha256,
-                safety_config_sha256=config.sources.safety.sha256,
-                production_artifact_sha256=production.sha256,
-                now_ms=now_ms,
-            )
-            # **書く直前にもう一度読む。** 検証している間に production が動いていたら、
-            # その昇格はもう「いまの production」についての判断ではない。
-            current, current_revision = self._resolve_production(registry, artifact_kind)
-            if current_revision != registry_revision or current.sha256 != production.sha256:
-                raise AuthorityEvidenceError(
-                    "検証中に Model Registry の production が動いた（やり直す）"
-                    f"（revision={registry_revision}→{current_revision}）"
-                )
-            event = AuthorityEvent(
-                revision=journal.revision + 1,
-                occurred_at_ms=max(now_ms, self._last_ms(journal)),
-                kind=AuthorityChangeKind.RAISED,
-                trigger=AuthorityTrigger.HUMAN,
-                from_stage=journal.stage,
-                to_stage=approval.to_stage,
-                actor=approval.approver,
-                reason=approval.reason,
-                approval=approval,
-            )
-            return self._append(root_fd, journal, event)
+                return self._append(root_fd, journal, event)
 
     def lower_stage(
         self,
@@ -562,21 +570,45 @@ class AuthorityStore:
             trigger=AuthorityTrigger.HUMAN,
         )
 
+    @contextmanager
+    def _pinned_production(
+        self, registry: ModelRegistry, artifact_kind: ArtifactKind
+    ) -> Iterator[tuple[ArtifactMetadata, int]]:
+        """Registry の lock を握ったまま、いまの production を返す。
+
+        **lock の順序は Registry → Authority で固定する。** この with の中でだけ
+        authority の lock を取り、逆順で取る経路はどこにも無いので deadlock しない。
+        降格（`lower_stage`）はこの経路を通らないため、registry が使えなくても
+        安全側へは常に動ける。
+        """
+        try:
+            with registry.pinned() as snapshot:
+                yield self._production_of(snapshot, artifact_kind)
+        except (OSError, ValueError, ModelRegistryError) as error:
+            # Registry を読めないことを「production が無い」と読み替えない。止める。
+            raise AuthorityEvidenceError("Model Registry の状態を読めない") from error
+
     @staticmethod
-    def _resolve_production(
+    def _read_production(
         registry: ModelRegistry, artifact_kind: ArtifactKind
     ) -> tuple[ArtifactMetadata, int]:
-        """**いま** production pointer が指している artifact の metadata と registry revision。
+        """lock を握ったまま読み直すための、lock を取らない読み取り。"""
+        try:
+            snapshot = registry.inspect()
+        except (OSError, ValueError, ModelRegistryError) as error:
+            raise AuthorityEvidenceError("Model Registry の状態を読めない") from error
+        return AuthorityStore._production_of(snapshot, artifact_kind)
+
+    @staticmethod
+    def _production_of(
+        snapshot: RegistrySnapshot, artifact_kind: ArtifactKind
+    ) -> tuple[ArtifactMetadata, int]:
+        """production pointer が指している artifact の metadata と registry revision。
 
         #92 は #104 の state を**読むだけ**である（書き込む経路を持たない。0057 §2.3）。
         読む向きは Issue #92 が引いた境界そのもので、「#104 がどの artifact を Production に
         するか決め、#92 がその Production artifact へどこまで制御権を渡すか決める」に従う。
         """
-        try:
-            snapshot = registry.inspect()
-        except (OSError, ValueError, ModelRegistryError) as error:
-            # Registry を読めないことを「production が無い」と読み替えない。止める。
-            raise AuthorityEvidenceError("Model Registry の状態を読めない") from error
         slot = snapshot.production.get(artifact_kind)
         if slot is None:
             raise AuthorityEvidenceError(
@@ -871,7 +903,6 @@ class AuthorityRuntime:
     """
 
     __slots__ = (
-        "_applied_ceiling",
         "_demotion_consumed",
         "_journal",
         "_last_mono_ms",
@@ -880,6 +911,7 @@ class AuthorityRuntime:
         "_persist_failure",
         "_policy",
         "_store",
+        "_unpersisted_ceiling",
     )
 
     def __init__(self, store: AuthorityStore, policy: FanPolicyConfig) -> None:
@@ -887,8 +919,10 @@ class AuthorityRuntime:
         self._store = store
         self._policy = policy
         self._journal = store.read()
-        # この process が下げた上限。**永続化できなくても保持する**（0057 §2.6）。
-        self._applied_ceiling = AuthorityStage.FULL
+        # **書き残せなかった降格だけ**を memory 上の上限として持つ（0057 §2.6）。
+        # 書けた降格は journal がそのまま表しているので、二重に持たない。持つと、
+        # あとから承認された昇格が再起動まで効かなくなる（codex #4056968495）。
+        self._unpersisted_ceiling = AuthorityStage.FULL
         # Gate の降格推奨を、立ち下がるまで1回だけ消費するための記憶。
         self._demotion_consumed = False
         self._last_mono_ms: int | None = None
@@ -913,7 +947,7 @@ class AuthorityRuntime:
 
     def current_stage(self) -> AuthorityStage:
         """この tick に与えてよい制御権。**上限を超えることはない。**"""
-        return lowest_stage(self._journal.stage, self.configured_ceiling, self._applied_ceiling)
+        return lowest_stage(self._journal.stage, self.configured_ceiling, self._unpersisted_ceiling)
 
     def reload(self) -> None:
         """外（管理操作）で変わった journal を読み直す。
@@ -1006,6 +1040,11 @@ class AuthorityRuntime:
         metadata = self._journal.trace_metadata()
         metadata["authority_stage"] = self.current_stage().value
         metadata["authority_journal_stage"] = self._journal.stage.value
+        metadata["authority_unpersisted_ceiling"] = (
+            None
+            if self._unpersisted_ceiling is AuthorityStage.FULL
+            else self._unpersisted_ceiling.value
+        )
         metadata["authority_config_ceiling"] = self.configured_ceiling.value
         metadata["authority_persist_failure"] = (
             None if self._persist_failure is None else self._persist_failure.model_dump(mode="json")
@@ -1039,8 +1078,6 @@ class AuthorityRuntime:
         """
         code = cause.value if cause is not None else "manual_rollback"
         reason = Reason(code=code, detail=detail[:500])
-        # **先に下げる。** 書き込みの成否を待たない。
-        self._applied_ceiling = lowest_stage(self._applied_ceiling, to_stage)
         self._low_confidence.clear()
         self._ood.clear()
         persist_failure: Reason | None = None
@@ -1054,6 +1091,8 @@ class AuthorityRuntime:
             )
             self._persist_failure = None
         except (AuthorityError, OSError) as error:
+            # **書き残せなくても下げる。** 記録の無い降格を memory 上の上限として持つ。
+            self._unpersisted_ceiling = lowest_stage(self._unpersisted_ceiling, to_stage)
             persist_failure = Reason(code="authority_persist_failed", detail=str(error)[:500])
             self._persist_failure = persist_failure
         return AuthorityDemotion(

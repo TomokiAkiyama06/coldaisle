@@ -20,6 +20,8 @@
 from __future__ import annotations
 
 import json
+import os
+from fcntl import LOCK_EX, LOCK_NB, LOCK_UN, flock
 from hashlib import sha256
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -508,9 +510,11 @@ class UnwritableStore(AuthorityStore):
         raise AuthorityStoreError("disk full")
 
 
-def unwritable_runtime(tmp_path: Path) -> AuthorityRuntime:
-    """FULL まで上げた journal を読み、以後は書けなくなった runtime。"""
-    runtime(tmp_path, stage=AuthorityStage.FULL)
+def unwritable_runtime(
+    tmp_path: Path, *, stage: AuthorityStage = AuthorityStage.FULL
+) -> AuthorityRuntime:
+    """`stage` まで上げた journal を読み、以後は書けなくなった runtime。"""
+    runtime(tmp_path, stage=stage)
     return AuthorityRuntime(
         UnwritableStore(tmp_path / "authority", SimulatedClock(NOW_MS)),
         policy(authority="full"),
@@ -1277,6 +1281,66 @@ def test_invariant_6_k_one_threshold_crossing_lowers_exactly_one_stage(tmp_path:
     assert control.current_stage() is AuthorityStage.LIMITED
 
 
+def test_invariant_6_m_an_approved_promotion_after_a_persisted_demotion_takes_effect(
+    tmp_path: Path,
+) -> None:
+    """**書き残せた降格は journal が表す。** 承認された昇格が再起動を待たない
+    （codex #4056968495）。
+
+    memory 上の上限を二重に持つと、記録に残った降格のあとで承認された昇格が、
+    process を作り直すまで効かなくなる。
+    """
+    authority = store(tmp_path)
+    control = runtime(tmp_path, stage=AuthorityStage.FULL)
+    demotion = control.observe(safety_state=SafetyState.EMERGENCY, now_mono_ms=0)
+
+    assert demotion is not None
+    assert demotion.persisted is True
+    assert control.current_stage() is BASELINE_STAGE
+
+    # 人が承認して上げる（別の管理操作）。
+    document = report_document()
+    journal = raise_stage(
+        authority,
+        approval=approval_for(document, revision=control.journal.revision),
+        document=document,
+    )
+    assert journal.stage is AuthorityStage.LIMITED
+
+    control.reload()
+
+    assert control.current_stage() is AuthorityStage.LIMITED
+    assert control.trace_metadata()["authority_unpersisted_ceiling"] is None
+
+
+def test_invariant_6_n_an_unpersisted_demotion_still_survives_a_promotion(
+    tmp_path: Path,
+) -> None:
+    """**書き残せなかった降格は、読み直しでも昇格でも外れない。**"""
+    control = unwritable_runtime(tmp_path, stage=AuthorityStage.LIMITED)
+    control.observe(safety_state=SafetyState.EMERGENCY, now_mono_ms=0)
+    assert control.current_stage() is BASELINE_STAGE
+    assert control.trace_metadata()["authority_unpersisted_ceiling"] == BASELINE_STAGE.value
+
+    authority = store(tmp_path)
+    document = report_document(
+        stages=(AuthorityStage.LIMITED.value,), arm_stage=AuthorityStage.LIMITED
+    )
+    raise_stage(
+        authority,
+        approval=approval_for(
+            document,
+            from_stage=AuthorityStage.LIMITED,
+            revision=authority.read().revision,
+            evidence=evidence_for(document, arm=learned_arm(AuthorityStage.LIMITED).key),
+        ),
+        document=document,
+    )
+    control.reload()
+
+    assert control.current_stage() is BASELINE_STAGE, "記録の無い降格は読み直しで外れない"
+
+
 # --- 不変条件 7: 設定は上限 ----------------------------------------------------
 
 
@@ -1531,6 +1595,61 @@ def test_invariant_8_f_a_stage_the_registry_did_not_allow_is_refused(tmp_path: P
 
     with pytest.raises(AuthorityApprovalError, match="Registry が許していない"):
         raise_stage(store(tmp_path), approval=approval, document=document, registry=registry)
+
+
+def registry_lock_is_held(root: Path) -> bool:
+    """別の fd から non-blocking で取れなければ、その lock は誰かが握っている。"""
+    lock_fd = os.open(root / ".registry.lock", os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        try:
+            flock(lock_fd, LOCK_EX | LOCK_NB)
+        except BlockingIOError:
+            return True
+        flock(lock_fd, LOCK_UN)
+        return False
+    finally:
+        os.close(lock_fd)
+
+
+def test_invariant_8_h_the_registry_is_pinned_until_the_authority_commit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """**読んでから書くまでの間に production を動かされない**（codex #4056968492）。
+
+    `inspect()` は戻るときに lock を手放すので、それだけでは別 process が B へ promote
+    できる。`raise_stage()` は Registry を pin したまま authority journal を書く。
+    """
+    registry, sha = production_registry(tmp_path, version="1.0.0", name="registry")
+    document = report_document(artifacts=(sha,))
+    approval = approval_for(document, evidence=evidence_for(document, artifact=sha))
+    observed: list[bool] = []
+    original = AuthorityStore._append
+
+    def watching_append(self, root_fd, journal, event):  # type: ignore[no-untyped-def]
+        # journal を書くまさにその瞬間に、Registry の lock が握られていること。
+        observed.append(registry_lock_is_held(tmp_path / "registry"))
+        return original(self, root_fd, journal, event)
+
+    monkeypatch.setattr(AuthorityStore, "_append", watching_append)
+    journal = raise_stage(store(tmp_path), approval=approval, document=document, registry=registry)
+
+    assert journal.stage is AuthorityStage.LIMITED
+    assert observed == [True]
+
+
+def test_invariant_8_i_lowering_never_waits_for_the_registry(tmp_path: Path) -> None:
+    """**降格は Registry の lock を取らない。** 安全側へは常に動ける（0057 §2.3 / §2.6）。"""
+    registry, _sha = production_registry(tmp_path, version="1.0.0", name="registry")
+    authority = store(tmp_path)
+    first = report_document()
+    raise_stage(authority, approval=approval_for(first), document=first, registry=registry)
+
+    # 別の誰かが Registry を握っている間でも、Baseline へ戻せる。
+    with registry.pinned():
+        assert registry_lock_is_held(tmp_path / "registry")
+        journal = authority.rollback_to_baseline(actor="operator", reason="異音の切り分け")
+
+    assert journal.stage is BASELINE_STAGE
 
 
 def test_invariant_8_c_the_registry_cannot_write_the_authority_journal() -> None:

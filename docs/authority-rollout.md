@@ -51,10 +51,14 @@ store.raise_stage(
 ```
 
 **承認者は値を持ち込めない。** artifact の hash も設定の checksum も「いま」も、
-発行済みの attestation さえも受け取らない。artifact の identity は **exclusive lock の中で
-`ModelRegistry.inspect()` を読んで**決め、書き込む直前にもう一度読んで registry が
-動いていないことを確かめる。発行時点の写し（`production_active`）を受け取ると、
-A の証拠を持ったまま B が production になったあとに昇格できてしまう。
+発行済みの attestation さえも受け取らない。artifact の identity は
+`ModelRegistry.pinned()` で **registry の lock を握ったまま**決め、その lock を
+authority journal を書き終えるまで手放さない。発行時点の写し（`production_active`）や
+lock を手放す `inspect()` だけでは、A の証拠を持ったまま B が production になったあとに
+昇格できてしまう。
+
+**lock の順序は Registry → Authority で固定**（逆順の経路が無いので deadlock しない）。
+**降格は registry の lock を取らない**ので、registry が使えなくても安全側へは常に動ける。
 
 **#104 と #92 の境界**: #92 は #104 の state を**読む**だけで、**書かない**。
 逆向き（#104 が authority journal を触ること）も無い（試験で走査）。
@@ -93,8 +97,10 @@ A の証拠を持ったまま B が production になったあとに昇格でき
 
 降格推奨は**立ち上がりだけ**を消費する（1回の閾値超えで1段だけ下げる）。
 
-`rollback_to_baseline()` は1手で `SHADOW` へ戻す。**降格は先に効き、そのあとで書き残す。**
-書けなくても下げたままにし、理由を `persist_failure` として残す（0057 §2.6 / §3）。
+`rollback_to_baseline()` は1手で `SHADOW` へ戻す。**書けなくても下げたままにし**、
+理由を `persist_failure` として残す（0057 §2.6 / §3）。
+書けた降格は journal が表すので、そのあと承認された昇格は `reload()` でそのまま効く。
+**記録の無い降格の上限だけ**が `reload()` でも外れない（process を作り直すまで残る）。
 下がったあとに自動で戻る経路は無い。戻すには新しい承認が要る。
 
 ## 記録

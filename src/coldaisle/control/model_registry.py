@@ -894,6 +894,23 @@ class ModelRegistry:
         """Read the current snapshot without changing filesystem state."""
         return self._read_snapshot()
 
+    @contextmanager
+    def pinned(self) -> Iterator[RegistrySnapshot]:
+        """Hold the registry lock while the caller acts on the snapshot it read.
+
+        ``inspect()`` releases the lock before it returns, so a caller that decides
+        something from the snapshot and then commits elsewhere races with any
+        concurrent promotion.  Authority Rollout (#92) uses this to make
+        "this artifact is production" true **at the moment it writes**.
+
+        **Lock order: the registry lock first, then the caller's own lock.**  The
+        registry never acquires another component's lock while holding this one, so
+        the ordering is total and cannot cycle.  Callers must not take this lock
+        while already holding theirs.
+        """
+        with self._exclusive_lock() as root_fd:
+            yield self._read_snapshot(root_fd)
+
     def register_candidate(
         self,
         metadata: ArtifactMetadata,
