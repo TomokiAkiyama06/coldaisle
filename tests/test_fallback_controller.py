@@ -156,7 +156,7 @@ def policy(
     mpc: dict[str, object] | None = None,
 ) -> FanPolicyConfig:
     document: dict[str, object] = {
-        "schema_version": 7,
+        "schema_version": 8,
         "fallback_curve": [
             {"temperature_c": 20.0, "demand": 0.2},
             {"temperature_c": 80.0, "demand": 0.8},
@@ -242,6 +242,7 @@ def policy(
                 "limit_down": 0.2,
             },
         },
+        "shadow": {"enabled": True, "outcome_match_tolerance_ms": provisional(500)},
         "recovery_hold_ms": recovery_hold_ms,
         "demote_window_ms": demote_window_ms,
         "demote_after": demote_after,

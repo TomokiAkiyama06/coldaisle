@@ -238,6 +238,7 @@ src/coldaisle/
     fallback/   # Baseline / degraded運転
     hardware/   # Demand→PWM/RPM/flow mapping、mock backendを含む
     acoustic/   # 独立Acoustic Cost Model（初期は近似、将来実測対応）
+    shadow/     # Shadow Mode。適用しなかった提案の記録と実測照合（書き込み経路を持たない）
   notify/     # L2: 通知（Slack / LINE / stdout）。秘匿情報は .env
   ai/         # L3: LLM Provider抽象、ツール、プロンプト。制御権限を持たない
   web/        # L4: 静的アセット

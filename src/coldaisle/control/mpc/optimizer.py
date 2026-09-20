@@ -60,6 +60,12 @@ class MpcSolution(_Frozen):
     baseline_requested: PerZone[Demand]
     anchor_inference_id: Sha256
     """この解の根拠になった anchor 推論（#85 の判定対象）。"""
+    prediction: PlanPrediction
+    """採用した plan に対する予測 future。**同じ探索で評価したものだけ**を持つ。
+
+    Shadow Mode（#90）が記録し、あとで実測と突き合わせる。別の候補の予測を後から
+    添えられないよう、plan の識別子と anchor 推論の一致を型の不変条件にする。
+    """
     evaluations: int = Field(gt=0)
 
     @model_validator(mode="after")
@@ -69,6 +75,10 @@ class MpcSolution(_Frozen):
         if self.cost.total > self.baseline_cost.total:
             # incumbent から始める探索では起こらない。起きたら探索の不変条件が壊れている。
             raise ValueError("採用した解のコストが Baseline を上回っている")
+        if not self.prediction.matches(self.plan):
+            raise ValueError("解が別の候補 plan の予測を持っている")
+        if self.prediction.anchor_inference_id != self.anchor_inference_id:
+            raise ValueError("解の予測が別の anchor 推論に属している")
         return self
 
     @property
@@ -170,7 +180,7 @@ class LearnedMpcOptimizer:
             if self._out_of_budget(started_ms):
                 # 制約の組み立てで越えた場合も、モデルを呼ぶ前に止める。
                 return self._timed_out(started_ms, evaluations)
-            baseline_cost = self._evaluate(
+            baseline_cost, baseline_prediction = self._evaluate(
                 baseline_requested,
                 observed,
                 anchor,
@@ -186,6 +196,7 @@ class LearnedMpcOptimizer:
         evaluations += 1
         incumbent = baseline_requested
         best_cost = baseline_cost
+        best_prediction = baseline_prediction
         # Baseline の評価だけで予算を使い切ることもある。**評価のあとにも必ず見る。**
         if self._out_of_budget(started_ms):
             return self._timed_out(started_ms, evaluations)
@@ -201,7 +212,7 @@ class LearnedMpcOptimizer:
                     if evaluations >= max_evaluations or self._out_of_budget(started_ms):
                         return self._timed_out(started_ms, evaluations)
                     try:
-                        cost = self._evaluate(
+                        cost, prediction = self._evaluate(
                             candidate,
                             observed,
                             anchor,
@@ -232,6 +243,9 @@ class LearnedMpcOptimizer:
                     # 評価順によって解が変わる（再現性が落ちる）。
                     if cost.total < best_cost.total:
                         best_cost = cost
+                        # 予測もコストと一緒に持ち替える。あとで採用した plan の予測を
+                        # 引き直すと、探索に使った予測と別のものを記録しうる。
+                        best_prediction = prediction
                         incumbent = candidate
                         improved = True
                     # 最後の候補で予算を越えたまま OK を返さない。
@@ -248,6 +262,7 @@ class LearnedMpcOptimizer:
             baseline_cost=baseline_cost,
             baseline_requested=baseline_requested,
             anchor_inference_id=anchor_inference_id,
+            prediction=best_prediction,
             evaluations=evaluations,
         )
         return OptimizerOutcome(
@@ -296,7 +311,8 @@ class LearnedMpcOptimizer:
         constraints: HardConstraintSet,
         weights: SupervisorObjectiveWeights,
         target_band: SupervisorTargetBand,
-    ) -> PlanCost:
+    ) -> tuple[PlanCost, PlanPrediction]:
+        """候補のコストと、その根拠になった予測を**対で**返す（#90 が記録する）。"""
         violations = constraints.violations(demands)
         if violations:
             raise InfeasiblePlanError("; ".join(violations))
@@ -305,13 +321,14 @@ class LearnedMpcOptimizer:
             PlannedThermalInput(observed=observed, plan=plan)
         )
         self._check_prediction(prediction, anchor, anchor_inference_id)
-        return self._cost_model.evaluate(
+        cost = self._cost_model.evaluate(
             plan=plan,
             prediction=prediction,
             weights=weights,
             target_band=target_band,
             previous=constraints.current,
         )
+        return cost, prediction
 
     def _check_prediction(
         self,
