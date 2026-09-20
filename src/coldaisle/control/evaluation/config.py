@@ -113,6 +113,12 @@ class EvidenceGate(_ConfigModel):
     """`scored / outcomes`。これに満たない counterfactual の予測指標は出さない。"""
     minimum_scored_outcomes: EvalCount
     """採点できた outcome の最小数。少数の当たりを根拠にしない。"""
+    minimum_temperature_coverage: EvalUnitInterval
+    """温度の観測が結び付いた tick の割合の下限（metric ごと・segment ごと）。
+
+    **薄い証拠で温度を語らせない。** 1000 tick の区間に1件の観測しか無くても平均も
+    threshold margin も出せてしまうので、裏づけの厚みそのものを条件にする。
+    """
 
 
 class CostGate(_ConfigModel):

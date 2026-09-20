@@ -2,7 +2,7 @@
 
 同じ Dataset / Replay 条件で Controller 構成を比べ、rollout 可否の材料を作る。
 規則は [`decisions/0054-offline-evaluation-attribution-and-gates.md`](decisions/0054-offline-evaluation-attribution-and-gates.md)
-（**Status: Proposed。所有者の承認が要る**）。Shadow の記録側は
+（**Status: FINAL**。2026-09-20 に所有者が承認。**設定値は provisional のまま**）。Shadow の記録側は
 [`decisions/0053-control-shadow-mode-and-counterfactual-logging.md`](decisions/0053-control-shadow-mode-and-counterfactual-logging.md)。
 
 ## まず知っておくこと
@@ -41,6 +41,11 @@ coverage.sufficient               設定の下限を満たしたか
 
 `sufficient` が `false` の arm には **`predictions` が入らない**。少数の当たりを
 全体の予測精度に見せないためで、gate もその arm を `blocked` にする。
+
+**`scored` は「掛かっていた action を識別できた」ことしか言わない。** 識別できた outcome でも、
+ある metric の実測が一度も照合できなければ、その metric の誤差はどこにも出てきません。
+**予測した metric をすべて1度は採点できていること**（`unscored_metrics` が空）も
+`sufficient` の条件です。
 
 **coverage は segment ごとに判定する。** 評価した holdout segment が1つでも足りなければ
 （`insufficient_coverage_segments` > 0）、ほかの segment がどれだけ揃っていても `blocked`。
@@ -133,5 +138,9 @@ outcome は、すべてその場で拒む（数えないだけにすると、行
 - 適用された arm の gate には cost の条件が無い。同じ条件の別の運転が無い以上、
   合否を決められないため（決められないものを置かない）
 - 閾値はすべて `provisional`。確定には基準となる測定が要る
+- **一部の sample にしか記録が無い要約は、全体の要約として扱わない。** optimizer latency は
+  全 sample に記録があるときだけ判定し、温度は観測が裏づけた tick の割合
+  （`minimum_temperature_coverage`）に下限を課す。そのほかの要約は裏づけの厚みを
+  `sample_coverage` / `count` として残し、薄ければ `partial_*` の理由を付ける
 - 欠けている証拠は理由付きで残す。`no_*`（1つも無い）/ `partial_*`（一部だけ）/
   `applied_optimizer_record_unavailable`（この arm には記録の場所が無い）を区別する

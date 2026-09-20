@@ -95,6 +95,10 @@ class TemperatureReport(_Frozen):
 
     metric: str = Field(min_length=1, max_length=120)
     values: MetricSummary
+    ticks: int = Field(ge=1)
+    """この arm の tick 数。**`values.count` と並べて、証拠の薄さが見えるようにする。**"""
+    sample_coverage: float = Field(ge=0.0, allow_inf_nan=False)
+    """観測が結び付いた tick の割合。1000 tick に1件の観測で温度を語らせない。"""
     threshold_c: float = Field(allow_inf_nan=False)
     margin: MetricSummary
     """`threshold_c - 観測値`。**最小値が worst-case になる。**"""
@@ -109,6 +113,9 @@ class DeltaReport(_Frozen):
     minuend: str = Field(min_length=1, max_length=120)
     subtrahend: str = Field(min_length=1, max_length=120)
     values: MetricSummary
+    ticks: int = Field(ge=1)
+    sample_coverage: float = Field(ge=0.0, allow_inf_nan=False)
+    """裏づけのある tick の割合。**一部だけの要約を全体の要約として読ませない。**"""
 
 
 class AirBalanceReport(_Frozen):
@@ -190,11 +197,26 @@ class OptimizerReport(_Frozen):
     error_rate: float = Field(ge=0.0, le=1.0, allow_inf_nan=False)
     latency_ms: MetricSummary | None = None
     evaluations: MetricSummary | None = None
+    latency_complete: bool = False
+    """**すべての sample に latency の記録があるか。**
+
+    一部にしか記録が無い latency を「この arm の latency」として読ませない。
+    50 回のうち1回だけ記録があれば、その1件が最大値になり gate を通ってしまう。
+    """
+    evaluations_complete: bool = False
+    """すべての sample に評価回数の記録があるか。"""
 
     @model_validator(mode="after")
     def _statuses_add_up(self) -> Self:
         if self.ok + self.timeout + self.error != self.samples:
             raise ValueError("optimizer の status の合計を samples と揃える")
+        for name, complete in (
+            ("latency_ms", self.latency_complete),
+            ("evaluations", self.evaluations_complete),
+        ):
+            summary: MetricSummary | None = getattr(self, name)
+            if complete and (summary is None or summary.count != self.samples):
+                raise ValueError(f"{name} を complete にできるのは全 sample に記録があるときだけ")
         if self.timeout_rate != self.timeout / self.samples:
             raise ValueError("timeout_rate を実際の件数から計算する")
         if self.error_rate != self.error / self.samples:
@@ -219,6 +241,16 @@ class CoverageReport(_Frozen):
     matched_outputs: int = Field(default=0, ge=0)
     scored_outputs: int = Field(default=0, ge=0)
     unmatched_reasons: tuple[CountedReason, ...] = ()
+    predicted_metrics: tuple[str, ...] = ()
+    """予測に現れた metric（記録から取る）。"""
+    unscored_metrics: tuple[str, ...] = ()
+    """**一度も採点できなかった** metric。
+
+    `scored` は「掛かっていた action を識別できた」ことしか言わない。識別できた
+    outcome でも、ある metric の実測が一度も照合できなければ、その metric の誤差は
+    **どこにも出てこない**。それを「問題が無かった」と読ませないために、採点できて
+    いない metric を名指しで残し、`sufficient` にしない（決定記録 0054 §2.3）。
+    """
     sufficient: bool
     """設定の下限を満たしたか。**満たさなければ予測指標を出さない。**"""
 
@@ -238,6 +270,12 @@ class CoverageReport(_Frozen):
         if self.sufficient and self.scored == 0:
             # 採点できた outcome が1つも無いのに「足りている」とは言わせない。
             raise ValueError("scored が 0 の coverage を sufficient にしない")
+        if set(self.unscored_metrics) - set(self.predicted_metrics):
+            raise ValueError("採点できていない metric は、予測した metric の中から挙げる")
+        if self.sufficient and self.unscored_metrics:
+            # 1つでも採点できていない metric があれば、残りの metric だけで
+            # underprediction の gate を通せてしまう。
+            raise ValueError("採点できていない metric がある coverage を sufficient にしない")
         return self
 
 

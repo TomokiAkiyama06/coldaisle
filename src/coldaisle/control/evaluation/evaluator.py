@@ -205,6 +205,8 @@ class _AppliedBucket:
     ticks: list[ControlTick] = field(default_factory=list)
     values: dict[str, list[float]] = field(default_factory=dict)
     """metric ごとの観測値（この arm の tick に結び付いたもの）。"""
+    attributed: dict[tuple[int, int], frozenset[str]] = field(default_factory=dict)
+    """tick ごとに、観測が結び付いた metric。**証拠の薄さを数えるのに使う。**"""
 
 
 @dataclass
@@ -702,7 +704,9 @@ def _applied_reports(
         arm = _applied_arm(tick)
         bucket = buckets.setdefault(arm.key, _AppliedBucket(arm=arm))
         bucket.ticks.append(tick)
-        for metric, values in attributed.get((tick.ts_ms, tick.tick_id), {}).items():
+        at_tick = attributed.get((tick.ts_ms, tick.tick_id), {})
+        bucket.attributed[(tick.ts_ms, tick.tick_id)] = frozenset(at_tick)
+        for metric, values in at_tick.items():
             bucket.values.setdefault(metric, []).extend(values)
     return tuple(_applied_report(buckets[key], context) for key in sorted(buckets))
 
@@ -723,10 +727,18 @@ def _applied_report(bucket: _AppliedBucket, context: EvaluationContext) -> Appli
             continue
         margin = summarize((ceiling - value for value in values), quantiles=quantiles)
         assert margin is not None
+        sampled = sum(
+            1 for tick in ticks if metric in bucket.attributed.get((tick.ts_ms, tick.tick_id), ())
+        )
         temperatures.append(
             TemperatureReport(
                 metric=metric,
                 values=summary,
+                ticks=len(ticks),
+                # **薄い証拠で温度を語らせない。** 1000 tick に1件の観測でも
+                # 平均も margin も出せてしまうので、どれだけの tick が裏づけられて
+                # いるかを一緒に持つ（gate が下限を課す）。
+                sample_coverage=sampled / len(ticks),
                 threshold_c=ceiling,
                 margin=margin,
                 exceedances=sum(1 for value in values if value >= ceiling),
@@ -739,12 +751,19 @@ def _applied_report(bucket: _AppliedBucket, context: EvaluationContext) -> Appli
         if summary is None:
             gaps["no_delta_observation"] += 1
             continue
+        sampled = sum(
+            1
+            for tick in ticks
+            if delta.name in bucket.attributed.get((tick.ts_ms, tick.tick_id), ())
+        )
         deltas.append(
             DeltaReport(
                 metric=delta.name,
                 minuend=delta.minuend,
                 subtrahend=delta.subtrahend,
                 values=summary,
+                ticks=len(ticks),
+                sample_coverage=sampled / len(ticks),
             )
         )
 
@@ -1041,17 +1060,30 @@ def _counterfactual_report(
     optimizer = _optimizer(statuses, latencies, evaluations, quantiles=quantiles)
     if optimizer is None:
         gaps["no_optimizer_record"] += 1
-    elif optimizer.latency_ms is None:
-        gaps["no_optimizer_latency"] += 1
+    else:
+        if optimizer.latency_ms is None:
+            gaps["no_optimizer_latency"] += 1
+        elif not optimizer.latency_complete:
+            # 50 回のうち1回だけ記録があれば、その1件が最大値になって gate を通る。
+            gaps["partial_optimizer_latency"] += 1
+        if optimizer.evaluations is not None and not optimizer.evaluations_complete:
+            gaps["partial_optimizer_evaluations"] += 1
     if proposals == 0:
         gaps["no_proposal"] += 1
+    elif proposals < len(bucket.entries):
+        # 一部の tick にしか提案が無い区間の要約を、全体の要約として読ませない。
+        gaps["partial_proposal"] += 1
     improvement = summarize(improvements, quantiles=quantiles)
     if improvement is None:
         gaps["no_cost_record"] += 1
+    elif improvement.count < statuses[OptimizerStatus.OK]:
+        gaps["partial_cost_record"] += 1
     confidence = summarize(confidences, quantiles=quantiles)
     if confidence is None:
         # 裏づけ済み（`attested`）の判断が無い区間を「confidence が 0 だった」に見せない。
         gaps["no_attested_confidence"] += 1
+    elif confidence.count < attested:
+        gaps["partial_attested_confidence"] += 1
 
     return CounterfactualArmReport(
         arm=bucket.arm,
@@ -1112,6 +1144,9 @@ def _optimizer(
         error_rate=statuses[OptimizerStatus.ERROR] / samples,
         latency_ms=summarize(latencies, quantiles=quantiles),
         evaluations=summarize(evaluations, quantiles=quantiles),
+        # **一部の sample にしか記録が無い要約を、全体の要約として読ませない。**
+        latency_complete=len(latencies) == samples,
+        evaluations_complete=len(evaluations) == samples,
     )
 
 
@@ -1120,22 +1155,31 @@ def _coverage(outcomes: Sequence[ShadowOutcome], config: EvaluationConfig) -> Co
     scored = sum(1 for outcome in outcomes if outcome.scored)
     unidentifiable_reasons: Counter[str] = Counter()
     unmatched_reasons: Counter[str] = Counter()
+    predicted: set[str] = set()
+    scored_metrics: set[str] = set()
     outputs = matched = scored_outputs = 0
     for outcome in outcomes:
         if outcome.unidentifiable is not None:
             unidentifiable_reasons[outcome.unidentifiable.code] += 1
         for match in outcome.matches:
             outputs += 1
+            predicted.add(match.metric)
             if match.observed is not None:
                 matched += 1
             if match.unmatched is not None:
                 unmatched_reasons[match.unmatched.code] += 1
             if match.error is not None:
                 scored_outputs += 1
+                scored_metrics.add(match.metric)
     total = len(outcomes)
     fraction = None if total == 0 else scored / total
+    # **`scored` は「掛かっていた action を識別できた」ことしか言わない。**
+    # 識別できた outcome でも、ある metric の実測が一度も照合できなければ、その metric の
+    # 誤差はどこにも出てこない。残りの metric だけで gate を通せないよう、名指しで残す。
+    unscored = tuple(sorted(predicted - scored_metrics))
     sufficient = (
         scored > 0
+        and not unscored
         and fraction is not None
         and fraction >= config.gate.evidence.minimum_identifiable_fraction.value
         and scored >= config.gate.evidence.minimum_scored_outcomes.value
@@ -1150,6 +1194,8 @@ def _coverage(outcomes: Sequence[ShadowOutcome], config: EvaluationConfig) -> Co
         matched_outputs=matched,
         scored_outputs=scored_outputs,
         unmatched_reasons=_counted(unmatched_reasons),
+        predicted_metrics=tuple(sorted(predicted)),
+        unscored_metrics=unscored,
         sufficient=sufficient,
     )
 

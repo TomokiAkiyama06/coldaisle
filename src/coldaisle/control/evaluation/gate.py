@@ -44,6 +44,8 @@ class _AppliedEvidence:
     emergency_ticks: int = 0
     fault_ticks: int = 0
     minimum_margin_c: float | None = None
+    minimum_sample_coverage: float | None = None
+    """温度の観測が裏づけた tick の割合の**最小**（metric ごと・segment ごと）。"""
 
     @property
     def temperature_is_complete(self) -> bool:
@@ -66,6 +68,10 @@ class _CounterfactualEvidence:
     insufficient_segments: int = 0
     """coverage が下限に満たなかった segment の数。**1つでもあれば gate を通さない。**"""
     minimum_identifiable_fraction: float | None = None
+    unscored_metrics: set[str] = field(default_factory=set)
+    """一度も採点できなかった予測 metric。**1つでもあれば通さない。**"""
+    incomplete_latency_segments: int = 0
+    """latency の記録が全 sample に無かった segment の数。"""
     maximum_underprediction_c: float | None = None
     optimizer_samples: int = 0
     maximum_timeout_rate: float | None = None
@@ -142,6 +148,12 @@ def _collect_applied(
         evidence.exceedances, sum(item.exceedances for item in report.temperatures)
     )
     for temperature in report.temperatures:
+        coverage = temperature.sample_coverage
+        evidence.minimum_sample_coverage = (
+            coverage
+            if evidence.minimum_sample_coverage is None
+            else min(evidence.minimum_sample_coverage, coverage)
+        )
         margin = temperature.margin.minimum
         evidence.minimum_margin_c = (
             margin if evidence.minimum_margin_c is None else min(evidence.minimum_margin_c, margin)
@@ -186,9 +198,13 @@ def _collect_counterfactual(
             if evidence.maximum_underprediction_c is None
             else max(evidence.maximum_underprediction_c, value)
         )
+    evidence.unscored_metrics.update(report.coverage.unscored_metrics)
     optimizer = report.optimizer
     if optimizer is not None:
         evidence.optimizer_samples += optimizer.samples
+        if not optimizer.latency_complete:
+            # 一部の sample にしか記録が無い latency で gate を通さない。
+            evidence.incomplete_latency_segments += 1
         evidence.maximum_timeout_rate = (
             optimizer.timeout_rate
             if evidence.maximum_timeout_rate is None
@@ -246,6 +262,16 @@ def _applied_gate(
             limit=float(safety.maximum_fault_ticks.value),
             reason="no_tick_evidence",
         ),
+        # **段の順に並べる。** evidence は safety のあと。
+        _at_least(
+            GateStage.EVIDENCE,
+            "temperature_sample_coverage",
+            observed=(
+                evidence.minimum_sample_coverage if evidence.temperature_is_complete else None
+            ),
+            limit=config.gate.evidence.minimum_temperature_coverage.value,
+            reason=_temperature_gap(evidence),
+        ),
     ]
     return _result(arm_key, tuple(conditions))
 
@@ -292,6 +318,16 @@ def _counterfactual_gate(
         ),
         _at_most(
             GateStage.EVIDENCE,
+            "unscored_metrics",
+            # **予測した metric のうち一度も採点できなかったものの数。**
+            # 残りの metric だけで underprediction の gate を通せないようにする。
+            # 0 は設定値ではなく構造上の要求（決定記録 0054 §2.3）。
+            observed=(None if evidence.segments == 0 else float(len(evidence.unscored_metrics))),
+            limit=0.0,
+            reason="no_segment_evidence",
+        ),
+        _at_most(
+            GateStage.EVIDENCE,
             "insufficient_coverage_segments",
             # **評価したすべての holdout segment で coverage が足りていること。**
             # 0 は設定値ではなく構造上の要求（0054 §2.3）。伏せた区間の証拠と、出した
@@ -319,9 +355,17 @@ def _counterfactual_gate(
         _at_most(
             GateStage.COST,
             "optimizer_latency_ms",
-            observed=evidence.maximum_latency_ms,
+            # **全 sample に記録がある segment だけで判定する。** 50 回のうち1回しか
+            # 記録が無ければ、その1件が最大値になって通ってしまう。
+            observed=(
+                evidence.maximum_latency_ms if evidence.incomplete_latency_segments == 0 else None
+            ),
             limit=float(gate.cost.maximum_optimizer_latency_ms.value),
-            reason="no_optimizer_evidence",
+            reason=(
+                "incomplete_optimizer_latency"
+                if evidence.incomplete_latency_segments
+                else "no_optimizer_evidence"
+            ),
         ),
     ]
     return _result(arm_key, tuple(conditions))

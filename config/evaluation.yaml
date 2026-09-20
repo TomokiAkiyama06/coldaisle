@@ -62,6 +62,7 @@ gate:
   evidence:
     minimum_identifiable_fraction: {value: 0.2, status: provisional}
     minimum_scored_outcomes: {value: 50, status: provisional}
+    minimum_temperature_coverage: {value: 0.8, status: provisional}
   cost:
     maximum_underprediction_c: {value: 3.0, status: provisional}
     maximum_optimizer_timeout_rate: {value: 0.02, status: provisional}

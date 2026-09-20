@@ -1,7 +1,7 @@
 # 決定記録 0054: Offline Evaluation の帰属規則・coverage の扱い・rollout gate
 
 - **種別**: Decision Record
-- **Status**: Proposed（**リポジトリ所有者の承認が要る**。§2 は承認まで確定しない）
+- **Status**: FINAL（2026-09-20、リポジトリ所有者が承認）
 - **Date**: 2026-09-20
 - **Supersedes**: なし
 - **関連**: [`0027-fan-control-architecture.md`](0027-fan-control-architecture.md)、
@@ -89,6 +89,17 @@ counterfactual arm ごとに必ず次を出す。
   「採点できた僅かな区間だけが良かった」を rollout の根拠にしない
 - 下限に満たないときは**予測指標を出さない**。coverage と理由の内訳だけを残す。
   少数の区間の平均を、全体の予測精度に見える形で並べない
+- **`scored` は「掛かっていた action を識別できた」ことしか言わない。** 識別できた outcome でも、
+  ある metric の実測が一度も照合できなければ、その metric の誤差は**どこにも出てこない**。
+  残りの metric だけで underprediction の gate を通せてしまうので、**予測した metric を
+  すべて1度は採点できていること**を `sufficient` の条件に加える（`unscored_metrics` が空。
+  設定値ではなく構造上の要求）
+- **一部の sample にしか記録が無い要約を、全体の要約として扱わない。** optimizer latency は
+  **全 sample に記録があるとき**だけ判定する（50 回のうち1回の記録では、その1件が最大値に
+  なって通ってしまう）。温度は **観測が裏づけた tick の割合**に下限を課す
+  （`minimum_temperature_coverage`。1000 tick の区間に1件の観測でも平均も margin も出せる）。
+  そのほかの要約（ΔT・acoustic cost・confidence・cost 改善率・RPM・提案）は、
+  裏づけの厚み（`sample_coverage` / `count`）を報告に残し、薄ければ `partial_*` の理由を付ける
 - **coverage は segment ごとに判定し、評価したすべての holdout segment で足りていることを
   要求する**（`insufficient_coverage_segments` が 0 であること。設定値ではなく構造上の要求）。
   予測指標を伏せるかどうかは segment ごとに決まるので、足りない segment の採点数を
@@ -191,6 +202,7 @@ hunting: { demand_deadband: {...}, rpm_deadband: {...} }
 observation_match_tolerance_ms: {...}  # 観測を tick へ結び付ける許容幅（全 metric 共通）
 worst_case_count: <int>
 gate: { safety: {...}, evidence: {...}, cost: {...} }  # §2.4 の3段
+#   evidence には coverage の下限に加え minimum_temperature_coverage（裏づけの厚み）を置く
 ```
 
 ## 3. Consequences
@@ -233,13 +245,17 @@ gate: { safety: {...}, evidence: {...}, cost: {...} }  # §2.4 の3段
 | coverage を holdout 全体の合計で判定する | 足りない区間の採点数で下限を満たし、その区間の予測指標は伏せたまま通せる。segment ごとに要求する |
 | 温度 metric が1つでも読めていれば Safety の段を判定する | 欠けた metric の超過を見ないまま合格になる。全 metric・全 segment を要求する |
 | `operating_mode` を factual arm の鍵から外す | `MANUAL` / `MAX` の区間が、制御器が回した区間と同じ行に混ざる |
+| `scored` だけで coverage を足りているとみなす | 一度も照合できなかった metric があっても、残りの metric だけで underprediction の gate を通せる |
+| 記録のある sample だけで latency / 温度を要約し、全体の値として読む | 50 回のうち1回、1000 tick に1件でも要約は作れる。裏づけの厚みを条件にする |
 | tick の無い segment を許す | 空の holdout は条件が1つも無い gate になり、「何も落ちなかった」と読める |
 | 報告に生成時刻を入れる | 壁時計が入ると、同じ入力から同じ bytes が出なくなる。再現性の判定に使えない |
 | 未来のデータを含めて全体統計を作り、segment ごとに切り出す | 正規化や percentile を通して未来が漏れる。segment は evidence window の中だけで閉じる |
 
 ## 5. 未決事項
 
-- **所有者の承認が要る。** 承認まで本記録は `Proposed` であり、§2 は確定していない
+- 所有者の承認（2026-09-20）で本記録は `FINAL` になった。**§2 の決定が変わるときは、
+  書き換えずに新しい記録を作る**（`docs/decisions/README.md`「追記のみ」）。
+  下の未決事項と provisional な設定値は、**確定するまで開いたままである**
 - `config/evaluation.yaml` の実運用値（percentile・帯・deadband・gate の閾値）は**実測後に確定する**。
   いまはすべて provisional で、確定には基準となる測定が要る
 - 適用された Learned MPC の optimizer 実績を trace に残すか（`ControlTick` の追加が要る）は

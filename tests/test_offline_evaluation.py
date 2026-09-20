@@ -52,6 +52,7 @@ from coldaisle.control.evaluation.model import (
     GateResult,
     GroupReport,
     InterventionReport,
+    OptimizerReport,
     PredictionReport,
     TemperatureReport,
 )
@@ -1897,3 +1898,183 @@ def test_the_run_id_pattern_matches_the_report_contract() -> None:
     assert RUN_ID_PATTERN.fullmatch("a" * 120) is not None
     assert RUN_ID_PATTERN.fullmatch("a" * 121) is None
     assert RUN_ID_PATTERN.fullmatch("_leading") is None
+
+
+# --------- 不変条件 14: 一部だけの要約を、全体の要約として扱わない（Codex レビュー第3回）
+
+
+def test_invariant_14_a_a_never_matched_metric_blocks_the_coverage(
+    context: EvaluationContext,
+) -> None:
+    """**`scored` は「action を識別できた」ことしか言わない**（決定記録 0054 §2.3）。
+
+    識別できた outcome でも、ある metric の実測が一度も照合できなければ、その metric の
+    誤差はどこにも出てこない。残りの metric だけで underprediction の gate を通せない。
+    """
+    hotspot = "gpu.0.hotspot"
+    traces = [
+        trace_of(
+            tick_at(
+                TICK_TS_MS + index * STEP_MS,
+                index,
+                cf=_two_metric_counterfactual(TICK_TS_MS + index * STEP_MS),
+            )
+        )
+        for index in range(60)
+    ]
+    # **`gpu.0.hotspot` の実測を一度も置かない。** ほかの metric は揃っている。
+    observations = [
+        observation(metric, TICK_TS_MS + index * STEP_MS, 50.0)
+        for index in range(64)
+        for metric in TEMPERATURES
+        if metric != hotspot
+    ]
+    report = evaluate([run_of(traces, observations)], context=context)
+    shadow_arm = overall(report).counterfactual[0]
+
+    assert hotspot in shadow_arm.coverage.predicted_metrics
+    assert shadow_arm.coverage.unscored_metrics == (hotspot,)
+    assert shadow_arm.coverage.scored > 0, "action は識別できている（scored は立つ）"
+    assert shadow_arm.coverage.sufficient is False
+    assert shadow_arm.predictions == ()
+
+    gate = next(item for item in report.gates if item.arm_key.startswith("counterfactual:"))
+    unscored = next(item for item in gate.conditions if item.name == "unscored_metrics")
+    assert unscored.observed == 1.0 and unscored.outcome is GateOutcome.BLOCKED
+
+
+def _two_metric_counterfactual(action_ts_ms: int) -> ShadowCounterfactual:
+    """2つの metric を予測する counterfactual（片方だけ実測が来る状況を作る）。"""
+    plan = plan_for(0.8)
+    identifier = f"{action_ts_ms:064x}"
+    prediction = ShadowPrediction(
+        model_id="rack-thermal",
+        model_version="thermal-v1",
+        artifact_sha256="a" * 64,
+        inference_id=identifier,
+        plan_digest=plan.digest(),
+        input_action_ts_ms=action_ts_ms,
+        targets=tuple(
+            ShadowPredictedTarget(
+                offset_ms=offset,
+                expected_ts_ms=action_ts_ms + offset,
+                values={GPU: 50.0, "gpu.0.hotspot": 60.0},
+            )
+            for offset in plan.offsets_ms
+        ),
+    )
+    return ShadowCounterfactual(
+        controller=ControllerKind.LEARNED_MPC,
+        requested=plan.first,
+        reason=Reason(code="optimizer_ok"),
+        optimizer_status=OptimizerStatus.OK,
+        latency_ms=120,
+        evaluations=64,
+        model_version="thermal-v1",
+        inference_id=identifier,
+        artifact_sha256="a" * 64,
+        plan=plan,
+        prediction=prediction,
+        cost_total=1.0,
+        baseline_cost_total=2.0,
+    )
+
+
+def test_invariant_14_b_a_coverage_cannot_claim_sufficiency_with_an_unscored_metric() -> None:
+    """型でも閉じる。**採点できていない metric があれば `sufficient` にできない。**"""
+    with pytest.raises(ValidationError, match="採点できていない metric"):
+        CoverageReport(
+            outcomes=60,
+            scored=60,
+            unidentifiable=0,
+            identifiable_fraction=1.0,
+            outputs=240,
+            matched_outputs=120,
+            scored_outputs=120,
+            predicted_metrics=(GPU, "gpu.0.hotspot"),
+            unscored_metrics=("gpu.0.hotspot",),
+            sufficient=True,
+        )
+
+
+def test_invariant_14_c_a_partly_recorded_latency_cannot_pass_the_gate(
+    context: EvaluationContext,
+) -> None:
+    """**50 回のうち1回の記録で latency の gate を通さない**（0054 §2.3）。"""
+    traces = [
+        trace_of(
+            tick_at(
+                TICK_TS_MS + index * STEP_MS,
+                index,
+                cf=counterfactual(
+                    action_ts_ms=TICK_TS_MS + index * STEP_MS,
+                    status=OptimizerStatus.OK,
+                    latency_ms=10,
+                ),
+            )
+        )
+        for index in range(60)
+    ]
+    # 1件だけ latency を落とす（`ShadowCounterfactual` は latency を必須にしない）。
+    first = ControlTick.model_validate_json(traces[0].trace_json)
+    assert first.shadow is not None
+    stripped = first.shadow.counterfactuals[0].model_copy(update={"latency_ms": None})
+    traces[0] = trace_of(
+        first.model_copy(
+            update={"shadow": first.shadow.model_copy(update={"counterfactuals": (stripped,)})}
+        )
+    )
+    report = evaluate([run_of(traces, [])], context=context)
+    optimizer = overall(report).counterfactual[0].optimizer
+
+    assert optimizer is not None
+    assert optimizer.samples == 60 and optimizer.latency_ms is not None
+    assert optimizer.latency_ms.count == 59
+    assert optimizer.latency_complete is False
+    assert "partial_optimizer_latency" in {
+        gap.code for gap in overall(report).counterfactual[0].gaps
+    }
+
+    gate = next(item for item in report.gates if item.arm_key.startswith("counterfactual:"))
+    latency = next(item for item in gate.conditions if item.name == "optimizer_latency_ms")
+    assert latency.observed is None and latency.outcome is GateOutcome.BLOCKED
+    assert latency.reason is not None
+    assert latency.reason.code == "incomplete_optimizer_latency"
+
+
+def test_invariant_14_d_an_incomplete_summary_cannot_claim_completeness() -> None:
+    """型でも閉じる。**全 sample に記録が無ければ `complete` にできない。**"""
+    with pytest.raises(ValidationError, match="complete にできるのは"):
+        OptimizerReport(
+            samples=50,
+            ok=50,
+            timeout=0,
+            error=0,
+            timeout_rate=0.0,
+            error_rate=0.0,
+            latency_ms=summarize([10.0]) or _never(),
+            latency_complete=True,
+        )
+
+
+def test_invariant_14_e_thin_temperature_evidence_blocks_the_gate(
+    context: EvaluationContext,
+) -> None:
+    """**1000 tick に1件の観測で温度を語らせない**（0054 §2.3）。"""
+    traces = [
+        trace_of(tick_at(TICK_TS_MS + index * STEP_MS, index, shadow=False)) for index in range(40)
+    ]
+    # 各 metric の観測は**最初の tick の分だけ**。平均も margin も出せてしまう。
+    thin = [observation(metric, TICK_TS_MS, 50.0) for metric in TEMPERATURES]
+    report = evaluate([run_of(traces, thin)], context=context)
+    applied = overall(report).applied[0]
+    temperature = applied.temperatures[0]
+
+    assert temperature.ticks == 40
+    assert temperature.values.count == 1
+    assert temperature.sample_coverage == pytest.approx(1 / 40)
+
+    gate = next(item for item in report.gates if item.arm_key.startswith("applied:"))
+    coverage = next(item for item in gate.conditions if item.name == "temperature_sample_coverage")
+    assert coverage.outcome is GateOutcome.BLOCKED
+    assert gate.blocking_stage is GateStage.EVIDENCE
