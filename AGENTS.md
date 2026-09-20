@@ -33,6 +33,7 @@ uv run coldaisle-memory             # 運用メモリの更新案（**既定で�
 uv run coldaisle-memory --apply --commit  # 確認してから書く
 uv run coldaisle-calibrate          # 較正オフセットの算出（**既定では書かない**）
 uv run coldaisle-calibrate --apply  # 確認してから書く。手順は docs/calibration.md
+uv run coldaisle-evaluate --runs var/evaluation-runs.yaml --out var/evaluation.json  # Controller構成の比較（読み取りのみ）
 uv run coldaisle-eventd             # 書き込み専用の Unix ソケット入口（決定記録 0045。API とは別）
 uv run coldaisle-event gpu-mode compute  # GPU Mode の切り替えを記録する（#67）
 uv run coldaisle-telemetry --once   # NVML / hwmon を1回収集（#65）
@@ -224,6 +225,7 @@ src/coldaisle/
   escalate.py # 合成の起点: 故障疑いの案件資料（AI非依存・送信しない）。#39
   memory.py   # 合成の起点: 運用メモリの記録（確認を経由する）。#40
   calibrate.py# 合成の起点: 較正オフセットの算出（確認を経由する）。#13
+  evaluate.py # 合成の起点: Controller構成の比較レポート（読み取りのみ）。#91
   event_entry/ # 合成の起点: 書き込み専用の Unix ソケット入口。AI 層・API から import しない。#67
   rollup_job.py # 合成の起点: `coldaisle-rollup` の入口（周期メトリクスを Store へ渡す）。#65
   store/      # L1: SQLite、ロールアップ、CSVエクスポート
@@ -238,12 +240,14 @@ src/coldaisle/
     fallback/   # Baseline / degraded運転
     hardware/   # Demand→PWM/RPM/flow mapping、mock backendを含む
     acoustic/   # 独立Acoustic Cost Model（初期は近似、将来実測対応）
+    shadow/     # 適用しなかった提案の記録と突き合わせ（制御へ届かない）。#90
+    evaluation/ # Offline Evaluation（読み取り専用。制御へ届かない）。#91
     shadow/     # Shadow Mode。適用しなかった提案の記録と実測照合（書き込み経路を持たない）
   notify/     # L2: 通知（Slack / LINE / stdout）。秘匿情報は .env
   ai/         # L3: LLM Provider抽象、ツール、プロンプト。制御権限を持たない
   web/        # L4: 静的アセット
 firmware/     # ESP32-S3 Arduino スケッチ。**コンパイルは人の手**（#11 / 決定記録 0022 §2.9）
-config/       # rules.yaml, calibration.json, coldaisle.toml, fan-policy.yaml, fan-hardware.yaml, safety.yaml
+config/       # rules.yaml, calibration.json, coldaisle.toml, fan-policy.yaml, fan-hardware.yaml, safety.yaml, evaluation.yaml
 memory/       # 運用メモリ（いまの閾値・較正値）。`coldaisle-memory` が更新案を出す
 docs/         # 要件定義、仕様レビュー、ADR
 tests/

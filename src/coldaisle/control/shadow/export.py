@@ -179,6 +179,25 @@ def write_shadow_jsonl(rows: Iterable[ShadowExportRow], stream: TextIO) -> int:
     return written
 
 
+def read_shadow_jsonl(stream: TextIO) -> tuple[ShadowExportRow, ...]:
+    """書き出した JSON Lines を読み戻す（#91 が取り込む口）。
+
+    **省略された欄は既定値（None）として読み戻す。** ``write_shadow_jsonl`` が
+    ``exclude_none`` で落とした欄をここで補い、書いた行と同じ record になる
+    （決定記録 0053 §2.4）。形式の知識を Shadow の外へ写さないため、読む側もここに置く。
+
+    空行は読み飛ばす。**中身の検証は ``ShadowExportRow`` に任せる**（束縛の壊れた行は
+    そこで例外になる）。
+    """
+    rows: list[ShadowExportRow] = []
+    for line in stream:
+        text = line.strip()
+        if not text:
+            continue
+        rows.append(ShadowExportRow.model_validate_json(text))
+    return tuple(rows)
+
+
 def counterfactual_controllers(rows: Iterable[ShadowExportRow]) -> frozenset[ControllerKind]:
     """export に現れた counterfactual の制御器。#91 が比較対象を決めるのに使う。"""
     return frozenset(
