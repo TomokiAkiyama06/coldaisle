@@ -80,6 +80,7 @@ from coldaisle.control.schema import (
     ShadowPredictedTarget,
     ShadowPrediction,
     ShadowRecord,
+    SupervisorPolicyKind,
     WorkloadRegime,
     Zone,
     ZoneRecord,
@@ -2184,3 +2185,130 @@ def test_the_required_schema_version_is_read_from_the_migrations(tmp_path: Path)
     assert len(named) == 1
     assert required_schema_version() == named[0].version
     del tmp_path
+
+
+# ---- 不変条件 16: 添え file を作らない / 記録された policy を潰さない（第5回レビュー）
+
+
+def test_invariant_16_a_opening_the_evidence_db_creates_no_sidecar(tmp_path: Path) -> None:
+    """**WAL の DB を `mode=ro` で開くと `-shm` / `-wal` が作られる。**
+
+    「何も変えない」が守れず、読み取り専用の媒体では開けもしない。`immutable=1` は
+    添え file を作らない。
+    """
+    import sqlite3
+
+    from coldaisle.evaluate import EvidenceDatabase
+
+    db = tmp_path / "pr91-wal.db"
+    _evidence_db(db)
+    # 書き手と同じように WAL にしてから、きちんと閉じる（＝静止した DB）。
+    conn = sqlite3.connect(db, isolation_level=None)
+    try:
+        conn.execute("PRAGMA journal_mode=WAL")
+    finally:
+        conn.close()
+    before = sorted(item.name for item in tmp_path.iterdir())
+
+    with EvidenceDatabase(db) as store, store.snapshot():
+        assert store.control_traces(0, TICK_TS_MS) == ()
+
+    after = sorted(item.name for item in tmp_path.iterdir())
+    assert after == before
+    assert not (tmp_path / "pr91-wal.db-wal").exists()
+    assert not (tmp_path / "pr91-wal.db-shm").exists()
+
+
+def test_invariant_16_b_a_database_that_is_not_quiescent_is_refused(tmp_path: Path) -> None:
+    """**未 checkpoint の WAL を黙って無視して古い断面を読まない。**
+
+    `immutable=1` は WAL を読まないので、書きかけの DB を開くと table が丸ごと
+    見えないことさえある。証拠を読み違えるくらいなら読まない。
+    """
+    from coldaisle.evaluate import EvidenceDatabase, EvidenceDatabaseError
+
+    db = tmp_path / "pr91-live.db"
+    _evidence_db(db)
+    (tmp_path / "pr91-live.db-wal").write_bytes(b"\x00" * 32)
+
+    with pytest.raises(EvidenceDatabaseError, match="静止していない"):
+        EvidenceDatabase(db)
+
+
+def test_invariant_16_c_a_file_that_is_not_sqlite_is_refused(tmp_path: Path) -> None:
+    """SQLite でない file を証拠として開かない。"""
+    from coldaisle.evaluate import EvidenceDatabase, EvidenceDatabaseError
+
+    fake = tmp_path / "pr91-fake.db"
+    fake.write_text("not a database", encoding="utf-8")
+    with pytest.raises(EvidenceDatabaseError, match="SQLite の file ではない"):
+        EvidenceDatabase(fake)
+
+
+def _legacy_tick(ts_ms: int, tick_id: int, policy: str) -> ControlTick:
+    """`SupervisorDecision` を持てない v2 の trace（policy は自由文字列）。"""
+    return ControlTick(
+        schema_version=2,
+        tick_id=tick_id,
+        ts_ms=ts_ms,
+        state=ControlState(
+            operating_mode=OperatingMode.AUTO,
+            authority_stage=AuthorityStage.SHADOW,
+            active_controller=ControllerKind.FALLBACK,
+            safety_state=SafetyState.NORMAL,
+            fallback_active=True,
+            supervisor_policy=policy,
+            workload_regime=WorkloadRegime.IDLE,
+            regime_confidence=0.5,
+        ),
+        zones=zone_records(requested=0.4, effective=0.4),
+    )
+
+
+def test_invariant_16_d_legacy_supervisor_policies_stay_separate_arms(
+    context: EvaluationContext,
+) -> None:
+    """**違う policy で回した古い区間を、1つの arm に潰さない**（決定記録 0054 §2.1）。
+
+    v1 / v2 の trace は `SupervisorDecision` を持てず、policy は実装固有の自由文字列
+    だった。そこを見ずに `None` にすると、別々の運転が同じ行に混ざる。
+    """
+    traces = [
+        trace_of(_legacy_tick(TICK_TS_MS, 0, "legacy_rule_v1")),
+        trace_of(_legacy_tick(TICK_TS_MS + STEP_MS, 1, "legacy_rule_v2")),
+    ]
+    report = evaluate([run_of(traces, [])], context=context)
+    keys = {item.arm_key for item in overall(report).applied}
+
+    assert len(keys) == 2
+    assert any("legacy_rule_v1" in key for key in keys)
+    assert any("legacy_rule_v2" in key for key in keys)
+
+
+def test_invariant_16_e_a_policy_name_that_cannot_be_keyed_is_refused(
+    context: EvaluationContext,
+) -> None:
+    """鍵に入れられない policy 名を、黙って `none` に潰さない。"""
+    traces = [trace_of(_legacy_tick(TICK_TS_MS, 0, "bad policy@name"))]
+    with pytest.raises(EvaluationInputError, match="arm の鍵にできない"):
+        evaluate([run_of(traces, [])], context=context)
+
+
+def test_the_policy_pattern_matches_the_report_contract() -> None:
+    """**写した形が、報告の契約と食い違わない。**"""
+    from coldaisle.control.evaluation.evaluator import POLICY_NAME_PATTERN
+
+    assert POLICY_NAME_PATTERN.fullmatch("a" * 64) is not None
+    assert POLICY_NAME_PATTERN.fullmatch("a" * 65) is None
+    assert POLICY_NAME_PATTERN.fullmatch("_leading") is None
+    # 現行の列挙値はそのまま通る（v3 以降の鍵は今までと同じ）。
+    for policy in SupervisorPolicyKind:
+        assert POLICY_NAME_PATTERN.fullmatch(policy.value) is not None
+        arm = AppliedArm(
+            controller=ControllerKind.FALLBACK,
+            supervisor_policy=policy,
+            authority_stage=AuthorityStage.SHADOW,
+            operating_mode=OperatingMode.AUTO,
+        )
+        assert arm.key.endswith("@shadow/auto")
+        assert f"+{policy.value}@" in arm.key

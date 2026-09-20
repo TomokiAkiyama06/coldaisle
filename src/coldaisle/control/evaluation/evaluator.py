@@ -71,7 +71,6 @@ from coldaisle.control.schema import (
     SafetyState,
     ShadowCounterfactual,
     ShadowRecord,
-    SupervisorPolicyKind,
     Zone,
 )
 from coldaisle.control.shadow import (
@@ -88,6 +87,9 @@ from coldaisle.metrics import MetricCatalog
 
 RUN_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,119}$")
 """run の名前の形。**`RunProvenance.run_id` と同じにする**（一致は試験で確かめる）。"""
+
+POLICY_NAME_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
+"""記録された Supervisor policy 名の形。**`AppliedArm` の `LegacyPolicyName` と同じにする。**"""
 
 BEFORE_ANY_OBSERVATION_MS = -1
 """`ObservationIndex.nearest` の「この時刻より後」に使う下限。
@@ -687,11 +689,21 @@ def _nearest_tick(
 
 
 def _applied_arm(tick: ControlTick) -> AppliedArm:
-    """tick の**記録から** arm を決める（設定の宣言ではなく証拠から。0054 §2.1）。"""
-    policy: SupervisorPolicyKind | None = None
-    if tick.supervisor is not None:
-        selected = tick.supervisor.selected_output
-        policy = None if selected is None else selected.policy
+    """tick の**記録から** arm を決める（設定の宣言ではなく証拠から。0054 §2.1）。
+
+    policy は `ControlState.supervisor_policy` を**そのまま**使う。v3 以降は
+    `ControlTick` が「選ばれた出力の policy と揃っていること」を検証しているので
+    `SupervisorDecision` から引くのと同じ値になり、`SupervisorDecision` を持てない
+    v1 / v2 では**記録されていた自由文字列がそのまま残る**。
+    列挙値へ狭めると、違う policy で回した古い区間が1つの arm に潰れてしまう。
+    """
+    policy = tick.state.supervisor_policy
+    if policy is not None and not POLICY_NAME_PATTERN.fullmatch(policy):
+        # 鍵に入れられない名前は「識別できない」。黙って `none` に潰さない。
+        raise EvaluationInputError(
+            f"Supervisor policy の名前を arm の鍵にできない"
+            f"（tick={tick.tick_id}/{tick.ts_ms}; policy={policy!r}）"
+        )
     return AppliedArm(
         controller=tick.state.active_controller,
         supervisor_policy=policy,

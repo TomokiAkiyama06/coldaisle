@@ -16,6 +16,12 @@ Shadow の間の Learned MPC は Fan へ届いていないので、その区間�
 | `applied:<controller>+<supervisor>@<stage>/<mode>` | 温度・threshold margin・ΔT・Air Balance・demand / RPM の変動とハンチング・approximate acoustic cost・Safety / Guard / Fallback の介入回数 |
 | `counterfactual:<controller>+<supervisor>@<stage>` | 要求 demand の変動とハンチング・approximate acoustic cost・optimizer の latency / timeout・cost 改善率・**`scored` な予測の誤差だけ**・**coverage** |
 
+`<supervisor>` は **`ControlState.supervisor_policy` に記録されていた値そのもの**である。
+v3 以降は `rule_policy` / `rl_policy` だが、`SupervisorDecision` を持てない v1 / v2 の
+trace では実装固有の自由文字列が入る。**列挙値へ狭めず、記録された値をそのまま使う**
+（狭めると、違う policy で回した古い区間が1つの arm に潰れる）。鍵に入れられない形の
+名前は「識別できない」として拒む。
+
 **適用側の鍵にだけ `operating_mode` が入る。** `MANUAL` / `CALIBRATION` では人が、
 `MAX` では forced_max が適用 demand を決めるので、制御器が回した区間と混ぜない。
 counterfactual 側に mode が無いのは意図的で、提案は mode に依らず作られ、

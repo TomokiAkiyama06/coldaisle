@@ -11,7 +11,7 @@
 from __future__ import annotations
 
 from enum import StrEnum
-from typing import Literal, Self
+from typing import Annotated, Literal, Self
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -31,6 +31,14 @@ EVALUATION_REPORT_SCHEMA_VERSION: Literal[1] = 1
 
 class _Frozen(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid", strict=True)
+
+
+LegacyPolicyName = Annotated[str, Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")]
+"""v1 / v2 の trace に残る、実装固有の Supervisor policy 名。
+
+鍵に入れるので形を縛る。**この形に収まらない値は「識別できない」として評価が拒む**
+（黙って `none` に潰すと、違う policy の区間が同じ行に混ざる）。
+"""
 
 
 class CountedReason(_Frozen):
@@ -58,7 +66,14 @@ class AppliedArm(_Frozen):
 
     controller: ControllerKind | None
     """requested を作った制御器。`MANUAL` / `CALIBRATION` では `None`。"""
-    supervisor_policy: SupervisorPolicyKind | None
+    supervisor_policy: SupervisorPolicyKind | LegacyPolicyName | None
+    """**記録された** Supervisor policy（`ControlState.supervisor_policy`）。
+
+    v1 / v2 の trace は `SupervisorDecision` を持てず、policy は実装固有の自由文字列
+    だった（`ControlState` の注記）。**その値をそのまま鍵に使う。** 列挙値へ狭めると、
+    違う policy で回した古い区間が1つの arm に潰れ、別々の運転が同じ行に混ざる
+    （決定記録 0054 §2.1 の「trace の証拠から決める」に反する）。
+    """
     authority_stage: AuthorityStage
     operating_mode: OperatingMode
 
@@ -66,7 +81,7 @@ class AppliedArm(_Frozen):
     def key(self) -> str:
         """報告の中で arm を指す文字列。**counterfactual とは別の名前空間。**"""
         controller = "none" if self.controller is None else self.controller.value
-        policy = "none" if self.supervisor_policy is None else self.supervisor_policy.value
+        policy = "none" if self.supervisor_policy is None else str(self.supervisor_policy)
         return (
             f"applied:{controller}+{policy}"
             f"@{self.authority_stage.value}/{self.operating_mode.value}"

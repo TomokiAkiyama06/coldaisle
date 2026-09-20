@@ -119,22 +119,49 @@ class EvidenceDatabaseError(RuntimeError):
     """証拠の DB を読めない（存在しない・スキーマが古い / 新しい）。"""
 
 
+SQLITE_MAGIC = b"SQLite format 3\x00"
+"""SQLite の file header。**path を開く前に、中身を1度だけ読んで確かめる。**"""
+
+SIDECAR_SUFFIXES = ("-wal", "-journal")
+"""書き込みが途中である／WAL に未 checkpoint の内容がある、ことを示す添え file。"""
+
+
 class EvidenceDatabase:
-    """評価が読む decision trace と観測。**読み取り専用で開く。**
+    """評価が読む decision trace と観測。**開いても何も作らず、何も変えない。**
 
     `SqliteStore` は開くだけで WAL を設定し、未適用の migration を当て、path が
     無ければ**作る**。証拠として読む DB をそれで開くと、評価が証拠を書き換えてしまう
-    （古い run の DB を開いた瞬間にスキーマが上がる）。ここでは sqlite の
-    `mode=ro` で開き、**版を確かめるだけで何も変えない**。
+    （古い run の DB を開いた瞬間にスキーマが上がる）。
+
+    **`mode=ro` でも足りない。** WAL の DB を `mode=ro` で開くと `-shm` / `-wal` が
+    **作られる**ので、「何も変えない」が守れず、読み取り専用の媒体では開けもしない。
+    ここでは `immutable=1` を使う。添え file を作らず、ロックも取らない。
+
+    **`immutable=1` は「DB が静止している」ことを前提にする。** 動いている書き手が
+    いると未定義で、WAL に未 checkpoint の内容があると**それを黙って無視して古い
+    断面を読む**（table が丸ごと見えないことさえある）。証拠を読み違えるくらいなら
+    読まないほうがよいので、`-wal` / `-journal` が中身を持っていれば**開かずに落とす**。
+    その場合は checkpoint するか、別の場所へ複製してから渡す。
     """
 
     __slots__ = ("_conn", "_version")
 
     def __init__(self, path: Path) -> None:
         if not path.is_file():
-            # `mode=ro` は作らないが、理由が分かるメッセージで落とす。
+            # `immutable=1` は作らないが、理由が分かるメッセージで落とす。
             raise EvidenceDatabaseError(f"証拠の DB が無い: {path}")
-        uri = f"file:{quote(str(path.resolve()))}?mode=ro"
+        header = path.read_bytes()[: len(SQLITE_MAGIC)]
+        if header != SQLITE_MAGIC:
+            raise EvidenceDatabaseError(f"証拠の DB が SQLite の file ではない: {path}")
+        for suffix in SIDECAR_SUFFIXES:
+            sidecar = path.with_name(path.name + suffix)
+            if sidecar.is_file() and sidecar.stat().st_size > 0:
+                raise EvidenceDatabaseError(
+                    f"証拠の DB が静止していない（{sidecar.name} が残っている）: {path}。"
+                    f"**評価は DB を書き換えないので checkpoint もしない。**"
+                    f" 書き手を止めて checkpoint するか、複製してから渡す"
+                )
+        uri = f"file:{quote(str(path.resolve()))}?immutable=1"
         try:
             self._conn = sqlite3.connect(uri, uri=True, isolation_level=None)
         except sqlite3.Error as exc:
@@ -163,7 +190,11 @@ class EvidenceDatabase:
 
     @contextmanager
     def snapshot(self) -> Iterator[None]:
-        """複数の読み出しを1つの読み取りトランザクションにまとめる。"""
+        """複数の読み出しを1つの読み取りトランザクションにまとめる。
+
+        `immutable=1` では file が変わらない前提なので断面は元々1つだが、
+        読み出しの単位を明示しておく。
+        """
         self._conn.execute("BEGIN")
         try:
             yield
