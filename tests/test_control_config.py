@@ -163,7 +163,7 @@ def valid_documents() -> dict[str, dict[str, object]]:
             },
         },
         "safety.yaml": {
-            "schema_version": 2,
+            "schema_version": 3,
             "absolute_temp_ceiling_c": provisional(85.0),
             "zone_min_demand": {
                 "front": provisional(0.4),
@@ -202,6 +202,7 @@ def valid_documents() -> dict[str, dict[str, object]]:
             "ramp_down_per_s": provisional(0.1),
             "startup_settle_ms": provisional(3000),
             "fault_clear_hold_ms": provisional(3000),
+            "tick_ms": provisional(1000),
             "tick_deadline_ms": provisional(100),
             "overrun_consecutive_limit": provisional(3),
             "watchdog_timeout_ms": provisional(5000),
@@ -343,11 +344,11 @@ def load_config(tmp_path: Path) -> ControlConfig:
 def test_complete_config_has_traceable_sources_and_is_not_actuation_ready(tmp_path: Path) -> None:
     config = load_config(tmp_path)
 
-    assert CONTROL_CONFIG_VERSION == 9
+    assert CONTROL_CONFIG_VERSION == 10
     assert config.actuation_permitted is False
     metadata = config.trace_metadata()["control_config"]
     assert metadata["fan_hardware"]["name"] == "fan-hardware.yaml"
-    assert metadata["safety"]["schema_version"] == 2
+    assert metadata["safety"]["schema_version"] == 3
     assert metadata["policy"]["schema_version"] == 9
     assert len(metadata["safety"]["sha256"]) == 64
 

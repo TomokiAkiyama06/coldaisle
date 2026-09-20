@@ -8,6 +8,7 @@ from coldaisle.control.reactive.guard import (
     GuardTransition,
     ReactiveGuard,
     ReactiveGuardDecision,
+    guard_input_metrics,
 )
 
 __all__ = [
@@ -18,4 +19,5 @@ __all__ = [
     "GuardTransition",
     "ReactiveGuard",
     "ReactiveGuardDecision",
+    "guard_input_metrics",
 ]

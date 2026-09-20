@@ -1211,6 +1211,21 @@ def _tick_for_schema_version(version: int, *, ts_ms: int, tick_id: int) -> Contr
     if version >= 3:
         # v3以降はsupervisor_policyにSupervisor decisionを要求する。無い形で記録する
         raw["state"]["supervisor_policy"] = None
+    if version >= 8:
+        # v8は「版が中身を表す」ため、runtimeを省いた記録を作れない（#74 / 決定記録 0060）
+        raw["runtime"] = {
+            "schema_version": 1,
+            "tick_period_ms": 1_000,
+            "deadline_ms": 500,
+            "duration_ms": 10,
+            "deadline_exceeded": False,
+            "snapshot_schema_version": 1,
+            "config": {
+                "fan_hardware_sha256": "0" * 64,
+                "safety_sha256": "1" * 64,
+                "policy_sha256": "2" * 64,
+            },
+        }
     return ControlTick.model_validate_json(json.dumps(raw))
 
 
