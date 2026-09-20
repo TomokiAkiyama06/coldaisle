@@ -57,6 +57,10 @@
 
 > **承認点**: `safety.yaml` の schema を変えるので、0028 §2.9 の承認点 2 に当たる。
 > 2026-09-20 に所有者が承認した。
+>
+> **2026-09-21 訂正**: 上の不等式は当初 `watchdog_timeout_ms >= tick_ms * 2` と書いていたが、
+> heartbeat の間隔には「その tick の処理」も入るため、その値では成り立たなかった。
+> 所有者の承認のあと、**保守側へ寄せる向きの訂正**として現在の式に直した（§2.7）。
 
 ### 2.2 Telemetry は読み取り専用のストア経由で供給する（0028 未決 8）
 
@@ -233,6 +237,37 @@ busy timeout（5 秒）は暫定の `watchdog_timeout_ms`（5 秒）と同じな
 最後の行は 0028 §2.7 の「設定不正なら Max」**には当たらない**。あの規則は制御設定そのものが
 読めない場合のもので、ここに混ぜると「DB が一時的に開けない」だけで Max を書く。
 §2.9 の規則そのものは変えていない（適用する範囲を、制御設定の不正に限ると明示しただけである）。
+**終了コード 5（Max を書かずに制御を取らない）は本節の refinement の範囲**として
+2026-09-21 に所有者が確認した。
+
+#### worker の結果は、この process が出した snapshot に紐づくものだけを使う
+
+§2.6 の RL 出力と**同じ束縛を Learned MPC の結果にも掛ける**。MPC の有効期限は
+「受け取ってから `mpc.valid_ms`」（0028 §2.6。0041 は Supervisor 側だけを Supersede した）
+なので、受信時刻が「この loop が初めて見た時刻」であることに意味がある。ところが
+`coldaisle-fand` を再起動すると `tick_id` は 0 から振り直されるので、生き残った worker の
+古い結果をそのまま受け取ると、**前の process のときに作られた提案へ新しい受信時刻を押す**。
+
+- 提案は `ControllerProposal.seq` / `computed_at_ms`（worker が読んだ snapshot の
+  `tick_id` / `ts_ms`）で照合する。**この process が出した snapshot**に一致しなければ使わない
+- 覚えておく snapshot の幅は、有効期限のいちばん長い提案（`supervisor.valid_ms` と
+  `mpc.valid_ms` の大きいほう）が収まる長さにする。短いと、まだ使える提案まで落とす
+- 提案の無い結果（worker の失敗）は素通しする。**Fallback へ倒す向きにしか効かず、
+  制御権を与えない**ため
+
+#### 降格の書き残しも、待ち続けない
+
+authority の降格（#92）は memory 上で先に効かせてから journal へ書く（0057 §2.6）。
+その書き込みは `flock` を取るので、**他 process が持っていると無期限に待つ**。control tick の
+中から呼ばれる以上、その待ちは2つの heartbeat のあいだに丸ごと入る。
+
+- `AuthorityStore` に lock の待ち上限を持たせ、control runtime から使う store には
+  **必ず指定する**（`AuthorityRuntime` が上限の無い store を拒む）。人の操作（昇格）は
+  deadman の無い経路なので、待ち続けてよい
+- 上限で諦めたら `AuthorityStoreError` になり、**memory 上の上限は下がったまま**で
+  `persist_failure` が残る（安全側は待たない）
+- **書き残せなかった降格を黙って流さない。** control loop は `persisted=False` を error として
+  記録する（再起動で戻るので、運用者が直せるようにする）
 
 ### 2.8 authority の既定は `SHADOW`
 
@@ -285,6 +320,9 @@ Learned MPC が実 Fan を握る。trace に残す stage も Gate と同じ式
 | decision trace の保存を別スレッドの queue へ逃がす | 安全側の経路にスレッドと「queue が溢れたときどうするか」という失敗の種類が増える。待ちの上限を決めれば足りる（2.7） |
 | `NOTIFY_SOCKET` があれば deadman があるとみなす | `Type=notify` なら `WatchdogSec` が無くても渡る。`WATCHDOG=1` が誰にも見られない状態を「deadman あり」と扱う（2.7） |
 | 起動時の失敗をまとめて「設定不正」として全 zone Max にする | Metric Catalog が読めない・DB が一時的に開けないだけで、0028 §2.7 が決めていない状況で制御を取る（2.7） |
+| Learned MPC の結果の受信時刻を、元 snapshot を確かめずに押す | 再起動で `tick_id` が 0 に戻るので、生き残った worker の古い結果が新しく見える（2.7） |
+| 降格の書き残しで `flock` を待ち続ける | control tick の中から呼ばれるので、待ちが2つの heartbeat のあいだに丸ごと入る（2.7） |
+| 書き残せなかった降格を戻す（元の stage に復帰させる） | disk が一杯な間ほど高い authority で回ることになる。下げたままにして失敗を残す（0057 §2.6 / 2.7） |
 | worker が読めない tick で、前回の結果の識別子と受信時刻を捨てる | 同じ提案が後から出てきたときに新しい受信時刻を押し、止まった worker の提案が有効期限を取り戻す（2.6） |
 | RL 出力を `tick_id` だけで元 snapshot に結び付ける | 番号は再起動で 0 に戻る。前の process の出力が無関係な snapshot に結び付く（2.6） |
 | `runtime` を持たない v8 の記録を許す | 版を見ても中身が言えなくなる。版は自分の中身を表す（2.4） |

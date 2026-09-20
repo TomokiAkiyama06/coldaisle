@@ -211,10 +211,27 @@ class SupervisorOutputSource(Protocol):
         ...
 
 
+class DemotionReport(Protocol):
+    """#92 が返す降格の結果のうち、loop が記録に残す面。"""
+
+    @property
+    def to_stage(self) -> AuthorityStage: ...
+
+    @property
+    def persisted(self) -> bool: ...
+
+    @property
+    def persist_failure(self) -> Reason | None: ...
+
+
 class AuthorityObserver(Protocol):
     """#92 の `AuthorityRuntime` のうち、loop が使う読み取りと観測だけの面。
 
     **上げる経路を持たない。** 昇格は人の承認だけが行う（0028 §2.5 (b)）。
+
+    `observe` は**待たない**。降格は memory 上で先に効かせ、書き残しの I/O に上限を
+    掛ける（決定記録 0060 §2.7）。待ち続ける実装を渡すと、2つの heartbeat のあいだに
+    その待ちが丸ごと入る。
     """
 
     def current_stage(self) -> AuthorityStage:
@@ -229,8 +246,8 @@ class AuthorityObserver(Protocol):
         confidence_level: ConfidenceLevel | None,
         ood: bool | None,
         now_mono_ms: int,
-    ) -> object:
-        """この tick の健全性を渡す。戻り値は loop では使わない。"""
+    ) -> DemotionReport | None:
+        """この tick の健全性を渡す。下げたときだけ結果を返す。"""
         ...
 
 
@@ -260,8 +277,9 @@ class StaticAuthority:
         confidence_level: ConfidenceLevel | None,
         ood: bool | None,
         now_mono_ms: int,
-    ) -> None:
+    ) -> DemotionReport | None:
         """記録を持たないので何もしない。"""
+        return None
 
 
 class Watchdog(Protocol):
@@ -512,7 +530,10 @@ class ControlLoop:
         self._rl_received_mono_ms: int | None = None
         # RL 出力の元 snapshot を loop 自身の単調時計で特定するための窓。有効期限より
         # 長く持っても使えないので、設定から幅を決める（固定長にしない）。
-        window = config.policy.supervisor.valid_ms // config.safety.tick_ms.value + 2
+        # **有効期限のいちばん長い提案が収まる幅**にする。窓が短いと、まだ使える提案の
+        # 元 snapshot を特定できず、健全な worker の提案まで落としてしまう。
+        horizon_ms = max(config.policy.supervisor.valid_ms, config.policy.mpc.valid_ms)
+        window = horizon_ms // config.safety.tick_ms.value + 2
         self._snapshots: deque[_SnapshotIdentity] = deque(maxlen=window)
         self._config_digest = ControlConfigDigest(
             fan_hardware_sha256=config.sources.fan_hardware.sha256,
@@ -790,15 +811,8 @@ class ControlLoop:
         # **tick 番号だけで照合しない。** 番号は再起動で 0 に戻るので、前の process の出力が
         # 新しい process の無関係な snapshot に結び付く。壁時計の時刻と snapshot の形まで
         # 一致した記録だけを「この loop が出した snapshot」とみなす（0060 §2.6）。
-        source = next(
-            (
-                item
-                for item in self._snapshots
-                if item.tick_id == output.tick_id
-                and item.ts_ms == output.ts_ms
-                and item.schema_version == output.snapshot_schema_version
-            ),
-            None,
+        source = self._issued_snapshot(
+            output.tick_id, output.ts_ms, schema_version=output.snapshot_schema_version
         )
         if source is None or source.monotonic_ms > received_mono_ms:
             return None, Reason(
@@ -814,6 +828,25 @@ class ControlLoop:
                 output=output,
                 source_monotonic_ms=source.monotonic_ms,
                 received_monotonic_ms=received_mono_ms,
+            ),
+            None,
+        )
+
+    def _issued_snapshot(
+        self, tick_id: int, ts_ms: int, *, schema_version: int | None = None
+    ) -> _SnapshotIdentity | None:
+        """**この process が出した** snapshot の記録を探す。
+
+        `tick_id` だけでは足りない（再起動で 0 に戻る）。壁時計の `ts_ms` まで一致した
+        ものだけを自分が出した snapshot とみなす（決定記録 0060 §2.6）。
+        """
+        return next(
+            (
+                item
+                for item in self._snapshots
+                if item.tick_id == tick_id
+                and item.ts_ms == ts_ms
+                and (schema_version is None or item.schema_version == schema_version)
             ),
             None,
         )
@@ -953,11 +986,41 @@ class ControlLoop:
             # あとで同じ提案が出てきたときに新しい受信時刻を押してしまい、止まった worker の
             # 古い提案が何度でも有効期限を取り戻す（決定記録 0060 §2.6）。
             return None
+        if not self._result_is_bound_to_our_snapshot(result):
+            return None
         digest = result.result_digest()
         if digest != self._learned_digest:
             self._learned_digest = digest
             self._learned_received_mono_ms = now_mono_ms
         return result
+
+    def _result_is_bound_to_our_snapshot(self, result: MpcProposal) -> bool:
+        """worker 結果が、**この process が出した snapshot**から作られたか（0060 §2.6）。
+
+        受信時刻は「この loop が初めて見た時刻」なので、再起動をまたいで生き残った worker の
+        結果をそのまま受け取ると、前の process のときに作られた提案へ新しい受信時刻を押す。
+        `tick_id` は 0 から振り直されるため、それだけでは見分けられない。
+
+        提案の無い結果（worker の失敗）は素通しする。**Fallback へ倒す向きにしか効かず、
+        制御権を与えないため**である。
+        """
+        proposal = result.proposal
+        if proposal is None:
+            return True
+        # `ControllerProposal.seq` / `computed_at_ms` は、worker が読んだ snapshot の
+        # `tick_id` / `ts_ms` そのものである（#86）。
+        if self._issued_snapshot(proposal.seq, proposal.computed_at_ms) is not None:
+            return True
+        LOGGER.warning(
+            "learned worker の結果がこの process の snapshot に紐づかない",
+            extra={
+                logs.FIELDS_KEY: {
+                    "seq": proposal.seq,
+                    "computed_at_ms": proposal.computed_at_ms,
+                }
+            },
+        )
+        return False
 
     def _learned_status(
         self,
@@ -1015,7 +1078,7 @@ class ControlLoop:
     ) -> None:
         gate = None if selection is None else selection.model_gate
         try:
-            self._authority.observe(
+            demotion = self._authority.observe(
                 safety_state=safety_state,
                 demotion_recommended=selection is not None and selection.demotion_recommended,
                 confidence_level=None if gate is None else gate.confidence_level,
@@ -1025,6 +1088,27 @@ class ControlLoop:
         except Exception:
             # 降格を記録できなくても制御は続ける（#92 が理由を持つ）。上げる経路は無い。
             LOGGER.exception("authority runtime observation failed")
+            return
+        if demotion is None:
+            return
+        if demotion.persisted:
+            LOGGER.warning(
+                "authority stage を下げた",
+                extra={logs.FIELDS_KEY: {"to_stage": demotion.to_stage.value}},
+            )
+            return
+        # **書き残せなかった降格を黙って流さない。** memory 上の上限は下がったままだが、
+        # 再起動で戻るので、運用者が直せるように残す（0057 §2.6 / 0060 §2.7）。
+        failure = demotion.persist_failure
+        LOGGER.error(
+            "authority stage を下げたが書き残せなかった（再起動で戻る）",
+            extra={
+                logs.FIELDS_KEY: {
+                    "to_stage": demotion.to_stage.value,
+                    "persist_failure": None if failure is None else failure.model_dump(mode="json"),
+                }
+            },
+        )
 
     def _control_state(
         self,

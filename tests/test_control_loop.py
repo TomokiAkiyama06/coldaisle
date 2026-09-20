@@ -28,6 +28,8 @@
 24. deadman の有無は `WATCHDOG_USEC` で決め、通知先の存在を証拠にしない
 25. decision trace の保存は heartbeat の間隔を食いつぶせない（待ちに上限がある）
 26. 起動時の失敗を**別の種類**として報告しない（設定不正と環境の失敗を混ぜない）
+27. worker の結果は、**この process が出した snapshot**に紐づくものだけを受け取る
+28. 降格の書き残しは無期限に待たず、失敗が見える
 """
 
 from __future__ import annotations
@@ -267,11 +269,21 @@ class RecordingAuthority:
         self.order.append("authority")
 
 
+@dataclass(frozen=True)
+class StubProposalOrigin:
+    """worker が読んだ snapshot（`ControllerProposal.seq` / `computed_at_ms` と同じ）。"""
+
+    seq: int
+    computed_at_ms: int
+
+
 @dataclass
 class StubWorkerResult:
     """worker 結果の代わり。loop が使うのは識別子と `to_status` だけである。"""
 
     digest: str = "a" * 64
+    proposal: Any = None
+    """この結果が読んだ snapshot（`seq` / `computed_at_ms`）。None は worker の失敗。"""
     seen_received_ms: list[int] = field(default_factory=list)
     seen_deadline_exceeded: list[bool] = field(default_factory=list)
     seen_snapshot_status: list[SnapshotStatus] = field(default_factory=list)
@@ -321,6 +333,7 @@ class Harness:
         fault_plan: SimulatedFaultPlan | None = None,
         learned_source: Any = None,
         watchdog: Any = None,
+        authority: Any = None,
         guard: Any = None,
         fallback: Any = None,
         gate: Any = None,
@@ -378,7 +391,7 @@ class Harness:
             learned_source=learned_source,
             shadow=ShadowRecorder(self.config.policy.shadow),
             trace=ControlTraceLogger(self.trace) if with_trace else None,
-            authority=RecordingAuthority(self.authority, self.order),
+            authority=authority or RecordingAuthority(self.authority, self.order),
             watchdog=self.watchdog,
         )
 
@@ -1002,6 +1015,114 @@ def _rl_output(*, tick_id: int, ts_ms: int) -> Any:
         ),
         computed_at_ms=ts_ms,
     )
+
+
+def test_invariant_27_a_learned_result_from_another_process_is_not_accepted(catalog) -> None:
+    """**再起動をまたいだ worker 結果を新しく見せない**（Codex 4057590589）。
+
+    受信時刻は「この loop が初めて見た時刻」なので、生き残った worker の古い結果を
+    そのまま受け取ると、前の process のときに作られた提案へ新しい受信時刻を押す。
+    `tick_id` は 0 から振り直されるため、番号だけでは見分けられない。
+    """
+    source = StubWorkerSource(result=None)
+    harness = Harness(catalog, learned_source=source)
+    first = harness.tick()
+
+    ours = StubWorkerResult(
+        digest="b" * 64,
+        proposal=StubProposalOrigin(seq=first.tick.tick_id, computed_at_ms=first.tick.ts_ms),
+    )
+    source.result = ours
+    harness.tick()
+    assert ours.seen_received_ms, "この process の snapshot から作られた結果は受け取る"
+
+    stale = StubWorkerResult(
+        digest="c" * 64,
+        proposal=StubProposalOrigin(seq=first.tick.tick_id, computed_at_ms=1),
+    )
+    source.result = stale
+    harness.tick()
+
+    assert stale.seen_received_ms == [], "別 process の snapshot の結果を Gate へ渡している"
+
+
+def test_invariant_27_a_worker_failure_still_reaches_the_gate(catalog) -> None:
+    """提案の無い結果（worker の失敗）は素通しする。**Fallback へ倒すだけで制御権を与えない。**"""
+    stub = StubWorkerResult()
+    harness = Harness(catalog, learned_source=StubWorkerSource(result=stub))
+    harness.tick()
+
+    assert stub.seen_received_ms
+
+
+def test_invariant_28_the_authority_store_does_not_wait_forever_for_its_lock(
+    tmp_path: Path,
+) -> None:
+    """降格の書き残しが lock を無期限に待たない（Codex 4057590594）。
+
+    待ち続けると、control tick のあいだに他 process の lock が居座り、2つの heartbeat の
+    あいだにその待ちが丸ごと入る。
+    """
+    import fcntl
+    import os
+
+    from coldaisle.control.authority import (
+        AuthorityStore,
+        AuthorityStoreError,
+        AuthorityTrigger,
+    )
+
+    root = tmp_path / "authority"
+    root.mkdir(parents=True)
+    store = AuthorityStore(root, SimulatedClock(TEST_EPOCH_MS), lock_timeout_ms=20)
+    held = os.open(root / ".authority.lock", os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(held, fcntl.LOCK_EX)
+        with pytest.raises(AuthorityStoreError, match="以内に取れなかった"):
+            store.lower_stage(
+                to_stage=StaticAuthority().current_stage(),
+                actor="test",
+                reason="lock",
+                trigger=AuthorityTrigger.AUTOMATIC,
+            )
+    finally:
+        os.close(held)
+
+    with pytest.raises(AuthorityStoreError, match="lock の待ち上限"):
+        # 待ち上限の無い store を control runtime に配線させない。
+        from coldaisle.control.authority import AuthorityRuntime
+
+        AuthorityRuntime(
+            AuthorityStore(root, SimulatedClock(TEST_EPOCH_MS)),
+            control_config().policy,
+        )
+
+
+def test_invariant_28_a_demotion_that_cannot_be_persisted_is_visible(catalog, caplog) -> None:
+    """書き残せなかった降格を黙って流さない（再起動で戻るので運用者が直す）。"""
+
+    @dataclass
+    class FailingAuthority:
+        inner: StaticAuthority
+
+        def current_stage(self):  # type: ignore[no-untyped-def]
+            return self.inner.current_stage()
+
+        def observe(self, **kwargs: Any) -> Any:
+            from types import SimpleNamespace
+
+            return SimpleNamespace(
+                to_stage=self.inner.current_stage(),
+                persisted=False,
+                persist_failure=Reason(code="authority_persist_failed", detail="disk full"),
+            )
+
+    harness = Harness(catalog, authority=FailingAuthority(StaticAuthority()))
+    with caplog.at_level("ERROR"):
+        result = harness.tick()
+
+    assert result.hardware is not None, "記録できなくても制御は続ける"
+    assert any("書き残せなかった" in record.message for record in caplog.records)
 
 
 def test_invariant_15_a_late_tick_never_lets_the_learned_proposal_in(catalog) -> None:
