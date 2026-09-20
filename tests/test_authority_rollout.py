@@ -1071,7 +1071,7 @@ def test_invariant_5_t_an_applied_arm_without_a_recorded_artifact_is_refused(
     """**artifact 不明の適用実績で上げない**（fail closed）。
 
     欄を持たない v1〜v6 だけで回した区間は「どの artifact の実績か」を言えない。
-    **推測で埋めない。**
+    **推測で埋めない。** 不明だけが数えられ、artifact は1つも挙がらない形になる。
     """
     authority = store(tmp_path)
     first = report_document()
@@ -1084,6 +1084,7 @@ def test_invariant_5_t_an_applied_arm_without_a_recorded_artifact_is_refused(
         arm_stage=AuthorityStage.LIMITED,
         with_applied_learned=True,
         applied_artifacts=(),
+        applied_unbound_ticks=1_000,
     )
     approval = approval_for(
         document,
@@ -1241,6 +1242,26 @@ def test_invariant_5_x_a_sibling_applied_arm_with_unknown_artifacts_blocks_the_p
 
     with pytest.raises(AuthorityEvidenceError, match="artifact を言えない適用 tick"):
         raise_stage(authority, approval=approval, document=document)
+
+
+def test_invariant_5_y_a_report_that_predates_the_artifact_fields_cannot_promote(
+    tmp_path: Path,
+) -> None:
+    """**artifact の完全性を言えない古い報告で昇格しない**（codex #4057527950）。
+
+    報告 v1 には適用 arm の `model_artifacts` / `unbound_attested_ticks` が無い。
+    欄の無さは「空・0」と読めてしまい、**適用 Learned arm が混ざった古い報告が
+    「完全に束縛できている」ように見える。** 記録の無さは unknown であって
+    completeness ではない（決定記録 0059 §2.5）。
+    """
+    document = report_document()
+    payload = json.loads(document)
+    payload["schema_version"] = 1
+    document = json.dumps(payload).encode("utf-8")
+    approval = approval_for(document, evidence=evidence_for(document))
+
+    with pytest.raises(AuthorityEvidenceError, match="完全性を言えない古い報告"):
+        raise_stage(store(tmp_path), approval=approval, document=document)
 
 
 def test_invariant_5_n_a_blocked_sibling_learned_arm_blocks_the_promotion(

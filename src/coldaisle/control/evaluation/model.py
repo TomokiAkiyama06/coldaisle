@@ -25,8 +25,17 @@ from coldaisle.control.schema import (
     Zone,
 )
 
-EVALUATION_REPORT_SCHEMA_VERSION: Literal[1] = 1
-"""報告1つの形の版。**欄の意味を変えたら上げる。**"""
+EVALUATION_REPORT_SCHEMA_VERSION: Literal[2] = 2
+"""報告1つの形の版。**欄の意味を変えたら上げる。**
+
+- v2（#159）: 適用 arm の `model_artifacts` / `unbound_attested_ticks`。
+  **欄を足しただけだが版を上げる**（codex #4057527950）。この2つは
+  「無い＝空・0」と読めてしまい、**artifact の完全性を言えない古い報告が
+  「完全に束縛できている」ように見える。** 0057 §2.4 が `last_attested_ts_ms` を
+  足したときは、欄の無い報告が `None`＝「言えない」と読まれたので版を上げなかった。
+  **absence が unknown に落ちるか completeness に落ちるかで扱いを変える。**
+  v1 は読めるが、昇格の証拠には使えない（#92 が拒む）
+"""
 
 
 class _Frozen(BaseModel):
@@ -388,13 +397,24 @@ class AppliedArmReport(_Frozen):
         if tuple(sorted(self.model_artifacts)) != self.model_artifacts:
             # 同じ入力から同じ bytes を出すため（0054 §2.7）。
             raise ValueError("適用した artifact は昇順に並べる")
-        bound = bool(self.model_artifacts) or self.unbound_attested_ticks > 0
-        if bound and self.arm.controller is not ControllerKind.LEARNED_MPC:
+        learned = self.arm.controller is ControllerKind.LEARNED_MPC
+        counted = bool(self.model_artifacts) or self.unbound_attested_ticks > 0
+        if counted and not learned:
             # artifact を持つ提案を出せるのは Learned MPC だけ（0028 §2.5 (c)）。
             raise ValueError("Learned MPC 以外の適用 arm に model artifact を付けない")
-        if bound and self.last_attested_ts_ms is None:
+        if self.model_artifacts and self.last_attested_ts_ms is None:
             # 裏づけのある提案が1つも無い arm に、その提案の artifact は存在しない。
+            # **`unbound_attested_ticks` はこの条件に含めない。** `model_gate` を持たない
+            # v1〜v4 の tick は「適用したが裏づけの記録が無い」ので、時刻は `None` のまま
+            # 不明だけが数えられる。
             raise ValueError("裏づけの無い適用 arm に model artifact を付けない")
+        if learned and not counted:
+            # **数えていないことを「全部束縛できた」と読ませない**（codex #4057527950）。
+            # 適用 arm が Learned MPC なら、その tick は必ず artifact を言えるか
+            # 言えないかのどちらかである。欄の無い古い報告はここで落ちる。
+            raise ValueError(
+                f"適用 Learned MPC の arm には artifact の勘定が要る（arm={self.arm_key}）"
+            )
         return self
 
 
@@ -716,7 +736,7 @@ class EvaluationReport(_Frozen):
     **同じ入力からは同じ bytes になる。** 生成時刻を持たず、時刻はすべて証拠から来る。
     """
 
-    schema_version: Literal[1] = EVALUATION_REPORT_SCHEMA_VERSION
+    schema_version: Literal[1, 2] = EVALUATION_REPORT_SCHEMA_VERSION
     provenance: EvaluationProvenance
     segments: tuple[SegmentReport, ...] = Field(min_length=1)
     worst_cases: tuple[WorstCase, ...] = ()
@@ -746,6 +766,14 @@ class EvaluationReport(_Frozen):
         for segment in self.segments:
             for group in segment.groups:
                 for applied in group.applied:
+                    if self.schema_version < 2 and (
+                        applied.model_artifacts or applied.unbound_attested_ticks
+                    ):
+                        # v1 の報告にこの欄は存在しなかった。後から足して読ませない。
+                        raise ValueError(
+                            "適用 arm の artifact を記録する報告は schema version 2 にする"
+                            f"（arm={applied.arm_key}）"
+                        )
                     if not set(applied.model_artifacts) <= observed:
                         # run が一度も見ていない artifact を arm の実績に書けない。
                         # 書けると、報告全体の照合（#92）を通る artifact を arm 側にだけ

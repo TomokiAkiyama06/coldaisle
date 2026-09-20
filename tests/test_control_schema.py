@@ -1054,3 +1054,39 @@ def test_a_tick_cannot_claim_two_different_artifacts():
                 counterfactuals=(learned_counterfactual,),
             ),
         )
+
+
+@pytest.mark.parametrize("schema_version", [1, 2, 3, 4])
+def test_a_learned_tick_without_a_model_gate_is_artifact_unknown(schema_version: int):
+    """**`model_gate` を必須にしたのは v5 から**（codex #4057527947）。
+
+    v1〜v4 は Learned MPC を適用した tick でも `model_gate` を持たない。gate の有無から
+    数えると、そういう tick が「artifact 不明」にも「束縛できた」にも数えられず、
+    **欠けていること自体が記録から消える。** 起点は `ControlState` にする。
+    """
+    stored = ControlTick(
+        schema_version=schema_version,
+        tick_id=1,
+        ts_ms=NOW_MS,
+        state=learned_state(),
+        zones=zones(passthrough()),
+    )
+
+    restored = ControlTick.model_validate_json(stored.model_dump_json())
+    assert restored.model_gate is None
+    assert restored.state.active_controller is ControllerKind.LEARNED_MPC
+    assert restored.applied_model_artifact is None
+    assert restored.applied_artifact_unknown is True, "記録の無さを「不明なし」に落とさない"
+
+
+def test_a_fallback_tick_is_not_counted_as_artifact_unknown():
+    """**「言えない」と「そうではなかった」を混ぜない。**
+
+    Fallback で回していた tick は artifact を持たないのが正しい姿で、「不明」ではない。
+    ここを混ぜると、Fallback 区間の多い報告がすべて不明で埋まり、昇格が永久に来ない。
+    """
+    recorded = tick(passthrough())
+
+    assert recorded.state.active_controller is ControllerKind.FALLBACK
+    assert recorded.applied_model_artifact is None
+    assert recorded.applied_artifact_unknown is False

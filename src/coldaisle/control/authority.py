@@ -76,6 +76,7 @@ __all__ = [
     "AUTHORITY_STATE_FILENAME",
     "BASELINE_STAGE",
     "MAX_JOURNAL_EVENTS",
+    "MIN_EVIDENCE_REPORT_SCHEMA_VERSION",
     "STAGE_ORDER",
     "AuthorityApprovalError",
     "AuthorityChangeKind",
@@ -108,6 +109,14 @@ AUTHORITY_STATE_FILENAME = "authority.json"
 _LOCK_FILENAME = ".authority.lock"
 _MAX_JOURNAL_BYTES = 4 * 1024 * 1024
 """journal の読み書きに許す大きさ。資源の境界であり、調整値ではない。"""
+
+MIN_EVIDENCE_REPORT_SCHEMA_VERSION = 2
+"""昇格の証拠に使える Offline Evaluation 報告の最小 version（#159 / 決定記録 0059 §2.5）。
+
+v1 は適用 arm の `model_artifacts` / `unbound_attested_ticks` を持たない。欄の無さが
+「空・0」と読めてしまい、**artifact の完全性を言えない報告が「完全に束縛できた」ように
+見える**（codex #4057527950）。読むことはできるが、昇格の根拠にはしない。
+"""
 
 MAX_JOURNAL_EVENTS = 4_096
 """1つの journal に残す変更の件数。超えたら**昇格を拒む**（黙って古い記録を捨てない）。"""
@@ -762,6 +771,16 @@ class AuthorityStore:
             report = EvaluationReport.model_validate_json(evaluation_report)
         except ValidationError as error:
             raise AuthorityEvidenceError("Offline Evaluation の報告を検証できない") from error
+        if report.schema_version < MIN_EVIDENCE_REPORT_SCHEMA_VERSION:
+            # **artifact の完全性を言えない報告で昇格しない**（codex #4057527950）。
+            # v1 には適用 arm の `model_artifacts` / `unbound_attested_ticks` が無く、
+            # 欄の無さが「空・0」＝「全部束縛できた」と読めてしまう。
+            # **記録の無さは unknown であって completeness ではない**（決定記録 0059 §2.5）。
+            raise AuthorityEvidenceError(
+                "artifact の完全性を言えない古い報告では昇格できない"
+                f"（schema_version={report.schema_version}; "
+                f"required>={MIN_EVIDENCE_REPORT_SCHEMA_VERSION}）"
+            )
         provenance = report.provenance
         if provenance.conditions_sha256 != evidence.conditions_sha256:
             raise AuthorityEvidenceError("報告の比較条件が承認と違う")

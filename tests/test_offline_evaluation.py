@@ -1511,7 +1511,7 @@ def test_the_cli_writes_a_deterministic_report(tmp_path: Path) -> None:
     assert out.read_text(encoding="utf-8") == first
 
     document = json.loads(first)
-    assert document["schema_version"] == 1
+    assert document["schema_version"] == 2
     assert document["segments"][0]["run_id"] == "pr91-cli"
     assert "generated_at" not in document
 
@@ -2529,3 +2529,80 @@ def test_invariant_17_d_an_arm_cannot_name_an_artifact_the_run_never_saw() -> No
                 ticks=1, safety_states=(CountedReason(code="normal", count=1),)
             ),
         )
+
+
+def test_invariant_17_e_a_learned_tick_without_a_model_gate_counts_as_unknown(
+    context: EvaluationContext,
+) -> None:
+    """**`model_gate` を持たない v1〜v4 の適用 tick も「不明」に数える**（codex #4057527947）。
+
+    数えないと、その区間は artifact を1つも挙げないまま `unbound_attested_ticks == 0` に
+    なり、`#92` の「適用 arm すべてに不明が無いこと」を素通りする。
+    """
+    traces = []
+    for index in range(3):
+        tick = tick_at(
+            TICK_TS_MS + index * STEP_MS,
+            index,
+            shadow=False,
+            state=_applied_learned_state(),
+            model_gate=_applied_gate(),
+        )
+        document = tick.model_dump(mode="python")
+        # v4 の trace。Learned MPC を適用しているが `model_gate` を持たない。
+        document["schema_version"] = 4
+        document["model_gate"] = None
+        traces.append(trace_of(ControlTick.model_validate(document)))
+
+    report = evaluate([run_of(traces, [])], context=context)
+    applied = overall(report).applied[0]
+
+    assert applied.arm.controller is ControllerKind.LEARNED_MPC
+    assert applied.model_artifacts == ()
+    assert applied.unbound_attested_ticks == 3, "記録の無さを「不明なし」に落とさない"
+    assert applied.last_attested_ts_ms is None
+    assert "applied_artifact_unknown" in {gap.code for gap in applied.gaps}
+
+
+def test_invariant_17_f_an_applied_learned_arm_must_account_for_every_tick() -> None:
+    """**数えていないことを「全部束縛できた」と読ませない**（codex #4057527950）。
+
+    適用 arm が Learned MPC なら、その tick は必ず artifact を言えるか言えないかの
+    どちらかである。欄の無い古い報告はここで落ちる。
+    """
+    from coldaisle.control.evaluation.model import AppliedArmReport, InterventionReport
+
+    arm = AppliedArm(
+        controller=ControllerKind.LEARNED_MPC,
+        supervisor_policy=SupervisorPolicyKind.RULE,
+        authority_stage=AuthorityStage.LIMITED,
+        operating_mode=OperatingMode.AUTO,
+    )
+
+    with pytest.raises(ValidationError, match="artifact の勘定が要る"):
+        AppliedArmReport(
+            arm=arm,
+            arm_key=arm.key,
+            ticks=1,
+            first_ts_ms=TICK_TS_MS,
+            last_ts_ms=TICK_TS_MS,
+            last_attested_ts_ms=TICK_TS_MS,
+            interventions=InterventionReport(
+                ticks=1, safety_states=(CountedReason(code="normal", count=1),)
+            ),
+        )
+
+
+def test_invariant_17_g_a_v1_report_cannot_carry_the_fields_added_in_v2(
+    context: EvaluationContext,
+) -> None:
+    """**古い version に、後から意味の違う欄を足して読ませない**（決定記録 0030 と同じ向き）。"""
+    report = evaluate(
+        [run_of(_applied_learned_run(artifacts=("a" * 64,) * 3), [])], context=context
+    )
+    document = json.loads(report.model_dump_json())
+    assert document["schema_version"] == 2
+    document["schema_version"] = 1
+
+    with pytest.raises(ValidationError, match="schema version 2"):
+        EvaluationReport.model_validate_json(json.dumps(document))

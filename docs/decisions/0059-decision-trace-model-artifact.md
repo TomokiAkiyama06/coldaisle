@@ -186,9 +186,16 @@ gate の段（§2.4）も同じである。
 - 報告の型として、**適用 arm の `model_artifacts` は `provenance.versions.model_artifacts` の
   部分集合**でなければならない。run が一度も見ていない artifact を arm の実績に書けない
 
-**報告の schema version は上げない。** 既存の欄の意味は変わらず、古い報告は欄が無い
-（`()` / `0`）として読まれる。0057 §2.4 が `last_attested_ts_ms` を足したときと同じ扱いで、
-**古い報告では適用側の arm が昇格の根拠にならない**（判断は fail closed のまま）。
+**報告の schema version を 2 へ上げる。** 0057 §2.4 が `last_attested_ts_ms` を足したときは
+上げなかったが、あれは**欄が無い＝`None`＝「言えない」**と読まれたからである。
+今度の2つは**欄が無い＝`()` / `0`**、すなわち**「不明が1件も無い」＝完全**と読めてしまう
+（codex #4057527950）。v1 は読めるが、`#92` は昇格の証拠として受け取らない。
+v1 の報告がこの2欄を持つことも型が拒む（古い version に意味の違う欄を後から足さない）。
+
+**適用 arm が Learned MPC なら、artifact の勘定が必ず存在する**（`model_artifacts` が
+空でないか、`unbound_attested_ticks` が 0 より大きいか）。その arm の tick は必ず
+「artifact を言える」か「言えない」のどちらかなので、**両方とも空になるのは
+「数えていない」ときだけ**である。欄の無い古い報告はここで落ちる。
 
 ### 2.4 適用側の arm を昇格の根拠にできるようにする（0057 §3 の帰結の置き換え）
 
@@ -221,6 +228,32 @@ gate の段（§2.4）も同じである。
 
 **昇格は1段ずつ・人の承認だけ**（0057 §2.3 / §2.5）も、**降格は承認なしで即時**（§2.6）も、
 **Critical Safety は全 stage で同一**（§2.7）も変えない。
+
+### 2.5 **記録の無さは常に「不明」であって「完全」ではない**
+
+本記録で足した欄はすべて「無い」ことがありうる。**そのとき何と読むかを1つの規則で固定する。**
+
+> **artifact に関する記録が無いことは、常に `unknown` である。**
+> **`none` / `0` / `complete` とは読まない。**
+
+具体的には次のとおり（codex #4057527947 / #4057527950）。
+
+| 読む場所 | 「無い」とき | **してはいけない読み方** |
+|---|---|---|
+| `ControlTick.model_gate` が無い（v1〜v4）で `active_controller` が Learned MPC | `applied_artifact_unknown = True` | 「gate が無い＝適用していない＝不明も無い」 |
+| `model_gate.artifact_sha256` が無い（v1〜v6） | 同上 | 「欄が無い＝まだ書いていないだけ」 |
+| `AppliedArmReport.model_artifacts` が空 | その arm は artifact を言えない | 「混ざっていない＝1つに絞れている」 |
+| `AppliedArmReport.unbound_attested_ticks` が 0 | **報告 v2 でだけ**「不明は無い」 | v1 でも同じに読む |
+| `EvaluationReport.schema_version` が 1 | 完全性を**言えない** | 「欄が無い＝完全」 |
+| `ObservedVersions.model_artifacts` が空 | artifact を言えない | 「Production だけで回した」 |
+
+**判断の起点は `ControlState.active_controller` に置く。** `model_gate` の有無から数えると、
+`model_gate` を持たない v1〜v4 の適用 tick が「不明」にも「束縛できた」にも数えられず、
+**欠けていること自体が記録から消える。**
+
+**逆向きも固定する。** Fallback で回していた tick は artifact を持たないのが正しい姿であり、
+**「不明」ではない。** ここを混ぜると Fallback の多い報告がすべて不明で埋まり、
+昇格が永久に来ない。区別するのは `active_controller` である。
 
 ## 3. Consequences
 
@@ -257,6 +290,10 @@ gate の段（§2.4）も同じである。
 | 入力 window そのものを assessment に持たせて識別子を作り直す | tick ごとに大きな object を運ぶ。digest（`input_sha256`）で同じ導出ができる |
 | `ControllerGate` の `expected_artifact_sha256` に既定値を置く | 渡し忘れた配線が「何にも照らさない」Gate を作る。0057 §2.2 が `authority` を必須にしたのと同じ理由で、必須の引数にする |
 | 「artifact を言えない適用 tick が無いこと」を、名指した arm だけに求める | 同じ holdout に v1〜v6 の tick を含む別の適用 arm が残っていても昇格できる（codex #4057191724）。gate の判定と同じく、報告に現れた Learned MPC の arm すべてに求める |
+| `model_gate` の有無から「artifact 不明」を数える | `model_gate` が必須なのは v5 から。v1〜v4 の適用 tick が不明にも束縛済みにも数えられず、**欠けていることが消える**（codex #4057527947）。起点は `ControlState.active_controller` |
+| 報告 v1 の欄の無さを `()` / `0` として読む | 「不明が1件も無い」＝完全に見える。`last_attested_ts_ms`（`None`＝言えない）とは向きが逆である（codex #4057527950）。version を上げ、v1 は昇格の証拠にしない |
+| 適用 Learned MPC の arm に artifact の勘定が無いことを許す | 「数えていない」と「全部束縛できた」が同じ形になる。必ずどちらかを数える |
+| Fallback の tick も「artifact 不明」に数える | 正しい姿を欠落として数えることになり、Fallback の多い報告が不明で埋まって昇格が永久に来ない |
 | `ControlTick` の version を上げず、欄だけ足す | 0030 §2 が「schema の意味を変える場合は version を上げ、既存 trace を新しい意味として解釈しない」と決めている。上げないと、欄の無い v6 を「artifact 不明」ではなく「まだ書いていないだけ」と読める |
 | 欄の無い古い tick を、同じ区間の別の tick の artifact で埋める | 推測である。**記録から言えないことを言わない**（0054 §2.2 と同じ向き） |
 | `unbound_attested_ticks` を持たず、artifact の集合だけを見る | 新旧の trace が混ざった区間で、残った tick の artifact が区間全体の実績に見える。部分的な束縛が完全なものとして通る |

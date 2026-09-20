@@ -1282,10 +1282,14 @@ class ControlTick(_Frozen):
         記録していた tick の hash だけである。次のどれかなら `None`、すなわち
         **「artifact 不明」**として扱う（昇格の証拠に使わない。fail closed）。
 
-        - `model_gate` の無い tick（提案が無かった / Fallback で回していた）
+        - `model_gate` の無い tick（提案が無かった / Fallback で回していた /
+          `model_gate` を持たない v1〜v4 の trace）
         - 裏づけの無い判断（`attested` でない）
         - Learned MPC を選ばなかった tick（提案は counterfactual に残る）
         - artifact の欄を持たない保存済みの v1〜v6 の trace
+
+        **「言えない」と「そうではなかった」は別物である。** 適用した tick かどうかは
+        `applied_artifact_unknown` が別に答える。
         """
         gate = self.model_gate
         if gate is None or not gate.attested or not gate.learned_selected:
@@ -1294,15 +1298,23 @@ class ControlTick(_Frozen):
 
     @property
     def applied_artifact_unknown(self) -> bool:
-        """裏づけのある Learned MPC を**適用したのに** artifact を言えない tick か。
+        """Learned MPC を**適用したのに** artifact を言えない tick か。
 
         保存済みの v1〜v6 がこれに当たる。**「記録が無いだけ」と「束縛できた」を混ぜない**
         ために、数えられる形で分けて持つ（#91 / #92 が部分的な証拠を完全として扱わないため）。
+
+        **判断の起点は `model_gate` ではなく `ControlState` である**（codex #4057527947）。
+        `model_gate` を必須にしたのは v5 からで、**v1〜v4 は Learned MPC を適用した tick でも
+        `model_gate` を持たない。** gate の有無から数えると、そういう tick が
+        「artifact 不明」にも「束縛できた」にも数えられず、**欠けていること自体が消える。**
+        `#92` の「適用 arm すべてに不明が無いこと」が、記録の無い区間を素通りしてしまう。
+
+        `active_controller` と `model_gate.learned_selected` の一致は v5 以降で schema が
+        要求しているので、起点を `ControlState` にしても v5 以降の意味は変わらない。
         """
-        gate = self.model_gate
-        if gate is None or not gate.attested or not gate.learned_selected:
+        if self.state.active_controller is not ControllerKind.LEARNED_MPC:
             return False
-        return gate.artifact_sha256 is None
+        return self.applied_model_artifact is None
 
     def _check_model_gate(self) -> None:
         """v5 の ``model_gate`` が ControlState と同じ判断を指しているか。"""
