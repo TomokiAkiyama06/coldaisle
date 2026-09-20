@@ -25,6 +25,9 @@
 21. heartbeat は書き込みと検証の直後に出し、記録や降格の I/O で遅らせない
 22. 完了しなかった tick は heartbeat を出さない（deadman が効く）
 23. 外部の deadman が無いことを黙って no-op にしない
+24. deadman の有無は `WATCHDOG_USEC` で決め、通知先の存在を証拠にしない
+25. decision trace の保存は heartbeat の間隔を食いつぶせない（待ちに上限がある）
+26. 起動時の失敗を**別の種類**として報告しない（設定不正と環境の失敗を混ぜない）
 """
 
 from __future__ import annotations
@@ -77,19 +80,25 @@ from coldaisle.control.supervisor.regime import WorkloadRegimeEstimator
 from coldaisle.control_daemon import (
     EXIT_ACTUATION_NOT_APPROVED,
     EXIT_HARDWARE_CONFIG_INVALID,
+    EXIT_STARTUP_ENVIRONMENT,
     EXIT_WATCHDOG_UNAVAILABLE,
     NOTIFY_SOCKET_ENV,
     WATCHDOG_DATAGRAM,
+    WATCHDOG_PID_ENV,
+    WATCHDOG_USEC_ENV,
     ActuationNotApprovedError,
     Config,
+    ControlConfigInvalidError,
     ControlDaemon,
     ControlStats,
+    StartupEnvironmentError,
     StoreTelemetrySource,
     SystemdWatchdog,
     UnsupervisedWatchdog,
     WatchdogUnavailableError,
     build,
     create_watchdog,
+    heartbeat_interval_ms,
     main,
     run_config_invalid_max,
 )
@@ -227,15 +236,19 @@ class RecordingTrace:
 
 @dataclass
 class RecordingWatchdog:
-    """heartbeat の回数と、tick の中での順番を記録する deadman。"""
+    """heartbeat の回数・時刻・tick の中での順番を記録する deadman。"""
 
     order: list[str] = field(default_factory=list)
+    monotonic: ManualMonotonicClock | None = None
     beats: int = 0
+    beats_at: list[int] = field(default_factory=list)
     error: Exception | None = None
 
     def notify(self) -> None:
         self.order.append("watchdog")
         self.beats += 1
+        if self.monotonic is not None:
+            self.beats_at.append(self.monotonic.monotonic_ms())
         if self.error is not None:
             raise self.error
 
@@ -321,7 +334,7 @@ class Harness:
         self.telemetry = FakeTelemetry(self.clock, self.monotonic)
         self.mode = MutableMode()
         self.order: list[str] = []
-        self.watchdog = watchdog or RecordingWatchdog(self.order)
+        self.watchdog = watchdog or RecordingWatchdog(self.order, monotonic=self.monotonic)
         self.trace = RecordingTrace(order=self.order)
         self.contract = build_input_contract(self.config, catalog)
         binding = create_control_runtime_binding(self.config)
@@ -1242,6 +1255,7 @@ def _fake_result() -> Any:
         duration_ms=0,
         deadline_exceeded=False,
         recorded=False,
+        trace_failed=False,
         hardware=None,
     )
 
@@ -1330,19 +1344,27 @@ def test_invariant_23_a_missing_notify_socket_is_not_a_silent_no_op(catalog, cap
     """deadman が無い環境を黙って no-op にしない（`--require-watchdog` なら起動しない）。"""
     monotonic = ManualMonotonicClock(0)
     with caplog.at_level("ERROR"):
-        watchdog = create_watchdog(timeout_ms=5_000, monotonic=monotonic, environ={})
+        watchdog = create_watchdog(
+            interval_ms=1_100, timeout_ms=5_000, monotonic=monotonic, environ={}
+        )
 
     assert isinstance(watchdog, UnsupervisedWatchdog)
     assert any("deadman" in record.message for record in caplog.records)
 
     with pytest.raises(WatchdogUnavailableError):
-        create_watchdog(timeout_ms=5_000, monotonic=monotonic, require=True, environ={})
+        create_watchdog(
+            interval_ms=1_100,
+            timeout_ms=5_000,
+            monotonic=monotonic,
+            require=True,
+            environ={},
+        )
 
 
 def test_invariant_23_the_unsupervised_watchdog_reports_a_late_heartbeat(caplog) -> None:
     """外の deadman が無くても、heartbeat の遅れを捨てない。"""
     monotonic = ManualMonotonicClock(0)
-    watchdog = create_watchdog(timeout_ms=1_000, monotonic=monotonic, environ={})
+    watchdog = create_watchdog(interval_ms=400, timeout_ms=1_000, monotonic=monotonic, environ={})
     watchdog.notify()
     monotonic.advance_ms(500)
     with caplog.at_level("ERROR"):
@@ -1367,9 +1389,10 @@ def test_invariant_23_the_systemd_watchdog_sends_the_abi_datagram(tmp_path: Path
     listener.bind(address)
     try:
         watchdog = create_watchdog(
+            interval_ms=1_100,
             timeout_ms=5_000,
             monotonic=ManualMonotonicClock(0),
-            environ={NOTIFY_SOCKET_ENV: address},
+            environ=_watchdog_env(address, 5_000),
         )
         assert isinstance(watchdog, SystemdWatchdog)
         assert listener.recv(64) == b"READY=1"
@@ -1400,6 +1423,225 @@ def test_invariant_23_the_daemon_composition_always_wires_a_deadman(tmp_path: Pa
             daemon.store.close()
 
     assert main([*_argv(tmp_path), "--require-watchdog"]) == EXIT_WATCHDOG_UNAVAILABLE
+
+
+def _watchdog_env(address: str, usec_ms: int, *, pid: int | None = None) -> dict[str, str]:
+    """`WatchdogSec` が有効なときに systemd が渡す環境。"""
+    env = {NOTIFY_SOCKET_ENV: address, WATCHDOG_USEC_ENV: str(usec_ms * 1_000)}
+    if pid is not None:
+        env[WATCHDOG_PID_ENV] = str(pid)
+    return env
+
+
+def test_invariant_24_a_notify_socket_alone_is_not_proof_of_a_deadman(tmp_path: Path) -> None:
+    """**通知先があることを deadman の証拠にしない**（Codex 4057548959）。
+
+    `Type=notify` なら `WatchdogSec` が無くても `NOTIFY_SOCKET` は渡る。それだけで
+    `--require-watchdog` を通すと、`WATCHDOG=1` は誰にも見られないまま「deadman あり」
+    として運転してしまう。
+    """
+    import socket
+
+    address = str(tmp_path / "notify.sock")
+    listener = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+    listener.bind(address)
+    try:
+        with pytest.raises(WatchdogUnavailableError, match=WATCHDOG_USEC_ENV):
+            create_watchdog(
+                interval_ms=1_100,
+                timeout_ms=5_000,
+                monotonic=ManualMonotonicClock(0),
+                require=True,
+                environ={NOTIFY_SOCKET_ENV: address},
+            )
+    finally:
+        listener.close()
+
+
+def test_invariant_24_a_watchdog_meant_for_another_process_is_not_ours(tmp_path: Path) -> None:
+    """`WATCHDOG_PID` が別 process を指していれば、その deadman は自分を見ていない。"""
+    import os
+    import socket
+
+    address = str(tmp_path / "notify.sock")
+    listener = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+    listener.bind(address)
+    try:
+        with pytest.raises(WatchdogUnavailableError):
+            create_watchdog(
+                interval_ms=1_100,
+                timeout_ms=5_000,
+                monotonic=ManualMonotonicClock(0),
+                require=True,
+                environ=_watchdog_env(address, 5_000, pid=os.getpid() + 1),
+            )
+        watchdog = create_watchdog(
+            interval_ms=1_100,
+            timeout_ms=5_000,
+            monotonic=ManualMonotonicClock(0),
+            environ=_watchdog_env(address, 5_000, pid=os.getpid()),
+        )
+        assert isinstance(watchdog, SystemdWatchdog)
+        watchdog.close()
+    finally:
+        listener.close()
+
+
+def test_invariant_24_a_watchdog_shorter_than_the_heartbeat_never_starts(tmp_path: Path) -> None:
+    """時間切れが heartbeat の間隔に足りない unit では**制御を取らない。**
+
+    起動できてしまうと、健全な運転のまま殺されて再起動を繰り返す。
+    """
+    import socket
+
+    address = str(tmp_path / "notify.sock")
+    listener = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+    listener.bind(address)
+    try:
+        with pytest.raises(WatchdogUnavailableError, match="短すぎる"):
+            create_watchdog(
+                interval_ms=1_100,
+                timeout_ms=5_000,
+                monotonic=ManualMonotonicClock(0),
+                environ=_watchdog_env(address, 2_000),
+            )
+    finally:
+        listener.close()
+
+
+def test_invariant_26_a_dead_notify_socket_is_reported_as_a_watchdog_failure(
+    tmp_path: Path,
+) -> None:
+    """通知先が消えている失敗を、素の `OSError` のまま外へ出さない（Codex 4057548964）。
+
+    素通しすると、起動時の分類が「設定が不正」へ落ちて全 zone Max を書いてしまう。
+    """
+    stale = str(tmp_path / "gone.sock")
+
+    with pytest.raises(WatchdogUnavailableError, match=NOTIFY_SOCKET_ENV):
+        create_watchdog(
+            interval_ms=1_100,
+            timeout_ms=5_000,
+            monotonic=ManualMonotonicClock(0),
+            environ=_watchdog_env(stale, 5_000),
+        )
+
+
+def test_invariant_25_the_trace_store_cannot_wait_longer_than_a_tick_deadline(
+    tmp_path: Path,
+) -> None:
+    """decision trace の保存の待ちに上限を掛ける（Codex 4057548962）。
+
+    既定の 5 秒待つと、保存が終わるまで次の tick が始まらず、heartbeat の間隔が
+    deadman の時間切れを超える。**制御を止めずに、落ちた記録は見えるようにする。**
+    """
+    documents = valid_documents()
+    documents["fan-hardware.yaml"] = json.loads(hardware_config().model_dump_json())
+    write_documents(tmp_path, documents)
+    config = Config(
+        config_dir=tmp_path,
+        db=tmp_path / "control.db",
+        metrics=METRICS_PATH,
+        quality_rules=CONFIG_DIR / "quality.yaml",
+    )
+
+    daemon = build(config)
+    try:
+        assert daemon.store is not None
+        busy_timeout_ms = daemon.store._conn.execute("PRAGMA busy_timeout").fetchone()[0]
+        deadline_ms = daemon.loop.tick_deadline_ms
+        assert busy_timeout_ms <= deadline_ms
+        # 最悪でも「保存の待ち + 次の tick」が deadman の時間切れに収まる。
+        assert (
+            busy_timeout_ms + heartbeat_interval_ms(daemon.loop._config.safety)
+            < daemon.loop._config.safety.watchdog_timeout_ms.value
+        )
+    finally:
+        if daemon.store is not None:
+            daemon.store.close()
+
+
+def test_invariant_25_a_dropped_trace_is_counted_and_control_continues(catalog) -> None:
+    """保存に失敗した記録を黙って捨てない。**制御は止めない。**"""
+    harness = Harness(catalog)
+    harness.trace.error = RuntimeError("保存先が落ちた")
+
+    result = harness.tick()
+
+    assert result.trace_failed is True
+    assert result.recorded is False
+    assert result.hardware is not None
+
+    daemon = ControlDaemon(loop=harness.loop, monotonic=harness.monotonic)
+    daemon._record(result)
+    assert daemon.stats.trace_dropped == 1
+
+
+def test_invariant_22_a_hung_tick_leaves_a_gap_longer_than_the_deadman(catalog) -> None:
+    """**tick が固まれば heartbeat が途切れる。** 実運用の時間切れで確かめる。"""
+    harness = Harness(catalog)
+    harness.tick()
+    watchdog_ms = harness.config.safety.watchdog_timeout_ms.value
+
+    # 収集層が固まった tick を1つ作る（書き込みと検証が終わるまで heartbeat は出ない）。
+    harness.telemetry.cost_ms = watchdog_ms + 1_000
+    harness.tick()
+
+    gaps = [
+        later - earlier
+        for earlier, later in zip(
+            harness.watchdog.beats_at, harness.watchdog.beats_at[1:], strict=False
+        )
+    ]
+    assert gaps and max(gaps) > watchdog_ms
+
+
+def test_invariant_26_startup_failures_are_reported_by_their_own_kind(tmp_path: Path) -> None:
+    """起動時の失敗を**種類ごとに**返す（設定不正と環境の失敗を混ぜない）。
+
+    ここを1つの `Exception` にまとめると、Metric Catalog が読めないだけで
+    0028 §2.7 の「設定不正なら全 zone Max」が走る。
+    """
+    documents = valid_documents()
+    documents["fan-hardware.yaml"] = json.loads(hardware_config().model_dump_json())
+    write_documents(tmp_path, documents)
+    base = Config(
+        config_dir=tmp_path,
+        db=tmp_path / "control.db",
+        metrics=METRICS_PATH,
+        quality_rules=CONFIG_DIR / "quality.yaml",
+    )
+
+    # Metric Catalog が無い → 制御を取らない（BIOS の制御のまま）。
+    with pytest.raises(StartupEnvironmentError):
+        build(base_with(base, metrics=tmp_path / "missing-metrics.yaml"))
+    assert (
+        main(
+            [
+                *_argv(tmp_path),
+                "--quality-rules",
+                str(CONFIG_DIR / "quality.yaml"),
+                "--metrics",
+                str(tmp_path / "missing-metrics.yaml"),
+            ]
+        )
+        == EXIT_STARTUP_ENVIRONMENT
+    )
+
+    # safety.yaml が不正 → 0028 §2.7 の「全 zone Max」。
+    broken = valid_documents()
+    broken["fan-hardware.yaml"] = json.loads(hardware_config().model_dump_json())
+    broken["safety.yaml"]["tick_deadline_ms"] = {"value": 999_999, "status": "provisional"}
+    write_documents(tmp_path, broken)
+    with pytest.raises(ControlConfigInvalidError):
+        build(base)
+    assert main([*_argv(tmp_path), "--quality-rules", str(CONFIG_DIR / "quality.yaml")]) == 1
+
+
+def base_with(config: Config, **overrides: Any) -> Config:
+    from dataclasses import replace
+
+    return replace(config, **overrides)
 
 
 def test_invariant_19_a_watchdog_that_only_covers_one_period_is_rejected() -> None:

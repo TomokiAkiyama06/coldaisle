@@ -291,6 +291,8 @@ class ControlTickResult:
     duration_ms: int
     deadline_exceeded: bool
     recorded: bool
+    trace_failed: bool
+    """decision trace を保存できなかったか。**落ちた記録を黙って捨てない。**"""
     hardware: PerZone[FanHardwareResult] | None
 
 
@@ -650,7 +652,7 @@ class ControlLoop:
                 config=self._config_digest,
             ),
         )
-        recorded = self._record(tick)
+        recorded, trace_failed = self._record(tick)
 
         if overrun:
             LOGGER.warning(
@@ -668,6 +670,7 @@ class ControlLoop:
             duration_ms=duration_ms,
             deadline_exceeded=overrun,
             recorded=recorded,
+            trace_failed=trace_failed,
             hardware=hardware,
         )
 
@@ -1140,17 +1143,23 @@ class ControlLoop:
         except Exception:
             LOGGER.exception("watchdog へ heartbeat を送れなかった")
 
-    def _record(self, tick: ControlTick) -> bool:
+    def _record(self, tick: ControlTick) -> tuple[bool, bool]:
+        """decision trace を保存する。返すのは（保存できたか, 失敗したか）。
+
+        **制御は止めない**（0060 §2.6）。保存先の待ち時間は接続側で上限を掛けてあるので、
+        ここで待ち続けて次の tick を遅らせることはない（0060 §2.7）。落ちた記録は
+        呼び出し側が数えられるように、失敗を戻り値で返す。
+        """
         if self._trace is None:
-            return False
+            return False, False
         try:
-            return self._trace.record(tick)
+            return self._trace.record(tick), False
         except Exception:
             LOGGER.exception(
                 "control trace record failed",
                 extra={logs.FIELDS_KEY: {"tick_id": tick.tick_id}},
             )
-            return False
+            return False, True
 
 
 def _fan_state(demand: EffectiveZoneDemand, result: FanHardwareResult) -> FanState:

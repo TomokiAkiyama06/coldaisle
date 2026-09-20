@@ -37,6 +37,7 @@ from coldaisle.control.config import (
     CONFIG_FILENAMES,
     ControlConfig,
     FanHardwareConfig,
+    SafetyConfig,
     load_fan_hardware_document,
 )
 from coldaisle.control.fallback.controller import FallbackController
@@ -89,18 +90,56 @@ EXIT_ACTUATION_NOT_APPROVED = 3
 """hardware mapping が `provisional` で、実機の制御を取る承認が無い（0028 §2.9）。"""
 
 EXIT_WATCHDOG_UNAVAILABLE = 4
-"""`--require-watchdog` を指定したのに deadman へ通知できない（0028 §2.6）。"""
+"""外部の deadman が使えない（0028 §2.6 / 決定記録 0060 §2.7）。"""
+
+EXIT_STARTUP_ENVIRONMENT = 5
+"""制御設定**以外**の理由で起動できない。**制御を取らない**（BIOS の制御のまま）。"""
 
 NOTIFY_SOCKET_ENV = "NOTIFY_SOCKET"
 """systemd が `Type=notify` のサービスへ渡す通知先。**この名前は ABI で、調整値ではない。**"""
+
+WATCHDOG_USEC_ENV = "WATCHDOG_USEC"
+"""`WatchdogSec` が有効なときだけ渡る時間切れ（マイクロ秒）。**deadman の有無はこれで決まる。**"""
+
+WATCHDOG_PID_ENV = "WATCHDOG_PID"
+"""`WATCHDOG_USEC` が誰宛かを示す PID。自分宛でなければ deadman は自分を見ていない。"""
 
 WATCHDOG_DATAGRAM = b"WATCHDOG=1"
 READY_DATAGRAM = b"READY=1"
 """sd_notify の ABI。値を組み立てる余地を残さない。"""
 
+HEARTBEAT_INTERVALS_PER_TIMEOUT = 2
+"""時間切れのあいだに入れる heartbeat の最低回数。
+
+systemd が `WatchdogSec` の半分の間隔で通知することを求めている ABI 側の前提で、
+運用で調整する値ではない。`safety.yaml` の側も同じ式で検証している。
+"""
+
+
+def heartbeat_interval_ms(safety: SafetyConfig) -> int:
+    """heartbeat の間隔として見込む最悪値（ミリ秒）。
+
+    heartbeat は tick ごとにしか出ない。次の tick が始まるまで（最悪 `tick_ms`）と、
+    その tick の処理（最悪 `tick_deadline_ms`）を合わせた分だけ空きうる。
+    """
+    return safety.tick_ms.value + safety.tick_deadline_ms.value
+
 
 class WatchdogUnavailableError(RuntimeError):
-    """外部の deadman へ通知できないのに、通知を必須にして起動しようとした。"""
+    """外部の deadman が使えない（通知先が無い・時間切れが無効・間隔が足りない・送れない）。"""
+
+
+class ControlConfigInvalidError(RuntimeError):
+    """`safety.yaml` / `fan-policy.yaml` が不正（0028 §2.7 の「全 zone Max」の条件）。"""
+
+
+class StartupEnvironmentError(RuntimeError):
+    """制御設定**以外**（Metric Catalog・品質規則・ストアなど）の理由で起動できない。
+
+    **0028 §2.7 の「設定不正なら Max」には当たらない。** あの規則は制御設定そのものが
+    読めない場合のもので、ここに混ぜると「DB が一時的に開けない」だけで Max を書く
+    ことになる。制御を取らず、BIOS の制御（Safety-0）のまま終了する。
+    """
 
 
 class SystemdWatchdog:
@@ -118,7 +157,10 @@ class SystemdWatchdog:
             raise WatchdogUnavailableError(f"{NOTIFY_SOCKET_ENV} が空")
         # systemd の abstract namespace（先頭が `@`）を AF_UNIX の表現へ直す。
         self._address = "\0" + address[1:] if address.startswith("@") else address
-        self._socket = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM | socket.SOCK_CLOEXEC)
+        try:
+            self._socket = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM | socket.SOCK_CLOEXEC)
+        except OSError as error:
+            raise WatchdogUnavailableError(f"通知用 socket を作れない: {error}") from error
 
     def ready(self) -> None:
         """起動を伝える（`Type=notify` の service が待っている）。"""
@@ -133,7 +175,17 @@ class SystemdWatchdog:
         self._socket.close()
 
     def _send(self, payload: bytes) -> None:
-        self._socket.sendto(payload, self._address)
+        """**失敗を素の `OSError` のまま外へ出さない。**
+
+        通知先が消えている・権限が無いといった失敗を素通しすると、呼び出し側が
+        「設定が不正」など**別の種類の失敗**として扱ってしまう（起動時の分類が狂う）。
+        """
+        try:
+            self._socket.sendto(payload, self._address)
+        except OSError as error:
+            raise WatchdogUnavailableError(
+                f"{NOTIFY_SOCKET_ENV} へ通知できない: {error}"
+            ) from error
 
 
 class UnsupervisedWatchdog:
@@ -179,26 +231,104 @@ class UnsupervisedWatchdog:
             )
 
 
+def enabled_watchdog_interval_ms(environ: Mapping[str, str]) -> int | None:
+    """systemd が**この process に対して**有効にした deadman の時間切れ（ミリ秒）。
+
+    **`NOTIFY_SOCKET` の有無を deadman の証拠にしない。** 通知先は `Type=notify` なら
+    `WatchdogSec` が無くても渡るので、それだけを見ると「`WATCHDOG=1` は届くが誰も
+    見ていない」状態を「deadman あり」と誤認する（sd_watchdog_enabled(3) と同じ判定にする）。
+    """
+    raw = environ.get(WATCHDOG_USEC_ENV, "")
+    if not raw:
+        return None
+    try:
+        usec = int(raw)
+    except ValueError:
+        LOGGER.error(
+            "watchdog の時間切れが整数ではない",
+            extra={logs.FIELDS_KEY: {WATCHDOG_USEC_ENV: raw}},
+        )
+        return None
+    if usec <= 0:
+        return None
+    owner = environ.get(WATCHDOG_PID_ENV, "")
+    if owner:
+        try:
+            owner_pid = int(owner)
+        except ValueError:
+            LOGGER.error(
+                "watchdog の宛先 PID が整数ではない",
+                extra={logs.FIELDS_KEY: {WATCHDOG_PID_ENV: owner}},
+            )
+            return None
+        if owner_pid != os.getpid():
+            # 親から引き継いだ環境変数。この process の heartbeat は見られていない。
+            LOGGER.error(
+                "watchdog の宛先がこの process ではない",
+                extra={logs.FIELDS_KEY: {WATCHDOG_PID_ENV: owner_pid, "pid": os.getpid()}},
+            )
+            return None
+    return usec // 1_000
+
+
 def create_watchdog(
     *,
+    interval_ms: int,
     timeout_ms: int,
     monotonic: MonotonicClock,
     require: bool = False,
     environ: Mapping[str, str] | None = None,
 ) -> Watchdog:
-    """環境に応じた deadman を作る。**既定を無音の no-op にしない。**"""
-    address = (os.environ if environ is None else environ).get(NOTIFY_SOCKET_ENV, "")
-    if address:
+    """環境に応じた deadman を作る。**既定を無音の no-op にしない。**
+
+    `timeout_ms` は `safety.yaml` が意図した時間切れ、実際に効くのは systemd が渡す
+    `WATCHDOG_USEC` である。**効くほうで間隔を検証する。**
+    """
+    env = os.environ if environ is None else environ
+    address = env.get(NOTIFY_SOCKET_ENV, "")
+    enabled_ms = enabled_watchdog_interval_ms(env)
+    if enabled_ms is not None:
+        # 時間切れが有効でも、heartbeat が tick ごとにしか出ない以上、間隔が足りなければ
+        # 健全な運転でも殺される。**再起動を繰り返す構成で制御を取らない。**
+        required_ms = interval_ms * HEARTBEAT_INTERVALS_PER_TIMEOUT
+        if enabled_ms < required_ms:
+            raise WatchdogUnavailableError(
+                f"{WATCHDOG_USEC_ENV} が heartbeat の間隔に対して短すぎる: "
+                f"watchdog={enabled_ms}ms; heartbeat_interval={interval_ms}ms; "
+                f"required>={required_ms}ms"
+            )
+        if enabled_ms != timeout_ms:
+            LOGGER.warning(
+                "systemd の WatchdogSec と safety.yaml の watchdog_timeout_ms が違う",
+                extra={
+                    logs.FIELDS_KEY: {
+                        "systemd_watchdog_ms": enabled_ms,
+                        "watchdog_timeout_ms": timeout_ms,
+                    }
+                },
+            )
+    if address and enabled_ms is not None:
         watchdog = SystemdWatchdog(address)
         watchdog.ready()
         LOGGER.info(
             "systemd の deadman へ heartbeat を送る",
-            extra={logs.FIELDS_KEY: {"watchdog_timeout_ms": timeout_ms}},
+            extra={
+                logs.FIELDS_KEY: {
+                    "systemd_watchdog_ms": enabled_ms,
+                    "watchdog_timeout_ms": timeout_ms,
+                    "heartbeat_interval_ms": interval_ms,
+                }
+            },
         )
         return watchdog
     if require:
+        missing = []
+        if not address:
+            missing.append(NOTIFY_SOCKET_ENV)
+        if enabled_ms is None:
+            missing.append(f"有効な {WATCHDOG_USEC_ENV}")
         raise WatchdogUnavailableError(
-            f"{NOTIFY_SOCKET_ENV} が無いのに --require-watchdog が指定されている"
+            f"--require-watchdog が指定されているのに deadman が無い（{', '.join(missing)}）"
         )
     return UnsupervisedWatchdog(timeout_ms=timeout_ms, monotonic=monotonic)
 
@@ -226,6 +356,8 @@ class ControlStats:
     skipped_slots: int = 0
     """処理が周期を超えて飛ばした control tick の枠。追いつくために連続実行しない。"""
     recorded: int = 0
+    trace_dropped: int = 0
+    """保存できなかった decision trace の数。**落ちた記録を黙って捨てない。**"""
     emergency_max: bool = False
 
     def as_fields(self) -> dict[str, int | bool]:
@@ -235,6 +367,7 @@ class ControlStats:
             "overruns": self.overruns,
             "skipped_slots": self.skipped_slots,
             "recorded": self.recorded,
+            "trace_dropped": self.trace_dropped,
             "emergency_max": self.emergency_max,
         }
 
@@ -323,6 +456,8 @@ class ControlDaemon:
             self.stats.overruns += 1
         if result.recorded:
             self.stats.recorded += 1
+        if result.trace_failed:
+            self.stats.trace_dropped += 1
         state = result.tick.state
         LOGGER.info(
             "control tick",
@@ -357,22 +492,38 @@ def build(
 
     **1つでも検証に失敗したら組み立てない。** 途中まで配線した状態で走らせると、どの層が
     設定を持っていないのかが運転中にしか分からなくなる。
+
+    失敗は**種類ごとに違う例外**で返す。起動時の失敗を1つの `Exception` にまとめると、
+    「DB が一時的に開けない」だけで 0028 §2.7 の「設定不正なら全 zone Max」が走る。
     """
-    control = ControlConfig.from_directory(config.config_dir)
+    try:
+        control = ControlConfig.from_directory(config.config_dir)
+    except Exception as error:
+        # ここだけが 0028 §2.7 の「hardware は正しく safety / policy が不正」に当たる。
+        raise ControlConfigInvalidError(str(error)) from error
     if not control.actuation_permitted:
         raise ActuationNotApprovedError(
             "fan-hardware.yaml の approval が confirmed ではないため制御を取らない"
         )
-    catalog = MetricCatalog.from_yaml(config.metrics)
-    contract = build_input_contract(control, catalog, t_sensor_metric=config.t_sensor_metric)
     clock: Clock = WallClock()
     monotonic: MonotonicClock = SystemMonotonicClock()
+    try:
+        catalog = MetricCatalog.from_yaml(config.metrics)
+        contract = build_input_contract(control, catalog, t_sensor_metric=config.t_sensor_metric)
+        rules = QualityRules.from_yaml(config.quality_rules)
+        store = SqliteStore(
+            config.db,
+            rules=rules,
+            clock=clock,
+            # **decision trace の保存で待てる上限を tick の締め切りに収める。**
+            # 既定の 5 秒待つと、保存が終わるまで次の tick が始まらず、heartbeat の
+            # 間隔が deadman の時間切れを超える（決定記録 0060 §2.7）。待てなかった
+            # 書き込みは失敗として記録に残る（制御は止めない）。
+            busy_timeout_ms=control.safety.tick_deadline_ms.value,
+        )
+    except Exception as error:
+        raise StartupEnvironmentError(f"{type(error).__name__}: {error}") from error
     binding = create_control_runtime_binding(control)
-    store = SqliteStore(
-        config.db,
-        rules=QualityRules.from_yaml(config.quality_rules),
-        clock=clock,
-    )
     authority = StaticAuthority()
     # **deadman を必ず配線する。** ここを省くと hang しても heartbeat の欠落が起きず、
     # `watchdog_timeout_ms` が一度も効かない（0028 §2.6 / 決定記録 0060 §2.7）。
@@ -380,6 +531,7 @@ def build(
         watchdog
         if watchdog is not None
         else create_watchdog(
+            interval_ms=heartbeat_interval_ms(control.safety),
             timeout_ms=control.safety.watchdog_timeout_ms.value,
             monotonic=monotonic,
             require=config.require_watchdog,
@@ -525,9 +677,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         LOGGER.exception("実機の制御を取る承認が無いため起動しない（決定記録 0028 §2.9）")
         return EXIT_ACTUATION_NOT_APPROVED
     except WatchdogUnavailableError:
-        LOGGER.exception("外部の deadman へ通知できないため起動しない（決定記録 0028 §2.6）")
+        LOGGER.exception("外部の deadman が使えないため起動しない（決定記録 0028 §2.6）")
         return EXIT_WATCHDOG_UNAVAILABLE
-    except Exception:
+    except ControlConfigInvalidError:
         LOGGER.exception("safety.yaml / fan-policy.yaml が不正なため全 zone を Max にする")
         try:
             stats = run_config_invalid_max(config, monotonic=monotonic)
@@ -536,6 +688,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             return EXIT_ACTUATION_NOT_APPROVED
         LOGGER.error("config_invalid で停止", extra={logs.FIELDS_KEY: stats.as_fields()})
         return 1
+    except Exception:
+        # **制御設定の不正と同じ扱いにしない。** Metric Catalog・品質規則・ストアの失敗で
+        # Max を書くと、0028 §2.7 が決めていない状況で制御を取ることになる。BIOS の
+        # 制御（Safety-0）のまま終了し、原因をそのまま記録する。
+        LOGGER.exception("制御設定以外の理由で起動できないため制御を取らない")
+        return EXIT_STARTUP_ENVIRONMENT
 
     def _stop(signum: int, _frame: FrameType | None) -> None:
         LOGGER.info("シグナルを受けた", extra={logs.FIELDS_KEY: {"signal": signum}})

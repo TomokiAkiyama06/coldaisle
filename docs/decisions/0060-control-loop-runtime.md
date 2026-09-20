@@ -49,7 +49,7 @@
 | 不変条件 | 破れたときに起きること |
 |---|---|
 | `tick_deadline_ms <= tick_ms` | 超過を検出したときには次の tick が始まっている |
-| `watchdog_timeout_ms >= tick_ms * 2` | heartbeat は tick ごとにしか出ないので、時間切れが1周期ぶんだと健全な運転でも deadman が鳴る（systemd も `WatchdogSec` の半分の間隔で通知することを前提にしている） |
+| `watchdog_timeout_ms >= (tick_ms + tick_deadline_ms) * 2` | heartbeat は tick ごとにしか出ない。次の tick が始まるまでと、その tick の処理の合計が heartbeat の間隔になるので、時間切れがそれを下回ると健全な運転でも deadman が鳴る（systemd も `WatchdogSec` の半分の間隔で通知することを前提にしている。§2.7） |
 
 **`fan-policy.yaml` には置かない。** 締め切り（`tick_deadline_ms`）と overrun の上限は
 0028 §2.8 で `safety.yaml` にあり、周期はその2つと同じ不変条件で縛られる。
@@ -182,6 +182,58 @@ snapshot → Supervisor → Reactive Guard → Fallback → Critical Safety
 - 送れるのは `READY=1` と `WATCHDOG=1` の**固定 datagram だけ**で、値を引数や設定から
   組み立てない（Max しか書けない引き継ぎ実行部と同じ考え方。0028 §2.7）
 
+#### deadman が「ある」と言える条件
+
+**`NOTIFY_SOCKET` の存在を deadman の証拠にしない。** 通知先は `Type=notify` なら
+`WatchdogSec` が無くても渡るので、それだけで通知を必須にした起動を通すと、
+`WATCHDOG=1` は届くが誰も見ていない状態を「deadman あり」として運転してしまう。
+
+判定は sd_watchdog_enabled(3) と同じにする。
+
+| 条件 | 扱い |
+|---|---|
+| `WATCHDOG_USEC` が無い・0 以下・整数でない | deadman は無い（`--require-watchdog` なら起動しない） |
+| `WATCHDOG_PID` があり、この process の PID と違う | deadman はこの process を見ていない（同上） |
+| `WATCHDOG_USEC` が **heartbeat の間隔 × 2 未満** | **起動しない。** 健全な運転のまま殺され、再起動を繰り返す |
+| `WATCHDOG_USEC` と `safety.yaml` の `watchdog_timeout_ms` が違う | 実際に効くのは環境側。warning を残して環境側で検証する |
+
+heartbeat の間隔は `tick_ms + tick_deadline_ms`（次の tick が始まるまでと、その tick の処理）
+として数える。`safety.yaml` 側も §2.1 で同じ式を検証する。
+
+#### 記録の待ち時間は heartbeat の間隔を食いつぶせない
+
+heartbeat を書き込みの直後へ出しても、**decision trace の保存がそのまま次の tick の前に
+居座る**なら、2つの heartbeat のあいだに保存の待ち時間が丸ごと入る。ストアの既定の
+busy timeout（5 秒）は暫定の `watchdog_timeout_ms`（5 秒）と同じなので、これだけで
+時間切れに届く。
+
+**制御ループの接続の busy timeout を `tick_deadline_ms` に絞る。**
+
+- 待てなかった書き込みは**失敗として残す**（`trace_dropped` を数え、log に理由を出す）。
+  記録の失敗は制御の失敗ではない（§2.6）ので、運転は続ける
+- 保存のあとにもう1回 heartbeat を出す案は採らない。間隔は**前回の heartbeat から**
+  数えるので、保存が長ければ最初の間隔がそのまま伸びる（数を増やしても解決しない）
+- 保存を別スレッドの queue へ逃がす案も採らない。安全側の経路にスレッドと、
+  その落とし方という失敗の種類を増やすわりに、**待ちの上限を決めれば足りる**
+
+#### 起動時の失敗は、種類ごとに報告する
+
+`sd_notify` の失敗（通知先が消えている・権限が無い）を素の `OSError` のまま外へ出すと、
+呼び出し側の分類が「設定が不正」へ落ち、**0028 §2.7 が決めていない状況で全 zone Max を
+書く**ことになる。起動時の失敗は種類ごとに別の例外にし、終了コードも分ける。
+
+| 失敗 | 扱い | 終了コード |
+|---|---|---|
+| `fan-hardware.yaml` が不正 | 制御を取らない（BIOS のまま） | 2 |
+| hardware mapping が `provisional` | 制御を取らない（0028 §2.9 の承認点 3） | 3 |
+| deadman が使えない（通知先・時間切れ・送信のいずれか） | 制御を取らない | 4 |
+| `safety.yaml` / `fan-policy.yaml` が不正 | **0028 §2.7 のとおり全 zone Max** | 1 |
+| それ以外（Metric Catalog・品質規則・ストア・入力契約の組み立て） | 制御を取らない（BIOS のまま） | 5 |
+
+最後の行は 0028 §2.7 の「設定不正なら Max」**には当たらない**。あの規則は制御設定そのものが
+読めない場合のもので、ここに混ぜると「DB が一時的に開けない」だけで Max を書く。
+§2.9 の規則そのものは変えていない（適用する範囲を、制御設定の不正に限ると明示しただけである）。
+
 ### 2.8 authority の既定は `SHADOW`
 
 `AuthorityRuntime`（#92）を配線しない構成では、固定 stage の authority を使い、**既定を
@@ -229,6 +281,10 @@ Learned MPC が実 Fan を握る。trace に残す stage も Gate と同じ式
 | deadman が無い環境では黙って何もしない | 「deadman がある」と思ったまま運転することになる。起動時と遅れのたびに記録する（2.7） |
 | `NOTIFY_SOCKET` が無ければ常に起動しない | 手元実行（`uv run coldaisle-fand`）ができなくなる。必須にするのは service 側の `--require-watchdog`（2.7） |
 | heartbeat を decision trace の保存後に出す | 保存先のロックで待たされているあいだ heartbeat が出ず、制御が終わっているのに殺される（2.7） |
+| heartbeat を保存の前後の両方で出して済ませる | 間隔は前回の heartbeat から数えるので、保存が長ければ最初の間隔がそのまま伸びる（2.7） |
+| decision trace の保存を別スレッドの queue へ逃がす | 安全側の経路にスレッドと「queue が溢れたときどうするか」という失敗の種類が増える。待ちの上限を決めれば足りる（2.7） |
+| `NOTIFY_SOCKET` があれば deadman があるとみなす | `Type=notify` なら `WatchdogSec` が無くても渡る。`WATCHDOG=1` が誰にも見られない状態を「deadman あり」と扱う（2.7） |
+| 起動時の失敗をまとめて「設定不正」として全 zone Max にする | Metric Catalog が読めない・DB が一時的に開けないだけで、0028 §2.7 が決めていない状況で制御を取る（2.7） |
 | worker が読めない tick で、前回の結果の識別子と受信時刻を捨てる | 同じ提案が後から出てきたときに新しい受信時刻を押し、止まった worker の提案が有効期限を取り戻す（2.6） |
 | RL 出力を `tick_id` だけで元 snapshot に結び付ける | 番号は再起動で 0 に戻る。前の process の出力が無関係な snapshot に結び付く（2.6） |
 | `runtime` を持たない v8 の記録を許す | 版を見ても中身が言えなくなる。版は自分の中身を表す（2.4） |
