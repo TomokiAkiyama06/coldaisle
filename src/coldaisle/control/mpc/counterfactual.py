@@ -224,6 +224,10 @@ class MpcModelBinding:
     ) -> MpcModelBinding:
         """制御へ提案を出すための束を作る。条件を1つでも欠けば拒む。
 
+        ``authority_stage`` は**いま与えられている実効 stage**（#92 / 決定記録 0057 §2.2）で、
+        設定の `authority_stage`（v9 からは上限）ではない。上限を渡すと、journal がまだ
+        SHADOW の初日に SHADOW 互換の artifact が拒まれ、昇格に要る証拠を集められなくなる。
+
         ``attestation`` は Model Registry（#104）の検証経路だけが発行する。呼び出し側が
         作れないため、**検証していない artifact を取り違えて渡す配線ミスは型で止まる。**
         同一プロセス内の悪意ある偽造までは防げない（決定記録 0050 §3 / 0052 §2.1）。

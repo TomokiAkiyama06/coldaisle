@@ -236,6 +236,14 @@ class ModelCompatibility(_Frozen):
     feature_schema_version: str = Field(min_length=1, max_length=120)
     target_schema_version: str = Field(min_length=1, max_length=120)
     authority_stage: AuthorityStage
+    """The authority stage the caller intends to RUN at.
+
+    **This is the effective stage (#92 / decision record 0057 §2.2), not the configured
+    ceiling.** Since `fan-policy.yaml` v9 `authority_stage` is only an upper bound; the
+    stage actually granted lives in the Authority journal. Asking here with the ceiling
+    rejects a SHADOW-only artifact while the journal still says SHADOW, which is exactly
+    the state the first promotion has to be collected in.
+    """
 
 
 class HumanApproval(_Frozen):
@@ -885,6 +893,23 @@ class ModelRegistry:
     def inspect(self) -> RegistrySnapshot:
         """Read the current snapshot without changing filesystem state."""
         return self._read_snapshot()
+
+    @contextmanager
+    def pinned(self) -> Iterator[RegistrySnapshot]:
+        """Hold the registry lock while the caller acts on the snapshot it read.
+
+        ``inspect()`` releases the lock before it returns, so a caller that decides
+        something from the snapshot and then commits elsewhere races with any
+        concurrent promotion.  Authority Rollout (#92) uses this to make
+        "this artifact is production" true **at the moment it writes**.
+
+        **Lock order: the registry lock first, then the caller's own lock.**  The
+        registry never acquires another component's lock while holding this one, so
+        the ordering is total and cannot cycle.  Callers must not take this lock
+        while already holding theirs.
+        """
+        with self._exclusive_lock() as root_fd:
+            yield self._read_snapshot(root_fd)
 
     def register_candidate(
         self,

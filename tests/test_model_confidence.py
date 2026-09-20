@@ -83,6 +83,7 @@ from coldaisle.store.models import Quality
 from test_fallback_controller import (
     assessment_for,
     fallback_proposal,
+    gate_for,
     learned_proposal,
     policy,
 )
@@ -651,7 +652,7 @@ def test_confidence_level_follows_stage_thresholds_and_ood() -> None:
 
 
 def _active_gate(stage: AuthorityStage) -> ControllerGate:
-    gate = ControllerGate(
+    gate = gate_for(
         policy(authority=stage.value, recovery_hold_ms=1), expected_model_version="thermal-v1"
     )
     _select(gate, 0, learned_proposal(0.7))
@@ -671,6 +672,7 @@ def _select(gate: ControllerGate, now: int, proposal, assessment: object = _ATTA
             proposal=proposal,
             received_at_mono_ms=now,
             assessment=attached,  # type: ignore[arg-type]
+            binding_authority_stage=AuthorityStage.FULL,
         ),
         operating_mode=OperatingMode.AUTO,
         safety_state=SafetyState.NORMAL,
@@ -1320,10 +1322,11 @@ def test_a1_learned_confidence_requires_a_matching_verified_assessment(
                 proposal=proposal.model_copy(update={"confidence": 1.0}),
                 received_at_mono_ms=0,
                 assessment=forged,
+                binding_authority_stage=AuthorityStage.FULL,
             )
         return
 
-    gate = ControllerGate(
+    gate = gate_for(
         policy(authority="full", recovery_hold_ms=1), expected_model_version="thermal-v1"
     )
     first = _select(gate, 0, proposal, attached)
@@ -1345,7 +1348,7 @@ def test_a1_matching_assessment_is_accepted(trained) -> None:
     proposal = assessment.apply_to(
         learned_proposal(0.9, confidence=0.0, inference_id=assessment.inference_id)
     )
-    gate = ControllerGate(
+    gate = gate_for(
         policy(authority="limited", recovery_hold_ms=1), expected_model_version="thermal-v1"
     )
     _select(gate, 0, proposal, assessment)

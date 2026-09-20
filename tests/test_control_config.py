@@ -207,7 +207,7 @@ def valid_documents() -> dict[str, dict[str, object]]:
             "watchdog_timeout_ms": provisional(5000),
         },
         "fan-policy.yaml": {
-            "schema_version": 8,
+            "schema_version": 9,
             "fallback_curve": [
                 {"temperature_c": 25.0, "demand": 0.3},
                 {"temperature_c": 80.0, "demand": 1.0},
@@ -311,6 +311,13 @@ def valid_documents() -> dict[str, dict[str, object]]:
                     "limit_down": 0.2,
                 },
             },
+            "authority_rollout": {
+                "approval_max_age_ms": provisional(3_600_000),
+                "evidence_max_age_ms": provisional(604_800_000),
+                "unhealthy_window_ms": provisional(600_000),
+                "low_confidence_after": provisional(10),
+                "ood_after": provisional(5),
+            },
             "shadow": {
                 "enabled": True,
                 "outcome_match_tolerance_ms": provisional(2000),
@@ -336,12 +343,12 @@ def load_config(tmp_path: Path) -> ControlConfig:
 def test_complete_config_has_traceable_sources_and_is_not_actuation_ready(tmp_path: Path) -> None:
     config = load_config(tmp_path)
 
-    assert CONTROL_CONFIG_VERSION == 8
+    assert CONTROL_CONFIG_VERSION == 9
     assert config.actuation_permitted is False
     metadata = config.trace_metadata()["control_config"]
     assert metadata["fan_hardware"]["name"] == "fan-hardware.yaml"
     assert metadata["safety"]["schema_version"] == 2
-    assert metadata["policy"]["schema_version"] == 8
+    assert metadata["policy"]["schema_version"] == 9
     assert len(metadata["safety"]["sha256"]) == 64
 
 
@@ -751,9 +758,9 @@ def test_v4_to_v5_migration_requires_explicit_supervisor_policy_values(tmp_path:
         ControlConfig.from_directory(tmp_path)
 
     documents["fan-policy.yaml"]["supervisor"] = supervisor
-    documents["fan-policy.yaml"]["schema_version"] = 8
+    documents["fan-policy.yaml"]["schema_version"] = 9
     write_documents(tmp_path, documents)
-    assert ControlConfig.from_directory(tmp_path).policy.schema_version == 8
+    assert ControlConfig.from_directory(tmp_path).policy.schema_version == 9
 
     del documents["fan-policy.yaml"]["supervisor"]["active_policy"]
     write_documents(tmp_path, documents)

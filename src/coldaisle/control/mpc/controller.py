@@ -38,6 +38,8 @@ from coldaisle.control.mpc.counterfactual import MpcModelBinding, MpcModelUnusab
 from coldaisle.control.mpc.optimizer import LearnedMpcOptimizer, MpcSolution
 from coldaisle.control.mpc.plan import HardConstraintSet
 from coldaisle.control.schema import (
+    AuthorityStage,
+    AuthorityStageSource,
     ControllerKind,
     ControllerProposal,
     Demand,
@@ -47,6 +49,7 @@ from coldaisle.control.schema import (
     SupervisorOutput,
     Zone,
     ZoneRequest,
+    stage_rank,
 )
 from coldaisle.control.state import ControlStateSnapshot
 
@@ -68,6 +71,12 @@ class MpcProposal(_Frozen):
     failure_reason: Reason | None = None
     solution: MpcSolution | None = None
     """採用した解。記録と評価（#90 / #91）のためで、demand の権限は持たない。"""
+    binding_authority_stage: AuthorityStage | None = None
+    """この結果を作った束縛が Registry に検証された authority stage（#92 / 0057 §2.2）。
+
+    **識別子（`result_digest`）に覆われる。** worker の照合結果を Gate まで運び、
+    worker が走ってから選ばれるまでの間に昇格が起きた提案を採らせない。
+    """
 
     @model_validator(mode="after")
     def _proposal_is_bound_to_its_own_assessment(self) -> Self:
@@ -107,6 +116,9 @@ class MpcProposal(_Frozen):
                 raise ValueError("提案の requested が解の最初の step と一致しない")
         elif self.proposal.optimizer_status is OptimizerStatus.OK:
             raise ValueError("optimizer_status=ok の提案には解が要る")
+        if self.binding_authority_stage is None:
+            # 束縛の stage を持たない結果は、どの authority まで検証されたのか言えない。
+            raise ValueError("Learned MPC の提案には束縛の authority stage を添える")
         return self
 
     def result_digest(self) -> str:
@@ -156,6 +168,7 @@ class MpcProposal(_Frozen):
             supervisor_available=supervisor_available,
             control_deadline_exceeded=control_deadline_exceeded,
             snapshot_status=snapshot_status,
+            binding_authority_stage=self.binding_authority_stage,
             # Gate はこの識別子をそのまま選択結果へ残す。記録側（#90）は、自分が持っている
             # worker 結果を数え直して照らし、別の結果を記録しない。
             result_digest=self.result_digest(),
@@ -194,6 +207,7 @@ class LearnedMpcController:
         *,
         assessor: ConfidenceAssessor,
         monotonic_ms: Callable[[], int],
+        authority: AuthorityStageSource,
         acoustic: AcousticCostModel | None = None,
         air_balance: AirBalanceModel | None = None,
         balance_band: BalanceBand | None = None,
@@ -202,7 +216,12 @@ class LearnedMpcController:
 
         tick ごとに失敗させない。呼び出し側（runtime）はこれを
         ``LearnedFailure.MODEL_LOAD_FAILURE`` として Gate へ渡し、Fallback で運転を続ける。
+
+        ``authority`` は**いま与えている制御権**（#92 / 決定記録 0057 §2.2）。設定の
+        ``authority_stage`` は v9 から**上限**なので、そちらとは照合しない。
         """
+        self._authority = authority
+        self._check_binding_covers_authority(binding, authority.current_stage())
         self._check_binding_matches_policy(binding, policy, assessor)
         # **目的関数を外から受け取らない。** 別の設定で作った cost model を渡されると、
         # 重みや基準量だけが運転設定とずれる。任意依存（#94 / #81）だけを受け取る。
@@ -263,24 +282,36 @@ class LearnedMpcController:
         }
 
     @staticmethod
+    def _check_binding_covers_authority(
+        binding: MpcModelBinding,
+        effective_stage: AuthorityStage,
+    ) -> None:
+        """**束縛が、いま与えている制御権を覆っているか**を確かめる（#92 / 0057 §2.2）。
+
+        `MpcModelBinding.authority_stage` は Registry が「この stage で使ってよい」と
+        検証した stage である（#104 の `authority_compatibility`）。それより**高い**
+        実効 stage で動かすと、SHADOW だけを許された artifact が LIMITED 以上の経路へ入る。
+
+        **低いぶんには通す。** 設定の上限（v9 の `authority_stage`）や journal で
+        実効 stage が下がっているだけなら、与えている制御権は検証済みの範囲に収まる。
+        ここを「一致」にすると、journal が SHADOW・上限が LIMITED の初回昇格で
+        SHADOW 互換の artifact が拒まれ、**新しい設定での証拠を1件も集められなくなる**
+        （codex #4056864031）。
+        """
+        if stage_rank(effective_stage) > stage_rank(binding.authority_stage):
+            raise MpcModelUnusableError(
+                "束縛が実効 authority stage を覆っていない"
+                f"（binding={binding.authority_stage.value}; "
+                f"effective={effective_stage.value}）"
+            )
+
+    @staticmethod
     def _check_binding_matches_policy(
         binding: MpcModelBinding,
         policy: FanPolicyConfig,
         assessor: ConfidenceAssessor,
     ) -> None:
-        """束縛・判定器・運転設定が**同じ前提で作られているか**を生成時に確かめる。
-
-        束縛を検証したときの authority stage と、いま動かす policy の stage が違うと、
-        Registry が SHADOW だけを許した artifact が FULL の経路へ入ってしまう。
-        `MpcModelBinding.authority_stage` が誰にも読まれないままだと、この食い違いは
-        「復帰 hold のあとに authority を得る」形で表に出る。
-        """
-        if binding.authority_stage is not policy.authority_stage:
-            raise MpcModelUnusableError(
-                "束縛時と運転中の authority stage が違う"
-                f"（binding={binding.authority_stage.value}; "
-                f"policy={policy.authority_stage.value}）"
-            )
+        """束縛・判定器・運転設定が**同じ前提で作られているか**を生成時に確かめる。"""
         if assessor.policy != policy.model_confidence:
             # 別の設定で作った判定器を渡されると、閾値だけがすり替わる。
             raise MpcModelUnusableError("Confidence 判定器が runtime と別の設定で作られている")
@@ -357,6 +388,9 @@ class LearnedMpcController:
                 "観測 window の action 時刻が Snapshot と違う"
                 f"（window={observed.action_ts_ms}; snapshot={snapshot.ts_ms}）"
             )
+        # 制御権は運転中に動く（#92）。生成時の照合だけだと、昇格のあとに作り直されなかった
+        # worker が、束縛の覆っていない stage で提案を出し続ける。tick ごとに見る。
+        self._check_binding_covers_authority(self._binding, self._authority.current_stage())
         anchor = self._binding.model.predict(observed)
         self._check_anchor(anchor, observed)
         assessment = self._assessor.assess(observed, anchor, residual)
@@ -404,6 +438,8 @@ class LearnedMpcController:
             proposal=proposal,
             assessment=assessment,
             solution=outcome.solution,
+            # **照合した stage を結果に結び付ける。** Gate が選ぶ瞬間まで運ぶ（#92）。
+            binding_authority_stage=self._binding.authority_stage,
         )
 
     def _check_anchor(self, anchor: ThermalPrediction, observed: ObservedThermalInput) -> None:

@@ -81,6 +81,7 @@ from coldaisle.control.schema import (
     PerZone,
     Reason,
     SafetyState,
+    StaticAuthorityStage,
     SupervisorPolicyKind,
     Zone,
 )
@@ -425,7 +426,12 @@ class SupervisorTrainingEnvironment:
         # Gate も episode ごとに作り直す。復帰 hold や降格の数えを前の episode から持ち越さない。
         self._baseline = self._baseline_factory()
         self._gate = ControllerGate(
-            self._policy, expected_model_version=self._expected_model_version
+            self._policy,
+            expected_model_version=self._expected_model_version,
+            # **学習環境は journal を読まない**（#92 / 決定記録 0057 §2.2）。実機の制御権は
+            # `AuthorityRuntime` が持つが、ここは同じ条件を再現するための simulation なので、
+            # 設定の stage をそのまま実効 stage として固定する。
+            authority=StaticAuthorityStage(self._policy.authority_stage),
         )
         # **最初の state にも screen を掛ける。** 掛けないと、上限を超えた初期 window を
         # 「まだ1 step も進んでいないから安全」として agent へ見せ、そこから探索を始めてしまう。

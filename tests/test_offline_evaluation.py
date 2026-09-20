@@ -564,6 +564,67 @@ def test_invariant_3_a_unidentifiable_outcomes_never_become_prediction_error(
     assert shadow_arm.coverage.scored_outputs == 0
 
 
+def test_invariant_3_c_a_later_failure_does_not_move_the_attested_timestamp(
+    context: EvaluationContext,
+) -> None:
+    """**提案の無い tick で「証拠の新しさ」を更新できない**（#92 / 決定記録 0057 §2.4）。
+
+    `last_ts_ms` は区間の最後の tick で、model を読めなかった tick も含む。それを
+    新しさに使うと、いまの失敗を1つ足すだけで古い実績が「新鮮」に見えてしまう。
+    裏づけのある提案が実在した時刻（`last_attested_ts_ms`）は別に持つ。
+    """
+
+    def attested_gate(index: int) -> ModelGateDecision:
+        return ModelGateDecision(
+            model_version="thermal-v1",
+            inference_id=f"{TICK_TS_MS + index * STEP_MS:064x}",
+            attested=True,
+            confidence=0.9,
+            ood=False,
+            confidence_level=ConfidenceLevel.HIGH,
+            authority_stage=AuthorityStage.SHADOW,
+            learned_selected=False,
+            assessment=tuple(
+                Reason(code=component) for component in MODEL_GATE_ASSESSMENT_COMPONENTS
+            ),
+        )
+
+    proposals = [
+        trace_of(
+            tick_at(
+                TICK_TS_MS + index * STEP_MS,
+                index,
+                model_gate=attested_gate(index),
+                state=control_state().model_copy(
+                    update={
+                        "model_version": "thermal-v1",
+                        "model_confidence": 0.9,
+                        "model_ood": False,
+                    }
+                ),
+                cf=counterfactual(action_ts_ms=TICK_TS_MS + index * STEP_MS).model_copy(
+                    update={"attested": True, "confidence": 0.9, "ood": False}
+                ),
+            )
+        )
+        for index in range(3)
+    ]
+    last_proposal_ts_ms = TICK_TS_MS + 2 * STEP_MS
+    failed_ts_ms = TICK_TS_MS + 3 * STEP_MS
+    failure = ShadowCounterfactual(
+        controller=ControllerKind.LEARNED_MPC,
+        failure=Reason(code="model_load_failure"),
+    )
+    proposals.append(trace_of(tick_at(failed_ts_ms, 3, cf=failure)))
+
+    report = evaluate([run_of(proposals, [])], context=context)
+    shadow_arm = overall(report).counterfactual[0]
+
+    assert shadow_arm.last_ts_ms == failed_ts_ms, "区間の最後は失敗の tick"
+    assert shadow_arm.last_attested_ts_ms == last_proposal_ts_ms
+    assert shadow_arm.proposals == 3
+
+
 def test_invariant_3_b_only_scored_outputs_feed_the_error_statistics() -> None:
     """採点した出力の数を、coverage が数えた採点数より多くできない。"""
     coverage = CoverageReport(

@@ -339,6 +339,22 @@ class AppliedArmReport(_Frozen):
     acoustic_cost: MetricSummary | None = None
     """適用された demand の approximate Acoustic Cost（無単位。dBA ではない）。"""
     interventions: InterventionReport
+    last_attested_ts_ms: int | None = Field(default=None, ge=0)
+    """この arm が**裏づけのある提案**を最後に出した tick の時刻。
+
+    `last_ts_ms` は「この arm の区間の最後の tick」で、提案を作れなかった tick
+    （model の読み込み失敗など）も含む。**区間の新しさと、証拠の新しさは別物である。**
+    失敗の tick を1つ足すだけで古い実績が「新しい」ことにできてしまうため、
+    裏づけ（`attested`）のある提案が実在した時刻を別に持つ（#92 / 決定記録 0057 §2.4）。
+
+    裏づけのある提案が1つも無ければ `None`。**0054 の帰属規則は変えない。**
+    記録から言える事実を1つ増やしただけで、どの実測をどの arm に帰属させるかは同じ。
+
+    **この欄は artifact へ束縛できない。** `ModelGateDecision` は artifact の hash を持たず、
+    適用 arm の鍵にも model の identity が入らないので、「どの artifact の実績か」は
+    記録から言えない。Authority Rollout（#92）は適用側の arm を昇格の根拠にしない
+    （決定記録 0057 §2.4 / §5）。
+    """
     gaps: tuple[CountedReason, ...] = ()
     """出せなかった指標と、その理由。**欄を埋め合わせない。**"""
 
@@ -350,6 +366,10 @@ class AppliedArmReport(_Frozen):
             raise ValueError("最後の tick を最初より前にしない")
         if self.interventions.ticks != self.ticks:
             raise ValueError("介入の集計を arm の tick 数と揃える")
+        if self.last_attested_ts_ms is not None and not (
+            self.first_ts_ms <= self.last_attested_ts_ms <= self.last_ts_ms
+        ):
+            raise ValueError("裏づけのある提案の時刻を arm の区間の外に置かない")
         return self
 
 
@@ -389,6 +409,17 @@ class CounterfactualArmReport(_Frozen):
     coverage: CoverageReport
     predictions: tuple[PredictionReport, ...] = ()
     """**coverage が足りているときだけ**入る（0054 §2.3）。"""
+    last_attested_ts_ms: int | None = Field(default=None, ge=0)
+    """この arm が**裏づけのある提案**を最後に出した tick の時刻。
+
+    `last_ts_ms` は「この arm の区間の最後の tick」で、提案を作れなかった tick
+    （model の読み込み失敗など）も含む。**区間の新しさと、証拠の新しさは別物である。**
+    失敗の tick を1つ足すだけで古い実績が「新しい」ことにできてしまうため、
+    裏づけ（`attested`）のある提案が実在した時刻を別に持つ（#92 / 決定記録 0057 §2.4）。
+
+    裏づけのある提案が1つも無ければ `None`。**0054 の帰属規則は変えない。**
+    記録から言える事実を1つ増やしただけで、どの実測をどの arm に帰属させるかは同じ。
+    """
     gaps: tuple[CountedReason, ...] = ()
 
     @model_validator(mode="after")
@@ -397,6 +428,13 @@ class CounterfactualArmReport(_Frozen):
             raise ValueError("arm_key を arm から導いた値と揃える")
         if self.last_ts_ms < self.first_ts_ms:
             raise ValueError("最後の tick を最初より前にしない")
+        if self.last_attested_ts_ms is not None:
+            if not (self.first_ts_ms <= self.last_attested_ts_ms <= self.last_ts_ms):
+                raise ValueError("裏づけのある提案の時刻を arm の区間の外に置かない")
+            if self.attested_ticks == 0:
+                raise ValueError("裏づけの無い arm に裏づけのある提案の時刻を付けない")
+            if self.proposals == 0:
+                raise ValueError("提案の無い arm に裏づけのある提案の時刻を付けない")
         if self.predictions and not self.coverage.sufficient:
             # 少数の採点区間の平均を、全体の予測精度に見える形で並べない。
             raise ValueError("coverage が足りない counterfactual に予測指標を付けない")

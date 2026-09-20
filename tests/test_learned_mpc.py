@@ -47,7 +47,6 @@ from coldaisle.control.air_balance import (
 )
 from coldaisle.control.config import MAX_MPC_HORIZON_STEPS, FanPolicyConfig, SafetyConfig
 from coldaisle.control.fallback import (
-    ControllerGate,
     FallbackCause,
     LearnedControlStatus,
     LearnedFailure,
@@ -110,6 +109,7 @@ from coldaisle.control.schema import (
     PerZone,
     Reason,
     SafetyState,
+    StaticAuthorityStage,
     SupervisorObjectiveWeights,
     SupervisorOutput,
     SupervisorPolicyKind,
@@ -120,7 +120,7 @@ from coldaisle.control.schema import (
 )
 from coldaisle.control.state import ControlStateSnapshot, TelemetryHealth
 from test_critical_safety import safety_config
-from test_fallback_controller import fallback_proposal, policy
+from test_fallback_controller import fallback_proposal, gate_for, policy
 from test_model_confidence import (
     GPU,
     dataset,
@@ -505,6 +505,7 @@ def build_controller(
     policy_config: FanPolicyConfig | None = None,
     clock: ScriptedClock | None = None,
     acoustic: bool = False,
+    authority_stage: AuthorityStage | None = None,
 ) -> tuple[LearnedMpcController, PlanningModel, FanPolicyConfig]:
     """束縛済みの MPC controller を組み立てる。"""
     base, profile, attestation = trained
@@ -522,6 +523,8 @@ def build_controller(
         safety(),
         assessor=ConfidenceAssessor(profile, settings.model_confidence),
         monotonic_ms=clock or ScriptedClock(0),
+        # #92: 実効 stage は journal が決める。試験では設定の stage をそのまま使う。
+        authority=StaticAuthorityStage(authority_stage or settings.authority_stage),
         acoustic=acoustic_model() if acoustic else None,
     )
     return controller, planning, settings
@@ -732,7 +735,7 @@ def test_invariant_2_g_a_refused_model_degrades_to_fallback_without_stopping(tra
         failure=LearnedFailure.MODEL_LOAD_FAILURE,
         failure_reason=Reason(code="model_unusable", detail=str(refusal.value)),
     ).to_status(received_at_mono_ms=0)
-    gate = ControllerGate(settings, expected_model_version=observational.version)
+    gate = gate_for(settings, expected_model_version=observational.version)
 
     selection = gate.select(
         now_mono_ms=0,
@@ -823,7 +826,7 @@ def test_invariant_1_d_a_plan_prediction_from_another_inference_is_rejected(trai
     assert result.proposal is not None
     assert result.proposal.optimizer_status is OptimizerStatus.ERROR
 
-    gate = ControllerGate(settings, expected_model_version=base.manifest.model_version)
+    gate = gate_for(settings, expected_model_version=base.manifest.model_version)
     selection = gate.select(
         now_mono_ms=0,
         fallback=fallback_proposal(0.4),
@@ -1078,7 +1081,7 @@ def test_invariant_6_c_a_timed_out_proposal_is_never_made_active(trained) -> Non
         trained, clock=ScriptedClock(0, 0, 10_000), policy_config=mpc_policy(budget_ms=10)
     )
     result = propose(controller)
-    gate = ControllerGate(settings, expected_model_version=base.manifest.model_version)
+    gate = gate_for(settings, expected_model_version=base.manifest.model_version)
 
     selection = gate.select(
         now_mono_ms=0,
@@ -1151,7 +1154,7 @@ def test_invariant_8_a_an_ood_input_is_handed_to_the_gate_as_ood(trained) -> Non
     assert result.proposal.ood is True
     assert result.proposal.confidence == 0.0
 
-    gate = ControllerGate(settings, expected_model_version=base.manifest.model_version)
+    gate = gate_for(settings, expected_model_version=base.manifest.model_version)
     selection = gate.select(
         now_mono_ms=0,
         fallback=fallback_proposal(0.4),
@@ -1188,7 +1191,7 @@ def test_invariant_8_c_a_shadow_stage_records_the_proposal_without_selecting_it(
     settings = mpc_policy(authority="shadow")
     controller, _model, _settings = build_controller(trained, policy_config=settings)
     result = propose(controller)
-    gate = ControllerGate(settings, expected_model_version=base.manifest.model_version)
+    gate = gate_for(settings, expected_model_version=base.manifest.model_version)
 
     selection = gate.select(
         now_mono_ms=0,
@@ -1376,7 +1379,7 @@ def test_the_whole_chain_hands_a_bounded_request_to_the_guard(trained) -> None:
     assert result.assessment is not None
     assert result.assessment.ood is False
 
-    gate = ControllerGate(settings, expected_model_version=attestation.version)
+    gate = gate_for(settings, expected_model_version=attestation.version)
     # 復帰 hold を満たすため、健全なまま2 tick 進める（#79）。
     for now_mono_ms in (0, settings.recovery_hold_ms):
         selection = gate.select(
@@ -1657,7 +1660,7 @@ def test_the_worker_failure_detail_reaches_the_fallback_trace(trained) -> None:
         policy_config=settings,
     )
     result = propose(controller)
-    gate = ControllerGate(settings, expected_model_version=attestation.version)
+    gate = gate_for(settings, expected_model_version=attestation.version)
 
     selection = gate.select(
         now_mono_ms=0,
@@ -1800,7 +1803,7 @@ def test_a_prediction_for_another_candidate_is_rejected(trained) -> None:
     assert result.proposal is not None
     assert result.proposal.optimizer_status is OptimizerStatus.ERROR
 
-    gate = ControllerGate(settings, expected_model_version=_attestation.version)
+    gate = gate_for(settings, expected_model_version=_attestation.version)
     selection = gate.select(
         now_mono_ms=0,
         fallback=fallback_proposal(0.4),
@@ -1872,7 +1875,7 @@ def test_a_model_delegating_to_other_bytes_is_refused(trained) -> None:
     assert result.failure_reason is not None
     assert "artifact_sha256" in result.failure_reason.detail
 
-    gate = ControllerGate(settings, expected_model_version=attestation.version)
+    gate = gate_for(settings, expected_model_version=attestation.version)
     selection = gate.select(
         now_mono_ms=0,
         fallback=fallback_proposal(0.4),
@@ -1908,14 +1911,17 @@ def test_an_anchor_from_another_model_version_is_refused(trained, tmp_path: Path
             safety(),
             assessor=ConfidenceAssessor(profile, settings.model_confidence),
             monotonic_ms=ScriptedClock(0),
+            authority=StaticAuthorityStage(AuthorityStage.FULL),
         )
 
 
-def test_the_binding_authority_must_match_the_running_policy(trained) -> None:
-    """**Registry が SHADOW だけを許した artifact を FULL の経路へ入れない**（codex #4055635582）。
+def test_the_binding_must_cover_the_effective_authority_stage(trained) -> None:
+    """**Registry が SHADOW だけを許した artifact を、より高い実効 stage で動かさない。**
 
-    束縛時の stage が誰にも読まれないままだと、食い違いは「復帰 hold のあとに authority を
-    得る」形でしか表に出ない。生成時に拒む。
+    照合の相手は設定の `authority_stage` ではなく**実効 stage**（#92 / 0057 §2.2、
+    codex #4056864031）。設定は v9 から上限なので、上限と照合すると
+    「journal は SHADOW、上限は LIMITED」の初回昇格で SHADOW 互換の artifact が拒まれ、
+    新しい設定での証拠を1件も集められなくなる。
     """
     base, profile, attestation = trained
     shadow_binding = MpcModelBinding.for_control(
@@ -1933,18 +1939,65 @@ def test_the_binding_authority_must_match_the_running_policy(trained) -> None:
             safety(),
             assessor=ConfidenceAssessor(profile, full_policy.model_confidence),
             monotonic_ms=ScriptedClock(0),
+            authority=StaticAuthorityStage(AuthorityStage.FULL),
         )
 
-    # 揃っていれば通る。
-    shadow_policy = mpc_policy(authority="shadow")
+    # **上限が LIMITED でも、journal が SHADOW なら SHADOW 互換の artifact は動く。**
+    # ここが通らないと、昇格に要る証拠を集める運転そのものが始められない。
+    limited_ceiling = mpc_policy(authority="limited")
     controller = LearnedMpcController(
         shadow_binding,
-        shadow_policy,
+        limited_ceiling,
         safety(),
-        assessor=ConfidenceAssessor(profile, shadow_policy.model_confidence),
+        assessor=ConfidenceAssessor(profile, limited_ceiling.model_confidence),
         monotonic_ms=ScriptedClock(0),
+        authority=StaticAuthorityStage(AuthorityStage.SHADOW),
     )
     assert propose(controller).proposal is not None
+
+
+def test_a_raised_stage_stops_a_binding_that_no_longer_covers_it(trained) -> None:
+    """**昇格のあと、束縛の覆っていない stage で提案を出し続けない。**
+
+    worker は生成時にしか照合しないと、`AuthorityStore` が stage を上げた瞬間から
+    「検証していない authority で作られた提案」を Gate へ渡すことになる。tick ごとに見る。
+    """
+    base, profile, attestation = trained
+    binding = MpcModelBinding.for_control(
+        PlanningModel(base),
+        attestation=attestation,
+        authority_stage=AuthorityStage.SHADOW,
+        expected_model_version=attestation.version,
+    )
+    settings = mpc_policy(authority="limited")
+
+    class Rising:
+        """途中で昇格した journal を模す。"""
+
+        def __init__(self) -> None:
+            self.stage = AuthorityStage.SHADOW
+
+        def current_stage(self) -> AuthorityStage:
+            return self.stage
+
+    authority = Rising()
+    controller = LearnedMpcController(
+        binding,
+        settings,
+        safety(),
+        assessor=ConfidenceAssessor(profile, settings.model_confidence),
+        monotonic_ms=ScriptedClock(0),
+        authority=authority,
+    )
+    assert propose(controller).proposal is not None
+
+    authority.stage = AuthorityStage.LIMITED
+    result = propose(controller)
+
+    assert result.proposal is None
+    assert result.failure is LearnedFailure.MODEL_LOAD_FAILURE
+    assert result.failure_reason is not None
+    assert "authority" in result.failure_reason.detail
 
 
 def test_a_confidence_assessor_from_another_policy_is_refused(trained) -> None:
@@ -1972,6 +2025,7 @@ def test_a_confidence_assessor_from_another_policy_is_refused(trained) -> None:
             safety(),
             assessor=ConfidenceAssessor(profile, other),
             monotonic_ms=ScriptedClock(0),
+            authority=StaticAuthorityStage(settings.authority_stage),
         )
 
 
@@ -2010,7 +2064,7 @@ def test_every_attested_value_has_a_place_where_it_is_compared() -> None:
 def test_the_policy_values_with_a_binding_counterpart_are_compared(trained) -> None:
     """運転設定と束縛の対応を、生成時にすべて突き合わせていること。
 
-    - `authority_stage` ↔ `binding.authority_stage`
+    - **実効 authority stage**（#92。設定の `authority_stage` は上限）↔ `binding.authority_stage`
     - `model_confidence` ↔ 判定器の設定
     - `mpc.optimizer` の horizon / step / cost_metrics ↔ model の target schema
     """
@@ -2023,18 +2077,38 @@ def test_the_policy_values_with_a_binding_counterpart_are_compared(trained) -> N
         expected_model_version=attestation.version,
     )
 
-    def build(policy_config: FanPolicyConfig) -> LearnedMpcController:
+    def build(
+        policy_config: FanPolicyConfig,
+        *,
+        stage: AuthorityStage | None = None,
+    ) -> LearnedMpcController:
         return LearnedMpcController(
             binding,
             policy_config,
             safety(),
             assessor=ConfidenceAssessor(profile, policy_config.model_confidence),
             monotonic_ms=ScriptedClock(0),
+            authority=StaticAuthorityStage(stage or policy_config.authority_stage),
         )
 
     assert build(settings) is not None
+    # 束縛は settings の stage（full）。低い実効 stage は通り、覆えない stage は拒む。
+    assert build(mpc_policy(authority="shadow"), stage=AuthorityStage.SHADOW) is not None
+    shadow_binding = MpcModelBinding.for_control(
+        PlanningModel(base),
+        attestation=attestation,
+        authority_stage=AuthorityStage.SHADOW,
+        expected_model_version=attestation.version,
+    )
     with pytest.raises(MpcModelUnusableError, match="authority stage"):
-        build(mpc_policy(authority="expanded"))
+        LearnedMpcController(
+            shadow_binding,
+            settings,
+            safety(),
+            assessor=ConfidenceAssessor(profile, settings.model_confidence),
+            monotonic_ms=ScriptedClock(0),
+            authority=StaticAuthorityStage(AuthorityStage.EXPANDED),
+        )
     with pytest.raises(MpcModelUnusableError, match="horizon"):
         build(mpc_policy(step_ms=_provisional(7_000), horizon_ms=_provisional(7_000)))
     with pytest.raises(MpcModelUnusableError, match="metric"):
