@@ -19,6 +19,7 @@ from coldaisle import logs
 from coldaisle.clock import Clock, WallClock
 from coldaisle.internal_telemetry import (
     SOURCE_STATE_PREFIX,
+    TELEMETRY_KIND_KEY,
     HwmonAdapter,
     InternalTelemetryCollector,
     InternalTelemetryConfig,
@@ -26,6 +27,7 @@ from coldaisle.internal_telemetry import (
     ProcStatAdapter,
     SourceStatus,
     TelemetryAdapter,
+    TelemetrySourceKind,
 )
 from coldaisle.metrics import MetricCatalog
 from coldaisle.store import QualityRules, SqliteStore
@@ -82,6 +84,7 @@ class InternalTelemetryDaemon:
         collector: InternalTelemetryCollector,
         store: SqliteStore,
         interval_ms: int,
+        source_kind: TelemetrySourceKind,
         sleep: Callable[[float], None] = time.sleep,
         monotonic_ms: Callable[[], int] = _monotonic_ms,
     ) -> None:
@@ -96,6 +99,9 @@ class InternalTelemetryDaemon:
         self._collector = collector
         self._store = store
         self._interval_ms = interval_ms
+        # 値の出どころの種類。**既定値を持たせない**（決定記録 0049 §2.1）。
+        # 既定を hardware にすると、差し込まれた模擬の adapter が黙って「実機」を名乗る
+        self._source_kind = source_kind
         self._sleep = sleep
         self._monotonic_ms = monotonic_ms
         self._stop = False
@@ -104,6 +110,11 @@ class InternalTelemetryDaemon:
     @property
     def store(self) -> SqliteStore:
         return self._store
+
+    @property
+    def source_kind(self) -> TelemetrySourceKind:
+        """このデーモンが書く値の出どころの種類（決定記録 0049 §2.2）。"""
+        return self._source_kind
 
     def _next_deadline(self, previous: int) -> int:
         """次の収集予定時刻。処理時間を差し引き、周期が後ろへずれ続けないようにする。
@@ -140,7 +151,20 @@ class InternalTelemetryDaemon:
         """停止要求または ``max_cycles`` まで収集する。"""
         LOGGER.info(
             "Internal Telemetry の収集を開始する",
-            extra={logs.FIELDS_KEY: {"interval_ms": self._interval_ms}},
+            extra={
+                logs.FIELDS_KEY: {
+                    "interval_ms": self._interval_ms,
+                    "source_kind": self._source_kind.value,
+                }
+            },
+        )
+        # 出どころの種類は**最初の収集の前**に、収集と同じ Clock（Unix ms）で書く。
+        # 画面はこれを「いま届いている値」の札に使うので、値より後に書くと
+        # 最初の周期だけ種類の分からない値が出る（決定記録 0049 §2.3）
+        self._store.set_system_state(
+            TELEMETRY_KIND_KEY,
+            self._source_kind.value,
+            at_ms=self._collector.clock.now_ms(),
         )
         deadline = self._monotonic_ms()
         try:
@@ -208,9 +232,26 @@ def build(
     *,
     clock: Clock | None = None,
     adapters: tuple[TelemetryAdapter, ...] | None = None,
+    source_kind: TelemetrySourceKind | None = None,
     sleep: Callable[[float], None] = time.sleep,
 ) -> InternalTelemetryDaemon:
-    """設定を読み、実 adapter と既存 Store を1つの clock で束ねる。"""
+    """設定を読み、実 adapter と既存 Store を1つの clock で束ねる。
+
+    **出どころの種類を決めるのはこの合成の起点**（決定記録 0049 §2.1）。adapter 自身や
+    設定ファイルには申告させない。``NvmlAdapter(api=...)`` のように実クラスのまま中身を
+    差し替えられるため、クラスでは判別できないため。
+
+    - ``adapters`` を渡さない（CLI からの通常の起動）→ ``hardware``
+    - ``adapters`` を渡す → 呼び出し側が ``source_kind`` を**必ず明示する**。
+      既定を ``hardware`` にすると、試験の偽 adapter が黙って「実機」を名乗る
+    """
+    if adapters is None:
+        if source_kind is not None:
+            # 実 adapter を組むのはこの関数自身なので、種類を外から名乗らせない
+            raise ValueError("adapters を渡さないときの source_kind は build が決める")
+        source_kind = TelemetrySourceKind.HARDWARE
+    elif source_kind is None:
+        raise ValueError("adapters を渡すときは source_kind を明示する")
     telemetry = InternalTelemetryConfig.from_yaml(
         config.telemetry, catalog=MetricCatalog.from_yaml(config.metrics)
     )
@@ -235,6 +276,7 @@ def build(
         collector=collector,
         store=store,
         interval_ms=telemetry.interval_ms,
+        source_kind=source_kind,
         sleep=sleep,
     )
 

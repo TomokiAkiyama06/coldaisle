@@ -192,6 +192,14 @@ class HealthResponse(BaseModel):
     ok: bool
     source: str | None
     """取り込みソース種別。デーモンが記録する（`sys.ingest_source`）。"""
+    telemetry_source: str | None
+    """内部テレメトリの出どころの種類（`hardware` / `mock`）。
+
+    テレメトリデーモンが記録する（`sys.telemetry_kind`。決定記録 0049 §2.3）。
+    **これは「いまの種類」であって、保存済みの値ごとの出どころではない。**
+    記録の無い DB（古いデーモン）では `null` で、画面は中立な「読み取り値」のままにする。
+    取り込み（`source`）とは別の経路なので、意味を混ぜない。
+    """
     last_sample_at: str | None
     last_sample_ts_ms: int | None
     data_age_seconds: float | None

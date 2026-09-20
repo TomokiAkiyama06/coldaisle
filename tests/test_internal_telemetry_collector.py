@@ -12,17 +12,21 @@ from pydantic import ValidationError
 from coldaisle import logs, rollup_job
 from coldaisle.clock import SimulatedClock
 from coldaisle.internal_telemetry import (
+    TELEMETRY_KIND_KEY,
     AdapterResult,
     InternalTelemetryCollector,
     InternalTelemetryConfig,
     SourceStatus,
+    TelemetrySourceKind,
 )
 from coldaisle.metrics import MetricCatalog
 from coldaisle.store import Quality, Reading, Sample, SqliteStore
 from coldaisle.telemetry_daemon import (
     SOURCE_STATE_PREFIX,
+    Config,
     InternalTelemetryDaemon,
     _log_configuration,
+    build,
     main,
     periodic_metric_intervals,
 )
@@ -102,6 +106,7 @@ def test_daemon_adds_internal_values_to_the_existing_air_timeline(tmp_path: Path
         collector=collector,
         store=store,
         interval_ms=2_500,
+        source_kind=TelemetrySourceKind.MOCK,
         sleep=lambda _: None,
     )
 
@@ -113,7 +118,146 @@ def test_daemon_adds_internal_values_to_the_existing_air_timeline(tmp_path: Path
     assert latest["gpu.0.core"].ts_ms == 1_000
     assert latest["power.gpu.0"].quality is Quality.MISSING
     assert store.current_state(SOURCE_STATE_PREFIX + "nvml") == "degraded"
+    assert store.current_state(TELEMETRY_KIND_KEY) == "mock"
     assert adapter.closed
+
+
+# ------------------------------------------------- 値の出どころの種類（決定記録 0049）
+
+
+def _kind_daemon(tmp_path: Path, rules, kind: TelemetrySourceKind):
+    clock = SimulatedClock(1_000)
+    store = SqliteStore(tmp_path / "kind.db", rules=rules, clock=clock)
+    adapter = FakeAdapter(
+        name="nvml",
+        expected_metrics=("gpu.0.core",),
+        result=AdapterResult(
+            source="nvml",
+            status=SourceStatus.OK,
+            readings=(Reading(metric="gpu.0.core", value=55.0, quality=Quality.OK),),
+        ),
+    )
+    daemon = InternalTelemetryDaemon(
+        collector=InternalTelemetryCollector((adapter,), clock),
+        store=store,
+        interval_ms=2_500,
+        source_kind=kind,
+        sleep=lambda _: None,
+    )
+    return daemon, store, clock
+
+
+@pytest.mark.parametrize("kind", list(TelemetrySourceKind))
+def test_the_daemon_records_its_own_source_kind(tmp_path: Path, rules, kind):
+    """デーモンが自分の出どころの種類を `sys.telemetry_kind` へ書く（決定記録 0049 §2.3）。"""
+    daemon, store, _ = _kind_daemon(tmp_path, rules, kind)
+
+    daemon.run(max_cycles=1)
+
+    assert store.current_state(TELEMETRY_KIND_KEY) == kind.value
+
+
+def test_the_source_kind_is_written_before_the_first_collection(tmp_path: Path, rules):
+    """最初の収集の前に、収集と同じ Clock の時刻で書く。
+
+    値より後に書くと、最初の周期だけ種類の分からない値が画面に出る。
+    """
+    daemon, store, clock = _kind_daemon(tmp_path, rules, TelemetrySourceKind.HARDWARE)
+
+    daemon.run(max_cycles=1)
+
+    kind_at = store.connection.execute(
+        "SELECT ts_ms FROM system_state WHERE key = ?", (TELEMETRY_KIND_KEY,)
+    ).fetchone()[0]
+    assert kind_at == clock.now_ms() == 1_000
+    assert store.latest()["gpu.0.core"].ts_ms == 1_000
+
+
+def test_the_source_kind_is_written_once_while_it_does_not_change(tmp_path: Path, rules):
+    """`set_system_state` の規則どおり変化時だけ書く（決定記録 0002 §2.6）。"""
+    daemon, store, _ = _kind_daemon(tmp_path, rules, TelemetrySourceKind.HARDWARE)
+
+    daemon.run(max_cycles=3)
+
+    rows = store.connection.execute(
+        "SELECT COUNT(*) FROM system_state WHERE key = ?", (TELEMETRY_KIND_KEY,)
+    ).fetchone()[0]
+    assert rows == 1
+
+
+def test_the_source_kind_is_not_under_the_source_status_prefix():
+    """adapter ごとの稼働状態の名前空間と混ぜない（Server Health が読んでいる）。"""
+    assert not TELEMETRY_KIND_KEY.startswith(SOURCE_STATE_PREFIX)
+
+
+def test_replay_is_not_a_source_kind_yet():
+    """内部テレメトリを再生する経路が無いので `replay` は定義しない（決定記録 0049 §2.2）。"""
+    assert {kind.value for kind in TelemetrySourceKind} == {"hardware", "mock"}
+
+
+def _telemetry_config(tmp_path: Path) -> Config:
+    telemetry = tmp_path / "internal-telemetry.yaml"
+    telemetry.write_text(
+        "version: 1\ninterval_ms: 2500\n"
+        "nvml: {enabled: false, gpu_indices: [0]}\n"
+        "proc_stat: {enabled: false, path: /proc/stat}\n"
+        "hwmon: {enabled: false, root: /sys/class/hwmon, sensors: []}\n",
+        encoding="utf-8",
+    )
+    return Config(
+        db=tmp_path / "built.db",
+        telemetry=telemetry,
+        quality_rules=CONFIG_DIR / "quality.yaml",
+        metrics=CONFIG_DIR / "metrics.yaml",
+    )
+
+
+def test_building_without_adapters_is_hardware(tmp_path: Path):
+    """通常の起動（実 adapter を build が組む）は `hardware`（決定記録 0049 §2.1）。"""
+    daemon = build(_telemetry_config(tmp_path), clock=SimulatedClock(0))
+    try:
+        assert daemon.source_kind is TelemetrySourceKind.HARDWARE
+    finally:
+        daemon.store.close()
+
+
+def test_building_with_adapters_requires_an_explicit_source_kind(tmp_path: Path):
+    """**既定を持たせない。** 既定が hardware だと偽 adapter が黙って実機を名乗る。"""
+    adapter = FakeAdapter(
+        name="fake",
+        expected_metrics=("gpu.0.core",),
+        result=AdapterResult(source="fake", status=SourceStatus.OK),
+    )
+    with pytest.raises(ValueError, match="source_kind"):
+        build(_telemetry_config(tmp_path), clock=SimulatedClock(0), adapters=(adapter,))
+
+
+def test_building_with_adapters_uses_the_given_source_kind(tmp_path: Path):
+    adapter = FakeAdapter(
+        name="fake",
+        expected_metrics=("gpu.0.core",),
+        result=AdapterResult(source="fake", status=SourceStatus.OK),
+    )
+    daemon = build(
+        _telemetry_config(tmp_path),
+        clock=SimulatedClock(0),
+        adapters=(adapter,),
+        source_kind=TelemetrySourceKind.MOCK,
+    )
+    try:
+        assert daemon.source_kind is TelemetrySourceKind.MOCK
+    finally:
+        daemon.store.close()
+
+
+def test_the_source_kind_of_the_real_adapters_is_not_named_from_outside(tmp_path: Path):
+    """実 adapter を組むのは build 自身。外から種類を名乗らせない。"""
+    with pytest.raises(ValueError, match="source_kind"):
+        build(
+            _telemetry_config(tmp_path),
+            clock=SimulatedClock(0),
+            source_kind=TelemetrySourceKind.MOCK,
+        )
 
 
 def test_startup_audit_logs_disabled_reason_and_confirmation(caplog):
@@ -239,6 +383,7 @@ def _paced_daemon(tmp_path: Path, rules, work_ms: int):
         collector=InternalTelemetryCollector((TimedAdapter(clock, work_ms),), clock),
         store=store,
         interval_ms=2_500,
+        source_kind=TelemetrySourceKind.MOCK,
         sleep=sleep,
         monotonic_ms=clock.now_ms,
     )

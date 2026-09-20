@@ -168,6 +168,7 @@ const page = {
   control: null, // 実データでは常に null（未接続）
   zone: "top", // 「なぜこの回転数か」で見ている系統
   ingestSource: undefined, // health.source。undefined = まだ届いていない
+  telemetrySource: undefined, // health.telemetry_source（hardware / mock）。undefined = まだ届いていない
   pageNote: null,
   refreshing: false,
 };
@@ -299,6 +300,7 @@ function showBanner(id, text) {
 function renderHealth(health) {
   const age = document.getElementById("age-label");
   page.ingestSource = health.source; // serial / mock / replay / null
+  page.telemetrySource = health.telemetry_source; // hardware / mock / null（決定記録 0049）
   if (health.last_sample_ts_ms === null) {
     showBanner("banner", "データが1件も届いていません。取り込みデーモンを確認してください。");
   } else if (health.data_age_seconds < 0) {
@@ -326,11 +328,28 @@ function displaySource() {
 }
 
 /**
- * そのメトリクスの値の札に付ける語。**取り込み経路（air.*）だけ health.source で決める**。
- * 内部テレメトリ（回転数・PWM・CPU・GPU）は「読み取り値」。`?mock=` のときは全部「模擬」。
+ * そのメトリクスの**いまの値**の札に付ける語。取り込み経路（air.*）は health.source、
+ * 内部テレメトリ（回転数・PWM・CPU・GPU）は health.telemetry_source で決める。
+ * **札が付くのは届いている値だけ**（古い・未取得は「読み取り値」。決定記録 0049 §2.5）。
+ * `?mock=` のときは全部「模擬」。
  */
 function valueKind(metric) {
-  return window.ColdaisleAirflowStatus.metricKind(metric, page.ingestSource, Boolean(page.mockName));
+  return window.ColdaisleAirflowStatus.metricKind(
+    metric,
+    page.ingestSource,
+    Boolean(page.mockName),
+    page.telemetrySource,
+    page.latest
+  );
+}
+
+/** 見出し・凡例に出す内部テレメトリの札。**いま届いている値**の出どころとして書く。 */
+function telemetryKind() {
+  return window.ColdaisleAirflowStatus.telemetrySummaryKind(
+    page.telemetrySource,
+    page.latest,
+    Boolean(page.mockName)
+  );
 }
 
 function renderSource() {
@@ -354,10 +373,10 @@ function renderSource() {
   }
   // 内部テレメトリの出どころ。見出しに置き、グラフのタブでも見えるようにする
   const telemetry = document.getElementById("telemetry-label");
-  telemetry.textContent = `回転数・PWM・CPU・GPU：${valueKind("fan.front.pwm")}`;
+  telemetry.textContent = `回転数・PWM・CPU・GPU（いま届いている値）：${telemetryKind()}`;
   telemetry.classList.toggle("mock", Boolean(page.mockName));
   document.getElementById("value-kind-key").textContent =
-    `空気の温度＝${valueKind("air.room")}、回転数・PWM・CPU・GPU＝${valueKind("fan.front.pwm")}`;
+    `空気の温度＝${valueKind("air.room")}、回転数・PWM・CPU・GPU（いま届いている値）＝${telemetryKind()}`;
   decision.textContent = page.control && page.control.decision_id ? `判断 ${page.control.decision_id}` : "";
 }
 
@@ -379,7 +398,7 @@ function renderControl() {
   document.getElementById("control-note").textContent = control
     ? "制御の状態は模擬データです。実際の制御とは関係ありません。"
     : "制御の状態は未接続です。制御デーモンの判断記録（#74 / #82）を読む API がまだ無いため表示していません。" +
-      window.ColdaisleAirflowStatus.measuredNote(displaySource());
+      window.ColdaisleAirflowStatus.measuredNote(displaySource(), page.telemetrySource, page.latest);
 
   const alert = control && control.alert;
   const box = document.getElementById("control-alert");
@@ -816,6 +835,7 @@ async function refresh() {
     } else {
       // 鮮度も出どころも確かめられない。前回の health の表示（古い・未来・最終受信）を残さない
       page.ingestSource = null;
+      page.telemetrySource = null; // 内部テレメトリの種類も確かめられない → 「読み取り値」に戻す
       showBanner("banner", null);
       document.getElementById("age-label").textContent = "";
       errors.push(`状態（/api/v1/health）を取得できません — データの新しさと出どころを確認できません: ${health.reason.message}`);

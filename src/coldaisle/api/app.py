@@ -67,6 +67,7 @@ from coldaisle.channels import (
 from coldaisle.clock import Clock, WallClock
 from coldaisle.internal_telemetry import (
     SOURCE_STATE_PREFIX,
+    TELEMETRY_KIND_KEY,
     InternalTelemetryConfig,
     NvmlAdapter,
     ProcStatAdapter,
@@ -504,6 +505,7 @@ def create_app(
         return HealthResponse(
             ok=bool(periodic) and not stale,
             source=store.current_state("sys.ingest_source"),
+            telemetry_source=store.current_state(TELEMETRY_KIND_KEY),
             last_sample_at=None if newest is None else iso(newest),
             last_sample_ts_ms=newest,
             data_age_seconds=None if newest is None else round((now_ms - newest) / 1000, 3),
