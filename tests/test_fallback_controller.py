@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import pytest
+from pydantic import ValidationError
 
 from coldaisle.control.config import FanPolicyConfig
 from coldaisle.control.fallback import (
@@ -16,8 +17,14 @@ from coldaisle.control.model.confidence import (
     ComponentResult,
     ConfidenceAssessment,
     ConfidenceComponent,
+    derive_inference_id,
 )
-from coldaisle.control.model.thermal import ArtifactVerification
+from coldaisle.control.model.thermal import (
+    ArtifactVerification,
+    InferenceCapability,
+    PredictedTarget,
+    ThermalPrediction,
+)
 from coldaisle.control.schema import (
     AuthorityStage,
     ControllerKind,
@@ -344,6 +351,45 @@ def requests(demand: float, code: str = "test") -> PerZone[ZoneRequest]:
     return PerZone(front=request, rear=request, top=request)
 
 
+TEST_ARTIFACT_SHA256 = "a" * 64
+"""`assessment_for` が作る assessment の artifact。**仮の値である**（AGENTS.md ルール10）。"""
+
+TEST_INPUT_SHA256 = "c" * 64
+"""判定に使った入力 window の digest（試験用の仮の値）。"""
+
+ACTION_TS_MS = 10_000
+
+
+def synthetic_prediction(
+    artifact_sha256: str = TEST_ARTIFACT_SHA256,
+    *,
+    verification: ArtifactVerification = ArtifactVerification.REGISTRY_VERIFIED,
+) -> ThermalPrediction:
+    """試験用の予測。**artifact はここにあり、推論の識別子はここから導かれる**（#159）。"""
+    return ThermalPrediction(
+        model_id="rack-thermal",
+        model_version="0.1.0",
+        artifact_sha256=artifact_sha256,
+        artifact_verification=verification,
+        capability=InferenceCapability.OBSERVATIONAL_REPLAY,
+        input_action_ts_ms=ACTION_TS_MS,
+        targets=(
+            PredictedTarget(
+                horizon_ms=30_000,
+                expected_ts_ms=ACTION_TS_MS + 30_000,
+                values={"gpu.0.core": 50.0},
+            ),
+        ),
+    )
+
+
+def synthetic_inference_id(
+    *, artifact_sha256: str = TEST_ARTIFACT_SHA256, input_sha256: str = TEST_INPUT_SHA256
+) -> str:
+    """その artifact・その入力から**導出される**識別子。宣言した値ではない。"""
+    return derive_inference_id(input_sha256, synthetic_prediction(artifact_sha256))
+
+
 def learned_proposal(
     demand: float = 0.7,
     *,
@@ -351,7 +397,7 @@ def learned_proposal(
     ood: bool = False,
     version: str = "thermal-v1",
     optimizer: OptimizerStatus = OptimizerStatus.OK,
-    inference_id: str = "c" * 64,
+    inference_id: str | None = None,
 ) -> ControllerProposal:
     return ControllerProposal(
         controller=ControllerKind.LEARNED_MPC,
@@ -363,7 +409,7 @@ def learned_proposal(
         ood=ood,
         optimizer_status=optimizer,
         latency_ms=10,
-        inference_id=inference_id,
+        inference_id=inference_id if inference_id is not None else synthetic_inference_id(),
     )
 
 
@@ -377,15 +423,21 @@ def fallback_proposal(demand: float = 0.4) -> ControllerProposal:
 
 
 def assessment_for(
-    proposal: ControllerProposal, *, artifact_sha256: str = "a" * 64
+    proposal: ControllerProposal,
+    *,
+    artifact_sha256: str = TEST_ARTIFACT_SHA256,
+    input_sha256: str = TEST_INPUT_SHA256,
+    verification: ArtifactVerification = ArtifactVerification.REGISTRY_VERIFIED,
 ) -> ConfidenceAssessment:
-    """提案と同じ推論・値を持つ、Registry 検証済みの assessment（Gate の試験用）。
+    """その artifact で判定した、Registry 検証済みの assessment（Gate の試験用）。
 
-    `artifact_sha256` は Gate が束縛した artifact と揃える（#159）。揃っていなければ
-    Gate は `model_artifact_mismatch` で Fallback にする。
+    **推論の識別子は宣言せず、予測と入力 digest から導出する**（#159）。だから
+    `artifact_sha256` を変えれば識別子も変わり、既定の提案とは別の推論になる。
+    `input_sha256` を変えれば、同じ artifact のまま別の入力の推論になる。
     """
     assert proposal.confidence is not None and proposal.inference_id is not None
     assert proposal.model_version is not None
+    prediction = synthetic_prediction(artifact_sha256, verification=verification)
     components = tuple(
         ComponentResult(component=component, score=1.0, ood=False)
         for component in ConfidenceComponent
@@ -408,10 +460,12 @@ def assessment_for(
         model_id="rack-thermal",
         model_version=proposal.model_version,
         artifact_sha256=artifact_sha256,
-        artifact_verification=ArtifactVerification.REGISTRY_VERIFIED,
+        artifact_verification=verification,
         profile_sha256="d" * 64,
-        input_action_ts_ms=10_000,
-        inference_id=proposal.inference_id,
+        input_action_ts_ms=ACTION_TS_MS,
+        input_sha256=input_sha256,
+        prediction=prediction,
+        inference_id=derive_inference_id(input_sha256, prediction),
         confidence=0.0 if proposal.ood else proposal.confidence,
         ood=proposal.ood,
         components=components,
@@ -435,10 +489,6 @@ def healthy_status(
         assessment=assessment_for(selected),
         binding_authority_stage=binding_stage,
     )
-
-
-TEST_ARTIFACT_SHA256 = "a" * 64
-"""`assessment_for` が作る assessment の artifact。**仮の値である**（AGENTS.md ルール10）。"""
 
 
 def gate_for(
@@ -971,10 +1021,11 @@ def test_an_assessment_the_registry_did_not_verify_leaves_the_artifact_unknown()
     昇格の根拠に使えてしまう。裏づけが無ければ「artifact 不明」にする（fail closed）。
     """
     gate = gate_for(policy(), expected_model_version="thermal-v1")
-    proposal = learned_proposal()
-    offline = assessment_for(proposal).model_copy(
-        update={"artifact_verification": ArtifactVerification.OFFLINE_UNVERIFIED}
+    offline = assessment_for(
+        learned_proposal(), verification=ArtifactVerification.OFFLINE_UNVERIFIED
     )
+    # 検証状態も識別子の導出に入るので、提案の側も同じ推論を指す。
+    proposal = learned_proposal(inference_id=offline.inference_id)
     selected = gate.select(
         now_mono_ms=0,
         fallback=fallback_proposal(0.4),
@@ -994,39 +1045,92 @@ def test_an_assessment_the_registry_did_not_verify_leaves_the_artifact_unknown()
     assert selected.model_gate.artifact_sha256 is None
 
 
-def test_a_forged_artifact_field_is_not_recorded_as_attested() -> None:
-    """**検証し直すだけでは足りない**（codex #4057191721）。
+def test_an_assessment_from_another_artifact_cannot_be_relabelled_as_the_bound_one() -> None:
+    """**artifact B の判定を A と名乗らせられない**（codex #4057241944）。
 
-    artifact B の正しい assessment を `model_copy(update={"artifact_sha256": A})` で
-    書き換えたものは、`REGISTRY_VERIFIED` も同じ推論 ID も版も confidence もそのまま通る。
-    形の検証だけで信じると、**B の判定を A の実績として trace に書いてしまう。**
-    Gate は配線時に束縛した attestation の hash と照らし、合わなければ artifact を残さない。
+    前の版は「写した欄同士」を比べていたので、A を期待する Gate に対して
+    `model_copy(update={"artifact_sha256": A})` した B の assessment が素通りし、
+    **B の提案がそのまま採られた**（推論 ID は B のままなので提案とは一致する）。
+
+    いまは識別子を `prediction`（artifact を含む）から**導出**して検証するので、
+
+    1. 欄だけ書き換えたものは **型が受け取らない**（導出が合わない）
+    2. 予測ごと A に差し替えれば識別子が変わり、**B の提案とは別の推論**になる
+    3. B の assessment をそのまま出せば、A を期待する Gate が artifact で退ける
     """
-    gate = gate_for(policy(), expected_model_version="thermal-v1")
-    proposal = learned_proposal()
-    forged = assessment_for(proposal).model_copy(update={"artifact_sha256": "b" * 64})
-    # **形は完全に正しい。** 検証し直しても通る（だから形の検証では止まらない）。
-    assert ConfidenceAssessment.model_validate(forged.model_dump(mode="python")) == forged
+    other = "b" * 64
+    # B で作った、完全に正しい assessment と、その推論に属する B の提案。
+    b_assessment = assessment_for(learned_proposal(), artifact_sha256=other)
+    b_proposal = learned_proposal(inference_id=b_assessment.inference_id)
+    gate = gate_for(
+        policy(), expected_model_version="thermal-v1", expected_artifact_sha256=TEST_ARTIFACT_SHA256
+    )
 
-    selected = gate.select(
+    # 1. 欄だけ A に書き換えたものは、そもそも型が受け取らない。
+    relabelled = b_assessment.model_copy(update={"artifact_sha256": TEST_ARTIFACT_SHA256})
+    with pytest.raises(ValidationError, match="判定した予測の artifact と違う"):
+        ConfidenceAssessment.model_validate(relabelled.model_dump(mode="python"))
+    with pytest.raises(ValidationError, match="判定した予測の artifact と違う"):
+        LearnedControlStatus(
+            proposal=b_proposal,
+            received_at_mono_ms=0,
+            assessment=relabelled,
+            binding_authority_stage=AuthorityStage.FULL,
+        )
+
+    # 1b. 予測の中の artifact まで書き換えても、**識別子の導出が合わなくなる**。
+    deeper = b_assessment.model_copy(
+        update={
+            "artifact_sha256": TEST_ARTIFACT_SHA256,
+            "prediction": b_assessment.prediction.model_copy(
+                update={"artifact_sha256": TEST_ARTIFACT_SHA256}
+            ),
+        }
+    )
+    with pytest.raises(ValidationError, match="入力の digest と予測から導けない"):
+        ConfidenceAssessment.model_validate(deeper.model_dump(mode="python"))
+
+    # 2. 予測ごと A にすれば識別子が変わり、B の提案の推論ではなくなる。
+    a_assessment = assessment_for(learned_proposal(), artifact_sha256=TEST_ARTIFACT_SHA256)
+    assert a_assessment.inference_id != b_assessment.inference_id
+    rebuilt = gate.select(
         now_mono_ms=0,
         fallback=fallback_proposal(0.4),
         learned=LearnedControlStatus(
-            proposal=proposal,
+            proposal=b_proposal,
             received_at_mono_ms=0,
-            assessment=forged,
+            assessment=a_assessment,
             binding_authority_stage=AuthorityStage.FULL,
         ),
         operating_mode=OperatingMode.AUTO,
         safety_state=SafetyState.NORMAL,
     )
+    assert rebuilt.active_controller is ControllerKind.FALLBACK
+    assert rebuilt.fallback_reason is not None
+    assert rebuilt.fallback_reason.code == "confidence_unattested"
+    assert "another inference" in rebuilt.fallback_reason.detail
+    assert rebuilt.model_gate is not None
+    assert rebuilt.model_gate.artifact_sha256 is None
 
-    assert selected.active_controller is ControllerKind.FALLBACK
-    assert selected.fallback_reason is not None
-    assert selected.fallback_reason.code == "model_artifact_mismatch"
-    assert selected.model_gate is not None
-    assert selected.model_gate.attested is False
-    assert selected.model_gate.artifact_sha256 is None, "束縛できない artifact を残さない"
+    # 3. B の assessment をそのまま出せば、artifact で退ける。
+    honest = gate.select(
+        now_mono_ms=1,
+        fallback=fallback_proposal(0.4),
+        learned=LearnedControlStatus(
+            proposal=b_proposal,
+            received_at_mono_ms=1,
+            assessment=b_assessment,
+            binding_authority_stage=AuthorityStage.FULL,
+        ),
+        operating_mode=OperatingMode.AUTO,
+        safety_state=SafetyState.NORMAL,
+    )
+    assert honest.active_controller is ControllerKind.FALLBACK
+    assert honest.fallback_reason is not None
+    assert honest.fallback_reason.code == "model_artifact_mismatch"
+    assert honest.model_gate is not None
+    assert honest.model_gate.attested is False
+    assert honest.model_gate.artifact_sha256 is None, "束縛できない artifact を残さない"
 
 
 def test_a_gate_without_a_bound_artifact_never_records_one() -> None:
@@ -1079,9 +1183,9 @@ def test_an_assessment_for_another_inference_cannot_lend_its_artifact() -> None:
     """
     gate = gate_for(policy(), expected_model_version="thermal-v1")
     proposal = learned_proposal()
-    other = assessment_for(learned_proposal(inference_id="e" * 64)).model_copy(
-        update={"artifact_sha256": "f" * 64}
-    )
+    # 同じ artifact だが**別の入力**の推論。識別子が違うので提案には付けられない。
+    other = assessment_for(proposal, input_sha256="e" * 64)
+    assert other.inference_id != proposal.inference_id
     selected = gate.select(
         now_mono_ms=0,
         fallback=fallback_proposal(0.4),

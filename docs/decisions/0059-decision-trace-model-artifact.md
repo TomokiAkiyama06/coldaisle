@@ -83,8 +83,60 @@ counterfactual に残り `artifact_sha256` が付く）が、**LIMITED 以降は
   Learned MPC を束縛できなかった runtime は `None` を**明示的に**渡し、その場合は
   どの Learned 提案も採らない（既定値を置かないのは、渡し忘れが「何にも照らさない」
   状態を作らないためである。0057 §2.2 の `authority` と同じ理由）
-- 0050 §3 が受け入れたとおり、**同一 process 内の悪意ある偽造は防げない。**
-  ここで塞ぐのはそれではなく、**何とも照らされていない欄**があることである
+- **照らす相手も、書き換えられる欄であってはならない**（codex #4057241944）。
+  「期待する A」と「assessment が名乗る A」を比べるだけでは、**B の判定を A と名乗らせた**
+  ものが通る。推論 ID は B のままなので B の提案と一致し、**B の提案が採られたまま
+  A の実績として記録される。**
+
+  そこで **identity を宣言ではなく導出にする。** `ConfidenceAssessment` は
+  `input_sha256`（判定に使った入力 window の digest）と `prediction`
+  （**判定した予測そのもの。artifact SHA-256 はこの中にある**）を持ち、
+  `inference_id` は `derive_inference_id(input_sha256, prediction)` と一致しなければ
+  **型として作れない**（`model_validate` が検証する）。あわせて
+  `artifact_sha256` / `model_id` / `artifact_verification` / `input_action_ts_ms` が
+  `prediction` のそれと一致することも要求する。
+
+  Gate が期待値と照らすのは、**識別子の導出に入っている値**（`prediction.artifact_sha256`）
+  である。これで次が閉じる。
+
+  | 手口 | どこで落ちるか |
+  |---|---|
+  | `artifact_sha256` の欄だけ A に書き換える | `prediction` と食い違う → 型が拒む |
+  | `prediction` の中の artifact まで A にする | `inference_id` の導出が合わない → 型が拒む |
+  | 識別子も作り直す | もう B の推論ではない。提案の `inference_id` と合わない → Gate が退ける |
+  | B の assessment をそのまま出す | 導出側の artifact が B → Gate が `model_artifact_mismatch` |
+
+- **counterfactual 側（`ShadowCounterfactual.artifact_sha256`）も同じ値にする。**
+  記録側（#90）は assessment の欄ではなく **Gate が照合し終えた artifact** を写す。
+  同じ tick の2つの記録が違う artifact を名乗ることは `ControlTick` が拒む（§2.2）
+
+#### いま何が照合されていて、何を信用したままか
+
+**照合している（写した値ではなく、導出または配線から来る）:**
+
+| 値 | 何と照らすか |
+|---|---|
+| `model_gate.artifact_sha256` | 配線時の `ArtifactAttestation.artifact_sha256` と、`prediction`（識別子の導出に入る） |
+| `model_gate.inference_id` | 提案の `inference_id`。assessment 側は `derive_inference_id` で導出を検証 |
+| `model_gate.model_version` | 配線時の `expected_model_version` と、提案・assessment の版 |
+| `model_gate.confidence` / `ood` | 検証済み assessment（その validator が components との一致を要求） |
+| `model_gate.authority_stage` | Gate 自身の実効 stage（呼び出し側から受け取らない） |
+| anchor 推論の identity | `LearnedMpcController._check_anchor()` が attestation と照合（既存） |
+| Confidence Profile | `_check_binding_matches_policy()` が attestation と照合（既存） |
+| `ControlState.model_version` | `ControlTick` が `model_gate` との一致を要求 |
+| `RolloutEvidence.artifact_sha256` | lock を握ったまま読み直した production pointer（0057 §2.3） |
+
+**信用したまま（ここでは塞がない）:**
+
+- **同一 process 内で、一式を整合させて作り直す偽造。** 0050 §3 が受け入れた範囲である。
+  秘密鍵を持たない以上、導出関数は誰でも呼べる。塞いだのは**欄の書き換え**であって、
+  「A の入力・A の予測・A の識別子を揃えて作る」ことではない。ただしそれは
+  **もう A の仕事そのもの**であり、B の実績を A に付け替えることにはならない
+- `LearnedControlStatus.binding_authority_stage`。worker 側の値だが、0057 §2.2 が
+  `result_digest` に覆わせたうえで意図的にそう決めた。本記録では変えない
+- `ConfidenceAssessment.profile_sha256` と `model_version`。前者は
+  `LearnedMpcController` の生成時に attestation と照合済み、後者は配線時の
+  `expected_model_version` と提案の両方に照らしている
 - **counterfactual 側（`ShadowCounterfactual.artifact_sha256`）も同じ値にする。**
   記録側（#90）は assessment の欄ではなく **Gate が照合し終えた artifact** を写す。
   同じ tick の2つの記録が違う artifact を名乗ることは `ControlTick` が拒む（§2.2）
@@ -200,6 +252,9 @@ gate の段（§2.4）も同じである。
 | `ControllerProposal` に artifact の欄を足し、Gate がそれを写す | **自己申告を受け取ることになる。** 提案の `confidence` / `ood` を信用しないのと同じ理由で、artifact も信用しない（#85） |
 | 適用 arm の**鍵**（`arm_key`）に artifact を入れる | artifact を入れ替えるたびに arm が別物になり、同じ構成の運転実績が分断される。鍵は「どう回したか」で、artifact は「何で回したか」である |
 | assessment の `artifact_sha256` を、形の検証だけで信じる | `model_validate` は形しか見ない。artifact B の assessment を A に書き換えたものが素通りする（codex #4057191721）。**何とも照らされていない欄を記録しない** |
+| 期待する artifact を、assessment が名乗る `artifact_sha256` と比べる | **攻撃されている欄同士を比べている。** A を期待する Gate に「B の判定を A と名乗らせた」ものが通り、推論 ID は B のままなので B の提案が採られる（codex #4057241944）。識別子の導出に入っている値と照らす |
+| `ConfidenceAssessment` に digest（seal）を1つ足して自己整合だけを見る | 欄の書き換えは止まるが、**identity が宣言のままである。** どの推論・どの artifact のものかを外から確かめられない。導出（`inference_id`）で縛る |
+| 入力 window そのものを assessment に持たせて識別子を作り直す | tick ごとに大きな object を運ぶ。digest（`input_sha256`）で同じ導出ができる |
 | `ControllerGate` の `expected_artifact_sha256` に既定値を置く | 渡し忘れた配線が「何にも照らさない」Gate を作る。0057 §2.2 が `authority` を必須にしたのと同じ理由で、必須の引数にする |
 | 「artifact を言えない適用 tick が無いこと」を、名指した arm だけに求める | 同じ holdout に v1〜v6 の tick を含む別の適用 arm が残っていても昇格できる（codex #4057191724）。gate の判定と同じく、報告に現れた Learned MPC の arm すべてに求める |
 | `ControlTick` の version を上げず、欄だけ足す | 0030 §2 が「schema の意味を変える場合は version を上げ、既存 trace を新しい意味として解釈しない」と決めている。上げないと、欄の無い v6 を「artifact 不明」ではなく「まだ書いていないだけ」と読める |

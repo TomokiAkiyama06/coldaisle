@@ -456,11 +456,18 @@ class ControllerGate:
         object ではなくここで返した検証済みの assessment から取る**（#159）。
         `model_copy(update=...)` は検証を通らないため、Gate でも検証し直す。
 
-        **検証し直すだけでは足りない**（codex #4057191721）。`model_validate` が見るのは
-        形だけなので、artifact B の正しい assessment を `model_copy` で
-        `artifact_sha256=A` に書き換えたものは、`REGISTRY_VERIFIED` も同じ推論 ID も版も
-        confidence もそのまま通り、**A の実績として記録できてしまう。**
+        **検証し直すだけでは足りない**（codex #4057191721）。artifact B の正しい assessment を
+        `model_copy` で `artifact_sha256=A` に書き換えたものは、`REGISTRY_VERIFIED` も
+        同じ推論 ID も版も confidence もそのまま通ってしまう。
         だから artifact は、配線時に束縛した attestation の hash と照らす。
+
+        **照らす相手も、書き換えられる欄であってはならない**（codex #4057241944）。
+        `verified.artifact_sha256` 同士を比べると、A を期待する Gate に「B の判定を A と
+        名乗らせた」ものが通る（推論 ID は B のままなので、B の提案がそのまま採られる）。
+        `ConfidenceAssessment` は **判定した予測そのもの**を持ち、推論 ID をそこから
+        導出して検証するので（#159）、ここでは **`prediction.artifact_sha256`**、すなわち
+        **識別子の導出に入っている値**と照らす。artifact を差し替えれば識別子が変わり、
+        識別子を作り直せば提案の `inference_id` と合わなくなる。
         """
         if assessment is None:
             return None, self._reason(FallbackCause.CONFIDENCE_UNATTESTED, "assessment is missing")
@@ -481,10 +488,13 @@ class ControllerGate:
         if expected is None:
             # Learned MPC を束縛できていない runtime。どの artifact の判定も受け取らない。
             return None, self._reason(FallbackCause.MODEL_ARTIFACT_MISMATCH, "no bound artifact")
-        if verified.artifact_sha256 != expected:
+        # **識別子の導出に入っている値と照らす。** 写した欄（`verified.artifact_sha256`）
+        # ではない。型の validator が両者の一致を要求するので、ここは常に導出側を見る。
+        attested_artifact = verified.prediction.artifact_sha256
+        if attested_artifact != expected:
             return None, self._reason(
                 FallbackCause.MODEL_ARTIFACT_MISMATCH,
-                f"expected={expected}; actual={verified.artifact_sha256}",
+                f"expected={expected}; actual={attested_artifact}",
             )
         return verified, None
 

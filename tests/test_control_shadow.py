@@ -906,11 +906,13 @@ def test_invariant_3_k_a_conflict_among_unusable_values_is_not_a_conflict() -> N
 
 def test_invariant_4_a_an_unattested_proposal_records_no_confidence() -> None:
     """assessment と束ねられない提案の confidence / ood は**記録しない**。"""
-    proposal = shadow_proposal(0.9, confidence=0.99)
     # Registry を通っていない判定は Gate が裏づけとして扱わない（#85）。
-    offline = assessment_for(proposal).model_copy(
-        update={"artifact_verification": ArtifactVerification.OFFLINE_UNVERIFIED}
+    # 検証状態も識別子の導出に入るので、提案の側も同じ推論を指す（#159）。
+    offline = assessment_for(
+        shadow_proposal(0.9, confidence=0.99),
+        verification=ArtifactVerification.OFFLINE_UNVERIFIED,
     )
+    proposal = shadow_proposal(0.9, confidence=0.99, inference_id=offline.inference_id)
     result = mpc_result(proposal, assessment=offline)
     selection = gate_selection(learned=worker_status(result))
     state = control_state(selection)

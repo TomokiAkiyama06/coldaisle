@@ -47,7 +47,7 @@ from coldaisle.control.model.confidence import (
     ConfidenceComponent,
     ModelConfidenceProfile,
 )
-from coldaisle.control.model.thermal import ArtifactVerification, ObservedThermalInput
+from coldaisle.control.model.thermal import ObservedThermalInput
 from coldaisle.control.schema import (
     AuthorityStage,
     ControllerKind,
@@ -69,11 +69,12 @@ from coldaisle.control.shadow import (
     ShadowOutcome,
     ShadowOutcomeMatcher,
 )
-from test_fallback_controller import TEST_ARTIFACT_SHA256, learned_proposal
+from test_fallback_controller import learned_proposal
 from test_model_confidence import (
     AIR,
     GPU,
     _active_gate,
+    _deployed,
     _select,
     assessor,
     confidence_policy,
@@ -438,15 +439,9 @@ def test_runtime_drift_still_reaches_the_authority_gate_through_confidence(train
     assert "ood_residual_drift" in {reason.code for reason in drifted.trace_reasons()}
 
     # Gate は assessment の値だけを信じる（0050 §2.3）。OOD の判定は Fallback へ落ちる。
-    deployed = drifted.model_copy(
-        update={
-            "artifact_verification": ArtifactVerification.REGISTRY_VERIFIED,
-            "model_version": "thermal-v1",
-            # Gate が束縛した artifact に揃える（#159）。揃えないと artifact の不一致で
-            # 先に落ち、ここで見たい OOD の理由が出ない。
-            "artifact_sha256": TEST_ARTIFACT_SHA256,
-        }
-    )
+    # Gate が束縛した artifact に揃える（#159）。揃えないと artifact の不一致で先に落ち、
+    # ここで見たい OOD の理由が出ない。**予測ごと差し替えて識別子を作り直す。**
+    deployed = _deployed(drifted)
     gate = _active_gate(AuthorityStage.FULL)
     proposal = deployed.apply_to(learned_proposal(0.1, inference_id=deployed.inference_id))
     selected = _select(gate, 2, proposal, deployed)

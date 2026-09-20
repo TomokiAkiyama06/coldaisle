@@ -28,6 +28,7 @@ from coldaisle.control.model.confidence import (
     ResidualEvidence,
     ResidualObservation,
     SupportAxis,
+    derive_inference_id,
     evaluate_ood_detection,
     fit_confidence_profile,
     inference_id,
@@ -802,12 +803,7 @@ def test_an_assessment_cannot_be_moved_to_a_proposal_from_another_inference(trai
     # 同じ action 時刻・同じ model でも、入力が違えば識別子が違う
     assert safe.input_action_ts_ms == ood.input_action_ts_ms
 
-    deployed_safe = safe.model_copy(
-        update={
-            "artifact_verification": ArtifactVerification.REGISTRY_VERIFIED,
-            "model_version": "thermal-v1",
-        }
-    )
+    deployed_safe = _deployed(safe)
     proposal_for_ood_input = learned_proposal(0.1, confidence=0.0, inference_id=ood.inference_id)
     with pytest.raises(ValueError, match="別の推論"):
         deployed_safe.apply_to(proposal_for_ood_input)
@@ -1263,14 +1259,22 @@ def _deployed(assessment: ConfidenceAssessment) -> ConfidenceAssessment:
     `model_artifact_mismatch` で退ける。揃えるのはここが「production へ配線した」
     状況を作る helper だからで、**Gate 側の照合そのものは別の試験で破りにいく**。
     """
+    # **予測ごと差し替えて、識別子を作り直す**（#159）。欄だけを書き換えたものは型が拒む。
+    prediction = assessment.prediction.model_copy(
+        update={
+            "artifact_sha256": TEST_ARTIFACT_SHA256,
+            "artifact_verification": ArtifactVerification.REGISTRY_VERIFIED,
+        }
+    )
     return ConfidenceAssessment.model_validate(
-        assessment.model_copy(
-            update={
-                "artifact_verification": ArtifactVerification.REGISTRY_VERIFIED,
-                "model_version": "thermal-v1",
-                "artifact_sha256": TEST_ARTIFACT_SHA256,
-            }
-        ).model_dump(mode="python")
+        {
+            **assessment.model_dump(mode="python"),
+            "artifact_verification": ArtifactVerification.REGISTRY_VERIFIED,
+            "model_version": "thermal-v1",
+            "artifact_sha256": TEST_ARTIFACT_SHA256,
+            "prediction": prediction.model_dump(mode="python"),
+            "inference_id": derive_inference_id(assessment.input_sha256, prediction),
+        }
     )
 
 
@@ -1314,9 +1318,19 @@ def test_a1_learned_confidence_requires_a_matching_verified_assessment(
             )
         )
     elif violation == "offline_artifact":
-        attached = assessment.model_copy(
+        # 検証状態は予測にも入るので、予測ごと offline にして識別子を作り直す（#159）。
+        offline_prediction = assessment.prediction.model_copy(
             update={"artifact_verification": ArtifactVerification.OFFLINE_UNVERIFIED}
         )
+        attached = ConfidenceAssessment.model_validate(
+            {
+                **assessment.model_dump(mode="python"),
+                "artifact_verification": ArtifactVerification.OFFLINE_UNVERIFIED,
+                "prediction": offline_prediction.model_dump(mode="python"),
+                "inference_id": derive_inference_id(assessment.input_sha256, offline_prediction),
+            }
+        )
+        proposal = proposal.model_copy(update={"inference_id": attached.inference_id})
     elif violation == "another_model_version":
         proposal = proposal.model_copy(update={"model_version": "thermal-v1"})
         attached = assessment.model_copy(update={"model_version": "thermal-v0"})
