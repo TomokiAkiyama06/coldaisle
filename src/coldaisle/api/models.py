@@ -282,6 +282,57 @@ class ServerEnvironmentHealth(BaseModel):
     metrics: dict[str, ServerHealthMetric]
 
 
+class AdvisoryCondition(BaseModel):
+    """切替直前に提示する環境条件1件（#68 / 決定記録 0063 §2.2）。
+
+    **欠けている条件も必ず1件として載せる。** キーごと省略すると、
+    受け手は「条件が無い」と「条件が正常」を区別できない。
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    metric: str
+    value: float | None
+    unit: str | None
+    quality: Quality
+    age_seconds: float | None
+    usable: bool
+    """判断材料として使えるか（`quality=ok` かつ設定の `max_age_s` 以内）。"""
+    advisory_max: float | None
+    """助言用の上限（`config/compute-mode-advisory.yaml`）。制御には使わない。"""
+    exceeded: bool
+    """使える値が `advisory_max` を超えているか。使えない値では常に false。"""
+    reference_value: float | None
+    """直近の実測フルロード期間中の同じ metric の値。比較できなければ null。"""
+    delta: float | None
+    """`value - reference_value`。どちらかが無ければ null。"""
+
+
+class FullLoadReference(BaseModel):
+    """直近に**観測された**フルロード期間（#68 / 決定記録 0063 §2.3）。
+
+    GPU Mode の申告（`events` / `sys.gpu_mode`）ではなく、記録された電力から導く。
+    時刻・継続時間は根拠となったバケットの時刻から決め、現在時刻から作らない。
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    started_at_ms: int
+    started_at: str
+    ended_at_ms: int
+    ended_at: str
+    covered_s: float
+    """根拠として数えたバケットの合計時間。欠落した時間は含まない。"""
+    bucket_count: int
+    load_metric: str
+    load_peak: float | None
+    load_mean: float | None
+    conditions: dict[str, float]
+    """当時の環境条件。証拠の無い metric はキーごと入らない。"""
+    peaks: dict[str, float]
+    """当時の最高温度。証拠の無い metric はキーごと入らない。"""
+
+
 class ComputeModeAdvisory(BaseModel):
     """Compute Mode 切替の判断材料。制御や拒否には使わない。"""
 
@@ -290,6 +341,18 @@ class ComputeModeAdvisory(BaseModel):
     safe: bool
     warnings: tuple[str, ...]
     blocking: Literal[False] = False
+    conditions: tuple[AdvisoryCondition, ...]
+    """設定に並べた順の環境条件。件数は設定と常に一致する。"""
+    reference: FullLoadReference | None
+    """比較に使った実測フルロード期間。無ければ null（`limitations` に理由が入る）。"""
+    reference_count: int
+    """さかのぼり期間に見つかったフルロード期間の件数。重複した観測では増えない。"""
+    reference_window_days: int
+    evaluated_at_ms: int
+    """履歴部分を評価した時刻。`generated_at_ms` より古いことがある。"""
+    evaluated_at: str
+    limitations: tuple[str, ...]
+    """**比較できなかったこと。** 空でないなら判断材料が欠けている。"""
 
 
 class ServerHealthResponse(BaseModel):
