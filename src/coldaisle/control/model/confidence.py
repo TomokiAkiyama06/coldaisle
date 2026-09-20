@@ -750,7 +750,8 @@ class ConfidenceAssessment(_Frozen):
             raise ValueError("assessment と予測の model_id が違う")
         if self.prediction.model_version != self.model_version:
             # **版も、識別子の導出に入っている値から動かせないようにする**
-            # （codex #4057753197）。同じ artifact bytes を指す登録が2つあると、
+            # （決定記録 0065 §2.1。codex #4057753197）。
+            # 同じ artifact bytes を指す登録が2つあると、
             # 版だけを書き換えた assessment（と同じく書き換えた提案）が、
             # artifact の照合も識別子の照合もそのまま通ってしまう。
             raise ValueError("assessment と予測の model_version が違う")

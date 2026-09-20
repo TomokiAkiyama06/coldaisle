@@ -139,7 +139,8 @@ EVIDENCE_END_MS = NOW_MS - 3_600_000
 
 
 def store(tmp_path: Path, *, now_ms: int = NOW_MS) -> AuthorityStore:
-    return AuthorityStore(tmp_path / "authority", SimulatedClock(now_ms))
+    # control runtime から使う store は lock の待ち上限が要る（決定記録 0060 §2.7）。
+    return AuthorityStore(tmp_path / "authority", SimulatedClock(now_ms), lock_timeout_ms=500)
 
 
 _FIXTURES = TemporaryDirectory(prefix="pr92-authority-")
@@ -586,7 +587,7 @@ def unwritable_runtime(
     """`stage` まで上げた journal を読み、以後は書けなくなった runtime。"""
     runtime(tmp_path, stage=stage)
     return AuthorityRuntime(
-        UnwritableStore(tmp_path / "authority", SimulatedClock(NOW_MS)),
+        UnwritableStore(tmp_path / "authority", SimulatedClock(NOW_MS), lock_timeout_ms=500),
         policy(authority="full"),
     )
 
@@ -1721,7 +1722,7 @@ def test_invariant_6_o_a_demotion_takes_effect_before_it_is_persisted(tmp_path: 
 
     runtime(tmp_path, stage=AuthorityStage.FULL)
     control = AuthorityRuntime(
-        WatchingStore(tmp_path / "authority", SimulatedClock(NOW_MS)),
+        WatchingStore(tmp_path / "authority", SimulatedClock(NOW_MS), lock_timeout_ms=500),
         policy(authority="full"),
     )
     holder.append(control)
@@ -1745,7 +1746,7 @@ def test_invariant_6_p_an_unexpected_persist_failure_still_lowers(tmp_path: Path
 
     runtime(tmp_path, stage=AuthorityStage.FULL)
     control = AuthorityRuntime(
-        ExplodingStore(tmp_path / "authority", SimulatedClock(NOW_MS)),
+        ExplodingStore(tmp_path / "authority", SimulatedClock(NOW_MS), lock_timeout_ms=500),
         policy(authority="full"),
     )
 

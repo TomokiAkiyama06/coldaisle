@@ -24,11 +24,12 @@ from __future__ import annotations
 import os
 import secrets
 import stat
+import time
 from collections import deque
 from collections.abc import Iterator
 from contextlib import ExitStack, contextmanager, suppress
 from enum import StrEnum
-from fcntl import LOCK_EX, LOCK_UN, flock
+from fcntl import LOCK_EX, LOCK_NB, LOCK_UN, flock
 from hashlib import sha256
 from pathlib import Path
 from typing import Literal, Self
@@ -513,18 +514,37 @@ class AuthorityStore:
     状態を動かせてしまう（0057 §2.3）。
     """
 
-    __slots__ = ("_clock", "_root")
+    __slots__ = ("_clock", "_lock_timeout_ms", "_root")
 
-    def __init__(self, root: Path, clock: Clock | None = None) -> None:
+    def __init__(
+        self,
+        root: Path,
+        clock: Clock | None = None,
+        *,
+        lock_timeout_ms: int | None = None,
+    ) -> None:
         """**時刻は store が持つ時計から取る。**
 
         操作のたびに `now_ms` を受け取ると、期限の判定に使う「いま」を呼び出し側が
         決められる（承認の期限も証拠の新しさも、渡す値ひとつで外せる）。
+
+        ``lock_timeout_ms`` は排他 lock を待てる上限である。**制御ループから呼ぶ store
+        には必ず指定する**（決定記録 0060 §2.7）。指定しないと `flock` が無期限に待ち、
+        降格の書き残しが control tick のあいだに居座って heartbeat が途切れる。
+        人の操作（昇格）のように deadman の無い経路では、待ち続けてよいので省略できる。
         """
         if not root.is_absolute():
             raise AuthorityStoreError("authority store の root は絶対 path にする")
+        if lock_timeout_ms is not None and lock_timeout_ms <= 0:
+            raise AuthorityStoreError("authority lock の待ち上限は正にする")
         self._root = root
         self._clock = clock if clock is not None else WallClock()
+        self._lock_timeout_ms = lock_timeout_ms
+
+    @property
+    def lock_timeout_ms(self) -> int | None:
+        """排他 lock を待てる上限。`None` は「待ち続ける」。"""
+        return self._lock_timeout_ms
 
     def read(self) -> AuthorityJournal:
         """いまの journal。file が無ければ Baseline から始まったものとして返す。"""
@@ -911,13 +931,41 @@ class AuthorityStore:
             try:
                 if not stat.S_ISREG(os.fstat(lock_fd).st_mode):
                     raise AuthorityStoreError("authority lock が regular file ではない")
-                flock(lock_fd, LOCK_EX)
+                self._acquire(lock_fd)
                 try:
                     yield root_fd
                 finally:
                     flock(lock_fd, LOCK_UN)
             finally:
                 os.close(lock_fd)
+
+    def _acquire(self, lock_fd: int) -> None:
+        """排他 lock を取る。上限が指定されていれば、そこで諦める。
+
+        **待ち続ける実装を制御ループから使わない。** `flock` は他 process が持っている
+        あいだ無期限に待つので、降格の書き残しが control tick のあいだに居座り、
+        heartbeat が途切れる（決定記録 0060 §2.7）。諦めた場合は `AuthorityStoreError`
+        になり、呼び出し側（`AuthorityRuntime`）が **memory 上で下げたまま** 失敗を記録する。
+
+        ここで使う時計は control loop の単調時計ではない。判断の期限ではなく
+        **syscall の再試行の上限**なので、注入した時計に合わせる必要がない。
+        """
+        timeout_ms = self._lock_timeout_ms
+        if timeout_ms is None:
+            flock(lock_fd, LOCK_EX)
+            return
+        deadline = time.monotonic() + timeout_ms / 1_000
+        interval = max(0.001, timeout_ms / 10_000)
+        while True:
+            try:
+                flock(lock_fd, LOCK_EX | LOCK_NB)
+                return
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    raise AuthorityStoreError(
+                        f"authority lock を {timeout_ms}ms 以内に取れなかった"
+                    ) from None
+                time.sleep(interval)
 
     @staticmethod
     def _open_directory_chain(root_fd: int, parts: tuple[str, ...], *, create: bool) -> int:
@@ -1035,7 +1083,16 @@ class AuthorityRuntime:
     )
 
     def __init__(self, store: AuthorityStore, policy: FanPolicyConfig) -> None:
-        """**時計は持たない。** 記録の時刻は store が自分の時計で決める。"""
+        """**時計は持たない。** 記録の時刻は store が自分の時計で決める。
+
+        store には**必ず lock の待ち上限を持たせる**（決定記録 0060 §2.7）。この runtime は
+        control tick の中から呼ばれるので、待ち続ける store を渡すと、降格の書き残しが
+        2つの heartbeat のあいだに居座って deadman が鳴る。
+        """
+        if store.lock_timeout_ms is None:
+            raise AuthorityStoreError(
+                "control runtime の AuthorityStore には lock の待ち上限（lock_timeout_ms）が要る"
+            )
         self._store = store
         self._policy = policy
         self._journal = store.read()
