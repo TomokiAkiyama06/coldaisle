@@ -38,10 +38,21 @@ class _AppliedEvidence:
 
     segments: int = 0
     temperature_reports: int = 0
+    incomplete_segments: int = 0
+    """設定した温度 metric が**1つでも欠けた** segment の数。"""
     exceedances: int = 0
     emergency_ticks: int = 0
     fault_ticks: int = 0
     minimum_margin_c: float | None = None
+
+    @property
+    def temperature_is_complete(self) -> bool:
+        """**設定したすべての温度 metric が、評価したすべての segment に揃っているか。**
+
+        1つの metric の証拠だけで Safety の段を通すと、欠けている metric の超過を
+        見ないまま合格になる（部分的な証拠を全体として扱わない）。
+        """
+        return self.segments > 0 and self.temperature_reports > 0 and self.incomplete_segments == 0
 
 
 @dataclass
@@ -50,7 +61,10 @@ class _CounterfactualEvidence:
 
     segments: int = 0
     outcomes: int = 0
-    scored: int = 0
+    minimum_scored: int | None = None
+    """**segment ごとの**採点数の最小。合計にすると、足りない区間を数で薄められる。"""
+    insufficient_segments: int = 0
+    """coverage が下限に満たなかった segment の数。**1つでもあれば gate を通さない。**"""
     minimum_identifiable_fraction: float | None = None
     maximum_underprediction_c: float | None = None
     optimizer_samples: int = 0
@@ -73,13 +87,16 @@ def evaluate_gates(
     applied: dict[str, _AppliedEvidence] = {}
     counterfactual: dict[str, _CounterfactualEvidence] = {}
     holdout = tuple(segment for segment in segments if segment.role is SegmentRole.HOLDOUT)
+    expected_metrics = frozenset(config.temperature_metrics)
     for segment in holdout:
         for group in segment.groups:
             if group.kind is not GroupKind.OVERALL:
                 continue
             for applied_report in group.applied:
                 _collect_applied(
-                    applied.setdefault(applied_report.arm_key, _AppliedEvidence()), applied_report
+                    applied.setdefault(applied_report.arm_key, _AppliedEvidence()),
+                    applied_report,
+                    expected_metrics=expected_metrics,
                 )
             for shadow_report in group.counterfactual:
                 _collect_counterfactual(
@@ -109,9 +126,14 @@ def _worst_by_arm(
     return found
 
 
-def _collect_applied(evidence: _AppliedEvidence, report: AppliedArmReport) -> None:
+def _collect_applied(
+    evidence: _AppliedEvidence, report: AppliedArmReport, *, expected_metrics: frozenset[str]
+) -> None:
     evidence.segments += 1
     evidence.temperature_reports += len(report.temperatures)
+    if expected_metrics - {item.metric for item in report.temperatures}:
+        # **この segment では、設定した温度 metric のどれかが読めていない。**
+        evidence.incomplete_segments += 1
     evidence.emergency_ticks = max(evidence.emergency_ticks, report.interventions.emergency_ticks)
     evidence.fault_ticks = max(evidence.fault_ticks, report.interventions.fault_ticks)
     for temperature in report.temperatures:
@@ -127,10 +149,18 @@ def _collect_counterfactual(
 ) -> None:
     evidence.segments += 1
     evidence.outcomes += report.coverage.outcomes
-    evidence.scored += report.coverage.scored
     evidence.proposals += report.proposals
     evidence.predictions += len(report.predictions)
     evidence.sufficient_segments += int(report.coverage.sufficient)
+    if not report.coverage.sufficient:
+        # 予測指標を伏せた segment の採点数を、ほかの segment と足して下限を満たさない
+        # （伏せた区間の証拠で通し、出した区間の指標で採点することになる。0054 §2.3）。
+        evidence.insufficient_segments += 1
+    evidence.minimum_scored = (
+        report.coverage.scored
+        if evidence.minimum_scored is None
+        else min(evidence.minimum_scored, report.coverage.scored)
+    )
     if report.safety_floor_shortfalls is not None:
         # Safety は**最悪の segment**で見る。平均で薄めない（決定記録 0054 §2.4）。
         evidence.floor_shortfalls = (
@@ -184,17 +214,17 @@ def _applied_gate(
         _at_most(
             GateStage.SAFETY,
             "ceiling_exceedances",
-            observed=(None if evidence.temperature_reports == 0 else float(evidence.exceedances)),
+            observed=(float(evidence.exceedances) if evidence.temperature_is_complete else None),
             limit=float(safety.maximum_ceiling_exceedances.value),
-            reason="no_temperature_evidence",
+            reason=_temperature_gap(evidence),
             worst_case=worst.get((arm_key, WorstCaseKind.CEILING_EXCEEDANCES)),
         ),
         _at_least(
             GateStage.SAFETY,
             "threshold_margin_c",
-            observed=evidence.minimum_margin_c,
+            observed=(evidence.minimum_margin_c if evidence.temperature_is_complete else None),
             limit=safety.minimum_threshold_margin_c.value,
-            reason="no_temperature_evidence",
+            reason=_temperature_gap(evidence),
             worst_case=worst.get((arm_key, WorstCaseKind.MINIMUM_THRESHOLD_MARGIN)),
         ),
         _at_most(
@@ -250,9 +280,21 @@ def _counterfactual_gate(
         _at_least(
             GateStage.EVIDENCE,
             "scored_outcomes",
-            observed=float(evidence.scored),
+            # **segment ごとの最小**で見る。合計にすると、採点できた区間が1つあるだけで
+            # 足りない区間をまたいで下限を満たせてしまう。
+            observed=(None if evidence.minimum_scored is None else float(evidence.minimum_scored)),
             limit=float(gate.evidence.minimum_scored_outcomes.value),
             reason="no_outcome_evidence",
+        ),
+        _at_most(
+            GateStage.EVIDENCE,
+            "insufficient_coverage_segments",
+            # **評価したすべての holdout segment で coverage が足りていること。**
+            # 0 は設定値ではなく構造上の要求（0054 §2.3）。伏せた区間の証拠と、出した
+            # 区間の指標が混ざらないようにする。
+            observed=(None if evidence.segments == 0 else float(evidence.insufficient_segments)),
+            limit=0.0,
+            reason="no_segment_evidence",
         ),
         _at_most(
             GateStage.COST,
@@ -279,6 +321,13 @@ def _counterfactual_gate(
         ),
     ]
     return _result(arm_key, tuple(conditions))
+
+
+def _temperature_gap(evidence: _AppliedEvidence) -> str:
+    """温度の証拠が使えない理由。**「無い」と「一部だけ」を区別する。**"""
+    if evidence.temperature_reports == 0:
+        return "no_temperature_evidence"
+    return "incomplete_temperature_evidence"
 
 
 def _at_most(

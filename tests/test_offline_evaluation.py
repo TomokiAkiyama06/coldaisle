@@ -58,13 +58,16 @@ from coldaisle.control.evaluation.model import (
 from coldaisle.control.evaluation.stats import MetricSummary, shape_of, summarize
 from coldaisle.control.schema import (
     MAX_SHADOW_PREDICTION_METRICS,
+    MODEL_GATE_ASSESSMENT_COMPONENTS,
     AuthorityStage,
     BoundBy,
+    ConfidenceLevel,
     ControllerKind,
     ControlState,
     ControlTick,
     EffectiveZoneDemand,
     HardwareReadback,
+    ModelGateDecision,
     OperatingMode,
     OptimizerStatus,
     PerZone,
@@ -99,6 +102,8 @@ EVALUATION_YAML = ROOT / "config" / "evaluation.yaml"
 
 GPU = "gpu.0.core"
 ROOM = "air.room"
+TEMPERATURES = ("gpu.0.core", "gpu.0.hotspot", "cpu.package")
+"""`config/evaluation.yaml` の `temperature_metrics`。**全部揃わないと Safety の段は通らない。**"""
 TICK_TS_MS = 1_787_616_000_000
 STEP_MS = 10_000
 """`valid_documents()` の `mpc.optimizer.step_ms`。照合の許容幅より大きい。"""
@@ -251,6 +256,7 @@ def tick_at(
     rpm: int | None = 1200,
     faults: tuple[Any, ...] = (),
     cf: ShadowCounterfactual | None = None,
+    model_gate: ModelGateDecision | None = None,
 ) -> ControlTick:
     """1 tick。**適用は Fallback、counterfactual は Learned MPC**（重ならない）。"""
     zones = zone_records(
@@ -277,6 +283,7 @@ def tick_at(
         ts_ms=ts_ms,
         state=state or control_state(),
         zones=zones,
+        model_gate=model_gate,
         shadow=record,
         faults=faults,
     )
@@ -320,8 +327,9 @@ def plan_following_run(
         for index in range(ticks)
     ]
     observations = [
-        observation(GPU, start_ms + index * STEP_MS, 50.0 + index * 0.1)
+        observation(metric, start_ms + index * STEP_MS, 50.0 + index * 0.1)
         for index in range(ticks + 4)
+        for metric in TEMPERATURES
     ]
     observations.extend(
         observation(ROOM, start_ms + index * STEP_MS, 24.0) for index in range(ticks)
@@ -774,7 +782,7 @@ def test_invariant_5_d_a_safety_violation_blocks_even_with_perfect_cost_metrics(
     traces, observations = plan_following_run()
     ceiling = context.control.safety.absolute_temp_ceiling_c.value
     hot = [
-        item if item.metric != GPU else observation(item.metric, item.ts_ms, ceiling + 5.0)
+        observation(item.metric, item.ts_ms, ceiling + 5.0) if item.metric in TEMPERATURES else item
         for item in observations
     ]
     report = evaluate([run_of(traces, hot)], context=context)
@@ -931,10 +939,13 @@ def test_invariant_7_c_a_shadow_export_row_must_match_the_stored_trace(
         evaluate([run_of(traces, observations, shadow=(swapped, *rows[1:]))], context=context)
 
 
-def test_invariant_7_d_an_outcome_from_another_inference_is_not_counted(
+def test_invariant_7_d_an_outcome_from_another_inference_is_refused(
     context: EvaluationContext,
 ) -> None:
-    """outcome は `inference_id` と `plan_digest` で結び直す。**結べなければ数えない。**"""
+    """outcome は `inference_id` と `plan_digest` で結び直す。**結べなければ受け取らない。**
+
+    数えないだけにすると、壊れた export が「予測が無かった」として素通りする。
+    """
     traces, observations = plan_following_run()
     rows = list(shadow_rows(traces, observations=observations, matcher=context.matcher()))
     relabelled = tuple(
@@ -948,11 +959,39 @@ def test_invariant_7_d_an_outcome_from_another_inference_is_not_counted(
         )
         for row in rows
     )
-    report = evaluate([run_of(traces, observations, shadow=relabelled)], context=context)
-    shadow_arm = overall(report).counterfactual[0]
+    with pytest.raises(EvaluationInputError, match="結べない"):
+        evaluate([run_of(traces, observations, shadow=relabelled)], context=context)
 
-    assert shadow_arm.coverage.outcomes == 0
-    assert shadow_arm.coverage.identifiable_fraction is None
+
+def test_invariant_7_f_a_duplicated_shadow_row_cannot_inflate_the_coverage(
+    context: EvaluationContext,
+) -> None:
+    """**行を複製するだけで採点数と coverage の下限を満たせない。**"""
+    traces, observations = plan_following_run()
+    rows = tuple(shadow_rows(traces, observations=observations, matcher=context.matcher()))
+    with pytest.raises(EvaluationInputError, match="同じ tick の行が複数"):
+        evaluate([run_of(traces, observations, shadow=(*rows, rows[0]))], context=context)
+
+
+def test_invariant_7_g_a_duplicated_outcome_cannot_inflate_the_scored_count(
+    context: EvaluationContext,
+) -> None:
+    """同じ推論・同じ候補 plan の outcome を2つ置いて採点数を増やせない。"""
+    traces, observations = plan_following_run()
+    rows = list(shadow_rows(traces, observations=observations, matcher=context.matcher()))
+    doubled = rows[0].model_copy(update={"outcomes": rows[0].outcomes * 2})
+    with pytest.raises(EvaluationInputError, match="同じ推論・同じ候補 plan の outcome"):
+        evaluate([run_of(traces, observations, shadow=(doubled, *rows[1:]))], context=context)
+
+
+def test_invariant_7_h_a_shadow_tick_without_a_row_is_refused(
+    context: EvaluationContext,
+) -> None:
+    """counterfactual を持つ tick と export の行は**1対1**。抜けを「提案が無かった」にしない。"""
+    traces, observations = plan_following_run()
+    rows = tuple(shadow_rows(traces, observations=observations, matcher=context.matcher()))
+    with pytest.raises(EvaluationInputError, match="1対1でない"):
+        evaluate([run_of(traces, observations, shadow=rows[1:])], context=context)
 
 
 def test_invariant_7_e_the_shadow_export_round_trips(context: EvaluationContext) -> None:
@@ -1457,3 +1496,211 @@ def test_temperature_and_margin_come_from_the_safety_contract(
     assert temperature.threshold_c == ceiling
     assert temperature.margin.minimum == pytest.approx(ceiling - temperature.values.maximum)
     assert temperature.exceedances == 0
+
+
+# ------------- 不変条件 12: 部分的な証拠を「揃っている」として扱わない（Codex レビュー）
+
+
+def test_invariant_12_a_partial_temperature_evidence_blocks_the_safety_gate(
+    context: EvaluationContext,
+) -> None:
+    """**1つの温度 metric の証拠だけで Safety の段を通さない**（決定記録 0054 §2.3）。
+
+    欠けた metric の超過を見ないまま合格になるのを防ぐ。「1つも無い」と「一部だけ」は
+    別の理由として残す。
+    """
+    traces, observations = plan_following_run()
+    partial = [item for item in observations if item.metric != "cpu.package"]
+    report = evaluate([run_of(traces, partial)], context=context)
+    gate = next(item for item in report.gates if item.arm_key.startswith("applied:"))
+    exceedances = next(item for item in gate.conditions if item.name == "ceiling_exceedances")
+    margin = next(item for item in gate.conditions if item.name == "threshold_margin_c")
+
+    assert gate.outcome is GateOutcome.BLOCKED
+    assert gate.blocking_stage is GateStage.SAFETY
+    for condition in (exceedances, margin):
+        assert condition.observed is None
+        assert condition.reason is not None
+        assert condition.reason.code == "incomplete_temperature_evidence"
+
+
+def test_invariant_12_b_no_temperature_evidence_is_a_different_reason(
+    context: EvaluationContext,
+) -> None:
+    """「1つも読めていない」を「一部だけ読めた」と同じ理由にしない。"""
+    traces, _observations = plan_following_run()
+    report = evaluate([run_of(traces, [])], context=context)
+    gate = next(item for item in report.gates if item.arm_key.startswith("applied:"))
+    margin = next(item for item in gate.conditions if item.name == "threshold_margin_c")
+
+    assert margin.reason is not None and margin.reason.code == "no_temperature_evidence"
+
+
+def test_invariant_12_c_one_insufficient_segment_blocks_the_whole_arm(
+    context: EvaluationContext,
+) -> None:
+    """**coverage は評価したすべての holdout segment で足りていること**（0054 §2.3）。
+
+    足りない segment の採点数をほかの segment と足すと、「証拠は伏せた区間から、
+    指標は出した区間から」という取り合わせになる。`scored_outcomes` も最小で見る。
+    """
+    long_traces, long_observations = plan_following_run(ticks=60)
+    short_traces, short_observations = plan_following_run(
+        ticks=6, start_ms=TICK_TS_MS + 200 * STEP_MS
+    )
+    report = evaluate(
+        [
+            run_of(long_traces, long_observations, run_id="pr91-long"),
+            run_of(short_traces, short_observations, run_id="pr91-short"),
+        ],
+        context=context,
+    )
+    gate = next(item for item in report.gates if item.arm_key.startswith("counterfactual:"))
+    insufficient = next(
+        item for item in gate.conditions if item.name == "insufficient_coverage_segments"
+    )
+    scored = next(item for item in gate.conditions if item.name == "scored_outcomes")
+
+    assert insufficient.observed == 1.0 and insufficient.outcome is GateOutcome.BLOCKED
+    # **合計（60 超）ではなく、足りない segment の採点数が出ている。**
+    assert scored.observed is not None
+    assert scored.observed < context.config.gate.evidence.minimum_scored_outcomes.value
+    assert gate.outcome is GateOutcome.BLOCKED
+
+
+def test_a_run_with_enough_coverage_passes_the_evidence_stage(
+    context: EvaluationContext,
+) -> None:
+    """fail closed を入れても、**証拠が揃えば通る**（常に blocked な gate ではない）。"""
+    traces, observations = plan_following_run(ticks=60)
+    report = evaluate([run_of(traces, observations)], context=context)
+    gate = next(item for item in report.gates if item.arm_key.startswith("counterfactual:"))
+    evidence = [item for item in gate.conditions if item.stage is GateStage.EVIDENCE]
+
+    assert all(item.outcome is GateOutcome.PASS for item in evidence), gate
+    applied_gate = next(item for item in report.gates if item.arm_key.startswith("applied:"))
+    assert applied_gate.outcome is GateOutcome.PASS, applied_gate
+
+
+def test_invariant_12_d_an_applied_learned_mpc_arm_records_the_missing_optimizer(
+    context: EvaluationContext,
+) -> None:
+    """**「optimizer があるのに記録が無い」を「該当しない」と区別する**（0054 §3）。"""
+    gate = ModelGateDecision(
+        model_version="thermal-v1",
+        inference_id="c" * 64,
+        attested=True,
+        confidence=0.9,
+        ood=False,
+        confidence_level=ConfidenceLevel.HIGH,
+        authority_stage=AuthorityStage.FULL,
+        learned_selected=True,
+        assessment=tuple(Reason(code=component) for component in MODEL_GATE_ASSESSMENT_COMPONENTS),
+    )
+    learned = ControlState(
+        operating_mode=OperatingMode.AUTO,
+        authority_stage=AuthorityStage.FULL,
+        active_controller=ControllerKind.LEARNED_MPC,
+        safety_state=SafetyState.NORMAL,
+        fallback_active=False,
+        workload_regime=WorkloadRegime.SUSTAINED_GPU,
+        regime_confidence=0.9,
+        model_version="thermal-v1",
+        model_confidence=0.9,
+        model_ood=False,
+    )
+    traces = [
+        trace_of(
+            tick_at(
+                TICK_TS_MS + index * STEP_MS,
+                index,
+                shadow=False,
+                state=learned,
+                model_gate=gate,
+            )
+        )
+        for index in range(3)
+    ]
+    fallback = [
+        trace_of(tick_at(TICK_TS_MS + index * STEP_MS, index, shadow=False)) for index in range(3)
+    ]
+    learned_report = evaluate([run_of(traces, [])], context=context)
+    fallback_report = evaluate([run_of(fallback, [])], context=context)
+
+    learned_gaps = {gap.code for gap in overall(learned_report).applied[0].gaps}
+    fallback_gaps = {gap.code for gap in overall(fallback_report).applied[0].gaps}
+    assert "applied_optimizer_record_unavailable" in learned_gaps
+    assert "applied_optimizer_record_unavailable" not in fallback_gaps
+
+
+def test_invariant_12_e_partial_rpm_readback_is_recorded_as_a_gap(
+    context: EvaluationContext,
+) -> None:
+    """一部の zone だけ RPM が読めている状態を「読めている」と読ませない。"""
+    ticks = [tick_at(TICK_TS_MS + index * STEP_MS, index) for index in range(3)]
+    stripped = []
+    for tick in ticks:
+        zones = tick.zones.model_copy(
+            update={"top": tick.zones.top.model_copy(update={"hardware": None})}
+        )
+        stripped.append(trace_of(tick.model_copy(update={"zones": zones})))
+    report = evaluate([run_of(stripped, [])], context=context)
+    applied = overall(report).applied[0]
+
+    assert len(applied.rpm) == 2
+    assert "partial_rpm_readback" in {gap.code for gap in applied.gaps}
+
+
+def test_invariant_12_f_a_boundary_that_leaves_a_segment_empty_is_refused(
+    context: EvaluationContext,
+) -> None:
+    """**tick の無い区間を作らない。** 空の holdout は何も判定しない gate になる。"""
+    traces, observations = plan_following_run(ticks=4)
+    between = TICK_TS_MS + STEP_MS + 1
+    with pytest.raises(EvaluationInputError, match="tick の無い区間"):
+        evaluate([run_of(traces, observations, boundaries=(between, between + 1))], context=context)
+
+
+def test_invariant_12_g_duplicate_observations_do_not_depend_on_input_order(
+    context: EvaluationContext,
+) -> None:
+    """同じ metric・同じ時刻の観測が2つあっても、**順序で結果が変わらない**。"""
+    traces, observations = plan_following_run(ticks=4)
+    clash = observation(GPU, observations[0].ts_ms, 99.0)
+    forward = evaluate([run_of(traces, [*observations, clash])], context=context)
+    backward = evaluate([run_of(traces, [clash, *observations])], context=context)
+
+    assert render(forward) == render(backward)
+
+
+def test_invariant_12_h_observations_no_tick_claims_are_counted_not_dropped(
+    context: EvaluationContext,
+) -> None:
+    """どの tick からも離れた観測を**黙って落とさない**（帰属させないだけで、数える）。"""
+    tolerance_ms = context.config.observation_match_tolerance_ms.value
+    far_apart = 4 * tolerance_ms
+    traces = [
+        trace_of(tick_at(TICK_TS_MS, 0, shadow=False)),
+        trace_of(tick_at(TICK_TS_MS + far_apart, 1, shadow=False)),
+    ]
+    # **どちらの tick からも許容幅の外**に落ちる観測。
+    stray = observation(GPU, TICK_TS_MS + far_apart // 2, 55.0)
+    near = observation(GPU, TICK_TS_MS + 1, 51.0)
+    report = evaluate([run_of(traces, [near, stray])], context=context)
+
+    assert report.segments[0].unattributed_observations == 1
+    assert overall(report).applied[0].temperatures[0].values.count == 1
+
+
+def test_invariant_12_i_a_report_always_carries_a_gate_result(
+    context: EvaluationContext,
+) -> None:
+    """**条件が1つも無い結果を「何も落ちなかった」と読ませない。**"""
+    traces, observations = plan_following_run(ticks=3)
+    report = evaluate([run_of(traces, observations)], context=context)
+    assert report.gates
+
+    stripped = report.model_dump()
+    stripped["gates"] = ()
+    with pytest.raises(ValidationError, match="gate の結果を必ず載せる"):
+        EvaluationReport.model_validate(stripped)

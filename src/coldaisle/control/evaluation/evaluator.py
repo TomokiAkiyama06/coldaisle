@@ -281,30 +281,69 @@ def _shadow_rows_for(
     matcher = context.matcher()
     if run.shadow is None:
         return tuple(shadow_rows(run.traces, observations=run.observations, matcher=matcher))
-    by_tick = {(tick.ts_ms, tick.tick_id): tick for tick in ticks}
+    by_tick = {(tick.ts_ms, tick.tick_id): tick for tick in ticks if tick.shadow is not None}
     rows = sorted(run.shadow, key=lambda row: (row.ts_ms, row.tick_id))
+    keys = [(row.ts_ms, row.tick_id) for row in rows]
+    if len(set(keys)) != len(keys):
+        # 同じ tick の行が2つあると、その分だけ outcome と scored が水増しされ、
+        # coverage の下限を「行を複製するだけ」で満たせてしまう。
+        duplicated = sorted({key for key in keys if keys.count(key) > 1})
+        raise EvaluationInputError(
+            f"{run.run_id}: Shadow export に同じ tick の行が複数ある（{duplicated}）"
+        )
+    if set(keys) != set(by_tick):
+        missing = sorted(set(by_tick) - set(keys))
+        extra = sorted(set(keys) - set(by_tick))
+        # counterfactual を持つ tick と行は**1対1**にする。足りない行は「その区間には
+        # 提案が無かった」に化け、余分な行は trace に無い実績を足す。
+        raise EvaluationInputError(
+            f"{run.run_id}: Shadow export と counterfactual を持つ tick が1対1でない"
+            f"（足りない={missing}; 余分={extra}）"
+        )
     for row in rows:
-        tick = by_tick.get((row.ts_ms, row.tick_id))
-        if tick is None:
-            raise EvaluationInputError(
-                f"{run.run_id}: Shadow export の行に対応する decision trace が無い"
-                f"（tick={row.tick_id}/{row.ts_ms}）"
-            )
+        tick = by_tick[(row.ts_ms, row.tick_id)]
         if tick.schema_version != row.control_schema_version or tick.shadow != row.shadow:
             # 別の記録を貼り替えた export を、その tick の実績として読まない。
             raise EvaluationInputError(
                 f"{run.run_id}: Shadow export の counterfactual が trace と一致しない"
                 f"（tick={row.tick_id}/{row.ts_ms}）"
             )
-        for outcome in row.outcomes:
-            if outcome.match_tolerance_ms != matcher.match_tolerance_ms:
-                # 別の許容幅で照合された結果を、同じ coverage として並べない（0054 §2.6）。
-                raise EvaluationInputError(
-                    f"{run.run_id}: Shadow export の照合許容幅が設定と違う"
-                    f"（export={outcome.match_tolerance_ms}; "
-                    f"config={matcher.match_tolerance_ms}）"
-                )
+        _check_outcomes(run.run_id, row, matcher.match_tolerance_ms)
     return tuple(rows)
+
+
+def _check_outcomes(run_id: str, row: ShadowExportRow, tolerance_ms: int) -> None:
+    """1行の outcome が、同じ行の counterfactual と**1対1で結べる**か（0054 §2.6）。
+
+    結べない outcome は、その行が trace と別の推論を抱えている証拠である。
+    数えないだけにすると、壊れた export でも「予測が無かった」として素通りする。
+    同じ識別子の outcome が2つあれば、複製するだけで採点数を増やせてしまう。
+    """
+    bound = {
+        (item.inference_id, item.plan.digest())
+        for item in row.shadow.counterfactuals
+        if item.plan is not None and item.inference_id is not None
+    }
+    seen: set[tuple[str, str]] = set()
+    for outcome in row.outcomes:
+        if outcome.match_tolerance_ms != tolerance_ms:
+            # 別の許容幅で照合された結果を、同じ coverage として並べない（0054 §2.6）。
+            raise EvaluationInputError(
+                f"{run_id}: Shadow export の照合許容幅が設定と違う"
+                f"（export={outcome.match_tolerance_ms}; config={tolerance_ms}）"
+            )
+        key = (outcome.inference_id, outcome.plan_digest)
+        if key not in bound:
+            raise EvaluationInputError(
+                f"{run_id}: Shadow export の outcome が、その tick の counterfactual と"
+                f"結べない（tick={row.tick_id}/{row.ts_ms}; inference={outcome.inference_id}）"
+            )
+        if key in seen:
+            raise EvaluationInputError(
+                f"{run_id}: Shadow export に同じ推論・同じ候補 plan の outcome が複数ある"
+                f"（tick={row.tick_id}/{row.ts_ms}; inference={outcome.inference_id}）"
+            )
+        seen.add(key)
 
 
 def _bind_outcomes(
@@ -352,6 +391,12 @@ def _segments(
     segments: list[_Segment] = []
     for index, (lower, upper) in enumerate(pairwise(edges)):
         inside = tuple(tick for tick in ticks if lower <= tick.ts_ms < upper)
+        if not inside:
+            # tick の無い区間を作らない。**空の holdout は何も判定しない gate になる**
+            # （条件が1つも無い結果を「問題なし」と読める）。
+            raise EvaluationInputError(
+                f"{run.run_id}: split の境界が tick の無い区間を作る [{lower}, {upper})"
+            )
         kept, purged = _split_shadow(rows, lower, upper, tolerance_ms=tolerance_ms)
         segments.append(
             _Segment(
@@ -421,7 +466,7 @@ def _segment_report(segment: _Segment, context: EvaluationContext) -> SegmentRep
         )
     )
     keys.extend((GroupKind.ROOM_TEMPERATURE_BAND, value) for value in sorted(set(room.values())))
-    attributed = _attribute_observations(segment, tick_times, context)
+    attributed, unattributed = _attribute_observations(segment, tick_times, context)
     for kind, value in keys:
         selected = tuple(
             tick for tick in segment.ticks if _in_group(tick, room, kind=kind, value=value)
@@ -444,6 +489,7 @@ def _segment_report(segment: _Segment, context: EvaluationContext) -> SegmentRep
         start_ms=segment.start_ms,
         end_ms=segment.end_ms,
         ticks=len(segment.ticks),
+        unattributed_observations=unattributed,
         purged_outcomes=segment.purged_outcomes,
         groups=tuple(groups),
     )
@@ -479,7 +525,7 @@ def _room_bands(
 
 def _attribute_observations(
     segment: _Segment, tick_times: Sequence[int], context: EvaluationContext
-) -> dict[tuple[int, int], dict[str, list[float]]]:
+) -> tuple[dict[tuple[int, int], dict[str, list[float]]], int]:
     """観測を**最も近い tick**へ結び付ける（許容幅の外は帰属させない）。
 
     温度も ΔT も、tick に結び付いて初めて arm と group に帰属できる。どの tick からも
@@ -497,11 +543,19 @@ def _attribute_observations(
         value = observation.usable
         if value is None:
             continue
-        by_time.setdefault(observation.ts_ms, {})[observation.metric] = value
+        at_time = by_time.setdefault(observation.ts_ms, {})
+        previous = at_time.get(observation.metric)
+        # 同じ metric・同じ時刻の観測が2つあれば、**値の小さいほうを採る**。
+        # `ObservationIndex` と同じ規則にして、入力の順序で結果が変わらないようにする。
+        at_time[observation.metric] = value if previous is None else min(previous, value)
     attributed: dict[tuple[int, int], dict[str, list[float]]] = {}
+    unattributed = 0
     for ts_ms, values in sorted(by_time.items()):
         tick_key = _nearest_tick(segment.ticks, tick_times, ts_ms, tolerance_ms=tolerance_ms)
         if tick_key is None:
+            # **黙って落とさずに数える。** どの tick からも離れた観測は、どの arm の
+            # 実績にもしないが、「無かった」ことにもしない。
+            unattributed += len(values)
             continue
         bucket = attributed.setdefault(tick_key, {})
         for metric in config.temperature_metrics:
@@ -513,7 +567,7 @@ def _attribute_observations(
                 bucket.setdefault(delta.name, []).append(
                     values[delta.minuend] - values[delta.subtrahend]
                 )
-    return attributed
+    return attributed, unattributed
 
 
 def _nearest_tick(
@@ -614,29 +668,40 @@ def _applied_report(bucket: _AppliedBucket, context: EvaluationContext) -> Appli
         )
 
     acoustic = _acoustic_summary(
-        (
+        [
             PerZone[float](
                 front=tick.zones.front.demand.effective,
                 rear=tick.zones.rear.demand.effective,
                 top=tick.zones.top.demand.effective,
             )
             for tick in ticks
-        ),
+        ],
         context,
         quantiles=quantiles,
+        gaps=gaps,
     )
-    if acoustic is None:
-        gaps["no_acoustic_model"] += 1
 
     rpm = _zone_series(
         ticks, _rpm_of, deadband=config.hunting.rpm_deadband.value, quantiles=quantiles
     )
     if not rpm:
         gaps["no_rpm_readback"] += 1
+    elif len(rpm) < len(Zone):
+        # **一部の zone だけの RPM を「読めている」と読ませない。**
+        gaps["partial_rpm_readback"] += 1
 
     balance = _air_balance(ticks, quantiles=quantiles)
     if balance is None:
         gaps["no_estimated_flow"] += 1
+    elif balance.ticks_without_ratio:
+        gaps["partial_estimated_flow"] += 1
+
+    if bucket.arm.controller is ControllerKind.LEARNED_MPC:
+        # 適用された Learned MPC の optimizer latency / timeout は `ControlTick`（v6）に
+        # 残らない（`ControllerProposal` が trace に埋まっていない。決定記録 0054 §3）。
+        # **「この arm には optimizer があるのに記録が無い」ことを、明示的に残す。**
+        # 制御器が Fallback の arm に欄が無いこと（該当しない）と区別するため。
+        gaps["applied_optimizer_record_unavailable"] += 1
 
     return AppliedArmReport(
         arm=bucket.arm,
@@ -717,20 +782,31 @@ def _air_balance(
 
 
 def _acoustic_summary(
-    demands: Iterable[PerZone[float]],
+    demands: Sequence[PerZone[float]],
     context: EvaluationContext,
     *,
     quantiles: Sequence[float],
+    gaps: Counter[str],
 ) -> MetricSummary | None:
-    """approximate Acoustic Cost（無単位。dBA ではない）。モデルが無ければ `None`。"""
+    """approximate Acoustic Cost（無単位。dBA ではない）。
+
+    モデルが無い・値が1つも出なかったときは `None`。**一部の demand でしかコストが
+    出なかったときは、その旨を理由として残す**（部分的な証拠を全体に見せない）。
+    """
     if context.acoustic is None:
+        gaps["no_acoustic_model"] += 1
         return None
     costs: list[float] = []
     for demand in demands:
         estimate = context.acoustic.estimate(demand)
         if estimate is not None:
             costs.append(estimate.acoustic_cost)
-    return summarize(costs, quantiles=quantiles)
+    summary = summarize(costs, quantiles=quantiles)
+    if summary is None:
+        gaps["no_acoustic_cost"] += 1
+    elif len(costs) < len(demands):
+        gaps["partial_acoustic_cost"] += 1
+    return summary
 
 
 def _interventions(ticks: Sequence[ControlTick]) -> InterventionReport:
@@ -875,12 +951,21 @@ def _counterfactual_report(
         # 少数の採点区間の平均を、全体の予測精度に見える形で出さない（0054 §2.3）。
         gaps["insufficient_coverage"] += 1
 
-    acoustic = _acoustic_summary(demands, context, quantiles=quantiles)
-    if acoustic is None:
-        gaps["no_acoustic_model"] += 1
+    acoustic = _acoustic_summary(demands, context, quantiles=quantiles, gaps=gaps)
     optimizer = _optimizer(statuses, latencies, evaluations, quantiles=quantiles)
     if optimizer is None:
         gaps["no_optimizer_record"] += 1
+    elif optimizer.latency_ms is None:
+        gaps["no_optimizer_latency"] += 1
+    if proposals == 0:
+        gaps["no_proposal"] += 1
+    improvement = summarize(improvements, quantiles=quantiles)
+    if improvement is None:
+        gaps["no_cost_record"] += 1
+    confidence = summarize(confidences, quantiles=quantiles)
+    if confidence is None:
+        # 裏づけ済み（`attested`）の判断が無い区間を「confidence が 0 だった」に見せない。
+        gaps["no_attested_confidence"] += 1
 
     return CounterfactualArmReport(
         arm=bucket.arm,
@@ -895,12 +980,12 @@ def _counterfactual_report(
         ),
         acoustic_cost=acoustic,
         optimizer=optimizer,
-        cost_improvement=summarize(improvements, quantiles=quantiles),
+        cost_improvement=improvement,
         safety_floor_shortfalls=None if proposals == 0 else shortfalls,
         maximum_floor_shortfall=None if proposals == 0 else worst_shortfall,
         attested_ticks=attested,
         ood_ticks=ood,
-        confidence=summarize(confidences, quantiles=quantiles),
+        confidence=confidence,
         coverage=coverage,
         predictions=predictions,
         gaps=_counted(gaps),
@@ -1194,8 +1279,21 @@ def _run_provenance(run: EvaluationRun, ticks: tuple[ControlTick, ...]) -> RunPr
         ),
         observation_sha256=_digest(
             [observation.metric, observation.ts_ms, observation.value, observation.quality.value]
-            for observation in sorted(run.observations, key=lambda item: (item.metric, item.ts_ms))
+            # **全部の欄で並べる。** `(metric, ts_ms)` だけだと、同じ時刻に2つ届いた
+            # 観測の順序が入力の順序に残り、同じ入力集合から違う digest が出る。
+            for observation in sorted(run.observations, key=_observation_order)
         ),
+    )
+
+
+def _observation_order(observation: OutcomeObservation) -> tuple[str, int, bool, float, str]:
+    """観測の全順序。`value` が `None` でも壊れないようにする。"""
+    return (
+        observation.metric,
+        observation.ts_ms,
+        observation.value is None,
+        observation.value if observation.value is not None else 0.0,
+        observation.quality.value,
     )
 
 

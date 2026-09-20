@@ -16,6 +16,11 @@ Shadow の間の Learned MPC は Fan へ届いていないので、その区間�
 | `applied:<controller>+<supervisor>@<stage>/<mode>` | 温度・threshold margin・ΔT・Air Balance・demand / RPM の変動とハンチング・approximate acoustic cost・Safety / Guard / Fallback の介入回数 |
 | `counterfactual:<controller>+<supervisor>@<stage>` | 要求 demand の変動とハンチング・approximate acoustic cost・optimizer の latency / timeout・cost 改善率・**`scored` な予測の誤差だけ**・**coverage** |
 
+**適用側の鍵にだけ `operating_mode` が入る。** `MANUAL` / `CALIBRATION` では人が、
+`MAX` では forced_max が適用 demand を決めるので、制御器が回した区間と混ぜない。
+counterfactual 側に mode が無いのは意図的で、提案は mode に依らず作られ、
+`MANUAL` / `CALIBRATION` の tick はそもそも counterfactual を持たない（0053 §2.1）。
+
 **「MPC 単体 vs MPC + Guard」は比較対象にならない。** 適用された制御に Guard と
 Critical Safety を通らない経路が無いからである（AGENTS.md ルール2）。代わりに、
 同じ arm の `requested_demand` と `effective_demand` の差、そして `interventions` を見る。
@@ -36,6 +41,11 @@ coverage.sufficient               設定の下限を満たしたか
 
 `sufficient` が `false` の arm には **`predictions` が入らない**。少数の当たりを
 全体の予測精度に見せないためで、gate もその arm を `blocked` にする。
+
+**coverage は segment ごとに判定する。** 評価した holdout segment が1つでも足りなければ
+（`insufficient_coverage_segments` > 0）、ほかの segment がどれだけ揃っていても `blocked`。
+`scored_outcomes` の判定も **segment ごとの最小**で見る。足りない区間の採点数をほかの
+区間と足すと、「証拠は伏せた区間から、指標は出した区間から」という取り合わせになる。
 
 ## 実行
 
@@ -73,17 +83,26 @@ runs:
 **評価設定に閾値を写さない。** 絶対温度上限は `safety.yaml`、ΔT の式は `metrics.yaml`、
 照合の許容幅は `fan-policy.yaml` の `shadow` から取る。写すと評価だけが別の契約で動く。
 
+**外から渡した `shadow_jsonl` は、counterfactual を持つ tick と1対1でなければ受け取らない。**
+行の重複・欠落・余分、同じ識別子の outcome の重複、その tick の counterfactual と結べない
+outcome は、すべてその場で拒む（数えないだけにすると、行を複製するだけで coverage の下限を
+満たせてしまう）。`split_boundaries_ms` が tick の無い区間を作る場合も拒む。
+
 ## レポートの読み方
 
 - `provenance` — 設定の hash、run ごとの trace / 観測の digest、現れた model / controller の版、
   `conditions_sha256`（**これが同じなら同じ条件で比べている**）
 - `segments[]` — run × 区間。`role` は `calibration` / `holdout`。`purged_outcomes` は
-  境界を跨ぐため採点に使えなかった予測の数
+  境界を跨ぐため採点に使えなかった予測の数、`unattributed_observations` はどの tick からも
+  許容幅の外にあって、どの arm にも帰属させなかった観測の数（**黙って落とさずに数える**）
 - `segments[].groups[]` — `overall` / `workload_regime` / `room_temperature_band` の切り口
 - `worst_cases[]` — 最小 threshold margin・最高温度・上限超過・EMERGENCY・最大 underprediction・
   最小 identifiable fraction の上位。**平均に埋もれさせない**
 - `gates[]` — arm ごとの `pass` / `blocked`。段は `safety` → `evidence` → `cost` で、
-  **上の段が落ちたら下では覆らない**。欠測・未設定・coverage 不足も `blocked`
+  **上の段が落ちたら下では覆らない**。欠測・未設定・coverage 不足も `blocked`。
+  適用 arm の Safety の段は、**設定したすべての温度 metric が、評価したすべての segment に
+  揃っているとき**だけ判定する（一部だけなら `incomplete_temperature_evidence` で `blocked`。
+  1つも無いときの `no_temperature_evidence` とは区別する）
 
 **gate は助言である。** 昇格・降格の判断は #92 と人が行う。
 
@@ -102,3 +121,5 @@ runs:
 - 適用された arm の gate には cost の条件が無い。同じ条件の別の運転が無い以上、
   合否を決められないため（決められないものを置かない）
 - 閾値はすべて `provisional`。確定には基準となる測定が要る
+- 欠けている証拠は理由付きで残す。`no_*`（1つも無い）/ `partial_*`（一部だけ）/
+  `applied_optimizer_record_unavailable`（この arm には記録の場所が無い）を区別する

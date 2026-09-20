@@ -43,10 +43,19 @@
 
 ### 2.1 arm は「適用された構成」と「適用されなかった提案」の**2つの名前空間**に分ける
 
-- **factual arm**（適用された構成）: `(applied_controller, supervisor_policy, authority_stage)` を
+- **factual arm**（適用された構成）:
+  `(applied_controller, supervisor_policy, authority_stage, operating_mode)` を
   **decision trace の証拠から**決める。設定ファイルの宣言ではなく、その tick に実際に記録されていた値を使う
 - **counterfactual arm**（適用されなかった提案）: `(counterfactual controller, supervisor_policy, authority_stage)`。
   `ShadowRecord` から取る
+- **`operating_mode` は factual 側にだけ入れる。非対称だが意図的である。**
+  `MANUAL` / `CALIBRATION` では人が requested を決め、`MAX` では AUTO の上に forced_max が
+  重なる（0028 §2.5 (a)）。同じ制御器でも**適用された demand の出どころが違う**ので、
+  混ぜると「人が回した区間」を制御器の実績に数えてしまう。
+  counterfactual 側に入れないのは、提案が mode に依らず作られるからである。
+  `MANUAL` / `CALIBRATION` の tick はそもそも counterfactual を持てず（0053 §2.1）、
+  `MAX` 中の提案が「適用値と違う」ことは coverage の `applied_action_differs` に出る。
+  **mode で分けても counterfactual の指標は変わらず、区分だけが増える**
 - **Reactive Guard と Critical Safety は arm の区別に使わない。** 常に経路にあるからである
 - 「MPC 単体 vs MPC + Guard」は arm の差ではなく、**同じ arm の中の `requested` → `effective` の分解**
   として出す。Guard / Safety が requested をどれだけ動かしたか（介入回数・介入した zone・bound_by の内訳）
@@ -80,6 +89,15 @@ counterfactual arm ごとに必ず次を出す。
   「採点できた僅かな区間だけが良かった」を rollout の根拠にしない
 - 下限に満たないときは**予測指標を出さない**。coverage と理由の内訳だけを残す。
   少数の区間の平均を、全体の予測精度に見える形で並べない
+- **coverage は segment ごとに判定し、評価したすべての holdout segment で足りていることを
+  要求する**（`insufficient_coverage_segments` が 0 であること。設定値ではなく構造上の要求）。
+  予測指標を伏せるかどうかは segment ごとに決まるので、足りない segment の採点数を
+  ほかの segment と足し合わせると、**証拠は伏せた区間から、指標は出した区間から**という
+  取り合わせになる。`scored_outcomes` の判定も **segment ごとの最小**で見る
+- **適用された arm の Safety の段は、設定したすべての温度 metric が評価したすべての
+  segment に揃っているときだけ判定する。** 1つの metric の証拠だけで通すと、欠けている
+  metric の超過を見ないまま合格になる。欠けていれば `incomplete_temperature_evidence`
+  として `blocked`（「1つも無い」= `no_temperature_evidence` とは区別する）
 - `unidentifiable` / `unmatched` は**落とさずに理由別に数える**。「予測が無かった」と
   「採点できなかった」を区別する（0053 §2.4 と同じ理由）
 
@@ -121,6 +139,12 @@ counterfactual arm ごとに必ず次を出す。
   違う幅で照合された結果を、同じ coverage として並べない
 - outcome は `inference_id` と `plan_digest` で counterfactual に結び直し、**結べなければ数えない**
   （0052 §2.2 / 0053 §2.2 の識別子をそのまま使う。新しい識別の仕組みを作らない）
+- **外から渡された Shadow export は、counterfactual を持つ tick と1対1でなければ受け取らない。**
+  行の重複・欠落・余分、同じ識別子の outcome の重複、その tick の counterfactual と
+  結べない outcome は**すべて拒む**。数えないだけにすると、行を複製するだけで
+  `scored` と coverage の下限を満たせてしまう
+- **tick の無い segment を作らない。** 空の holdout は条件が1つも無い gate になり、
+  「何も落ちなかった」と読めてしまう
 - 絶対温度上限は `safety.yaml` の `absolute_temp_ceiling_c` を使う。**評価設定に写さない**
 - 派生 ΔT の式は `config/metrics.yaml` の `derived` を引く。**評価設定に写さない**
 - 観測の品質規則は `OutcomeObservation.usable`（`Quality.OK` だけ）をそのまま使う
@@ -158,6 +182,10 @@ gate: { safety: {...}, evidence: {...}, cost: {...} }  # §2.4 の3段
   少ない採点区間を根拠に rollout しようとすると、gate が `blocked` を返す
 - `identifiable_fraction` が上がるまで、Learned MPC の予測精度は「まだ言えない」という答えになる。
   これは制限ではなく、観測から言えることの範囲そのものである
+- 欠けている証拠は**理由を付けて残す**。「モデルが無い」「1つも読めない」「一部だけ読めた」
+  「この arm には記録の場所が無い」を別の理由にする（`partial_*` / `*_unavailable`）。
+  適用された Learned MPC の optimizer 実績は `applied_optimizer_record_unavailable` として
+  残し、そもそも optimizer を持たない Fallback の arm（欄が無いこと）と区別する
 - 適用された arm の gate には cost の条件が無い。同じ条件の別の運転が存在しない以上、
   適用実績に対する cost の合否は決められないためで、**決められないものを置かない**
 - 適用された Learned MPC の optimizer latency / timeout は、現在の `ControlTick`（v6）には
@@ -178,6 +206,11 @@ gate: { safety: {...}, evidence: {...}, cost: {...} }  # §2.4 の3段
 | 評価設定に絶対温度上限や ΔT の式を写す | `safety.yaml` / `metrics.yaml` と食い違ったときに、評価だけが別の契約で動く（#85 / #90 で見つかった型） |
 | 評価用に独自の照合許容幅を持つ | 記録された coverage と意味が変わる。記録済みの `match_tolerance_ms` と照らして fail closed にする |
 | outcome を時刻の近さで counterfactual に結び付ける | 同じ tick に複数の候補がありうる。`inference_id` + `plan_digest` で結ぶ |
+| 外から渡された export の重複行・結べない outcome を「数えないだけ」にする | 行を複製するだけで coverage の下限を満たせる。1対1でなければ拒む |
+| coverage を holdout 全体の合計で判定する | 足りない区間の採点数で下限を満たし、その区間の予測指標は伏せたまま通せる。segment ごとに要求する |
+| 温度 metric が1つでも読めていれば Safety の段を判定する | 欠けた metric の超過を見ないまま合格になる。全 metric・全 segment を要求する |
+| `operating_mode` を factual arm の鍵から外す | `MANUAL` / `MAX` の区間が、制御器が回した区間と同じ行に混ざる |
+| tick の無い segment を許す | 空の holdout は条件が1つも無い gate になり、「何も落ちなかった」と読める |
 | 報告に生成時刻を入れる | 壁時計が入ると、同じ入力から同じ bytes が出なくなる。再現性の判定に使えない |
 | 未来のデータを含めて全体統計を作り、segment ごとに切り出す | 正規化や percentile を通して未来が漏れる。segment は evidence window の中だけで閉じる |
 

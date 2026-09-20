@@ -46,6 +46,14 @@ class AppliedArm(_Frozen):
     **Reactive Guard と Critical Safety は区別に使わない。** 適用された制御に
     それらを通らない経路は無いので、arm の差にはならない（AGENTS.md ルール2）。
     Guard / Safety の効きは `interventions` と `requested_demand` との差で見る。
+
+    **`operating_mode` は鍵に入れる。** `MANUAL` / `CALIBRATION` では人が requested を
+    決め、`MAX` では AUTO の上に forced_max が重なる（0028 §2.5 (a)）。同じ制御器でも
+    適用された demand の出どころが違うので、混ぜると「人が回した区間」を制御器の実績に
+    数えてしまう。`CounterfactualArm` が mode を持たないのは非対称だが**意図的**である
+    （0054 §2.1）。提案そのものは mode に依らず作られ、`MANUAL` / `CALIBRATION` の tick は
+    そもそも counterfactual を持てない（0053 §2.1）。`MAX` 中の提案が「適用値と違う」
+    ことは coverage の `applied_action_differs` に出る。
     """
 
     controller: ControllerKind | None
@@ -396,7 +404,13 @@ class SegmentReport(_Frozen):
     start_ms: int = Field(ge=0)
     end_ms: int = Field(ge=0)
     """**この時刻より先の入力は、この segment の指標に一切入らない**（決定記録 0054 §2.5）。"""
-    ticks: int = Field(ge=0)
+    ticks: int = Field(ge=1)
+    """**tick の無い segment は作らない。** 空の holdout は何も判定しない gate になる。"""
+    unattributed_observations: int = Field(default=0, ge=0)
+    """どの tick からも許容幅の外にあり、どの arm にも帰属させなかった観測の数。
+
+    **黙って落とさずに数える。** 多ければ、tick と観測の周期が噛み合っていない。
+    """
     purged_outcomes: int = Field(ge=0)
     """証拠が `end_ms` を越えるため、どの segment にも入れなかった outcome。
 
@@ -578,9 +592,14 @@ class EvaluationReport(_Frozen):
             if previous is not None and current <= previous:
                 raise ValueError("segment は run_id と index の昇順に並べる")
             previous = current
-        if any(segment.ticks for segment in self.segments) and not self.worst_cases:
+        if not self.worst_cases:
             # 平均だけを見て「問題なかった」と読ませない（Issue の評価原則）。
+            # segment には必ず tick があるので、worst-case は必ず作れる。
             raise ValueError("tick のある報告には worst-case を必ず載せる")
+        if not self.gates:
+            # **条件が1つも無い結果を「何も落ちなかった」と読ませない。**
+            # holdout には必ず tick があるので、適用 arm の gate は必ず作れる。
+            raise ValueError("holdout のある報告には gate の結果を必ず載せる")
         keys = tuple(gate.arm_key for gate in self.gates)
         if len(set(keys)) != len(keys):
             raise ValueError("同じ arm の gate 結果を2つ入れない")
