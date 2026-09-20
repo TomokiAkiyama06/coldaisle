@@ -4,6 +4,7 @@
 - **Status**: FINAL（2026-09-20、リポジトリ所有者が承認）
 - **Date**: 2026-09-20
 - **Supersedes**: なし
+- **Superseded by**: [0055](0055-shadow-duplicate-observation-rule.md)（§2.3 のうち、同じ metric・同じ時刻に**食い違う**観測があるときの扱いだけ。他の節と §2.3 の他の規則は有効）
 - **関連**: [`0027-fan-control-architecture.md`](0027-fan-control-architecture.md)、
   [`0028-fan-control-contracts.md`](0028-fan-control-contracts.md) §2.3 / §2.5、
   [`0030-control-decision-trace-storage.md`](0030-control-decision-trace-storage.md) §5、
