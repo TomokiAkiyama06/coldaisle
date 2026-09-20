@@ -135,7 +135,28 @@ offset が target horizon にあることは、tick ごとではなく optimizer
 v6からv7へは `mpc.optimizer` を追加してから `schema_version: 7` へ上げる。
 v1〜v6は自動補完せず起動前に拒否する。
 
-現行 Control Config v7 は設定の live reload を行わない。設定変更は候補全体を別オブジェクトで検証したうえで
+#90 のv8で `shadow` を追加する（決定記録 0053。FINAL、2026-09-20 所有者承認）。
+counterfactual を decision trace へ残すかどうかの `enabled`、予測時刻と実測時刻のずれの
+許容幅 `outcome_match_tolerance_ms`、予測した候補 action が「実際に掛かっていた」とみなす
+zone ごとの demand の幅 `applied_demand_tolerance` を `status` / `basis` 付きで明示する。
+後者は 1.0 未満にする（1.0 はどんな適用値も plan どおりにしてしまい、採点の可否の判定が
+意味を失う）。掛かっていた action が plan と違う区間の実測は、差を取っても制御器の違いと
+モデル誤差が混ざるだけなので、`unidentifiable` として誤差を出さない（0053 §2.3）。
+時刻の許容幅は
+`mpc.optimizer.step_ms` 未満でなければならない。1 step に届くと、別の候補 action の効果を
+「その予測が当たった証拠」に数えてしまうためで、#85 の `residual_match_tolerance_ms` が
+Profile の最短 horizon に対して満たす条件と同じである。`enabled` は記録の量だけを変え、
+Gate の選択にも effective demand にも影響しない。
+
+記録側の構造上限（1 tick の counterfactual、候補 plan と予測の step 数、1 step の metric 数、
+metric 名の長さ）は**写し元の契約と同じ値**にする。設定として妥当な MPC が出した解を記録側だけが
+拒むと、tick の途中で記録が失敗するためである。v7 で「設定の上限を予測の契約へ合わせる」と
+決めた向きと同じで、一致は試験で突き合わせる。
+
+v7からv8へは `shadow` を追加してから `schema_version: 8` へ上げる。
+v1〜v7は自動補完せず起動前に拒否する。
+
+現行 Control Config v8 は設定の live reload を行わない。設定変更は候補全体を別オブジェクトで検証したうえで
 **次回再起動時**にだけ反映する。これにより、変更後の設定も必ず `STARTUP` の Max を通る。
 `trace_metadata()` は、採用されたsource名・schema version・SHA-256を #82 の decision traceへ渡す。
 Confidence / OOD の判断（`model_gate`）には検証済み assessment の値だけを書き、裏付けの無い tick は

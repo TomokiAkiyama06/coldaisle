@@ -880,9 +880,54 @@ def test_invariant_3_b_a_solution_cannot_claim_a_request_outside_its_plan() -> N
                 "baseline_cost": _flat_cost(2.0),
                 "baseline_requested": demands(0.4).model_dump(mode="python"),
                 "anchor_inference_id": "a" * 64,
+                "prediction": _flat_prediction(plan),
                 "evaluations": 1,
             }
         )
+
+
+def test_invariant_3_d_a_solution_cannot_carry_another_candidates_prediction() -> None:
+    """解に**別の候補 plan の予測**を添えられない（#90 が記録する予測の束縛）。"""
+    from coldaisle.control.mpc.optimizer import MpcSolution
+
+    plan = ActionPlan.held(demands(0.4), step_ms=STEP_MS, steps=2)
+    other = ActionPlan.held(demands(0.9), step_ms=STEP_MS, steps=2)
+    payload = {
+        "plan": plan.model_dump(mode="python"),
+        "requested": plan.first.model_dump(mode="python"),
+        "cost": _flat_cost(1.0),
+        "baseline_cost": _flat_cost(2.0),
+        "baseline_requested": demands(0.4).model_dump(mode="python"),
+        "anchor_inference_id": "a" * 64,
+        "evaluations": 1,
+    }
+    with pytest.raises(ValidationError, match="別の候補 plan"):
+        MpcSolution.model_validate(payload | {"prediction": _flat_prediction(other)})
+    with pytest.raises(ValidationError, match="別の anchor 推論"):
+        MpcSolution.model_validate(
+            payload | {"prediction": _flat_prediction(plan, anchor_id="b" * 64)}
+        )
+
+
+def _flat_prediction(plan: ActionPlan, *, anchor_id: str = "a" * 64) -> dict[str, object]:
+    return {
+        "model_id": "thermal",
+        "model_version": "1.0.0",
+        "artifact_sha256": "c" * 64,
+        "artifact_verification": ArtifactVerification.REGISTRY_VERIFIED,
+        "capability": InferenceCapability.COUNTERFACTUAL_ACTION,
+        "anchor_inference_id": anchor_id,
+        "input_action_ts_ms": 0,
+        "plan_digest": plan.digest(),
+        "targets": tuple(
+            PlannedTarget(
+                offset_ms=step.offset_ms,
+                expected_ts_ms=step.offset_ms,
+                values={"gpu.0.core": 50.0},
+            )
+            for step in plan.steps
+        ),
+    }
 
 
 def _flat_cost(total: float) -> dict[str, object]:

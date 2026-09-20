@@ -17,12 +17,14 @@ Supervisor の出力は #88 で本moduleに追加した。Telemetry snapshot は
 
 from __future__ import annotations
 
+import hashlib
+import json
 from enum import StrEnum
 from typing import Annotated, Literal, Self
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-SCHEMA_VERSION: Literal[5] = 5
+SCHEMA_VERSION: Literal[6] = 6
 """`ControlTick` の形の版。**フィールドの名前や意味を変えたら上げる。**
 
 #82 が保存したデータを読み違えないため。
@@ -33,6 +35,9 @@ SCHEMA_VERSION: Literal[5] = 5
   無条件の `EMERGENCY` にした。保存済みの v1〜v3 は v3 までの規則のまま読める
 - v5（#85）: Model Confidence / OOD と authority の判断（`model_gate`）。Learned MPC を
   active にした tick には必須。保存済みの v1〜v4 はそのまま読める
+- v6（#90）: Shadow Mode の counterfactual 記録（`shadow`）。**適用した demand とは別の枠**に
+  置き、適用した制御器と同じ controller を counterfactual にできない。保存済みの v1〜v5 は
+  そのまま読める
 """
 
 Demand = Annotated[float, Field(ge=0.0, le=1.0, allow_inf_nan=False)]
@@ -565,6 +570,312 @@ class ModelGateDecision(_Frozen):
             raise ValueError("assessment の ood_* の理由と ood の判定が食い違っている")
 
 
+SHADOW_SCHEMA_VERSION: Literal[1] = 1
+"""`ShadowRecord` の形の版（#90 / 決定記録 0053）。"""
+
+MAX_SHADOW_COUNTERFACTUALS = len(ControllerKind)
+"""1 tick に残す counterfactual の上限。
+
+制御器ごとに高々1つなので（`ShadowRecord` が重複を拒む）、**種類の数と必ず一致する**。
+任意の数を置くと、制御器が増えたときにここだけが先に詰まる。
+"""
+
+MAX_SHADOW_PLAN_STEPS = 32
+"""counterfactual の候補 plan と予測に残す control step 数の上限。
+
+**写している契約と同じ値にする。** 設定が許す plan の step 数（`MAX_MPC_HORIZON_STEPS`）と
+予測が持てる horizon 数（`MAX_TARGET_HORIZONS`）はどちらも 32 で、ここだけ狭いと
+「設定としては妥当な MPC が出した解を記録できない」tick が生まれる。記録の失敗は制御の
+途中で起きるので、**狭い上限を後から見つけない**。下位 schema から上位 module を import
+しないためここに写し、一致は試験で確かめる。
+"""
+
+MAX_SHADOW_PREDICTION_METRICS = 32
+"""1 step に残す予測 metric 数の上限。`MAX_TARGET_METRICS` に合わせる（同上）。"""
+
+MAX_SHADOW_METRIC_NAME_LENGTH = 120
+"""予測 metric 名の長さの上限。`MAX_METRIC_NAME_LENGTH`（#84）に合わせる（同上）。"""
+
+Sha256Hex = Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
+
+SHADOW_METRIC_NAME_PATTERN = r"^[a-z][a-z0-9_]*(\.[a-z0-9_]+){1,3}$"
+"""予測 metric 名の形。**`ThermalMetricName`（#84）と同じ**にする。
+
+記録するのはモデルの target metric なので、そちらより狭い形にすると、学習に使えた metric を
+記録できなくなる。一致は試験で確かめる。
+"""
+
+ShadowMetricName = Annotated[
+    str,
+    Field(pattern=SHADOW_METRIC_NAME_PATTERN, max_length=MAX_SHADOW_METRIC_NAME_LENGTH),
+]
+
+
+class ShadowPlanStep(_Frozen):
+    """記録した候補 action 列の1 step。"""
+
+    offset_ms: int = Field(gt=0)
+    demands: PerZone[Demand]
+
+
+class ShadowActionPlan(_Frozen):
+    """counterfactual が評価された候補 action 列。
+
+    **``coldaisle.control.mpc.plan.ActionPlan`` と同じ形にする。** 同じ内容から同じ
+    ``digest()`` が出なければ、記録した予測がどの候補に対するものかを後から確かめられない。
+    schema から mpc を import しないためここに写し、digest の一致は試験で確かめる。
+    """
+
+    step_ms: int = Field(gt=0)
+    steps: tuple[ShadowPlanStep, ...] = Field(min_length=1, max_length=MAX_SHADOW_PLAN_STEPS)
+
+    @model_validator(mode="after")
+    def _offsets_are_a_uniform_grid(self) -> Self:
+        expected = tuple(self.step_ms * (index + 1) for index in range(len(self.steps)))
+        if tuple(step.offset_ms for step in self.steps) != expected:
+            raise ValueError("shadow plan の offset_ms は step_ms の等間隔にする")
+        return self
+
+    @property
+    def first(self) -> PerZone[Demand]:
+        """次の control step で要求していた demand。**これだけが requested になりうる。**"""
+        return self.steps[0].demands
+
+    @property
+    def offsets_ms(self) -> tuple[int, ...]:
+        """各 step の予測時刻（action からの相対）。"""
+        return tuple(step.offset_ms for step in self.steps)
+
+    def digest(self) -> str:
+        """この plan を一意に表す SHA-256（``ActionPlan.digest()`` と同じ値）。"""
+        payload = json.dumps(
+            self.model_dump(mode="json"),
+            ensure_ascii=False,
+            allow_nan=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+        return hashlib.sha256(payload).hexdigest()
+
+
+class ShadowPredictedTarget(_Frozen):
+    """counterfactual な候補 action に対する1 control step の予測。
+
+    ``expected_ts_ms`` は**予測の元になった action 時刻から決まる**。あとで実測と突き合わせる
+    ときに、記録した時刻ではなく処理した時刻を使わせないため、ここで固定する（0053 §2.3）。
+    """
+
+    offset_ms: int = Field(gt=0)
+    expected_ts_ms: int = Field(ge=0)
+    values: dict[ShadowMetricName, TemperatureC] = Field(
+        min_length=1, max_length=MAX_SHADOW_PREDICTION_METRICS
+    )
+
+
+class ShadowPrediction(_Frozen):
+    """counterfactual の予測 future。**1回の推論に束ねられている。**
+
+    ``inference_id`` / ``plan_digest`` / ``artifact_sha256`` を持たない予測は作れない。
+    別の推論の予測を後から貼り替えて「当たっていた」ことにできないようにするため
+    （#85 / #86 と同じ束縛を使い、別の仕組みを作らない）。
+    """
+
+    schema_version: Literal[1] = SHADOW_SCHEMA_VERSION
+    model_id: str = Field(min_length=1, max_length=120)
+    model_version: str = Field(min_length=1, max_length=120)
+    artifact_sha256: Sha256Hex
+    inference_id: Sha256Hex
+    """この予測が属する anchor 推論（#85 の判定対象）。"""
+    plan_digest: Sha256Hex
+    """予測した候補 plan の識別子（``ActionPlan.digest()``。決定記録 0052 §2.2）。"""
+    input_action_ts_ms: int = Field(ge=0)
+    targets: tuple[ShadowPredictedTarget, ...] = Field(
+        min_length=1, max_length=MAX_SHADOW_PLAN_STEPS
+    )
+
+    @model_validator(mode="after")
+    def _targets_follow_the_recorded_action_time(self) -> Self:
+        offsets = tuple(target.offset_ms for target in self.targets)
+        if tuple(sorted(set(offsets))) != offsets:
+            raise ValueError("shadow prediction の offset は重複なし昇順にする")
+        if any(
+            target.expected_ts_ms != self.input_action_ts_ms + target.offset_ms
+            for target in self.targets
+        ):
+            raise ValueError("shadow prediction の時刻は action 時刻 + offset にする")
+        return self
+
+
+class ShadowCounterfactual(_Frozen):
+    """**適用しなかった**提案の記録（#90）。
+
+    この型は effective demand も PWM も表現できない。``requested`` は「もし使っていたら
+    要求していた値」であって、この tick の Fan には届いていない（0053 §2.1）。
+    confidence / ood は **Gate が裏付けた値だけ**を持つ。提案の自称値は残さない（#85 と同じ規則）。
+    """
+
+    controller: ControllerKind
+    requested: PerZone[Demand] | None = None
+    """counterfactual な要求。worker が提案を作れなかった tick では None。"""
+    reason: Reason | None = None
+    """その値にした理由。提案のある counterfactual には必ず付く。"""
+    optimizer_status: OptimizerStatus | None = None
+    latency_ms: int | None = Field(default=None, ge=0)
+    evaluations: int | None = Field(default=None, ge=0)
+    model_version: str | None = Field(default=None, min_length=1, max_length=120)
+    inference_id: Sha256Hex | None = None
+    artifact_sha256: Sha256Hex | None = None
+    attested: bool = False
+    """Gate が検証済み assessment で裏付けた記録か。"""
+    confidence: float | None = Field(default=None, ge=0.0, le=1.0, allow_inf_nan=False)
+    ood: bool | None = None
+    plan: ShadowActionPlan | None = None
+    """予測した候補 action 列そのもの。``requested`` はこの plan の最初の step である。"""
+    prediction: ShadowPrediction | None = None
+    cost_total: float | None = Field(default=None, ge=0.0, allow_inf_nan=False)
+    baseline_cost_total: float | None = Field(default=None, ge=0.0, allow_inf_nan=False)
+    failure: Reason | None = None
+    """提案を作れなかった worker の失敗（model 読込失敗・optimizer 例外）。"""
+
+    @model_validator(mode="after")
+    def _record_is_bound_to_one_inference(self) -> Self:
+        if (self.requested is None) != (self.reason is None):
+            raise ValueError("counterfactual の要求と理由は一緒に記録する")
+        learned = (
+            self.optimizer_status,
+            self.latency_ms,
+            self.evaluations,
+            self.model_version,
+            self.inference_id,
+            self.artifact_sha256,
+            self.plan,
+            self.prediction,
+            self.cost_total,
+            self.baseline_cost_total,
+        )
+        if self.controller is not ControllerKind.LEARNED_MPC:
+            if any(value is not None for value in learned) or self.attested:
+                raise ValueError("Fallback の counterfactual に ML の項目を入れない")
+            if self.failure is not None or self.requested is None:
+                raise ValueError("Fallback の counterfactual には要求した demand が要る")
+            return self._check_attestation()
+        if (self.requested is None) != (self.failure is not None):
+            raise ValueError("Learned MPC の counterfactual は提案か失敗のどちらか一方にする")
+        if self.failure is not None:
+            if any(
+                value is not None
+                for value in (
+                    self.optimizer_status,
+                    self.model_version,
+                    self.inference_id,
+                    self.artifact_sha256,
+                    self.plan,
+                    self.prediction,
+                    self.cost_total,
+                    self.baseline_cost_total,
+                )
+            ):
+                raise ValueError("提案を作れなかった counterfactual に推論の記録を残さない")
+            if self.attested:
+                raise ValueError("提案の無い counterfactual を attested にしない")
+            return self._check_attestation()
+        if self.optimizer_status is None or self.model_version is None:
+            raise ValueError("Learned MPC の counterfactual には optimizer_status と版が要る")
+        if self.inference_id is None or self.artifact_sha256 is None:
+            raise ValueError("Learned MPC の counterfactual には推論と artifact の識別子が要る")
+        return self._check_solution()
+
+    def _check_solution(self) -> Self:
+        """解を持つ counterfactual の中身が、その解と噛み合っているか。"""
+        solved = self.optimizer_status is OptimizerStatus.OK
+        if (self.cost_total is None) != (self.baseline_cost_total is None):
+            raise ValueError("counterfactual のコストは Baseline と対で記録する")
+        if not solved:
+            # timeout / error の tick は解を持たない。Baseline の値を「MPC の解」として残さない。
+            if self.prediction is not None or self.cost_total is not None or self.plan is not None:
+                raise ValueError("optimizer_status が ok でない counterfactual に解を残さない")
+            return self._check_attestation()
+        if self.prediction is None or self.plan is None:
+            raise ValueError("ok の counterfactual には候補 plan と予測 future が要る（#90）")
+        if self.cost_total is None or self.baseline_cost_total is None:
+            raise ValueError("ok の counterfactual にはコストと Baseline コストが要る")
+        if self.cost_total > self.baseline_cost_total:
+            raise ValueError("採用した解のコストが Baseline を上回っている")
+        prediction = self.prediction
+        if (prediction.model_version, prediction.inference_id, prediction.artifact_sha256) != (
+            self.model_version,
+            self.inference_id,
+            self.artifact_sha256,
+        ):
+            # 別の推論の予測を貼り替えて「当たっていた」記録にさせない。
+            raise ValueError("counterfactual の予測が別の推論のもの")
+        self._check_plan(self.plan, prediction)
+        return self._check_attestation()
+
+    def _check_plan(self, plan: ShadowActionPlan, prediction: ShadowPrediction) -> None:
+        """記録した要求・候補 plan・予測が**同じ候補**を指しているか（決定記録 0052 §2.2）。
+
+        版・推論・artifact が合っていても、それだけでは「どの候補 action に対する予測か」は
+        決まらない。同じ tick の候補は step の刻みが同じなので、plan の識別子まで照らさないと
+        plan A の要求に plan B の予測を貼れてしまう。**digest を数え直して閉じる。**
+        """
+        if plan.first != self.requested:
+            raise ValueError("counterfactual の requested が候補 plan の最初の step と違う")
+        if plan.offsets_ms != tuple(target.offset_ms for target in prediction.targets):
+            raise ValueError("counterfactual の候補 plan と予測の step 列が違う")
+        if plan.digest() != prediction.plan_digest:
+            raise ValueError("counterfactual の予測が別の候補 plan のもの")
+
+    def _check_attestation(self) -> Self:
+        """裏付けのない confidence / ood を counterfactual に残さないこと（0050 §2.5 と同じ）。"""
+        if self.attested != (self.confidence is not None):
+            raise ValueError("attested な counterfactual だけが confidence を持つ")
+        if (self.confidence is None) != (self.ood is None):
+            raise ValueError("counterfactual の confidence と ood は一緒に記録する")
+        if self.attested and self.inference_id is None:
+            raise ValueError("attested な counterfactual には推論の識別子が要る")
+        if self.ood and self.confidence != 0.0:
+            raise ValueError("OOD の confidence は 0 にする（決定記録 0050 §2.2）")
+        return self
+
+
+class ShadowRecord(_Frozen):
+    """1 tick の Shadow Mode の記録（#90 / 決定記録 0053）。
+
+    **適用した値と counterfactual を同じ枠に入れない。** ``applied_*`` は実際に Fan へ届いた
+    結果、``counterfactuals`` は届かなかった提案である。同じ制御器が両方に現れることはない。
+    """
+
+    schema_version: Literal[1] = SHADOW_SCHEMA_VERSION
+    tick_id: int = Field(ge=0)
+    ts_ms: int = Field(ge=0)
+    authority_stage: AuthorityStage
+    applied_controller: ControllerKind | None
+    """この tick の requested を作った制御器。``ControlState`` と揃える。"""
+    applied_effective: PerZone[Demand]
+    """実際に Fan へ渡った effective demand。比較の基準になる。"""
+    counterfactuals: tuple[ShadowCounterfactual, ...] = Field(
+        min_length=1, max_length=MAX_SHADOW_COUNTERFACTUALS
+    )
+    supervisor: SupervisorOutput | None = None
+    """counterfactual が前提にした運転戦略（strategy / weights / target band）。"""
+
+    @model_validator(mode="after")
+    def _counterfactuals_are_never_the_applied_decision(self) -> Self:
+        controllers = tuple(item.controller for item in self.counterfactuals)
+        if len(set(controllers)) != len(controllers):
+            raise ValueError("同じ制御器の counterfactual を1 tick に2つ残さない")
+        if self.applied_controller is not None and self.applied_controller in controllers:
+            # ここが破れると、適用した demand を「使わなかった提案」として読める記録になる。
+            raise ValueError("適用した制御器を counterfactual として記録しない")
+        if self.supervisor is not None:
+            if self.supervisor.tick_id > self.tick_id:
+                raise ValueError("shadow の Supervisor output を未来の tick にしない")
+            if self.supervisor.tick_id == self.tick_id and self.supervisor.ts_ms != self.ts_ms:
+                raise ValueError("同じ tick の Supervisor output の ts_ms を揃える")
+        return self
+
+
 class GuardZoneOutput(_Frozen):
     """Reactive Guard の zone ごとの出力（0028 §2.3）。介入していなければすべて None。
 
@@ -785,7 +1096,7 @@ v1〜v3 の reader は知らないため v3 以前には記録しない。
 class ControlTick(_Frozen):
     """1 tick の判断の記録（decision trace。0028 §2.3）。#82 が保存し、#90 / #91 が読む。"""
 
-    schema_version: Literal[1, 2, 3, 4, 5] = SCHEMA_VERSION
+    schema_version: Literal[1, 2, 3, 4, 5, 6] = SCHEMA_VERSION
     tick_id: int = Field(ge=0)
     ts_ms: int = Field(ge=0)
     """記録の時刻（壁時計。0028 §2.6）。"""
@@ -798,6 +1109,8 @@ class ControlTick(_Frozen):
         default=None, exclude_if=lambda value: value is None
     )
     """Confidence / OOD Gate の判断（v5。#85）。Learned MPC の提案が無い tick では None。"""
+    shadow: ShadowRecord | None = Field(default=None, exclude_if=lambda value: value is None)
+    """適用しなかった提案の記録（v6。#90）。counterfactual が無い tick では None。"""
     faults: tuple[Fault, ...] = ()
     """いま有効な故障。
 
@@ -827,6 +1140,7 @@ class ControlTick(_Frozen):
         ):
             raise ValueError("v3 以降の supervisor_policy には Supervisor decision が必要")
         self._check_model_gate()
+        self._check_shadow()
         if self.supervisor is not None:
             if self.supervisor.tick_id != self.tick_id:
                 raise ValueError("Supervisor decision の tick_id を ControlTick と揃える")
@@ -916,6 +1230,71 @@ class ControlTick(_Frozen):
         if state.operating_mode in {OperatingMode.MANUAL, OperatingMode.CALIBRATION}:
             # 人が requested を決める mode では Gate が動かない（0028 §2.5 (a)）。
             raise ValueError("MANUAL / CALIBRATION の tick に model_gate を残さない")
+
+    def _check_shadow(self) -> None:
+        """v6 の ``shadow`` が、同じ tick の適用結果と同じ判断を指しているか（#90）。"""
+        shadow = self.shadow
+        if shadow is None:
+            return
+        if self.schema_version < 6:
+            raise ValueError("shadow を記録する ControlTick は schema version 6 にする")
+        state = self.state
+        if (shadow.tick_id, shadow.ts_ms) != (self.tick_id, self.ts_ms):
+            raise ValueError("ShadowRecord の tick_id / ts_ms を ControlTick と揃える")
+        if shadow.authority_stage is not state.authority_stage:
+            raise ValueError("ShadowRecord と ControlState の authority stage を揃える")
+        if state.operating_mode in {OperatingMode.MANUAL, OperatingMode.CALIBRATION}:
+            # 人が requested を決める mode では「使わなかった提案」の比較対象が無い。
+            raise ValueError("MANUAL / CALIBRATION の tick に shadow を残さない")
+        if shadow.applied_controller is not state.active_controller:
+            raise ValueError("ShadowRecord の applied_controller と active_controller を揃える")
+        for zone in Zone:
+            if shadow.applied_effective.get(zone) != self.zones.get(zone).demand.effective:
+                # ここが揃っていないと、比較の基準が実際に掛かった風量と別物になる。
+                raise ValueError(
+                    f"{zone.value}: ShadowRecord の applied_effective が effective と違う"
+                )
+        self._check_shadow_supervisor(shadow)
+        self._check_shadow_learned(shadow)
+
+    def _check_shadow_supervisor(self, shadow: ShadowRecord) -> None:
+        """counterfactual が前提にした戦略が、この tick に実在した出力か。"""
+        if shadow.supervisor is None:
+            return
+        if self.supervisor is None:
+            raise ValueError("Supervisor decision の無い tick に shadow の戦略を残さない")
+        decision = self.supervisor
+        outputs = tuple(
+            evaluation.output
+            for evaluation in (decision.active, decision.fallback, decision.shadow)
+            if evaluation is not None and evaluation.output is not None
+        )
+        if all(output != shadow.supervisor for output in outputs):
+            raise ValueError("shadow の Supervisor output がこの tick の decision に無い")
+
+    def _check_shadow_learned(self, shadow: ShadowRecord) -> None:
+        """Learned MPC の counterfactual が、Gate の裏付けと同じ推論を指しているか。"""
+        learned = [
+            item for item in shadow.counterfactuals if item.controller is ControllerKind.LEARNED_MPC
+        ]
+        if not learned:
+            return
+        item = learned[0]
+        gate = self.model_gate
+        if gate is None:
+            if item.attested:
+                # 裏付けの記録が無い tick に attested な counterfactual があると、
+                # 評価（#91）が Gate の判定を経ていない confidence を読む。
+                raise ValueError("model_gate の無い tick に attested な counterfactual を残さない")
+            return
+        if item.inference_id is not None and item.inference_id != gate.inference_id:
+            raise ValueError("counterfactual と model_gate が別の推論を指している")
+        if item.attested != gate.attested:
+            raise ValueError("counterfactual の attested を model_gate と揃える")
+        if item.attested and (item.confidence, item.ood) != (gate.confidence, gate.ood):
+            raise ValueError("counterfactual の confidence / ood を model_gate と揃える")
+        if item.model_version is not None and item.model_version != gate.model_version:
+            raise ValueError("counterfactual の model_version を model_gate と揃える")
 
     def _check_fault_response(self, fault: Fault) -> None:
         """0028 §2.7 の無条件の対応を満たしているか。"""

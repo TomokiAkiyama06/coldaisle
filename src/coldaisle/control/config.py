@@ -26,8 +26,8 @@ from coldaisle.control.schema import (
 )
 from coldaisle.store.models import validate_metric
 
-CONTROL_CONFIG_VERSION: Literal[7] = 7
-FAN_POLICY_CONFIG_VERSION: Literal[7] = 7
+CONTROL_CONFIG_VERSION: Literal[8] = 8
+FAN_POLICY_CONFIG_VERSION: Literal[8] = 8
 SAFETY_CONFIG_VERSION: Literal[2] = 2
 CONFIG_FILENAMES = {
     "fan_hardware": "fan-hardware.yaml",
@@ -860,8 +860,35 @@ class WorkloadRegimeConfig(_ConfigModel):
         return self
 
 
+class ShadowConfig(_ConfigModel):
+    """Shadow Mode の記録設定（#90 / 決定記録 0053）。
+
+    記録の**量**と**照合の幅**だけを持つ。何を counterfactual にするかは authority stage と
+    Gate の判断で決まるので、ここには置かない。値は実測前の暫定値として扱う。
+    """
+
+    enabled: bool
+    """counterfactual を decision trace へ残すか。制御の挙動は変えない。"""
+    outcome_match_tolerance_ms: PolicyMilliseconds
+    """予測時刻と実測時刻のずれの許容幅。Dataset の target 選択（0031 §2.2）と同じ規則で使う。"""
+    applied_demand_tolerance: PolicyDemand
+    """予測した候補 action が「実際に掛かっていた」とみなす zone ごとの demand の許容幅。
+
+    counterfactual の予測を**採点してよいのは、その plan が実際に実行された区間だけ**である
+    （決定記録 0053 §2.3）。別の値が掛かっていた区間の実測と引き算しても、出てくるのは
+    制御器の違いとモデル誤差が混ざった量になる。
+    """
+
+    @model_validator(mode="after")
+    def _tolerance_keeps_the_check_meaningful(self) -> Self:
+        if self.applied_demand_tolerance.value >= 1.0:
+            # demand の全域を許すと、どんな適用値も「plan どおり」になり判定が意味を失う。
+            raise ValueError("shadow.applied_demand_tolerance は 1.0 未満にする")
+        return self
+
+
 class FanPolicyConfig(_ConfigModel):
-    schema_version: Literal[7]
+    schema_version: Literal[8]
     fallback_curve: Annotated[
         tuple[FallbackPoint, ...], BeforeValidator(_yaml_sequence_to_tuple), Field(min_length=2)
     ]
@@ -876,6 +903,7 @@ class FanPolicyConfig(_ConfigModel):
     model_confidence: ModelConfidencePolicy
     authority_stage: Annotated[AuthorityStage, BeforeValidator(_yaml_authority_stage)]
     authority_limits: AuthorityLimits
+    shadow: ShadowConfig
     recovery_hold_ms: PositiveMilliseconds
     demote_window_ms: PositiveMilliseconds
     demote_after: Annotated[int, Field(gt=0)]
@@ -896,6 +924,12 @@ class FanPolicyConfig(_ConfigModel):
             # Fallback 境界の直上で帯なしの authority を得てしまう。
             raise ValueError(
                 "model_confidence.high_min_confidence は gate_min_confidence.full 以上にする"
+            )
+        if self.shadow.outcome_match_tolerance_ms.value >= self.mpc.optimizer.step_ms.value:
+            # 許容幅が1 step に届くと、別の step の実測を「その予測が当たった証拠」に数える。
+            # ResidualDriftMonitor が最短 horizon に課す条件（0050 §2.2）と同じ理由。
+            raise ValueError(
+                "shadow.outcome_match_tolerance_ms は mpc.optimizer.step_ms より小さくする"
             )
         return self
 
@@ -1149,6 +1183,16 @@ class ControlConfig(_ConfigModel):
                 f"mpc.optimizer.cost_scales.{name}",
                 getattr(optimizer.cost_scales, name),
             )
+        append(
+            "fan-policy.yaml",
+            "shadow.outcome_match_tolerance_ms",
+            self.policy.shadow.outcome_match_tolerance_ms,
+        )
+        append(
+            "fan-policy.yaml",
+            "shadow.applied_demand_tolerance",
+            self.policy.shadow.applied_demand_tolerance,
+        )
         for zone in Zone:
             bound = optimizer.zone_bounds.get(zone)
             append("fan-policy.yaml", f"mpc.optimizer.zone_bounds.{zone.value}.floor", bound.floor)

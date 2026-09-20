@@ -28,7 +28,11 @@ from coldaisle.control.model.confidence import (
     ConfidenceAssessor,
     ResidualEvidence,
 )
-from coldaisle.control.model.thermal import ObservedThermalInput, ThermalPrediction
+from coldaisle.control.model.thermal import (
+    ObservedThermalInput,
+    ThermalPrediction,
+    canonical_sha256,
+)
 from coldaisle.control.mpc.cost import MpcCostModel, MpcCostUnusableError, PlanCost
 from coldaisle.control.mpc.counterfactual import MpcModelBinding, MpcModelUnusableError
 from coldaisle.control.mpc.optimizer import LearnedMpcOptimizer, MpcSolution
@@ -105,6 +109,19 @@ class MpcProposal(_Frozen):
             raise ValueError("optimizer_status=ok の提案には解が要る")
         return self
 
+    def result_digest(self) -> str:
+        """**この worker 結果そのもの**を表す SHA-256。
+
+        提案だけでは足りない。同じ ``ControllerProposal`` と assessment を持ったまま、
+        別の解（別の予測）を抱えた結果をいくつでも作れるので、提案の識別子だけで照らすと、
+        Gate が見たのとは別の予測を「その判断に属する予測」として記録できてしまう
+        （#90 / 決定記録 0053 §2.2）。
+
+        canonical JSON はこの型の**全フィールド**（提案・assessment・解・失敗の理由）を含むので、
+        記録側が書く値はすべてこの識別子に覆われる。
+        """
+        return canonical_sha256(self)
+
     @property
     def cost(self) -> PlanCost | None:
         """採用した解の総合コスト。"""
@@ -139,6 +156,9 @@ class MpcProposal(_Frozen):
             supervisor_available=supervisor_available,
             control_deadline_exceeded=control_deadline_exceeded,
             snapshot_status=snapshot_status,
+            # Gate はこの識別子をそのまま選択結果へ残す。記録側（#90）は、自分が持っている
+            # worker 結果を数え直して照らし、別の結果を記録しない。
+            result_digest=self.result_digest(),
         )
 
 
