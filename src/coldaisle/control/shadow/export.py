@@ -35,8 +35,13 @@ from coldaisle.control.shadow.outcome import (
     ShadowOutcomeMatcher,
 )
 
-SHADOW_EXPORT_SCHEMA_VERSION: Literal[1] = 1
-"""export 1行の形の版。**列の意味を変えたら上げる。**"""
+SHADOW_EXPORT_SCHEMA_VERSION: Literal[2] = 2
+"""export 1行の形の版。**列の意味を変えたら上げる。**
+
+v2 で `ShadowOutcome` に識別の許容幅（`applied_demand_tolerance`）が要るようになった
+（#93 / 決定記録 0056 §2.3）。v1 の行は**読み込みで落とす**。既定で補うと、どの幅で
+識別したのか分からない結果が「運用の幅で作られた」ものとして通ってしまう。
+"""
 
 
 class ControlTraceRow(Protocol):
@@ -66,7 +71,7 @@ class _Frozen(BaseModel):
 class ShadowExportRow(_Frozen):
     """1 tick 分の Shadow 実績。"""
 
-    schema_version: Literal[1] = SHADOW_EXPORT_SCHEMA_VERSION
+    schema_version: Literal[2] = SHADOW_EXPORT_SCHEMA_VERSION
     control_schema_version: int = Field(ge=1)
     tick_id: int = Field(ge=0)
     ts_ms: int = Field(ge=0)

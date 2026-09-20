@@ -49,6 +49,8 @@ coldaisle-calibrate = "coldaisle.calibrate:main"
 coldaisle-dataset = "coldaisle.dataset:main"
 # Controller 構成の比較レポート。**読み取りだけで、制御へ届かない**（#91 / 決定記録 0054）
 coldaisle-evaluate = "coldaisle.evaluate:main"
+# Thermal Model の drift 検知と再学習の推奨。**書き込みはしない**（#93 / 決定記録 0056）
+coldaisle-drift = "coldaisle.drift:main"
 # fan daemon 停止後にだけ systemd ExecStopPost から起動する。
 # 制御モデル・Safety Config・外部パッケージに依存せず Max しか書かない。
 coldaisle-safety-handoff = "coldaisle.safety_handoff:main"

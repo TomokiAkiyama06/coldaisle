@@ -1,0 +1,42 @@
+# Thermal Model の drift 検知の設定（#93 / 決定記録 0056 §2.8）
+#
+# **すべて実測前の暫定値（provisional）。** 確定には基準となる測定と所有者の承認が要る。
+# コード側に既定値は無いので、ここを消すと drift 検知は動かない（AGENTS.md ルール9）。
+#
+# **ほかの契約が持つ値をここへ写さない**（0056 §2.2 / §2.8）。
+#   - 範囲 / support / 欠測の閾値 : config/fan-policy.yaml の model_confidence
+#   - residual の基準（正規化）   : ModelConfidenceProfile の validation residual RMS
+#   - 照合の許容幅               : config/fan-policy.yaml の shadow
+
+schema_version: 1
+
+# prediction residual の悪化。比 1.0 が学習時（validation）の水準。
+residual:
+  # 比に数えられた outcome（全出力が照合できた scored）の下限。
+  minimum_scored_outcomes: {value: 50, status: provisional}
+  # scored / outcomes の下限。Shadow の間は多くが unidentifiable になる。
+  minimum_identifiable_fraction: {value: 0.2, status: provisional}
+  warning_ratio: {value: 1.5, status: provisional}
+  # **model_confidence.residual_drift_ood_ratio 以下にする**（検知器が照合する）。
+  degraded_ratio: {value: 2.0, status: provisional}
+  # residual trend の bucket（証拠時刻順に一定件数ずつ切る）。
+  trend_bucket_outcomes: {value: 20, status: provisional}
+  minimum_bucket_outcomes: {value: 10, status: provisional}
+
+# 入力分布の判定に要る入力の下限。
+minimum_inputs: {value: 50, status: provisional}
+
+# 学習範囲（feature metric と Fan demand）を外れた入力の割合。
+feature_range:
+  warning_fraction: {value: 0.05, status: provisional}
+  degraded_fraction: {value: 0.20, status: provisional}
+
+# 学習件数の足りない support cell（室温・Power・Fan state の組）に落ちた入力の割合。
+support:
+  warning_fraction: {value: 0.10, status: provisional}
+  degraded_fraction: {value: 0.30, status: provisional}
+
+# 学習時に無かった欠測の組み合わせの割合。
+missing_pattern:
+  warning_fraction: {value: 0.05, status: provisional}
+  degraded_fraction: {value: 0.20, status: provisional}
