@@ -84,13 +84,96 @@ Rollback前にも旧artifactのchecksumとschema互換性を再検証し、成�
 承認付きpromotion / rollbackを経ずに作られたProduction pointerを拒否する。
 `previous_artifact` はpointerを動かすpromotion / rollbackのauditだけが持てる。
 
+## 起動時検証
+
+`ModelRegistry.verify(compatibility)` は、production pointerが指すartifactの checksum / format と、
+kindごとのruntime contractが渡されていればfeature / target schemaとauthority互換性をまとめて検査し、
+`RegistryHealthReport` を返す。**registryを書き換えず、rootが無くても作らず、例外も投げない。**
+
+| `RegistryHealth` | 意味 | `coldaisle-registry verify` の終了コード |
+|---|---|---|
+| `ok` | productionも、検証済みの戻り先も揃っている | 0 |
+| `degraded` | productionは使えるが、known-goodな戻り先が無い / 壊れている | 3 |
+| `unusable` | production pointerはあるがloadできない。その kind は #79 Fallback | 4 |
+| `no_production` | production pointerがひとつも無い。**候補があっても昇格扱いにしない** | 4 |
+| `invalid` | snapshotを検証できない（schema version違いを含む） | 4 |
+
+戻り先の検証は checksum と format だけにする。互換性はrollback実行時のその時点のruntime contractで
+判断するため、schemaを更新しただけで健全な戻り先を失わない（決定記録0037 §2）。
+`ArtifactHealth.compatibility_checked` は**既定値の無い必須項目**で、contractを渡さずに得た
+`loaded` を「互換性も確かめた」と読み違えさせない。`RegistryHealthReport` は、個別の検証結果と
+食い違う総合判定（失敗があるのに `ok`、何も検証していないのに `ok`）を受け付けない。
+
+## 運用（`coldaisle-registry`）
+
+管理操作の入口はCLIである（決定記録0062）。**読み取りが既定**で、registryを変える操作は
+`--expected-revision` を必須にする（既定値を持たせない。いまのrevisionを読まずに書けると、
+他者の判断を後勝ちで潰せる）。読み取りAPI（#23）にもAIツールにもこの操作を出さない。
+
+```bash
+uv run coldaisle-registry status   --root var/model-registry
+uv run coldaisle-registry audit    --root var/model-registry --pointer-changes
+uv run coldaisle-registry verify   --root var/model-registry --contract config/model-runtime.yaml
+uv run coldaisle-registry register --root var/model-registry \
+    --metadata var/candidate.json --payload var/candidate.model.json \
+    --actor trainer --reason "training completed"
+uv run coldaisle-registry validate --root var/model-registry \
+    --artifact thermal_model/rack-thermal/1.2.0 \
+    --offline-evaluation-ref evaluation/offline/1.2.0 \
+    --actor evaluator --reason "offline gates passed" --expected-revision 1
+uv run coldaisle-registry promote  --root var/model-registry --approval var/approval.json \
+    --shadow-evaluation-ref evaluation/shadow/1.2.0 \
+    --feature-schema thermal-features-v1 --target-schema thermal-targets-v1 \
+    --authority-stage shadow --expected-revision 2
+uv run coldaisle-registry rollback --root var/model-registry --kind thermal_model \
+    --approval var/rollback-approval.json \
+    --feature-schema thermal-features-v1 --target-schema thermal-targets-v1 \
+    --authority-stage shadow --expected-revision 3
+```
+
+**承認を合成しない。** `promote` / `rollback` の `HumanApproval` は人が書いたJSONをそのまま渡す。
+`--approver` / `--reason` のように承認を引数から組み立てるflagは作らない（決定記録0062 §2.2）。
+`promote` の対象artifactは**承認が名指ししたartifact**を使う。写すべき `artifact_sha256` と
+`expected_revision` は `status` が出す。
+
+```json
+{
+  "decision": "approved",
+  "action": "promote",
+  "artifact": {"kind": "thermal_model", "model_id": "rack-thermal", "version": "1.2.0"},
+  "artifact_sha256": "<status が出した値>",
+  "expected_revision": 2,
+  "approver": "model-operator",
+  "approved_at_ms": 1700000000000,
+  "reason": "shadow evaluation passed"
+}
+```
+
+`--authority-stage` には**実際に運転するstage**を渡す。設定上の上限ではない（決定記録0057 §2.2）。
+`--contract` のYAMLは kind ごとのruntime contractで、未知のkind / stageは黙って落とさず拒否する。
+
+```yaml
+schema_version: 1
+contracts:
+  thermal_model:
+    feature_schema_version: thermal-features-v1
+    target_schema_version: thermal-targets-v1
+    authority_stage: shadow
+```
+
+このCLIはartifactをdeserializeも実行もせず、Fan Demand・PWM・Authority Stageへ届く経路を持たない。
+
 ## 後続Issueとの接続
 
 - #79 Fallback Controller: `ArtifactLoadResult.status` と `fallback_required` を消費する。Registryは
   Fallback demandを生成しない。
 - #82 Control Logging: `ArtifactLoadResult.trace_metadata()` をdecision traceへ足せる。現在の
   `ControlState.model_version` には `VerifiedArtifact.model_version` を渡せる。Promotion / rollback
-  の時刻、理由、approvalは `RegistrySnapshot.audit` から追跡できる。
+  の時刻、理由、approvalは `RegistrySnapshot.audit` が正本で、`pointer_changes` がpointerを動かした
+  判断だけを返し、`RegistryAuditEvent.trace_metadata()` がpathを含まない形にする（**欄は常に揃え、
+  値が無ければ `None`**。欄ごと消すと「記録されていない」と「起きていない」を区別できない）。
+  起動時検証は `RegistryHealthReport.trace_metadata()` で載せられる。0030のdecision traceは
+  tick単位の保存なので、registry event用の保存先を足すかは#82側の決定に委ねる（決定記録0062 §2.5）。
 - #84 / #85 / #89: 各format固有loaderと推論interfaceを実装し、`VerifiedArtifact.payload` だけを
   入力にする。Registry内に任意コード実行経路を追加しない。
 - #86 Learned MPC: `VerifiedArtifact.attestation`（`ArtifactAttestation`）を内部モデルの束縛に使う。
