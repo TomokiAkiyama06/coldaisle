@@ -311,7 +311,7 @@ def test_a_learned_proposal_must_report_what_the_gate_needs():
             seq=1,
             computed_at_ms=NOW_MS,
             requested=requests(),
-            model_version="thermal-v1",
+            model_version="0.1.0",
         )
 
 
@@ -321,7 +321,7 @@ def test_a_complete_learned_proposal_is_accepted():
         seq=7,
         computed_at_ms=NOW_MS,
         requested=requests(0.55),
-        model_version="thermal-v1",
+        model_version="0.1.0",
         confidence=0.82,
         ood=False,
         optimizer_status=OptimizerStatus.OK,
@@ -389,7 +389,7 @@ def test_ml_cannot_be_active_outside_its_allowed_conditions(overrides):
             **values,
             active_controller=ControllerKind.LEARNED_MPC,
             fallback_active=False,
-            model_version="thermal-v1",
+            model_version="0.1.0",
             model_confidence=0.9,
             model_ood=False,
         )
@@ -403,7 +403,7 @@ def test_max_cannot_mark_a_counterfactual_learned_proposal_as_active():
             safety_state=SafetyState.NORMAL,
             active_controller=ControllerKind.LEARNED_MPC,
             fallback_active=False,
-            model_version="thermal-v1",
+            model_version="0.1.0",
             model_confidence=0.9,
             model_ood=False,
         )
@@ -422,7 +422,7 @@ def test_fallback_while_ml_was_allowed_must_say_why():
     state = fallback_state(
         authority_stage=AuthorityStage.LIMITED,
         fallback_reason=Reason(code="low_confidence"),
-        model_version="thermal-v1",
+        model_version="0.1.0",
         model_confidence=0.31,
         model_ood=False,
     )
@@ -442,7 +442,7 @@ def test_an_out_of_distribution_model_cannot_stay_in_control():
         "safety_state": SafetyState.NORMAL,
         "active_controller": ControllerKind.LEARNED_MPC,
         "fallback_active": False,
-        "model_version": "thermal-v1",
+        "model_version": "0.1.0",
         "model_confidence": 0.9,
     }
     with pytest.raises(ValidationError, match="OOD"):
@@ -879,7 +879,7 @@ def learned_state(**overrides) -> ControlState:
         "active_controller": ControllerKind.LEARNED_MPC,
         "safety_state": SafetyState.NORMAL,
         "fallback_active": False,
-        "model_version": "thermal-v1",
+        "model_version": "0.1.0",
         "model_confidence": 0.9,
         "model_ood": False,
     }
@@ -889,7 +889,7 @@ def learned_state(**overrides) -> ControlState:
 def model_gate(**overrides) -> ModelGateDecision:
     """Learned MPC を採った tick の裏づけのある判断。"""
     values = {
-        "model_version": "thermal-v1",
+        "model_version": "0.1.0",
         "inference_id": "b" * 64,
         "artifact_sha256": ARTIFACT,
         "attested": True,
@@ -942,11 +942,14 @@ def test_a_stored_tick_without_the_field_is_read_as_artifact_unknown(schema_vers
         ts_ms=NOW_MS,
         state=learned_state(),
         zones=zones(passthrough()),
-        model_gate=model_gate(artifact_sha256=None),
+        # 保存済みの v5 / v6 は、入れ子の判断も v1（artifact の欄を持たない）。
+        model_gate=model_gate(schema_version=1, artifact_sha256=None),
     )
 
     restored = ControlTick.model_validate_json(stored.model_dump_json())
     assert restored.schema_version == schema_version
+    assert restored.model_gate is not None
+    assert restored.model_gate.schema_version == 1
     assert restored.state.active_controller is ControllerKind.LEARNED_MPC
     assert restored.applied_model_artifact is None, "推測で埋めない"
     assert restored.applied_artifact_unknown is True, "「記録が無いだけ」に見せない"
@@ -1000,7 +1003,7 @@ def test_a_proposal_cannot_declare_its_own_artifact():
             seq=0,
             computed_at_ms=NOW_MS,
             requested=requests(),
-            model_version="thermal-v1",
+            model_version="0.1.0",
             confidence=0.9,
             ood=False,
             optimizer_status=OptimizerStatus.OK,
@@ -1023,7 +1026,7 @@ def test_a_tick_cannot_claim_two_different_artifacts():
         reason=Reason(code="optimizer_timeout"),
         optimizer_status=OptimizerStatus.TIMEOUT,
         latency_ms=10,
-        model_version="thermal-v1",
+        model_version="0.1.0",
         inference_id="b" * 64,
         # **同じ tick の model_gate とは別の artifact。**
         artifact_sha256="c" * 64,
@@ -1039,7 +1042,7 @@ def test_a_tick_cannot_claim_two_different_artifacts():
             state=fallback_state(
                 authority_stage=AuthorityStage.LIMITED,
                 fallback_reason=Reason(code="low_confidence"),
-                model_version="thermal-v1",
+                model_version="0.1.0",
                 model_confidence=0.9,
                 model_ood=False,
             ),
@@ -1090,3 +1093,24 @@ def test_a_fallback_tick_is_not_counted_as_artifact_unknown():
     assert recorded.state.active_controller is ControllerKind.FALLBACK
     assert recorded.applied_model_artifact is None
     assert recorded.applied_artifact_unknown is False
+
+
+def test_the_nested_model_gate_carries_its_own_schema_version():
+    """**入れ子の判断にも版を持たせる**（codex #4057753201）。
+
+    入れ子の版を上げないと、v7 の trace が「v1 と名乗るのに v1 には無かった欄を持つ」
+    記録を書いてしまう。v1 の判断は artifact を持てず、v7 の tick は v2 を要求する。
+    """
+    recorded = learned_tick()
+    assert recorded.model_gate is not None
+    assert recorded.model_gate.schema_version == 2
+
+    with pytest.raises(ValidationError, match="schema version 2 にする"):
+        model_gate(schema_version=1)
+
+    with pytest.raises(ValidationError, match="schema version 2 の model_gate が要る"):
+        learned_tick(model_gate=model_gate(schema_version=1, artifact_sha256=None))
+
+    # 保存済みの v1 の判断はそのまま読める。
+    stored = model_gate(schema_version=1, artifact_sha256=None)
+    assert ModelGateDecision.model_validate_json(stored.model_dump_json()) == stored

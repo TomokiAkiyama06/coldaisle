@@ -144,7 +144,7 @@ def gate_selection(
 ):
     """設定した authority stage で選ばせる。復帰 hold を満たすため健全なまま2 tick 進める。"""
     settings = policy(authority=stage, recovery_hold_ms=1)
-    gate = gate_for(settings, expected_model_version="thermal-v1")
+    gate = gate_for(settings, expected_model_version="0.1.0")
     selection = None
     for now_mono_ms in (0, settings.recovery_hold_ms):
         selection = gate.select(
@@ -304,7 +304,7 @@ def prediction(
     plan = plan if plan is not None else plan_for(offsets=offsets)
     return ShadowPrediction(
         model_id="rack-thermal",
-        model_version="thermal-v1",
+        model_version="0.1.0",
         artifact_sha256="a" * 64,
         inference_id=inference,
         plan_digest=plan.digest(),
@@ -328,7 +328,7 @@ def solved_counterfactual(**overrides) -> dict[str, object]:
         "requested": plan.first,
         "reason": Reason(code="optimizer_ok"),
         "optimizer_status": OptimizerStatus.OK,
-        "model_version": "thermal-v1",
+        "model_version": "0.1.0",
         "inference_id": "c" * 64,
         "artifact_sha256": "a" * 64,
         "plan": plan,
@@ -566,7 +566,11 @@ def test_invariant_1_h_a_v5_trace_cannot_carry_a_shadow_record() -> None:
     # artifact は v7 の欄なので、v5 の tick には最初から載せられない（#159）。
     # ここで見たいのは `shadow` のほうなので、v5 に載る形の model_gate で試す。
     gate = ModelGateDecision.model_validate(
-        {**selection.model_gate.model_dump(mode="python"), "artifact_sha256": None}
+        {
+            **selection.model_gate.model_dump(mode="python"),
+            "schema_version": 1,
+            "artifact_sha256": None,
+        }
     )
     with pytest.raises(ValidationError, match="schema version 6"):
         ControlTick(
@@ -953,7 +957,7 @@ def test_invariant_4_c_a_counterfactual_cannot_claim_numbers_without_attestation
             requested=demands(0.8),
             reason=Reason(code="optimizer_ok"),
             optimizer_status=OptimizerStatus.TIMEOUT,
-            model_version="thermal-v1",
+            model_version="0.1.0",
             inference_id="c" * 64,
             artifact_sha256="a" * 64,
             attested=False,
@@ -970,7 +974,7 @@ def test_invariant_4_d_an_ood_counterfactual_keeps_the_zero_confidence_rule() ->
             requested=demands(0.8),
             reason=Reason(code="optimizer_ok"),
             optimizer_status=OptimizerStatus.TIMEOUT,
-            model_version="thermal-v1",
+            model_version="0.1.0",
             inference_id="c" * 64,
             artifact_sha256="a" * 64,
             attested=True,
@@ -986,7 +990,7 @@ def test_invariant_4_e_the_fallback_counterfactual_carries_no_ml_fields() -> Non
             controller=ControllerKind.FALLBACK,
             requested=demands(0.4),
             reason=Reason(code="fallback_curve"),
-            model_version="thermal-v1",
+            model_version="0.1.0",
         )
 
 
@@ -1037,7 +1041,7 @@ def test_invariant_5_d_a_non_ok_status_cannot_carry_a_prediction() -> None:
             requested=demands(0.8),
             reason=Reason(code="optimizer_budget_exhausted"),
             optimizer_status=OptimizerStatus.TIMEOUT,
-            model_version="thermal-v1",
+            model_version="0.1.0",
             inference_id="c" * 64,
             artifact_sha256="a" * 64,
             prediction=prediction(),

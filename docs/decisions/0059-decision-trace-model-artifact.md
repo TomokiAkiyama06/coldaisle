@@ -93,8 +93,11 @@ counterfactual に残り `artifact_sha256` が付く）が、**LIMITED 以降は
   （**判定した予測そのもの。artifact SHA-256 はこの中にある**）を持ち、
   `inference_id` は `derive_inference_id(input_sha256, prediction)` と一致しなければ
   **型として作れない**（`model_validate` が検証する）。あわせて
-  `artifact_sha256` / `model_id` / `artifact_verification` / `input_action_ts_ms` が
-  `prediction` のそれと一致することも要求する。
+  `artifact_sha256` / `model_id` / **`model_version`** / `artifact_verification` /
+  `input_action_ts_ms` が `prediction` のそれと一致することも要求する。
+  **版も独立には言い直せない**（codex #4057753197）。同じ artifact bytes を指す登録が
+  2つあると、artifact の照合も識別子の照合も通ったまま、版だけを書き換えた assessment
+  （と同じく書き換えた提案）が別の版の実績になる。
 
   Gate が期待値と照らすのは、**識別子の導出に入っている値**（`prediction.artifact_sha256`）
   である。これで次が閉じる。
@@ -158,6 +161,10 @@ counterfactual に残り `artifact_sha256` が付く）が、**LIMITED 以降は
   **推測で埋めない**
 - 同じ tick の `shadow` の counterfactual が別の artifact を名乗ることを拒む。
   2つの記録が食い違うと、あとから読む側が「どの artifact の提案か」を決められない
+- **入れ子の `ModelGateDecision` にも版を持たせる**（`MODEL_GATE_SCHEMA_VERSION = 2`。
+  codex #4057753201）。上げないと、v7 の trace が「v1 と名乗るのに v1 には無かった欄を
+  持つ」記録を書いてしまう。v1 の判断は artifact を持てず、v7 の tick は v2 を要求し、
+  v1〜v6 の tick は v1 を要求する。**保存済みの v1 の判断はそのまま読める**
 
 `ControlTick.applied_model_artifact` が値を返すのは、**その tick の requested を実際に作った**
 裏づけのある Learned MPC の判断だけである（`attested` かつ `learned_selected`）。
@@ -332,3 +339,9 @@ tick 数で突き合わせないと、区間の何割を束縛できたのかを
 適用側の arm を昇格の根拠にできるようにすること、§2.5 の
 「記録の無さは常に unknown であって completeness ではない」という規則、
 および 0057 §3 の帰結1項と §5 の未決1項の置き換え）である。
+
+**承認後の追記（2026-09-21）。** 上の §2.1 の照合対象に `model_version` を、§2.2 に
+入れ子の `ModelGateDecision` の版を加えた。どちらも **§2 の決定を変えるものではなく**、
+同じ決定（「identity は宣言ではなく導出」「古い version に意味の違う欄を足さない」）を
+取りこぼしていた欄・層へ適用したものである（codex #4057753197 / #4057753201）。
+決定そのものが変わるときは、この記録を書き換えずに新しい記録を作る。

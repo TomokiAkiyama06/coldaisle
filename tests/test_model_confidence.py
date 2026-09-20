@@ -657,7 +657,7 @@ def _active_gate(stage: AuthorityStage, *, artifact: str = TEST_ARTIFACT_SHA256)
     """**束縛した artifact も渡す**（#159）。Gate はこれと assessment の artifact を照らす。"""
     gate = gate_for(
         policy(authority=stage.value, recovery_hold_ms=1),
-        expected_model_version="thermal-v1",
+        expected_model_version="0.1.0",
         expected_artifact_sha256=artifact,
     )
     _select(gate, 0, learned_proposal(0.7), artifact=artifact)
@@ -779,7 +779,7 @@ def test_offline_or_mismatched_assessment_cannot_be_attached_to_a_control_propos
     deployed = assessment.model_copy(
         update={
             "artifact_verification": ArtifactVerification.REGISTRY_VERIFIED,
-            "model_version": "thermal-v1",
+            "model_version": "0.1.0",
         }
     )
     with pytest.raises(ValueError, match="model_version"):
@@ -859,7 +859,7 @@ def test_v5_trace_requires_consistent_model_gate_for_learned_ticks() -> None:
     plain = reasons()
     with pytest.raises(ValidationError, match="LOW"):
         ModelGateDecision(
-            model_version="thermal-v1",
+            model_version="0.1.0",
             inference_id="c" * 64,
             attested=True,
             confidence=0.0,
@@ -871,7 +871,7 @@ def test_v5_trace_requires_consistent_model_gate_for_learned_ticks() -> None:
         )
     with pytest.raises(ValidationError, match="MEDIUM 帯"):
         ModelGateDecision(
-            model_version="thermal-v1",
+            model_version="0.1.0",
             inference_id="c" * 64,
             attested=True,
             confidence=0.8,
@@ -1270,7 +1270,6 @@ def _deployed(assessment: ConfidenceAssessment) -> ConfidenceAssessment:
         {
             **assessment.model_dump(mode="python"),
             "artifact_verification": ArtifactVerification.REGISTRY_VERIFIED,
-            "model_version": "thermal-v1",
             "artifact_sha256": TEST_ARTIFACT_SHA256,
             "prediction": prediction.model_dump(mode="python"),
             "inference_id": derive_inference_id(assessment.input_sha256, prediction),
@@ -1332,8 +1331,18 @@ def test_a1_learned_confidence_requires_a_matching_verified_assessment(
         )
         proposal = proposal.model_copy(update={"inference_id": attached.inference_id})
     elif violation == "another_model_version":
-        proposal = proposal.model_copy(update={"model_version": "thermal-v1"})
-        attached = assessment.model_copy(update={"model_version": "thermal-v0"})
+        # 版も識別子の導出に入るので、**予測ごと別の版にした assessment** を作る（#159）。
+        # 欄だけ書き換えたものは型が拒むため、そもそも Gate まで届かない。
+        other_prediction = assessment.prediction.model_copy(update={"model_version": "9.9.9"})
+        attached = ConfidenceAssessment.model_validate(
+            {
+                **assessment.model_dump(mode="python"),
+                "model_version": "9.9.9",
+                "prediction": other_prediction.model_dump(mode="python"),
+                "inference_id": derive_inference_id(assessment.input_sha256, other_prediction),
+            }
+        )
+        # 提案は期待どおりの版のまま。**別の版の判定を付け替えられない**ことを見る。
     elif violation == "proposal_confidence_raised":
         proposal = proposal.model_copy(update={"confidence": 1.0})
     elif violation == "proposal_hides_ood":
@@ -1355,9 +1364,7 @@ def test_a1_learned_confidence_requires_a_matching_verified_assessment(
             )
         return
 
-    gate = gate_for(
-        policy(authority="full", recovery_hold_ms=1), expected_model_version="thermal-v1"
-    )
+    gate = gate_for(policy(authority="full", recovery_hold_ms=1), expected_model_version="0.1.0")
     first = _select(gate, 0, proposal, attached)
     second = _select(gate, 1, proposal, attached)
     for selected in (first, second):
@@ -1377,9 +1384,7 @@ def test_a1_matching_assessment_is_accepted(trained) -> None:
     proposal = assessment.apply_to(
         learned_proposal(0.9, confidence=0.0, inference_id=assessment.inference_id)
     )
-    gate = gate_for(
-        policy(authority="limited", recovery_hold_ms=1), expected_model_version="thermal-v1"
-    )
+    gate = gate_for(policy(authority="limited", recovery_hold_ms=1), expected_model_version="0.1.0")
     _select(gate, 0, proposal, assessment)
     selected = _select(gate, 1, proposal, assessment)
     assert selected.active_controller is ControllerKind.LEARNED_MPC
@@ -1498,7 +1503,7 @@ def test_trace_marks_a_proposal_without_an_assessment_as_unattested(trained) -> 
 def test_trace_rejects_recording_numbers_without_attestation() -> None:
     with pytest.raises(ValidationError, match="attested"):
         ModelGateDecision(
-            model_version="thermal-v1",
+            model_version="0.1.0",
             inference_id="c" * 64,
             attested=False,
             confidence=0.9,
@@ -1509,7 +1514,7 @@ def test_trace_rejects_recording_numbers_without_attestation() -> None:
         )
     with pytest.raises(ValidationError, match="裏付けの無い提案"):
         ModelGateDecision(
-            model_version="thermal-v1",
+            model_version="0.1.0",
             inference_id="c" * 64,
             attested=False,
             confidence_level=ConfidenceLevel.LOW,
@@ -1541,7 +1546,7 @@ REASONS = reasons()
 def gate_record(**changes: object) -> ModelGateDecision:
     """Gate が実際に出す形の記録（既定は裏付けのある HIGH / FULL）。"""
     fields: dict[str, object] = {
-        "model_version": "thermal-v1",
+        "model_version": "0.1.0",
         "inference_id": "c" * 64,
         "attested": True,
         "confidence": 0.9,
@@ -1704,7 +1709,7 @@ def _fallback_tick(**state_changes: object) -> dict[str, object]:
     ("state_changes", "match"),
     [
         ({"model_confidence": 0.99, "model_ood": False}, "残さない"),
-        ({"model_version": "thermal-v1"}, "残さない"),
+        ({"model_version": "0.1.0"}, "残さない"),
     ],
 )
 def test_v5_tick_without_a_model_gate_cannot_keep_ml_numbers(

@@ -1799,7 +1799,7 @@ def test_invariant_7_c_the_gate_never_uses_a_stage_above_the_configured_ceiling(
     settings = policy(authority="limited", recovery_hold_ms=1)
     gate = ControllerGate(
         settings,
-        expected_model_version="thermal-v1",
+        expected_model_version="0.1.0",
         expected_artifact_sha256=TEST_ARTIFACT_SHA256,
         authority=Lying(),
     )
@@ -1833,7 +1833,7 @@ def test_invariant_7_d_a_lowered_stage_puts_the_gate_back_on_fallback() -> None:
     source = StaticAuthorityStage(AuthorityStage.FULL)
     gate = ControllerGate(
         settings,
-        expected_model_version="thermal-v1",
+        expected_model_version="0.1.0",
         expected_artifact_sha256=TEST_ARTIFACT_SHA256,
         authority=source,
     )
@@ -1855,7 +1855,7 @@ def test_invariant_7_d_a_lowered_stage_puts_the_gate_back_on_fallback() -> None:
 
     lowered = ControllerGate(
         settings,
-        expected_model_version="thermal-v1",
+        expected_model_version="0.1.0",
         expected_artifact_sha256=TEST_ARTIFACT_SHA256,
         authority=StaticAuthorityStage(AuthorityStage.SHADOW),
     )
@@ -1883,7 +1883,7 @@ def test_invariant_7_e_a_proposal_made_before_a_promotion_is_not_used_after_it(
     source = StaticAuthorityStage(AuthorityStage.SHADOW)
     gate = ControllerGate(
         settings,
-        expected_model_version="thermal-v1",
+        expected_model_version="0.1.0",
         expected_artifact_sha256=TEST_ARTIFACT_SHA256,
         authority=source,
     )
@@ -1891,7 +1891,7 @@ def test_invariant_7_e_a_proposal_made_before_a_promotion_is_not_used_after_it(
 
     raised = ControllerGate(
         settings,
-        expected_model_version="thermal-v1",
+        expected_model_version="0.1.0",
         expected_artifact_sha256=TEST_ARTIFACT_SHA256,
         authority=StaticAuthorityStage(AuthorityStage.LIMITED),
     )
@@ -2137,7 +2137,7 @@ def test_invariant_9_a_the_stage_is_recorded_on_a_tick_without_any_model() -> No
     """**model が無い tick にも stage を残す**（受入基準「独立して #82 へ記録できる」）。"""
     gate = ControllerGate(
         policy(authority="full"),
-        expected_model_version="thermal-v1",
+        expected_model_version="0.1.0",
         expected_artifact_sha256=TEST_ARTIFACT_SHA256,
         authority=StaticAuthorityStage(AuthorityStage.EXPANDED),
     )
@@ -2162,7 +2162,7 @@ def test_invariant_9_b_the_recorded_stage_does_not_follow_the_model_version() ->
     """**model version が変わっても stage は動かない。**"""
     settings = policy(authority="full", recovery_hold_ms=1)
     stages = []
-    for version in ("thermal-v1", "thermal-v1"):
+    for version in ("0.1.0", "0.1.0"):
         gate = ControllerGate(
             settings,
             expected_model_version=version,
@@ -2193,7 +2193,7 @@ def test_invariant_9_c_a_selection_cannot_claim_two_different_stages() -> None:
     """**2つの欄が別の stage を名乗れない。** 読む側がどちらを信じるか決められなくなる。"""
     gate = ControllerGate(
         policy(authority="full", recovery_hold_ms=1),
-        expected_model_version="thermal-v1",
+        expected_model_version="0.1.0",
         expected_artifact_sha256=TEST_ARTIFACT_SHA256,
         authority=StaticAuthorityStage(AuthorityStage.LIMITED),
     )
@@ -2266,7 +2266,7 @@ def test_invariant_10_b_the_safety_floor_is_identical_at_every_stage() -> None:
     for stage in AuthorityStage:
         gate = ControllerGate(
             settings,
-            expected_model_version="thermal-v1",
+            expected_model_version="0.1.0",
             expected_artifact_sha256=TEST_ARTIFACT_SHA256,
             authority=StaticAuthorityStage(stage),
         )

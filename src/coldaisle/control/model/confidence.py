@@ -737,8 +737,9 @@ class ConfidenceAssessment(_Frozen):
     def _identity_is_derived_not_declared(self) -> Self:
         """**artifact と推論の識別子を、写した欄ではなく導出で確かめる**（#159）。
 
-        `artifact_sha256` は誰でも書き換えられる欄なので、それ同士を比べても
-        「artifact B の判定を A と名乗らせる」ことは止められない（codex #4057241944）。
+        `artifact_sha256` / `model_version` は誰でも書き換えられる欄なので、それ同士を
+        比べても「artifact B の判定を A と名乗らせる」ことは止められない
+        （codex #4057241944 / #4057753197）。
         識別子は `prediction`（artifact SHA-256 を含む）から導出するので、artifact を
         差し替えれば必ず値が変わる。差し替えたうえで識別子も作り直せば、それはもう
         **その提案の推論ではない**（提案の `inference_id` と合わなくなる）。
@@ -747,6 +748,12 @@ class ConfidenceAssessment(_Frozen):
             raise ValueError("assessment と予測の input action 時刻が違う")
         if self.prediction.model_id != self.model_id:
             raise ValueError("assessment と予測の model_id が違う")
+        if self.prediction.model_version != self.model_version:
+            # **版も、識別子の導出に入っている値から動かせないようにする**
+            # （codex #4057753197）。同じ artifact bytes を指す登録が2つあると、
+            # 版だけを書き換えた assessment（と同じく書き換えた提案）が、
+            # artifact の照合も識別子の照合もそのまま通ってしまう。
+            raise ValueError("assessment と予測の model_version が違う")
         if self.prediction.artifact_sha256 != self.artifact_sha256:
             raise ValueError("assessment の artifact が、判定した予測の artifact と違う")
         if self.prediction.artifact_verification is not self.artifact_verification:

@@ -533,6 +533,16 @@ OOD_REASON_PREFIX = "ood_"
 """OOD と判定した構成要素の理由に付く接頭辞。"""
 
 
+MODEL_GATE_SCHEMA_VERSION: Literal[2] = 2
+"""`ModelGateDecision` の形の版（`ControlTick` の中に入れ子で入る）。
+
+- v2（#159）: `artifact_sha256`。**保存済みの v1 はそのまま読め、artifact を持てない。**
+  `ControlTick` v7 はこの v2 を、v1〜v6 は v1 を要求する。入れ子の版を上げないと、
+  v7 の trace が「v1 と名乗るのに v1 には無かった欄を持つ」記録を書いてしまう
+  （codex #4057753201）。
+"""
+
+
 class ModelGateDecision(_Frozen):
     """Confidence / OOD Gate の1 tick の判断（決定記録 0050 §2.5）。
 
@@ -540,7 +550,7 @@ class ModelGateDecision(_Frozen):
     この型は「なぜ ML をその範囲で使った / 使わなかったか」だけを残す。
     """
 
-    schema_version: Literal[1] = 1
+    schema_version: Literal[1, 2] = MODEL_GATE_SCHEMA_VERSION
     model_version: str = Field(min_length=1, max_length=120)
     inference_id: str = Field(pattern=r"^[0-9a-f]{64}$")
     """判定した推論（入力と予測）の識別子。提案の ``inference_id`` と同じ。"""
@@ -586,6 +596,9 @@ class ModelGateDecision(_Frozen):
             # 裏づけの無い判断に artifact を書くと、別の推論の artifact が「この tick の
             # 実績」として読まれる。**束縛できていない identity は残さない。**
             raise ValueError("裏づけの無い記録に artifact_sha256 を残さない")
+        if self.schema_version < 2 and self.artifact_sha256 is not None:
+            # v1 の記録にこの欄は無かった。後から足して読ませない。
+            raise ValueError("artifact を記録する model_gate は schema version 2 にする")
         if (self.confidence is None) != (self.ood is None):
             raise ValueError("model_gate の confidence と ood は一緒に記録する")
         if not self.attested:
@@ -1339,8 +1352,12 @@ class ControlTick(_Frozen):
         if self.schema_version < 5:
             raise ValueError("model_gate を記録する ControlTick は schema version 5 にする")
         if self.schema_version < 7:
-            if gate.artifact_sha256 is not None:
+            if gate.schema_version >= 2:
                 raise ValueError("artifact を記録する ControlTick は schema version 7 にする")
+        elif gate.schema_version < 2:
+            # v7 の tick が v1 の判断を抱えられると、「artifact の欄が無い」記録を
+            # **新しい trace でも**作れてしまう。
+            raise ValueError("v7 の ControlTick には schema version 2 の model_gate が要る")
         elif gate.attested and gate.artifact_sha256 is None:
             # **新しい trace で「artifact 不明」を作れないようにする。** 作れると、
             # 束縛できる形に直したあとも、欄を空けるだけで束縛を外せてしまう。

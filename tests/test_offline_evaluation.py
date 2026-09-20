@@ -189,7 +189,7 @@ def prediction_for(
 ) -> ShadowPrediction:
     return ShadowPrediction(
         model_id="rack-thermal",
-        model_version="thermal-v1",
+        model_version="0.1.0",
         artifact_sha256="a" * 64,
         inference_id=inference,
         plan_digest=plan.digest(),
@@ -222,7 +222,7 @@ def counterfactual(
             reason=Reason(code="optimizer_timeout"),
             optimizer_status=status,
             latency_ms=latency_ms,
-            model_version="thermal-v1",
+            model_version="0.1.0",
             inference_id=identifier,
             artifact_sha256="a" * 64,
         )
@@ -233,7 +233,7 @@ def counterfactual(
         optimizer_status=status,
         latency_ms=latency_ms,
         evaluations=64,
-        model_version="thermal-v1",
+        model_version="0.1.0",
         inference_id=identifier,
         artifact_sha256="a" * 64,
         plan=plan,
@@ -577,7 +577,7 @@ def test_invariant_3_c_a_later_failure_does_not_move_the_attested_timestamp(
 
     def attested_gate(index: int) -> ModelGateDecision:
         return ModelGateDecision(
-            model_version="thermal-v1",
+            model_version="0.1.0",
             inference_id=f"{TICK_TS_MS + index * STEP_MS:064x}",
             artifact_sha256="a" * 64,
             attested=True,
@@ -599,7 +599,7 @@ def test_invariant_3_c_a_later_failure_does_not_move_the_attested_timestamp(
                 model_gate=attested_gate(index),
                 state=control_state().model_copy(
                     update={
-                        "model_version": "thermal-v1",
+                        "model_version": "0.1.0",
                         "model_confidence": 0.9,
                         "model_ood": False,
                     }
@@ -1119,7 +1119,7 @@ def test_invariant_8_c_the_report_records_the_versions_and_configs_it_used(
     assert provenance.safety_config_sha256 == context.control.sources.safety.sha256
     assert provenance.fan_policy_config_sha256 == context.control.sources.policy.sha256
     assert provenance.evaluation_config_sha256 == context.config_sha256
-    assert provenance.versions.model_versions == ("thermal-v1",)
+    assert provenance.versions.model_versions == ("0.1.0",)
     assert provenance.versions.model_artifacts == ("a" * 64,)
     assert provenance.versions.control_schema_versions == (7,)
     assert provenance.outcome_match_tolerance_ms == (
@@ -1651,7 +1651,7 @@ def test_invariant_12_d_an_applied_learned_mpc_arm_records_the_missing_optimizer
 ) -> None:
     """**「optimizer があるのに記録が無い」を「該当しない」と区別する**（0054 §3）。"""
     gate = ModelGateDecision(
-        model_version="thermal-v1",
+        model_version="0.1.0",
         inference_id="c" * 64,
         artifact_sha256="a" * 64,
         attested=True,
@@ -1670,7 +1670,7 @@ def test_invariant_12_d_an_applied_learned_mpc_arm_records_the_missing_optimizer
         fallback_active=False,
         workload_regime=WorkloadRegime.SUSTAINED_GPU,
         regime_confidence=0.9,
-        model_version="thermal-v1",
+        model_version="0.1.0",
         model_confidence=0.9,
         model_ood=False,
     )
@@ -2012,7 +2012,7 @@ def _two_metric_counterfactual(action_ts_ms: int) -> ShadowCounterfactual:
     identifier = f"{action_ts_ms:064x}"
     prediction = ShadowPrediction(
         model_id="rack-thermal",
-        model_version="thermal-v1",
+        model_version="0.1.0",
         artifact_sha256="a" * 64,
         inference_id=identifier,
         plan_digest=plan.digest(),
@@ -2033,7 +2033,7 @@ def _two_metric_counterfactual(action_ts_ms: int) -> ShadowCounterfactual:
         optimizer_status=OptimizerStatus.OK,
         latency_ms=120,
         evaluations=64,
-        model_version="thermal-v1",
+        model_version="0.1.0",
         inference_id=identifier,
         artifact_sha256="a" * 64,
         plan=plan,
@@ -2391,7 +2391,7 @@ def _applied_learned_state() -> ControlState:
         fallback_active=False,
         workload_regime=WorkloadRegime.SUSTAINED_GPU,
         regime_confidence=0.9,
-        model_version="thermal-v1",
+        model_version="0.1.0",
         model_confidence=0.9,
         model_ood=False,
     )
@@ -2399,7 +2399,7 @@ def _applied_learned_state() -> ControlState:
 
 def _applied_gate(*, artifact: str | None = "a" * 64) -> ModelGateDecision:
     return ModelGateDecision(
-        model_version="thermal-v1",
+        model_version="0.1.0",
         inference_id="c" * 64,
         artifact_sha256=artifact,
         attested=True,
@@ -2428,6 +2428,7 @@ def _applied_learned_run(*, artifacts: tuple[str | None, ...]) -> list[ControlTr
             # 保存済みの v6（artifact の欄が無い）。読めなければならない（決定記録 0030）。
             document = tick.model_dump(mode="python")
             document["schema_version"] = 6
+            document["model_gate"]["schema_version"] = 1
             document["model_gate"]["artifact_sha256"] = None
             tick = ControlTick.model_validate(document)
         elif artifact != "a" * 64:
