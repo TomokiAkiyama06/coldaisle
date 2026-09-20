@@ -1,7 +1,7 @@
 # 決定記録 0057: Authority Rollout の stage 変更（承認・証拠・自動降格・設定の上限）
 
 - **種別**: Decision Record
-- **Status**: Proposed
+- **Status**: FINAL（2026-09-20、リポジトリ所有者が承認）
 - **Date**: 2026-09-20
 - **Supersedes**: なし
 - **関連**: [`0027-fan-control-architecture.md`](0027-fan-control-architecture.md)、
@@ -11,7 +11,7 @@
   [`0050-model-confidence-ood-and-authority.md`](0050-model-confidence-ood-and-authority.md) §2.4 / §2.5、
   [`0053-control-shadow-mode-and-counterfactual-logging.md`](0053-control-shadow-mode-and-counterfactual-logging.md)、
   [`0054-offline-evaluation-attribution-and-gates.md`](0054-offline-evaluation-attribution-and-gates.md) §2.4 / §2.5 / §2.7、
-  GitHub #78 / #79 / #85 / #90 / #91 / #103 / #104
+  GitHub #78 / #79 / #85 / #90 / #91 / #103 / #104 / #159
 - **対象 Issue**: #92
 
 ## 1. Context
@@ -349,13 +349,16 @@ v8 からの移行は自動補完せず、v1〜v8 は起動前に拒否する。
   構築時と `reload()` のときだけ journal を読む。管理操作の入口（下記）を決めるときに、
   下げたことを走っているループへ伝える手（tick ごとの読み直し、signal、socket のいずれか）を
   一緒に決める。いまは in-process の降格だけなので穴になっていない
-- **decision trace へ、適用した tick の model artifact を記録すること。** これが無い限り、
-  適用側の実績を artifact へ束縛できず、LIMITED 以降の昇格の証拠を作れない（§3）。
-  `ModelGateDecision` に artifact の hash を足すか、`ControlState` に持たせるかを含め、
-  #82 / 0030 の側で決める。**別 Issue にする。**
+- **decision trace へ、適用した tick の model artifact を記録すること（GitHub #159）。**
+  これが無い限り、適用側の実績を artifact へ束縛できず、LIMITED 以降の昇格の証拠を
+  作れない（§3）。`ModelGateDecision` に artifact の hash を足すか、`ControlState` に
+  持たせるかを含め、#82 / 0030 の側で決める
 - **管理操作の入口。** いまは `AuthorityStore` の API だけで、CLI も API も無い。
   読み取り API（#23）は制御を変えられないので、昇格・rollback の入口を
   どこに置くか（CLI か、0045 の書き込み専用ソケットか）は別 Issue で決める
 
-**この記録は Proposed である。安全系の設計変更なので、リポジトリ所有者の承認を
-マージの条件とする（AGENTS.md「迷ったら」）。**
+**2026-09-20、リポジトリ所有者がこの記録を承認した。** 承認の対象は §2 の決定すべて
+（`authority_stage` を上限にする v8 → v9 の変更、昇格は人の承認だけ・降格は即時、
+#92 が #104 を読む境界と lock の順序 Registry → Authority、LIMITED で止まるという §3 の帰結、
+`last_attested_ts_ms` を 0054 への追記として §2.4 に置くこと）である。
+**§5 の未決事項と `provisional` の値は開いたままとする。**

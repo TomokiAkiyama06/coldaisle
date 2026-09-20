@@ -156,7 +156,7 @@ metric 名の長さ）は**写し元の契約と同じ値**にする。設定と
 v7からv8へは `shadow` を追加してから `schema_version: 8` へ上げる。
 v1〜v7は自動補完せず起動前に拒否する。
 
-#92 のv9で `authority_rollout` を追加する（決定記録 0057。Proposed）。
+#92 のv9で `authority_rollout` を追加する（決定記録 0057。FINAL、2026-09-20 所有者承認）。
 昇格の承認の有効期限 `approval_max_age_ms`、rollout gate の証拠の有効期限
 `evidence_max_age_ms`、自動降格のために不健全な tick を数える窓 `unhealthy_window_ms`、
 その窓の中で降格に至る件数 `low_confidence_after` / `ood_after` を `status` / `basis` 付きで

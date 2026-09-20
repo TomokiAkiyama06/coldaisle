@@ -4,7 +4,7 @@
 どの artifact を Production にするかは Model Registry（#104 / `docs/model-registry.md`）の
 責務で、**Model を Production へ昇格させても authority は動かない。**
 
-設計上の決定は決定記録 0057（Proposed。所有者の承認が要る）。ここは使い方をまとめる。
+設計上の決定は決定記録 0057（FINAL、2026-09-20 所有者承認）。ここは使い方をまとめる。
 
 ## Stage
 
