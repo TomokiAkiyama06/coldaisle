@@ -322,6 +322,7 @@ def test_a_complete_learned_proposal_is_accepted():
         ood=False,
         optimizer_status=OptimizerStatus.OK,
         latency_ms=340,
+        inference_id="c" * 64,
     )
     assert proposal.requested.get(Zone.TOP).demand == 0.55
 
@@ -668,7 +669,7 @@ def test_the_stored_v1_record_still_loads_unchanged():
     stored = FIXTURE.read_text(encoding="utf-8")
     tick = ControlTick.model_validate_json(stored)
     assert tick.schema_version == 1
-    assert SCHEMA_VERSION == 4
+    assert SCHEMA_VERSION == 5
     assert json.loads(tick.model_dump_json()) == json.loads(stored)
 
 
@@ -679,7 +680,7 @@ def test_v4_trace_records_the_absolute_temperature_limit():
         safety_state=SafetyState.EMERGENCY,
     )
 
-    assert recorded.schema_version == 4
+    assert recorded.schema_version == 5
     restored = ControlTick.model_validate_json(recorded.model_dump_json())
     assert restored.faults[0].code is FaultCode.ABSOLUTE_TEMPERATURE_LIMIT
     with pytest.raises(ValidationError, match="EMERGENCY"):
@@ -732,7 +733,7 @@ def test_current_trace_stores_workload_regime_and_confidence_together():
     recorded = ControlTick(tick_id=1, ts_ms=NOW_MS, state=state, zones=zones(passthrough()))
 
     payload = json.loads(recorded.model_dump_json())
-    assert recorded.schema_version == 4
+    assert recorded.schema_version == 5
     assert payload["state"]["workload_regime"] == "sustained_gpu"
     assert payload["state"]["regime_confidence"] == 0.85
 
@@ -769,7 +770,7 @@ def test_fallback_trace_remains_valid_when_regime_is_not_available():
         zones=zones(passthrough()),
     )
 
-    assert recorded.schema_version == 4
+    assert recorded.schema_version == 5
     assert recorded.state.workload_regime is None
 
 

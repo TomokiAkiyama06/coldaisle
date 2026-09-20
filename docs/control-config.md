@@ -90,9 +90,36 @@ control loopがworkerへ渡した元snapshotのローカル単調時刻から `s
 切替回数が `demote_window_ms` 内で `demote_after` に達した場合、Gateは降格推奨をtraceへ出す。
 設定上のstageを`SHADOW`へ変更・永続化する責務は #92 に残す。
 
-現行 Control Config v5 は設定の live reload を行わない。設定変更は候補全体を別オブジェクトで検証したうえで
+#85 のv6で `model_confidence` を追加する（決定記録 0050。FINAL）。HIGH の下限
+`high_min_confidence`、MEDIUM で Learned MPC を Fallback 近傍へ閉じ込める `medium_limit`
+（`limit_up` / `limit_down`。`limit_down` は最低 demand の制限を兼ねる）、OOD 判定の
+`range_margin`・`min_support_count`・`full_support_count`・`min_missing_pattern_count`、
+residual drift の `residual_window`・`residual_min_samples`・`residual_match_tolerance_ms`・
+`residual_max_age_ms`・`residual_drift_ood_ratio`（`residual_window` / `residual_min_samples` の単位は
+解決した予測（forecast）の件数で、出力の数ではない。window は照合できなかった forecast も枠に数え、
+解決から `residual_max_age_ms` を過ぎた証拠は数えない。照合は品質 OK の観測だけを、期待時刻の前後
+`residual_match_tolerance_ms` 以内の最も近いもので行い、同距離なら過去側）、uncertainty や residual の証拠が無い間の confidence 上限
+`cap_without_uncertainty`・`cap_before_residual_evidence` をすべて `status` / `basis` 付きで明示する。
+MEDIUM の下限は stage ごとの `gate_min_confidence` で、`high_min_confidence >= gate_min_confidence.full`
+と、証拠が無い間に HIGH へ届かないよう `cap_before_residual_evidence < high_min_confidence`、
+`residual_max_age_ms > residual_match_tolerance_ms` を検証する。`residual_match_tolerance_ms` は Profile の最短 horizon 未満でなければならず、horizon は
+Profile 側にあるため residual monitor の生成時に検証する。MEDIUM 帯は stage の帯との共通部分を採り、confidence が authority を広げることはない。
+`cap_without_uncertainty` にコード側の上限は置かない。uncertainty を出さないモデルを構造的に締め出すのではなく、
+学習期間は保守的な暫定値に留め、評価（#90 / #91）で証拠が積み上がったら所有者が設定で広げる方針である
+（決定記録 0050 §2.4 / §3）。学習期間の暫定値の目安は決定記録 0050 §2.5 に置き、`status: provisional` のまま運用する。
+危険温度への対応は confidence に依存せず、Reactive Guard（#80）と Critical Safety（#78）が決定論的に行う。
+Confidence / OOD が動かせるのはその前段の `requested` だけである。
+
+v5からv6へは `model_confidence` を実データの評価根拠とともに追加してから `schema_version: 6` へ上げる。
+v1〜v5は自動補完せず起動前に拒否する。
+
+現行 Control Config v6 は設定の live reload を行わない。設定変更は候補全体を別オブジェクトで検証したうえで
 **次回再起動時**にだけ反映する。これにより、変更後の設定も必ず `STARTUP` の Max を通る。
 `trace_metadata()` は、採用されたsource名・schema version・SHA-256を #82 の decision traceへ渡す。
+Confidence / OOD の判断（`model_gate`）には検証済み assessment の値だけを書き、裏付けの無い tick は
+`attested: false` として confidence / ood も理由も残さない。`model_gate` の無い v5 の tick は
+`ControlState` の ML 項目もすべて `null` にする。Gate が出さない組み合わせは schema が拒む
+（決定記録 0050 §2.6）。
 
 #78 で Safety Config に `stall_check_min_demand`・`write_fail_emergency_after`・
 `cpu_power_cooling_floor`（`power_w` / `demand` の曲線）・`telemetry.cpu_power_ms` を

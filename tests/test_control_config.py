@@ -178,7 +178,7 @@ def valid_documents() -> dict[str, dict[str, object]]:
             "watchdog_timeout_ms": provisional(5000),
         },
         "fan-policy.yaml": {
-            "schema_version": 5,
+            "schema_version": 6,
             "fallback_curve": [
                 {"temperature_c": 25.0, "demand": 0.3},
                 {"temperature_c": 80.0, "demand": 1.0},
@@ -250,6 +250,24 @@ def valid_documents() -> dict[str, dict[str, object]]:
                 "expanded": provisional(0.7),
                 "full": provisional(0.8),
             },
+            "model_confidence": {
+                "high_min_confidence": provisional(0.85),
+                "medium_limit": {
+                    "limit_up": provisional(0.1),
+                    "limit_down": provisional(0.05),
+                },
+                "range_margin": provisional(0.1),
+                "min_support_count": provisional(1),
+                "full_support_count": provisional(5),
+                "min_missing_pattern_count": provisional(1),
+                "residual_window": provisional(20),
+                "residual_min_samples": provisional(5),
+                "residual_match_tolerance_ms": provisional(500),
+                "residual_max_age_ms": provisional(60_000),
+                "residual_drift_ood_ratio": provisional(3.0),
+                "cap_without_uncertainty": provisional(0.9),
+                "cap_before_residual_evidence": provisional(0.7),
+            },
             "authority_stage": "shadow",
             "authority_limits": {
                 "limited": {"permitted_zones": ["front"], "limit_up": 0.1, "limit_down": 0.1},
@@ -279,12 +297,12 @@ def load_config(tmp_path: Path) -> ControlConfig:
 def test_complete_config_has_traceable_sources_and_is_not_actuation_ready(tmp_path: Path) -> None:
     config = load_config(tmp_path)
 
-    assert CONTROL_CONFIG_VERSION == 5
+    assert CONTROL_CONFIG_VERSION == 6
     assert config.actuation_permitted is False
     metadata = config.trace_metadata()["control_config"]
     assert metadata["fan_hardware"]["name"] == "fan-hardware.yaml"
     assert metadata["safety"]["schema_version"] == 2
-    assert metadata["policy"]["schema_version"] == 5
+    assert metadata["policy"]["schema_version"] == 6
     assert len(metadata["safety"]["sha256"]) == 64
 
 
@@ -671,7 +689,7 @@ def test_supervisor_selection_and_output_bounds_are_validated(tmp_path: Path) ->
         ControlConfig.from_directory(tmp_path)
 
 
-@pytest.mark.parametrize("old_version", [1, 2, 3, 4])
+@pytest.mark.parametrize("old_version", [1, 2, 3, 4, 5])
 def test_previous_policy_versions_are_rejected_until_explicitly_migrated(
     tmp_path: Path,
     old_version: int,
@@ -694,11 +712,56 @@ def test_v4_to_v5_migration_requires_explicit_supervisor_policy_values(tmp_path:
         ControlConfig.from_directory(tmp_path)
 
     documents["fan-policy.yaml"]["supervisor"] = supervisor
-    documents["fan-policy.yaml"]["schema_version"] = 5
+    documents["fan-policy.yaml"]["schema_version"] = 6
     write_documents(tmp_path, documents)
-    assert ControlConfig.from_directory(tmp_path).policy.schema_version == 5
+    assert ControlConfig.from_directory(tmp_path).policy.schema_version == 6
 
     del documents["fan-policy.yaml"]["supervisor"]["active_policy"]
     write_documents(tmp_path, documents)
     with pytest.raises(ValidationError, match="active_policy"):
         ControlConfig.from_directory(tmp_path)
+
+
+def test_v5_to_v6_migration_requires_explicit_model_confidence_values(tmp_path: Path) -> None:
+    """#85: Confidence / OOD の閾値と MEDIUM 帯は自動補完しない（決定記録 0050）。"""
+    documents = valid_documents()
+    del documents["fan-policy.yaml"]["model_confidence"]
+    write_documents(tmp_path, documents)
+    with pytest.raises(ValidationError, match="model_confidence"):
+        ControlConfig.from_directory(tmp_path)
+
+    documents["fan-policy.yaml"]["schema_version"] = 5
+    write_documents(tmp_path, documents)
+    with pytest.raises(ValidationError, match="schema_version"):
+        ControlConfig.from_directory(tmp_path)
+
+
+def test_model_confidence_values_are_cross_validated(tmp_path: Path) -> None:
+    config = load_config(tmp_path)
+    confidence = config.policy.model_confidence
+    assert confidence.high_min_confidence.value == 0.85
+    assert confidence.medium_limit.limit_down.value == 0.05
+
+    cases = [
+        ("high_min_confidence", provisional(0.7), "high_min_confidence"),
+        ("full_support_count", provisional(0), "full_support_count"),
+        ("residual_min_samples", provisional(21), "residual_min_samples"),
+        ("residual_drift_ood_ratio", provisional(1.0), "residual_drift_ood_ratio"),
+        ("range_margin", provisional(-0.1), "range_margin"),
+        ("cap_without_uncertainty", provisional(1.5), "cap_without_uncertainty"),
+        # 証拠が無い間に HIGH（帯なし）へ届く組み合わせは拒否する
+        ("cap_before_residual_evidence", provisional(0.85), "cap_before_residual_evidence"),
+    ]
+    for name, value, match in cases:
+        documents = valid_documents()
+        documents["fan-policy.yaml"]["model_confidence"][name] = value
+        write_documents(tmp_path, documents)
+        with pytest.raises(ValidationError, match=match):
+            ControlConfig.from_directory(tmp_path)
+
+
+def test_model_confidence_values_are_listed_as_provisional(tmp_path: Path) -> None:
+    paths = {item.path for item in load_config(tmp_path).provisional_values()}
+    assert "model_confidence.high_min_confidence" in paths
+    assert "model_confidence.medium_limit.limit_down" in paths
+    assert "model_confidence.residual_drift_ood_ratio" in paths
