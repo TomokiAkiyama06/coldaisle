@@ -22,10 +22,12 @@ from coldaisle.control import (
     SCHEMA_VERSION,
     AuthorityStage,
     BoundBy,
+    ControlConfigDigest,
     ControllerKind,
     ControllerProposal,
     ControlState,
     ControlTick,
+    ControlTickRuntime,
     EffectiveZoneDemand,
     Fault,
     FaultCode,
@@ -510,6 +512,22 @@ def test_a_ceiling_never_raises_the_request():
         )
 
 
+CONTROL_TICK_RUNTIME = ControlTickRuntime(
+    tick_period_ms=1_000,
+    deadline_ms=500,
+    duration_ms=10,
+    deadline_exceeded=False,
+    snapshot_schema_version=1,
+    config=ControlConfigDigest(
+        fan_hardware_sha256="0" * 64, safety_sha256="1" * 64, policy_sha256="2" * 64
+    ),
+)
+"""v8 の `ControlTick` に必須の実行記録（#74 / 決定記録 0060 §2.4）。
+
+**版が中身を表すことを型で縛った**ので、v8 を名乗る記録はこの欄を省けない。
+値そのものはこの試験の判断に影響しない。
+"""
+
 # ---------------------------------------------------------------- 1 tick の記録
 
 
@@ -520,6 +538,7 @@ def tick(demand: EffectiveZoneDemand, faults=(), **state_overrides) -> ControlTi
         state=fallback_state(**state_overrides),
         zones=zones(demand),
         faults=faults,
+        runtime=CONTROL_TICK_RUNTIME,
     )
 
 
@@ -627,6 +646,7 @@ def test_a_front_or_rear_stall_can_stay_degraded():
         state=fallback_state(safety_state=SafetyState.DEGRADED),
         zones=front_at_max,
         faults=(Fault(code=FaultCode.TACH_STALL, zone=Zone.FRONT),),
+        runtime=CONTROL_TICK_RUNTIME,
     )
     assert recorded.state.safety_state is SafetyState.DEGRADED
 
@@ -653,6 +673,7 @@ def test_stale_cpu_temperature_drives_top_to_max():
         state=fallback_state(safety_state=SafetyState.DEGRADED),
         zones=top_at_max,
         faults=faults,
+        runtime=CONTROL_TICK_RUNTIME,
     )
     assert recorded.zones.top.demand.forced_max
 
@@ -669,7 +690,7 @@ def test_the_stored_v1_record_still_loads_unchanged():
     stored = FIXTURE.read_text(encoding="utf-8")
     tick = ControlTick.model_validate_json(stored)
     assert tick.schema_version == 1
-    assert SCHEMA_VERSION == 6
+    assert SCHEMA_VERSION == 8
     assert json.loads(tick.model_dump_json()) == json.loads(stored)
 
 
@@ -680,7 +701,7 @@ def test_v4_trace_records_the_absolute_temperature_limit():
         safety_state=SafetyState.EMERGENCY,
     )
 
-    assert recorded.schema_version == 6
+    assert recorded.schema_version == 8
     restored = ControlTick.model_validate_json(recorded.model_dump_json())
     assert restored.faults[0].code is FaultCode.ABSOLUTE_TEMPERATURE_LIMIT
     with pytest.raises(ValidationError, match="EMERGENCY"):
@@ -730,10 +751,16 @@ def test_current_trace_stores_workload_regime_and_confidence_together():
         workload_regime=WorkloadRegime.SUSTAINED_GPU,
         regime_confidence=0.85,
     )
-    recorded = ControlTick(tick_id=1, ts_ms=NOW_MS, state=state, zones=zones(passthrough()))
+    recorded = ControlTick(
+        tick_id=1,
+        ts_ms=NOW_MS,
+        state=state,
+        zones=zones(passthrough()),
+        runtime=CONTROL_TICK_RUNTIME,
+    )
 
     payload = json.loads(recorded.model_dump_json())
-    assert recorded.schema_version == 6
+    assert recorded.schema_version == 8
     assert payload["state"]["workload_regime"] == "sustained_gpu"
     assert payload["state"]["regime_confidence"] == 0.85
 
@@ -754,7 +781,13 @@ def test_v2_trace_keeps_simultaneous_transient_load_distinct():
         workload_regime=WorkloadRegime.TRANSIENT_CPU_GPU,
         regime_confidence=0.4,
     )
-    recorded = ControlTick(tick_id=1, ts_ms=NOW_MS, state=state, zones=zones(passthrough()))
+    recorded = ControlTick(
+        tick_id=1,
+        ts_ms=NOW_MS,
+        state=state,
+        zones=zones(passthrough()),
+        runtime=CONTROL_TICK_RUNTIME,
+    )
 
     payload = json.loads(recorded.model_dump_json())
     assert payload["state"]["workload_regime"] == "transient_cpu_gpu"
@@ -768,9 +801,10 @@ def test_fallback_trace_remains_valid_when_regime_is_not_available():
         ts_ms=NOW_MS,
         state=fallback_state(),
         zones=zones(passthrough()),
+        runtime=CONTROL_TICK_RUNTIME,
     )
 
-    assert recorded.schema_version == 6
+    assert recorded.schema_version == 8
     assert recorded.state.workload_regime is None
 
 
@@ -810,6 +844,40 @@ def test_v3_supervisor_policy_requires_a_matching_decision():
             ts_ms=NOW_MS,
             state=fallback_state(supervisor_policy="legacy_rule_v1"),
             zones=zones(passthrough()),
+            runtime=CONTROL_TICK_RUNTIME,
+        )
+
+
+def test_a_v8_tick_cannot_claim_the_version_without_its_payload():
+    """**版が中身を表す。** v8 を名乗りながら v8 を定義する欄が無い記録を作れない。
+
+    ここが破れると、読む側は `schema_version` を見ても何が入っているか言えない
+    （#82 の保存データと #91 の評価が、無い欄を「古い記録」と区別できなくなる）。
+    """
+    with pytest.raises(ValidationError, match="runtime が要る"):
+        ControlTick(
+            tick_id=1,
+            ts_ms=NOW_MS,
+            state=fallback_state(),
+            zones=zones(passthrough()),
+        )
+    # 保存済みの v1〜v7 は runtime を持たないまま読める。
+    stored = ControlTick(
+        schema_version=6,
+        tick_id=1,
+        ts_ms=NOW_MS,
+        state=fallback_state(),
+        zones=zones(passthrough()),
+    )
+    assert stored.runtime is None
+    with pytest.raises(ValidationError, match="schema version 8"):
+        ControlTick(
+            schema_version=6,
+            tick_id=1,
+            ts_ms=NOW_MS,
+            state=fallback_state(),
+            zones=zones(passthrough()),
+            runtime=CONTROL_TICK_RUNTIME,
         )
 
 

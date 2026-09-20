@@ -112,7 +112,7 @@ def safety_config(*, zone_min: float = 0.0) -> SafetyConfig:
 
     return SafetyConfig.model_validate(
         {
-            "schema_version": 2,
+            "schema_version": 3,
             "absolute_temp_ceiling_c": value(85.0),
             "zone_min_demand": {zone.value: value(zone_min) for zone in Zone},
             "cpu_cooling_floor": [
@@ -139,6 +139,7 @@ def safety_config(*, zone_min: float = 0.0) -> SafetyConfig:
             "ramp_down_per_s": value(1.0),
             "startup_settle_ms": value(1_000),
             "fault_clear_hold_ms": value(2_000),
+            "tick_ms": value(1_000),
             "tick_deadline_ms": value(500),
             "overrun_consecutive_limit": value(3),
             "watchdog_timeout_ms": value(5_000),
@@ -156,7 +157,7 @@ def control_config(
     policy = FanPolicyConfig.model_validate(valid_documents()["fan-policy.yaml"])
     sources = ConfigSources(
         fan_hardware=ConfigSource(name="fan-hardware.yaml", schema_version=1, sha256="1" * 64),
-        safety=ConfigSource(name="safety.yaml", schema_version=2, sha256="2" * 64),
+        safety=ConfigSource(name="safety.yaml", schema_version=3, sha256="2" * 64),
         policy=ConfigSource(
             name="fan-policy.yaml", schema_version=policy.schema_version, sha256="3" * 64
         ),
