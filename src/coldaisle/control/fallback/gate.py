@@ -305,12 +305,19 @@ class ControllerGate:
             return self._reason(FallbackCause.CONFIDENCE_UNATTESTED, unattested)
         assessment = learned.assessment
         assert assessment is not None
-        if assessment.ood or proposal.ood:
-            return self._reason(FallbackCause.OOD)
+        # 自称値の照合を先に行う。ここを後に回すと、assessment が OOD でないのに提案だけが
+        # OOD を名乗った tick を「OOD」として記録し、trace の理由と判定が食い違う。
         if (proposal.confidence, proposal.ood) != (assessment.confidence, assessment.ood):
             return self._reason(
-                FallbackCause.CONFIDENCE_UNATTESTED, "proposal confidence/ood != assessment"
+                FallbackCause.CONFIDENCE_UNATTESTED,
+                (
+                    f"proposal_confidence={proposal.confidence}; proposal_ood={proposal.ood}; "
+                    f"assessed_confidence={assessment.confidence:.6f}; "
+                    f"assessed_ood={assessment.ood}"
+                ),
             )
+        if assessment.ood:
+            return self._reason(FallbackCause.OOD)
         required_confidence = self._required_confidence()
         if assessment.confidence < required_confidence:
             return self._reason(

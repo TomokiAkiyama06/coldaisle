@@ -80,6 +80,10 @@ Registry（#104）の `confidence_model` artifact としての登録・昇格は
 - **window は解決した forecast を順に数える。** matched だけでなく、許容幅の中で観測が揃わなかった
   forecast（expired）と照合待ちの上限で捨てた forecast（dropped）も window の枠を占める。照合できない
   forecast が続けば、古い「当たっていた」証拠は押し出される
+- **証拠の時刻は forecast 自身から決める。** matched は照合に使った観測のうち最も新しい時刻、
+  expired / dropped はその forecast の照合期限（最後の期待時刻 + 許容幅）とする。
+  処理した時刻（遅れて届いた別の観測や `evidence()` を読んだ時刻）を使うと、古い観測の照合が
+  「新しい証拠」になり、上限が外れてしまう
 - **証拠は鮮度を持つ。** 解決から `residual_max_age_ms` を過ぎた matched は数えない。証拠を読む時点で
   許容幅を過ぎた照合待ちも expired にするので、観測が止まっても古い証拠は残らない
   （Telemetry の stale で Safety が働くことを前提にしない）
@@ -109,7 +113,9 @@ Registry（#104）の `confidence_model` artifact としての登録・昇格は
   付けられない（同じ model version でも、以前の in-distribution な判定を別の入力の提案へ付け替えさせない）
 - **Gate は提案の値を信用しない。** Learned MPC の提案は assessment そのものと一緒に Gate へ渡す。Gate は
   assessment を検証し直し、Registry 検証済み・同じ推論・同じ model version・提案と同じ confidence / ood で
-  なければ `confidence_unattested` として Fallback にする。assessment の無い提案も同じ
+  なければ `confidence_unattested` として Fallback にする。assessment の無い提案も同じ。
+  **自称値の照合は OOD の判定より先に行う。** 後に回すと、assessment が OOD でないのに提案だけが OOD を
+  名乗った tick を「OOD」として記録し、trace の理由（`ood_*` を含まない）と判定が食い違う
 - Fallback への切替、confidence level、authority の帯は #79 の Controller Gate が決める。
   出せるのは requested までで、**Reactive Guard と Critical Safety は後段で常に掛かる**（0028 §2.4）。
   OOD の間も Critical Safety はそのまま有効である

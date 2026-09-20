@@ -1413,7 +1413,9 @@ def test_trace_records_the_verified_assessment_not_the_proposal_claim(trained) -
     selected = _select(gate, 1, liar, assessment)
 
     assert selected.active_controller is ControllerKind.FALLBACK
-    assert selected.fallback_reason is not None and selected.fallback_reason.code == "ood"
+    # 自称値の食い違いを先に見るので、理由は OOD ではなく不一致になる（trace と一貫させる）
+    assert selected.fallback_reason is not None
+    assert selected.fallback_reason.code == "confidence_unattested"
     record = selected.model_gate
     assert record is not None
     assert record.attested is True
@@ -1776,3 +1778,74 @@ def test_attested_trace_accepts_the_reason_set_the_gate_writes(trained) -> None:
         f"ood_{component.value}" if component in assessment.ood_components else component.value
         for component in ConfidenceComponent
     }
+
+
+def test_a_proposal_only_ood_claim_is_recorded_as_a_mismatch_not_as_ood(trained) -> None:
+    """assessment が OOD でないのに提案だけが OOD を名乗る tick（#149 review 7回目）。"""
+    assessment = _assessed(trained, ood_input=False)
+    claims_ood = learned_proposal(
+        0.7, confidence=assessment.confidence, ood=True, inference_id=assessment.inference_id
+    )
+    gate = _active_gate(AuthorityStage.FULL)
+    selected = _select(gate, 1, claims_ood, assessment)
+
+    assert selected.active_controller is ControllerKind.FALLBACK
+    assert selected.fallback_reason is not None
+    assert selected.fallback_reason.code == "confidence_unattested"
+    record = selected.model_gate
+    assert record is not None
+    # trace の判定は assessment 側（OOD ではない）。理由と食い違わない
+    assert record.ood is False
+    assert record.proposal_mismatch is not None
+    assert "proposal_ood=True" in record.proposal_mismatch.detail
+    assert not any(reason.code.startswith("ood_") for reason in record.assessment)
+
+
+def test_matching_the_verdict_of_an_ood_assessment_is_still_reported_as_ood(trained) -> None:
+    assessment = _assessed(trained, ood_input=True)
+    honest = learned_proposal(
+        0.7, confidence=assessment.confidence, ood=True, inference_id=assessment.inference_id
+    )
+    gate = _active_gate(AuthorityStage.FULL)
+    selected = _select(gate, 1, honest, assessment)
+
+    assert selected.fallback_reason is not None and selected.fallback_reason.code == "ood"
+    record = selected.model_gate
+    assert record is not None
+    assert (record.ood, record.proposal_mismatch) == (True, None)
+
+
+def test_a_forecast_resolved_long_after_its_deadline_is_not_fresh_evidence(trained) -> None:
+    """照合は期限内でも、解決の処理が遅れた forecast を「新しい証拠」にしない。"""
+    _data, parts, model, profile = trained
+    settings = tuned(residual_max_age_ms=60_000)
+    monitor = ResidualDriftMonitor(profile, settings)
+    base = ObservedThermalInput.from_example(parts.test[0])
+    prediction = model.predict(base)
+    monitor.record(prediction)
+    target = prediction.targets[0]
+
+    # 期待時刻の手前（許容幅の中）に観測が来たが、次の観測はずっと後だった
+    feed(monitor, target.expected_ts_ms - 100, {GPU: target.values[GPU]})
+    late = target.expected_ts_ms + 10_000_000
+    feed(monitor, late, {GPU: 0.0})
+
+    state = monitor.evidence(late)
+    # 照合自体はできているが、証拠の時刻は観測時刻（期限内）なので鮮度切れになる
+    assert (state.forecasts, state.unmatched) == (0, 1)
+    fresh = monitor.evidence(late)
+    assert fresh.ratio is None
+
+
+def test_an_expired_forecast_is_timestamped_at_its_deadline(trained) -> None:
+    _data, parts, model, profile = trained
+    settings = tuned(residual_max_age_ms=60_000)
+    monitor = ResidualDriftMonitor(profile, settings)
+    base = ObservedThermalInput.from_example(parts.test[0])
+    prediction = model.predict(base)
+    monitor.record(prediction)
+    deadline = prediction.targets[0].expected_ts_ms + 500
+
+    # 期限を大きく過ぎてから読んでも、その forecast は「いま解決した」扱いにしない
+    state = monitor.evidence(deadline + 10_000_000)
+    assert (state.forecasts, state.unmatched) == (0, 1)

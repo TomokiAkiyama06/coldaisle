@@ -505,9 +505,10 @@ class ResidualDriftMonitor:
         self._last_action_ms = prediction.input_action_ts_ms
         self._pending.append(forecast)
         while len(self._pending) > MAX_PENDING_FORECASTS:
-            self._pending.popleft()
+            dropped = self._pending.popleft()
             # 捨てた forecast も window の枠を占める。証拠が無いまま古い証拠を残さない。
-            self._outcomes.append((prediction.input_action_ts_ms, None))
+            # 時刻は捨てた forecast 自身の照合期限にする（処理した時刻ではない）。
+            self._outcomes.append((self._deadline(dropped), None))
 
     def observe(self, ts_ms: int, values: Mapping[str, ResidualObservation]) -> None:
         """観測を1つ受け取り、照合待ちの予測の候補を更新する。時刻は巻き戻せない。"""
@@ -549,7 +550,7 @@ class ResidualDriftMonitor:
         for forecast in self._pending:
             self._update(forecast, ts_ms, values)
             if len(forecast.finalized) == len(forecast.targets):
-                self._complete(forecast, ts_ms)
+                self._complete(forecast)
             else:
                 remaining.append(forecast)
         self._pending = remaining
@@ -581,15 +582,30 @@ class ResidualDriftMonitor:
                 # 期待時刻以降の値が来た。以降の観測はこれより遠いか同距離の未来側。
                 forecast.finalized.add(key)
 
-    def _complete(self, forecast: _PendingForecast, resolved_ts_ms: int) -> None:
+    def _complete(self, forecast: _PendingForecast) -> None:
+        """解決した forecast を window へ入れる。
+
+        時刻は **forecast 自身の観測 / 照合期限**から決める。処理した時刻（遅れて届いた別の観測の
+        時刻や ``evidence()`` を読んだ時刻）を使うと、古い観測の照合が「新しい証拠」になり、
+        証拠が無い間の confidence 上限を外してしまう。
+        """
         if len(forecast.best) != len(forecast.targets):
-            self._outcomes.append((resolved_ts_ms, None))
+            self._outcomes.append((self._deadline(forecast), None))
             return
         squared = [
             ((forecast.best[key][2] - predicted) / self._scales[key]) ** 2
             for key, (_expected, predicted) in sorted(forecast.targets.items())
         ]
+        # 照合に使った観測のうち最も新しいものを、この証拠の時刻とする。
+        resolved_ts_ms = max(observation[1] for observation in forecast.best.values())
         self._outcomes.append((resolved_ts_ms, math.fsum(squared) / len(squared)))
+
+    def _deadline(self, forecast: _PendingForecast) -> int:
+        """forecast の照合期限（最後の期待時刻 + 許容幅）。"""
+        return (
+            max(expected_ts_ms for expected_ts_ms, _predicted in forecast.targets.values())
+            + self._tolerance_ms
+        )
 
 
 # ---------------------------------------------------------------- Assessment
