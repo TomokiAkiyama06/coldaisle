@@ -1,8 +1,7 @@
 # 決定記録 0058: RL Supervisor 学習環境の責務・dynamics の出どころ・安全の扱い
 
 - **種別**: Decision Record
-- **Status**: Proposed（**リポジトリ所有者の承認が要る。** 安全系・制御系の設計変更は
-  実装担当モデルに関係なく人間レビューを必須とする。AGENTS.md「実装の担当」）
+- **Status**: FINAL（2026-09-20、リポジトリ所有者が承認）
 - **Date**: 2026-09-20
 - **Supersedes**: なし
 - **関連**: [0027](0027-fan-control-architecture.md) / [0028](0028-fan-control-contracts.md) §2.3〜§2.6 /
@@ -374,8 +373,10 @@ simulator: { model_id, model_version, responses: [...] }
 
 ## 5. 未決事項
 
-- **本記録は `Proposed` である。所有者の承認が要る**（AGENTS.md「安全系・制御系の設計変更は
-  人間レビュー必須」）。承認されるまで §2 は確定していない
+- 所有者の承認（2026-09-20）で本記録は `FINAL` になった。**§2 の決定が変わるときは、
+  書き換えずに新しい記録を作る**（`docs/decisions/README.md`「追記のみ」）。
+  承認されたのは §2 の方式であって、下の未決事項と `provisional` な設定値は
+  **確定するまで開いたままである**
 - `config/rl-training.yaml` の実運用値（刻み・重み・基準量・coverage 下限・simulator の応答）は
   **すべて実測前の暫定値**。確定には基準となる測定が要る
 - 近似 simulator の応答式（1次遅れ + 流量近似）を、実測でどこまで検証するか。
