@@ -127,4 +127,5 @@ docs/decisions/NNNN-<slug>.md      例: 0002-metric-naming.md
 | [0056](0056-model-drift-detection-and-retraining-triggers.md) | Thermal Model の drift 検知の置き場所（runtime は 0050 のまま）・証拠の規則・再学習の条件（0053 §2.3 の記録内容を1点だけ拡張） | FINAL |
 | [0057](0057-authority-rollout-stage-changes.md) | Authority Rollout の stage 変更（人の承認・証拠の束縛・自動降格・設定は上限） | FINAL |
 | [0058](0058-rl-supervisor-training-environment.md) | RL Supervisor 学習環境の責務（action は戦略まで・dynamics の出どころ・Safety 違反は terminal） | FINAL |
-| [0061](0061-rl-supervisor-policy-artifact-and-binding.md) | RL Supervisor policy の artifact 形式（全 regime の表・Demand を表現できない）・束縛（shadow と active を分け、active は反実仮想の裏づけを要求）・shadow 集計の規律 | Proposed |
+| [0060](0060-control-loop-runtime.md) | Control Loop の実行時契約（`tick_ms` は safety.yaml・Telemetry はストア経由・モードは読み取り port・deadman の配線・実行の記録を trace へ） | FINAL |
+| [0061](0061-rl-supervisor-policy-artifact-and-binding.md) | RL Supervisor policy の artifact 形式（全 regime の表・Demand を表現できない）・束縛（active は開かない門・shadow 用の提案は active slot を通らない）・shadow 集計の規律 | Proposed |

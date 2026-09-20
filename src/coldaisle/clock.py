@@ -68,3 +68,49 @@ class SimulatedClock:
         if value < self._now_ms:
             raise ValueError(f"時刻は巻き戻さない: {self._now_ms} -> {value}")
         self._now_ms = value
+
+
+@runtime_checkable
+class MonotonicClock(Protocol):
+    """経過時間・締め切り・hold・stall の判定に使う単調時計（決定記録 0028 §2.6）。
+
+    **壁時計と分ける。** `Clock` は時刻合わせで前後に飛ぶので、期限の判定に使うと
+    時計が戻ったときに古い提案が有効なまま残り、stall や stale の timer が満了しない。
+    tick は回り続けるので watchdog も介入しない。
+    """
+
+    def monotonic_ms(self) -> int:
+        """起点を問わない単調増加のミリ秒。**絶対時刻としての意味を持たない。**"""
+        ...
+
+
+class SystemMonotonicClock:
+    """OS の単調時計。制御デーモンの本番で使う。"""
+
+    def monotonic_ms(self) -> int:
+        # monotonic_ns から作る。float の monotonic() は長時間稼働で
+        # ミリ秒未満の桁が落ち、丸めの向きが環境で変わる
+        return time.monotonic_ns() // 1_000_000
+
+
+class ManualMonotonicClock:
+    """試験・Replay 用に、呼び出し側が明示的に進める単調時計。
+
+    **巻き戻せない。** 巻き戻る時計を許すと、期限・hold・stall の検証が
+    「戻せば満了しない」経路を持ってしまう。
+    """
+
+    def __init__(self, start_ms: int = 0) -> None:
+        if start_ms < 0:
+            raise ValueError(f"単調時計の開始値が負: {start_ms}")
+        self._now_ms = start_ms
+
+    def monotonic_ms(self) -> int:
+        return self._now_ms
+
+    def advance_ms(self, delta_ms: int) -> int:
+        """`delta_ms` だけ進めて、進めたあとの値を返す。"""
+        if delta_ms < 0:
+            raise ValueError(f"単調時計は巻き戻さない: {delta_ms}")
+        self._now_ms += delta_ms
+        return self._now_ms

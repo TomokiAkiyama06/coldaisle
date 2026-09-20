@@ -24,7 +24,7 @@ from typing import Annotated, Literal, Protocol, Self, runtime_checkable
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-SCHEMA_VERSION: Literal[6] = 6
+SCHEMA_VERSION: Literal[8] = 8
 """`ControlTick` の形の版。**フィールドの名前や意味を変えたら上げる。**
 
 #82 が保存したデータを読み違えないため。
@@ -38,6 +38,11 @@ SCHEMA_VERSION: Literal[6] = 6
 - v6（#90）: Shadow Mode の counterfactual 記録（`shadow`）。**適用した demand とは別の枠**に
   置き、適用した制御器と同じ controller を counterfactual にできない。保存済みの v1〜v5 は
   そのまま読める
+- v7: **#159（PR #160）が先に確保した番号**。判断を出した model artifact の hash を
+  `model_gate` へ足す。番号を取り合わないため、本 module では欠番として扱う
+- v8（#74 / 決定記録 0060）: control loop の実行そのものの記録（`runtime`）。tick の所要時間・
+  締め切り超過・周期・snapshot schema・設定の内容ハッシュを、判断と同じ行に残す。
+  保存済みの v1〜v7 はそのまま読める
 """
 
 Demand = Annotated[float, Field(ge=0.0, le=1.0, allow_inf_nan=False)]
@@ -938,6 +943,48 @@ class ShadowRecord(_Frozen):
         return self
 
 
+class ControlConfigDigest(_Frozen):
+    """この tick が使っていた検証済み設定（#103）の内容ハッシュ。
+
+    **絶対 path も個体識別子も残さない**（AGENTS.md ルール10）。ここにあるのは、あとから
+    「どの設定で回っていた tick か」を言えるだけの hash である。
+    """
+
+    fan_hardware_sha256: Sha256Hex
+    safety_sha256: Sha256Hex
+    policy_sha256: Sha256Hex
+
+
+class ControlTickRuntime(_Frozen):
+    """1 tick の**実行そのもの**の記録（#74 / 決定記録 0060 §2.4）。
+
+    判断ではなく、判断を出した実行の条件を残す。別のログと突き合わせずに
+    「この tick は締め切りに間に合っていたか」「どの設定と snapshot の形で回っていたか」を
+    言えるようにするための欄である。
+
+    ``duration_ms`` は**書き込みと検証まで**の所要時間で、decision trace の保存時間を含まない
+    （0028 §2.6 の watchdog が数える区間と同じ）。
+    """
+
+    schema_version: Literal[1] = 1
+    tick_period_ms: int = Field(gt=0)
+    deadline_ms: int = Field(gt=0)
+    duration_ms: int = Field(ge=0)
+    deadline_exceeded: bool
+    snapshot_schema_version: int = Field(ge=1)
+    config: ControlConfigDigest
+
+    @model_validator(mode="after")
+    def _overrun_matches_the_recorded_duration(self) -> Self:
+        if self.deadline_exceeded != (self.duration_ms > self.deadline_ms):
+            # 超過の有無を、同じ行に残した所要時間と食い違わせない。片方だけを書き換えて
+            # 「遅れていない tick」に見せられる欄を作らないため。
+            raise ValueError("deadline_exceeded は記録した duration と締め切りから決まる")
+        if self.deadline_ms > self.tick_period_ms:
+            raise ValueError("tick の締め切りを周期より長くしない（0028 §2.6）")
+        return self
+
+
 class GuardZoneOutput(_Frozen):
     """Reactive Guard の zone ごとの出力（0028 §2.3）。介入していなければすべて None。
 
@@ -1158,7 +1205,7 @@ v1〜v3 の reader は知らないため v3 以前には記録しない。
 class ControlTick(_Frozen):
     """1 tick の判断の記録（decision trace。0028 §2.3）。#82 が保存し、#90 / #91 が読む。"""
 
-    schema_version: Literal[1, 2, 3, 4, 5, 6] = SCHEMA_VERSION
+    schema_version: Literal[1, 2, 3, 4, 5, 6, 7, 8] = SCHEMA_VERSION
     tick_id: int = Field(ge=0)
     ts_ms: int = Field(ge=0)
     """記録の時刻（壁時計。0028 §2.6）。"""
@@ -1173,6 +1220,8 @@ class ControlTick(_Frozen):
     """Confidence / OOD Gate の判断（v5。#85）。Learned MPC の提案が無い tick では None。"""
     shadow: ShadowRecord | None = Field(default=None, exclude_if=lambda value: value is None)
     """適用しなかった提案の記録（v6。#90）。counterfactual が無い tick では None。"""
+    runtime: ControlTickRuntime | None = Field(default=None, exclude_if=lambda value: value is None)
+    """control loop の実行そのものの記録（v8。#74）。保存済みの v1〜v7 では None。"""
     faults: tuple[Fault, ...] = ()
     """いま有効な故障。
 
@@ -1201,6 +1250,13 @@ class ControlTick(_Frozen):
             and state.supervisor_policy is not None
         ):
             raise ValueError("v3 以降の supervisor_policy には Supervisor decision が必要")
+        if self.runtime is None:
+            if self.schema_version >= 8:
+                # **版が中身を表さない記録を作らない。** v8 を名乗りながら v8 を定義する欄が
+                # 無いと、読む側は版を見ても何が入っているか言えない。
+                raise ValueError("v8 の ControlTick には runtime が要る")
+        elif self.schema_version < 8:
+            raise ValueError("runtime を記録する ControlTick は schema version 8 にする")
         self._check_model_gate()
         self._check_shadow()
         if self.supervisor is not None:
