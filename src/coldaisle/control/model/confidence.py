@@ -720,6 +720,15 @@ class ConfidenceAssessor:
         """検証済みの Profile。"""
         return self._profile
 
+    @property
+    def policy(self) -> ModelConfidencePolicy:
+        """この判定器が使っている設定。
+
+        呼び出し側（#86）が「runtime の設定と同じものか」を確かめられるようにする。
+        別の設定で作った判定器を渡されると、閾値だけがすり替わる。
+        """
+        return self._policy
+
     def assess(
         self,
         observed: ObservedThermalInput,

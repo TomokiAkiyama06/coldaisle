@@ -93,6 +93,19 @@ Rollback前にも旧artifactのchecksumとschema互換性を再検証し、成�
   の時刻、理由、approvalは `RegistrySnapshot.audit` から追跡できる。
 - #84 / #85 / #89: 各format固有loaderと推論interfaceを実装し、`VerifiedArtifact.payload` だけを
   入力にする。Registry内に任意コード実行経路を追加しない。
+- #86 Learned MPC: `VerifiedArtifact.attestation`（`ArtifactAttestation`）を内部モデルの束縛に使う。
+  この値はpublic constructorを持たず、Registryの検証経路だけが発行する。受け取った側は
+  verification / authority / 版 / schema versionをモデルの自称ではなくこの値から読む
+  （決定記録 0052 §2.1）。暗号的な保証ではなく、配線の誤りを型で止めるためのものである。
+  attestationは lifecycle 状態（`status`）と、その kind の**いまのproduction pointerそのものか**
+  （`production_active`）も載せる。`load_version()` はReplay / offline評価のために候補・検証済み・
+  引退も返すため、これを載せないと、promotionの承認を経ていないartifactをactive制御へ配線できて
+  しまう。#86 の `for_control` は `production_active` を要求し、Replay / offline評価は
+  productionでないattestationをそのまま使う。
+  さらに `ArtifactMetadata.capability`（`ArtifactCapability`: `observational_replay` / `counterfactual_action`）を
+  必須項目として登録時に申告し、attestationがそれを載せる。#86 はこの申告だけを見て内部モデルの
+  可否を決め、推論器の自称では判断しない。capabilityの追加にともない Registry schema version を
+  2 へ上げた（既定値を補うと、能力を申告していないartifactが「反実仮想もできる」側へ倒れる）。
 - #90 / #91: `load_version()` でcandidate / validated / retiredを含む明示versionを固定できる。
   `load_production()` と混ぜず、評価対象のversionを暗黙に変えない。
 - #92 Authority Rollout: `ModelCompatibility.authority_stage` で互換性だけを検査する。モデルの

@@ -86,11 +86,23 @@ in-memory artifactを使う評価は別型`OfflineRidgeThermalModel`になり、
 `offline_unverified`を明示する。#85 / #86のdeployment consumerは`RegistryThermalModel`だけを受ける。
 offline / shadow evaluation referenceとpromotion / rollbackは#104が管理し、payloadへ埋め込まない。
 
-現行#104の`VerifiedArtifact`はpublic constructorを持つため、`registry_verified`は「そのnominal
-typeとchecksum / metadata / payloadの整合を#84が再検証した」ことだけを表す。Registry lifecycle、
-promotion、production authorizationの証明には使わない。#85 / #86に統合する前に#104側で
-`VerifiedArtifact`をRegistryだけが発行できるsealed / opaqueな値にし、artifact読み込みの8 MiB
-上限もallocation前に適用することをblockerとする。
+**更新（#86 / 決定記録 0052 §2.1）**: #104に`ArtifactAttestation`を追加し、`VerifiedArtifact`は
+これを必須項目として持つようになった。`ArtifactAttestation`はpublic constructorを持たず
+`ModelRegistry`の検証経路だけが発行するため、`VerifiedArtifact`はRegistryの外では組み立てられない。
+上記のsealed / opaqueな発行境界はこれで満たす。ただし暗号的な保証ではなく、同一プロセス内の
+悪意ある偽造は防げない（決定記録 0050 §3）。狙いは、検証していないartifactを取り違えて制御経路へ
+渡す配線の誤りを型で止めることである。artifact読み込みの8 MiB上限をallocation前に適用することは
+引き続きblockerとして残る。
+
+**更新（#86 / 決定記録 0052 §2.1）**: `ThermalRegistryMetadata` に `capability` を足し、manifestの
+capabilityをそのまま#104へ申告する（Registry schema version 2）。#86 はRegistryが発行した
+attestationのcapabilityだけを見て内部モデルの可否を決める。v1 artifactのcapabilityは
+`observational_replay`固定なので、**登録されるcapabilityも必ずそれになり、#86 は常に拒否する**。
+反実仮想artifactを定義するときに満たすべき条件は決定記録 0052 §2.1 に列挙した。
+
+（元の記述）現行#104の`VerifiedArtifact`はpublic constructorを持つため、`registry_verified`は
+「そのnominal typeとchecksum / metadata / payloadの整合を#84が再検証した」ことだけを表す。
+Registry lifecycle、promotion、production authorizationの証明には使わない。
 
 ## 読み取り専用推論
 

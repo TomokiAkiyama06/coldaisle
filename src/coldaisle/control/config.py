@@ -26,8 +26,8 @@ from coldaisle.control.schema import (
 )
 from coldaisle.store.models import validate_metric
 
-CONTROL_CONFIG_VERSION: Literal[6] = 6
-FAN_POLICY_CONFIG_VERSION: Literal[6] = 6
+CONTROL_CONFIG_VERSION: Literal[7] = 7
+FAN_POLICY_CONFIG_VERSION: Literal[7] = 7
 SAFETY_CONFIG_VERSION: Literal[2] = 2
 CONFIG_FILENAMES = {
     "fan_hardware": "fan-hardware.yaml",
@@ -522,15 +522,137 @@ class ModelConfidencePolicy(_ConfigModel):
         return self
 
 
+MAX_MPC_HORIZON_STEPS = 32
+"""1 plan に置ける control step 数の構造上限（#86）。
+
+worker 1回の計算量と trace の大きさを抑えるための境界で、調整値ではない。
+horizon / step の実運用値は設定に置く。
+
+**#84 の ``MAX_TARGET_HORIZONS`` を超えない。** 内部モデルの target schema と plan prediction が
+32 horizon までしか表現できないため、それより多い step 数の設定は検証を通っても決して動かない。
+設定の上限を予測の契約へ合わせる（逆に契約を広げない）。一致は試験で確かめる。
+"""
+
+MAX_MPC_EVALUATIONS = 4_096
+"""1 tick に許す内部モデル評価回数の構造上限（#86）。budget_ms とは別の、決定論的な打ち切り。"""
+
+
+class MpcZoneBound(_ConfigModel):
+    """Learned MPC が探索してよい zone ごとの demand の範囲（#86）。
+
+    **Critical Safety の floor はここに書かない。** 実行時に safety 側の floor を重ねて
+    さらに狭める。この範囲は探索の上限であって、安全上の保証ではない。
+    """
+
+    floor: PolicyDemand
+    ceiling: PolicyDemand
+
+    @model_validator(mode="after")
+    def _floor_is_below_ceiling(self) -> Self:
+        if self.floor.value > self.ceiling.value:
+            raise ValueError("mpc.optimizer.zone_bounds の floor は ceiling 以下にする")
+        return self
+
+
+class MpcCostScales(_ConfigModel):
+    """各コスト項を無単位へ揃える基準量（#86）。
+
+    重み（``SupervisorObjectiveWeights``）は相対値なので、単位の違う項をそのまま足すと
+    暗黙の換算係数がコードに埋まる。基準量を設定へ出し、0 除算を避けるため正に限る。
+    """
+
+    temperature_c: PolicyFloat
+    balance_ratio: PolicyFloat
+    acoustic_cost: PolicyFloat
+    demand_change: PolicyFloat
+
+    @model_validator(mode="after")
+    def _scales_are_positive(self) -> Self:
+        for name in ("temperature_c", "balance_ratio", "acoustic_cost", "demand_change"):
+            scale: ConfigValue[float] = getattr(self, name)
+            if scale.value <= 0.0:
+                raise ValueError(f"mpc.optimizer.cost_scales.{name} は正にする")
+        return self
+
+
+class MpcCostMetrics(_ConfigModel):
+    """コストに使う予測 metric 名（#86）。
+
+    metric 名をコードに埋めない（AGENTS.md ルール9）。内部モデルの target schema が
+    ここで指定した metric を持つことは optimizer の生成時に照合する。
+    """
+
+    cpu_temperature: str
+    gpu_temperature: str
+
+    @field_validator("cpu_temperature", "gpu_temperature")
+    @classmethod
+    def _metric_is_stored_telemetry(cls, value: str) -> str:
+        return validate_metric(value)
+
+    @model_validator(mode="after")
+    def _metrics_are_distinct(self) -> Self:
+        if self.cpu_temperature == self.gpu_temperature:
+            raise ValueError("mpc.optimizer.cost_metrics の CPU / GPU は別の metric にする")
+        return self
+
+
+class MpcOptimizerConfig(_ConfigModel):
+    """Learned MPC の horizon・探索・コストの設定（#86 / 決定記録 0052）。
+
+    値はすべて実測前の暫定値として扱い、コードに既定値を置かない。
+    """
+
+    horizon_ms: PolicyMilliseconds
+    step_ms: PolicyMilliseconds
+    candidate_levels: ConfigValue[Annotated[int, Field(ge=2)]]
+    """1 zone の1掃引で試す demand の格子点数。両端を含む等間隔。"""
+    sweeps: ConfigValue[PositiveCount]
+    """座標降下の掃引回数。増やすほど探索は良くなるが budget を食う。"""
+    max_evaluations: ConfigValue[PositiveCount]
+    """1 tick に許す内部モデル評価回数。budget_ms とは独立に打ち切る決定論的な上限。"""
+    max_step_up: PolicyDemand
+    max_step_down: PolicyDemand
+    zone_bounds: PerZone[MpcZoneBound]
+    cost_scales: MpcCostScales
+    cost_metrics: MpcCostMetrics
+    unknown_balance_cost: PolicyFloat
+    """Air Balance の比を推定できない step に課す無単位コスト。"""
+
+    @model_validator(mode="after")
+    def _horizon_is_a_whole_number_of_steps(self) -> Self:
+        if self.horizon_ms.value % self.step_ms.value != 0:
+            raise ValueError("mpc.optimizer.horizon_ms は step_ms の整数倍にする")
+        steps = self.horizon_ms.value // self.step_ms.value
+        if steps > MAX_MPC_HORIZON_STEPS:
+            raise ValueError(
+                f"mpc.optimizer の control step 数は {MAX_MPC_HORIZON_STEPS} 以下にする"
+            )
+        if self.max_evaluations.value > MAX_MPC_EVALUATIONS:
+            raise ValueError(f"mpc.optimizer.max_evaluations は {MAX_MPC_EVALUATIONS} 以下にする")
+        if self.unknown_balance_cost.value < 0.0:
+            raise ValueError("mpc.optimizer.unknown_balance_cost は 0 以上にする")
+        return self
+
+    @property
+    def steps(self) -> int:
+        """1 plan の control step 数。"""
+        return self.horizon_ms.value // self.step_ms.value
+
+
 class MpcTiming(_ConfigModel):
     period_ms: PositiveMilliseconds
     budget_ms: PositiveMilliseconds
     valid_ms: PositiveMilliseconds
+    optimizer: MpcOptimizerConfig
 
     @model_validator(mode="after")
     def _budget_fits_period(self) -> Self:
         if self.budget_ms > self.period_ms:
             raise ValueError("mpc.budget_ms は mpc.period_ms 以下にする")
+        if self.valid_ms < self.period_ms:
+            # 再計算の周期より短い有効期限では、健全な提案でも毎 tick 期限切れになる。
+            raise ValueError("mpc.valid_ms は mpc.period_ms 以上にする")
         return self
 
 
@@ -739,7 +861,7 @@ class WorkloadRegimeConfig(_ConfigModel):
 
 
 class FanPolicyConfig(_ConfigModel):
-    schema_version: Literal[6]
+    schema_version: Literal[7]
     fallback_curve: Annotated[
         tuple[FallbackPoint, ...], BeforeValidator(_yaml_sequence_to_tuple), Field(min_length=2)
     ]
@@ -1009,6 +1131,32 @@ class ControlConfig(_ConfigModel):
             "model_confidence.medium_limit.limit_down",
             confidence.medium_limit.limit_down,
         )
+        optimizer = self.policy.mpc.optimizer
+        for name in (
+            "horizon_ms",
+            "step_ms",
+            "candidate_levels",
+            "sweeps",
+            "max_evaluations",
+            "max_step_up",
+            "max_step_down",
+            "unknown_balance_cost",
+        ):
+            append("fan-policy.yaml", f"mpc.optimizer.{name}", getattr(optimizer, name))
+        for name in ("temperature_c", "balance_ratio", "acoustic_cost", "demand_change"):
+            append(
+                "fan-policy.yaml",
+                f"mpc.optimizer.cost_scales.{name}",
+                getattr(optimizer.cost_scales, name),
+            )
+        for zone in Zone:
+            bound = optimizer.zone_bounds.get(zone)
+            append("fan-policy.yaml", f"mpc.optimizer.zone_bounds.{zone.value}.floor", bound.floor)
+            append(
+                "fan-policy.yaml",
+                f"mpc.optimizer.zone_bounds.{zone.value}.ceiling",
+                bound.ceiling,
+            )
         return tuple(values)
 
     @property

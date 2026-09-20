@@ -122,9 +122,17 @@ class LearnedControlStatus(_Frozen):
 
     Gate は提案の値を信用せず、この assessment と照合する。無い・合わない提案は Fallback にする。
     """
+    failure_reason: Reason | None = None
+    """worker 失敗の具体的な理由（#86）。
+
+    `failure` だけでは `model_load_failure` としか残らず、何が起きたのかを後から読めない。
+    Gate はこれを Fallback の理由の detail に載せる。
+    """
 
     @model_validator(mode="after")
     def _proposal_and_receipt_match(self) -> Self:
+        if self.failure_reason is not None and self.failure is None:
+            raise ValueError("失敗していない状態に failure_reason を付けない")
         if (self.proposal is None) != (self.received_at_mono_ms is None):
             raise ValueError("Learned proposal と受信単調時刻は一緒に指定する")
         if self.proposal is None and self.assessment is not None:
@@ -277,9 +285,9 @@ class ControllerGate:
         if not learned.supervisor_available:
             return self._reason(FallbackCause.SUPERVISOR_FAILURE)
         if learned.failure is LearnedFailure.MODEL_LOAD_FAILURE:
-            return self._reason(FallbackCause.MODEL_LOAD_FAILURE)
+            return self._reason(FallbackCause.MODEL_LOAD_FAILURE, self._failure_detail(learned))
         if learned.failure is LearnedFailure.OPTIMIZER_EXCEPTION:
-            return self._reason(FallbackCause.OPTIMIZER_EXCEPTION)
+            return self._reason(FallbackCause.OPTIMIZER_EXCEPTION, self._failure_detail(learned))
         proposal = learned.proposal
         if proposal is None:
             return self._reason(FallbackCause.LEARNED_PROPOSAL_UNAVAILABLE)
@@ -602,6 +610,15 @@ class ControllerGate:
             self._last_requested = None
             self._healthy_since_mono_ms = None
         self._operating_mode = operating_mode
+
+    @staticmethod
+    def _failure_detail(learned: LearnedControlStatus) -> str:
+        """worker が付けた理由を Fallback の理由の detail へ移す（#86）。"""
+        reason = learned.failure_reason
+        if reason is None:
+            return ""
+        detail = f"{reason.code}: {reason.detail}" if reason.detail else reason.code
+        return detail[:500]
 
     @staticmethod
     def _reason(cause: FallbackCause, detail: str = "") -> Reason:

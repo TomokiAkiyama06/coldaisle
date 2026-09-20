@@ -89,6 +89,14 @@ class InferenceCapability(StrEnum):
     """Scientific claim supported by an artifact, not its deployment lifecycle state."""
 
     OBSERVATIONAL_REPLAY = "observational_replay"
+    COUNTERFACTUAL_ACTION = "counterfactual_action"
+    """Prediction under a candidate future fan-action trajectory (#86).
+
+    No Dataset v1 artifact can declare it: ``ThermalModelManifest.capability`` and
+    ``ThermalPrediction.capability`` are pinned to ``OBSERVATIONAL_REPLAY`` because v1 has no
+    post-anchor action trajectory (decision record 0048 §2.1).  The member exists so that #86
+    can name the capability it requires and refuse every current artifact deterministically.
+    """
 
 
 class ArtifactVerification(StrEnum):
@@ -485,9 +493,15 @@ class ThermalModelArtifact(_Frozen):
 class ThermalRegistryMetadata(_Frozen):
     """Values that map one-to-one to #104 ``ArtifactMetadata``."""
 
-    schema_version: Literal[1] = 1
+    schema_version: Literal[2] = 2
     kind: Literal["thermal_model"] = "thermal_model"
     artifact_format: Literal["json"] = "json"
+    capability: InferenceCapability
+    """登録時に #104 へ申告する能力。**manifest の capability をそのまま写す。**
+
+    #86 はこの値（Registry の metadata と attestation 側）だけを見て内部モデルの可否を決める。
+    推論器が自分で名乗った値では判断しない（決定記録 0052 §2.1）。
+    """
     model_id: ModelId
     version: SemanticVersion
     created_at: str
@@ -1187,6 +1201,7 @@ def _registry_metadata_from_artifact(
 ) -> ThermalRegistryMetadata:
     manifest = artifact.manifest
     return ThermalRegistryMetadata(
+        capability=manifest.capability,
         model_id=manifest.model_id,
         version=manifest.model_version,
         created_at=manifest.created_at,
@@ -1205,6 +1220,7 @@ def _registry_contract(metadata: ThermalRegistryMetadata) -> tuple[object, ...]:
         metadata.schema_version,
         metadata.kind,
         metadata.artifact_format,
+        metadata.capability,
         metadata.model_id,
         metadata.version,
         metadata.created_at,

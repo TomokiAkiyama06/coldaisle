@@ -18,6 +18,7 @@ import coldaisle.control.model_registry as registry_module
 from coldaisle.clock import SimulatedClock
 from coldaisle.control import (
     ApprovalAction,
+    ArtifactCapability,
     ArtifactFormat,
     ArtifactKind,
     ArtifactLoadStatus,
@@ -69,11 +70,13 @@ def metadata(
     *,
     content: bytes | None = None,
     feature_schema_version: str = "thermal-features-v1",
+    capability: ArtifactCapability = ArtifactCapability.OBSERVATIONAL_REPLAY,
 ) -> ArtifactMetadata:
     body = payload(version) if content is None else content
     return ArtifactMetadata(
         kind=ArtifactKind.THERMAL_MODEL,
         artifact_format=ArtifactFormat.JSON,
+        capability=capability,
         model_id="rack-thermal",
         version=version,
         created_at="2026-09-18T10:00:00+09:00",
@@ -1600,3 +1603,95 @@ def test_loaded_trace_metadata_has_version_checksum_and_schema(tmp_path: Path) -
     assert trace["artifact_sha256"] == metadata("1.0.0").sha256
     assert trace["feature_schema_version"] == "thermal-features-v1"
     assert "authority_stage" not in trace, "Model Promotion と Authority Rollout を混同しない"
+
+
+def test_only_the_verification_path_issues_an_artifact_attestation(tmp_path: Path) -> None:
+    """**Registry を通った事実を、型で示せるようにする**（決定記録 0048 §2.4 / 0052 §2.1）。
+
+    `VerifiedArtifact` は誰でも組み立てられたため、その型であること自体は証明にならなかった。
+    発行できない `ArtifactAttestation` を必須にして、検証していない artifact を取り違えて
+    制御経路へ渡す配線ミスを止める。暗号的な保証ではない（決定記録 0050 §3）。
+    """
+    root = tmp_path / "registry"
+    registry = ModelRegistry(root, SimulatedClock(NOW_MS), limits=LIMITS)
+    register_and_validate(registry, "1.0.0")
+    promote(registry, "1.0.0")
+
+    loaded = registry.load_production(ArtifactKind.THERMAL_MODEL, COMPATIBILITY)
+
+    assert loaded.artifact is not None
+    attestation = loaded.artifact.attestation
+    assert attestation.model_id == "rack-thermal"
+    assert attestation.version == "1.0.0"
+    assert attestation.artifact_sha256 == metadata("1.0.0").sha256
+    assert attestation.kind is ArtifactKind.THERMAL_MODEL
+    assert attestation.authority_compatibility == (AuthorityStage.SHADOW, AuthorityStage.LIMITED)
+    assert attestation.registry_revision == registry.inspect().revision
+    assert attestation.trace_metadata()["artifact_sha256"] == metadata("1.0.0").sha256
+
+    with pytest.raises(TypeError, match="検証経路"):
+        registry_module.ArtifactAttestation()
+    with pytest.raises(TypeError, match="Registry の検証経路"):
+        registry_module.ArtifactAttestation._issue(metadata("1.0.0"), 0)
+    with pytest.raises(AttributeError, match="不変"):
+        attestation._model_id = "other"
+
+
+def test_a_verified_artifact_cannot_be_assembled_without_an_attestation(tmp_path: Path) -> None:
+    """証拠なしでは `VerifiedArtifact` を作れず、別 artifact の証拠も付け替えられない。"""
+    root = tmp_path / "registry"
+    registry = ModelRegistry(root, SimulatedClock(NOW_MS), limits=LIMITS)
+    register_and_validate(registry, "1.0.0")
+    register_and_validate(registry, "1.1.0")
+    promote(registry, "1.0.0")
+    loaded = registry.load_production(ArtifactKind.THERMAL_MODEL, COMPATIBILITY)
+    assert loaded.artifact is not None
+
+    with pytest.raises(ValidationError, match="attestation"):
+        registry_module.VerifiedArtifact(metadata=metadata("1.0.0"), payload=payload("1.0.0"))
+    with pytest.raises(ValidationError, match="別の artifact"):
+        registry_module.VerifiedArtifact(
+            metadata=metadata("1.1.0"),
+            payload=payload("1.1.0"),
+            attestation=loaded.artifact.attestation,
+        )
+
+
+def test_the_attestation_records_lifecycle_and_production_provenance(tmp_path: Path) -> None:
+    """**明示 version の読み込みを、そのまま制御へ配線できないようにする**（#86 / 0052 §2.1）。
+
+    `load_version()` は Replay / offline 評価のために候補・検証済み・引退も返す。attestation に
+    lifecycle と production pointer を載せ、active 制御側（#86）が要求できるようにする。
+    """
+    root = tmp_path / "registry"
+    registry = ModelRegistry(root, SimulatedClock(NOW_MS), limits=LIMITS)
+    register_and_validate(registry, "1.0.0")
+    register_and_validate(registry, "1.1.0")
+    promote(registry, "1.0.0")
+
+    production = registry.load_production(ArtifactKind.THERMAL_MODEL, COMPATIBILITY)
+    pinned_production = registry.load_version(metadata("1.0.0").ref, COMPATIBILITY)
+    pinned_validated = registry.load_version(metadata("1.1.0").ref, COMPATIBILITY)
+
+    assert production.artifact is not None
+    assert production.artifact.attestation.status is ArtifactStatus.PRODUCTION
+    assert production.artifact.attestation.production_active is True
+    # production pointer そのものを version 指定で読んだ場合も production として扱う。
+    assert pinned_production.artifact is not None
+    assert pinned_production.artifact.attestation.production_active is True
+    # promotion を経ていない artifact は、version を固定しても production にならない。
+    assert pinned_validated.artifact is not None
+    assert pinned_validated.artifact.attestation.status is ArtifactStatus.VALIDATED
+    assert pinned_validated.artifact.attestation.production_active is False
+    trace = pinned_validated.artifact.attestation.trace_metadata()
+    assert trace["artifact_status"] == "validated"
+    assert trace["production_active"] is False
+
+    with pytest.raises(ValueError, match="production pointer"):
+        registry_module.ArtifactAttestation._issue(
+            metadata("1.1.0"),
+            0,
+            status=ArtifactStatus.VALIDATED,
+            production_active=True,
+            _token=registry_module._ATTESTATION_ISSUE_TOKEN,
+        )

@@ -27,6 +27,35 @@ def guard_band(
     }
 
 
+def mpc_optimizer_config() -> dict[str, object]:
+    """#86 optimizer の暫定設定。値は実測前なのですべて provisional のままにする。"""
+    return {
+        "horizon_ms": provisional(60_000),
+        "step_ms": provisional(10_000),
+        "candidate_levels": provisional(5),
+        "sweeps": provisional(2),
+        "max_evaluations": provisional(64),
+        "max_step_up": provisional(0.2),
+        "max_step_down": provisional(0.1),
+        "zone_bounds": {
+            "front": {"floor": provisional(0.2), "ceiling": provisional(1.0)},
+            "rear": {"floor": provisional(0.2), "ceiling": provisional(1.0)},
+            "top": {"floor": provisional(0.2), "ceiling": provisional(1.0)},
+        },
+        "cost_scales": {
+            "temperature_c": provisional(5.0),
+            "balance_ratio": provisional(0.2),
+            "acoustic_cost": provisional(1.0),
+            "demand_change": provisional(0.1),
+        },
+        "cost_metrics": {
+            "cpu_temperature": "cpu.package",
+            "gpu_temperature": "gpu.0.core",
+        },
+        "unknown_balance_cost": provisional(1.0),
+    }
+
+
 def supervisor_config() -> dict[str, object]:
     target_band = {
         "cpu_temperature": {"lower_c": 45.0, "upper_c": 75.0},
@@ -178,7 +207,7 @@ def valid_documents() -> dict[str, dict[str, object]]:
             "watchdog_timeout_ms": provisional(5000),
         },
         "fan-policy.yaml": {
-            "schema_version": 6,
+            "schema_version": 7,
             "fallback_curve": [
                 {"temperature_c": 25.0, "demand": 0.3},
                 {"temperature_c": 80.0, "demand": 1.0},
@@ -223,7 +252,12 @@ def valid_documents() -> dict[str, dict[str, object]]:
                 "intake_rise_c": guard_band(2.0, 1.0, 1.5, 0.5),
                 "gpu_hotspot_c": guard_band(85.0, 80.0, 82.0, 78.0),
             },
-            "mpc": {"period_ms": 1000, "budget_ms": 100, "valid_ms": 2000},
+            "mpc": {
+                "period_ms": 1000,
+                "budget_ms": 100,
+                "valid_ms": 2000,
+                "optimizer": mpc_optimizer_config(),
+            },
             "supervisor": supervisor_config(),
             "workload_regime": {
                 "cpu_power": {
@@ -297,12 +331,12 @@ def load_config(tmp_path: Path) -> ControlConfig:
 def test_complete_config_has_traceable_sources_and_is_not_actuation_ready(tmp_path: Path) -> None:
     config = load_config(tmp_path)
 
-    assert CONTROL_CONFIG_VERSION == 6
+    assert CONTROL_CONFIG_VERSION == 7
     assert config.actuation_permitted is False
     metadata = config.trace_metadata()["control_config"]
     assert metadata["fan_hardware"]["name"] == "fan-hardware.yaml"
     assert metadata["safety"]["schema_version"] == 2
-    assert metadata["policy"]["schema_version"] == 6
+    assert metadata["policy"]["schema_version"] == 7
     assert len(metadata["safety"]["sha256"]) == 64
 
 
@@ -712,9 +746,9 @@ def test_v4_to_v5_migration_requires_explicit_supervisor_policy_values(tmp_path:
         ControlConfig.from_directory(tmp_path)
 
     documents["fan-policy.yaml"]["supervisor"] = supervisor
-    documents["fan-policy.yaml"]["schema_version"] = 6
+    documents["fan-policy.yaml"]["schema_version"] = 7
     write_documents(tmp_path, documents)
-    assert ControlConfig.from_directory(tmp_path).policy.schema_version == 6
+    assert ControlConfig.from_directory(tmp_path).policy.schema_version == 7
 
     del documents["fan-policy.yaml"]["supervisor"]["active_policy"]
     write_documents(tmp_path, documents)
@@ -765,3 +799,76 @@ def test_model_confidence_values_are_listed_as_provisional(tmp_path: Path) -> No
     assert "model_confidence.high_min_confidence" in paths
     assert "model_confidence.medium_limit.limit_down" in paths
     assert "model_confidence.residual_drift_ood_ratio" in paths
+
+
+def test_mpc_optimizer_horizon_must_be_a_whole_number_of_control_steps(tmp_path: Path) -> None:
+    """#86 の plan は等間隔の control step で予測時刻に対応する。端数を黙って丸めない。"""
+    documents = valid_documents()
+    documents["fan-policy.yaml"]["mpc"]["optimizer"]["horizon_ms"] = provisional(65_000)
+    write_documents(tmp_path, documents)
+
+    with pytest.raises(ValidationError, match="整数倍"):
+        ControlConfig.from_directory(tmp_path)
+
+
+def test_mpc_optimizer_zone_bounds_and_cost_scales_are_checked(tmp_path: Path) -> None:
+    """探索範囲の上下が逆なもの、0 除算になる基準量は起動前に拒否する。"""
+    documents = valid_documents()
+    documents["fan-policy.yaml"]["mpc"]["optimizer"]["zone_bounds"]["top"] = {
+        "floor": provisional(0.9),
+        "ceiling": provisional(0.5),
+    }
+    write_documents(tmp_path, documents)
+    with pytest.raises(ValidationError, match="ceiling"):
+        ControlConfig.from_directory(tmp_path)
+
+    documents = valid_documents()
+    documents["fan-policy.yaml"]["mpc"]["optimizer"]["cost_scales"]["temperature_c"] = provisional(
+        0.0
+    )
+    write_documents(tmp_path, documents)
+    with pytest.raises(ValidationError, match=r"cost_scales\.temperature_c"):
+        ControlConfig.from_directory(tmp_path)
+
+
+def test_mpc_validity_window_cannot_be_shorter_than_the_recalculation_period(
+    tmp_path: Path,
+) -> None:
+    """周期より短い有効期限では、健全な提案でも毎 tick 期限切れになる。"""
+    documents = valid_documents()
+    documents["fan-policy.yaml"]["mpc"]["valid_ms"] = 500
+    write_documents(tmp_path, documents)
+
+    with pytest.raises(ValidationError, match=r"mpc.valid_ms"):
+        ControlConfig.from_directory(tmp_path)
+
+
+def test_mpc_optimizer_cost_metrics_must_be_stored_and_distinct(tmp_path: Path) -> None:
+    """metric 名をコードに埋めない代わりに、設定側で保存対象かどうかを検証する。"""
+    documents = valid_documents()
+    documents["fan-policy.yaml"]["mpc"]["optimizer"]["cost_metrics"]["cpu_temperature"] = (
+        "gpu.0.core"
+    )
+    write_documents(tmp_path, documents)
+    with pytest.raises(ValidationError, match="別の metric"):
+        ControlConfig.from_directory(tmp_path)
+
+    documents = valid_documents()
+    documents["fan-policy.yaml"]["mpc"]["optimizer"]["cost_metrics"]["gpu_temperature"] = (
+        "Not.A.Metric"
+    )
+    write_documents(tmp_path, documents)
+    with pytest.raises(ValidationError):
+        ControlConfig.from_directory(tmp_path)
+
+
+def test_provisional_values_list_the_new_mpc_optimizer_settings(tmp_path: Path) -> None:
+    """実測前の #86 の値も、位置と根拠だけを起動ログへ出せるようにする。"""
+    paths = {item.path for item in load_config(tmp_path).provisional_values()}
+
+    assert "mpc.optimizer.horizon_ms" in paths
+    assert "mpc.optimizer.step_ms" in paths
+    assert "mpc.optimizer.cost_scales.temperature_c" in paths
+    assert "mpc.optimizer.zone_bounds.top.ceiling" in paths
+    # 値そのものは出さない（ProvisionalConfigValue は path と basis だけを持つ）。
+    assert all(not hasattr(item, "value") for item in load_config(tmp_path).provisional_values())

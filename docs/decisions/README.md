@@ -120,3 +120,4 @@ docs/decisions/NNNN-<slug>.md      例: 0002-metric-naming.md
 | [0049](0049-internal-telemetry-source-kind.md) | 内部テレメトリの出どころの種類（`sys.telemetry_kind`: hardware / mock）を記録し、いまの値にだけ「実測」と書く | FINAL |
 | [0050](0050-model-confidence-ood-and-authority.md) | Model Confidence / OOD の判定方式と confidence に応じた Authority 制限 | FINAL |
 | [0051](0051-airflow-cpu-utilization-display.md) | エアフロー画面の CPU 使用率の表示（`cpu.utilization` と「未計測」の判断） | FINAL |
+| [0052](0052-learned-mpc-optimizer-and-hard-constraints.md) | Learned MPC optimizer の内部モデル要件（反実仮想 capability）と Hard Constraints の扱い | FINAL |

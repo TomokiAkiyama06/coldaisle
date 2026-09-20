@@ -114,6 +114,35 @@ def supervisor_config() -> dict[str, object]:
     }
 
 
+def mpc_optimizer_config() -> dict[str, object]:
+    """#86 optimizer の暫定設定。値は実測前なのですべて provisional のままにする。"""
+    return {
+        "horizon_ms": provisional(60_000),
+        "step_ms": provisional(10_000),
+        "candidate_levels": provisional(5),
+        "sweeps": provisional(2),
+        "max_evaluations": provisional(64),
+        "max_step_up": provisional(0.2),
+        "max_step_down": provisional(0.1),
+        "zone_bounds": {
+            "front": {"floor": provisional(0.2), "ceiling": provisional(1.0)},
+            "rear": {"floor": provisional(0.2), "ceiling": provisional(1.0)},
+            "top": {"floor": provisional(0.2), "ceiling": provisional(1.0)},
+        },
+        "cost_scales": {
+            "temperature_c": provisional(5.0),
+            "balance_ratio": provisional(0.2),
+            "acoustic_cost": provisional(1.0),
+            "demand_change": provisional(0.1),
+        },
+        "cost_metrics": {
+            "cpu_temperature": "cpu.package",
+            "gpu_temperature": "gpu.0.core",
+        },
+        "unknown_balance_cost": provisional(1.0),
+    }
+
+
 def policy(
     *,
     authority: str = "full",
@@ -124,9 +153,10 @@ def policy(
     high_min_confidence: float = 0.85,
     medium_limit_up: float = 0.1,
     medium_limit_down: float = 0.05,
+    mpc: dict[str, object] | None = None,
 ) -> FanPolicyConfig:
     document: dict[str, object] = {
-        "schema_version": 6,
+        "schema_version": 7,
         "fallback_curve": [
             {"temperature_c": 20.0, "demand": 0.2},
             {"temperature_c": 80.0, "demand": 0.8},
@@ -148,7 +178,13 @@ def policy(
             "intake_rise_c": guard_band(2.0, 1.0, 1.5, 0.5),
             "gpu_hotspot_c": guard_band(85.0, 80.0, 82.0, 78.0),
         },
-        "mpc": {"period_ms": 1_000, "budget_ms": 100, "valid_ms": 2_000},
+        "mpc": mpc
+        or {
+            "period_ms": 1_000,
+            "budget_ms": 100,
+            "valid_ms": 2_000,
+            "optimizer": mpc_optimizer_config(),
+        },
         "supervisor": supervisor_config(),
         "workload_regime": {
             "cpu_power": {
