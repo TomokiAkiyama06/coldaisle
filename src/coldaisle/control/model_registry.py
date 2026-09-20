@@ -37,7 +37,7 @@ from pydantic import (
 from coldaisle.clock import Clock, WallClock
 from coldaisle.control.schema import AuthorityStage
 
-MODEL_REGISTRY_SCHEMA_VERSION: Literal[2] = 2
+MODEL_REGISTRY_SCHEMA_VERSION: Literal[3] = 3
 MODEL_REGISTRY_CONFIG_FILENAME = "model-registry.yaml"
 
 _STATE_FILENAME = "registry.json"
@@ -170,14 +170,19 @@ class ArtifactRef(_Frozen):
 class ArtifactMetadata(_Frozen):
     """Training, compatibility, evaluation, and integrity metadata."""
 
-    schema_version: Literal[2] = MODEL_REGISTRY_SCHEMA_VERSION
+    schema_version: Literal[3] = MODEL_REGISTRY_SCHEMA_VERSION
     kind: ArtifactKind
     artifact_format: ArtifactFormat
     capability: ArtifactCapability
     """この artifact が主張する能力。**登録時に申告し、既定値を持たない。**
 
-    v1 の metadata には無かったため schema version を 2 へ上げる。既定値を補って読むと、
+    v1 の metadata には無かったため schema version を 2 へ上げた。既定値を補って読むと、
     能力を申告していない artifact が「反実仮想もできる」側に倒れる余地を残してしまう。
+
+    v3 で `supervisor_strategy` を足した（#89 / 決定記録 0061 §2.1）。**列挙は閉じている**
+    ので、値が1つ増えた snapshot は古い読み手が復号できない。復号できないと
+    `INVALID_REGISTRY` になり registry 全体が読めなくなるため、**加算だからと版を据え置か
+    ない。** 版を上げることで「この snapshot は新しい読み手が要る」を明示する。
     """
     model_id: str = Field(pattern=_IDENTIFIER_PATTERN, max_length=120)
     version: str = Field(pattern=_SEMVER_PATTERN, max_length=80)
@@ -363,7 +368,7 @@ def _validate_member[ModelT: BaseModel](model: type[ModelT], value: object) -> M
 class RegistrySnapshot(_Frozen):
     """Atomically replaced complete registry state."""
 
-    schema_version: Literal[2] = MODEL_REGISTRY_SCHEMA_VERSION
+    schema_version: Literal[3] = MODEL_REGISTRY_SCHEMA_VERSION
     revision: int = Field(ge=0)
     artifacts: dict[str, ArtifactRecord] = Field(default_factory=dict)
     production: dict[ArtifactKind, ProductionSlot] = Field(default_factory=dict)

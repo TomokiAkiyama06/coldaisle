@@ -7,6 +7,7 @@ to ``SupervisorCoordinator``; it never waits for or directly invokes RL inferenc
 from __future__ import annotations
 
 from collections.abc import Sequence
+from enum import StrEnum
 from typing import Protocol, Self
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -68,6 +69,26 @@ class SupervisorInput(_Frozen):
             previous_tick_id = snapshot.tick_id
 
 
+class SupervisorOutputOrigin(StrEnum):
+    """その提案を作った policy が、**どの用途で束縛されていたか**（#89 / 決定記録 0061 §2.4）。
+
+    **出力そのものに用途を持たせる。** `SupervisorOutput` は strategy / weights / target band
+    しか持たないので、shadow 用に束縛した policy の出力と active 用の出力が**値として
+    見分けられない**。用途が値に付いて回らないと、shadow の提案を active slot へ渡す
+    配線ミスを Coordinator が止められない。
+    """
+
+    ACTIVE_BINDING = "active_binding"
+    """active slot として束縛した policy の出力。**いまこの値を発行できる経路は無い**
+
+    （`SupervisorPolicyBinding.for_active` が閉じているため。決定記録 0061 §2.4）。
+    """
+    SHADOW_BINDING = "shadow_binding"
+    """比較のためだけに束縛した policy の出力。**active slot では受け取らない。**"""
+    UNVERIFIED = "unverified"
+    """用途を名乗っていない出力。既定値で、**active slot では受け取らない**（fail closed）。"""
+
+
 class ReceivedSupervisorOutput(_Frozen):
     """worker output と、control loop 自身の単調時計で記録した元 snapshot 時刻・受信時刻。
 
@@ -79,6 +100,14 @@ class ReceivedSupervisorOutput(_Frozen):
     output: SupervisorOutput
     source_monotonic_ms: int = Field(ge=0)
     received_monotonic_ms: int = Field(ge=0)
+    origin: SupervisorOutputOrigin = SupervisorOutputOrigin.UNVERIFIED
+    """提案を作った policy の束縛用途。**既定は `unverified` で、active slot を通らない。**
+
+    値は `RegimeTableRlPolicy.deliver()` が束縛から写す。手で組み立てて
+    `active_binding` を名乗ることはできてしまうが、それは同一プロセス内の偽造という
+    既知の残余リスク（決定記録 0050 §3）と同じ扱いである。狙いは**配線の誤りを型で
+    止めること**で、shadow 用の policy を active slot へ繋いだ構成が黙って通らなくなる。
+    """
 
     @model_validator(mode="after")
     def _source_precedes_receipt(self) -> Self:
@@ -194,16 +223,21 @@ class SupervisorCoordinator:
                 now_monotonic_ms=now_monotonic_ms,
                 candidate=rl_candidate,
                 worker_error=rl_error,
+                # **active slot は active 用に束縛した提案だけを受け取る**（0061 §2.4）。
+                require_active_origin=True,
             )
             fallback = self._evaluate_rule(policy_input) if active.output is None else None
 
         shadow = None
         if self._config.shadow_policy is SupervisorPolicyKind.RL:
+            # shadow は MPC にも Fan にも届かない（0053 §2.3）ので、用途を問わず記録する。
+            # 問わないと、昇格前の候補を観測できず、昇格に要る証拠を集められない。
             shadow = self._evaluate_rl(
                 policy_input,
                 now_monotonic_ms=now_monotonic_ms,
                 candidate=rl_candidate,
                 worker_error=rl_error,
+                require_active_origin=False,
             )
 
         return SupervisorDecision(
@@ -236,6 +270,7 @@ class SupervisorCoordinator:
         now_monotonic_ms: int,
         candidate: ReceivedSupervisorOutput | None,
         worker_error: Reason | None,
+        require_active_origin: bool,
     ) -> SupervisorPolicyEvaluation:
         if candidate is None:
             return SupervisorPolicyEvaluation(
@@ -245,6 +280,19 @@ class SupervisorCoordinator:
             )
         received = candidate.received_monotonic_ms
         source = candidate.source_monotonic_ms
+        if require_active_origin and candidate.origin is not SupervisorOutputOrigin.ACTIVE_BINDING:
+            # **用途を名乗らない提案を active にしない**（fail closed）。shadow 用に束縛した
+            # policy の出力を active slot へ繋いだ構成は、ここで Rule へ落ちる。
+            return SupervisorPolicyEvaluation(
+                policy=SupervisorPolicyKind.RL,
+                error=Reason(
+                    code="supervisor_origin_not_active",
+                    detail="active slot に active 用でない提案が届いた"
+                    f"（origin={candidate.origin.value}）",
+                ),
+                received_monotonic_ms=received,
+                source_monotonic_ms=source,
+            )
         if received > now_monotonic_ms:
             return SupervisorPolicyEvaluation(
                 policy=SupervisorPolicyKind.RL,

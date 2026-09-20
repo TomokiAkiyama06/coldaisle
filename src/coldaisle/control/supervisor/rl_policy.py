@@ -13,10 +13,22 @@
 の3つで決める。同一プロセス内の悪意ある偽造までは防げない（決定記録 0050 §3）。狙いは
 **配線の誤りを型で止めること**である。
 
-**いま active authority を得られる RL policy は存在しない。** `for_active` は
-「反実仮想の裏づけのある学習で選ばれたこと」を要求し、反実仮想能力を申告した thermal
-artifact が1つも無い以上（決定記録 0048 §2.1 / 0052 §2.1 / 0058 §3）、この条件は
-決定論的に満たせない。拒否は不具合ではなく意図した振る舞いである。
+**active への門は閉じている。** `for_active` は**入力を一切見ずに拒否する**。
+
+policy artifact が「反実仮想の裏づけがあった」と書いていても、それは artifact の**自称**で
+あって証拠ではない（0061 §2.3）。自称を門の条件にすると、この package がほかの場所で
+閉じたのと同じ穴——自称を根拠として読む——をここで開けることになる。裏づけを**検証できる
+形**（環境が封をした `DynamicsEvidence` の系譜、または Registry が反実仮想能力を申告した
+artifact の attestation）で受け取る手立ては、いまの依存関係では用意できない
+（`control.supervisor` は `control.rl` を import できない。循環になる）。
+
+そこで門は開けたままにせず、**閉じたことを1か所に書く**。反実仮想能力を申告した thermal
+artifact が1つも無い以上（決定記録 0048 §2.1 / 0052 §2.1 / 0058 §3）、いま通してよい
+policy はそもそも存在しない。**門を開く条件は未決で、決定記録と所有者の承認が要る**
+（0061 §5）。
+
+**出力には束縛の用途が付いて回る。** `deliver()` が `SupervisorOutputOrigin` を写すので、
+shadow 用に束縛した policy の出力を active slot へ繋いだ構成は Coordinator で Rule へ落ちる。
 """
 
 from __future__ import annotations
@@ -46,7 +58,11 @@ from coldaisle.control.supervisor.artifact import (
     canonical_policy_artifact_bytes,
     policy_registry_metadata,
 )
-from coldaisle.control.supervisor.policy import SupervisorInput
+from coldaisle.control.supervisor.policy import (
+    ReceivedSupervisorOutput,
+    SupervisorInput,
+    SupervisorOutputOrigin,
+)
 
 _BINDING_TOKEN = object()
 """`SupervisorPolicyBinding` の発行境界。
@@ -77,7 +93,11 @@ class PolicyBindingIntent(StrEnum):
     SHADOW = "shadow"
     """比較のためだけに提案を作る。MPC の入力にならない（0053 §2.3）。"""
     ACTIVE = "active"
-    """active slot として Supervisor 出力に使う。**反実仮想の裏づけを要求する。**"""
+    """active slot として Supervisor 出力に使う。**いまこの値を持つ束は発行されない。**
+
+    `for_active` が開かない門なので、ここへ到達する経路は存在しない。値を残してあるのは、
+    `SupervisorOutputOrigin` との対応と「閉じている」という事実を1か所に置くためである。
+    """
 
 
 def check_action_space(artifact: SupervisorPolicyArtifact, bounds: SupervisorOutputBounds) -> None:
@@ -154,21 +174,26 @@ class SupervisorPolicyBinding:
         bounds: SupervisorOutputBounds,
         authority_stage: AuthorityStage,
     ) -> SupervisorPolicyBinding:
-        """active slot として使う束を作る。**いまは必ず拒否される。**
+        """active slot として使う束を作る。**入力を見ずに必ず拒否する。**
 
-        `authority_stage` は**いま与えられている実効 stage**（#92 / 決定記録 0057 §2.2）で、
-        `fan-policy.yaml` の上限ではない。
+        **artifact の自称を門の条件にしない。** `training_evidence.counterfactual_backed` は
+        artifact が自分で書いた値で、証拠ではない（0061 §2.3）。自称で開く門は、
+        自称を書き換えれば開く門である。
 
-        production pointer であること（人の承認を経たこと）に加えて、
-        **反実仮想の裏づけのある学習で選ばれたこと**を要求する。裏づけの無い policy を
-        active にすると、action が demand に効かない条件で選ばれた戦略が運転へ出る。
+        検証できる形で裏づけを受け取る手立ては、いまの依存関係では用意できない
+        （`control.supervisor` は `control.rl` を import できないので、環境が封をした
+        `DynamicsEvidence` の系譜をここで確かめられない）。そして反実仮想能力を申告した
+        thermal artifact は1つも存在しないので、**いま通してよい policy もそもそも無い**
+        （決定記録 0048 §2.1 / 0052 §2.1 / 0058 §3）。
+
+        したがって、ここは**開かない門**である。開く条件——何をもって裏づけとみなし、
+        誰がそれを発行するか——は未決で、決定記録と所有者の承認が要る（0061 §5）。
         """
-        return cls._bind(
-            verified,
-            expected_policy_version=expected_policy_version,
-            bounds=bounds,
-            intent=PolicyBindingIntent.ACTIVE,
-            authority_stage=authority_stage,
+        del verified, expected_policy_version, bounds, authority_stage
+        raise SupervisorPolicyUnusableError(
+            "RL Supervisor policy を active slot へ束縛できない。"
+            "反実仮想の裏づけを検証できる経路がまだ無く、artifact の自称は根拠にしない"
+            "（決定記録 0048 §2.1 / 0058 §3 / 0061 §2.4）"
         )
 
     @classmethod
@@ -220,18 +245,6 @@ class SupervisorPolicyBinding:
                 f"（stage={authority_stage.value}）"
             )
         check_action_space(artifact, bounds)
-        if intent is PolicyBindingIntent.ACTIVE:
-            if not attestation.production_active:
-                raise SupervisorPolicyUnusableError(
-                    "production pointer でない policy artifact を active にしない"
-                    f"（status={attestation.status.value}）"
-                )
-            if not manifest.training_evidence.counterfactual_backed:
-                # 決定記録 0058 §3: 反実仮想 artifact が揃うまで、この条件は満たせない。
-                raise SupervisorPolicyUnusableError(
-                    "反実仮想の裏づけの無い policy を active にしない"
-                    "（決定記録 0058 §3 / 0061 §2.4）"
-                )
         binding = object.__new__(cls)
         object.__setattr__(binding, "_artifact", artifact)
         object.__setattr__(
@@ -325,6 +338,13 @@ class SupervisorPolicyBinding:
     def authority_stage(self) -> AuthorityStage:
         """束縛時に要求した実効 stage。"""
         return self._authority_stage
+
+    @property
+    def origin(self) -> SupervisorOutputOrigin:
+        """この束から出る提案が名乗る用途。**束縛の意図をそのまま写す。**"""
+        if self._intent is PolicyBindingIntent.ACTIVE:  # pragma: no cover - 門が閉じている
+            return SupervisorOutputOrigin.ACTIVE_BINDING
+        return SupervisorOutputOrigin.SHADOW_BINDING
 
     @property
     def model_version(self) -> str:
@@ -430,6 +450,36 @@ class RegimeTableRlPolicy:
     def artifact(self) -> SupervisorPolicyArtifact:
         """束縛した policy artifact。"""
         return self._artifact
+
+    @property
+    def origin(self) -> SupervisorOutputOrigin:
+        """この policy の出力が名乗る用途。
+
+        Registry を通さずに作った instance（`offline`）は `unverified` で、
+        **Coordinator の active slot を通らない**（決定記録 0061 §2.4）。
+        """
+        if self._binding is None:
+            return SupervisorOutputOrigin.UNVERIFIED
+        return self._binding.origin
+
+    def deliver(
+        self,
+        policy_input: SupervisorInput,
+        *,
+        received_monotonic_ms: int,
+    ) -> ReceivedSupervisorOutput:
+        """提案を、**用途を付けた**受信済みの形で返す。
+
+        worker から control loop へ渡す値をこの1か所で組み立てる。呼び出し側が
+        `origin` を選べないので、shadow 用に束縛した policy の提案が
+        `active_binding` を名乗って active slot へ届くことがない。
+        """
+        return ReceivedSupervisorOutput(
+            output=self.propose(policy_input),
+            source_monotonic_ms=policy_input.snapshot.monotonic_ms,
+            received_monotonic_ms=received_monotonic_ms,
+            origin=self.origin,
+        )
 
     def propose(self, policy_input: SupervisorInput) -> SupervisorOutput:
         """観測した regime に対応する戦略 context を返す。**Demand を含まない。**"""

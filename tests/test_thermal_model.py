@@ -1167,7 +1167,9 @@ def test_runtime_expectation_is_bound_to_identity_schema_and_shadow():
         load_registry_model(artifact_bytes, expected=forged_expectation)
 
     bridged = json.loads(registry_metadata_json_bytes(metadata))
-    # #104 の metadata が capability を持つようになった版（決定記録 0052 §2.1）。
-    assert bridged["schema_version"] == 2
+    # #104 の metadata の版をそのまま写す（lockstep）。v2 で capability が入り
+    # （決定記録 0052 §2.1）、v3 で `supervisor_strategy` が足された（決定記録 0061 §2.1）。
+    # この module は #104 を stub するので、版は定数を import せず値で確かめる。
+    assert bridged["schema_version"] == 3
     assert bridged["capability"] == "observational_replay"
     assert bridged["kind"] == "thermal_model"

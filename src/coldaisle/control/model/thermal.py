@@ -493,7 +493,14 @@ class ThermalModelArtifact(_Frozen):
 class ThermalRegistryMetadata(_Frozen):
     """Values that map one-to-one to #104 ``ArtifactMetadata``."""
 
-    schema_version: Literal[2] = 2
+    schema_version: Literal[3] = 3
+    """#104 ``ArtifactMetadata`` の版をそのまま写す。**lockstep にする。**
+
+    この型は Registry metadata の写しなので、版がずれると読み込みが落ちる（落ちるのは
+    正しい: 写しのつもりで別の契約を読んでいる）。#104 が v3 へ上がったのは
+    `ArtifactCapability` に `supervisor_strategy` を足したためで（#89 / 決定記録 0061 §2.1）、
+    thermal model 側の欄は何も変わっていない。
+    """
     kind: Literal["thermal_model"] = "thermal_model"
     artifact_format: Literal["json"] = "json"
     capability: InferenceCapability

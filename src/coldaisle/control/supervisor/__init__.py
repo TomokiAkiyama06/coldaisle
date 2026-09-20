@@ -26,6 +26,7 @@ from coldaisle.control.supervisor.policy import (
     ShadowRLPolicy,
     SupervisorCoordinator,
     SupervisorInput,
+    SupervisorOutputOrigin,
     SupervisorPolicy,
 )
 from coldaisle.control.supervisor.policy_config import (
@@ -91,6 +92,7 @@ __all__ = [
     "ShadowRLPolicy",
     "SupervisorCoordinator",
     "SupervisorInput",
+    "SupervisorOutputOrigin",
     "SupervisorPolicy",
     "SupervisorPolicyArtifact",
     "SupervisorPolicyBinding",

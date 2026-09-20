@@ -37,6 +37,7 @@ from coldaisle.control.supervisor import (
     ShadowRLPolicy,
     SupervisorCoordinator,
     SupervisorInput,
+    SupervisorOutputOrigin,
     WorkloadRegimeEstimate,
 )
 
@@ -189,14 +190,21 @@ def rl_candidate(
     received_mono: int = 10_000,
     *,
     source: SupervisorInput | None = None,
+    binding_origin: SupervisorOutputOrigin = SupervisorOutputOrigin.ACTIVE_BINDING,
 ) -> ReceivedSupervisorOutput:
-    """``source``（既定は現在）の snapshot から作った RL 提案を、受信済みの形にする。"""
+    """``source``（既定は現在）の snapshot から作った RL 提案を、受信済みの形にする。
+
+    `binding_origin` の既定を `active_binding` にしているのは、鮮度や範囲の試験が
+    用途の検査で先に落ちないようにするためである。用途そのものの検査は
+    `test_the_active_slot_refuses_output_that_is_not_bound_for_active` が行う。
+    """
     origin = source or current
     shadow = ShadowRLPolicy(FakeRLPolicy(SimulatedClock(BASE_TS_MS)))
     return ReceivedSupervisorOutput(
         output=shadow.propose(origin),
         source_monotonic_ms=origin.snapshot.monotonic_ms,
         received_monotonic_ms=received_mono,
+        origin=binding_origin,
     )
 
 
@@ -345,6 +353,7 @@ def test_rl_proposal_from_a_future_tick_is_rejected(active: str) -> None:
             output=future,
             source_monotonic_ms=10_000,
             received_monotonic_ms=10_000,
+            origin=SupervisorOutputOrigin.ACTIVE_BINDING,
         ),
     )
 
@@ -354,6 +363,44 @@ def test_rl_proposal_from_a_future_tick_is_rejected(active: str) -> None:
     assert "未来" in rl.error.detail
     assert decision.selected_output is not None
     assert decision.selected_output.policy is SupervisorPolicyKind.RULE
+
+
+@pytest.mark.parametrize(
+    "origin",
+    [SupervisorOutputOrigin.UNVERIFIED, SupervisorOutputOrigin.SHADOW_BINDING],
+)
+def test_the_active_slot_refuses_output_that_is_not_bound_for_active(
+    origin: SupervisorOutputOrigin,
+) -> None:
+    """**用途は値に付いて回る。** shadow 用・用途なしの提案を active slot で使わない。
+
+    `SupervisorOutput` は strategy / weights / target band しか持たないので、shadow 用に
+    束縛した policy の出力と active 用の出力は**値として見分けられない**。用途を
+    `ReceivedSupervisorOutput` に持たせ、active slot では `active_binding` 以外を
+    Rule へ落とす（fail closed。#89 / 決定記録 0061 §2.4）。
+    """
+    current = policy_input()
+    candidate = rl_candidate(current, binding_origin=origin)
+
+    active = SupervisorCoordinator(
+        config(active="rl_policy", shadow=None), SimulatedClock(BASE_TS_MS)
+    ).evaluate(current, now_monotonic_ms=10_000, rl_candidate=candidate)
+
+    assert active.active.output is None
+    assert active.active.error is not None
+    assert active.active.error.code == "supervisor_origin_not_active"
+    assert active.fallback is not None and active.fallback.output is not None
+    assert active.selected_output is active.fallback.output
+    assert active.selected_output.policy is SupervisorPolicyKind.RULE
+
+    # shadow は MPC にも Fan にも届かないので、用途を問わず記録する。問うと、昇格前の
+    # 候補を観測できず、昇格に要る証拠をそもそも集められない（決定記録 0053 §2.3）。
+    shadowed = SupervisorCoordinator(config(), SimulatedClock(BASE_TS_MS)).evaluate(
+        current, now_monotonic_ms=10_000, rl_candidate=candidate
+    )
+
+    assert shadowed.shadow is not None and shadowed.shadow.output is not None
+    assert shadowed.active.output is shadowed.selected_output
 
 
 def test_older_rl_proposal_is_rejected_when_the_regime_has_changed_since() -> None:
@@ -401,6 +448,7 @@ def test_expired_or_stopped_rl_falls_back_to_rule_without_using_wall_clock() -> 
             output=expired_output,
             source_monotonic_ms=7_999,
             received_monotonic_ms=7_999,
+            origin=SupervisorOutputOrigin.ACTIVE_BINDING,
         ),
     )
     stopped = coordinator.evaluate(current, now_monotonic_ms=10_000)

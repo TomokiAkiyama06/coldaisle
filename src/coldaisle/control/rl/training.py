@@ -136,6 +136,14 @@ class CandidateOutcome(_Frozen):
     candidate_id: str = Field(pattern=r"^[a-z0-9][a-z0-9_.-]*$", max_length=120)
     policy_version: str = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9_.-]*$", max_length=120)
     comparable: bool
+    """**policy どうしを実際に比べられたか。**
+
+    条件や母集団が揃わず `PolicyComparison` を作れなかった候補だけでなく、
+    **Learned MPC を束縛できていなかった run も `False`** にする。束縛できていなければ
+    action が demand に効かず、全 arm の requested が同一になるので、比較そのものが
+    成立していない（決定記録 0058 §2.1 / §3）。`True` で絞った読み手が
+    「policy を比較した結果」だけを受け取れるようにする。
+    """
     rejection: Reason | None = None
     safety_violations: int = Field(ge=0)
     invalid_actions: int = Field(ge=0)
@@ -477,6 +485,29 @@ class SupervisorPolicyTrainer:
                     improved=False,
                 ),
                 None,
+            )
+        if not comparison.learned_controller_available:
+            # **policy を比べていない。** Learned MPC を束縛できていない episode 群では
+            # action が demand に効かないので、全 arm の requested が同一になる
+            # （決定記録 0058 §2.1 / §3）。`comparable=True` のまま並べると、この欄で
+            # 絞った読み手が「policy を比較した結果だ」と受け取ってしまう。
+            return (
+                CandidateOutcome(
+                    candidate_id=identifier,
+                    policy_version=version,
+                    comparable=False,
+                    rejection=Reason(
+                        code="learned_controller_unavailable",
+                        detail=(
+                            "Learned MPC を束縛できていないので action が demand に効かない。"
+                            "候補間の差を測っていない（決定記録 0058 §3）"
+                        ),
+                    ),
+                    safety_violations=arm.safety_violations,
+                    invalid_actions=arm.invalid_actions,
+                    improved=False,
+                ),
+                arm,
             )
         key = comparison.ranking_key(arm)
         baseline_key = comparison.ranking_key(baseline_arm)

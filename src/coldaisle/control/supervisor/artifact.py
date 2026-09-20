@@ -34,7 +34,10 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 
 from coldaisle.control.config import SupervisorOutputBounds
 from coldaisle.control.model.thermal import canonical_json_bytes, canonical_sha256
-from coldaisle.control.model_registry import ArtifactCapability
+from coldaisle.control.model_registry import (
+    MODEL_REGISTRY_SCHEMA_VERSION,
+    ArtifactCapability,
+)
 from coldaisle.control.schema import (
     STAGE_ORDER,
     AuthorityStage,
@@ -296,7 +299,7 @@ class SupervisorPolicyArtifact(_Frozen):
 class SupervisorPolicyRegistryMetadata(_Frozen):
     """#104 `ArtifactMetadata` へ1対1で写せる値。**artifact bytes から導く。**"""
 
-    schema_version: Literal[2] = 2
+    schema_version: Literal[3] = MODEL_REGISTRY_SCHEMA_VERSION
     kind: Literal["supervisor_policy"] = "supervisor_policy"
     artifact_format: Literal["json"] = "json"
     capability: Literal[ArtifactCapability.SUPERVISOR_STRATEGY] = (

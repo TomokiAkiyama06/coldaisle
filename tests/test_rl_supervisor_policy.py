@@ -65,6 +65,7 @@ from coldaisle.control.schema import (
 from coldaisle.control.state import ControlStateSnapshot, TelemetryHealth
 from coldaisle.control.supervisor import (
     PolicyArtifactVerification,
+    PolicyBindingIntent,
     PolicySearchHyperparameters,
     PolicyTrainingEvidence,
     ReceivedSupervisorOutput,
@@ -76,6 +77,7 @@ from coldaisle.control.supervisor import (
     ShadowRLPolicy,
     SupervisorCoordinator,
     SupervisorInput,
+    SupervisorOutputOrigin,
     SupervisorPolicyArtifact,
     SupervisorPolicyBinding,
     SupervisorPolicyManifest,
@@ -526,12 +528,16 @@ def test_invariant_8_binding_requires_the_same_action_space(
         )
 
 
-def test_invariant_9_active_binding_requires_production_and_counterfactual_evidence(
+def test_invariant_9_the_active_gate_is_closed_and_never_reads_the_self_claim(
     tmp_path: Path, bounds: SupervisorOutputBounds
 ) -> None:
-    """**いま active authority を得られる RL policy は存在しない**（決定記録 0058 §3）。"""
+    """**active への門は開かない。** artifact の自称で開く門を作らない。
+
+    `counterfactual_backed` は artifact が自分で書いた値である。自称を門の条件にすると、
+    自称を書き換えれば開く門になる。だから門は入力を見ずに閉じる（決定記録 0061 §2.4）。
+    """
     candidate = register_policy(tmp_path / "pr89-candidate", artifact(bounds))
-    with pytest.raises(SupervisorPolicyUnusableError, match="production pointer"):
+    with pytest.raises(SupervisorPolicyUnusableError, match="active slot へ束縛できない"):
         SupervisorPolicyBinding.for_active(
             candidate,
             expected_policy_version="0.1.0",
@@ -539,21 +545,82 @@ def test_invariant_9_active_binding_requires_production_and_counterfactual_evide
             authority_stage=AuthorityStage.SHADOW,
         )
 
+    # **昇格済みでも、裏づけを自称していても開かない。** 自称を読んでいない証拠として、
+    # 「通りそうな」artifact を2通り用意しても同じ理由で拒まれることを確かめる。
     promoted = register_policy(tmp_path / "pr89-promoted", artifact(bounds), promoted=True)
-    with pytest.raises(SupervisorPolicyUnusableError, match="反実仮想の裏づけの無い"):
-        SupervisorPolicyBinding.for_active(
-            promoted,
-            expected_policy_version="0.1.0",
-            bounds=bounds,
-            authority_stage=AuthorityStage.SHADOW,
-        )
+    claiming = artifact(
+        bounds,
+        training_evidence=evidence(
+            counterfactual_backed=True,
+            learned_controller_available=True,
+            promotable_episodes=2,
+            improved_over_baseline=True,
+        ),
+        authority_compatibility=(AuthorityStage.SHADOW, AuthorityStage.LIMITED),
+    )
+    claimed = register_policy(
+        tmp_path / "pr89-claimed",
+        claiming,
+        authority=(AuthorityStage.SHADOW, AuthorityStage.LIMITED),
+        stage=AuthorityStage.LIMITED,
+        promoted=True,
+    )
+    for verified in (promoted, claimed):
+        with pytest.raises(SupervisorPolicyUnusableError, match="自称は根拠にしない"):
+            SupervisorPolicyBinding.for_active(
+                verified,
+                expected_policy_version="0.1.0",
+                bounds=bounds,
+                authority_stage=AuthorityStage.LIMITED,
+            )
 
     # shadow は昇格前の candidate をそのまま回せる。回せないと証拠を集められない。
     binding = SupervisorPolicyBinding.for_shadow(
         candidate, expected_policy_version="0.1.0", bounds=bounds
     )
-    assert binding.intent.value == "shadow"
-    assert binding.conditions()["counterfactual_backed"] is False
+    assert binding.intent is PolicyBindingIntent.SHADOW
+    assert binding.origin is SupervisorOutputOrigin.SHADOW_BINDING
+
+
+def test_invariant_9_b_a_shadow_bound_policy_cannot_reach_the_active_slot(
+    tmp_path: Path, bounds: SupervisorOutputBounds
+) -> None:
+    """**用途が値に付いて回る。** shadow 用の policy の提案は active slot を通らない。"""
+    settings = shadow_settings(mpc_policy(), rl_version="0.1.0")
+    verified = register_policy(tmp_path / "pr89-origin", artifact(bounds))
+    policy = RegimeTableRlPolicy.from_binding(
+        SupervisorPolicyBinding.for_shadow(
+            verified, expected_policy_version="0.1.0", bounds=bounds
+        ),
+        SimulatedClock(0),
+    )
+    assert policy.origin is SupervisorOutputOrigin.SHADOW_BINDING
+
+    policy_input = supervisor_input()
+    candidate = policy.deliver(
+        policy_input, received_monotonic_ms=policy_input.snapshot.monotonic_ms
+    )
+    assert candidate.origin is SupervisorOutputOrigin.SHADOW_BINDING
+
+    active_settings = SupervisorConfig.model_validate(
+        settings.supervisor.model_dump(mode="python")
+        | {"active_policy": SupervisorPolicyKind.RL, "shadow_policy": None}
+    )
+    decision = SupervisorCoordinator(active_settings, SimulatedClock(0)).evaluate(
+        policy_input,
+        now_monotonic_ms=policy_input.snapshot.monotonic_ms,
+        rl_candidate=candidate,
+    )
+
+    assert decision.active.output is None
+    assert decision.active.error is not None
+    assert decision.active.error.code == "supervisor_origin_not_active"
+    assert decision.selected_output is not None
+    assert decision.selected_output.policy is SupervisorPolicyKind.RULE
+
+    # Registry を通さない offline の instance は、用途すら名乗れない。
+    offline = RegimeTableRlPolicy.offline(artifact(bounds), SimulatedClock(0), bounds=bounds)
+    assert offline.origin is SupervisorOutputOrigin.UNVERIFIED
 
 
 # ------------------------------------- 不変条件 10: #88 の interface を満たす
@@ -715,6 +782,15 @@ def test_invariant_15_without_an_improvement_the_baseline_table_is_selected(
     assert all(not outcome.improved for outcome in report.outcomes)
     assert report.comparison.learned_controller_available is False
 
+    # **「比べた」と読ませない。** action が demand に効かない run では、候補は
+    # `comparable=False` になり、理由が残る。この欄で絞った読み手が
+    # 「policy を比較した結果」として受け取ることがない。
+    assert all(not outcome.comparable for outcome in report.outcomes)
+    assert {outcome.rejection.code for outcome in report.outcomes if outcome.rejection} == {
+        "learned_controller_unavailable"
+    }
+    assert all(outcome.mean_matched_reward is None for outcome in report.outcomes)
+
 
 def test_invariant_16_an_unbacked_search_can_never_be_promotable(trained: Any) -> None:
     """**昇格の根拠にできる結果が出ない。** artifact は SHADOW 互換だけになる。"""
@@ -747,6 +823,9 @@ def test_invariant_16_b_an_approximate_simulator_is_not_promotable_even_with_an_
         specs, model_version="0.1.0", created_at=CREATED_AT
     )
     assert report.learned_controller_available is True
+    # MPC を束縛できた run では候補を実際に比べている（`comparable=True`）。
+    # それでも近似 simulator の episode は promotable にならない。
+    assert all(outcome.comparable for outcome in report.outcomes)
     assert all(not episode.promotable for arm in report.comparison.arms for episode in arm.episodes)
     assert report.promotable is False
     assert report.artifact.manifest.authority_compatibility == (AuthorityStage.SHADOW,)
