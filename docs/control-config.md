@@ -113,7 +113,7 @@ Confidence / OOD が動かせるのはその前段の `requested` だけであ�
 v5からv6へは `model_confidence` を実データの評価根拠とともに追加してから `schema_version: 6` へ上げる。
 v1〜v5は自動補完せず起動前に拒否する。
 
-#86 のv7で `mpc.optimizer` を追加する（決定記録 0052。Proposed）。
+#86 のv7で `mpc.optimizer` を追加する（決定記録 0052。FINAL、2026-09-20 所有者承認）。
 Learned MPC の `horizon_ms` / `step_ms`、探索の `candidate_levels` / `sweeps` / `max_evaluations`、
 変化幅の `max_step_up` / `max_step_down`、zone ごとの探索範囲 `zone_bounds`、
 目的関数の基準量 `cost_scales`、コストに使う予測 metric 名 `cost_metrics`、

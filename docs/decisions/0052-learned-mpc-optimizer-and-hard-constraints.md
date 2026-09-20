@@ -1,7 +1,7 @@
 # 決定記録 0052: Learned MPC optimizer の内部モデル要件と Hard Constraints の扱い
 
 - **種別**: Decision Record
-- **Status**: Proposed
+- **Status**: FINAL（2026-09-20、リポジトリ所有者が承認）
 - **Date**: 2026-09-20
 - **Supersedes**: なし
 - **関連**: [0027](0027-fan-control-architecture.md) / [0028](0028-fan-control-contracts.md) §2.3〜§2.6 /
@@ -344,6 +344,9 @@ replay の再現性は seed だけでは守れない。決定論的な探索と�
 目標帯は #81 が所有し、MPC は受け取るだけにする。
 
 ## 5. 未決事項
+
+**承認されたのは §2 の方式である。** 設定に置いた閾値・重み・基準量は実測前の暫定値
+（`status: provisional`）のままで、下の論点とあわせて未決のまま残る。
 
 | 論点 | どこで決めるか |
 |---|---|
