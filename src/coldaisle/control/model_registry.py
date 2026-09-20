@@ -14,7 +14,7 @@ import os
 import re
 import secrets
 import stat
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from contextlib import contextmanager, suppress
 from datetime import datetime
 from enum import StrEnum
@@ -139,6 +139,26 @@ class ArtifactLoadStatus(StrEnum):
     AUTHORITY_INCOMPATIBLE = "authority_incompatible"
     INVALID_REGISTRY = "invalid_registry"
     INVALID_ARTIFACT_FORMAT = "invalid_artifact_format"
+
+
+class RegistryHealth(StrEnum):
+    """起動時検証（`ModelRegistry.verify()`）の総合判定。
+
+    **例外で起動を止めない。** どれであっても制御は起動できる。`OK` 以外は、その kind で
+    #79 Fallback を選ぶか、戻り先が無いことを運用者へ知らせるためにある（決定記録 0062 §2.4）。
+    """
+
+    OK = "ok"
+    """全 production artifact が checksum・format・（渡されていれば）互換性を満たし、
+    検証済みの rollback 先も残っている。"""
+    DEGRADED = "degraded"
+    """production は load できるが、known-good な戻り先が無いか壊れている（決定記録 0037 §5）。"""
+    UNUSABLE = "unusable"
+    """production pointer はあるが load できない。その kind は Fallback で運転する。"""
+    NO_PRODUCTION = "no_production"
+    """production pointer がひとつも無い。**candidate があっても昇格扱いにはしない。**"""
+    INVALID = "invalid"
+    """snapshot 自体を検証できない。schema version 違いもここに落ちる（既定値で補わない）。"""
 
 
 HyperparameterValue = str | int | float | bool | None
@@ -278,6 +298,11 @@ class ProductionSlot(_Frozen):
     previous: ArtifactRef | None = None
 
 
+def _ref_label(ref: ArtifactRef | None) -> str | None:
+    """Return the path-free label of an artifact reference, or ``None``."""
+    return None if ref is None else ref.key
+
+
 class RegistryAuditEvent(_Frozen):
     """State transition record suitable for a control decision trace."""
 
@@ -293,6 +318,29 @@ class RegistryAuditEvent(_Frozen):
     actor: str = Field(pattern=_IDENTIFIER_PATTERN, max_length=120)
     reason: str = Field(min_length=1, max_length=1000)
     approval: HumanApproval | None = None
+
+    def trace_metadata(self) -> dict[str, object]:
+        """#82 の decision trace へ載せられる、path を含まない lifecycle 記録。
+
+        **欄は常に揃える。** 値が無いときは `None` を入れる。欄ごと消すと、後から読む側が
+        「記録されていない」と「起きていない」を区別できない（決定記録 0062 §2.5）。
+        """
+        approval = self.approval
+        return {
+            "registry_revision": self.revision,
+            "occurred_at_ms": self.occurred_at_ms,
+            "event": self.event.value,
+            "artifact_kind": self.artifact.kind.value,
+            "model_id": self.artifact.model_id,
+            "model_version": self.artifact.version,
+            "actor": self.actor,
+            "reason": self.reason,
+            "previous_artifact": _ref_label(self.previous_artifact),
+            "rollback_target": _ref_label(self.rollback_target),
+            "approver": None if approval is None else approval.approver,
+            "approved_at_ms": None if approval is None else approval.approved_at_ms,
+            "approval_artifact_sha256": None if approval is None else approval.artifact_sha256,
+        }
 
     @model_validator(mode="after")
     def _previous_artifact_belongs_to_pointer_change(self) -> Self:
@@ -362,6 +410,19 @@ class RegistrySnapshot(_Frozen):
     # one ValidationError entry per element, which would cost far more memory than the
     # structure-bounded JSON itself (decision in docs/model-registry.md).
     audit: Annotated[tuple[RegistryAuditEvent, ...], FailFast()] = ()
+
+    @property
+    def pointer_changes(self) -> tuple[RegistryAuditEvent, ...]:
+        """Return only the audit events that moved a production pointer.
+
+        Promotion と rollback だけが「どの artifact を使うか」を変える。登録や検証の記録と
+        混ぜずに取り出せるようにして、#82 が pointer の変更だけを追えるようにする。
+        """
+        return tuple(
+            event
+            for event in self.audit
+            if event.event in {RegistryEventKind.PROMOTED, RegistryEventKind.ROLLED_BACK}
+        )
 
     @field_validator("artifacts", mode="before")
     @classmethod
@@ -745,6 +806,138 @@ class ArtifactLoadResult(_Frozen):
                 }
             )
         return {"model_registry": trace}
+
+
+class ArtifactHealth(_Frozen):
+    """1 artifact の起動時検証の結果。**bytes も path も持たない。**"""
+
+    artifact: ArtifactRef
+    status: ArtifactStatus
+    """registry が記録している lifecycle 状態。artifact の自称ではない。"""
+    load_status: ArtifactLoadStatus
+    compatibility_checked: bool
+    """runtime contract（feature / target schema と authority）まで見たか。
+
+    **既定値を持たない。** 見ていないのに見たことにできると、checksum しか通っていない
+    artifact の `LOADED` を「互換性も確かめた」と読み違える。
+    """
+    detail: str = Field(min_length=1, max_length=500)
+
+    @property
+    def usable(self) -> bool:
+        """Return whether this artifact passed every check that was applied."""
+        return self.load_status is ArtifactLoadStatus.LOADED
+
+
+class ProductionHealth(_Frozen):
+    """1 kind の production pointer と、その rollback 先の状態。"""
+
+    kind: ArtifactKind
+    active: ArtifactHealth
+    rollback_target: ArtifactHealth | None = None
+    """検証した known-good な戻り先。``None`` は「戻り先が無い」（決定記録 0037 §2）。"""
+
+    @model_validator(mode="after")
+    def _health_entries_match_this_kind(self) -> Self:
+        if self.active.artifact.kind is not self.kind:
+            raise ValueError("production health の kind が一致しない")
+        if self.rollback_target is not None and self.rollback_target.artifact.kind is not self.kind:
+            raise ValueError("rollback target health の kind が一致しない")
+        if self.active.status is not ArtifactStatus.PRODUCTION:
+            raise ValueError("production health は production artifact だけを指す")
+        return self
+
+    @property
+    def fallback_required(self) -> bool:
+        """Return whether this kind must run on its deterministic Fallback path."""
+        return not self.active.usable
+
+    @property
+    def rollback_available(self) -> bool:
+        """Return whether a verified known-good artifact can still be restored."""
+        return self.rollback_target is not None and self.rollback_target.usable
+
+
+class RegistryHealthReport(_Frozen):
+    """起動時検証の読み取り専用の結果。**例外を投げず、registry を書き換えない。**
+
+    「production が無い」「壊れている」を起動の失敗にしない。制御は #79 Fallback で
+    運転を続けられなければならない（AGENTS.md ルール4 / 決定記録 0062 §2.4）。
+    """
+
+    health: RegistryHealth
+    supported_schema_version: Literal[2] = MODEL_REGISTRY_SCHEMA_VERSION
+    """**この実装が受理する** registry schema version。読んだ snapshot の申告ではない。"""
+    revision: int = Field(ge=0)
+    productions: tuple[ProductionHealth, ...] = ()
+    detail: str = Field(min_length=1, max_length=500)
+
+    @model_validator(mode="after")
+    def _health_matches_the_checked_pointers(self) -> Self:
+        if self.health in {RegistryHealth.INVALID, RegistryHealth.NO_PRODUCTION}:
+            if self.productions:
+                raise ValueError("production を検証できた報告に NO_PRODUCTION / INVALID は使えない")
+            return self
+        if not self.productions:
+            raise ValueError("production を検証していない報告に OK / DEGRADED は使えない")
+        kinds = [entry.kind for entry in self.productions]
+        if len(set(kinds)) != len(kinds):
+            raise ValueError("同じ kind の production health を重複させない")
+        unusable = any(entry.fallback_required for entry in self.productions)
+        degraded = any(not entry.rollback_available for entry in self.productions)
+        expected = (
+            RegistryHealth.UNUSABLE
+            if unusable
+            else RegistryHealth.DEGRADED
+            if degraded
+            else RegistryHealth.OK
+        )
+        if self.health is not expected:
+            raise ValueError("総合判定が個別の検証結果と一致しない")
+        return self
+
+    def fallback_kinds(self) -> tuple[ArtifactKind, ...]:
+        """Return the kinds whose production artifact cannot be used as it stands."""
+        return tuple(entry.kind for entry in self.productions if entry.fallback_required)
+
+    def unchecked_kinds(self) -> tuple[ArtifactKind, ...]:
+        """runtime contract を当てずに checksum / format だけで通した kind を返す。
+
+        **`ok` だけを見て「互換性も確かめた」と読まないための欄。** 互換性まで確かめる
+        つもりで検証したのに contract を渡し忘れた kind は、schema や authority が合って
+        いなくても `loaded` になる。互換性を見る立場の呼び出し側は、ここが空であることを
+        確かめてから `ok` を信じる（決定記録 0062 §2.4）。
+        """
+        return tuple(
+            entry.kind for entry in self.productions if not entry.active.compatibility_checked
+        )
+
+    def trace_metadata(self) -> dict[str, object]:
+        """#82 の decision trace へ載せられる、path を含まない起動時検証の要約。"""
+        return {
+            "model_registry_health": {
+                "health": self.health.value,
+                "registry_revision": self.revision,
+                "supported_schema_version": self.supported_schema_version,
+                "productions": [
+                    {
+                        "artifact_kind": entry.kind.value,
+                        "active": entry.active.artifact.key,
+                        "active_load_status": entry.active.load_status.value,
+                        "compatibility_checked": entry.active.compatibility_checked,
+                        "rollback_target": _ref_label(
+                            None
+                            if entry.rollback_target is None
+                            else entry.rollback_target.artifact
+                        ),
+                        "rollback_available": entry.rollback_available,
+                    }
+                    for entry in self.productions
+                ],
+                "fallback_kinds": [kind.value for kind in self.fallback_kinds()],
+                "unchecked_kinds": [kind.value for kind in self.unchecked_kinds()],
+            }
+        }
 
 
 class ModelRegistryLimits(_Frozen):
@@ -1239,14 +1432,112 @@ class ModelRegistry:
                 "registry snapshot を検証できない",
             )
 
+    def verify(
+        self,
+        compatibility: Mapping[ArtifactKind, ModelCompatibility] | None = None,
+    ) -> RegistryHealthReport:
+        """起動時に registry 全体を検証する。**書き込まず、例外も投げない。**
+
+        production pointer が指す artifact の checksum / format と、``compatibility`` に
+        その kind の契約があれば feature / target schema と authority 互換性を検査する。
+        rollback 先は **checksum と format だけ**を見る。互換性は rollback 実行時のその時点の
+        runtime contract で判断するため、schema を更新しただけで健全な戻り先を失わない
+        （決定記録 0037 §2）。
+
+        registry root が無い、snapshot を検証できない（schema version 違いを含む）場合も、
+        ここで起動を止めない。呼び出し側が #79 Fallback を選べるように結果として返す。
+        """
+        contracts = dict(compatibility or {})
+        try:
+            with self._open_root(create=False) as root_fd:
+                if root_fd is None:
+                    return RegistryHealthReport(
+                        health=RegistryHealth.NO_PRODUCTION,
+                        revision=0,
+                        detail="registry root が無い。Fallback で起動できる",
+                    )
+                snapshot = self._read_snapshot(root_fd)
+                productions = tuple(
+                    self._production_health(root_fd, snapshot, kind, contracts.get(kind))
+                    for kind in sorted(snapshot.production, key=lambda kind: kind.value)
+                )
+        except ModelRegistryError:
+            # UnsafeRegistryPathError / RegistryCorruptError / UnknownArtifactError。
+            # どれも「この snapshot を信用できない」であって、起動の失敗ではない。
+            return RegistryHealthReport(
+                health=RegistryHealth.INVALID,
+                revision=0,
+                detail="registry snapshot を検証できない",
+            )
+        if not productions:
+            return RegistryHealthReport(
+                health=RegistryHealth.NO_PRODUCTION,
+                revision=snapshot.revision,
+                detail="production artifact が登録されていない。Fallback で起動できる",
+            )
+        unusable = tuple(entry.kind.value for entry in productions if entry.fallback_required)
+        without_rollback = tuple(
+            entry.kind.value for entry in productions if not entry.rollback_available
+        )
+        if unusable:
+            health = RegistryHealth.UNUSABLE
+            detail = f"production artifact を検証できない kind: {', '.join(unusable)}"
+        elif without_rollback:
+            health = RegistryHealth.DEGRADED
+            detail = f"known-good な rollback 先が無い kind: {', '.join(without_rollback)}"
+        else:
+            health = RegistryHealth.OK
+            detail = "production artifact と rollback 先を検証した"
+        return RegistryHealthReport(
+            health=health,
+            revision=snapshot.revision,
+            productions=productions,
+            detail=detail,
+        )
+
+    def _production_health(
+        self,
+        root_fd: int,
+        snapshot: RegistrySnapshot,
+        kind: ArtifactKind,
+        compatibility: ModelCompatibility | None,
+    ) -> ProductionHealth:
+        slot = snapshot.production[kind]
+        return ProductionHealth(
+            kind=kind,
+            active=self._artifact_health(root_fd, snapshot, slot.active, compatibility),
+            rollback_target=(
+                None
+                if slot.previous is None
+                else self._artifact_health(root_fd, snapshot, slot.previous, None)
+            ),
+        )
+
+    def _artifact_health(
+        self,
+        root_fd: int,
+        snapshot: RegistrySnapshot,
+        ref: ArtifactRef,
+        compatibility: ModelCompatibility | None,
+    ) -> ArtifactHealth:
+        # 読み込み経路をそのまま使う。検証の規則を2箇所に書くと、片方だけが緩む。
+        result = self._load_record(root_fd, snapshot, ref, compatibility)
+        return ArtifactHealth(
+            artifact=ref,
+            status=self._record(snapshot, ref).status,
+            load_status=result.status,
+            compatibility_checked=compatibility is not None,
+            detail=result.detail,
+        )
+
     def _load_record(
         self,
         root_fd: int,
         snapshot: RegistrySnapshot,
         ref: ArtifactRef,
-        compatibility: ModelCompatibility,
+        compatibility: ModelCompatibility | None,
     ) -> ArtifactLoadResult:
-        record = snapshot.artifacts[ref.key]
+        record = self._record(snapshot, ref)
         slot = snapshot.production.get(ref.kind)
         # 明示 version を固定した読み込みでも、production pointer そのものなら production と
         # して発行する。指した先が候補・検証済み・引退なら false のままにする。
