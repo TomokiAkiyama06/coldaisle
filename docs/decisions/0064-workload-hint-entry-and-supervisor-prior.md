@@ -1,7 +1,7 @@
 # 決定記録 0064: Workload Hint の入口・形・期限と、Supervisor の prior としての扱い
 
 - **種別**: Decision Record
-- **Status**: Proposed（リポジトリ所有者の承認をもって FINAL。承認前に実装しない）
+- **Status**: FINAL（2026-09-21、リポジトリ所有者が承認。0045 のソケット再利用・Workload Regime 推定へは入れず SupervisorInput のみ・冷却を弱めない・Stage A は記録のみ、の 4 点。Stage A の実装は別 Issue / 別 PR）
 - **Date**: 2026-09-21
 - **Supersedes**: なし。[0045](0045-local-socket-write-entry.md) §2.9 と §5 の未決 #1
   （「Workload Hint のメッセージ形・Supervisor への渡し方・実装時期」）に答える記録であり、

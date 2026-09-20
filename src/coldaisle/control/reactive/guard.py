@@ -142,6 +142,18 @@ _STATIC_TRIGGERS: tuple[_TriggerSpec, ...] = (
 )
 
 
+def guard_input_metrics(config: ReactiveGuardConfig) -> frozenset[str]:
+    """この設定で Guard が読む metric 名の全体（派生値の名前を含む）。
+
+    **trigger の定義から数え直す。** 入力契約（#74）を別表で持つと、trigger を足したときに
+    契約だけが古いまま残り、Guard が「入力が無い」と判断して静かに発火しなくなる。
+    """
+    metrics = {trigger.metric for trigger in _STATIC_TRIGGERS}
+    if config.cpu_power_metric is not None:
+        metrics.add(config.cpu_power_metric.value)
+    return frozenset(metrics)
+
+
 class ReactiveGuard:
     """急な熱負荷へ floor を上げ、hysteresis と単調時計 hold で遅く解除する。"""
 
