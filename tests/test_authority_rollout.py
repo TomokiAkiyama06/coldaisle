@@ -88,8 +88,8 @@ from coldaisle.control.evaluation.model import (
     WorstCaseKind,
 )
 from coldaisle.control.model.confidence import ConfidenceAssessor
-from coldaisle.control.model_registry import ArtifactAttestation
 from coldaisle.control.mpc import LearnedMpcController, MpcModelBinding
+from coldaisle.control.shadow import SHADOW_EXPORT_SCHEMA_VERSION
 from test_control_config import valid_documents, write_documents
 from test_critical_safety import (
     critical_safety,
@@ -107,6 +107,7 @@ from test_fallback_controller import (
 )
 from test_learned_mpc import (
     ALL_STAGES,
+    REGISTRY_LIMITS,
     PlanningModel,
     ScriptedClock,
     issue_attestation,
@@ -163,15 +164,29 @@ def control_config(tmp_path: Path, *, ceiling: str = "full", **rollout: int) -> 
     return ControlConfig.from_directory(root)
 
 
-def production_attestation(tmp_path: Path, *, version: str = "1.0.0") -> ArtifactAttestation:
-    """**本物の Registry の検証経路が発行した** production attestation（#104）。"""
-    return issue_attestation(
-        tmp_path / f"registry-{version}",
+def production_registry(
+    tmp_path: Path,
+    *,
+    version: str = "1.0.0",
+    authority: tuple[AuthorityStage, ...] = ALL_STAGES,
+    promoted: bool = True,
+    name: str | None = None,
+) -> tuple[ModelRegistry, str]:
+    """**本物の Registry**（#104）と、その production artifact の sha256。
+
+    `raise_stage()` は artifact の identity を registry から読み直すので、試験でも
+    実際の registry を渡す（承認者が hash を持ち込めない側と同じ経路を通す）。
+    """
+    root = tmp_path / (name or f"registry-{version}")
+    attestation = issue_attestation(
+        root,
         model_id="rack-thermal",
         version=version,
-        authority=ALL_STAGES,
+        authority=authority,
         stage=AuthorityStage.SHADOW,
+        promoted=promoted,
     )
+    return ModelRegistry(root, limits=REGISTRY_LIMITS), attestation.artifact_sha256
 
 
 def learned_arm(stage: AuthorityStage = AuthorityStage.SHADOW) -> CounterfactualArm:
@@ -200,13 +215,15 @@ FALLBACK_ARM = applied_fallback_arm().key
 """実 Fan を作っていた Fallback の arm。**昇格の根拠にはできない。**"""
 
 
-def counterfactual_report(arm: CounterfactualArm, *, end_ms: int) -> CounterfactualArmReport:
+def counterfactual_report(
+    arm: CounterfactualArm, *, end_ms: int, last_ts_ms: int | None = None
+) -> CounterfactualArmReport:
     return CounterfactualArmReport(
         arm=arm,
         arm_key=arm.key,
         ticks=1_000,
-        first_ts_ms=end_ms - 3_600_000,
-        last_ts_ms=end_ms,
+        first_ts_ms=min(end_ms, last_ts_ms if last_ts_ms is not None else end_ms) - 3_600_000,
+        last_ts_ms=end_ms if last_ts_ms is None else last_ts_ms,
         proposals=1_000,
         safety_floor_shortfalls=0,
         maximum_floor_shortfall=0.0,
@@ -243,10 +260,21 @@ DEFAULT_CONFIG = control_config(Path(_FIXTURES.name), ceiling="full")
 POLICY_SHA = DEFAULT_CONFIG.sources.policy.sha256
 SAFETY_SHA = DEFAULT_CONFIG.sources.safety.sha256
 
-PRODUCTION = production_attestation(Path(_FIXTURES.name))
-"""既定の production attestation。**Registry の検証経路が発行したもの。**"""
 
-ARTIFACT_SHA = PRODUCTION.artifact_sha256
+def promote_next_version(root: Path, *, version: str) -> str:
+    """同じ Registry の production を別の artifact へ入れ替え、その sha256 を返す。"""
+    attestation = issue_attestation(
+        root,
+        model_id="rack-thermal",
+        version=version,
+        authority=ALL_STAGES,
+        stage=AuthorityStage.SHADOW,
+    )
+    return attestation.artifact_sha256
+
+
+PRODUCTION_REGISTRY, ARTIFACT_SHA = production_registry(Path(_FIXTURES.name))
+"""既定の Registry と、その production artifact の sha256。"""
 
 
 def report_document(
@@ -264,6 +292,8 @@ def report_document(
     extra_learned: CounterfactualArm | None = None,
     extra_outcome: GateOutcome = GateOutcome.PASS,
     fresh_fallback_end_ms: int | None = None,
+    learned_last_ts_ms: int | None = None,
+    start_ms: int | None = None,
 ) -> bytes:
     """最小の Offline Evaluation 報告（#91）。**arm の実績と gate を持つ。**"""
     learned = learned_arm(arm_stage)
@@ -286,7 +316,9 @@ def report_document(
             ),
         )
 
-    counterfactual_arms = [counterfactual_report(learned, end_ms=end_ms)]
+    counterfactual_arms = [
+        counterfactual_report(learned, end_ms=end_ms, last_ts_ms=learned_last_ts_ms)
+    ]
     gates = [gate(arm, outcome)]
     if arm != learned.key:
         gates.append(gate(learned.key, GateOutcome.PASS))
@@ -325,7 +357,7 @@ def report_document(
             absolute_temp_ceiling_c=95.0,
             outcome_match_tolerance_ms=500,
             applied_demand_tolerance=0.01,
-            shadow_export_schema_version=1,
+            shadow_export_schema_version=SHADOW_EXPORT_SCHEMA_VERSION,
             runs=(
                 RunProvenance(
                     run_id="run-001",
@@ -345,7 +377,7 @@ def report_document(
                 run_id="run-001",
                 index=0,
                 role=SegmentRole.HOLDOUT,
-                start_ms=end_ms - 3_600_000,
+                start_ms=start_ms if start_ms is not None else end_ms - 3_600_000,
                 end_ms=end_ms,
                 ticks=1_000,
                 purged_outcomes=0,
@@ -425,13 +457,13 @@ def raise_stage(
     approval: StageApproval,
     document: bytes,
     config: ControlConfig | None = None,
-    production: ArtifactAttestation | None = None,
+    registry: ModelRegistry | None = None,
 ) -> AuthorityJournal:
     return authority.raise_stage(
         approval=approval,
         evaluation_report=document,
         config=config if config is not None else DEFAULT_CONFIG,
-        production=production if production is not None else PRODUCTION,
+        registry=registry if registry is not None else PRODUCTION_REGISTRY,
     )
 
 
@@ -983,6 +1015,43 @@ def test_invariant_5_p_a_fresh_fallback_only_run_does_not_refresh_stale_evidence
         )
 
 
+def test_invariant_5_q_a_fallback_only_continuation_does_not_refresh_the_same_segment(
+    tmp_path: Path,
+) -> None:
+    """**同じ segment の続きを Fallback で回しても、Learned の実績は新鮮にならない**
+    （codex #4056942799）。
+
+    segment の `end_ms` は区間の終わりであって、その arm が最後に動いた時刻ではない。
+    新しさは arm 自身の `last_ts_ms` で測る。
+    """
+    limit_ms = DEFAULT_CONFIG.policy.authority_rollout.evidence_max_age_ms.value
+    stale_ts_ms = NOW_MS - limit_ms - 1
+    document = report_document(
+        end_ms=NOW_MS - 60_000,
+        learned_last_ts_ms=stale_ts_ms,
+        with_applied_fallback=True,
+        start_ms=stale_ts_ms - 3_600_000,
+    )
+
+    # segment の終わり（新しい）を名乗ると、arm の実績と食い違う。
+    with pytest.raises(AuthorityEvidenceError, match="名指した arm の実績と違う"):
+        raise_stage(
+            store(tmp_path),
+            approval=approval_for(
+                document, evidence=evidence_for(document, end_ms=NOW_MS - 60_000)
+            ),
+            document=document,
+        )
+
+    # arm 自身の時刻を名乗れば、こんどは「古い」として拒まれる。
+    with pytest.raises(AuthorityEvidenceError, match="証拠が古い"):
+        raise_stage(
+            store(tmp_path),
+            approval=approval_for(document, evidence=evidence_for(document, end_ms=stale_ts_ms)),
+            document=document,
+        )
+
+
 # --- 不変条件 6: 降格に承認は要らない ------------------------------------------
 
 
@@ -1390,71 +1459,78 @@ def test_invariant_8_b_an_approval_for_the_retired_artifact_is_refused_after_pro
 ) -> None:
     """**artifact が入れ替わったら、前の artifact の証拠は使えない。**
 
-    承認者は artifact の hash を持ち込めない（codex #4056903570）。Production の
-    identity は Registry の検証経路が発行した attestation から取るので、
-    「A の実績で承認し、B に制御権を与える」が成立しない。
+    承認者は artifact の hash を持ち込めない（codex #4056903570）し、発行済みの
+    attestation も渡せない（codex #4056942797）。Production の identity は
+    **書き込む直前に Registry から読み直す**ので、「A の実績で承認し、B に制御権を
+    与える」が成立しない。
     """
-    old_production = production_attestation(tmp_path, version="1.0.0")
-    document = report_document(artifacts=(old_production.artifact_sha256,))
-    approval = approval_for(
-        document,
-        evidence=evidence_for(document, artifact=old_production.artifact_sha256),
-    )
-    new_production = production_attestation(tmp_path, version="1.1.0")
+    registry, old_sha = production_registry(tmp_path, version="1.0.0", name="registry")
+    document = report_document(artifacts=(old_sha,))
+    approval = approval_for(document, evidence=evidence_for(document, artifact=old_sha))
 
-    assert new_production.artifact_sha256 != old_production.artifact_sha256
+    # 同じ registry の production を入れ替える。承認と報告はそのまま。
+    new_sha = promote_next_version(tmp_path / "registry", version="1.1.0")
+
+    assert new_sha != old_sha
+    with pytest.raises(AuthorityEvidenceError, match="Production の artifact"):
+        raise_stage(store(tmp_path), approval=approval, document=document, registry=registry)
+
+
+def test_invariant_8_e_the_production_identity_is_read_at_promotion_time(
+    tmp_path: Path,
+) -> None:
+    """**production を読むのは承認の時ではなく、昇格を書く時である**（codex #4056942797）。
+
+    `production_active` のような「発行した瞬間の写し」を受け取ると、A の証拠を持ったまま
+    B が production になったあとに昇格できる。`raise_stage()` は artifact を引数に取らず、
+    **その場で Registry を読む**ので、同じ承認・同じ報告でも結果が変わる。
+    """
+    registry, sha = production_registry(tmp_path, version="1.0.0", name="registry")
+    document = report_document(artifacts=(sha,))
+    approval = approval_for(document, evidence=evidence_for(document, artifact=sha))
+
+    # まだ A が production。同じ承認は通る。
+    journal = raise_stage(store(tmp_path), approval=approval, document=document, registry=registry)
+    assert journal.stage is AuthorityStage.LIMITED
+
+    # production を B へ入れ替えると、**同じ承認・同じ報告**がもう通らない。
+    promote_next_version(tmp_path / "registry", version="2.0.0")
     with pytest.raises(AuthorityEvidenceError, match="Production の artifact"):
         raise_stage(
-            store(tmp_path),
+            store(tmp_path / "second"),
             approval=approval,
             document=document,
-            production=new_production,
+            registry=registry,
         )
 
 
-def test_invariant_8_e_the_approver_cannot_supply_the_production_identity(
+def test_invariant_8_g_a_registry_without_a_production_pointer_is_refused(
     tmp_path: Path,
 ) -> None:
-    """**production でない artifact の attestation では上げられない**（codex #4056903570）。
-
-    `raise_stage()` は artifact の hash を文字列で受け取らない。受け取るのは Registry の
-    検証経路だけが発行する封をした attestation で、production pointer が指しているかも
-    その中の値で見る。
-    """
-    candidate = issue_attestation(
-        tmp_path / "registry-candidate",
-        model_id="rack-thermal",
-        version="2.0.0",
-        authority=ALL_STAGES,
-        stage=AuthorityStage.SHADOW,
-        promoted=False,
+    """**production が無い Registry では上げられない。** 「判定できない」を合格にしない。"""
+    registry, sha = production_registry(
+        tmp_path, version="1.0.0", promoted=False, name="registry-candidate"
     )
-    document = report_document(artifacts=(candidate.artifact_sha256,))
-    approval = approval_for(
-        document, evidence=evidence_for(document, artifact=candidate.artifact_sha256)
-    )
+    document = report_document(artifacts=(sha,))
+    approval = approval_for(document, evidence=evidence_for(document, artifact=sha))
 
-    assert candidate.production_active is False
-    with pytest.raises(AuthorityEvidenceError, match="Production pointer"):
-        raise_stage(store(tmp_path), approval=approval, document=document, production=candidate)
+    with pytest.raises(AuthorityEvidenceError, match="Production の artifact が無い"):
+        raise_stage(store(tmp_path), approval=approval, document=document, registry=registry)
 
 
 def test_invariant_8_f_a_stage_the_registry_did_not_allow_is_refused(tmp_path: Path) -> None:
     """**Registry が許していない stage へ、authority の側から上げない**（#104 の境界）。"""
-    shadow_only = issue_attestation(
-        tmp_path / "registry-shadow-only",
-        model_id="rack-thermal",
+    registry, sha = production_registry(
+        tmp_path,
         version="3.0.0",
         authority=(AuthorityStage.SHADOW,),
-        stage=AuthorityStage.SHADOW,
+        name="registry-shadow-only",
     )
-    document = report_document(artifacts=(shadow_only.artifact_sha256,))
-    approval = approval_for(
-        document, evidence=evidence_for(document, artifact=shadow_only.artifact_sha256)
-    )
+    document = report_document(artifacts=(sha,))
+    approval = approval_for(document, evidence=evidence_for(document, artifact=sha))
 
     with pytest.raises(AuthorityApprovalError, match="Registry が許していない"):
-        raise_stage(store(tmp_path), approval=approval, document=document, production=shadow_only)
+        raise_stage(store(tmp_path), approval=approval, document=document, registry=registry)
 
 
 def test_invariant_8_c_the_registry_cannot_write_the_authority_journal() -> None:
@@ -1716,9 +1792,9 @@ def test_the_first_promotion_can_actually_be_walked(tmp_path: Path, trained) -> 
 
     # 3. その区間の証拠で昇格する。証拠はいまの設定・いまの artifact のものである。
     config = control_config(tmp_path, ceiling="limited")
-    production = production_attestation(tmp_path, version="9.0.0")
+    registry, production_sha = production_registry(tmp_path, version="9.0.0", name="registry-e2e")
     document = report_document(
-        artifacts=(production.artifact_sha256,),
+        artifacts=(production_sha,),
         policy_sha=config.sources.policy.sha256,
         safety_sha=config.sources.safety.sha256,
     )
@@ -1728,14 +1804,14 @@ def test_the_first_promotion_can_actually_be_walked(tmp_path: Path, trained) -> 
             document,
             evidence=evidence_for(
                 document,
-                artifact=production.artifact_sha256,
+                artifact=production_sha,
                 policy_sha=config.sources.policy.sha256,
                 safety_sha=config.sources.safety.sha256,
             ),
         ),
         document=document,
         config=config,
-        production=production,
+        registry=registry,
     )
     assert journal.stage is AuthorityStage.LIMITED
     control.reload()

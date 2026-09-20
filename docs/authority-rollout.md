@@ -46,13 +46,18 @@ store.raise_stage(
     approval=approval,  # 承認者・理由・時刻・遷移・revision を持つ
     evaluation_report=report_bytes,  # #91 の報告そのもの（bytes）
     config=config,  # 検証済み ControlConfig（#103）。設定の checksum はここから
-    production=attestation,  # Registry の検証経路が発行した attestation（#104）
+    registry=registry,  # Model Registry（#104）。artifact は書く直前に読み直す
 )
 ```
 
-**承認者は値を持ち込めない。** artifact の hash も設定の checksum も「いま」も
-文字列・数値では受け取らない。hash を受け取ると、production が入れ替わったあとに
-古い artifact の hash を渡すだけで A の実績で B に制御権を与えられる。
+**承認者は値を持ち込めない。** artifact の hash も設定の checksum も「いま」も、
+発行済みの attestation さえも受け取らない。artifact の identity は **exclusive lock の中で
+`ModelRegistry.inspect()` を読んで**決め、書き込む直前にもう一度読んで registry が
+動いていないことを確かめる。発行時点の写し（`production_active`）を受け取ると、
+A の証拠を持ったまま B が production になったあとに昇格できてしまう。
+
+**#104 と #92 の境界**: #92 は #104 の state を**読む**だけで、**書かない**。
+逆向き（#104 が authority journal を触ること）も無い（試験で走査）。
 
 次のどれか1つでも満たさなければ昇格は通らない（**判定できないことを合格にしない**）。
 
@@ -60,12 +65,14 @@ store.raise_stage(
 - 承認した stage が設定の上限を超える
 - 渡した報告が承認の指した報告と違う、比較条件（`conditions_sha256`）が違う
 - 報告が別の設定（`fan-policy.yaml` / `safety.yaml`）で取られている
-- 渡した attestation が production pointer の指す artifact でない
+- その kind の production pointer が無い、または指す先が production artifact でない
+- 検証している間に Registry の production が動いた（やり直す）
 - `to_stage` が Registry の `authority_compatibility` に含まれない
 - 報告に現れた artifact が、いま Production の artifact ちょうど1つでない
 - 報告に現れた authority stage が、いまの stage より高い / いまの stage を含まない
-- **名指した arm の実績が実在する最後の holdout segment**が `evidence_max_age_ms` より古い
-  （報告全体の最新 run では測らない。Fallback だけの新しい run を足しても新鮮にならない）
+- **名指した arm 自身の `last_ts_ms`** が `evidence_max_age_ms` より古い
+  （報告全体の run でも segment の終わりでも測らない。Fallback だけで回した続きを
+  足しても新鮮にならない）
 - 名指した arm が holdout の実績に無い、または**制御器が Learned MPC でない**
   （適用された Fallback の arm を名指して昇格できない）
 - 名指した arm の stage が、いまの stage と違う

@@ -107,13 +107,36 @@ checksum も「いまの時刻」も文字列や数値で受け取らない。�
 | `approval` | 人の承認そのもの |
 | `evaluation_report` | 報告の bytes（承認の digest と突き合わせる） |
 | `config` | 検証済み `ControlConfig`（#103）。設定の checksum はここから取る |
-| `production` | Registry の検証経路だけが発行する `ArtifactAttestation`（#104） |
+| `registry` | `ModelRegistry`（#104）。artifact の identity は**書く直前に読み直す** |
 
 「いま」は `AuthorityStore` 自身の時計から取る。hash を文字列で受け取ると、production が
 入れ替わったあとに古い artifact の hash を渡すだけで、**A の実績で B に制御権を与えられる**
-（codex #4056903570）。あわせて、`production.production_active` が立っていること（pointer が
-本当にそれを指していること）と、`approval.to_stage` が
-`production.authority_compatibility` に含まれることも確かめる。
+（codex #4056903570）。
+
+**発行済みの `ArtifactAttestation` も受け取らない**（codex #4056942797）。
+`production_active` は attestation を発行した瞬間の写しでしかないので、A の attestation と
+A の報告を持っていれば、B が production になったあとでも昇格できてしまう。
+`raise_stage()` は **exclusive lock の中で** `ModelRegistry.inspect()` を読み、
+
+1. その kind の production pointer が指す artifact の metadata を取り、
+2. 承認・証拠の検証をすべて済ませ、
+3. **書き込む直前にもう一度読んで** registry revision と artifact が動いていないことを確かめる
+
+という順で進む。検証の途中で production が動いていたら、その昇格はもう「いまの
+production」についての判断ではないので拒む（やり直す）。
+あわせて `approval.to_stage` が、その artifact の `authority_compatibility` に
+含まれることも確かめる。
+
+#### #104 と #92 の境界
+
+**#92 は #104 の state を読む。書かない。** これは Issue #92 が引いた境界そのもの
+（「#104 がどの artifact を Production にするか決め、#92 がその Production artifact へ
+どこまで制御権を渡すか決める」）であり、依存の向きと一致する。逆向き、すなわち
+**#104 が authority journal を読み書きすることは無い**（`model_registry.py` が
+`AuthorityStore` / `AuthorityJournal` / `authority.json` を参照しないことを試験で走査する）。
+状態は別の file・別の revision に置いたまま（§2.1）で、片方の lock がもう片方を
+待つこともない。読む一方向だけを許すことで、「Model の promotion が authority を動かす」
+経路は生まれない。
 
 承認は次のすべてに束縛する。1つでも合わなければ昇格は通らない。
 
@@ -138,11 +161,12 @@ checksum も「いまの時刻」も文字列や数値で受け取らない。�
 - 報告に現れた model artifact が、**いま Production の artifact ちょうど1つ**である
   （複数混ざった報告は帰属が決まらないので使わない）
 - 報告に現れた authority stage が、**いまの stage 以下**で、かつ**いまの stage を含む**
-- 証拠の新しさは、**名指した arm の実績が実在する最後の holdout segment の `end_ms`** で測り、
+- 証拠の新しさは、**名指した arm 自身の `last_ts_ms`**（`AppliedArmReport` /
+  `CounterfactualArmReport` が持つ、その arm が最後に動いた時刻）で測り、
   `evidence_max_age_ms` 以内である。0054 §2.7 により報告は生成時刻を持たないので、
-  自己申告ではなく中に記録された観測時刻を使う。**報告全体の最新 run では測らない。**
-  Fallback だけで回した新しい run を足すだけで、古い Learned MPC の実績が「新鮮」に
-  見えてしまうためである（codex #4056903573）
+  自己申告ではなく中に記録された観測時刻を使う。**報告全体の run でも segment の終わりでも
+  測らない。** どちらも、Fallback だけで回した続きを足すだけで古い Learned MPC の実績を
+  「新鮮」にできてしまう（codex #4056903573 / #4056942799）
 - 名指した arm が**holdout の `overall` group に実在し**、その**制御器が Learned MPC**である。
   `arm_key` の一致だけで gate を読むと、承認者が適用された Fallback の arm を名指すだけで、
   肝心の Learned MPC が `blocked` のまま昇格できる（codex #4056864033）。
@@ -207,6 +231,9 @@ v8 からの移行は自動補完せず、v1〜v8 は起動前に拒否する。
 
 良くなること。
 
+- 昇格の判断が、**書き込む瞬間の** production pointer についての判断になる。発行済みの
+  写しを持ち回って、入れ替わったあとに使うことができない
+
 - Model の入れ替えと制御権の大きさが**別々に**動く。新しい Production へ切り替えても
   authority は暗黙に上がらない
 - 異常時の降格が、設定の再起動を待たずに効く。Baseline への rollback は常に1手
@@ -214,6 +241,11 @@ v8 からの移行は自動補完せず、v1〜v8 は起動前に拒否する。
 - 承認も証拠も使い回せない。貯めた承認や古い報告で上げられない
 
 悪くなること。
+
+- `raise_stage()` が Model Registry を読むようになり、authority の昇格が registry の
+  可用性に依存する。緩和として、読めないことは「production が無い」と読み替えず
+  `AuthorityEvidenceError` で止める（fail closed）。**降格は registry を読まない**ので、
+  registry が壊れていても安全側へは常に動ける
 
 - **書き残せなかった降格は、再起動で戻る。** in-memory の上限は process の寿命しか
   持たない。緩和として、永続化の失敗は `persist_failure` として trace と runtime に残し、
@@ -253,11 +285,6 @@ v8 からの移行は自動補完せず、v1〜v8 は起動前に拒否する。
   残すだけで、起動時に「前回書けなかった」を知る手段が無い。#82 の decision trace から
   読み取って起動時に Baseline から始める案があるが、trace の保存先（0030）が Proposed の
   ままなので、そちらの確定後に別の記録で決める
-- **`ArtifactAttestation` は発行時点の registry の写しである。** 発行から `raise_stage()` の
-  間に production pointer が動く余地は残る（`registry_revision` は載っているが、authority 側から
-  registry を読み直す経路は持たせていない）。Registry と Authority を別の状態にした以上、
-  片方がもう片方をロックする形にはしない。実運用の手順（昇格の直前に attestation を取り直す）で
-  埋めるか、`registry_revision` の下限を承認に持たせるかは、管理操作の入口を決めるときに一緒に決める
 - **管理操作の入口。** いまは `AuthorityStore` の API だけで、CLI も API も無い。
   読み取り API（#23）は制御を変えられないので、昇格・rollback の入口を
   どこに置くか（CLI か、0045 の書き込み専用ソケットか）は別 Issue で決める

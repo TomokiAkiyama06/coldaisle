@@ -46,7 +46,13 @@ from coldaisle.control.evaluation.model import (
     GroupKind,
     SegmentRole,
 )
-from coldaisle.control.model_registry import ArtifactAttestation
+from coldaisle.control.model_registry import (
+    ArtifactKind,
+    ArtifactMetadata,
+    ArtifactStatus,
+    ModelRegistry,
+    ModelRegistryError,
+)
 from coldaisle.control.schema import (
     BASELINE_STAGE,
     STAGE_ORDER,
@@ -312,7 +318,13 @@ class _ArmEvidence(_Frozen):
     """1つの arm が holdout に現れた事実と、**その arm が現れた最後の時刻**。"""
 
     arm: AppliedArm | CounterfactualArm
-    last_segment_end_ms: int = Field(ge=0)
+    last_ts_ms: int = Field(ge=0)
+    """**その arm 自身の最後の tick の時刻**（`AppliedArmReport` / `CounterfactualArmReport`）。
+
+    segment の `end_ms` ではない。同じ segment の続きを Fallback だけで回しても
+    segment は伸びるので、そちらで測ると古い Learned MPC の実績が新鮮に見える
+    （codex #4056942799）。
+    """
 
 
 def _holdout_arms(report: EvaluationReport) -> dict[str, _ArmEvidence]:
@@ -322,17 +334,17 @@ def _holdout_arms(report: EvaluationReport) -> dict[str, _ArmEvidence]:
     「どの制御器の実績か」を確かめないまま合格を読むことになる（codex #4056864033）。
     報告の中の arm object へ結び直してから判断する。
 
-    **その arm が現れた segment の終了時刻も持つ。** 証拠の新しさは報告全体の run では
-    なく、**その arm の実績が実在する区間**で測る（codex #4056903573）。報告全体の
-    最新 run で測ると、Fallback だけで回した新しい run を足すだけで、古い Learned MPC の
-    実績が「新鮮」に見えてしまう。
+    **その arm 自身の最後の tick の時刻も持つ。** 証拠の新しさは報告全体の run でも
+    segment の終わりでもなく、**その arm が最後に動いた時刻**で測る
+    （codex #4056903573 / #4056942799）。報告全体や segment で測ると、Fallback だけで
+    回した続きを足すだけで、古い Learned MPC の実績が「新鮮」に見えてしまう。
     """
     arms: dict[str, _ArmEvidence] = {}
 
-    def observe(key: str, arm: AppliedArm | CounterfactualArm, end_ms: int) -> None:
+    def observe(key: str, arm: AppliedArm | CounterfactualArm, last_ts_ms: int) -> None:
         current = arms.get(key)
-        if current is None or end_ms > current.last_segment_end_ms:
-            arms[key] = _ArmEvidence(arm=arm, last_segment_end_ms=end_ms)
+        if current is None or last_ts_ms > current.last_ts_ms:
+            arms[key] = _ArmEvidence(arm=arm, last_ts_ms=last_ts_ms)
 
     for segment in report.segments:
         if segment.role is not SegmentRole.HOLDOUT:
@@ -341,9 +353,9 @@ def _holdout_arms(report: EvaluationReport) -> dict[str, _ArmEvidence]:
             if group.kind is not GroupKind.OVERALL:
                 continue
             for applied in group.applied:
-                observe(applied.arm_key, applied.arm, segment.end_ms)
+                observe(applied.arm_key, applied.arm, applied.last_ts_ms)
             for counterfactual in group.counterfactual:
-                observe(counterfactual.arm_key, counterfactual.arm, segment.end_ms)
+                observe(counterfactual.arm_key, counterfactual.arm, counterfactual.last_ts_ms)
     return arms
 
 
@@ -436,7 +448,8 @@ class AuthorityStore:
         approval: StageApproval,
         evaluation_report: bytes,
         config: ControlConfig,
-        production: ArtifactAttestation,
+        registry: ModelRegistry,
+        artifact_kind: ArtifactKind = ArtifactKind.THERMAL_MODEL,
     ) -> AuthorityJournal:
         """人の承認と rollout gate の証拠を検証してから、stage を1段上げる。
 
@@ -445,9 +458,13 @@ class AuthorityStore:
 
         **承認者が値を持ち込む余地を残さない**（codex #4056903570）。設定の checksum は
         検証済みの `ControlConfig` から、artifact の identity は Model Registry の
-        検証経路だけが発行する `ArtifactAttestation` から取る。文字列で受け取ると、
-        production が入れ替わったあとに古い artifact の hash を渡すだけで、
-        A の実績で B に制御権を与えられる。
+        **いまの production pointer** から取る。
+
+        **Registry は書き込む直前に読み直す**（codex #4056942797）。発行済みの
+        attestation は「発行した時点で production だった」としか言わないので、それを
+        受け取るだけだと、A の attestation と A の報告で、B が production になった
+        あとに昇格できてしまう。読むのは #104 の state で、**書くことはない**
+        （境界は 0057 §2.3）。
         """
         policy = config.policy
         now_ms = self._clock.now_ms()
@@ -459,16 +476,6 @@ class AuthorityStore:
                 "設定が許す上限を超える stage は承認できない"
                 f"（ceiling={policy.authority_stage.value}; to={approval.to_stage.value}）"
             )
-        self._check_production(approval, production)
-        self._check_evidence(
-            approval,
-            evaluation_report,
-            policy=policy,
-            fan_policy_config_sha256=config.sources.policy.sha256,
-            safety_config_sha256=config.sources.safety.sha256,
-            production_artifact_sha256=production.artifact_sha256,
-            now_ms=now_ms,
-        )
         with self._exclusive_lock() as root_fd:
             journal = self._read(root_fd)
             if approval.expected_revision != journal.revision:
@@ -480,6 +487,25 @@ class AuthorityStore:
                 raise AuthorityApprovalError(
                     "承認した遷移元といまの stage が違う"
                     f"（approved_from={approval.from_stage.value}; now={journal.stage.value}）"
+                )
+            production, registry_revision = self._resolve_production(registry, artifact_kind)
+            self._check_production(approval, production)
+            self._check_evidence(
+                approval,
+                evaluation_report,
+                policy=policy,
+                fan_policy_config_sha256=config.sources.policy.sha256,
+                safety_config_sha256=config.sources.safety.sha256,
+                production_artifact_sha256=production.sha256,
+                now_ms=now_ms,
+            )
+            # **書く直前にもう一度読む。** 検証している間に production が動いていたら、
+            # その昇格はもう「いまの production」についての判断ではない。
+            current, current_revision = self._resolve_production(registry, artifact_kind)
+            if current_revision != registry_revision or current.sha256 != production.sha256:
+                raise AuthorityEvidenceError(
+                    "検証中に Model Registry の production が動いた（やり直す）"
+                    f"（revision={registry_revision}→{current_revision}）"
                 )
             event = AuthorityEvent(
                 revision=journal.revision + 1,
@@ -537,13 +563,33 @@ class AuthorityStore:
         )
 
     @staticmethod
-    def _check_production(approval: StageApproval, production: ArtifactAttestation) -> None:
-        """**いま Production である artifact そのもの**へ制御権を渡すことを確かめる。"""
-        if not production.production_active:
+    def _resolve_production(
+        registry: ModelRegistry, artifact_kind: ArtifactKind
+    ) -> tuple[ArtifactMetadata, int]:
+        """**いま** production pointer が指している artifact の metadata と registry revision。
+
+        #92 は #104 の state を**読むだけ**である（書き込む経路を持たない。0057 §2.3）。
+        読む向きは Issue #92 が引いた境界そのもので、「#104 がどの artifact を Production に
+        するか決め、#92 がその Production artifact へどこまで制御権を渡すか決める」に従う。
+        """
+        try:
+            snapshot = registry.inspect()
+        except (OSError, ValueError, ModelRegistryError) as error:
+            # Registry を読めないことを「production が無い」と読み替えない。止める。
+            raise AuthorityEvidenceError("Model Registry の状態を読めない") from error
+        slot = snapshot.production.get(artifact_kind)
+        if slot is None:
             raise AuthorityEvidenceError(
-                "Production pointer が指していない artifact へ authority を渡さない"
-                f"（status={production.status.value}）"
+                f"Production の artifact が無い（kind={artifact_kind.value}）"
             )
+        record = snapshot.artifacts.get(slot.active.key)
+        if record is None or record.status is not ArtifactStatus.PRODUCTION:
+            raise AuthorityEvidenceError("Production pointer が production artifact を指していない")
+        return record.metadata, snapshot.revision
+
+    @staticmethod
+    def _check_production(approval: StageApproval, production: ArtifactMetadata) -> None:
+        """**いま Production である artifact そのもの**へ制御権を渡すことを確かめる。"""
         if approval.to_stage not in production.authority_compatibility:
             # Registry が許していない stage を、authority の側から与えない（#104 の境界）。
             raise AuthorityApprovalError(
@@ -626,10 +672,10 @@ class AuthorityStore:
         if approval.from_stage not in observed:
             raise AuthorityEvidenceError("いまの stage で運転した証拠が無い")
         named = _check_learned_arms(report, approval)
-        # **新しさは「その arm の実績が実在する最後の区間」で測る**（codex #4056903573）。
-        # 報告全体の最新 run で測ると、Fallback だけで回した新しい run を足すだけで、
-        # 古い Learned MPC の実績が「新鮮」に見えてしまう。
-        end_ms = named.last_segment_end_ms
+        # **新しさは「その arm が最後に動いた時刻」で測る**（codex #4056903573 / #4056942799）。
+        # 報告全体の run でも segment の終わりでもない。どちらも、Fallback だけで回した
+        # 続きを足すだけで、古い Learned MPC の実績を「新鮮」にできてしまう。
+        end_ms = named.last_ts_ms
         if evidence.evidence_end_ms != end_ms:
             raise AuthorityEvidenceError(
                 "証拠の最終観測時刻が、名指した arm の実績と違う"
