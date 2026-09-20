@@ -1,7 +1,7 @@
 # 決定記録 0055: Shadow の照合が同じ時刻の重複観測をどう扱うか
 
 - **種別**: Decision Record
-- **Status**: Proposed
+- **Status**: FINAL（2026-09-20、リポジトリ所有者が承認）
 - **Date**: 2026-09-20
 - **Supersedes**: [`0053-control-shadow-mode-and-counterfactual-logging.md`](0053-control-shadow-mode-and-counterfactual-logging.md)
   §2.3 のうち、**同じ metric・同じ時刻に複数の観測があるときの扱いだけ**
@@ -109,7 +109,9 @@
 
 ## 5. 未決事項
 
-- **本記録は所有者の承認を待つ**（`Status: Proposed`）。承認をもって `FINAL` になる
+- 所有者の承認（2026-09-20）で本記録は `FINAL` になった。**§2 の決定が変わるときは、
+  書き換えずに新しい記録を作る**（`docs/decisions/README.md`「追記のみ」）。
+  下の未決事項は、**確定するまで開いたままである**
 - 将来、時刻ごとに複数の値を持ちうる取り込み（別プローブの同名 metric など）が必要になったら、
   **重複の解決ではなく metric の分離**で扱う。本記録はその設計を先取りしない
 - 食い違う重複を受け取ったときに、例外で止める以外の報告（件数を数えて続ける等）が要るかは、
