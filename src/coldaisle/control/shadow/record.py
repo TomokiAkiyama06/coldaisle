@@ -20,6 +20,7 @@ from coldaisle.control.config import ShadowConfig
 from coldaisle.control.fallback.gate import ControllerSelection
 from coldaisle.control.mpc.controller import MpcProposal
 from coldaisle.control.mpc.counterfactual import PlanPrediction
+from coldaisle.control.mpc.plan import ActionPlan
 from coldaisle.control.schema import (
     ControllerKind,
     ControllerProposal,
@@ -30,13 +31,29 @@ from coldaisle.control.schema import (
     OptimizerStatus,
     PerZone,
     Reason,
+    ShadowActionPlan,
     ShadowCounterfactual,
+    ShadowPlanStep,
     ShadowPredictedTarget,
     ShadowPrediction,
     ShadowRecord,
     SupervisorOutput,
     Zone,
 )
+
+
+def shadow_plan(plan: ActionPlan) -> ShadowActionPlan:
+    """optimizer が採用した候補 action 列を、trace に残せる形へ写す。
+
+    **形を変えない。** 同じ内容から同じ ``digest()`` が出なければ、記録した予測がどの候補に
+    対するものかを後から確かめられない（決定記録 0052 §2.2 / 0053 §2.2）。
+    """
+    return ShadowActionPlan(
+        step_ms=plan.step_ms,
+        steps=tuple(
+            ShadowPlanStep(offset_ms=step.offset_ms, demands=step.demands) for step in plan.steps
+        ),
+    )
 
 
 def shadow_prediction(prediction: PlanPrediction) -> ShadowPrediction:
@@ -86,6 +103,12 @@ class ShadowRecorder:
     """1 tick の counterfactual を組み立てる。**制御の状態を持たない純粋な記録器。**
 
     Gate が選んだ提案は counterfactual にしない。逆に counterfactual を選び直す API も無い。
+
+    **束縛が壊れていれば記録を作らず例外にする（fail closed）。** 食い違ったまま残した記録は、
+    あとの評価（#91）と昇格の判断（#92）を誤らせる。記録は制御の入力ではないので、制御ループは
+    この失敗で運転を止めない（#83 の配線。記録の失敗と制御の失敗を混ぜない）。
+    記録側の構造上限は写し元の契約と同じ値にしてあるので、**設定として妥当な解がここで弾かれる
+    ことはない**（決定記録 0053 §2.5。一致は試験で突き合わせる）。
     """
 
     def __init__(self, config: ShadowConfig) -> None:
@@ -183,6 +206,7 @@ class ShadowRecorder:
             # **提案の自称値は使わない。** Gate が裏づけた値だけを残す。
             confidence=gate.confidence if attested and gate is not None else None,
             ood=gate.ood if attested and gate is not None else None,
+            plan=shadow_plan(solution.plan) if solved and solution is not None else None,
             prediction=(
                 shadow_prediction(solution.prediction) if solved and solution is not None else None
             ),

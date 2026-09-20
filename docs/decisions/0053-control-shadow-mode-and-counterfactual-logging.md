@@ -54,12 +54,19 @@ authority stage が `SHADOW` の間、Learned MPC と RL Supervisor の提案は
 | 適用した controller / effective demand | Critical Safety の合成結果 | 制御器の requested |
 | MPC の requested demand | `ControllerProposal`（Gate が選ばなかったもの） | — |
 | Supervisor の strategy / weights / target band | **その tick の `SupervisorDecision` に実在する** `SupervisorOutput` | 別 tick の戦略 |
+| 評価した候補 plan | `MpcSolution.plan`（step ごとの demand をそのまま） | 要求値からの復元 |
 | 予測した future | `MpcSolution.prediction`（`plan_digest` と `inference_id` 付き） | 記録時に引き直した予測 |
 | confidence / ood | `ModelGateDecision`（`attested` のときだけ） | **提案の自称値** |
 | optimizer timeout / error | `optimizer_status`（解も予測も持たせない） | Baseline の値を「解」として |
 | worker の失敗（model 読込・例外） | `LearnedFailure` と worker の理由 | 省略 |
 
 裏づけの無い（`attested=False`）記録には confidence も ood も**書かない**（0050 §2.5 と同じ規則）。
+
+**予測は「どの候補 action に対するものか」まで束ねる。** 版・推論・artifact が合っていても、
+それだけでは plan A の要求に plan B の予測を貼れてしまう（同じ tick の候補は step の刻みが同じ）。
+記録には採用した候補 plan そのものを残し、読む側が `plan_digest` を数え直して照合する。
+要求した demand が plan の最初の step と違う、step 列が予測と違う、digest が合わない記録は
+**作れない**（決定記録 0052 §2.2 の識別子をそのまま使い、fail closed にする）。
 
 ### 2.3 実測との突き合わせは、**記録された時刻からだけ**決める
 
@@ -77,6 +84,11 @@ authority stage が `SHADOW` の間、Learned MPC と RL Supervisor の提案は
 - 1行 = counterfactual を持つ1 tick。`schema_version` を持ち、適用値・counterfactual・
   予測と実測の突き合わせを、同じ `tick_id` / `ts_ms` と `inference_id` で結んで置く
 - 入力は保存済み trace と観測で、**読み取りのみ**。同じ入力からは同じ bytes を出す
+- 保存した索引（`ts_ms` / `tick_id` / `schema_version`）と trace 本文が食い違う行は流さない。
+  **版も照らす**（`coldaisle.dataset` の trace 検証と同じ）。索引の版だけを見て読み分ける側が、
+  中身と違う意味で解釈するため
+- 実測の索引は **export 全体で1回**だけ作り、照合は期待時刻の周りだけを二分探索で切り出す。
+  行ごとに観測を並べ直すと、走査が行数に比例して伸びる（結果は素朴な全走査と同じ）
 - 突き合わせ結果は trace へ**書き戻さない**（追記専用の記録を後から書き換えない）
 - #91 Offline Evaluation はこの行を読む。Shadow 側に別の集計経路を作らない
 
@@ -89,8 +101,13 @@ shadow:
 ```
 
 - **実測前の暫定値**として扱う。コードに既定値を置かない
-- 記録の構造上の上限（1 tick の counterfactual 4件、1予測の step 16、1 step の metric 8）は
-  trace の大きさを抑えるための**構造上の上限**であり、調整値ではないのでコード側に置く
+- 許容幅は `mpc.optimizer.step_ms` 未満を設定で検証する（§2.3）
+- 記録の構造上の上限はコード側に置くが、**写し元の契約と同じ値にする**。
+  1 tick の counterfactual は制御器の種類の数、候補 plan と予測の step 数は
+  `MAX_MPC_HORIZON_STEPS` / `MAX_TARGET_HORIZONS`、1 step の metric 数は `MAX_TARGET_METRICS`、
+  metric 名の形と長さは `ThermalMetricName` に合わせる。**記録側だけが狭いと、設定としては
+  妥当な MPC が出した解を記録できず、tick の途中で記録が失敗する。** 下位 schema から上位
+  module を import しないため値は写しになり、一致は試験で突き合わせる
 
 ## 3. Consequences
 
@@ -99,6 +116,9 @@ shadow:
 - #91 は trace と観測だけで比較できる。Shadow 専用の収集経路を作らずに済む
 - trace は大きくなる。`shadow.enabled`・構造上の上限・保持期間（0030 の `control_trace_days`）で抑える
 - `ControlTick` の版が v6 になる。保存済みの v1〜v5 はそのまま読める（shadow を持てない）
+- 記録の束縛（推論・候補 plan・適用値との対応）が壊れていれば、記録は**例外で閉じる**。
+  記録は制御の入力ではないので、制御ループ側はこの失敗で運転を止めない配線にする（#83）。
+  逆に「黙って記録しない」を選ぶと、食い違いに気づけないまま評価だけが進む
 
 ## 4. 却下した代替案
 
@@ -110,6 +130,8 @@ shadow:
 | 照合の時刻に処理時刻（現在時刻）を使う | 遅れて流し込んだ古い観測が「新しい証拠」になる。0050 §2.2 で塞いだ穴と同じ |
 | shadow 専用に confidence を計算し直す | #85 と二重になり、どちらが本物か分からなくなる。Gate の判定だけを写す |
 | 記録した予測を、あとで plan から引き直す | 探索に使った予測と別のものを記録しうる。採用した解と対で持つ |
+| 候補 plan を残さず、要求と offset から plan を組み直して digest を数える | v1 の「horizon 全体で同じ demand」に依存する。step ごとに違う demand を探索する版が入った瞬間、正しい記録まで閉じる |
+| 記録側の上限を小さめに置いて trace を抑える | 設定としては妥当な解を記録できない tick が生まれる。量は `enabled` と保持期間で抑える |
 
 ## 5. 未決事項
 

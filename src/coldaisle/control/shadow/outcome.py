@@ -13,7 +13,8 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from bisect import bisect_left, bisect_right
+from collections.abc import Iterable, Sequence
 from typing import Self
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -93,6 +94,55 @@ class ShadowOutcome(_Frozen):
         return self.matched == len(self.matches)
 
 
+class ObservationIndex:
+    """metric ごとに時刻順へ並べ直した実測。**1回だけ作って使い回す。**
+
+    予測1件ごとに観測の履歴を並べ直すと、走査が「その tick の候補の数 × 履歴の長さ」に
+    比例して伸びる。ここで metric ごとに1回だけ並べ、照合は期待時刻の周り
+    （``±tolerance``）だけを二分探索で切り出して見る。**規則は変えない。**
+
+    同じ metric・同じ時刻の観測が2つあれば、**値の小さいほうを採る**。どちらでも誤差の
+    扱いは同じだが、入力の順序で結果が変わらないように順序を固定しておく。
+    """
+
+    __slots__ = ("_by_metric",)
+
+    def __init__(self, observations: Iterable[OutcomeObservation]) -> None:
+        collected: dict[str, list[tuple[int, float]]] = {}
+        for observation in observations:
+            value = observation.usable
+            if value is None:
+                # 品質が OK でない値は「当たった証拠」に数えない。索引にも入れない。
+                continue
+            collected.setdefault(observation.metric, []).append((observation.ts_ms, value))
+        # 時刻の列も**ここで一度だけ**作る。照合のたびに作り直すと、二分探索の意味が無くなる。
+        self._by_metric: dict[str, tuple[list[int], list[tuple[int, float]]]] = {}
+        for metric, points in collected.items():
+            points.sort()
+            self._by_metric[metric] = ([point[0] for point in points], points)
+
+    def nearest(
+        self, metric: str, *, expected_ts_ms: int, tolerance_ms: int, after_ts_ms: int
+    ) -> tuple[int, float] | None:
+        """期待時刻に最も近い観測を返す。**同距離なら過去側**、無ければ None。"""
+        found = self._by_metric.get(metric)
+        if found is None:
+            return None
+        timestamps, points = found
+        low = bisect_left(timestamps, expected_ts_ms - tolerance_ms)
+        high = bisect_right(timestamps, expected_ts_ms + tolerance_ms)
+        best: tuple[int, int, float] | None = None
+        for ts_ms, value in points[low:high]:
+            if ts_ms <= after_ts_ms:
+                # 予測の元になった action より後の観測だけが、その action の効果を含む。
+                continue
+            distance = abs(ts_ms - expected_ts_ms)
+            # 時刻の昇順に見るので、同距離なら先に見た（過去側の）候補が残る。
+            if best is None or distance < best[0]:
+                best = (distance, ts_ms, value)
+        return None if best is None else (best[1], best[2])
+
+
 class ShadowOutcomeMatcher:
     """記録済みの予測に実測を突き合わせる。**時計も I/O も持たない。**
 
@@ -112,9 +162,13 @@ class ShadowOutcomeMatcher:
     def match(
         self,
         prediction: ShadowPrediction,
-        observations: Sequence[OutcomeObservation],
+        observations: Sequence[OutcomeObservation] | ObservationIndex,
     ) -> ShadowOutcome:
-        """予測の全出力を実測と突き合わせる。照合できない出力は理由付きで残す。"""
+        """予測の全出力を実測と突き合わせる。照合できない出力は理由付きで残す。
+
+        多くの予測を続けて照合するときは ``ObservationIndex`` を一度作って渡す。
+        結果は列を渡したときと同じになる。
+        """
         shortest_offset_ms = prediction.targets[0].offset_ms
         if self._tolerance_ms >= shortest_offset_ms:
             # 許容幅が1 step に届くと、別の step（別の候補 action の効果）の実測を
@@ -122,7 +176,11 @@ class ShadowOutcomeMatcher:
             raise ShadowOutcomeUnusableError(
                 f"照合の許容幅={self._tolerance_ms} が最短 offset={shortest_offset_ms} 以上"
             )
-        ordered = sorted(observations, key=lambda item: (item.ts_ms, item.metric))
+        index = (
+            observations
+            if isinstance(observations, ObservationIndex)
+            else ObservationIndex(observations)
+        )
         matches = tuple(
             self._match_output(
                 prediction,
@@ -130,7 +188,7 @@ class ShadowOutcomeMatcher:
                 expected_ts_ms=target.expected_ts_ms,
                 metric=metric,
                 predicted=value,
-                ordered=ordered,
+                index=index,
             )
             for target in prediction.targets
             for metric, value in sorted(target.values.items())
@@ -151,21 +209,14 @@ class ShadowOutcomeMatcher:
         expected_ts_ms: int,
         metric: str,
         predicted: float,
-        ordered: Sequence[OutcomeObservation],
+        index: ObservationIndex,
     ) -> OutcomeMatch:
-        best: tuple[int, int, float] | None = None
-        for observation in ordered:
-            if observation.metric != metric:
-                continue
-            value = observation.usable
-            if value is None or observation.ts_ms <= prediction.input_action_ts_ms:
-                continue
-            distance = abs(observation.ts_ms - expected_ts_ms)
-            if distance > self._tolerance_ms:
-                continue
-            # 時刻順に見るので、同距離なら先に見た（過去側の）候補を残す。
-            if best is None or distance < best[0]:
-                best = (distance, observation.ts_ms, value)
+        best = index.nearest(
+            metric,
+            expected_ts_ms=expected_ts_ms,
+            tolerance_ms=self._tolerance_ms,
+            after_ts_ms=prediction.input_action_ts_ms,
+        )
         if best is None:
             return OutcomeMatch(
                 offset_ms=offset_ms,
@@ -177,7 +228,7 @@ class ShadowOutcomeMatcher:
                     detail=f"expected_ts_ms={expected_ts_ms}; tolerance_ms={self._tolerance_ms}",
                 ),
             )
-        _distance, observed_ts_ms, observed = best
+        observed_ts_ms, observed = best
         return OutcomeMatch(
             offset_ms=offset_ms,
             expected_ts_ms=expected_ts_ms,

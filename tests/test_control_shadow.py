@@ -11,6 +11,7 @@
 6. **RulePolicy active + MPC shadow** を同じ trace に残せる
 7. #91 Offline Evaluation へ **決定論的に export** できる
 8. 記録は設定で止められる（止めても制御は変わらない）
+9. 写した構造上の上限が、元の契約と食い違わない（記録側だけが狭くならない）
 """
 
 from __future__ import annotations
@@ -40,7 +41,9 @@ from coldaisle.control.schema import (
     PerZone,
     Reason,
     SafetyState,
+    ShadowActionPlan,
     ShadowCounterfactual,
+    ShadowPlanStep,
     ShadowPredictedTarget,
     ShadowPrediction,
     ShadowRecord,
@@ -52,11 +55,13 @@ from coldaisle.control.schema import (
     ZoneRecord,
 )
 from coldaisle.control.shadow import (
+    ObservationIndex,
     OutcomeObservation,
     ShadowOutcomeMatcher,
     ShadowOutcomeUnusableError,
     ShadowRecorder,
     counterfactual_controllers,
+    shadow_plan,
     shadow_rows,
     write_shadow_jsonl,
 )
@@ -245,29 +250,62 @@ def recorded(
     return selection, state, record
 
 
+def plan_for(demand: float = 0.8, *, offsets: tuple[int, ...] = (1_000, 2_000)) -> ShadowActionPlan:
+    """記録した候補 action 列（v1 は horizon 全体で同じ demand を保つ）。"""
+    return ShadowActionPlan(
+        step_ms=offsets[0],
+        steps=tuple(
+            ShadowPlanStep(offset_ms=offset, demands=demands(demand)) for offset in offsets
+        ),
+    )
+
+
 def prediction(
     *,
     action_ts_ms: int = 100_000,
     offsets: tuple[int, ...] = (1_000, 2_000),
     values: tuple[float, ...] = (50.0, 51.0),
     inference: str = "c" * 64,
+    plan: ShadowActionPlan | None = None,
+    metric: str = GPU,
 ) -> ShadowPrediction:
+    """候補 plan に対応する予測。plan を渡さなければ同じ offset の held plan を使う。"""
+    plan = plan if plan is not None else plan_for(offsets=offsets)
     return ShadowPrediction(
         model_id="rack-thermal",
         model_version="thermal-v1",
         artifact_sha256="a" * 64,
         inference_id=inference,
-        plan_digest="d" * 64,
+        plan_digest=plan.digest(),
         input_action_ts_ms=action_ts_ms,
         targets=tuple(
             ShadowPredictedTarget(
                 offset_ms=offset,
                 expected_ts_ms=action_ts_ms + offset,
-                values={GPU: value},
+                values={metric: value},
             )
             for offset, value in zip(offsets, values, strict=True)
         ),
     )
+
+
+def solved_counterfactual(**overrides) -> dict[str, object]:
+    """解を持つ Learned MPC の counterfactual（不変条件を1つずつ壊すための素体）。"""
+    plan = plan_for()
+    payload: dict[str, object] = {
+        "controller": ControllerKind.LEARNED_MPC,
+        "requested": plan.first,
+        "reason": Reason(code="optimizer_ok"),
+        "optimizer_status": OptimizerStatus.OK,
+        "model_version": "thermal-v1",
+        "inference_id": "c" * 64,
+        "artifact_sha256": "a" * 64,
+        "plan": plan,
+        "prediction": prediction(plan=plan),
+        "cost_total": 1.0,
+        "baseline_cost_total": 2.0,
+    }
+    return payload | overrides
 
 
 def observation(ts_ms: int, value: float, *, quality: Quality = Quality.OK) -> OutcomeObservation:
@@ -488,19 +526,49 @@ def test_invariant_2_a_the_prediction_comes_from_the_recorded_inference(trained_
 
 def test_invariant_2_b_a_prediction_from_another_inference_cannot_be_attached() -> None:
     """別の推論の予測を counterfactual へ**貼り替えられない**。"""
+    plan = plan_for()
     with pytest.raises(ValidationError, match="別の推論"):
         ShadowCounterfactual(
-            controller=ControllerKind.LEARNED_MPC,
-            requested=demands(0.8),
-            reason=Reason(code="optimizer_ok"),
-            optimizer_status=OptimizerStatus.OK,
-            model_version="thermal-v1",
-            inference_id="c" * 64,
-            artifact_sha256="a" * 64,
-            prediction=prediction(inference="e" * 64),
-            cost_total=1.0,
-            baseline_cost_total=2.0,
+            **solved_counterfactual(prediction=prediction(plan=plan, inference="e" * 64))
         )
+
+
+def test_invariant_2_e_a_prediction_for_another_candidate_plan_cannot_be_attached() -> None:
+    """**候補 plan が違えば貼れない。** 版・推論・artifact が合っていても閉じる。
+
+    同じ tick の候補は step の刻みが同じなので、識別子まで照らさないと plan A の要求に
+    plan B の予測を貼れる（決定記録 0052 §2.2 / 0053 §2.2）。
+    """
+    other = plan_for(0.2)
+    with pytest.raises(ValidationError, match="別の候補 plan"):
+        # 予測だけを別の候補のものに差し替える（requested と plan はそのまま）。
+        ShadowCounterfactual(**solved_counterfactual(prediction=prediction(plan=other)))
+
+    with pytest.raises(ValidationError, match="最初の step と違う"):
+        # plan を差し替えて digest を合わせても、要求した demand と食い違う。
+        ShadowCounterfactual(**solved_counterfactual(plan=other, prediction=prediction(plan=other)))
+
+    longer = plan_for(offsets=(1_000, 2_000, 3_000))
+    with pytest.raises(ValidationError, match="候補 plan と予測の step 列"):
+        # digest も要求も合うが、予測が覆う step が plan より短い。
+        ShadowCounterfactual(
+            **solved_counterfactual(
+                plan=longer, prediction=prediction(plan=longer, offsets=(1_000, 2_000))
+            )
+        )
+
+
+def test_invariant_2_f_the_recorded_plan_digest_matches_the_optimizer_s() -> None:
+    """記録した候補 plan の digest は、**optimizer の `ActionPlan` と同じ値**になる。
+
+    ここがずれると、trace 側で数え直した digest が予測と一致せず、正しい記録まで閉じる。
+    """
+    from coldaisle.control.mpc import ActionPlan
+
+    original = ActionPlan.held(demands(0.8), step_ms=1_000, steps=2)
+
+    assert shadow_plan(original).digest() == original.digest()
+    assert plan_for(0.8, offsets=(1_000, 2_000)).digest() == original.digest()
 
 
 def test_invariant_2_c_the_counterfactual_and_the_gate_must_share_one_inference() -> None:
@@ -519,18 +587,7 @@ def test_invariant_2_c_the_counterfactual_and_the_gate_must_share_one_inference(
 def test_invariant_2_d_a_solution_cost_cannot_beat_its_own_baseline_backwards() -> None:
     """Baseline より悪い解を「採用した解」として記録できない（#86 の不変条件を写す）。"""
     with pytest.raises(ValidationError, match="Baseline を上回っている"):
-        ShadowCounterfactual(
-            controller=ControllerKind.LEARNED_MPC,
-            requested=demands(0.8),
-            reason=Reason(code="optimizer_ok"),
-            optimizer_status=OptimizerStatus.OK,
-            model_version="thermal-v1",
-            inference_id="c" * 64,
-            artifact_sha256="a" * 64,
-            prediction=prediction(),
-            cost_total=3.0,
-            baseline_cost_total=2.0,
-        )
+        ShadowCounterfactual(**solved_counterfactual(cost_total=3.0, baseline_cost_total=2.0))
 
 
 # ------------------------------------- 不変条件 3: 照合は記録された時刻からだけ決まる
@@ -638,6 +695,72 @@ def _optimizer_with_step(step_ms: int) -> dict[str, object]:
     document["step_ms"] = {"value": step_ms, "status": "provisional"}
     document["horizon_ms"] = {"value": step_ms * 2, "status": "provisional"}
     return document
+
+
+def _naive_matches(
+    prediction_: ShadowPrediction,
+    observations: list[OutcomeObservation],
+    *,
+    tolerance_ms: int,
+) -> list[tuple[int, str, int | None, float | None]]:
+    """索引を使わない素朴な突き合わせ（最適化の前後で結果が同じことを確かめる基準）。"""
+    results: list[tuple[int, str, int | None, float | None]] = []
+    for target in prediction_.targets:
+        for metric, _value in sorted(target.values.items()):
+            best: tuple[int, int, float] | None = None
+            for item in sorted(observations, key=lambda one: (one.ts_ms, one.metric)):
+                value = item.usable
+                if item.metric != metric or value is None:
+                    continue
+                if item.ts_ms <= prediction_.input_action_ts_ms:
+                    continue
+                distance = abs(item.ts_ms - target.expected_ts_ms)
+                if distance > tolerance_ms:
+                    continue
+                if best is None or distance < best[0]:
+                    best = (distance, item.ts_ms, value)
+            found = (None, None) if best is None else (best[1], best[2])
+            results.append((target.offset_ms, metric, found[0], found[1]))
+    return results
+
+
+def test_invariant_3_h_the_indexed_match_equals_the_naive_one() -> None:
+    """**索引を使っても結果が変わらない。** 走査の順序ではなく規則で決まっていること。
+
+    期待時刻の周りだけを二分探索で切り出す実装へ替えたので、履歴が長く metric が混ざった
+    入力で、素朴な全走査と同じ照合になることを確かめる。
+    """
+    metrics = (GPU, "cpu.package")
+    observations = [
+        OutcomeObservation(
+            metric=metric,
+            ts_ms=ts_ms,
+            value=float(ts_ms % 97) / 3.0,
+            quality=Quality.OK if ts_ms % 7 else Quality.STALE,
+        )
+        for metric in metrics
+        for ts_ms in range(99_000, 106_000, 137)
+    ]
+    # 同じ時刻に2つ、action より前、許容幅の外なども混ぜる。
+    observations.append(
+        OutcomeObservation(metric=GPU, ts_ms=101_000, value=1.0, quality=Quality.OK)
+    )
+    observations.append(OutcomeObservation(metric=GPU, ts_ms=99_000, value=2.0, quality=Quality.OK))
+    matcher = ShadowOutcomeMatcher(match_tolerance_ms=400)
+    index = ObservationIndex(observations)
+
+    for metric in metrics:
+        predicted = prediction(metric=metric, offsets=(1_000, 2_000), values=(50.0, 51.0))
+        expected = _naive_matches(predicted, observations, tolerance_ms=400)
+
+        from_sequence = matcher.match(predicted, observations)
+        from_index = matcher.match(predicted, index)
+
+        assert from_sequence == from_index
+        assert [
+            (item.offset_ms, item.metric, item.observed_ts_ms, item.observed)
+            for item in from_index.matches
+        ] == expected
 
 
 # ------------------------------------- 不変条件 4: 裏づけの無い数値を残さない
@@ -951,11 +1074,30 @@ def test_invariant_7_c_ticks_without_a_counterfactual_are_not_exported() -> None
     assert list(shadow_rows(trace_rows(tick))) == []
 
 
-def test_invariant_7_d_a_trace_whose_index_disagrees_is_refused(trained_model) -> None:
-    """索引と中身が食い違う trace を、そのまま評価へ流さない。"""
+@pytest.mark.parametrize("field", ["tick_id", "ts_ms", "schema_version"])
+def test_invariant_7_d_a_trace_whose_index_disagrees_is_refused(trained_model, field) -> None:
+    """索引と中身が食い違う trace を、そのまま評価へ流さない。**版も照らす。**
+
+    版だけがずれた trace を通すと、索引の版で読み分ける側が中身と違う意味で解釈する
+    （`coldaisle.dataset` の trace 検証と同じ）。
+    """
     tick = exportable_tick(trained_model)
     (row,) = trace_rows(tick)
-    forged = row.model_copy(update={"tick_id": row.tick_id + 1})
+    forged = row.model_copy(update={field: getattr(row, field) + 1})
+
+    with pytest.raises(ValueError, match="索引と中身"):
+        list(shadow_rows((forged,)))
+
+
+def test_invariant_7_f_a_broken_index_is_refused_even_without_a_counterfactual() -> None:
+    """counterfactual を持たない行でも索引は照らす。
+
+    素通しすると、索引の壊れた trace が「この期間には Shadow 実績が無い」に化ける。
+    """
+    selection = gate_selection()
+    tick = tick_with(None, state=control_state(selection))
+    (row,) = trace_rows(tick)
+    forged = row.model_copy(update={"schema_version": row.schema_version - 1})
 
     with pytest.raises(ValueError, match="索引と中身"):
         list(shadow_rows((forged,)))
@@ -1017,3 +1159,69 @@ def test_the_recorder_refuses_a_baseline_that_is_not_the_fallback() -> None:
             selection=selection,
             baseline=learned_proposal(0.9),
         )
+
+
+# ------------------------------------- 不変条件 9: 写した上限が元の契約と一致する
+
+
+def test_invariant_9_a_the_structural_limits_match_the_contracts_they_copy() -> None:
+    """**写し元より狭い上限を置かない。**
+
+    記録側だけが狭いと、設定としては妥当な MPC が出した解を記録できず、tick の途中で
+    記録が失敗する。schema から上位 module を import しない代わりに、ここで突き合わせる。
+    """
+    from coldaisle.control.config import MAX_MPC_HORIZON_STEPS
+    from coldaisle.control.model.thermal import (
+        MAX_METRIC_NAME_LENGTH,
+        MAX_TARGET_HORIZONS,
+        MAX_TARGET_METRICS,
+    )
+    from coldaisle.control.schema import (
+        MAX_SHADOW_COUNTERFACTUALS,
+        MAX_SHADOW_METRIC_NAME_LENGTH,
+        MAX_SHADOW_PLAN_STEPS,
+        MAX_SHADOW_PREDICTION_METRICS,
+    )
+
+    assert MAX_SHADOW_PLAN_STEPS >= MAX_MPC_HORIZON_STEPS
+    assert MAX_SHADOW_PLAN_STEPS >= MAX_TARGET_HORIZONS
+    assert MAX_SHADOW_PREDICTION_METRICS >= MAX_TARGET_METRICS
+    assert MAX_SHADOW_METRIC_NAME_LENGTH >= MAX_METRIC_NAME_LENGTH
+    # 制御器ごとに高々1つしか入らないので、種類の数と一致する。
+    assert len(ControllerKind) == MAX_SHADOW_COUNTERFACTUALS
+
+
+def test_invariant_9_b_the_metric_name_contract_matches_the_model_s() -> None:
+    """記録する metric 名の形を、モデルの target metric より狭くしない。"""
+    from coldaisle.control.model.thermal import ThermalMetricName
+    from coldaisle.control.schema import SHADOW_METRIC_NAME_PATTERN
+
+    def pattern_of(annotated: object) -> str:
+        found = [
+            constraint.pattern
+            for item in getattr(annotated, "__metadata__", ())
+            for constraint in (*getattr(item, "metadata", ()), item)
+            if getattr(constraint, "pattern", None) is not None
+        ]
+        assert found, f"pattern を持たない注釈: {annotated!r}"
+        return str(found[0])
+
+    assert pattern_of(ThermalMetricName) == SHADOW_METRIC_NAME_PATTERN
+
+
+def test_invariant_9_c_a_full_horizon_solution_can_be_recorded() -> None:
+    """設定が許す**最大の horizon** の解も、そのまま記録できる（途中で失敗しない）。"""
+    from coldaisle.control.config import MAX_MPC_HORIZON_STEPS
+
+    offsets = tuple(1_000 * (index + 1) for index in range(MAX_MPC_HORIZON_STEPS))
+    plan = plan_for(0.8, offsets=offsets)
+    values = tuple(50.0 + index for index in range(len(offsets)))
+
+    counterfactual = ShadowCounterfactual(
+        **solved_counterfactual(
+            plan=plan, prediction=prediction(plan=plan, offsets=offsets, values=values)
+        )
+    )
+
+    assert counterfactual.plan is not None
+    assert len(counterfactual.plan.steps) == MAX_MPC_HORIZON_STEPS

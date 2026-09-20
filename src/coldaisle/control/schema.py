@@ -17,6 +17,8 @@ Supervisor の出力は #88 で本moduleに追加した。Telemetry snapshot は
 
 from __future__ import annotations
 
+import hashlib
+import json
 from enum import StrEnum
 from typing import Annotated, Literal, Self
 
@@ -571,22 +573,89 @@ class ModelGateDecision(_Frozen):
 SHADOW_SCHEMA_VERSION: Literal[1] = 1
 """`ShadowRecord` の形の版（#90 / 決定記録 0053）。"""
 
-MAX_SHADOW_COUNTERFACTUALS = 4
-"""1 tick に残す counterfactual の上限。trace の大きさを抑える構造上の上限で、調整値ではない。"""
+MAX_SHADOW_COUNTERFACTUALS = len(ControllerKind)
+"""1 tick に残す counterfactual の上限。
 
-MAX_SHADOW_PREDICTION_TARGETS = 16
-"""1つの予測に残す control step 数の上限。構造上の上限で、調整値ではない。"""
+制御器ごとに高々1つなので（`ShadowRecord` が重複を拒む）、**種類の数と必ず一致する**。
+任意の数を置くと、制御器が増えたときにここだけが先に詰まる。
+"""
 
-MAX_SHADOW_PREDICTION_METRICS = 8
-"""1 step に残す予測 metric 数の上限。構造上の上限で、調整値ではない。"""
+MAX_SHADOW_PLAN_STEPS = 32
+"""counterfactual の候補 plan と予測に残す control step 数の上限。
+
+**写している契約と同じ値にする。** 設定が許す plan の step 数（`MAX_MPC_HORIZON_STEPS`）と
+予測が持てる horizon 数（`MAX_TARGET_HORIZONS`）はどちらも 32 で、ここだけ狭いと
+「設定としては妥当な MPC が出した解を記録できない」tick が生まれる。記録の失敗は制御の
+途中で起きるので、**狭い上限を後から見つけない**。下位 schema から上位 module を import
+しないためここに写し、一致は試験で確かめる。
+"""
+
+MAX_SHADOW_PREDICTION_METRICS = 32
+"""1 step に残す予測 metric 数の上限。`MAX_TARGET_METRICS` に合わせる（同上）。"""
+
+MAX_SHADOW_METRIC_NAME_LENGTH = 120
+"""予測 metric 名の長さの上限。`MAX_METRIC_NAME_LENGTH`（#84）に合わせる（同上）。"""
 
 Sha256Hex = Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
 
+SHADOW_METRIC_NAME_PATTERN = r"^[a-z][a-z0-9_]*(\.[a-z0-9_]+){1,3}$"
+"""予測 metric 名の形。**`ThermalMetricName`（#84）と同じ**にする。
+
+記録するのはモデルの target metric なので、そちらより狭い形にすると、学習に使えた metric を
+記録できなくなる。一致は試験で確かめる。
+"""
+
 ShadowMetricName = Annotated[
     str,
-    Field(pattern=r"^[a-z][a-z0-9_]*(\.([a-z][a-z0-9_]*|[0-9]+)){1,3}$", max_length=64),
+    Field(pattern=SHADOW_METRIC_NAME_PATTERN, max_length=MAX_SHADOW_METRIC_NAME_LENGTH),
 ]
-"""予測 metric の名前。保存済み metric（決定記録 0002）と同じ形にする。"""
+
+
+class ShadowPlanStep(_Frozen):
+    """記録した候補 action 列の1 step。"""
+
+    offset_ms: int = Field(gt=0)
+    demands: PerZone[Demand]
+
+
+class ShadowActionPlan(_Frozen):
+    """counterfactual が評価された候補 action 列。
+
+    **``coldaisle.control.mpc.plan.ActionPlan`` と同じ形にする。** 同じ内容から同じ
+    ``digest()`` が出なければ、記録した予測がどの候補に対するものかを後から確かめられない。
+    schema から mpc を import しないためここに写し、digest の一致は試験で確かめる。
+    """
+
+    step_ms: int = Field(gt=0)
+    steps: tuple[ShadowPlanStep, ...] = Field(min_length=1, max_length=MAX_SHADOW_PLAN_STEPS)
+
+    @model_validator(mode="after")
+    def _offsets_are_a_uniform_grid(self) -> Self:
+        expected = tuple(self.step_ms * (index + 1) for index in range(len(self.steps)))
+        if tuple(step.offset_ms for step in self.steps) != expected:
+            raise ValueError("shadow plan の offset_ms は step_ms の等間隔にする")
+        return self
+
+    @property
+    def first(self) -> PerZone[Demand]:
+        """次の control step で要求していた demand。**これだけが requested になりうる。**"""
+        return self.steps[0].demands
+
+    @property
+    def offsets_ms(self) -> tuple[int, ...]:
+        """各 step の予測時刻（action からの相対）。"""
+        return tuple(step.offset_ms for step in self.steps)
+
+    def digest(self) -> str:
+        """この plan を一意に表す SHA-256（``ActionPlan.digest()`` と同じ値）。"""
+        payload = json.dumps(
+            self.model_dump(mode="json"),
+            ensure_ascii=False,
+            allow_nan=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+        return hashlib.sha256(payload).hexdigest()
 
 
 class ShadowPredictedTarget(_Frozen):
@@ -621,7 +690,7 @@ class ShadowPrediction(_Frozen):
     """予測した候補 plan の識別子（``ActionPlan.digest()``。決定記録 0052 §2.2）。"""
     input_action_ts_ms: int = Field(ge=0)
     targets: tuple[ShadowPredictedTarget, ...] = Field(
-        min_length=1, max_length=MAX_SHADOW_PREDICTION_TARGETS
+        min_length=1, max_length=MAX_SHADOW_PLAN_STEPS
     )
 
     @model_validator(mode="after")
@@ -660,6 +729,8 @@ class ShadowCounterfactual(_Frozen):
     """Gate が検証済み assessment で裏付けた記録か。"""
     confidence: float | None = Field(default=None, ge=0.0, le=1.0, allow_inf_nan=False)
     ood: bool | None = None
+    plan: ShadowActionPlan | None = None
+    """予測した候補 action 列そのもの。``requested`` はこの plan の最初の step である。"""
     prediction: ShadowPrediction | None = None
     cost_total: float | None = Field(default=None, ge=0.0, allow_inf_nan=False)
     baseline_cost_total: float | None = Field(default=None, ge=0.0, allow_inf_nan=False)
@@ -677,6 +748,7 @@ class ShadowCounterfactual(_Frozen):
             self.model_version,
             self.inference_id,
             self.artifact_sha256,
+            self.plan,
             self.prediction,
             self.cost_total,
             self.baseline_cost_total,
@@ -697,6 +769,7 @@ class ShadowCounterfactual(_Frozen):
                     self.model_version,
                     self.inference_id,
                     self.artifact_sha256,
+                    self.plan,
                     self.prediction,
                     self.cost_total,
                     self.baseline_cost_total,
@@ -719,11 +792,11 @@ class ShadowCounterfactual(_Frozen):
             raise ValueError("counterfactual のコストは Baseline と対で記録する")
         if not solved:
             # timeout / error の tick は解を持たない。Baseline の値を「MPC の解」として残さない。
-            if self.prediction is not None or self.cost_total is not None:
+            if self.prediction is not None or self.cost_total is not None or self.plan is not None:
                 raise ValueError("optimizer_status が ok でない counterfactual に解を残さない")
             return self._check_attestation()
-        if self.prediction is None:
-            raise ValueError("ok の counterfactual には予測 future が要る（#90 の記録対象）")
+        if self.prediction is None or self.plan is None:
+            raise ValueError("ok の counterfactual には候補 plan と予測 future が要る（#90）")
         if self.cost_total is None or self.baseline_cost_total is None:
             raise ValueError("ok の counterfactual にはコストと Baseline コストが要る")
         if self.cost_total > self.baseline_cost_total:
@@ -736,7 +809,22 @@ class ShadowCounterfactual(_Frozen):
         ):
             # 別の推論の予測を貼り替えて「当たっていた」記録にさせない。
             raise ValueError("counterfactual の予測が別の推論のもの")
+        self._check_plan(self.plan, prediction)
         return self._check_attestation()
+
+    def _check_plan(self, plan: ShadowActionPlan, prediction: ShadowPrediction) -> None:
+        """記録した要求・候補 plan・予測が**同じ候補**を指しているか（決定記録 0052 §2.2）。
+
+        版・推論・artifact が合っていても、それだけでは「どの候補 action に対する予測か」は
+        決まらない。同じ tick の候補は step の刻みが同じなので、plan の識別子まで照らさないと
+        plan A の要求に plan B の予測を貼れてしまう。**digest を数え直して閉じる。**
+        """
+        if plan.first != self.requested:
+            raise ValueError("counterfactual の requested が候補 plan の最初の step と違う")
+        if plan.offsets_ms != tuple(target.offset_ms for target in prediction.targets):
+            raise ValueError("counterfactual の候補 plan と予測の step 列が違う")
+        if plan.digest() != prediction.plan_digest:
+            raise ValueError("counterfactual の予測が別の候補 plan のもの")
 
     def _check_attestation(self) -> Self:
         """裏付けのない confidence / ood を counterfactual に残さないこと（0050 §2.5 と同じ）。"""

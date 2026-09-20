@@ -22,6 +22,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from coldaisle.control.schema import ControllerKind, ControlTick, ShadowRecord
 from coldaisle.control.shadow.outcome import (
+    ObservationIndex,
     OutcomeObservation,
     ShadowOutcome,
     ShadowOutcomeMatcher,
@@ -78,46 +79,48 @@ def shadow_rows(
     ``matcher`` を渡すと予測と実測を突き合わせる。渡さなければ ``outcomes`` は空になる。
     **突き合わせの有無で counterfactual の記録内容は変わらない。**
     """
-    by_metric: dict[str, list[OutcomeObservation]] = {}
-    for observation in observations:
-        by_metric.setdefault(observation.metric, []).append(observation)
+    # 実測の索引は**全行で1つ**。行ごとに並べ直すと、走査が行数に比例して伸びる。
+    index = ObservationIndex(observations)
     for row in traces:
         tick = ControlTick.model_validate_json(row.trace_json)
+        # **counterfactual の有無に関わらず先に照らす。** shadow を持たない行を素通しすると、
+        # 索引の壊れた trace が「この期間には Shadow 実績が無い」に化ける。
+        if (tick.tick_id, tick.ts_ms, tick.schema_version) != (
+            row.tick_id,
+            row.ts_ms,
+            row.schema_version,
+        ):
+            # 保存した索引と中身が食い違う trace を、そのまま評価へ流さない。
+            # **版も照らす**（`coldaisle.dataset` の trace 検証と同じ）。索引の版だけを見て
+            # 読み分ける側が、中身と違う意味で解釈してしまう。
+            raise ValueError(
+                f"decision trace の索引と中身が一致しない"
+                f"（row={row.tick_id}/{row.ts_ms}/v{row.schema_version}; "
+                f"trace={tick.tick_id}/{tick.ts_ms}/v{tick.schema_version}）"
+            )
         if tick.shadow is None:
             continue
-        if (tick.tick_id, tick.ts_ms) != (row.tick_id, row.ts_ms):
-            # 保存した索引と中身が食い違う trace を、そのまま評価へ流さない。
-            raise ValueError(
-                f"decision trace の索引と中身が一致しない（row={row.tick_id}/{row.ts_ms}; "
-                f"trace={tick.tick_id}/{tick.ts_ms}）"
-            )
         yield ShadowExportRow(
             control_schema_version=tick.schema_version,
             tick_id=tick.tick_id,
             ts_ms=tick.ts_ms,
             shadow=tick.shadow,
-            outcomes=_outcomes(tick.shadow, by_metric, matcher),
+            outcomes=_outcomes(tick.shadow, index, matcher),
         )
 
 
 def _outcomes(
     shadow: ShadowRecord,
-    by_metric: dict[str, list[OutcomeObservation]],
+    index: ObservationIndex,
     matcher: ShadowOutcomeMatcher | None,
 ) -> tuple[ShadowOutcome, ...]:
     if matcher is None:
         return ()
-    outcomes: list[ShadowOutcome] = []
-    for counterfactual in shadow.counterfactuals:
-        prediction = counterfactual.prediction
-        if prediction is None:
-            continue
-        needed: list[OutcomeObservation] = []
-        for target in prediction.targets:
-            for metric in target.values:
-                needed.extend(by_metric.get(metric, ()))
-        outcomes.append(matcher.match(prediction, needed))
-    return tuple(outcomes)
+    return tuple(
+        matcher.match(counterfactual.prediction, index)
+        for counterfactual in shadow.counterfactuals
+        if counterfactual.prediction is not None
+    )
 
 
 def write_shadow_jsonl(rows: Iterable[ShadowExportRow], stream: TextIO) -> int:

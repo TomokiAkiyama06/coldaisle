@@ -15,17 +15,19 @@ from coldaisle.control.shadow.export import (
     write_shadow_jsonl,
 )
 from coldaisle.control.shadow.outcome import (
+    ObservationIndex,
     OutcomeMatch,
     OutcomeObservation,
     ShadowOutcome,
     ShadowOutcomeMatcher,
     ShadowOutcomeUnusableError,
 )
-from coldaisle.control.shadow.record import ShadowRecorder, shadow_prediction
+from coldaisle.control.shadow.record import ShadowRecorder, shadow_plan, shadow_prediction
 
 __all__ = [
     "SHADOW_EXPORT_SCHEMA_VERSION",
     "ControlTraceRow",
+    "ObservationIndex",
     "OutcomeMatch",
     "OutcomeObservation",
     "ShadowExportRow",
@@ -34,6 +36,7 @@ __all__ = [
     "ShadowOutcomeUnusableError",
     "ShadowRecorder",
     "counterfactual_controllers",
+    "shadow_plan",
     "shadow_prediction",
     "shadow_rows",
     "write_shadow_jsonl",
