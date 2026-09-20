@@ -284,6 +284,7 @@ def main(argv: list[str] | None = None) -> int:
     detector = DriftDetector(
         ConfidenceAssessor(profile, control.policy.model_confidence),
         config,
+        shadow=control.policy.shadow,
         config_sha256=config_sha256,
     )
     # **証拠の DB は読み取り専用で開く**（#91 と同じ入口を使う。規則を写さない）。

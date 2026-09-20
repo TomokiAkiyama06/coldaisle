@@ -25,6 +25,7 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
+from coldaisle.control.config import ShadowConfig
 from coldaisle.control.drift import (
     ChangeKind,
     DeclaredChange,
@@ -147,10 +148,27 @@ def drift_config(
     )
 
 
-def detector(profile: ModelConfidenceProfile, config: DriftConfig | None = None) -> DriftDetector:
+def shadow_config(tolerance_ms: int = TOLERANCE_MS) -> ShadowConfig:
+    """照合の許容幅の契約（`fan-policy.yaml` の `shadow`）。**drift 設定に写さない。**"""
+    return ShadowConfig.model_validate(
+        {
+            "enabled": True,
+            "outcome_match_tolerance_ms": provisional(tolerance_ms),
+            "applied_demand_tolerance": provisional(0.01),
+        }
+    )
+
+
+def detector(
+    profile: ModelConfidenceProfile,
+    config: DriftConfig | None = None,
+    *,
+    shadow: ShadowConfig | None = None,
+) -> DriftDetector:
     return DriftDetector(
         ConfidenceAssessor(profile, confidence_policy()),
         config if config is not None else drift_config(),
+        shadow=shadow if shadow is not None else shadow_config(),
         config_sha256="d" * 64,
     )
 
@@ -653,12 +671,29 @@ def test_observation_times_outside_the_recorded_tolerance_are_refused(trained) -
         )
 
 
-def test_outcomes_matched_with_another_tolerance_are_refused(trained) -> None:
-    """違う許容幅で照合された結果を、同じ coverage として並べない（0054 §2.6 と同じ）。"""
+def test_outcomes_must_be_matched_with_the_configured_tolerance(trained) -> None:
+    """**照合の許容幅は `fan-policy.yaml` の契約から取る**（0054 §2.6 / 0056 §2.3）。
+
+    outcome どうしが揃っているだけでは足りない。全部が同じ「別の幅」で照合されていれば、
+    記録された coverage と意味の違う証拠が、そのまま drift の根拠になる。
+    """
     _data, _parts, _model, profile = trained
     mixed = (row(profile, 0), row(profile, 1, tolerance_ms=TOLERANCE_MS + 1))
     with pytest.raises(DriftInputError, match="照合許容幅"):
         detector(profile).detect(DriftEvidence(shadow=mixed))
+
+    # **全部が揃って別の幅**でも受け取らない（契約と照らすため）。
+    consistent = rows(profile, 6, ratio=1.0)
+    other = tuple(
+        row(profile, index, ratio=1.0, tolerance_ms=TOLERANCE_MS + 1) for index in range(6)
+    )
+    assert detector(profile).detect(DriftEvidence(shadow=consistent)).residual.ratio is not None
+    with pytest.raises(DriftInputError, match="fan-policy"):
+        detector(profile).detect(DriftEvidence(shadow=other))
+    # 契約の側を合わせれば数えられる（写しではなく照合であることの確認）。
+    loosened = detector(profile, shadow=shadow_config(TOLERANCE_MS + 1))
+    report = loosened.detect(DriftEvidence(shadow=other))
+    assert report.provenance.outcome_match_tolerance_ms == TOLERANCE_MS + 1
 
 
 # ---------------------------------------------------------------- 4. 複製で数を増やせない
@@ -1164,23 +1199,57 @@ def test_repeated_declarations_do_not_change_the_report(trained) -> None:
     assert once.provenance.evidence_sha256 == twice.provenance.evidence_sha256
     assert once.declared_changes == (change,)
 
+    # **同じ時刻・同じ種別で `detail` だけが違う宣言**も、並びが集合の反復順に委ねられない。
+    same_time = tuple(
+        DeclaredChange(kind=ChangeKind.SENSOR_REPLACED, ts_ms=BASE_TS_MS, detail=detail)
+        for detail in ("rear", "front", "top")
+    )
+    first = detector(profile).detect(DriftEvidence(shadow=shadow, changes=same_time))
+    again = detector(profile).detect(
+        DriftEvidence(shadow=shadow, changes=tuple(reversed(same_time)))
+    )
+    assert first.canonical_bytes() == again.canonical_bytes()
+    assert [item.detail for item in first.declared_changes] == ["front", "rear", "top"]
+
 
 def test_the_declared_window_is_part_of_the_report(trained) -> None:
     """**違う期間を見た報告が同じ bytes を名乗れない**（0056 §2.7）。"""
     _data, _parts, _model, profile = trained
     shadow = rows(profile, 6, ratio=1.0)
     narrow = detector(profile).detect(
-        DriftEvidence(shadow=shadow, window_start_ms=BASE_TS_MS, window_end_ms=BASE_TS_MS + 1)
+        DriftEvidence(
+            shadow=shadow, window_start_ms=BASE_TS_MS, window_end_ms=BASE_TS_MS + 6 * STEP_MS
+        )
     )
     wide = detector(profile).detect(
-        DriftEvidence(shadow=shadow, window_start_ms=BASE_TS_MS, window_end_ms=BASE_TS_MS + 2)
+        DriftEvidence(
+            shadow=shadow, window_start_ms=BASE_TS_MS, window_end_ms=BASE_TS_MS + 7 * STEP_MS
+        )
     )
 
-    assert narrow.provenance.window_end_ms == BASE_TS_MS + 1
+    assert narrow.provenance.window_end_ms == BASE_TS_MS + 6 * STEP_MS
     assert narrow.canonical_bytes() != wide.canonical_bytes()
     assert narrow.provenance.evidence_sha256 != wide.provenance.evidence_sha256
     with pytest.raises(DriftInputError, match="両端"):
         detector(profile).detect(DriftEvidence(shadow=shadow, window_start_ms=BASE_TS_MS))
+    with pytest.raises(DriftInputError, match="start < end"):
+        detector(profile).detect(
+            DriftEvidence(shadow=shadow, window_start_ms=BASE_TS_MS, window_end_ms=BASE_TS_MS)
+        )
+
+
+def test_the_detector_itself_refuses_evidence_outside_the_declared_window(trained) -> None:
+    """**期間の外の証拠は検知器の境界で閉じる**（CLI を通らない経路も同じ保証にする）。"""
+    _data, parts, _model, profile = trained
+    window = {"window_start_ms": BASE_TS_MS + STEP_MS, "window_end_ms": BASE_TS_MS + 3 * STEP_MS}
+    with pytest.raises(DriftInputError, match="期間の外の Shadow 行"):
+        detector(profile).detect(DriftEvidence(shadow=rows(profile, 4), **window))
+
+    inside = rows(profile, 2, start=1)
+    detector(profile).detect(DriftEvidence(shadow=inside, **window))
+    stale = tuple(ObservedThermalInput.from_example(item) for item in parts.test)
+    with pytest.raises(DriftInputError, match="期間の外の推論入力"):
+        detector(profile).detect(DriftEvidence(shadow=inside, inputs=stale, **window))
 
 
 # ---------------------------------------------------------------- 14. 写した上限で報告を落とさない

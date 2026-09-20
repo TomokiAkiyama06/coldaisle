@@ -25,6 +25,7 @@ import math
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 
+from coldaisle.control.config import ShadowConfig
 from coldaisle.control.drift.config import DriftConfig
 from coldaisle.control.drift.model import (
     MAX_DECLARED_CHANGES,
@@ -69,7 +70,23 @@ class DriftConfigError(ValueError):
 
 @dataclass(frozen=True)
 class DriftEvidence:
-    """1回の判定に使う証拠。**すべて保存済みの記録か、人が宣言した事実である。**"""
+    """1回の判定に使う証拠。**すべて保存済みの記録か、人が宣言した事実である。**
+
+    **検知器の境界で閉じること**（CLI を通らない経路でも同じ保証になる）。
+
+    - 記録どうしの束縛（model / artifact / 推論 / 候補 plan / 予測の出力集合 / 期待時刻）
+    - 誤差を記録された予測から数え直すこと
+    - 照合の許容幅が `fan-policy.yaml` の契約と同じであること
+    - 証拠・推論入力・宣言された変更の重複を数えないこと
+    - 宣言した期間の外の証拠を受け取らないこと
+    - 入力の window が feature schema と合うこと（`ConfidenceAssessor.coverage()`）
+
+    **呼び出し側に残る責務**（この型からは確かめられない）。
+
+    - 渡された Shadow export が、同じ trace と観測から**数え直した結果と一致する**こと
+      （検知器は trace も観測も持たない。`coldaisle.drift` の `load_shadow` が行う）
+    - Dataset artifact の bytes と manifest の整合（`coldaisle.drift` の `load_inputs`）
+    """
 
     shadow: tuple[ShadowExportRow, ...] = ()
     """#90 の export（0053 §2.4）。**drift 専用の収集経路は作らない。**"""
@@ -128,6 +145,7 @@ class DriftDetector:
         assessor: ConfidenceAssessor,
         config: DriftConfig,
         *,
+        shadow: ShadowConfig,
         config_sha256: str,
     ) -> None:
         policy = assessor.policy
@@ -143,6 +161,9 @@ class DriftDetector:
         self._profile = assessor.profile
         self._policy = policy
         self._config = config
+        # **照合の許容幅は `fan-policy.yaml` の契約から取る**（0054 §2.6 と同じ規則）。
+        # 記録された幅が運用の幅と違えば、coverage の意味が変わる。評価用に別の値を持たない。
+        self._match_tolerance_ms = shadow.outcome_match_tolerance_ms.value
         self._config_sha256 = config_sha256
         self._scales = {
             (scale.horizon_ms, scale.metric): scale.scale for scale in self._profile.residual_scales
@@ -152,17 +173,14 @@ class DriftDetector:
         """証拠から1つの報告を作る。**同じ証拠からは同じ bytes になる。**"""
         # まったく同じ宣言が2度届くのは冪等な取り込みで起きる。**1つに畳んでから**
         # 数える（報告の bytes が「何回渡したか」に依存しないように。0054 §2.6 と同じ扱い）。
-        changes = tuple(
-            sorted(set(evidence.changes), key=lambda item: (item.ts_ms, item.kind.value))
-        )
+        changes = tuple(sorted(set(evidence.changes), key=_change_order))
         if len(changes) > MAX_DECLARED_CHANGES:
             # 報告の型で落とすと理由が分からない。入力の問題として、ここで閉じる。
             raise DriftInputError(
                 f"宣言された構成変更の数が構造上限を超えた（{len(changes)} > "
                 f"{MAX_DECLARED_CHANGES}）。期間を区切って判定する"
             )
-        if (evidence.window_start_ms is None) != (evidence.window_end_ms is None):
-            raise DriftInputError("証拠の期間は両端を揃えて宣言する")
+        _check_window(evidence)
         cutoff_ms = max((change.ts_ms for change in changes), default=None)
         tally = self._tally_residual(evidence.shadow, cutoff_ms)
         residual = self._residual_signal(tally)
@@ -191,6 +209,7 @@ class DriftDetector:
                 min_support_count=self._policy.min_support_count.value,
                 min_missing_pattern_count=self._policy.min_missing_pattern_count.value,
                 shadow_rows=len(evidence.shadow),
+                outcome_match_tolerance_ms=self._match_tolerance_ms,
                 window_start_ms=evidence.window_start_ms,
                 window_end_ms=evidence.window_end_ms,
                 evidence_sha256=_evidence_sha256(evidence, changes),
@@ -205,7 +224,6 @@ class DriftDetector:
         tally = _ResidualTally()
         seen_ticks: set[tuple[int, int]] = set()
         seen_outcomes: set[tuple[str, str]] = set()
-        tolerance_ms: int | None = None
         for row in rows:
             if row.schema_version != SHADOW_EXPORT_SCHEMA_VERSION:
                 raise DriftInputError(
@@ -230,13 +248,14 @@ class DriftDetector:
                         f"同じ推論・同じ候補 plan の outcome が2度現れた: {outcome.inference_id}"
                     )
                 seen_outcomes.add(key)
-                if tolerance_ms is None:
-                    tolerance_ms = outcome.match_tolerance_ms
-                elif tolerance_ms != outcome.match_tolerance_ms:
-                    # 違う幅で照合された結果を、同じ coverage として並べない。
+                if outcome.match_tolerance_ms != self._match_tolerance_ms:
+                    # **運用の契約（`fan-policy.yaml` の `shadow`）と同じ幅で照合された
+                    # 結果だけ**を数える。違う幅で照合された結果を同じ coverage として
+                    # 並べると、記録された coverage と意味が変わる（0054 §2.6）。
                     raise DriftInputError(
-                        "別の照合許容幅で作られた outcome を混ぜない"
-                        f"（{tolerance_ms} と {outcome.match_tolerance_ms}）"
+                        "別の照合許容幅で作られた outcome を数えない"
+                        f"（export={outcome.match_tolerance_ms}; "
+                        f"fan-policy={self._match_tolerance_ms}）"
                     )
                 self._tally_outcome(tally, outcome, counterfactual, cutoff_ms)
         return tally
@@ -633,6 +652,49 @@ def _counterfactuals_by_plan(row: ShadowExportRow) -> dict[tuple[str, str], Shad
             )
         found[key] = counterfactual
     return found
+
+
+def _change_order(change: DeclaredChange) -> tuple[int, str, str]:
+    """宣言された変更の全順序。**すべての欄で決める。**
+
+    `ts_ms` と `kind` だけで並べると、`detail` だけが違う宣言の順が集合の反復順に委ねられ、
+    **同じ証拠が process ごとに違う digest を出す**。
+    """
+    return (
+        change.ts_ms,
+        change.kind.value,
+        json.dumps(change.model_dump(mode="json"), ensure_ascii=False, sort_keys=True),
+    )
+
+
+def _check_window(evidence: DriftEvidence) -> None:
+    """宣言した期間の外の証拠を受け取らない（決定記録 0056 §2.3）。
+
+    期間を絞って「証拠が無い」はずの区間を見ているのに、古い健全な証拠が判定を埋めては
+    ならない。**呼び出し側の絞り込みに頼らず、検知器の境界で閉じる**（CLI を通らない
+    経路でも同じ保証にするため）。
+    """
+    start_ms, end_ms = evidence.window_start_ms, evidence.window_end_ms
+    if (start_ms is None) != (end_ms is None):
+        raise DriftInputError("証拠の期間は両端を揃えて宣言する")
+    if start_ms is None or end_ms is None:
+        return
+    if end_ms <= start_ms:
+        raise DriftInputError(f"証拠の期間は start < end にする（[{start_ms}, {end_ms})）")
+    rows = sorted(row.ts_ms for row in evidence.shadow if not start_ms <= row.ts_ms < end_ms)
+    if rows:
+        raise DriftInputError(
+            f"宣言した期間の外の Shadow 行がある: {rows}（[{start_ms}, {end_ms}) の外）"
+        )
+    inputs = sorted(
+        observed.action_ts_ms
+        for observed in evidence.inputs
+        if not start_ms <= observed.action_ts_ms < end_ms
+    )
+    if inputs:
+        raise DriftInputError(
+            f"宣言した期間の外の推論入力がある: {inputs}（[{start_ms}, {end_ms}) の外）"
+        )
 
 
 def _check_observation_times(outcome: ShadowOutcome) -> None:

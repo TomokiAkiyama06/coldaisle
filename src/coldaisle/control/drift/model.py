@@ -396,6 +396,11 @@ class DriftProvenance(_Frozen):
     min_support_count: int = Field(gt=0)
     min_missing_pattern_count: int = Field(gt=0)
     shadow_rows: int = Field(ge=0)
+    outcome_match_tolerance_ms: int = Field(ge=0)
+    """照合に使った許容幅（`fan-policy.yaml` の `shadow`）。**写しではなく、照合した値の記録。**
+
+    記録された幅がこれと違う outcome は数えない（0054 §2.6 と同じ規則）。
+    """
     window_start_ms: int | None = Field(default=None, ge=0)
     window_end_ms: int | None = Field(default=None, ge=0)
     """**証拠として見た期間**（0056 §2.7）。呼び出し側が期間を宣言したときだけ入る。
