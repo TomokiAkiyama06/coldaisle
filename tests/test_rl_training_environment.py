@@ -1123,6 +1123,10 @@ class ForgedAttestedDynamics:
         return TrainingMode.LEARNED_SIMULATOR
 
     @property
+    def applied_demand_tolerance(self) -> None:
+        return None
+
+    @property
     def evidence(self) -> None:
         """**封をした証拠は作れない。** 自称できるのは identity と provenances だけ。"""
         return None
@@ -1449,6 +1453,10 @@ class ForgedLoggedDynamics:
         return TrainingMode.LOGGED
 
     @property
+    def applied_demand_tolerance(self) -> float:
+        return shadow_config().applied_demand_tolerance.value
+
+    @property
     def evidence(self) -> None:
         return None
 
@@ -1517,6 +1525,7 @@ def test_invariant_6_k_borrowed_evidence_cannot_be_attached_to_another_identity(
         )
         provenances = frozenset({DynamicsProvenance.LOGGED_TRAJECTORY})
         mode = TrainingMode.LOGGED
+        applied_demand_tolerance = 0.01
 
         @property
         def evidence(self):
@@ -1822,3 +1831,32 @@ def test_invariant_16_f_the_mode_comes_from_the_dynamics(trained) -> None:
     )
     assert run_all(logged, episode_spec(demand=0.8, max_steps=2)).mode is TrainingMode.LOGGED
     assert logged_dynamics.mode is TrainingMode.LOGGED
+
+
+def test_invariant_17_a_the_identification_tolerance_is_recorded(trained) -> None:
+    """**識別に使った幅を結果に残す**（決定記録 0056 §2.3 と同じ理由）。
+
+    広い幅で識別すれば別の action の区間まで採点できるので、`supported` の意味を読む側が
+    確かめられるようにする。条件 hash にも入るが、hash は読めないので欄としても残す。
+    """
+    shadow = shadow_config()
+    logged = LoggedTrajectoryDynamics(logged_trajectory(0.8), shadow=shadow)
+    environment, *_ = build_environment(
+        trained, dynamics=logged, baseline_demand=0.8, authority="shadow"
+    )
+    result = run_all(environment, episode_spec(demand=0.8, max_steps=3))
+
+    assert result.mode is TrainingMode.LOGGED
+    assert result.applied_demand_tolerance == shadow.applied_demand_tolerance.value
+
+    # 記録を再生しない mode では持たない。**「幅がある」と読めてしまわないようにする。**
+    simulated = run_all(build_environment(trained)[0], episode_spec(max_steps=2))
+    assert simulated.applied_demand_tolerance is None
+    with pytest.raises(ValidationError):
+        EpisodeResult.model_validate(
+            simulated.model_dump(mode="python") | {"applied_demand_tolerance": 0.5}
+        )
+    with pytest.raises(ValidationError):
+        EpisodeResult.model_validate(
+            result.model_dump(mode="python") | {"applied_demand_tolerance": None}
+        )

@@ -549,6 +549,7 @@ class SupervisorTrainingEnvironment:
             termination_reason=state.termination_reason,
             coverage=coverage,
             safety=safety,
+            applied_demand_tolerance=self._dynamics.applied_demand_tolerance,
             conditions_sha256=state.conditions_sha256,
             usable_for_comparison=usable,
             learned_controller_available=self.learned_controller_available,

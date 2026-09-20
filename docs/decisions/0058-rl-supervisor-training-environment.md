@@ -9,6 +9,7 @@
   [0031](0031-thermal-dataset-contract.md) §2.2 / [0048](0048-thermal-model-artifact-and-inference.md) §2.1 /
   [0050](0050-model-confidence-ood-and-authority.md) / [0052](0052-learned-mpc-optimizer-and-hard-constraints.md) §2.1〜§2.5 /
   [0053](0053-control-shadow-mode-and-counterfactual-logging.md) §2.3 / [0054](0054-offline-evaluation-attribution-and-gates.md) §2.2〜§2.7 /
+  [0056](0056-model-drift-detection-and-retraining-triggers.md) §2.3 /
   GitHub #89 / #105
 - **対象 Issue**: #105（依存 #75 / #77 / #81 / #83 / #84 / #85 / #86 / #88 / #90 / #91 / #94 / #104。利用者 #89）
 
@@ -109,6 +110,7 @@ scalar で受け取れると、記録された coverage と意味の違う幅で
 | 要求と記録の差（許容幅の中） | **しない。** 記録側が掛かっていた事実なので、要求は `requested` として別に残す |
 | 記録に無い action の結果 | **しない。** `supported=False` として数え、観測を作らない |
 | 記録に品質が無い場合 | **再現できないので受け取らない。** `LoggedFrame` の mask と `source_ts_ms` は必須で、既定値を持たない |
+| 識別に使った許容幅 | **結果に残す。** `EpisodeResult.applied_demand_tolerance`（決定記録 0056 §2.3 と同じ理由。広い幅で作った coverage が `supported` を名乗っていないか、読む側が確かめられるようにする） |
 | 読めていない cell（mask が立っている） | **採点に使わない。** reward が作れず、その step は `reward_unusable` で終端する |
 
 最後の2行が規則の要点である。**再現できないものは既定値で埋めず、拒否する。**
@@ -347,6 +349,7 @@ simulator: { model_id, model_version, responses: [...] }
 | `history[-recent_history_steps:]` をそのまま使う | 0 のとき履歴が全件返る。0 は「渡さない」である |
 | 採点できなかった終端 step を出どころの照合から外す | 記録が尽きた区間を飛ばして「全部裏づけあり」と読める |
 | 記録と僅かに違う要求を、そのまま次の state の掛かっている action にする | window の action と食い違う2つ目の applied ができる |
+| 識別の幅を条件 hash に入れるだけにする | hash は読めない。どの幅で `supported` にしたのかを読む側が確かめられない（0056 §2.3） |
 | 再生時に観測の時刻と品質 mask を作り直す | 1 step 目から stale / suspect が `OK` に見える。記録が品質を持たないなら受け取らない |
 | `DynamicsStep` に window とは別の値の欄を持たせる | mask と食い違う値を渡せる。観測の出どころは window ひとつにする |
 | `TrainingMode` を `EpisodeSpec` の欄にする | 記録再生を `learned_simulator` と書いた結果を作れる |

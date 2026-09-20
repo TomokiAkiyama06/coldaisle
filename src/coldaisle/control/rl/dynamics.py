@@ -297,6 +297,15 @@ class EnvironmentDynamics(Protocol):
         ...
 
     @property
+    def applied_demand_tolerance(self) -> float | None:
+        """記録と同じ action とみなした幅。記録を再生しない dynamics は `None`。
+
+        **識別に使った幅を結果に残す**（決定記録 0056 §2.3）。広い幅で識別すれば、別の
+        action が掛かっていた区間まで採点できてしまうので、読む側が確かめられるようにする。
+        """
+        ...
+
+    @property
     def provenances(self) -> frozenset[DynamicsProvenance]:
         """この dynamics が出しうる step の出どころ。
 
@@ -407,6 +416,11 @@ class SimulatedThermalDynamics:
     def mode(self) -> TrainingMode:
         """この dynamics が表す学習 mode。"""
         return TrainingMode.LEARNED_SIMULATOR
+
+    @property
+    def applied_demand_tolerance(self) -> float | None:
+        """記録を再生しないので識別の幅を持たない。"""
+        return None
 
     @property
     def provenances(self) -> frozenset[DynamicsProvenance]:
@@ -537,14 +551,14 @@ class LoggedTrajectoryDynamics:
         return TrainingMode.LOGGED
 
     @property
+    def applied_demand_tolerance(self) -> float | None:
+        """記録と同じ action とみなした幅（`fan-policy.yaml` の `shadow` から取った値）。"""
+        return self._tolerance
+
+    @property
     def provenances(self) -> frozenset[DynamicsProvenance]:
         """記録再生の step しか出さない。"""
         return frozenset({DynamicsProvenance.LOGGED_TRAJECTORY})
-
-    @property
-    def applied_demand_tolerance(self) -> float:
-        """記録と同じ action とみなす幅（`fan-policy.yaml` の `shadow` から取った値）。"""
-        return self._tolerance
 
     def conditions(self) -> dict[str, object]:
         """条件 hash へ載せる値。**許容幅も入れる**（coverage が変わるため）。"""
@@ -620,6 +634,11 @@ class HybridDynamics:
     def mode(self) -> TrainingMode:
         """この dynamics が表す学習 mode。"""
         return TrainingMode.HYBRID
+
+    @property
+    def applied_demand_tolerance(self) -> float | None:
+        """記録側が使った識別の幅。"""
+        return self._logged.applied_demand_tolerance
 
     @property
     def provenances(self) -> frozenset[DynamicsProvenance]:
@@ -759,6 +778,11 @@ class AttestedThermalDynamics:
     def mode(self) -> TrainingMode:
         """この dynamics が表す学習 mode。"""
         return TrainingMode.LEARNED_SIMULATOR
+
+    @property
+    def applied_demand_tolerance(self) -> float | None:
+        """記録を再生しないので識別の幅を持たない。"""
+        return None
 
     @property
     def provenances(self) -> frozenset[DynamicsProvenance]:

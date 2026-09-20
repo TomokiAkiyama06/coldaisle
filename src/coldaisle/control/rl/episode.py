@@ -190,6 +190,14 @@ class EpisodeResult(_Frozen):
     termination_reason: Reason
     coverage: EpisodeCoverage
     safety: EpisodeSafety
+    applied_demand_tolerance: float | None = Field(default=None, ge=0.0, lt=1.0)
+    """記録と同じ action とみなした幅（決定記録 0056 §2.3）。
+
+    `status`（ここでは `supported`）は「記録した action が実際に掛かっていたか」の判定に依る。
+    幅を結果に残さないと、**広い幅で作った coverage が `supported` を名乗っている**ことを
+    読む側が確かめられない。条件 hash にも入るが、hash は読めないので欄としても残す。
+    記録を再生しない mode では `None`。
+    """
     conditions_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     """policy 以外のすべての条件を覆う hash。**arm を比べる鍵になる。**"""
     usable_for_comparison: bool
@@ -220,6 +228,11 @@ class EpisodeResult(_Frozen):
     def _evidence_matches_the_claims(self) -> Self:
         if self.coverage.steps != len(self.steps):
             raise ValueError("coverage の step 数が記録した step 数と一致しない")
+        replays = self.mode in {TrainingMode.LOGGED, TrainingMode.HYBRID}
+        if replays and self.applied_demand_tolerance is None:
+            raise ValueError("記録を再生した episode には識別に使った幅を残す")
+        if not replays and self.applied_demand_tolerance is not None:
+            raise ValueError("記録を再生しない episode に識別の幅を書かない")
         if self.safety.violated and self.termination is not TerminationReason.SAFETY_VIOLATION:
             # 違反したのに続きを探索した episode を作れないようにする。
             raise ValueError("安全側の違反がある episode は SAFETY_VIOLATION で終わらせる")
