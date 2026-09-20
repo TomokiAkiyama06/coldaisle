@@ -9,6 +9,7 @@
 - 期待時刻に**最も近い**観測を、``±match_tolerance_ms`` の中でだけ採る。**同距離なら過去側**
 - 観測は予測の元になった action より後に限る
 - **品質が OK の値だけ**を証拠にする。stale / suspect / missing は「当たった」に数えない
+- 同じ metric・同じ時刻に**食い違う**値があれば受け取らない（0055 §2.1）。同じ値の重複は畳む
 
 **採点してよいのは、予測した候補 action が実際に掛かっていた区間だけ**（0053 §2.3）。
 counterfactual の予測は「その plan を実行したら」の予測なので、実際には Fallback（や Guard /
@@ -45,6 +46,14 @@ class _Frozen(BaseModel):
 
 class ShadowOutcomeUnusableError(ValueError):
     """予測と照合設定が噛み合わないため、実測と突き合わせられない。"""
+
+
+class ShadowObservationConflictError(ValueError):
+    """同じ metric・同じ時刻に**食い違う**観測がある（決定記録 0055 §2.1）。
+
+    照合が「どちらを採るか」を決めると、**どちらを選んでも片方の事実が消える**。
+    時刻ごとに1つの値しか持てない以上、食い違いは入力の誤りである。
+    """
 
 
 class OutcomeObservation(_Frozen):
@@ -203,20 +212,40 @@ class ObservationIndex:
     比例して伸びる。ここで metric ごとに1回だけ並べ、照合は期待時刻の周り
     （``±tolerance``）だけを二分探索で切り出して見る。**規則は変えない。**
 
-    同じ metric・同じ時刻の観測が2つあれば、**値の小さいほうを採る**。どちらでも誤差の
-    扱いは同じだが、入力の順序で結果が変わらないように順序を固定しておく。
+    同じ metric・同じ時刻に**食い違う**観測があれば受け取らない（決定記録 0055 §2.1）。
+    どちらかを選ぶ規則を置くと、**どちらを選んでも片方の事実が消える**。予測誤差は
+    ``実測 - 予測`` なので、小さいほうを採れば正の誤差（underprediction＝冷却が足りない
+    向きの外し方）が実際より小さく見え、大きいほうを採れば予測の当たりが消える。
+    **選ばずに閉じる**（fail closed）。
+
+    **まったく同じ観測が2度届くのは冪等な取り込みで起きる**ので許すが、**1つに畳んでから**
+    索引に入れる。件数や digest が「何回渡したか」に依存しないようにするためである。
     """
 
     __slots__ = ("_by_metric",)
 
     def __init__(self, observations: Iterable[OutcomeObservation]) -> None:
-        collected: dict[str, list[tuple[int, float]]] = {}
+        seen: dict[tuple[str, int], float] = {}
         for observation in observations:
             value = observation.usable
             if value is None:
                 # 品質が OK でない値は「当たった証拠」に数えない。索引にも入れない。
+                # 証拠に使わない値どうしの食い違いも、ここでは見ない。
                 continue
-            collected.setdefault(observation.metric, []).append((observation.ts_ms, value))
+            key = (observation.metric, observation.ts_ms)
+            previous = seen.get(key)
+            if previous is None:
+                seen[key] = value
+            elif previous != value:
+                raise ShadowObservationConflictError(
+                    "同じ metric・同じ時刻に食い違う観測がある"
+                    f"（metric={observation.metric}; ts_ms={observation.ts_ms}; "
+                    f"{previous} と {value}）"
+                )
+            # 同じ値の2度目は畳む（先に入れた1つがそのまま残る）。
+        collected: dict[str, list[tuple[int, float]]] = {}
+        for (metric, ts_ms), value in seen.items():
+            collected.setdefault(metric, []).append((ts_ms, value))
         # 時刻の列も**ここで一度だけ**作る。照合のたびに作り直すと、二分探索の意味が無くなる。
         self._by_metric: dict[str, tuple[list[int], list[tuple[int, float]]]] = {}
         for metric, points in collected.items():
@@ -283,6 +312,10 @@ class ShadowOutcomeMatcher:
         ``plan`` はこの予測が前提にした候補 action 列、``applied`` は実際に掛かった値の列で、
         **両方を必ず要求する**。「実行されたか分からないまま採点する」呼び方を作らない。
         多くの予測を続けて照合するときは ``ObservationIndex`` を一度作って渡す。
+
+        ``observations`` を直接渡す場合も、索引を渡す場合と**同じ契約**である。同じ metric・
+        同じ時刻に食い違う値があれば ``ShadowObservationConflictError`` を上げ、まったく同じ
+        観測の重複は1つに畳む（0055 §2.1）。並び順は結果に影響しない。
         """
         shortest_offset_ms = prediction.targets[0].offset_ms
         if self._tolerance_ms >= shortest_offset_ms:
