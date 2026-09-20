@@ -19,10 +19,11 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from bisect import bisect_left
 from collections import Counter
 from collections.abc import Callable, Iterable, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from itertools import pairwise
 
 from pydantic import ValidationError
@@ -35,6 +36,7 @@ from coldaisle.control.evaluation.config import (
 )
 from coldaisle.control.evaluation.gate import evaluate_gates
 from coldaisle.control.evaluation.model import (
+    EVALUATION_REPORT_SCHEMA_VERSION,
     AirBalanceReport,
     AppliedArm,
     AppliedArmReport,
@@ -83,6 +85,9 @@ from coldaisle.control.shadow import (
     shadow_rows,
 )
 from coldaisle.metrics import MetricCatalog
+
+RUN_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,119}$")
+"""run の名前の形。**`RunProvenance.run_id` と同じにする**（一致は試験で確かめる）。"""
 
 BEFORE_ANY_OBSERVATION_MS = -1
 """`ObservationIndex.nearest` の「この時刻より後」に使う下限。
@@ -217,11 +222,17 @@ def evaluate(runs: Sequence[EvaluationRun], *, context: EvaluationContext) -> Ev
         raise EvaluationInputError("評価する run が1つも無い")
     if len({run.run_id for run in runs}) != len(runs):
         raise EvaluationInputError("同じ run_id の run を2つ渡さない")
+    for run in runs:
+        if not RUN_ID_PATTERN.fullmatch(run.run_id):
+            # 報告の鍵になる名前なので、**報告を組み立てる前に**閉じる。
+            raise EvaluationInputError(f"run_id の形が正しくない: {run.run_id!r}")
 
     segments: list[SegmentReport] = []
     provenances: list[RunProvenance] = []
     versions = _VersionCollector()
-    for run in sorted(runs, key=lambda item: item.run_id):
+    for unchecked in sorted(runs, key=lambda item: item.run_id):
+        # **同じ証拠を1つに畳んでから数える。** 以降はこの run だけを使う。
+        run = _check_observations(unchecked)
         parsed = _parse_traces(run)
         rows = _shadow_rows_for(run, parsed, context)
         provenances.append(_run_provenance(run, parsed))
@@ -274,13 +285,52 @@ def _parse_traces(run: EvaluationRun) -> tuple[ControlTick, ...]:
     return tuple(ordered)
 
 
+def _check_observations(run: EvaluationRun) -> EvaluationRun:
+    """観測を検証し、**同じ証拠を1つに畳んだ** run を返す（決定記録 0054 §2.6）。
+
+    どちらかを選ぶ規則（小さいほう／大きいほう）を置くと、**どちらを選んでも片方の
+    事実が消える**。小さいほうを採れば絶対上限の超過が消え、大きいほうを採れば
+    予測の当たりが消える。時刻ごとに1つの値しか持てない以上、食い違いは入力の誤りで
+    あって、評価が選んでよいものではない。**受け取らずに閉じる**（fail closed）。
+
+    品質が `OK` でない観測は証拠に使わないので（`OutcomeObservation.usable`）、
+    食い違いの判定では見ない。
+
+    **まったく同じ観測が2度届くのは冪等な取り込みで起きる**ので許すが、そのまま数えると
+    件数も digest も「何回渡したか」に依存する。証拠の集合は同じなので、**1つに畳んでから
+    数える**（同じ証拠から同じ `conditions_sha256` が出るようにする。0054 §2.7）。
+    """
+    seen: dict[tuple[str, int], float] = {}
+    for observation in run.observations:
+        value = observation.usable
+        if value is None:
+            continue
+        key = (observation.metric, observation.ts_ms)
+        previous = seen.get(key)
+        if previous is not None and previous != value:
+            raise EvaluationInputError(
+                f"{run.run_id}: 同じ metric・同じ時刻に食い違う観測がある"
+                f"（metric={observation.metric}; ts_ms={observation.ts_ms}; "
+                f"{previous} と {value}）"
+            )
+        seen[key] = value
+    unique = sorted(set(run.observations), key=_observation_order)
+    return replace(run, observations=tuple(unique))
+
+
 def _shadow_rows_for(
     run: EvaluationRun, ticks: tuple[ControlTick, ...], context: EvaluationContext
 ) -> tuple[ShadowExportRow, ...]:
     """Shadow 実績を用意する。**渡された export も trace と突き合わせてから使う。**"""
     matcher = context.matcher()
+    computed = tuple(
+        sorted(
+            shadow_rows(run.traces, observations=run.observations, matcher=matcher),
+            key=lambda row: (row.ts_ms, row.tick_id),
+        )
+    )
     if run.shadow is None:
-        return tuple(shadow_rows(run.traces, observations=run.observations, matcher=matcher))
+        return computed
     by_tick = {(tick.ts_ms, tick.tick_id): tick for tick in ticks if tick.shadow is not None}
     rows = sorted(run.shadow, key=lambda row: (row.ts_ms, row.tick_id))
     keys = [(row.ts_ms, row.tick_id) for row in rows]
@@ -309,7 +359,39 @@ def _shadow_rows_for(
                 f"（tick={row.tick_id}/{row.ts_ms}）"
             )
         _check_outcomes(run.run_id, row, matcher.match_tolerance_ms)
-    return tuple(rows)
+    _check_recomputed(run.run_id, tuple(rows), computed)
+    # 照らし合わせが済んだら、**数え直したほうを使う。** 渡された行と1 bit も違わない
+    # ことを確かめてあるので値は同じで、以降の経路に外から来た object を残さない。
+    return computed
+
+
+def _check_recomputed(
+    run_id: str, supplied: tuple[ShadowExportRow, ...], computed: tuple[ShadowExportRow, ...]
+) -> None:
+    """渡された export を、**同じ trace と観測から数え直した結果と1欄ずつ照らす**。
+
+    識別子（`inference_id` / `plan_digest`）と許容幅だけを見ても、`status`・`observed`・
+    `error`・`expected_ts_ms`・`input_action_ts_ms` は書き換えられる。**採点していない
+    区間を `scored` に、外れた予測を誤差の小さい予測に仕立てられる**ので、識別子の照合
+    だけでは閉じない。
+
+    照合器は時計も I/O も持たず、同じ入力からは同じ結果を返す（0053 §2.3）。だから
+    「数え直して一致するか」で閉じられる。一致しなければ受け取らない（fail closed）。
+    """
+    if supplied == computed:
+        return
+    for left, right in zip(supplied, computed, strict=False):
+        if left == right:
+            continue
+        raise EvaluationInputError(
+            f"{run_id}: Shadow export が、同じ trace と観測から数え直した結果と違う"
+            f"（tick={left.tick_id}/{left.ts_ms}）。"
+            f"照合の結果は記録と観測だけから決まるので、書き換えられた行は受け取らない"
+        )
+    raise EvaluationInputError(
+        f"{run_id}: Shadow export の行数が、数え直した結果と違う"
+        f"（export={len(supplied)}; 数え直し={len(computed)}）"
+    )
 
 
 def _check_outcomes(run_id: str, row: ShadowExportRow, tolerance_ms: int) -> None:
@@ -543,11 +625,10 @@ def _attribute_observations(
         value = observation.usable
         if value is None:
             continue
-        at_time = by_time.setdefault(observation.ts_ms, {})
-        previous = at_time.get(observation.metric)
-        # 同じ metric・同じ時刻の観測が2つあれば、**値の小さいほうを採る**。
-        # `ObservationIndex` と同じ規則にして、入力の順序で結果が変わらないようにする。
-        at_time[observation.metric] = value if previous is None else min(previous, value)
+        # 食い違う重複は `_check_observations` が先に弾いているので、同じ鍵に来る値は
+        # 必ず同じである。**「どちらを採るか」の規則をここに置かない**（どちらを選んでも
+        # 片方の事実が消えるため。決定記録 0054 §2.6）。
+        by_time.setdefault(observation.ts_ms, {})[observation.metric] = value
     attributed: dict[tuple[int, int], dict[str, list[float]]] = {}
     unattributed = 0
     for ts_ms, values in sorted(by_time.items()):
@@ -816,8 +897,12 @@ def _interventions(ticks: Sequence[ControlTick]) -> InterventionReport:
     fallback_reasons: Counter[str] = Counter()
     fault_codes: Counter[str] = Counter()
     states: Counter[str] = Counter()
+    bound_zones: Counter[str] = Counter()
     for tick in ticks:
         bounds = {tick.zones.get(zone).demand.bound_by for zone in Zone}
+        for zone in Zone:
+            # **同時に縛られた zone の数を隠さない**（tick 数だけだと 3 zone でも 1）。
+            bound_zones[tick.zones.get(zone).demand.bound_by.value] += 1
         forced_max += BoundBy.FORCED_MAX in bounds
         safety_floor += BoundBy.SAFETY_FLOOR in bounds
         guard_floor += BoundBy.GUARD_FLOOR in bounds
@@ -854,6 +939,7 @@ def _interventions(ticks: Sequence[ControlTick]) -> InterventionReport:
         fault_ticks=faulted,
         fault_codes=_counted(fault_codes),
         safety_states=_counted(states),
+        bound_zone_ticks=_counted(bound_zones),
     )
 
 
@@ -1146,6 +1232,16 @@ def _worst_cases(
                             metric=temperature.metric,
                         )
                     )
+                if applied.temperatures:
+                    # **gate が読むのは metric を足した数。** worst-case もそれに揃える。
+                    candidates[WorstCaseKind.SEGMENT_CEILING_EXCEEDANCES].append(
+                        _worst(
+                            WorstCaseKind.SEGMENT_CEILING_EXCEEDANCES,
+                            segment,
+                            applied.arm_key,
+                            float(sum(item.exceedances for item in applied.temperatures)),
+                        )
+                    )
                 candidates[WorstCaseKind.EMERGENCY_TICKS].append(
                     _worst(
                         WorstCaseKind.EMERGENCY_TICKS,
@@ -1271,6 +1367,7 @@ def _run_provenance(run: EvaluationRun, ticks: tuple[ControlTick, ...]) -> RunPr
         run_id=run.run_id,
         start_ms=ticks[0].ts_ms if ticks else 0,
         end_ms=(ticks[-1].ts_ms + 1) if ticks else 0,
+        split_boundaries_ms=tuple(sorted(set(run.split_boundaries_ms))),
         traces=len(ticks),
         observations=len(run.observations),
         trace_sha256=_digest(
@@ -1311,6 +1408,10 @@ def _provenance(
                 sources.policy.sha256,
                 context.catalog_sha256,
                 context.acoustic_sha256,
+                # **出力の形を決めるコード側の版も条件に入れる。** 設定の hash だけでは
+                # 「同じ条件」が同じ意味の行を指しているとは言えない。
+                SHADOW_EXPORT_SCHEMA_VERSION,
+                EVALUATION_REPORT_SCHEMA_VERSION,
             ],
             [json.loads(run.model_dump_json()) for run in runs],
         ]

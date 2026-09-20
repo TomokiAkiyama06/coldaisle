@@ -136,8 +136,12 @@ def _collect_applied(
         evidence.incomplete_segments += 1
     evidence.emergency_ticks = max(evidence.emergency_ticks, report.interventions.emergency_ticks)
     evidence.fault_ticks = max(evidence.fault_ticks, report.interventions.fault_ticks)
+    # **1つの segment の中では metric をまたいで足す。** metric ごとの最大を採ると、
+    # 3つの metric が同時に超えていても「1つ分」に見える（決定記録 0054 §2.4）。
+    evidence.exceedances = max(
+        evidence.exceedances, sum(item.exceedances for item in report.temperatures)
+    )
     for temperature in report.temperatures:
-        evidence.exceedances = max(evidence.exceedances, temperature.exceedances)
         margin = temperature.margin.minimum
         evidence.minimum_margin_c = (
             margin if evidence.minimum_margin_c is None else min(evidence.minimum_margin_c, margin)
@@ -217,7 +221,7 @@ def _applied_gate(
             observed=(float(evidence.exceedances) if evidence.temperature_is_complete else None),
             limit=float(safety.maximum_ceiling_exceedances.value),
             reason=_temperature_gap(evidence),
-            worst_case=worst.get((arm_key, WorstCaseKind.CEILING_EXCEEDANCES)),
+            worst_case=worst.get((arm_key, WorstCaseKind.SEGMENT_CEILING_EXCEEDANCES)),
         ),
         _at_least(
             GateStage.SAFETY,

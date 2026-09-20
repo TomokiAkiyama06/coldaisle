@@ -85,6 +85,7 @@ from coldaisle.control.schema import (
 )
 from coldaisle.control.shadow import (
     OutcomeObservation,
+    OutcomeStatus,
     ShadowExportRow,
     read_shadow_jsonl,
     shadow_rows,
@@ -1661,16 +1662,31 @@ def test_invariant_12_f_a_boundary_that_leaves_a_segment_empty_is_refused(
         evaluate([run_of(traces, observations, boundaries=(between, between + 1))], context=context)
 
 
-def test_invariant_12_g_duplicate_observations_do_not_depend_on_input_order(
+def test_invariant_12_g_contradictory_duplicate_observations_are_refused(
     context: EvaluationContext,
 ) -> None:
-    """同じ metric・同じ時刻の観測が2つあっても、**順序で結果が変わらない**。"""
-    traces, observations = plan_following_run(ticks=4)
-    clash = observation(GPU, observations[0].ts_ms, 99.0)
-    forward = evaluate([run_of(traces, [*observations, clash])], context=context)
-    backward = evaluate([run_of(traces, [clash, *observations])], context=context)
+    """**同じ metric・同じ時刻の食い違う観測を、評価が選ばない**（決定記録 0054 §2.6）。
 
-    assert render(forward) == render(backward)
+    小さいほうを採れば絶対上限の超過が消え、大きいほうを採れば予測の当たりが消える。
+    どちらを選んでも片方の事実が消えるので、入力の誤りとして受け取らない。
+    """
+    traces, observations = plan_following_run(ticks=4)
+    ceiling = context.control.safety.absolute_temp_ceiling_c.value
+    hotter = observation(GPU, observations[0].ts_ms, ceiling + 10.0)
+    with pytest.raises(EvaluationInputError, match="食い違う観測"):
+        evaluate([run_of(traces, [*observations, hotter])], context=context)
+    # 順序を入れ替えても同じ。**「先に来たほうが勝つ」規則も置かない。**
+    with pytest.raises(EvaluationInputError, match="食い違う観測"):
+        evaluate([run_of(traces, [hotter, *observations])], context=context)
+
+
+def test_the_same_observation_twice_is_allowed(context: EvaluationContext) -> None:
+    """同じ値が2度届くのは冪等な取り込みで起きる。**それは食い違いではない。**"""
+    traces, observations = plan_following_run(ticks=4)
+    report = evaluate([run_of(traces, [*observations, observations[0]])], context=context)
+    once = evaluate([run_of(traces, observations)], context=context)
+
+    assert render(report) == render(once)
 
 
 def test_invariant_12_h_observations_no_tick_claims_are_counted_not_dropped(
@@ -1704,3 +1720,180 @@ def test_invariant_12_i_a_report_always_carries_a_gate_result(
     stripped["gates"] = ()
     with pytest.raises(ValidationError, match="gate の結果を必ず載せる"):
         EvaluationReport.model_validate(stripped)
+
+
+# ------------- 不変条件 13: 渡された実績は数え直して照らす（Codex レビュー第2回）
+
+
+def _tampered(rows: list[ShadowExportRow], **updates: object) -> tuple[ShadowExportRow, ...]:
+    """識別子と許容幅はそのままに、**採点の中身だけを書き換えた** export を作る。"""
+    first = rows[0]
+    outcome = first.outcomes[0]
+    return (
+        first.model_copy(
+            update={"outcomes": (outcome.model_copy(update=updates), *first.outcomes[1:])}
+        ),
+        *rows[1:],
+    )
+
+
+def test_invariant_13_a_a_tampered_outcome_status_is_refused(
+    context: EvaluationContext,
+) -> None:
+    """**採点していない区間を `scored` に仕立てられない。**
+
+    識別子（`inference_id` / `plan_digest`）と許容幅は本物のままでも、`status` を
+    書き換えれば「当たっていた」記録になる。同じ trace と観測から数え直して閉じる。
+    """
+    aside = [
+        trace_of(
+            tick_at(
+                TICK_TS_MS + index * STEP_MS,
+                index,
+                applied=0.2,  # plan は 0.8。掛かっていた action が違う
+                cf=counterfactual(action_ts_ms=TICK_TS_MS + index * STEP_MS),
+            )
+        )
+        for index in range(6)
+    ]
+    observations = [
+        observation(metric, TICK_TS_MS + index * STEP_MS, 50.0)
+        for index in range(10)
+        for metric in TEMPERATURES
+    ]
+    rows = list(shadow_rows(aside, observations=observations, matcher=context.matcher()))
+    assert rows[0].outcomes[0].status is OutcomeStatus.UNIDENTIFIABLE
+
+    forged = _tampered(
+        rows,
+        status=OutcomeStatus.SCORED,
+        unidentifiable=None,
+        matches=tuple(
+            match.model_copy(update={"error": 0.0, "observed": match.predicted})
+            for match in rows[0].outcomes[0].matches
+        ),
+    )
+    with pytest.raises(EvaluationInputError, match="数え直した結果と違う"):
+        evaluate([run_of(aside, observations, shadow=forged)], context=context)
+
+
+def test_invariant_13_b_a_rewritten_error_is_refused(context: EvaluationContext) -> None:
+    """**外れた予測を「誤差の小さい予測」に仕立てられない。**"""
+    traces, observations = plan_following_run(ticks=6)
+    rows = list(shadow_rows(traces, observations=observations, matcher=context.matcher()))
+    scored = next(
+        (index, row) for index, row in enumerate(rows) if any(o.scored for o in row.outcomes)
+    )
+    index, row = scored
+    outcome = next(item for item in row.outcomes if item.scored)
+    shrunk = outcome.model_copy(
+        update={
+            "matches": tuple(
+                match.model_copy(update={"observed": match.predicted, "error": 0.0})
+                if match.observed is not None
+                else match
+                for match in outcome.matches
+            )
+        }
+    )
+    forged = [*rows]
+    forged[index] = row.model_copy(update={"outcomes": (shrunk,)})
+    with pytest.raises(EvaluationInputError, match="数え直した結果と違う"):
+        evaluate([run_of(traces, observations, shadow=tuple(forged))], context=context)
+
+
+def test_invariant_13_c_a_rewritten_expected_time_is_refused(
+    context: EvaluationContext,
+) -> None:
+    """**照合の時刻を動かして、別の観測を「当たり」に数えさせない。**"""
+    traces, observations = plan_following_run(ticks=6)
+    rows = list(shadow_rows(traces, observations=observations, matcher=context.matcher()))
+    outcome = rows[0].outcomes[0]
+    forged = _tampered(rows, input_action_ts_ms=outcome.input_action_ts_ms + 1)
+    with pytest.raises(EvaluationInputError, match="数え直した結果と違う"):
+        evaluate([run_of(traces, observations, shadow=forged)], context=context)
+
+
+def test_invariant_13_d_exceedances_add_up_across_metrics_in_a_segment(
+    context: EvaluationContext,
+) -> None:
+    """**同時に超えている metric の数を、metric ごとの最大で隠さない**（0054 §2.4）。"""
+    traces, observations = plan_following_run(ticks=3)
+    ceiling = context.control.safety.absolute_temp_ceiling_c.value
+    hot = [
+        observation(item.metric, item.ts_ms, ceiling + 1.0) if item.metric in TEMPERATURES else item
+        for item in observations
+    ]
+    report = evaluate([run_of(traces, hot)], context=context)
+    applied = overall(report).applied[0]
+    per_metric = [item.exceedances for item in applied.temperatures]
+    gate = next(item for item in report.gates if item.arm_key.startswith("applied:"))
+    exceedances = next(item for item in gate.conditions if item.name == "ceiling_exceedances")
+
+    assert len(per_metric) == len(TEMPERATURES)
+    assert exceedances.observed == float(sum(per_metric))
+    assert exceedances.observed > max(per_metric)
+
+
+def test_invariant_13_e_the_split_is_part_of_the_conditions(
+    context: EvaluationContext,
+) -> None:
+    """**違う切り方の比較が、同じ条件を名乗れない**（0054 §2.7）。"""
+    traces, observations = plan_following_run(ticks=6)
+    boundary = TICK_TS_MS + 3 * STEP_MS
+    whole = evaluate([run_of(traces, observations)], context=context)
+    split = evaluate([run_of(traces, observations, boundaries=(boundary,))], context=context)
+
+    assert split.provenance.runs[0].split_boundaries_ms == (boundary,)
+    assert whole.provenance.runs[0].split_boundaries_ms == ()
+    assert whole.provenance.conditions_sha256 != split.provenance.conditions_sha256
+
+
+def test_invariant_13_f_simultaneous_zone_interventions_are_not_hidden(
+    context: EvaluationContext,
+) -> None:
+    """**tick 数だけだと、3 zone が同時に縛られても1に見える。** 総数も並べる。"""
+    traces = [
+        trace_of(
+            tick_at(
+                TICK_TS_MS + index * STEP_MS,
+                index,
+                applied=0.9,
+                requested=0.3,
+                bound_by=BoundBy.GUARD_FLOOR,
+                guard_floor=0.9,
+            )
+        )
+        for index in range(4)
+    ]
+    report = evaluate([run_of(traces, [])], context=context)
+    interventions = overall(report).applied[0].interventions
+    per_zone = {item.code: item.count for item in interventions.bound_zone_ticks}
+
+    assert interventions.guard_floor_ticks == 4
+    assert per_zone["guard_floor"] == 4 * len(Zone)
+
+
+def test_invariant_13_g_the_run_id_is_checked_before_the_report_is_built(
+    context: EvaluationContext,
+) -> None:
+    """報告の鍵になる名前は、**組み立てる前に**閉じる。"""
+    traces, observations = plan_following_run(ticks=3)
+    with pytest.raises(EvaluationInputError, match="run_id の形"):
+        evaluate([run_of(traces, observations, run_id="../escape")], context=context)
+
+
+def test_the_run_id_pattern_matches_the_report_contract() -> None:
+    """**写した形が、報告の契約と食い違わない。**"""
+    from coldaisle.control.evaluation.evaluator import RUN_ID_PATTERN
+    from coldaisle.control.evaluation.model import RunProvenance
+
+    field = RunProvenance.model_fields["run_id"]
+    patterns = [item.pattern for item in field.metadata if hasattr(item, "pattern")]
+    lengths = [item.max_length for item in field.metadata if hasattr(item, "max_length")]
+    assert patterns == [r"^[A-Za-z0-9][A-Za-z0-9_.-]*$"]
+    assert lengths == [120]
+    # 先頭の1文字を含めて 120 文字まで（報告の契約と同じ範囲）
+    assert RUN_ID_PATTERN.fullmatch("a" * 120) is not None
+    assert RUN_ID_PATTERN.fullmatch("a" * 121) is None
+    assert RUN_ID_PATTERN.fullmatch("_leading") is None

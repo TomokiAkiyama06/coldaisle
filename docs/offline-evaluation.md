@@ -88,6 +88,14 @@ runs:
 outcome は、すべてその場で拒む（数えないだけにすると、行を複製するだけで coverage の下限を
 満たせてしまう）。`split_boundaries_ms` が tick の無い区間を作る場合も拒む。
 
+さらに、**渡された export は同じ trace と観測から数え直した結果と1欄ずつ照らします。**
+識別子と許容幅だけを見ても `status` / `observed` / `error` / 時刻は書き換えられるので、
+それだけでは「採点していない区間を `scored` に仕立てる」ことを防げません。
+
+**同じ metric・同じ時刻に食い違う観測があれば受け取りません。** 小さいほうを採れば絶対上限の
+超過が消え、大きいほうを採れば予測の当たりが消えるため、評価が選ぶべきものではありません。
+まったく同じ観測が2度届くのは許し、1つに畳んでから数えます。
+
 ## レポートの読み方
 
 - `provenance` — 設定の hash、run ごとの trace / 観測の digest、現れた model / controller の版、
@@ -96,19 +104,23 @@ outcome は、すべてその場で拒む（数えないだけにすると、行
   境界を跨ぐため採点に使えなかった予測の数、`unattributed_observations` はどの tick からも
   許容幅の外にあって、どの arm にも帰属させなかった観測の数（**黙って落とさずに数える**）
 - `segments[].groups[]` — `overall` / `workload_regime` / `room_temperature_band` の切り口
-- `worst_cases[]` — 最小 threshold margin・最高温度・上限超過・EMERGENCY・最大 underprediction・
-  最小 identifiable fraction の上位。**平均に埋もれさせない**
+- `worst_cases[]` — 最小 threshold margin・最高温度・上限超過（metric ごと／segment の合計）・
+  EMERGENCY・最大 underprediction・最小 identifiable fraction の上位。**平均に埋もれさせない**
 - `gates[]` — arm ごとの `pass` / `blocked`。段は `safety` → `evidence` → `cost` で、
   **上の段が落ちたら下では覆らない**。欠測・未設定・coverage 不足も `blocked`。
   適用 arm の Safety の段は、**設定したすべての温度 metric が、評価したすべての segment に
   揃っているとき**だけ判定する（一部だけなら `incomplete_temperature_evidence` で `blocked`。
-  1つも無いときの `no_temperature_evidence` とは区別する）
+  1つも無いときの `no_temperature_evidence` とは区別する）。
+  **超過数は1つの segment の中で metric をまたいで足します**（metric ごとの最大では、
+  3つ同時に超えていても「1つ分」に見えるため）
 
 **gate は助言である。** 昇格・降格の判断は #92 と人が行う。
 
 ## 再現性
 
 - レポートに**生成時刻は入らない**。同じ入力からは同じ bytes が出る
+- `conditions_sha256` は設定の hash・run ごとの digest に加え、**時系列 split の境界**と
+  出力の形を決めるコード側の版を覆う。**同じ hash なら本当に同じ条件**である
 - 評価は `coldaisle.control.hardware` / `safety` / `reactive` / `serial` / `subprocess` を
   import しない（`tests/test_offline_evaluation.py` が走査する）
 - 時刻はすべて decision trace と観測から来る。壁時計は使わない

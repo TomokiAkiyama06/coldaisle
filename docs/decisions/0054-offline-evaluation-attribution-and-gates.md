@@ -107,7 +107,9 @@ counterfactual arm ごとに必ず次を出す。
 
 1. `safety` — **worst-case segment で判定する**（平均で薄めない）
    - 適用された arm: 絶対温度上限を超えた観測数・`EMERGENCY` の tick 数・fault を持つ tick 数・
-     最小 threshold margin
+     最小 threshold margin。**超過数は1つの segment の中で metric をまたいで足す。**
+     metric ごとの最大を採ると、3つの metric が同時に超えていても「1つ分」に見える
+     （同じ理由で、zone ごとの介入も tick 数だけでなく (tick, zone) の総数を残す）
    - counterfactual arm: **記録された Critical Safety floor を下回った要求の数**。
      実行されていない提案について記録から言える安全側の指標はこれだけで、温度の実績は存在しない
 2. `evidence` — coverage の下限、必要な入力（設定・観測）の有無
@@ -143,6 +145,18 @@ counterfactual arm ごとに必ず次を出す。
   行の重複・欠落・余分、同じ識別子の outcome の重複、その tick の counterfactual と
   結べない outcome は**すべて拒む**。数えないだけにすると、行を複製するだけで
   `scored` と coverage の下限を満たせてしまう
+- **渡された export は、同じ trace と観測から数え直した結果と1欄ずつ照らす。**
+  識別子と許容幅だけを見ても、`status` / `observed` / `error` / `expected_ts_ms` /
+  `input_action_ts_ms` は書き換えられる（**採点していない区間を `scored` に、外れた予測を
+  誤差の小さい予測に仕立てられる**）。照合器は時計も I/O も持たず同じ入力から同じ結果を
+  返すので（0053 §2.3）、数え直して閉じられる。一致しなければ受け取らず、一致したら
+  **数え直したほうを使う**
+- **同じ metric・同じ時刻に食い違う観測があれば受け取らない。**
+  どちらかを選ぶ規則を置くと、**どちらを選んでも片方の事実が消える**（小さいほうを採れば
+  絶対上限の超過が消え、大きいほうを採れば予測の当たりが消える）。時刻ごとに1つの値しか
+  持てない以上、食い違いは入力の誤りであって、評価が選んでよいものではない。
+  **まったく同じ観測が2度届くのは許すが、1つに畳んでから数える**（件数と digest が
+  「何回渡したか」に依存しないように）
 - **tick の無い segment を作らない。** 空の holdout は条件が1つも無い gate になり、
   「何も落ちなかった」と読めてしまう
 - 絶対温度上限は `safety.yaml` の `absolute_temp_ceiling_c` を使う。**評価設定に写さない**
@@ -156,6 +170,11 @@ counterfactual arm ごとに必ず次を出す。
 - **壁時計を使わない。** 報告に生成時刻の欄を持たない。時刻はすべて証拠から来る
 - 同じ入力からは同じ bytes を出す。run ごとに trace と観測の digest を残す
   （`coldaisle.dataset` の `_trace_digest` / `_telemetry_digest` と同じ形）
+- **`conditions_sha256` は「条件」をすべて覆う。** 設定の hash と run ごとの digest に加え、
+  **時系列 split の境界**（同じ run でも切る位置で holdout の中身と gate の判定が変わる）と、
+  出力の形を決めるコード側の版（`SHADOW_EXPORT_SCHEMA_VERSION` /
+  `EVALUATION_REPORT_SCHEMA_VERSION`）を入れる。**覆えていない条件があると、
+  違う条件の比較が同じ hash を名乗れる**
 
 ### 2.8 設定（`config/evaluation.yaml`。schema v1）
 
@@ -206,6 +225,10 @@ gate: { safety: {...}, evidence: {...}, cost: {...} }  # §2.4 の3段
 | 評価設定に絶対温度上限や ΔT の式を写す | `safety.yaml` / `metrics.yaml` と食い違ったときに、評価だけが別の契約で動く（#85 / #90 で見つかった型） |
 | 評価用に独自の照合許容幅を持つ | 記録された coverage と意味が変わる。記録済みの `match_tolerance_ms` と照らして fail closed にする |
 | outcome を時刻の近さで counterfactual に結び付ける | 同じ tick に複数の候補がありうる。`inference_id` + `plan_digest` で結ぶ |
+| 渡された export を識別子と許容幅の照合だけで受け取る | `status` / `observed` / `error` / 時刻は書き換えられる。採点していない区間を `scored` に仕立てられる。数え直して1欄ずつ照らす |
+| 食い違う重複観測から「小さいほう」「大きいほう」を選ぶ | どちらを選んでも片方の事実が消える（超過が消えるか、当たりが消えるか）。入力の誤りとして拒む |
+| 絶対上限の超過を metric ごとの最大で数える | 3つの metric が同時に超えていても「1つ分」に見える。segment の中で足す |
+| 時系列 split の境界を `conditions_sha256` に入れない | 同じ run を違う位置で切った比較が、同じ条件を名乗れる |
 | 外から渡された export の重複行・結べない outcome を「数えないだけ」にする | 行を複製するだけで coverage の下限を満たせる。1対1でなければ拒む |
 | coverage を holdout 全体の合計で判定する | 足りない区間の採点数で下限を満たし、その区間の予測指標は伏せたまま通せる。segment ごとに要求する |
 | 温度 metric が1つでも読めていれば Safety の段を判定する | 欠けた metric の超過を見ないまま合格になる。全 metric・全 segment を要求する |
@@ -221,5 +244,10 @@ gate: { safety: {...}, evidence: {...}, cost: {...} }  # §2.4 の3段
   いまはすべて provisional で、確定には基準となる測定が要る
 - 適用された Learned MPC の optimizer 実績を trace に残すか（`ControlTick` の追加が要る）は
   別 issue とする。いまは counterfactual の区間からだけ読める
+- **0053 §2.3 の `ObservationIndex` にも同じ型の危うさがある。** 同じ metric・同じ時刻に
+  食い違う観測があると「小さいほうを採る」ため、予測誤差（`実測 - 予測`）が
+  **underprediction を小さく見せる**向きに偏る。#91 の経路は入力の段階で食い違いを拒むので
+  塞がれているが、**記録側（#90 の照合器）はそのままである**。0054 で 0053 を書き換える
+  ことはしない（「追記のみ」）。**#154 として起票した**。その記録で決める
 - RL Supervisor を含む比較（#89 / #105）は、同じ arm の枠で足せるが、本記録では扱わない
 - 昇格 / 降格の運用（#92）はここで決めない。gate は助言である

@@ -149,6 +149,13 @@ class InterventionReport(_Frozen):
     fault_ticks: int = Field(default=0, ge=0)
     fault_codes: tuple[CountedReason, ...] = ()
     safety_states: tuple[CountedReason, ...] = ()
+    bound_zone_ticks: tuple[CountedReason, ...] = ()
+    """`bound_by` ごとの **(tick, zone) の総数**。
+
+    上の `*_ticks` は「その tick でどれかの zone が縛られたか」なので、**3 zone が同時に
+    縛られても1と数える**。同時に起きたことを隠さないよう、総数も並べて持つ
+    （決定記録 0054 §2.4 の「metric ごとの最大で隠さない」と同じ理由）。
+    """
 
     @model_validator(mode="after")
     def _counts_fit_inside_the_ticks(self) -> Self:
@@ -434,6 +441,9 @@ class WorstCaseKind(StrEnum):
     MINIMUM_THRESHOLD_MARGIN = "minimum_threshold_margin"
     MAXIMUM_TEMPERATURE = "maximum_temperature"
     CEILING_EXCEEDANCES = "ceiling_exceedances"
+    """metric ごとの超過数。**どの metric が超えたか**を示す。"""
+    SEGMENT_CEILING_EXCEEDANCES = "segment_ceiling_exceedances"
+    """1つの segment で**すべての metric を足した**超過数。gate が読むのはこちら。"""
     EMERGENCY_TICKS = "emergency_ticks"
     MAXIMUM_UNDERPREDICTION = "maximum_underprediction"
     MINIMUM_IDENTIFIABLE_FRACTION = "minimum_identifiable_fraction"
@@ -457,6 +467,12 @@ class RunProvenance(_Frozen):
     run_id: str = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9_.-]*$", max_length=120)
     start_ms: int = Field(ge=0)
     end_ms: int = Field(ge=0)
+    split_boundaries_ms: tuple[int, ...] = ()
+    """時系列 split の境界。**条件の一部である。**
+
+    同じ run を違う位置で切れば、holdout の中身も gate の判定も変わる。digest に
+    入れないと、**違う切り方の比較が同じ `conditions_sha256` を名乗れてしまう**。
+    """
     traces: int = Field(ge=0)
     observations: int = Field(ge=0)
     trace_sha256: Sha256Hex
