@@ -119,7 +119,11 @@ Learned MPC の `horizon_ms` / `step_ms`、探索の `candidate_levels` / `sweep
 目的関数の基準量 `cost_scales`、コストに使う予測 metric 名 `cost_metrics`、
 Air Balance の比を推定できない step のコスト `unknown_balance_cost` をすべて
 `status` / `basis` 付きで明示する。`horizon_ms` は `step_ms` の整数倍で、control step 数は
-構造上限 64、1 tick の内部モデル評価は 4,096 回までとする（資源枯渇を防ぐ境界であり、調整値ではない）。
+構造上限 32、1 tick の内部モデル評価は 4,096 回までとする（資源枯渇を防ぐ境界であり、調整値ではない）。
+step 数の上限 32 は #84 の `MAX_TARGET_HORIZONS` と同じ値にする。内部モデルの target schema と
+plan prediction が 32 horizon までしか表現できないため、設定だけがそれより多い step を許すと、
+検証に通っても決して動かない組み合わせを作れてしまう。**設定の上限を予測の契約へ合わせる**
+（逆に契約を広げない）。
 `cost_metrics` の metric を内部モデルの target schema が覆うことと、control step のすべての
 offset が target horizon にあることは、tick ごとではなく optimizer の**生成時**に照合する。
 `mpc.valid_ms` は `mpc.period_ms` 以上にする（再計算の周期より短い有効期限では、

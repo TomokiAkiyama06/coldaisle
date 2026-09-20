@@ -556,14 +556,12 @@ def propose(
 ) -> MpcProposal:
     """1 tick 分の提案を作る。"""
     window = observed if observed is not None else observed_input(action)
-    current = _mean(tuple(window.action.get(zone).effective_demand for zone in Zone))
     return controller.propose(
         snapshot=snapshot(ts_ms),
         observed=window,
         supervisor=supervisor_output(),
         baseline=fallback_proposal(baseline),
         safety_floor=demands(safety_floor),
-        current_demand=demands(current),
         residual=residual,
     )
 
@@ -2059,3 +2057,58 @@ def test_the_configured_step_limit_cannot_exceed_the_prediction_contract() -> No
             step_ms=_provisional(1_000),
             horizon_ms=_provisional(1_000 * (MAX_MPC_HORIZON_STEPS + 1)),
         )
+
+
+def test_the_rate_limit_origin_comes_from_the_observed_action(trained) -> None:
+    """**変化幅の起点を呼び出し側から受け取らない**（codex #4055749781）。
+
+    anchor が見ている action と違う値を渡せると、rate limit と変化コストだけが別の前提で
+    計算される。起点は観測 window の action（= いま実際に掛かっている effective demand）から取る。
+    """
+    import inspect
+
+    controller, _model, settings = build_controller(trained)
+    signature = inspect.signature(controller.propose)
+
+    # 渡す口が無いこと自体を固定する（将来また受け取り始めたら落ちる）。
+    assert "current_demand" not in signature.parameters
+
+    applied = 0.45
+    window = observed_input(applied)
+    result = propose(controller, observed=window, safety_floor=0.2)
+    assert result.solution is not None
+
+    # 起点が window の action なら、許される範囲は applied を中心にした帯になる。
+    constraints = HardConstraintSet.build(
+        optimizer=settings.mpc.optimizer,
+        safety=safety(),
+        safety_floor=demands(0.2),
+        current=demands(applied),
+    )
+    for zone in Zone:
+        lower, upper = constraints.window(zone)
+        assert lower <= result.solution.requested.get(zone) <= upper
+    assert constraints.window(Zone.FRONT)[0] == pytest.approx(applied - 0.1)
+
+
+def test_a_window_action_outside_the_search_bounds_fails_closed(trained) -> None:
+    """window の action が探索 ceiling より上なら、勝手に広げず実行不能にする。
+
+    起点を window から取るので、`HardConstraintSet` の交わりの規則がそのまま効く。
+    """
+    base, _profile, _attestation = trained
+    settings = mpc_policy(
+        max_step_down=_provisional(0.1),
+        zone_bounds={
+            zone.value: {"floor": _provisional(0.2), "ceiling": _provisional(0.5)} for zone in Zone
+        },
+    )
+    controller, _model, _ = build_controller(trained, policy_config=settings)
+    del base
+
+    result = propose(controller, observed=observed_input(1.0), safety_floor=0.2)
+
+    assert result.proposal is None
+    assert result.failure is LearnedFailure.OPTIMIZER_EXCEPTION
+    assert result.failure_reason is not None
+    assert "ceiling" in result.failure_reason.detail

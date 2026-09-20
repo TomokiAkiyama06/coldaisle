@@ -142,6 +142,15 @@ class MpcProposal(_Frozen):
         )
 
 
+def _applied_demands(observed: ObservedThermalInput) -> PerZone[Demand]:
+    """いま実際に掛かっている effective demand（#84 の観測 window の action）。"""
+    return PerZone[Demand](
+        front=observed.action.front.effective_demand,
+        rear=observed.action.rear.effective_demand,
+        top=observed.action.top.effective_demand,
+    )
+
+
 def _demands(proposal: ControllerProposal) -> PerZone[Demand]:
     return PerZone[Demand](
         front=proposal.requested.front.demand,
@@ -244,7 +253,6 @@ class LearnedMpcController:
         supervisor: SupervisorOutput,
         baseline: ControllerProposal,
         safety_floor: PerZone[Demand],
-        current_demand: PerZone[Demand],
         residual: ResidualEvidence | None = None,
     ) -> MpcProposal:
         """この tick の提案を作る。**失敗しても例外を外へ出さない。**
@@ -264,7 +272,6 @@ class LearnedMpcController:
                 supervisor=supervisor,
                 baseline=baseline,
                 safety_floor=safety_floor,
-                current_demand=current_demand,
                 residual=residual,
                 started_ms=started_ms,
             )
@@ -285,7 +292,6 @@ class LearnedMpcController:
         supervisor: SupervisorOutput,
         baseline: ControllerProposal,
         safety_floor: PerZone[Demand],
-        current_demand: PerZone[Demand],
         residual: ResidualEvidence | None,
         started_ms: int,
     ) -> MpcProposal:
@@ -301,7 +307,9 @@ class LearnedMpcController:
             optimizer=self._policy.mpc.optimizer,
             safety=self._safety,
             safety_floor=safety_floor,
-            current=current_demand,
+            # **変化幅の起点は観測 window の action から取る。** 呼び出し側から別に受け取ると、
+            # anchor が見ている action と違う値で rate limit と変化コストを計算できてしまう。
+            current=_applied_demands(observed),
         )
         outcome = self._optimizer.solve(
             observed=observed,

@@ -203,6 +203,10 @@ optimizer が従う制約は3つを重ねた最も狭い範囲とする。
 2. Critical Safety の最低 demand（`safety.zone_min_demand` と、その tick の Safety floor）
 3. 直前の effective demand からの変化幅（下げる向きは `safety.ramp_down_per_s` × step）
 
+**変化幅の起点（直前の effective demand）は、観測 window の action から取る。** 呼び出し側から
+別に受け取ると、anchor 推論が見ている action と違う値で rate limit と変化コストだけが計算できて
+しまう。#84 の観測 window は「その action が実際に掛かった結果の観測」なので、起点はそこにある。
+
 規則は2つ。
 
 - **どれも範囲を狭める向きにしか働かない。** 満たせる値が無ければ緩めず、実行不能として扱う。
@@ -284,8 +288,9 @@ mpc:
 - horizon / step の候補は統合メモ 2026-09-13 §21.3 の
   「prediction horizon 60〜120 秒級、制御周期 2〜5 秒級」を出発点とするが、**確定値としない。**
   0028 §2.6 の `mpc.period_ms = 10000` を含め、実測と deadline の評価で決める（Q-22）。
-- 構造上限として control step 数 64、1 tick の内部モデル評価 4,096 回を置く。
-  これは未信頼な設定による資源枯渇を防ぐ境界で、調整値ではない。
+- 構造上限として control step 数 32（#84 の `MAX_TARGET_HORIZONS` と同じ値）、
+  1 tick の内部モデル評価 4,096 回を置く。これは未信頼な設定による資源枯渇を防ぐ境界で、
+  調整値ではない。step 数を予測の契約に合わせる理由は §2.3 に書いた。
 - `provisional_values()` は新しい暫定値の**位置と根拠だけ**を起動ログへ出す（値は出さない）。
 
 ## 3. Consequences

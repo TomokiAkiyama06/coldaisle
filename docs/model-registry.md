@@ -102,7 +102,7 @@ Rollback前にも旧artifactのchecksumとschema互換性を再検証し、成�
   引退も返すため、これを載せないと、promotionの承認を経ていないartifactをactive制御へ配線できて
   しまう。#86 の `for_control` は `production_active` を要求し、Replay / offline評価は
   productionでないattestationをそのまま使う。
-  さらに `ArtifactMetadata.capability`（`observational_replay` / `counterfactual_action`）を
+  さらに `ArtifactMetadata.capability`（`ArtifactCapability`: `observational_replay` / `counterfactual_action`）を
   必須項目として登録時に申告し、attestationがそれを載せる。#86 はこの申告だけを見て内部モデルの
   可否を決め、推論器の自称では判断しない。capabilityの追加にともない Registry schema version を
   2 へ上げた（既定値を補うと、能力を申告していないartifactが「反実仮想もできる」側へ倒れる）。
