@@ -311,7 +311,11 @@ def valid_documents() -> dict[str, dict[str, object]]:
                     "limit_down": 0.2,
                 },
             },
-            "shadow": {"enabled": True, "outcome_match_tolerance_ms": provisional(2000)},
+            "shadow": {
+                "enabled": True,
+                "outcome_match_tolerance_ms": provisional(2000),
+                "applied_demand_tolerance": provisional(0.01),
+            },
             "recovery_hold_ms": 1000,
             "demote_window_ms": 60000,
             "demote_after": 3,

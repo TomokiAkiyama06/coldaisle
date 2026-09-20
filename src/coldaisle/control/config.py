@@ -871,6 +871,20 @@ class ShadowConfig(_ConfigModel):
     """counterfactual を decision trace へ残すか。制御の挙動は変えない。"""
     outcome_match_tolerance_ms: PolicyMilliseconds
     """予測時刻と実測時刻のずれの許容幅。Dataset の target 選択（0031 §2.2）と同じ規則で使う。"""
+    applied_demand_tolerance: PolicyDemand
+    """予測した候補 action が「実際に掛かっていた」とみなす zone ごとの demand の許容幅。
+
+    counterfactual の予測を**採点してよいのは、その plan が実際に実行された区間だけ**である
+    （決定記録 0053 §2.3）。別の値が掛かっていた区間の実測と引き算しても、出てくるのは
+    制御器の違いとモデル誤差が混ざった量になる。
+    """
+
+    @model_validator(mode="after")
+    def _tolerance_keeps_the_check_meaningful(self) -> Self:
+        if self.applied_demand_tolerance.value >= 1.0:
+            # demand の全域を許すと、どんな適用値も「plan どおり」になり判定が意味を失う。
+            raise ValueError("shadow.applied_demand_tolerance は 1.0 未満にする")
+        return self
 
 
 class FanPolicyConfig(_ConfigModel):
@@ -1173,6 +1187,11 @@ class ControlConfig(_ConfigModel):
             "fan-policy.yaml",
             "shadow.outcome_match_tolerance_ms",
             self.policy.shadow.outcome_match_tolerance_ms,
+        )
+        append(
+            "fan-policy.yaml",
+            "shadow.applied_demand_tolerance",
+            self.policy.shadow.applied_demand_tolerance,
         )
         for zone in Zone:
             bound = optimizer.zone_bounds.get(zone)

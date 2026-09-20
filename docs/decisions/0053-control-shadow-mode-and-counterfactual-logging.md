@@ -79,10 +79,36 @@ authority stage が `SHADOW` の間、Learned MPC と RL Supervisor の提案は
   1 step に届くと、別の候補 action の効果を「この予測が当たった証拠」に数える
 - 照合できなかった出力は**理由付きの未照合**として残す。値を埋め合わせない
 
+**採点してよいのは、予測した候補 action が実際に掛かっていた区間だけ。**
+counterfactual の予測は「その plan を実行したら」の予測である。実際には Fallback（や Guard /
+Safety が決めた別の値）が掛かっていた区間の実測と引き算すると、出てくるのは
+**制御器の違いとモデル誤差が混ざった量**で、モデル誤差ではない。判定は記録だけで行う。
+
+- plan の step `i` が覆う区間は `[action + offset[i-1], action + offset[i])`（`offset[0]` の手前は
+  action 時刻）。その区間に**記録がある tick** の effective demand を見る
+- zone ごとに `|適用値 - plan の値| <= shadow.applied_demand_tolerance` なら、その step は
+  「plan どおり実行された」とみなす
+- 区間に tick の記録が1つも無ければ `applied_action_unknown`、1つでも違えば
+  `applied_action_differs` として **`unidentifiable`** にする
+- `unidentifiable` でも**実測は残す**。誤差だけを出さない
+
+適用値は既存の記録から取る。`ControlTick` は zone ごとの effective demand を必ず持つので
+（0028 §2.3 / #82）、counterfactual を持たない tick も「その時刻に何が掛かっていたか」の証拠に
+なる。**この判定のために新しい記録項目は要らない。**
+
+**反実仮想の補正（因果推定）はこの記録の範囲外とする。** 別の action が掛かっていた区間の
+実測から「その plan だったらどうだったか」を推定する道具はここでは作らない。
+`unidentifiable` を「採点できない」として残し、評価（#91）はその区分を見て扱いを決める。
+
 ### 2.4 export は JSON Lines（0030 §5 の未決を閉じる）
 
 - 1行 = counterfactual を持つ1 tick。`schema_version` を持ち、適用値・counterfactual・
   予測と実測の突き合わせを、同じ `tick_id` / `ts_ms` と `inference_id` で結んで置く
+- 突き合わせは3つの状態を**区別して**書く。`status: scored`（採点した）、
+  `status: unidentifiable` + 理由（実測はあるが誤差を出さない）、出力ごとの `unmatched` + 理由
+  （実測が無い）。採点していない結果に `error` は入らない
+- 採点の可否は**渡された trace の適用 demand だけ**で決める。horizon を覆う tick が範囲外なら
+  `unidentifiable`（範囲を跨いで推定しない）
 - 入力は保存済み trace と観測で、**読み取りのみ**。同じ入力からは同じ bytes を出す
 - 保存した索引（`ts_ms` / `tick_id` / `schema_version`）と trace 本文が食い違う行は流さない。
   **版も照らす**（`coldaisle.dataset` の trace 検証と同じ）。索引の版だけを見て読み分ける側が、
@@ -98,10 +124,13 @@ authority stage が `SHADOW` の間、Learned MPC と RL Supervisor の提案は
 shadow:
   enabled: true
   outcome_match_tolerance_ms: { value: <ms>, status: provisional }
+  applied_demand_tolerance: { value: <demand>, status: provisional }
 ```
 
 - **実測前の暫定値**として扱う。コードに既定値を置かない
-- 許容幅は `mpc.optimizer.step_ms` 未満を設定で検証する（§2.3）
+- 時刻の許容幅は `mpc.optimizer.step_ms` 未満を設定で検証する（§2.3）
+- `applied_demand_tolerance` は「同じ action とみなす」zone ごとの demand の幅。**1.0 未満**を
+  設定で検証する（1.0 はどんな適用値も plan どおりにしてしまい、判定が意味を失う）
 - 記録の構造上の上限はコード側に置くが、**写し元の契約と同じ値にする**。
   1 tick の counterfactual は制御器の種類の数、候補 plan と予測の step 数は
   `MAX_MPC_HORIZON_STEPS` / `MAX_TARGET_HORIZONS`、1 step の metric 数は `MAX_TARGET_METRICS`、
@@ -113,6 +142,9 @@ shadow:
 
 - 1 tick の「何を適用し、何を適用しなかったか」を**1つの不変な record**で読める
 - 予測の当たり外れを、あとから決定論的に計算できる。処理の順序や実行時刻に依らない
+- **Shadow の間は多くの予測が `unidentifiable` になる**（提案が実行されていないため）。
+  採点できるのは、適用値がたまたま候補 plan と一致した区間だけである。これは制限ではなく、
+  観測から言えることの範囲そのもので、混ぜて集計しないための区分である
 - #91 は trace と観測だけで比較できる。Shadow 専用の収集経路を作らずに済む
 - trace は大きくなる。`shadow.enabled`・構造上の上限・保持期間（0030 の `control_trace_days`）で抑える
 - `ControlTick` の版が v6 になる。保存済みの v1〜v5 はそのまま読める（shadow を持てない）
@@ -128,6 +160,9 @@ shadow:
 | `ControllerProposal` をそのまま shadow に保存する | 提案が自称した confidence / ood が混ざり、裏づけの有無を区別できない |
 | 突き合わせ結果を trace へ追記する | 追記専用の判断記録を後から書き換えることになり、事故調査に使えなくなる |
 | 照合の時刻に処理時刻（現在時刻）を使う | 遅れて流し込んだ古い観測が「新しい証拠」になる。0050 §2.2 で塞いだ穴と同じ |
+| 適用 action を問わず、予測と実測の差を「予測誤差」として残す | 制御器の違いとモデル誤差が混ざる。Shadow の提案は実行されていないので、その差は当たり外れではない |
+| 別の action の実測から反実仮想を推定して採点する | 因果推定はこの記録の範囲外。学習中のモデルの評価に、検証していない推定を重ねない |
+| 採点できない予測を export から落とす | 「予測が無かった」と「採点できなかった」を区別できなくなる。実測は残して区分で示す |
 | shadow 専用に confidence を計算し直す | #85 と二重になり、どちらが本物か分からなくなる。Gate の判定だけを写す |
 | 記録した予測を、あとで plan から引き直す | 探索に使った予測と別のものを記録しうる。採用した解と対で持つ |
 | 候補 plan を残さず、要求と offset から plan を組み直して digest を数える | v1 の「horizon 全体で同じ demand」に依存する。step ごとに違う demand を探索する版が入った瞬間、正しい記録まで閉じる |
@@ -135,8 +170,10 @@ shadow:
 
 ## 5. 未決事項
 
-- `outcome_match_tolerance_ms` の実運用値と、Shadow trace の保持期間は**実測後に確定する**
-  （いまは provisional。確定には基準となる測定が要る）
+- `outcome_match_tolerance_ms` / `applied_demand_tolerance` の実運用値と、Shadow trace の
+  保持期間は**実測後に確定する**（いまは provisional。確定には基準となる測定が要る）
+- 実行されなかった提案の当たり外れをどう評価するかは #91 で決める。採点できる区間が少ない場合の
+  扱い（例: 適用値が一致した区間だけを集計する、Shadow 以外の証拠を使う）もそちらの論点とする
 - RL Supervisor の counterfactual は `SupervisorDecision.shadow` に入る。Demand を伴う RL の
   提案を記録する必要が出たら（#89）、その時点で別の記録を作る
 - 昇格 / 降格の gate 条件（#92）と評価指標のしきい値（#91）はここで決めない

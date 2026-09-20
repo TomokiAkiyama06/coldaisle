@@ -9,20 +9,32 @@
 - 期待時刻に**最も近い**観測を、``±match_tolerance_ms`` の中でだけ採る。**同距離なら過去側**
 - 観測は予測の元になった action より後に限る
 - **品質が OK の値だけ**を証拠にする。stale / suspect / missing は「当たった」に数えない
+
+**採点してよいのは、予測した候補 action が実際に掛かっていた区間だけ**（0053 §2.3）。
+counterfactual の予測は「その plan を実行したら」の予測なので、実際には Fallback（や Guard /
+Safety が決めた別の値）が掛かっていた区間の実測と引き算しても、出てくるのは
+**制御器の違いとモデル誤差が混ざった量**である。掛かっていた action が plan と違う場合は
+``unidentifiable`` として、観測は残したまま**誤差を出さない**。
+ここで因果推定（反実仮想の補正）はしない。
 """
 
 from __future__ import annotations
 
 from bisect import bisect_left, bisect_right
 from collections.abc import Iterable, Sequence
+from enum import StrEnum
 from typing import Self
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from coldaisle.control.schema import (
+    Demand,
+    PerZone,
     Reason,
+    ShadowActionPlan,
     ShadowMetricName,
     ShadowPrediction,
+    Zone,
 )
 from coldaisle.store.models import Quality
 
@@ -49,8 +61,24 @@ class OutcomeObservation(_Frozen):
         return self.value if self.quality is Quality.OK else None
 
 
+class OutcomeStatus(StrEnum):
+    """1つの予測に対する照合結果の区分（#91 が読み分ける）。"""
+
+    SCORED = "scored"
+    """予測した候補 action が実際に掛かっていた。誤差をモデル誤差として読める。"""
+    UNIDENTIFIABLE = "unidentifiable"
+    """掛かっていた action が plan と違う（または記録が無い）。**誤差を出さない。**"""
+
+
 class OutcomeMatch(_Frozen):
-    """1つの予測出力（step × metric）と実測の突き合わせ結果。"""
+    """1つの予測出力（step × metric）と実測の突き合わせ結果。
+
+    状態は3つあり、**混ぜない**。
+
+    - 照合できて採点した: ``observed`` と ``error`` を持つ
+    - 照合できたが採点していない: ``observed`` だけを持つ（``unidentifiable`` な予測）
+    - 照合できなかった: ``unmatched`` に理由だけを持つ
+    """
 
     offset_ms: int = Field(gt=0)
     expected_ts_ms: int = Field(ge=0)
@@ -59,39 +87,86 @@ class OutcomeMatch(_Frozen):
     observed: float | None = Field(default=None, allow_inf_nan=False)
     observed_ts_ms: int | None = Field(default=None, ge=0)
     error: float | None = Field(default=None, allow_inf_nan=False)
+    """予測誤差。**採点してよい予測のときだけ**入る。"""
     unmatched: Reason | None = None
     """照合できなかった理由。**埋め合わせの値は入れない。**"""
 
     @model_validator(mode="after")
-    def _matched_outputs_carry_all_three_values(self) -> Self:
+    def _matched_outputs_carry_their_evidence(self) -> Self:
         matched = self.observed is not None
-        if matched != (self.observed_ts_ms is not None) or matched != (self.error is not None):
-            raise ValueError("照合できた出力は観測値・観測時刻・誤差を揃って持つ")
+        if matched != (self.observed_ts_ms is not None):
+            raise ValueError("照合できた出力は観測値と観測時刻を揃って持つ")
         if matched == (self.unmatched is not None):
             raise ValueError("照合できた出力に理由を付けず、できなかった出力には必ず付ける")
-        if self.observed is not None and self.error != self.observed - self.predicted:
-            raise ValueError("誤差は observed - predicted にする")
+        if self.error is not None:
+            if not matched:
+                raise ValueError("照合できていない出力に誤差を付けない")
+            assert self.observed is not None
+            if self.error != self.observed - self.predicted:
+                raise ValueError("誤差は observed - predicted にする")
         return self
 
 
 class ShadowOutcome(_Frozen):
-    """1つの予測に対する照合結果。**予測と同じ推論に束ねて持つ。**"""
+    """1つの予測に対する照合結果。**予測と同じ推論・同じ候補 plan に束ねて持つ。**"""
 
     inference_id: str = Field(pattern=r"^[0-9a-f]{64}$")
     plan_digest: str = Field(pattern=r"^[0-9a-f]{64}$")
     input_action_ts_ms: int = Field(ge=0)
     match_tolerance_ms: int = Field(ge=0)
+    status: OutcomeStatus
+    unidentifiable: Reason | None = None
+    """採点できない理由（掛かっていた action が plan と違う / 記録が無い）。"""
     matches: tuple[OutcomeMatch, ...] = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def _scoring_follows_the_applied_action(self) -> Self:
+        if (self.status is OutcomeStatus.UNIDENTIFIABLE) != (self.unidentifiable is not None):
+            raise ValueError("採点できない結果にだけ理由を付ける")
+        if self.status is OutcomeStatus.UNIDENTIFIABLE:
+            if any(item.error is not None for item in self.matches):
+                # 別の action の結果との差を「予測誤差」として残さない（0053 §2.3）。
+                raise ValueError("採点できない予測に誤差を残さない")
+            return self
+        if any((item.error is None) != (item.observed is None) for item in self.matches):
+            raise ValueError("採点する予測では、照合できた出力に必ず誤差を付ける")
+        return self
+
+    @property
+    def scored(self) -> bool:
+        """予測誤差として読んでよい結果か。"""
+        return self.status is OutcomeStatus.SCORED
 
     @property
     def matched(self) -> int:
-        """実測と突き合わせられた出力の数。"""
+        """実測と突き合わせられた出力の数。**採点したかどうかとは別。**"""
         return sum(1 for item in self.matches if item.observed is not None)
 
     @property
     def complete(self) -> bool:
         """すべての出力を実測と突き合わせられたか。"""
         return self.matched == len(self.matches)
+
+
+class AppliedActionTimeline:
+    """各 tick で**実際に掛かった** effective demand の列（#82 の decision trace から作る）。
+
+    counterfactual の予測を採点してよいかは、この列だけで決める。推定も補間もしない。
+    「その時刻に掛かっていた値」は、その区間に記録がある tick の effective demand そのものである。
+    """
+
+    __slots__ = ("_applied", "_timestamps")
+
+    def __init__(self, applied: Iterable[tuple[int, PerZone[Demand]]]) -> None:
+        points = sorted(applied, key=lambda item: item[0])
+        self._applied = points
+        self._timestamps = [ts_ms for ts_ms, _demands in points]
+
+    def covering(self, *, start_ms: int, end_ms: int) -> tuple[tuple[int, PerZone[Demand]], ...]:
+        """半開区間 ``[start, end)`` に記録がある tick の適用値を時刻順に返す。"""
+        low = bisect_left(self._timestamps, start_ms)
+        high = bisect_left(self._timestamps, end_ms)
+        return tuple(self._applied[low:high])
 
 
 class ObservationIndex:
@@ -144,30 +219,43 @@ class ObservationIndex:
 
 
 class ShadowOutcomeMatcher:
-    """記録済みの予測に実測を突き合わせる。**時計も I/O も持たない。**
+    """記録済みの予測に実測を突き合わせ、**採点してよいときだけ**誤差を出す。
 
-    設定の許容幅だけを持ち、同じ入力からは必ず同じ結果を返す。
+    **時計も I/O も持たない。** 設定の2つの許容幅だけを持ち、同じ入力からは必ず同じ結果を返す。
     """
 
-    def __init__(self, *, match_tolerance_ms: int) -> None:
+    def __init__(self, *, match_tolerance_ms: int, applied_demand_tolerance: float) -> None:
         if match_tolerance_ms < 0:
             raise ValueError("照合の許容幅は負にできない")
+        if not 0.0 <= applied_demand_tolerance < 1.0:
+            # 1.0 はどんな適用値も「plan どおり」にしてしまう（識別の判定が意味を失う）。
+            raise ValueError("適用 demand の許容幅は 0 以上 1 未満にする")
         self._tolerance_ms = match_tolerance_ms
+        self._demand_tolerance = applied_demand_tolerance
 
     @property
     def match_tolerance_ms(self) -> int:
         """設定した照合の許容幅。"""
         return self._tolerance_ms
 
+    @property
+    def applied_demand_tolerance(self) -> float:
+        """適用値と plan を同じとみなす zone ごとの許容幅。"""
+        return self._demand_tolerance
+
     def match(
         self,
         prediction: ShadowPrediction,
         observations: Sequence[OutcomeObservation] | ObservationIndex,
+        *,
+        plan: ShadowActionPlan,
+        applied: AppliedActionTimeline,
     ) -> ShadowOutcome:
         """予測の全出力を実測と突き合わせる。照合できない出力は理由付きで残す。
 
+        ``plan`` はこの予測が前提にした候補 action 列、``applied`` は実際に掛かった値の列で、
+        **両方を必ず要求する**。「実行されたか分からないまま採点する」呼び方を作らない。
         多くの予測を続けて照合するときは ``ObservationIndex`` を一度作って渡す。
-        結果は列を渡したときと同じになる。
         """
         shortest_offset_ms = prediction.targets[0].offset_ms
         if self._tolerance_ms >= shortest_offset_ms:
@@ -176,6 +264,10 @@ class ShadowOutcomeMatcher:
             raise ShadowOutcomeUnusableError(
                 f"照合の許容幅={self._tolerance_ms} が最短 offset={shortest_offset_ms} 以上"
             )
+        if plan.digest() != prediction.plan_digest:
+            # 別の候補の plan で識別を判定させない（決定記録 0052 §2.2 の識別子で閉じる）。
+            raise ShadowOutcomeUnusableError("予測と別の候補 plan で識別を判定しようとしている")
+        unidentifiable = self._unidentifiable_reason(prediction, plan, applied)
         index = (
             observations
             if isinstance(observations, ObservationIndex)
@@ -189,6 +281,7 @@ class ShadowOutcomeMatcher:
                 metric=metric,
                 predicted=value,
                 index=index,
+                scored=unidentifiable is None,
             )
             for target in prediction.targets
             for metric, value in sorted(target.values.items())
@@ -198,8 +291,54 @@ class ShadowOutcomeMatcher:
             plan_digest=prediction.plan_digest,
             input_action_ts_ms=prediction.input_action_ts_ms,
             match_tolerance_ms=self._tolerance_ms,
+            status=(
+                OutcomeStatus.SCORED if unidentifiable is None else OutcomeStatus.UNIDENTIFIABLE
+            ),
+            unidentifiable=unidentifiable,
             matches=matches,
         )
+
+    def _unidentifiable_reason(
+        self,
+        prediction: ShadowPrediction,
+        plan: ShadowActionPlan,
+        applied: AppliedActionTimeline,
+    ) -> Reason | None:
+        """予測した候補 action が**実際に掛かっていたか**を、記録だけで判定する。
+
+        step ``i`` が覆うのは ``[action + offset[i-1], action + offset[i])``（``offset[0]`` の手前は
+        action 時刻）。その区間に記録がある tick の effective demand が、zone ごとに plan の
+        値と許容幅の中で一致していれば、その step は「plan どおり実行された」とみなす。
+
+        - 区間に tick の記録が1つも無ければ、実行されたと**言えない**（採点しない）
+        - 1つでも違う値が掛かっていれば、その差は制御器の違いであってモデル誤差ではない
+        """
+        action_ts_ms = prediction.input_action_ts_ms
+        previous_offset_ms = 0
+        for step in plan.steps:
+            start_ms = action_ts_ms + previous_offset_ms
+            end_ms = action_ts_ms + step.offset_ms
+            previous_offset_ms = step.offset_ms
+            covering = applied.covering(start_ms=start_ms, end_ms=end_ms)
+            if not covering:
+                return Reason(
+                    code="applied_action_unknown",
+                    detail=f"[{start_ms}, {end_ms}) に適用 demand の記録が無い",
+                )
+            for ts_ms, demands in covering:
+                for zone in Zone:
+                    planned = step.demands.get(zone)
+                    actual = demands.get(zone)
+                    if abs(actual - planned) > self._demand_tolerance:
+                        return Reason(
+                            code="applied_action_differs",
+                            detail=(
+                                f"zone={zone.value}; ts_ms={ts_ms}; "
+                                f"applied={actual:.6f}; planned={planned:.6f}; "
+                                f"tolerance={self._demand_tolerance:.6f}"
+                            ),
+                        )
+        return None
 
     def _match_output(
         self,
@@ -210,6 +349,7 @@ class ShadowOutcomeMatcher:
         metric: str,
         predicted: float,
         index: ObservationIndex,
+        scored: bool,
     ) -> OutcomeMatch:
         best = index.nearest(
             metric,
@@ -236,5 +376,6 @@ class ShadowOutcomeMatcher:
             predicted=predicted,
             observed=observed,
             observed_ts_ms=observed_ts_ms,
-            error=observed - predicted,
+            # **観測は残し、採点だけを止める。** 別の action の結果との差は予測誤差ではない。
+            error=(observed - predicted) if scored else None,
         )

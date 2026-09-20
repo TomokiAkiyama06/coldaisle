@@ -20,8 +20,15 @@ from typing import Literal, Protocol, TextIO
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from coldaisle.control.schema import ControllerKind, ControlTick, ShadowRecord
+from coldaisle.control.schema import (
+    ControllerKind,
+    ControlTick,
+    Demand,
+    PerZone,
+    ShadowRecord,
+)
 from coldaisle.control.shadow.outcome import (
+    AppliedActionTimeline,
     ObservationIndex,
     OutcomeObservation,
     ShadowOutcome,
@@ -78,11 +85,16 @@ def shadow_rows(
 
     ``matcher`` を渡すと予測と実測を突き合わせる。渡さなければ ``outcomes`` は空になる。
     **突き合わせの有無で counterfactual の記録内容は変わらない。**
+
+    採点の可否は、**渡された trace に記録されている適用 demand だけ**で決める。horizon を
+    覆う tick が範囲に入っていなければ、その予測は ``unidentifiable`` になる（推定しない）。
     """
     # 実測の索引は**全行で1つ**。行ごとに並べ直すと、走査が行数に比例して伸びる。
     index = ObservationIndex(observations)
-    for row in traces:
-        tick = ControlTick.model_validate_json(row.trace_json)
+    # 索引と本文の照合は行ごとに行うが、適用 demand の列は**全行から1回だけ**作る。
+    # counterfactual を持たない tick も、その時刻に何が掛かっていたかの証拠になる。
+    parsed = [(row, ControlTick.model_validate_json(row.trace_json)) for row in traces]
+    for row, tick in parsed:
         # **counterfactual の有無に関わらず先に照らす。** shadow を持たない行を素通しすると、
         # 索引の壊れた trace が「この期間には Shadow 実績が無い」に化ける。
         if (tick.tick_id, tick.ts_ms, tick.schema_version) != (
@@ -98,6 +110,8 @@ def shadow_rows(
                 f"（row={row.tick_id}/{row.ts_ms}/v{row.schema_version}; "
                 f"trace={tick.tick_id}/{tick.ts_ms}/v{tick.schema_version}）"
             )
+    applied = applied_action_timeline(tick for _row, tick in parsed)
+    for _row, tick in parsed:
         if tick.shadow is None:
             continue
         yield ShadowExportRow(
@@ -105,21 +119,47 @@ def shadow_rows(
             tick_id=tick.tick_id,
             ts_ms=tick.ts_ms,
             shadow=tick.shadow,
-            outcomes=_outcomes(tick.shadow, index, matcher),
+            outcomes=_outcomes(tick.shadow, index, applied, matcher),
         )
+
+
+def applied_action_timeline(ticks: Iterable[ControlTick]) -> AppliedActionTimeline:
+    """各 tick が**実際に掛かった** effective demand の列を作る（#82 の trace から）。
+
+    counterfactual の予測を採点してよいかの判定に使う。`ControlTick` は zone ごとの
+    effective demand を必ず持つので、shadow を持たない tick も証拠になる。
+    """
+    return AppliedActionTimeline(
+        (
+            tick.ts_ms,
+            PerZone[Demand](
+                front=tick.zones.front.demand.effective,
+                rear=tick.zones.rear.demand.effective,
+                top=tick.zones.top.demand.effective,
+            ),
+        )
+        for tick in ticks
+    )
 
 
 def _outcomes(
     shadow: ShadowRecord,
     index: ObservationIndex,
+    applied: AppliedActionTimeline,
     matcher: ShadowOutcomeMatcher | None,
 ) -> tuple[ShadowOutcome, ...]:
     if matcher is None:
         return ()
     return tuple(
-        matcher.match(counterfactual.prediction, index)
+        matcher.match(
+            counterfactual.prediction,
+            index,
+            # schema が `ok` の counterfactual に候補 plan を要求する（#90）。
+            plan=counterfactual.plan,
+            applied=applied,
+        )
         for counterfactual in shadow.counterfactuals
-        if counterfactual.prediction is not None
+        if counterfactual.prediction is not None and counterfactual.plan is not None
     )
 
 

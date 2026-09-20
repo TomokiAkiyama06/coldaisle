@@ -136,8 +136,13 @@ v6からv7へは `mpc.optimizer` を追加してから `schema_version: 7` へ�
 v1〜v6は自動補完せず起動前に拒否する。
 
 #90 のv8で `shadow` を追加する（決定記録 0053。Proposed、所有者承認待ち）。
-counterfactual を decision trace へ残すかどうかの `enabled` と、予測時刻と実測時刻のずれの
-許容幅 `outcome_match_tolerance_ms` を `status` / `basis` 付きで明示する。許容幅は
+counterfactual を decision trace へ残すかどうかの `enabled`、予測時刻と実測時刻のずれの
+許容幅 `outcome_match_tolerance_ms`、予測した候補 action が「実際に掛かっていた」とみなす
+zone ごとの demand の幅 `applied_demand_tolerance` を `status` / `basis` 付きで明示する。
+後者は 1.0 未満にする（1.0 はどんな適用値も plan どおりにしてしまい、採点の可否の判定が
+意味を失う）。掛かっていた action が plan と違う区間の実測は、差を取っても制御器の違いと
+モデル誤差が混ざるだけなので、`unidentifiable` として誤差を出さない（0053 §2.3）。
+時刻の許容幅は
 `mpc.optimizer.step_ms` 未満でなければならない。1 step に届くと、別の候補 action の効果を
 「その予測が当たった証拠」に数えてしまうためで、#85 の `residual_match_tolerance_ms` が
 Profile の最短 horizon に対して満たす条件と同じである。`enabled` は記録の量だけを変え、

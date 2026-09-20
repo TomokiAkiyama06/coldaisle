@@ -242,7 +242,11 @@ def policy(
                 "limit_down": 0.2,
             },
         },
-        "shadow": {"enabled": True, "outcome_match_tolerance_ms": provisional(500)},
+        "shadow": {
+            "enabled": True,
+            "outcome_match_tolerance_ms": provisional(500),
+            "applied_demand_tolerance": provisional(0.01),
+        },
         "recovery_hold_ms": recovery_hold_ms,
         "demote_window_ms": demote_window_ms,
         "demote_after": demote_after,
