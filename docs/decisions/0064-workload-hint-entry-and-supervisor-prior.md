@@ -3,6 +3,7 @@
 - **種別**: Decision Record
 - **Status**: FINAL（2026-09-21、リポジトリ所有者が承認。0045 のソケット再利用・Workload Regime 推定へは入れず SupervisorInput のみ・冷却を弱めない・Stage A は記録のみ、の 4 点。Stage A の実装は別 Issue / 別 PR）
 - **Date**: 2026-09-21
+- **Superseded by**: [0066](0066-workload-hint-stage-b-conditions.md)（§2.8 の「単調性（片方向）」の検証方法と、§2.6 の「起動時の取り込み」の条件式のみ。他の節は有効）
 - **Supersedes**: なし。[0045](0045-local-socket-write-entry.md) §2.9 と §5 の未決 #1
   （「Workload Hint のメッセージ形・Supervisor への渡し方・実装時期」）に答える記録であり、
   0045 の本文は書き換えない

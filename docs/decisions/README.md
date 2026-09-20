@@ -130,3 +130,4 @@ docs/decisions/NNNN-<slug>.md      例: 0002-metric-naming.md
 | [0060](0060-control-loop-runtime.md) | Control Loop の実行時契約（`tick_ms` は safety.yaml・Telemetry はストア経由・モードは読み取り port・deadman の配線・実行の記録を trace へ） | FINAL |
 | [0062](0062-model-registry-operations.md) | Model Registry の運用入口（CLI）と起動時検証、lifecycle 監査の追跡 | FINAL |
 | [0064](0064-workload-hint-entry-and-supervisor-prior.md) | Workload Hint の入口（0045 のソケットを再利用）・形と版・期限の数え方・矛盾時は Telemetry 優先・trace への出し方・実装の段階 | FINAL |
+| [0066](0066-workload-hint-stage-b-conditions.md) | Workload Hint の Stage B 条件の精緻化（冷却の単調性は構成制限＋網羅試験で保証・起動時取り込みは 0 <= 経過 <= startup_backfill_ms のみ） | Proposed |
