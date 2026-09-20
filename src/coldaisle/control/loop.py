@@ -170,7 +170,11 @@ class OperatingModeSource(Protocol):
     """運転モードの読み取り専用の窓口。**LLM からは到達できない**（AGENTS.md ルール1）。"""
 
     def current(self) -> ModeCommand:
-        """いまのモード。入口（ローカル Unix ソケット）の配線は #60（0028 未決 3）。"""
+        """いまのモード。入口（ローカル Unix ソケット）の配線は #60（0028 未決 3）。
+
+        **待たない。** この呼び出しは Critical Safety より前にあるので、ここで待つと
+        安全側の裁定ごと止まる。手元に無ければ直前の値を返し、失敗は例外で返す。
+        """
         ...
 
 
@@ -391,6 +395,20 @@ def _advisory_stale_ms(metric: str, config: ControlConfig) -> int:
     raise ValueError(f"制御入力の許容遅延を決められない metric がある: {metric}")
 
 
+@dataclass(frozen=True, slots=True)
+class _SnapshotIdentity:
+    """loop が出した snapshot を、**この process の中で**一意に指すための記録。
+
+    `tick_id` は再起動で 0 に戻るので、それだけで照合すると、前の process の worker 出力が
+    新しい process の無関係な snapshot に結び付く（決定記録 0060 §2.6）。
+    """
+
+    tick_id: int
+    ts_ms: int
+    schema_version: int
+    monotonic_ms: int
+
+
 class _TelemetryAgeTracker:
     """metric ごとに「`source_ts_ms` が変わったことを観測した単調時計の時刻」を持つ。
 
@@ -493,7 +511,7 @@ class ControlLoop:
         # RL 出力の元 snapshot を loop 自身の単調時計で特定するための窓。有効期限より
         # 長く持っても使えないので、設定から幅を決める（固定長にしない）。
         window = config.policy.supervisor.valid_ms // config.safety.tick_ms.value + 2
-        self._tick_monotonic: deque[tuple[int, int]] = deque(maxlen=window)
+        self._snapshots: deque[_SnapshotIdentity] = deque(maxlen=window)
         self._config_digest = ControlConfigDigest(
             fan_hardware_sha256=config.sources.fan_hardware.sha256,
             safety_sha256=config.sources.safety.sha256,
@@ -528,7 +546,14 @@ class ControlLoop:
         ts_ms = self._clock.now_ms()
 
         snapshot, snapshot_status = self._snapshot(tick_id, ts_ms, started_mono_ms)
-        self._tick_monotonic.append((tick_id, snapshot.monotonic_ms))
+        self._snapshots.append(
+            _SnapshotIdentity(
+                tick_id=snapshot.tick_id,
+                ts_ms=snapshot.ts_ms,
+                schema_version=snapshot.schema_version,
+                monotonic_ms=snapshot.monotonic_ms,
+            )
+        )
         mode = self._mode_command()
         supervisor_decision, regime_estimate = self._run_supervisor(
             snapshot, now_mono_ms=snapshot.monotonic_ms
@@ -580,6 +605,10 @@ class ControlLoop:
         duration_ms = max(0, self._monotonic.monotonic_ms() - started_mono_ms)
         overrun = duration_ms > self.tick_deadline_ms
         self._previous_overrun = overrun
+        # **heartbeat は書き込みと検証が終わった時点で出す**（0028 §2.6 / 0060 §2.7）。
+        # このあとに置く処理（降格の永続化・decision trace の保存）はどれも I/O を伴い、
+        # 保存先のロックで待たされると deadman が鳴る。制御は終わっているのに殺される。
+        self._beat()
 
         self._observe_authority(
             safety_state=safety_decision.state,
@@ -622,7 +651,6 @@ class ControlLoop:
             ),
         )
         recorded = self._record(tick)
-        self._watchdog.notify()
 
         if overrun:
             LOGGER.warning(
@@ -756,19 +784,32 @@ class ControlLoop:
             self._rl_received_mono_ms = now_mono_ms
         received_mono_ms = self._rl_received_mono_ms
         assert received_mono_ms is not None
-        source_mono_ms = next(
-            (mono for tick_id, mono in self._tick_monotonic if tick_id == output.tick_id), None
+        # **tick 番号だけで照合しない。** 番号は再起動で 0 に戻るので、前の process の出力が
+        # 新しい process の無関係な snapshot に結び付く。壁時計の時刻と snapshot の形まで
+        # 一致した記録だけを「この loop が出した snapshot」とみなす（0060 §2.6）。
+        source = next(
+            (
+                item
+                for item in self._snapshots
+                if item.tick_id == output.tick_id
+                and item.ts_ms == output.ts_ms
+                and item.schema_version == output.snapshot_schema_version
+            ),
+            None,
         )
-        if source_mono_ms is None or source_mono_ms > received_mono_ms:
-            # 元 snapshot を loop の時計で特定できない出力は、新しさを測れない。使わない。
+        if source is None or source.monotonic_ms > received_mono_ms:
             return None, Reason(
                 code="supervisor_source_unknown",
-                detail=f"tick_id={output.tick_id} の元 snapshot を単調時計で特定できない",
+                detail=(
+                    f"tick_id={output.tick_id}; ts_ms={output.ts_ms}; "
+                    f"snapshot_schema_version={output.snapshot_schema_version} "
+                    "の元 snapshot をこの loop の単調時計で特定できない"
+                ),
             )
         return (
             ReceivedSupervisorOutput(
                 output=output,
-                source_monotonic_ms=source_mono_ms,
+                source_monotonic_ms=source.monotonic_ms,
                 received_monotonic_ms=received_mono_ms,
             ),
             None,
@@ -905,8 +946,9 @@ class ControlLoop:
             LOGGER.exception("learned worker poll failed")
             return None
         if result is None:
-            self._learned_digest = None
-            self._learned_received_mono_ms = None
+            # **識別子と受信時刻を消さない。** 消すと、worker が一時的に読めなくなった
+            # あとで同じ提案が出てきたときに新しい受信時刻を押してしまい、止まった worker の
+            # 古い提案が何度でも有効期限を取り戻す（決定記録 0060 §2.6）。
             return None
         digest = result.result_digest()
         if digest != self._learned_digest:
@@ -1085,6 +1127,18 @@ class ControlLoop:
             # 記録の失敗で制御を止めない（決定記録 0053 §2.5）。
             LOGGER.exception("shadow record failed", extra={logs.FIELDS_KEY: {"tick_id": tick_id}})
             return None
+
+    def _beat(self) -> None:
+        """外部の deadman へ「この tick を書き終えた」と伝える。
+
+        **watchdog の失敗で冷却を止めない。** 送れなかったことは記録に残し、運転は続ける。
+        本当に heartbeat が途切れていれば、外の systemd が時間切れで終わらせ、
+        引き継ぎで Max になる（0028 §2.6 / §2.7、決定記録 0060 §2.7）。
+        """
+        try:
+            self._watchdog.notify()
+        except Exception:
+            LOGGER.exception("watchdog へ heartbeat を送れなかった")
 
     def _record(self, tick: ControlTick) -> bool:
         if self._trace is None:

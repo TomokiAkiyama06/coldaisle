@@ -76,6 +76,7 @@ from coldaisle.control.shadow import (
     write_shadow_jsonl,
 )
 from coldaisle.store.models import ControlTraceRecord, Quality
+from test_control_schema import CONTROL_TICK_RUNTIME
 from test_fallback_controller import (
     assessment_for,
     fallback_proposal,
@@ -248,6 +249,7 @@ def tick_with(
         model_gate=None if selection is None else selection.model_gate,
         shadow=shadow,
         supervisor=supervisor,
+        runtime=CONTROL_TICK_RUNTIME,
     )
 
 
@@ -540,6 +542,7 @@ def test_invariant_1_g_a_shadow_record_is_refused_in_modes_people_drive() -> Non
             state=manual,
             zones=zone_records(0.4),
             shadow=record.model_copy(update={"applied_controller": None}),
+            runtime=CONTROL_TICK_RUNTIME,
         )
     # 記録器自身も、その mode では何も作らない。
     assert (
@@ -1397,6 +1400,7 @@ def solved_shadow_tick(*, applied: float, ts_ms: int = SCORED_ACTION_TS_MS) -> C
         ),
         zones=zone_records(applied),
         shadow=record,
+        runtime=CONTROL_TICK_RUNTIME,
     )
 
 
@@ -1413,6 +1417,7 @@ def follow_up_tick(*, tick_id: int, ts_ms: int, applied: float) -> ControlTick:
             fallback_active=True,
         ),
         zones=zone_records(applied),
+        runtime=CONTROL_TICK_RUNTIME,
     )
 
 

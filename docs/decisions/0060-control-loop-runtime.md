@@ -1,7 +1,7 @@
 # 決定記録 0060: Control Loop の実行時契約（周期の置き場所・入力の供給・モードの入口・実行の記録）
 
 - **種別**: Decision Record
-- **Status**: Proposed（**所有者の承認が必要**。`safety.yaml` の schema を変えるため、0028 §2.9 の承認点 2 に当たる）
+- **Status**: FINAL（2026-09-20、リポジトリ所有者が承認。`safety.yaml` の schema 変更を含むため 0028 §2.9 の承認点 2 に当たる）
 - **Date**: 2026-09-20
 - **Supersedes**: なし
 - **関連**: [`0028-fan-control-contracts.md`](0028-fan-control-contracts.md)（§2.2 / §2.5 / §2.6 / §2.7 / §2.8、未決 3 と 8） /
@@ -49,14 +49,14 @@
 | 不変条件 | 破れたときに起きること |
 |---|---|
 | `tick_deadline_ms <= tick_ms` | 超過を検出したときには次の tick が始まっている |
-| `watchdog_timeout_ms > tick_ms` | 1 周期ぶんの遅れで deadman が落ち、健全な運転で再起動を繰り返す |
+| `watchdog_timeout_ms >= tick_ms * 2` | heartbeat は tick ごとにしか出ないので、時間切れが1周期ぶんだと健全な運転でも deadman が鳴る（systemd も `WatchdogSec` の半分の間隔で通知することを前提にしている） |
 
 **`fan-policy.yaml` には置かない。** 締め切り（`tick_deadline_ms`）と overrun の上限は
 0028 §2.8 で `safety.yaml` にあり、周期はその2つと同じ不変条件で縛られる。
 別のファイルへ分けると、**片方だけを変えた組み合わせが検証されないまま採用される。**
 
-> **承認点**: `safety.yaml` の schema を変えるので、0028 §2.9 の承認点 2 として
-> 所有者の承認を得てからマージする。
+> **承認点**: `safety.yaml` の schema を変えるので、0028 §2.9 の承認点 2 に当たる。
+> 2026-09-20 に所有者が承認した。
 
 ### 2.2 Telemetry は読み取り専用のストア経由で供給する（0028 未決 8）
 
@@ -154,11 +154,35 @@ snapshot → Supervisor → Reactive Guard → Fallback → Critical Safety
   安全側の裁定が ML の遅延を待つ形になる
 - worker 結果の受信時刻は**初めて見た結果にだけ**押す（識別子 `MpcProposal.result_digest()` で
   新旧を見分ける）。毎 tick 現在時刻を押すと、worker が止まって同じ結果を返し続けても
-  永久に期限切れにならない
+  永久に期限切れにならない。**worker が一時的に読めない tick でも識別子と受信時刻を捨てない。**
+  捨てると、同じ提案が後から出てきたときに新しい受信時刻を押してしまう
 - RL Supervisor の出力は、**元 snapshot を loop 自身の単調時計で特定できたときだけ**使う
-  （0041 の「元 snapshot の単調時刻から数える」を、worker の時計を信じずに満たす）
+  （0041 の「元 snapshot の単調時刻から数える」を、worker の時計を信じずに満たす）。
+  照合は `tick_id` だけで行わない。**番号は再起動で 0 に戻る**ので、前の process の出力が
+  新しい process の無関係な snapshot に結び付く。`(tick_id, ts_ms, snapshot schema)` が
+  そろった記録だけを「この loop が出した snapshot」とみなす
 
-### 2.7 authority の既定は `SHADOW`
+### 2.7 deadman（watchdog）は必ず配線し、heartbeat は書き込みの直後に出す
+
+0028 §2.6 は deadman を**制御プロセスの外の systemd** に置くと決めた。その heartbeat を
+出す側の契約をここで固定する。
+
+- **heartbeat は「書き込みと検証が終わった」直後に出す。** そのあとに置く処理
+  （降格の永続化・decision trace の保存）はどれも I/O を伴い、保存先のロックで待たされると、
+  制御は終わっているのに deadman に殺される。`duration_ms` の区間（2.4）と同じ境目にする
+- **完了しなかった tick では heartbeat を出さない。** Critical Safety と合成の例外は
+  捕まえない（2.6）ので、その tick の heartbeat も出ない。これが deadman の効き目である
+- **heartbeat の失敗で冷却を止めない。** 送れなかったことは記録に残して運転を続ける。
+  本当に途切れていれば外の systemd が時間切れで終わらせ、引き継ぎで Max になる
+- 本番の合成（`coldaisle-fand`）は deadman を**必ず**配線する。`NOTIFY_SOCKET` があれば
+  `WATCHDOG=1` を送り、無ければ**無音の no-op にはしない**。起動時に「deadman が無い」ことを
+  error として残し、heartbeat の間隔が `watchdog_timeout_ms` を超えたらそのつど記録する。
+  service の unit は `Type=notify` と `WatchdogSec` を設定し、`--require-watchdog` を付けて
+  「通知できないなら起動しない」にする
+- 送れるのは `READY=1` と `WATCHDOG=1` の**固定 datagram だけ**で、値を引数や設定から
+  組み立てない（Max しか書けない引き継ぎ実行部と同じ考え方。0028 §2.7）
+
+### 2.8 authority の既定は `SHADOW`
 
 `AuthorityRuntime`（#92）を配線しない構成では、固定 stage の authority を使い、**既定を
 `SHADOW`（`BASELINE_STAGE`）にする**。設定の `authority_stage` は v9 から**上限**なので、
@@ -166,7 +190,7 @@ snapshot → Supervisor → Reactive Guard → Fallback → Critical Safety
 Learned MPC が実 Fan を握る。trace に残す stage も Gate と同じ式
 （`min(いまの stage, 設定の上限)`）で数える。
 
-### 2.8 設定不正時は Max を1回書いて保持する
+### 2.9 設定不正時は Max を1回書いて保持する
 
 0028 §2.7 の「hardware は正しく `safety.yaml` / `fan-policy.yaml` が不正」の経路では、
 確認済みの hardware mapping だけを使って `config_invalid` の `EMERGENCY`（全 zone Max）を
@@ -201,6 +225,13 @@ Learned MPC が実 Fan を握る。trace に残す stage も Gate と同じ式
 
 | 案 | 却下理由 |
 |---|---|
+| deadman を配線せず、port だけを用意して既定を no-op にする | hang しても heartbeat の欠落が起きず、`watchdog_timeout_ms` が一度も効かない（2.7） |
+| deadman が無い環境では黙って何もしない | 「deadman がある」と思ったまま運転することになる。起動時と遅れのたびに記録する（2.7） |
+| `NOTIFY_SOCKET` が無ければ常に起動しない | 手元実行（`uv run coldaisle-fand`）ができなくなる。必須にするのは service 側の `--require-watchdog`（2.7） |
+| heartbeat を decision trace の保存後に出す | 保存先のロックで待たされているあいだ heartbeat が出ず、制御が終わっているのに殺される（2.7） |
+| worker が読めない tick で、前回の結果の識別子と受信時刻を捨てる | 同じ提案が後から出てきたときに新しい受信時刻を押し、止まった worker の提案が有効期限を取り戻す（2.6） |
+| RL 出力を `tick_id` だけで元 snapshot に結び付ける | 番号は再起動で 0 に戻る。前の process の出力が無関係な snapshot に結び付く（2.6） |
+| `runtime` を持たない v8 の記録を許す | 版を見ても中身が言えなくなる。版は自分の中身を表す（2.4） |
 | `tick_ms` を `fan-policy.yaml` に置く | `tick_deadline_ms` と別ファイルになり、組み合わせの不変条件を検証できない（2.1） |
 | `tick_ms` を CLI の必須引数にする | 設定ファイルに無い値が運転を決める。0028 §2.8 の「値はすべて設定に置く」に反する |
 | `tick_ms` をコードの既定値にする | AGENTS.md ルール9 |
@@ -226,6 +257,7 @@ Learned MPC が実 Fan を握る。trace に残す stage も Gate と同じ式
 | # | 内容 | 決める場所 |
 |---|---|---|
 | 1 | 設定不正時の Max を周期的に書き直すか（外から `pwmN_enable` を戻されたときの再主張） | #57（実機 backend）と合わせて |
+| 7 | `coldaisle-fand` の systemd unit（`Type=notify` / `WatchdogSec` / `Restart` / `ExecStopPost`）の中身 | #57 / #64 |
 | 2 | 制御の許容遅延とストアの `quality.yaml` のしきい値を完全に分けるか | #50 の実測後 |
 | 3 | `tick_ms` / `tick_deadline_ms` / `overrun_consecutive_limit` の確定値 | #50 / #75 の後（0028 §2.9 の承認点 2） |
 | 4 | 運転モードのソケットのプロトコルと認可 | #60 |

@@ -97,6 +97,7 @@ from coldaisle.evaluate import RunsManifest, build_context, main, render
 from coldaisle.metrics import MetricCatalog
 from coldaisle.store.models import ControlTraceRecord, Quality
 from test_control_config import valid_documents, write_documents
+from test_control_schema import CONTROL_TICK_RUNTIME
 
 ROOT = Path(__file__).resolve().parents[1]
 EVALUATION_PACKAGE = ROOT / "src" / "coldaisle" / "control" / "evaluation"
@@ -289,6 +290,7 @@ def tick_at(
         model_gate=model_gate,
         shadow=record,
         faults=faults,
+        runtime=CONTROL_TICK_RUNTIME,
     )
 
 

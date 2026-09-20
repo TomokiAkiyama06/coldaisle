@@ -282,9 +282,11 @@ class SafetyConfig(_ConfigModel):
         if self.tick_deadline_ms.value > self.tick_ms.value:
             # 締め切りが周期より長いと、超過を検出したときには次の tick が始まっている。
             raise ValueError("tick_deadline_ms は tick_ms 以下にする")
-        if self.watchdog_timeout_ms.value <= self.tick_ms.value:
-            # 1 周期ぶんの遅れで watchdog が落ちると、健全な運転でも再起動を繰り返す。
-            raise ValueError("watchdog_timeout_ms は tick_ms より長くする")
+        if self.watchdog_timeout_ms.value < self.tick_ms.value * 2:
+            # heartbeat は tick ごとにしか出ないので、時間切れが1周期ぶんしか無いと
+            # 健全な運転でも deadman が鳴り、再起動を繰り返す。systemd も
+            # `WatchdogSec` の半分の間隔で通知することを前提にしている。
+            raise ValueError("watchdog_timeout_ms は tick_ms の2倍以上にする")
         for zone in Zone:
             if self.stall_check_min_demand.get(zone).value > self.zone_min_demand.get(zone).value:
                 raise ValueError(

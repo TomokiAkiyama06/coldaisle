@@ -1250,7 +1250,12 @@ class ControlTick(_Frozen):
             and state.supervisor_policy is not None
         ):
             raise ValueError("v3 以降の supervisor_policy には Supervisor decision が必要")
-        if self.runtime is not None and self.schema_version < 8:
+        if self.runtime is None:
+            if self.schema_version >= 8:
+                # **版が中身を表さない記録を作らない。** v8 を名乗りながら v8 を定義する欄が
+                # 無いと、読む側は版を見ても何が入っているか言えない。
+                raise ValueError("v8 の ControlTick には runtime が要る")
+        elif self.schema_version < 8:
             raise ValueError("runtime を記録する ControlTick は schema version 8 にする")
         self._check_model_gate()
         self._check_shadow()

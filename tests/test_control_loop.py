@@ -22,6 +22,9 @@
 18. 同じ入力・同じ時計・同じ設定なら decision trace が再現する
 19. #103 で検証できた設定だけが active になる
 20. 遅れた tick を後から取り戻して連続実行しない
+21. heartbeat は書き込みと検証の直後に出し、記録や降格の I/O で遅らせない
+22. 完了しなかった tick は heartbeat を出さない（deadman が効く）
+23. 外部の deadman が無いことを黙って no-op にしない
 """
 
 from __future__ import annotations
@@ -74,12 +77,19 @@ from coldaisle.control.supervisor.regime import WorkloadRegimeEstimator
 from coldaisle.control_daemon import (
     EXIT_ACTUATION_NOT_APPROVED,
     EXIT_HARDWARE_CONFIG_INVALID,
+    EXIT_WATCHDOG_UNAVAILABLE,
+    NOTIFY_SOCKET_ENV,
+    WATCHDOG_DATAGRAM,
     ActuationNotApprovedError,
     Config,
     ControlDaemon,
     ControlStats,
     StoreTelemetrySource,
+    SystemdWatchdog,
+    UnsupervisedWatchdog,
+    WatchdogUnavailableError,
     build,
+    create_watchdog,
     main,
     run_config_invalid_max,
 )
@@ -203,14 +213,45 @@ class RecordingTrace:
 
     rows: list[str] = field(default_factory=list)
     error: Exception | None = None
+    order: list[str] = field(default_factory=list)
 
     def record_control_trace(
         self, *, ts_ms: int, tick_id: int, schema_version: int, trace_json: str
     ) -> bool:
+        self.order.append("trace")
         if self.error is not None:
             raise self.error
         self.rows.append(trace_json)
         return True
+
+
+@dataclass
+class RecordingWatchdog:
+    """heartbeat の回数と、tick の中での順番を記録する deadman。"""
+
+    order: list[str] = field(default_factory=list)
+    beats: int = 0
+    error: Exception | None = None
+
+    def notify(self) -> None:
+        self.order.append("watchdog")
+        self.beats += 1
+        if self.error is not None:
+            raise self.error
+
+
+@dataclass
+class RecordingAuthority:
+    """#92 の runtime の代わり。**journal の書き出しは I/O** なので順番を見る。"""
+
+    inner: StaticAuthority
+    order: list[str]
+
+    def current_stage(self):  # type: ignore[no-untyped-def]
+        return self.inner.current_stage()
+
+    def observe(self, **kwargs: Any) -> None:
+        self.order.append("authority")
 
 
 @dataclass
@@ -266,6 +307,7 @@ class Harness:
         with_trace: bool = True,
         fault_plan: SimulatedFaultPlan | None = None,
         learned_source: Any = None,
+        watchdog: Any = None,
         guard: Any = None,
         fallback: Any = None,
         gate: Any = None,
@@ -278,7 +320,9 @@ class Harness:
         self.monotonic = ManualMonotonicClock(0)
         self.telemetry = FakeTelemetry(self.clock, self.monotonic)
         self.mode = MutableMode()
-        self.trace = RecordingTrace()
+        self.order: list[str] = []
+        self.watchdog = watchdog or RecordingWatchdog(self.order)
+        self.trace = RecordingTrace(order=self.order)
         self.contract = build_input_contract(self.config, catalog)
         binding = create_control_runtime_binding(self.config)
         self.backend = backend or SimulatedFanBackend(
@@ -321,7 +365,8 @@ class Harness:
             learned_source=learned_source,
             shadow=ShadowRecorder(self.config.policy.shadow),
             trace=ControlTraceLogger(self.trace) if with_trace else None,
-            authority=self.authority,
+            authority=RecordingAuthority(self.authority, self.order),
+            watchdog=self.watchdog,
         )
 
     def tick(self, *, advance_ms: int | None = None) -> Any:
@@ -868,6 +913,84 @@ def test_invariant_14_a_new_worker_result_gets_a_new_receipt_time(catalog) -> No
     assert len(set(stub.seen_received_ms)) == 2
 
 
+def test_invariant_14_an_empty_poll_does_not_refresh_a_cached_result(catalog) -> None:
+    """worker が一時的に読めなくなっても、**同じ提案は新しくならない**。
+
+    空の poll で識別子と受信時刻を捨てると、あとで同じ提案が出てきたときに新しい受信時刻を
+    押してしまい、止まった worker の古い提案が何度でも有効期限を取り戻す
+    （Codex 4057225329）。
+    """
+    stub = StubWorkerResult()
+    source = StubWorkerSource(result=stub)
+    harness = Harness(catalog, learned_source=source)
+    harness.settle()
+    first = stub.seen_received_ms[0]
+
+    source.result = None
+    harness.tick()
+    harness.tick()
+    source.result = stub
+    harness.tick()
+
+    assert set(stub.seen_received_ms) == {first}
+
+
+def test_invariant_14_an_rl_output_from_another_process_is_not_bound(catalog) -> None:
+    """RL 出力は **tick 番号だけ**で束縛しない（番号は再起動で 0 に戻る）。
+
+    前の process の出力が新しい process の無関係な snapshot に結び付くと、
+    古い戦略が「この tick のもの」として新鮮に見える（Codex 4057225330）。
+    """
+    harness = Harness(catalog)
+    result = harness.tick()
+    now_ms = harness.monotonic.monotonic_ms()
+    same_tick_id_other_process = _rl_output(tick_id=result.tick.tick_id, ts_ms=1)
+
+    harness.loop._rl_supervisor_source = StubWorkerSource(result=same_tick_id_other_process)
+    candidate, reason = harness.loop._rl_candidate(now_ms)
+
+    assert candidate is None
+    assert reason is not None and reason.code == "supervisor_source_unknown"
+
+    # 同じ snapshot（tick_id / ts_ms / snapshot schema）を指す出力なら束縛できる。
+    matching = _rl_output(tick_id=result.tick.tick_id, ts_ms=result.tick.ts_ms)
+    harness.loop._rl_supervisor_source = StubWorkerSource(result=matching)
+    candidate, reason = harness.loop._rl_candidate(now_ms)
+
+    assert reason is None
+    assert candidate is not None and candidate.output is matching
+
+
+def _rl_output(*, tick_id: int, ts_ms: int) -> Any:
+    from coldaisle.control.schema import (
+        SupervisorObjectiveWeights,
+        SupervisorOutput,
+        SupervisorPolicyKind,
+        SupervisorTargetBand,
+        TemperatureTarget,
+        WorkloadRegime,
+    )
+
+    return SupervisorOutput(
+        snapshot_schema_version=1,
+        tick_id=tick_id,
+        ts_ms=ts_ms,
+        policy=SupervisorPolicyKind.RL,
+        version="rl-vtest",
+        regime=WorkloadRegime.UNKNOWN,
+        regime_confidence=0.0,
+        weights=SupervisorObjectiveWeights(
+            gpu_temperature=0.8, cpu_temperature=0.8, balance=0.5, acoustic=0.4, change=0.3
+        ),
+        strategy="balanced",
+        target_band=SupervisorTargetBand(
+            cpu_temperature=TemperatureTarget(lower_c=45.0, upper_c=75.0),
+            gpu_temperature=TemperatureTarget(lower_c=45.0, upper_c=78.0),
+        ),
+        computed_at_ms=ts_ms,
+    )
+
+
 def test_invariant_15_a_late_tick_never_lets_the_learned_proposal_in(catalog) -> None:
     """締め切りを過ぎた tick では ML を通さない（安全側が I/O を待たない）。"""
     stub = StubWorkerResult()
@@ -1159,6 +1282,132 @@ def test_the_scheduler_stops_between_ticks_when_asked() -> None:
 
     assert len(loop.calls) == 1
     assert daemon.stats.ticks == 1
+
+
+# ------------------------------------------------- 21〜23. deadman（watchdog）
+
+
+def test_invariant_21_the_heartbeat_is_sent_before_any_persistence(catalog) -> None:
+    """**書き込みと検証の直後に heartbeat を出す。**
+
+    降格の永続化（#92）と decision trace の保存（#82）はどちらも I/O を伴う。あとに置くと、
+    保存先のロックで待たされているあいだ heartbeat が出ず、制御は終わっているのに
+    deadman に殺される（Codex 4057225328）。
+    """
+    harness = Harness(catalog)
+    harness.tick()
+
+    assert harness.order == ["watchdog", "authority", "trace"]
+    assert harness.watchdog.beats == 1
+
+
+def test_invariant_22_a_tick_that_never_completes_sends_no_heartbeat(catalog) -> None:
+    """完了しなかった tick では heartbeat を出さない（deadman が効く）。"""
+
+    class BrokenSafety:
+        def evaluate(self, snapshot, **kwargs):  # type: ignore[no-untyped-def]
+            raise RuntimeError("safety が壊れた")
+
+    harness = Harness(catalog, safety=BrokenSafety())
+    with pytest.raises(RuntimeError):
+        harness.tick()
+
+    assert harness.watchdog.beats == 0
+
+
+def test_invariant_22_a_failing_watchdog_does_not_stop_cooling(catalog) -> None:
+    """heartbeat を送れなくても制御は続ける（本当に途切れていれば外の deadman が終わらせる）。"""
+    harness = Harness(catalog)
+    harness.watchdog.error = OSError("notify socket が詰まった")
+
+    result = harness.tick()
+
+    assert result.hardware is not None
+    assert all(result.tick.zones.get(zone).demand.effective == 1.0 for zone in Zone)
+
+
+def test_invariant_23_a_missing_notify_socket_is_not_a_silent_no_op(catalog, caplog) -> None:
+    """deadman が無い環境を黙って no-op にしない（`--require-watchdog` なら起動しない）。"""
+    monotonic = ManualMonotonicClock(0)
+    with caplog.at_level("ERROR"):
+        watchdog = create_watchdog(timeout_ms=5_000, monotonic=monotonic, environ={})
+
+    assert isinstance(watchdog, UnsupervisedWatchdog)
+    assert any("deadman" in record.message for record in caplog.records)
+
+    with pytest.raises(WatchdogUnavailableError):
+        create_watchdog(timeout_ms=5_000, monotonic=monotonic, require=True, environ={})
+
+
+def test_invariant_23_the_unsupervised_watchdog_reports_a_late_heartbeat(caplog) -> None:
+    """外の deadman が無くても、heartbeat の遅れを捨てない。"""
+    monotonic = ManualMonotonicClock(0)
+    watchdog = create_watchdog(timeout_ms=1_000, monotonic=monotonic, environ={})
+    watchdog.notify()
+    monotonic.advance_ms(500)
+    with caplog.at_level("ERROR"):
+        caplog.clear()
+        watchdog.notify()
+    assert caplog.records == []
+
+    monotonic.advance_ms(5_000)
+    with caplog.at_level("ERROR"):
+        caplog.clear()
+        watchdog.notify()
+
+    assert any("heartbeat" in record.message for record in caplog.records)
+
+
+def test_invariant_23_the_systemd_watchdog_sends_the_abi_datagram(tmp_path: Path) -> None:
+    """`NOTIFY_SOCKET` へ送るのは固定の `WATCHDOG=1` だけ（値を組み立てない）。"""
+    import socket
+
+    address = str(tmp_path / "notify.sock")
+    listener = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+    listener.bind(address)
+    try:
+        watchdog = create_watchdog(
+            timeout_ms=5_000,
+            monotonic=ManualMonotonicClock(0),
+            environ={NOTIFY_SOCKET_ENV: address},
+        )
+        assert isinstance(watchdog, SystemdWatchdog)
+        assert listener.recv(64) == b"READY=1"
+        watchdog.notify()
+        assert listener.recv(64) == WATCHDOG_DATAGRAM
+        watchdog.close()
+    finally:
+        listener.close()
+
+
+def test_invariant_23_the_daemon_composition_always_wires_a_deadman(tmp_path: Path) -> None:
+    """`build()` が deadman を配線する（`NullWatchdog` のまま本番に出ない）。"""
+    documents = valid_documents()
+    documents["fan-hardware.yaml"] = json.loads(hardware_config().model_dump_json())
+    write_documents(tmp_path, documents)
+    config = Config(
+        config_dir=tmp_path,
+        db=tmp_path / "control.db",
+        metrics=METRICS_PATH,
+        quality_rules=CONFIG_DIR / "quality.yaml",
+    )
+
+    daemon = build(config)
+    try:
+        assert isinstance(daemon.loop._watchdog, UnsupervisedWatchdog)
+    finally:
+        if daemon.store is not None:
+            daemon.store.close()
+
+    assert main([*_argv(tmp_path), "--require-watchdog"]) == EXIT_WATCHDOG_UNAVAILABLE
+
+
+def test_invariant_19_a_watchdog_that_only_covers_one_period_is_rejected() -> None:
+    """heartbeat は tick ごとにしか出ないので、時間切れは2周期ぶん以上にする。"""
+    documents = valid_documents()
+    documents["safety.yaml"]["watchdog_timeout_ms"] = {"value": 1_500, "status": "provisional"}
+    with pytest.raises(ValidationError, match="watchdog_timeout_ms"):
+        SafetyConfig.model_validate(documents["safety.yaml"])
 
 
 # ------------------------------------------------------------- 入力契約の組み立て

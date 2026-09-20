@@ -22,9 +22,11 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 import signal
+import socket
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import FrameType
@@ -47,6 +49,7 @@ from coldaisle.control.loop import (
     StaticAuthority,
     StaticOperatingMode,
     TelemetrySample,
+    Watchdog,
     build_input_contract,
 )
 from coldaisle.control.reactive.guard import ReactiveGuard
@@ -85,6 +88,120 @@ EXIT_HARDWARE_CONFIG_INVALID = 2
 EXIT_ACTUATION_NOT_APPROVED = 3
 """hardware mapping が `provisional` で、実機の制御を取る承認が無い（0028 §2.9）。"""
 
+EXIT_WATCHDOG_UNAVAILABLE = 4
+"""`--require-watchdog` を指定したのに deadman へ通知できない（0028 §2.6）。"""
+
+NOTIFY_SOCKET_ENV = "NOTIFY_SOCKET"
+"""systemd が `Type=notify` のサービスへ渡す通知先。**この名前は ABI で、調整値ではない。**"""
+
+WATCHDOG_DATAGRAM = b"WATCHDOG=1"
+READY_DATAGRAM = b"READY=1"
+"""sd_notify の ABI。値を組み立てる余地を残さない。"""
+
+
+class WatchdogUnavailableError(RuntimeError):
+    """外部の deadman へ通知できないのに、通知を必須にして起動しようとした。"""
+
+
+class SystemdWatchdog:
+    """`NOTIFY_SOCKET` へ `WATCHDOG=1` を送る deadman（0028 §2.6）。
+
+    **書けるのはこの2つの固定 datagram だけ**で、値を引数から組み立てない。
+    送信に失敗したら例外にする。握りつぶすと、heartbeat が届いていないのに
+    「通知した」ことになり、deadman が無いのと同じになる。
+    """
+
+    __slots__ = ("_address", "_socket")
+
+    def __init__(self, address: str) -> None:
+        if not address:
+            raise WatchdogUnavailableError(f"{NOTIFY_SOCKET_ENV} が空")
+        # systemd の abstract namespace（先頭が `@`）を AF_UNIX の表現へ直す。
+        self._address = "\0" + address[1:] if address.startswith("@") else address
+        self._socket = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM | socket.SOCK_CLOEXEC)
+
+    def ready(self) -> None:
+        """起動を伝える（`Type=notify` の service が待っている）。"""
+        self._send(READY_DATAGRAM)
+
+    def notify(self) -> None:
+        """1 tick を書き終えたことを伝える。"""
+        self._send(WATCHDOG_DATAGRAM)
+
+    def close(self) -> None:
+        """socket を閉じる。"""
+        self._socket.close()
+
+    def _send(self, payload: bytes) -> None:
+        self._socket.sendto(payload, self._address)
+
+
+class UnsupervisedWatchdog:
+    """外部の deadman が無い環境（手元実行・試験）の代わり。**黙って何もしない訳ではない。**
+
+    `NullWatchdog` をそのまま本番に置くと、hang しても誰も気づかない。この実装は
+    起動時に「deadman が無い」ことを error として残し、heartbeat の間隔が
+    `watchdog_timeout_ms` を超えたらそのつど記録する。**プロセスを殺す力は無い**ので、
+    本番の service では `--require-watchdog` で `SystemdWatchdog` を必須にする。
+    """
+
+    __slots__ = ("_last_mono_ms", "_monotonic", "_timeout_ms")
+
+    def __init__(self, *, timeout_ms: int, monotonic: MonotonicClock) -> None:
+        self._timeout_ms = timeout_ms
+        self._monotonic = monotonic
+        self._last_mono_ms: int | None = None
+        LOGGER.error(
+            "外部の deadman が無い状態で起動する（hang しても停止させられない）",
+            extra={
+                logs.FIELDS_KEY: {
+                    "notify_socket": None,
+                    "watchdog_timeout_ms": timeout_ms,
+                    "hint": "systemd の Type=notify と WatchdogSec、または --require-watchdog",
+                }
+            },
+        )
+
+    def notify(self) -> None:
+        """heartbeat の間隔だけを見る。**遅れを黙って捨てない。**"""
+        now_ms = self._monotonic.monotonic_ms()
+        previous = self._last_mono_ms
+        self._last_mono_ms = now_ms
+        if previous is not None and now_ms - previous > self._timeout_ms:
+            LOGGER.error(
+                "control tick の heartbeat が deadman の時間切れを超えた",
+                extra={
+                    logs.FIELDS_KEY: {
+                        "gap_ms": now_ms - previous,
+                        "watchdog_timeout_ms": self._timeout_ms,
+                    }
+                },
+            )
+
+
+def create_watchdog(
+    *,
+    timeout_ms: int,
+    monotonic: MonotonicClock,
+    require: bool = False,
+    environ: Mapping[str, str] | None = None,
+) -> Watchdog:
+    """環境に応じた deadman を作る。**既定を無音の no-op にしない。**"""
+    address = (os.environ if environ is None else environ).get(NOTIFY_SOCKET_ENV, "")
+    if address:
+        watchdog = SystemdWatchdog(address)
+        watchdog.ready()
+        LOGGER.info(
+            "systemd の deadman へ heartbeat を送る",
+            extra={logs.FIELDS_KEY: {"watchdog_timeout_ms": timeout_ms}},
+        )
+        return watchdog
+    if require:
+        raise WatchdogUnavailableError(
+            f"{NOTIFY_SOCKET_ENV} が無いのに --require-watchdog が指定されている"
+        )
+    return UnsupervisedWatchdog(timeout_ms=timeout_ms, monotonic=monotonic)
+
 
 @dataclass(frozen=True, slots=True)
 class Config:
@@ -96,6 +213,8 @@ class Config:
     quality_rules: Path = DEFAULT_QUALITY_RULES
     t_sensor_metric: str | None = None
     record_trace: bool = True
+    require_watchdog: bool = False
+    """外部の deadman へ通知できないときに起動を拒むか（本番の service では真にする）。"""
 
 
 @dataclass(slots=True)
@@ -228,7 +347,12 @@ class ControlDaemon:
         )
 
 
-def build(config: Config, *, backend_factory: BackendFactory = simulated_backend) -> ControlDaemon:
+def build(
+    config: Config,
+    *,
+    backend_factory: BackendFactory = simulated_backend,
+    watchdog: Watchdog | None = None,
+) -> ControlDaemon:
     """検証済み設定から control loop 一式を組み立てる。
 
     **1つでも検証に失敗したら組み立てない。** 途中まで配線した状態で走らせると、どの層が
@@ -250,6 +374,17 @@ def build(config: Config, *, backend_factory: BackendFactory = simulated_backend
         clock=clock,
     )
     authority = StaticAuthority()
+    # **deadman を必ず配線する。** ここを省くと hang しても heartbeat の欠落が起きず、
+    # `watchdog_timeout_ms` が一度も効かない（0028 §2.6 / 決定記録 0060 §2.7）。
+    deadman = (
+        watchdog
+        if watchdog is not None
+        else create_watchdog(
+            timeout_ms=control.safety.watchdog_timeout_ms.value,
+            monotonic=monotonic,
+            require=config.require_watchdog,
+        )
+    )
     loop = ControlLoop(
         config=control,
         estimator=ControlStateEstimator(contract, catalog),
@@ -278,6 +413,7 @@ def build(config: Config, *, backend_factory: BackendFactory = simulated_backend
         shadow=ShadowRecorder(control.policy.shadow),
         trace=ControlTraceLogger(store) if config.record_trace else None,
         authority=authority,
+        watchdog=deadman,
     )
     _log_configuration(control)
     return ControlDaemon(loop=loop, monotonic=monotonic, store=store)
@@ -352,6 +488,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="この tick 数で終了する（試験・Replay 用）",
     )
     parser.add_argument("--no-trace", action="store_true", help="decision trace を保存しない")
+    parser.add_argument(
+        "--require-watchdog",
+        action="store_true",
+        help=f"{NOTIFY_SOCKET_ENV} が無ければ起動しない（systemd の Type=notify で使う）",
+    )
     parser.add_argument("--log-level", default="INFO")
     return parser
 
@@ -367,6 +508,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         quality_rules=args.quality_rules,
         t_sensor_metric=args.t_sensor_metric,
         record_trace=not args.no_trace,
+        require_watchdog=args.require_watchdog,
     )
     monotonic: MonotonicClock = SystemMonotonicClock()
 
@@ -382,6 +524,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     except ActuationNotApprovedError:
         LOGGER.exception("実機の制御を取る承認が無いため起動しない（決定記録 0028 §2.9）")
         return EXIT_ACTUATION_NOT_APPROVED
+    except WatchdogUnavailableError:
+        LOGGER.exception("外部の deadman へ通知できないため起動しない（決定記録 0028 §2.6）")
+        return EXIT_WATCHDOG_UNAVAILABLE
     except Exception:
         LOGGER.exception("safety.yaml / fan-policy.yaml が不正なため全 zone を Max にする")
         try:

@@ -80,6 +80,7 @@ from coldaisle.control.schema import (
     ZoneRecord,
 )
 from coldaisle.store.models import Quality
+from test_control_schema import CONTROL_TICK_RUNTIME
 from test_fallback_controller import (
     assessment_for,
     fallback_proposal,
@@ -843,6 +844,8 @@ def test_v5_trace_requires_consistent_model_gate_for_learned_ticks() -> None:
 
     payload = json.loads(tick.model_dump_json())
     payload["schema_version"] = 4
+    # v4 の記録は v8 の runtime を持たない（版が中身を表す。#74）。
+    payload.pop("runtime", None)
     with pytest.raises(ValidationError, match="schema version 5"):
         ControlTick.model_validate_json(json.dumps(payload))
 
@@ -911,6 +914,7 @@ def _trace_tick(selection) -> ControlTick:
         ),
         zones=PerZone(**zones),
         model_gate=gate,
+        runtime=CONTROL_TICK_RUNTIME,
     )
 
 
