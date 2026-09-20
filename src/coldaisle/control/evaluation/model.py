@@ -369,13 +369,23 @@ class AppliedArmReport(_Frozen):
 
     裏づけのある提案を1度も適用していない arm（Fallback の arm など）では空。
     """
+    bound_attested_ticks: int = Field(default=0, ge=0)
+    """この arm で **artifact を言えた** tick の数（#159）。
+
+    `model_artifacts` は集合なので「どの artifact か」しか言わない。**何 tick 分を
+    束縛できたか**は別に数える（codex #4057573941）。これが無いと、100 tick の arm が
+    1 tick だけ束縛できた報告を「完全に束縛できた」と読めてしまう。
+    """
     unbound_attested_ticks: int = Field(default=0, ge=0)
-    """裏づけのある提案を適用したのに、**artifact を言えなかった** tick の数（#159）。
+    """この arm で **artifact を言えなかった** tick の数（#159）。
 
     artifact の欄を持たない保存済みの v1〜v6 の trace がこれに当たる。
     「artifact 不明」を「記録が無いだけ」に見せないために、数えられる形で分けて持つ。
     **1件でもあれば、この arm の artifact 束縛は完全ではない。**
     #92 は 0 でなければ昇格の根拠にしない（部分的な証拠を完全として扱わない）。
+
+    報告 v2 では `bound_attested_ticks + unbound_attested_ticks == ticks` を要求する
+    （`EvaluationReport` が版を見て検証する）。**適用 arm のすべての tick を勘定する。**
     """
     gaps: tuple[CountedReason, ...] = ()
     """出せなかった指標と、その理由。**欄を埋め合わせない。**"""
@@ -398,23 +408,28 @@ class AppliedArmReport(_Frozen):
             # 同じ入力から同じ bytes を出すため（0054 §2.7）。
             raise ValueError("適用した artifact は昇順に並べる")
         learned = self.arm.controller is ControllerKind.LEARNED_MPC
-        counted = bool(self.model_artifacts) or self.unbound_attested_ticks > 0
+        counted = (
+            bool(self.model_artifacts)
+            or self.bound_attested_ticks > 0
+            or self.unbound_attested_ticks > 0
+        )
         if counted and not learned:
             # artifact を持つ提案を出せるのは Learned MPC だけ（0028 §2.5 (c)）。
             raise ValueError("Learned MPC 以外の適用 arm に model artifact を付けない")
+        if bool(self.model_artifacts) != (self.bound_attested_ticks > 0):
+            # 束縛できた tick が無いのに artifact が挙がる（逆も）形を作らせない。
+            raise ValueError("束縛できた tick の数と artifact の有無が食い違っている")
         if self.model_artifacts and self.last_attested_ts_ms is None:
             # 裏づけのある提案が1つも無い arm に、その提案の artifact は存在しない。
             # **`unbound_attested_ticks` はこの条件に含めない。** `model_gate` を持たない
             # v1〜v4 の tick は「適用したが裏づけの記録が無い」ので、時刻は `None` のまま
             # 不明だけが数えられる。
             raise ValueError("裏づけの無い適用 arm に model artifact を付けない")
-        if learned and not counted:
-            # **数えていないことを「全部束縛できた」と読ませない**（codex #4057527950）。
-            # 適用 arm が Learned MPC なら、その tick は必ず artifact を言えるか
-            # 言えないかのどちらかである。欄の無い古い報告はここで落ちる。
-            raise ValueError(
-                f"適用 Learned MPC の arm には artifact の勘定が要る（arm={self.arm_key}）"
-            )
+        if self.bound_attested_ticks + self.unbound_attested_ticks > self.ticks:
+            raise ValueError("artifact の勘定が arm の tick 数を超えている")
+        # **「すべての tick を勘定したか」は報告の版を見て判断する**（codex #4057573943）。
+        # 保存済みの v1 はこの欄を持たないので、ここで要求すると**読めなくなる**。
+        # 判定は `EvaluationReport`（版を知っている側）が行う。
         return self
 
 
@@ -766,14 +781,7 @@ class EvaluationReport(_Frozen):
         for segment in self.segments:
             for group in segment.groups:
                 for applied in group.applied:
-                    if self.schema_version < 2 and (
-                        applied.model_artifacts or applied.unbound_attested_ticks
-                    ):
-                        # v1 の報告にこの欄は存在しなかった。後から足して読ませない。
-                        raise ValueError(
-                            "適用 arm の artifact を記録する報告は schema version 2 にする"
-                            f"（arm={applied.arm_key}）"
-                        )
+                    self._check_applied_artifacts(applied)
                     if not set(applied.model_artifacts) <= observed:
                         # run が一度も見ていない artifact を arm の実績に書けない。
                         # 書けると、報告全体の照合（#92）を通る artifact を arm 側にだけ
@@ -783,6 +791,38 @@ class EvaluationReport(_Frozen):
                             f"（arm={applied.arm_key}）"
                         )
         return self
+
+    def _check_applied_artifacts(self, applied: AppliedArmReport) -> None:
+        """適用 arm の artifact の勘定を、**報告の版に合わせて**検証する（#159）。
+
+        **v1 はそのまま読める。** v1 にこの欄は存在しなかったので、完全性を要求すると
+        保存済みの報告を読めなくしてしまう（codex #4057573943）。読めたうえで、
+        `#92` が「完全性を言えない報告」として昇格の証拠から外す（決定記録 0059 §2.5）。
+        """
+        counted = (
+            applied.model_artifacts
+            or applied.bound_attested_ticks
+            or applied.unbound_attested_ticks
+        )
+        if self.schema_version < 2:
+            if counted:
+                # v1 の報告にこの欄は存在しなかった。後から足して読ませない。
+                raise ValueError(
+                    "適用 arm の artifact を記録する報告は schema version 2 にする"
+                    f"（arm={applied.arm_key}）"
+                )
+            return
+        if applied.arm.controller is not ControllerKind.LEARNED_MPC:
+            return
+        # **すべての tick を勘定する**（codex #4057573941）。`model_artifacts` は集合なので
+        # 「どの artifact か」しか言わない。1 tick だけ束縛できた 100 tick の arm を
+        # 「完全に束縛できた」と読ませないため、tick 数で突き合わせる。
+        accounted = applied.bound_attested_ticks + applied.unbound_attested_ticks
+        if accounted != applied.ticks:
+            raise ValueError(
+                "適用 Learned MPC の arm は、すべての tick の artifact を勘定する"
+                f"（arm={applied.arm_key}; accounted={accounted}; ticks={applied.ticks}）"
+            )
 
 
 __all__ = [

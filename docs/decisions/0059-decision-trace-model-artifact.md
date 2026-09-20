@@ -1,7 +1,7 @@
 # 決定記録 0059: decision trace が tick ごとに model artifact を記録する（適用側の証拠を artifact へ束縛する）
 
 - **種別**: Decision Record
-- **Status**: Proposed
+- **Status**: FINAL（2026-09-21、リポジトリ所有者が承認）
 - **Date**: 2026-09-20
 - **Supersedes**: [`0057-authority-rollout-stage-changes.md`](0057-authority-rollout-stage-changes.md)
   の **§3 の帰結「適用側（factual）の実績では昇格できない」の項**と、
@@ -164,14 +164,16 @@ counterfactual に残り `artifact_sha256` が付く）が、**LIMITED 以降は
 
 ### 2.3 適用側の arm を artifact へ束縛する（0054 への追記）
 
-`AppliedArmReport` に2つ足す。**0054 の帰属規則は変えない。** 記録から言える事実を増やした
-だけで、どの実測をどの arm に帰属させるか（§2.1 / §2.2）も coverage の扱い（§2.3）も
+**0054 の帰属規則は変えない。** 記録から言える事実を増やしただけで、どの実測をどの arm に帰属させるか（§2.1 / §2.2）も coverage の扱い（§2.3）も
 gate の段（§2.4）も同じである。
+
+`AppliedArmReport` に3つ足す。
 
 | 欄 | 意味 |
 |---|---|
 | `model_artifacts` | この arm で**裏づけのある提案を適用した** tick の artifact（昇順・重複なし） |
-| `unbound_attested_ticks` | 裏づけのある提案を適用したのに **artifact を言えなかった** tick の数 |
+| `bound_attested_ticks` | **artifact を言えた** tick の数 |
+| `unbound_attested_ticks` | **artifact を言えなかった** tick の数 |
 
 - 出どころは `ControlTick.model_gate.artifact_sha256` **だけ**である。走らせた側の自己申告も
   設定の宣言も入れない（0054 §2.6 と同じ向き）
@@ -188,14 +190,21 @@ gate の段（§2.4）も同じである。
 
 **報告の schema version を 2 へ上げる。** 0057 §2.4 が `last_attested_ts_ms` を足したときは
 上げなかったが、あれは**欄が無い＝`None`＝「言えない」**と読まれたからである。
-今度の2つは**欄が無い＝`()` / `0`**、すなわち**「不明が1件も無い」＝完全**と読めてしまう
-（codex #4057527950）。v1 は読めるが、`#92` は昇格の証拠として受け取らない。
-v1 の報告がこの2欄を持つことも型が拒む（古い version に意味の違う欄を後から足さない）。
+今度の欄は**無い＝`()` / `0`**、すなわち**「不明が1件も無い」＝完全**と読めてしまう
+（codex #4057527950）。**absence が unknown に落ちるか completeness に落ちるかで扱いを変える。**
+v1 の報告がこの3欄を持つことは型が拒む（古い version に意味の違う欄を後から足さない）。
 
-**適用 arm が Learned MPC なら、artifact の勘定が必ず存在する**（`model_artifacts` が
-空でないか、`unbound_attested_ticks` が 0 より大きいか）。その arm の tick は必ず
-「artifact を言える」か「言えない」のどちらかなので、**両方とも空になるのは
-「数えていない」ときだけ**である。欄の無い古い報告はここで落ちる。
+**適用 arm が Learned MPC なら、その arm のすべての tick を勘定する。**
+報告 v2 では `bound_attested_ticks + unbound_attested_ticks == ticks` を要求する。
+`model_artifacts` は集合なので「どの artifact か」しか言わず、**1 tick だけ束縛できた
+100 tick の arm でも `{production}` / 不明 0 になりうる**（codex #4057573941）。
+tick 数で突き合わせないと、区間の何割を束縛できたのかを言えていない報告が
+「完全に束縛できた」と読まれる。
+
+**この勘定を要求するのは報告 v2 以降だけである。** v1 の報告は**そのまま読める**
+（codex #4057573943）。型の段で完全性を要求すると、保存済みの v1 が**読めなくなる。**
+読めることと、昇格の根拠にできることは別で、`#92` は v1 を
+「artifact の完全性を言えない報告」として証拠から外す（§2.5）。
 
 ### 2.4 適用側の arm を昇格の根拠にできるようにする（0057 §3 の帰結の置き換え）
 
@@ -243,7 +252,7 @@ v1 の報告がこの2欄を持つことも型が拒む（古い version に意�
 | `ControlTick.model_gate` が無い（v1〜v4）で `active_controller` が Learned MPC | `applied_artifact_unknown = True` | 「gate が無い＝適用していない＝不明も無い」 |
 | `model_gate.artifact_sha256` が無い（v1〜v6） | 同上 | 「欄が無い＝まだ書いていないだけ」 |
 | `AppliedArmReport.model_artifacts` が空 | その arm は artifact を言えない | 「混ざっていない＝1つに絞れている」 |
-| `AppliedArmReport.unbound_attested_ticks` が 0 | **報告 v2 でだけ**「不明は無い」 | v1 でも同じに読む |
+| `AppliedArmReport.bound_attested_ticks` / `unbound_attested_ticks` が 0 | **報告 v2 でだけ**「不明は無い」。v2 では2つの和が `ticks` と一致することも求める | v1 でも同じに読む／和を確かめずに「不明 0」だけ見る |
 | `EvaluationReport.schema_version` が 1 | 完全性を**言えない** | 「欄が無い＝完全」 |
 | `ObservedVersions.model_artifacts` が空 | artifact を言えない | 「Production だけで回した」 |
 
@@ -298,15 +307,17 @@ v1 の報告がこの2欄を持つことも型が拒む（古い version に意�
 | 欄の無い古い tick を、同じ区間の別の tick の artifact で埋める | 推測である。**記録から言えないことを言わない**（0054 §2.2 と同じ向き） |
 | `unbound_attested_ticks` を持たず、artifact の集合だけを見る | 新旧の trace が混ざった区間で、残った tick の artifact が区間全体の実績に見える。部分的な束縛が完全なものとして通る |
 | artifact と「不明」を、最も新しい segment のものだけで見る | 別の artifact で回した古い segment が照合から消える。混ざった実績が1つの artifact を名乗れる |
-| 報告の schema version を上げる | 既存の欄の意味は変わっていない。古い報告は欄が無い＝根拠にならないとして読まれ、判断は fail closed のまま（0057 §2.4 の `last_attested_ts_ms` と同じ扱い） |
+| 報告の schema version を上げず、欄だけ足す | 欄の無さが `()` / `0`＝「不明が1件も無い」＝完全に見える。`last_attested_ts_ms`（`None`＝「言えない」）とは向きが逆なので、あのときと同じ扱いにはできない（codex #4057527950）。§2.3 のとおり v2 へ上げる |
+| 完全性（すべての tick の勘定）を `AppliedArmReport` の型で要求する | 保存済みの v1 の報告が**読めなくなる**（codex #4057573943）。読めることと根拠にできることは別で、判定は版を知っている `EvaluationReport` 側で行う |
+| artifact の集合だけで「束縛できた」と判断する | 集合は「どの artifact か」しか言わない。1 tick だけ束縛できた 100 tick の arm が完全に見える（codex #4057573941）。tick 数で突き合わせる |
 | 適用側の arm を、報告全体の `model_artifacts` の照合だけで受け入れる | 照合が1箇所になる。arm ごとの束縛を持たないと、報告の素性の欄を1つ書き換えるだけで通る |
 | rollout gate が通ったら自動で昇格する | Issue #92 の原則に反する。0057 §4 のまま、gate は助言で判断は人が行う |
 
 ## 5. 未決事項
 
-- **所有者の承認が要る。** 本記録は 0057（`FINAL`）の §3 の帰結1項と §5 の未決1項を
-  置き換え、§2.4 の条件一覧へ追記する。
-  安全系・制御系の設計変更は人間レビューが必須である（AGENTS.md）。承認までは `Proposed`
+- 所有者の承認（2026-09-21）で本記録は `FINAL` になった。**§2 の決定が変わるときは、
+  書き換えずに新しい記録を作る**（`docs/decisions/README.md`「追記のみ」）。
+  下の未決事項は、確定するまで開いたままである
 - **適用された Learned MPC の optimizer 実績を trace に残すか**（0054 §5 / 0057 §3）。
   本記録では扱わない。`ControlTick` の追加が要るので、必要になったときに別の記録で決める
 - **各段に必要な運転期間**（0057 §5 のまま）。いまも「その段で運転した証拠があること」しか
@@ -314,3 +325,10 @@ v1 の報告がこの2欄を持つことも型が拒む（古い version に意�
 - **v6 から v7 への切り替え時期の運用。** 切り替え直後は `unbound_attested_ticks` を持つ
   区間が残るので、最初の EXPANDED への昇格は v7 だけで回した区間が貯まるまで通らない。
   運用の手順書（管理操作の入口。0057 §5）を決めるときに一緒に書く
+
+**2026-09-21、リポジトリ所有者がこの記録を承認した。** 承認の対象は §2 の決定すべて
+（artifact を `ModelGateDecision` に置くこと、`ControlTick` を v7 へ上げること、
+推論の identity を宣言ではなく導出にすること、適用 arm の artifact の勘定と報告 v2、
+適用側の arm を昇格の根拠にできるようにすること、§2.5 の
+「記録の無さは常に unknown であって completeness ではない」という規則、
+および 0057 §3 の帰結1項と §5 の未決1項の置き換え）である。

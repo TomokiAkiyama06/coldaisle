@@ -283,6 +283,11 @@ def applied_report(
     artifacts = model_artifacts
     if artifacts is None:
         artifacts = (ARTIFACT_SHA,) if learned else ()
+    ticks = 1_000
+    # **すべての tick を勘定する**（#159）。束縛できなかったぶんが `unbound`。
+    bound = (ticks - unbound_attested_ticks) if (learned and artifacts) else 0
+    if learned and not artifacts:
+        unbound_attested_ticks = ticks
     return AppliedArmReport(
         arm=arm,
         arm_key=arm.key,
@@ -291,6 +296,7 @@ def applied_report(
         last_ts_ms=end_ms,
         last_attested_ts_ms=attested,
         model_artifacts=tuple(sorted(artifacts)),
+        bound_attested_ticks=bound,
         unbound_attested_ticks=unbound_attested_ticks,
         interventions=InterventionReport(
             ticks=1_000,
@@ -1192,7 +1198,8 @@ def test_invariant_5_w_unknown_artifact_ticks_are_summed_across_segments(
     stale["groups"][0]["counterfactual"] = []
     for applied in stale["groups"][0]["applied"]:
         applied["model_artifacts"] = []
-        applied["unbound_attested_ticks"] = 5
+        applied["bound_attested_ticks"] = 0
+        applied["unbound_attested_ticks"] = applied["ticks"]
         applied["first_ts_ms"] = stale["start_ms"]
         applied["last_ts_ms"] = stale["end_ms"]
         applied["last_attested_ts_ms"] = stale["end_ms"]

@@ -2525,6 +2525,21 @@ def test_invariant_17_d_an_arm_cannot_name_an_artifact_the_run_never_saw() -> No
             first_ts_ms=TICK_TS_MS,
             last_ts_ms=TICK_TS_MS,
             model_artifacts=("a" * 64,),
+            bound_attested_ticks=1,
+            interventions=InterventionReport(
+                ticks=1, safety_states=(CountedReason(code="normal", count=1),)
+            ),
+        )
+
+    with pytest.raises(ValidationError, match="束縛できた tick の数と artifact の有無"):
+        AppliedArmReport(
+            arm=arm,
+            arm_key=arm.key,
+            ticks=1,
+            first_ts_ms=TICK_TS_MS,
+            last_ts_ms=TICK_TS_MS,
+            last_attested_ts_ms=TICK_TS_MS,
+            model_artifacts=("a" * 64,),
             interventions=InterventionReport(
                 ticks=1, safety_states=(CountedReason(code="normal", count=1),)
             ),
@@ -2564,33 +2579,60 @@ def test_invariant_17_e_a_learned_tick_without_a_model_gate_counts_as_unknown(
     assert "applied_artifact_unknown" in {gap.code for gap in applied.gaps}
 
 
-def test_invariant_17_f_an_applied_learned_arm_must_account_for_every_tick() -> None:
-    """**数えていないことを「全部束縛できた」と読ませない**（codex #4057527950）。
+def test_invariant_17_f_an_applied_learned_arm_must_account_for_every_tick(
+    context: EvaluationContext,
+) -> None:
+    """**一部の tick しか束縛できていない arm を「完全」と読ませない**（codex #4057573941）。
 
-    適用 arm が Learned MPC なら、その tick は必ず artifact を言えるか言えないかの
-    どちらかである。欄の無い古い報告はここで落ちる。
+    `model_artifacts` は集合なので「どの artifact か」しか言わない。1 tick だけ束縛できた
+    100 tick の arm でも `model_artifacts == (production,)` / `unbound == 0` になりうる。
+    **すべての tick を勘定する。**
     """
-    from coldaisle.control.evaluation.model import AppliedArmReport, InterventionReport
-
-    arm = AppliedArm(
-        controller=ControllerKind.LEARNED_MPC,
-        supervisor_policy=SupervisorPolicyKind.RULE,
-        authority_stage=AuthorityStage.LIMITED,
-        operating_mode=OperatingMode.AUTO,
+    report = evaluate(
+        [run_of(_applied_learned_run(artifacts=("a" * 64,) * 3), [])], context=context
     )
+    applied = overall(report).applied[0]
+    assert (applied.bound_attested_ticks, applied.unbound_attested_ticks) == (3, 0)
+    assert applied.ticks == 3
 
-    with pytest.raises(ValidationError, match="artifact の勘定が要る"):
-        AppliedArmReport(
-            arm=arm,
-            arm_key=arm.key,
-            ticks=1,
-            first_ts_ms=TICK_TS_MS,
-            last_ts_ms=TICK_TS_MS,
-            last_attested_ts_ms=TICK_TS_MS,
-            interventions=InterventionReport(
-                ticks=1, safety_states=(CountedReason(code="normal", count=1),)
-            ),
-        )
+    document = json.loads(report.model_dump_json())
+    # 3 tick のうち1 tick しか勘定していない報告。artifact も「不明」も食い違わないが、
+    # **区間の何割を束縛できたのかを言えていない。**
+    for group in document["segments"][0]["groups"]:
+        for item in group["applied"]:
+            item["bound_attested_ticks"] = 1
+
+    with pytest.raises(ValidationError, match="すべての tick の artifact を勘定する"):
+        EvaluationReport.model_validate_json(json.dumps(document))
+
+
+def test_invariant_17_h_a_stored_v1_report_still_loads(context: EvaluationContext) -> None:
+    """**保存済みの v1 の報告は、そのまま読める**（codex #4057573943）。
+
+    完全性を型の段で要求すると、v1 が**読めなくなる。** v1 は読めたうえで、
+    `#92` が「artifact の完全性を言えない報告」として昇格の証拠から外す
+    （決定記録 0059 §2.5）。読めなくするのと、根拠にしないのは別である。
+    """
+    report = evaluate(
+        [run_of(_applied_learned_run(artifacts=("a" * 64,) * 3), [])], context=context
+    )
+    document = json.loads(report.model_dump_json())
+    # v1 の報告の形（この3欄は当時まだ無かった）。
+    document["schema_version"] = 1
+    for segment in document["segments"]:
+        for group in segment["groups"]:
+            for item in group["applied"]:
+                del item["model_artifacts"]
+                del item["bound_attested_ticks"]
+                del item["unbound_attested_ticks"]
+
+    stored = EvaluationReport.model_validate_json(json.dumps(document))
+
+    assert stored.schema_version == 1
+    applied = overall(stored).applied[0]
+    assert applied.arm.controller is ControllerKind.LEARNED_MPC
+    assert applied.model_artifacts == ()
+    assert (applied.bound_attested_ticks, applied.unbound_attested_ticks) == (0, 0)
 
 
 def test_invariant_17_g_a_v1_report_cannot_carry_the_fields_added_in_v2(
