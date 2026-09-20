@@ -108,17 +108,54 @@ scalar で受け取れると、記録された coverage と意味の違う幅で
 一致することを要求する。**現行の artifact はすべて `observational_replay` なので、この経路は
 決定論的にすべて拒む。** 0052 §2.1 と同じで、拒否は不具合ではなく意図した振る舞いである。
 
-**昇格の判断は identity の文字列を見ない。** `DynamicsIdentity` はただの値なので、
-`registry_attested` と `artifact_sha256` を並べた identity は誰でも組み立てられる。
-`attested_evidence()` は `EnvironmentDynamics.attestation`（`ArtifactAttestation` object）を
-要求し、その `kind` / `capability` / `model_id` / 版 / artifact hash が identity と一致する
-ことまで確かめる。`ArtifactAttestation` は Registry の検証経路だけが発行するので、
-近似 simulator はこれを用意できない。`DynamicsIdentity.claims_evidence` は**自称**であり、
-昇格の判断には使わない。
+#### 昇格の根拠にできる条件（完全な規則）
 
-**step ごとの provenance も自称である。** `EnvironmentDynamics` は「自分が出しうる出どころ」
-（`provenances`）を宣言し、環境はその集合に無い step を受け取らず `DYNAMICS_UNUSABLE` として
-終端する。近似 simulator が「記録から来た」と名乗る step を返す経路を塞ぐ。
+**自称は一切見ない。** `EnvironmentDynamics` が返す `identity`・`provenances`・
+`DynamicsStep.provenance` は、どれも実装が並べたただの値である。`registry_attested` も
+`logged_trajectory` も、近似 simulator が名乗れる。したがって裏づけは、**この package の
+検証経路だけが発行できる封をした object** `DynamicsEvidence` が与える。
+
+`DynamicsEvidence` は公開 constructor を持たず、発行できるのは次の2箇所だけである。
+
+| 発行する場所 | 発行できる provenance | 何を検証したか |
+|---|---|---|
+| `LoggedTrajectoryDynamics.__init__` | `logged_trajectory` | 検証済みの `LoggedTrajectory` と、検証済み設定（`policy.shadow`）の許容幅 |
+| `AttestedThermalDynamics.bind` | `registry_attested` | Registry が発行した `ArtifactAttestation`（kind / capability / identity / schema 版を照合済み） |
+
+`SimulatedThermalDynamics` と `HybridDynamics` は `evidence = None` を返す。
+近似を含む以上、記録から来た step があっても昇格の根拠にはしない。
+
+**`EpisodeResult.promotable` が立つのは、次の7つがすべて成り立つときだけ**である。
+環境だけがこの欄を立て、1つでも欠ければ `False` になる。
+
+1. coverage の下限を満たした（`usable_for_comparison`）
+2. 安全側の違反が0（絶対上限の超過・Critical Safety floor を下回った要求）
+3. 設定範囲外の action が0
+4. Learned MPC を束縛できた（`learned_controller_available`。§2.1）
+5. dynamics が **封をした `DynamicsEvidence`** を持つ
+6. その証拠の `identity` が、いま dynamics が名乗っている identity と一致する
+   （借りた証拠を別の identity に付けさせない）。`registry_attested` ならさらに
+   `ArtifactAttestation` の kind / capability / model ID / 版 / artifact hash が identity と一致する
+7. **記録したすべての step の出どころが、その証拠が裏づける唯一の出どころと等しい**
+
+#### step が持ちうる出どころは、すべて環境が検証済み入力から作ったものへ辿れる
+
+`StepRecord.provenance` は `DynamicsStep.provenance` から来る。環境はこの値を2回見る。
+
+- **走らせてよいか**: `EnvironmentDynamics.provenances`（実装の宣言）に無い値なら、
+  その step を受け取らず `DYNAMICS_UNUSABLE` で終端する。実装の宣言と実際の返り値が
+  食い違う配線の誤りを、episode を進める前に止める
+- **根拠にしてよいか**: 上の条件 7。封をした証拠の provenance と一致しない step が1つでも
+  あれば `promotable` は立たない
+
+この2段があるので、**証拠に辿れない provenance の step は「走ることはできても、根拠には
+決してならない」**。近似 simulator が `logged_trajectory` を名乗った step を返す経路
+（1巡目・2巡目で指摘された形）は、宣言と一致していれば走るが、`evidence` が `None` なので
+`promotable` は立たない。
+
+**同一プロセス内の悪意ある偽造までは防げない**（決定記録 0050 §3）。本物の
+`LoggedTrajectoryDynamics` を包んで `evidence` を借りつつ別の値を返す wrapper は作れる。
+0052 §2.1 と同じ残余リスクで、狙いは**配線の誤りを型で止めること**である。
 
 `production_active` は**要求しない**。0052 §2.1 が「Replay / offline 評価は production でない
 attestation をそのまま使う」としているためで、ここは制御経路ではない。代わりに、
@@ -157,6 +194,17 @@ attestation をそのまま使う」としているためで、ここは制御�
 **screen は `reset` の時点でも掛ける。** 初期 window が既に上限を超えていたり、初期 demand が
 floor を下回っていたりする episode を「まだ1 step も進んでいないから安全」として agent へ
 見せない。違反している初期 state の episode は、1 step も進まずに `SAFETY_VIOLATION` で終わる。
+
+**掛かっている action は1つしか持てない。** `EpisodeSpec` は初期 demand を欄として持たず、
+`initial_window.action`（#84 の「その action が実際に掛かった結果の観測」）から derive する。
+別の欄として持つと、window の action と食い違う2つ目の「掛かっている action」を作れてしまい、
+片方だけが screen を通る。
+
+**読めていない値を screen の証拠にしない。** 観測 window の `missing` / `stale` / `suspect` の
+cell は、安全 screen にも reward にも渡さない。「読めていない」を「上限を下回っている」とも
+「超えている」とも読み替えない（0054 §2.6 の `OutcomeObservation.usable` と同じ規則）。
+Snapshot へ写すときも品質と source 時刻をそのまま写す。`Quality.OK` へ丸めると、本物の
+Fallback Controller が「使えない」と判断する値を環境だけが使い、環境と運転で別の demand が出る。
 
 **違反したら探索を止める。** 運転時は #78 が引き上げるが、環境がそれを模すと
 「Safety が直してくれる」前提の policy を学習させてしまう。
@@ -250,6 +298,11 @@ simulator: { model_id, model_version, responses: [...] }
 | 記録済み trajectory を回すために、試験用の attestation を production へ昇格させる | 0052 §2.1 の promotion の規律をこちら側で崩す。`mpc=None` の経路を持てば偽の証拠は要らない |
 | `identity.provenance` が `registry_attested` なら裏づけありとみなす | provenance も hash もただの値。近似 simulator でも名乗れる。`ArtifactAttestation` object を要求する |
 | step ごとの provenance をそのまま信じる | 近似 simulator が「記録から来た」と名乗れる。出しうる出どころを宣言させ、外れた step を拒む |
+| 記録再生だけは「`attestation` が無い」ことを裏づけとみなす | 自称の `logged_trajectory` がすべて通る。記録側にも封をした `DynamicsEvidence` を要求する |
+| `EnvironmentDynamics.provenances`（実装の宣言）を昇格の根拠に使う | 宣言も自称である。根拠は封をした証拠の provenance との一致で判断する |
+| 初期 demand を `EpisodeSpec` の欄として持つ | window の action と食い違う2つ目の「掛かっている action」ができ、片方だけが screen を通る |
+| Snapshot へ写すときに品質を `OK` へ丸める | 本物の Fallback が「使えない」とする値を環境だけが使い、環境と運転で別の demand が出る |
+| `history[-recent_history_steps:]` をそのまま使う | 0 のとき履歴が全件返る。0 は「渡さない」である |
 | 呼び出し側が渡した設定 hash だけを条件に入れる | 中身と食い違う hash を渡せる。検証済み設定 object からの hash も併せて入れる |
 | 記録照合の許容幅を呼び出し側から scalar で受け取る | 記録された coverage と意味の違う幅で照合した結果を、同じ表に並べられる（0054 §2.6） |
 | Baseline / Acoustic を条件 hash に載せない（factory は hash できないから） | 依存の差が policy の差に見える。名指しを必須にすれば載せられる |

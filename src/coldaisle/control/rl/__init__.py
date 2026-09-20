@@ -44,6 +44,7 @@ from coldaisle.control.rl.config import (
 )
 from coldaisle.control.rl.dynamics import (
     AttestedThermalDynamics,
+    DynamicsEvidence,
     DynamicsIdentity,
     DynamicsProvenance,
     DynamicsRequest,
@@ -98,6 +99,7 @@ __all__ = [
     "BaselineProposer",
     "CoverageConfig",
     "DependencyIdentity",
+    "DynamicsEvidence",
     "DynamicsIdentity",
     "DynamicsProvenance",
     "DynamicsRequest",

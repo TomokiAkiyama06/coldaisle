@@ -202,10 +202,18 @@ class EpisodeResult(_Frozen):
     と読まないために、結果に必ず残す。
     """
     promotable: bool
-    """この結果を昇格 / rollout の根拠にしてよいか。
+    """この結果を昇格 / rollout の根拠にしてよいか。**環境だけが立てる欄である。**
 
-    **環境が `attested_evidence()` で Registry の証拠 object を確かめてから立てる。**
-    `dynamics.provenance` の自称では立たない（決定記録 0058 §2.3）。
+    立つ条件は7つで、1つでも欠ければ `False`（決定記録 0058 §2.3）。
+
+    1. coverage の下限を満たした（`usable_for_comparison`）
+    2. 安全側の違反が0（絶対上限の超過・floor を下回った要求）
+    3. 設定範囲外の action が0
+    4. Learned MPC を束縛できた（`learned_controller_available`）
+    5. dynamics が**封をした `DynamicsEvidence`** を持つ（自称の identity では立たない）
+    6. その証拠の identity が dynamics の identity と一致し、`registry_attested` なら
+       `ArtifactAttestation` の kind / capability / model ID / 版 / artifact hash まで一致する
+    7. **すべての step の出どころが、その証拠が裏づける唯一の出どころと等しい**
     """
 
     @model_validator(mode="after")
@@ -230,10 +238,12 @@ class EpisodeResult(_Frozen):
             if not self.learned_controller_available:
                 # action が demand に効いていない episode は、policy の根拠になりえない。
                 raise ValueError("Learned MPC を束縛できなかった episode を昇格の根拠にしない")
-            if any(
-                step.provenance is DynamicsProvenance.SIMULATED_PROVISIONAL for step in self.steps
-            ):
-                # hybrid で1 step でも近似が混ざれば、その episode は根拠にできない。
+            provenances = {step.provenance for step in self.steps if step.provenance is not None}
+            if provenances - {self.dynamics.provenance}:
+                # hybrid で1 step でも別の出どころが混ざれば、その episode は根拠にできない。
+                # 証拠そのものとの照合は環境が行う（この型は防御的な検査だけを持つ）。
+                raise ValueError("dynamics と違う出どころの step を含む episode を昇格させない")
+            if DynamicsProvenance.SIMULATED_PROVISIONAL in provenances:
                 raise ValueError("近似 simulator の step を含む episode を昇格の根拠にしない")
         return self
 

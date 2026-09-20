@@ -33,7 +33,11 @@ from pydantic import BaseModel, ConfigDict, Field
 from coldaisle.control.acoustic import AcousticCostModel
 from coldaisle.control.config import FanPolicyConfig, SafetyConfig
 from coldaisle.control.fallback.gate import ControllerGate, LearnedControlStatus, LearnedFailure
-from coldaisle.control.model.thermal import ObservedThermalInput, canonical_sha256
+from coldaisle.control.model.thermal import (
+    ObservedThermalInput,
+    ObservedWindowFrame,
+    canonical_sha256,
+)
 from coldaisle.control.mpc import LearnedMpcController
 from coldaisle.control.rl.action import (
     ActionSpace,
@@ -42,7 +46,6 @@ from coldaisle.control.rl.action import (
 )
 from coldaisle.control.rl.config import RlTrainingConfig
 from coldaisle.control.rl.dynamics import (
-    DynamicsProvenance,
     DynamicsRequest,
     DynamicsUnusableError,
     EnvironmentDynamics,
@@ -105,10 +108,56 @@ class _Frozen(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid", strict=True)
 
 
+def _snapshot_signal(metric: str, frame: ObservedWindowFrame, *, ts_ms: int) -> SnapshotSignal:
+    """観測 window の1 cell を、#102 の Snapshot signal へ**そのまま**写す。
+
+    **欠測・stale・suspect を `OK` へ丸めない。** 丸めると、本物の Fallback Controller が
+    「使えない」と判断する値を環境だけが使ってしまい、環境と運転で別の demand が出る
+    （`SnapshotSignal.available` は `Quality.OK` だけを通す）。
+    """
+    value = frame.values[metric]
+    source_ts = frame.source_ts_ms[metric]
+    if frame.missing_mask[metric] or value is None:
+        # 未観測 cell は source 時刻も持たない（#84 の window の不変条件）。
+        return SnapshotSignal(
+            metric=metric,
+            importance=TelemetryImportance.CRITICAL,
+            enabled=True,
+            value=None,
+            quality=Quality.MISSING,
+        )
+    if frame.stale_mask[metric]:
+        quality = Quality.STALE
+    elif frame.suspect_mask[metric]:
+        quality = Quality.SUSPECT
+    else:
+        quality = Quality.OK
+    return SnapshotSignal(
+        metric=metric,
+        importance=TelemetryImportance.CRITICAL,
+        enabled=True,
+        value=value,
+        quality=quality,
+        source_ts_ms=source_ts,
+        last_changed_mono_ms=source_ts,
+        age_ms=max(0, ts_ms - source_ts) if source_ts is not None else None,
+    )
+
+
 def _frame_values(window: ObservedThermalInput) -> dict[str, float]:
-    """window の最後の frame の、値のある metric だけを返す。"""
+    """window の最後の frame の、**使える値だけ**を返す。
+
+    欠測・stale・suspect の cell は安全 screen にも reward にも渡さない。
+    「読めていない値」を「上限を下回っている」と読み替えないためである。
+    """
+    frame = window.window[-1]
     return {
-        metric: value for metric, value in window.window[-1].values.items() if value is not None
+        metric: value
+        for metric, value in frame.values.items()
+        if value is not None
+        and not frame.missing_mask[metric]
+        and not frame.stale_mask[metric]
+        and not frame.suspect_mask[metric]
     }
 
 
@@ -182,9 +231,24 @@ class EpisodeSpec(_Frozen):
     mode: TrainingMode
     trace: WorkloadTrace
     initial_window: ObservedThermalInput
-    initial_demands: PerZone[Demand]
     max_steps: int | None = Field(default=None, ge=1)
     """省略すると設定の `episode.max_steps` を使う。設定より長くはできない。"""
+
+    @property
+    def initial_demands(self) -> PerZone[Demand]:
+        """episode の開始時に掛かっている demand。
+
+        **観測 window の action から derive する。** 別の欄として持つと、`initial_window` の
+        action と食い違う「2つの掛かっている action」を作れてしまい、片方だけが安全 screen を
+        通る。#84 の観測 window は「その action が実際に掛かった結果の観測」なので、
+        起点はそこにしかない（決定記録 0052 §2.4 と同じ理由）。
+        """
+        action = self.initial_window.action
+        return PerZone[Demand](
+            front=action.front.effective_demand,
+            rear=action.rear.effective_demand,
+            top=action.top.effective_demand,
+        )
 
 
 class _EpisodeState:
@@ -399,7 +463,9 @@ class SupervisorTrainingEnvironment:
         state = self._require_episode()
         snapshot = self._snapshot(state)
         workload = self._workload_estimate(state, snapshot)
-        history = tuple(state.history[-self._config.episode.recent_history_steps :])
+        # **0 を「全部」と読まない。** `history[-0:]` は履歴すべてを返す。
+        window = self._config.episode.recent_history_steps
+        history = tuple(state.history[-window:]) if window > 0 else ()
         return SupervisorInput(snapshot=snapshot, recent_history=history, workload=workload)
 
     def step(self, action: SupervisorAction) -> StepRecord:
@@ -439,11 +505,15 @@ class SupervisorTrainingEnvironment:
             minimum_margin_c=state.minimum_margin_c,
         )
         usable = self._is_usable(coverage)
-        simulated = any(
-            step.provenance is DynamicsProvenance.SIMULATED_PROVISIONAL for step in state.steps
+        # **自称では立てない。** 封をした `DynamicsEvidence` object だけを見る（0058 §2.3）。
+        evidence = attested_evidence(self._dynamics)
+        # すべての step が、その証拠が裏づける唯一の出どころから来ていること。
+        # 近似の step を `logged_trajectory` と名乗らせても、証拠が無ければここで落ちる。
+        every_step_is_backed = evidence is not None and all(
+            step.provenance is evidence.provenance
+            for step in state.steps
+            if step.provenance is not None
         )
-        # **自称の provenance では立てない。** Registry の証拠 object そのものを確かめる。
-        attested = attested_evidence(self._dynamics)
         return EpisodeResult(
             episode_id=state.spec.episode_id,
             seed=state.spec.seed,
@@ -466,8 +536,7 @@ class SupervisorTrainingEnvironment:
                 usable
                 and not safety.violated
                 and safety.invalid_actions == 0
-                and attested
-                and not simulated
+                and every_step_is_backed
                 and self.learned_controller_available
             ),
         )
@@ -779,19 +848,7 @@ class SupervisorTrainingEnvironment:
         """
         frame = state.window.window[-1]
         ts_ms = state.window.action_ts_ms
-        signals = tuple(
-            SnapshotSignal(
-                metric=metric,
-                importance=TelemetryImportance.CRITICAL,
-                enabled=True,
-                value=value,
-                quality=Quality.OK if value is not None else Quality.MISSING,
-                source_ts_ms=frame.ts_ms,
-                last_changed_mono_ms=frame.ts_ms,
-                age_ms=ts_ms - frame.ts_ms,
-            )
-            for metric, value in frame.values.items()
-        )
+        signals = tuple(_snapshot_signal(metric, frame, ts_ms=ts_ms) for metric in frame.values)
         return ControlStateSnapshot(
             tick_id=state.tick_id,
             ts_ms=ts_ms,

@@ -43,6 +43,7 @@ from coldaisle.control.rl import (
     ActionSpace,
     AttestedThermalDynamics,
     DependencyIdentity,
+    DynamicsEvidence,
     DynamicsIdentity,
     DynamicsProvenance,
     DynamicsStep,
@@ -86,6 +87,7 @@ from coldaisle.control.schema import (
 )
 from coldaisle.control.state import ControlStateSnapshot
 from coldaisle.control.supervisor import RulePolicy, SupervisorInput
+from coldaisle.store.models import Quality
 from test_learned_mpc import (
     ACTION_TS_MS,
     HORIZONS,
@@ -307,8 +309,8 @@ def episode_spec(
         seed=seed,
         mode=mode,
         trace=workload_trace(steps, load=load),
+        # 掛かっている demand は **観測 window の action から derive** される。
         initial_window=observed_input(demand),
-        initial_demands=PerZone[Demand](front=demand, rear=demand, top=demand),
         max_steps=max_steps,
     )
 
@@ -685,8 +687,8 @@ def test_invariant_6_b_the_configured_simulator_is_always_provisional() -> None:
     assert simulator.identity.provenance is DynamicsProvenance.SIMULATED_PROVISIONAL
     assert simulator.identity.artifact_sha256 is None
     assert not simulator.identity.claims_evidence
-    assert simulator.attestation is None
-    assert not attested_evidence(simulator)
+    assert simulator.evidence is None
+    assert attested_evidence(simulator) is None
 
 
 def test_invariant_6_c_todays_artifacts_cannot_be_a_learned_simulator(trained, tmp_path) -> None:
@@ -1089,7 +1091,8 @@ class ForgedAttestedDynamics:
         return self._identity
 
     @property
-    def attestation(self) -> None:
+    def evidence(self) -> None:
+        """**封をした証拠は作れない。** 自称できるのは identity と provenances だけ。"""
         return None
 
     @property
@@ -1169,7 +1172,8 @@ def test_invariant_6_f_a_self_declared_registry_provenance_grants_nothing(traine
     )
 
     assert forged.identity.claims_evidence  # 自称はできてしまう
-    assert not attested_evidence(forged)  # 証拠が無いので裏づけにならない
+    assert forged.evidence is None  # 封をした証拠は作れない
+    assert attested_evidence(forged) is None
 
     environment, *_ = build_environment(trained, dynamics=forged)
     result = run_all(environment, episode_spec(max_steps=3))
@@ -1183,7 +1187,10 @@ def test_invariant_6_g_an_attested_binding_is_the_only_source_of_evidence(traine
     dynamics = AttestedThermalDynamics.bind(PlanningModel(base), attestation=attestation)
 
     assert dynamics.attestation is attestation
-    assert attested_evidence(dynamics)
+    evidence = attested_evidence(dynamics)
+    assert evidence is not None
+    assert evidence.provenance is DynamicsProvenance.REGISTRY_ATTESTED
+    assert evidence.attestation is attestation
     assert dynamics.identity.artifact_sha256 == attestation.artifact_sha256
 
 
@@ -1253,7 +1260,6 @@ def test_invariant_5_e_the_initial_state_is_screened_before_any_step(trained) ->
         mode=TrainingMode.LEARNED_SIMULATOR,
         trace=workload_trace(),
         initial_window=hot_window(120.0),
-        initial_demands=PerZone[Demand](front=0.4, rear=0.4, top=0.4),
         max_steps=4,
     )
     environment.reset(spec)
@@ -1382,3 +1388,241 @@ def test_invariant_6_h_a_step_cannot_claim_an_uncontracted_provenance(trained) -
     assert result.termination is TerminationReason.DYNAMICS_UNUSABLE
     assert result.termination_reason.code == "provenance_unexpected"
     assert not result.promotable
+
+
+# ---------------- codex レビュー 2巡目（PR #158 / d631df9）で塞いだ穴
+
+
+class ForgedLoggedDynamics:
+    """`logged_trajectory` を**自称するだけ**の dynamics。
+
+    近似 simulator の値を「記録から来た」と名乗って返す。`provenances` も自称なので、
+    **自称だけで通る実装が1つでもあれば昇格の根拠が汚れる**。
+    """
+
+    def __init__(self, inner: SimulatedThermalDynamics, trajectory: LoggedTrajectory) -> None:
+        self._inner = inner
+        self._identity = DynamicsIdentity(
+            provenance=DynamicsProvenance.LOGGED_TRAJECTORY,
+            model_id=trajectory.trajectory_id,
+            model_version="1",
+            trace_digest=trajectory.digest(),
+        )
+
+    @property
+    def identity(self) -> DynamicsIdentity:
+        return self._identity
+
+    @property
+    def evidence(self) -> None:
+        return None
+
+    @property
+    def provenances(self) -> frozenset[DynamicsProvenance]:
+        return frozenset({DynamicsProvenance.LOGGED_TRAJECTORY})
+
+    def conditions(self) -> dict[str, object]:
+        return {"identity": self._identity.model_dump(mode="json")}
+
+    def advance(self, request, *, rng):
+        step = self._inner.advance(request, rng=rng)
+        return DynamicsStep.model_validate(
+            step.model_dump(mode="python") | {"provenance": DynamicsProvenance.LOGGED_TRAJECTORY}
+        )
+
+
+def test_invariant_6_i_logged_provenance_also_needs_sealed_evidence(trained) -> None:
+    """**記録再生の自称でも昇格させない。**
+
+    `logged_trajectory` を名乗って `evidence=None` を返す実装は、近似の値を実測の裏づけ付きに
+    見せられてしまう。裏づけは封をした `DynamicsEvidence` object だけが与える
+    （決定記録 0058 §2.3）。
+    """
+    config, config_sha = rl_config()
+    forged = ForgedLoggedDynamics(
+        SimulatedThermalDynamics(config.simulator, config_sha256=config_sha),
+        logged_trajectory(0.4),
+    )
+
+    assert forged.identity.claims_evidence  # 自称はできてしまう
+    assert attested_evidence(forged) is None  # 封をした証拠が無い
+
+    environment, *_ = build_environment(trained, dynamics=forged)
+    result = run_all(environment, episode_spec(max_steps=3))
+    assert result.coverage.supported_steps == 3
+    assert not result.promotable
+
+
+def test_invariant_6_j_evidence_cannot_be_built_outside_the_verified_paths() -> None:
+    """`DynamicsEvidence` は公開 constructor を持たず、番兵なしでは発行できない。"""
+    with pytest.raises(TypeError, match="検証経路"):
+        DynamicsEvidence()
+    identity = DynamicsIdentity(
+        provenance=DynamicsProvenance.LOGGED_TRAJECTORY,
+        model_id="pr105-log",
+        model_version="1",
+        trace_digest="a" * 64,
+    )
+    with pytest.raises(TypeError, match="検証経路"):
+        DynamicsEvidence._issue(DynamicsProvenance.LOGGED_TRAJECTORY, identity)
+
+
+def test_invariant_6_k_borrowed_evidence_cannot_be_attached_to_another_identity(trained) -> None:
+    """**借りた証拠を別の identity に付けられない。**"""
+    logged = LoggedTrajectoryDynamics(logged_trajectory(0.4), shadow=shadow_config())
+    evidence = logged.evidence
+    assert evidence is not None
+
+    class Borrower:
+        identity = DynamicsIdentity(
+            provenance=DynamicsProvenance.LOGGED_TRAJECTORY,
+            model_id="other-log",
+            model_version="1",
+            trace_digest="b" * 64,
+        )
+        provenances = frozenset({DynamicsProvenance.LOGGED_TRAJECTORY})
+
+        @property
+        def evidence(self):
+            return evidence
+
+        def conditions(self):
+            return {}
+
+        def advance(self, request, *, rng):
+            raise AssertionError("使わない")
+
+    assert attested_evidence(Borrower()) is None
+    del trained
+
+
+def test_invariant_6_l_a_verified_logged_dynamics_carries_sealed_evidence() -> None:
+    """検証済みの記録から作った dynamics だけが、記録再生の証拠を持つ。"""
+    logged = LoggedTrajectoryDynamics(logged_trajectory(0.4), shadow=shadow_config())
+    evidence = attested_evidence(logged)
+
+    assert evidence is not None
+    assert evidence.provenance is DynamicsProvenance.LOGGED_TRAJECTORY
+    assert evidence.attestation is None
+    assert evidence.identity == logged.identity
+
+
+def masked_window(
+    *, stale: str | None = None, missing: str | None = None, stale_value: float | None = None
+):
+    """最後の frame に mask を立てた観測 window。"""
+    base = observed_input(0.4)
+    last = base.window[-1]
+    values = dict(last.values)
+    source = dict(last.source_ts_ms)
+    stale_mask = dict(last.stale_mask)
+    missing_mask = dict(last.missing_mask)
+    if stale is not None:
+        stale_mask[stale] = True
+        if stale_value is not None:
+            values[stale] = stale_value
+    if missing is not None:
+        missing_mask[missing] = True
+        values[missing] = None
+        source[missing] = None
+    frame = last.model_copy(
+        update={
+            "values": values,
+            "source_ts_ms": source,
+            "stale_mask": stale_mask,
+            "missing_mask": missing_mask,
+        }
+    )
+    return ObservedThermalInput.model_validate(
+        base.model_copy(update={"window": (*base.window[:-1], frame)}).model_dump(mode="python")
+    )
+
+
+def test_invariant_15_a_snapshot_quality_and_timestamps_are_faithful(trained) -> None:
+    """**欠測・stale を `Quality.OK` へ丸めない。**
+
+    丸めると、本物の Fallback Controller が「使えない」と判断する値を環境だけが使ってしまい、
+    環境と運転で別の demand が出る（`SnapshotSignal.available` は `Quality.OK` だけを通す）。
+    """
+    environment, *_ = build_environment(trained)
+    spec = EpisodeSpec(
+        episode_id="pr105-masked",
+        seed=1,
+        mode=TrainingMode.LEARNED_SIMULATOR,
+        trace=workload_trace(),
+        initial_window=masked_window(stale=AIR, missing=GPU),
+        max_steps=2,
+    )
+    signals = {signal.metric: signal for signal in environment.reset(spec).snapshot.signals}
+
+    assert signals[AIR].quality is Quality.STALE
+    assert not signals[AIR].available
+    assert signals[AIR].source_ts_ms == spec.initial_window.window[-1].ts_ms
+    assert signals[GPU].quality is Quality.MISSING
+    assert signals[GPU].value is None
+    assert signals[GPU].source_ts_ms is None
+    assert not signals[GPU].available
+
+
+def test_invariant_15_b_unusable_cells_do_not_feed_the_safety_screen(trained) -> None:
+    """**読めていない値を「上限を下回っている」とも「超えている」とも読まない。**"""
+    environment, *_ = build_environment(trained)
+    spec = EpisodeSpec(
+        episode_id="pr105-hot-stale",
+        seed=1,
+        mode=TrainingMode.LEARNED_SIMULATOR,
+        trace=workload_trace(),
+        # 上限を大きく超える値だが stale。**証拠として使わない。**
+        initial_window=masked_window(stale=AIR, stale_value=120.0),
+        max_steps=2,
+    )
+    observation = environment.reset(spec)
+    signals = {signal.metric: signal for signal in observation.snapshot.signals}
+
+    assert signals[AIR].value == 120.0  # 値は残す
+    assert not signals[AIR].available  # が、使える値としては扱わない
+    # screen は読めていない cell を見ないので、episode は終端されない。
+    with pytest.raises(EnvironmentUsageError, match="終わっていない"):
+        environment.episode_result()
+
+    # 同じ値が `Quality.OK` なら、入口で終端される。
+    hot = build_environment(trained)[0]
+    hot.reset(
+        EpisodeSpec(
+            episode_id="pr105-hot-ok",
+            seed=1,
+            mode=TrainingMode.LEARNED_SIMULATOR,
+            trace=workload_trace(),
+            initial_window=hot_window(120.0),
+            max_steps=2,
+        )
+    )
+    assert hot.episode_result().termination is TerminationReason.SAFETY_VIOLATION
+
+
+def test_invariant_15_c_initial_demands_are_derived_from_the_window() -> None:
+    """**掛かっている action を2つ持てない。** 初期 demand は観測 window から derive する。"""
+    spec = episode_spec(demand=0.55)
+    action = spec.initial_window.action
+
+    assert spec.initial_demands.front == action.front.effective_demand
+    assert spec.initial_demands.rear == action.rear.effective_demand
+    assert spec.initial_demands.top == action.top.effective_demand
+
+    with pytest.raises(ValidationError):
+        EpisodeSpec.model_validate(
+            spec.model_dump(mode="python")
+            | {"initial_demands": {"front": 0.9, "rear": 0.9, "top": 0.9}}
+        )
+
+
+def test_invariant_15_d_a_zero_history_window_gives_no_history(trained) -> None:
+    """`recent_history_steps = 0` を「全部」と読まない（`history[-0:]` は全件）。"""
+    episode = dict(rl_document()["episode"])
+    episode["recent_history_steps"] = 0
+    environment, *_ = build_environment(trained, config_overrides={"episode": episode})
+    environment.reset(episode_spec(max_steps=3))
+    environment.step(default_action())
+    environment.step(default_action())
+
+    assert environment.observation().recent_history == ()

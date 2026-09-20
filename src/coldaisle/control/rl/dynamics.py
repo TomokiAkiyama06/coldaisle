@@ -113,6 +113,79 @@ class DynamicsIdentity(_Frozen):
         return self.provenance is not DynamicsProvenance.SIMULATED_PROVISIONAL
 
 
+_EVIDENCE_ISSUE_TOKEN = object()
+"""`DynamicsEvidence` の発行経路を閉じるための番兵。**この module の外へ出さない。**"""
+
+
+class DynamicsEvidence:
+    """昇格の根拠にできる遷移の出どころを表す、**封をした**証拠。
+
+    **公開 constructor を持たない。** この module の検証経路だけが発行する。
+
+    - `logged_trajectory`: `LoggedTrajectoryDynamics` の構築
+      （検証済みの記録 + 検証済み設定の許容幅）
+    - `registry_attested`: `AttestedThermalDynamics.bind`
+      （Registry が発行した `ArtifactAttestation`）
+
+    `DynamicsIdentity` は pydantic model で、`registry_attested` も `logged_trajectory` も
+    値として組み立てられる。**identity は自称で、これは証拠である**（決定記録 0058 §2.3）。
+    `EnvironmentDynamics.provenances` も実装の自称なので、昇格の判断には使わない。
+
+    **同一プロセス内の悪意ある偽造までは防げない**（決定記録 0050 §3）。狙いは、裏づけの無い
+    dynamics が「検証済み」を名乗って昇格の根拠へ混ざる**配線の誤り**を型で止めることである。
+    """
+
+    __slots__ = ("_attestation", "_identity", "_provenance")
+    _provenance: DynamicsProvenance
+    _identity: DynamicsIdentity
+    _attestation: ArtifactAttestation | None
+
+    def __init__(self) -> None:
+        raise TypeError("DynamicsEvidence は dynamics の検証経路からだけ得られる")
+
+    def __setattr__(self, name: str, value: object) -> None:
+        """発行後に差し替えられないようにする。"""
+        raise AttributeError("DynamicsEvidence は不変")
+
+    @classmethod
+    def _issue(
+        cls,
+        provenance: DynamicsProvenance,
+        identity: DynamicsIdentity,
+        *,
+        attestation: ArtifactAttestation | None = None,
+        _token: object | None = None,
+    ) -> DynamicsEvidence:
+        if _token is not _EVIDENCE_ISSUE_TOKEN:
+            raise TypeError("DynamicsEvidence は dynamics の検証経路だけが発行できる")
+        if provenance is DynamicsProvenance.SIMULATED_PROVISIONAL:
+            raise ValueError("近似 simulator に証拠は発行しない")
+        if provenance is not identity.provenance:
+            raise ValueError("証拠の出どころを identity と食い違わせない")
+        if (provenance is DynamicsProvenance.REGISTRY_ATTESTED) != (attestation is not None):
+            raise ValueError("registry_attested の証拠にだけ ArtifactAttestation を添える")
+        evidence = object.__new__(cls)
+        object.__setattr__(evidence, "_provenance", provenance)
+        object.__setattr__(evidence, "_identity", identity)
+        object.__setattr__(evidence, "_attestation", attestation)
+        return evidence
+
+    @property
+    def provenance(self) -> DynamicsProvenance:
+        """**この証拠が裏づける唯一の出どころ。** step はこれと一致しなければ根拠にならない。"""
+        return self._provenance
+
+    @property
+    def identity(self) -> DynamicsIdentity:
+        """証拠を発行したときの identity。借りた証拠を別の identity に付けさせない。"""
+        return self._identity
+
+    @property
+    def attestation(self) -> ArtifactAttestation | None:
+        """Registry が発行した artifact の証拠（`registry_attested` のときだけ）。"""
+        return self._attestation
+
+
 class WorkloadSample(_Frozen):
     """1 step の負荷擾乱。**将来の継続時間を断定しない**（AGENTS.md 制御アーキテクチャ）。"""
 
@@ -190,13 +263,12 @@ class EnvironmentDynamics(Protocol):
         ...
 
     @property
-    def attestation(self) -> ArtifactAttestation | None:
-        """Registry が発行した証拠そのもの。持たない dynamics は `None` を返す。
+    def evidence(self) -> DynamicsEvidence | None:
+        """封をした証拠。持たない dynamics は `None` を返す。
 
-        **昇格の判断はこの object を見る。** `identity.provenance` は文字列なので、
-        近似 simulator でも `registry_attested` を名乗る値を組み立てられてしまう
-        （決定記録 0058 §2.3）。`ArtifactAttestation` は Registry の検証経路だけが
-        発行するので、自称では用意できない。
+        **昇格の判断はこの object だけを見る。** `identity` も `provenances` も実装の自称で、
+        値としてなら誰でも組み立てられる（決定記録 0058 §2.3）。`DynamicsEvidence` は
+        この module の検証経路だけが発行するので、自称では用意できない。
         """
         ...
 
@@ -287,8 +359,8 @@ class SimulatedThermalDynamics:
         return self._identity
 
     @property
-    def attestation(self) -> ArtifactAttestation | None:
-        """**常に `None`。** 近似 simulator は Registry の証拠を持たない。"""
+    def evidence(self) -> DynamicsEvidence | None:
+        """**常に `None`。** 近似 simulator に証拠は無い。"""
         return None
 
     @property
@@ -371,7 +443,7 @@ class LoggedTrajectoryDynamics:
     （決定記録 0053 §2.3 / 0054 §2.2 と同じ帰属規則）。これが coverage になる。
     """
 
-    __slots__ = ("_identity", "_tolerance", "_trajectory")
+    __slots__ = ("_evidence", "_identity", "_tolerance", "_trajectory")
 
     def __init__(self, trajectory: LoggedTrajectory, *, shadow: ShadowConfig) -> None:
         """照合の許容幅は**検証済み設定から取る**（呼び出し側の写しを受け取らない）。
@@ -387,6 +459,12 @@ class LoggedTrajectoryDynamics:
             model_version=str(len(trajectory.frames)),
             trace_digest=trajectory.digest(),
         )
+        # 検証済みの記録と検証済み設定の許容幅から作ったことを、封をした証拠として残す。
+        self._evidence = DynamicsEvidence._issue(
+            DynamicsProvenance.LOGGED_TRAJECTORY,
+            self._identity,
+            _token=_EVIDENCE_ISSUE_TOKEN,
+        )
 
     @property
     def identity(self) -> DynamicsIdentity:
@@ -394,9 +472,9 @@ class LoggedTrajectoryDynamics:
         return self._identity
 
     @property
-    def attestation(self) -> ArtifactAttestation | None:
-        """**常に `None`。** 記録再生は artifact ではない。"""
-        return None
+    def evidence(self) -> DynamicsEvidence | None:
+        """検証済みの記録に裏づけられた証拠。**構築経路だけが発行している。**"""
+        return self._evidence
 
     @property
     def provenances(self) -> frozenset[DynamicsProvenance]:
@@ -475,8 +553,12 @@ class HybridDynamics:
         return self._identity
 
     @property
-    def attestation(self) -> ArtifactAttestation | None:
-        """**常に `None`。** 近似を含む以上、Registry の証拠は名乗れない。"""
+    def evidence(self) -> DynamicsEvidence | None:
+        """**常に `None`。** 近似を含む以上、証拠は名乗れない。
+
+        記録から来た step も、この dynamics の下では昇格の根拠にしない。step ごとに
+        分けて数え直すより、`promotable=False` で閉じるほうが取り違えが起きない。
+        """
         return None
 
     @property
@@ -516,10 +598,11 @@ class AttestedThermalDynamics:
     代わりに、この束は `MpcModelBinding` へ変換できない（制御へ配線する API を持たない）。
     """
 
-    __slots__ = ("_attestation", "_identity", "_model")
+    __slots__ = ("_attestation", "_evidence", "_identity", "_model")
     _model: CounterfactualThermalModel
     _attestation: ArtifactAttestation
     _identity: DynamicsIdentity
+    _evidence: DynamicsEvidence
 
     def __init__(self) -> None:
         raise TypeError("AttestedThermalDynamics は bind からだけ作る")
@@ -572,16 +655,23 @@ class AttestedThermalDynamics:
                 f"model が検証済み artifact と一致しない: {','.join(mismatches)}"
             )
         bound = object.__new__(cls)
+        bound_identity = DynamicsIdentity(
+            provenance=DynamicsProvenance.REGISTRY_ATTESTED,
+            model_id=attestation.model_id,
+            model_version=attestation.version,
+            artifact_sha256=attestation.artifact_sha256,
+        )
         object.__setattr__(bound, "_model", model)
         object.__setattr__(bound, "_attestation", attestation)
+        object.__setattr__(bound, "_identity", bound_identity)
         object.__setattr__(
             bound,
-            "_identity",
-            DynamicsIdentity(
-                provenance=DynamicsProvenance.REGISTRY_ATTESTED,
-                model_id=attestation.model_id,
-                model_version=attestation.version,
-                artifact_sha256=attestation.artifact_sha256,
+            "_evidence",
+            DynamicsEvidence._issue(
+                DynamicsProvenance.REGISTRY_ATTESTED,
+                bound_identity,
+                attestation=attestation,
+                _token=_EVIDENCE_ISSUE_TOKEN,
             ),
         )
         return bound
@@ -597,8 +687,13 @@ class AttestedThermalDynamics:
 
     @property
     def attestation(self) -> ArtifactAttestation:
-        """束ねたときの Registry の証拠。**昇格の判断はこれを見る。**"""
+        """束ねたときの Registry の証拠。"""
         return self._attestation
+
+    @property
+    def evidence(self) -> DynamicsEvidence | None:
+        """Registry の証拠に封をしたもの。**`bind` だけが発行している。**"""
+        return self._evidence
 
     @property
     def provenances(self) -> frozenset[DynamicsProvenance]:
@@ -633,30 +728,41 @@ class AttestedThermalDynamics:
         )
 
 
-def attested_evidence(dynamics: EnvironmentDynamics) -> bool:
-    """この dynamics が**証拠に裏づけられた**遷移を作るかを返す。
+def attested_evidence(dynamics: EnvironmentDynamics) -> DynamicsEvidence | None:
+    """昇格の根拠にできる**封をした証拠**を返す。無ければ `None`。
 
-    `identity.provenance` の文字列だけを見ない。`registry_attested` を名乗る dynamics には
-    `ArtifactAttestation` を要求し、その中身（kind / capability / model ID / 版 / artifact hash）が
-    identity と一致することまで確かめる。`ArtifactAttestation` は Registry の検証経路だけが
-    発行するので、近似 simulator はこれを用意できない（決定記録 0052 §2.1 / 0058 §2.3）。
+    **自称は一切見ない。** `identity.provenance` も `provenances` も、実装が返すただの値で、
+    近似 simulator でも `logged_trajectory` / `registry_attested` を名乗れる。判断するのは
+    `DynamicsEvidence` object の有無と中身だけで、これは `LoggedTrajectoryDynamics` の構築と
+    `AttestedThermalDynamics.bind` しか発行できない（決定記録 0058 §2.3）。
+
+    確かめるのは3つ。
+
+    1. 証拠があること（= この module の検証経路を通ったこと）
+    2. 証拠の identity が、いま dynamics が名乗っている identity と一致すること
+       （借りた証拠を別の identity に付けさせない）
+    3. `registry_attested` なら、`ArtifactAttestation` の kind / capability / model ID / 版 /
+       artifact hash が identity と一致すること
 
     **同一プロセス内の悪意ある偽造までは防げない**（決定記録 0050 §3）。狙いは、裏づけの無い
-    dynamics が「検証済み」を名乗って昇格の根拠へ混ざる**配線の誤り**を止めることである。
+    dynamics が「検証済み」を名乗って昇格の根拠へ混ざる**配線の誤り**を型で止めることである。
     """
-    identity = dynamics.identity
-    attestation = dynamics.attestation
-    if identity.provenance is DynamicsProvenance.LOGGED_TRAJECTORY:
-        # 記録再生は artifact ではない。証拠は記録そのもので、trace digest が identity にある。
-        return attestation is None
-    if identity.provenance is not DynamicsProvenance.REGISTRY_ATTESTED:
-        return False
+    evidence = dynamics.evidence
+    if evidence is None:
+        return None
+    if evidence.identity != dynamics.identity:
+        return None
+    if evidence.provenance is DynamicsProvenance.LOGGED_TRAJECTORY:
+        # 発行経路が閉じているので、ここに来た時点で検証済みの記録から来ている。
+        return evidence if evidence.attestation is None else None
+    attestation = evidence.attestation
     if attestation is None:
-        return False
-    return (
+        return None
+    matches = (
         attestation.kind is ArtifactKind.THERMAL_MODEL
         and attestation.capability is ArtifactCapability.COUNTERFACTUAL_ACTION
-        and attestation.model_id == identity.model_id
-        and attestation.version == identity.model_version
-        and attestation.artifact_sha256 == identity.artifact_sha256
+        and attestation.model_id == evidence.identity.model_id
+        and attestation.version == evidence.identity.model_version
+        and attestation.artifact_sha256 == evidence.identity.artifact_sha256
     )
+    return evidence if matches else None
