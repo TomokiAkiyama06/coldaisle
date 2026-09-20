@@ -268,6 +268,15 @@ class AirBalanceCoordination(_Frozen):
 class AirBalanceModel(Protocol):
     """Fallback / MPC が差し替えて読める Air Balance の契約。"""
 
+    @property
+    def metadata(self) -> AirBalanceMetadata:
+        """再現に必要な出どころ（characterization と設定 hash）。
+
+        任意依存を差し替えたことが offline 評価（#91 / #105）の条件 hash に出るように、
+        契約として公開する。値そのものは推定結果にも載る。
+        """
+        ...
+
     def evaluate(
         self,
         demands: PerZone[Demand],
@@ -310,6 +319,11 @@ class ConfiguredAirBalanceModel:
             flow_unit=config.flow_unit,
             config_sha256=config_sha256,
         )
+
+    @property
+    def metadata(self) -> AirBalanceMetadata:
+        """設定から作った出どころ。条件 hash と推定結果の両方に載る。"""
+        return self._metadata
 
     @classmethod
     def from_file(

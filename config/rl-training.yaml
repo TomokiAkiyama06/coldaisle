@@ -1,0 +1,79 @@
+# RL Supervisor 学習環境の設定（#105 / 決定記録 0058 §2.7）
+#
+# **すべて実測前の暫定値（provisional）。** 確定には基準となる測定が要る。
+# コード側に既定値は無いので、ここを消すと学習環境は動かない（AGENTS.md ルール9）。
+#
+# **ほかの契約が持つ値をここへ写さない**（決定記録 0054 §2.6 と同じ規則）。
+#   - 絶対温度上限・最低安全 demand : config/safety.yaml
+#   - action の許容範囲             : config/fan-policy.yaml の supervisor.output_bounds
+#   - 適用 demand の照合幅          : config/fan-policy.yaml の shadow.applied_demand_tolerance
+#
+# **この設定で回した episode が、そのまま昇格の根拠になるわけではない。**
+# 近似 simulator（下の simulator:）は実測に裏づけられていないため、そこから出た結果は
+# promotable=false になる（決定記録 0058 §2.3 / §3）。
+
+schema_version: 1
+
+episode:
+  # 制御周期の候補。fan-policy.yaml の mpc.optimizer.step_ms と揃える運用を想定するが、
+  # 環境側の刻みは episode の粒度なので別の設定として持つ。
+  step_ms: {value: 10000, status: provisional}
+  max_steps: 60
+  # policy へ渡す過去 snapshot の本数。
+  recent_history_steps: 4
+
+reward:
+  # 版を変えたら必ずここを上げる。episode の結果に残り、条件 hash に入る。
+  version: reward-v1
+  metrics:
+    cpu_temperature: cpu.package
+    gpu_temperature: gpu.0.core
+  # 単位の違う項を無単位へ落とす基準量。
+  scales:
+    temperature_c: {value: 5.0, status: provisional}
+    acoustic_cost: {value: 10.0, status: provisional}
+    demand_change: {value: 0.5, status: provisional}
+  # **安全の項はここに置けない**（決定記録 0058 §2.4）。安全は EpisodeSafety で数える。
+  weights:
+    cpu_temperature: {value: 0.2, status: provisional}
+    gpu_temperature: {value: 1.0, status: provisional}
+    acoustic: {value: 0.2, status: provisional}
+    change: {value: 0.1, status: provisional}
+  # 採点に使う温度帯。**agent の action の target band ではない。**
+  target_band:
+    cpu_temperature: {lower_c: 30.0, upper_c: 75.0}
+    gpu_temperature: {lower_c: 30.0, upper_c: 80.0}
+  discount: {value: 0.99, status: provisional}
+
+# 採点できた step の下限。満たさない episode は比較に使わない（fail closed）。
+coverage:
+  minimum_supported_fraction: {value: 0.9, status: provisional}
+  minimum_steps: {value: 10, status: provisional}
+
+# 環境上で「Critical Safety 違反に相当する」と見なす温度。閾値は safety.yaml から取る。
+# **これは Critical Safety ではない**（決定記録 0058 §2.5）。
+safety_screen:
+  temperature_metrics:
+    - cpu.package
+    - gpu.0.core
+
+# 近似 simulator。**実測に裏づけられていない。**
+# Registry の証拠を持てないので、ここから出た episode は昇格の根拠にできない。
+simulator:
+  model_id: rl-sim-provisional
+  model_version: "0.1.0"
+  responses:
+    - metric: cpu.package
+      ambient_c: {value: 24.0, status: provisional}
+      load_gain_c: {value: 40.0, status: provisional}
+      flow_floor: {value: 0.3, status: provisional}
+      flow_gain: {value: 1.2, status: provisional}
+      time_constant_ms: {value: 30000, status: provisional}
+      noise_sigma_c: {value: 0.0, status: provisional}
+    - metric: gpu.0.core
+      ambient_c: {value: 24.0, status: provisional}
+      load_gain_c: {value: 55.0, status: provisional}
+      flow_floor: {value: 0.3, status: provisional}
+      flow_gain: {value: 1.0, status: provisional}
+      time_constant_ms: {value: 45000, status: provisional}
+      noise_sigma_c: {value: 0.0, status: provisional}

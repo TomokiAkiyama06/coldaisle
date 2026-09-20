@@ -1419,6 +1419,16 @@ class StubAirBalance:
         self._ratio = ratio
         self.calls = 0
 
+    @property
+    def metadata(self) -> AirBalanceMetadata:
+        """任意依存を差し替えたことが条件 hash に出るよう、契約どおり出どころを返す。"""
+        return AirBalanceMetadata(
+            model_id="stub-balance",
+            source=CharacterizationSource(status="uncalibrated", basis="試験用"),
+            flow_unit="relative",
+            config_sha256="e" * 64,
+        )
+
     def evaluate(self, demands: PerZone[Demand], thermal: ThermalInputs) -> AirBalanceEstimate:
         """比と状態だけを持つ最小の評価結果を返す。"""
         del demands, thermal

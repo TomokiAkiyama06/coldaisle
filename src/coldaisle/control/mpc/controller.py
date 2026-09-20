@@ -236,6 +236,10 @@ class LearnedMpcController:
         self._safety = safety
         self._assessor = assessor
         self._monotonic_ms = monotonic_ms
+        # 任意依存を差し替えたことが offline 評価（#91 / #105）の条件へ出るように保持する。
+        self._acoustic = acoustic
+        self._air_balance = air_balance
+        self._balance_band = balance_band
         self._optimizer = LearnedMpcOptimizer(
             binding,
             policy.mpc.optimizer,
@@ -243,6 +247,39 @@ class LearnedMpcController:
             budget_ms=policy.mpc.budget_ms,
             monotonic_ms=monotonic_ms,
         )
+
+    @property
+    def binding(self) -> MpcModelBinding:
+        """この controller が束縛した内部モデル（読み取り専用）。
+
+        offline 評価（#105）が「どの artifact で回したか」を条件へ入れるために読む。
+        束縛は不変で、ここから制御へ配線する経路は増えない。
+        """
+        return self._binding
+
+    def conditions(self) -> dict[str, object]:
+        """条件 hash へ載せる、この controller の**結果に効くすべて**。
+
+        `expected_model_version` だけでは足りない。同じ版を名乗る別の artifact、別の
+        Confidence Profile、別の任意依存（#94 / #81）は、どれも同じ入力から違う提案を作る。
+        """
+        return {
+            "binding": self._binding.attestation.trace_metadata(),
+            "authority_stage": self._binding.authority_stage.value,
+            "confidence_profile_sha256": self._assessor.profile.sha256(),
+            "model_confidence": self._assessor.policy.model_dump(mode="json"),
+            "acoustic": (
+                None if self._acoustic is None else _optional_metadata(self._acoustic.metadata)
+            ),
+            "air_balance": (
+                None
+                if self._air_balance is None
+                else self._air_balance.metadata.model_dump(mode="json")
+            ),
+            "balance_band": (
+                None if self._balance_band is None else self._balance_band.model_dump(mode="json")
+            ),
+        }
 
     @staticmethod
     def _check_binding_covers_authority(
@@ -442,6 +479,11 @@ class LearnedMpcController:
             failure=failure,
             failure_reason=Reason(code=_reason_code(code), detail=detail[:500]),
         )
+
+
+def _optional_metadata(metadata: BaseModel | None) -> dict[str, object] | None:
+    """任意依存の出どころを条件 hash へ載せる形にする。"""
+    return None if metadata is None else metadata.model_dump(mode="json")
 
 
 def _reason_code(name: str) -> str:
