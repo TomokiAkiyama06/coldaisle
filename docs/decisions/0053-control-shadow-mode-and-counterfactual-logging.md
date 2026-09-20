@@ -1,7 +1,7 @@
 # 決定記録 0053: Control Shadow Mode の記録内容と counterfactual の扱い
 
 - **種別**: Decision Record
-- **Status**: Proposed
+- **Status**: FINAL（2026-09-20、リポジトリ所有者が承認）
 - **Date**: 2026-09-20
 - **Supersedes**: なし
 - **関連**: [`0027-fan-control-architecture.md`](0027-fan-control-architecture.md)、
@@ -208,5 +208,6 @@ shadow:
 - RL Supervisor の counterfactual は `SupervisorDecision.shadow` に入る。Demand を伴う RL の
   提案を記録する必要が出たら（#89）、その時点で別の記録を作る
 - 昇格 / 降格の gate 条件（#92）と評価指標のしきい値（#91）はここで決めない
-- **この記録は所有者の承認を必要とする。** 安全系・制御系の設計変更に当たるため、
-  承認されるまで `Proposed` のままにする（AGENTS.md「実装の担当」）
+- 所有者の承認（2026-09-20）で本記録は `FINAL` になった。**§2 の決定が変わるときは、
+  書き換えずに新しい記録を作る**（`docs/decisions/README.md`「追記のみ」）。
+  上の未決事項と provisional な設定値は、確定するまで開いたままである

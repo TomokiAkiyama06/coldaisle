@@ -135,7 +135,7 @@ offset が target horizon にあることは、tick ごとではなく optimizer
 v6からv7へは `mpc.optimizer` を追加してから `schema_version: 7` へ上げる。
 v1〜v6は自動補完せず起動前に拒否する。
 
-#90 のv8で `shadow` を追加する（決定記録 0053。Proposed、所有者承認待ち）。
+#90 のv8で `shadow` を追加する（決定記録 0053。FINAL、2026-09-20 所有者承認）。
 counterfactual を decision trace へ残すかどうかの `enabled`、予測時刻と実測時刻のずれの
 許容幅 `outcome_match_tolerance_ms`、予測した候補 action が「実際に掛かっていた」とみなす
 zone ごとの demand の幅 `applied_demand_tolerance` を `status` / `basis` 付きで明示する。
