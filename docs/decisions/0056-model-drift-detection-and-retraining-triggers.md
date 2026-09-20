@@ -108,6 +108,9 @@
   1つも照合できなければ照合期限（最後の期待時刻 + 許容幅）とする（0050 §2.2 と同じ）
 - 予測の出力が Profile の target schema に無ければ**例外で閉じる**。binding が一致している以上、
   schema が違うのは記録か Profile のどちらかが壊れている
+- **誤差は、記録された予測そのものから数え直す。** 照合結果に書かれた `predicted` / `error` を
+  信じると、出力どうしで予測値を入れ替えるだけで degraded を ok にできる。期待時刻も同じ理由で
+  予測の値と照合する（別の step の実測を「この出力の当たり」にさせない）
 
 ### 2.4 coverage を一級の出力にし、**足りない証拠から「drift 無し」を出さない**
 
@@ -123,6 +126,10 @@
   **一定件数ずつ**の bucket に切って出す。**bucket ごとに自分の件数だけで判定し、
   足りない bucket は比を持たない。** 隣の bucket から証拠を借りない。
   coverage が足りない signal には trend を付けない
+- **構造上限を理由に報告が作れなくなる形にしない**（#90 で見つかった「狭い写し」の型）。
+  理由・出どころの内訳は種類の上限まで並べ、**残りは1つに集約して件数を保つ**。
+  trend の bucket 数が上限を超えるときは bucket を設定値の整数倍へ粗くする（判定の規則は変えない）。
+  metric 名や metric 数の上限は**写し元の契約と同じ値**にし、長い欠測の組み合わせは digest 付きに畳む
 - judgement は `ok` / `warning` / `degraded` / `insufficient_evidence` の4つ。報告全体の judgement は
   **`degraded` > `insufficient_evidence` > `warning` > `ok`** の順で決める。
   drift があると言えるなら言い、言えないなら「言えない」と言う。**`ok` は全 signal が
@@ -160,7 +167,8 @@
 - 報告は canonical JSON（sort_keys・生成時刻なし）で、`sha256()` を持つ。同じ入力からは同じ bytes。
   保存して並べれば residual trend の履歴になる
 - provenance に drift 設定の hash、`shadow_export_schema_version`、参照した
-  `residual_drift_ood_ratio`（runtime の契約）、証拠の期間を残す
+  `residual_drift_ood_ratio`（runtime の契約）、**証拠として見た期間**を残す。
+  期間が報告に無いと、**違う期間を見た2つの報告が同じ bytes を名乗れる**
 
 ### 2.8 設定（`config/drift.yaml`。schema v1）
 

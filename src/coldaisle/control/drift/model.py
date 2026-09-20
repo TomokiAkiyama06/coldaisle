@@ -16,11 +16,19 @@ from typing import Annotated, Literal, Self
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from coldaisle.control.model.thermal import MAX_METRIC_NAME_LENGTH, MAX_TARGET_METRICS
+
 DRIFT_REPORT_SCHEMA_VERSION: Literal[1] = 1
 """報告1つの形の版。**欄の意味を変えたら上げる。**"""
 
 MAX_DRIFT_REASONS = 32
-"""理由の内訳に並べる種類の上限。件数は落とさず、種類だけを構造上限で抑える。"""
+"""理由・出どころの内訳に並べる**種類**の上限。
+
+**件数は落とさない。** 種類がこれを超えたら、残りを1つに集約して数え続ける
+（上限を超えた瞬間に報告が作れなくなる、という形にしない）。
+"""
+MAX_DRIFT_SOURCE_LENGTH = 200
+"""出どころの表示名の上限。**これを超える組み合わせは digest 付きに畳む**（切るだけにしない）。"""
 MAX_DRIFT_TREND_BUCKETS = 4_096
 MAX_DECLARED_CHANGES = 64
 MAX_DRIFT_TRIGGERS = 32
@@ -49,7 +57,7 @@ class DriftSourceCount(_Frozen):
     """逸脱の出どころごとの件数。出どころは metric 名や欠測の組み合わせなので、
     `DriftReasonCount` の識別子より広い形を許す。"""
 
-    source: str = Field(min_length=1, max_length=200)
+    source: str = Field(min_length=1, max_length=MAX_DRIFT_SOURCE_LENGTH)
     count: int = Field(ge=1)
 
 
@@ -141,8 +149,14 @@ class DriftCoverage(_Frozen):
     unmatched_reasons: tuple[DriftReasonCount, ...] = Field(
         default=(), max_length=MAX_DRIFT_REASONS
     )
-    predicted_metrics: tuple[str, ...] = Field(default=(), max_length=MAX_DRIFT_REASONS)
-    unscored_metrics: tuple[str, ...] = Field(default=(), max_length=MAX_DRIFT_REASONS)
+    predicted_metrics: tuple[str, ...] = Field(default=(), max_length=MAX_TARGET_METRICS)
+    """予測に現れた metric。
+
+    **写し元と同じ上限にする。** 束縛できた予測の出力は Profile の target schema の中に
+    あることを検知器が確かめるので（0056 §2.3）、種類は `MAX_TARGET_METRICS` を超えない。
+    ここだけ狭いと、正しい記録から報告を作れない tick が生まれる（#90 で見つかった型）。
+    """
+    unscored_metrics: tuple[str, ...] = Field(default=(), max_length=MAX_TARGET_METRICS)
     """**一度も比に数えられなかった** metric。
 
     残りの metric だけで「悪化していない」と言えてしまうので、1つでもあれば
@@ -206,7 +220,8 @@ class ResidualTrendBucket(_Frozen):
 class MetricResidual(_Frozen):
     """metric ごとの正規化 residual（Profile の validation RMS を 1.0 とした比）。"""
 
-    metric: str = Field(min_length=1, max_length=120)
+    metric: str = Field(min_length=1, max_length=MAX_METRIC_NAME_LENGTH)
+    """**写し元と同じ上限にする**（`ThermalMetricName`）。狭いと正しい metric を書けない。"""
     counted_outputs: int = Field(ge=1)
     ratio: float = Field(ge=0.0, allow_inf_nan=False)
 
@@ -227,6 +242,13 @@ class ResidualDriftSignal(_Frozen):
     degraded_ratio: float = Field(gt=1.0, allow_inf_nan=False)
     per_metric: tuple[MetricResidual, ...] = ()
     trend: tuple[ResidualTrendBucket, ...] = Field(default=(), max_length=MAX_DRIFT_TREND_BUCKETS)
+    trend_bucket_outcomes: int | None = Field(default=None, gt=0)
+    """trend を切った実際の bucket の大きさ。
+
+    証拠が多すぎて構造上限（`MAX_DRIFT_TREND_BUCKETS`）を超えるときは、設定値の**整数倍**へ
+    粗くする。**報告が作れなくなる形にしない。** 粗くしても bucket は自分の件数だけで
+    判定するので、隣から証拠を借りることにはならない（0056 §2.4）。
+    """
     first_evidence_ts_ms: int | None = Field(default=None, ge=0)
     last_evidence_ts_ms: int | None = Field(default=None, ge=0)
 
@@ -237,6 +259,8 @@ class ResidualDriftSignal(_Frozen):
             raise ValueError("比の有無と coverage の充足を一致させる")
         if (self.ratio is None) != (self.verdict is DriftVerdict.INSUFFICIENT_EVIDENCE):
             raise ValueError("比の無い residual signal は insufficient_evidence にする")
+        if (self.trend_bucket_outcomes is None) != (not self.trend):
+            raise ValueError("trend がある signal には bucket の大きさを付ける")
         if self.ratio is None and (self.trend or self.per_metric):
             # trend も metric 別も、伏せた比と同じ証拠から出る。
             raise ValueError("比を出さない residual signal に trend / metric 別を付けない")
@@ -372,8 +396,30 @@ class DriftProvenance(_Frozen):
     min_support_count: int = Field(gt=0)
     min_missing_pattern_count: int = Field(gt=0)
     shadow_rows: int = Field(ge=0)
+    window_start_ms: int | None = Field(default=None, ge=0)
+    window_end_ms: int | None = Field(default=None, ge=0)
+    """**証拠として見た期間**（0056 §2.7）。呼び出し側が期間を宣言したときだけ入る。
+
+    これが無いと、**違う期間を見た2つの報告が同じ bytes を名乗れる**（同じ証拠しか
+    入っていなければ、どこを見たのかが報告から消える）。
+    """
     evidence_sha256: Sha256Hex
-    """数えた証拠そのものの digest。**同じ証拠なら同じ値**になる。"""
+    """数えた証拠そのものの digest。**同じ証拠なら同じ値**になる。
+
+    宣言された変更は**1つに畳んでから**数えるので、同じ宣言を2度渡しても値は変わらない。
+    """
+
+    @model_validator(mode="after")
+    def _window_is_ordered(self) -> Self:
+        if (self.window_start_ms is None) != (self.window_end_ms is None):
+            raise ValueError("証拠の期間は両端を揃えて記録する")
+        if (
+            self.window_start_ms is not None
+            and self.window_end_ms is not None
+            and self.window_end_ms <= self.window_start_ms
+        ):
+            raise ValueError("証拠の期間は start < end にする")
+        return self
 
 
 class DriftTarget(_Frozen):

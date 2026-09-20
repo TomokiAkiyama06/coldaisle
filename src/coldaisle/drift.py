@@ -298,7 +298,15 @@ def main(argv: list[str] | None = None) -> int:
             end_ms=manifest.end_ms,
         )
     )
-    report = detector.detect(DriftEvidence(shadow=shadow, inputs=inputs, changes=manifest.changes))
+    report = detector.detect(
+        DriftEvidence(
+            shadow=shadow,
+            inputs=inputs,
+            changes=manifest.changes,
+            window_start_ms=manifest.start_ms,
+            window_end_ms=manifest.end_ms,
+        )
+    )
     path = write(report, args.out)
     LOGGER.info(
         "Model drift の報告を書き出した",

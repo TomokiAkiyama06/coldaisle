@@ -27,6 +27,9 @@ from dataclasses import dataclass, field
 
 from coldaisle.control.drift.config import DriftConfig
 from coldaisle.control.drift.model import (
+    MAX_DECLARED_CHANGES,
+    MAX_DRIFT_REASONS,
+    MAX_DRIFT_SOURCE_LENGTH,
     MAX_DRIFT_TREND_BUCKETS,
     ChangeKind,
     DeclaredChange,
@@ -74,6 +77,13 @@ class DriftEvidence:
     """入力分布を見るための直近の推論入力（#83 Dataset の example から起こす）。"""
     changes: tuple[DeclaredChange, ...] = ()
     """宣言された構成変更。**この時刻より前の証拠は数えない**（0056 §2.5）。"""
+    window_start_ms: int | None = None
+    window_end_ms: int | None = None
+    """**証拠として見た期間**（0056 §2.7）。呼び出し側が期間を絞ったなら宣言する。
+
+    これを報告に残さないと、**違う期間を見た2つの報告が同じ bytes を名乗れる**。
+    証拠そのものの絞り込みは呼び出し側が行う（この型は宣言を受け取るだけ）。
+    """
 
 
 @dataclass
@@ -145,6 +155,14 @@ class DriftDetector:
         changes = tuple(
             sorted(set(evidence.changes), key=lambda item: (item.ts_ms, item.kind.value))
         )
+        if len(changes) > MAX_DECLARED_CHANGES:
+            # 報告の型で落とすと理由が分からない。入力の問題として、ここで閉じる。
+            raise DriftInputError(
+                f"宣言された構成変更の数が構造上限を超えた（{len(changes)} > "
+                f"{MAX_DECLARED_CHANGES}）。期間を区切って判定する"
+            )
+        if (evidence.window_start_ms is None) != (evidence.window_end_ms is None):
+            raise DriftInputError("証拠の期間は両端を揃えて宣言する")
         cutoff_ms = max((change.ts_ms for change in changes), default=None)
         tally = self._tally_residual(evidence.shadow, cutoff_ms)
         residual = self._residual_signal(tally)
@@ -173,7 +191,9 @@ class DriftDetector:
                 min_support_count=self._policy.min_support_count.value,
                 min_missing_pattern_count=self._policy.min_missing_pattern_count.value,
                 shadow_rows=len(evidence.shadow),
-                evidence_sha256=_evidence_sha256(evidence),
+                window_start_ms=evidence.window_start_ms,
+                window_end_ms=evidence.window_end_ms,
+                evidence_sha256=_evidence_sha256(evidence, changes),
             ),
         )
 
@@ -241,18 +261,22 @@ class DriftDetector:
             # 別のモデルの区間を、この Production artifact の実績に数えない。
             tally.foreign_model += 1
             return
-        _check_observation_times(outcome)
-        evidence_ts_ms = _evidence_time(outcome)
-        if cutoff_ms is not None and evidence_ts_ms <= cutoff_ms:
-            tally.excluded_by_change += 1
-            return
-
-        # **出力の集合は予測から取る。** `outcome.matches` に現れた出力だけを見ると、
-        # 記録から出力を落とすだけで「全出力が揃った forecast」に仕立てられる
-        # （`ShadowOutcome.complete` は残っている match の中だけを見る）。
-        expected = {
-            (target.offset_ms, metric) for target in prediction.targets for metric in target.values
+        # **出力の集合と、各出力の期待時刻・予測値は予測から取る。**
+        # `outcome.matches` に現れた出力だけを見ると、記録から出力を落とすだけで
+        # 「全出力が揃った forecast」に仕立てられる（`ShadowOutcome.complete` は残っている
+        # match の中だけを見る）。予測値と期待時刻を記録側の値で信じると、**出力どうしで
+        # 入れ替えるだけで**外れた予測を当たりに変えられる。
+        predicted_by_key = {
+            (target.offset_ms, metric): (target.expected_ts_ms, value)
+            for target in prediction.targets
+            for metric, value in target.values.items()
         }
+        unknown = sorted(key for key in predicted_by_key if key not in self._scales)
+        if unknown:
+            # binding が一致しているのに出力が Profile の target schema に無い。
+            # 記録か Profile のどちらかが壊れている。**採点するより前に閉じる。**
+            raise DriftInputError(f"予測の出力が Profile の target schema に無い: {unknown}")
+        expected = set(predicted_by_key)
         actual = {(match.offset_ms, match.metric) for match in outcome.matches}
         if len(actual) != len(outcome.matches):
             # 同じ出力を2度置けば、その誤差を2回数えられる。
@@ -263,6 +287,20 @@ class DriftDetector:
             # 予測に無い出力は、記録が別の推論を抱えている証拠である。
             raise DriftInputError(f"予測に無い出力の照合結果がある: {sorted(actual - expected)}")
         missing = expected - actual
+
+        for match in outcome.matches:
+            expected_ts_ms, _value = predicted_by_key[(match.offset_ms, match.metric)]
+            if match.expected_ts_ms != expected_ts_ms:
+                raise DriftInputError(
+                    f"照合結果の期待時刻が予測と違う: offset_ms={match.offset_ms}; "
+                    f"metric={match.metric}; 記録={match.expected_ts_ms}; 予測={expected_ts_ms}"
+                )
+        # **束縛を確かめてから**時刻を見る。壊れた記録は、期間の外でも入力の誤りである。
+        _check_observation_times(outcome)
+        evidence_ts_ms = _evidence_time(outcome)
+        if cutoff_ms is not None and evidence_ts_ms <= cutoff_ms:
+            tally.excluded_by_change += 1
+            return
 
         tally.outcomes += 1
         tally.outputs += len(expected)
@@ -289,16 +327,13 @@ class DriftDetector:
             return
         squared: list[float] = []
         for match in outcome.matches:
-            scale = self._scales.get((match.offset_ms, match.metric))
-            if scale is None:
-                # binding が一致しているのに出力が Profile の target schema に無い。
-                # 記録か Profile のどちらかが壊れている。
-                raise DriftInputError(
-                    f"予測の出力が Profile の target schema に無い: "
-                    f"offset_ms={match.offset_ms}; metric={match.metric}"
-                )
-            assert match.error is not None  # scored かつ complete
-            normalized = (match.error / scale) ** 2
+            key = (match.offset_ms, match.metric)
+            scale = self._scales[key]
+            _expected_ts_ms, predicted_value = predicted_by_key[key]
+            assert match.observed is not None  # scored かつ complete
+            # **誤差は記録された予測値から数え直す。** 記録の `error` / `predicted` を
+            # そのまま使うと、出力どうしで予測値を入れ替えるだけで誤差を小さくできる。
+            normalized = ((match.observed - predicted_value) / scale) ** 2
             squared.append(normalized)
             tally.counted_metrics.setdefault(match.metric, []).append(normalized)
         tally.counted.append(
@@ -352,6 +387,7 @@ class DriftDetector:
             )
         ordered = sorted(tally.counted, key=lambda item: (item.evidence_ts_ms, item.inference_id))
         ratio = math.sqrt(math.fsum(item.mean_squared for item in ordered) / len(ordered))
+        trend, bucket_size = self._trend(ordered)
         return ResidualDriftSignal(
             verdict=_verdict_for(ratio, warning_ratio, degraded_ratio),
             coverage=coverage,
@@ -366,26 +402,31 @@ class DriftDetector:
                 )
                 for metric, values in sorted(tally.counted_metrics.items())
             ),
-            trend=self._trend(ordered),
+            trend=trend,
+            trend_bucket_outcomes=None if not trend else bucket_size,
             first_evidence_ts_ms=ordered[0].evidence_ts_ms,
             last_evidence_ts_ms=ordered[-1].evidence_ts_ms,
         )
 
-    def _trend(self, ordered: Sequence[_ResidualOutcome]) -> tuple[ResidualTrendBucket, ...]:
-        """証拠時刻順に一定件数ずつ切った residual の推移。
+    def _trend(
+        self, ordered: Sequence[_ResidualOutcome]
+    ) -> tuple[tuple[ResidualTrendBucket, ...], int]:
+        """証拠時刻順に一定件数ずつ切った residual の推移と、使った bucket の大きさ。
 
         **bucket は自分の件数だけで判定する。** 足りない bucket は比を持たない。
         隣から借りると、「証拠は薄い区間から、指標は厚い区間から」になる（0056 §2.4）。
+
+        証拠が多くて bucket 数が構造上限を超えるときは、**設定値の整数倍へ粗くする**。
+        上限を理由に報告そのものを作れなくしない（正しい入力で落ちる形にしない）。
+        粗くしても判定の規則は変わらない。
         """
         gate = self._config.residual
         size = gate.trend_bucket_outcomes.value
         minimum = gate.minimum_bucket_outcomes.value
+        if len(ordered) > size * MAX_DRIFT_TREND_BUCKETS:
+            multiple = -(-len(ordered) // (size * MAX_DRIFT_TREND_BUCKETS))
+            size *= multiple
         chunks = [ordered[start : start + size] for start in range(0, len(ordered), size)]
-        if len(chunks) > MAX_DRIFT_TREND_BUCKETS:
-            raise DriftInputError(
-                f"residual trend の bucket 数が構造上限を超えた（{len(chunks)} > "
-                f"{MAX_DRIFT_TREND_BUCKETS}）。期間を区切って判定する"
-            )
         buckets: list[ResidualTrendBucket] = []
         for index, chunk in enumerate(chunks):
             enough = len(chunk) >= minimum
@@ -410,7 +451,7 @@ class DriftDetector:
                     ),
                 )
             )
-        return tuple(buckets)
+        return tuple(buckets), size
 
     # ------------------------------------------------------------ input distribution
 
@@ -471,7 +512,7 @@ class DriftDetector:
                 affected[DriftSignalKind.MISSING_PATTERN] += 1
                 _bump(
                     sources[DriftSignalKind.MISSING_PATTERN],
-                    ",".join(coverage.missing_pattern) or "-",
+                    _pattern_name(coverage.missing_pattern),
                 )
         minimum = self._config.minimum_inputs.value
         gates = {
@@ -644,13 +685,32 @@ def _bump(counts: dict[str, int], key: str) -> None:
     counts[key] = counts.get(key, 0) + 1
 
 
+def _capped(counts: Mapping[str, int], *, other: str) -> tuple[tuple[str, int], ...]:
+    """内訳を構造上限まで並べ、残りを1つに集約する。
+
+    **件数は落とさない。** 種類が上限を超えた瞬間に報告が作れなくなる、という形にしない
+    （写した上限より入力のほうが広くなりうる。#90 で見つかった型）。
+    多い順に残し、同数は名前順にするので、同じ入力からは同じ並びになる。
+    """
+    items = sorted(counts.items(), key=lambda item: (-item[1], item[0]))
+    if len(items) <= MAX_DRIFT_REASONS:
+        return tuple(sorted(items))
+    kept = sorted(items[: MAX_DRIFT_REASONS - 1])
+    rest = items[MAX_DRIFT_REASONS - 1 :]
+    return (*kept, (other, sum(count for _name, count in rest)))
+
+
 def _counted_reasons(counts: Mapping[str, int]) -> tuple[DriftReasonCount, ...]:
-    return tuple(DriftReasonCount(code=code, count=count) for code, count in sorted(counts.items()))
+    return tuple(
+        DriftReasonCount(code=code, count=count)
+        for code, count in _capped(counts, other="other_reasons")
+    )
 
 
 def _source_counts(counts: Mapping[str, int]) -> tuple[DriftSourceCount, ...]:
     return tuple(
-        DriftSourceCount(source=source, count=count) for source, count in sorted(counts.items())
+        DriftSourceCount(source=source, count=count)
+        for source, count in _capped(counts, other="other_sources")
     )
 
 
@@ -658,13 +718,33 @@ def _cell_name(bins: Iterable[int]) -> str:
     return "cell:" + ",".join(str(index) for index in bins)
 
 
-def _evidence_sha256(evidence: DriftEvidence) -> str:
-    """数えた証拠そのものの digest。**同じ証拠なら同じ値**になる。"""
+def _pattern_name(pattern: tuple[str, ...]) -> str:
+    """欠測の組み合わせの表示名。**長い組み合わせでも上限に収まる形にする。**
+
+    metric 名は1つで最大 120 文字あるので、2つ並べるだけで表示名の上限を超えうる。
+    切るだけにすると別の組み合わせが同じ名前になるので、収まらないときは**件数と
+    digest** を付けて一意にする（`ThermalFeatureSchema` が許すどの組み合わせも書ける）。
+    """
+    joined = ",".join(pattern) or "-"
+    if len(joined) <= MAX_DRIFT_SOURCE_LENGTH:
+        return joined
+    digest = hashlib.sha256(joined.encode("utf-8")).hexdigest()[:16]
+    suffix = f"…+{len(pattern)}:{digest}"
+    return joined[: MAX_DRIFT_SOURCE_LENGTH - len(suffix)] + suffix
+
+
+def _evidence_sha256(evidence: DriftEvidence, changes: Sequence[DeclaredChange]) -> str:
+    """数えた証拠そのものの digest。**同じ証拠なら同じ値**になる。
+
+    宣言された変更は**畳んで並べ直したもの**を数える。渡された順や重複で digest が
+    変わると、同じ証拠の報告が違う条件を名乗ることになる。
+    """
     payload = json.dumps(
         {
             "shadow": [row.model_dump(mode="json") for row in evidence.shadow],
             "inputs": [observed.model_dump(mode="json") for observed in evidence.inputs],
-            "changes": [change.model_dump(mode="json") for change in evidence.changes],
+            "changes": [change.model_dump(mode="json") for change in changes],
+            "window": [evidence.window_start_ms, evidence.window_end_ms],
         },
         ensure_ascii=False,
         allow_nan=False,

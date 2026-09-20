@@ -1101,3 +1101,157 @@ def test_cli_refuses_a_shadow_export_that_does_not_match_the_recomputation(train
     old = rows(profile, 2, ratio=1.0, start=0)
     with pytest.raises(ValueError, match="期間の外"):
         _check_supplied_shadow((*old, *computed), computed, manifest)
+
+
+# ---------------------------------------------------------------- 12. 記録された予測に束ねる
+
+
+def test_recorded_prediction_values_cannot_be_rewritten_into_a_better_score(trained) -> None:
+    """**誤差は記録された予測値から数え直す**（0056 §2.3）。
+
+    記録の `predicted` / `error` をそのまま信じると、出力どうしで予測値を入れ替えたり
+    「当たった」ことにしたりするだけで、degraded な residual を ok に変えられる。
+    """
+    _data, _parts, _model, profile = trained
+    honest = rows(profile, 6, ratio=2.5)
+    # 照合結果の側だけ「予測は完璧だった」と書き換える（型の検査は通る）。
+    polished = tuple(
+        item.model_copy(
+            update={
+                "outcomes": (
+                    item.outcomes[0].model_copy(
+                        update={
+                            "matches": tuple(
+                                match.model_copy(update={"predicted": match.observed, "error": 0.0})
+                                for match in item.outcomes[0].matches
+                            )
+                        }
+                    ),
+                )
+            }
+        )
+        for item in honest
+    )
+    report = detector(profile).detect(DriftEvidence(shadow=polished))
+
+    assert report.residual.ratio == pytest.approx(2.5)
+    assert report.residual.verdict is DriftVerdict.DEGRADED
+
+
+def test_recorded_expected_times_must_match_the_prediction(trained) -> None:
+    """期待時刻を書き換えて、別の step の実測を「この出力の当たり」にさせない。"""
+    _data, _parts, _model, profile = trained
+    source = row(profile, 0)
+    moved = source.outcomes[0].matches[2].expected_ts_ms
+    with pytest.raises(DriftInputError, match="期待時刻が予測と違う"):
+        detector(profile).detect(
+            DriftEvidence(shadow=(rewrite_first_match(source, expected_ts_ms=moved),))
+        )
+
+
+# ---------------------------------------------------------------- 13. 条件が digest を覆う
+
+
+def test_repeated_declarations_do_not_change_the_report(trained) -> None:
+    """同じ宣言を2度渡しても、報告の bytes は変わらない（0054 §2.6 と同じ扱い）。"""
+    _data, _parts, _model, profile = trained
+    change = DeclaredChange(kind=ChangeKind.FAN_REPLACED, ts_ms=BASE_TS_MS, detail="交換")
+    shadow = rows(profile, 6, ratio=1.0, start=1)
+    once = detector(profile).detect(DriftEvidence(shadow=shadow, changes=(change,)))
+    twice = detector(profile).detect(DriftEvidence(shadow=shadow, changes=(change, change)))
+
+    assert once.canonical_bytes() == twice.canonical_bytes()
+    assert once.provenance.evidence_sha256 == twice.provenance.evidence_sha256
+    assert once.declared_changes == (change,)
+
+
+def test_the_declared_window_is_part_of_the_report(trained) -> None:
+    """**違う期間を見た報告が同じ bytes を名乗れない**（0056 §2.7）。"""
+    _data, _parts, _model, profile = trained
+    shadow = rows(profile, 6, ratio=1.0)
+    narrow = detector(profile).detect(
+        DriftEvidence(shadow=shadow, window_start_ms=BASE_TS_MS, window_end_ms=BASE_TS_MS + 1)
+    )
+    wide = detector(profile).detect(
+        DriftEvidence(shadow=shadow, window_start_ms=BASE_TS_MS, window_end_ms=BASE_TS_MS + 2)
+    )
+
+    assert narrow.provenance.window_end_ms == BASE_TS_MS + 1
+    assert narrow.canonical_bytes() != wide.canonical_bytes()
+    assert narrow.provenance.evidence_sha256 != wide.provenance.evidence_sha256
+    with pytest.raises(DriftInputError, match="両端"):
+        detector(profile).detect(DriftEvidence(shadow=shadow, window_start_ms=BASE_TS_MS))
+
+
+# ---------------------------------------------------------------- 14. 写した上限で報告を落とさない
+
+
+def test_a_wide_breakdown_is_capped_without_losing_the_count() -> None:
+    """**種類が構造上限を超えても報告を作る**（#90 で見つかった「狭い写し」の型）。
+
+    上限で例外にすると、正しい入力から報告が作れない組み合わせが生まれる。
+    """
+    from coldaisle.control.drift.detector import _counted_reasons, _source_counts
+    from coldaisle.control.drift.model import MAX_DRIFT_REASONS
+
+    counts = {f"source_{index:03d}": index + 1 for index in range(100)}
+    sources = _source_counts(counts)
+    assert len(sources) == MAX_DRIFT_REASONS
+    assert sources[-1].source == "other_sources"
+    assert sum(item.count for item in sources) == sum(counts.values())
+
+    reasons = _counted_reasons(counts)
+    assert len(reasons) == MAX_DRIFT_REASONS
+    assert reasons[-1].code == "other_reasons"
+    assert sum(item.count for item in reasons) == sum(counts.values())
+
+
+def test_a_long_missing_pattern_still_fits_in_the_report() -> None:
+    """metric 名は1つで 120 文字あるので、2つ並べるだけで表示名の上限を超える。"""
+    from coldaisle.control.drift.detector import _pattern_name
+    from coldaisle.control.drift.model import MAX_DRIFT_SOURCE_LENGTH, DriftSourceCount
+
+    long_names = tuple(f"{'a' * 110}.{index:03d}" for index in range(4))
+    name = _pattern_name(long_names)
+    assert len(name) <= MAX_DRIFT_SOURCE_LENGTH
+    assert DriftSourceCount(source=name, count=1).source == name
+    # **切るだけにしない。** 別の組み合わせが同じ名前にならない。
+    assert name != _pattern_name((*long_names[:3], f"{'a' * 110}.999"))
+    assert _pattern_name(()) == "-"
+
+
+def test_a_very_long_trend_is_coarsened_instead_of_failing(trained) -> None:
+    """証拠が多くても報告は作れる。**bucket を粗くするだけ**で、判定の規則は変えない。"""
+    from coldaisle.control.drift.detector import _ResidualOutcome
+    from coldaisle.control.drift.model import MAX_DRIFT_TREND_BUCKETS
+
+    _data, _parts, _model, profile = trained
+    judge = detector(profile)
+    size = drift_config().residual.trend_bucket_outcomes.value
+    many = [
+        _ResidualOutcome(
+            evidence_ts_ms=BASE_TS_MS + index,
+            inference_id=f"{index:064x}",
+            mean_squared=1.0,
+            outputs=1,
+        )
+        for index in range(size * MAX_DRIFT_TREND_BUCKETS + 1)
+    ]
+    buckets, bucket_size = judge._trend(many)
+
+    assert len(buckets) <= MAX_DRIFT_TREND_BUCKETS
+    assert bucket_size % size == 0 and bucket_size > size
+    assert sum(bucket.outcomes for bucket in buckets) == len(many)
+
+
+def test_declaring_too_many_changes_is_an_input_error(trained) -> None:
+    """報告の型で落とすと理由が分からない。入力の問題として閉じる。"""
+    from coldaisle.control.drift.model import MAX_DECLARED_CHANGES
+
+    _data, _parts, _model, profile = trained
+    changes = tuple(
+        DeclaredChange(kind=ChangeKind.SENSOR_REPLACED, ts_ms=BASE_TS_MS + index)
+        for index in range(MAX_DECLARED_CHANGES + 1)
+    )
+    with pytest.raises(DriftInputError, match="構造上限"):
+        detector(profile).detect(DriftEvidence(changes=changes))
