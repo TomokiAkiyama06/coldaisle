@@ -393,10 +393,9 @@ class ControllerGate:
                 FallbackCause.MODEL_VERSION_MISMATCH,
                 f"expected={self._expected_model_version}; actual={proposal.model_version}",
             )
-        unattested = self._attestation_failure(proposal, learned.assessment)
+        assessment, unattested = self._attested_assessment(proposal, learned.assessment)
         if unattested is not None:
             return self._reason(FallbackCause.CONFIDENCE_UNATTESTED, unattested)
-        assessment = learned.assessment
         assert assessment is not None
         # 自称値の照合を先に行う。ここを後に回すと、assessment が OOD でないのに提案だけが
         # OOD を名乗った tick を「OOD」として記録し、trace の理由と判定が食い違う。
@@ -424,24 +423,26 @@ class ControllerGate:
         return None
 
     @staticmethod
-    def _attestation_failure(
+    def _attested_assessment(
         proposal: ControllerProposal, assessment: ConfidenceAssessment | None
-    ) -> str | None:
-        """提案がこの推論の検証済み assessment に裏付けられていなければ理由を返す。
+    ) -> tuple[ConfidenceAssessment | None, str | None]:
+        """この推論に束縛できた **検証し直した** assessment と、できなかった理由を返す。
 
-        提案の ``confidence`` / ``ood`` は誰でも書ける値なので、それだけで authority を与えない。
+        提案の ``confidence`` / ``ood`` は誰でも書ける値なので、それだけで authority を
+        与えない。**trace へ写す値（confidence / ood / artifact の hash）も、渡された
+        object ではなくここで返した検証済みの assessment から取る**（#159）。
+        `model_copy(update=...)` は検証を通らないため、Gate でも検証し直す。
         """
         if assessment is None:
-            return "assessment is missing"
-        # model_copy(update=...) は検証を通らないため、Gate でも検証し直す。
+            return None, "assessment is missing"
         verified = ConfidenceAssessment.model_validate(assessment.model_dump(mode="python"))
         if verified.artifact_verification is not ArtifactVerification.REGISTRY_VERIFIED:
-            return "assessment is not registry verified"
+            return None, "assessment is not registry verified"
         if verified.inference_id != proposal.inference_id:
-            return "assessment is for another inference"
+            return None, "assessment is for another inference"
         if verified.model_version != proposal.model_version:
-            return "assessment is for another model version"
-        return None
+            return None, "assessment is for another model version"
+        return verified, None
 
     def _required_confidence(self, stage: AuthorityStage) -> float:
         thresholds = self._policy.gate_min_confidence
@@ -588,8 +589,9 @@ class ControllerGate:
         assert proposal.model_version is not None
         assert proposal.inference_id is not None
         learned_selected = selected.controller is ControllerKind.LEARNED_MPC
-        assessment = learned.assessment
-        if assessment is None or self._attestation_failure(proposal, assessment) is not None:
+        # **trace へ写す値は、検証し直した assessment からだけ取る**（#85 / #159）。
+        assessment, _ = self._attested_assessment(proposal, learned.assessment)
+        if assessment is None:
             # 提案が自称した confidence / ood は残さない。評価と stage の判断が誤読するため。
             return ModelGateDecision(
                 model_version=proposal.model_version,
@@ -616,6 +618,9 @@ class ControllerGate:
         return ModelGateDecision(
             model_version=proposal.model_version,
             inference_id=proposal.inference_id,
+            # **束縛できた推論の artifact をそのまま残す**（#159 / 決定記録 0059）。
+            # 提案は artifact の欄を持たないので、自称値が入り込む経路は無い。
+            artifact_sha256=assessment.artifact_sha256,
             attested=True,
             confidence=assessment.confidence,
             ood=assessment.ood,

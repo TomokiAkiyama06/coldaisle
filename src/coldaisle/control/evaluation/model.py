@@ -349,11 +349,24 @@ class AppliedArmReport(_Frozen):
 
     裏づけのある提案が1つも無ければ `None`。**0054 の帰属規則は変えない。**
     記録から言える事実を1つ増やしただけで、どの実測をどの arm に帰属させるかは同じ。
+    """
+    model_artifacts: tuple[Sha256Hex, ...] = ()
+    """この arm で**裏づけのある提案を実際に適用した** tick の model artifact（#159）。
 
-    **この欄は artifact へ束縛できない。** `ModelGateDecision` は artifact の hash を持たず、
-    適用 arm の鍵にも model の identity が入らないので、「どの artifact の実績か」は
-    記録から言えない。Authority Rollout（#92）は適用側の arm を昇格の根拠にしない
-    （決定記録 0057 §2.4 / §5）。
+    出どころは `ControlTick.applied_model_artifact`、すなわち decision trace の
+    `model_gate.artifact_sha256` だけである（決定記録 0059）。走らせた側の自己申告や
+    設定の宣言は入れない。**昇格（#92）は、この集合がいま Production の artifact
+    ちょうど1つであることを求める。**
+
+    裏づけのある提案を1度も適用していない arm（Fallback の arm など）では空。
+    """
+    unbound_attested_ticks: int = Field(default=0, ge=0)
+    """裏づけのある提案を適用したのに、**artifact を言えなかった** tick の数（#159）。
+
+    artifact の欄を持たない保存済みの v1〜v6 の trace がこれに当たる。
+    「artifact 不明」を「記録が無いだけ」に見せないために、数えられる形で分けて持つ。
+    **1件でもあれば、この arm の artifact 束縛は完全ではない。**
+    #92 は 0 でなければ昇格の根拠にしない（部分的な証拠を完全として扱わない）。
     """
     gaps: tuple[CountedReason, ...] = ()
     """出せなかった指標と、その理由。**欄を埋め合わせない。**"""
@@ -370,6 +383,18 @@ class AppliedArmReport(_Frozen):
             self.first_ts_ms <= self.last_attested_ts_ms <= self.last_ts_ms
         ):
             raise ValueError("裏づけのある提案の時刻を arm の区間の外に置かない")
+        if len(set(self.model_artifacts)) != len(self.model_artifacts):
+            raise ValueError("適用した artifact を重複させない")
+        if tuple(sorted(self.model_artifacts)) != self.model_artifacts:
+            # 同じ入力から同じ bytes を出すため（0054 §2.7）。
+            raise ValueError("適用した artifact は昇順に並べる")
+        bound = bool(self.model_artifacts) or self.unbound_attested_ticks > 0
+        if bound and self.arm.controller is not ControllerKind.LEARNED_MPC:
+            # artifact を持つ提案を出せるのは Learned MPC だけ（0028 §2.5 (c)）。
+            raise ValueError("Learned MPC 以外の適用 arm に model artifact を付けない")
+        if bound and self.last_attested_ts_ms is None:
+            # 裏づけのある提案が1つも無い arm に、その提案の artifact は存在しない。
+            raise ValueError("裏づけの無い適用 arm に model artifact を付けない")
         return self
 
 
@@ -582,6 +607,13 @@ class ObservedVersions(_Frozen):
     """`<policy>:<version>`。"""
     model_versions: tuple[str, ...] = ()
     model_artifacts: tuple[Sha256Hex, ...] = ()
+    """入力に現れた model artifact。
+
+    **counterfactual（`ShadowCounterfactual.artifact_sha256`）と適用側
+    （`ControlTick.model_gate.artifact_sha256`）の両方から集める**（#159 / 決定記録 0059）。
+    適用側を集めないと、「artifact B の適用実績 + artifact A の counterfactual」という
+    報告が `{A}` の照合を素通りする（決定記録 0057 §3）。
+    """
     authority_stages: tuple[str, ...] = ()
     operating_modes: tuple[str, ...] = ()
 
@@ -710,6 +742,18 @@ class EvaluationReport(_Frozen):
         keys = tuple(gate.arm_key for gate in self.gates)
         if len(set(keys)) != len(keys):
             raise ValueError("同じ arm の gate 結果を2つ入れない")
+        observed = set(self.provenance.versions.model_artifacts)
+        for segment in self.segments:
+            for group in segment.groups:
+                for applied in group.applied:
+                    if not set(applied.model_artifacts) <= observed:
+                        # run が一度も見ていない artifact を arm の実績に書けない。
+                        # 書けると、報告全体の照合（#92）を通る artifact を arm 側にだけ
+                        # 足して、別の artifact の実績を昇格の根拠にできる。
+                        raise ValueError(
+                            "run に現れていない model artifact を適用 arm に書けない"
+                            f"（arm={applied.arm_key}）"
+                        )
         return self
 
 

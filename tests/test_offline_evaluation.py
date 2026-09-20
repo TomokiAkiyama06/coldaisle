@@ -60,6 +60,7 @@ from coldaisle.control.evaluation.stats import MetricSummary, shape_of, summariz
 from coldaisle.control.schema import (
     MAX_SHADOW_PREDICTION_METRICS,
     MODEL_GATE_ASSESSMENT_COMPONENTS,
+    AuthorityLimitSource,
     AuthorityStage,
     BoundBy,
     ConfidenceLevel,
@@ -578,6 +579,7 @@ def test_invariant_3_c_a_later_failure_does_not_move_the_attested_timestamp(
         return ModelGateDecision(
             model_version="thermal-v1",
             inference_id=f"{TICK_TS_MS + index * STEP_MS:064x}",
+            artifact_sha256="a" * 64,
             attested=True,
             confidence=0.9,
             ood=False,
@@ -1119,7 +1121,7 @@ def test_invariant_8_c_the_report_records_the_versions_and_configs_it_used(
     assert provenance.evaluation_config_sha256 == context.config_sha256
     assert provenance.versions.model_versions == ("thermal-v1",)
     assert provenance.versions.model_artifacts == ("a" * 64,)
-    assert provenance.versions.control_schema_versions == (6,)
+    assert provenance.versions.control_schema_versions == (7,)
     assert provenance.outcome_match_tolerance_ms == (
         context.control.policy.shadow.outcome_match_tolerance_ms.value
     )
@@ -1651,6 +1653,7 @@ def test_invariant_12_d_an_applied_learned_mpc_arm_records_the_missing_optimizer
     gate = ModelGateDecision(
         model_version="thermal-v1",
         inference_id="c" * 64,
+        artifact_sha256="a" * 64,
         attested=True,
         confidence=0.9,
         ood=False,
@@ -2373,3 +2376,156 @@ def test_the_policy_pattern_matches_the_report_contract() -> None:
         )
         assert arm.key.endswith("@shadow/auto")
         assert f"+{policy.value}@" in arm.key
+
+
+# ------------------- 不変条件 17: 適用側の arm を artifact へ束縛する（#159 / 0059）
+
+
+def _applied_learned_state() -> ControlState:
+    """Learned MPC が実 Fan の requested を作っていた tick の状態（LIMITED 以降）。"""
+    return ControlState(
+        operating_mode=OperatingMode.AUTO,
+        authority_stage=AuthorityStage.LIMITED,
+        active_controller=ControllerKind.LEARNED_MPC,
+        safety_state=SafetyState.NORMAL,
+        fallback_active=False,
+        workload_regime=WorkloadRegime.SUSTAINED_GPU,
+        regime_confidence=0.9,
+        model_version="thermal-v1",
+        model_confidence=0.9,
+        model_ood=False,
+    )
+
+
+def _applied_gate(*, artifact: str | None = "a" * 64) -> ModelGateDecision:
+    return ModelGateDecision(
+        model_version="thermal-v1",
+        inference_id="c" * 64,
+        artifact_sha256=artifact,
+        attested=True,
+        confidence=0.9,
+        ood=False,
+        confidence_level=ConfidenceLevel.HIGH,
+        authority_stage=AuthorityStage.LIMITED,
+        learned_selected=True,
+        limits=(AuthorityLimitSource.STAGE_BAND,),
+        assessment=tuple(Reason(code=component) for component in MODEL_GATE_ASSESSMENT_COMPONENTS),
+    )
+
+
+def _applied_learned_run(*, artifacts: tuple[str | None, ...]) -> list[ControlTraceRecord]:
+    """Learned MPC が適用された tick の列。`None` は artifact の欄を持たない v6 の trace。"""
+    traces: list[ControlTraceRecord] = []
+    for index, artifact in enumerate(artifacts):
+        tick = tick_at(
+            TICK_TS_MS + index * STEP_MS,
+            index,
+            shadow=False,
+            state=_applied_learned_state(),
+            model_gate=_applied_gate(artifact="a" * 64),
+        )
+        if artifact is None:
+            # 保存済みの v6（artifact の欄が無い）。読めなければならない（決定記録 0030）。
+            document = tick.model_dump(mode="python")
+            document["schema_version"] = 6
+            document["model_gate"]["artifact_sha256"] = None
+            tick = ControlTick.model_validate(document)
+        elif artifact != "a" * 64:
+            document = tick.model_dump(mode="python")
+            document["model_gate"]["artifact_sha256"] = artifact
+            tick = ControlTick.model_validate(document)
+        traces.append(trace_of(tick))
+    return traces
+
+
+def test_invariant_17_a_an_applied_learned_arm_is_bound_to_its_artifact(
+    context: EvaluationContext,
+) -> None:
+    """**適用した tick の artifact が、適用側の arm の実績として報告に残る**（#159）。"""
+    report = evaluate(
+        [run_of(_applied_learned_run(artifacts=("a" * 64,) * 3), [])], context=context
+    )
+    applied = overall(report).applied[0]
+
+    assert applied.arm.controller is ControllerKind.LEARNED_MPC
+    assert applied.model_artifacts == ("a" * 64,)
+    assert applied.unbound_attested_ticks == 0
+    assert applied.last_attested_ts_ms is not None
+    assert "applied_artifact_unknown" not in {gap.code for gap in applied.gaps}
+
+
+def test_invariant_17_b_a_tick_without_the_field_is_counted_as_artifact_unknown(
+    context: EvaluationContext,
+) -> None:
+    """**「artifact 不明」を黙って落とさない**（部分的な束縛を完全として扱わない）。
+
+    落とすと、残った tick の artifact が区間全体の実績に見え、#92 が欠けた区間を
+    見ないまま昇格できてしまう。
+    """
+    report = evaluate(
+        [run_of(_applied_learned_run(artifacts=("a" * 64, None, "a" * 64)), [])],
+        context=context,
+    )
+    applied = overall(report).applied[0]
+
+    assert applied.model_artifacts == ("a" * 64,)
+    assert applied.unbound_attested_ticks == 1
+    assert "applied_artifact_unknown" in {gap.code for gap in applied.gaps}
+
+
+def test_invariant_17_c_the_provenance_collects_artifacts_from_the_applied_side(
+    context: EvaluationContext,
+) -> None:
+    """**適用側からも artifact を集める**（#159 / 決定記録 0059）。
+
+    counterfactual からしか集めないと、「artifact B の適用実績 + artifact A の
+    counterfactual」という報告が `{A}` の照合を素通りする（決定記録 0057 §3）。
+    """
+    report = evaluate(
+        [run_of(_applied_learned_run(artifacts=("b" * 64,) * 3), [])], context=context
+    )
+
+    assert report.provenance.versions.model_artifacts == ("b" * 64,)
+
+
+def test_invariant_17_d_an_arm_cannot_name_an_artifact_the_run_never_saw() -> None:
+    """**run に現れていない artifact を arm の実績に書けない。**
+
+    書けると、報告全体の照合（#92）を通る artifact を arm 側にだけ足して、別の
+    artifact の実績を昇格の根拠にできる。
+    """
+    from coldaisle.control.evaluation.model import AppliedArmReport, InterventionReport
+
+    arm = AppliedArm(
+        controller=ControllerKind.LEARNED_MPC,
+        supervisor_policy=SupervisorPolicyKind.RULE,
+        authority_stage=AuthorityStage.LIMITED,
+        operating_mode=OperatingMode.AUTO,
+    )
+
+    with pytest.raises(ValidationError, match="Learned MPC 以外の適用 arm"):
+        AppliedArmReport(
+            arm=arm.model_copy(update={"controller": ControllerKind.FALLBACK}),
+            arm_key=arm.model_copy(update={"controller": ControllerKind.FALLBACK}).key,
+            ticks=1,
+            first_ts_ms=TICK_TS_MS,
+            last_ts_ms=TICK_TS_MS,
+            last_attested_ts_ms=TICK_TS_MS,
+            model_artifacts=("a" * 64,),
+            interventions=InterventionReport(
+                ticks=1, safety_states=(CountedReason(code="normal", count=1),)
+            ),
+        )
+
+    with pytest.raises(ValidationError, match="裏づけの無い適用 arm"):
+        AppliedArmReport(
+            arm=arm,
+            arm_key=arm.key,
+            ticks=1,
+            first_ts_ms=TICK_TS_MS,
+            last_ts_ms=TICK_TS_MS,
+            model_artifacts=("a" * 64,),
+            interventions=InterventionReport(
+                ticks=1, safety_states=(CountedReason(code="normal", count=1),)
+            ),
+        )

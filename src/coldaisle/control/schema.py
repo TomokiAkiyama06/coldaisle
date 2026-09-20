@@ -24,7 +24,7 @@ from typing import Annotated, Literal, Protocol, Self, runtime_checkable
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-SCHEMA_VERSION: Literal[6] = 6
+SCHEMA_VERSION: Literal[7] = 7
 """`ControlTick` の形の版。**フィールドの名前や意味を変えたら上げる。**
 
 #82 が保存したデータを読み違えないため。
@@ -38,10 +38,17 @@ SCHEMA_VERSION: Literal[6] = 6
 - v6（#90）: Shadow Mode の counterfactual 記録（`shadow`）。**適用した demand とは別の枠**に
   置き、適用した制御器と同じ controller を counterfactual にできない。保存済みの v1〜v5 は
   そのまま読める
+- v7（#159）: 判断を出した model artifact の hash（`model_gate.artifact_sha256`。
+  `ModelGateDecision` の schema version も 2 へ上げる）。**裏づけのある推論にだけ付く。**
+  保存済みの v1〜v6 はそのまま読め、欄の無い tick は「artifact 不明」として扱う
+  （昇格の証拠に使わない。fail closed）
 """
 
 Demand = Annotated[float, Field(ge=0.0, le=1.0, allow_inf_nan=False)]
 """制御の内部単位（0027 §2.1）。**NaN / 無限大は拒否する**（0028 §2.1）。"""
+
+Sha256Hex = Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
+"""sha256 の16進表現。**大文字や短縮形を受け取らない。**"""
 
 HWMON_PWM_MAX = 255
 """hwmon の ABI が定める `pwmN` の最大値。調整する値ではない。"""
@@ -537,6 +544,17 @@ class ModelGateDecision(_Frozen):
     model_version: str = Field(min_length=1, max_length=120)
     inference_id: str = Field(pattern=r"^[0-9a-f]{64}$")
     """判定した推論（入力と予測）の識別子。提案の ``inference_id`` と同じ。"""
+    artifact_sha256: Sha256Hex | None = None
+    """この判断を出した **model artifact** の hash（`ControlTick` v7。#159）。
+
+    **裏づけのある assessment からしか来ない。** 提案は artifact の欄を持たず、Gate は
+    検証済み（`REGISTRY_VERIFIED`）の ``ConfidenceAssessment`` の値をそのまま写す。
+    自称値や呼び出し側から受け取った値を書く経路を作らない（#85 の束縛をそのまま使う）。
+
+    **裏づけの無い判断には付かない。** 保存済みの v1〜v6 の tick も欄を持たないので、
+    どちらも **「artifact 不明」**として扱う。昇格の証拠（#92 / 決定記録 0057 §2.4）に
+    使えるのは、artifact を言える tick だけである（fail closed）。
+    """
     attested: bool
     """検証済み assessment に裏付けられた記録か。
 
@@ -564,6 +582,10 @@ class ModelGateDecision(_Frozen):
             raise ValueError("authority limit の根拠を重複させない")
         if self.attested != (self.confidence is not None):
             raise ValueError("attested な記録だけが confidence を持つ")
+        if not self.attested and self.artifact_sha256 is not None:
+            # 裏づけの無い判断に artifact を書くと、別の推論の artifact が「この tick の
+            # 実績」として読まれる。**束縛できていない identity は残さない。**
+            raise ValueError("裏づけの無い記録に artifact_sha256 を残さない")
         if (self.confidence is None) != (self.ood is None):
             raise ValueError("model_gate の confidence と ood は一緒に記録する")
         if not self.attested:
@@ -657,8 +679,6 @@ MAX_SHADOW_PREDICTION_METRICS = 32
 
 MAX_SHADOW_METRIC_NAME_LENGTH = 120
 """予測 metric 名の長さの上限。`MAX_METRIC_NAME_LENGTH`（#84）に合わせる（同上）。"""
-
-Sha256Hex = Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
 
 SHADOW_METRIC_NAME_PATTERN = r"^[a-z][a-z0-9_]*(\.[a-z0-9_]+){1,3}$"
 """予測 metric 名の形。**`ThermalMetricName`（#84）と同じ**にする。
@@ -1158,7 +1178,7 @@ v1〜v3 の reader は知らないため v3 以前には記録しない。
 class ControlTick(_Frozen):
     """1 tick の判断の記録（decision trace。0028 §2.3）。#82 が保存し、#90 / #91 が読む。"""
 
-    schema_version: Literal[1, 2, 3, 4, 5, 6] = SCHEMA_VERSION
+    schema_version: Literal[1, 2, 3, 4, 5, 6, 7] = SCHEMA_VERSION
     tick_id: int = Field(ge=0)
     ts_ms: int = Field(ge=0)
     """記録の時刻（壁時計。0028 §2.6）。"""
@@ -1254,6 +1274,36 @@ class ControlTick(_Frozen):
                 raise ValueError(f"{zone.value}: AUTO なのに Guard の ceiling を掛けていない")
         return self
 
+    @property
+    def applied_model_artifact(self) -> str | None:
+        """**この tick の requested を実際に作った** model artifact（#159）。
+
+        返すのは、裏づけのある判断（`attested`）で Learned MPC が選ばれ、かつ artifact を
+        記録していた tick の hash だけである。次のどれかなら `None`、すなわち
+        **「artifact 不明」**として扱う（昇格の証拠に使わない。fail closed）。
+
+        - `model_gate` の無い tick（提案が無かった / Fallback で回していた）
+        - 裏づけの無い判断（`attested` でない）
+        - Learned MPC を選ばなかった tick（提案は counterfactual に残る）
+        - artifact の欄を持たない保存済みの v1〜v6 の trace
+        """
+        gate = self.model_gate
+        if gate is None or not gate.attested or not gate.learned_selected:
+            return None
+        return gate.artifact_sha256
+
+    @property
+    def applied_artifact_unknown(self) -> bool:
+        """裏づけのある Learned MPC を**適用したのに** artifact を言えない tick か。
+
+        保存済みの v1〜v6 がこれに当たる。**「記録が無いだけ」と「束縛できた」を混ぜない**
+        ために、数えられる形で分けて持つ（#91 / #92 が部分的な証拠を完全として扱わないため）。
+        """
+        gate = self.model_gate
+        if gate is None or not gate.attested or not gate.learned_selected:
+            return False
+        return gate.artifact_sha256 is None
+
     def _check_model_gate(self) -> None:
         """v5 の ``model_gate`` が ControlState と同じ判断を指しているか。"""
         state = self.state
@@ -1276,6 +1326,14 @@ class ControlTick(_Frozen):
             return
         if self.schema_version < 5:
             raise ValueError("model_gate を記録する ControlTick は schema version 5 にする")
+        if self.schema_version < 7:
+            if gate.artifact_sha256 is not None:
+                raise ValueError("artifact を記録する ControlTick は schema version 7 にする")
+        elif gate.attested and gate.artifact_sha256 is None:
+            # **新しい trace で「artifact 不明」を作れないようにする。** 作れると、
+            # 束縛できる形に直したあとも、欄を空けるだけで束縛を外せてしまう。
+            # 保存済みの v1〜v6 だけが「artifact 不明」でありうる。
+            raise ValueError("v7 の裏づけのある model_gate には artifact_sha256 が要る")
         if (state.model_version, state.model_confidence, state.model_ood) != (
             gate.model_version,
             gate.confidence,
@@ -1357,6 +1415,14 @@ class ControlTick(_Frozen):
             raise ValueError("counterfactual の confidence / ood を model_gate と揃える")
         if item.model_version is not None and item.model_version != gate.model_version:
             raise ValueError("counterfactual の model_version を model_gate と揃える")
+        if (
+            gate.artifact_sha256 is not None
+            and item.artifact_sha256 is not None
+            and item.artifact_sha256 != gate.artifact_sha256
+        ):
+            # 同じ tick の2つの記録が別の artifact を名乗ると、あとから読む側が
+            # 「どの artifact の提案か」を決められない。
+            raise ValueError("counterfactual と model_gate が別の artifact を指している")
 
     def _check_fault_response(self, fault: Fault) -> None:
         """0028 §2.7 の無条件の対応を満たしているか。"""

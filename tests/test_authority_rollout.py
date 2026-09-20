@@ -253,14 +253,35 @@ def counterfactual_report(
     )
 
 
-def applied_report(
-    arm: AppliedArm, *, end_ms: int, last_attested_ts_ms: int | None = None
-) -> AppliedArmReport:
-    attested = (
-        last_attested_ts_ms
-        if last_attested_ts_ms is not None
-        else (end_ms if arm.controller is ControllerKind.LEARNED_MPC else None)
+def applied_learned_arm(stage: AuthorityStage = AuthorityStage.LIMITED) -> AppliedArm:
+    """実 Fan を **Learned MPC が作っていた** arm（LIMITED 以降。#159）。
+
+    trace が tick ごとの artifact を記録するようになったので、この arm も
+    artifact へ束縛したうえで昇格の根拠にできる（決定記録 0059）。
+    """
+    return AppliedArm(
+        controller=ControllerKind.LEARNED_MPC,
+        supervisor_policy=SupervisorPolicyKind.RULE,
+        authority_stage=stage,
+        operating_mode=OperatingMode.AUTO,
     )
+
+
+def applied_report(
+    arm: AppliedArm,
+    *,
+    end_ms: int,
+    last_attested_ts_ms: int | None = None,
+    model_artifacts: tuple[str, ...] | None = None,
+    unbound_attested_ticks: int = 0,
+) -> AppliedArmReport:
+    learned = arm.controller is ControllerKind.LEARNED_MPC
+    attested = (
+        last_attested_ts_ms if last_attested_ts_ms is not None else (end_ms if learned else None)
+    )
+    artifacts = model_artifacts
+    if artifacts is None:
+        artifacts = (ARTIFACT_SHA,) if learned else ()
     return AppliedArmReport(
         arm=arm,
         arm_key=arm.key,
@@ -268,6 +289,8 @@ def applied_report(
         first_ts_ms=min(end_ms, attested if attested is not None else end_ms) - 3_600_000,
         last_ts_ms=end_ms,
         last_attested_ts_ms=attested,
+        model_artifacts=tuple(sorted(artifacts)),
+        unbound_attested_ticks=unbound_attested_ticks,
         interventions=InterventionReport(
             ticks=1_000,
             safety_states=(CountedReason(code="normal", count=1_000),),
@@ -316,6 +339,9 @@ def report_document(
     learned_last_ts_ms: int | None = None,
     learned_last_attested_ts_ms: int | None = None,
     start_ms: int | None = None,
+    with_applied_learned: bool = False,
+    applied_artifacts: tuple[str, ...] | None = None,
+    applied_unbound_ticks: int = 0,
 ) -> bytes:
     """最小の Offline Evaluation 報告（#91）。**arm の実績と gate を持つ。**"""
     learned = learned_arm(arm_stage)
@@ -353,6 +379,18 @@ def report_document(
         counterfactual_arms.append(counterfactual_report(extra_learned, end_ms=end_ms))
         gates.append(gate(extra_learned.key, extra_outcome))
     applied_arms = [applied_report(fallback, end_ms=end_ms)] if with_applied_fallback else []
+    if with_applied_learned:
+        applied_learned = applied_learned_arm(arm_stage)
+        applied_arms.append(
+            applied_report(
+                applied_learned,
+                end_ms=end_ms,
+                model_artifacts=applied_artifacts,
+                unbound_attested_ticks=applied_unbound_ticks,
+            )
+        )
+        if applied_learned.key != arm:
+            gates.append(gate(applied_learned.key, GateOutcome.PASS))
     # **Learned の実績が無い、新しいだけの区間。** 新しさの測り方を試すために足す。
     fresh_segments: list[SegmentReport] = []
     if fresh_fallback_end_ms is not None:
@@ -993,37 +1031,171 @@ def test_invariant_5_m_an_applied_fallback_arm_cannot_justify_a_promotion(
         raise_stage(store(tmp_path), approval=approval, document=document)
 
 
-def test_invariant_5_o_an_applied_learned_arm_cannot_justify_a_promotion(
+def test_invariant_5_o_an_applied_learned_arm_bound_to_production_justifies_a_promotion(
     tmp_path: Path,
 ) -> None:
-    """**適用側の arm は artifact へ束縛できないので根拠にできない**（codex #4057064074）。
+    """**適用側の arm も、artifact へ束縛できれば昇格の根拠になる**（#159 / 決定記録 0059）。
 
-    `ModelGateDecision` は artifact の hash を持たず、適用 arm の鍵にも model の identity が
-    入らない。`provenance.model_artifacts` は counterfactual の `artifact_sha256` からしか
-    集まらないので、「B の適用実績 + A の counterfactual」という報告が {A} の照合を通る。
-    **束縛できない証拠は使わない**（fail closed）。trace が tick ごとの artifact を記録
-    するようになったら開ける（0057 §5）。
+    0057 §2.4 / §3 はこれを「使えない」側に倒していた。`ModelGateDecision` が artifact の
+    hash を持たず、適用 arm の実績を「どの artifact のものか」言えなかったためである
+    （codex #4057064074）。trace が tick ごとの artifact を記録し、報告がそれを arm ごとに
+    残すようになったので、束縛したうえで受け入れる。**これが無いと LIMITED で止まる。**
     """
     authority = store(tmp_path)
     first = report_document()
     raise_stage(authority, approval=approval_for(first), document=first)
 
-    applied_learned = AppliedArm(
-        controller=ControllerKind.LEARNED_MPC,
-        supervisor_policy=SupervisorPolicyKind.RULE,
-        authority_stage=AuthorityStage.LIMITED,
-        operating_mode=OperatingMode.AUTO,
-    )
+    applied_learned = applied_learned_arm(AuthorityStage.LIMITED)
     document = report_document(
         arm=applied_learned.key,
         stages=(AuthorityStage.LIMITED.value,),
         arm_stage=AuthorityStage.LIMITED,
+        with_applied_learned=True,
+    )
+    approval = approval_for(
+        document,
+        from_stage=AuthorityStage.LIMITED,
+        revision=1,
+        evidence=evidence_for(document, arm=applied_learned.key),
+    )
+
+    journal = raise_stage(authority, approval=approval, document=document)
+
+    assert journal.stage is AuthorityStage.EXPANDED
+
+
+def test_invariant_5_t_an_applied_arm_without_a_recorded_artifact_is_refused(
+    tmp_path: Path,
+) -> None:
+    """**artifact 不明の適用実績で上げない**（fail closed）。
+
+    欄を持たない v1〜v6 だけで回した区間は「どの artifact の実績か」を言えない。
+    **推測で埋めない。**
+    """
+    authority = store(tmp_path)
+    first = report_document()
+    raise_stage(authority, approval=approval_for(first), document=first)
+
+    applied_learned = applied_learned_arm(AuthorityStage.LIMITED)
+    document = report_document(
+        arm=applied_learned.key,
+        stages=(AuthorityStage.LIMITED.value,),
+        arm_stage=AuthorityStage.LIMITED,
+        with_applied_learned=True,
+        applied_artifacts=(),
+    )
+    approval = approval_for(
+        document,
+        from_stage=AuthorityStage.LIMITED,
+        revision=1,
+        evidence=evidence_for(document, arm=applied_learned.key),
+    )
+
+    with pytest.raises(AuthorityEvidenceError, match="artifact が記録されていない"):
+        raise_stage(authority, approval=approval, document=document)
+
+
+def test_invariant_5_u_an_applied_arm_with_unknown_artifact_ticks_is_refused(
+    tmp_path: Path,
+) -> None:
+    """**部分的な束縛を完全として扱わない**（#159）。
+
+    新しい trace と、artifact の欄を持たない古い trace が混ざった区間では、残った
+    tick の artifact が区間全体の実績に見える。1件でも不明があれば根拠にしない。
+    """
+    authority = store(tmp_path)
+    first = report_document()
+    raise_stage(authority, approval=approval_for(first), document=first)
+
+    applied_learned = applied_learned_arm(AuthorityStage.LIMITED)
+    document = report_document(
+        arm=applied_learned.key,
+        stages=(AuthorityStage.LIMITED.value,),
+        arm_stage=AuthorityStage.LIMITED,
+        with_applied_learned=True,
+        applied_unbound_ticks=3,
+    )
+    approval = approval_for(
+        document,
+        from_stage=AuthorityStage.LIMITED,
+        revision=1,
+        evidence=evidence_for(document, arm=applied_learned.key),
+    )
+
+    with pytest.raises(AuthorityEvidenceError, match="artifact を言えない適用 tick"):
+        raise_stage(authority, approval=approval, document=document)
+
+
+def test_invariant_5_v_applied_evidence_from_another_artifact_is_refused(
+    tmp_path: Path,
+) -> None:
+    """**「artifact B の適用実績 + artifact A の counterfactual」を通さない**（0057 §3）。
+
+    trace が適用側の artifact を記録するようになり、`provenance.model_artifacts` を
+    適用側からも集めるので、混在が報告の素性に現れる（#159 / 決定記録 0059）。
+    counterfactual からしか集めていなかった間は、この報告が `{A}` の照合を素通りしていた。
+    """
+    authority = store(tmp_path)
+    first = report_document()
+    raise_stage(authority, approval=approval_for(first), document=first)
+
+    other = "b" * 64
+    applied_learned = applied_learned_arm(AuthorityStage.LIMITED)
+    document = report_document(
+        arm=applied_learned.key,
+        stages=(AuthorityStage.LIMITED.value,),
+        arm_stage=AuthorityStage.LIMITED,
+        # 評価器が適用側の tick から集めた artifact。counterfactual は A、適用は B。
+        artifacts=(ARTIFACT_SHA, other),
+        with_applied_learned=True,
+        applied_artifacts=(other,),
+    )
+    approval = approval_for(
+        document,
+        from_stage=AuthorityStage.LIMITED,
+        revision=1,
+        evidence=evidence_for(document, arm=applied_learned.key),
+    )
+
+    with pytest.raises(AuthorityEvidenceError, match="報告に Production 以外の artifact"):
+        raise_stage(authority, approval=approval, document=document)
+
+
+def test_invariant_5_w_unknown_artifact_ticks_are_summed_across_segments(
+    tmp_path: Path,
+) -> None:
+    """**artifact 不明の tick は segment をまたいで足し合わせる**（#159）。
+
+    新しいほうの segment だけを見ると、artifact の欄を持たない古い trace で回した
+    segment が束縛の照合から消え、**一部しか束縛できていない実績**が完全なものとして
+    通ってしまう。
+    """
+    authority = store(tmp_path)
+    first = report_document()
+    raise_stage(authority, approval=approval_for(first), document=first)
+
+    applied_learned = applied_learned_arm(AuthorityStage.LIMITED)
+    document = report_document(
+        arm=applied_learned.key,
+        stages=(AuthorityStage.LIMITED.value,),
+        arm_stage=AuthorityStage.LIMITED,
+        with_applied_learned=True,
     )
     payload = json.loads(document)
-    groups = payload["segments"][0]["groups"][0]
-    groups["applied"] = [
-        json.loads(applied_report(applied_learned, end_ms=EVIDENCE_END_MS).model_dump_json())
-    ]
+    # 古い segment は v6 の trace だけで回していた（artifact を言えない）。
+    stale = json.loads(json.dumps(payload["segments"][0]))
+    stale["index"] = 1
+    stale["start_ms"] = EVIDENCE_END_MS - 7_200_000
+    stale["end_ms"] = EVIDENCE_END_MS - 3_600_000
+    stale["groups"][0]["counterfactual"] = []
+    for applied in stale["groups"][0]["applied"]:
+        applied["model_artifacts"] = []
+        applied["unbound_attested_ticks"] = 5
+        applied["first_ts_ms"] = stale["start_ms"]
+        applied["last_ts_ms"] = stale["end_ms"]
+        applied["last_attested_ts_ms"] = stale["end_ms"]
+    payload["segments"] = [stale, payload["segments"][0]]
+    payload["segments"][1]["index"] = 2
     document = json.dumps(payload).encode("utf-8")
     approval = approval_for(
         document,
@@ -1032,7 +1204,7 @@ def test_invariant_5_o_an_applied_learned_arm_cannot_justify_a_promotion(
         evidence=evidence_for(document, arm=applied_learned.key),
     )
 
-    with pytest.raises(AuthorityEvidenceError, match="適用側の arm"):
+    with pytest.raises(AuthorityEvidenceError, match="artifact を言えない適用 tick"):
         raise_stage(authority, approval=approval, document=document)
 
 
@@ -2183,3 +2355,82 @@ def test_the_first_promotion_can_actually_be_walked(tmp_path: Path, trained) -> 
 
     assert limited_tick.authority_stage is AuthorityStage.LIMITED
     assert limited_tick.active_controller is ControllerKind.LEARNED_MPC
+
+
+def test_the_rollout_can_be_walked_from_limited_to_full(tmp_path: Path) -> None:
+    """**LIMITED → EXPANDED → FULL を、適用側の実績だけで歩ける**（#159 の受入基準）。
+
+    LIMITED 以降は Learned MPC が適用側に出るので、counterfactual には Learned の arm が
+    現れない。適用側の arm を根拠にできない限り、rollout は LIMITED で止まる
+    （決定記録 0057 §3）。trace が tick ごとの artifact を記録し、報告がそれを arm ごとに
+    残すようになったことで、**残りの2段を歩ける。**
+
+    実機は要らない。報告は #91 の型そのもので、Registry と journal は tmp_path に作る。
+    """
+    authority = store(tmp_path)
+    config = control_config(tmp_path, ceiling="full")
+    registry, production_sha = production_registry(tmp_path, version="9.0.0", name="registry-e2e")
+
+    # 1段目は Shadow の counterfactual の実績で上げる（LIMITED 以降とは根拠の形が違う）。
+    shadow_document = report_document(
+        artifacts=(production_sha,),
+        policy_sha=config.sources.policy.sha256,
+        safety_sha=config.sources.safety.sha256,
+    )
+    journal = raise_stage(
+        authority,
+        approval=approval_for(
+            shadow_document,
+            evidence=evidence_for(
+                shadow_document,
+                artifact=production_sha,
+                policy_sha=config.sources.policy.sha256,
+                safety_sha=config.sources.safety.sha256,
+            ),
+        ),
+        document=shadow_document,
+        config=config,
+        registry=registry,
+    )
+    assert journal.stage is AuthorityStage.LIMITED
+
+    # 2段目・3段目は**適用側**の実績で上げる。counterfactual には Learned が出ない。
+    for index, stage in enumerate((AuthorityStage.LIMITED, AuthorityStage.EXPANDED)):
+        applied_learned = applied_learned_arm(stage)
+        document = report_document(
+            arm=applied_learned.key,
+            stages=(stage.value,),
+            arm_stage=stage,
+            artifacts=(production_sha,),
+            policy_sha=config.sources.policy.sha256,
+            safety_sha=config.sources.safety.sha256,
+            with_applied_learned=True,
+            applied_artifacts=(production_sha,),
+        )
+        journal = raise_stage(
+            authority,
+            approval=approval_for(
+                document,
+                from_stage=stage,
+                revision=index + 1,
+                evidence=evidence_for(
+                    document,
+                    arm=applied_learned.key,
+                    artifact=production_sha,
+                    policy_sha=config.sources.policy.sha256,
+                    safety_sha=config.sources.safety.sha256,
+                ),
+            ),
+            document=document,
+            config=config,
+            registry=registry,
+        )
+
+    assert journal.stage is AuthorityStage.FULL
+    assert [event.to_stage for event in journal.events] == [
+        AuthorityStage.LIMITED,
+        AuthorityStage.EXPANDED,
+        AuthorityStage.FULL,
+    ]
+    # **すべて人の承認で、1段ずつ。** 自動で上がった段は1つも無い。
+    assert all(event.trigger is AuthorityTrigger.HUMAN for event in journal.events)

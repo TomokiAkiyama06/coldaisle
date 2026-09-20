@@ -912,3 +912,95 @@ def test_max_keeps_fallback_active_and_auto_return_requires_a_fresh_recovery_hol
     assert returned.fallback_reason.code == "ml_recovery_hold"
     assert before_hold.active_controller is ControllerKind.FALLBACK
     assert recovered.active_controller is ControllerKind.LEARNED_MPC
+
+
+# ------------------------------- 判断を出した model artifact を trace へ残す（#159）
+
+
+def test_the_gate_records_the_artifact_of_the_attested_inference() -> None:
+    """**適用した tick の artifact が `model_gate` に残る**（#159 / 決定記録 0059）。
+
+    値は Registry 検証済みの assessment から来る。提案は artifact の欄を持たないので、
+    worker が自称する経路は型として存在しない。
+    """
+    gate = gate_for(policy(recovery_hold_ms=1), expected_model_version="thermal-v1")
+    gate.select(
+        now_mono_ms=0,
+        fallback=fallback_proposal(0.4),
+        learned=healthy_status(),
+        operating_mode=OperatingMode.AUTO,
+        safety_state=SafetyState.NORMAL,
+    )
+    selected = gate.select(
+        now_mono_ms=1_000,
+        fallback=fallback_proposal(0.4),
+        learned=healthy_status(received=1_000),
+        operating_mode=OperatingMode.AUTO,
+        safety_state=SafetyState.NORMAL,
+    )
+
+    assert selected.active_controller is ControllerKind.LEARNED_MPC
+    assert selected.model_gate is not None
+    assert selected.model_gate.attested is True
+    assert selected.model_gate.artifact_sha256 == "a" * 64
+
+
+def test_an_assessment_the_registry_did_not_verify_leaves_the_artifact_unknown() -> None:
+    """**束縛できない assessment の artifact は残さない**（#85 の裏づけと同じ向き）。
+
+    Registry を通っていない判定の artifact を書くと、検証していない artifact の実績が
+    昇格の根拠に使えてしまう。裏づけが無ければ「artifact 不明」にする（fail closed）。
+    """
+    gate = gate_for(policy(), expected_model_version="thermal-v1")
+    proposal = learned_proposal()
+    offline = assessment_for(proposal).model_copy(
+        update={"artifact_verification": ArtifactVerification.OFFLINE_UNVERIFIED}
+    )
+    selected = gate.select(
+        now_mono_ms=0,
+        fallback=fallback_proposal(0.4),
+        learned=LearnedControlStatus(
+            proposal=proposal,
+            received_at_mono_ms=0,
+            assessment=offline,
+            binding_authority_stage=AuthorityStage.FULL,
+        ),
+        operating_mode=OperatingMode.AUTO,
+        safety_state=SafetyState.NORMAL,
+    )
+
+    assert selected.active_controller is ControllerKind.FALLBACK
+    assert selected.model_gate is not None
+    assert selected.model_gate.attested is False
+    assert selected.model_gate.artifact_sha256 is None
+
+
+def test_an_assessment_for_another_inference_cannot_lend_its_artifact() -> None:
+    """**artifact は、その提案を出した推論の assessment からしか来ない。**
+
+    別の推論の assessment を付け替えても、Gate はそれを退け、artifact も残さない。
+    付け替えが通ると、「A の提案の実績」を B の artifact の実績にできる。
+    """
+    gate = gate_for(policy(), expected_model_version="thermal-v1")
+    proposal = learned_proposal()
+    other = assessment_for(learned_proposal(inference_id="e" * 64)).model_copy(
+        update={"artifact_sha256": "f" * 64}
+    )
+    selected = gate.select(
+        now_mono_ms=0,
+        fallback=fallback_proposal(0.4),
+        learned=LearnedControlStatus(
+            proposal=proposal,
+            received_at_mono_ms=0,
+            assessment=other,
+            binding_authority_stage=AuthorityStage.FULL,
+        ),
+        operating_mode=OperatingMode.AUTO,
+        safety_state=SafetyState.NORMAL,
+    )
+
+    assert selected.active_controller is ControllerKind.FALLBACK
+    assert selected.fallback_reason is not None
+    assert selected.fallback_reason.code == "confidence_unattested"
+    assert selected.model_gate is not None
+    assert selected.model_gate.artifact_sha256 is None

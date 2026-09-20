@@ -42,6 +42,7 @@ from coldaisle.control.schema import (
     ControlState,
     ControlTick,
     EffectiveZoneDemand,
+    ModelGateDecision,
     OperatingMode,
     OptimizerStatus,
     PerZone,
@@ -561,6 +562,12 @@ def test_invariant_1_h_a_v5_trace_cannot_carry_a_shadow_record() -> None:
     proposal = shadow_proposal(0.9)
     selection, state, record = recorded(learned=mpc_result(proposal))
     assert record is not None
+    assert selection.model_gate is not None
+    # artifact は v7 の欄なので、v5 の tick には最初から載せられない（#159）。
+    # ここで見たいのは `shadow` のほうなので、v5 に載る形の model_gate で試す。
+    gate = ModelGateDecision.model_validate(
+        {**selection.model_gate.model_dump(mode="python"), "artifact_sha256": None}
+    )
     with pytest.raises(ValidationError, match="schema version 6"):
         ControlTick(
             schema_version=5,
@@ -568,7 +575,7 @@ def test_invariant_1_h_a_v5_trace_cannot_carry_a_shadow_record() -> None:
             ts_ms=TICK_TS_MS,
             state=state,
             zones=zone_records(0.4),
-            model_gate=selection.model_gate,
+            model_gate=gate,
             shadow=record,
         )
 

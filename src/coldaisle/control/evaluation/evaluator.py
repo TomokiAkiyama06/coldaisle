@@ -821,6 +821,12 @@ def _applied_report(bucket: _AppliedBucket, context: EvaluationContext) -> Appli
         # 制御器が Fallback の arm に欄が無いこと（該当しない）と区別するため。
         gaps["applied_optimizer_record_unavailable"] += 1
 
+    artifacts, unbound = _applied_artifacts(ticks)
+    if unbound:
+        # **「artifact 不明」を黙って落とさない。** 落とすと、残った tick の artifact が
+        # 区間全体の実績に見え、#92 が部分的な証拠を完全なものとして読む。
+        gaps["applied_artifact_unknown"] += 1
+
     return AppliedArmReport(
         arm=bucket.arm,
         arm_key=bucket.arm.key,
@@ -846,8 +852,28 @@ def _applied_report(bucket: _AppliedBucket, context: EvaluationContext) -> Appli
         acoustic_cost=acoustic,
         interventions=_interventions(ticks),
         last_attested_ts_ms=_last_attested_ts_ms(ticks),
+        model_artifacts=artifacts,
+        unbound_attested_ticks=unbound,
         gaps=_counted(gaps),
     )
+
+
+def _applied_artifacts(ticks: Sequence[ControlTick]) -> tuple[tuple[str, ...], int]:
+    """**適用された**裏づけのある提案を出した artifact と、言えなかった tick の数（#159）。
+
+    出どころは trace の `model_gate.artifact_sha256` だけである（決定記録 0059）。
+    欄を持たない v1〜v6 の tick は「artifact 不明」として数え、artifact の集合には入れない。
+    **記録の無い tick を、記録のある tick の artifact で埋めない。**
+    """
+    artifacts: set[str] = set()
+    unbound = 0
+    for tick in ticks:
+        artifact = tick.applied_model_artifact
+        if artifact is not None:
+            artifacts.add(artifact)
+        elif tick.applied_artifact_unknown:
+            unbound += 1
+    return tuple(sorted(artifacts)), unbound
 
 
 def _last_attested_ts_ms(ticks: Sequence[ControlTick]) -> int | None:
@@ -1419,6 +1445,12 @@ class _VersionCollector:
         self._modes.add(tick.state.operating_mode.value)
         if tick.state.model_version is not None:
             self._models.add(tick.state.model_version)
+        gate = tick.model_gate
+        if gate is not None and gate.artifact_sha256 is not None:
+            # **適用側からも集める**（#159 / 決定記録 0059）。counterfactual からしか
+            # 集めないと、「artifact B の適用実績 + artifact A の counterfactual」という
+            # 報告が `{A}` の照合を素通りする（決定記録 0057 §3）。
+            self._artifacts.add(gate.artifact_sha256)
         if tick.supervisor is not None:
             for evaluation in (
                 tick.supervisor.active,
