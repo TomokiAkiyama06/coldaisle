@@ -1,8 +1,8 @@
-"""Model Drift の報告の型（#93 / 決定記録 0055）。
+"""Model Drift の報告の型（#93 / 決定記録 0056）。
 
 **この型は制御へ届かない。** `Demand` も PWM も authority も表現できない。出せるのは
 「どれだけ劣化しているか」「どれだけの証拠で言っているか」「再学習を推奨するか」だけで、
-confidence を動かすのは runtime の `ConfidenceAssessor` だけである（0055 §2.1）。
+confidence を動かすのは runtime の `ConfidenceAssessor` だけである（0056 §2.1）。
 
 **時刻はすべて証拠から来る。** 生成時刻の欄は無い（0054 §2.7 と同じ規律）。
 """
@@ -54,7 +54,7 @@ class DriftSourceCount(_Frozen):
 
 
 class DriftVerdict(StrEnum):
-    """1つの signal、または報告全体の判定（決定記録 0055 §2.4）。"""
+    """1つの signal、または報告全体の判定（決定記録 0056 §2.4）。"""
 
     OK = "ok"
     WARNING = "warning"
@@ -85,7 +85,7 @@ def combine_verdicts(verdicts: tuple[DriftVerdict, ...]) -> DriftVerdict:
 
 
 class DriftSignalKind(StrEnum):
-    """drift を見る切り口（決定記録 0055 §2.2）。"""
+    """drift を見る切り口（決定記録 0056 §2.2）。"""
 
     RESIDUAL = "residual"
     """予測誤差の悪化。Profile の validation residual RMS を 1.0 とした比で見る。"""
@@ -98,7 +98,7 @@ class DriftSignalKind(StrEnum):
 
 
 class ChangeKind(StrEnum):
-    """人が宣言する構成変更（決定記録 0055 §2.5）。**検知器は推測しない。**"""
+    """人が宣言する構成変更（決定記録 0056 §2.5）。**検知器は推測しない。**"""
 
     FAN_REPLACED = "fan_replaced"
     SENSOR_REPLACED = "sensor_replaced"
@@ -115,7 +115,7 @@ class DeclaredChange(_Frozen):
 
 
 class DriftCoverage(_Frozen):
-    """**どれだけを証拠に数えられたか**（決定記録 0055 §2.4）。
+    """**どれだけを証拠に数えられたか**（決定記録 0056 §2.4）。
 
     Shadow の間は多くの outcome が `unidentifiable` になる（0053 §3）。それは制限ではなく、
     記録から言えることの範囲そのものである。**混ぜずに区分として出す。**
@@ -149,7 +149,7 @@ class DriftCoverage(_Frozen):
     `sufficient` にしない（0054 §2.3 と同じ理由）。
     """
     excluded_by_change: int = Field(default=0, ge=0)
-    """宣言された変更より前だったため数えなかった outcome（0055 §2.5）。"""
+    """宣言された変更より前だったため数えなかった outcome（0056 §2.5）。"""
     foreign_model: int = Field(default=0, ge=0)
     """別のモデル / artifact の counterfactual。**混ぜない。**"""
     sufficient: bool
@@ -183,7 +183,7 @@ class ResidualTrendBucket(_Frozen):
     """residual trend の1区切り（#93 の「residual trend を可視化・保存できる」）。
 
     **bucket は自分の件数だけで判定する。** 足りなければ比を持たず
-    `insufficient_evidence` になる。隣の bucket から証拠を借りない（0055 §2.4）。
+    `insufficient_evidence` になる。隣の bucket から証拠を借りない（0056 §2.4）。
     """
 
     index: int = Field(ge=0)
@@ -212,7 +212,7 @@ class MetricResidual(_Frozen):
 
 
 class ResidualDriftSignal(_Frozen):
-    """prediction residual の悪化（決定記録 0055 §2.2 / §2.3）。
+    """prediction residual の悪化（決定記録 0056 §2.2 / §2.3）。
 
     **`status: scored` で、かつ全出力が照合できた outcome だけ**から作る。
     `unidentifiable` の差は制御器の違いとモデル誤差の混合であって、drift ではない。
@@ -333,7 +333,7 @@ class RetrainingTrigger(_Frozen):
 
 
 class RetrainingRecommendation(_Frozen):
-    """再学習の推奨。**Registry も設定も書き換えない**（決定記録 0055 §2.6）。
+    """再学習の推奨。**Registry も設定も書き換えない**（決定記録 0056 §2.6）。
 
     `human_approval_required` は型の上で常に真である。「承認不要の再学習」を
     表現できないようにするための構造上の制約で、設定値ではない。

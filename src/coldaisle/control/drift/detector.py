@@ -1,4 +1,4 @@
-"""Thermal Model の drift 検知（#93 / 決定記録 0055）。
+"""Thermal Model の drift 検知（#93 / 決定記録 0056）。
 
 **読み取りだけで、時計を持たない。** 入力は #90 の Shadow export（保存済み decision trace と
 観測から作られたもの）、Dataset から起こした入力、そして人が宣言した構成変更で、時刻はすべて
@@ -6,9 +6,9 @@
 
 **制御へ届かない。** この module は `coldaisle.control.hardware` / `safety` / `reactive` を
 import せず、`Demand` も PWM も authority も作らない。confidence を動かすのは runtime の
-`ConfidenceAssessor` だけである（0055 §2.1。**試験で走査する**）。
+`ConfidenceAssessor` だけである（0056 §2.1。**試験で走査する**）。
 
-守る線は5つ（決定記録 0055 §2.3 / §2.4）。
+守る線は5つ（決定記録 0056 §2.3 / §2.4）。
 
 1. 誤差に数えてよいのは `status: scored` で**全出力が照合できた** outcome だけ
 2. 証拠は model / artifact / 推論 / 候補 plan の識別子で束縛する。結べない証拠は受け取らない
@@ -73,7 +73,7 @@ class DriftEvidence:
     inputs: tuple[ObservedThermalInput, ...] = ()
     """入力分布を見るための直近の推論入力（#83 Dataset の example から起こす）。"""
     changes: tuple[DeclaredChange, ...] = ()
-    """宣言された構成変更。**この時刻より前の証拠は数えない**（0055 §2.5）。"""
+    """宣言された構成変更。**この時刻より前の証拠は数えない**（0056 §2.5）。"""
 
 
 @dataclass
@@ -110,7 +110,7 @@ class DriftDetector:
     """Profile と運用中の証拠から drift を判定し、再学習の推奨を出す。
 
     判定に使う「何を逸脱と呼ぶか」は runtime の `model_confidence` がそのまま決める。
-    **drift 設定に写さない**（0055 §2.2）。
+    **drift 設定に写さない**（0056 §2.2）。
     """
 
     def __init__(
@@ -123,7 +123,7 @@ class DriftDetector:
         policy = assessor.policy
         if config.residual.degraded_ratio.value > policy.residual_drift_ood_ratio.value:
             # offline が runtime より鈍いと、runtime が OOD で Fallback へ落ちている最中に
-            # offline は「問題なし」と答える。写さず、照合して落とす（0055 §2.8）。
+            # offline は「問題なし」と答える。写さず、照合して落とす（0056 §2.8）。
             raise DriftConfigError(
                 "drift の degraded_ratio は model_confidence.residual_drift_ood_ratio "
                 f"以下にする（drift={config.residual.degraded_ratio.value}; "
@@ -140,7 +140,11 @@ class DriftDetector:
 
     def detect(self, evidence: DriftEvidence) -> DriftReport:
         """証拠から1つの報告を作る。**同じ証拠からは同じ bytes になる。**"""
-        changes = tuple(sorted(evidence.changes, key=lambda item: (item.ts_ms, item.kind.value)))
+        # まったく同じ宣言が2度届くのは冪等な取り込みで起きる。**1つに畳んでから**
+        # 数える（報告の bytes が「何回渡したか」に依存しないように。0054 §2.6 と同じ扱い）。
+        changes = tuple(
+            sorted(set(evidence.changes), key=lambda item: (item.ts_ms, item.kind.value))
+        )
         cutoff_ms = max((change.ts_ms for change in changes), default=None)
         tally = self._tally_residual(evidence.shadow, cutoff_ms)
         residual = self._residual_signal(tally)
@@ -237,20 +241,41 @@ class DriftDetector:
             # 別のモデルの区間を、この Production artifact の実績に数えない。
             tally.foreign_model += 1
             return
+        _check_observation_times(outcome)
         evidence_ts_ms = _evidence_time(outcome)
         if cutoff_ms is not None and evidence_ts_ms <= cutoff_ms:
             tally.excluded_by_change += 1
             return
 
+        # **出力の集合は予測から取る。** `outcome.matches` に現れた出力だけを見ると、
+        # 記録から出力を落とすだけで「全出力が揃った forecast」に仕立てられる
+        # （`ShadowOutcome.complete` は残っている match の中だけを見る）。
+        expected = {
+            (target.offset_ms, metric) for target in prediction.targets for metric in target.values
+        }
+        actual = {(match.offset_ms, match.metric) for match in outcome.matches}
+        if len(actual) != len(outcome.matches):
+            # 同じ出力を2度置けば、その誤差を2回数えられる。
+            raise DriftInputError(
+                f"同じ出力の照合結果が1つの outcome に2つある: {outcome.inference_id}"
+            )
+        if actual - expected:
+            # 予測に無い出力は、記録が別の推論を抱えている証拠である。
+            raise DriftInputError(f"予測に無い出力の照合結果がある: {sorted(actual - expected)}")
+        missing = expected - actual
+
         tally.outcomes += 1
-        tally.outputs += len(outcome.matches)
+        tally.outputs += len(expected)
+        tally.predicted_metrics.update(metric for _offset, metric in expected)
         for match in outcome.matches:
-            tally.predicted_metrics.add(match.metric)
             if match.observed is None:
                 assert match.unmatched is not None
                 _bump(tally.unmatched_reasons, match.unmatched.code)
             else:
                 tally.matched_outputs += 1
+        for _key in missing:
+            # **落ちた出力を「無かったこと」にしない。** 照合できなかったのと同じ扱いにする。
+            _bump(tally.unmatched_reasons, "output_missing_from_outcome")
         if not outcome.scored:
             tally.unidentifiable += 1
             assert outcome.unidentifiable is not None
@@ -258,8 +283,8 @@ class DriftDetector:
             return
 
         tally.scored += 1
-        if not outcome.complete:
-            # 照合できた出力だけの誤差は、当たりやすい出力に偏る（0055 §2.3）。
+        if missing or not outcome.complete:
+            # 照合できた出力だけの誤差は、当たりやすい出力に偏る（0056 §2.3）。
             tally.incomplete_scored += 1
             return
         squared: list[float] = []
@@ -350,7 +375,7 @@ class DriftDetector:
         """証拠時刻順に一定件数ずつ切った residual の推移。
 
         **bucket は自分の件数だけで判定する。** 足りない bucket は比を持たない。
-        隣から借りると、「証拠は薄い区間から、指標は厚い区間から」になる（0055 §2.4）。
+        隣から借りると、「証拠は薄い区間から、指標は厚い区間から」になる（0056 §2.4）。
         """
         gate = self._config.residual
         size = gate.trend_bucket_outcomes.value
@@ -395,7 +420,7 @@ class DriftDetector:
         """入力分布の逸脱を3つの切り口で数える。
 
         **判定は `ConfidenceAssessor` と同じ実装**（`coverage()`）を通す。ここで範囲や
-        support を数え直すと、runtime と offline が別の規則で動く（0055 §2.2）。
+        support を数え直すと、runtime と offline が別の規則で動く（0056 §2.2）。
         """
         excluded = 0
         considered = 0
@@ -408,7 +433,15 @@ class DriftDetector:
         first_ts: int | None = None
         last_ts: int | None = None
         margin = self._policy.range_margin.value
+        seen_inputs: set[int] = set()
         for observed in inputs:
+            if observed.action_ts_ms in seen_inputs:
+                # **同じ推論入力を2回数えない。** 1件を並べ直すだけで `minimum_inputs` を
+                # 満たせてしまう（行の複製で coverage を満たせないのと同じ型の穴）。
+                raise DriftInputError(
+                    f"同じ action 時刻の推論入力が2度現れた: {observed.action_ts_ms}"
+                )
+            seen_inputs.add(observed.action_ts_ms)
             if cutoff_ms is not None and observed.action_ts_ms <= cutoff_ms:
                 excluded += 1
                 continue
@@ -482,7 +515,7 @@ class DriftDetector:
         inputs: Sequence[InputDriftSignal],
         changes: Sequence[DeclaredChange],
     ) -> RetrainingRecommendation:
-        """再学習の推奨。**Registry も設定も書き換えない**（0055 §2.6）。"""
+        """再学習の推奨。**Registry も設定も書き換えない**（0056 §2.6）。"""
         triggers: list[RetrainingTrigger] = []
         if residual.verdict is DriftVerdict.DEGRADED:
             assert residual.ratio is not None
@@ -559,6 +592,30 @@ def _counterfactuals_by_plan(row: ShadowExportRow) -> dict[tuple[str, str], Shad
             )
         found[key] = counterfactual
     return found
+
+
+def _check_observation_times(outcome: ShadowOutcome) -> None:
+    """照合に使った観測が、**記録された照合の規則の中にある**か（0053 §2.3）。
+
+    証拠の時刻はここから決まるので、許容幅の外の観測時刻を置けると、宣言された変更より
+    前の証拠を後ろへずらして数えさせたり、trend の bucket を並べ替えたりできる。
+    照合器が置ける値の範囲は決まっているので、範囲の外は入力の誤りとして拒む。
+    """
+    for match in outcome.matches:
+        observed_ts_ms = match.observed_ts_ms
+        if observed_ts_ms is None:
+            continue
+        if observed_ts_ms <= outcome.input_action_ts_ms:
+            raise DriftInputError(
+                f"予測の action より前の観測が証拠になっている: "
+                f"observed_ts_ms={observed_ts_ms}; action={outcome.input_action_ts_ms}"
+            )
+        if abs(observed_ts_ms - match.expected_ts_ms) > outcome.match_tolerance_ms:
+            raise DriftInputError(
+                f"照合に使った観測が許容幅の外にある: observed_ts_ms={observed_ts_ms}; "
+                f"expected_ts_ms={match.expected_ts_ms}; "
+                f"tolerance_ms={outcome.match_tolerance_ms}"
+            )
 
 
 def _evidence_time(outcome: ShadowOutcome) -> int:

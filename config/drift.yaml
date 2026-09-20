@@ -1,9 +1,9 @@
-# Thermal Model の drift 検知の設定（#93 / 決定記録 0055 §2.8）
+# Thermal Model の drift 検知の設定（#93 / 決定記録 0056 §2.8）
 #
 # **すべて実測前の暫定値（provisional）。** 確定には基準となる測定と所有者の承認が要る。
 # コード側に既定値は無いので、ここを消すと drift 検知は動かない（AGENTS.md ルール9）。
 #
-# **ほかの契約が持つ値をここへ写さない**（0055 §2.2 / §2.8）。
+# **ほかの契約が持つ値をここへ写さない**（0056 §2.2 / §2.8）。
 #   - 範囲 / support / 欠測の閾値 : config/fan-policy.yaml の model_confidence
 #   - residual の基準（正規化）   : ModelConfidenceProfile の validation residual RMS
 #   - 照合の許容幅               : config/fan-policy.yaml の shadow

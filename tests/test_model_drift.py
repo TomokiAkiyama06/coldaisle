@@ -1,6 +1,6 @@
 """#93 Thermal Model の drift 検知と再学習の条件。実機不要（合成した証拠だけで判定する）。
 
-**ここでは「守れているか」ではなく「破れないか」を試す。** 決定記録 0055 の不変条件を並べ、
+**ここでは「守れているか」ではなく「破れないか」を試す。** 決定記録 0056 の不変条件を並べ、
 1つずつ破ろうとする試験を置く。
 
 1. drift は **runtime（0050 の confidence）と offline（この package）に分かれる**。
@@ -246,7 +246,8 @@ def row(
                     )
                 )
                 continue
-            observed = PREDICTED + ratio * scale[(offset, metric)]
+            # Profile に基準が無い metric（試験用）でも記録は作れる。判定側が拒む。
+            observed = PREDICTED + ratio * scale.get((offset, metric), 1.0)
             matches.append(
                 OutcomeMatch(
                     offset_ms=offset,
@@ -301,7 +302,7 @@ def signal_of(report: DriftReport, kind: DriftSignalKind) -> InputDriftSignal:
 
 
 def test_drift_package_cannot_reach_fan_control() -> None:
-    """**offline の drift 検知は制御経路を持たない**（決定記録 0055 §2.1）。
+    """**offline の drift 検知は制御経路を持たない**（決定記録 0056 §2.1）。
 
     hardware / safety / reactive / serial / subprocess を import しないことを走査で確かめる。
     import できてしまえば、あとから1行で「drift を見て demand を下げる」が書ける。
@@ -335,7 +336,7 @@ def test_drift_package_cannot_reach_fan_control() -> None:
 
 
 def test_drift_package_has_no_clock() -> None:
-    """**時計を持たない**（0055 §2.1）。時刻はすべて証拠から来る。"""
+    """**時計を持たない**（0056 §2.1）。時刻はすべて証拠から来る。"""
     banned = {"time", "datetime", "coldaisle.clock"}
     for path in sorted(DRIFT_PACKAGE.glob("*.py")):
         tree = ast.parse(path.read_text(encoding="utf-8"))
@@ -349,7 +350,7 @@ def test_drift_package_has_no_clock() -> None:
 
 
 def test_report_cannot_carry_demand_or_authority(trained) -> None:
-    """報告に demand / PWM / authority の欄を作らない（0055 §2.1）。"""
+    """報告に demand / PWM / authority の欄を作らない（0056 §2.1）。"""
     _data, _parts, _model, profile = trained
     report = detector(profile).detect(DriftEvidence(shadow=rows(profile, 6)))
     payload = json.dumps(report.model_dump(mode="json"))
@@ -467,7 +468,7 @@ def test_residual_trend_is_ordered_by_evidence_time_and_stored(trained) -> None:
 
 
 def test_unidentifiable_outcomes_never_become_measured_drift(trained) -> None:
-    """**採点できない区間の差を drift にしない**（0053 §2.3 / 0055 §2.3）。
+    """**採点できない区間の差を drift にしない**（0053 §2.3 / 0056 §2.3）。
 
     掛かっていた action が違えば、差は制御器の違いとモデル誤差の混合である。
     """
@@ -491,7 +492,7 @@ def test_unidentifiable_outcomes_never_become_measured_drift(trained) -> None:
 
 
 def test_partially_matched_outcomes_are_not_counted_as_measured_drift(trained) -> None:
-    """**全出力が揃った outcome だけ**を比に数える（0055 §2.3）。
+    """**全出力が揃った outcome だけ**を比に数える（0056 §2.3）。
 
     照合できた出力だけの誤差は、当たりやすい出力に偏る。
     """
@@ -536,7 +537,7 @@ def test_a_metric_that_is_never_scored_blocks_sufficiency(trained) -> None:
 
 
 def test_evidence_from_another_model_is_not_counted_as_this_model_drift(trained) -> None:
-    """**identity を束縛する**（0055 §2.3）。別のモデルの区間を混ぜない。"""
+    """**identity を束縛する**（0056 §2.3）。別のモデルの区間を混ぜない。"""
     _data, _parts, _model, profile = trained
     ours = rows(profile, 6, ratio=1.0)
     theirs = tuple(row(profile, index, ratio=9.0, model_version="0.2.0") for index in range(6, 12))
@@ -550,26 +551,106 @@ def test_evidence_from_another_model_is_not_counted_as_this_model_drift(trained)
     assert report.residual.coverage.outcomes == 6
 
 
-def test_outputs_outside_the_profile_target_schema_are_refused(trained) -> None:
-    """binding が一致しているのに Profile に無い出力は、記録か Profile が壊れている。"""
-    _data, _parts, _model, profile = trained
-    stray = row(profile, 0)
-    broken = stray.model_copy(
+def rewrite_first_match(source: ShadowExportRow, **overrides: object) -> ShadowExportRow:
+    """1行の outcome の**最初の**照合結果だけを差し替える（束縛を1つずつ壊すため）。"""
+    outcome = source.outcomes[0]
+    first, *rest = outcome.matches
+    return source.model_copy(
         update={
             "outcomes": (
-                stray.outcomes[0].model_copy(
-                    update={
-                        "matches": tuple(
-                            match.model_copy(update={"metric": "gpu.0.hotspot"})
-                            for match in stray.outcomes[0].matches
-                        )
-                    }
+                outcome.model_copy(
+                    update={"matches": (first.model_copy(update=dict(overrides)), *rest)}
                 ),
             )
         }
     )
-    with pytest.raises(DriftInputError, match="target schema"):
+
+
+def test_outputs_that_the_prediction_never_had_are_refused(trained) -> None:
+    """**照合結果の出力は、束ねた予測の出力そのものでなければならない。**
+
+    予測に無い出力は、その記録が別の推論を抱えている証拠である。
+    """
+    _data, _parts, _model, profile = trained
+    broken = rewrite_first_match(row(profile, 0), metric="gpu.0.hotspot")
+    with pytest.raises(DriftInputError, match="予測に無い出力"):
         detector(profile).detect(DriftEvidence(shadow=(broken,)))
+
+
+def test_outputs_outside_the_profile_target_schema_are_refused(trained) -> None:
+    """binding が一致しているのに Profile に無い出力は、記録か Profile が壊れている。"""
+    _data, _parts, _model, profile = trained
+    # 予測も照合結果も同じ metric（束縛は壊れていない）。Profile にだけ基準が無い。
+    stray = row(profile, 0, metrics=("gpu.0.hotspot",))
+    with pytest.raises(DriftInputError, match="target schema"):
+        detector(profile).detect(DriftEvidence(shadow=(stray,)))
+
+
+def test_an_outcome_that_drops_outputs_is_not_a_complete_forecast(trained) -> None:
+    """**記録から出力を落とすだけで「全出力が揃った forecast」にできない。**
+
+    `ShadowOutcome.complete` は残っている match の中しか見ない。出力の集合は
+    束ねた予測から取り、落ちた出力は**照合できなかった**のと同じ扱いにする。
+    """
+    _data, _parts, _model, profile = trained
+    trimmed = tuple(
+        item.model_copy(
+            update={
+                "outcomes": (
+                    item.outcomes[0].model_copy(update={"matches": item.outcomes[0].matches[:1]}),
+                )
+            }
+        )
+        for item in rows(profile, 6, ratio=1.0)
+    )
+    report = detector(profile).detect(DriftEvidence(shadow=trimmed))
+
+    coverage = report.residual.coverage
+    assert (coverage.scored, coverage.counted, coverage.incomplete_scored) == (6, 0, 6)
+    assert coverage.outputs == 6 * len(HORIZONS) * len(TARGETS)
+    assert ("output_missing_from_outcome", 6 * 3) in [
+        (item.code, item.count) for item in coverage.unmatched_reasons
+    ]
+    # 落ちた metric は「採点できていない metric」として残る。
+    assert coverage.predicted_metrics == tuple(sorted(TARGETS))
+    assert report.residual.ratio is None
+    assert report.residual.verdict is DriftVerdict.INSUFFICIENT_EVIDENCE
+
+
+def test_the_same_output_cannot_be_counted_twice_inside_one_outcome(trained) -> None:
+    """同じ出力の照合結果を2つ置けば、その誤差を2回数えられる。"""
+    _data, _parts, _model, profile = trained
+    source = row(profile, 0)
+    outcome = source.outcomes[0]
+    doubled = source.model_copy(
+        update={
+            "outcomes": (
+                outcome.model_copy(update={"matches": (*outcome.matches, outcome.matches[0])}),
+            )
+        }
+    )
+    with pytest.raises(DriftInputError, match="同じ出力"):
+        detector(profile).detect(DriftEvidence(shadow=(doubled,)))
+
+
+def test_observation_times_outside_the_recorded_tolerance_are_refused(trained) -> None:
+    """**証拠の時刻は照合の規則の中にしか置けない**（0053 §2.3）。
+
+    許容幅の外の観測時刻を置けると、宣言された変更より前の証拠を後ろへずらして
+    数えさせたり、trend の bucket を並べ替えたりできる。
+    """
+    _data, _parts, _model, profile = trained
+    source = row(profile, 0)
+    late = source.outcomes[0].matches[0].expected_ts_ms + TOLERANCE_MS + 1
+    with pytest.raises(DriftInputError, match="許容幅の外"):
+        detector(profile).detect(
+            DriftEvidence(shadow=(rewrite_first_match(source, observed_ts_ms=late),))
+        )
+    early = source.shadow.ts_ms - 1
+    with pytest.raises(DriftInputError, match="action より前"):
+        detector(profile).detect(
+            DriftEvidence(shadow=(rewrite_first_match(source, observed_ts_ms=early),))
+        )
 
 
 def test_outcomes_matched_with_another_tolerance_are_refused(trained) -> None:
@@ -629,7 +710,7 @@ def test_another_export_schema_version_is_refused(trained) -> None:
 
 
 def test_thin_evidence_is_never_reported_as_no_drift(trained) -> None:
-    """**足りない証拠は `ok` にしない**（fail closed。0055 §2.4）。"""
+    """**足りない証拠は `ok` にしない**（fail closed。0056 §2.4）。"""
     _data, _parts, _model, profile = trained
     report = detector(profile).detect(DriftEvidence(shadow=rows(profile, 4, ratio=1.0)))
 
@@ -688,7 +769,7 @@ def test_a_degraded_signal_outranks_an_inconclusive_one(trained) -> None:
 
 
 def test_a_thin_trend_bucket_does_not_borrow_evidence_from_its_neighbours(trained) -> None:
-    """**bucket は自分の件数だけで判定する**（0055 §2.4）。"""
+    """**bucket は自分の件数だけで判定する**（0056 §2.4）。"""
     _data, _parts, _model, profile = trained
     # bucket = 3 件、bucket の下限 = 2 件。7 件なら最後の bucket は1件しか無い。
     report = detector(profile).detect(DriftEvidence(shadow=rows(profile, 7, ratio=1.0)))
@@ -727,6 +808,14 @@ def test_operating_outside_the_learned_range_is_reported_as_input_drift(trained)
     assert {"feature_range_degraded", "support_degraded"} <= codes
 
 
+def test_the_same_input_cannot_be_counted_twice(trained) -> None:
+    """**同じ推論入力を2回数えない。** 1件を並べ直すだけで下限を満たせてしまう。"""
+    _data, parts, _model, profile = trained
+    one = ObservedThermalInput.from_example(parts.test[0])
+    with pytest.raises(DriftInputError, match="2度現れた"):
+        detector(profile).detect(DriftEvidence(inputs=(one,) * 8))
+
+
 def test_too_few_inputs_publish_no_fraction(trained) -> None:
     """入力が下限に満たなければ**割合を出さない**（薄い証拠で分布を語らない）。"""
     _data, parts, _model, profile = trained
@@ -748,7 +837,7 @@ def test_too_few_inputs_publish_no_fraction(trained) -> None:
 
 
 def test_evidence_before_a_declared_change_is_not_counted(trained) -> None:
-    """**交換前後の residual を平均しない**（0055 §2.5）。"""
+    """**交換前後の residual を平均しない**（0056 §2.5）。"""
     _data, _parts, _model, profile = trained
     before = tuple(row(profile, index, ratio=2.5) for index in range(6))
     after = tuple(row(profile, index, ratio=1.0) for index in range(6, 12))
@@ -794,7 +883,7 @@ def test_a_change_that_removes_all_evidence_leaves_the_answer_open(trained) -> N
 
 
 def test_offline_thresholds_cannot_be_looser_than_the_runtime_contract(trained) -> None:
-    """**runtime より鈍い設定を受け付けない**（0055 §2.8）。
+    """**runtime より鈍い設定を受け付けない**（0056 §2.8）。
 
     offline が `degraded` と呼ぶ前に runtime が OOD で Fallback へ落ちていると、
     「Fallback で回っているのに drift は無い」という報告が出る。
@@ -834,7 +923,7 @@ def test_shipped_config_loads_and_stays_provisional() -> None:
         config.missing_pattern.warning_fraction.status,
     }
     assert statuses == {"provisional"}
-    # 0055 §2.2: runtime が持つ閾値を drift 設定へ写さない。
+    # 0056 §2.2: runtime が持つ閾値を drift 設定へ写さない。
     text = SHIPPED_CONFIG.read_text(encoding="utf-8")
     for copied in ("range_margin:", "min_support_count:", "residual_drift_ood_ratio:"):
         assert copied not in text
@@ -853,7 +942,7 @@ def test_reason_count_mirrors_the_evaluation_contract() -> None:
 
 
 def test_retraining_recommendation_always_needs_a_human(trained) -> None:
-    """**承認不要の再学習を表現できない**（0055 §2.6。AGENTS.md ルール1〜5）。"""
+    """**承認不要の再学習を表現できない**（0056 §2.6。AGENTS.md ルール1〜5）。"""
     _data, _parts, _model, profile = trained
     report = detector(profile).detect(DriftEvidence(shadow=rows(profile, 6, ratio=2.5)))
 
@@ -876,7 +965,7 @@ def test_a_recommendation_cannot_claim_retraining_without_a_reason(trained) -> N
 def test_acting_on_a_recommendation_registers_a_candidate_without_touching_production(
     trained, tmp_path
 ) -> None:
-    """**再学習した成果物は candidate 止まり**（#93 受入基準 / 0055 §2.6）。
+    """**再学習した成果物は candidate 止まり**（#93 受入基準 / 0056 §2.6）。
 
     drift の推奨は「候補を作れ」までで、Production ポインタは動かない。昇格は
     #90 / #91 の評価と人の承認を経る（0028 §2.9 承認点 5）。
@@ -928,20 +1017,87 @@ def test_cli_manifest_requires_an_explicit_window() -> None:
     assert manifest.changes[0].kind is ChangeKind.CALIBRATION_CHANGED
 
 
-def test_cli_refuses_a_dataset_whose_examples_do_not_match_the_manifest(trained, tmp_path) -> None:
-    """**書き換えられた example を「範囲外で運転した証拠」にしない。**"""
+def write_dataset(directory: Path, data, *, examples=None, manifest=None) -> None:
+    """Dataset artifact を書き出す（manifest と examples を別々に壊せるように）。"""
+    directory.mkdir(exist_ok=True)
+    chosen = data.examples if examples is None else examples
+    (directory / "manifest.json").write_bytes(
+        (
+            (manifest if manifest is not None else data.manifest).model_dump_json(indent=2) + "\n"
+        ).encode()
+    )
     from coldaisle.control.model.dataset import examples_jsonl_bytes
+
+    (directory / "examples.jsonl").write_bytes(examples_jsonl_bytes(chosen))
+
+
+def test_cli_refuses_a_dataset_whose_examples_do_not_match_the_manifest(trained, tmp_path) -> None:
+    """**書き換えられた example を「範囲外で運転した証拠」にしない。**
+
+    bytes（checksum）だけでなく、`ThermalDataset` の検証も通す。checksum は examples
+    からしか作られないので、**manifest ごと差し替えた dataset は checksum では閉じない。**
+    """
+    from coldaisle.drift import load_inputs
+
+    data, _parts, _model, _profile = trained
+    span = {"start_ms": 0, "end_ms": BASE_TS_MS}
+    directory = tmp_path / "dataset"
+    write_dataset(directory, data)
+    assert len(load_inputs(directory, **span)) == len(data.examples)
+
+    write_dataset(directory, data, examples=data.examples[:-1])
+    with pytest.raises(ValueError, match="checksum"):
+        load_inputs(directory, **span)
+
+    # checksum は examples から作るので、manifest だけを書き換えると通ってしまう。
+    # `ThermalDataset` の検証がそれを閉じる。
+    liar = data.manifest.model_copy(update={"example_count": len(data.examples) + 1})
+    write_dataset(directory, data, manifest=liar)
+    with pytest.raises(ValidationError, match="example_count"):
+        load_inputs(directory, **span)
+
+
+def test_cli_ignores_dataset_examples_outside_the_declared_window(trained, tmp_path) -> None:
+    """**空の区間が、古い健全な example を借りられないようにする。**"""
     from coldaisle.drift import load_inputs
 
     data, _parts, _model, _profile = trained
     directory = tmp_path / "dataset"
-    directory.mkdir()
-    (directory / "manifest.json").write_bytes(
-        (data.manifest.model_dump_json(indent=2) + "\n").encode()
-    )
-    (directory / "examples.jsonl").write_bytes(examples_jsonl_bytes(data.examples))
-    assert len(load_inputs(directory)) == len(data.examples)
+    write_dataset(directory, data)
+    action_times = sorted(example.action_ts_ms for example in data.examples)
 
-    (directory / "examples.jsonl").write_bytes(examples_jsonl_bytes(data.examples[:-1]))
-    with pytest.raises(ValueError, match="checksum"):
-        load_inputs(directory)
+    assert load_inputs(directory, start_ms=0, end_ms=action_times[0]) == ()
+    inside = load_inputs(directory, start_ms=action_times[0], end_ms=action_times[3])
+    assert tuple(item.action_ts_ms for item in inside) == tuple(action_times[:3])
+
+
+def test_cli_refuses_a_shadow_export_that_does_not_match_the_recomputation(trained) -> None:
+    """**渡された export は、同じ trace と観測から数え直した結果と1欄ずつ照らす。**
+
+    識別子と許容幅だけを見ても `status` / `observed` / `error` / 時刻は書き換えられる
+    （採点していない区間を `scored` に、外れた予測を当たりに仕立てられる）。
+    """
+    from coldaisle.drift import DriftEvidenceManifest, _check_supplied_shadow
+
+    _data, _parts, _model, profile = trained
+    computed = tuple(rows(profile, 3, ratio=1.0, start=2))
+    manifest = DriftEvidenceManifest.model_validate(
+        {
+            "schema_version": 1,
+            "start_ms": BASE_TS_MS + 2 * STEP_MS,
+            "end_ms": BASE_TS_MS + 5 * STEP_MS,
+        }
+    )
+    _check_supplied_shadow(computed, computed, manifest)
+
+    tampered = (*computed[:2], rewrite_first_match(computed[2], error=0.0))
+    with pytest.raises(ValueError, match="数え直した結果と違う"):
+        _check_supplied_shadow(tampered, computed, manifest)
+
+    with pytest.raises(ValueError, match="同じ tick の行が複数"):
+        _check_supplied_shadow((*computed, computed[0]), computed, manifest)
+
+    # 期間の外の行（古い健全な証拠）を借りない。
+    old = rows(profile, 2, ratio=1.0, start=0)
+    with pytest.raises(ValueError, match="期間の外"):
+        _check_supplied_shadow((*old, *computed), computed, manifest)

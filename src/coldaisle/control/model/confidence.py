@@ -615,7 +615,7 @@ class ProfileCoverage(_Frozen):
     """1つの入力を Profile と照らした結果。**判定の素材で、判定そのものではない。**
 
     ``ConfidenceAssessor`` の feature range / fan state range / support / missing pattern は
-    すべてこの値から作られる。offline の drift 検知（#93 / 決定記録 0055 §2.2）も同じものを
+    すべてこの値から作られる。offline の drift 検知（#93 / 決定記録 0056 §2.2）も同じものを
     読む。**同じ問いに2つの実装を置かない**ための共有点である。
     """
 

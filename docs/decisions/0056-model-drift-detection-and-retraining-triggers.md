@@ -1,4 +1,4 @@
-# 決定記録 0055: Thermal Model の drift 検知の置き場所と再学習の条件
+# 決定記録 0056: Thermal Model の drift 検知の置き場所と再学習の条件
 
 - **種別**: Decision Record
 - **Status**: Proposed
@@ -82,13 +82,28 @@
 - **全出力が照合できた outcome だけ**を比に数える（0050 §2.2 の forecast 単位と同じ）。
   一部の出力しか照合できなかった `scored` は「採点したが比には入れない」として別に数える。
   出力の数で数えると、多出力の予測1回で最低件数を満たしてしまう
+- **「全出力」は束ねた予測の出力の集合から決める。** 照合結果に残っている出力だけを見ると
+  （`ShadowOutcome.complete` はそれしか見ない）、**記録から出力を落とすだけで**
+  「全出力が揃った forecast」に仕立てられる。予測に無い出力と、同じ出力の二重の照合結果は拒み、
+  落ちた出力は**照合できなかった**のと同じに数える
+- **証拠の時刻は、記録された照合の規則の中にしか置けない。** 照合に使った観測は action より後で、
+  期待時刻から `match_tolerance_ms` 以内でなければならない（0053 §2.3）。外を許すと、
+  宣言された変更より前の証拠を後ろへずらして数えさせたり、trend の bucket を並べ替えたりできる
 - **識別子で束縛する。** counterfactual の `model_version` / `artifact_sha256` / `model_id` が
   Profile の binding と一致するものだけを数える。別のモデルの区間は `foreign_model` として
   数え、混ぜない。outcome は `inference_id` + `plan_digest` で counterfactual に結び直し、
   **結べなければ受け取らない**（0054 §2.6）
 - **同じ証拠を2回数えない。** 同じ `(tick_id, ts_ms)` の行、同じ `(inference_id, plan_digest)` の
   outcome が2度現れたら**入力の誤りとして拒む**。「数えないだけ」にすると、行を複製するだけで
-  coverage の下限を満たせる
+  coverage の下限を満たせる。**入力分布の側も同じ**で、同じ action 時刻の推論入力を2度は数えない
+  （1件を並べ直すだけで `minimum_inputs` を満たせてしまう）
+- **外から渡された Shadow export は、同じ trace と観測から数え直した結果と1欄ずつ照らす**
+  （0054 §2.6 と同じ扱い）。識別子と許容幅だけを見ても `status` / `observed` / `error` / 時刻は
+  書き換えられる。一致しなければ受け取らず、一致したら**数え直したほうを使う**
+- **宣言した期間の外の証拠を使わない。** 期間を絞って「証拠が無い」はずの区間を見ているのに、
+  古い健全な export の行や Dataset の example が判定を埋めてはならない。
+  Dataset は checksum だけでなく `ThermalDataset` の検証も通す（manifest ごと差し替えた
+  dataset は checksum では閉じない）
 - **証拠の時刻は証拠自身から決める。** outcome の時刻は照合に使った観測のうち最も新しい時刻、
   1つも照合できなければ照合期限（最後の期待時刻 + 許容幅）とする（0050 §2.2 と同じ）
 - 予測の出力が Profile の target schema に無ければ**例外で閉じる**。binding が一致している以上、

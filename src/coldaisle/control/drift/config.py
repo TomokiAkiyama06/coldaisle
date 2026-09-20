@@ -1,9 +1,9 @@
-"""Model Drift 検知の設定（`config/drift.yaml`。#93 / 決定記録 0055 §2.8）。
+"""Model Drift 検知の設定（`config/drift.yaml`。#93 / 決定記録 0056 §2.8）。
 
 **既定値を置かない。** 実測前の暫定値はすべて `{value, status: provisional}` で持ち、
 設定が欠けていれば読み込みで落とす（AGENTS.md ルール9）。
 
-**ほかの契約が持っている値をここへ写さない**（0055 §2.2 / §2.8）。
+**ほかの契約が持っている値をここへ写さない**（0056 §2.2 / §2.8）。
 
 - 範囲・support・欠測の閾値は `fan-policy.yaml` の `model_confidence`
 - 正規化に使う residual の基準は `ModelConfidenceProfile`（validation residual RMS）
@@ -38,7 +38,7 @@ class _ConfigModel(BaseModel):
 
 
 class ResidualDriftGate(_ConfigModel):
-    """prediction residual の悪化をどこで warning / degraded と呼ぶか（0055 §2.4）。
+    """prediction residual の悪化をどこで warning / degraded と呼ぶか（0056 §2.4）。
 
     比の基準は **Profile の validation residual RMS**（`ratio = 1.0` が学習時の水準）である。
     """
@@ -51,7 +51,7 @@ class ResidualDriftGate(_ConfigModel):
     degraded_ratio: DriftRatioValue
     """`degraded_ratio` は `model_confidence.residual_drift_ood_ratio` 以下にする。
 
-    値そのものは**写さない**。検知器の生成時に runtime の設定と照合する（0055 §2.8）。
+    値そのものは**写さない**。検知器の生成時に runtime の設定と照合する（0056 §2.8）。
     offline が runtime より鈍いと、runtime が OOD で Fallback へ落ちている最中に
     offline が「問題なし」と言う。
     """
