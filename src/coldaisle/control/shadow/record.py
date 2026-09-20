@@ -39,7 +39,6 @@ from coldaisle.control.schema import (
     ShadowRecord,
     SupervisorOutput,
     Zone,
-    proposal_digest,
 )
 
 
@@ -175,11 +174,11 @@ class ShadowRecorder:
 
     @staticmethod
     def _check_candidate(learned: MpcProposal, selection: ControllerSelection) -> None:
-        """記録しようとしている提案が、**Gate が評価した候補そのもの**か確かめる。
+        """記録しようとしている結果が、**Gate が評価した worker 結果そのもの**か確かめる。
 
-        推論の識別子だけでは足りない。同じ anchor 推論からは別の候補 demand を持つ提案を
-        いくつでも作れるので、それだけで照合すると「Gate が退けたのはこの提案」と言えない。
-        Gate が残した候補の識別子（``ControllerSelection.candidate_digest``）と突き合わせる。
+        推論の識別子では足りない（同じ入力・同じ予測から別の候補 demand を作れる）し、提案
+        だけの識別子でも足りない（同じ提案のまま別の解＝別の予測を抱えられる）。記録側が書く
+        値をすべて覆う ``MpcProposal.result_digest()`` で照らす（決定記録 0053 §2.2）。
         """
         if learned.proposal is None:
             if selection.candidate_digest is not None:
@@ -187,7 +186,7 @@ class ShadowRecorder:
             return
         if selection.candidate_digest is None:
             raise ValueError("Gate が評価した候補の識別子が無い提案は記録しない")
-        if proposal_digest(learned.proposal) != selection.candidate_digest:
+        if learned.result_digest() != selection.candidate_digest:
             raise ValueError("Gate が評価した候補と別の提案を counterfactual にしようとしている")
 
     @staticmethod

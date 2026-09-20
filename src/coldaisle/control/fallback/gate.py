@@ -25,7 +25,6 @@ from coldaisle.control.schema import (
     SafetyState,
     Zone,
     ZoneRequest,
-    proposal_digest,
 )
 
 
@@ -129,9 +128,17 @@ class LearnedControlStatus(_Frozen):
     `failure` だけでは `model_load_failure` としか残らず、何が起きたのかを後から読めない。
     Gate はこれを Fallback の理由の detail に載せる。
     """
+    result_digest: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    """この状態の元になった **worker 結果そのもの**の識別子（``MpcProposal.result_digest()``）。
+
+    Gate は中身を解釈せず、選んだ結果とともにそのまま残す。記録側（#90）が「Gate が見たのと
+    同じ worker 結果か」を照らすために使う。提案・assessment・解のすべてを覆う。
+    """
 
     @model_validator(mode="after")
     def _proposal_and_receipt_match(self) -> Self:
+        if self.result_digest is not None and self.proposal is None:
+            raise ValueError("提案の無い状態に worker 結果の識別子を付けない")
         if self.failure_reason is not None and self.failure is None:
             raise ValueError("失敗していない状態に failure_reason を付けない")
         if (self.proposal is None) != (self.received_at_mono_ms is None):
@@ -157,17 +164,18 @@ class ControllerSelection(_Frozen):
     model_gate: ModelGateDecision | None = None
     """Learned proposal があった tick の confidence / authority の判断（#85）。"""
     candidate_digest: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
-    """Gate が評価した Learned 候補**そのもの**の識別子（``proposal_digest``）。
+    """Gate が評価した **worker 結果そのもの**の識別子（``MpcProposal.result_digest()``）。
 
-    記録側（#90）が「Gate が退けたのはこの提案か」を照らすために使う。推論の識別子だけでは、
-    同じ anchor から作った別の候補 demand の提案と見分けられない。
+    記録側（#90）が「Gate が退けたのはこの結果か」を照らすために使う。推論の識別子では入力と
+    予測しか指さず、提案の識別子では解（候補 plan と予測）を覆えない。**記録側が書く値を
+    すべて覆う識別子**をそのまま持ち回る。
     """
 
     @model_validator(mode="after")
     def _the_evaluated_candidate_is_identified(self) -> Self:
-        if (self.candidate_digest is None) != (self.model_gate is None):
-            # Gate が候補を見た tick には必ず識別子が付く（記録側が照合できるように）。
-            raise ValueError("評価した候補の識別子と model_gate は一緒に記録する")
+        if self.candidate_digest is not None and self.model_gate is None:
+            # 候補を評価していない tick に、候補の識別子だけが残ることはない。
+            raise ValueError("候補を評価していない tick に worker 結果の識別子を付けない")
         return self
 
     @property
@@ -593,11 +601,9 @@ class ControllerGate:
             # #92 がこのsignalを受けてSHADOW降格を永続化する。Gateは設定を変更しない。
             demotion_recommended=transition_count >= self._policy.demote_after,
             model_gate=self._model_gate(learned, proposal, limits),
-            # **Gate が受け取った候補そのもの**を識別する。authority で値を狭めたあとの提案でも、
-            # 記録側が「退けられたのはどれか」を元の候補で照合できる。
-            candidate_digest=(
-                None if learned.proposal is None else proposal_digest(learned.proposal)
-            ),
+            # **Gate が受け取った worker 結果そのもの**を識別する。authority で値を狭めたあとの
+            # 提案でも、記録側が「退けられたのはどれか」を元の結果で照合できる。
+            candidate_digest=learned.result_digest,
         )
 
     def _check_inputs(

@@ -32,8 +32,8 @@ from coldaisle.control.fallback import (
     LearnedControlStatus,
     LearnedFailure,
 )
-from coldaisle.control.model.confidence import fit_confidence_profile
-from coldaisle.control.model.thermal import canonical_artifact_bytes
+from coldaisle.control.model.confidence import ConfidenceAssessment, fit_confidence_profile
+from coldaisle.control.model.thermal import ArtifactVerification, canonical_artifact_bytes
 from coldaisle.control.mpc import MpcProposal
 from coldaisle.control.schema import (
     AuthorityStage,
@@ -178,6 +178,7 @@ def mpc_result(
     proposal: ControllerProposal | None = None,
     *,
     failure: LearnedFailure | None = None,
+    assessment: ConfidenceAssessment | None = None,
 ) -> MpcProposal:
     """worker の結果（解を持たない軽量版）。timeout / 失敗の記録に使う。"""
     if failure is not None:
@@ -186,7 +187,12 @@ def mpc_result(
             failure_reason=Reason(code="model_unusable", detail="capability mismatch"),
         )
     assert proposal is not None
-    return MpcProposal(proposal=proposal, assessment=assessment_for(proposal))
+    return MpcProposal(proposal=proposal, assessment=assessment or assessment_for(proposal))
+
+
+def worker_status(result: MpcProposal) -> LearnedControlStatus:
+    """worker 結果から Gate へ渡す状態（**識別子ごと**運ばれる実際の経路）。"""
+    return result.to_status(received_at_mono_ms=0)
 
 
 def control_state(selection, *, stage: AuthorityStage = AuthorityStage.SHADOW) -> ControlState:
@@ -252,7 +258,7 @@ def recorded(
     """1 tick の Gate 選択と ShadowRecord を一緒に返す。"""
     status = LearnedControlStatus()
     if learned is not None and learned.proposal is not None:
-        status = learned_status(learned.proposal)
+        status = worker_status(learned)
     selection = gate_selection(stage=stage, learned=status, baseline=baseline)
     state = control_state(selection, stage=AuthorityStage(stage))
     record = ShadowRecorder(config).record(
@@ -829,8 +835,12 @@ def test_invariant_3_h_the_indexed_match_equals_the_naive_one() -> None:
 def test_invariant_4_a_an_unattested_proposal_records_no_confidence() -> None:
     """assessment と束ねられない提案の confidence / ood は**記録しない**。"""
     proposal = shadow_proposal(0.9, confidence=0.99)
-    unattested = LearnedControlStatus(proposal=proposal, received_at_mono_ms=0)
-    selection = gate_selection(learned=unattested)
+    # Registry を通っていない判定は Gate が裏づけとして扱わない（#85）。
+    offline = assessment_for(proposal).model_copy(
+        update={"artifact_verification": ArtifactVerification.OFFLINE_UNVERIFIED}
+    )
+    result = mpc_result(proposal, assessment=offline)
+    selection = gate_selection(learned=worker_status(result))
     state = control_state(selection)
     record = ShadowRecorder(SHADOW_CONFIG).record(
         tick_id=7,
@@ -839,7 +849,7 @@ def test_invariant_4_a_an_unattested_proposal_records_no_confidence() -> None:
         effective=demands(0.4),
         selection=selection,
         baseline=fallback_proposal(0.4),
-        learned=mpc_result(proposal),
+        learned=result,
     )
 
     assert record is not None
@@ -1526,56 +1536,45 @@ def test_invariant_2_g_the_recorded_candidate_must_be_the_one_the_gate_saw() -> 
     推論の識別子だけで照合すると、同じ入力・同じ予測から作った別の候補 demand の提案を
     「Gate が退けたのはこれ」として残せてしまう。
     """
-    evaluated = shadow_proposal(0.9)
-    selection = gate_selection(learned=learned_status(evaluated))
+    evaluated = mpc_result(shadow_proposal(0.9))
+    selection = gate_selection(learned=worker_status(evaluated))
     state = control_state(selection)
     # 同じ推論・同じ assessment だが、要求した demand が違う提案。
-    another = shadow_proposal(0.5)
-    assert another.inference_id == evaluated.inference_id
+    another = mpc_result(shadow_proposal(0.5))
+    assert another.proposal is not None and evaluated.proposal is not None
+    assert another.proposal.inference_id == evaluated.proposal.inference_id
 
     with pytest.raises(ValueError, match="別の提案"):
-        ShadowRecorder(SHADOW_CONFIG).record(
-            tick_id=7,
-            ts_ms=TICK_TS_MS,
-            state=state,
-            effective=demands(0.4),
-            selection=selection,
-            baseline=fallback_proposal(0.4),
-            learned=mpc_result(another),
-        )
+        record_with(selection, state, learned=another)
 
-    # Gate が見た候補そのものなら記録できる。
-    record = ShadowRecorder(SHADOW_CONFIG).record(
+    # Gate が見た結果そのものなら記録できる。
+    assert record_with(selection, state, learned=evaluated) is not None
+
+
+def record_with(selection, state, *, learned: MpcProposal):
+    """同じ tick の記録を、worker 結果だけ差し替えて試す。"""
+    return ShadowRecorder(SHADOW_CONFIG).record(
         tick_id=7,
         ts_ms=TICK_TS_MS,
         state=state,
         effective=demands(0.4),
         selection=selection,
         baseline=fallback_proposal(0.4),
-        learned=mpc_result(evaluated),
+        learned=learned,
     )
-    assert record is not None
 
 
 def test_invariant_2_h_a_selection_without_the_candidate_identity_is_refused() -> None:
     """Gate の識別子を落とした選択結果では記録しない（fail closed）。"""
-    evaluated = shadow_proposal(0.9)
-    selection = gate_selection(learned=learned_status(evaluated))
+    evaluated = mpc_result(shadow_proposal(0.9))
+    selection = gate_selection(learned=worker_status(evaluated))
     state = control_state(selection)
     stripped = ControllerSelection.model_validate(
-        selection.model_dump(mode="python") | {"candidate_digest": None, "model_gate": None}
+        selection.model_dump(mode="python") | {"candidate_digest": None}
     )
 
     with pytest.raises(ValueError, match="識別子が無い"):
-        ShadowRecorder(SHADOW_CONFIG).record(
-            tick_id=7,
-            ts_ms=TICK_TS_MS,
-            state=state,
-            effective=demands(0.4),
-            selection=stripped,
-            baseline=fallback_proposal(0.4),
-            learned=mpc_result(evaluated),
-        )
+        record_with(stripped, state, learned=evaluated)
 
 
 def test_invariant_7_g_the_jsonl_omits_the_fields_that_have_no_value() -> None:
@@ -1626,3 +1625,138 @@ def _jsonl_outcome(*, applied: float, observations=None) -> dict:
     payload = json.loads(line)
     (outcome,) = payload["outcomes"]
     return outcome
+
+
+def swapped_solution(result: MpcProposal) -> MpcProposal:
+    """提案も assessment もそのままに、**解（候補 plan と予測）だけ**を別物にした結果。
+
+    同じ held plan に対する別の妥当な予測は、いくらでも作れる。検証を通さない ``model_copy``
+    で作るのは、「壊れた値」ではなく「別の正しい結果」を渡したときに閉じることを試すため。
+    """
+    assert result.solution is not None
+    prediction_ = result.solution.prediction
+    other = prediction_.model_copy(
+        update={
+            "targets": tuple(
+                target.model_copy(
+                    update={
+                        "values": {metric: value + 1.0 for metric, value in target.values.items()}
+                    }
+                )
+                for target in prediction_.targets
+            )
+        }
+    )
+    return result.model_copy(
+        update={"solution": result.solution.model_copy(update={"prediction": other})}
+    )
+
+
+def test_invariant_2_i_a_result_with_another_solution_is_refused(trained_model) -> None:
+    """**解だけを差し替えた結果**を、Gate の判断に属する記録にできない。
+
+    提案と assessment が同じなら、解（= 予測）を入れ替えても提案の識別子は変わらない。
+    それだけで照合すると、Gate が見たのとは別の予測を「その判断の予測」として残せてしまう。
+    """
+    controller, _model, _settings = build_controller(
+        trained_model, policy_config=mpc_policy(authority="shadow"), acoustic=True
+    )
+    evaluated = propose(controller, baseline=0.3)
+    assert evaluated.proposal is not None and evaluated.solution is not None
+    forged = swapped_solution(evaluated)
+    assert forged.proposal == evaluated.proposal
+    assert forged.assessment == evaluated.assessment
+    assert forged.solution != evaluated.solution
+
+    selection = gate_selection(learned=worker_status(evaluated))
+    state = control_state(selection)
+
+    with pytest.raises(ValueError, match="別の提案"):
+        record_with(selection, state, learned=forged)
+    assert record_with(selection, state, learned=evaluated) is not None
+
+
+def test_invariant_2_j_the_digest_covers_every_recorded_part_of_the_result(trained_model) -> None:
+    """**記録が書く値は、すべて識別子に覆われている。**
+
+    counterfactual が worker 結果から写すのは、要求 demand・理由・optimizer の結果・latency・
+    評価回数・model 版・推論 id・artifact hash・候補 plan・予測・コスト・失敗の理由である。
+    そのどれを変えても識別子が変わること（= 覆われていること）を、1つずつ確かめる。
+    confidence / ood は worker 結果ではなく Gate の判断（`model_gate`）から取るため、ここには
+    含まれない（trace 側で `model_gate` と突き合わせる。不変条件 2-c）。
+    """
+    controller, _model, _settings = build_controller(
+        trained_model, policy_config=mpc_policy(authority="shadow"), acoustic=True
+    )
+    base = propose(controller, baseline=0.3)
+    assert base.proposal is not None and base.solution is not None and base.assessment is not None
+    digest = base.result_digest()
+
+    variants = {
+        "requested": base.model_copy(
+            update={
+                "proposal": base.proposal.model_copy(
+                    update={"requested": requests_of(base.proposal, 0.55)}
+                )
+            }
+        ),
+        "optimizer_status": base.model_copy(
+            update={
+                "proposal": base.proposal.model_copy(
+                    update={"optimizer_status": OptimizerStatus.TIMEOUT}
+                )
+            }
+        ),
+        "latency_ms": base.model_copy(
+            update={"proposal": base.proposal.model_copy(update={"latency_ms": 999})}
+        ),
+        "model_version": base.model_copy(
+            update={"proposal": base.proposal.model_copy(update={"model_version": "other-v9"})}
+        ),
+        "inference_id": base.model_copy(
+            update={"proposal": base.proposal.model_copy(update={"inference_id": "e" * 64})}
+        ),
+        "artifact_sha256": base.model_copy(
+            update={"assessment": base.assessment.model_copy(update={"artifact_sha256": "f" * 64})}
+        ),
+        "evaluations": base.model_copy(
+            update={"solution": base.solution.model_copy(update={"evaluations": 999})}
+        ),
+        "plan": base.model_copy(
+            update={
+                "solution": base.solution.model_copy(
+                    update={"plan": other_plan(base.solution.plan)}
+                )
+            }
+        ),
+        "prediction": swapped_solution(base),
+        "cost_total": base.model_copy(
+            update={
+                "solution": base.solution.model_copy(update={"cost": zero_cost(base.solution.cost)})
+            }
+        ),
+        "failure_reason": base.model_copy(update={"failure_reason": Reason(code="other_failure")}),
+    }
+    unchanged = sorted(
+        name for name, variant in variants.items() if variant.result_digest() == digest
+    )
+    assert unchanged == []
+
+
+def requests_of(proposal: ControllerProposal, demand: float):
+    request = proposal.requested.front.model_copy(update={"demand": demand})
+    return PerZone(front=request, rear=request, top=request)
+
+
+def other_plan(plan):
+    return plan.model_copy(
+        update={
+            "steps": tuple(
+                step.model_copy(update={"demands": demands(0.11)}) for step in plan.steps
+            )
+        }
+    )
+
+
+def zero_cost(cost):
+    return cost.model_copy(update={"total": cost.total + 1.0})

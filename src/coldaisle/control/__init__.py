@@ -214,7 +214,6 @@ from coldaisle.control.schema import (
     Zone,
     ZoneRecord,
     ZoneRequest,
-    proposal_digest,
 )
 from coldaisle.control.shadow import (
     SHADOW_EXPORT_SCHEMA_VERSION,
@@ -470,7 +469,6 @@ __all__ = [
     "invalid_config_decision",
     "load_acoustic_model",
     "load_model_registry_limits",
-    "proposal_digest",
     "shadow_plan",
     "shadow_prediction",
     "shadow_rows",
