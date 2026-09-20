@@ -3,7 +3,13 @@
 - **種別**: Decision Record
 - **Status**: Proposed
 - **Date**: 2026-09-20
-- **Supersedes**: なし
+- **Supersedes**: [`0053-control-shadow-mode-and-counterfactual-logging.md`](0053-control-shadow-mode-and-counterfactual-logging.md)
+  §2.3 のうち、**照合結果（`ShadowOutcome`）に残す照合条件の範囲だけ**。0053 は時刻の許容幅
+  （`match_tolerance_ms`）だけを記録に残し、識別の許容幅（`applied_demand_tolerance`）を
+  残していなかった。**§2.3 の照合・採点の規則そのもの**（期待時刻・±許容幅の最近傍・同距離は
+  過去側・action より後・品質 `OK` だけ・**予測した候補 action が実際に掛かっていた区間だけ
+  採点する**）と、§2.1 / §2.2 / §2.4 / §2.5 は**そのまま有効**。
+  これに伴い §2.4 の export の版が 1 → 2 になる（下記 2.9）
 - **関連**: [`0027-fan-control-architecture.md`](0027-fan-control-architecture.md)、
   [`0028-fan-control-contracts.md`](0028-fan-control-contracts.md) §2.4 / §2.5 / §2.9、
   [`0037-model-registry-rollback-target.md`](0037-model-registry-rollback-target.md)、
@@ -107,6 +113,9 @@
 - **外から渡された Shadow export は、同じ trace と観測から数え直した結果と1欄ずつ照らす**
   （0054 §2.6 と同じ扱い）。識別子と許容幅だけを見ても `status` / `observed` / `error` / 時刻は
   書き換えられる。一致しなければ受け取らず、一致したら**数え直したほうを使う**
+- **期間の判定は証拠の時刻で行う。** 行が期間の中にあっても、その予測の実測は `end_ms` を
+  越えうる。越えた outcome は `purged` として数え、指標には入れない（0054 §2.5 の `purged` と
+  同じ扱い）。行の時刻だけを見ると、絞ったはずの区間の coverage を外の証拠が満たす
 - **宣言した期間の外の証拠を使わない。** 期間を絞って「証拠が無い」はずの区間を見ているのに、
   古い健全な export の行や Dataset の example が判定を埋めてはならない。
   Dataset は checksum だけでなく `ThermalDataset` の検証も通す（manifest ごと差し替えた
@@ -215,6 +224,23 @@ missing_pattern: { warning_fraction: {...}, degraded_fraction: {...} }
   「問題なし」と言う。写しではなく**照合**であり、drift 設定に runtime の値を置かない
 - 範囲・support・欠測の閾値は `fan-policy.yaml` の `model_confidence` をそのまま使う。
   **drift 設定に持たない**
+
+### 2.9 照合結果に**識別の許容幅**を残す（0053 §2.3 のこの1点だけを置き換える）
+
+`ShadowOutcome.status` は、時刻の照合だけでなく「**予測した候補 action が実際に掛かっていたか**」
+の判定にも依る（0053 §2.3。`shadow.applied_demand_tolerance` で判定する）。ところが記録に
+残っていたのは時刻の許容幅だけで、**広い幅で識別した結果が `scored` を名乗っている**ことを
+読む側が確かめられなかった。幅を広げれば、別の action が掛かっていた区間まで「plan どおり
+実行された」になる。
+
+- `ShadowOutcome` に `applied_demand_tolerance` を**必須**で足す
+- 照合器はこれを記録し、drift の検知器は `fan-policy.yaml` の `shadow` と**照らす**
+  （時刻の許容幅と同じ規則。写さない）
+- **既定値を置かない。** 欄を持たない古い記録は読み込みで落とす。既定で補うと、どの幅で
+  識別したのか分からない結果が「運用の幅で作られた」ものとして通る
+- export 1行の版を **1 → 2** に上げる。v1 の行は読み込みで落ちる
+
+**この節の変更は #90 / #91 の記録の形に触れる。** 0056 の承認と**一緒に所有者の承認が要る**。
 
 ## 3. Consequences
 

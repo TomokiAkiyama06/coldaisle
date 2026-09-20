@@ -67,6 +67,7 @@ from coldaisle.control.shadow import (
     OutcomeStatus,
     ShadowExportRow,
     ShadowOutcome,
+    ShadowOutcomeMatcher,
 )
 from test_fallback_controller import learned_proposal
 from test_model_confidence import (
@@ -94,6 +95,7 @@ TARGETS = (GPU, AIR)
 BASE_TS_MS = 1_787_616_000_000
 STEP_MS = 10_000
 TOLERANCE_MS = 500
+APPLIED_DEMAND_TOLERANCE = 0.01
 PREDICTED = 50.0
 
 
@@ -149,13 +151,16 @@ def drift_config(
     )
 
 
-def shadow_config(tolerance_ms: int = TOLERANCE_MS) -> ShadowConfig:
+def shadow_config(
+    tolerance_ms: int = TOLERANCE_MS,
+    demand_tolerance: float = APPLIED_DEMAND_TOLERANCE,
+) -> ShadowConfig:
     """照合の許容幅の契約（`fan-policy.yaml` の `shadow`）。**drift 設定に写さない。**"""
     return ShadowConfig.model_validate(
         {
             "enabled": True,
             "outcome_match_tolerance_ms": provisional(tolerance_ms),
-            "applied_demand_tolerance": provisional(0.01),
+            "applied_demand_tolerance": provisional(demand_tolerance),
         }
     )
 
@@ -207,6 +212,7 @@ def row(
     tick_id: int | None = None,
     inference: str | None = None,
     tolerance_ms: int = TOLERANCE_MS,
+    demand_tolerance: float = APPLIED_DEMAND_TOLERANCE,
     observed_offset_ms: int = 100,
 ) -> ShadowExportRow:
     """1 tick 分の Shadow 実績。**誤差は validation scale の `ratio` 倍**にする。
@@ -283,6 +289,7 @@ def row(
         plan_digest=plan.digest(),
         input_action_ts_ms=action_ts_ms,
         match_tolerance_ms=tolerance_ms,
+        applied_demand_tolerance=demand_tolerance,
         status=status,
         unidentifiable=(
             None if scored else Reason(code="applied_action_differs", detail="別の値が掛かっていた")
@@ -368,13 +375,45 @@ def test_drift_package_has_no_clock() -> None:
             assert not names & banned, f"{path.name} が時計を import している: {names}"
 
 
+def field_names(payload: object) -> set[str]:
+    """報告のすべての階層に現れる欄の名前。"""
+    if isinstance(payload, dict):
+        found = set(payload)
+        for value in payload.values():
+            found |= field_names(value)
+        return found
+    if isinstance(payload, list):
+        return {name for item in payload for name in field_names(item)}
+    return set()
+
+
 def test_report_cannot_carry_demand_or_authority(trained) -> None:
-    """報告に demand / PWM / authority の欄を作らない（0056 §2.1）。"""
+    """報告に demand / PWM / authority の**値**を持つ欄を作らない（0056 §2.1）。
+
+    記録した閾値（`applied_demand_tolerance`）は判定の条件であって、制御へ渡せる値ではない。
+    欄の名前で確かめるので、条件の記録と取り違えない。
+    """
     _data, _parts, _model, profile = trained
     report = detector(profile).detect(DriftEvidence(shadow=rows(profile, 6)))
-    payload = json.dumps(report.model_dump(mode="json"))
-    for banned in ("demand", "pwm", "authority", "effective"):
-        assert banned not in payload.lower()
+    names = field_names(report.model_dump(mode="json"))
+    banned = {
+        "demand",
+        "requested",
+        "requested_demand",
+        "effective",
+        "effective_demand",
+        "pwm",
+        "duty",
+        "rpm",
+        "authority",
+        "authority_stage",
+        "confidence",
+        "ood",
+        "front",
+        "rear",
+        "top",
+    }
+    assert names & banned == set()
     assert not hasattr(report, "confidence")
 
 
@@ -765,7 +804,7 @@ def test_another_export_schema_version_is_refused(trained) -> None:
     single = row(profile, 0)
     with pytest.raises(DriftInputError, match="版"):
         detector(profile).detect(
-            DriftEvidence(shadow=(single.model_copy(update={"schema_version": 2}),))
+            DriftEvidence(shadow=(single.model_copy(update={"schema_version": 1}),))
         )
 
 
@@ -1411,3 +1450,90 @@ def test_the_evidence_digest_does_not_depend_on_the_caller_order(trained) -> Non
     )
     inside = detector(profile).detect(DriftEvidence(shadow=shuffled, inputs=inputs))
     assert inside.provenance.evidence_sha256 == forward.provenance.evidence_sha256
+
+
+# ---------------------------------------------------------------- 16. 期間と識別の許容幅
+
+
+def test_evidence_landing_outside_the_window_is_purged_not_counted(trained) -> None:
+    """**行が期間の中でも、その予測の実測は `end_ms` を越えうる**（0056 §2.3）。
+
+    期間の外の residual を数えると、絞ったはずの区間の coverage を外の証拠が満たす。
+    """
+    _data, _parts, _model, profile = trained
+    shadow = rows(profile, 6, ratio=1.0)
+    end_ms = shadow[-1].ts_ms + 1  # 最後の行は期間の中だが、その実測は外に落ちる
+    # 最後の行の実測（action + 2000ms + 100ms）は end_ms を越える。
+    report = detector(profile).detect(
+        DriftEvidence(shadow=shadow, window_start_ms=BASE_TS_MS, window_end_ms=end_ms)
+    )
+
+    coverage = report.residual.coverage
+    # 最後の行だけが期間を跨ぐ。**落とさずに数え、指標には入れない。**
+    assert coverage.purged == 1
+    assert coverage.outcomes == 5
+    assert coverage.counted == 5
+
+    wide = detector(profile).detect(
+        DriftEvidence(
+            shadow=shadow, window_start_ms=BASE_TS_MS, window_end_ms=end_ms + 10 * STEP_MS
+        )
+    )
+    assert wide.residual.coverage.purged == 0
+    assert wide.residual.coverage.counted == 6
+
+
+def test_outcomes_made_with_another_applied_demand_tolerance_are_refused(trained) -> None:
+    """**`status` は識別の許容幅にも依る**（0056 §2.3。0053 §2.3 の記録内容を拡張）。
+
+    広い幅で識別すれば、別の action が掛かっていた区間まで `scored` になる。記録に
+    残していなければ、読む側はそれを確かめられない。
+    """
+    _data, _parts, _model, profile = trained
+    loose = tuple(
+        row(profile, index, ratio=1.0, demand_tolerance=APPLIED_DEMAND_TOLERANCE * 2)
+        for index in range(6)
+    )
+    with pytest.raises(DriftInputError, match="識別許容幅"):
+        detector(profile).detect(DriftEvidence(shadow=loose))
+
+    # 契約の側を合わせれば数えられる（写しではなく照合）。
+    matched = detector(profile, shadow=shadow_config(demand_tolerance=APPLIED_DEMAND_TOLERANCE * 2))
+    report = matched.detect(DriftEvidence(shadow=loose))
+    assert report.provenance.applied_demand_tolerance == APPLIED_DEMAND_TOLERANCE * 2
+
+
+def test_an_outcome_without_the_applied_demand_tolerance_is_rejected() -> None:
+    """**古い記録を「互換」として通さない。** 欄が無ければ読み込みで落とす。"""
+    import io
+
+    from coldaisle.control.shadow import read_shadow_jsonl
+
+    matcher = ShadowOutcomeMatcher(match_tolerance_ms=500, applied_demand_tolerance=0.01)
+    assert matcher.applied_demand_tolerance == 0.01
+    with pytest.raises(ValidationError, match="applied_demand_tolerance"):
+        ShadowOutcome(
+            inference_id=inference_for(1),
+            plan_digest=inference_for(2),
+            input_action_ts_ms=BASE_TS_MS,
+            match_tolerance_ms=TOLERANCE_MS,
+            status=OutcomeStatus.UNIDENTIFIABLE,
+            unidentifiable=Reason(code="applied_action_differs"),
+            matches=(
+                OutcomeMatch(
+                    offset_ms=1_000,
+                    expected_ts_ms=BASE_TS_MS + 1_000,
+                    metric=GPU,
+                    predicted=PREDICTED,
+                    unmatched=Reason(code="no_usable_observation"),
+                ),
+            ),
+        )  # type: ignore[call-arg]
+    # v1 の export 行も読み戻せない（版で閉じる）。
+    with pytest.raises(ValidationError):
+        read_shadow_jsonl(
+            io.StringIO(
+                '{"schema_version": 1, "control_schema_version": 6, '
+                '"tick_id": 0, "ts_ms": 0, "shadow": {}}\n'
+            )
+        )

@@ -125,6 +125,7 @@ class _ResidualTally:
     matched_outputs: int = 0
     counted_outputs: int = 0
     excluded_by_change: int = 0
+    purged: int = 0
     foreign_model: int = 0
     unidentifiable_reasons: dict[str, int] = field(default_factory=dict)
     unmatched_reasons: dict[str, int] = field(default_factory=dict)
@@ -164,6 +165,7 @@ class DriftDetector:
         # **照合の許容幅は `fan-policy.yaml` の契約から取る**（0054 §2.6 と同じ規則）。
         # 記録された幅が運用の幅と違えば、coverage の意味が変わる。評価用に別の値を持たない。
         self._match_tolerance_ms = shadow.outcome_match_tolerance_ms.value
+        self._applied_demand_tolerance = shadow.applied_demand_tolerance.value
         self._config_sha256 = config_sha256
         self._scales = {
             (scale.horizon_ms, scale.metric): scale.scale for scale in self._profile.residual_scales
@@ -182,7 +184,12 @@ class DriftDetector:
             )
         _check_window(evidence)
         cutoff_ms = max((change.ts_ms for change in changes), default=None)
-        tally = self._tally_residual(evidence.shadow, cutoff_ms)
+        window = (
+            None
+            if evidence.window_start_ms is None or evidence.window_end_ms is None
+            else (evidence.window_start_ms, evidence.window_end_ms)
+        )
+        tally = self._tally_residual(evidence.shadow, cutoff_ms, window)
         residual = self._residual_signal(tally)
         inputs = self._input_signals(evidence.inputs, cutoff_ms)
         verdicts = (residual.verdict, *(signal.verdict for signal in inputs))
@@ -210,6 +217,7 @@ class DriftDetector:
                 min_missing_pattern_count=self._policy.min_missing_pattern_count.value,
                 shadow_rows=len(evidence.shadow),
                 outcome_match_tolerance_ms=self._match_tolerance_ms,
+                applied_demand_tolerance=self._applied_demand_tolerance,
                 window_start_ms=evidence.window_start_ms,
                 window_end_ms=evidence.window_end_ms,
                 evidence_sha256=_evidence_sha256(evidence, changes),
@@ -219,7 +227,10 @@ class DriftDetector:
     # ------------------------------------------------------------ residual
 
     def _tally_residual(
-        self, rows: Sequence[ShadowExportRow], cutoff_ms: int | None
+        self,
+        rows: Sequence[ShadowExportRow],
+        cutoff_ms: int | None,
+        window: tuple[int, int] | None,
     ) -> _ResidualTally:
         tally = _ResidualTally()
         seen_ticks: set[tuple[int, int]] = set()
@@ -248,6 +259,14 @@ class DriftDetector:
                         f"同じ推論・同じ候補 plan の outcome が2度現れた: {outcome.inference_id}"
                     )
                 seen_outcomes.add(key)
+                if outcome.applied_demand_tolerance != self._applied_demand_tolerance:
+                    # `status` は識別の判定にも依る。**広い幅で作った `scored` を数えない**
+                    # （0056 §2.3。時刻の許容幅と同じ理由で、契約と照らす）。
+                    raise DriftInputError(
+                        "別の識別許容幅で作られた outcome を数えない"
+                        f"（export={outcome.applied_demand_tolerance}; "
+                        f"fan-policy={self._applied_demand_tolerance}）"
+                    )
                 if outcome.match_tolerance_ms != self._match_tolerance_ms:
                     # **運用の契約（`fan-policy.yaml` の `shadow`）と同じ幅で照合された
                     # 結果だけ**を数える。違う幅で照合された結果を同じ coverage として
@@ -257,7 +276,7 @@ class DriftDetector:
                         f"（export={outcome.match_tolerance_ms}; "
                         f"fan-policy={self._match_tolerance_ms}）"
                     )
-                self._tally_outcome(tally, outcome, counterfactual, cutoff_ms)
+                self._tally_outcome(tally, outcome, counterfactual, cutoff_ms, window)
             covered = {(item.inference_id, item.plan_digest) for item in row.outcomes}
             uncovered = sorted(key[0] for key in set(candidates) - covered)
             if uncovered:
@@ -277,6 +296,7 @@ class DriftDetector:
         outcome: ShadowOutcome,
         counterfactual: ShadowCounterfactual,
         cutoff_ms: int | None,
+        window: tuple[int, int] | None,
     ) -> None:
         prediction = counterfactual.prediction
         assert prediction is not None  # _counterfactuals_by_plan が保証する
@@ -334,6 +354,12 @@ class DriftDetector:
         # **束縛を確かめてから**時刻を見る。壊れた記録は、期間の外でも入力の誤りである。
         _check_observation_times(outcome)
         evidence_ts_ms = _evidence_time(outcome)
+        if window is not None and not window[0] <= evidence_ts_ms < window[1]:
+            # **行が期間の中でも、その予測の実測は `end_ms` を越えうる。**
+            # 期間の外の residual を数えると、絞ったはずの区間の coverage を外の証拠が満たす。
+            # 落とさずに数える（0054 §2.5 の `purged` と同じ扱い）。
+            tally.purged += 1
+            return
         if cutoff_ms is not None and evidence_ts_ms <= cutoff_ms:
             tally.excluded_by_change += 1
             return
@@ -408,6 +434,7 @@ class DriftDetector:
             predicted_metrics=tuple(sorted(tally.predicted_metrics)),
             unscored_metrics=unscored,
             excluded_by_change=tally.excluded_by_change,
+            purged=tally.purged,
             foreign_model=tally.foreign_model,
             sufficient=sufficient,
         )

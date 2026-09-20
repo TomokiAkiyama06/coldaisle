@@ -123,6 +123,18 @@ class ShadowOutcome(_Frozen):
     plan_digest: str = Field(pattern=r"^[0-9a-f]{64}$")
     input_action_ts_ms: int = Field(ge=0)
     match_tolerance_ms: int = Field(ge=0)
+    """時刻の照合に使った許容幅（`shadow.outcome_match_tolerance_ms`）。"""
+    applied_demand_tolerance: float = Field(ge=0.0, lt=1.0, allow_inf_nan=False)
+    """**識別**に使った許容幅（`shadow.applied_demand_tolerance`）。
+
+    `status` は時刻の照合だけでなく、「予測した候補 action が実際に掛かっていたか」の
+    判定にも依る（`ShadowOutcomeMatcher._unidentifiable_reason`）。この幅を記録に残さないと、
+    **広い幅で作った結果が `scored` を名乗っている**ことを読む側が確かめられない
+    （決定記録 0056 §2.3。0053 §2.3 の記録内容をこの1点だけ拡張する）。
+
+    **既定値を置かない。** この欄を持たない古い記録は読み込みで落とす。既定で補うと、
+    どの幅で識別したのか分からない結果が「運用の幅で作られた」ものとして通ってしまう。
+    """
     status: OutcomeStatus
     unidentifiable: Reason | None = None
     """採点できない理由（掛かっていた action が plan と違う / 記録が無い）。"""
@@ -351,6 +363,7 @@ class ShadowOutcomeMatcher:
             plan_digest=prediction.plan_digest,
             input_action_ts_ms=prediction.input_action_ts_ms,
             match_tolerance_ms=self._tolerance_ms,
+            applied_demand_tolerance=self._demand_tolerance,
             status=(
                 OutcomeStatus.SCORED if unidentifiable is None else OutcomeStatus.UNIDENTIFIABLE
             ),

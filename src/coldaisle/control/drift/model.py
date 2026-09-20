@@ -164,6 +164,13 @@ class DriftCoverage(_Frozen):
     """
     excluded_by_change: int = Field(default=0, ge=0)
     """宣言された変更より前だったため数えなかった outcome（0056 §2.5）。"""
+    purged: int = Field(default=0, ge=0)
+    """証拠の時刻が**宣言した期間の外**だったため数えなかった outcome（0056 §2.3）。
+
+    行そのものは期間の中にあっても、その予測の実測は `end_ms` を越えうる。**落とさずに
+    数える**（0054 §2.5 の `purged` と同じ扱い。「予測が無かった」と「この区間では
+    確かめられない」を区別する）。
+    """
     foreign_model: int = Field(default=0, ge=0)
     """別のモデル / artifact の counterfactual。**混ぜない。**"""
     sufficient: bool
@@ -401,6 +408,8 @@ class DriftProvenance(_Frozen):
 
     記録された幅がこれと違う outcome は数えない（0054 §2.6 と同じ規則）。
     """
+    applied_demand_tolerance: float = Field(ge=0.0, lt=1.0, allow_inf_nan=False)
+    """識別に使った許容幅（`fan-policy.yaml` の `shadow`）。**照合した値の記録。**"""
     window_start_ms: int | None = Field(default=None, ge=0)
     window_end_ms: int | None = Field(default=None, ge=0)
     """**証拠として見た期間**（0056 §2.7）。呼び出し側が期間を宣言したときだけ入る。

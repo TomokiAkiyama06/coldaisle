@@ -5,6 +5,7 @@
 - **Date**: 2026-09-20
 - **Supersedes**: なし
 - **Superseded by**: [0055](0055-shadow-duplicate-observation-rule.md)（§2.3 のうち、同じ metric・同じ時刻に**食い違う**観測があるときの扱いだけ。他の節と §2.3 の他の規則は有効）
+- **Superseded by**: [0056](0056-model-drift-detection-and-retraining-triggers.md)（§2.3 のうち、**照合結果に残す照合条件の範囲だけ** — 識別の許容幅 `applied_demand_tolerance` を記録に足し、export の版を 2 に上げる。照合・採点の規則そのものと他の節は有効）
 - **関連**: [`0027-fan-control-architecture.md`](0027-fan-control-architecture.md)、
   [`0028-fan-control-contracts.md`](0028-fan-control-contracts.md) §2.3 / §2.5、
   [`0030-control-decision-trace-storage.md`](0030-control-decision-trace-storage.md) §5、

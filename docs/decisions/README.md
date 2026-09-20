@@ -124,4 +124,4 @@ docs/decisions/NNNN-<slug>.md      例: 0002-metric-naming.md
 | [0053](0053-control-shadow-mode-and-counterfactual-logging.md) | Control Shadow Mode の記録内容（counterfactual の置き場所・予測と実測の突き合わせ・export） | FINAL |
 | [0054](0054-offline-evaluation-attribution-and-gates.md) | Offline Evaluation の帰属規則（適用と counterfactual を分ける）・coverage の扱い・rollout gate | FINAL |
 | [0055](0055-shadow-duplicate-observation-rule.md) | Shadow の照合は同じ metric・同じ時刻の食い違う観測を受け取らない（同じ値の重複は1つに畳む） | FINAL |
-| [0056](0056-model-drift-detection-and-retraining-triggers.md) | Thermal Model の drift 検知の置き場所（runtime は 0050 のまま）・証拠の規則・再学習の条件 | Proposed |
+| [0056](0056-model-drift-detection-and-retraining-triggers.md) | Thermal Model の drift 検知の置き場所（runtime は 0050 のまま）・証拠の規則・再学習の条件（0053 §2.3 の記録内容を1点だけ拡張） | Proposed |
