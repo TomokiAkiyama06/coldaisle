@@ -25,7 +25,7 @@
 
 | メソッド | パス | 用途 |
 |---|---|---|
-| GET | `/api/v1/health` | デーモンの稼働状態、最終受信時刻、ソース種別、欠損率 |
+| GET | `/api/v1/health` | デーモンの稼働状態、最終受信時刻、ソース種別（取り込み / 内部テレメトリ）、欠損率 |
 | GET | `/api/v1/server-health` | **Server Health パネル1枚分。Workspace が最も多く叩く** |
 | GET | `/api/v1/latest` | 全メトリクスの最新値 + 派生値 + quality |
 | GET | `/api/v1/metrics` | メトリクスの表示名・単位と派生値の式（値は含まない）（決定記録 0039） |
@@ -175,6 +175,47 @@ API が返すオフセットは `+00:00` です。同じ瞬間を指すので解
 安全を保証しません。実測フルロード履歴との比較は #50 の測定完了後に追加します。
 `blocking` は型でも **常に false** です。判断は人間が行います（決定 D-08）。
 将来もこのフィールドを true にする実装を入れないでください。
+
+### `GET /api/v1/health`
+
+デーモンの稼働状況（FR-305）と、**値の出どころの種類**を返します。
+
+```json
+{
+  "ok": true,
+  "source": "serial",
+  "telemetry_source": "hardware",
+  "last_sample_at": "2026-09-20T00:00:00+00:00",
+  "last_sample_ts_ms": 1789516800000,
+  "data_age_seconds": 1.2,
+  "stale": false,
+  "metrics": 24,
+  "missing_ratio_1h": 0.0,
+  "queue_drops_1h": 0
+}
+```
+
+**出どころは経路ごとに別のフィールドです。** 片方でもう片方を説明しないでください。
+
+| フィールド | 経路 | 値 | 書くメトリクス |
+|---|---|---|---|
+| `source` | 取り込み（`coldaisle-daemon`。`sys.ingest_source`） | `serial` / `mock` / `replay` / `null` | 空気の温度・湿度（`air.*`） |
+| `telemetry_source` | 内部テレメトリ（`coldaisle-telemetry`。`sys.telemetry_kind`） | `hardware` / `mock` / `null` | 回転数・PWM・CPU・GPU |
+
+`telemetry_source` は**いまの種類**で、保存済みの値ごとの出どころではありません
+（決定記録 0049）。`hardware` は「実 adapter が、設定された OS の読み取り口
+（NVML / hwmon / `/proc/stat`）を読んでいる」という意味で、センサーと物理部位の対応が
+正しいことまでは表しません（それは `/api/v1/devices` と hwmon の `confirmation`）。
+記録の無い DB（種類を書かない版のデーモンで貯めたもの）では `null` です。
+
+**`null` や知らない値を「実機」とみなさないでください。** また、`telemetry_source` が
+`hardware` でも、**古い値・更新の止まったメトリクスまで実測とは言えません**。
+DB を使い回して種類を切り替えると、もう書かれないメトリクスの古い行が `/latest` に
+残るためです。画面は `/api/v1/latest` の `value` が非 `null` かつ `quality` が
+`ok` / `suspect` の値（＝いま届いている値）にだけ札を付けます（決定記録 0049 §2.5）。
+
+**Server Health（`/api/v1/server-health`）の `sources.*` とは別物です。** あちらは
+adapter の稼働状態（読めたか）で、出どころの種類ではありません。
 
 ### `GET /api/v1/devices`
 

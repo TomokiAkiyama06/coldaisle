@@ -35,6 +35,14 @@ class InternalTelemetryCollector:
         if len(metrics) != len(set(metrics)):
             raise ValueError("Telemetry adapter 間で metric を重複させない")
 
+    @property
+    def clock(self) -> Clock:
+        """収集の timestamp を決める Clock。
+
+        出どころの種類（決定記録 0049 §2.3）も**同じ Clock** の時刻で書くために公開する。
+        """
+        return self._clock
+
     def collect(self) -> CollectionCycle:
         """時刻を1回だけ確定し、全 source を読み取る。"""
         ts_ms = self._clock.now_ms()

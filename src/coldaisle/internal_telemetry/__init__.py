@@ -15,9 +15,11 @@ from coldaisle.internal_telemetry.config import (
 from coldaisle.internal_telemetry.hwmon import HwmonAdapter
 from coldaisle.internal_telemetry.models import (
     SOURCE_STATE_PREFIX,
+    TELEMETRY_KIND_KEY,
     AdapterResult,
     SourceStatus,
     TelemetryAdapter,
+    TelemetrySourceKind,
 )
 from coldaisle.internal_telemetry.nvml import (
     THROTTLE_REASON_BITS,
@@ -37,6 +39,7 @@ __all__ = [
     "CONNECTOR_TEMPERATURE_METRIC",
     "CPU_UTILIZATION_METRIC",
     "SOURCE_STATE_PREFIX",
+    "TELEMETRY_KIND_KEY",
     "THROTTLE_REASON_BITS",
     "AdapterResult",
     "ClockEventReasons",
@@ -58,5 +61,6 @@ __all__ = [
     "PynvmlApi",
     "SourceStatus",
     "TelemetryAdapter",
+    "TelemetrySourceKind",
     "parse_cpu_times",
 ]
