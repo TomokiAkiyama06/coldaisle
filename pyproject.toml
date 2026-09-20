@@ -51,6 +51,9 @@ coldaisle-dataset = "coldaisle.dataset:main"
 coldaisle-evaluate = "coldaisle.evaluate:main"
 # Thermal Model の drift 検知と再学習の推奨。**書き込みはしない**（#93 / 決定記録 0056）
 coldaisle-drift = "coldaisle.drift:main"
+# Control Model Registry の lifecycle 操作。**読み取りが既定**で、promotion / rollback は
+# 人が書いた承認ファイルを要求する（#104 / 決定記録 0062）
+coldaisle-registry = "coldaisle.registry:main"
 # fan daemon 停止後にだけ systemd ExecStopPost から起動する。
 # 制御モデル・Safety Config・外部パッケージに依存せず Max しか書かない。
 coldaisle-safety-handoff = "coldaisle.safety_handoff:main"

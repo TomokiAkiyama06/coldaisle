@@ -51,6 +51,7 @@ from coldaisle.control.model_registry import (
 from coldaisle.control.schema import (
     AuthorityStage,
     SupervisorOutput,
+    SupervisorPolicyIdentity,
     SupervisorPolicyKind,
 )
 from coldaisle.control.supervisor.artifact import (
@@ -358,6 +359,15 @@ class SupervisorPolicyBinding:
         return self._authority_stage
 
     @property
+    def identity(self) -> SupervisorPolicyIdentity:
+        """束縛した artifact の**完全な識別**（Registry が検証した model ID・版・bytes hash）。"""
+        return SupervisorPolicyIdentity(
+            model_id=self._attestation.model_id,
+            version=self._attestation.version,
+            artifact_sha256=self._artifact_sha256,
+        )
+
+    @property
     def origin(self) -> SupervisorOutputOrigin:
         """この束から出る提案が名乗る用途。**束縛の意図をそのまま写す。**"""
         if self._intent is PolicyBindingIntent.ACTIVE:  # pragma: no cover - 門が閉じている
@@ -470,6 +480,25 @@ class RegimeTableRlPolicy:
         return self._artifact
 
     @property
+    def identity(self) -> SupervisorPolicyIdentity:
+        """この policy の artifact の**完全な識別**。version だけでは同じ版の別物と区別できない。
+
+        Registry を通した instance は attestation の値、`offline` は artifact の canonical
+        bytes から自分で導いた値（bytes hash は同じ規則で作るので、束縛した同じ artifact と
+        同じ値になる）。
+        """
+        if self._binding is not None:
+            return self._binding.identity
+        manifest = self._artifact.manifest
+        return SupervisorPolicyIdentity(
+            model_id=manifest.model_id,
+            version=manifest.model_version,
+            artifact_sha256=hashlib.sha256(
+                canonical_policy_artifact_bytes(self._artifact)
+            ).hexdigest(),
+        )
+
+    @property
     def origin(self) -> SupervisorOutputOrigin:
         """この policy の出力が名乗る用途。
 
@@ -496,6 +525,7 @@ class RegimeTableRlPolicy:
             output=self.propose(policy_input),
             source_monotonic_ms=policy_input.snapshot.monotonic_ms,
             received_monotonic_ms=received_monotonic_ms,
+            identity=self.identity,
             origin=self.origin,
         )
 

@@ -276,11 +276,25 @@ class SupervisorOutput(_Frozen):
     computed_at_ms: int = Field(ge=0)
 
 
+class SupervisorPolicyIdentity(_Frozen):
+    """RL policy artifact の**完全な**識別（#89 / 決定記録 0061）。
+
+    semantic version だけでは、同じ版を名乗る別の model ID・別の bytes を区別できない。
+    shadow の証拠がどの artifact のものかは、この3つ組で名指しする。
+    """
+
+    model_id: str = Field(pattern=r"^[a-z][a-z0-9_.-]*$", max_length=120)
+    version: str = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9_.-]*$", max_length=120)
+    artifact_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+
 class SupervisorPolicyEvaluation(_Frozen):
     """1 policy の成功出力または構造化された失敗を decision trace に残す。"""
 
     policy: SupervisorPolicyKind
     output: SupervisorOutput | None = None
+    policy_identity: SupervisorPolicyIdentity | None = None
+    """成功した RL 出力を作った artifact の完全な識別。Rule と失敗には付かない。"""
     error: Reason | None = None
     received_monotonic_ms: int | None = Field(default=None, ge=0)
     source_monotonic_ms: int | None = Field(default=None, ge=0)
@@ -292,6 +306,10 @@ class SupervisorPolicyEvaluation(_Frozen):
             raise ValueError("Supervisor evaluation は output または error の片方だけを持つ")
         if self.output is not None and self.output.policy is not self.policy:
             raise ValueError("Supervisor evaluation の policy と output が一致しない")
+        if self.policy_identity is not None and (
+            self.policy is not SupervisorPolicyKind.RL or self.output is None
+        ):
+            raise ValueError("artifact の識別は成功した RL 出力にだけ付ける")
         if self.policy is SupervisorPolicyKind.RULE and (
             self.received_monotonic_ms is not None or self.source_monotonic_ms is not None
         ):

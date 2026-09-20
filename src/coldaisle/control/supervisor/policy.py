@@ -20,6 +20,7 @@ from coldaisle.control.schema import (
     SupervisorDecision,
     SupervisorOutput,
     SupervisorPolicyEvaluation,
+    SupervisorPolicyIdentity,
     SupervisorPolicyKind,
 )
 from coldaisle.control.state import ControlStateSnapshot
@@ -100,6 +101,12 @@ class ReceivedSupervisorOutput(_Frozen):
     output: SupervisorOutput
     source_monotonic_ms: int = Field(ge=0)
     received_monotonic_ms: int = Field(ge=0)
+    identity: SupervisorPolicyIdentity | None = None
+    """提案を作った artifact の**完全な識別**（model ID・版・bytes hash）。
+
+    `SupervisorOutput.version` は semantic version だけで、同じ版を名乗る別の artifact を
+    区別できない。`deliver()` が束縛から写し、Coordinator が期待する識別と照合する。
+    """
     origin: SupervisorOutputOrigin = SupervisorOutputOrigin.UNVERIFIED
     """提案を作った policy の束縛用途。**既定は `unverified` で、active slot を通らない。**
 
@@ -196,7 +203,14 @@ class SupervisorCoordinator:
         clock: Clock,
         *,
         rule_policy: SupervisorPolicy | None = None,
+        expected_rl_identity: SupervisorPolicyIdentity | None = None,
     ) -> None:
+        """`expected_rl_identity` を渡すと、RL 提案の identity が**完全に一致**するものだけ通す。
+
+        版だけの照合（`rl_version`）では、同じ版を名乗る別の model ID・別の bytes の提案が
+        通る。運転で RL を使う構成は、束縛した artifact の識別をここへ渡す。
+        """
+        self._expected_rl_identity = expected_rl_identity
         self._config = config
         self._rule = rule_policy or RulePolicy(config.rule_policy, clock)
 
@@ -311,6 +325,17 @@ class SupervisorCoordinator:
                 received_monotonic_ms=received,
                 source_monotonic_ms=source,
             )
+        expected = self._expected_rl_identity
+        if expected is not None and candidate.identity != expected:
+            return SupervisorPolicyEvaluation(
+                policy=SupervisorPolicyKind.RL,
+                error=Reason(
+                    code="supervisor_identity_mismatch",
+                    detail="RL 提案の artifact 識別が期待する束縛と一致しない",
+                ),
+                received_monotonic_ms=received,
+                source_monotonic_ms=source,
+            )
         try:
             self._validate_output(
                 candidate.output,
@@ -329,6 +354,7 @@ class SupervisorCoordinator:
         return SupervisorPolicyEvaluation(
             policy=SupervisorPolicyKind.RL,
             output=candidate.output,
+            policy_identity=candidate.identity,
             received_monotonic_ms=received,
             source_monotonic_ms=source,
         )

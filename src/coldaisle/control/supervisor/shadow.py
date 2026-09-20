@@ -26,6 +26,7 @@ from coldaisle.control.schema import (
     SupervisorDecision,
     SupervisorObjectiveWeights,
     SupervisorOutput,
+    SupervisorPolicyIdentity,
     SupervisorPolicyKind,
     WorkloadRegime,
 )
@@ -81,7 +82,12 @@ class SupervisorShadowSummary(_Frozen):
 
     schema_version: Literal[1] = SUPERVISOR_SHADOW_SCHEMA_VERSION
     rule_policy_version: str = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9_.-]*$", max_length=120)
-    rl_policy_version: str = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9_.-]*$", max_length=120)
+    rl_policy_identity: SupervisorPolicyIdentity
+    """比べた RL artifact の**完全な識別**（model ID・版・bytes hash）。
+
+    版だけでは同じ版を名乗る別の artifact と区別できず、その集計を別の artifact の
+    証拠として読めてしまう。
+    """
     observed_ticks: int = Field(ge=0)
     paired_ticks: int = Field(ge=0)
     rule_unavailable_ticks: int = Field(ge=0)
@@ -162,8 +168,8 @@ class SupervisorShadowLedger:
         "_last_ts_ms",
         "_regimes",
         "_rl_errors",
+        "_rl_identity",
         "_rl_unavailable",
-        "_rl_version",
         "_rule_unavailable",
         "_rule_version",
         "_seen",
@@ -178,16 +184,16 @@ class SupervisorShadowLedger:
         config: PolicyShadowConfig,
         *,
         rule_policy_version: str,
-        rl_policy_version: str,
+        rl_identity: SupervisorPolicyIdentity,
     ) -> None:
-        """比較する2つの版を束縛する。**あとから混ぜられない。**"""
-        if not rule_policy_version or not rl_policy_version:
-            raise SupervisorShadowUsageError("比較する policy version を名指しする")
-        if rule_policy_version == rl_policy_version:
+        """Rule の版と RL artifact の完全な識別を束縛する。**あとから混ぜられない。**"""
+        if not rule_policy_version:
+            raise SupervisorShadowUsageError("比較する Rule policy version を名指しする")
+        if rule_policy_version == rl_identity.version:
             raise SupervisorShadowUsageError("Rule と RL に同じ version を指定しない")
         self._config = config
         self._rule_version = rule_policy_version
-        self._rl_version = rl_policy_version
+        self._rl_identity = rl_identity
         self._seen: dict[int, str] = {}
         self._rule_unavailable = 0
         self._rl_unavailable = 0
@@ -212,6 +218,12 @@ class SupervisorShadowLedger:
         if shadow.policy is not SupervisorPolicyKind.RL:
             raise SupervisorShadowUsageError("shadow slot に RLPolicy 以外を渡さない")
         self._check_versions(decision.active.output, shadow.output)
+        if shadow.output is not None and shadow.policy_identity != self._rl_identity:
+            # **版だけでなく完全な識別を照合する。** 同じ版を名乗る別の model ID・別の bytes の
+            # 提案を、束縛した artifact の証拠として数えない。identity の無い提案も拒む。
+            raise SupervisorShadowUsageError(
+                "RL 提案の artifact 識別が台帳の束縛と一致しない（model ID・版・bytes hash）"
+            )
 
         digest = canonical_sha256(decision)
         previous = self._seen.get(decision.tick_id)
@@ -257,9 +269,9 @@ class SupervisorShadowLedger:
                 f"Rule policy の版が台帳と違う（expected={self._rule_version};"
                 f" actual={rule_output.version}）"
             )
-        if rl_output is not None and rl_output.version != self._rl_version:
+        if rl_output is not None and rl_output.version != self._rl_identity.version:
             raise SupervisorShadowUsageError(
-                f"RL policy の版が台帳と違う（expected={self._rl_version};"
+                f"RL policy の版が台帳と違う（expected={self._rl_identity.version};"
                 f" actual={rl_output.version}）"
             )
 
@@ -302,7 +314,7 @@ class SupervisorShadowLedger:
         )
         return SupervisorShadowSummary(
             rule_policy_version=self._rule_version,
-            rl_policy_version=self._rl_version,
+            rl_policy_identity=self._rl_identity,
             observed_ticks=observed,
             paired_ticks=paired,
             rule_unavailable_ticks=self._rule_unavailable,

@@ -59,6 +59,7 @@ from coldaisle.control.schema import (
     SupervisorObjectiveWeights,
     SupervisorOutput,
     SupervisorPolicyEvaluation,
+    SupervisorPolicyIdentity,
     SupervisorPolicyKind,
     SupervisorTargetBand,
     TemperatureTarget,
@@ -108,6 +109,9 @@ trained = _trained_fixture
 
 CREATED_AT = "2026-09-21T10:00:00+09:00"
 CONDITIONS = "a" * 64
+RL_IDENTITY = SupervisorPolicyIdentity(
+    model_id="rl-supervisor-test", version="0.1.0", artifact_sha256="d" * 64
+)
 
 
 # ---------------------------------------------------------------- 下ごしらえ
@@ -872,6 +876,84 @@ def test_invariant_17_the_artifact_reproduces_the_selected_strategy(
     assert binding.artifact == report.artifact
 
 
+def test_invariant_21_shadow_evidence_carries_the_full_artifact_identity(
+    tmp_path: Path, bounds: SupervisorOutputBounds
+) -> None:
+    """**同じ版を名乗る別の artifact を、同じ証拠として数えない**（#89 レビュー）。
+
+    `SupervisorOutput.version` は semantic version だけである。model ID と bytes hash を
+    出力に運び、Coordinator と台帳の両方で完全一致を要求する。
+    """
+    settings = shadow_settings(mpc_policy(), rl_version="0.1.0")
+    verified = register_policy(tmp_path / "pr89-ident", artifact(bounds))
+    binding = SupervisorPolicyBinding.for_shadow(
+        verified, expected_policy_version="0.1.0", bounds=bounds
+    )
+    policy = RegimeTableRlPolicy.from_binding(binding, SimulatedClock(0))
+    identity = policy.identity
+    assert identity.model_id == "rl-supervisor-test"
+    assert identity.version == "0.1.0"
+    assert identity.artifact_sha256 == binding.conditions()["policy_artifact_sha256"]
+    # offline の instance も、同じ bytes なら同じ識別になる。
+    assert (
+        RegimeTableRlPolicy.offline(binding.artifact, SimulatedClock(0), bounds=bounds).identity
+        == identity
+    )
+
+    policy_input = supervisor_input()
+    delivered = policy.deliver(
+        policy_input, received_monotonic_ms=policy_input.snapshot.monotonic_ms
+    )
+    assert delivered.identity == identity
+
+    # Coordinator: 期待する識別と完全一致するものだけが通る。
+    def decide(expected: SupervisorPolicyIdentity, candidate: ReceivedSupervisorOutput):
+        return SupervisorCoordinator(
+            settings.supervisor, SimulatedClock(0), expected_rl_identity=expected
+        ).evaluate(
+            policy_input,
+            now_monotonic_ms=policy_input.snapshot.monotonic_ms,
+            rl_candidate=candidate,
+        )
+
+    ok = decide(identity, delivered)
+    assert ok.shadow is not None and ok.shadow.policy_identity == identity
+
+    for other in (
+        identity.model_copy(update={"model_id": "rl-supervisor-other"}),
+        identity.model_copy(update={"artifact_sha256": "e" * 64}),
+    ):
+        # 同じ版・別の model ID / 別の bytes。版だけの照合では通っていた。
+        swapped = decide(other, delivered)
+        assert swapped.shadow is not None and swapped.shadow.output is None
+        assert swapped.shadow.error is not None
+        assert swapped.shadow.error.code == "supervisor_identity_mismatch"
+    unlabeled = delivered.model_copy(update={"identity": None})
+    missing = decide(identity, unlabeled)
+    assert missing.shadow is not None and missing.shadow.output is None
+
+    # 台帳: 完全一致しない提案・識別の無い提案は数えない。
+    ledger = ledger_for()
+    ledger.observe(paired_decision(tick_id=1))
+    for other in (
+        RL_IDENTITY.model_copy(update={"model_id": "rl-supervisor-other"}),
+        RL_IDENTITY.model_copy(update={"artifact_sha256": "e" * 64}),
+        None,
+    ):
+        with pytest.raises(SupervisorShadowUsageError, match="artifact 識別"):
+            ledger.observe(paired_decision(tick_id=2, rl_identity=other))
+    summary = ledger.summary()
+    assert summary.observed_ticks == 1
+    assert summary.rl_policy_identity == RL_IDENTITY
+    # 別の identity の集計は digest（= shadow_evaluation_ref）も別になる。
+    other_ledger = SupervisorShadowLedger(
+        rl_policy_config()[0].shadow,
+        rule_policy_version="rule-test-v1",
+        rl_identity=RL_IDENTITY.model_copy(update={"artifact_sha256": "e" * 64}),
+    )
+    assert other_ledger.summary().digest() != ledger_for().summary().digest()
+
+
 def test_invariant_18_the_baseline_table_comes_from_the_policy_that_was_evaluated(
     trained: Any,
 ) -> None:
@@ -1217,7 +1299,7 @@ def received(output: SupervisorOutput) -> ReceivedSupervisorOutput:
 def ledger_for() -> SupervisorShadowLedger:
     config, _digest = rl_policy_config()
     return SupervisorShadowLedger(
-        config.shadow, rule_policy_version="rule-test-v1", rl_policy_version="0.1.0"
+        config.shadow, rule_policy_version="rule-test-v1", rl_identity=RL_IDENTITY
     )
 
 
@@ -1253,6 +1335,7 @@ def paired_decision(
     rl_version: str = "0.1.0",
     rl_strategy: str = "balanced",
     rl_regime: WorkloadRegime = WorkloadRegime.SUSTAINED_GPU,
+    rl_identity: SupervisorPolicyIdentity | None = RL_IDENTITY,
 ) -> SupervisorDecision:
     return SupervisorDecision(
         tick_id=tick_id,
@@ -1279,6 +1362,7 @@ def paired_decision(
                 regime=rl_regime,
                 strategy=rl_strategy,
             ),
+            policy_identity=rl_identity,
             received_monotonic_ms=ts_ms,
             source_monotonic_ms=ts_ms,
         ),
