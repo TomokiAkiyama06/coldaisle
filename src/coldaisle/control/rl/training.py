@@ -24,13 +24,14 @@ strategy / target band と `rl-policy.yaml` の weight 候補の組み合わせ�
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+import math
+from collections.abc import Mapping, Sequence
 from random import Random
 from typing import Literal, Self
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from coldaisle.control.config import RulePolicyConfig, SupervisorOutputBounds
+from coldaisle.control.config import SupervisorOutputBounds
 from coldaisle.control.model.thermal import canonical_sha256
 from coldaisle.control.rl.environment import (
     EnvironmentUsageError,
@@ -47,6 +48,7 @@ from coldaisle.control.schema import (
     SupervisorTargetBand,
     WorkloadRegime,
 )
+from coldaisle.control.state import ControlStateSnapshot, TelemetryHealth
 from coldaisle.control.supervisor.artifact import (
     POLICY_FAMILY,
     PolicySearchHyperparameters,
@@ -59,6 +61,11 @@ from coldaisle.control.supervisor.artifact import (
 )
 from coldaisle.control.supervisor.policy import SupervisorInput, SupervisorPolicy
 from coldaisle.control.supervisor.policy_config import RlPolicyConfig
+from coldaisle.control.supervisor.regime import (
+    RegimeEvidence,
+    RegimeReason,
+    WorkloadRegimeEstimate,
+)
 
 TRAINING_REPORT_SCHEMA_VERSION: Literal[1] = 1
 
@@ -122,6 +129,35 @@ class _TablePolicy:
         )
 
 
+def _probe_input(regime: WorkloadRegime) -> SupervisorInput:
+    """Baseline policy に「この regime の戦略は何か」を聞くための最小の入力。
+
+    #88 の Rule policy は regime から設定済み context への写像なので、観測の中身に依らない。
+    **壁時計を読まない**（時刻はすべて 0 の固定値）。
+    """
+    snapshot = ControlStateSnapshot(
+        tick_id=0,
+        ts_ms=0,
+        monotonic_ms=0,
+        signals=(),
+        derived=(),
+        trends=(),
+        telemetry_health=TelemetryHealth.NORMAL,
+        critical_unavailable=(),
+    )
+    return SupervisorInput(
+        snapshot=snapshot,
+        workload=WorkloadRegimeEstimate(
+            regime=regime,
+            confidence=0.0,
+            reason=RegimeReason.INSUFFICIENT_HISTORY,
+            as_of_tick_id=snapshot.tick_id,
+            computed_at_ms=snapshot.ts_ms,
+            evidence=RegimeEvidence(observed_window_ms=0),
+        ),
+    )
+
+
 class _CandidateAction(_Frozen):
     """1 regime へ差し替える候補。**regime を持たない**（どの regime にも当てられる）。"""
 
@@ -147,8 +183,16 @@ class CandidateOutcome(_Frozen):
     rejection: Reason | None = None
     safety_violations: int = Field(ge=0)
     invalid_actions: int = Field(ge=0)
-    mean_matched_reward: float | None = Field(default=None, allow_inf_nan=False)
-    baseline_mean_matched_reward: float | None = Field(default=None, allow_inf_nan=False)
+    mean_reward_over_common_horizon: float | None = Field(default=None, allow_inf_nan=False)
+    """**すべての arm が採点できた共通の長さ**で割り引いた reward の平均。
+
+    候補ごとに別々の長さで採点すると、早く終わった候補ほど負の reward を積む回数が
+    少なく、「早く壊れたほうが良い」になる（決定記録 0058 §2.6）。長さは
+    `SupervisorPolicyTrainingReport.common_matched_steps` に残す。
+    """
+    baseline_mean_reward_over_common_horizon: float | None = Field(
+        default=None, allow_inf_nan=False
+    )
     improved: bool
 
     @model_validator(mode="after")
@@ -162,7 +206,10 @@ class CandidateOutcome(_Frozen):
         if self.improved:
             # 比べられなかった候補が「Baseline を上回った」と読めないようにする。
             raise ValueError("比べられなかった候補を改善扱いにしない")
-        if self.mean_matched_reward is not None or self.baseline_mean_matched_reward is not None:
+        if (
+            self.mean_reward_over_common_horizon is not None
+            or self.baseline_mean_reward_over_common_horizon is not None
+        ):
             raise ValueError("比べられなかった候補に reward を書かない")
         return self
 
@@ -186,6 +233,12 @@ class SupervisorPolicyTrainingReport(_Frozen):
     """
     comparison: PolicyComparison
     """Rule baseline と選ばれた候補の2 arm 比較。条件・母集団は arm 間で揃っている。"""
+    common_matched_steps: dict[str, int] = Field(default_factory=dict)
+    """episode ごとの、**すべての arm が採点できた step 数**（最小）。
+
+    候補の順位はこの長さの上だけで決める。hash では読めないので欄としても残す
+    （決定記録 0056 §2.3 と同じ理由）。
+    """
     artifact: SupervisorPolicyArtifact
     promotable: bool
     """この結果を昇格の根拠にしてよいか。**反実仮想の裏づけが無ければ立たない。**"""
@@ -226,6 +279,43 @@ class SupervisorPolicyTrainingReport(_Frozen):
         return canonical_sha256(self)
 
 
+def common_matched_steps(arms: Sequence[PolicyArm]) -> dict[str, int]:
+    """episode ごとに、**すべての arm が採点できた step 数**（最小）を返す。
+
+    `PolicyComparison.matched_steps()` と同じ考え方だが、対象が2 arm ではなく
+    **候補すべて**である。2 arm ごとに別々の長さで採点すると、候補 A を4 step、候補 B を
+    2 step で割り引いた平均を同じ表に並べることになる（決定記録 0058 §2.6）。
+
+    比較に使える episode は arm 間で一致している（`compare()` が要求する）ので、
+    先頭の arm の並びを基準にする。
+    """
+    if not arms:
+        return {}
+    return {
+        episode_id: min(len(arm.episode(episode_id).supported_steps) for arm in arms)
+        for episode_id in arms[0].comparable_episode_ids
+    }
+
+
+def mean_reward_over(arm: PolicyArm, horizon: Mapping[str, int]) -> float | None:
+    """揃えた長さで割り引いた reward の、episode にわたる平均。
+
+    長さが 0 の episode が1つでもあれば `None`。**判定できないことを合格にしない**
+    （`PolicyComparison.mean_matched_reward` と同じ規則）。
+    """
+    if not horizon or any(steps == 0 for steps in horizon.values()):
+        return None
+    return math.fsum(
+        arm.episode(episode_id).discounted_reward_over(steps)
+        for episode_id, steps in horizon.items()
+    ) / len(horizon)
+
+
+def _rank_value(mean: float | None) -> float:
+    """reward を出せない arm を勝たせないための順位値。"""
+    return math.inf if mean is None else -mean
+
+
 class SupervisorPolicyTrainer:
     """Rule baseline を起点に候補表を並べ、同じ episode 群で比べて artifact を作る。
 
@@ -238,7 +328,6 @@ class SupervisorPolicyTrainer:
         "_config",
         "_config_sha256",
         "_environment",
-        "_rule_config",
         "_rule_policy",
     )
 
@@ -249,36 +338,66 @@ class SupervisorPolicyTrainer:
         policy_config: RlPolicyConfig,
         policy_config_sha256: str,
         bounds: SupervisorOutputBounds,
-        rule_config: RulePolicyConfig,
         rule_policy: SupervisorPolicy,
     ) -> None:
-        """探索の設定と Baseline を束ねる。**噛み合わなければ生成時に落とす。**"""
+        """探索の設定と Baseline を束ねる。**噛み合わなければ生成時に落とす。**
+
+        **Baseline の表は設定からではなく、渡された `rule_policy` そのものから作る**
+        （`baseline_table()`）。設定と policy を別々に受け取ると、版だけ同じで中身の違う
+        2つの Baseline——報告に載る arm と、`baseline` 候補の表——を作れてしまう。
+        """
         if rule_policy.kind is not SupervisorPolicyKind.RULE:
             raise SupervisorPolicyTrainingError("Baseline には RulePolicy を渡す")
-        if rule_policy.version != rule_config.version:
-            # 表の出どころと Baseline arm の版がずれると、比較の起点が特定できなくなる。
-            raise SupervisorPolicyTrainingError("RulePolicy の版が rule_policy 設定と違う")
         self._environment = environment
         self._config = policy_config
         self._config_sha256 = policy_config_sha256
         self._bounds = bounds
-        self._rule_config = rule_config
         self._rule_policy = rule_policy
 
     # ------------------------------------------------------------------ 候補の並べ方
 
     def baseline_table(self) -> RegimeTablePayload:
-        """Rule policy の設定をそのまま表にした起点。"""
-        entries = tuple(
-            RegimeActionEntry(
-                regime=regime,
-                strategy=self._rule_config.contexts.get(regime).strategy,
-                weights=self._rule_config.contexts.get(regime).weights,
-                target_band=self._rule_config.contexts.get(regime).target_band,
+        """**評価する Rule policy そのものに聞いて**起点の表を作る。
+
+        設定（`rule_policy.contexts`）から作ると、版だけ同じで中身の違う policy を渡された
+        ときに、報告に載る Baseline arm と `baseline` 候補の表が別物になる。#88 の Rule policy
+        は regime から context への写像なので、regime ごとに1度聞けば表が取れる。
+
+        範囲外の欄を返す policy は**丸めず拒む**（決定記録 0058 §2.1 と同じ規律）。
+        """
+        entries: list[RegimeActionEntry] = []
+        for regime in sorted(WorkloadRegime, key=lambda item: item.value):
+            try:
+                output = self._rule_policy.propose(_probe_input(regime))
+            except Exception as error:
+                raise SupervisorPolicyTrainingError(
+                    f"Baseline policy が {regime.value} の戦略を返せない: {error}"
+                ) from error
+            if output.policy is not SupervisorPolicyKind.RULE:
+                raise SupervisorPolicyTrainingError("Baseline policy が Rule 以外を名乗った")
+            if output.regime is not regime:
+                raise SupervisorPolicyTrainingError(
+                    f"Baseline policy が聞いたのと違う regime を返した（{output.regime.value}）"
+                )
+            try:
+                self._bounds.validate_context(
+                    strategy=output.strategy,
+                    weights=output.weights,
+                    target_band=output.target_band,
+                )
+            except ValueError as error:
+                raise SupervisorPolicyTrainingError(
+                    f"Baseline policy の {regime.value} が supervisor.output_bounds の外: {error}"
+                ) from error
+            entries.append(
+                RegimeActionEntry(
+                    regime=regime,
+                    strategy=output.strategy,
+                    weights=output.weights,
+                    target_band=output.target_band,
+                )
             )
-            for regime in sorted(WorkloadRegime, key=lambda item: item.value)
-        )
-        return RegimeTablePayload(entries=entries)
+        return RegimeTablePayload(entries=tuple(entries))
 
     def candidates(self) -> tuple[tuple[str, RegimeTablePayload], ...]:
         """評価する候補を `(識別子, 表)` の決定論的な並びで返す。
@@ -384,15 +503,29 @@ class SupervisorPolicyTrainer:
         order = self._evaluation_order(tuple(identifier for identifier, _ in candidates))
         tables = dict(candidates)
 
+        # 1巡目: 候補を回し、Baseline と**並べられるか**だけを判定する。
         arms: dict[str, PolicyArm] = {}
-        outcomes: dict[str, CandidateOutcome] = {}
+        rejections: dict[str, Reason] = {}
         for identifier in order:
-            outcome, arm = self._evaluate_candidate(
+            arm, rejection = self._run_candidate(
                 identifier, tables[identifier], specs, baseline_arm
             )
-            outcomes[identifier] = outcome
-            if arm is not None:
-                arms[identifier] = arm
+            arms[identifier] = arm
+            if rejection is not None:
+                rejections[identifier] = rejection
+
+        # 2巡目: **すべての arm に共通の長さ**を決めてから採点する。候補ごとに別々の長さで
+        # 割り引いた reward を並べると、早く終わった候補ほど負の reward を積む回数が少なく、
+        # 「早く壊れたほうが良い」になる（決定記録 0058 §2.6）。
+        horizon = common_matched_steps(
+            (baseline_arm, *(arms[key] for key in sorted(arms) if key not in rejections))
+        )
+        outcomes = self._score(
+            arms=arms,
+            rejections=rejections,
+            baseline_arm=baseline_arm,
+            horizon=horizon,
+        )
 
         selected_id = self._select(outcomes)
         selected_arm = arms.get(selected_id)
@@ -441,6 +574,7 @@ class SupervisorPolicyTrainer:
             improved_over_baseline=selected.improved,
             learned_controller_available=self._environment.learned_controller_available,
             comparison=comparison,
+            common_matched_steps=dict(sorted(horizon.items())),
             artifact=artifact,
             promotable=counterfactual_backed,
         )
@@ -456,86 +590,92 @@ class SupervisorPolicyTrainer:
         Random(self._config.search.seed.value).shuffle(order)
         return tuple(order)
 
-    def _evaluate_candidate(
+    def _run_candidate(
         self,
         identifier: str,
         table: RegimeTablePayload,
         specs: Sequence[EpisodeSpec],
         baseline_arm: PolicyArm,
-    ) -> tuple[CandidateOutcome, PolicyArm | None]:
+    ) -> tuple[PolicyArm, Reason | None]:
+        """候補を回し、Baseline と**並べられるか**を返す。採点はここでしない。
+
+        採点を分けるのは、共通の長さが**すべての候補を回し終えるまで決まらない**ためである。
+        """
         version = f"{self._config.artifact.model_id}-{identifier}"
-        policy = _TablePolicy(table, version)
-        arm = self._environment.run_policy(policy, specs)
+        arm = self._environment.run_policy(_TablePolicy(table, version), specs)
         try:
             comparison = SupervisorTrainingEnvironment.compare([baseline_arm, arm])
         except (EnvironmentUsageError, ValueError) as error:
             # **比べられない候補は勝たせない。** 母集団や条件が揃わない結果を、
             # 「差が出た」として採らない（決定記録 0058 §2.6）。
-            return (
-                CandidateOutcome(
-                    candidate_id=identifier,
-                    policy_version=version,
-                    comparable=False,
-                    rejection=Reason(
-                        code="candidate_not_comparable",
-                        detail=f"{type(error).__name__}: {error}"[:500],
-                    ),
-                    safety_violations=arm.safety_violations,
-                    invalid_actions=arm.invalid_actions,
-                    improved=False,
-                ),
-                None,
+            return arm, Reason(
+                code="candidate_not_comparable",
+                detail=f"{type(error).__name__}: {error}"[:500],
             )
         if not comparison.learned_controller_available:
             # **policy を比べていない。** Learned MPC を束縛できていない episode 群では
-            # action が demand に効かないので、全 arm の requested が同一になる
-            # （決定記録 0058 §2.1 / §3）。`comparable=True` のまま並べると、この欄で
-            # 絞った読み手が「policy を比較した結果だ」と受け取ってしまう。
-            return (
-                CandidateOutcome(
+            # action が demand に効かず、全 arm の requested が同一になる（0058 §2.1 / §3）。
+            return arm, Reason(
+                code="learned_controller_unavailable",
+                detail=(
+                    "Learned MPC を束縛できていないので action が demand に効かない。"
+                    "候補間の差を測っていない（決定記録 0058 §3）"
+                ),
+            )
+        return arm, None
+
+    def _score(
+        self,
+        *,
+        arms: Mapping[str, PolicyArm],
+        rejections: Mapping[str, Reason],
+        baseline_arm: PolicyArm,
+        horizon: Mapping[str, int],
+    ) -> dict[str, CandidateOutcome]:
+        """**共通の長さ**で採点し、Baseline を上回ったかを判定する。"""
+        baseline_mean = mean_reward_over(baseline_arm, horizon)
+        minimum = self._config.search.minimum_reward_improvement.value
+        outcomes: dict[str, CandidateOutcome] = {}
+        for identifier, arm in arms.items():
+            rejection = rejections.get(identifier)
+            if rejection is not None:
+                outcomes[identifier] = CandidateOutcome(
                     candidate_id=identifier,
-                    policy_version=version,
+                    policy_version=f"{self._config.artifact.model_id}-{identifier}",
                     comparable=False,
-                    rejection=Reason(
-                        code="learned_controller_unavailable",
-                        detail=(
-                            "Learned MPC を束縛できていないので action が demand に効かない。"
-                            "候補間の差を測っていない（決定記録 0058 §3）"
-                        ),
-                    ),
+                    rejection=rejection,
                     safety_violations=arm.safety_violations,
                     invalid_actions=arm.invalid_actions,
                     improved=False,
-                ),
-                arm,
+                )
+                continue
+            mean = mean_reward_over(arm, horizon)
+            key = (arm.safety_violations, arm.invalid_actions, _rank_value(mean))
+            baseline_key = (
+                baseline_arm.safety_violations,
+                baseline_arm.invalid_actions,
+                _rank_value(baseline_mean),
             )
-        key = comparison.ranking_key(arm)
-        baseline_key = comparison.ranking_key(baseline_arm)
-        mean = comparison.mean_matched_reward(arm)
-        baseline_mean = comparison.mean_matched_reward(baseline_arm)
-        improved = key < baseline_key
-        if improved and key[:2] == baseline_key[:2]:
-            # 安全側が同点のときだけ reward の差を見る。差は設定した下限を満たすこと。
-            minimum = self._config.search.minimum_reward_improvement.value
-            improved = (
-                mean is not None
-                and baseline_mean is not None
-                and (mean - baseline_mean) > 0.0
-                and (mean - baseline_mean) >= minimum
-            )
-        return (
-            CandidateOutcome(
+            improved = key < baseline_key
+            if improved and key[:2] == baseline_key[:2]:
+                # 安全側が同点のときだけ reward の差を見る。差は設定した下限を満たすこと。
+                improved = (
+                    mean is not None
+                    and baseline_mean is not None
+                    and (mean - baseline_mean) > 0.0
+                    and (mean - baseline_mean) >= minimum
+                )
+            outcomes[identifier] = CandidateOutcome(
                 candidate_id=identifier,
-                policy_version=version,
+                policy_version=f"{self._config.artifact.model_id}-{identifier}",
                 comparable=True,
                 safety_violations=arm.safety_violations,
                 invalid_actions=arm.invalid_actions,
-                mean_matched_reward=mean,
-                baseline_mean_matched_reward=baseline_mean,
+                mean_reward_over_common_horizon=mean,
+                baseline_mean_reward_over_common_horizon=baseline_mean,
                 improved=improved,
-            ),
-            arm,
-        )
+            )
+        return outcomes
 
     @staticmethod
     def _select(outcomes: dict[str, CandidateOutcome]) -> str:
@@ -552,7 +692,7 @@ class SupervisorPolicyTrainer:
             key=lambda outcome: (
                 outcome.safety_violations,
                 outcome.invalid_actions,
-                -(outcome.mean_matched_reward or 0.0),
+                -(outcome.mean_reward_over_common_horizon or 0.0),
                 outcome.candidate_id,
             ),
         )

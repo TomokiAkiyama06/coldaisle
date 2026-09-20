@@ -37,6 +37,8 @@ import hashlib
 from enum import StrEnum
 from typing import Self
 
+from pydantic import BaseModel
+
 from coldaisle.clock import Clock
 from coldaisle.control.config import SupervisorOutputBounds
 from coldaisle.control.model.thermal import is_pickle_payload
@@ -54,6 +56,7 @@ from coldaisle.control.schema import (
 from coldaisle.control.supervisor.artifact import (
     MAX_POLICY_ARTIFACT_BYTES,
     SupervisorPolicyArtifact,
+    SupervisorPolicyRegistryMetadata,
     action_space_sha256,
     canonical_policy_artifact_bytes,
     policy_registry_metadata,
@@ -98,6 +101,51 @@ class PolicyBindingIntent(StrEnum):
     `for_active` が開かない門なので、ここへ到達する経路は存在しない。値を残してあるのは、
     `SupervisorOutputOrigin` との対応と「閉じている」という事実を1か所に置くためである。
     """
+
+
+ARTIFACT_DETERMINED_METADATA_EXCLUSIONS: frozenset[str] = frozenset(
+    {"offline_evaluation_ref", "shadow_evaluation_ref"}
+)
+"""artifact が決めない Registry metadata の欄。
+
+この2つは lifecycle の途中で Registry 側が書き込む参照（#104 の `mark_validated` /
+`promote`）で、artifact bytes からは導けない。**これ以外はすべて artifact が決める**ので、
+束縛時に1つ残らず照合する。
+"""
+
+
+def _comparable(value: object) -> object:
+    """列挙と列を、由来の違う表現どうしで比べられる形へ落とす。"""
+    if isinstance(value, StrEnum):
+        return value.value
+    if isinstance(value, list | tuple):
+        return tuple(_comparable(item) for item in value)
+    if isinstance(value, dict):
+        return {key: _comparable(item) for key, item in sorted(value.items())}
+    return value
+
+
+def _registry_metadata_mismatches(
+    derived: SupervisorPolicyRegistryMetadata, stored: BaseModel
+) -> list[str]:
+    """artifact から導いた metadata と Registry が持つ metadata の食い違いを列挙する。
+
+    **欄を手で並べない。** 並べると、あとから足した欄が照合から漏れる。
+    `SupervisorPolicyRegistryMetadata` の欄をすべて回り、artifact が決めないものだけを
+    名前で除く（`ARTIFACT_DETERMINED_METADATA_EXCLUSIONS`）。
+    """
+    missing = object()
+    mismatches: list[str] = []
+    for name in SupervisorPolicyRegistryMetadata.model_fields:
+        if name in ARTIFACT_DETERMINED_METADATA_EXCLUSIONS:
+            continue
+        actual = getattr(stored, name, missing)
+        if actual is missing:
+            mismatches.append(name)
+            continue
+        if _comparable(getattr(derived, name)) != _comparable(actual):
+            mismatches.append(name)
+    return mismatches
 
 
 def check_action_space(artifact: SupervisorPolicyArtifact, bounds: SupervisorOutputBounds) -> None:
@@ -279,41 +327,11 @@ class SupervisorPolicyBinding:
         except ValueError as error:  # pragma: no cover - 上の canonical 判定で先に落ちる
             raise SupervisorPolicyUnusableError(str(error)) from error
         stored = verified.metadata
-        mismatches = [
-            name
-            for name, left, right in (
-                ("model_id", derived.model_id, stored.model_id),
-                ("version", derived.version, stored.version),
-                ("created_at", derived.created_at, stored.created_at),
-                ("capability", derived.capability.value, stored.capability.value),
-                ("model_family", derived.model_family, stored.model_family),
-                (
-                    "feature_schema_version",
-                    derived.feature_schema_version,
-                    stored.feature_schema_version,
-                ),
-                (
-                    "target_schema_version",
-                    derived.target_schema_version,
-                    stored.target_schema_version,
-                ),
-                ("sha256", derived.sha256, stored.sha256),
-                ("source_runs", derived.source_runs, tuple(stored.source_runs)),
-                (
-                    "training_dataset_version",
-                    derived.training_dataset_version,
-                    stored.training_dataset_version,
-                ),
-                (
-                    "authority_compatibility",
-                    derived.authority_compatibility,
-                    tuple(stored.authority_compatibility),
-                ),
-            )
-            if left != right
-        ]
+        mismatches = _registry_metadata_mismatches(derived, stored)
         if mismatches:
             # Registry が持つ metadata と artifact の中身が食い違ったまま束縛しない。
+            # **artifact が決める欄は1つ残らず照合する。** 一部だけ見ていると、正しい bytes を
+            # 登録しながら metadata だけ書き換えた artifact が通ってしまう。
             raise SupervisorPolicyUnusableError(
                 f"policy artifact の identity が Registry metadata と一致しない: {mismatches}"
             )

@@ -49,6 +49,8 @@ from coldaisle.control.rl.training import (
     BASELINE_CANDIDATE_ID,
     SupervisorPolicyTrainer,
     SupervisorPolicyTrainingError,
+    common_matched_steps,
+    mean_reward_over,
 )
 from coldaisle.control.schema import (
     AuthorityStage,
@@ -81,6 +83,7 @@ from coldaisle.control.supervisor import (
     SupervisorPolicyArtifact,
     SupervisorPolicyBinding,
     SupervisorPolicyManifest,
+    SupervisorPolicyRegistryMetadata,
     SupervisorPolicyUnusableError,
     SupervisorShadowConflictError,
     SupervisorShadowLedger,
@@ -94,6 +97,7 @@ from coldaisle.control.supervisor.regime import (
     RegimeReason,
     WorkloadRegimeEstimate,
 )
+from coldaisle.control.supervisor.rl_policy import ARTIFACT_DETERMINED_METADATA_EXCLUSIONS
 from test_learned_mpc import REGISTRY_LIMITS, mpc_policy
 from test_rl_training_environment import build_environment, episode_spec
 from test_rl_training_environment import trained as _trained_fixture
@@ -216,6 +220,7 @@ def register_policy(
     kind: ArtifactKind = ArtifactKind.SUPERVISOR_POLICY,
     capability: ArtifactCapability = ArtifactCapability.SUPERVISOR_STRATEGY,
     payload: bytes | None = None,
+    metadata_overrides: dict[str, Any] | None = None,
 ) -> VerifiedArtifact:
     """**本物の Model Registry（#104）へ登録し、検証経路から VerifiedArtifact を受け取る。**
 
@@ -240,6 +245,11 @@ def register_policy(
         hyperparameters=derived.hyperparameters,
         authority_compatibility=authority,
     )
+    if metadata_overrides:
+        # **bytes はそのまま、metadata だけ書き換える。** checksum は合うので登録は通る。
+        metadata = ArtifactMetadata.model_validate(
+            metadata.model_dump(mode="python") | metadata_overrides
+        )
     registry = ModelRegistry(root, limits=REGISTRY_LIMITS)
     registry.register_candidate(
         metadata, artifact_bytes, actor="trainer", reason="policy search completed"
@@ -326,7 +336,6 @@ def trainer_for(
         policy_config=config,
         policy_config_sha256=digest,
         bounds=settings.supervisor.output_bounds,
-        rule_config=settings.supervisor.rule_policy,
         rule_policy=RulePolicy(settings.supervisor.rule_policy, SimulatedClock(0)),
     )
 
@@ -789,7 +798,7 @@ def test_invariant_15_without_an_improvement_the_baseline_table_is_selected(
     assert {outcome.rejection.code for outcome in report.outcomes if outcome.rejection} == {
         "learned_controller_unavailable"
     }
-    assert all(outcome.mean_matched_reward is None for outcome in report.outcomes)
+    assert all(outcome.mean_reward_over_common_horizon is None for outcome in report.outcomes)
 
 
 def test_invariant_16_an_unbacked_search_can_never_be_promotable(trained: Any) -> None:
@@ -863,6 +872,166 @@ def test_invariant_17_the_artifact_reproduces_the_selected_strategy(
     assert binding.artifact == report.artifact
 
 
+def test_invariant_18_the_baseline_table_comes_from_the_policy_that_was_evaluated(
+    trained: Any,
+) -> None:
+    """**報告に載る Baseline と `baseline` 候補の表が別物にならない。**
+
+    設定と policy を別々に受け取っていた頃は、版だけ同じで context の違う policy を渡すと、
+    `baseline` 候補の表（設定から）と Baseline arm（policy から）が食い違った。
+    表は**評価する policy そのものに聞いて**作る。
+    """
+    environment, _config, settings, _safety = build_environment(trained, with_mpc=False)
+    divergent_weights = weights(acoustic=0.1, change=0.9)
+
+    class DivergentRulePolicy:
+        """設定と同じ版を名乗りながら、違う context を返す Rule policy。"""
+
+        kind = SupervisorPolicyKind.RULE
+
+        @property
+        def version(self) -> str:
+            return settings.supervisor.rule_policy.version
+
+        def propose(self, policy_input: SupervisorInput) -> SupervisorOutput:
+            snapshot = policy_input.snapshot
+            return SupervisorOutput(
+                snapshot_schema_version=snapshot.schema_version,
+                tick_id=snapshot.tick_id,
+                ts_ms=snapshot.ts_ms,
+                policy=SupervisorPolicyKind.RULE,
+                version=self.version,
+                regime=policy_input.workload.regime,
+                regime_confidence=policy_input.workload.confidence,
+                weights=divergent_weights,
+                strategy="balanced",
+                target_band=target_band(),
+                computed_at_ms=snapshot.ts_ms,
+            )
+
+    config, digest = rl_policy_config()
+    trainer = SupervisorPolicyTrainer(
+        environment,
+        policy_config=config,
+        policy_config_sha256=digest,
+        bounds=settings.supervisor.output_bounds,
+        rule_policy=DivergentRulePolicy(),
+    )
+
+    table_from_policy = trainer.baseline_table()
+    assert all(entry.weights == divergent_weights for entry in table_from_policy.entries)
+    # 設定の context（acoustic=0.4 / change=0.3）ではなく、policy が返した値になっている。
+    configured = settings.supervisor.rule_policy.contexts.get(WorkloadRegime.IDLE)
+    assert table_from_policy.entry(WorkloadRegime.IDLE).weights != configured.weights
+
+    specs = (episode_spec(episode_id="pr89-a", seed=3),)
+    report = trainer.train(specs, model_version="0.1.0", created_at=CREATED_AT)
+    assert report.selected_candidate_id == BASELINE_CANDIDATE_ID
+    assert report.artifact.payload == table_from_policy
+
+
+def test_invariant_18_b_a_baseline_outside_the_action_space_is_refused(trained: Any) -> None:
+    """**Baseline の欄も丸めない。** 範囲外を返す policy を起点にしない。"""
+    environment, _config, settings, _safety = build_environment(trained, with_mpc=False)
+
+    class OutOfRangeRulePolicy:
+        kind = SupervisorPolicyKind.RULE
+        version = "rule-test-v1"
+
+        def propose(self, policy_input: SupervisorInput) -> SupervisorOutput:
+            snapshot = policy_input.snapshot
+            return SupervisorOutput(
+                snapshot_schema_version=snapshot.schema_version,
+                tick_id=snapshot.tick_id,
+                ts_ms=snapshot.ts_ms,
+                policy=SupervisorPolicyKind.RULE,
+                version=self.version,
+                regime=policy_input.workload.regime,
+                regime_confidence=policy_input.workload.confidence,
+                weights=weights(),
+                strategy="unconfigured",
+                target_band=target_band(),
+                computed_at_ms=snapshot.ts_ms,
+            )
+
+    config, digest = rl_policy_config()
+    trainer = SupervisorPolicyTrainer(
+        environment,
+        policy_config=config,
+        policy_config_sha256=digest,
+        bounds=settings.supervisor.output_bounds,
+        rule_policy=OutOfRangeRulePolicy(),
+    )
+    with pytest.raises(SupervisorPolicyTrainingError, match="output_bounds の外"):
+        trainer.baseline_table()
+
+
+def test_invariant_19_candidates_are_ranked_on_one_common_horizon(trained: Any) -> None:
+    """**長さの違う候補を、別々の長さで採点した平均で並べない**（決定記録 0058 §2.6）。
+
+    途中で終わった候補は負の reward を積む回数が少ないので、生の平均で比べると
+    「早く壊れたほうが良い」になる。共通の長さへ揃えてから採点する。
+    """
+    environment, _config, settings, _safety = build_environment(trained, with_mpc=False)
+    trainer = trainer_for(environment, settings)
+    specs = (episode_spec(episode_id="pr89-a", seed=3),)
+    report = trainer.train(specs, model_version="0.1.0", created_at=CREATED_AT)
+
+    # 報告は揃えた長さを欄として残す（hash では読めないため）。
+    assert set(report.common_matched_steps) == {"pr89-a"}
+    full = report.comparison.arms[0].episode("pr89-a")
+    assert report.common_matched_steps["pr89-a"] == len(full.supported_steps)
+
+    # **短く終わった arm は、生の平均が高くても共通の長さでは勝てない。**
+    short_episode = full.model_copy(update={"steps": full.steps[:1]})
+    short_arm = report.comparison.arms[0].model_copy(update={"episodes": (short_episode,)})
+    long_arm = report.comparison.arms[0]
+
+    horizon = common_matched_steps((long_arm, short_arm))
+    assert horizon["pr89-a"] == 1
+
+    # 生の総和では step 数の少ない側が有利になる（負の reward を積む回数が少ない）。
+    assert short_episode.discounted_reward > full.discounted_reward
+    # 揃えた長さでは同じ step だけを見るので、その有利が消える。
+    assert mean_reward_over(short_arm, horizon) == mean_reward_over(long_arm, horizon)
+
+
+def test_invariant_20_binding_compares_every_artifact_determined_metadata_field(
+    tmp_path: Path, bounds: SupervisorOutputBounds
+) -> None:
+    """**正しい bytes を登録しながら metadata だけ書き換えた artifact を通さない。**
+
+    `policy_registry_metadata()` が artifact から導く欄は1つ残らず照合する。
+    一部だけ見ていると、見ていない欄を書き換えた登録が通る。
+    """
+    policy_artifact = artifact(bounds)
+    for field, value in (
+        ("code_commit", "0123456789abcdef"),
+        ("hyperparameters", {"search_family": "tampered", "seed": 999}),
+        ("training_dataset_version", "rl-episodes:" + "f" * 64),
+        ("source_runs", ("ep-z",)),
+    ):
+        verified = register_policy(
+            tmp_path / f"pr89-meta-{field}",
+            policy_artifact,
+            metadata_overrides={field: value},
+        )
+        with pytest.raises(SupervisorPolicyUnusableError, match="Registry metadata と一致しない"):
+            SupervisorPolicyBinding.for_shadow(
+                verified, expected_policy_version="0.1.0", bounds=bounds
+            )
+
+    # 照合の網は欄を手で並べず、model の欄から作る（あとから足した欄が漏れないように）。
+    assert {
+        "offline_evaluation_ref",
+        "shadow_evaluation_ref",
+    } == ARTIFACT_DETERMINED_METADATA_EXCLUSIONS
+    checked = set(SupervisorPolicyRegistryMetadata.model_fields) - (
+        ARTIFACT_DETERMINED_METADATA_EXCLUSIONS
+    )
+    assert {"code_commit", "hyperparameters", "sha256", "authority_compatibility"} <= checked
+
+
 def test_candidates_are_bounded_and_never_silently_truncated(trained: Any) -> None:
     """**候補が上限を超えたら切り詰めず落とす。** 報告に出ない候補を作らない。"""
     environment, _config, settings, _safety = build_environment(trained, with_mpc=False)
@@ -883,7 +1052,6 @@ def test_the_trainer_refuses_a_baseline_that_is_not_the_rule_policy(trained: Any
             policy_config=config,
             policy_config_sha256=digest,
             bounds=settings.supervisor.output_bounds,
-            rule_config=settings.supervisor.rule_policy,
             rule_policy=StubRlPolicy(weights()),
         )
 

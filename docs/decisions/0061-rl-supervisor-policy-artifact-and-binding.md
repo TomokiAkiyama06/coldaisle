@@ -129,8 +129,12 @@ Rule policy（#88 の `WorkloadPolicyContexts`）と同じ鍵なので同じ epi
 - **runtime の `supervisor.output_bounds` の hash が `action_space_sha256` と一致し、
   表の全欄がその範囲内**（範囲外は**丸めず拒む**。0058 §2.1 と同じ規律）
 - 要求 stage が attestation の `authority_compatibility` に入っている
-- bytes が canonical JSON で、checksum が attestation と一致し、Registry metadata と
-  artifact の identity が食い違わない
+- bytes が canonical JSON で、checksum が attestation と一致する
+- **artifact が決める Registry metadata の欄が1つ残らず一致**する。`policy_registry_metadata()`
+  が artifact から導く全欄を、`SupervisorPolicyRegistryMetadata` の欄を回って照合し、
+  lifecycle 中に Registry 側が書く `offline_evaluation_ref` / `shadow_evaluation_ref` だけを
+  名前で除く。**欄を手で並べない。** 並べると、あとから足した欄が照合から漏れ、
+  **正しい bytes を登録しながら metadata だけ書き換えた artifact** が通ってしまう
 
 を確かめる。そのうえで用途ごとに違う条件を置く。
 
@@ -219,9 +223,15 @@ shadow:   { minimum_ticks, minimum_paired_fraction }
 
 ### 2.7 探索は `per_regime_coordinate_v1`。決定論的で、評価順に依らない
 
-Baseline（Rule policy の設定をそのまま表にしたもの）を起点に、**regime を1つだけ**
-候補 action へ差し替えた表をすべて並べる。候補 action は
-`supervisor.output_bounds` の strategy × target band × `rl-policy.yaml` の weight 候補である。
+Baseline を起点に、**regime を1つだけ**候補 action へ差し替えた表をすべて並べる。
+候補 action は `supervisor.output_bounds` の strategy × target band ×
+`rl-policy.yaml` の weight 候補である。
+
+**Baseline の表は、評価する Rule policy そのものに聞いて作る**（設定からは作らない）。
+設定（`supervisor.rule_policy.contexts`）から作ると、版だけ同じで context の違う policy を
+渡されたときに、**報告に載る Baseline arm と `baseline` 候補の表が別物**になる。#88 の
+Rule policy は regime から context への写像なので、regime ごとに1度聞けば表が取れる。
+Baseline の欄が `output_bounds` の外にあれば**丸めず拒む**。
 
 - **上限を超えたら切り詰めず落とす。** 黙って切ると、報告に出ない候補が生まれ
   「全候補を比べた」と読めてしまう
@@ -238,6 +248,13 @@ Baseline（Rule policy の設定をそのまま表にしたもの）を起点に
   `True` のまま並べると、差が出なかったことが比較の結論に見えてしまう
 - 改善の判定は #105 の辞書式比較をそのまま使う。安全側が同点のときだけ、
   揃えた長さの reward 平均の差が `minimum_reward_improvement` 以上かを見る
+- **採点は、すべての候補に共通の長さの上でだけ行う。** 候補ごとに「Baseline と揃えた長さ」で
+  採点すると、候補 A を4 step、候補 B を2 step で割り引いた平均を同じ表に並べることになり、
+  途中で終わった候補ほど負の reward を積む回数が少なくて有利になる（0058 §2.6 が
+  1つの比較の中で言っているのと同じことが、**候補の並びに対しても成り立つ**）。
+  候補をすべて回してから、episode ごとに**全 arm の採点できた step 数の最小**を取り、
+  その長さで採点する。使った長さは `common_matched_steps` として報告に残す
+  （hash では読めないため。0056 §2.3 と同じ理由）
 - **どの候補も Baseline を上回らなければ、Baseline の表が選ばれる。** 上回っていないのに
   別の表を出さないためで、その artifact は「Rule の戦略を RL artifact として表したもの」になる。
   shadow の配線を確かめるには十分で、戦略は何も変わらない
@@ -301,6 +318,9 @@ Baseline（Rule policy の設定をそのまま表にしたもの）を起点に
 | 未知の capability を前方互換に復号する（版は据え置く） | 復号だけ通しても、再書き出しで未知の値が失われる。#104 の内部表現を変える話になり、本記録の範囲を超える。版を上げるほうが意図を正しく伝える |
 | 束縛の用途を `SupervisorOutput` の欄にする | #88 / 0028 §2.3 の出力 schema を広げることになる。用途は「誰が作ったか」であって提案の内容ではないので、worker→loop の carrier（`ReceivedSupervisorOutput`）が持つ |
 | shadow slot でも `active_binding` 以外を拒む | 昇格前の候補を観測できなくなる。shadow は MPC にも Fan にも届かないので、用途を問う必要がない |
+| Baseline の表を `supervisor.rule_policy.contexts` から作る | 版だけ同じで context の違う policy を渡されると、報告の Baseline arm と `baseline` 候補の表が別物になる。表は評価する policy そのものに聞く |
+| 候補ごとに「Baseline と揃えた長さ」で採点し、その平均を並べる | 候補ごとに長さの違う平均を同じ表に並べることになり、途中で終わった候補が有利になる（0058 §2.6） |
+| 束縛時に照合する Registry metadata の欄を手で並べる | あとから足した欄が照合から漏れる。正しい bytes に別の metadata を付けた登録が通る |
 | Learned MPC を束縛できない run の候補も `comparable=True` で並べる | `comparable` で絞った読み手が「policy を比較した結果」と受け取る。差が出なかったことが比較の結論に見える |
 | 範囲外の候補・範囲外の表を範囲内へ丸める | 丸めると罰が無くなり、運転時に拒否される戦略を学び続ける（0058 §2.1 と同じ） |
 | 候補が上限を超えたら切り詰めて続ける | 報告に出ない候補が生まれ、「全候補を比べた」と読めてしまう |
@@ -326,6 +346,11 @@ Baseline（Rule policy の設定をそのまま表にしたもの）を起点に
   **すべて実測前の暫定値**。確定には shadow の実運用データが要る
 - 運転中の `SupervisorDecision` を `SupervisorShadowLedger` へ流す配線（どこで観測し、
   どこへ保存するか）は control loop 側（#74 / 決定記録 0060）で決める
+- worker が束縛の用途（`SupervisorOutputOrigin`）を control loop まで運ぶ形も未決。
+  いまは `ControlLoop` が組み立てる `ReceivedSupervisorOutput` が `unverified` のままで、
+  `active_policy: rl_policy` の構成では Rule へ落ちる。**証明できない提案に制御権を
+  渡さないので、それが正しい振る舞いである。** 運べる形にするのは、`for_active` の門を
+  開く条件を決めるときに一緒に決める
 - 学習の入口を CLI（`coldaisle-rl-*`）にするか。**いまは作らない。** 反実仮想モデルが
   無い間、CLI があると「回せば policy が良くなる」と読めてしまう。記録済み trajectory の
   収集経路（#83 / #84）が揃ってから決める
