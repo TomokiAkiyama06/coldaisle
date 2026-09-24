@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ast
 import importlib
+import json
 import threading
 import time
 from pathlib import Path
@@ -483,6 +484,32 @@ def test_websocket_pushes_the_exact_rest_payload(healthy_db):
             pushed = websocket.receive_json()
 
     assert pushed == rest
+
+
+def test_websocket_state_changes_when_the_history_is_re_evaluated(healthy_db):
+    """履歴の再評価（evaluated_at の変化）は WS の変更として通知する。
+
+    reference が変わらなくても、長く接続したクライアントが「いつ時点の比較か」を
+    古いまま持ち続けないため。evaluated_at は refresh_s の窓ごとにしか動かない。
+    """
+    clock = SimulatedClock(NOW_MS)
+    with TestClient(_app(healthy_db, clock)) as client:
+        first = ServerHealthResponse.model_validate(client.get("/api/v1/server-health").json())
+        clock.advance_to_ms(NOW_MS + 3_600_000)
+        second = ServerHealthResponse.model_validate(client.get("/api/v1/server-health").json())
+
+    assert (
+        second.compute_mode_advisory.evaluated_at_ms != first.compute_mode_advisory.evaluated_at_ms
+    )
+    first_state = json.loads(server_health_state(first))
+    second_state = json.loads(server_health_state(second))
+    assert first_state["compute_mode_advisory"]["evaluated_at_ms"] == (
+        first.compute_mode_advisory.evaluated_at_ms
+    )
+    assert (
+        first_state["compute_mode_advisory"]["evaluated_at_ms"]
+        != second_state["compute_mode_advisory"]["evaluated_at_ms"]
+    )
 
 
 def test_websocket_state_ignores_clock_and_age_only_changes(healthy_db):

@@ -138,7 +138,10 @@ def build_server_health(
     # 遅れた応答に自分より新しい時点の履歴が混ざる（決定記録 0063 §2.6）
     with advisor.ordered(), store.read_snapshot():
         now_ms = store.clock.now_ms()
-        readings = store.latest()
+        # 行の上限と age の基準を generated_at と同じ時刻に固定する。BEGIN DEFERRED は
+        # 最初の SELECT まで時点を固定しないため、時刻を読んだあとに確定した行が
+        # 混ざりうる。latest() に時刻を読み直させると age も別の時刻になる
+        readings = store.latest(at_ms=now_ms)
         # 一覧は新しい順に打ち切るため、重大度は件数上限の無い集計から判定する
         alerts = list(store.alerts(state="firing", limit=settings.active_alerts_limit))
         firing = store.alert_severity_counts(state="firing")
@@ -379,10 +382,8 @@ def server_health_state(payload: ServerHealthResponse) -> str:
         for metric in section["metrics"].values():
             metric.pop("age_seconds")
     advisory = state["compute_mode_advisory"]
-    # 履歴の評価時刻と条件の age は毎秒動く。これで push すると、判断材料が
-    # 何も変わっていないのに WS が1秒ごとに流れる
-    advisory.pop("evaluated_at_ms")
-    advisory.pop("evaluated_at")
+    # 条件の age は毎秒動くので除く。履歴の評価時刻（evaluated_at）は refresh_s の
+    # 窓ごとにしか動かず、再評価を長く接続したクライアントへ知らせるために残す
     for condition in advisory["conditions"]:
         condition.pop("age_seconds")
     return json.dumps(state, ensure_ascii=False, sort_keys=True, separators=(",", ":"))

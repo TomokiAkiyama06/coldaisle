@@ -179,7 +179,7 @@ class ComputeModeAdvisor:
         self._catalog = catalog
         # 再入可能にする。ordered() の中から evaluate() が同じロックを取るため
         self._lock = threading.RLock()
-        # 評価済みの窓とその結果。ordered() の中で呼ぶ限り、窓は前にしか進まない
+        # 評価済みの最も新しい窓とその結果。時計が戻った呼び出しでは置き換えない
         self._cached: tuple[int, _History] | None = None
 
     @property
@@ -295,7 +295,10 @@ class ComputeModeAdvisor:
             # 他の呼び出しの結果を流用しないので、evaluated_at <= generated_at が
             # 常に成り立ち、応答に無いデータが reference に混ざらない
             history = self._evaluate_history(store, now_ms)
-            self._cached = (window, history)
+            # 壁時計は戻りうる。戻った呼び出しの結果で新しい窓を置き換えると、
+            # 時計が戻ったあとに新しい窓がもう一度評価される
+            if cached is None or window > cached[0]:
+                self._cached = (window, history)
             return history
 
     def _evaluate_history(self, store: SqliteStore, now_ms: int) -> _History:

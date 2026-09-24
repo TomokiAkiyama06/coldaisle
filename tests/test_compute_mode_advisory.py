@@ -590,13 +590,13 @@ def test_the_first_history_evaluation_in_a_window_runs_only_once(
     assert results["first"] is results["second"]
 
 
-def test_a_window_change_is_evaluated_at_the_callers_own_time(
+def test_a_clock_rollback_neither_leaks_nor_evicts_the_newer_window(
     tmp_path, rules, catalog, monkeypatch
 ):
-    """窓が変わったら、**その呼び出しの時刻で**評価する。他の時点の結果を流用しない。
+    """時計が戻った呼び出し（W+1 → W → W+1）でも、新しい窓は1回だけ評価する。
 
-    流用すると evaluated_at が generated_at を追い越しうる。同じ窓の再呼び出しは
-    評価しない。
+    戻った呼び出しは**自分の時刻で**評価し（新しい窓の結果を受け取らない）、
+    新しい窓のキャッシュは置き換えない。
     """
     advisor = ComputeModeAdvisor(_settings(tmp_path, catalog), catalog)
     calls: list[int] = []
@@ -612,12 +612,82 @@ def test_a_window_change_is_evaluated_at_the_callers_own_time(
     with _store(tmp_path, rules) as store:
         newer = advisor._history(store, newer_ms)
         older = advisor._history(store, older_ms)
-        older_again = advisor._history(store, older_ms + 1_000)
+        newer_again = advisor._history(store, newer_ms + 1_000)
 
     assert calls == [newer_ms, older_ms]
-    assert newer.evaluated_at_ms == newer_ms
     assert older.evaluated_at_ms == older_ms
-    assert older_again is older
+    assert newer_again is newer
+
+
+class _SteppingClock(SimulatedClock):
+    """読まれるたびに進む時計。最初の読み出しの直後に別の書き手が行を足す。"""
+
+    def __init__(self, start_ms: int, on_first_read) -> None:
+        super().__init__(start_ms)
+        self.armed = False
+        self._on_first_read = on_first_read
+
+    def now_ms(self) -> int:
+        value = super().now_ms()
+        if self.armed:
+            if self._on_first_read is not None:
+                hook, self._on_first_read = self._on_first_read, None
+                hook(value)
+            self.advance_to_ms(value + 1_000)
+        return value
+
+
+def test_current_readings_are_pinned_to_generated_at(tmp_path, rules, catalog):
+    """最新値は ``generated_at`` 時点で固定する（0042 §2.6）。
+
+    時刻を読んだあとに届いた行を混ぜず、age も同じ時刻から数える。
+    """
+    health_settings = ServerHealthSettings.from_yaml(
+        CONFIG_DIR / "server-health.yaml", catalog=catalog
+    )
+    advisor = ComputeModeAdvisor(_settings(tmp_path, catalog), catalog)
+    reading_ts = NOW_MS - 5_000
+    with _store(tmp_path, rules) as store:
+        store.insert_samples(
+            [
+                Sample(
+                    ts_ms=reading_ts,
+                    readings=(
+                        Reading(metric="air.room", value=26.4, quality=Quality.OK),
+                        Reading(metric="air.room_humidity", value=48.0, quality=Quality.OK),
+                    ),
+                )
+            ]
+        )
+
+    def late_writer(now_ms: int) -> None:
+        # 時刻を読んだ直後・最初の SELECT の前に、別の接続が新しい行を確定する
+        with _store(tmp_path, rules, now_ms=now_ms + 500) as writer:
+            writer.insert_samples(
+                [
+                    Sample(
+                        ts_ms=now_ms + 500,
+                        readings=(Reading(metric="air.room", value=99.0, quality=Quality.OK),),
+                    )
+                ]
+            )
+
+    clock = _SteppingClock(NOW_MS, late_writer)
+    with SqliteStore(tmp_path / "advisory.db", rules=rules, clock=clock) as store:
+        clock.armed = True
+        response = build_server_health(
+            store,
+            catalog,
+            settings=health_settings,
+            advisor=advisor,
+            hwmon_metrics=(),
+            nvml_metrics=(),
+        )
+
+    room = response.compute_mode_advisory.conditions[0]
+    assert response.generated_at_ms == NOW_MS
+    assert room.value == 26.4
+    assert room.age_seconds == (NOW_MS - reading_ts) / 1000
 
 
 class _WatchedClock(SimulatedClock):
