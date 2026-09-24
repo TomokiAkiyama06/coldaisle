@@ -38,7 +38,7 @@ from coldaisle.control.rl.environment import (
     EpisodeSpec,
     SupervisorTrainingEnvironment,
 )
-from coldaisle.control.rl.episode import PolicyArm, PolicyComparison
+from coldaisle.control.rl.episode import PolicyArm, PolicyComparison, TerminationReason
 from coldaisle.control.schema import (
     AuthorityStage,
     Reason,
@@ -194,9 +194,19 @@ class CandidateOutcome(_Frozen):
         default=None, allow_inf_nan=False
     )
     improved: bool
+    truncated_episodes: tuple[str, ...] = ()
+    """Baseline より**早く、自分の安全違反・範囲外 action 以外の理由で**終わった episode。
+
+    安全側の台帳（`safety_violations` / `invalid_actions`）は episode 全体を数えるので、
+    採点できなくなって先に終わった候補は、Baseline がその後で踏んだ違反をそもそも観測しない。
+    それを「違反が少ない」と読むと、**壊れたせいで安全に見える**候補が選ばれる。
+    1つでもあれば改善扱いにしない（fail closed）。
+    """
 
     @model_validator(mode="after")
     def _uncomparable_candidates_never_win(self) -> Self:
+        if self.truncated_episodes and self.improved:
+            raise ValueError("Baseline より早く打ち切られた候補を改善扱いにしない")
         if self.comparable:
             if self.rejection is not None:
                 raise ValueError("比べられた候補に却下理由を付けない")
@@ -309,6 +319,28 @@ def mean_reward_over(arm: PolicyArm, horizon: Mapping[str, int]) -> float | None
         arm.episode(episode_id).discounted_reward_over(steps)
         for episode_id, steps in horizon.items()
     ) / len(horizon)
+
+
+_OWN_FAILURE_TERMINATIONS = frozenset(
+    {TerminationReason.SAFETY_VIOLATION, TerminationReason.INVALID_ACTION}
+)
+"""候補自身の違反で終わった理由。これで短くなった episode は、その違反が台帳に載る。"""
+
+
+def truncated_episodes(arm: PolicyArm, baseline: PolicyArm) -> tuple[str, ...]:
+    """`arm` が Baseline より**少ない step で、自分の違反以外の理由で**終わった episode。
+
+    安全側の台帳は episode 全体を数えるので、長さの違う arm の違反数は同じ区間を
+    見ていない。自分の違反で短くなった場合は、その違反が台帳に載っているので除く。
+    """
+    return tuple(
+        sorted(
+            episode.episode_id
+            for episode in arm.episodes
+            if episode.termination not in _OWN_FAILURE_TERMINATIONS
+            and len(episode.steps) < len(baseline.episode(episode.episode_id).steps)
+        )
+    )
 
 
 def _rank_value(mean: float | None) -> float:
@@ -657,6 +689,11 @@ class SupervisorPolicyTrainer:
                 _rank_value(baseline_mean),
             )
             improved = key < baseline_key
+            truncated = truncated_episodes(arm, baseline_arm)
+            if truncated:
+                # **壊れたせいで安全に見える候補を勝たせない。** 先に終わった候補は、
+                # Baseline がその後で踏んだ違反を観測していない（fail closed）。
+                improved = False
             if improved and key[:2] == baseline_key[:2]:
                 # 安全側が同点のときだけ reward の差を見る。差は設定した下限を満たすこと。
                 improved = (
@@ -674,6 +711,7 @@ class SupervisorPolicyTrainer:
                 mean_reward_over_common_horizon=mean,
                 baseline_mean_reward_over_common_horizon=baseline_mean,
                 improved=improved,
+                truncated_episodes=truncated,
             )
         return outcomes
 

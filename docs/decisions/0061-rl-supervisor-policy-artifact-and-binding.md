@@ -285,6 +285,12 @@ Baseline の欄が `output_bounds` の外にあれば**丸めず拒む**。
   候補をすべて回してから、episode ごとに**全 arm の採点できた step 数の最小**を取り、
   その長さで採点する。使った長さは `common_matched_steps` として報告に残す
   （hash では読めないため。0056 §2.3 と同じ理由）
+- **Baseline より早く打ち切られた候補は改善扱いにしない**（fail closed）。reward は共通の長さへ
+  揃えるが、安全側の台帳（違反・範囲外 action）は episode 全体を数える。候補が自分の違反以外の
+  理由（`dynamics_unusable` など）で Baseline より少ない step で終わると、Baseline がその後で
+  踏んだ違反を観測しないまま「違反が少ない」ことになる。該当する episode は
+  `CandidateOutcome.truncated_episodes` に残し、1つでもあれば `improved=False` とする。
+  自分の違反・範囲外 action で短くなった場合は、その違反が台帳に載るので対象外
 - **どの候補も Baseline を上回らなければ、Baseline の表が選ばれる。** 上回っていないのに
   別の表を出さないためで、その artifact は「Rule の戦略を RL artifact として表したもの」になる。
   shadow の配線を確かめるには十分で、戦略は何も変わらない

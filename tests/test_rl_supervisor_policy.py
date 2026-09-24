@@ -45,12 +45,14 @@ from coldaisle.control.model_registry import (
     ModelRegistry,
     VerifiedArtifact,
 )
+from coldaisle.control.rl.episode import TerminationReason
 from coldaisle.control.rl.training import (
     BASELINE_CANDIDATE_ID,
     SupervisorPolicyTrainer,
     SupervisorPolicyTrainingError,
     common_matched_steps,
     mean_reward_over,
+    truncated_episodes,
 )
 from coldaisle.control.schema import (
     AuthorityStage,
@@ -1154,6 +1156,50 @@ def test_invariant_19_candidates_are_ranked_on_one_common_horizon(trained: Any) 
     assert short_episode.discounted_reward > full.discounted_reward
     # 揃えた長さでは同じ step だけを見るので、その有利が消える。
     assert mean_reward_over(short_arm, horizon) == mean_reward_over(long_arm, horizon)
+
+
+def test_invariant_19_b_a_candidate_cut_short_cannot_look_safer(trained: Any) -> None:
+    """**壊れたせいで安全に見える候補を改善扱いにしない**（fail closed）。
+
+    Baseline が coverage を満たした後で安全違反を踏み、候補が同じ所より前に
+    採点できない理由（dynamics_unusable など）で終わると、候補は違反を観測しないまま
+    `safety_violations=0` になる。全体の台帳で比べると候補が「改善」に見える。
+    """
+    environment, _config, settings, _safety = build_environment(trained, with_mpc=False)
+    trainer = trainer_for(environment, settings)
+    specs = (episode_spec(episode_id="pr89-a", seed=3),)
+    report = trainer.train(specs, model_version="0.1.0", created_at=CREATED_AT)
+    base = report.comparison.arms[0]
+    full = base.episode("pr89-a")
+    assert len(full.steps) >= 2
+
+    # Baseline は最後の step で安全違反を踏んだ（台帳は型の検査を通さず直に作る）。
+    violated = full.model_copy(
+        update={
+            "safety": full.safety.model_copy(update={"ceiling_exceedances": 1}),
+            "termination": TerminationReason.SAFETY_VIOLATION,
+        }
+    )
+    baseline_arm = base.model_copy(update={"episodes": (violated,)})
+    # 候補は、その手前で dynamics が使えなくなって終わった。
+    cut = full.model_copy(
+        update={"steps": full.steps[:-1], "termination": TerminationReason.DYNAMICS_UNUSABLE}
+    )
+    cut_arm = base.model_copy(update={"episodes": (cut,), "policy_version": "cand-cut"})
+    # 対照: 同じ長さを走り切って違反しなかった候補は、正しく改善になる。
+    clean_arm = base.model_copy(update={"episodes": (full,), "policy_version": "cand-clean"})
+
+    assert truncated_episodes(cut_arm, baseline_arm) == ("pr89-a",)
+    assert truncated_episodes(clean_arm, baseline_arm) == ()
+
+    arms = {"cut": cut_arm, "clean": clean_arm}
+    horizon = common_matched_steps((baseline_arm, *arms.values()))
+    outcomes = trainer._score(arms=arms, rejections={}, baseline_arm=baseline_arm, horizon=horizon)
+    assert outcomes["cut"].safety_violations < baseline_arm.safety_violations
+    assert outcomes["cut"].truncated_episodes == ("pr89-a",)
+    assert outcomes["cut"].improved is False
+    assert outcomes["clean"].improved is True
+    assert trainer._select(outcomes) == "clean"
 
 
 def test_invariant_20_binding_compares_every_artifact_determined_metadata_field(
