@@ -351,18 +351,32 @@ def fit_confidence_profile(
     )
 
 
-def inference_id(observed: ObservedThermalInput, prediction: ThermalPrediction) -> str:
-    """1回の推論（入力と予測）の識別子。
+def input_sha256(observed: ObservedThermalInput) -> str:
+    """推論に使った入力 window の canonical JSON の SHA-256。
 
-    Learned MPC の提案と assessment の両方に付け、同じ推論の判定だけを提案へ付けられるようにする。
-    入力と予測の canonical JSON（artifact SHA-256 を含む）の SHA-256 なので、同じ model version の
-    別の入力・別の artifact とは必ず違う値になる。
+    `inference_id` を **assessment だけから作り直せるようにする**ために分けて持つ（#159）。
+    window そのものを assessment へ持たせると、tick ごとに大きな object を運ぶことになる。
     """
-    if observed.action_ts_ms != prediction.input_action_ts_ms:
-        raise ValueError("推論の識別子は同じ入力の予測からだけ作る")
+    payload = json.dumps(
+        observed.model_dump(mode="json"),
+        ensure_ascii=False,
+        allow_nan=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def derive_inference_id(input_digest: str, prediction: ThermalPrediction) -> str:
+    """入力の digest と**予測そのもの**から推論の識別子を作り直す。
+
+    `ConfidenceAssessment` はこの2つを持つので、**識別子を宣言ではなく導出として検証できる**
+    （#159 / codex #4057241944）。artifact SHA-256 は `prediction` の中にあるので、
+    artifact を差し替えれば識別子は必ず変わる。
+    """
     payload = json.dumps(
         {
-            "observed": observed.model_dump(mode="json"),
+            "input_sha256": input_digest,
             "prediction": prediction.model_dump(mode="json"),
         },
         ensure_ascii=False,
@@ -371,6 +385,18 @@ def inference_id(observed: ObservedThermalInput, prediction: ThermalPrediction) 
         sort_keys=True,
     ).encode("utf-8")
     return hashlib.sha256(payload).hexdigest()
+
+
+def inference_id(observed: ObservedThermalInput, prediction: ThermalPrediction) -> str:
+    """1回の推論（入力と予測）の識別子。
+
+    Learned MPC の提案と assessment の両方に付け、同じ推論の判定だけを提案へ付けられるようにする。
+    入力の digest と予測の canonical JSON（artifact SHA-256 を含む）の SHA-256 なので、
+    同じ model version の別の入力・別の artifact とは必ず違う値になる。
+    """
+    if observed.action_ts_ms != prediction.input_action_ts_ms:
+        raise ValueError("推論の識別子は同じ入力の予測からだけ作る")
+    return derive_inference_id(input_sha256(observed), prediction)
 
 
 # ---------------------------------------------------------------- Residual drift
@@ -687,13 +713,55 @@ class ConfidenceAssessment(_Frozen):
     artifact_verification: ArtifactVerification
     profile_sha256: Sha256
     input_action_ts_ms: int = Field(ge=0)
+    input_sha256: Sha256
+    """判定に使った入力 window の digest（#159）。``prediction`` と合わせて識別子を作り直す。"""
+    prediction: ThermalPrediction
+    """**判定した予測そのもの。** identity を宣言ではなく導出にするために持つ（#159）。
+
+    `artifact_sha256` はこの中にもある。**欄だけを書き換えても、識別子の導出が合わなくなる**
+    ので通らない（codex #4057241944）。
+    """
     inference_id: Sha256
-    """判定した推論（入力と予測）。提案の ``inference_id`` と一致したときだけ提案へ付けられる。"""
+    """判定した推論（入力と予測）。提案の ``inference_id`` と一致したときだけ提案へ付けられる。
+
+    **宣言ではない。** `derive_inference_id(input_sha256, prediction)` と一致しなければ
+    この型は作れない（`model_validate` で検証する）。
+    """
     confidence: UnitInterval
     ood: bool
     components: tuple[ComponentResult, ...] = Field(
         min_length=len(ConfidenceComponent), max_length=len(ConfidenceComponent)
     )
+
+    @model_validator(mode="after")
+    def _identity_is_derived_not_declared(self) -> Self:
+        """**artifact と推論の識別子を、写した欄ではなく導出で確かめる**（#159）。
+
+        `artifact_sha256` / `model_version` は誰でも書き換えられる欄なので、それ同士を
+        比べても「artifact B の判定を A と名乗らせる」ことは止められない
+        （codex #4057241944 / #4057753197）。
+        識別子は `prediction`（artifact SHA-256 を含む）から導出するので、artifact を
+        差し替えれば必ず値が変わる。差し替えたうえで識別子も作り直せば、それはもう
+        **その提案の推論ではない**（提案の `inference_id` と合わなくなる）。
+        """
+        if self.prediction.input_action_ts_ms != self.input_action_ts_ms:
+            raise ValueError("assessment と予測の input action 時刻が違う")
+        if self.prediction.model_id != self.model_id:
+            raise ValueError("assessment と予測の model_id が違う")
+        if self.prediction.model_version != self.model_version:
+            # **版も、識別子の導出に入っている値から動かせないようにする**
+            # （決定記録 0065 §2.1。codex #4057753197）。
+            # 同じ artifact bytes を指す登録が2つあると、
+            # 版だけを書き換えた assessment（と同じく書き換えた提案）が、
+            # artifact の照合も識別子の照合もそのまま通ってしまう。
+            raise ValueError("assessment と予測の model_version が違う")
+        if self.prediction.artifact_sha256 != self.artifact_sha256:
+            raise ValueError("assessment の artifact が、判定した予測の artifact と違う")
+        if self.prediction.artifact_verification is not self.artifact_verification:
+            raise ValueError("assessment と予測の artifact 検証状態が違う")
+        if self.inference_id != derive_inference_id(self.input_sha256, self.prediction):
+            raise ValueError("推論の識別子が、入力の digest と予測から導けない")
+        return self
 
     @model_validator(mode="after")
     def _confidence_follows_components(self) -> Self:
@@ -798,6 +866,7 @@ class ConfidenceAssessor:
             self._uncertainty(prediction),
             self._residual_drift(residual, observed.action_ts_ms),
         )
+        digest = input_sha256(observed)
         return ConfidenceAssessment(
             model_id=prediction.model_id,
             model_version=prediction.model_version,
@@ -805,7 +874,9 @@ class ConfidenceAssessor:
             artifact_verification=prediction.artifact_verification,
             profile_sha256=self._profile_sha256,
             input_action_ts_ms=observed.action_ts_ms,
-            inference_id=inference_id(observed, prediction),
+            input_sha256=digest,
+            prediction=prediction,
+            inference_id=derive_inference_id(digest, prediction),
             confidence=_combine(components),
             ood=any(item.ood for item in components),
             components=components,
