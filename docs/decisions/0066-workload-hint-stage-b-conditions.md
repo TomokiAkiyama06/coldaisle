@@ -158,7 +158,7 @@ wall_elapsed_ms     = startup_wall_ms - ts_ms                 （壁時計の差
 - 残り時間は**元の期限（`min(declared_ms, max_age_ms)`）を超えない**ことを不変条件とし、試験で固定する
   （**期限と残り時間は `boottime_elapsed_ms` だけで数える**。壁時計の差は巻き戻しで短くなりうるので、
   残り時間の計算には使わない。`boottime_elapsed_ms >= 0` が保証されるので引き算は減る方向にしか働かない）
-- 採らなかった理由は構造化ログに閉じた語彙（`backfill_rejected: future_ts | too_old | expired | unverifiable_elapsed | already_terminated | unverifiable_status`）で残す。
+- 採らなかった理由は構造化ログに閉じた語彙（`backfill_rejected: future_ts | too_old | expired | unverifiable_elapsed | already_terminated | unclean_previous_run`）で残す。
   `ts_ms` の値そのものは載せない（0064 §2.9）
 - 制御中の鮮度判定は 0064 §2.6 のとおり単調時計のままで、この規則は**起動時 1 回**にだけ関わる
 - **起動時に復元する行の順序は壁時計で決めない。** 0064 §2.6 は `events.ts_ms` を行の順序に使うが、
@@ -167,15 +167,23 @@ wall_elapsed_ms     = startup_wall_ms - ts_ms                 （壁時計の差
   `events.id`（追記の順。0045 §2.5 の表は更新・削除をトリガで拒むので、`id` は追記の順に増える）の昇順に
   行を当てはめ、終了・置き換えを反映してから、最後に残った未完了のヒントを1つ選ぶ。そのヒントに上の経過の
   条件を当てはめる。`ts_ms` の順は使わない
-- **`contradicted` になったヒントは再起動をまたいでも復元しない。** 0064 §2.7 では矛盾は `events` に書かれず、
-  ログと decision trace（0064 §2.9 の `status: contradicted` と `event_id`）にだけ残る。`events` だけで復元すると、
-  矛盾したヒントの `phase: "start"` を未完了として再び採ってしまい、「一度 `contradicted` になった行は再採用しない」
-  を再起動で破る。そこで起動時の復元は、選んだヒントの `event_id` について、そのヒントの記録以後の decision trace
-  （同じ boot の `CLOCK_BOOTTIME` の範囲）を引き、`status` が一度でも `contradicted`（または `expired` / `ended` /
-  `superseded`）になっていれば採らない（`backfill_rejected: already_terminated`）
-  - その範囲の trace が途切れていて終端状態の有無を確かめられない場合も採らない（`backfill_rejected: unverifiable_status`）。
-    確かめられない状態を「矛盾していない」と扱わない
-  - 制御デーモンは `events` に書かない（書き込み入口は 0045 のソケットだけ）ので、終端状態を `events` に追記する形は採らない
+- **`contradicted` などの終端状態は制御デーモン自身が永続化し、再起動で復元しない。** 0064 §2.7 では矛盾は
+  `events` に書かれず、ログと decision trace にだけ残る。trace は壁時計の `ts_ms` と `CLOCK_MONOTONIC` しか持たず、
+  保存に失敗しても制御は続く（0060 §2.6）ので、trace から終端状態を探す方法では「終端の記録が欠けた」ことと
+  「その間デーモンが動いていなかった」ことを区別できない。そこで次のように決める
+  - 制御デーモンは、ヒントが `contradicted` / `expired` / `ended` / `superseded` になった時点で、自分の store に
+    **終端状態の表**（`event_id` を主キー、状態、その時点の boot id と `CLOCK_BOOTTIME`）へ1行書く。
+    制御デーモンは `events` に書かない（書き込み入口は 0045 のソケットだけ）ので、この表は `events` とは別に持つ
+  - 起動時の復元は、選んだヒントの `event_id` がこの表にあれば採らない（`backfill_rejected: already_terminated`）。
+    時刻の範囲で探さないので、時計の種類の違いに左右されない
+  - **終端状態を書けなかった可能性がある run の後では、起動時の取り込みをしない。** 制御デーモンは run ごとに
+    開始と正常終了の記録を同じ store に残し、終端状態の書き込みに1回でも失敗した run では正常終了の記録を
+    「欠けあり」として残す。起動時に、直前の run に正常終了の記録が無い（異常終了）または「欠けあり」なら、
+    どのヒントも取り込まない（`backfill_rejected: unclean_previous_run`）。確かめられない状態を
+    「終端していない」と扱わない
+  - デーモンが止まっている間に届いたヒントは、直前の run が正常に終わっていれば、終端状態が書かれている
+    はずもないので、上の条件で取り込める
+  - 表と run の記録の形（列・migration）は、0066 の実装 Issue で定める
 - **経過を過小に見積もった行は採らない。** 記録の後に壁時計が戻り、起動までに `ts_ms` を少しだけ
   追い越した場合、`wall_elapsed_ms` は正でも実際の経過より短く、期限切れのヒントが復活しうる。
   負の値を拒むだけでは防げないので、起動時の取り込みは**壁時計の差だけでは採らない**:
