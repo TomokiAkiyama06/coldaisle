@@ -65,7 +65,11 @@ from coldaisle.control.supervisor.artifact import (
     action_space_sha256,
 )
 from coldaisle.control.supervisor.policy import SupervisorInput, SupervisorPolicy
-from coldaisle.control.supervisor.policy_config import RlPolicyConfig
+from coldaisle.control.supervisor.policy_config import (
+    BASELINE_CANDIDATE_ID,
+    RlPolicyConfig,
+    candidate_identifier,
+)
 from coldaisle.control.supervisor.regime import (
     RegimeEvidence,
     RegimeReason,
@@ -74,7 +78,6 @@ from coldaisle.control.supervisor.regime import (
 
 TRAINING_REPORT_SCHEMA_VERSION: Literal[1] = 1
 
-BASELINE_CANDIDATE_ID = "baseline"
 """Rule policy の表をそのまま RL artifact として回す候補の識別子。
 
 **必ず並べる。** どの候補も Baseline を上回らないとき、選ばれるのはこれである。
@@ -578,6 +581,15 @@ class SupervisorPolicyTrainer:
         「全候補を比べた」と読めてしまう。
         """
         baseline = self.baseline_table()
+        # **数えてから作る。** 直積と表を先に作ってから上限を見ると、大きいが妥当な設定で
+        # 上限の検査に届く前に資源を使い切る。
+        projected = self._projected_candidate_count(baseline)
+        limit = self._config.search.max_candidate_tables
+        if projected > limit:
+            raise SupervisorPolicyTrainingError(
+                f"候補表が設定の上限を超えた（candidates={projected}; limit={limit}）。"
+                "切り詰めずに設定を見直す"
+            )
         pool = self._action_pool()
         candidates: list[tuple[str, RegimeTablePayload]] = [(BASELINE_CANDIDATE_ID, baseline)]
         for regime in sorted(WorkloadRegime, key=lambda item: item.value):
@@ -601,15 +613,33 @@ class SupervisorPolicyTrainer:
                     for entry in baseline.entries
                 )
                 candidates.append(
-                    (f"{regime.value}-a{index:04d}", RegimeTablePayload(entries=entries))
+                    (candidate_identifier(regime, index), RegimeTablePayload(entries=entries))
                 )
-        limit = self._config.search.max_candidate_tables
-        if len(candidates) > limit:
-            raise SupervisorPolicyTrainingError(
-                f"候補表が設定の上限を超えた（candidates={len(candidates)}; limit={limit}）。"
-                "切り詰めずに設定を見直す"
-            )
+        if len(candidates) != projected:  # pragma: no cover - 数え方と作り方の食い違い
+            raise SupervisorPolicyTrainingError("候補表の数が事前に数えた数と一致しない")
         return tuple(candidates)
+
+    def _projected_candidate_count(self, baseline: RegimeTablePayload) -> int:
+        """候補表の数を**作らずに**数える。
+
+        action の候補は strategy × target band × weight の直積で、各軸は重複しない
+        （`output_bounds` と `weight_candidates` の検証）ので、直積の要素も重複しない。
+        regime ごとに、Baseline と同じ action になる差し替えが直積に含まれていれば1つ除く。
+        """
+        strategies = self._bounds.strategies
+        bands = self._bounds.target_bands
+        weights = self._config.search.weight_candidates
+        pool_size = len(strategies) * len(bands) * len(weights)
+        count = 1
+        for regime in WorkloadRegime:
+            current = baseline.entry(regime)
+            in_pool = (
+                current.strategy in strategies
+                and current.target_band in bands
+                and current.weights in weights
+            )
+            count += pool_size - (1 if in_pool else 0)
+        return count
 
     def _action_pool(self) -> tuple[_CandidateAction, ...]:
         """strategy × target band × weight 候補を、設定の並びのまま展開する。

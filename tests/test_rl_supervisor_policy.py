@@ -47,7 +47,6 @@ from coldaisle.control.model_registry import (
 )
 from coldaisle.control.rl.episode import TerminationReason
 from coldaisle.control.rl.training import (
-    BASELINE_CANDIDATE_ID,
     SupervisorPolicyTrainer,
     SupervisorPolicyTrainingError,
     candidate_rejection,
@@ -98,6 +97,12 @@ from coldaisle.control.supervisor import (
     action_space_sha256,
     canonical_policy_artifact_bytes,
     policy_registry_metadata,
+)
+from coldaisle.control.supervisor.policy_config import (
+    BASELINE_CANDIDATE_ID,
+    MAX_CANDIDATE_TABLES,
+    MAX_POLICY_MODEL_ID_LENGTH,
+    POLICY_VERSION_MAX_LENGTH,
 )
 from coldaisle.control.supervisor.regime import (
     RegimeEvidence,
@@ -1560,6 +1565,50 @@ def test_candidates_are_bounded_and_never_silently_truncated(trained: Any) -> No
     trainer = trainer_for(environment, settings, search={"max_candidate_tables": 2})
     with pytest.raises(SupervisorPolicyTrainingError, match="上限を超えた"):
         trainer.candidates()
+
+
+def test_candidates_are_counted_before_they_are_materialized(
+    trained: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """**上限は作る前に数えて検査する。** 直積や表を先に作ると、大きい設定で資源を使い切る。"""
+    environment, _config, settings, _safety = build_environment(trained, with_mpc=False)
+    trainer = trainer_for(environment, settings, search={"max_candidate_tables": 2})
+
+    def forbidden(self: Any) -> Any:
+        raise AssertionError("上限を超える設定で action の直積を作った")
+
+    monkeypatch.setattr(SupervisorPolicyTrainer, "_action_pool", forbidden)
+    with pytest.raises(SupervisorPolicyTrainingError, match="上限を超えた"):
+        trainer.candidates()
+
+    # 事前の数は、実際に作った数と一致する（上限の中では作ってから照合している）。
+    monkeypatch.undo()
+    roomy = trainer_for(
+        environment, settings, search={"max_candidate_tables": MAX_CANDIDATE_TABLES}
+    )
+    baseline = roomy.baseline_table()
+    assert roomy._projected_candidate_count(baseline) == len(roomy.candidates())
+
+
+def test_a_maximal_model_id_leaves_room_for_every_candidate_version(trained: Any) -> None:
+    """**候補の版 `<model_id>-<識別子>` は上限に収まる。**
+
+    収まらない model_id は、探索の途中ではなく設定の読み込みで落とす。
+    """
+    with pytest.raises(ValidationError, match="model_id"):
+        rl_policy_config(artifact={"model_id": "m" * (MAX_POLICY_MODEL_ID_LENGTH + 1)})
+
+    environment, _config, settings, _safety = build_environment(trained, with_mpc=False)
+    model_id = "m" * MAX_POLICY_MODEL_ID_LENGTH
+    trainer = trainer_for(environment, settings, artifact={"model_id": model_id})
+    identifiers = [identifier for identifier, _ in trainer.candidates()]
+    assert max(len(f"{model_id}-{identifier}") for identifier in identifiers) <= (
+        POLICY_VERSION_MAX_LENGTH
+    )
+    # 学習を最後まで回しても、候補の版が検証に落ちない。
+    specs = (episode_spec(episode_id="pr89-a", seed=3),)
+    report = trainer.train(specs, model_version="0.1.0", created_at=CREATED_AT)
+    assert report.artifact.manifest.model_id == model_id
 
 
 def test_the_trainer_refuses_a_baseline_that_is_not_the_rule_policy(trained: Any) -> None:

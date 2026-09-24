@@ -24,7 +24,7 @@ import yaml
 from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, model_validator
 
 from coldaisle.control.config import ConfigValue, FiniteFloat, UnitInterval
-from coldaisle.control.schema import SupervisorObjectiveWeights
+from coldaisle.control.schema import SupervisorObjectiveWeights, WorkloadRegime
 
 RL_POLICY_CONFIG_VERSION: Literal[1] = 1
 RL_POLICY_CONFIG_FILENAME = "rl-policy.yaml"
@@ -34,6 +34,44 @@ MAX_WEIGHT_CANDIDATES = 64
 
 MAX_CANDIDATE_TABLES = 4_096
 """1回の探索で回せる候補表の構造上限。"""
+
+POLICY_VERSION_MAX_LENGTH = 120
+"""候補の policy version が収まらなければならない長さ。
+
+`SupervisorOutput.version` / `EpisodeResult.policy_version` の上限と同じ値で、
+候補の版は `<model_id>-<候補識別子>` になる。
+"""
+
+BASELINE_CANDIDATE_ID = "baseline"
+"""Baseline の表を表す候補識別子。"""
+
+CANDIDATE_INDEX_WIDTH = len(str(MAX_CANDIDATE_TABLES - 1))
+"""候補識別子の番号の桁数。
+
+1 regime に並ぶ候補は候補表の総数を超えないので、番号は `MAX_CANDIDATE_TABLES - 1` 以下に
+収まる（総数は生成の前に上限で検査する）。
+"""
+
+MAX_CANDIDATE_ID_LENGTH = max(
+    len(BASELINE_CANDIDATE_ID),
+    max(len(regime.value) for regime in WorkloadRegime) + len("-a") + CANDIDATE_INDEX_WIDTH,
+)
+"""候補識別子の最大の長さ（`candidate_identifier()` が作る形から導く）。"""
+
+MAX_POLICY_MODEL_ID_LENGTH = POLICY_VERSION_MAX_LENGTH - len("-") - MAX_CANDIDATE_ID_LENGTH
+"""`artifact.model_id` の上限。**候補の版が上限を超えないよう、接尾辞の分を残す。**
+
+超える model_id を受け取ると、探索の途中で候補の版が `SupervisorOutput` の検証に落ち、
+学習が中断する。設定の読み込みで先に落とす。
+"""
+
+
+def candidate_identifier(regime: WorkloadRegime, index: int) -> str:
+    """regime を1つだけ差し替えた候補の識別子。長さは `MAX_CANDIDATE_ID_LENGTH` 以下。"""
+    if not 0 <= index < MAX_CANDIDATE_TABLES:
+        raise ValueError(f"候補の番号が構造上限の外にある（index={index}）")
+    return f"{regime.value}-a{index:0{CANDIDATE_INDEX_WIDTH}d}"
+
 
 PolicyFloat = ConfigValue[FiniteFloat]
 PolicyUnitInterval = ConfigValue[UnitInterval]
@@ -58,7 +96,8 @@ class PolicyArtifactConfig(_ConfigModel):
     版を設定から取ると、同じ設定で回した2つの探索が同じ版を名乗れてしまう。
     """
 
-    model_id: str = Field(pattern=r"^[a-z][a-z0-9_.-]*$", max_length=120)
+    model_id: str = Field(pattern=r"^[a-z][a-z0-9_.-]*$", max_length=MAX_POLICY_MODEL_ID_LENGTH)
+    """候補の版 `<model_id>-<候補識別子>` が `POLICY_VERSION_MAX_LENGTH` に収まる長さまで。"""
 
 
 class PolicySearchConfig(_ConfigModel):

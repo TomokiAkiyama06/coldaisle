@@ -88,13 +88,13 @@ from coldaisle.control.rl.reward import (
     SafetyLedgerEntry,
 )
 from coldaisle.control.rl.training import (
-    BASELINE_CANDIDATE_ID,
     TRAINING_REPORT_SCHEMA_VERSION,
     CandidateOutcome,
     SupervisorPolicyTrainer,
     SupervisorPolicyTrainingError,
     SupervisorPolicyTrainingReport,
 )
+from coldaisle.control.supervisor.policy_config import BASELINE_CANDIDATE_ID
 
 __all__ = [
     "BASELINE_CANDIDATE_ID",

@@ -200,6 +200,11 @@ search:   { family, seed, max_candidate_tables, minimum_reward_improvement, weig
 shadow:   { minimum_ticks, minimum_paired_fraction }
 ```
 
+`artifact.model_id` の長さは、候補の版 `<model_id>-<候補識別子>` が `SupervisorOutput.version`
+の上限（120）に収まる分まで（`MAX_POLICY_MODEL_ID_LENGTH`）。候補識別子の最大長は
+識別子の形（`<regime>-a<番号>`、番号は `max_candidate_tables` の構造上限の桁数）から導く。
+超える model_id は、探索の途中で候補の版が検証に落ちて学習が中断するので、設定の読み込みで落とす。
+
 **`config/rl-training.yaml` へ足さない。** 0058 §2.7 は環境の設定を schema v1 として
 確定させており、FINAL の記録が決めた形をこちら側の都合で広げない。所有も分かれる
 （環境の契約は #105、探索と昇格の判断材料は #89）。
@@ -265,6 +270,9 @@ Baseline の欄が `output_bounds` の外にあれば**丸めず拒む**。
 
 - **上限を超えたら切り詰めず落とす。** 黙って切ると、報告に出ない候補が生まれ
   「全候補を比べた」と読めてしまう
+  - 上限の検査は、action の直積も候補表も**作る前に**、数えて行う（各軸は重複しないので、
+    regime ごとの候補数は直積の大きさから Baseline と同じ action の分を引いた数になる）。
+    作ってから数えると、大きいが妥当な設定で検査に届く前に資源を使い切る
 - 設定した weight 候補が範囲外なら**落とさず拒む**。黙って落とすと、設定した候補が
   評価されていないことに気づけない
 - 評価順は seed で決めるが、**選択は順序に依らない**。並び替えの鍵は
