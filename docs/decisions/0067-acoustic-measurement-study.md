@@ -92,6 +92,11 @@
   **実機の backend で書き込み、読み戻しに成功していた**ことを求め、そうでない回答は当てはめに使わない
   - 残す結果にも、tick の backend の種類と読み戻しの成否（lookback 区間を通した判定）を残す。
     これが trace に記録されていない間は、どの回答も当てはめに使わない
+  - 書き込みと読み戻しが成功していても、Fan が回っているとは限らない（`HardwareReadback` は `rpm` を
+    `write_ok` / `readback_ok` と別に持ち、tach stall では `rpm=0` のまま両方が成功しうる）。そこで lookback 区間の
+    すべての tick で、各 Zone の **tach の RPM が有効で、`TACH_STALL` などの Fan の故障が出ていない**ことも求める。
+    止まった Fan の「高い Demand で `ok`」を数えると、曲線を低く見積もってしまうため。満たさない回答は
+    当てはめに使わず、残す結果にもこの判定（RPM の有効性と故障の有無）を残す
 
 - 回答の時刻**以前で最も新しい** decision trace の tick から、各 Zone の **effective の Demand** と
   RPM を取る。回答より後の tick は使わない（その状態はまだ鳴っていなかった）。
