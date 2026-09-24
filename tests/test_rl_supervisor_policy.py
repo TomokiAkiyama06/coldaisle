@@ -53,7 +53,9 @@ from coldaisle.control.rl.training import (
     candidate_rejection,
     common_matched_steps,
     mean_reward_over,
+    safety_observed_steps,
     scoring_horizon,
+    short_episodes,
     truncated_episodes,
 )
 from coldaisle.control.schema import (
@@ -1378,6 +1380,73 @@ def test_invariant_19_d_a_self_failing_candidate_never_shortens_the_common_horiz
     assert outcomes["b-same"].improved is False
     assert outcomes["c-better"].improved is True
     assert trainer._select(outcomes) == "c-better"
+
+
+def test_invariant_19_e_short_is_judged_by_observed_length_not_supported_steps(
+    trained: Any,
+) -> None:
+    """**長さの定義は1つ（観測した長さ）。** 採点できた step 数が同じでも短い候補を見落とさない。
+
+    候補は採点できた step で温度上限を超えて終わり、Baseline は同じ数の採点できた step の後、
+    採点できない終端で floor 不足を記録した。採点できた step 数は等しいが、Baseline は
+    候補が観測していない最後の安全側の結果を観測している。
+    """
+    environment, _config, settings, _safety = build_environment(trained, with_mpc=False)
+    trainer = trainer_for(environment, settings)
+    specs = (episode_spec(episode_id="pr89-a", seed=3),)
+    report = trainer.train(specs, model_version="0.1.0", created_at=CREATED_AT)
+    base = report.comparison.arms[0]
+    full = base.episode("pr89-a").model_copy(update={"learned_controller_available": True})
+    assert len(full.steps) >= 3 and all(step.supported for step in full.steps)
+    kept = full.steps[:-1]
+
+    # Baseline: 最後から2つ目までは採点でき、最後の step で floor を下回った（採点できない終端）。
+    baseline_episode = full.model_copy(
+        update={
+            "steps": (
+                *kept,
+                _unobserved(full.steps[-1], "safety_floor_shortfall", floor_shortfalls=1),
+            ),
+            "safety": full.safety.model_copy(update={"floor_shortfalls": 1}),
+            "termination": TerminationReason.SAFETY_VIOLATION,
+        }
+    )
+    # 候補: 同じ数の採点できた step で、最後の採点できた step が温度上限を超えて終わった。
+    # reward は Baseline より良くしておく（違反の数が同点なら reward で改善に見えてしまう）。
+    tail = kept[-1]
+    assert tail.reward is not None
+    violating_tail = tail.model_copy(
+        update={
+            "safety": tail.safety.model_copy(update={"ceiling_exceedances": 1}),
+            "reward": tail.reward.model_copy(update={"reward": tail.reward.reward + 1.0}),
+        }
+    )
+    candidate_episode = full.model_copy(
+        update={
+            "steps": (*kept[:-1], violating_tail),
+            "safety": full.safety.model_copy(update={"ceiling_exceedances": 1}),
+            "termination": TerminationReason.SAFETY_VIOLATION,
+        }
+    )
+    assert len(candidate_episode.supported_steps) == len(baseline_episode.supported_steps)
+
+    baseline_arm = _arm_of(base, baseline_episode, base.policy_version)
+    arms = {"early": _arm_of(base, candidate_episode, "cand-early")}
+    assert safety_observed_steps(candidate_episode) < safety_observed_steps(baseline_episode)
+    assert short_episodes(arms["early"], baseline_arm) == ("pr89-a",)
+    # 自分の違反で終わったので打ち切りではない（比較には残る）。
+    assert truncated_episodes(arms["early"], baseline_arm) == ()
+    assert candidate_rejection(arms["early"], baseline_arm) is None
+
+    horizon = scoring_horizon(baseline_arm, arms, {})
+    outcomes = trainer._score(arms=arms, rejections={}, baseline_arm=baseline_arm, horizon=horizon)
+    early = outcomes["early"]
+    assert early.comparable is True
+    assert early.safety_violations == baseline_arm.safety_violations == 1
+    assert early.short_episodes == ("pr89-a",)
+    assert early.mean_reward_over_common_horizon is None
+    assert early.improved is False
+    assert trainer._select(outcomes) == BASELINE_CANDIDATE_ID
 
 
 def test_invariant_20_binding_compares_every_artifact_determined_metadata_field(

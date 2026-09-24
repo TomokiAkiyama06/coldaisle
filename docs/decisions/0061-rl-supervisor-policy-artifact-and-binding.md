@@ -285,33 +285,28 @@ Baseline の欄が `output_bounds` の外にあれば**丸めず拒む**。
   候補をすべて回してから、episode ごとに**全 arm の採点できた step 数の最小**を取り、
   その長さで採点する。使った長さは `common_matched_steps` として報告に残す
   （hash では読めないため。0056 §2.3 と同じ理由）
-- **Baseline より早く打ち切られた候補は比べない**（fail closed）。reward は共通の長さへ
-  揃えるが、安全側の台帳（違反・範囲外 action）は episode 全体を数える。候補が自分の違反以外の
-  理由（`dynamics_unusable` など）で先に終わると、Baseline がその後で踏んだ違反を観測しないまま
-  「違反が少ない」ことになる
-  - 判定は**終わり方と、安全を観測した step の数**で行う。数えるのは、採点できた step と、
-    採点はできないが安全側の違反を記録した step（`safety_floor_shortfall` の終端など）である。
-    環境は採点できない終端も記録に積むので、**記録の数でも採点できた step の数でもない**。
-    どちらで比べても、Baseline が最後の step で違反を記録し、候補が同じ位置で観測できずに
-    終わった場合を見落とす
-  - 候補の終端理由が自分の違反・範囲外 action でなく、かつ安全を観測した step 数が Baseline より
-    少ない episode が1つでもあれば、候補を `comparable=False`（理由 `candidate_truncated`）にし、
-    該当 episode を `CandidateOutcome.truncated_episodes` に残す。自分の違反で終わった場合は
-    その違反が台帳に載るので対象外。Baseline と同じだけ観測した場合、Baseline の違反した位置を
-    越えて観測した場合も対象外
-  - **比べてよいかは採点の前に1度だけ決める**（`candidate_rejection()`）。共通の長さは
-    比べてよい候補と Baseline だけから取る（`scoring_horizon()`）。後で落とす形だと、
-    落とす候補の短さが健全な候補すべての採点区間を縮める
-- **Baseline より先に終わった候補は、理由を問わず共通の長さに入れない。** 自分の違反・範囲外
-  action で先に終わった候補は打ち切りではない（違反が台帳に載る）ので比較には残す
-  （`comparable=True`）。ただし共通の長さに入れると、健全な候補どうしが最初の数 step だけで
-  並べられ、壊れた候補が「どの健全な候補が選ばれるか」を変えてしまう
-  - 共通の長さ（`scoring_horizon()`）は、Baseline と、比べてよく、かつ採点できた step 数が
-    どの episode でも Baseline 以上の候補だけから取る
-  - 先に終わった候補は `CandidateOutcome.short_episodes` に該当 episode を残す。共通の長さの
-    reward を持たないので `mean_reward_over_common_horizon` は書かず（`None`）、
-    **改善扱いにしない**（fail closed）。自分の長さで採点した reward を並べると、
-    長さの違う総和を並べることになる（0058 §2.6）ので、この単純な形を採る
+- **Baseline より短い候補を、Baseline と同じ区間を比べたものとして扱わない**（fail closed）。
+  reward は共通の長さへ揃えるが、安全側の台帳（違反・範囲外 action）は episode 全体を数える。
+  候補が先に終わると、Baseline がその後で観測した安全側の結果を観測しないまま「違反が少ない」
+  「同点」に見え、また候補の短さが共通の長さを縮めて健全な候補どうしの並びを変えてしまう
+  - **長さの定義は1つ**: episode の「観測した長さ」（`safety_observed_steps()`）は、安全側の
+    結果を観測した step の数である。採点できた step と、採点はできないが安全側の違反を記録した
+    step（`safety_floor_shortfall` の終端など）を数え、`dynamics_unusable` /
+    `controller_unusable` などの終端記録は数えない。環境は採点できない終端も記録に積むので、
+    **記録の数でも採点できた step の数でもない**。判定ごとに別の長さを使うと、片方で等しく
+    片方で短い組み合わせ（例: 候補は採点できた step で違反して終わり、Baseline は同じ数の
+    採点できた step の後に採点できない終端で floor 不足を記録した）が判定をすり抜ける
+  - **短い**: 観測した長さが Baseline より短い episode を持つ候補。終わった理由を問わない。
+    `CandidateOutcome.short_episodes` に該当 episode を残し、共通の長さに入れず、
+    `mean_reward_over_common_horizon` を書かず（`None`）、**改善扱いにしない**。
+    自分の長さで採点した reward を並べると長さの違う総和を並べることになる（0058 §2.6）ので、
+    この単純な形を採る
+  - **打ち切り**: 短い episode のうち、自分の違反・範囲外 action **以外**の理由で終わったもの。
+    違反を観測しなかったことが「違反が少ない」に見えるので、候補ごと `comparable=False`
+    （理由 `candidate_truncated`）にし、`CandidateOutcome.truncated_episodes` に残す。
+    自分の違反で終わった短い候補は、違反が台帳に載るので比較には残す（改善にはならない）
+  - **比べてよいかは採点の前に1度だけ決める**（`candidate_rejection()`）。共通の長さ
+    （`scoring_horizon()`）は、Baseline と、比べてよく、かつ短くない候補だけから取る
 - **どの候補も Baseline を上回らなければ、Baseline の表が選ばれる。** 上回っていないのに
   別の表を出さないためで、その artifact は「Rule の戦略を RL artifact として表したもの」になる。
   shadow の配線を確かめるには十分で、戦略は何も変わらない
