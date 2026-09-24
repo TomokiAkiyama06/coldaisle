@@ -164,7 +164,14 @@ wall_elapsed_ms     = startup_wall_ms - ts_ms                 （壁時計の差
   追い越した場合、`wall_elapsed_ms` は正でも実際の経過より短く、期限切れのヒントが復活しうる。
   負の値を拒むだけでは防げないので、起動時の取り込みは**壁時計の差だけでは採らない**:
   - ヒントの行に、書いた時点の boot id（`/proc/sys/kernel/random/boot_id`）と
-    **`CLOCK_BOOTTIME`** の値を持たせる（0045 の `events` に列を足す。実装は別 Issue）。
+    **`CLOCK_BOOTTIME`** の値を持たせる（0045 の `events` に列を足す。実装は別 Issue）。移行の契約は次のとおり固定する
+    - 列: `boot_id TEXT NULL`（UUID の小文字 36 文字。`CHECK (boot_id IS NULL OR length(boot_id) = 36)`）と
+      `boottime_ns INTEGER NULL`（`CLOCK_BOOTTIME` のナノ秒。`CHECK (boottime_ns IS NULL OR boottime_ns >= 0)`）。
+      `CHECK ((boot_id IS NULL) = (boottime_ns IS NULL))`（片方だけの行を作らない）
+    - **既存の行は NULL のまま残す。** migration で現在の boot id や既定値で埋めない（移行前のヒントを
+      確かめられる行として再び採ってしまうため）
+    - 移行後に `coldaisle-eventd` が書く行は、両方を必ず入れる
+    - 起動時の取り込みでは、どちらかが NULL の行は `backfill_rejected: unverifiable_elapsed` とする
     `CLOCK_MONOTONIC` は suspend 中に進まず、同じ boot の中でも suspend をはさむと経過を過小に見積もるので使わない
   - 起動時の boot id が行と同じときだけ、経過を **`CLOCK_BOOTTIME` の差**（`boottime_elapsed_ms`）で求めて上の条件を当てはめる
     （壁時計の修正で戻らず、suspend 中も進むので、経過を過小に見積もらない）
