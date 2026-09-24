@@ -25,6 +25,7 @@ from pathlib import Path
 
 import pytest
 from pydantic import ValidationError
+from pydantic_core import to_json
 
 from coldaisle.control.config import ShadowConfig
 from coldaisle.control.drift import (
@@ -1601,15 +1602,15 @@ def test_markdown_lists_every_trend_bucket_with_the_report_values(trained) -> No
     assert len(table) == len(trend)
     for cells, bucket in zip(table, trend, strict=True):
         assert cells[:4] == [
-            json.dumps(bucket.index),
-            json.dumps(bucket.start_ts_ms),
-            json.dumps(bucket.end_ts_ms),
-            json.dumps(bucket.outcomes),
+            to_json(bucket.index).decode(),
+            to_json(bucket.start_ts_ms).decode(),
+            to_json(bucket.end_ts_ms).decode(),
+            to_json(bucket.outcomes).decode(),
         ]
         if bucket.ratio is None:
             assert cells[4].startswith("—")
         else:
-            assert cells[4] == json.dumps(bucket.ratio)
+            assert cells[4] == to_json(bucket.ratio).decode()
         assert cells[5].startswith(f"`{bucket.verdict.value}`")
 
 
@@ -1674,14 +1675,28 @@ def test_markdown_headline_is_the_report_verdict_and_nothing_else(trained) -> No
 
 
 def test_markdown_introduces_no_number_that_is_not_in_the_report(trained) -> None:
-    """**報告に無い数を作らない。** 丸めも集計もしない（数の字面は JSON の部分集合）。"""
-    from coldaisle.drift import render_markdown
+    """**報告に無い数を作らない。** 丸めも集計もしない（数の字面は保存する JSON の部分集合）。"""
+    from coldaisle.drift import render, render_markdown
 
     _data, parts, _model, profile = trained
     for report in report_variety(profile, parts):
-        reported = set(NUMBER.findall(json.dumps(report.model_dump(mode="json"))))
+        reported = set(NUMBER.findall(render(report)))
         rendered = set(NUMBER.findall(render_markdown(report)))
         assert rendered <= reported, sorted(rendered - reported)
+
+
+@pytest.mark.parametrize("value", [1e-7, 1e-20, 2.5e-5, 1e20, 0.30000000000000004, 3.0, 0.0])
+def test_markdown_spells_small_and_large_numbers_like_the_saved_json(value: float) -> None:
+    """数の字面は保存する JSON（pydantic）と同じ。`json.dumps` の `1e-07` にしない。"""
+    from pydantic import BaseModel
+
+    from coldaisle.drift import _number
+
+    class Holder(BaseModel):
+        value: float
+
+    saved = Holder(value=value).model_dump_json()
+    assert saved == '{"value":' + _number(value) + "}"
 
 
 def test_markdown_is_deterministic_and_depends_only_on_the_report(trained) -> None:

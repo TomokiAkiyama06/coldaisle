@@ -22,7 +22,6 @@ uv run coldaisle-drift --evidence config/drift-evidence.yaml \\
 from __future__ import annotations
 
 import argparse
-import json
 import logging
 from collections.abc import Callable, Sequence
 from pathlib import Path
@@ -30,6 +29,7 @@ from typing import Annotated, Any, Literal, Self
 
 import yaml
 from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, model_validator
+from pydantic_core import to_json
 
 from coldaisle import logs
 from coldaisle.control.config import ControlConfig
@@ -282,10 +282,14 @@ _VERDICT_NOTES: dict[DriftVerdict, str] = {
 
 
 def _number(value: float | None) -> str:
-    """数値を**報告の JSON と同じ字面**で出す。丸めない（丸めると報告に無い数が生まれる）。"""
+    """数値を**報告の JSON と同じ字面**で出す。丸めない（丸めると報告に無い数が生まれる）。
+
+    `json.dumps` ではなく、保存する JSON（`render` = `model_dump_json`）と同じ
+    pydantic の直列化を使う。`json.dumps` は `1e-7` を `1e-07` と書き、字面がずれる。
+    """
     if value is None:
         return _ABSENT
-    return json.dumps(value)
+    return to_json(value).decode()
 
 
 def _text(value: str) -> str:
