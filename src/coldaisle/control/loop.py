@@ -869,6 +869,25 @@ class ControlLoop:
                     detail=f"{type(error).__name__}: {error}"[:500],
                 ),
             )
+        # inactive な GuardZoneOutput は理由を持てないので、解除の理由は events にしか無い。
+        # ここで落とすと「なぜ floor が外れたか」を後から辿れなくなる（#80）。
+        for event in decision.events:
+            LOGGER.info(
+                "reactive guard %s",
+                event.transition.value,
+                extra={
+                    logs.FIELDS_KEY: {
+                        "tick_id": decision.tick_id,
+                        "monotonic_ms": decision.monotonic_ms,
+                        "zone": event.zone.value,
+                        "transition": event.transition.value,
+                        "reason_code": event.reason.code,
+                        "reason_detail": event.reason.detail,
+                        "trigger_codes": list(event.trigger_codes),
+                        "threshold_profile": decision.threshold_profile.value,
+                    }
+                },
+            )
         return decision.zones, None
 
     def _run_fallback(

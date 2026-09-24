@@ -30,6 +30,7 @@
 26. 起動時の失敗を**別の種類**として報告しない（設定不正と環境の失敗を混ぜない）
 27. worker の結果は、**この process が出した snapshot**に紐づくものだけを受け取る
 28. 降格の書き残しは無期限に待たず、失敗が見える
+29. Guard の介入の開始と解除は、理由とともに構造化ログへ残る（解除の理由を落とさない）
 """
 
 from __future__ import annotations
@@ -43,6 +44,7 @@ import pytest
 import yaml
 from pydantic import ValidationError
 
+from coldaisle import logs
 from coldaisle.clock import ManualMonotonicClock, SimulatedClock
 from coldaisle.control.config import ControlConfig, FanPolicyConfig, SafetyConfig
 from coldaisle.control.fallback.controller import FallbackController
@@ -672,6 +674,68 @@ def test_invariant_6_a_guard_floor_is_never_bypassed(catalog) -> None:
         demand = result.tick.zones.get(zone).demand
         assert demand.guard_floor == guard_floor
         assert demand.effective >= guard_floor
+
+
+def _guard_log_fields(caplog: pytest.LogCaptureFixture) -> list[dict[str, Any]]:
+    return [
+        getattr(record, logs.FIELDS_KEY)
+        for record in caplog.records
+        if record.getMessage().startswith("reactive guard ")
+        and record.getMessage() != "reactive guard failed"
+    ]
+
+
+def test_invariant_29_a_sudden_gpu_rise_logs_the_start_in_the_same_tick(catalog, caplog) -> None:
+    """急な上昇で floor を上げた tick に、開始の理由と発火した trigger が残る。
+
+    Replay のように値を tick ごとに与え、学習側の提案を待たずに同じ tick で
+    floor が効いていること、その理由がログから辿れることを確かめる。
+    """
+    harness = Harness(catalog, with_supervisor=False)
+    harness.settle()
+    with caplog.at_level("INFO", logger="coldaisle"):
+        harness.telemetry.values["gpu.0.hotspot"] = 95.0
+        result = harness.tick()
+
+    guard_floor = harness.config.policy.reactive_guard.floor.value
+    assert result.tick.zones.front.demand.guard_floor == guard_floor
+    started = [f for f in _guard_log_fields(caplog) if f["transition"] == "started"]
+    assert {f["zone"] for f in started} >= {"front", "rear"}
+    for fields in started:
+        assert fields["tick_id"] == result.tick.tick_id
+        assert fields["reason_code"] == "reactive_guard_triggered"
+        assert fields["trigger_codes"], "どの trigger で上げたかを落とさない"
+
+
+def test_invariant_29_the_release_keeps_its_reason_after_the_hold(catalog, caplog) -> None:
+    """解除 tick の GuardZoneOutput は理由を持てない。**ログから解除理由を失わない。**"""
+    harness = Harness(catalog, with_supervisor=False)
+    harness.settle()
+    harness.telemetry.values["gpu.0.hotspot"] = 95.0
+    harness.tick()
+
+    harness.telemetry.values["gpu.0.hotspot"] = READINGS["gpu.0.hotspot"]
+    hold_ms = harness.config.policy.reactive_guard.hold_ms.value
+    tick_ms = harness.config.safety.tick_ms.value
+    with caplog.at_level("INFO", logger="coldaisle"):
+        results = harness.run(hold_ms // tick_ms + 3)
+
+    released = [f for f in _guard_log_fields(caplog) if f["transition"] == "released"]
+    assert {f["zone"] for f in released} >= {"front", "rear"}
+    for fields in released:
+        assert fields["reason_code"] == "reactive_guard_released"
+        assert fields["trigger_codes"], "解除でも、何が発火していたかを残す"
+    assert results[-1].tick.zones.front.demand.guard_floor is None
+
+
+def test_invariant_29_a_quiet_run_logs_no_guard_transition(catalog, caplog) -> None:
+    """発火していない間は開始も解除も記録しない（毎 tick の雑音にしない）。"""
+    harness = Harness(catalog, with_supervisor=False)
+    harness.settle()
+    with caplog.at_level("INFO", logger="coldaisle"):
+        harness.run(5)
+
+    assert _guard_log_fields(caplog) == []
 
 
 # ------------------------------------------------------------- 8. MAX はすべてに勝つ
