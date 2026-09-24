@@ -250,6 +250,7 @@ def evaluate(runs: Sequence[EvaluationRun], *, context: EvaluationContext) -> Ev
     report_segments = tuple(segments)
     worst = _worst_cases(report_segments, context)
     return EvaluationReport(
+        schema_version=EVALUATION_REPORT_SCHEMA_VERSION,
         provenance=_provenance(context, tuple(provenances), versions.collected()),
         segments=report_segments,
         worst_cases=worst,

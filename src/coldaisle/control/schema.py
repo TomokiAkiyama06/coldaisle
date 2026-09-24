@@ -553,7 +553,12 @@ class ModelGateDecision(_Frozen):
     この型は「なぜ ML をその範囲で使った / 使わなかったか」だけを残す。
     """
 
-    schema_version: Literal[1, 2] = MODEL_GATE_SCHEMA_VERSION
+    schema_version: Literal[1, 2]
+    """判断の形の版。**入力では必須で、既定値を持たない**（codex #4092017585）。
+
+    版の無い記録を最新版（v2）として読まない。作る側（Gate）は
+    `MODEL_GATE_SCHEMA_VERSION` を明示して渡す。
+    """
     model_version: str = Field(min_length=1, max_length=120)
     inference_id: str = Field(pattern=r"^[0-9a-f]{64}$")
     """判定した推論（入力と予測）の識別子。提案の ``inference_id`` と同じ。"""

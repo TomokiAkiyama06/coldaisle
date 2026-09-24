@@ -82,6 +82,20 @@ Gate の `expected_model_version` には Registry の `ArtifactAttestation.versi
 - `ControlTick` の **v7 以降は v2 の判断を要求**し、**v1〜v6 は v1 を要求**する
 - **保存済みの v1 の判断はそのまま読める**
 
+### 2.3 版は入力で必須にする（codex #4092017585）
+
+`ModelGateDecision.schema_version` と、報告 v2（0059 §2.5）の
+`EvaluationReport.schema_version` は **既定値を持たない。** 作る側（Gate / `evaluate`）が
+現行の版を明示して渡し、読む側は**版の書かれていない記録を拒む。**
+
+- 既定値があると、既定値を省いて書き出した v1（`exclude_defaults` など）が**最新版として
+  読まれる。** 報告では `#92` の版の下限を素通りし、SHADOW の通常の証拠（Fallback を適用、
+  Learned MPC は counterfactual）には完全性の欄を検める適用 Learned arm が無いので、
+  **古い報告が昇格の根拠になる。** 版の無さは unknown であって最新ではない
+- 通常どおり書き出した保存済みの記録は版を必ず含むので、読めなくなるものは無い
+- `ControlTick.schema_version` の既定値（v8）は本記録では変えない。v8 は `runtime` を
+  要求するため、版の無い v1〜v7 の tick は拒まれ、古い形が新しい形として通ることはない
+
 0059 §2.2 の「v7 の attested な判断は artifact 必須」「欄の無い tick は artifact 不明」
 という規則は変えない。版の判定が `ControlTick` の版だけから、入れ子の版と合わせた
 2層になる。
@@ -109,6 +123,7 @@ Gate の `expected_model_version` には Registry の `ArtifactAttestation.versi
 | `model_version` を照合対象から外したままにする | 同じ artifact bytes を指す登録が2つあると、版だけを書き換えた assessment が別の版の実績になる（codex #4057753197）。型の差（自由文字列 vs semver）は理由にならない |
 | `ThermalPrediction.model_version` を自由文字列へ広げる | Registry の版の形を緩めることになる。**照合のために縛りを外す**のは向きが逆 |
 | 入れ子の `ModelGateDecision` の版を上げず、`ControlTick` の版だけで読み分ける | v7 の trace が「v1 と名乗るのに v1 には無かった欄を持つ」記録を書ける（codex #4057753201）。`SCHEMA_VERSION` の changelog とも食い違う |
+| 版の既定値を現行版のまま残す | 既定値を省いて書き出した v1 が最新版として読まれ、報告では昇格の版の下限を素通りする（codex #4092017585）。**欠けた値を最も新しい形として読まない** |
 | 0059（`FINAL`）を直接書き換えて済ませる | `docs/decisions/README.md`「追記のみ」に反する。**FINAL の記録に許されるのは `Superseded by` の追記だけ**である。範囲を絞った新しい記録を作る |
 
 ## 5. 未決事項

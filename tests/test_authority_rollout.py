@@ -421,6 +421,7 @@ def report_document(
             )
         )
     report = EvaluationReport(
+        schema_version=2,
         provenance=EvaluationProvenance(
             evaluation_config_sha256="5" * 64,
             fan_hardware_config_sha256="6" * 64,
@@ -1269,6 +1270,25 @@ def test_invariant_5_y_a_report_that_predates_the_artifact_fields_cannot_promote
     approval = approval_for(document, evidence=evidence_for(document))
 
     with pytest.raises(AuthorityEvidenceError, match="完全性を言えない古い報告"):
+        raise_stage(store(tmp_path), approval=approval, document=document)
+
+
+def test_invariant_5_z_a_report_without_a_schema_version_cannot_promote(
+    tmp_path: Path,
+) -> None:
+    """**版の書かれていない報告を最新版として読まない**（codex #4092017585）。
+
+    版に既定値があると、既定値を省いて書き出した v1 の報告（`exclude_defaults` など）が
+    v2 として読まれ、版の下限の検査を素通りする。SHADOW の通常の証拠（Fallback を適用し、
+    Learned MPC は counterfactual）には完全性の欄を検める適用 Learned arm が無いので、
+    **古い報告がそのまま昇格の根拠になる。** 記録の無さは unknown であって最新ではない。
+    """
+    payload = json.loads(report_document(with_applied_fallback=True))
+    del payload["schema_version"]
+    document = json.dumps(payload).encode("utf-8")
+    approval = approval_for(document, evidence=evidence_for(document))
+
+    with pytest.raises(AuthorityEvidenceError, match="報告を検証できない"):
         raise_stage(store(tmp_path), approval=approval, document=document)
 
 

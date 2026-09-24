@@ -957,6 +957,7 @@ def learned_state(**overrides) -> ControlState:
 def model_gate(**overrides) -> ModelGateDecision:
     """Learned MPC を採った tick の裏づけのある判断。"""
     values = {
+        "schema_version": 2,
         "model_version": "0.1.0",
         "inference_id": "b" * 64,
         "artifact_sha256": ARTIFACT,
@@ -1187,3 +1188,16 @@ def test_the_nested_model_gate_carries_its_own_schema_version():
     # 保存済みの v1 の判断はそのまま読める。
     stored = model_gate(schema_version=1, artifact_sha256=None)
     assert ModelGateDecision.model_validate_json(stored.model_dump_json()) == stored
+
+
+def test_a_model_gate_without_a_schema_version_is_refused():
+    """**版の書かれていない判断を最新版として読まない**（codex #4092017585）。
+
+    既定値を省いて書き出した v1 の判断が v2 と読まれないよう、版は入力で必須にする。
+    """
+    document = json.loads(learned_tick().model_dump_json())
+    assert document["model_gate"]["schema_version"] == 2
+    del document["model_gate"]["schema_version"]
+
+    with pytest.raises(ValidationError, match="schema_version"):
+        ControlTick.model_validate_json(json.dumps(document))

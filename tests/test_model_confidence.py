@@ -862,6 +862,7 @@ def test_v5_trace_requires_consistent_model_gate_for_learned_ticks() -> None:
     plain = reasons()
     with pytest.raises(ValidationError, match="LOW"):
         ModelGateDecision(
+            schema_version=2,
             model_version="0.1.0",
             inference_id="c" * 64,
             attested=True,
@@ -874,6 +875,7 @@ def test_v5_trace_requires_consistent_model_gate_for_learned_ticks() -> None:
         )
     with pytest.raises(ValidationError, match="MEDIUM 帯"):
         ModelGateDecision(
+            schema_version=2,
             model_version="0.1.0",
             inference_id="c" * 64,
             attested=True,
@@ -1507,6 +1509,7 @@ def test_trace_marks_a_proposal_without_an_assessment_as_unattested(trained) -> 
 def test_trace_rejects_recording_numbers_without_attestation() -> None:
     with pytest.raises(ValidationError, match="attested"):
         ModelGateDecision(
+            schema_version=2,
             model_version="0.1.0",
             inference_id="c" * 64,
             attested=False,
@@ -1518,6 +1521,7 @@ def test_trace_rejects_recording_numbers_without_attestation() -> None:
         )
     with pytest.raises(ValidationError, match="裏付けの無い提案"):
         ModelGateDecision(
+            schema_version=2,
             model_version="0.1.0",
             inference_id="c" * 64,
             attested=False,
@@ -1550,6 +1554,7 @@ REASONS = reasons()
 def gate_record(**changes: object) -> ModelGateDecision:
     """Gate が実際に出す形の記録（既定は裏付けのある HIGH / FULL）。"""
     fields: dict[str, object] = {
+        "schema_version": 2,
         "model_version": "0.1.0",
         "inference_id": "c" * 64,
         "attested": True,

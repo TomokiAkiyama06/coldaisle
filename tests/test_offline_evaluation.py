@@ -579,6 +579,7 @@ def test_invariant_3_c_a_later_failure_does_not_move_the_attested_timestamp(
 
     def attested_gate(index: int) -> ModelGateDecision:
         return ModelGateDecision(
+            schema_version=2,
             model_version="0.1.0",
             inference_id=f"{TICK_TS_MS + index * STEP_MS:064x}",
             artifact_sha256="a" * 64,
@@ -1653,6 +1654,7 @@ def test_invariant_12_d_an_applied_learned_mpc_arm_records_the_missing_optimizer
 ) -> None:
     """**「optimizer があるのに記録が無い」を「該当しない」と区別する**（0054 §3）。"""
     gate = ModelGateDecision(
+        schema_version=2,
         model_version="0.1.0",
         inference_id="c" * 64,
         artifact_sha256="a" * 64,
@@ -2401,6 +2403,7 @@ def _applied_learned_state() -> ControlState:
 
 def _applied_gate(*, artifact: str | None = "a" * 64) -> ModelGateDecision:
     return ModelGateDecision(
+        schema_version=2,
         model_version="0.1.0",
         inference_id="c" * 64,
         artifact_sha256=artifact,
@@ -2639,6 +2642,29 @@ def test_invariant_17_h_a_stored_v1_report_still_loads(context: EvaluationContex
     assert applied.arm.controller is ControllerKind.LEARNED_MPC
     assert applied.model_artifacts == ()
     assert (applied.bound_attested_ticks, applied.unbound_attested_ticks) == (0, 0)
+
+
+def test_invariant_17_i_a_report_without_a_schema_version_is_refused(
+    context: EvaluationContext,
+) -> None:
+    """**版の書かれていない報告を最新版として読まない**（codex #4092017585）。
+
+    版に既定値があると、既定値を省いて書き出した v1 の報告（`exclude_defaults` など）が
+    v2 として読まれ、`#92` の版の下限を素通りする。版は明示されたものだけを信じる。
+    """
+    report = evaluate(
+        [run_of(_applied_learned_run(artifacts=("a" * 64,) * 3), [])], context=context
+    )
+    document = json.loads(report.model_dump_json())
+    assert document["schema_version"] == 2
+    # v2 はそのまま往復する。
+    assert EvaluationReport.model_validate_json(json.dumps(document)) == report
+
+    del document["schema_version"]
+    with pytest.raises(ValidationError, match="schema_version"):
+        EvaluationReport.model_validate_json(json.dumps(document))
+    # 既定値を省いて書き出しても、版は必ず残る（省ける既定値が無い）。
+    assert json.loads(report.model_dump_json(exclude_defaults=True))["schema_version"] == 2
 
 
 def test_invariant_17_g_a_v1_report_cannot_carry_the_fields_added_in_v2(

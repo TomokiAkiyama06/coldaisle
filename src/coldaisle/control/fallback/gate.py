@@ -13,6 +13,7 @@ from coldaisle.control.config import FanPolicyConfig
 from coldaisle.control.model.confidence import ConfidenceAssessment
 from coldaisle.control.model.thermal import ArtifactVerification
 from coldaisle.control.schema import (
+    MODEL_GATE_SCHEMA_VERSION,
     AuthorityLimitSource,
     AuthorityStage,
     AuthorityStageSource,
@@ -649,6 +650,7 @@ class ControllerGate:
         if assessment is None:
             # 提案が自称した confidence / ood は残さない。評価と stage の判断が誤読するため。
             return ModelGateDecision(
+                schema_version=MODEL_GATE_SCHEMA_VERSION,
                 model_version=proposal.model_version,
                 inference_id=proposal.inference_id,
                 attested=False,
@@ -671,6 +673,7 @@ class ControllerGate:
                 ),
             )
         return ModelGateDecision(
+            schema_version=MODEL_GATE_SCHEMA_VERSION,
             model_version=proposal.model_version,
             inference_id=proposal.inference_id,
             # **束縛できた推論の artifact をそのまま残す**（#159 / 決定記録 0059）。

@@ -751,7 +751,13 @@ class EvaluationReport(_Frozen):
     **同じ入力からは同じ bytes になる。** 生成時刻を持たず、時刻はすべて証拠から来る。
     """
 
-    schema_version: Literal[1, 2] = EVALUATION_REPORT_SCHEMA_VERSION
+    schema_version: Literal[1, 2]
+    """報告の形の版。**入力では必須で、既定値を持たない**（codex #4092017585）。
+
+    既定値があると、既定値を省いて書き出した v1 の報告（`exclude_defaults` など）が
+    最新版として読まれ、`#92` の版の下限を素通りする。**版の無さは unknown であって
+    最新ではない。** 作る側（`evaluate`）は `EVALUATION_REPORT_SCHEMA_VERSION` を明示して渡す。
+    """
     provenance: EvaluationProvenance
     segments: tuple[SegmentReport, ...] = Field(min_length=1)
     worst_cases: tuple[WorstCase, ...] = ()
