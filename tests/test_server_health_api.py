@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ast
 import importlib
+import json
 import threading
 import time
 from pathlib import Path
@@ -165,6 +166,7 @@ def _app(
             db=path,
             quality_rules=QUALITY_RULES_PATH,
             metrics=CONFIG_DIR / "metrics.yaml",
+            compute_mode_advisory=CONFIG_DIR / "compute-mode-advisory.yaml",
             stream_poll_s=0.001,
         ),
         clock=clock,
@@ -205,11 +207,19 @@ def test_complete_template_payload_is_green_when_monitoring_sources_are_healthy(
     }
     assert set(body["sources"]) == {"sensor_unit", "nvml", "lm_sensors", "ai_layer"}
     assert body["sources"]["ai_layer"]["status"] == "stopped"
-    assert body["compute_mode_advisory"] == {
-        "safe": True,
-        "warnings": [],
-        "blocking": False,
-    }
+    advisory = body["compute_mode_advisory"]
+    assert advisory["safe"] is True
+    assert advisory["warnings"] == []
+    assert advisory["blocking"] is False
+    assert [condition["metric"] for condition in advisory["conditions"]] == [
+        "air.room",
+        "air.gpu_intake",
+        "air.room_humidity",
+    ]
+    # 比較できる実測フルロードが無いことを、黙って省略しない（#68 / 決定記録 0063）
+    assert advisory["reference"] is None
+    assert advisory["reference_count"] == 0
+    assert advisory["limitations"]
 
 
 def test_missing_optional_gpu_values_keep_stable_keys_without_nvidia_smi(tmp_path, rules):
@@ -476,6 +486,32 @@ def test_websocket_pushes_the_exact_rest_payload(healthy_db):
     assert pushed == rest
 
 
+def test_websocket_state_changes_when_the_history_is_re_evaluated(healthy_db):
+    """履歴の再評価（evaluated_at の変化）は WS の変更として通知する。
+
+    reference が変わらなくても、長く接続したクライアントが「いつ時点の比較か」を
+    古いまま持ち続けないため。evaluated_at は refresh_s の窓ごとにしか動かない。
+    """
+    clock = SimulatedClock(NOW_MS)
+    with TestClient(_app(healthy_db, clock)) as client:
+        first = ServerHealthResponse.model_validate(client.get("/api/v1/server-health").json())
+        clock.advance_to_ms(NOW_MS + 3_600_000)
+        second = ServerHealthResponse.model_validate(client.get("/api/v1/server-health").json())
+
+    assert (
+        second.compute_mode_advisory.evaluated_at_ms != first.compute_mode_advisory.evaluated_at_ms
+    )
+    first_state = json.loads(server_health_state(first))
+    second_state = json.loads(server_health_state(second))
+    assert first_state["compute_mode_advisory"]["evaluated_at_ms"] == (
+        first.compute_mode_advisory.evaluated_at_ms
+    )
+    assert (
+        first_state["compute_mode_advisory"]["evaluated_at_ms"]
+        != second_state["compute_mode_advisory"]["evaluated_at_ms"]
+    )
+
+
 def test_websocket_state_ignores_clock_and_age_only_changes(healthy_db):
     clock = SimulatedClock(NOW_MS)
     with TestClient(_app(healthy_db, clock)) as client:
@@ -540,8 +576,25 @@ def test_api_layer_still_does_not_import_the_ai_layer():
 
 
 def test_compute_mode_advisory_cannot_become_blocking():
+    """**他のフィールドが揃っていても** blocking だけは true にできない。
+
+    必須フィールドの追加で「別の理由で落ちているだけ」にならないよう、
+    まず blocking 抜きで作れることを確かめてから blocking を足す。
+    """
+    fields = {
+        "safe": False,
+        "warnings": ("hot",),
+        "conditions": (),
+        "reference": None,
+        "reference_count": 0,
+        "reference_window_days": 30,
+        "evaluated_at_ms": NOW_MS,
+        "evaluated_at": "2026-08-25T00:00:00+00:00",
+        "limitations": (),
+    }
+    assert ComputeModeAdvisory(**fields).blocking is False
     with pytest.raises(ValueError):
-        ComputeModeAdvisory(safe=False, warnings=("hot",), blocking=True)  # type: ignore[arg-type]
+        ComputeModeAdvisory(**fields, blocking=True)
 
 
 @pytest.mark.parametrize(

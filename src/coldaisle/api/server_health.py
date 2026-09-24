@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import json
 import logging
-from collections import Counter
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any, Literal, Protocol
@@ -16,8 +15,8 @@ from typing import Any, Literal, Protocol
 import yaml
 from pydantic import BaseModel, ConfigDict, Field
 
+from coldaisle.api.compute_mode_advisory import ComputeModeAdvisor
 from coldaisle.api.models import (
-    ComputeModeAdvisory,
     HealthSource,
     HealthSources,
     HealthSourceStatus,
@@ -32,7 +31,7 @@ from coldaisle.channels import EVENT_METRICS
 from coldaisle.internal_telemetry import SOURCE_STATE_PREFIX
 from coldaisle.metrics import MetricCatalog
 from coldaisle.store import AlertSeverity, Quality, SqliteStore
-from coldaisle.store.models import AlertRecord, LatestReading
+from coldaisle.store.models import LatestReading
 
 LOGGER = logging.getLogger("coldaisle.api.server_health")
 
@@ -127,6 +126,7 @@ def build_server_health(
     summarizer: HealthSummarizer | None = None,
     *,
     settings: ServerHealthSettings,
+    advisor: ComputeModeAdvisor,
     hwmon_metrics: tuple[str, ...],
     nvml_metrics: tuple[str, ...],
 ) -> ServerHealthResponse:
@@ -134,18 +134,35 @@ def build_server_health(
     # payload 全体を DB の1時点から作る。文ごとに読むと、間に resolve や新しい
     # サンプルが入ったとき一覧・件数・値・source 状態が食い違う。AI 要約は
     # スナップショットの外で行い、読み取りトランザクションを長く保持しない
-    with store.read_snapshot():
-        readings = store.latest()
+    # 時刻とスナップショットを読む**前に** advisor の順序を取る。読んでから待つと、
+    # 遅れた応答に自分より新しい時点の履歴が混ざる（決定記録 0063 §2.6）
+    with advisor.ordered(), store.read_snapshot():
+        now_ms = store.clock.now_ms()
+        # 行の上限と age の基準を generated_at と同じ時刻に固定する。BEGIN DEFERRED は
+        # 最初の SELECT まで時点を固定しないため、時刻を読んだあとに確定した行が
+        # 混ざりうる。latest() に時刻を読み直させると age も別の時刻になる
+        readings = store.latest(at_ms=now_ms)
         # 一覧は新しい順に打ち切るため、重大度は件数上限の無い集計から判定する
         alerts = list(store.alerts(state="firing", limit=settings.active_alerts_limit))
         firing = store.alert_severity_counts(state="firing")
         sources = _monitoring_sources(store, readings, settings, hwmon_metrics)
         gpu_mode = store.current_state("sys.gpu_mode") or "unknown"
-    # 無効化・撤去した入力の最後の行は store.latest() に残り続け、やがて stale になる。
-    # 監視していない metric で signal を下げないよう、必須 metric と現在有効な入力だけを
-    # 見る。パネルは表示専用で、入力が無効なら値が古くても signal に影響させない
-    monitored = settings.required_metrics() | frozenset((*hwmon_metrics, *nvml_metrics))
-    signal = _signal(sources, readings, firing, settings.missing_tolerated, sorted(monitored))
+        # 無効化・撤去した入力の最後の行は store.latest() に残り続け、やがて stale になる。
+        # 監視していない metric で signal を下げないよう、必須 metric と現在有効な入力だけを
+        # 見る。パネルは表示専用で、入力が無効なら値が古くても signal に影響させない
+        monitored = settings.required_metrics() | frozenset((*hwmon_metrics, *nvml_metrics))
+        signal = _signal(sources, readings, firing, settings.missing_tolerated, sorted(monitored))
+        # advisory も同じスナップショットから作る。過去のフルロード実績は別の
+        # 読み出しになるため、現在値と食い違う時点を混ぜない（決定記録 0042 §2.6）
+        advisory = advisor.evaluate(
+            store,
+            readings,
+            signal=signal,
+            sources=sources,
+            alerts=alerts,
+            firing=firing,
+            now_ms=now_ms,
+        )
     gpu = ServerGpuHealth(
         mode=gpu_mode,
         metrics=_metrics(settings.panels.gpu, readings, catalog),
@@ -153,7 +170,6 @@ def build_server_health(
     environment = ServerEnvironmentHealth(
         metrics=_metrics(settings.panels.environment, readings, catalog)
     )
-    advisory = _compute_mode_advisory(signal, sources, alerts, firing)
 
     summary = None
     if summarizer is not None:
@@ -182,7 +198,6 @@ def build_server_health(
         summary = _TEMPLATES[signal]
         summary_source = "template"
 
-    now_ms = store.clock.now_ms()
     return ServerHealthResponse(
         generated_at_ms=now_ms,
         generated_at=iso(now_ms),
@@ -358,41 +373,6 @@ def _degrades_signal(metric: str, quality: Quality, missing_tolerated: frozenset
     return quality is not Quality.OK
 
 
-def _compute_mode_advisory(
-    signal: ServerSignal,
-    sources: HealthSources,
-    alerts: list[AlertRecord],
-    firing: Mapping[AlertSeverity, int],
-) -> ComputeModeAdvisory:
-    warnings = [
-        f"{name} source is {source.status.value}"
-        for name, source in (
-            ("sensor_unit", sources.sensor_unit),
-            ("nvml", sources.nvml),
-            ("lm_sensors", sources.lm_sensors),
-        )
-        if source.status is not HealthSourceStatus.OK
-    ]
-    warnings.extend(f"active alert: {alert.rule_id} ({alert.severity.value})" for alert in alerts)
-    listed = Counter(alert.severity for alert in alerts)
-    unlisted = {
-        severity: firing.get(severity, 0) - listed.get(severity, 0) for severity in AlertSeverity
-    }
-    if any(count > 0 for count in unlisted.values()):
-        # 一覧から外れた古いアラートも、件数と重大度だけは警告に残す
-        detail = ", ".join(
-            f"{severity.value}={count}" for severity, count in unlisted.items() if count > 0
-        )
-        warnings.append(f"more active alerts not listed: {detail}")
-    if signal is not ServerSignal.GREEN and not warnings:
-        warnings.append("one or more telemetry values are not quality=ok")
-    return ComputeModeAdvisory(
-        safe=signal is ServerSignal.GREEN,
-        warnings=tuple(warnings),
-        blocking=False,
-    )
-
-
 def server_health_state(payload: ServerHealthResponse) -> str:
     """WS の変更検出用。時計と連続的な age だけの変化では push しない。"""
     state = payload.model_dump(mode="json")
@@ -401,4 +381,9 @@ def server_health_state(payload: ServerHealthResponse) -> str:
     for section in (state["gpu"], state["environment"]):
         for metric in section["metrics"].values():
             metric.pop("age_seconds")
+    advisory = state["compute_mode_advisory"]
+    # 条件の age は毎秒動くので除く。履歴の評価時刻（evaluated_at）は refresh_s の
+    # 窓ごとにしか動かず、再評価を長く接続したクライアントへ知らせるために残す
+    for condition in advisory["conditions"]:
+        condition.pop("age_seconds")
     return json.dumps(state, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
