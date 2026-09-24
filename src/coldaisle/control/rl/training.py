@@ -188,6 +188,12 @@ class CandidateOutcome(_Frozen):
     成立していない（決定記録 0058 §2.1 / §3）。`True` で絞った読み手が
     「policy を比較した結果」だけを受け取れるようにする。
     """
+    table_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    """この候補として評価した表（`RegimeTablePayload`）の canonical SHA-256。
+
+    **選ばれた候補の値は、出力する artifact の `payload_sha256` と一致しなければならない。**
+    評価した表と別の表を artifact に入れ替えられないようにする。
+    """
     rejection: Reason | None = None
     safety_violations: int = Field(ge=0)
     invalid_actions: int = Field(ge=0)
@@ -455,6 +461,65 @@ class SupervisorPolicyTrainingReport(_Frozen):
             raise ValueError("artifact の条件 hash が比較と一致しない")
         if evidence.baseline_policy_version != self.baseline_policy_version:
             raise ValueError("artifact の Baseline の版が報告と一致しない")
+        self._check_artifact_is_what_was_evaluated(selected, baseline_arm, selected_arm)
+
+    def _check_artifact_is_what_was_evaluated(
+        self, selected: CandidateOutcome, baseline_arm: PolicyArm, selected_arm: PolicyArm
+    ) -> None:
+        """**artifact が「評価したもの」を名乗る欄は、比較の記録から導いた値と一致させる。**
+
+        形や数だけを見ると、同じ形の別の表・別の episode を名指しした artifact が通る。
+        """
+        manifest = self.artifact.manifest
+        # 表: 選ばれた候補として評価した表と、artifact の表が同じものであること。
+        if manifest.payload_sha256 != selected.table_sha256:
+            raise ValueError("artifact の表が選ばれた候補として評価した表と一致しない")
+        for episode in selected_arm.episodes:
+            for step in episode.steps:
+                entry = self.artifact.entry(step.regime)
+                if (entry.strategy, entry.weights, entry.target_band) != (
+                    step.action.strategy,
+                    step.action.weights,
+                    step.action.target_band,
+                ):
+                    # 評価中に実際に出した action を、artifact の表が再現しなければならない。
+                    raise ValueError(
+                        "artifact の表が、選ばれた候補の episode で出した action を再現しない"
+                        f"（{episode.episode_id}; step={step.step_index}）"
+                    )
+        # 候補の版: `<model_id>-<候補識別子>`。選ばれた arm はその版で回した arm であること。
+        for outcome in self.outcomes:
+            if outcome.policy_version != f"{manifest.model_id}-{outcome.candidate_id}":
+                raise ValueError(
+                    f"候補の版が artifact の model_id と一致しない（{outcome.candidate_id}）"
+                )
+        if selected_arm.policy_version != selected.policy_version:
+            raise ValueError("比較の arm が選ばれた候補の版で回したものではない")
+        # episode: 名指しした識別子は、両 arm が実際に回した episode と同じであること。
+        selected_ids = tuple(sorted(episode.episode_id for episode in selected_arm.episodes))
+        baseline_ids = tuple(sorted(episode.episode_id for episode in baseline_arm.episodes))
+        if manifest.training_episode_ids != selected_ids or selected_ids != baseline_ids:
+            raise ValueError("artifact の学習 episode が比較で回した episode と一致しない")
+        # 探索の再現に要る値。
+        hyperparameters = manifest.hyperparameters
+        if (
+            hyperparameters.search_family,
+            hyperparameters.seed,
+            hyperparameters.candidates_evaluated,
+            hyperparameters.episodes_per_candidate,
+        ) != (self.search_family, self.seed, len(self.outcomes), len(selected_ids)):
+            raise ValueError("artifact の探索条件が報告と一致しない")
+        # reward の版・学習の mode・dynamics の出どころは、回した episode が持つ値。
+        episodes = (*baseline_arm.episodes, *selected_arm.episodes)
+        if {episode.reward_version for episode in episodes} != {manifest.reward_version}:
+            raise ValueError("artifact の reward の版が比較の episode と一致しない")
+        evidence = manifest.training_evidence
+        if {episode.mode.value for episode in episodes} != {evidence.training_mode}:
+            raise ValueError("artifact の学習 mode が比較の episode と一致しない")
+        if {episode.dynamics.provenance.value for episode in episodes} != {
+            evidence.dynamics_provenance
+        }:
+            raise ValueError("artifact の dynamics の出どころが比較の episode と一致しない")
 
     def digest(self) -> str:
         """この報告そのものを表す SHA-256。"""
@@ -863,6 +928,7 @@ class SupervisorPolicyTrainer:
             rejections=rejections,
             baseline_arm=baseline_arm,
             horizon=horizon,
+            tables=tables,
         )
 
         selected_id = self._select(outcomes)
@@ -946,6 +1012,7 @@ class SupervisorPolicyTrainer:
         rejections: Mapping[str, Reason],
         baseline_arm: PolicyArm,
         horizon: Mapping[str, int],
+        tables: Mapping[str, RegimeTablePayload],
     ) -> dict[str, CandidateOutcome]:
         """**共通の長さ**で採点し、Baseline を上回ったかを判定する。"""
         baseline_mean = mean_reward_over(baseline_arm, horizon)
@@ -957,6 +1024,7 @@ class SupervisorPolicyTrainer:
                 outcomes[identifier] = CandidateOutcome(
                     candidate_id=identifier,
                     policy_version=f"{self._config.artifact.model_id}-{identifier}",
+                    table_sha256=canonical_sha256(tables[identifier]),
                     comparable=False,
                     rejection=rejection,
                     safety_violations=arm.safety_violations,
@@ -976,6 +1044,7 @@ class SupervisorPolicyTrainer:
                 outcomes[identifier] = CandidateOutcome(
                     candidate_id=identifier,
                     policy_version=f"{self._config.artifact.model_id}-{identifier}",
+                    table_sha256=canonical_sha256(tables[identifier]),
                     comparable=True,
                     safety_violations=arm.safety_violations,
                     invalid_actions=arm.invalid_actions,
@@ -997,6 +1066,7 @@ class SupervisorPolicyTrainer:
             outcomes[identifier] = CandidateOutcome(
                 candidate_id=identifier,
                 policy_version=f"{self._config.artifact.model_id}-{identifier}",
+                table_sha256=canonical_sha256(tables[identifier]),
                 comparable=True,
                 safety_violations=arm.safety_violations,
                 invalid_actions=arm.invalid_actions,

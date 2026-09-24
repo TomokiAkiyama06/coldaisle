@@ -274,6 +274,19 @@ shadow:   { minimum_ticks, minimum_paired_fraction }
     - `learned_controller_available`: 比較から導く。`comparable` は却下理由の有無と対
     - artifact の `promotable_episodes` / `total_episodes` / `conditions_sha256` /
       `baseline_policy_version`: 比較と報告から導く
+    - **artifact が「評価したもの」を名乗る欄**は、形や数ではなく値で比較の記録に束縛する
+      - 表: `payload_sha256` は、選ばれた候補として評価した表の hash
+        （`CandidateOutcome.table_sha256`）と一致する。さらに、選ばれた arm の episode で実際に
+        出した action を、artifact の表がすべて再現する
+      - 候補の版: 各候補の `policy_version` は `<manifest.model_id>-<候補識別子>`。比較の
+        選ばれた arm はその版で回したもの
+      - `training_episode_ids`: 両 arm が実際に回した episode の識別子と一致する
+      - `hyperparameters`: 探索 family・seed・候補数・episode 数が報告と一致する
+      - `reward_version`・`training_evidence.training_mode` / `dynamics_provenance`: 回した
+        episode が持つ値と一致する
+      - 報告の記録から導けない欄（`action_space_sha256`・設定の hash・`created_at`・
+        `model_version`・`code_commit`・`authority_compatibility`）は、呼び出し側または設定が
+        決める値で、Registry の束縛（§2.4）が bytes と metadata の一致を見る
 - 集計の digest は #104 の `shadow_evaluation_ref` にそのまま渡せる
 
 違う regime を前提にした提案どうしの比較は、**`SupervisorDecision` の段階で作れない**

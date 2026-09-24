@@ -938,6 +938,48 @@ def test_the_training_report_cannot_claim_an_improvement_it_does_not_derive(
         SupervisorPolicyTrainingReport.model_validate_json(json.dumps(tampered))
 
 
+def test_the_artifact_is_bound_to_what_was_evaluated(trained: Any) -> None:
+    """**artifact が「評価したもの」を名乗る欄は、比較の記録から導いた値と一致する。**
+
+    形や数だけを照合すると、同じ形の別の表・同じ数の別の episode を名指しした artifact が
+    `promotable` な報告のまま通ってしまう。
+    """
+    from coldaisle.control.model.thermal import canonical_sha256
+
+    report = report_for(trained, (episode_spec(episode_id="pr89-a", seed=3),))
+    restored = SupervisorPolicyTrainingReport.model_validate_json(report.model_dump_json())
+    assert restored.digest() == report.digest()
+    document = json.loads(report.model_dump_json())
+
+    # 表を、形の正しい別の表へ差し替える（payload checksum も揃えて書き換える）。
+    swapped_payload = report.artifact.payload.model_copy(
+        update={
+            "entries": tuple(
+                entry.model_copy(
+                    update={
+                        "weights": entry.weights.model_copy(
+                            update={"change": entry.weights.change * 0.5}
+                        )
+                    }
+                )
+                for entry in report.artifact.payload.entries
+            )
+        }
+    )
+    assert canonical_sha256(swapped_payload) != report.artifact.manifest.payload_sha256
+    tampered = json.loads(json.dumps(document))
+    tampered["artifact"]["payload"] = json.loads(swapped_payload.model_dump_json())
+    tampered["artifact"]["manifest"]["payload_sha256"] = canonical_sha256(swapped_payload)
+    with pytest.raises(ValidationError, match="評価した表と一致しない"):
+        SupervisorPolicyTrainingReport.model_validate_json(json.dumps(tampered))
+
+    # 学習 episode を、同じ数の別の識別子へ差し替える。
+    tampered = json.loads(json.dumps(document))
+    tampered["artifact"]["manifest"]["training_episode_ids"] = ["pr89-z"]
+    with pytest.raises(ValidationError, match="学習 episode が比較で回した episode と一致しない"):
+        SupervisorPolicyTrainingReport.model_validate_json(json.dumps(tampered))
+
+
 def test_supervisor_decision_v2_carries_identity_and_v1_still_reads() -> None:
     """**識別を足した decision は版を上げる。** 保存済みの v1 はそのまま読める。"""
     decision = paired_decision(tick_id=1)
@@ -1420,7 +1462,11 @@ def test_invariant_19_b_a_candidate_cut_short_cannot_look_safer(trained: Any) ->
         assert rejections["cut"].code == "candidate_truncated"
         horizon = scoring_horizon(baseline_arm, arms, rejections)
         outcomes = trainer._score(
-            arms=arms, rejections=rejections, baseline_arm=baseline_arm, horizon=horizon
+            tables={key: trainer.baseline_table() for key in arms},
+            arms=arms,
+            rejections=rejections,
+            baseline_arm=baseline_arm,
+            horizon=horizon,
         )
         assert outcomes["cut"].comparable is False
         assert outcomes["cut"].truncated_episodes == ("pr89-a",)
@@ -1521,7 +1567,11 @@ def test_invariant_19_d_a_self_failing_candidate_never_shortens_the_common_horiz
     assert horizon == {"pr89-a": len(full.supported_steps)}
 
     outcomes = trainer._score(
-        arms=arms, rejections=rejections, baseline_arm=baseline_arm, horizon=horizon
+        tables={key: trainer.baseline_table() for key in arms},
+        arms=arms,
+        rejections=rejections,
+        baseline_arm=baseline_arm,
+        horizon=horizon,
     )
     assert outcomes["a-self-failed"].comparable is True
     assert outcomes["a-self-failed"].short_episodes == ("pr89-a",)
@@ -1590,7 +1640,13 @@ def test_invariant_19_e_short_is_judged_by_observed_length_not_supported_steps(
     assert candidate_rejection(arms["early"], baseline_arm) is None
 
     horizon = scoring_horizon(baseline_arm, arms, {})
-    outcomes = trainer._score(arms=arms, rejections={}, baseline_arm=baseline_arm, horizon=horizon)
+    outcomes = trainer._score(
+        tables={key: trainer.baseline_table() for key in arms},
+        arms=arms,
+        rejections={},
+        baseline_arm=baseline_arm,
+        horizon=horizon,
+    )
     early = outcomes["early"]
     assert early.comparable is True
     assert early.safety_violations == baseline_arm.safety_violations == 1
@@ -1656,7 +1712,11 @@ def test_invariant_19_f_a_reward_short_failure_never_shortens_the_common_horizon
     assert horizon == {"pr89-a": len(full.supported_steps)}
 
     outcomes = trainer._score(
-        arms=arms, rejections=rejections, baseline_arm=baseline_arm, horizon=horizon
+        tables={key: trainer.baseline_table() for key in arms},
+        arms=arms,
+        rejections=rejections,
+        baseline_arm=baseline_arm,
+        horizon=horizon,
     )
     failed = outcomes["a-floor-at-end"]
     assert failed.comparable is True
