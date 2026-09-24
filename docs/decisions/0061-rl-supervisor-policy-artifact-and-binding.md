@@ -317,6 +317,13 @@ shadow:   { minimum_ticks, minimum_paired_fraction }
   合わせた集計を受け取らない
 - 集計の digest は #104 の `shadow_evaluation_ref` にそのまま渡せる。ただし **`usable` でない集計は
   参照を出さない**（`evaluation_ref()` が拒む。#104 の `promote()` は参照が空でないことしか見ない）
+- **shadow の証拠は、比べた artifact に束縛する。** 登録用の `policy_registry_metadata()` は
+  shadow の証拠を文字列ではなく `SupervisorShadowSummary` で受け取り、集計の
+  `rl_policy_identity` が照合済み artifact の完全な識別（`certified_identity()`）と一致しなければ
+  拒む。昇格には policy 専用の入口 `promote_supervisor_policy()` を使い、`ref` と registry 上の
+  bytes hash が照合済み artifact と一致することと、集計がその artifact を比べた `usable` な集計で
+  あることを確かめてから `ModelRegistry.promote()` へ渡す。#104 の `promote()` を直接呼ぶ経路は
+  残る（0062 の契約。§5 の Registry CLI と同じ残余）
 
 違う regime を前提にした提案どうしの比較は、**`SupervisorDecision` の段階で作れない**
 （同じ tick の active / shadow は同じ regime を使う。#88）。台帳側で読み替えもしない。

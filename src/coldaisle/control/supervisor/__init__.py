@@ -17,8 +17,11 @@ from coldaisle.control.supervisor.artifact import (
     SupervisorPolicyRegistryMetadata,
     action_space_sha256,
     canonical_policy_artifact_bytes,
+    certified_identity,
     policy_registry_metadata,
     policy_registry_metadata_json_bytes,
+    promote_supervisor_policy,
+    shadow_evidence_ref,
 )
 from coldaisle.control.supervisor.policy import (
     ReceivedSupervisorOutput,
@@ -110,6 +113,9 @@ __all__ = [
     "WorkloadRegimeState",
     "action_space_sha256",
     "canonical_policy_artifact_bytes",
+    "certified_identity",
     "policy_registry_metadata",
     "policy_registry_metadata_json_bytes",
+    "promote_supervisor_policy",
+    "shadow_evidence_ref",
 ]

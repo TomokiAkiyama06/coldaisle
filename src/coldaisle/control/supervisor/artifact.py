@@ -37,14 +37,21 @@ from coldaisle.control.model.thermal import canonical_json_bytes, canonical_sha2
 from coldaisle.control.model_registry import (
     MODEL_REGISTRY_SCHEMA_VERSION,
     ArtifactCapability,
+    ArtifactKind,
+    ArtifactRef,
+    HumanApproval,
+    ModelCompatibility,
+    ModelRegistry,
 )
 from coldaisle.control.schema import (
     STAGE_ORDER,
     AuthorityStage,
     SupervisorObjectiveWeights,
+    SupervisorPolicyIdentity,
     SupervisorTargetBand,
     WorkloadRegime,
 )
+from coldaisle.control.supervisor.shadow import SupervisorShadowSummary
 
 POLICY_ARTIFACT_SCHEMA_VERSION: Literal[1] = 1
 """`SupervisorPolicyArtifact` の形の版。**欄の意味を変えたら上げる。**"""
@@ -452,14 +459,99 @@ def policy_registry_metadata(
     artifact_bytes: bytes,
     *,
     offline_evaluation_ref: str | None = None,
-    shadow_evaluation_ref: str | None = None,
+    shadow_evidence: SupervisorShadowSummary | None = None,
 ) -> SupervisorPolicyRegistryMetadata:
-    """#104 登録用 metadata を作る。**照合済みの artifact だけ。**"""
+    """#104 登録用 metadata を作る。**照合済みの artifact だけ。**
+
+    shadow の証拠は文字列ではなく**集計そのもの**で受け取り、その集計が**この artifact**を
+    比べたものであることを確かめてから参照を書く（`shadow_evidence_ref()`）。
+    """
+    artifact = _require_certified(certified)
+    shadow_ref = (
+        None
+        if shadow_evidence is None
+        else _shadow_ref_for(certified_identity(certified), shadow_evidence)
+    )
     return _derive_policy_registry_metadata(
-        _require_certified(certified),
+        artifact,
         artifact_bytes,
         offline_evaluation_ref=offline_evaluation_ref,
-        shadow_evaluation_ref=shadow_evaluation_ref,
+        shadow_evaluation_ref=shadow_ref,
+    )
+
+
+def certified_identity(certified: CertifiedPolicyArtifact) -> SupervisorPolicyIdentity:
+    """照合済み artifact の**完全な識別**（model ID・版・canonical bytes の SHA-256）。"""
+    artifact = _require_certified(certified)
+    return SupervisorPolicyIdentity(
+        model_id=artifact.manifest.model_id,
+        version=artifact.manifest.model_version,
+        artifact_sha256=hashlib.sha256(_policy_artifact_bytes(artifact)).hexdigest(),
+    )
+
+
+def shadow_evidence_ref(
+    certified: CertifiedPolicyArtifact, shadow_evidence: SupervisorShadowSummary
+) -> str:
+    """**この artifact を比べた** shadow 集計から、昇格に渡す参照を作る。
+
+    集計の `rl_policy_identity` が artifact の完全な識別と一致しなければ拒む。別の artifact の
+    shadow 集計を、この artifact の昇格の証拠として記録させない。`usable` でない集計は
+    `evaluation_ref()` が拒む。
+    """
+    return _shadow_ref_for(certified_identity(certified), shadow_evidence)
+
+
+def _shadow_ref_for(
+    identity: SupervisorPolicyIdentity, shadow_evidence: SupervisorShadowSummary
+) -> str:
+    if not isinstance(shadow_evidence, SupervisorShadowSummary):
+        raise TypeError("shadow の証拠は SupervisorShadowSummary で渡す（文字列では照合できない）")
+    if shadow_evidence.rl_policy_identity != identity:
+        raise ValueError(
+            "shadow 集計が比べた artifact がこの artifact と一致しない（model ID・版・bytes hash）"
+        )
+    return shadow_evidence.evaluation_ref()
+
+
+def promote_supervisor_policy(
+    registry: ModelRegistry,
+    ref: ArtifactRef,
+    compatibility: ModelCompatibility,
+    *,
+    certified: CertifiedPolicyArtifact,
+    shadow_evidence: SupervisorShadowSummary,
+    approval: HumanApproval,
+    expected_revision: int,
+) -> int:
+    """supervisor policy を昇格する**policy 専用の入口**。
+
+    #104 の `ModelRegistry.promote()` は参照が空でないことしか見ないので、ここで次を確かめて
+    から渡す。
+
+    - `ref` が supervisor policy で、照合済み artifact の model ID・版を名指す
+    - registry に登録された bytes の hash が、照合済み artifact の canonical bytes の hash と
+      一致する
+    - shadow 集計が**この artifact**を比べた `usable` な集計である
+    """
+    identity = certified_identity(certified)
+    if ref.kind is not ArtifactKind.SUPERVISOR_POLICY or (ref.model_id, ref.version) != (
+        identity.model_id,
+        identity.version,
+    ):
+        raise ValueError("昇格する artifact が照合済みの supervisor policy と一致しない")
+    snapshot = registry.inspect()
+    if snapshot.revision != expected_revision:
+        raise ValueError("registry の revision が昇格の前提と一致しない")
+    record = snapshot.artifacts.get(ref.key)
+    if record is None or record.metadata.sha256 != identity.artifact_sha256:
+        raise ValueError("registry に登録された bytes が照合済みの artifact と一致しない")
+    return registry.promote(
+        ref,
+        compatibility,
+        shadow_evaluation_ref=_shadow_ref_for(identity, shadow_evidence),
+        approval=approval,
+        expected_revision=expected_revision,
     )
 
 

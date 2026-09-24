@@ -1140,6 +1140,116 @@ def test_summary_counts_are_never_negative() -> None:
         SupervisorShadowSummary.model_validate_json(json.dumps(document))
 
 
+def test_shadow_evidence_is_bound_to_the_promoted_artifact(tmp_path: Path, trained: Any) -> None:
+    """**別の artifact の shadow 集計を、この artifact の昇格の証拠にしない。**
+
+    shadow の証拠は文字列ではなく集計で受け取り、集計の `rl_policy_identity` が
+    照合済み artifact の完全な識別と一致しなければ、metadata にも昇格にも使わない。
+    """
+    from coldaisle.control.supervisor import (
+        canonical_policy_artifact_bytes,
+        certified_identity,
+        policy_registry_metadata,
+        promote_supervisor_policy,
+    )
+
+    environment, _config, settings, _safety = build_environment(trained, with_mpc=False)
+    trainer = trainer_for(environment, settings)
+    report = trainer.train(
+        (episode_spec(episode_id="pr89-a", seed=3),), model_version="0.1.0", created_at=CREATED_AT
+    )
+    certified = trainer.certify(report)
+    identity = certified_identity(certified)
+
+    def usable_summary(rl_identity: SupervisorPolicyIdentity) -> SupervisorShadowSummary:
+        config, _digest = rl_policy_config()
+        ledger = SupervisorShadowLedger(
+            config.shadow, rule_policy_version="rule-test-v1", rl_identity=rl_identity
+        )
+        for tick in range(4):
+            ledger.observe(
+                paired_decision(
+                    tick_id=tick, rl_version=rl_identity.version, rl_identity=rl_identity
+                )
+            )
+        summary = ledger.summary()
+        assert summary.usable is True
+        return summary
+
+    matching = usable_summary(identity)
+    other = usable_summary(identity.model_copy(update={"artifact_sha256": "e" * 64}))
+
+    artifact_bytes = canonical_policy_artifact_bytes(certified)
+    with pytest.raises(ValueError, match="shadow 集計が比べた artifact"):
+        policy_registry_metadata(certified, artifact_bytes, shadow_evidence=other)
+    derived = policy_registry_metadata(certified, artifact_bytes, shadow_evidence=matching)
+    assert derived.shadow_evaluation_ref == matching.evaluation_ref()
+
+    # 本物の Registry へ登録し、policy 専用の入口から昇格する。
+    registry = ModelRegistry(tmp_path / "pr89-promote", limits=REGISTRY_LIMITS)
+    metadata = ArtifactMetadata(
+        kind=ArtifactKind.SUPERVISOR_POLICY,
+        artifact_format=ArtifactFormat.JSON,
+        capability=ArtifactCapability.SUPERVISOR_STRATEGY,
+        model_id=derived.model_id,
+        version=derived.version,
+        created_at=derived.created_at,
+        training_dataset_version=derived.training_dataset_version,
+        source_runs=derived.source_runs,
+        feature_schema_version=derived.feature_schema_version,
+        target_schema_version=derived.target_schema_version,
+        code_commit=derived.code_commit,
+        sha256=derived.sha256,
+        model_family=derived.model_family,
+        hyperparameters=derived.hyperparameters,
+        authority_compatibility=derived.authority_compatibility,
+    )
+    registry.register_candidate(metadata, artifact_bytes, actor="trainer", reason="certified")
+    registry.mark_validated(
+        metadata.ref,
+        offline_evaluation_ref="evaluation/offline/89",
+        actor="evaluator",
+        reason="offline gates passed",
+        expected_revision=registry.inspect().revision,
+    )
+    compatibility = ModelCompatibility(
+        feature_schema_version=derived.feature_schema_version,
+        target_schema_version=derived.target_schema_version,
+        authority_stage=AuthorityStage.SHADOW,
+    )
+    revision = registry.inspect().revision
+    approval = HumanApproval(
+        action=ApprovalAction.PROMOTE,
+        artifact=metadata.ref,
+        artifact_sha256=metadata.sha256,
+        expected_revision=revision,
+        approver="model-operator",
+        approved_at_ms=1_700_000_000_000,
+        reason="shadow evaluation passed",
+    )
+    with pytest.raises(ValueError, match="shadow 集計が比べた artifact"):
+        promote_supervisor_policy(
+            registry,
+            metadata.ref,
+            compatibility,
+            certified=certified,
+            shadow_evidence=other,
+            approval=approval,
+            expected_revision=revision,
+        )
+    promote_supervisor_policy(
+        registry,
+        metadata.ref,
+        compatibility,
+        certified=certified,
+        shadow_evidence=matching,
+        approval=approval,
+        expected_revision=revision,
+    )
+    promoted = registry.inspect().artifacts[metadata.ref.key]
+    assert promoted.metadata.shadow_evaluation_ref == matching.evaluation_ref()
+
+
 def test_supervisor_decision_v2_carries_identity_and_v1_still_reads() -> None:
     """**識別を足した decision は版を上げる。** 保存済みの v1 はそのまま読める。"""
     decision = paired_decision(tick_id=1)

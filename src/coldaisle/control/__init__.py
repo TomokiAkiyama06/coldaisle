@@ -332,8 +332,11 @@ from coldaisle.control.supervisor import (
     WorkloadRegimeState,
     action_space_sha256,
     canonical_policy_artifact_bytes,
+    certified_identity,
     policy_registry_metadata,
     policy_registry_metadata_json_bytes,
+    promote_supervisor_policy,
+    shadow_evidence_ref,
 )
 
 __all__ = [
@@ -621,6 +624,7 @@ __all__ = [
     "applied_action_timeline",
     "build_input_contract",
     "canonical_policy_artifact_bytes",
+    "certified_identity",
     "counterfactual_controllers",
     "create_control_runtime_binding",
     "create_emergency_control_runtime",
@@ -632,6 +636,8 @@ __all__ = [
     "lowest_stage",
     "policy_registry_metadata",
     "policy_registry_metadata_json_bytes",
+    "promote_supervisor_policy",
+    "shadow_evidence_ref",
     "shadow_plan",
     "shadow_prediction",
     "shadow_rows",
