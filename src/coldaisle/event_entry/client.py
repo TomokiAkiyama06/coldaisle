@@ -3,10 +3,16 @@
 ```bash
 uv run coldaisle-event gpu-mode compute --source workspace-gpu-manager
 uv run coldaisle-event gpu-mode ai --note "推論サーバを再開"
+uv run coldaisle-event workload-hint training --expected-duration 4h --source job-launcher
+uv run coldaisle-event workload-hint end
 ```
+
+`workload-hint` は決定記録 0064 の Workload Hint を送る（#107）。Stage A では**記録するだけ**で、
+制御はこれを読まない。`--expected-duration` は `90s` / `30m` / `4h` / `2d` か秒数で書く。
 
 Workspace の GPU Manager やスクリプトから呼ぶ。送る前にサーバと同じ検証を通すので、
 形の誤りは接続する前に分かる。**受理したかはサーバの応答だけで判断する。**
+設定で決まる上限（受理する `hint_v`・`expected_duration_s` の上限）はサーバだけが確かめる。
 
 `--socket` を渡したときは**設定ファイルを読まない**。Workspace などリポジトリの外から
 呼ぶ側は、作業ディレクトリに `config/event-entry.yaml` が無いのが普通である。
@@ -23,6 +29,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import socket
 import sys
 from collections.abc import Sequence
@@ -32,7 +39,7 @@ from typing import Any
 import yaml
 
 from coldaisle.event_entry.config import DEFAULT_CONFIG, EventEntrySettings
-from coldaisle.event_entry.messages import MessageError, encode_gpu_mode
+from coldaisle.event_entry.messages import MessageError, encode_gpu_mode, encode_workload_hint
 
 RESPONSE_MAX_BYTES = 4096
 
@@ -41,6 +48,15 @@ TIMEOUT_ENV = "COLDAISLE_EVENT_TIMEOUT_S"
 
 DEFAULT_TIMEOUT_S = 5.0
 """`--timeout` も環境変数も無いときの待ち時間（秒）。"""
+
+HINT_WORKLOADS = ("training", "benchmark", "inference_service")
+"""`workload-hint` の第1引数に書ける負荷の種類（決定記録 0064 §2.3 の閉じた語彙）。"""
+
+HINT_END = "end"
+"""`workload-hint end`: いま有効なヒントを取り消す。"""
+
+_DURATION_PATTERN = re.compile(r"^(\d+)([smhd]?)$")
+_DURATION_UNITS_S = {"": 1, "s": 1, "m": 60, "h": 3600, "d": 86_400}
 
 
 class EntryUnavailableError(RuntimeError):
@@ -100,7 +116,48 @@ def build_parser() -> argparse.ArgumentParser:
         "--source", default=None, help="書き手の名前（例: workspace-gpu-manager）"
     )
     gpu_mode.add_argument("--note", default=None, help="人間向けの補足（200文字以内）")
+    hint = commands.add_parser(
+        "workload-hint", help="これから流す負荷を記録する（記録のみ。制御は読まない）"
+    )
+    hint.add_argument("workload", choices=[*HINT_WORKLOADS, HINT_END])
+    hint.add_argument(
+        "--expected-duration",
+        type=_duration_s,
+        default=None,
+        help="見込みの長さ（例: 4h, 30m, 14400）。end には付けない",
+    )
+    hint.add_argument("--source", default=None, help="書き手の名前（例: job-launcher）")
+    hint.add_argument("--note", default=None, help="人間向けの補足（200文字以内）")
     return parser
+
+
+def _duration_s(text: str) -> int:
+    """`4h` / `30m` / `90s` / `2d` / `14400` を秒にする。"""
+    matched = _DURATION_PATTERN.match(text)
+    if matched is None:
+        raise argparse.ArgumentTypeError("期間は 90s / 30m / 4h / 2d か秒数で書く")
+    return int(matched.group(1)) * _DURATION_UNITS_S[matched.group(2)]
+
+
+def _encode(args: argparse.Namespace) -> bytes:
+    """副コマンドの引数を1行にする。形の誤りは `MessageError`。"""
+    if args.command == "gpu-mode":
+        return encode_gpu_mode(args.mode, source=args.source, note=args.note)
+    if args.workload == HINT_END:
+        # 期間の付いた取り消しは送る前に形の検証で落ちる（0064 §2.3）
+        return encode_workload_hint(
+            "end",
+            expected_duration_s=args.expected_duration,
+            source=args.source,
+            note=args.note,
+        )
+    return encode_workload_hint(
+        "start",
+        workload=args.workload,
+        expected_duration_s=args.expected_duration,
+        source=args.source,
+        note=args.note,
+    )
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -112,7 +169,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     except ValueError as exc:
         parser.error(str(exc))
     try:
-        line = encode_gpu_mode(args.mode, source=args.source, note=args.note)
+        line = _encode(args)
     except MessageError as exc:
         _fail(exc.reason)
         return 1

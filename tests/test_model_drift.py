@@ -20,10 +20,12 @@ from __future__ import annotations
 
 import ast
 import json
+import re
 from pathlib import Path
 
 import pytest
 from pydantic import ValidationError
+from pydantic_core import to_json
 
 from coldaisle.control.config import ShadowConfig
 from coldaisle.control.drift import (
@@ -1535,3 +1537,218 @@ def test_an_outcome_without_the_applied_demand_tolerance_is_rejected() -> None:
                 '"tick_id": 0, "ts_ms": 0, "shadow": {}}\n'
             )
         )
+
+
+# ---------------------------------------------------------------- 13. Markdown（人が読む版）
+
+
+NUMBER = re.compile(r"(?<![\w.])-?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?(?![\w.])")
+"""報告に現れる数の字面。識別子や digest の中の数字は拾わない（前後が語の文字）。"""
+
+NO_DRIFT_PHRASES = ("drift 無し", "drift なし", "drift は無", "no drift", "問題なし", "問題無し")
+"""証拠が足りないときに**書いてはいけない**読み方（0056 §2.4）。"""
+
+
+def trend_rows(markdown: str) -> list[list[str]]:
+    """「Residual trend」節の表の本体（見出し行と区切り行を除く）。"""
+    section = markdown.split("## Residual trend\n", 1)[1].split("\n## ", 1)[0]
+    table = [line for line in section.splitlines() if line.startswith("| ")]
+    return [[cell.strip() for cell in line.strip("|").split(" | ")] for line in table[1:]]
+
+
+def headline(markdown: str) -> str:
+    return next(line for line in markdown.splitlines() if line.startswith("> **判定: "))
+
+
+def report_variety(profile, parts) -> list[DriftReport]:
+    """判定の種類がばらける報告の組（証拠無し・薄い・健全・劣化・変更あり・入力あり）。"""
+    judge = detector(profile)
+    inside = tuple(ObservedThermalInput.from_example(item) for item in parts.test)
+    change = DeclaredChange(
+        kind=ChangeKind.FAN_REPLACED, ts_ms=BASE_TS_MS + 3 * STEP_MS - 1, detail="front | rear"
+    )
+    return [
+        judge.detect(DriftEvidence()),
+        judge.detect(DriftEvidence(shadow=rows(profile, 4, ratio=1.0))),
+        judge.detect(DriftEvidence(shadow=rows(profile, 7, ratio=1.0), inputs=inside)),
+        judge.detect(DriftEvidence(shadow=rows(profile, 6, ratio=2.5))),
+        judge.detect(
+            DriftEvidence(
+                shadow=(*rows(profile, 3, ratio=1.0), *rows(profile, 9, ratio=1.6, start=3)),
+                changes=(change,),
+            )
+        ),
+        judge.detect(DriftEvidence(inputs=tuple(shifted(item, air=35.0) for item in inside))),
+    ]
+
+
+def test_markdown_lists_every_trend_bucket_with_the_report_values(trained) -> None:
+    """**trend の bucket を1つも落とさない。** 比の無い bucket も行として残す。"""
+    from coldaisle.drift import render_markdown
+
+    _data, _parts, _model, profile = trained
+    shadow = (
+        *rows(profile, 9, ratio=1.0),
+        *tuple(row(profile, index, ratio=2.5) for index in range(9, 31)),
+    )
+    report = detector(profile).detect(DriftEvidence(shadow=shadow))
+    trend = report.residual.trend
+    assert len(trend) == 11
+    assert trend[-1].verdict is DriftVerdict.INSUFFICIENT_EVIDENCE
+
+    table = trend_rows(render_markdown(report))
+    assert len(table) == len(trend)
+    for cells, bucket in zip(table, trend, strict=True):
+        assert cells[:4] == [
+            to_json(bucket.index).decode(),
+            to_json(bucket.start_ts_ms).decode(),
+            to_json(bucket.end_ts_ms).decode(),
+            to_json(bucket.outcomes).decode(),
+        ]
+        if bucket.ratio is None:
+            assert cells[4].startswith("—")
+        else:
+            assert cells[4] == to_json(bucket.ratio).decode()
+        assert cells[5].startswith(f"`{bucket.verdict.value}`")
+
+
+def test_markdown_never_reads_thin_evidence_as_no_drift(trained) -> None:
+    """**証拠不足を「drift 無し」と書かない**（0056 §2.4）。冒頭で判定と同じ強さで出す。"""
+    from coldaisle.drift import render_markdown
+
+    _data, _parts, _model, profile = trained
+    for evidence_set in (DriftEvidence(), DriftEvidence(shadow=rows(profile, 4, ratio=1.0))):
+        report = detector(profile).detect(evidence_set)
+        assert report.verdict is DriftVerdict.INSUFFICIENT_EVIDENCE
+        markdown = render_markdown(report)
+
+        assert headline(markdown).startswith("> **判定: `insufficient_evidence`")
+        assert "`ok` ではない" in headline(markdown)
+        assert "> **判定できなかった signal**: `residual`" in markdown
+        assert "> **Residual の coverage**: **足りない**" in markdown
+        assert "「再学習は不要」とは言えない" in markdown
+        assert "**trend は無い。**" in markdown
+        assert trend_rows(markdown) == []
+        withheld = "| `residual` | `insufficient_evidence` | ratio | —（証拠不足のため出さない）"
+        assert withheld in markdown
+        for phrase in NO_DRIFT_PHRASES:
+            assert phrase not in markdown
+
+
+def test_markdown_keeps_inconclusive_signals_visible_next_to_a_degraded_verdict(trained) -> None:
+    """`degraded` が勝っても、判定できなかった signal を冒頭から消さない。"""
+    from coldaisle.drift import render_markdown
+
+    _data, _parts, _model, profile = trained
+    report = detector(profile).detect(DriftEvidence(shadow=rows(profile, 6, ratio=2.5)))
+    assert report.verdict is DriftVerdict.DEGRADED
+    assert report.recommendation.inconclusive_signals
+    markdown = render_markdown(report)
+
+    assert headline(markdown).startswith("> **判定: `degraded`")
+    inconclusive = next(
+        line for line in markdown.splitlines() if line.startswith("> **判定できなかった signal**")
+    )
+    for kind in report.recommendation.inconclusive_signals:
+        assert f"`{kind.value}`" in inconclusive
+    assert "`residual_degraded`" in markdown
+
+
+def test_markdown_headline_is_the_report_verdict_and_nothing_else(trained) -> None:
+    """冒頭の判定は報告の `verdict` そのもの。**Markdown 側で判定を作らない。**"""
+    from coldaisle.drift import render_markdown
+
+    _data, parts, _model, profile = trained
+    for report in report_variety(profile, parts):
+        markdown = render_markdown(report)
+        assert headline(markdown).startswith(f"> **判定: `{report.verdict.value}`")
+        coverage = "下限を満たしている" if report.residual.coverage.sufficient else "**足りない**"
+        assert f"> **Residual の coverage**: {coverage}" in markdown
+        assert report.target.model_version in markdown
+        assert report.target.artifact_sha256 in markdown
+        assert report.sha256() in markdown
+        if report.verdict is not DriftVerdict.OK:
+            for phrase in NO_DRIFT_PHRASES:
+                assert phrase not in markdown
+
+
+def test_markdown_introduces_no_number_that_is_not_in_the_report(trained) -> None:
+    """**報告に無い数を作らない。** 丸めも集計もしない（数の字面は保存する JSON の部分集合）。"""
+    from coldaisle.drift import render, render_markdown
+
+    _data, parts, _model, profile = trained
+    for report in report_variety(profile, parts):
+        reported = set(NUMBER.findall(render(report)))
+        rendered = set(NUMBER.findall(render_markdown(report)))
+        assert rendered <= reported, sorted(rendered - reported)
+
+
+@pytest.mark.parametrize("value", [1e-7, 1e-20, 2.5e-5, 1e20, 0.30000000000000004, 3.0, 0.0])
+def test_markdown_spells_small_and_large_numbers_like_the_saved_json(value: float) -> None:
+    """数の字面は保存する JSON（pydantic）と同じ。`json.dumps` の `1e-07` にしない。"""
+    from pydantic import BaseModel
+
+    from coldaisle.drift import _number
+
+    class Holder(BaseModel):
+        value: float
+
+    saved = Holder(value=value).model_dump_json()
+    assert saved == '{"value":' + _number(value) + "}"
+
+
+def test_markdown_is_deterministic_and_depends_only_on_the_report(trained) -> None:
+    """同じ報告からは同じ bytes。**入力の順序や JSON の往復で変わらない。**"""
+    from coldaisle.drift import render_markdown
+
+    _data, _parts, _model, profile = trained
+    shadow = (*rows(profile, 3, ratio=1.0), *rows(profile, 4, ratio=2.5, start=3))
+    report = detector(profile).detect(DriftEvidence(shadow=shadow))
+    shuffled = detector(profile).detect(DriftEvidence(shadow=tuple(reversed(shadow))))
+    restored = DriftReport.model_validate_json(report.canonical_bytes())
+
+    first = render_markdown(report)
+    assert first == render_markdown(report)
+    assert first == render_markdown(shuffled)
+    assert first == render_markdown(restored)
+
+
+def test_free_text_cannot_break_the_markdown_tables(trained) -> None:
+    """宣言の説明に `|` や改行があっても、表の列数は変わらない。"""
+    from coldaisle.drift import render_markdown
+
+    _data, _parts, _model, profile = trained
+    change = DeclaredChange(
+        kind=ChangeKind.SENSOR_REPLACED, ts_ms=BASE_TS_MS, detail="a | b\n| c | `d`"
+    )
+    report = detector(profile).detect(
+        DriftEvidence(shadow=rows(profile, 6, ratio=1.0, start=1), changes=(change,))
+    )
+    markdown = render_markdown(report)
+    section = markdown.split("## 宣言された構成変更\n", 1)[1].split("\n## ", 1)[0]
+    table = [line for line in section.splitlines() if line.startswith("|")]
+    assert len(table) == 3
+    assert {len(re.findall(r"(?<!\\)\|", line)) for line in table} == {4}
+
+
+def test_json_output_is_unchanged_and_stays_the_default(trained, tmp_path) -> None:
+    """**既定は JSON のまま**（保存と比較の正本）。Markdown は別の出力先に書く。"""
+    from coldaisle.drift import DEFAULT_OUT, build_parser, render, render_markdown, write
+
+    _data, _parts, _model, profile = trained
+    report = detector(profile).detect(DriftEvidence(shadow=rows(profile, 6, ratio=2.5)))
+    assert render(report) == report.model_dump_json(indent=2) + "\n"
+    assert DriftReport.model_validate_json(render(report)) == report
+
+    default = write(report, tmp_path / "drift.json")
+    assert default.read_text(encoding="utf-8") == render(report)
+    markdown = write(report, tmp_path / "drift.md", report_format="markdown")
+    assert markdown.read_text(encoding="utf-8") == render_markdown(report)
+
+    args = build_parser().parse_args(["--evidence", "e.yaml", "--profile", "p.json"])
+    assert args.report_format == "json"
+    assert args.out is None
+    assert DEFAULT_OUT["json"] == Path("var/drift.json")
+    assert DEFAULT_OUT["markdown"].suffix == ".md"
+    with pytest.raises(SystemExit):
+        build_parser().parse_args(["--evidence", "e", "--profile", "p", "--format", "html"])
