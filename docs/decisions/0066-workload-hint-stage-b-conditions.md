@@ -4,9 +4,10 @@
 - **Status**: Proposed（リポジトリ所有者の承認をもって FINAL。承認前に実装しない）
 - **Date**: 2026-09-21
 - **Supersedes**: なし。[0064](0064-workload-hint-entry-and-supervisor-prior.md) は FINAL のため本文を書き換えず、
-  §2.8 の「単調性（片方向）」の検証方法と §2.6 の「起動時の取り込み」の条件を
-  本記録が**限定的に置き換える**（0064 側には `Superseded by` の追記だけを行う）
-- **関連**: [0064](0064-workload-hint-entry-and-supervisor-prior.md) §2.6 / §2.8 / §2.10 /
+  §2.8 の「単調性（片方向）」の検証方法、§2.6 の「起動時の取り込み」の条件、§2.4 の
+  「表・トリガ・索引は 0045 §2.5 のままでスキーマ変更は要らない」の記述を本記録が**限定的に置き換える**
+  （§2.2 で `events` に boot id と `CLOCK_BOOTTIME` の列を足すため。0064 側には `Superseded by` の追記だけを行う）
+- **関連**: [0064](0064-workload-hint-entry-and-supervisor-prior.md) §2.4 / §2.6 / §2.8 / §2.10 /
   [0041](0041-supervisor-proposal-freshness.md) / [0045](0045-local-socket-write-entry.md) /
   [0052](0052-learned-mpc-optimizer-and-hard-constraints.md) / [0062](0062-model-registry-operations.md) /
   AGENTS.md ルール 2 / 3 / 4 / 9
@@ -116,6 +117,9 @@ weight・band の単調性が**選ばれる Demand の単調性**をそのまま
   - Optimizer の設定（探索格子・予算など、`solve` の結果に効く設定）と目的関数の設定
   - Optimizer / 目的関数の実装の識別子（パッケージ版と該当モジュールの内容ハッシュ）
   - Thermal Model artifact の識別子（Registry の digest。0062）
+  - **実行時ゲート自身の実装の識別子**: 認証領域の判定・二重解法・`eps` / `eps_c` の比較・context の選択を
+    行うモジュールと、Optimizer に渡す入力（window・制約・baseline）を組み立てるモジュールの内容ハッシュ。
+    これらだけを変えても、検証時と違う判定のまま同じハッシュで Stage B が有効にならないようにする
   - **Thermal Model の推論の実装の識別子**（`predict` と前処理・特徴量の組み立てを含むモジュールの
     内容ハッシュ）と、結果に効く依存（数値計算ライブラリなど）のロックファイルのハッシュ。
     同じ artifact でも推論の実装や依存が変われば予測が変わり、パッケージ版はソースの変更ごとには
@@ -145,13 +149,14 @@ elapsed_ms = startup_wall_ms - ts_ms
 - **経過を過小に見積もった行は採らない。** 記録の後に壁時計が戻り、起動までに `ts_ms` を少しだけ
   追い越した場合、`elapsed_ms` は正でも実際の経過より短く、期限切れのヒントが復活しうる。
   負の値を拒むだけでは防げないので、起動時の取り込みは**壁時計の差だけでは採らない**:
-  - ヒントの行に、書いた時点の boot id（`/proc/sys/kernel/random/boot_id`）と単調時計
-    （`CLOCK_MONOTONIC`）の値を持たせる（0045 の `events` に列を足す。実装は別 Issue）
-  - 起動時の boot id が行と同じときだけ、`elapsed_ms` を**単調時計の差**で求めて上の条件を当てはめる
-    （単調時計は壁時計の修正で戻らないので、経過を過小に見積もらない）
+  - ヒントの行に、書いた時点の boot id（`/proc/sys/kernel/random/boot_id`）と
+    **`CLOCK_BOOTTIME`** の値を持たせる（0045 の `events` に列を足す。実装は別 Issue）。
+    `CLOCK_MONOTONIC` は suspend 中に進まず、同じ boot の中でも suspend をはさむと経過を過小に見積もるので使わない
+  - 起動時の boot id が行と同じときだけ、`elapsed_ms` を **`CLOCK_BOOTTIME` の差**で求めて上の条件を当てはめる
+    （壁時計の修正で戻らず、suspend 中も進むので、経過を過小に見積もらない）
   - boot id が違う（再起動をまたいだ）行、またはこれらの列を持たない行は、**取り込まない**
     （`backfill_rejected: unverifiable_elapsed`）。再起動をまたいだ経過は確かめられないため
-  - 壁時計の差による上の式は、単調時計の差と食い違わないことを確かめる追加の検査として残す
+  - 壁時計の差による上の式は、`CLOCK_BOOTTIME` の差と食い違わないことを確かめる追加の検査として残す
     （どちらかで条件を外れれば採らない）
 
 ### 2.3 0064 との関係
