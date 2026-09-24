@@ -158,7 +158,7 @@ wall_elapsed_ms     = startup_wall_ms - ts_ms                 （壁時計の差
 - 残り時間は**元の期限（`min(declared_ms, max_age_ms)`）を超えない**ことを不変条件とし、試験で固定する
   （**期限と残り時間は `boottime_elapsed_ms` だけで数える**。壁時計の差は巻き戻しで短くなりうるので、
   残り時間の計算には使わない。`boottime_elapsed_ms >= 0` が保証されるので引き算は減る方向にしか働かない）
-- 採らなかった理由は構造化ログに閉じた語彙（`backfill_rejected: future_ts | too_old | expired | unverifiable_elapsed`）で残す。
+- 採らなかった理由は構造化ログに閉じた語彙（`backfill_rejected: future_ts | too_old | expired | unverifiable_elapsed | already_terminated | unverifiable_status`）で残す。
   `ts_ms` の値そのものは載せない（0064 §2.9）
 - 制御中の鮮度判定は 0064 §2.6 のとおり単調時計のままで、この規則は**起動時 1 回**にだけ関わる
 - **起動時に復元する行の順序は壁時計で決めない。** 0064 §2.6 は `events.ts_ms` を行の順序に使うが、
@@ -167,6 +167,15 @@ wall_elapsed_ms     = startup_wall_ms - ts_ms                 （壁時計の差
   `events.id`（追記の順。0045 §2.5 の表は更新・削除をトリガで拒むので、`id` は追記の順に増える）の昇順に
   行を当てはめ、終了・置き換えを反映してから、最後に残った未完了のヒントを1つ選ぶ。そのヒントに上の経過の
   条件を当てはめる。`ts_ms` の順は使わない
+- **`contradicted` になったヒントは再起動をまたいでも復元しない。** 0064 §2.7 では矛盾は `events` に書かれず、
+  ログと decision trace（0064 §2.9 の `status: contradicted` と `event_id`）にだけ残る。`events` だけで復元すると、
+  矛盾したヒントの `phase: "start"` を未完了として再び採ってしまい、「一度 `contradicted` になった行は再採用しない」
+  を再起動で破る。そこで起動時の復元は、選んだヒントの `event_id` について、そのヒントの記録以後の decision trace
+  （同じ boot の `CLOCK_BOOTTIME` の範囲）を引き、`status` が一度でも `contradicted`（または `expired` / `ended` /
+  `superseded`）になっていれば採らない（`backfill_rejected: already_terminated`）
+  - その範囲の trace が途切れていて終端状態の有無を確かめられない場合も採らない（`backfill_rejected: unverifiable_status`）。
+    確かめられない状態を「矛盾していない」と扱わない
+  - 制御デーモンは `events` に書かない（書き込み入口は 0045 のソケットだけ）ので、終端状態を `events` に追記する形は採らない
 - **経過を過小に見積もった行は採らない。** 記録の後に壁時計が戻り、起動までに `ts_ms` を少しだけ
   追い越した場合、`wall_elapsed_ms` は正でも実際の経過より短く、期限切れのヒントが復活しうる。
   負の値を拒むだけでは防げないので、起動時の取り込みは**壁時計の差だけでは採らない**:
