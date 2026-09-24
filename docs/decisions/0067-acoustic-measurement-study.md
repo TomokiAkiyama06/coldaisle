@@ -3,7 +3,9 @@
 - **種別**: Decision Record
 - **Status**: Proposed
 - **Date**: 2026-09-24
-- **Supersedes**: なし
+- **Supersedes**: [0045](0045-local-socket-write-entry.md) §2.4 のメッセージの表の `type` 行
+  （「`gpu_mode` のみ受理する」）のうち、受理する種類の列挙だけ。本記録は `noise_feedback` を受理する種類に
+  加える（§2.2）。0045 の他の節（入口・認可・保存の形・`peer_uid`）は有効
 - **関連**: [0009](0009-read-api.md) §3（GET-only） / [0026](0026-three-zone-fan-control.md) /
   [0027](0027-fan-control-architecture.md) /
   [0028](0028-fan-control-contracts.md) §2.5 (a)（`CALIBRATION` でも Guard の floor と Critical Safety を外さない） /
