@@ -980,6 +980,73 @@ def test_the_artifact_is_bound_to_what_was_evaluated(trained: Any) -> None:
         SupervisorPolicyTrainingReport.model_validate_json(json.dumps(tampered))
 
 
+def test_certify_regenerates_the_selected_table_from_the_config(trained: Any) -> None:
+    """**信頼の根は報告の外（設定と Rule policy）にある。** 登録の前に作り直して照合する。
+
+    報告は JSON として書き換えられるので、訪れなかった regime の欄だけを変え、
+    `payload_sha256` と `table_sha256` を揃えて書き換えた偽造は報告の検証を通る。
+    設定から作り直した表とは食い違うので、`certify()` が拒む。
+    """
+    from coldaisle.control.model.thermal import canonical_sha256
+
+    environment, _config, settings, _safety = build_environment(trained, with_mpc=False)
+    trainer = trainer_for(environment, settings)
+    specs = (episode_spec(episode_id="pr89-a", seed=3),)
+    report = trainer.train(specs, model_version="0.1.0", created_at=CREATED_AT)
+    # 本物の報告は通り、作り直した表は artifact の表と同じ。
+    assert trainer.certify(report) == report.artifact
+    assert trainer.regenerate_candidate_table(report.selected_candidate_id) == (
+        report.artifact.payload
+    )
+    for identifier, table in trainer.candidates():
+        assert trainer.regenerate_candidate_table(identifier) == table
+
+    # 選ばれた arm が訪れなかった regime の欄だけを変える。
+    visited = {
+        step.regime for episode in report.comparison.arms[-1].episodes for step in episode.steps
+    }
+    unvisited = next(regime for regime in WorkloadRegime if regime not in visited)
+    forged_payload = report.artifact.payload.model_copy(
+        update={
+            "entries": tuple(
+                entry.model_copy(
+                    update={
+                        "weights": entry.weights.model_copy(
+                            update={"change": entry.weights.change * 0.5}
+                        )
+                    }
+                )
+                if entry.regime is unvisited
+                else entry
+                for entry in report.artifact.payload.entries
+            )
+        }
+    )
+    digest = canonical_sha256(forged_payload)
+    document = json.loads(report.model_dump_json())
+    document["artifact"]["payload"] = json.loads(forged_payload.model_dump_json())
+    document["artifact"]["manifest"]["payload_sha256"] = digest
+    for outcome in document["outcomes"]:
+        if outcome["candidate_id"] == report.selected_candidate_id:
+            outcome["table_sha256"] = digest
+    # 報告の中の値どうしは揃っているので、報告としては読めてしまう。
+    forged = SupervisorPolicyTrainingReport.model_validate_json(json.dumps(document))
+    with pytest.raises(SupervisorPolicyTrainingError, match="作り直した"):
+        trainer.certify(forged)
+
+    # manifest の設定 hash と違う設定では作り直さない。
+    config, _digest = rl_policy_config()
+    other = SupervisorPolicyTrainer(
+        environment,
+        policy_config=config,
+        policy_config_sha256="0" * 64,
+        bounds=settings.supervisor.output_bounds,
+        rule_policy=RulePolicy(settings.supervisor.rule_policy, SimulatedClock(0)),
+    )
+    with pytest.raises(SupervisorPolicyTrainingError, match="rl_policy_config_sha256"):
+        other.certify(report)
+
+
 def test_supervisor_decision_v2_carries_identity_and_v1_still_reads() -> None:
     """**識別を足した decision は版を上げる。** 保存済みの v1 はそのまま読める。"""
     decision = paired_decision(tick_id=1)

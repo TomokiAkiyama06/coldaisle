@@ -695,6 +695,57 @@ def _rank_value(mean: float | None) -> float:
     return math.inf if mean is None else -mean
 
 
+def _replace_entry(
+    baseline: RegimeTablePayload, regime: WorkloadRegime, action: _CandidateAction
+) -> RegimeTablePayload:
+    """Baseline の表の `regime` だけを `action` へ差し替えた表。"""
+    return RegimeTablePayload(
+        entries=tuple(
+            RegimeActionEntry(
+                regime=entry.regime,
+                strategy=action.strategy if entry.regime is regime else entry.strategy,
+                weights=action.weights if entry.regime is regime else entry.weights,
+                target_band=action.target_band if entry.regime is regime else entry.target_band,
+            )
+            for entry in baseline.entries
+        )
+    )
+
+
+def regenerate_candidate_table(
+    baseline: RegimeTablePayload,
+    pool: Sequence[_CandidateAction],
+    candidate_id: str,
+) -> RegimeTablePayload:
+    """候補識別子から表を作り直す（`SupervisorPolicyTrainer.candidates()` と同じ規則）。
+
+    識別子は `candidate_identifier(regime, index)` の形で、`index` は action の直積
+    （設定の並び）の位置である。この形でない識別子、直積の外の番号、Baseline と同じ action
+    になる差し替え（`candidates()` が並べない）は `ValueError` で拒む。
+    """
+    if candidate_id == BASELINE_CANDIDATE_ID:
+        return baseline
+    regime_value, separator, index_text = candidate_id.rpartition("-a")
+    if not separator or not index_text.isdigit():
+        raise ValueError(f"候補識別子の形ではない: {candidate_id}")
+    try:
+        regime = WorkloadRegime(regime_value)
+    except ValueError as error:
+        raise ValueError(f"候補識別子の regime が無い: {candidate_id}") from error
+    index = int(index_text)
+    if index >= len(pool) or candidate_identifier(regime, index) != candidate_id:
+        raise ValueError(f"候補識別子の番号が action の直積の外: {candidate_id}")
+    action = pool[index]
+    current = baseline.entry(regime)
+    if (action.strategy, action.weights, action.target_band) == (
+        current.strategy,
+        current.weights,
+        current.target_band,
+    ):
+        raise ValueError(f"Baseline と同じ action の候補は並べない: {candidate_id}")
+    return _replace_entry(baseline, regime, action)
+
+
 class SupervisorPolicyTrainer:
     """Rule baseline を起点に候補表を並べ、同じ episode 群で比べて artifact を作る。
 
@@ -809,23 +860,83 @@ class SupervisorPolicyTrainer:
                     current.target_band,
                 ):
                     continue
-                entries = tuple(
-                    RegimeActionEntry(
-                        regime=entry.regime,
-                        strategy=action.strategy if entry.regime is regime else entry.strategy,
-                        weights=action.weights if entry.regime is regime else entry.weights,
-                        target_band=(
-                            action.target_band if entry.regime is regime else entry.target_band
-                        ),
-                    )
-                    for entry in baseline.entries
-                )
                 candidates.append(
-                    (candidate_identifier(regime, index), RegimeTablePayload(entries=entries))
+                    (candidate_identifier(regime, index), _replace_entry(baseline, regime, action))
                 )
         if len(candidates) != projected:  # pragma: no cover - 数え方と作り方の食い違い
             raise SupervisorPolicyTrainingError("候補表の数が事前に数えた数と一致しない")
         return tuple(candidates)
+
+    def regenerate_candidate_table(self, candidate_id: str) -> RegimeTablePayload:
+        """候補識別子から、その候補として評価する表を**作り直す**。
+
+        候補は設定（`output_bounds` と `weight_candidates` の並び）と Baseline の表だけから
+        決定論的に決まる（seed は評価順にしか使わない）。報告の外にあるこの根から作り直すので、
+        報告の中の hash を揃えて書き換えても、作り直した表とは食い違う。
+        """
+        return regenerate_candidate_table(self.baseline_table(), self._action_pool(), candidate_id)
+
+    def certify(self, report: SupervisorPolicyTrainingReport) -> SupervisorPolicyArtifact:
+        """報告の artifact を、**この設定から作り直した表**と照合して返す（登録の前に通す）。
+
+        報告は JSON として書き換えられるので、報告の中の値どうしが揃っているだけでは、
+        すべてを揃えて書き換えた偽造を止められない（決定記録 0050 §3 と同じ立場）。
+        **信頼の根は報告の外にある設定と Rule policy である。** ここで次を確かめる。
+
+        - manifest の設定 hash・action 空間の hash・reward の版・model ID・探索条件が、
+          この trainer に渡した設定と一致する（別の設定で作り直させない）
+        - 選ばれた候補の表を設定から作り直し、artifact の表・`payload_sha256`・
+          選ばれた候補の `table_sha256` と一致する
+        - すべての候補の識別子がこの設定で作れる識別子で、`table_sha256` が作り直した表の
+          hash と一致し、候補数が設定から数えた数と一致する
+        """
+        manifest = report.artifact.manifest
+        expected = {
+            "rl_policy_config_sha256": self._config_sha256,
+            "rl_training_config_sha256": self._environment.config_sha256,
+            "action_space_sha256": action_space_sha256(self._bounds),
+            "reward_version": self._environment.reward_version,
+            "model_id": self._config.artifact.model_id,
+        }
+        for name, value in expected.items():
+            if getattr(manifest, name) != value:
+                raise SupervisorPolicyTrainingError(
+                    f"artifact の {name} がこの設定と一致しない。別の設定では作り直さない"
+                )
+        search = self._config.search
+        if (report.search_family, report.seed, report.minimum_reward_improvement) != (
+            search.family,
+            search.seed.value,
+            search.minimum_reward_improvement.value,
+        ):
+            raise SupervisorPolicyTrainingError("報告の探索条件がこの設定と一致しない")
+        if report.baseline_policy_version != self._rule_policy.version:
+            raise SupervisorPolicyTrainingError("報告の Baseline がこの Rule policy ではない")
+        baseline = self.baseline_table()
+        pool = self._action_pool()
+        if len(report.outcomes) != self._projected_candidate_count(baseline):
+            raise SupervisorPolicyTrainingError("報告の候補数がこの設定から数えた数と一致しない")
+        for outcome in report.outcomes:
+            try:
+                table = regenerate_candidate_table(baseline, pool, outcome.candidate_id)
+            except ValueError as error:
+                raise SupervisorPolicyTrainingError(
+                    f"この設定では作れない候補がある（{outcome.candidate_id}）: {error}"
+                ) from error
+            if outcome.table_sha256 != canonical_sha256(table):
+                raise SupervisorPolicyTrainingError(
+                    f"候補の表の hash が設定から作り直した表と一致しない（{outcome.candidate_id}）"
+                )
+            if outcome.candidate_id == report.selected_candidate_id:
+                if report.artifact.payload != table:
+                    raise SupervisorPolicyTrainingError(
+                        "artifact の表が、設定から作り直した選ばれた候補の表と一致しない"
+                    )
+                if manifest.payload_sha256 != canonical_sha256(table):
+                    raise SupervisorPolicyTrainingError(
+                        "artifact の payload_sha256 が作り直した表の hash と一致しない"
+                    )
+        return report.artifact
 
     def _projected_candidate_count(self, baseline: RegimeTablePayload) -> int:
         """候補表の数を**作らずに**数える。

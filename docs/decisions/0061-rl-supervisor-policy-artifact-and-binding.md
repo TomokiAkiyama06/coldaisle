@@ -287,6 +287,20 @@ shadow:   { minimum_ticks, minimum_paired_fraction }
       - 報告の記録から導けない欄（`action_space_sha256`・設定の hash・`created_at`・
         `model_version`・`code_commit`・`authority_compatibility`）は、呼び出し側または設定が
         決める値で、Registry の束縛（§2.4）が bytes と metadata の一致を見る
+  - **報告だけでは信頼の根にならない**（0050 §3 と同じ立場）。報告は JSON として書き換え
+    られるので、上の照合は**報告の中の値どうしの整合**を見るにとどまり、すべてを揃えて
+    書き換えた偽造（例: 選ばれた arm が訪れなかった regime の欄だけを変え、`payload_sha256` と
+    `table_sha256` を揃える）は止められない
+  - **束縛は、設定を持つ登録の前の段階で行う**（`SupervisorPolicyTrainer.certify()`）。候補の表は
+    設定（`output_bounds` と `weight_candidates` の並び）と Rule policy から決定論的に作り直せる
+    （seed は評価順にしか使わない。`regenerate_candidate_table()`）。`certify()` は次を確かめて
+    から artifact を返し、登録はこれを通したものだけにする
+    - manifest の `rl_policy_config_sha256` / `rl_training_config_sha256` /
+      `action_space_sha256` / `reward_version` / `model_id` と報告の探索条件が、渡した設定と
+      一致する（別の設定で作り直させない）。Baseline の版が渡した Rule policy の版と一致する
+    - すべての候補の識別子がこの設定で作れ、`table_sha256` が作り直した表の hash と一致し、
+      候補数が設定から数えた数と一致する
+    - 選ばれた候補の作り直した表が、artifact の表・`payload_sha256` と一致する
 - 集計の digest は #104 の `shadow_evaluation_ref` にそのまま渡せる
 
 違う regime を前提にした提案どうしの比較は、**`SupervisorDecision` の段階で作れない**
