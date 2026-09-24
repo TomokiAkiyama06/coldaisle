@@ -3,9 +3,11 @@
 - **種別**: Decision Record
 - **Status**: Proposed
 - **Date**: 2026-09-24
-- **Supersedes**: [0045](0045-local-socket-write-entry.md) §2.4 のメッセージの表の `type` 行
-  （「`gpu_mode` のみ受理する」）のうち、受理する種類の列挙だけ。本記録は `noise_feedback` を受理する種類に
-  加える（§2.2）。0045 の他の節（入口・認可・保存の形・`peer_uid`）は有効
+- **Supersedes**: [0045](0045-local-socket-write-entry.md) §2.4 のメッセージの表のうち、
+  (1) `type` 行の受理する種類の列挙（「`gpu_mode` のみ受理する」）と、(2) フィールドの表が `type` によらず
+  1つであるという前提。本記録は `noise_feedback` を受理する種類に加え、その種類で許すフィールドを §2.2 の表で定める。
+  **未知のフィールドを拒む（`extra = forbid`）・strict・`v` は `1` のみ**という 0045 §2.4 の規則は種類ごとに
+  そのまま適用する。0045 の他の節（入口・認可・保存の形・`peer_uid`）は有効
 - **関連**: [0009](0009-read-api.md) §3（GET-only） / [0026](0026-three-zone-fan-control.md) /
   [0027](0027-fan-control-architecture.md) /
   [0028](0028-fan-control-contracts.md) §2.5 (a)（`CALIBRATION` でも Guard の floor と Critical Safety を外さない） /
@@ -53,10 +55,18 @@
 - UI（0046 のエアフロー画面など）は**表示専用のまま**、いまの各 Zone の effective Demand と
   RPM を見せるだけにする
 - 回答は 0045 のローカル Unix ソケット（`coldaisle-eventd`）へ、新しい種類
-  `noise_feedback` として送る。メッセージの本体は次の2つのフィールドを**どちらも必須**で持つ
-  - `value`: `loud` / `ok`
-  - `sampling`: `prompted`（定時の回答） / `spontaneous`（気づいたときの回答）。§2.1 の区別を
-    保存の境界で失わないため。0045 は未知・欠けたフィールドを受け取らないので、ここで決めておく
+  `noise_feedback` として送る。この種類で許すフィールドは次の表だけで、**これ以外は拒む**
+  （0045 §2.4 の `extra = forbid` と strict をこの種類にもそのまま当てる。`mode` など他の種類のフィールドも拒む）
+
+  | フィールド | 型 | 規則 |
+  |---|---|---|
+  | `v` | int | `1` のみ（0045 §2.4 のまま） |
+  | `type` | str | `noise_feedback` |
+  | `value` | str | **必須**。`loud` / `ok` |
+  | `sampling` | str | **必須**。`prompted`（定時の回答） / `spontaneous`（気づいたときの回答）。§2.1 の区別を保存の境界で失わないため |
+  | `source` | str | 任意。0045 §2.4 と同じ規則 |
+  | `note` | str | 任意。0045 §2.4 と同じ規則 |
+
   - 例: `coldaisle-event noise-feedback loud --sampling prompted`
 - 読み取り API（0009 GET-only）に書き込みを足さない
 - **ブラウザの UI にボタンを置く案は本記録では決めない。** ブラウザからソケットへは届かず、
@@ -268,7 +278,7 @@
     run id と連番を持つ前に捨てられる。**一意の鍵を新しい識別（run id と連番）に置き換える**必要がある
   - これは 0030 の主キーの契約を変えるので、本記録では決めない。実装 Issue で 0030 の該当箇所を
     `Supersedes` する新しい決定記録を作り、承認を得てから migration を入れる（本記録は 0030 を置き換えない。
-    本記録が置き換えるのは冒頭の 0045 §2.4 の受理する種類の列挙だけ）。その記録が承認されるまで、
+    本記録が置き換えるのは冒頭に書いた 0045 §2.4 の一部だけ）。その記録が承認されるまで、
     §2.4 の突き合わせは動かさない
   - trace に tick の backend の種類と読み戻しの成否、**各 Zone の backend が返した生の故障**
     （`FanHardwareResult.fault`）を残す（§2.4 の実機と故障の条件）。いまの trace は `HardwareReadback` だけを
