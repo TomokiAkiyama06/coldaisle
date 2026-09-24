@@ -49,9 +49,11 @@ from coldaisle.control.schema import (
     AuthorityStage,
     SupervisorObjectiveWeights,
     SupervisorPolicyIdentity,
+    SupervisorPolicyKind,
     SupervisorTargetBand,
     WorkloadRegime,
 )
+from coldaisle.control.supervisor.policy import SupervisorPolicy
 from coldaisle.control.supervisor.shadow import SupervisorShadowSummary
 
 POLICY_ARTIFACT_SCHEMA_VERSION: Literal[1] = 1
@@ -524,25 +526,48 @@ def certified_identity(certified: CertifiedPolicyArtifact) -> SupervisorPolicyId
 
 
 def shadow_evidence_ref(
-    certified: CertifiedPolicyArtifact, shadow_evidence: SupervisorShadowSummary
+    certified: CertifiedPolicyArtifact,
+    shadow_evidence: SupervisorShadowSummary,
+    *,
+    baseline_rule_policy: SupervisorPolicy,
 ) -> str:
-    """**この artifact を比べた** shadow 集計から、昇格に渡す参照を作る。
+    """**この artifact を、いまの Rule policy と比べた** shadow 集計から、昇格に渡す参照を作る。
 
     集計の `rl_policy_identity` が artifact の完全な識別と一致しなければ拒む。別の artifact の
-    shadow 集計を、この artifact の昇格の証拠として記録させない。`usable` でない集計は
+    shadow 集計を、この artifact の昇格の証拠として記録させない。集計の `rule_policy_version`
+    が、運転の Baseline として渡した Rule policy の版と一致しなければ拒む。古い Rule と
+    比べた集計を、いまの Rule を上回った証拠として記録させない。`usable` でない集計は
     `evaluation_ref()` が拒む。
     """
-    return _shadow_ref_for(certified_identity(certified), shadow_evidence)
+    return _shadow_ref_for(
+        certified_identity(certified),
+        _rule_version_of(baseline_rule_policy),
+        shadow_evidence,
+    )
+
+
+def _rule_version_of(baseline_rule_policy: SupervisorPolicy) -> str:
+    """Baseline として渡された policy の版。**Rule 以外は受け取らない。**"""
+    if baseline_rule_policy.kind is not SupervisorPolicyKind.RULE:
+        raise TypeError("shadow の Baseline には RulePolicy を渡す")
+    return baseline_rule_policy.version
 
 
 def _shadow_ref_for(
-    identity: SupervisorPolicyIdentity, shadow_evidence: SupervisorShadowSummary
+    identity: SupervisorPolicyIdentity,
+    rule_policy_version: str,
+    shadow_evidence: SupervisorShadowSummary,
 ) -> str:
     if not isinstance(shadow_evidence, SupervisorShadowSummary):
         raise TypeError("shadow の証拠は SupervisorShadowSummary で渡す（文字列では照合できない）")
     if shadow_evidence.rl_policy_identity != identity:
         raise ValueError(
             "shadow 集計が比べた artifact がこの artifact と一致しない（model ID・版・bytes hash）"
+        )
+    if shadow_evidence.rule_policy_version != rule_policy_version:
+        raise ValueError(
+            "shadow 集計が比べた Rule policy の版が、いまの Baseline と一致しない"
+            f"（summary={shadow_evidence.rule_policy_version}; expected={rule_policy_version}）"
         )
     return shadow_evidence.evaluation_ref()
 
@@ -554,6 +579,7 @@ def promote_supervisor_policy(
     *,
     certified: CertifiedPolicyArtifact,
     shadow_evidence: SupervisorShadowSummary,
+    baseline_rule_policy: SupervisorPolicy,
     approval: HumanApproval,
     expected_revision: int,
 ) -> int:
@@ -565,9 +591,14 @@ def promote_supervisor_policy(
     - `ref` が supervisor policy で、照合済み artifact の model ID・版を名指す
     - registry に登録された bytes の hash が、照合済み artifact の canonical bytes の hash と
       一致する
-    - shadow 集計が**この artifact**を比べた `usable` な集計である
+    - shadow 集計が**この artifact**を、**`baseline_rule_policy`（いま運転の Baseline に使う
+      Rule policy）と同じ版**の Rule と比べた `usable` な集計である
+
+    Rule の版は文字列ではなく Rule policy そのものから取る（自由な文字列だと、集計に合わせた
+    版を渡せてしまう）。
     """
     identity = certified_identity(certified)
+    rule_policy_version = _rule_version_of(baseline_rule_policy)
     if ref.kind is not ArtifactKind.SUPERVISOR_POLICY or (ref.model_id, ref.version) != (
         identity.model_id,
         identity.version,
@@ -590,7 +621,7 @@ def promote_supervisor_policy(
     return registry.promote(
         ref,
         compatibility,
-        shadow_evaluation_ref=_shadow_ref_for(identity, shadow_evidence),
+        shadow_evaluation_ref=_shadow_ref_for(identity, rule_policy_version, shadow_evidence),
         approval=approval,
         expected_revision=expected_revision,
     )

@@ -330,6 +330,9 @@ shadow:   { minimum_ticks, minimum_paired_fraction }
     拒まれて Fallback へ落ちる）
   - 集計の `rl_policy_identity` が照合済み artifact の完全な識別（`certified_identity()`）と一致し、
     集計が `usable` である
+  - 集計の `rule_policy_version` が、昇格時に渡す**いま運転の Baseline に使う Rule policy**
+    （`baseline_rule_policy`。版は文字列ではなく policy そのものから取る）の版と一致する。
+    古い Rule と比べた集計を、いまの Rule を上回った証拠として記録させない
   - #104 の `promote()` を直接呼ぶ経路は残る（0062 の契約。§5 の Registry CLI と同じ残余）
 
 違う regime を前提にした提案どうしの比較は、**`SupervisorDecision` の段階で作れない**

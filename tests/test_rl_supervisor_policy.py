@@ -1163,16 +1163,22 @@ def test_shadow_evidence_is_bound_to_the_promoted_artifact(tmp_path: Path, train
     )
     certified = trainer.certify(report)
     identity = certified_identity(certified)
+    rule_policy = RulePolicy(settings.supervisor.rule_policy, SimulatedClock(0))
 
-    def usable_summary(rl_identity: SupervisorPolicyIdentity) -> SupervisorShadowSummary:
+    def usable_summary(
+        rl_identity: SupervisorPolicyIdentity, rule_version: str = rule_policy.version
+    ) -> SupervisorShadowSummary:
         config, _digest = rl_policy_config()
         ledger = SupervisorShadowLedger(
-            config.shadow, rule_policy_version="rule-test-v1", rl_identity=rl_identity
+            config.shadow, rule_policy_version=rule_version, rl_identity=rl_identity
         )
         for tick in range(4):
             ledger.observe(
                 paired_decision(
-                    tick_id=tick, rl_version=rl_identity.version, rl_identity=rl_identity
+                    tick_id=tick,
+                    rule_version=rule_version,
+                    rl_version=rl_identity.version,
+                    rl_identity=rl_identity,
                 )
             )
         summary = ledger.summary()
@@ -1181,6 +1187,8 @@ def test_shadow_evidence_is_bound_to_the_promoted_artifact(tmp_path: Path, train
 
     matching = usable_summary(identity)
     other = usable_summary(identity.model_copy(update={"artifact_sha256": "e" * 64}))
+    # 同じ artifact を、いまの Baseline とは別の版の Rule と比べた集計。
+    stale_rule = usable_summary(identity, rule_version=f"{rule_policy.version}-old")
 
     def registered(name: str, **metadata_overrides: Any) -> tuple[ModelRegistry, Any, Any]:
         artifact_bytes = canonical_policy_artifact_bytes(certified)
@@ -1218,6 +1226,7 @@ def test_shadow_evidence_is_bound_to_the_promoted_artifact(tmp_path: Path, train
             compatibility,
             certified=certified,
             shadow_evidence=evidence,
+            baseline_rule_policy=rule_policy,
             approval=HumanApproval(
                 action=ApprovalAction.PROMOTE,
                 artifact=metadata.ref,
@@ -1233,6 +1242,8 @@ def test_shadow_evidence_is_bound_to_the_promoted_artifact(tmp_path: Path, train
     registry, metadata, compatibility = registered("pr89-promote")
     with pytest.raises(ValueError, match="shadow 集計が比べた artifact"):
         promote(registry, metadata, compatibility, other)
+    with pytest.raises(ValueError, match="Rule policy の版が、いまの Baseline と一致しない"):
+        promote(registry, metadata, compatibility, stale_rule)
     promote(registry, metadata, compatibility, matching)
     promoted = registry.inspect().artifacts[metadata.ref.key]
     assert promoted.metadata.shadow_evaluation_ref == matching.evaluation_ref()
