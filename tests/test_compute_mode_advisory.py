@@ -336,6 +336,24 @@ def test_evidence_older_than_the_lookback_window_is_not_used(tmp_path, rules, ca
     assert advisory.reference_window_days == 30
 
 
+def test_a_bucket_straddling_the_lookback_cutoff_is_not_counted(tmp_path, rules, catalog):
+    """さかのぼりの境界をまたぐバケットは数えない（範囲内に丸ごと入るバケットだけ）。
+
+    境界が 00:04:59 のとき、00:00 のバケットの大半は範囲外。これを数えると、
+    範囲内に10分しか無い負荷が15分の実績になる。
+    """
+    advisor = ComputeModeAdvisor(_settings(tmp_path, catalog), catalog)
+    lookback_ms = BASE_SETTINGS["history"]["lookback_days"] * 24 * HOUR_MS
+    now_ms = NOW_MS + 5 * MINUTE_MS - 1_000
+    cutoff_bucket_ms = NOW_MS - lookback_ms  # 00:00 のバケット（境界は 00:04:59）
+    with _store(tmp_path, rules, now_ms=now_ms) as store:
+        _full_load(store, start_ms=cutoff_bucket_ms, duration_ms=15 * MINUTE_MS)
+        advisory = _evaluate(advisor, store, now_ms=now_ms)
+
+    assert advisory.reference is None
+    assert advisory.reference_count == 0
+
+
 # --- I-3 自己申告を根拠にしない ---------------------------------------------
 
 

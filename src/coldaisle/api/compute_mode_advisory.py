@@ -310,7 +310,9 @@ class ComputeModeAdvisor:
         # 完了したバケットだけを読む。進行中のバケットは5分ぶん観測していないのに
         # 5分として数えられ、終了時刻も未来になる（0063 §2.3）
         end_ms = now_ms // bucket_ms * bucket_ms
-        start_ms = max(0, (now_ms - self._settings.lookback_ms) // bucket_ms * bucket_ms)
+        # 範囲内に丸ごと入るバケットだけを読む（境界を切り上げる）。切り捨てると、
+        # 境界より最大1バケットぶん前の証拠が範囲内の負荷に足されて実績になる
+        start_ms = max(0, -(-(now_ms - self._settings.lookback_ms) // bucket_ms) * bucket_ms)
         limitations: list[str] = []
         if start_ms >= end_ms:
             return _History(None, 0, now_ms, ("history window is empty",))
