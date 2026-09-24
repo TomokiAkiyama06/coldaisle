@@ -301,6 +301,16 @@ shadow:   { minimum_ticks, minimum_paired_fraction }
     - すべての候補の識別子がこの設定で作れ、`table_sha256` が作り直した表の hash と一致し、
       候補数が設定から数えた数と一致する
     - 選ばれた候補の作り直した表が、artifact の表・`payload_sha256` と一致する
+  - **登録は照合済みの型だけを受け取る（慣習ではなく型で縛る）。** `certify()` は
+    `CertifiedPolicyArtifact` を返し、この型は `certify()` の外では作れない（構築 token。
+    同一プロセス内で token を持ち出す偽造は 0050 §3 と同じ残余リスク）。登録用の関数
+    `canonical_policy_artifact_bytes()` / `policy_registry_metadata()` は**この型だけ**を受け取り、
+    それ以外は `TypeError` で拒む。登録済み artifact の束縛時の照合は、登録の道ではないので
+    内部の関数（`_policy_artifact_bytes()` / `_derive_policy_registry_metadata()`）を使う
+  - **残余**: #104 の Registry とその CLI（`coldaisle-registry register`、0062）は bytes を解釈せず、
+    kind を問わず metadata と payload をそのまま受け取る。そこから照合していない policy
+    artifact を書く経路は残る。CLI 側で supervisor policy の登録に照合を要求するかは
+    0062（FINAL）の契約を広げる話なので、**所有者の判断**とする（§5）
 - 集計の digest は #104 の `shadow_evaluation_ref` にそのまま渡せる
 
 違う regime を前提にした提案どうしの比較は、**`SupervisorDecision` の段階で作れない**
@@ -479,3 +489,7 @@ Baseline の欄が `output_bounds` の外にあれば**丸めず拒む**。
   送った未決事項）。本記録も踏み込まない
 - `policy_family` を増やす条件。反実仮想 artifact が揃い、候補間の差を実際に測れるように
   なってから、どの state を足すかを新しい記録で決める
+- #104 の Registry CLI（`coldaisle-registry register`）で supervisor policy を登録するときに、
+  `certify()` を通したことを要求するか（§2.6 の残余）。0062（FINAL）の CLI 契約を広げるので、
+  所有者が決める。決めるまでは、照合済みの登録は `certify()` → `canonical_policy_artifact_bytes()`
+  / `policy_registry_metadata()` の道で行う

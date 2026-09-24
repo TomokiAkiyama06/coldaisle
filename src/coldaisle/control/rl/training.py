@@ -56,12 +56,14 @@ from coldaisle.control.schema import (
 from coldaisle.control.state import ControlStateSnapshot, TelemetryHealth
 from coldaisle.control.supervisor.artifact import (
     POLICY_FAMILY,
+    CertifiedPolicyArtifact,
     PolicySearchHyperparameters,
     PolicyTrainingEvidence,
     RegimeActionEntry,
     RegimeTablePayload,
     SupervisorPolicyArtifact,
     SupervisorPolicyManifest,
+    _issue_certified_policy_artifact,
     action_space_sha256,
 )
 from coldaisle.control.supervisor.policy import SupervisorInput, SupervisorPolicy
@@ -876,7 +878,7 @@ class SupervisorPolicyTrainer:
         """
         return regenerate_candidate_table(self.baseline_table(), self._action_pool(), candidate_id)
 
-    def certify(self, report: SupervisorPolicyTrainingReport) -> SupervisorPolicyArtifact:
+    def certify(self, report: SupervisorPolicyTrainingReport) -> CertifiedPolicyArtifact:
         """報告の artifact を、**この設定から作り直した表**と照合して返す（登録の前に通す）。
 
         報告は JSON として書き換えられるので、報告の中の値どうしが揃っているだけでは、
@@ -936,7 +938,13 @@ class SupervisorPolicyTrainer:
                     raise SupervisorPolicyTrainingError(
                         "artifact の payload_sha256 が作り直した表の hash と一致しない"
                     )
-        return report.artifact
+        # **登録の道はこの型だけを受け取る。** 照合を通していない artifact は登録できない。
+        return _issue_certified_policy_artifact(
+            report.artifact,
+            rl_policy_config_sha256=self._config_sha256,
+            rl_training_config_sha256=self._environment.config_sha256,
+            action_space_sha256=action_space_sha256(self._bounds),
+        )
 
     def _projected_candidate_count(self, baseline: RegimeTablePayload) -> int:
         """候補表の数を**作らずに**数える。

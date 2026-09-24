@@ -98,8 +98,10 @@ from coldaisle.control.supervisor import (
     SupervisorShadowLedger,
     SupervisorShadowUsageError,
     action_space_sha256,
-    canonical_policy_artifact_bytes,
-    policy_registry_metadata,
+)
+from coldaisle.control.supervisor.artifact import (
+    _derive_policy_registry_metadata,
+    _policy_artifact_bytes,
 )
 from coldaisle.control.supervisor.policy_config import (
     BASELINE_CANDIDATE_ID,
@@ -245,8 +247,11 @@ def register_policy(
 
     試験が自分で証拠を組み立てないようにする。
     """
-    artifact_bytes = payload or canonical_policy_artifact_bytes(policy_artifact)
-    derived = policy_registry_metadata(policy_artifact, artifact_bytes)
+    # **Registry へ直接書く経路を模す。** #104 の Registry は bytes を解釈しないので、照合を
+    # 通していない artifact も書けてしまう（決定記録 0061 §2.6 の残余リスク）。束縛の試験は、
+    # その書き込みを束縛側が正しく扱うかを見るので、登録用の公開関数を迂回する。
+    artifact_bytes = payload or _policy_artifact_bytes(policy_artifact)
+    derived = _derive_policy_registry_metadata(policy_artifact, artifact_bytes)
     metadata = ArtifactMetadata(
         kind=kind,
         artifact_format=ArtifactFormat.JSON,
@@ -994,7 +999,7 @@ def test_certify_regenerates_the_selected_table_from_the_config(trained: Any) ->
     specs = (episode_spec(episode_id="pr89-a", seed=3),)
     report = trainer.train(specs, model_version="0.1.0", created_at=CREATED_AT)
     # 本物の報告は通り、作り直した表は artifact の表と同じ。
-    assert trainer.certify(report) == report.artifact
+    assert trainer.certify(report).artifact == report.artifact
     assert trainer.regenerate_candidate_table(report.selected_candidate_id) == (
         report.artifact.payload
     )
@@ -1045,6 +1050,44 @@ def test_certify_regenerates_the_selected_table_from_the_config(trained: Any) ->
     )
     with pytest.raises(SupervisorPolicyTrainingError, match="rl_policy_config_sha256"):
         other.certify(report)
+
+
+def test_registration_accepts_only_a_certified_artifact(trained: Any) -> None:
+    """**登録の道は `certify()` を通した型だけを受け取る**（慣習ではなく型で縛る）。"""
+    from coldaisle.control.supervisor import (
+        CertifiedPolicyArtifact,
+        canonical_policy_artifact_bytes,
+        policy_registry_metadata,
+    )
+
+    environment, _config, settings, _safety = build_environment(trained, with_mpc=False)
+    trainer = trainer_for(environment, settings)
+    report = trainer.train(
+        (episode_spec(episode_id="pr89-a", seed=3),), model_version="0.1.0", created_at=CREATED_AT
+    )
+
+    # 照合を通していない artifact は登録用の関数に渡せない。
+    with pytest.raises(TypeError, match="certify"):
+        canonical_policy_artifact_bytes(report.artifact)  # type: ignore[arg-type]
+    with pytest.raises(TypeError, match="certify"):
+        policy_registry_metadata(report.artifact, b"{}")  # type: ignore[arg-type]
+    # 照合済みの型は certify() の外では作れない。
+    with pytest.raises(TypeError, match="certify"):
+        CertifiedPolicyArtifact(
+            report.artifact,
+            rl_policy_config_sha256=report.artifact.manifest.rl_policy_config_sha256,
+            rl_training_config_sha256=report.artifact.manifest.rl_training_config_sha256,
+            action_space_sha256=report.artifact.manifest.action_space_sha256,
+        )
+
+    # 本物の流れ: certify → bytes / metadata。
+    certified = trainer.certify(report)
+    artifact_bytes = canonical_policy_artifact_bytes(certified)
+    metadata = policy_registry_metadata(certified, artifact_bytes)
+    assert metadata.sha256 == sha256(artifact_bytes).hexdigest()
+    assert metadata.source_runs == report.artifact.manifest.training_episode_ids
+    with pytest.raises(AttributeError):
+        certified._artifact = report.artifact  # type: ignore[misc]
 
 
 def test_supervisor_decision_v2_carries_identity_and_v1_still_reads() -> None:

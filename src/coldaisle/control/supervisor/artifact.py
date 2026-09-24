@@ -341,20 +341,142 @@ def action_space_sha256(bounds: SupervisorOutputBounds) -> str:
     return canonical_sha256(bounds)
 
 
-def canonical_policy_artifact_bytes(artifact: SupervisorPolicyArtifact) -> bytes:
-    """#104 へ保存する canonical JSON bytes を返す。"""
+_CERTIFICATION_TOKEN = object()
+
+
+class CertifiedPolicyArtifact:
+    """**設定から作り直して照合した** policy artifact（`SupervisorPolicyTrainer.certify()`）。
+
+    登録用の関数（`canonical_policy_artifact_bytes` / `policy_registry_metadata`）は
+    **この型だけ**を受け取る。学習報告は JSON として書き換えられるので、報告の中の値だけで
+    照合した artifact を登録させない（決定記録 0061 §2.6）。
+
+    `__init__` は構築用の token が無ければ拒む。手で token を持ち出す偽造は同一プロセス内では
+    可能で、0050 §3 と同じ残余リスクである。狙いは配線の誤りを型で止めることである。
+    """
+
+    __slots__ = (
+        "_action_space_sha256",
+        "_artifact",
+        "_rl_policy_config_sha256",
+        "_rl_training_config_sha256",
+    )
+    _artifact: SupervisorPolicyArtifact
+    _rl_policy_config_sha256: str
+    _rl_training_config_sha256: str
+    _action_space_sha256: str
+
+    def __init__(
+        self,
+        artifact: SupervisorPolicyArtifact,
+        *,
+        rl_policy_config_sha256: str,
+        rl_training_config_sha256: str,
+        action_space_sha256: str,
+        _token: object | None = None,
+    ) -> None:
+        """`SupervisorPolicyTrainer.certify()` からだけ作る。"""
+        if _token is not _CERTIFICATION_TOKEN:
+            raise TypeError(
+                "CertifiedPolicyArtifact は SupervisorPolicyTrainer.certify() からだけ作る"
+            )
+        manifest = artifact.manifest
+        if (
+            manifest.rl_policy_config_sha256,
+            manifest.rl_training_config_sha256,
+            manifest.action_space_sha256,
+        ) != (rl_policy_config_sha256, rl_training_config_sha256, action_space_sha256):
+            raise ValueError("認証に使った設定の hash が artifact の manifest と一致しない")
+        object.__setattr__(self, "_artifact", artifact)
+        object.__setattr__(self, "_rl_policy_config_sha256", rl_policy_config_sha256)
+        object.__setattr__(self, "_rl_training_config_sha256", rl_training_config_sha256)
+        object.__setattr__(self, "_action_space_sha256", action_space_sha256)
+
+    def __setattr__(self, name: str, value: object) -> None:
+        raise AttributeError("CertifiedPolicyArtifact は不変")
+
+    @property
+    def artifact(self) -> SupervisorPolicyArtifact:
+        """照合済みの artifact。"""
+        return self._artifact
+
+    @property
+    def rl_policy_config_sha256(self) -> str:
+        """照合に使った `rl-policy.yaml` の hash。"""
+        return self._rl_policy_config_sha256
+
+    @property
+    def rl_training_config_sha256(self) -> str:
+        """照合に使った `rl-training.yaml` の hash。"""
+        return self._rl_training_config_sha256
+
+    @property
+    def action_space_sha256(self) -> str:
+        """照合に使った `supervisor.output_bounds` の hash。"""
+        return self._action_space_sha256
+
+
+def _issue_certified_policy_artifact(
+    artifact: SupervisorPolicyArtifact,
+    *,
+    rl_policy_config_sha256: str,
+    rl_training_config_sha256: str,
+    action_space_sha256: str,
+) -> CertifiedPolicyArtifact:
+    """`SupervisorPolicyTrainer.certify()` 専用の発行口。**ほかから呼ばない。**"""
+    return CertifiedPolicyArtifact(
+        artifact,
+        rl_policy_config_sha256=rl_policy_config_sha256,
+        rl_training_config_sha256=rl_training_config_sha256,
+        action_space_sha256=action_space_sha256,
+        _token=_CERTIFICATION_TOKEN,
+    )
+
+
+def _require_certified(certified: object) -> SupervisorPolicyArtifact:
+    if not isinstance(certified, CertifiedPolicyArtifact):
+        # **照合していない artifact を登録の道へ入れない。**
+        raise TypeError(
+            "登録には SupervisorPolicyTrainer.certify() を通した CertifiedPolicyArtifact を渡す"
+        )
+    return certified.artifact
+
+
+def canonical_policy_artifact_bytes(certified: CertifiedPolicyArtifact) -> bytes:
+    """#104 へ保存する canonical JSON bytes を返す。**照合済みの artifact だけ。**"""
+    return _policy_artifact_bytes(_require_certified(certified))
+
+
+def policy_registry_metadata(
+    certified: CertifiedPolicyArtifact,
+    artifact_bytes: bytes,
+    *,
+    offline_evaluation_ref: str | None = None,
+    shadow_evaluation_ref: str | None = None,
+) -> SupervisorPolicyRegistryMetadata:
+    """#104 登録用 metadata を作る。**照合済みの artifact だけ。**"""
+    return _derive_policy_registry_metadata(
+        _require_certified(certified),
+        artifact_bytes,
+        offline_evaluation_ref=offline_evaluation_ref,
+        shadow_evaluation_ref=shadow_evaluation_ref,
+    )
+
+
+def _policy_artifact_bytes(artifact: SupervisorPolicyArtifact) -> bytes:
+    """canonical JSON bytes（登録済み artifact の**検証**にも使う。登録の道ではない）。"""
     validated = SupervisorPolicyArtifact.model_validate(artifact.model_dump(mode="python"))
     return canonical_json_bytes(validated)
 
 
-def policy_registry_metadata(
+def _derive_policy_registry_metadata(
     artifact: SupervisorPolicyArtifact,
     artifact_bytes: bytes,
     *,
     offline_evaluation_ref: str | None = None,
     shadow_evaluation_ref: str | None = None,
 ) -> SupervisorPolicyRegistryMetadata:
-    """**渡された bytes そのもの**から #104 登録用 metadata を作る。
+    """**渡された bytes そのもの**から metadata を導く（束縛時の照合にも使う）。
 
     bytes と artifact が食い違っていれば作らない。食い違いを許すと、登録される bytes と
     metadata が別物になり、attestation が別の内容を名指すことになる。
@@ -364,7 +486,7 @@ def policy_registry_metadata(
     parsed = SupervisorPolicyArtifact.model_validate_json(artifact_bytes)
     if parsed != artifact:
         raise ValueError("Registry へ渡す bytes が指定 artifact と一致しない")
-    if artifact_bytes != canonical_policy_artifact_bytes(parsed):
+    if artifact_bytes != _policy_artifact_bytes(parsed):
         raise ValueError("Registry へ渡す artifact は canonical JSON bytes に限定する")
     manifest = parsed.manifest
     evidence = manifest.training_evidence

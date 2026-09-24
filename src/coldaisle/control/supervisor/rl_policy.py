@@ -58,9 +58,9 @@ from coldaisle.control.supervisor.artifact import (
     MAX_POLICY_ARTIFACT_BYTES,
     SupervisorPolicyArtifact,
     SupervisorPolicyRegistryMetadata,
+    _derive_policy_registry_metadata,
+    _policy_artifact_bytes,
     action_space_sha256,
-    canonical_policy_artifact_bytes,
-    policy_registry_metadata,
 )
 from coldaisle.control.supervisor.policy import (
     ReceivedSupervisorOutput,
@@ -319,12 +319,12 @@ class SupervisorPolicyBinding:
             artifact = SupervisorPolicyArtifact.model_validate_json(payload)
         except ValueError as error:
             raise SupervisorPolicyUnusableError(f"policy artifact を読めない: {error}") from error
-        if payload != canonical_policy_artifact_bytes(artifact):
+        if payload != _policy_artifact_bytes(artifact):
             raise SupervisorPolicyUnusableError(
                 "policy artifact は canonical JSON bytes に限定する"
             )
         try:
-            derived = policy_registry_metadata(artifact, payload)
+            derived = _derive_policy_registry_metadata(artifact, payload)
         except ValueError as error:  # pragma: no cover - 上の canonical 判定で先に落ちる
             raise SupervisorPolicyUnusableError(str(error)) from error
         stored = verified.metadata
@@ -493,9 +493,7 @@ class RegimeTableRlPolicy:
         return SupervisorPolicyIdentity(
             model_id=manifest.model_id,
             version=manifest.model_version,
-            artifact_sha256=hashlib.sha256(
-                canonical_policy_artifact_bytes(self._artifact)
-            ).hexdigest(),
+            artifact_sha256=hashlib.sha256(_policy_artifact_bytes(self._artifact)).hexdigest(),
         )
 
     @property
