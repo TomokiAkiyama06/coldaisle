@@ -317,13 +317,20 @@ shadow:   { minimum_ticks, minimum_paired_fraction }
   合わせた集計を受け取らない
 - 集計の digest は #104 の `shadow_evaluation_ref` にそのまま渡せる。ただし **`usable` でない集計は
   参照を出さない**（`evaluation_ref()` が拒む。#104 の `promote()` は参照が空でないことしか見ない）
-- **shadow の証拠は、比べた artifact に束縛する。** 登録用の `policy_registry_metadata()` は
-  shadow の証拠を文字列ではなく `SupervisorShadowSummary` で受け取り、集計の
-  `rl_policy_identity` が照合済み artifact の完全な識別（`certified_identity()`）と一致しなければ
-  拒む。昇格には policy 専用の入口 `promote_supervisor_policy()` を使い、`ref` と registry 上の
-  bytes hash が照合済み artifact と一致することと、集計がその artifact を比べた `usable` な集計で
-  あることを確かめてから `ModelRegistry.promote()` へ渡す。#104 の `promote()` を直接呼ぶ経路は
-  残る（0062 の契約。§5 の Registry CLI と同じ残余）
+- **shadow の証拠は、比べた artifact に束縛する。** 候補登録用の `policy_registry_metadata()` は
+  評価の参照（`offline_evaluation_ref` / `shadow_evaluation_ref`）を**書かない**（#104 はそれぞれ
+  `mark_validated` / `promote` の記録があるときだけ許すので、登録時に書くと
+  `register_candidate` が拒む）。shadow の証拠は `SupervisorShadowSummary` で受け取り、昇格の
+  policy 専用の入口 `promote_supervisor_policy()` だけが照合してから `ModelRegistry.promote()` へ
+  渡す。確かめるのは次のとおり
+  - `ref` が照合済み artifact の model ID・版を名指し、registry 上の bytes hash が一致する
+  - registry の記録の **artifact が決める metadata の欄がすべて**、照合済み artifact から導いた
+    値と一致する（束縛時の照合と同じ関数 `registry_metadata_mismatches()` を使う。checksum
+    だけ見て昇格すると、metadata だけ書き換えた記録が production になり、運転時の束縛で
+    拒まれて Fallback へ落ちる）
+  - 集計の `rl_policy_identity` が照合済み artifact の完全な識別（`certified_identity()`）と一致し、
+    集計が `usable` である
+  - #104 の `promote()` を直接呼ぶ経路は残る（0062 の契約。§5 の Registry CLI と同じ残余）
 
 違う regime を前提にした提案どうしの比較は、**`SupervisorDecision` の段階で作れない**
 （同じ tick の active / shadow は同じ regime を使う。#88）。台帳側で読み替えもしない。

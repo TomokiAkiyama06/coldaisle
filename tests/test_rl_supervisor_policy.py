@@ -1143,13 +1143,16 @@ def test_summary_counts_are_never_negative() -> None:
 def test_shadow_evidence_is_bound_to_the_promoted_artifact(tmp_path: Path, trained: Any) -> None:
     """**別の artifact の shadow 集計を、この artifact の昇格の証拠にしない。**
 
-    shadow の証拠は文字列ではなく集計で受け取り、集計の `rl_policy_identity` が
-    照合済み artifact の完全な識別と一致しなければ、metadata にも昇格にも使わない。
+    候補登録の metadata は評価の参照を持たず（#104 は lifecycle の記録があるときだけ許す）、
+    本物の `policy_registry_metadata_json_bytes()` → `register_candidate()` の道で登録できる。
+    shadow の証拠は `promote_supervisor_policy()` だけが、集計の `rl_policy_identity` と
+    照合済み artifact の完全な識別を照合してから渡す。
     """
     from coldaisle.control.supervisor import (
         canonical_policy_artifact_bytes,
         certified_identity,
         policy_registry_metadata,
+        policy_registry_metadata_json_bytes,
         promote_supervisor_policy,
     )
 
@@ -1179,75 +1182,68 @@ def test_shadow_evidence_is_bound_to_the_promoted_artifact(tmp_path: Path, train
     matching = usable_summary(identity)
     other = usable_summary(identity.model_copy(update={"artifact_sha256": "e" * 64}))
 
-    artifact_bytes = canonical_policy_artifact_bytes(certified)
-    with pytest.raises(ValueError, match="shadow 集計が比べた artifact"):
-        policy_registry_metadata(certified, artifact_bytes, shadow_evidence=other)
-    derived = policy_registry_metadata(certified, artifact_bytes, shadow_evidence=matching)
-    assert derived.shadow_evaluation_ref == matching.evaluation_ref()
+    def registered(name: str, **metadata_overrides: Any) -> tuple[ModelRegistry, Any, Any]:
+        artifact_bytes = canonical_policy_artifact_bytes(certified)
+        derived = policy_registry_metadata(certified, artifact_bytes)
+        assert derived.offline_evaluation_ref is None and derived.shadow_evaluation_ref is None
+        metadata = ArtifactMetadata.model_validate_json(
+            policy_registry_metadata_json_bytes(derived)
+        )
+        if metadata_overrides:
+            # **bytes はそのまま、metadata だけ書き換える。** checksum は合うので登録は通る。
+            metadata = ArtifactMetadata.model_validate(
+                metadata.model_dump(mode="python") | metadata_overrides
+            )
+        registry = ModelRegistry(tmp_path / name, limits=REGISTRY_LIMITS)
+        registry.register_candidate(metadata, artifact_bytes, actor="trainer", reason="certified")
+        registry.mark_validated(
+            metadata.ref,
+            offline_evaluation_ref="evaluation/offline/89",
+            actor="evaluator",
+            reason="offline gates passed",
+            expected_revision=registry.inspect().revision,
+        )
+        compatibility = ModelCompatibility(
+            feature_schema_version=derived.feature_schema_version,
+            target_schema_version=derived.target_schema_version,
+            authority_stage=AuthorityStage.SHADOW,
+        )
+        return registry, metadata, compatibility
 
-    # 本物の Registry へ登録し、policy 専用の入口から昇格する。
-    registry = ModelRegistry(tmp_path / "pr89-promote", limits=REGISTRY_LIMITS)
-    metadata = ArtifactMetadata(
-        kind=ArtifactKind.SUPERVISOR_POLICY,
-        artifact_format=ArtifactFormat.JSON,
-        capability=ArtifactCapability.SUPERVISOR_STRATEGY,
-        model_id=derived.model_id,
-        version=derived.version,
-        created_at=derived.created_at,
-        training_dataset_version=derived.training_dataset_version,
-        source_runs=derived.source_runs,
-        feature_schema_version=derived.feature_schema_version,
-        target_schema_version=derived.target_schema_version,
-        code_commit=derived.code_commit,
-        sha256=derived.sha256,
-        model_family=derived.model_family,
-        hyperparameters=derived.hyperparameters,
-        authority_compatibility=derived.authority_compatibility,
-    )
-    registry.register_candidate(metadata, artifact_bytes, actor="trainer", reason="certified")
-    registry.mark_validated(
-        metadata.ref,
-        offline_evaluation_ref="evaluation/offline/89",
-        actor="evaluator",
-        reason="offline gates passed",
-        expected_revision=registry.inspect().revision,
-    )
-    compatibility = ModelCompatibility(
-        feature_schema_version=derived.feature_schema_version,
-        target_schema_version=derived.target_schema_version,
-        authority_stage=AuthorityStage.SHADOW,
-    )
-    revision = registry.inspect().revision
-    approval = HumanApproval(
-        action=ApprovalAction.PROMOTE,
-        artifact=metadata.ref,
-        artifact_sha256=metadata.sha256,
-        expected_revision=revision,
-        approver="model-operator",
-        approved_at_ms=1_700_000_000_000,
-        reason="shadow evaluation passed",
-    )
-    with pytest.raises(ValueError, match="shadow 集計が比べた artifact"):
-        promote_supervisor_policy(
+    def promote(registry: ModelRegistry, metadata: Any, compatibility: Any, evidence: Any) -> int:
+        revision = registry.inspect().revision
+        return promote_supervisor_policy(
             registry,
             metadata.ref,
             compatibility,
             certified=certified,
-            shadow_evidence=other,
-            approval=approval,
+            shadow_evidence=evidence,
+            approval=HumanApproval(
+                action=ApprovalAction.PROMOTE,
+                artifact=metadata.ref,
+                artifact_sha256=metadata.sha256,
+                expected_revision=revision,
+                approver="model-operator",
+                approved_at_ms=1_700_000_000_000,
+                reason="shadow evaluation passed",
+            ),
             expected_revision=revision,
         )
-    promote_supervisor_policy(
-        registry,
-        metadata.ref,
-        compatibility,
-        certified=certified,
-        shadow_evidence=matching,
-        approval=approval,
-        expected_revision=revision,
-    )
+
+    registry, metadata, compatibility = registered("pr89-promote")
+    with pytest.raises(ValueError, match="shadow 集計が比べた artifact"):
+        promote(registry, metadata, compatibility, other)
+    promote(registry, metadata, compatibility, matching)
     promoted = registry.inspect().artifacts[metadata.ref.key]
     assert promoted.metadata.shadow_evaluation_ref == matching.evaluation_ref()
+
+    # 同じ bytes・同じ checksum のまま、artifact が決める metadata だけを書き換えた記録は
+    # 昇格しない（束縛と同じ照合。昇格させると運転時の束縛で拒まれて Fallback へ落ちる）。
+    tampered_registry, tampered, tampered_compatibility = registered(
+        "pr89-promote-tampered", source_runs=("ep-z",)
+    )
+    with pytest.raises(ValueError, match="metadata が照合済みの artifact と一致しない"):
+        promote(tampered_registry, tampered, tampered_compatibility, matching)
 
 
 def test_supervisor_decision_v2_carries_identity_and_v1_still_reads() -> None:

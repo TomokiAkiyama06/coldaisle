@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import hashlib
 from datetime import datetime
+from enum import StrEnum
 from typing import Annotated, Literal, Self
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -339,6 +340,51 @@ class SupervisorPolicyRegistryMetadata(_Frozen):
         return self
 
 
+ARTIFACT_DETERMINED_METADATA_EXCLUSIONS: frozenset[str] = frozenset(
+    {"offline_evaluation_ref", "shadow_evaluation_ref"}
+)
+"""artifact が決めない Registry metadata の欄。
+
+この2つは lifecycle の途中で Registry 側が書き込む参照（#104 の `mark_validated` /
+`promote`）で、artifact bytes からは導けない。**これ以外はすべて artifact が決める**ので、
+束縛時にも昇格前にも1つ残らず照合する。
+"""
+
+
+def _comparable(value: object) -> object:
+    """列挙と列を、由来の違う表現どうしで比べられる形へ落とす。"""
+    if isinstance(value, StrEnum):
+        return value.value
+    if isinstance(value, list | tuple):
+        return tuple(_comparable(item) for item in value)
+    if isinstance(value, dict):
+        return {key: _comparable(item) for key, item in sorted(value.items())}
+    return value
+
+
+def registry_metadata_mismatches(
+    derived: SupervisorPolicyRegistryMetadata, stored: BaseModel
+) -> list[str]:
+    """artifact から導いた metadata と Registry が持つ metadata の食い違いを列挙する。
+
+    **欄を手で並べない。** 並べると、あとから足した欄が照合から漏れる。
+    `SupervisorPolicyRegistryMetadata` の欄をすべて回り、artifact が決めないものだけを
+    名前で除く（`ARTIFACT_DETERMINED_METADATA_EXCLUSIONS`）。束縛と昇格の入口が同じ関数を使う。
+    """
+    missing = object()
+    mismatches: list[str] = []
+    for name in SupervisorPolicyRegistryMetadata.model_fields:
+        if name in ARTIFACT_DETERMINED_METADATA_EXCLUSIONS:
+            continue
+        actual = getattr(stored, name, missing)
+        if actual is missing:
+            mismatches.append(name)
+            continue
+        if _comparable(getattr(derived, name)) != _comparable(actual):
+            mismatches.append(name)
+    return mismatches
+
+
 def action_space_sha256(bounds: SupervisorOutputBounds) -> str:
     """`supervisor.output_bounds` そのものの SHA-256。
 
@@ -455,29 +501,16 @@ def canonical_policy_artifact_bytes(certified: CertifiedPolicyArtifact) -> bytes
 
 
 def policy_registry_metadata(
-    certified: CertifiedPolicyArtifact,
-    artifact_bytes: bytes,
-    *,
-    offline_evaluation_ref: str | None = None,
-    shadow_evidence: SupervisorShadowSummary | None = None,
+    certified: CertifiedPolicyArtifact, artifact_bytes: bytes
 ) -> SupervisorPolicyRegistryMetadata:
-    """#104 登録用 metadata を作る。**照合済みの artifact だけ。**
+    """#104 の**候補登録**用 metadata を作る。**照合済みの artifact だけ。**
 
-    shadow の証拠は文字列ではなく**集計そのもの**で受け取り、その集計が**この artifact**を
-    比べたものであることを確かめてから参照を書く（`shadow_evidence_ref()`）。
+    評価の参照（`offline_evaluation_ref` / `shadow_evaluation_ref`）は書かない。#104 は
+    それぞれ `mark_validated` / `promote` の記録があるときだけこの欄を許すので、登録の時点で
+    書くと `register_candidate` が拒む。shadow の証拠は `promote_supervisor_policy()` だけが
+    照合してから渡す。
     """
-    artifact = _require_certified(certified)
-    shadow_ref = (
-        None
-        if shadow_evidence is None
-        else _shadow_ref_for(certified_identity(certified), shadow_evidence)
-    )
-    return _derive_policy_registry_metadata(
-        artifact,
-        artifact_bytes,
-        offline_evaluation_ref=offline_evaluation_ref,
-        shadow_evaluation_ref=shadow_ref,
-    )
+    return _derive_policy_registry_metadata(_require_certified(certified), artifact_bytes)
 
 
 def certified_identity(certified: CertifiedPolicyArtifact) -> SupervisorPolicyIdentity:
@@ -546,6 +579,14 @@ def promote_supervisor_policy(
     record = snapshot.artifacts.get(ref.key)
     if record is None or record.metadata.sha256 != identity.artifact_sha256:
         raise ValueError("registry に登録された bytes が照合済みの artifact と一致しない")
+    artifact = _require_certified(certified)
+    derived = _derive_policy_registry_metadata(artifact, _policy_artifact_bytes(artifact))
+    mismatches = registry_metadata_mismatches(derived, record.metadata)
+    if mismatches:
+        # **束縛（`SupervisorPolicyBinding`）と同じ照合を昇格の前にも行う。** checksum だけ見て
+        # 昇格すると、metadata だけ書き換えた記録が production になり、運転時の束縛で拒まれて
+        # Fallback へ落ちる。
+        raise ValueError(f"registry の metadata が照合済みの artifact と一致しない: {mismatches}")
     return registry.promote(
         ref,
         compatibility,
@@ -562,11 +603,7 @@ def _policy_artifact_bytes(artifact: SupervisorPolicyArtifact) -> bytes:
 
 
 def _derive_policy_registry_metadata(
-    artifact: SupervisorPolicyArtifact,
-    artifact_bytes: bytes,
-    *,
-    offline_evaluation_ref: str | None = None,
-    shadow_evaluation_ref: str | None = None,
+    artifact: SupervisorPolicyArtifact, artifact_bytes: bytes
 ) -> SupervisorPolicyRegistryMetadata:
     """**渡された bytes そのもの**から metadata を導く（束縛時の照合にも使う）。
 
@@ -600,8 +637,6 @@ def _derive_policy_registry_metadata(
             "learned_controller_available": evidence.learned_controller_available,
             "counterfactual_backed": evidence.counterfactual_backed,
         },
-        offline_evaluation_ref=offline_evaluation_ref,
-        shadow_evaluation_ref=shadow_evaluation_ref,
         authority_compatibility=manifest.authority_compatibility,
     )
 
