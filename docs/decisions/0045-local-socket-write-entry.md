@@ -3,6 +3,7 @@
 - **種別**: Decision Record
 - **Status**: FINAL（2026-09-18、リポジトリ所有者が承認）
 - **Date**: 2026-09-18
+- **Superseded by**: [0067](0067-acoustic-measurement-study.md)（§2.4 のメッセージの表のうち、`type` 行の受理する種類の列挙と、フィールドの表が種類によらず1つである前提のみ。`noise_feedback` とそのフィールドを加える。`extra = forbid`・strict・他の節は有効）
 - **Supersedes**: [0002](0002-metric-naming.md) §2.6「用語の区別」の GPU Mode 行のうち
   「coldaisle が知る必要: なし」と、[0006](0006-gpu-mode-and-mixed-state.md) §2.1 の
   「coldaisle のデータモデルには現れない」の一文のみ（§2.8）。両記録の他の節は有効

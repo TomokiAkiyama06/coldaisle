@@ -348,8 +348,8 @@ coldaisle が NVML / lm-sensors も収集し、`GET /api/v1/server-health` を�
 | FR-305 | `GET /api/v1/health` | デーモン稼働・最終受信時刻・ソース種別 |
 | FR-306 | `WS  /api/v1/stream` | 新サンプルをpush |
 | FR-308 | `GET /api/v1/server-health` | **Workspace GPUパネル向けの統合ビュー**。signal / summary / gpu / environment / alerts / sources / compute_mode_advisory（スキーマは `docs/api-contract.md`） |
-| FR-309 | `GET /api/v1/events?from=&to=&window=&kind=&limit=` | 記録された事象（GPU Mode の切り替え）の一覧。タイムライン注釈用（読み取り専用。スキーマは `docs/api-contract.md`） |
-| FR-310 | Unix ソケット `coldaisle-eventd`（HTTP ではない） | **GPU Mode イベントの唯一の書き込み経路**。Workspace の GPU Manager が Mode 変更を通知するためだけに存在する。読み取り API とは別プロセスの書き込み専用入口で、ファイル権限と `SO_PEERCRED` で接続相手を限定し、`events` 表へ追記するだけ（決定記録 [0045](decisions/0045-local-socket-write-entry.md)） |
+| FR-309 | `GET /api/v1/events?from=&to=&window=&kind=&limit=` | 記録された事象（GPU Mode の切り替え・Workload Hint の申告）の一覧。タイムライン注釈用（読み取り専用。スキーマは `docs/api-contract.md`）。Workload Hint は申告であって実測ではない（決定記録 [0064](decisions/0064-workload-hint-entry-and-supervisor-prior.md)） |
+| FR-310 | Unix ソケット `coldaisle-eventd`（HTTP ではない） | **GPU Mode イベントと Workload Hint の唯一の書き込み経路**。Workspace の GPU Manager が Mode 変更を、学習ジョブ等の起動側が負荷のヒントを通知するために存在する。読み取り API とは別プロセスの書き込み専用入口で、ファイル権限と `SO_PEERCRED` で接続相手を限定し、`events` 表へ追記するだけ（決定記録 [0045](decisions/0045-local-socket-write-entry.md)）。Workload Hint は `system_state` に映さず、現時点（Stage A）では記録のみで制御は読まない（決定記録 [0064](decisions/0064-workload-hint-entry-and-supervisor-prior.md) §2.4 / §2.10） |
 | FR-307 | HTTP API の全エンドポイントは **読み取り専用**（例外なし）。書き込みは FR-310 の Unix ソケットだけが受ける |
 
 ### 6.4 FR-4xx: ルールエンジン
@@ -616,7 +616,7 @@ Kaggle・研究でGPUを使う際は `--gpu-memory-utilization` による制限�
 | Q-23 | Confidence / OOD の方式、Authority 昇格ゲートの閾値 | 方式は決定記録 0050（FINAL、2026-09-20 所有者承認）で決定。**閾値の値**は GitHub #85 / #90 / #91、**stage の昇格**は #92 で未決 |
 | Q-24 | Air Balance の最適な帯 | GitHub #81 |
 | Q-25 | 本番でオンライン学習を行うか | GitHub #93 / #104 |
-| Q-26 | 音響センサーのハードウェア | GitHub #95 |
+| Q-26 | 音響センサーのハードウェア | 導入しない。騒音は「うるさいか」の回答で測る（決定記録 0067、Proposed。手順は `docs/acoustic-measurement.md`） |
 | Q-27 | Workload Hint を実装する時期 | GitHub #107 |
 | Q-28 | Airflow 可視化 UI の置き場所（coldaisle / Workspace） | GitHub #106 |
 
