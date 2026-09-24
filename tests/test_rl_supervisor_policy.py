@@ -50,6 +50,7 @@ from coldaisle.control.rl.episode import TerminationReason
 from coldaisle.control.rl.training import (
     SupervisorPolicyTrainer,
     SupervisorPolicyTrainingError,
+    SupervisorPolicyTrainingReport,
     candidate_rejection,
     common_matched_steps,
     mean_reward_over,
@@ -112,6 +113,7 @@ from coldaisle.control.supervisor.regime import (
     WorkloadRegimeEstimate,
 )
 from coldaisle.control.supervisor.rl_policy import ARTIFACT_DETERMINED_METADATA_EXCLUSIONS
+from coldaisle.control.supervisor.shadow import SupervisorShadowSummary, shadow_summary_usable
 from test_learned_mpc import REGISTRY_LIMITS, mpc_policy
 from test_rl_training_environment import build_environment, episode_spec
 from test_rl_training_environment import trained as _trained_fixture
@@ -819,12 +821,19 @@ def test_invariant_13_c_both_unavailable_keeps_the_rl_failure() -> None:
 def test_invariant_13_d_an_unpaired_ledger_is_never_usable() -> None:
     """**対が1つも無い集計を読めたことにしない**（fail closed）。
 
-    設定は `minimum_ticks` に 0 を許さない。設定を迂回して 0 の下限を渡されても、
-    台帳は対が 0 の集計を `usable` にしない。
+    設定も集計の型も `minimum_ticks` に 0 を許さない。判定の関数そのものも、
+    下限の値によらず対が 0 の集計を読めるとは言わない。
     """
     with pytest.raises(ValidationError, match="minimum_ticks"):
         rl_policy_config(shadow={"minimum_ticks": provisional(0)})
+    assert (
+        shadow_summary_usable(
+            observed_ticks=1, paired_ticks=0, minimum_ticks=0, minimum_paired_fraction=0.0
+        )
+        is False
+    )
 
+    # 設定を迂回して 0 の下限を渡しても、集計の型が受け取らない（読めたことにはならない）。
     config, _digest = rl_policy_config()
     zero = config.shadow.model_copy(
         update={
@@ -838,9 +847,52 @@ def test_invariant_13_d_an_unpaired_ledger_is_never_usable() -> None:
         zero, rule_policy_version="rule-test-v1", rl_identity=RL_IDENTITY
     )
     ledger.observe(missing_rl_decision(tick_id=1))
-    summary = ledger.summary()
-    assert (summary.observed_ticks, summary.paired_ticks) == (1, 0)
-    assert summary.usable is False
+    with pytest.raises(ValidationError, match="minimum_ticks"):
+        ledger.summary()
+
+
+def test_invariant_13_e_a_summary_cannot_claim_a_usable_flag_it_does_not_derive() -> None:
+    """**`usable` は導いた値だけ。** 保存した集計を読み戻しても、台帳が立てない値を名乗れない。"""
+    usable_ledger = ledger_for()
+    for tick in range(4):
+        usable_ledger.observe(paired_decision(tick_id=tick))
+    usable = usable_ledger.summary()
+    unusable_ledger = ledger_for()
+    unusable_ledger.observe(missing_rl_decision(tick_id=1))
+    unusable = unusable_ledger.summary()
+    assert (usable.usable, unusable.usable) == (True, False)
+
+    # 台帳が作った集計はそのまま往復できる。
+    for summary in (usable, unusable):
+        restored = SupervisorShadowSummary.model_validate_json(summary.model_dump_json())
+        assert restored == summary and restored.digest() == summary.digest()
+
+    # 対が 0 なのに usable=true を名乗る集計（下限 0 も含む）を受け取らない。
+    forged = json.loads(unusable.model_dump_json())
+    for document in (
+        {**forged, "usable": True},
+        {**forged, "usable": True, "minimum_ticks": 0, "minimum_paired_fraction": 0.0},
+    ):
+        with pytest.raises(ValidationError):
+            SupervisorShadowSummary.model_validate_json(json.dumps(document))
+
+    # 導いた値と違えば、どちら向きでも受け取らない。
+    with pytest.raises(ValidationError, match="usable"):
+        SupervisorShadowSummary.model_validate_json(
+            json.dumps({**json.loads(usable.model_dump_json()), "usable": False})
+        )
+
+
+def test_the_training_report_cannot_claim_promotable_it_does_not_derive(trained: Any) -> None:
+    """**報告の `promotable` は比較から導いた値だけ。** 読み戻しでも名乗れない。"""
+    report = report_for(trained, (episode_spec(episode_id="pr89-a", seed=3),))
+    assert report.promotable is False
+    restored = SupervisorPolicyTrainingReport.model_validate_json(report.model_dump_json())
+    assert restored.digest() == report.digest()
+    with pytest.raises(ValidationError):
+        SupervisorPolicyTrainingReport.model_validate_json(
+            json.dumps({**json.loads(report.model_dump_json()), "promotable": True})
+        )
 
 
 def test_supervisor_decision_v2_carries_identity_and_v1_still_reads() -> None:

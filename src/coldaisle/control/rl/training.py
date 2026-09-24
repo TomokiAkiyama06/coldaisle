@@ -253,6 +253,22 @@ class CandidateOutcome(_Frozen):
         return self
 
 
+def training_counterfactual_backed(
+    *, improved_over_baseline: bool, comparison: PolicyComparison
+) -> bool:
+    """学習結果を反実仮想の裏づけありと言えるか。**探索と報告の型が同じこの関数を使う。**
+
+    選ばれた候補が Baseline を上回り、Learned MPC を束縛でき、比較した**両方の arm の
+    すべての episode** が環境の立てた `promotable` を持つときだけ立つ。
+    別々に書くと、探索が立てない `promotable` を、保存した報告を読み戻す側が受け取れてしまう。
+    """
+    return (
+        improved_over_baseline
+        and comparison.learned_controller_available
+        and all(episode.promotable for arm in comparison.arms for episode in arm.episodes)
+    )
+
+
 class SupervisorPolicyTrainingReport(_Frozen):
     """探索1回の結果。**同じ入力からは同じ bytes になる。**"""
 
@@ -311,6 +327,13 @@ class SupervisorPolicyTrainingReport(_Frozen):
                 raise ValueError("Learned MPC を束縛できていない結果を昇格の根拠にしない")
             if not evidence.counterfactual_backed:
                 raise ValueError("反実仮想の裏づけの無い結果を昇格の根拠にしない")
+        derived = training_counterfactual_backed(
+            improved_over_baseline=self.improved_over_baseline, comparison=self.comparison
+        )
+        if self.promotable != derived or evidence.counterfactual_backed != derived:
+            # **導いた値と違う判定を受け取らない。** 報告が持つ比較から導けるので、保存した
+            # 報告や手で作った報告が、探索なら立てない `promotable` を名乗れないようにする。
+            raise ValueError("promotable / counterfactual_backed が比較から導いた値と一致しない")
         return self
 
     def digest(self) -> str:
@@ -733,11 +756,8 @@ class SupervisorPolicyTrainer:
         if len(episode_ids) != len(specs):
             raise SupervisorPolicyTrainingError("同じ episode_id を2度並べない")
         promotable_episodes = sum(1 for episode in selected_arm.episodes if episode.promotable)
-        counterfactual_backed = (
-            selected.improved
-            and comparison.learned_controller_available
-            and promotable_episodes == len(episode_ids)
-            and all(episode.promotable for episode in baseline_arm.episodes)
+        counterfactual_backed = training_counterfactual_backed(
+            improved_over_baseline=selected.improved, comparison=comparison
         )
         artifact = self._build_artifact(
             table=tables[selected_id],

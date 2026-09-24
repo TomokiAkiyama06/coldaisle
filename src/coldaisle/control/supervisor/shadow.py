@@ -47,6 +47,25 @@ MAX_SHADOW_TICKS = 1_000_000
 """1つの台帳が受け取れる tick 数の構造上限。資源枯渇を防ぐ境界で、調整値ではない。"""
 
 
+def shadow_summary_usable(
+    *,
+    observed_ticks: int,
+    paired_ticks: int,
+    minimum_ticks: int,
+    minimum_paired_fraction: float,
+) -> bool:
+    """集計を shadow の証拠として読めるか。**台帳と集計の型が同じこの関数を使う。**
+
+    対が1つも無い集計は、下限の値によらず読めない（fail closed）。別々に書くと、
+    台帳が立てない `usable` を、保存した集計を読み戻す側が受け取れてしまう。
+    """
+    if observed_ticks == 0 or paired_ticks == 0:
+        return False
+    return (
+        paired_ticks >= minimum_ticks and paired_ticks / observed_ticks >= minimum_paired_fraction
+    )
+
+
 class _Frozen(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid", strict=True)
 
@@ -118,10 +137,14 @@ class SupervisorShadowSummary(_Frozen):
     weight_max_abs_delta: dict[str, float] = Field(default_factory=dict)
     """同じく、差の絶対値の最大。対が無ければ 0.0。"""
     regimes: tuple[RegimeAgreement, ...] = ()
-    minimum_ticks: int = Field(ge=0)
+    minimum_ticks: int = Field(ge=1)
+    """対で観測できた tick 数の下限。**1 以上**（`PolicyShadowConfig.minimum_ticks` と同じ）。"""
     minimum_paired_fraction: float = Field(ge=0.0, le=1.0, allow_inf_nan=False)
     usable: bool
-    """下限を満たしたか。**満たさない集計を「差が無かった」と読まない**（fail closed）。"""
+    """下限を満たしたか。**満たさない集計を「差が無かった」と読まない**（fail closed）。
+
+    `shadow_summary_usable()` から導く値で、食い違う集計は作れない（読み戻しでも同じ）。
+    """
 
     @model_validator(mode="after")
     def _counts_add_up(self) -> Self:
@@ -142,6 +165,16 @@ class SupervisorShadowSummary(_Frozen):
             raise ValueError("一致数が対になった tick 数を超えている")
         if sum(agreement.paired_ticks for agreement in self.regimes) != self.paired_ticks:
             raise ValueError("regime ごとの対の合計が全体と一致しない")
+        derived = shadow_summary_usable(
+            observed_ticks=self.observed_ticks,
+            paired_ticks=self.paired_ticks,
+            minimum_ticks=self.minimum_ticks,
+            minimum_paired_fraction=self.minimum_paired_fraction,
+        )
+        if self.usable != derived:
+            # **導いた値と違う `usable` を受け取らない。** 保存した集計や手で作った集計が、
+            # 台帳なら立てない `usable=True` を名乗れないようにする。
+            raise ValueError("usable が観測数・対の数・下限から導いた値と一致しない")
         if (self.first_ts_ms is None) != (self.last_ts_ms is None):
             raise ValueError("観測区間の両端はそろえて持つ")
         if (
@@ -333,14 +366,12 @@ class SupervisorShadowLedger:
             )
             for regime, counters in sorted(self._regimes.items(), key=lambda item: item[0].value)
         )
-        fraction = None if observed == 0 else paired / observed
-        # **対が1つも無い集計を読めたことにしない**（fail closed）。設定の下限が 0 を許さない
-        # ことに加えて、ここでも独立に塞ぐ。
-        usable = (
-            fraction is not None
-            and paired > 0
-            and paired >= self._config.minimum_ticks.value
-            and fraction >= self._config.minimum_paired_fraction.value
+        # 集計の型と同じ関数で導く（対が1つも無い集計は下限によらず読めない）。
+        usable = shadow_summary_usable(
+            observed_ticks=observed,
+            paired_ticks=paired,
+            minimum_ticks=self._config.minimum_ticks.value,
+            minimum_paired_fraction=self._config.minimum_paired_fraction.value,
         )
         return SupervisorShadowSummary(
             rule_policy_version=self._rule_version,

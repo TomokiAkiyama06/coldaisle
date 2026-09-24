@@ -257,6 +257,12 @@ shadow:   { minimum_ticks, minimum_paired_fraction }
   **「差が無かった」と読めない**（fail closed）
   - `minimum_ticks` は **1 以上**（設定の読み込みで検査）。加えて台帳も、対が 0 の集計を
     下限の値によらず `usable` にしない。0 を許すと、比べていない集計が証拠として読めてしまう
+  - `usable` は**導いた値**で、台帳と `SupervisorShadowSummary` の型が同じ関数
+    （`shadow_summary_usable()`）を使う。型は `minimum_ticks` に 1 以上を要求し、導いた値と
+    違う `usable` を持つ集計を受け取らない。保存した集計を読み戻す側が、台帳なら立てない
+    `usable=True` を受け取らないためである。学習報告の `promotable` と artifact の
+    `counterfactual_backed` も同じく、報告が持つ比較から導く値（`training_counterfactual_backed()`）
+    と一致しなければ受け取らない
 - 集計の digest は #104 の `shadow_evaluation_ref` にそのまま渡せる
 
 違う regime を前提にした提案どうしの比較は、**`SupervisorDecision` の段階で作れない**
