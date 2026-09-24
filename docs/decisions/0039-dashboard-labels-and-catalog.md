@@ -6,6 +6,7 @@
 - **Date**: 2026-09-18
 - **Supersedes**: [`0011-dashboard.md`](0011-dashboard.md) §2.4 のうち **`stale` の文言バッジだけ**
   （色と文言の両方で示す、という原則そのものは残す）
+- **Superseded by**: [`0068-dashboard-status-strip-and-fault-cards.md`](0068-dashboard-status-strip-and-fault-cards.md)（§2.3 のうち `stale` の見た目の記述のみ）
 - **関連**: [`0009-read-api.md`](0009-read-api.md) §2.1 / §2.2 /
   [`0011-dashboard.md`](0011-dashboard.md) §2.4 / §2.5 / §2.6.1 /
   `docs/api-contract.md` §2 / §6 / `config/metrics.yaml`

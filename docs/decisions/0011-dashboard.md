@@ -5,6 +5,7 @@
 - **Date**: 2026-08-25
 - **Supersedes**: なし
 - **Superseded by**: [`0039-dashboard-labels-and-catalog.md`](0039-dashboard-labels-and-catalog.md)（§2.4 のうち `stale` の文言バッジのみ）
+- **Superseded by**: [`0068-dashboard-status-strip-and-fault-cards.md`](0068-dashboard-status-strip-and-fault-cards.md)（§2.4 のうち `missing` の見た目のみ）
 - **関連**: [`0007-ingest-pipeline.md`](0007-ingest-pipeline.md) §2.11 /
   [`0009-read-api.md`](0009-read-api.md) §2.3 / §2.12 /
   `docs/requirements.md` §7.4 / §11（技術スタック） / NFR-03 / `docs/api-contract.md`
