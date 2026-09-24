@@ -37,7 +37,16 @@ from pydantic import (
 from coldaisle.clock import Clock, WallClock
 from coldaisle.control.schema import AuthorityStage
 
-MODEL_REGISTRY_SCHEMA_VERSION: Literal[2] = 2
+MODEL_REGISTRY_SCHEMA_VERSION: Literal[3] = 3
+"""**書き出す** registry schema version。"""
+MODEL_REGISTRY_READABLE_SCHEMA_VERSIONS: tuple[int, ...] = (2, 3)
+"""**読める** registry schema version。v2 は v3 の部分集合である。
+
+v3 の差は `ArtifactCapability` に値が1つ増えただけで、v2 の snapshot は新しい列挙でそのまま
+復号できる。読めないことにすると、既存の production artifact がすべて使えなくなり
+Fallback へ落ちる（#89 レビュー）。**v2 は読み、次の書き込みで v3 へ上げる**
+（`_append_event` は既定の版で snapshot を作り直す）。
+"""
 MODEL_REGISTRY_CONFIG_FILENAME = "model-registry.yaml"
 
 _STATE_FILENAME = "registry.json"
@@ -88,6 +97,15 @@ class ArtifactCapability(StrEnum):
     """観測の再生だけ。**反実仮想予測は主張しない**（決定記録 0048 §2.1）。"""
     COUNTERFACTUAL_ACTION = "counterfactual_action"
     """候補 Fan action 列に対する将来観測の予測。#86 が要求する（決定記録 0052 §2.1）。"""
+    SUPERVISOR_STRATEGY = "supervisor_strategy"
+    """`WorkloadRegime` から Supervisor の戦略・目的関数 weight・target band への写像（#89）。
+
+    **thermal model の能力ではない。** 将来観測を1つも予測しないので、#86 の
+    `COUNTERFACTUAL_CAPABILITIES` にも `AttestedThermalDynamics.bind` の要求にも入らず、
+    この能力を申告した artifact が MPC の内部モデルや学習 dynamics として束縛される経路は
+    無い。逆に #89 の束縛はこの能力だけを受け付けるので、thermal artifact を
+    `supervisor_policy` として取り違えて渡す配線ミスも型で止まる（決定記録 0061 §2.1）。
+    """
 
 
 class ArtifactFormat(StrEnum):
@@ -181,14 +199,19 @@ class ArtifactRef(_Frozen):
 class ArtifactMetadata(_Frozen):
     """Training, compatibility, evaluation, and integrity metadata."""
 
-    schema_version: Literal[2] = MODEL_REGISTRY_SCHEMA_VERSION
+    schema_version: Literal[2, 3] = MODEL_REGISTRY_SCHEMA_VERSION
     kind: ArtifactKind
     artifact_format: ArtifactFormat
     capability: ArtifactCapability
     """この artifact が主張する能力。**登録時に申告し、既定値を持たない。**
 
-    v1 の metadata には無かったため schema version を 2 へ上げる。既定値を補って読むと、
+    v1 の metadata には無かったため schema version を 2 へ上げた。既定値を補って読むと、
     能力を申告していない artifact が「反実仮想もできる」側に倒れる余地を残してしまう。
+
+    v3 で `supervisor_strategy` を足した（#89 / 決定記録 0061 §2.1）。**列挙は閉じている**
+    ので、値が1つ増えた snapshot は古い読み手が復号できない。復号できないと
+    `INVALID_REGISTRY` になり registry 全体が読めなくなるため、**加算だからと版を据え置か
+    ない。** 版を上げることで「この snapshot は新しい読み手が要る」を明示する。
     """
     model_id: str = Field(pattern=_IDENTIFIER_PATTERN, max_length=120)
     version: str = Field(pattern=_SEMVER_PATTERN, max_length=80)
@@ -402,7 +425,7 @@ def _validate_member[ModelT: BaseModel](model: type[ModelT], value: object) -> M
 class RegistrySnapshot(_Frozen):
     """Atomically replaced complete registry state."""
 
-    schema_version: Literal[2] = MODEL_REGISTRY_SCHEMA_VERSION
+    schema_version: Literal[2, 3] = MODEL_REGISTRY_SCHEMA_VERSION
     revision: int = Field(ge=0)
     artifacts: dict[str, ArtifactRecord] = Field(default_factory=dict)
     production: dict[ArtifactKind, ProductionSlot] = Field(default_factory=dict)
@@ -866,8 +889,13 @@ class RegistryHealthReport(_Frozen):
     """
 
     health: RegistryHealth
-    supported_schema_version: Literal[2] = MODEL_REGISTRY_SCHEMA_VERSION
-    """**この実装が受理する** registry schema version。読んだ snapshot の申告ではない。"""
+    supported_schema_version: Literal[3] = MODEL_REGISTRY_SCHEMA_VERSION
+    """**この実装が受理する** registry schema version。読んだ snapshot の申告ではない。
+
+    `MODEL_REGISTRY_SCHEMA_VERSION` と lockstep にする。v3 で `ArtifactCapability` に
+    `supervisor_strategy` が入った（#89 / 決定記録 0061 §2.1）ので、v2 の snapshot は
+    この実装では復号できず `INVALID_REGISTRY` になる（fail closed）。
+    """
     revision: int = Field(ge=0)
     productions: tuple[ProductionHealth, ...] = ()
     detail: str = Field(min_length=1, max_length=500)

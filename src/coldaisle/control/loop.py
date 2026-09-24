@@ -834,6 +834,13 @@ class ControlLoop:
                 output=output,
                 source_monotonic_ms=source.monotonic_ms,
                 received_monotonic_ms=received_mono_ms,
+                # **origin は `unverified` のままにする**（既定値。#89 / 決定記録 0061 §2.4）。
+                # `SupervisorOutputSource.poll()` が返すのは素の `SupervisorOutput` で、
+                # それがどの用途で束縛された policy から出たかを loop は知らない。
+                # 知らないまま `active_binding` を名乗らせると、shadow 用の提案が
+                # active slot を通る。結果として `active_policy: rl_policy` の構成では
+                # Rule へ落ちるが、**それが正しい**（証明できない提案に制御権を渡さない）。
+                # worker が用途を運べる形にするのは、`for_active` の門を開くときに一緒に決める。
             ),
             None,
         )

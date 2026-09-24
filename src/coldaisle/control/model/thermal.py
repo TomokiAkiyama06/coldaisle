@@ -493,7 +493,14 @@ class ThermalModelArtifact(_Frozen):
 class ThermalRegistryMetadata(_Frozen):
     """Values that map one-to-one to #104 ``ArtifactMetadata``."""
 
-    schema_version: Literal[2] = 2
+    schema_version: Literal[2, 3] = 3
+    """#104 ``ArtifactMetadata`` の版。**書き出しは v3、v2 で登録済みの記録も読む。**
+
+    v3 は `ArtifactCapability` に `supervisor_strategy` が増えただけで（#89）、thermal model
+    側の欄は何も変わっていない。v2 で登録済みの production artifact を版の違いだけで
+    読めなくしないため、両方を受け付ける。版は Registry の封筒の値で artifact が決める値では
+    ないので、artifact との照合（`_registry_contract`）にも入れない。
+    """
     kind: Literal["thermal_model"] = "thermal_model"
     artifact_format: Literal["json"] = "json"
     capability: InferenceCapability
@@ -1220,8 +1227,9 @@ def _registry_metadata_from_artifact(
 
 def _registry_contract(metadata: ThermalRegistryMetadata) -> tuple[object, ...]:
     """Exclude lifecycle evaluation refs while binding every artifact-owned field."""
+    # `schema_version` は Registry の封筒の版で artifact が決める値ではない。v2 で登録済みの
+    # production artifact を、版が違うだけで読めなくしない（#89 レビュー）。
     return (
-        metadata.schema_version,
         metadata.kind,
         metadata.artifact_format,
         metadata.capability,

@@ -383,6 +383,29 @@ class SupervisorTrainingEnvironment:
         return self._action_space
 
     @property
+    def config_sha256(self) -> str:
+        """この環境が回している `rl-training.yaml` の bytes hash。
+
+        **利用者（#89）に写しを持たせないために公開する。** 同じ値を別経路で持つと、
+        環境と報告が違う設定を指したまま気づけない。
+        """
+        return self._config_sha256
+
+    @property
+    def reward_version(self) -> str:
+        """この環境が使っている reward 版（`rl-training.yaml` の `reward.version`）。"""
+        return self._reward.version
+
+    @property
+    def dynamics(self) -> EnvironmentDynamics:
+        """注入した dynamics への読み取り参照。**環境が持つものと同一である。**
+
+        学習 mode と出どころを報告へ写すために公開する。object そのものは呼び出し側が
+        渡したものなので、新しい能力は増えない。
+        """
+        return self._dynamics
+
+    @property
     def safety_model(self) -> SafetyModel:
         """環境が持っている安全の表現。**Critical Safety そのものではない。**"""
         return SafetyModel.CONFIGURED_MINIMUM_ONLY

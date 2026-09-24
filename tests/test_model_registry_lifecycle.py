@@ -228,7 +228,7 @@ def test_feature_schema_mismatch_names_the_kind_that_must_fall_back(tmp_path: Pa
     assert report.trace_metadata()["model_registry_health"] == {
         "health": "unusable",
         "registry_revision": report.revision,
-        "supported_schema_version": 2,
+        "supported_schema_version": 3,
         "productions": [
             {
                 "artifact_kind": "thermal_model",
@@ -371,6 +371,64 @@ def test_an_older_registry_schema_version_fails_closed(tmp_path: Path) -> None:
     )
 
 
+def as_v2_snapshot(snapshot_path: Path) -> None:
+    """v3 で書かれた snapshot を、v2 の registry が書いた形へ戻す。
+
+    v2 と v3 の違いは版の数字と、`ArtifactCapability` の値が1つ増えたことだけである。
+    thermal artifact しか無い registry では、版の数字を2へ戻せば v2 が書いたものと同じ。
+    """
+    stored = json.loads(snapshot_path.read_text(encoding="utf-8"))
+    stored["schema_version"] = 2
+    for record in stored["artifacts"].values():
+        record["metadata"]["schema_version"] = 2
+    write_json(snapshot_path, stored)
+
+
+def test_an_existing_v2_registry_keeps_its_production_artifact_and_upgrades_on_write(
+    tmp_path: Path,
+) -> None:
+    """**v3 へ上げても、v2 で動いている production artifact を使えなくしない**（#89 レビュー）。
+
+    読めないことにすると、既存の thermal production がすべて `INVALID_REGISTRY` になり
+    Fallback へ落ちる。v2 は読み、次の書き込みで v3 へ上げる。
+    """
+    root = tmp_path / "registry"
+    production_registry(root)
+    snapshot_path = root / "registry.json"
+    as_v2_snapshot(snapshot_path)
+    assert json.loads(snapshot_path.read_text(encoding="utf-8"))["schema_version"] == 2
+
+    registry = make_registry(root)
+    loaded = registry.load_production(ArtifactKind.THERMAL_MODEL, COMPATIBILITY)
+    assert loaded.status is ArtifactLoadStatus.LOADED
+    # rollback 先が無い（単一 version）ので DEGRADED だが、production は使える。
+    assert registry.verify(CONTRACTS).health is not RegistryHealth.UNUSABLE
+    # 読むだけでは書き換えない。
+    assert json.loads(snapshot_path.read_text(encoding="utf-8"))["schema_version"] == 2
+
+    register_and_validate(registry, "2.0.0")
+    upgraded = json.loads(snapshot_path.read_text(encoding="utf-8"))
+    assert upgraded["schema_version"] == 3
+    after = make_registry(root).load_production(ArtifactKind.THERMAL_MODEL, COMPATIBILITY)
+    assert after.status is ArtifactLoadStatus.LOADED
+    assert after.artifact is not None and loaded.artifact is not None
+    assert after.artifact.metadata.version == loaded.artifact.metadata.version
+
+
+def test_an_unknown_registry_schema_version_still_fails_closed(tmp_path: Path) -> None:
+    """読める版は 2 と 3 だけ。それ以外を補って読まない。"""
+    root = tmp_path / "registry"
+    production_registry(root)
+    snapshot_path = root / "registry.json"
+    stored = json.loads(snapshot_path.read_text(encoding="utf-8"))
+    stored["schema_version"] = 4
+    write_json(snapshot_path, stored)
+    assert (
+        make_registry(root).load_production(ArtifactKind.THERMAL_MODEL, COMPATIBILITY).status
+        is ArtifactLoadStatus.INVALID_REGISTRY
+    )
+
+
 def test_a_record_without_the_capability_field_is_not_defaulted(tmp_path: Path) -> None:
     """能力を申告していない古い記録を「反実仮想もできる」側へ倒さない（決定記録 0052 §2.1）。"""
     root = tmp_path / "registry"
@@ -462,7 +520,7 @@ def test_cli_status_is_read_only_and_does_not_create_the_registry(
     missing = tmp_path / "absent"
     assert cli.main(["status", *base_args(missing)]) == cli.EXIT_OK
     assert stdout_json(capsys) == {
-        "schema_version": 2,
+        "schema_version": 3,
         "revision": 0,
         "production": {},
         "artifacts": [],
