@@ -1,7 +1,7 @@
 # 決定記録 0068: ダッシュボードの状態の帯と、異常なカードの見た目
 
 - **種別**: Decision Record
-- **Status**: Proposed（本 PR のマージをもって FINAL）
+- **Status**: FINAL（2026-09-24、リポジトリ所有者が承認）
 - **Date**: 2026-09-24
 - **Supersedes**:
   - [`0039-dashboard-labels-and-catalog.md`](0039-dashboard-labels-and-catalog.md) §2.3 のうち
