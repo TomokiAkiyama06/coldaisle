@@ -129,7 +129,7 @@ docs/decisions/NNNN-<slug>.md      例: 0002-metric-naming.md
 | [0058](0058-rl-supervisor-training-environment.md) | RL Supervisor 学習環境の責務（action は戦略まで・dynamics の出どころ・Safety 違反は terminal） | FINAL |
 | [0059](0059-decision-trace-model-artifact.md) | decision trace が tick ごとに model artifact を記録する（適用側の証拠を artifact へ束縛し、LIMITED 以降の昇格を通す） | FINAL（§2.1 の照合対象と §2.2 の入れ子の版は [0065](0065-assessment-identity-and-nested-gate-version.md)） |
 | [0060](0060-control-loop-runtime.md) | Control Loop の実行時契約（`tick_ms` は safety.yaml・Telemetry はストア経由・モードは読み取り port・deadman の配線・実行の記録を trace へ） | FINAL |
-| [0061](0061-rl-supervisor-policy-artifact-and-binding.md) | RL Supervisor policy の artifact 形式（全 regime の表・Demand を表現できない）・束縛（active は開かない門・shadow 用の提案は active slot を通らない）・shadow 集計の規律 | Proposed |
+| [0061](0061-rl-supervisor-policy-artifact-and-binding.md) | RL Supervisor policy の artifact 形式（全 regime の表・Demand を表現できない）・束縛（active は開かない門・shadow 用の提案は active slot を通らない）・shadow 集計の規律 | FINAL |
 | [0062](0062-model-registry-operations.md) | Model Registry の運用入口（CLI）と起動時検証、lifecycle 監査の追跡 | FINAL |
 | [0063](0063-compute-mode-advisory.md) | Compute Mode 切替時の環境条件アドバイザリ（助言のみ・実測フルロードとの比較・欠けた材料の明示） | FINAL |
 | [0064](0064-workload-hint-entry-and-supervisor-prior.md) | Workload Hint の入口（0045 のソケットを再利用）・形と版・期限の数え方・矛盾時は Telemetry 優先・trace への出し方・実装の段階 | FINAL |

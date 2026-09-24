@@ -1,7 +1,7 @@
 # 決定記録 0061: RL Supervisor policy の artifact 形式・束縛・昇格の規律
 
 - **種別**: Decision Record
-- **Status**: Proposed（**リポジトリ所有者の承認が必要**。§2.1 は #104 の契約を広げる）
+- **Status**: FINAL（2026-09-24、リポジトリ所有者が承認）
 - **Date**: 2026-09-21
 - **Supersedes**: なし
 - **関連**: [0027](0027-fan-control-architecture.md) / [0028](0028-fan-control-contracts.md) §2.3 /
@@ -312,7 +312,7 @@ shadow:   { minimum_ticks, minimum_paired_fraction }
   - **残余**: #104 の Registry とその CLI（`coldaisle-registry register`、0062）は bytes を解釈せず、
     kind を問わず metadata と payload をそのまま受け取る。そこから照合していない policy
     artifact を書く経路は残る。CLI 側で supervisor policy の登録に照合を要求するかは
-    0062（FINAL）の契約を広げる話なので、**所有者の判断**とする（§5）
+    0062（FINAL）の契約を広げる話なので、**2026-09-24 の所有者の判断により、いまは手を入れず残余として記録する**（§5）
 - 集計の件数（理由別の内訳 `rl_errors` を含む）は**すべて 0 以上**。負の内訳で合計だけを
   合わせた集計を受け取らない
 - 集計の digest は #104 の `shadow_evaluation_ref` にそのまま渡せる。ただし **`usable` でない集計は
@@ -497,13 +497,13 @@ Baseline の欄が `output_bounds` の外にあれば**丸めず拒む**。
 
 ## 5. 未決事項
 
-- **本記録は `Proposed` で、所有者の承認が要る。** とくに §2.1 は #104 の公開契約を広げ、
+- **2026-09-24、リポジトリ所有者が本記録（§2.1 の #104 の公開契約の拡張を含む）を承認した。** §2.1 は #104 の公開契約を広げ、
   **registry の書き出し版を 2 から 3 へ上げる**（v2 は読み、次の書き込みで v3 へ上がる）。
   #104（PR #162 / 決定記録 0062）は main に入り、`RegistryHealthReport` の版を 3 に揃えた
 - **`for_active` を開く条件が未決**（§2.4）。何をもって「反実仮想の裏づけ」とみなし、
   誰がその証拠を発行するか。候補は (a) 環境が封をした `DynamicsEvidence` の系譜を
   policy 側へ運べる形にする、(b) 学習で束縛した反実仮想 thermal artifact の
-  `ArtifactAttestation` を束縛時に要求する、のいずれか。**決めるまで門は閉じたままにする**
+  `ArtifactAttestation` を束縛時に要求する、のいずれか。**決めるまで門は閉じたままにする**。RL へ制御権を渡す時期と条件は、2026-09-24 の所有者の判断により**別の決定記録で決める**
 - `config/rl-policy.yaml` の値（seed・候補 weight・候補上限・改善の下限・shadow の下限）は
   **すべて実測前の暫定値**。確定には shadow の実運用データが要る
 - 運転中の `SupervisorDecision` を `SupervisorShadowLedger` へ流す配線（どこで観測し、
@@ -521,6 +521,6 @@ Baseline の欄が `output_bounds` の外にあれば**丸めず拒む**。
 - `policy_family` を増やす条件。反実仮想 artifact が揃い、候補間の差を実際に測れるように
   なってから、どの state を足すかを新しい記録で決める
 - #104 の Registry CLI（`coldaisle-registry register`）で supervisor policy を登録するときに、
-  `certify()` を通したことを要求するか（§2.6 の残余）。0062（FINAL）の CLI 契約を広げるので、
-  所有者が決める。決めるまでは、照合済みの登録は `certify()` → `canonical_policy_artifact_bytes()`
+  `certify()` を通したことを要求するか（§2.6 の残余）。2026-09-24 の所有者の判断で、**いまは 0062 の CLI 契約を
+  広げず残余として残す**。変えるときは新しい決定記録で行う。それまでは、照合済みの登録は `certify()` → `canonical_policy_artifact_bytes()`
   / `policy_registry_metadata()` の道で行う
