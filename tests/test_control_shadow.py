@@ -42,6 +42,7 @@ from coldaisle.control.schema import (
     ControlState,
     ControlTick,
     EffectiveZoneDemand,
+    ModelGateDecision,
     OperatingMode,
     OptimizerStatus,
     PerZone,
@@ -144,7 +145,7 @@ def gate_selection(
 ):
     """設定した authority stage で選ばせる。復帰 hold を満たすため健全なまま2 tick 進める。"""
     settings = policy(authority=stage, recovery_hold_ms=1)
-    gate = gate_for(settings, expected_model_version="thermal-v1")
+    gate = gate_for(settings, expected_model_version="0.1.0")
     selection = None
     for now_mono_ms in (0, settings.recovery_hold_ms):
         selection = gate.select(
@@ -305,7 +306,7 @@ def prediction(
     plan = plan if plan is not None else plan_for(offsets=offsets)
     return ShadowPrediction(
         model_id="rack-thermal",
-        model_version="thermal-v1",
+        model_version="0.1.0",
         artifact_sha256="a" * 64,
         inference_id=inference,
         plan_digest=plan.digest(),
@@ -329,7 +330,7 @@ def solved_counterfactual(**overrides) -> dict[str, object]:
         "requested": plan.first,
         "reason": Reason(code="optimizer_ok"),
         "optimizer_status": OptimizerStatus.OK,
-        "model_version": "thermal-v1",
+        "model_version": "0.1.0",
         "inference_id": "c" * 64,
         "artifact_sha256": "a" * 64,
         "plan": plan,
@@ -564,6 +565,16 @@ def test_invariant_1_h_a_v5_trace_cannot_carry_a_shadow_record() -> None:
     proposal = shadow_proposal(0.9)
     selection, state, record = recorded(learned=mpc_result(proposal))
     assert record is not None
+    assert selection.model_gate is not None
+    # artifact は v7 の欄なので、v5 の tick には最初から載せられない（#159）。
+    # ここで見たいのは `shadow` のほうなので、v5 に載る形の model_gate で試す。
+    gate = ModelGateDecision.model_validate(
+        {
+            **selection.model_gate.model_dump(mode="python"),
+            "schema_version": 1,
+            "artifact_sha256": None,
+        }
+    )
     with pytest.raises(ValidationError, match="schema version 6"):
         ControlTick(
             schema_version=5,
@@ -571,7 +582,7 @@ def test_invariant_1_h_a_v5_trace_cannot_carry_a_shadow_record() -> None:
             ts_ms=TICK_TS_MS,
             state=state,
             zones=zone_records(0.4),
-            model_gate=selection.model_gate,
+            model_gate=gate,
             shadow=record,
         )
 
@@ -902,11 +913,13 @@ def test_invariant_3_k_a_conflict_among_unusable_values_is_not_a_conflict() -> N
 
 def test_invariant_4_a_an_unattested_proposal_records_no_confidence() -> None:
     """assessment と束ねられない提案の confidence / ood は**記録しない**。"""
-    proposal = shadow_proposal(0.9, confidence=0.99)
     # Registry を通っていない判定は Gate が裏づけとして扱わない（#85）。
-    offline = assessment_for(proposal).model_copy(
-        update={"artifact_verification": ArtifactVerification.OFFLINE_UNVERIFIED}
+    # 検証状態も識別子の導出に入るので、提案の側も同じ推論を指す（#159）。
+    offline = assessment_for(
+        shadow_proposal(0.9, confidence=0.99),
+        verification=ArtifactVerification.OFFLINE_UNVERIFIED,
     )
+    proposal = shadow_proposal(0.9, confidence=0.99, inference_id=offline.inference_id)
     result = mpc_result(proposal, assessment=offline)
     selection = gate_selection(learned=worker_status(result))
     state = control_state(selection)
@@ -947,7 +960,7 @@ def test_invariant_4_c_a_counterfactual_cannot_claim_numbers_without_attestation
             requested=demands(0.8),
             reason=Reason(code="optimizer_ok"),
             optimizer_status=OptimizerStatus.TIMEOUT,
-            model_version="thermal-v1",
+            model_version="0.1.0",
             inference_id="c" * 64,
             artifact_sha256="a" * 64,
             attested=False,
@@ -964,7 +977,7 @@ def test_invariant_4_d_an_ood_counterfactual_keeps_the_zero_confidence_rule() ->
             requested=demands(0.8),
             reason=Reason(code="optimizer_ok"),
             optimizer_status=OptimizerStatus.TIMEOUT,
-            model_version="thermal-v1",
+            model_version="0.1.0",
             inference_id="c" * 64,
             artifact_sha256="a" * 64,
             attested=True,
@@ -980,7 +993,7 @@ def test_invariant_4_e_the_fallback_counterfactual_carries_no_ml_fields() -> Non
             controller=ControllerKind.FALLBACK,
             requested=demands(0.4),
             reason=Reason(code="fallback_curve"),
-            model_version="thermal-v1",
+            model_version="0.1.0",
         )
 
 
@@ -1031,7 +1044,7 @@ def test_invariant_5_d_a_non_ok_status_cannot_carry_a_prediction() -> None:
             requested=demands(0.8),
             reason=Reason(code="optimizer_budget_exhausted"),
             optimizer_status=OptimizerStatus.TIMEOUT,
-            model_version="thermal-v1",
+            model_version="0.1.0",
             inference_id="c" * 64,
             artifact_sha256="a" * 64,
             prediction=prediction(),
@@ -1830,3 +1843,38 @@ def other_plan(plan):
 
 def zero_cost(cost):
     return cost.model_copy(update={"total": cost.total + 1.0})
+
+
+def test_the_counterfactual_artifact_comes_from_the_gate_not_the_assessment() -> None:
+    """**counterfactual の artifact も、Gate が照合し終えた値にする**（#159 / 決定記録 0059）。
+
+    assessment の欄をそのまま写すと、Gate が束縛した attestation と照らしていない値が
+    counterfactual 側にだけ残る（codex #4057191721 と同じ型の穴）。同じ tick の
+    `model_gate` と食い違う artifact を `ControlTick` は拒むので、trace 全体で1つになる。
+    """
+    proposal = shadow_proposal(0.9)
+    selection, state, record = recorded(learned=mpc_result(proposal))
+
+    assert record is not None
+    assert selection.model_gate is not None
+    assert selection.model_gate.attested is True
+    item = next(
+        counterfactual
+        for counterfactual in record.counterfactuals
+        if counterfactual.controller is ControllerKind.LEARNED_MPC
+    )
+    assert item.attested is True
+    assert item.artifact_sha256 == selection.model_gate.artifact_sha256
+
+    # 同じ tick に2つの artifact を書けないことを、schema の側でも確かめる。
+    tick = ControlTick(
+        tick_id=7,
+        ts_ms=TICK_TS_MS,
+        state=state,
+        zones=zone_records(0.4),
+        model_gate=selection.model_gate,
+        shadow=record,
+        runtime=CONTROL_TICK_RUNTIME,
+    )
+    assert tick.model_gate is not None
+    assert tick.model_gate.artifact_sha256 == item.artifact_sha256

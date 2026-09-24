@@ -29,6 +29,10 @@ from coldaisle.api.airflow import (
     airflow_config_payload,
     cpu_utilization_measured,
 )
+from coldaisle.api.compute_mode_advisory import (
+    ComputeModeAdvisor,
+    ComputeModeAdvisorySettings,
+)
 from coldaisle.api.models import (
     AlertsResponse,
     DerivedLabelOut,
@@ -128,6 +132,8 @@ class Config:
     metrics: Path = Path("config/metrics.yaml")
     internal_telemetry: Path = Path("config/internal-telemetry.yaml")
     server_health: Path = Path("config/server-health.yaml")
+    compute_mode_advisory: Path = Path("config/compute-mode-advisory.yaml")
+    """Compute Mode 切替アドバイザリの助言用しきい値（#68 / 決定記録 0063）。"""
     airflow_ui: Path = Path("config/airflow-ui.yaml")
     """エアフロー画面の表示設定（#106 / 決定記録 0046）。"""
     max_points: int = 2_000
@@ -145,6 +151,9 @@ class Config:
                 os.environ.get("COLDAISLE_INTERNAL_TELEMETRY", str(cls.internal_telemetry))
             ),
             server_health=Path(os.environ.get("COLDAISLE_SERVER_HEALTH", str(cls.server_health))),
+            compute_mode_advisory=Path(
+                os.environ.get("COLDAISLE_COMPUTE_MODE_ADVISORY", str(cls.compute_mode_advisory))
+            ),
             airflow_ui=Path(os.environ.get("COLDAISLE_AIRFLOW_UI", str(cls.airflow_ui))),
             max_points=int(os.environ.get("COLDAISLE_MAX_POINTS", cls.max_points)),
             stream_poll_s=float(os.environ.get("COLDAISLE_STREAM_POLL_S", cls.stream_poll_s)),
@@ -227,6 +236,10 @@ def create_app(
     settings = config or Config.from_env()
     catalog = MetricCatalog.from_yaml(settings.metrics)
     health_settings = ServerHealthSettings.from_yaml(settings.server_health, catalog=catalog)
+    advisor = ComputeModeAdvisor(
+        ComputeModeAdvisorySettings.from_yaml(settings.compute_mode_advisory, catalog=catalog),
+        catalog,
+    )
     airflow_ui = AirflowUiSettings.from_yaml(settings.airflow_ui)
     if health_hwmon_metrics is None or health_nvml_metrics is None:
         internal_telemetry = InternalTelemetryConfig.from_yaml(
@@ -288,6 +301,7 @@ def create_app(
             catalog,
             health_summarizer,
             settings=health_settings,
+            advisor=advisor,
             hwmon_metrics=health_hwmon_metrics,
             nvml_metrics=health_nvml_metrics,
         )

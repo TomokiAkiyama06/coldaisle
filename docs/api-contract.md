@@ -35,7 +35,7 @@
 | GET | `/api/v1/gpu/processes` | CUDA プロセス一覧と VRAM 使用量 |
 | GET | `/api/v1/airflow/config` | エアフロー画面の表示設定（空気の温度の色分けの区切り）。測定値は含まない（#106 / 決定記録 0046） |
 | GET | `/api/v1/devices` | 記録されたセンサー構成（チャネル / メトリクス / ROM）（#14） |
-| GET | `/api/v1/events` | 記録された事象（GPU Mode の切り替え）。タイムライン注釈用（#67） |
+| GET | `/api/v1/events` | 記録された事象（GPU Mode の切り替え・Workload Hint）。タイムライン注釈用（#67 / #107） |
 | GET | `/api/v1/tools` | **AI 向けツールの関数定義**と注意書き（#23） |
 | GET | `/api/v1/tools/{name}` | ツールを1つ実行し、結果と呼び出しの記録を返す（#23） |
 | WS | `/api/v1/stream` | 新サンプルの push |
@@ -93,7 +93,32 @@ Workspace 側で複数エンドポイントを叩いて組み立てさせない�
     "lm_sensors":  {"status": "ok", "detail": "collector_state=ok", "last_sample_ts_ms": 1787615999600, "last_sample_at": "2026-08-24T23:59:59.600000+00:00"},
     "ai_layer":    {"status": "stopped", "detail": "deterministic template used", "last_sample_ts_ms": null, "last_sample_at": null}
   },
-  "compute_mode_advisory": {"safe": true, "warnings": [], "blocking": false}
+  "compute_mode_advisory": {
+    "safe": true,
+    "warnings": [],
+    "blocking": false,
+    "conditions": [
+      {"metric": "air.room", "value": 26.4, "unit": "C", "quality": "ok", "age_seconds": 0.4,
+       "usable": true, "advisory_max": 30.0, "exceeded": false, "reference_value": 26.1, "delta": 0.3},
+      {"metric": "air.gpu_intake", "value": 28.3, "unit": "C", "quality": "ok", "age_seconds": 0.4,
+       "usable": true, "advisory_max": 32.0, "exceeded": false, "reference_value": 28.0, "delta": 0.3},
+      {"metric": "air.room_humidity", "value": 48.2, "unit": "%RH", "quality": "ok", "age_seconds": 0.4,
+       "usable": true, "advisory_max": 65.0, "exceeded": false, "reference_value": 45.0, "delta": 3.2}
+    ],
+    "reference": {
+      "started_at_ms": 1787529600000, "started_at": "2026-08-24T00:00:00+00:00",
+      "ended_at_ms": 1787533200000, "ended_at": "2026-08-24T01:00:00+00:00",
+      "covered_s": 3600.0, "bucket_count": 12,
+      "load_metric": "power.gpu.0", "load_peak": 598.0, "load_mean": 571.0,
+      "conditions": {"air.room": 26.1, "air.gpu_intake": 28.0, "air.room_humidity": 45.0},
+      "peaks": {"gpu.0.core": 84.0}
+    },
+    "reference_count": 3,
+    "reference_window_days": 30,
+    "evaluated_at_ms": 1787615900000,
+    "evaluated_at": "2026-08-24T23:58:20+00:00",
+    "limitations": []
+  }
 }
 ```
 
@@ -167,14 +192,46 @@ API が返すオフセットは `+00:00` です。同じ瞬間を指すので解
 
 ### `compute_mode_advisory`
 
+Compute Mode へ切り替える**前に人が見る判断材料**です（#68 / [決定記録 0063](decisions/0063-compute-mode-advisory.md)）。
+判定はすべて決定論的で、AI は関与しません。AI が停止していても同じ内容を返します。
+
+**どんな条件でも切替をブロックしません。** `blocking` は型でも **常に false** です。
+判断は人間が行います（決定 D-08）。将来もこのフィールドを true にする実装を
+入れないでください。Workspace 側も、この payload を根拠に切替を拒否しないでください。
+
+| フィールド | 意味 |
+|---|---|
+| `safe` | signal が green で、**かつ**すべての `conditions` が使えて助言上限の範囲内か。将来の高負荷時の安全は保証しません |
+| `warnings` | 切替の判断に効く事実（情報源・アラート・条件）。`safe` が false の理由を含みます |
+| `conditions` | いまの環境条件。`config/compute-mode-advisory.yaml` に並べた順で、**値が無くても件数は変わりません** |
+| `reference` | 直近に**観測された**フルロード期間。無ければ `null`（理由は `limitations`） |
+| `reference_count` | さかのぼり期間に見つかったフルロード期間の件数 |
+| `reference_window_days` | さかのぼった日数 |
+| `evaluated_at_ms` / `evaluated_at` | 履歴部分を評価した時刻。**`generated_at_ms` より古いことがあります** |
+| `limitations` | **比較できなかったこと。** 空でなければ判断材料が欠けています |
+
+`conditions` の1件は次の形です。`usable` は「`quality=ok` かつ設定の `max_age_s`
+以内」で、false のものを現在の条件として表示しないでください。`exceeded` は使える値が
+`advisory_max` を超えた場合だけ true です。`reference_value` / `delta` は
+`reference` と比較できたときだけ入ります。
+
 ```json
-{"safe": false, "warnings": ["active alert: INTAKE_HIGH (warning)"], "blocking": false}
+{"metric": "air.room", "value": 31.2, "unit": "C", "quality": "ok", "age_seconds": 0.4,
+ "usable": true, "advisory_max": 30.0, "exceeded": true, "reference_value": 26.1, "delta": 5.1}
 ```
 
-`safe` は**現在の決定論的 signal が green か**だけを示し、将来の高負荷時の
-安全を保証しません。実測フルロード履歴との比較は #50 の測定完了後に追加します。
-`blocking` は型でも **常に false** です。判断は人間が行います（決定 D-08）。
-将来もこのフィールドを true にする実装を入れないでください。
+**`reference` は観測された電力から導きます。** GPU Mode の申告
+（`POST` 相当のイベント / `sys.gpu_mode`）は根拠にしません（[決定記録 0045](decisions/0045-local-socket-write-entry.md) §2.6）。
+時刻と継続時間は根拠になったバケットの時刻から決まり、現在時刻からは作りません。
+`covered_s` は**観測できたバケットの合計**で、欠落した時間を含みません。
+
+**`reference` が `null` のときに「比較の結果、問題なし」と表示しないでください。**
+比較していないことを画面に出してください。同じく `limitations` が空でないときは、
+どの材料が欠けたかを人が読める形で出してください。
+
+しきい値（`advisory_max`・フルロードとみなす電力・さかのぼり日数など）はすべて
+`config/compute-mode-advisory.yaml` にあり、**現時点では暫定値**です
+（実測は #50 / #19）。設定は `COLDAISLE_COMPUTE_MODE_ADVISORY` で差し替えられます。
 
 ### `GET /api/v1/health`
 
@@ -284,9 +341,11 @@ coldaisle のエアフロー画面（`/airflow.html`、#106）が使う**表示�
 
 ### `GET /api/v1/events`
 
-GPU Mode の切り替え（AI / Compute）など、外から通知された事象を時刻順に返します（#67）。
+GPU Mode の切り替え（AI / Compute）や Workload Hint など、外から通知された事象を
+時刻順に返します（#67 / #107）。
 温度・電力の `series` と同じ時間軸に重ねるための注釈です。
-パラメータは `from` / `to` または `window`、`kind`（複数可。例 `kind=gpu_mode`）、`limit`（既定 500）。
+パラメータは `from` / `to` または `window`、`kind`（複数可。例 `kind=gpu_mode`・
+`kind=workload_hint`）、`limit`（既定 500）。
 
 ```json
 {
@@ -296,14 +355,31 @@ GPU Mode の切り替え（AI / Compute）など、外から通知された事�
   "events": [
     {"id": 12, "ts_ms": 1787614200000, "ts": "2026-08-24T23:30:00+00:00",
      "kind": "gpu_mode",
-     "payload": {"v": 1, "type": "gpu_mode", "mode": "compute", "source": "workspace-gpu-manager"}}
+     "payload": {"v": 1, "type": "gpu_mode", "mode": "compute", "source": "workspace-gpu-manager"}},
+    {"id": 13, "ts_ms": 1787614260000, "ts": "2026-08-24T23:31:00+00:00",
+     "kind": "workload_hint",
+     "payload": {"v": 1, "type": "workload_hint", "hint_v": 1, "phase": "start",
+                 "workload": "training", "expected_duration_s": 14400,
+                 "source": "workspace-job-launcher"}}
   ]
 }
 ```
 
+`kind` ごとの `payload`:
+
+| `kind` | `payload` の中身 |
+|---|---|
+| `gpu_mode` | `mode`（`ai` / `compute`）、任意で `source` / `note` |
+| `workload_hint` | `hint_v`（ヒント本体の版。いまは `1`）、`phase`（`start` / `end`）、`start` のときだけ `workload`（`training` / `benchmark` / `inference_service`）、任意で `expected_duration_s`（`start` のときだけ）/ `source` / `note`（決定記録 0064 §2.3） |
+
+**Workload Hint は書き手の申告であって、測定値ではありません。** いまは記録するだけで
+（決定記録 0064 §2.10 の Stage A）、制御は読みません。`server-health` などの「いまの値」にも
+反映されません（0064 §2.4）。知らない `hint_v` の行は、推測で解釈せず「ヒント無し」として扱ってください。
+
 **このエンドポイントは読み取り専用です。** 事象を書き込む入口は API ではなく、
 別プロセスのローカル Unix ソケット（`coldaisle-eventd`、クライアントは
-`coldaisle-event gpu-mode ai|compute`）です（決定記録 0045）。
+`coldaisle-event gpu-mode ai|compute` と
+`coldaisle-event workload-hint training|benchmark|inference_service|end`）です（決定記録 0045 / 0064）。
 Workspace の GPU Manager は HTTP ではなくこのソケットへ通知してください。
 受理した GPU Mode は `server-health` の `gpu.mode` にも反映されます。
 

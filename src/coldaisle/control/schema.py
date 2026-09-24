@@ -38,8 +38,10 @@ SCHEMA_VERSION: Literal[8] = 8
 - v6（#90）: Shadow Mode の counterfactual 記録（`shadow`）。**適用した demand とは別の枠**に
   置き、適用した制御器と同じ controller を counterfactual にできない。保存済みの v1〜v5 は
   そのまま読める
-- v7: **#159（PR #160）が先に確保した番号**。判断を出した model artifact の hash を
-  `model_gate` へ足す。番号を取り合わないため、本 module では欠番として扱う
+- v7（#159 / 決定記録 0059）: 判断を出した model artifact の hash
+  （`model_gate.artifact_sha256`。`ModelGateDecision` の schema version も 2 へ上げる）。
+  **裏づけのある推論にだけ付く。** 保存済みの v1〜v6 はそのまま読め、欄の無い tick は
+  「artifact 不明」として扱う（昇格の証拠に使わない。fail closed）
 - v8（#74 / 決定記録 0060）: control loop の実行そのものの記録（`runtime`）。tick の所要時間・
   締め切り超過・周期・snapshot schema・設定の内容ハッシュを、判断と同じ行に残す。
   保存済みの v1〜v7 はそのまま読める
@@ -47,6 +49,9 @@ SCHEMA_VERSION: Literal[8] = 8
 
 Demand = Annotated[float, Field(ge=0.0, le=1.0, allow_inf_nan=False)]
 """制御の内部単位（0027 §2.1）。**NaN / 無限大は拒否する**（0028 §2.1）。"""
+
+Sha256Hex = Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
+"""sha256 の16進表現。**大文字や短縮形を受け取らない。**"""
 
 HWMON_PWM_MAX = 255
 """hwmon の ABI が定める `pwmN` の最大値。調整する値ではない。"""
@@ -574,6 +579,16 @@ OOD_REASON_PREFIX = "ood_"
 """OOD と判定した構成要素の理由に付く接頭辞。"""
 
 
+MODEL_GATE_SCHEMA_VERSION: Literal[2] = 2
+"""`ModelGateDecision` の形の版（`ControlTick` の中に入れ子で入る。決定記録 0065 §2.2）。
+
+- v2（#159）: `artifact_sha256`。**保存済みの v1 はそのまま読め、artifact を持てない。**
+  `ControlTick` v7 以降はこの v2 を、v1〜v6 は v1 を要求する。入れ子の版を上げないと、
+  v7 の trace が「v1 と名乗るのに v1 には無かった欄を持つ」記録を書いてしまう
+  （codex #4057753201）。
+"""
+
+
 class ModelGateDecision(_Frozen):
     """Confidence / OOD Gate の1 tick の判断（決定記録 0050 §2.5）。
 
@@ -581,10 +596,26 @@ class ModelGateDecision(_Frozen):
     この型は「なぜ ML をその範囲で使った / 使わなかったか」だけを残す。
     """
 
-    schema_version: Literal[1] = 1
+    schema_version: Literal[1, 2]
+    """判断の形の版。**入力では必須で、既定値を持たない**（codex #4092017585）。
+
+    版の無い記録を最新版（v2）として読まない。作る側（Gate）は
+    `MODEL_GATE_SCHEMA_VERSION` を明示して渡す。
+    """
     model_version: str = Field(min_length=1, max_length=120)
     inference_id: str = Field(pattern=r"^[0-9a-f]{64}$")
     """判定した推論（入力と予測）の識別子。提案の ``inference_id`` と同じ。"""
+    artifact_sha256: Sha256Hex | None = None
+    """この判断を出した **model artifact** の hash（`ControlTick` v7。#159）。
+
+    **裏づけのある assessment からしか来ない。** 提案は artifact の欄を持たず、Gate は
+    検証済み（`REGISTRY_VERIFIED`）の ``ConfidenceAssessment`` の値をそのまま写す。
+    自称値や呼び出し側から受け取った値を書く経路を作らない（#85 の束縛をそのまま使う）。
+
+    **裏づけの無い判断には付かない。** 保存済みの v1〜v6 の tick も欄を持たないので、
+    どちらも **「artifact 不明」**として扱う。昇格の証拠（#92 / 決定記録 0057 §2.4）に
+    使えるのは、artifact を言える tick だけである（fail closed）。
+    """
     attested: bool
     """検証済み assessment に裏付けられた記録か。
 
@@ -612,6 +643,13 @@ class ModelGateDecision(_Frozen):
             raise ValueError("authority limit の根拠を重複させない")
         if self.attested != (self.confidence is not None):
             raise ValueError("attested な記録だけが confidence を持つ")
+        if not self.attested and self.artifact_sha256 is not None:
+            # 裏づけの無い判断に artifact を書くと、別の推論の artifact が「この tick の
+            # 実績」として読まれる。**束縛できていない identity は残さない。**
+            raise ValueError("裏づけの無い記録に artifact_sha256 を残さない")
+        if self.schema_version < 2 and self.artifact_sha256 is not None:
+            # v1 の記録にこの欄は無かった。後から足して読ませない。
+            raise ValueError("artifact を記録する model_gate は schema version 2 にする")
         if (self.confidence is None) != (self.ood is None):
             raise ValueError("model_gate の confidence と ood は一緒に記録する")
         if not self.attested:
@@ -705,8 +743,6 @@ MAX_SHADOW_PREDICTION_METRICS = 32
 
 MAX_SHADOW_METRIC_NAME_LENGTH = 120
 """予測 metric 名の長さの上限。`MAX_METRIC_NAME_LENGTH`（#84）に合わせる（同上）。"""
-
-Sha256Hex = Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
 
 SHADOW_METRIC_NAME_PATTERN = r"^[a-z][a-z0-9_]*(\.[a-z0-9_]+){1,3}$"
 """予測 metric 名の形。**`ThermalMetricName`（#84）と同じ**にする。
@@ -1353,6 +1389,48 @@ class ControlTick(_Frozen):
                 raise ValueError(f"{zone.value}: AUTO なのに Guard の ceiling を掛けていない")
         return self
 
+    @property
+    def applied_model_artifact(self) -> str | None:
+        """**この tick の requested を実際に作った** model artifact（#159）。
+
+        返すのは、裏づけのある判断（`attested`）で Learned MPC が選ばれ、かつ artifact を
+        記録していた tick の hash だけである。次のどれかなら `None`、すなわち
+        **「artifact 不明」**として扱う（昇格の証拠に使わない。fail closed）。
+
+        - `model_gate` の無い tick（提案が無かった / Fallback で回していた /
+          `model_gate` を持たない v1〜v4 の trace）
+        - 裏づけの無い判断（`attested` でない）
+        - Learned MPC を選ばなかった tick（提案は counterfactual に残る）
+        - artifact の欄を持たない保存済みの v1〜v6 の trace
+
+        **「言えない」と「そうではなかった」は別物である。** 適用した tick かどうかは
+        `applied_artifact_unknown` が別に答える。
+        """
+        gate = self.model_gate
+        if gate is None or not gate.attested or not gate.learned_selected:
+            return None
+        return gate.artifact_sha256
+
+    @property
+    def applied_artifact_unknown(self) -> bool:
+        """Learned MPC を**適用したのに** artifact を言えない tick か。
+
+        保存済みの v1〜v6 がこれに当たる。**「記録が無いだけ」と「束縛できた」を混ぜない**
+        ために、数えられる形で分けて持つ（#91 / #92 が部分的な証拠を完全として扱わないため）。
+
+        **判断の起点は `model_gate` ではなく `ControlState` である**（codex #4057527947）。
+        `model_gate` を必須にしたのは v5 からで、**v1〜v4 は Learned MPC を適用した tick でも
+        `model_gate` を持たない。** gate の有無から数えると、そういう tick が
+        「artifact 不明」にも「束縛できた」にも数えられず、**欠けていること自体が消える。**
+        `#92` の「適用 arm すべてに不明が無いこと」が、記録の無い区間を素通りしてしまう。
+
+        `active_controller` と `model_gate.learned_selected` の一致は v5 以降で schema が
+        要求しているので、起点を `ControlState` にしても v5 以降の意味は変わらない。
+        """
+        if self.state.active_controller is not ControllerKind.LEARNED_MPC:
+            return False
+        return self.applied_model_artifact is None
+
     def _check_model_gate(self) -> None:
         """v5 の ``model_gate`` が ControlState と同じ判断を指しているか。"""
         state = self.state
@@ -1375,6 +1453,18 @@ class ControlTick(_Frozen):
             return
         if self.schema_version < 5:
             raise ValueError("model_gate を記録する ControlTick は schema version 5 にする")
+        if self.schema_version < 7:
+            if gate.schema_version >= 2:
+                raise ValueError("artifact を記録する ControlTick は schema version 7 にする")
+        elif gate.schema_version < 2:
+            # v7 の tick が v1 の判断を抱えられると、「artifact の欄が無い」記録を
+            # **新しい trace でも**作れてしまう。
+            raise ValueError("v7 の ControlTick には schema version 2 の model_gate が要る")
+        elif gate.attested and gate.artifact_sha256 is None:
+            # **新しい trace で「artifact 不明」を作れないようにする。** 作れると、
+            # 束縛できる形に直したあとも、欄を空けるだけで束縛を外せてしまう。
+            # 保存済みの v1〜v6 だけが「artifact 不明」でありうる。
+            raise ValueError("v7 の裏づけのある model_gate には artifact_sha256 が要る")
         if (state.model_version, state.model_confidence, state.model_ood) != (
             gate.model_version,
             gate.confidence,
@@ -1456,6 +1546,14 @@ class ControlTick(_Frozen):
             raise ValueError("counterfactual の confidence / ood を model_gate と揃える")
         if item.model_version is not None and item.model_version != gate.model_version:
             raise ValueError("counterfactual の model_version を model_gate と揃える")
+        if (
+            gate.artifact_sha256 is not None
+            and item.artifact_sha256 is not None
+            and item.artifact_sha256 != gate.artifact_sha256
+        ):
+            # 同じ tick の2つの記録が別の artifact を名乗ると、あとから読む側が
+            # 「どの artifact の提案か」を決められない。
+            raise ValueError("counterfactual と model_gate が別の artifact を指している")
 
     def _check_fault_response(self, fault: Fault) -> None:
         """0028 §2.7 の無条件の対応を満たしているか。"""
