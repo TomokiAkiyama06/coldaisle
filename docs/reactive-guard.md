@@ -36,6 +36,11 @@ hysteresis 状態を維持する。signal が `missing` / `suspect` / `stale` �
 `GuardZoneOutput`、比較した値と閾値、使えなかった入力、開始・解除 event を持つ。inactive な
 `GuardZoneOutput` は理由を持てない既存契約なので、解除理由は `events` に残す。
 
+Control loop（`coldaisle-fand`）は `events` を1件ずつ構造化ログ（`reactive guard started` /
+`reactive guard released`）へ出す。欄は tick id・単調時計時刻・zone・理由・発火した trigger・
+閾値組。decision trace（`ControlTick`）には zone ごとの `guard_floor` と理由だけが残り、
+解除の理由は持たないため、解除の経緯はこのログから辿る。
+
 上昇への先回りで demand を下げないため、v1 の trigger は floor だけを出し、ceiling は
 出さない。型の `ceiling` は将来、別途安全性を定義した行き過ぎ抑制 rule を追加できる境界
 として残す。Critical Safety の floor は Guard の ceiling より常に強く、forced Max は
