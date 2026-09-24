@@ -1186,18 +1186,56 @@ def test_invariant_19_b_a_candidate_cut_short_cannot_look_safer(trained: Any) ->
         update={"steps": full.steps[:-1], "termination": TerminationReason.DYNAMICS_UNUSABLE}
     )
     cut_arm = base.model_copy(update={"episodes": (cut,), "policy_version": "cand-cut"})
-    # 対照: 同じ長さを走り切って違反しなかった候補は、正しく改善になる。
+    # (a) **記録の数は同じ**で、候補の最後の記録だけが採点できない終端。環境は採点できない
+    # 終端 step も記録に積むので、記録の数で比べると打ち切りを見落とす。
+    last = full.steps[-1]
+    unsupported_last = last.model_copy(
+        update={
+            "supported": False,
+            "unsupported_reason": Reason(code="dynamics_unusable", detail="試験"),
+            "applied": None,
+            "observed": {},
+            "provenance": None,
+            "reward": None,
+        }
+    )
+    same_count = full.model_copy(
+        update={
+            "steps": (*full.steps[:-1], unsupported_last),
+            "termination": TerminationReason.DYNAMICS_UNUSABLE,
+        }
+    )
+    same_count_arm = base.model_copy(
+        update={"episodes": (same_count,), "policy_version": "cand-same-count"}
+    )
+    assert len(same_count.steps) == len(violated.steps)
+    # (b) 候補が**自分の違反**で先に終わった場合は、その違反が台帳に載るので打ち切りではない。
+    own = full.model_copy(
+        update={
+            "steps": full.steps[:-1],
+            "safety": full.safety.model_copy(update={"ceiling_exceedances": 1}),
+            "termination": TerminationReason.SAFETY_VIOLATION,
+        }
+    )
+    own_arm = base.model_copy(update={"episodes": (own,), "policy_version": "cand-own"})
+    # (c) 対照: 同じ長さを走り切って違反しなかった候補は、正しく改善になる。
     clean_arm = base.model_copy(update={"episodes": (full,), "policy_version": "cand-clean"})
 
     assert truncated_episodes(cut_arm, baseline_arm) == ("pr89-a",)
+    assert truncated_episodes(same_count_arm, baseline_arm) == ("pr89-a",)
+    assert truncated_episodes(own_arm, baseline_arm) == ()
     assert truncated_episodes(clean_arm, baseline_arm) == ()
 
-    arms = {"cut": cut_arm, "clean": clean_arm}
+    arms = {"cut": cut_arm, "same-count": same_count_arm, "own": own_arm, "clean": clean_arm}
     horizon = common_matched_steps((baseline_arm, *arms.values()))
     outcomes = trainer._score(arms=arms, rejections={}, baseline_arm=baseline_arm, horizon=horizon)
-    assert outcomes["cut"].safety_violations < baseline_arm.safety_violations
-    assert outcomes["cut"].truncated_episodes == ("pr89-a",)
-    assert outcomes["cut"].improved is False
+    for identifier in ("cut", "same-count"):
+        assert outcomes[identifier].safety_violations < baseline_arm.safety_violations
+        assert outcomes[identifier].truncated_episodes == ("pr89-a",)
+        assert outcomes[identifier].improved is False
+    assert outcomes["own"].truncated_episodes == ()
+    assert outcomes["own"].safety_violations == baseline_arm.safety_violations
+    assert outcomes["clean"].truncated_episodes == ()
     assert outcomes["clean"].improved is True
     assert trainer._select(outcomes) == "clean"
 

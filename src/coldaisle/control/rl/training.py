@@ -195,7 +195,8 @@ class CandidateOutcome(_Frozen):
     )
     improved: bool
     truncated_episodes: tuple[str, ...] = ()
-    """Baseline より**早く、自分の安全違反・範囲外 action 以外の理由で**終わった episode。
+    """Baseline より**観測した step が少なく、自分の安全違反・範囲外 action 以外の理由で**
+    終わった episode（判定は `truncated_episodes()`。記録の数ではなく採点できた step 数で比べる）。
 
     安全側の台帳（`safety_violations` / `invalid_actions`）は episode 全体を数えるので、
     採点できなくなって先に終わった候補は、Baseline がその後で踏んだ違反をそもそも観測しない。
@@ -328,17 +329,26 @@ _OWN_FAILURE_TERMINATIONS = frozenset(
 
 
 def truncated_episodes(arm: PolicyArm, baseline: PolicyArm) -> tuple[str, ...]:
-    """`arm` が Baseline より**少ない step で、自分の違反以外の理由で**終わった episode。
+    """`arm` が Baseline より**観測した step が少なく、自分の違反以外の理由で**終わった episode。
 
-    安全側の台帳は episode 全体を数えるので、長さの違う arm の違反数は同じ区間を
-    見ていない。自分の違反で短くなった場合は、その違反が台帳に載っているので除く。
+    判定は**終わり方**で行う。候補の終端理由が自分の違反・範囲外 action でなく、かつ
+    **採点できた（= 成果と安全を観測した）step 数**が Baseline より少なければ打ち切りとみなす。
+
+    記録の数（`steps`）では比べない。環境は採点できない終端 step も記録に積むので、
+    Baseline が最後の step で違反し、候補が同じ位置で `dynamics_unusable` の記録を積むと、
+    記録の数は同じでも候補はその step の安全を観測していない。途中に採点できない step を
+    挟んだ候補も同じで、観測していない区間の違反は台帳に載らない。
+
+    自分の違反・範囲外 action で終わった候補は、その違反が台帳に載っているので除く。
+    Baseline も同じだけしか観測できなかった場合（採点できた step 数が等しい）も除く。
     """
     return tuple(
         sorted(
             episode.episode_id
             for episode in arm.episodes
             if episode.termination not in _OWN_FAILURE_TERMINATIONS
-            and len(episode.steps) < len(baseline.episode(episode.episode_id).steps)
+            and len(episode.supported_steps)
+            < len(baseline.episode(episode.episode_id).supported_steps)
         )
     )
 

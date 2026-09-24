@@ -291,6 +291,9 @@ Baseline の欄が `output_bounds` の外にあれば**丸めず拒む**。
   踏んだ違反を観測しないまま「違反が少ない」ことになる。該当する episode は
   `CandidateOutcome.truncated_episodes` に残し、1つでもあれば `improved=False` とする。
   自分の違反・範囲外 action で短くなった場合は、その違反が台帳に載るので対象外
+  - 比べるのは**記録の数ではなく採点できた step の数**（成果と安全を観測した step）である。
+    環境は採点できない終端 step も記録に積むので、記録の数で比べると、Baseline が最後の
+    step で違反し候補が同じ位置で採点できない終端を積んだ場合に、打ち切りを見落とす
 - **どの候補も Baseline を上回らなければ、Baseline の表が選ばれる。** 上回っていないのに
   別の表を出さないためで、その artifact は「Rule の戦略を RL artifact として表したもの」になる。
   shadow の配線を確かめるには十分で、戦略は何も変わらない
