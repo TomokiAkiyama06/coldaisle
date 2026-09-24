@@ -164,6 +164,15 @@ class _History:
     limitations: tuple[str, ...]
 
 
+_RETAINED_WINDOWS = 2
+"""履歴の結果を保持する窓の数。**調整値ではなく構造上の数**。
+
+呼び出し側は評価の直前に時刻を読むため、窓の境目で同時に参照されうるのは
+最新の窓とその直前の窓の2つだけ。この2つを窓単位で保持すれば、境目で遅れた
+前の窓の呼び出しが何本あっても、どちらの窓も1回だけ評価され同じ結果を返す。
+"""
+
+
 class ComputeModeAdvisor:
     """決定論的な advisory を組み立てる。AI も制御も関与しない。
 
@@ -176,7 +185,8 @@ class ComputeModeAdvisor:
         self._settings = settings
         self._catalog = catalog
         self._lock = threading.Lock()
-        self._cached: tuple[int, _History] | None = None
+        # 窓ごとの結果。保持するのは最新の窓とその直前の窓だけ（_RETAINED_WINDOWS）
+        self._cached: dict[int, _History] = {}
 
     @property
     def settings(self) -> ComputeModeAdvisorySettings:
@@ -273,14 +283,19 @@ class ComputeModeAdvisor:
         # 窓ごとの初回評価を1回に限る。離すと2本が別スナップショットで評価し、
         # 同じ窓で異なる reference を返したうえ、どちらが残るかが実行順で変わる
         with self._lock:
-            cached = self._cached
-            if cached is not None and cached[0] == window:
-                return cached[1]
+            cached = self._cached.get(window)
+            if cached is not None:
+                return cached
             history = self._evaluate_history(store, now_ms)
-            # 窓の境目で遅れて届いた前の窓の呼び出しが、新しい窓の結果を消さない
-            # （消すと新しい窓が2回評価され、同じ窓で結果が変わりうる）
-            if cached is None or cached[0] < window:
-                self._cached = (window, history)
+            newest = max(self._cached, default=window)
+            if window <= newest - _RETAINED_WINDOWS:
+                # 保持範囲より古い窓（refresh_s 以上遅れた呼び出し）は結果を返すだけ。
+                # 新しい窓の結果を押し出さない
+                return history
+            self._cached[window] = history
+            newest = max(newest, window)
+            for stale in [key for key in self._cached if key <= newest - _RETAINED_WINDOWS]:
+                del self._cached[stale]
             return history
 
     def _evaluate_history(self, store: SqliteStore, now_ms: int) -> _History:

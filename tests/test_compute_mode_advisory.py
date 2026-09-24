@@ -602,6 +602,36 @@ def test_a_late_call_from_an_older_window_does_not_evict_the_newer_result(
     assert calls == [newer_ms, older_ms]
 
 
+def test_the_previous_window_is_also_evaluated_once_after_the_newer_one_is_cached(
+    tmp_path, rules, catalog, monkeypatch
+):
+    """新しい窓を保持したあとでも、**前の窓は1回だけ評価し、同じ結果を返す**。
+
+    境目で遅れた前の窓の呼び出しが2本あっても、評価が2回走って別の reference を
+    返してはいけない。
+    """
+    advisor = ComputeModeAdvisor(_settings(tmp_path, catalog), catalog)
+    calls: list[int] = []
+
+    def counting(store, now_ms):
+        calls.append(now_ms)
+        return _History(None, len(calls), now_ms, ())
+
+    monkeypatch.setattr(advisor, "_evaluate_history", counting)
+    refresh_ms = BASE_SETTINGS["history"]["refresh_s"] * 1000
+    newer_ms = NOW_MS + refresh_ms
+    older_ms = newer_ms - 1_000
+    with _store(tmp_path, rules) as store:
+        newer = advisor._history(store, newer_ms)
+        first_older = advisor._history(store, older_ms)
+        second_older = advisor._history(store, older_ms - 1_000)
+        newer_again = advisor._history(store, newer_ms + 1_000)
+
+    assert calls == [newer_ms, older_ms]
+    assert second_older is first_older
+    assert newer_again is newer
+
+
 def test_the_bucket_still_in_progress_is_not_counted_as_a_full_bucket(tmp_path, rules, catalog):
     """進行中のバケットを5分ぶんの観測として数えない（0063 §2.3）。
 
