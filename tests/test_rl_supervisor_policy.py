@@ -895,6 +895,49 @@ def test_the_training_report_cannot_claim_promotable_it_does_not_derive(trained:
         )
 
 
+def test_the_training_report_cannot_claim_an_improvement_it_does_not_derive(
+    trained: Any,
+) -> None:
+    """**改善の判定は、報告の記録から導き直した値だけ。**
+
+    選ばれた候補・報告・artifact の3か所を揃えて「改善した」と書き換えても、記録した
+    安全側の数・reward・下限から導いた値と違えば受け取らない。
+    """
+    environment, _config, settings, _safety = build_environment(trained, with_mpc=True)
+    specs = (episode_spec(episode_id="pr89-a", seed=3),)
+    report = trainer_for(environment, settings).train(
+        specs, model_version="0.1.0", created_at=CREATED_AT
+    )
+    assert all(outcome.comparable for outcome in report.outcomes)
+    # 本物の報告はそのまま往復できる。
+    restored = SupervisorPolicyTrainingReport.model_validate_json(report.model_dump_json())
+    assert restored.digest() == report.digest()
+
+    document = json.loads(report.model_dump_json())
+    selected_index = next(
+        index
+        for index, outcome in enumerate(document["outcomes"])
+        if outcome["candidate_id"] == report.selected_candidate_id
+    )
+    assert report.improved_over_baseline is False
+    # 3か所を揃えて改善を名乗らせる（自称どうしは整合している）。
+    tampered = json.loads(json.dumps(document))
+    tampered["outcomes"][selected_index]["improved"] = True
+    tampered["improved_over_baseline"] = True
+    tampered["artifact"]["manifest"]["training_evidence"]["improved_over_baseline"] = True
+    with pytest.raises(ValidationError, match="改善判定が記録から導いた値と一致しない"):
+        SupervisorPolicyTrainingReport.model_validate_json(json.dumps(tampered))
+
+    # 選ばれていない候補に改善を名乗らせても受け取らない。
+    other_index = next(
+        index for index in range(len(document["outcomes"])) if index != selected_index
+    )
+    tampered = json.loads(json.dumps(document))
+    tampered["outcomes"][other_index]["improved"] = True
+    with pytest.raises(ValidationError, match="導いた"):
+        SupervisorPolicyTrainingReport.model_validate_json(json.dumps(tampered))
+
+
 def test_supervisor_decision_v2_carries_identity_and_v1_still_reads() -> None:
     """**識別を足した decision は版を上げる。** 保存済みの v1 はそのまま読める。"""
     decision = paired_decision(tick_id=1)

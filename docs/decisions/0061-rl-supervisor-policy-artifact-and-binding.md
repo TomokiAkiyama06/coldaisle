@@ -263,6 +263,17 @@ shadow:   { minimum_ticks, minimum_paired_fraction }
     `usable=True` を受け取らないためである。学習報告の `promotable` と artifact の
     `counterfactual_backed` も同じく、報告が持つ比較から導く値（`training_counterfactual_backed()`）
     と一致しなければ受け取らない
+  - **学習報告に残す値のうち、記録から導けるものはすべて導き直して照合する。** 自称どうしが
+    揃っているだけでは、揃えて書き換えた報告が通るためである。探索と報告の型は同じ関数を使う
+    - 各候補の `improved`: `candidate_improved()`（記録した安全側の数・共通の長さの reward・
+      Baseline arm の値・報告に残した `minimum_reward_improvement` から導く）。短い候補と
+      比べられなかった候補は常に false
+    - `selected_candidate_id`: `select_candidate()`。`improved_over_baseline` は選ばれた候補の値
+    - 選ばれた候補の安全側の数・`short_episodes`・reward、全候補の Baseline の reward: 比較に
+      残した arm と `common_matched_steps` から導く
+    - `learned_controller_available`: 比較から導く。`comparable` は却下理由の有無と対
+    - artifact の `promotable_episodes` / `total_episodes` / `conditions_sha256` /
+      `baseline_policy_version`: 比較と報告から導く
 - 集計の digest は #104 の `shadow_evaluation_ref` にそのまま渡せる
 
 違う regime を前提にした提案どうしの比較は、**`SupervisorDecision` の段階で作れない**

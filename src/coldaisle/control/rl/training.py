@@ -25,7 +25,7 @@ strategy / target band と `rl-policy.yaml` の weight 候補の組み合わせ�
 from __future__ import annotations
 
 import math
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from random import Random
 from typing import Literal, Self
 
@@ -253,6 +253,61 @@ class CandidateOutcome(_Frozen):
         return self
 
 
+def candidate_improved(
+    *,
+    safety_violations: int,
+    invalid_actions: int,
+    mean_reward: float | None,
+    baseline_safety_violations: int,
+    baseline_invalid_actions: int,
+    baseline_mean_reward: float | None,
+    minimum_reward_improvement: float,
+) -> bool:
+    """候補が Baseline を上回ったか。**探索と報告の型が同じこの関数を使う。**
+
+    `(安全側の違反, 範囲外 action, -reward)` の辞書式比較で厳密に小さいこと。安全側が
+    同点のときだけ reward の差を見て、差は正かつ設定した下限以上であること。
+    reward を出せない側（`None`）は勝てない。
+    """
+    key = (safety_violations, invalid_actions, _rank_value(mean_reward))
+    baseline_key = (
+        baseline_safety_violations,
+        baseline_invalid_actions,
+        _rank_value(baseline_mean_reward),
+    )
+    if not key < baseline_key:
+        return False
+    if key[:2] != baseline_key[:2]:
+        return True
+    return (
+        mean_reward is not None
+        and baseline_mean_reward is not None
+        and (mean_reward - baseline_mean_reward) > 0.0
+        and (mean_reward - baseline_mean_reward) >= minimum_reward_improvement
+    )
+
+
+def select_candidate(outcomes: Iterable[CandidateOutcome]) -> str:
+    """改善した候補の中から最良を選ぶ。**1つも無ければ Baseline の表を選ぶ。**
+
+    並び替えの鍵は `(安全側の違反, 範囲外 action, -reward, 識別子)` で、
+    **評価順に依らない**。同点は識別子で決める。探索と報告の型が同じこの関数を使う。
+    """
+    improved = [outcome for outcome in outcomes if outcome.improved]
+    if not improved:
+        return BASELINE_CANDIDATE_ID
+    best = min(
+        improved,
+        key=lambda outcome: (
+            outcome.safety_violations,
+            outcome.invalid_actions,
+            -(outcome.mean_reward_over_common_horizon or 0.0),
+            outcome.candidate_id,
+        ),
+    )
+    return best.candidate_id
+
+
 def training_counterfactual_backed(
     *, improved_over_baseline: bool, comparison: PolicyComparison
 ) -> bool:
@@ -294,6 +349,12 @@ class SupervisorPolicyTrainingReport(_Frozen):
     候補の順位はこの長さの上だけで決める。hash では読めないので欄としても残す
     （決定記録 0056 §2.3 と同じ理由）。
     """
+    minimum_reward_improvement: float = Field(allow_inf_nan=False)
+    """探索で使った `search.minimum_reward_improvement`。
+
+    **改善の判定を報告の記録だけから導き直すため**に残す。無いと、保存した報告の
+    `improved` が本当に比較から出た値かを確かめられない。
+    """
     artifact: SupervisorPolicyArtifact
     promotable: bool
     """この結果を昇格の根拠にしてよいか。**反実仮想の裏づけが無ければ立たない。**"""
@@ -319,6 +380,7 @@ class SupervisorPolicyTrainingReport(_Frozen):
             raise ValueError("artifact の改善判定が報告と一致しない")
         if evidence.learned_controller_available != self.learned_controller_available:
             raise ValueError("artifact の Learned MPC の有無が報告と一致しない")
+        self._check_derived_values(selected)
         if self.promotable:
             if not self.improved_over_baseline:
                 raise ValueError("Baseline を上回らない結果を昇格の根拠にしない")
@@ -335,6 +397,64 @@ class SupervisorPolicyTrainingReport(_Frozen):
             # 報告や手で作った報告が、探索なら立てない `promotable` を名乗れないようにする。
             raise ValueError("promotable / counterfactual_backed が比較から導いた値と一致しない")
         return self
+
+    def _check_derived_values(self, selected: CandidateOutcome) -> None:
+        """**記録から導ける値は、導いた値と一致しなければ受け取らない。**
+
+        探索と同じ関数で導き直す。自称の値どうしが揃っているだけでは足りない
+        （揃えて書き換えた報告が通ってしまう）。
+        """
+        baseline_arm, selected_arm = self.comparison.arms[0], self.comparison.arms[-1]
+        horizon = self.common_matched_steps
+        baseline_mean = mean_reward_over(baseline_arm, horizon)
+        if self.learned_controller_available != self.comparison.learned_controller_available:
+            raise ValueError("Learned MPC の有無が比較から導いた値と一致しない")
+        if self.baseline_policy_version != baseline_arm.policy_version:
+            raise ValueError("Baseline の版が比較の Baseline arm と一致しない")
+        # 選ばれた候補の欄は、比較に残した arm から導き直せる。
+        if (selected.safety_violations, selected.invalid_actions) != (
+            selected_arm.safety_violations,
+            selected_arm.invalid_actions,
+        ):
+            raise ValueError("選ばれた候補の安全側の記録が比較の arm と一致しない")
+        if selected.comparable:
+            expected_short = short_episodes(selected_arm, baseline_arm)
+            if selected.short_episodes != expected_short:
+                raise ValueError("選ばれた候補の short_episodes が比較から導いた値と一致しない")
+            expected_mean = None if expected_short else mean_reward_over(selected_arm, horizon)
+            if selected.mean_reward_over_common_horizon != expected_mean:
+                raise ValueError("選ばれた候補の reward が比較から導いた値と一致しない")
+        for outcome in self.outcomes:
+            if not outcome.comparable:
+                continue
+            if outcome.baseline_mean_reward_over_common_horizon != baseline_mean:
+                raise ValueError("Baseline の reward が比較から導いた値と一致しない")
+            expected = not outcome.short_episodes and candidate_improved(
+                safety_violations=outcome.safety_violations,
+                invalid_actions=outcome.invalid_actions,
+                mean_reward=outcome.mean_reward_over_common_horizon,
+                baseline_safety_violations=baseline_arm.safety_violations,
+                baseline_invalid_actions=baseline_arm.invalid_actions,
+                baseline_mean_reward=baseline_mean,
+                minimum_reward_improvement=self.minimum_reward_improvement,
+            )
+            if outcome.improved != expected:
+                raise ValueError(
+                    f"候補の改善判定が記録から導いた値と一致しない（{outcome.candidate_id}）"
+                )
+        if self.selected_candidate_id != select_candidate(self.outcomes):
+            raise ValueError("選ばれた候補が記録から導いた選択と一致しない")
+        evidence = self.artifact.manifest.training_evidence
+        promotable_episodes = sum(1 for episode in selected_arm.episodes if episode.promotable)
+        if (evidence.promotable_episodes, evidence.total_episodes) != (
+            promotable_episodes,
+            len(selected_arm.episodes),
+        ):
+            raise ValueError("artifact の episode 数が比較から導いた値と一致しない")
+        if evidence.conditions_sha256 != self.comparison.conditions_sha256:
+            raise ValueError("artifact の条件 hash が比較と一致しない")
+        if evidence.baseline_policy_version != self.baseline_policy_version:
+            raise ValueError("artifact の Baseline の版が報告と一致しない")
 
     def digest(self) -> str:
         """この報告そのものを表す SHA-256。"""
@@ -790,6 +910,7 @@ class SupervisorPolicyTrainer:
             learned_controller_available=self._environment.learned_controller_available,
             comparison=comparison,
             common_matched_steps=dict(sorted(horizon.items())),
+            minimum_reward_improvement=self._config.search.minimum_reward_improvement.value,
             artifact=artifact,
             promotable=counterfactual_backed,
         )
@@ -864,21 +985,15 @@ class SupervisorPolicyTrainer:
                 )
                 continue
             mean = mean_reward_over(arm, horizon)
-            key = (arm.safety_violations, arm.invalid_actions, _rank_value(mean))
-            baseline_key = (
-                baseline_arm.safety_violations,
-                baseline_arm.invalid_actions,
-                _rank_value(baseline_mean),
+            improved = candidate_improved(
+                safety_violations=arm.safety_violations,
+                invalid_actions=arm.invalid_actions,
+                mean_reward=mean,
+                baseline_safety_violations=baseline_arm.safety_violations,
+                baseline_invalid_actions=baseline_arm.invalid_actions,
+                baseline_mean_reward=baseline_mean,
+                minimum_reward_improvement=minimum,
             )
-            improved = key < baseline_key
-            if improved and key[:2] == baseline_key[:2]:
-                # 安全側が同点のときだけ reward の差を見る。差は設定した下限を満たすこと。
-                improved = (
-                    mean is not None
-                    and baseline_mean is not None
-                    and (mean - baseline_mean) > 0.0
-                    and (mean - baseline_mean) >= minimum
-                )
             outcomes[identifier] = CandidateOutcome(
                 candidate_id=identifier,
                 policy_version=f"{self._config.artifact.model_id}-{identifier}",
@@ -892,25 +1007,9 @@ class SupervisorPolicyTrainer:
         return outcomes
 
     @staticmethod
-    def _select(outcomes: dict[str, CandidateOutcome]) -> str:
-        """改善した候補の中から最良を選ぶ。**1つも無ければ Baseline の表を選ぶ。**
-
-        並び替えの鍵は `(安全側の違反, 範囲外 action, -reward, 識別子)` で、
-        **評価順に依らない**。同点は識別子で決める。
-        """
-        improved = [outcome for outcome in outcomes.values() if outcome.improved]
-        if not improved:
-            return BASELINE_CANDIDATE_ID
-        best = min(
-            improved,
-            key=lambda outcome: (
-                outcome.safety_violations,
-                outcome.invalid_actions,
-                -(outcome.mean_reward_over_common_horizon or 0.0),
-                outcome.candidate_id,
-            ),
-        )
-        return best.candidate_id
+    def _select(outcomes: Mapping[str, CandidateOutcome]) -> str:
+        """改善した候補の中から最良を選ぶ（`select_candidate()`）。"""
+        return select_candidate(outcomes.values())
 
     def _build_artifact(
         self,
