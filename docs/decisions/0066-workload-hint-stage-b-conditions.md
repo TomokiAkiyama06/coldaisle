@@ -153,6 +153,12 @@ weight・band の単調性が**選ばれる Demand の単調性**をそのまま
     Model Confidence の設定を含む）と、Acoustic Cost Model / Air Balance Model / `BalanceBand` を計算するモジュールの
     内容ハッシュ。たとえば acoustic curve だけを変えても、同じハッシュのまま別の Demand を選ぶ Stage B が
     有効にならないようにする。`conditions()` に項目が増えたときは、それもそのまま束ねる（列挙を別に持たない）
+  - **実装は列挙ではなくソースツリー全体で束ねる。** 上の各「モジュールの内容ハッシュ」は説明のための例であり、
+    実際に束ねるのは `src/coldaisle/` 配下の全ソース（パスの昇順に、相対パスと内容を連結した digest）と
+    ロックファイルのハッシュである。`plan.py` の `HardConstraintSet` / `ActionPlan`、`counterfactual.py` の
+    prediction / offset の契約のような、結果に推移的に効く実装を列挙し漏らしても、未検証の組み合わせで
+    Stage B が有効にならないようにするため。代わりに、`src/coldaisle/` のどのコードを変えても (b) の再実行が要る。
+    これは Stage B を有効にしておく費用として受け入れる（再実行は CI で回す）
 - **一致しない、または記録が無い場合は Stage B を無効のまま（＝ヒントは記録のみ）で起動する**。
   ヒント無しの通常運転は安全側なので、ここは起動拒否にしない。
   稼働中に Thermal Model の昇格などで artifact が変わった場合も、同じ照合に落ちて Stage B を止める
