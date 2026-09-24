@@ -14,8 +14,9 @@
 
    ```bash
    # 予定の形（0045 の入口に noise_feedback を足す。実装は別 Issue）
-   uv run coldaisle-event noise-feedback loud
-   uv run coldaisle-event noise-feedback ok
+   uv run coldaisle-event noise-feedback loud --sampling prompted     # 定時の回答
+   uv run coldaisle-event noise-feedback ok --sampling prompted
+   uv run coldaisle-event noise-feedback loud --sampling spontaneous  # 気づいたときの回答
    ```
 
 3. 回答は2種類ある（0067 §2.1）
@@ -28,6 +29,7 @@
 - 回答は、回答の時刻**以前で最も新しい** decision trace の tick の **effective の Demand** と RPM に
   結びつけて集計する。回答の直前の区間で Demand が変わっていた回答は使わない（0067 §2.4）
 - `events` の行には 0045 どおり書き手の `peer_uid` が残る（0067 §2.2）
+- 回答と tick の突き合わせは日次で、decision trace の保持期間（30 日）が切れる前に行い、結果を残す（0067 §2.4）
 
 ## 2. Zone を1つずつ確かめる（補助の方法）
 
@@ -38,6 +40,7 @@
 2. `coldaisle-fand` を `CALIBRATION` モードにし、他の 2 Zone を低めの基準 Demand に固定する
 3. 1つの Zone だけを 0.0 / 0.25 / 0.5 / 0.75 / 1.0 と上げる
 4. 各段で回転数が落ち着くのを待ち（目安 20 秒）、普段の位置で聞いて `loud` / `ok` を答える
+   （各段で必ず答えるので `--sampling prompted`）
 5. 他の Zone でも繰り返す。別の日にもう一度回すと、その日の気分による揺れが分かる
 
 - PWM を直接書かない。Fan を動かすのは `CALIBRATION` だけ（0067 §2.5）

@@ -36,7 +36,8 @@
 - 騒音計・マイク・スマートフォンの騒音計アプリは使わない。dBA は記録しない
 - ユーザーが**普段の運転中に**「うるさい（`loud`）」/「気にならない（`ok`）」を答え、
   回答した時刻の Fan の状態と突き合わせる
-- 回答には2種類ある。**区別して記録する**（`noise_feedback` に `prompted` / `spontaneous` の別を持たせる）
+- 回答には2種類ある。**区別して記録する**（`noise_feedback` の必須フィールド `sampling` に
+  `prompted` / `spontaneous` を持たせる。§2.2）
   - **定時の回答（`prompted`）**: 前もって決めた時刻（例: 作業の区切りの決まった時刻）に、
     うるさいかどうかに関わらず必ず `loud` か `ok` を答える
   - **気づいたときの回答（`spontaneous`）**: うるさいと感じたときなどに自由に答える
@@ -50,7 +51,11 @@
 - UI（0046 のエアフロー画面など）は**表示専用のまま**、いまの各 Zone の effective Demand と
   RPM を見せるだけにする
 - 回答は 0045 のローカル Unix ソケット（`coldaisle-eventd`）へ、新しい種類
-  `noise_feedback`（値は `loud` / `ok`）として送る。例: `coldaisle-event noise-feedback loud`
+  `noise_feedback` として送る。メッセージの本体は次の2つのフィールドを**どちらも必須**で持つ
+  - `value`: `loud` / `ok`
+  - `sampling`: `prompted`（定時の回答） / `spontaneous`（気づいたときの回答）。§2.1 の区別を
+    保存の境界で失わないため。0045 は未知・欠けたフィールドを受け取らないので、ここで決めておく
+  - 例: `coldaisle-event noise-feedback loud --sampling prompted`
 - 読み取り API（0009 GET-only）に書き込みを足さない
 - **ブラウザの UI にボタンを置く案は本記録では決めない。** ブラウザからソケットへは届かず、
   API に書き込みの入口を作ることになるため、置くなら別の記録で入口と認可を決める
@@ -75,6 +80,13 @@
   各 Zone の effective の Demand が変わっていないことを求める。区間の途中で Demand が変わった回答は、
   どの状態を聞いて答えたか分からないので集計に使わない
 - 回答の直前の区間に tick が無い（trace が途切れている）回答も、状態が分からないので集計に使わない
+- **結びつけは decision trace が消える前に行い、結果を残す。** decision trace の保持は 30 日
+  （`config/retention.yaml` の `control_trace_days`。決定記録 0030）で、`events` は無期限である。
+  集計の時点でまとめて突き合わせると、30 日より前の回答は tick も lookback も失って全部捨てることになる。
+  そこで、回答と tick の突き合わせ（結びついた effective の Demand・RPM・lookback の判定）を
+  **定期的に（ロールアップと同じ日次で、保持期間の削除より前に）実行し、結果を無期限の記録として残す**。
+  下限の集計は、この残した結果だけを読む。保持期間そのものは変えない
+- 突き合わせる前に trace が消えた回答は「状態不明」として数を残し、集計には使わない
 - CPU / GPU が高負荷のとき、GPU 本体の Fan（`gpu.0.fan_speed`）が回っているときの回答は、
   coldaisle が変えられない音の可能性があるので**分けて集計する**
 - 1つの回答は 3 Zone すべての状態を指すので、どの Zone がうるさいかは1つの回答からは分からない。
@@ -84,7 +96,7 @@
 
 普段の回答だけでは、高い Demand の状態がなかなか現れない。補助として、所有者が
 `coldaisle-fand` の `CALIBRATION` モードで1つの Zone ずつ Demand を段階的に上げ、
-各段で `noise_feedback` を答えてよい。
+各段で `noise_feedback` を答えてよい。各段では必ず答えるので `sampling: prompted` とする。
 
 - Fan を動かすのは `CALIBRATION` だけ。PWM / hwmon へ直接書くスクリプトは作らない（ルール 2）
 - `CALIBRATION` でも Reactive Guard の floor と Critical Safety は外れない。
@@ -114,8 +126,8 @@
 
 ### 2.8 実装は別 Issue
 
-- `noise_feedback` を 0045 の許可リストへ足すこと、回答を trace と突き合わせる集計、
-  その集計の設定ファイルは、本記録の承認後に別 Issue で実装する
+- `noise_feedback`（`value` / `sampling`）を 0045 の許可リストへ足すこと、回答と trace の日次の
+  突き合わせと結果の保存（§2.4）、下限の集計、その設定ファイルは、本記録の承認後に別 Issue で実装する
 
 ## 3. Consequences
 
