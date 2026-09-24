@@ -12,7 +12,9 @@
     書き込み用の別の接続が加わる）、
     §2.6 の「ヒントの `observed_monotonic_ms` は `ControlStateSnapshot.monotonic_ms` と同じ時計」および「読んだ tick で
     観測時刻を刻む」の記述（稼働中のヒントの期限・矛盾の保持時間は `CLOCK_BOOTTIME` で数え、期限の起点は行に記録された
-    `boottime_ns` とする。他の鮮度判定と 0041 の規律は有効）、
+    `boottime_ns` とする。`expires_at` / `age_ms` の式も含む。他の鮮度判定と 0041 の規律は有効）、
+    §2.9 の trace の欄 `age_ms` の定義（`now_monotonic_ms - observed_monotonic_ms` を、`CLOCK_BOOTTIME` と行の
+    `boottime_ns` の差に置き換える。欄そのものと他の欄は有効）、
     §2.10 の Stage B の前提（着手条件）の一覧（4 項目はすべて有効のまま、本記録の §2.1 (b) の単調性試験の合格と
     §2.1 (c) の照合済みハッシュを前提に加える。一覧を列挙が尽きたものとして読まない）、
     §2.1 の「実装の変更点は `messages.py` の予約解除と型の追加に限る」という範囲の制約（Stage A の入口の変更を
@@ -216,6 +218,12 @@ wall_elapsed_ms     = startup_wall_ms - ts_ms                 （壁時計の差
     行の boot id が現在と同じで `boottime_ns` を持つこと（そうでなければ `unverifiable_elapsed`）、
     残り時間 = `min(declared_ms, max_age_ms) - (現在の CLOCK_BOOTTIME - 行の boottime_ns)` が正であること
     （そうでなければ `expired`）。読んだ tick の時刻は記録（trace）に残すだけで、期限の計算には使わない
+  - **0064 の `expires_at` / `age_ms` の式も同じ時計で書き直す。** 0064 §2.6 の
+    `expires_at = observed_monotonic_ms + min(...)` / `age_ms = now_monotonic_ms - observed_monotonic_ms` と、
+    §2.9 の trace の欄 `age_ms` は、次に置き換える（異なる時計どうしを引き算しない）:
+    `age_ms = (現在の CLOCK_BOOTTIME - 行の boottime_ns) / 1e6`（同じ boot の行だけを採るので 0 以上）、
+    `remaining_ms = min(declared_ms, max_age_ms) - age_ms`、期限切れは `remaining_ms <= 0`。
+    trace の `age_ms` もこの値を載せ、Stage A の証拠（ヒントと trace の突き合わせ）も同じ値で数える
 - **行の順序は壁時計で決めない（起動時の復元も、稼働中の増分取り込みも）。** 0064 §2.6 は `events.ts_ms` を行の順序に使うが、
   ヒントの記録後に時計が戻ってから `phase: "end"` や置き換えのヒントが追記されると、古いヒントのほうが
   新しい `ts_ms` を持ち、後から来た終了・置き換えを無視して古いヒントを再び採りうる。そこで起動時の復元は、
@@ -287,7 +295,7 @@ wall_elapsed_ms     = startup_wall_ms - ts_ms                 （壁時計の差
 - 0064 の他の決定（ソケット再利用・Regime 推定に入れない・冷却を弱めない方針・Stage A は記録のみ）は
   そのまま有効
 - 本記録が置き換えるのは、0064 の §2.8 の単調性の**検証方法**、§2.6 の起動時取り込みの**条件式**と行の順序（起動時・稼働中とも `events.id`）、
-  §2.4 の「スキーマ変更は要らない」の記述、§2.10 の Stage B の前提の一覧（§2.1 (b) / (c) を前提に加える）、§2.6 のヒントの時計と期限の起点（稼働中も `CLOCK_BOOTTIME`、起点は行の `boottime_ns`）、§2.5 の「読み取り専用の接続」の記述（`events` は読み取り専用のまま、制御デーモン自身の表へ書く別の接続を加える）、§2.1 の実装範囲の制約（上記のとおり。`events` の migration に加え、
+  §2.4 の「スキーマ変更は要らない」の記述、§2.10 の Stage B の前提の一覧（§2.1 (b) / (c) を前提に加える）、§2.6 のヒントの時計と期限の起点（稼働中も `CLOCK_BOOTTIME`、起点は行の `boottime_ns`）、§2.9 の trace の `age_ms` の定義（同じ時計で数える）、§2.5 の「読み取り専用の接続」の記述（`events` は読み取り専用のまま、制御デーモン自身の表へ書く別の接続を加える）、§2.1 の実装範囲の制約（上記のとおり。`events` の migration に加え、
   §2.2 の終端状態の表・run の記録・取り込みの境界とそれらの migration を範囲に含める）と、
   0045 §2.5 の `events` の表の**列の定義**（列を足す）のみ
 
