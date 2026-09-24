@@ -5,6 +5,7 @@
 - **Date**: 2026-09-18
 - **Supersedes**: [`0009-read-api.md`](0009-read-api.md) §5 未決事項1 のみ（0009 の他の節は有効）
 - **Superseded by**: [0042](0042-server-health-signal-rules.md)（§2.4 のうち判定対象の metric・quality の扱い・source 状態の導出と、§2.6 のうち signal の判定対象を `config/server-health.yaml` だけで決めるとも読める部分のみ。他の節は有効）
+- **Superseded by**: [0063](0063-compute-mode-advisory.md)（§2.2 の「`safe` は現在の決定論的 signal が green かだけを示す」という定義と、§5 未決事項4 のみ。他の節と `blocking` が常に false であることは有効）
 - **関連**: [`0009-read-api.md`](0009-read-api.md) §2.9 / §2.12 /
   [`0032-internal-telemetry-metric-names.md`](0032-internal-telemetry-metric-names.md) /
   [`0006-gpu-mode-and-mixed-state.md`](0006-gpu-mode-and-mixed-state.md) /
