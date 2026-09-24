@@ -209,6 +209,41 @@ function renderBanner() {
 const ALERT_STATE_LABEL = { pending: "判定中", firing: "発生中", resolved: "解消" };
 const SEVERITY_LABEL = { info: "情報", warning: "警告", critical: "重大" };
 
+// 状態の帯の信号（決定記録 0068 §2.1）。**信号の規則は API（server-health）が持つ。**
+// ここで作り直すと API と食い違うので、返ってきた `signal` をそのまま描く
+const SIGNAL_LABEL = { green: "GREEN", yellow: "YELLOW", red: "RED" };
+
+/**
+ * 状態の帯。`GET /api/v1/server-health` の `signal` / `summary` / `active_alerts` を描く。
+ *
+ * **取れていないときに GREEN を出さない。**
+ *   - 直近の取得が失敗している間は、前回の値を使わず「状態不明」にする
+ *     （古い GREEN が残ると、いま止まっていても正常に見える）
+ *   - 未知の `signal` も「状態不明」。GREEN に読み替えない
+ *   - 一度も取れていなければ帯を出さない（赤帯とカードが先に状態を言う）
+ */
+function renderStatusStrip() {
+  const strip = document.getElementById("status-strip");
+  const failed = Boolean(fetchErrors.serverHealth);
+  const body = failed ? null : lastServerHealth;
+  if (!failed && body === null) {
+    strip.classList.add("hidden");
+    return;
+  }
+  // 表の引き当ては自前のキーだけ（`constructor` のような名前を有効な信号にしない）
+  const known = body !== null && Object.hasOwn(SIGNAL_LABEL, body.signal);
+  strip.className = `strip ${known ? body.signal : "unknown"}`;
+  strip.classList.remove("hidden");
+  strip.replaceChildren();
+  strip.appendChild(el("span", "level", known ? SIGNAL_LABEL[body.signal] : "状態不明"));
+  strip.appendChild(el("span", "summary", known ? String(body.summary ?? "") : "状態を取得できません。"));
+  if (!known) return;
+  const active = Array.isArray(body.active_alerts) ? body.active_alerts : [];
+  const critical = active.filter((alert) => alert.severity === "critical").length;
+  const detail = critical > 0 ? `（${SEVERITY_LABEL.critical} ${critical}）` : "";
+  strip.appendChild(el("span", "alert-count", `発生中のアラート ${active.length}${detail}`));
+}
+
 /** アラート一覧（FIRING / RESOLVED）。表にして、状態と重大度を文言でも出す。 */
 function renderAlerts(alerts) {
   const container = document.getElementById("alerts");
@@ -427,7 +462,7 @@ let historySeq = 0;
 let historyAppliedSeq = 0;
 let refreshSeq = 0;
 // 定期更新の4つは**エンドポイントごとに**適用済みの番号を持つ（1つの失敗で残りを捨てない）
-const refreshAppliedSeq = { latest: 0, health: 0, alerts: 0, devices: 0 };
+const refreshAppliedSeq = { latest: 0, health: 0, alerts: 0, devices: 0, serverHealth: 0 };
 let refreshInFlight = false;
 // WebSocket で最新値を受け取った回数。定期更新の最新値がこれより古ければ使わない
 let streamVersion = 0;
@@ -525,6 +560,8 @@ function renderNote() {
 // 最後に受け取った応答。**表示名の表が後から届いたときに描き直すため**に持つ
 let lastLatest = null;
 let lastHealth = null;
+// 状態の帯の入力（`/api/v1/server-health`）。**赤帯の入力ではない**（bannerMessages は読まない）
+let lastServerHealth = null;
 // 定期更新でいま失敗しているエンドポイントの文言。**そのエンドポイントが次に成功するまで残す**
 // （赤帯を WebSocket で消さない）
 let lastFetchError = null;
@@ -537,6 +574,7 @@ const REFRESH_ENDPOINTS = [
   { key: "health", path: "/api/v1/health" },
   { key: "alerts", path: "/api/v1/alerts", params: { limit: 20 } },
   { key: "devices", path: "/api/v1/devices" },
+  { key: "serverHealth", path: "/api/v1/server-health" },
 ];
 const APPLY_ENDPOINT = {
   // 待っている間に WebSocket がより新しい最新値を届けていたら、そちらを残す。
@@ -555,6 +593,9 @@ const APPLY_ENDPOINT = {
   devices: (body) => {
     lastDevices = body.devices;
     renderDevices(lastDevices);
+  },
+  serverHealth: (body) => {
+    lastServerHealth = body;
   },
 };
 let lastAlerts = null;
@@ -661,6 +702,7 @@ async function refresh() {
     const failures = REFRESH_ENDPOINTS.map(({ key }) => fetchErrors[key]).filter(Boolean);
     lastFetchError = failures.length > 0 ? failures.join(", ") : null;
     renderBanner();
+    renderStatusStrip(); // 失敗の有無（fetchErrors）を見るので、失敗の記録のあとで描く
     if (!historyLoaded && lastLatest) {
       historyLoaded = true;
       loadHistory();

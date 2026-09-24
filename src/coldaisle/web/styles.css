@@ -9,6 +9,9 @@
   --warn: #d99a2b;
   --bad: #cf4b4b;
   --info: #4b8bcf;
+  --bad-text: #f29a9a;
+  --bad-hatch-a: #2a1717;
+  --bad-hatch-b: #221414;
 }
 
 * { box-sizing: border-box; }
@@ -77,14 +80,51 @@ main { padding: 0 20px 40px; }
 /* 品質フラグの4値（要件 §5.3）。**どれか1つでも欠けると異常が正常に見える** */
 .q-ok { border-left-color: var(--ok); }
 .q-ok .badge { background: rgba(78, 163, 107, 0.2); color: var(--ok); }
-.q-missing { border-left-color: var(--muted); }
-.q-missing .badge { background: rgba(154, 164, 178, 0.2); color: var(--muted); }
+/* 値の無いカード。赤枠に加えて斜線の背景にする。色に頼らない手がかり（決定記録 0068 §2.3） */
+.q-missing {
+  border: 2px solid var(--bad);
+  border-left-width: 4px;
+  /* 枠が太い分だけ余白を減らし、ほかのカードと文字の位置をそろえる */
+  padding: 9px 11px 9px 12px;
+  background: repeating-linear-gradient(135deg, var(--bad-hatch-a) 0 8px, var(--bad-hatch-b) 8px 16px);
+}
+.q-missing .badge { background: rgba(207, 75, 75, 0.22); color: var(--bad-text); }
+.q-missing .value { color: var(--bad-text); }
 .q-suspect { border-left-color: var(--warn); }
 .q-suspect .badge { background: rgba(217, 154, 43, 0.22); color: var(--warn); }
 /* stale は文言のバッジを出さない（決定記録 0039 §2.3）。文言は画面全体の赤帯が担う。
-   カード側は赤い左辺と、値を薄くして「いまの値ではない」ことを示す */
+   カード側は赤い左辺と、薄くして取り消し線を引いた値で「いまの値ではない」ことを示す
+   （取り消し線は決定記録 0068 §2.2）。
+   単位には引かない。inline-block にすると親の取り消し線が伝わらない */
 .q-stale { border-left-color: var(--bad); }
-.q-stale .value { color: var(--muted); }
+.q-stale .value { color: var(--muted); text-decoration: line-through; text-decoration-color: var(--bad); }
+.q-stale .unit { display: inline-block; }
+
+/* 状態の帯（決定記録 0068 §2.1）。色と文字（GREEN / YELLOW / RED）の両方で示す。
+   `unknown` は取れていない・未知の値のとき。**GREEN に見せない** */
+.strip {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 16px;
+  margin-top: 16px;
+  padding: 12px 18px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--panel);
+}
+.strip.hidden { display: none; }
+.strip .level { display: inline-flex; align-items: center; gap: 8px; font-weight: 700; font-size: 15px; }
+.strip .level::before { content: ""; width: 10px; height: 10px; border-radius: 50%; background: currentColor; }
+.strip .summary { font-size: 15px; }
+.strip .alert-count { margin-left: auto; font-size: 12px; color: var(--muted); }
+.strip.green { background: #14231b; border-color: #2c4a38; }
+.strip.green .level { color: var(--ok); }
+.strip.yellow { background: #2a2110; border-color: #5c4a1c; }
+.strip.yellow .level { color: var(--warn); }
+.strip.red { background: #2a1616; border-color: #7a3a3a; }
+.strip.red .level, .strip.red .alert-count { color: var(--bad-text); }
+.strip.unknown .level { color: var(--muted); }
 
 .derived .card { border-left-color: var(--info); }
 .derived .formula { font-size: 11px; color: var(--muted); margin-top: 4px; }
