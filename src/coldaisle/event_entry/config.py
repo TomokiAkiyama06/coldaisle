@@ -15,10 +15,19 @@ from typing import Any, Literal
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from coldaisle.event_entry.messages import IMPLEMENTED_HINT_VERSIONS, WorkloadHintLimits
+
 DEFAULT_CONFIG = Path("config/event-entry.yaml")
 
 SOCKET_PATH_MAX_BYTES = 107
 """Linux の `sun_path` は 108 バイトで、終端の NUL を含む。"""
+
+MAX_EXPECTED_DURATION_CEILING_S = 31 * 24 * 3600
+"""`limits.max_expected_duration_s` に書ける値の天井（31日）。
+
+書き間違い（ミリ秒で書く等）で実質無期限のヒントを受理させないための型の上限であり、
+運用の上限は設定ファイルの値が持つ。
+"""
 
 _MODE_PATTERN = re.compile(r"^0[0-7]{3}$")
 _GROUP_PATTERN = re.compile(r"^[a-z_][a-z0-9_-]{0,31}$")
@@ -84,6 +93,31 @@ class LimitSettings(BaseModel):
 
     max_message_bytes: int = Field(ge=64, le=65_536)
     read_timeout_s: float = Field(gt=0, le=60)
+    max_expected_duration_s: int = Field(
+        ge=1,
+        le=MAX_EXPECTED_DURATION_CEILING_S,
+        description="Workload Hint の expected_duration_s の上限（決定記録 0064 §2.3）",
+    )
+
+
+class WorkloadHintSettings(BaseModel):
+    """Workload Hint の受理条件（#107 / 決定記録 0064 §2.3）。"""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    accepted_hint_versions: tuple[int, ...]
+
+    @field_validator("accepted_hint_versions")
+    @classmethod
+    def _only_versions_the_code_knows(cls, value: tuple[int, ...]) -> tuple[int, ...]:
+        # 空は「ヒントを1件も受理しない」。拒否する側なので許す
+        if len(value) != len(set(value)):
+            raise ValueError("workload_hint.accepted_hint_versions に重複がある")
+        unknown = sorted(set(value) - IMPLEMENTED_HINT_VERSIONS)
+        if unknown:
+            # 形を知らない版を設定だけで受理させない（古い形の検証で新しい意味を通す）
+            raise ValueError(f"workload_hint.accepted_hint_versions に未実装の版がある: {unknown}")
+        return value
 
 
 class EventEntrySettings(BaseModel):
@@ -95,6 +129,15 @@ class EventEntrySettings(BaseModel):
     socket: SocketSettings
     authorization: AuthorizationSettings
     limits: LimitSettings
+    workload_hint: WorkloadHintSettings
+
+    @property
+    def hint_limits(self) -> WorkloadHintLimits:
+        """`parse_message` へ渡す、設定で決まる Workload Hint の上限。"""
+        return WorkloadHintLimits(
+            accepted_hint_versions=frozenset(self.workload_hint.accepted_hint_versions),
+            max_expected_duration_s=self.limits.max_expected_duration_s,
+        )
 
     @classmethod
     def from_yaml(cls, path: Path) -> EventEntrySettings:

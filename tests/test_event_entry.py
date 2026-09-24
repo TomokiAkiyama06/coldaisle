@@ -1,12 +1,14 @@
 """書き込み専用のローカル Unix ソケット入口（#67 / 決定記録 0045）。
 
 実機もシステムのパスも使わない。ソケットは一時ディレクトリに作る。
-守りたいことは4つ。
+守りたいことは5つ。
 
 1. 読み取り API は GET だけのまま（書き込みはソケットだけ）
 2. 受理するのはホワイトリストの種類・形だけで、それ以外は何も残さない
 3. ソケットは other に開かず、認可されていない uid を拒否する
 4. AI 層・読み取り API・ツール窓口はこの入口を import できない
+5. Workload Hint（#107 / 決定記録 0064）は Stage A では記録されるだけで、
+   `system_state` にも制御にも届かない
 """
 
 from __future__ import annotations
@@ -40,8 +42,11 @@ from coldaisle.event_entry import server as event_server
 from coldaisle.event_entry.config import EventEntrySettings
 from coldaisle.event_entry.messages import (
     GPU_MODE_STATE_KEY,
+    RESERVED_TYPES,
     MessageError,
+    WorkloadHintLimits,
     encode_gpu_mode,
+    encode_workload_hint,
     parse_message,
 )
 from coldaisle.event_entry.server import EntryStartupError, EventEntryServer
@@ -53,6 +58,8 @@ ROOT = Path(__file__).resolve().parents[1]
 SRC = ROOT / "src" / "coldaisle"
 CONFIG_PATH = CONFIG_DIR / "event-entry.yaml"
 DECISION = ROOT / "docs" / "decisions" / "0045-local-socket-write-entry.md"
+HINT_LIMITS = EventEntrySettings.from_yaml(CONFIG_PATH).hint_limits
+"""出荷した設定で決まる Workload Hint の上限。"""
 
 needs_peercred = pytest.mark.skipif(
     not hasattr(socket, "SO_PEERCRED"), reason="SO_PEERCRED が無い（入口は起動しない設計）"
@@ -205,7 +212,10 @@ def test_unknown_config_keys_are_rejected():
 
 
 def test_gpu_mode_message_is_accepted():
-    message = parse_message(b'{"v": 1, "type": "gpu_mode", "mode": "compute", "source": "gm"}\n')
+    message = parse_message(
+        b'{"v": 1, "type": "gpu_mode", "mode": "compute", "source": "gm"}\n',
+        hint_limits=HINT_LIMITS,
+    )
     assert message.kind == "gpu_mode"
     assert message.system_state() == ("sys.gpu_mode", "compute")
     assert json.loads(message.payload_json()) == {
@@ -229,7 +239,7 @@ def test_gpu_mode_message_is_accepted():
         b'{"v": 1, "type": "drop_table", "mode": "ai"}\n',
         b'{"v": 1, "type": "Gpu_Mode", "mode": "ai"}\n',
         b'{"v": 1, "type": "fan_demand", "front": 1.0}\n',
-        b'{"v": 1, "type": "workload_hint", "hint": "training"}\n',
+        b'{"v": 1, "type": "workload_hint", "hint_v": 1, "phase": "start", "hint": "training"}\n',
         b'{"v": 2, "type": "gpu_mode", "mode": "ai"}\n',
         b'{"v": true, "type": "gpu_mode", "mode": "ai"}\n',
         b'{"v": 1.0, "type": "gpu_mode", "mode": "ai"}\n',
@@ -247,7 +257,7 @@ def test_gpu_mode_message_is_accepted():
 )
 def test_malformed_or_unauthorized_messages_are_rejected(line):
     with pytest.raises(MessageError):
-        parse_message(line)
+        parse_message(line, hint_limits=HINT_LIMITS)
 
 
 def test_overlong_note_is_rejected():
@@ -260,11 +270,16 @@ def test_rejection_reason_does_not_reflect_the_input():
     injected = "INJECTED-TEXT"
     with pytest.raises(MessageError) as excinfo:
         parse_message(
-            json.dumps({"v": 1, "type": "gpu_mode", "mode": injected, injected: 1}).encode() + b"\n"
+            json.dumps({"v": 1, "type": "gpu_mode", "mode": injected, injected: 1}).encode()
+            + b"\n",
+            hint_limits=HINT_LIMITS,
         )
     assert injected not in excinfo.value.reason
     with pytest.raises(MessageError) as excinfo:
-        parse_message(json.dumps({"v": 1, "type": "zz" + injected.lower()}).encode() + b"\n")
+        parse_message(
+            json.dumps({"v": 1, "type": "zz" + injected.lower()}).encode() + b"\n",
+            hint_limits=HINT_LIMITS,
+        )
     assert injected.lower() not in excinfo.value.reason
 
 
@@ -356,7 +371,7 @@ def test_socket_is_created_with_the_configured_mode(running):
 @pytest.mark.parametrize(
     "line",
     [
-        b'{"v": 1, "type": "workload_hint", "hint": "training"}\n',
+        b'{"v": 1, "type": "workload_hint", "hint_v": 1, "phase": "start", "hint": "training"}\n',
         b'{"v": 1, "type": "fan_demand", "front": 1.0}\n',
         b"garbage\n",
     ],
@@ -819,7 +834,7 @@ def test_server_main_serves_until_stopped(short_dir, tmp_path):
 def api(tmp_path, rules):
     path = tmp_path / "api.db"
     with SqliteStore(path, rules=rules, clock=SimulatedClock(TEST_EPOCH_MS)) as store:
-        message = parse_message(encode_gpu_mode("compute", source="gm"))
+        message = parse_message(encode_gpu_mode("compute", source="gm"), hint_limits=HINT_LIMITS)
         store.record_event(
             EventRecord(
                 ts_ms=TEST_EPOCH_MS - 60_000,
@@ -962,3 +977,408 @@ def test_no_ai_tool_can_send_events():
     text = json.dumps(DEFINITIONS, ensure_ascii=False).lower()
     for word in ("event", "gpu_mode", "socket", "write", "record"):
         assert word not in text, word
+
+
+# ---------------------------------------------------------------- Workload Hint（#107 / 0064）
+#
+# Stage A（0064 §2.10）: 入口は受理して `events` に残すだけ。`system_state` にも制御にも届かない。
+
+HINT_START = {
+    "v": 1,
+    "type": "workload_hint",
+    "hint_v": 1,
+    "phase": "start",
+    "workload": "training",
+}
+HINT_END = {"v": 1, "type": "workload_hint", "hint_v": 1, "phase": "end"}
+
+
+def hint_line(body: dict[str, object], **changes: object) -> bytes:
+    """``body`` を ``changes`` で上書きした1行。値が ``None`` のキーは消す。"""
+    merged = {**body, **changes}
+    return (json.dumps({k: v for k, v in merged.items() if v is not None}) + "\n").encode()
+
+
+def all_state_rows(db: Path) -> list[tuple[int, str, str]]:
+    conn = sqlite3.connect(db)
+    try:
+        return [
+            (int(row[0]), str(row[1]), str(row[2]))
+            for row in conn.execute(
+                "SELECT ts_ms, key, value FROM system_state ORDER BY ts_ms, key"
+            )
+        ]
+    finally:
+        conn.close()
+
+
+def test_workload_hint_is_no_longer_reserved():
+    assert "workload_hint" not in RESERVED_TYPES
+
+
+def test_shipped_hint_config_matches_the_decision():
+    """既定で受理する `hint_v` は `[1]` だけ（0064 §2.3）。"""
+    assert HINT_LIMITS.accepted_hint_versions == frozenset({1})
+    assert HINT_LIMITS.max_expected_duration_s >= 1
+
+
+def test_workload_hint_start_is_accepted_and_keeps_hint_v():
+    line = hint_line(
+        HINT_START,
+        expected_duration_s=14400,
+        source="workspace-job-launcher",
+        note="nightly run",
+    )
+    message = parse_message(line, hint_limits=HINT_LIMITS)
+    assert message.kind == "workload_hint"
+    assert json.loads(message.payload_json()) == {
+        "v": 1,
+        "type": "workload_hint",
+        "hint_v": 1,
+        "phase": "start",
+        "workload": "training",
+        "expected_duration_s": 14400,
+        "source": "workspace-job-launcher",
+        "note": "nightly run",
+    }
+
+
+def test_workload_hint_end_is_accepted_with_the_minimal_shape():
+    message = parse_message(hint_line(HINT_END), hint_limits=HINT_LIMITS)
+    assert json.loads(message.payload_json()) == HINT_END
+
+
+@pytest.mark.parametrize("workload", ["training", "benchmark", "inference_service"])
+def test_every_workload_in_the_closed_set_is_accepted(workload):
+    message = parse_message(hint_line(HINT_START, workload=workload), hint_limits=HINT_LIMITS)
+    assert json.loads(message.payload_json())["workload"] == workload
+
+
+@pytest.mark.parametrize(
+    "body",
+    [HINT_START, HINT_END, {**HINT_START, "expected_duration_s": 60, "note": "x"}],
+    ids=["start", "end", "full"],
+)
+def test_workload_hint_never_writes_system_state(body):
+    """ヒントは真値ではない。「いまの値」を1箇所に置かない（0064 §2.4）。"""
+    message = parse_message(hint_line(body), hint_limits=HINT_LIMITS)
+    assert message.system_state() is None
+
+
+def test_duration_up_to_the_configured_limit_is_accepted():
+    limit = HINT_LIMITS.max_expected_duration_s
+    line = hint_line(HINT_START, expected_duration_s=limit)
+    assert parse_message(line, hint_limits=HINT_LIMITS).kind == "workload_hint"
+    with pytest.raises(MessageError) as excinfo:
+        parse_message(hint_line(HINT_START, expected_duration_s=limit + 1), hint_limits=HINT_LIMITS)
+    assert excinfo.value.reason == "expected_duration_s is too long"
+
+
+def test_the_duration_limit_comes_from_the_limits_not_the_code():
+    tight = WorkloadHintLimits(accepted_hint_versions=frozenset({1}), max_expected_duration_s=60)
+    parse_message(hint_line(HINT_START, expected_duration_s=60), hint_limits=tight)
+    with pytest.raises(MessageError):
+        parse_message(hint_line(HINT_START, expected_duration_s=61), hint_limits=tight)
+
+
+def test_hint_version_outside_the_configured_set_is_rejected():
+    """形を知っている版でも、設定で受理していなければ拒否する（空 = 1件も受理しない）。"""
+    closed = WorkloadHintLimits(accepted_hint_versions=frozenset(), max_expected_duration_s=60)
+    with pytest.raises(MessageError) as excinfo:
+        parse_message(hint_line(HINT_START), hint_limits=closed)
+    assert excinfo.value.reason == "unsupported hint version"
+    with pytest.raises(MessageError):
+        parse_message(hint_line(HINT_END), hint_limits=closed)
+    # 同じ上限でも GPU Mode は巻き込まない（封筒の版と本体の版は別。0064 §2.3）
+    assert parse_message(encode_gpu_mode("ai"), hint_limits=closed).kind == "gpu_mode"
+
+
+def test_configuring_an_unimplemented_hint_version_does_not_widen_the_shape():
+    """上限に未知の版が紛れても、形を知らない版は通らない。"""
+    wide = WorkloadHintLimits(accepted_hint_versions=frozenset({1, 2}), max_expected_duration_s=60)
+    with pytest.raises(MessageError):
+        parse_message(hint_line(HINT_START, hint_v=2), hint_limits=wide)
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        # 版
+        {"hint_v": None},
+        {"hint_v": 0},
+        {"hint_v": 2},
+        {"hint_v": "1"},
+        {"hint_v": True},
+        {"hint_v": 1.0},
+        {"v": 2},
+        # phase と workload の組み合わせ
+        {"phase": None},
+        {"phase": "stop"},
+        {"phase": "START"},
+        {"workload": None},
+        {"phase": "end", "workload": "training"},
+        {"phase": "end", "workload": None, "expected_duration_s": 60},
+        # 閉じた語彙の外（冷却を弱める向きの申告を含む。0064 §2.8）
+        {"workload": "idle"},
+        {"workload": "idle_planned"},
+        {"workload": "cooldown"},
+        {"workload": "Training"},
+        {"workload": ""},
+        {"workload": 1},
+        # 期間
+        {"expected_duration_s": 0},
+        {"expected_duration_s": -1},
+        {"expected_duration_s": 14400.0},
+        {"expected_duration_s": "4h"},
+        {"expected_duration_s": True},
+        {"expected_duration_s": 10**30},
+        # 時刻は書き手に渡させない（0045 §2.5）
+        {"ts": 0},
+        {"ts_ms": 0},
+        {"expires_at": 0},
+        # 識別子（0064 §2.3 / AGENTS.md ルール10）
+        {"job_id": "job-1"},
+        {"user": "someone"},
+        {"host": "node"},
+        {"pid": 1234},
+        {"path": "/srv/job"},
+        # 読み手のいない進捗（0064 §2.3 未決 #2）
+        {"progress": 0.5},
+        {"step": 10},
+        {"epoch": 1},
+        # 0045 と同じ source / note の規則
+        {"source": "Bad Name"},
+        {"source": ""},
+        {"note": "line\nbreak"},
+        {"note": "a\u001b[31mred"},
+        {"note": "x" * 201},
+        # 指令のような未知のフィールド
+        {"demand": 1.0},
+        {"mode": "compute"},
+    ],
+)
+def test_malformed_workload_hints_are_rejected(changes):
+    with pytest.raises(MessageError):
+        parse_message(hint_line(HINT_START, **changes), hint_limits=HINT_LIMITS)
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        b'{"v": 1, "type": "idle_planned", "hint_v": 1, "phase": "start"}\n',
+        b'{"v": 1, "type": "workload_idle", "hint_v": 1, "phase": "start"}\n',
+        b'{"v": 1, "type": "Workload_Hint", "hint_v": 1, "phase": "end"}\n',
+        b'{"v": 1, "type": "workload_hint", "hint_v": 1, "phase": "end", "phase": "start",'
+        b' "workload": "training"}\n',
+    ],
+)
+def test_hint_lookalikes_are_rejected(line):
+    with pytest.raises(MessageError):
+        parse_message(line, hint_limits=HINT_LIMITS)
+
+
+def test_hint_rejection_reason_does_not_reflect_the_input():
+    injected = "INJECTED-TEXT"
+    for changes in ({"workload": injected}, {injected: 1}, {"note": injected + "\n"}):
+        with pytest.raises(MessageError) as excinfo:
+            parse_message(hint_line(HINT_START, **changes), hint_limits=HINT_LIMITS)
+        assert injected not in excinfo.value.reason
+
+
+def test_encode_workload_hint_checks_the_shape_before_sending():
+    assert json.loads(encode_workload_hint("end")) == HINT_END
+    line = encode_workload_hint("start", workload="benchmark", expected_duration_s=90)
+    assert json.loads(line) == {**HINT_START, "workload": "benchmark", "expected_duration_s": 90}
+    with pytest.raises(MessageError):
+        encode_workload_hint("start")
+    with pytest.raises(MessageError):
+        encode_workload_hint("end", workload="training")
+    with pytest.raises(MessageError):
+        encode_workload_hint("end", expected_duration_s=60)
+    with pytest.raises(MessageError):
+        encode_workload_hint("start", workload="idle")
+    with pytest.raises(MessageError):
+        encode_workload_hint("start", workload="training", expected_duration_s=0)
+
+
+@pytest.mark.parametrize("versions", [[2], [1, 1], [0, 1]])
+def test_hint_config_rejects_versions_the_code_does_not_know(versions):
+    base = EventEntrySettings.from_yaml(CONFIG_PATH).model_dump()
+    base["workload_hint"]["accepted_hint_versions"] = versions
+    with pytest.raises(ValueError):
+        EventEntrySettings.model_validate(base)
+
+
+def test_hint_config_may_accept_nothing():
+    """空は「1件も受理しない」。拒否する側なので起動を妨げない。"""
+    base = EventEntrySettings.from_yaml(CONFIG_PATH).model_dump()
+    base["workload_hint"]["accepted_hint_versions"] = []
+    assert EventEntrySettings.model_validate(base).hint_limits.accepted_hint_versions == frozenset()
+
+
+@pytest.mark.parametrize("value", [0, -1, 31 * 24 * 3600 + 1])
+def test_hint_duration_limit_must_be_positive_and_bounded(value):
+    base = EventEntrySettings.from_yaml(CONFIG_PATH).model_dump()
+    base["limits"]["max_expected_duration_s"] = value
+    with pytest.raises(ValueError):
+        EventEntrySettings.model_validate(base)
+
+
+def test_hint_config_is_required():
+    """ヒントの受理条件を書き忘れた設定では起動しない（黙って既定に倒さない）。"""
+    base = EventEntrySettings.from_yaml(CONFIG_PATH).model_dump()
+    del base["workload_hint"]
+    with pytest.raises(ValueError):
+        EventEntrySettings.model_validate(base)
+    base = EventEntrySettings.from_yaml(CONFIG_PATH).model_dump()
+    del base["limits"]["max_expected_duration_s"]
+    with pytest.raises(ValueError):
+        EventEntrySettings.model_validate(base)
+
+
+@needs_peercred
+def test_workload_hint_is_recorded_as_an_event_only(running, db, rules):
+    """`events` に行が残り、`system_state` は1行も増えない（0064 §2.4）。"""
+    start = running.send(encode_workload_hint("start", workload="training", source="launcher"))
+    assert start["ok"] is True
+    assert start["ts_ms"] == TEST_EPOCH_MS, "時刻はサーバの時計で決まる"
+    assert running.send(encode_workload_hint("end"))["ok"] is True
+
+    first, second = stored_events(db, rules)
+    assert (first.kind, second.kind) == ("workload_hint", "workload_hint")
+    assert first.peer_uid == os.geteuid()
+    assert json.loads(first.payload_json) == {**HINT_START, "source": "launcher"}
+    assert json.loads(second.payload_json) == HINT_END
+    assert all_state_rows(db) == []
+
+
+@needs_peercred
+def test_workload_hint_does_not_touch_the_gpu_mode_state(running, db, rules):
+    assert running.send(encode_gpu_mode("compute"))["ok"] is True
+    before = all_state_rows(db)
+    assert running.send(encode_workload_hint("start", workload="inference_service"))["ok"] is True
+    assert all_state_rows(db) == before == [(TEST_EPOCH_MS, GPU_MODE_STATE_KEY, "compute")]
+
+
+@needs_peercred
+def test_the_server_enforces_the_configured_duration_limit(short_dir, db, rules):
+    """クライアントは上限を知らなくても送れる。上限を決めるのはサーバの設定。"""
+    settings = settings_for(short_dir / "events.sock", max_expected_duration_s=3600)
+    entry = RunningServer(settings, db, rules)
+    try:
+        too_long = encode_workload_hint("start", workload="training", expected_duration_s=3601)
+        assert entry.send(too_long) == {"ok": False, "error": "expected_duration_s is too long"}
+        assert stored_events(db, rules) == ()
+        at_limit = encode_workload_hint("start", workload="training", expected_duration_s=3600)
+        assert entry.send(at_limit)["ok"] is True
+    finally:
+        entry.stop()
+
+
+@needs_peercred
+def test_a_server_that_accepts_no_hint_version_still_accepts_gpu_mode(short_dir, db, rules):
+    base = settings_for(short_dir / "events.sock")
+    hint = base.workload_hint.model_copy(update={"accepted_hint_versions": ()})
+    entry = RunningServer(base.model_copy(update={"workload_hint": hint}), db, rules)
+    try:
+        assert entry.send(encode_workload_hint("end")) == {
+            "ok": False,
+            "error": "unsupported hint version",
+        }
+        assert entry.send(encode_gpu_mode("ai"))["ok"] is True
+        assert [event.kind for event in stored_events(db, rules)] == ["gpu_mode"]
+    finally:
+        entry.stop()
+
+
+@needs_peercred
+def test_rejected_hints_leave_nothing_behind(running, db, rules):
+    for changes in ({"workload": "idle"}, {"ts": 0}, {"job_id": "x"}, {"hint_v": 2}):
+        assert running.send(hint_line(HINT_START, **changes))["ok"] is False
+    assert stored_events(db, rules) == ()
+    assert all_state_rows(db) == []
+
+
+@needs_peercred
+def test_cli_client_sends_workload_hints(running, capsys, db, rules):
+    argv = ["--socket", str(running.settings.socket.path), "workload-hint"]
+    assert event_client.main([*argv, "training", "--expected-duration", "4h"]) == 0
+    assert json.loads(capsys.readouterr().out)["ok"] is True
+    assert event_client.main([*argv, "benchmark", "--source", "bench", "--note", "sweep"]) == 0
+    assert event_client.main([*argv, "end"]) == 0
+    # 取り消しに期間は付けられない。送る前に落ち、何も残らない
+    assert event_client.main([*argv, "end", "--expected-duration", "1h"]) == 1
+    assert event_client.main([*argv, "training", "--expected-duration", "0"]) == 1
+
+    payloads = [json.loads(event.payload_json) for event in stored_events(db, rules)]
+    assert payloads == [
+        {**HINT_START, "expected_duration_s": 14400},
+        {**HINT_START, "workload": "benchmark", "source": "bench", "note": "sweep"},
+        HINT_END,
+    ]
+    assert all_state_rows(db) == []
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        ["idle"],
+        ["idle_planned"],
+        ["training", "--expected-duration", "4 hours"],
+        ["training", "--expected-duration", "-1h"],
+        ["training", "--expected-duration", "1.5h"],
+        ["training", "--ts", "0"],
+        ["training", "--job-id", "x"],
+    ],
+)
+def test_cli_client_refuses_unknown_hint_arguments(extra, short_dir):
+    with pytest.raises(SystemExit) as excinfo:
+        event_client.main(["--socket", str(short_dir / "none.sock"), "workload-hint", *extra])
+    assert excinfo.value.code == 2
+
+
+@pytest.mark.parametrize(
+    ("text", "seconds"),
+    [("90s", 90), ("30m", 1800), ("4h", 14400), ("2d", 172800), ("14400", 14400)],
+)
+def test_cli_duration_units(text, seconds):
+    args = event_client.build_parser().parse_args(
+        ["workload-hint", "training", "--expected-duration", text]
+    )
+    assert args.expected_duration == seconds
+
+
+HINT_NAME = re.compile(r"workload[_-]?hint", re.IGNORECASE)
+
+
+def test_control_does_not_read_workload_hints_in_stage_a():
+    """Stage A では制御は1ビットも変わらない（0064 §2.10）。名前すら出てこない。"""
+    sources = [SRC / "control_daemon.py", *sorted((SRC / "control").rglob("*.py"))]
+    offenders = [
+        str(path.relative_to(SRC))
+        for path in sources
+        if HINT_NAME.search(path.read_text(encoding="utf-8"))
+    ]
+    assert offenders == []
+
+
+def test_control_does_not_open_the_event_store():
+    """`coldaisle.control` は DB を開かない。`events` を読む経路が無い（0064 §2.5）。"""
+    offenders = [
+        f"{path.relative_to(SRC)}: {name}"
+        for path in sorted((SRC / "control").rglob("*.py"))
+        for name in _imports(path)
+        if name in ("coldaisle.store.db", "coldaisle.store.SqliteStore", "sqlite3")
+        or name.startswith("coldaisle.store.db.")
+    ]
+    assert offenders == []
+
+
+def test_only_the_entry_config_mentions_workload_hints():
+    """Stage B の設定（`supervisor.workload_hint` 等）はまだ無い（0064 §2.10）。"""
+    mentioned = sorted(
+        path.name
+        for path in CONFIG_DIR.rglob("*")
+        if path.is_file() and HINT_NAME.search(path.read_text(encoding="utf-8", errors="ignore"))
+    )
+    assert mentioned == ["event-entry.yaml"]
