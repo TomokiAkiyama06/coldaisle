@@ -22,13 +22,6 @@ DEFAULT_CONFIG = Path("config/event-entry.yaml")
 SOCKET_PATH_MAX_BYTES = 107
 """Linux の `sun_path` は 108 バイトで、終端の NUL を含む。"""
 
-MAX_EXPECTED_DURATION_CEILING_S = 31 * 24 * 3600
-"""`limits.max_expected_duration_s` に書ける値の天井（31日）。
-
-書き間違い（ミリ秒で書く等）で実質無期限のヒントを受理させないための型の上限であり、
-運用の上限は設定ファイルの値が持つ。
-"""
-
 _MODE_PATTERN = re.compile(r"^0[0-7]{3}$")
 _GROUP_PATTERN = re.compile(r"^[a-z_][a-z0-9_-]{0,31}$")
 
@@ -95,7 +88,7 @@ class LimitSettings(BaseModel):
     read_timeout_s: float = Field(gt=0, le=60)
     max_expected_duration_s: int = Field(
         ge=1,
-        le=MAX_EXPECTED_DURATION_CEILING_S,
+        # 上限の値は設定だけが持つ（AGENTS.md ルール 9）。コードに天井を置かない
         description="Workload Hint の expected_duration_s の上限（決定記録 0064 §2.3）",
     )
 

@@ -1216,12 +1216,20 @@ def test_hint_config_may_accept_nothing():
     assert EventEntrySettings.model_validate(base).hint_limits.accepted_hint_versions == frozenset()
 
 
-@pytest.mark.parametrize("value", [0, -1, 31 * 24 * 3600 + 1])
-def test_hint_duration_limit_must_be_positive_and_bounded(value):
+@pytest.mark.parametrize("value", [0, -1])
+def test_hint_duration_limit_must_be_positive(value):
     base = EventEntrySettings.from_yaml(CONFIG_PATH).model_dump()
     base["limits"]["max_expected_duration_s"] = value
     with pytest.raises(ValueError):
         EventEntrySettings.model_validate(base)
+
+
+def test_hint_duration_limit_is_owned_by_the_config_not_by_a_code_ceiling():
+    """上限は設定の値だけが決める。コードの天井で、設定した長い上限を拒まない。"""
+    base = EventEntrySettings.from_yaml(CONFIG_PATH).model_dump()
+    base["limits"]["max_expected_duration_s"] = 90 * 24 * 3600
+    settings = EventEntrySettings.model_validate(base)
+    assert settings.hint_limits.max_expected_duration_s == 90 * 24 * 3600
 
 
 def test_hint_config_is_required():
