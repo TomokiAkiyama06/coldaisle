@@ -619,6 +619,37 @@ def test_a_clock_rollback_neither_leaks_nor_evicts_the_newer_window(
     assert newer_again is newer
 
 
+def test_a_rollback_within_the_same_window_does_not_reuse_a_later_evaluation(
+    tmp_path, rules, catalog, monkeypatch
+):
+    """同じ窓の中で時計が戻ったとき、**自分より後の時刻で評価した履歴を返さない**。
+
+    12:04 に評価した窓 W の結果を、12:03（同じ W）の応答に流用すると
+    evaluated_at が generated_at を追い越し、後のスナップショットでしか見えない
+    行が混ざりうる。戻った呼び出しは自分の時点で評価し、キャッシュは残す。
+    """
+    advisor = ComputeModeAdvisor(_settings(tmp_path, catalog), catalog)
+    calls: list[int] = []
+
+    def counting(store, now_ms):
+        calls.append(now_ms)
+        return _History(None, len(calls), now_ms, ())
+
+    monkeypatch.setattr(advisor, "_evaluate_history", counting)
+    later_ms = NOW_MS + 4 * MINUTE_MS
+    earlier_ms = NOW_MS + 3 * MINUTE_MS
+    with _store(tmp_path, rules) as store:
+        later = advisor._history(store, later_ms)
+        earlier = advisor._history(store, earlier_ms)
+        later_again = advisor._history(store, later_ms + 1_000)
+
+    assert earlier is not later
+    assert earlier.evaluated_at_ms <= earlier_ms
+    assert calls == [later_ms, earlier_ms]
+    # 置き換えていないので、時計が戻る前の時点以降は評価済みの結果を使う
+    assert later_again is later
+
+
 class _SteppingClock(SimulatedClock):
     """読まれるたびに進む時計。最初の読み出しの直後に別の書き手が行を足す。"""
 

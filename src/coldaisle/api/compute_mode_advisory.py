@@ -289,14 +289,17 @@ class ComputeModeAdvisor:
         # スナップショットを読むため、窓はロックの順に単調に進む
         with self._lock:
             cached = self._cached
-            if cached is not None and cached[0] == window:
+            # 同じ窓でも、自分より後の時刻で評価した結果は流用しない（同じ窓の中で
+            # 時計が戻った場合）。流用すると evaluated_at が generated_at を追い越す
+            if cached is not None and cached[0] == window and cached[1].evaluated_at_ms <= now_ms:
                 return cached[1]
             # 窓が変わったら、その呼び出しの時刻とスナップショットで評価し直す。
             # 他の呼び出しの結果を流用しないので、evaluated_at <= generated_at が
             # 常に成り立ち、応答に無いデータが reference に混ざらない
             history = self._evaluate_history(store, now_ms)
             # 壁時計は戻りうる。戻った呼び出しの結果で新しい窓を置き換えると、
-            # 時計が戻ったあとに新しい窓がもう一度評価される
+            # 時計が戻ったあとに新しい窓がもう一度評価される（同じ窓の中で戻った
+            # 場合も、後の時刻の評価を残す）
             if cached is None or window > cached[0]:
                 self._cached = (window, history)
             return history
