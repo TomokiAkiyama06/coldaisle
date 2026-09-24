@@ -3,10 +3,11 @@
 - **種別**: Decision Record
 - **Status**: Proposed（リポジトリ所有者の承認をもって FINAL。承認前に実装しない）
 - **Date**: 2026-09-21
-- **Supersedes**: なし。[0064](0064-workload-hint-entry-and-supervisor-prior.md) は FINAL のため本文を書き換えず、
-  §2.8 の「単調性（片方向）」の検証方法、§2.6 の「起動時の取り込み」の条件、§2.4 の
-  「表・トリガ・索引は 0045 §2.5 のままでスキーマ変更は要らない」の記述を本記録が**限定的に置き換える**
-  （§2.2 で `events` に boot id と `CLOCK_BOOTTIME` の列を足すため。0064 側には `Superseded by` の追記だけを行う）
+- **Supersedes**（いずれも限定的な置き換え。旧記録は FINAL のため本文を書き換えず、`Superseded by` の追記だけを行う）:
+  - [0064](0064-workload-hint-entry-and-supervisor-prior.md) §2.8 の「単調性（片方向）」の検証方法、§2.6 の
+    「起動時の取り込み」の条件、§2.4 の「表・トリガ・索引は 0045 §2.5 のままでスキーマ変更は要らない」の記述
+  - [0045](0045-local-socket-write-entry.md) §2.5 の `events` の表の列の定義（§2.2 で boot id と
+    `CLOCK_BOOTTIME` の値の列を足す。既存の列・トリガ・索引・`kind` の扱いは有効）
 - **関連**: [0064](0064-workload-hint-entry-and-supervisor-prior.md) §2.4 / §2.6 / §2.8 / §2.10 /
   [0041](0041-supervisor-proposal-freshness.md) / [0045](0045-local-socket-write-entry.md) /
   [0052](0052-learned-mpc-optimizer-and-hard-constraints.md) / [0062](0062-model-registry-operations.md) /
@@ -134,25 +135,29 @@ weight・band の単調性が**選ばれる Demand の単調性**をそのまま
 0064 §2.6 の条件を次に置き換える。
 
 ```text
-elapsed_ms = startup_wall_ms - ts_ms
-採る条件   = 0 <= elapsed_ms <= workload_hint.startup_backfill_ms
-残り時間   = min(declared_ms, max_age_ms) - elapsed_ms     （0 以下なら採らない）
+前提       = 起動時の boot_id == 行の boot_id （違えば採らない。下記）
+boottime_elapsed_ms = startup_boottime_ms - row_boottime_ms   （CLOCK_BOOTTIME の差）
+wall_elapsed_ms     = startup_wall_ms - ts_ms                 （壁時計の差。追加の検査だけに使う）
+採る条件   = 0 <= boottime_elapsed_ms <= workload_hint.startup_backfill_ms
+             かつ 0 <= wall_elapsed_ms <= workload_hint.startup_backfill_ms
+残り時間   = min(declared_ms, max_age_ms) - boottime_elapsed_ms   （0 以下なら採らない）
 ```
 
-- **`elapsed_ms < 0`（行の時刻が起動時の壁時計より未来）は、ヒント無し**として扱う。
+- **`wall_elapsed_ms < 0`（行の時刻が起動時の壁時計より未来）は、ヒント無し**として扱う。
   壁時計の逆行・書き手の時計のずれ・改ざんのいずれでも、「経過が分からない」ものを採らない
 - 残り時間は**元の期限（`min(declared_ms, max_age_ms)`）を超えない**ことを不変条件とし、試験で固定する
-  （`elapsed_ms >= 0` が保証されるので引き算は常に減る方向にしか働かない）
+  （**期限と残り時間は `boottime_elapsed_ms` だけで数える**。壁時計の差は巻き戻しで短くなりうるので、
+  残り時間の計算には使わない。`boottime_elapsed_ms >= 0` が保証されるので引き算は減る方向にしか働かない）
 - 採らなかった理由は構造化ログに閉じた語彙（`backfill_rejected: future_ts | too_old | expired | unverifiable_elapsed`）で残す。
   `ts_ms` の値そのものは載せない（0064 §2.9）
 - 制御中の鮮度判定は 0064 §2.6 のとおり単調時計のままで、この規則は**起動時 1 回**にだけ関わる
 - **経過を過小に見積もった行は採らない。** 記録の後に壁時計が戻り、起動までに `ts_ms` を少しだけ
-  追い越した場合、`elapsed_ms` は正でも実際の経過より短く、期限切れのヒントが復活しうる。
+  追い越した場合、`wall_elapsed_ms` は正でも実際の経過より短く、期限切れのヒントが復活しうる。
   負の値を拒むだけでは防げないので、起動時の取り込みは**壁時計の差だけでは採らない**:
   - ヒントの行に、書いた時点の boot id（`/proc/sys/kernel/random/boot_id`）と
     **`CLOCK_BOOTTIME`** の値を持たせる（0045 の `events` に列を足す。実装は別 Issue）。
     `CLOCK_MONOTONIC` は suspend 中に進まず、同じ boot の中でも suspend をはさむと経過を過小に見積もるので使わない
-  - 起動時の boot id が行と同じときだけ、`elapsed_ms` を **`CLOCK_BOOTTIME` の差**で求めて上の条件を当てはめる
+  - 起動時の boot id が行と同じときだけ、経過を **`CLOCK_BOOTTIME` の差**（`boottime_elapsed_ms`）で求めて上の条件を当てはめる
     （壁時計の修正で戻らず、suspend 中も進むので、経過を過小に見積もらない）
   - boot id が違う（再起動をまたいだ）行、またはこれらの列を持たない行は、**取り込まない**
     （`backfill_rejected: unverifiable_elapsed`）。再起動をまたいだ経過は確かめられないため
@@ -163,7 +168,8 @@ elapsed_ms = startup_wall_ms - ts_ms
 
 - 0064 の他の決定（ソケット再利用・Regime 推定に入れない・冷却を弱めない方針・Stage A は記録のみ）は
   そのまま有効
-- 本記録が置き換えるのは、§2.8 の単調性の**検証方法**と、§2.6 の起動時取り込みの**条件式**のみ
+- 本記録が置き換えるのは、0064 の §2.8 の単調性の**検証方法**、§2.6 の起動時取り込みの**条件式**、
+  §2.4 の「スキーマ変更は要らない」の記述と、0045 §2.5 の `events` の表の**列の定義**（列を足す）のみ
 
 ## 3. Consequences
 
