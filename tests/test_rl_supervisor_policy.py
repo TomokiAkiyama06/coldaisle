@@ -115,6 +115,7 @@ from coldaisle.control.supervisor.regime import (
     WorkloadRegimeEstimate,
 )
 from coldaisle.control.supervisor.rl_policy import ARTIFACT_DETERMINED_METADATA_EXCLUSIONS
+from coldaisle.control.supervisor.rule_identity import RulePolicyIdentity, rule_policy_identity
 from coldaisle.control.supervisor.shadow import SupervisorShadowSummary, shadow_summary_usable
 from test_learned_mpc import REGISTRY_LIMITS, mpc_policy
 from test_rl_training_environment import build_environment, episode_spec
@@ -126,6 +127,8 @@ trained = _trained_fixture
 
 CREATED_AT = "2026-09-21T10:00:00+09:00"
 CONDITIONS = "a" * 64
+RULE_IDENTITY = RulePolicyIdentity(version="rule-test-v1", table_sha256="f" * 64)
+"""試験の台帳が束縛する Rule policy の識別（台帳の試験は表の中身を見ない）。"""
 RL_IDENTITY = SupervisorPolicyIdentity(
     model_id="rl-supervisor-test", version="0.1.0", artifact_sha256="d" * 64
 )
@@ -804,6 +807,20 @@ def test_invariant_13_f_an_unusable_summary_issues_no_evaluation_ref() -> None:
     assert usable.usable is True
     assert usable.evaluation_ref() == f"supervisor-shadow:{usable.digest()}"
 
+    # v1 の集計（Rule の版しか持たない）は、下限を満たしていても昇格の証拠にしない。
+    legacy_document = json.loads(usable.model_dump_json())
+    legacy_document["schema_version"] = 1
+    del legacy_document["rule_policy_identity"]
+    legacy = SupervisorShadowSummary.model_validate_json(json.dumps(legacy_document))
+    assert legacy.usable is True
+    with pytest.raises(SupervisorShadowUsageError, match="Rule policy の完全な識別"):
+        legacy.evaluation_ref()
+    # v1 と名乗りながら Rule の識別を持つ集計は作れない。
+    with pytest.raises(ValidationError, match="schema version 2"):
+        SupervisorShadowSummary.model_validate_json(
+            json.dumps({**json.loads(usable.model_dump_json()), "schema_version": 1})
+        )
+
 
 def test_invariant_13_b_rule_and_rl_may_share_a_version_string() -> None:
     """**Rule と RL が同じ版文字列を名乗っても台帳を作れる。**
@@ -812,7 +829,9 @@ def test_invariant_13_b_rule_and_rl_may_share_a_version_string() -> None:
     """
     config, _digest = rl_policy_config()
     ledger = SupervisorShadowLedger(
-        config.shadow, rule_policy_version="0.1.0", rl_identity=RL_IDENTITY
+        config.shadow,
+        rule_identity=RULE_IDENTITY.model_copy(update={"version": "0.1.0"}),
+        rl_identity=RL_IDENTITY,
     )
     ledger.observe(paired_decision(tick_id=1, rule_version="0.1.0"))
     summary = ledger.summary()
@@ -866,9 +885,7 @@ def test_invariant_13_d_an_unpaired_ledger_is_never_usable() -> None:
             ),
         }
     )
-    ledger = SupervisorShadowLedger(
-        zero, rule_policy_version="rule-test-v1", rl_identity=RL_IDENTITY
-    )
+    ledger = SupervisorShadowLedger(zero, rule_identity=RULE_IDENTITY, rl_identity=RL_IDENTITY)
     ledger.observe(missing_rl_decision(tick_id=1))
     with pytest.raises(ValidationError, match="minimum_ticks"):
         ledger.summary()
@@ -1165,18 +1182,35 @@ def test_shadow_evidence_is_bound_to_the_promoted_artifact(tmp_path: Path, train
     identity = certified_identity(certified)
     rule_policy = RulePolicy(settings.supervisor.rule_policy, SimulatedClock(0))
 
+    class SameVersionOtherContexts:
+        """いまの Rule policy と同じ版を名乗りながら、違う context を返す Rule policy。"""
+
+        kind = SupervisorPolicyKind.RULE
+        version = rule_policy.version
+
+        def propose(self, policy_input: SupervisorInput) -> SupervisorOutput:
+            output = rule_policy.propose(policy_input)
+            return output.model_copy(
+                update={"weights": output.weights.model_copy(update={"change": 0.0})}
+            )
+
+    current_rule = rule_policy_identity(rule_policy)
+    other_contexts = rule_policy_identity(SameVersionOtherContexts())
+    assert other_contexts.version == current_rule.version
+    assert other_contexts.table_sha256 != current_rule.table_sha256
+
     def usable_summary(
-        rl_identity: SupervisorPolicyIdentity, rule_version: str = rule_policy.version
+        rl_identity: SupervisorPolicyIdentity, rule_identity: RulePolicyIdentity = current_rule
     ) -> SupervisorShadowSummary:
         config, _digest = rl_policy_config()
         ledger = SupervisorShadowLedger(
-            config.shadow, rule_policy_version=rule_version, rl_identity=rl_identity
+            config.shadow, rule_identity=rule_identity, rl_identity=rl_identity
         )
         for tick in range(4):
             ledger.observe(
                 paired_decision(
                     tick_id=tick,
-                    rule_version=rule_version,
+                    rule_version=rule_identity.version,
                     rl_version=rl_identity.version,
                     rl_identity=rl_identity,
                 )
@@ -1188,7 +1222,11 @@ def test_shadow_evidence_is_bound_to_the_promoted_artifact(tmp_path: Path, train
     matching = usable_summary(identity)
     other = usable_summary(identity.model_copy(update={"artifact_sha256": "e" * 64}))
     # 同じ artifact を、いまの Baseline とは別の版の Rule と比べた集計。
-    stale_rule = usable_summary(identity, rule_version=f"{rule_policy.version}-old")
+    stale_rule = usable_summary(
+        identity, current_rule.model_copy(update={"version": f"{rule_policy.version}-old"})
+    )
+    # 同じ artifact を、**同じ版で context の違う** Rule と比べた集計。
+    same_version_other_table = usable_summary(identity, other_contexts)
 
     def registered(name: str, **metadata_overrides: Any) -> tuple[ModelRegistry, Any, Any]:
         artifact_bytes = canonical_policy_artifact_bytes(certified)
@@ -1242,8 +1280,9 @@ def test_shadow_evidence_is_bound_to_the_promoted_artifact(tmp_path: Path, train
     registry, metadata, compatibility = registered("pr89-promote")
     with pytest.raises(ValueError, match="shadow 集計が比べた artifact"):
         promote(registry, metadata, compatibility, other)
-    with pytest.raises(ValueError, match="Rule policy の版が、いまの Baseline と一致しない"):
-        promote(registry, metadata, compatibility, stale_rule)
+    for stale in (stale_rule, same_version_other_table):
+        with pytest.raises(ValueError, match="Rule policy が、いまの Baseline と一致しない"):
+            promote(registry, metadata, compatibility, stale)
     promote(registry, metadata, compatibility, matching)
     promoted = registry.inspect().artifacts[metadata.ref.key]
     assert promoted.metadata.shadow_evaluation_ref == matching.evaluation_ref()
@@ -1461,7 +1500,7 @@ def test_invariant_21_shadow_evidence_carries_the_full_artifact_identity(
     # 別の identity の集計は digest（= shadow_evaluation_ref）も別になる。
     other_ledger = SupervisorShadowLedger(
         rl_policy_config()[0].shadow,
-        rule_policy_version="rule-test-v1",
+        rule_identity=RULE_IDENTITY,
         rl_identity=RL_IDENTITY.model_copy(update={"artifact_sha256": "e" * 64}),
     )
     assert other_ledger.summary().digest() != ledger_for().summary().digest()
@@ -2263,7 +2302,7 @@ def shadow_settings(settings: FanPolicyConfig, *, rl_version: str) -> FanPolicyC
 def ledger_for() -> SupervisorShadowLedger:
     config, _digest = rl_policy_config()
     return SupervisorShadowLedger(
-        config.shadow, rule_policy_version="rule-test-v1", rl_identity=RL_IDENTITY
+        config.shadow, rule_identity=RULE_IDENTITY, rl_identity=RL_IDENTITY
     )
 
 

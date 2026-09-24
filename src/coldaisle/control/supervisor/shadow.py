@@ -31,8 +31,14 @@ from coldaisle.control.schema import (
     WorkloadRegime,
 )
 from coldaisle.control.supervisor.policy_config import PolicyShadowConfig
+from coldaisle.control.supervisor.rule_identity import RulePolicyIdentity
 
-SUPERVISOR_SHADOW_SCHEMA_VERSION: Literal[1] = 1
+SUPERVISOR_SHADOW_SCHEMA_VERSION: Literal[2] = 2
+"""`SupervisorShadowSummary` の形の版。
+
+- v2（#89 / 決定記録 0061 §2.6）: Rule policy の完全な識別（`rule_policy_identity`。版 + 表の
+  digest）。**v1 の集計は版しか持たないので、昇格の証拠にしない**（`evaluation_ref()` が拒む）。
+"""
 
 OBJECTIVE_NAMES: tuple[str, ...] = (
     "acoustic",
@@ -99,8 +105,15 @@ class RegimeAgreement(_Frozen):
 class SupervisorShadowSummary(_Frozen):
     """Shadow 比較の集計。**Registry の `shadow_evaluation_ref` に使える。**"""
 
-    schema_version: Literal[1] = SUPERVISOR_SHADOW_SCHEMA_VERSION
+    schema_version: Literal[1, 2] = SUPERVISOR_SHADOW_SCHEMA_VERSION
     rule_policy_version: str = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9_.-]*$", max_length=120)
+    rule_policy_identity: RulePolicyIdentity | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
+    """比べた Rule policy の**完全な識別**（版 + 表の digest。v2）。
+
+    版だけでは、同じ版で context の違う Rule policy と区別できない。v1 の集計は持たない。
+    """
     rl_policy_identity: SupervisorPolicyIdentity
     """比べた RL artifact の**完全な識別**（model ID・版・bytes hash）。
 
@@ -148,6 +161,13 @@ class SupervisorShadowSummary(_Frozen):
 
     @model_validator(mode="after")
     def _counts_add_up(self) -> Self:
+        if self.schema_version >= 2:
+            if self.rule_policy_identity is None:
+                raise ValueError("v2 の shadow 集計には Rule policy の完全な識別が要る")
+            if self.rule_policy_identity.version != self.rule_policy_version:
+                raise ValueError("Rule policy の識別の版が rule_policy_version と一致しない")
+        elif self.rule_policy_identity is not None:
+            raise ValueError("Rule policy の識別を持つ shadow 集計は schema version 2 にする")
         accounted = (
             self.paired_ticks
             + self.rule_unavailable_ticks
@@ -212,6 +232,11 @@ class SupervisorShadowSummary(_Frozen):
         空でないことしか見ないので、下限に満たない集計の参照を渡せば、足りない shadow の
         証拠が昇格の根拠として記録されてしまう。
         """
+        if self.schema_version < 2 or self.rule_policy_identity is None:
+            # v1 の集計は Rule の版しか持たず、同じ版の別の表と比べた集計と区別できない。
+            raise SupervisorShadowUsageError(
+                "Rule policy の完全な識別を持たない shadow 集計は昇格の証拠にしない"
+            )
         if not self.usable:
             raise SupervisorShadowUsageError(
                 "下限を満たさない shadow 集計は昇格の証拠にしない"
@@ -232,6 +257,7 @@ class SupervisorShadowLedger:
         "_rl_errors",
         "_rl_identity",
         "_rl_unavailable",
+        "_rule_identity",
         "_rule_unavailable",
         "_rule_version",
         "_seen",
@@ -245,18 +271,18 @@ class SupervisorShadowLedger:
         self,
         config: PolicyShadowConfig,
         *,
-        rule_policy_version: str,
+        rule_identity: RulePolicyIdentity,
         rl_identity: SupervisorPolicyIdentity,
     ) -> None:
-        """Rule の版と RL artifact の完全な識別を束縛する。**あとから混ぜられない。**
+        """Rule policy と RL artifact の完全な識別を束縛する。**あとから混ぜられない。**
 
+        Rule 側は版と表の digest（`rule_policy_identity()`）、RL 側は model ID・版・bytes hash。
         Rule と RL が同じ版文字列（例 `1.0.0`）を名乗ってもよい。版は policy kind ごとに
-        別々に照合し、RL 側はさらに model ID・bytes hash まで束縛するので、取り違えない。
+        別々に照合するので、取り違えない。
         """
-        if not rule_policy_version:
-            raise SupervisorShadowUsageError("比較する Rule policy version を名指しする")
         self._config = config
-        self._rule_version = rule_policy_version
+        self._rule_identity = rule_identity
+        self._rule_version = rule_identity.version
         self._rl_identity = rl_identity
         self._seen: dict[int, str] = {}
         self._rule_unavailable = 0
@@ -385,6 +411,7 @@ class SupervisorShadowLedger:
         )
         return SupervisorShadowSummary(
             rule_policy_version=self._rule_version,
+            rule_policy_identity=self._rule_identity,
             rl_policy_identity=self._rl_identity,
             observed_ticks=observed,
             paired_ticks=paired,

@@ -313,6 +313,7 @@ from coldaisle.control.supervisor import (
     RLPolicy,
     RlPolicyConfig,
     RulePolicy,
+    RulePolicyIdentity,
     ShadowRLPolicy,
     SupervisorCoordinator,
     SupervisorInput,
@@ -336,6 +337,7 @@ from coldaisle.control.supervisor import (
     policy_registry_metadata,
     policy_registry_metadata_json_bytes,
     promote_supervisor_policy,
+    rule_policy_identity,
     shadow_evidence_ref,
 )
 
@@ -548,6 +550,7 @@ __all__ = [
     "RolloutEvidence",
     "RulePolicy",
     "RulePolicyConfig",
+    "RulePolicyIdentity",
     "SafetyState",
     "SafetyZoneOutput",
     "ShadowActionPlan",
@@ -637,6 +640,7 @@ __all__ = [
     "policy_registry_metadata",
     "policy_registry_metadata_json_bytes",
     "promote_supervisor_policy",
+    "rule_policy_identity",
     "shadow_evidence_ref",
     "shadow_plan",
     "shadow_prediction",

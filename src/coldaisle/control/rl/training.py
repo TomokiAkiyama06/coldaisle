@@ -53,7 +53,6 @@ from coldaisle.control.schema import (
     SupervisorTargetBand,
     WorkloadRegime,
 )
-from coldaisle.control.state import ControlStateSnapshot, TelemetryHealth
 from coldaisle.control.supervisor.artifact import (
     POLICY_FAMILY,
     CertifiedPolicyArtifact,
@@ -72,11 +71,7 @@ from coldaisle.control.supervisor.policy_config import (
     RlPolicyConfig,
     candidate_identifier,
 )
-from coldaisle.control.supervisor.regime import (
-    RegimeEvidence,
-    RegimeReason,
-    WorkloadRegimeEstimate,
-)
+from coldaisle.control.supervisor.rule_identity import rule_probe_input
 
 TRAINING_REPORT_SCHEMA_VERSION: Literal[1] = 1
 
@@ -137,35 +132,6 @@ class _TablePolicy:
             target_band=entry.target_band,
             computed_at_ms=snapshot.ts_ms,
         )
-
-
-def _probe_input(regime: WorkloadRegime) -> SupervisorInput:
-    """Baseline policy に「この regime の戦略は何か」を聞くための最小の入力。
-
-    #88 の Rule policy は regime から設定済み context への写像なので、観測の中身に依らない。
-    **壁時計を読まない**（時刻はすべて 0 の固定値）。
-    """
-    snapshot = ControlStateSnapshot(
-        tick_id=0,
-        ts_ms=0,
-        monotonic_ms=0,
-        signals=(),
-        derived=(),
-        trends=(),
-        telemetry_health=TelemetryHealth.NORMAL,
-        critical_unavailable=(),
-    )
-    return SupervisorInput(
-        snapshot=snapshot,
-        workload=WorkloadRegimeEstimate(
-            regime=regime,
-            confidence=0.0,
-            reason=RegimeReason.INSUFFICIENT_HISTORY,
-            as_of_tick_id=snapshot.tick_id,
-            computed_at_ms=snapshot.ts_ms,
-            evidence=RegimeEvidence(observed_window_ms=0),
-        ),
-    )
 
 
 class _CandidateAction(_Frozen):
@@ -812,7 +778,7 @@ class SupervisorPolicyTrainer:
         entries: list[RegimeActionEntry] = []
         for regime in sorted(WorkloadRegime, key=lambda item: item.value):
             try:
-                output = self._rule_policy.propose(_probe_input(regime))
+                output = self._rule_policy.propose(rule_probe_input(regime))
             except Exception as error:
                 raise SupervisorPolicyTrainingError(
                     f"Baseline policy が {regime.value} の戦略を返せない: {error}"

@@ -330,9 +330,15 @@ shadow:   { minimum_ticks, minimum_paired_fraction }
     拒まれて Fallback へ落ちる）
   - 集計の `rl_policy_identity` が照合済み artifact の完全な識別（`certified_identity()`）と一致し、
     集計が `usable` である
-  - 集計の `rule_policy_version` が、昇格時に渡す**いま運転の Baseline に使う Rule policy**
-    （`baseline_rule_policy`。版は文字列ではなく policy そのものから取る）の版と一致する。
-    古い Rule と比べた集計を、いまの Rule を上回った証拠として記録させない
+  - 集計の **Rule policy の完全な識別**（`rule_policy_identity`）が、昇格時に渡す**いま運転の
+    Baseline に使う Rule policy**（`baseline_rule_policy`）から作った識別と一致する。識別は
+    版と**表の digest**（`rule_policy_identity()`：regime ごとに policy へ戦略を聞いた表の
+    canonical SHA-256）で、版だけでは同じ版で context の違う Rule を区別できない
+    （`RulePolicyConfig` はそれを許す）。古い表と比べた集計を、いまの Rule を上回った証拠として
+    記録させない
+  - 台帳（`SupervisorShadowLedger`）は Rule 側も完全な識別を束縛し（`rule_identity`）、集計に
+    書く。集計の版は 1 → 2 に上げ（`SUPERVISOR_SHADOW_SCHEMA_VERSION`）、**Rule の識別を
+    持たない v1 の集計は昇格の証拠にしない**（`evaluation_ref()` が拒む。fail closed）
   - #104 の `promote()` を直接呼ぶ経路は残る（0062 の契約。§5 の Registry CLI と同じ残余）
 
 違う regime を前提にした提案どうしの比較は、**`SupervisorDecision` の段階で作れない**

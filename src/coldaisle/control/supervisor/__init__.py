@@ -55,6 +55,7 @@ from coldaisle.control.supervisor.rl_policy import (
     SupervisorPolicyBinding,
     SupervisorPolicyUnusableError,
 )
+from coldaisle.control.supervisor.rule_identity import RulePolicyIdentity, rule_policy_identity
 from coldaisle.control.supervisor.shadow import (
     OBJECTIVE_NAMES,
     SUPERVISOR_SHADOW_SCHEMA_VERSION,
@@ -94,6 +95,7 @@ __all__ = [
     "RegimeTableRlPolicy",
     "RlPolicyConfig",
     "RulePolicy",
+    "RulePolicyIdentity",
     "ShadowRLPolicy",
     "SupervisorCoordinator",
     "SupervisorInput",
@@ -117,5 +119,6 @@ __all__ = [
     "policy_registry_metadata",
     "policy_registry_metadata_json_bytes",
     "promote_supervisor_policy",
+    "rule_policy_identity",
     "shadow_evidence_ref",
 ]
