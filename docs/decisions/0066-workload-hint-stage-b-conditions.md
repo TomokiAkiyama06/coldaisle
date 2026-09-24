@@ -115,6 +115,10 @@ weight・band の単調性が**選ばれる Demand の単調性**をそのまま
     ヒント有りの solve へ渡す。制御ループの `tick_deadline_ms` とは結びつけない（`tick_deadline_ms` は optimizer の
     所有ではない。0052 §2.5）。worker の提案が遅れた場合の扱いは既存のとおり（0041 の鮮度と fallback）で、
     後段の Guard / Safety と heartbeat は worker を待たない
+  - モデルの評価回数の上限（`mpc.optimizer.max_evaluations`。1 tick に許す内部のモデル評価の回数で、時間とは
+    独立した決定論的な打ち切り。0052 §2.5）も同じく**2 回で 1 つを共有する**。基準の solve が使った回数を引いた
+    残りだけをヒント有りの solve へ渡し、残りが無ければヒント有りは解かない（`hint_prior_skipped: budget_exhausted`）。
+    時間と評価回数のどちらかが尽きた時点で打ち切る
   - 基準の solve が期限内に解けなければ、既存の経路（0041 の fallback を含む）をそのまま使う。
     残りの予算でヒント有りが解けなければ、基準の結果を使う（`hint_prior_skipped: budget_exhausted`）。
     ヒントのために期限を延ばさない
@@ -264,6 +268,6 @@ wall_elapsed_ms     = startup_wall_ms - ts_ms                 （壁時計の差
 1. 網羅試験の格子の刻み・範囲と `eps` / `eps_c` の値（Stage A の実測で決める。測る前に決めない）
 2. 系統ごとの配分替え（Demand が下がる系統があるが温度は上がらない）を将来許すか
 3. 単調性ゲートのハッシュを保存する場所（`config/` の隣か、リリース成果物か）
-4. §2.1 (d) の二重解法が、既存の `mpc.budget_ms` の中でどれだけの割合で両方とも解けるか（計算量と成功率の評価。
-   Stage A の実測で見る）。**使える時間の予算は増やさない**。成功率が低ければ Stage B を使わない判断をする（人間が決める）
+4. §2.1 (d) の二重解法が、既存の `mpc.budget_ms` と `mpc.optimizer.max_evaluations` の中でどれだけの割合で両方とも解けるか（計算量と成功率の評価。
+   Stage A の実測で見る）。**使える時間と評価回数の予算は増やさない**。成功率が低ければ Stage B を使わない判断をする（人間が決める）
 5. Thermal Model の昇格と単調性ゲートの再検証を、Registry の運用（0062）のどこで結び付けるか
