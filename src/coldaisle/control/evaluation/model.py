@@ -25,8 +25,17 @@ from coldaisle.control.schema import (
     Zone,
 )
 
-EVALUATION_REPORT_SCHEMA_VERSION: Literal[1] = 1
-"""報告1つの形の版。**欄の意味を変えたら上げる。**"""
+EVALUATION_REPORT_SCHEMA_VERSION: Literal[2] = 2
+"""報告1つの形の版。**欄の意味を変えたら上げる。**
+
+- v2（#159）: 適用 arm の `model_artifacts` / `unbound_attested_ticks`。
+  **欄を足しただけだが版を上げる**（codex #4057527950）。この2つは
+  「無い＝空・0」と読めてしまい、**artifact の完全性を言えない古い報告が
+  「完全に束縛できている」ように見える。** 0057 §2.4 が `last_attested_ts_ms` を
+  足したときは、欄の無い報告が `None`＝「言えない」と読まれたので版を上げなかった。
+  **absence が unknown に落ちるか completeness に落ちるかで扱いを変える。**
+  v1 は読めるが、昇格の証拠には使えない（#92 が拒む）
+"""
 
 
 class _Frozen(BaseModel):
@@ -349,11 +358,34 @@ class AppliedArmReport(_Frozen):
 
     裏づけのある提案が1つも無ければ `None`。**0054 の帰属規則は変えない。**
     記録から言える事実を1つ増やしただけで、どの実測をどの arm に帰属させるかは同じ。
+    """
+    model_artifacts: tuple[Sha256Hex, ...] = ()
+    """この arm で**裏づけのある提案を実際に適用した** tick の model artifact（#159）。
 
-    **この欄は artifact へ束縛できない。** `ModelGateDecision` は artifact の hash を持たず、
-    適用 arm の鍵にも model の identity が入らないので、「どの artifact の実績か」は
-    記録から言えない。Authority Rollout（#92）は適用側の arm を昇格の根拠にしない
-    （決定記録 0057 §2.4 / §5）。
+    出どころは `ControlTick.applied_model_artifact`、すなわち decision trace の
+    `model_gate.artifact_sha256` だけである（決定記録 0059）。走らせた側の自己申告や
+    設定の宣言は入れない。**昇格（#92）は、この集合がいま Production の artifact
+    ちょうど1つであることを求める。**
+
+    裏づけのある提案を1度も適用していない arm（Fallback の arm など）では空。
+    """
+    bound_attested_ticks: int = Field(default=0, ge=0)
+    """この arm で **artifact を言えた** tick の数（#159）。
+
+    `model_artifacts` は集合なので「どの artifact か」しか言わない。**何 tick 分を
+    束縛できたか**は別に数える（codex #4057573941）。これが無いと、100 tick の arm が
+    1 tick だけ束縛できた報告を「完全に束縛できた」と読めてしまう。
+    """
+    unbound_attested_ticks: int = Field(default=0, ge=0)
+    """この arm で **artifact を言えなかった** tick の数（#159）。
+
+    artifact の欄を持たない保存済みの v1〜v6 の trace がこれに当たる。
+    「artifact 不明」を「記録が無いだけ」に見せないために、数えられる形で分けて持つ。
+    **1件でもあれば、この arm の artifact 束縛は完全ではない。**
+    #92 は 0 でなければ昇格の根拠にしない（部分的な証拠を完全として扱わない）。
+
+    報告 v2 では `bound_attested_ticks + unbound_attested_ticks == ticks` を要求する
+    （`EvaluationReport` が版を見て検証する）。**適用 arm のすべての tick を勘定する。**
     """
     gaps: tuple[CountedReason, ...] = ()
     """出せなかった指標と、その理由。**欄を埋め合わせない。**"""
@@ -370,6 +402,34 @@ class AppliedArmReport(_Frozen):
             self.first_ts_ms <= self.last_attested_ts_ms <= self.last_ts_ms
         ):
             raise ValueError("裏づけのある提案の時刻を arm の区間の外に置かない")
+        if len(set(self.model_artifacts)) != len(self.model_artifacts):
+            raise ValueError("適用した artifact を重複させない")
+        if tuple(sorted(self.model_artifacts)) != self.model_artifacts:
+            # 同じ入力から同じ bytes を出すため（0054 §2.7）。
+            raise ValueError("適用した artifact は昇順に並べる")
+        learned = self.arm.controller is ControllerKind.LEARNED_MPC
+        counted = (
+            bool(self.model_artifacts)
+            or self.bound_attested_ticks > 0
+            or self.unbound_attested_ticks > 0
+        )
+        if counted and not learned:
+            # artifact を持つ提案を出せるのは Learned MPC だけ（0028 §2.5 (c)）。
+            raise ValueError("Learned MPC 以外の適用 arm に model artifact を付けない")
+        if bool(self.model_artifacts) != (self.bound_attested_ticks > 0):
+            # 束縛できた tick が無いのに artifact が挙がる（逆も）形を作らせない。
+            raise ValueError("束縛できた tick の数と artifact の有無が食い違っている")
+        if self.model_artifacts and self.last_attested_ts_ms is None:
+            # 裏づけのある提案が1つも無い arm に、その提案の artifact は存在しない。
+            # **`unbound_attested_ticks` はこの条件に含めない。** `model_gate` を持たない
+            # v1〜v4 の tick は「適用したが裏づけの記録が無い」ので、時刻は `None` のまま
+            # 不明だけが数えられる。
+            raise ValueError("裏づけの無い適用 arm に model artifact を付けない")
+        if self.bound_attested_ticks + self.unbound_attested_ticks > self.ticks:
+            raise ValueError("artifact の勘定が arm の tick 数を超えている")
+        # **「すべての tick を勘定したか」は報告の版を見て判断する**（codex #4057573943）。
+        # 保存済みの v1 はこの欄を持たないので、ここで要求すると**読めなくなる**。
+        # 判定は `EvaluationReport`（版を知っている側）が行う。
         return self
 
 
@@ -582,6 +642,13 @@ class ObservedVersions(_Frozen):
     """`<policy>:<version>`。"""
     model_versions: tuple[str, ...] = ()
     model_artifacts: tuple[Sha256Hex, ...] = ()
+    """入力に現れた model artifact。
+
+    **counterfactual（`ShadowCounterfactual.artifact_sha256`）と適用側
+    （`ControlTick.model_gate.artifact_sha256`）の両方から集める**（#159 / 決定記録 0059）。
+    適用側を集めないと、「artifact B の適用実績 + artifact A の counterfactual」という
+    報告が `{A}` の照合を素通りする（決定記録 0057 §3）。
+    """
     authority_stages: tuple[str, ...] = ()
     operating_modes: tuple[str, ...] = ()
 
@@ -684,7 +751,13 @@ class EvaluationReport(_Frozen):
     **同じ入力からは同じ bytes になる。** 生成時刻を持たず、時刻はすべて証拠から来る。
     """
 
-    schema_version: Literal[1] = EVALUATION_REPORT_SCHEMA_VERSION
+    schema_version: Literal[1, 2]
+    """報告の形の版。**入力では必須で、既定値を持たない**（codex #4092017585）。
+
+    既定値があると、既定値を省いて書き出した v1 の報告（`exclude_defaults` など）が
+    最新版として読まれ、`#92` の版の下限を素通りする。**版の無さは unknown であって
+    最新ではない。** 作る側（`evaluate`）は `EVALUATION_REPORT_SCHEMA_VERSION` を明示して渡す。
+    """
     provenance: EvaluationProvenance
     segments: tuple[SegmentReport, ...] = Field(min_length=1)
     worst_cases: tuple[WorstCase, ...] = ()
@@ -710,7 +783,52 @@ class EvaluationReport(_Frozen):
         keys = tuple(gate.arm_key for gate in self.gates)
         if len(set(keys)) != len(keys):
             raise ValueError("同じ arm の gate 結果を2つ入れない")
+        observed = set(self.provenance.versions.model_artifacts)
+        for segment in self.segments:
+            for group in segment.groups:
+                for applied in group.applied:
+                    self._check_applied_artifacts(applied)
+                    if not set(applied.model_artifacts) <= observed:
+                        # run が一度も見ていない artifact を arm の実績に書けない。
+                        # 書けると、報告全体の照合（#92）を通る artifact を arm 側にだけ
+                        # 足して、別の artifact の実績を昇格の根拠にできる。
+                        raise ValueError(
+                            "run に現れていない model artifact を適用 arm に書けない"
+                            f"（arm={applied.arm_key}）"
+                        )
         return self
+
+    def _check_applied_artifacts(self, applied: AppliedArmReport) -> None:
+        """適用 arm の artifact の勘定を、**報告の版に合わせて**検証する（#159）。
+
+        **v1 はそのまま読める。** v1 にこの欄は存在しなかったので、完全性を要求すると
+        保存済みの報告を読めなくしてしまう（codex #4057573943）。読めたうえで、
+        `#92` が「完全性を言えない報告」として昇格の証拠から外す（決定記録 0059 §2.5）。
+        """
+        counted = (
+            applied.model_artifacts
+            or applied.bound_attested_ticks
+            or applied.unbound_attested_ticks
+        )
+        if self.schema_version < 2:
+            if counted:
+                # v1 の報告にこの欄は存在しなかった。後から足して読ませない。
+                raise ValueError(
+                    "適用 arm の artifact を記録する報告は schema version 2 にする"
+                    f"（arm={applied.arm_key}）"
+                )
+            return
+        if applied.arm.controller is not ControllerKind.LEARNED_MPC:
+            return
+        # **すべての tick を勘定する**（codex #4057573941）。`model_artifacts` は集合なので
+        # 「どの artifact か」しか言わない。1 tick だけ束縛できた 100 tick の arm を
+        # 「完全に束縛できた」と読ませないため、tick 数で突き合わせる。
+        accounted = applied.bound_attested_ticks + applied.unbound_attested_ticks
+        if accounted != applied.ticks:
+            raise ValueError(
+                "適用 Learned MPC の arm は、すべての tick の artifact を勘定する"
+                f"（arm={applied.arm_key}; accounted={accounted}; ticks={applied.ticks}）"
+            )
 
 
 __all__ = [

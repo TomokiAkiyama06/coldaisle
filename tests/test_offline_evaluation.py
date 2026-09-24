@@ -60,6 +60,7 @@ from coldaisle.control.evaluation.stats import MetricSummary, shape_of, summariz
 from coldaisle.control.schema import (
     MAX_SHADOW_PREDICTION_METRICS,
     MODEL_GATE_ASSESSMENT_COMPONENTS,
+    AuthorityLimitSource,
     AuthorityStage,
     BoundBy,
     ConfidenceLevel,
@@ -189,7 +190,7 @@ def prediction_for(
 ) -> ShadowPrediction:
     return ShadowPrediction(
         model_id="rack-thermal",
-        model_version="thermal-v1",
+        model_version="0.1.0",
         artifact_sha256="a" * 64,
         inference_id=inference,
         plan_digest=plan.digest(),
@@ -222,7 +223,7 @@ def counterfactual(
             reason=Reason(code="optimizer_timeout"),
             optimizer_status=status,
             latency_ms=latency_ms,
-            model_version="thermal-v1",
+            model_version="0.1.0",
             inference_id=identifier,
             artifact_sha256="a" * 64,
         )
@@ -233,7 +234,7 @@ def counterfactual(
         optimizer_status=status,
         latency_ms=latency_ms,
         evaluations=64,
-        model_version="thermal-v1",
+        model_version="0.1.0",
         inference_id=identifier,
         artifact_sha256="a" * 64,
         plan=plan,
@@ -578,8 +579,10 @@ def test_invariant_3_c_a_later_failure_does_not_move_the_attested_timestamp(
 
     def attested_gate(index: int) -> ModelGateDecision:
         return ModelGateDecision(
-            model_version="thermal-v1",
+            schema_version=2,
+            model_version="0.1.0",
             inference_id=f"{TICK_TS_MS + index * STEP_MS:064x}",
+            artifact_sha256="a" * 64,
             attested=True,
             confidence=0.9,
             ood=False,
@@ -599,7 +602,7 @@ def test_invariant_3_c_a_later_failure_does_not_move_the_attested_timestamp(
                 model_gate=attested_gate(index),
                 state=control_state().model_copy(
                     update={
-                        "model_version": "thermal-v1",
+                        "model_version": "0.1.0",
                         "model_confidence": 0.9,
                         "model_ood": False,
                     }
@@ -1119,7 +1122,7 @@ def test_invariant_8_c_the_report_records_the_versions_and_configs_it_used(
     assert provenance.safety_config_sha256 == context.control.sources.safety.sha256
     assert provenance.fan_policy_config_sha256 == context.control.sources.policy.sha256
     assert provenance.evaluation_config_sha256 == context.config_sha256
-    assert provenance.versions.model_versions == ("thermal-v1",)
+    assert provenance.versions.model_versions == ("0.1.0",)
     assert provenance.versions.model_artifacts == ("a" * 64,)
     assert provenance.versions.control_schema_versions == (8,)
     assert provenance.outcome_match_tolerance_ms == (
@@ -1511,7 +1514,7 @@ def test_the_cli_writes_a_deterministic_report(tmp_path: Path) -> None:
     assert out.read_text(encoding="utf-8") == first
 
     document = json.loads(first)
-    assert document["schema_version"] == 1
+    assert document["schema_version"] == 2
     assert document["segments"][0]["run_id"] == "pr91-cli"
     assert "generated_at" not in document
 
@@ -1651,8 +1654,10 @@ def test_invariant_12_d_an_applied_learned_mpc_arm_records_the_missing_optimizer
 ) -> None:
     """**「optimizer があるのに記録が無い」を「該当しない」と区別する**（0054 §3）。"""
     gate = ModelGateDecision(
-        model_version="thermal-v1",
+        schema_version=2,
+        model_version="0.1.0",
         inference_id="c" * 64,
+        artifact_sha256="a" * 64,
         attested=True,
         confidence=0.9,
         ood=False,
@@ -1669,7 +1674,7 @@ def test_invariant_12_d_an_applied_learned_mpc_arm_records_the_missing_optimizer
         fallback_active=False,
         workload_regime=WorkloadRegime.SUSTAINED_GPU,
         regime_confidence=0.9,
-        model_version="thermal-v1",
+        model_version="0.1.0",
         model_confidence=0.9,
         model_ood=False,
     )
@@ -2011,7 +2016,7 @@ def _two_metric_counterfactual(action_ts_ms: int) -> ShadowCounterfactual:
     identifier = f"{action_ts_ms:064x}"
     prediction = ShadowPrediction(
         model_id="rack-thermal",
-        model_version="thermal-v1",
+        model_version="0.1.0",
         artifact_sha256="a" * 64,
         inference_id=identifier,
         plan_digest=plan.digest(),
@@ -2032,7 +2037,7 @@ def _two_metric_counterfactual(action_ts_ms: int) -> ShadowCounterfactual:
         optimizer_status=OptimizerStatus.OK,
         latency_ms=120,
         evaluations=64,
-        model_version="thermal-v1",
+        model_version="0.1.0",
         inference_id=identifier,
         artifact_sha256="a" * 64,
         plan=plan,
@@ -2375,3 +2380,303 @@ def test_the_policy_pattern_matches_the_report_contract() -> None:
         )
         assert arm.key.endswith("@shadow/auto")
         assert f"+{policy.value}@" in arm.key
+
+
+# ------------------- 不変条件 17: 適用側の arm を artifact へ束縛する（#159 / 0059）
+
+
+def _applied_learned_state() -> ControlState:
+    """Learned MPC が実 Fan の requested を作っていた tick の状態（LIMITED 以降）。"""
+    return ControlState(
+        operating_mode=OperatingMode.AUTO,
+        authority_stage=AuthorityStage.LIMITED,
+        active_controller=ControllerKind.LEARNED_MPC,
+        safety_state=SafetyState.NORMAL,
+        fallback_active=False,
+        workload_regime=WorkloadRegime.SUSTAINED_GPU,
+        regime_confidence=0.9,
+        model_version="0.1.0",
+        model_confidence=0.9,
+        model_ood=False,
+    )
+
+
+def _applied_gate(*, artifact: str | None = "a" * 64) -> ModelGateDecision:
+    return ModelGateDecision(
+        schema_version=2,
+        model_version="0.1.0",
+        inference_id="c" * 64,
+        artifact_sha256=artifact,
+        attested=True,
+        confidence=0.9,
+        ood=False,
+        confidence_level=ConfidenceLevel.HIGH,
+        authority_stage=AuthorityStage.LIMITED,
+        learned_selected=True,
+        limits=(AuthorityLimitSource.STAGE_BAND,),
+        assessment=tuple(Reason(code=component) for component in MODEL_GATE_ASSESSMENT_COMPONENTS),
+    )
+
+
+def _applied_learned_run(*, artifacts: tuple[str | None, ...]) -> list[ControlTraceRecord]:
+    """Learned MPC が適用された tick の列。`None` は artifact の欄を持たない v6 の trace。"""
+    traces: list[ControlTraceRecord] = []
+    for index, artifact in enumerate(artifacts):
+        tick = tick_at(
+            TICK_TS_MS + index * STEP_MS,
+            index,
+            shadow=False,
+            state=_applied_learned_state(),
+            model_gate=_applied_gate(artifact="a" * 64),
+        )
+        if artifact is None:
+            # 保存済みの v6（artifact の欄が無い）。読めなければならない（決定記録 0030）。
+            document = tick.model_dump(mode="python")
+            document["schema_version"] = 6
+            document["model_gate"]["schema_version"] = 1
+            document["model_gate"]["artifact_sha256"] = None
+            # v6 に実行記録の欄は無い（#74 / 決定記録 0060）。
+            document.pop("runtime", None)
+            tick = ControlTick.model_validate(document)
+        elif artifact != "a" * 64:
+            document = tick.model_dump(mode="python")
+            document["model_gate"]["artifact_sha256"] = artifact
+            tick = ControlTick.model_validate(document)
+        traces.append(trace_of(tick))
+    return traces
+
+
+def test_invariant_17_a_an_applied_learned_arm_is_bound_to_its_artifact(
+    context: EvaluationContext,
+) -> None:
+    """**適用した tick の artifact が、適用側の arm の実績として報告に残る**（#159）。"""
+    report = evaluate(
+        [run_of(_applied_learned_run(artifacts=("a" * 64,) * 3), [])], context=context
+    )
+    applied = overall(report).applied[0]
+
+    assert applied.arm.controller is ControllerKind.LEARNED_MPC
+    assert applied.model_artifacts == ("a" * 64,)
+    assert applied.unbound_attested_ticks == 0
+    assert applied.last_attested_ts_ms is not None
+    assert "applied_artifact_unknown" not in {gap.code for gap in applied.gaps}
+
+
+def test_invariant_17_b_a_tick_without_the_field_is_counted_as_artifact_unknown(
+    context: EvaluationContext,
+) -> None:
+    """**「artifact 不明」を黙って落とさない**（部分的な束縛を完全として扱わない）。
+
+    落とすと、残った tick の artifact が区間全体の実績に見え、#92 が欠けた区間を
+    見ないまま昇格できてしまう。
+    """
+    report = evaluate(
+        [run_of(_applied_learned_run(artifacts=("a" * 64, None, "a" * 64)), [])],
+        context=context,
+    )
+    applied = overall(report).applied[0]
+
+    assert applied.model_artifacts == ("a" * 64,)
+    assert applied.unbound_attested_ticks == 1
+    assert "applied_artifact_unknown" in {gap.code for gap in applied.gaps}
+
+
+def test_invariant_17_c_the_provenance_collects_artifacts_from_the_applied_side(
+    context: EvaluationContext,
+) -> None:
+    """**適用側からも artifact を集める**（#159 / 決定記録 0059）。
+
+    counterfactual からしか集めないと、「artifact B の適用実績 + artifact A の
+    counterfactual」という報告が `{A}` の照合を素通りする（決定記録 0057 §3）。
+    """
+    report = evaluate(
+        [run_of(_applied_learned_run(artifacts=("b" * 64,) * 3), [])], context=context
+    )
+
+    assert report.provenance.versions.model_artifacts == ("b" * 64,)
+
+
+def test_invariant_17_d_an_arm_cannot_name_an_artifact_the_run_never_saw() -> None:
+    """**run に現れていない artifact を arm の実績に書けない。**
+
+    書けると、報告全体の照合（#92）を通る artifact を arm 側にだけ足して、別の
+    artifact の実績を昇格の根拠にできる。
+    """
+    from coldaisle.control.evaluation.model import AppliedArmReport, InterventionReport
+
+    arm = AppliedArm(
+        controller=ControllerKind.LEARNED_MPC,
+        supervisor_policy=SupervisorPolicyKind.RULE,
+        authority_stage=AuthorityStage.LIMITED,
+        operating_mode=OperatingMode.AUTO,
+    )
+
+    with pytest.raises(ValidationError, match="Learned MPC 以外の適用 arm"):
+        AppliedArmReport(
+            arm=arm.model_copy(update={"controller": ControllerKind.FALLBACK}),
+            arm_key=arm.model_copy(update={"controller": ControllerKind.FALLBACK}).key,
+            ticks=1,
+            first_ts_ms=TICK_TS_MS,
+            last_ts_ms=TICK_TS_MS,
+            last_attested_ts_ms=TICK_TS_MS,
+            model_artifacts=("a" * 64,),
+            interventions=InterventionReport(
+                ticks=1, safety_states=(CountedReason(code="normal", count=1),)
+            ),
+        )
+
+    with pytest.raises(ValidationError, match="裏づけの無い適用 arm"):
+        AppliedArmReport(
+            arm=arm,
+            arm_key=arm.key,
+            ticks=1,
+            first_ts_ms=TICK_TS_MS,
+            last_ts_ms=TICK_TS_MS,
+            model_artifacts=("a" * 64,),
+            bound_attested_ticks=1,
+            interventions=InterventionReport(
+                ticks=1, safety_states=(CountedReason(code="normal", count=1),)
+            ),
+        )
+
+    with pytest.raises(ValidationError, match="束縛できた tick の数と artifact の有無"):
+        AppliedArmReport(
+            arm=arm,
+            arm_key=arm.key,
+            ticks=1,
+            first_ts_ms=TICK_TS_MS,
+            last_ts_ms=TICK_TS_MS,
+            last_attested_ts_ms=TICK_TS_MS,
+            model_artifacts=("a" * 64,),
+            interventions=InterventionReport(
+                ticks=1, safety_states=(CountedReason(code="normal", count=1),)
+            ),
+        )
+
+
+def test_invariant_17_e_a_learned_tick_without_a_model_gate_counts_as_unknown(
+    context: EvaluationContext,
+) -> None:
+    """**`model_gate` を持たない v1〜v4 の適用 tick も「不明」に数える**（codex #4057527947）。
+
+    数えないと、その区間は artifact を1つも挙げないまま `unbound_attested_ticks == 0` に
+    なり、`#92` の「適用 arm すべてに不明が無いこと」を素通りする。
+    """
+    traces = []
+    for index in range(3):
+        tick = tick_at(
+            TICK_TS_MS + index * STEP_MS,
+            index,
+            shadow=False,
+            state=_applied_learned_state(),
+            model_gate=_applied_gate(),
+        )
+        document = tick.model_dump(mode="python")
+        # v4 の trace。Learned MPC を適用しているが `model_gate` を持たない。
+        document["schema_version"] = 4
+        document["model_gate"] = None
+        document.pop("runtime", None)
+        traces.append(trace_of(ControlTick.model_validate(document)))
+
+    report = evaluate([run_of(traces, [])], context=context)
+    applied = overall(report).applied[0]
+
+    assert applied.arm.controller is ControllerKind.LEARNED_MPC
+    assert applied.model_artifacts == ()
+    assert applied.unbound_attested_ticks == 3, "記録の無さを「不明なし」に落とさない"
+    assert applied.last_attested_ts_ms is None
+    assert "applied_artifact_unknown" in {gap.code for gap in applied.gaps}
+
+
+def test_invariant_17_f_an_applied_learned_arm_must_account_for_every_tick(
+    context: EvaluationContext,
+) -> None:
+    """**一部の tick しか束縛できていない arm を「完全」と読ませない**（codex #4057573941）。
+
+    `model_artifacts` は集合なので「どの artifact か」しか言わない。1 tick だけ束縛できた
+    100 tick の arm でも `model_artifacts == (production,)` / `unbound == 0` になりうる。
+    **すべての tick を勘定する。**
+    """
+    report = evaluate(
+        [run_of(_applied_learned_run(artifacts=("a" * 64,) * 3), [])], context=context
+    )
+    applied = overall(report).applied[0]
+    assert (applied.bound_attested_ticks, applied.unbound_attested_ticks) == (3, 0)
+    assert applied.ticks == 3
+
+    document = json.loads(report.model_dump_json())
+    # 3 tick のうち1 tick しか勘定していない報告。artifact も「不明」も食い違わないが、
+    # **区間の何割を束縛できたのかを言えていない。**
+    for group in document["segments"][0]["groups"]:
+        for item in group["applied"]:
+            item["bound_attested_ticks"] = 1
+
+    with pytest.raises(ValidationError, match="すべての tick の artifact を勘定する"):
+        EvaluationReport.model_validate_json(json.dumps(document))
+
+
+def test_invariant_17_h_a_stored_v1_report_still_loads(context: EvaluationContext) -> None:
+    """**保存済みの v1 の報告は、そのまま読める**（codex #4057573943）。
+
+    完全性を型の段で要求すると、v1 が**読めなくなる。** v1 は読めたうえで、
+    `#92` が「artifact の完全性を言えない報告」として昇格の証拠から外す
+    （決定記録 0059 §2.5）。読めなくするのと、根拠にしないのは別である。
+    """
+    report = evaluate(
+        [run_of(_applied_learned_run(artifacts=("a" * 64,) * 3), [])], context=context
+    )
+    document = json.loads(report.model_dump_json())
+    # v1 の報告の形（この3欄は当時まだ無かった）。
+    document["schema_version"] = 1
+    for segment in document["segments"]:
+        for group in segment["groups"]:
+            for item in group["applied"]:
+                del item["model_artifacts"]
+                del item["bound_attested_ticks"]
+                del item["unbound_attested_ticks"]
+
+    stored = EvaluationReport.model_validate_json(json.dumps(document))
+
+    assert stored.schema_version == 1
+    applied = overall(stored).applied[0]
+    assert applied.arm.controller is ControllerKind.LEARNED_MPC
+    assert applied.model_artifacts == ()
+    assert (applied.bound_attested_ticks, applied.unbound_attested_ticks) == (0, 0)
+
+
+def test_invariant_17_i_a_report_without_a_schema_version_is_refused(
+    context: EvaluationContext,
+) -> None:
+    """**版の書かれていない報告を最新版として読まない**（codex #4092017585）。
+
+    版に既定値があると、既定値を省いて書き出した v1 の報告（`exclude_defaults` など）が
+    v2 として読まれ、`#92` の版の下限を素通りする。版は明示されたものだけを信じる。
+    """
+    report = evaluate(
+        [run_of(_applied_learned_run(artifacts=("a" * 64,) * 3), [])], context=context
+    )
+    document = json.loads(report.model_dump_json())
+    assert document["schema_version"] == 2
+    # v2 はそのまま往復する。
+    assert EvaluationReport.model_validate_json(json.dumps(document)) == report
+
+    del document["schema_version"]
+    with pytest.raises(ValidationError, match="schema_version"):
+        EvaluationReport.model_validate_json(json.dumps(document))
+    # 既定値を省いて書き出しても、版は必ず残る（省ける既定値が無い）。
+    assert json.loads(report.model_dump_json(exclude_defaults=True))["schema_version"] == 2
+
+
+def test_invariant_17_g_a_v1_report_cannot_carry_the_fields_added_in_v2(
+    context: EvaluationContext,
+) -> None:
+    """**古い version に、後から意味の違う欄を足して読ませない**（決定記録 0030 と同じ向き）。"""
+    report = evaluate(
+        [run_of(_applied_learned_run(artifacts=("a" * 64,) * 3), [])], context=context
+    )
+    document = json.loads(report.model_dump_json())
+    assert document["schema_version"] == 2
+    document["schema_version"] = 1
+
+    with pytest.raises(ValidationError, match="schema version 2"):
+        EvaluationReport.model_validate_json(json.dumps(document))

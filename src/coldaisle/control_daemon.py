@@ -544,6 +544,11 @@ def build(
         gate=ControllerGate(
             control.policy,
             expected_model_version=UNCONFIGURED_MODEL_VERSION,
+            # **束縛した artifact が無いことを明示する**（#159 / 決定記録 0059 §2.1）。
+            # worker を配線していないので提案は1件も来ないが、仮に来ても採らない。
+            # 既定値を置かず必須の引数にしてあるのは、渡し忘れが「何にも照らさない
+            # Gate」を作らないためである。
+            expected_artifact_sha256=None,
             authority=authority,
         ),
         guard=ReactiveGuard(control.policy.reactive_guard, catalog),
