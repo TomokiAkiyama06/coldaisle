@@ -333,21 +333,27 @@ class ComputeModeAdvisor:
     def _episodes(self, buckets: Sequence[RollupPoint], bucket_ms: int) -> list[_Episode]:
         """観測された電力だけからフルロード期間を切り出す（I-3 / I-4 / I-5）。"""
         load = self._settings.history.load
-        qualifying = [
-            point
-            for point in buckets
-            # 数サンプルしか届かなかったバケットを5分ぶんの根拠に数えない（I-2）
-            if point.mean_value is not None
-            and point.mean_value >= load.min_value
-            and point.ok_value_count >= load.min_ok_samples
-        ]
         join_ms = bucket_ms + load.max_gap_s * 1000
         runs: list[list[RollupPoint]] = []
-        for point in qualifying:
-            if runs and point.bucket_ms - runs[-1][-1].bucket_ms <= join_ms:
+        broken = True
+        for point in sorted(buckets, key=lambda item: item.bucket_ms):
+            if point.mean_value is None:
+                # quality=ok の値が無いバケットは「観測できなかった」＝欠落と同じ扱い
+                continue
+            if point.mean_value < load.min_value:
+                # 閾値未満を**観測した**バケットは欠落ではない。期間をここで必ず切る
+                # （欠落として繋ぐと、途切れた負荷を連続したフルロードに数えてしまう）
+                broken = True
+                continue
+            if point.ok_value_count < load.min_ok_samples:
+                # 数サンプルしか届かなかったバケットを5分ぶんの根拠に数えない（I-2）。
+                # 負荷が下がった証拠でもないので、欠落と同じく切りも数えもしない
+                continue
+            if not broken and point.bucket_ms - runs[-1][-1].bucket_ms <= join_ms:
                 runs[-1].append(point)
             else:
                 runs.append([point])
+            broken = False
 
         episodes: list[_Episode] = []
         for run in runs:

@@ -412,6 +412,23 @@ def test_a_gap_inside_one_period_is_not_counted_as_observed_time(tmp_path, rules
     assert advisory.reference.ended_at_ms - advisory.reference.started_at_ms == 35 * MINUTE_MS
 
 
+def test_an_observed_low_load_bucket_splits_the_period(tmp_path, rules, catalog):
+    """**観測された閾値未満のバケットは欠落ではない**。期間を必ずそこで切る。
+
+    10分の高負荷・5分の観測済み低負荷・5分の高負荷は、連続15分のフルロードではない。
+    """
+    advisor = ComputeModeAdvisor(_settings(tmp_path, catalog), catalog)
+    start = NOW_MS - 3 * HOUR_MS
+    with _store(tmp_path, rules) as store:
+        _full_load(store, start_ms=start, duration_ms=10 * MINUTE_MS)
+        _full_load(store, start_ms=start + 10 * MINUTE_MS, duration_ms=5 * MINUTE_MS, power=120.0)
+        _full_load(store, start_ms=start + 15 * MINUTE_MS, duration_ms=5 * MINUTE_MS)
+        advisory = _evaluate(advisor, store)
+
+    assert advisory.reference is None
+    assert advisory.reference_count == 0
+
+
 # --- I-5 時刻は証拠由来 -----------------------------------------------------
 
 
