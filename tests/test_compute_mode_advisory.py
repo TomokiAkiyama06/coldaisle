@@ -9,6 +9,7 @@ from __future__ import annotations
 import ast
 import json
 import re
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -20,6 +21,7 @@ from coldaisle.api.app import Config, create_app
 from coldaisle.api.compute_mode_advisory import (
     ComputeModeAdvisor,
     ComputeModeAdvisorySettings,
+    _History,
 )
 from coldaisle.api.models import (
     HealthSource,
@@ -494,6 +496,70 @@ def test_history_is_evaluated_once_per_refresh_window_and_says_when(tmp_path, ru
 
     assert after.reference is not None
     assert after.evaluated_at_ms == NOW_MS + 300_000
+
+
+def test_the_first_history_evaluation_in_a_window_runs_only_once(
+    tmp_path, rules, catalog, monkeypatch
+):
+    """REST と WS が同じ advisor を同時に呼んでも、**窓ごとの評価は1回だけ**。
+
+    2本が別々のスナップショットで評価すると、同じ窓で異なる reference を返し、
+    どちらがキャッシュに残るかが実行順で変わってしまう。
+    """
+    advisor = ComputeModeAdvisor(_settings(tmp_path, catalog), catalog)
+    calls: list[int] = []
+    first_entered = threading.Event()
+    second_entered = threading.Event()
+    release = threading.Event()
+
+    def counting(store, now_ms):
+        calls.append(now_ms)
+        if len(calls) == 1:
+            first_entered.set()
+            assert release.wait(timeout=10)
+        else:
+            second_entered.set()
+        # 呼び出しごとに別の結果を返し、どちらがキャッシュに残ったかを見分ける
+        return _History(None, len(calls), now_ms, ())
+
+    monkeypatch.setattr(advisor, "_evaluate_history", counting)
+    results: dict[str, Any] = {}
+
+    def run(name: str, now_ms: int) -> None:
+        # SQLite の接続はスレッドをまたげないため、本番と同じく呼び出し側ごとに開く
+        with _store(tmp_path, rules, now_ms=now_ms) as store:
+            results[name] = advisor._history(store, now_ms)
+
+    first = threading.Thread(target=run, args=("first", NOW_MS))
+    second = threading.Thread(target=run, args=("second", NOW_MS + 1_000))
+    first.start()
+    assert first_entered.wait(timeout=10)
+    second.start()
+    # 修正前は2本目もすぐ評価に入る。修正後は1本目の完了まで待たされる
+    entered_concurrently = second_entered.wait(timeout=0.5)
+    release.set()
+    first.join(timeout=10)
+    second.join(timeout=10)
+
+    assert not entered_concurrently
+    assert calls == [NOW_MS]
+    assert results["first"] is results["second"]
+
+
+def test_the_bucket_still_in_progress_is_not_counted_as_a_full_bucket(tmp_path, rules, catalog):
+    """進行中のバケットを5分ぶんの観測として数えない（0063 §2.3）。
+
+    12.5分の実負荷が、進行中バケットを含めて 3 バケット＝15分に化けてはいけない。
+    終了時刻が未来になることもあってはならない。
+    """
+    now_ms = NOW_MS + 150_000
+    advisor = ComputeModeAdvisor(_settings(tmp_path, catalog), catalog)
+    with _store(tmp_path, rules, now_ms=now_ms) as store:
+        _full_load(store, start_ms=NOW_MS - 10 * MINUTE_MS, duration_ms=12 * MINUTE_MS + 30_000)
+        advisory = _evaluate(advisor, store, now_ms=now_ms)
+
+    assert advisory.reference is None
+    assert advisory.reference_count == 0
 
 
 # --- I-7 しきい値・metric 名は設定から ---------------------------------------

@@ -268,19 +268,23 @@ class ComputeModeAdvisor:
 
     def _history(self, store: SqliteStore, now_ms: int) -> _History:
         window = now_ms // (self._settings.history.refresh_s * 1000)
+        # REST と WS が同じ advisor を別スレッドから呼ぶ。評価中もロックを持ち、
+        # 窓ごとの初回評価を1回に限る。離すと2本が別スナップショットで評価し、
+        # 同じ窓で異なる reference を返したうえ、どちらが残るかが実行順で変わる
         with self._lock:
             cached = self._cached
-        if cached is not None and cached[0] == window:
-            return cached[1]
-        history = self._evaluate_history(store, now_ms)
-        with self._lock:
+            if cached is not None and cached[0] == window:
+                return cached[1]
+            history = self._evaluate_history(store, now_ms)
             self._cached = (window, history)
-        return history
+            return history
 
     def _evaluate_history(self, store: SqliteStore, now_ms: int) -> _History:
         history = self._settings.history
         bucket_ms = history.bucket_ms
-        end_ms = (now_ms // bucket_ms + 1) * bucket_ms
+        # 完了したバケットだけを読む。進行中のバケットは5分ぶん観測していないのに
+        # 5分として数えられ、終了時刻も未来になる（0063 §2.3）
+        end_ms = now_ms // bucket_ms * bucket_ms
         start_ms = max(0, (now_ms - self._settings.lookback_ms) // bucket_ms * bucket_ms)
         limitations: list[str] = []
         if start_ms >= end_ms:
