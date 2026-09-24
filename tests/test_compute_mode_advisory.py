@@ -244,6 +244,7 @@ def test_a_condition_that_was_never_recorded_is_reported_and_is_not_safe(tmp_pat
     ("kwargs", "reason"),
     [
         ({"age_ms": 120_000}, "古い値を現在の条件として扱わない"),
+        ({"age_ms": -5_000}, "未来の時刻の値を現在の条件として扱わない"),
         ({"quality": Quality.SUSPECT}, "疑わしい値を判断材料にしない"),
         ({"quality": Quality.STALE}, "stale を判断材料にしない"),
     ],
@@ -431,6 +432,33 @@ def test_an_observed_low_load_bucket_splits_the_period(tmp_path, rules, catalog)
     assert advisory.reference_count == 0
 
 
+def test_a_thin_low_bucket_is_a_gap_and_does_not_split_the_period(tmp_path, rules, catalog):
+    """数サンプルしか無いバケットは、負荷が下がった証拠にもならない（欠落と同じ）。
+
+    閾値未満の値が少しだけ届いたバケットで期間を切らない。
+    """
+    advisor = ComputeModeAdvisor(_settings(tmp_path, catalog), catalog)
+    start = NOW_MS - 3 * HOUR_MS
+    with _store(tmp_path, rules) as store:
+        _full_load(store, start_ms=start, duration_ms=10 * MINUTE_MS)
+        # 5分に10サンプルだけ（min_ok_samples=60 未満）の低い値
+        _full_load(
+            store,
+            start_ms=start + 10 * MINUTE_MS,
+            duration_ms=5 * MINUTE_MS,
+            interval_ms=30_000,
+            power=120.0,
+        )
+        _full_load(store, start_ms=start + 15 * MINUTE_MS, duration_ms=5 * MINUTE_MS)
+        advisory = _evaluate(advisor, store)
+
+    assert advisory.reference_count == 1
+    assert advisory.reference is not None
+    # 薄いバケットは繋ぐが、観測時間には数えない
+    assert advisory.reference.bucket_count == 3
+    assert advisory.reference.covered_s == 900
+
+
 # --- I-5 時刻は証拠由来 -----------------------------------------------------
 
 
@@ -544,6 +572,34 @@ def test_the_first_history_evaluation_in_a_window_runs_only_once(
     assert not entered_concurrently
     assert calls == [NOW_MS]
     assert results["first"] is results["second"]
+
+
+def test_a_late_call_from_an_older_window_does_not_evict_the_newer_result(
+    tmp_path, rules, catalog, monkeypatch
+):
+    """窓の境目で、遅れて届いた前の窓の呼び出しが新しい窓の結果を消さない。
+
+    消すと新しい窓が2回評価され、同じ窓で結果が変わりうる。
+    """
+    advisor = ComputeModeAdvisor(_settings(tmp_path, catalog), catalog)
+    calls: list[int] = []
+
+    def counting(store, now_ms):
+        calls.append(now_ms)
+        return _History(None, len(calls), now_ms, ())
+
+    monkeypatch.setattr(advisor, "_evaluate_history", counting)
+    refresh_ms = BASE_SETTINGS["history"]["refresh_s"] * 1000
+    newer_ms = NOW_MS + refresh_ms
+    older_ms = newer_ms - 1_000
+    with _store(tmp_path, rules) as store:
+        newer = advisor._history(store, newer_ms)
+        older = advisor._history(store, older_ms)
+        again = advisor._history(store, newer_ms + 1_000)
+
+    assert older.evaluated_at_ms == older_ms
+    assert again is newer
+    assert calls == [newer_ms, older_ms]
 
 
 def test_the_bucket_still_in_progress_is_not_counted_as_a_full_bucket(tmp_path, rules, catalog):

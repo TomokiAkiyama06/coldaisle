@@ -236,7 +236,8 @@ class ComputeModeAdvisor:
                 value is not None
                 and quality is Quality.OK
                 and age_ms is not None
-                and age_ms <= max_age_ms
+                # 未来の時刻の値（負の age）も「いまの条件」として使わない
+                and 0 <= age_ms <= max_age_ms
             )
             reference_value = (
                 None if reference is None else reference.conditions.get(setting.metric)
@@ -276,7 +277,10 @@ class ComputeModeAdvisor:
             if cached is not None and cached[0] == window:
                 return cached[1]
             history = self._evaluate_history(store, now_ms)
-            self._cached = (window, history)
+            # 窓の境目で遅れて届いた前の窓の呼び出しが、新しい窓の結果を消さない
+            # （消すと新しい窓が2回評価され、同じ窓で結果が変わりうる）
+            if cached is None or cached[0] < window:
+                self._cached = (window, history)
             return history
 
     def _evaluate_history(self, store: SqliteStore, now_ms: int) -> _History:
@@ -344,14 +348,15 @@ class ComputeModeAdvisor:
             if point.mean_value is None:
                 # quality=ok の値が無いバケットは「観測できなかった」＝欠落と同じ扱い
                 continue
-            if point.mean_value < load.min_value:
-                # 閾値未満を**観測した**バケットは欠落ではない。期間をここで必ず切る
-                # （欠落として繋ぐと、途切れた負荷を連続したフルロードに数えてしまう）
-                broken = True
-                continue
             if point.ok_value_count < load.min_ok_samples:
                 # 数サンプルしか届かなかったバケットを5分ぶんの根拠に数えない（I-2）。
-                # 負荷が下がった証拠でもないので、欠落と同じく切りも数えもしない
+                # 負荷が下がった証拠でもないので、値の高低によらず欠落と同じく
+                # 切りも数えもしない
+                continue
+            if point.mean_value < load.min_value:
+                # 閾値未満を**十分に観測した**バケットは欠落ではない。期間をここで必ず切る
+                # （欠落として繋ぐと、途切れた負荷を連続したフルロードに数えてしまう）
+                broken = True
                 continue
             if not broken and point.bucket_ms - runs[-1][-1].bucket_ms <= join_ms:
                 runs[-1].append(point)
