@@ -616,7 +616,7 @@ Kaggle・研究でGPUを使う際は `--gpu-memory-utilization` による制限�
 | Q-23 | Confidence / OOD の方式、Authority 昇格ゲートの閾値 | 方式は決定記録 0050（FINAL、2026-09-20 所有者承認）で決定。**閾値の値**は GitHub #85 / #90 / #91、**stage の昇格**は #92 で未決 |
 | Q-24 | Air Balance の最適な帯 | GitHub #81 |
 | Q-25 | 本番でオンライン学習を行うか | GitHub #93 / #104 |
-| Q-26 | 音響センサーのハードウェア | 専用の音響センサーは導入せず、手持ちの騒音計 / アプリで概算する（決定記録 0067、Proposed。手順は `docs/acoustic-measurement.md`） |
+| Q-26 | 音響センサーのハードウェア | 導入しない。騒音は「うるさいか」の回答で測る（決定記録 0067、Proposed。手順は `docs/acoustic-measurement.md`） |
 | Q-27 | Workload Hint を実装する時期 | GitHub #107 |
 | Q-28 | Airflow 可視化 UI の置き場所（coldaisle / Workspace） | GitHub #106 |
 
