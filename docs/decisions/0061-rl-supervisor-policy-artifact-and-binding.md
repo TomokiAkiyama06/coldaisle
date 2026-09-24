@@ -302,6 +302,16 @@ Baseline の欄が `output_bounds` の外にあれば**丸めず拒む**。
   - **比べてよいかは採点の前に1度だけ決める**（`candidate_rejection()`）。共通の長さは
     比べてよい候補と Baseline だけから取る（`scoring_horizon()`）。後で落とす形だと、
     落とす候補の短さが健全な候補すべての採点区間を縮める
+- **Baseline より先に終わった候補は、理由を問わず共通の長さに入れない。** 自分の違反・範囲外
+  action で先に終わった候補は打ち切りではない（違反が台帳に載る）ので比較には残す
+  （`comparable=True`）。ただし共通の長さに入れると、健全な候補どうしが最初の数 step だけで
+  並べられ、壊れた候補が「どの健全な候補が選ばれるか」を変えてしまう
+  - 共通の長さ（`scoring_horizon()`）は、Baseline と、比べてよく、かつ採点できた step 数が
+    どの episode でも Baseline 以上の候補だけから取る
+  - 先に終わった候補は `CandidateOutcome.short_episodes` に該当 episode を残す。共通の長さの
+    reward を持たないので `mean_reward_over_common_horizon` は書かず（`None`）、
+    **改善扱いにしない**（fail closed）。自分の長さで採点した reward を並べると、
+    長さの違う総和を並べることになる（0058 §2.6）ので、この単純な形を採る
 - **どの候補も Baseline を上回らなければ、Baseline の表が選ばれる。** 上回っていないのに
   別の表を出さないためで、その artifact は「Rule の戦略を RL artifact として表したもの」になる。
   shadow の配線を確かめるには十分で、戦略は何も変わらない

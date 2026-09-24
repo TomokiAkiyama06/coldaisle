@@ -1314,6 +1314,72 @@ def test_invariant_19_c_a_truncated_candidate_never_shortens_the_common_horizon(
     assert horizon == {"pr89-a": len(full.supported_steps)}
 
 
+def test_invariant_19_d_a_self_failing_candidate_never_shortens_the_common_horizon(
+    trained: Any,
+) -> None:
+    """**自分の違反で先に終わった候補も、共通の長さを縮めない。**
+
+    その候補は打ち切りではない（違反は台帳に載る）ので比較には残るが、共通の長さに入れると
+    健全な候補どうしが最初の数 step だけで並べられ、後半の差が無視される。壊れた候補が
+    「どの健全な候補が選ばれるか」を変えてはならない。
+    """
+    environment, _config, settings, _safety = build_environment(trained, with_mpc=False)
+    trainer = trainer_for(environment, settings)
+    specs = (episode_spec(episode_id="pr89-a", seed=3),)
+    report = trainer.train(specs, model_version="0.1.0", created_at=CREATED_AT)
+    base = report.comparison.arms[0]
+    full = base.episode("pr89-a").model_copy(update={"learned_controller_available": True})
+    assert len(full.steps) >= 3 and all(step.supported for step in full.steps)
+
+    # A: 1 step 目の後、2 step 目で自分の違反を踏んで終わった（違反を観測した記録は残す）。
+    violating = full.steps[1].model_copy(
+        update={"safety": full.steps[1].safety.model_copy(update={"ceiling_exceedances": 1})}
+    )
+    self_failed = full.model_copy(
+        update={
+            "steps": (full.steps[0], violating),
+            "safety": full.safety.model_copy(update={"ceiling_exceedances": 1}),
+            "termination": TerminationReason.SAFETY_VIOLATION,
+        }
+    )
+    # B / C: 走り切る。**違いは最後の step の reward だけ**（A が終わった後の区間）。
+    last = full.steps[-1]
+    assert last.reward is not None
+    better_last = last.model_copy(
+        update={"reward": last.reward.model_copy(update={"reward": last.reward.reward + 1.0})}
+    )
+    better = full.model_copy(update={"steps": (*full.steps[:-1], better_last)})
+
+    baseline_arm = _arm_of(base, full, base.policy_version)
+    arms = {
+        "a-self-failed": _arm_of(base, self_failed, "cand-a"),
+        "b-same": _arm_of(base, full, "cand-b"),
+        "c-better": _arm_of(base, better, "cand-c"),
+    }
+    rejections = {
+        key: reason
+        for key, value in arms.items()
+        if (reason := candidate_rejection(value, baseline_arm)) is not None
+    }
+    # A は打ち切りではない（自分の違反で終わった）ので却下されない。
+    assert rejections == {}
+
+    horizon = scoring_horizon(baseline_arm, arms, rejections)
+    assert horizon == {"pr89-a": len(full.supported_steps)}
+
+    outcomes = trainer._score(
+        arms=arms, rejections=rejections, baseline_arm=baseline_arm, horizon=horizon
+    )
+    assert outcomes["a-self-failed"].comparable is True
+    assert outcomes["a-self-failed"].short_episodes == ("pr89-a",)
+    assert outcomes["a-self-failed"].safety_violations == 1
+    assert outcomes["a-self-failed"].mean_reward_over_common_horizon is None
+    assert outcomes["a-self-failed"].improved is False
+    assert outcomes["b-same"].improved is False
+    assert outcomes["c-better"].improved is True
+    assert trainer._select(outcomes) == "c-better"
+
+
 def test_invariant_20_binding_compares_every_artifact_determined_metadata_field(
     tmp_path: Path, bounds: SupervisorOutputBounds
 ) -> None:

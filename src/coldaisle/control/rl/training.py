@@ -210,8 +210,22 @@ class CandidateOutcome(_Frozen):
     （fail closed）。
     """
 
+    short_episodes: tuple[str, ...] = ()
+    """Baseline より**採点できた step が少ないまま**終わった episode（`short_episodes()`）。
+
+    打ち切り（`truncated_episodes`）と違い、自分の違反・範囲外 action で先に終わった場合も
+    含む。違反は台帳に載るので比較には残す（`comparable=True`）が、**共通の長さには
+    入れない**。入れると、壊れた候補の短さで健全な候補どうしが最初の数 step だけで
+    並べられ、壊れた候補が「どの健全な候補が選ばれるか」を変えてしまう。
+    共通の長さを満たせないので reward は書かず（`None`）、**改善扱いにしない**（fail closed）。
+    """
+
     @model_validator(mode="after")
     def _uncomparable_candidates_never_win(self) -> Self:
+        if self.short_episodes and (
+            self.improved or self.mean_reward_over_common_horizon is not None
+        ):
+            raise ValueError("先に終わった候補に共通の長さの reward を書かず、改善扱いにしない")
         truncated_rejection = (
             self.rejection is not None and self.rejection.code == TRUNCATED_REJECTION_CODE
         )
@@ -416,18 +430,43 @@ def candidate_rejection(arm: PolicyArm, baseline: PolicyArm) -> Reason | None:
     return None
 
 
+def short_episodes(arm: PolicyArm, baseline: PolicyArm) -> tuple[str, ...]:
+    """`arm` が Baseline より**採点できた step が少ないまま**終わった episode。
+
+    終わった理由を問わない（自分の違反・範囲外 action で先に終わった場合も含む）。
+    こうした arm は Baseline と同じ長さの reward を持たないので、共通の長さに入れない。
+    """
+    return tuple(
+        sorted(
+            episode.episode_id
+            for episode in arm.episodes
+            if len(episode.supported_steps)
+            < len(baseline.episode(episode.episode_id).supported_steps)
+        )
+    )
+
+
 def scoring_horizon(
     baseline: PolicyArm,
     arms: Mapping[str, PolicyArm],
     rejections: Mapping[str, Reason],
 ) -> dict[str, int]:
-    """Baseline と**比べてよい候補だけ**から共通の長さを決める。
+    """Baseline と、**比べてよく、かつ Baseline より先に終わっていない候補だけ**から
+    共通の長さを決める。
 
-    却下した候補（打ち切りを含む）を入れると、その候補の短さが健全な候補すべての
-    採点区間を縮める。
+    却下した候補（打ち切りを含む）や、自分の違反で先に終わった候補を入れると、その候補の
+    短さが健全な候補すべての採点区間を縮め、健全な候補どうしを最初の数 step だけで
+    並べることになる。先に終わった候補は安全側の台帳で比べ、reward は書かない（`_score`）。
     """
     return common_matched_steps(
-        (baseline, *(arms[key] for key in sorted(arms) if key not in rejections))
+        (
+            baseline,
+            *(
+                arms[key]
+                for key in sorted(arms)
+                if key not in rejections and not short_episodes(arms[key], baseline)
+            ),
+        )
     )
 
 
@@ -748,6 +787,21 @@ class SupervisorPolicyTrainer:
                         if rejection.code == TRUNCATED_REJECTION_CODE
                         else ()
                     ),
+                )
+                continue
+            short = short_episodes(arm, baseline_arm)
+            if short:
+                # **先に終わった候補は共通の長さの reward を持たない。** 違反は台帳に載るので
+                # 比較には残すが、改善扱いにしない（fail closed。0061 §2.7）。
+                outcomes[identifier] = CandidateOutcome(
+                    candidate_id=identifier,
+                    policy_version=f"{self._config.artifact.model_id}-{identifier}",
+                    comparable=True,
+                    safety_violations=arm.safety_violations,
+                    invalid_actions=arm.invalid_actions,
+                    baseline_mean_reward_over_common_horizon=baseline_mean,
+                    improved=False,
+                    short_episodes=short,
                 )
                 continue
             mean = mean_reward_over(arm, horizon)
