@@ -428,6 +428,12 @@ class SupervisorTrainingEnvironment:
         self._gate = ControllerGate(
             self._policy,
             expected_model_version=self._expected_model_version,
+            # **束縛した artifact の hash を Gate へ渡す**（#159 / 決定記録 0059）。
+            # Learned MPC を束縛できなかった episode は `None` を渡す（提案が無いので
+            # 照らす相手も無い。渡し忘れで「何にも照らさない」状態を作らない）。
+            expected_artifact_sha256=(
+                None if self._mpc is None else self._mpc.binding.attestation.artifact_sha256
+            ),
             # **学習環境は journal を読まない**（#92 / 決定記録 0057 §2.2）。実機の制御権は
             # `AuthorityRuntime` が持つが、ここは同じ条件を再現するための simulation なので、
             # 設定の stage をそのまま実効 stage として固定する。
