@@ -38,7 +38,12 @@ from coldaisle.control.rl.environment import (
     EpisodeSpec,
     SupervisorTrainingEnvironment,
 )
-from coldaisle.control.rl.episode import PolicyArm, PolicyComparison, TerminationReason
+from coldaisle.control.rl.episode import (
+    EpisodeResult,
+    PolicyArm,
+    PolicyComparison,
+    TerminationReason,
+)
 from coldaisle.control.schema import (
     AuthorityStage,
     Reason,
@@ -195,19 +200,24 @@ class CandidateOutcome(_Frozen):
     )
     improved: bool
     truncated_episodes: tuple[str, ...] = ()
-    """Baseline より**観測した step が少なく、自分の安全違反・範囲外 action 以外の理由で**
-    終わった episode（判定は `truncated_episodes()`。記録の数ではなく採点できた step 数で比べる）。
+    """Baseline より**安全を観測した step が少ないまま、自分の違反以外の理由で**終わった
+    episode（判定は `truncated_episodes()`）。
 
     安全側の台帳（`safety_violations` / `invalid_actions`）は episode 全体を数えるので、
-    採点できなくなって先に終わった候補は、Baseline がその後で踏んだ違反をそもそも観測しない。
-    それを「違反が少ない」と読むと、**壊れたせいで安全に見える**候補が選ばれる。
-    1つでもあれば改善扱いにしない（fail closed）。
+    先に終わった候補は、Baseline がその後で踏んだ違反をそもそも観測しない。それを
+    「違反が少ない」と読むと、**壊れたせいで安全に見える**候補が選ばれる。1つでもあれば
+    候補を `comparable=False`（理由 `candidate_truncated`）にし、共通の長さからも外す
+    （fail closed）。
     """
 
     @model_validator(mode="after")
     def _uncomparable_candidates_never_win(self) -> Self:
-        if self.truncated_episodes and self.improved:
-            raise ValueError("Baseline より早く打ち切られた候補を改善扱いにしない")
+        truncated_rejection = (
+            self.rejection is not None and self.rejection.code == TRUNCATED_REJECTION_CODE
+        )
+        if bool(self.truncated_episodes) != truncated_rejection:
+            # 打ち切りの事実と却下理由を食い違わせない。比べた候補に打ち切りを残さない。
+            raise ValueError("打ち切られた episode と candidate_truncated の却下は対で持つ")
         if self.comparable:
             if self.rejection is not None:
                 raise ValueError("比べられた候補に却下理由を付けない")
@@ -327,29 +337,97 @@ _OWN_FAILURE_TERMINATIONS = frozenset(
 )
 """候補自身の違反で終わった理由。これで短くなった episode は、その違反が台帳に載る。"""
 
+TRUNCATED_REJECTION_CODE = "candidate_truncated"
+"""Baseline より先に、自分の違反以外の理由で打ち切られた候補の却下理由。"""
+
+
+def safety_observed_steps(episode: EpisodeResult) -> int:
+    """安全側の事実を**観測した** step の数。
+
+    採点できた step（成果と安全の両方を観測した）と、採点はできないが安全側の違反を
+    記録した step（`safety_floor_shortfall` の終端など）を数える。`dynamics_unusable` や
+    `controller_unusable` で積まれた終端記録は、その step の安全を観測していないので数えない。
+    環境は採点できない終端も記録に積むので、記録の数（`steps`）とは一致しない。
+    """
+    return sum(1 for step in episode.steps if step.supported or step.safety.violated)
+
 
 def truncated_episodes(arm: PolicyArm, baseline: PolicyArm) -> tuple[str, ...]:
-    """`arm` が Baseline より**観測した step が少なく、自分の違反以外の理由で**終わった episode。
+    """`arm` が Baseline より**安全を観測した step が少ないまま、自分の違反以外の理由で**
+    終わった episode。
 
-    判定は**終わり方**で行う。候補の終端理由が自分の違反・範囲外 action でなく、かつ
-    **採点できた（= 成果と安全を観測した）step 数**が Baseline より少なければ打ち切りとみなす。
+    判定は**終わり方と観測した量**で行う。
 
-    記録の数（`steps`）では比べない。環境は採点できない終端 step も記録に積むので、
-    Baseline が最後の step で違反し、候補が同じ位置で `dynamics_unusable` の記録を積むと、
-    記録の数は同じでも候補はその step の安全を観測していない。途中に採点できない step を
-    挟んだ候補も同じで、観測していない区間の違反は台帳に載らない。
-
-    自分の違反・範囲外 action で終わった候補は、その違反が台帳に載っているので除く。
-    Baseline も同じだけしか観測できなかった場合（採点できた step 数が等しい）も除く。
+    - 候補が自分の違反・範囲外 action で終わった episode は除く（その違反が台帳に載る）
+    - それ以外の理由（`dynamics_unusable` / `controller_unusable` / `unsupported_action` /
+      trace の枯渇など）で終わった episode は、`safety_observed_steps()` が Baseline より
+      少なければ打ち切りとみなす。Baseline が同じ位置で違反を記録し、候補が同じ位置で
+      観測できずに終わった場合も、Baseline のほうが1つ多く観測しているので打ち切りになる
+    - Baseline も同じだけしか観測できなかった場合（数が等しい）は除く。候補が Baseline の
+      違反した位置を越えて観測していれば、その違反を避けたことは観測済みなので除く
     """
     return tuple(
         sorted(
             episode.episode_id
             for episode in arm.episodes
             if episode.termination not in _OWN_FAILURE_TERMINATIONS
-            and len(episode.supported_steps)
-            < len(baseline.episode(episode.episode_id).supported_steps)
+            and safety_observed_steps(episode)
+            < safety_observed_steps(baseline.episode(episode.episode_id))
         )
+    )
+
+
+def candidate_rejection(arm: PolicyArm, baseline: PolicyArm) -> Reason | None:
+    """候補を Baseline と**比べてよいか**を1度だけ決める。比べてよければ `None`。
+
+    採点（共通の長さ・reward・改善）より**前に**決める。後で落とすと、落とす候補が
+    共通の長さを縮め、健全な候補まで短い区間で採点されてしまう。
+    """
+    try:
+        comparison = SupervisorTrainingEnvironment.compare([baseline, arm])
+    except (EnvironmentUsageError, ValueError) as error:
+        # **比べられない候補は勝たせない。** 母集団や条件が揃わない結果を、
+        # 「差が出た」として採らない（決定記録 0058 §2.6）。
+        return Reason(
+            code="candidate_not_comparable",
+            detail=f"{type(error).__name__}: {error}"[:500],
+        )
+    if not comparison.learned_controller_available:
+        # **policy を比べていない。** Learned MPC を束縛できていない episode 群では
+        # action が demand に効かず、全 arm の requested が同一になる（0058 §2.1 / §3）。
+        return Reason(
+            code="learned_controller_unavailable",
+            detail=(
+                "Learned MPC を束縛できていないので action が demand に効かない。"
+                "候補間の差を測っていない（決定記録 0058 §3）"
+            ),
+        )
+    truncated = truncated_episodes(arm, baseline)
+    if truncated:
+        # **壊れたせいで安全に見える候補を比べない。** 先に終わった候補は、Baseline が
+        # その後で踏んだ違反を観測していない（fail closed）。
+        return Reason(
+            code=TRUNCATED_REJECTION_CODE,
+            detail=(
+                "Baseline より安全を観測した step が少ないまま、自分の違反以外の理由で"
+                f"終わった episode がある（{', '.join(truncated)}）"
+            )[:500],
+        )
+    return None
+
+
+def scoring_horizon(
+    baseline: PolicyArm,
+    arms: Mapping[str, PolicyArm],
+    rejections: Mapping[str, Reason],
+) -> dict[str, int]:
+    """Baseline と**比べてよい候補だけ**から共通の長さを決める。
+
+    却下した候補（打ち切りを含む）を入れると、その候補の短さが健全な候補すべての
+    採点区間を縮める。
+    """
+    return common_matched_steps(
+        (baseline, *(arms[key] for key in sorted(arms) if key not in rejections))
     )
 
 
@@ -549,19 +627,16 @@ class SupervisorPolicyTrainer:
         arms: dict[str, PolicyArm] = {}
         rejections: dict[str, Reason] = {}
         for identifier in order:
-            arm, rejection = self._run_candidate(
-                identifier, tables[identifier], specs, baseline_arm
-            )
+            arm = self._run_candidate(identifier, tables[identifier], specs)
             arms[identifier] = arm
+            rejection = candidate_rejection(arm, baseline_arm)
             if rejection is not None:
                 rejections[identifier] = rejection
 
         # 2巡目: **すべての arm に共通の長さ**を決めてから採点する。候補ごとに別々の長さで
         # 割り引いた reward を並べると、早く終わった候補ほど負の reward を積む回数が少なく、
         # 「早く壊れたほうが良い」になる（決定記録 0058 §2.6）。
-        horizon = common_matched_steps(
-            (baseline_arm, *(arms[key] for key in sorted(arms) if key not in rejections))
-        )
+        horizon = scoring_horizon(baseline_arm, arms, rejections)
         outcomes = self._score(
             arms=arms,
             rejections=rejections,
@@ -637,34 +712,13 @@ class SupervisorPolicyTrainer:
         identifier: str,
         table: RegimeTablePayload,
         specs: Sequence[EpisodeSpec],
-        baseline_arm: PolicyArm,
-    ) -> tuple[PolicyArm, Reason | None]:
-        """候補を回し、Baseline と**並べられるか**を返す。採点はここでしない。
+    ) -> PolicyArm:
+        """候補を回す。比べてよいかは `candidate_rejection()`、採点は `_score()` が決める。
 
         採点を分けるのは、共通の長さが**すべての候補を回し終えるまで決まらない**ためである。
         """
         version = f"{self._config.artifact.model_id}-{identifier}"
-        arm = self._environment.run_policy(_TablePolicy(table, version), specs)
-        try:
-            comparison = SupervisorTrainingEnvironment.compare([baseline_arm, arm])
-        except (EnvironmentUsageError, ValueError) as error:
-            # **比べられない候補は勝たせない。** 母集団や条件が揃わない結果を、
-            # 「差が出た」として採らない（決定記録 0058 §2.6）。
-            return arm, Reason(
-                code="candidate_not_comparable",
-                detail=f"{type(error).__name__}: {error}"[:500],
-            )
-        if not comparison.learned_controller_available:
-            # **policy を比べていない。** Learned MPC を束縛できていない episode 群では
-            # action が demand に効かず、全 arm の requested が同一になる（0058 §2.1 / §3）。
-            return arm, Reason(
-                code="learned_controller_unavailable",
-                detail=(
-                    "Learned MPC を束縛できていないので action が demand に効かない。"
-                    "候補間の差を測っていない（決定記録 0058 §3）"
-                ),
-            )
-        return arm, None
+        return self._environment.run_policy(_TablePolicy(table, version), specs)
 
     def _score(
         self,
@@ -689,6 +743,11 @@ class SupervisorPolicyTrainer:
                     safety_violations=arm.safety_violations,
                     invalid_actions=arm.invalid_actions,
                     improved=False,
+                    truncated_episodes=(
+                        truncated_episodes(arm, baseline_arm)
+                        if rejection.code == TRUNCATED_REJECTION_CODE
+                        else ()
+                    ),
                 )
                 continue
             mean = mean_reward_over(arm, horizon)
@@ -699,11 +758,6 @@ class SupervisorPolicyTrainer:
                 _rank_value(baseline_mean),
             )
             improved = key < baseline_key
-            truncated = truncated_episodes(arm, baseline_arm)
-            if truncated:
-                # **壊れたせいで安全に見える候補を勝たせない。** 先に終わった候補は、
-                # Baseline がその後で踏んだ違反を観測していない（fail closed）。
-                improved = False
             if improved and key[:2] == baseline_key[:2]:
                 # 安全側が同点のときだけ reward の差を見る。差は設定した下限を満たすこと。
                 improved = (
@@ -721,7 +775,6 @@ class SupervisorPolicyTrainer:
                 mean_reward_over_common_horizon=mean,
                 baseline_mean_reward_over_common_horizon=baseline_mean,
                 improved=improved,
-                truncated_episodes=truncated,
             )
         return outcomes
 

@@ -50,8 +50,10 @@ from coldaisle.control.rl.training import (
     BASELINE_CANDIDATE_ID,
     SupervisorPolicyTrainer,
     SupervisorPolicyTrainingError,
+    candidate_rejection,
     common_matched_steps,
     mean_reward_over,
+    scoring_horizon,
     truncated_episodes,
 )
 from coldaisle.control.schema import (
@@ -1158,58 +1160,86 @@ def test_invariant_19_candidates_are_ranked_on_one_common_horizon(trained: Any) 
     assert mean_reward_over(short_arm, horizon) == mean_reward_over(long_arm, horizon)
 
 
-def test_invariant_19_b_a_candidate_cut_short_cannot_look_safer(trained: Any) -> None:
-    """**壊れたせいで安全に見える候補を改善扱いにしない**（fail closed）。
+def _unobserved(step: Any, code: str, *, floor_shortfalls: int = 0) -> Any:
+    """採点できない終端記録（環境の `_unsupported_record` と同じ形）を作る。"""
+    return step.model_copy(
+        update={
+            "supported": False,
+            "unsupported_reason": Reason(code=code, detail="試験"),
+            "applied": None,
+            "observed": {},
+            "provenance": None,
+            "reward": None,
+            "safety": step.safety.model_copy(
+                update={
+                    "ceiling_exceedances": 0,
+                    "floor_shortfalls": floor_shortfalls,
+                    "margin_c": None,
+                }
+            ),
+        }
+    )
 
-    Baseline が coverage を満たした後で安全違反を踏み、候補が同じ所より前に
-    採点できない理由（dynamics_unusable など）で終わると、候補は違反を観測しないまま
-    `safety_violations=0` になる。全体の台帳で比べると候補が「改善」に見える。
+
+def _arm_of(base: Any, episode: Any, version: str) -> Any:
+    """1 episode の arm を作る。episode も arm と同じ policy の版を名乗る。"""
+    return base.model_copy(
+        update={
+            "episodes": (episode.model_copy(update={"policy_version": version}),),
+            "policy_version": version,
+        }
+    )
+
+
+def test_invariant_19_b_a_candidate_cut_short_cannot_look_safer(trained: Any) -> None:
+    """**壊れたせいで安全に見える候補を比べない**（fail closed）。
+
+    安全側の台帳は episode 全体を数えるので、候補が自分の違反以外の理由で先に終わると、
+    Baseline がその後で踏んだ違反を観測しないまま `safety_violations=0` になる。
+    判定は記録の数ではなく、終わり方と**安全を観測した step の数**で行う。
     """
     environment, _config, settings, _safety = build_environment(trained, with_mpc=False)
     trainer = trainer_for(environment, settings)
     specs = (episode_spec(episode_id="pr89-a", seed=3),)
     report = trainer.train(specs, model_version="0.1.0", created_at=CREATED_AT)
     base = report.comparison.arms[0]
-    full = base.episode("pr89-a")
-    assert len(full.steps) >= 2
+    # Learned MPC を束縛できた run として扱う（比べられる条件を作るため。台帳は直に作る）。
+    full = base.episode("pr89-a").model_copy(update={"learned_controller_available": True})
+    assert len(full.steps) >= 3 and all(step.supported for step in full.steps)
+    last = full.steps[-1]
 
-    # Baseline は最後の step で安全違反を踏んだ（台帳は型の検査を通さず直に作る）。
-    violated = full.model_copy(
+    def arm(episode: Any, version: str) -> Any:
+        return _arm_of(base, episode, version)
+
+    # Baseline 1: 最後の採点できた step で温度上限を超えた。
+    ceiling = full.model_copy(
         update={
             "safety": full.safety.model_copy(update={"ceiling_exceedances": 1}),
             "termination": TerminationReason.SAFETY_VIOLATION,
         }
     )
-    baseline_arm = base.model_copy(update={"episodes": (violated,)})
-    # 候補は、その手前で dynamics が使えなくなって終わった。
-    cut = full.model_copy(
-        update={"steps": full.steps[:-1], "termination": TerminationReason.DYNAMICS_UNUSABLE}
-    )
-    cut_arm = base.model_copy(update={"episodes": (cut,), "policy_version": "cand-cut"})
-    # (a) **記録の数は同じ**で、候補の最後の記録だけが採点できない終端。環境は採点できない
-    # 終端 step も記録に積むので、記録の数で比べると打ち切りを見落とす。
-    last = full.steps[-1]
-    unsupported_last = last.model_copy(
+    # Baseline 2: 最後の step で floor を下回り、**採点できない終端記録**に違反が載った。
+    floor = full.model_copy(
         update={
-            "supported": False,
-            "unsupported_reason": Reason(code="dynamics_unusable", detail="試験"),
-            "applied": None,
-            "observed": {},
-            "provenance": None,
-            "reward": None,
+            "steps": (
+                *full.steps[:-1],
+                _unobserved(last, "safety_floor_shortfall", floor_shortfalls=1),
+            ),
+            "safety": full.safety.model_copy(update={"floor_shortfalls": 1}),
+            "termination": TerminationReason.SAFETY_VIOLATION,
         }
     )
-    same_count = full.model_copy(
+    # 候補: 同じ位置で dynamics が使えなくなった。
+    # 記録の数も採点できた step 数も Baseline 2 と同じ。
+    same_point = full.model_copy(
         update={
-            "steps": (*full.steps[:-1], unsupported_last),
+            "steps": (*full.steps[:-1], _unobserved(last, "dynamics_unusable")),
             "termination": TerminationReason.DYNAMICS_UNUSABLE,
         }
     )
-    same_count_arm = base.model_copy(
-        update={"episodes": (same_count,), "policy_version": "cand-same-count"}
-    )
-    assert len(same_count.steps) == len(violated.steps)
-    # (b) 候補が**自分の違反**で先に終わった場合は、その違反が台帳に載るので打ち切りではない。
+    assert len(same_point.steps) == len(floor.steps)
+    assert len(same_point.supported_steps) == len(floor.supported_steps)
+    # 候補: 自分の違反で先に終わった（違反は台帳に載る）。
     own = full.model_copy(
         update={
             "steps": full.steps[:-1],
@@ -1217,27 +1247,71 @@ def test_invariant_19_b_a_candidate_cut_short_cannot_look_safer(trained: Any) ->
             "termination": TerminationReason.SAFETY_VIOLATION,
         }
     )
-    own_arm = base.model_copy(update={"episodes": (own,), "policy_version": "cand-own"})
-    # (c) 対照: 同じ長さを走り切って違反しなかった候補は、正しく改善になる。
-    clean_arm = base.model_copy(update={"episodes": (full,), "policy_version": "cand-clean"})
 
-    assert truncated_episodes(cut_arm, baseline_arm) == ("pr89-a",)
-    assert truncated_episodes(same_count_arm, baseline_arm) == ("pr89-a",)
-    assert truncated_episodes(own_arm, baseline_arm) == ()
-    assert truncated_episodes(clean_arm, baseline_arm) == ()
+    for baseline_episode in (ceiling, floor):
+        baseline_arm = arm(baseline_episode, base.policy_version)
+        cut = arm(same_point, "cand-same-point")
+        own_arm = arm(own, "cand-own")
+        clean = arm(full, "cand-clean")
+        assert truncated_episodes(cut, baseline_arm) == ("pr89-a",)
+        assert truncated_episodes(own_arm, baseline_arm) == ()
+        assert truncated_episodes(clean, baseline_arm) == ()
 
-    arms = {"cut": cut_arm, "same-count": same_count_arm, "own": own_arm, "clean": clean_arm}
-    horizon = common_matched_steps((baseline_arm, *arms.values()))
-    outcomes = trainer._score(arms=arms, rejections={}, baseline_arm=baseline_arm, horizon=horizon)
-    for identifier in ("cut", "same-count"):
-        assert outcomes[identifier].safety_violations < baseline_arm.safety_violations
-        assert outcomes[identifier].truncated_episodes == ("pr89-a",)
-        assert outcomes[identifier].improved is False
-    assert outcomes["own"].truncated_episodes == ()
-    assert outcomes["own"].safety_violations == baseline_arm.safety_violations
-    assert outcomes["clean"].truncated_episodes == ()
-    assert outcomes["clean"].improved is True
-    assert trainer._select(outcomes) == "clean"
+        arms = {"cut": cut, "own": own_arm, "clean": clean}
+        rejections = {
+            key: reason
+            for key, value in arms.items()
+            if (reason := candidate_rejection(value, baseline_arm)) is not None
+        }
+        assert set(rejections) == {"cut"}
+        assert rejections["cut"].code == "candidate_truncated"
+        horizon = scoring_horizon(baseline_arm, arms, rejections)
+        outcomes = trainer._score(
+            arms=arms, rejections=rejections, baseline_arm=baseline_arm, horizon=horizon
+        )
+        assert outcomes["cut"].comparable is False
+        assert outcomes["cut"].truncated_episodes == ("pr89-a",)
+        assert outcomes["cut"].improved is False
+        assert outcomes["cut"].mean_reward_over_common_horizon is None
+        assert outcomes["own"].truncated_episodes == ()
+        assert outcomes["clean"].improved is True
+        assert trainer._select(outcomes) == "clean"
+
+
+def test_invariant_19_c_a_truncated_candidate_never_shortens_the_common_horizon(
+    trained: Any,
+) -> None:
+    """**打ち切った候補は共通の長さを縮めない。** 比べてよいかは採点の前に1度だけ決める。
+
+    後で落とす形だと、coverage を満たしたまま早く終わった候補が最小を取り、
+    健全な候補すべてがその短い区間で採点される。
+    """
+    environment, _config, settings, _safety = build_environment(trained, with_mpc=False)
+    trainer = trainer_for(environment, settings)
+    specs = (episode_spec(episode_id="pr89-a", seed=3),)
+    report = trainer.train(specs, model_version="0.1.0", created_at=CREATED_AT)
+    base = report.comparison.arms[0]
+    full = base.episode("pr89-a").model_copy(update={"learned_controller_available": True})
+    assert len(full.steps) >= 3
+
+    early = full.model_copy(
+        update={
+            "steps": (*full.steps[:1], _unobserved(full.steps[1], "dynamics_unusable")),
+            "termination": TerminationReason.DYNAMICS_UNUSABLE,
+        }
+    )
+    baseline_arm = _arm_of(base, full, base.policy_version)
+    arms = {"early": _arm_of(base, early, "cand-early"), "clean": _arm_of(base, full, "cand-clean")}
+    rejections = {
+        key: reason
+        for key, value in arms.items()
+        if (reason := candidate_rejection(value, baseline_arm)) is not None
+    }
+    assert set(rejections) == {"early"}
+    horizon = scoring_horizon(baseline_arm, arms, rejections)
+    # 打ち切った候補を入れていれば 1 になっていた。
+    assert common_matched_steps((baseline_arm, *arms.values()))["pr89-a"] == 1
+    assert horizon == {"pr89-a": len(full.supported_steps)}
 
 
 def test_invariant_20_binding_compares_every_artifact_determined_metadata_field(

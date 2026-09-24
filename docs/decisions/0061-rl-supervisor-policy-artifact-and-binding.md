@@ -285,15 +285,23 @@ Baseline の欄が `output_bounds` の外にあれば**丸めず拒む**。
   候補をすべて回してから、episode ごとに**全 arm の採点できた step 数の最小**を取り、
   その長さで採点する。使った長さは `common_matched_steps` として報告に残す
   （hash では読めないため。0056 §2.3 と同じ理由）
-- **Baseline より早く打ち切られた候補は改善扱いにしない**（fail closed）。reward は共通の長さへ
+- **Baseline より早く打ち切られた候補は比べない**（fail closed）。reward は共通の長さへ
   揃えるが、安全側の台帳（違反・範囲外 action）は episode 全体を数える。候補が自分の違反以外の
-  理由（`dynamics_unusable` など）で Baseline より少ない step で終わると、Baseline がその後で
-  踏んだ違反を観測しないまま「違反が少ない」ことになる。該当する episode は
-  `CandidateOutcome.truncated_episodes` に残し、1つでもあれば `improved=False` とする。
-  自分の違反・範囲外 action で短くなった場合は、その違反が台帳に載るので対象外
-  - 比べるのは**記録の数ではなく採点できた step の数**（成果と安全を観測した step）である。
-    環境は採点できない終端 step も記録に積むので、記録の数で比べると、Baseline が最後の
-    step で違反し候補が同じ位置で採点できない終端を積んだ場合に、打ち切りを見落とす
+  理由（`dynamics_unusable` など）で先に終わると、Baseline がその後で踏んだ違反を観測しないまま
+  「違反が少ない」ことになる
+  - 判定は**終わり方と、安全を観測した step の数**で行う。数えるのは、採点できた step と、
+    採点はできないが安全側の違反を記録した step（`safety_floor_shortfall` の終端など）である。
+    環境は採点できない終端も記録に積むので、**記録の数でも採点できた step の数でもない**。
+    どちらで比べても、Baseline が最後の step で違反を記録し、候補が同じ位置で観測できずに
+    終わった場合を見落とす
+  - 候補の終端理由が自分の違反・範囲外 action でなく、かつ安全を観測した step 数が Baseline より
+    少ない episode が1つでもあれば、候補を `comparable=False`（理由 `candidate_truncated`）にし、
+    該当 episode を `CandidateOutcome.truncated_episodes` に残す。自分の違反で終わった場合は
+    その違反が台帳に載るので対象外。Baseline と同じだけ観測した場合、Baseline の違反した位置を
+    越えて観測した場合も対象外
+  - **比べてよいかは採点の前に1度だけ決める**（`candidate_rejection()`）。共通の長さは
+    比べてよい候補と Baseline だけから取る（`scoring_horizon()`）。後で落とす形だと、
+    落とす候補の短さが健全な候補すべての採点区間を縮める
 - **どの候補も Baseline を上回らなければ、Baseline の表が選ばれる。** 上回っていないのに
   別の表を出さないためで、その artifact は「Rule の戦略を RL artifact として表したもの」になる。
   shadow の配線を確かめるには十分で、戦略は何も変わらない
