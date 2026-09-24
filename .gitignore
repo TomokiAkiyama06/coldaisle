@@ -36,6 +36,9 @@ config/secrets.*
 *.sqlite3-shm
 data/
 var/
+# 騒音測定の生の音声（室内の会話を含みうる。決定記録 0067 §2.3）
+*.wav
+*.flac
 
 # ログ・CSVエクスポート（FR-205 の出力先。~/server_sensor_logs 相当）
 logs/
