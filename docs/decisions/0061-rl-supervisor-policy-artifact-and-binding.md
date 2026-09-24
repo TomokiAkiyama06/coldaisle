@@ -289,22 +289,28 @@ Baseline の欄が `output_bounds` の外にあれば**丸めず拒む**。
   reward は共通の長さへ揃えるが、安全側の台帳（違反・範囲外 action）は episode 全体を数える。
   候補が先に終わると、Baseline がその後で観測した安全側の結果を観測しないまま「違反が少ない」
   「同点」に見え、また候補の短さが共通の長さを縮めて健全な候補どうしの並びを変えてしまう
-  - **長さの定義は1つ**: episode の「観測した長さ」（`safety_observed_steps()`）は、安全側の
-    結果を観測した step の数である。採点できた step と、採点はできないが安全側の違反を記録した
-    step（`safety_floor_shortfall` の終端など）を数え、`dynamics_unusable` /
-    `controller_unusable` などの終端記録は数えない。環境は採点できない終端も記録に積むので、
-    **記録の数でも採点できた step の数でもない**。判定ごとに別の長さを使うと、片方で等しく
-    片方で短い組み合わせ（例: 候補は採点できた step で違反して終わり、Baseline は同じ数の
-    採点できた step の後に採点できない終端で floor 不足を記録した）が判定をすり抜ける
-  - **短い**: 観測した長さが Baseline より短い episode を持つ候補。終わった理由を問わない。
-    `CandidateOutcome.short_episodes` に該当 episode を残し、共通の長さに入れず、
-    `mean_reward_over_common_horizon` を書かず（`None`）、**改善扱いにしない**。
-    自分の長さで採点した reward を並べると長さの違う総和を並べることになる（0058 §2.6）ので、
-    この単純な形を採る
-  - **打ち切り**: 短い episode のうち、自分の違反・範囲外 action **以外**の理由で終わったもの。
-    違反を観測しなかったことが「違反が少ない」に見えるので、候補ごと `comparable=False`
-    （理由 `candidate_truncated`）にし、`CandidateOutcome.truncated_episodes` に残す。
-    自分の違反で終わった短い候補は、違反が台帳に載るので比較には残す（改善にはならない）
+  - **長さは2つあり、目的ごとに意図して使い分ける。** 環境は採点できない終端も記録に積むので、
+    どちらも記録の数（`steps`）ではない
+    - **観測した長さ**（`safety_observed_steps()`）: 安全側の結果を観測した step の数。
+      採点できた step と、採点はできないが安全側の違反を記録した step
+      （`safety_floor_shortfall` の終端など）を数え、`dynamics_unusable` /
+      `controller_unusable` などの終端記録は数えない。**安全側の台帳を Baseline と同じ区間で
+      比べられるか**を決める
+    - **採点できた step の数**（`supported_steps`）: reward を持つ step の数。**reward を
+      Baseline と同じ区間で比べられるか**を決める。最後の step で `safety_floor_shortfall` を
+      記録して終わった候補は、観測した長さが Baseline と等しくても reward を持つ step が1つ少ない
+  - **短い**（`short_episodes()`）: 観測した長さ**または**採点できた step の数が Baseline より
+    短い episode。終わった理由を問わない。`CandidateOutcome.short_episodes` に該当 episode を
+    残し、共通の長さに入れず、`mean_reward_over_common_horizon` を書かず（`None`）、
+    **改善扱いにしない**。どちらかが短ければ、違反の数か reward のどちらかを Baseline と同じ
+    区間で比べられない。自分の長さで採点した reward を並べると長さの違う総和を並べることになる
+    （0058 §2.6）ので、この単純な形を採る
+  - **打ち切り**（`truncated_episodes()`）: 観測した長さが Baseline より短く、かつ自分の違反・
+    範囲外 action **以外**の理由で終わった episode。違反を観測しなかったことが「違反が少ない」に
+    見えるので、候補ごと `comparable=False`（理由 `candidate_truncated`）にし、
+    `CandidateOutcome.truncated_episodes` に残す。判定は観測した長さだけで行う。reward を持つ
+    step が少ないだけの候補は、安全側の台帳は同じ区間を見ているので却下せず、短い扱いにとどめる。
+    自分の違反で終わった短い候補も、違反が台帳に載るので比較には残す（改善にはならない）
   - **比べてよいかは採点の前に1度だけ決める**（`candidate_rejection()`）。共通の長さ
     （`scoring_horizon()`）は、Baseline と、比べてよく、かつ短くない候補だけから取る
 - **どの候補も Baseline を上回らなければ、Baseline の表が選ばれる。** 上回っていないのに

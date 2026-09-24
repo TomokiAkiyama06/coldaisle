@@ -1449,6 +1449,75 @@ def test_invariant_19_e_short_is_judged_by_observed_length_not_supported_steps(
     assert trainer._select(outcomes) == BASELINE_CANDIDATE_ID
 
 
+def test_invariant_19_f_a_reward_short_failure_never_shortens_the_common_horizon(
+    trained: Any,
+) -> None:
+    """**観測した長さが等しくても、reward を持つ step が少ない候補は共通の長さに入れない。**
+
+    候補は Baseline の最後の step まで来て、そこで floor を下回って終わった（採点できない終端）。
+    違反は観測しているので観測した長さは Baseline と等しいが、reward を持つ step は1つ少ない。
+    共通の長さに入れると、健全な候補どうしが最後の step の差を無視して並べられる。
+    """
+    environment, _config, settings, _safety = build_environment(trained, with_mpc=False)
+    trainer = trainer_for(environment, settings)
+    specs = (episode_spec(episode_id="pr89-a", seed=3),)
+    report = trainer.train(specs, model_version="0.1.0", created_at=CREATED_AT)
+    base = report.comparison.arms[0]
+    full = base.episode("pr89-a").model_copy(update={"learned_controller_available": True})
+    assert len(full.steps) >= 3 and all(step.supported for step in full.steps)
+    last = full.steps[-1]
+    assert last.reward is not None
+
+    floor_at_end = full.model_copy(
+        update={
+            "steps": (
+                *full.steps[:-1],
+                _unobserved(last, "safety_floor_shortfall", floor_shortfalls=1),
+            ),
+            "safety": full.safety.model_copy(update={"floor_shortfalls": 1}),
+            "termination": TerminationReason.SAFETY_VIOLATION,
+        }
+    )
+    better_last = last.model_copy(
+        update={"reward": last.reward.model_copy(update={"reward": last.reward.reward + 1.0})}
+    )
+    better = full.model_copy(update={"steps": (*full.steps[:-1], better_last)})
+
+    baseline_arm = _arm_of(base, full, base.policy_version)
+    arms = {
+        "a-floor-at-end": _arm_of(base, floor_at_end, "cand-a"),
+        "b-same": _arm_of(base, full, "cand-b"),
+        "c-better": _arm_of(base, better, "cand-c"),
+    }
+    assert safety_observed_steps(floor_at_end) == safety_observed_steps(full)
+    assert len(floor_at_end.supported_steps) == len(full.supported_steps) - 1
+
+    assert short_episodes(arms["a-floor-at-end"], baseline_arm) == ("pr89-a",)
+    assert truncated_episodes(arms["a-floor-at-end"], baseline_arm) == ()
+    rejections = {
+        key: reason
+        for key, value in arms.items()
+        if (reason := candidate_rejection(value, baseline_arm)) is not None
+    }
+    assert rejections == {}
+
+    horizon = scoring_horizon(baseline_arm, arms, rejections)
+    assert horizon == {"pr89-a": len(full.supported_steps)}
+
+    outcomes = trainer._score(
+        arms=arms, rejections=rejections, baseline_arm=baseline_arm, horizon=horizon
+    )
+    failed = outcomes["a-floor-at-end"]
+    assert failed.comparable is True
+    assert failed.short_episodes == ("pr89-a",)
+    assert failed.truncated_episodes == ()
+    assert failed.mean_reward_over_common_horizon is None
+    assert failed.improved is False
+    assert outcomes["b-same"].improved is False
+    assert outcomes["c-better"].improved is True
+    assert trainer._select(outcomes) == "c-better"
+
+
 def test_invariant_20_binding_compares_every_artifact_determined_metadata_field(
     tmp_path: Path, bounds: SupervisorOutputBounds
 ) -> None:

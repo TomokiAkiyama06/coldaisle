@@ -211,7 +211,8 @@ class CandidateOutcome(_Frozen):
     """
 
     short_episodes: tuple[str, ...] = ()
-    """観測した長さ（`safety_observed_steps()`）が Baseline より短い episode（`short_episodes()`）。
+    """Baseline と同じ区間を比べられない episode（`short_episodes()`）。観測した長さか、
+    採点できた step の数のどちらかが Baseline より短い。
 
     打ち切り（`truncated_episodes`）と違い、自分の違反・範囲外 action で先に終わった場合も
     含む。違反は台帳に載るので比較には残す（`comparable=True`）が、**共通の長さには
@@ -358,51 +359,59 @@ TRUNCATED_REJECTION_CODE = "candidate_truncated"
 def safety_observed_steps(episode: EpisodeResult) -> int:
     """episode の**観測した長さ**: 安全側の結果を観測した step の数。
 
-    **候補の長さを比べる定義はこれ1つだけ**である（打ち切り・先に終わった判定・共通の長さに
-    入れるかの判定のすべてがこれを使う）。定義が2つあると、片方で等しく片方で短い組み合わせが
-    判定をすり抜ける。
-
-    数えるのは、採点できた step（成果と安全の両方を観測した）と、採点はできないが安全側の
-    違反を記録した step（`safety_floor_shortfall` の終端など）である。`dynamics_unusable` や
+    採点できた step（成果と安全の両方を観測した）と、採点はできないが安全側の違反を
+    記録した step（`safety_floor_shortfall` の終端など）を数える。`dynamics_unusable` や
     `controller_unusable` で積まれた終端記録は、その step の安全を観測していないので数えない。
-    環境は採点できない終端も記録に積むので、記録の数（`steps`）とも、採点できた step の数
-    （`supported_steps`）とも一致しない。
+    環境は採点できない終端も記録に積むので、記録の数（`steps`）とは一致しない。
+
+    **安全側の台帳を Baseline と同じ区間で比べられるか**を決める長さである（打ち切りの判定）。
+    reward を同じ区間で比べられるかは、採点できた step の数（`supported_steps`）で決める。
+    2つは測っているものが違うので、目的ごとに意図して使い分ける（決定記録 0061 §2.7）。
     """
     return sum(1 for step in episode.steps if step.supported or step.safety.violated)
 
 
 def short_episodes(arm: PolicyArm, baseline: PolicyArm) -> tuple[str, ...]:
-    """`arm` の観測した長さ（`safety_observed_steps()`）が Baseline より短い episode。
+    """`arm` が Baseline と**同じ区間を比べられない** episode。終わった理由を問わない。
 
-    **終わった理由を問わない。** 短い arm は、Baseline が後で観測した安全側の結果を
-    観測していないので、違反の数でも reward でも Baseline と同じ区間を比べられない。
-    共通の長さに入れず、改善扱いにしない（`_score`）。
+    次のどちらかを満たせば短い。
+
+    - 観測した長さ（`safety_observed_steps()`）が Baseline より短い。Baseline が後で観測した
+      安全側の結果を観測していないので、違反の数を同じ区間で比べられない
+    - 採点できた step の数（`supported_steps`）が Baseline より少ない。最後の step で
+      `safety_floor_shortfall` を記録して終わった候補は観測した長さが Baseline と等しくても、
+      reward を持つ step が1つ少ない。共通の長さに入れると、健全な候補すべての採点区間を縮める
+
+    短い arm は共通の長さに入れず、reward を書かず、改善扱いにしない（`_score`）。
     """
-    return tuple(
-        sorted(
-            episode.episode_id
-            for episode in arm.episodes
-            if safety_observed_steps(episode)
-            < safety_observed_steps(baseline.episode(episode.episode_id))
-        )
-    )
+    short: list[str] = []
+    for episode in arm.episodes:
+        reference = baseline.episode(episode.episode_id)
+        if safety_observed_steps(episode) < safety_observed_steps(reference) or len(
+            episode.supported_steps
+        ) < len(reference.supported_steps):
+            short.append(episode.episode_id)
+    return tuple(sorted(short))
 
 
 def truncated_episodes(arm: PolicyArm, baseline: PolicyArm) -> tuple[str, ...]:
-    """短い episode（`short_episodes()`）のうち、**自分の違反・範囲外 action 以外の理由で**
-    終わったもの。
+    """観測した長さが Baseline より短く、**自分の違反・範囲外 action 以外の理由で**終わった
+    episode。
 
-    自分の違反で終わった episode は、その違反が台帳に載るので比較には残す（短いので改善には
-    ならない）。それ以外の理由（`dynamics_unusable` / `controller_unusable` /
-    `unsupported_action` / trace の枯渇など）で短い episode は、違反を観測しなかったことが
-    「違反が少ない」に見えるので、候補ごと比較から外す（`candidate_rejection()`）。
+    判定は観測した長さ（`safety_observed_steps()`）だけで行う。reward を持つ step が少ない
+    だけの候補は、安全側の台帳は Baseline と同じ区間を見ているので却下しない（短い扱いで
+    共通の長さから外す）。自分の違反で終わった episode は、その違反が台帳に載るので比較には
+    残す。それ以外の理由（`dynamics_unusable` / `controller_unusable` /
+    `unsupported_action` / trace の枯渇など）で観測が足りない episode は、違反を観測しなかった
+    ことが「違反が少ない」に見えるので、候補ごと比較から外す（`candidate_rejection()`）。
     """
-    short = set(short_episodes(arm, baseline))
     return tuple(
         sorted(
             episode.episode_id
             for episode in arm.episodes
-            if episode.episode_id in short and episode.termination not in _OWN_FAILURE_TERMINATIONS
+            if episode.termination not in _OWN_FAILURE_TERMINATIONS
+            and safety_observed_steps(episode)
+            < safety_observed_steps(baseline.episode(episode.episode_id))
         )
     )
 
