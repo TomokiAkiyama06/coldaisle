@@ -206,7 +206,17 @@ class SupervisorShadowSummary(_Frozen):
         return canonical_sha256(self)
 
     def evaluation_ref(self) -> str:
-        """#104 の `shadow_evaluation_ref` へ渡す、path を含まない参照。"""
+        """#104 の `shadow_evaluation_ref` へ渡す、path を含まない参照。
+
+        **`usable` でない集計には参照を出さない**（fail closed）。#104 の `promote()` は参照が
+        空でないことしか見ないので、下限に満たない集計の参照を渡せば、足りない shadow の
+        証拠が昇格の根拠として記録されてしまう。
+        """
+        if not self.usable:
+            raise SupervisorShadowUsageError(
+                "下限を満たさない shadow 集計は昇格の証拠にしない"
+                "（shadow_evaluation_ref を出さない）"
+            )
         return f"supervisor-shadow:{self.digest()}"
 
 

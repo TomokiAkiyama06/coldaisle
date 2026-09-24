@@ -311,7 +311,8 @@ shadow:   { minimum_ticks, minimum_paired_fraction }
     kind を問わず metadata と payload をそのまま受け取る。そこから照合していない policy
     artifact を書く経路は残る。CLI 側で supervisor policy の登録に照合を要求するかは
     0062（FINAL）の契約を広げる話なので、**所有者の判断**とする（§5）
-- 集計の digest は #104 の `shadow_evaluation_ref` にそのまま渡せる
+- 集計の digest は #104 の `shadow_evaluation_ref` にそのまま渡せる。ただし **`usable` でない集計は
+  参照を出さない**（`evaluation_ref()` が拒む。#104 の `promote()` は参照が空でないことしか見ない）
 
 違う regime を前提にした提案どうしの比較は、**`SupervisorDecision` の段階で作れない**
 （同じ tick の active / shadow は同じ regime を使う。#88）。台帳側で読み替えもしない。

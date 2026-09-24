@@ -787,6 +787,24 @@ def test_invariant_13_the_ledger_binds_versions_and_reads_time_from_evidence() -
     assert empty.first_ts_ms is None and empty.paired_fraction is None and empty.usable is False
 
 
+def test_invariant_13_f_an_unusable_summary_issues_no_evaluation_ref() -> None:
+    """**下限を満たさない集計は昇格の証拠にならない。** `shadow_evaluation_ref` を出さない。"""
+    ledger = ledger_for()
+    ledger.observe(paired_decision(tick_id=1))
+    ledger.observe(missing_rl_decision(tick_id=2))
+    unusable = ledger.summary()
+    assert unusable.usable is False
+    with pytest.raises(SupervisorShadowUsageError, match="昇格の証拠にしない"):
+        unusable.evaluation_ref()
+
+    usable_ledger = ledger_for()
+    for tick in range(4):
+        usable_ledger.observe(paired_decision(tick_id=tick))
+    usable = usable_ledger.summary()
+    assert usable.usable is True
+    assert usable.evaluation_ref() == f"supervisor-shadow:{usable.digest()}"
+
+
 def test_invariant_13_b_rule_and_rl_may_share_a_version_string() -> None:
     """**Rule と RL が同じ版文字列を名乗っても台帳を作れる。**
 
