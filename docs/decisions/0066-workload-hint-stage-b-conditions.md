@@ -8,9 +8,9 @@
   本記録が**限定的に置き換える**（0064 側には `Superseded by` の追記だけを行う）
 - **関連**: [0064](0064-workload-hint-entry-and-supervisor-prior.md) §2.6 / §2.8 / §2.10 /
   [0041](0041-supervisor-proposal-freshness.md) / [0045](0045-local-socket-write-entry.md) /
-  [0052](0052-learned-mpc-optimizer-and-hard-constraints.md) /
+  [0052](0052-learned-mpc-optimizer-and-hard-constraints.md) / [0062](0062-model-registry-operations.md) /
   AGENTS.md ルール 2 / 3 / 4 / 9
-- **対象 Issue**: #107（PR #164 の Codex レビュー指摘 2 件への対応）
+- **対象 Issue**: #107（PR #164 の Codex レビュー指摘 2 件への対応。§2.1 (b)〜(d) は PR #166 の指摘 2 件も反映）
 
 ---
 
@@ -63,27 +63,52 @@ PR #164（0064）のレビューで、Stage B（ヒントを prior として使�
 
 (a) を満たしても、MPC は 3 系統を結合して最適化する（balance 項など）ので、
 weight・band の単調性が**選ばれる Demand の単調性**をそのまま意味するとは限らない。
-そこで、実際の Optimizer と Thermal Model（固定した fixture / 決定論の seed）に対し、
-**許容状態集合**の全点で次を確かめる試験を CI に置く。
+そこで、実際の Optimizer と、**Stage B で使う Thermal Model artifact**（決定論の seed）に対し、
+**許容状態集合**の全点で次を確かめる試験を CI とリリースゲートに置く。
 
 - 許容状態集合: (Regime) × (CPU/GPU 温度: band 下 / band 内 / 基準 `upper_c` 付近 / 超過) ×
-  (直前 Demand: 低 / 中 / 高) × (workload) の格子。格子の刻みと範囲は設定から生成し、
-  試験側に別の定数を持たない
+  (直前 Demand: 低 / 中 / 高) × (workload) × (hard constraints の代表集合) × (baseline の代表集合)
+  の格子。`LearnedMpcOptimizer.solve` の入力のうち、温度と直前 Demand 以外の window feature
+  （周囲温度・GPU 電力など）も、格子の各軸として範囲を設定から与える。
+  格子の刻みと範囲は設定から生成し、試験側に別の定数を持たない
 - 各点で、ヒント有りの context とヒント無しの context について `requested_demand` を求め、
   - **各系統で `demand_hint >= demand_base - eps`**（`eps` は設定の許容誤差）
   - **同じモデルでの予測温度（CPU / GPU）が `hint <= base + eps_c`**
   を両方満たすこと。1 点でも破れたら**試験失敗＝ Stage B へ進めない**
 - 系統ごとの Demand が下がるが温度は上がらない配分替えは、この記録では**通さない**。
   必要なら別の決定で条件を緩める（緩めるほうを人間が決める）
+- **格子は実行時の入力領域全体を覆わない**（window の履歴・制約の組み合わせは連続で多い）。
+  そのため (b) は「認証した領域の中で」の証拠にとどまり、領域外の単調性は主張しない。
+  領域外の扱いは (d) で決める
+
+**(d) 認証領域の外では Stage B を使わない（実行時。tick ごと）**
+
+- (b) が合格したときの格子の各軸の範囲（Regime・workload・温度・直前 Demand・window feature・
+  hard constraints・baseline）を**認証領域**として (c) の成果物に含める
+- Stage B が有効でも、その tick の入力が認証領域の**どれか 1 軸でも外**にあれば、その tick は
+  ヒントを prior に使わず**ヒント無しの context で解く**（＝ Stage A と同じ振る舞い）。
+  理由は構造化ログに閉じた語彙（`hint_prior_skipped: out_of_certified_domain`）で残す
+- 判定は範囲比較だけの決定論的な処理とし、Optimizer を二重に回さない（予算を食わない）
+- ヒントは `requested_demand` の手前にしか効かないため、領域内で試験の見逃しがあっても
+  Reactive Guard / Critical Safety の floor はそのまま効く（ルール 2 / 3）。
+  これは (b) の代わりではなく、見逃しに対する最後の層である
 
 **(c) 起動時の失敗の仕方（fail closed）**
 
 - (a) の違反: 該当 context を含む設定では**制御デーモンを起動しない**（0064 §2.8 と同じ）。
   ヒントの入口だけを止めて他を動かす、という半端な状態にしない
 - (b) は起動時に走らせない（重い・非決定性の温床になる）。代わりに、試験が通ったときの
-  `context_overrides` の**内容ハッシュ**を成果物として記録し、Stage B を有効にする設定は
-  起動時にそのハッシュと照合する。**一致しない、または記録が無い場合は Stage B を無効のまま
-  （＝ヒントは記録のみ）で起動する**。ヒント無しの通常運転は安全側なので、ここは起動拒否にしない
+  **試験の全入力と実装の識別子を束ねたハッシュ**を成果物として記録し、Stage B を有効にする設定は
+  起動時に同じ手順で計算したハッシュと照合する。ハッシュに束ねるのは少なくとも次のすべて。
+  どれか 1 つでも変われば一致せず、再検証（(b) の再実行）が要る
+  - `context_overrides` と、基準（ヒント無し）の context
+  - 格子の定義（各軸の刻み・範囲＝(d) の認証領域）と `eps` / `eps_c`
+  - Optimizer の設定（探索格子・予算など、`solve` の結果に効く設定）と目的関数の設定
+  - Optimizer / 目的関数の実装の識別子（パッケージ版と該当モジュールの内容ハッシュ）
+  - Thermal Model artifact の識別子（Registry の digest。0062）
+- **一致しない、または記録が無い場合は Stage B を無効のまま（＝ヒントは記録のみ）で起動する**。
+  ヒント無しの通常運転は安全側なので、ここは起動拒否にしない。
+  稼働中に Thermal Model の昇格などで artifact が変わった場合も、同じ照合に落ちて Stage B を止める
 - どちらの失敗も構造化ログ（JSON Lines）に閉じた語彙で残す（0064 §2.9 と同じ規律）
 
 ### 2.2 起動時の取り込みは `0 <= 経過 <= startup_backfill_ms` だけを採る
@@ -126,8 +151,9 @@ elapsed_ms = startup_wall_ms - ts_ms
   weight まで動かしたい場合は別の決定で、(b) の網羅試験を根拠に緩める
 - 網羅試験は格子の設計に依存する。格子の粗さで見逃す可能性は残るため、
   刻みを設定にして Stage A の実測分布から見直せるようにする
-- 起動時に (b) を走らせないため、設定変更のたびにハッシュの更新（試験の再実行）が要る。
-  照合に失敗しても通常運転は続く（安全側）
+- 起動時に (b) を走らせないため、設定・実装・Thermal Model artifact が変わるたびに
+  ハッシュの更新（試験の再実行）が要る。照合に失敗しても通常運転は続く（安全側）
+- 認証領域の外ではヒントが効かないので、想定外の状態ほどヒントの効果は出ない（安全側に倒した帰結）
 
 ## 4. 却下した代替案
 
@@ -142,4 +168,7 @@ elapsed_ms = startup_wall_ms - ts_ms
 
 1. 網羅試験の格子の刻み・範囲と `eps` / `eps_c` の値（Stage A の実測で決める。測る前に決めない）
 2. 系統ごとの配分替え（Demand が下がる系統があるが温度は上がらない）を将来許すか
-3. `context_overrides` のハッシュを保存する場所（`config/` の隣か、リリース成果物か）
+3. 単調性ゲートのハッシュを保存する場所（`config/` の隣か、リリース成果物か）
+4. 認証領域の中でも tick ごとにヒント有り / 無しの両方を解いて `max` を取る実行時の保証を足すか
+   （単調性を実行時に保証できる代わりに Optimizer の予算が約 2 倍になる。人間が決める）
+5. Thermal Model の昇格と単調性ゲートの再検証を、Registry の運用（0062）のどこで結び付けるか
