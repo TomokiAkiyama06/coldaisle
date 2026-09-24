@@ -135,3 +135,4 @@ docs/decisions/NNNN-<slug>.md      例: 0002-metric-naming.md
 | [0064](0064-workload-hint-entry-and-supervisor-prior.md) | Workload Hint の入口（0045 のソケットを再利用）・形と版・期限の数え方・矛盾時は Telemetry 優先・trace への出し方・実装の段階 | FINAL |
 | [0065](0065-assessment-identity-and-nested-gate-version.md) | assessment の identity に model version を含め、入れ子の `ModelGateDecision` に版を持たせる（0059 §2.1 / §2.2 の締め直し） | FINAL |
 | [0067](0067-acoustic-measurement-study.md) | 騒音は「うるさいか」の回答で測る（騒音計を使わない・UI は表示専用のまま回答は 0045 の入口へ・回答は Fan を変えない・effective の Demand と結びつける・曲線は `approximate` のまま） | Proposed |
+| [0068](0068-dashboard-status-strip-and-fault-cards.md) | ダッシュボードの状態の帯（`server-health` の signal を描く）と、異常なカードの見た目（stale の取り消し線・欠測の斜線＋赤枠） | FINAL |
