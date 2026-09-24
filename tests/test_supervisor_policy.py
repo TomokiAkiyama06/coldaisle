@@ -28,6 +28,7 @@ from coldaisle.control import (
     ZoneRecord,
 )
 from coldaisle.control.config import SupervisorConfig
+from coldaisle.control.schema import SupervisorPolicyIdentity
 from coldaisle.control.state import ControlStateSnapshot, TelemetryHealth
 from coldaisle.control.supervisor import (
     ReceivedSupervisorOutput,
@@ -43,6 +44,10 @@ from coldaisle.control.supervisor import (
 from test_control_schema import CONTROL_TICK_RUNTIME
 
 BASE_TS_MS = 1_800_000_000_000
+RL_IDENTITY = SupervisorPolicyIdentity(
+    model_id="rl-supervisor-test", version="rl-test-v1", artifact_sha256="e" * 64
+)
+"""試験の RL 提案が名乗る artifact 識別。Coordinator は照合する識別が無い提案を通さない。"""
 
 
 def target_band() -> SupervisorTargetBand:
@@ -205,6 +210,7 @@ def rl_candidate(
         output=shadow.propose(origin),
         source_monotonic_ms=origin.snapshot.monotonic_ms,
         received_monotonic_ms=received_mono,
+        identity=RL_IDENTITY,
         origin=binding_origin,
     )
 
@@ -252,7 +258,9 @@ def test_rule_policy_has_a_config_context_for_every_workload_regime(
 
 def test_rule_active_and_rl_shadow_are_recorded_for_the_same_state() -> None:
     current = policy_input()
-    decision = SupervisorCoordinator(config(), SimulatedClock(BASE_TS_MS)).evaluate(
+    decision = SupervisorCoordinator(
+        config(), SimulatedClock(BASE_TS_MS), expected_rl_identity=RL_IDENTITY
+    ).evaluate(
         current,
         now_monotonic_ms=10_000,
         rl_candidate=rl_candidate(current),
@@ -273,6 +281,7 @@ def test_rl_candidate_is_valid_at_the_monotonic_freshness_boundary(age_ms: int) 
     coordinator = SupervisorCoordinator(
         config(active="rl_policy", shadow=None),
         SimulatedClock(BASE_TS_MS),
+        expected_rl_identity=RL_IDENTITY,
     )
     decision = coordinator.evaluate(
         current,
@@ -296,6 +305,7 @@ def test_older_but_fresh_rl_proposal_keeps_its_source_identity(
     decision = SupervisorCoordinator(
         config(active=active, shadow=shadow),
         SimulatedClock(BASE_TS_MS),
+        expected_rl_identity=RL_IDENTITY,
     ).evaluate(
         current,
         now_monotonic_ms=10_000,
@@ -326,6 +336,7 @@ def test_rl_proposal_older_than_valid_ms_from_its_source_is_rejected(active: str
     decision = SupervisorCoordinator(
         config(active=active, shadow=None if active == "rl_policy" else "rl_policy"),
         SimulatedClock(BASE_TS_MS),
+        expected_rl_identity=RL_IDENTITY,
     ).evaluate(
         current,
         now_monotonic_ms=10_000,
@@ -347,6 +358,7 @@ def test_rl_proposal_from_a_future_tick_is_rejected(active: str) -> None:
     decision = SupervisorCoordinator(
         config(active=active, shadow=None if active == "rl_policy" else "rl_policy"),
         SimulatedClock(BASE_TS_MS),
+        expected_rl_identity=RL_IDENTITY,
     ).evaluate(
         current,
         now_monotonic_ms=10_000,
@@ -354,6 +366,7 @@ def test_rl_proposal_from_a_future_tick_is_rejected(active: str) -> None:
             output=future,
             source_monotonic_ms=10_000,
             received_monotonic_ms=10_000,
+            identity=RL_IDENTITY,
             origin=SupervisorOutputOrigin.ACTIVE_BINDING,
         ),
     )
@@ -384,7 +397,9 @@ def test_the_active_slot_refuses_output_that_is_not_bound_for_active(
     candidate = rl_candidate(current, binding_origin=origin)
 
     active = SupervisorCoordinator(
-        config(active="rl_policy", shadow=None), SimulatedClock(BASE_TS_MS)
+        config(active="rl_policy", shadow=None),
+        SimulatedClock(BASE_TS_MS),
+        expected_rl_identity=RL_IDENTITY,
     ).evaluate(current, now_monotonic_ms=10_000, rl_candidate=candidate)
 
     assert active.active.output is None
@@ -396,9 +411,9 @@ def test_the_active_slot_refuses_output_that_is_not_bound_for_active(
 
     # shadow は MPC にも Fan にも届かないので、用途を問わず記録する。問うと、昇格前の
     # 候補を観測できず、昇格に要る証拠をそもそも集められない（決定記録 0053 §2.3）。
-    shadowed = SupervisorCoordinator(config(), SimulatedClock(BASE_TS_MS)).evaluate(
-        current, now_monotonic_ms=10_000, rl_candidate=candidate
-    )
+    shadowed = SupervisorCoordinator(
+        config(), SimulatedClock(BASE_TS_MS), expected_rl_identity=RL_IDENTITY
+    ).evaluate(current, now_monotonic_ms=10_000, rl_candidate=candidate)
 
     assert shadowed.shadow is not None and shadowed.shadow.output is not None
     assert shadowed.active.output is shadowed.selected_output
@@ -410,6 +425,7 @@ def test_older_rl_proposal_is_rejected_when_the_regime_has_changed_since() -> No
     decision = SupervisorCoordinator(
         config(active="rl_policy", shadow=None),
         SimulatedClock(BASE_TS_MS),
+        expected_rl_identity=RL_IDENTITY,
     ).evaluate(
         current,
         now_monotonic_ms=10_000,
@@ -429,6 +445,7 @@ def test_source_snapshot_cannot_be_later_than_receipt() -> None:
             output=rl_candidate(current).output,
             source_monotonic_ms=10_001,
             received_monotonic_ms=10_000,
+            identity=RL_IDENTITY,
         )
 
 
@@ -437,6 +454,7 @@ def test_expired_or_stopped_rl_falls_back_to_rule_without_using_wall_clock() -> 
     coordinator = SupervisorCoordinator(
         config(active="rl_policy", shadow=None),
         SimulatedClock(BASE_TS_MS),
+        expected_rl_identity=RL_IDENTITY,
     )
     source = earlier_input(tick=4, mono=7_999)
     expired_output = rl_candidate(current, source=source).output.model_copy(
@@ -449,6 +467,7 @@ def test_expired_or_stopped_rl_falls_back_to_rule_without_using_wall_clock() -> 
             output=expired_output,
             source_monotonic_ms=7_999,
             received_monotonic_ms=7_999,
+            identity=RL_IDENTITY,
             origin=SupervisorOutputOrigin.ACTIVE_BINDING,
         ),
     )
@@ -468,13 +487,16 @@ def test_expired_or_stopped_rl_falls_back_to_rule_without_using_wall_clock() -> 
 def test_invalid_shadow_output_is_recorded_but_never_selected() -> None:
     current = policy_input()
     wrong_tick = rl_candidate(current).output.model_copy(update={"tick_id": 999})
-    decision = SupervisorCoordinator(config(), SimulatedClock(BASE_TS_MS)).evaluate(
+    decision = SupervisorCoordinator(
+        config(), SimulatedClock(BASE_TS_MS), expected_rl_identity=RL_IDENTITY
+    ).evaluate(
         current,
         now_monotonic_ms=10_000,
         rl_candidate=ReceivedSupervisorOutput(
             output=wrong_tick,
             source_monotonic_ms=10_000,
             received_monotonic_ms=10_000,
+            identity=RL_IDENTITY,
         ),
     )
 
@@ -487,7 +509,9 @@ def test_invalid_shadow_output_is_recorded_but_never_selected() -> None:
 def test_future_worker_receipt_is_rejected_and_rl_success_requires_receipt_time() -> None:
     current = policy_input()
     candidate = rl_candidate(current, received_mono=10_001)
-    decision = SupervisorCoordinator(config(), SimulatedClock(BASE_TS_MS)).evaluate(
+    decision = SupervisorCoordinator(
+        config(), SimulatedClock(BASE_TS_MS), expected_rl_identity=RL_IDENTITY
+    ).evaluate(
         current,
         now_monotonic_ms=10_000,
         rl_candidate=candidate,
@@ -526,13 +550,16 @@ def test_rl_output_is_limited_to_configured_strategy_weights_and_target(
             }
         )
 
-    decision = SupervisorCoordinator(bounded, SimulatedClock(BASE_TS_MS)).evaluate(
+    decision = SupervisorCoordinator(
+        bounded, SimulatedClock(BASE_TS_MS), expected_rl_identity=RL_IDENTITY
+    ).evaluate(
         current,
         now_monotonic_ms=10_000,
         rl_candidate=ReceivedSupervisorOutput(
             output=invalid,
             source_monotonic_ms=10_000,
             received_monotonic_ms=10_000,
+            identity=RL_IDENTITY,
         ),
     )
 
@@ -553,6 +580,7 @@ def test_rule_failure_returns_no_context_instead_of_stopping_the_control_loop() 
     decision = SupervisorCoordinator(
         config(shadow=None),
         SimulatedClock(BASE_TS_MS),
+        expected_rl_identity=RL_IDENTITY,
         rule_policy=BrokenRule(),
     ).evaluate(policy_input(), now_monotonic_ms=10_000)
 
@@ -594,7 +622,9 @@ def control_tick(decision: SupervisorDecision, current: SupervisorInput) -> Cont
 
 def test_decision_can_be_embedded_in_v3_control_trace_with_shadow_output() -> None:
     current = policy_input()
-    decision = SupervisorCoordinator(config(), SimulatedClock(BASE_TS_MS)).evaluate(
+    decision = SupervisorCoordinator(
+        config(), SimulatedClock(BASE_TS_MS), expected_rl_identity=RL_IDENTITY
+    ).evaluate(
         current,
         now_monotonic_ms=10_000,
         rl_candidate=rl_candidate(current),
@@ -644,7 +674,9 @@ def test_decision_can_be_embedded_in_v3_control_trace_with_shadow_output() -> No
 
 def test_active_shadow_outputs_must_share_input_identity_and_regime() -> None:
     current = policy_input()
-    decision = SupervisorCoordinator(config(), SimulatedClock(BASE_TS_MS)).evaluate(
+    decision = SupervisorCoordinator(
+        config(), SimulatedClock(BASE_TS_MS), expected_rl_identity=RL_IDENTITY
+    ).evaluate(
         current,
         now_monotonic_ms=10_000,
         rl_candidate=rl_candidate(current),

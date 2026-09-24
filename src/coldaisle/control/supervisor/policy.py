@@ -205,10 +205,11 @@ class SupervisorCoordinator:
         rule_policy: SupervisorPolicy | None = None,
         expected_rl_identity: SupervisorPolicyIdentity | None = None,
     ) -> None:
-        """`expected_rl_identity` を渡すと、RL 提案の identity が**完全に一致**するものだけ通す。
+        """RL 提案は identity が `expected_rl_identity` と**完全に一致**するものだけ通す。
 
         版だけの照合（`rl_version`）では、同じ版を名乗る別の model ID・別の bytes の提案が
-        通る。運転で RL を使う構成は、束縛した artifact の識別をここへ渡す。
+        通る。`expected_rl_identity` を渡さない構成では、RL 提案は**すべて**
+        `supervisor_identity_mismatch` で拒まれ、active slot なら Rule へ落ちる（fail closed）。
         """
         self._expected_rl_identity = expected_rl_identity
         self._config = config
@@ -326,13 +327,18 @@ class SupervisorCoordinator:
                 source_monotonic_ms=source,
             )
         expected = self._expected_rl_identity
-        if expected is not None and candidate.identity != expected:
+        if expected is None or candidate.identity != expected:
+            # **期待する識別が無いときも通さない**（fail closed。0061 §2.6）。照合を飛ばすと、
+            # 同じ版を名乗る別の artifact や識別の無い提案が trace に入り、その artifact の
+            # 証拠として読めてしまう。RL slot を持つ構成は束縛した識別を必ず渡す。
+            detail = (
+                "RL 提案と照合する artifact 識別が Coordinator に束縛されていない"
+                if expected is None
+                else "RL 提案の artifact 識別が期待する束縛と一致しない"
+            )
             return SupervisorPolicyEvaluation(
                 policy=SupervisorPolicyKind.RL,
-                error=Reason(
-                    code="supervisor_identity_mismatch",
-                    detail="RL 提案の artifact 識別が期待する束縛と一致しない",
-                ),
+                error=Reason(code="supervisor_identity_mismatch", detail=detail),
                 received_monotonic_ms=received,
                 source_monotonic_ms=source,
             )

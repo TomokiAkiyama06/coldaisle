@@ -237,6 +237,9 @@ shadow:   { minimum_ticks, minimum_paired_fraction }
     identity の無い提案を `supervisor_identity_mismatch` で拒む**（active / shadow どちらの
     slot でも）。成功した提案の識別は `SupervisorPolicyEvaluation.policy_identity` として
     trace に残す（**trace の加算的な追加**。成功した RL 出力にだけ付けられる）
+  - `expected_rl_identity` を**渡さない** Coordinator は、照合を飛ばすのではなく
+    RL 提案を**すべて** `supervisor_identity_mismatch` で拒む（fail closed。active slot なら
+    Rule へ落ちる）。照合を省くと、同じ版を名乗る別の artifact や識別の無い提案が trace に入る
   - `SupervisorShadowLedger` は `rl_identity` を束縛し、完全一致しない・識別の無い提案を
     数えずに拒む。`SupervisorShadowSummary` も識別を持つので、別 artifact の集計と
     digest（= `shadow_evaluation_ref`）が混ざらない

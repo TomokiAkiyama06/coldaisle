@@ -681,9 +681,13 @@ def test_invariant_10_b_the_shadow_slot_never_becomes_active(
     )
     policy = RegimeTableRlPolicy.from_binding(binding, SimulatedClock(0))
     policy_input = supervisor_input()
-    candidate = received(policy.propose(policy_input))
+    candidate = policy.deliver(
+        policy_input, received_monotonic_ms=policy_input.snapshot.monotonic_ms
+    )
 
-    coordinator = SupervisorCoordinator(settings.supervisor, SimulatedClock(0))
+    coordinator = SupervisorCoordinator(
+        settings.supervisor, SimulatedClock(0), expected_rl_identity=policy.identity
+    )
     decision = coordinator.evaluate(
         policy_input, now_monotonic_ms=policy_input.snapshot.monotonic_ms, rl_candidate=candidate
     )
@@ -985,6 +989,47 @@ def test_invariant_21_shadow_evidence_carries_the_full_artifact_identity(
         rl_identity=RL_IDENTITY.model_copy(update={"artifact_sha256": "e" * 64}),
     )
     assert other_ledger.summary().digest() != ledger_for().summary().digest()
+
+
+@pytest.mark.parametrize("slot", ["shadow", "active"])
+def test_invariant_21_b_an_unbound_coordinator_refuses_every_rl_proposal(
+    tmp_path: Path, bounds: SupervisorOutputBounds, slot: str
+) -> None:
+    """**照合する識別を持たない Coordinator は RL 提案を通さない**（fail closed。0061 §2.6）。
+
+    照合を省けば、同じ版を名乗る別の artifact や識別の無い提案が trace に入る。
+    active slot なら Rule へ落ちる。
+    """
+    settings = shadow_settings(mpc_policy(), rl_version="0.1.0")
+    supervisor = settings.supervisor
+    if slot == "active":
+        supervisor = SupervisorConfig.model_validate(
+            supervisor.model_dump(mode="python")
+            | {"active_policy": SupervisorPolicyKind.RL, "shadow_policy": None}
+        )
+    verified = register_policy(tmp_path / f"pr89-unbound-{slot}", artifact(bounds))
+    binding = SupervisorPolicyBinding.for_shadow(
+        verified, expected_policy_version="0.1.0", bounds=supervisor.output_bounds
+    )
+    policy = RegimeTableRlPolicy.from_binding(binding, SimulatedClock(0))
+    policy_input = supervisor_input()
+    delivered = policy.deliver(
+        policy_input, received_monotonic_ms=policy_input.snapshot.monotonic_ms
+    )
+    # active slot の用途検査より先で落ちないよう、用途だけは active と名乗らせる。
+    delivered = delivered.model_copy(update={"origin": SupervisorOutputOrigin.ACTIVE_BINDING})
+
+    for candidate in (delivered, delivered.model_copy(update={"identity": None})):
+        decision = SupervisorCoordinator(supervisor, SimulatedClock(0)).evaluate(
+            policy_input,
+            now_monotonic_ms=policy_input.snapshot.monotonic_ms,
+            rl_candidate=candidate,
+        )
+        rl = decision.shadow if slot == "shadow" else decision.active
+        assert rl is not None and rl.output is None
+        assert rl.error is not None and rl.error.code == "supervisor_identity_mismatch"
+        assert decision.selected_output is not None
+        assert decision.selected_output.policy is SupervisorPolicyKind.RULE
 
 
 def test_invariant_18_the_baseline_table_comes_from_the_policy_that_was_evaluated(
@@ -1319,14 +1364,6 @@ def shadow_settings(settings: FanPolicyConfig, *, rl_version: str) -> FanPolicyC
     policy_document = settings.model_dump(mode="python")
     policy_document["supervisor"] = supervisor
     return FanPolicyConfig.model_validate(policy_document)
-
-
-def received(output: SupervisorOutput) -> ReceivedSupervisorOutput:
-    return ReceivedSupervisorOutput(
-        output=output,
-        source_monotonic_ms=output.ts_ms,
-        received_monotonic_ms=output.ts_ms,
-    )
 
 
 def ledger_for() -> SupervisorShadowLedger:
