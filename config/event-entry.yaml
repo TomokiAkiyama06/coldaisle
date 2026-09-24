@@ -35,3 +35,13 @@ limits:
   max_message_bytes: 4096
   # 1接続が1行を送り切るまでの上限秒数。遅い接続で入口を塞がせない。
   read_timeout_s: 2.0
+  # Workload Hint（#107 / 決定記録 0064）の expected_duration_s に書ける上限秒数。
+  # 超えた申告は拒否する（切り詰めて受理はしない）。値は暫定で、運用を見て決める。
+  # Stage A（記録のみ）では制御に効かない。期限の上限は Stage B で fan-policy.yaml が別に持つ。
+  max_expected_duration_s: 604800
+
+workload_hint:
+  # 受理するヒント本体の版（hint_v。封筒の版 v とは別。決定記録 0064 §2.3）。
+  # コードが形を知っている版しか書けない（未実装の版は起動時に拒否する）。
+  # 空リストにすると Workload Hint を1件も受理しない。
+  accepted_hint_versions: [1]
