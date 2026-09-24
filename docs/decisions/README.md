@@ -130,7 +130,9 @@ docs/decisions/NNNN-<slug>.md      例: 0002-metric-naming.md
 | [0059](0059-decision-trace-model-artifact.md) | decision trace が tick ごとに model artifact を記録する（適用側の証拠を artifact へ束縛し、LIMITED 以降の昇格を通す） | FINAL（§2.1 の照合対象と §2.2 の入れ子の版は [0065](0065-assessment-identity-and-nested-gate-version.md)） |
 | [0060](0060-control-loop-runtime.md) | Control Loop の実行時契約（`tick_ms` は safety.yaml・Telemetry はストア経由・モードは読み取り port・deadman の配線・実行の記録を trace へ） | FINAL |
 | [0062](0062-model-registry-operations.md) | Model Registry の運用入口（CLI）と起動時検証、lifecycle 監査の追跡 | FINAL |
+| [0063](0063-compute-mode-advisory.md) | Compute Mode 切替時の環境条件アドバイザリ（助言のみ・実測フルロードとの比較・欠けた材料の明示） | FINAL |
 | [0064](0064-workload-hint-entry-and-supervisor-prior.md) | Workload Hint の入口（0045 のソケットを再利用）・形と版・期限の数え方・矛盾時は Telemetry 優先・trace への出し方・実装の段階 | FINAL |
 | [0065](0065-assessment-identity-and-nested-gate-version.md) | assessment の identity に model version を含め、入れ子の `ModelGateDecision` に版を持たせる（0059 §2.1 / §2.2 の締め直し） | FINAL |
 | [0066](0066-workload-hint-stage-b-conditions.md) | Workload Hint の Stage B 条件の精緻化（冷却の単調性は構成制限＋網羅試験＋実行時の二重解法で保証・試験の成果物はソースと実行環境に束縛・ヒントの期限は boot id と CLOCK_BOOTTIME で数え、行は追記順に処理・終端状態と取り込み境界を制御デーモンが永続化） | FINAL |
 | [0067](0067-acoustic-measurement-study.md) | 騒音は「うるさいか」の回答で測る（騒音計を使わない・UI は表示専用のまま回答は 0045 の入口へ・回答は Fan を変えない・effective の Demand と結びつける・曲線は `approximate` のまま） | Proposed |
+| [0068](0068-dashboard-status-strip-and-fault-cards.md) | ダッシュボードの状態の帯（`server-health` の signal を描く）と、異常なカードの見た目（stale の取り消し線・欠測の斜線＋赤枠） | FINAL |
