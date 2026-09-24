@@ -407,7 +407,7 @@ class EventEntryServer:
             return
         try:
             line = self._read_line(conn)
-            message = parse_message(line)
+            message = parse_message(line, hint_limits=self._settings.hint_limits)
         except MessageError as exc:
             LOGGER.warning(
                 "メッセージを拒否した",
