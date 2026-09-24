@@ -1,7 +1,7 @@
 # 決定記録 0066: Workload Hint の Stage B 条件の精緻化（冷却の単調性の検証・起動時取り込みの時計規則）
 
 - **種別**: Decision Record
-- **Status**: Proposed（リポジトリ所有者の承認をもって FINAL。承認前に実装しない）
+- **Status**: FINAL（2026-09-24、リポジトリ所有者が承認）
 - **Date**: 2026-09-21
 - **Supersedes**（いずれも限定的な置き換え。旧記録は FINAL のため本文を書き換えず、`Superseded by` の追記だけを行う）:
   - [0064](0064-workload-hint-entry-and-supervisor-prior.md) §2.8 の「単調性（片方向）」の検証方法、§2.6 の
