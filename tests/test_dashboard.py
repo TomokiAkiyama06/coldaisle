@@ -130,7 +130,7 @@ def test_script_does_not_use_inner_html():
 def test_script_reads_only_documented_endpoints():
     """叩く先が API 契約の範囲に収まっていること。"""
     script = SCRIPT.read_text(encoding="utf-8")
-    used = set(re.findall(r'"(/api/v1/[a-z]+)"', script))
+    used = set(re.findall(r'"(/api/v1/[a-z-]+)"', script))
     assert used == {
         "/api/v1/metrics",
         "/api/v1/latest",
@@ -140,6 +140,8 @@ def test_script_reads_only_documented_endpoints():
         "/api/v1/devices",
         # GPU Mode の切り替えの縦線（#67）。読み取り専用
         "/api/v1/events",
+        # 状態の帯（決定記録 0068 §2.1）。信号の規則は API が持つ
+        "/api/v1/server-health",
     }
     assert "/api/v1/stream" in script, "WebSocket を使う（FR-306）"
 
@@ -333,6 +335,38 @@ def test_stale_cards_carry_no_badge_text():
     for quality in (Quality.OK, Quality.MISSING, Quality.SUSPECT):
         assert f"{quality.value}:" in labels, f"{quality.value} の文言が無い"
     assert ".q-stale" in STYLES.read_text(encoding="utf-8")
+
+
+def _rule(css: str, selector: str) -> str:
+    """`selector { ... }` の中身。複数行の規則にも対応する。"""
+    match = re.search(re.escape(selector) + r"\s*\{([^}]*)\}", css)
+    assert match, f"{selector} の規則が無い"
+    return match.group(1)
+
+
+def test_stale_values_are_struck_through_but_not_their_units():
+    """stale の値に取り消し線を引く。**単位には引かない**（決定記録 0068 §2.2）。
+
+    単位は inline-block にして、親の取り消し線が伝わらないようにしている。
+    """
+    css = STYLES.read_text(encoding="utf-8")
+    assert "line-through" in _rule(css, ".q-stale .value")
+    assert "inline-block" in _rule(css, ".q-stale .unit")
+    assert "line-through" not in _rule(css, ".q-missing"), "欠測に取り消し線は引かない"
+
+
+def test_missing_cards_have_a_red_frame_and_hatching():
+    """欠測は赤枠＋斜線（決定記録 0068 §2.3）。バッジの文言は残す（0011 §2.4）。
+
+    斜線は色に頼らない手がかりで、赤枠だけに戻すと色覚特性・印刷で落ちる。
+    """
+    css = STYLES.read_text(encoding="utf-8")
+    rule = _rule(css, ".q-missing")
+    assert "repeating-linear-gradient" in rule
+    assert re.search(r"border:\s*2px solid var\(--bad\)", rule)
+    assert ".q-missing .badge" in css
+    script = SCRIPT.read_text(encoding="utf-8")
+    assert "missing:" in script[script.index("const QUALITY_LABEL") :].split("};")[0]
 
 
 def test_a_stale_metric_always_raises_the_banner(tmp_path, rules):
@@ -857,8 +891,11 @@ vm.createContext(context);
 vm.runInContext(
   fs.readFileSync(process.argv[2], "utf8") +
     "\n;this.__refresh = refresh;" +
-    " this.__state = () => ({ health: lastHealth, alerts: lastAlerts, error: lastFetchError," +
-    " banner: document.getElementById('banner').textContent });",
+    " this.__state = () => { const strip = document.getElementById('status-strip');" +
+    " return { health: lastHealth, alerts: lastAlerts, error: lastFetchError," +
+    " banner: document.getElementById('banner').textContent," +
+    " strip: { hidden: strip.hidden, className: strip.className," +
+    " texts: strip.children.map((c) => c.textContent) } }; };",
   context,
 );
 const settle = () => new Promise((resolve) => setImmediate(resolve));
@@ -917,6 +954,7 @@ def test_health_applies_while_alerts_fails(tmp_path):
             "/api/v1/health": health_body,
             "/api/v1/alerts": alerts_body,
             "/api/v1/devices": devices,
+            "/api/v1/server-health": _server_health("green"),
             "/api/v1/series": {"points": [], "agg": "raw"},
         }
 
@@ -943,3 +981,88 @@ def test_health_applies_while_alerts_fails(tmp_path):
     assert recovered["error"] is None, "成功したら、そのエンドポイントの失敗は消える"
     assert recovered["health"]["stale"] is False
     assert recovered["banner"] == ""
+
+
+# ---------------------------------------------------------------- 状態の帯（決定記録 0068 §2.1）
+
+
+def _server_health(signal, summary="要約", alerts=()):
+    """`GET /api/v1/server-health` のうち、帯が読む3つだけ。"""
+    return {"signal": signal, "summary": summary, "active_alerts": list(alerts)}
+
+
+def test_the_status_strip_sits_before_the_cards():
+    """状態の帯は現在値のカードより先にある（キャンバスの Main / Dashboard-Fault）。"""
+    html = INDEX.read_text(encoding="utf-8")
+    assert 'id="status-strip"' in html
+    assert html.index('id="status-strip"') < html.index('id="cards"')
+
+
+def test_the_strip_is_not_an_input_of_the_red_banner():
+    """帯の入力は赤帯の判定に混ぜない。赤帯は古さ・欠落を、帯はサーバの信号を言う。"""
+    script = SCRIPT.read_text(encoding="utf-8")
+    assert "lastServerHealth" not in _body(script, "function bannerMessages()")
+    # 信号の規則を JS に持たない（決定記録 0068 §2.1）。`green` を返すのは表の引き当てだけ
+    strip = _body(script, "function renderStatusStrip()")
+    assert "quality" not in strip and "stale" not in strip
+
+
+def test_the_strip_shows_what_the_server_says_and_never_a_false_green(tmp_path):
+    """信号・要約・アラート数をそのまま描く。**取れていないときに GREEN を出さない。**
+
+    1. 成功（green）→ GREEN と要約。アラートは 0
+    2. 取得の失敗 → 前回の GREEN を残さず「状態不明」
+    3. 回復（red・アラート2件、うち重大1）→ RED と件数
+    4. 未知の信号（`constructor` を含む）→ GREEN に読み替えず「状態不明」
+
+    `node` が無い手元では飛ばし、CI では必須（決定記録 0044）。
+    """
+    node = _require_node()
+    latest = {
+        "stale": False,
+        "metrics": {"air.room": {"value": 26.0, "unit": "C", "quality": "ok", "age_seconds": 1.0}},
+        "derived": {},
+    }
+    health = {
+        "last_sample_ts_ms": NOW_MS,
+        "data_age_seconds": 1.0,
+        "stale": False,
+        "source": "mock",
+    }
+    alert = {"rule_id": "R", "severity": "critical", "state": "firing", "started_ms": NOW_MS}
+    warning = dict(alert, severity="warning")
+
+    def phase(server_health):
+        return {
+            "/api/v1/metrics": {"metrics": {}, "derived": {}},
+            "/api/v1/latest": latest,
+            "/api/v1/health": health,
+            "/api/v1/alerts": {"alerts": []},
+            "/api/v1/devices": {"devices": []},
+            "/api/v1/server-health": server_health,
+            "/api/v1/series": {"points": [], "agg": "raw"},
+        }
+
+    phases = [
+        phase(_server_health("green", "正常です")),
+        phase(None),  # 取得の失敗（500）
+        phase(_server_health("red", "重大なアラート", [alert, warning])),
+        phase(_server_health("constructor", "未知")),
+    ]
+    spec = tmp_path / "phases.json"
+    spec.write_text(json.dumps(phases), encoding="utf-8")
+    harness = tmp_path / "refresh.js"
+    harness.write_text(REFRESH_HARNESS, encoding="utf-8")
+    run = subprocess.run(
+        [node, str(harness), str(SCRIPT), str(spec)], capture_output=True, text=True, check=True
+    )
+    ok, failed, red, unknown = (state["strip"] for state in json.loads(run.stdout))
+
+    assert ok["hidden"] is False and ok["className"] == "strip green"
+    assert ok["texts"] == ["GREEN", "正常です", "発生中のアラート 0"]
+    assert failed["hidden"] is False and failed["className"] == "strip unknown"
+    assert failed["texts"] == ["状態不明", "状態を取得できません。"], "前回の GREEN を残している"
+    assert red["className"] == "strip red"
+    assert red["texts"] == ["RED", "重大なアラート", "発生中のアラート 2（重大 1）"]
+    assert unknown["className"] == "strip unknown", "未知の信号を有効な信号として扱っている"
+    assert unknown["texts"][0] == "状態不明"
