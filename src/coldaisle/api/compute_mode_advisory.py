@@ -164,29 +164,21 @@ class _History:
     limitations: tuple[str, ...]
 
 
-_RETAINED_WINDOWS = 2
-"""履歴の結果を保持する窓の数。**調整値ではなく構造上の数**。
-
-呼び出し側は評価の直前に時刻を読むため、窓の境目で同時に参照されうるのは
-最新の窓とその直前の窓の2つだけ。この2つを窓単位で保持すれば、境目で遅れた
-前の窓の呼び出しが何本あっても、どちらの窓も1回だけ評価され同じ結果を返す。
-"""
-
-
 class ComputeModeAdvisor:
     """決定論的な advisory を組み立てる。AI も制御も関与しない。
 
     履歴部分は設定の ``refresh_s`` の窓ごとに1回だけ評価する。WebSocket は
     毎秒 payload を作り直すため、30日ぶんの集計を毎回走らせない。窓の鍵は
     時刻そのものであり、**同じ時刻・同じ DB なら常に同じ結果**になる。
+    評価済みの窓より古い時刻の呼び出しは評価せず、評価済みの結果を返す。
     """
 
     def __init__(self, settings: ComputeModeAdvisorySettings, catalog: MetricCatalog) -> None:
         self._settings = settings
         self._catalog = catalog
         self._lock = threading.Lock()
-        # 窓ごとの結果。保持するのは最新の窓とその直前の窓だけ（_RETAINED_WINDOWS）
-        self._cached: dict[int, _History] = {}
+        # 評価済みの最も新しい窓とその結果。窓は前にしか進まない（_history を参照）
+        self._cached: tuple[int, _History] | None = None
 
     @property
     def settings(self) -> ComputeModeAdvisorySettings:
@@ -283,19 +275,14 @@ class ComputeModeAdvisor:
         # 窓ごとの初回評価を1回に限る。離すと2本が別スナップショットで評価し、
         # 同じ窓で異なる reference を返したうえ、どちらが残るかが実行順で変わる
         with self._lock:
-            cached = self._cached.get(window)
-            if cached is not None:
-                return cached
+            cached = self._cached
+            # 評価済みの窓と同じか古い窓では評価しない。古い窓の呼び出し（境目や
+            # 遅延で遅れて届いたもの）には、より新しい窓で評価済みの結果を返す。
+            # どの時点の評価かは evaluated_at が示す。これでどの窓も2回評価されない
+            if cached is not None and window <= cached[0]:
+                return cached[1]
             history = self._evaluate_history(store, now_ms)
-            newest = max(self._cached, default=window)
-            if window <= newest - _RETAINED_WINDOWS:
-                # 保持範囲より古い窓（refresh_s 以上遅れた呼び出し）は結果を返すだけ。
-                # 新しい窓の結果を押し出さない
-                return history
-            self._cached[window] = history
-            newest = max(newest, window)
-            for stale in [key for key in self._cached if key <= newest - _RETAINED_WINDOWS]:
-                del self._cached[stale]
+            self._cached = (window, history)
             return history
 
     def _evaluate_history(self, store: SqliteStore, now_ms: int) -> _History:

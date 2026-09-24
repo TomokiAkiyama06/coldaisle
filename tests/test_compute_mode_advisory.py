@@ -574,12 +574,14 @@ def test_the_first_history_evaluation_in_a_window_runs_only_once(
     assert results["first"] is results["second"]
 
 
-def test_a_late_call_from_an_older_window_does_not_evict_the_newer_result(
+def test_a_late_call_for_an_older_window_reuses_the_newest_result(
     tmp_path, rules, catalog, monkeypatch
 ):
-    """窓の境目で、遅れて届いた前の窓の呼び出しが新しい窓の結果を消さない。
+    """新しい窓を評価したあとに遅れて届いた古い窓の呼び出しは、**評価しない**。
 
-    消すと新しい窓が2回評価され、同じ窓で結果が変わりうる。
+    履歴はすでにより新しい窓で評価済みなので、その結果をそのまま返す（どの時点の
+    評価かは `evaluated_at` が示す）。これで遅れがどれだけ大きくても、どの窓も
+    2回評価されない。
     """
     advisor = ComputeModeAdvisor(_settings(tmp_path, catalog), catalog)
     calls: list[int] = []
@@ -590,46 +592,21 @@ def test_a_late_call_from_an_older_window_does_not_evict_the_newer_result(
 
     monkeypatch.setattr(advisor, "_evaluate_history", counting)
     refresh_ms = BASE_SETTINGS["history"]["refresh_s"] * 1000
-    newer_ms = NOW_MS + refresh_ms
-    older_ms = newer_ms - 1_000
+    newer_ms = NOW_MS + 3 * refresh_ms
     with _store(tmp_path, rules) as store:
         newer = advisor._history(store, newer_ms)
-        older = advisor._history(store, older_ms)
-        again = advisor._history(store, newer_ms + 1_000)
-
-    assert older.evaluated_at_ms == older_ms
-    assert again is newer
-    assert calls == [newer_ms, older_ms]
-
-
-def test_the_previous_window_is_also_evaluated_once_after_the_newer_one_is_cached(
-    tmp_path, rules, catalog, monkeypatch
-):
-    """新しい窓を保持したあとでも、**前の窓は1回だけ評価し、同じ結果を返す**。
-
-    境目で遅れた前の窓の呼び出しが2本あっても、評価が2回走って別の reference を
-    返してはいけない。
-    """
-    advisor = ComputeModeAdvisor(_settings(tmp_path, catalog), catalog)
-    calls: list[int] = []
-
-    def counting(store, now_ms):
-        calls.append(now_ms)
-        return _History(None, len(calls), now_ms, ())
-
-    monkeypatch.setattr(advisor, "_evaluate_history", counting)
-    refresh_ms = BASE_SETTINGS["history"]["refresh_s"] * 1000
-    newer_ms = NOW_MS + refresh_ms
-    older_ms = newer_ms - 1_000
-    with _store(tmp_path, rules) as store:
-        newer = advisor._history(store, newer_ms)
-        first_older = advisor._history(store, older_ms)
-        second_older = advisor._history(store, older_ms - 1_000)
+        # 直前の窓と、refresh_s の数倍遅れた窓
+        previous = advisor._history(store, newer_ms - 1_000)
+        much_older = advisor._history(store, newer_ms - 2 * refresh_ms)
+        much_older_again = advisor._history(store, newer_ms - 2 * refresh_ms)
         newer_again = advisor._history(store, newer_ms + 1_000)
 
-    assert calls == [newer_ms, older_ms]
-    assert second_older is first_older
+    assert calls == [newer_ms]
+    assert previous is newer
+    assert much_older is newer
+    assert much_older_again is newer
     assert newer_again is newer
+    assert newer.evaluated_at_ms == newer_ms
 
 
 def test_the_bucket_still_in_progress_is_not_counted_as_a_full_bucket(tmp_path, rules, catalog):
