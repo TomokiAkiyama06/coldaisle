@@ -1,7 +1,7 @@
 # 決定記録 0065: assessment の identity に model version を含め、入れ子の `ModelGateDecision` に版を持たせる
 
 - **種別**: Decision Record
-- **Status**: Proposed
+- **Status**: FINAL（2026-09-24、リポジトリ所有者が承認）
 - **Date**: 2026-09-21
 - **Supersedes**: [`0059-decision-trace-model-artifact.md`](0059-decision-trace-model-artifact.md)
   の **§2.1 の「`artifact_sha256` / `model_id` / `artifact_verification` /
@@ -130,7 +130,7 @@ Gate の `expected_model_version` には Registry の `ArtifactAttestation.versi
 
 - **所有者の承認が要る。** 本記録は 0059（`FINAL`）の §2.1 の列挙と §2.2 の規則を
   置き換える。**コード側の変更は小さな締め直しだが、安全系・制御系の設計変更は
-  人間レビューが必須である**（AGENTS.md）。承認までは `Proposed`
+  人間レビューが必須である**（AGENTS.md）。2026-09-24 にリポジトリ所有者が承認した
 - `ConfidenceAssessment` が `prediction` を丸ごと持つことの重さ（tick ごとの in-memory
   object）。いまは digest（`input_sha256`）と予測だけで、入力 window は持っていない。
   実運用の tick 周期で問題になるようなら別の記録で見直す
