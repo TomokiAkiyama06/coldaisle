@@ -39,6 +39,10 @@
 - `source.basis` に「概算 study（機材の種類・日付）」を書き、仮置きの曲線と区別する
 - `measured` は、将来 精密な測定をするときのために残す。その条件は、そのとき別の記録で決める
 - `acoustic_cost` は引き続き無単位。dBA の読みをそのまま曲線の値にしない
+- 曲線は `demand=0.0` と `demand=1.0` の点を必須とする（`ZoneAcousticCurve` の既存の契約）。
+  Critical Safety の floor がある Zone では floor 未満を測れない（§2.4）ので、**測った最小の点の
+  `acoustic_cost` を 0.0 まで平らに延ばす**。floor 未満は運転中に届かないため、その区間の値は
+  最適化に効かない。延ばしたことは `source.basis` に書く
 
 ### 2.3 測定は制御ループの外で行う
 

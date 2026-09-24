@@ -66,6 +66,8 @@ decision trace の effective の値を見て確認する。
 - `acoustic_cost` は無単位のまま。dBA の読みをそのまま値にしない
 - 写し方の具体（最小の読みを 0、最大を 1 にするなど）は、最初の結果を見て `acoustic.yaml` の PR で決める（0067 §5）
 - `source.basis` には「概算 study（機材の種類・日付）」を書く
+- 曲線は `demand=0.0` の点が必須。floor があって 0.0 付近を測れない Zone は、測った最小の点の
+  コストを 0.0 まで平らに延ばし、そうしたことを `source.basis` に書く（0067 §2.2）
 
 ## 6. 確認
 
