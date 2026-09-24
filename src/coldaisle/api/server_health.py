@@ -134,7 +134,9 @@ def build_server_health(
     # payload 全体を DB の1時点から作る。文ごとに読むと、間に resolve や新しい
     # サンプルが入ったとき一覧・件数・値・source 状態が食い違う。AI 要約は
     # スナップショットの外で行い、読み取りトランザクションを長く保持しない
-    with store.read_snapshot():
+    # 時刻とスナップショットを読む**前に** advisor の順序を取る。読んでから待つと、
+    # 遅れた応答に自分より新しい時点の履歴が混ざる（決定記録 0063 §2.6）
+    with advisor.ordered(), store.read_snapshot():
         now_ms = store.clock.now_ms()
         readings = store.latest()
         # 一覧は新しい順に打ち切るため、重大度は件数上限の無い集計から判定する

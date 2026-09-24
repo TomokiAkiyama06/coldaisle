@@ -29,6 +29,7 @@ from coldaisle.api.models import (
     HealthSourceStatus,
     ServerSignal,
 )
+from coldaisle.api.server_health import ServerHealthSettings, build_server_health
 from coldaisle.clock import SimulatedClock
 from coldaisle.metrics import MetricCatalog
 from coldaisle.store import Quality, Reading, Sample, SqliteStore
@@ -495,6 +496,21 @@ def test_the_delta_against_the_last_full_load_is_reported(tmp_path, rules, catal
     assert room.exceeded is False
 
 
+def test_a_delta_equal_to_warn_delta_is_warned(tmp_path, rules, catalog):
+    """``warn_delta`` は「これ以上高ければ警告」。ちょうど等しい差も警告する。"""
+    advisor = ComputeModeAdvisor(_settings(tmp_path, catalog), catalog)
+    with _store(tmp_path, rules) as store:
+        _full_load(store, start_ms=NOW_MS - 2 * HOUR_MS, duration_ms=HOUR_MS, room=26.1)
+        advisory = _evaluate(
+            advisor, store, _readings({"air.room": 28.1, "air.room_humidity": 48.0})
+        )
+
+    room = advisory.conditions[0]
+    # 比較は payload と同じ丸めの delta で行う（浮動小数の誤差で境界が揺れない）
+    assert room.delta == 2.0
+    assert any("versus the last observed full load" in warning for warning in advisory.warnings)
+
+
 # --- I-6 AI に依存しない・決定論 ---------------------------------------------
 
 
@@ -574,14 +590,13 @@ def test_the_first_history_evaluation_in_a_window_runs_only_once(
     assert results["first"] is results["second"]
 
 
-def test_a_late_call_for_an_older_window_reuses_the_newest_result(
+def test_a_window_change_is_evaluated_at_the_callers_own_time(
     tmp_path, rules, catalog, monkeypatch
 ):
-    """新しい窓を評価したあとに遅れて届いた古い窓の呼び出しは、**評価しない**。
+    """窓が変わったら、**その呼び出しの時刻で**評価する。他の時点の結果を流用しない。
 
-    履歴はすでにより新しい窓で評価済みなので、その結果をそのまま返す（どの時点の
-    評価かは `evaluated_at` が示す）。これで遅れがどれだけ大きくても、どの窓も
-    2回評価されない。
+    流用すると evaluated_at が generated_at を追い越しうる。同じ窓の再呼び出しは
+    評価しない。
     """
     advisor = ComputeModeAdvisor(_settings(tmp_path, catalog), catalog)
     calls: list[int] = []
@@ -592,21 +607,88 @@ def test_a_late_call_for_an_older_window_reuses_the_newest_result(
 
     monkeypatch.setattr(advisor, "_evaluate_history", counting)
     refresh_ms = BASE_SETTINGS["history"]["refresh_s"] * 1000
-    newer_ms = NOW_MS + 3 * refresh_ms
+    newer_ms = NOW_MS + refresh_ms
+    older_ms = NOW_MS
     with _store(tmp_path, rules) as store:
         newer = advisor._history(store, newer_ms)
-        # 直前の窓と、refresh_s の数倍遅れた窓
-        previous = advisor._history(store, newer_ms - 1_000)
-        much_older = advisor._history(store, newer_ms - 2 * refresh_ms)
-        much_older_again = advisor._history(store, newer_ms - 2 * refresh_ms)
-        newer_again = advisor._history(store, newer_ms + 1_000)
+        older = advisor._history(store, older_ms)
+        older_again = advisor._history(store, older_ms + 1_000)
 
-    assert calls == [newer_ms]
-    assert previous is newer
-    assert much_older is newer
-    assert much_older_again is newer
-    assert newer_again is newer
+    assert calls == [newer_ms, older_ms]
     assert newer.evaluated_at_ms == newer_ms
+    assert older.evaluated_at_ms == older_ms
+    assert older_again is older
+
+
+class _WatchedClock(SimulatedClock):
+    """時刻が読まれたことを知らせる。順序を取る前に時刻を読んでいないかを見る。"""
+
+    def __init__(self, start_ms: int) -> None:
+        super().__init__(start_ms)
+        self.read = threading.Event()
+        self.armed = False
+
+    def now_ms(self) -> int:
+        if self.armed:
+            self.read.set()
+        return super().now_ms()
+
+
+def test_a_waiting_response_never_carries_history_newer_than_its_own_snapshot(
+    tmp_path, rules, catalog
+):
+    """**時刻とスナップショットは順序を取ってから読む**（0042 §2.6 / 0063 §2.6）。
+
+    先に読んでから待つと、待っている間に新しい窓で作られた履歴を受け取り、
+    evaluated_at が generated_at を追い越し、応答のスナップショットに無い
+    フルロードが reference に現れる。
+    """
+    health_settings = ServerHealthSettings.from_yaml(
+        CONFIG_DIR / "server-health.yaml", catalog=catalog
+    )
+    advisor = ComputeModeAdvisor(_settings(tmp_path, catalog), catalog)
+    later_ms = NOW_MS + 30 * MINUTE_MS
+    worker_clock = _WatchedClock(NOW_MS)
+    with _store(tmp_path, rules):
+        pass  # スキーマを作っておく
+    results: dict[str, Any] = {}
+
+    def respond() -> None:
+        path = tmp_path / "advisory.db"
+        with SqliteStore(path, rules=rules, clock=worker_clock) as store:
+            # 接続を開くまでの時刻の読み出しは数えない
+            worker_clock.armed = True
+            ready.set()
+            results["response"] = build_server_health(
+                store,
+                catalog,
+                settings=health_settings,
+                advisor=advisor,
+                hwmon_metrics=(),
+                nvml_metrics=(),
+            )
+
+    ready = threading.Event()
+    worker = threading.Thread(target=respond)
+    with advisor._lock:
+        worker.start()
+        assert ready.wait(timeout=10)
+        # 修正前はここで時刻を読んでからロックを待つ
+        read_before_order = worker_clock.read.wait(timeout=0.5)
+        # 待っている間に時間が進み、フルロードが記録され、新しい窓の履歴が作られる
+        worker_clock.advance_to_ms(later_ms)
+        with _store(tmp_path, rules, now_ms=later_ms) as store:
+            _full_load(store, start_ms=NOW_MS, duration_ms=20 * MINUTE_MS)
+            window = later_ms // (BASE_SETTINGS["history"]["refresh_s"] * 1000)
+            advisor._cached = (window, advisor._evaluate_history(store, later_ms))
+    worker.join(timeout=10)
+
+    response = results["response"]
+    advisory = response.compute_mode_advisory
+    assert not read_before_order
+    assert advisory.evaluated_at_ms <= response.generated_at_ms
+    assert advisory.reference is not None
+    assert advisory.reference.ended_at_ms <= response.generated_at_ms
 
 
 def test_the_bucket_still_in_progress_is_not_counted_as_a_full_bucket(tmp_path, rules, catalog):

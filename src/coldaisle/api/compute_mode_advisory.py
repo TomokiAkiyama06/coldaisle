@@ -26,6 +26,7 @@ from __future__ import annotations
 import threading
 from collections import Counter
 from collections.abc import Mapping, Sequence
+from contextlib import AbstractContextManager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
@@ -170,19 +171,31 @@ class ComputeModeAdvisor:
     履歴部分は設定の ``refresh_s`` の窓ごとに1回だけ評価する。WebSocket は
     毎秒 payload を作り直すため、30日ぶんの集計を毎回走らせない。窓の鍵は
     時刻そのものであり、**同じ時刻・同じ DB なら常に同じ結果**になる。
-    評価済みの窓より古い時刻の呼び出しは評価せず、評価済みの結果を返す。
+    呼び出し側は ``ordered()`` の中で時刻とスナップショットを読む。
     """
 
     def __init__(self, settings: ComputeModeAdvisorySettings, catalog: MetricCatalog) -> None:
         self._settings = settings
         self._catalog = catalog
-        self._lock = threading.Lock()
-        # 評価済みの最も新しい窓とその結果。窓は前にしか進まない（_history を参照）
+        # 再入可能にする。ordered() の中から evaluate() が同じロックを取るため
+        self._lock = threading.RLock()
+        # 評価済みの窓とその結果。ordered() の中で呼ぶ限り、窓は前にしか進まない
         self._cached: tuple[int, _History] | None = None
 
     @property
     def settings(self) -> ComputeModeAdvisorySettings:
         return self._settings
+
+    def ordered(self) -> AbstractContextManager[bool]:
+        """呼び出しを直列にする。**現在時刻とスナップショットはこの中で読む。**
+
+        時刻を読んでからロックを待つと、遅れた呼び出しが自分より新しい時刻で
+        作られた履歴を受け取り、`evaluated_at` が `generated_at` を追い越したり、
+        応答のスナップショットに無いデータが `reference` に混ざったりする
+        （決定記録 0042 §2.6）。時刻を読む前に順序を決めれば、観測される窓は
+        ロックの順に単調に進み、履歴は窓が進んだときだけ評価すればよい。
+        """
+        return self._lock
 
     def evaluate(
         self,
@@ -272,15 +285,15 @@ class ComputeModeAdvisor:
     def _history(self, store: SqliteStore, now_ms: int) -> _History:
         window = now_ms // (self._settings.history.refresh_s * 1000)
         # REST と WS が同じ advisor を別スレッドから呼ぶ。評価中もロックを持ち、
-        # 窓ごとの初回評価を1回に限る。離すと2本が別スナップショットで評価し、
-        # 同じ窓で異なる reference を返したうえ、どちらが残るかが実行順で変わる
+        # 窓ごとの評価を1回に限る。呼び出し側は ordered() の中で時刻と
+        # スナップショットを読むため、窓はロックの順に単調に進む
         with self._lock:
             cached = self._cached
-            # 評価済みの窓と同じか古い窓では評価しない。古い窓の呼び出し（境目や
-            # 遅延で遅れて届いたもの）には、より新しい窓で評価済みの結果を返す。
-            # どの時点の評価かは evaluated_at が示す。これでどの窓も2回評価されない
-            if cached is not None and window <= cached[0]:
+            if cached is not None and cached[0] == window:
                 return cached[1]
+            # 窓が変わったら、その呼び出しの時刻とスナップショットで評価し直す。
+            # 他の呼び出しの結果を流用しないので、evaluated_at <= generated_at が
+            # 常に成り立ち、応答に無いデータが reference に混ざらない
             history = self._evaluate_history(store, now_ms)
             self._cached = (window, history)
             return history
@@ -493,7 +506,8 @@ def _condition_warnings(
             warn_delta is not None
             and condition.delta is not None
             and condition.reference_value is not None
-            and condition.delta > warn_delta
+            # 設定の意味は「これ以上高ければ警告」。delta は payload と同じ丸めの値
+            and condition.delta >= warn_delta
         ):
             warnings.append(
                 f"{condition.metric} is {condition.delta:+g}{unit} versus the last observed "
