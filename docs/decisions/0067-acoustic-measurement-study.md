@@ -6,6 +6,8 @@
 - **Supersedes**: [0045](0045-local-socket-write-entry.md) §2.4 のメッセージの表のうち、
   (1) `type` 行の受理する種類の列挙（「`gpu_mode` のみ受理する」）と、(2) フィールドの表が `type` によらず
   1つであるという前提。本記録は `noise_feedback` を受理する種類に加え、その種類で許すフィールドを §2.2 の表で定める。
+  置き換えた後に受理する種類は **`gpu_mode`・`workload_hint`（0064 §2.1。有効のまま）・`noise_feedback`** の3つで、
+  本記録は 0064 の追加を取り消さない。
   **未知のフィールドを拒む（`extra = forbid`）・strict・`v` は `1` のみ**という 0045 §2.4 の規則は種類ごとに
   そのまま適用する。0045 の他の節（入口・認可・保存の形・`peer_uid`）は有効
 - **関連**: [0009](0009-read-api.md) §3（GET-only） / [0026](0026-three-zone-fan-control.md) /
