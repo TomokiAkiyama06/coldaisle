@@ -29,7 +29,7 @@ from collections.abc import Iterable, Mapping, Sequence
 from random import Random
 from typing import Literal, Self
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, NonNegativeInt, model_validator
 
 from coldaisle.control.config import SupervisorOutputBounds
 from coldaisle.control.model.thermal import canonical_sha256
@@ -351,7 +351,7 @@ class SupervisorPolicyTrainingReport(_Frozen):
     """
     comparison: PolicyComparison
     """Rule baseline と選ばれた候補の2 arm 比較。条件・母集団は arm 間で揃っている。"""
-    common_matched_steps: dict[str, int] = Field(default_factory=dict)
+    common_matched_steps: dict[str, NonNegativeInt] = Field(default_factory=dict)
     """episode ごとの、**すべての arm が採点できた step 数**（最小）。
 
     候補の順位はこの長さの上だけで決める。hash では読めないので欄としても残す
@@ -476,19 +476,13 @@ class SupervisorPolicyTrainingReport(_Frozen):
         # 表: 選ばれた候補として評価した表と、artifact の表が同じものであること。
         if manifest.payload_sha256 != selected.table_sha256:
             raise ValueError("artifact の表が選ばれた候補として評価した表と一致しない")
-        for episode in selected_arm.episodes:
-            for step in episode.steps:
-                entry = self.artifact.entry(step.regime)
-                if (entry.strategy, entry.weights, entry.target_band) != (
-                    step.action.strategy,
-                    step.action.weights,
-                    step.action.target_band,
-                ):
-                    # 評価中に実際に出した action を、artifact の表が再現しなければならない。
-                    raise ValueError(
-                        "artifact の表が、選ばれた候補の episode で出した action を再現しない"
-                        f"（{episode.episode_id}; step={step.step_index}）"
-                    )
+        mismatch = first_unreplayed_step(self.artifact.payload, selected_arm)
+        if mismatch is not None:
+            # 評価中に実際に出した action を、artifact の表が再現しなければならない。
+            raise ValueError(
+                "artifact の表が、選ばれた候補の episode で出した action を再現しない"
+                f"（{mismatch}）"
+            )
         # 候補の版: `<model_id>-<候補識別子>`。選ばれた arm はその版で回した arm であること。
         for outcome in self.outcomes:
             if outcome.policy_version != f"{manifest.model_id}-{outcome.candidate_id}":
@@ -695,6 +689,24 @@ def scoring_horizon(
 def _rank_value(mean: float | None) -> float:
     """reward を出せない arm を勝たせないための順位値。"""
     return math.inf if mean is None else -mean
+
+
+def first_unreplayed_step(table: RegimeTablePayload, arm: PolicyArm) -> str | None:
+    """`arm` が記録した step の action を `table` が再現しない最初の step（無ければ `None`）。
+
+    表は regime → 戦略の写像なので、各 step の regime に対する表の欄が、その step で
+    実際に出した action と一致するはずである。報告の中の照合と `certify()` が同じ関数を使う。
+    """
+    for episode in arm.episodes:
+        for step in episode.steps:
+            entry = table.entry(step.regime)
+            if (entry.strategy, entry.weights, entry.target_band) != (
+                step.action.strategy,
+                step.action.weights,
+                step.action.target_band,
+            ):
+                return f"{episode.episode_id}; step={step.step_index}"
+    return None
 
 
 def _replace_entry(
@@ -915,6 +927,21 @@ class SupervisorPolicyTrainer:
         if report.baseline_policy_version != self._rule_policy.version:
             raise SupervisorPolicyTrainingError("報告の Baseline がこの Rule policy ではない")
         baseline = self.baseline_table()
+        baseline_arm = report.comparison.arms[0]
+        if (baseline_arm.policy, baseline_arm.policy_version) != (
+            SupervisorPolicyKind.RULE,
+            self._rule_policy.version,
+        ):
+            raise SupervisorPolicyTrainingError(
+                "報告の Baseline arm がこの Rule policy の arm ではない"
+            )
+        mismatch = first_unreplayed_step(baseline, baseline_arm)
+        if mismatch is not None:
+            # **版だけでは Baseline を特定できない。** 同じ版を名乗る別の Rule policy の arm を
+            # 比較に入れた報告を、この Rule policy の結果として通さない。
+            raise SupervisorPolicyTrainingError(
+                f"報告の Baseline arm の action を、この Rule policy の表が再現しない（{mismatch}）"
+            )
         pool = self._action_pool()
         if len(report.outcomes) != self._projected_candidate_count(baseline):
             raise SupervisorPolicyTrainingError("報告の候補数がこの設定から数えた数と一致しない")

@@ -1108,6 +1108,38 @@ def test_registration_accepts_only_a_certified_artifact(trained: Any) -> None:
         certified._artifact = report.artifact  # type: ignore[misc]
 
 
+def test_certify_replays_the_baseline_arm_against_the_rule_policy(trained: Any) -> None:
+    """**Baseline は版ではなく、出した action で照合する。**
+
+    同じ版を名乗る別の Rule policy の arm を比較に入れた報告は、報告としては読めても、
+    この Rule policy の表が arm の action を再現しないので `certify()` が拒む。
+    """
+    environment, _config, settings, _safety = build_environment(trained, with_mpc=False)
+    trainer = trainer_for(environment, settings)
+    report = trainer.train(
+        (episode_spec(episode_id="pr89-a", seed=3),), model_version="0.1.0", created_at=CREATED_AT
+    )
+    assert trainer.certify(report).artifact == report.artifact
+
+    document = json.loads(report.model_dump_json())
+    step = document["comparison"]["arms"][0]["episodes"][0]["steps"][0]
+    step["action"]["weights"]["change"] = step["action"]["weights"]["change"] * 0.5
+    forged = SupervisorPolicyTrainingReport.model_validate_json(json.dumps(document))
+    with pytest.raises(SupervisorPolicyTrainingError, match="Baseline arm の action"):
+        trainer.certify(forged)
+
+
+def test_summary_counts_are_never_negative() -> None:
+    """**件数は負にならない。** 負の内訳で合計だけを合わせた集計を受け取らない。"""
+    ledger = ledger_for()
+    ledger.observe(missing_rl_decision(tick_id=1))
+    document = json.loads(ledger.summary().model_dump_json())
+    assert document["rl_errors"] == {"supervisor_expired": 1}
+    document["rl_errors"] = {"supervisor_expired": 2, "supervisor_unavailable": -1}
+    with pytest.raises(ValidationError, match="greater than or equal to 0"):
+        SupervisorShadowSummary.model_validate_json(json.dumps(document))
+
+
 def test_supervisor_decision_v2_carries_identity_and_v1_still_reads() -> None:
     """**識別を足した decision は版を上げる。** 保存済みの v1 はそのまま読める。"""
     decision = paired_decision(tick_id=1)

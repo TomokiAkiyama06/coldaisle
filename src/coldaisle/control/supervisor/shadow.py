@@ -19,7 +19,7 @@ from __future__ import annotations
 
 from typing import Literal, Self
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, NonNegativeInt, model_validator
 
 from coldaisle.control.model.thermal import canonical_sha256
 from coldaisle.control.schema import (
@@ -119,7 +119,7 @@ class SupervisorShadowSummary(_Frozen):
     Rule 側の欠落へ畳むと、同じ tick の RL の欠落が内訳から消え、Rule も落ちていた間の
     RL worker の停止が見えなくなる。どちらの事実も残すため別の欄にする。
     """
-    rl_errors: dict[str, int] = Field(default_factory=dict)
+    rl_errors: dict[str, NonNegativeInt] = Field(default_factory=dict)
     """RL の提案が無かった理由の内訳（`Reason.code` ごと）。
 
     `rl_unavailable_ticks` と `both_unavailable_ticks` の**両方**を数える。

@@ -297,7 +297,9 @@ shadow:   { minimum_ticks, minimum_paired_fraction }
     から artifact を返し、登録はこれを通したものだけにする
     - manifest の `rl_policy_config_sha256` / `rl_training_config_sha256` /
       `action_space_sha256` / `reward_version` / `model_id` と報告の探索条件が、渡した設定と
-      一致する（別の設定で作り直させない）。Baseline の版が渡した Rule policy の版と一致する
+      一致する（別の設定で作り直させない）。Baseline の版が渡した Rule policy の版と一致し、
+      **比較の Baseline arm が記録した action を、その Rule policy の表がすべて再現する**
+      （版だけでは同じ版を名乗る別の Rule policy を区別できない）
     - すべての候補の識別子がこの設定で作れ、`table_sha256` が作り直した表の hash と一致し、
       候補数が設定から数えた数と一致する
     - 選ばれた候補の作り直した表が、artifact の表・`payload_sha256` と一致する
@@ -311,6 +313,8 @@ shadow:   { minimum_ticks, minimum_paired_fraction }
     kind を問わず metadata と payload をそのまま受け取る。そこから照合していない policy
     artifact を書く経路は残る。CLI 側で supervisor policy の登録に照合を要求するかは
     0062（FINAL）の契約を広げる話なので、**所有者の判断**とする（§5）
+- 集計の件数（理由別の内訳 `rl_errors` を含む）は**すべて 0 以上**。負の内訳で合計だけを
+  合わせた集計を受け取らない
 - 集計の digest は #104 の `shadow_evaluation_ref` にそのまま渡せる。ただし **`usable` でない集計は
   参照を出さない**（`evaluation_ref()` が拒む。#104 の `promote()` は参照が空でないことしか見ない）
 
