@@ -76,8 +76,10 @@
 - **前後関係と区間の長さは壁時計で決めない。** 壁時計（`ts_ms`）は戻りうるので、同じ時刻の範囲を2度通ると
   どちらが先か決められない（trace・readings・回答のどれでも同じ）。そこで、回答（`events`）・decision trace・
   readings の各行に、書いた時点の **boot id（起動ごとの識別。Linux の `/proc/sys/kernel/random/boot_id`）と
-  単調時計（`CLOCK_MONOTONIC`）の値**を持たせ、以下の「以前」「最も新しい」「lookback 区間」「途切れ」は
-  すべて**同じ boot id の中の単調時計**で判定する。単調時計は壁時計の修正で戻らない
+  単調時計（**`CLOCK_BOOTTIME`**）の値**を持たせ、以下の「以前」「最も新しい」「lookback 区間」「途切れ」は
+  すべて**同じ boot id の中の単調時計**で判定する。単調時計は壁時計の修正で戻らない。
+  `CLOCK_MONOTONIC` は suspend 中に進まず、suspend をはさんだ区間の長さや途切れを短く見積もるので使わない
+  （本記録で「単調時計」と書くときは `CLOCK_BOOTTIME` を指す）
   - 回答と同じ boot id を持たない trace / readings は、その回答の結びつけと静かな条件に使わない
     （再起動をまたいだ前後関係は決められないため）
   - boot id と単調時計を持たない行（これを足す前の行）しか無い回答は「状態不明」とする
