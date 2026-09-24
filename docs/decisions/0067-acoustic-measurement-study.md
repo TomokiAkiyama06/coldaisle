@@ -83,9 +83,15 @@
 - **結びつけは decision trace が消える前に行い、結果を残す。** decision trace の保持は 30 日
   （`config/retention.yaml` の `control_trace_days`。決定記録 0030）で、`events` は無期限である。
   集計の時点でまとめて突き合わせると、30 日より前の回答は tick も lookback も失って全部捨てることになる。
-  そこで、回答と tick の突き合わせ（結びついた effective の Demand・RPM・lookback の判定）を
+  そこで、回答と tick の突き合わせを
   **定期的に（ロールアップと同じ日次で、保持期間の削除より前に）実行し、結果を無期限の記録として残す**。
   下限の集計は、この残した結果だけを読む。保持期間そのものは変えない
+- 残す結果には、**後から分類に要る値をすべて含める**（元の trace と readings は 30 日で消えるため）
+  - 回答の `value` / `sampling` と時刻
+  - 結びついた tick の各 Zone の effective の Demand と RPM、lookback の判定
+  - その tick の運転モード（`AUTO` / `CALIBRATION` など。§2.5 の段階確認を普段の回答と分けるため）
+  - 分けて集計する条件の元の値: CPU / GPU の Power と `gpu.0.fan_speed`（lookback 区間の値。
+    高負荷かどうかの判定の閾値は集計の設定に置き、判定そのものではなく元の値を残す）
 - 突き合わせる前に trace が消えた回答は「状態不明」として数を残し、集計には使わない
 - CPU / GPU が高負荷のとき、GPU 本体の Fan（`gpu.0.fan_speed`）が回っているときの回答は、
   coldaisle が変えられない音の可能性があるので**分けて集計する**
@@ -94,7 +100,12 @@
 
 ### 2.5 意図的に確かめる補助の方法
 
-普段の回答だけでは、高い Demand の状態がなかなか現れない。補助として、所有者が
+**この方法は、いまは実施できない。** `coldaisle-fand` は運転モードを固定で持ち
+（`StaticOperatingMode`）、`CALIBRATION` へ切り替えて Zone ごとの requested を渡す入口がまだ無い。
+入口は 0028 §2.2 の「モード変更はローカル Unix ソケットだけ」に沿って別の Issue / 決定記録で作る。
+それまでは §2.1 の回答（定時・気づいたとき）だけで進める。
+
+普段の回答だけでは、高い Demand の状態がなかなか現れない。補助として、入口ができた後に、所有者が
 `coldaisle-fand` の `CALIBRATION` モードで1つの Zone ずつ Demand を段階的に上げ、
 各段で `noise_feedback` を答えてよい。各段では必ず答えるので `sampling: prompted` とする。
 
@@ -128,6 +139,8 @@
 
 - `noise_feedback`（`value` / `sampling`）を 0045 の許可リストへ足すこと、回答と trace の日次の
   突き合わせと結果の保存（§2.4）、下限の集計、その設定ファイルは、本記録の承認後に別 Issue で実装する
+- §2.5 の段階確認に要る `coldaisle-fand` のモード・requested の入口（0028 §2.2）も、別 Issue で作る。
+  入口ができるまで §2.5 は実施しない
 
 ## 3. Consequences
 
