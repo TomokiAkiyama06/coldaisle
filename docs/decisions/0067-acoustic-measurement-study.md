@@ -267,8 +267,9 @@
     `INSERT OR IGNORE` なので、再起動と時計の逆行が重なって同じ組が再び現れると、新しい trace は
     run id と連番を持つ前に捨てられる。**一意の鍵を新しい識別（run id と連番）に置き換える**必要がある
   - これは 0030 の主キーの契約を変えるので、本記録では決めない。実装 Issue で 0030 の該当箇所を
-    `Supersedes` する新しい決定記録を作り、承認を得てから migration を入れる（本記録の `Supersedes` は
-    「なし」のまま）。その記録が承認されるまで、§2.4 の突き合わせは動かさない
+    `Supersedes` する新しい決定記録を作り、承認を得てから migration を入れる（本記録は 0030 を置き換えない。
+    本記録が置き換えるのは冒頭の 0045 §2.4 の受理する種類の列挙だけ）。その記録が承認されるまで、
+    §2.4 の突き合わせは動かさない
   - trace に tick の backend の種類と読み戻しの成否、**各 Zone の backend が返した生の故障**
     （`FanHardwareResult.fault`）を残す（§2.4 の実機と故障の条件）。いまの trace は `HardwareReadback` だけを
     残し、backend の故障は次の tick へ回されたうえ、Critical Safety は `stall_window_ms` が過ぎるまで
