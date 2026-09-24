@@ -94,7 +94,8 @@
     これが trace に記録されていない間は、どの回答も当てはめに使わない
   - 書き込みと読み戻しが成功していても、Fan が回っているとは限らない（`HardwareReadback` は `rpm` を
     `write_ok` / `readback_ok` と別に持ち、tach stall では `rpm=0` のまま両方が成功しうる）。そこで lookback 区間の
-    すべての tick で、各 Zone の **tach の RPM が有効で、`TACH_STALL` などの Fan の故障が出ていない**ことも求める。
+    すべての tick で、各 Zone の **tach の RPM が有効で、`TACH_STALL` などの Fan の故障が出ていない**ことも求める
+    （故障は Critical Safety の判定後の `ControlTick.faults` ではなく、backend が返した生の故障で見る。§2.8）。
     止まった Fan の「高い Demand で `ok`」を数えると、曲線を低く見積もってしまうため。満たさない回答は
     当てはめに使わず、残す結果にもこの判定（RPM の有効性と故障の有無）を残す
 
@@ -264,7 +265,11 @@
   - これは 0030 の主キーの契約を変えるので、本記録では決めない。実装 Issue で 0030 の該当箇所を
     `Supersedes` する新しい決定記録を作り、承認を得てから migration を入れる（本記録の `Supersedes` は
     「なし」のまま）。その記録が承認されるまで、§2.4 の突き合わせは動かさない
-  - trace に tick の backend の種類と読み戻しの成否を残す（§2.4 の実機の条件）。いまの `coldaisle-fand` は
+  - trace に tick の backend の種類と読み戻しの成否、**各 Zone の backend が返した生の故障**
+    （`FanHardwareResult.fault`）を残す（§2.4 の実機と故障の条件）。いまの trace は `HardwareReadback` だけを
+    残し、backend の故障は次の tick へ回されたうえ、Critical Safety は `stall_window_ms` が過ぎるまで
+    stall を出さないので、`ControlTick.faults` が空でも lookback の中で故障が起きていたことがある。
+    §2.4 の故障の条件は `ControlTick.faults` ではなく、この生の故障で判定する。いまの `coldaisle-fand` は
     `SimulatedFanBackend` だけで、実機の backend は #57 / #75 のあとなので、それまでの回答は当てはめに使えない
   - 回答・trace・readings の各行に boot id と単調時計の値を足す（§2.4 の前後関係の鍵。`events` は 0045、
     trace は 0030、readings は既存の store の契約に列を足すことになるので、これも同じ新しい決定記録で扱う）
