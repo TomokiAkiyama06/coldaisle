@@ -1,0 +1,68 @@
+# Compute Mode 切替アドバイザリ（#68 / 決定記録 0063）
+#
+# **助言だけを作る設定です。** ここの値で切替を止めることはありません
+# （`compute_mode_advisory.blocking` は型で常に false。決定 D-08）。
+#
+# **ここが唯一の情報源です。** コード側に既定値を持たせないでください
+# （AGENTS.md「絶対に守るルール」9）。
+#
+# しきい値は **すべて暫定値** です。#50（RTX PRO 6000 の実測）と #19 の
+# ベースライン測定が揃ったら、所有者が決定記録 0063 §5 に従って見直します。
+
+version: 1
+
+# 切替直前に提示する「いまの環境条件」。
+current:
+  # この時間より古い値は判断材料に使わない（`usable: false`）。
+  # quality の stale 判定（config/quality.yaml の stale_after_ms = 10s）より
+  # 緩いのは、切替の判断に使うのが1サンプルではなく直近の状況だからです。
+  max_age_s: 60.0
+
+  # 表示する条件。advisory_max を超えたら警告し、warn_delta は
+  # 過去のフルロード実績との差の警告に使います。どちらも省略できます。
+  conditions:
+    - metric: air.room
+      advisory_max: 30.0 # 暫定。室温の上限は #19 の実測後に決める
+      warn_delta: 2.0 # 暫定。前回フルロード時よりこれ以上高ければ警告
+    - metric: air.gpu_intake
+      advisory_max: 32.0 # 暫定
+      warn_delta: 2.0 # 暫定
+    - metric: air.room_humidity
+      advisory_max: 65.0 # 暫定。結露リスクの閾値は未測定（0063 §5）
+      warn_delta: 10.0 # 暫定
+
+# 過去の「実測されたフルロード」との比較。
+# **GPU Mode の申告（events / sys.gpu_mode）は根拠にしません**（決定記録 0045 §2.6）。
+# 観測された電力だけからフルロード期間を導きます。
+history:
+  # さかのぼる日数。生データの保持は 30 日（config/retention.yaml）で、
+  # 1分・1時間のロールアップは無期限です（FR-204）。
+  lookback_days: 30
+
+  # 判定に使うバケット幅（1m / 5m / 1h）。生データを1件ずつ見ないのは、
+  # この payload が WebSocket で毎秒組み立てられるためです。
+  bucket: 5m
+
+  # 履歴部分を作り直す間隔。同じ間隔の中では同じ結果を返します
+  # （結果に evaluated_at を入れて「いつ時点か」を隠しません）。
+  refresh_s: 300
+
+  load:
+    # フルロードかどうかを決める観測値。
+    metric: power.gpu.0
+    # バケット平均がこの値以上ならフルロードとみなす（W）。
+    # 暫定。RTX PRO 6000 の TGP 600W に対する概ね 2/3。#50 の実測後に見直す
+    min_value: 400.0
+    # そのバケットに quality=ok の値がこれだけ無ければ、根拠として数えない。
+    # 取り込み周期 2500ms なら5分で 120 サンプル。その半分を下限とする（暫定）
+    min_ok_samples: 60
+    # 実測が continuous にこれだけ続いて初めて「フルロード実績」とする（秒）
+    min_duration_s: 900
+    # この長さまでの欠落は同じ期間として繋ぐ（秒）。繋いでも、
+    # 継続時間は欠落を含めず「観測できたバケットの合計」で数える
+    max_gap_s: 300
+
+  # 参照時の最高温度として出す metric。実機の NVML は hotspot を公開しないため
+  # core を使う（決定記録 0040 §2.5 / config/server-health.yaml の missing_tolerated）
+  peak_metrics:
+    - gpu.0.core
