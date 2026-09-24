@@ -115,7 +115,12 @@ from coldaisle.control.supervisor.regime import (
     WorkloadRegimeEstimate,
 )
 from coldaisle.control.supervisor.rl_policy import ARTIFACT_DETERMINED_METADATA_EXCLUSIONS
-from coldaisle.control.supervisor.rule_identity import RulePolicyIdentity, rule_policy_identity
+from coldaisle.control.supervisor.rule_identity import (
+    RulePolicyTable,
+    RulePolicyTableEntry,
+    rule_policy_identity,
+    rule_policy_table,
+)
 from coldaisle.control.supervisor.shadow import SupervisorShadowSummary, shadow_summary_usable
 from test_learned_mpc import REGISTRY_LIMITS, mpc_policy
 from test_rl_training_environment import build_environment, episode_spec
@@ -127,8 +132,6 @@ trained = _trained_fixture
 
 CREATED_AT = "2026-09-21T10:00:00+09:00"
 CONDITIONS = "a" * 64
-RULE_IDENTITY = RulePolicyIdentity(version="rule-test-v1", table_sha256="f" * 64)
-"""試験の台帳が束縛する Rule policy の識別（台帳の試験は表の中身を見ない）。"""
 RL_IDENTITY = SupervisorPolicyIdentity(
     model_id="rl-supervisor-test", version="0.1.0", artifact_sha256="d" * 64
 )
@@ -790,6 +793,25 @@ def test_invariant_13_the_ledger_binds_versions_and_reads_time_from_evidence() -
     assert empty.first_ts_ms is None and empty.paired_fraction is None and empty.usable is False
 
 
+def test_invariant_13_g_rule_outputs_must_match_the_bound_table() -> None:
+    """**台帳は Rule の表に束縛する。** 同じ版の別の表が出した提案を今の digest で数えない。"""
+    table = ledger_rule_table()
+    stale_entry = table.entry(WorkloadRegime.SUSTAINED_GPU).model_copy(
+        update={"weights": weights(acoustic=0.1, change=0.9)}
+    )
+    ledger = ledger_for()
+    with pytest.raises(SupervisorShadowUsageError, match="束縛した表と一致しない"):
+        ledger.observe(paired_decision(tick_id=1, rule_entry=stale_entry))
+    # 受け取らなかった tick は数えない。
+    assert ledger.summary().observed_ticks == 0
+
+    for tick in range(4):
+        ledger.observe(paired_decision(tick_id=tick))
+    summary = ledger.summary()
+    assert summary.usable is True
+    assert summary.rule_policy_identity == table.identity
+
+
 def test_invariant_13_f_an_unusable_summary_issues_no_evaluation_ref() -> None:
     """**下限を満たさない集計は昇格の証拠にならない。** `shadow_evaluation_ref` を出さない。"""
     ledger = ledger_for()
@@ -830,7 +852,7 @@ def test_invariant_13_b_rule_and_rl_may_share_a_version_string() -> None:
     config, _digest = rl_policy_config()
     ledger = SupervisorShadowLedger(
         config.shadow,
-        rule_identity=RULE_IDENTITY.model_copy(update={"version": "0.1.0"}),
+        rule_table=ledger_rule_table("0.1.0"),
         rl_identity=RL_IDENTITY,
     )
     ledger.observe(paired_decision(tick_id=1, rule_version="0.1.0"))
@@ -885,7 +907,7 @@ def test_invariant_13_d_an_unpaired_ledger_is_never_usable() -> None:
             ),
         }
     )
-    ledger = SupervisorShadowLedger(zero, rule_identity=RULE_IDENTITY, rl_identity=RL_IDENTITY)
+    ledger = SupervisorShadowLedger(zero, rule_table=ledger_rule_table(), rl_identity=RL_IDENTITY)
     ledger.observe(missing_rl_decision(tick_id=1))
     with pytest.raises(ValidationError, match="minimum_ticks"):
         ledger.summary()
@@ -1194,25 +1216,25 @@ def test_shadow_evidence_is_bound_to_the_promoted_artifact(tmp_path: Path, train
                 update={"weights": output.weights.model_copy(update={"change": 0.0})}
             )
 
-    current_rule = rule_policy_identity(rule_policy)
-    other_contexts = rule_policy_identity(SameVersionOtherContexts())
+    current_rule = rule_policy_table(rule_policy)
+    other_contexts = rule_policy_table(SameVersionOtherContexts())
     assert other_contexts.version == current_rule.version
-    assert other_contexts.table_sha256 != current_rule.table_sha256
+    assert other_contexts.identity.table_sha256 != current_rule.identity.table_sha256
+    assert rule_policy_identity(rule_policy) == current_rule.identity
 
     def usable_summary(
-        rl_identity: SupervisorPolicyIdentity, rule_identity: RulePolicyIdentity = current_rule
+        rl_identity: SupervisorPolicyIdentity, table: RulePolicyTable = current_rule
     ) -> SupervisorShadowSummary:
         config, _digest = rl_policy_config()
-        ledger = SupervisorShadowLedger(
-            config.shadow, rule_identity=rule_identity, rl_identity=rl_identity
-        )
+        ledger = SupervisorShadowLedger(config.shadow, rule_table=table, rl_identity=rl_identity)
         for tick in range(4):
             ledger.observe(
                 paired_decision(
                     tick_id=tick,
-                    rule_version=rule_identity.version,
+                    rule_version=table.version,
                     rl_version=rl_identity.version,
                     rl_identity=rl_identity,
+                    rule_entry=table.entry(WorkloadRegime.SUSTAINED_GPU),
                 )
             )
         summary = ledger.summary()
@@ -1500,7 +1522,7 @@ def test_invariant_21_shadow_evidence_carries_the_full_artifact_identity(
     # 別の identity の集計は digest（= shadow_evaluation_ref）も別になる。
     other_ledger = SupervisorShadowLedger(
         rl_policy_config()[0].shadow,
-        rule_identity=RULE_IDENTITY,
+        rule_table=ledger_rule_table(),
         rl_identity=RL_IDENTITY.model_copy(update={"artifact_sha256": "e" * 64}),
     )
     assert other_ledger.summary().digest() != ledger_for().summary().digest()
@@ -2302,7 +2324,20 @@ def shadow_settings(settings: FanPolicyConfig, *, rl_version: str) -> FanPolicyC
 def ledger_for() -> SupervisorShadowLedger:
     config, _digest = rl_policy_config()
     return SupervisorShadowLedger(
-        config.shadow, rule_identity=RULE_IDENTITY, rl_identity=RL_IDENTITY
+        config.shadow, rule_table=ledger_rule_table(), rl_identity=RL_IDENTITY
+    )
+
+
+def ledger_rule_table(version: str = "rule-test-v1") -> RulePolicyTable:
+    """試験の台帳が束縛する Rule policy の表。`paired_decision()` の Rule 出力と一致する。"""
+    return RulePolicyTable(
+        version=version,
+        entries=tuple(
+            RulePolicyTableEntry(
+                regime=regime, strategy="balanced", weights=weights(), target_band=target_band()
+            )
+            for regime in sorted(WorkloadRegime, key=lambda item: item.value)
+        ),
     )
 
 
@@ -2314,6 +2349,8 @@ def supervisor_output(
     version: str,
     regime: WorkloadRegime,
     strategy: str,
+    output_weights: SupervisorObjectiveWeights | None = None,
+    output_band: SupervisorTargetBand | None = None,
 ) -> SupervisorOutput:
     return SupervisorOutput(
         snapshot_schema_version=1,
@@ -2323,9 +2360,9 @@ def supervisor_output(
         version=version,
         regime=regime,
         regime_confidence=0.9,
-        weights=weights(),
+        weights=output_weights or weights(),
         strategy=strategy,
-        target_band=target_band(),
+        target_band=output_band or target_band(),
         computed_at_ms=ts_ms,
     )
 
@@ -2339,7 +2376,9 @@ def paired_decision(
     rl_strategy: str = "balanced",
     rl_regime: WorkloadRegime = WorkloadRegime.SUSTAINED_GPU,
     rl_identity: SupervisorPolicyIdentity | None = RL_IDENTITY,
+    rule_entry: RulePolicyTableEntry | None = None,
 ) -> SupervisorDecision:
+    """Rule（active）と RL（shadow）の対。`rule_entry` を渡すと Rule 出力をその欄にする。"""
     return SupervisorDecision(
         tick_id=tick_id,
         ts_ms=ts_ms,
@@ -2352,7 +2391,9 @@ def paired_decision(
                 policy=SupervisorPolicyKind.RULE,
                 version=rule_version,
                 regime=WorkloadRegime.SUSTAINED_GPU,
-                strategy="balanced",
+                strategy="balanced" if rule_entry is None else rule_entry.strategy,
+                output_weights=None if rule_entry is None else rule_entry.weights,
+                output_band=None if rule_entry is None else rule_entry.target_band,
             ),
         ),
         shadow=SupervisorPolicyEvaluation(

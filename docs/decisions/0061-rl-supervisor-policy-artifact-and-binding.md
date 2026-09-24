@@ -336,8 +336,11 @@ shadow:   { minimum_ticks, minimum_paired_fraction }
     canonical SHA-256）で、版だけでは同じ版で context の違う Rule を区別できない
     （`RulePolicyConfig` はそれを許す）。古い表と比べた集計を、いまの Rule を上回った証拠として
     記録させない
-  - 台帳（`SupervisorShadowLedger`）は Rule 側も完全な識別を束縛し（`rule_identity`）、集計に
-    書く。集計の版は 1 → 2 に上げ（`SUPERVISOR_SHADOW_SCHEMA_VERSION`）、**Rule の識別を
+  - 台帳（`SupervisorShadowLedger`）は Rule 側を**表そのもの**（`rule_policy_table()` が
+    作る `RulePolicyTable`）に束縛し、集計にはその表から導いた識別を書く。観測した Rule の出力は
+    表の欄（その regime の strategy・weights・target band）と照合し、一致しない提案は
+    **受け取らない**（`SupervisorShadowUsageError`。数えない）。識別だけを渡すと、同じ版の
+    古い表が出した提案に今の digest を付けてしまうためである。集計の版は 1 → 2 に上げ（`SUPERVISOR_SHADOW_SCHEMA_VERSION`）、**Rule の識別を
     持たない v1 の集計は昇格の証拠にしない**（`evaluation_ref()` が拒む。fail closed）
   - #104 の `promote()` を直接呼ぶ経路は残る（0062 の契約。§5 の Registry CLI と同じ残余）
 

@@ -11,7 +11,9 @@ policy は別の識別になる。
 
 from __future__ import annotations
 
-from pydantic import BaseModel, ConfigDict, Field
+from typing import Self
+
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from coldaisle.control.model.thermal import canonical_sha256
 from coldaisle.control.schema import (
@@ -41,15 +43,52 @@ class RulePolicyIdentity(_Frozen):
     """regime ごとに policy へ聞いた戦略（strategy・weights・target band）の表の digest。"""
 
 
-class _RuleTableEntry(_Frozen):
+class RulePolicyTableEntry(_Frozen):
+    """1 regime に対して Rule policy が返す戦略。"""
+
     regime: WorkloadRegime
-    strategy: str
+    strategy: str = Field(pattern=r"^[a-z][a-z0-9_]*$", max_length=64)
     weights: SupervisorObjectiveWeights
     target_band: SupervisorTargetBand
 
 
 class _RuleTable(_Frozen):
-    entries: tuple[_RuleTableEntry, ...]
+    entries: tuple[RulePolicyTableEntry, ...]
+
+
+class RulePolicyTable(_Frozen):
+    """Rule policy の**表そのもの**（版 + regime ごとの戦略）。識別はこの表から導く。
+
+    shadow の台帳はこの表に束縛し、観測した Rule の出力が表の欄と一致することを確かめる
+    （識別だけを渡すと、同じ版の古い表の出力に今の digest を付けてしまう）。
+    """
+
+    version: str = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9_.-]*$", max_length=120)
+    entries: tuple[RulePolicyTableEntry, ...] = Field(
+        min_length=len(WorkloadRegime), max_length=len(WorkloadRegime)
+    )
+
+    @model_validator(mode="after")
+    def _one_entry_per_regime_in_order(self) -> Self:
+        expected = tuple(sorted(WorkloadRegime, key=lambda item: item.value))
+        if tuple(entry.regime for entry in self.entries) != expected:
+            raise ValueError("Rule policy の表は全 regime を1つずつ、値の昇順に持つ")
+        return self
+
+    def entry(self, regime: WorkloadRegime) -> RulePolicyTableEntry:
+        """regime に対応する欄。"""
+        for item in self.entries:
+            if item.regime is regime:
+                return item
+        raise KeyError(regime)  # pragma: no cover - validator が全 regime を保証する
+
+    @property
+    def identity(self) -> RulePolicyIdentity:
+        """版と表の digest からなる完全な識別。"""
+        return RulePolicyIdentity(
+            version=self.version,
+            table_sha256=canonical_sha256(_RuleTable(entries=self.entries)),
+        )
 
 
 def rule_probe_input(regime: WorkloadRegime) -> SupervisorInput:
@@ -82,13 +121,18 @@ def rule_probe_input(regime: WorkloadRegime) -> SupervisorInput:
 
 
 def rule_policy_identity(policy: SupervisorPolicy) -> RulePolicyIdentity:
-    """Rule policy に regime ごとの戦略を聞き、版と表の digest から識別を作る。
+    """Rule policy に regime ごとの戦略を聞き、版と表の digest から識別を作る。"""
+    return rule_policy_table(policy).identity
+
+
+def rule_policy_table(policy: SupervisorPolicy) -> RulePolicyTable:
+    """Rule policy に regime ごとの戦略を聞いて表を作る。
 
     Rule 以外の policy、聞いたのと違う regime を返す policy は拒む。
     """
     if policy.kind is not SupervisorPolicyKind.RULE:
         raise TypeError("Rule policy の識別は RulePolicy からだけ作る")
-    entries: list[_RuleTableEntry] = []
+    entries: list[RulePolicyTableEntry] = []
     for regime in sorted(WorkloadRegime, key=lambda item: item.value):
         output = policy.propose(rule_probe_input(regime))
         if output.policy is not SupervisorPolicyKind.RULE:
@@ -98,14 +142,11 @@ def rule_policy_identity(policy: SupervisorPolicy) -> RulePolicyIdentity:
                 f"Rule policy が聞いたのと違う regime を返した（{output.regime.value}）"
             )
         entries.append(
-            _RuleTableEntry(
+            RulePolicyTableEntry(
                 regime=regime,
                 strategy=output.strategy,
                 weights=output.weights,
                 target_band=output.target_band,
             )
         )
-    return RulePolicyIdentity(
-        version=policy.version,
-        table_sha256=canonical_sha256(_RuleTable(entries=tuple(entries))),
-    )
+    return RulePolicyTable(version=policy.version, entries=tuple(entries))

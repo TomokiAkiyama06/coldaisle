@@ -31,7 +31,7 @@ from coldaisle.control.schema import (
     WorkloadRegime,
 )
 from coldaisle.control.supervisor.policy_config import PolicyShadowConfig
-from coldaisle.control.supervisor.rule_identity import RulePolicyIdentity
+from coldaisle.control.supervisor.rule_identity import RulePolicyIdentity, RulePolicyTable
 
 SUPERVISOR_SHADOW_SCHEMA_VERSION: Literal[2] = 2
 """`SupervisorShadowSummary` の形の版。
@@ -258,6 +258,7 @@ class SupervisorShadowLedger:
         "_rl_identity",
         "_rl_unavailable",
         "_rule_identity",
+        "_rule_table",
         "_rule_unavailable",
         "_rule_version",
         "_seen",
@@ -271,18 +272,21 @@ class SupervisorShadowLedger:
         self,
         config: PolicyShadowConfig,
         *,
-        rule_identity: RulePolicyIdentity,
+        rule_table: RulePolicyTable,
         rl_identity: SupervisorPolicyIdentity,
     ) -> None:
-        """Rule policy と RL artifact の完全な識別を束縛する。**あとから混ぜられない。**
+        """Rule policy の**表**と RL artifact の完全な識別を束縛する。**あとから混ぜられない。**
 
-        Rule 側は版と表の digest（`rule_policy_identity()`）、RL 側は model ID・版・bytes hash。
+        Rule 側は表そのもの（`rule_policy_table()`）に束縛し、集計にはその表から導いた識別
+        （版 + 表の digest）を書く。観測した Rule の出力は表の欄と照合するので、同じ版の古い表の
+        出力に今の digest が付くことはない。RL 側は model ID・版・bytes hash。
         Rule と RL が同じ版文字列（例 `1.0.0`）を名乗ってもよい。版は policy kind ごとに
         別々に照合するので、取り違えない。
         """
         self._config = config
-        self._rule_identity = rule_identity
-        self._rule_version = rule_identity.version
+        self._rule_table = rule_table
+        self._rule_identity = rule_table.identity
+        self._rule_version = rule_table.version
         self._rl_identity = rl_identity
         self._seen: dict[int, str] = {}
         self._rule_unavailable = 0
@@ -365,6 +369,19 @@ class SupervisorShadowLedger:
                 f"Rule policy の版が台帳と違う（expected={self._rule_version};"
                 f" actual={rule_output.version}）"
             )
+        if rule_output is not None:
+            entry = self._rule_table.entry(rule_output.regime)
+            if (entry.strategy, entry.weights, entry.target_band) != (
+                rule_output.strategy,
+                rule_output.weights,
+                rule_output.target_band,
+            ):
+                # **版だけでなく表の中身まで照合する。** 同じ版の別の表（古い設定など）が出した
+                # 提案を、束縛した表の digest の下で数えない（fail closed。受け取らない）。
+                raise SupervisorShadowUsageError(
+                    "Rule policy の出力が台帳に束縛した表と一致しない"
+                    f"（regime={rule_output.regime.value}; version={rule_output.version}）"
+                )
         if rl_output is not None and rl_output.version != self._rl_identity.version:
             raise SupervisorShadowUsageError(
                 f"RL policy の版が台帳と違う（expected={self._rl_identity.version};"
