@@ -209,6 +209,15 @@ class ShadowRecorder:
         solution = learned.solution
         solved = proposal.optimizer_status is OptimizerStatus.OK
         attested = gate is not None and gate.attested and gate.inference_id == proposal.inference_id
+        # **裏づけがあるなら、Gate が照合し終えた artifact をそのまま使う**（#159 / 0059）。
+        # assessment の欄をそのまま写すと、Gate が束縛した attestation と照らしていない
+        # 値が counterfactual 側にだけ残る（codex #4057191721 と同じ型の穴）。
+        # 裏づけが無いときは照らす相手が無いので、`attested=False` の記録として残す
+        # （#91 は attested でない提案を実績に数えず、#92 は根拠にできない）。
+        artifact_sha256 = (
+            gate.artifact_sha256 if attested and gate is not None else assessment.artifact_sha256
+        )
+        assert artifact_sha256 is not None
         return ShadowCounterfactual(
             controller=ControllerKind.LEARNED_MPC,
             requested=_demands(proposal),
@@ -218,8 +227,8 @@ class ShadowRecorder:
             evaluations=None if solution is None else solution.evaluations,
             model_version=proposal.model_version,
             inference_id=proposal.inference_id,
-            # 版も hash も、提案と同じ推論に束ねられた assessment から取る（#85 の束縛）。
-            artifact_sha256=assessment.artifact_sha256,
+            # 版は提案と同じ推論に束ねられた assessment から、hash は Gate の照合結果から。
+            artifact_sha256=artifact_sha256,
             attested=attested,
             # **提案の自称値は使わない。** Gate が裏づけた値だけを残す。
             confidence=gate.confidence if attested and gate is not None else None,

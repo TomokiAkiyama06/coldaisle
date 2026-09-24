@@ -367,6 +367,8 @@ class Harness:
             or ControllerGate(
                 self.config.policy,
                 expected_model_version="thermal-vtest",
+                # Learned MPC の worker を配線しない構成（#159 / 決定記録 0059 §2.1）。
+                expected_artifact_sha256=None,
                 authority=self.authority,
             ),
             guard=guard or ReactiveGuard(self.config.policy.reactive_guard, catalog),
@@ -874,7 +876,10 @@ def test_invariant_10_a_gate_exception_keeps_control_and_is_recorded_next_tick(c
         catalog,
         config=config,
         gate=BrokenGate(
-            config.policy, expected_model_version="thermal-vtest", authority=StaticAuthority()
+            config.policy,
+            expected_model_version="thermal-vtest",
+            expected_artifact_sha256=None,
+            authority=StaticAuthority(),
         ),
     )
     harness.tick()

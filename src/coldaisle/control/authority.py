@@ -77,6 +77,7 @@ __all__ = [
     "AUTHORITY_STATE_FILENAME",
     "BASELINE_STAGE",
     "MAX_JOURNAL_EVENTS",
+    "MIN_EVIDENCE_REPORT_SCHEMA_VERSION",
     "STAGE_ORDER",
     "AuthorityApprovalError",
     "AuthorityChangeKind",
@@ -109,6 +110,14 @@ AUTHORITY_STATE_FILENAME = "authority.json"
 _LOCK_FILENAME = ".authority.lock"
 _MAX_JOURNAL_BYTES = 4 * 1024 * 1024
 """journal の読み書きに許す大きさ。資源の境界であり、調整値ではない。"""
+
+MIN_EVIDENCE_REPORT_SCHEMA_VERSION = 2
+"""昇格の証拠に使える Offline Evaluation 報告の最小 version（#159 / 決定記録 0059 §2.5）。
+
+v1 は適用 arm の `model_artifacts` / `unbound_attested_ticks` を持たない。欄の無さが
+「空・0」と読めてしまい、**artifact の完全性を言えない報告が「完全に束縛できた」ように
+見える**（codex #4057527950）。読むことはできるが、昇格の根拠にはしない。
+"""
 
 MAX_JOURNAL_EVENTS = 4_096
 """1つの journal に残す変更の件数。超えたら**昇格を拒む**（黙って古い記録を捨てない）。"""
@@ -328,6 +337,17 @@ class _ArmEvidence(_Frozen):
     いまの失敗を1つ足すだけで古い実績が「新鮮」に見えてしまう（codex #4057035287）。
     裏づけ（`attested`）のある提案が実在した時刻だけを新しさに使う。
     """
+    model_artifacts: tuple[str, ...] = ()
+    """**その arm が実際に適用した** model artifact（#159 / 決定記録 0059）。
+
+    適用側の arm にだけ付く（`AppliedArmReport.model_artifacts`）。counterfactual の arm は
+    報告全体の `model_artifacts` の照合で束縛されるので空のままである。
+    """
+    unbound_attested_ticks: int = Field(default=0, ge=0)
+    """その arm で、裏づけのある提案を適用したのに artifact を言えなかった tick の数。
+
+    **1件でもあれば束縛は完全ではない。** 部分的な証拠を完全として扱わない（fail closed）。
+    """
 
 
 def _holdout_arms(report: EvaluationReport) -> dict[str, _ArmEvidence]:
@@ -345,16 +365,34 @@ def _holdout_arms(report: EvaluationReport) -> dict[str, _ArmEvidence]:
     arms: dict[str, _ArmEvidence] = {}
 
     def observe(
-        key: str, arm: AppliedArm | CounterfactualArm, last_attested_ts_ms: int | None
+        key: str,
+        arm: AppliedArm | CounterfactualArm,
+        last_attested_ts_ms: int | None,
+        *,
+        model_artifacts: tuple[str, ...] = (),
+        unbound_attested_ticks: int = 0,
     ) -> None:
         current = arms.get(key)
-        if current is None:
-            arms[key] = _ArmEvidence(arm=arm, last_attested_ts_ms=last_attested_ts_ms)
-            return
-        if last_attested_ts_ms is None:
-            return
-        if current.last_attested_ts_ms is None or last_attested_ts_ms > current.last_attested_ts_ms:
-            arms[key] = _ArmEvidence(arm=arm, last_attested_ts_ms=last_attested_ts_ms)
+        # **artifact と「不明」の数は segment をまたいで足し合わせる**（#159）。
+        # 新しいほうの segment だけを残すと、別の artifact で回した区間や、artifact の
+        # 欄を持たない古い trace の区間が束縛の照合から消える。
+        artifacts = set(model_artifacts)
+        unbound = unbound_attested_ticks
+        newest = last_attested_ts_ms
+        if current is not None:
+            artifacts |= set(current.model_artifacts)
+            unbound += current.unbound_attested_ticks
+            older = current.last_attested_ts_ms
+            if newest is None or (older is not None and older > newest):
+                newest = older
+            if last_attested_ts_ms is None or (older is not None and older >= last_attested_ts_ms):
+                arm = current.arm
+        arms[key] = _ArmEvidence(
+            arm=arm,
+            last_attested_ts_ms=newest,
+            model_artifacts=tuple(sorted(artifacts)),
+            unbound_attested_ticks=unbound,
+        )
 
     for segment in report.segments:
         if segment.role is not SegmentRole.HOLDOUT:
@@ -363,7 +401,13 @@ def _holdout_arms(report: EvaluationReport) -> dict[str, _ArmEvidence]:
             if group.kind is not GroupKind.OVERALL:
                 continue
             for applied in group.applied:
-                observe(applied.arm_key, applied.arm, applied.last_attested_ts_ms)
+                observe(
+                    applied.arm_key,
+                    applied.arm,
+                    applied.last_attested_ts_ms,
+                    model_artifacts=applied.model_artifacts,
+                    unbound_attested_ticks=applied.unbound_attested_ticks,
+                )
             for counterfactual in group.counterfactual:
                 observe(
                     counterfactual.arm_key,
@@ -373,8 +417,13 @@ def _holdout_arms(report: EvaluationReport) -> dict[str, _ArmEvidence]:
     return arms
 
 
-def _check_learned_arms(report: EvaluationReport, approval: StageApproval) -> _ArmEvidence:
-    """昇格の根拠を **Learned MPC の arm** に束縛する（0057 §2.4）。
+def _check_learned_arms(
+    report: EvaluationReport,
+    approval: StageApproval,
+    *,
+    production_artifact_sha256: str,
+) -> _ArmEvidence:
+    """昇格の根拠を **Learned MPC の arm** に束縛する（0057 §2.4 / 決定記録 0059）。
 
     `arm_key` の一致だけで gate を読むと、承認者が**適用された Fallback の arm**を
     名指すだけで、肝心の Learned MPC の counterfactual arm が `blocked` のまま昇格できる。
@@ -384,6 +433,10 @@ def _check_learned_arms(report: EvaluationReport, approval: StageApproval) -> _A
     - その arm の stage が、いま上げようとしている遷移元と同じである
     - **報告に現れた Learned MPC の arm すべて**に gate があり、すべて `pass` である
       （良い arm だけを選んで、落ちた構成を残したまま上げられないようにする）
+    - **報告に現れた Learned MPC の arm すべて**に「artifact を言えない適用 tick」が
+      1つも無い（#159 / 決定記録 0059。名指した arm だけを見ない）
+    - 名指した arm が適用側なら、その arm が適用した artifact が
+      **いま Production のちょうど1つ**である
 
     返すのは名指した arm の実績で、呼び出し側が**その arm の新しさ**を測るのに使う。
     """
@@ -402,17 +455,22 @@ def _check_learned_arms(report: EvaluationReport, approval: StageApproval) -> _A
             f"（arm={approval.evidence.arm_key}; "
             f"controller={'none' if controller is None else controller.value}）"
         )
-    if not isinstance(named.arm, CounterfactualArm):
-        # **適用側の arm を artifact へ束縛できない**（codex #4057064074）。
-        # `ModelGateDecision` は artifact の hash を持たず、適用 arm の鍵にも model の
-        # identity が入らない。`provenance.model_artifacts` は counterfactual の
-        # `artifact_sha256` からしか集まらないので、「B の適用実績 + A の counterfactual」という
-        # 報告が {A} の照合を通ってしまう。**束縛できない証拠は使わない**（fail closed）。
-        # trace が tick ごとの artifact を記録するようになったら、ここを開ける（0057 §5）。
-        raise AuthorityEvidenceError(
-            "適用側の arm は、trace が tick ごとの artifact を記録するまで根拠にできない"
-            f"（arm={approval.evidence.arm_key}）"
-        )
+    if isinstance(named.arm, AppliedArm):
+        # **適用側の arm は、その arm 自身が適用した artifact へ束縛してから受け入れる**
+        # （#159 / 決定記録 0059 が 0057 §3 の禁止を置き換える）。
+        # 報告全体の `model_artifacts` の照合（呼び出し側）と合わせて**2箇所**で見る。
+        artifacts = set(named.model_artifacts)
+        if not artifacts:
+            # trace に artifact が無い（旧 version だけの区間）。**推測で埋めない。**
+            raise AuthorityEvidenceError(
+                "適用した artifact が記録されていない arm を根拠にできない"
+                f"（arm={approval.evidence.arm_key}）"
+            )
+        if artifacts != {production_artifact_sha256}:
+            raise AuthorityEvidenceError(
+                "適用 arm が Production 以外の artifact で回した実績を含んでいる"
+                f"（arm={approval.evidence.arm_key}）"
+            )
     if named.arm.authority_stage is not approval.from_stage:
         raise AuthorityEvidenceError(
             "名指した arm の authority stage が、いまの stage と違う"
@@ -424,6 +482,15 @@ def _check_learned_arms(report: EvaluationReport, approval: StageApproval) -> _A
     for key, evidence in sorted(arms.items()):
         if evidence.arm.controller is not ControllerKind.LEARNED_MPC:
             continue
+        if evidence.unbound_attested_ticks:
+            # **名指した arm だけでなく、報告に現れた Learned MPC の適用 arm すべて**が
+            # 束縛できていなければならない（codex #4057191724）。名指した arm だけを見ると、
+            # 同じ holdout に v1〜v6 の tick を含む別の適用 arm が残っていても昇格できる。
+            # 欄を持たない tick が1件でもあれば、その区間は「artifact 不明」である。
+            raise AuthorityEvidenceError(
+                "artifact を言えない適用 tick が混ざった arm がある"
+                f"（arm={key}; unknown_ticks={evidence.unbound_attested_ticks}）"
+            )
         results = outcomes.get(key, [])
         if not results:
             # 判定していないことを合格にしない（0054 の fail closed と同じ向き）。
@@ -724,6 +791,16 @@ class AuthorityStore:
             report = EvaluationReport.model_validate_json(evaluation_report)
         except ValidationError as error:
             raise AuthorityEvidenceError("Offline Evaluation の報告を検証できない") from error
+        if report.schema_version < MIN_EVIDENCE_REPORT_SCHEMA_VERSION:
+            # **artifact の完全性を言えない報告で昇格しない**（codex #4057527950）。
+            # v1 には適用 arm の `model_artifacts` / `unbound_attested_ticks` が無く、
+            # 欄の無さが「空・0」＝「全部束縛できた」と読めてしまう。
+            # **記録の無さは unknown であって completeness ではない**（決定記録 0059 §2.5）。
+            raise AuthorityEvidenceError(
+                "artifact の完全性を言えない古い報告では昇格できない"
+                f"（schema_version={report.schema_version}; "
+                f"required>={MIN_EVIDENCE_REPORT_SCHEMA_VERSION}）"
+            )
         provenance = report.provenance
         if provenance.conditions_sha256 != evidence.conditions_sha256:
             raise AuthorityEvidenceError("報告の比較条件が承認と違う")
@@ -756,7 +833,9 @@ class AuthorityStore:
             raise AuthorityEvidenceError("いまより高い authority で取った証拠は使えない")
         if approval.from_stage not in observed:
             raise AuthorityEvidenceError("いまの stage で運転した証拠が無い")
-        named = _check_learned_arms(report, approval)
+        named = _check_learned_arms(
+            report, approval, production_artifact_sha256=production_artifact_sha256
+        )
         # **新しさは「裏づけのある提案が最後に実在した時刻」で測る**
         # （codex #4056903573 / #4056942799 / #4057035287）。報告全体の run でも、
         # segment の終わりでも、arm の最後の tick でもない。どれも、Fallback だけで回した

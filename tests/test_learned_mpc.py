@@ -735,7 +735,11 @@ def test_invariant_2_g_a_refused_model_degrades_to_fallback_without_stopping(tra
         failure=LearnedFailure.MODEL_LOAD_FAILURE,
         failure_reason=Reason(code="model_unusable", detail=str(refusal.value)),
     ).to_status(received_at_mono_ms=0)
-    gate = gate_for(settings, expected_model_version=observational.version)
+    gate = gate_for(
+        settings,
+        expected_model_version=observational.version,
+        expected_artifact_sha256=observational.artifact_sha256,
+    )
 
     selection = gate.select(
         now_mono_ms=0,
@@ -826,7 +830,11 @@ def test_invariant_1_d_a_plan_prediction_from_another_inference_is_rejected(trai
     assert result.proposal is not None
     assert result.proposal.optimizer_status is OptimizerStatus.ERROR
 
-    gate = gate_for(settings, expected_model_version=base.manifest.model_version)
+    gate = gate_for(
+        settings,
+        expected_model_version=base.manifest.model_version,
+        expected_artifact_sha256=_attestation.artifact_sha256,
+    )
     selection = gate.select(
         now_mono_ms=0,
         fallback=fallback_proposal(0.4),
@@ -1081,7 +1089,11 @@ def test_invariant_6_c_a_timed_out_proposal_is_never_made_active(trained) -> Non
         trained, clock=ScriptedClock(0, 0, 10_000), policy_config=mpc_policy(budget_ms=10)
     )
     result = propose(controller)
-    gate = gate_for(settings, expected_model_version=base.manifest.model_version)
+    gate = gate_for(
+        settings,
+        expected_model_version=base.manifest.model_version,
+        expected_artifact_sha256=_attestation.artifact_sha256,
+    )
 
     selection = gate.select(
         now_mono_ms=0,
@@ -1154,7 +1166,11 @@ def test_invariant_8_a_an_ood_input_is_handed_to_the_gate_as_ood(trained) -> Non
     assert result.proposal.ood is True
     assert result.proposal.confidence == 0.0
 
-    gate = gate_for(settings, expected_model_version=base.manifest.model_version)
+    gate = gate_for(
+        settings,
+        expected_model_version=base.manifest.model_version,
+        expected_artifact_sha256=_attestation.artifact_sha256,
+    )
     selection = gate.select(
         now_mono_ms=0,
         fallback=fallback_proposal(0.4),
@@ -1191,7 +1207,11 @@ def test_invariant_8_c_a_shadow_stage_records_the_proposal_without_selecting_it(
     settings = mpc_policy(authority="shadow")
     controller, _model, _settings = build_controller(trained, policy_config=settings)
     result = propose(controller)
-    gate = gate_for(settings, expected_model_version=base.manifest.model_version)
+    gate = gate_for(
+        settings,
+        expected_model_version=base.manifest.model_version,
+        expected_artifact_sha256=_attestation.artifact_sha256,
+    )
 
     selection = gate.select(
         now_mono_ms=0,
@@ -1379,7 +1399,11 @@ def test_the_whole_chain_hands_a_bounded_request_to_the_guard(trained) -> None:
     assert result.assessment is not None
     assert result.assessment.ood is False
 
-    gate = gate_for(settings, expected_model_version=attestation.version)
+    gate = gate_for(
+        settings,
+        expected_model_version=attestation.version,
+        expected_artifact_sha256=attestation.artifact_sha256,
+    )
     # 復帰 hold を満たすため、健全なまま2 tick 進める（#79）。
     for now_mono_ms in (0, settings.recovery_hold_ms):
         selection = gate.select(
@@ -1660,7 +1684,11 @@ def test_the_worker_failure_detail_reaches_the_fallback_trace(trained) -> None:
         policy_config=settings,
     )
     result = propose(controller)
-    gate = gate_for(settings, expected_model_version=attestation.version)
+    gate = gate_for(
+        settings,
+        expected_model_version=attestation.version,
+        expected_artifact_sha256=attestation.artifact_sha256,
+    )
 
     selection = gate.select(
         now_mono_ms=0,
@@ -1803,7 +1831,11 @@ def test_a_prediction_for_another_candidate_is_rejected(trained) -> None:
     assert result.proposal is not None
     assert result.proposal.optimizer_status is OptimizerStatus.ERROR
 
-    gate = gate_for(settings, expected_model_version=_attestation.version)
+    gate = gate_for(
+        settings,
+        expected_model_version=_attestation.version,
+        expected_artifact_sha256=_attestation.artifact_sha256,
+    )
     selection = gate.select(
         now_mono_ms=0,
         fallback=fallback_proposal(0.4),
@@ -1875,7 +1907,11 @@ def test_a_model_delegating_to_other_bytes_is_refused(trained) -> None:
     assert result.failure_reason is not None
     assert "artifact_sha256" in result.failure_reason.detail
 
-    gate = gate_for(settings, expected_model_version=attestation.version)
+    gate = gate_for(
+        settings,
+        expected_model_version=attestation.version,
+        expected_artifact_sha256=attestation.artifact_sha256,
+    )
     selection = gate.select(
         now_mono_ms=0,
         fallback=fallback_proposal(0.4),

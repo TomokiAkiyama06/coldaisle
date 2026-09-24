@@ -20,8 +20,10 @@ from pydantic import ValidationError
 from coldaisle.control import (
     BOUND_BY_PRECEDENCE,
     SCHEMA_VERSION,
+    AuthorityLimitSource,
     AuthorityStage,
     BoundBy,
+    ConfidenceLevel,
     ControlConfigDigest,
     ControllerKind,
     ControllerProposal,
@@ -32,6 +34,7 @@ from coldaisle.control import (
     Fault,
     FaultCode,
     GuardZoneOutput,
+    ModelGateDecision,
     OperatingMode,
     OptimizerStatus,
     PerZone,
@@ -43,6 +46,7 @@ from coldaisle.control import (
     ZoneRecord,
     ZoneRequest,
 )
+from coldaisle.control.schema import MODEL_GATE_ASSESSMENT_COMPONENTS
 
 SRC = Path(__file__).resolve().parents[1] / "src" / "coldaisle"
 FIXTURE = Path(__file__).resolve().parent / "fixtures" / "control_tick_v1.json"
@@ -309,7 +313,7 @@ def test_a_learned_proposal_must_report_what_the_gate_needs():
             seq=1,
             computed_at_ms=NOW_MS,
             requested=requests(),
-            model_version="thermal-v1",
+            model_version="0.1.0",
         )
 
 
@@ -319,7 +323,7 @@ def test_a_complete_learned_proposal_is_accepted():
         seq=7,
         computed_at_ms=NOW_MS,
         requested=requests(0.55),
-        model_version="thermal-v1",
+        model_version="0.1.0",
         confidence=0.82,
         ood=False,
         optimizer_status=OptimizerStatus.OK,
@@ -387,7 +391,7 @@ def test_ml_cannot_be_active_outside_its_allowed_conditions(overrides):
             **values,
             active_controller=ControllerKind.LEARNED_MPC,
             fallback_active=False,
-            model_version="thermal-v1",
+            model_version="0.1.0",
             model_confidence=0.9,
             model_ood=False,
         )
@@ -401,7 +405,7 @@ def test_max_cannot_mark_a_counterfactual_learned_proposal_as_active():
             safety_state=SafetyState.NORMAL,
             active_controller=ControllerKind.LEARNED_MPC,
             fallback_active=False,
-            model_version="thermal-v1",
+            model_version="0.1.0",
             model_confidence=0.9,
             model_ood=False,
         )
@@ -420,7 +424,7 @@ def test_fallback_while_ml_was_allowed_must_say_why():
     state = fallback_state(
         authority_stage=AuthorityStage.LIMITED,
         fallback_reason=Reason(code="low_confidence"),
-        model_version="thermal-v1",
+        model_version="0.1.0",
         model_confidence=0.31,
         model_ood=False,
     )
@@ -440,7 +444,7 @@ def test_an_out_of_distribution_model_cannot_stay_in_control():
         "safety_state": SafetyState.NORMAL,
         "active_controller": ControllerKind.LEARNED_MPC,
         "fallback_active": False,
-        "model_version": "thermal-v1",
+        "model_version": "0.1.0",
         "model_confidence": 0.9,
     }
     with pytest.raises(ValidationError, match="OOD"):
@@ -927,3 +931,273 @@ def test_fan_control_does_not_depend_on_the_ai_api_or_serial():
         if module.startswith(forbidden)
     ]
     assert offending == []
+
+
+# ------------------------------------------- v7: 判断を出した model artifact（#159）
+
+ARTIFACT = "a" * 64
+"""試験用の artifact hash。**実機の値ではない**（AGENTS.md ルール10）。"""
+
+
+def learned_state(**overrides) -> ControlState:
+    """Learned MPC が requested を作った tick の状態。"""
+    values = {
+        "operating_mode": OperatingMode.AUTO,
+        "authority_stage": AuthorityStage.LIMITED,
+        "active_controller": ControllerKind.LEARNED_MPC,
+        "safety_state": SafetyState.NORMAL,
+        "fallback_active": False,
+        "model_version": "0.1.0",
+        "model_confidence": 0.9,
+        "model_ood": False,
+    }
+    return ControlState(**(values | overrides))
+
+
+def model_gate(**overrides) -> ModelGateDecision:
+    """Learned MPC を採った tick の裏づけのある判断。"""
+    values = {
+        "schema_version": 2,
+        "model_version": "0.1.0",
+        "inference_id": "b" * 64,
+        "artifact_sha256": ARTIFACT,
+        "attested": True,
+        "confidence": 0.9,
+        "ood": False,
+        "confidence_level": ConfidenceLevel.HIGH,
+        "authority_stage": AuthorityStage.LIMITED,
+        "learned_selected": True,
+        "limits": (AuthorityLimitSource.STAGE_BAND,),
+        "assessment": tuple(
+            Reason(code=component) for component in MODEL_GATE_ASSESSMENT_COMPONENTS
+        ),
+    }
+    return ModelGateDecision(**(values | overrides))
+
+
+def learned_tick(**overrides) -> ControlTick:
+    values = {
+        "tick_id": 1,
+        "ts_ms": NOW_MS,
+        "state": learned_state(),
+        "zones": zones(passthrough()),
+        "model_gate": model_gate(),
+        # v8 を名乗る記録は実行記録を省けない（#74 / 決定記録 0060 §2.4）。
+        "runtime": CONTROL_TICK_RUNTIME,
+    }
+    if overrides.get("schema_version", SCHEMA_VERSION) < 8:
+        values.pop("runtime")
+    return ControlTick(**(values | overrides))
+
+
+def test_v7_trace_records_the_artifact_that_produced_the_applied_proposal():
+    """**適用した tick の artifact が decision trace に残る**（#159 の受入基準）。"""
+    recorded = learned_tick()
+
+    assert recorded.schema_version == SCHEMA_VERSION >= 7
+    restored = ControlTick.model_validate_json(recorded.model_dump_json())
+    assert restored.model_gate is not None
+    assert restored.model_gate.artifact_sha256 == ARTIFACT
+    assert restored.applied_model_artifact == ARTIFACT
+    assert restored.applied_artifact_unknown is False
+
+
+@pytest.mark.parametrize("schema_version", [5, 6])
+def test_a_stored_tick_without_the_field_is_read_as_artifact_unknown(schema_version: int):
+    """**欄の無い古い tick は「artifact 不明」**。昇格の証拠に使えない（fail closed）。
+
+    保存済みの v5 / v6 はそのまま読めなければならない（決定記録 0030）。読めたうえで、
+    `applied_model_artifact` は `None`、`applied_artifact_unknown` は `True` になる。
+    """
+    stored = ControlTick(
+        schema_version=schema_version,
+        tick_id=1,
+        ts_ms=NOW_MS,
+        state=learned_state(),
+        zones=zones(passthrough()),
+        # 保存済みの v5 / v6 は、入れ子の判断も v1（artifact の欄を持たない）。
+        model_gate=model_gate(schema_version=1, artifact_sha256=None),
+    )
+
+    restored = ControlTick.model_validate_json(stored.model_dump_json())
+    assert restored.schema_version == schema_version
+    assert restored.model_gate is not None
+    assert restored.model_gate.schema_version == 1
+    assert restored.state.active_controller is ControllerKind.LEARNED_MPC
+    assert restored.applied_model_artifact is None, "推測で埋めない"
+    assert restored.applied_artifact_unknown is True, "「記録が無いだけ」に見せない"
+
+
+@pytest.mark.parametrize("schema_version", [5, 6])
+def test_a_legacy_trace_cannot_carry_the_artifact_added_in_v7(schema_version: int):
+    """**古い version に、後から意味の違う欄を足して読ませない**（決定記録 0030 §2）。"""
+    with pytest.raises(ValidationError, match="schema version 7"):
+        learned_tick(schema_version=schema_version)
+
+
+def test_a_v7_tick_cannot_hide_the_artifact_of_an_attested_judgement():
+    """**新しい trace で「artifact 不明」を作れない。**
+
+    作れると、束縛できる形に直したあとも、欄を空けるだけで束縛を外せてしまう。
+    「artifact 不明」でありうるのは保存済みの v1〜v6 だけである。
+    """
+    with pytest.raises(ValidationError, match="artifact_sha256 が要る"):
+        learned_tick(model_gate=model_gate(artifact_sha256=None))
+
+
+def test_an_unattested_judgement_cannot_name_an_artifact():
+    """**束縛できていない identity を残さない**（#85 の裏づけと同じ向き）。
+
+    裏づけの無い判断に artifact を書けると、別の推論の artifact が「この tick の実績」
+    として読まれる。
+    """
+    with pytest.raises(ValidationError, match="裏づけの無い記録に artifact_sha256"):
+        model_gate(
+            artifact_sha256=ARTIFACT,
+            attested=False,
+            confidence=None,
+            ood=None,
+            confidence_level=ConfidenceLevel.LOW,
+            learned_selected=False,
+            limits=(),
+            assessment=(),
+        )
+
+
+def test_a_proposal_cannot_declare_its_own_artifact():
+    """**artifact は提案の自称値にできない**（#159 の不変条件）。
+
+    `ControllerProposal` に欄を作らないことで、worker が「この提案はこの artifact が
+    出した」と名乗る経路そのものを無くす。Gate は検証済み assessment からだけ写す。
+    """
+    with pytest.raises(ValidationError):
+        ControllerProposal(
+            controller=ControllerKind.LEARNED_MPC,
+            seq=0,
+            computed_at_ms=NOW_MS,
+            requested=requests(),
+            model_version="0.1.0",
+            confidence=0.9,
+            ood=False,
+            optimizer_status=OptimizerStatus.OK,
+            latency_ms=10,
+            inference_id="b" * 64,
+            artifact_sha256=ARTIFACT,
+        )
+
+
+def test_a_tick_cannot_claim_two_different_artifacts():
+    """**同じ tick の2つの記録が別の artifact を名乗らない。**
+
+    名乗れると、あとから読む側が「どの artifact の提案か」を決められない。
+    """
+    from coldaisle.control.schema import ShadowCounterfactual, ShadowRecord
+
+    learned_counterfactual = ShadowCounterfactual(
+        controller=ControllerKind.LEARNED_MPC,
+        requested=PerZone[float](front=0.5, rear=0.5, top=0.5),
+        reason=Reason(code="optimizer_timeout"),
+        optimizer_status=OptimizerStatus.TIMEOUT,
+        latency_ms=10,
+        model_version="0.1.0",
+        inference_id="b" * 64,
+        # **同じ tick の model_gate とは別の artifact。**
+        artifact_sha256="c" * 64,
+        attested=True,
+        confidence=0.9,
+        ood=False,
+    )
+
+    with pytest.raises(ValidationError, match="別の artifact"):
+        ControlTick(
+            tick_id=1,
+            ts_ms=NOW_MS,
+            runtime=CONTROL_TICK_RUNTIME,
+            state=fallback_state(
+                authority_stage=AuthorityStage.LIMITED,
+                fallback_reason=Reason(code="low_confidence"),
+                model_version="0.1.0",
+                model_confidence=0.9,
+                model_ood=False,
+            ),
+            zones=zones(passthrough()),
+            model_gate=model_gate(learned_selected=False, limits=()),
+            shadow=ShadowRecord(
+                tick_id=1,
+                ts_ms=NOW_MS,
+                authority_stage=AuthorityStage.LIMITED,
+                applied_controller=ControllerKind.FALLBACK,
+                applied_effective=PerZone[float](front=0.4, rear=0.4, top=0.4),
+                counterfactuals=(learned_counterfactual,),
+            ),
+        )
+
+
+@pytest.mark.parametrize("schema_version", [1, 2, 3, 4])
+def test_a_learned_tick_without_a_model_gate_is_artifact_unknown(schema_version: int):
+    """**`model_gate` を必須にしたのは v5 から**（codex #4057527947）。
+
+    v1〜v4 は Learned MPC を適用した tick でも `model_gate` を持たない。gate の有無から
+    数えると、そういう tick が「artifact 不明」にも「束縛できた」にも数えられず、
+    **欠けていること自体が記録から消える。** 起点は `ControlState` にする。
+    """
+    stored = ControlTick(
+        schema_version=schema_version,
+        tick_id=1,
+        ts_ms=NOW_MS,
+        state=learned_state(),
+        zones=zones(passthrough()),
+    )
+
+    restored = ControlTick.model_validate_json(stored.model_dump_json())
+    assert restored.model_gate is None
+    assert restored.state.active_controller is ControllerKind.LEARNED_MPC
+    assert restored.applied_model_artifact is None
+    assert restored.applied_artifact_unknown is True, "記録の無さを「不明なし」に落とさない"
+
+
+def test_a_fallback_tick_is_not_counted_as_artifact_unknown():
+    """**「言えない」と「そうではなかった」を混ぜない。**
+
+    Fallback で回していた tick は artifact を持たないのが正しい姿で、「不明」ではない。
+    ここを混ぜると、Fallback 区間の多い報告がすべて不明で埋まり、昇格が永久に来ない。
+    """
+    recorded = tick(passthrough())
+
+    assert recorded.state.active_controller is ControllerKind.FALLBACK
+    assert recorded.applied_model_artifact is None
+    assert recorded.applied_artifact_unknown is False
+
+
+def test_the_nested_model_gate_carries_its_own_schema_version():
+    """**入れ子の判断にも版を持たせる**（codex #4057753201）。
+
+    入れ子の版を上げないと、v7 の trace が「v1 と名乗るのに v1 には無かった欄を持つ」
+    記録を書いてしまう。v1 の判断は artifact を持てず、v7 の tick は v2 を要求する。
+    """
+    recorded = learned_tick()
+    assert recorded.model_gate is not None
+    assert recorded.model_gate.schema_version == 2
+
+    with pytest.raises(ValidationError, match="schema version 2 にする"):
+        model_gate(schema_version=1)
+
+    with pytest.raises(ValidationError, match="schema version 2 の model_gate が要る"):
+        learned_tick(model_gate=model_gate(schema_version=1, artifact_sha256=None))
+
+    # 保存済みの v1 の判断はそのまま読める。
+    stored = model_gate(schema_version=1, artifact_sha256=None)
+    assert ModelGateDecision.model_validate_json(stored.model_dump_json()) == stored
+
+
+def test_a_model_gate_without_a_schema_version_is_refused():
+    """**版の書かれていない判断を最新版として読まない**（codex #4092017585）。
+
+    既定値を省いて書き出した v1 の判断が v2 と読まれないよう、版は入力で必須にする。
+    """
+    document = json.loads(learned_tick().model_dump_json())
+    assert document["model_gate"]["schema_version"] == 2
+    del document["model_gate"]["schema_version"]
+
+    with pytest.raises(ValidationError, match="schema_version"):
+        ControlTick.model_validate_json(json.dumps(document))
