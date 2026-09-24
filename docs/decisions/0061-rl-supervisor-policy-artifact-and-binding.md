@@ -221,6 +221,11 @@ shadow:   { minimum_ticks, minimum_paired_fraction }
   消えるので、照合器が選ばない
 - **片方しか無い tick を一致として数えない。** RL の提案が無い tick は `Reason.code` ごとに
   数え、対になった tick だけを比較の母数にする
+  - 欠落は Rule だけ・RL だけ・**両方**の3つに分けて数える。両方が無い tick を Rule 側へ
+    畳むと、同じ tick の RL の欠落理由が内訳から消え、Rule も落ちていた間の RL worker の
+    停止が見えなくなる。`rl_errors` の合計は「RL だけ」と「両方」の和に一致する
+  - Rule と RL が**同じ版文字列を名乗ってもよい**。版は policy kind ごとに別々に照合し、
+    RL 側は下の完全な識別まで束縛するので取り違えない
 - **Rule は版、RL は artifact の完全な識別を束縛する。** `SupervisorOutput.version` は
   semantic version だけで、同じ版を名乗る別の model ID・別の bytes を区別できない。
   そこで `SupervisorPolicyIdentity`（model ID・版・artifact bytes の SHA-256）を作り、

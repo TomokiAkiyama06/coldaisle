@@ -91,9 +91,20 @@ class SupervisorShadowSummary(_Frozen):
     observed_ticks: int = Field(ge=0)
     paired_ticks: int = Field(ge=0)
     rule_unavailable_ticks: int = Field(ge=0)
+    """Rule だけが無かった tick 数（RL の提案はあった）。"""
     rl_unavailable_ticks: int = Field(ge=0)
+    """RL だけが無かった tick 数（Rule の提案はあった）。"""
+    both_unavailable_ticks: int = Field(default=0, ge=0)
+    """Rule と RL の**両方**が無かった tick 数。
+
+    Rule 側の欠落へ畳むと、同じ tick の RL の欠落が内訳から消え、Rule も落ちていた間の
+    RL worker の停止が見えなくなる。どちらの事実も残すため別の欄にする。
+    """
     rl_errors: dict[str, int] = Field(default_factory=dict)
-    """RL の提案が無かった理由の内訳（`Reason.code` ごと）。"""
+    """RL の提案が無かった理由の内訳（`Reason.code` ごと）。
+
+    `rl_unavailable_ticks` と `both_unavailable_ticks` の**両方**を数える。
+    """
     first_ts_ms: int | None = Field(default=None, ge=0)
     last_ts_ms: int | None = Field(default=None, ge=0)
     strategy_matches: int = Field(ge=0)
@@ -114,9 +125,16 @@ class SupervisorShadowSummary(_Frozen):
 
     @model_validator(mode="after")
     def _counts_add_up(self) -> Self:
-        accounted = self.paired_ticks + self.rule_unavailable_ticks + self.rl_unavailable_ticks
+        accounted = (
+            self.paired_ticks
+            + self.rule_unavailable_ticks
+            + self.rl_unavailable_ticks
+            + self.both_unavailable_ticks
+        )
         if accounted != self.observed_ticks:
             raise ValueError("対と欠落の合計が観測 tick 数と一致しない")
+        if sum(self.rl_errors.values()) != self.rl_unavailable_ticks + self.both_unavailable_ticks:
+            raise ValueError("RL 欠落の理由の内訳が RL の欠落 tick 数と一致しない")
         if (
             self.strategy_matches > self.paired_ticks
             or self.target_band_matches > self.paired_ticks
@@ -163,6 +181,7 @@ class SupervisorShadowLedger:
     """同じ tick の Rule / RL 提案を集計する。**制御へ戻る経路を持たない。**"""
 
     __slots__ = (
+        "_both_unavailable",
         "_config",
         "_first_ts_ms",
         "_last_ts_ms",
@@ -186,17 +205,20 @@ class SupervisorShadowLedger:
         rule_policy_version: str,
         rl_identity: SupervisorPolicyIdentity,
     ) -> None:
-        """Rule の版と RL artifact の完全な識別を束縛する。**あとから混ぜられない。**"""
+        """Rule の版と RL artifact の完全な識別を束縛する。**あとから混ぜられない。**
+
+        Rule と RL が同じ版文字列（例 `1.0.0`）を名乗ってもよい。版は policy kind ごとに
+        別々に照合し、RL 側はさらに model ID・bytes hash まで束縛するので、取り違えない。
+        """
         if not rule_policy_version:
             raise SupervisorShadowUsageError("比較する Rule policy version を名指しする")
-        if rule_policy_version == rl_identity.version:
-            raise SupervisorShadowUsageError("Rule と RL に同じ version を指定しない")
         self._config = config
         self._rule_version = rule_policy_version
         self._rl_identity = rl_identity
         self._seen: dict[int, str] = {}
         self._rule_unavailable = 0
         self._rl_unavailable = 0
+        self._both_unavailable = 0
         self._strategy_matches = 0
         self._target_band_matches = 0
         self._rl_errors: dict[str, int] = {}
@@ -248,13 +270,18 @@ class SupervisorShadowLedger:
 
         rule_output = decision.active.output
         rl_output = shadow.output
-        if rule_output is None:
-            self._rule_unavailable += 1
-            return
         if rl_output is None:
-            self._rl_unavailable += 1
+            # Rule も落ちている tick でも RL の欠落理由を数える。Rule 側へ畳むと
+            # RL worker の停止が内訳から消える。
             code = shadow.error.code if shadow.error is not None else "supervisor_unavailable"
             self._rl_errors[code] = self._rl_errors.get(code, 0) + 1
+            if rule_output is None:
+                self._both_unavailable += 1
+            else:
+                self._rl_unavailable += 1
+            return
+        if rule_output is None:
+            self._rule_unavailable += 1
             return
         # 違う regime を前提にした提案どうしは、`SupervisorDecision` の段階で作れない
         # （同じ tick の active / shadow は同じ regime を使う）。ここで読み替えもしない。
@@ -293,7 +320,7 @@ class SupervisorShadowLedger:
     def summary(self) -> SupervisorShadowSummary:
         """いままでの観測から集計を作る。**同じ観測列からは同じ bytes が出る。**"""
         observed = len(self._seen)
-        paired = observed - (self._rule_unavailable + self._rl_unavailable)
+        paired = observed - (self._rule_unavailable + self._rl_unavailable + self._both_unavailable)
         mean = {
             name: (self._weight_total[name] / paired if paired else 0.0) for name in OBJECTIVE_NAMES
         }
@@ -319,6 +346,7 @@ class SupervisorShadowLedger:
             paired_ticks=paired,
             rule_unavailable_ticks=self._rule_unavailable,
             rl_unavailable_ticks=self._rl_unavailable,
+            both_unavailable_ticks=self._both_unavailable,
             rl_errors=dict(sorted(self._rl_errors.items())),
             first_ts_ms=self._first_ts_ms,
             last_ts_ms=self._last_ts_ms,

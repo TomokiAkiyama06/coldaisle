@@ -763,6 +763,39 @@ def test_invariant_13_the_ledger_binds_versions_and_reads_time_from_evidence() -
     assert empty.first_ts_ms is None and empty.paired_fraction is None and empty.usable is False
 
 
+def test_invariant_13_b_rule_and_rl_may_share_a_version_string() -> None:
+    """**Rule と RL が同じ版文字列を名乗っても台帳を作れる。**
+
+    版は policy kind ごとに照合し、RL 側は model ID・bytes hash まで束縛するので曖昧さは無い。
+    """
+    config, _digest = rl_policy_config()
+    ledger = SupervisorShadowLedger(
+        config.shadow, rule_policy_version="0.1.0", rl_identity=RL_IDENTITY
+    )
+    ledger.observe(paired_decision(tick_id=1, rule_version="0.1.0"))
+    summary = ledger.summary()
+    assert (summary.observed_ticks, summary.paired_ticks) == (1, 1)
+    assert summary.rule_policy_version == summary.rl_policy_identity.version == "0.1.0"
+
+
+def test_invariant_13_c_both_unavailable_keeps_the_rl_failure() -> None:
+    """**Rule と RL が同じ tick で両方落ちても、RL の欠落理由を内訳に残す。**"""
+    ledger = ledger_for()
+    ledger.observe(paired_decision(tick_id=1))
+    ledger.observe(missing_rl_decision(tick_id=2))
+    ledger.observe(both_missing_decision(tick_id=3))
+    summary = ledger.summary()
+    assert summary.observed_ticks == 3
+    assert summary.paired_ticks == 1
+    assert summary.rule_unavailable_ticks == 0
+    assert summary.rl_unavailable_ticks == 1
+    assert summary.both_unavailable_ticks == 1
+    assert summary.rl_errors == {"supervisor_expired": 1, "supervisor_worker_down": 1}
+
+    with pytest.raises(ValidationError, match="RL 欠落の理由の内訳"):
+        type(summary).model_validate(summary.model_dump(mode="python") | {"rl_errors": {}})
+
+
 # ------------------------------------- 不変条件 14 / 15 / 16 / 17: 探索と artifact
 
 
@@ -1388,6 +1421,22 @@ def missing_rl_decision(*, tick_id: int, ts_ms: int = 2_000) -> SupervisorDecisi
         shadow=SupervisorPolicyEvaluation(
             policy=SupervisorPolicyKind.RL,
             error=Reason(code="supervisor_expired", detail="RLPolicy output の有効期限切れ"),
+        ),
+    )
+
+
+def both_missing_decision(*, tick_id: int, ts_ms: int = 4_000) -> SupervisorDecision:
+    return SupervisorDecision(
+        tick_id=tick_id,
+        ts_ms=ts_ms,
+        snapshot_schema_version=1,
+        active=SupervisorPolicyEvaluation(
+            policy=SupervisorPolicyKind.RULE,
+            error=Reason(code="supervisor_rule_failed", detail="RulePolicy の評価に失敗"),
+        ),
+        shadow=SupervisorPolicyEvaluation(
+            policy=SupervisorPolicyKind.RL,
+            error=Reason(code="supervisor_worker_down", detail="RLPolicy worker が応答しない"),
         ),
     )
 
