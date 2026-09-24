@@ -241,7 +241,11 @@ shadow:   { minimum_ticks, minimum_paired_fraction }
   - `SupervisorCoordinator` は `expected_rl_identity` を受け取り、**完全一致しない提案・
     identity の無い提案を `supervisor_identity_mismatch` で拒む**（active / shadow どちらの
     slot でも）。成功した提案の識別は `SupervisorPolicyEvaluation.policy_identity` として
-    trace に残す（**trace の加算的な追加**。成功した RL 出力にだけ付けられる）
+    trace に残す（成功した RL 出力にだけ付けられる）
+  - この欄を足すので、**入れ子の `SupervisorDecision` の版を 1 → 2 へ上げる**
+    （`SUPERVISOR_DECISION_SCHEMA_VERSION`）。v1 と名乗りながら v1 に無かった欄を持つ記録は
+    作れず、保存済みの v1 はそのまま読める。欄は値が無ければ書き出さない。`ControlTick` の版は
+    上げない（番号は PR 間で確保して使うため。#159 の `model_gate` v2 と同じ入れ子の上げ方）
   - `expected_rl_identity` を**渡さない** Coordinator は、照合を飛ばすのではなく
     RL 提案を**すべて** `supervisor_identity_mismatch` で拒む（fail closed。active slot なら
     Rule へ落ちる）。照合を省くと、同じ版を名乗る別の artifact や識別の無い提案が trace に入る
@@ -251,6 +255,8 @@ shadow:   { minimum_ticks, minimum_paired_fraction }
 - **時刻は観測した decision から取る**（壁時計を読まない。0054 §2.7）
 - `minimum_ticks` と `minimum_paired_fraction` を満たさない集計は `usable=False` で、
   **「差が無かった」と読めない**（fail closed）
+  - `minimum_ticks` は **1 以上**（設定の読み込みで検査）。加えて台帳も、対が 0 の集計を
+    下限の値によらず `usable` にしない。0 を許すと、比べていない集計が証拠として読めてしまう
 - 集計の digest は #104 の `shadow_evaluation_ref` にそのまま渡せる
 
 違う regime を前提にした提案どうしの比較は、**`SupervisorDecision` の段階で作れない**

@@ -75,7 +75,7 @@ def candidate_identifier(regime: WorkloadRegime, index: int) -> str:
 
 PolicyFloat = ConfigValue[FiniteFloat]
 PolicyUnitInterval = ConfigValue[UnitInterval]
-PolicyCount = ConfigValue[Annotated[int, Field(ge=0)]]
+PolicyPositiveCount = ConfigValue[Annotated[int, Field(ge=1)]]
 PolicySeed = ConfigValue[Annotated[int, Field(ge=0)]]
 
 
@@ -146,8 +146,11 @@ class PolicySearchConfig(_ConfigModel):
 class PolicyShadowConfig(_ConfigModel):
     """shadow 比較を「読めた」と見なす下限（fail closed）。"""
 
-    minimum_ticks: PolicyCount
-    """対で観測できた tick 数の下限。"""
+    minimum_ticks: PolicyPositiveCount
+    """対で観測できた tick 数の下限。**1 以上。**
+
+    0 を許すと、対が1つも無い集計が `usable` になり、比べていない証拠を読めたことにする。
+    """
     minimum_paired_fraction: PolicyUnitInterval
     """観測した tick のうち、Rule と RL の両方の提案が揃っていた割合の下限。"""
 

@@ -25,6 +25,7 @@
 from __future__ import annotations
 
 import ast
+import json
 from hashlib import sha256
 from pathlib import Path
 from typing import Any
@@ -58,6 +59,7 @@ from coldaisle.control.rl.training import (
     truncated_episodes,
 )
 from coldaisle.control.schema import (
+    SUPERVISOR_DECISION_SCHEMA_VERSION,
     AuthorityStage,
     Reason,
     SupervisorDecision,
@@ -812,6 +814,55 @@ def test_invariant_13_c_both_unavailable_keeps_the_rl_failure() -> None:
 
 
 # ------------------------------------- 不変条件 14 / 15 / 16 / 17: 探索と artifact
+
+
+def test_invariant_13_d_an_unpaired_ledger_is_never_usable() -> None:
+    """**対が1つも無い集計を読めたことにしない**（fail closed）。
+
+    設定は `minimum_ticks` に 0 を許さない。設定を迂回して 0 の下限を渡されても、
+    台帳は対が 0 の集計を `usable` にしない。
+    """
+    with pytest.raises(ValidationError, match="minimum_ticks"):
+        rl_policy_config(shadow={"minimum_ticks": provisional(0)})
+
+    config, _digest = rl_policy_config()
+    zero = config.shadow.model_copy(
+        update={
+            "minimum_ticks": config.shadow.minimum_ticks.model_copy(update={"value": 0}),
+            "minimum_paired_fraction": config.shadow.minimum_paired_fraction.model_copy(
+                update={"value": 0.0}
+            ),
+        }
+    )
+    ledger = SupervisorShadowLedger(
+        zero, rule_policy_version="rule-test-v1", rl_identity=RL_IDENTITY
+    )
+    ledger.observe(missing_rl_decision(tick_id=1))
+    summary = ledger.summary()
+    assert (summary.observed_ticks, summary.paired_ticks) == (1, 0)
+    assert summary.usable is False
+
+
+def test_supervisor_decision_v2_carries_identity_and_v1_still_reads() -> None:
+    """**識別を足した decision は版を上げる。** 保存済みの v1 はそのまま読める。"""
+    decision = paired_decision(tick_id=1)
+    assert decision.schema_version == SUPERVISOR_DECISION_SCHEMA_VERSION == 2
+    assert decision.shadow is not None and decision.shadow.policy_identity == RL_IDENTITY
+
+    # v1 と名乗りながら v1 に無かった欄を持つ記録は作れない。
+    dumped = decision.model_dump(mode="json")
+    with pytest.raises(ValidationError, match="schema version 2"):
+        SupervisorDecision.model_validate_json(json.dumps({**dumped, "schema_version": 1}))
+
+    # 識別を持たない評価は欄を書き出さないので、v1 の形のまま残り、v1 として読める。
+    legacy = missing_rl_decision(tick_id=2)
+    legacy_dump = legacy.model_dump(mode="json")
+    assert "policy_identity" not in legacy_dump["active"]
+    assert "policy_identity" not in legacy_dump["shadow"]
+    restored = SupervisorDecision.model_validate_json(
+        json.dumps({**legacy_dump, "schema_version": 1})
+    )
+    assert restored.schema_version == 1
 
 
 def test_invariant_14_the_search_is_deterministic_and_order_independent(trained: Any) -> None:

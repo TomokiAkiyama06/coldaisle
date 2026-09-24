@@ -293,8 +293,14 @@ class SupervisorPolicyEvaluation(_Frozen):
 
     policy: SupervisorPolicyKind
     output: SupervisorOutput | None = None
-    policy_identity: SupervisorPolicyIdentity | None = None
-    """成功した RL 出力を作った artifact の完全な識別。Rule と失敗には付かない。"""
+    policy_identity: SupervisorPolicyIdentity | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
+    """成功した RL 出力を作った artifact の完全な識別。Rule と失敗には付かない。
+
+    `SupervisorDecision` v2 で足した欄（#89 / 決定記録 0061 §2.6）。**無いときは書き出さない**
+    ので、識別を持たない評価は v1 と同じ形で残る。
+    """
     error: Reason | None = None
     received_monotonic_ms: int | None = Field(default=None, ge=0)
     source_monotonic_ms: int | None = Field(default=None, ge=0)
@@ -328,10 +334,21 @@ class SupervisorPolicyEvaluation(_Frozen):
         return self
 
 
+SUPERVISOR_DECISION_SCHEMA_VERSION: Literal[2] = 2
+"""`SupervisorDecision` の形の版（`ControlTick` の中に入れ子で入る）。
+
+- v2（#89 / 決定記録 0061 §2.6）: 評価ごとの `policy_identity`（RL artifact の完全な識別）。
+  **保存済みの v1 はそのまま読め、識別を持てない。** 入れ子の版を上げないと、v1 と名乗るのに
+  v1 には無かった欄を持つ記録を書いてしまい、前の版の reader（`extra="forbid"`）が
+  版ではなく未知の欄で拒むことになる。`ControlTick` の版は上げない（番号は PR 間で
+  確保して使うため。#159 の `model_gate` v2 と同じ入れ子の上げ方）
+"""
+
+
 class SupervisorDecision(_Frozen):
     """active / shadow と Rule fallback を同じ入力単位で記録する。"""
 
-    schema_version: Literal[1] = 1
+    schema_version: Literal[1, 2] = SUPERVISOR_DECISION_SCHEMA_VERSION
     tick_id: int = Field(ge=0)
     ts_ms: int = Field(ge=0)
     snapshot_schema_version: int = Field(ge=1)
@@ -350,6 +367,14 @@ class SupervisorDecision(_Frozen):
 
     @model_validator(mode="after")
     def _runs_share_one_state_and_shadow_never_becomes_active(self) -> Self:
+        if self.schema_version < 2 and any(
+            evaluation is not None and evaluation.policy_identity is not None
+            for evaluation in (self.active, self.fallback, self.shadow)
+        ):
+            # v1 の記録にこの欄は無かった。後から足して読ませない。
+            raise ValueError(
+                "policy_identity を記録する Supervisor decision は schema version 2 にする"
+            )
         active_failed = self.active.output is None
         if self.active.policy is SupervisorPolicyKind.RL and active_failed:
             if self.fallback is None or self.fallback.policy is not SupervisorPolicyKind.RULE:

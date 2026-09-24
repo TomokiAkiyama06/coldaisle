@@ -334,8 +334,11 @@ class SupervisorShadowLedger:
             for regime, counters in sorted(self._regimes.items(), key=lambda item: item[0].value)
         )
         fraction = None if observed == 0 else paired / observed
+        # **対が1つも無い集計を読めたことにしない**（fail closed）。設定の下限が 0 を許さない
+        # ことに加えて、ここでも独立に塞ぐ。
         usable = (
             fraction is not None
+            and paired > 0
             and paired >= self._config.minimum_ticks.value
             and fraction >= self._config.minimum_paired_fraction.value
         )
