@@ -728,6 +728,41 @@ def test_invariant_29_the_release_keeps_its_reason_after_the_hold(catalog, caplo
     assert results[-1].tick.zones.front.demand.guard_floor is None
 
 
+def test_invariant_29_the_log_is_written_after_the_fan_write_and_heartbeat(catalog) -> None:
+    """ログの出力先が詰まっても、介入が要る tick の書き込みと heartbeat を遅らせない。
+
+    Guard が発火した tick こそ冷却を急ぐ。ログは I/O なので、書き込み・heartbeat・
+    decision trace の保存より**後**に出す（0060 §2.7 と同じ理由）。
+    """
+    import logging
+
+    harness = Harness(catalog, with_supervisor=False)
+    harness.settle()
+    harness.order.clear()
+
+    class OrderHandler(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            if record.getMessage().startswith("reactive guard started"):
+                harness.order.append("guard_log")
+
+    handler = OrderHandler(level=logging.INFO)
+    logger = logging.getLogger("coldaisle.control")
+    previous = logger.level
+    logger.addHandler(handler)
+    logger.setLevel(logging.INFO)
+    try:
+        harness.telemetry.values["gpu.0.hotspot"] = 95.0
+        harness.tick()
+    finally:
+        logger.removeHandler(handler)
+        logger.setLevel(previous)
+
+    assert "guard_log" in harness.order
+    first_log = harness.order.index("guard_log")
+    assert harness.order.index("watchdog") < first_log
+    assert harness.order.index("trace") < first_log
+
+
 def test_invariant_29_a_quiet_run_logs_no_guard_transition(catalog, caplog) -> None:
     """発火していない間は開始も解除も記録しない（毎 tick の雑音にしない）。"""
     harness = Harness(catalog, with_supervisor=False)

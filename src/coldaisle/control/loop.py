@@ -44,7 +44,11 @@ from coldaisle.control.fallback.gate import (
 from coldaisle.control.hardware.simulated import FanHardwareBackend, FanHardwareResult
 from coldaisle.control.logging import ControlTraceLogger
 from coldaisle.control.mpc.controller import MpcProposal
-from coldaisle.control.reactive.guard import ReactiveGuard, guard_input_metrics
+from coldaisle.control.reactive.guard import (
+    ReactiveGuard,
+    ReactiveGuardDecision,
+    guard_input_metrics,
+)
 from coldaisle.control.safety.critical import (
     AIR_TELEMETRY_GROUP,
     AIR_TEMPERATURE_METRICS,
@@ -584,7 +588,8 @@ class ControlLoop:
         supervisor_output = (
             None if supervisor_decision is None else supervisor_decision.selected_output
         )
-        guard_zones, guard_fault = self._run_guard(snapshot)
+        guard_decision, guard_fault = self._run_guard(snapshot)
+        guard_zones = self._guard_zones(guard_decision)
         baseline, controller_fault = self._run_fallback(snapshot, snapshot_status)
         learned = self._poll_learned(snapshot.monotonic_ms)
 
@@ -674,6 +679,7 @@ class ControlLoop:
             ),
         )
         recorded, trace_failed = self._record(tick)
+        self._log_guard_events(guard_decision)
 
         if overrun:
             LOGGER.warning(
@@ -853,24 +859,37 @@ class ControlLoop:
 
     def _run_guard(
         self, snapshot: ControlStateSnapshot
-    ) -> tuple[PerZone[GuardZoneOutput], Fault | None]:
+    ) -> tuple[ReactiveGuardDecision | None, Fault | None]:
         try:
-            decision = self._guard.evaluate(snapshot)
+            return self._guard.evaluate(snapshot), None
         except Exception as error:
             LOGGER.exception(
                 "reactive guard failed",
                 extra={logs.FIELDS_KEY: {"tick_id": snapshot.tick_id}},
             )
-            empty = GuardZoneOutput()
-            return (
-                PerZone[GuardZoneOutput](front=empty, rear=empty, top=empty),
-                Fault(
-                    code=FaultCode.GUARD_EXCEPTION,
-                    detail=f"{type(error).__name__}: {error}"[:500],
-                ),
+            return None, Fault(
+                code=FaultCode.GUARD_EXCEPTION,
+                detail=f"{type(error).__name__}: {error}"[:500],
             )
-        # inactive な GuardZoneOutput は理由を持てないので、解除の理由は events にしか無い。
-        # ここで落とすと「なぜ floor が外れたか」を後から辿れなくなる（#80）。
+
+    @staticmethod
+    def _guard_zones(decision: ReactiveGuardDecision | None) -> PerZone[GuardZoneOutput]:
+        if decision is not None:
+            return decision.zones
+        empty = GuardZoneOutput()
+        return PerZone[GuardZoneOutput](front=empty, rear=empty, top=empty)
+
+    @staticmethod
+    def _log_guard_events(decision: ReactiveGuardDecision | None) -> None:
+        """Guard の介入の開始・解除を構造化ログへ出す（#80）。
+
+        inactive な GuardZoneOutput は理由を持てないので、解除の理由は events にしか無い。
+        ここで落とすと「なぜ floor が外れたか」を後から辿れなくなる。
+        **書き込み・heartbeat・trace の保存の後に呼ぶ。** ログの出力先が詰まっても、
+        介入が必要な tick の Critical Safety と Fan の書き込みを遅らせないため。
+        """
+        if decision is None:
+            return
         for event in decision.events:
             LOGGER.info(
                 "reactive guard %s",
@@ -888,7 +907,6 @@ class ControlLoop:
                     }
                 },
             )
-        return decision.zones, None
 
     def _run_fallback(
         self, snapshot: ControlStateSnapshot, snapshot_status: SnapshotStatus
