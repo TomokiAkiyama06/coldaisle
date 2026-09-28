@@ -597,6 +597,7 @@ Kaggle・研究でGPUを使う際は `--gpu-memory-utilization` による制限�
 | Q-14 | 夜間通知 | 常時通知。ただし閾値確定までは critical のみに段階制限 | 2026-08-23 |
 | Q-15 | 通知先 | Slack / LINE ともに専用の宛先を使用 | 2026-08-23 |
 | Q-19 | 制御入力の欠測の分類 | Critical / Degraded / Advisory（[決定記録 0029](decisions/0029-telemetry-loss-classes.md)） | 2026-09-16 |
+| Q-26 | 音響センサーのハードウェア | **導入しない。** 騒音は「うるさいか」の回答で測る（[決定記録 0067](decisions/0067-acoustic-measurement-study.md)。手順は `docs/acoustic-measurement.md`） | 2026-09-28 |
 
 ### 検証済み
 
@@ -616,7 +617,6 @@ Kaggle・研究でGPUを使う際は `--gpu-memory-utilization` による制限�
 | Q-23 | Confidence / OOD の方式、Authority 昇格ゲートの閾値 | 方式は決定記録 0050（FINAL、2026-09-20 所有者承認）で決定。**閾値の値**は GitHub #85 / #90 / #91、**stage の昇格**は #92 で未決 |
 | Q-24 | Air Balance の最適な帯 | GitHub #81 |
 | Q-25 | 本番でオンライン学習を行うか | GitHub #93 / #104 |
-| Q-26 | 音響センサーのハードウェア | 導入しない。騒音は「うるさいか」の回答で測る（決定記録 0067、FINAL。手順は `docs/acoustic-measurement.md`） |
 | Q-27 | Workload Hint を実装する時期 | GitHub #107 |
 | Q-28 | Airflow 可視化 UI の置き場所（coldaisle / Workspace） | GitHub #106 |
 
