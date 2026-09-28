@@ -1,7 +1,7 @@
 # 騒音の測り方: 「うるさいか」の回答
 
 #94 の Acoustic Cost Model の曲線に、仮置きより良い根拠を与えるための手順（#95）。
-方針の正本は [決定記録 0067](decisions/0067-acoustic-measurement-study.md)（**Proposed**）。
+方針の正本は [決定記録 0067](decisions/0067-acoustic-measurement-study.md)（**FINAL**）。
 
 > **騒音計は使わない。** dBA は測らず、本人が「うるさいか」を答えて、不快に感じ始める
 > Demand の下限を探す。ここで作った曲線は `source.kind: approximate` のままにする。

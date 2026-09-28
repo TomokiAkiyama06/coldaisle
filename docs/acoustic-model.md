@@ -10,7 +10,7 @@ Thermal Model、Reactive Guard、Critical Safety、Hardware Backend への依存
 初期値は実測のない `source.kind: approximate` として扱う。実測 SPL・周波数特性・
 subjective annoyance score が揃った後は、同じ zone 曲線の契約のまま
 `source.kind: measured` と根拠を設定できる。
-曲線の根拠は「うるさいか」の回答から作る（`docs/acoustic-measurement.md`、決定記録 0067、Proposed）。
+曲線の根拠は「うるさいか」の回答から作る（`docs/acoustic-measurement.md`、決定記録 0067、FINAL）。
 回答から作った曲線も `approximate` のままにする。
 
 各 zone は別々の単調・区分線形曲線を持つ。設定値が非線形の関係を定義し、補間以外の

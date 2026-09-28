@@ -1,7 +1,7 @@
 # 決定記録 0067: 騒音は「うるさいか」の回答で測る（騒音計を使わない・回答は Fan を変えない・曲線は approximate のまま）
 
 - **種別**: Decision Record
-- **Status**: Proposed
+- **Status**: FINAL（2026-09-28、リポジトリ所有者が承認）
 - **Date**: 2026-09-24
 - **Supersedes**: [0045](0045-local-socket-write-entry.md) §2.4 のメッセージの表のうち、
   (1) `type` 行の受理する種類の列挙（「`gpu_mode` のみ受理する」）と、(2) フィールドの表が `type` によらず
@@ -272,7 +272,7 @@
 ### 2.8 実装は別 Issue
 
 - `noise_feedback`（`value` / `sampling`）を 0045 の許可リストへ足すこと、回答と trace の日次の
-  突き合わせと結果の保存（§2.4）、下限の集計、その設定ファイルは、本記録の承認後に別 Issue で実装する
+  突き合わせと結果の保存（§2.4）、下限の集計、その設定ファイルは、別 Issue で実装する（本記録は 2026-09-28 に所有者が承認）
   - その Issue で、`control_traces` の各行に run id と単調な挿入の連番を足す（§2.4 の epoch の鍵。
     decision trace の schema と migration の変更を含む）
   - 列を足すだけでは足りない。いまの主キーは `(ts_ms, tick_id)` で（決定記録 0030 §2）、書き込みは
