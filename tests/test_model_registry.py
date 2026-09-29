@@ -40,6 +40,11 @@ from coldaisle.control import (
     UnsafeRegistryPathError,
     load_model_registry_limits,
 )
+from coldaisle.control.schema import (
+    REGISTRY_ARTIFACT_KINDS,
+    REGISTRY_POINTER_CHANGE_EVENTS,
+    registry_reason_sha256,
+)
 
 NOW_MS = 1_800_000_000_000
 CONFIG_DIR = Path(__file__).resolve().parents[1] / "config"
@@ -1695,3 +1700,76 @@ def test_the_attestation_records_lifecycle_and_production_provenance(tmp_path: P
             production_active=True,
             _token=registry_module._ATTESTATION_ISSUE_TOKEN,
         )
+
+
+# ------------------------------------------------ decision trace への版（#104 / 0071 §2.5）
+
+
+def test_trace_provenance_of_an_empty_registry_lists_every_kind_without_production(
+    tmp_path: Path,
+) -> None:
+    """読んだが記録が1件も無い registry は `revision=0` と、全 kind の `None` の欄になる。"""
+    registry = ModelRegistry(tmp_path / "registry", SimulatedClock(NOW_MS), limits=LIMITS)
+
+    provenance = registry.inspect().trace_provenance()
+
+    assert provenance.revision == 0
+    assert set(provenance.production) == {kind.value for kind in ArtifactKind}
+    for pointer in provenance.production.values():
+        assert pointer.artifact_sha256 is None
+        assert pointer.established_by is None
+
+
+def test_trace_provenance_names_the_pointer_change_that_established_production(
+    tmp_path: Path,
+) -> None:
+    """kind ごとに production の checksum と、それを成立させた最後の変更の metadata を載せる。"""
+    registry = ModelRegistry(tmp_path / "registry", SimulatedClock(NOW_MS), limits=LIMITS)
+    register_and_validate(registry, "1.0.0")
+    promote(registry, "1.0.0")
+    register_and_validate(registry, "2.0.0")
+    promote(registry, "2.0.0")
+    revision = registry.inspect().revision
+    registry.rollback(
+        ArtifactKind.THERMAL_MODEL,
+        COMPATIBILITY,
+        approval=rollback_approval("1.0.0", revision),
+        expected_revision=revision,
+    )
+    snapshot = registry.inspect()
+
+    provenance = snapshot.trace_provenance()
+
+    assert provenance.revision == snapshot.revision == 7
+    thermal = provenance.production[ArtifactKind.THERMAL_MODEL.value]
+    assert thermal.artifact_sha256 == metadata("1.0.0").sha256
+    assert thermal.established_by is not None
+    # 写しは `trace_metadata()` と同じ欄・値で、自由記述の `reason` だけを digest に置き換える。
+    # path を含まない（0062 §2.5 / 決定記録 0075）。
+    audit = snapshot.audit[-1].trace_metadata()
+    assert thermal.established_by.reason_sha256 == registry_reason_sha256(str(audit.pop("reason")))
+    assert thermal.established_by.model_dump(exclude={"reason_sha256"}) == audit
+    assert snapshot.audit[-1].reason not in provenance.model_dump_json()
+    assert thermal.established_by.event == RegistryEventKind.ROLLED_BACK.value
+    assert str(tmp_path) not in provenance.model_dump_json()
+    # candidate の登録や検証は pointer を動かさないので載らない。
+    assert provenance.production[ArtifactKind.CONFIDENCE_MODEL.value].established_by is None
+
+
+def test_trace_provenance_pointer_change_events_match_the_registry_vocabulary() -> None:
+    """schema は registry を import しないので値で持つ。**値の食い違いをここで止める。**"""
+    assert {
+        RegistryEventKind.PROMOTED.value,
+        RegistryEventKind.ROLLED_BACK.value,
+    } == REGISTRY_POINTER_CHANGE_EVENTS
+    snapshot = RegistrySnapshot(revision=0)
+    assert all(
+        event.event.value in REGISTRY_POINTER_CHANGE_EVENTS for event in snapshot.pointer_changes
+    )
+
+
+def test_trace_provenance_artifact_kinds_match_the_registry_vocabulary() -> None:
+    """schema が値で持つ kind の集合と `ArtifactKind` を揃える。**食い違いをここで止める。**"""
+    assert {kind.value for kind in ArtifactKind} == REGISTRY_ARTIFACT_KINDS
+    provenance = RegistrySnapshot(revision=0).trace_provenance()
+    assert set(provenance.production) == REGISTRY_ARTIFACT_KINDS

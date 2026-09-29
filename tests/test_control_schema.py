@@ -10,6 +10,7 @@
 """
 
 import ast
+import hashlib
 import json
 import math
 from pathlib import Path
@@ -39,6 +40,9 @@ from coldaisle.control import (
     OptimizerStatus,
     PerZone,
     Reason,
+    RegistryPointerChange,
+    RegistryProductionPointer,
+    RegistryProvenance,
     SafetyProvenance,
     SafetyState,
     SafetyZoneOutput,
@@ -47,7 +51,11 @@ from coldaisle.control import (
     ZoneRecord,
     ZoneRequest,
 )
-from coldaisle.control.schema import MODEL_GATE_ASSESSMENT_COMPONENTS
+from coldaisle.control.schema import (
+    MODEL_GATE_ASSESSMENT_COMPONENTS,
+    REGISTRY_ARTIFACT_KINDS,
+    registry_reason_sha256,
+)
 
 SRC = Path(__file__).resolve().parents[1] / "src" / "coldaisle"
 FIXTURE = Path(__file__).resolve().parent / "fixtures" / "control_tick_v1.json"
@@ -539,6 +547,46 @@ SAFETY_PROVENANCE = SafetyProvenance(disabled_inputs=(), config_is_provisional=F
 v8 の runtime と同じく、v9 を名乗る記録はこの欄を省けない。値はこの試験の判断に影響しない。
 """
 
+
+def registry_provenance_for(artifact: str) -> RegistryProvenance:
+    """thermal_model の production を `artifact` にした v10 の registry の版（#104）。"""
+    return RegistryProvenance(
+        revision=3,
+        production={
+            "thermal_model": RegistryProductionPointer(
+                artifact_sha256=artifact,
+                established_by=RegistryPointerChange(
+                    registry_revision=3,
+                    occurred_at_ms=1_000,
+                    event="promoted",
+                    artifact_kind="thermal_model",
+                    model_id="thermal-test",
+                    model_version="0.1.0",
+                    actor="operator",
+                    reason_sha256=registry_reason_sha256("試験用の昇格"),
+                    previous_artifact=None,
+                    rollback_target=None,
+                    approver="operator",
+                    approved_at_ms=500,
+                    approval_artifact_sha256=artifact,
+                ),
+            ),
+        }
+        | {
+            kind: RegistryProductionPointer(artifact_sha256=None, established_by=None)
+            for kind in ("confidence_model", "supervisor_policy", "feature_transform")
+        },
+    )
+
+
+REGISTRY_PROVENANCE = registry_provenance_for("a" * 64)
+"""v10 の `ControlTick` に必須の Model Registry の版（#104 / 決定記録 0071 §2.5）。
+
+v9 と同じく、v10 を名乗る記録はこの欄を省けない。thermal_model の production を試験の
+artifact（`"a" * 64`）にしてある。裏づけのある `model_gate` は production と一致しなければ
+ならない（決定記録 0052 §2.1 の3。codex #4133594515）ため。
+"""
+
 # ---------------------------------------------------------------- 1 tick の記録
 
 
@@ -551,6 +599,7 @@ def tick(demand: EffectiveZoneDemand, faults=(), **state_overrides) -> ControlTi
         faults=faults,
         runtime=CONTROL_TICK_RUNTIME,
         safety_provenance=SAFETY_PROVENANCE,
+        registry=REGISTRY_PROVENANCE,
     )
 
 
@@ -660,6 +709,7 @@ def test_a_front_or_rear_stall_can_stay_degraded():
         faults=(Fault(code=FaultCode.TACH_STALL, zone=Zone.FRONT),),
         runtime=CONTROL_TICK_RUNTIME,
         safety_provenance=SAFETY_PROVENANCE,
+        registry=REGISTRY_PROVENANCE,
     )
     assert recorded.state.safety_state is SafetyState.DEGRADED
 
@@ -688,6 +738,7 @@ def test_stale_cpu_temperature_drives_top_to_max():
         faults=faults,
         runtime=CONTROL_TICK_RUNTIME,
         safety_provenance=SAFETY_PROVENANCE,
+        registry=REGISTRY_PROVENANCE,
     )
     assert recorded.zones.top.demand.forced_max
 
@@ -704,7 +755,7 @@ def test_the_stored_v1_record_still_loads_unchanged():
     stored = FIXTURE.read_text(encoding="utf-8")
     tick = ControlTick.model_validate_json(stored)
     assert tick.schema_version == 1
-    assert SCHEMA_VERSION == 9
+    assert SCHEMA_VERSION == 10
     assert json.loads(tick.model_dump_json()) == json.loads(stored)
 
 
@@ -772,6 +823,7 @@ def test_current_trace_stores_workload_regime_and_confidence_together():
         zones=zones(passthrough()),
         runtime=CONTROL_TICK_RUNTIME,
         safety_provenance=SAFETY_PROVENANCE,
+        registry=REGISTRY_PROVENANCE,
     )
 
     payload = json.loads(recorded.model_dump_json())
@@ -803,6 +855,7 @@ def test_v2_trace_keeps_simultaneous_transient_load_distinct():
         zones=zones(passthrough()),
         runtime=CONTROL_TICK_RUNTIME,
         safety_provenance=SAFETY_PROVENANCE,
+        registry=REGISTRY_PROVENANCE,
     )
 
     payload = json.loads(recorded.model_dump_json())
@@ -819,6 +872,7 @@ def test_fallback_trace_remains_valid_when_regime_is_not_available():
         zones=zones(passthrough()),
         runtime=CONTROL_TICK_RUNTIME,
         safety_provenance=SAFETY_PROVENANCE,
+        registry=REGISTRY_PROVENANCE,
     )
 
     assert recorded.schema_version == SCHEMA_VERSION
@@ -863,6 +917,7 @@ def test_v3_supervisor_policy_requires_a_matching_decision():
             zones=zones(passthrough()),
             runtime=CONTROL_TICK_RUNTIME,
             safety_provenance=SAFETY_PROVENANCE,
+            registry=REGISTRY_PROVENANCE,
         )
 
 
@@ -971,9 +1026,10 @@ def test_the_v9_trace_keeps_disabled_inputs_and_the_provisional_flag():
         zones=zones(passthrough()),
         runtime=CONTROL_TICK_RUNTIME,
         safety_provenance=provenance,
+        registry=REGISTRY_PROVENANCE,
     )
     payload = json.loads(recorded.model_dump_json())
-    assert payload["schema_version"] == 9
+    assert payload["schema_version"] == SCHEMA_VERSION
     assert payload["safety_provenance"] == {
         "schema_version": 1,
         "disabled_inputs": [{"code": "t_sensor_disabled", "detail": "not approved"}],
@@ -989,6 +1045,308 @@ def test_the_safety_provenance_requires_both_fields(missing: str):
     del values[missing]
     with pytest.raises(ValidationError):
         SafetyProvenance.model_validate(values)
+
+
+# ---------------------------------------------------------------- v10: registry の版（#104）
+
+REGISTRY_SHA = "a" * 64
+
+
+def pointer_change(**overrides: object) -> RegistryPointerChange:
+    """`RegistryAuditEvent.tick_trace_metadata()` と同じ欄を持つ promotion の記録。"""
+    values: dict[str, object] = {
+        "registry_revision": 3,
+        "occurred_at_ms": NOW_MS,
+        "event": "promoted",
+        "artifact_kind": "thermal_model",
+        "model_id": "rack-thermal",
+        "model_version": "1.0.0",
+        "actor": "model-operator",
+        "reason_sha256": registry_reason_sha256("shadow evaluation passed"),
+        "previous_artifact": None,
+        "rollback_target": None,
+        "approver": "model-operator",
+        "approved_at_ms": NOW_MS - 1_000,
+        "approval_artifact_sha256": REGISTRY_SHA,
+    }
+    return RegistryPointerChange.model_validate(values | overrides)
+
+
+EMPTY_POINTER = RegistryProductionPointer(artifact_sha256=None, established_by=None)
+
+
+def bound_registry(**overrides: object) -> RegistryProvenance:
+    production = {
+        "thermal_model": RegistryProductionPointer(
+            artifact_sha256=REGISTRY_SHA, established_by=pointer_change()
+        ),
+    } | {
+        kind: EMPTY_POINTER
+        for kind in ("confidence_model", "supervisor_policy", "feature_transform")
+    }
+    values: dict[str, object] = {"revision": 3, "production": production}
+    return RegistryProvenance(**(values | overrides))
+
+
+def registry_tick(registry: RegistryProvenance, **overrides: object) -> ControlTick:
+    values: dict[str, object] = {
+        "tick_id": 1,
+        "ts_ms": NOW_MS,
+        "state": fallback_state(),
+        "zones": zones(passthrough()),
+        "runtime": CONTROL_TICK_RUNTIME,
+        "safety_provenance": SAFETY_PROVENANCE,
+        "registry": registry,
+    }
+    return ControlTick(**(values | overrides))
+
+
+def test_a_v10_tick_round_trips_the_registry_pointer_it_used():
+    """**tick が使っていた pointer と revision が、保存と読み戻しで失われない**（0071 §2.5）。"""
+    recorded = registry_tick(bound_registry())
+
+    payload = json.loads(recorded.model_dump_json())
+    assert payload["schema_version"] == SCHEMA_VERSION == 10
+    assert payload["registry"]["revision"] == 3
+    thermal = payload["registry"]["production"]["thermal_model"]
+    assert thermal["artifact_sha256"] == REGISTRY_SHA
+    assert thermal["established_by"]["registry_revision"] == 3
+    assert thermal["established_by"]["approver"] == "model-operator"
+    # 欄は常に揃える。production の無い kind も None の欄で残す（0062 §2.5）。
+    assert payload["registry"]["production"]["confidence_model"] == {
+        "artifact_sha256": None,
+        "established_by": None,
+    }
+    assert set(thermal["established_by"]) == {
+        "registry_revision",
+        "occurred_at_ms",
+        "event",
+        "artifact_kind",
+        "model_id",
+        "model_version",
+        "actor",
+        "reason_sha256",
+        "previous_artifact",
+        "rollback_target",
+        "approver",
+        "approved_at_ms",
+        "approval_artifact_sha256",
+    }
+    assert ControlTick.model_validate_json(recorded.model_dump_json()) == recorded
+
+
+def test_a_v10_tick_carries_only_the_reason_digest():
+    """**毎 tick の塊に `reason` の全文を載せない。** digest だけを置く（決定記録 0075）。"""
+    reason = "昇格の理由。" * 150  # audit が許す上限（1000字）に近い全文
+    change = pointer_change(reason_sha256=registry_reason_sha256(reason))
+    recorded = registry_tick(
+        bound_registry(
+            production={
+                "thermal_model": RegistryProductionPointer(
+                    artifact_sha256=REGISTRY_SHA, established_by=change
+                ),
+            }
+            | {
+                kind: EMPTY_POINTER
+                for kind in ("confidence_model", "supervisor_policy", "feature_transform")
+            }
+        )
+    )
+
+    stored = recorded.model_dump_json()
+    thermal = json.loads(stored)["registry"]["production"]["thermal_model"]["established_by"]
+    assert "reason" not in thermal
+    assert thermal["reason_sha256"] == registry_reason_sha256(reason)
+    assert "昇格の理由" not in stored
+    assert ControlTick.model_validate_json(stored) == recorded
+
+
+def test_the_reason_digest_is_the_sha256_of_the_utf8_reason():
+    """audit の全文から誰でも同じ digest を計算して照合できる（決定記録 0075）。"""
+    assert registry_reason_sha256("shadow evaluation passed") == (
+        hashlib.sha256(b"shadow evaluation passed").hexdigest()
+    )
+    assert registry_reason_sha256("回帰を観測") == (
+        hashlib.sha256("回帰を観測".encode()).hexdigest()
+    )
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"reason": "shadow evaluation passed"},
+        {"reason_sha256": "not-a-digest"},
+        {"previous_artifact": "x" * 241},
+        {"rollback_target": "x" * 241},
+    ],
+)
+def test_a_pointer_change_rejects_free_text_and_unbounded_labels(overrides: dict[str, object]):
+    """全文の `reason` は受け取らず、識別子の欄も長さを閉じる（決定記録 0075 §2.2）。"""
+    with pytest.raises(ValidationError):
+        pointer_change(**overrides)
+
+
+def test_a_v10_tick_without_a_registry_read_records_it_explicitly():
+    """registry を読んでいない構成は `revision=None` の塊を持つ。**欄を省いて表さない。**"""
+    recorded = registry_tick(RegistryProvenance.unbound())
+
+    payload = json.loads(recorded.model_dump_json())
+    assert payload["registry"] == {"schema_version": 1, "revision": None, "production": {}}
+    assert ControlTick.model_validate_json(recorded.model_dump_json()) == recorded
+
+
+def test_a_v10_tick_cannot_claim_the_version_without_the_registry():
+    """**v10 は registry の版を省けない**（#104）。無いと、どの pointer の下の判断か言えない。"""
+    with pytest.raises(ValidationError, match="registry が要る"):
+        ControlTick(
+            tick_id=1,
+            ts_ms=NOW_MS,
+            state=fallback_state(),
+            zones=zones(passthrough()),
+            runtime=CONTROL_TICK_RUNTIME,
+            safety_provenance=SAFETY_PROVENANCE,
+        )
+
+
+@pytest.mark.parametrize("schema_version", [1, 2, 3, 4, 5, 6, 7, 8, 9])
+def test_a_stored_trace_before_v10_loads_without_the_registry(schema_version: int):
+    """保存済みの v1〜v9 は欄を持たないまま読め、書き戻しても欄が現れない（決定記録 0030）。"""
+    stored = ControlTick(
+        schema_version=schema_version,
+        tick_id=1,
+        ts_ms=NOW_MS,
+        state=fallback_state(),
+        zones=zones(passthrough()),
+        runtime=CONTROL_TICK_RUNTIME if schema_version >= 8 else None,
+        safety_provenance=SAFETY_PROVENANCE if schema_version >= 9 else None,
+    )
+    restored = ControlTick.model_validate_json(stored.model_dump_json())
+    assert restored.schema_version == schema_version
+    assert restored.registry is None
+    assert "registry" not in json.loads(stored.model_dump_json())
+
+
+@pytest.mark.parametrize("schema_version", [1, 5, 8, 9])
+def test_a_legacy_trace_cannot_carry_the_registry_added_in_v10(schema_version: int):
+    """v10 の欄を持つ記録に旧い版を名乗らせない。旧い reader は欄を知らない。"""
+    with pytest.raises(ValidationError, match="schema version 10"):
+        ControlTick(
+            schema_version=schema_version,
+            tick_id=1,
+            ts_ms=NOW_MS,
+            state=fallback_state(),
+            zones=zones(passthrough()),
+            runtime=CONTROL_TICK_RUNTIME if schema_version >= 8 else None,
+            safety_provenance=SAFETY_PROVENANCE if schema_version >= 9 else None,
+            registry=bound_registry(),
+        )
+
+
+@pytest.mark.parametrize(
+    ("overrides", "message"),
+    [
+        ({"event": "registered"}, "promotion / rollback だけ"),
+        ({"event": "retired"}, "promotion / rollback だけ"),
+        ({"approver": None}, "human approval"),
+        ({"approved_at_ms": None}, "human approval"),
+        ({"approval_artifact_sha256": None}, "checksum"),
+        ({"approver": "someone-else"}, "approver"),
+        ({"approved_at_ms": NOW_MS + 1}, "未来"),
+        ({"event": "rolled_back", "rollback_target": "thermal_model/x/1.0.0"}, "rollback_target"),
+    ],
+)
+def test_a_pointer_change_is_an_approved_promotion_or_rollback(
+    overrides: dict[str, object], message: str
+):
+    with pytest.raises(ValidationError, match=message):
+        pointer_change(**overrides)
+
+
+def test_a_pointer_change_keeps_every_field_of_the_audit_metadata():
+    """欄を1つでも落とした記録は受け付けない（「記録されていない」と「起きていない」を混ぜない）。"""
+    values = pointer_change().model_dump()
+    del values["rollback_target"]
+    with pytest.raises(ValidationError):
+        RegistryPointerChange.model_validate(values)
+
+
+def test_a_production_pointer_and_its_change_are_recorded_together():
+    with pytest.raises(ValidationError, match="一緒に記録"):
+        RegistryProductionPointer(artifact_sha256=REGISTRY_SHA, established_by=None)
+    with pytest.raises(ValidationError, match="一緒に記録"):
+        RegistryProductionPointer(artifact_sha256=None, established_by=pointer_change())
+    with pytest.raises(ValidationError, match="承認した checksum"):
+        RegistryProductionPointer(artifact_sha256="b" * 64, established_by=pointer_change())
+
+
+@pytest.mark.parametrize(
+    ("overrides", "message"),
+    [
+        # registry を読んでいないのに pointer を持つ
+        ({"revision": None}, "読んでいない"),
+        # snapshot の revision より後の変更
+        ({"revision": 2}, "revision より後"),
+        # 別 kind の変更を載せる
+        (
+            {
+                "production": {
+                    "thermal_model": EMPTY_POINTER,
+                    "confidence_model": RegistryProductionPointer(
+                        artifact_sha256=REGISTRY_SHA, established_by=pointer_change()
+                    ),
+                    "supervisor_policy": EMPTY_POINTER,
+                    "feature_transform": EMPTY_POINTER,
+                }
+            },
+            "変更を揃える",
+        ),
+        # 1つの変更を2つの kind に載せる
+        (
+            {
+                "production": {
+                    "thermal_model": RegistryProductionPointer(
+                        artifact_sha256=REGISTRY_SHA, established_by=pointer_change()
+                    ),
+                    "confidence_model": RegistryProductionPointer(
+                        artifact_sha256=REGISTRY_SHA,
+                        established_by=pointer_change(artifact_kind="confidence_model"),
+                    ),
+                    "supervisor_policy": EMPTY_POINTER,
+                    "feature_transform": EMPTY_POINTER,
+                }
+            },
+            "複数の kind",
+        ),
+    ],
+)
+def test_registry_pointers_belong_to_the_recorded_revision(
+    overrides: dict[str, object], message: str
+):
+    with pytest.raises(ValidationError, match=message):
+        bound_registry(**overrides)
+
+
+@pytest.mark.parametrize(
+    "production",
+    [
+        {},
+        {"thermal_model": EMPTY_POINTER},
+        {kind: EMPTY_POINTER for kind in REGISTRY_ARTIFACT_KINDS} | {"extra_model": EMPTY_POINTER},
+    ],
+)
+def test_a_registry_read_records_every_kind(production: dict[str, RegistryProductionPointer]):
+    """registry を読んだなら**全 kind の欄を揃える**（0062 §2.5）。欠けた記録は受け付けない。
+
+    欠けていると「その kind は production が無かった」のか「記録されていない」のかを
+    読む側が区別できない。
+    """
+    with pytest.raises(ValidationError, match="全 kind"):
+        RegistryProvenance(revision=3, production=production)
+
+
+def test_the_registry_revision_cannot_be_negative():
+    with pytest.raises(ValidationError):
+        RegistryProvenance(revision=-1, production={})
 
 
 def test_the_stored_record_explains_every_changed_zone():
@@ -1092,7 +1450,11 @@ def learned_tick(**overrides) -> ControlTick:
         "runtime": CONTROL_TICK_RUNTIME,
         # v9 を名乗る記録は Safety の裁定の前提を省けない（#78）。
         "safety_provenance": SAFETY_PROVENANCE,
+        # v10 を名乗る記録は registry の版を省けない（#104）。
+        "registry": REGISTRY_PROVENANCE,
     }
+    if overrides.get("schema_version", SCHEMA_VERSION) < 10:
+        values.pop("registry")
     if overrides.get("schema_version", SCHEMA_VERSION) < 9:
         values.pop("safety_provenance")
     if overrides.get("schema_version", SCHEMA_VERSION) < 8:
@@ -1110,6 +1472,67 @@ def test_v7_trace_records_the_artifact_that_produced_the_applied_proposal():
     assert restored.model_gate.artifact_sha256 == ARTIFACT
     assert restored.applied_model_artifact == ARTIFACT
     assert restored.applied_artifact_unknown is False
+
+
+def test_an_attested_artifact_needs_the_registry_that_bound_it():
+    """**registry を読んでいない記録に、裏づけのある artifact を載せない**（codex #4133594515）。
+
+    Learned MPC を制御へ束縛できるのは production pointer だけ（決定記録 0052 §2.1 の3）で、
+    その pointer は registry を読まなければ得られない。
+    """
+    with pytest.raises(ValidationError, match="registry を読んでいる"):
+        learned_tick(registry=RegistryProvenance.unbound())
+
+
+def test_an_attested_artifact_must_be_the_recorded_production():
+    """**別の artifact を production に持つ registry の版と組み合わせない**（codex #4133594515）。
+
+    組み合わせられると、artifact B の判断を artifact A の昇格の下で出たものとして記録できる。
+    """
+    with pytest.raises(ValidationError, match="thermal_model の production と揃える"):
+        learned_tick(registry=registry_provenance_for("f" * 64))
+
+    other = {
+        kind: pointer
+        for kind, pointer in REGISTRY_PROVENANCE.production.items()
+        if kind != "thermal_model"
+    }
+    with pytest.raises(ValidationError, match="thermal_model の production と揃える"):
+        learned_tick(
+            registry=RegistryProvenance(
+                revision=3,
+                production=other
+                | {
+                    "thermal_model": RegistryProductionPointer(
+                        artifact_sha256=None, established_by=None
+                    )
+                },
+            )
+        )
+
+
+def test_an_unattested_gate_does_not_need_a_registry_read():
+    """裏づけの無い判断は artifact を持たないので、registry を読んでいない記録でもよい。"""
+    recorded = learned_tick(
+        state=fallback_state(
+            authority_stage=AuthorityStage.LIMITED,
+            fallback_reason=Reason(code="low_confidence"),
+            model_version="0.1.0",
+        ),
+        model_gate=model_gate(
+            artifact_sha256=None,
+            attested=False,
+            confidence=None,
+            ood=None,
+            confidence_level=ConfidenceLevel.LOW,
+            learned_selected=False,
+            limits=(),
+            assessment=(),
+        ),
+        registry=RegistryProvenance.unbound(),
+    )
+
+    assert recorded.registry == RegistryProvenance.unbound()
 
 
 @pytest.mark.parametrize("schema_version", [5, 6])
@@ -1224,6 +1647,7 @@ def test_a_tick_cannot_claim_two_different_artifacts():
             ts_ms=NOW_MS,
             runtime=CONTROL_TICK_RUNTIME,
             safety_provenance=SAFETY_PROVENANCE,
+            registry=REGISTRY_PROVENANCE,
             state=fallback_state(
                 authority_stage=AuthorityStage.LIMITED,
                 fallback_reason=Reason(code="low_confidence"),

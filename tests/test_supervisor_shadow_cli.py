@@ -56,7 +56,13 @@ from coldaisle.supervisor_shadow import (
     render,
 )
 from test_control_config import valid_documents, write_documents
-from test_control_schema import SAFETY_PROVENANCE, fallback_state, passthrough, zones
+from test_control_schema import (
+    REGISTRY_PROVENANCE,
+    SAFETY_PROVENANCE,
+    fallback_state,
+    passthrough,
+    zones,
+)
 from test_rl_supervisor_policy import (
     artifact,
     register_policy,
@@ -240,6 +246,7 @@ class Fixture:
                 ),
             ),
             safety_provenance=SAFETY_PROVENANCE,
+            registry=REGISTRY_PROVENANCE,
         )
 
 

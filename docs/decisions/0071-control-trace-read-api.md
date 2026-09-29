@@ -6,6 +6,7 @@
 - **Supersedes**: なし。次の未決事項に答える記録であり、各記録の本文は書き換えない
   - [0046](0046-airflow-ui.md) §5 #2（判断記録を読む API の形）
   - [0062](0062-model-registry-operations.md) §5 の1項目め（registry の lifecycle event を decision trace へ載せるか）
+- **Superseded by**: [0075](0075-trace-registry-block-reason-digest.md)（§2.5 のうち、pointer を成立させた変更の `trace_metadata()` を自由記述の `reason` の全文ごと毎 tick 載せる部分のみ。毎 tick の塊では `reason` を `reason_sha256` にする。§2.5 の残りと他の節は有効）
 - **関連**: [0009](0009-read-api.md)（GET-only・環境変数の設定・`truncated`）/
   [0015](0015-llm-tools.md) / [0018](0018-tool-exposure.md) /
   [0028](0028-fan-control-contracts.md) §2.2 / §2.3 /

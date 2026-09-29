@@ -1233,6 +1233,9 @@ def _tick_for_schema_version(version: int, *, ts_ms: int, tick_id: int) -> Contr
             "disabled_inputs": [],
             "config_is_provisional": False,
         }
+    if version >= 10:
+        # v10も同じく、tickが使っていたregistryの版を省いた記録を作れない（#104）
+        raw["registry"] = {"schema_version": 1, "revision": None, "production": {}}
     return ControlTick.model_validate_json(json.dumps(raw))
 
 
