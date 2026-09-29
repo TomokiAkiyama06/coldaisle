@@ -76,7 +76,14 @@ GPU Manager などの書き手が入る。モード変更を足すと、その�
 
 ### 2.2 管理ソケットは `coldaisle-fand` のプロセス内の別スレッドが持ち、loop は待たない
 
-- 待ち受けは `coldaisle-fand` の中の**受付スレッド1本**。受付スレッドは loop の状態
+- 待ち受けは `coldaisle-fand` の中の**受付スレッド1本**。ただし受付スレッドは接続を1つずつ
+  直列に処理しない。**I/O 多重化（`selectors`）で複数の接続を同時に持ち**、ある接続の要求の
+  受信・適用の確認待ち（下）・応答の送信の途中でも、新しい接続を受け付けて次の指令を
+  受け渡し口へ置ける。直列にすると、1件の確認待ちや遅いクライアントの読み取り
+  （`limits.read_timeout_s`）の間、後から来た `set_mode(max)` や rollback が次の tick の
+  受け渡し口に入れず、下の同じ軸の置き換え・合成の規則も働かない
+  （接続の同時数の上限は `limits.max_connections`。超えた接続は閉じて接続ごとのログに残す）
+- 受付スレッドは loop の状態
   （`ControlLoop` / `ControllerGate` / `AuthorityRuntime`）に**一切触れない**
 - 受付スレッドは検証済みの指令を**受け渡し口**（mailbox）へ置くだけにする。受け渡し口は
   **状態の軸ごとに1枠**（モードの枠と authority の枠の2枠）を持つ。loop は tick の先頭で1回だけ
@@ -92,7 +99,8 @@ GPU Manager などの書き手が入る。モード変更を足すと、その�
     先の rollback を打ち消さない）
   - 採られなかった指令は `superseded` として応答・監査に残す（§2.7）
 - loop は適用した指令の `command_id` と `tick_id` を受け渡し口へ返す。受付スレッドは
-  それを `apply_ack_timeout_ms` まで待って応答する（**待つのは受付スレッドで、loop ではない**）。
+  それを `apply_ack_timeout_ms` まで待って応答する（**待つのは受付スレッドで、loop ではない**。
+  待つ間も、上の多重化により他の接続の受付は止まらない）。
   時間内に適用されなければ `{"ok": true, "applied": false, "pending": true}` を返し、
   適用は取り消さない（遅れて効いたことは監査と decision trace に残る）
 - **受付スレッドが死んでも制御は止めない。** error を構造化ログに残し、loop は直前の
@@ -221,8 +229,19 @@ GPU Manager などの書き手が入る。モード変更を足すと、その�
 - **走行中に journal が読めない・壊れているときは、その process の in-memory の上限を
   `SHADOW` に下げる**（`authority_journal_unreadable`）。0057 §2.1 は壊れた journal を起動時に
   `AuthorityStateError` で止めるが、走行中に止めると冷却が止まる。止めずに、**読めない間は
-  制御権を最小にする**。次に正しく読めたら 0057 §2.6 の規則どおり（書き残した降格は journal が
-  表すので、in-memory の上限はこの理由の分だけ外す）
+  制御権を最小にする**。
+- **この上限は、正しく読めるようになっただけでは外さない。** これは 0057 §2.6 の自動降格の
+  1つ（原因は `authority_journal_unreadable`）として扱い、同じ規則に従う。すなわち
+  「先に in-memory、あとで journal」で、loop は次の tick 以降（heartbeat の後、lock の待ち上限つき。
+  0060 §2.7）に `lower_stage(to_stage=SHADOW)` で journal へ書き残しを試みる。
+  **書けたら** journal が `SHADOW` を表すので in-memory の上限を手放す（0057 §2.6 の「書けたら
+  手放す」。下げ先は journal と同じなので authority は上がらない）。**書けなければ**上限を
+  持ち続け、`reload()` でも外れない（0057 §2.6）。読めたときの journal が高い stage を
+  表していても、それを理由に戻さない。一時的な読み取りの失敗のあとで、状態の整合性が
+  崩れた可能性のある journal を「読めたから」と信じて制御権を自動で戻すと、0057 §2.6
+  「下がったあとに自動で戻る経路は無い」に反する。戻すには 0057 §2.3 の承認による昇格
+  （`SHADOW` から1段ずつ）が要る
+- `AutomaticCause` に `authority_journal_unreadable` を足す（journal の版の扱いは段階 2 の実装 PR で決める）
 
 ### 2.7 監査：全接続をログに、状態を変えた指令を追記専用の表に残す
 
@@ -235,9 +254,14 @@ GPU Manager などの書き手が入る。モード変更を足すと、その�
   適用した tick も分からないため、結果の列を後から埋める形にすると追記専用のトリガと両立しない。
   - 受付の行（`event = accepted`）: `command_id`・受付時刻（壁時計）・`peer_uid`・`op`・
     検証済みの本文。**受け渡し口へ置く前に**書く（弱めうる指令は、この行が書けたときだけ置く）
-  - 結末の行（`event = applied` / `superseded` / `expired`）: 同じ `command_id`・記録時刻・
-    `applied` なら適用した `tick_id`、`superseded` なら置き換えた `command_id`、`expired` は
-    `MANUAL` の lease 切れ。1つの `command_id` に結末の行は**高々1つ**（一意制約）
+  - 結末の行（`event = applied` / `superseded`）: 同じ `command_id`・記録時刻・
+    `applied` なら適用した `tick_id`、`superseded` なら置き換えた `command_id`。
+    1つの `command_id` に結末の行は**高々1つ**（一意制約）
+  - lease 切れの行（`event = lease_expired`）: **結末の行とは別の事象**として足す。適用された
+    `MANUAL` はまず `applied` の結末を持ち、そのあと人がモードを変えないまま期限が来たときに
+    この行が加わる（同じ `command_id`・記録時刻・期限切れを判定した `tick_id`）。
+    1つの `command_id` に**高々1つ**（結末の行とは別の一意制約）。`applied` の結末を持つ
+    `MANUAL` の指令にだけ書く
   - 拒否（検証の失敗・認可の失敗・弱めうる指令で受付の行を書けなかった）は受付の行を作らず、
     接続ごとのログ（上）にだけ残す
   - 受付の行があって結末の行が無い指令は「受理済み・未確定」（応答の `pending` と同じ状態）として
@@ -255,7 +279,7 @@ GPU Manager などの書き手が入る。モード変更を足すと、その�
 - decision trace の各 tick にはすでに `operating_mode` と `authority_stage` が残る。
   加えて、その tick に効いていたモードを決めた `command_id` と、`MANUAL` の期限切れを
   残す（`ControlTick` の版を上げる。番号は実装 PR が他の PR と取り合わないように決める）
-- lease 切れ（`expired`）と、loop が適用したときの結末の行は、loop の tick の中では書かない。
+- lease 切れの行（`lease_expired`）と、loop が適用したときの結末の行は、loop の tick の中では書かない。
   loop は結果を受け渡し口へ返すだけで、書くのは受付スレッドの側（loop は DB を待たない。0060 §2.3）
 - `status` は、いまのモード・`command_id`・`MANUAL` の残り期限・実効 stage・journal の stage・
   設定の上限・`persist_failure`・入口の起動状態を返す。**読み取り API には出さない**
@@ -268,6 +292,7 @@ GPU Manager などの書き手が入る。モード変更を足すと、その�
 | `socket.path` / `socket.mode` / `socket.group` | 0045 §2.2 と同じ規則（other のビット・setuid / setgid / sticky は拒否） |
 | `authorization.allow_same_user` | 既定 `false`。`true` は `socket.group: null` の開発用のときだけ許す |
 | `limits.max_message_bytes` / `limits.read_timeout_s` | 0045 と同じ意味 |
+| `limits.max_connections` | 受付スレッドが同時に持つ接続の上限（§2.2） |
 | `apply_ack_timeout_ms` | `>= tick_ms + tick_deadline_ms`（起動時に `safety.yaml` と照合） |
 | `manual.max_lease_s` | `MANUAL` の期限に書ける上限。`status` / `basis` 付きの暫定値 |
 
@@ -292,8 +317,8 @@ GPU Manager などの書き手が入る。モード変更を足すと、その�
 
 | 段階 | 内容 | 前提 |
 |---|---|---|
-| 1 | 管理ソケット（`AUTO` / `MAX` / `MANUAL` と lease、`lower_authority` / `rollback_authority`、`status`）・監査の表・`coldaisle-control` クライアント・§2.9 の試験 | 本記録の承認 |
-| 2 | `AuthorityRuntime` を `coldaisle-fand` へ配線し、journal の変化を毎 tick 検知する（§2.6） | 段階 1 |
+| 1 | 管理ソケット（`AUTO` / `MAX` / `MANUAL` と lease、`status`）・受け渡し口のモードの枠・監査の表・`coldaisle-control` クライアント・§2.9 の試験。**この段階では `lower_authority` / `rollback_authority` を受理しない**（`unsupported_op` で拒否） | 本記録の承認 |
+| 2 | `AuthorityRuntime` を `coldaisle-fand` へ配線し、受け渡し口の authority の枠と `lower_authority` / `rollback_authority` の受理を足し、journal の変化を毎 tick 検知する（§2.6） | 段階 1 |
 | 3 | `coldaisle-authority raise` / `rollback` の CLI | 段階 2（昇格が走行中の loop に届くため） |
 | 4 | `CALIBRATION` の受理 | #75 の測定計画の形 |
 
@@ -356,7 +381,7 @@ GPU Manager などの書き手が入る。モード変更を足すと、その�
 | 1 | `CALIBRATION` の指令の形（#75 の測定計画をどう参照し、いつ終わるか） | #75 |
 | 2 | Workspace / GUI（#60）に管理ソケットの権限を渡すか。渡すなら §4 の J（安全側だけのグループ）を含めて決める | #60（本記録では渡さない） |
 | 3 | `coldaisle-fand` の実行ユーザー・管理グループ名・`RuntimeDirectory`・`authority.json` のディレクトリの所有者 | 0060 未決 7 / #57（0069 の後続） |
-| 4 | `apply_ack_timeout_ms`・`manual.max_lease_s`・`limits` の値 | 段階 1 の実装で暫定値、運用後に所有者 |
+| 4 | `apply_ack_timeout_ms`・`manual.max_lease_s`・`limits`（`max_connections` を含む）の値 | 段階 1 の実装で暫定値、運用後に所有者 |
 | 5 | 昇格の承認者（`StageApproval.approver`）を CLI の実行 uid に束縛するか。束縛するなら journal の版を上げる | #92 の段階 3 |
 | 6 | 監査の表の DDL・migration、`ControlTick` の版番号 | 段階 1 の実装 PR |
 | 7 | いまのモードと stage を読み取り API（Server Health など）に出すか | 別の決定記録（0009 / 0040 の拡張） |
