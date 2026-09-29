@@ -51,7 +51,8 @@ SCHEMA_VERSION: Literal[10] = 10
   「確定値で回っていた」ではない）
 - v10（#104 / 決定記録 0071 §2.5）: tick が使っていた Model Registry の版（`registry`）。
   registry の `revision` と、kind ごとの production pointer・それを成立させた pointer 変更の
-  `RegistryAuditEvent.trace_metadata()`。**v10 には必須**で、保存済みの v1〜v9 は欄なしのまま
+  `RegistryAuditEvent.trace_metadata()`（ただし自由記述の `reason` は全文でなく `reason_sha256`。
+  決定記録 0075）。**v10 には必須**で、保存済みの v1〜v9 は欄なしのまま
   読める（「記録が無い」であって「production が無かった」ではない）
 """
 
@@ -1117,12 +1118,32 @@ _REGISTRY_IDENTIFIER_PATTERN = r"^[a-z][a-z0-9_.-]*$"
 """Registry の kind・model id・actor の形（`model_registry._IDENTIFIER_PATTERN` と同じ）。"""
 
 
-class RegistryPointerChange(_Frozen):
-    """production pointer を成立させた変更の、path を含まない記録（決定記録 0071 §2.5）。
+_REGISTRY_REF_LABEL_MAX_LENGTH = 240
+"""`ArtifactRef.key`（`<kind>/<model_id>/<version>`）の長さの上限。
 
-    `RegistryAuditEvent.trace_metadata()` の欄を**そのまま・全部**持つ。欄を落とすと、
-    読む側が「記録されていない」と「起きていない」を区別できない（決定記録 0062 §2.5）。
+各部の上限（kind は語彙・model id 120・version 80）と区切りの和を下回らない値。
+毎 tick 載る欄なので、識別子であっても長さを schema で閉じる（決定記録 0075 §2.2）。
+"""
+
+
+def registry_reason_sha256(reason: str) -> str:
+    """registry の audit の `reason` を、毎 tick の塊に載せる digest にする（決定記録 0075）。
+
+    UTF-8 の bytes の SHA-256（小文字16進）。全文の正本は registry の audit であり
+    （`coldaisle-registry audit --pointer-changes`）、digest はそれと照合するためだけに置く。
+    """
+    return hashlib.sha256(reason.encode("utf-8")).hexdigest()
+
+
+class RegistryPointerChange(_Frozen):
+    """production pointer を成立させた変更の、path を含まない記録（決定記録 0071 §2.5 / 0075）。
+
+    `RegistryAuditEvent.trace_metadata()` の欄を**全部**持つ。欄を落とすと、読む側が
+    「記録されていない」と「起きていない」を区別できない（決定記録 0062 §2.5）。
+    ただし**自由記述の `reason` だけは全文を持たず、`reason_sha256` に置き換える**
+    （決定記録 0075。毎 tick 載るため、最大1000字の全文は保存量を押し上げる）。
     誰が・なぜ・いつ承認したかの正本は `registry.json` の audit であり、ここは写しである。
+    `RegistryAuditEvent.tick_trace_metadata()` がこの形を作る。
     """
 
     registry_revision: int = Field(ge=1)
@@ -1132,9 +1153,10 @@ class RegistryPointerChange(_Frozen):
     model_id: str = Field(pattern=_REGISTRY_IDENTIFIER_PATTERN, max_length=120)
     model_version: str = Field(min_length=1, max_length=80)
     actor: str = Field(pattern=_REGISTRY_IDENTIFIER_PATTERN, max_length=120)
-    reason: str = Field(min_length=1, max_length=1000)
-    previous_artifact: str | None
-    rollback_target: str | None
+    reason_sha256: Sha256Hex
+    """audit の `reason` の UTF-8 の SHA-256（`registry_reason_sha256`）。全文は audit で引く。"""
+    previous_artifact: str | None = Field(max_length=_REGISTRY_REF_LABEL_MAX_LENGTH)
+    rollback_target: str | None = Field(max_length=_REGISTRY_REF_LABEL_MAX_LENGTH)
     approver: str | None
     approved_at_ms: int | None = Field(ge=0)
     approval_artifact_sha256: Sha256Hex | None

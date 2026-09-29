@@ -40,7 +40,11 @@ from coldaisle.control import (
     UnsafeRegistryPathError,
     load_model_registry_limits,
 )
-from coldaisle.control.schema import REGISTRY_ARTIFACT_KINDS, REGISTRY_POINTER_CHANGE_EVENTS
+from coldaisle.control.schema import (
+    REGISTRY_ARTIFACT_KINDS,
+    REGISTRY_POINTER_CHANGE_EVENTS,
+    registry_reason_sha256,
+)
 
 NOW_MS = 1_800_000_000_000
 CONFIG_DIR = Path(__file__).resolve().parents[1] / "config"
@@ -1740,8 +1744,12 @@ def test_trace_provenance_names_the_pointer_change_that_established_production(
     thermal = provenance.production[ArtifactKind.THERMAL_MODEL.value]
     assert thermal.artifact_sha256 == metadata("1.0.0").sha256
     assert thermal.established_by is not None
-    # 写しは `trace_metadata()` と欄も値も同じ。path を含まない（0062 §2.5）。
-    assert thermal.established_by.model_dump() == snapshot.audit[-1].trace_metadata()
+    # 写しは `trace_metadata()` と同じ欄・値で、自由記述の `reason` だけを digest に置き換える。
+    # path を含まない（0062 §2.5 / 決定記録 0075）。
+    audit = snapshot.audit[-1].trace_metadata()
+    assert thermal.established_by.reason_sha256 == registry_reason_sha256(str(audit.pop("reason")))
+    assert thermal.established_by.model_dump(exclude={"reason_sha256"}) == audit
+    assert snapshot.audit[-1].reason not in provenance.model_dump_json()
     assert thermal.established_by.event == RegistryEventKind.ROLLED_BACK.value
     assert str(tmp_path) not in provenance.model_dump_json()
     # candidate の登録や検証は pointer を動かさないので載らない。

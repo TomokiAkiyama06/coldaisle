@@ -10,6 +10,7 @@
 """
 
 import ast
+import hashlib
 import json
 import math
 from pathlib import Path
@@ -50,7 +51,11 @@ from coldaisle.control import (
     ZoneRecord,
     ZoneRequest,
 )
-from coldaisle.control.schema import MODEL_GATE_ASSESSMENT_COMPONENTS, REGISTRY_ARTIFACT_KINDS
+from coldaisle.control.schema import (
+    MODEL_GATE_ASSESSMENT_COMPONENTS,
+    REGISTRY_ARTIFACT_KINDS,
+    registry_reason_sha256,
+)
 
 SRC = Path(__file__).resolve().parents[1] / "src" / "coldaisle"
 FIXTURE = Path(__file__).resolve().parent / "fixtures" / "control_tick_v1.json"
@@ -558,7 +563,7 @@ def registry_provenance_for(artifact: str) -> RegistryProvenance:
                     model_id="thermal-test",
                     model_version="0.1.0",
                     actor="operator",
-                    reason="試験用の昇格",
+                    reason_sha256=registry_reason_sha256("試験用の昇格"),
                     previous_artifact=None,
                     rollback_target=None,
                     approver="operator",
@@ -1048,7 +1053,7 @@ REGISTRY_SHA = "a" * 64
 
 
 def pointer_change(**overrides: object) -> RegistryPointerChange:
-    """`RegistryAuditEvent.trace_metadata()` と同じ欄を持つ promotion の記録。"""
+    """`RegistryAuditEvent.tick_trace_metadata()` と同じ欄を持つ promotion の記録。"""
     values: dict[str, object] = {
         "registry_revision": 3,
         "occurred_at_ms": NOW_MS,
@@ -1057,7 +1062,7 @@ def pointer_change(**overrides: object) -> RegistryPointerChange:
         "model_id": "rack-thermal",
         "model_version": "1.0.0",
         "actor": "model-operator",
-        "reason": "shadow evaluation passed",
+        "reason_sha256": registry_reason_sha256("shadow evaluation passed"),
         "previous_artifact": None,
         "rollback_target": None,
         "approver": "model-operator",
@@ -1120,7 +1125,7 @@ def test_a_v10_tick_round_trips_the_registry_pointer_it_used():
         "model_id",
         "model_version",
         "actor",
-        "reason",
+        "reason_sha256",
         "previous_artifact",
         "rollback_target",
         "approver",
@@ -1128,6 +1133,57 @@ def test_a_v10_tick_round_trips_the_registry_pointer_it_used():
         "approval_artifact_sha256",
     }
     assert ControlTick.model_validate_json(recorded.model_dump_json()) == recorded
+
+
+def test_a_v10_tick_carries_only_the_reason_digest():
+    """**毎 tick の塊に `reason` の全文を載せない。** digest だけを置く（決定記録 0075）。"""
+    reason = "昇格の理由。" * 150  # audit が許す上限（1000字）に近い全文
+    change = pointer_change(reason_sha256=registry_reason_sha256(reason))
+    recorded = registry_tick(
+        bound_registry(
+            production={
+                "thermal_model": RegistryProductionPointer(
+                    artifact_sha256=REGISTRY_SHA, established_by=change
+                ),
+            }
+            | {
+                kind: EMPTY_POINTER
+                for kind in ("confidence_model", "supervisor_policy", "feature_transform")
+            }
+        )
+    )
+
+    stored = recorded.model_dump_json()
+    thermal = json.loads(stored)["registry"]["production"]["thermal_model"]["established_by"]
+    assert "reason" not in thermal
+    assert thermal["reason_sha256"] == registry_reason_sha256(reason)
+    assert "昇格の理由" not in stored
+    assert ControlTick.model_validate_json(stored) == recorded
+
+
+def test_the_reason_digest_is_the_sha256_of_the_utf8_reason():
+    """audit の全文から誰でも同じ digest を計算して照合できる（決定記録 0075）。"""
+    assert registry_reason_sha256("shadow evaluation passed") == (
+        hashlib.sha256(b"shadow evaluation passed").hexdigest()
+    )
+    assert registry_reason_sha256("回帰を観測") == (
+        hashlib.sha256("回帰を観測".encode()).hexdigest()
+    )
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"reason": "shadow evaluation passed"},
+        {"reason_sha256": "not-a-digest"},
+        {"previous_artifact": "x" * 241},
+        {"rollback_target": "x" * 241},
+    ],
+)
+def test_a_pointer_change_rejects_free_text_and_unbounded_labels(overrides: dict[str, object]):
+    """全文の `reason` は受け取らず、識別子の欄も長さを閉じる（決定記録 0075 §2.2）。"""
+    with pytest.raises(ValidationError):
+        pointer_change(**overrides)
 
 
 def test_a_v10_tick_without_a_registry_read_records_it_explicitly():

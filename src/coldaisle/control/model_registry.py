@@ -40,6 +40,7 @@ from coldaisle.control.schema import (
     RegistryPointerChange,
     RegistryProductionPointer,
     RegistryProvenance,
+    registry_reason_sha256,
 )
 
 MODEL_REGISTRY_SCHEMA_VERSION: Literal[3] = 3
@@ -370,6 +371,18 @@ class RegistryAuditEvent(_Frozen):
             "approval_artifact_sha256": None if approval is None else approval.artifact_sha256,
         }
 
+    def tick_trace_metadata(self) -> dict[str, object]:
+        """decision trace の**毎 tick** に載せる形（`RegistryPointerChange`。決定記録 0075）。
+
+        `trace_metadata()` と同じ欄から、自由記述の `reason`（最大1000字）だけを除き、
+        その UTF-8 の SHA-256 を `reason_sha256` として置く。毎 tick 全文を写すと保存量が
+        保持期間ぶん積み上がるため。全文の正本は audit（`coldaisle-registry audit`）のまま。
+        """
+        metadata = self.trace_metadata()
+        del metadata["reason"]
+        metadata["reason_sha256"] = registry_reason_sha256(self.reason)
+        return metadata
+
     @model_validator(mode="after")
     def _previous_artifact_belongs_to_pointer_change(self) -> Self:
         # Only promotion / rollback move a production pointer, so only they can name
@@ -456,7 +469,8 @@ class RegistrySnapshot(_Frozen):
         """decision trace の各 tick へ載せる、この snapshot の版（決定記録 0071 §2.5）。
 
         `revision` と、**全 kind** の production pointer（無ければ `None`）、その pointer を
-        成立させた最後の promotion / rollback の `trace_metadata()` を返す。path を含まない。
+        成立させた最後の promotion / rollback の `tick_trace_metadata()`（`reason` は digest。
+        決定記録 0075）を返す。path を含まない。
 
         **snapshot から読むだけで、registry にも過去の trace にも触れない。** 制御デーモンは
         起動時に持った snapshot からこれを1度作り、毎 tick 同じ値を載せる。
@@ -479,7 +493,7 @@ class RegistrySnapshot(_Frozen):
                 raise ValueError("production pointer を成立させた audit event が見つからない")
             production[kind.value] = RegistryProductionPointer(
                 artifact_sha256=self.artifacts[slot.active.key].metadata.sha256,
-                established_by=RegistryPointerChange.model_validate(change.trace_metadata()),
+                established_by=RegistryPointerChange.model_validate(change.tick_trace_metadata()),
             )
         return RegistryProvenance(revision=self.revision, production=production)
 

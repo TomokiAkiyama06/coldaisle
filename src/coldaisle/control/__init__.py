@@ -273,6 +273,7 @@ from coldaisle.control.schema import (
     Zone,
     ZoneRecord,
     ZoneRequest,
+    registry_reason_sha256,
 )
 from coldaisle.control.shadow import (
     SHADOW_EXPORT_SCHEMA_VERSION,
@@ -655,6 +656,7 @@ __all__ = [
     "policy_registry_metadata",
     "policy_registry_metadata_json_bytes",
     "promote_supervisor_policy",
+    "registry_reason_sha256",
     "rule_policy_identity",
     "rule_policy_table",
     "shadow_evidence_ref",

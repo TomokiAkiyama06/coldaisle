@@ -79,6 +79,7 @@ from coldaisle.control.schema import (
     SafetyState,
     Zone,
     ZoneRequest,
+    registry_reason_sha256,
 )
 from coldaisle.control.shadow.record import ShadowRecorder
 from coldaisle.control.state import ControlStateEstimator
@@ -1078,12 +1079,15 @@ def test_invariant_12_every_tick_records_the_production_pointer_it_used(
         thermal = provenance.production[ArtifactKind.THERMAL_MODEL.value]
         assert thermal.artifact_sha256 == registry_metadata("1.0.0").sha256
         assert thermal.established_by is not None
-        assert thermal.established_by.model_dump() == promotion.trace_metadata()
+        assert thermal.established_by.model_dump() == promotion.tick_trace_metadata()
+        # 自由記述の `reason` は全文を載せず digest だけ（決定記録 0075）。
+        assert thermal.established_by.reason_sha256 == registry_reason_sha256(promotion.reason)
         # production の無い kind も欄を揃えて残す（0062 §2.5）。
         assert set(provenance.production) == {kind.value for kind in ArtifactKind}
         assert provenance.production[ArtifactKind.SUPERVISOR_POLICY.value].established_by is None
     stored = [json.loads(row) for row in harness.trace.rows]
     assert {row["registry"]["revision"] for row in stored} == {3}
+    assert all(promotion.reason not in row for row in harness.trace.rows)
 
 
 def test_invariant_12_a_restart_shows_the_revision_jump_and_the_pointer_in_use(
@@ -1131,7 +1135,10 @@ def test_invariant_12_a_restart_shows_the_revision_jump_and_the_pointer_in_use(
         ("promoted", "2.0.0"),
         ("rolled_back", "1.0.0"),
     ]
-    assert between[-1] == thermal["established_by"]
+    # trace は reason の digest だけを持ち、全文は audit から引いて照合する（決定記録 0075）。
+    established = dict(thermal["established_by"])
+    assert established.pop("reason_sha256") == registry_reason_sha256(str(between[-1]["reason"]))
+    assert {key: value for key, value in between[-1].items() if key != "reason"} == established
 
 
 def test_invariant_12_the_loop_requires_the_registry_state_explicitly() -> None:
