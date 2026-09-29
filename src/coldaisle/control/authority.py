@@ -103,20 +103,29 @@ __all__ = [
     "stage_rank",
 ]
 
-AUTHORITY_JOURNAL_SCHEMA_VERSION: Literal[1] = 1
-"""journal 1つの形の版。**欄の意味を変えたら上げる。**"""
+AUTHORITY_JOURNAL_SCHEMA_VERSION: Literal[2] = 2
+"""journal 1つの形の版。**欄の意味を変えたら上げる。**
+
+- v2（#81 / 決定記録 0073 §2.6）: 昇格 event の証拠（`RolloutEvidence`）に
+  `air_balance_config_sha256` と `fan_hardware_config_sha256` を足した。v2 の journal に
+  新しく書く昇格は両方を必ず持つ。v1 の event は持たないまま読む（過去の記録として読むだけで、
+  新しい昇格の根拠にはならない）。既に残った event は書き換えない
+"""
 
 AUTHORITY_STATE_FILENAME = "authority.json"
 _LOCK_FILENAME = ".authority.lock"
 _MAX_JOURNAL_BYTES = 4 * 1024 * 1024
 """journal の読み書きに許す大きさ。資源の境界であり、調整値ではない。"""
 
-MIN_EVIDENCE_REPORT_SCHEMA_VERSION = 2
+MIN_EVIDENCE_REPORT_SCHEMA_VERSION = 3
 """昇格の証拠に使える Offline Evaluation 報告の最小 version（#159 / 決定記録 0059 §2.5）。
 
 v1 は適用 arm の `model_artifacts` / `unbound_attested_ticks` を持たない。欄の無さが
 「空・0」と読めてしまい、**artifact の完全性を言えない報告が「完全に束縛できた」ように
 見える**（codex #4057527950）。読むことはできるが、昇格の根拠にはしない。
+
+v2 は `air-balance.yaml` の設定と、消費した trace の設定 hash の突き合わせを言えない
+（#81 / 決定記録 0073 §2.6）。同じ理由で昇格の根拠にしない。
 """
 
 MAX_JOURNAL_EVENTS = 4_096
@@ -194,6 +203,32 @@ class RolloutEvidence(_Frozen):
     fan_policy_config_sha256: Sha256Hex
     safety_config_sha256: Sha256Hex
     """証拠を取ったときの設定。いま動いている設定と一致しなければ使わない。"""
+    air_balance_config_sha256: Sha256Hex | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
+    fan_hardware_config_sha256: Sha256Hex | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
+    """証拠を取ったときの ``air-balance.yaml`` / ``fan-hardware.yaml``（決定記録 0073 §2.6）。
+
+    Learned MPC の cost は Air Balance の曲線と目標帯、profile の ``minimum_stable_demand`` で
+    変わる。別の characterization・別の profile で集めた証拠で昇格させない。
+    journal v1 の event は持たない（過去の記録として読むだけ）。**新しい昇格には必須**で、
+    ``raise_stage`` が欠けた承認を拒む。
+    """
+
+    @model_validator(mode="after")
+    def _config_bindings_come_together(self) -> Self:
+        if (self.air_balance_config_sha256 is None) != (self.fan_hardware_config_sha256 is None):
+            raise ValueError(
+                "air_balance_config_sha256 と fan_hardware_config_sha256 は一緒に記録する"
+            )
+        return self
+
+    @property
+    def binds_air_balance(self) -> bool:
+        """``air-balance.yaml`` と ``fan-hardware.yaml`` に束縛された証拠か（journal v2）。"""
+        return self.air_balance_config_sha256 is not None
 
 
 class StageApproval(_Frozen):
@@ -271,7 +306,7 @@ class AuthorityJournal(_Frozen):
     **stage は event から再現できなければならない。** 再現できない journal は読まない。
     """
 
-    schema_version: Literal[1] = AUTHORITY_JOURNAL_SCHEMA_VERSION
+    schema_version: Literal[1, 2] = AUTHORITY_JOURNAL_SCHEMA_VERSION
     revision: int = Field(ge=0)
     stage: AuthorityStage = BASELINE_STAGE
     events: tuple[AuthorityEvent, ...] = ()
@@ -280,6 +315,17 @@ class AuthorityJournal(_Frozen):
     def _events_replay_to_the_current_stage(self) -> Self:
         if len(self.events) != self.revision:
             raise ValueError("revision と event 数が一致しない")
+        bound_seen = False
+        for event in self.events:
+            if event.approval is None:
+                continue
+            if event.approval.evidence.binds_air_balance:
+                if self.schema_version < 2:
+                    raise ValueError("設定に束縛した証拠を記録する journal は v2 にする")
+                bound_seen = True
+            elif bound_seen:
+                # 束縛は一度入ったら外せない。後の昇格が欄を空けて束縛を外す記録を作らない。
+                raise ValueError("設定に束縛した昇格のあとに、束縛の無い昇格を記録しない")
         if self.revision > MAX_JOURNAL_EVENTS:
             raise ValueError("journal の event 数が上限を超えている")
         stage = BASELINE_STAGE
@@ -619,6 +665,8 @@ class AuthorityStore:
                     policy=policy,
                     fan_policy_config_sha256=config.sources.policy.sha256,
                     safety_config_sha256=config.sources.safety.sha256,
+                    air_balance_config_sha256=config.sources.air_balance.sha256,
+                    fan_hardware_config_sha256=config.sources.fan_hardware.sha256,
                     production_artifact_sha256=production.sha256,
                     now_ms=now_ms,
                 )
@@ -780,6 +828,8 @@ class AuthorityStore:
         policy: FanPolicyConfig,
         fan_policy_config_sha256: str,
         safety_config_sha256: str,
+        air_balance_config_sha256: str,
+        fan_hardware_config_sha256: str,
         production_artifact_sha256: str,
         now_ms: int,
     ) -> None:
@@ -814,6 +864,35 @@ class AuthorityStore:
             or provenance.safety_config_sha256 != safety_config_sha256
         ):
             raise AuthorityEvidenceError("証拠がいまの safety.yaml のものではない")
+        # **air-balance.yaml と fan-hardware.yaml も、承認・報告・いまの設定の3つで照合する**
+        # （決定記録 0073 §2.6）。Air Balance の曲線と profile の写像は MPC の cost を変える。
+        if (
+            evidence.air_balance_config_sha256 != air_balance_config_sha256
+            or provenance.air_balance_config_sha256 != air_balance_config_sha256
+        ):
+            raise AuthorityEvidenceError("証拠がいまの air-balance.yaml のものではない")
+        if (
+            evidence.fan_hardware_config_sha256 != fan_hardware_config_sha256
+            or provenance.fan_hardware_config_sha256 != fan_hardware_config_sha256
+        ):
+            raise AuthorityEvidenceError("証拠がいまの fan-hardware.yaml のものではない")
+        # **評価に使った trace が、その hash の設定で記録されたこと**を確かめる。評価時の hash を
+        # 写すだけでは、別の characterization や hash を持たない古い trace から作った報告が
+        # いまの設定を名乗れてしまう。1件でも不一致・欠落があれば丸ごと証拠にしない。
+        for name, binding in (
+            ("air-balance.yaml", provenance.air_balance_trace_binding),
+            ("fan-hardware.yaml", provenance.fan_hardware_trace_binding),
+        ):
+            if binding is None or not binding.complete_for(provenance.consumed_traces):
+                raise AuthorityEvidenceError(
+                    f"評価に使った trace が、いまの {name} で記録されたと言えない"
+                    + (
+                        ""
+                        if binding is None
+                        else f"（matched={binding.matched}; mismatched={binding.mismatched}; "
+                        f"missing={binding.missing}; traces={provenance.consumed_traces}）"
+                    )
+                )
         if evidence.artifact_sha256 != production_artifact_sha256:
             raise AuthorityEvidenceError("証拠が Production の artifact のものではない")
         artifacts = set(provenance.versions.model_artifacts)

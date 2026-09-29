@@ -8,6 +8,29 @@ from pydantic import ValidationError
 
 from coldaisle.control.config import CONTROL_CONFIG_VERSION, ConfigSource, ControlConfig
 
+AIR_BALANCE_FIXTURE = Path(__file__).parent / "fixtures" / "air_balance_uncalibrated.yaml"
+
+
+def air_balance_document() -> dict[str, object]:
+    """未校正の `air-balance.yaml`（v2）。リポジトリの雛形そのもの（決定記録 0073 §2.1）。"""
+    loaded = yaml.safe_load(AIR_BALANCE_FIXTURE.read_text(encoding="utf-8"))
+    assert isinstance(loaded, dict)
+    return loaded
+
+
+def calibrated_air_balance_document(
+    thermal_inputs: dict[str, str | None] | None = None,
+) -> dict[str, object]:
+    """試験用に `calibrated` を名乗らせた `air-balance.yaml`。**実機の値ではない。**"""
+    document = air_balance_document()
+    document["source"] = {
+        "status": "calibrated",
+        "basis": "試験用の characterization。実機の測定ではない",
+    }
+    if thermal_inputs is not None:
+        document["thermal_inputs"] = thermal_inputs
+    return document
+
 
 def provisional(value: float | int) -> dict[str, object]:
     return {"value": value, "status": "provisional"}
@@ -132,6 +155,7 @@ def valid_documents() -> dict[str, dict[str, object]]:
         "airflow_index": [0.2, 1.0],
     }
     return {
+        "air-balance.yaml": air_balance_document(),
         "fan-hardware.yaml": {
             "schema_version": 1,
             "approval": {"status": "provisional"},
@@ -344,13 +368,76 @@ def load_config(tmp_path: Path) -> ControlConfig:
 def test_complete_config_has_traceable_sources_and_is_not_actuation_ready(tmp_path: Path) -> None:
     config = load_config(tmp_path)
 
-    assert CONTROL_CONFIG_VERSION == 10
+    assert CONTROL_CONFIG_VERSION == 11
     assert config.actuation_permitted is False
+    assert config.trace_metadata()["control_config_version"] == 11
     metadata = config.trace_metadata()["control_config"]
     assert metadata["fan_hardware"]["name"] == "fan-hardware.yaml"
     assert metadata["safety"]["schema_version"] == 3
     assert metadata["policy"]["schema_version"] == 9
+    assert metadata["air_balance"]["name"] == "air-balance.yaml"
+    assert metadata["air_balance"]["schema_version"] == 2
     assert len(metadata["safety"]["sha256"]) == 64
+    assert len(metadata["air_balance"]["sha256"]) == 64
+
+
+def test_air_balance_is_the_fourth_file_and_its_absence_is_invalid(tmp_path: Path) -> None:
+    """**無いことを「Air Balance 無し」と読まない**（決定記録 0073 §2.2）。"""
+    documents = valid_documents()
+    del documents["air-balance.yaml"]
+    write_documents(tmp_path, documents)
+    with pytest.raises(FileNotFoundError):
+        ControlConfig.from_directory(tmp_path)
+
+
+def test_air_balance_v1_is_rejected_without_filling_in_thermal_inputs(tmp_path: Path) -> None:
+    """v1 は起動前に拒否し、`thermal_inputs` を自動補完しない（決定記録 0073 §2.1）。"""
+    documents = valid_documents()
+    legacy = documents["air-balance.yaml"]
+    legacy["schema_version"] = 1
+    del legacy["thermal_inputs"]
+    write_documents(tmp_path, documents)
+    with pytest.raises(ValidationError, match="schema_version"):
+        ControlConfig.from_directory(tmp_path)
+
+
+def test_a_malformed_air_balance_curve_rejects_the_whole_config(tmp_path: Path) -> None:
+    """4ファイルは一括で採用する。曲線だけが壊れていても部分適用しない（0033 §2）。"""
+    documents = valid_documents()
+    front = documents["air-balance.yaml"]["zones"]["front"]["points"]
+    front[1]["demand"] = 0.0
+    write_documents(tmp_path, documents)
+    with pytest.raises(ValidationError, match="単調"):
+        ControlConfig.from_directory(tmp_path)
+
+
+def test_uncalibrated_air_balance_validates_but_is_disabled(tmp_path: Path) -> None:
+    """未校正でも検証は通し、Air Balance だけを無効にする（決定記録 0073 §2.2）。"""
+    config = load_config(tmp_path)
+    assert config.air_balance.source.status == "uncalibrated"
+    assert config.air_balance_enabled is False
+
+    documents = valid_documents()
+    documents["air-balance.yaml"] = calibrated_air_balance_document()
+    write_documents(tmp_path, documents)
+    assert ControlConfig.from_directory(tmp_path).air_balance_enabled is True
+
+
+def test_thermal_input_bindings_must_be_stored_metric_names(tmp_path: Path) -> None:
+    documents = valid_documents()
+    documents["air-balance.yaml"]["thermal_inputs"]["gpu_intake_c"] = "not a metric"
+    write_documents(tmp_path, documents)
+    with pytest.raises(ValidationError):
+        ControlConfig.from_directory(tmp_path)
+
+
+def test_the_stable_demand_mapping_is_one_pure_function(tmp_path: Path) -> None:
+    """backend と MPC が共有する `minimum_stable_demand` への引き上げ（決定記録 0073 §2.3）。"""
+    from coldaisle.control.schema import PerZone
+
+    hardware = load_config(tmp_path).fan_hardware
+    mapped = hardware.stable_demands(PerZone[float](front=0.0, rear=0.3, top=0.9))
+    assert (mapped.front, mapped.rear, mapped.top) == (0.3, 0.3, 0.9)
 
 
 def test_safety_v1_is_rejected_without_defaulting_new_safety_fields(tmp_path: Path) -> None:

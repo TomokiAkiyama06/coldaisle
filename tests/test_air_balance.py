@@ -26,7 +26,7 @@ TEST_CONFIG_FILENAME = "air-balance.yaml"
 def document() -> dict[str, Any]:
     """物理 CFM を含まない、Mock 用の未校正 EFU characterization。"""
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "model_id": "mock-air-balance",
         "source": {
             "status": "uncalibrated",
@@ -66,6 +66,12 @@ def document() -> dict[str, Any]:
             "case_delta_c": 12.0,
             "cpu_package_c": 80.0,
             "gpu_temperature_c": 78.0,
+        },
+        "thermal_inputs": {
+            "gpu_intake_c": None,
+            "case_delta_c": None,
+            "cpu_package_c": None,
+            "gpu_temperature_c": None,
         },
     }
 

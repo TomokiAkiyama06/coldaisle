@@ -35,12 +35,26 @@ class FanHardwareResult:
 
     ``fault`` は Critical Safety へそのまま渡せる ``Fault`` であり、この層が
     safety state を決めることはない。
+
+    ``applied_demand`` は profile の制約（``minimum_stable_demand`` への引き上げと、未起動
+    zone の ``startup_demand``）を掛けた後の、PWM へ写す直前の demand（決定記録 0073 §2.5 (a)）。
+    **``write_ok`` と ``readback_ok`` の両方が真のときだけ値を持つ。** 書けていない・
+    確かめられていない指令を「適用した demand」として返さない。PWM の raw 値から逆算しない。
+    実機 backend も同じ規則で返す。
     """
 
     target_rpm: int
     airflow_index: float
     readback: HardwareReadback
+    applied_demand: float | None
     fault: Fault | None = None
+
+    def __post_init__(self) -> None:
+        confirmed = self.readback.write_ok and self.readback.readback_ok
+        if confirmed != (self.applied_demand is not None):
+            raise ValueError("applied_demand は write と readback が確認できたときだけ持つ")
+        if self.applied_demand is not None and not 0.0 <= self.applied_demand <= 1.0:
+            raise ValueError("applied_demand は 0.0..1.0 にする")
 
 
 class FanHardwareBackend(Protocol):
@@ -157,6 +171,7 @@ class SimulatedFanBackend:
                     write_ok=False,
                     readback_ok=False,
                 ),
+                applied_demand=None,
                 fault=Fault(code=FaultCode.WRITE_FAILURE, zone=zone),
             )
 
@@ -170,6 +185,7 @@ class SimulatedFanBackend:
                     write_ok=True,
                     readback_ok=False,
                 ),
+                applied_demand=None,
                 fault=Fault(code=FaultCode.READBACK_MISMATCH, zone=zone),
             )
 
@@ -183,6 +199,9 @@ class SimulatedFanBackend:
                     write_ok=True,
                     readback_ok=True,
                 ),
+                # 書き込みと読み戻しは成功している。回っていないことは fault が表し、
+                # 風量の記録から外すのは呼び出し側（決定記録 0073 §2.5 (a)）。
+                applied_demand=mapped_demand,
                 fault=Fault(code=FaultCode.TACH_STALL, zone=zone),
             )
 
@@ -198,6 +217,7 @@ class SimulatedFanBackend:
                 write_ok=True,
                 readback_ok=True,
             ),
+            applied_demand=mapped_demand,
         )
 
     def _safe_demand(self, zone: Zone, effective: float, profile: FanProfile) -> float:
@@ -205,7 +225,7 @@ class SimulatedFanBackend:
         # では表さない。初回だけ startup demand を使い、以後の最低値も profile の
         # minimum stable demand に固定する（0028 §2.4 の kick の責務）。起動済み
         # 状態への遷移は _apply_zone で write/readback/tach 成功後にだけ行う。
-        stable_demand = max(effective, profile.minimum_stable_demand)
+        stable_demand = profile.stable_demand(effective)
         if zone not in self._running:
             return max(stable_demand, profile.startup_demand)
         return stable_demand

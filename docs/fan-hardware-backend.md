@@ -27,5 +27,9 @@ session とも hardware approval が `confirmed` の場合だけ発行する。�
 全 zone Max 以外を発行できず、通常 session との途中切替えも許さない。
 
 profile が表す minimum stable demand 未満へは写像しない。起動直後は startup demand を
-使い、その後も minimum stable demand を下限とする。profile の値はすべて設定由来であり、
+使い、その後も minimum stable demand を下限とする。minimum stable demand への引き上げは
+`FanProfile.stable_demand()` の1箇所に置き、Learned MPC の Air Balance の項も同じ関数を使う
+（決定記録 0073 §2.3）。backend は写像後・PWM 直前の demand を `FanHardwareResult.applied_demand`
+として返す。`write_ok` と `readback_ok` の両方が真のときだけ値を持ち、PWM の raw 値から逆算しない
+（0073 §2.5 (a)。実機 backend も同じ規則で返す）。profile の値はすべて設定由来であり、
 実測値をコードへ追加しない。

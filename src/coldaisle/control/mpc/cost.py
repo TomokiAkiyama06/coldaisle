@@ -17,7 +17,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from coldaisle.control.acoustic import AcousticCostModel
 from coldaisle.control.air_balance import AirBalanceModel, BalanceBand, ThermalInputs
-from coldaisle.control.config import MpcOptimizerConfig
+from coldaisle.control.config import FanHardwareConfig, MpcOptimizerConfig
 from coldaisle.control.mpc.counterfactual import PlanPrediction
 from coldaisle.control.mpc.plan import ActionPlan
 from coldaisle.control.schema import (
@@ -69,6 +69,11 @@ class MpcCostModel:
     Acoustic（#94）と Air Balance（#81）は任意依存で、無ければその項は 0 になる。
     **無い依存を「良い」と読み替えない**ため、Air Balance は比を推定できなかった step に
     設定した ``unknown_balance_cost`` を課す。
+
+    Air Balance の項は、候補の demand を ``fan-hardware.yaml`` の profile の写像
+    （``minimum_stable_demand`` への引き上げ）に通した値で評価する（決定記録 0073 §2.3）。
+    backend は引き上げてから書くので、そのまま評価すると実際には起きない風量の比を採点する。
+    写像は balance の項にだけ使い、plan の requested そのものは変えない。
     """
 
     def __init__(
@@ -78,14 +83,21 @@ class MpcCostModel:
         acoustic: AcousticCostModel | None = None,
         air_balance: AirBalanceModel | None = None,
         balance_band: BalanceBand | None = None,
+        fan_hardware: FanHardwareConfig | None = None,
     ) -> None:
         if (air_balance is None) != (balance_band is None):
             # 目標比は #81 の設定が持つ。MPC 側に写すと同じ定数が2箇所になる。
             raise MpcCostUnusableError("Air Balance Model と BalanceBand は一緒に渡す")
+        if air_balance is not None and fan_hardware is None:
+            # 写像を通さずに比を採点すると、適用後の比が目標帯の外になる plan を選びうる。
+            raise MpcCostUnusableError(
+                "Air Balance を渡すなら同じ Control Config の fan-hardware.yaml も渡す"
+            )
         self._optimizer = optimizer
         self._acoustic = acoustic
         self._air_balance = air_balance
         self._balance_band = balance_band
+        self._fan_hardware = fan_hardware
         self._cpu_metric = optimizer.cost_metrics.cpu_temperature
         self._gpu_metric = optimizer.cost_metrics.gpu_temperature
 
@@ -174,8 +186,10 @@ class MpcCostModel:
             # Model を繋いでいない（項が無い）ことと、繋いだ上で比が不明なことは区別する。
             # 前者は 0、後者は設定した ``unknown_balance_cost`` を課す。
             return 0.0, False
+        assert self._fan_hardware is not None  # 生成時に保証している
         estimate = self._air_balance.evaluate(
-            demands,
+            # trace の推定（applied demand）と同じ定義にそろえる（決定記録 0073 §2.3）。
+            self._fan_hardware.stable_demands(demands),
             ThermalInputs(cpu_package_c=cpu_c, gpu_temperature_c=gpu_c),
         )
         ratio = estimate.balance_ratio

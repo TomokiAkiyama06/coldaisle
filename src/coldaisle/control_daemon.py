@@ -11,8 +11,15 @@
 |---|---|
 | `fan-hardware.yaml` が不正 | **制御を取らない。** BIOS の制御のまま 0 以外で終了する |
 | hardware は正しいが承認前（`provisional`） | 制御を取らない（0028 §2.9 の承認点 3） |
-| hardware は正しく safety / policy が不正 | 制御を取り、**全 zone を Max**（`config_invalid`） |
-| すべて正しい | `STARTUP` の Max から通常の control loop へ入る |
+| hardware は正しく、ほかが不正・不在 | 制御を取り、**全 zone を Max**（`config_invalid`） |
+| すべて正しく air-balance が `uncalibrated` | Air Balance を**無効**にして通常運転 |
+| すべて正しく air-balance が `calibrated` | Air Balance を有効にして通常運転 |
+
+「ほか」は `safety.yaml` / `fan-policy.yaml` / `air-balance.yaml`。Air Balance を無効にしても
+Critical Safety と Reactive Guard は変わらない。
+
+どの場合も `STARTUP` の Max を通ってから通常の制御へ入る。`air-balance.yaml` の扱いは
+決定記録 0073 §2.2 に従う。「無い」を「無効」と読まない。
 
 **動作中に設定を読み直さない**（0028 §2.7）。反映は再起動で行い、再起動は必ず
 `STARTUP` の Max を通る。
@@ -51,6 +58,7 @@ from coldaisle.control.loop import (
     StaticOperatingMode,
     TelemetrySample,
     Watchdog,
+    air_balance_input_metrics,
     build_input_contract,
 )
 from coldaisle.control.reactive.guard import ReactiveGuard
@@ -130,7 +138,11 @@ class WatchdogUnavailableError(RuntimeError):
 
 
 class ControlConfigInvalidError(RuntimeError):
-    """`safety.yaml` / `fan-policy.yaml` が不正（0028 §2.7 の「全 zone Max」の条件）。"""
+    """`safety.yaml` / `fan-policy.yaml` / `air-balance.yaml` が無い・不正。
+
+    0028 §2.7 の「全 zone Max」の条件。`air-balance.yaml` の不在と、`thermal_inputs` の
+    metric を Metric Catalog で検証できないことも含む（決定記録 0073 §2.2 / §2.4）。
+    """
 
 
 class StartupEnvironmentError(RuntimeError):
@@ -499,7 +511,8 @@ def build(
     try:
         control = ControlConfig.from_directory(config.config_dir)
     except Exception as error:
-        # ここだけが 0028 §2.7 の「hardware は正しく safety / policy が不正」に当たる。
+        # ここが 0028 §2.7 の「hardware は正しく safety / policy が不正」に当たる。
+        # `air-balance.yaml` の不在・不正も同じ扱い（決定記録 0073 §2.2）。
         raise ControlConfigInvalidError(str(error)) from error
     if not control.actuation_permitted:
         raise ActuationNotApprovedError(
@@ -509,6 +522,15 @@ def build(
     monotonic: MonotonicClock = SystemMonotonicClock()
     try:
         catalog = MetricCatalog.from_yaml(config.metrics)
+    except Exception as error:
+        raise StartupEnvironmentError(f"{type(error).__name__}: {error}") from error
+    try:
+        # `thermal_inputs` の metric を Catalog で確かめられないのは `air-balance.yaml` の不正で
+        # あり、起動環境の問題ではない（決定記録 0073 §2.4 / §2.2）。
+        air_balance_input_metrics(control, catalog, t_sensor_metric=config.t_sensor_metric)
+    except Exception as error:
+        raise ControlConfigInvalidError(str(error)) from error
+    try:
         contract = build_input_contract(control, catalog, t_sensor_metric=config.t_sensor_metric)
         rules = QualityRules.from_yaml(config.quality_rules)
         store = SqliteStore(
@@ -592,7 +614,9 @@ def run_config_invalid_max(
     monotonic: MonotonicClock,
     backend_factory: BackendFactory = simulated_backend,
 ) -> ControlStats:
-    """`safety.yaml` / `fan-policy.yaml` が不正なときの、全 zone Max だけの経路（0028 §2.7）。
+    """制御設定が無い・不正なときの、全 zone Max だけの経路（0028 §2.7 / 0073 §2.2）。
+
+    対象は `safety.yaml` / `fan-policy.yaml` / `air-balance.yaml`。
 
     **不正な閾値を読まない。** 確認済みの hardware mapping だけを使い、`config_invalid` の
     `EMERGENCY` を1回書く。以後は正しい設定で再起動するまで解除しない。
@@ -620,11 +644,20 @@ def _log_configuration(control: ControlConfig, safety: CriticalSafety) -> None:
     1つも保存されないまま止まった起動でも追えるようにするため（#78）。
     """
     provisional = control.provisional_values()
+    air_balance = control.air_balance
     LOGGER.info(
         "制御設定を読み込んだ",
         extra={
             logs.FIELDS_KEY: {
                 **control.trace_metadata(),
+                # **未校正で無効にした起動を黙って流さない**（決定記録 0073 §2.2）。
+                # 毎 tick の trace にも `disabled: uncalibrated` が残る。
+                "air_balance": {
+                    "status": "enabled" if control.air_balance_enabled else "disabled",
+                    "disabled_reason": None if control.air_balance_enabled else "uncalibrated",
+                    "model_id": air_balance.model_id,
+                    "source_status": air_balance.source.status,
+                },
                 "tick_ms": control.safety.tick_ms.value,
                 "tick_deadline_ms": control.safety.tick_deadline_ms.value,
                 "authority_stage_ceiling": control.policy.authority_stage.value,
@@ -700,7 +733,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         LOGGER.exception("外部の deadman が使えないため起動しない（決定記録 0028 §2.6）")
         return EXIT_WATCHDOG_UNAVAILABLE
     except ControlConfigInvalidError:
-        LOGGER.exception("safety.yaml / fan-policy.yaml が不正なため全 zone を Max にする")
+        LOGGER.exception(
+            "safety.yaml / fan-policy.yaml / air-balance.yaml が無い・不正なため"
+            "全 zone を Max にする"
+        )
         try:
             stats = run_config_invalid_max(config, monotonic=monotonic)
         except ActuationNotApprovedError:

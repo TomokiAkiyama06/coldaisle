@@ -641,7 +641,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--control-config",
         type=Path,
         default=Path("config"),
-        help="fan-hardware.yaml / safety.yaml / fan-policy.yaml のあるディレクトリ",
+        help=(
+            "fan-hardware.yaml / safety.yaml / fan-policy.yaml / air-balance.yaml"
+            " のあるディレクトリ（4ファイルとも必須）"
+        ),
     )
     parser.add_argument(
         "--format",

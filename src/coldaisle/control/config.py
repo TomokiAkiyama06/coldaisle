@@ -1,6 +1,8 @@
 """Fan control configuration contracts (#103).
 
-値を持つ三つの YAML は、全てを検証できたときだけひとまとまりとして採用する。
+値を持つ四つの YAML（``fan-hardware.yaml`` / ``safety.yaml`` / ``fan-policy.yaml`` /
+``air-balance.yaml``）は、全てを検証できたときだけひとまとまりとして採用する
+（決定記録 0033 §2 / 0073 §2.1）。
 このモジュールは設定値を決めず、実機への書き込み経路も持たない。
 """
 
@@ -14,6 +16,7 @@ from typing import Annotated, Any, Literal, Self, cast
 import yaml
 from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, field_validator, model_validator
 
+from coldaisle.control.air_balance import AirBalanceConfig
 from coldaisle.control.schema import (
     AuthorityStage,
     Demand,
@@ -26,14 +29,22 @@ from coldaisle.control.schema import (
 )
 from coldaisle.store.models import validate_metric
 
-CONTROL_CONFIG_VERSION: Literal[10] = 10
+CONTROL_CONFIG_VERSION: Literal[11] = 11
+"""4ファイルを束ねた Control Config の版。
+
+- v11（#81 / 決定記録 0073 §2.1）: ``air-balance.yaml``（v2）を4つ目のファイルにした。
+  各ファイルの版は変えていない
+"""
 FAN_POLICY_CONFIG_VERSION: Literal[9] = 9
 SAFETY_CONFIG_VERSION: Literal[3] = 3
 CONFIG_FILENAMES = {
     "fan_hardware": "fan-hardware.yaml",
     "safety": "safety.yaml",
     "policy": "fan-policy.yaml",
+    "air_balance": "air-balance.yaml",
 }
+
+ConfigFileName = Literal["fan-hardware.yaml", "safety.yaml", "fan-policy.yaml", "air-balance.yaml"]
 
 FiniteFloat = Annotated[float, Field(allow_inf_nan=False)]
 PositiveMilliseconds = Annotated[int, Field(gt=0)]
@@ -153,6 +164,15 @@ class FanProfile(_ConfigModel):
             raise ValueError("PWM→RPM 表は maximum_rpm を超えない")
         return self
 
+    def stable_demand(self, demand: float) -> float:
+        """``minimum_stable_demand`` 未満の demand を引き上げた値（決定記録 0073 §2.3）。
+
+        Hardware Backend が書く前に掛ける引き上げと、Learned MPC の balance 項が評価に使う
+        写像を**この1箇所**に置く（2つの実装を持たない）。起動時の ``startup_demand`` の
+        kick は backend の起動状態に依存する一時的な値なので含めない。
+        """
+        return max(demand, self.minimum_stable_demand)
+
 
 class FanHeader(_ConfigModel):
     """sysfs を番号でなく driver・label・属性名で特定する。"""
@@ -177,6 +197,18 @@ class FanHardwareConfig(_ConfigModel):
     schema_version: Literal[1]
     approval: ConfigApproval
     zones: PerZone[FanHeader]
+
+    def stable_demands(self, demands: PerZone[Demand]) -> PerZone[Demand]:
+        """3 zone の demand を各 profile の ``stable_demand()`` に通した値。
+
+        MPC は Hardware Backend を呼ばない（決定記録 0052 の境界）。同じ設定から同じ写像を
+        得るための純粋関数で、requested / effective そのものは変えない。
+        """
+        return PerZone[Demand](
+            front=self.zones.front.profile.stable_demand(demands.front),
+            rear=self.zones.rear.profile.stable_demand(demands.rear),
+            top=self.zones.top.profile.stable_demand(demands.top),
+        )
 
     @model_validator(mode="after")
     def _each_zone_targets_a_different_header(self) -> Self:
@@ -993,7 +1025,7 @@ class FanPolicyConfig(_ConfigModel):
 class ConfigSource(_ConfigModel):
     """decision trace に残せる入力の版・名前・内容ハッシュ。絶対 path は残さない。"""
 
-    name: Literal["fan-hardware.yaml", "safety.yaml", "fan-policy.yaml"]
+    name: ConfigFileName
     schema_version: int = Field(ge=1)
     sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
 
@@ -1046,6 +1078,7 @@ class ConfigSources(_ConfigModel):
     fan_hardware: ConfigSource
     safety: ConfigSource
     policy: ConfigSource
+    air_balance: ConfigSource
 
 
 class ControlConfig(_ConfigModel):
@@ -1054,6 +1087,13 @@ class ControlConfig(_ConfigModel):
     fan_hardware: FanHardwareConfig
     safety: SafetyConfig
     policy: FanPolicyConfig
+    air_balance: AirBalanceConfig
+    """Air Balance の characterization（決定記録 0033 / 0073）。
+
+    **``source.status: uncalibrated`` でも検証は通す。** そのときは Air Balance を無効にして
+    起動し、未校正の曲線・比・熱の閾値を requested にも trace の推定値にも入れない
+    （0073 §2.2。``air_balance_enabled``）。
+    """
     sources: ConfigSources
 
     @model_validator(mode="after")
@@ -1062,15 +1102,28 @@ class ControlConfig(_ConfigModel):
             (self.sources.fan_hardware, "fan-hardware.yaml", self.fan_hardware.schema_version),
             (self.sources.safety, "safety.yaml", self.safety.schema_version),
             (self.sources.policy, "fan-policy.yaml", self.policy.schema_version),
+            (self.sources.air_balance, "air-balance.yaml", self.air_balance.schema_version),
         )
         for source, name, version in expected:
             if source.name != name or source.schema_version != version:
                 raise ValueError(f"ConfigSource が検証済み設定と一致しない: {name}")
         return self
 
+    @property
+    def air_balance_enabled(self) -> bool:
+        """Air Balance を推定・記録に使うか（決定記録 0073 §2.2）。
+
+        ``source.status`` だけで決まる。
+        """
+        return self.air_balance.calibrated
+
     @classmethod
     def from_directory(cls, directory: Path) -> ControlConfig:
-        """三つ全てを読んでから生成する。1つでも不正なら返さない。"""
+        """四つ全てを読んでから生成する。1つでも無い・不正なら返さない。
+
+        ``air-balance.yaml`` が無いことを「Air Balance 無し」と読み替えない
+        （決定記録 0073 §2.2。置き忘れを黙って部分適用にしない）。
+        """
         contents: dict[str, tuple[dict[str, Any], ConfigSource]] = {}
         for key, filename in CONFIG_FILENAMES.items():
             path = directory / filename
@@ -1084,9 +1137,7 @@ class ControlConfig(_ConfigModel):
             contents[key] = (
                 loaded,
                 ConfigSource(
-                    name=cast(
-                        Literal["fan-hardware.yaml", "safety.yaml", "fan-policy.yaml"], filename
-                    ),
+                    name=cast(ConfigFileName, filename),
                     schema_version=schema_version,
                     sha256=sha256(text.encode("utf-8")).hexdigest(),
                 ),
@@ -1095,16 +1146,21 @@ class ControlConfig(_ConfigModel):
             fan_hardware=FanHardwareConfig.model_validate(contents["fan_hardware"][0]),
             safety=SafetyConfig.model_validate(contents["safety"][0]),
             policy=FanPolicyConfig.model_validate(contents["policy"][0]),
+            air_balance=AirBalanceConfig.model_validate(contents["air_balance"][0]),
             sources=ConfigSources(
                 fan_hardware=contents["fan_hardware"][1],
                 safety=contents["safety"][1],
                 policy=contents["policy"][1],
+                air_balance=contents["air_balance"][1],
             ),
         )
 
     def trace_metadata(self) -> dict[str, object]:
-        """#82 の decision trace payload へ足せる再現情報。"""
-        return {"control_config": self.sources.model_dump(mode="json")}
+        """#82 の decision trace payload へ足せる再現情報（4ファイルの名前・版・SHA-256）。"""
+        return {
+            "control_config_version": CONTROL_CONFIG_VERSION,
+            "control_config": self.sources.model_dump(mode="json"),
+        }
 
     def provisional_values(self) -> tuple[ProvisionalConfigValue, ...]:
         """起動ログ用に、確認前の設定位置だけを返す。"""

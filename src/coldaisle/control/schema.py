@@ -24,7 +24,7 @@ from typing import Annotated, Literal, Protocol, Self, runtime_checkable
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-SCHEMA_VERSION: Literal[10] = 10
+SCHEMA_VERSION: Literal[11] = 11
 """`ControlTick` の形の版。**フィールドの名前や意味を変えたら上げる。**
 
 #82 が保存したデータを読み違えないため。
@@ -54,6 +54,11 @@ SCHEMA_VERSION: Literal[10] = 10
   `RegistryAuditEvent.trace_metadata()`（ただし自由記述の `reason` は全文でなく `reason_sha256`。
   決定記録 0075）。**v10 には必須**で、保存済みの v1〜v9 は欄なしのまま
   読める（「記録が無い」であって「production が無かった」ではない）
+- v11（#81 / 決定記録 0073 §2.5）: Air Balance の記録（`air_balance`）と、zone ごとの
+  `applied_demand`（Hardware Backend が PWM へ写す直前の demand）・それを曲線で写した
+  `estimated_flow`。`runtime` は schema version 2（4ファイルの版と SHA-256）を要求する。
+  **v11 には `air_balance` が必須**で、保存済みの v1〜v10 は欄なしのまま読める。
+  決定記録 0073 は「v10」と書くが、先に #104 が v10 を使ったため次の空き番号にした（0073 §5）
 """
 
 Demand = Annotated[float, Field(ge=0.0, le=1.0, allow_inf_nan=False)]
@@ -1036,11 +1041,62 @@ class ControlConfigDigest(_Frozen):
 
     **絶対 path も個体識別子も残さない**（AGENTS.md ルール10）。ここにあるのは、あとから
     「どの設定で回っていた tick か」を言えるだけの hash である。
+
+    runtime v2（#81 / 決定記録 0073 §2.5 (c)）で ``air-balance.yaml`` の hash と、束ねた版・
+    4ファイルそれぞれの schema version を足した。**v2 ではすべて必須、v1 ではどれも持たない**
+    （検証は ``ControlTickRuntime`` が版を見て行う）。値は ``ControlConfig.sources`` から写す。
     """
 
     fan_hardware_sha256: Sha256Hex
     safety_sha256: Sha256Hex
     policy_sha256: Sha256Hex
+    air_balance_sha256: Sha256Hex | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
+    control_config_version: int | None = Field(
+        default=None, ge=1, exclude_if=lambda value: value is None
+    )
+    fan_hardware_schema_version: int | None = Field(
+        default=None, ge=1, exclude_if=lambda value: value is None
+    )
+    safety_schema_version: int | None = Field(
+        default=None, ge=1, exclude_if=lambda value: value is None
+    )
+    policy_schema_version: int | None = Field(
+        default=None, ge=1, exclude_if=lambda value: value is None
+    )
+    air_balance_schema_version: int | None = Field(
+        default=None, ge=1, exclude_if=lambda value: value is None
+    )
+
+    @property
+    def _v2_fields(self) -> tuple[object, ...]:
+        return (
+            self.air_balance_sha256,
+            self.control_config_version,
+            self.fan_hardware_schema_version,
+            self.safety_schema_version,
+            self.policy_schema_version,
+            self.air_balance_schema_version,
+        )
+
+    @property
+    def complete(self) -> bool:
+        """runtime v2 の欄（4ファイルの版と SHA-256）をすべて持つか。"""
+        return all(value is not None for value in self._v2_fields)
+
+    @property
+    def legacy(self) -> bool:
+        """runtime v1 の形（3ファイルの SHA-256 だけ）か。"""
+        return all(value is None for value in self._v2_fields)
+
+
+CONTROL_TICK_RUNTIME_SCHEMA_VERSION: Literal[2] = 2
+"""`ControlTickRuntime` の形の版。
+
+- v2（#81 / 決定記録 0073 §2.5 (c)）: `config` に `air-balance.yaml` の SHA-256 と、束ねた版・
+  4ファイルの schema version を足した。`ControlTick` v11 は v2 を要求する
+"""
 
 
 class ControlTickRuntime(_Frozen):
@@ -1054,7 +1110,7 @@ class ControlTickRuntime(_Frozen):
     （0028 §2.6 の watchdog が数える区間と同じ）。
     """
 
-    schema_version: Literal[1] = 1
+    schema_version: Literal[1, 2] = CONTROL_TICK_RUNTIME_SCHEMA_VERSION
     tick_period_ms: int = Field(gt=0)
     deadline_ms: int = Field(gt=0)
     duration_ms: int = Field(ge=0)
@@ -1064,6 +1120,12 @@ class ControlTickRuntime(_Frozen):
 
     @model_validator(mode="after")
     def _overrun_matches_the_recorded_duration(self) -> Self:
+        if self.schema_version >= 2 and not self.config.complete:
+            # 版が中身を表さない記録を作らない（0060 §2.4）。v2 を名乗りながら
+            # 4ファイルの版と hash が欠けていると、どの設定で回っていたかを言えない。
+            raise ValueError("runtime v2 の config には4ファイルの版と SHA-256 が要る")
+        if self.schema_version < 2 and not self.config.legacy:
+            raise ValueError("4ファイルの版と hash を記録する runtime は schema version 2 にする")
         if self.deadline_exceeded != (self.duration_ms > self.deadline_ms):
             # 超過の有無を、同じ行に残した所要時間と食い違わせない。片方だけを書き換えて
             # 「遅れていない tick」に見せられる欄を作らないため。
@@ -1369,9 +1431,30 @@ class ZoneRecord(_Frozen):
     airflow_index: float | None = Field(default=None, ge=0.0, le=1.0, allow_inf_nan=False)
     """zone 自身の能力比（#75）。zone をまたいで比べない。"""
     estimated_flow: float | None = Field(default=None, ge=0.0, allow_inf_nan=False)
-    """zone をまたいで比べる推定量（#75 / #81）。単位は #75 で決める。"""
+    """zone をまたいで比べる推定量（#75 / #81）。単位は EFU で、CFM ではない。
+
+    v11 では ``applied_demand`` を ``air-balance.yaml`` の曲線で写した値（決定記録 0073
+    §2.5 (a)）。Air Balance が無効・書き込み結果が無い・確認できていない・その tick の backend
+    fault がある・有効な stall の zone は None（0 にしない）。
+    """
+    applied_demand: Demand | None = Field(default=None, exclude_if=lambda value: value is None)
+    """Hardware Backend が PWM へ写す直前の demand（v11。決定記録 0073 §2.5 (a)）。
+
+    ``effective`` に profile の制約（``minimum_stable_demand`` への引き上げ、未起動 zone の
+    ``startup_demand``）を掛けた後の値。書き込み結果の無い tick と、``write_ok`` /
+    ``readback_ok`` のどちらかが偽の tick は None。
+    """
     hardware: HardwareReadback | None = None
     """まだ書き込んでいない tick（`STARTUP` の最初など）は None。"""
+
+    @model_validator(mode="after")
+    def _applied_demand_was_confirmed(self) -> Self:
+        if self.applied_demand is not None and (
+            self.hardware is None or not (self.hardware.write_ok and self.hardware.readback_ok)
+        ):
+            # 書けていない・確かめられていない指令を「適用した demand」として残さない。
+            raise ValueError("applied_demand は write と readback を確認できた zone にだけ残す")
+        return self
 
 
 class ControlState(_Frozen):
@@ -1443,6 +1526,143 @@ class ControlState(_Frozen):
         return self
 
 
+AIR_BALANCE_RECORD_SCHEMA_VERSION: Literal[1] = 1
+"""`AirBalanceRecord` の形の版（決定記録 0073 §2.5 (b)）。"""
+
+EffectiveFlowUnit = Annotated[float, Field(ge=0.0, allow_inf_nan=False)]
+"""zone をまたいで比べる推定風量（EFU）。実測 CFM ではない。"""
+
+
+class AirBalanceTraceState(StrEnum):
+    """trace に残す Air Balance の状態。
+
+    ``disabled`` 以外は ``coldaisle.control.air_balance.AirBalanceState`` と同じ値である。
+    **``disabled`` は trace 側の型だけ**が持つ（決定記録 0073 §2.5 (b)）。モデルは無効のとき
+    呼ばれないので、モデルの出力に ``disabled`` を返す経路は作らない。schema は
+    air_balance を import しない（向きを一方にする）ので値で持ち、食い違いは試験で止める。
+    """
+
+    BALANCED = "balanced"
+    INTAKE_HEAVY = "intake_heavy"
+    EXHAUST_HEAVY = "exhaust_heavy"
+    THERMALLY_LIMITED = "thermally_limited"
+    UNKNOWN = "unknown"
+    DISABLED = "disabled"
+
+
+class AirBalanceRecord(_Frozen):
+    """1 tick の Air Balance の記録（`ControlTick` v11。#81 / 決定記録 0073 §2.5 (b)）。
+
+    **「推定できなかった」（``enabled`` + ``unknown``）と「使っていなかった」（``disabled``）を
+    同じ形にしない。** ``disabled`` は ``source.status: uncalibrated`` の起動だけが作り、
+    q・比・熱の理由はすべて空である（未校正の曲線と閾値を記録に入れない）。
+
+    ``enabled`` の q・吸排気量・比・状態は ``AirBalanceEstimate`` の不変条件をそのまま守る。
+    熱の理由は風量と独立に残す（q が欠けた tick でも温度の超過を落とさない）。
+    """
+
+    schema_version: Literal[1] = AIR_BALANCE_RECORD_SCHEMA_VERSION
+    status: Literal["enabled", "disabled"]
+    disabled_reason: Literal["uncalibrated"] | None
+    demand_basis: Literal["applied"] = "applied"
+    """何の demand で評価したか。requested でも effective でもなく applied（0073 §2.3）。"""
+    model_id: str = Field(pattern=r"^[a-z][a-z0-9_-]*$", max_length=120)
+    source_status: Literal["uncalibrated", "calibrated"]
+    config_sha256: Sha256Hex
+    q_front: EffectiveFlowUnit | None
+    q_rear: EffectiveFlowUnit | None
+    q_top: EffectiveFlowUnit | None
+    estimated_intake: EffectiveFlowUnit | None
+    estimated_exhaust: EffectiveFlowUnit | None
+    balance_ratio: EffectiveFlowUnit | None
+    state: AirBalanceTraceState
+    thermal_limited: bool
+    thermal_reasons: tuple[Annotated[str, Field(pattern=r"^[a-z][a-z0-9_]*$", max_length=64)], ...]
+
+    @classmethod
+    def disabled(cls, *, model_id: str, config_sha256: str) -> AirBalanceRecord:
+        """未校正で無効にして起動した tick の記録。どの未校正ファイルかだけを残す。"""
+        return cls(
+            status="disabled",
+            disabled_reason="uncalibrated",
+            model_id=model_id,
+            source_status="uncalibrated",
+            config_sha256=config_sha256,
+            q_front=None,
+            q_rear=None,
+            q_top=None,
+            estimated_intake=None,
+            estimated_exhaust=None,
+            balance_ratio=None,
+            state=AirBalanceTraceState.DISABLED,
+            thermal_limited=False,
+            thermal_reasons=(),
+        )
+
+    @property
+    def flows(self) -> PerZone[float | None]:
+        """zone ごとの q（``ZoneRecord.estimated_flow`` と突き合わせる値）。"""
+        return PerZone[float | None](front=self.q_front, rear=self.q_rear, top=self.q_top)
+
+    @model_validator(mode="after")
+    def _enabled_and_disabled_have_distinct_shapes(self) -> Self:
+        if self.status == "disabled":
+            if self.disabled_reason is None or self.source_status != "uncalibrated":
+                raise ValueError("disabled の Air Balance は uncalibrated の理由と出どころを持つ")
+            if any(
+                value is not None
+                for value in (
+                    self.q_front,
+                    self.q_rear,
+                    self.q_top,
+                    self.estimated_intake,
+                    self.estimated_exhaust,
+                    self.balance_ratio,
+                )
+            ):
+                raise ValueError("disabled の Air Balance に q・吸排気量・比を残さない")
+            if self.state is not AirBalanceTraceState.DISABLED:
+                raise ValueError("disabled の Air Balance の state は disabled にする")
+            if self.thermal_limited or self.thermal_reasons:
+                raise ValueError("disabled の Air Balance に熱の理由を残さない")
+            return self
+        if self.disabled_reason is not None:
+            raise ValueError("enabled の Air Balance に disabled_reason を付けない")
+        if self.source_status != "calibrated":
+            raise ValueError("enabled の Air Balance は calibrated の設定からだけ作る")
+        if self.state is AirBalanceTraceState.DISABLED:
+            raise ValueError("enabled の Air Balance の state を disabled にしない")
+        # 以下は AirBalanceEstimate の不変条件と同じ（schema は air_balance を import しない）。
+        ratio_available = (
+            self.q_front is not None
+            and self.q_rear is not None
+            and self.q_top is not None
+            and self.q_front > 0.0
+        )
+        if ratio_available != (self.balance_ratio is not None):
+            raise ValueError("balance_ratio は3つの q があり q_front > 0 のときだけ持つ")
+        if ratio_available:
+            assert self.q_front is not None and self.q_rear is not None and self.q_top is not None
+            if self.estimated_intake != self.q_front:
+                raise ValueError("estimated_intake は q_front と一致させる")
+            if self.estimated_exhaust != self.q_rear + self.q_top:
+                raise ValueError("estimated_exhaust は q_rear + q_top と一致させる")
+            assert self.balance_ratio is not None
+            if self.balance_ratio != self.estimated_exhaust / self.q_front:
+                raise ValueError("balance_ratio は estimated_exhaust / estimated_intake にする")
+        elif self.estimated_intake is not None or self.estimated_exhaust is not None:
+            raise ValueError("比を計算できないときは推定吸排気量も未確定にする")
+        if (self.state is AirBalanceTraceState.UNKNOWN) == ratio_available:
+            raise ValueError("q が使えるときだけ unknown 以外の状態にする")
+        if self.thermal_limited != bool(self.thermal_reasons):
+            raise ValueError("thermal_limited と thermal_reasons を一致させる")
+        if ratio_available and self.thermal_limited != (
+            self.state is AirBalanceTraceState.THERMALLY_LIMITED
+        ):
+            raise ValueError("q が使えるときは熱制約と thermally_limited を一致させる")
+        return self
+
+
 EMERGENCY_FAULTS: frozenset[FaultCode] = frozenset(
     {
         FaultCode.ABSOLUTE_TEMPERATURE_LIMIT,
@@ -1478,7 +1698,7 @@ v1〜v3 の reader は知らないため v3 以前には記録しない。
 class ControlTick(_Frozen):
     """1 tick の判断の記録（decision trace。0028 §2.3）。#82 が保存し、#90 / #91 が読む。"""
 
-    schema_version: Literal[1, 2, 3, 4, 5, 6, 7, 8, 9, 10] = SCHEMA_VERSION
+    schema_version: Literal[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11] = SCHEMA_VERSION
     tick_id: int = Field(ge=0)
     ts_ms: int = Field(ge=0)
     """記録の時刻（壁時計。0028 §2.6）。"""
@@ -1506,6 +1726,13 @@ class ControlTick(_Frozen):
 
     保存済みの v1〜v9 では None。registry を読んでいない構成の v10 は `None` ではなく
     `RegistryProvenance.unbound()`（`revision=None`）を持つ。
+    """
+    air_balance: AirBalanceRecord | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
+    """Air Balance の記録（v11。#81 / 決定記録 0073 §2.5 (b)）。保存済みの v1〜v10 では None。
+
+    無効（未校正）の起動も ``None`` ではなく ``AirBalanceRecord.disabled()`` を持つ。
     """
     faults: tuple[Fault, ...] = ()
     """いま有効な故障。
@@ -1556,6 +1783,7 @@ class ControlTick(_Frozen):
                 raise ValueError("v10 の ControlTick には registry が要る")
         elif self.schema_version < 10:
             raise ValueError("registry を記録する ControlTick は schema version 10 にする")
+        self._check_air_balance()
         self._check_model_gate()
         self._check_registry_binds_model()
         self._check_shadow()
@@ -1651,6 +1879,50 @@ class ControlTick(_Frozen):
         if self.state.active_controller is not ControllerKind.LEARNED_MPC:
             return False
         return self.applied_model_artifact is None
+
+    def _check_air_balance(self) -> None:
+        """v11 の ``air_balance`` と zone の風量・runtime の設定 hash が同じ事実を指すか。"""
+        record = self.air_balance
+        runtime = self.runtime
+        if self.schema_version < 11:
+            if record is not None:
+                raise ValueError("air_balance を記録する ControlTick は schema version 11 にする")
+            if runtime is not None and runtime.schema_version >= 2:
+                raise ValueError("runtime v2 を記録する ControlTick は schema version 11 にする")
+            if any(self.zones.get(zone).applied_demand is not None for zone in Zone):
+                raise ValueError("applied_demand を記録する ControlTick は v11 にする")
+            return
+        if record is None:
+            # 版が中身を表さない記録を作らない（0060 §2.4）。
+            raise ValueError("v11 の ControlTick には air_balance が要る")
+        assert runtime is not None  # v8 以降は必須（上で検証済み）
+        if runtime.schema_version < 2:
+            raise ValueError("v11 の ControlTick には runtime v2 が要る")
+        if record.config_sha256 != runtime.config.air_balance_sha256:
+            raise ValueError("air_balance.config_sha256 を runtime の air-balance.yaml と揃える")
+        for zone in Zone:
+            zone_record = self.zones.get(zone)
+            flow = record.flows.get(zone)
+            if zone_record.estimated_flow != flow:
+                # zone ごとに突き合わせるので、Rear と Top の入れ替わりも検出できる。
+                raise ValueError(f"{zone.value}: estimated_flow を air_balance の q と揃える")
+            hardware = zone_record.hardware
+            confirmed = hardware is not None and hardware.write_ok and hardware.readback_ok
+            if confirmed and zone_record.applied_demand is None:
+                # FanHardwareResult と同じ同値関係（書けて読み戻せた ⇔ applied がある）を
+                # v11 の trace でも守る（codex #4134968263）。欠けを許すと、確認済みの zone を
+                # 「書き込みを確認できていない」と読ませてしまう。v10 以前は欄が無いので見ない。
+                raise ValueError(
+                    f"{zone.value}: write と readback を確認できた v11 の zone には"
+                    " applied_demand が要る"
+                )
+            if zone_record.applied_demand is None and flow is not None:
+                raise ValueError(f"{zone.value}: applied demand の無い zone に風量を残さない")
+            if flow is not None and any(
+                fault.code is FaultCode.TACH_STALL and fault.zone is zone for fault in self.faults
+            ):
+                # 回っていない Fan に風量を書かない（0073 §2.5 (a)）。
+                raise ValueError(f"{zone.value}: stall の zone に風量を残さない")
 
     def _check_model_gate(self) -> None:
         """v5 の ``model_gate`` が ControlState と同じ判断を指しているか。"""

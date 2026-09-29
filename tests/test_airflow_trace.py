@@ -2,7 +2,7 @@
 
 `airflow-trace.js` の変換を node で実際に動かして確かめる（決定記録 0044。CI では node が必須）。
 
-1. **版の解釈は1か所**（`airflow-trace.js`）。v1〜v10 の fixture を読める
+1. **版の解釈は1か所**（`airflow-trace.js`）。v1〜v11 の fixture を読める
    （schema.py に無い版は「未対応の版」）
 2. **3つの状態を混ぜない**: その版に欄が無い／欄はあるが値が無い／画面が知らない版
 3. Safety override・Fallback・OOD を通常状態と区別して出す
@@ -38,7 +38,7 @@ AIRFLOW_UI_PATH = CONFIG_DIR / "airflow-ui.yaml"
 NOW_MS = 1_787_616_020_000
 
 NOT_IN_VERSION = "この版の記録には無い"
-FIXTURE_VERSIONS = range(1, 11)
+FIXTURE_VERSIONS = range(1, 12)
 
 
 def _node() -> str:
@@ -113,7 +113,7 @@ def _steps(result: Any, zone: str) -> dict[str, dict[str, Any]]:
 
 @pytest.mark.parametrize("version", FIXTURE_VERSIONS)
 def test_every_stored_version_is_read(version):
-    """保存済みの v1〜v10 の fixture を、同じ `page.control` の形にできる。"""
+    """保存済みの v1〜v11 の fixture を、同じ `page.control` の形にできる。"""
     result = _convert(_body(version))
     assert result["status"] == "ok"
     assert result["schema_version"] == version
@@ -182,11 +182,11 @@ def test_workload_regime_absent_in_v1_only():
     assert _chip(_convert(_body(2)), "負荷の傾向")["v"] != NOT_IN_VERSION
 
 
-@pytest.mark.parametrize("version", [11, 12, 999])
+@pytest.mark.parametrize("version", [12, 999])
 def test_an_unknown_version_is_not_shown(version):
     """画面が知らない版は「未対応の版」。**制御由来の項目を出さない。**
 
-    v11 は schema.py にまだ無い。中身は先にマージされた PR で決まるので、推測で読まない。
+    v12 は schema.py にまだ無い。中身は先にマージされた PR で決まるので、推測で読まない。
     """
     body = _body(10)
     body["schema_version"] = version
@@ -339,6 +339,125 @@ def test_estimates_without_values_stay_null():
     zone = _convert(_body(10))["control"]["zones"]["front"]
     assert zone["airflow_index"] is None
     assert zone["estimated_flow"] is None
+
+
+# ---------------------------------------------------------------- v11: Air Balance（0073 §2.5）
+
+
+def _v11(document: dict[str, Any]) -> dict[str, Any]:
+    """schema.py の ControlTick として検証を通した v11 の本文。**実在しない形を試さない。**"""
+    tick = ControlTick.model_validate_json(json.dumps(document))
+    assert tick.schema_version == 11
+    loaded: dict[str, Any] = json.loads(tick.model_dump_json())
+    return loaded
+
+
+def _disabled_v11() -> dict[str, Any]:
+    """未校正で起動した v11（`AirBalanceRecord.disabled`。zone の推定風量も無い）。"""
+    body = _body(11)
+    tick = ControlTick.model_validate_json(json.dumps(body))
+    assert tick.air_balance is not None
+    body["air_balance"] = json.loads(
+        type(tick.air_balance)
+        .disabled(model_id=tick.air_balance.model_id, config_sha256=tick.air_balance.config_sha256)
+        .model_dump_json()
+    )
+    for zone in ("front", "rear", "top"):
+        body["zones"][zone]["estimated_flow"] = None
+    return _v11(body)
+
+
+def test_v11_air_balance_is_read_from_the_record():
+    body = _v11(_body(11))
+    record = body["air_balance"]
+    balance = _convert(body)["control"]["balance"]
+    assert record["status"] == "enabled" and record["state"] == "exhaust_heavy"
+    assert balance["state"] == "排気が多い"
+    assert balance["tone"] == "warn"
+    assert balance["ratio"] == pytest.approx(record["balance_ratio"])
+    assert balance["position"] is None, "目標帯は trace に無い。位置を推測で描かない"
+    assert "absent" not in balance and "disabled" not in balance
+
+
+def test_v11_applied_demand_and_estimated_flow_are_shown():
+    body = _v11(_body(11))
+    result = _convert(body)
+    for zone in ("front", "rear", "top"):
+        record = body["zones"][zone]
+        converted = result["control"]["zones"][zone]
+        assert converted["applied_demand"] == pytest.approx(record["applied_demand"])
+        assert converted["estimated_flow"] == pytest.approx(record["estimated_flow"])
+        applied = f"{round(record['applied_demand'] * 100)}%"
+        assert f"適用した出力：{applied}" in _steps(result, zone)["ファン"]["detail"]
+        assert NOT_IN_VERSION not in _steps(result, zone)["ファン"]["detail"]
+
+
+def test_v11_disabled_air_balance_is_disabled_not_an_error():
+    """未校正の Air Balance は「使っていない」。**故障・未対応・「釣り合っている」にしない。**"""
+    result = _convert(_disabled_v11())
+    assert result["status"] == "ok"
+    balance = result["control"]["balance"]
+    assert balance["disabled"] is True
+    assert balance["state"] == "無効（未校正）"
+    assert balance.get("tone") not in ("ok", "warn", "bad")
+    assert balance["ratio"] is None
+    assert "absent" not in balance, "欄はある（版に無いのではない）"
+    assert result["control"]["alert"] is None
+    assert _chip(result, "故障")["v"] == "なし"
+    for zone in result["control"]["zones"].values():
+        assert zone["estimated_flow"] is None
+
+
+def test_v11_a_zone_without_an_applied_demand_has_no_value_not_no_field():
+    """v11 で書き込みを確認できなかった zone は「記録なし」。
+
+    **「この版の記録には無い」と言わない**（欄はあるが値が無い）。
+    """
+    body = _body(11)
+    body["zones"]["top"].pop("applied_demand")
+    body["zones"]["top"]["estimated_flow"] = None
+    # 書けて読み戻せた zone は applied_demand を必ず持つので、読み戻しの不一致を置く
+    body["zones"]["top"]["hardware"]["readback_ok"] = False
+    record = body["air_balance"]
+    record.update(
+        q_top=None,
+        estimated_intake=None,
+        estimated_exhaust=None,
+        balance_ratio=None,
+        state="unknown",
+    )
+    result = _convert(_v11(body))
+    detail = _steps(result, "top")["ファン"]["detail"]
+    assert "適用した出力：記録なし" in detail
+    assert NOT_IN_VERSION not in detail
+    assert result["control"]["zones"]["top"]["applied_demand"] is None
+    balance = result["control"]["balance"]
+    assert balance["state"] == "推定できない"
+    assert balance["ratio"] is None
+    assert balance["tone"] == "warn"
+
+
+@pytest.mark.parametrize("breakage", ["missing", "status", "state"])
+def test_v11_an_unreadable_air_balance_is_not_normal(breakage):
+    body = _v11(_body(11))
+    if breakage == "missing":
+        del body["air_balance"]
+    elif breakage == "status":
+        body["air_balance"]["status"] = "paused"
+    else:
+        body["air_balance"]["state"] = "sideways"
+    balance = _convert(body)["control"]["balance"]
+    assert balance["state"] == "記録の値を解釈できない"
+    assert balance["tone"] == "warn"
+    assert "absent" not in balance and "disabled" not in balance
+
+
+def test_the_page_draws_a_disabled_balance_as_disabled():
+    script = SCRIPT.read_text(encoding="utf-8")
+    render = script[script.index("function renderBalance()") :]
+    render = render[: render.index("\nfunction ")]
+    assert "balance.disabled" in render
+    assert "未校正" in render
 
 
 # ---------------------------------------------------------------- 古さ（0071 §2.6）

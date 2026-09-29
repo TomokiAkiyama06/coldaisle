@@ -21,7 +21,7 @@ from pydantic import BaseModel, ConfigDict, model_validator
 
 from coldaisle.control.acoustic import AcousticCostModel
 from coldaisle.control.air_balance import AirBalanceModel, BalanceBand
-from coldaisle.control.config import FanPolicyConfig, SafetyConfig
+from coldaisle.control.config import FanHardwareConfig, FanPolicyConfig, SafetyConfig
 from coldaisle.control.fallback.gate import LearnedControlStatus, LearnedFailure, SnapshotStatus
 from coldaisle.control.model.confidence import (
     ConfidenceAssessment,
@@ -211,8 +211,12 @@ class LearnedMpcController:
         acoustic: AcousticCostModel | None = None,
         air_balance: AirBalanceModel | None = None,
         balance_band: BalanceBand | None = None,
+        fan_hardware: FanHardwareConfig | None = None,
     ) -> None:
         """設定とモデルが噛み合わなければ ``MpcModelUnusableError`` で**生成時に**失敗する。
+
+        Air Balance を渡すなら、同じ ``ControlConfig`` の ``fan_hardware`` も渡す
+        （決定記録 0073 §2.3。欠ければ ``MpcCostUnusableError``）。
 
         tick ごとに失敗させない。呼び出し側（runtime）はこれを
         ``LearnedFailure.MODEL_LOAD_FAILURE`` として Gate へ渡し、Fallback で運転を続ける。
@@ -230,6 +234,7 @@ class LearnedMpcController:
             acoustic=acoustic,
             air_balance=air_balance,
             balance_band=balance_band,
+            fan_hardware=fan_hardware,
         )
         self._binding = binding
         self._policy = policy
@@ -240,6 +245,7 @@ class LearnedMpcController:
         self._acoustic = acoustic
         self._air_balance = air_balance
         self._balance_band = balance_band
+        self._fan_hardware = fan_hardware
         self._optimizer = LearnedMpcOptimizer(
             binding,
             policy.mpc.optimizer,
@@ -278,6 +284,16 @@ class LearnedMpcController:
             ),
             "balance_band": (
                 None if self._balance_band is None else self._balance_band.model_dump(mode="json")
+            ),
+            # balance の項は profile の写像を通した demand で評価する（決定記録 0073 §2.3）。
+            # 写像が変われば同じ入力から違う提案になるので、条件に入れる。
+            "balance_minimum_stable_demand": (
+                None
+                if self._fan_hardware is None or self._air_balance is None
+                else {
+                    zone.value: self._fan_hardware.zones.get(zone).profile.minimum_stable_demand
+                    for zone in Zone
+                }
             ),
         }
 
