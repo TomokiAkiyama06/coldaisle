@@ -79,10 +79,27 @@ uv run coldaisle-supervisor-shadow --evidence config/supervisor-shadow-runs.yaml
 | どの時点か | **運転の後**。保存済み trace を、manifest に明示した期間（`[start_ms, end_ms)`。「直近」のような相対指定は置かない）で読む |
 | 何を読むか | decision trace（`control_traces`）の `ControlTick.supervisor` だけ。**新しい記録項目も新しい IPC も作らない** |
 | どう開くか | `coldaisle-evaluate` の `EvidenceDatabase`（`immutable=1`、`-wal` / `-journal` に中身があれば開かない）をそのまま使う |
-| 何を書くか | `SupervisorShadowSummary`（schema v2）の canonical JSON を1つ、`--out` へ。**DB・Registry・設定・trace には書かない** |
+| 何を書くか | `SupervisorShadowRunReport`（schema v1、新設。下の「出力の形」）の canonical JSON を1つ、`--out` へ。**DB・Registry・設定・trace には書かない** |
 | Registry に触れるか | **読むだけ。** manifest が名指した RL artifact を `ModelRegistry.load_version()`（`create=False` で開き、書かない）で検証し、その attestation から識別を作る（下の「台帳に渡す tick」）。`register_candidate()` / `mark_validated()` / `promote()` などの**書く操作は呼ばない**。import の走査で、CLI の module がそれらを呼ばないことを確かめる |
 | 誰が使うか | 人が `promote_supervisor_policy()`（0061 §2.6）へ渡す。昇格は CLI の外で行う |
 | shadow の下限をどこから取るか | 検証済みの `rl-policy.yaml`（`PolicyShadowConfig`）を**必須の入力**にする。下限を引数や manifest で上書きする口は作らない（下の「下限の束縛」） |
+
+#### 出力の形（集計と振り分けの件数を同じ文書に置く）
+
+振り分けの件数（下の「台帳に渡す tick と渡さない tick」）は、いまの `SupervisorShadowSummary` v2 に欄が無い。
+集計の schema を上げると、昇格の入口と Registry の `shadow_evaluation_ref` が名指す digest の意味が変わるので、
+**集計は変えずに包む**。
+
+- `SupervisorShadowRunReport`（schema v1、`extra="forbid"`）は次だけを持つ
+  - `summary`: `SupervisorShadowSummary` v2 **そのもの**（入れ子。bytes の作り方は変えない）
+  - `summary_sha256`: `summary` の canonical digest。**validator が作り直して一致を確かめる**
+  - `filtered`: 理由別の件数（`no_supervisor_decision` / `no_shadow_slot` / `active_not_rule`）。
+    **3つの鍵を常に全部出す**（0 でも省かない。欠けた鍵と 0 を区別させない）
+  - `period`（`[start_ms, end_ms)`）と、照合に使った `fan-policy.yaml` の digest
+- 昇格に使うのは `summary` だけである。人は `SupervisorShadowRunReport.summary` を取り出して
+  `promote_supervisor_policy()` へ渡し、Registry の `shadow_evaluation_ref` は**これまでどおり集計の digest**を名指す。
+  包みの digest を昇格の証拠にしない（振り分けの件数は監査用で、`usable` の判定に入らない）
+- 包みの型は `coldaisle.supervisor_shadow`（合成の起点）に置き、`control/supervisor` は包みを知らない
 
 #### 制御へ逆流しないことの保証
 
@@ -175,11 +192,16 @@ trace の主キー・#91 の評価器（`EvaluationInputError`「同じ `(ts_ms,
 
 #### `PolicyEpisodeReport` が持つもの・持たないもの
 
-入力は **`PolicyComparison` 1つと、検証済みの `RlPolicyConfig`**（`rl-policy.yaml`。cost の閾値を取る）だけ。
+入力は **`PolicyComparison` 1つ、検証済みの `RlPolicyConfig`**（`rl-policy.yaml`。cost の閾値を取る）、
+**RL arm ごとの `certify()` を通した artifact**（識別を取る）だけ。
 同じ条件・同じ episode 群・同じ Learned MPC の有無は 0058 §2.6 で比較にすでに保証されている。
 report は `control/evaluation/episode.py` に置き、`control.rl` の型を**読むだけ**で import する
 （`control.rl` は `control.evaluation` を import しない。向きは一方向）。
-**呼び出し側が数字や hash を文字列で渡す口は作らない。** report の欄は、すべてこの2つの入力から導く。
+**呼び出し側が数字や hash を文字列で渡す口は作らない。** report の欄は、すべてこれらの入力から導く。
+`PolicyComparison` の arm は `policy` と `policy_version` しか持たず、model ID や bytes hash を含む
+`SupervisorPolicyIdentity` を比較からは作れない。そこで RL arm ごとに artifact を受け取り、
+**`certified_identity()` の版が arm の `policy_version` と一致しなければ report を作らない**。
+RL arm に対応する artifact が欠けている・余っている場合も作らない
 
 | 欄 | 出どころ |
 |---|---|
@@ -189,7 +211,7 @@ report は `control/evaluation/episode.py` に置き、`control.rl` の型を**�
 | `rl-policy.yaml` の digest と `minimum_reward_improvement` の値 | 入力の検証済み `RlPolicyConfig` から |
 | `training_mode` / dynamics の provenance / `safety_model` / `reward_version` / `applied_demand_tolerance` | episode の値。**arm 間で揃っていなければ作らない** |
 | `learned_controller_available` | 比較から導く（欄として受け取らない） |
-| arm ごと: `policy` / `policy_version` / RL なら `SupervisorPolicyIdentity` | Rule は版、RL は §2.3 の照合済み artifact から |
+| arm ごと: `policy` / `policy_version` / RL なら `SupervisorPolicyIdentity` | Rule は版、RL は入力の `certify()` を通した artifact の `certified_identity()` から |
 | arm ごと: 安全側の数（絶対上限の超過・floor 不足・範囲外 action・最小 margin） | `EpisodeSafety` の合計と **worst-case episode** |
 | arm ごと: coverage（採点できた step・割合・理由別の内訳・`usable_for_comparison` でない episode 数） | `EpisodeCoverage` |
 | arm ごと: 共通の長さ（episode ごとの全 arm の採点できた step 数の最小）で揃えた reward 平均 | 0058 §2.6 / 0061 §2.7 と同じ規則。**使った長さを欄として残す** |
@@ -203,9 +225,17 @@ report は `control/evaluation/episode.py` に置き、`control.rl` の型を**�
 閾値と provenance が別の設定を指せる）。そこで次のように変える。
 
 - `EpisodeResult` に `config_digests`（上の3つの検証済み設定の digest。環境が自分の持つ設定から作る）と
-  `other_conditions_sha256`（それ以外の条件。いまの payload から3つの digest を除いたもの）を持たせる
-- `conditions_sha256 = canonical_sha256({config_digests, other_conditions_sha256})` とし、
-  **`EpisodeResult` の validator がこの一致を確かめる**。食い違う episode は作れず、読み戻しでも拒む
+  `other_conditions`（それ以外の条件。いまの payload から3つの digest を除いたもの）を**読める形の欄**として持たせる。
+  中の hash を1つだけ持たせる形は採らない。中の hash を payload から作り直す手段が無いと、episode の
+  dynamics・`reward_version`・`safety_model`・許容幅を書き換えても中の hash が変わらず、外の一致が通ってしまう
+- **`EpisodeResult` の validator は内側から順に確かめる。** (1) `other_conditions` のうち episode の欄としても
+  現れる値（`episode_id` / `seed` / `mode` / `reward_version` / `discount` / `dynamics` / `safety_model` /
+  `applied_demand_tolerance` / `learned_controller_available`）が、episode の欄と一致する。
+  (2) `conditions_sha256 = canonical_sha256({config_digests, other_conditions})` を作り直して一致する。
+  食い違う episode は作れず、読み戻しでも拒む
+- `other_conditions` のうち episode の欄に現れない入力（workload trace・初期 window・controller の条件など）は
+  いまと同じく digest として入る。これらは episode の中からは作り直せず、**環境で同じ条件・同じ seed から
+  回し直して同じ bytes になること**（0058）で確かめる。この記録はそこを変えない
 - 条件 hash が policy 以外のすべてを覆う、という 0058 §2.6 の性質は変わらない。変わるのは
   「3つの設定の digest を外から照合できる」ことだけである。episode の schema 版は 2 に上げ、
   v1 の episode は report の入力にしない
@@ -247,8 +277,8 @@ supervisor policy について、その参照の出どころはこれまで決�
   0061 §2.6 の `promote_supervisor_policy()` と対になる）だけで行う。入力は report に加えて
   **元の `PolicyComparison`**・検証済みの `rl-training.yaml` / `fan-policy.yaml` / `safety.yaml` / `rl-policy.yaml`・
   `certify()` を通した artifact・Baseline の Rule policy である。次を確かめてから `ModelRegistry.mark_validated()` へ渡す
-  - 渡した比較の canonical digest が report の `comparison_sha256` と一致し、**その比較と検証済み
-    `rl-policy.yaml` から report を作り直した bytes が、渡した report の bytes と一致する**。
+  - 渡した比較の canonical digest が report の `comparison_sha256` と一致し、**その比較・検証済み
+    `rl-policy.yaml`・渡した `certify()` 済みの artifact から report を作り直した bytes が、渡した report の bytes と一致する**。
     report は集計だけを持ち action の列を持たないので、action の照合は元の比較に対して行う。
     作り直しの一致で、report の識別・数字・gate がその比較から導かれたことを保証する
     （識別だけを差し替えた report を通さない）
@@ -264,7 +294,13 @@ supervisor policy について、その参照の出どころはこれまで決�
   **元の比較を必須の入力にし、report はそこへ digest で束縛する**
 - **#104 の `mark_validated()` を直接呼ぶ経路は残る**（0062 の CLI 契約。0061 §5 の Registry CLI と同じ残余として記録する）
 
-**帰結として、反実仮想 artifact が揃うまで supervisor policy は validated にも production にもならない。**
+**帰結として、policy 専用の入口（`validate_supervisor_policy()` / `promote_supervisor_policy()`）を通る限り、
+反実仮想 artifact が揃うまで supervisor policy は validated にも production にもならない。**
+これは**入口を通ることを前提にした性質であって、Registry が強制する性質ではない。** 上のとおり #104 の
+`mark_validated()` / `promote()`（0062 の CLI）を直接呼べば、episode の gate を経ずに参照を付けて昇格できる。
+その経路を閉じるか（Registry CLI が `supervisor_policy` の kind について policy 専用の入口を要求する等）は
+0061 §5 と同じく別の記録で決める（§5）。**それまでは「fail closed」を Registry の保証として扱わない。**
+運用者は supervisor policy の validated 化・昇格を policy 専用の入口でだけ行う
 shadow の運転は `for_shadow` が `production_active` を要求しない（0061 §2.4）ので、**candidate のまま
 shadow で比べられる**。証拠の収集は止まらない。
 
@@ -333,9 +369,11 @@ shadow で比べられる**。証拠の収集は止まらない。
   1. 台帳を制御プロセスの外（CLI）に置くか、in-loop にするか（§2.1。推奨は外）
   2. 台帳の鍵を `(ts_ms, tick_id)` に変え、設定の食い違う期間を run ごと拒否するか（§2.1）
   3. episode の結果を別の report 型にするか、`EvaluationReport` v3 の第3名前空間にするか（§2.2。推奨は別の型）
-  4. 反実仮想 artifact が揃うまで supervisor policy を validated にしない帰結を受け入れるか（§2.3）
+  4. 反実仮想 artifact が揃うまで supervisor policy を validated にしない帰結を受け入れるか（§2.3）。
+     この帰結は policy 専用の入口を通る限りのもので、#104 の直接の経路は別の記録まで残る
   5. 証拠の束縛のために、`promote_supervisor_policy()` へ検証済み `PolicyShadowConfig` を足し（§2.1）、
-     episode の条件 hash を2段にして schema を v2 に上げるか（§2.2）
+     episode の条件 hash を2段にして schema を v2 に上げるか（§2.2）、shadow の出力を包みの型
+     `SupervisorShadowRunReport` にするか（§2.1）
 - **`SupervisorPolicyBinding.for_active` を開く条件は、この記録の範囲外である。** 何を反実仮想の裏づけと
   みなし誰が発行するか、RL へ制御権を渡す時期と条件は、0061 §5 のとおり**別の決定記録で決める**。
   本記録の shadow 集計と episode report は、その門の条件として読まない
