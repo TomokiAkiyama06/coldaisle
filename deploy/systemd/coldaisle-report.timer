@@ -1,0 +1,13 @@
+# coldaisle-report.service を毎朝起動する（#25 / #57）。
+#
+# 時刻は config/report.yaml の例（08:05）に揃えた。ロールアップ（03:00）のあと。
+
+[Unit]
+Description=Run coldaisle daily report every morning
+
+[Timer]
+OnCalendar=*-*-* 08:05:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target

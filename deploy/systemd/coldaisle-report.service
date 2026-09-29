@@ -1,0 +1,24 @@
+# 前日の日次レポート（#25 / 決定記録 0017）のテンプレート。
+#
+# 1回走って終わる。起動は coldaisle-report.timer が行う。
+# 集計元は1分ロールアップなので、coldaisle-rollup のあとに走らせる（0017 §2.1）。
+
+[Unit]
+Description=coldaisle daily report
+
+[Service]
+Type=oneshot
+User=coldaisle
+Group=coldaisle
+WorkingDirectory=/opt/coldaisle
+StateDirectory=coldaisle
+StateDirectoryMode=0750
+EnvironmentFile=-/etc/coldaisle/coldaisle.env
+ExecStart=/opt/coldaisle/.venv/bin/coldaisle-report --db /var/lib/coldaisle/coldaisle.db
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=coldaisle-report
+
+NoNewPrivileges=yes
+PrivateTmp=yes

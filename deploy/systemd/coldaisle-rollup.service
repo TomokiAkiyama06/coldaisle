@@ -1,0 +1,23 @@
+# ロールアップと保持期間の適用（#10 / 決定記録 0008 §2.7）のテンプレート。
+#
+# 1回走って終わる。起動は coldaisle-rollup.timer が行う。
+# 取り込みデーモンの中では動かさない（0008 §2.7）。WAL なので取り込みと並行してよい。
+
+[Unit]
+Description=coldaisle rollup and retention
+
+[Service]
+Type=oneshot
+User=coldaisle
+Group=coldaisle
+WorkingDirectory=/opt/coldaisle
+StateDirectory=coldaisle
+StateDirectoryMode=0750
+ExecStart=/opt/coldaisle/.venv/bin/coldaisle-rollup --db /var/lib/coldaisle/coldaisle.db
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=coldaisle-rollup
+
+NoNewPrivileges=yes
+PrivateTmp=yes

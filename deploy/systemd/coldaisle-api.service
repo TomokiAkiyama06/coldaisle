@@ -1,0 +1,35 @@
+# coldaisle 読み取り API とダッシュボード（#9 / #57）のテンプレート。
+#
+# **テンプレートである。** `User=` / `Group=` は仮の値。導入の手順は
+# docs/ubuntu-deploy.md。API の設定は環境変数で渡す（決定記録 0009 §2.9）。
+#
+# 待ち受けは loopback だけにする。外へ出す場合の判断はこのテンプレートでは行わない。
+
+[Unit]
+Description=coldaisle read API and dashboard
+Documentation=file:///opt/coldaisle/docs/ubuntu-deploy.md
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=coldaisle
+Group=coldaisle
+WorkingDirectory=/opt/coldaisle
+StateDirectory=coldaisle
+StateDirectoryMode=0750
+EnvironmentFile=-/etc/coldaisle/coldaisle.env
+Environment=COLDAISLE_DB=/var/lib/coldaisle/coldaisle.db
+ExecStart=/opt/coldaisle/.venv/bin/uvicorn coldaisle.api:app --host 127.0.0.1 --port 8000
+
+Restart=always
+RestartSec=5
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=coldaisle-api
+
+NoNewPrivileges=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target
