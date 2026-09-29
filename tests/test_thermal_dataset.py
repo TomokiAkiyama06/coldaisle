@@ -1226,6 +1226,13 @@ def _tick_for_schema_version(version: int, *, ts_ms: int, tick_id: int) -> Contr
                 "policy_sha256": "2" * 64,
             },
         }
+    if version >= 9:
+        # v9も同じく、Critical Safetyの裁定の前提を省いた記録を作れない（#78）
+        raw["safety_provenance"] = {
+            "schema_version": 1,
+            "disabled_inputs": [],
+            "config_is_provisional": False,
+        }
     return ControlTick.model_validate_json(json.dumps(raw))
 
 

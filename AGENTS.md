@@ -28,6 +28,7 @@ uv run coldaisle-daemon --source serial --port /dev/cu.usbmodem1101  # ポート
 uv run coldaisle-rollup             # ロールアップと保持期間の適用（1日1回）
 uv run coldaisle-report             # 前日の日次レポート（ロールアップのあと）
 uv run coldaisle-report --date 2026-08-24 --no-send --print  # 任意の日を作り直す
+uv run coldaisle-soak-report --start 2026-08-24T09:00  # 連続運転テストの集計（**DB を読むだけ**）
 uv run coldaisle-escalate           # 故障疑いの案件資料（**送信はしない**）
 uv run coldaisle-memory             # 運用メモリの更新案（**既定では書かない**）
 uv run coldaisle-memory --apply --commit  # 確認してから書く
@@ -224,6 +225,7 @@ src/coldaisle/
   daemon.py   # 合成の起点: Source→Normalizer→Store→Rules を束ねる。#8 / #18
   ingest/     # L0: Source実装（serial / mock / replay）、正規化
   report.py   # 合成の起点: 日次レポート（Store→AI→通知）。#25
+  soak.py     # 合成の起点: 連続運転テストの集計（Store を読むだけ）。#47
   server.py   # 合成の起点: 読み取りAPI + AIツールの窓口。#23
   escalate.py # 合成の起点: 故障疑いの案件資料（AI非依存・送信しない）。#39
   memory.py   # 合成の起点: 運用メモリの記録（確認を経由する）。#40
@@ -255,7 +257,7 @@ src/coldaisle/
   web/        # L4: 静的アセット
 firmware/     # ESP32-S3 Arduino スケッチ。**コンパイルは人の手**（#11 / 決定記録 0022 §2.9）
 deploy/       # Ubuntu 常駐化のテンプレート（systemd / udev）。**仮の値だけ**。手順は docs/ubuntu-deploy.md（#57）
-config/       # rules.yaml, calibration.json, coldaisle.toml, fan-policy.yaml, fan-hardware.yaml, safety.yaml, evaluation.yaml, drift.yaml, rl-training.yaml
+config/       # rules.yaml, calibration.json, coldaisle.toml, fan-policy.yaml, fan-hardware.yaml, safety.yaml, evaluation.yaml, drift.yaml, rl-training.yaml, soak.yaml
 memory/       # 運用メモリ（いまの閾値・較正値）。`coldaisle-memory` が更新案を出す
 docs/         # 要件定義、仕様レビュー、ADR
 tests/

@@ -159,6 +159,33 @@ def control_config(
     )
 
 
+T_SENSOR_METRIC = "board.connector_12v2x6"
+"""本番の Metric Catalog に温度(C)で載っている、T_SENSOR 有効化の試験用 metric。"""
+
+
+def confirmed_safety_document() -> dict[str, Any]:
+    """暫定値を1つも含まず、T_SENSOR を有効にした safety.yaml（#78 の空の前提の試験用）。
+
+    値は既定の試験用設定のまま status だけを confirmed にする。実機の承認記録ではない。
+    """
+
+    def confirm(node: Any) -> Any:
+        if isinstance(node, dict):
+            if node.get("status") == "provisional":
+                return {**node, "status": "confirmed", "basis": "test fixture"}
+            return {key: confirm(item) for key, item in node.items()}
+        if isinstance(node, list):
+            return [confirm(item) for item in node]
+        return node
+
+    document: dict[str, Any] = confirm(valid_documents()["safety.yaml"])
+    document["telemetry"]["t_sensor"] = {
+        "enabled": {"value": True, "status": "confirmed", "basis": "test fixture"},
+        "stale_after_ms": {"value": 1_000, "status": "confirmed", "basis": "test fixture"},
+    }
+    return document
+
+
 def _sources(safety_document: dict[str, Any], policy_document: dict[str, Any]) -> Any:
     from hashlib import sha256
 
@@ -342,6 +369,7 @@ class Harness:
         safety: Any = None,
         composer: Any = None,
         backend: Any = None,
+        t_sensor_metric: str | None = None,
     ) -> None:
         self.config = config if config is not None else control_config()
         self.clock = SimulatedClock(TEST_EPOCH_MS)
@@ -351,7 +379,7 @@ class Harness:
         self.order: list[str] = []
         self.watchdog = watchdog or RecordingWatchdog(self.order, monotonic=self.monotonic)
         self.trace = RecordingTrace(order=self.order)
-        self.contract = build_input_contract(self.config, catalog)
+        self.contract = build_input_contract(self.config, catalog, t_sensor_metric=t_sensor_metric)
         binding = create_control_runtime_binding(self.config)
         self.backend = backend or SimulatedFanBackend(
             config=self.config.fan_hardware,
@@ -374,7 +402,11 @@ class Harness:
             guard=guard or ReactiveGuard(self.config.policy.reactive_guard, catalog),
             safety=safety
             or CriticalSafety(
-                self.config.safety, input_contract=self.contract, runtime_binding=binding
+                self.config.safety,
+                input_contract=self.contract,
+                runtime_binding=binding,
+                approved_t_sensor_metric=t_sensor_metric,
+                metric_catalog=catalog if t_sensor_metric is not None else None,
             ),
             composer=composer or DemandComposer(self.config.safety),
             backend=self.backend,
@@ -933,6 +965,57 @@ def test_invariant_12_tick_overrun_is_detected_and_recorded(catalog) -> None:
     assert runtime.tick_period_ms == harness.config.safety.tick_ms.value
     assert runtime.config.safety_sha256 == harness.config.sources.safety.sha256
     assert runtime.snapshot_schema_version >= 1
+
+
+def test_invariant_12_the_trace_records_the_premise_of_the_safety_decision(catalog) -> None:
+    """Critical Safety の裁定の前提を**判断と同じ行に**残す（`ControlTick` v9。#78）。
+
+    設定で外した入力（T_SENSOR）と暫定値の有無が trace に無いと、確定値で全入力を
+    見ていた期間の trace と区別できない（docs/critical-safety.md の本番有効化の blocker）。
+    """
+    harness = Harness(catalog)
+
+    results = [harness.tick(), harness.settle()]
+
+    safety = harness.loop._safety
+    for result in results:
+        provenance = result.tick.safety_provenance
+        assert provenance is not None
+        assert provenance.disabled_inputs == safety.disabled_inputs
+        assert provenance.config_is_provisional is safety.config_is_provisional
+        assert "t_sensor_disabled" in {reason.code for reason in provenance.disabled_inputs}
+    recorded = json.loads(harness.trace.rows[-1])
+    assert recorded["schema_version"] == 9
+    assert recorded["safety_provenance"]["disabled_inputs"][0]["code"] == "t_sensor_disabled"
+
+
+def test_invariant_12_a_confirmed_safety_with_t_sensor_records_an_empty_premise(
+    catalog,
+) -> None:
+    """T_SENSOR を有効にし暫定値を含まない構成では、空タプルと false を**そのまま**写す（#78）。
+
+    既定構成だけの試験では、裁定を写さず常に既定値を書く退行を検出できない。
+    """
+    safety_document = confirmed_safety_document()
+    harness = Harness(
+        catalog,
+        config=control_config(safety=safety_document),
+        t_sensor_metric=T_SENSOR_METRIC,
+    )
+    harness.telemetry.values[T_SENSOR_METRIC] = 40.0
+
+    result = harness.tick()
+
+    safety = harness.loop._safety
+    assert safety.disabled_inputs == ()
+    assert safety.config_is_provisional is False
+    provenance = result.tick.safety_provenance
+    assert provenance is not None
+    assert provenance.disabled_inputs == ()
+    assert provenance.config_is_provisional is False
+    recorded = json.loads(harness.trace.rows[-1])
+    assert recorded["safety_provenance"]["disabled_inputs"] == []
+    assert recorded["safety_provenance"]["config_is_provisional"] is False
 
 
 def test_invariant_12_a_recorded_overrun_cannot_disagree_with_its_duration() -> None:
@@ -1648,6 +1731,78 @@ def test_invariant_23_the_daemon_composition_always_wires_a_deadman(tmp_path: Pa
             daemon.store.close()
 
     assert main([*_argv(tmp_path), "--require-watchdog"]) == EXIT_WATCHDOG_UNAVAILABLE
+
+
+def test_invariant_23_the_startup_log_carries_the_premise_of_the_safety_decision(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """起動ログに Safety の裁定の前提を構造化で出す（#78）。
+
+    tick が1つも保存されないまま止まった起動でも、T_SENSOR を外していたか・暫定値で
+    回そうとしていたかを追えるようにする。decision trace と同じ内容である。
+    """
+    documents = valid_documents()
+    documents["fan-hardware.yaml"] = json.loads(hardware_config().model_dump_json())
+    write_documents(tmp_path, documents)
+    config = Config(
+        config_dir=tmp_path,
+        db=tmp_path / "control.db",
+        metrics=METRICS_PATH,
+        quality_rules=CONFIG_DIR / "quality.yaml",
+    )
+
+    with caplog.at_level("INFO", logger="coldaisle"):
+        daemon = build(config)
+    try:
+        safety = daemon.loop._safety
+        fields = [
+            getattr(record, logs.FIELDS_KEY)
+            for record in caplog.records
+            if record.getMessage() == "制御設定を読み込んだ"
+        ]
+        assert len(fields) == 1
+        assert fields[0]["safety_config_is_provisional"] is safety.config_is_provisional
+        assert fields[0]["safety_disabled_inputs"] == [
+            reason.model_dump(mode="json") for reason in safety.disabled_inputs
+        ]
+        assert "t_sensor_disabled" in {item["code"] for item in fields[0]["safety_disabled_inputs"]}
+        # JSON Lines へそのまま書ける形であること（AGENTS.md「ログは構造化」）。
+        json.dumps(fields[0])
+    finally:
+        if daemon.store is not None:
+            daemon.store.close()
+
+
+def test_invariant_23_the_startup_log_carries_an_empty_premise_when_confirmed(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """T_SENSOR 有効・暫定値なしなら、起動ログは空の一覧と false を出す（#78）。"""
+    documents = valid_documents()
+    documents["fan-hardware.yaml"] = json.loads(hardware_config().model_dump_json())
+    documents["safety.yaml"] = confirmed_safety_document()
+    write_documents(tmp_path, documents)
+    config = Config(
+        config_dir=tmp_path,
+        db=tmp_path / "control.db",
+        metrics=METRICS_PATH,
+        quality_rules=CONFIG_DIR / "quality.yaml",
+        t_sensor_metric=T_SENSOR_METRIC,
+    )
+
+    with caplog.at_level("INFO", logger="coldaisle"):
+        daemon = build(config)
+    try:
+        fields = [
+            getattr(record, logs.FIELDS_KEY)
+            for record in caplog.records
+            if record.getMessage() == "制御設定を読み込んだ"
+        ]
+        assert len(fields) == 1
+        assert fields[0]["safety_config_is_provisional"] is False
+        assert fields[0]["safety_disabled_inputs"] == []
+    finally:
+        if daemon.store is not None:
+            daemon.store.close()
 
 
 def _watchdog_env(address: str, usec_ms: int, *, pid: int | None = None) -> dict[str, str]:

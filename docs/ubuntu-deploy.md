@@ -153,8 +153,11 @@ curl -s http://127.0.0.1:8000/api/v1/health
 
 ## 5. Mac からのデータ移行
 
-1. **Mac 側の取り込みを止める。** launchd などで常駐させているなら止めます。
-   動いたままコピーすると、コピーのあとに書かれたサンプルが移行先に入りません
+1. **Mac 側で DB に書くプロセスをすべて止める。** 取り込み（`coldaisle-daemon`）だけでなく、
+   `coldaisle-telemetry`（周期メトリクス）・`coldaisle-eventd`（イベント）・
+   `coldaisle-fand`（decision trace）・`coldaisle-rollup` / `coldaisle-report` も同じ DB に書きます。
+   launchd などで常駐・定期実行させているなら、移行が終わるまで止めたままにします。
+   動いたままバックアップすると、スナップショットのあとに書かれた行が移行先に入りません
 2. **SQLite のオンラインバックアップで1ファイルに書き出す。** `var/coldaisle.db` を
    `cp` / `rsync` で直接運ぶのは避けます。WAL モードでは確定済みの書き込みが
    `-wal` に残っていることがあり、`PRAGMA wal_checkpoint(TRUNCATE);` も

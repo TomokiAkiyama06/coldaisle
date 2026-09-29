@@ -138,3 +138,4 @@ docs/decisions/NNNN-<slug>.md      例: 0002-metric-naming.md
 | [0067](0067-acoustic-measurement-study.md) | 騒音は「うるさいか」の回答で測る（騒音計を使わない・UI は表示専用のまま回答は 0045 の入口へ・回答は Fan を変えない・effective の Demand と結びつける・曲線は `approximate` のまま） | FINAL |
 | [0068](0068-dashboard-status-strip-and-fault-cards.md) | ダッシュボードの状態の帯（`server-health` の signal を描く）と、異常なカードの見た目（stale の取り消し線・欠測の斜線＋赤枠） | FINAL |
 | [0069](0069-ubuntu-deploy-templates.md) | Ubuntu 常駐化のテンプレート（固定名 `/dev/server-sensors` を名前の順より先に選ぶ・systemd / udev は `deploy/` に仮の値で置く・`coldaisle-fand` の unit は含めない） | FINAL |
+| [0070](0070-soak-acceptance-interpretation.md) | 連続運転テスト（soak）の受入基準の読み方（欠測率は最も悪いチャネルで判定・母数は期間÷送信周期で周期不明なら判定不能・再起動はすべて意図しないものとみなす・DB を読み取り専用で開く） | FINAL |

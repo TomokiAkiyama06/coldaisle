@@ -39,6 +39,7 @@ from coldaisle.control import (
     OptimizerStatus,
     PerZone,
     Reason,
+    SafetyProvenance,
     SafetyState,
     SafetyZoneOutput,
     WorkloadRegime,
@@ -532,6 +533,12 @@ CONTROL_TICK_RUNTIME = ControlTickRuntime(
 値そのものはこの試験の判断に影響しない。
 """
 
+SAFETY_PROVENANCE = SafetyProvenance(disabled_inputs=(), config_is_provisional=False)
+"""v9 の `ControlTick` に必須の Critical Safety の裁定の前提（#78）。
+
+v8 の runtime と同じく、v9 を名乗る記録はこの欄を省けない。値はこの試験の判断に影響しない。
+"""
+
 # ---------------------------------------------------------------- 1 tick の記録
 
 
@@ -543,6 +550,7 @@ def tick(demand: EffectiveZoneDemand, faults=(), **state_overrides) -> ControlTi
         zones=zones(demand),
         faults=faults,
         runtime=CONTROL_TICK_RUNTIME,
+        safety_provenance=SAFETY_PROVENANCE,
     )
 
 
@@ -651,6 +659,7 @@ def test_a_front_or_rear_stall_can_stay_degraded():
         zones=front_at_max,
         faults=(Fault(code=FaultCode.TACH_STALL, zone=Zone.FRONT),),
         runtime=CONTROL_TICK_RUNTIME,
+        safety_provenance=SAFETY_PROVENANCE,
     )
     assert recorded.state.safety_state is SafetyState.DEGRADED
 
@@ -678,6 +687,7 @@ def test_stale_cpu_temperature_drives_top_to_max():
         zones=top_at_max,
         faults=faults,
         runtime=CONTROL_TICK_RUNTIME,
+        safety_provenance=SAFETY_PROVENANCE,
     )
     assert recorded.zones.top.demand.forced_max
 
@@ -694,7 +704,7 @@ def test_the_stored_v1_record_still_loads_unchanged():
     stored = FIXTURE.read_text(encoding="utf-8")
     tick = ControlTick.model_validate_json(stored)
     assert tick.schema_version == 1
-    assert SCHEMA_VERSION == 8
+    assert SCHEMA_VERSION == 9
     assert json.loads(tick.model_dump_json()) == json.loads(stored)
 
 
@@ -705,7 +715,7 @@ def test_v4_trace_records_the_absolute_temperature_limit():
         safety_state=SafetyState.EMERGENCY,
     )
 
-    assert recorded.schema_version == 8
+    assert recorded.schema_version == SCHEMA_VERSION
     restored = ControlTick.model_validate_json(recorded.model_dump_json())
     assert restored.faults[0].code is FaultCode.ABSOLUTE_TEMPERATURE_LIMIT
     with pytest.raises(ValidationError, match="EMERGENCY"):
@@ -761,10 +771,11 @@ def test_current_trace_stores_workload_regime_and_confidence_together():
         state=state,
         zones=zones(passthrough()),
         runtime=CONTROL_TICK_RUNTIME,
+        safety_provenance=SAFETY_PROVENANCE,
     )
 
     payload = json.loads(recorded.model_dump_json())
-    assert recorded.schema_version == 8
+    assert recorded.schema_version == SCHEMA_VERSION
     assert payload["state"]["workload_regime"] == "sustained_gpu"
     assert payload["state"]["regime_confidence"] == 0.85
 
@@ -791,6 +802,7 @@ def test_v2_trace_keeps_simultaneous_transient_load_distinct():
         state=state,
         zones=zones(passthrough()),
         runtime=CONTROL_TICK_RUNTIME,
+        safety_provenance=SAFETY_PROVENANCE,
     )
 
     payload = json.loads(recorded.model_dump_json())
@@ -806,9 +818,10 @@ def test_fallback_trace_remains_valid_when_regime_is_not_available():
         state=fallback_state(),
         zones=zones(passthrough()),
         runtime=CONTROL_TICK_RUNTIME,
+        safety_provenance=SAFETY_PROVENANCE,
     )
 
-    assert recorded.schema_version == 8
+    assert recorded.schema_version == SCHEMA_VERSION
     assert recorded.state.workload_regime is None
 
 
@@ -849,6 +862,7 @@ def test_v3_supervisor_policy_requires_a_matching_decision():
             state=fallback_state(supervisor_policy="legacy_rule_v1"),
             zones=zones(passthrough()),
             runtime=CONTROL_TICK_RUNTIME,
+            safety_provenance=SAFETY_PROVENANCE,
         )
 
 
@@ -883,6 +897,98 @@ def test_a_v8_tick_cannot_claim_the_version_without_its_payload():
             zones=zones(passthrough()),
             runtime=CONTROL_TICK_RUNTIME,
         )
+
+
+def test_a_v9_tick_cannot_claim_the_version_without_the_safety_provenance():
+    """**v9 は Critical Safety の裁定の前提を省けない**（#78）。
+
+    無いと、T_SENSOR を外していた期間や暫定値で回っていた期間の trace を、
+    確定値で全入力を見ていた trace と区別できない（docs/critical-safety.md）。
+    """
+    with pytest.raises(ValidationError, match="safety_provenance が要る"):
+        ControlTick(
+            tick_id=1,
+            ts_ms=NOW_MS,
+            state=fallback_state(),
+            zones=zones(passthrough()),
+            runtime=CONTROL_TICK_RUNTIME,
+        )
+
+
+@pytest.mark.parametrize("schema_version", [1, 5, 7])
+def test_a_stored_trace_before_v9_loads_without_the_safety_provenance(schema_version: int):
+    """保存済みの v1〜v8 は欄を持たないまま読め、書き戻しても欄が現れない（決定記録 0030）。"""
+    stored = ControlTick(
+        schema_version=schema_version,
+        tick_id=1,
+        ts_ms=NOW_MS,
+        state=fallback_state(),
+        zones=zones(passthrough()),
+    )
+    assert stored.safety_provenance is None
+    assert "safety_provenance" not in json.loads(stored.model_dump_json())
+
+
+def test_a_stored_v8_trace_loads_without_the_safety_provenance():
+    stored = ControlTick(
+        schema_version=8,
+        tick_id=1,
+        ts_ms=NOW_MS,
+        state=fallback_state(),
+        zones=zones(passthrough()),
+        runtime=CONTROL_TICK_RUNTIME,
+    )
+    restored = ControlTick.model_validate_json(stored.model_dump_json())
+    assert restored.schema_version == 8
+    assert restored.safety_provenance is None
+
+
+@pytest.mark.parametrize("schema_version", [7, 8])
+def test_a_legacy_trace_cannot_carry_the_safety_provenance_added_in_v9(schema_version: int):
+    """v9 の欄を持つ記録に旧い版を名乗らせない。旧い reader は欄を知らない。"""
+    with pytest.raises(ValidationError, match="schema version 9"):
+        ControlTick(
+            schema_version=schema_version,
+            tick_id=1,
+            ts_ms=NOW_MS,
+            state=fallback_state(),
+            zones=zones(passthrough()),
+            runtime=CONTROL_TICK_RUNTIME if schema_version >= 8 else None,
+            safety_provenance=SAFETY_PROVENANCE,
+        )
+
+
+def test_the_v9_trace_keeps_disabled_inputs_and_the_provisional_flag():
+    """設定で外した入力の理由と暫定値の有無が、保存と読み戻しで失われない。"""
+    provenance = SafetyProvenance(
+        disabled_inputs=(Reason(code="t_sensor_disabled", detail="not approved"),),
+        config_is_provisional=True,
+    )
+    recorded = ControlTick(
+        tick_id=1,
+        ts_ms=NOW_MS,
+        state=fallback_state(),
+        zones=zones(passthrough()),
+        runtime=CONTROL_TICK_RUNTIME,
+        safety_provenance=provenance,
+    )
+    payload = json.loads(recorded.model_dump_json())
+    assert payload["schema_version"] == 9
+    assert payload["safety_provenance"] == {
+        "schema_version": 1,
+        "disabled_inputs": [{"code": "t_sensor_disabled", "detail": "not approved"}],
+        "config_is_provisional": True,
+    }
+    assert ControlTick.model_validate_json(recorded.model_dump_json()) == recorded
+
+
+@pytest.mark.parametrize("missing", ["disabled_inputs", "config_is_provisional"])
+def test_the_safety_provenance_requires_both_fields(missing: str):
+    """片方だけの記録を作らない。**既定値で「外していない」「確定値」と読ませない。**"""
+    values: dict[str, object] = {"disabled_inputs": [], "config_is_provisional": False}
+    del values[missing]
+    with pytest.raises(ValidationError):
+        SafetyProvenance.model_validate(values)
 
 
 def test_the_stored_record_explains_every_changed_zone():
@@ -984,7 +1090,11 @@ def learned_tick(**overrides) -> ControlTick:
         "model_gate": model_gate(),
         # v8 を名乗る記録は実行記録を省けない（#74 / 決定記録 0060 §2.4）。
         "runtime": CONTROL_TICK_RUNTIME,
+        # v9 を名乗る記録は Safety の裁定の前提を省けない（#78）。
+        "safety_provenance": SAFETY_PROVENANCE,
     }
+    if overrides.get("schema_version", SCHEMA_VERSION) < 9:
+        values.pop("safety_provenance")
     if overrides.get("schema_version", SCHEMA_VERSION) < 8:
         values.pop("runtime")
     return ControlTick(**(values | overrides))
@@ -1113,6 +1223,7 @@ def test_a_tick_cannot_claim_two_different_artifacts():
             tick_id=1,
             ts_ms=NOW_MS,
             runtime=CONTROL_TICK_RUNTIME,
+            safety_provenance=SAFETY_PROVENANCE,
             state=fallback_state(
                 authority_stage=AuthorityStage.LIMITED,
                 fallback_reason=Reason(code="low_confidence"),

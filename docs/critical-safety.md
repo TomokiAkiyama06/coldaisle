@@ -151,10 +151,21 @@ deadman は完成しない。#74 / #57 でこれらを接続し、startup / rest
 を実機検証することを、本番サービスを有効にする統合 PR の merge 条件とする。この #78 PR の
 merge だけでは #78 を完了扱いにせず、それまではサービスで Fan 制御を有効化しない。
 
-同じ統合 PR では #82 の保存済み `ControlTick` v1〜v4 互換を壊さず schema migration を用意し、
-`CriticalSafetyDecision.disabled_inputs` と `config_is_provisional` を decision trace と起動ログへ
-永続化する。現状は Safety 裁定には両方が入るが `ControlTick` v4 には field が無いため、
-この配線も本番有効化の blocker とする。
+`CriticalSafetyDecision.disabled_inputs` と `config_is_provisional` は decision trace と起動ログへ
+永続化した（#78）。
+
+- decision trace: `ControlTick` を schema version 9 とし、`safety_provenance`
+  （`disabled_inputs` と `config_is_provisional`。どちらも必須）を毎 tick の裁定から写す。
+  v9 はこの欄を省けず、v1〜v8 は欄を持てない。保存済みの v1〜v8 は欄なしのまま読め、
+  欄が無い記録は「前提が記録されていない」であって「確定値で全入力を見ていた」ではない
+- 起動ログ: `coldaisle-fand` の「制御設定を読み込んだ」の構造化 field に
+  `safety_config_is_provisional` と `safety_disabled_inputs`（`code` / `detail` の配列）を出す。
+  tick を1つも保存しないまま止まった起動でも追えるようにするため
+
+`config_is_provisional=false` は「暫定値を1つも含まない Safety 設定で裁定した」ことだけを表す。
+`config_invalid` の経路（`DemandComposer.for_invalid_config()`）は Safety 設定を読まず、
+`ControlTick` も書かない。
 
 `ControlTick` は #78 で schema version 4 とした（fault code `absolute_temperature_limit` と Top の
 `enable_reverted` の無条件 `EMERGENCY`）。保存済みの v1〜v3 は当時の規則のまま読める。
+上の `safety_provenance` は同じ #78 の v9 で追加した（v5〜v8 は #85 / #90 / #159 / #74）。

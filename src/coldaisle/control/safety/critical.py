@@ -552,6 +552,11 @@ class CriticalSafety:
         return self._runtime_binding._takeover_is_acknowledged(authority=_RUNTIME_BINDING_AUTHORITY)
 
     @property
+    def disabled_inputs(self) -> tuple[Reason, ...]:
+        """設定で Critical の対象から外した入力と理由。裁定の `disabled_inputs` と同じ値。"""
+        return self._disabled_inputs
+
+    @property
     def config_is_provisional(self) -> bool:
         """安全値に未確定の項目があることを返す。値そのものは変えない。"""
         return self._config_is_provisional
