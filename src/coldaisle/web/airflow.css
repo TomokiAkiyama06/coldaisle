@@ -132,6 +132,12 @@ body {
 /* 未接続。**正常（緑）に見せない** */
 .chip.na { border-style: dashed; }
 .chip.na .v { color: var(--faint); font-weight: 500; }
+/* その版の記録に欄が無い（決定記録 0071 §2.3）。「無し」「正常」と見分けるため点線＋斜体 */
+.chip.absent { border-style: dotted; }
+.chip.absent .v { color: var(--faint); font-weight: 500; font-style: italic; }
+.step-value.absent { color: var(--faint); font-style: italic; font-family: inherit; font-size: 12px; }
+/* 古い（または古さを判定できない）trace の値。いまの状態のように見せない */
+.chips.stale .v { text-decoration: line-through; text-decoration-color: var(--bad); }
 
 /* ---------------------------------------------------------------- レイアウト */
 .layout { display: grid; grid-template-columns: minmax(0, 1fr); gap: 14px; margin-top: 12px; }

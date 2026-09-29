@@ -13,3 +13,13 @@ air_temperature:
   # 仮の値（デザインの初期値）。#50 の実測が出たら見直す
   thresholds_c: [27.0, 28.0, 29.0, 30.0]
   provisional: true
+
+control_trace:
+  # 制御の判断記録（decision trace）を画面が「古い」と言う境目（決定記録 0071 §2.6 / §5 #1）。
+  # `GET /api/v1/control/latest` の `age_ms` が、その trace 自身の `runtime.tick_period_ms`
+  # （v8 以降）のこの倍を超えたら「古い」と出す。v1〜v7 は周期を持たないので判定しない。
+  # 1 より大きい有限の値（1 以下だと、周期どおりに記録していても毎回「古い」になる）。
+  # 仮の値。tick の書き込みの遅れ（締め切り・保存）と画面の読み出しの間隔を見込み、
+  # 止まった制御デーモンを数周期で「古い」と言えるよう小さめに置いた。実運用で見直す
+  stale_after_tick_periods: 3.0
+  provisional: true

@@ -6,8 +6,10 @@
 //   2. **実データと模擬データを混ぜない。** 模擬は `?mock=normal|override|throttle` のときだけ
 //      別ファイル（airflow-mock.js）を読み、そのときは実データを1件も取りに行かない。
 //      画面全体の帯で「模擬データ」と言う
-//   3. **未接続・未取得・古い値を正常値のように見せない。** 制御の判断記録（#74 / #82）は
-//      まだ API から読めないので、制御の状態はすべて「未接続」と出す
+//   3. **未接続・未取得・古い値を正常値のように見せない。** 制御の状態は decision trace
+//      （`GET /api/v1/control/latest`。決定記録 0071）から描く。版の解釈は airflow-trace.js の
+//      1か所だけ（0071 §2.3）。trace が無ければ「未接続」、知らない版は「未対応の版」、
+//      その版に無い欄は「この版の記録には無い」。古さは周期×設定の倍数で判定する（0071 §2.6）
 //   4. **API から来た文字列を HTML として解釈しない。** 常に textContent（要件 §7.4）
 //   5. **内部のメトリクス名を画面に出さない。** 表示名はこのファイルの表が持つ
 //   6. **色の区切りをコードに書かない。** `GET /api/v1/airflow/config`（config/airflow-ui.yaml）から読む
@@ -107,7 +109,7 @@ const REFERENCE = [
   { label: "VRM ファン", metric: "fan.vrm.rpm" },
 ];
 
-// 制御の状態。**値はまだ読めない**（#74 / #82）。実データでは全部「未接続」
+// 制御の状態の項目。trace が無い・読めないときは、この名前で「未接続」などの枠だけを出す
 const CONTROL_CHIPS = [
   "運転モード",
   "安全状態",
@@ -177,7 +179,10 @@ const page = {
   scale: null, // { thresholds_c, provisional }。読めなければ null（色を付けない）
   cpuMeasured: null, // airflow/config の cpu_utilization.measured。読めなければ null（分からない）
   latest: null,
-  control: null, // 実データでは常に null（未接続）
+  control: null, // 表示中の制御の状態。trace が無い・未対応の版・読めないときは null
+  controlStatus: null, // airflow-trace.js の変換結果（status / freshness / schema_version）。null = まだ読んでいない
+  controlError: null, // /api/v1/control/latest を読めなかったときの理由
+  traceStaleFactor: null, // airflow/config の control_trace.stale_after_tick_periods。読めなければ null（判定しない）
   zone: "top", // 「なぜこの回転数か」で見ている系統
   ingestSource: undefined, // health.source。undefined = まだ届いていない
   telemetrySource: undefined, // health.telemetry_source（hardware / mock）。undefined = まだ届いていない
@@ -390,33 +395,99 @@ function renderSource() {
   telemetry.classList.toggle("mock", Boolean(page.mockName));
   document.getElementById("value-kind-key").textContent =
     `空気の温度＝${valueKind("air.room")}、回転数・PWM・CPU・GPU（いま届いている値）＝${telemetryKind()}`;
-  decision.textContent = page.control && page.control.decision_id ? `判断 ${page.control.decision_id}` : "";
+  decision.textContent = decisionLabel();
 }
 
 // ---------------------------------------------------------------- 制御の状態
+
+/** 見出しの「判断 #seq（記録の版 v10・3.2 秒前）」。模擬データは模擬の判断番号。 */
+function decisionLabel() {
+  if (page.mockName) return page.control && page.control.decision_id ? `判断 ${page.control.decision_id}（模擬）` : "";
+  const status = page.controlStatus;
+  if (!status || status.status === "none" || !status.decision_id) return "";
+  return `判断 ${status.decision_id}（記録の版 v${status.schema_version}・${status.freshness.text}）`;
+}
+
+/**
+ * 制御の状態が無いときの1語と注記。**「正常」にも「無し」にも見せない**（0046 §2.3 / 0071 §2.3）。
+ * - trace が1件も無い → 未接続 / API を読めない → 取得できない
+ * - 画面が知らない版 → 未対応の版 / 知っている版だが形が読めない → 記録を読めない
+ */
+function controlAbsence() {
+  const status = page.controlStatus;
+  if (page.controlError) {
+    return { word: "取得できない", note: `制御の判断記録（/api/v1/control/latest）を取得できません: ${page.controlError}。` };
+  }
+  if (status && status.status === "unsupported") {
+    return {
+      word: "未対応の版",
+      note: `制御の判断記録の版（v${status.schema_version}）をこの画面は解釈できないため、制御由来の項目を表示していません。通常状態とは限りません。`,
+    };
+  }
+  if (status && status.status === "unreadable") {
+    return {
+      word: "記録を読めない",
+      note: `制御の判断記録（v${status.schema_version}）の形を読めないため、制御由来の項目を表示していません。通常状態とは限りません。`,
+    };
+  }
+  if (status === null) return { word: "確認中", note: "制御の判断記録を読み込み中です。" };
+  return {
+    word: "未接続",
+    note: "制御の状態は未接続です。制御の判断記録（decision trace）が1件もありません（制御デーモンが動いていない・保持期間で消えた）。",
+  };
+}
+
+/** trace が古いときの帯。**古い記録を、いまの状態のように見せない**（0071 §2.6）。 */
+function renderTraceBanner() {
+  const status = page.controlStatus;
+  if (!page.mockName && status && status.status !== "none" && status.freshness.state === "stale") {
+    showBanner(
+      "trace-banner",
+      `制御の判断記録が古い（${status.freshness.text}）。制御の状態は最後に記録された tick のもので、いまの状態とは限りません。`
+    );
+  } else {
+    showBanner("trace-banner", null);
+  }
+}
 
 function renderControl() {
   const control = page.control;
   const chips = document.getElementById("control-chips");
   chips.replaceChildren();
+  const absence = control ? null : controlAbsence();
+  const measured = page.mockName
+    ? ""
+    : window.ColdaisleAirflowStatus.measuredNote(
+        displaySource(),
+        page.telemetrySource,
+        page.latest,
+        TELEMETRY_METRICS
+      );
+  const freshness = page.controlStatus ? page.controlStatus.freshness : null;
+  // 古い trace の値には取り消し線（決定記録 0068 §2.2 と同じ見た目）
+  chips.classList.toggle("stale", Boolean(control && !page.mockName && freshness && freshness.state === "stale"));
   const list = control
     ? control.chips
-    : CONTROL_CHIPS.map((k) => ({ k, v: "未接続", tone: "na" }));
+    : CONTROL_CHIPS.map((k) => ({ k, v: absence.word, tone: "na" }));
   for (const chip of list) {
     const node = el("div", `chip ${chip.tone || ""}`.trim());
     node.appendChild(el("span", "k", chip.k));
     node.appendChild(el("span", "v", chip.v));
     chips.appendChild(node);
   }
-  document.getElementById("control-note").textContent = control
-    ? "制御の状態は模擬データです。実際の制御とは関係ありません。"
-    : "制御の状態は未接続です。制御デーモンの判断記録（#74 / #82）を読む API がまだ無いため表示していません。" +
-      window.ColdaisleAirflowStatus.measuredNote(
-        displaySource(),
-        page.telemetrySource,
-        page.latest,
-        TELEMETRY_METRICS
-      );
+  let note;
+  if (control && page.mockName) {
+    note = "制御の状態は模擬データです。実際の制御とは関係ありません。";
+  } else if (control) {
+    note =
+      `制御の状態は制御デーモンの判断記録（${control.decision_id || ""}、記録の版 v${control.schema_version}）から表示しています。` +
+      (freshness && freshness.state === "fresh" ? "" : `記録の新しさ：${freshness ? freshness.text : "不明"}。`) +
+      "風量などは推定値で、測った値ではありません。";
+  } else {
+    note = absence.note;
+  }
+  document.getElementById("control-note").textContent = note + measured;
+  renderTraceBanner();
 
   const alert = control && control.alert;
   const box = document.getElementById("control-alert");
@@ -621,6 +692,11 @@ function pct(value) {
   return `${Math.round(value * 100)}%`;
 }
 
+/** 推定値。**この tick に値が無いときは 0 にせず、そう言う**（欄は v1 からある。0071 §2.3 の「値が無い」）。 */
+function estimateText(value, unit) {
+  return value === null || value === undefined ? "推定なし" : `${fmt(value, 2)}${unit}`;
+}
+
 function renderZones() {
   const container = document.getElementById("zones");
   container.replaceChildren();
@@ -643,9 +719,10 @@ function renderZones() {
 
     if (!control) {
       const box = el("div", "na-box");
-      box.appendChild(el("b", null, "未接続"));
+      const absence = controlAbsence();
+      box.appendChild(el("b", null, absence.word));
       box.appendChild(
-        document.createTextNode(" — 制御の出力（要求 → 実際）・決め手・推定風量は、制御の判断記録を読めるようになったら表示します。")
+        document.createTextNode(` — 制御の出力（要求 → 実際）・決め手・推定風量は表示していません。${absence.note}`)
       );
       panel.appendChild(box);
       container.appendChild(panel);
@@ -685,11 +762,11 @@ function renderZones() {
     est.appendChild(el("div", "tag", "推定"));
     const idx = el("div", "kv");
     idx.appendChild(el("span", null, "風量指数（このファンの最大比）"));
-    idx.appendChild(el("span", "mono", fmt(control.airflow_index, 2)));
+    idx.appendChild(el("span", "mono", estimateText(control.airflow_index, "")));
     est.appendChild(idx);
     const flow = el("div", "kv");
     flow.appendChild(el("span", null, "推定風量"));
-    flow.appendChild(el("span", "mono", `${fmt(control.estimated_flow, 2)} EFU`));
+    flow.appendChild(el("span", "mono", estimateText(control.estimated_flow, " EFU")));
     est.appendChild(flow);
     panel.appendChild(est);
 
@@ -707,10 +784,11 @@ function renderTrace() {
   container.replaceChildren();
   if (!page.control) {
     const box = el("div", "na-box");
-    box.appendChild(el("b", null, "未接続"));
+    const absence = controlAbsence();
+    box.appendChild(el("b", null, absence.word));
     box.appendChild(
       document.createTextNode(
-        " — 1回の判断の記録（運転方針 → 学習モデルの提案 → 信頼度チェック → 急変への対応 → 安全制御 → 最終的な出力 → ファン）を読めるようになったら、ここに系統ごとに表示します。"
+        ` — 1回の判断の記録（運転方針 → 制御器の要求 → 信頼度チェック → 急変への対応 → 安全制御 → 最終的な出力 → ファン）を、系統ごとにここへ表示します。${absence.note}`
       )
     );
     container.appendChild(box);
@@ -752,21 +830,34 @@ function renderBalance() {
   const container = document.getElementById("balance");
   container.replaceChildren();
   const balance = page.control && page.control.balance;
-  if (!balance) {
-    state.textContent = "未接続";
+  if (!balance || balance.absent) {
+    // trace が無い → 未接続など。trace はあるがその版に Air Balance の記録が無い → 「この版の記録には無い」
+    const word = balance ? balance.absent : controlAbsence().word;
+    state.textContent = word;
     state.className = "pill";
     const box = el("div", "na-box");
-    box.appendChild(el("b", null, "未接続"));
-    box.appendChild(document.createTextNode(" — 吸気と排気の釣り合い（推定）は Air Balance の推定（#81）を読めるようになったら表示します。"));
+    box.appendChild(el("b", null, word));
+    box.appendChild(
+      document.createTextNode(
+        balance
+          ? " — この判断記録の版は吸気と排気の釣り合い（推定）を持ちません。「釣り合っている」という意味ではありません。"
+          : " — 吸気と排気の釣り合い（推定）は、制御の判断記録を読めるときに表示します。"
+      )
+    );
     container.appendChild(box);
     return;
   }
   state.textContent = balance.state;
   state.className = `pill ${balance.tone || ""}`.trim();
   const value = el("div", "balance-value");
-  value.appendChild(el("span", "v", fmt(balance.ratio, 2)));
+  value.appendChild(el("span", "v", balance.ratio === null || balance.ratio === undefined ? "推定なし" : fmt(balance.ratio, 2)));
   value.appendChild(el("span", "note", "排気 ÷ 吸気（推定）"));
   container.appendChild(value);
+  if (balance.position === null || balance.position === undefined) {
+    // 目標帯は trace に無い（air-balance.yaml が持つ）。帯の上の位置を推測で描かない
+    container.appendChild(el("div", "note", "目標帯は判断記録に含まれないため、帯の上の位置は表示していません。"));
+    return;
+  }
   const scale = el("div", "balance-scale");
   const bands = el("div", "bands");
   for (const [width, color] of [["30%", "#24405a"], ["40%", "#1f3a2a"], ["30%", "#4a3020"]]) {
@@ -839,7 +930,11 @@ async function refresh() {
   page.refreshing = true;
   try {
     // **片方の失敗でもう片方の応答を捨てない**（Codex P2）。それぞれを別々に反映し、失敗は別々に言う
-    const [latest, health] = await Promise.allSettled([fetchJson("/api/v1/latest"), fetchJson("/api/v1/health")]);
+    const [latest, health, control] = await Promise.allSettled([
+      fetchJson("/api/v1/latest"),
+      fetchJson("/api/v1/health"),
+      fetchJson("/api/v1/control/latest"),
+    ]);
     const errors = [];
     if (latest.status === "fulfilled") {
       page.latest = latest.value;
@@ -858,6 +953,15 @@ async function refresh() {
       document.getElementById("age-label").textContent = "";
       errors.push(`状態（/api/v1/health）を取得できません — データの新しさと出どころを確認できません: ${health.reason.message}`);
     }
+    if (control.status === "fulfilled") {
+      applyControlTrace(control.value);
+    } else {
+      // 前回の trace を「いまの制御の状態」として出し続けない
+      page.control = null;
+      page.controlStatus = null;
+      page.controlError = control.reason.message;
+      errors.push(`制御の判断記録（/api/v1/control/latest）を取得できません: ${control.reason.message}`);
+    }
     showBanner("api-banner", errors.join(" / ") || null);
     renderNow();
   } catch (error) {
@@ -867,15 +971,37 @@ async function refresh() {
   }
 }
 
+/**
+ * `/api/v1/control/latest` の応答を反映する。**版の解釈は airflow-trace.js だけ**（0071 §2.3）。
+ * 古い・古さを判定できない trace は、正常（緑）の色を外して出す（いまの状態に見せない）。
+ */
+function applyControlTrace(response) {
+  const converted = window.ColdaisleAirflowTrace.controlFromLatest(response, page.traceStaleFactor);
+  page.controlError = null;
+  page.controlStatus = converted;
+  if (converted.status !== "ok") {
+    page.control = null;
+    return;
+  }
+  page.control =
+    converted.freshness.state === "fresh"
+      ? converted.control
+      : window.ColdaisleAirflowTrace.withoutOkTones(converted.control);
+}
+
 async function loadScale() {
   try {
     const body = await fetchJson("/api/v1/airflow/config");
     page.scale = body.air_temperature;
     const cpu = body.cpu_utilization;
     page.cpuMeasured = cpu && typeof cpu.measured === "boolean" ? cpu.measured : null;
+    // trace を「古い」と言う倍数（0071 §2.6）。読めなければ null（古さを判定しない。新しいとも言わない）
+    const trace = body.control_trace;
+    page.traceStaleFactor = trace && typeof trace.stale_after_tick_periods === "number" ? trace.stale_after_tick_periods : null;
   } catch (error) {
     page.scale = null; // 色を付けない。凡例で「読み込めません」と言う
     page.cpuMeasured = null;
+    page.traceStaleFactor = null;
   }
 }
 
@@ -1215,7 +1341,7 @@ function renderReadout() {
   regime.style.paddingTop = "8px";
   regime.style.marginTop = "6px";
   regime.appendChild(el("span", "name", "負荷の傾向"));
-  regime.appendChild(el("span", null, page.control ? page.control.regime : "未接続"));
+  regime.appendChild(el("span", null, page.control ? page.control.regime : controlAbsence().word));
   container.appendChild(regime);
 }
 
