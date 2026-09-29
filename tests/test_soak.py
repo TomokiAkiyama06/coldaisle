@@ -167,6 +167,51 @@ def test_an_empty_window_is_not_a_pass(tmp_path, rules, scenarios, config):
     assert report.verdict is Verdict.UNKNOWN
 
 
+def test_a_restart_without_periodic_data_still_fails(tmp_path, rules, scenarios, config):
+    """再起動したまま送信が戻らなかった期間。**超過が分かっていれば判定不能にしない。**"""
+    db = tmp_path / "soak.db"
+    ingest_mock(db, rules, scenarios, "ramp")
+    later = TEST_EPOCH_MS + 10 * TEN_MINUTES_MS
+    with closing(sqlite3.connect(db, isolation_level=None)) as conn:
+        conn.execute(
+            "INSERT INTO readings (metric, ts_ms, value, quality) VALUES (?, ?, ?, ?)",
+            ("sys.device_restarts", later - TEN_MINUTES_MS + 1_000, 1.0, "ok"),
+        )
+
+    with SoakDatabase(db) as store:
+        report = build(
+            store,
+            start_ms=later - TEN_MINUTES_MS,
+            end_ms=later,
+            now_ms=later,
+            config=config,
+        )
+
+    assert not report.has_data
+    assert report.device_restarts == 1
+    assert report.checks[0].verdict is Verdict.UNKNOWN
+    assert report.checks[1].verdict is Verdict.FAIL
+    assert report.verdict is Verdict.FAIL
+
+
+def test_zero_restarts_without_periodic_data_is_not_a_pass(tmp_path, rules, scenarios, config):
+    """0件でも、周期データが無ければ期間を観測できていたか分からない。"""
+    db = tmp_path / "soak.db"
+    ingest_mock(db, rules, scenarios, "ramp")
+    later = TEST_EPOCH_MS + 10 * TEN_MINUTES_MS
+
+    with SoakDatabase(db) as store:
+        report = build(
+            store,
+            start_ms=later - TEN_MINUTES_MS,
+            end_ms=later,
+            now_ms=later,
+            config=config,
+        )
+
+    assert report.checks[1].verdict is Verdict.UNKNOWN
+
+
 def test_threshold_comes_from_the_config(tmp_path, rules, scenarios, config):
     """閾値を緩めれば同じ DB が合格になる。**コードに閾値が無い**ことの確認。"""
     db = tmp_path / "soak.db"

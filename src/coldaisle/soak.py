@@ -523,10 +523,15 @@ def _restart_check(
     limit = f"≤ {thresholds.max_device_restarts} 回"
     note = "意図した再起動かどうかは DB から区別できない"
     display = f"{restarts} 回"
-    if not complete or not has_data:
+    if not complete:
         return Check(name, float(restarts), display, limit, Verdict.UNKNOWN, _why_unknown(complete))
-    verdict = Verdict.PASS if restarts <= thresholds.max_device_restarts else Verdict.FAIL
-    return Check(name, float(restarts), display, limit, verdict, note)
+    # 超過は周期データが無くても確定している（再起動したまま送信が戻らなかった場合など）。
+    # 周期データで期間のカバーを確かめる必要があるのは「閾値以下」と言うときだけ
+    if restarts > thresholds.max_device_restarts:
+        return Check(name, float(restarts), display, limit, Verdict.FAIL, note)
+    if not has_data:
+        return Check(name, float(restarts), display, limit, Verdict.UNKNOWN, _why_unknown(complete))
+    return Check(name, float(restarts), display, limit, Verdict.PASS, note)
 
 
 def _why_unknown(complete: bool) -> str:
