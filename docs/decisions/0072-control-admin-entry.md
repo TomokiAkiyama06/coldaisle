@@ -92,8 +92,12 @@ GPU Manager などの書き手が入る。モード変更を足すと、その�
 - 次の tick までに**同じ軸**の指令が複数来たときだけ置き換える。**別の軸の指令は互いに消さない**
   （例: `set_mode(max)` のあとに `rollback_authority` が来ても、両方が同じ tick で効く。
   モードの軸の安全側の指令が authority の軸の指令で失われない）
-  - モードの枠: **最後の1件**を採る（人の最新の意図。`MAX` のあとの `set_mode(auto)` は、
-    人が弱めると決めた指令として §2.7 の監査を経て受けたものである）
+  - モードの枠: **`command_id` が最大の1件**を採る（人の最新の意図。`MAX` のあとの `set_mode(auto)` は、
+    人が弱めると決めた指令として §2.7 の監査を経て受けたものである）。「最後に置かれた1件」ではない。
+    §2.7 のとおり安全側の指令は監査を待たずに置き、弱めうる指令は監査の書き込みを待ってから置くので、
+    **先に届いた弱めうる指令が、後から届いて先に置かれた `MAX` を上書きしうる**。これを防ぐため、
+    受け渡し口はモードの軸で**これまでに置いた最大の `command_id`** を覚え（loop が取り出したあとも
+    保つ）、それより小さい `command_id` の指令は置かずに `superseded` とする
   - authority の枠: 置き換えずに**合成する**。`rollback_authority` と `lower_authority` は
     どちらも下げる向きなので、届いた指令のうち**最も低い行き先**を採る（後から来た「浅い降格」が
     先の rollback を打ち消さない）
@@ -103,9 +107,27 @@ GPU Manager などの書き手が入る。モード変更を足すと、その�
   待つ間も、上の多重化により他の接続の受付は止まらない）。
   時間内に適用されなければ `{"ok": true, "applied": false, "pending": true}` を返し、
   適用は取り消さない（遅れて効いたことは監査と decision trace に残る）
-- **受付スレッドが死んでも制御は止めない。** error を構造化ログに残し、loop は直前の
-  モードで運転を続ける（冷却の継続を入口の可用性より優先する）。入口が死んだ状態で
-  人が冷却を強めたいときは、service を止めれば 0028 §2.7 の引き継ぎが効く
+- **受付スレッドが死んだら、loop が自分で Max に倒す。** loop は**毎 tick の先頭**（受け渡し口を
+  覗く前）に、受付スレッドが生きているかを **lock を取らずに**確かめる（`OperatingModeSource` の
+  非ブロッキングな照会。実装は `coldaisle.control_admin` にあり、`coldaisle.control` は
+  その Protocol だけを知る）。死んでいたら、その tick で
+  1. 効いている `MANUAL` を解除する（lease の残りも捨てる）
+  2. モードを `MAX` にする。`MAX` は Critical Safety の `forced_max`（§2.4、0028 §2.4）として
+     表すので、Guard の ceiling でも `ramp_down` でも下がらない
+  3. decision trace の tick に `admin_receiver_dead` を残し、error を構造化ログに残す
+
+  この `MAX` は **`coldaisle-fand` の再起動まで保つ**。死んだあとは受け渡し口を読まない
+  （受付スレッドの死後に残った指令も適用しない）ので、人の指令で下げる経路も無い。
+  lease も付けない（勝手に下がる経路を作らない。§2.4 の `MAX` と同じ）。
+  **これは 0028 §2.7 の SIGTERM での引き継ぎに依存しない。** 通常の停止での引き継ぎは
+  元の `pwmN_enable` が `0` / `2+` なら自動制御へ戻すので、低い `MANUAL` が効いていた
+  ときに service を止めても冷却が強まるとは限らない。入口が死んだ状態では、人が冷却を
+  強める手段（`set_mode(max)`）も `MANUAL` から出る手段も失われるため、loop の中で決定論的に
+  安全側へ倒す。
+  ただし、**入口を最初から開かなかった場合**（§2.5 の `SO_PEERCRED` が無い、§2.8 の設定が不正）は
+  死んだとは扱わない（`MANUAL` に入る経路が無く、`AUTO` と journal の stage で運転する）。
+  `coldaisle-fand` 自身の停止の手順で受付スレッドを止めるときも死んだとは扱わない
+  （loop が止まった後に止める）
 - Critical Safety・合成は受付スレッドの例外を見ない。受付スレッドの例外で
   `coldaisle-fand` を終わらせない（0060 §2.6 の「捕まえない」は Critical Safety・合成だけ）
 
@@ -250,10 +272,33 @@ GPU Manager などの書き手が入る。モード変更を足すと、その�
 - **状態を変える指令**（`set_mode` / `lower_authority` / `rollback_authority`）は、
   `coldaisle-fand` が**自分の表にだけ書く別の接続**（0066 の前例）で、追記専用の表へ残す。
   更新・削除はトリガで拒否する（0045 §2.5 と同じ）。表の DDL と migration は実装 PR で決める
+- **監査の表へ書くのは、専用の監査書き込みスレッド1本だけ**にする。受付スレッドは書き込みの
+  依頼を **FIFO の queue** へ入れるだけで、自分では DB を開かない。書き込みは依頼の順に1件ずつ行う
+  （同じ指令の受付の行が結末の行より先に書かれる）。queue には上限（`limits.audit_queue_max`）を
+  置き、溢れた依頼は書き込みの失敗として扱う（下の「向きで分ける」）。監査の DB が lock されて
+  いても、待つのはこのスレッドだけで、受付スレッドの多重化（§2.2）も loop も止まらない。
+  loop はこのスレッドにも queue にも触れない（0060 §2.7 の「保存を別スレッドへ逃がさない」は
+  loop の tick の中の decision trace の話で、loop の外の監査には当たらない）
+- **`command_id` は受け渡し口へ置く前に、受付スレッドが採番する。** プロセスの中で単調に増える
+  整数で、DB を待たずに決まる。監査の行は起動ごとの識別子（`run_id`）との組で一意にする
+  （再起動で番号が戻っても行が衝突しないため。形は実装 PR で決める）。受付の順と
+  `command_id` の順は一致し、§2.2 のモードの枠の比較はこの番号で行う
+- **置く順番は向きで分ける。**
+  - **安全側の指令**（`MAX` への移行、`lower_authority`、`rollback_authority`）は、
+    採番したら**先に受け渡し口へ置き**、そのあとで受付の行の書き込みを依頼する。
+    監査の書き込みの成否を待たず、失敗しても**取り消さない**（安全側は記録を待たない。
+    0057 §2.6 と同じ考え方）。操作者の Manual safety override が監査の DB の lock
+    （いまの `Store` の busy timeout は 5 秒）で何 tick も遅れることを避ける
+  - **冷却を弱めうる指令**（下の「向きで分ける」）は、受付の行の書き込みを依頼し、
+    **書けたと分かってから**受け渡し口へ置く。完了の知らせは受付スレッドの多重化の中で受け取り、
+    待つ間も他の接続（後から来た `set_mode(max)` など）の受付は止めない。書けなければ置かずに拒否する。
+    書けた時点で、モードの軸にそれより大きい `command_id` がすでに置かれていたら置かずに
+    `superseded` とする（§2.2）
 - **1つの指令の経過は、行を書き換えずに「事象の行」を足して表す。** 受付の時点では結果も
   適用した tick も分からないため、結果の列を後から埋める形にすると追記専用のトリガと両立しない。
   - 受付の行（`event = accepted`）: `command_id`・受付時刻（壁時計）・`peer_uid`・`op`・
-    検証済みの本文。**受け渡し口へ置く前に**書く（弱めうる指令は、この行が書けたときだけ置く）
+    検証済みの本文。弱めうる指令では**受け渡し口へ置く前に**確定し、安全側の指令では
+    **置いた後に**書く（上の「置く順番」）
   - 結末の行（`event = applied` / `superseded`）: 同じ `command_id`・記録時刻・
     `applied` なら適用した `tick_id`、`superseded` なら置き換えた `command_id`。
     1つの `command_id` に結末の行は**高々1つ**（一意制約）
@@ -267,9 +312,12 @@ GPU Manager などの書き手が入る。モード変更を足すと、その�
   - 受付の行があって結末の行が無い指令は「受理済み・未確定」（応答の `pending` と同じ状態）として
     読む。結末の行が書けなくても適用は取り消さない。適用の事実は decision trace の `command_id`（下）に
     残るので、弱めうる指令が「記録なしで効いた」状態にはならない（受付の行は適用より前に確定している）
+  - 受付の行が無く結末の行だけがある `command_id` は、受付の行を書けなかった安全側の指令として読む
+    （結末の行は受付の行の存在を前提にしない）
 - **書けなかったときは向きで分ける。** 冷却を強める・制御権を下げる指令（`MAX` への移行、
-  `lower_authority`、`rollback_authority`）は、監査の書き込みに失敗しても**適用する**
-  （安全側は記録を待たない。0057 §2.6 と同じ考え方）。**それ以外の状態を変える指令はすべて
+  `lower_authority`、`rollback_authority`）は、監査の書き込みに失敗しても（queue が溢れた、
+  監査書き込みスレッドが死んだ場合を含む）**適用を妨げず、取り消さない**。失敗は構造化ログに
+  `command_id` 付きで残し、`status` の監査の失敗数に数える。**それ以外の状態を変える指令はすべて
   冷却を弱めうるものとして扱い**、受付の行を書けなければ受理しない（記録の無い弱化を作らない）。
   これには `MAX` から出る、`MANUAL` に入る・値を変える、**`MANUAL` から出る（`AUTO` へ戻すことを
   含む）**が入る。`MANUAL` の値が Fallback の出力より高いとき、`AUTO` へ戻すと冷却が下がるためである。
@@ -277,12 +325,13 @@ GPU Manager などの書き手が入る。モード変更を足すと、その�
   変わりうるため、指令の種類だけで保守的に決める）
 - authority の変更は 0057 の journal にもそのまま残る（`actor = uid.<数値>`、`trigger = human`）
 - decision trace の各 tick にはすでに `operating_mode` と `authority_stage` が残る。
-  加えて、その tick に効いていたモードを決めた `command_id` と、`MANUAL` の期限切れを
-  残す（`ControlTick` の版を上げる。番号は実装 PR が他の PR と取り合わないように決める）
+  加えて、その tick に効いていたモードを決めた `command_id` と、`MANUAL` の期限切れと、
+  受付スレッドの死による `MAX`（`admin_receiver_dead`、§2.2）を残す（`ControlTick` の版を上げる。番号は実装 PR が他の PR と取り合わないように決める）
 - lease 切れの行（`lease_expired`）と、loop が適用したときの結末の行は、loop の tick の中では書かない。
-  loop は結果を受け渡し口へ返すだけで、書くのは受付スレッドの側（loop は DB を待たない。0060 §2.3）
+  loop は結果を受け渡し口へ返すだけで、受付スレッドがそれを監査書き込みスレッドへ依頼する
+  （loop は DB を待たない。0060 §2.3）
 - `status` は、いまのモード・`command_id`・`MANUAL` の残り期限・実効 stage・journal の stage・
-  設定の上限・`persist_failure`・入口の起動状態を返す。**読み取り API には出さない**
+  設定の上限・`persist_failure`・入口の起動状態・監査の失敗数を返す。**読み取り API には出さない**
   （出すかは §5）
 
 ### 2.8 設定：`config/control-admin.yaml`
@@ -293,6 +342,7 @@ GPU Manager などの書き手が入る。モード変更を足すと、その�
 | `authorization.allow_same_user` | 既定 `false`。`true` は `socket.group: null` の開発用のときだけ許す |
 | `limits.max_message_bytes` / `limits.read_timeout_s` | 0045 と同じ意味 |
 | `limits.max_connections` | 受付スレッドが同時に持つ接続の上限（§2.2） |
+| `limits.audit_queue_max` | 監査書き込みスレッドの FIFO の上限（§2.7） |
 | `apply_ack_timeout_ms` | `>= tick_ms + tick_deadline_ms`（起動時に `safety.yaml` と照合） |
 | `manual.max_lease_s` | `MANUAL` の期限に書ける上限。`status` / `basis` 付きの暫定値 |
 
@@ -317,7 +367,7 @@ GPU Manager などの書き手が入る。モード変更を足すと、その�
 
 | 段階 | 内容 | 前提 |
 |---|---|---|
-| 1 | 管理ソケット（`AUTO` / `MAX` / `MANUAL` と lease、`status`）・受け渡し口のモードの枠・監査の表・`coldaisle-control` クライアント・§2.9 の試験。**この段階では `lower_authority` / `rollback_authority` を受理しない**（`unsupported_op` で拒否） | 本記録の承認 |
+| 1 | 管理ソケット（`AUTO` / `MAX` / `MANUAL` と lease、`status`）・受け渡し口のモードの枠・監査の表と監査書き込みスレッド（§2.7。`MAX` は監査の前に置く）・受付スレッドの生存確認と `admin_receiver_dead` の `MAX`（§2.2。受付スレッドを止めた試験で、次の tick から `MANUAL` が解除されて `forced_max` になり、再起動まで保たれることを確かめる）・`coldaisle-control` クライアント・§2.9 の試験。**この段階では `lower_authority` / `rollback_authority` を受理しない**（`unsupported_op` で拒否） | 本記録の承認 |
 | 2 | `AuthorityRuntime` を `coldaisle-fand` へ配線し、受け渡し口の authority の枠と `lower_authority` / `rollback_authority` の受理を足し、journal の変化を毎 tick 検知する（§2.6） | 段階 1 |
 | 3 | `coldaisle-authority raise` / `rollback` の CLI | 段階 2（昇格が走行中の loop に届くため） |
 | 4 | `CALIBRATION` の受理 | #75 の測定計画の形 |
@@ -335,7 +385,9 @@ GPU Manager などの書き手が入る。モード変更を足すと、その�
   #92 は stage を、走っている `coldaisle-fand` に対して変えられるようになる
 - 管理ソケットが「上げられない」ので、ソケットの認可を誤っても制御権は増えない。
   増やせるのは人が CLI で行う昇格だけで、0057 §2.3 の検証をすべて通る
-- loop はどの入口も待たない。入口が壊れても、止まっても、冷却と deadman は影響を受けない
+- loop はどの入口も待たない。入口が壊れても冷却と deadman は影響を受けず、受付スレッドが死んだら
+  loop が自分で `MAX` に倒す（0028 §2.7 の停止時の引き継ぎに頼らない）
+- 監査の DB が lock されていても、`MAX` と降格は待たずに次の tick で効く（§2.7）
 - 誰が・いつ・どのモードにしたかが、追記専用の表・journal・decision trace の3か所で辿れる
 
 ### 悪くなること・その緩和
@@ -343,11 +395,13 @@ GPU Manager などの書き手が入る。モード変更を足すと、その�
 | トレードオフ | 緩和策 |
 |---|---|
 | `coldaisle-fand` にスレッドが1本増える | 受付スレッドは loop の状態に触れず、受け渡し口は軸ごとに1枠（モードと authority の2枠）。loop 側は非ブロッキングで覗くだけ（§2.2） |
-| 管理ソケットが死ぬとモードを変えられない | 直前のモードで運転を続け、error を残す。冷却を強めたいときは service の停止で 0028 §2.7 の引き継ぎが効く |
+| 受付スレッドが死ぬと、再起動まで `MAX` で運転する（騒音が増え、`MANUAL` / `AUTO` に戻せない） | 入口が死ぬと人は冷却を強めることも `MANUAL` から出ることもできないので、安全側に固定する。decision trace の `admin_receiver_dead` と error のログで気づき、再起動で `AUTO` に戻す。入口を最初から開かなかった場合は対象外（§2.2） |
+| スレッドがもう1本（監査書き込み）増える | loop は触れない。受付スレッドは queue に入れるだけ。queue は上限つき（§2.7） |
+| 安全側の指令は、監査の行が無いまま効くことがある | 失敗は `command_id` 付きで構造化ログと `status` に残り、適用の事実は decision trace と authority の journal に残る。弱めうる指令は従来どおり監査が書けたときだけ置く |
 | 昇格が走行中の loop に効くまで最大 1 tick 遅れる | 安全側ではないので遅れてよい。降格は受け渡し口経由で次の tick から効く |
 | 毎 tick の `stat` が1回増える | heartbeat の後に置き、flock を待たない（§2.6） |
 | `MANUAL` の lease が切れると勝手に `AUTO` へ戻る | 戻り先は Fallback の自動追従で、Guard / Safety はそのまま効く。`MAX` には lease を付けない |
-| 監査を書けないと `MANUAL` に入れず、`MANUAL` から `AUTO` へも戻せない | 安全側（`MAX`・降格）は書けなくても効く。弱める向きだけを止める。`MANUAL` は lease 切れで `AUTO` へ戻る（loop が決めるので監査の可否に依存しない） |
+| 監査を書けないと `MANUAL` に入れず、`MANUAL` から `AUTO` へも戻せない | 安全側（`MAX`・降格）は監査を待たずに先に置くので、書けなくても遅れずに効く。弱める向きだけを止める。`MANUAL` は lease 切れで `AUTO` へ戻る（loop が決めるので監査の可否に依存しない） |
 | 同じ uid は守れない | 0045 §2.3 と同じ限界。API / AI サーバを別ユーザーで動かすことを配置の必須条件にする（§2.5） |
 | 設定ファイルが1つ増える | 入口の形だけを持ち、制御の閾値を持たない。壊れていても入口が閉じるだけ（§2.8） |
 
@@ -381,9 +435,9 @@ GPU Manager などの書き手が入る。モード変更を足すと、その�
 | 1 | `CALIBRATION` の指令の形（#75 の測定計画をどう参照し、いつ終わるか） | #75 |
 | 2 | Workspace / GUI（#60）に管理ソケットの権限を渡すか。渡すなら §4 の J（安全側だけのグループ）を含めて決める | #60（本記録では渡さない） |
 | 3 | `coldaisle-fand` の実行ユーザー・管理グループ名・`RuntimeDirectory`・`authority.json` のディレクトリの所有者 | 0060 未決 7 / #57（0069 の後続） |
-| 4 | `apply_ack_timeout_ms`・`manual.max_lease_s`・`limits`（`max_connections` を含む）の値 | 段階 1 の実装で暫定値、運用後に所有者 |
+| 4 | `apply_ack_timeout_ms`・`manual.max_lease_s`・`limits`（`max_connections`・`audit_queue_max` を含む）の値 | 段階 1 の実装で暫定値、運用後に所有者 |
 | 5 | 昇格の承認者（`StageApproval.approver`）を CLI の実行 uid に束縛するか。束縛するなら journal の版を上げる | #92 の段階 3 |
-| 6 | 監査の表の DDL・migration、`ControlTick` の版番号 | 段階 1 の実装 PR |
+| 6 | 監査の表の DDL・migration（`run_id` と `command_id` の組の形を含む）、`ControlTick` の版番号と `admin_receiver_dead` の表し方 | 段階 1 の実装 PR |
 | 7 | いまのモードと stage を読み取り API（Server Health など）に出すか | 別の決定記録（0009 / 0040 の拡張） |
 | 8 | 0057 §5「降格の永続化に失敗したまま再起動したときの扱い」 | 0057 のまま（本記録では扱わない） |
 | 9 | 0060 §2.3 は「プロトコルと認可は #60 で決める」としていたが、本記録が #74 / #92 で決める。0060 側への注記を足すか | 本記録の承認時に所有者 |
