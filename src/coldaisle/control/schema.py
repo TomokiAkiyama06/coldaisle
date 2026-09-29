@@ -24,7 +24,7 @@ from typing import Annotated, Literal, Protocol, Self, runtime_checkable
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-SCHEMA_VERSION: Literal[9] = 9
+SCHEMA_VERSION: Literal[10] = 10
 """`ControlTick` の形の版。**フィールドの名前や意味を変えたら上げる。**
 
 #82 が保存したデータを読み違えないため。
@@ -49,6 +49,11 @@ SCHEMA_VERSION: Literal[9] = 9
   理由（`disabled_inputs`）と、暫定値を含む Safety 設定で回っていたか（`config_is_provisional`）。
   **v9 には必須**で、保存済みの v1〜v8 は欄なしのまま読める（「記録が無い」であって
   「確定値で回っていた」ではない）
+- v10（#104 / 決定記録 0071 §2.5）: tick が使っていた Model Registry の版（`registry`）。
+  registry の `revision` と、kind ごとの production pointer・それを成立させた pointer 変更の
+  `RegistryAuditEvent.trace_metadata()`（ただし自由記述の `reason` は全文でなく `reason_sha256`。
+  決定記録 0075）。**v10 には必須**で、保存済みの v1〜v9 は欄なしのまま
+  読める（「記録が無い」であって「production が無かった」ではない）
 """
 
 Demand = Annotated[float, Field(ge=0.0, le=1.0, allow_inf_nan=False)]
@@ -1089,6 +1094,170 @@ class SafetyProvenance(_Frozen):
     """Safety 設定に `status: provisional` の値が1つでもあったか（0028 §2.8）。"""
 
 
+REGISTRY_ARTIFACT_KINDS: frozenset[str] = frozenset(
+    {"thermal_model", "confidence_model", "supervisor_policy", "feature_transform"}
+)
+"""registry が production pointer を持つ artifact kind（`RegistryProvenance.production` の鍵）。
+
+`coldaisle.control.model_registry.ArtifactKind` の値。schema は registry を import しないので
+値で持ち、食い違いは tests/test_model_registry.py で止める。
+"""
+
+REGISTRY_POINTER_CHANGE_EVENTS: frozenset[str] = frozenset({"promoted", "rolled_back"})
+"""production pointer を動かす registry event（決定記録 0062 §2.5 の `pointer_changes`）。
+
+`coldaisle.control.model_registry.RegistryEventKind` の値のうち2つ。schema は registry を
+import しない（registry が schema を import する向きだけにする）ので、値で持つ。
+一致は試験が確かめる。
+"""
+
+_REGISTRY_THERMAL_MODEL_KIND = "thermal_model"
+"""Learned MPC が制御に束縛する artifact の kind（決定記録 0052 §2.1 の2）。"""
+
+_REGISTRY_IDENTIFIER_PATTERN = r"^[a-z][a-z0-9_.-]*$"
+"""Registry の kind・model id・actor の形（`model_registry._IDENTIFIER_PATTERN` と同じ）。"""
+
+
+_REGISTRY_REF_LABEL_MAX_LENGTH = 240
+"""`ArtifactRef.key`（`<kind>/<model_id>/<version>`）の長さの上限。
+
+各部の上限（kind は語彙・model id 120・version 80）と区切りの和を下回らない値。
+毎 tick 載る欄なので、識別子であっても長さを schema で閉じる（決定記録 0075 §2.2）。
+"""
+
+
+def registry_reason_sha256(reason: str) -> str:
+    """registry の audit の `reason` を、毎 tick の塊に載せる digest にする（決定記録 0075）。
+
+    UTF-8 の bytes の SHA-256（小文字16進）。全文の正本は registry の audit であり
+    （`coldaisle-registry audit --pointer-changes`）、digest はそれと照合するためだけに置く。
+    """
+    return hashlib.sha256(reason.encode("utf-8")).hexdigest()
+
+
+class RegistryPointerChange(_Frozen):
+    """production pointer を成立させた変更の、path を含まない記録（決定記録 0071 §2.5 / 0075）。
+
+    `RegistryAuditEvent.trace_metadata()` の欄を**全部**持つ。欄を落とすと、読む側が
+    「記録されていない」と「起きていない」を区別できない（決定記録 0062 §2.5）。
+    ただし**自由記述の `reason` だけは全文を持たず、`reason_sha256` に置き換える**
+    （決定記録 0075。毎 tick 載るため、最大1000字の全文は保存量を押し上げる）。
+    誰が・なぜ・いつ承認したかの正本は `registry.json` の audit であり、ここは写しである。
+    `RegistryAuditEvent.tick_trace_metadata()` がこの形を作る。
+    """
+
+    registry_revision: int = Field(ge=1)
+    occurred_at_ms: int = Field(ge=0)
+    event: str
+    artifact_kind: str = Field(pattern=_REGISTRY_IDENTIFIER_PATTERN, max_length=120)
+    model_id: str = Field(pattern=_REGISTRY_IDENTIFIER_PATTERN, max_length=120)
+    model_version: str = Field(min_length=1, max_length=80)
+    actor: str = Field(pattern=_REGISTRY_IDENTIFIER_PATTERN, max_length=120)
+    reason_sha256: Sha256Hex
+    """audit の `reason` の UTF-8 の SHA-256（`registry_reason_sha256`）。全文は audit で引く。"""
+    previous_artifact: str | None = Field(max_length=_REGISTRY_REF_LABEL_MAX_LENGTH)
+    rollback_target: str | None = Field(max_length=_REGISTRY_REF_LABEL_MAX_LENGTH)
+    approver: str | None
+    approved_at_ms: int | None = Field(ge=0)
+    approval_artifact_sha256: Sha256Hex | None
+
+    @model_validator(mode="after")
+    def _is_an_approved_pointer_change(self) -> Self:
+        if self.event not in REGISTRY_POINTER_CHANGE_EVENTS:
+            # 登録・検証・retire は production pointer を動かさない。pointer を成立させた
+            # 変更として載せられるのは promotion / rollback だけ（決定記録 0062 §2.5）。
+            raise ValueError("production pointer を成立させるのは promotion / rollback だけ")
+        if self.approver is None or self.approved_at_ms is None:
+            raise ValueError("promotion / rollback の記録には human approval が要る")
+        if self.approval_artifact_sha256 is None:
+            raise ValueError("承認した artifact の checksum が要る")
+        if self.approver != self.actor:
+            raise ValueError("pointer 変更の actor と approver を揃える")
+        if self.approved_at_ms > self.occurred_at_ms:
+            raise ValueError("未来の approval は記録できない")
+        if self.rollback_target is not None and self.event != "promoted":
+            raise ValueError("rollback_target は promotion の記録だけが持つ")
+        return self
+
+
+class RegistryProductionPointer(_Frozen):
+    """1つの artifact kind について、tick が使っていた production pointer（決定記録 0071 §2.5）。
+
+    production が無ければ両方 `None`。**欄は常に揃える**（値が無いときも欄を消さない）。
+    """
+
+    artifact_sha256: Sha256Hex | None
+    """production artifact の checksum。production が無ければ `None`。"""
+    established_by: RegistryPointerChange | None
+    """その production を成立させた pointer 変更（最後の promotion / rollback）。"""
+
+    @model_validator(mode="after")
+    def _pointer_and_its_change_agree(self) -> Self:
+        change = self.established_by
+        if (self.artifact_sha256 is None) != (change is None):
+            raise ValueError("production の checksum と、それを成立させた変更は一緒に記録する")
+        if change is not None and change.approval_artifact_sha256 != self.artifact_sha256:
+            # 承認は artifact の checksum に束縛されている（0062）。食い違う pointer は、
+            # 承認していない bytes の下で判断したと読めてしまう。
+            raise ValueError("production の checksum を承認した checksum と揃える")
+        return self
+
+
+class RegistryProvenance(_Frozen):
+    """この tick の判断が**どの Model Registry の版の下で出たか**（`ControlTick` v10。#104）。
+
+    決定記録 0071 §2.5。制御デーモンが起動時に持っていた registry の状態を**毎 tick** 写す。
+    起動した tick だけに載せると、保持期間より長く動いたデーモンでは「どの昇格の下で
+    動いているか」が trace から言えなくなる。
+
+    - `revision`: registry の revision（audit の件数と一致し 1 から連続する）。
+      **`None` は「この制御デーモンは registry を読んでいない」**（artifact を束縛していない構成）
+      であり、`production` は空にする。`0` は「読んだが1件も記録が無い」で、両者を混ぜない
+    - `production`: kind ごとの pointer。registry を読んだなら**全 kind を載せる**
+      （production が無い kind も `None` の欄で残す）
+
+    隣り合う trace の `revision` が飛んでいれば、その間の pointer 変更は
+    `coldaisle-registry audit --pointer-changes` で引く。**trace は tick が使っていた pointer
+    だけを持ち、変更の全件は持たない**（決定記録 0071 §2.5 / §5 #7）。
+    """
+
+    schema_version: Literal[1] = 1
+    revision: int | None = Field(ge=0)
+    production: dict[
+        Annotated[str, Field(pattern=_REGISTRY_IDENTIFIER_PATTERN, max_length=120)],
+        RegistryProductionPointer,
+    ]
+
+    @model_validator(mode="after")
+    def _pointers_belong_to_this_revision(self) -> Self:
+        if self.revision is None:
+            if self.production:
+                raise ValueError("registry を読んでいない tick に production pointer を載せない")
+            return self
+        if set(self.production) != REGISTRY_ARTIFACT_KINDS:
+            # 欄を欠くと「production が無かった」と「記録されていない」を区別できない（0062 §2.5）。
+            raise ValueError("registry を読んだ tick は全 kind の production pointer を載せる")
+        change_revisions: list[int] = []
+        for kind, pointer in self.production.items():
+            change = pointer.established_by
+            if change is None:
+                continue
+            if change.artifact_kind != kind:
+                raise ValueError("production pointer の kind と、それを成立させた変更を揃える")
+            if change.registry_revision > self.revision:
+                raise ValueError("registry の revision より後の変更を production に載せない")
+            change_revisions.append(change.registry_revision)
+        if len(change_revisions) != len(set(change_revisions)):
+            # 1つの audit event が動かす pointer は1つだけ。
+            raise ValueError("1つの pointer 変更を複数の kind に載せない")
+        return self
+
+    @classmethod
+    def unbound(cls) -> RegistryProvenance:
+        """registry を読んでいない制御デーモンの記録（artifact を束縛していない構成）。"""
+        return cls(revision=None, production={})
+
+
 class GuardZoneOutput(_Frozen):
     """Reactive Guard の zone ごとの出力（0028 §2.3）。介入していなければすべて None。
 
@@ -1309,7 +1478,7 @@ v1〜v3 の reader は知らないため v3 以前には記録しない。
 class ControlTick(_Frozen):
     """1 tick の判断の記録（decision trace。0028 §2.3）。#82 が保存し、#90 / #91 が読む。"""
 
-    schema_version: Literal[1, 2, 3, 4, 5, 6, 7, 8, 9] = SCHEMA_VERSION
+    schema_version: Literal[1, 2, 3, 4, 5, 6, 7, 8, 9, 10] = SCHEMA_VERSION
     tick_id: int = Field(ge=0)
     ts_ms: int = Field(ge=0)
     """記録の時刻（壁時計。0028 §2.6）。"""
@@ -1330,6 +1499,14 @@ class ControlTick(_Frozen):
         default=None, exclude_if=lambda value: value is None
     )
     """Critical Safety の裁定の前提（v9。#78）。保存済みの v1〜v8 では None。"""
+    registry: RegistryProvenance | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
+    """tick が使っていた Model Registry の版（v10。#104 / 決定記録 0071 §2.5）。
+
+    保存済みの v1〜v9 では None。registry を読んでいない構成の v10 は `None` ではなく
+    `RegistryProvenance.unbound()`（`revision=None`）を持つ。
+    """
     faults: tuple[Fault, ...] = ()
     """いま有効な故障。
 
@@ -1372,7 +1549,15 @@ class ControlTick(_Frozen):
                 raise ValueError("v9 の ControlTick には safety_provenance が要る")
         elif self.schema_version < 9:
             raise ValueError("safety_provenance を記録する ControlTick は schema version 9 にする")
+        if self.registry is None:
+            if self.schema_version >= 10:
+                # v9 と同じく、版が中身を表さない記録を作らない。欄が無いと「どの production
+                # pointer の下で出た判断か」を言えない（決定記録 0071 §2.5）。
+                raise ValueError("v10 の ControlTick には registry が要る")
+        elif self.schema_version < 10:
+            raise ValueError("registry を記録する ControlTick は schema version 10 にする")
         self._check_model_gate()
+        self._check_registry_binds_model()
         self._check_shadow()
         if self.supervisor is not None:
             if self.supervisor.tick_id != self.tick_id:
@@ -1517,6 +1702,31 @@ class ControlTick(_Frozen):
         if state.operating_mode in {OperatingMode.MANUAL, OperatingMode.CALIBRATION}:
             # 人が requested を決める mode では Gate が動かない（0028 §2.5 (a)）。
             raise ValueError("MANUAL / CALIBRATION の tick に model_gate を残さない")
+
+    def _check_registry_binds_model(self) -> None:
+        """v10 の ``registry`` が、この tick の裏づけのある model artifact を production に持つか。
+
+        Learned MPC を制御へ束縛できるのは thermal_model の**production pointer そのもの**
+        だけである（決定記録 0052 §2.1 の3）。制御デーモンは起動時に読んだ registry の版を
+        毎 tick 載せる（0071 §2.5）ので、裏づけのある `model_gate` の artifact は、その版の
+        thermal_model の production と一致していなければならない。
+        一致を求めないと、registry を読んでいない記録（`unbound`）や別の版の snapshot と
+        組み合わさり、**判断を別の昇格の下で出たものとして記録できてしまう**（codex #4133594515）。
+
+        RL Supervisor の識別はここで照合しない。shadow は production でない candidate を
+        回す（0061 §2.4 の `for_shadow`）ので、production との一致は要件にならない。
+        """
+        registry = self.registry
+        gate = self.model_gate
+        if registry is None or gate is None or not gate.attested or gate.artifact_sha256 is None:
+            return
+        if registry.revision is None:
+            raise ValueError("裏づけのある model artifact を記録する tick は registry を読んでいる")
+        pointer = registry.production[_REGISTRY_THERMAL_MODEL_KIND]
+        if pointer.artifact_sha256 != gate.artifact_sha256:
+            raise ValueError(
+                "model_gate の artifact を registry の thermal_model の production と揃える"
+            )
 
     def _check_shadow(self) -> None:
         """v6 の ``shadow`` が、同じ tick の適用結果と同じ判断を指しているか（#90）。"""

@@ -59,6 +59,7 @@ from coldaisle.control.loop import (
     TelemetrySample,
     build_input_contract,
 )
+from coldaisle.control.model_registry import ArtifactKind, ModelRegistry
 from coldaisle.control.reactive.guard import ReactiveGuard
 from coldaisle.control.safety.critical import (
     CriticalSafety,
@@ -66,6 +67,7 @@ from coldaisle.control.safety.critical import (
     create_control_runtime_binding,
 )
 from coldaisle.control.schema import (
+    SCHEMA_VERSION,
     BoundBy,
     ControllerKind,
     ControlTick,
@@ -73,9 +75,11 @@ from coldaisle.control.schema import (
     OperatingMode,
     PerZone,
     Reason,
+    RegistryProvenance,
     SafetyState,
     Zone,
     ZoneRequest,
+    registry_reason_sha256,
 )
 from coldaisle.control.shadow.record import ShadowRecorder
 from coldaisle.control.state import ControlStateEstimator
@@ -110,6 +114,19 @@ from coldaisle.metrics import MetricCatalog
 from coldaisle.store.models import Quality
 from conftest import TEST_EPOCH_MS
 from test_control_config import valid_documents, write_documents
+from test_model_registry import (
+    COMPATIBILITY as REGISTRY_COMPATIBILITY,
+)
+from test_model_registry import (
+    LIMITS,
+    NOW_MS,
+    promote,
+    register_and_validate,
+    rollback_approval,
+)
+from test_model_registry import (
+    metadata as registry_metadata,
+)
 from test_simulated_fan_backend import hardware_config
 
 CONFIG_DIR = Path(__file__).resolve().parents[1] / "config"
@@ -370,6 +387,7 @@ class Harness:
         composer: Any = None,
         backend: Any = None,
         t_sensor_metric: str | None = None,
+        registry: RegistryProvenance | None = None,
     ) -> None:
         self.config = config if config is not None else control_config()
         self.clock = SimulatedClock(TEST_EPOCH_MS)
@@ -413,6 +431,7 @@ class Harness:
             telemetry=self.telemetry,
             clock=self.clock,
             monotonic=self.monotonic,
+            registry=registry if registry is not None else RegistryProvenance.unbound(),
             mode_source=self.mode,
             supervisor=(
                 SupervisorCoordinator(self.config.policy.supervisor, self.clock)
@@ -985,7 +1004,7 @@ def test_invariant_12_the_trace_records_the_premise_of_the_safety_decision(catal
         assert provenance.config_is_provisional is safety.config_is_provisional
         assert "t_sensor_disabled" in {reason.code for reason in provenance.disabled_inputs}
     recorded = json.loads(harness.trace.rows[-1])
-    assert recorded["schema_version"] == 9
+    assert recorded["schema_version"] == SCHEMA_VERSION
     assert recorded["safety_provenance"]["disabled_inputs"][0]["code"] == "t_sensor_disabled"
 
 
@@ -1016,6 +1035,118 @@ def test_invariant_12_a_confirmed_safety_with_t_sensor_records_an_empty_premise(
     recorded = json.loads(harness.trace.rows[-1])
     assert recorded["safety_provenance"]["disabled_inputs"] == []
     assert recorded["safety_provenance"]["config_is_provisional"] is False
+
+
+def test_invariant_12_every_tick_records_that_no_registry_was_read(catalog) -> None:
+    """registry を読んでいない構成は、それを**毎 tick 明示する**（v10。#104 / 0071 §2.5）。"""
+    harness = Harness(catalog)
+
+    results = [harness.tick(), harness.settle()]
+
+    for result in results:
+        assert result.tick.registry == RegistryProvenance.unbound()
+    recorded = json.loads(harness.trace.rows[-1])
+    assert recorded["schema_version"] == SCHEMA_VERSION == 10
+    assert recorded["registry"] == {"schema_version": 1, "revision": None, "production": {}}
+
+
+def test_invariant_12_every_tick_records_the_production_pointer_it_used(
+    catalog, tmp_path: Path
+) -> None:
+    """起動時に持った registry の版を**毎 tick** 載せる（決定記録 0071 §2.5）。
+
+    起動した tick だけに載せると、保持期間より長く動いたデーモンでは「どの昇格の下で
+    動いているか」が trace から言えなくなる。loop は registry を読み直さないので、起動後に
+    registry が動いても、その tick が使っていた pointer のまま記録する。
+    """
+    registry = ModelRegistry(tmp_path / "registry", SimulatedClock(NOW_MS), limits=LIMITS)
+    register_and_validate(registry, "1.0.0")
+    promote(registry, "1.0.0")
+    snapshot = registry.inspect()
+    harness = Harness(catalog, registry=snapshot.trace_provenance())
+
+    first = harness.tick()
+    # 起動後の rollback 相当の変更（ここでは次の promotion）。loop は再起動まで反映しない。
+    register_and_validate(registry, "2.0.0")
+    promote(registry, "2.0.0")
+    results = [first, harness.tick(), harness.settle()]
+
+    promotion = snapshot.pointer_changes[-1]
+    for result in results:
+        provenance = result.tick.registry
+        assert provenance is not None
+        assert provenance.revision == snapshot.revision == 3
+        thermal = provenance.production[ArtifactKind.THERMAL_MODEL.value]
+        assert thermal.artifact_sha256 == registry_metadata("1.0.0").sha256
+        assert thermal.established_by is not None
+        assert thermal.established_by.model_dump() == promotion.tick_trace_metadata()
+        # 自由記述の `reason` は全文を載せず digest だけ（決定記録 0075）。
+        assert thermal.established_by.reason_sha256 == registry_reason_sha256(promotion.reason)
+        # production の無い kind も欄を揃えて残す（0062 §2.5）。
+        assert set(provenance.production) == {kind.value for kind in ArtifactKind}
+        assert provenance.production[ArtifactKind.SUPERVISOR_POLICY.value].established_by is None
+    stored = [json.loads(row) for row in harness.trace.rows]
+    assert {row["registry"]["revision"] for row in stored} == {3}
+    assert all(promotion.reason not in row for row in harness.trace.rows)
+
+
+def test_invariant_12_a_restart_shows_the_revision_jump_and_the_pointer_in_use(
+    catalog, tmp_path: Path
+) -> None:
+    """再起動の間の promotion / rollback は `revision` の飛びとして trace から検出できる。
+
+    trace が持つのは tick が使っていた pointer だけで、途中の pointer は現れない。間の変更の
+    全件は registry の audit が正本で、`registry_revision` で範囲に絞れる（0071 §2.5 / §5 #7）。
+    """
+    registry = ModelRegistry(tmp_path / "registry", SimulatedClock(NOW_MS), limits=LIMITS)
+    register_and_validate(registry, "1.0.0")
+    promote(registry, "1.0.0")
+    before = Harness(catalog, registry=registry.inspect().trace_provenance())
+    before.tick()
+
+    # 停止中に promotion と rollback が両方起きる。
+    register_and_validate(registry, "2.0.0")
+    promote(registry, "2.0.0")
+    revision = registry.inspect().revision
+    registry.rollback(
+        ArtifactKind.THERMAL_MODEL,
+        REGISTRY_COMPATIBILITY,
+        approval=rollback_approval("1.0.0", revision),
+        expected_revision=revision,
+    )
+    snapshot = registry.inspect()
+    after = Harness(catalog, registry=snapshot.trace_provenance())
+    after.tick()
+
+    old = json.loads(before.trace.rows[-1])["registry"]
+    new = json.loads(after.trace.rows[-1])["registry"]
+    assert (old["revision"], new["revision"]) == (3, 7)
+    thermal = new["production"][ArtifactKind.THERMAL_MODEL.value]
+    assert thermal["artifact_sha256"] == registry_metadata("1.0.0").sha256
+    assert thermal["established_by"]["event"] == "rolled_back"
+    assert thermal["established_by"]["registry_revision"] == 7
+    # 飛んだ区間の変更は audit から全件引ける。途中の 2.0.0 は trace のどの tick にも無い。
+    between = [
+        event.trace_metadata()
+        for event in snapshot.pointer_changes
+        if old["revision"] < event.revision <= new["revision"]
+    ]
+    assert [(event["event"], event["model_version"]) for event in between] == [
+        ("promoted", "2.0.0"),
+        ("rolled_back", "1.0.0"),
+    ]
+    # trace は reason の digest だけを持ち、全文は audit から引いて照合する（決定記録 0075）。
+    established = dict(thermal["established_by"])
+    assert established.pop("reason_sha256") == registry_reason_sha256(str(between[-1]["reason"]))
+    assert {key: value for key, value in between[-1].items() if key != "reason"} == established
+
+
+def test_invariant_12_the_loop_requires_the_registry_state_explicitly() -> None:
+    """渡し忘れを「registry を読んでいない」と同じ記録にしない。既定値を置かない。"""
+    import inspect
+
+    parameter = inspect.signature(ControlLoop).parameters["registry"]
+    assert parameter.default is inspect.Parameter.empty
 
 
 def test_invariant_12_a_recorded_overrun_cannot_disagree_with_its_duration() -> None:

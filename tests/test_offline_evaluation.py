@@ -99,7 +99,12 @@ from coldaisle.evaluate import RunsManifest, build_context, main, render
 from coldaisle.metrics import MetricCatalog
 from coldaisle.store.models import ControlTraceRecord, Quality
 from test_control_config import valid_documents, write_documents
-from test_control_schema import CONTROL_TICK_RUNTIME, SAFETY_PROVENANCE
+from test_control_schema import (
+    CONTROL_TICK_RUNTIME,
+    REGISTRY_PROVENANCE,
+    SAFETY_PROVENANCE,
+    registry_provenance_for,
+)
 
 ROOT = Path(__file__).resolve().parents[1]
 EVALUATION_PACKAGE = ROOT / "src" / "coldaisle" / "control" / "evaluation"
@@ -294,6 +299,13 @@ def tick_at(
         faults=faults,
         runtime=CONTROL_TICK_RUNTIME,
         safety_provenance=SAFETY_PROVENANCE,
+        # 裏づけのある artifact は、その tick が使っていた registry の production と揃える
+        # （決定記録 0052 §2.1 の3。codex #4133594515）。
+        registry=(
+            registry_provenance_for(model_gate.artifact_sha256)
+            if model_gate is not None and model_gate.artifact_sha256 is not None
+            else REGISTRY_PROVENANCE
+        ),
     )
 
 
@@ -2440,10 +2452,13 @@ def _applied_learned_run(*, artifacts: tuple[str | None, ...]) -> list[ControlTr
             # v6 に実行記録の欄は無い（#74 / 決定記録 0060）。
             document.pop("runtime", None)
             document.pop("safety_provenance", None)
+            document.pop("registry", None)
             tick = ControlTick.model_validate(document)
         elif artifact != "a" * 64:
             document = tick.model_dump(mode="python")
             document["model_gate"]["artifact_sha256"] = artifact
+            # tick が使っていた registry の production も同じ artifact にする（codex #4133594515）。
+            document["registry"] = registry_provenance_for(artifact).model_dump(mode="python")
             tick = ControlTick.model_validate(document)
         traces.append(trace_of(tick))
     return traces
@@ -2580,6 +2595,7 @@ def test_invariant_17_e_a_learned_tick_without_a_model_gate_counts_as_unknown(
         document["model_gate"] = None
         document.pop("runtime", None)
         document.pop("safety_provenance", None)
+        document.pop("registry", None)
         traces.append(trace_of(ControlTick.model_validate(document)))
 
     report = evaluate([run_of(traces, [])], context=context)
