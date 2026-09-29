@@ -2,7 +2,8 @@
 
 `airflow-trace.js` の変換を node で実際に動かして確かめる（決定記録 0044。CI では node が必須）。
 
-1. **版の解釈は1か所**（`airflow-trace.js`）。v1〜v11 の fixture を読める
+1. **版の解釈は1か所**（`airflow-trace.js`）。v1〜v10 の fixture を読める
+   （schema.py に無い版は「未対応の版」）
 2. **3つの状態を混ぜない**: その版に欄が無い／欄はあるが値が無い／画面が知らない版
 3. Safety override・Fallback・OOD を通常状態と区別して出す
 4. **古さは読む側で判定する**（`runtime.tick_period_ms` × 設定の倍数。v1〜v7 は判定しない）
@@ -15,7 +16,7 @@ import os
 import shutil
 import subprocess
 from pathlib import Path
-from typing import Any
+from typing import Any, get_args
 
 import pytest
 import yaml
@@ -25,6 +26,7 @@ from pydantic import ValidationError
 from coldaisle.api.airflow import AirflowUiSettings
 from coldaisle.api.app import WEB_ROOT, Config, create_app
 from coldaisle.clock import SimulatedClock
+from coldaisle.control.schema import ControlTick
 from coldaisle.store import SqliteStore
 from conftest import CONFIG_DIR, QUALITY_RULES_PATH
 
@@ -70,31 +72,6 @@ def _body(version: int) -> dict[str, Any]:
         (FIXTURES / f"control_tick_v{version}.json").read_text(encoding="utf-8")
     )
     return loaded
-
-
-def _v11() -> dict[str, Any]:
-    """v11 の形（決定記録 0073 §2.5）。v10 に `air_balance` と `zones.*.applied_demand` を足す。"""
-    body = _body(10)
-    body["schema_version"] = 11
-    for zone in body["zones"].values():
-        zone["applied_demand"] = 0.4
-        zone["estimated_flow"] = 0.5
-    body["air_balance"] = {
-        "schema_version": 1,
-        "status": "enabled",
-        "disabled_reason": None,
-        "demand_basis": "applied",
-        "q_front": 0.5,
-        "q_rear": 0.5,
-        "q_top": 0.5,
-        "estimated_intake": 0.5,
-        "estimated_exhaust": 1.0,
-        "balance_ratio": 2.0,
-        "state": "exhaust_heavy",
-        "thermal_limited": False,
-        "thermal_reasons": [],
-    }
-    return body
 
 
 def _latest(body: dict[str, Any] | None, *, age_ms: int = 500, seq: int = 7) -> dict[str, Any]:
@@ -147,35 +124,6 @@ def test_every_stored_version_is_read(version):
     assert control["decision_id"] == "#7"
 
 
-def test_v11_air_balance_is_read():
-    result = _convert(_v11())
-    assert result["status"] == "ok"
-    balance = result["control"]["balance"]
-    assert balance["ratio"] == 2.0
-    assert balance["state"] == "排気が多い"
-    assert balance["position"] is None  # 目標帯は trace に無い。推測で描かない
-    assert "適用した出力 40%" in _steps(result, "front")["ファン"]["detail"]
-
-
-def test_v11_disabled_air_balance_is_not_called_balanced():
-    body = _v11()
-    body["air_balance"].update(
-        status="disabled",
-        disabled_reason="uncalibrated",
-        balance_ratio=None,
-        state="disabled",
-        q_front=None,
-        q_rear=None,
-        q_top=None,
-        estimated_intake=None,
-        estimated_exhaust=None,
-    )
-    balance = _convert(body)["control"]["balance"]
-    assert balance["state"] == "使っていない（未校正）"
-    assert balance["ratio"] is None
-    assert balance["tone"] != "ok"
-
-
 @pytest.mark.parametrize("version", [1, 4, 7, 10])
 def test_a_field_the_version_does_not_have_is_named_so(version):
     """v10 以前に Air Balance の記録は無い。**「釣り合っている」「無し」と言わない。**"""
@@ -187,8 +135,12 @@ def test_a_field_the_version_does_not_have_is_named_so(version):
 def test_model_gate_absent_in_v4_but_empty_in_v5():
     """v4 に model_gate の欄は無い（→ 版に無い）。v5 で null は「判定なし」（→ 値が無い）。"""
     v4 = _convert(_body(4))
-    assert _chip(v4, "予測の信頼度") == {"k": "予測の信頼度", "v": NOT_IN_VERSION, "tone": "absent"}
-    assert _chip(v4, "想定外の状態")["v"] == NOT_IN_VERSION
+    assert _chip(v4, "予測の信頼度") == {
+        "k": "予測の信頼度",
+        "v": f"値の記録なし（Gate の判断は{NOT_IN_VERSION}）",
+        "tone": "absent",
+    }
+    assert _chip(v4, "想定外の状態")["v"] == f"値の記録なし（Gate の判断は{NOT_IN_VERSION}）"
     assert _steps(v4, "front")["信頼度チェック"]["value"] == NOT_IN_VERSION
 
     v5 = _convert(_body(5))
@@ -196,6 +148,25 @@ def test_model_gate_absent_in_v4_but_empty_in_v5():
     assert _chip(v5, "予測の信頼度")["v"].startswith("判定なし")
     assert _chip(v5, "想定外の状態")["v"].startswith("判定なし")
     assert _chip(v5, "想定外の状態").get("tone") != "ok", "判定が無いのに「なし（正常）」と言わない"
+
+
+@pytest.mark.parametrize("version", [1, 4])
+def test_v1_to_v4_state_values_are_shown_without_attestation(version):
+    """v1〜v4 は ControlState に信頼度と OOD を持つ。**OOD を「版に無い」で隠さない。**"""
+    body = _body(version)
+    body["state"].update(model_confidence=0.41, model_ood=True, model_version="1.0.0")
+    result = _convert(body)
+    ood = _chip(result, "想定外の状態")
+    assert ood["v"].startswith("あり")
+    assert "裏づけなし" in ood["v"]
+    assert ood["tone"] == "bad"
+    confidence = _chip(result, "予測の信頼度")
+    assert confidence["v"].startswith("41%")
+    assert confidence["tone"] == "warn"
+
+    body["state"]["model_ood"] = False
+    # 裏づけの無い「なし」を緑にしない
+    assert _chip(_convert(body), "想定外の状態").get("tone") != "ok"
 
 
 def test_supervisor_absent_in_v2_but_empty_in_v9():
@@ -211,9 +182,12 @@ def test_workload_regime_absent_in_v1_only():
     assert _chip(_convert(_body(2)), "負荷の傾向")["v"] != NOT_IN_VERSION
 
 
-@pytest.mark.parametrize("version", [12, 999])
+@pytest.mark.parametrize("version", [11, 12, 999])
 def test_an_unknown_version_is_not_shown(version):
-    """画面が知らない版は「未対応の版」。**制御由来の項目を出さない。**"""
+    """画面が知らない版は「未対応の版」。**制御由来の項目を出さない。**
+
+    v11 は schema.py にまだ無い。中身は先にマージされた PR で決まるので、推測で読まない。
+    """
     body = _body(10)
     body["schema_version"] = version
     result = _convert(body)
@@ -561,3 +535,52 @@ def test_the_multiplier_is_required():
                 "air_temperature": {"thresholds_c": [27.0, 28.0, 29.0, 30.0], "provisional": True},
             }
         )
+
+
+# ---------------------------------------------------------------- レビューでの追加
+
+
+def test_known_versions_match_the_schema():
+    """画面が知っている版は schema.py の ControlTick の版と同じ。**先取りしない**（0064 §2.9）。"""
+    stored = sorted(get_args(ControlTick.model_fields["schema_version"].annotation))
+    assert _call_value("KNOWN_VERSIONS") == stored
+
+
+def _call_value(name: str) -> Any:
+    code = "const t = require(process.argv[1]); console.log(JSON.stringify(t[process.argv[2]]));"
+    done = subprocess.run(
+        [_node(), "-e", code, str(TRACE), name], capture_output=True, text=True, check=True
+    )
+    return json.loads(done.stdout)
+
+
+def test_the_stale_multiplier_is_retried_until_it_is_read():
+    """起動時に表示設定を読めなくても、refresh ごとに読み直す（ずっと判定不能のままにしない）。"""
+    script = SCRIPT.read_text(encoding="utf-8")
+    refresh = script[script.index("async function refresh()") :]
+    refresh = refresh[: refresh.index("\n}\n")]
+    retry = refresh.index("page.traceStaleFactor === null) await loadScale();")
+    assert retry < refresh.index('fetchJson("/api/v1/control/latest")')
+
+
+def test_an_unjudged_trace_also_gets_the_banner():
+    """古さを判定できない trace も帯で目立たせる（判定できない ≠ 新しい）。"""
+    script = SCRIPT.read_text(encoding="utf-8")
+    banner = script[script.index("function renderTraceBanner(") :]
+    banner = banner[: banner.index("\n}\n")]
+    assert 'status.freshness.state !== "fresh"' in banner
+    assert "新しさを確かめられません" in banner
+
+
+def test_an_alert_from_a_non_fresh_trace_is_not_shown_as_current():
+    script = SCRIPT.read_text(encoding="utf-8")
+    render = script[script.index("function renderControl(") :]
+    render = render[: render.index("\n}\n")]
+    assert "最後に記録された tick の状態です" in render
+
+
+def test_the_mock_mode_does_not_say_loading_forever():
+    script = SCRIPT.read_text(encoding="utf-8")
+    absence = script[script.index("function controlAbsence(") :]
+    absence = absence[: absence.index("\n}\n")]
+    assert absence.index("page.mockName") < absence.index("読み込み中")

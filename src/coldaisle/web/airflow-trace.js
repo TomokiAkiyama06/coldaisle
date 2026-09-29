@@ -20,7 +20,10 @@
 
 (function (root) {
   // 版ごとに**初めて現れた**欄（control/schema.py の SCHEMA_VERSION の説明）。
-  // v11 は決定記録 0073 §2.5 の Air Balance の記録（`air_balance` と `zones.*.applied_demand`）
+  // **schema.py にある版だけを知っている版にする。** Air Balance の記録（決定記録 0073 §2.5、
+  // `air_balance` と `zones.*.applied_demand`）は、次の版を実装する PR（#81 系）が実際の
+  // ControlTick の fixture と一緒にここへ足す。版の番号は先にマージされた PR で決まる
+  // （0064 §2.9 / 0071 §2.5）ため、推測で先取りしない。それまで v11 以降は「未対応の版」
   const SINCE = {
     workload_regime: 2,
     supervisor: 3,
@@ -29,10 +32,8 @@
     runtime: 8,
     safety_provenance: 9,
     registry: 10,
-    air_balance: 11,
-    applied_demand: 11,
   };
-  const KNOWN_VERSIONS = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11];
+  const KNOWN_VERSIONS = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
 
   const NOT_IN_VERSION = "この版の記録には無い";
   const ZONE_KEYS = ["front", "rear", "top"];
@@ -91,15 +92,6 @@
     tick_overrun: "制御の周期に間に合わない",
     config_invalid: "制御の設定が不正",
   };
-  const BALANCE_STATE = {
-    balanced: { text: "釣り合っている", tone: "ok" },
-    intake_heavy: { text: "吸気が多い", tone: "warn" },
-    exhaust_heavy: { text: "排気が多い", tone: "warn" },
-    thermally_limited: { text: "熱で制限", tone: "bad" },
-    unknown: { text: "推定できない", tone: "na" },
-    disabled: { text: "使っていない（未校正）", tone: "na" },
-  };
-
   function has(version, field) {
     return version >= SINCE[field];
   }
@@ -195,16 +187,33 @@
   }
 
   /**
+   * v1〜v4 の信頼度と OOD。**Gate の判断（`model_gate`）はこの版に無い**が、ControlState は
+   * v1 から `model_confidence` / `model_ood` を持つ（Learned MPC を適用した tick なら値が入りうる）。
+   * 値は出すが、Gate の裏づけが無いことを添える。**OOD が true なら隠さない。**
+   */
+  function legacyGateChips(state) {
+    const unattested = "裏づけなし・v4 以前の記録";
+    const noGate = `値の記録なし（Gate の判断は${NOT_IN_VERSION}）`;
+    const confidence = number(state.model_confidence);
+    const confidenceChip =
+      confidence === null
+        ? { k: "予測の信頼度", v: noGate, tone: "absent" }
+        : { k: "予測の信頼度", v: `${pct(confidence)}（${unattested}）`, tone: "warn" };
+    const oodChip =
+      state.model_ood === true
+        ? { k: "想定外の状態", v: `あり（${unattested}）`, tone: "bad" }
+        : state.model_ood === false
+          ? { k: "想定外の状態", v: `なし（${unattested}）` }
+          : { k: "想定外の状態", v: noGate, tone: "absent" };
+    return [confidenceChip, oodChip];
+  }
+
+  /**
    * 信頼度と想定外の状態（OOD）。v5 以降は Gate の判断（`model_gate`）から。
    * **裏づけの無い（attested でない）数値は出さない**（schema の ModelGateDecision と同じ規律）。
    */
   function gateChips(version, body) {
-    if (!has(version, "model_gate")) {
-      return [
-        { k: "予測の信頼度", v: NOT_IN_VERSION, tone: "absent" },
-        { k: "想定外の状態", v: NOT_IN_VERSION, tone: "absent" },
-      ];
-    }
+    if (!has(version, "model_gate")) return legacyGateChips(body.state);
     const gate = body.model_gate;
     if (!isObject(gate)) {
       return [
@@ -354,12 +363,8 @@
           }`;
       if (!ok) fanTone = "bad";
     }
-    if (has(version, "applied_demand")) {
-      const applied = number(record.applied_demand);
-      fanDetail += applied === null ? " ・ 適用した出力：記録なし" : ` ・ 適用した出力 ${pct(applied)}`;
-    } else {
-      fanDetail += ` ・ 適用した出力：${NOT_IN_VERSION}`;
-    }
+    // 適用した出力（applied_demand）を持つ版はまだ無い（上の SINCE の説明）
+    fanDetail += ` ・ 適用した出力：${NOT_IN_VERSION}`;
     if (zoneFaults.length) fanDetail += ` ・ ${zoneFaults.map(faultText).join(" ・ ")}`;
     steps.push({ title: "ファン", value: fanValue, detail: fanDetail, tone: zoneFaults.length ? "bad" : fanTone });
 
@@ -379,20 +384,12 @@
     };
   }
 
-  /** Air Balance（v11。決定記録 0073 §2.5 (b)）。v10 以前は「この版の記録には無い」。 */
-  function balanceFromTrace(version, body) {
-    if (!has(version, "air_balance")) return { absent: NOT_IN_VERSION };
-    const balance = body.air_balance;
-    if (!isObject(balance)) return { absent: UNKNOWN_VALUE };
-    const state = label(BALANCE_STATE, balance.state, { text: UNKNOWN_VALUE, tone: "warn" });
-    const ratio = number(balance.balance_ratio);
-    return {
-      ratio,
-      state: state.text,
-      tone: state.tone,
-      position: null, // 目標帯は air-balance.yaml にあり trace に無い。帯の上の位置は描かない
-      thermal: balance.thermal_limited === true,
-    };
+  /**
+   * Air Balance。**いま知っている版（v1〜v10）には記録が無い**ので「この版の記録には無い」。
+   * 記録を持つ版の読み取りは、その版を実装する PR が fixture と一緒に足す（上の SINCE の説明）。
+   */
+  function balanceFromTrace() {
+    return { absent: NOT_IN_VERSION };
   }
 
   function alertFromTrace(body, zones, faults) {
@@ -487,7 +484,7 @@
         alert: alertFromTrace(body, zones, faults),
         chips,
         zones,
-        balance: balanceFromTrace(version, body),
+        balance: balanceFromTrace(),
       },
     };
   }

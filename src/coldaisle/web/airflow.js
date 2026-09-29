@@ -415,6 +415,10 @@ function decisionLabel() {
  */
 function controlAbsence() {
   const status = page.controlStatus;
+  if (page.mockName) {
+    // 模擬データのときは API を読まない。「読み込み中」と言い続けない
+    return { word: "模擬データなし", note: "模擬データを読み込めないため、制御の状態を表示していません。" };
+  }
   if (page.controlError) {
     return { word: "取得できない", note: `制御の判断記録（/api/v1/control/latest）を取得できません: ${page.controlError}。` };
   }
@@ -437,13 +441,23 @@ function controlAbsence() {
   };
 }
 
-/** trace が古いときの帯。**古い記録を、いまの状態のように見せない**（0071 §2.6）。 */
+/**
+ * trace が新しいと言えないときの帯。**古い記録を、いまの状態のように見せない**（0071 §2.6）。
+ * 古さを判定できない（unknown: 表示設定を読めない・周期を持たない版・時計が戻った）ときも出す。
+ * 判定できないことは「新しい」ことではないため。
+ */
 function renderTraceBanner() {
   const status = page.controlStatus;
-  if (!page.mockName && status && status.status !== "none" && status.freshness.state === "stale") {
+  const shown = !page.mockName && status && ["ok", "unreadable"].includes(status.status);
+  if (shown && status.freshness.state === "stale") {
     showBanner(
       "trace-banner",
       `制御の判断記録が古い（${status.freshness.text}）。制御の状態は最後に記録された tick のもので、いまの状態とは限りません。`
+    );
+  } else if (shown && status.freshness.state !== "fresh") {
+    showBanner(
+      "trace-banner",
+      `制御の判断記録の新しさを確かめられません（${status.freshness.text}）。制御の状態は最後に記録された tick のもので、いまの状態とは限りません。`
     );
   } else {
     showBanner("trace-banner", null);
@@ -492,8 +506,13 @@ function renderControl() {
   const alert = control && control.alert;
   const box = document.getElementById("control-alert");
   if (alert) {
+    // 新しいと言えない trace の緊急・故障を、いまのアラートとして読ませない
+    const notCurrent =
+      !page.mockName && !(freshness && freshness.state === "fresh")
+        ? `最後に記録された tick の状態です（${freshness ? freshness.text : "新しさ不明"}）。いまの状態とは限りません。`
+        : "";
     document.getElementById("control-alert-text").textContent = alert.text;
-    document.getElementById("control-alert-note").textContent = alert.note || "";
+    document.getElementById("control-alert-note").textContent = [notCurrent, alert.note].filter(Boolean).join(" ");
     box.classList.remove("hidden");
   } else {
     box.classList.add("hidden");
@@ -929,6 +948,9 @@ async function refresh() {
   if (page.mockName || page.refreshing) return;
   page.refreshing = true;
   try {
+    // 起動時に表示設定を読めなかったら、読めるまで毎回読み直す（API の再起動直後など）。
+    // 読めないままだと trace の古さを判定できず、止まった制御の記録を出し続けてしまう
+    if (!page.scale || page.traceStaleFactor === null) await loadScale();
     // **片方の失敗でもう片方の応答を捨てない**（Codex P2）。それぞれを別々に反映し、失敗は別々に言う
     const [latest, health, control] = await Promise.allSettled([
       fetchJson("/api/v1/latest"),
