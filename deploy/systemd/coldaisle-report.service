@@ -1,0 +1,30 @@
+# 前日の日次レポート（#25 / 決定記録 0017）のテンプレート。
+#
+# 1回走って終わる。起動は coldaisle-report.timer が行う。
+# 集計元は1分ロールアップなので、coldaisle-rollup のあとに走らせる（0017 §2.1）。
+
+[Unit]
+Description=coldaisle daily report
+# 平常時は時刻の差で rollup が先に終わる。停止をまたいで両タイマー（Persistent=true）が
+# 起動直後に同時に追いついたときも、rollup の完了を待ってから走らせる。
+# After= は順序だけで起動はしないので、Wants= で report の起動時に rollup を必ず queue する
+# （両タイマーが別々に queue すると、report が先に走り古い集計を読むことがある）
+Wants=coldaisle-rollup.service
+After=coldaisle-rollup.service
+
+[Service]
+Type=oneshot
+User=coldaisle
+Group=coldaisle
+WorkingDirectory=/opt/coldaisle
+StateDirectory=coldaisle
+StateDirectoryMode=0750
+EnvironmentFile=-/etc/coldaisle/coldaisle.env
+ExecStart=/opt/coldaisle/.venv/bin/coldaisle-report --db /var/lib/coldaisle/coldaisle.db
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=coldaisle-report
+
+NoNewPrivileges=yes
+PrivateTmp=yes
