@@ -35,7 +35,12 @@ from pydantic import (
 )
 
 from coldaisle.clock import Clock, WallClock
-from coldaisle.control.schema import AuthorityStage
+from coldaisle.control.schema import (
+    AuthorityStage,
+    RegistryPointerChange,
+    RegistryProductionPointer,
+    RegistryProvenance,
+)
 
 MODEL_REGISTRY_SCHEMA_VERSION: Literal[3] = 3
 """**書き出す** registry schema version。"""
@@ -446,6 +451,37 @@ class RegistrySnapshot(_Frozen):
             for event in self.audit
             if event.event in {RegistryEventKind.PROMOTED, RegistryEventKind.ROLLED_BACK}
         )
+
+    def trace_provenance(self) -> RegistryProvenance:
+        """decision trace の各 tick へ載せる、この snapshot の版（決定記録 0071 §2.5）。
+
+        `revision` と、**全 kind** の production pointer（無ければ `None`）、その pointer を
+        成立させた最後の promotion / rollback の `trace_metadata()` を返す。path を含まない。
+
+        **snapshot から読むだけで、registry にも過去の trace にも触れない。** 制御デーモンは
+        起動時に持った snapshot からこれを1度作り、毎 tick 同じ値を載せる。
+        """
+        established: dict[ArtifactKind, RegistryAuditEvent] = {}
+        for event in self.pointer_changes:
+            established[event.artifact.kind] = event
+        production: dict[str, RegistryProductionPointer] = {}
+        for kind in ArtifactKind:
+            slot = self.production.get(kind)
+            if slot is None:
+                production[kind.value] = RegistryProductionPointer(
+                    artifact_sha256=None, established_by=None
+                )
+                continue
+            change = established.get(kind)
+            if change is None or change.artifact != slot.active:
+                # snapshot の検証（audit の再生）が成り立っていれば起きない。起きたなら
+                # 「どの変更で成立したか言えない pointer」を trace に載せない。
+                raise ValueError("production pointer を成立させた audit event が見つからない")
+            production[kind.value] = RegistryProductionPointer(
+                artifact_sha256=self.artifacts[slot.active.key].metadata.sha256,
+                established_by=RegistryPointerChange.model_validate(change.trace_metadata()),
+            )
+        return RegistryProvenance(revision=self.revision, production=production)
 
     @field_validator("artifacts", mode="before")
     @classmethod

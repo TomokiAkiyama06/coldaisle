@@ -78,6 +78,7 @@ from coldaisle.control.schema import (
     OperatingMode,
     PerZone,
     Reason,
+    RegistryProvenance,
     SafetyProvenance,
     SafetyState,
     ShadowRecord,
@@ -481,6 +482,7 @@ class ControlLoop:
         telemetry: TelemetrySource,
         clock: Clock,
         monotonic: MonotonicClock,
+        registry: RegistryProvenance,
         mode_source: OperatingModeSource | None = None,
         supervisor: SupervisorCoordinator | None = None,
         regime: WorkloadRegimeEstimator | None = None,
@@ -519,6 +521,13 @@ class ControlLoop:
             authority if authority is not None else StaticAuthority()
         )
         self._watchdog: Watchdog = watchdog if watchdog is not None else NullWatchdog()
+        # **起動時に渡された registry の版をそのまま毎 tick 載せる**（決定記録 0071 §2.5）。
+        # loop は registry も過去の trace も読まない。promotion / rollback が trace に現れるのは
+        # それを反映して再起動した最初の tick からで、それが「判断がどの artifact で出たか」の
+        # 記録として正しい。既定値を置かないのは、渡し忘れが「registry を読んでいない」と
+        # 同じ記録になるのを防ぐため（読んでいない構成は `RegistryProvenance.unbound()` を
+        # 明示する）。
+        self._registry = registry
 
         self._ages = _TelemetryAgeTracker()
         self._tick_id = 0
@@ -684,6 +693,8 @@ class ControlLoop:
                 disabled_inputs=safety_decision.disabled_inputs,
                 config_is_provisional=safety_decision.config_is_provisional,
             ),
+            # **tick が使っていた registry の版を毎 tick 残す**（v10。#104 / 決定記録 0071 §2.5）。
+            registry=self._registry,
         )
         recorded, trace_failed = self._record(tick)
         self._log_guard_events(guard_decision)

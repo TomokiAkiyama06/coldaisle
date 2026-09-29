@@ -61,7 +61,7 @@ from coldaisle.control.safety.critical import (
     create_control_runtime_binding,
     create_emergency_control_runtime,
 )
-from coldaisle.control.schema import Zone
+from coldaisle.control.schema import RegistryProvenance, Zone
 from coldaisle.control.shadow.record import ShadowRecorder
 from coldaisle.control.state import ControlStateEstimator
 from coldaisle.control.supervisor.policy import SupervisorCoordinator
@@ -565,6 +565,11 @@ def build(
         telemetry=StoreTelemetrySource(store, frozenset(spec.metric for spec in contract.signals)),
         clock=clock,
         monotonic=monotonic,
+        # **registry を読んでいないことを明示する**（#104 / 決定記録 0071 §2.5）。Learned MPC の
+        # worker を配線していない構成では束縛する artifact が無く、registry の root も
+        # 設定に無い。worker を配線するときは、起動時に読んだ snapshot の
+        # `RegistrySnapshot.trace_provenance()` を渡す（Gate の期待版と同じ snapshot から作る）。
+        registry=RegistryProvenance.unbound(),
         mode_source=StaticOperatingMode(),
         supervisor=SupervisorCoordinator(control.policy.supervisor, clock),
         regime=WorkloadRegimeEstimator(control.policy.workload_regime, catalog, clock),

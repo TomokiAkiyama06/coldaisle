@@ -188,6 +188,16 @@ MemoryErrorで落とさないためである。壊れたYAML・JSONやファイ�
   値が無ければ `None`**。欄ごと消すと「記録されていない」と「起きていない」を区別できない）。
   起動時検証は `RegistryHealthReport.trace_metadata()` で載せられる。0030のdecision traceは
   tick単位の保存なので、registry event用の保存先を足すかは#82側の決定に委ねる（決定記録0062 §2.5）。
+- decision trace への載せ方（決定記録 0071 §2.5 / §5 #7）: registry event用の表は足さない。
+  `ControlTick` v10 の `registry` に、**tickが使っていた** registry の `revision` と、kindごとの
+  production の `artifact_sha256` と、そのpointerを成立させた最後のpromotion / rollbackの
+  `trace_metadata()` を**毎tick**載せる（`RegistrySnapshot.trace_provenance()` が作る。全kindの欄を
+  揃え、productionが無いkindは `None`）。制御loopは起動時に渡された値を写すだけで、registryも
+  過去のtraceも読み直さない。promotion / rollbackがtraceに現れるのは、それを反映して再起動した
+  最初のtickからである。再起動のあいだの変更は、隣り合うtraceの `revision` の飛びとして検出し、
+  全件は `coldaisle-registry audit --pointer-changes` の `registry_revision` で範囲に絞って引く
+  （正本はaudit）。いまの `coldaisle-fand` はregistryを読まない（Learned MPCのworkerを配線して
+  いない）ので、`revision: null`・`production: {}` の塊（`RegistryProvenance.unbound()`）を載せる。
 - #84 / #85 / #89: 各format固有loaderと推論interfaceを実装し、`VerifiedArtifact.payload` だけを
   入力にする。Registry内に任意コード実行経路を追加しない。
 - #86 Learned MPC: `VerifiedArtifact.attestation`（`ArtifactAttestation`）を内部モデルの束縛に使う。

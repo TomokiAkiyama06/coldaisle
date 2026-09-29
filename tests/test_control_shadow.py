@@ -77,7 +77,7 @@ from coldaisle.control.shadow import (
     write_shadow_jsonl,
 )
 from coldaisle.store.models import ControlTraceRecord, Quality
-from test_control_schema import CONTROL_TICK_RUNTIME, SAFETY_PROVENANCE
+from test_control_schema import CONTROL_TICK_RUNTIME, REGISTRY_PROVENANCE, SAFETY_PROVENANCE
 from test_fallback_controller import (
     assessment_for,
     fallback_proposal,
@@ -252,6 +252,7 @@ def tick_with(
         supervisor=supervisor,
         runtime=CONTROL_TICK_RUNTIME,
         safety_provenance=SAFETY_PROVENANCE,
+        registry=REGISTRY_PROVENANCE,
     )
 
 
@@ -546,6 +547,7 @@ def test_invariant_1_g_a_shadow_record_is_refused_in_modes_people_drive() -> Non
             shadow=record.model_copy(update={"applied_controller": None}),
             runtime=CONTROL_TICK_RUNTIME,
             safety_provenance=SAFETY_PROVENANCE,
+            registry=REGISTRY_PROVENANCE,
         )
     # 記録器自身も、その mode では何も作らない。
     assert (
@@ -1417,6 +1419,7 @@ def solved_shadow_tick(*, applied: float, ts_ms: int = SCORED_ACTION_TS_MS) -> C
         shadow=record,
         runtime=CONTROL_TICK_RUNTIME,
         safety_provenance=SAFETY_PROVENANCE,
+        registry=REGISTRY_PROVENANCE,
     )
 
 
@@ -1435,6 +1438,7 @@ def follow_up_tick(*, tick_id: int, ts_ms: int, applied: float) -> ControlTick:
         zones=zone_records(applied),
         runtime=CONTROL_TICK_RUNTIME,
         safety_provenance=SAFETY_PROVENANCE,
+        registry=REGISTRY_PROVENANCE,
     )
 
 
@@ -1880,6 +1884,7 @@ def test_the_counterfactual_artifact_comes_from_the_gate_not_the_assessment() ->
         shadow=record,
         runtime=CONTROL_TICK_RUNTIME,
         safety_provenance=SAFETY_PROVENANCE,
+        registry=REGISTRY_PROVENANCE,
     )
     assert tick.model_gate is not None
     assert tick.model_gate.artifact_sha256 == item.artifact_sha256
