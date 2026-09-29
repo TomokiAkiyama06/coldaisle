@@ -169,27 +169,42 @@ decision trace（`ControlTick`）は、制御デーモンが tick ごとに SQLi
   `NOT NULL UNIQUE` の列は `ALTER TABLE ADD COLUMN` で足せないので、表を作り直して移す。
   既存の行には `(ts_ms, tick_id)` の順に 1 から振る（移行前の記録の順は残っていないので、これが取れる最善）
 - **`control_trace_prune` を1行だけの表として足す。** 列は `pruned_through_seq`（消した行の `seq` の上限。
-  初期値 0）と `pruned_before_ms`（これより前の `ts_ms` の行は消したことがある。初期値 `NULL`）。
-  書くのは `coldaisle-rollup` だけ
+  初期値 0）と `pruned_before_ms`（これより前の `ts_ms` の行は消したことがある。初期値 `NULL`）と
+  `legacy_until_ms`（移行前の削除で欠けたかもしれない範囲の上限。migration が1回だけ書き、以後は変えない）。
+  `pruned_*` を書くのは `coldaisle-rollup` だけ
+  - `legacy_until_ms` は、migration を適用した時点の壁時計と、移行前から残る行の `MAX(ts_ms)` の大きいほう
+    （表が空なら壁時計）。移行前の削除がどこまで消したかは記録が無く、残っている最小の `ts_ms` から
+    完全性を導けない（時計が戻った後に書かれた行が最小になると、その後ろに移行前の削除で消えた範囲が
+    挟まりうる）。そこで、移行前の期間はまとめて「欠けているかもしれない」と扱う
 - **`seq` は書き手（Control Logging）が挿入と同じ文で振る。** 値は
   `max(表の MAX(seq), pruned_through_seq) + 1`。表が全部消えても `pruned_through_seq` が残るので、`seq` は
   巻き戻らず、古い cursor が新しい行を指すことはない。rowid の `AUTOINCREMENT` と同じ性質を、主キーを
   変えずに得るための形である（§4 O）。書き手は1つで、SQLite の書き込みは直列なので重ならない。
   `INSERT OR IGNORE` で捨てた挿入の番号は使わないので、`seq` は欠番を持ちうる。**連続を仮定しない**
-- **`coldaisle-rollup` の削除は `seq` の先頭の連続した範囲にする。** 同じ書き込みトランザクションで、
-  `S = MIN(seq)`（`ts_ms >= cutoff` の行。無ければ表の `MAX(seq) + 1`）を求め、`seq < S` の行を消し、
-  `pruned_through_seq = max(旧値, S - 1)`、`pruned_before_ms = max(旧値, cutoff)` にする
-  - これで `ts_ms >= pruned_before_ms` の行は1件も消えていない（`ts_ms >= cutoff` の行はどれも `seq >= S`）。
-    §2.2 の `before_retained` は取りこぼしなく立つ
-  - 時計が戻った後に書かれた行は、`ts_ms < cutoff` でも、それより前に書かれた `ts_ms >= cutoff` の行が
-    残っているあいだは消えない。保持期間の内側の行を先に消すより、期限を過ぎた行を少し長く残すほうを選ぶ。
-    0030 §5 の1項目め（期限を過ぎた record を消す）は、この遅れを含めて満たすとみなす
-  - 削除の実装がいまの `ts_ms < cutoff` から変わるので、`rollup` の JSON ログに、期限を過ぎたが残した行の
-    件数を足し、時計の異常で削除が進まないことに運用者が気付けるようにする（§3）
-- API の `retained_from_ms` は `pruned_before_ms` を返す。`NULL`（移行後にまだ一度も消していない）のときは
-  表の最小の `ts_ms`（表が空なら `null`）を返す。移行前の削除は記録が無く分からないので、残っている最古の
-  行より前は欠けている可能性があるとみなす。最初の `rollup` の後は、移行前の削除も今回の `cutoff` より前に
-  収まる（保持日数を移行前より延ばしていない限り）
+- **`coldaisle-rollup` の削除は、いまと同じ `ts_ms < cutoff` の行とする。** 同じ書き込みトランザクションで、
+  消す行の `MAX(seq)` を `D`（消す行が無ければ旧値）として `ts_ms < cutoff` の行を消し、
+  `pruned_through_seq = max(旧値, D)`、`pruned_before_ms = max(旧値, cutoff)` にする
+  - 0030 §5 の1項目め（期限を過ぎた record を消す。FINAL で確定）は、時計の異常があっても遅れずにそのまま満たす。0030 を
+    弱めないので、Supersedes は要らない
+  - `ts_ms >= pruned_before_ms` の行は1件も消えていない（消すのは `ts_ms < cutoff <= pruned_before_ms` の
+    行だけ）。§2.2 の `before_retained` は取りこぼしなく立つ
+  - 消した行はどれも `seq <= pruned_through_seq`。`after >= pruned_through_seq` の読み手にとって未読の行は
+    1件も消えておらず、`after < pruned_through_seq` の読み手は §2.2 の 409 で読み直す
+  - 消す範囲を `seq` の先頭の連続した範囲に限る案は採らない（§4 Q）。時計が一時的に未来へ跳んで書かれた
+    行が1件あるだけで、その `ts_ms` に実時間が追いつくまで削除が止まり、表が際限なく育つ
+  - 時計が戻った後は、`seq <= pruned_through_seq` でも消えずに残る行（`ts_ms >= cutoff`）がありうる。
+    その範囲を読んでいた読み手は 409 になり読み直す。欠けていないのに読み直させることはあるが、
+    欠けたのに黙って続けることは無い
+  - 時計の異常に運用者が気付けるよう、`rollup` の JSON ログに、`ts_ms` が `rollup` の時刻より未来の行の
+    件数を足す（§3）
+- API の `retained_from_ms` は `max(pruned_before_ms, legacy_until_ms)`（`pruned_before_ms` が `NULL` なら
+  `legacy_until_ms`）を返す。移行前の期間を読む要求は、`rollup` の `cutoff` が `legacy_until_ms` を越えるまで
+  `before_retained: true` になる。保持期間ぶん運用すれば、移行前の期間は保持期間の外へ出て、この扱いは
+  自然に消える
+  - 残る限界: 移行前に、時計が `legacy_until_ms` より先へ進んだ状態で削除が走っていた場合、その削除で
+    消えた範囲は `legacy_until_ms` より後ろにかかりうる。これはストアに痕跡が残らず、API からは検出できない。
+    migration を適用する前に時計の異常が分かっているなら、運用者は `legacy_until_ms` を手で後ろへ
+    ずらしてよい（後ろへずらすのは常に安全側。前へは戻さない）
 - Offline Evaluation が使う `SqliteStore.control_traces` の `ts_ms` 順の読み出しは変えない。`seq` は読み取り API の
   並びと cursor のためのもので、判断の時刻の意味は `ts_ms` のまま
 
@@ -317,7 +332,8 @@ decision trace（`ControlTick`）は、制御デーモンが tick ごとに SQLi
 | 保持期間の境界の近くを読むと、`coldaisle-rollup` の後で 409 になり読み直しになる | 消えたかもしれない列を完全に見せるより、欠けたことを伝えるほうを選ぶ。409 の応答に読み直す起点（`retained_from_ms`）を入れる（§2.2） |
 | 境界より前から読むと、1ページ目から `before_retained: true` になる。導入直後や移行直後は「記録していない」期間も欠けている可能性として出る | 消えた証拠を「tick が無かった」と見せるより、欠けている可能性を明示するほうを選ぶ（§2.2 / §2.2a） |
 | `seq` と `control_trace_prune` を足す migration が要り、表を作り直す | 主キーと `INSERT OR IGNORE` は変えないので、0030 §2 の契約と書き手の挙動は変わらない。壁時計が戻っても行を飛ばさない並びは、単調な挿入の番号でしか得られない（§4 N / O） |
-| 時計が戻ると、期限を過ぎた行の削除が遅れる | 保持期間の内側の行を先に消さないための代償。`rollup` のログに残した件数を出す（§2.2a） |
+| 時計が戻った後は、残っている行を読んでいても 409 になり読み直しになることがある | 欠けたのに黙って続けるより、欠けていないのに読み直させるほうを選ぶ。削除は `ts_ms < cutoff` のままなので、時計の異常で表が育ち続けることは無い。`rollup` のログに未来の `ts_ms` の行の件数を出す（§2.2a） |
+| 移行前の期間は、保持期間ぶん運用するまで `before_retained: true` になる | 移行前の削除の範囲は記録が無く分からない。残っている最小の `ts_ms` から完全性を言うと、時計が戻った場合に欠けた範囲を「残っている」と見せる（§2.2a） |
 | 2ページ目以降に `window` を使えない | 1ページ目の応答が `from_ms` / `to_ms` を返すので、それを渡すだけでよい。黙って行が飛ぶより、422 で気付けるほうを選ぶ（§2.2） |
 | API が trace を検証し直さないので、壊れた意味の trace も返す | 書き手は制御デーモンだけで、保存時に型を通っている。SQLite の CHECK が JSON object であることを保証する。読み手は `schema_version` で分岐する |
 | 古さの判定が API（`/health`）と画面で別の場所にある | `/control/latest` は `age_ms` と周期（`body.runtime`）を必ず返し、判定の倍数は設定で1か所に置く |
@@ -344,6 +360,8 @@ decision trace（`ControlTick`）は、制御デーモンが tick ごとに SQLi
 | **N. 主キー `(ts_ms, tick_id)` を cursor にし、`/control/latest` も `ts_ms` の最大で選ぶ** | `ts_ms` は壁時計で、時刻合わせで戻る（`clock.py`）。読んでいる途中に戻ると、新しい行が cursor より前に並んで永久に飛ばされる。`/control/latest` も時計が追いつくまで戻る前の tick を返す |
 | **O. 表を rowid 付きにして rowid（`AUTOINCREMENT` なし）を cursor にする** | 表が全部消えると rowid が 1 から振り直され、古い cursor より小さい番号の新しい行を飛ばす。`AUTOINCREMENT` には `INTEGER PRIMARY KEY` が要り、0030 §2 の主キーを変えることになる |
 | **P. 1ページ目は境界を見ず、2ページ目以降だけ 409 にする** | 1ページ目の `from` が既に消えた範囲にかかっていても、残りの行と `has_more: false` だけが返り、「消えた」と「tick が無かった」を区別できない |
+| **Q. 削除を `seq` の先頭の連続した範囲に限る（`ts_ms >= cutoff` の最小の `seq` より前だけを消す）** | 時計が一時的に未来へ跳んで書かれた行が1件あると、その `ts_ms` に実時間が追いつくまで何も消せず、表が際限なく育つ。0030 §5 の1項目め（期限を過ぎた record を消す）を弱めることにもなる。`pruned_through_seq` を消した行の `MAX(seq)` にすれば、先頭に限らなくても 409 の判定は取りこぼさない（§2.2a） |
+| **R. 移行後の `retained_from_ms` を、残っている行の最小の `ts_ms` から始める** | 移行前に時計が戻った後の行が最小になると、その後ろに移行前の削除で消えた範囲が挟まっていても `before_retained: false` を返す。移行前の期間はまとめて不明として扱う（§2.2a の `legacy_until_ms`） |
 
 ---
 
@@ -358,7 +376,7 @@ decision trace（`ControlTick`）は、制御デーモンが tick ごとに SQLi
 | 5 | LLM 向けの集計ツール（`bound_by` / fault / fallback の理由の件数など）の形 | 別の決定記録（0015 / 0018 の続き） |
 | 6 | `RegistryHealthReport.trace_metadata()`（起動時検証の結果）も `registry` の塊に入れるか | #104 の実装 PR。入れるなら同じ版上げに含める |
 | 7 | §2.5 の「tick が使っていた pointer」と `revision` の飛びの検出で、#104 の受入基準「promotion / rollback が decision trace へ残る」を満たすとみなすか。満たさないなら、起動した tick に直前の trace の `revision` 以降の pointer 変更の metadata をすべて載せる（制御デーモンが起動時にストアの最新 trace を読むことになる） | 本記録の承認時に人間が判断する |
-| 11 | §2.2a の migration の番号と、`rollup` のログに足す件数の項目名 | #106 の実装 PR |
+| 11 | §2.2a の migration の番号、`legacy_until_ms` を migration で求める方法、`rollup` のログに足す件数の項目名 | #106 の実装 PR |
 | 8 | `requirements.md` に FR を足す番号と文言、`api-contract.md` の表 | #106 の実装 PR（本記録は文書を書き換えない） |
 | 9 | SQLite 外への export（0030 §5 の2項目め） | #90 / #91。本記録は扱わない |
 | 10 | Workspace（#60）からエアフロー画面へのリンク（0046 §5 #5） | #60 |
