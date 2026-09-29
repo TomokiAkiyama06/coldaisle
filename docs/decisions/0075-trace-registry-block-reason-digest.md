@@ -1,7 +1,7 @@
 # 決定記録 0075: decision trace の registry の塊では、自由記述の `reason` を digest にする
 
 - **種別**: Decision Record
-- **Status**: Proposed
+- **Status**: FINAL（2026-09-29、リポジトリ所有者が承認）
 - **Date**: 2026-09-29
 - **Supersedes**: [`0071-control-trace-read-api.md`](0071-control-trace-read-api.md) §2.5 のうち、
   pointer を成立させた変更の `RegistryAuditEvent.trace_metadata()` を**そのまま**（自由記述の
