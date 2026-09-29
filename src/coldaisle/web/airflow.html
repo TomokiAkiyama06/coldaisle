@@ -13,10 +13,12 @@
     （モード変更の入り口は coldaisle-fand のローカル Unix ソケットだけ。決定記録 0028 §2.2）
   - 外部への参照を持たない（オフラインでも見える。決定記録 0011 §2.1）
   - 模擬データは `?mock=normal` / `?mock=override` のときだけ別ファイルから読み、画面全体で言う
+  - 制御の状態は decision trace（GET /api/v1/control/latest）から描く。版の解釈は airflow-trace.js だけ（決定記録 0071 §2.3）
 -->
 <div id="mock-banner" class="mock-banner hidden" role="status"></div>
 <div id="banner" class="banner hidden" role="alert"></div>
 <div id="api-banner" class="banner hidden" role="alert"></div>
+<div id="trace-banner" class="banner hidden" role="alert"></div>
 <div id="control-alert" class="control-alert hidden" role="alert">
   <span id="control-alert-text"></span>
   <span id="control-alert-note" class="control-alert-note"></span>
@@ -198,6 +200,7 @@
 </main>
 
 <script src="airflow-status.js"></script>
+<script src="airflow-trace.js"></script>
 <script src="airflow.js"></script>
 </body>
 </html>

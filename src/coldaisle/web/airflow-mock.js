@@ -2,8 +2,9 @@
 //
 // **実機の値でも実際の制御の状態でもない。** `airflow.html?mock=normal|override|throttle` のときだけ
 // airflow.js がこのファイルを読み込む。実データの表示ではこのファイルを読まない。
-// 制御の状態（運転モード・決め手・推定風量など）は、制御の判断記録（#74 / #82）を読める
-// ようになるまで画面の確認に使うための仮の値。値はデザイン（Airflow / Airflow-Override）に合わせた。
+// 制御の状態（運転モード・決め手・推定風量など）は、画面の見え方を実機・制御デーモンなしで
+// 確かめるための仮の値。実データの表示では decision trace（/control/latest）を airflow-trace.js が
+// 同じ形に変換する（決定記録 0071）。値はデザイン（Airflow / Airflow-Override）に合わせた。
 "use strict";
 
 (function () {
