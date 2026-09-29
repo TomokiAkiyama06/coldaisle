@@ -1,7 +1,7 @@
 # 決定記録 0074: 運転中の Supervisor decision を Shadow 台帳へ流す配線と、RL episode 結果を Offline Evaluation の arm にする接続形式
 
 - **種別**: Decision Record
-- **Status**: Proposed
+- **Status**: FINAL（2026-09-29、リポジトリ所有者が承認）
 - **Date**: 2026-09-29
 - **Supersedes**: なし
 - **関連**: [0028](0028-fan-control-contracts.md) §2.2 / §2.3 /
@@ -389,7 +389,7 @@ shadow で比べられる**。証拠の収集は止まらない。
 
 ## 5. 未決事項
 
-- **所有者の承認が要る**（Status: Proposed）。とくに次の4点は所有者に選んでほしい
+- 次の5点は、2026-09-29 に所有者が本文（推奨案）のとおり承認した（Status: FINAL）
   1. 台帳を制御プロセスの外（CLI）に置くか、in-loop にするか（§2.1。推奨は外）
   2. 台帳の鍵を `(ts_ms, tick_id)` に変え、設定の食い違う期間を run ごと拒否するか（§2.1）
   3. episode の結果を別の report 型にするか、`EvaluationReport` v3 の第3名前空間にするか（§2.2。推奨は別の型）
