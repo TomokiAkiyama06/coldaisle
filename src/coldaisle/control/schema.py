@@ -1906,6 +1906,16 @@ class ControlTick(_Frozen):
             if zone_record.estimated_flow != flow:
                 # zone ごとに突き合わせるので、Rear と Top の入れ替わりも検出できる。
                 raise ValueError(f"{zone.value}: estimated_flow を air_balance の q と揃える")
+            hardware = zone_record.hardware
+            confirmed = hardware is not None and hardware.write_ok and hardware.readback_ok
+            if confirmed and zone_record.applied_demand is None:
+                # FanHardwareResult と同じ同値関係（書けて読み戻せた ⇔ applied がある）を
+                # v11 の trace でも守る（codex #4134968263）。欠けを許すと、確認済みの zone を
+                # 「書き込みを確認できていない」と読ませてしまう。v10 以前は欄が無いので見ない。
+                raise ValueError(
+                    f"{zone.value}: write と readback を確認できた v11 の zone には"
+                    " applied_demand が要る"
+                )
             if zone_record.applied_demand is None and flow is not None:
                 raise ValueError(f"{zone.value}: applied demand の無い zone に風量を残さない")
             if flow is not None and any(

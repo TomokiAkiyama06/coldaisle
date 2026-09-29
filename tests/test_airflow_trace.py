@@ -416,6 +416,8 @@ def test_v11_a_zone_without_an_applied_demand_has_no_value_not_no_field():
     body = _body(11)
     body["zones"]["top"].pop("applied_demand")
     body["zones"]["top"]["estimated_flow"] = None
+    # 書けて読み戻せた zone は applied_demand を必ず持つので、読み戻しの不一致を置く
+    body["zones"]["top"]["hardware"]["readback_ok"] = False
     record = body["air_balance"]
     record.update(
         q_top=None,

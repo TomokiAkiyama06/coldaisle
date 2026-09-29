@@ -1,11 +1,12 @@
 # Control Config
 
-#103 は Fan Control の設定を `fan-hardware.yaml`、`safety.yaml`、
-`fan-policy.yaml` の3ファイルで一括検証する。
+Fan Control の設定は `fan-hardware.yaml`、`safety.yaml`、`fan-policy.yaml`、
+`air-balance.yaml` の**4ファイル**で一括検証する（#103 の3ファイルに、#81 で
+`air-balance.yaml` を加えた。決定記録 0033 / 0073）。**4ファイルとも必須**である。
 
-現時点では実機測定がないため、リポジトリに実運用用の3ファイルは置かない。
+現時点では実機測定がないため、リポジトリに実運用用の4ファイルは置かない。
 仮の hwmon 対応や温度閾値をコミットして実機を作動させないためである。
-`ControlConfig.from_directory()` は3ファイルすべてが揃い、schema version・型・範囲・
+`ControlConfig.from_directory()` は4ファイルすべてが揃い、schema version・型・範囲・
 相互条件を満たす場合にだけ設定を返す。欠損または不正なら、書き込み層へ設定を渡さない。
 #78 はこの例外を Critical Safety の config-invalid failure semantics（書込み対象を特定できなければ
 BIOS制御のまま終了、特定済みなら安全側へ引継ぎ）へ接続するconsumerである。

@@ -463,6 +463,60 @@ def test_an_unconfirmed_write_cannot_carry_an_applied_demand() -> None:
         ControlTick.model_validate_json(json.dumps(payload))
 
 
+def _disabled_tick() -> dict[str, Any]:
+    """未校正で起動した v11（Air Balance を使わず、zone の風量も持たない）。"""
+    payload = _enabled_tick()
+    record = AirBalanceRecord.disabled(
+        model_id=payload["air_balance"]["model_id"],
+        config_sha256=payload["air_balance"]["config_sha256"],
+    )
+    payload["air_balance"] = json.loads(record.model_dump_json())
+    for zone in ("front", "rear", "top"):
+        payload["zones"][zone]["estimated_flow"] = None
+    return payload
+
+
+@pytest.mark.parametrize("make", [_enabled_tick, _disabled_tick])
+@pytest.mark.parametrize("zone", ["front", "rear", "top"])
+def test_a_confirmed_write_in_v11_must_carry_an_applied_demand(make: Any, zone: str) -> None:
+    """書けて読み戻せた v11 の zone は applied_demand を必ず持つ（codex #4134968263）。
+
+    FanHardwareResult と同じ同値関係。Air Balance が無効でも applied は記録する。
+    """
+    payload = make()
+    ControlTick.model_validate_json(json.dumps(payload))
+    payload["zones"][zone].pop("applied_demand")
+    payload["zones"][zone]["estimated_flow"] = None
+    if payload["air_balance"]["status"] == "enabled":
+        # 風量の欠けは Air Balance の記録にも写す（別の検査に落ちないように）
+        payload["air_balance"].update(
+            {f"q_{zone}": None},
+            estimated_intake=None,
+            estimated_exhaust=None,
+            balance_ratio=None,
+            state="unknown",
+        )
+    with pytest.raises(ValidationError, match=f"{zone}: .*applied_demand が要る"):
+        ControlTick.model_validate_json(json.dumps(payload))
+
+    # 確認できなかった zone なら、applied が無いのが正しい形
+    payload["zones"][zone]["hardware"]["readback_ok"] = False
+    tick = ControlTick.model_validate_json(json.dumps(payload))
+    assert tick.zones.get(Zone(zone)).applied_demand is None
+
+
+@pytest.mark.parametrize("version", [1, 8, 10])
+def test_a_legacy_tick_with_a_confirmed_write_needs_no_applied_demand(version: int) -> None:
+    """v1〜v10 には applied_demand の欄が無い。**保存済みの記録はそのまま読める。**"""
+    fixture = Path(__file__).parent / "fixtures" / f"control_tick_v{version}.json"
+    payload = json.loads(fixture.read_text(encoding="utf-8"))
+    for zone in payload["zones"].values():
+        zone["hardware"] = {"pwm_raw": 99, "rpm": 690, "write_ok": True, "readback_ok": True}
+        assert "applied_demand" not in zone
+    tick = ControlTick.model_validate_json(json.dumps(payload))
+    assert all(tick.zones.get(zone).applied_demand is None for zone in Zone)
+
+
 def test_a_disabled_record_carries_no_estimate() -> None:
     record = AirBalanceRecord.disabled(model_id="provisional-air-balance", config_sha256="3" * 64)
     payload = json.loads(record.model_dump_json())

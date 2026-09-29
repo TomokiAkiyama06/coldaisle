@@ -87,7 +87,7 @@ runs:
 |---|---|---|
 | `--db` | `var/coldaisle.db` | decision trace と観測（**読み取り専用で開く**。下記） |
 | `--config` | `config/evaluation.yaml` | 評価設定（percentile・室温帯・不感帯・gate） |
-| `--control-config` | `config` | `fan-hardware.yaml` / `safety.yaml` / `fan-policy.yaml` |
+| `--control-config` | `config` | `fan-hardware.yaml` / `safety.yaml` / `fan-policy.yaml` / `air-balance.yaml`（4ファイルとも必須。#81 / 決定記録 0073） |
 | `--metrics` | `config/metrics.yaml` | ΔT の式（`derived`） |
 | `--acoustic` | なし | `acoustic.yaml`。無ければ acoustic cost は「欠測」として残る |
 

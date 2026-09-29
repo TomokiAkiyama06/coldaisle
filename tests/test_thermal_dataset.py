@@ -1242,6 +1242,11 @@ def _tick_for_schema_version(version: int, *, ts_ms: int, tick_id: int) -> Contr
                 model_id="provisional-air-balance", config_sha256="3" * 64
             ).model_dump_json()
         )
+        # 書けて読み戻せた zone は applied_demand を必ず持つ（FanHardwareResult と同じ同値関係）
+        for zone in raw["zones"].values():
+            hardware = zone.get("hardware")
+            if hardware and hardware["write_ok"] and hardware["readback_ok"]:
+                zone["applied_demand"] = zone["demand"]["effective"]
     if version >= 9:
         # v9も同じく、Critical Safetyの裁定の前提を省いた記録を作れない（#78）
         raw["safety_provenance"] = {
