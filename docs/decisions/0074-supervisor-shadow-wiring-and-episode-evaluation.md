@@ -193,6 +193,7 @@ trace の主キー・#91 の評価器（`EvaluationInputError`「同じ `(ts_ms,
 #### `PolicyEpisodeReport` が持つもの・持たないもの
 
 入力は **`PolicyComparison` 1つ、検証済みの `RlPolicyConfig`**（`rl-policy.yaml`。cost の閾値を取る）、
+**Baseline の Rule policy**（Baseline arm の識別を取る）、
 **RL arm ごとの `certify()` を通した artifact**（識別を取る）だけ。
 同じ条件・同じ episode 群・同じ Learned MPC の有無は 0058 §2.6 で比較にすでに保証されている。
 report は `control/evaluation/episode.py` に置き、`control.rl` の型を**読むだけ**で import する
@@ -214,6 +215,18 @@ arm を artifact へ束縛する。**版の文字列どうしの一致では束�
   1 step でも再現しなければ report を作らない
 - **1対1**: 異なる RL arm に同じ artifact（同じ `payload_sha256`）を当てない。RL arm に対応する artifact が
   欠けている・余っている場合も作らない
+- **Baseline はちょうど1つの Rule arm で、位置は `arms[0]` に固定する。** `PolicyComparison` の schema は
+  2〜8 個の一意な `(policy, policy_version)` を許すだけで、Rule arm が無い・2つ以上ある比較も作れる。
+  そうした比較は Baseline を一意に決められないので、**report を作らない**（どれかを選んで比べない）。
+  `arms[0]` が Rule でない、`arms[1:]` に Rule が居る、のどちらも拒む。`arms[0]` を Baseline とするのは
+  `SupervisorPolicyTrainer.certify()` が学習報告の Baseline arm を `comparison.arms[0]` として照合するのと揃えるためである
+- **Baseline arm は渡した Rule policy へ束縛する。** `rule_policy_identity(rule_policy)`（版と**全 regime の表の digest**）を
+  作り、その版が Baseline arm の `policy_version` と一致し、かつ `rule_policy_table(rule_policy)` の表が
+  Baseline arm の全 episode・全 step の `StepRecord.action` を再現する（`first_unreplayed_step()` が `None`。
+  `certify()` の Baseline 照合と同じ）ことを確かめる。1つでも満たさなければ report を作らない。
+  report には**版だけでなく `RulePolicyIdentity` 全体（`table_sha256` を含む）**を残す。比較の step は
+  episode が訪れた regime の action しか持たないので、版と action だけでは**訪れなかった regime だけが違う
+  同じ版の Rule 表**を区別できない。表の digest を report に持たせることで、§2.3 の照合が比べる相手を持つ
 - arm の `policy_version` は比較が持つラベルとしてそのまま report に写す。**識別（model ID・版・bytes hash）は
   `certified_identity()` からだけ取り**、ラベルから導かない
 
@@ -225,7 +238,7 @@ arm を artifact へ束縛する。**版の文字列どうしの一致では束�
 | `rl-policy.yaml` の digest と `minimum_reward_improvement` の値 | 入力の検証済み `RlPolicyConfig` から |
 | `training_mode` / dynamics の provenance / `safety_model` / `reward_version` / `applied_demand_tolerance` | episode の値。**arm 間で揃っていなければ作らない** |
 | `learned_controller_available` | 比較から導く（欄として受け取らない） |
-| arm ごと: `policy` / `policy_version` / RL なら `SupervisorPolicyIdentity` と表の digest | Rule は版、RL は入力の `certify()` を通した artifact の `certified_identity()` と `manifest.payload_sha256` から（上の表と action の証拠で arm に束縛したもの。`policy_version` はラベルとして写すだけ） |
+| arm ごと: `policy` / `policy_version` / Rule なら `RulePolicyIdentity`（版と表の digest）/ RL なら `SupervisorPolicyIdentity` と表の digest | Rule は入力の Rule policy の `rule_policy_identity()`（上の版と action の照合で Baseline arm に束縛したもの）、RL は入力の `certify()` を通した artifact の `certified_identity()` と `manifest.payload_sha256` から（上の表と action の証拠で arm に束縛したもの。`policy_version` はラベルとして写すだけ） |
 | arm ごと: 安全側の数（絶対上限の超過・floor 不足・範囲外 action・最小 margin） | `EpisodeSafety` の合計と **worst-case episode** |
 | arm ごと: coverage（採点できた step・割合・理由別の内訳・`usable_for_comparison` でない episode 数） | `EpisodeCoverage` |
 | arm ごと: 共通の長さ（episode ごとの全 arm の採点できた step 数の最小）で揃えた reward 平均 | 0058 §2.6 / 0061 §2.7 と同じ規則。**使った長さを欄として残す** |
@@ -290,9 +303,15 @@ supervisor policy について、その参照の出どころはこれまで決�
 - validated 化は **policy 専用の入口 `validate_supervisor_policy()`**（`control/supervisor/artifact.py`。
   0061 §2.6 の `promote_supervisor_policy()` と対になる）だけで行う。入力は report に加えて
   **元の `PolicyComparison`**・検証済みの `rl-training.yaml` / `fan-policy.yaml` / `safety.yaml` / `rl-policy.yaml`・
-  `certify()` を通した artifact・Baseline の Rule policy・validated にする Registry の `ref` と `expected_revision` である。
+  **比較のすべての RL arm について** `certify()` を通した artifact の対応（report の構築と同じく arm の
+  `policy_version` をキーにした対応。1つでも欠けていれば拒む）・その中で **validated にする対象の arm**
+  （対応のキーで名指す）・Baseline の Rule policy・validated にする Registry の `ref` と `expected_revision` である。
+  比較は最大 8 arm を持ちうるので、対象の artifact だけでは他の RL arm の識別と表の digest を作り直せず、
+  report の作り直しが成り立たない。そのため全 arm の artifact を受け取り、対象はその中から別に名指す
   次を確かめてから `ModelRegistry.mark_validated()` へ渡す
-  - **validated にする対象が、渡した `certify()` 済みの artifact そのものである。** `ref` が supervisor policy で、
+  - **validated にする対象が、渡した対応の中で名指した arm の `certify()` 済みの artifact そのものである。**
+    名指した arm が比較の RL arm であり、その gate が `pass` である（§2.3 冒頭の `evaluation_ref()` と同じ）。
+    `ref` が supervisor policy で、
     その `(model_id, version)` が `certified_identity(certified)` の model ID・版と一致する。Registry の
     `expected_revision` の snapshot にその `ref` の記録があり、記録の checksum（`metadata.sha256`）が
     `certified_identity(certified).artifact_sha256` と一致し、artifact から導いた Registry metadata と
@@ -302,17 +321,20 @@ supervisor policy について、その参照の出どころはこれまで決�
     `offline_evaluation_ref` を持ったまま、B の shadow 証拠で `promote_supervisor_policy()` を通る
     （昇格は `offline_evaluation_ref` を検証し直さない）
   - 渡した比較の canonical digest が report の `comparison_sha256` と一致し、**その比較・検証済み
-    `rl-policy.yaml`・渡した `certify()` 済みの artifact から report を作り直した bytes が、渡した report の bytes と一致する**。
+    `rl-policy.yaml`・渡した Rule policy・渡した**全 RL arm の** `certify()` 済みの artifact から report を作り直した
+    bytes が、渡した report の bytes と一致する**（作り直しは §2.2 の構築と同じ関数で行い、Baseline の条件・
+    束縛・1対1 の照合もそこで再び通る）。
     report は集計だけを持ち action の列を持たないので、action の照合は元の比較に対して行う。
     作り直しの一致で、report の識別・数字・gate がその比較から導かれたことを保証する
     （識別だけを差し替えた report を通さない）
   - report の設定の digest が、渡した検証済み設定の digest と一致する（別の設定で作った episode の
     結果を、いまの設定での評価として validated にしない）
-  - report の RL arm の `SupervisorPolicyIdentity` が、`certify()` を通した artifact の識別
+  - report の**各** RL arm の `SupervisorPolicyIdentity` が、対応する `certify()` 済み artifact の識別
     （`certified_identity()`）と一致する
-  - 元の比較のその arm の全 episode・全 step の `StepRecord.action` を、artifact の表がすべて再現する
+  - 元の比較の**各** RL arm の全 episode・全 step の `StepRecord.action` を、対応する artifact の表がすべて再現する
     （0061 §2.6 と同じ照合）
-  - Baseline arm の Rule が、渡した Rule policy の表（`rule_policy_identity()`）と一致する
+  - report の Baseline の `RulePolicyIdentity`（版と表の digest）が、渡した Rule policy の
+    `rule_policy_identity()` と一致し、元の比較の Baseline arm の全 step の action をその表が再現する
 - report に action の列を入れる案・action 列の digest だけを入れる案は採らない。前者は report が
   `MAX_EPISODES_PER_ARM` × step 数に比例して膨らみ、後者は digest を照合するのに結局元の比較が要る。
   **元の比較を必須の入力にし、report はそこへ digest で束縛する**
