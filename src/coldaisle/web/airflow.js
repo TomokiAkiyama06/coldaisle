@@ -868,10 +868,25 @@ function renderBalance() {
   }
   state.textContent = balance.state;
   state.className = `pill ${balance.tone || ""}`.trim();
+  if (balance.disabled) {
+    // 未校正で起動した → Air Balance を使っていない。**故障ではない**が、「釣り合っている」でもない
+    const box = el("div", "na-box");
+    box.appendChild(el("b", null, balance.state));
+    box.appendChild(
+      document.createTextNode(
+        " — 風量の曲線が未校正のため、吸気と排気の釣り合い（推定）を使っていません。「釣り合っている」という意味ではありません。"
+      )
+    );
+    container.appendChild(box);
+    return;
+  }
   const value = el("div", "balance-value");
   value.appendChild(el("span", "v", balance.ratio === null || balance.ratio === undefined ? "推定なし" : fmt(balance.ratio, 2)));
   value.appendChild(el("span", "note", "排気 ÷ 吸気（推定）"));
   container.appendChild(value);
+  if (Array.isArray(balance.reasons) && balance.reasons.length) {
+    container.appendChild(el("div", "note", `熱の制約：${balance.reasons.join(" ・ ")}`));
+  }
   if (balance.position === null || balance.position === undefined) {
     // 目標帯は trace に無い（air-balance.yaml が持つ）。帯の上の位置を推測で描かない
     container.appendChild(el("div", "note", "目標帯は判断記録に含まれないため、帯の上の位置は表示していません。"));

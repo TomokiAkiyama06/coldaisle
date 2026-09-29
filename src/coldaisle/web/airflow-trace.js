@@ -20,10 +20,9 @@
 
 (function (root) {
   // 版ごとに**初めて現れた**欄（control/schema.py の SCHEMA_VERSION の説明）。
-  // **schema.py にある版だけを知っている版にする。** Air Balance の記録（決定記録 0073 §2.5、
-  // `air_balance` と `zones.*.applied_demand`）は、次の版を実装する PR（#81 系）が実際の
-  // ControlTick の fixture と一緒にここへ足す。版の番号は先にマージされた PR で決まる
-  // （0064 §2.9 / 0071 §2.5）ため、推測で先取りしない。それまで v11 以降は「未対応の版」
+  // **schema.py にある版だけを知っている版にする。** 版の番号は先にマージされた PR で決まる
+  // （0064 §2.9 / 0071 §2.5）ため、推測で先取りしない。v12 以降は「未対応の版」。
+  // v11（#81 / 決定記録 0073 §2.5）: `air_balance` と `zones.*.applied_demand`。
   const SINCE = {
     workload_regime: 2,
     supervisor: 3,
@@ -32,8 +31,10 @@
     runtime: 8,
     safety_provenance: 9,
     registry: 10,
+    air_balance: 11,
+    applied_demand: 11,
   };
-  const KNOWN_VERSIONS = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
+  const KNOWN_VERSIONS = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11];
 
   const NOT_IN_VERSION = "この版の記録には無い";
   const ZONE_KEYS = ["front", "rear", "top"];
@@ -92,6 +93,16 @@
     tick_overrun: "制御の周期に間に合わない",
     config_invalid: "制御の設定が不正",
   };
+  // Air Balance の状態（schema.py の AirBalanceTraceState）。`disabled` は別に扱う
+  const BALANCE_STATE = {
+    balanced: { state: "釣り合っている", tone: "ok" },
+    intake_heavy: { state: "吸気が多い", tone: "warn" },
+    exhaust_heavy: { state: "排気が多い", tone: "warn" },
+    thermally_limited: { state: "熱の制約を優先中", tone: "warn" },
+    unknown: { state: "推定できない", tone: "warn" },
+  };
+  const BALANCE_DISABLED = "無効（未校正）";
+
   function has(version, field) {
     return version >= SINCE[field];
   }
@@ -363,8 +374,11 @@
           }`;
       if (!ok) fanTone = "bad";
     }
-    // 適用した出力（applied_demand）を持つ版はまだ無い（上の SINCE の説明）
-    fanDetail += ` ・ 適用した出力：${NOT_IN_VERSION}`;
+    // 適用した出力（applied_demand。v11〜）。**欄が無い版と、値が無い tick を分ける**
+    const applied = number(record.applied_demand);
+    if (!has(version, "applied_demand")) fanDetail += ` ・ 適用した出力：${NOT_IN_VERSION}`;
+    else if (applied !== null) fanDetail += ` ・ 適用した出力：${pct(applied)}`;
+    else fanDetail += " ・ 適用した出力：記録なし（書き込みを確認できていない）";
     if (zoneFaults.length) fanDetail += ` ・ ${zoneFaults.map(faultText).join(" ・ ")}`;
     steps.push({ title: "ファン", value: fanValue, detail: fanDetail, tone: zoneFaults.length ? "bad" : fanTone });
 
@@ -379,17 +393,47 @@
       bound_tone: bound.tone,
       airflow_index: number(record.airflow_index),
       estimated_flow: number(record.estimated_flow),
+      applied_demand: has(version, "applied_demand") ? number(record.applied_demand) : null,
       reason: reasonText(record.controller_reason) || "（説明の記録なし）",
       trace: steps,
     };
   }
 
   /**
-   * Air Balance。**いま知っている版（v1〜v10）には記録が無い**ので「この版の記録には無い」。
-   * 記録を持つ版の読み取りは、その版を実装する PR が fixture と一緒に足す（上の SINCE の説明）。
+   * Air Balance（v11〜。schema.py の AirBalanceRecord）。
+   * - v10 以前 → `{ absent }`「この版の記録には無い」。**「釣り合っている」と言わない**
+   * - `status: disabled`（未校正で起動）→ `{ disabled: true }`。**故障ではなく「使っていない」**
+   * - `status: enabled` → 状態と比。比が無い tick（q が欠けた）は `ratio: null`（0 にしない）
+   * - 欄が無い・知らない値 → 「記録の値を解釈できない」。**正常に見せない**
+   * 目標帯は trace に無い（air-balance.yaml が持つ）ので `position` は常に null。
    */
-  function balanceFromTrace() {
-    return { absent: NOT_IN_VERSION };
+  function balanceFromTrace(version, body) {
+    if (!has(version, "air_balance")) return { absent: NOT_IN_VERSION };
+    const record = body.air_balance;
+    const unreadable = { state: UNKNOWN_VALUE, tone: "warn", ratio: null, position: null, reasons: [] };
+    if (!isObject(record)) return unreadable;
+    if (record.status === "disabled") {
+      return {
+        disabled: true,
+        state: BALANCE_DISABLED,
+        ratio: null,
+        position: null,
+        reasons: [],
+        model_id: typeof record.model_id === "string" ? record.model_id : null,
+      };
+    }
+    if (record.status !== "enabled") return unreadable;
+    if (!Object.prototype.hasOwnProperty.call(BALANCE_STATE, record.state)) return unreadable;
+    const reasons = Array.isArray(record.thermal_reasons)
+      ? record.thermal_reasons.filter((reason) => typeof reason === "string")
+      : [];
+    return {
+      ...BALANCE_STATE[record.state],
+      ratio: number(record.balance_ratio),
+      position: null,
+      reasons,
+      model_id: typeof record.model_id === "string" ? record.model_id : null,
+    };
   }
 
   function alertFromTrace(body, zones, faults) {
@@ -484,7 +528,7 @@
         alert: alertFromTrace(body, zones, faults),
         chips,
         zones,
-        balance: balanceFromTrace(),
+        balance: balanceFromTrace(version, body),
       },
     };
   }

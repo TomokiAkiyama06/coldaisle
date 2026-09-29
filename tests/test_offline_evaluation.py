@@ -2826,7 +2826,8 @@ def test_the_report_counts_traces_recorded_under_the_evaluated_config(
     assert provenance.fan_hardware_trace_binding == TraceConfigBinding(
         matched=3, mismatched=1, missing=0
     )
-    assert not provenance.air_balance_trace_binding.complete
+    assert provenance.consumed_traces == 4
+    assert not provenance.air_balance_trace_binding.complete_for(provenance.consumed_traces)
 
 
 def test_the_air_balance_file_is_part_of_the_conditions(

@@ -671,9 +671,20 @@ class TraceConfigBinding(_Frozen):
     """hash の欄を持たない tick（Air Balance なら runtime v1、すなわち v10 以前の tick）。"""
 
     @property
-    def complete(self) -> bool:
-        """昇格の証拠に使えるか（1件以上あり、不一致・欠落が無い）。"""
-        return self.matched > 0 and self.mismatched == 0 and self.missing == 0
+    def total(self) -> int:
+        """突き合わせた tick の数。"""
+        return self.matched + self.mismatched + self.missing
+
+    def complete_for(self, traces: int) -> bool:
+        """``traces`` 件を消費した報告で、昇格の証拠に使えるか。
+
+        **件数が消費した tick の数と一致し**、1件以上あり、不一致・欠落が無いときだけ真。
+        件数だけを見ると、1000件の tick を消費した報告が ``matched=1`` を名乗って
+        通れてしまう（codex #4134851497）。
+        """
+        return (
+            self.total == traces and self.matched > 0 and self.mismatched == 0 and self.missing == 0
+        )
 
 
 class EvaluationProvenance(_Frozen):
@@ -705,6 +716,27 @@ class EvaluationProvenance(_Frozen):
         default=None, exclude_if=lambda value: value is None
     )
     """消費した tick の ``fan_hardware_sha256`` と評価時の hash の突き合わせ（v3）。"""
+
+    @model_validator(mode="after")
+    def _trace_bindings_cover_every_consumed_trace(self) -> Self:
+        # **突き合わせの件数を、消費した tick の数に縛る**（codex #4134851497）。
+        # 縛らないと、1000件の tick から作った報告が matched=1 を名乗り、
+        # 残りの tick がどの設定で記録されたかを言わずに昇格の証拠になる。
+        consumed = self.consumed_traces
+        for name, binding in (
+            ("air_balance_trace_binding", self.air_balance_trace_binding),
+            ("fan_hardware_trace_binding", self.fan_hardware_trace_binding),
+        ):
+            if binding is not None and binding.total != consumed:
+                raise ValueError(
+                    f"{name} の件数（{binding.total}）が消費した trace の数（{consumed}）と違う"
+                )
+        return self
+
+    @property
+    def consumed_traces(self) -> int:
+        """評価が消費した tick の数（run ごとの ``traces`` の和）。"""
+        return sum(run.traces for run in self.runs)
 
     @property
     def config_bound(self) -> bool:

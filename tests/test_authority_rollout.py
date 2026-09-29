@@ -362,6 +362,7 @@ def report_document(
     fan_hardware_sha: str = FAN_HARDWARE_SHA,
     air_balance_binding: TraceConfigBinding = ALL_MATCHED,
     fan_hardware_binding: TraceConfigBinding = ALL_MATCHED,
+    traces: int = 1_000,
 ) -> bytes:
     """最小の Offline Evaluation 報告（#91）。**arm の実績と gate を持つ。**"""
     learned = learned_arm(arm_stage)
@@ -452,7 +453,7 @@ def report_document(
                     run_id="run-001",
                     start_ms=end_ms - 86_400_000,
                     end_ms=end_ms if fresh_fallback_end_ms is None else fresh_fallback_end_ms,
-                    traces=1_000,
+                    traces=traces,
                     observations=1_000,
                     trace_sha256="8" * 64,
                     observation_sha256="9" * 64,
@@ -1357,7 +1358,8 @@ def test_the_air_balance_and_hardware_files_are_bound_three_ways(
     [
         TraceConfigBinding(matched=999, mismatched=1, missing=0),
         TraceConfigBinding(matched=999, mismatched=0, missing=1),
-        TraceConfigBinding(matched=0, mismatched=0, missing=0),
+        TraceConfigBinding(matched=0, mismatched=1_000, missing=0),
+        TraceConfigBinding(matched=0, mismatched=0, missing=1_000),
     ],
 )
 @pytest.mark.parametrize("name", ["air-balance.yaml", "fan-hardware.yaml"])
@@ -1374,6 +1376,39 @@ def test_a_report_built_from_traces_of_another_config_cannot_promote(
     approval = approval_for(document)
 
     with pytest.raises(AuthorityEvidenceError, match=f"いまの {name} で記録されたと言えない"):
+        raise_stage(store(tmp_path), approval=approval, document=document)
+
+
+def test_a_report_without_traces_cannot_promote(tmp_path: Path) -> None:
+    """tick を1件も消費していない報告は、件数が揃っていても証拠にしない。"""
+    empty = TraceConfigBinding(matched=0, mismatched=0, missing=0)
+    document = report_document(air_balance_binding=empty, fan_hardware_binding=empty, traces=0)
+    approval = approval_for(document)
+
+    with pytest.raises(AuthorityEvidenceError, match=r"で記録されたと言えない.*traces=0"):
+        raise_stage(store(tmp_path), approval=approval, document=document)
+
+
+@pytest.mark.parametrize("key", ["air_balance_binding", "fan_hardware_binding"])
+def test_a_truncated_binding_count_is_rejected_when_the_report_is_built(key: str) -> None:
+    """**突き合わせの件数は、消費した trace の数と一致しなければ報告にならない**。
+
+    codex #4134851497: 1000件の tick を消費した報告が matched=1 を名乗れてはいけない。
+    """
+    truncated = TraceConfigBinding(matched=1, mismatched=0, missing=0)
+    with pytest.raises(ValidationError, match="消費した trace の数"):
+        report_document(**{key: truncated})
+
+
+@pytest.mark.parametrize("field", ["air_balance_trace_binding", "fan_hardware_trace_binding"])
+def test_a_report_with_a_truncated_binding_count_cannot_promote(tmp_path: Path, field: str) -> None:
+    """件数を書き換えた報告を読み直しても、昇格の証拠にしない（codex #4134851497）。"""
+    payload = json.loads(report_document())
+    payload["provenance"][field] = {"matched": 1, "mismatched": 0, "missing": 0}
+    document = json.dumps(payload).encode("utf-8")
+    approval = approval_for(document, evidence=evidence_for(document))
+
+    with pytest.raises(AuthorityEvidenceError, match="報告を検証できない"):
         raise_stage(store(tmp_path), approval=approval, document=document)
 
 

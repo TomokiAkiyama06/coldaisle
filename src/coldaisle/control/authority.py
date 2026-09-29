@@ -883,14 +883,14 @@ class AuthorityStore:
             ("air-balance.yaml", provenance.air_balance_trace_binding),
             ("fan-hardware.yaml", provenance.fan_hardware_trace_binding),
         ):
-            if binding is None or not binding.complete:
+            if binding is None or not binding.complete_for(provenance.consumed_traces):
                 raise AuthorityEvidenceError(
                     f"評価に使った trace が、いまの {name} で記録されたと言えない"
                     + (
                         ""
                         if binding is None
                         else f"（matched={binding.matched}; mismatched={binding.mismatched}; "
-                        f"missing={binding.missing}）"
+                        f"missing={binding.missing}; traces={provenance.consumed_traces}）"
                     )
                 )
         if evidence.artifact_sha256 != production_artifact_sha256:
