@@ -255,6 +255,62 @@ class ControlTraceRecord(BaseModel):
         return value
 
 
+class SequencedControlTrace(BaseModel):
+    """記録した順（``seq``）付きの decision trace（#106 / 決定記録 0071 §2.2a）。
+
+    ``seq`` は読み取り API の並びと cursor のためだけの番号で、判断の時刻の意味は
+    ``ts_ms`` のまま。欠番を持ちうるので連続を仮定しない。
+    ``trace_json`` は保存したまま渡す。意味の検証は書いた時点で済んでいる（0071 §2.4）。
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    seq: int = Field(ge=1)
+    ts_ms: int = Field(ge=0)
+    tick_id: int = Field(ge=0)
+    schema_version: int = Field(ge=1)
+    trace_json: str
+
+
+class ControlTracePruneState(BaseModel):
+    """保持期間の削除の境界（``control_trace_prune`` の1行。決定記録 0071 §2.2a）。"""
+
+    model_config = ConfigDict(frozen=True)
+
+    pruned_through_seq: int = Field(ge=0)
+    """消した行の ``seq`` の上限。1件も消していなければ 0。"""
+    pruned_before_ms: int | None = Field(default=None, ge=0)
+    """これより前の ``ts_ms`` の行は消したことがある。まだ削除していなければ ``None``。"""
+    legacy_until_ms: int = Field(ge=0)
+    """移行前の削除で欠けたかもしれない範囲の上限。"""
+
+    @property
+    def retained_from_ms(self) -> int:
+        """これより前の ``ts_ms`` の行は残っていることを保証しない境界。"""
+        if self.pruned_before_ms is None:
+            return self.legacy_until_ms
+        return max(self.pruned_before_ms, self.legacy_until_ms)
+
+
+class ControlTracePage(BaseModel):
+    """``seq`` のキーセットで読んだ1ページ（決定記録 0071 §2.2）。"""
+
+    model_config = ConfigDict(frozen=True)
+
+    traces: tuple[SequencedControlTrace, ...]
+    has_more: bool
+    """読んだ時点で、期間内でこのページより後ろの ``seq`` の行がまだあるか。"""
+    retained_from_ms: int = Field(ge=0)
+
+
+class ControlTraceCursorPrunedError(LookupError):
+    """cursor より後ろの行が保持期間の削除で消えた可能性がある（決定記録 0071 §2.2 の 409）。"""
+
+    def __init__(self, retained_from_ms: int) -> None:
+        super().__init__(f"cursor より後ろの trace が削除された可能性がある: {retained_from_ms}")
+        self.retained_from_ms = retained_from_ms
+
+
 EVENT_KIND_PATTERN = re.compile(r"^[a-z][a-z0-9_]*$")
 """`events.kind` の形（決定記録 0045 §2.5）。許可リストは書き込みの入口が持つ。"""
 

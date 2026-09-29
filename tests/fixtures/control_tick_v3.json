@@ -1,0 +1,77 @@
+{
+  "schema_version": 3,
+  "tick_id": 103,
+  "ts_ms": 1787616003000,
+  "state": {
+    "operating_mode": "auto",
+    "authority_stage": "shadow",
+    "active_controller": "fallback",
+    "safety_state": "normal",
+    "fallback_active": true,
+    "fallback_reason": null,
+    "supervisor_policy": null,
+    "model_version": null,
+    "model_confidence": null,
+    "model_ood": null
+  },
+  "zones": {
+    "front": {
+      "controller_reason": {
+        "code": "fallback_baseline",
+        "detail": "Baseline で回す"
+      },
+      "demand": {
+        "requested": 0.32999999999999996,
+        "effective": 0.32999999999999996,
+        "bound_by": "requested",
+        "safety_floor": 0.2,
+        "forced_max": false,
+        "guard_floor": null,
+        "guard_ceiling": null,
+        "reasons": []
+      },
+      "airflow_index": null,
+      "estimated_flow": null,
+      "hardware": null
+    },
+    "rear": {
+      "controller_reason": {
+        "code": "fallback_baseline",
+        "detail": "Baseline で回す"
+      },
+      "demand": {
+        "requested": 0.32999999999999996,
+        "effective": 0.32999999999999996,
+        "bound_by": "requested",
+        "safety_floor": 0.2,
+        "forced_max": false,
+        "guard_floor": null,
+        "guard_ceiling": null,
+        "reasons": []
+      },
+      "airflow_index": null,
+      "estimated_flow": null,
+      "hardware": null
+    },
+    "top": {
+      "controller_reason": {
+        "code": "fallback_baseline",
+        "detail": "Baseline で回す"
+      },
+      "demand": {
+        "requested": 0.32999999999999996,
+        "effective": 0.32999999999999996,
+        "bound_by": "requested",
+        "safety_floor": 0.2,
+        "forced_max": false,
+        "guard_floor": null,
+        "guard_ceiling": null,
+        "reasons": []
+      },
+      "airflow_index": null,
+      "estimated_flow": null,
+      "hardware": null
+    }
+  },
+  "faults": []
+}

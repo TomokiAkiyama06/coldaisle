@@ -180,6 +180,78 @@ class EventsResponse(BaseModel):
     truncated: bool
 
 
+class ControlTraceOut(BaseModel):
+    """保存した1 tick の decision trace（#106 / 決定記録 0071 §2.2 / §2.3）。
+
+    外枠（``seq`` / ``ts_ms`` / ``ts`` / ``tick_id`` / ``schema_version``）は
+    ``/api/v1`` の版に属し、
+    ``ControlTick`` の版が上がっても変えない。``body`` は保存した JSON を**そのまま**返す。
+    API は項目を足さない・消さない・直さない・検証し直さない（0071 §2.4）。
+    版の解釈は読む側が ``schema_version`` で分岐して行う。
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    seq: int
+    ts_ms: int
+    ts: str
+    tick_id: int
+    schema_version: int
+    body: dict[str, Any]
+
+
+class ControlLatestTraceOut(ControlTraceOut):
+    """最新の1 tick。``age_ms`` はサーバの時計で数えた経過（0071 §2.2）。
+
+    **古いかどうかは判定しない**（0071 §2.6）。壁時計が戻った直後は負になりうるが、丸めない。
+    """
+
+    age_ms: int
+
+
+class ControlLatestResponse(BaseModel):
+    """`GET /api/v1/control/latest`。trace が1件も無ければ ``trace: null``（404 にしない）。
+
+    **LLM のプロンプトへ直接入れない**（FR-504 / 決定記録 0071 §2.8）。
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    trace: ControlLatestTraceOut | None
+
+
+class ControlTracesResponse(BaseModel):
+    """`GET /api/v1/control/traces`。``seq`` のキーセットで読んだ1ページ（決定記録 0071 §2.2）。
+
+    上限を超えたら ``has_more: true`` を返し、**黙って落とさない。**
+    ``retained_from_ms`` より前の ``ts_ms`` の行は残っていることを保証しない。
+    **LLM のプロンプトへ直接入れない**（FR-504 / 決定記録 0071 §2.8）。
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    from_ms: int
+    to_ms: int
+    retained_from_ms: int
+    before_retained: bool
+    traces: list[ControlTraceOut]
+    has_more: bool
+    next_after: str | None
+    """次のページの ``after``。このページの最後の ``seq``（行が無ければ要求の ``after``）。"""
+
+
+class ControlTracesPrunedResponse(BaseModel):
+    """409: cursor より後ろの行が保持期間の削除で消えた可能性がある（決定記録 0071 §2.2）。
+
+    呼び出し側は ``retained_from_ms`` を ``from`` にして ``after`` なしで読み直す。
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    detail: str
+    retained_from_ms: int
+
+
 class HealthResponse(BaseModel):
     """`GET /api/v1/health`（FR-305）。
 

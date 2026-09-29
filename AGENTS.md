@@ -47,7 +47,9 @@ COLDAISLE_DB=var/coldaisle.db uv run uvicorn coldaisle.server:app --port 8000  #
 ```
 
 API の設定は環境変数（`COLDAISLE_DB` / `COLDAISLE_METRICS` / `COLDAISLE_MAX_POINTS` ほか。
-決定記録 0009 §2.9）。`uvicorn` に引数を渡せないため。
+決定記録 0009 §2.9）。`uvicorn` に引数を渡せないため。decision trace の読み出し
+（`/api/v1/control/*`）の件数は `COLDAISLE_CONTROL_TRACE_LIMIT` / `COLDAISLE_CONTROL_TRACE_MAX_LIMIT`
+（決定記録 0071）。**trace の応答を LLM のプロンプトへ直接入れない**（ルール 8）。
 
 **`--speed` を付けている間は API / ダッシュボードを同時に使わない。**
 圧縮再生ではホスト時刻がシナリオ時間で進むため、別プロセスから見ると

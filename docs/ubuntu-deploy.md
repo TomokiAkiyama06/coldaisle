@@ -151,6 +151,35 @@ curl -s http://127.0.0.1:8000/api/v1/health
 - **落ちても10秒以内に戻ること**（NFR-01）。`sudo systemctl kill coldaisle-daemon`
   のあと、`RestartSec=5` で再起動する
 
+### コードを更新するとき（DB の migration）
+
+DB の migration は、更新後に**最初にストアを開いたプロセス**が当てます（API の最初の要求、
+`coldaisle-rollup` のタイマーなど）。書き手を動かしたまま更新すると、移行前のコードを
+読み込んだままの書き手が新しいスキーマに書くことになります。そのため、更新は次の順で行います。
+
+1. **DB に書くものをすべて止める。** 取り込み（`coldaisle-daemon`）・API・タイマーに加え、
+   制御デーモン（`coldaisle-fand`）・`coldaisle-telemetry`・`coldaisle-eventd` を常駐させていれば
+   それも止めます
+2. コードを更新し、`coldaisle-rollup` を1回だけ手で走らせて migration を当てる
+3. 書き手とタイマーを起動し直す
+
+```bash
+sudo systemctl stop coldaisle-rollup.timer coldaisle-report.timer
+sudo systemctl stop coldaisle-daemon coldaisle-api   # 常駐させている他の書き手も
+# ここでコードを更新する（git pull と venv の同期）
+sudo systemctl start coldaisle-rollup.service        # migration を当てる（終わるまで待つ）
+sudo systemctl start coldaisle-daemon coldaisle-api
+sudo systemctl start coldaisle-rollup.timer coldaisle-report.timer
+```
+
+- **表を作り直す migration は、その間ほかの書き込みを止めます。** たとえば 0007（#106）は
+  decision trace の表（保持期間いっぱい、最大30日分の JSON）を作り直し、1つの書き込み
+  トランザクションで行います。その間は取り込みも制御の trace も書けません。書き手を止めて
+  から当てるのはこのためでもあります
+- 手順を守らずに移行前の制御デーモンが動き続けた場合でも、trace は黙って欠けません。
+  `control_traces` は `seq` の無い INSERT を trigger で拒否するので、制御ループのログに
+  trace の保存失敗として出ます。気付いたら制御デーモンを再起動してください
+
 ## 5. Mac からのデータ移行
 
 1. **Mac 側で DB に書くプロセスをすべて止める。** 取り込み（`coldaisle-daemon`）だけでなく、
