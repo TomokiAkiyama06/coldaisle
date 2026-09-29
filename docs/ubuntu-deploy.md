@@ -154,23 +154,45 @@ curl -s http://127.0.0.1:8000/api/v1/health
 ## 5. Mac からのデータ移行
 
 1. **Mac 側の取り込みを止める。** launchd などで常駐させているなら止めます。
-   動いたままコピーすると、WAL に残った書き込みが欠けます
-2. **DB の整合を取ってからコピーする。** 止めたあと、Mac 側で
+   動いたままコピーすると、コピーのあとに書かれたサンプルが移行先に入りません
+2. **SQLite のオンラインバックアップで1ファイルに書き出す。** `var/coldaisle.db` を
+   `cp` / `rsync` で直接運ぶのは避けます。WAL モードでは確定済みの書き込みが
+   `-wal` に残っていることがあり、`PRAGMA wal_checkpoint(TRUNCATE);` も
+   API やダッシュボードなどの読み手が DB を開いている間は `busy` を返して
+   途中で止まるためです。`.backup` は読み手が残っていても整合した1ファイルを作ります
 
    ```bash
-   sqlite3 var/coldaisle.db 'PRAGMA wal_checkpoint(TRUNCATE);'
+   sqlite3 var/coldaisle.db ".backup /tmp/coldaisle-migrate.db"
+   sqlite3 /tmp/coldaisle-migrate.db 'PRAGMA integrity_check;'   # ok と出ること
    ```
 
-   を実行し、`var/coldaisle.db` を1ファイルで運びます（`-wal` / `-shm` が残っていれば
-   それも一緒に）
-3. **Ubuntu 側に置く。** サービスを止めてから置き、所有者を揃えます
+   `-wal` / `-shm` を伴わない `/tmp/coldaisle-migrate.db` だけを運びます。
+   `.backup` を使わずに元のファイルを運ぶ場合は、Mac 側の読み手（API・ダッシュボード・
+   `sqlite3` のシェルなど）も**すべて**止めてから
+   `sqlite3 var/coldaisle.db 'PRAGMA wal_checkpoint(TRUNCATE);'` を実行し、
+   結果の1列目（busy）が `0`（`0|0|0` のように出る）であることを確かめます。
+   `1` のときは読み手が残っています。止め切れない場合は `coldaisle.db` と
+   `-wal`（あれば `-shm` も）を**組で**同じディレクトリへ運び、そこで
+   `sqlite3 coldaisle.db ".backup /tmp/coldaisle-migrate.db"` を実行して1ファイルにしてから
+   手順 3 へ進みます
+3. **Ubuntu 側に置く。** DB に触るものを全部止めてから置き、所有者を揃えます。
+   デーモンと API のほか、ロールアップと日次レポートのタイマーも止めます
+   （置き換えの途中で起動して古い DB や書きかけの DB を開かないように）。
+   前の DB の `-wal` / `-shm` が残っていると新しい DB に誤って重なるため、消してから置きます
 
    ```bash
-   sudo systemctl stop coldaisle-daemon coldaisle-api
-   rsync -av <mac>:<リポジトリ>/var/coldaisle.db /tmp/coldaisle.db
+   sudo systemctl stop coldaisle-rollup.timer coldaisle-report.timer
+   sudo systemctl stop coldaisle-rollup.service coldaisle-report.service \
+        coldaisle-daemon coldaisle-api
+   rsync -av <mac>:/tmp/coldaisle-migrate.db /tmp/coldaisle.db
+   sudo rm -f /var/lib/coldaisle/coldaisle.db-wal /var/lib/coldaisle/coldaisle.db-shm
    sudo install -o coldaisle -g coldaisle -m 0640 /tmp/coldaisle.db /var/lib/coldaisle/coldaisle.db
    sudo systemctl start coldaisle-daemon coldaisle-api
+   sudo systemctl start coldaisle-rollup.timer coldaisle-report.timer
    ```
+
+   タイマーは置き換えが済んでから戻します。手順 5 の再生を続けて行うなら、
+   デーモンとタイマーは再生が終わってから起動しても構いません
 
 4. **日次 CSV を運ぶ。** Mac の `~/server_sensor_logs/` を
    `/var/lib/coldaisle/server_sensor_logs/` へコピーし、所有者を `coldaisle` にします
