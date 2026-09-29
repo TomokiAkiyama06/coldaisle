@@ -207,6 +207,7 @@ air_balance:
   q_front / q_rear / q_top                     # zone ごとの q（EFU）。AirBalanceEstimate と同じ定義
   estimated_intake / estimated_exhaust / balance_ratio   # AirBalanceEstimate と同じ定義
   state: balanced | intake_heavy | exhaust_heavy | thermally_limited | unknown | disabled
+  thermal_limited: true | false                # AirBalanceEstimate.thermal_limited と同じ定義。state と独立
   thermal_reasons: [...]
 ```
 
@@ -224,7 +225,8 @@ air_balance:
 | `q_front` / `q_rear` / `q_top` | `EffectiveFlow` または `null`（下記） | すべて `null` |
 | `estimated_intake` / `estimated_exhaust` / `balance_ratio` | `AirBalanceEstimate` の不変条件のとおり | すべて `null` |
 | `state` | `disabled` 以外 | `disabled` |
-| `thermal_reasons` | `AirBalanceEstimate` のとおり（`thermally_limited` のときだけ非空） | `[]`（空の列。`null` にしない） |
+| `thermal_limited` | `bool(thermal_reasons)` と一致（下記） | `false` |
+| `thermal_reasons` | `AirBalanceEstimate` のとおり（下記。`state: unknown` でも非空になりうる） | `[]`（空の列。`null` にしない） |
 | zone の `estimated_flow` | `q_*` と zone ごとに一致（下記） | Front / Rear / Top すべて `None` |
 
 - `enabled` のとき、`q_*` / `estimated_intake` / `estimated_exhaust` / `balance_ratio` / `state` は
@@ -235,6 +237,15 @@ air_balance:
   zone ごとに対応させるので、Rear と Top の値の入れ替わりも検出できる
 - (a) で `None` の zone は、その `q_*` も `None` にする。1つでも `None` があるときは
   `balance_ratio` を出さず `state: unknown` とする（`enabled` のまま。`disabled` と混ぜない）
+- **熱制約は `state` と独立に残す。** `AirBalanceEstimate` と同じく、`thermal_limited == bool(thermal_reasons)`
+  を常に守り、比が出せる（`state` が `unknown` 以外の）ときだけ
+  `thermal_limited == (state == thermally_limited)` を要求する。`state: unknown` のときは
+  `thermal_limited: true` と非空の `thermal_reasons` を許す（既存の `_unknown_estimate()` と同じ）。
+  Fan の fault で `q_*` が欠けた tick は、熱の証拠が最も要る tick でもある。風量が不明という理由で
+  温度の超過を記録から落とさない
+- 熱の理由は風量と無関係に、束縛した `thermal_inputs`（§2.4）から `evaluate()` と同じ規則
+  （`_thermal_reasons()`）で求める。`q_*` が欠けて `evaluate()` の結果をそのまま使えない tick も、
+  この規則を1箇所の実装から呼び、2つ目の分類を作らない
 - `disabled` は上の表の形だけを許す。「推定できなかった」（`enabled` + `unknown`）と
   「使っていなかった」（`disabled`）を、同じ形の記録にしない
 - 0060 §2.4 と同じく、**版が中身を表さない記録を作らない**。v10 を名乗る tick は `air_balance` を
@@ -265,19 +276,29 @@ air_balance:
 - counterfactual の行に Air Balance の欄を置かない規則（0054 §2.2）は変えない。
   本記録が記録するのは**実際に適用された applied demand の推定だけ**である
 
-### 2.6 昇格の証拠を `air-balance.yaml` に束縛する
+### 2.6 昇格の証拠を `air-balance.yaml` と `fan-hardware.yaml` に束縛する
 
 Air Balance を Learned MPC の cost へ渡すと（§2.3）、曲線と目標帯は optimizer の判断を変える。
 tick ごとの hash（§2.5 (c)）だけでは、characterization A で集めた証拠が B へ切り替えた後の
 昇格を許せてしまう。0057 §2.4 の「束縛済み」に `air-balance.yaml` を加える。
+
+同じ理由で **`fan-hardware.yaml` も昇格の照合に加える**。§2.3 で MPC の balance の項は profile の
+`minimum_stable_demand` による引き上げを通した demand で評価するので、profile が変わると optimizer が
+見る cost も変わる。いまの `main` では hash は報告の provenance（`fan_hardware_config_sha256`）と
+`conditions_sha256` にあるが、`RolloutEvidence` と `_check_evidence()` がいまの設定と比べないため、
+profile A で集めた証拠と承認が profile B の下で昇格を通ってしまう。以下の `air-balance.yaml` の規則は、
+特記しない限り `fan-hardware.yaml` にも同じく適用する。
 
 - `EvaluationProvenance` に `air_balance_config_sha256`（必須）を加え、評価時の
   `ControlConfig.sources.air_balance.sha256` を写す
 - `conditions_sha256` の材料（`_provenance()` の digest）に同じ hash を加える。
   Air Balance の設定だけが違う2つの評価が、同じ条件を名乗らないようにする
 - Offline Evaluation の報告の版を上げる。いまの `EVALUATION_REPORT_SCHEMA_VERSION` は 2 なので **3** にする
-- `RolloutEvidence` に `air_balance_config_sha256` を加える
+- `RolloutEvidence` に `air_balance_config_sha256` と `fan_hardware_config_sha256` を加える
+  （後者は報告の `provenance.fan_hardware_config_sha256` と、承認時の
+  `ControlConfig.sources.fan_hardware.sha256` を写す）
 - 昇格の照合（`_check_evidence()`）は、`fan-policy.yaml` / `safety.yaml` と同じく、
+  `air-balance.yaml` と `fan-hardware.yaml` のそれぞれについて、
   **承認の証拠・報告の provenance・いま動いている設定の3つが一致しなければ昇格を拒む**
   （`AuthorityEvidenceError`）
 - **評価に使った trace が、その hash の設定で記録されたことを確かめる。** 上の3つの一致だけでは、
@@ -288,17 +309,25 @@ tick ごとの hash（§2.5 (c)）だけでは、characterization A で集めた
     評価時の `ControlConfig.sources.air_balance.sha256` と突き合わせ、一致・不一致・欠落
     （runtime v1、すなわち v9 以前の tick）の件数を報告 v3 の provenance に
     `air_balance_trace_binding` として残す（`conditions_sha256` の材料にも入れる）
+  - 同じく、消費した各 tick の `runtime.config.fan_hardware_sha256`（runtime v1 から既存）を
+    評価時の `ControlConfig.sources.fan_hardware.sha256` と突き合わせ、件数を
+    `fan_hardware_trace_binding` として報告 v3 の provenance に残す（`conditions_sha256` の材料にも入れる）。
+    runtime v1 の tick も hash を持つので欠落は通常 0 だが、欄が無い tick は欠落として数える
   - **消費した tick が1つ以上あり、すべてが一致したときだけ**、その報告を昇格の証拠に使える。
     不一致または欠落が1件でもあれば、報告は出してよいが昇格の証拠にはしない。
-    `_check_evidence()` はこの件数を見て、不一致・欠落が 0 でなければ `AuthorityEvidenceError` で拒む
+    `_check_evidence()` はこの件数を見て、不一致・欠落が 0 でなければ `AuthorityEvidenceError` で拒む。
+    **`air_balance_trace_binding` と `fan_hardware_trace_binding` の両方**がこの条件を満たすことを要する。
+    Air Balance の条件が v10 の tick を要求するので、v9 以前の trace は `fan-hardware.yaml` の hash が
+    一致しても昇格の証拠にならない
   - 該当する tick を黙って除外して残りで評価する方式は採らない（除外の仕方で結果を選べてしまい、
     除外したことが報告から見えにくくなる）。一致しない trace が混ざった評価は、証拠として丸ごと無効にする
-  - 同じ突き合わせを `fan-policy.yaml` / `safety.yaml` の hash にも行うかは本記録では決めない（§5）
+  - 同じ突き合わせを `fan-policy.yaml` / `safety.yaml` の hash にも行うかは本記録では決めない（§5）。
+    この2ファイルは `_check_evidence()` による証拠・provenance・いまの設定の3者照合を既に持つ
 - `MIN_EVIDENCE_REPORT_SCHEMA_VERSION` を **3** に上げる。v2 以前の報告は Air Balance の設定を
   言えないので、昇格の証拠にしない（「記録の無さは不明であって完全ではない」。0059 §2.5）
 - journal に既に残った昇格 event の `RolloutEvidence` は書き換えない。`AuthorityJournal` の版を
-  **1 → 2** に上げ、v2 の新しい昇格 event の証拠は `air_balance_config_sha256` を必ず持ち、
-  v1 の event は持たないまま読む（過去の記録として読むだけで、新しい昇格の根拠にはならない）
+  **1 → 2** に上げ、v2 の新しい昇格 event の証拠は `air_balance_config_sha256` と `fan_hardware_config_sha256` を
+  必ず持ち、v1 の event は持たないまま読む（過去の記録として読むだけで、新しい昇格の根拠にはならない）
 - Air Balance が無効（`uncalibrated`）でもファイルはあり hash も決まるので、無効の間の証拠も
   その未校正ファイルに束縛される。`calibrated` へ差し替えた後は hash が変わり、
   **無効の間に集めた証拠では昇格できない**（Air Balance 無しの挙動の証拠を、有効な構成へ流用しない）
@@ -314,7 +343,7 @@ tick ごとの hash（§2.5 (c)）だけでは、characterization A で集めた
   実データで意味を持つ。trace の比と MPC の cost が同じ曲線・同じ定義から出る
 - どの characterization で回っていたかを、tick ごとの `config_sha256` と runtime の digest で追える
 - 保存された tick だけで、4ファイルの schema version と SHA-256 が言える（0033 §2）
-- 別の characterization で集めた証拠で authority を昇格できない（§2.6）
+- 別の characterization、または別の `fan-hardware.yaml` の profile で集めた証拠で authority を昇格できない（§2.6）
 
 ### 悪くなること・その緩和
 
@@ -324,7 +353,7 @@ tick ごとの hash（§2.5 (c)）だけでは、characterization A で集めた
 | 未校正の間、Air Balance を持つ完成形の経路が動かない | 無効な状態はいまの `main` と同じ挙動で、安全側の層は変わらない。#75 の後に `calibrated` へ変えて再起動する |
 | `ControlTick` と `ControlTickRuntime` の版が上がり、`FanHardwareResult` にも `applied_demand` が要る。reader・backend・試験の更新が要る | 既存の版の追加（v8 / v9）と同じ手順。旧版の trace は書き換えない |
 | 評価報告 v3・`AuthorityJournal` v2 への更新で、v2 以前の報告は昇格の証拠に使えなくなる | 評価をやり直せば v3 の報告が出る。昇格は証拠を取り直すまで止まる側（Shadow / いまの stage のまま）に倒れ、安全側を弱めない |
-| v9 以前の trace と、別の characterization で記録された trace は昇格の証拠にならない（§2.6）。v10 の trace が溜まるまで昇格できない | 昇格が止まる側に倒れるだけで、安全側は弱めない。v9 以前の trace は評価・分析には引き続き使える |
+| v9 以前の trace と、別の characterization または別の `fan-hardware.yaml` で記録された trace は昇格の証拠にならない（§2.6）。`fan-hardware.yaml` を変えると、それまでの証拠では昇格できない。v10 の trace が溜まるまで昇格できない | 昇格が止まる側に倒れるだけで、安全側は弱めない。v9 以前の trace は評価・分析には引き続き使える |
 | MPC の balance の項が `fan-hardware.yaml` の profile にも依存する（§2.3） | 引き上げの規則を1箇所の純粋関数にし、backend と同じ定義を使う。profile は同じ `ControlConfig` から渡し、欠ければ構成時に拒否する |
 | applied demand からの推定は、Fan が指令どおり回っていない場合を過大に見積もる | 書き込み失敗・読み戻し不一致・その tick の backend fault（窓が満ちる前の stall を含む）・有効な stall の zone は `None` にする（2.5 (a)）。RPM 基準への切り替えは #75 の結果で判断する（§5） |
 | `air-balance.yaml` の熱閾値（状態の分類用）と `safety.yaml` の閾値が2箇所にある | 前者は Safety ではない分類用の値であることを変えない（0033）。Safety の判断は `safety.yaml` だけが持つ |
@@ -366,6 +395,6 @@ tick ごとの hash（§2.5 (c)）だけでは、characterization A で集めた
 | RPM の読み戻しを使った推定への切り替え | #75 で demand と RPM のどちらが風量をよく説明するかを見てから |
 | `basis` と #75 の測定記録の機械的な照合形式（0033 §5 の2点目） | #75 の測定記録の形式が決まった後 |
 | 版番号の衝突（`ControlTick` v10・`ControlTickRuntime` v2・束ねた版 11・評価報告 v3・`AuthorityJournal` v2） | 別の記録・実装が先にその番号を使った場合は、実装の時点で次の空いた番号を使う。欄の意味は本記録のとおり |
-| offline 評価が、trace の `runtime.config` の `fan-policy.yaml` / `safety.yaml` の hash と評価時の設定の不一致を検出するか | `air-balance.yaml` の hash は §2.6 で突き合わせを決めた。ほかの2ファイルは未実装のまま、別の記録で |
+| offline 評価が、trace の `runtime.config` の `fan-policy.yaml` / `safety.yaml` の hash と評価時の設定の不一致を検出するか | `air-balance.yaml` と `fan-hardware.yaml` の hash は §2.6 で突き合わせを決めた。ほかの2ファイルは未実装のまま、別の記録で |
 | MPC の Acoustic の項も hardware の写像を通した demand で評価するか | #94。本記録は balance の項だけを決める（§2.3） |
 | Air Balance の推定に要求との対応づけを持たせるか（0052 §5） | 本記録は `demand_basis: applied` の記録だけを決める。MPC 側は #86 |
