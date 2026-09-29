@@ -251,11 +251,9 @@ src/coldaisle/
     fallback/   # Baseline / degraded運転
     hardware/   # Demand→PWM/RPM/flow mapping、mock backendを含む
     acoustic/   # 独立Acoustic Cost Model（初期は近似、将来実測対応）
-    rl/         # RL Supervisor の学習環境・episode・探索（Fan へ届く経路を持たない）。#105 / #89
-    evaluation/ # Offline Evaluation（#91）と RL episode の報告 `PolicyEpisodeReport`（#105）
-    rl/         # RL Supervisorの学習・評価環境（#105 / 決定記録 0058）。**制御権を持たない**
+    rl/         # RL Supervisorの学習・評価環境・episode・探索（#105 / #89 / 決定記録 0058）。**制御権を持たない**
     shadow/     # 適用しなかった提案の記録と突き合わせ（制御へ届かない）。#90
-    evaluation/ # Offline Evaluation（読み取り専用。制御へ届かない）。#91
+    evaluation/ # Offline Evaluation と RL episode の報告 PolicyEpisodeReport（読み取り専用。制御へ届かない）。#91 / #105
     drift/      # Model Drift 検知と再学習の推奨（読み取り専用。制御へ届かない）。#93
     shadow/     # Shadow Mode。適用しなかった提案の記録と実測照合（書き込み経路を持たない）
   notify/     # L2: 通知（Slack / LINE / stdout）。秘匿情報は .env

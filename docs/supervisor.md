@@ -97,6 +97,8 @@ supervisor policy を #104 の validated にする入口は `validate_supervisor
 
 次を1つでも満たさなければ拒み、**Registry へ何も書かない**。
 
+- 渡した比較を**JSON として読み戻して検証し直す**（`revalidated_comparison()`。`model_copy` などで
+  validator を迂回した比較をここで拒む）。以降の照合はすべて読み戻した比較で行う
 - 比較の canonical digest が report の `comparison_sha256` と一致する
 - その比較・`rl-policy.yaml`・Rule policy・全 RL arm の artifact から作り直した report の bytes が、
   渡した report の bytes と一致する（Baseline・表と action の束縛・1対1 の照合も再び通る）

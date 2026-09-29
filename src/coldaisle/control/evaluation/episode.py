@@ -569,6 +569,20 @@ def _bind_rl_arms(
     return bound
 
 
+def revalidated_comparison(comparison: PolicyComparison) -> PolicyComparison:
+    """渡された比較を**JSON として読み戻して検証し直した**ものを返す。
+
+    `model_copy` / `model_construct` は validator を通らないので、同じプロセスの中では
+    条件 hash の2段検証（0074 §2.2）も、環境だけが立てる `promotable` の規則（0058 §2.3）も
+    迂回した比較を作れる。報告の構築と validated 化の入口（`validate_supervisor_policy()`）は
+    **どちらもこの関数を最初に通し、その結果だけ**で digest を計算し報告を作る。
+    読み戻せない比較は `ValidationError`（`ValueError`）で拒む。
+    """
+    if not isinstance(comparison, PolicyComparison):
+        raise TypeError("比較は PolicyComparison で渡す")
+    return PolicyComparison.model_validate_json(comparison.model_dump_json())
+
+
 def build_policy_episode_report(
     comparison: PolicyComparison,
     *,
@@ -583,8 +597,7 @@ def build_policy_episode_report(
     `certified_identity()` から、束縛は表の digest と action の再現から取る。
     `validate_supervisor_policy()` も同じこの関数で作り直して bytes を照合する。
     """
-    if not isinstance(comparison, PolicyComparison):
-        raise TypeError("比較は PolicyComparison で渡す")
+    comparison = revalidated_comparison(comparison)
     if not isinstance(policy_config, RlPolicyConfig):
         raise TypeError("rl-policy.yaml は検証済みの RlPolicyConfig で渡す")
     rule_identity = _bind_baseline(comparison, rule_policy)
@@ -640,4 +653,5 @@ __all__ = [
     "PolicyEpisodeReportError",
     "build_policy_episode_report",
     "episode_arm_key",
+    "revalidated_comparison",
 ]

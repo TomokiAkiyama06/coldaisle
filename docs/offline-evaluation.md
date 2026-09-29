@@ -155,7 +155,8 @@ arm の名前空間は第3の `episode:<policy>+<policy_version>` である。
   （試験で確かめる）。温度 percentile・ΔT・Air Balance・RPM の欄は作らない
 - 入力は `PolicyComparison` 1つ・検証済みの `RlPolicyConfig`・Baseline の Rule policy・
   **RL arm ごとの `certify()` を通した artifact**（arm の `policy_version` をキーにした対応）だけ。
-  数字や hash を文字列で渡す口は無い（`build_policy_episode_report()`）
+  数字や hash を文字列で渡す口は無い（`build_policy_episode_report()`）。比較は最初に
+  JSON として読み戻して検証し直す（validator を迂回した比較を使わない）
 - **Baseline はちょうど1つの Rule arm で `arms[0]` に固定する。** 渡した Rule policy の版と
   一致し、その表が Baseline arm の全 step の action を再現しなければ作らない。報告には
   `RulePolicyIdentity`（版と表の digest）を残す

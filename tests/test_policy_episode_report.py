@@ -23,6 +23,8 @@ from typing import Any
 import pytest
 from pydantic import ValidationError
 
+import coldaisle.control.evaluation.episode as episode_module
+import coldaisle.control.rl.training as training_module
 from coldaisle.clock import SimulatedClock
 from coldaisle.control.evaluation.episode import (
     PolicyEpisodeReport,
@@ -39,10 +41,12 @@ from coldaisle.control.model_registry import (
     ModelRegistry,
 )
 from coldaisle.control.rl.episode import (
+    EPISODE_MIRRORED_CONDITIONS,
     EPISODE_SCHEMA_VERSION,
     EpisodeConfigDigests,
     EpisodeResult,
     PolicyComparison,
+    conditions_digest,
     config_digest,
     episode_conditions_sha256,
 )
@@ -61,7 +65,8 @@ from coldaisle.control.supervisor import (
     rule_policy_identity,
     validate_supervisor_policy,
 )
-from test_learned_mpc import REGISTRY_LIMITS
+from test_critical_safety import safety_config
+from test_learned_mpc import REGISTRY_LIMITS, mpc_policy
 from test_rl_supervisor_policy import CREATED_AT, rl_policy_config, trainer_for
 from test_rl_training_environment import build_environment, episode_spec, provisional, rl_config
 from test_rl_training_environment import trained as _trained_fixture
@@ -126,23 +131,45 @@ def test_invariant_1_episode_conditions_are_two_level_and_readable(unbacked: Set
     assert EpisodeResult.model_validate_json(episode.model_dump_json()) == episode
 
 
+def _rewrite_field(document: dict[str, Any], field: str) -> None:
+    """episode の欄**だけ**を、型として妥当な別の値に書き換える。"""
+    replacements: dict[str, object] = {
+        "episode_id": "pr105-other",
+        "seed": 999,
+        "mode": "logged",
+        "reward_version": "reward-other",
+        "discount": 0.5,
+        "learned_controller_available": not document["learned_controller_available"],
+        "applied_demand_tolerance": 0.1,
+    }
+    if field == "dynamics":
+        document["dynamics"] = {**document["dynamics"], "model_version": "other-version"}
+    else:
+        document[field] = replacements[field]
+
+
 @pytest.mark.parametrize(
-    ("field", "value"),
-    [
-        ("reward_version", "reward-other"),
-        ("discount", 0.5),
-        ("seed", 999),
-        ("learned_controller_available", True),
-        ("applied_demand_tolerance", 0.1),
-    ],
+    "field",
+    # safety_model は値が1つしか無い enum なので、欄の側は書き換えられない（中の側は下で試す）。
+    [key for key in EPISODE_MIRRORED_CONDITIONS if key != "safety_model"],
 )
-def test_invariant_1_b_rewriting_a_mirrored_field_is_refused(
-    unbacked: Setup, field: str, value: object
-) -> None:
+def test_invariant_1_b_rewriting_a_mirrored_field_is_refused(unbacked: Setup, field: str) -> None:
     """欄だけ書き換えた episode は、中の条件と食い違うので作れない。"""
     document = json.loads(unbacked.comparison.arms[0].episodes[0].model_dump_json())
-    document[field] = value
-    with pytest.raises(ValidationError, match="条件"):
+    _rewrite_field(document, field)
+    with pytest.raises(ValidationError, match=f"条件の {field} が episode の欄と一致しない"):
+        EpisodeResult.model_validate_json(json.dumps(document))
+
+
+@pytest.mark.parametrize("key", EPISODE_MIRRORED_CONDITIONS)
+def test_invariant_1_b2_rewriting_a_mirrored_condition_is_refused(
+    unbacked: Setup, key: str
+) -> None:
+    """中の条件だけ書き換えた episode も、欄と食い違うので作れない（9つの鍵すべて）。"""
+    assert len(EPISODE_MIRRORED_CONDITIONS) == 9
+    document = json.loads(unbacked.comparison.arms[0].episodes[0].model_dump_json())
+    document["other_conditions"][key] = {"tampered": key}
+    with pytest.raises(ValidationError, match=f"条件の {key} が episode の欄と一致しない"):
         EpisodeResult.model_validate_json(json.dumps(document))
 
 
@@ -320,6 +347,34 @@ def test_invariant_3_c_an_artifact_that_does_not_replay_the_arm_is_refused(
 
 
 def test_invariant_3_d_episodes_built_under_other_configs_are_refused(unbacked: Setup) -> None:
+    """episode ごとに**それぞれ妥当**でも、設定の digest が揃わない比較からは報告を作らない。
+
+    片方の arm だけを書き換えると比較の条件 hash で割れるので、同じ episode を**すべての arm で**
+    別の設定の digest に揃え、条件 hash も作り直す（validator は通る）。
+    """
+    document = json.loads(unbacked.comparison.model_dump_json())
+    for arm in document["arms"]:
+        episode = arm["episodes"][0]
+        episode["config_digests"]["safety"] = "e" * 64
+        episode["conditions_sha256"] = episode_conditions_sha256(
+            EpisodeConfigDigests.model_validate(episode["config_digests"]),
+            episode["other_conditions"],
+        )
+    document["conditions_sha256"] = conditions_digest(
+        [
+            (item["episode_id"], item["conditions_sha256"])
+            for item in document["arms"][0]["episodes"]
+        ]
+    )
+    comparison = PolicyComparison.model_validate_json(json.dumps(document))
+    with pytest.raises(PolicyEpisodeReportError, match="設定"):
+        unbacked.build(comparison)
+
+
+def test_invariant_3_e_a_comparison_that_bypassed_its_validator_is_refused(
+    unbacked: Setup,
+) -> None:
+    """`model_copy` で validator を迂回した比較は、報告の構築の入口で読み戻して拒む。"""
     baseline, arm = unbacked.comparison.arms
     episode = arm.episodes[0]
     digests = episode.config_digests.model_copy(update={"safety": "e" * 64})
@@ -329,21 +384,21 @@ def test_invariant_3_d_episodes_built_under_other_configs_are_refused(unbacked: 
         }
     )
     comparison = unbacked.comparison.model_copy(update={"arms": (baseline, tampered)})
-    with pytest.raises(PolicyEpisodeReportError, match="設定"):
+    with pytest.raises(ValidationError, match="条件 hash"):
         unbacked.build(comparison)
 
 
 # ---------------------------------------------------------------- 6. validated 化
 
 
-def _forged_passing_comparison(setup: Setup) -> PolicyComparison:
-    """**試験だけで作る**、gate を通る比較。
+def _forged_passing_comparison(comparison: PolicyComparison) -> PolicyComparison:
+    """**試験だけで作る**、gate を通る比較（validator を通らない）。
 
-    いまは反実仮想 artifact が無いので、環境は `promotable` を立てない。validated 化の経路を
-    試すために、validator を通さない `model_copy` で episode を昇格可能にし、Baseline の
-    reward を下げる（RL arm の action は環境が出したまま。artifact の表で再現できる）。
+    いまは反実仮想 artifact が無いので、環境は `promotable` を立てず、validator を通る形では
+    gate を通る比較を作れない。validated 化の**残りの照合**を試すために、`model_copy` で
+    episode を昇格可能にし、Baseline の reward を下げる（RL arm の action は環境が出したまま）。
+    **入口の読み戻しはこれを拒む**ので、使う試験は `bypass_revalidation` で入口だけを外す。
     """
-    baseline, arm = setup.comparison.arms
 
     def promotable(item: Any, *, penalty: float) -> Any:
         episodes = []
@@ -363,14 +418,39 @@ def _forged_passing_comparison(setup: Setup) -> PolicyComparison:
             episodes.append(episode.model_copy(update={"promotable": True, "steps": steps}))
         return item.model_copy(update={"episodes": tuple(episodes)})
 
-    return setup.comparison.model_copy(
-        update={"arms": (promotable(baseline, penalty=1.0), promotable(arm, penalty=0.0))}
+    baseline, *rl_arms = comparison.arms
+    return comparison.model_copy(
+        update={
+            "arms": (
+                promotable(baseline, penalty=1.0),
+                *(promotable(arm, penalty=0.0) for arm in rl_arms),
+            )
+        }
     )
 
 
-def _registered(setup: Setup, root: Path, **metadata_overrides: Any) -> tuple[ModelRegistry, Any]:
-    artifact_bytes = canonical_policy_artifact_bytes(setup.certified)
-    derived = policy_registry_metadata(setup.certified, artifact_bytes)
+@pytest.fixture
+def bypass_revalidation(monkeypatch: pytest.MonkeyPatch) -> None:
+    """入口の読み戻し（`revalidated_comparison()`）**だけ**を外す（試験の中だけ）。
+
+    入口が読み戻しで拒むことは `test_invariant_6_c` が別に確かめる。ここで外すのは、
+    validator を通る形では pass の比較を作れない間も、その先の照合を試すためである。
+    """
+
+    def isinstance_only(comparison: PolicyComparison) -> PolicyComparison:
+        if not isinstance(comparison, PolicyComparison):
+            raise TypeError("比較は PolicyComparison で渡す")
+        return comparison
+
+    monkeypatch.setattr(episode_module, "revalidated_comparison", isinstance_only)
+
+
+def _registered(
+    setup: Setup, root: Path, *, certified: Any = None, **metadata_overrides: Any
+) -> tuple[ModelRegistry, Any]:
+    certified = certified or setup.certified
+    artifact_bytes = canonical_policy_artifact_bytes(certified)
+    derived = policy_registry_metadata(certified, artifact_bytes)
     metadata = ArtifactMetadata.model_validate_json(policy_registry_metadata_json_bytes(derived))
     if metadata_overrides:
         metadata = ArtifactMetadata.model_validate(
@@ -418,9 +498,9 @@ def test_invariant_6_the_current_evidence_never_validates_a_policy(
 
 
 def test_invariant_6_b_a_passing_report_validates_only_the_certified_record(
-    tmp_path: Path, with_mpc: Setup
+    tmp_path: Path, with_mpc: Setup, bypass_revalidation: None
 ) -> None:
-    comparison = _forged_passing_comparison(with_mpc)
+    comparison = _forged_passing_comparison(with_mpc.comparison)
     report = with_mpc.build(comparison)
     gate = report.gate(with_mpc.key)
     assert gate.outcome is GateOutcome.PASS, gate
@@ -481,6 +561,8 @@ def test_invariant_6_b_a_passing_report_validates_only_the_certified_record(
         }
     )[0]
     refused(registry, ref, "設定の digest", training_config=other_training)
+    refused(registry, ref, "設定の digest", fan_policy=mpc_policy(authority="shadow"))
+    refused(registry, ref, "設定の digest", safety=safety_config(uniform_zone_min=0.3))
     # 対応の欠け・名指しの誤り。
     refused(registry, ref, "対応に無い", target="missing")
     refused(
@@ -496,6 +578,116 @@ def test_invariant_6_b_a_passing_report_validates_only_the_certified_record(
     assert revision == registry.inspect().revision
     assert record.status is ArtifactStatus.VALIDATED
     assert record.metadata.offline_evaluation_ref == report.evaluation_ref(with_mpc.key)
+
+
+def test_invariant_6_c_a_comparison_that_bypassed_its_validator_never_validates(
+    tmp_path: Path, with_mpc: Setup
+) -> None:
+    """validator を迂回した比較は、validated 化の入口で読み戻して拒む（何も書かない）。
+
+    報告も迂回した比較から作れないので、報告は入口を外して作り、入口だけを戻して試す。
+    """
+    comparison = _forged_passing_comparison(with_mpc.comparison)
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(episode_module, "revalidated_comparison", lambda item: item)
+        report = with_mpc.build(comparison)
+    assert report.gate(with_mpc.key).outcome is GateOutcome.PASS
+    with pytest.raises(ValidationError):
+        with_mpc.build(comparison)
+    registry, metadata = _registered(with_mpc, tmp_path / "bypassed")
+    before = registry.inspect()
+    with pytest.raises(ValidationError):
+        _validate(with_mpc, registry, metadata.ref, report, comparison)
+    assert registry.inspect() == before
+
+
+class TwoArmSetup:
+    """RL arm が2つある比較: 同じ episode 群を、**別の表**の certify 済み artifact で回した arm。
+
+    近似 simulator ではどの候補も Baseline を上回らない（常に `baseline` が選ばれる）ので、
+    2つ目の学習でだけ、選ぶ候補を**訪れた regime を差し替えた候補**に固定する
+    （`select_candidate` を試験の中で置き換える。探索と報告の検証が同じ関数を使う）。
+    """
+
+    def __init__(self, first: Setup, trained: Any) -> None:
+        environment = build_environment(trained, with_mpc=True)[0]
+        trainer = trainer_for(environment, first.settings)
+        visited = {
+            step.regime.value
+            for episode in first.comparison.arms[1].episodes
+            for step in episode.steps
+        }
+        chosen = next(
+            identifier
+            for identifier, _table in trainer.candidates()
+            if identifier.rsplit("-a", 1)[0] in visited
+        )
+        with pytest.MonkeyPatch.context() as patch:
+            patch.setattr(training_module, "select_candidate", lambda _outcomes: chosen)
+            training = trainer.train(SPECS, model_version="0.2.0", created_at=CREATED_AT)
+            self.second = trainer.certify(training)
+        self.first = first
+        self.second_key = training.comparison.arms[1].policy_version
+        baseline, first_arm = first.comparison.arms
+        self.comparison = PolicyComparison(
+            conditions_sha256=first.comparison.conditions_sha256,
+            arms=(baseline, first_arm, training.comparison.arms[1]),
+        )
+        self.certified = {first.key: first.certified, self.second_key: self.second}
+
+
+@pytest.fixture(scope="module")
+def two_arms(with_mpc: Setup, trained: Any) -> TwoArmSetup:
+    return TwoArmSetup(with_mpc, trained)
+
+
+def test_invariant_3_f_each_rl_arm_is_bound_to_its_own_artifact(two_arms: TwoArmSetup) -> None:
+    first = two_arms.first
+    assert (
+        two_arms.second.artifact.manifest.payload_sha256
+        != first.certified.artifact.manifest.payload_sha256
+    )
+    report = first.build(two_arms.comparison, certified=two_arms.certified)
+    assert [arm.policy_version for arm in report.arms[1:]] == [first.key, two_arms.second_key]
+    assert report.arms[2].rl_policy_identity == certified_identity(two_arms.second)
+    # artifact を取り違えると、表が arm の action を再現しない。
+    swapped = {first.key: two_arms.second, two_arms.second_key: first.certified}
+    with pytest.raises(PolicyEpisodeReportError, match="再現しない"):
+        first.build(two_arms.comparison, certified=swapped)
+
+
+def test_invariant_6_d_validation_targets_one_of_several_rl_arms(
+    tmp_path: Path, two_arms: TwoArmSetup, bypass_revalidation: None
+) -> None:
+    """先頭以外の arm を validated にでき、別の arm の artifact・記録は当てられない。"""
+    first = two_arms.first
+    comparison = _forged_passing_comparison(two_arms.comparison)
+    report = first.build(comparison, certified=two_arms.certified)
+    assert report.gate(two_arms.second_key).outcome is GateOutcome.PASS
+    registry, metadata = _registered(first, tmp_path / "second", certified=two_arms.second)
+    first_registry, first_metadata = _registered(first, tmp_path / "first")
+    arguments: dict[str, Any] = {
+        "certified": two_arms.certified,
+        "target": two_arms.second_key,
+    }
+
+    def refused(registry: ModelRegistry, ref: ArtifactRef, match: str, **overrides: Any) -> None:
+        before = registry.inspect()
+        with pytest.raises((ValueError, PolicyEpisodeReportError), match=match):
+            _validate(first, registry, ref, report, comparison, **(arguments | overrides))
+        assert registry.inspect() == before
+
+    # 別の arm の artifact の記録を、この arm として validated にしない。
+    refused(first_registry, first_metadata.ref, "照合済みの supervisor policy")
+    refused(registry, metadata.ref, "照合済みの supervisor policy", target=first.key)
+    # 対応を取り違えた artifact では、作り直しの束縛で割れる。
+    swapped = {first.key: two_arms.second, two_arms.second_key: first.certified}
+    refused(registry, metadata.ref, "再現しない", certified=swapped)
+
+    _validate(first, registry, metadata.ref, report, comparison, **arguments)
+    record = registry.inspect().artifacts[metadata.ref.key]
+    assert record.status is ArtifactStatus.VALIDATED
+    assert record.metadata.offline_evaluation_ref == report.evaluation_ref(two_arms.second_key)
 
 
 # ---------------------------------------------------------------- import の向き

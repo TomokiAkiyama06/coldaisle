@@ -201,6 +201,10 @@ class PolicyTrainingEvidence(_Frozen):
 
     policy は条件に入らない（決定記録 0058 §2.6）ので、この値は
     **「どの条件で Rule と比べたか」**を指す。
+
+    #105（決定記録 0074 §2.2）から、episode の条件 hash は2段（設定の digest と他の条件）で
+    作る。**それより前に作った artifact の値は v1 の算出**であり、同じ名前でも v2 の値と
+    比べられない（学習報告の版 `TRAINING_REPORT_SCHEMA_VERSION` 2 で区別する）。
     """
 
     @model_validator(mode="after")
@@ -685,7 +689,8 @@ def validate_supervisor_policy(
 
     - `target` が比較の RL arm で、その artifact の識別が `ref` と Registry の記録に一致する
       （`_check_registry_record()`。`promote_supervisor_policy()` と同じ照合）
-    - 渡した比較の canonical digest が report の `comparison_sha256` と一致する
+    - 渡した比較を**読み戻して検証し直し**（`revalidated_comparison()`）、その canonical digest が
+      report の `comparison_sha256` と一致する
     - その比較・検証済み `rl-policy.yaml`・Rule policy・**全 RL arm** の artifact から
       `build_policy_episode_report()` で作り直した bytes が、渡した report の bytes と一致する。
       Baseline の束縛・RL arm の表と action の束縛・1対1 もそこで再び通る
@@ -701,6 +706,7 @@ def validate_supervisor_policy(
     from coldaisle.control.evaluation.episode import (
         PolicyEpisodeReport,
         build_policy_episode_report,
+        revalidated_comparison,
     )
     from coldaisle.control.model.thermal import canonical_json_bytes as _bytes
     from coldaisle.control.rl.config import RlTrainingConfig
@@ -710,6 +716,9 @@ def validate_supervisor_policy(
         raise TypeError("episode の証拠は PolicyEpisodeReport で渡す（文字列では照合できない）")
     if not isinstance(comparison, PolicyComparison):
         raise TypeError("元の比較は PolicyComparison で渡す")
+    # **validator を迂回した比較（`model_copy` など）を入口で拒む。** isinstance と digest
+    # だけでは、条件 hash の2段検証も `promotable` の規則も効かないまま mark_validated() に届く。
+    comparison = revalidated_comparison(comparison)
     for value, expected_type, name in (
         (training_config, RlTrainingConfig, "rl-training.yaml"),
         (fan_policy, FanPolicyConfig, "fan-policy.yaml"),
