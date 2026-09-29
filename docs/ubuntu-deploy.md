@@ -60,11 +60,26 @@ sudo usermod -aG dialout coldaisle
 sudo usermod -aG dialout "$USER"
 
 sudo install -d -o coldaisle -g coldaisle -m 0750 /var/lib/coldaisle
+# コードと config/ は root の所有のまま置く（coldaisle からは読み取りだけ）
 sudo git clone <このリポジトリの URL> /opt/coldaisle
-sudo chown -R coldaisle:coldaisle /opt/coldaisle
-sudo -u coldaisle ln -s /var/lib/coldaisle /opt/coldaisle/var
-cd /opt/coldaisle && sudo -u coldaisle uv sync --no-dev
+sudo ln -s /var/lib/coldaisle /opt/coldaisle/var
+
+# venv も root が作る。uv は sudo の PATH に無いことが多いので実体のパスを渡し、
+# Python はシステムのもの（Ubuntu 24.04 の python3.12）を使う
+cd /opt/coldaisle
+sudo UV_PYTHON_DOWNLOADS=never "$(command -v uv)" sync --no-dev --python /usr/bin/python3.12
 ```
+
+**`/opt/coldaisle` を `coldaisle` の所有にしません。** 常駐する daemon / api が
+乗っ取られても、コードや `config/`（`rules.yaml`・`safety.yaml`・`fan-policy.yaml`
+など）を書き換えられないようにするためです。サービスが書くのは `var`
+（= `/var/lib/coldaisle`。unit の `StateDirectory=`）だけです。
+`config/calibration.json` や `memory/` を書く `coldaisle-calibrate --apply` /
+`coldaisle-memory --apply` は、確認を経て**管理者が `sudo` で**実行します。
+
+システムに Python 3.12 が無い場合は、uv の管理する Python を `/opt` 側に置きます
+（`UV_PYTHON_INSTALL_DIR=/opt/coldaisle-python`）。サービス用ユーザーのホーム
+（`/var/lib/coldaisle`。データの置き場所）の下へ Python を入れないためです。
 
 秘匿情報を使う場合（通知の宛先など）。
 
@@ -166,7 +181,7 @@ curl -s http://127.0.0.1:8000/api/v1/health
    取り込みデーモン（シリアル）と同じ DB へ同時に書いてよいかは試していません。
    再生の間は `coldaisle-daemon.service` を止めておくのが安全です
 6. **較正値と運用メモリ。** `config/calibration.json` と `memory/` をリポジトリで
-   管理しているなら、`git pull` で揃います。手元だけで変えたものがあれば Mac から
+   管理しているなら、`sudo git -C /opt/coldaisle pull` で揃います。手元だけで変えたものがあれば Mac から
    コピーします
 7. 移行後に1回 `sudo systemctl start coldaisle-rollup.service` を実行し、
    `journalctl -u coldaisle-rollup` でロールアップが通ることを確かめます

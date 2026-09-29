@@ -134,6 +134,12 @@ def test_exec_start_points_at_a_real_entry_point(name):
     assert name in scripts()
 
 
+def test_the_report_waits_for_the_rollup():
+    """停止をまたいで両タイマーが同時に追いついても、report は rollup のあと（0017 §2.1）。"""
+    unit = parse_unit(SYSTEMD / "coldaisle-report.service")
+    assert "coldaisle-rollup.service" in " ".join(unit["Unit"].get("After", []))
+
+
 def test_the_ingest_daemon_reads_serial_with_dialout():
     unit = parse_unit(SYSTEMD / "coldaisle-daemon.service")
     assert "--source serial" in one(unit, "Service", "ExecStart")

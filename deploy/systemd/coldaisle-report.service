@@ -5,6 +5,9 @@
 
 [Unit]
 Description=coldaisle daily report
+# 平常時は時刻の差で rollup が先に終わる。停止をまたいで両タイマー（Persistent=true）が
+# 起動直後に同時に追いついたときも、rollup の完了を待ってから走らせる
+After=coldaisle-rollup.service
 
 [Service]
 Type=oneshot
