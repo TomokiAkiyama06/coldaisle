@@ -1,7 +1,7 @@
 # 決定記録 0069: Ubuntu 常駐化のテンプレート（固定デバイス名の優先・systemd / udev の置き方）
 
 - **種別**: Decision Record
-- **Status**: Proposed（本 PR のマージをもって FINAL。**実機での再起動・差し替えの確認は別**。§5-1）
+- **Status**: FINAL（2026-09-29、リポジトリ所有者が承認。**実機での再起動・差し替えの確認は別**。§5-1）
 - **Date**: 2026-09-29
 - **Supersedes**: なし（[`0023`](0023-serial-source.md) §2.6 を補う。名前の順という規則は残る）
 - **関連**: `docs/requirements.md` S-09 / FR-102 / NFR-01 /
