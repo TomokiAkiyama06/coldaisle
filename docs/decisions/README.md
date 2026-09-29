@@ -137,3 +137,4 @@ docs/decisions/NNNN-<slug>.md      例: 0002-metric-naming.md
 | [0066](0066-workload-hint-stage-b-conditions.md) | Workload Hint の Stage B 条件の精緻化（冷却の単調性は構成制限＋網羅試験＋実行時の二重解法で保証・試験の成果物はソースと実行環境に束縛・ヒントの期限は boot id と CLOCK_BOOTTIME で数え、行は追記順に処理・終端状態と取り込み境界を制御デーモンが永続化） | FINAL |
 | [0067](0067-acoustic-measurement-study.md) | 騒音は「うるさいか」の回答で測る（騒音計を使わない・UI は表示専用のまま回答は 0045 の入口へ・回答は Fan を変えない・effective の Demand と結びつける・曲線は `approximate` のまま） | FINAL |
 | [0068](0068-dashboard-status-strip-and-fault-cards.md) | ダッシュボードの状態の帯（`server-health` の signal を描く）と、異常なカードの見た目（stale の取り消し線・欠測の斜線＋赤枠） | FINAL |
+| [0073](0073-air-balance-control-config-integration.md) | `air-balance.yaml` を4つ目の Control Config として一括検証に統合する（束ねた版 11・不在は `config_invalid`・未校正は Air Balance を無効にして起動・`ControlTick` v10 に effective demand 基準の `estimated_flow` と Air Balance の記録） | Proposed |
