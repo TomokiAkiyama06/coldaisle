@@ -199,9 +199,23 @@ report は `control/evaluation/episode.py` に置き、`control.rl` の型を**�
 （`control.rl` は `control.evaluation` を import しない。向きは一方向）。
 **呼び出し側が数字や hash を文字列で渡す口は作らない。** report の欄は、すべてこれらの入力から導く。
 `PolicyComparison` の arm は `policy` と `policy_version` しか持たず、model ID や bytes hash を含む
-`SupervisorPolicyIdentity` を比較からは作れない。そこで RL arm ごとに artifact を受け取り、
-**`certified_identity()` の版が arm の `policy_version` と一致しなければ report を作らない**。
-RL arm に対応する artifact が欠けている・余っている場合も作らない
+`SupervisorPolicyIdentity` を比較からは作れない。そこで RL arm ごとに artifact を受け取り
+（arm の `policy_version` をキーにした対応。キーは**対応を引くためだけ**に使う）、次の**表と action の証拠**で
+arm を artifact へ束縛する。**版の文字列どうしの一致では束縛しない。**
+`SupervisorPolicyTrainer` は RL arm を `<model_id>-<候補識別子>` の版で回し（`training.py` の
+`_run_candidate()`）、`certified_identity().version` は manifest の意味論的な `model_version`（例 `0.1.0`）で、
+**2つは別の名前空間**である。版の一致を要求すると、実際の学習出力から report を1つも作れない
+
+- **表**: artifact の `manifest.payload_sha256` を束縛の digest にする。`certify()` は、この値が
+  **選ばれた候補の `CandidateOutcome.table_sha256`** と一致し、設定から作り直した表の hash と一致することを
+  確かめている（`training.py` の `certify()`）。report はこの digest を arm の欄として残す
+- **action**: 比較のその arm の全 episode・全 step の `StepRecord.action` を、artifact の表が
+  すべて再現する（`first_unreplayed_step(artifact.payload, arm)` が `None`。`certify()` と学習報告の照合と同じ関数）。
+  1 step でも再現しなければ report を作らない
+- **1対1**: 異なる RL arm に同じ artifact（同じ `payload_sha256`）を当てない。RL arm に対応する artifact が
+  欠けている・余っている場合も作らない
+- arm の `policy_version` は比較が持つラベルとしてそのまま report に写す。**識別（model ID・版・bytes hash）は
+  `certified_identity()` からだけ取り**、ラベルから導かない
 
 | 欄 | 出どころ |
 |---|---|
@@ -211,7 +225,7 @@ RL arm に対応する artifact が欠けている・余っている場合も作
 | `rl-policy.yaml` の digest と `minimum_reward_improvement` の値 | 入力の検証済み `RlPolicyConfig` から |
 | `training_mode` / dynamics の provenance / `safety_model` / `reward_version` / `applied_demand_tolerance` | episode の値。**arm 間で揃っていなければ作らない** |
 | `learned_controller_available` | 比較から導く（欄として受け取らない） |
-| arm ごと: `policy` / `policy_version` / RL なら `SupervisorPolicyIdentity` | Rule は版、RL は入力の `certify()` を通した artifact の `certified_identity()` から |
+| arm ごと: `policy` / `policy_version` / RL なら `SupervisorPolicyIdentity` と表の digest | Rule は版、RL は入力の `certify()` を通した artifact の `certified_identity()` と `manifest.payload_sha256` から（上の表と action の証拠で arm に束縛したもの。`policy_version` はラベルとして写すだけ） |
 | arm ごと: 安全側の数（絶対上限の超過・floor 不足・範囲外 action・最小 margin） | `EpisodeSafety` の合計と **worst-case episode** |
 | arm ごと: coverage（採点できた step・割合・理由別の内訳・`usable_for_comparison` でない episode 数） | `EpisodeCoverage` |
 | arm ごと: 共通の長さ（episode ごとの全 arm の採点できた step 数の最小）で揃えた reward 平均 | 0058 §2.6 / 0061 §2.7 と同じ規則。**使った長さを欄として残す** |
@@ -276,7 +290,17 @@ supervisor policy について、その参照の出どころはこれまで決�
 - validated 化は **policy 専用の入口 `validate_supervisor_policy()`**（`control/supervisor/artifact.py`。
   0061 §2.6 の `promote_supervisor_policy()` と対になる）だけで行う。入力は report に加えて
   **元の `PolicyComparison`**・検証済みの `rl-training.yaml` / `fan-policy.yaml` / `safety.yaml` / `rl-policy.yaml`・
-  `certify()` を通した artifact・Baseline の Rule policy である。次を確かめてから `ModelRegistry.mark_validated()` へ渡す
+  `certify()` を通した artifact・Baseline の Rule policy・validated にする Registry の `ref` と `expected_revision` である。
+  次を確かめてから `ModelRegistry.mark_validated()` へ渡す
+  - **validated にする対象が、渡した `certify()` 済みの artifact そのものである。** `ref` が supervisor policy で、
+    その `(model_id, version)` が `certified_identity(certified)` の model ID・版と一致する。Registry の
+    `expected_revision` の snapshot にその `ref` の記録があり、記録の checksum（`metadata.sha256`）が
+    `certified_identity(certified).artifact_sha256` と一致し、artifact から導いた Registry metadata と
+    記録の metadata に食い違いが無い（`registry_metadata_mismatches()` が空）。1つでも満たさなければ
+    **拒否し、`mark_validated()` を呼ばない**。`promote_supervisor_policy()` の照合と同じ内容である。
+    これが無いと、artifact A と A の通る report で**別の candidate B** を validated にでき、B が A の
+    `offline_evaluation_ref` を持ったまま、B の shadow 証拠で `promote_supervisor_policy()` を通る
+    （昇格は `offline_evaluation_ref` を検証し直さない）
   - 渡した比較の canonical digest が report の `comparison_sha256` と一致し、**その比較・検証済み
     `rl-policy.yaml`・渡した `certify()` 済みの artifact から report を作り直した bytes が、渡した report の bytes と一致する**。
     report は集計だけを持ち action の列を持たないので、action の照合は元の比較に対して行う。
