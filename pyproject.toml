@@ -39,6 +39,8 @@ coldaisle-daemon = "coldaisle.daemon:main"
 coldaisle-rollup = "coldaisle.rollup_job:main"
 # 日次レポート。cron から毎朝、ロールアップのあとに呼ぶ（#25）
 coldaisle-report = "coldaisle.report:main"
+# 連続運転テスト（soak）の集計。**既存の DB を読むだけ**（#47）
+coldaisle-soak-report = "coldaisle.soak:main"
 # 故障疑いの案件資料。**送信はしない**（#39）
 coldaisle-escalate = "coldaisle.escalate:main"
 # 運用メモリの更新案。**既定では書かない**（#40）

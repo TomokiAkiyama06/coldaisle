@@ -1,0 +1,43 @@
+# coldaisle 取り込みデーモン（#57 / FR-101〜103 / NFR-01）のテンプレート。
+#
+# **テンプレートである。** `User=` / `Group=` は仮の値。導入の手順は
+# docs/ubuntu-deploy.md。シリアルポートを開くのはこのプロセスだけ（AGENTS.md ルール6）。
+#
+# ポートは自動検出に任せる。udev ルール（deploy/udev/）が作る `/dev/server-sensors`
+# があれば最優先で使う（決定記録 0069 §2.1）。
+
+[Unit]
+Description=coldaisle ingest daemon (serial sensors)
+Documentation=file:///opt/coldaisle/docs/ubuntu-deploy.md
+
+# 再起動を諦めない。既定の StartLimit に当たると、監視が止まったまま戻らない
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=coldaisle
+Group=coldaisle
+# /dev/server-sensors（udev で GROUP="dialout"）を読むため
+SupplementaryGroups=dialout
+WorkingDirectory=/opt/coldaisle
+# /var/lib/coldaisle を作り、User= の所有にする
+StateDirectory=coldaisle
+StateDirectoryMode=0750
+# 通知の宛先など秘匿情報（.env.example の変数名）。無くても起動する
+EnvironmentFile=-/etc/coldaisle/coldaisle.env
+ExecStart=/opt/coldaisle/.venv/bin/coldaisle-daemon --source serial --db /var/lib/coldaisle/coldaisle.db
+
+# NFR-01: クラッシュ後10秒以内に復帰する
+Restart=always
+RestartSec=5
+
+# ログは JSON Lines を標準出力へ出す。journald が受ける（`journalctl -u coldaisle-daemon`）
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=coldaisle-daemon
+
+NoNewPrivileges=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

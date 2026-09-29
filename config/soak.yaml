@@ -1,0 +1,31 @@
+# 連続運転テスト（soak）の集計（#47 / issues/15-soak-test.md）
+#
+# `coldaisle-soak-report` が**既存の DB を読むだけ**で使います。
+# 期間の始まりは `--start` で渡し、終わりは `--end` か下の `duration_hours` で決まります。
+#
+#   uv run coldaisle-soak-report --start 2026-08-24T09:00
+#
+# 集計元は生データ（`readings`）です。`suspect` の件数はロールアップに残らないため、
+# **生データの保持期間（`config/retention.yaml`）のうちに**走らせてください。
+
+# `--start` / `--end` にタイムゾーンが無いときの解釈と、表示に使うローカル時刻
+timezone: "Asia/Tokyo"
+
+# `--end` を省いたときの期間の長さ。受入基準は24時間連続運転
+duration_hours: 24
+
+# 合否判定の閾値。**判定するのは受入基準に書かれた項目だけ**です。
+# seq の欠損・queue drops・suspect 件数は数えて表に出しますが、閾値を持ちません
+# （欠測率の分子にはすでに入っています）。
+thresholds:
+  # 欠測率がこれ**未満**なら合格（NFR-02「欠測率 1%未満」）。
+  # 周期的に届くデバイスのチャネルごとに出し、**最も悪いチャネル**で判定します（決定記録 0070）
+  missing_ratio_below: 0.01
+  # デバイス再起動（`sys.device_restarts`）がこの回数**以下**なら合格
+  # （受入基準「意図しない再起動が0回」。DB では意図したかどうかを区別できません）
+  max_device_restarts: 0
+
+# Markdown と JSON の保存先。`~` は展開します。
+# `docs/` には置きません（室温の推移は生活パターンそのもの。決定記録 0017 §2.4 と同じ理由）。
+# `docs/soak-test-YYYY-MM-DD.md` への記録は、人が内容を確かめてから書きます
+output_dir: "var/soak"
