@@ -45,6 +45,8 @@ uv run coldaisle-fand --max-ticks 5 # 3系統Fan制御デーモン（simulated b
 uv run coldaisle-fand --config-dir var/control-config  # 4ファイル（air-balance.yaml を含む）を置いた設定で起動。無ければ全 zone Max（決定記録 0073）
 COLDAISLE_DB=var/coldaisle.db uv run uvicorn coldaisle.api:app --host 127.0.0.1 --port 8000
 COLDAISLE_DB=var/coldaisle.db uv run uvicorn coldaisle.server:app --port 8000  # + AI ツールの窓口
+# エアフロー画面: http://127.0.0.1:8000/airflow.html（制御の状態は /api/v1/control/latest の trace から。
+#   ?mock=normal|override|throttle で模擬データだけを表示。#106 / 決定記録 0046 / 0071）
 ```
 
 API の設定は環境変数（`COLDAISLE_DB` / `COLDAISLE_METRICS` / `COLDAISLE_MAX_POINTS` ほか。
@@ -261,7 +263,7 @@ src/coldaisle/
     shadow/     # Shadow Mode。適用しなかった提案の記録と実測照合（書き込み経路を持たない）
   notify/     # L2: 通知（Slack / LINE / stdout）。秘匿情報は .env
   ai/         # L3: LLM Provider抽象、ツール、プロンプト。制御権限を持たない
-  web/        # L4: 静的アセット
+  web/        # L4: 静的アセット。airflow-trace.js が decision trace の版の解釈を1か所で持つ（0071 §2.3）
 firmware/     # ESP32-S3 Arduino スケッチ。**コンパイルは人の手**（#11 / 決定記録 0022 §2.9）
 deploy/       # Ubuntu 常駐化のテンプレート（systemd / udev）。**仮の値だけ**。手順は docs/ubuntu-deploy.md（#57）
 config/       # rules.yaml, calibration.json, coldaisle.toml, evaluation.yaml, drift.yaml, rl-training.yaml, soak.yaml（Control Config の4ファイル fan-hardware / safety / fan-policy / air-balance は実運用のものを置かない。docs/control-config.md）

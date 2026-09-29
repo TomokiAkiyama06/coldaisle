@@ -48,7 +48,8 @@ SCRIPT = WEB_ROOT / "airflow.js"
 MOCK = WEB_ROOT / "airflow-mock.js"
 STYLES = WEB_ROOT / "airflow.css"
 STATUS = WEB_ROOT / "airflow-status.js"
-ASSETS = [PAGE, SCRIPT, MOCK, STATUS, STYLES]
+TRACE = WEB_ROOT / "airflow-trace.js"
+ASSETS = [PAGE, SCRIPT, MOCK, STATUS, TRACE, STYLES]
 
 ALLOWED_URLS = {"http://www.w3.org/2000/svg"}
 URL_PATTERN = re.compile(r"https?://[^\s\"'()]+")
@@ -96,7 +97,8 @@ def test_the_dashboard_links_to_the_page():
 
 def test_the_config_endpoint_returns_the_thresholds_from_yaml(client):
     body = client.get("/api/v1/airflow/config").json()
-    expected = yaml.safe_load(_text(AIRFLOW_UI_PATH))["air_temperature"]
+    shipped = yaml.safe_load(_text(AIRFLOW_UI_PATH))
+    expected = shipped["air_temperature"]
     assert body == {
         "schema_version": 1,
         "air_temperature": {
@@ -105,6 +107,7 @@ def test_the_config_endpoint_returns_the_thresholds_from_yaml(client):
             "provisional": expected["provisional"],
         },
         "cpu_utilization": {"measured": None},  # collector の状態が無い = 分からない
+        "control_trace": shipped["control_trace"],  # trace の古さの倍数（決定記録 0071 §2.6）
     }
 
 
@@ -134,7 +137,11 @@ def test_bad_thresholds_are_rejected(thresholds):
     """段数違い・逆順・重複は起動時に落とす。**ある温度が何色になるか読めなくなる。**"""
     with pytest.raises(ValidationError):
         AirflowUiSettings.model_validate(
-            {"version": 1, "air_temperature": {"thresholds_c": thresholds, "provisional": True}}
+            {
+                "version": 1,
+                "air_temperature": {"thresholds_c": thresholds, "provisional": True},
+                "control_trace": {"stale_after_tick_periods": 3.0, "provisional": True},
+            }
         )
 
 
@@ -149,6 +156,9 @@ def test_non_finite_thresholds_are_rejected(tmp_path, bad, position):
         "version: 1\n"
         "air_temperature:\n"
         f"  thresholds_c: [{', '.join(thresholds)}]\n"
+        "  provisional: true\n"
+        "control_trace:\n"
+        "  stale_after_tick_periods: 3.0\n"
         "  provisional: true\n",
         encoding="utf-8",
     )
@@ -186,8 +196,16 @@ def test_no_write_paths(asset):
 
 def test_script_reads_only_documented_endpoints():
     used = set(re.findall(r'"(/api/v1/[a-z/]+)"', _text(SCRIPT)))
-    assert used == {"/api/v1/latest", "/api/v1/health", "/api/v1/series", "/api/v1/airflow/config"}
+    assert used == {
+        "/api/v1/latest",
+        "/api/v1/health",
+        "/api/v1/series",
+        "/api/v1/airflow/config",
+        "/api/v1/control/latest",  # decision trace（決定記録 0071 §2.2）
+    }
     assert re.findall(r"/api/", _text(MOCK)) == [], "模擬データのファイルは API を叩かない"
+    # 版の変換は応答を受け取るだけ。自分では何も取りに行かない
+    assert "fetch(" not in _text(TRACE)
 
 
 # ---------------------------------------------------------------- 模擬データの分離
@@ -228,12 +246,18 @@ def test_the_script_holds_no_mock_values():
 # ---------------------------------------------------------------- 未接続・未取得
 
 
-def test_control_state_is_unconnected_on_real_data():
+def test_control_state_without_a_trace_is_not_shown_as_normal():
+    """trace が無い・未対応の版・読めない・取得できないときは、その語を出す。
+
+    決定記録 0046 §2.3 / 0071 §2.3。
+    """
     script = _text(SCRIPT)
-    assert "control: null, // 実データでは常に null（未接続）" in script
+    absence = _function(script, "function controlAbsence()")
+    for word in ("未接続", "未対応の版", "記録を読めない", "取得できない", "確認中"):
+        assert f'"{word}"' in absence, word
     for name in ("renderControl", "renderZones", "renderTrace", "renderBalance"):
         body = script[script.index(f"function {name}()") :][:2500]
-        assert "未接続" in body, f"{name} が未接続を出さない"
+        assert "controlAbsence()" in body, f"{name} が制御の状態の欠けを言わない"
 
 
 def test_missing_values_are_named():
@@ -319,7 +343,7 @@ def test_no_external_references(asset):
     assert not found, f"{asset.name} が外部を参照している: {sorted(found)}"
 
 
-@pytest.mark.parametrize("asset", [SCRIPT, MOCK, STATUS])
+@pytest.mark.parametrize("asset", [SCRIPT, MOCK, STATUS, TRACE])
 def test_script_does_not_use_inner_html(asset):
     text = _text(asset)
     for dangerous in ("innerHTML", "outerHTML", "insertAdjacentHTML", "document.write", "eval("):
@@ -451,7 +475,7 @@ def test_the_throttle_mock_is_selectable():
     assert '"gpu.0.throttle.hw_thermal": 1' in _text(MOCK)
 
 
-@pytest.mark.parametrize("asset", [SCRIPT, MOCK, STATUS])
+@pytest.mark.parametrize("asset", [SCRIPT, MOCK, STATUS, TRACE])
 def test_script_parses(asset):
     """構文エラーで真っ白な画面にならないこと。"""
     assert subprocess.run([_node(), "--check", str(asset)], capture_output=True).returncode == 0

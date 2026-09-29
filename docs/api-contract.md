@@ -325,7 +325,8 @@ coldaisle のエアフロー画面（`/airflow.html`、#106）が使う**表示�
 {
   "schema_version": 1,
   "air_temperature": {"unit": "C", "thresholds_c": [27.0, 28.0, 29.0, 30.0], "provisional": true},
-  "cpu_utilization": {"measured": true}
+  "cpu_utilization": {"measured": true},
+  "control_trace": {"stale_after_tick_periods": 3.0, "provisional": true}
 }
 ```
 
@@ -341,6 +342,13 @@ coldaisle のエアフロー画面（`/airflow.html`、#106）が使う**表示�
 （#145）。`disabled` → `false`、`ok` / `degraded` → `true`、`unavailable`・状態なし → `null`（分からない）。
 `false` のとき画面は CPU 使用率を「未計測」と出します。無効にする前の行が `/latest` に残りうるため、
 行の有無では判断しません。API 側の設定ファイルや OS からは決めません（collector は別の設定で動きうる）。
+
+`control_trace.stale_after_tick_periods` は、画面が decision trace を「古い」と言う倍数です（#106 /
+決定記録 0071 §2.6 / §5 #1）。`GET /api/v1/control/latest` の `age_ms` が、その trace 自身の
+`body.runtime.tick_period_ms`（v8 以降）のこの倍を超えたら、画面は「古い」と出し、制御の状態を
+いまの状態として見せません（正常の緑を外し、値に取り消し線を引く）。v1〜v7 の trace は周期を持たないので
+経過時間だけを出し、`age_ms` が負のときは判定不能とします。1 より大きい有限の値で、
+`provisional: true` の間は仮の値です。**API は古さを判定しません**（`safety.yaml` も読みません）。
 
 ### `GET /api/v1/events`
 
