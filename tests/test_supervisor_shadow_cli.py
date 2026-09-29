@@ -380,6 +380,20 @@ def test_a_trace_from_another_fan_policy_rejects_the_whole_run(setup: Fixture) -
     assert not setup.out.exists()
 
 
+def test_a_rejected_run_leaves_an_earlier_output_untouched(setup: Fixture) -> None:
+    """拒否した run は既存の `--out` を置き換えない。成功した run は一時ファイルを残さない。"""
+    setup.store(restart_rows(setup))
+    assert main(setup.argv()) == 0
+    earlier = setup.out.read_bytes()
+    assert list(setup.out.parent.glob(f".{setup.out.name}*")) == []
+
+    # 同じ DB へ別の fan-policy の行を1つ足す。これで run 全体が拒否される。
+    setup.store([row(setup.tick(3, ts(30), setup.paired(3, ts(30)), policy_sha256="f" * 64))])
+
+    assert main(setup.argv()) == 1
+    assert setup.out.read_bytes() == earlier
+
+
 def test_an_index_that_disagrees_with_the_body_rejects_the_run(setup: Fixture) -> None:
     """索引と本文が食い違う行は run ごと拒む（0053 §2.4）。"""
     tick = setup.tick(1, ts(1), setup.paired(1, ts(1)))

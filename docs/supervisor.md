@@ -71,6 +71,13 @@ rl_artifact: {model_id: rl-supervisor, version: 0.1.0}
 （`SupervisorShadowSummary` v2 そのもの）・`summary_sha256`・`filtered`・`period`・
 `fan_policy_sha256` を持つ。生成時刻を持たず、同じ入力からは同じ bytes になる。
 
+終了コードと出力ファイルの対応:
+
+- **0**: 包みを一時ファイルへ書いてから `--out` へ置き換えた。`--out` が変わるのはこのときだけ
+- **1**: run を拒否した。`--out` には**触れない**。以前の run の包みが残っていても、それは
+  **今回の結果ではない**（ログの `stale_out_exists` で分かる）。昇格に渡す前に、包みの
+  `period` と `fan_policy_sha256` が意図した run と一致することを確かめる
+
 **昇格に使うのは `summary` だけである。** `read_run_report()` で読み戻した `.summary` を
 `promote_supervisor_policy()` へ渡す。昇格の入口は、昇格の時点で読んだ検証済み
 `rl-policy.yaml` の `shadow`（`shadow_config`）を必須にとり、集計の `minimum_ticks` /

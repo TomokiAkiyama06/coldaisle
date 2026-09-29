@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 from collections.abc import Iterable
 from pathlib import Path
 from typing import Any, Literal, Self
@@ -341,9 +342,18 @@ def build_run_report(
 
 
 def write(report: SupervisorShadowRunReport, path: Path) -> Path:
-    """包みを書き出す。**書くのはこの path だけ**（DB・Registry・設定・trace には書かない）。"""
+    """包みを書き出す。**書くのはこの path だけ**（DB・Registry・設定・trace には書かない）。
+
+    同じディレクトリの一時ファイルへ書いてから置き換える。途中で落ちても `path` に
+    書きかけの包みが残らず、`path` が変わるのは書き出しが最後まで済んだときだけになる。
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_bytes(render(report))
+    tmp = path.with_name(f".{path.name}.tmp")
+    try:
+        tmp.write_bytes(render(report))
+        os.replace(tmp, path)
+    finally:
+        tmp.unlink(missing_ok=True)
     return path
 
 
@@ -415,6 +425,9 @@ def main(argv: list[str] | None = None) -> int:
             extra={
                 logs.FIELDS_KEY: {
                     "reason": str(error),
+                    # 既存の --out は消さない。残っていても**今回の run の結果ではない**。
+                    "out": str(args.out),
+                    "stale_out_exists": args.out.exists(),
                     "start_ms": period.start_ms,
                     "end_ms": period.end_ms,
                 }
