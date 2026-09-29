@@ -349,6 +349,8 @@ coldaisle が NVML / lm-sensors も収集し、`GET /api/v1/server-health` を�
 | FR-306 | `WS  /api/v1/stream` | 新サンプルをpush |
 | FR-308 | `GET /api/v1/server-health` | **Workspace GPUパネル向けの統合ビュー**。signal / summary / gpu / environment / alerts / sources / compute_mode_advisory（スキーマは `docs/api-contract.md`） |
 | FR-309 | `GET /api/v1/events?from=&to=&window=&kind=&limit=` | 記録された事象（GPU Mode の切り替え・Workload Hint の申告）の一覧。タイムライン注釈用（読み取り専用。スキーマは `docs/api-contract.md`）。Workload Hint は申告であって実測ではない（決定記録 [0064](decisions/0064-workload-hint-entry-and-supervisor-prior.md)） |
+| FR-311 | `GET /api/v1/control/latest` / `GET /api/v1/control/traces?from=&to=&window=&after=&limit=` | 制御の decision trace の読み出し（読み取り専用）。本文は保存した JSON をそのまま返し、版の解釈は読む側で行う。ページングは記録した順（`seq`）のキーセットで、上限を超えても黙って落とさない。**LLM のプロンプトへ直接入れない**（FR-504。スキーマは `docs/api-contract.md`、決定記録 [0071](decisions/0071-control-trace-read-api.md)） |
+| FR-312 | `GET /api/v1/events/{id}` | 記録された事象を ID で1件引く（読み取り専用。無ければ 404。決定記録 [0071](decisions/0071-control-trace-read-api.md) §2.7） |
 | FR-310 | Unix ソケット `coldaisle-eventd`（HTTP ではない） | **GPU Mode イベントと Workload Hint の唯一の書き込み経路**。Workspace の GPU Manager が Mode 変更を、学習ジョブ等の起動側が負荷のヒントを通知するために存在する。読み取り API とは別プロセスの書き込み専用入口で、ファイル権限と `SO_PEERCRED` で接続相手を限定し、`events` 表へ追記するだけ（決定記録 [0045](decisions/0045-local-socket-write-entry.md)）。Workload Hint は `system_state` に映さず、現時点（Stage A）では記録のみで制御は読まない（決定記録 [0064](decisions/0064-workload-hint-entry-and-supervisor-prior.md) §2.4 / §2.10） |
 | FR-307 | HTTP API の全エンドポイントは **読み取り専用**（例外なし）。書き込みは FR-310 の Unix ソケットだけが受ける |
 

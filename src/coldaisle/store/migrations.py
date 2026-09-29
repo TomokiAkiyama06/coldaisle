@@ -115,6 +115,8 @@ def apply_pending(
     落ちる。`busy_timeout` では防げない（待つ前に判定が終わっているため）。
     `BEGIN IMMEDIATE` でロックを取ってから判定し直す。
 
+    SQL は名前付きパラメータ `:now_ms` で ``now_ms``（ストアの時計）を参照できる。
+
     適用は丸ごと成功するか丸ごと巻き戻る。中途半端なスキーマが残ると、
     次回の起動が「テーブルが既にある」で失敗し、手作業でしか復旧できない。
     """
@@ -129,7 +131,9 @@ def apply_pending(
         applied: list[int] = []
         for migration in _pending(conn, migrations):
             for statement in _statements(migration.read_sql()):
-                conn.execute(statement)
+                # `:now_ms` を参照できる（0007 の `legacy_until_ms`）。migration の SQL に
+                # 時刻を書き込むと、適用した時点ではなく書いた時点の値になるため
+                conn.execute(statement, {"now_ms": now_ms})
             conn.execute(
                 "INSERT INTO schema_version (version, applied_ms) VALUES (?, ?)",
                 (migration.version, now_ms),

@@ -24,6 +24,9 @@ from coldaisle.store import migrations
 from coldaisle.store.models import (
     AlertRecord,
     AlertSeverity,
+    ControlTraceCursorPrunedError,
+    ControlTracePage,
+    ControlTracePruneState,
     ControlTraceRecord,
     DeviceRecord,
     EventRecord,
@@ -32,6 +35,7 @@ from coldaisle.store.models import (
     RollupPoint,
     Sample,
     SensorRecord,
+    SequencedControlTrace,
     SeriesPoint,
     Stats,
     validate_metric,
@@ -40,6 +44,9 @@ from coldaisle.store.quality import QualityRules
 
 P95 = 0.95
 """FR-303 が要求する分位点。"""
+
+_SEQUENCED_TRACE_COLUMNS = "seq, ts_ms, tick_id, schema_version, trace_json"
+"""読み取り API が読む `control_traces` の列（決定記録 0071 §2.2a）。"""
 
 
 def combine_minutes_sql(
@@ -397,20 +404,48 @@ class SqliteStore:
             trace_json=trace_json,
         )
         with self.transaction():
+            # `seq` は挿入と同じ文で振る（決定記録 0071 §2.2a）。`pruned_through_seq` も見るので、
+            # 表が全部消えても番号は巻き戻らず、古い cursor が新しい行を指さない。
+            # 捨てた挿入（重複）の番号は使わないため、`seq` は欠番を持ちうる
             cursor = self._conn.execute(
                 "INSERT OR IGNORE INTO control_traces "
-                "(ts_ms, tick_id, schema_version, trace_json) VALUES (?, ?, ?, ?)",
+                "(seq, ts_ms, tick_id, schema_version, trace_json) "
+                "SELECT MAX(COALESCE((SELECT MAX(seq) FROM control_traces), 0), "
+                "           (SELECT pruned_through_seq FROM control_trace_prune)) + 1, "
+                "       ?, ?, ?, ?",
                 (trace.ts_ms, trace.tick_id, trace.schema_version, trace.trace_json),
             )
         return cursor.rowcount == 1
 
     def delete_control_traces_before(self, cutoff_ms: int) -> int:
-        """保持期間を過ぎた decision trace を削除して行数を返す。"""
+        """保持期間を過ぎた decision trace を削除して行数を返す（決定記録 0030 §5 / 0071 §2.2a）。
+
+        消すのは ``ts_ms < cutoff_ms`` の行で、同じトランザクションで削除の境界
+        （``pruned_through_seq`` / ``pruned_before_ms``）を進める。境界が無いと、読み取り API は
+        未読の行が消えたことに気付けず、欠けた列を黙って返す。境界は前へは戻さない。
+        """
         if cutoff_ms < 0:
             raise ValueError("control trace の削除基準時刻が不正")
         with self.transaction():
+            self._conn.execute(
+                "UPDATE control_trace_prune SET "
+                "pruned_through_seq = MAX(pruned_through_seq, COALESCE("
+                "    (SELECT MAX(seq) FROM control_traces WHERE ts_ms < :cutoff), 0)), "
+                "pruned_before_ms = MAX(COALESCE(pruned_before_ms, :cutoff), :cutoff)",
+                {"cutoff": cutoff_ms},
+            )
             cursor = self._conn.execute("DELETE FROM control_traces WHERE ts_ms < ?", (cutoff_ms,))
         return int(cursor.rowcount)
+
+    def count_control_traces_after(self, ts_ms: int) -> int:
+        """``ts_ms`` より未来の時刻を持つ trace の件数（決定記録 0071 §2.2a）。
+
+        時計が未来へ跳んで書かれた行を運用者が `rollup` のログで気付けるようにする。
+        """
+        row = self._conn.execute(
+            "SELECT COUNT(*) FROM control_traces WHERE ts_ms > ?", (ts_ms,)
+        ).fetchone()
+        return int(row[0])
 
     def record_event(
         self,
@@ -533,6 +568,78 @@ class SqliteStore:
                 trace_json=row["trace_json"],
             )
             for row in rows
+        )
+
+    def control_trace_prune_state(self) -> ControlTracePruneState:
+        """保持期間の削除の境界（決定記録 0071 §2.2a）。"""
+        row = self._conn.execute(
+            "SELECT pruned_through_seq, pruned_before_ms, legacy_until_ms FROM control_trace_prune"
+        ).fetchone()
+        if row is None:  # pragma: no cover - migration が必ず1行入れ、削除はトリガが拒否する
+            raise RuntimeError("control_trace_prune の行が無い")
+        return ControlTracePruneState(
+            pruned_through_seq=row["pruned_through_seq"],
+            pruned_before_ms=row["pruned_before_ms"],
+            legacy_until_ms=row["legacy_until_ms"],
+        )
+
+    def latest_control_trace(self) -> SequencedControlTrace | None:
+        """最後に記録した trace（``seq`` が最大の行。決定記録 0071 §2.2）。
+
+        ``ts_ms`` の最大では選ばない。壁時計が戻ると、戻る前に書いた行のほうが ``ts_ms`` が
+        大きくなり、時計が追いつくまで古い tick を「最新」として返し続けるため。
+        """
+        row = self._conn.execute(
+            f"SELECT {_SEQUENCED_TRACE_COLUMNS} FROM control_traces ORDER BY seq DESC LIMIT 1"
+        ).fetchone()
+        return None if row is None else _sequenced_trace(row)
+
+    def control_trace_page(
+        self, start_ms: int, end_ms: int, *, after_seq: int | None, limit: int
+    ) -> ControlTracePage:
+        """``ts_ms`` が ``[start_ms, end_ms)`` の trace を ``seq`` の昇順で1ページ読む（0071）。
+
+        ``after_seq`` を渡すと、それより大きい ``seq`` の行だけを返す。``after_seq`` が
+        ``pruned_through_seq`` より小さければ、未読の行が削除で消えた可能性があるので
+        ``ControlTraceCursorPrunedError`` を送出する（API は 409 にする）。
+
+        判定・境界の算出・読み出しを**同じ読み取りトランザクション**で行う。間に
+        `coldaisle-rollup` の削除が挟まると、判定を通った後に行が消えて黙って欠ける。
+        """
+        self._check_range(start_ms, end_ms)
+        if limit <= 0:
+            raise ValueError("limit は正にする")
+        if after_seq is not None and after_seq < 0:
+            raise ValueError("after は 0 以上にする")
+        with self.read_snapshot():
+            prune = self.control_trace_prune_state()
+            if after_seq is not None and after_seq < prune.pruned_through_seq:
+                raise ControlTraceCursorPrunedError(prune.retained_from_ms)
+            rows = self._conn.execute(
+                f"SELECT {_SEQUENCED_TRACE_COLUMNS} FROM control_traces "
+                "WHERE ts_ms >= ? AND ts_ms < ? AND seq > ? ORDER BY seq LIMIT ?",
+                (start_ms, end_ms, after_seq or 0, limit + 1),
+            ).fetchall()
+        traces = tuple(_sequenced_trace(row) for row in rows[:limit])
+        return ControlTracePage(
+            traces=traces,
+            has_more=len(rows) > limit,
+            retained_from_ms=prune.retained_from_ms,
+        )
+
+    def event(self, event_id: int) -> EventRecord | None:
+        """ID で1件の事象を引く（#106 / 決定記録 0071 §2.7）。無ければ ``None``。"""
+        row = self._conn.execute(
+            "SELECT id, ts_ms, kind, payload, peer_uid FROM events WHERE id = ?", (event_id,)
+        ).fetchone()
+        if row is None:
+            return None
+        return EventRecord(
+            id=row["id"],
+            ts_ms=row["ts_ms"],
+            kind=row["kind"],
+            payload_json=row["payload"],
+            peer_uid=row["peer_uid"],
         )
 
     def events(
@@ -1152,3 +1259,13 @@ def _slope(
     if denominator == 0:
         return None
     return (n * sxy - sx * sy) / denominator
+
+
+def _sequenced_trace(row: sqlite3.Row) -> SequencedControlTrace:
+    return SequencedControlTrace(
+        seq=row["seq"],
+        ts_ms=row["ts_ms"],
+        tick_id=row["tick_id"],
+        schema_version=row["schema_version"],
+        trace_json=row["trace_json"],
+    )

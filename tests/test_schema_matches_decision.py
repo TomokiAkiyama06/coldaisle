@@ -91,6 +91,9 @@ def test_migration_creates_exactly_the_decided_objects():
         ("index", "ix_events_ts"),
         ("trigger", "events_no_update"),
         ("trigger", "events_no_delete"),
+        ("table", "control_trace_prune"),
+        ("trigger", "control_trace_prune_no_rewind"),
+        ("trigger", "control_trace_prune_no_delete"),
     }
 
 

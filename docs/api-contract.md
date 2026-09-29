@@ -36,6 +36,9 @@
 | GET | `/api/v1/airflow/config` | エアフロー画面の表示設定（空気の温度の色分けの区切り）。測定値は含まない（#106 / 決定記録 0046） |
 | GET | `/api/v1/devices` | 記録されたセンサー構成（チャネル / メトリクス / ROM）（#14） |
 | GET | `/api/v1/events` | 記録された事象（GPU Mode の切り替え・Workload Hint）。タイムライン注釈用（#67 / #107） |
+| GET | `/api/v1/events/{id}` | 事象を ID で1件引く。trace のヒントの `event_id` から元の `note` / `source` を引く（#106 / 決定記録 0071 §2.7） |
+| GET | `/api/v1/control/latest` | 最後に記録した1 tick の decision trace。**LLM のプロンプトへ直接入れない。要約が要るなら集計済みのツールを別に定める**（#106 / 決定記録 0071） |
+| GET | `/api/v1/control/traces` | 期間内の decision trace を記録した順に。`seq` のキーセットでページング。**LLM のプロンプトへ直接入れない。要約が要るなら集計済みのツールを別に定める**（#106 / 決定記録 0071） |
 | GET | `/api/v1/tools` | **AI 向けツールの関数定義**と注意書き（#23） |
 | GET | `/api/v1/tools/{name}` | ツールを1つ実行し、結果と呼び出しの記録を返す（#23） |
 | WS | `/api/v1/stream` | 新サンプルの push |
@@ -382,6 +385,93 @@ GPU Mode の切り替え（AI / Compute）や Workload Hint など、外から�
 `coldaisle-event workload-hint training|benchmark|inference_service|end`）です（決定記録 0045 / 0064）。
 Workspace の GPU Manager は HTTP ではなくこのソケットへ通知してください。
 受理した GPU Mode は `server-health` の `gpu.mode` にも反映されます。
+
+### `GET /api/v1/events/{id}`
+
+`GET /api/v1/events` の要素と同じ形の1件を返します。無ければ（保持期間で消えた・存在しない）**404** です。
+decision trace のヒントの塊が持つ `event_id` から元の `note` / `source` を引くために使います（決定記録 0071 §2.7）。
+期間で引いた一覧は上限を超えると古い側を落とすため、長く効いているヒントの元の event を確実には引けません。
+404 のとき画面は `note` / `source` を「記録が残っていない」と出してください。**「無し」と言わない**でください。
+書き込んだ接続の uid（`peer_uid`）は返しません。
+
+### `GET /api/v1/control/latest` と `GET /api/v1/control/traces`
+
+制御デーモンが tick ごとに保存した **decision trace**（`ControlTick`）を読みます（#106 / 決定記録 0071）。
+エアフロー画面の「現在の状態」と、「なぜこの回転数か」を前後の tick まで辿るために使います。
+
+> **LLM のプロンプトへ直接入れないでください。** trace は制御 ML と同じ粒度の生の時系列です
+> （FR-504 / AGENTS.md ルール 8）。要約が要るなら、集計済みのツールを別に定めます（0071 §2.8 / §5 #5）。
+> `/api/v1/tools` の一覧にも載りません。
+
+**読み取り専用です。** 制御の状態を変える入口ではありません（モード変更は `coldaisle-fand` の
+Unix ソケットだけ。決定記録 0028 §2.2）。制御デーモンが止まっていても動き、trace が無いことをそのまま返します。
+
+#### 外枠と本文
+
+```json
+{
+  "seq": 5120733,
+  "ts_ms": 1790000000000,
+  "ts": "2026-09-21T14:13:20+00:00",
+  "tick_id": 184390,
+  "schema_version": 9,
+  "body": { "...": "保存した ControlTick の JSON をそのまま" }
+}
+```
+
+- 外枠（`seq` / `ts_ms` / `ts` / `tick_id` / `schema_version`、`/latest` では `age_ms` も）は `/api/v1` の版に属し、
+  `ControlTick` の版が上がっても変わりません
+- `body` は保存した JSON を**そのまま**返します。API は項目を足さない・消さない・直さない・検証し直しません
+- 読む側は **`schema_version` で分岐してください。** 保存済みの trace は v1〜v9 が混在しえます
+  - その版に欄が無い（例: v4 に `model_gate` が無い）→「この版の記録には無い」。「無し」「正常」と言わない
+  - 知らない版（読む側の実装より新しい版）→「未対応の版」として制御由来の項目を出さない。通常状態に見せない
+- `seq` は記録した順を表す番号です。欠番がありえます。連続を仮定しないでください。
+  `tick_id` は制御デーモンの再起動で 0 に戻ります
+
+#### `GET /api/v1/control/latest`
+
+```json
+{"trace": {"seq": 5120733, "ts_ms": 1790000000000, "ts": "…", "tick_id": 184390,
+           "schema_version": 9, "age_ms": 820, "body": {}}}
+```
+
+- trace が1件も無いときは **200 で `"trace": null`** です（404 にしません）。画面は「未接続」と出してください
+- 「最新」は `seq` が最大の行です（`ts_ms` の最大ではない。壁時計が戻っても古い tick を返し続けない）
+- `age_ms` はサーバの時計で数えた経過です。**古いかどうかは判定しません。** v8 以降の trace は
+  `body.runtime.tick_period_ms` を持つので、読む側が周期の何倍かで判断してください。v1〜v7 には周期が無いので
+  経過時間だけを出し、「古い／新しい」を言わないでください。壁時計が戻った直後は負になりえます。
+  負の値を「新しい」とせず判定不能として扱ってください
+
+#### `GET /api/v1/control/traces`
+
+パラメータは `from` / `to` または `window`、`after`、`limit`。
+
+```json
+{
+  "from_ms": 1790000000000,
+  "to_ms": 1790000600000,
+  "retained_from_ms": 1789999000000,
+  "before_retained": false,
+  "traces": [ {"seq": 0, "ts_ms": 0, "ts": "…", "tick_id": 0, "schema_version": 9, "body": {}} ],
+  "has_more": true,
+  "next_after": "5120733"
+}
+```
+
+- 期間は `[from, to)` で、`ts_ms` の絞り込みにだけ使います。並びは `seq` の昇順（記録した順）です
+- **ページング**: 次のページは、1ページ目の応答の `from_ms` / `to_ms` と `after=<next_after>` を渡して読みます
+  - `after` を付けるときは `from` と `to` の両方が必須です。`window` との同時指定・`from` / `to` の欠けは **422**
+  - `has_more: false` は「読んだ時点で、期間内に `after` より後ろの行がもう無い」ことです。壁時計が戻ると、
+    期間内の時刻を持つ行が後から書かれえます。その行は必ず大きな `seq` を持つので、同じ `after` で読み直せば取れます
+  - `next_after` はそのページの最後の `seq` です（行が無ければ要求の `after`。1ページ目なら `null`）
+- **上限を超えたら `has_more: true`。黙って落としません**（`/events` の `truncated` とは違います）
+- **保持期間の境界**: `retained_from_ms` より前の `ts_ms` の行は、残っていることを保証しません。
+  `from` がそれより前なら `before_retained: true` です（拒否はせず、残っている行は返します）。
+  画面は `retained_from_ms` より前を「記録が残っていない」と出し、**「tick が無かった」と言わないでください**
+- **409**: `after` より後ろの行が保持期間の削除で消えた可能性があるときは、黙って続けず 409 を返します。
+  応答 `{"detail": "…", "retained_from_ms": …}` の `retained_from_ms` を `from` にして、`after` なしで読み直してください
+- `limit` の既定と上限は環境変数 `COLDAISLE_CONTROL_TRACE_LIMIT`（既定 `100`）と
+  `COLDAISLE_CONTROL_TRACE_MAX_LIMIT`（既定 `500`）。上限を超える `limit` は 422 です
 
 ### `GET /api/v1/metrics`
 
