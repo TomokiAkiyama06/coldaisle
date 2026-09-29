@@ -3,7 +3,8 @@
 - **種別**: Decision Record
 - **Status**: Proposed
 - **Date**: 2026-09-29
-- **Supersedes**: なし
+- **Supersedes**: [`0033-air-balance-config-boundary.md`](0033-air-balance-config-boundary.md) §2 の
+  「`uncalibrated` を runtime controller は起動時に拒否する」の一文のみ（§2.2 で置き換える。0033 の他の節は有効）
 - **関連**: [`0033-air-balance-config-boundary.md`](0033-air-balance-config-boundary.md) §2 / §5、
   [`0028-fan-control-contracts.md`](0028-fan-control-contracts.md) §2.3 / §2.4 / §2.7、
   [`0026-three-zone-fan-control.md`](0026-three-zone-fan-control.md)、
@@ -35,9 +36,9 @@
 
 このままでは #81 の「制御ループへの接続」と、#74 の「`estimated_flow` を記録する」を
 実装できない。さらに、#75 の実測が終わるまで**校正済みの `air-balance.yaml` は存在しない**。
-0033 は「`uncalibrated` を runtime controller は起動時に拒否する」と決めたが、
-その「拒否」が**デーモンの起動を止める**のか、**Air Balance を使わずに起動する**のかは
-書いていない。前者なら、#75 まで `coldaisle-fand` は通常運転に入れない。
+0033 は「`uncalibrated` を runtime controller は起動時に拒否する」と決めた。
+これをそのまま実装すると、#75 まで `coldaisle-fand` は通常運転に入れない。
+本記録はこの一文を**置き換える**（解釈で両立させない。0033 側に `Superseded by` を追記する）。
 
 本記録はこの3点（統合の版と移行・未校正と不在時の起動・`estimated_flow` の格納）を決める。
 0033 の2点目（`basis` の機械照合）は扱わない（§5）。
@@ -82,7 +83,8 @@
 要点:
 
 - **0033 §2 の「runtime controller は起動時に拒否する」を、「runtime は未校正の
-  characterization から `ConfiguredAirBalanceModel` を作らない」と読む。**
+  characterization を検証したうえで、そこから `ConfiguredAirBalanceModel` を作らない」に置き換える。**
+  0033 のその一文は本記録で失効する（Supersedes）。
   デーモンは `allow_uncalibrated_for_testing` を渡す経路を持たず、未校正の曲線・比・熱の閾値が
   requested demand にも trace の推定値にも入らない。**起動そのものは止めない**
 - 無効のときに失うのは **Air Balance による requested の引き上げ提案と推定の記録だけ**である。
@@ -144,7 +146,14 @@ thermal_inputs:
 - 次のときは **`None`**（0 にしない）:
   - Air Balance が無効（§2.2）
   - その tick にその zone の Hardware 書き込み結果が無い、または `write_ok` / `readback_ok` が
-    偽、またはその zone の stall が有効な fault に含まれる（回っていない Fan に風量を書かない）
+    偽（回っていない Fan に風量を書かない）
+  - **その tick の** その zone の `FanHardwareResult.fault` が `None` でない（`TACH_STALL` を含む）。
+    backend の fault は `_apply()` の後に次 tick の Safety 入力へ回り、Critical Safety は
+    `stall_window_ms` が経つまで stall を有効な fault にしない。simulated の stall は
+    `write_ok` / `readback_ok` がどちらも真のまま返る。したがって有効な fault だけを見ると、
+    stall の最初の tick から窓が満ちるまでの間に風量が記録されてしまう。当該 tick の結果を直接見る
+  - その zone の stall が Critical Safety の有効な fault に含まれる（窓が満ちた後、backend の報告が
+    途切れても残る間）
 - RPM の読み戻しから推定する方式は採らない（§4）。曲線の入力は demand のまま
 
 **(b) tick ごと: `air_balance`（新設、v10 では必須）**
@@ -201,7 +210,7 @@ air_balance:
 | 設定ディレクトリに4つ目のファイルが要る。置き忘れると全 zone Max で止まる | 大きな音と `config_invalid` のログで気付ける側に倒す。移行手順を `docs/control-config.md` と実装 PR に書く（2.1） |
 | 未校正の間、Air Balance を持つ完成形の経路が動かない | 無効な状態はいまの `main` と同じ挙動で、安全側の層は変わらない。#75 の後に `calibrated` へ変えて再起動する |
 | `ControlTick` と `ControlTickRuntime` の版が上がり、reader と試験の更新が要る | 既存の版の追加（v8 / v9）と同じ手順。旧版の trace は書き換えない |
-| effective demand からの推定は、Fan が指令どおり回っていない場合を過大に見積もる | 書き込み失敗・読み戻し不一致・stall の zone は `None` にする（2.5 (a)）。RPM 基準への切り替えは #75 の結果で判断する（§5） |
+| effective demand からの推定は、Fan が指令どおり回っていない場合を過大に見積もる | 書き込み失敗・読み戻し不一致・その tick の backend fault（窓が満ちる前の stall を含む）・有効な stall の zone は `None` にする（2.5 (a)）。RPM 基準への切り替えは #75 の結果で判断する（§5） |
 | `air-balance.yaml` の熱閾値（状態の分類用）と `safety.yaml` の閾値が2箇所にある | 前者は Safety ではない分類用の値であることを変えない（0033）。Safety の判断は `safety.yaml` だけが持つ |
 
 ## 4. 却下した代替案

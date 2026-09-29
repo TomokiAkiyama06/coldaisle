@@ -5,6 +5,8 @@
 - **Date**: 2026-09-18
 - **Supersedes**: [`0028-fan-control-contracts.md`](0028-fan-control-contracts.md) §2.8 の
   3ファイル境界
+- **Superseded by**: [0073](0073-air-balance-control-config-integration.md)（§2 の「`uncalibrated` を runtime controller は
+  起動時に拒否する」の一文のみ。runtime は未校正の設定を検証して Air Balance を無効にして起動する。他の節は有効）
 - **関連**: [`0026-three-zone-fan-control.md`](0026-three-zone-fan-control.md)、
   [`docs/airflow-model.md`](../airflow-model.md)、GitHub #75 / #81 / #103
 - **対象 Issue**: #81
