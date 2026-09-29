@@ -17,8 +17,10 @@ from coldaisle.ingest.protocol import RawHello, RawSample, decode_line
 from coldaisle.ingest.serial_source import (
     BACKOFF_MAX_S,
     DEFAULT_BAUD,
+    FIXED_PORTS,
     PORT_PATTERNS,
     SerialSource,
+    find_ports,
 )
 
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -393,6 +395,80 @@ def test_the_patterns_cover_macos_and_linux():
     assert "/dev/ttyACM*" in PORT_PATTERNS
 
 
+def test_the_patterns_start_with_the_udev_fixed_name():
+    """FR-102: `/dev/server-sensors` を候補に入れ、**先頭に置く**（#57）。"""
+    assert FIXED_PORTS == ("/dev/server-sensors",)
+    assert PORT_PATTERNS[0] == "/dev/server-sensors"
+
+
+def _fake_glob(existing: dict[str, list[str]]):
+    """`glob.glob` の代わり。パターンごとに決まった結果を返す。"""
+
+    def fake(pattern: str) -> list[str]:
+        return list(existing.get(pattern, []))
+
+    return fake
+
+
+def test_find_ports_includes_the_fixed_name(monkeypatch):
+    """**glob を差し替えて**、固定名が候補に入ることを実機なしで確かめる。"""
+    monkeypatch.setattr(
+        "coldaisle.ingest.serial_source.glob.glob",
+        _fake_glob(
+            {
+                "/dev/server-sensors": ["/dev/server-sensors"],
+                "/dev/ttyACM*": ["/dev/ttyACM1", "/dev/ttyACM0"],
+            }
+        ),
+    )
+    assert find_ports() == ["/dev/server-sensors", "/dev/ttyACM0", "/dev/ttyACM1"]
+
+
+def test_the_fixed_name_wins_over_name_order(monkeypatch, caplog):
+    """**固定名があれば、名前の順より先に選ぶ。** 同じ機器のリンク先を「複数」と警告しない。
+
+    `/dev/cu.*` は名前の順では `/dev/server-sensors` より前に来る。文字の並びに
+    頼らず固定名を選ぶことを、両方が見える（ありえない組み合わせの）状態で確かめる。
+    """
+    monkeypatch.setattr(
+        "coldaisle.ingest.serial_source.glob.glob",
+        _fake_glob(
+            {
+                "/dev/server-sensors": ["/dev/server-sensors"],
+                "/dev/cu.usbmodem*": ["/dev/cu.usbmodem01"],
+                "/dev/ttyACM*": ["/dev/ttyACM0"],
+            }
+        ),
+    )
+    opened: list[str] = []
+
+    def opener(port: str, _baud: int) -> FakePort:
+        opened.append(port)
+        return FakePort([])
+
+    source = SerialSource(port=None, opener=opener, sleep=lambda _s: None, max_reconnects=0)
+    list(source.stream())
+    assert opened == ["/dev/server-sensors"]
+    assert "候補が複数" not in caplog.text
+
+
+def test_without_the_fixed_name_name_order_still_applies(monkeypatch):
+    """固定名が無い環境（macOS・udev 未設定）では、従来どおり名前の順（0023 §2.6）。"""
+    monkeypatch.setattr(
+        "coldaisle.ingest.serial_source.glob.glob",
+        _fake_glob({"/dev/ttyACM*": ["/dev/ttyACM1", "/dev/ttyACM0"]}),
+    )
+    opened: list[str] = []
+
+    def opener(port: str, _baud: int) -> FakePort:
+        opened.append(port)
+        return FakePort([])
+
+    source = SerialSource(port=None, opener=opener, sleep=lambda _s: None, max_reconnects=0)
+    list(source.stream())
+    assert opened == ["/dev/ttyACM0"]
+
+
 def test_the_baud_matches_the_firmware():
     """デバイス側の `Serial.begin` と揃っていること。"""
     sketch = (
@@ -423,8 +499,6 @@ def test_a_real_device_streams_samples():
     実機を繋いで走らせる。`uv run pytest -m hardware`。
     手で抜き差ししながら、例外が出ずにサンプルが再開することを見る。
     """
-    from coldaisle.ingest.serial_source import find_ports
-
     ports = find_ports()
     if not ports:
         pytest.skip("シリアルポートが見つからない")

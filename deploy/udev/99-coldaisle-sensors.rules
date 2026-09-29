@@ -1,0 +1,12 @@
+# センサー基板（ESP32-S3）に固定名 /dev/server-sensors を割り当てる（FR-102 / #57）。
+#
+# **テンプレートである。** 下の VID / PID / シリアルは明らかな仮の値で、このままでは
+# どの機器にも当たらない。実機の値は `udevadm info` で調べ、**導入先でだけ**書き換える。
+# 実機の値をこのリポジトリへコミットしない（AGENTS.md ルール10 / 決定記録 0021）。
+#
+# 手順は docs/ubuntu-deploy.md。
+#
+#   sudo cp deploy/udev/99-coldaisle-sensors.rules /etc/udev/rules.d/
+#   sudo udevadm control --reload-rules && sudo udevadm trigger
+
+SUBSYSTEM=="tty", ATTRS{idVendor}=="0000", ATTRS{idProduct}=="0000", ATTRS{serial}=="REPLACE-WITH-DEVICE-SERIAL", SYMLINK+="server-sensors", GROUP="dialout", MODE="0660"

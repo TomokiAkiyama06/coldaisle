@@ -1,0 +1,15 @@
+# coldaisle-rollup.service を1日1回起動する（決定記録 0008 未決1 / #57）。
+#
+# 時刻は config/report.yaml の例（ロールアップ 03:00、レポート 08:05）に揃えた。
+# OS の時刻帯（`timedatectl`）で解釈される。
+
+[Unit]
+Description=Run coldaisle rollup daily
+
+[Timer]
+OnCalendar=*-*-* 03:00:00
+# 止まっていた間の実行を、起動後に取り戻す
+Persistent=true
+
+[Install]
+WantedBy=timers.target
