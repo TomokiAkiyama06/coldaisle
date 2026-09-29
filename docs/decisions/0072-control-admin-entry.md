@@ -1,7 +1,7 @@
 # 決定記録 0072: 制御デーモンの管理操作の入口（運転モードと Authority Stage の切替）
 
 - **種別**: Decision Record
-- **Status**: Proposed
+- **Status**: FINAL（2026-09-29、リポジトリ所有者が承認）
 - **Date**: 2026-09-29
 - **Supersedes**: なし
 - **関連**: [0009](0009-read-api.md) §3（GET-only） /
