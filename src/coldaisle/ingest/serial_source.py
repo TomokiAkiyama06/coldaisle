@@ -32,8 +32,20 @@ LOGGER = logging.getLogger("coldaisle.ingest.serial")
 DEFAULT_BAUD = 115200
 """デバイス側と揃える（`firmware/coldaisle_sensor` の `Serial.begin`）。"""
 
-PORT_PATTERNS: tuple[str, ...] = ("/dev/cu.usbmodem*", "/dev/ttyACM*")
-"""macOS と Linux の並び。**見つけた順ではなく、名前の順で決める**（毎回同じ選択にする）。"""
+FIXED_PORTS: tuple[str, ...] = ("/dev/server-sensors",)
+"""udev が VID/PID + シリアルで割り当てる固定名（FR-102 / #57）。**あれば最優先で使う。**
+
+固定名は「どの機器か」で決まっているので、USB の差し替えで番号が動く
+`/dev/ttyACM*` より確かである。固定名は `/dev/ttyACM*` へのリンクなので、
+**同じ機器が2つの名前で見える**。その重複を「候補が複数」と警告しない
+（決定記録 0069 §2.1）。
+"""
+
+PORT_PATTERNS: tuple[str, ...] = (*FIXED_PORTS, "/dev/cu.usbmodem*", "/dev/ttyACM*")
+"""固定名、macOS、Linux の並び。
+
+固定名が無いときは**見つけた順ではなく、名前の順で決める**（毎回同じ選択にする）。
+"""
 
 READ_TIMEOUT_S = 1.0
 """1回の読み取りで待つ上限。**無限に待たない**（停止要求に気づけなくなる）。"""
@@ -127,6 +139,11 @@ class SerialSource:
         candidates = sorted(self.finder(self.patterns))
         if not candidates:
             return None
+        for fixed in FIXED_PORTS:
+            # **固定名は名前の順より先に見る。** 名前の順だと、たまたま文字の並びで
+            # 勝つかどうかに依存する（`/dev/cu.*` は `/dev/server-sensors` より前に来る）
+            if fixed in candidates:
+                return fixed
         if len(candidates) > 1:
             # **どれを選んだかを言う。** 黙って1つ選ぶと、別の機器を読んでいても気づけない
             LOGGER.warning(

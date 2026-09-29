@@ -1,7 +1,7 @@
 # 決定記録 0073: `air-balance.yaml` の Control Config への統合、未校正時の起動、`estimated_flow` の記録
 
 - **種別**: Decision Record
-- **Status**: Proposed
+- **Status**: FINAL（2026-09-29、リポジトリ所有者が承認）
 - **Date**: 2026-09-29
 - **Supersedes**: [`0033-air-balance-config-boundary.md`](0033-air-balance-config-boundary.md) §2 の
   「`uncalibrated` を runtime controller は起動時に拒否する」の一文のみ（§2.2 で置き換える。0033 の他の節は有効）
@@ -9,7 +9,8 @@
   [`0028-fan-control-contracts.md`](0028-fan-control-contracts.md) §2.3 / §2.4 / §2.7、
   [`0026-three-zone-fan-control.md`](0026-three-zone-fan-control.md)、
   [`0052-learned-mpc-optimizer-and-hard-constraints.md`](0052-learned-mpc-optimizer-and-hard-constraints.md) §2.3、
-  [`0054-offline-evaluation-attribution-and-gates.md`](0054-offline-evaluation-attribution-and-gates.md)、
+  [`0054-offline-evaluation-attribution-and-gates.md`](0054-offline-evaluation-attribution-and-gates.md) §2.7、
+  [`0057-authority-rollout-stage-changes.md`](0057-authority-rollout-stage-changes.md) §2.4、
   [`0060-control-loop-runtime.md`](0060-control-loop-runtime.md) §2.4、
   [`docs/control-config.md`](../control-config.md)、[`docs/air-balance-model.md`](../air-balance-model.md)、
   [`docs/airflow-model.md`](../airflow-model.md)
@@ -32,7 +33,8 @@
 | `AirBalanceConfig` / `ConfiguredAirBalanceModel` | 純粋モデルとして実装済み。`uncalibrated` は `allow_uncalibrated_for_testing=True` が無いと `UncalibratedAirBalanceError` |
 | `coldaisle-fand` | Air Balance を配線していない。Learned MPC の worker も未配線で、制御器は Fallback だけ |
 | `ZoneRecord.estimated_flow` | 欄はあるが、loop が値を入れないため**常に `None`**。offline 評価は毎 tick `no_estimated_flow` を数える |
-| `ControlTickRuntime.config`（`ControlConfigDigest`） | 3ファイルの SHA-256 だけ |
+| `ControlTickRuntime.config`（`ControlConfigDigest`） | 3ファイルの SHA-256 だけ。schema version は `ControlConfig.trace_metadata()` にあるが、起動ログにしか出ず、保存される `ControlTick` には無い |
+| `EvaluationProvenance` / `conditions_sha256` / `RolloutEvidence` | 設定は `fan-hardware.yaml`（provenance と条件のみ）・`safety.yaml`・`fan-policy.yaml` だけを束縛する。昇格の照合（`_check_evidence()`）は `fan-policy.yaml` と `safety.yaml` の hash だけをいまの設定と比べる |
 
 このままでは #81 の「制御ループへの接続」と、#74 の「`estimated_flow` を記録する」を
 実装できない。さらに、#75 の実測が終わるまで**校正済みの `air-balance.yaml` は存在しない**。
@@ -40,7 +42,8 @@
 これをそのまま実装すると、#75 まで `coldaisle-fand` は通常運転に入れない。
 本記録はこの一文を**置き換える**（解釈で両立させない。0033 側に `Superseded by` を追記する）。
 
-本記録はこの3点（統合の版と移行・未校正と不在時の起動・`estimated_flow` の格納）を決める。
+本記録はこの3点（統合の版と移行・未校正と不在時の起動・`estimated_flow` の格納）と、
+Air Balance を制御へつないだ後に必要になる**昇格の証拠への `air-balance.yaml` の束縛**（§2.6）を決める。
 0033 の2点目（`basis` の機械照合）は扱わない（§5）。
 
 ## 2. Decision
@@ -183,12 +186,29 @@ air_balance:
   status: enabled | disabled
   disabled_reason: uncalibrated | null        # disabled のときだけ値を持つ
   demand_basis: applied                        # 何の demand で評価したか（固定値。将来の拡張の余地）
-  model_id / source.status / config_sha256     # AirBalanceMetadata をそのまま写す（enabled のとき）
+  model_id / source_status / config_sha256     # 検証済みの air-balance.yaml から写す（enabled / disabled とも必須）
   q_front / q_rear / q_top                     # zone ごとの q（EFU）。AirBalanceEstimate と同じ定義
   estimated_intake / estimated_exhaust / balance_ratio   # AirBalanceEstimate と同じ定義
-  state: balanced | intake_heavy | exhaust_heavy | thermally_limited | unknown
+  state: balanced | intake_heavy | exhaust_heavy | thermally_limited | unknown | disabled
   thermal_reasons: [...]
 ```
+
+`state` の `disabled` は **trace 側の型だけ**が持つ値で、`AirBalanceState`（純粋モデルの出力）には
+加えない。モデルは無効のとき呼ばれないので、`disabled` を返す経路を作らない。
+
+**検証の不変条件**（`ControlTick` の読み書きの両方で検証し、破れた記録は拒む）:
+
+| 条件 | `status: enabled` | `status: disabled` |
+|---|---|---|
+| `disabled_reason` | `null` | `uncalibrated`（非 null） |
+| `source_status` | `calibrated` | `uncalibrated` |
+| `model_id` / `config_sha256` | 必須 | 必須（どの未校正ファイルで起動していたかを残す） |
+| `config_sha256` | `runtime.config.air_balance_sha256` と一致 | 同左 |
+| `q_front` / `q_rear` / `q_top` | `EffectiveFlow` または `null`（下記） | すべて `null` |
+| `estimated_intake` / `estimated_exhaust` / `balance_ratio` | `AirBalanceEstimate` の不変条件のとおり | すべて `null` |
+| `state` | `disabled` 以外 | `disabled` |
+| `thermal_reasons` | `AirBalanceEstimate` のとおり（`thermally_limited` のときだけ非空） | `[]`（空の列。`null` にしない） |
+| zone の `estimated_flow` | `q_*` と zone ごとに一致（下記） | Front / Rear / Top すべて `None` |
 
 - `enabled` のとき、`q_*` / `estimated_intake` / `estimated_exhaust` / `balance_ratio` / `state` は
   `AirBalanceEstimate` の不変条件（比は3つの q が揃い `q_front > 0` のときだけ、
@@ -197,14 +217,26 @@ air_balance:
   `ZoneRecord.estimated_flow` と突き合わせ、**どちらも `None` か、同じ値**でなければ拒む。
   zone ごとに対応させるので、Rear と Top の値の入れ替わりも検出できる
 - (a) で `None` の zone は、その `q_*` も `None` にする。1つでも `None` があるときは
-  `balance_ratio` を出さず `state: unknown` とする
-- `disabled` のときは推定の欄をすべて `null` にし、理由だけを残す
+  `balance_ratio` を出さず `state: unknown` とする（`enabled` のまま。`disabled` と混ぜない）
+- `disabled` は上の表の形だけを許す。「推定できなかった」（`enabled` + `unknown`）と
+  「使っていなかった」（`disabled`）を、同じ形の記録にしない
 - 0060 §2.4 と同じく、**版が中身を表さない記録を作らない**。v10 を名乗る tick は `air_balance` を
   必ず持ち、v9 以前は持たない
 
-**(c) 設定の hash: `ControlTickRuntime` を schema version 2 にする**
+**(c) 設定の版と hash: `ControlTickRuntime` を schema version 2 にする**
 
-- `ControlConfigDigest` に `air_balance_sha256` を加える。runtime v2 では必須、v1 では持たない
+0033 §2 の「decision trace には4ファイルすべての schema version と SHA-256 を残す」を、
+保存される `ControlTick` の中で満たす（起動ログの `trace_metadata()` だけでは、tick の記録から
+どの版の設定で回っていたかを言えない）。
+
+- `ControlConfigDigest` に次を加える。runtime v2 ではすべて必須、v1 ではどれも持たない
+  - `air_balance_sha256`
+  - `control_config_version`（束ねた版。§2.1 の 11）
+  - `fan_hardware_schema_version` / `safety_schema_version` / `policy_schema_version` /
+    `air_balance_schema_version`（`ConfigSource.schema_version` をそのまま写す）
+- 既存の `fan_hardware_sha256` / `safety_sha256` / `policy_sha256` はそのまま。
+  4ファイルそれぞれについて、版と SHA-256 の組が1つの digest に揃う
+- 値は `ControlConfig.sources` から写し、手で書かない（起動ログの `trace_metadata()` と同じ出どころ）
 - `ControlTick` v10 は runtime v2 を要求する
 
 **(d) 保存済みの trace と offline 評価**
@@ -216,6 +248,30 @@ air_balance:
 - counterfactual の行に Air Balance の欄を置かない規則（0054 §2.2）は変えない。
   本記録が記録するのは**実際に適用された applied demand の推定だけ**である
 
+### 2.6 昇格の証拠を `air-balance.yaml` に束縛する
+
+Air Balance を Learned MPC の cost へ渡すと（§2.3）、曲線と目標帯は optimizer の判断を変える。
+tick ごとの hash（§2.5 (c)）だけでは、characterization A で集めた証拠が B へ切り替えた後の
+昇格を許せてしまう。0057 §2.4 の「束縛済み」に `air-balance.yaml` を加える。
+
+- `EvaluationProvenance` に `air_balance_config_sha256`（必須）を加え、評価時の
+  `ControlConfig.sources.air_balance.sha256` を写す
+- `conditions_sha256` の材料（`_provenance()` の digest）に同じ hash を加える。
+  Air Balance の設定だけが違う2つの評価が、同じ条件を名乗らないようにする
+- Offline Evaluation の報告の版を上げる。いまの `EVALUATION_REPORT_SCHEMA_VERSION` は 2 なので **3** にする
+- `RolloutEvidence` に `air_balance_config_sha256` を加える
+- 昇格の照合（`_check_evidence()`）は、`fan-policy.yaml` / `safety.yaml` と同じく、
+  **承認の証拠・報告の provenance・いま動いている設定の3つが一致しなければ昇格を拒む**
+  （`AuthorityEvidenceError`）
+- `MIN_EVIDENCE_REPORT_SCHEMA_VERSION` を **3** に上げる。v2 以前の報告は Air Balance の設定を
+  言えないので、昇格の証拠にしない（「記録の無さは不明であって完全ではない」。0059 §2.5）
+- journal に既に残った昇格 event の `RolloutEvidence` は書き換えない。`AuthorityJournal` の版を
+  **1 → 2** に上げ、v2 の新しい昇格 event の証拠は `air_balance_config_sha256` を必ず持ち、
+  v1 の event は持たないまま読む（過去の記録として読むだけで、新しい昇格の根拠にはならない）
+- Air Balance が無効（`uncalibrated`）でもファイルはあり hash も決まるので、無効の間の証拠も
+  その未校正ファイルに束縛される。`calibrated` へ差し替えた後は hash が変わり、
+  **無効の間に集めた証拠では昇格できない**（Air Balance 無しの挙動の証拠を、有効な構成へ流用しない）
+
 ## 3. Consequences
 
 ### 良くなること
@@ -226,6 +282,8 @@ air_balance:
 - `estimated_flow` が埋まり、offline 評価の Air Balance 報告と `no_estimated_flow` の gap が
   実データで意味を持つ。trace の比と MPC の cost が同じ曲線・同じ定義から出る
 - どの characterization で回っていたかを、tick ごとの `config_sha256` と runtime の digest で追える
+- 保存された tick だけで、4ファイルの schema version と SHA-256 が言える（0033 §2）
+- 別の characterization で集めた証拠で authority を昇格できない（§2.6）
 
 ### 悪くなること・その緩和
 
@@ -234,6 +292,7 @@ air_balance:
 | 設定ディレクトリに4つ目のファイルが要る。置き忘れると全 zone Max で止まる | 大きな音と `config_invalid` のログで気付ける側に倒す。移行手順を `docs/control-config.md` と実装 PR に書く（2.1） |
 | 未校正の間、Air Balance を持つ完成形の経路が動かない | 無効な状態はいまの `main` と同じ挙動で、安全側の層は変わらない。#75 の後に `calibrated` へ変えて再起動する |
 | `ControlTick` と `ControlTickRuntime` の版が上がり、`FanHardwareResult` にも `applied_demand` が要る。reader・backend・試験の更新が要る | 既存の版の追加（v8 / v9）と同じ手順。旧版の trace は書き換えない |
+| 評価報告 v3・`AuthorityJournal` v2 への更新で、v2 以前の報告は昇格の証拠に使えなくなる | 評価をやり直せば v3 の報告が出る。昇格は証拠を取り直すまで止まる側（Shadow / いまの stage のまま）に倒れ、安全側を弱めない |
 | applied demand からの推定は、Fan が指令どおり回っていない場合を過大に見積もる | 書き込み失敗・読み戻し不一致・その tick の backend fault（窓が満ちる前の stall を含む）・有効な stall の zone は `None` にする（2.5 (a)）。RPM 基準への切り替えは #75 の結果で判断する（§5） |
 | `air-balance.yaml` の熱閾値（状態の分類用）と `safety.yaml` の閾値が2箇所にある | 前者は Safety ではない分類用の値であることを変えない（0033）。Safety の判断は `safety.yaml` だけが持つ |
 
@@ -251,6 +310,9 @@ air_balance:
 | **requested demand** で推定を記録する | Safety の floor が入っておらず、実際に回った風量と食い違う（特に Top の CPU cooling floor） |
 | **effective demand** で推定を記録する | backend の `minimum_stable_demand` への引き上げと `startup_demand` の kick が入らず、低 demand の運転で風量を過小に記録する |
 | applied demand を **PWM の raw 値から逆算**する | raw への量子化と backend ごとの写像の違いが記録の定義に入る。backend が写像前の値を返せば足りる |
+| 無効の tick を `state: unknown` と空でない欄で表す | 「推定できなかった」と「使っていなかった」が同じ形になり、offline 評価が区別できない |
+| 保存 tick に設定の版を持たず、起動ログの `trace_metadata()` だけに残す | tick の記録単独ではどの版の設定で回っていたかを言えず、0033 §2 を満たさない |
+| `air-balance.yaml` の hash を tick にだけ残し、昇格の証拠に束縛しない | characterization A で集めた証拠で、B に差し替えた後の昇格を許せてしまう |
 | `air_balance` に zone ごとの q を持たず、吸排気の合計だけを zone の記録と照合する | Rear と Top の入れ替わりを検出できない。`AirBalanceEstimate` と形が変わり、既存の不変条件を流用できない |
 | `thermal_inputs` の metric を Catalog の検証だけで済ませ、入力契約に加えない | 契約に無い metric は取り込まれず毎 tick `None` になり、熱の制約が黙って効かない |
 | **RPM の読み戻し**から推定する | 曲線は demand → Airflow Index で定義されており、RPM → 風量の対応は #75 の実測がまだ無い。MPC の cost と同じ定義で記録できなくなる |
@@ -266,5 +328,6 @@ air_balance:
 | 校正済みのまま Air Balance を止めたいときの手段（`uncalibrated` へ戻すのか、別の手段か） | 必要になった時点で。本記録は別フラグを作らない |
 | RPM の読み戻しを使った推定への切り替え | #75 で demand と RPM のどちらが風量をよく説明するかを見てから |
 | `basis` と #75 の測定記録の機械的な照合形式（0033 §5 の2点目） | #75 の測定記録の形式が決まった後 |
-| `ControlTick` の版番号の衝突 | 別の記録が先に v10 を使った場合は、実装の時点で次の番号を使う。欄の意味は本記録のとおり |
+| 版番号の衝突（`ControlTick` v10・`ControlTickRuntime` v2・束ねた版 11・評価報告 v3・`AuthorityJournal` v2） | 別の記録・実装が先にその番号を使った場合は、実装の時点で次の空いた番号を使う。欄の意味は本記録のとおり |
+| offline 評価が、trace の `runtime.config` の hash と評価時の設定の不一致を検出するか | `fan-policy.yaml` / `safety.yaml` も同じく未実装。本記録は証拠の束縛（§2.6）までを決め、trace 側の突き合わせは別の記録で |
 | Air Balance の推定に要求との対応づけを持たせるか（0052 §5） | 本記録は `demand_basis: applied` の記録だけを決める。MPC 側は #86 |
