@@ -1,7 +1,7 @@
 # 決定記録 0030: Control decision trace の保存先
 
 - **種別**: Decision Record
-- **Status**: Proposed
+- **Status**: FINAL（2026-09-29、リポジトリ所有者が承認。§5 は1項目めのみ確定、0071 §2.1 の範囲）
 - **Date**: 2026-09-15
 - **Supersedes**: なし
 - **関連**: [`0028-fan-control-contracts.md`](0028-fan-control-contracts.md) §2.3 / §5、
