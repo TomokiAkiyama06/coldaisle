@@ -140,3 +140,4 @@ docs/decisions/NNNN-<slug>.md      例: 0002-metric-naming.md
 | [0069](0069-ubuntu-deploy-templates.md) | Ubuntu 常駐化のテンプレート（固定名 `/dev/server-sensors` を名前の順より先に選ぶ・systemd / udev は `deploy/` に仮の値で置く・`coldaisle-fand` の unit は含めない） | FINAL |
 | [0070](0070-soak-acceptance-interpretation.md) | 連続運転テスト（soak）の受入基準の読み方（欠測率は最も悪いチャネルで判定・母数は期間÷送信周期で周期不明なら判定不能・再起動はすべて意図しないものとみなす・DB を読み取り専用で開く） | FINAL |
 | [0071](0071-control-trace-read-api.md) | decision trace の読み取り API（`/api/v1/control/latest` と `/control/traces`・記録した順の `seq` によるページングと保持期間の境界の明示・本文は保存した JSON のまま版の解釈は読む側・registry の版を毎 tick 載せる・AI ツールに足さない。0030 §2 / §5 の1項目めの承認が前提） | FINAL |
+| [0074](0074-supervisor-shadow-wiring-and-episode-evaluation.md) | 運転中の Supervisor decision を Shadow 台帳へ流す配線（制御プロセスの外の CLI が保存済み trace から集計・鍵は `(ts_ms, tick_id)`）と、RL episode 結果を別の report 型 `PolicyEpisodeReport` の `episode:` arm として出す接続（`for_active` の条件は範囲外） | FINAL |
