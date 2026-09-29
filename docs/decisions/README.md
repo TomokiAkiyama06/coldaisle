@@ -102,7 +102,7 @@ docs/decisions/NNNN-<slug>.md      例: 0002-metric-naming.md
 | [0030](0030-control-decision-trace-storage.md) | Control decision trace の保存先 | FINAL |
 | [0031](0031-thermal-dataset-contract.md) | Thermal Dataset v1 の時刻対応と再生成契約 | FINAL |
 | [0032](0032-internal-telemetry-metric-names.md) | Internal Telemetry のメトリクス名 | FINAL |
-| [0033](0033-air-balance-config-boundary.md) | Air Balance characterization の設定境界 | FINAL |
+| [0033](0033-air-balance-config-boundary.md) | Air Balance characterization の設定境界 | FINAL（§2 の「`uncalibrated` を runtime controller は起動時に拒否する」の一文は [0073](0073-air-balance-control-config-integration.md)） |
 | [0034](0034-unavailable-fan-tach-safety.md) | 制御対象 Fan の tach 読み取り不能を Safety fault にする | FINAL |
 | [0036](0036-transient-cpu-gpu-regime.md) | Workload Regime に TRANSIENT_CPU_GPU を加える | FINAL |
 | [0037](0037-model-registry-rollback-target.md) | Model Registry の promotion 時の rollback target | Proposed |
@@ -140,4 +140,6 @@ docs/decisions/NNNN-<slug>.md      例: 0002-metric-naming.md
 | [0069](0069-ubuntu-deploy-templates.md) | Ubuntu 常駐化のテンプレート（固定名 `/dev/server-sensors` を名前の順より先に選ぶ・systemd / udev は `deploy/` に仮の値で置く・`coldaisle-fand` の unit は含めない） | FINAL |
 | [0070](0070-soak-acceptance-interpretation.md) | 連続運転テスト（soak）の受入基準の読み方（欠測率は最も悪いチャネルで判定・母数は期間÷送信周期で周期不明なら判定不能・再起動はすべて意図しないものとみなす・DB を読み取り専用で開く） | FINAL |
 | [0071](0071-control-trace-read-api.md) | decision trace の読み取り API（`/api/v1/control/latest` と `/control/traces`・記録した順の `seq` によるページングと保持期間の境界の明示・本文は保存した JSON のまま版の解釈は読む側・registry の版を毎 tick 載せる・AI ツールに足さない。0030 §2 / §5 の1項目めの承認が前提） | FINAL |
+| [0072](0072-control-admin-entry.md) | 制御デーモンの管理操作の入口（`coldaisle-fand` の専用ソケットでモード設定と authority の降格だけを受ける・昇格は CLI・同じ uid と root を暗黙に認めない・次の tick で反映・journal は毎 tick の stat で読み直す・監査は追記専用） | FINAL |
+| [0073](0073-air-balance-control-config-integration.md) | `air-balance.yaml` を4つ目の Control Config として一括検証に統合する（束ねた版 11・不在は `config_invalid`・未校正は Air Balance を無効にして起動・`ControlTick` v10 に applied demand 基準の `estimated_flow` と Air Balance の記録・trace に4ファイルの版と hash・昇格の証拠を `air-balance.yaml` に束縛） | FINAL |
 | [0074](0074-supervisor-shadow-wiring-and-episode-evaluation.md) | 運転中の Supervisor decision を Shadow 台帳へ流す配線（制御プロセスの外の CLI が保存済み trace から集計・鍵は `(ts_ms, tick_id)`）と、RL episode 結果を別の report 型 `PolicyEpisodeReport` の `episode:` arm として出す接続（`for_active` の条件は範囲外） | FINAL |
