@@ -89,9 +89,9 @@ def test_trace_rejects_invalid_or_non_object_json(store, trace_json):
 def test_database_also_rejects_non_object_trace_json(store, trace_json):
     with pytest.raises(sqlite3.IntegrityError):
         store.connection.execute(
-            "INSERT INTO control_traces (ts_ms, tick_id, schema_version, trace_json) "
-            "VALUES (?, ?, ?, ?)",
-            (0, 0, 1, trace_json),
+            "INSERT INTO control_traces (seq, ts_ms, tick_id, schema_version, trace_json) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (1, 0, 0, 1, trace_json),
         )
 
 
