@@ -57,6 +57,7 @@ from coldaisle.control.evaluation.model import (
     SegmentReport,
     SegmentRole,
     TemperatureReport,
+    TraceConfigBinding,
     WorstCase,
     WorstCaseKind,
     ZoneSeriesReport,
@@ -234,6 +235,9 @@ def evaluate(runs: Sequence[EvaluationRun], *, context: EvaluationContext) -> Ev
     segments: list[SegmentReport] = []
     provenances: list[RunProvenance] = []
     versions = _VersionCollector()
+    sources = context.control.sources
+    air_balance_binding = _TraceBindingCounter(sources.air_balance.sha256)
+    fan_hardware_binding = _TraceBindingCounter(sources.fan_hardware.sha256)
     for unchecked in sorted(runs, key=lambda item: item.run_id):
         # **同じ証拠を1つに畳んでから数える。** 以降はこの run だけを使う。
         run = _check_observations(unchecked)
@@ -242,6 +246,9 @@ def evaluate(runs: Sequence[EvaluationRun], *, context: EvaluationContext) -> Ev
         provenances.append(_run_provenance(run, parsed))
         for tick in parsed:
             versions.add_tick(tick)
+            config = None if tick.runtime is None else tick.runtime.config
+            air_balance_binding.add(None if config is None else config.air_balance_sha256)
+            fan_hardware_binding.add(None if config is None else config.fan_hardware_sha256)
         for row in rows:
             versions.add_shadow(row.shadow)
         for segment in _segments(run, parsed, rows, context):
@@ -251,7 +258,13 @@ def evaluate(runs: Sequence[EvaluationRun], *, context: EvaluationContext) -> Ev
     worst = _worst_cases(report_segments, context)
     return EvaluationReport(
         schema_version=EVALUATION_REPORT_SCHEMA_VERSION,
-        provenance=_provenance(context, tuple(provenances), versions.collected()),
+        provenance=_provenance(
+            context,
+            tuple(provenances),
+            versions.collected(),
+            air_balance_trace_binding=air_balance_binding.collected(),
+            fan_hardware_trace_binding=fan_hardware_binding.collected(),
+        ),
         segments=report_segments,
         worst_cases=worst,
         gates=evaluate_gates(report_segments, config=context.config, worst_cases=worst),
@@ -810,9 +823,18 @@ def _applied_report(bucket: _AppliedBucket, context: EvaluationContext) -> Appli
         gaps["partial_rpm_readback"] += 1
 
     balance = _air_balance(ticks, quantiles=quantiles)
+    disabled = sum(
+        1
+        for tick in ticks
+        if tick.air_balance is not None and tick.air_balance.status == "disabled"
+    )
+    if disabled:
+        # **「使っていなかった」を「推定できなかった」と分けて数える**（決定記録 0073 §2.5 (d)）。
+        gaps["air_balance_disabled"] += 1
     if balance is None:
-        gaps["no_estimated_flow"] += 1
-    elif balance.ticks_without_ratio:
+        if disabled < len(ticks):
+            gaps["no_estimated_flow"] += 1
+    elif balance.ticks_without_ratio > disabled:
         gaps["partial_estimated_flow"] += 1
 
     if bucket.arm.controller is ControllerKind.LEARNED_MPC:
@@ -1522,8 +1544,36 @@ def _observation_order(observation: OutcomeObservation) -> tuple[str, int, bool,
     )
 
 
+class _TraceBindingCounter:
+    """消費した tick の設定 hash を、評価時の hash と突き合わせて数える（決定記録 0073 §2.6）。"""
+
+    def __init__(self, expected: str) -> None:
+        self._expected = expected
+        self._matched = 0
+        self._mismatched = 0
+        self._missing = 0
+
+    def add(self, recorded: str | None) -> None:
+        if recorded is None:
+            self._missing += 1
+        elif recorded == self._expected:
+            self._matched += 1
+        else:
+            self._mismatched += 1
+
+    def collected(self) -> TraceConfigBinding:
+        return TraceConfigBinding(
+            matched=self._matched, mismatched=self._mismatched, missing=self._missing
+        )
+
+
 def _provenance(
-    context: EvaluationContext, runs: tuple[RunProvenance, ...], versions: ObservedVersions
+    context: EvaluationContext,
+    runs: tuple[RunProvenance, ...],
+    versions: ObservedVersions,
+    *,
+    air_balance_trace_binding: TraceConfigBinding,
+    fan_hardware_trace_binding: TraceConfigBinding,
 ) -> EvaluationProvenance:
     shadow = context.control.policy.shadow
     sources = context.control.sources
@@ -1534,6 +1584,11 @@ def _provenance(
                 sources.fan_hardware.sha256,
                 sources.safety.sha256,
                 sources.policy.sha256,
+                # **Air Balance の設定だけが違う2つの評価を、同じ条件と名乗らせない**
+                # （決定記録 0073 §2.6）。trace の突き合わせの件数も条件に入れる。
+                sources.air_balance.sha256,
+                json.loads(air_balance_trace_binding.model_dump_json()),
+                json.loads(fan_hardware_trace_binding.model_dump_json()),
                 context.catalog_sha256,
                 context.acoustic_sha256,
                 # **出力の形を決めるコード側の版も条件に入れる。** 設定の hash だけでは
@@ -1558,6 +1613,9 @@ def _provenance(
         runs=runs,
         versions=versions,
         conditions_sha256=conditions,
+        air_balance_config_sha256=sources.air_balance.sha256,
+        air_balance_trace_binding=air_balance_trace_binding,
+        fan_hardware_trace_binding=fan_hardware_trace_binding,
     )
 
 

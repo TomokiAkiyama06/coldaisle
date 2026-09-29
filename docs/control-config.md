@@ -12,7 +12,7 @@ BIOS制御のまま終了、特定済みなら安全側へ引継ぎ）へ接続�
 
 決定記録 0033（FINAL）により、`air-balance.yaml` を4つ目の Control Config として加え、
 4ファイルを一括検証・一括採用する（0028 §2.8 の3ファイル境界を置き換える）。
-4ファイルの読み込みはまだ実装していないため、それまで Air Balance Model は runtime に接続しない。
+#81 で4ファイルの読み込みを実装した（決定記録 0073。下の「Control Config v11」）。
 
 `fan-hardware.yaml` の `approval.status` が `confirmed` かつ根拠 `basis` を持つまで、
 `actuation_permitted` は false になる。実機の header 対応・Fan profile は #75 の測定記録を
@@ -173,7 +173,41 @@ Model を Production へ昇格させても authority は動かない（#104 と 
 v8からv9へは `authority_rollout` を追加してから `schema_version: 9` へ上げる。
 v1〜v8は自動補完せず起動前に拒否する。
 
-現行 Control Config v9 は設定の live reload を行わない。設定変更は候補全体を別オブジェクトで検証したうえで
+## Control Config v11 と `air-balance.yaml` v2（#81 / 決定記録 0073）
+
+束ねた版 `CONTROL_CONFIG_VERSION` を 10 → 11 に上げ、`air-balance.yaml` を4つ目のファイルにした。
+各ファイルの版は変えない（`fan-hardware.yaml` 1、`safety.yaml` 3、`fan-policy.yaml` 9）。
+`air-balance.yaml` 自身は schema version 2 で、熱の指標をどの snapshot metric から取るかを
+`thermal_inputs`（`gpu_intake_c` / `case_delta_c` / `cpu_package_c` / `gpu_temperature_c`。
+使わない指標は `null`）に置く。各 metric は Metric Catalog にあり単位が `C` であること、
+派生値（`d.*`）は材料の metric へ展開できること、材料の許容遅延を決められることを起動時に
+検証し、満たさなければ Control Config の不正として扱う。束縛した metric は入力契約へ
+`ADVISORY` として加わる（既に契約にある metric はその重要度のまま）。v1 は起動前に拒否し、
+自動補完しない。
+
+| `air-balance.yaml` | `coldaisle-fand` |
+|---|---|
+| 無い | Control Config の不正。**全 zone Max（`config_invalid`）** |
+| 形が不正（schema 違反・v1・曲線の単調性違反・`thermal_inputs` の検証失敗） | 同上 |
+| `source.status: uncalibrated` | 検証を通し、**Air Balance を無効**にして起動する（Safety / Guard は変わらない） |
+| `source.status: calibrated` | 検証を通し、Air Balance を有効にする |
+
+**移行手順**（決定記録 0073 §2.1）:
+
+1. 運用の設定ディレクトリに `air-balance.yaml`（v2）を置く。#75 の前なら
+   `source.status: uncalibrated` のもの。雛形は `tests/fixtures/air_balance_uncalibrated.yaml`
+2. 新しいコードへ更新して再起動する
+
+リポジトリの `config/` には、ほかの3ファイルと同じく実運用の `air-balance.yaml` を置かない。
+置き忘れると全 zone Max で止まる（大きな音と `config_invalid` のログで気付ける側に倒す）。
+
+`ControlTick` は v11 になり、runtime（`ControlTickRuntime` v2）に4ファイルの schema version と
+SHA-256 を毎 tick 残す。Offline Evaluation の報告は v3 になり、`air-balance.yaml` の hash と、
+消費した trace の `air-balance.yaml` / `fan-hardware.yaml` の hash の突き合わせを provenance に持つ。
+昇格（`AuthorityJournal` v2）は、この2ファイルについても承認の証拠・報告・いまの設定の一致を求める
+（`docs/authority-rollout.md`）。
+
+現行 Control Config v11 は設定の live reload を行わない。設定変更は候補全体を別オブジェクトで検証したうえで
 **次回再起動時**にだけ反映する。これにより、変更後の設定も必ず `STARTUP` の Max を通る。
 `trace_metadata()` は、採用されたsource名・schema version・SHA-256を #82 の decision traceへ渡す。
 Confidence / OOD の判断（`model_gate`）には検証済み assessment の値だけを書き、裏付けの無い tick は

@@ -55,12 +55,15 @@ from coldaisle.control.evaluation.model import (
     OptimizerReport,
     PredictionReport,
     TemperatureReport,
+    TraceConfigBinding,
 )
 from coldaisle.control.evaluation.stats import MetricSummary, shape_of, summarize
 from coldaisle.control.schema import (
     MAX_SHADOW_PREDICTION_METRICS,
     MODEL_GATE_ASSESSMENT_COMPONENTS,
     SCHEMA_VERSION,
+    AirBalanceRecord,
+    AirBalanceTraceState,
     AuthorityLimitSource,
     AuthorityStage,
     BoundBy,
@@ -100,7 +103,10 @@ from coldaisle.metrics import MetricCatalog
 from coldaisle.store.models import ControlTraceRecord, Quality
 from test_control_config import valid_documents, write_documents
 from test_control_schema import (
+    AIR_BALANCE_RECORD,
+    AIR_BALANCE_SHA256,
     CONTROL_TICK_RUNTIME,
+    LEGACY_CONTROL_TICK_RUNTIME,
     REGISTRY_PROVENANCE,
     SAFETY_PROVENANCE,
     registry_provenance_for,
@@ -136,6 +142,7 @@ def zone_records(
     guard_floor: float | None = None,
     rpm: int | None = 1200,
     flow: float | None = None,
+    legacy: bool = False,
 ) -> PerZone[ZoneRecord]:
     record = ZoneRecord(
         controller_reason=Reason(code="fallback_curve"),
@@ -149,6 +156,7 @@ def zone_records(
             reasons=() if bound_by is BoundBy.REQUESTED else (Reason(code="guard_floor"),),
         ),
         estimated_flow=flow,
+        applied_demand=None if rpm is None or legacy else effective,
         hardware=(
             None
             if rpm is None
@@ -156,6 +164,61 @@ def zone_records(
         ),
     )
     return PerZone[ZoneRecord](front=record, rear=record, top=record)
+
+
+def strip_v3_provenance(document: dict[str, Any]) -> None:
+    """報告 v3 で足した provenance の欄を、v2 以前の報告の形へ戻す。"""
+    for key in (
+        "air_balance_config_sha256",
+        "air_balance_trace_binding",
+        "fan_hardware_trace_binding",
+    ):
+        del document["provenance"][key]
+
+
+def strip_v11_fields(document: dict[str, Any]) -> None:
+    """v11 で足した欄（`air_balance` と zone の `applied_demand`）を旧い版の形へ戻す。"""
+    document.pop("air_balance", None)
+    for zone in ("front", "rear", "top"):
+        document["zones"][zone].pop("applied_demand", None)
+
+
+def air_balance_for(flow: float | None) -> AirBalanceRecord:
+    """zone の `estimated_flow` と揃えた v11 の Air Balance の記録（有効・校正済みを名乗る）。"""
+    if flow is None:
+        q: float | None = None
+        return AirBalanceRecord(
+            status="enabled",
+            disabled_reason=None,
+            model_id="test-air-balance",
+            source_status="calibrated",
+            config_sha256=AIR_BALANCE_SHA256,
+            q_front=q,
+            q_rear=q,
+            q_top=q,
+            estimated_intake=None,
+            estimated_exhaust=None,
+            balance_ratio=None,
+            state=AirBalanceTraceState.UNKNOWN,
+            thermal_limited=False,
+            thermal_reasons=(),
+        )
+    return AirBalanceRecord(
+        status="enabled",
+        disabled_reason=None,
+        model_id="test-air-balance",
+        source_status="calibrated",
+        config_sha256=AIR_BALANCE_SHA256,
+        q_front=flow,
+        q_rear=flow,
+        q_top=flow,
+        estimated_intake=flow,
+        estimated_exhaust=flow + flow,
+        balance_ratio=(flow + flow) / flow,
+        state=AirBalanceTraceState.EXHAUST_HEAVY,
+        thermal_limited=False,
+        thermal_reasons=(),
+    )
 
 
 def control_state(
@@ -306,6 +369,7 @@ def tick_at(
             if model_gate is not None and model_gate.artifact_sha256 is not None
             else REGISTRY_PROVENANCE
         ),
+        air_balance=air_balance_for(flow),
     )
 
 
@@ -1528,7 +1592,7 @@ def test_the_cli_writes_a_deterministic_report(tmp_path: Path) -> None:
     assert out.read_text(encoding="utf-8") == first
 
     document = json.loads(first)
-    assert document["schema_version"] == 2
+    assert document["schema_version"] == 3
     assert document["segments"][0]["run_id"] == "pr91-cli"
     assert "generated_at" not in document
 
@@ -1723,10 +1787,17 @@ def test_invariant_12_e_partial_rpm_readback_is_recorded_as_a_gap(
     ticks = [tick_at(TICK_TS_MS + index * STEP_MS, index) for index in range(3)]
     stripped = []
     for tick in ticks:
-        zones = tick.zones.model_copy(
-            update={"top": tick.zones.top.model_copy(update={"hardware": None})}
+        # 書き込み結果の無い zone は applied demand も風量も持たない（決定記録 0073 §2.5 (a)）。
+        document = json.loads(tick.model_dump_json())
+        document["zones"]["top"].update(hardware=None, applied_demand=None, estimated_flow=None)
+        document["air_balance"].update(
+            q_top=None,
+            estimated_intake=None,
+            estimated_exhaust=None,
+            balance_ratio=None,
+            state="unknown",
         )
-        stripped.append(trace_of(tick.model_copy(update={"zones": zones})))
+        stripped.append(trace_of(ControlTick.model_validate_json(json.dumps(document))))
     report = evaluate([run_of(stripped, [])], context=context)
     applied = overall(report).applied[0]
 
@@ -2343,7 +2414,7 @@ def _legacy_tick(ts_ms: int, tick_id: int, policy: str) -> ControlTick:
             workload_regime=WorkloadRegime.IDLE,
             regime_confidence=0.5,
         ),
-        zones=zone_records(requested=0.4, effective=0.4),
+        zones=zone_records(requested=0.4, effective=0.4, legacy=True),
     )
 
 
@@ -2453,6 +2524,7 @@ def _applied_learned_run(*, artifacts: tuple[str | None, ...]) -> list[ControlTr
             document.pop("runtime", None)
             document.pop("safety_provenance", None)
             document.pop("registry", None)
+            strip_v11_fields(document)
             tick = ControlTick.model_validate(document)
         elif artifact != "a" * 64:
             document = tick.model_dump(mode="python")
@@ -2596,6 +2668,7 @@ def test_invariant_17_e_a_learned_tick_without_a_model_gate_counts_as_unknown(
         document.pop("runtime", None)
         document.pop("safety_provenance", None)
         document.pop("registry", None)
+        strip_v11_fields(document)
         traces.append(trace_of(ControlTick.model_validate(document)))
 
     report = evaluate([run_of(traces, [])], context=context)
@@ -2646,8 +2719,9 @@ def test_invariant_17_h_a_stored_v1_report_still_loads(context: EvaluationContex
         [run_of(_applied_learned_run(artifacts=("a" * 64,) * 3), [])], context=context
     )
     document = json.loads(report.model_dump_json())
-    # v1 の報告の形（この3欄は当時まだ無かった）。
+    # v1 の報告の形（この3欄も、v3 の設定の突き合わせも当時まだ無かった）。
     document["schema_version"] = 1
+    strip_v3_provenance(document)
     for segment in document["segments"]:
         for group in segment["groups"]:
             for item in group["applied"]:
@@ -2676,15 +2750,15 @@ def test_invariant_17_i_a_report_without_a_schema_version_is_refused(
         [run_of(_applied_learned_run(artifacts=("a" * 64,) * 3), [])], context=context
     )
     document = json.loads(report.model_dump_json())
-    assert document["schema_version"] == 2
-    # v2 はそのまま往復する。
+    assert document["schema_version"] == 3
+    # v3 はそのまま往復する。
     assert EvaluationReport.model_validate_json(json.dumps(document)) == report
 
     del document["schema_version"]
     with pytest.raises(ValidationError, match="schema_version"):
         EvaluationReport.model_validate_json(json.dumps(document))
     # 既定値を省いて書き出しても、版は必ず残る（省ける既定値が無い）。
-    assert json.loads(report.model_dump_json(exclude_defaults=True))["schema_version"] == 2
+    assert json.loads(report.model_dump_json(exclude_defaults=True))["schema_version"] == 3
 
 
 def test_invariant_17_g_a_v1_report_cannot_carry_the_fields_added_in_v2(
@@ -2695,8 +2769,125 @@ def test_invariant_17_g_a_v1_report_cannot_carry_the_fields_added_in_v2(
         [run_of(_applied_learned_run(artifacts=("a" * 64,) * 3), [])], context=context
     )
     document = json.loads(report.model_dump_json())
-    assert document["schema_version"] == 2
+    assert document["schema_version"] == 3
     document["schema_version"] = 1
+    strip_v3_provenance(document)
 
     with pytest.raises(ValidationError, match="schema version 2"):
+        EvaluationReport.model_validate_json(json.dumps(document))
+
+
+# ------------------------------ 設定の束縛と Air Balance（#81 / 決定記録 0073 §2.5 (d) / §2.6）
+
+
+def _bound_to(tick: ControlTick, context: EvaluationContext) -> ControlTick:
+    """tick の runtime の hash を、評価時の設定と同じにする（その設定で記録された tick）。"""
+    sources = context.control.sources
+    document = json.loads(tick.model_dump_json())
+    document["runtime"]["config"].update(
+        fan_hardware_sha256=sources.fan_hardware.sha256,
+        air_balance_sha256=sources.air_balance.sha256,
+    )
+    document["air_balance"]["config_sha256"] = sources.air_balance.sha256
+    return ControlTick.model_validate_json(json.dumps(document))
+
+
+def _legacy_v10(tick: ControlTick) -> ControlTick:
+    """同じ tick を、runtime v1（air-balance.yaml の hash を持たない）の v10 として保存した形。"""
+    document = json.loads(tick.model_dump_json())
+    document["schema_version"] = 10
+    fan_hardware = document["runtime"]["config"]["fan_hardware_sha256"]
+    document["runtime"] = json.loads(LEGACY_CONTROL_TICK_RUNTIME.model_dump_json())
+    document["runtime"]["config"]["fan_hardware_sha256"] = fan_hardware
+    strip_v11_fields(document)
+    return ControlTick.model_validate_json(json.dumps(document))
+
+
+def test_the_report_counts_traces_recorded_under_the_evaluated_config(
+    context: EvaluationContext,
+) -> None:
+    """消費した tick の hash を評価時の設定と突き合わせ、件数を provenance に残す。"""
+    ticks = [tick_at(TICK_TS_MS + index * STEP_MS, index) for index in range(4)]
+    traces = [
+        trace_of(_bound_to(ticks[0], context)),
+        trace_of(_bound_to(ticks[1], context)),
+        trace_of(ticks[2]),  # 別の characterization・別の profile で記録された tick
+        trace_of(_legacy_v10(_bound_to(ticks[3], context))),  # hash の欄を持たない v10
+    ]
+    report = evaluate([run_of(traces, [])], context=context)
+    provenance = report.provenance
+
+    assert report.schema_version == 3
+    assert provenance.air_balance_config_sha256 == context.control.sources.air_balance.sha256
+    assert provenance.air_balance_trace_binding == TraceConfigBinding(
+        matched=2, mismatched=1, missing=1
+    )
+    # fan-hardware.yaml の hash は runtime v1 から持つので、v10 の tick も突き合わせられる。
+    assert provenance.fan_hardware_trace_binding == TraceConfigBinding(
+        matched=3, mismatched=1, missing=0
+    )
+    assert not provenance.air_balance_trace_binding.complete
+
+
+def test_the_air_balance_file_is_part_of_the_conditions(
+    context: EvaluationContext, tmp_path: Path
+) -> None:
+    """Air Balance の設定だけが違う2つの評価を、同じ条件と名乗らせない。"""
+    traces = [trace_of(tick_at(TICK_TS_MS + index * STEP_MS, index)) for index in range(3)]
+    documents = valid_documents()
+    documents["air-balance.yaml"]["model_id"] = "another-characterization"
+    directory = tmp_path / "pr81-config"
+    directory.mkdir()
+    write_documents(directory, documents)
+    other = EvaluationContext.build(
+        config=context.config,
+        config_sha256=context.config_sha256,
+        control=ControlConfig.from_directory(directory),
+        catalog=context.catalog,
+        catalog_sha256=context.catalog_sha256,
+    )
+
+    first = evaluate([run_of(traces, [])], context=context).provenance
+    second = evaluate([run_of(traces, [])], context=other).provenance
+
+    assert first.fan_policy_config_sha256 == second.fan_policy_config_sha256
+    assert first.air_balance_config_sha256 != second.air_balance_config_sha256
+    assert first.conditions_sha256 != second.conditions_sha256
+
+
+def test_disabled_air_balance_is_counted_apart_from_an_unknown_flow(
+    context: EvaluationContext,
+) -> None:
+    """「使っていなかった」と「推定できなかった」を分けて数える（0073 §2.5 (d)）。"""
+    disabled = []
+    for index in range(3):
+        document = json.loads(tick_at(TICK_TS_MS + index * STEP_MS, index).model_dump_json())
+        for zone in ("front", "rear", "top"):
+            document["zones"][zone]["estimated_flow"] = None
+        document["air_balance"] = json.loads(AIR_BALANCE_RECORD.model_dump_json())
+        disabled.append(trace_of(ControlTick.model_validate_json(json.dumps(document))))
+    codes = {
+        gap.code
+        for gap in overall(evaluate([run_of(disabled, [])], context=context)).applied[0].gaps
+    }
+    assert "air_balance_disabled" in codes
+    assert "no_estimated_flow" not in codes
+
+    unknown = [
+        trace_of(tick_at(TICK_TS_MS + index * STEP_MS, index, flow=None)) for index in range(3)
+    ]
+    codes = {
+        gap.code
+        for gap in overall(evaluate([run_of(unknown, [])], context=context)).applied[0].gaps
+    }
+    assert "no_estimated_flow" in codes
+    assert "air_balance_disabled" not in codes
+
+
+def test_a_v3_report_must_carry_the_config_bindings(context: EvaluationContext) -> None:
+    """版が中身を表さない報告を作らない。"""
+    report = evaluate([run_of([trace_of(tick_at(TICK_TS_MS, 0))], [])], context=context)
+    document = json.loads(report.model_dump_json())
+    strip_v3_provenance(document)
+    with pytest.raises(ValidationError, match="v3 の報告"):
         EvaluationReport.model_validate_json(json.dumps(document))

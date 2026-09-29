@@ -32,6 +32,8 @@ from pydantic import ValidationError
 
 from coldaisle.clock import SimulatedClock
 from coldaisle.control import (
+    AUTHORITY_JOURNAL_SCHEMA_VERSION,
+    AUTHORITY_STATE_FILENAME,
     BASELINE_STAGE,
     STAGE_ORDER,
     ArtifactKind,
@@ -86,6 +88,7 @@ from coldaisle.control.evaluation.model import (
     RunProvenance,
     SegmentReport,
     SegmentRole,
+    TraceConfigBinding,
     WorstCase,
     WorstCaseKind,
 )
@@ -311,6 +314,11 @@ DEFAULT_CONFIG = control_config(Path(_FIXTURES.name), ceiling="full")
 
 POLICY_SHA = DEFAULT_CONFIG.sources.policy.sha256
 SAFETY_SHA = DEFAULT_CONFIG.sources.safety.sha256
+AIR_BALANCE_SHA = DEFAULT_CONFIG.sources.air_balance.sha256
+FAN_HARDWARE_SHA = DEFAULT_CONFIG.sources.fan_hardware.sha256
+
+ALL_MATCHED = TraceConfigBinding(matched=1_000, mismatched=0, missing=0)
+"""消費した tick がすべていまの設定で記録されていた、という突き合わせ（決定記録 0073 §2.6）。"""
 
 
 def promote_next_version(root: Path, *, version: str) -> str:
@@ -350,6 +358,10 @@ def report_document(
     with_applied_learned: bool = False,
     applied_artifacts: tuple[str, ...] | None = None,
     applied_unbound_ticks: int = 0,
+    air_balance_sha: str = AIR_BALANCE_SHA,
+    fan_hardware_sha: str = FAN_HARDWARE_SHA,
+    air_balance_binding: TraceConfigBinding = ALL_MATCHED,
+    fan_hardware_binding: TraceConfigBinding = ALL_MATCHED,
 ) -> bytes:
     """最小の Offline Evaluation 報告（#91）。**arm の実績と gate を持つ。**"""
     learned = learned_arm(arm_stage)
@@ -421,10 +433,13 @@ def report_document(
             )
         )
     report = EvaluationReport(
-        schema_version=2,
+        schema_version=3,
         provenance=EvaluationProvenance(
             evaluation_config_sha256="5" * 64,
-            fan_hardware_config_sha256="6" * 64,
+            fan_hardware_config_sha256=fan_hardware_sha,
+            air_balance_config_sha256=air_balance_sha,
+            air_balance_trace_binding=air_balance_binding,
+            fan_hardware_trace_binding=fan_hardware_binding,
             safety_config_sha256=safety_sha,
             fan_policy_config_sha256=policy_sha,
             metric_catalog_sha256="7" * 64,
@@ -491,6 +506,8 @@ def evidence_for(
     policy_sha: str = POLICY_SHA,
     safety_sha: str = SAFETY_SHA,
     conditions_sha: str = CONDITIONS_SHA,
+    air_balance_sha: str | None = AIR_BALANCE_SHA,
+    fan_hardware_sha: str | None = FAN_HARDWARE_SHA,
 ) -> RolloutEvidence:
     return RolloutEvidence(
         report_sha256=sha256(document).hexdigest(),
@@ -500,6 +517,8 @@ def evidence_for(
         evidence_end_ms=end_ms,
         fan_policy_config_sha256=policy_sha,
         safety_config_sha256=safety_sha,
+        air_balance_config_sha256=air_balance_sha,
+        fan_hardware_config_sha256=fan_hardware_sha,
     )
 
 
@@ -1266,11 +1285,176 @@ def test_invariant_5_y_a_report_that_predates_the_artifact_fields_cannot_promote
     document = report_document()
     payload = json.loads(document)
     payload["schema_version"] = 1
+    _strip_v3_provenance(payload)
     document = json.dumps(payload).encode("utf-8")
     approval = approval_for(document, evidence=evidence_for(document))
 
     with pytest.raises(AuthorityEvidenceError, match="完全性を言えない古い報告"):
         raise_stage(store(tmp_path), approval=approval, document=document)
+
+
+def _strip_v3_provenance(payload: dict[str, Any]) -> None:
+    for key in (
+        "air_balance_config_sha256",
+        "air_balance_trace_binding",
+        "fan_hardware_trace_binding",
+    ):
+        del payload["provenance"][key]
+
+
+# ------------------------------------------------ air-balance.yaml / fan-hardware.yaml（0073 §2.6）
+
+
+def test_a_v2_report_cannot_promote_because_it_cannot_name_the_air_balance_file(
+    tmp_path: Path,
+) -> None:
+    """v2 の報告は Air Balance の設定を言えない。**読めるが昇格の証拠にしない。**"""
+    payload = json.loads(report_document())
+    payload["schema_version"] = 2
+    _strip_v3_provenance(payload)
+    document = json.dumps(payload).encode("utf-8")
+    approval = approval_for(document, evidence=evidence_for(document))
+
+    with pytest.raises(AuthorityEvidenceError, match="required>=3"):
+        raise_stage(store(tmp_path), approval=approval, document=document)
+
+
+@pytest.mark.parametrize("name", ["air-balance.yaml", "fan-hardware.yaml"])
+@pytest.mark.parametrize("where", ["evidence", "report", "running"])
+def test_the_air_balance_and_hardware_files_are_bound_three_ways(
+    tmp_path: Path, name: str, where: str
+) -> None:
+    """承認の証拠・報告の provenance・いま動いている設定の3つが一致しなければ昇格しない。"""
+    other = "c" * 64
+    report_overrides: dict[str, Any] = {}
+    evidence_overrides: dict[str, Any] = {}
+    config = DEFAULT_CONFIG
+    key = "air_balance_sha" if name == "air-balance.yaml" else "fan_hardware_sha"
+    if where == "report":
+        report_overrides[key] = other
+    elif where == "evidence":
+        evidence_overrides[key] = other
+    else:
+        documents = valid_documents()
+        documents["fan-policy.yaml"]["authority_stage"] = "full"
+        if name == "air-balance.yaml":
+            documents["air-balance.yaml"]["model_id"] = "another-characterization"
+        else:
+            documents["fan-hardware.yaml"]["zones"]["front"]["profile"]["startup_demand"] = 0.55
+        root = tmp_path / "running-config"
+        root.mkdir()
+        write_documents(root, documents)
+        config = ControlConfig.from_directory(root)
+    document = report_document(**report_overrides)
+    approval = approval_for(document, evidence=evidence_for(document, **evidence_overrides))
+
+    with pytest.raises(AuthorityEvidenceError, match=f"いまの {name} のものではない"):
+        raise_stage(store(tmp_path), approval=approval, document=document, config=config)
+
+
+@pytest.mark.parametrize(
+    "binding",
+    [
+        TraceConfigBinding(matched=999, mismatched=1, missing=0),
+        TraceConfigBinding(matched=999, mismatched=0, missing=1),
+        TraceConfigBinding(matched=0, mismatched=0, missing=0),
+    ],
+)
+@pytest.mark.parametrize("name", ["air-balance.yaml", "fan-hardware.yaml"])
+def test_a_report_built_from_traces_of_another_config_cannot_promote(
+    tmp_path: Path, binding: TraceConfigBinding, name: str
+) -> None:
+    """**評価に使った trace がその hash の設定で記録された**ことを確かめる（0073 §2.6）。
+
+    評価時の hash を写すだけでは、別の characterization や hash を持たない v10 以前の
+    trace から作った報告が、いまの設定を名乗れてしまう。1件でも混ざれば丸ごと使わない。
+    """
+    key = "air_balance_binding" if name == "air-balance.yaml" else "fan_hardware_binding"
+    document = report_document(**{key: binding})
+    approval = approval_for(document)
+
+    with pytest.raises(AuthorityEvidenceError, match=f"いまの {name} で記録されたと言えない"):
+        raise_stage(store(tmp_path), approval=approval, document=document)
+
+
+def test_an_approval_without_the_config_bindings_cannot_promote(tmp_path: Path) -> None:
+    """journal v2 の新しい昇格は、2つの hash を持つ承認でなければ書かない。"""
+    document = report_document()
+    approval = approval_for(
+        document, evidence=evidence_for(document, air_balance_sha=None, fan_hardware_sha=None)
+    )
+
+    with pytest.raises(AuthorityEvidenceError, match=r"air-balance\.yaml"):
+        raise_stage(store(tmp_path), approval=approval, document=document)
+
+
+def test_the_two_config_bindings_are_recorded_together() -> None:
+    document = report_document()
+    with pytest.raises(ValidationError, match="一緒に記録する"):
+        evidence_for(document, fan_hardware_sha=None)
+
+
+def test_a_promotion_is_written_as_a_v2_journal_with_both_hashes(tmp_path: Path) -> None:
+    document = report_document()
+    journal = raise_stage(store(tmp_path), approval=approval_for(document), document=document)
+
+    assert journal.schema_version == AUTHORITY_JOURNAL_SCHEMA_VERSION == 2
+    event = journal.events[-1]
+    assert event.approval is not None
+    assert event.approval.evidence.air_balance_config_sha256 == AIR_BALANCE_SHA
+    assert event.approval.evidence.fan_hardware_config_sha256 == FAN_HARDWARE_SHA
+
+
+def test_a_stored_v1_journal_still_loads_and_can_be_appended(tmp_path: Path) -> None:
+    """既に残った v1 の昇格 event は書き換えずに読む。新しい event は v2 で書く。"""
+    document = report_document()
+    journal = raise_stage(store(tmp_path), approval=approval_for(document), document=document)
+    payload = json.loads(journal.model_dump_json())
+    payload["schema_version"] = 1
+    for event in payload["events"]:
+        evidence = event["approval"]["evidence"]
+        del evidence["air_balance_config_sha256"]
+        del evidence["fan_hardware_config_sha256"]
+    legacy = AuthorityJournal.model_validate_json(json.dumps(payload))
+    assert legacy.schema_version == 1
+    assert legacy.events[0].approval is not None
+    assert not legacy.events[0].approval.evidence.binds_air_balance
+
+    # v1 の journal に、設定に束縛した証拠を持つ event は置けない。
+    bound = json.loads(journal.model_dump_json()) | {"schema_version": 1}
+    with pytest.raises(ValidationError, match="v2"):
+        AuthorityJournal.model_validate_json(json.dumps(bound))
+
+    root = tmp_path / "authority"
+    (root / AUTHORITY_STATE_FILENAME).write_text(json.dumps(payload), encoding="utf-8")
+    lowered = store(tmp_path).rollback_to_baseline(actor=APPROVER, reason="試験の rollback")
+    assert lowered.schema_version == 2
+    assert lowered.events[0] == legacy.events[0]
+
+
+def test_a_later_promotion_cannot_drop_the_config_bindings(tmp_path: Path) -> None:
+    """束縛は一度入ったら外せない。欄を空けた昇格で束縛を外す記録を作らない。"""
+    authority = store(tmp_path)
+    document = report_document()
+    journal = raise_stage(authority, approval=approval_for(document), document=document)
+    payload = json.loads(journal.model_dump_json())
+    second = json.loads(json.dumps(payload["events"][0]))
+    second.update(
+        revision=2,
+        from_stage=AuthorityStage.LIMITED.value,
+        to_stage=AuthorityStage.EXPANDED.value,
+    )
+    second["approval"].update(
+        from_stage=AuthorityStage.LIMITED.value,
+        to_stage=AuthorityStage.EXPANDED.value,
+        expected_revision=1,
+    )
+    del second["approval"]["evidence"]["air_balance_config_sha256"]
+    del second["approval"]["evidence"]["fan_hardware_config_sha256"]
+    payload.update(revision=2, stage=AuthorityStage.EXPANDED.value)
+    payload["events"].append(second)
+    with pytest.raises(ValidationError, match="束縛の無い昇格"):
+        AuthorityJournal.model_validate_json(json.dumps(payload))
 
 
 def test_invariant_5_z_a_report_without_a_schema_version_cannot_promote(

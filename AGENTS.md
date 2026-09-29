@@ -42,6 +42,7 @@ uv run coldaisle-event gpu-mode compute  # GPU Mode の切り替えを記録す�
 uv run coldaisle-event workload-hint training --expected-duration 4h  # Workload Hint を記録する（記録のみ。#107 / 決定記録 0064）
 uv run coldaisle-telemetry --once   # NVML / hwmon を1回収集（#65）
 uv run coldaisle-fand --max-ticks 5 # 3系統Fan制御デーモン（simulated backend。#74 / 決定記録 0028）
+uv run coldaisle-fand --config-dir var/control-config  # 4ファイル（air-balance.yaml を含む）を置いた設定で起動。無ければ全 zone Max（決定記録 0073）
 COLDAISLE_DB=var/coldaisle.db uv run uvicorn coldaisle.api:app --host 127.0.0.1 --port 8000
 COLDAISLE_DB=var/coldaisle.db uv run uvicorn coldaisle.server:app --port 8000  # + AI ツールの窓口
 ```
@@ -243,6 +244,8 @@ src/coldaisle/
   rules/      # L2: アラート用ルールエンジン（決定論的。LLM非依存）
   control/    # Fan制御。Supervisor / MPC / Guard / Safety / Fallback / hardware mapping
     loop.py     # 1 tickの順序・期限・例外の翻訳（閾値もdemandの計算も持たない）。#74
+    air_balance.py       # Air Balance Model と air-balance.yaml（v2）の形。Safety ではない。#81
+    air_balance_trace.py # applied demand から Air Balance を trace へ記録するだけ（制御へ効かない）。#81 / 決定記録 0073
     supervisor/ # RulePolicy / RLPolicy / Workload Regime
     model/      # Learned Thermal Model、Confidence / OOD
     mpc/        # Optimizer / horizon制御
@@ -261,7 +264,7 @@ src/coldaisle/
   web/        # L4: 静的アセット
 firmware/     # ESP32-S3 Arduino スケッチ。**コンパイルは人の手**（#11 / 決定記録 0022 §2.9）
 deploy/       # Ubuntu 常駐化のテンプレート（systemd / udev）。**仮の値だけ**。手順は docs/ubuntu-deploy.md（#57）
-config/       # rules.yaml, calibration.json, coldaisle.toml, fan-policy.yaml, fan-hardware.yaml, safety.yaml, evaluation.yaml, drift.yaml, rl-training.yaml, soak.yaml
+config/       # rules.yaml, calibration.json, coldaisle.toml, evaluation.yaml, drift.yaml, rl-training.yaml, soak.yaml（Control Config の4ファイル fan-hardware / safety / fan-policy / air-balance は実運用のものを置かない。docs/control-config.md）
 memory/       # 運用メモリ（いまの閾値・較正値）。`coldaisle-memory` が更新案を出す
 docs/         # 要件定義、仕様レビュー、ADR
 tests/

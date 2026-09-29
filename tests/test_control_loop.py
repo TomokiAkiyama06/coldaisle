@@ -46,6 +46,7 @@ from pydantic import ValidationError
 
 from coldaisle import logs
 from coldaisle.clock import ManualMonotonicClock, SimulatedClock
+from coldaisle.control.air_balance import AirBalanceConfig
 from coldaisle.control.config import ControlConfig, FanPolicyConfig, SafetyConfig
 from coldaisle.control.fallback.controller import FallbackController
 from coldaisle.control.fallback.gate import ControllerGate, LearnedControlStatus, SnapshotStatus
@@ -161,17 +162,23 @@ def control_config(
     *,
     safety: dict[str, Any] | None = None,
     policy: dict[str, Any] | None = None,
+    air_balance: dict[str, Any] | None = None,
     confirmed_hardware: bool = True,
 ) -> ControlConfig:
-    """検証済みの ControlConfig。hardware は実機の識別子を含まない測定済み設定を使う。"""
+    """検証済みの ControlConfig。hardware は実機の識別子を含まない測定済み設定を使う。
+
+    ``air_balance`` を省くとリポジトリの未校正の雛形（Air Balance は無効）を使う。
+    """
     documents = valid_documents()
     safety_document = documents["safety.yaml"] | (safety or {})
     policy_document = documents["fan-policy.yaml"] | (policy or {})
-    sources = _sources(safety_document, policy_document)
+    air_balance_document = air_balance if air_balance is not None else documents["air-balance.yaml"]
+    sources = _sources(safety_document, policy_document, air_balance_document)
     return ControlConfig(
         fan_hardware=hardware_config(confirmed=confirmed_hardware),
         safety=SafetyConfig.model_validate(safety_document),
         policy=FanPolicyConfig.model_validate(policy_document),
+        air_balance=AirBalanceConfig.model_validate(air_balance_document),
         sources=sources,
     )
 
@@ -203,7 +210,11 @@ def confirmed_safety_document() -> dict[str, Any]:
     return document
 
 
-def _sources(safety_document: dict[str, Any], policy_document: dict[str, Any]) -> Any:
+def _sources(
+    safety_document: dict[str, Any],
+    policy_document: dict[str, Any],
+    air_balance_document: dict[str, Any],
+) -> Any:
     from hashlib import sha256
 
     from coldaisle.control.config import ConfigSource, ConfigSources
@@ -222,6 +233,11 @@ def _sources(safety_document: dict[str, Any], policy_document: dict[str, Any]) -
             name="fan-policy.yaml",
             schema_version=int(policy_document["schema_version"]),
             sha256=digest(policy_document),
+        ),
+        air_balance=ConfigSource(
+            name="air-balance.yaml",
+            schema_version=int(air_balance_document["schema_version"]),
+            sha256=digest(air_balance_document),
         ),
     )
 
@@ -1046,7 +1062,7 @@ def test_invariant_12_every_tick_records_that_no_registry_was_read(catalog) -> N
     for result in results:
         assert result.tick.registry == RegistryProvenance.unbound()
     recorded = json.loads(harness.trace.rows[-1])
-    assert recorded["schema_version"] == SCHEMA_VERSION == 10
+    assert recorded["schema_version"] == SCHEMA_VERSION == 11
     assert recorded["registry"] == {"schema_version": 1, "revision": None, "production": {}}
 
 
@@ -1158,6 +1174,7 @@ def test_invariant_12_a_recorded_overrun_cannot_disagree_with_its_duration() -> 
     )
     with pytest.raises(ValidationError, match="deadline_exceeded"):
         ControlTickRuntime(
+            schema_version=1,
             tick_period_ms=1_000,
             deadline_ms=100,
             duration_ms=900,
@@ -1167,6 +1184,7 @@ def test_invariant_12_a_recorded_overrun_cannot_disagree_with_its_duration() -> 
         )
     with pytest.raises(ValidationError, match="締め切りを周期より長く"):
         ControlTickRuntime(
+            schema_version=1,
             tick_period_ms=100,
             deadline_ms=1_000,
             duration_ms=10,

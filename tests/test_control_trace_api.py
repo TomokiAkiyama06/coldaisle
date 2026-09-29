@@ -3,7 +3,7 @@
 - 保存: `seq`（記録した順）と削除の境界 `control_trace_prune`（0071 §2.2a）
 - API: `GET /api/v1/control/latest` と `GET /api/v1/control/traces`（0071 §2.2）、
   `GET /api/v1/events/{id}`（0071 §2.7）
-- 本文は保存した JSON をそのまま返す。v1〜v10 の fixture で確かめる（0071 §2.3 / §2.4）
+- 本文は保存した JSON をそのまま返す。v1〜v11 の fixture で確かめる（0071 §2.3 / §2.4）
 - API は `coldaisle.control` を import しない。AI ツールに trace を足さない（0071 §2.4 / §2.8）
 """
 
@@ -90,7 +90,7 @@ def seqs(body: dict[str, Any]) -> list[int]:
     return [trace["seq"] for trace in body["traces"]]
 
 
-# ---------------------------------------------------------------- fixture（v1〜v10）
+# ---------------------------------------------------------------- fixture（v1〜v11）
 
 
 @pytest.mark.parametrize("version", VERSIONS)
@@ -303,7 +303,7 @@ def test_latest_returns_the_stored_json_as_is(
 def test_traces_return_every_version_unchanged_in_recorded_order(
     store: SqliteStore, client: TestClient
 ) -> None:
-    """v1〜v10 が混ざっていても、そのまま返す。検証し直さない・投影しない（0071 §2.4）。"""
+    """v1〜v11 が混ざっていても、そのまま返す。検証し直さない・投影しない（0071 §2.4）。"""
     for version in reversed(VERSIONS):  # 時刻の並びと記録の順を逆にする
         stored = fixture_text(version)
         tick = json.loads(stored)

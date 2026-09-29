@@ -25,9 +25,10 @@ import yaml
 from pydantic import ValidationError
 
 from coldaisle.clock import SimulatedClock
-from coldaisle.control.config import ControlConfig
+from coldaisle.control.config import CONTROL_CONFIG_VERSION, ControlConfig
 from coldaisle.control.model_registry import ModelRegistry
 from coldaisle.control.schema import (
+    AirBalanceRecord,
     ControlConfigDigest,
     ControlTick,
     ControlTickRuntime,
@@ -243,10 +244,20 @@ class Fixture:
                     fan_hardware_sha256=self.control.sources.fan_hardware.sha256,
                     safety_sha256=self.control.sources.safety.sha256,
                     policy_sha256=policy_sha256 or self.policy_sha256,
+                    air_balance_sha256=self.control.sources.air_balance.sha256,
+                    control_config_version=CONTROL_CONFIG_VERSION,
+                    fan_hardware_schema_version=self.control.sources.fan_hardware.schema_version,
+                    safety_schema_version=self.control.sources.safety.schema_version,
+                    policy_schema_version=self.control.sources.policy.schema_version,
+                    air_balance_schema_version=self.control.sources.air_balance.schema_version,
                 ),
             ),
             safety_provenance=SAFETY_PROVENANCE,
             registry=REGISTRY_PROVENANCE,
+            air_balance=AirBalanceRecord.disabled(
+                model_id=self.control.air_balance.model_id,
+                config_sha256=self.control.sources.air_balance.sha256,
+            ),
         )
 
 

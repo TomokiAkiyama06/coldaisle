@@ -25,7 +25,7 @@ from coldaisle.control.schema import (
     Zone,
 )
 
-EVALUATION_REPORT_SCHEMA_VERSION: Literal[2] = 2
+EVALUATION_REPORT_SCHEMA_VERSION: Literal[3] = 3
 """報告1つの形の版。**欄の意味を変えたら上げる。**
 
 - v2（#159）: 適用 arm の `model_artifacts` / `unbound_attested_ticks`。
@@ -35,6 +35,10 @@ EVALUATION_REPORT_SCHEMA_VERSION: Literal[2] = 2
   足したときは、欄の無い報告が `None`＝「言えない」と読まれたので版を上げなかった。
   **absence が unknown に落ちるか completeness に落ちるかで扱いを変える。**
   v1 は読めるが、昇格の証拠には使えない（#92 が拒む）
+- v3（#81 / 決定記録 0073 §2.6）: provenance の `air_balance_config_sha256` と、消費した
+  trace の設定 hash の突き合わせ（`air_balance_trace_binding` / `fan_hardware_trace_binding`）。
+  **v3 ではすべて必須、v2 以前は持たない。** v2 以前は Air Balance の設定を言えないので、
+  読めるが昇格の証拠には使えない（#92 が拒む）
 """
 
 
@@ -653,6 +657,25 @@ class ObservedVersions(_Frozen):
     operating_modes: tuple[str, ...] = ()
 
 
+class TraceConfigBinding(_Frozen):
+    """消費した tick の設定 hash と、評価時の設定の突き合わせ（決定記録 0073 §2.6）。
+
+    評価時の hash を provenance に写すだけでは、**trace がどの設定で記録されたか**を言えない。
+    tick ごとに数え、**1件以上あってすべて一致したときだけ**昇格の証拠に使える。
+    一致しない tick を黙って除外しない（除外の仕方で結果を選べてしまう）。
+    """
+
+    matched: int = Field(ge=0)
+    mismatched: int = Field(ge=0)
+    missing: int = Field(ge=0)
+    """hash の欄を持たない tick（Air Balance なら runtime v1、すなわち v10 以前の tick）。"""
+
+    @property
+    def complete(self) -> bool:
+        """昇格の証拠に使えるか（1件以上あり、不一致・欠落が無い）。"""
+        return self.matched > 0 and self.mismatched == 0 and self.missing == 0
+
+
 class EvaluationProvenance(_Frozen):
     """再現に要る入力の素性。**絶対 path も生成時刻も持たない**（0021 / 0054 §2.7）。"""
 
@@ -670,6 +693,36 @@ class EvaluationProvenance(_Frozen):
     versions: ObservedVersions
     conditions_sha256: Sha256Hex
     """入力と設定をまとめた識別子。**これが同じなら同じ条件で比べている。**"""
+    air_balance_config_sha256: Sha256Hex | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
+    """評価時の ``air-balance.yaml`` の SHA-256（報告 v3。決定記録 0073 §2.6）。"""
+    air_balance_trace_binding: TraceConfigBinding | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
+    """消費した tick の ``air_balance_sha256`` と評価時の hash の突き合わせ（v3）。"""
+    fan_hardware_trace_binding: TraceConfigBinding | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
+    """消費した tick の ``fan_hardware_sha256`` と評価時の hash の突き合わせ（v3）。"""
+
+    @property
+    def config_bound(self) -> bool:
+        """v3 の設定の束縛の欄をすべて持つか。"""
+        return (
+            self.air_balance_config_sha256 is not None
+            and self.air_balance_trace_binding is not None
+            and self.fan_hardware_trace_binding is not None
+        )
+
+    @property
+    def config_unbound(self) -> bool:
+        """v2 以前の形（設定の束縛の欄を1つも持たない）か。"""
+        return (
+            self.air_balance_config_sha256 is None
+            and self.air_balance_trace_binding is None
+            and self.fan_hardware_trace_binding is None
+        )
 
 
 class GateStage(StrEnum):
@@ -751,7 +804,7 @@ class EvaluationReport(_Frozen):
     **同じ入力からは同じ bytes になる。** 生成時刻を持たず、時刻はすべて証拠から来る。
     """
 
-    schema_version: Literal[1, 2]
+    schema_version: Literal[1, 2, 3]
     """報告の形の版。**入力では必須で、既定値を持たない**（codex #4092017585）。
 
     既定値があると、既定値を省いて書き出した v1 の報告（`exclude_defaults` など）が
@@ -766,6 +819,12 @@ class EvaluationReport(_Frozen):
 
     @model_validator(mode="after")
     def _segments_are_ordered_and_worst_cases_are_present(self) -> Self:
+        if self.schema_version >= 3 and not self.provenance.config_bound:
+            # 版が中身を表さない報告を作らない。v3 を名乗りながら Air Balance の設定を
+            # 言えない報告が、昇格の版の下限を素通りしないようにする。
+            raise ValueError("v3 の報告には air-balance.yaml の hash と trace の突き合わせが要る")
+        if self.schema_version < 3 and not self.provenance.config_unbound:
+            raise ValueError("設定の突き合わせを記録する報告は schema version 3 にする")
         previous: tuple[str, int] | None = None
         for segment in self.segments:
             current = (segment.run_id, segment.index)

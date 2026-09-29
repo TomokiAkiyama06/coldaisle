@@ -9,6 +9,7 @@ cooling floor は後段の Critical Safety が保持する。
 
 from __future__ import annotations
 
+import re
 from enum import StrEnum
 from hashlib import sha256
 from itertools import pairwise
@@ -19,8 +20,17 @@ import yaml
 from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, model_validator
 
 from coldaisle.control.schema import Demand, PerZone, Reason, Zone
+from coldaisle.store.models import DERIVED_PREFIX, validate_metric
 
-AIR_BALANCE_CONFIG_VERSION: Literal[1] = 1
+_DERIVED_NAME = re.compile(r"^d\.[a-z][a-z0-9_]*$")
+"""派生値（決定記録 0002 §2.2）の名前の形。存在は起動時に Metric Catalog で確かめる。"""
+
+AIR_BALANCE_CONFIG_VERSION: Literal[2] = 2
+"""`air-balance.yaml` の形の版。
+
+- v2（#81 / 決定記録 0073 §2.4）: `thermal_inputs`（熱の指標を tick の snapshot のどの
+  metric から取るか）を必須にした。**v1 は起動前に拒否し、自動補完しない。**
+"""
 
 FiniteFloat = Annotated[float, Field(allow_inf_nan=False)]
 EffectiveFlow = Annotated[float, Field(ge=0.0, allow_inf_nan=False)]
@@ -155,16 +165,60 @@ class ThermalLimits(_Frozen):
     gpu_temperature_c: FiniteFloat
 
 
+class ThermalInputBindings(_Frozen):
+    """``ThermalInputs`` の各指標を snapshot のどの metric から取るか（決定記録 0073 §2.4）。
+
+    metric 名をコードに書かない（AGENTS.md ルール9）。``None`` はその指標を使わない。
+    Metric Catalog に存在し単位が ``C`` であることは、Catalog を持つ起動時に検証する
+    （``fan-policy.yaml`` の Fallback 入力と同じ規則）。
+    """
+
+    gpu_intake_c: str | None
+    case_delta_c: str | None
+    cpu_package_c: str | None
+    gpu_temperature_c: str | None
+
+    @model_validator(mode="after")
+    def _metrics_are_stored_or_derived_names(self) -> Self:
+        for metric in self.metrics():
+            if metric.startswith(DERIVED_PREFIX):
+                # 派生値は Catalog の定義で材料の metric へ展開して契約に加える（0073 §2.4）。
+                if not _DERIVED_NAME.fullmatch(metric):
+                    raise ValueError(f"派生値の名前の形が正しくない: {metric!r}")
+                continue
+            validate_metric(metric)
+        return self
+
+    def metrics(self) -> tuple[str, ...]:
+        """束縛している metric（重複を除き、名前の昇順）。"""
+        values = (
+            self.gpu_intake_c,
+            self.case_delta_c,
+            self.cpu_package_c,
+            self.gpu_temperature_c,
+        )
+        return tuple(sorted({value for value in values if value is not None}))
+
+
 class AirBalanceConfig(_Frozen):
     """未校正の初期モデルと #75 の実測モデルが共有する設定形式。"""
 
-    schema_version: Literal[1]
+    schema_version: Literal[2]
     model_id: str = Field(pattern=r"^[a-z][a-z0-9_-]*$", max_length=120)
     source: CharacterizationSource
     flow_unit: Literal["efu"]
     zones: PerZone[ZoneFlowCurve]
     balance: BalanceBand
     thermal_limits: ThermalLimits
+    thermal_inputs: ThermalInputBindings
+
+    @property
+    def calibrated(self) -> bool:
+        """Air Balance を制御と記録に使ってよいか（決定記録 0073 §2.2）。
+
+        有効・無効は ``source.status`` **だけ**から決める。別のフラグは持たない。
+        """
+        return self.source.status == "calibrated"
 
     @classmethod
     def from_file(cls, path: Path) -> tuple[AirBalanceConfig, str]:
@@ -351,7 +405,7 @@ class ConfiguredAirBalanceModel:
             rear=self._config.zones.rear.estimate(demands.rear),
             top=self._config.zones.top.estimate(demands.top),
         )
-        thermal_reasons = self._thermal_reasons(thermal)
+        thermal_reasons = self.thermal_reasons(thermal)
         q_front = zones.front.effective_flow
         q_rear = zones.rear.effective_flow
         q_top = zones.top.effective_flow
@@ -520,7 +574,12 @@ class ConfiguredAirBalanceModel:
                 )
         return requested, reasons
 
-    def _thermal_reasons(self, thermal: ThermalInputs) -> tuple[str, ...]:
+    def thermal_reasons(self, thermal: ThermalInputs) -> tuple[str, ...]:
+        """熱の指標のうち、設定の閾値に達したものの名前（``evaluate()`` と同じ規則）。
+
+        風量と無関係に求まる。q が欠けて ``evaluate()`` を使えない tick の記録
+        （決定記録 0073 §2.5 (b)）も、この1箇所の実装から熱の理由を取る。
+        """
         limits = self._config.thermal_limits
         comparisons = (
             ("gpu_intake", thermal.gpu_intake_c, limits.gpu_intake_c),
@@ -531,6 +590,10 @@ class ConfiguredAirBalanceModel:
         return tuple(
             name for name, value, limit in comparisons if value is not None and value >= limit
         )
+
+    def estimate_flow(self, zone: Zone, demand: Demand) -> float:
+        """1 zone の demand を EFU に写す（``evaluate()`` の q と同じ曲線）。"""
+        return self._config.zones.get(zone).estimate(demand).effective_flow
 
     def _unknown_estimate(
         self,

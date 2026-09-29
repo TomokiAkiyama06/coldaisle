@@ -45,7 +45,12 @@ from coldaisle.control.air_balance import (
     CharacterizationSource,
     ThermalInputs,
 )
-from coldaisle.control.config import MAX_MPC_HORIZON_STEPS, FanPolicyConfig, SafetyConfig
+from coldaisle.control.config import (
+    MAX_MPC_HORIZON_STEPS,
+    FanHardwareConfig,
+    FanPolicyConfig,
+    SafetyConfig,
+)
 from coldaisle.control.fallback import (
     FallbackCause,
     LearnedControlStatus,
@@ -119,6 +124,7 @@ from coldaisle.control.schema import (
     Zone,
 )
 from coldaisle.control.state import ControlStateSnapshot, TelemetryHealth
+from test_control_config import valid_documents
 from test_critical_safety import safety_config
 from test_fallback_controller import fallback_proposal, gate_for, policy
 from test_model_confidence import (
@@ -1442,6 +1448,7 @@ class StubAirBalance:
     def __init__(self, ratio: float | None) -> None:
         self._ratio = ratio
         self.calls = 0
+        self.seen: list[PerZone[Demand]] = []
 
     @property
     def metadata(self) -> AirBalanceMetadata:
@@ -1455,8 +1462,9 @@ class StubAirBalance:
 
     def evaluate(self, demands: PerZone[Demand], thermal: ThermalInputs) -> AirBalanceEstimate:
         """比と状態だけを持つ最小の評価結果を返す。"""
-        del demands, thermal
+        del thermal
         self.calls += 1
+        self.seen.append(demands)
         known = self._ratio is not None
         return AirBalanceEstimate(
             q_front=1.0 if known else None,
@@ -1484,6 +1492,54 @@ def _balance_band() -> BalanceBand:
     return BalanceBand(target_ratio=1.0, minimum_ratio=0.8, maximum_ratio=1.2)
 
 
+def _fan_hardware() -> FanHardwareConfig:
+    """`minimum_stable_demand` が 0.3 の試験用 profile（`test_control_config` と同じ）。"""
+    return FanHardwareConfig.model_validate(valid_documents()["fan-hardware.yaml"])
+
+
+def test_the_balance_term_scores_the_demand_the_hardware_would_apply(trained) -> None:
+    """**balance の項は `minimum_stable_demand` へ引き上げた demand で評価する**（0073 §2.3）。
+
+    backend は下限未満を引き上げてから書くので、候補のまま採点すると実際には起きない
+    風量の比を最適化してしまう。写像は balance の項だけに使い、plan は変えない。
+    """
+    settings = mpc_policy()
+    plan, prediction = _plan_prediction(trained, settings)
+    stub = StubAirBalance(1.0)
+    hardware = _fan_hardware()
+    MpcCostModel(
+        settings.mpc.optimizer,
+        air_balance=stub,
+        balance_band=_balance_band(),
+        fan_hardware=hardware,
+    ).evaluate(
+        plan=plan,
+        prediction=prediction,
+        weights=supervisor_output().weights,
+        target_band=supervisor_output().target_band,
+        previous=demands(0.45),
+    )
+
+    assert len(stub.seen) == len(plan.steps)
+    for step, seen in zip(plan.steps, stub.seen, strict=True):
+        assert seen == hardware.stable_demands(step.demands)
+        for zone in Zone:
+            minimum = hardware.zones.get(zone).profile.minimum_stable_demand
+            assert seen.get(zone) >= minimum
+
+
+def test_air_balance_without_the_hardware_profile_is_refused_at_construction(trained) -> None:
+    """Air Balance を渡して profile を渡さない組み合わせは構成時に拒否する（0073 §2.3）。"""
+    del trained
+    settings = mpc_policy()
+    with pytest.raises(MpcCostUnusableError, match=r"fan-hardware\.yaml"):
+        MpcCostModel(
+            settings.mpc.optimizer,
+            air_balance=StubAirBalance(1.0),
+            balance_band=_balance_band(),
+        )
+
+
 def test_an_unknown_air_balance_ratio_is_not_treated_as_a_good_one(trained) -> None:
     """**比を推定できない step を「釣り合っている」と読み替えない。**
 
@@ -1497,6 +1553,7 @@ def test_an_unknown_air_balance_ratio_is_not_treated_as_a_good_one(trained) -> N
         settings.mpc.optimizer,
         air_balance=StubAirBalance(None),
         balance_band=_balance_band(),
+        fan_hardware=_fan_hardware(),
     ).evaluate(
         plan=prediction[0],
         prediction=prediction[1],
@@ -1508,6 +1565,7 @@ def test_an_unknown_air_balance_ratio_is_not_treated_as_a_good_one(trained) -> N
         settings.mpc.optimizer,
         air_balance=StubAirBalance(1.0),
         balance_band=_balance_band(),
+        fan_hardware=_fan_hardware(),
     ).evaluate(
         plan=prediction[0],
         prediction=prediction[1],

@@ -69,6 +69,13 @@ lock を手放す `inspect()` だけでは、A の証拠を持ったまま B が
 - 承認した stage が設定の上限を超える
 - 渡した報告が承認の指した報告と違う、比較条件（`conditions_sha256`）が違う
 - 報告が別の設定（`fan-policy.yaml` / `safety.yaml`）で取られている
+- `air-balance.yaml` / `fan-hardware.yaml` の hash が、承認の証拠・報告の provenance・
+  いま動いている設定の3つで一致しない（#81 / 決定記録 0073 §2.6）。Air Balance の曲線・目標帯と
+  profile の `minimum_stable_demand` は Learned MPC の cost を変えるため
+- 報告の `air_balance_trace_binding` / `fan_hardware_trace_binding` が、消費した tick が1件以上で
+  すべて一致、を満たさない（別の characterization・別の profile で記録された tick や、hash を持たない
+  v10 以前の tick が1件でも混ざった評価は、丸ごと証拠にしない）
+- 報告の版が 3 未満（`MIN_EVIDENCE_REPORT_SCHEMA_VERSION`。v2 以前は Air Balance の設定を言えない）
 - その kind の production pointer が無い、または指す先が production artifact でない
 - 検証している間に Registry の production が動いた（やり直す）
 - `to_stage` が Registry の `authority_compatibility` に含まれない
@@ -86,6 +93,11 @@ lock を手放す `inspect()` だけでは、A の証拠を持ったまま B が
 - 報告に現れた **Learned MPC の arm のどれか**に gate 判定が無い、または1つでも `blocked` である
 
 同じ承認は2回使えない（`expected_revision` に束縛する）。
+
+`AuthorityJournal` は v2 である。v2 で新しく書く昇格の証拠（`RolloutEvidence`）は
+`air_balance_config_sha256` と `fan_hardware_config_sha256` を必ず持つ。既に残った v1 の event は
+書き換えずに読むが、新しい昇格の根拠にはならない。Air Balance が無効（`uncalibrated`）の間に
+集めた証拠もその未校正ファイルに束縛されるので、`calibrated` へ差し替えた後は使えない。
 
 ## 下げる（承認は要らない）
 

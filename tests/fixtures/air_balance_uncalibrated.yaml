@@ -1,4 +1,4 @@
-schema_version: 1
+schema_version: 2
 model_id: provisional-air-balance
 source:
   status: uncalibrated
@@ -39,3 +39,12 @@ thermal_limits:
   case_delta_c: 12.0
   cpu_package_c: 80.0
   gpu_temperature_c: 78.0
+
+# Which snapshot metric feeds each thermal indicator (decision record 0073 section 2.4).
+# null means the indicator is not used. The concrete bindings are decided after the
+# #75 / #81 measurements (0073 section 5); this template binds none of them.
+thermal_inputs:
+  gpu_intake_c: null
+  case_delta_c: null
+  cpu_package_c: null
+  gpu_temperature_c: null

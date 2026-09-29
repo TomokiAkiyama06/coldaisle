@@ -33,7 +33,8 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from coldaisle import logs
 from coldaisle.clock import Clock, MonotonicClock
-from coldaisle.control.config import ControlConfig, FanPolicyConfig
+from coldaisle.control.air_balance_trace import AirBalanceRecorder
+from coldaisle.control.config import CONTROL_CONFIG_VERSION, ControlConfig, FanPolicyConfig
 from coldaisle.control.fallback.controller import FallbackController
 from coldaisle.control.fallback.gate import (
     ControllerGate,
@@ -61,7 +62,9 @@ from coldaisle.control.safety.critical import (
 )
 from coldaisle.control.schema import (
     BASELINE_STAGE,
+    CONTROL_TICK_RUNTIME_SCHEMA_VERSION,
     SCHEMA_VERSION,
+    AirBalanceRecord,
     AuthorityStage,
     ConfidenceLevel,
     ControlConfigDigest,
@@ -368,6 +371,13 @@ def build_input_contract(
     for metric in sorted(_policy_input_metrics(config.policy, catalog)):
         if metric not in specs:
             add(metric, TelemetryImportance.ADVISORY, _advisory_stale_ms(metric, config))
+    # **`air-balance.yaml` の熱の入力も契約へ加える**（決定記録 0073 §2.4）。契約に無い metric は
+    # 取り込まれず毎 tick None になり、熱の制約が黙って効かない。`source.status` にかかわらず
+    # 加える（無効の間も、校正後に初めて拒否が見つかる事態を作らない）。すでに契約にある
+    # metric は、その重要度・許容遅延のまま使う。
+    for metric in sorted(air_balance_input_metrics(config, catalog)):
+        if metric not in specs:
+            add(metric, TelemetryImportance.ADVISORY, _advisory_stale_ms(metric, config))
 
     return ControlInputContract(
         signals=tuple(specs[metric] for metric in sorted(specs)),
@@ -375,19 +385,29 @@ def build_input_contract(
     )
 
 
-def _policy_input_metrics(policy: FanPolicyConfig, catalog: MetricCatalog) -> frozenset[str]:
-    """`fan-policy.yaml` が指している metric（派生値はその材料へ展開する）。"""
-    metrics: set[str] = set()
-    for zone in Zone:
-        metrics.update(policy.fallback_temperature_inputs.get(zone).metrics)
-        if policy.fallback_power_feedforward is not None:
-            metrics.add(policy.fallback_power_feedforward.get(zone).metric)
-    metrics.add(policy.workload_regime.cpu_power.metric)
-    metrics.add(policy.workload_regime.gpu_power.metric)
-    metrics.add(policy.mpc.optimizer.cost_metrics.cpu_temperature)
-    metrics.add(policy.mpc.optimizer.cost_metrics.gpu_temperature)
-    metrics.update(guard_input_metrics(policy.reactive_guard))
+def air_balance_input_metrics(config: ControlConfig, catalog: MetricCatalog) -> frozenset[str]:
+    """`air-balance.yaml` の ``thermal_inputs`` が指す、契約へ加える metric（決定記録 0073 §2.4）。
 
+    各 metric が Metric Catalog にあり単位が ``C`` であること、派生値は材料へ展開できること、
+    材料の許容遅延を決められることを確かめる。**決められない metric は拒否する**
+    （起動時の Control Config の不正として扱う。0073 §2.2）。
+    """
+    bindings = config.air_balance.thermal_inputs.metrics()
+    for metric in bindings:
+        unit = catalog.unit_for(metric)
+        if unit != "C":
+            raise ValueError(
+                f"air-balance.yaml の thermal_inputs は既知の温度(C)にする: "
+                f"metric={metric}, unit={unit}"
+            )
+    resolved = _resolve_derived(frozenset(bindings), catalog)
+    for metric in resolved:
+        _advisory_stale_ms(metric, config)
+    return resolved
+
+
+def _resolve_derived(metrics: frozenset[str], catalog: MetricCatalog) -> frozenset[str]:
+    """派生値を材料の metric へ展開する。Catalog に無い名前は拒否する。"""
     resolved: set[str] = set()
     for metric in metrics:
         if not metric.startswith(DERIVED_PREFIX):
@@ -402,6 +422,21 @@ def _policy_input_metrics(policy: FanPolicyConfig, catalog: MetricCatalog) -> fr
     if unknown:
         raise ValueError(f"Metric Catalog に無い制御入力がある: {unknown}")
     return frozenset(resolved)
+
+
+def _policy_input_metrics(policy: FanPolicyConfig, catalog: MetricCatalog) -> frozenset[str]:
+    """`fan-policy.yaml` が指している metric（派生値はその材料へ展開する）。"""
+    metrics: set[str] = set()
+    for zone in Zone:
+        metrics.update(policy.fallback_temperature_inputs.get(zone).metrics)
+        if policy.fallback_power_feedforward is not None:
+            metrics.add(policy.fallback_power_feedforward.get(zone).metric)
+    metrics.add(policy.workload_regime.cpu_power.metric)
+    metrics.add(policy.workload_regime.gpu_power.metric)
+    metrics.add(policy.mpc.optimizer.cost_metrics.cpu_temperature)
+    metrics.add(policy.mpc.optimizer.cost_metrics.gpu_temperature)
+    metrics.update(guard_input_metrics(policy.reactive_guard))
+    return _resolve_derived(frozenset(metrics), catalog)
 
 
 def _advisory_stale_ms(metric: str, config: ControlConfig) -> int:
@@ -549,11 +584,23 @@ class ControlLoop:
         horizon_ms = max(config.policy.supervisor.valid_ms, config.policy.mpc.valid_ms)
         window = horizon_ms // config.safety.tick_ms.value + 2
         self._snapshots: deque[_SnapshotIdentity] = deque(maxlen=window)
+        # **4ファイルの版と SHA-256 を `ControlConfig.sources` から写す**（runtime v2。
+        # 決定記録 0073 §2.5 (c)）。手で書かない（起動ログの `trace_metadata()` と同じ出どころ）。
+        sources = config.sources
         self._config_digest = ControlConfigDigest(
-            fan_hardware_sha256=config.sources.fan_hardware.sha256,
-            safety_sha256=config.sources.safety.sha256,
-            policy_sha256=config.sources.policy.sha256,
+            fan_hardware_sha256=sources.fan_hardware.sha256,
+            safety_sha256=sources.safety.sha256,
+            policy_sha256=sources.policy.sha256,
+            air_balance_sha256=sources.air_balance.sha256,
+            control_config_version=CONTROL_CONFIG_VERSION,
+            fan_hardware_schema_version=sources.fan_hardware.schema_version,
+            safety_schema_version=sources.safety.schema_version,
+            policy_schema_version=sources.policy.schema_version,
+            air_balance_schema_version=sources.air_balance.schema_version,
         )
+        # **未校正なら推定モデルを作らない**（決定記録 0073 §2.2）。記録するだけで、requested・
+        # Guard・Safety へは値を返さない。
+        self._air_balance = AirBalanceRecorder.from_control_config(config)
 
     @property
     def tick_period_ms(self) -> int:
@@ -660,12 +707,15 @@ class ControlLoop:
             supervisor_decision=supervisor_decision,
             regime_estimate=regime_estimate,
         )
+        flows, air_balance = self._air_balance_record(
+            snapshot, hardware=hardware, faults=safety_decision.faults
+        )
         tick = ControlTick(
             schema_version=SCHEMA_VERSION,
             tick_id=tick_id,
             ts_ms=ts_ms,
             state=state,
-            zones=self._zone_records(requested, effective, hardware),
+            zones=self._zone_records(requested, effective, hardware, flows),
             supervisor=supervisor_decision,
             model_gate=None if selection is None else selection.model_gate,
             shadow=self._shadow_record(
@@ -680,6 +730,7 @@ class ControlLoop:
             ),
             faults=safety_decision.faults,
             runtime=ControlTickRuntime(
+                schema_version=CONTROL_TICK_RUNTIME_SCHEMA_VERSION,
                 tick_period_ms=self.tick_period_ms,
                 deadline_ms=self.tick_deadline_ms,
                 duration_ms=duration_ms,
@@ -695,6 +746,9 @@ class ControlLoop:
             ),
             # **tick が使っていた registry の版を毎 tick 残す**（v10。#104 / 決定記録 0071 §2.5）。
             registry=self._registry,
+            # **Air Balance の推定を毎 tick 残す**（v11。#81 / 決定記録 0073 §2.5 (b)）。
+            # 未校正で無効な起動も `disabled` の形で残す。
+            air_balance=air_balance,
         )
         recorded, trace_failed = self._record(tick)
         self._log_guard_events(guard_decision)
@@ -1223,11 +1277,46 @@ class ControlLoop:
         # Gate と同じ式で数える。**設定の上限を超えない**（#79 / 決定記録 0057 §2.2）。
         return lowest_stage(self._authority.current_stage(), self._config.policy.authority_stage)
 
+    def _air_balance_record(
+        self,
+        snapshot: ControlStateSnapshot,
+        *,
+        hardware: PerZone[FanHardwareResult] | None,
+        faults: tuple[Fault, ...],
+    ) -> tuple[PerZone[float | None], AirBalanceRecord]:
+        """applied demand から zone の風量と Air Balance の記録を作る（決定記録 0073 §2.5）。
+
+        **回っていない・確かめられていない Fan に風量を書かない。** 次の zone は None にする。
+
+        - この tick の書き込み結果が無い、または ``write_ok`` / ``readback_ok`` が偽
+          （backend が ``applied_demand`` を返さない）
+        - **この tick の** backend の fault がある（stall 窓が満ちる前の ``TACH_STALL`` を含む。
+          simulated の stall は write / readback が成功のまま返るため、結果を直接見る）
+        - その zone の stall が Critical Safety の有効な fault に含まれる
+        """
+        stalled = frozenset(
+            fault.zone
+            for fault in faults
+            if fault.code is FaultCode.TACH_STALL and fault.zone is not None
+        )
+
+        def applied(zone: Zone) -> float | None:
+            result = None if hardware is None else hardware.get(zone)
+            if result is None or result.fault is not None or zone in stalled:
+                return None
+            return result.applied_demand
+
+        demands = PerZone[float | None](
+            front=applied(Zone.FRONT), rear=applied(Zone.REAR), top=applied(Zone.TOP)
+        )
+        return self._air_balance.record(demands, self._air_balance.thermal_inputs(snapshot))
+
     @staticmethod
     def _zone_records(
         requested: PerZone[ZoneRequest],
         effective: PerZone[EffectiveZoneDemand],
         hardware: PerZone[FanHardwareResult] | None,
+        flows: PerZone[float | None],
     ) -> PerZone[ZoneRecord]:
         def record(zone: Zone) -> ZoneRecord:
             result = None if hardware is None else hardware.get(zone)
@@ -1235,6 +1324,8 @@ class ControlLoop:
                 controller_reason=requested.get(zone).reason,
                 demand=effective.get(zone),
                 airflow_index=None if result is None else result.airflow_index,
+                estimated_flow=flows.get(zone),
+                applied_demand=None if result is None else result.applied_demand,
                 hardware=None if result is None else result.readback,
             )
 

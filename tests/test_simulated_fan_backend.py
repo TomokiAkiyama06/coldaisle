@@ -11,6 +11,7 @@ import pytest
 import yaml
 from pydantic import ValidationError
 
+from coldaisle.control.air_balance import AirBalanceConfig
 from coldaisle.control.config import (
     ConfigSource,
     ConfigSources,
@@ -34,6 +35,7 @@ from coldaisle.control.schema import (
     Fault,
     FaultCode,
     GuardZoneOutput,
+    HardwareReadback,
     OperatingMode,
     PerZone,
     Reason,
@@ -52,7 +54,7 @@ from coldaisle.control.state import (
     TelemetryImportance,
 )
 from coldaisle.store.models import Quality
-from test_control_config import valid_documents
+from test_control_config import air_balance_document, valid_documents
 
 
 def hardware_config(*, confirmed: bool = True) -> FanHardwareConfig:
@@ -161,11 +163,13 @@ def control_config(
         policy=ConfigSource(
             name="fan-policy.yaml", schema_version=policy.schema_version, sha256="3" * 64
         ),
+        air_balance=ConfigSource(name="air-balance.yaml", schema_version=2, sha256="4" * 64),
     )
     return ControlConfig(
         fan_hardware=fan_hardware or hardware_config(),
         safety=safety or safety_config(),
         policy=policy,
+        air_balance=AirBalanceConfig.model_validate(air_balance_document()),
         sources=sources,
     )
 
@@ -340,6 +344,44 @@ def test_startup_max_then_normal_write_never_uses_unsafe_low_pwm() -> None:
     # STARTUP の Max の後は起動済み。profile の 0.3（minimum stable）未満は生成しない。
     assert result.front.readback.pwm_raw == 76
     assert result.front.target_rpm == 600
+
+
+def test_applied_demand_is_the_lifted_demand_the_backend_wrote() -> None:
+    """``applied_demand`` は effective に profile の引き上げを掛けた PWM 直前の値（0073 §2.5）。"""
+    backend, (command,) = runtime(0.0, 0.7, 0.2)
+
+    results = backend.apply(command)
+
+    assert command.front.effective == 0.0
+    assert results.front.applied_demand == 0.3  # minimum_stable_demand
+    assert results.rear.applied_demand == 0.7
+    assert results.top.applied_demand == 0.3
+    # backend と MPC が共有する1つの写像と一致する（2つの実装を持たない）。
+    profile = backend.config.zones.front.profile
+    assert results.front.applied_demand == profile.stable_demand(command.front.effective)
+
+
+def test_applied_demand_is_absent_when_the_write_was_not_confirmed() -> None:
+    """書けていない・確かめられていない指令を「適用した demand」として返さない。"""
+    backend, (command,) = runtime(0.7)
+    backend.fault_plan = SimulatedFaultPlan(
+        write_failure=frozenset({Zone.FRONT}),
+        readback_mismatch=frozenset({Zone.REAR}),
+        tach_stall=frozenset({Zone.TOP}),
+    )
+
+    results = backend.apply(command)
+
+    assert results.front.applied_demand is None
+    assert results.rear.applied_demand is None
+    # stall は write / readback が成功のまま返る。風量から外すのは loop の責務。
+    assert results.top.applied_demand == 0.7
+
+
+def test_a_result_cannot_claim_an_unconfirmed_applied_demand() -> None:
+    readback = HardwareReadback(pwm_raw=10, rpm=None, write_ok=False, readback_ok=False)
+    with pytest.raises(ValueError, match="applied_demand"):
+        FanHardwareResult(target_rpm=0, airflow_index=0.0, readback=readback, applied_demand=0.5)
 
 
 def test_delayed_startup_command_cannot_be_followed_by_a_precomposed_normal() -> None:

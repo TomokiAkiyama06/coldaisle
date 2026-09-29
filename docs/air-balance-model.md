@@ -65,6 +65,57 @@ still raises Front make-up air rather than leaving Front at zero.
 The model is pure and uses no hardware I/O, which lets Mock and Replay exercise all state changes
 without a sensor module.
 
-The model is not wired into `ControlConfig` or the runtime daemon yet. Decision record 0033 (FINAL)
-makes `air-balance.yaml` the fourth Control Config, validated and adopted atomically with the other
-three files; that four-file loader is implemented together with #103.
+## Control Config and the runtime (#81 / decision record 0073)
+
+`air-balance.yaml` (schema version 2) is the fourth Control Config (decision record 0033 / 0073).
+`ControlConfig.from_directory()` validates all four files and returns only when every file is
+valid (bundled `CONTROL_CONFIG_VERSION` 11). Version 1 files are rejected and never filled in.
+
+| `air-balance.yaml` | `coldaisle-fand` |
+|---|---|
+| missing | invalid Control Config: all zones Max (`config_invalid`) until restarted with a valid file |
+| malformed (schema, v1, non-monotonic curve, unverifiable `thermal_inputs`) | same as missing |
+| `source.status: uncalibrated` | validated; Air Balance is **disabled**. No `ConfiguredAirBalanceModel` is built and the trace records `disabled: uncalibrated` |
+| `source.status: calibrated` | validated; Air Balance is enabled and every tick records the estimate |
+
+Disabling Air Balance leaves Critical Safety, the CPU cooling floor and Reactive Guard unchanged.
+The enable/disable decision comes from `source.status` only; there is no separate flag.
+
+v2 adds `thermal_inputs`, which binds each thermal indicator to a snapshot metric (or `null` to
+leave it unused). Each metric must exist in the Metric Catalog with unit `C`; derived values
+(`d.*`) are expanded to their operands. Bound metrics join the control input contract as
+`ADVISORY` inputs (existing inputs keep their importance), whether Air Balance is enabled or not.
+Missing or stale values reach the model as `None`, never 0. The concrete bindings are decided
+after the #75 / #81 measurements (0073 §5); the committed template binds none.
+
+### Decision trace (`ControlTick` v11)
+
+- `ZoneRecord.applied_demand` is the demand the Hardware Backend mapped to PWM, after the profile's
+  `minimum_stable_demand` lift and start-up kick. It is `None` when there was no write result or
+  when `write_ok` / `readback_ok` is false. `FanHardwareResult.applied_demand` follows the same rule.
+- `ZoneRecord.estimated_flow` is that applied demand mapped through the zone's EFU curve. It is
+  `None` while Air Balance is disabled, for zones without a confirmed write, for zones with a
+  backend fault on that tick (including a `TACH_STALL` before the stall window elapses), and for
+  zones whose stall is an active Critical Safety fault.
+- `air_balance` holds `status` (`enabled` / `disabled`), the model id, source status and file hash,
+  `q_front` / `q_rear` / `q_top`, intake / exhaust / ratio, `state` and the thermal reasons. The
+  zone flows must match the `q_*` values zone by zone. Thermal reasons are recorded even when a
+  `q_*` is missing (`state: unknown`).
+- `runtime` is schema version 2 and carries the bundled config version plus the schema version and
+  SHA-256 of all four files.
+
+Decision record 0073 names these "v10"; `ControlTick` v10 was already taken by #104, so the
+implementation uses v11 (0073 §5 allows the next free number).
+
+### Learned MPC
+
+When the Learned MPC worker is wired (#86 / #104), `LearnedMpcController` receives the
+`AirBalanceModel` and `BalanceBand` from `ControlConfig.air_balance` (or `None` while disabled)
+together with `ControlConfig.fan_hardware`. The balance cost term evaluates candidate demands after
+`FanHardwareConfig.stable_demands()` — the same pure function the simulated backend uses — so it
+scores the ratio the hardware would actually produce. Passing Air Balance without the hardware
+profile is rejected at construction (`MpcCostUnusableError`). The mapping never changes the plan's
+requested demand.
+
+Applying `coordinate()` to the Fallback controller's requested demand is **not** done: decision
+record 0073 leaves it open because it changes Baseline behaviour (0073 §5).

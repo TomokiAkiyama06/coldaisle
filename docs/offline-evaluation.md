@@ -127,7 +127,13 @@ DB を作ります。証拠として読む DB をそれで開くと、**古い r
 ## レポートの読み方
 
 - `provenance` — 設定の hash、run ごとの trace / 観測の digest、現れた model / controller の版、
-  `conditions_sha256`（**これが同じなら同じ条件で比べている**）
+  `conditions_sha256`（**これが同じなら同じ条件で比べている**）。報告 v3（#81 / 決定記録 0073 §2.6）で
+  `air_balance_config_sha256` と、消費した tick の `runtime.config` の hash を評価時の
+  `air-balance.yaml` / `fan-hardware.yaml` と突き合わせた件数（`air_balance_trace_binding` /
+  `fan_hardware_trace_binding` の `matched` / `mismatched` / `missing`）を持つ。一致しない tick を
+  除外せずに数え、1件でも不一致・欠落があれば報告は出るが昇格の証拠にはならない
+- 適用 arm の `gaps` の `air_balance_disabled` は、Air Balance を無効（未校正）で回していた tick が
+  あったこと。`no_estimated_flow`（有効だったが推定できなかった）とは別に数える
 - `segments[]` — run × 区間。`role` は `calibration` / `holdout`。`purged_outcomes` は
   境界を跨ぐため採点に使えなかった予測の数、`unattributed_observations` はどの tick からも
   許容幅の外にあって、どの arm にも帰属させなかった観測の数（**黙って落とさずに数える**）

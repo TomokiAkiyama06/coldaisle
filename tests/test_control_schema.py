@@ -21,6 +21,7 @@ from pydantic import ValidationError
 from coldaisle.control import (
     BOUND_BY_PRECEDENCE,
     SCHEMA_VERSION,
+    AirBalanceRecord,
     AuthorityLimitSource,
     AuthorityStage,
     BoundBy,
@@ -525,7 +526,8 @@ def test_a_ceiling_never_raises_the_request():
         )
 
 
-CONTROL_TICK_RUNTIME = ControlTickRuntime(
+LEGACY_CONTROL_TICK_RUNTIME = ControlTickRuntime(
+    schema_version=1,
     tick_period_ms=1_000,
     deadline_ms=500,
     duration_ms=10,
@@ -535,11 +537,47 @@ CONTROL_TICK_RUNTIME = ControlTickRuntime(
         fan_hardware_sha256="0" * 64, safety_sha256="1" * 64, policy_sha256="2" * 64
     ),
 )
-"""v8 の `ControlTick` に必須の実行記録（#74 / 決定記録 0060 §2.4）。
+"""v8〜v10 の `ControlTick` に必須の実行記録（runtime v1。#74 / 決定記録 0060 §2.4）。
 
 **版が中身を表すことを型で縛った**ので、v8 を名乗る記録はこの欄を省けない。
 値そのものはこの試験の判断に影響しない。
 """
+
+AIR_BALANCE_SHA256 = "3" * 64
+"""試験の `air-balance.yaml` の SHA-256（runtime v2 と `air_balance` で揃える）。"""
+
+CONTROL_TICK_RUNTIME = ControlTickRuntime(
+    tick_period_ms=1_000,
+    deadline_ms=500,
+    duration_ms=10,
+    deadline_exceeded=False,
+    snapshot_schema_version=1,
+    config=ControlConfigDigest(
+        fan_hardware_sha256="0" * 64,
+        safety_sha256="1" * 64,
+        policy_sha256="2" * 64,
+        air_balance_sha256=AIR_BALANCE_SHA256,
+        control_config_version=11,
+        fan_hardware_schema_version=1,
+        safety_schema_version=3,
+        policy_schema_version=9,
+        air_balance_schema_version=2,
+    ),
+)
+"""v11 の `ControlTick` に必須の実行記録（runtime v2。#81 / 決定記録 0073 §2.5 (c)）。"""
+
+AIR_BALANCE_RECORD = AirBalanceRecord.disabled(
+    model_id="provisional-air-balance", config_sha256=AIR_BALANCE_SHA256
+)
+"""v11 の `ControlTick` に必須の Air Balance の記録（未校正で無効。決定記録 0073 §2.5 (b)）。"""
+
+
+def runtime_for(schema_version: int) -> ControlTickRuntime | None:
+    """その版の `ControlTick` が持つべき runtime（v8 未満は無し、v11 からは v2）。"""
+    if schema_version < 8:
+        return None
+    return CONTROL_TICK_RUNTIME if schema_version >= 11 else LEGACY_CONTROL_TICK_RUNTIME
+
 
 SAFETY_PROVENANCE = SafetyProvenance(disabled_inputs=(), config_is_provisional=False)
 """v9 の `ControlTick` に必須の Critical Safety の裁定の前提（#78）。
@@ -600,6 +638,7 @@ def tick(demand: EffectiveZoneDemand, faults=(), **state_overrides) -> ControlTi
         runtime=CONTROL_TICK_RUNTIME,
         safety_provenance=SAFETY_PROVENANCE,
         registry=REGISTRY_PROVENANCE,
+        air_balance=AIR_BALANCE_RECORD,
     )
 
 
@@ -710,6 +749,7 @@ def test_a_front_or_rear_stall_can_stay_degraded():
         runtime=CONTROL_TICK_RUNTIME,
         safety_provenance=SAFETY_PROVENANCE,
         registry=REGISTRY_PROVENANCE,
+        air_balance=AIR_BALANCE_RECORD,
     )
     assert recorded.state.safety_state is SafetyState.DEGRADED
 
@@ -739,6 +779,7 @@ def test_stale_cpu_temperature_drives_top_to_max():
         runtime=CONTROL_TICK_RUNTIME,
         safety_provenance=SAFETY_PROVENANCE,
         registry=REGISTRY_PROVENANCE,
+        air_balance=AIR_BALANCE_RECORD,
     )
     assert recorded.zones.top.demand.forced_max
 
@@ -755,7 +796,7 @@ def test_the_stored_v1_record_still_loads_unchanged():
     stored = FIXTURE.read_text(encoding="utf-8")
     tick = ControlTick.model_validate_json(stored)
     assert tick.schema_version == 1
-    assert SCHEMA_VERSION == 10
+    assert SCHEMA_VERSION == 11
     assert json.loads(tick.model_dump_json()) == json.loads(stored)
 
 
@@ -824,6 +865,7 @@ def test_current_trace_stores_workload_regime_and_confidence_together():
         runtime=CONTROL_TICK_RUNTIME,
         safety_provenance=SAFETY_PROVENANCE,
         registry=REGISTRY_PROVENANCE,
+        air_balance=AIR_BALANCE_RECORD,
     )
 
     payload = json.loads(recorded.model_dump_json())
@@ -856,6 +898,7 @@ def test_v2_trace_keeps_simultaneous_transient_load_distinct():
         runtime=CONTROL_TICK_RUNTIME,
         safety_provenance=SAFETY_PROVENANCE,
         registry=REGISTRY_PROVENANCE,
+        air_balance=AIR_BALANCE_RECORD,
     )
 
     payload = json.loads(recorded.model_dump_json())
@@ -873,6 +916,7 @@ def test_fallback_trace_remains_valid_when_regime_is_not_available():
         runtime=CONTROL_TICK_RUNTIME,
         safety_provenance=SAFETY_PROVENANCE,
         registry=REGISTRY_PROVENANCE,
+        air_balance=AIR_BALANCE_RECORD,
     )
 
     assert recorded.schema_version == SCHEMA_VERSION
@@ -918,6 +962,7 @@ def test_v3_supervisor_policy_requires_a_matching_decision():
             runtime=CONTROL_TICK_RUNTIME,
             safety_provenance=SAFETY_PROVENANCE,
             registry=REGISTRY_PROVENANCE,
+            air_balance=AIR_BALANCE_RECORD,
         )
 
 
@@ -950,7 +995,7 @@ def test_a_v8_tick_cannot_claim_the_version_without_its_payload():
             ts_ms=NOW_MS,
             state=fallback_state(),
             zones=zones(passthrough()),
-            runtime=CONTROL_TICK_RUNTIME,
+            runtime=LEGACY_CONTROL_TICK_RUNTIME,
         )
 
 
@@ -991,7 +1036,7 @@ def test_a_stored_v8_trace_loads_without_the_safety_provenance():
         ts_ms=NOW_MS,
         state=fallback_state(),
         zones=zones(passthrough()),
-        runtime=CONTROL_TICK_RUNTIME,
+        runtime=LEGACY_CONTROL_TICK_RUNTIME,
     )
     restored = ControlTick.model_validate_json(stored.model_dump_json())
     assert restored.schema_version == 8
@@ -1008,7 +1053,7 @@ def test_a_legacy_trace_cannot_carry_the_safety_provenance_added_in_v9(schema_ve
             ts_ms=NOW_MS,
             state=fallback_state(),
             zones=zones(passthrough()),
-            runtime=CONTROL_TICK_RUNTIME if schema_version >= 8 else None,
+            runtime=runtime_for(schema_version),
             safety_provenance=SAFETY_PROVENANCE,
         )
 
@@ -1027,6 +1072,7 @@ def test_the_v9_trace_keeps_disabled_inputs_and_the_provisional_flag():
         runtime=CONTROL_TICK_RUNTIME,
         safety_provenance=provenance,
         registry=REGISTRY_PROVENANCE,
+        air_balance=AIR_BALANCE_RECORD,
     )
     payload = json.loads(recorded.model_dump_json())
     assert payload["schema_version"] == SCHEMA_VERSION
@@ -1097,6 +1143,7 @@ def registry_tick(registry: RegistryProvenance, **overrides: object) -> ControlT
         "runtime": CONTROL_TICK_RUNTIME,
         "safety_provenance": SAFETY_PROVENANCE,
         "registry": registry,
+        "air_balance": AIR_BALANCE_RECORD,
     }
     return ControlTick(**(values | overrides))
 
@@ -1106,7 +1153,7 @@ def test_a_v10_tick_round_trips_the_registry_pointer_it_used():
     recorded = registry_tick(bound_registry())
 
     payload = json.loads(recorded.model_dump_json())
-    assert payload["schema_version"] == SCHEMA_VERSION == 10
+    assert payload["schema_version"] == SCHEMA_VERSION == 11
     assert payload["registry"]["revision"] == 3
     thermal = payload["registry"]["production"]["thermal_model"]
     assert thermal["artifact_sha256"] == REGISTRY_SHA
@@ -1217,7 +1264,7 @@ def test_a_stored_trace_before_v10_loads_without_the_registry(schema_version: in
         ts_ms=NOW_MS,
         state=fallback_state(),
         zones=zones(passthrough()),
-        runtime=CONTROL_TICK_RUNTIME if schema_version >= 8 else None,
+        runtime=runtime_for(schema_version),
         safety_provenance=SAFETY_PROVENANCE if schema_version >= 9 else None,
     )
     restored = ControlTick.model_validate_json(stored.model_dump_json())
@@ -1236,7 +1283,7 @@ def test_a_legacy_trace_cannot_carry_the_registry_added_in_v10(schema_version: i
             ts_ms=NOW_MS,
             state=fallback_state(),
             zones=zones(passthrough()),
-            runtime=CONTROL_TICK_RUNTIME if schema_version >= 8 else None,
+            runtime=runtime_for(schema_version),
             safety_provenance=SAFETY_PROVENANCE if schema_version >= 9 else None,
             registry=bound_registry(),
         )
@@ -1452,7 +1499,14 @@ def learned_tick(**overrides) -> ControlTick:
         "safety_provenance": SAFETY_PROVENANCE,
         # v10 を名乗る記録は registry の版を省けない（#104）。
         "registry": REGISTRY_PROVENANCE,
+        # v11 を名乗る記録は Air Balance の記録を省けない（#81）。
+        "air_balance": AIR_BALANCE_RECORD,
     }
+    version = overrides.get("schema_version", SCHEMA_VERSION)
+    assert isinstance(version, int)
+    values["runtime"] = runtime_for(version)
+    if version < 11:
+        values.pop("air_balance")
     if overrides.get("schema_version", SCHEMA_VERSION) < 10:
         values.pop("registry")
     if overrides.get("schema_version", SCHEMA_VERSION) < 9:
@@ -1648,6 +1702,7 @@ def test_a_tick_cannot_claim_two_different_artifacts():
             runtime=CONTROL_TICK_RUNTIME,
             safety_provenance=SAFETY_PROVENANCE,
             registry=REGISTRY_PROVENANCE,
+            air_balance=AIR_BALANCE_RECORD,
             state=fallback_state(
                 authority_stage=AuthorityStage.LIMITED,
                 fallback_reason=Reason(code="low_confidence"),
