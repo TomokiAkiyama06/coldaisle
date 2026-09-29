@@ -1,0 +1,382 @@
+# 決定記録 0071: decision trace の読み取り API（エンドポイント・ページング・版の扱い・registry の記録・LLM との境界）
+
+- **種別**: Decision Record
+- **Status**: FINAL（2026-09-29、リポジトリ所有者が承認）
+- **Date**: 2026-09-29
+- **Supersedes**: なし。次の未決事項に答える記録であり、各記録の本文は書き換えない
+  - [0046](0046-airflow-ui.md) §5 #2（判断記録を読む API の形）
+  - [0062](0062-model-registry-operations.md) §5 の1項目め（registry の lifecycle event を decision trace へ載せるか）
+- **関連**: [0009](0009-read-api.md)（GET-only・環境変数の設定・`truncated`）/
+  [0015](0015-llm-tools.md) / [0018](0018-tool-exposure.md) /
+  [0028](0028-fan-control-contracts.md) §2.2 / §2.3 /
+  [0030](0030-control-decision-trace-storage.md)（**前提。§2.1 を参照**）/
+  [0045](0045-local-socket-write-entry.md) / [0046](0046-airflow-ui.md) §2.2 / §2.3 / §5 /
+  [0059](0059-decision-trace-model-artifact.md) / [0060](0060-control-loop-runtime.md) §2.4 / §2.7 /
+  [0062](0062-model-registry-operations.md) §2.5 / §5 /
+  [0064](0064-workload-hint-entry-and-supervisor-prior.md) §2.9 / §2.10 /
+  [0066](0066-workload-hint-stage-b-conditions.md)（§2.9 の `age_ms` の置き換え）/
+  `docs/api-contract.md` / `docs/requirements.md` FR-307 / FR-504 /
+  AGENTS.md ルール 1 / 2 / 6 / 8 / 9 / 10
+- **対象 Issue**: #106（関連: #104 / #107 / #82 / #66）
+
+---
+
+## 1. Context
+
+decision trace（`ControlTick`）は、制御デーモンが tick ごとに SQLite の `control_traces` へ
+追記している（`coldaisle.control.logging.ControlTraceLogger`、migration `0002_control_traces`）。
+形は 0030 §2 のとおりで、主キー `(ts_ms, tick_id)`、`schema_version` と完全な JSON を保存する。
+ところが**読む経路が HTTP に無い。** 読んでいるのは Offline Evaluation（`coldaisle.evaluate`）だけで、
+これはストアを直接開く。この欠落が、3つの Issue を止めている。
+
+| Issue | 止まっている点 |
+|---|---|
+| #106 | エアフロー画面は制御由来の項目をすべて「未接続」と出している（0046 §2.3）。模擬データの `page.control` を実データで埋める API の形が未決（0046 §5 #2） |
+| #104 | 受入基準「promotion / rollback が decision trace へ残る」。0062 §2.5 は、tick に対応しない registry event を 0030 の trace へ載せるかを #82 側の決定に委ねた（0062 §5） |
+| #107 | 0064 §2.9 は trace に載せるヒントの塊の中身を決めたが、Stage B の前提1「#82 の decision trace が保存されていること（0030）」の 0030 が `Proposed` のまま。載せた塊を**どこから読むか**も決まっていない |
+
+加えて、trace の読み取りには、既存の読み取り API（0009）には無い論点が3つある。
+
+1. **版が混ざる。** 保存済みの trace は v1〜v9 が混在しうる（`SCHEMA_VERSION = 9`）。
+   0030 §2 は「既存 trace を新しい意味として解釈しない」と決めている。読む側がどこで版を見分けるかを決める必要がある
+2. **量が多い。** tick は秒以下の周期（`safety.yaml` の `tick_ms`）で、保持は `control_trace_days`（30日）。
+   `events` のように「上限を超えたら古い側を落とす」（0009 §2.4）と、証拠を黙って欠くことになる
+3. **LLM との境界。** trace は制御 ML の時系列そのものであり、FR-504 は生の時系列をプロンプトへ入れることを禁じる。
+   読み取り API は `coldaisle.server` で AI ツールの窓口と同じアプリに載る
+
+仕様に書かれていない判断なので、実装より先にここへ記録して承認を求める（AGENTS.md「決定記録」）。
+
+---
+
+## 2. Decision
+
+### 2.1 前提: 0030 の承認。承認してほしいのは §2 と §5 の1項目めだけ
+
+本記録は 0030 の保存の形の上に API を置く。**0030 が `FINAL` になるまで本記録も `FINAL` にしない。**
+所有者に承認してほしいのは次の範囲で、どれも main で実装済みである（承認は実装の追認になる）。
+
+| 0030 の箇所 | 内容 | main の実装 |
+|---|---|---|
+| §2 | 同じ SQLite に追記専用の `control_traces`。主キー `(ts_ms, tick_id)` で上書きしない | `0002_control_traces.sql`、`SqliteStore.record_control_trace`（`INSERT OR IGNORE`） |
+| §2 | `schema_version` と完全な `ControlTick` JSON。JSON object を SQLite とアプリの両方で検証 | `CHECK (json_type(trace_json) = 'object')`、`ControlTraceRecord` |
+| §2 | 読み出しは半開区間 `[from, to)` | `SqliteStore.control_traces` |
+| §2 | 意味を変えたら schema version を上げ、既存 trace を新しい意味で読まない | `ControlTick` の版ごとの validator（v1〜v9） |
+| §2 | 書くのは Control Logging だけ。AI・API・Collector・Backend は書き換えない | 書き手は `control_daemon` の `ControlTraceLogger` だけ |
+| §5 の1項目め | `config/retention.yaml` の `control_trace_days` を `coldaisle-rollup` が適用。コードに既定値を持たない | `config/retention.yaml`、`store/rollup.py` |
+
+0030 §5 の残り（SQLite 外への export は #90 / #91、actuator 固有フィールドは後続の記録）は
+**開いたままでよい。** 本記録はそれに依存しない。
+0030 の Status の遷移は内容の変更ではないので、README「追記のみ」の例外で足りる。
+
+### 2.2 エンドポイントは2つ。どちらも GET
+
+| メソッド | パス | 用途 |
+|---|---|---|
+| GET | `/api/v1/control/latest` | 最新の1 tick。エアフロー画面の「現在の状態」（0046 の `page.control`） |
+| GET | `/api/v1/control/traces?from=&to=&window=&after=&limit=` | `ts_ms` が期間内の trace を、記録した順（`seq` の昇順、§2.2a）で。1 tick の履歴を辿る・グラフへ重ねる |
+
+- trace の外では、ヒントの元の event を ID で引く `GET /api/v1/events/{id}` を1つ足す（§2.7）
+- **GET だけ。** FR-307 / api-contract §1。OpenAPI に `get` 以外が現れないことを固定する既存の試験の範囲に入る
+- 制御の状態を変える入口はここに作らない。モード変更は `coldaisle-fand` の Unix ソケットだけ（0028 §2.2）、
+  イベントとヒントは `coldaisle-eventd` だけ（0045）。registry の操作は CLI だけ（0062 §2.1）
+- API はストア（L1）の読み出しだけを使う。**API から `coldaisle.control` を import しない**（§2.4 の理由）
+- API はシリアルポートにも、制御デーモンのソケットにも触れない（AGENTS.md ルール 6）。制御デーモンが
+  止まっていても API は動き、trace が無いことをそのまま返す
+
+#### `/api/v1/control/latest`
+
+```json
+{
+  "trace": {
+    "seq": 5120733,
+    "ts_ms": 1790000000000,
+    "ts": "2026-09-21T14:13:20+00:00",
+    "tick_id": 184390,
+    "schema_version": 9,
+    "age_ms": 820,
+    "body": { "...": "保存した ControlTick の JSON をそのまま" }
+  }
+}
+```
+
+- trace が1件も無い（制御デーモンを動かしていない・保持期間で消えた）ときは **200 で `"trace": null`**。
+  404 にしない。ルートが無いのか、記録が無いのかを取り違えないため。画面はこれを「未接続」と出す（0046 §2.3）
+- 「最新」は **`seq` が最大の行**である（§2.2a）。`ts_ms` の最大ではない。壁時計が戻ると、戻る前に書いた行の
+  `ts_ms` が戻った後の行より大きくなり、`ts_ms` で選ぶと時計が追いつくまで古い tick を返し続けるため
+- `age_ms` はサーバの `store.clock` で数える（`/health` と同じ時計）。**古いかどうかの判定は §2.6**。
+  壁時計が戻った直後は負になりうる。API は丸めずそのまま返し、画面は負の値を「新しい」とせず判定不能として出す
+
+#### `/api/v1/control/traces`
+
+```json
+{
+  "from_ms": 1790000000000,
+  "to_ms": 1790000600000,
+  "retained_from_ms": 1789999000000,
+  "before_retained": false,
+  "traces": [ { "seq": 0, "ts_ms": 0, "ts": "…", "tick_id": 0, "schema_version": 9, "body": { } } ],
+  "has_more": true,
+  "next_after": "5120733"
+}
+```
+
+- 期間は `[from, to)`（0030 §2 / 0004）で、**`ts_ms` による絞り込みにだけ使う。** `window` は既存の `/events` と
+  同じ `_resolve_range` で解く
+- **並びとページングは `seq`（§2.2a）のキーセット方式。** `after` は直前のページの最後の `seq` を10進の文字列で
+  表したもので、次のページは `ts_ms` が期間内で `seq > after` の行を `seq` の昇順で返す
+  - `ts_ms` は並びに使わない。制御デーモンは tick に `Clock.now_ms()`（壁時計）を刻み、`clock.py` の
+    `MonotonicClock` の説明のとおり壁時計は時刻合わせで前後に飛ぶ。`(ts_ms, tick_id)` で並べると、
+    読んでいる途中に時計が戻ったとき、新しく書かれた行が cursor より前に並び、黙って飛ばされる（§4 N）
+  - `tick_id` も使わない。制御デーモンの再起動で 0 に戻る（`control/loop.py`）
+  - offset 方式は採らない。制御デーモンが末尾へ追記し、`coldaisle-rollup` が先頭を消すあいだに、
+    offset はずれて行を飛ばす・重ねる
+  - `has_more: false` は「読んだ時点で、期間内で `seq > after` の行がもう無い」ことを表す。期間の上限が過去でも、
+    時計が戻ればその期間の `ts_ms` を持つ行が後から書かれうる。その行は必ず大きな `seq` を持つので、同じ `after`
+    で読み直せば取れる
+- **保持期間の境界を毎回返す（1ページ目を含む）。** 応答は `retained_from_ms`（§2.2a。これより前の `ts_ms` の
+  行は残っていることを保証しない）と、`before_retained`（`from_ms < retained_from_ms` のとき `true`）を必ず持つ。
+  `from` が境界より前なら、1ページ目でも行を返したうえで `before_retained: true` とし、先頭が欠けている
+  可能性を明示する。拒否はしない。境界より前の期間は「消えた」のか「もともと記録していない」のかを
+  API は区別できず、`window=7d` のような要求を導入直後に一律で拒むことになるため。画面はこのとき、
+  `retained_from_ms` より前を「記録が残っていない」と出し、**「tick が無かった」と言わない**
+- **保持期間の削除で未読の行が消えたら、黙って続けず 409 で止める。** `after` を付けた要求で
+  `after < pruned_through_seq`（§2.2a。消した行の `seq` の上限）なら、`after` より後ろの行が消えた可能性が
+  あるので **409** を返す。応答には `retained_from_ms` を入れ、呼び出し側はそれを `from` にして `after` なしで
+  読み直す
+  - この判定は、消えた行が期間外だった場合にも 409 を返しうる。取りこぼしを黙って `has_more: false` で
+    終えるよりは、読み直しを求めるほうを選ぶ
+  - 判定・境界の算出・読み出しは同じ読み取りトランザクションで行い、その間に削除が挟まらないようにする
+- **2ページ目以降は期間を固定する。** `after` を付けた要求は `from` と `to` の両方を必須とし、
+  `window` との同時指定、または `from` / `to` の欠けは 422 で拒否する。呼び出し側は1ページ目の応答の
+  `from_ms` / `to_ms` をそのまま渡す
+  - `window` はリクエストごとに `now` から解くので、ページをまたいで使うと下限が進んで未読の行を飛ばし、
+    上限も進んで行が足され続け、列が終わらない。「途中が欠けない」（下の `has_more`）が崩れる
+  - cursor に期間を埋め込む案は採らない。`after` は `seq` の値だけを表し、期間は要求の側で見えるほうが
+    読み手の取り違えに気付きやすい（§4 M）
+- **上限を超えたら `has_more: true` を返し、黙って落とさない。** `/events` の「古い側を落として
+  `truncated`」は採らない（§4）。trace は判断の証拠で、途中が欠けた列は事故調査に使えない
+- `limit` の既定と上限は環境変数（0009 §2.9 と同じ理由。`uvicorn` に引数を渡せない）。
+  名前と値は §5 #2
+
+### 2.2a 記録した順を表す `seq` と、削除の境界を表す1行を足す（migration）
+
+いまの `control_traces` は `WITHOUT ROWID` で、主キー `(ts_ms, tick_id)` のほかに記録した順を表す列が無い
+（`0002_control_traces.sql`）。rowid も無いので、#106 の実装 PR で次の migration を足す（番号は実装時点の
+次の空き番号。main はいま `0006_events` まで）。
+
+- **`control_traces` に `seq INTEGER NOT NULL UNIQUE` を足す。** 主キー `(ts_ms, tick_id)` と `INSERT OR IGNORE`
+  はそのままにし、0030 §2 の「主キーは `(ts_ms, tick_id)` とし、同じ trace を上書きしない」を変えない。
+  `NOT NULL UNIQUE` の列は `ALTER TABLE ADD COLUMN` で足せないので、表を作り直して移す。
+  既存の行には `(ts_ms, tick_id)` の順に 1 から振る（移行前の記録の順は残っていないので、これが取れる最善）
+- **`control_trace_prune` を1行だけの表として足す。** 列は `pruned_through_seq`（消した行の `seq` の上限。
+  初期値 0）と `pruned_before_ms`（これより前の `ts_ms` の行は消したことがある。初期値 `NULL`）と
+  `legacy_until_ms`（移行前の削除で欠けたかもしれない範囲の上限。migration が1回だけ書き、以後は変えない）。
+  `pruned_*` を書くのは `coldaisle-rollup` だけ
+  - `legacy_until_ms` は、migration を適用した時点の壁時計と、移行前から残る行の `MAX(ts_ms)` の大きいほう
+    （表が空なら壁時計）。移行前の削除がどこまで消したかは記録が無く、残っている最小の `ts_ms` から
+    完全性を導けない（時計が戻った後に書かれた行が最小になると、その後ろに移行前の削除で消えた範囲が
+    挟まりうる）。そこで、移行前の期間はまとめて「欠けているかもしれない」と扱う
+- **`seq` は書き手（Control Logging）が挿入と同じ文で振る。** 値は
+  `max(表の MAX(seq), pruned_through_seq) + 1`。表が全部消えても `pruned_through_seq` が残るので、`seq` は
+  巻き戻らず、古い cursor が新しい行を指すことはない。rowid の `AUTOINCREMENT` と同じ性質を、主キーを
+  変えずに得るための形である（§4 O）。書き手は1つで、SQLite の書き込みは直列なので重ならない。
+  `INSERT OR IGNORE` で捨てた挿入の番号は使わないので、`seq` は欠番を持ちうる。**連続を仮定しない**
+- **`coldaisle-rollup` の削除は、いまと同じ `ts_ms < cutoff` の行とする。** 同じ書き込みトランザクションで、
+  消す行の `MAX(seq)` を `D`（消す行が無ければ旧値）として `ts_ms < cutoff` の行を消し、
+  `pruned_through_seq = max(旧値, D)`、`pruned_before_ms = max(旧値, cutoff)` にする
+  - 0030 §5 の1項目め（期限を過ぎた record を消す。FINAL で確定）は、時計の異常があっても遅れずにそのまま満たす。0030 を
+    弱めないので、Supersedes は要らない
+  - `ts_ms >= pruned_before_ms` の行は1件も消えていない（消すのは `ts_ms < cutoff <= pruned_before_ms` の
+    行だけ）。§2.2 の `before_retained` は取りこぼしなく立つ
+  - 消した行はどれも `seq <= pruned_through_seq`。`after >= pruned_through_seq` の読み手にとって未読の行は
+    1件も消えておらず、`after < pruned_through_seq` の読み手は §2.2 の 409 で読み直す
+  - 消す範囲を `seq` の先頭の連続した範囲に限る案は採らない（§4 Q）。時計が一時的に未来へ跳んで書かれた
+    行が1件あるだけで、その `ts_ms` に実時間が追いつくまで削除が止まり、表が際限なく育つ
+  - 時計が戻った後は、`seq <= pruned_through_seq` でも消えずに残る行（`ts_ms >= cutoff`）がありうる。
+    その範囲を読んでいた読み手は 409 になり読み直す。欠けていないのに読み直させることはあるが、
+    欠けたのに黙って続けることは無い
+  - 時計の異常に運用者が気付けるよう、`rollup` の JSON ログに、`ts_ms` が `rollup` の時刻より未来の行の
+    件数を足す（§3）
+- API の `retained_from_ms` は `max(pruned_before_ms, legacy_until_ms)`（`pruned_before_ms` が `NULL` なら
+  `legacy_until_ms`）を返す。移行前の期間を読む要求は、`rollup` の `cutoff` が `legacy_until_ms` を越えるまで
+  `before_retained: true` になる。保持期間ぶん運用すれば、移行前の期間は保持期間の外へ出て、この扱いは
+  自然に消える
+  - 残る限界: 移行前に、時計が `legacy_until_ms` より先へ進んだ状態で削除が走っていた場合、その削除で
+    消えた範囲は `legacy_until_ms` より後ろにかかりうる。これはストアに痕跡が残らず、API からは検出できない。
+    migration を適用する前に時計の異常が分かっているなら、運用者は `legacy_until_ms` を手で後ろへ
+    ずらしてよい（後ろへずらすのは常に安全側。前へは戻さない）
+- Offline Evaluation が使う `SqliteStore.control_traces` の `ts_ms` 順の読み出しは変えない。`seq` は読み取り API の
+  並びと cursor のためのもので、判断の時刻の意味は `ts_ms` のまま
+
+### 2.3 本文（`body`）は保存した JSON をそのまま返す。版の解釈は読む側で行う
+
+- `body` は `control_traces.trace_json` を JSON として解いた object で、**API は項目を足さない・消さない・直さない**
+- 外枠（`seq` / `ts_ms` / `ts` / `tick_id` / `schema_version` / `age_ms`）は API の版（`/api/v1`）に属し、
+  `ControlTick` の版が上がっても変えない。`ControlTick` が v10 になっても `/api/v1` の形は変わらない
+- 読む側は **`schema_version` で分岐する。** 画面（`airflow.js`）の変換は1か所に置き（0046 §3 の
+  「API ができた時点で変換を1つ書く」）、版ごとの欄の有無を次のように見分けて出す
+
+| 状態 | 例 | 画面の表示 |
+|---|---|---|
+| その版に欄が無い | v4 の trace に `model_gate`（v5〜）が無い | 「この版の記録には無い」。**「無し」「正常」と言わない** |
+| 欄はあるが値が無い | v9 で `supervisor: null`（Supervisor の出力が無い tick） | 項目ごとの既存の表示（例: 介入なし） |
+| 画面が知らない版 | 画面の実装より新しい v10 | 「未対応の版」として制御由来の項目を出さない。**通常状態に見せない** |
+
+これは 0062 §2.5 / 0064 §2.9 と同じ規律である。「記録されていない」と「起きていない」を区別する。
+
+### 2.4 API は trace を検証し直さない・投影しない
+
+`body` を `ControlTick.model_validate` に通さない。サーバ側で画面向けの形（`page.control`）に投影もしない。
+
+- **版を解釈する場所を1つにする。** 投影すると、版ごとの意味の解釈がサーバとストアの読み手（Offline
+  Evaluation）と画面の3か所に散る。API が `coldaisle.control.schema` を import することにもなり、
+  読み取り API が制御の内部型に依存する
+- 検証し直すと、**いまのコードが読めない古い trace を API が 500 で返せなくなる**、あるいは黙って
+  捨てる。保存時に JSON object であることは SQLite の CHECK とアプリで検証済み（0030 §2）で、意味の検証は
+  書いた時点の `ControlTick` が済ませている
+
+### 2.5 registry の lifecycle は「tick が使っていた registry の版」として毎 tick 載せる（#104）
+
+0062 §5 への答え。**registry event 用の表を足さない。tick に対応しない記録へ tick_id を合成しない**
+（0062 §4 の却下を守る）。代わりに、**その tick の判断がどの production pointer の下で出たか**を tick 側に載せる。
+
+- `ControlTick` に `registry` の塊を足し、schema version を**実装時点の値から1つ上げる**
+  （0064 §2.9 のヒントの塊と同じ手順。どちらが先に入っても、それぞれが次の版を取る）
+- 中身は、制御デーモンが起動時に読んだ registry snapshot の `revision` と、kind ごとに
+  - production の `artifact_sha256`（無ければ `None`）
+  - その production を成立させた pointer 変更の `RegistryAuditEvent.trace_metadata()`（0062 §2.5。path を含まず、欄は常に揃える）
+- **毎 tick 載せる。** 起動した tick だけに載せると、30日の保持（`control_trace_days`）より長く動いた
+  デーモンでは、その tick が消えて「どの昇格の下で動いているか」が trace から言えなくなる
+- 誰が・なぜ・いつ承認したかの正本は `registry.json` の audit のまま（0062 §2.5）。trace には `revision` と
+  path を含まない metadata だけを置き、全文は `coldaisle-registry audit --pointer-changes` で引く
+  （0064 §2.9 の「全文は `event_id` から引く」と同じ関係）
+- 読み取り API はこの塊を §2.3 のとおり `body` の一部として返すだけで、registry のファイルを読まない
+- **いまの制御デーモンは起動時にしか registry を読まない。** promotion / rollback が trace に現れるのは、
+  それを反映して再起動した最初の tick からである。これは正しい。trace は「判断がどの artifact で出たか」の
+  記録であり、pointer を動かした瞬間の記録ではない（それは audit の役割）
+- **trace が持つのは「tick が使っていた pointer」だけで、pointer 変更の全件ではない。** 再起動のあいだに
+  promotion と rollback が両方起きると、どの tick にも使われなかった途中の pointer は trace に現れない。
+  本記録は「すべての promotion / rollback が trace に残る」とは主張しない
+  - 取りこぼしは trace から**検出できる。** registry の `revision` は audit の件数と一致し、1から連続する
+    （`ModelRegistrySnapshot` の検証）。隣り合う trace の `revision` が飛んでいれば、その間の変更は
+    `coldaisle-registry audit --pointer-changes` で全件を出し、各要素の `registry_revision` で
+    読む側が範囲に絞る（`RegistryAuditEvent.trace_metadata()` が必ず持つ欄）。いまの CLI に `revision` の
+    範囲を指定するオプションは無く、本記録は足さない。audit は promotion / rollback の件数ぶんしか無く、
+    全件を出して絞れば足りるため
+  - これで #104 の受入基準「promotion / rollback が decision trace へ残る」を満たすとみなすかは、
+    人間の判断に委ねる（§5 #7）。満たさないと判断した場合の代案（起動した tick に、直前の trace の
+    `revision` 以降の pointer 変更の metadata をすべて載せる）も §5 #7 に置く
+
+### 2.6 古さの判定は読む側で、周期は trace 自身から取る
+
+`/control/latest` は `age_ms` を返すだけで、`ok` / `stale` を決めない。
+
+- v8 以降の trace は `runtime.tick_period_ms` を持つ（0060 §2.4）。画面は「`age_ms` が周期の何倍を超えたら古い」
+  で判断し、その倍数は `config/airflow-ui.yaml` に置いて `GET /api/v1/airflow/config` で返す（AGENTS.md ルール 9）。
+  **API は `safety.yaml` を読まない**（読み取り API が制御の設定に依存しない）
+- v1〜v7 の trace は周期を持たないので、画面は経過時間だけを出し、「古い／新しい」を言わない
+- 倍数の値は §5 #1
+
+### 2.7 ヒントの塊（#107）は §2.3 の `body` に入るだけ。専用の口を作らない
+
+- 塊の中身と閉じた語彙は 0064 §2.9（`age_ms` の定義は 0066）で決まっている。本記録は足さない・減らさない
+- `note` と `source` は `events` の `payload` にある。ただし既存の `GET /api/v1/events` は期間・kind・件数でしか
+  引けず、上限を超えると古い側を落とす（0009 §2.4）。長く効いているヒントの元の event は、画面が選んだ期間の
+  外や、落とされた側に入りうるので、**期間で引いた一覧との突き合わせでは確実に引けない**
+- そこで **`GET /api/v1/events/{id}` を足す**（#106 の実装 PR。GET だけで §2.2 の規律の範囲）。応答は既存の
+  `EventOut` 1件で、`peer_uid` を含まない（下）。無ければ（保持期間で消えた・存在しない）**404**。
+  画面は trace の `event_id` でこれを引き、404 なら `note` / `source` を「記録が残っていない」と出す。
+  **「無し」と言わない**（§2.3 と同じ規律）
+- **`peer_uid` は HTTP では引けない。** `EventOut` は監査のためだけに DB へ残す `peer_uid` を意図して出さない
+  （`coldaisle.api.models.EventOut`）。本記録はこれを変えない。書き込んだ接続の uid が要る監査は、
+  ホスト上でストアを直接読む運用者の作業とする
+- **trace の API からヒントを書く・消す経路は無い**（§2.2。書く入口は 0045 のソケットだけ）
+- #107 の Stage B の前提1（0064 §2.10）は、§2.1 の 0030 の承認で「保存の形が決まっている」状態になる。
+  前後比較に要る読み出しは Offline Evaluation がストアから直接行うので、Stage B は本記録の API の実装を待たない
+
+### 2.8 LLM には渡さない。AI ツールに trace を足さない（FR-504）
+
+- `/api/v1/control/*` は**画面と人のための HTTP 読み取り口**であり、`/api/v1/tools` の一覧に載せない。
+  AI 向けツールは 0015 / 0018 の読み取り専用の5つのまま
+- trace の列は制御 ML と同じ粒度の時系列で、FR-504 / AGENTS.md ルール 8 がプロンプトへの直接投入を禁じる対象である。
+  **制御 ML が Window を直接扱ってよいこと（ルール 8 のただし書き）と、LLM に渡すことを混同しない**
+- 実装 PR で `docs/api-contract.md` の表に2行を足すとき、「LLM のプロンプトへ直接入れない。要約が要るなら
+  集計済みのツールを別に定める」と注記する。Workspace 側のチャットが API の応答をそのままプロンプトへ貼る実装を防ぐため
+- 将来 LLM に「なぜこの回転数か」を説明させたい場合は、期間内の `bound_by` / fault code / fallback の理由を
+  **閉じた語彙で数えた集計**を返すツールを、別の決定記録で定める（§5 #5）。その場合も LLM は
+  Fan Demand・PWM・registry・authority に触れない（ルール 1）
+
+---
+
+## 3. Consequences
+
+### 良くなること
+
+- #106 の画面が、模擬データと同じ `page.control` の形を実 trace から作れる。変換は画面の1か所
+- 「なぜこの回転数か」を、`/control/traces` で前後の tick まで辿れる。途中が黙って欠けない（§2.2）
+- `ControlTick` の版を上げても `/api/v1` の形は変わらない。API の版と trace の版が独立する（§2.3）
+- どの tick がどの昇格の下で出たかが、束縛していない識別子を作らずに、保持期間の中のどの tick からも言える。
+  tick に使われなかった pointer 変更は trace に載らないが、`revision` の飛びで検出でき audit で全件引ける（§2.5）。
+  これで #104 の受入基準を満たすとみなすかは §5 #7
+- #107 は 0030 の承認で Stage B の前提1が満たされる（§2.1 / §2.7）
+
+### 悪くなること・その緩和
+
+| トレードオフ | 緩和策 |
+|---|---|
+| 版の解釈を画面側（JS）で持つ。v1〜v9 の差を JS に写すことになる | 分岐を1つの変換関数に集め、`tests/fixtures/control_tick_v1.json` と版ごとの fixture を node の試験で読ませる（0044 の範囲）。知らない版は「未対応の版」と出し、通常に見せない |
+| 1 tick の JSON を丸ごと返すので応答が大きい | `limit` の上限を環境変数で絞る。履歴の俯瞰は `series`（メトリクス）で行い、trace は drill-down に使う |
+| `registry` の塊を毎 tick 載せると保存量が増える | 載せるのは kind の数（数個）ぶんの sha と path を含まない metadata だけ。起動した tick だけに載せる案は、保持期間で証拠が消えるので採らない（§4） |
+| promotion は再起動するまで trace に現れない | trace は「判断がどの artifact で出たか」の記録。pointer を動かした時刻・理由は audit にあり、`revision` で突き合わせられる |
+| 再起動のあいだに複数の pointer 変更があると、途中の変更は trace に載らない | `revision` は audit の件数と一致して連続するので、隣り合う trace の飛びで検出し、audit で全件引ける（§2.5 / §5 #7） |
+| 保持期間の境界の近くを読むと、`coldaisle-rollup` の後で 409 になり読み直しになる | 消えたかもしれない列を完全に見せるより、欠けたことを伝えるほうを選ぶ。409 の応答に読み直す起点（`retained_from_ms`）を入れる（§2.2） |
+| 境界より前から読むと、1ページ目から `before_retained: true` になる。導入直後や移行直後は「記録していない」期間も欠けている可能性として出る | 消えた証拠を「tick が無かった」と見せるより、欠けている可能性を明示するほうを選ぶ（§2.2 / §2.2a） |
+| `seq` と `control_trace_prune` を足す migration が要り、表を作り直す | 主キーと `INSERT OR IGNORE` は変えないので、0030 §2 の契約と書き手の挙動は変わらない。壁時計が戻っても行を飛ばさない並びは、単調な挿入の番号でしか得られない（§4 N / O） |
+| 時計が戻った後は、残っている行を読んでいても 409 になり読み直しになることがある | 欠けたのに黙って続けるより、欠けていないのに読み直させるほうを選ぶ。削除は `ts_ms < cutoff` のままなので、時計の異常で表が育ち続けることは無い。`rollup` のログに未来の `ts_ms` の行の件数を出す（§2.2a） |
+| 移行前の期間は、保持期間ぶん運用するまで `before_retained: true` になる | 移行前の削除の範囲は記録が無く分からない。残っている最小の `ts_ms` から完全性を言うと、時計が戻った場合に欠けた範囲を「残っている」と見せる（§2.2a） |
+| 2ページ目以降に `window` を使えない | 1ページ目の応答が `from_ms` / `to_ms` を返すので、それを渡すだけでよい。黙って行が飛ぶより、422 で気付けるほうを選ぶ（§2.2） |
+| API が trace を検証し直さないので、壊れた意味の trace も返す | 書き手は制御デーモンだけで、保存時に型を通っている。SQLite の CHECK が JSON object であることを保証する。読み手は `schema_version` で分岐する |
+| 古さの判定が API（`/health`）と画面で別の場所にある | `/control/latest` は `age_ms` と周期（`body.runtime`）を必ず返し、判定の倍数は設定で1か所に置く |
+
+---
+
+## 4. 却下した代替案
+
+| 案 | 却下理由 |
+|---|---|
+| **A. サーバ側で画面向けの形（`page.control`）に投影して返す** | 版の解釈がサーバ・Offline Evaluation・画面に散る。API が `coldaisle.control.schema` を import する。投影を変えるたびに API の版を上げることになる（§2.4） |
+| **B. `ControlTick.model_validate` で検証し直してから返す** | いまのコードが読めない古い trace（または将来の版を読む古い API）で 500 になるか、黙って捨てる。「記録されていない」と「起きていない」を区別できなくなる |
+| **C. `/events` と同じく、上限を超えたら古い側を落として `truncated`** | 判断の列の途中が欠けても気付きにくい。trace は証拠であり、欠けた列で「なぜ」を辿らせない（§2.2） |
+| **D. offset / page 番号でページングする** | 末尾への追記と保持期間の削除が同時に起きるので、ページがずれて行を飛ばす・重ねる |
+| **E. `tick_id` 単独を cursor にする** | 再起動で 0 に戻る |
+| **F. `WS /api/v1/control/stream` で押し出す** | 画面は `/control/latest` を周期的に読めば足りる。0009 §2.6 と同じ理由で、まず問い合わせで作る。要るなら後で足す（§5 #4） |
+| **G. registry event 用の表（`registry_events`）を SQLite に足し、CLI に書かせる** | 書き手が2つになる（CLI と制御デーモン）。`registry.json` の audit と二重の正本になり、食い違ったときにどちらを信じるか決められない |
+| **H. registry event に tick_id を合成して `control_traces` に書く** | 0062 §4 がすでに却下。束縛していない識別子を作る |
+| **I. `registry` の塊を起動した tick だけに載せる** | 保持期間（30日）より長く動くと、その tick が消えて「どの昇格の下か」が trace から言えなくなる |
+| **J. trace を AI ツールに足す（`get_control_traces`）** | FR-504 / ルール 8。生の時系列をプロンプトへ入れる経路になる。説明が要るなら集計済みのツールを別に決める（§2.8） |
+| **K. 読み取り API が `safety.yaml` を読んで古さを判定する** | 読み取り API が制御の設定に依存する。周期は trace 自身（v8 の `runtime`）が持っている |
+| **L. 0030 の承認を待たずに本記録だけを FINAL にする** | 保存の形が変わりうる前提の上に API の契約を固定することになる。承認してほしい範囲を §2.1 に絞った |
+| **M. `after` の cursor に `from` / `to` を埋め込む** | cursor が不透明になり、読み手がどの期間を読んでいるかを要求から読めない。期間を要求に明示させ、`window` との併用を拒否すれば同じ固定が得られる（§2.2） |
+| **N. 主キー `(ts_ms, tick_id)` を cursor にし、`/control/latest` も `ts_ms` の最大で選ぶ** | `ts_ms` は壁時計で、時刻合わせで戻る（`clock.py`）。読んでいる途中に戻ると、新しい行が cursor より前に並んで永久に飛ばされる。`/control/latest` も時計が追いつくまで戻る前の tick を返す |
+| **O. 表を rowid 付きにして rowid（`AUTOINCREMENT` なし）を cursor にする** | 表が全部消えると rowid が 1 から振り直され、古い cursor より小さい番号の新しい行を飛ばす。`AUTOINCREMENT` には `INTEGER PRIMARY KEY` が要り、0030 §2 の主キーを変えることになる |
+| **P. 1ページ目は境界を見ず、2ページ目以降だけ 409 にする** | 1ページ目の `from` が既に消えた範囲にかかっていても、残りの行と `has_more: false` だけが返り、「消えた」と「tick が無かった」を区別できない |
+| **Q. 削除を `seq` の先頭の連続した範囲に限る（`ts_ms >= cutoff` の最小の `seq` より前だけを消す）** | 時計が一時的に未来へ跳んで書かれた行が1件あると、その `ts_ms` に実時間が追いつくまで何も消せず、表が際限なく育つ。0030 §5 の1項目め（期限を過ぎた record を消す）を弱めることにもなる。`pruned_through_seq` を消した行の `MAX(seq)` にすれば、先頭に限らなくても 409 の判定は取りこぼさない（§2.2a） |
+| **R. 移行後の `retained_from_ms` を、残っている行の最小の `ts_ms` から始める** | 移行前に時計が戻った後の行が最小になると、その後ろに移行前の削除で消えた範囲が挟まっていても `before_retained: false` を返す。移行前の期間はまとめて不明として扱う（§2.2a の `legacy_until_ms`） |
+
+---
+
+## 5. 未決事項
+
+| # | 内容 | 決める場所 |
+|---|---|---|
+| 1 | 画面が trace を「古い」と言う倍数（`runtime.tick_period_ms` の何倍か）と、`config/airflow-ui.yaml` での項目名 | #106 の実装 PR。設定であり、記録には値を書かない |
+| 2 | `limit` の既定と上限の環境変数の名前と値（0009 §2.9 の表へ足す） | #106 の実装 PR |
+| 3 | 条件での絞り込み（fault のある tick だけ・Fallback の tick だけ等）。版ごとに JSON の位置が違うため、閉じた語彙の索引列を足すかを含む | 必要が出てから別 Issue。いまは期間とページングだけ |
+| 4 | `WS /api/v1/control/stream` を足すか | 画面の実運用で周期読み出しが足りないと分かってから |
+| 5 | LLM 向けの集計ツール（`bound_by` / fault / fallback の理由の件数など）の形 | 別の決定記録（0015 / 0018 の続き） |
+| 6 | `RegistryHealthReport.trace_metadata()`（起動時検証の結果）も `registry` の塊に入れるか | #104 の実装 PR。入れるなら同じ版上げに含める |
+| 7 | §2.5 の「tick が使っていた pointer」と `revision` の飛びの検出で、#104 の受入基準「promotion / rollback が decision trace へ残る」を満たすとみなすか。満たさないなら、起動した tick に直前の trace の `revision` 以降の pointer 変更の metadata をすべて載せる（制御デーモンが起動時にストアの最新 trace を読むことになる） | **決定（2026-09-29 所有者）**: 満たすとみなす。trace には tick が使っていた pointer と `revision` を残し、変更の全履歴は registry の audit を正本とする。制御デーモンは起動時に過去の trace を読まない |
+| 11 | §2.2a の migration の番号、`legacy_until_ms` を migration で求める方法、`rollup` のログに足す件数の項目名 | #106 の実装 PR |
+| 8 | `requirements.md` に FR を足す番号と文言、`api-contract.md` の表 | #106 の実装 PR（本記録は文書を書き換えない） |
+| 9 | SQLite 外への export（0030 §5 の2項目め） | #90 / #91。本記録は扱わない |
+| 10 | Workspace（#60）からエアフロー画面へのリンク（0046 §5 #5） | #60 |
