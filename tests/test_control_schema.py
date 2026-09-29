@@ -542,10 +542,44 @@ SAFETY_PROVENANCE = SafetyProvenance(disabled_inputs=(), config_is_provisional=F
 v8 の runtime と同じく、v9 を名乗る記録はこの欄を省けない。値はこの試験の判断に影響しない。
 """
 
-REGISTRY_PROVENANCE = RegistryProvenance.unbound()
+
+def registry_provenance_for(artifact: str) -> RegistryProvenance:
+    """thermal_model の production を `artifact` にした v10 の registry の版（#104）。"""
+    return RegistryProvenance(
+        revision=3,
+        production={
+            "thermal_model": RegistryProductionPointer(
+                artifact_sha256=artifact,
+                established_by=RegistryPointerChange(
+                    registry_revision=3,
+                    occurred_at_ms=1_000,
+                    event="promoted",
+                    artifact_kind="thermal_model",
+                    model_id="thermal-test",
+                    model_version="0.1.0",
+                    actor="operator",
+                    reason="試験用の昇格",
+                    previous_artifact=None,
+                    rollback_target=None,
+                    approver="operator",
+                    approved_at_ms=500,
+                    approval_artifact_sha256=artifact,
+                ),
+            ),
+        }
+        | {
+            kind: RegistryProductionPointer(artifact_sha256=None, established_by=None)
+            for kind in ("confidence_model", "supervisor_policy", "feature_transform")
+        },
+    )
+
+
+REGISTRY_PROVENANCE = registry_provenance_for("a" * 64)
 """v10 の `ControlTick` に必須の Model Registry の版（#104 / 決定記録 0071 §2.5）。
 
-v9 と同じく、v10 を名乗る記録はこの欄を省けない。値はこの試験の判断に影響しない。
+v9 と同じく、v10 を名乗る記録はこの欄を省けない。thermal_model の production を試験の
+artifact（`"a" * 64`）にしてある。裏づけのある `model_gate` は production と一致しなければ
+ならない（決定記録 0052 §2.1 の3。codex #4133594515）ため。
 """
 
 # ---------------------------------------------------------------- 1 tick の記録
@@ -1382,6 +1416,67 @@ def test_v7_trace_records_the_artifact_that_produced_the_applied_proposal():
     assert restored.model_gate.artifact_sha256 == ARTIFACT
     assert restored.applied_model_artifact == ARTIFACT
     assert restored.applied_artifact_unknown is False
+
+
+def test_an_attested_artifact_needs_the_registry_that_bound_it():
+    """**registry を読んでいない記録に、裏づけのある artifact を載せない**（codex #4133594515）。
+
+    Learned MPC を制御へ束縛できるのは production pointer だけ（決定記録 0052 §2.1 の3）で、
+    その pointer は registry を読まなければ得られない。
+    """
+    with pytest.raises(ValidationError, match="registry を読んでいる"):
+        learned_tick(registry=RegistryProvenance.unbound())
+
+
+def test_an_attested_artifact_must_be_the_recorded_production():
+    """**別の artifact を production に持つ registry の版と組み合わせない**（codex #4133594515）。
+
+    組み合わせられると、artifact B の判断を artifact A の昇格の下で出たものとして記録できる。
+    """
+    with pytest.raises(ValidationError, match="thermal_model の production と揃える"):
+        learned_tick(registry=registry_provenance_for("f" * 64))
+
+    other = {
+        kind: pointer
+        for kind, pointer in REGISTRY_PROVENANCE.production.items()
+        if kind != "thermal_model"
+    }
+    with pytest.raises(ValidationError, match="thermal_model の production と揃える"):
+        learned_tick(
+            registry=RegistryProvenance(
+                revision=3,
+                production=other
+                | {
+                    "thermal_model": RegistryProductionPointer(
+                        artifact_sha256=None, established_by=None
+                    )
+                },
+            )
+        )
+
+
+def test_an_unattested_gate_does_not_need_a_registry_read():
+    """裏づけの無い判断は artifact を持たないので、registry を読んでいない記録でもよい。"""
+    recorded = learned_tick(
+        state=fallback_state(
+            authority_stage=AuthorityStage.LIMITED,
+            fallback_reason=Reason(code="low_confidence"),
+            model_version="0.1.0",
+        ),
+        model_gate=model_gate(
+            artifact_sha256=None,
+            attested=False,
+            confidence=None,
+            ood=None,
+            confidence_level=ConfidenceLevel.LOW,
+            learned_selected=False,
+            limits=(),
+            assessment=(),
+        ),
+        registry=RegistryProvenance.unbound(),
+    )
+
+    assert recorded.registry == RegistryProvenance.unbound()
 
 
 @pytest.mark.parametrize("schema_version", [5, 6])

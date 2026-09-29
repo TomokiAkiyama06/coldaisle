@@ -1110,6 +1110,9 @@ import しない（registry が schema を import する向きだけにする）
 一致は試験が確かめる。
 """
 
+_REGISTRY_THERMAL_MODEL_KIND = "thermal_model"
+"""Learned MPC が制御に束縛する artifact の kind（決定記録 0052 §2.1 の2）。"""
+
 _REGISTRY_IDENTIFIER_PATTERN = r"^[a-z][a-z0-9_.-]*$"
 """Registry の kind・model id・actor の形（`model_registry._IDENTIFIER_PATTERN` と同じ）。"""
 
@@ -1532,6 +1535,7 @@ class ControlTick(_Frozen):
         elif self.schema_version < 10:
             raise ValueError("registry を記録する ControlTick は schema version 10 にする")
         self._check_model_gate()
+        self._check_registry_binds_model()
         self._check_shadow()
         if self.supervisor is not None:
             if self.supervisor.tick_id != self.tick_id:
@@ -1676,6 +1680,31 @@ class ControlTick(_Frozen):
         if state.operating_mode in {OperatingMode.MANUAL, OperatingMode.CALIBRATION}:
             # 人が requested を決める mode では Gate が動かない（0028 §2.5 (a)）。
             raise ValueError("MANUAL / CALIBRATION の tick に model_gate を残さない")
+
+    def _check_registry_binds_model(self) -> None:
+        """v10 の ``registry`` が、この tick の裏づけのある model artifact を production に持つか。
+
+        Learned MPC を制御へ束縛できるのは thermal_model の**production pointer そのもの**
+        だけである（決定記録 0052 §2.1 の3）。制御デーモンは起動時に読んだ registry の版を
+        毎 tick 載せる（0071 §2.5）ので、裏づけのある `model_gate` の artifact は、その版の
+        thermal_model の production と一致していなければならない。
+        一致を求めないと、registry を読んでいない記録（`unbound`）や別の版の snapshot と
+        組み合わさり、**判断を別の昇格の下で出たものとして記録できてしまう**（codex #4133594515）。
+
+        RL Supervisor の識別はここで照合しない。shadow は production でない candidate を
+        回す（0061 §2.4 の `for_shadow`）ので、production との一致は要件にならない。
+        """
+        registry = self.registry
+        gate = self.model_gate
+        if registry is None or gate is None or not gate.attested or gate.artifact_sha256 is None:
+            return
+        if registry.revision is None:
+            raise ValueError("裏づけのある model artifact を記録する tick は registry を読んでいる")
+        pointer = registry.production[_REGISTRY_THERMAL_MODEL_KIND]
+        if pointer.artifact_sha256 != gate.artifact_sha256:
+            raise ValueError(
+                "model_gate の artifact を registry の thermal_model の production と揃える"
+            )
 
     def _check_shadow(self) -> None:
         """v6 の ``shadow`` が、同じ tick の適用結果と同じ判断を指しているか（#90）。"""
