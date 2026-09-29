@@ -32,3 +32,50 @@ Safety State は変えない。比較は提案時と現在の2点だけで、con
 active RLが利用不能ならinlineの決定論的RulePolicyへfallbackする。RulePolicyも失敗した場合は
 Supervisor contextを返さず、#79 Fallback Controllerがsnapshotだけで運転を継続できる境界を保つ。
 ControlTick v3はこのdecisionをoptionalに保存し、保存済みv1/v2 traceはそのまま読み書きできる。
+
+## Shadow 集計（`coldaisle-supervisor-shadow`。#89 / 決定記録 0074 §2.1）
+
+Rule（active）と RL（shadow）の提案の突き合わせは、**制御プロセスの外で、運転の後に**行う。
+`coldaisle-fand` は `ControlTick.supervisor` を decision trace へ保存するだけで、台帳
+（`SupervisorShadowLedger`）を持たない。台帳の例外・上限・集計の遅さは control tick にも
+heartbeat にも届かない。
+
+```bash
+uv run coldaisle-supervisor-shadow --evidence var/supervisor-shadow-runs.yaml \
+  --registry-root var/model-registry --out var/supervisor-shadow.json
+```
+
+`--evidence` の manifest は期間（`[start_ms, end_ms)`。相対指定は置かない）と、比べた RL artifact の
+**model ID と版だけ**を名指す。bytes hash は受け取らず、Registry を `load_version()` で**読んで**
+（書かない）得た attestation から識別を作る。
+
+```yaml
+schema_version: 1
+period: {start_ms: 1700000000000, end_ms: 1700086400000}
+rl_artifact: {model_id: rl-supervisor, version: 0.1.0}
+```
+
+- 証拠の DB は `coldaisle-evaluate` と同じ `EvidenceDatabase`（`immutable=1`）で開く。
+  `-wal` / `-journal` に中身があれば開かない
+- shadow の下限は検証済みの `config/rl-policy.yaml`（`--rl-policy`）の `shadow` から取る。
+  **引数や manifest で上書きする口は無い**
+- Rule 表は `--control-config` の `fan-policy.yaml` から作る。trace の `runtime.config` の
+  `fan-policy.yaml` hash が違う行が1つでもあれば **run 全体を拒否する**（期間を分けて渡す）
+- 索引と本文の食い違い・v8 未満（`runtime` が無い）の trace・台帳の拒否
+  （Rule 表との不一致・同じ `(ts_ms, tick_id)` の食い違い）も run 全体を拒否し、何も書かない
+- 台帳へ渡さない行は理由別に数え、`filtered` に**3つの鍵を常に全部**出す
+  （`no_supervisor_decision` / `no_shadow_slot` / `active_not_rule`）
+- 台帳は tick を `(ts_ms, tick_id)` で識別する。`tick_id` は再起動で 0 に戻るため
+
+出力は `SupervisorShadowRunReport`（schema v1）の canonical JSON で、`summary`
+（`SupervisorShadowSummary` v2 そのもの）・`summary_sha256`・`filtered`・`period`・
+`fan_policy_sha256` を持つ。生成時刻を持たず、同じ入力からは同じ bytes になる。
+
+**昇格に使うのは `summary` だけである。** `read_run_report()` で読み戻した `.summary` を
+`promote_supervisor_policy()` へ渡す。昇格の入口は、昇格の時点で読んだ検証済み
+`rl-policy.yaml` の `shadow`（`shadow_config`）を必須にとり、集計の `minimum_ticks` /
+`minimum_paired_fraction` が**値で等しくなければ拒否する**（緩いほうも厳しいほうも）。
+包みの digest は昇格の証拠にしない。
+
+RL worker と `expected_rl_identity` の配線が無い間は、RL の提案がすべて欠落か識別の不一致になり、
+集計は `usable=False` になる（0074 §3）。それが正しい振る舞いである。

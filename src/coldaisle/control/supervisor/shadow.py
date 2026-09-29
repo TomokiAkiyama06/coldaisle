@@ -6,7 +6,7 @@
 この台帳が守る規則は4つある。どれも、過去の PR で実際に見つかった壊れ方に対応する。
 
 1. **同じ tick を2度渡しても数が増えない。** 同じ内容なら畳み、食い違えば受け取らない
-   （決定記録 0055 §2.1 と同じ契約）
+   （決定記録 0055 §2.1 と同じ契約）。tick は `(ts_ms, tick_id)` で識別する（0074 §2.1）
 2. **片方しか無い tick を一致として数えない。** RL の提案が無い tick は理由別に数え、
    対になった tick だけを比較の母数にする
 3. **版を名指しする。** Rule / RL の policy version を束縛し、違う版の提案を同じ表に混ぜない
@@ -288,7 +288,10 @@ class SupervisorShadowLedger:
         self._rule_identity = rule_table.identity
         self._rule_version = rule_table.version
         self._rl_identity = rl_identity
-        self._seen: dict[int, str] = {}
+        # **鍵は `(ts_ms, tick_id)`**（決定記録 0074 §2.1）。`tick_id` は再起動で 0 に戻るので、
+        # `tick_id` だけで畳むと、再起動を跨いだ別の tick が同じ tick として衝突する。
+        # trace の主キー・#91 の評価器と同じ鍵にする。
+        self._seen: dict[tuple[int, int], str] = {}
         self._rule_unavailable = 0
         self._rl_unavailable = 0
         self._both_unavailable = 0
@@ -321,19 +324,20 @@ class SupervisorShadowLedger:
             )
 
         digest = canonical_sha256(decision)
-        previous = self._seen.get(decision.tick_id)
+        key = (decision.ts_ms, decision.tick_id)
+        previous = self._seen.get(key)
         if previous is not None:
             if previous != digest:
                 # どちらを採っても片方の事実が消える。選ぶのは照合器の仕事ではない（0055 §2.1）。
                 raise SupervisorShadowConflictError(
                     "同じ tick に食い違う Supervisor decision が届いた"
-                    f"（tick_id={decision.tick_id}）"
+                    f"（ts_ms={decision.ts_ms}; tick_id={decision.tick_id}）"
                 )
             # **冪等な取り込みで数が増えないようにする。** 同じ行が2度届くのは入力の誤りではない。
             return
         if len(self._seen) >= MAX_SHADOW_TICKS:
             raise SupervisorShadowUsageError("shadow 台帳の tick 数が構造上限を超えている")
-        self._seen[decision.tick_id] = digest
+        self._seen[key] = digest
         self._first_ts_ms = (
             decision.ts_ms if self._first_ts_ms is None else min(self._first_ts_ms, decision.ts_ms)
         )

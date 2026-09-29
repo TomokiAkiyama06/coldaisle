@@ -53,6 +53,7 @@ from coldaisle.control.schema import (
     WorkloadRegime,
 )
 from coldaisle.control.supervisor.policy import SupervisorPolicy
+from coldaisle.control.supervisor.policy_config import PolicyShadowConfig
 from coldaisle.control.supervisor.rule_identity import RulePolicyIdentity, rule_policy_identity
 from coldaisle.control.supervisor.shadow import SupervisorShadowSummary
 
@@ -575,6 +576,7 @@ def promote_supervisor_policy(
     certified: CertifiedPolicyArtifact,
     shadow_evidence: SupervisorShadowSummary,
     baseline_rule_policy: SupervisorPolicy,
+    shadow_config: PolicyShadowConfig,
     approval: HumanApproval,
     expected_revision: int,
 ) -> int:
@@ -589,9 +591,14 @@ def promote_supervisor_policy(
     - shadow 集計が**この artifact**を、**`baseline_rule_policy`（いま運転の Baseline に使う
       Rule policy）と同じ版**の Rule と比べた `usable` な集計である
 
+    - shadow 集計の下限（`minimum_ticks` / `minimum_paired_fraction`）が、昇格の時点で読んだ
+      検証済みの `rl-policy.yaml` の `shadow`（`shadow_config`）と**値で等しい**
+      （決定記録 0074 §2.1「下限の束縛」）
+
     Rule の版は文字列ではなく Rule policy そのものから取る（自由な文字列だと、集計に合わせた
     版を渡せてしまう）。
     """
+    _check_shadow_minimums(shadow_evidence, shadow_config)
     identity = certified_identity(certified)
     rule_identity = rule_policy_identity(baseline_rule_policy)
     if ref.kind is not ArtifactKind.SUPERVISOR_POLICY or (ref.model_id, ref.version) != (
@@ -620,6 +627,28 @@ def promote_supervisor_policy(
         approval=approval,
         expected_revision=expected_revision,
     )
+
+
+def _check_shadow_minimums(
+    shadow_evidence: SupervisorShadowSummary, shadow_config: PolicyShadowConfig
+) -> None:
+    """集計の下限が、昇格の時点の検証済み設定と**値で等しい**ことを確かめる（0074 §2.1）。
+
+    `usable` は集計が持つ下限から導かれるので、緩い `rl-policy.yaml` で作った集計は
+    `usable=True` を名乗れる。**緩いほうだけでなく厳しいほうの食い違いも拒む。**
+    「どちらが安全側か」を昇格の入口で解釈させない。
+    """
+    if not isinstance(shadow_config, PolicyShadowConfig):
+        raise TypeError("shadow の下限は検証済みの PolicyShadowConfig（rl-policy.yaml）で渡す")
+    if not isinstance(shadow_evidence, SupervisorShadowSummary):
+        raise TypeError("shadow の証拠は SupervisorShadowSummary で渡す（文字列では照合できない）")
+    expected = (shadow_config.minimum_ticks.value, shadow_config.minimum_paired_fraction.value)
+    actual = (shadow_evidence.minimum_ticks, shadow_evidence.minimum_paired_fraction)
+    if actual != expected:
+        raise ValueError(
+            "shadow 集計の下限が、いまの rl-policy.yaml の shadow 設定と一致しない"
+            f"（summary={actual}; expected={expected}）"
+        )
 
 
 def _policy_artifact_bytes(artifact: SupervisorPolicyArtifact) -> bytes:

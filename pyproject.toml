@@ -53,6 +53,9 @@ coldaisle-dataset = "coldaisle.dataset:main"
 coldaisle-evaluate = "coldaisle.evaluate:main"
 # Thermal Model の drift 検知と再学習の推奨。**書き込みはしない**（#93 / 決定記録 0056）
 coldaisle-drift = "coldaisle.drift:main"
+# 保存済み trace から Supervisor の Shadow 集計を作る。**DB と Registry を読むだけで、制御へ届かない**
+# （#89 / 決定記録 0074 §2.1）
+coldaisle-supervisor-shadow = "coldaisle.supervisor_shadow:main"
 # Control Model Registry の lifecycle 操作。**読み取りが既定**で、promotion / rollback は
 # 人が書いた承認ファイルを要求する（#104 / 決定記録 0062）
 coldaisle-registry = "coldaisle.registry:main"
