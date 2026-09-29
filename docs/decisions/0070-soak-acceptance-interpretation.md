@@ -1,7 +1,7 @@
 # 決定記録 0070: 連続運転テスト（soak）の受入基準の読み方
 
 - **種別**: Decision Record
-- **Status**: Proposed
+- **Status**: FINAL（2026-09-29、リポジトリ所有者が承認）
 - **Date**: 2026-09-29
 - **Supersedes**: なし
 - **関連**: `docs/requirements.md` NFR-02 / `issues/15-soak-test.md` /
