@@ -180,7 +180,9 @@ thermal_inputs:
   （`minimum_stable_demand` への引き上げ、未起動 zone の `startup_demand`）を掛けた後の、
   PWM へ写す直前の demand（0.0..1.0）とする。`FanHardwareResult` に `applied_demand` を加えて
   backend が返し（実機 backend も同じ Protocol で返す）、`ZoneRecord` にも `applied_demand`
-  （v10 で新設、書き込み結果の無い tick は `None`）として残す。PWM の raw 値から逆算しない
+  （v10 で新設）として残す。書き込み結果の無い tick と、結果があっても `write_ok` / `readback_ok` の
+  どちらかが偽の tick は **`None`** にする（書けていない・確かめられていない指令を「適用した demand」として
+  残さない）。backend が返す `FanHardwareResult.applied_demand` も同じ条件で `None` とする。PWM の raw 値から逆算しない
   （raw への量子化と、実機 backend の写像の違いを記録の定義に持ち込まないため）
 - 次のときは **`None`**（0 にしない）:
   - Air Balance が無効（§2.2）
