@@ -48,7 +48,7 @@ decision trace（`ControlTick`）は、制御デーモンが tick ごとに SQLi
 
 ---
 
-## 2. Decision（推奨案）
+## 2. Decision
 
 ### 2.1 前提: 0030 の承認。承認してほしいのは §2 と §5 の1項目めだけ
 
@@ -375,7 +375,7 @@ decision trace（`ControlTick`）は、制御デーモンが tick ごとに SQLi
 | 4 | `WS /api/v1/control/stream` を足すか | 画面の実運用で周期読み出しが足りないと分かってから |
 | 5 | LLM 向けの集計ツール（`bound_by` / fault / fallback の理由の件数など）の形 | 別の決定記録（0015 / 0018 の続き） |
 | 6 | `RegistryHealthReport.trace_metadata()`（起動時検証の結果）も `registry` の塊に入れるか | #104 の実装 PR。入れるなら同じ版上げに含める |
-| 7 | §2.5 の「tick が使っていた pointer」と `revision` の飛びの検出で、#104 の受入基準「promotion / rollback が decision trace へ残る」を満たすとみなすか。満たさないなら、起動した tick に直前の trace の `revision` 以降の pointer 変更の metadata をすべて載せる（制御デーモンが起動時にストアの最新 trace を読むことになる） | 本記録の承認時に人間が判断する |
+| 7 | §2.5 の「tick が使っていた pointer」と `revision` の飛びの検出で、#104 の受入基準「promotion / rollback が decision trace へ残る」を満たすとみなすか。満たさないなら、起動した tick に直前の trace の `revision` 以降の pointer 変更の metadata をすべて載せる（制御デーモンが起動時にストアの最新 trace を読むことになる） | **決定（2026-09-29 所有者）**: 満たすとみなす。trace には tick が使っていた pointer と `revision` を残し、変更の全履歴は registry の audit を正本とする。制御デーモンは起動時に過去の trace を読まない |
 | 11 | §2.2a の migration の番号、`legacy_until_ms` を migration で求める方法、`rollup` のログに足す件数の項目名 | #106 の実装 PR |
 | 8 | `requirements.md` に FR を足す番号と文言、`api-contract.md` の表 | #106 の実装 PR（本記録は文書を書き換えない） |
 | 9 | SQLite 外への export（0030 §5 の2項目め） | #90 / #91。本記録は扱わない |
