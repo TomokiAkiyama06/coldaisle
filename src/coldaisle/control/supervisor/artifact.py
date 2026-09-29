@@ -27,13 +27,14 @@ action から demand への写像は Learned MPC（#86）と Controller Gate（#
 from __future__ import annotations
 
 import hashlib
+from collections.abc import Mapping
 from datetime import datetime
 from enum import StrEnum
-from typing import Annotated, Literal, Self
+from typing import TYPE_CHECKING, Annotated, Literal, Self
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from coldaisle.control.config import SupervisorOutputBounds
+from coldaisle.control.config import FanPolicyConfig, SafetyConfig, SupervisorOutputBounds
 from coldaisle.control.model.thermal import canonical_json_bytes, canonical_sha256
 from coldaisle.control.model_registry import (
     MODEL_REGISTRY_SCHEMA_VERSION,
@@ -53,9 +54,14 @@ from coldaisle.control.schema import (
     WorkloadRegime,
 )
 from coldaisle.control.supervisor.policy import SupervisorPolicy
-from coldaisle.control.supervisor.policy_config import PolicyShadowConfig
+from coldaisle.control.supervisor.policy_config import PolicyShadowConfig, RlPolicyConfig
 from coldaisle.control.supervisor.rule_identity import RulePolicyIdentity, rule_policy_identity
 from coldaisle.control.supervisor.shadow import SupervisorShadowSummary
+
+if TYPE_CHECKING:
+    from coldaisle.control.evaluation.episode import PolicyEpisodeReport
+    from coldaisle.control.rl.config import RlTrainingConfig
+    from coldaisle.control.rl.episode import PolicyComparison
 
 POLICY_ARTIFACT_SCHEMA_VERSION: Literal[1] = 1
 """`SupervisorPolicyArtifact` の形の版。**欄の意味を変えたら上げる。**"""
@@ -601,14 +607,45 @@ def promote_supervisor_policy(
     _check_shadow_minimums(shadow_evidence, shadow_config)
     identity = certified_identity(certified)
     rule_identity = rule_policy_identity(baseline_rule_policy)
+    _check_registry_record(
+        registry, ref, certified, expected_revision=expected_revision, purpose="昇格"
+    )
+    return registry.promote(
+        ref,
+        compatibility,
+        shadow_evaluation_ref=_shadow_ref_for(identity, rule_identity, shadow_evidence),
+        approval=approval,
+        expected_revision=expected_revision,
+    )
+
+
+def _check_registry_record(
+    registry: ModelRegistry,
+    ref: ArtifactRef,
+    certified: CertifiedPolicyArtifact,
+    *,
+    expected_revision: int,
+    purpose: str,
+) -> None:
+    """Registry の `ref` とその記録が、照合済み artifact そのものを名指すことを確かめる。
+
+    昇格（`promote_supervisor_policy()`）と validated 化（`validate_supervisor_policy()`）が
+    **同じこの照合**を通る（決定記録 0074 §2.3）。**Registry は読むだけで書かない。**
+
+    - `ref` が supervisor policy で、`certified_identity()` の model ID・版を名指す
+    - `expected_revision` の snapshot にその記録があり、checksum（`metadata.sha256`）が
+      `certified_identity().artifact_sha256` と一致する
+    - artifact から導いた metadata と記録の metadata に食い違いが無い
+    """
+    identity = certified_identity(certified)
     if ref.kind is not ArtifactKind.SUPERVISOR_POLICY or (ref.model_id, ref.version) != (
         identity.model_id,
         identity.version,
     ):
-        raise ValueError("昇格する artifact が照合済みの supervisor policy と一致しない")
+        raise ValueError(f"{purpose}する artifact が照合済みの supervisor policy と一致しない")
     snapshot = registry.inspect()
     if snapshot.revision != expected_revision:
-        raise ValueError("registry の revision が昇格の前提と一致しない")
+        raise ValueError(f"registry の revision が{purpose}の前提と一致しない")
     record = snapshot.artifacts.get(ref.key)
     if record is None or record.metadata.sha256 != identity.artifact_sha256:
         raise ValueError("registry に登録された bytes が照合済みの artifact と一致しない")
@@ -616,15 +653,109 @@ def promote_supervisor_policy(
     derived = _derive_policy_registry_metadata(artifact, _policy_artifact_bytes(artifact))
     mismatches = registry_metadata_mismatches(derived, record.metadata)
     if mismatches:
-        # **束縛（`SupervisorPolicyBinding`）と同じ照合を昇格の前にも行う。** checksum だけ見て
-        # 昇格すると、metadata だけ書き換えた記録が production になり、運転時の束縛で拒まれて
-        # Fallback へ落ちる。
+        # **束縛（`SupervisorPolicyBinding`）と同じ照合を昇格・validated 化の前にも行う。**
+        # checksum だけ見て進めると、metadata だけ書き換えた記録が production になり、
+        # 運転時の束縛で拒まれて Fallback へ落ちる。
         raise ValueError(f"registry の metadata が照合済みの artifact と一致しない: {mismatches}")
-    return registry.promote(
+
+
+def validate_supervisor_policy(
+    registry: ModelRegistry,
+    ref: ArtifactRef,
+    *,
+    report: PolicyEpisodeReport,
+    comparison: PolicyComparison,
+    training_config: RlTrainingConfig,
+    fan_policy: FanPolicyConfig,
+    safety: SafetyConfig,
+    policy_config: RlPolicyConfig,
+    certified: Mapping[str, CertifiedPolicyArtifact],
+    target: str,
+    baseline_rule_policy: SupervisorPolicy,
+    actor: str,
+    reason: str,
+    expected_revision: int,
+) -> int:
+    """supervisor policy を validated にする**policy 専用の入口**（決定記録 0074 §2.3）。
+
+    `certified` は比較の**すべての RL arm** について、arm の `policy_version` をキーにした
+    certify 済み artifact の対応で、`target` はその中で validated にする arm のキーである。
+    次をすべて確かめてから、**`ModelRegistry.mark_validated()` を1度だけ**呼ぶ
+    （Registry へ書くのはこの呼び出しだけ）。1つでも満たさなければ拒み、何も書かない。
+
+    - `target` が比較の RL arm で、その artifact の識別が `ref` と Registry の記録に一致する
+      （`_check_registry_record()`。`promote_supervisor_policy()` と同じ照合）
+    - 渡した比較の canonical digest が report の `comparison_sha256` と一致する
+    - その比較・検証済み `rl-policy.yaml`・Rule policy・**全 RL arm** の artifact から
+      `build_policy_episode_report()` で作り直した bytes が、渡した report の bytes と一致する。
+      Baseline の束縛・RL arm の表と action の束縛・1対1 もそこで再び通る
+    - report の設定の digest が、渡した検証済み設定の digest と一致する
+    - report の各 RL arm の識別が、対応する artifact の `certified_identity()` と一致する
+    - `target` の gate が `pass` である（`evaluation_ref()` が拒む）
+
+    **反実仮想 artifact が揃うまで、どの RL arm の gate も `pass` にならない**（evidence の段で
+    `learned_controller_unavailable`）。したがって、いまこの入口は必ず拒む。
+    """
+    # control.evaluation.episode → control.rl → control.supervisor.artifact の循環を避けるため、
+    # 呼ばれた時点で読む（型は TYPE_CHECKING でだけ読む）。
+    from coldaisle.control.evaluation.episode import (
+        PolicyEpisodeReport,
+        build_policy_episode_report,
+    )
+    from coldaisle.control.model.thermal import canonical_json_bytes as _bytes
+    from coldaisle.control.rl.config import RlTrainingConfig
+    from coldaisle.control.rl.episode import EpisodeConfigDigests, PolicyComparison, config_digest
+
+    if not isinstance(report, PolicyEpisodeReport):
+        raise TypeError("episode の証拠は PolicyEpisodeReport で渡す（文字列では照合できない）")
+    if not isinstance(comparison, PolicyComparison):
+        raise TypeError("元の比較は PolicyComparison で渡す")
+    for value, expected_type, name in (
+        (training_config, RlTrainingConfig, "rl-training.yaml"),
+        (fan_policy, FanPolicyConfig, "fan-policy.yaml"),
+        (safety, SafetyConfig, "safety.yaml"),
+        (policy_config, RlPolicyConfig, "rl-policy.yaml"),
+    ):
+        if not isinstance(value, expected_type):
+            raise TypeError(f"{name} は検証済みの設定で渡す")
+    if target not in certified:
+        raise ValueError(f"validated にする arm が artifact の対応に無い（target={target}）")
+    target_certified = certified[target]
+    if not isinstance(target_certified, CertifiedPolicyArtifact):
+        raise TypeError("validated にする artifact は certify() を通したものを渡す")
+    if canonical_sha256(comparison) != report.comparison_sha256:
+        raise ValueError("渡した比較が report の comparison_sha256 と一致しない")
+    expected_digests = EpisodeConfigDigests(
+        rl_training=config_digest(training_config),
+        fan_policy=config_digest(fan_policy),
+        safety=config_digest(safety),
+    )
+    if report.config_digests != expected_digests:
+        # 別の設定で作った episode の結果を、いまの設定での評価として validated にしない。
+        raise ValueError("report の設定の digest が、渡した検証済み設定と一致しない")
+    rebuilt = build_policy_episode_report(
+        comparison,
+        policy_config=policy_config,
+        rule_policy=baseline_rule_policy,
+        certified=certified,
+    )
+    if _bytes(rebuilt) != _bytes(report):
+        # 識別だけ・数字だけを差し替えた report を通さない。
+        raise ValueError("渡した report が、元の比較から作り直した report と bytes で一致しない")
+    for arm in report.arms[1:]:
+        if arm.rl_policy_identity != certified_identity(certified[arm.policy_version]):
+            raise ValueError(
+                f"report の RL arm の識別が artifact と一致しない（{arm.policy_version}）"
+            )
+    evaluation_ref = report.evaluation_ref(target)
+    _check_registry_record(
+        registry, ref, target_certified, expected_revision=expected_revision, purpose="validated に"
+    )
+    return registry.mark_validated(
         ref,
-        compatibility,
-        shadow_evaluation_ref=_shadow_ref_for(identity, rule_identity, shadow_evidence),
-        approval=approval,
+        offline_evaluation_ref=evaluation_ref,
+        actor=actor,
+        reason=reason,
         expected_revision=expected_revision,
     )
 
