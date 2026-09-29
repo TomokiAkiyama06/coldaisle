@@ -375,7 +375,9 @@ def build_input_contract(
     # 取り込まれず毎 tick None になり、熱の制約が黙って効かない。`source.status` にかかわらず
     # 加える（無効の間も、校正後に初めて拒否が見つかる事態を作らない）。すでに契約にある
     # metric は、その重要度・許容遅延のまま使う。
-    for metric in sorted(air_balance_input_metrics(config, catalog)):
+    for metric in sorted(
+        air_balance_input_metrics(config, catalog, t_sensor_metric=t_sensor_metric)
+    ):
         if metric not in specs:
             add(metric, TelemetryImportance.ADVISORY, _advisory_stale_ms(metric, config))
 
@@ -385,12 +387,22 @@ def build_input_contract(
     )
 
 
-def air_balance_input_metrics(config: ControlConfig, catalog: MetricCatalog) -> frozenset[str]:
+def air_balance_input_metrics(
+    config: ControlConfig,
+    catalog: MetricCatalog,
+    *,
+    t_sensor_metric: str | None = None,
+) -> frozenset[str]:
     """`air-balance.yaml` の ``thermal_inputs`` が指す、契約へ加える metric（決定記録 0073 §2.4）。
 
     各 metric が Metric Catalog にあり単位が ``C`` であること、派生値は材料へ展開できること、
-    材料の許容遅延を決められることを確かめる。**決められない metric は拒否する**
-    （起動時の Control Config の不正として扱う。0073 §2.2）。
+    **契約に新しく加わる** metric の許容遅延を決められることを確かめる。**決められない metric は
+    拒否する**（起動時の Control Config の不正として扱う。0073 §2.2）。
+
+    すでに契約にある metric（必須入力と `fan-policy.yaml` の入力）は、その重要度・許容遅延の
+    まま使うので、ここでは許容遅延を求めない。求めると、承認済みの T_SENSOR（源の決まらない
+    ``board.*`` など）を束縛しただけで、契約では扱える設定を拒否してしまう。
+    ``t_sensor_metric`` は `build_input_contract()` に渡すものと同じ値を渡す。
     """
     bindings = config.air_balance.thermal_inputs.metrics()
     for metric in bindings:
@@ -401,9 +413,25 @@ def air_balance_input_metrics(config: ControlConfig, catalog: MetricCatalog) -> 
                 f"metric={metric}, unit={unit}"
             )
     resolved = _resolve_derived(frozenset(bindings), catalog)
-    for metric in resolved:
+    contracted = _contracted_metrics(config, catalog, t_sensor_metric=t_sensor_metric)
+    for metric in resolved - contracted:
         _advisory_stale_ms(metric, config)
     return resolved
+
+
+def _contracted_metrics(
+    config: ControlConfig,
+    catalog: MetricCatalog,
+    *,
+    t_sensor_metric: str | None,
+) -> frozenset[str]:
+    """`air-balance.yaml` より前に契約へ入る metric。`build_input_contract()` と同じ順で数える。"""
+    metrics: set[str] = {CPU_TEMPERATURE_METRIC, GPU_TEMPERATURE_METRIC, CPU_POWER_METRIC}
+    metrics.update(AIR_TEMPERATURE_METRICS)
+    if config.safety.telemetry.t_sensor.enabled.value and t_sensor_metric is not None:
+        metrics.add(t_sensor_metric)
+    metrics.update(_policy_input_metrics(config.policy, catalog))
+    return frozenset(metrics)
 
 
 def _resolve_derived(metrics: frozenset[str], catalog: MetricCatalog) -> frozenset[str]:

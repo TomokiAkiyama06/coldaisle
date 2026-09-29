@@ -527,7 +527,7 @@ def build(
     try:
         # `thermal_inputs` の metric を Catalog で確かめられないのは `air-balance.yaml` の不正で
         # あり、起動環境の問題ではない（決定記録 0073 §2.4 / §2.2）。
-        air_balance_input_metrics(control, catalog)
+        air_balance_input_metrics(control, catalog, t_sensor_metric=config.t_sensor_metric)
     except Exception as error:
         raise ControlConfigInvalidError(str(error)) from error
     try:

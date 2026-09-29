@@ -43,7 +43,12 @@ from test_control_config import (
     valid_documents,
     write_documents,
 )
-from test_control_loop import Harness, control_config
+from test_control_loop import (
+    T_SENSOR_METRIC,
+    Harness,
+    confirmed_safety_document,
+    control_config,
+)
 
 METRICS_PATH = CONFIG_DIR / "metrics.yaml"
 
@@ -280,6 +285,31 @@ def test_unverifiable_bindings_are_rejected(
         air_balance_input_metrics(config, catalog)
 
 
+def test_a_bound_t_sensor_keeps_its_critical_contract(catalog: MetricCatalog) -> None:
+    """承認済みの T_SENSOR を束縛しても拒否しない（0073 §2.4: 既存の metric はそのまま使う）。
+
+    T_SENSOR には源の決まらない ``board.*`` も承認できる。契約に新しく加わる metric だけに
+    許容遅延を求めないと、契約では CRITICAL として扱える設定を起動時に拒否してしまう。
+    """
+    config = control_config(
+        safety=confirmed_safety_document(),
+        air_balance=calibrated_air_balance_document(
+            THERMAL_INPUTS | {"gpu_intake_c": T_SENSOR_METRIC}
+        ),
+    )
+    assert T_SENSOR_METRIC in air_balance_input_metrics(
+        config, catalog, t_sensor_metric=T_SENSOR_METRIC
+    )
+    contract = {
+        spec.metric: spec
+        for spec in build_input_contract(config, catalog, t_sensor_metric=T_SENSOR_METRIC).signals
+    }
+    assert contract[T_SENSOR_METRIC].importance is TelemetryImportance.CRITICAL
+    # T_SENSOR として承認していない ``board.*`` は、契約に新しく加わるので従来どおり拒否する。
+    with pytest.raises(ValueError, match="許容遅延"):
+        air_balance_input_metrics(config, catalog)
+
+
 # ---------------------------------------------------------------- coldaisle-fand の起動
 
 
@@ -325,6 +355,35 @@ def test_the_daemon_treats_an_unverifiable_binding_as_invalid_config(tmp_path: P
     with pytest.raises(ControlConfigInvalidError) as raised:
         build(daemon_config(directory, tmp_path))
     assert not isinstance(raised.value, StartupEnvironmentError)
+
+
+def test_the_daemon_starts_with_a_t_sensor_bound_to_thermal_inputs(tmp_path: Path) -> None:
+    """T_SENSOR の metric を ``thermal_inputs`` に束縛しても `config_invalid` にしない。"""
+    directory = tmp_path / "config"
+    directory.mkdir()
+    documents = confirmed_documents()
+    documents["safety.yaml"] = confirmed_safety_document()
+    documents["air-balance.yaml"] = calibrated_air_balance_document(
+        THERMAL_INPUTS | {"gpu_intake_c": T_SENSOR_METRIC}
+    )
+    write_documents(directory, documents)
+    config = daemon_config(directory, tmp_path)
+    config = Config(
+        config_dir=config.config_dir,
+        db=config.db,
+        metrics=config.metrics,
+        quality_rules=config.quality_rules,
+        t_sensor_metric=T_SENSOR_METRIC,
+        record_trace=False,
+        require_watchdog=False,
+    )
+    daemon = build(config, watchdog=_NoWatchdog())
+    try:
+        daemon.run(max_ticks=1)
+    finally:
+        assert daemon.store is not None
+        daemon.store.close()
+    assert daemon.stats.ticks == 1
 
 
 def test_the_daemon_starts_with_air_balance_disabled_when_uncalibrated(tmp_path: Path) -> None:
