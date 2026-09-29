@@ -14,7 +14,9 @@
   [0064](0064-workload-hint-entry-and-supervisor-prior.md) §2.2（`coldaisle-eventd` は「指令」を受けない） /
   [0066](0066-workload-hint-stage-b-conditions.md)（制御デーモンが自分の表を別の接続で書く前例） /
   AGENTS.md「絶対に守るルール」1〜3・5・6・9・10
-- **対象 Issue**: #92（Authority Stage 切替の管理操作）、#74（運転モードの入口）
+- **対象 Issue**: #92（Authority Stage 切替の管理操作。本記録の PR はこの Issue に属する）
+- **関連 Issue**: #74（運転モードの入口）。本記録は入口の設計を1つに決めるために #74 の受入基準も参照するが、
+  **実装は Issue ごとに別の PR に分ける**（AGENTS.md「1 Issue = 1 ブランチ = 1 PR」。§2.10 の「担当 Issue」列）
 
 ---
 
@@ -82,7 +84,21 @@ GPU Manager などの書き手が入る。モード変更を足すと、その�
   受け渡し口へ置ける。直列にすると、1件の確認待ちや遅いクライアントの読み取り
   （`limits.read_timeout_s`）の間、後から来た `set_mode(max)` や rollback が次の tick の
   受け渡し口に入れず、下の同じ軸の置き換え・合成の規則も働かない
-  （接続の同時数の上限は `limits.max_connections`。超えた接続は閉じて接続ごとのログに残す）
+  （接続の同時数の上限は下の2つに分ける。超えた接続は閉じて接続ごとのログに残す）
+- **安全側の指令が受け渡し口へ届く枠を、待っている接続に食わせない。** 接続を2つの段階に分けて
+  別々に数える
+  - **受信中の接続**（要求の1行を読み終えていない）: 上限 `limits.max_connections`。
+    これを超えた新しい接続だけを閉じる。受信中の接続は `limits.read_timeout_s` で必ず閉じるので、
+    この枠は時間で空く
+  - **受信後の接続**（弱めうる指令の監査の書き込み待ち、適用の確認待ち、応答の送信中）:
+    要求を読み終えた時点で受信中の枠から外し、別の上限 `limits.max_pending_commands` で数える。
+    監査の DB の lock で書き込み待ちが積み上がっても、受信中の枠は減らないので、後から来た
+    `set_mode(max)` や rollback は読まれて受け渡し口へ置かれる
+  - 受信後の枠が埋まっているときは、**向きで分ける**（§2.7）。
+    冷却を弱めうる指令は受け渡し口へ置かず、監査も依頼せずに `busy` で拒否する（接続ごとのログに残す）。
+    安全側の指令は**先に受け渡し口へ置き**（監査の依頼も §2.7 のとおり行う）、適用の確認を待たずに
+    `{"ok": true, "applied": false, "pending": true}` を返して閉じる。安全側の指令が受け渡し口へ
+    届くかどうかは、受信後の枠の空きに依存しない
 - 受付スレッドは loop の状態
   （`ControlLoop` / `ControllerGate` / `AuthorityRuntime`）に**一切触れない**
 - 受付スレッドは検証済みの指令を**受け渡し口**（mailbox）へ置くだけにする。受け渡し口は
@@ -341,7 +357,8 @@ GPU Manager などの書き手が入る。モード変更を足すと、その�
 | `socket.path` / `socket.mode` / `socket.group` | 0045 §2.2 と同じ規則（other のビット・setuid / setgid / sticky は拒否） |
 | `authorization.allow_same_user` | 既定 `false`。`true` は `socket.group: null` の開発用のときだけ許す |
 | `limits.max_message_bytes` / `limits.read_timeout_s` | 0045 と同じ意味 |
-| `limits.max_connections` | 受付スレッドが同時に持つ接続の上限（§2.2） |
+| `limits.max_connections` | 受付スレッドが同時に持つ**受信中**の接続の上限（§2.2） |
+| `limits.max_pending_commands` | 要求を読み終えた後（監査の書き込み待ち・適用の確認待ち・応答の送信中）の接続の上限。受信中の枠とは別に数える（§2.2） |
 | `limits.audit_queue_max` | 監査書き込みスレッドの FIFO の上限（§2.7） |
 | `apply_ack_timeout_ms` | `>= tick_ms + tick_deadline_ms`（起動時に `safety.yaml` と照合） |
 | `manual.max_lease_s` | `MANUAL` の期限に書ける上限。`status` / `basis` 付きの暫定値 |
@@ -365,12 +382,12 @@ GPU Manager などの書き手が入る。モード変更を足すと、その�
 
 ### 2.10 実装の段階
 
-| 段階 | 内容 | 前提 |
-|---|---|---|
-| 1 | 管理ソケット（`AUTO` / `MAX` / `MANUAL` と lease、`status`）・受け渡し口のモードの枠・監査の表と監査書き込みスレッド（§2.7。`MAX` は監査の前に置く）・受付スレッドの生存確認と `admin_receiver_dead` の `MAX`（§2.2。受付スレッドを止めた試験で、次の tick から `MANUAL` が解除されて `forced_max` になり、再起動まで保たれることを確かめる）・`coldaisle-control` クライアント・§2.9 の試験。**この段階では `lower_authority` / `rollback_authority` を受理しない**（`unsupported_op` で拒否） | 本記録の承認 |
-| 2 | `AuthorityRuntime` を `coldaisle-fand` へ配線し、受け渡し口の authority の枠と `lower_authority` / `rollback_authority` の受理を足し、journal の変化を毎 tick 検知する（§2.6） | 段階 1 |
-| 3 | `coldaisle-authority raise` / `rollback` の CLI | 段階 2（昇格が走行中の loop に届くため） |
-| 4 | `CALIBRATION` の受理 | #75 の測定計画の形 |
+| 段階 | 担当 Issue（1段階ずつ別の PR） | 内容 | 前提 |
+|---|---|---|---|
+| 1 | #74 | 管理ソケット（`AUTO` / `MAX` / `MANUAL` と lease、`status`）・受け渡し口のモードの枠・監査の表と監査書き込みスレッド（§2.7。`MAX` は監査の前に置く）・受付スレッドの生存確認と `admin_receiver_dead` の `MAX`（§2.2。受付スレッドを止めた試験で、次の tick から `MANUAL` が解除されて `forced_max` になり、再起動まで保たれることを確かめる）・`coldaisle-control` クライアント・§2.9 の試験。**この段階では `lower_authority` / `rollback_authority` を受理しない**（`unsupported_op` で拒否） | 本記録の承認 |
+| 2 | #92 | `AuthorityRuntime` を `coldaisle-fand` へ配線し、受け渡し口の authority の枠と `lower_authority` / `rollback_authority` の受理を足し、journal の変化を毎 tick 検知する（§2.6） | 段階 1 |
+| 3 | #92 | `coldaisle-authority raise` / `rollback` の CLI | 段階 2（昇格が走行中の loop に届くため） |
+| 4 | #74 | `CALIBRATION` の受理 | #75 の測定計画の形 |
 
 実機で初めてこの入口からモードを変えるのは、0028 §2.9 の承認点 3（実機の制御を初めて取る）の
 確認項目に含める。
@@ -435,7 +452,7 @@ GPU Manager などの書き手が入る。モード変更を足すと、その�
 | 1 | `CALIBRATION` の指令の形（#75 の測定計画をどう参照し、いつ終わるか） | #75 |
 | 2 | Workspace / GUI（#60）に管理ソケットの権限を渡すか。渡すなら §4 の J（安全側だけのグループ）を含めて決める | #60（本記録では渡さない） |
 | 3 | `coldaisle-fand` の実行ユーザー・管理グループ名・`RuntimeDirectory`・`authority.json` のディレクトリの所有者 | 0060 未決 7 / #57（0069 の後続） |
-| 4 | `apply_ack_timeout_ms`・`manual.max_lease_s`・`limits`（`max_connections`・`audit_queue_max` を含む）の値 | 段階 1 の実装で暫定値、運用後に所有者 |
+| 4 | `apply_ack_timeout_ms`・`manual.max_lease_s`・`limits`（`max_connections`・`max_pending_commands`・`audit_queue_max` を含む）の値 | 段階 1 の実装で暫定値、運用後に所有者 |
 | 5 | 昇格の承認者（`StageApproval.approver`）を CLI の実行 uid に束縛するか。束縛するなら journal の版を上げる | #92 の段階 3 |
 | 6 | 監査の表の DDL・migration（`run_id` と `command_id` の組の形を含む）、`ControlTick` の版番号と `admin_receiver_dead` の表し方 | 段階 1 の実装 PR |
 | 7 | いまのモードと stage を読み取り API（Server Health など）に出すか | 別の決定記録（0009 / 0040 の拡張） |
