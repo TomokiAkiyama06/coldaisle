@@ -5,12 +5,14 @@
 1. **欠測率の母数は期間と送信周期から出す**（装置ごと沈黙した時間も欠測に入る）
 2. **閾値は `config/soak.yaml` から読む**（AGENTS.md ルール9）
 3. **分からないものを合格と書かない**（期間が終わっていない・周期が不明）
-4. **DB に書かない**
+4. **DB に書かない**（行・スキーマ・journal_mode のどれも変えない。マイグレーションも当てない）
 
 DB は MockSource / ReplaySource を取り込みデーモンに通して作る。
 """
 
 import json
+import sqlite3
+from contextlib import closing
 from pathlib import Path
 
 import pytest
@@ -20,9 +22,18 @@ from coldaisle.daemon import Daemon
 from coldaisle.ingest import MockSource, Normalizer
 from coldaisle.ingest.calibration import Calibration
 from coldaisle.ingest.replay import ReplaySource
-from coldaisle.soak import SoakConfig, SoakReport, Verdict, build, main, window
-from coldaisle.store import SqliteStore
-from conftest import CONFIG_DIR, QUALITY_RULES_PATH, TEST_EPOCH_MS
+from coldaisle.soak import (
+    SoakConfig,
+    SoakDatabase,
+    SoakDatabaseError,
+    SoakReport,
+    Verdict,
+    build,
+    main,
+    window,
+)
+from coldaisle.store import Quality, SqliteStore
+from conftest import CONFIG_DIR, TEST_EPOCH_MS
 
 INTERVAL_MS = 2_500
 TEN_MINUTES_MS = 600_000
@@ -58,7 +69,7 @@ def ingest_mock(db: Path, rules, scenarios, name: str) -> None:
 def report_for(
     db: Path, rules, config: SoakConfig, *, end_ms: int = TEST_EPOCH_MS + TEN_MINUTES_MS
 ) -> SoakReport:
-    with SqliteStore(db, rules=rules, clock=SimulatedClock(end_ms)) as store:
+    with SoakDatabase(db) as store:
         return build(store, start_ms=TEST_EPOCH_MS, end_ms=end_ms, now_ms=end_ms, config=config)
 
 
@@ -124,7 +135,7 @@ def test_an_unfinished_window_is_not_judged(tmp_path, rules, scenarios, config):
     db = tmp_path / "soak.db"
     ingest_mock(db, rules, scenarios, "ramp")
 
-    with SqliteStore(db, rules=rules, clock=SimulatedClock(TEST_EPOCH_MS)) as store:
+    with SoakDatabase(db) as store:
         report = build(
             store,
             start_ms=TEST_EPOCH_MS,
@@ -143,7 +154,7 @@ def test_an_empty_window_is_not_a_pass(tmp_path, rules, scenarios, config):
     ingest_mock(db, rules, scenarios, "ramp")
     later = TEST_EPOCH_MS + 10 * TEN_MINUTES_MS
 
-    with SqliteStore(db, rules=rules, clock=SimulatedClock(later)) as store:
+    with SoakDatabase(db) as store:
         report = build(
             store,
             start_ms=later - TEN_MINUTES_MS,
@@ -198,7 +209,7 @@ def test_replayed_blank_cells_are_missing(tmp_path, rules, config):
         daemon.store.close()
     start_ms, end_ms = window("2026-08-24T00:00:00", "2026-08-24T00:00:12", config)
 
-    with SqliteStore(db, rules=rules, clock=SimulatedClock(end_ms)) as store:
+    with SoakDatabase(db) as store:
         report = build(store, start_ms=start_ms, end_ms=end_ms, now_ms=end_ms, config=config)
 
     room = next(line for line in report.metrics if line.metric == "air.room")
@@ -217,8 +228,7 @@ def test_main_writes_markdown_and_json_without_touching_the_db(
 ):
     db = tmp_path / "soak.db"
     ingest_mock(db, rules, scenarios, "dropout")
-    with SqliteStore(db, rules=rules, clock=SimulatedClock(TEST_EPOCH_MS)) as store:
-        before = store.readings_digest()
+    before = db_fingerprint(db)
     out_dir = tmp_path / "out"
     soak_yaml = tmp_path / "soak.yaml"
     soak_yaml.write_text(
@@ -236,8 +246,6 @@ def test_main_writes_markdown_and_json_without_touching_the_db(
             str(db),
             "--config",
             str(soak_yaml),
-            "--quality-rules",
-            str(QUALITY_RULES_PATH),
             "--start",
             start,
             "--end",
@@ -258,8 +266,7 @@ def test_main_writes_markdown_and_json_without_touching_the_db(
     markdown = (out_dir / "soak-20260825T090000.md").read_text(encoding="utf-8")
     assert "不合格" in markdown
     assert "RSS" in markdown
-    with SqliteStore(db, rules=rules, clock=SimulatedClock(TEST_EPOCH_MS)) as store:
-        assert store.readings_digest() == before
+    assert db_fingerprint(db) == before
 
 
 def test_main_refuses_a_missing_db(tmp_path):
@@ -281,3 +288,117 @@ def test_main_refuses_a_missing_db(tmp_path):
 def test_end_defaults_to_the_configured_duration(config):
     start_ms, end_ms = window("2026-08-24T09:00", None, config)
     assert end_ms - start_ms == int(config.duration_hours * 3_600_000)
+
+
+# ---------------------------------------------------------------- 読み取り専用で開く
+
+
+def db_fingerprint(db: Path) -> tuple[object, ...]:
+    """行・スキーマ・journal_mode・適用済みの版。**どれか1つでも変われば「書いた」。**"""
+    with closing(sqlite3.connect(f"file:{db}?mode=ro", uri=True)) as conn:
+        return (
+            conn.execute("PRAGMA journal_mode").fetchone()[0],
+            conn.execute("PRAGMA user_version").fetchone()[0],
+            conn.execute("SELECT MAX(version) FROM schema_version").fetchone()[0],
+            tuple(conn.execute("SELECT type, name, sql FROM sqlite_master ORDER BY name")),
+            tuple(conn.execute("SELECT * FROM readings ORDER BY metric, ts_ms")),
+            tuple(conn.execute("SELECT * FROM devices ORDER BY device_id")),
+        )
+
+
+def test_a_non_wal_db_keeps_its_journal_mode(tmp_path, rules, scenarios, config):
+    """`SqliteStore` なら WAL へ切り替えてしまう。**集計はそれをしない。**"""
+    db = tmp_path / "soak.db"
+    ingest_mock(db, rules, scenarios, "ramp")
+    with closing(sqlite3.connect(db, isolation_level=None)) as conn:
+        conn.execute("PRAGMA journal_mode = DELETE")
+    before = db_fingerprint(db)
+    assert before[0] == "delete"
+
+    report_for(db, rules, config)
+
+    assert db_fingerprint(db) == before
+
+
+def test_an_old_schema_is_refused_not_migrated(tmp_path):
+    """古い版の DB を開いてもマイグレーションを当てない。**開かずに落とす。**"""
+    db = tmp_path / "old.db"
+    with closing(sqlite3.connect(db, isolation_level=None)) as conn:
+        conn.execute("CREATE TABLE schema_version (version INTEGER, applied_ms INTEGER)")
+        conn.execute("INSERT INTO schema_version VALUES (1, 0)")
+    before = db_fingerprint_minimal(db)
+
+    with pytest.raises(SoakDatabaseError, match="版が合わない"):
+        SoakDatabase(db)
+
+    assert db_fingerprint_minimal(db) == before
+
+
+def db_fingerprint_minimal(db: Path) -> tuple[object, ...]:
+    with closing(sqlite3.connect(f"file:{db}?mode=ro", uri=True)) as conn:
+        return (
+            conn.execute("PRAGMA journal_mode").fetchone()[0],
+            tuple(conn.execute("SELECT type, name, sql FROM sqlite_master ORDER BY name")),
+            tuple(conn.execute("SELECT * FROM schema_version")),
+        )
+
+
+def test_main_refuses_an_old_schema(tmp_path):
+    db = tmp_path / "old.db"
+    with closing(sqlite3.connect(db, isolation_level=None)) as conn:
+        conn.execute("CREATE TABLE schema_version (version INTEGER, applied_ms INTEGER)")
+    with pytest.raises(SystemExit):
+        main(
+            [
+                "--db",
+                str(db),
+                "--config",
+                str(CONFIG_DIR / "soak.yaml"),
+                "--start",
+                "2026-08-24T00:00",
+            ]
+        )
+
+
+def test_quality_counts_boundaries(tmp_path, rules):
+    """値の無い `ok` 行はどこにも数えない。範囲は `[start, end)` で end ちょうどは含まない。"""
+    db = tmp_path / "counts.db"
+    SqliteStore(db, rules=rules, clock=SimulatedClock(TEST_EPOCH_MS)).close()
+    metric = "air.room"
+    start, end = TEST_EPOCH_MS, TEST_EPOCH_MS + 10_000
+    with closing(sqlite3.connect(db, isolation_level=None)) as conn:
+        conn.executemany(
+            "INSERT INTO readings (metric, ts_ms, value, quality) VALUES (?, ?, ?, ?)",
+            [
+                (metric, start - 1, 24.0, "ok"),  # 範囲の前
+                (metric, start, 24.0, "ok"),
+                (metric, start + 1_000, None, "ok"),  # 値の無い ok
+                (metric, start + 2_000, None, "missing"),
+                (metric, start + 3_000, -127.0, "suspect"),
+                (metric, start + 4_000, 24.1, "stale"),
+                (metric, end - 1, 24.2, "ok"),
+                (metric, end, 24.3, "ok"),  # end ちょうど
+                ("air.front_intake", start + 5_000, 24.0, "ok"),  # 別のメトリクス
+            ],
+        )
+
+    with SoakDatabase(db) as database:
+        counts = database.quality_counts(metric, start, end)
+
+    assert counts == {Quality.OK: 2, Quality.MISSING: 1, Quality.SUSPECT: 1, Quality.STALE: 1}
+
+
+def test_an_interval_announced_after_the_window_is_not_judged(tmp_path, rules, scenarios, config):
+    """周期は起動バナーのたびに上書きされる。**期間より後の値で合否を出さない。**"""
+    db = tmp_path / "soak.db"
+    ingest_mock(db, rules, scenarios, "ramp")
+    end_ms = TEST_EPOCH_MS + TEN_MINUTES_MS
+    with closing(sqlite3.connect(db, isolation_level=None)) as conn:
+        conn.execute("UPDATE devices SET interval_ms = 5000, last_hello_ms = ?", (end_ms + 1,))
+
+    report = report_for(db, rules, config)
+
+    assert report.interval_after_window
+    assert report.checks[0].verdict is Verdict.UNKNOWN
+    assert "期間より後" in report.as_markdown()
+    assert report.as_dict()["interval_after_window"] is True

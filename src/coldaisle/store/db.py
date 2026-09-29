@@ -1054,42 +1054,13 @@ class SqliteStore:
         """
         if metric not in METRIC_TO_CHANNEL:
             return None
-        interval_ms = self.latest_interval_ms()
-        if interval_ms is None:
-            return None
-        return bucket_ms // interval_ms
-
-    def latest_interval_ms(self) -> int | None:
-        """直近の起動バナーが申告した送信周期（決定記録 0002 §2.8）。
-
-        期待サンプル数の元になる。起動バナーを1度も受け取っていなければ `None`。
-        """
         row = self._conn.execute(
             "SELECT interval_ms FROM devices WHERE interval_ms IS NOT NULL "
             "ORDER BY last_hello_ms DESC LIMIT 1"
         ).fetchone()
-        return None if row is None else int(row[0])
-
-    def quality_counts(self, metric: str, start_ms: int, end_ms: int) -> dict[Quality, int]:
-        """窓 `[start_ms, end_ms)` の生データを品質ごとに数える（#47）。
-
-        `ok` は**値を持つ行だけ**を数える（`Stats.ok_value_count` と同じ母数。
-        決定記録 0002 §2.8）。値の無い `ok` 行は `missing` にも入れない。
-        ロールアップは `suspect` の件数を持たないため、生データから数える。
-        """
-        validate_metric(metric)
-        self._check_range(start_ms, end_ms)
-        rows = self._conn.execute(
-            "SELECT quality, COUNT(*) AS n FROM readings "
-            "WHERE metric = ? AND ts_ms >= ? AND ts_ms < ? "
-            "  AND (quality != 'ok' OR value IS NOT NULL) "
-            "GROUP BY quality",
-            (metric, start_ms, end_ms),
-        ).fetchall()
-        counts = dict.fromkeys(Quality, 0)
-        for row in rows:
-            counts[Quality(row["quality"])] = int(row["n"])
-        return counts
+        if row is None:
+            return None
+        return bucket_ms // int(row[0])
 
     def stats(self, metric: str, start_ms: int, end_ms: int) -> Stats:
         """窓 `[start_ms, end_ms)` の統計量（FR-303）。

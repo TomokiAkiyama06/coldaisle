@@ -1,6 +1,10 @@
 """連続運転テスト（soak）の集計（#47 / issues/15-soak-test.md）。
 
 **既存の DB を読むだけ。** 取り込み・ロールアップ・通知のどれにも触らない。
+DB は `SqliteStore` ではなく**読み取り専用の接続**で開く（`SoakDatabase`）。
+`SqliteStore` は開くだけで WAL への切り替えとマイグレーションを当てるので、
+実機から持ち帰った DB を集計した瞬間にスキーマが上がってしまう。
+
 24時間連続運転のあとに `coldaisle-soak-report` を1回呼び、人が読む Markdown と
 機械が読む JSON を残す。
 
@@ -12,6 +16,7 @@
 欠測率は「届くはずのサンプルのうち、`ok` の値として届かなかった割合」
 （決定記録 0002 §2.8 と同じ分子）。**母数は期間の長さと送信周期から出す。**
 行の数を母数にすると、装置ごと沈黙していた時間が欠測に数えられない。
+判定の単位（最も悪いチャネル）・母数・再起動の数え方は決定記録 0070 に従う。
 
 **この集計に無いもの**（DB に記録経路が無い。#47 の対象外）:
 
@@ -24,12 +29,16 @@ from __future__ import annotations
 import argparse
 import json
 import logging
-from collections.abc import Sequence
+import sqlite3
+from collections.abc import Iterator, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from enum import StrEnum
 from pathlib import Path
+from types import TracebackType
 from typing import Any
+from urllib.parse import quote
 from zoneinfo import ZoneInfo
 
 import yaml
@@ -43,8 +52,7 @@ from coldaisle.channels import (
     QUEUE_DROPS_METRIC,
 )
 from coldaisle.clock import Clock, WallClock
-from coldaisle.store import Quality, SqliteStore
-from coldaisle.store.quality import QualityRules
+from coldaisle.store import Quality, migrations
 
 LOGGER = logging.getLogger("coldaisle.soak")
 
@@ -153,6 +161,8 @@ class SoakReport:
     end_ms: int
     timezone: str
     interval_ms: int | None
+    interval_hello_ms: int | None
+    """`interval_ms` を申告した起動バナーの受信時刻。**どの時点の周期か**を示す。"""
     complete: bool
     """期間の終わりが集計時刻より前か。**終わっていない期間は判定しない。**"""
     metrics: tuple[MetricLine, ...]
@@ -160,6 +170,11 @@ class SoakReport:
     device_restarts: int
     queue_drops: int
     checks: tuple[Check, ...]
+
+    @property
+    def interval_after_window(self) -> bool:
+        """周期を申告した起動バナーが期間より後か。**期間中の周期と違うかもしれない。**"""
+        return self.interval_hello_ms is not None and self.interval_hello_ms >= self.end_ms
 
     @property
     def has_data(self) -> bool:
@@ -196,6 +211,11 @@ class SoakReport:
                 "complete": self.complete,
             },
             "interval_ms": self.interval_ms,
+            "interval_hello": (
+                None if self.interval_hello_ms is None else self._local(self.interval_hello_ms)
+            ),
+            "interval_hello_ms": self.interval_hello_ms,
+            "interval_after_window": self.interval_after_window,
             "verdict": self.verdict.value,
             "checks": [
                 {
@@ -238,7 +258,7 @@ class SoakReport:
             "# 連続運転テスト（soak）集計",
             "",
             f"- 期間: {self._local(self.start_ms)} 〜 {self._local(self.end_ms)}",
-            f"- 送信周期: {'不明' if self.interval_ms is None else f'{self.interval_ms} ms'}",
+            f"- 送信周期: {self._interval_text()}",
             f"- 判定（DB で判定できる項目）: **{_VERDICT_LABEL[self.verdict]}**",
             "",
         ]
@@ -277,6 +297,14 @@ class SoakReport:
         lines += [f"- {item}" for item in NOT_COVERED]
         return "\n".join(lines).rstrip() + "\n"
 
+    def _interval_text(self) -> str:
+        if self.interval_ms is None or self.interval_hello_ms is None:
+            return "不明"
+        text = f"{self.interval_ms} ms（{self._local(self.interval_hello_ms)} の起動バナー）"
+        if self.interval_after_window:
+            text += " **期間より後の値。期間中の周期とは限らない**"
+        return text
+
 
 def _count(value: int | None) -> str:
     return "—" if value is None else str(value)
@@ -289,8 +317,107 @@ def _ratio(value: float | None) -> str:
 # ---------------------------------------------------------------------- 集計
 
 
+class SoakDatabaseError(RuntimeError):
+    """集計する DB を開けない（SQLite ではない・スキーマの版が合わない）。"""
+
+
+class SoakDatabase:
+    """soak の集計が読む DB。**開いても行もスキーマも変えない。**
+
+    `mode=ro` の URI で開く。soak はデーモンが書いている最中にも走らせるので、
+    静止した DB を前提にする `immutable=1`（evaluate.py の `EvidenceDatabase`）は
+    使えない。WAL の DB では SQLite が `-shm` / `-wal` の添え file を作ることがあるが、
+    DB の中身（行・スキーマ・journal_mode）は変わらない。
+
+    **マイグレーションは当てない。** 版が合わなければ開かずに落とす。
+    """
+
+    __slots__ = ("_conn",)
+
+    def __init__(self, path: Path) -> None:
+        uri = f"file:{quote(str(path.resolve()))}?mode=ro"
+        try:
+            self._conn = sqlite3.connect(uri, uri=True, isolation_level=None)
+            self._conn.row_factory = sqlite3.Row
+            version = migrations.current_version(self._conn)
+        except sqlite3.Error as error:
+            raise SoakDatabaseError(f"DB を読み取り専用で開けない: {path}") from error
+        known = len(migrations.discover())
+        if version != known:
+            self.close()
+            raise SoakDatabaseError(
+                f"DB のスキーマの版が合わない（DB={version}; コード={known}）: {path}。"
+                "**集計は DB を書き換えないので移行もしない。** 取り込みデーモンで開いて"
+                "移行するか、同じ版のコードで集計する"
+            )
+
+    def close(self) -> None:
+        self._conn.close()
+
+    def __enter__(self) -> SoakDatabase:
+        return self
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: TracebackType | None,
+    ) -> None:
+        self.close()
+
+    @contextmanager
+    def read_snapshot(self) -> Iterator[None]:
+        """ブロック内の読み出しを1つのスナップショットにそろえる（`SqliteStore` と同じ）。"""
+        self._conn.execute("BEGIN DEFERRED")
+        try:
+            yield
+        finally:
+            self._conn.execute("COMMIT")
+
+    def latest_interval(self) -> tuple[int, int] | None:
+        """直近の起動バナーが申告した `(interval_ms, last_hello_ms)`（決定記録 0002 §2.8）。
+
+        `devices` は起動バナーのたびに上書きされ、過去の周期は残らない。
+        そのため**いつの値か**を一緒に返し、期間より後なら呼び出し側が判定しない。
+        """
+        row = self._conn.execute(
+            "SELECT interval_ms, last_hello_ms FROM devices "
+            "WHERE interval_ms IS NOT NULL AND last_hello_ms IS NOT NULL "
+            "ORDER BY last_hello_ms DESC LIMIT 1"
+        ).fetchone()
+        return None if row is None else (int(row[0]), int(row[1]))
+
+    def quality_counts(self, metric: str, start_ms: int, end_ms: int) -> dict[Quality, int]:
+        """窓 `[start_ms, end_ms)` の生データを品質ごとに数える。
+
+        `ok` は**値を持つ行だけ**を数える（`Stats.ok_value_count` と同じ母数。
+        決定記録 0002 §2.8）。値の無い `ok` 行はどの品質にも数えない。
+        ロールアップは `suspect` の件数を持たないため、生データから数える。
+        """
+        rows = self._conn.execute(
+            "SELECT quality, COUNT(*) AS n FROM readings "
+            "WHERE metric = ? AND ts_ms >= ? AND ts_ms < ? "
+            "  AND (quality != 'ok' OR value IS NOT NULL) "
+            "GROUP BY quality",
+            (metric, start_ms, end_ms),
+        ).fetchall()
+        counts = dict.fromkeys(Quality, 0)
+        for row in rows:
+            counts[Quality(row["quality"])] = int(row["n"])
+        return counts
+
+    def event_total(self, metric: str, start_ms: int, end_ms: int) -> int:
+        """事象メトリクスの合計。**起きたときしか書かれない**ので、行が無ければ 0 件。"""
+        row = self._conn.execute(
+            "SELECT COALESCE(SUM(value), 0) FROM readings "
+            "WHERE metric = ? AND ts_ms >= ? AND ts_ms < ?",
+            (metric, start_ms, end_ms),
+        ).fetchone()
+        return round(float(row[0]))
+
+
 def build(
-    store: SqliteStore,
+    store: SoakDatabase,
     *,
     start_ms: int,
     end_ms: int,
@@ -300,29 +427,38 @@ def build(
     """期間 `[start_ms, end_ms)` を集計して判定する。**DB には書かない。**"""
     if start_ms >= end_ms:
         raise ValueError(f"期間が空か逆転している: start_ms={start_ms} end_ms={end_ms}")
-    interval_ms = store.latest_interval_ms()
+    interval = store.latest_interval()
+    interval_ms = None if interval is None else interval[0]
     expected = None if interval_ms is None else (end_ms - start_ms) // interval_ms
     metrics = tuple(
         _metric_line(store, metric, start_ms, end_ms, expected) for metric in PERIODIC_METRICS
     )
     counters = {
-        metric: _event_total(store, metric, start_ms, end_ms)
+        metric: store.event_total(metric, start_ms, end_ms)
         for metric in (DROPPED_SAMPLES_METRIC, DEVICE_RESTART_METRIC, QUEUE_DROPS_METRIC)
     }
     complete = end_ms <= now_ms
     has_data = any(line.rows > 0 for line in metrics)
+    interval_after_window = interval is not None and interval[1] >= end_ms
     return SoakReport(
         start_ms=start_ms,
         end_ms=end_ms,
         timezone=config.timezone,
         interval_ms=interval_ms,
+        interval_hello_ms=None if interval is None else interval[1],
         complete=complete,
         metrics=metrics,
         dropped_samples=counters[DROPPED_SAMPLES_METRIC],
         device_restarts=counters[DEVICE_RESTART_METRIC],
         queue_drops=counters[QUEUE_DROPS_METRIC],
         checks=(
-            _missing_check(metrics, config.thresholds, complete=complete, has_data=has_data),
+            _missing_check(
+                metrics,
+                config.thresholds,
+                complete=complete,
+                has_data=has_data,
+                interval_after_window=interval_after_window,
+            ),
             _restart_check(
                 counters[DEVICE_RESTART_METRIC],
                 config.thresholds,
@@ -334,7 +470,7 @@ def build(
 
 
 def _metric_line(
-    store: SqliteStore, metric: str, start_ms: int, end_ms: int, expected: int | None
+    store: SoakDatabase, metric: str, start_ms: int, end_ms: int, expected: int | None
 ) -> MetricLine:
     counts = store.quality_counts(metric, start_ms, end_ms)
     return MetricLine(
@@ -347,17 +483,18 @@ def _metric_line(
     )
 
 
-def _event_total(store: SqliteStore, metric: str, start_ms: int, end_ms: int) -> int:
-    """事象メトリクスの合計。**起きたときしか書かれない**ので、行が無ければ 0 件。"""
-    return round(
-        sum(point.value for point in store.series(metric, start_ms, end_ms) if point.value)
-    )
-
-
 def _missing_check(
-    metrics: Sequence[MetricLine], thresholds: Thresholds, *, complete: bool, has_data: bool
+    metrics: Sequence[MetricLine],
+    thresholds: Thresholds,
+    *,
+    complete: bool,
+    has_data: bool,
+    interval_after_window: bool,
 ) -> Check:
-    """**最も悪いチャネル**で判定する。平均すると、1本だけ死んだプローブが薄まる。"""
+    """**最も悪いチャネル**で判定する（決定記録 0070 §2.1）。
+
+    平均すると、1本だけ死んだプローブが薄まる。
+    """
     name = "欠測率（最も悪いチャネル）"
     limit = f"< {thresholds.missing_ratio_below * 100:g}%"
     ratios = [(line.missing_ratio, line.metric) for line in metrics]
@@ -370,6 +507,11 @@ def _missing_check(
     display = _ratio(worst)
     if not complete or not has_data:
         return Check(name, worst, display, limit, Verdict.UNKNOWN, _why_unknown(complete))
+    if interval_after_window:
+        # 周期は起動バナーのたびに上書きされる。期間より後のバナーの値は、
+        # 期間中の周期とは限らない（決定記録 0070 §2.2）
+        note = "送信周期が期間より後の起動バナーの値（期間中の周期とは限らない）"
+        return Check(name, worst, display, limit, Verdict.UNKNOWN, note)
     verdict = Verdict.PASS if worst < thresholds.missing_ratio_below else Verdict.FAIL
     return Check(name, worst, display, limit, verdict, metric)
 
@@ -433,7 +575,6 @@ def main(argv: Sequence[str] | None = None, *, clock: Clock | None = None) -> in
     )
     parser.add_argument("--db", type=Path, default=Path("var/coldaisle.db"))
     parser.add_argument("--config", type=Path, default=Path("config/soak.yaml"))
-    parser.add_argument("--quality-rules", type=Path, default=Path("config/quality.yaml"))
     parser.add_argument("--start", required=True, help="期間の始まり（ISO 8601）")
     parser.add_argument("--end", help="期間の終わり（ISO 8601）。既定は duration_hours 後")
     parser.add_argument("--no-write", action="store_true", help="ファイルに書かない")
@@ -451,14 +592,14 @@ def main(argv: Sequence[str] | None = None, *, clock: Clock | None = None) -> in
     start_ms, end_ms = window(args.start, args.end, config)
     clock = clock or WallClock()
 
-    store = SqliteStore(args.db, rules=QualityRules.from_yaml(args.quality_rules), clock=clock)
     try:
-        with store.read_snapshot():
-            report = build(
-                store, start_ms=start_ms, end_ms=end_ms, now_ms=clock.now_ms(), config=config
-            )
-    finally:
-        store.close()
+        database = SoakDatabase(args.db)
+    except SoakDatabaseError as error:
+        parser.error(str(error))
+    with database, database.read_snapshot():
+        report = build(
+            database, start_ms=start_ms, end_ms=end_ms, now_ms=clock.now_ms(), config=config
+        )
 
     paths: tuple[Path, Path] | None = None
     if not args.no_write:
