@@ -121,6 +121,13 @@ decision trace（`ControlTick`）は、制御デーモンが tick ごとに SQLi
   - offset 方式は採らない。制御デーモンが末尾へ追記し、`coldaisle-rollup` が先頭を消すあいだに、
     offset はずれて行を飛ばす・重ねる
   - `after` の行が保持期間で消えていても、比較は値で行うので続きから読める
+- **2ページ目以降は期間を固定する。** `after` を付けた要求は `from` と `to` の両方を必須とし、
+  `window` との同時指定、または `from` / `to` の欠けは 422 で拒否する。呼び出し側は1ページ目の応答の
+  `from_ms` / `to_ms` をそのまま渡す
+  - `window` はリクエストごとに `now` から解くので、ページをまたいで使うと下限が進んで未読の行を飛ばし、
+    上限も進んで行が足され続け、列が終わらない。「途中が欠けない」（下の `has_more`）が崩れる
+  - cursor に期間を埋め込む案は採らない。`after` は主キーの値だけを表し、期間は要求の側で見えるほうが
+    読み手の取り違えに気付きやすい（§4 M）
 - **上限を超えたら `has_more: true` を返し、黙って落とさない。** `/events` の「古い側を落として
   `truncated`」は採らない（§4）。trace は判断の証拠で、途中が欠けた列は事故調査に使えない
 - `limit` の既定と上限は環境変数（0009 §2.9 と同じ理由。`uvicorn` に引数を渡せない）。
@@ -172,6 +179,15 @@ decision trace（`ControlTick`）は、制御デーモンが tick ごとに SQLi
 - **いまの制御デーモンは起動時にしか registry を読まない。** promotion / rollback が trace に現れるのは、
   それを反映して再起動した最初の tick からである。これは正しい。trace は「判断がどの artifact で出たか」の
   記録であり、pointer を動かした瞬間の記録ではない（それは audit の役割）
+- **trace が持つのは「tick が使っていた pointer」だけで、pointer 変更の全件ではない。** 再起動のあいだに
+  promotion と rollback が両方起きると、どの tick にも使われなかった途中の pointer は trace に現れない。
+  本記録は「すべての promotion / rollback が trace に残る」とは主張しない
+  - 取りこぼしは trace から**検出できる。** registry の `revision` は audit の件数と一致し、1から連続する
+    （`ModelRegistrySnapshot` の検証）。隣り合う trace の `revision` が飛んでいれば、その間の変更は
+    `coldaisle-registry audit --pointer-changes` で `revision` の範囲を指定して全件引ける
+  - これで #104 の受入基準「promotion / rollback が decision trace へ残る」を満たすとみなすかは、
+    人間の判断に委ねる（§5 #7）。満たさないと判断した場合の代案（起動した tick に、直前の trace の
+    `revision` 以降の pointer 変更の metadata をすべて載せる）も §5 #7 に置く
 
 ### 2.6 古さの判定は読む側で、周期は trace 自身から取る
 
@@ -186,7 +202,10 @@ decision trace（`ControlTick`）は、制御デーモンが tick ごとに SQLi
 ### 2.7 ヒントの塊（#107）は §2.3 の `body` に入るだけ。専用の口を作らない
 
 - 塊の中身と閉じた語彙は 0064 §2.9（`age_ms` の定義は 0066）で決まっている。本記録は足さない・減らさない
-- 全文（`note` / `source` / `peer_uid`）は既存の `GET /api/v1/events` にある。画面は `event_id` で突き合わせる
+- `note` と `source` は既存の `GET /api/v1/events` の `payload` にある。画面は `event_id` で突き合わせる
+- **`peer_uid` は HTTP では引けない。** `EventOut` は監査のためだけに DB へ残す `peer_uid` を意図して出さない
+  （`coldaisle.api.models.EventOut`）。本記録はこれを変えない。書き込んだ接続の uid が要る監査は、
+  ホスト上でストアを直接読む運用者の作業とする
 - **trace の API からヒントを書く・消す経路は無い**（§2.2。書く入口は 0045 のソケットだけ）
 - #107 の Stage B の前提1（0064 §2.10）は、§2.1 の 0030 の承認で「保存の形が決まっている」状態になる。
   前後比較に要る読み出しは Offline Evaluation がストアから直接行うので、Stage B は本記録の API の実装を待たない
@@ -212,8 +231,9 @@ decision trace（`ControlTick`）は、制御デーモンが tick ごとに SQLi
 - #106 の画面が、模擬データと同じ `page.control` の形を実 trace から作れる。変換は画面の1か所
 - 「なぜこの回転数か」を、`/control/traces` で前後の tick まで辿れる。途中が黙って欠けない（§2.2）
 - `ControlTick` の版を上げても `/api/v1` の形は変わらない。API の版と trace の版が独立する（§2.3）
-- #104 の「promotion / rollback が trace へ残る」が、束縛していない識別子を作らずに満たせる。
-  どの tick がどの昇格の下で出たかが、保持期間の中のどの tick からも言える（§2.5）
+- どの tick がどの昇格の下で出たかが、束縛していない識別子を作らずに、保持期間の中のどの tick からも言える。
+  tick に使われなかった pointer 変更は trace に載らないが、`revision` の飛びで検出でき audit で全件引ける（§2.5）。
+  これで #104 の受入基準を満たすとみなすかは §5 #7
 - #107 は 0030 の承認で Stage B の前提1が満たされる（§2.1 / §2.7）
 
 ### 悪くなること・その緩和
@@ -224,6 +244,8 @@ decision trace（`ControlTick`）は、制御デーモンが tick ごとに SQLi
 | 1 tick の JSON を丸ごと返すので応答が大きい | `limit` の上限を環境変数で絞る。履歴の俯瞰は `series`（メトリクス）で行い、trace は drill-down に使う |
 | `registry` の塊を毎 tick 載せると保存量が増える | 載せるのは kind の数（数個）ぶんの sha と path を含まない metadata だけ。起動した tick だけに載せる案は、保持期間で証拠が消えるので採らない（§4） |
 | promotion は再起動するまで trace に現れない | trace は「判断がどの artifact で出たか」の記録。pointer を動かした時刻・理由は audit にあり、`revision` で突き合わせられる |
+| 再起動のあいだに複数の pointer 変更があると、途中の変更は trace に載らない | `revision` は audit の件数と一致して連続するので、隣り合う trace の飛びで検出し、audit で全件引ける（§2.5 / §5 #7） |
+| 2ページ目以降に `window` を使えない | 1ページ目の応答が `from_ms` / `to_ms` を返すので、それを渡すだけでよい。黙って行が飛ぶより、422 で気付けるほうを選ぶ（§2.2） |
 | API が trace を検証し直さないので、壊れた意味の trace も返す | 書き手は制御デーモンだけで、保存時に型を通っている。SQLite の CHECK が JSON object であることを保証する。読み手は `schema_version` で分岐する |
 | 古さの判定が API（`/health`）と画面で別の場所にある | `/control/latest` は `age_ms` と周期（`body.runtime`）を必ず返し、判定の倍数は設定で1か所に置く |
 
@@ -245,6 +267,7 @@ decision trace（`ControlTick`）は、制御デーモンが tick ごとに SQLi
 | **J. trace を AI ツールに足す（`get_control_traces`）** | FR-504 / ルール 8。生の時系列をプロンプトへ入れる経路になる。説明が要るなら集計済みのツールを別に決める（§2.8） |
 | **K. 読み取り API が `safety.yaml` を読んで古さを判定する** | 読み取り API が制御の設定に依存する。周期は trace 自身（v8 の `runtime`）が持っている |
 | **L. 0030 の承認を待たずに本記録だけを FINAL にする** | 保存の形が変わりうる前提の上に API の契約を固定することになる。承認してほしい範囲を §2.1 に絞った |
+| **M. `after` の cursor に `from` / `to` を埋め込む** | cursor が不透明になり、読み手がどの期間を読んでいるかを要求から読めない。期間を要求に明示させ、`window` との併用を拒否すれば同じ固定が得られる（§2.2） |
 
 ---
 
@@ -258,6 +281,7 @@ decision trace（`ControlTick`）は、制御デーモンが tick ごとに SQLi
 | 4 | `WS /api/v1/control/stream` を足すか | 画面の実運用で周期読み出しが足りないと分かってから |
 | 5 | LLM 向けの集計ツール（`bound_by` / fault / fallback の理由の件数など）の形 | 別の決定記録（0015 / 0018 の続き） |
 | 6 | `RegistryHealthReport.trace_metadata()`（起動時検証の結果）も `registry` の塊に入れるか | #104 の実装 PR。入れるなら同じ版上げに含める |
+| 7 | §2.5 の「tick が使っていた pointer」と `revision` の飛びの検出で、#104 の受入基準「promotion / rollback が decision trace へ残る」を満たすとみなすか。満たさないなら、起動した tick に直前の trace の `revision` 以降の pointer 変更の metadata をすべて載せる（制御デーモンが起動時にストアの最新 trace を読むことになる） | 本記録の承認時に人間が判断する |
 | 7 | 保持期間の境界（いま読める最古の `ts_ms`）を応答に含めるか | #106 の実装 PR |
 | 8 | `requirements.md` に FR を足す番号と文言、`api-contract.md` の表 | #106 の実装 PR（本記録は文書を書き換えない） |
 | 9 | SQLite 外への export（0030 §5 の2項目め） | #90 / #91。本記録は扱わない |
