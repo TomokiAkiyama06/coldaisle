@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import ast
 import json
+import os
 from pathlib import Path
 from typing import Any
 
@@ -392,6 +393,36 @@ def test_a_rejected_run_leaves_an_earlier_output_untouched(setup: Fixture) -> No
 
     assert main(setup.argv()) == 1
     assert setup.out.read_bytes() == earlier
+
+
+def test_concurrent_writers_do_not_share_a_temporary_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """同じ `--out` へ同時に書いても、**各 run は自分の包みを置く**（一時ファイルを共有しない）。
+
+    1つ目の run が置き換える直前に2つ目の run が書き終える、という割り込みを再現する。
+    一時ファイルの名前が固定だと、1つ目は2つ目の中身を置くか、移動済みで失敗する。
+    """
+    import coldaisle.supervisor_shadow as shadow
+
+    out = tmp_path / "shadow.json"
+    monkeypatch.setattr(shadow, "render", lambda report: report)
+    real_replace = os.replace
+    interleaved: list[bool] = []
+
+    def replace(src: Any, dst: Any) -> None:
+        if not interleaved:
+            interleaved.append(True)
+            shadow.write(b"second", out)  # type: ignore[arg-type]
+            assert out.read_bytes() == b"second"
+        real_replace(src, dst)
+
+    monkeypatch.setattr(shadow.os, "replace", replace)
+    shadow.write(b"first", out)  # type: ignore[arg-type]
+
+    assert interleaved == [True]
+    assert out.read_bytes() == b"first"
+    assert list(tmp_path.glob(f".{out.name}*")) == []
 
 
 def test_an_index_that_disagrees_with_the_body_rejects_the_run(setup: Fixture) -> None:

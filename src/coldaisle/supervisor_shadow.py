@@ -27,6 +27,7 @@ from __future__ import annotations
 import argparse
 import logging
 import os
+import tempfile
 from collections.abc import Iterable
 from pathlib import Path
 from typing import Any, Literal, Self
@@ -346,11 +347,15 @@ def write(report: SupervisorShadowRunReport, path: Path) -> Path:
 
     同じディレクトリの一時ファイルへ書いてから置き換える。途中で落ちても `path` に
     書きかけの包みが残らず、`path` が変わるのは書き出しが最後まで済んだときだけになる。
+    一時ファイルは呼び出しごとに排他的に作る。同じ `--out` へ2つの run が同時に書いても、
+    互いの一時ファイルを上書きして**他の run の包みを自分の成功として置く**ことがない。
     """
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(f".{path.name}.tmp")
+    fd, name = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
+    tmp = Path(name)
     try:
-        tmp.write_bytes(render(report))
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(render(report))
         os.replace(tmp, path)
     finally:
         tmp.unlink(missing_ok=True)
