@@ -393,6 +393,7 @@ decision trace のヒントの塊が持つ `event_id` から元の `note` / `sou
 期間で引いた一覧は上限を超えると古い側を落とすため、長く効いているヒントの元の event を確実には引けません。
 404 のとき画面は `note` / `source` を「記録が残っていない」と出してください。**「無し」と言わない**でください。
 書き込んだ接続の uid（`peer_uid`）は返しません。
+`id` は `1` 以上 `2^63-1` 以下の整数です。範囲外は 422 です（SQLite の整数に収まらない値で 500 にしないため）。
 
 ### `GET /api/v1/control/latest` と `GET /api/v1/control/traces`
 
@@ -472,6 +473,10 @@ Unix ソケットだけ。決定記録 0028 §2.2）。制御デーモンが止�
   応答 `{"detail": "…", "retained_from_ms": …}` の `retained_from_ms` を `from` にして、`after` なしで読み直してください
 - `limit` の既定と上限は環境変数 `COLDAISLE_CONTROL_TRACE_LIMIT`（既定 `100`）と
   `COLDAISLE_CONTROL_TRACE_MAX_LIMIT`（既定 `500`）。上限を超える `limit` は 422 です
+- **狭い期間を掘り下げるための口です。** 各ページで期間内の行を `seq` の順に並べ直すため
+  （本文は読まず、`(ts_ms, seq)` の索引だけを使います）、`window=7d` / `30d` のような広い期間を
+  最後まで辿ると、行数に対して2乗に近い手間がかかります
+- `from` / `to` は `0` 以上 `2^63-1` 以下です。範囲外は 422 です
 
 ### `GET /api/v1/metrics`
 

@@ -25,6 +25,7 @@ from coldaisle.clock import SimulatedClock
 from coldaisle.control.schema import SCHEMA_VERSION, ControlTick
 from coldaisle.store import (
     ControlTraceCursorPrunedError,
+    ControlTracePruneState,
     EventRecord,
     QualityRules,
     SqliteStore,
@@ -504,6 +505,75 @@ def test_the_store_checks_the_cursor_inside_one_snapshot(store: SqliteStore) -> 
     assert not store.connection.in_transaction, "読み取りトランザクションを閉じる"
 
 
+def test_the_page_is_read_from_the_snapshot_taken_before_a_concurrent_prune(
+    store: SqliteStore,
+    db: Path,
+    rules: QualityRules,
+    clock: SimulatedClock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """判定と読み出しの間に別プロセスの削除が挟まっても、判定した断面で読む（0071 §2.2）。
+
+    `read_snapshot` を外すと、判定は削除前の境界で通り、読み出しは削除後の行を返すので、
+    `seq` 2 が 409 にならずに黙って欠ける。この試験はそれを捕まえる。
+    """
+    for tick in range(4):
+        record(store, NOW_MS + tick * 1_000, tick)
+    original = SqliteStore.control_trace_prune_state
+
+    with SqliteStore(db, rules=rules, clock=clock) as rollup:
+
+        def prune_in_between(self: SqliteStore) -> ControlTracePruneState:
+            state = original(self)
+            if self is store:
+                # 読み手が境界を読んだ直後に、rollup が seq 1〜3 を消して確定させる
+                assert rollup.delete_control_traces_before(NOW_MS + 3_000) == 3
+            return state
+
+        monkeypatch.setattr(SqliteStore, "control_trace_prune_state", prune_in_between)
+        page = store.control_trace_page(0, NOW_MS + 60_000, after_seq=1, limit=10)
+
+    assert [trace.seq for trace in page.traces] == [2, 3, 4], "削除前の断面で一貫して読む"
+    monkeypatch.setattr(SqliteStore, "control_trace_prune_state", original)
+    with pytest.raises(ControlTraceCursorPrunedError):
+        store.control_trace_page(0, NOW_MS + 60_000, after_seq=1, limit=10)
+
+
+def test_a_writer_from_before_the_migration_fails_loudly(store: SqliteStore) -> None:
+    """移行前のコードの `INSERT OR IGNORE`（seq なし）は黙って捨てられず例外になる。
+
+    OR IGNORE の NOT NULL 違反は rowcount=0 になり「重複」と見分けられない。制御ループの
+    `trace_failed` として数えられるよう、trigger の RAISE(ABORT) で IntegrityError にする。
+    """
+    with pytest.raises(sqlite3.IntegrityError, match="seq is required"):
+        store.connection.execute(
+            "INSERT OR IGNORE INTO control_traces (ts_ms, tick_id, schema_version, trace_json) "
+            "VALUES (?, 1, 9, '{}')",
+            (NOW_MS,),
+        )
+    assert record(store, NOW_MS, 1) is True, "今の書き手は seq を渡すので通る"
+
+
+def test_a_wide_range_page_does_not_scan_the_trace_bodies(store: SqliteStore) -> None:
+    """期間内の並べ替えは `seq` だけの被覆索引で行い、JSON 本体を読まない（#106 レビュー）。"""
+    plan = [
+        row[3]
+        for row in store.connection.execute(
+            "EXPLAIN QUERY PLAN SELECT seq FROM control_traces "
+            "INDEXED BY ix_control_traces_ts_seq "
+            "WHERE ts_ms >= 0 AND ts_ms < 1 AND seq > 0 ORDER BY seq LIMIT 101"
+        )
+    ]
+    assert any("COVERING INDEX ix_control_traces_ts_seq" in step for step in plan), plan
+
+
+@pytest.mark.parametrize("name", ["from", "to"])
+def test_a_range_bound_beyond_sqlite_integers_is_422(client: TestClient, name: str) -> None:
+    params: dict[str, Any] = {"from": 0, "to": NOW_MS}
+    params[name] = 2**63
+    assert client.get("/api/v1/control/traces", params=params).status_code == 422
+
+
 # ---------------------------------------------------------------- /events/{id}
 
 
@@ -531,6 +601,12 @@ def test_an_event_can_be_looked_up_by_id_without_the_peer_uid(
 
 def test_a_missing_event_is_404(client: TestClient) -> None:
     assert client.get("/api/v1/events/12345").status_code == 404
+
+
+@pytest.mark.parametrize("event_id", ["0", "99999999999999999999"])
+def test_an_event_id_outside_sqlite_integers_is_422(client: TestClient, event_id: str) -> None:
+    """2^63-1 を超える ID を SQLite に渡すと OverflowError で 500 になるため、手前で止める。"""
+    assert client.get(f"/api/v1/events/{event_id}").status_code == 422
 
 
 # ---------------------------------------------------------------- 境界（読み取り専用・層・LLM）

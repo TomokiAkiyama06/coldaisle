@@ -69,3 +69,20 @@ DROP INDEX ix_control_traces_tick;
 DROP TABLE control_traces;
 ALTER TABLE control_traces_seq RENAME TO control_traces;
 CREATE INDEX ix_control_traces_tick ON control_traces (tick_id, ts_ms);
+
+-- `seq` は書き手が必ず渡す。既定値を持たせると、移行前のコードを読み込んだまま動く
+-- 制御デーモンの `INSERT OR IGNORE`（seq を指定しない）が NOT NULL 違反になり、OR IGNORE で
+-- **黙って捨てられる**（rowcount=0 を「重複」と見分けられない）。RAISE(ABORT) は OR IGNORE でも
+-- 握りつぶされず IntegrityError になるので、制御ループの `trace_failed` として数えられ、ログに出る
+-- （0071 の「黙って欠けない」）
+CREATE TRIGGER control_traces_require_seq
+BEFORE INSERT ON control_traces
+WHEN NEW.seq IS NULL
+BEGIN
+    SELECT RAISE(ABORT, 'control_traces.seq is required (restart the writer after migration)');
+END;
+
+-- 期間で絞って `seq` 順に並べる読み取り（`/api/v1/control/traces`）用。WITHOUT ROWID の主キー
+-- B-tree は trace_json 本体を持つため、主キーで期間を走査すると並べ替えのために JSON ごと読む。
+-- この索引で期間内の `seq` だけを拾って並べ、1ページ分の本文だけを引く（#106 レビュー）
+CREATE INDEX ix_control_traces_ts_seq ON control_traces (ts_ms, seq);

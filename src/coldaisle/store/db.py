@@ -615,9 +615,14 @@ class SqliteStore:
             prune = self.control_trace_prune_state()
             if after_seq is not None and after_seq < prune.pruned_through_seq:
                 raise ControlTraceCursorPrunedError(prune.retained_from_ms)
+            # 2段に分ける。主キー（WITHOUT ROWID）は trace_json 本体を持つので、期間で走査して
+            # 並べ替えると期間内の JSON をすべて読む。`ix_control_traces_ts_seq` で期間内の seq
+            # だけを並べ、1ページ分の本文だけを `seq` の UNIQUE 索引で引く（#106 レビュー）
             rows = self._conn.execute(
-                f"SELECT {_SEQUENCED_TRACE_COLUMNS} FROM control_traces "
-                "WHERE ts_ms >= ? AND ts_ms < ? AND seq > ? ORDER BY seq LIMIT ?",
+                f"SELECT {_SEQUENCED_TRACE_COLUMNS} FROM control_traces WHERE seq IN ("
+                "    SELECT seq FROM control_traces INDEXED BY ix_control_traces_ts_seq"
+                "    WHERE ts_ms >= ? AND ts_ms < ? AND seq > ? ORDER BY seq LIMIT ?"
+                ") ORDER BY seq",
                 (start_ms, end_ms, after_seq or 0, limit + 1),
             ).fetchall()
         traces = tuple(_sequenced_trace(row) for row in rows[:limit])

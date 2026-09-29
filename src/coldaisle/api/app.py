@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Annotated, Any, Protocol
 
 from fastapi import FastAPI, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
+from fastapi import Path as PathParam
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 
@@ -494,7 +495,7 @@ def create_app(
         )
 
     @app.get("/api/v1/events/{event_id}", response_model=EventOut)
-    def get_event(event_id: int) -> EventOut:
+    def get_event(event_id: int = PathParam(ge=1, le=SQLITE_MAX_INTEGER)) -> EventOut:
         """ID で1件の事象を引く（#106 / 決定記録 0071 §2.7）。
 
         trace のヒントの塊が持つ `event_id` から、元の `note` / `source` を引くために使う。
@@ -538,8 +539,9 @@ def create_app(
         responses={409: {"model": ControlTracesPrunedResponse}},
     )
     def get_control_traces(
-        from_ms: int | None = Query(default=None, alias="from"),
-        to_ms: int | None = Query(default=None, alias="to"),
+        # SQLite の整数に収まらない値は 500（OverflowError）ではなく 422 にする
+        from_ms: int | None = Query(default=None, alias="from", ge=0, le=SQLITE_MAX_INTEGER),
+        to_ms: int | None = Query(default=None, alias="to", ge=0, le=SQLITE_MAX_INTEGER),
         window: str | None = None,
         after: str | None = None,
         limit: int | None = Query(default=None, ge=1),
