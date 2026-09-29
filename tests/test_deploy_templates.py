@@ -155,6 +155,14 @@ def test_the_api_listens_on_loopback_only():
     assert "--host 127.0.0.1" in exec_start
 
 
+def test_the_api_reads_the_same_db_the_writers_write():
+    """env ファイルの COLDAISLE_DB が Environment= を上書きしても、API は書き手と同じ DB を読む。"""
+    unit = parse_unit(SYSTEMD / "coldaisle-api.service")
+    exec_start = one(unit, "Service", "ExecStart")
+    assert exec_start.startswith("/usr/bin/env COLDAISLE_DB=/var/lib/coldaisle/coldaisle.db ")
+    assert not any("COLDAISLE_DB" in v for v in unit["Service"].get("Environment", []))
+
+
 # ---------------------------------------------------------------- udev
 
 

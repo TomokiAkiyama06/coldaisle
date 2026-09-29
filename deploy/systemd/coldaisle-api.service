@@ -18,8 +18,10 @@ WorkingDirectory=/opt/coldaisle
 StateDirectory=coldaisle
 StateDirectoryMode=0750
 EnvironmentFile=-/etc/coldaisle/coldaisle.env
-Environment=COLDAISLE_DB=/var/lib/coldaisle/coldaisle.db
-ExecStart=/opt/coldaisle/.venv/bin/uvicorn coldaisle.api:app --host 127.0.0.1 --port 8000
+# DB の置き場は ExecStart の env で固定する。Environment= に書くと、EnvironmentFile= の
+# COLDAISLE_DB が順序によらず上書きし（systemd の仕様）、書き手の daemon / rollup / report と
+# 別の DB を読んでしまう。env ファイルに COLDAISLE_DB があっても、ここでの値が勝つ。
+ExecStart=/usr/bin/env COLDAISLE_DB=/var/lib/coldaisle/coldaisle.db /opt/coldaisle/.venv/bin/uvicorn coldaisle.api:app --host 127.0.0.1 --port 8000
 
 Restart=always
 RestartSec=5
