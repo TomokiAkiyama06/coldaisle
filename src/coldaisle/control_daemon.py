@@ -537,6 +537,13 @@ def build(
             require=config.require_watchdog,
         )
     )
+    safety = CriticalSafety(
+        control.safety,
+        input_contract=contract,
+        runtime_binding=binding,
+        approved_t_sensor_metric=config.t_sensor_metric,
+        metric_catalog=catalog if config.t_sensor_metric is not None else None,
+    )
     loop = ControlLoop(
         config=control,
         estimator=ControlStateEstimator(contract, catalog),
@@ -552,13 +559,7 @@ def build(
             authority=authority,
         ),
         guard=ReactiveGuard(control.policy.reactive_guard, catalog),
-        safety=CriticalSafety(
-            control.safety,
-            input_contract=contract,
-            runtime_binding=binding,
-            approved_t_sensor_metric=config.t_sensor_metric,
-            metric_catalog=catalog if config.t_sensor_metric is not None else None,
-        ),
+        safety=safety,
         composer=DemandComposer(control.safety),
         backend=backend_factory(control.fan_hardware, binding),
         telemetry=StoreTelemetrySource(store, frozenset(spec.metric for spec in contract.signals)),
@@ -572,7 +573,7 @@ def build(
         authority=authority,
         watchdog=deadman,
     )
-    _log_configuration(control)
+    _log_configuration(control, safety)
     return ControlDaemon(loop=loop, monotonic=monotonic, store=store)
 
 
@@ -606,8 +607,13 @@ def run_config_invalid_max(
     return ControlStats(ticks=1, emergency_max=True)
 
 
-def _log_configuration(control: ControlConfig) -> None:
-    """起動時に暫定値の位置を出す（0028 §2.8）。**値そのものは出さない。**"""
+def _log_configuration(control: ControlConfig, safety: CriticalSafety) -> None:
+    """起動時に暫定値の位置を出す（0028 §2.8）。**値そのものは出さない。**
+
+    Critical Safety の裁定の前提（設定で外した入力の理由と、暫定値を含むか）も同じ行に
+    出す。decision trace（`ControlTick` v9 の `safety_provenance`）と同じ内容を、tick が
+    1つも保存されないまま止まった起動でも追えるようにするため（#78）。
+    """
     provisional = control.provisional_values()
     LOGGER.info(
         "制御設定を読み込んだ",
@@ -618,6 +624,10 @@ def _log_configuration(control: ControlConfig) -> None:
                 "tick_deadline_ms": control.safety.tick_deadline_ms.value,
                 "authority_stage_ceiling": control.policy.authority_stage.value,
                 "provisional_values": [f"{item.source}:{item.path}" for item in provisional],
+                "safety_config_is_provisional": safety.config_is_provisional,
+                "safety_disabled_inputs": [
+                    reason.model_dump(mode="json") for reason in safety.disabled_inputs
+                ],
             }
         },
     )

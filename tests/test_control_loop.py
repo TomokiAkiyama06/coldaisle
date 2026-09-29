@@ -935,6 +935,28 @@ def test_invariant_12_tick_overrun_is_detected_and_recorded(catalog) -> None:
     assert runtime.snapshot_schema_version >= 1
 
 
+def test_invariant_12_the_trace_records_the_premise_of_the_safety_decision(catalog) -> None:
+    """Critical Safety の裁定の前提を**判断と同じ行に**残す（`ControlTick` v9。#78）。
+
+    設定で外した入力（T_SENSOR）と暫定値の有無が trace に無いと、確定値で全入力を
+    見ていた期間の trace と区別できない（docs/critical-safety.md の本番有効化の blocker）。
+    """
+    harness = Harness(catalog)
+
+    results = [harness.tick(), harness.settle()]
+
+    safety = harness.loop._safety
+    for result in results:
+        provenance = result.tick.safety_provenance
+        assert provenance is not None
+        assert provenance.disabled_inputs == safety.disabled_inputs
+        assert provenance.config_is_provisional is safety.config_is_provisional
+        assert "t_sensor_disabled" in {reason.code for reason in provenance.disabled_inputs}
+    recorded = json.loads(harness.trace.rows[-1])
+    assert recorded["schema_version"] == 9
+    assert recorded["safety_provenance"]["disabled_inputs"][0]["code"] == "t_sensor_disabled"
+
+
 def test_invariant_12_a_recorded_overrun_cannot_disagree_with_its_duration() -> None:
     """記録した超過の有無を、同じ行の所要時間と食い違わせられない。"""
     from coldaisle.control.schema import ControlConfigDigest, ControlTickRuntime
@@ -1648,6 +1670,46 @@ def test_invariant_23_the_daemon_composition_always_wires_a_deadman(tmp_path: Pa
             daemon.store.close()
 
     assert main([*_argv(tmp_path), "--require-watchdog"]) == EXIT_WATCHDOG_UNAVAILABLE
+
+
+def test_invariant_23_the_startup_log_carries_the_premise_of_the_safety_decision(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """起動ログに Safety の裁定の前提を構造化で出す（#78）。
+
+    tick が1つも保存されないまま止まった起動でも、T_SENSOR を外していたか・暫定値で
+    回そうとしていたかを追えるようにする。decision trace と同じ内容である。
+    """
+    documents = valid_documents()
+    documents["fan-hardware.yaml"] = json.loads(hardware_config().model_dump_json())
+    write_documents(tmp_path, documents)
+    config = Config(
+        config_dir=tmp_path,
+        db=tmp_path / "control.db",
+        metrics=METRICS_PATH,
+        quality_rules=CONFIG_DIR / "quality.yaml",
+    )
+
+    with caplog.at_level("INFO", logger="coldaisle"):
+        daemon = build(config)
+    try:
+        safety = daemon.loop._safety
+        fields = [
+            getattr(record, logs.FIELDS_KEY)
+            for record in caplog.records
+            if record.getMessage() == "制御設定を読み込んだ"
+        ]
+        assert len(fields) == 1
+        assert fields[0]["safety_config_is_provisional"] is safety.config_is_provisional
+        assert fields[0]["safety_disabled_inputs"] == [
+            reason.model_dump(mode="json") for reason in safety.disabled_inputs
+        ]
+        assert "t_sensor_disabled" in {item["code"] for item in fields[0]["safety_disabled_inputs"]}
+        # JSON Lines へそのまま書ける形であること（AGENTS.md「ログは構造化」）。
+        json.dumps(fields[0])
+    finally:
+        if daemon.store is not None:
+            daemon.store.close()
 
 
 def _watchdog_env(address: str, usec_ms: int, *, pid: int | None = None) -> dict[str, str]:

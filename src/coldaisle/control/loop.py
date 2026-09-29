@@ -78,6 +78,7 @@ from coldaisle.control.schema import (
     OperatingMode,
     PerZone,
     Reason,
+    SafetyProvenance,
     SafetyState,
     ShadowRecord,
     SupervisorDecision,
@@ -676,6 +677,12 @@ class ControlLoop:
                 deadline_exceeded=overrun,
                 snapshot_schema_version=snapshot.schema_version,
                 config=self._config_digest,
+            ),
+            # **裁定の前提を判断と同じ行に残す**（v9。#78）。T_SENSOR を外していた期間や
+            # 暫定値で回っていた期間を、確定値の trace と混ぜないため。
+            safety_provenance=SafetyProvenance(
+                disabled_inputs=safety_decision.disabled_inputs,
+                config_is_provisional=safety_decision.config_is_provisional,
             ),
         )
         recorded, trace_failed = self._record(tick)
