@@ -48,6 +48,7 @@ from coldaisle.control.model_registry import (
 )
 from coldaisle.control.rl.episode import TerminationReason
 from coldaisle.control.rl.training import (
+    TRAINING_REPORT_SCHEMA_VERSION,
     SupervisorPolicyTrainer,
     SupervisorPolicyTrainingError,
     SupervisorPolicyTrainingReport,
@@ -955,6 +956,17 @@ def test_the_training_report_cannot_claim_promotable_it_does_not_derive(trained:
         SupervisorPolicyTrainingReport.model_validate_json(
             json.dumps({**json.loads(report.model_dump_json()), "promotable": True})
         )
+
+
+def test_a_v1_training_report_is_refused_by_its_own_version(trained: Any) -> None:
+    """#105 で入れ子の比較の形が変わったので、v1 の報告は**報告の版**で拒む（0074 §2.2）。"""
+    report = report_for(trained, (episode_spec(episode_id="pr105-v", seed=3),))
+    assert report.schema_version == TRAINING_REPORT_SCHEMA_VERSION == 2
+    with pytest.raises(ValidationError) as caught:
+        SupervisorPolicyTrainingReport.model_validate_json(
+            json.dumps({**json.loads(report.model_dump_json()), "schema_version": 1})
+        )
+    assert any(error["loc"] == ("schema_version",) for error in caught.value.errors())
 
 
 def test_the_training_report_cannot_claim_an_improvement_it_does_not_derive(

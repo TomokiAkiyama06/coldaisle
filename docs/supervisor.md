@@ -86,3 +86,29 @@ rl_artifact: {model_id: rl-supervisor, version: 0.1.0}
 
 RL worker と `expected_rl_identity` の配線が無い間は、RL の提案がすべて欠落か識別の不一致になり、
 集計は `usable=False` になる（0074 §3）。それが正しい振る舞いである。
+
+## Validated 化（`validate_supervisor_policy()`。#105 / 決定記録 0074 §2.3）
+
+supervisor policy を #104 の validated にする入口は `validate_supervisor_policy()`
+（`control/supervisor/artifact.py`）だけにする。入力は `PolicyEpisodeReport`・**元の
+`PolicyComparison`**・検証済みの `rl-training.yaml` / `fan-policy.yaml` / `safety.yaml` /
+`rl-policy.yaml`・**比較のすべての RL arm** の certify 済み artifact の対応・その中で validated に
+する arm（`target`）・Baseline の Rule policy・Registry の `ref` と `expected_revision`。
+
+次を1つでも満たさなければ拒み、**Registry へ何も書かない**。
+
+- 渡した比較を**JSON として読み戻して検証し直す**（`revalidated_comparison()`。`model_copy` などで
+  validator を迂回した比較をここで拒む）。以降の照合はすべて読み戻した比較で行う
+- 比較の canonical digest が report の `comparison_sha256` と一致する
+- その比較・`rl-policy.yaml`・Rule policy・全 RL arm の artifact から作り直した report の bytes が、
+  渡した report の bytes と一致する（Baseline・表と action の束縛・1対1 の照合も再び通る）
+- report の設定の digest が、渡した検証済み設定の digest と一致する
+- `target` の gate が `pass` である
+- `ref` が supervisor policy で `certified_identity()` の model ID・版を名指し、`expected_revision`
+  の snapshot の記録の checksum と metadata が artifact と一致する（`promote_supervisor_policy()`
+  と同じ照合）
+
+通れば `ModelRegistry.mark_validated()` を1度だけ呼び、`offline_evaluation_ref` に
+`supervisor-episode:<digest>` を記録する。**いまは反実仮想 artifact が無いので gate が必ず
+`blocked` になり、この入口は必ず拒む**（0074 §3）。#104 の `mark_validated()` を直接呼ぶ経路
+（0062 の CLI）は残余として残る。supervisor policy の validated 化はこの入口でだけ行う。
