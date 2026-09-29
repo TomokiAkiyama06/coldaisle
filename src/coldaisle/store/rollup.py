@@ -78,6 +78,8 @@ class Result:
     """実際に削除の基準にした時刻。安全弁で手前に引き戻された場合はその値。"""
     deleted_control_traces: int = 0
     control_trace_cutoff_ms: int | None = None
+    future_control_traces: int = 0
+    """実行時刻より未来の ``ts_ms`` を持つ trace の件数。時計の異常の手がかり（0071 §2.2a）。"""
 
 
 def rollup_minutes(
@@ -435,7 +437,10 @@ def run(
     hours = rollup_hours(store)
     deleted, cutoff = apply_retention(store, rules, now_ms=now_ms)
     trace_cutoff = max(0, now_ms - rules.control_trace_retention_ms)
+    # 削除は `ts_ms < cutoff` のまま。削除の境界（`control_trace_prune`）は store が
+    # 同じトランザクションで進める（決定記録 0071 §2.2a）
     deleted_traces = store.delete_control_traces_before(trace_cutoff)
+    future_traces = store.count_control_traces_after(now_ms)
     return Result(
         minute_buckets=minutes,
         hour_buckets=hours,
@@ -443,6 +448,7 @@ def run(
         cutoff_ms=cutoff,
         deleted_control_traces=deleted_traces,
         control_trace_cutoff_ms=trace_cutoff,
+        future_control_traces=future_traces,
     )
 
 
@@ -507,6 +513,7 @@ def main(
                     "deleted_control_traces": result.deleted_control_traces,
                     "control_trace_cutoff_ms": result.control_trace_cutoff_ms,
                     "control_trace_days": rules.control_trace_days,
+                    "future_control_traces": result.future_control_traces,
                 }
             },
         )

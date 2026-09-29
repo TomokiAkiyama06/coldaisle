@@ -21,6 +21,8 @@ from pathlib import Path
 from typing import Annotated, Any, Protocol
 
 from fastapi import FastAPI, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
+from fastapi import Path as PathParam
+from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from coldaisle.api.airflow import (
@@ -35,6 +37,11 @@ from coldaisle.api.compute_mode_advisory import (
 )
 from coldaisle.api.models import (
     AlertsResponse,
+    ControlLatestResponse,
+    ControlLatestTraceOut,
+    ControlTraceOut,
+    ControlTracesPrunedResponse,
+    ControlTracesResponse,
     DerivedLabelOut,
     DeviceOut,
     DevicesResponse,
@@ -77,7 +84,15 @@ from coldaisle.internal_telemetry import (
     ProcStatAdapter,
 )
 from coldaisle.metrics import MetricCatalog, compute_derived
-from coldaisle.store import Aggregation, Quality, QualityRules, SqliteStore
+from coldaisle.store import (
+    Aggregation,
+    ControlTraceCursorPrunedError,
+    EventRecord,
+    Quality,
+    QualityRules,
+    SequencedControlTrace,
+    SqliteStore,
+)
 from coldaisle.store.db import FIVE_MINUTES_MS, HOUR_MS, MINUTE_MS
 from coldaisle.store.models import EVENT_KIND_PATTERN, LatestReading, validate_metric
 
@@ -88,6 +103,10 @@ DEFAULT_SAMPLE_INTERVAL_MS = 2_500
 """起動バナーを受け取れていないときの想定周期。点数の見積りにだけ使う。"""
 
 WINDOW_PATTERN = re.compile(r"^(\d+)([smhd])$")
+CURSOR_PATTERN = re.compile(r"^(0|[1-9][0-9]{0,18})$")
+"""`/control/traces` の `after`。`seq` を10進で表した文字列（決定記録 0071 §2.2）。"""
+SQLITE_MAX_INTEGER = 2**63 - 1
+"""SQLite の INTEGER の上限。`seq` はこれを超えない。"""
 _WINDOW_UNITS = {"s": 1_000, "m": 60_000, "h": 3_600_000, "d": 86_400_000}
 
 _BUCKET_MS = {
@@ -140,6 +159,17 @@ class Config:
     """1レスポンスの最大点数。超えるなら粗い粒度へ自動で落とす（受入基準）。"""
     stream_poll_s: float = 1.0
     """WebSocket が新着を見に行く間隔。"""
+    control_trace_limit: int = 100
+    """`/control/traces` の `limit` の既定（決定記録 0071 §2.2 / §5 #2）。"""
+    control_trace_max_limit: int = 500
+    """`/control/traces` の `limit` の上限。1 tick の JSON を丸ごと返し応答が大きい（0071 §3）。"""
+
+    def __post_init__(self) -> None:
+        if not 1 <= self.control_trace_limit <= self.control_trace_max_limit:
+            raise ValueError(
+                "control trace の limit は 1 <= 既定 <= 上限 にする: "
+                f"{self.control_trace_limit} / {self.control_trace_max_limit}"
+            )
 
     @classmethod
     def from_env(cls) -> Config:
@@ -157,6 +187,12 @@ class Config:
             airflow_ui=Path(os.environ.get("COLDAISLE_AIRFLOW_UI", str(cls.airflow_ui))),
             max_points=int(os.environ.get("COLDAISLE_MAX_POINTS", cls.max_points)),
             stream_poll_s=float(os.environ.get("COLDAISLE_STREAM_POLL_S", cls.stream_poll_s)),
+            control_trace_limit=int(
+                os.environ.get("COLDAISLE_CONTROL_TRACE_LIMIT", cls.control_trace_limit)
+            ),
+            control_trace_max_limit=int(
+                os.environ.get("COLDAISLE_CONTROL_TRACE_MAX_LIMIT", cls.control_trace_max_limit)
+            ),
         )
 
 
@@ -455,16 +491,108 @@ def create_app(
             from_ms=start,
             to_ms=end,
             truncated=truncated,
-            events=[
-                EventOut(
-                    id=record.id or 0,
-                    ts_ms=record.ts_ms,
-                    ts=iso(record.ts_ms),
-                    kind=record.kind,
-                    payload=json.loads(record.payload_json),
+            events=[_event_out(record) for record in kept],
+        )
+
+    @app.get("/api/v1/events/{event_id}", response_model=EventOut)
+    def get_event(event_id: int = PathParam(ge=1, le=SQLITE_MAX_INTEGER)) -> EventOut:
+        """ID で1件の事象を引く（#106 / 決定記録 0071 §2.7）。
+
+        trace のヒントの塊が持つ `event_id` から、元の `note` / `source` を引くために使う。
+        期間で引いた一覧との突き合わせでは、期間外・上限で落とした側の event を引けない。
+        無ければ（保持期間で消えた・存在しない）**404**。`peer_uid` は返さない。
+        """
+        record = provider.get().event(event_id)
+        if record is None:
+            raise HTTPException(404, f"event が見つからない: {event_id}")
+        return _event_out(record)
+
+    @app.get("/api/v1/control/latest", response_model=ControlLatestResponse)
+    def get_control_latest() -> ControlLatestResponse:
+        """最後に記録した1 tick の decision trace（#106 / 決定記録 0071 §2.2）。
+
+        **読み取り専用。** 制御の状態を変える入口ではない（モード変更は `coldaisle-fand` の
+        Unix ソケットだけ。0028 §2.2）。制御デーモンが止まっていても動き、trace が無ければ
+        `trace: null` を返す。`body` は保存した JSON をそのまま返す（0071 §2.3 / §2.4）。
+        **LLM のプロンプトへ直接入れない**（FR-504 / 0071 §2.8）。
+        """
+        store = provider.get()
+        trace = store.latest_control_trace()
+        if trace is None:
+            return ControlLatestResponse(trace=None)
+        return ControlLatestResponse(
+            trace=ControlLatestTraceOut(
+                seq=trace.seq,
+                ts_ms=trace.ts_ms,
+                ts=iso(trace.ts_ms),
+                tick_id=trace.tick_id,
+                schema_version=trace.schema_version,
+                body=json.loads(trace.trace_json),
+                # 丸めない。時計が戻った直後の負の値も、そのまま返す（0071 §2.2）
+                age_ms=store.clock.now_ms() - trace.ts_ms,
+            )
+        )
+
+    @app.get(
+        "/api/v1/control/traces",
+        response_model=ControlTracesResponse,
+        responses={409: {"model": ControlTracesPrunedResponse}},
+    )
+    def get_control_traces(
+        # SQLite の整数に収まらない値は 500（OverflowError）ではなく 422 にする
+        from_ms: int | None = Query(default=None, alias="from", ge=0, le=SQLITE_MAX_INTEGER),
+        to_ms: int | None = Query(default=None, alias="to", ge=0, le=SQLITE_MAX_INTEGER),
+        window: str | None = None,
+        after: str | None = None,
+        limit: int | None = Query(default=None, ge=1),
+    ) -> ControlTracesResponse | JSONResponse:
+        """`ts_ms` が期間内の decision trace を記録した順（`seq` の昇順）で（決定記録 0071 §2.2）。
+
+        - 期間は `[from, to)` で、`ts_ms` の絞り込みにだけ使う。並びとページングは `seq`
+        - `after` は直前のページの `next_after`。付けるときは `from` と `to` の両方が要り、
+          `window` は使えない（ページをまたいで期間が動くと行を飛ばす）
+        - 上限を超えたら `has_more: true`。**黙って落とさない**
+        - `after` より後ろの行が保持期間の削除で消えた可能性があれば **409**
+        - **LLM のプロンプトへ直接入れない**（FR-504 / 0071 §2.8）
+        """
+        after_seq: int | None = None
+        if after is not None:
+            if CURSOR_PATTERN.match(after) is None:
+                raise HTTPException(422, f"after の書式が不正: {after!r}（seq の10進表記）")
+            if window is not None or from_ms is None or to_ms is None:
+                raise HTTPException(
+                    422, "after を付けるときは from と to の両方を指定し、window は使わない"
                 )
-                for record in kept
-            ],
+            after_seq = int(after)
+            if after_seq > SQLITE_MAX_INTEGER:
+                raise HTTPException(422, f"after が大きすぎる: {after!r}")
+        used_limit = settings.control_trace_limit if limit is None else limit
+        if used_limit > settings.control_trace_max_limit:
+            raise HTTPException(
+                422, f"limit は {settings.control_trace_max_limit} 以下にする: {used_limit}"
+            )
+        store = provider.get()
+        start, end = _resolve_range(store, from_ms, to_ms, window)
+        try:
+            page = store.control_trace_page(start, end, after_seq=after_seq, limit=used_limit)
+        except ControlTraceCursorPrunedError as error:
+            return JSONResponse(
+                status_code=409,
+                content=ControlTracesPrunedResponse(
+                    detail="after より後ろの trace が保持期間の削除で消えた可能性がある。"
+                    "retained_from_ms を from にして after なしで読み直す",
+                    retained_from_ms=error.retained_from_ms,
+                ).model_dump(),
+            )
+        traces = [_control_trace_out(trace) for trace in page.traces]
+        return ControlTracesResponse(
+            from_ms=start,
+            to_ms=end,
+            retained_from_ms=page.retained_from_ms,
+            before_retained=start < page.retained_from_ms,
+            traces=traces,
+            has_more=page.has_more,
+            next_after=str(traces[-1].seq) if traces else after,
         )
 
     @app.get("/api/v1/devices", response_model=DevicesResponse)
@@ -734,6 +862,29 @@ def _add_tool_routes(app: FastAPI, provider: StoreProvider, tools: ToolsFactory)
             ),
             result=result,
         )
+
+
+def _event_out(record: EventRecord) -> EventOut:
+    """保存した事象を HTTP の形にする。**`peer_uid` は出さない**（決定記録 0045 §2.7）。"""
+    return EventOut(
+        id=record.id or 0,
+        ts_ms=record.ts_ms,
+        ts=iso(record.ts_ms),
+        kind=record.kind,
+        payload=json.loads(record.payload_json),
+    )
+
+
+def _control_trace_out(trace: SequencedControlTrace) -> ControlTraceOut:
+    """保存した trace を外枠に包む。``body`` は保存した JSON を解いただけ（0071 §2.3）。"""
+    return ControlTraceOut(
+        seq=trace.seq,
+        ts_ms=trace.ts_ms,
+        ts=iso(trace.ts_ms),
+        tick_id=trace.tick_id,
+        schema_version=trace.schema_version,
+        body=json.loads(trace.trace_json),
+    )
 
 
 def _periodic(readings: Mapping[str, LatestReading]) -> dict[str, LatestReading]:
