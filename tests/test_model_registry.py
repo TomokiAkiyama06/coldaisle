@@ -40,7 +40,7 @@ from coldaisle.control import (
     UnsafeRegistryPathError,
     load_model_registry_limits,
 )
-from coldaisle.control.schema import REGISTRY_POINTER_CHANGE_EVENTS
+from coldaisle.control.schema import REGISTRY_ARTIFACT_KINDS, REGISTRY_POINTER_CHANGE_EVENTS
 
 NOW_MS = 1_800_000_000_000
 CONFIG_DIR = Path(__file__).resolve().parents[1] / "config"
@@ -1758,3 +1758,10 @@ def test_trace_provenance_pointer_change_events_match_the_registry_vocabulary() 
     assert all(
         event.event.value in REGISTRY_POINTER_CHANGE_EVENTS for event in snapshot.pointer_changes
     )
+
+
+def test_trace_provenance_artifact_kinds_match_the_registry_vocabulary() -> None:
+    """schema が値で持つ kind の集合と `ArtifactKind` を揃える。**食い違いをここで止める。**"""
+    assert {kind.value for kind in ArtifactKind} == REGISTRY_ARTIFACT_KINDS
+    provenance = RegistrySnapshot(revision=0).trace_provenance()
+    assert set(provenance.production) == REGISTRY_ARTIFACT_KINDS

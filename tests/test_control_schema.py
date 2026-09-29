@@ -50,7 +50,7 @@ from coldaisle.control import (
     ZoneRecord,
     ZoneRequest,
 )
-from coldaisle.control.schema import MODEL_GATE_ASSESSMENT_COMPONENTS
+from coldaisle.control.schema import MODEL_GATE_ASSESSMENT_COMPONENTS, REGISTRY_ARTIFACT_KINDS
 
 SRC = Path(__file__).resolve().parents[1] / "src" / "coldaisle"
 FIXTURE = Path(__file__).resolve().parent / "fixtures" / "control_tick_v1.json"
@@ -1033,12 +1033,17 @@ def pointer_change(**overrides: object) -> RegistryPointerChange:
     return RegistryPointerChange.model_validate(values | overrides)
 
 
+EMPTY_POINTER = RegistryProductionPointer(artifact_sha256=None, established_by=None)
+
+
 def bound_registry(**overrides: object) -> RegistryProvenance:
     production = {
         "thermal_model": RegistryProductionPointer(
             artifact_sha256=REGISTRY_SHA, established_by=pointer_change()
         ),
-        "confidence_model": RegistryProductionPointer(artifact_sha256=None, established_by=None),
+    } | {
+        kind: EMPTY_POINTER
+        for kind in ("confidence_model", "supervisor_policy", "feature_transform")
     }
     values: dict[str, object] = {"revision": 3, "production": production}
     return RegistryProvenance(**(values | overrides))
@@ -1195,12 +1200,15 @@ def test_a_production_pointer_and_its_change_are_recorded_together():
         (
             {
                 "production": {
+                    "thermal_model": EMPTY_POINTER,
                     "confidence_model": RegistryProductionPointer(
                         artifact_sha256=REGISTRY_SHA, established_by=pointer_change()
-                    )
+                    ),
+                    "supervisor_policy": EMPTY_POINTER,
+                    "feature_transform": EMPTY_POINTER,
                 }
             },
-            "kind",
+            "変更を揃える",
         ),
         # 1つの変更を2つの kind に載せる
         (
@@ -1213,6 +1221,8 @@ def test_a_production_pointer_and_its_change_are_recorded_together():
                         artifact_sha256=REGISTRY_SHA,
                         established_by=pointer_change(artifact_kind="confidence_model"),
                     ),
+                    "supervisor_policy": EMPTY_POINTER,
+                    "feature_transform": EMPTY_POINTER,
                 }
             },
             "複数の kind",
@@ -1224,6 +1234,24 @@ def test_registry_pointers_belong_to_the_recorded_revision(
 ):
     with pytest.raises(ValidationError, match=message):
         bound_registry(**overrides)
+
+
+@pytest.mark.parametrize(
+    "production",
+    [
+        {},
+        {"thermal_model": EMPTY_POINTER},
+        {kind: EMPTY_POINTER for kind in REGISTRY_ARTIFACT_KINDS} | {"extra_model": EMPTY_POINTER},
+    ],
+)
+def test_a_registry_read_records_every_kind(production: dict[str, RegistryProductionPointer]):
+    """registry を読んだなら**全 kind の欄を揃える**（0062 §2.5）。欠けた記録は受け付けない。
+
+    欠けていると「その kind は production が無かった」のか「記録されていない」のかを
+    読む側が区別できない。
+    """
+    with pytest.raises(ValidationError, match="全 kind"):
+        RegistryProvenance(revision=3, production=production)
 
 
 def test_the_registry_revision_cannot_be_negative():

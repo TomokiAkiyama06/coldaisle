@@ -1093,6 +1093,15 @@ class SafetyProvenance(_Frozen):
     """Safety 設定に `status: provisional` の値が1つでもあったか（0028 §2.8）。"""
 
 
+REGISTRY_ARTIFACT_KINDS: frozenset[str] = frozenset(
+    {"thermal_model", "confidence_model", "supervisor_policy", "feature_transform"}
+)
+"""registry が production pointer を持つ artifact kind（`RegistryProvenance.production` の鍵）。
+
+`coldaisle.control.model_registry.ArtifactKind` の値。schema は registry を import しないので
+値で持ち、食い違いは tests/test_model_registry.py で止める。
+"""
+
 REGISTRY_POINTER_CHANGE_EVENTS: frozenset[str] = frozenset({"promoted", "rolled_back"})
 """production pointer を動かす registry event（決定記録 0062 §2.5 の `pointer_changes`）。
 
@@ -1200,6 +1209,9 @@ class RegistryProvenance(_Frozen):
             if self.production:
                 raise ValueError("registry を読んでいない tick に production pointer を載せない")
             return self
+        if set(self.production) != REGISTRY_ARTIFACT_KINDS:
+            # 欄を欠くと「production が無かった」と「記録されていない」を区別できない（0062 §2.5）。
+            raise ValueError("registry を読んだ tick は全 kind の production pointer を載せる")
         change_revisions: list[int] = []
         for kind, pointer in self.production.items():
             change = pointer.established_by
