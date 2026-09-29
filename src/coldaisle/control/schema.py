@@ -24,7 +24,7 @@ from typing import Annotated, Literal, Protocol, Self, runtime_checkable
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-SCHEMA_VERSION: Literal[8] = 8
+SCHEMA_VERSION: Literal[9] = 9
 """`ControlTick` の形の版。**フィールドの名前や意味を変えたら上げる。**
 
 #82 が保存したデータを読み違えないため。
@@ -45,6 +45,10 @@ SCHEMA_VERSION: Literal[8] = 8
 - v8（#74 / 決定記録 0060）: control loop の実行そのものの記録（`runtime`）。tick の所要時間・
   締め切り超過・周期・snapshot schema・設定の内容ハッシュを、判断と同じ行に残す。
   保存済みの v1〜v7 はそのまま読める
+- v9（#78）: Critical Safety の裁定の出どころ（`safety_provenance`）。設定で外した入力の
+  理由（`disabled_inputs`）と、暫定値を含む Safety 設定で回っていたか（`config_is_provisional`）。
+  **v9 には必須**で、保存済みの v1〜v8 は欄なしのまま読める（「記録が無い」であって
+  「確定値で回っていた」ではない）
 """
 
 Demand = Annotated[float, Field(ge=0.0, le=1.0, allow_inf_nan=False)]
@@ -1064,6 +1068,27 @@ class ControlTickRuntime(_Frozen):
         return self
 
 
+class SafetyProvenance(_Frozen):
+    """Critical Safety の裁定が**どの前提で出たか**の記録（`ControlTick` v9。#78）。
+
+    `CriticalSafetyDecision` の `disabled_inputs` と `config_is_provisional` をそのまま写す。
+    判断そのもの（floor / forced Max / fault）は `zones` と `faults` が持ち、ここは
+    「その判断が確定値で出たか」「どの入力を設定で外していたか」だけを残す。
+    これが無いと、T_SENSOR を外していた期間や暫定の閾値で回っていた期間の trace を、
+    確定値で全入力を見ていた trace と区別できない（docs/critical-safety.md）。
+
+    ``config_is_provisional=false`` は「暫定値を1つも含まない Safety 設定で裁定した」ことだけを
+    表す。設定不正時の Max の経路は Safety 設定を読まず、この記録も作らない
+    （docs/critical-safety.md）。
+    """
+
+    schema_version: Literal[1] = 1
+    disabled_inputs: tuple[Reason, ...]
+    """設定で Critical の対象から外した入力と理由。外していなければ空。"""
+    config_is_provisional: bool
+    """Safety 設定に `status: provisional` の値が1つでもあったか（0028 §2.8）。"""
+
+
 class GuardZoneOutput(_Frozen):
     """Reactive Guard の zone ごとの出力（0028 §2.3）。介入していなければすべて None。
 
@@ -1284,7 +1309,7 @@ v1〜v3 の reader は知らないため v3 以前には記録しない。
 class ControlTick(_Frozen):
     """1 tick の判断の記録（decision trace。0028 §2.3）。#82 が保存し、#90 / #91 が読む。"""
 
-    schema_version: Literal[1, 2, 3, 4, 5, 6, 7, 8] = SCHEMA_VERSION
+    schema_version: Literal[1, 2, 3, 4, 5, 6, 7, 8, 9] = SCHEMA_VERSION
     tick_id: int = Field(ge=0)
     ts_ms: int = Field(ge=0)
     """記録の時刻（壁時計。0028 §2.6）。"""
@@ -1301,6 +1326,10 @@ class ControlTick(_Frozen):
     """適用しなかった提案の記録（v6。#90）。counterfactual が無い tick では None。"""
     runtime: ControlTickRuntime | None = Field(default=None, exclude_if=lambda value: value is None)
     """control loop の実行そのものの記録（v8。#74）。保存済みの v1〜v7 では None。"""
+    safety_provenance: SafetyProvenance | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
+    """Critical Safety の裁定の前提（v9。#78）。保存済みの v1〜v8 では None。"""
     faults: tuple[Fault, ...] = ()
     """いま有効な故障。
 
@@ -1336,6 +1365,13 @@ class ControlTick(_Frozen):
                 raise ValueError("v8 の ControlTick には runtime が要る")
         elif self.schema_version < 8:
             raise ValueError("runtime を記録する ControlTick は schema version 8 にする")
+        if self.safety_provenance is None:
+            if self.schema_version >= 9:
+                # v8 の runtime と同じく、版が中身を表さない記録を作らない。欄が無いと
+                # 「T_SENSOR を外していたか」「暫定値で回っていたか」を言えない。
+                raise ValueError("v9 の ControlTick には safety_provenance が要る")
+        elif self.schema_version < 9:
+            raise ValueError("safety_provenance を記録する ControlTick は schema version 9 にする")
         self._check_model_gate()
         self._check_shadow()
         if self.supervisor is not None:

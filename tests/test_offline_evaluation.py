@@ -60,6 +60,7 @@ from coldaisle.control.evaluation.stats import MetricSummary, shape_of, summariz
 from coldaisle.control.schema import (
     MAX_SHADOW_PREDICTION_METRICS,
     MODEL_GATE_ASSESSMENT_COMPONENTS,
+    SCHEMA_VERSION,
     AuthorityLimitSource,
     AuthorityStage,
     BoundBy,
@@ -98,7 +99,7 @@ from coldaisle.evaluate import RunsManifest, build_context, main, render
 from coldaisle.metrics import MetricCatalog
 from coldaisle.store.models import ControlTraceRecord, Quality
 from test_control_config import valid_documents, write_documents
-from test_control_schema import CONTROL_TICK_RUNTIME
+from test_control_schema import CONTROL_TICK_RUNTIME, SAFETY_PROVENANCE
 
 ROOT = Path(__file__).resolve().parents[1]
 EVALUATION_PACKAGE = ROOT / "src" / "coldaisle" / "control" / "evaluation"
@@ -292,6 +293,7 @@ def tick_at(
         shadow=record,
         faults=faults,
         runtime=CONTROL_TICK_RUNTIME,
+        safety_provenance=SAFETY_PROVENANCE,
     )
 
 
@@ -1124,7 +1126,7 @@ def test_invariant_8_c_the_report_records_the_versions_and_configs_it_used(
     assert provenance.evaluation_config_sha256 == context.config_sha256
     assert provenance.versions.model_versions == ("0.1.0",)
     assert provenance.versions.model_artifacts == ("a" * 64,)
-    assert provenance.versions.control_schema_versions == (8,)
+    assert provenance.versions.control_schema_versions == (SCHEMA_VERSION,)
     assert provenance.outcome_match_tolerance_ms == (
         context.control.policy.shadow.outcome_match_tolerance_ms.value
     )
@@ -2437,6 +2439,7 @@ def _applied_learned_run(*, artifacts: tuple[str | None, ...]) -> list[ControlTr
             document["model_gate"]["artifact_sha256"] = None
             # v6 に実行記録の欄は無い（#74 / 決定記録 0060）。
             document.pop("runtime", None)
+            document.pop("safety_provenance", None)
             tick = ControlTick.model_validate(document)
         elif artifact != "a" * 64:
             document = tick.model_dump(mode="python")
@@ -2576,6 +2579,7 @@ def test_invariant_17_e_a_learned_tick_without_a_model_gate_counts_as_unknown(
         document["schema_version"] = 4
         document["model_gate"] = None
         document.pop("runtime", None)
+        document.pop("safety_provenance", None)
         traces.append(trace_of(ControlTick.model_validate(document)))
 
     report = evaluate([run_of(traces, [])], context=context)
