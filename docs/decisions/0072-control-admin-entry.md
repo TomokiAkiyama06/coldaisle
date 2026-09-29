@@ -184,7 +184,7 @@ GPU Manager などの書き手が入る。モード変更を足すと、その�
 | `mode` | `auto` / `manual` / `max`。`calibration` は #75 の測定計画の参照形が決まるまで**拒否する**（予約） |
 | `requested` | `manual` のときだけ必須。`front` / `rear` / `top` の**3つすべて**を `0.0..1.0` の demand で持つ（PWM は受け取らない。0028 §2.3）。他のモードでは拒否 |
 | `lease_s` | `manual` のときだけ必須。`1..manual.max_lease_s`（§2.8）。期限が来たら `AUTO` へ戻す（§2.4）。期限は `coldaisle-fand` の**単調時計**で数える（§2.4） |
-| `to_stage` | `lower_authority` のときだけ必須。**いまの実効 stage より低い値だけ**を受ける。同じか高ければ `changed: false` で何もしない |
+| `to_stage` | `lower_authority` のときだけ必須。受付スレッドは実効 stage と比べて拒否しない（受付時点の stage は古いことがある）。適用するかどうかは loop が §2.6 で決める |
 | `reason` | 状態を変える操作では必須。1〜200 文字、制御文字を含まない |
 
 - **時刻・操作者名・設定値・path を受け取らない。** 時刻は受付時の `coldaisle-fand` の時計で
@@ -264,6 +264,11 @@ GPU Manager などの書き手が入る。モード変更を足すと、その�
   （0057 §2.6 の「先に in-memory、あとで journal」。lock の待ち上限つき。0060 §2.7）を行う
 - 降格は Gate がその tick の stage を読む前に効く。書き残せなかった降格は 0057 §2.6 のとおり
   in-memory の上限として残り、`persist_failure` が立つ
+- **降格は古い snapshot で no-op と判断しない。** loop は `lower_authority` の `to_stage` を、その時点の
+  実効 stage と比べずに**無条件で** in-memory の上限として入れ、journal への降格を試みる。
+  外の process（CLI の昇格）が直前の `stat` の後に journal を上げていても、この上限は `reload()` で
+  外れないので、後から届いた降格が捨てられて authority が上がることはない。結果の `changed` は、
+  上限を入れた後の実効 stage が入れる前より下がったかどうかで返す（下がらなくても上限は残る）
 
 **外の process が journal を変えたとき（CLI の rollback / 昇格）**
 
