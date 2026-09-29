@@ -75,6 +75,7 @@ decision trace（`ControlTick`）は、制御デーモンが tick ごとに SQLi
 | GET | `/api/v1/control/latest` | 最新の1 tick。エアフロー画面の「現在の状態」（0046 の `page.control`） |
 | GET | `/api/v1/control/traces?from=&to=&window=&after=&limit=` | 期間内の trace を時刻の昇順で。1 tick の履歴を辿る・グラフへ重ねる |
 
+- trace の外では、ヒントの元の event を ID で引く `GET /api/v1/events/{id}` を1つ足す（§2.7）
 - **GET だけ。** FR-307 / api-contract §1。OpenAPI に `get` 以外が現れないことを固定する既存の試験の範囲に入る
 - 制御の状態を変える入口はここに作らない。モード変更は `coldaisle-fand` の Unix ソケットだけ（0028 §2.2）、
   イベントとヒントは `coldaisle-eventd` だけ（0045）。registry の操作は CLI だけ（0062 §2.1）
@@ -120,7 +121,15 @@ decision trace（`ControlTick`）は、制御デーモンが tick ごとに SQLi
     主キーそのものを cursor にすれば、再起動をまたいでも重ならない
   - offset 方式は採らない。制御デーモンが末尾へ追記し、`coldaisle-rollup` が先頭を消すあいだに、
     offset はずれて行を飛ばす・重ねる
-  - `after` の行が保持期間で消えていても、比較は値で行うので続きから読める
+  - **保持期間の削除で未読の行が消えたら、黙って続けず 409 で止める。** `coldaisle-rollup` の削除は
+    `ts_ms < cutoff` なので、消えるのはいつも主キー順の先頭の連続した範囲である
+    （`SqliteStore.delete_control_traces_before`）。したがって、`after` 以下の行が表に1件でも残っていれば
+    `after` より後ろの行は1件も消えていない。`after` を付けた要求で、表の最小の主キーが `after` より大きい
+    （または表が空）ときは、未読の行が消えた可能性があるので **409** を返し、応答に表の最小の `ts_ms`
+    （無ければ `null`）を入れる。呼び出し側は列が欠けたことを知り、その値から読み直す
+    - この判定は、未読の行が実際には無かった場合（`after` の直後の行がもともと無い）にも 409 を返しうる。
+      取りこぼしを黙って `has_more: false` で終えるよりは、読み直しを求めるほうを選ぶ
+    - 判定と読み出しは同じ読み取りトランザクションで行い、その間に削除が挟まらないようにする
 - **2ページ目以降は期間を固定する。** `after` を付けた要求は `from` と `to` の両方を必須とし、
   `window` との同時指定、または `from` / `to` の欠けは 422 で拒否する。呼び出し側は1ページ目の応答の
   `from_ms` / `to_ms` をそのまま渡す
@@ -184,7 +193,10 @@ decision trace（`ControlTick`）は、制御デーモンが tick ごとに SQLi
   本記録は「すべての promotion / rollback が trace に残る」とは主張しない
   - 取りこぼしは trace から**検出できる。** registry の `revision` は audit の件数と一致し、1から連続する
     （`ModelRegistrySnapshot` の検証）。隣り合う trace の `revision` が飛んでいれば、その間の変更は
-    `coldaisle-registry audit --pointer-changes` で `revision` の範囲を指定して全件引ける
+    `coldaisle-registry audit --pointer-changes` で全件を出し、各要素の `registry_revision` で
+    読む側が範囲に絞る（`RegistryAuditEvent.trace_metadata()` が必ず持つ欄）。いまの CLI に `revision` の
+    範囲を指定するオプションは無く、本記録は足さない。audit は promotion / rollback の件数ぶんしか無く、
+    全件を出して絞れば足りるため
   - これで #104 の受入基準「promotion / rollback が decision trace へ残る」を満たすとみなすかは、
     人間の判断に委ねる（§5 #7）。満たさないと判断した場合の代案（起動した tick に、直前の trace の
     `revision` 以降の pointer 変更の metadata をすべて載せる）も §5 #7 に置く
@@ -202,7 +214,13 @@ decision trace（`ControlTick`）は、制御デーモンが tick ごとに SQLi
 ### 2.7 ヒントの塊（#107）は §2.3 の `body` に入るだけ。専用の口を作らない
 
 - 塊の中身と閉じた語彙は 0064 §2.9（`age_ms` の定義は 0066）で決まっている。本記録は足さない・減らさない
-- `note` と `source` は既存の `GET /api/v1/events` の `payload` にある。画面は `event_id` で突き合わせる
+- `note` と `source` は `events` の `payload` にある。ただし既存の `GET /api/v1/events` は期間・kind・件数でしか
+  引けず、上限を超えると古い側を落とす（0009 §2.4）。長く効いているヒントの元の event は、画面が選んだ期間の
+  外や、落とされた側に入りうるので、**期間で引いた一覧との突き合わせでは確実に引けない**
+- そこで **`GET /api/v1/events/{id}` を足す**（#106 の実装 PR。GET だけで §2.2 の規律の範囲）。応答は既存の
+  `EventOut` 1件で、`peer_uid` を含まない（下）。無ければ（保持期間で消えた・存在しない）**404**。
+  画面は trace の `event_id` でこれを引き、404 なら `note` / `source` を「記録が残っていない」と出す。
+  **「無し」と言わない**（§2.3 と同じ規律）
 - **`peer_uid` は HTTP では引けない。** `EventOut` は監査のためだけに DB へ残す `peer_uid` を意図して出さない
   （`coldaisle.api.models.EventOut`）。本記録はこれを変えない。書き込んだ接続の uid が要る監査は、
   ホスト上でストアを直接読む運用者の作業とする
@@ -245,6 +263,7 @@ decision trace（`ControlTick`）は、制御デーモンが tick ごとに SQLi
 | `registry` の塊を毎 tick 載せると保存量が増える | 載せるのは kind の数（数個）ぶんの sha と path を含まない metadata だけ。起動した tick だけに載せる案は、保持期間で証拠が消えるので採らない（§4） |
 | promotion は再起動するまで trace に現れない | trace は「判断がどの artifact で出たか」の記録。pointer を動かした時刻・理由は audit にあり、`revision` で突き合わせられる |
 | 再起動のあいだに複数の pointer 変更があると、途中の変更は trace に載らない | `revision` は audit の件数と一致して連続するので、隣り合う trace の飛びで検出し、audit で全件引ける（§2.5 / §5 #7） |
+| 保持期間の境界の近くを読むと、`coldaisle-rollup` の後で 409 になり読み直しになる | 消えたかもしれない列を完全に見せるより、欠けたことを伝えるほうを選ぶ。409 の応答に読み直す起点（表の最小の `ts_ms`）を入れる（§2.2） |
 | 2ページ目以降に `window` を使えない | 1ページ目の応答が `from_ms` / `to_ms` を返すので、それを渡すだけでよい。黙って行が飛ぶより、422 で気付けるほうを選ぶ（§2.2） |
 | API が trace を検証し直さないので、壊れた意味の trace も返す | 書き手は制御デーモンだけで、保存時に型を通っている。SQLite の CHECK が JSON object であることを保証する。読み手は `schema_version` で分岐する |
 | 古さの判定が API（`/health`）と画面で別の場所にある | `/control/latest` は `age_ms` と周期（`body.runtime`）を必ず返し、判定の倍数は設定で1か所に置く |
@@ -282,7 +301,6 @@ decision trace（`ControlTick`）は、制御デーモンが tick ごとに SQLi
 | 5 | LLM 向けの集計ツール（`bound_by` / fault / fallback の理由の件数など）の形 | 別の決定記録（0015 / 0018 の続き） |
 | 6 | `RegistryHealthReport.trace_metadata()`（起動時検証の結果）も `registry` の塊に入れるか | #104 の実装 PR。入れるなら同じ版上げに含める |
 | 7 | §2.5 の「tick が使っていた pointer」と `revision` の飛びの検出で、#104 の受入基準「promotion / rollback が decision trace へ残る」を満たすとみなすか。満たさないなら、起動した tick に直前の trace の `revision` 以降の pointer 変更の metadata をすべて載せる（制御デーモンが起動時にストアの最新 trace を読むことになる） | 本記録の承認時に人間が判断する |
-| 7 | 保持期間の境界（いま読める最古の `ts_ms`）を応答に含めるか | #106 の実装 PR |
 | 8 | `requirements.md` に FR を足す番号と文言、`api-contract.md` の表 | #106 の実装 PR（本記録は文書を書き換えない） |
 | 9 | SQLite 外への export（0030 §5 の2項目め） | #90 / #91。本記録は扱わない |
 | 10 | Workspace（#60）からエアフロー画面へのリンク（0046 §5 #5） | #60 |
