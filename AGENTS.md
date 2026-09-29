@@ -36,6 +36,7 @@ uv run coldaisle-calibrate          # 較正オフセットの算出（**既定�
 uv run coldaisle-calibrate --apply  # 確認してから書く。手順は docs/calibration.md
 uv run coldaisle-evaluate --runs var/evaluation-runs.yaml --out var/evaluation.json  # Controller構成の比較（読み取りのみ）
 uv run coldaisle-drift --evidence var/drift-evidence.yaml --profile var/confidence-profile.json  # Model driftの検知（読み取りのみ・書き込みはしない。`--format markdown` で trend を人が読む表に）
+uv run coldaisle-supervisor-shadow --evidence var/supervisor-shadow-runs.yaml --registry-root var/model-registry --out var/supervisor-shadow.json  # Supervisor の Shadow 集計（DB と Registry を読むだけ。昇格は CLI の外）
 uv run coldaisle-eventd             # 書き込み専用の Unix ソケット入口（決定記録 0045。API とは別）
 uv run coldaisle-event gpu-mode compute  # GPU Mode の切り替えを記録する（#67）
 uv run coldaisle-event workload-hint training --expected-duration 4h  # Workload Hint を記録する（記録のみ。#107 / 決定記録 0064）
@@ -233,6 +234,7 @@ src/coldaisle/
   memory.py   # 合成の起点: 運用メモリの記録（確認を経由する）。#40
   calibrate.py# 合成の起点: 較正オフセットの算出（確認を経由する）。#13
   evaluate.py # 合成の起点: Controller構成の比較レポート（読み取りのみ）。#91
+  supervisor_shadow.py # 合成の起点: 保存済み trace から Supervisor の Shadow 集計（読み取りのみ。制御へ届かない）。#89
   event_entry/ # 合成の起点: 書き込み専用の Unix ソケット入口。AI 層・API から import しない。#67
   rollup_job.py # 合成の起点: `coldaisle-rollup` の入口（周期メトリクスを Store へ渡す）。#65
   control_daemon.py # 合成の起点: Fan制御デーモン。**hwmonへ書くのはこのプロセスだけ**。#74

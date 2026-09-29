@@ -1278,7 +1278,13 @@ def test_shadow_evidence_is_bound_to_the_promoted_artifact(tmp_path: Path, train
         )
         return registry, metadata, compatibility
 
-    def promote(registry: ModelRegistry, metadata: Any, compatibility: Any, evidence: Any) -> int:
+    def promote(
+        registry: ModelRegistry,
+        metadata: Any,
+        compatibility: Any,
+        evidence: Any,
+        shadow_config: Any = None,
+    ) -> int:
         revision = registry.inspect().revision
         return promote_supervisor_policy(
             registry,
@@ -1287,6 +1293,7 @@ def test_shadow_evidence_is_bound_to_the_promoted_artifact(tmp_path: Path, train
             certified=certified,
             shadow_evidence=evidence,
             baseline_rule_policy=rule_policy,
+            shadow_config=shadow_config or rl_policy_config()[0].shadow,
             approval=HumanApproval(
                 action=ApprovalAction.PROMOTE,
                 artifact=metadata.ref,
@@ -1305,6 +1312,19 @@ def test_shadow_evidence_is_bound_to_the_promoted_artifact(tmp_path: Path, train
     for stale in (stale_rule, same_version_other_table):
         with pytest.raises(ValueError, match="Rule policy が、いまの Baseline と一致しない"):
             promote(registry, metadata, compatibility, stale)
+    # **下限は値で束縛する**（決定記録 0074 §2.1）。昇格の時点の rl-policy.yaml と違う下限で
+    # 作った集計は、緩いほうでも厳しいほうでも通さない。
+    for shadow_overrides in (
+        {"minimum_ticks": provisional(1)},
+        {"minimum_ticks": provisional(3)},
+        {"minimum_paired_fraction": provisional(0.5)},
+        {"minimum_paired_fraction": provisional(1.0)},
+    ):
+        other_minimums = rl_policy_config(shadow=shadow_overrides)[0].shadow
+        with pytest.raises(ValueError, match=r"下限が、いまの rl-policy\.yaml"):
+            promote(registry, metadata, compatibility, matching, other_minimums)
+    with pytest.raises(TypeError, match="PolicyShadowConfig"):
+        promote(registry, metadata, compatibility, matching, {"minimum_ticks": 2})
     promote(registry, metadata, compatibility, matching)
     promoted = registry.inspect().artifacts[metadata.ref.key]
     assert promoted.metadata.shadow_evaluation_ref == matching.evaluation_ref()
