@@ -1,0 +1,297 @@
+# 決定記録 0074: 運転中の Supervisor decision を Shadow 台帳へ流す配線と、RL episode 結果を Offline Evaluation の arm にする接続形式
+
+- **種別**: Decision Record
+- **Status**: Proposed
+- **Date**: 2026-09-29
+- **Supersedes**: なし
+- **関連**: [0028](0028-fan-control-contracts.md) §2.2 / §2.3 /
+  [0030](0030-control-decision-trace-storage.md) /
+  [0053](0053-control-shadow-mode-and-counterfactual-logging.md) §2.4 /
+  [0054](0054-offline-evaluation-attribution-and-gates.md) §2.1〜§2.7・§5 /
+  [0055](0055-shadow-duplicate-observation-rule.md) §2.1 /
+  [0057](0057-authority-rollout-stage-changes.md) §2.3 / §2.4 /
+  [0058](0058-rl-supervisor-training-environment.md) §2.3 / §2.6・§5 /
+  [0060](0060-control-loop-runtime.md) §2.4 / §2.6・§5 未決 5 /
+  [0061](0061-rl-supervisor-policy-artifact-and-binding.md) §2.4 / §2.6・§5 /
+  [0062](0062-model-registry-operations.md) /
+  `AGENTS.md`「絶対に守るルール」1・2・4・6・9 /
+  GitHub #74 / #89 / #91 / #92 / #104 / #105
+- **対象 Issue**: #89 / #105
+
+## 1. Context
+
+FINAL の記録が、次の2つを別々の場所へ送ったまま閉じていない。
+
+| 送った記録 | 未決の内容 | 送り先 |
+|---|---|---|
+| 0061 §5 | 運転中の `SupervisorDecision` を `SupervisorShadowLedger` へ流す配線（どこで観測し、どこへ保存するか） | control loop 側（#74 / 0060） |
+| 0058 §5 / 0054 §5 / 0061 §5 | RL 学習環境の episode 結果を #91 の `EvaluationReport` の arm としてどう載せるか | #91 / #92 側 |
+
+0060 は control loop の実行時契約を決めたが、Shadow 台帳には触れていない（0060 §5 の未決 5 は
+worker プロセスの実装を #86 / #89 へ送っただけ）。0054 は arm の名前空間を factual / counterfactual の
+2つに決め、「RL Supervisor を含む比較は同じ arm の枠で足せるが本記録では扱わない」とした。
+結果として、**どちらの記録の範囲でもない**まま残っている。
+
+いまの main の状態を先に確かめておく。
+
+- `ControlTick.supervisor`（`SupervisorDecision` v2）は `coldaisle-fand` が**すでに decision trace へ
+  保存している**（0028 §2.3 / #82）。台帳が読む材料は trace に揃っている
+- `SupervisorShadowLedger`（0061 §2.6）は実装済みだが、**どこからも呼ばれていない**
+- `SupervisorShadowLedger.observe()` は tick を **`tick_id` だけ**で重複判定している。
+  `tick_id` は**再起動で 0 に戻る**（0060 §2.6）。一方で trace の主キーと #91 の評価器は
+  `(ts_ms, tick_id)` で行を識別している。**保存済みの trace を再起動を跨いで流すと、別の tick が
+  同じ tick として衝突し `SupervisorShadowConflictError` で止まる**
+- `coldaisle-fand` は `SupervisorCoordinator` を `expected_rl_identity` 無しで組み立てており、
+  RL worker（`SupervisorOutputSource`）も配線していない。したがって**いまの運転では、shadow slot の
+  RL 提案はすべて欠落か `supervisor_identity_mismatch` になる**（0061 §2.6 の fail closed）。
+  台帳に流しても `usable=False` の集計しか出ない。それが正しい振る舞いである
+- `EpisodeResult` / `PolicyComparison`（0058）は `control/rl` に、`EvaluationReport` は
+  `control/evaluation` にあり、**互いに import していない**
+- `EvaluationReport` の bytes は #92 の `raise_stage()` が**Learned MPC の authority 昇格の証拠**として
+  読む（0057 §2.4）
+- 反実仮想能力を申告した artifact は1つも無く、episode はすべて `learned_controller_available=false`・
+  `promotable=false` である（0058 §3 / 0061 §3）
+
+いま決める理由は2つある。#89 の受入基準「Shadow で MPC 結果へ影響させず評価可能」と
+#105 の受入基準「#91 Offline Evaluation へ結果を出力できる」は、**どちらもこの接続が無い限り
+満たせない**。そして、接続の形を実装者が決めると、制御プロセスに集計を持ち込む・MPC の昇格証拠に
+simulator 由来の数字を混ぜる、という**取り返しのつきにくい向きへ倒れやすい**。
+
+**この記録は `SupervisorPolicyBinding.for_active` を開く条件を決めない**（範囲外。§5）。
+ここで作る証拠は、どれも active の門の条件として読まれない。
+
+## 2. Decision
+
+### 2.1 Shadow 台帳は**制御プロセスの外**で、保存済み decision trace から後で組み立てる（推奨）
+
+台帳を持つのは **新しい合成の起点 `coldaisle-supervisor-shadow`（`src/coldaisle/supervisor_shadow.py`）**
+だけにする。`coldaisle-evaluate`（#91）・`coldaisle-drift`（#93）と同じ形の、読み取り専用の
+1回実行の CLI である。
+
+```bash
+uv run coldaisle-supervisor-shadow --evidence config/supervisor-shadow-runs.yaml \
+  --out var/supervisor-shadow.json
+```
+
+| 問い | 決定 |
+|---|---|
+| どのプロセスか | `coldaisle-supervisor-shadow`（人が起動する1回実行の CLI）。`coldaisle-fand` でも RL worker でもない |
+| どの時点か | **運転の後**。保存済み trace を、manifest に明示した期間（`[start_ms, end_ms)`。「直近」のような相対指定は置かない）で読む |
+| 何を読むか | decision trace（`control_traces`）の `ControlTick.supervisor` だけ。**新しい記録項目も新しい IPC も作らない** |
+| どう開くか | `coldaisle-evaluate` の `EvidenceDatabase`（`immutable=1`、`-wal` / `-journal` に中身があれば開かない）をそのまま使う |
+| 何を書くか | `SupervisorShadowSummary`（schema v2）の canonical JSON を1つ、`--out` へ。**DB・Registry・設定・trace には書かない** |
+| 誰が使うか | 人が `promote_supervisor_policy()`（0061 §2.6）へ渡す。CLI は Registry を呼ばない |
+
+#### 制御へ逆流しないことの保証
+
+「逆流しない」を運用の約束ではなく、**経路が存在しないこと**で保証する。
+
+1. **プロセスが別である。** 台帳の例外（`SupervisorShadowConflictError` など）・資源の上限
+   （`MAX_SHADOW_TICKS`）・集計の遅さは、control tick にも heartbeat（0060 §2.7）にも届かない
+2. **import の向きを試験で走査する。** `coldaisle.control_daemon` と `coldaisle.control.loop` は
+   `coldaisle.control.supervisor.shadow` を import しない。`coldaisle.supervisor_shadow` は
+   `coldaisle.control.hardware` / `safety` / `reactive` / `serial` / `subprocess` / `coldaisle.event_entry`
+   を import しない（0054 §2.7 と同じ規則・同じ走査）
+3. **DB を書けない開き方をする**（`immutable=1`。上の表）。trace へ集計を書き戻さない（0053 §2.4 と同じ）
+4. **出力を読む制御側のコードが存在しない。** 集計は Registry の `shadow_evaluation_ref` の材料に
+   なるだけで、`SupervisorCoordinator`・MPC・設定のどれにも入力として渡らない。
+   `shadow_evaluation_ref` も production への昇格にしか効かず、active の門（`for_active`）は
+   **入力を見ずに拒否する**ままである（0061 §2.4）
+5. **LLM のツールにしない**（AGENTS.md ルール1）。公開する場合も読み取り専用・集計済みで、
+   別の記録で決める（§5）
+
+#### 台帳に渡す tick と渡さない tick
+
+trace の1行ごとに、次の順で振り分ける。**振り分けの件数は理由別に集計と並べて出す**
+（黙って落とさない。0054 §2.3 と同じ理由）。
+
+| trace の行 | 扱い | 理由 |
+|---|---|---|
+| 索引（`ts_ms` / `tick_id` / `schema_version`）と本文が食い違う | **run 全体を拒否** | 0053 §2.4 の trace 検証と同じ |
+| `ControlTick` v8 未満（`runtime` が無い） | **run 全体を拒否** | 下の設定の照合ができない |
+| `runtime.config` の `fan-policy.yaml` hash が、渡した設定の hash と違う | **run 全体を拒否** | 別の Rule 表・別の `rl_version` で回した区間を同じ集計に混ぜない。期間を分けて渡す |
+| `supervisor` が無い | 渡さない（`no_supervisor_decision` として数える） | Supervisor を配線していない区間は比較の母数ではない |
+| `supervisor.shadow` が無い / active が Rule でない | 渡さない（`no_shadow_slot` / `active_not_rule` として数える） | 構成上そもそも比較していない区間。台帳は受け取らない（`SupervisorShadowUsageError`） |
+| 上記以外 | **台帳へ渡す** | RL の欠落・識別の不一致（`supervisor_identity_mismatch`）は台帳が `rl_errors` として数える（0061 §2.6） |
+
+- **台帳が `SupervisorShadowUsageError` / `SupervisorShadowConflictError` を投げたら、run 全体を
+  拒否する**（落とした行を除いて続けない）。Rule 表との不一致は「別の表で回した区間が混ざった」
+  ことを意味し、除いて数えると残りの区間だけで `usable` に届きうる
+- 台帳に束縛する Rule 表は、渡した検証済み `fan-policy.yaml` から `rule_policy_table()` で作る。
+  **RL の識別は文字列で受け取らない。** manifest は model ID と版だけを名指し、CLI が Registry
+  （#104）の attestation から `SupervisorPolicyIdentity`（bytes hash を含む）を作る。hash を文字列で
+  受け取ると、同じ版を名乗る別 artifact の集計を作れてしまう（0057 §2.3 と同じ理由）
+- **同じ入力からは同じ bytes を出す。** 生成時刻を持たず、時刻は decision から取る（0054 §2.7）
+
+#### 台帳の重複判定の鍵を `(ts_ms, tick_id)` にする（#89 の実装変更）
+
+`SupervisorShadowLedger` の重複判定の鍵を `tick_id` から **`(ts_ms, tick_id)`** に変える。
+trace の主キー・#91 の評価器（`EvaluationInputError`「同じ `(ts_ms, tick_id)` の trace が2つある」）・
+0060 §2.6 の「`tick_id` だけで照合しない」と揃える。
+
+- 同じ鍵で同じ内容は畳み、食い違えば受け取らない（0055 §2.1 の契約は変えない）
+- `SupervisorShadowSummary` の形は変わらないので、**集計の schema 版は上げない**
+  （鍵は台帳の内部状態で、集計の bytes には現れない）
+
+### 2.2 RL episode 結果は**別の report 型**で出し、`EvaluationReport` には入れない（推奨）
+
+0054 §2.1 の arm の枠に **第3の名前空間 `episode:`** を足す。ただし置き場所は `EvaluationReport` ではなく、
+`control/evaluation` に新しく作る **`PolicyEpisodeReport`（schema v1）** にする。
+
+| 名前空間 | 出どころ | 置く report | 読む側 |
+|---|---|---|---|
+| `applied:` | decision trace（適用された構成） | `EvaluationReport` | #92（authority 昇格。0057 §2.4） |
+| `counterfactual:` | `ShadowRecord` | `EvaluationReport` | #92 |
+| **`episode:<policy>+<policy_version>`**（新） | `PolicyComparison`（0058 §2.6） | **`PolicyEpisodeReport`** | supervisor policy の validated 化（#104。§2.3） |
+
+**`EvaluationReport` の形も版も変えない。** 理由は3つある。
+
+1. `EvaluationReport` の bytes は **Learned MPC の authority 昇格の証拠**として #92 が読む（0057 §2.4）。
+   同じ文書に simulator / 記録再生の episode の数字を混ぜると、承認者が名指す digest に
+   **運転の実績ではない数字**が入り、episode を足しただけで承認済みの digest が変わる
+2. `EvaluationReport` は時系列 split の segment と holdout の gate を必須にしている（0054 §2.5）。
+   episode の比較は segment を持たない。入れるには「segment の無い report」を許すことになり、
+   0054 §2.6 の「tick の無い segment を作らない」が守る穴を別の形で開ける
+3. 型が別なら、#92 の `raise_stage()` は `PolicyEpisodeReport` の bytes を `EvaluationReport` として
+   **復号できずに拒む**（`extra="forbid"`・版の Literal）。episode の結果が MPC の昇格証拠として
+   読まれない、を**型で**保証できる（試験で確かめる）
+
+#### `PolicyEpisodeReport` が持つもの・持たないもの
+
+入力は **`PolicyComparison` 1つ**（同じ条件・同じ episode 群・同じ Learned MPC の有無が、0058 §2.6 で
+すでに保証されている）。report は `control/evaluation/episode.py` に置き、`control.rl` の型を
+**読むだけ**で import する（`control.rl` は `control.evaluation` を import しない。向きは一方向）。
+
+| 欄 | 出どころ |
+|---|---|
+| `conditions_sha256` | `PolicyComparison.conditions_sha256` |
+| `training_mode` / dynamics の provenance / `safety_model` / `reward_version` / `applied_demand_tolerance` | episode の値。**arm 間で揃っていなければ作らない** |
+| `learned_controller_available` | 比較から導く（欄として受け取らない） |
+| arm ごと: `policy` / `policy_version` / RL なら `SupervisorPolicyIdentity` | Rule は版、RL は §2.3 の照合済み artifact から |
+| arm ごと: 安全側の数（絶対上限の超過・floor 不足・範囲外 action・最小 margin） | `EpisodeSafety` の合計と **worst-case episode** |
+| arm ごと: coverage（採点できた step・割合・理由別の内訳・`usable_for_comparison` でない episode 数） | `EpisodeCoverage` |
+| arm ごと: 共通の長さ（episode ごとの全 arm の採点できた step 数の最小）で揃えた reward 平均 | 0058 §2.6 / 0061 §2.7 と同じ規則。**使った長さを欄として残す** |
+| arm ごと: `promotable` な episode の数 / 全 episode 数 | `EpisodeResult.promotable`（環境だけが立てる） |
+| 設定の hash | `rl-training.yaml` / `rl-policy.yaml` / `fan-policy.yaml` / `safety.yaml` |
+
+**置かないもの**: 「運転での温度実績」に見える欄。episode の観測は記録の再生か近似 simulator の
+出力であって、**適用された構成の運転実績ではない**（0054 §2.2 と同じ帰属規則を、第3の名前空間にも
+掛ける）。`applied:` の欄（温度 percentile・ΔT・Air Balance・RPM）を episode arm に作らない。
+
+#### gate は 0054 §2.4 と同じ3段・辞書式で、閾値は**写さない**
+
+Rule arm（Baseline）以外の各 arm に gate を1つ出す。**上の段が落ちたら下の段では覆らない。**
+
+1. `safety`: 安全側の違反が 0、範囲外 action が 0（worst-case episode で判定）
+2. `evidence`: **比較できる episode がすべて `promotable`**、`learned_controller_available=true`、
+   coverage の下限を満たす、短い / 打ち切りの episode が無い（0061 §2.7）
+3. `cost`: Baseline に対する改善が `minimum_reward_improvement` 以上（0061 §2.7 の辞書式比較をそのまま使う）
+
+- 閾値は `rl-training.yaml`（coverage）と `rl-policy.yaml`（`minimum_reward_improvement`）から取る。
+  **`evaluation.yaml` に写さない**（0054 §2.6 / 0061 §2.5 と同じ規則。新しい設定値は作らない）
+- 判定できないこと（欠測・未設定・coverage 不足・Learned MPC 無し）は `blocked`。**`pass` にしない**
+- **いまはすべての RL arm が `evidence` で `blocked`（`learned_controller_unavailable`）になる。**
+  それが 0058 §3 / 0061 §3 の「いまはどの戦略が良いかを決められない」の正しい表現である
+- gate は**助言**である（0054 §2.4）
+
+### 2.3 episode report は supervisor policy の `offline_evaluation_ref` にだけ使い、policy 専用の入口を通す
+
+#104 の `promote()` は **validated（`offline_evaluation_ref` あり）の artifact だけ**を production にする。
+supervisor policy について、その参照の出どころはこれまで決まっていなかった。
+
+- `PolicyEpisodeReport.evaluation_ref()` は `supervisor-episode:<digest>` を返す。**名指した RL arm の gate が
+  `pass` でなければ参照を出さない**（0061 §2.6 の `evaluation_ref()` と同じ fail closed）
+- validated 化は **policy 専用の入口 `validate_supervisor_policy()`**（`control/supervisor/artifact.py`。
+  0061 §2.6 の `promote_supervisor_policy()` と対になる）だけで行い、次を確かめてから
+  `ModelRegistry.mark_validated()` へ渡す
+  - report の RL arm の `SupervisorPolicyIdentity` が、`certify()` を通した artifact の識別
+    （`certified_identity()`）と一致する
+  - その arm の episode で実際に出した action を、artifact の表がすべて再現する（0061 §2.6 と同じ照合）
+  - Baseline arm の Rule が、渡した Rule policy の表（`rule_policy_identity()`）と一致する
+- **#104 の `mark_validated()` を直接呼ぶ経路は残る**（0062 の CLI 契約。0061 §5 の Registry CLI と同じ残余として記録する）
+
+**帰結として、反実仮想 artifact が揃うまで supervisor policy は validated にも production にもならない。**
+shadow の運転は `for_shadow` が `production_active` を要求しない（0061 §2.4）ので、**candidate のまま
+shadow で比べられる**。証拠の収集は止まらない。
+
+## 3. Consequences
+
+**いま何ができて、何ができないか。**
+
+| やりたいこと | この記録の後にできるか |
+|---|---|
+| 保存済み trace から Rule / RL の shadow 集計を作る | **できる**（CLI）。ただし RL worker と `expected_rl_identity` の配線が無い間は、RL 提案がすべて欠落か識別不一致になり **`usable=False`** になる |
+| 再起動を跨いだ期間の trace を集計する | **できる**（鍵が `(ts_ms, tick_id)` になる） |
+| 設定を変えた前後を1つの集計にまとめる | **できない**（run ごと拒否。期間を分けて渡す） |
+| episode の比較を #91 の枠（名前空間・3段 gate・digest）で出す | **できる**（`PolicyEpisodeReport`） |
+| episode の結果で supervisor policy を validated にする | **できない**（gate が `blocked`。反実仮想 artifact が揃うまで） |
+| episode の結果で Learned MPC の authority を上げる | **できない**（型が違い、#92 が復号できない） |
+| RL に制御権を渡す | **できない**（`for_active` は閉じたまま。範囲外） |
+
+良くなること。
+
+- #89「Shadow で MPC 結果へ影響させず評価可能」と #105「#91 へ結果を出力できる」の接続が決まり、
+  実装に入れる
+- 台帳・集計の失敗が control tick と deadman に届く経路が**存在しない**
+- trace という既存の不変な記録だけから集計を作り直せる。集計を失っても trace が残っていれば再現できる
+- MPC の昇格証拠（`EvaluationReport`）の意味が変わらない。0057 の検証をやり直さずに済む
+- episode の結果が「運転の実績」に見える欄を持たない
+
+悪くなること（と緩和策）。
+
+- **集計は後追いで、運転中には見えない。** 緩和策は、shadow の比較は昇格の証拠であって運転の判断材料
+  ではないので、後追いで足りると明示すること。常時見たくなったら、読み取り専用の表示として別に決める（§5）
+- **trace の保持期間（0030 / `control_trace_days`）を過ぎた区間は集計できない。** 緩和策は、出力の
+  集計 JSON 自体を証拠として保存し、Registry へ参照（digest）で束縛すること
+- **`fan-policy.yaml` の hash は設定全体を覆うので、Supervisor に関係の無い変更でも期間を分けることになる。**
+  緩和策は、分けた期間ごとに集計を作れること。欄ごとに「関係あるか」を判定する規則は、
+  数え落とし（0058 §2.6 の「丸ごと hash」と同じ理由）のほうが危ないので採らない
+- **v8 未満の trace は集計できない。** v8（`runtime`）は 0060 で入ったばかりで、それ以前に RL の
+  shadow 運転は存在しない（worker が無かった）ので、失うものは無い
+- report の型が2つになる。緩和策は、名前空間・gate の段・`GateOutcome`・digest の作り方を
+  `EvaluationReport` と共有し、**型だけを分ける**こと
+
+## 4. 却下した代替案
+
+| 案 | 却下理由 |
+|---|---|
+| `ControlLoop` が tick ごとに台帳へ `observe()` する（in-loop） | 台帳の例外・1,000,000 tick の上限・集計の時間を制御プロセスへ持ち込む。heartbeat の後に置いても次の tick の前に居座る（0060 §2.7 の「記録の待ち時間は heartbeat の間隔を食いつぶせない」と同じ問題）。再起動で集計も消える |
+| 常駐の別デーモンが trace を追いかけて台帳を更新する | 常駐プロセスと「どこまで読んだか」の永続化という失敗の種類が増えるわりに、trace は既に保存されている。後から読めば足りる |
+| RL worker が台帳を持つ | worker は自分の出力しか見えない。Coordinator が識別の不一致・期限切れで拒んだことも、同じ tick の Rule の出力も知らないので、trace と食い違う集計になる |
+| `coldaisle-evaluate` のサブコマンドにする | manifest・出力の型・読む側（#92 と #104）が違う。1つの CLI が2つの証拠を出すと、どちらの digest を承認に使うかを取り違えやすい。`EvidenceDatabase` は共有する |
+| 台帳の鍵を `tick_id` のまま、CLI が再起動の境目で期間を切る | 境目を「`tick_id` が戻った」ことから推定することになり、短い再起動で番号が重なると取り違える。trace の主キーと同じ鍵にすれば推定が要らない |
+| 設定の食い違う行・Rule 表と合わない行を除いて集計を続ける | 残りの区間だけで `usable` に届きうる。除いたことが証拠の digest から読めない。run ごと拒否して期間を分けさせる |
+| RL の識別（bytes hash）を manifest の文字列で受け取る | 同じ版を名乗る別 artifact の集計を作れる（0057 §2.3 と同じ穴）。Registry の attestation から作る |
+| episode arm を `EvaluationReport` v3 の第3名前空間として同じ report に入れる（主な代替案） | 1つの report で済み、#105 の受入基準の文言にいちばん素直に合う。**ただし** #92 が承認で名指す digest に simulator / 記録再生の数字が混ざり、segment を持たない arm のために「segment の無い report」を許す必要が出る。#92 側に「episode arm を読まない」検証を足すことになり、FINAL の 0057 §2.4 の検証の意味を広げる |
+| episode を ControlTick 風の trace に変換して既存の評価器に流す | 運転していない tick を trace の形で作ることになり、`applied:` の名前空間に simulator の結果が「適用された実績」として入る。0054 §2.2 と 0058 §2.2 がそれぞれ禁じた帰属そのもの |
+| `PolicyComparison` をそのまま #91 の出力とみなす（接続しない） | 0054 の3段 gate・coverage の fail closed・digest の規則が掛からない。Registry に渡す参照を何から作るかが決まらないまま残る |
+| episode の gate の閾値を `evaluation.yaml` に置く | `rl-training.yaml` / `rl-policy.yaml` が既に持つ値の写しになる（0054 §2.6 / 0061 §2.5） |
+| `blocked` の episode report からも `offline_evaluation_ref` を出し、validated 化は人の判断に任せる | 参照は「評価を通った」ことの記録として #104 の監査に残る。通っていない評価を通った形で残すと、あとで production への昇格の根拠として読まれる。人の判断は `promote` の `HumanApproval` で別に入る |
+| supervisor policy の validated 化に episode report を使わず、shadow 集計だけで validated / production を決める | 0061 §2.6 は shadow 集計を production の条件（`shadow_evaluation_ref`）に使っている。offline と shadow の2つの証拠を1つに潰すと、#104 の2段の lifecycle の意味が失われる |
+
+## 5. 未決事項
+
+- **所有者の承認が要る**（Status: Proposed）。とくに次の4点は所有者に選んでほしい
+  1. 台帳を制御プロセスの外（CLI）に置くか、in-loop にするか（§2.1。推奨は外）
+  2. 台帳の鍵を `(ts_ms, tick_id)` に変え、設定の食い違う期間を run ごと拒否するか（§2.1）
+  3. episode の結果を別の report 型にするか、`EvaluationReport` v3 の第3名前空間にするか（§2.2。推奨は別の型）
+  4. 反実仮想 artifact が揃うまで supervisor policy を validated にしない帰結を受け入れるか（§2.3）
+- **`SupervisorPolicyBinding.for_active` を開く条件は、この記録の範囲外である。** 何を反実仮想の裏づけと
+  みなし誰が発行するか、RL へ制御権を渡す時期と条件は、0061 §5 のとおり**別の決定記録で決める**。
+  本記録の shadow 集計と episode report は、その門の条件として読まない
+- RL worker プロセスと `SupervisorOutputSource` の実装、worker が束縛の用途（`SupervisorOutputOrigin`）と
+  識別を control loop まで運ぶ形（0060 §5 未決 5 / 0061 §5）。本記録が固定するのは「`coldaisle-fand` に渡す
+  `expected_rl_identity` は Registry の attestation から作り、文字列から作らない」ことだけである。
+  それまでは集計が `usable=False` になり続ける
+- `coldaisle-supervisor-shadow` を定期実行（systemd timer など）にするか。いまは人が起動する。
+  自動にするなら、出力の置き場所と保持を含めて決める
+- trace に書けなかった tick（`trace_dropped`。0060 §2.7）を集計の母数にどう出すか。いまの台帳は
+  「観測した tick」しか数えず、落ちた tick は見えない。`runtime.tick_period_ms` から期待 tick 数を数えて
+  欠けを出すかは、実運用の trace を見てから決める
+- 1つの `PolicyEpisodeReport` に複数の `PolicyComparison`（探索の全候補）を載せるか。v1 は1つだけにする
+- shadow 集計・episode report をダッシュボードや AI ツールに出すか。出すなら読み取り専用・集計済みで
+  （AGENTS.md ルール1 / 8）、別の記録で決める
+- `config/rl-policy.yaml` の shadow の下限と `minimum_reward_improvement`、`config/rl-training.yaml` の
+  coverage の下限は、0058 / 0061 のとおり**すべて実測前の暫定値**のままである
+- #104 の `mark_validated()` / `promote()` を直接呼ぶ経路（0062 の CLI）は残余として残る。
+  CLI 側で supervisor policy に policy 専用の入口を要求するかは、0061 §5 と同じく新しい記録で決める
