@@ -22,6 +22,13 @@ DB は `SqliteStore` ではなく**読み取り専用の接続**で開く（`Soa
 
 - シリアルの再接続回数（ログにだけ出る）
 - デーモンの RSS 推移
+
+そのため**総合の判定（`verdict`）は合格にならない。** 不合格の項目があれば不合格、
+なければ判定不能。DB で判定できる項目だけの総合は `db_verdict` に分けて出す。
+
+**再生（replay）の DB では再起動を判定しない。** `ReplaySource` は CSV に無い
+`seq` / `up` を連続した値で合成するので、再生からは seq の欠損も再起動も記録されない。
+「0 件」は観測の結果ではない。
 """
 
 from __future__ import annotations
@@ -52,6 +59,7 @@ from coldaisle.channels import (
     QUEUE_DROPS_METRIC,
 )
 from coldaisle.clock import Clock, WallClock
+from coldaisle.ingest.replay import REPLAY_DEVICE
 from coldaisle.store import Quality, migrations
 
 LOGGER = logging.getLogger("coldaisle.soak")
@@ -169,6 +177,8 @@ class SoakReport:
     dropped_samples: int
     device_restarts: int
     queue_drops: int
+    replay_in_window: bool
+    """期間に再生（replay）のデータが入りうるか。**seq の欠損と再起動は合成値で数えられない。**"""
     checks: tuple[Check, ...]
 
     @property
@@ -185,14 +195,31 @@ class SoakReport:
         return sum(line.suspect for line in self.metrics)
 
     @property
-    def verdict(self) -> Verdict:
-        """判定した項目の総合。1つでも不合格なら不合格、判定不能が残れば判定不能。"""
+    def db_verdict(self) -> Verdict:
+        """**DB で判定できる項目だけ**の総合。1つでも不合格なら不合格、判定不能が残れば判定不能。
+
+        受入基準の全部ではない（`NOT_COVERED` を見ない）。soak の合否には `verdict` を使う。
+        """
         verdicts = {check.verdict for check in self.checks}
         if Verdict.FAIL in verdicts:
             return Verdict.FAIL
         if Verdict.UNKNOWN in verdicts or not verdicts:
             return Verdict.UNKNOWN
         return Verdict.PASS
+
+    @property
+    def verdict(self) -> Verdict:
+        """受入基準**全体**の判定。不合格は確定するが、合格は出さない。
+
+        RSS 推移と再接続回数（`NOT_COVERED`）をこの集計は確かめられない。
+        DB の項目が全部合格でも、確かめていない基準が残る限り判定不能にする。
+        """
+        db_verdict = self.db_verdict
+        if db_verdict is Verdict.FAIL:
+            return Verdict.FAIL
+        if NOT_COVERED:
+            return Verdict.UNKNOWN
+        return db_verdict
 
     # ---------------------------------------------------------------- 出力
 
@@ -217,6 +244,8 @@ class SoakReport:
             "interval_hello_ms": self.interval_hello_ms,
             "interval_after_window": self.interval_after_window,
             "verdict": self.verdict.value,
+            "db_verdict": self.db_verdict.value,
+            "replay_in_window": self.replay_in_window,
             "checks": [
                 {
                     "name": check.name,
@@ -259,13 +288,21 @@ class SoakReport:
             "",
             f"- 期間: {self._local(self.start_ms)} 〜 {self._local(self.end_ms)}",
             f"- 送信周期: {self._interval_text()}",
-            f"- 判定（DB で判定できる項目）: **{_VERDICT_LABEL[self.verdict]}**",
+            f"- 判定（総合）: **{_VERDICT_LABEL[self.verdict]}**"
+            + ("" if self.verdict is Verdict.FAIL else "（「この集計に無いもの」が未確認）"),
+            f"- 判定（DB で判定できる項目のみ）: **{_VERDICT_LABEL[self.db_verdict]}**",
             "",
         ]
         if not self.complete:
             lines += ["**期間がまだ終わっていないため判定しない。**", ""]
         if not self.has_data:
             lines += ["**この期間のデータがありません。**", ""]
+        if self.replay_in_window:
+            lines += [
+                "**期間に再生（replay）のデータを含む。** 再生の seq / up は合成値のため、"
+                "seq の欠損と再起動は記録されない（0 件は観測の結果ではない）。",
+                "",
+            ]
         lines += ["## 判定", "", "| 項目 | 観測値 | 基準 | 判定 | 備考 |", "|---|---|---|---|---|"]
         lines += [
             f"| {check.name} | {check.display} | {check.threshold} "
@@ -387,6 +424,24 @@ class SoakDatabase:
         ).fetchone()
         return None if row is None else (int(row[0]), int(row[1]))
 
+    def replay_before(self, end_ms: int) -> bool:
+        """`end_ms` より前に再生（replay）の取り込みが始まっていたか。
+
+        `readings` には取り込み元の列が無いので、起動バナー（`devices`）と
+        dataset の来歴（`dataset_source_run`）から判断する。再生の起動バナーは
+        CSV の最初の行の時刻で記録され、行はそれ以降に並ぶ（`ReplaySource`）。
+        `first_seen_ms` が期間の終わりより前なら、期間に再生の行が入りうる。
+        **期間より前に終わった再生も含むが、甘い側には倒れない**（判定不能になるだけ）。
+        """
+        device = self._conn.execute(
+            "SELECT 1 FROM devices WHERE device_id = ? AND first_seen_ms < ? LIMIT 1",
+            (REPLAY_DEVICE, end_ms),
+        ).fetchone()
+        dataset = self._conn.execute(
+            "SELECT 1 FROM dataset_source_run WHERE source_kind = 'replay' LIMIT 1"
+        ).fetchone()
+        return device is not None or dataset is not None
+
     def quality_counts(self, metric: str, start_ms: int, end_ms: int) -> dict[Quality, int]:
         """窓 `[start_ms, end_ms)` の生データを品質ごとに数える。
 
@@ -439,6 +494,7 @@ def build(
     }
     complete = end_ms <= now_ms
     has_data = any(line.rows > 0 for line in metrics)
+    replay_in_window = store.replay_before(end_ms)
     interval_after_window = interval is not None and interval[1] >= end_ms
     return SoakReport(
         start_ms=start_ms,
@@ -451,6 +507,7 @@ def build(
         dropped_samples=counters[DROPPED_SAMPLES_METRIC],
         device_restarts=counters[DEVICE_RESTART_METRIC],
         queue_drops=counters[QUEUE_DROPS_METRIC],
+        replay_in_window=replay_in_window,
         checks=(
             _missing_check(
                 metrics,
@@ -464,6 +521,7 @@ def build(
                 config.thresholds,
                 complete=complete,
                 has_data=has_data,
+                replay_in_window=replay_in_window,
             ),
         ),
     )
@@ -517,8 +575,18 @@ def _missing_check(
 
 
 def _restart_check(
-    restarts: int, thresholds: Thresholds, *, complete: bool, has_data: bool
+    restarts: int,
+    thresholds: Thresholds,
+    *,
+    complete: bool,
+    has_data: bool,
+    replay_in_window: bool,
 ) -> Check:
+    """決定記録 0070 §2.3。**再生のデータを含む期間では閾値以下を合格と言わない。**
+
+    再生は `seq` / `up` を合成するので再起動を記録しない。記録された再起動は
+    再生以外（実機）から来たものなので、閾値超過はそのまま不合格にする。
+    """
     name = "デバイス再起動"
     limit = f"≤ {thresholds.max_device_restarts} 回"
     note = "意図した再起動かどうかは DB から区別できない"
@@ -531,6 +599,11 @@ def _restart_check(
         return Check(name, float(restarts), display, limit, Verdict.FAIL, note)
     if not has_data:
         return Check(name, float(restarts), display, limit, Verdict.UNKNOWN, _why_unknown(complete))
+    if replay_in_window:
+        replay_note = (
+            "期間に再生（replay）のデータを含む。再生の seq / up は合成値で再起動を記録しない"
+        )
+        return Check(name, float(restarts), display, limit, Verdict.UNKNOWN, replay_note)
     return Check(name, float(restarts), display, limit, Verdict.PASS, note)
 
 
@@ -621,6 +694,7 @@ def main(argv: Sequence[str] | None = None, *, clock: Clock | None = None) -> in
                 "start_ms": start_ms,
                 "end_ms": end_ms,
                 "verdict": report.verdict.value,
+                "db_verdict": report.db_verdict.value,
                 "paths": None if paths is None else [str(path) for path in paths],
             }
         },

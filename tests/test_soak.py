@@ -86,7 +86,12 @@ def test_clean_run_passes(tmp_path, rules, scenarios, config):
     assert all(line.expected == 240 for line in report.metrics)
     assert all(line.missing_ratio == 0.0 for line in report.metrics)
     assert (report.dropped_samples, report.device_restarts, report.queue_drops) == (0, 0, 0)
-    assert report.verdict is Verdict.PASS
+    assert not report.replay_in_window
+    assert report.db_verdict is Verdict.PASS
+    # RSS と再接続回数を確かめていないので、**総合は合格にしない**
+    assert report.verdict is Verdict.UNKNOWN
+    assert report.as_dict()["verdict"] == "unknown"
+    assert report.as_dict()["db_verdict"] == "pass"
 
 
 def test_dropout_counts_as_missing_and_as_a_seq_gap(tmp_path, rules, scenarios, config):
@@ -222,7 +227,7 @@ def test_threshold_comes_from_the_config(tmp_path, rules, scenarios, config):
         }
     )
 
-    assert report_for(db, rules, loose).verdict is Verdict.PASS
+    assert report_for(db, rules, loose).db_verdict is Verdict.PASS
 
 
 # ---------------------------------------------------------------- Replay で作った DB
@@ -238,10 +243,9 @@ ROWS = """2026-08-24T00:00:00,24.4,56.2,24.12,24.94,23.56,23.75,23.94
 """
 
 
-def test_replayed_blank_cells_are_missing(tmp_path, rules, config):
+def ingest_replay(db: Path, rules, config: SoakConfig, tmp_path: Path) -> None:
     csv = tmp_path / "sensors_2026-08-24.csv"
     csv.write_text(f"{HEADER}\n{ROWS}", encoding="utf-8")
-    db = tmp_path / "replay.db"
     source = ReplaySource(csv, tz=config.zone, bulk=True, sleep=no_sleep)
     daemon = Daemon(
         source=source,
@@ -252,6 +256,11 @@ def test_replayed_blank_cells_are_missing(tmp_path, rules, config):
         daemon.run()
     finally:
         daemon.store.close()
+
+
+def test_replayed_blank_cells_are_missing(tmp_path, rules, config):
+    db = tmp_path / "replay.db"
+    ingest_replay(db, rules, config, tmp_path)
     start_ms, end_ms = window("2026-08-24T00:00:00", "2026-08-24T00:00:12", config)
 
     with SoakDatabase(db) as store:
@@ -263,6 +272,66 @@ def test_replayed_blank_cells_are_missing(tmp_path, rules, config):
     assert (room.expected, room.ok, room.missing) == (4, 3, 1)
     assert room.missing_ratio == pytest.approx(0.25)
     assert front.missing_ratio == 0.0
+
+
+def test_replayed_zero_restarts_are_not_a_pass(tmp_path, rules, config):
+    """再生の seq / up は合成値。**再起動 0 件は観測の結果ではない**ので判定不能。"""
+    db = tmp_path / "replay.db"
+    ingest_replay(db, rules, config, tmp_path)
+    # 欠測の判定に引きずられないよう閾値を緩める（再起動の判定だけを見る）
+    loose = config.model_copy(
+        update={"thresholds": config.thresholds.model_copy(update={"missing_ratio_below": 0.5})}
+    )
+    start_ms, end_ms = window("2026-08-24T00:00:00", "2026-08-24T00:00:12", config)
+
+    with SoakDatabase(db) as store:
+        report = build(store, start_ms=start_ms, end_ms=end_ms, now_ms=end_ms, config=loose)
+
+    assert report.replay_in_window
+    assert (report.device_restarts, report.dropped_samples) == (0, 0)
+    assert report.checks[0].verdict is Verdict.PASS
+    assert report.checks[1].verdict is Verdict.UNKNOWN
+    assert "再生" in report.checks[1].note
+    assert report.db_verdict is Verdict.UNKNOWN
+    assert report.as_dict()["replay_in_window"] is True
+    assert "再生（replay）のデータを含む" in report.as_markdown()
+
+
+def test_a_recorded_restart_still_fails_with_replay_data(tmp_path, rules, config):
+    """再生は再起動を記録しない。**記録された超過は実機のもの**なので不合格のまま。"""
+    db = tmp_path / "replay.db"
+    ingest_replay(db, rules, config, tmp_path)
+    start_ms, end_ms = window("2026-08-24T00:00:00", "2026-08-24T00:00:12", config)
+    with closing(sqlite3.connect(db, isolation_level=None)) as conn:
+        conn.execute(
+            "INSERT INTO readings (metric, ts_ms, value, quality) VALUES (?, ?, ?, ?)",
+            ("sys.device_restarts", start_ms + 1_500, 1.0, "ok"),
+        )
+
+    with SoakDatabase(db) as store:
+        report = build(store, start_ms=start_ms, end_ms=end_ms, now_ms=end_ms, config=config)
+
+    assert report.replay_in_window
+    assert report.checks[1].verdict is Verdict.FAIL
+    assert report.verdict is Verdict.FAIL
+
+
+def test_a_replay_after_the_window_does_not_mark_it(tmp_path, rules, config):
+    """期間より後に始まった再生は、期間の行を持たない。"""
+    db = tmp_path / "replay.db"
+    ingest_replay(db, rules, config, tmp_path)
+    start_ms, _ = window("2026-08-24T00:00:00", "2026-08-24T00:00:12", config)
+
+    with SoakDatabase(db) as store:
+        report = build(
+            store,
+            start_ms=start_ms - TEN_MINUTES_MS,
+            end_ms=start_ms,
+            now_ms=start_ms,
+            config=config,
+        )
+
+    assert not report.replay_in_window
 
 
 # ---------------------------------------------------------------- CLI
@@ -304,6 +373,7 @@ def test_main_writes_markdown_and_json_without_touching_the_db(
     assert code == 0
     printed = json.loads(capsys.readouterr().out)
     assert printed["verdict"] == "fail"
+    assert printed["db_verdict"] == "fail"
     assert printed["counters"]["sys.dropped_samples"] == 12
     assert printed["not_covered"], "判定できない項目を書く"
     written = sorted(path.name for path in out_dir.iterdir())
