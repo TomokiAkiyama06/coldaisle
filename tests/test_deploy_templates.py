@@ -137,7 +137,9 @@ def test_exec_start_points_at_a_real_entry_point(name):
 def test_the_report_waits_for_the_rollup():
     """停止をまたいで両タイマーが同時に追いついても、report は rollup のあと（0017 §2.1）。"""
     unit = parse_unit(SYSTEMD / "coldaisle-report.service")
+    # After= は順序だけ。Wants= が無いと、別々に queue された report が先に走りうる
     assert "coldaisle-rollup.service" in " ".join(unit["Unit"].get("After", []))
+    assert "coldaisle-rollup.service" in " ".join(unit["Unit"].get("Wants", []))
 
 
 def test_the_ingest_daemon_reads_serial_with_dialout():

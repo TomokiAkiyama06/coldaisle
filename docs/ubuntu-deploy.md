@@ -126,6 +126,11 @@ sudo systemctl enable --now coldaisle-rollup.timer coldaisle-report.timer
 日境界は `Asia/Tokyo`（`coldaisle-rollup --timezone` / `config/report.yaml`）なので、
 OS の時刻帯が異なるなら `OnCalendar=` を合わせてください。
 
+`coldaisle-report.service` は `Wants=` + `After=coldaisle-rollup.service` を持ちます。
+停止をまたいで両タイマーが起動直後に追いついても、report を起動すると rollup が先に
+queue され、その完了を待ってから走ります。手で `systemctl start coldaisle-report.service`
+を実行したときも、先に rollup が1回走ります。
+
 確認。
 
 ```bash

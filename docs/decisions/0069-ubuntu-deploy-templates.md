@@ -60,6 +60,7 @@ FR-102 は自動検出の候補に `/dev/server-sensors` を挙げているが�
 | シリアルの権限 | `SupplementaryGroups=dialout`。udev は `GROUP="dialout"`, `MODE="0660"` | root で動かさない |
 | API | `127.0.0.1:8000` で待ち受け | 外部公開は別の判断 |
 | タイマー | ロールアップ 03:00、レポート 08:05、`Persistent=true` | `config/report.yaml` にある運用例に揃えた（0008 未決1 をここで閉じる） |
+| report と rollup の順序 | `coldaisle-report.service` に `Wants=` + `After=coldaisle-rollup.service` | 0017 §2.1（集計元は1分ロールアップ）。`After=` は順序だけで起動しないため、両タイマーが停止後に同時に追いついたとき report が先に走りうる。`Wants=` で report の起動時に rollup を必ず先に queue する |
 
 ### 2.4 `coldaisle-fand` の unit はこの決定に含めない
 
