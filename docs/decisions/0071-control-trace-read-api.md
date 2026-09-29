@@ -1,7 +1,7 @@
 # 決定記録 0071: decision trace の読み取り API（エンドポイント・ページング・版の扱い・registry の記録・LLM との境界）
 
 - **種別**: Decision Record
-- **Status**: Proposed
+- **Status**: FINAL（2026-09-29、リポジトリ所有者が承認）
 - **Date**: 2026-09-29
 - **Supersedes**: なし。次の未決事項に答える記録であり、各記録の本文は書き換えない
   - [0046](0046-airflow-ui.md) §5 #2（判断記録を読む API の形）
