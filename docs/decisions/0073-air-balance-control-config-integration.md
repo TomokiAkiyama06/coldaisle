@@ -112,6 +112,23 @@ Air Balance を制御へつないだ後に必要になる**昇格の証拠への
   `AirBalanceModel` と `BalanceBand` を `LearnedMpcController` に渡す（0052 §2.3 のとおり、
   目標帯は `air-balance.yaml` が持ち MPC へ写さない）。無効のときは `None` を渡し、
   cost の項は 0 になる（`MpcCostModel` の既存の区別。「不明」と「未接続」を混ぜない）
+- **MPC の balance の項は、候補の demand を hardware の写像に通した値で評価する。**
+  いまの `MpcCostModel._balance_cost()` は候補の `step.demands` をそのまま `evaluate()` に渡すが、
+  backend は profile の `minimum_stable_demand` 未満の値を引き上げてから書く
+  （`SimulatedFanBackend._safe_demand()`）。そのままでは optimizer が実際には起きない風量の
+  状態で比を採点し、適用後の比が目標帯の外になる plan を選びうる。trace の推定（applied demand。
+  §2.5 (a)）と同じ定義にそろえるため、次のようにする:
+  - 引き上げの規則（`max(demand, minimum_stable_demand)`）を `fan-hardware.yaml` の profile から
+    決まる**純粋関数**として1箇所に置き、backend と `MpcCostModel` の両方がそれを使う
+    （2つの実装を持たない。MPC は hardware を呼ばない。0052 の境界は変えない）
+  - Learned MPC を配線するとき、Air Balance を渡すなら同じ `ControlConfig` の profile も
+    `MpcCostModel` に渡す。**Air Balance を渡して profile を渡さない組み合わせは構成時に拒否する**
+    （`MpcCostUnusableError`。runtime は model 読込の失敗として Fallback を続ける）
+  - `startup_demand` の kick は backend の起動状態に依存する一時的な値なので写像に含めない。
+    kick は `minimum_stable_demand` 以上への一時的な引き上げで、その間の実際の比は trace
+    （applied demand）に残る
+  - 写像は balance の項の評価にだけ使い、plan の requested そのものは変えない（Guard / Safety の
+    入力を書き換えない）。Acoustic の項への同じ扱いは #94 で決める（§5）
 - **Fallback Controller の requested に `coordinate()` を掛けるかは本記録では決めない。**
   Baseline の requested を変える制御の変更であり、安全・制御系の変更として別途の承認が要る（§5）
 
@@ -263,6 +280,20 @@ tick ごとの hash（§2.5 (c)）だけでは、characterization A で集めた
 - 昇格の照合（`_check_evidence()`）は、`fan-policy.yaml` / `safety.yaml` と同じく、
   **承認の証拠・報告の provenance・いま動いている設定の3つが一致しなければ昇格を拒む**
   （`AuthorityEvidenceError`）
+- **評価に使った trace が、その hash の設定で記録されたことを確かめる。** 上の3つの一致だけでは、
+  評価時に characterization B を読みながら、A で記録された v10 の trace や、hash を持たない
+  v1〜v9 の trace を消費した報告が、B を名乗って照合を通ってしまう（評価時の hash を provenance へ
+  写すだけでは、trace の出どころを表さない）。そこで:
+  - Offline Evaluation は、消費した各 tick の `runtime.config.air_balance_sha256`（§2.5 (c)）を
+    評価時の `ControlConfig.sources.air_balance.sha256` と突き合わせ、一致・不一致・欠落
+    （runtime v1、すなわち v9 以前の tick）の件数を報告 v3 の provenance に
+    `air_balance_trace_binding` として残す（`conditions_sha256` の材料にも入れる）
+  - **消費した tick が1つ以上あり、すべてが一致したときだけ**、その報告を昇格の証拠に使える。
+    不一致または欠落が1件でもあれば、報告は出してよいが昇格の証拠にはしない。
+    `_check_evidence()` はこの件数を見て、不一致・欠落が 0 でなければ `AuthorityEvidenceError` で拒む
+  - 該当する tick を黙って除外して残りで評価する方式は採らない（除外の仕方で結果を選べてしまい、
+    除外したことが報告から見えにくくなる）。一致しない trace が混ざった評価は、証拠として丸ごと無効にする
+  - 同じ突き合わせを `fan-policy.yaml` / `safety.yaml` の hash にも行うかは本記録では決めない（§5）
 - `MIN_EVIDENCE_REPORT_SCHEMA_VERSION` を **3** に上げる。v2 以前の報告は Air Balance の設定を
   言えないので、昇格の証拠にしない（「記録の無さは不明であって完全ではない」。0059 §2.5）
 - journal に既に残った昇格 event の `RolloutEvidence` は書き換えない。`AuthorityJournal` の版を
@@ -293,6 +324,8 @@ tick ごとの hash（§2.5 (c)）だけでは、characterization A で集めた
 | 未校正の間、Air Balance を持つ完成形の経路が動かない | 無効な状態はいまの `main` と同じ挙動で、安全側の層は変わらない。#75 の後に `calibrated` へ変えて再起動する |
 | `ControlTick` と `ControlTickRuntime` の版が上がり、`FanHardwareResult` にも `applied_demand` が要る。reader・backend・試験の更新が要る | 既存の版の追加（v8 / v9）と同じ手順。旧版の trace は書き換えない |
 | 評価報告 v3・`AuthorityJournal` v2 への更新で、v2 以前の報告は昇格の証拠に使えなくなる | 評価をやり直せば v3 の報告が出る。昇格は証拠を取り直すまで止まる側（Shadow / いまの stage のまま）に倒れ、安全側を弱めない |
+| v9 以前の trace と、別の characterization で記録された trace は昇格の証拠にならない（§2.6）。v10 の trace が溜まるまで昇格できない | 昇格が止まる側に倒れるだけで、安全側は弱めない。v9 以前の trace は評価・分析には引き続き使える |
+| MPC の balance の項が `fan-hardware.yaml` の profile にも依存する（§2.3） | 引き上げの規則を1箇所の純粋関数にし、backend と同じ定義を使う。profile は同じ `ControlConfig` から渡し、欠ければ構成時に拒否する |
 | applied demand からの推定は、Fan が指令どおり回っていない場合を過大に見積もる | 書き込み失敗・読み戻し不一致・その tick の backend fault（窓が満ちる前の stall を含む）・有効な stall の zone は `None` にする（2.5 (a)）。RPM 基準への切り替えは #75 の結果で判断する（§5） |
 | `air-balance.yaml` の熱閾値（状態の分類用）と `safety.yaml` の閾値が2箇所にある | 前者は Safety ではない分類用の値であることを変えない（0033）。Safety の判断は `safety.yaml` だけが持つ |
 
@@ -313,6 +346,10 @@ tick ごとの hash（§2.5 (c)）だけでは、characterization A で集めた
 | 無効の tick を `state: unknown` と空でない欄で表す | 「推定できなかった」と「使っていなかった」が同じ形になり、offline 評価が区別できない |
 | 保存 tick に設定の版を持たず、起動ログの `trace_metadata()` だけに残す | tick の記録単独ではどの版の設定で回っていたかを言えず、0033 §2 を満たさない |
 | `air-balance.yaml` の hash を tick にだけ残し、昇格の証拠に束縛しない | characterization A で集めた証拠で、B に差し替えた後の昇格を許せてしまう |
+| 評価時の hash を provenance に写すだけで、消費した trace の hash と突き合わせない | 評価時に B を読めば、A や hash を持たない v9 以前の trace から作った報告が B を名乗って照合を通る |
+| 一致しない tick を除外し、残りの tick で昇格の証拠を作る | 除外の仕方で結果を選べ、報告から見えにくい。混ざった評価は証拠として丸ごと無効にする方が安全側 |
+| MPC の balance の項を候補の demand のまま評価する | backend が `minimum_stable_demand` へ引き上げた後の実際の比と食い違い、目標帯の外になる plan を選びうる |
+| MPC の balance の項に Safety の floor まで写す | Safety の floor は tick ごとの Critical Safety の判断で、MPC の予測区間では決まらない。MPC に Safety の判断を複製しない（AGENTS.md ルール5）。実際の比は trace の applied demand に残る |
 | `air_balance` に zone ごとの q を持たず、吸排気の合計だけを zone の記録と照合する | Rear と Top の入れ替わりを検出できない。`AirBalanceEstimate` と形が変わり、既存の不変条件を流用できない |
 | `thermal_inputs` の metric を Catalog の検証だけで済ませ、入力契約に加えない | 契約に無い metric は取り込まれず毎 tick `None` になり、熱の制約が黙って効かない |
 | **RPM の読み戻し**から推定する | 曲線は demand → Airflow Index で定義されており、RPM → 風量の対応は #75 の実測がまだ無い。MPC の cost と同じ定義で記録できなくなる |
@@ -329,5 +366,6 @@ tick ごとの hash（§2.5 (c)）だけでは、characterization A で集めた
 | RPM の読み戻しを使った推定への切り替え | #75 で demand と RPM のどちらが風量をよく説明するかを見てから |
 | `basis` と #75 の測定記録の機械的な照合形式（0033 §5 の2点目） | #75 の測定記録の形式が決まった後 |
 | 版番号の衝突（`ControlTick` v10・`ControlTickRuntime` v2・束ねた版 11・評価報告 v3・`AuthorityJournal` v2） | 別の記録・実装が先にその番号を使った場合は、実装の時点で次の空いた番号を使う。欄の意味は本記録のとおり |
-| offline 評価が、trace の `runtime.config` の hash と評価時の設定の不一致を検出するか | `fan-policy.yaml` / `safety.yaml` も同じく未実装。本記録は証拠の束縛（§2.6）までを決め、trace 側の突き合わせは別の記録で |
+| offline 評価が、trace の `runtime.config` の `fan-policy.yaml` / `safety.yaml` の hash と評価時の設定の不一致を検出するか | `air-balance.yaml` の hash は §2.6 で突き合わせを決めた。ほかの2ファイルは未実装のまま、別の記録で |
+| MPC の Acoustic の項も hardware の写像を通した demand で評価するか | #94。本記録は balance の項だけを決める（§2.3） |
 | Air Balance の推定に要求との対応づけを持たせるか（0052 §5） | 本記録は `demand_basis: applied` の記録だけを決める。MPC 側は #86 |
