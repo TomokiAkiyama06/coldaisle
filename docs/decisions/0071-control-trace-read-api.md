@@ -73,7 +73,7 @@ decision trace（`ControlTick`）は、制御デーモンが tick ごとに SQLi
 | メソッド | パス | 用途 |
 |---|---|---|
 | GET | `/api/v1/control/latest` | 最新の1 tick。エアフロー画面の「現在の状態」（0046 の `page.control`） |
-| GET | `/api/v1/control/traces?from=&to=&window=&after=&limit=` | 期間内の trace を時刻の昇順で。1 tick の履歴を辿る・グラフへ重ねる |
+| GET | `/api/v1/control/traces?from=&to=&window=&after=&limit=` | `ts_ms` が期間内の trace を、記録した順（`seq` の昇順、§2.2a）で。1 tick の履歴を辿る・グラフへ重ねる |
 
 - trace の外では、ヒントの元の event を ID で引く `GET /api/v1/events/{id}` を1つ足す（§2.7）
 - **GET だけ。** FR-307 / api-contract §1。OpenAPI に `get` 以外が現れないことを固定する既存の試験の範囲に入る
@@ -88,6 +88,7 @@ decision trace（`ControlTick`）は、制御デーモンが tick ごとに SQLi
 ```json
 {
   "trace": {
+    "seq": 5120733,
     "ts_ms": 1790000000000,
     "ts": "2026-09-21T14:13:20+00:00",
     "tick_id": 184390,
@@ -100,7 +101,10 @@ decision trace（`ControlTick`）は、制御デーモンが tick ごとに SQLi
 
 - trace が1件も無い（制御デーモンを動かしていない・保持期間で消えた）ときは **200 で `"trace": null`**。
   404 にしない。ルートが無いのか、記録が無いのかを取り違えないため。画面はこれを「未接続」と出す（0046 §2.3）
-- `age_ms` はサーバの `store.clock` で数える（`/health` と同じ時計）。**古いかどうかの判定は §2.6**
+- 「最新」は **`seq` が最大の行**である（§2.2a）。`ts_ms` の最大ではない。壁時計が戻ると、戻る前に書いた行の
+  `ts_ms` が戻った後の行より大きくなり、`ts_ms` で選ぶと時計が追いつくまで古い tick を返し続けるため
+- `age_ms` はサーバの `store.clock` で数える（`/health` と同じ時計）。**古いかどうかの判定は §2.6**。
+  壁時計が戻った直後は負になりうる。API は丸めずそのまま返し、画面は負の値を「新しい」とせず判定不能として出す
 
 #### `/api/v1/control/traces`
 
@@ -108,44 +112,91 @@ decision trace（`ControlTick`）は、制御デーモンが tick ごとに SQLi
 {
   "from_ms": 1790000000000,
   "to_ms": 1790000600000,
-  "traces": [ { "ts_ms": 0, "ts": "…", "tick_id": 0, "schema_version": 9, "body": { } } ],
+  "retained_from_ms": 1789999000000,
+  "before_retained": false,
+  "traces": [ { "seq": 0, "ts_ms": 0, "ts": "…", "tick_id": 0, "schema_version": 9, "body": { } } ],
   "has_more": true,
-  "next_after": "1790000123456:184390"
+  "next_after": "5120733"
 }
 ```
 
-- 期間は `[from, to)`（0030 §2 / 0004）。`window` は既存の `/events` と同じ `_resolve_range` で解く
-- **昇順とキーセット方式のページング。** `after` は直前のページの最後の `(ts_ms, tick_id)` を
-  `"<ts_ms>:<tick_id>"` で表したもので、次のページは `(ts_ms, tick_id) > after` を返す
-  - `tick_id` は制御デーモンの再起動で 0 に戻る（`control/loop.py`）。**`tick_id` 単独では位置を表せない。**
-    主キーそのものを cursor にすれば、再起動をまたいでも重ならない
+- 期間は `[from, to)`（0030 §2 / 0004）で、**`ts_ms` による絞り込みにだけ使う。** `window` は既存の `/events` と
+  同じ `_resolve_range` で解く
+- **並びとページングは `seq`（§2.2a）のキーセット方式。** `after` は直前のページの最後の `seq` を10進の文字列で
+  表したもので、次のページは `ts_ms` が期間内で `seq > after` の行を `seq` の昇順で返す
+  - `ts_ms` は並びに使わない。制御デーモンは tick に `Clock.now_ms()`（壁時計）を刻み、`clock.py` の
+    `MonotonicClock` の説明のとおり壁時計は時刻合わせで前後に飛ぶ。`(ts_ms, tick_id)` で並べると、
+    読んでいる途中に時計が戻ったとき、新しく書かれた行が cursor より前に並び、黙って飛ばされる（§4 N）
+  - `tick_id` も使わない。制御デーモンの再起動で 0 に戻る（`control/loop.py`）
   - offset 方式は採らない。制御デーモンが末尾へ追記し、`coldaisle-rollup` が先頭を消すあいだに、
     offset はずれて行を飛ばす・重ねる
-  - **保持期間の削除で未読の行が消えたら、黙って続けず 409 で止める。** `coldaisle-rollup` の削除は
-    `ts_ms < cutoff` なので、消えるのはいつも主キー順の先頭の連続した範囲である
-    （`SqliteStore.delete_control_traces_before`）。したがって、`after` 以下の行が表に1件でも残っていれば
-    `after` より後ろの行は1件も消えていない。`after` を付けた要求で、表の最小の主キーが `after` より大きい
-    （または表が空）ときは、未読の行が消えた可能性があるので **409** を返し、応答に表の最小の `ts_ms`
-    （無ければ `null`）を入れる。呼び出し側は列が欠けたことを知り、その値から読み直す
-    - この判定は、未読の行が実際には無かった場合（`after` の直後の行がもともと無い）にも 409 を返しうる。
-      取りこぼしを黙って `has_more: false` で終えるよりは、読み直しを求めるほうを選ぶ
-    - 判定と読み出しは同じ読み取りトランザクションで行い、その間に削除が挟まらないようにする
+  - `has_more: false` は「読んだ時点で、期間内で `seq > after` の行がもう無い」ことを表す。期間の上限が過去でも、
+    時計が戻ればその期間の `ts_ms` を持つ行が後から書かれうる。その行は必ず大きな `seq` を持つので、同じ `after`
+    で読み直せば取れる
+- **保持期間の境界を毎回返す（1ページ目を含む）。** 応答は `retained_from_ms`（§2.2a。これより前の `ts_ms` の
+  行は残っていることを保証しない）と、`before_retained`（`from_ms < retained_from_ms` のとき `true`）を必ず持つ。
+  `from` が境界より前なら、1ページ目でも行を返したうえで `before_retained: true` とし、先頭が欠けている
+  可能性を明示する。拒否はしない。境界より前の期間は「消えた」のか「もともと記録していない」のかを
+  API は区別できず、`window=7d` のような要求を導入直後に一律で拒むことになるため。画面はこのとき、
+  `retained_from_ms` より前を「記録が残っていない」と出し、**「tick が無かった」と言わない**
+- **保持期間の削除で未読の行が消えたら、黙って続けず 409 で止める。** `after` を付けた要求で
+  `after < pruned_through_seq`（§2.2a。消した行の `seq` の上限）なら、`after` より後ろの行が消えた可能性が
+  あるので **409** を返す。応答には `retained_from_ms` を入れ、呼び出し側はそれを `from` にして `after` なしで
+  読み直す
+  - この判定は、消えた行が期間外だった場合にも 409 を返しうる。取りこぼしを黙って `has_more: false` で
+    終えるよりは、読み直しを求めるほうを選ぶ
+  - 判定・境界の算出・読み出しは同じ読み取りトランザクションで行い、その間に削除が挟まらないようにする
 - **2ページ目以降は期間を固定する。** `after` を付けた要求は `from` と `to` の両方を必須とし、
   `window` との同時指定、または `from` / `to` の欠けは 422 で拒否する。呼び出し側は1ページ目の応答の
   `from_ms` / `to_ms` をそのまま渡す
   - `window` はリクエストごとに `now` から解くので、ページをまたいで使うと下限が進んで未読の行を飛ばし、
     上限も進んで行が足され続け、列が終わらない。「途中が欠けない」（下の `has_more`）が崩れる
-  - cursor に期間を埋め込む案は採らない。`after` は主キーの値だけを表し、期間は要求の側で見えるほうが
+  - cursor に期間を埋め込む案は採らない。`after` は `seq` の値だけを表し、期間は要求の側で見えるほうが
     読み手の取り違えに気付きやすい（§4 M）
 - **上限を超えたら `has_more: true` を返し、黙って落とさない。** `/events` の「古い側を落として
   `truncated`」は採らない（§4）。trace は判断の証拠で、途中が欠けた列は事故調査に使えない
 - `limit` の既定と上限は環境変数（0009 §2.9 と同じ理由。`uvicorn` に引数を渡せない）。
   名前と値は §5 #2
 
+### 2.2a 記録した順を表す `seq` と、削除の境界を表す1行を足す（migration）
+
+いまの `control_traces` は `WITHOUT ROWID` で、主キー `(ts_ms, tick_id)` のほかに記録した順を表す列が無い
+（`0002_control_traces.sql`）。rowid も無いので、#106 の実装 PR で次の migration を足す（番号は実装時点の
+次の空き番号。main はいま `0006_events` まで）。
+
+- **`control_traces` に `seq INTEGER NOT NULL UNIQUE` を足す。** 主キー `(ts_ms, tick_id)` と `INSERT OR IGNORE`
+  はそのままにし、0030 §2 の「主キーは `(ts_ms, tick_id)` とし、同じ trace を上書きしない」を変えない。
+  `NOT NULL UNIQUE` の列は `ALTER TABLE ADD COLUMN` で足せないので、表を作り直して移す。
+  既存の行には `(ts_ms, tick_id)` の順に 1 から振る（移行前の記録の順は残っていないので、これが取れる最善）
+- **`control_trace_prune` を1行だけの表として足す。** 列は `pruned_through_seq`（消した行の `seq` の上限。
+  初期値 0）と `pruned_before_ms`（これより前の `ts_ms` の行は消したことがある。初期値 `NULL`）。
+  書くのは `coldaisle-rollup` だけ
+- **`seq` は書き手（Control Logging）が挿入と同じ文で振る。** 値は
+  `max(表の MAX(seq), pruned_through_seq) + 1`。表が全部消えても `pruned_through_seq` が残るので、`seq` は
+  巻き戻らず、古い cursor が新しい行を指すことはない。rowid の `AUTOINCREMENT` と同じ性質を、主キーを
+  変えずに得るための形である（§4 O）。書き手は1つで、SQLite の書き込みは直列なので重ならない。
+  `INSERT OR IGNORE` で捨てた挿入の番号は使わないので、`seq` は欠番を持ちうる。**連続を仮定しない**
+- **`coldaisle-rollup` の削除は `seq` の先頭の連続した範囲にする。** 同じ書き込みトランザクションで、
+  `S = MIN(seq)`（`ts_ms >= cutoff` の行。無ければ表の `MAX(seq) + 1`）を求め、`seq < S` の行を消し、
+  `pruned_through_seq = max(旧値, S - 1)`、`pruned_before_ms = max(旧値, cutoff)` にする
+  - これで `ts_ms >= pruned_before_ms` の行は1件も消えていない（`ts_ms >= cutoff` の行はどれも `seq >= S`）。
+    §2.2 の `before_retained` は取りこぼしなく立つ
+  - 時計が戻った後に書かれた行は、`ts_ms < cutoff` でも、それより前に書かれた `ts_ms >= cutoff` の行が
+    残っているあいだは消えない。保持期間の内側の行を先に消すより、期限を過ぎた行を少し長く残すほうを選ぶ。
+    0030 §5 の1項目め（期限を過ぎた record を消す）は、この遅れを含めて満たすとみなす
+  - 削除の実装がいまの `ts_ms < cutoff` から変わるので、`rollup` の JSON ログに、期限を過ぎたが残した行の
+    件数を足し、時計の異常で削除が進まないことに運用者が気付けるようにする（§3）
+- API の `retained_from_ms` は `pruned_before_ms` を返す。`NULL`（移行後にまだ一度も消していない）のときは
+  表の最小の `ts_ms`（表が空なら `null`）を返す。移行前の削除は記録が無く分からないので、残っている最古の
+  行より前は欠けている可能性があるとみなす。最初の `rollup` の後は、移行前の削除も今回の `cutoff` より前に
+  収まる（保持日数を移行前より延ばしていない限り）
+- Offline Evaluation が使う `SqliteStore.control_traces` の `ts_ms` 順の読み出しは変えない。`seq` は読み取り API の
+  並びと cursor のためのもので、判断の時刻の意味は `ts_ms` のまま
+
 ### 2.3 本文（`body`）は保存した JSON をそのまま返す。版の解釈は読む側で行う
 
 - `body` は `control_traces.trace_json` を JSON として解いた object で、**API は項目を足さない・消さない・直さない**
-- 外枠（`ts_ms` / `ts` / `tick_id` / `schema_version` / `age_ms`）は API の版（`/api/v1`）に属し、
+- 外枠（`seq` / `ts_ms` / `ts` / `tick_id` / `schema_version` / `age_ms`）は API の版（`/api/v1`）に属し、
   `ControlTick` の版が上がっても変えない。`ControlTick` が v10 になっても `/api/v1` の形は変わらない
 - 読む側は **`schema_version` で分岐する。** 画面（`airflow.js`）の変換は1か所に置き（0046 §3 の
   「API ができた時点で変換を1つ書く」）、版ごとの欄の有無を次のように見分けて出す
@@ -263,7 +314,10 @@ decision trace（`ControlTick`）は、制御デーモンが tick ごとに SQLi
 | `registry` の塊を毎 tick 載せると保存量が増える | 載せるのは kind の数（数個）ぶんの sha と path を含まない metadata だけ。起動した tick だけに載せる案は、保持期間で証拠が消えるので採らない（§4） |
 | promotion は再起動するまで trace に現れない | trace は「判断がどの artifact で出たか」の記録。pointer を動かした時刻・理由は audit にあり、`revision` で突き合わせられる |
 | 再起動のあいだに複数の pointer 変更があると、途中の変更は trace に載らない | `revision` は audit の件数と一致して連続するので、隣り合う trace の飛びで検出し、audit で全件引ける（§2.5 / §5 #7） |
-| 保持期間の境界の近くを読むと、`coldaisle-rollup` の後で 409 になり読み直しになる | 消えたかもしれない列を完全に見せるより、欠けたことを伝えるほうを選ぶ。409 の応答に読み直す起点（表の最小の `ts_ms`）を入れる（§2.2） |
+| 保持期間の境界の近くを読むと、`coldaisle-rollup` の後で 409 になり読み直しになる | 消えたかもしれない列を完全に見せるより、欠けたことを伝えるほうを選ぶ。409 の応答に読み直す起点（`retained_from_ms`）を入れる（§2.2） |
+| 境界より前から読むと、1ページ目から `before_retained: true` になる。導入直後や移行直後は「記録していない」期間も欠けている可能性として出る | 消えた証拠を「tick が無かった」と見せるより、欠けている可能性を明示するほうを選ぶ（§2.2 / §2.2a） |
+| `seq` と `control_trace_prune` を足す migration が要り、表を作り直す | 主キーと `INSERT OR IGNORE` は変えないので、0030 §2 の契約と書き手の挙動は変わらない。壁時計が戻っても行を飛ばさない並びは、単調な挿入の番号でしか得られない（§4 N / O） |
+| 時計が戻ると、期限を過ぎた行の削除が遅れる | 保持期間の内側の行を先に消さないための代償。`rollup` のログに残した件数を出す（§2.2a） |
 | 2ページ目以降に `window` を使えない | 1ページ目の応答が `from_ms` / `to_ms` を返すので、それを渡すだけでよい。黙って行が飛ぶより、422 で気付けるほうを選ぶ（§2.2） |
 | API が trace を検証し直さないので、壊れた意味の trace も返す | 書き手は制御デーモンだけで、保存時に型を通っている。SQLite の CHECK が JSON object であることを保証する。読み手は `schema_version` で分岐する |
 | 古さの判定が API（`/health`）と画面で別の場所にある | `/control/latest` は `age_ms` と周期（`body.runtime`）を必ず返し、判定の倍数は設定で1か所に置く |
@@ -278,7 +332,7 @@ decision trace（`ControlTick`）は、制御デーモンが tick ごとに SQLi
 | **B. `ControlTick.model_validate` で検証し直してから返す** | いまのコードが読めない古い trace（または将来の版を読む古い API）で 500 になるか、黙って捨てる。「記録されていない」と「起きていない」を区別できなくなる |
 | **C. `/events` と同じく、上限を超えたら古い側を落として `truncated`** | 判断の列の途中が欠けても気付きにくい。trace は証拠であり、欠けた列で「なぜ」を辿らせない（§2.2） |
 | **D. offset / page 番号でページングする** | 末尾への追記と保持期間の削除が同時に起きるので、ページがずれて行を飛ばす・重ねる |
-| **E. `tick_id` 単独を cursor にする** | 再起動で 0 に戻る。主キー `(ts_ms, tick_id)` でなければ位置を表せない |
+| **E. `tick_id` 単独を cursor にする** | 再起動で 0 に戻る |
 | **F. `WS /api/v1/control/stream` で押し出す** | 画面は `/control/latest` を周期的に読めば足りる。0009 §2.6 と同じ理由で、まず問い合わせで作る。要るなら後で足す（§5 #4） |
 | **G. registry event 用の表（`registry_events`）を SQLite に足し、CLI に書かせる** | 書き手が2つになる（CLI と制御デーモン）。`registry.json` の audit と二重の正本になり、食い違ったときにどちらを信じるか決められない |
 | **H. registry event に tick_id を合成して `control_traces` に書く** | 0062 §4 がすでに却下。束縛していない識別子を作る |
@@ -287,6 +341,9 @@ decision trace（`ControlTick`）は、制御デーモンが tick ごとに SQLi
 | **K. 読み取り API が `safety.yaml` を読んで古さを判定する** | 読み取り API が制御の設定に依存する。周期は trace 自身（v8 の `runtime`）が持っている |
 | **L. 0030 の承認を待たずに本記録だけを FINAL にする** | 保存の形が変わりうる前提の上に API の契約を固定することになる。承認してほしい範囲を §2.1 に絞った |
 | **M. `after` の cursor に `from` / `to` を埋め込む** | cursor が不透明になり、読み手がどの期間を読んでいるかを要求から読めない。期間を要求に明示させ、`window` との併用を拒否すれば同じ固定が得られる（§2.2） |
+| **N. 主キー `(ts_ms, tick_id)` を cursor にし、`/control/latest` も `ts_ms` の最大で選ぶ** | `ts_ms` は壁時計で、時刻合わせで戻る（`clock.py`）。読んでいる途中に戻ると、新しい行が cursor より前に並んで永久に飛ばされる。`/control/latest` も時計が追いつくまで戻る前の tick を返す |
+| **O. 表を rowid 付きにして rowid（`AUTOINCREMENT` なし）を cursor にする** | 表が全部消えると rowid が 1 から振り直され、古い cursor より小さい番号の新しい行を飛ばす。`AUTOINCREMENT` には `INTEGER PRIMARY KEY` が要り、0030 §2 の主キーを変えることになる |
+| **P. 1ページ目は境界を見ず、2ページ目以降だけ 409 にする** | 1ページ目の `from` が既に消えた範囲にかかっていても、残りの行と `has_more: false` だけが返り、「消えた」と「tick が無かった」を区別できない |
 
 ---
 
@@ -301,6 +358,7 @@ decision trace（`ControlTick`）は、制御デーモンが tick ごとに SQLi
 | 5 | LLM 向けの集計ツール（`bound_by` / fault / fallback の理由の件数など）の形 | 別の決定記録（0015 / 0018 の続き） |
 | 6 | `RegistryHealthReport.trace_metadata()`（起動時検証の結果）も `registry` の塊に入れるか | #104 の実装 PR。入れるなら同じ版上げに含める |
 | 7 | §2.5 の「tick が使っていた pointer」と `revision` の飛びの検出で、#104 の受入基準「promotion / rollback が decision trace へ残る」を満たすとみなすか。満たさないなら、起動した tick に直前の trace の `revision` 以降の pointer 変更の metadata をすべて載せる（制御デーモンが起動時にストアの最新 trace を読むことになる） | 本記録の承認時に人間が判断する |
+| 11 | §2.2a の migration の番号と、`rollup` のログに足す件数の項目名 | #106 の実装 PR |
 | 8 | `requirements.md` に FR を足す番号と文言、`api-contract.md` の表 | #106 の実装 PR（本記録は文書を書き換えない） |
 | 9 | SQLite 外への export（0030 §5 の2項目め） | #90 / #91。本記録は扱わない |
 | 10 | Workspace（#60）からエアフロー画面へのリンク（0046 §5 #5） | #60 |
