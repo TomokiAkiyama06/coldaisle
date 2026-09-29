@@ -83,12 +83,23 @@ GPU Manager などの書き手が入る。モード変更を足すと、その�
   受け渡し口へ置ける。直列にすると、1件の確認待ちや遅いクライアントの読み取り
   （`limits.read_timeout_s`）の間、後から来た `set_mode(max)` や rollback が次の tick の
   受け渡し口に入れず、下の同じ軸の置き換え・合成の規則も働かない
-  （接続の同時数の上限は下の2つに分ける。超えた接続は閉じて接続ごとのログに残す）
+  （接続の同時数の上限は下の2つに分ける。上限を超えたときの扱いは段階ごとに下で決め、閉じた接続は接続ごとのログに残す）
 - **安全側の指令が受け渡し口へ届く枠を、待っている接続に食わせない。** 接続を2つの段階に分けて
   別々に数える
   - **受信中の接続**（要求の1行を読み終えていない）: 上限 `limits.max_connections`。
-    これを超えた新しい接続だけを閉じる。受信中の接続は `limits.read_timeout_s` で必ず閉じるので、
-    この枠は時間で空く
+    枠が埋まっているときに新しい接続が来たら、**新しい接続を閉じるのではなく、受信中の接続のうち
+    最も長く受信を続けているものを閉じて**新しい接続を受ける（接続ごとのログに `evicted` を残す）。
+    新しい接続を閉じる方式では、認可済みのクライアントが要求の1行を送り切らない接続を
+    `max_connections` 本持ち続けるだけで、後から来た `set_mode(max)` や rollback が
+    `limits.read_timeout_s` のあいだ読まれず、次の tick に届く約束（§2.1 の表）が
+    `read_timeout_s` の設定しだいで何 tick も崩れる。要求は `limits.max_message_bytes` 以下の
+    1行で、正しいクライアントは接続の直後に送り切るので、最も古い受信中の接続を追い出しても
+    正しい要求はほぼ失われない（追い出されたクライアントには応答が返らないので、再送できる）。
+    認可（§2.5）は受け付けた時点で先に判定し、認可されなかった接続はすぐ閉じてこの枠に数えず、
+    他の接続を追い出す理由にもしない。受信中の接続は `limits.read_timeout_s` でも必ず閉じる
+  - さらに `limits.read_timeout_s` は **`tick_ms` 以下**（`read_timeout_s * 1000 <= tick_ms`）でなければならない（起動時に
+    `safety.yaml` と照合し、満たさなければ §2.8 の「不正な設定」として扱う）。追い出しに加えて
+    時間でも、受信中の接続が1 tick を超えて枠を占めないようにする
   - **受信後の接続**（弱めうる指令の監査の書き込み待ち、適用の確認待ち、応答の送信中）:
     要求を読み終えた時点で受信中の枠から外し、別の上限 `limits.max_pending_commands` で数える。
     監査の DB の lock で書き込み待ちが積み上がっても、受信中の枠は減らないので、後から来た
@@ -355,8 +366,8 @@ GPU Manager などの書き手が入る。モード変更を足すと、その�
 |---|---|
 | `socket.path` / `socket.mode` / `socket.group` | 0045 §2.2 と同じ規則（other のビット・setuid / setgid / sticky は拒否） |
 | `authorization.allow_same_user` | 既定 `false`。`true` は `socket.group: null` の開発用のときだけ許す |
-| `limits.max_message_bytes` / `limits.read_timeout_s` | 0045 と同じ意味 |
-| `limits.max_connections` | 受付スレッドが同時に持つ**受信中**の接続の上限（§2.2） |
+| `limits.max_message_bytes` / `limits.read_timeout_s` | 0045 と同じ意味。ただし `read_timeout_s * 1000 <= tick_ms`（起動時に `safety.yaml` と照合。§2.2） |
+| `limits.max_connections` | 受付スレッドが同時に持つ**受信中**の接続の上限。埋まっているときは最も長く受信を続けている接続を閉じて新しい接続を受ける（§2.2） |
 | `limits.max_pending_commands` | 要求を読み終えた後（監査の書き込み待ち・適用の確認待ち・応答の送信中）の接続の上限。受信中の枠とは別に数える（§2.2） |
 | `limits.audit_queue_max` | 監査書き込みスレッドの FIFO の上限（§2.7） |
 | `apply_ack_timeout_ms` | `>= tick_ms + tick_deadline_ms`（起動時に `safety.yaml` と照合） |
