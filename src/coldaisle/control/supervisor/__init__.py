@@ -22,6 +22,7 @@ from coldaisle.control.supervisor.artifact import (
     policy_registry_metadata_json_bytes,
     promote_supervisor_policy,
     shadow_evidence_ref,
+    validate_supervisor_policy,
 )
 from coldaisle.control.supervisor.policy import (
     ReceivedSupervisorOutput,
@@ -130,4 +131,5 @@ __all__ = [
     "rule_policy_identity",
     "rule_policy_table",
     "shadow_evidence_ref",
+    "validate_supervisor_policy",
 ]

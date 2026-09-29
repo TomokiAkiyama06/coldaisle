@@ -16,7 +16,7 @@ from enum import StrEnum
 from hashlib import sha256
 from typing import Literal, Self
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, JsonValue, model_validator
 
 from coldaisle.control.model.thermal import ThermalMetricName, canonical_sha256
 from coldaisle.control.rl.action import SupervisorAction
@@ -33,8 +33,32 @@ from coldaisle.control.schema import (
     WorkloadRegime,
 )
 
-EPISODE_SCHEMA_VERSION: Literal[1] = 1
-"""`EpisodeResult` の形の版。**欄の意味を変えたら上げる。**"""
+EPISODE_SCHEMA_VERSION: Literal[2] = 2
+"""`EpisodeResult` の形の版。**欄の意味を変えたら上げる。**
+
+- v2（#105 / 決定記録 0074 §2.2）: 条件 hash を2段にした。`config_digests`（3つの検証済み設定の
+  digest）と `other_conditions`（それ以外の条件）を**読める欄**として持ち、`conditions_sha256` は
+  その2つから作り直せる。**v1 の episode は読まない**（report の入力にしない。0074 §3）。
+  v1 は同じ条件・同じ seed から回し直せば v2 として同じ意味の結果になる（0058）
+"""
+
+EPISODE_MIRRORED_CONDITIONS: tuple[str, ...] = (
+    "episode_id",
+    "seed",
+    "mode",
+    "reward_version",
+    "discount",
+    "dynamics",
+    "safety_model",
+    "applied_demand_tolerance",
+    "learned_controller_available",
+)
+"""`other_conditions` のうち、**episode の欄としても現れる**条件（決定記録 0074 §2.2）。
+
+validator はこれらが episode の欄と一致することを先に確かめ、そのうえで条件 hash を作り直す。
+欄だけ書き換えた episode（dynamics・`reward_version`・`safety_model`・許容幅など）を、
+中の条件が変わっていないように見せないためである。
+"""
 
 MAX_EPISODES_PER_ARM = 1_024
 """1 arm に載せる episode 数の構造上限。調整値ではない。"""
@@ -42,6 +66,55 @@ MAX_EPISODES_PER_ARM = 1_024
 
 class _Frozen(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid", strict=True)
+
+
+def _canonical_json(value: object) -> str:
+    """値を**型まで区別する**正規形の JSON にする（`1` と `true`、`1` と `1.0` を分ける）。"""
+    return json.dumps(
+        value, ensure_ascii=False, allow_nan=False, separators=(",", ":"), sort_keys=True
+    )
+
+
+def config_digest(config: BaseModel) -> str:
+    """検証済み設定そのものの SHA-256。**欄を数え上げずに全体を覆う。**
+
+    episode の `config_digests` と、それを照合する側（`PolicyEpisodeReport` の構築と
+    `validate_supervisor_policy()`）が**同じこの関数**で作る（決定記録 0074 §2.2 / §2.3）。
+    bytes の hash ではなく検証済みの値の hash なので、コメントや鍵の並びの違いでは割れない。
+    """
+    return sha256(_canonical_json(config.model_dump(mode="json")).encode("utf-8")).hexdigest()
+
+
+class EpisodeConfigDigests(_Frozen):
+    """episode を作った3つの検証済み設定の digest（`config_digest()`）。
+
+    環境が自分の設定から作る。
+    """
+
+    rl_training: str = Field(pattern=r"^[0-9a-f]{64}$")
+    """`config/rl-training.yaml`。"""
+    fan_policy: str = Field(pattern=r"^[0-9a-f]{64}$")
+    """`config/fan-policy.yaml`。"""
+    safety: str = Field(pattern=r"^[0-9a-f]{64}$")
+    """`config/safety.yaml`。"""
+
+
+class _EpisodeConditions(_Frozen):
+    config_digests: EpisodeConfigDigests
+    other_conditions: dict[str, JsonValue]
+
+
+def episode_conditions_sha256(
+    config_digests: EpisodeConfigDigests, other_conditions: dict[str, JsonValue]
+) -> str:
+    """2段の条件から episode の条件 hash を作る（決定記録 0074 §2.2）。
+
+    環境と `EpisodeResult` の validator が**同じこの関数**を使う。片方だけ作り方を変えると、
+    環境が作った episode を読み戻せなくなるか、書き換えた条件が通る。
+    """
+    return canonical_sha256(
+        _EpisodeConditions(config_digests=config_digests, other_conditions=other_conditions)
+    )
 
 
 def conditions_digest(conditions: Sequence[tuple[str, str]]) -> str:
@@ -175,7 +248,7 @@ class EpisodeSafety(_Frozen):
 class EpisodeResult(_Frozen):
     """1 episode の結果。**同じ条件・同じ seed からは同じ bytes になる。**"""
 
-    schema_version: Literal[1] = EPISODE_SCHEMA_VERSION
+    schema_version: Literal[2] = EPISODE_SCHEMA_VERSION
     episode_id: str = Field(pattern=r"^[a-z0-9][a-z0-9_.-]*$", max_length=120)
     seed: int = Field(ge=0)
     mode: TrainingMode
@@ -198,8 +271,23 @@ class EpisodeResult(_Frozen):
     読む側が確かめられない。条件 hash にも入るが、hash は読めないので欄としても残す。
     記録を再生しない mode では `None`。
     """
+    config_digests: EpisodeConfigDigests
+    """episode を作った3つの検証済み設定の digest（決定記録 0074 §2.2）。
+
+    **環境が自分の持つ設定から作る。** 読む側（`PolicyEpisodeReport`）はこの値を、
+    `conditions_sha256` に本当に入っていたことを validator で確かめたうえで使う。
+    """
+    other_conditions: dict[str, JsonValue]
+    """設定の digest 以外の条件（workload trace・初期 window・controller の条件など）。
+
+    `EPISODE_MIRRORED_CONDITIONS` の鍵は episode の欄と一致しなければならない。それ以外は
+    episode の中からは作り直せず、環境で同じ条件・同じ seed から回し直して確かめる（0058）。
+    """
     conditions_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
-    """policy 以外のすべての条件を覆う hash。**arm を比べる鍵になる。**"""
+    """policy 以外のすべての条件を覆う hash。**arm を比べる鍵になる。**
+
+    `episode_conditions_sha256(config_digests, other_conditions)` と一致しなければ受け取らない。
+    """
     usable_for_comparison: bool
     """coverage の下限を満たしたか。満たさない episode の reward は比較に使わない。"""
     learned_controller_available: bool
@@ -223,6 +311,39 @@ class EpisodeResult(_Frozen):
        `ArtifactAttestation` の kind / capability / model ID / 版 / artifact hash まで一致する
     7. **すべての step の出どころが、その証拠が裏づける唯一の出どころと等しい**
     """
+
+    @model_validator(mode="after")
+    def _conditions_are_rebuilt_from_the_inside(self) -> Self:
+        """**内側から順に**確かめる（決定記録 0074 §2.2）。
+
+        (1) episode の欄としても現れる条件が、その欄と一致する。(2) 2段の条件から条件 hash を
+        作り直して一致する。(1) を省くと、欄を書き換えても中の条件が変わらず (2) が通る。
+        """
+        missing = [key for key in EPISODE_MIRRORED_CONDITIONS if key not in self.other_conditions]
+        if missing:
+            raise ValueError(f"episode の条件に欄と照合する値が無い: {missing}")
+        mirrored: dict[str, object] = {
+            "episode_id": self.episode_id,
+            "seed": self.seed,
+            "mode": self.mode.value,
+            "reward_version": self.reward_version,
+            "discount": self.discount,
+            "dynamics": self.dynamics.model_dump(mode="json"),
+            "safety_model": self.safety_model.value,
+            "applied_demand_tolerance": self.applied_demand_tolerance,
+            "learned_controller_available": self.learned_controller_available,
+        }
+        for key, value in mirrored.items():
+            if _canonical_json(self.other_conditions[key]) != _canonical_json(value):
+                raise ValueError(f"episode の条件の {key} が episode の欄と一致しない")
+        if (
+            episode_conditions_sha256(self.config_digests, self.other_conditions)
+            != self.conditions_sha256
+        ):
+            raise ValueError(
+                "episode の条件 hash が設定の digest と条件から作り直した値と一致しない"
+            )
+        return self
 
     @model_validator(mode="after")
     def _evidence_matches_the_claims(self) -> Self:
@@ -379,7 +500,7 @@ class PolicyArm(_Frozen):
 class PolicyComparison(_Frozen):
     """同じ条件・同じ episode 群で複数の policy を比べた結果。"""
 
-    schema_version: Literal[1] = EPISODE_SCHEMA_VERSION
+    schema_version: Literal[2] = EPISODE_SCHEMA_VERSION
     conditions_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     arms: tuple[PolicyArm, ...] = Field(min_length=2, max_length=8)
 

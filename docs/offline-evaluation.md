@@ -144,6 +144,37 @@ DB を作ります。証拠として読む DB をそれで開くと、**古い r
 
 **gate は助言である。** 昇格・降格の判断は #92 と人が行う。
 
+## RL episode の比較（`PolicyEpisodeReport`。#105 / 決定記録 0074 §2.2）
+
+RL 学習環境の `PolicyComparison` は、`EvaluationReport` ではなく**別の型**
+`PolicyEpisodeReport`（schema v1、`coldaisle.control.evaluation.episode`）で出す。
+arm の名前空間は第3の `episode:<policy>+<policy_version>` である。
+
+- **`EvaluationReport` の形も版も変えない。** episode は記録の再生か近似 simulator の出力で、
+  運転の実績ではない。型が違うので、#92 の `raise_stage()` はこの bytes を復号できずに拒む
+  （試験で確かめる）。温度 percentile・ΔT・Air Balance・RPM の欄は作らない
+- 入力は `PolicyComparison` 1つ・検証済みの `RlPolicyConfig`・Baseline の Rule policy・
+  **RL arm ごとの `certify()` を通した artifact**（arm の `policy_version` をキーにした対応）だけ。
+  数字や hash を文字列で渡す口は無い（`build_policy_episode_report()`）。比較は最初に
+  JSON として読み戻して検証し直す（validator を迂回した比較を使わない）
+- **Baseline はちょうど1つの Rule arm で `arms[0]` に固定する。** 渡した Rule policy の版と
+  一致し、その表が Baseline arm の全 step の action を再現しなければ作らない。報告には
+  `RulePolicyIdentity`（版と表の digest）を残す
+- **RL arm は表と action の証拠で artifact へ束縛する**（版の文字列では束縛しない）。
+  `manifest.payload_sha256` を arm の欄に残し、artifact の表が arm の全 step の action を
+  再現することを確かめる。異なる arm に同じ artifact を当てない。欠け・余りも拒む
+- 設定の digest（`rl-training.yaml` / `fan-policy.yaml` / `safety.yaml`）は episode の
+  `config_digests` から取る。episode は v2 で、条件 hash を `config_digests` と
+  `other_conditions` の2段から作り直せる（validator が確かめる）。**v1 の episode は読まない**
+  （同じ条件・同じ seed から回し直す）
+- gate は RL arm ごとに `safety` → `evidence` → `cost` の3段・辞書式。閾値は写さない
+  （coverage は episode の `usable_for_comparison`、改善幅は `rl-policy.yaml` の
+  `minimum_reward_improvement`）。**いまはすべての RL arm が `evidence` で `blocked`
+  （`learned_controller_unavailable`）になる**
+- `evaluation_ref(<policy_version>)` は gate が `pass` の arm にだけ
+  `supervisor-episode:<digest>` を返す。使い道は supervisor policy の validated 化
+  （`validate_supervisor_policy()`。`docs/supervisor.md`）だけである
+
 ## 再現性
 
 - **証拠の DB を書き換えない**（`mode=ro`。上記）

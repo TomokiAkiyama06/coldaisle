@@ -24,11 +24,10 @@ from __future__ import annotations
 
 import json
 from collections.abc import Callable, Mapping, Sequence
-from hashlib import sha256
 from random import Random
 from typing import Protocol
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, JsonValue
 
 from coldaisle.control.acoustic import AcousticCostModel
 from coldaisle.control.config import FanPolicyConfig, SafetyConfig
@@ -55,6 +54,7 @@ from coldaisle.control.rl.dynamics import (
 )
 from coldaisle.control.rl.episode import (
     EPISODE_SCHEMA_VERSION,
+    EpisodeConfigDigests,
     EpisodeCoverage,
     EpisodeResult,
     EpisodeSafety,
@@ -64,6 +64,8 @@ from coldaisle.control.rl.episode import (
     StepRecord,
     TerminationReason,
     conditions_digest,
+    config_digest,
+    episode_conditions_sha256,
 )
 from coldaisle.control.rl.reward import (
     REWARD_SCHEMA_VERSION,
@@ -175,18 +177,6 @@ def _frame_values(window: ObservedThermalInput) -> dict[str, float]:
     }
 
 
-def _config_digest(config: BaseModel) -> str:
-    """検証済み設定そのものの SHA-256。**欄を数え上げずに全体を覆う。**"""
-    payload = json.dumps(
-        config.model_dump(mode="json"),
-        ensure_ascii=False,
-        allow_nan=False,
-        separators=(",", ":"),
-        sort_keys=True,
-    ).encode("utf-8")
-    return sha256(payload).hexdigest()
-
-
 class EnvironmentUsageError(RuntimeError):
     """環境の使い方が間違っている（reset していない、終わった episode を進めた、など）。
 
@@ -268,13 +258,21 @@ class EpisodeSpec(_Frozen):
         )
 
 
+class _Conditions(_Frozen):
+    """episode の2段の条件と、そこから作った条件 hash（決定記録 0074 §2.2）。"""
+
+    config_digests: EpisodeConfigDigests
+    other_conditions: dict[str, JsonValue]
+    sha256: str
+
+
 class _EpisodeState:
     """進行中の episode の可変状態。**環境の外へは出さない。**"""
 
     __slots__ = (
         "applied",
         "ceiling_exceedances",
-        "conditions_sha256",
+        "conditions",
         "ended",
         "floor_shortfalls",
         "history",
@@ -291,10 +289,10 @@ class _EpisodeState:
         "window",
     )
 
-    def __init__(self, spec: EpisodeSpec, *, max_steps: int, conditions_sha256: str) -> None:
+    def __init__(self, spec: EpisodeSpec, *, max_steps: int, conditions: _Conditions) -> None:
         self.spec = spec
         self.max_steps = max_steps
-        self.conditions_sha256 = conditions_sha256
+        self.conditions = conditions
         self.rng = Random(spec.seed)
         self.window = spec.initial_window
         self.applied = spec.initial_demands
@@ -444,7 +442,7 @@ class SupervisorTrainingEnvironment:
         if max_steps > self._config.episode.max_steps:
             raise EnvironmentUsageError("episode の step 数を設定の上限より長くしない")
         self._episode = _EpisodeState(
-            spec, max_steps=max_steps, conditions_sha256=self._conditions_sha256(spec, max_steps)
+            spec, max_steps=max_steps, conditions=self._conditions(spec, max_steps)
         )
         # Gate も episode ごとに作り直す。復帰 hold や降格の数えを前の episode から持ち越さない。
         self._baseline = self._baseline_factory()
@@ -585,7 +583,9 @@ class SupervisorTrainingEnvironment:
             coverage=coverage,
             safety=safety,
             applied_demand_tolerance=self._dynamics.applied_demand_tolerance,
-            conditions_sha256=state.conditions_sha256,
+            config_digests=state.conditions.config_digests,
+            other_conditions=state.conditions.other_conditions,
+            conditions_sha256=state.conditions.sha256,
             usable_for_comparison=usable,
             learned_controller_available=self.learned_controller_available,
             promotable=(
@@ -1022,19 +1022,29 @@ class SupervisorTrainingEnvironment:
             return False
         return fraction >= limits.minimum_supported_fraction.value
 
-    def _conditions_sha256(self, spec: EpisodeSpec, max_steps: int) -> str:
-        """policy 以外の条件をすべて覆う hash（決定記録 0054 §2.7 と同じ考え方）。
+    def _conditions(self, spec: EpisodeSpec, max_steps: int) -> _Conditions:
+        """policy 以外の条件をすべて覆う hash（決定記録 0054 §2.7 と同じ考え方）を**2段で**作る。
 
         **policy を入れない。** Rule と RL を同じ条件で比べる鍵にするためである。
         覆えていない条件があると、違う条件の比較が同じ hash を名乗れる。
+
+        3つの検証済み設定の digest は `config_digests` へ分け、読む側が照合できるようにする
+        （決定記録 0074 §2.2）。episode の欄としても現れる条件（`EPISODE_MIRRORED_CONDITIONS`）は
+        episode の欄と**同じ値・同じ形**で入れ、validator がそれを確かめる。
         """
-        payload = {
+        config_digests = EpisodeConfigDigests(
+            # 渡された hash が中身と食い違っていても、**検証済み設定そのものの hash** で
+            # 条件が割れる（呼び出し側の写しだけを信じない）。
+            rl_training=config_digest(self._config),
+            # 制御器の設定は**設定全体の hash で覆う**。mpc.optimizer・authority_limits・
+            # gate 閾値・復帰 hold・shadow の許容幅まで、欄を数え落とさずに入る。
+            fan_policy=config_digest(self._policy),
+            safety=config_digest(self._safety),
+        )
+        payload: dict[str, object] = {
             "episode_schema_version": EPISODE_SCHEMA_VERSION,
             "reward_schema_version": REWARD_SCHEMA_VERSION,
             "rl_training_config_sha256": self._config_sha256,
-            # 渡された hash が中身と食い違っていても、**検証済み設定そのものの hash** で
-            # 条件が割れる（呼び出し側の写しだけを信じない）。
-            "rl_training_config_digest": _config_digest(self._config),
             "reward_version": self._config.reward.version,
             "discount": self._config.reward.discount.value,
             "episode_id": spec.episode_id,
@@ -1043,16 +1053,15 @@ class SupervisorTrainingEnvironment:
             "max_steps": max_steps,
             "step_ms": self._config.episode.step_ms.value,
             "recent_history_steps": self._config.episode.recent_history_steps,
+            # episode の欄と同じ形で入れる（validator が照合する）。
+            "dynamics": self._dynamics.identity.model_dump(mode="json"),
+            "applied_demand_tolerance": self._dynamics.applied_demand_tolerance,
             # **identity だけでは足りない。** 照合の許容幅や hybrid の内側は identity に
             # 現れないのに結果を変える（決定記録 0058 §2.6）。
-            "dynamics": self._dynamics.conditions(),
+            "dynamics_conditions": self._dynamics.conditions(),
             "workload_trace": spec.trace.digest(),
             "initial_window": canonical_sha256(spec.initial_window),
             "initial_demands": spec.initial_demands.model_dump(mode="json"),
-            # 制御器の設定は**設定全体の hash で覆う**。mpc.optimizer・authority_limits・
-            # gate 閾値・復帰 hold・shadow の許容幅まで、欄を数え落とさずに入る。
-            "fan_policy_sha256": _config_digest(self._policy),
-            "safety_sha256": _config_digest(self._safety),
             "expected_model_version": self._expected_model_version,
             "learned_controller_available": self.learned_controller_available,
             # **期待する版だけでは足りない。** 同じ版を名乗る別の artifact、別の Confidence
@@ -1074,11 +1083,12 @@ class SupervisorTrainingEnvironment:
             "safety_screen": list(self._config.safety_screen.temperature_metrics),
             "coverage": self._config.coverage.model_dump(mode="json"),
         }
-        encoded = json.dumps(
-            payload,
-            ensure_ascii=False,
-            allow_nan=False,
-            separators=(",", ":"),
-            sort_keys=True,
-        ).encode("utf-8")
-        return sha256(encoded).hexdigest()
+        # **JSON の値へ落としてから持つ。** 読み戻した episode と同じ形で hash を作るためである。
+        other_conditions: dict[str, JsonValue] = json.loads(
+            json.dumps(payload, ensure_ascii=False, allow_nan=False, sort_keys=True)
+        )
+        return _Conditions(
+            config_digests=config_digests,
+            other_conditions=other_conditions,
+            sha256=episode_conditions_sha256(config_digests, other_conditions),
+        )
