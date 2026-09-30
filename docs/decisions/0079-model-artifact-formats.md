@@ -185,8 +185,28 @@ ThermalModelArtifact v2  (schema_name "coldaisle.thermal_model", schema_version 
   `ActionPlan`）で、**plan の offset 列は action schema の格子と完全に一致しなければならない。**
   補間・外挿・丸めはしない。target schema の horizon 列もこの格子と一致させる（0052 §2.3 の
   「設定の上限を予測の契約へ合わせる」と同じ向き）
+- **plan の demand は「その値が effective として掛かった」という仮定として model へ渡す。**
+  `ActionPlan` は requested しか表現しない（0052 §2.4。`control/mpc/plan.py`）が、学習の action は
+  effective である。この2つを同じ意味で扱えるのは、候補が 0052 §2.4 の写し（Safety の最低 demand・
+  直前の effective からの変化幅）で既に狭めてあり、Reactive Guard / Critical Safety が手を入れない
+  tick では requested と effective が一致するからである。Guard / Safety が値を変えた tick では、
+  その tick の予測は実際に掛かる action と違う仮定の上に立つ。推奨案ではこの差を model の入力へ
+  持ち込まない（MPC は `control/safety` / `control/reactive` を import しない。0052 §2.4）。
+  次の tick の anchor と変化幅の起点は観測 window の effective から取り直すので（0052 §2.2 / §2.4）、
+  差は1 tick で観測の側へ戻る。requested と effective の差そのものは既存の decision trace に並んで
+  残る。§2.5 の範囲の照合も同じ仮定（plan の値を effective の仮定として）で行う。
+  **これは Guard / Safety の後段の裁定を変えない。** 差をさらに扱う（Guard / Safety の決定論的な
+  写しを MPC 側へ持つ、差が出た tick の予測を評価から除く等）かは §5 #14、§6 の質問 10
 - **feature schema `thermal-features-v2`** は v1（0048 §2.1）の列に、計画 action の列
   （step × zone）を足す。anchor action が「いま掛かっている effective demand」であることは v1 と同じ
+- **target の horizon より後の action は、その horizon の予測に使わない（因果の mask）。**
+  step `k` の action は `[k × step_ms, (k + 1) × step_ms)` に掛かるものとし、horizon `h_ms` の target が
+  使ってよい計画 action の列は `k × step_ms < h_ms` を満たす step だけとする。0048 の ridge 出力は
+  horizon ごとに全 feature への係数を持つので、v2 の payload では**それ以外の計画 action の列の係数を
+  厳密に 0 とする**（trainer はその列を落として当てはめる）。過去の制御では前後の step の action が
+  相関するため、mask が無いと近い horizon の予測が物理的に後の操作に依存し、オフライン評価と MPC の
+  コストを歪める。mask は feature schema と target schema の格子から一意に導けるので、別の欄を持たず、
+  loader が L10 で検査する
 - **学習データの時間窓**は split の各集合の `[history_start_ms の最小, label_end_ms の最大]` を持つ。
   drift の判断（0056）と「いつのデータで学習したか」の説明に使う。hostname・path などの
   実機識別子は持たない（0031 §2.3 の alias の規律、AGENTS.md ルール10）
@@ -197,9 +217,11 @@ ThermalModelArtifact v2  (schema_name "coldaisle.thermal_model", schema_version 
   較正を使わない metric だけなら `null`。store は較正の出どころを記録しないので（§1）、digest は
   dataset を作る側が明示して渡す（既定値を置かない）
 - **較正の変更をまたぐ学習データは作らない。** Dataset v2 の生成（段 1）は、呼び出し側が渡す
-  0056 §2.5 の宣言された変更（`DeclaredChange`）のうち較正の変更が、train / validation / test のいずれかの
-  時間窓の中にあれば**拒否する**（窓を分けて作り直すのは人の判断）。1つの artifact に1つの較正 digest しか
-  持たせないための条件である
+  0056 §2.5 の宣言された変更（`DeclaredChange`）のうち較正の変更が、**全 split を通した期間**
+  `[全集合の history_start_ms の最小, 全集合の label_end_ms の最大]` の中にあれば**拒否する**
+  （窓を分けて作り直すのは人の判断）。集合ごとの窓だけを見ると、0031 §2.5 の purge で空いた集合の
+  間の隙間に変更があるとき、変更前の train と変更後の validation / test が1つの artifact に入ってしまう。
+  全 split が1つの較正の期間に収まることが、1つの artifact に1つの較正 digest しか持たせないための条件である
 - **digest は4層**：Registry の `artifact_sha256`（登録した bytes 全体）、manifest の
   `payload_sha256` と `confidence_profile_sha256`、schema ごとの checksum、学習データの checksum。
   **登録する bytes は canonical 直列化そのもの**とし、同じ artifact が2通りの bytes を持たない
@@ -230,6 +252,7 @@ Registry へは既存の `thermal_model` kind・`counterfactual_action` capabili
 | L7 | Profile の binding が manifest の payload・schema・split と一致 | 拒否 |
 | L8 | metric binding の全 entry が runtime の `MetricCatalog` に同じ単位（派生値は同じ定義）で存在 | 拒否 |
 | L9 | 較正の digest が runtime の較正と一致（§6 の質問 4 の答えを待つ間は**不一致を拒否**） | 拒否 |
+| L10 | payload の各 horizon で、§2.3 の因果の mask の外（horizon より後の step）の計画 action の係数がすべて厳密に 0 | 拒否 |
 
 **L9 の「runtime の較正」**は、推奨案では `coldaisle-fand` が起動時に1回だけ読む較正ファイル
 （取り込みと同じ `config/calibration.json` の path を設定で受け取る。既定の path を制御側に置かない）の、
@@ -294,8 +317,8 @@ Confidence / OOD（0050）は **anchor 推論**を判定する。反実仮想モ
 すべて `-m "not hardware"` で走る。
 
 - 合成 dataset v2（決定的な生成器）から artifact v2 を学習し、同じ入力から同じ bytes が出る
-- L1〜L9 のそれぞれについて、1箇所だけ壊した artifact / 設定（1 byte 改変・非 canonical な並び・
-  Profile の binding 違い・単位違いの catalog・較正 digest 違い・v1 artifact・格子違い）を与え、
+- L1〜L10 のそれぞれについて、1箇所だけ壊した artifact / 設定（1 byte 改変・非 canonical な並び・
+  Profile の binding 違い・単位違いの catalog・較正 digest 違い・v1 artifact・格子違い・horizon より後の計画 action に 0 でない係数）を与え、
   **型が作られず、runtime が `MODEL_LOAD_FAILURE` として Fallback の requested を出し、Guard /
   Safety の後段の結果が変わらない**ことを確かめる
 - 範囲外の Fallback requested で optimizer が `error`（`plan_out_of_learned_range`）を返し、Gate が Fallback を選ぶ。
@@ -331,7 +354,7 @@ Confidence / OOD（0050）は **anchor 推論**を判定する。反実仮想モ
 |---|---|---|---|
 | 0 | 本 PR | 本記録（承認で FINAL） | 変えない |
 | 1 | #83 | Thermal Dataset v2：各 example に anchor から `label_end_ms` までの **action 列**（action schema の格子上の、`action_source` が指す値。推奨案と 0031 §2 では effective demand。§5 #2 で applied を選ぶなら 0031 を置き換える記録が先）と、その元の ControlTick の時刻）を持たせる。較正の変更をまたぐ窓は拒否する（§2.3）。v1 を v2 として読み替えない。0031 §2.1〜§2.6 の規律（時刻対応・mask・split・値を既定しない）はそのまま | 変えない |
-| 2 | #84 | artifact v2・trainer・`RegistryCounterfactualThermalModel.from_verified_artifact`（L1〜L9）・`ThermalRegistryMetadata` の全欄照合 | 変えない |
+| 2 | #84 | artifact v2・trainer・`RegistryCounterfactualThermalModel.from_verified_artifact`（L1〜L10）・`ThermalRegistryMetadata` の全欄照合 | 変えない |
 | 3 | #85 | Profile v2 の生成（payload 束縛・action 列の範囲）と同梱。制御用の判定器は同梱 Profile からしか作れないようにする | 変えない |
 | 4 | #86 | 束縛を段 2 の型へ切り替え、格子の照合と §2.5 の探索範囲の写しを足す | 変えない（既存の `optimizer_status` / `failure_reason` に載せる） |
 | 5 | #104 | runtime contract の例と `docs/model-registry.md` を v2 に合わせる。`verify` の挙動は変えない | 変えない |
@@ -421,6 +444,7 @@ Confidence / OOD（0050）は **anchor 推論**を判定する。反実仮想モ
 | 11 | uncertainty を出す model（アンサンブル・分位点）と、そのときの `confidence_model` kind の使い方（0050 §5 #4） | #84 の後続 |
 | 12 | `coldaisle-registry status` が manifest の学習データの時間窓・metric 束縛を表示するか（Registry は payload を読まないので、別の読み取り専用 tool になる） | #104 |
 | 13 | retired artifact の bytes の保持期間（0062 §5） | 変わらず開いたまま |
+| 14 | plan（requested）を effective の仮定として model へ渡すこと（§2.3）の差を、推奨案（1 tick で観測へ戻す・trace に残す）以上に扱うか。Guard / Safety の決定論的な写しを MPC 側へ持つ、差が出た tick の予測を評価から除く等 | 所有者（§6 の質問 10）。差の頻度は #90 / #91 の Shadow・評価で測る |
 
 **実機の計測を待つ値**：#2 の差の大きさ、#4 の励起の条件、#5 の格子と family と正則化、#6 の margin の値。
 いずれも `status: provisional` の設定または後続の決定記録で扱い、本記録はコードに既定値を置かない（AGENTS.md ルール9）。
@@ -459,3 +483,7 @@ Confidence / OOD（0050）は **anchor 推論**を判定する。反実仮想モ
    - (a) **推奨**: 本記録では決めず、#82 / #20 の統合時に決める（方向は H2）
    - (b) いま H2 に決める
    - (c) いま H1 / H3 のどちらかに決める
+10. **plan（requested）と学習の action（effective）の意味の差をどう扱うか**（§2.3、§5 #14）。
+   - (a) **推奨**: plan を「effective として掛かった」仮定として渡す（0052 §2.4 の写しで狭めた候補では Guard / Safety が手を入れない限り一致する）。差が出た tick は次の tick の anchor で観測へ戻し、差は既存の decision trace に残すだけにする。Guard / Safety の後段の裁定は変えない
+   - (b) (a) に加え、requested と effective が食い違った tick の予測をオフライン評価と Profile の残差から除く（#91 / #85 の変更）
+   - (c) Guard / Safety の決定論的な写しを MPC 側に持ち、plan を写した値で評価する（MPC が `control/safety` / `control/reactive` を import しない規律（0052 §2.4）を保つ別の形が要り、新しい記録が先）
