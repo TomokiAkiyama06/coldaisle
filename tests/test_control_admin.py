@@ -17,6 +17,7 @@ import errno
 import grp
 import json
 import os
+import selectors
 import shutil
 import socket
 import sqlite3
@@ -60,6 +61,7 @@ from coldaisle.control.schema import (
 )
 from coldaisle.control_admin import client as admin_client
 from coldaisle.control_admin import runtime as admin_runtime
+from coldaisle.control_admin import server as admin_server
 from coldaisle.control_admin.audit import AuditWriter
 from coldaisle.control_admin.config import ControlAdminConfigError, ControlAdminSettings
 from coldaisle.control_admin.mailbox import AdminMailbox, Placed, Superseded
@@ -1883,6 +1885,53 @@ def test_a_thread_that_cannot_start_leaves_no_socket_and_no_thread(
     entry = _open(config, short_dir / "a.db", rules)
     assert entry is not None
     entry.stop()
+
+
+@needs_peercred
+def test_stopping_without_drain_ends_the_receiver_even_before_it_reaches_select(
+    short_dir, rules, monkeypatch
+):
+    """``drain=False`` の停止が受付スレッドの select の手前と重なっても、スレッドは終わる。
+
+    停止の手順が起こすための socket と待ち受けを先に閉じると、epoll からその fd が消え、
+    後から入った select は何にも起こされずに待ち続けた（PR #192 のレビュー 10）。
+    select の直前で受付スレッドを止めておき、停止の手順を済ませてから select へ進める。
+    """
+    entered = threading.Event()
+    gate = threading.Event()
+
+    class GatedSelector(selectors.DefaultSelector):  # type: ignore[misc,valid-type]
+        def select(self, timeout: float | None = None) -> Any:
+            entered.set()
+            gate.wait(timeout=10.0)
+            return super().select(timeout)
+
+    monkeypatch.setattr(admin_server.selectors, "DefaultSelector", GatedSelector)
+    config = short_dir / "control-admin.yaml"
+    socket_path = short_dir / "run" / "admin.sock"
+    config.write_text(yaml.safe_dump(admin_document(socket_path)), "utf-8")
+    entry = _open(config, short_dir / "a.db", rules)
+    assert entry is not None
+    receiver = entry.server.thread
+    wake_reader = entry.mailbox.wake_reader
+    try:
+        assert entered.wait(timeout=5.0), "受付スレッドが select の直前で止まるまで"
+        started = time.monotonic()
+        entry.stop(drain=False)
+        assert time.monotonic() - started < 0.5  # drain=False は待たない
+        # 次の起動の検査に当たらないよう、ソケットのファイルはこの時点で消えている
+        assert not socket_path.exists()
+    finally:
+        gate.set()
+    receiver.join(timeout=5.0)
+    assert not receiver.is_alive()
+    # 閉じるのを受付スレッドへ任せた fd も、スレッドの終わりで閉じている
+    assert wake_reader.fileno() == -1
+    # 同じ場所でもう一度開ける（ロックもソケットも残っていない）
+    monkeypatch.setattr(admin_server.selectors, "DefaultSelector", selectors.DefaultSelector)
+    again = _open(config, short_dir / "a.db", rules)
+    assert again is not None
+    again.stop()
 
 
 def test_a_missing_entry_config_does_not_open_the_socket(short_dir, rules):
