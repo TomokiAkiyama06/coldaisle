@@ -4,6 +4,7 @@
 - **Status**: FINAL（2026-09-20、リポジトリ所有者が承認）
 - **Date**: 2026-09-19
 - **Supersedes**: なし
+- **Superseded by**: [0079](0079-model-artifact-formats.md)（§2.1 の「モデルに束縛する」の項のうち、Confidence Profile v2（反実仮想 Thermal Model artifact v2 に同梱する Profile）の束縛の対象を artifact 全体の SHA-256 から model payload の SHA-256 へ替える部分のみ。v1 の Profile には §2.1 をそのまま適用する。§2.2 の推論ごとの model binding の照合と他の節は有効）
 - **関連**: [`0027-fan-control-architecture.md`](0027-fan-control-architecture.md) /
   [`0028-fan-control-contracts.md`](0028-fan-control-contracts.md)（§2.3 / §2.5 (b)(c) / §2.8 / §2.9） /
   [`0029-telemetry-loss-classes.md`](0029-telemetry-loss-classes.md) /
