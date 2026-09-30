@@ -29,14 +29,15 @@ from coldaisle.control.schema import (
 )
 from coldaisle.store.models import validate_metric
 
-CONTROL_CONFIG_VERSION: Literal[11] = 11
+CONTROL_CONFIG_VERSION: Literal[12] = 12
 """4ファイルを束ねた Control Config の版。
 
 - v11（#81 / 決定記録 0073 §2.1）: ``air-balance.yaml``（v2）を4つ目のファイルにした。
   各ファイルの版は変えていない
+- v12（#74 / 決定記録 0080 §2.6）: ``safety.yaml`` を v4 にした（``hardware_write_fail_exit_ms``）
 """
 FAN_POLICY_CONFIG_VERSION: Literal[9] = 9
-SAFETY_CONFIG_VERSION: Literal[3] = 3
+SAFETY_CONFIG_VERSION: Literal[4] = 4
 CONFIG_FILENAMES = {
     "fan_hardware": "fan-hardware.yaml",
     "safety": "safety.yaml",
@@ -268,7 +269,12 @@ class TelemetryDelays(_ConfigModel):
 class SafetyConfig(_ConfigModel):
     """Critical Safety だけが所有する設定。全数値に status/basis を残す。"""
 
-    schema_version: Literal[3]
+    schema_version: Literal[4]
+    """v4（決定記録 0080 §2.6）で ``hardware_write_fail_exit_ms`` を必須にした。
+
+    **v3 を v4 として補完しない。** 補うと、所有者が見ていない時間で「書けないまま制御を
+    持ち続ける」上限が決まる（0028 §2.8 / ``docs/control-config.md`` の移行の規則）。
+    """
     absolute_temp_ceiling_c: SafetyFloat
     zone_min_demand: PerZone[SafetyDemand]
     cpu_cooling_floor: Annotated[
@@ -300,6 +306,13 @@ class SafetyConfig(_ConfigModel):
     tick_deadline_ms: SafetyMilliseconds
     overrun_consecutive_limit: ConfigValue[Annotated[int, Field(gt=0)]]
     watchdog_timeout_ms: SafetyMilliseconds
+    hardware_write_fail_exit_ms: SafetyMilliseconds
+    """takeover の後、ある zone の書き込みと読み戻しが一度も成功しないまま続いたら
+    fand を終了コード 7 で終える時間（決定記録 0080 §2.6）。
+
+    終わるときは引き継ぎ記録を消さないので、``ExecStopPost`` が root で Max を書く。
+    ``write_fail_emergency_after``（fand の中で ``EMERGENCY`` へ上げる回数）の**後ろの段**である。
+    """
 
     @model_validator(mode="after")
     def _safety_values_are_consistent(self) -> Self:
@@ -320,6 +333,19 @@ class SafetyConfig(_ConfigModel):
         # 半分の間隔で通知することを前提にしているので、その2倍を下限にする。
         if self.watchdog_timeout_ms.value < (self.tick_ms.value + self.tick_deadline_ms.value) * 2:
             raise ValueError("watchdog_timeout_ms は (tick_ms + tick_deadline_ms) の2倍以上にする")
+        # 決定記録 0080 §2.6 の不変条件。下限は fand の中の再試行と EMERGENCY への昇格
+        # （write_fail_emergency_after 回）を先に試すため、上限は「書けないまま制御を持つ」
+        # 時間を hang の deadman より長くしないため（書けない fand は冷却の面で hang と同じ）。
+        write_fail_floor_ms = (
+            self.tick_ms.value + self.tick_deadline_ms.value
+        ) * self.write_fail_emergency_after.value
+        if self.hardware_write_fail_exit_ms.value < write_fail_floor_ms:
+            raise ValueError(
+                "hardware_write_fail_exit_ms は "
+                "(tick_ms + tick_deadline_ms) * write_fail_emergency_after 以上にする"
+            )
+        if self.hardware_write_fail_exit_ms.value > self.watchdog_timeout_ms.value:
+            raise ValueError("hardware_write_fail_exit_ms は watchdog_timeout_ms 以下にする")
         for zone in Zone:
             if self.stall_check_min_demand.get(zone).value > self.zone_min_demand.get(zone).value:
                 raise ValueError(
@@ -1191,6 +1217,7 @@ class ControlConfig(_ConfigModel):
         append("safety.yaml", "tick_deadline_ms", safety.tick_deadline_ms)
         append("safety.yaml", "overrun_consecutive_limit", safety.overrun_consecutive_limit)
         append("safety.yaml", "watchdog_timeout_ms", safety.watchdog_timeout_ms)
+        append("safety.yaml", "hardware_write_fail_exit_ms", safety.hardware_write_fail_exit_ms)
         for zone in Zone:
             append(
                 "safety.yaml",

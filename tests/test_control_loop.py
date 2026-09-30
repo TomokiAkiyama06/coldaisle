@@ -104,6 +104,7 @@ from coldaisle.control_daemon import (
     StoreTelemetrySource,
     SystemdWatchdog,
     UnsupervisedWatchdog,
+    WatchdogNotifyIoError,
     WatchdogUnavailableError,
     build,
     create_watchdog,
@@ -2065,16 +2066,19 @@ def test_invariant_26_a_dead_notify_socket_is_reported_as_a_watchdog_failure(
     """通知先が消えている失敗を、素の `OSError` のまま外へ出さない（Codex 4057548964）。
 
     素通しすると、起動時の分類が「設定が不正」へ落ちて全 zone Max を書いてしまう。
+    `READY=1` を送れないのは通知の I/O の失敗で、恒久的な食い違い（終了コード 4）とは
+    分ける（決定記録 0080 §2.4。終了コード 6）。
     """
     stale = str(tmp_path / "gone.sock")
 
-    with pytest.raises(WatchdogUnavailableError, match=NOTIFY_SOCKET_ENV):
+    with pytest.raises(WatchdogNotifyIoError, match=NOTIFY_SOCKET_ENV) as raised:
         create_watchdog(
             interval_ms=1_100,
             timeout_ms=5_000,
             monotonic=ManualMonotonicClock(0),
             environ=_watchdog_env(stale, 5_000),
         )
+    assert not isinstance(raised.value, WatchdogUnavailableError)
 
 
 def test_invariant_25_the_trace_store_cannot_wait_longer_than_a_tick_deadline(
