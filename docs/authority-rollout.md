@@ -87,8 +87,12 @@ lock を手放す `inspect()` だけでは、A の証拠を持ったまま B が
   Fallback だけで回した続きや、いまの読み込み失敗を足しても新鮮にならない）
 - 名指した arm が holdout の実績に無い、または**制御器が Learned MPC でない**
   （適用された Fallback の arm を名指して昇格できない）
-- 名指した arm が**適用側**である。trace が tick ごとの artifact を記録するまで、
-  適用側の実績は artifact へ束縛できないので根拠にできない（0057 §2.4 / §3 / §5）
+- 名指した arm が**適用側**で、その arm が適用した artifact が記録されていない
+  （v1〜v6 の tick だけの区間。推測で埋めない）、または記録された artifact が
+  いまの Production の artifact ちょうど1つでない（決定記録 0059 §2.3 が 0057 §3 の
+  禁止を置き換えた。`_check_learned_arms()`）
+- 報告に現れた **Learned MPC の適用 arm のどれか**に、artifact を言えない適用 tick
+  （`unbound_attested_ticks`）が1件でもある
 - 名指した arm の stage が、いまの stage と違う
 - 報告に現れた **Learned MPC の arm のどれか**に gate 判定が無い、または1つでも `blocked` である
 
