@@ -1,7 +1,7 @@
 # 決定記録 0010: CSV 再生の規約
 
 - **種別**: Decision Record
-- **Status**: Proposed（本 PR のマージをもって FINAL）
+- **Status**: FINAL（2026-08-25、PR #16 のマージ）
 - **Date**: 2026-08-25
 - **Supersedes**: なし
 - **関連**: [`0003-device-json-schema.md`](0003-device-json-schema.md) §2.7 /

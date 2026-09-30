@@ -1,7 +1,7 @@
 # 決定記録 0017: 日次レポート
 
 - **種別**: Decision Record
-- **Status**: Proposed（本 PR のマージをもって FINAL）
+- **Status**: FINAL（2026-08-25、PR #23 のマージ）
 - **Date**: 2026-08-25
 - **Supersedes**: なし
 - **関連**: [`0002-metric-naming.md`](0002-metric-naming.md) §2.8 /

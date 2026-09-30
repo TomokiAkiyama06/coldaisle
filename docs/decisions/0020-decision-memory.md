@@ -1,7 +1,7 @@
 # 決定記録 0020: 運用メモリへの記録
 
 - **種別**: Decision Record
-- **Status**: Proposed（本 PR のマージをもって FINAL）
+- **Status**: FINAL（2026-09-10、PR #26 のマージ）
 - **Date**: 2026-08-26
 - **Supersedes**: なし
 - **関連**: [`README.md`](README.md)（「追記のみ」）/

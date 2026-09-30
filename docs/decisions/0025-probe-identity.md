@@ -1,7 +1,7 @@
 # 決定記録 0025: プローブの同定
 
 - **種別**: Decision Record
-- **Status**: Proposed（本 PR のマージをもって FINAL）
+- **Status**: FINAL（2026-09-10、PR #31 のマージ）
 - **Date**: 2026-09-10
 - **Supersedes**: なし
 - **関連**: [`0012-rule-engine.md`](0012-rule-engine.md) §2.6 /

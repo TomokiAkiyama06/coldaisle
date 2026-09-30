@@ -1,7 +1,7 @@
 # 決定記録 0018: AI 向けツールの公開方法
 
 - **種別**: Decision Record
-- **Status**: Proposed（本 PR のマージをもって FINAL）
+- **Status**: FINAL（2026-08-25、PR #24 のマージ）
 - **Date**: 2026-08-25
 - **Supersedes**: なし
 - **関連**: [`0009-read-api.md`](0009-read-api.md) §2.9 /
