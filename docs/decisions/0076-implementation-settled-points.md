@@ -8,6 +8,7 @@
   本記録の他の節は、各記録が実装 PR へ委ねた点（0071 §5 #1、0072 §5 #4 / #6）、
   0073 §5 が許した版番号の繰り上げ、0072 が決めていなかった点への追加（§2.7。0072 §2.2 / §2.8 に足す）
   を記録するもので、どの記録の決定も置き換えない
+- **Superseded by**: [0082](0082-authority-wiring-settled-points.md)（§2.2 (a) の「`superseded_by` は自分の `command_id` より大きい」のみ。migration 0009 で「自分の `command_id` と異なる」に緩めた。他の点は有効）
 - **関連**: [0060](0060-control-loop-runtime.md) §5 /
   [0071](0071-control-trace-read-api.md) §2.6 / §5 #1 /
   [0072](0072-control-admin-entry.md) §2.2 / §2.3 / §2.4 / §2.5 / §2.7 / §2.8 / §5 #3 / #4 / #6 /

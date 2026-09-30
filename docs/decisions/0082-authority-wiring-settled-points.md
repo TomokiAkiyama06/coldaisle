@@ -3,7 +3,9 @@
 - **種別**: Decision Record
 - **Status**: FINAL（2026-09-30、リポジトリ所有者が承認）
 - **Date**: 2026-09-30
-- **Supersedes**: なし。0057 / 0072 が実装 PR へ委ねた点と、どの記録も決めていなかった点を記録するもので、
+- **Supersedes**: [0076](0076-implementation-settled-points.md) §2.2 (a) の「`superseded_by` は自分の
+  `command_id` より大きい」のみ（§2.4 で「自分の `command_id` と異なる」に緩める）。0076 の他の点は有効。
+  本記録の他の節は、0057 / 0072 が実装 PR へ委ねた点と、どの記録も決めていなかった点を記録するもので、
   どの記録の決定も置き換えない
 - **関連**: [0057](0057-authority-rollout-stage-changes.md) §2.1 / §2.6 /
   [0060](0060-control-loop-runtime.md) §2.7 /
@@ -41,7 +43,7 @@ PR #192（0072 §2.10 段階 2）は、`coldaisle-fand` へ `AuthorityRuntime` �
 
 ### 2.4 監査の表の `superseded_by` の CHECK を緩める（migration 0009）
 
-- 「`superseded_by > command_id`」を「`superseded_by <> command_id`」にする
+- 「`superseded_by > command_id`」（0076 §2.2 (a)）を「`superseded_by <> command_id`」にする
 - authority の枠では、先に届いた深い降格が後から来た浅い降格を置き換える（0072 §2.2 の合成）ため、
   置き換えた側の `command_id` の方が小さいことがある
 
