@@ -29,7 +29,7 @@ applied demand から Air Balance を**記録する**ところまでを決めた
 
 | 箇所 | 状態 |
 |---|---|
-| `ConfiguredAirBalanceModel.coordinate()` | 実装済みの純粋関数。Exhaust 過多なら Front make-up air、熱制約を伴う Intake 過多なら Rear → 不足分だけ Top（0026 の順）。`AirBalanceCoordination` の検証で**どの zone も candidate を下回らない**（上げるだけ）。`projected_top_floor` を受け取り Top の風量見積もりにだけ使う |
+| `ConfiguredAirBalanceModel.coordinate()` | 実装済みの純粋関数。Exhaust 過多なら Front make-up air、熱制約を伴う Intake 過多なら Rear → 不足分だけ Top（0026 の順）。`AirBalanceCoordination` の検証で**どの zone も candidate を下回らない**（上げるだけ）。`projected_top_floor` を受け取り Top の風量見積もりにだけ使う（Front / Rear の下限は受け取らない。§2.2 で zone ごとの `projected_floors` に広げる） |
 | `FallbackController` | 3 zone の最大値を共有する決定論的な制御器（全 zone 同じ demand）。Air Balance を知らない |
 | `ControlLoop._run_tick()` | Fallback → Critical Safety の評価 → Gate（`_select()`）→ `_requested()` → 合成（0028 §2.4）→ Backend。`coordinate()` を呼ぶ箇所は無い |
 | `AirBalanceRecorder` | 校正済みのときだけ `ConfiguredAirBalanceModel` を作り、applied demand の推定を `ControlTick` v11 の `air_balance` に**記録するだけ** |
@@ -60,7 +60,7 @@ Baseline が動いている時間のほとんどで「Top の排気が強い CPU
    `fallback_exception` の fault にし、その tick は raw baseline、次 tick の Critical Safety が `EMERGENCY`（全 zone Max）。
    `mode: shadow` では記録だけ（§2.6）。代替 I は採らない（0028 は置き換えない）
 5. **昇格の証拠を `fan-policy.yaml` の trace に束縛する**（`fan_policy_trace_binding`。§2.5）。代替 P は採らない
-6. **CPU Telemetry の stale による Top の `forced_max` は `projected_top_floor = 1.0` として協調を続け、
+6. **CPU Telemetry の stale による Top の `forced_max` は Top の `projected_floors.top = 1.0` として協調を続け、
    Top を含むどの zone でも Fan fault（確定前の tach 無応答を含む。下の 11）があれば `skipped`**（§2.3）。代替 O は採らない
 7. **LIMITED / EXPANDED の帯の中心は coordinated baseline**（§2.5）。代替 K は採らない
 8. **協調を掛ける Safety の状態は `NORMAL` と `DEGRADED`**（§2.3）
@@ -68,7 +68,8 @@ Baseline が動いている時間のほとんどで「Top の排気が強い CPU
 10. **shadow → apply の合否の基準は、shadow の実データを見てから別の記録か PR で決める**（§5）。
     shadow の `counterfactual_output` が開ループである（apply の閉ループを再現しない）ことの扱いも、その基準と一緒に決める（§2.4 / §5）
 11. **最終レビューの指摘への対応**（いずれも推奨の直し方）:
-    - Top の風量の見積もりは requested でなく、**合成の下限（Safety の floor・Guard の floor・`ramp_down` の下限）込みの effective の見込み**で行う（§2.2 / §2.4）
+    - 風量の見積もりは requested でなく、**合成の下限（Safety の floor・Guard の floor・`ramp_down` の下限）込みの effective の見込み**で行う（§2.2 / §2.4）。
+      当初は Top だけだったが、Codex の追加の指摘（7687fee、2026-09-30 の追加の修正）で **Front / Rear / Top のすべての zone** に広げた
     - **backend の生の `TACH_STALL` 報告と、`stall_window_ms` が満ちる前の tach 無応答**を Critical Safety の裁定に露出し
       （`CriticalSafetyDecision.tach_unconfirmed_zones`）、最初の報告の tick から `skipped` にする（§2.3）
     - **適用した zone ごとの `max_raise` を trace に記録**し、trace だけで `output - candidate <= max_raise` を検査できるようにする（§2.7）
@@ -89,8 +90,8 @@ Baseline が動いている時間のほとんどで「Top の排気が強い CPU
 ```text
 Fallback.propose()                       … raw baseline（いまの requested）
 Critical Safety.evaluate()               … requested を見ない（いまと同じ位置）
-  ↓ Top の safety floor・forced_max と、合成の Guard floor・ramp_down の下限を読むだけ
-AirBalanceCoordinator.apply(raw baseline, snapshot, Top の effective の下限の見込み)   ← 本記録
+  ↓ 各 zone の safety floor・forced_max と、合成の Guard floor・ramp_down の下限を読むだけ
+AirBalanceCoordinator.apply(raw baseline, snapshot, zone ごとの effective の下限の見込み)   ← 本記録
   ↓ coordinated baseline（mode: apply のときだけ raw と違いうる）
 ControllerGate.select(fallback = coordinated baseline, learned = …)
   ↓ requested
@@ -103,11 +104,25 @@ ControllerGate.select(fallback = coordinated baseline, learned = …)
   Critical Safety の floor・`ramp_down`・`forced_max` は、協調後の requested にもいまと同じく掛かる
   （AGENTS.md ルール2・5）。**合成の後・Backend の前に値を足す経路は作らない**
 - Critical Safety の裁定を先に評価するのは、いまの loop の順序のまま（Safety は requested を見ない）。
-  協調はその裁定の **Top の出力と合成の下限を読み、`projected_top_floor` として渡すだけ**で、裁定を作り直さない・
-  書き換えない（`CriticalSafetyDecision` は発行済みの不変オブジェクト）。`projected_top_floor` は、
-  Top の `forced_max` が真なら **1.0**、偽なら **合成（0028 §2.4）が requested に掛ける下限の最大値**
-  `max(Guard の Top floor, Safety の Top floor, Top の ramp_down の下限)` とする（所有者の判断 6・11）。
-  - **ramp_down の下限を入れる**（最終レビュー 765c728 の指摘1）: Top が高い demand から下がる途中は、
+  協調はその裁定の **各 zone の出力と合成の下限を読み、zone ごとの `projected_floors`（`PerZone[Demand]`）として渡すだけ**で、
+  裁定を作り直さない・書き換えない（`CriticalSafetyDecision` は発行済みの不変オブジェクト）。zone `z` の `projected_floors.z` は、
+  その zone の `forced_max` が真なら **1.0**、偽なら **合成（0028 §2.4）が requested に掛ける下限の最大値**
+  `max(Guard の z の floor, Safety の z の floor, z の ramp_down の下限)`（どれも無ければ 0.0）とする（所有者の判断 6・11）。
+  - **Front / Rear / Top のすべての zone に同じ式を掛ける**（2026-09-30 の追加の修正。Codex の 7687fee への指摘1）:
+    Front / Rear が Guard / Safety の floor や自身の ramp-down の下限で raw baseline より高く回る tick に、
+    Top の下限だけを見込むと、協調は実際には Fan に送られない風量で比を採点する。Front の下限が高ければ
+    Rear / Top の排気が、Rear の下限が高ければ Front make-up air が要るのに、どちらの補正も出せない。
+    Top だけの見込み（`projected_top_floor`）は Front / Rear について同じ取り違えを残すので採らない（§4 の T）
+  - **`coordinate()` の引数を zone ごとに広げる**（§2.11 の PR（b））。いまの `projected_top_floor: Demand | None` を
+    `projected_floors: PerZone[Demand] | None` に置き換え、`AirBalanceCoordination` の欄も同じく置き換える
+    （`coordinate()` はまだ loop から呼ばれていないので、呼び出し側の移行は単体試験だけ）。風量の見積もり
+    （`before` と `projected` の両方）は zone ごとに `max(requested_z, projected_floors.z)` の demand で行い、
+    引き上げの目標（Front make-up air・Rear → Top の不足分）もこの見積もりの風量から求める。
+    目標の demand が `max(s_z, projected_floors.z)` 以下の zone は、下限が既にその風量を出しているので**引き上げない**
+    （`requested.z` は candidate のまま。floor を requested に写さない）
+  - Front / Rear の `forced_max` は `NORMAL` / `DEGRADED` では Fan fault からしか生じず、その tick は §2.3 で `skipped` になる。
+    したがって実際に 1.0 と見積もるのは Top の `forced_max`（CPU Telemetry の stale）だけで、式は zone で分けない
+  - **ramp_down の下限を入れる**（最終レビュー 765c728 の指摘1。どの zone でも同じ）: Top が高い demand から下がる途中は、
     `DemandComposer` が前 tick の effective から `ramp_down_per_s` の下限を掛けるので、実際の Top の排気は
     requested（や Safety の floor）より大きい。requested だけで見積もると、requested が 0.2 でも実効は 1.0 近い
     tick に Front make-up air を足し損ねる。下限の値は **合成と同じ式・同じ前 tick の effective・同じ経過時間**で求める。
@@ -115,7 +130,7 @@ ControllerGate.select(fallback = coordinated baseline, learned = …)
     `_compose_effective_demands()` の ramp の下限と**同じ関数**を呼ぶ（式を写さない。値が合成とずれない）。
     新しい閾値は足さない（`ramp_down_per_s` は `safety.yaml` の既存の値）
   - Guard の ceiling は requested を切り詰めるだけで下限の後には掛からないので、見込みに入れない。
-    Top の requested 自身は `coordinate()` が candidate から読む（`projected_top_floor` との `max()`）
+    各 zone の requested 自身は `coordinate()` が candidate から読む（`projected_floors` との `max()`）
   - `DEGRADED` のまま Top だけを Max にする裁定（CPU Telemetry の stale。`_zone_outputs()` の `forced_by_fault`）が
     あり、`floor` だけを渡すと Top の排気を過小に見積もり、Top が Max の最中に Front make-up air を出し損ねるため 1.0 とする。
     同じ `forced_by_fault` には Top の Fan fault（stall・書き込み失敗）も入るが、そのときの Top の実際の排気は
@@ -123,7 +138,8 @@ ControllerGate.select(fallback = coordinated baseline, learned = …)
     **1.0 と見積もるのは CPU Telemetry の stale による Top の `forced_max` だけ**になる
   - Top の実際の排気は `max(case_aux_exhaust, 上の下限)`（`forced_max` なら 1.0）なので、CPU cooling floor や
     ramp-down 中の残りの排気による排気過多も Front make-up air の判断に入る（`docs/air-balance-model.md`）。
-    見込みは `requested.top` に写さない（下限の所有者は Critical Safety と合成のまま）
+    Front / Rear も同じく `max(requested, 上の下限)` で見積もる。見込みはどの zone でも requested に写さない
+    （下限の所有者は Critical Safety と合成のまま）
 - 協調は **Fallback の中に入れない**。別の部品（`control/air_balance_coordination.py` の
   `AirBalanceCoordinator`。`control/air_balance.py` を import し、`fallback/` は import しない）にする。
   Fallback は ML にも characterization にも依存しない最後の拠り所のまま残し、raw baseline を常に記録できるようにする
@@ -145,7 +161,7 @@ ControllerGate.select(fallback = coordinated baseline, learned = …)
 | snapshot が `AVAILABLE`（Fallback が `propose()` を使った tick） | `snapshot_unavailable` | `propose_without_snapshot()` は曲線の最大値を全 zone に出す保守側の tick で、熱の入力も無い |
 | Fallback が提案を返した（例外で `None` でない） | `baseline_unavailable` | `_requested()` の Max の経路を変えない |
 | Critical Safety の `state` が `NORMAL` か `DEGRADED` | `safety_state` | `STARTUP` / `EMERGENCY` は `forced_max` で全 zone Max。協調しても effective は変わらず、trace を読みにくくするだけ |
-| Critical Safety の裁定の `faults` に、zone つきの Fan fault（`TACH_STALL` / `WRITE_FAILURE` / `READBACK_MISMATCH` / `ENABLE_REVERTED`。`critical.py` の `_FAN_FAULTS`）が **Top を含めてどの zone にも無い**。かつ Front / Rear に `forced_max` が無い | `zone_fan_fault` | Fan fault の zone の `forced_max` は、その zone の実際の風量が demand から言えない（不明か 0）裁定で、Front / Rear でも Top でも同じ。Top の Fan fault を 1.0 と見積もると、存在しない Top の排気で Rear / Top の熱の排気を抑えたり、不要な Front make-up air を足したりする。ほかの zone は `fault_demand` が既に上げている（0028 §2.7）。判定は `CriticalSafetyDecision.faults` の fault code で行い、`SafetyZoneOutput.reason` の文字列は読まない。Front / Rear の `forced_max` は `NORMAL` / `DEGRADED` では Fan fault からしか生じないが、将来の裁定の追加に備えて明示的にも確かめる。CPU Telemetry の stale による Top の `forced_max` は skip せず、`projected_top_floor = 1.0` として扱う（§2.2。所有者の判断 6） |
+| Critical Safety の裁定の `faults` に、zone つきの Fan fault（`TACH_STALL` / `WRITE_FAILURE` / `READBACK_MISMATCH` / `ENABLE_REVERTED`。`critical.py` の `_FAN_FAULTS`）が **Top を含めてどの zone にも無い**。かつ Front / Rear に `forced_max` が無い | `zone_fan_fault` | Fan fault の zone の `forced_max` は、その zone の実際の風量が demand から言えない（不明か 0）裁定で、Front / Rear でも Top でも同じ。Top の Fan fault を 1.0 と見積もると、存在しない Top の排気で Rear / Top の熱の排気を抑えたり、不要な Front make-up air を足したりする。ほかの zone は `fault_demand` が既に上げている（0028 §2.7）。判定は `CriticalSafetyDecision.faults` の fault code で行い、`SafetyZoneOutput.reason` の文字列は読まない。Front / Rear の `forced_max` は `NORMAL` / `DEGRADED` では Fan fault からしか生じないが、将来の裁定の追加に備えて明示的にも確かめる。CPU Telemetry の stale による Top の `forced_max` は skip せず、`projected_floors.top = 1.0` として扱う（§2.2。所有者の判断 6） |
 | Critical Safety の裁定の `tach_unconfirmed_zones`（下記）が**空**（Top を含むどの zone にも無い） | `tach_unconfirmed` | backend の `TACH_STALL` は1回の帰還にすぎず、Critical Safety は `stall_window_ms` が満ちるまで `faults` に出さない（0028 §2.7 / 0034 §2。`critical.py` の `_stall_faults()`）。その間も tach が返っていない Fan を demand から見積もって協調すると、上の行と同じく存在しない風量で比を採点する（最終レビュー 765c728 の指摘2）。**最初の報告の tick から** `skipped` にする。Safety の fault の確定（`stall_window_ms` の窓）は変えない |
 
 **`CriticalSafetyDecision.tach_unconfirmed_zones` を足す**（所有者の判断 6・11）。Critical Safety の裁定に、
@@ -158,7 +174,12 @@ ControllerGate.select(fallback = coordinated baseline, learned = …)
 どちらも Critical Safety が**いま既に計算している**値を外へ見せるだけで、新しい閾値を足さない
 （`stall_window_ms` / `stall_min_rpm` / `stall_check_min_demand` は `safety.yaml` の既存の値）。
 この欄は Safety の `state`・floor・`forced_max`・`faults` を変えない（読むのは協調だけで、Safety の判定には戻さない）。
-裁定は trace へそのまま記録されるので、欄の追加は §2.7 の `ControlTick` の版上げに含める（新しい版の tick は欄を必ず持ち、旧版は持たない）。
+**trace への記録**: いまの `ControlLoop` は `CriticalSafetyDecision` をそのまま直列化せず、faults・合成後の zone の値・
+`SafetyProvenance` を `ControlTick` へ写している。したがって裁定に欄を足すだけでは trace に残らない。
+§2.7 の `ControlTick` の新しい版に **明示的な欄 `tach_unconfirmed_zones`**（zone 名の昇順の配列、既定は空）を加え、
+trace の writer（`ControlLoop` が `ControlTick` を組み立てる箇所）が**その tick の `CriticalSafetyDecision.tach_unconfirmed_zones` から埋める**
+（2026-09-30 の追加の修正。Codex の 7687fee への指摘2）。新しい版の tick は欄を必ず持ち、旧版は持たない。
+保存した trace だけで、どの zone の未確認の tach が `skipped`（`tach_unconfirmed`）の原因かを読めるようにする。
 協調が Critical Safety の内部状態を直接読む経路は作らず、発行済みの裁定だけを読む（§2.2 と同じ）。
 
 Telemetry の鮮度は**協調の側で別の閾値を持たない**。熱の入力は 0073 §2.4 の入力契約（`ADVISORY`、
@@ -173,9 +194,10 @@ zone `z` の raw baseline を `c_z`、`coordinate()` の提案を `p_z` とす�
 
 ```text
 s     = FanHardwareConfig.stable_demands(c)               … 0073 §2.3 の純粋関数（backend と同じ引き上げ）
-top   = 1.0 if safety.zones.top.forced_max
-        else max(guard.top.floor, safety.zones.top.floor, composer.ramp_floor(top))   … §2.2（Fan fault・tach 未確認の tick は §2.3 で skipped 済み）
-coord = coordinate(s, thermal, projected_top_floor = top)
+f_z   = 1.0 if safety.zones.z.forced_max
+        else max(guard.z.floor, safety.zones.z.floor, composer.ramp_floor(z) or 0.0)   … §2.2。z = front / rear / top
+                                                              （Fan fault・tach 未確認の tick は §2.3 で skipped 済み）
+coord = coordinate(s, thermal, projected_floors = f)          … 風量は zone ごとに max(requested_z, f_z) で見積もる
 p_z   = coord.requested.z  if coord.requested.z > s_z  else c_z     … 引き上げの無い zone は raw のまま
 r_z   = max(0, min(p_z, c_z + max_raise_z) - c_z)                     … この tick の引き上げ幅（上げるだけ・上限つき）
 h_z   = 直近 release_hold_ms の間（単調時計）の r_z の最大値（この tick を含む。apply でも shadow でも同じ保持の状態）
@@ -283,7 +305,13 @@ air_balance_coordination:
 
 ### 2.7 trace への記録（`ControlTick` の次の版）
 
-`ControlTick` に tick ごとの塊 `air_balance_coordination`（新設、その版では必須）を加える。
+`ControlTick` に tick ごとの塊 `air_balance_coordination`（新設、その版では必須）と、
+Critical Safety の裁定の写し `tach_unconfirmed_zones`（新設、その版では必須。§2.3）を加える。
+
+```text
+tach_unconfirmed_zones: [front | rear | top ...]     # ControlTick の直下（塊の外）。zone 名の昇順・重複なし。既定は空の配列
+                                                     # writer がその tick の CriticalSafetyDecision.tach_unconfirmed_zones から埋める
+```
 
 ```text
 air_balance_coordination:
@@ -301,8 +329,9 @@ air_balance_coordination:
   max_raise:  {front, rear, top} | null              # この tick に適用した fan-policy.yaml の max_raise（mode が shadow / apply なら status によらず記録）
   bounded_by_max_raise: {front, rear, top: bool} | null
   held:       {front, rear, top: bool} | null        # release_hold_ms の保持で h_z > r_z だった zone（shadow は模擬の保持）
-  projected_top_floor: demand | null                 # 渡した Top の値（forced_max なら 1.0、ほかは合成の下限の最大値。§2.2）
-  projected_top_basis: forced_max | safety_floor | guard_floor | ramp_down | none | null   # projected_top_floor を決めた下限
+  projected_floors: {front, rear, top} | null        # 渡した zone ごとの下限の見込み f_z（forced_max なら 1.0、ほかは合成の下限の最大値。§2.2）
+  projected_floor_basis: {front, rear, top: forced_max | safety_floor | guard_floor | ramp_down | none} | null
+                                                     # zone ごとに f_z を決めた下限（同値なら forced_max → safety_floor → guard_floor → ramp_down の順で1つ）
   before_state / before_ratio / projected_state / projected_ratio   # AirBalanceCoordination.before / projected から
   reasons: [front_makeup_air | rear_thermal_exhaust | top_case_aux_exhaust ...]
   failure: {type, detail(≤500)} | null               # failed のときだけ
@@ -312,7 +341,9 @@ air_balance_coordination:
 
 | 条件 | 内容 |
 |---|---|
-| `mode: off` | `status: off`、ほかの欄はすべて `null` / 空（`max_raise` も `null`） |
+| `mode: off` | `status: off`、ほかの欄はすべて `null` / 空（`max_raise`・`projected_floors`・`projected_floor_basis` も `null`） |
+| `projected_floors` / `projected_floor_basis` | どちらも null か、どちらも非 null。非 null なら各 zone が 0.0..1.0 の有限値で、basis が `forced_max` の zone は 1.0、`none` の zone は 0.0 |
+| `tach_unconfirmed_zones` | 空でないなら、`mode` が `shadow` / `apply` の tick は `status: skipped` で、`skip_reason` が `tach_unconfirmed` か表の上の行（`air_balance_disabled` 〜 `zone_fan_fault`）のどれか。`skip_reason: tach_unconfirmed` なら空でない |
 | `mode: shadow` / `apply` | `max_raise` は非 null で、各 zone が 0.0..1.0 の有限値 |
 | `status: skipped` / `failed` | `output == candidate`（raw baseline を使った）、`counterfactual_output` は `null`。`skip_reason` / `failure` はそれぞれのときだけ非 null。`held` はすべて偽（保持を解いた。§2.4） |
 | `status: shadow` | `mode: shadow` と同値（`mode: shadow` で `coordinate()` を呼んだ tick は、上げる必要の有無によらず常に `shadow`。`not_needed` / `applied` にはならない）。`output == candidate`、`proposed` と `counterfactual_output` は記録する（適用しない）。apply なら上げていたかは `counterfactual_output > candidate` で読む。`held` は模擬の保持（§2.4） |
@@ -376,14 +407,18 @@ air_balance_coordination:
 - **条件の欠け**: `MANUAL` / `CALIBRATION` / `MAX`、snapshot 不在、Fallback 例外、`STARTUP` / `EMERGENCY`、
   Front / Rear / Top の Fan fault（`TACH_STALL` と書き込み失敗の各 code）、Air Balance 無効のそれぞれで `skipped` と正しい `skip_reason`、`output == candidate`。
   Top の Fan fault と CPU Telemetry の stale が同じ tick に重なっても `skipped` であること
-- **Top の `forced_max`**: `DEGRADED` で CPU Telemetry が stale（Top だけ Max）の tick に `projected_top_floor == 1.0` が渡り、
+- **Top の `forced_max`**: `DEGRADED` で CPU Telemetry が stale（Top だけ Max）の tick に `projected_floors.top == 1.0` が渡り、
   Top の floor だけを渡した場合より Front make-up air が小さくならないこと
-- **Top の ramp-down**: Top が高い effective から下がる途中（requested は低い）の tick で、`projected_top_floor` が
+- **Front / Rear の下限**: Front が Guard / Safety の floor か ramp-down の下限で raw baseline より高い tick に、
+  Rear / Top の排気の引き上げ（熱制約を伴う場合）が見込まれること、Rear が同じく高い tick に Front make-up air が見込まれること。
+  下限が既に目標の風量を出している zone は引き上げないこと。trace の `projected_floor_basis` が zone ごとに決めた下限と一致すること
+- **Top の ramp-down**: Top が高い effective から下がる途中（requested は低い）の tick で、`projected_floors.top` が
   合成の ramp_down の下限と一致し（`DemandComposer.ramp_floor()` と合成の結果の `bound_by: ramp_down` の値が同じ）、
   requested だけで見積もった場合より Front make-up air が小さくならないこと。最初の tick（前 tick の effective が無い）は下限なし
 - **tach 未確認**: simulated backend が `TACH_STALL` を返した**最初の tick**から、`stall_window_ms` が満ちて
   `faults` に確定するまでの各 tick が `skipped`（`tach_unconfirmed`）で `output == candidate` であること。
-  Front / Rear / Top のそれぞれで確かめる。`tach_unconfirmed_zones` の有無で Safety の `state`・floor・`forced_max`・`faults` が変わらないこと
+  Front / Rear / Top のそれぞれで確かめる。`tach_unconfirmed_zones` の有無で Safety の `state`・floor・`forced_max`・`faults` が変わらないこと。
+  保存した `ControlTick` の `tach_unconfirmed_zones` が、その tick の裁定の値と一致すること（writer が埋める）
 - **合成を迂回しない**: 協調で上げた requested に Guard の ceiling が掛かること、Safety の floor・`forced_max`・
   `ramp_down` がいまと同じく掛かること、Top の CPU cooling floor が協調の有無で変わらないこと
 - **失敗**: `coordinate()` が例外を投げる・下げる値を返す偽の model を差し込み、その tick は `failed`・raw baseline・
@@ -408,7 +443,7 @@ air_balance_coordination:
 |---|---|---|---|
 | 1 | 本記録（docs） | 2026-09-30 に所有者が推奨案で承認（FINAL） | — |
 | 2 | #81 の実装 PR（a） | `fan-policy.yaml` の `air_balance_coordination` と検証（`uncalibrated` との組み合わせの拒否を含む）、純粋な `AirBalanceCoordinator`（上限・保持・下げない検証）と単体試験、`docs/control-config.md` の移行手順。**loop へは配線しない** | `fan-policy.yaml` 9 → 次、`CONTROL_CONFIG_VERSION` 11 → 次 |
-| 3 | #81 の実装 PR（b） | loop への配線（§2.2 の位置・§2.3 の条件・§2.6 の失敗）、`DemandComposer.ramp_floor()` と `CriticalSafetyDecision.tach_unconfirmed_zones`（Safety の判定は変えない）、Gate へ coordinated baseline を渡す、`ControlTick` の新しい版と `air_balance_coordination`、`airflow-trace.js` の `KNOWN_VERSIONS`、fixture、`docs/air-balance-model.md` の更新 | `ControlTick` 次の空いた番号（#192 の v13 の後なら v14）。**他の版上げの PR と直列** |
+| 3 | #81 の実装 PR（b） | loop への配線（§2.2 の位置・§2.3 の条件・§2.6 の失敗）、`DemandComposer.ramp_floor()` と `CriticalSafetyDecision.tach_unconfirmed_zones`（Safety の判定は変えない）、`coordinate()` の `projected_top_floor` を `projected_floors` へ置き換え（§2.2）、Gate へ coordinated baseline を渡す、`ControlTick` の新しい版と `air_balance_coordination`・`tach_unconfirmed_zones`、`airflow-trace.js` の `KNOWN_VERSIONS`、fixture、`docs/air-balance-model.md` の更新 | `ControlTick` 次の空いた番号（#192 の v13 の後なら v14）。**他の版上げの PR と直列** |
 | 4 | #91（または #81 の追加 PR） | `fan_policy_trace_binding` と `_check_evidence()` の拒否（§2.5）、offline 評価の Baseline の arm が `mode` に応じて coordinated baseline を再現する、shadow の集計（§5）。**段 6 より前に入れる** | 評価報告と `MIN_EVIDENCE_REPORT_SCHEMA_VERSION` を次の空いた番号へ |
 | 5 | #75（人・実機） | 校正済み `air-balance.yaml`（§2.9 の A）、続いて B | — |
 | 6 | 運用（人） | `mode: shadow` へ変更・再起動、集計を所有者が確認 | 設定のみ |
@@ -459,6 +494,8 @@ air_balance_coordination:
 | K. LIMITED / EXPANDED の帯の中心を raw baseline にする | MPC の自由度を変えない | Gate が Fallback を選んだときの値（coordinated）と、帯の基準（raw）が別の Baseline になり、「Baseline」が2つの意味を持つ。所有者は判断 7 で推奨案を採った（2026-09-30） |
 | L. 前 tick の applied demand（実測側）を基準に協調する | 実際に回った風量に近い | 1 tick 遅れの帰還になり、協調自身の出力を次の入力にする。candidate を `stable_demands()` に通せば backend の引き上げは反映できる |
 | Q. Top の風量を requested（と Safety の floor）だけで見積もる | 合成の状態を読まない | ramp-down の途中は実際の排気が requested より大きく、Front make-up air を足し損ねる（最終レビュー 765c728 の指摘1） |
+| T. Front / Rear の下限は見込まず Top だけを見込む（`projected_top_floor` のまま） | `coordinate()` の引数を変えない | Front / Rear が floor・ramp-down で raw より高い tick に、実際には送られない風量で比を採点し、Rear / Top の排気や Front make-up air の補正を出せない（Codex の 7687fee への指摘1） |
+| U. `tach_unconfirmed_zones` を `CriticalSafetyDecision` にだけ持ち、trace には書かない | `ControlTick` の欄が増えない | loop は裁定をそのまま直列化しないので、保存した trace から `tach_unconfirmed` の原因の zone を読めない（同 指摘2） |
 | R. tach の無応答は `stall_window_ms` で確定した `TACH_STALL` だけを見る | Critical Safety の裁定に欄を足さない | 確定までの窓の間、tach が返らない Fan を demand から見積もって協調する（同 指摘2） |
 | S. trace には `max_raise` の値を載せず、`fan-policy.yaml` の hash と `bounded_by_max_raise` だけにする | trace が小さい | trace だけで `output - candidate <= max_raise` を検査できない（同 指摘3） |
 | M. 協調専用の Telemetry 鮮度の閾値を持つ | 明示的 | 0073 §2.4 の入力契約と二重になる。stale は `None` になり、熱による引き上げは起きない側に倒れる |
