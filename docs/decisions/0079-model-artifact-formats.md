@@ -3,7 +3,17 @@
 - **種別**: Decision Record
 - **Status**: Proposed
 - **Date**: 2026-09-30
-- **Supersedes**: なし
+- **Supersedes**: 承認されたとき、次の部分だけを置き換える（**v2 の Profile と artifact についてのみ**。v1 の Profile には
+  従来どおり適用する）。
+  - [0050](0050-model-confidence-ood-and-authority.md) §2.1 の「モデルに束縛する」の項のうち、Profile が持つ
+    束縛の対象を artifact 全体の SHA-256 から model payload の SHA-256 へ替える部分（§2.1「Profile v2」）
+  - [0052](0052-learned-mpc-optimizer-and-hard-constraints.md) §2.1 の attestation の表の `artifact_sha256` の行の
+    「生成時: Confidence Profile の binding と照合」を、封をした型が同じ bytes から model と Profile を
+    作ることの保証へ替える部分（§2.1「推論ごとの model binding」）
+  - 0050 §2.2 の model binding の構成要素（予測の artifact SHA-256 を毎推論で照合する）は**置き換えない**。
+    v2 でも同じ強さで残す（§2.1）
+  - 旧記録側への `Superseded by` の追記（README「追記のみ」）は、所有者が承認した後、本 PR のマージ前に
+    行う（Proposed の間は 0050 / 0052 に手を入れない。§6 の質問 1）
 - **関連**: [0027](0027-fan-control-architecture.md) / [0028](0028-fan-control-contracts.md) §2.4 / §2.7 / §2.9 /
   [0031](0031-thermal-dataset-contract.md) §2.1 / §2.2 / §2.6 /
   [0037](0037-model-registry-rollback-target.md) §2 / §5 /
@@ -14,13 +24,21 @@
   [0058](0058-rl-supervisor-training-environment.md) §2.3 / §5 /
   [0059](0059-decision-trace-model-artifact.md) §2.1 / [0061](0061-rl-supervisor-policy-artifact-and-binding.md) §2.1 / §2.4 /
   [0062](0062-model-registry-operations.md) §2.4 / §5 /
-  [0071](0071-control-trace-read-api.md) §2.5 / [0075](0075-trace-registry-block-reason-digest.md) /
+  [0060](0060-control-loop-runtime.md) / [0071](0071-control-trace-read-api.md) §2.5 /
+  [0075](0075-trace-registry-block-reason-digest.md) / [0076](0076-implementation-settled-points.md) /
+  0077（open PR #196。Learned MPC worker の読み込みと受け渡し）/ 0078（open PR #194。`ControlTick` の版上げを含む）/
   `docs/model-registry.md` / `docs/requirements.md` Q-22 / Q-23
 - **対象 Issue**: #104 / #84 / #85 / #86 / #105（`registry_attested` dynamics）。依存 #83
 
 本記録は **Proposed** である。§2 は推奨案であり、§4 に主な代替案とトレードオフを並べた。
 所有者が §2 の推奨案を承認するか、§4 の代替案のどれかを選ぶまで、実装は §2.9 の段 0 から先へ進めない。
 安全・制御に関わる判断を含むため、実装担当モデルに関係なく人間のレビューを必須とする（AGENTS.md「実装の担当」）。
+所有者に答えてほしい選択は §6 に番号付きの質問として並べ、それぞれ推奨を示した。
+
+**前提とする記録の Status。** 本記録は 0037（rollback target の選び方）と 0048（v1 artifact の規律）を
+決着済みの土台として引く。両者は `main` ではまだ `Proposed` で、open PR #193 が `FINAL` にする。
+**本記録の承認は PR #193 のマージを前提とする**（#193 が先にマージされない、または 0037 / 0048 の
+内容が変わった場合、本記録の §2.1 と §4 の却下理由を見直す。§6 の質問 8）。
 
 ## 1. Context
 
@@ -57,8 +75,15 @@ artifact もそれを名乗れない。0048 §2.1 が v1 artifact の capability
   判断を出した thermal artifact の hash である
 - `ControlTick` は main で v12、open PR #192 が v13 へ上げる。`src/coldaisle/web/airflow-trace.js` の
   `KNOWN_VERSIONS` は v12 まで
+- Confidence の判定器は推論ごとに、予測の model ID・版・`artifact_sha256`（attestation 由来の artifact
+  全体の hash）を Profile の `ModelBinding` と照合する（0050 §2.2 の model binding。`control/model/confidence.py`）
 - Metric の単位は `config/metrics.yaml`（`MetricCatalog`）が持つ。較正の変更は 0056 §2.5 で
   「人が宣言する変更」として証拠を切る
+- 較正は**取り込み**（`coldaisle-daemon` の `Normalizer`）で掛かり、store には較正後の値だけが入る。
+  どの較正で作った値かを store は記録しない。制御ループは store を読む（0060）
+- `MpcProposal` は提案のある結果に `failure_reason` を付けられない。optimizer 自身の失敗の理由は
+  `OptimizerOutcome.reason`（`infeasible` / `cost_unusable` など）に載り、Gate は `OptimizerStatus.ERROR`
+  を detail の無い `optimizer_error` として Fallback にする
 
 実機 dataset はまだ無い。**本記録は形式・束縛・検証・失敗時の意味だけを決め、数値は決めない。**
 
@@ -95,12 +120,28 @@ v1 の `ModelBinding.artifact_sha256` は「artifact 全体の hash」なので�
 | 項目 | v1 | v2 |
 |---|---|---|
 | model への束縛 | artifact 全体の SHA-256 | **model payload の canonical SHA-256**（manifest の `payload_sha256` と同じ値）と feature / target / action schema の checksum・split checksum |
-| action の学習範囲 | anchor action の zone ごとの effective demand の範囲（`fan_ranges`） | v1 の欄に加え、**学習した action 列の範囲**（§2.5）: zone ごとの計画 demand の min / max と、step 間の変化量の min / max と件数 |
+| action の学習範囲 | anchor action の zone ごとの effective demand の範囲（`fan_ranges`） | v1 の欄に加え、**学習した action 列の範囲**（§2.5）: zone ごとの計画 demand の min / max、anchor → 最初の step の変化量の min / max と件数、step 間の変化量の min / max と件数 |
 | 置き場所 | 単独の JSON | artifact v2 の `confidence_profile` 区画。manifest が `confidence_profile_sha256` を持つ |
 
 作り方は 0050 §2.1 のまま（範囲・欠測・support は train だけ、residual の基準だけは validation、
 test / purged は使わない、呼び出し側が明示する値に既定値を置かない）。v1 の Profile は
 offline 評価の object として残し、Registry へは登録しない。
+
+#### 推論ごとの model binding（0050 §2.2）を v2 でどう保つか
+
+v2 の Profile は artifact 全体の hash を持てないが、0050 §2.2 の「予測の artifact SHA-256 が Profile と
+違えば OOD」は**弱めずに残す**。
+
+- 封をした型 `RegistryCounterfactualThermalModel`（§2.4）は、`VerifiedArtifact` の `artifact_sha256`
+  （Registry が検証した bytes 全体の hash）と、manifest の `payload_sha256`・model ID・版を**同じ bytes から**
+  取り出して持つ。判定器へ渡す runtime の束縛は、Profile v2 の binding（payload hash・schema・split）に、
+  この型が持つ `artifact_sha256` を**型の中で**足したものとし、呼び出し側が組み立てられない
+- 予測は従来どおり attestation 由来の `artifact_sha256` を持つ。判定器は推論ごとに、予測の model ID・版・
+  `artifact_sha256` を上の runtime の束縛と照合し、違えば OOD（0050 §2.2 の構成要素そのまま）。加えて
+  型の生成時に、Profile の `payload_sha256` が manifest の `payload_sha256` と一致することを L7 で確かめる
+- これにより「Profile が束縛する payload」と「予測を出した artifact」が同じ bytes に属することを、生成時
+  （L6 / L7）と推論ごと（0050 §2.2）の2段で確かめる。0052 §2.1 の「生成時: Profile の binding と照合」は、
+  v2 では「同じ `VerifiedArtifact` から model と Profile を作った型であること」に置き換わる（Supersedes）
 
 ### 2.2 v1 artifact は変えない
 
@@ -137,7 +178,10 @@ ThermalModelArtifact v2  (schema_name "coldaisle.thermal_model", schema_version 
 ```
 
 - **action schema `thermal-actions-v1`** は `step_ms`・step 数・zone の順（Front / Rear / Top）・
-  単位（demand、0.0..1.0）を持つ。推論の入力は 0052 の `PlannedThermalInput`（観測 window と
+  単位（demand、0.0..1.0）と、**action の出どころ `action_source`**（v1 では `effective_demand` だけの
+  Literal。0031 §2 の「熱応答の action は effective_demand」に従う）を持つ。applied demand へ替えるなら
+  action schema の版を上げ、0031 を置き換える新しい記録を作る（§5 #2）。出どころの違う artifact を
+  取り違えて読まない。推論の入力は 0052 の `PlannedThermalInput`（観測 window と
   `ActionPlan`）で、**plan の offset 列は action schema の格子と完全に一致しなければならない。**
   補間・外挿・丸めはしない。target schema の horizon 列もこの格子と一致させる（0052 §2.3 の
   「設定の上限を予測の契約へ合わせる」と同じ向き）
@@ -150,7 +194,12 @@ ThermalModelArtifact v2  (schema_name "coldaisle.thermal_model", schema_version 
   単位（派生値なら引き算の定義も）を写し、その canonical SHA-256 を持つ。表示名（label）は
   含めない（表示の変更で model を失効させない）
 - **較正の束縛**: 学習データに効いていた較正値のうち、使った metric に関わるものの digest を持つ。
-  較正を使わない metric だけなら `null`
+  較正を使わない metric だけなら `null`。store は較正の出どころを記録しないので（§1）、digest は
+  dataset を作る側が明示して渡す（既定値を置かない）
+- **較正の変更をまたぐ学習データは作らない。** Dataset v2 の生成（段 1）は、呼び出し側が渡す
+  0056 §2.5 の宣言された変更（`DeclaredChange`）のうち較正の変更が、train / validation / test のいずれかの
+  時間窓の中にあれば**拒否する**（窓を分けて作り直すのは人の判断）。1つの artifact に1つの較正 digest しか
+  持たせないための条件である
 - **digest は4層**：Registry の `artifact_sha256`（登録した bytes 全体）、manifest の
   `payload_sha256` と `confidence_profile_sha256`、schema ごとの checksum、学習データの checksum。
   **登録する bytes は canonical 直列化そのもの**とし、同じ artifact が2通りの bytes を持たない
@@ -180,13 +229,24 @@ Registry へは既存の `thermal_model` kind・`counterfactual_action` capabili
 | L6 | `payload_sha256`・`confidence_profile_sha256`・schema checksum を再計算して一致 | 拒否 |
 | L7 | Profile の binding が manifest の payload・schema・split と一致 | 拒否 |
 | L8 | metric binding の全 entry が runtime の `MetricCatalog` に同じ単位（派生値は同じ定義）で存在 | 拒否 |
-| L9 | 較正の digest が runtime の較正と一致（§5 の所有者判断を待つ間は**不一致を拒否**） | 拒否 |
+| L9 | 較正の digest が runtime の較正と一致（§6 の質問 4 の答えを待つ間は**不一致を拒否**） | 拒否 |
+
+**L9 の「runtime の較正」**は、推奨案では `coldaisle-fand` が起動時に1回だけ読む較正ファイル
+（取り込みと同じ `config/calibration.json` の path を設定で受け取る。既定の path を制御側に置かない）の、
+使った metric に関わる値の digest とする。ファイルを書き換えてから取り込みを再起動するまでの間は、
+store の値を作った較正と食い違いうる。この隙は推奨案では**閉じない**（取り込みが使った較正の digest を
+store へ記録する案は §6 の質問 5）。較正の変更は 0056 §2.5 で人が宣言するものなので、宣言と同時に
+取り込みと `coldaisle-fand` を再起動する手順で運用する。
 
 さらに利用側の生成時に次を照合する（tick ごとに失敗させない。0052 §2.6 と同じ）。
 
 - #86: `mpc.optimizer` の `step_ms` と step 数が action schema の格子と一致し、`cost_metrics` が
   target schema に含まれる。既存の `MpcModelBinding.for_control` の条件（production pointer・
   authority・版・schema）はそのまま
+- #86 と 0077（open PR #196）: 0077 の MPC worker が registry から artifact を検証して読み込む段は、
+  **`VerifiedArtifact` から本型を作る1つの呼び出し**にする。worker が `VerifiedArtifact` と、別に組み立てた
+  model / Profile を並べて持つ経路を作らない。本記録の段 4 と 0077 の読み込みの段は同じ境界を指すので、
+  先にマージされた方の実装にもう一方を合わせる
 - #86 / #85: Confidence 判定器は**同梱の Profile から作る**。別の Profile を渡す引数を制御側に持たせない
 - #105: `AttestedThermalDynamics.bind` は `RegistryCounterfactualThermalModel` だけを受け取る
   （`production_active` は従来どおり要求しない。0058 §2.3）
@@ -198,11 +258,19 @@ Confidence / OOD（0050）は **anchor 推論**を判定する。反実仮想モ
 それを見ない。そこで、0052 §2.4 の探索範囲に4つ目の「狭める写し」を足す。
 
 - 候補 plan の zone ごとの demand が Profile v2 の計画 demand の範囲（`range_margin` を適用した幅）を
-  外れるか、step 間の変化量が学習した変化量の範囲を外れる候補は**評価しない**
+  外れるか、変化量が学習した変化量の範囲を外れる候補は**評価しない**
+- **変化量には anchor から最初の step への遷移を含める。** 現行の optimizer は `ActionPlan.held` で
+  step の間を一定に保つ plan を作るので、step 間の変化量だけを見ると常に 0 で通り、anchor の effective
+  demand 0.2 から plan 0.9 への跳びが、両端の値が範囲内であれば評価されてしまう。Profile v2 は
+  「anchor action → 最初の step」の変化量（zone ごと・符号付きの min / max と件数）を step 間の変化量と
+  **別の欄**として持ち、候補ごとに anchor の effective demand からの遷移をこの範囲で照合する
 - **Fallback の requested（incumbent の出発点。0052 §2.3）自体が範囲外なら、optimizer は解を返さない**
-  （`optimizer_status = error`、`failure_reason` に範囲外であることを書く）。Gate は既存の
-  `optimizer_error` として Fallback にする。Baseline を範囲内へ丸めた値を出発点にしない
-  （丸めた値は Fallback ではなく、ML の外挿が選んだ値になるため）
+  （`OptimizerOutcome` の `status = error`、`reason.code = plan_out_of_learned_range`、detail に外れた
+  zone と量）。`MpcProposal.failure_reason` には書かない（提案のある結果に付けられない。§1）。
+  この理由は既存の経路どおり提案の zone ごとの requested の理由に載り、Gate は既存の `optimizer_error`
+  として detail なしで Fallback にする。Gate の `fallback_reason` の detail に範囲外を出すかは Gate と
+  trace の変更になるので推奨案ではしない（§5 #7、§6 の質問 6）。Baseline を範囲内へ丸めた値を出発点に
+  しない（丸めた値は Fallback ではなく、ML の外挿が選んだ値になるため）
 - margin は既存の `model_confidence.range_margin` を使う（設定の版を上げない）
 - 0052 §2.4 のとおり、**これは安全上の保証ではない。** 後段の Reactive Guard と Critical Safety は
   常に掛かる。ここは「外挿の予測で Demand を選ばない」ための写しである
@@ -230,8 +298,14 @@ Confidence / OOD（0050）は **anchor 推論**を判定する。反実仮想モ
   Profile の binding 違い・単位違いの catalog・較正 digest 違い・v1 artifact・格子違い）を与え、
   **型が作られず、runtime が `MODEL_LOAD_FAILURE` として Fallback の requested を出し、Guard /
   Safety の後段の結果が変わらない**ことを確かめる
-- 範囲外の Fallback requested で optimizer が `error` を返し、Gate が Fallback を選ぶ
-- 範囲外の候補が評価されない（評価回数と選ばれた解で確かめる）
+- 範囲外の Fallback requested で optimizer が `error`（`plan_out_of_learned_range`）を返し、Gate が Fallback を選ぶ。
+  `MpcProposal` の不変条件（提案のある結果に `failure_reason` を付けない）を破らない
+- 範囲外の候補が評価されない（評価回数と選ばれた解で確かめる）。**anchor から最初の step への跳びだけが
+  範囲外で、各 step の値と step 間の変化量は範囲内の held plan** も評価されない
+- model binding: 同じ model ID・版で別の bytes の artifact から出た予測（`artifact_sha256` だけ違う）を
+  v2 の判定器へ渡すと、model binding の構成要素が OOD になる。Profile の `payload_sha256` だけを
+  書き換えた artifact は L6 / L7 で型にならない
+- 較正: 宣言された較正の変更を train の窓の中に含む入力で Dataset v2 の生成が拒否される。窓の外なら通る
 - 一時 directory の Registry で「v2 を promotion → rollback」したとき、model と Profile が組のまま
   戻る（組の食い違いが作れない）
 - 既存の import 走査試験（`control/model` と `control/mpc` が hardware / safety / reactive を
@@ -256,7 +330,7 @@ Confidence / OOD（0050）は **anchor 推論**を判定する。反実仮想モ
 | 段 | Issue / PR | 内容 | `ControlTick` の版 |
 |---|---|---|---|
 | 0 | 本 PR | 本記録（承認で FINAL） | 変えない |
-| 1 | #83 | Thermal Dataset v2：各 example に anchor から `label_end_ms` までの **action 列**（action schema の格子上の effective demand と、その元の ControlTick の時刻）を持たせる。v1 を v2 として読み替えない。0031 §2.1〜§2.6 の規律（時刻対応・mask・split・値を既定しない）はそのまま | 変えない |
+| 1 | #83 | Thermal Dataset v2：各 example に anchor から `label_end_ms` までの **action 列**（action schema の格子上の、`action_source` が指す値。推奨案と 0031 §2 では effective demand。§5 #2 で applied を選ぶなら 0031 を置き換える記録が先）と、その元の ControlTick の時刻）を持たせる。較正の変更をまたぐ窓は拒否する（§2.3）。v1 を v2 として読み替えない。0031 §2.1〜§2.6 の規律（時刻対応・mask・split・値を既定しない）はそのまま | 変えない |
 | 2 | #84 | artifact v2・trainer・`RegistryCounterfactualThermalModel.from_verified_artifact`（L1〜L9）・`ThermalRegistryMetadata` の全欄照合 | 変えない |
 | 3 | #85 | Profile v2 の生成（payload 束縛・action 列の範囲）と同梱。制御用の判定器は同梱 Profile からしか作れないようにする | 変えない |
 | 4 | #86 | 束縛を段 2 の型へ切り替え、格子の照合と §2.5 の探索範囲の写しを足す | 変えない（既存の `optimizer_status` / `failure_reason` に載せる） |
@@ -266,7 +340,8 @@ Confidence / OOD（0050）は **anchor 推論**を判定する。反実仮想モ
 - 段 1 → 2 → 3 → 4 の順に依存する。段 5 は段 2 の後ならいつでもよい。段 6 は段 3 の後
 - **推奨案では `ControlTick` の版を上げない。** 後から trace へ何かを足す（たとえば §2.5 で除いた
   候補の件数を記録する、§4 の案 2 を選んで Profile の hash を `model_gate` に載せる）場合は、
-  - 他の版上げ（open PR #192 が v12 → v13）と**直列化**し、マージ時点の次の空き番号を使う
+  - 他の版上げ（open PR #192 が v12 → v13、open PR #194 の 0078 が `air_balance_coordination` でその次）と
+    **直列化**し、マージ時点の次の空き番号を使う
     （0073 が v10 と書いて v11 になった前例。0073 §5）
   - `src/coldaisle/web/airflow-trace.js` の `KNOWN_VERSIONS` とその試験を同じ PR で更新する
   - 入れ子の `ModelGateDecision` を変えるなら、その版も上げる（0065 §2.2）
@@ -333,15 +408,15 @@ Confidence / OOD（0050）は **anchor 推論**を判定する。反実仮想モ
 
 | # | 内容 | 決める場所 |
 |---|---|---|
-| 1 | §4 の案 1 / 2 / 3 の選択（本記録の承認で決める） | 所有者（本 PR） |
-| 2 | Dataset v2 の action 列を effective demand（0031 §2.2 と同じ。推奨）にするか、`ControlTick` v11 以降の applied demand（PWM へ写す直前）にするか。両者の差が熱応答に効くかは**実機で測る** | #83。実機計測の後 |
-| 3 | 較正の digest の不一致を拒否する（推奨・当面の既定）か、記録だけにして 0056 §2.5 の宣言変更に任せるか | 所有者。較正の頻度が実運用で分かった後 |
+| 1 | §4 の案 1 / 2 / 3 の選択（本記録の承認で決める） | 所有者（本 PR。§6 の質問 2） |
+| 2 | Dataset v2 の action 列を effective demand（0031 §2.2 と同じ。推奨）にするか、`ControlTick` v11 以降の applied demand（PWM へ写す直前）にするか。両者の差が熱応答に効くかは**実機で測る** | 所有者（§6 の質問 3）。見直しは #83 の実機計測の後 |
+| 3 | 較正の digest の不一致を拒否する（推奨・当面の既定）か、記録だけにして 0056 §2.5 の宣言変更に任せるか。取り込みが使った較正の digest を store へ記録するか | 所有者（§6 の質問 4 / 5）。較正の頻度が実運用で分かった後に見直す |
 | 4 | 反実仮想 capability を登録時に申告してよい条件（Dataset v2 由来であること以上に、action の励起の量・分布を要求するか）と、励起の実験（安全範囲内の step 応答など）の設計 | #83 / #84 / #91。**実機で測る** |
 | 5 | model family・ridge lambda・window / horizon / step 格子・target metric 集合の実値（0048 §5 / 0052 §5 / Q-22） | 実機 dataset の評価の後、#103 の設定と後続の記録 |
-| 6 | `range_margin` を plan の範囲にも使う（推奨）か、専用の設定値を足すか（`fan-policy.yaml` の版上げ）。値は暫定のまま | 所有者。#90 / #91 の評価の後 |
-| 7 | §2.5 で除いた候補の件数や理由を trace に載せるか（載せるなら `ControlTick` の版上げ。§2.9 の直列化の規則に従う） | #86 / #82 |
+| 6 | `range_margin` を plan の範囲にも使う（推奨）か、専用の設定値を足すか（`fan-policy.yaml` の版上げ）。値は暫定のまま | 所有者（§6 の質問 7）。値は #90 / #91 の評価の後 |
+| 7 | §2.5 で除いた候補の件数や理由、`plan_out_of_learned_range` を trace や Gate の `fallback_reason` の detail に載せるか（載せるなら Gate の変更と `ControlTick` の版上げ。§2.9 の直列化の規則に従う） | 所有者（§6 の質問 6）。実装は #86 / #82 |
 | 8 | #105 の episode で同梱 Profile が OOD と判定した step を `promotable` の条件に入れるか（0058 §2.3 の7条件を変えるので新しい記録が要る）。段 6 は記録だけにする | #105 の後続の記録 |
-| 9 | Registry の健全性を Rule Engine / Notification へ流す経路（§2.8。H1〜H3） | #82 / #20 の統合時 |
+| 9 | Registry の健全性を Rule Engine / Notification へ流す経路（§2.8。H1〜H3） | #82 / #20 の統合時（§6 の質問 9） |
 | 10 | thermal と Profile 以外の kind の組（supervisor policy と thermal model など）を同時に入れ替える手順（0062 §5 の残り） | 必要が生じたとき |
 | 11 | uncertainty を出す model（アンサンブル・分位点）と、そのときの `confidence_model` kind の使い方（0050 §5 #4） | #84 の後続 |
 | 12 | `coldaisle-registry status` が manifest の学習データの時間窓・metric 束縛を表示するか（Registry は payload を読まないので、別の読み取り専用 tool になる） | #104 |
@@ -349,3 +424,38 @@ Confidence / OOD（0050）は **anchor 推論**を判定する。反実仮想モ
 
 **実機の計測を待つ値**：#2 の差の大きさ、#4 の励起の条件、#5 の格子と family と正則化、#6 の margin の値。
 いずれも `status: provisional` の設定または後続の決定記録で扱い、本記録はコードに既定値を置かない（AGENTS.md ルール9）。
+
+## 6. 所有者への質問（番号付き。各問に推奨を示す）
+
+1. **0050 / 0052 の部分的な置き換えを承認するか。** ヘッダの Supersedes に書いた範囲（v2 の Profile の束縛先を
+   payload hash にする、0052 §2.1 の「生成時: Profile の binding と照合」を封をした型の保証に替える。0050 §2.2 の
+   推論ごとの照合は残す）。
+   - (a) **推奨**: 承認する。承認後、本 PR のマージ前に 0050 / 0052 へ `Superseded by: 0079（該当部分のみ）` を追記する
+   - (b) 置き換えない。Profile v2 も artifact 全体の hash に束縛する方法（例: Profile を artifact の外に出す §4 案 2 / 3）を選ぶ
+2. **Profile と Thermal Model の対をどう扱うか**（§4）。
+   - (a) **推奨**: 案 1 同梱
+   - (b) 案 2 別 kind ＋ 同時昇格
+   - (c) 案 3 別 kind ＋ 実行時の照合だけ
+3. **Dataset v2 の action の出どころ**（§5 #2）。
+   - (a) **推奨**: effective demand（0031 §2 のまま。`action_source = effective_demand`）で段 1 を進め、実機で差を測ってから見直す
+   - (b) 実機の計測まで段 1 を止める
+   - (c) applied demand にする（0031 を置き換える新しい記録と action schema の版上げが先）
+4. **較正の digest の不一致（L9）をどう扱うか**（§5 #3）。
+   - (a) **推奨**: 不一致なら artifact を拒否し Fallback（当面の既定）
+   - (b) 記録だけにして使い、0056 §2.5 の宣言変更による証拠の切断に任せる
+5. **取り込みが使った較正の digest を store へ記録するか**（§2.4 の L9 の隙）。
+   - (a) **推奨**: 推奨案では記録しない。較正の変更の宣言と同時に取り込みと `coldaisle-fand` を再起動する運用で埋め、実運用で食い違いが起きたら別の記録で足す
+   - (b) 記録する（store の schema 変更。本記録の後続として別の決定記録を先に作る）
+6. **範囲外（`plan_out_of_learned_range`）と除いた候補の件数を Gate の detail や trace に出すか**（§5 #7）。
+   - (a) **推奨**: 推奨案では出さない（`OptimizerOutcome.reason` と提案の requested の理由に残すだけ。Gate・`ControlTick` の版を動かさない）
+   - (b) 出す（Gate の変更と `ControlTick` の版上げ。#192 / 0078 と直列化）
+7. **plan の範囲の margin**（§5 #6）。
+   - (a) **推奨**: 既存の `model_confidence.range_margin` を使う（設定の版を上げない）
+   - (b) 専用の設定値を足す（`fan-policy.yaml` の版上げ）
+8. **本記録の承認を PR #193（0037 / 0048 を FINAL にする）のマージの後にするか。**
+   - (a) **推奨**: #193 のマージを待ってから承認する
+   - (b) 先に承認し、#193 で 0037 / 0048 が変わったら本記録を新しい記録で直す
+9. **Registry の健全性の通知経路**（§2.8、§5 #9）。
+   - (a) **推奨**: 本記録では決めず、#82 / #20 の統合時に決める（方向は H2）
+   - (b) いま H2 に決める
+   - (c) いま H1 / H3 のどちらかに決める
