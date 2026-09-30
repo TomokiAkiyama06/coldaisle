@@ -51,6 +51,15 @@ class Superseded:
     by: int
 
 
+@dataclass(frozen=True, slots=True)
+class Sealed:
+    """置かなかった。停止の手順が authority の枠を取り出し終えている（0072 §2.6）。
+
+    取り出した後に置いた降格は、どの tick にも journal にも届かない。置いたことにして
+    `pending` を返すと、受理した降格が再起動で失われる。
+    """
+
+
 class AdminMailbox:
     """モードの枠と authority の枠、loop からの結果の FIFO、`status` の写し。"""
 
@@ -63,6 +72,7 @@ class AdminMailbox:
         self._status: ModeStatus | None = None
         self._receiver: threading.Thread | None = None
         self._stopping = False
+        self._authority_sealed = False
         # loop・監査スレッドから受付スレッドを起こす（selectors で待っている）。
         # 書き込みは非ブロッキングで、詰まっていれば捨てる（起こす必要はもう満たされている）
         self._wake_reader, self._wake_writer = socket.socketpair()
@@ -97,12 +107,15 @@ class AdminMailbox:
             self._max_mode_command_id = command.command_id
             return Placed(replaced=replaced)
 
-    def place_authority(self, command: AdminAuthorityCommand) -> Placed | Superseded:
+    def place_authority(self, command: AdminAuthorityCommand) -> Placed | Superseded | Sealed:
         """authority の枠へ置く。**最も低い行き先**の1件を残す（0072 §2.2）。
 
         受付の時点の実効 stage とは比べない（適用するかは loop が決める。0072 §2.3）。
+        停止の手順が枠を取り出した後（`seal_authority`）は置かない。
         """
         with self._lock:
+            if self._authority_sealed:
+                return Sealed()
             current = self._authority
             if current is not None and not command.deeper_than(current):
                 return Superseded(by=current.command_id)
@@ -153,6 +166,28 @@ class AdminMailbox:
     def take(self) -> MailboxTake | None:
         """2枠を**同じ lock の中で**取り出す。lock を取れなければ None（直前のまま）。"""
         if not self._lock.acquire(blocking=False):
+            return None
+        try:
+            taken = MailboxTake(mode=self._mode, authority=self._authority)
+            self._mode = None
+            self._authority = None
+            return taken
+        finally:
+            self._lock.release()
+
+    def seal_authority(self, *, timeout_s: float) -> MailboxTake | None:
+        """停止の手順で authority の枠を取り出し、**以後は置かせない**（0072 §2.6）。
+
+        受付スレッドが時間内に止まらなくても、取り出した後に置かれた降格が黙って消えない。
+        封は lock の外で先に立てる。lock の中にいる `place_authority` は置き終えてから放すので、
+        その降格はこの取り出しに入る。lock を持つのは枠の出し入れの間だけなので、待つのは
+        ``timeout_s`` まで。取れなければ None（封は立ったまま）。
+        """
+        self._authority_sealed = True
+        acquired = (
+            self._lock.acquire(timeout=timeout_s) if timeout_s > 0 else self._lock.acquire(False)
+        )
+        if not acquired:
             return None
         try:
             taken = MailboxTake(mode=self._mode, authority=self._authority)

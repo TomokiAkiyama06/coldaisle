@@ -54,7 +54,7 @@ from coldaisle.control.schema import (
     ControlTick,
     OperatingMode,
 )
-from coldaisle.control_admin.mailbox import AdminMailbox, Placed, Superseded
+from coldaisle.control_admin.mailbox import AdminMailbox, Placed, Sealed, Superseded
 from coldaisle.control_admin.messages import (
     LowerAuthorityRequest,
     RollbackAuthorityRequest,
@@ -1074,6 +1074,44 @@ def test_the_daemon_build_persists_a_lowering_left_when_the_loop_cannot_be_built
     assert journal.stage is AuthorityStage.LIMITED, "再起動しても降格した stage で始まる"
     assert journal.events[-1].trigger is AuthorityTrigger.HUMAN
     assert "command_id=7" in journal.events[-1].reason
+
+
+def test_a_sealed_mailbox_hands_back_the_slot_and_refuses_later_lowerings():
+    """取り出した後に置かれた降格が黙って消えないよう、封の後は置かせない（0072 §2.6）。"""
+    mailbox = AdminMailbox()
+    first = leftover_lowering(command_id=3)
+    assert isinstance(mailbox.place_authority(first), Placed)
+
+    taken = mailbox.seal_authority(timeout_s=0.1)
+
+    assert taken is not None
+    assert taken.authority == first
+    assert isinstance(mailbox.place_authority(leftover_lowering(command_id=4)), Sealed)
+    assert mailbox.take() == MailboxTake(), "封の後に置いた降格は枠に無い"
+
+
+def test_a_seal_that_cannot_take_the_lock_still_refuses_later_lowerings():
+    mailbox = AdminMailbox()
+    mailbox._lock.acquire()
+    try:
+        assert mailbox.seal_authority(timeout_s=0.0) is None
+    finally:
+        mailbox._lock.release()
+    assert isinstance(mailbox.place_authority(leftover_lowering()), Sealed)
+
+
+@needs_peercred
+def test_a_lowering_that_arrives_after_the_seal_is_neither_acknowledged_nor_audited(entry):
+    """受付スレッドが時間内に止まらなくても、`pending` と受付の行を残さない（0072 §2.6）。"""
+    from coldaisle.control_admin.client import AdminUnavailableError
+
+    assert entry.mailbox.seal_authority(timeout_s=0.1) == MailboxTake()
+
+    with pytest.raises(AdminUnavailableError):
+        entry.send(LOWER)
+
+    assert entry.rows() == []
+    assert entry.mailbox.take() == MailboxTake()
 
 
 def test_the_admin_entry_stop_hands_back_the_authority_slot_and_drops_the_mode_slot():

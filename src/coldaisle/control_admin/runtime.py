@@ -68,7 +68,7 @@ class ControlAdminEntry:
         timeout_s = self.shutdown_wait_ms / 1_000 if drain else 0.0
         self.server.request_stop()
         self.server.join(timeout_s=timeout_s)
-        leftover = self._take_leftover_authority()
+        leftover = self._take_leftover_authority(timeout_s=timeout_s)
         self.audit.stop(timeout_s=timeout_s)
         self.server.close()
         self.mailbox.close()
@@ -78,9 +78,10 @@ class ControlAdminEntry:
         )
         return leftover
 
-    def _take_leftover_authority(self) -> AdminAuthorityCommand | None:
+    def _take_leftover_authority(self, *, timeout_s: float) -> AdminAuthorityCommand | None:
+        # 受付スレッドが時間内に止まらなかったときも、取り出した後に置かれる降格を作らない
         try:
-            taken = self.mailbox.take()
+            taken = self.mailbox.seal_authority(timeout_s=timeout_s)
         except Exception:
             LOGGER.exception(
                 "停止時に authority の枠を読めなかった（残った降格は再起動で戻る）",
@@ -88,7 +89,7 @@ class ControlAdminEntry:
             )
             return None
         if taken is None:
-            # 受付スレッドが止まり切らずに lock を持っている。停止を遅らせないため待たない
+            # 受付スレッドが止まり切らずに lock を持っている。停止を遅らせないため上限より待たない
             LOGGER.error(
                 "停止時に authority の枠の lock を取れなかった（残った降格は再起動で戻る）",
                 extra={logs.FIELDS_KEY: {"run_id": self.run_id}},

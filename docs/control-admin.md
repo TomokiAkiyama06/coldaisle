@@ -56,6 +56,10 @@ uv run coldaisle-control rollback-authority --reason "新しい artifact の挙�
 - 同じ tick までに降格が複数届いたら、**最も低い行き先**を採ります。採らなかった指令は `superseded_by`
   を返します（後から届いた浅い降格は、先に届いた深い降格に置き換えられる）
 - モードの枠とは別の枠なので、`max` と `rollback-authority` は同じ tick で両方効きます
+- `coldaisle-fand` の停止の手順では、どの tick にも取り出されなかった降格を枠から取り出し、
+  journal へ書き残してから止まります。取り出した後は枠を閉じ、そのあとに届いた降格は置かずに、
+  応答せずに接続を閉じます（受付の行も残しません）。CLI には「接続できない」（終了コード 2）と出るので、
+  次に起動した `coldaisle-fand` へ送り直してください
 - 走っている `coldaisle-fand` は、外の process（人の CLI）が journal を変えたことを毎 tick の `stat` で知り、
   次の tick から効かせます。走行中に journal が読めなければ `shadow` へ下げ、読めるようになっただけでは
   戻しません（`docs/authority-rollout.md`）

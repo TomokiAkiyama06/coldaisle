@@ -62,7 +62,7 @@ from coldaisle.control.schema import (
 )
 from coldaisle.control_admin.audit import AuditWriter
 from coldaisle.control_admin.config import ControlAdminSettings
-from coldaisle.control_admin.mailbox import AdminMailbox, Placed, Superseded
+from coldaisle.control_admin.mailbox import AdminMailbox, Placed, Sealed, Superseded
 from coldaisle.control_admin.messages import (
     AuthorityRequest,
     LowerAuthorityRequest,
@@ -565,6 +565,15 @@ class ControlAdminServer:
         # **安全側は記録を待たない。** 先に置き、そのあとで受付の行を依頼する。結末の行は
         # 受付の行の後に依頼する（同じ指令の受付の行が結末の行より先に書かれる）
         placement = self._mailbox.place_authority(command)
+        if isinstance(placement, Sealed):
+            # 停止の手順が枠を取り出し終えている。置いていないので `pending` も受付の行も
+            # 残さず、停止の手順が残りの接続を閉じるのと同じく応答せずに閉じる（0072 §2.6）
+            LOGGER.warning(
+                "停止の手順の途中に届いた authority の降格を置かずに閉じた",
+                extra={logs.FIELDS_KEY: {"run_id": self._run_id, "command_id": command_id}},
+            )
+            self._drop(conn)
+            return
         if not self._audit.submit(accepted):
             self._log_audit_failure(command_id, "accepted")
         if isinstance(placement, Superseded):
