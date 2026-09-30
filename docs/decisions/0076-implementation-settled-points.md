@@ -151,46 +151,72 @@ Critical Safety（`src/coldaisle/control/safety/critical.py`）では、人が `
 - 開発で同じ uid から操作するときは `--admin-config config/control-admin.dev.yaml` を**明示**する。
   このファイルは `socket.group: null` と `allow_same_user: true` の組だけが本番用と異なる（0072 §2.5）
 
-### 2.7 `accept()` が続けて `OSError` を返すときは、待ち受けだけを上限付きで休む（`MAX` にしない）
+### 2.7 `accept()` が続けて `OSError` を返すときは、待ち受けだけを上限付きで休み、一定時間続いたら受付スレッドの死として `MAX` に倒す
 
 **0072 への追加であり、置き換えではない。** 0072 は受付スレッドの死（§2.2）と接続の上限（§2.2 / §2.8）を
 決めたが、`accept()` 自体の失敗の扱いは決めていない。本節は 0072 §2.2（受付スレッドの振る舞い）と
-§2.8（`config/control-admin.yaml` の項目）に足す。
+§2.8（`config/control-admin.yaml` の項目）に足す。`MAX` に倒す経路は 0072 §2.2 の受付スレッドの死を
+そのまま使い、新しい経路を作らない。
 
 **問題**: 段階 1 の受付スレッド（`src/coldaisle/control_admin/server.py` の `_accept`）は、`EMFILE` / `ENFILE` /
 `ECONNABORTED` などの `OSError` を受けると warning を出してその回の accept を打ち切り、受付を続ける
 （スレッドは死なない）。ただし原因が続く（fd の枯渇など）と、待ち受けのソケットが読み取り可能のまま
-`select` が即座に戻り、受付スレッドが空回りして同じ失敗とログを繰り返す。
+`select` が即座に戻り、受付スレッドが空回りして同じ失敗とログを繰り返す。さらに、accept が失敗し続ける間は
+新しい `coldaisle-control max` を届けられない。この状態が際限なく続くと、非常時の `MAX` の経路が失われたまま
+になる。
 
-**決定**（2026-09-30、所有者が承認。提示した推奨案を採った）:
+**決定**（2026-09-30、所有者が承認。いずれも提示した推奨案を採った。最初に backoff を、
+続けて「失敗が設定した時間続いたら `MAX`」を決めた）:
+
+**(a) 短い失敗: 待ち受けだけを休む（モードは保つ）**
 
 - `accept()` が `OSError` を返したら、**待ち受けのソケットだけを selector から外し**（unregister）、
   **単調時計の期限**が来たら戻す。**`sleep` はしない**
-- 休む長さは最初が `accept_backoff.initial_ms`、失敗のたびに**倍**にして `accept_backoff.max_ms` で頭打ちにする。
-  `accept()` が1回でも成功したら長さを戻す（回復を info で1行残す）。倍率 2 はコードの定数とする
-  （値の調整は2つの時間で足り、倍率を設定にしても調整の自由度は実質増えないため）
+- 休む長さは最初が `accept_backoff.initial_ms`、失敗のたびに `accept_backoff.multiplier` 倍にして
+  `accept_backoff.max_ms` で頭打ちにする。`accept()` が1回でも成功したら長さを戻す（回復を info で1行残す）
 - 休んでいる間も、**接続済みの接続（`set_mode(max)` を送ってきた接続を含む）は selector に残り、読み続ける**。
   応答・適用の確認待ち・監査の完了の処理も止めない。待たされるのは新しい接続の受け付けだけ
-- **運転モードは保つ。`MAX` に倒さない。** accept の失敗は受付スレッドの死（0072 §2.2）ではなく、
-  `admin_receiver_dead` にもしない。loop と Critical Safety はこの間も通常どおり動き、Fan の Demand は
-  この失敗で変わらない。理由:
-  - fd の枯渇などは回復しうる一時的な資源不足で、受付スレッドは生きている
-  - `MAX` を届ける道は残っている。接続済みの接続はそのまま読まれ、新しい接続も次の accept（遅くとも
-    `max_ms` 後）で受け付けられる。受付スレッドの死のように「人が冷却を強める手段が無くなる」状態ではない
-  - 入口の資源不足で Fan を全開にし、再起動まで戻せなくする（受付スレッドの死と同じ扱い）のは過剰
+- `escalate_after_ms` に届かない失敗では、**運転モードを保ち、`MAX` に倒さない**。fd の枯渇などは回復しうる
+  一時的な資源不足で、接続済みの接続も、遅くとも `max_ms` 後の次の accept も `MAX` を届けられる。
+  短い資源不足のたびに Fan を全開にし、再起動まで戻せなくするのは過剰である
 - ログは warning（`reason: admin_accept_failed`）を、最初の失敗・休みが伸びたとき・頭打ちの後は連続の失敗の
   回数が 2 の冪に届いたときだけ出す。出さなかった回数（`suppressed_since_last_log`）・連続の失敗の回数・
   休みの長さ・`errno` を持たせる。スタックトレースは最初の1回だけ
-- **時間は `config/control-admin.yaml` に置く**（AGENTS.md ルール 9）。0072 §2.8 の表に次を足す
 
-| 設定 | 規則 |
-|---|---|
-| `accept_backoff.initial_ms` / `accept_backoff.max_ms` | 1 以上の整数（ミリ秒）。`initial_ms <= max_ms <= tick_ms`（`max_ms` は起動時に `safety.yaml` と照合）。`status` / `basis` 付き。暫定値 `initial_ms: 100` / `max_ms: 1000`（`status: provisional`） |
+**(b) 長く続く失敗: 受付スレッドの死として `MAX` に倒す**
 
+- 受付スレッドは、**途切れずに続いている accept の失敗の連なりの、最初の失敗の単調時刻**を覚える。
+  `accept()` が1回でも成功したら、この時刻を消す（連なりが切れる）
+- 失敗が途切れずに `accept_backoff.escalate_after_ms` 続いたら、受付スレッドは error のログ
+  （`reason: admin_accept_exhausted`）を出して**自分を意図して終える**
+- loop の毎 tick の生存確認（0072 §2.2）がこれを受付スレッドの死として扱う。以後は 0072 §2.2 と §2.2 (c) /
+  §2.5 のとおり: `MANUAL` を解除し、Critical Safety の `manual_max` の `forced_max` で全 zone を `MAX` にし、
+  **再起動まで保つ**。decision trace には `mode_command.admin_receiver_dead` が残る
+- **新しい `MAX` の経路を作らない。Critical Safety は変えない。** 死の原因（例外か、accept の枯渇か）は
+  構造化ログの `reason`（`admin_receiver_dead` の前の `admin_accept_exhausted`）で区別する
+- 理由: accept が失敗し続ける間は、新しい接続で `coldaisle-control max` を届けられない。非常時の `MAX` の経路を
+  際限なく失ったままにせず、上限の時間を過ぎたら、人が届けられなくなった `MAX` を安全側として自分で取る
+  （受付スレッドの死と同じ考え方）
+
+**(c) 設定**
+
+時間と倍率は `config/control-admin.yaml` に置く（AGENTS.md ルール 9）。0072 §2.8 の表に次を足す。
+
+| 設定 | 規則 | 暫定値（`status: provisional`） |
+|---|---|---|
+| `accept_backoff.initial_ms` | 1 以上の整数（ミリ秒）。`initial_ms <= max_ms` | 100 |
+| `accept_backoff.max_ms` | 1 以上の整数（ミリ秒）。`max_ms <= tick_ms`（起動時に `safety.yaml` と照合）かつ `max_ms < escalate_after_ms` | 1000 |
+| `accept_backoff.multiplier` | `> 1` の数 | 2 |
+| `accept_backoff.escalate_after_ms` | 整数（ミリ秒）。`> max_ms` | 30000 |
+
+- `status` / `basis` 付きで置く
 - `max_ms <= tick_ms` にするのは、休んでいる間に届いた新しい接続（`MAX` を運ぶかもしれない）を
-  1 tick を超えて待たせないためである。満たさなければ、0072 §2.8 の他の照合と同じく**管理ソケットを開かず**、
+  1 tick を超えて待たせないためである
+- `max_ms < escalate_after_ms` にするのは、`MAX` に倒す前に待ち受けを少なくとも1回は戻して accept を試すためである。
+  `multiplier > 1` は休みを伸ばすため（1 以下では空回りを抑えられない）
+- 起動時の照合を満たさなければ、0072 §2.8 の他の照合と同じく**管理ソケットを開かず**、
   `coldaisle-fand` は `AUTO` で運転を続ける
-- 暫定値は §2.3 の値と同じ扱いで、運用後に所有者が見直す（§5 #1）
+- これらの暫定値は §2.3 の値と同じく、運用後に所有者が見直す（§5 #1 の見直しの対象に加える）
 - 実装は #74 の fix PR #190（`src/coldaisle/control_admin/server.py` / `src/coldaisle/control_admin/config.py` /
   `config/control-admin.yaml` / `config/control-admin.dev.yaml` / `docs/control-admin.md`）。本記録のマージの後に入る
 
@@ -221,6 +247,7 @@ Critical Safety（`src/coldaisle/control/safety/critical.py`）では、人が `
 | 0073 の本文だけを読むと、まだ「v10」と読める | 追記のみの規則で本文は直せない。README の索引の本記録の行に 0073 の版の読み替えを書き、`schema.py` の版の履歴にも同じ注記がある |
 | Safety の理由の code だけを見ると、人の `MAX` と受付スレッドの死による `MAX` が区別できない | trace の `mode_command.admin_receiver_dead` と error のログで区別する。エアフロー画面（`src/coldaisle/web/airflow-trace.js`）も `admin_receiver_dead` を読む |
 | 休んでいる間は新しい接続（`set_mode(max)` を含む）の受け付けが遅れる | 待ちは `max_ms`（`tick_ms` 以下）を超えない。接続済みの接続は遅れない。loop と Critical Safety は動き続け、自動の安全側（温度・tach・telemetry loss など）は入口に依存しない |
+| accept の失敗が `escalate_after_ms` 続くと、再起動まで `MAX` で運転する（騒音が増え、`MANUAL` / `AUTO` に戻せない） | 新しい `MAX` を届けられない状態を際限なく続けないための安全側の固定（0072 §3 の受付スレッドの死と同じ緩和）。error のログ（`admin_accept_exhausted`）と trace の `admin_receiver_dead` で気づき、原因（fd の枯渇など）を直して再起動で `AUTO` に戻す。短い失敗ではモードを保つ |
 | §2.3 の値は運用の実績のない暫定値 | `manual.max_lease_s` は `status: provisional` を持つ。運用後に所有者が見直す |
 
 ## 4. 却下した代替案
@@ -230,15 +257,17 @@ Critical Safety（`src/coldaisle/control/safety/critical.py`）では、人が `
 | 0073 の本文の「v10」を「v11」に直す | README の「追記のみ」に反する。許される追記は `Superseded by` だけで、本記録は 0073 を置き換えない |
 | 0073 に `Superseded by: 0076` を付ける | 0073 の決定は何も置き換わっていない（番号の繰り上げは 0073 §5 自身が許していた）。付けると 0073 が失効したと誤読される |
 | 受付スレッドの死に Critical Safety の理由の code（例: `admin_receiver_dead_max`）を足す | Critical Safety が入口の事情を知ることになり、0072 §2.4 の「Safety は control_admin を知らない」を崩す。区別は trace とログで足りる（所有者の選択） |
-| 持続する `accept()` の失敗で `MAX` に倒す（受付スレッドの死と同じ扱い） | 入口の資源不足で Fan を全開にし、再起動まで戻せなくなる。受付スレッドは生きており、失敗は回復しうる |
+| accept の失敗の1回目で `MAX` に倒す（受付スレッドの死と同じ扱い） | 短い資源不足のたびに Fan を全開にし、再起動まで戻せなくなる。失敗は回復しうる。倒すのは `escalate_after_ms` 続いたときだけにした |
+| accept の失敗が続いても `MAX` に倒さない（backoff だけ） | 失敗が続く間は新しい `coldaisle-control max` を届けられず、非常時の `MAX` の経路が際限なく失われる（所有者の判断で退けた） |
+| 枯渇で `MAX` に倒す専用の経路（Safety の理由の code を含む）を作る | 受付スレッドの死（0072 §2.2）の経路で足りる。§2.5 のとおり Critical Safety は変えない |
 | backoff を入れず、段階 1 の「打ち切って次の select で再試行」のまま | 原因が続くと受付スレッドが空回りし、ログが溢れる |
 | 失敗したら受付スレッドで `sleep` する | 休んでいる間、接続済みの接続（`MAX` を含む）の読み取り・応答・監査の完了まで止まる |
-| backoff の時間をコードの定数にする | AGENTS.md ルール 9。`tick_ms` との照合も設定どうしで行える |
+| backoff の時間・倍率・`MAX` に倒すまでの時間をコードの定数にする | AGENTS.md ルール 9。`tick_ms` との照合や `max_ms < escalate_after_ms` の照合も設定どうしで行える |
 | 同じ uid を既定で認める（開発の手間を減らす） | 同じ uid で動く別のサービス（API / AI 層）が Fan を動かせる。0072 §2.5 の「同じ uid も root も暗黙には認めない」に反する |
 
 ## 5. 未決事項
 
 | # | 内容 | 決める場所 |
 |---|---|---|
-| 1 | §2.3 と §2.7 の暫定値（`accept_backoff.initial_ms` / `max_ms` を含む）の確定 | 運用後に所有者（0072 §5 #4 のまま） |
+| 1 | §2.3 と §2.7 の暫定値（`accept_backoff.initial_ms` / `max_ms` / `multiplier` / `escalate_after_ms` を含む）の確定 | 運用後に所有者（0072 §5 #4 のまま） |
 | 2 | 管理グループの実際の名前（`coldaisle-admin` は仮） | 0072 §5 #3 / 0060 の未決の系列 / #57 |
