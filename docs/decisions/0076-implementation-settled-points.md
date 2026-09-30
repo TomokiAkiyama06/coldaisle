@@ -5,8 +5,9 @@
 - **Date**: 2026-09-30
 - **Supersedes**: [0072](0072-control-admin-entry.md) §2.3 の「応答」の項のうち、受理の応答の形のみ
   （§2.4 で `superseded_by` を加える）。0072 の §2.3 の残りと他の節は有効。
-  本記録の他の節は、各記録が実装 PR へ委ねた点（0071 §5 #1、0072 §5 #4 / #6）と、
-  0073 §5 が許した版番号の繰り上げを記録するもので、どの記録の決定も置き換えない
+  本記録の他の節は、各記録が実装 PR へ委ねた点（0071 §5 #1、0072 §5 #4 / #6）、
+  0073 §5 が許した版番号の繰り上げ、0072 が決めていなかった点への追加（§2.7。0072 §2.2 / §2.8 に足す）
+  を記録するもので、どの記録の決定も置き換えない
 - **関連**: [0060](0060-control-loop-runtime.md) §5 /
   [0071](0071-control-trace-read-api.md) §2.6 / §5 #1 /
   [0072](0072-control-admin-entry.md) §2.2 / §2.3 / §2.4 / §2.5 / §2.7 / §2.8 / §5 #3 / #4 / #6 /
@@ -16,7 +17,7 @@
   `src/coldaisle/control/safety/critical.py` / `src/coldaisle/control_admin/` /
   `src/coldaisle/store/migrations/0008_control_admin_audit.sql` /
   `config/control-admin.yaml` / `config/control-admin.dev.yaml` / `config/airflow-ui.yaml`
-- **対象 Issue**: #74 / #81 / #106
+- **対象 Issue**: なし（本記録は特定の Issue の実装ではない。関連: #74 / #81 / #106。§2.7 の実装は #74 の fix PR #190 が本記録に従う）
 
 ## 1. Context
 
@@ -150,22 +151,48 @@ Critical Safety（`src/coldaisle/control/safety/critical.py`）では、人が `
 - 開発で同じ uid から操作するときは `--admin-config config/control-admin.dev.yaml` を**明示**する。
   このファイルは `socket.group: null` と `allow_same_user: true` の組だけが本番用と異なる（0072 §2.5）
 
-### 2.7 `accept()` が続けて `OSError` を返すときの、上限付きの backoff
+### 2.7 `accept()` が続けて `OSError` を返すときは、待ち受けだけを上限付きで休む（`MAX` にしない）
 
-いまの受付スレッド（`src/coldaisle/control_admin/server.py` の `_accept`）は、`EMFILE` / `ENFILE` /
+**0072 への追加であり、置き換えではない。** 0072 は受付スレッドの死（§2.2）と接続の上限（§2.2 / §2.8）を
+決めたが、`accept()` 自体の失敗の扱いは決めていない。本節は 0072 §2.2（受付スレッドの振る舞い）と
+§2.8（`config/control-admin.yaml` の項目）に足す。
+
+**問題**: 段階 1 の受付スレッド（`src/coldaisle/control_admin/server.py` の `_accept`）は、`EMFILE` / `ENFILE` /
 `ECONNABORTED` などの `OSError` を受けると warning を出してその回の accept を打ち切り、受付を続ける
 （スレッドは死なない）。ただし原因が続く（fd の枯渇など）と、待ち受けのソケットが読み取り可能のまま
-`select` が即座に戻り、同じ失敗とログを繰り返す。
+`select` が即座に戻り、受付スレッドが空回りして同じ失敗とログを繰り返す。
 
-所有者は次を決めた。
+**決定**（2026-09-30、所有者が承認。提示した推奨案を採った）:
 
-- 持続する `accept()` の `OSError` には、**上限のある backoff** を入れる（次の accept までの待ちを
-  伸ばし、上限で頭打ちにする。ログも抑える）
-- **backoff は `MAX` を強制しない。** accept の失敗は受付スレッドの死ではなく、`admin_receiver_dead` にも
-  しない。loop と Critical Safety はこの間も通常どおり動き、Fan の Demand はこの失敗で変わらない
-- backoff の間も、既に受け付けた接続の処理（応答・確認待ち・監査の完了）は止めない
-- 実装は #74 の別の fix PR で行う（本記録の時点では `main` に入っていない）。待ちの上限などの値は、
-  AGENTS.md ルール 9 に従いその PR で設定に置くかを決める
+- `accept()` が `OSError` を返したら、**待ち受けのソケットだけを selector から外し**（unregister）、
+  **単調時計の期限**が来たら戻す。**`sleep` はしない**
+- 休む長さは最初が `accept_backoff.initial_ms`、失敗のたびに**倍**にして `accept_backoff.max_ms` で頭打ちにする。
+  `accept()` が1回でも成功したら長さを戻す（回復を info で1行残す）。倍率 2 はコードの定数とする
+  （値の調整は2つの時間で足り、倍率を設定にしても調整の自由度は実質増えないため）
+- 休んでいる間も、**接続済みの接続（`set_mode(max)` を送ってきた接続を含む）は selector に残り、読み続ける**。
+  応答・適用の確認待ち・監査の完了の処理も止めない。待たされるのは新しい接続の受け付けだけ
+- **運転モードは保つ。`MAX` に倒さない。** accept の失敗は受付スレッドの死（0072 §2.2）ではなく、
+  `admin_receiver_dead` にもしない。loop と Critical Safety はこの間も通常どおり動き、Fan の Demand は
+  この失敗で変わらない。理由:
+  - fd の枯渇などは回復しうる一時的な資源不足で、受付スレッドは生きている
+  - `MAX` を届ける道は残っている。接続済みの接続はそのまま読まれ、新しい接続も次の accept（遅くとも
+    `max_ms` 後）で受け付けられる。受付スレッドの死のように「人が冷却を強める手段が無くなる」状態ではない
+  - 入口の資源不足で Fan を全開にし、再起動まで戻せなくする（受付スレッドの死と同じ扱い）のは過剰
+- ログは warning（`reason: admin_accept_failed`）を、最初の失敗・休みが伸びたとき・頭打ちの後は連続の失敗の
+  回数が 2 の冪に届いたときだけ出す。出さなかった回数（`suppressed_since_last_log`）・連続の失敗の回数・
+  休みの長さ・`errno` を持たせる。スタックトレースは最初の1回だけ
+- **時間は `config/control-admin.yaml` に置く**（AGENTS.md ルール 9）。0072 §2.8 の表に次を足す
+
+| 設定 | 規則 |
+|---|---|
+| `accept_backoff.initial_ms` / `accept_backoff.max_ms` | 1 以上の整数（ミリ秒）。`initial_ms <= max_ms <= tick_ms`（`max_ms` は起動時に `safety.yaml` と照合）。`status` / `basis` 付き。暫定値 `initial_ms: 100` / `max_ms: 1000`（`status: provisional`） |
+
+- `max_ms <= tick_ms` にするのは、休んでいる間に届いた新しい接続（`MAX` を運ぶかもしれない）を
+  1 tick を超えて待たせないためである。満たさなければ、0072 §2.8 の他の照合と同じく**管理ソケットを開かず**、
+  `coldaisle-fand` は `AUTO` で運転を続ける
+- 暫定値は §2.3 の値と同じ扱いで、運用後に所有者が見直す（§5 #1）
+- 実装は #74 の fix PR #190（`src/coldaisle/control_admin/server.py` / `src/coldaisle/control_admin/config.py` /
+  `config/control-admin.yaml` / `config/control-admin.dev.yaml` / `docs/control-admin.md`）。本記録のマージの後に入る
 
 ### 2.8 0071 §5 #1: 画面の「古い」の倍数は `stale_after_tick_periods: 3.0` で確定する
 
@@ -174,8 +201,9 @@ Critical Safety（`src/coldaisle/control/safety/critical.py`）では、人が `
 `src/coldaisle/api/airflow.py` が `> 1.0` の有限値として検証し、`GET /api/v1/airflow/config` で返す）。
 所有者はこの値を**確定**とした。
 
-- 設定ファイルにはまだ `provisional: true` と「仮の値。実運用で見直す」の注記が残っている。
-  これを確定の表記へ直すのは設定の変更なので、本記録の PR には含めない（別の PR で行う）
+- 確定は設定に反映済み。PR #188 が `control_trace.provisional: false` にし、注記を
+  「確定値（0071 §5 #1 が #106 に委ねた値。2026-09-30 にオーナーが確定した）」へ改めた（試験と文書も合わせた）。
+  #188 は本記録より先にマージする
 
 ## 3. Consequences
 
@@ -192,7 +220,7 @@ Critical Safety（`src/coldaisle/control/safety/critical.py`）では、人が `
 |---|---|
 | 0073 の本文だけを読むと、まだ「v10」と読める | 追記のみの規則で本文は直せない。README の索引の本記録の行に 0073 の版の読み替えを書き、`schema.py` の版の履歴にも同じ注記がある |
 | Safety の理由の code だけを見ると、人の `MAX` と受付スレッドの死による `MAX` が区別できない | trace の `mode_command.admin_receiver_dead` と error のログで区別する。エアフロー画面（`src/coldaisle/web/airflow-trace.js`）も `admin_receiver_dead` を読む |
-| backoff の間は新しい管理操作（`set_mode(max)` を含む）の受付が遅れる | 上限を置く。受付が遅れても loop と Critical Safety は動き続け、自動の安全側（温度・tach・telemetry loss など）は入口に依存しない |
+| 休んでいる間は新しい接続（`set_mode(max)` を含む）の受け付けが遅れる | 待ちは `max_ms`（`tick_ms` 以下）を超えない。接続済みの接続は遅れない。loop と Critical Safety は動き続け、自動の安全側（温度・tach・telemetry loss など）は入口に依存しない |
 | §2.3 の値は運用の実績のない暫定値 | `manual.max_lease_s` は `status: provisional` を持つ。運用後に所有者が見直す |
 
 ## 4. 却下した代替案
@@ -203,14 +231,14 @@ Critical Safety（`src/coldaisle/control/safety/critical.py`）では、人が `
 | 0073 に `Superseded by: 0076` を付ける | 0073 の決定は何も置き換わっていない（番号の繰り上げは 0073 §5 自身が許していた）。付けると 0073 が失効したと誤読される |
 | 受付スレッドの死に Critical Safety の理由の code（例: `admin_receiver_dead_max`）を足す | Critical Safety が入口の事情を知ることになり、0072 §2.4 の「Safety は control_admin を知らない」を崩す。区別は trace とログで足りる（所有者の選択） |
 | 持続する `accept()` の失敗で `MAX` に倒す（受付スレッドの死と同じ扱い） | 入口の資源不足で Fan を全開にし、再起動まで戻せなくなる。受付スレッドは生きており、失敗は回復しうる |
-| backoff を入れず、いまの「打ち切って次の select で再試行」のまま | 原因が続くと受付スレッドが空回りし、ログが溢れる |
+| backoff を入れず、段階 1 の「打ち切って次の select で再試行」のまま | 原因が続くと受付スレッドが空回りし、ログが溢れる |
+| 失敗したら受付スレッドで `sleep` する | 休んでいる間、接続済みの接続（`MAX` を含む）の読み取り・応答・監査の完了まで止まる |
+| backoff の時間をコードの定数にする | AGENTS.md ルール 9。`tick_ms` との照合も設定どうしで行える |
 | 同じ uid を既定で認める（開発の手間を減らす） | 同じ uid で動く別のサービス（API / AI 層）が Fan を動かせる。0072 §2.5 の「同じ uid も root も暗黙には認めない」に反する |
 
 ## 5. 未決事項
 
 | # | 内容 | 決める場所 |
 |---|---|---|
-| 1 | §2.3 の暫定値の確定 | 運用後に所有者（0072 §5 #4 のまま） |
+| 1 | §2.3 と §2.7 の暫定値（`accept_backoff.initial_ms` / `max_ms` を含む）の確定 | 運用後に所有者（0072 §5 #4 のまま） |
 | 2 | 管理グループの実際の名前（`coldaisle-admin` は仮） | 0072 §5 #3 / 0060 の未決の系列 / #57 |
-| 3 | §2.7 の backoff の初期値・上限・ログの抑え方、それを設定に置くか | #74 の fix PR |
-| 4 | `config/airflow-ui.yaml` の `stale_after_tick_periods` の `provisional: true` と注記を確定の表記へ直す | 別の PR（#106 の続き） |
