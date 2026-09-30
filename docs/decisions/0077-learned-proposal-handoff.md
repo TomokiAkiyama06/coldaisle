@@ -1,7 +1,7 @@
 # 決定記録 0077: Learned MPC / Supervisor worker から制御ループへの提案の受け渡し（プロセスの置き場所・経路・書き手・snapshot への束縛・registry の版の記録・worker の異常時の扱い）
 
 - **種別**: Decision Record
-- **Status**: Proposed
+- **Status**: FINAL（2026-09-30、リポジトリ所有者が推奨案で承認）
 - **Date**: 2026-09-30
 - **Supersedes**: なし
 - **関連**: [`0028-fan-control-contracts.md`](0028-fan-control-contracts.md)（§2.2 / §2.3 / §2.5 (c) / §2.6） /
@@ -56,11 +56,15 @@ worker は提案を置き、ループは最新の提案を読むだけにする�
 （`coldaisle-fand` が registry を読んで Gate と trace に束縛する）、#89 の RL worker のいずれも
 実装に入れない。安全系・制御系の設計であり、**実装より先に**所有者の承認を要する（AGENTS.md「迷ったら」）。
 
+**2026-09-30 オーナーが推奨案で承認した（FINAL）。** §5 の問いはすべて推奨案を採り、
+最終レビューで残った指摘（authority の stage が上がったときの worker の束縛の作り直し。§2.3）も
+推奨案で本文を直した上での承認である。§2 が決定、§4 は検討した代替案とその得失である。
+
 ---
 
 ## 2. Decision
 
-以下は**推奨案**である。所有者が選ぶべき分岐は §4 の代替案と §5 に並べた。
+以下は所有者が 2026-09-30 に推奨案で承認した決定である。検討した代替案は §4、各分岐の決定は §5 に残す。
 
 ### 2.1 置き場所：役割ごとの別プロセス（別 systemd unit）。`coldaisle-fand` の子にしない
 
@@ -145,6 +149,25 @@ frame は tick ごとに1つ、その tick の**同じ snapshot**から作る。
   失敗（`model_load_failure`、理由 `config_mismatch`）を返す。**設定の食い違った提案を作らない**
 - MPC worker は `mpc.period_ms` ごとに、**最後に受け取った frame** に対して `propose()` を1回呼ぶ。
   optimizer の予算（`mpc.budget_ms`）は worker が持つ（#86 の実装要件。0028 §2.6 の表のまま）
+- **frame の `authority_stage` が上がったら、worker は次の提案の前に `MpcModelBinding` を作り直して
+  検証し直す。** 走り続ける worker が作ったときの束縛を使い続けると、`binding_authority_stage` は
+  古い stage のままで、Gate は昇格後の tick で全提案を `binding_authority_not_covered` で拒む
+  （0057 §2.2）。安全側には倒れるが、SHADOW → LIMITED の昇格の後も Learned が Fallback のまま
+  になり、次の段の証拠が集まらない。そこで worker は提案を作るたびに、使う frame の
+  `authority_stage` を手元の束縛の stage と比べ、**上回っていれば**
+  - 古い束縛で `propose()` を呼ばない（提案を出さない）
+  - `expected_artifacts` で固定された同じ artifact について、frame の実効 stage を渡して
+    registry の検証から束縛を作り直す（`MpcModelBinding.for_control(..., authority_stage=<frame の stage>)`。
+    0057 §2.2 の「生成時に渡す stage は実効 stage」のまま）
+  - 作り直した束縛の検証を通ったときだけ、その束縛で `propose()` を呼ぶ。こうして
+    `binding_authority_stage` が実効 stage に追従する。registry がその stage での使用を
+    認めない（検証に失敗する）ときは提案を作らず、失敗（`model_load_failure`）を返す。
+    Gate は Fallback にし、worker が拒まれた束縛を使い続けることはない
+
+  **stage が下がったときは作り直さない。** 束縛の stage が実効 stage を覆っている限り Gate は
+  通す（0057 §2.2「下回るぶんは通す」）。作り直しで新しい閾値や設定値は足さず、Gate の照合
+  （tick ごとの `binding_authority_not_covered`）も変えない。昇格の手順に worker の再起動を
+  含める案は採らない（§4.4）
 - frame に含めてよいのは Telemetry の値と制御の状態だけで、path・個体識別子を入れない
   （AGENTS.md ルール10）。frame は LLM のプロンプトへ渡さない（ルール8。LLM と制御 ML を混同しない）
 
@@ -177,7 +200,7 @@ frame は tick ごとに1つ、その tick の**同じ snapshot**から作る。
      Learned が**黙って一度も使われない**構成を許してしまうため（安全側には倒れるが、設定の誤りを
      起動時に見せる）。overrun した tick は締め切り（5）で ML を通さないので、この下限の前提に入れない
 
-   （→ 所有者判断 6）
+   （§5 の決定 6）
 5. **締め切り**は 0060 §2.6 のまま。締め切りを過ぎた tick では ML を通さない。ループは
    worker を待たないので、worker の遅れが tick の所要時間に入る経路は無い
 6. **採った提案でも出せるのは requested だけである。** Gate（authority の帯）→ 合成（Reactive Guard の
@@ -202,8 +225,8 @@ frame は tick ごとに1つ、その tick の**同じ snapshot**から作る。
   Critical Safety と Reactive Guard は ML と独立に毎 tick 効いている（AGENTS.md ルール3）。
   worker の不調で Max にすると、ML の失敗が騒音という形で安全系に混ざる
 - 「落ちた」ときに直前の有効な提案を期限まで使わず**即 Fallback** にするのは、プロセスの死が
-  直前の出力の健全さを疑わせるからである（→ 所有者判断 4）
-- **trace の detail の運び方（推奨）。** `poll()` の形（`MpcProposal | None`）は変えない（§2.8）。
+  直前の出力の健全さを疑わせるからである（§5 の決定 4）
+- **trace の detail の運び方。** `poll()` の形（`MpcProposal | None`）は変えない（§2.8）。
   いまの `ControlLoop._poll_learned` は `None` を受けると Gate に何も渡さず、Gate は
   `learned_proposal_unavailable` を**空の detail** で出す（`fallback/gate.py` の
   `_unhealthy_reason`）。そこで次の2点だけを変える
@@ -218,7 +241,7 @@ frame は tick ごとに1つ、その tick の**同じ snapshot**から作る。
   ループと Gate の間だけの内部の型で trace に保存されず、`Reason.detail` は既に自由記述の欄
   （500 字まで）なので、**`ControlTick` の版も入れ子の `ModelGateDecision` の版（0065）も
   上げない**。detail の値は上の閉じた列挙の文字列だけにし、path・識別子を入れない（ルール10）
-  （→ 所有者判断 11。detail を出さずログだけにする案も並べる）
+  （§5 の決定 11。detail を出さずログだけにする案も並べる）
 
 ### 2.6 registry の版の束縛：`coldaisle-fand` が起動時に1回だけ読み、同じ snapshot から Gate・trace・frame を作る
 
@@ -250,13 +273,13 @@ frame は tick ごとに1つ、その tick の**同じ snapshot**から作る。
   新しい版へ移ると、固定された（古い）artifact は production でなくなるので、`coldaisle-fand` を
   再起動するまで Learned は Fallback のままになる。新しい artifact の提案を古い期待値で照合させない
   ための保守側の挙動であり、promotion の手順は「promotion → `coldaisle-fand` の再起動」を1組とする
-  （→ 所有者判断 8）
+  （§5 の決定 8）
 - **`--registry-root` を与えたのに読めない・壊れているときは、起動を止めずに Learned を無効にする。**
   `expected_model_version` を番兵 `UNCONFIGURED_MODEL_VERSION`、`expected_artifact_sha256` と
   `expected_rl_identity` を `None`、`registry` を `unbound()` にし、起動時に error を残す
   （いまの `coldaisle-fand` と同じ引数で、Gate の契約は変えない）。
   registry の破損で Fan の制御まで手放す（終了コード 5 で BIOS に戻す）のは、Learned が
-  任意の部品である以上、失うものが大きい（→ 所有者判断 7）。trace の `unbound()` は
+  任意の部品である以上、失うものが大きい（§5 の決定 7）。trace の `unbound()` は
   「読まなかった」と「読めなかった」を区別できないので、区別は起動ログで行う
   （trace で区別するなら §2.9 の選択肢 B に含める）
 - `coldaisle-fand` は artifact の bytes を読まず、deserialize もしない（ML を制御プロセスへ入れない）。
@@ -274,7 +297,7 @@ frame は tick ごとに1つ、その tick の**同じ snapshot**から作る。
   1つのソケットで最初のメッセージの名乗りから役割を決めると、どちらかの worker の資格さえあれば
   `mpc` を名乗れ、乗っ取られた RL worker が本物の MPC worker より先に接続して Demand を含む
   `MpcProposal` を送れてしまう（authority が `SHADOW` より上のとき実 Fan の requested に届く）
-  （→ 所有者判断 12）
+  （§5 の決定 12）
 - 2つのグループは**重ねない**（同じ uid を両方に入れない）。名前が違っても同じ uid を含む2つの
   グループは、その uid に両方の役割を与えてしまうので、**名前と path の比較だけでは足りない**。
   次の3つで確かめる。実行ユーザーも役割ごとに分ける（§2.1）
@@ -301,7 +324,7 @@ frame は tick ごとに1つ、その tick の**同じ snapshot**から作る。
   `worker_idle_timeout_ms` より長い構成でも健全な worker を切り続けない。
   heartbeat を推論とは別の実行単位から送ると、推論だけが固まったときは heartbeat が続く。
   その場合は提案が期限切れ（`learned_proposal_expired`）で Fallback になるので、
-  idle の検出は**プロセスの固まり**に、期限は**推論の遅れ**に役割を分ける（→ 所有者判断 13）
+  idle の検出は**プロセスの固まり**に、期限は**推論の遅れ**に役割を分ける（§5 の決定 13）
 - 読み取り API・AI 層・`coldaisle-eventd` の実行ユーザーを worker グループに入れない。
   **LLM から到達できる経路を作らない**（AGENTS.md ルール1）。worker の package は `coldaisle.ai`・
   `coldaisle.api`・`coldaisle.control.hardware` の書き込み側・`serial` を import しない（試験で止める）
@@ -328,16 +351,16 @@ frame は tick ごとに1つ、その tick の**同じ snapshot**から作る。
   `shadow_binding` を押すとその意味が変わる（`control/loop.py` の `_rl_candidate` の注記も
   同じ理由で `unverified` を保つ）。どちらの値も active slot を通らない（0061 §2.4 の表）ので、
   安全上の差は無い。`shadow_binding` / `active_binding` を経路で証明して運ぶ形は、`for_active` の
-  門を開く別の決定記録で決める（0061 §5 / 0074 §5）（→ 所有者判断 14）
+  門を開く別の決定記録で決める（0061 §5 / 0074 §5）（§5 の決定 14）
 - 経路の封筒の形（`schema_version`・`run_id`・`role`・本文）は版を持ち、知らない版は捨てる
 
-### 2.9 trace の版：推奨案では `ControlTick` の版を上げない
+### 2.9 trace の版：`ControlTick` の版を上げない
 
 - registry の束縛は既存の `registry` 欄（v10）、採否と理由は既存の `model_gate` / `fallback_reason` /
   `SupervisorDecision`（`policy_identity` は `SupervisorDecision` v2）で表せる。**段階 1〜4 では
-  `ControlTick` の版を上げない**（選択肢 A、推奨）
-- 選択肢 B として、経路の健全性（役割ごとの接続状態・捨てた件数と理由の code・`--registry-root` を
-  読めなかったこと）を trace に載せる塊（仮称 `learned_channel`）を足す案がある（→ 所有者判断 9）。
+  `ControlTick` の版を上げない**（選択肢 A、採用）
+- **採らなかった**選択肢 B として、経路の健全性（役割ごとの接続状態・捨てた件数と理由の code・`--registry-root` を
+  読めなかったこと）を trace に載せる塊（仮称 `learned_channel`）を足す案がある（§5 の決定 9）。
   採るなら
   - **`ControlTick` の版上げは、ほかの版上げと直列にする。** いま main は v12、PR #192 が v13 に上げる。
     この塊は #192 が main に入った後の**次の空いた番号**を使う（0073 §5 の番号の繰り上げの規則。
@@ -350,12 +373,12 @@ frame は tick ごとに1つ、その tick の**同じ snapshot**から作る。
 
 | 段階 | 担当（1段階ずつ別の PR） | 内容 | 前提 |
 |---|---|---|---|
-| 0 | 本記録 | 所有者の承認（§5 の判断を含む） | — |
+| 0 | 本記録 | 所有者の承認（§5 の判断を含む。2026-09-30 推奨案で承認済み） | — |
 | 1 | #86 | `coldaisle-fand` 側の経路：役割ごとのソケット・受付スレッド・受け渡し口・§2.7 の認可（役割ごとのグループ）と worker の heartbeat・設定・`LearnedProposalSource` の実装・`LearnedFrameSink` と frame の送り出し（制御の heartbeat の後）・`LearnedChannelHealth` と `LearnedControlStatus.unavailable_detail`（§2.5）・§2.4 の `run_id` 照合・§2.5 の失敗の扱い・受付スレッドの死の扱い。**worker はまだ無い**ので、試験の偽 worker（`socketpair`）で確かめる。設定が無い起動の挙動はいまと変わらない | 段階 0 |
 | 2 | #104（runtime の部分） | `--registry-root`・起動時に1回読む `RegistrySnapshot` から provenance・Gate の期待値・`expected_rl_identity` を作る（§2.6）・読めないときは Learned を無効にして起動・frame の `expected_artifacts` | 段階 1（frame に載せるため。provenance だけなら先行してよい） |
-| 3 | #86 | MPC worker（`coldaisle-learnd --role mpc`）：frame の列から window を組み立てる・固定された artifact を registry で検証して読む・`propose()` を `mpc.period_ms` ごと・config の hash 照合・rollback の検知。`mpc.max_source_age_ms` を `fan-policy.yaml` に足す（`fan-policy.yaml` の schema の版上げと、§2.4 の上限・下限の不変条件）。**束ねた版 `CONTROL_CONFIG_VERSION` も 11 から次の空いた番号へ上げる**（0073 §5 の番号の繰り上げの規則）。trace の `runtime.control_config_version` と `ControlConfigDigest` の値が変わるが、`ControlTick` / `ControlTickRuntime` の形は変えない。**現行の artifact はすべて `observational_replay` なので `MpcModelBinding.for_control` が拒み、`model_load_failure` で Fallback になるのが通常経路**（0052）。試験は試験用の反実仮想モデルで行う。authority は既定の `SHADOW`（0060 §2.8） | 段階 1・2 |
+| 3 | #86 | MPC worker（`coldaisle-learnd --role mpc`）：frame の列から window を組み立てる・固定された artifact を registry で検証して読む・`propose()` を `mpc.period_ms` ごと・config の hash 照合・rollback の検知・**frame の `authority_stage` が上がったときの `MpcModelBinding` の作り直しと検証し直し（§2.3。`binding_authority_stage` を実効 stage へ追従させてから次の提案を出す）**。`mpc.max_source_age_ms` を `fan-policy.yaml` に足す（`fan-policy.yaml` の schema の版上げと、§2.4 の上限・下限の不変条件）。**束ねた版 `CONTROL_CONFIG_VERSION` も 11 から次の空いた番号へ上げる**（0073 §5 の番号の繰り上げの規則）。trace の `runtime.control_config_version` と `ControlConfigDigest` の値が変わるが、`ControlTick` / `ControlTickRuntime` の形は変えない。**現行の artifact はすべて `observational_replay` なので `MpcModelBinding.for_control` が拒み、`model_load_failure` で Fallback になるのが通常経路**（0052）。試験は試験用の反実仮想モデルで行う。authority は既定の `SHADOW`（0060 §2.8） | 段階 1・2 |
 | 4 | #89 | RL worker（`--role supervisor`）・`SupervisorOutputSource` の形を広げる（§2.8）・`origin` は `unverified` のまま（§2.8）。active は閉じたまま（0061 §2.4） | 段階 1・2。#89 の policy 側 |
-| 5（選択肢 B を採る場合のみ） | #86 | `ControlTick` に `learned_channel` の塊を足す（§2.9）。**#192 の v13 の後に直列で**、`KNOWN_VERSIONS` と画面の解釈を同じ PR で更新 | 段階 1・2、#192 のマージ |
+| 5（選択肢 B を採る場合のみ。2026-09-30 の承認では採らなかったので行わない） | #86 | `ControlTick` に `learned_channel` の塊を足す（§2.9）。**#192 の v13 の後に直列で**、`KNOWN_VERSIONS` と画面の解釈を同じ PR で更新 | 段階 1・2、#192 のマージ |
 | 6 | #57 / 0060 未決 7 | worker の systemd unit のテンプレート（実行ユーザー・グループ・`RuntimeDirectory`・資源の上限）。**仮の値だけ**（AGENTS.md ルール10） | 段階 3 |
 
 各段階は hardware なしで試験できる。
@@ -370,6 +393,7 @@ frame は tick ごとに1つ、その tick の**同じ snapshot**から作る。
 | 認可 | 0072 の試験と同じ（他 uid・同じ uid・root の接続を拒む。`SO_PEERCRED` を偽装した試験用の門）。加えて、RL のグループの相手が MPC のソケットへ接続できないこと・封筒の `role` がソケットの役割と違えば捨てること・2つのグループが同じ設定を拒むこと・**名前の違う2つのグループが同じ uid を含む（補助グループ・主グループのどちらでも）とき起動時に Learned を無効にすること**・**起動後に両方のグループへ足された uid の接続をどちらのソケットでも拒むこと** |
 | heartbeat と idle | 提案を送らず heartbeat だけ送る偽 worker が `worker_idle_timeout_ms` を過ぎても切られず、受け渡し口の値と受信時刻が変わらないこと。heartbeat も止めた偽 worker は `worker_idle` で切られること |
 | 設定の不変条件 | `mpc.max_source_age_ms` の上限・下限、`worker_idle_timeout_ms >= 3 * heartbeat_interval_ms` を外した設定が読み込み時に拒まれること |
+| stage の昇格で束縛を作り直す | 試験用の registry と反実仮想モデルで、frame の `authority_stage` を `SHADOW` から `LIMITED` へ上げたとき、worker が古い束縛で提案を出さず、作り直した束縛の `binding_authority_stage` が `LIMITED` になった提案を出し、Gate がそれを `binding_authority_not_covered` で拒まないこと。registry がその stage を認めないときは `model_load_failure` を返すこと。stage が下がったときは作り直さず、提案が Gate を通ること |
 | worker が読む入力が frame だけ | worker の package の import 試験（`sqlite3`・`serial`・`coldaisle.store`・`coldaisle.ai` を import しない） |
 | registry の束縛 | 一時ディレクトリの registry で、provenance・Gate の期待値・`expected_rl_identity` が同じ `revision` から来ること、壊れた registry で Learned が無効のまま起動すること |
 | 再現性（#86 の受入基準） | 記録した frame の列・artifact・設定・seed から、同じ `result_digest()` が出ること |
@@ -410,7 +434,7 @@ frame は tick ごとに1つ、その tick の**同じ snapshot**から作る。
 
 | 案 | 利点 | 却下理由 |
 |---|---|---|
-| **A. 役割ごとの別 systemd unit（推奨）** | 権限を分けられる・片方の異常で他方を止めない | — |
+| **A. 役割ごとの別 systemd unit（採用）** | 権限を分けられる・片方の異常で他方を止めない | — |
 | B. MPC と RL を1つの worker プロセスに同居 | unit が1つで済む・frame の受信が1回 | 片方のメモリ枯渇・hang で両方止まる。周期が6倍違い、スケジューリングが混ざる。**所有者が unit 数を嫌うなら採れる**（安全上の差は無い） |
 | C. `coldaisle-fand` が子プロセスとして起動（`multiprocessing` など） | 配備が単純・寿命が揃う | hwmon に書ける権限を継承する。落とすには権限を下げる処理が要り、失敗の種類が増える。`coldaisle-fand` の再起動のたびに worker も作り直され、モデルの読み込みが `STARTUP` に重なる |
 | D. `coldaisle-fand` の中のスレッド | IPC が要らない | 0028 §2.2（FINAL）の「制御ループの外の worker プロセス」に反する。数値計算が GIL を長く握ると tick の締め切りに響き、モデルの読み込み（deserialize）が制御プロセスに入る。変えるなら 0028 を Supersede する記録が要る |
@@ -419,7 +443,7 @@ frame は tick ごとに1つ、その tick の**同じ snapshot**から作る。
 
 | 案 | 利点 | 却下理由 |
 |---|---|---|
-| **A. `SOCK_SEQPACKET` の Unix ソケット＋受付スレッド（推奨）** | 境界と相手の死を OS が教える・`SO_PEERCRED` で書き手を絞れる・0072 の部品を再利用できる | — |
+| **A. `SOCK_SEQPACKET` の Unix ソケット＋受付スレッド（採用）** | 境界と相手の死を OS が教える・`SO_PEERCRED` で書き手を絞れる・0072 の部品を再利用できる | — |
 | B. `RuntimeDirectory` の file を原子置換（worker が tmp に書いて rename、ループが毎 tick `stat` して読む） | スレッドが要らない・実装が小さい | 書き手をファイル権限でしか絞れない。**読み・検証が tick の中に入り**（Critical Safety の前）、大きな結果ほど tick が伸びる。worker の死を「更新が止まった」でしか知れない。逆向き（frame）にも同じ仕組みが要る。**スレッドを増やしたくないなら次善** |
 | C. 共有メモリ（`mmap` のリングバッファ） | 最速 | 途中まで書かれた値を読む・版の管理・壊れたメモリの検証が難しい。1 Hz の制御に速さは要らない |
 | D. SQLite の表（worker が書き、ループが読む） | 既存のストアを使える | ストアの書き手が増え、busy timeout の待ちがループに入る（0060 §2.7）。trace の保存とロックを取り合う |
@@ -429,7 +453,7 @@ frame は tick ごとに1つ、その tick の**同じ snapshot**から作る。
 
 | 案 | 却下理由 |
 |---|---|
-| **A. 毎 tick の frame、window は worker が組み立てる（推奨）** | — |
+| **A. 毎 tick の frame、window は worker が組み立てる（採用）** | — |
 | B. `coldaisle-fand` が `mpc.period_ms` ごとに window 全体を送る | `coldaisle-fand` がモデルの feature schema と window 長を知ることになり、モデルの変更が制御デーモンの変更になる。メッセージも大きい |
 | C. worker が SQLite の `latest()` / 履歴を自分で読む | 別時刻の Telemetry で推論する（#86「MPC だけが別時刻の Raw Telemetry を再取得しない」、0060 §2.5 に反する）。Fallback・Safety の floor・effective demand が worker から見えない |
 
@@ -437,77 +461,82 @@ frame は tick ごとに1つ、その tick の**同じ snapshot**から作る。
 
 | 案 | 却下理由 |
 |---|---|
-| worker が落ちても直前の提案を `mpc.valid_ms`（RL は `supervisor.valid_ms`）まで使う | 死んだプロセスの直前の出力を健全とみなす根拠が無い（→ 所有者判断 4。**採っても安全側の裁定は変わらない**ので、所有者が稼働率を優先するなら採れる） |
+| worker が落ちても直前の提案を `mpc.valid_ms`（RL は `supervisor.valid_ms`）まで使う | 死んだプロセスの直前の出力を健全とみなす根拠が無い（§5 の決定 4。**採っても安全側の裁定は変わらない**ので、所有者が稼働率を優先するなら採れる） |
 | 受付スレッドの死で Max にする（0072 と揃える） | 人の安全側の入口を失う 0072 と違い、ここで失うのは任意の ML だけ。Max は騒音として安全系に ML の失敗を混ぜる |
 | worker の異常を `EMERGENCY` の fault にする | Critical Safety を ML から独立させる（AGENTS.md ルール3）に反する。ML の失敗は Gate の Fallback で扱う（0028 §2.7） |
-| MPC の期限を受信起点のまま（0028 §2.6 のみ）にする | 滞留した提案が受信時に新しく見える。暗黙の上限（snapshot の窓）は Supervisor の期限に引きずられて長い（→ 所有者判断 6） |
+| MPC の期限を受信起点のまま（0028 §2.6 のみ）にする | 滞留した提案が受信時に新しく見える。暗黙の上限（snapshot の窓）は Supervisor の期限に引きずられて長い（§5 の決定 6） |
 | MPC の期限を 0041 のように元 snapshot 起点へ**置き換える**（0028 §2.6 を Supersede） | 受信起点の条件（受信してからの時間の上限）が消える。両方を掛けるほうが保守側で、既存の記録も書き換えずに済む |
-| `coldaisle-fand` が走行中に registry を `stat` して読み直す（PR #192 の journal と同じ形） | provenance と Gate の期待値が走行中に変わる。0071 §2.5（FINAL）の「promotion は再起動から trace に現れる」と食い違い、別の記録が要る（→ 所有者判断 8） |
-| `--registry-root` が読めないときは起動しない（終了コード 5） | 任意の部品の破損で Fan の制御を手放す（→ 所有者判断 7） |
+| authority の昇格の手順に worker の再起動を含め、走行中の worker は束縛を作り直さない | 手順の漏れで昇格後も Learned が Fallback のままになり、次の段の証拠が集まらない。束縛の追従は frame に stage があれば worker の中で閉じる（§2.3）。最終レビューの指摘への推奨案として 2026-09-30 に承認 |
+| `coldaisle-fand` が走行中に registry を `stat` して読み直す（PR #192 の journal と同じ形） | provenance と Gate の期待値が走行中に変わる。0071 §2.5（FINAL）の「promotion は再起動から trace に現れる」と食い違い、別の記録が要る（§5 の決定 8） |
+| `--registry-root` が読めないときは起動しない（終了コード 5） | 任意の部品の破損で Fan の制御を手放す（§5 の決定 7） |
 | worker に `expected_artifacts` を渡さず、各自で production を追わせる | promotion の直後に Gate と別の artifact で提案を作り続け、Fallback が続く。どの artifact で作ったかの説明も2か所に分かれる |
 | worker が `origin`（`active_binding`）を名乗る | 別プロセスからの自己申告に制御権の用途を任せる。`for_active` が閉じている間は `unverified` のまま（0061 §2.4） |
 | ループが経路から来た RL 出力に `origin = shadow_binding` を押す | 0061 §2.4 の `shadow_binding` は「`for_shadow` から出た束」で、別プロセスでそれを使ったことをループは証明できない。値の意味を黙って変えることになる（active slot を通らない点は `unverified` と同じなので、得るものも無い） |
 | 1つのソケットで、最初のメッセージの名乗りから役割を決める | どちらかの worker の資格で `mpc` を名乗れる。乗っ取られた RL worker が Demand を含む `MpcProposal` を送れる（§2.7） |
-| 1つのソケットのまま、`SO_PEERCRED` の uid / グループから役割を引く表を設定に持つ | 役割の境界は守れるが、ソケットのファイル権限だけでは役割を分けられず、表の誤りが認可の誤りになる。ソケットを分けるほうが OS の権限で二重に守れる（→ 所有者判断 12 の代替） |
+| 1つのソケットのまま、`SO_PEERCRED` の uid / グループから役割を引く表を設定に持つ | 役割の境界は守れるが、ソケットのファイル権限だけでは役割を分けられず、表の誤りが認可の誤りになる。ソケットを分けるほうが OS の権限で二重に守れる（§5 の決定 12 の代替） |
 | heartbeat を設けず、`worker_idle_timeout_ms` を最長の周期より長くするだけにする | 観測 window の立ち上がり中など、正当に黙る時間の上限が設定から決まらない。長くすると固まった worker の検出が遅れ、新しい接続が締め出される時間も延びる |
 | 経路の失敗を `LearnedFailure` / `FallbackCause` の新しい値にする | worker との通信の型と Gate の閉じた列挙が変わり、`ModelGateDecision`（0065）の版に触れうる。経路の失敗は worker が名乗るものでもない（§2.5） |
 | 認可で `coldaisle-fand` と同じ uid を認める | `coldaisle-fand` と同じ uid の別サービスが提案を差し込める（0072 §2.5 と同じ理由） |
-| 経路の健全性を必ず trace に載せる（版上げを必須にする） | 推奨案では既存の欄で足りる。版上げは #192 と直列にしなければならず、段階 1 を待たせる（→ 所有者判断 9） |
+| 経路の健全性を必ず trace に載せる（版上げを必須にする） | 採用した案では既存の欄で足りる。版上げは #192 と直列にしなければならず、段階 1 を待たせる（§5 の決定 9） |
 
 ---
 
 ## 5. 未決事項
 
-### 所有者の判断を要する点（本記録の承認で決める）
+### 所有者が決めた点（2026-09-30 オーナーが推奨案で承認）
 
-各問いの **【推奨】** が本記録の §2 の内容である。推奨以外を選んだ問いは、承認の前に本文をその案で書き直す。
+承認の前は所有者の判断を要する問いとして並べていた（15 は最終レビューで残った指摘）。2026-09-30、オーナーが**すべての問いで推奨案**を
+採った。各問いの **【採用】** が本記録の §2 の内容であり、それ以外の選択肢は検討の記録として残す。
 
 1. **worker をどこで動かすか。**（§2.1 / §4.1）
-   - (a) **【推奨】** 役割ごとの別 systemd unit・別ユーザー
+   - (a) **【採用】** 役割ごとの別 systemd unit・別ユーザー
    - (b) MPC と RL を1つの worker プロセスに同居させる
    - (c) `coldaisle-fand` の子プロセスとして起動する
 2. **提案をどの経路で運ぶか。**（§2.2 / §4.2）
-   - (a) **【推奨】** `coldaisle-fand` が持つ `SOCK_SEQPACKET` の Unix ソケット＋受付スレッド
+   - (a) **【採用】** `coldaisle-fand` が持つ `SOCK_SEQPACKET` の Unix ソケット＋受付スレッド
    - (b) `RuntimeDirectory` の file の原子置換（スレッド無し。読み・検証が tick に入る）
 3. **worker の入力を何にするか。**（§2.3 / §4.3）
-   - (a) **【推奨】** 毎 tick の frame を送り、観測 window は worker が組み立てる
+   - (a) **【採用】** 毎 tick の frame を送り、観測 window は worker が組み立てる
    - (b) `coldaisle-fand` が `mpc.period_ms` ごとに window 全体を送る
 4. **worker（MPC と RL の両方）の接続が切れた・固まったとき、直前の有効な出力をどう扱うか。**（§2.5）
-   - (a) **【推奨】** MPC・RL とも、その tick から受け渡し口を空にし Fallback / RulePolicy
+   - (a) **【採用】** MPC・RL とも、その tick から受け渡し口を空にし Fallback / RulePolicy
    - (b) 直前の出力をそれぞれの期限（`mpc.valid_ms` / `supervisor.valid_ms`）まで使う
 5. **受付スレッドが死んだとき、どう倒すか。**（§2.2）
-   - (a) **【推奨】** Learned の経路だけを閉じる（Max にしない）
+   - (a) **【採用】** Learned の経路だけを閉じる（Max にしない）
    - (b) 0072 の管理ソケットと揃えて `MAX`
 6. **MPC の提案の新しさをどう判定するか。**（§2.4 の4）
-   - (a) **【推奨】** `mpc.max_source_age_ms` を `fan-policy.yaml` に新設し、受信起点と元 snapshot 起点の両方を掛ける。上限 `<= mpc.valid_ms` と下限 `>= 2 * tick_ms + mpc.period_ms + mpc.budget_ms`（往きと還りの tick を1つずつ） を読み込み時に確かめ、`fan-policy.yaml` の schema と束ねた版 `CONTROL_CONFIG_VERSION` を上げる
+   - (a) **【採用】** `mpc.max_source_age_ms` を `fan-policy.yaml` に新設し、受信起点と元 snapshot 起点の両方を掛ける。上限 `<= mpc.valid_ms` と下限 `>= 2 * tick_ms + mpc.period_ms + mpc.budget_ms`（往きと還りの tick を1つずつ） を読み込み時に確かめ、`fan-policy.yaml` の schema と束ねた版 `CONTROL_CONFIG_VERSION` を上げる
    - (b) 受信起点のまま（0028 §2.6 だけ）
    - (c) 0028 §2.6 を Supersede して元 snapshot 起点へ置き換える
 7. **`--registry-root` を与えたのに registry が読めない・壊れているとき、起動をどうするか。**（§2.6）
-   - (a) **【推奨】** Learned を無効にして起動を続ける（`expected_model_version` は番兵 `unconfigured`、他は `None` / `unbound()`）
+   - (a) **【採用】** Learned を無効にして起動を続ける（`expected_model_version` は番兵 `unconfigured`、他は `None` / `unbound()`）
    - (b) 終了コード 5 で制御を取らない（BIOS に戻す）
 8. **model の promotion をいつ反映するか。また、promotion から再起動までの間 Learned を止めることを受け入れるか。**（§2.6）
-   - (a) **【推奨】** `coldaisle-fand` の再起動から反映（0071 §2.5 のまま）。固定された artifact が production でなくなったら、rollback でも promotion でも worker は自主停止し、再起動まで Fallback
+   - (a) **【採用】** `coldaisle-fand` の再起動から反映（0071 §2.5 のまま）。固定された artifact が production でなくなったら、rollback でも promotion でも worker は自主停止し、再起動まで Fallback
    - (b) 再起動からの反映は同じだが、promotion では worker を止めず、再起動まで古い artifact で提案を続ける（rollback だけで止める。worker が rollback と promotion を区別する規則が要る）
    - (c) `coldaisle-fand` が走行中に registry を読み直す（0071 §2.5 と食い違うので別の記録が要る）
 9. **経路の健全性を trace の独立した塊に載せるか。**（§2.9）
-   - (a) **【推奨】** 載せない（`ControlTick` の版を上げない。切断の理由は問い 11 の detail で残る）
+   - (a) **【採用】** 載せない（`ControlTick` の版を上げない。切断の理由は問い 11 の detail で残る）
    - (b) `learned_channel` の塊を足す（#192 の v13 の後に直列で版上げ・`KNOWN_VERSIONS` 更新）
 10. **再起動をまたいだ取り違えをどう防ぐか。**（§2.4 の1）
-    - (a) **【推奨】** 封筒の `run_id` の照合と 0060 の `(tick_id, ts_ms, schema)` の照合の二重
+    - (a) **【採用】** 封筒の `run_id` の照合と 0060 の `(tick_id, ts_ms, schema)` の照合の二重
     - (b) 0060 の照合だけ
 11. **経路の失敗の理由（`worker_disconnected` / `worker_idle` / `channel_dead` / `channel_disabled`）を trace に出すか。**（§2.2 / §2.5）
-    - (a) **【推奨】** `LearnedChannelHealth` を足し、`LearnedControlStatus.unavailable_detail` 経由で既存の `learned_proposal_unavailable` の `Reason.detail` に入れる（`FallbackCause` / `LearnedFailure` に値を足さない。版を上げない）
+    - (a) **【採用】** `LearnedChannelHealth` を足し、`LearnedControlStatus.unavailable_detail` 経由で既存の `learned_proposal_unavailable` の `Reason.detail` に入れる（`FallbackCause` / `LearnedFailure` に値を足さない。版を上げない）
     - (b) trace には空の detail のまま出し、理由は構造化ログだけに残す（Protocol も `LearnedControlStatus` も変えない）
     - (c) `FallbackCause` に経路ごとの値を足す（Gate の閉じた列挙が変わる。`ModelGateDecision` の版への影響を別に確かめる）
 12. **worker の役割をどう認可するか。**（§2.7）
-    - (a) **【推奨】** 役割ごとのソケットと、重ならない役割ごとのグループ（`SO_PEERCRED`）。封筒の `role` は照合だけ
+    - (a) **【採用】** 役割ごとのソケットと、重ならない役割ごとのグループ（`SO_PEERCRED`）。封筒の `role` は照合だけ
     - (b) 1つのソケットのまま、`SO_PEERCRED` の uid / グループから役割を引く表を設定に持つ
 13. **正当に黙っている worker と固まった worker をどう区別するか。**（§2.7）
-    - (a) **【推奨】** worker が `heartbeat_interval_ms` ごとに heartbeat を送り、`worker_idle_timeout_ms >= 3 * heartbeat_interval_ms` を読み込み時に確かめる。heartbeat は受け渡し口と受信時刻を変えない
+    - (a) **【採用】** worker が `heartbeat_interval_ms` ごとに heartbeat を送り、`worker_idle_timeout_ms >= 3 * heartbeat_interval_ms` を読み込み時に確かめる。heartbeat は受け渡し口と受信時刻を変えない
     - (b) heartbeat を設けず、`worker_idle_timeout_ms` を `mpc.period_ms` / `supervisor.period_ms` より十分長くする不変条件だけを置く
 14. **経路から来た RL 出力の `origin` を何にするか。**（§2.8）
-    - (a) **【推奨】** いまと同じ `unverified`（0061 §2.4 の意味を変えない）
+    - (a) **【採用】** いまと同じ `unverified`（0061 §2.4 の意味を変えない）
     - (b) ループが `shadow_binding` を押す（0061 §2.4 の `shadow_binding` の意味を広げる記録が別に要る）
+15. **authority の stage が上がったとき、走り続ける worker の `MpcModelBinding` をどうするか。**（§2.3。39ac39a の最終レビューで残った指摘）
+    - (a) **【採用】** frame の `authority_stage` が上がったら、次の提案の前に束縛を作り直して検証し直し、`binding_authority_stage` を実効 stage へ追従させる。検証に失敗すれば `model_load_failure`
+    - (b) 昇格の手順に worker の再起動を含める
 
 ### 実測を待つ値（`status: provisional` で置き、実測後に決める）
 
