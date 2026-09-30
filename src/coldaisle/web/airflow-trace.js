@@ -21,9 +21,10 @@
 (function (root) {
   // 版ごとに**初めて現れた**欄（control/schema.py の SCHEMA_VERSION の説明）。
   // **schema.py にある版だけを知っている版にする。** 版の番号は先にマージされた PR で決まる
-  // （0064 §2.9 / 0071 §2.5）ため、推測で先取りしない。v13 以降は「未対応の版」。
+  // （0064 §2.9 / 0071 §2.5）ため、推測で先取りしない。v14 以降は「未対応の版」。
   // v11（#81 / 決定記録 0073 §2.5）: `air_balance` と `zones.*.applied_demand`。
   // v12（#74 / 決定記録 0072 §2.7）: `mode_command`（モードの出どころ・lease 切れ・受付の停止）。
+  // v13（#92 / 決定記録 0072 §2.6）: `authority`（制御権の出どころ・journal を読めない・降格の指令）。
   const SINCE = {
     workload_regime: 2,
     supervisor: 3,
@@ -35,8 +36,9 @@
     air_balance: 11,
     applied_demand: 11,
     mode_command: 12,
+    authority: 13,
   };
-  const KNOWN_VERSIONS = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12];
+  const KNOWN_VERSIONS = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13];
 
   const NOT_IN_VERSION = "この版の記録には無い";
   const ZONE_KEYS = ["front", "rear", "top"];
@@ -311,6 +313,30 @@
     return { k: key, v: "指令なし（自動）" };
   }
 
+  // 制御権の出どころ（v13。決定記録 0072 §2.6）。**journal を読めないことと書き残せないことを
+  // 通常状態に見せない。** 実効の権限そのものは「学習モデルの権限」の行が出す。
+  function authoritySourceChip(version, body) {
+    const key = "制御権の出どころ";
+    if (!has(version, "authority")) return { k: key, v: NOT_IN_VERSION, tone: "absent" };
+    const record = body.authority;
+    if (!isObject(record)) return { k: key, v: UNKNOWN_VALUE, tone: "warn" };
+    if (record.journal_unreadable === true) {
+      return { k: key, v: "権限の記録を読めないため試験運転へ下げている", tone: "bad" };
+    }
+    if (isObject(record.persist_failure)) {
+      return { k: key, v: "権限を下げたが記録へ書き残せていない（再起動で戻る）", tone: "bad" };
+    }
+    if (typeof record.command_id === "number") {
+      return { k: key, v: `管理ソケットの降格 #${record.command_id} を入れた`, tone: "warn" };
+    }
+    if (record.entry === "static") return { k: key, v: "固定（権限の記録なし）", tone: "warn" };
+    if (typeof record.unpersisted_ceiling === "string") {
+      const ceiling = label(AUTHORITY, record.unpersisted_ceiling, UNKNOWN_VALUE);
+      return { k: key, v: `この運転の中で「${ceiling}」まで下げている`, tone: "warn" };
+    }
+    return { k: key, v: "権限の記録（journal）" };
+  }
+
   function number(value) {
     return typeof value === "number" && Number.isFinite(value) ? value : null;
   }
@@ -535,6 +561,7 @@
         : { k: "故障", v: "なし", tone: "ok" },
       safetyProvenanceChip(version, body),
       modeSourceChip(version, body),
+      authoritySourceChip(version, body),
     ];
     return {
       ...base,

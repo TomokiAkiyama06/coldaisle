@@ -1260,6 +1260,9 @@ def _tick_for_schema_version(version: int, *, ts_ms: int, tick_id: int) -> Contr
     if version >= 12:
         # v12も同じく、モードの出どころを省いた記録を作れない（#74 / 決定記録 0072 §2.7）
         raw["mode_command"] = {"schema_version": 1, "entry": "none"}
+    if version >= 13:
+        # v13も同じく、制御権の出どころを省いた記録を作れない（#92 / 決定記録 0072 §2.6）
+        raw["authority"] = {"schema_version": 1, "entry": "static", "config_ceiling": "full"}
     return ControlTick.model_validate_json(json.dumps(raw))
 
 
