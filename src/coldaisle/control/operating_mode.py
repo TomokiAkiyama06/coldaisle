@@ -11,6 +11,12 @@
 2. 受け渡し口を**非ブロッキングで**1回だけ覗く。取れなければ直前のモードのまま進む
 3. `MANUAL` の lease を**この loop の単調時計だけ**で数え、期限が来たら `AUTO` へ戻す
 
+受け渡し口は**状態の軸ごとに1枠**（モードの枠と authority の枠）を持ち、loop は2枠を同じ lock の
+中で取り出す（0072 §2.2）。authority の枠の指令（`lower_authority` / `rollback_authority`。段階 2 の
+#92）は、loop がこの tick の Gate が stage を読む前に `AuthorityRuntime` へ入れる。
+ここでは取り出して loop へ渡すだけで、`AuthorityRuntime` には触れない。
+**authority を上げる指令の型は無い**（0072 §2.1）。
+
 適用した指令と lease 切れは受け渡し口へ返すだけで、監査の表へは書かない（loop は DB を待たない。
 0072 §2.7）。`status` のための最新の状態も、受け渡し口へ置くだけにする。
 """
@@ -20,12 +26,14 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 from enum import StrEnum
-from typing import Protocol, Self
+from typing import Literal, Protocol, Self
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from coldaisle import logs
 from coldaisle.control.schema import (
+    BASELINE_STAGE,
+    AuthorityRecord,
     AuthorityStage,
     Demand,
     ModeCommandRecord,
@@ -33,6 +41,7 @@ from coldaisle.control.schema import (
     PerZone,
     Reason,
     ZoneRequest,
+    stage_rank,
 )
 
 LOGGER = logging.getLogger("coldaisle.control")
@@ -105,6 +114,47 @@ class AdminModeCommand(BaseModel):
         )
 
 
+ADMIN_ACTOR_PREFIX = "uid."
+"""管理ソケットの指令を journal に残すときの主体の形（`uid.<数値>`。0072 §2.5）。"""
+
+
+class AdminAuthorityCommand(BaseModel):
+    """受付スレッドが検証し、受け渡し口の authority の枠へ置いた降格（0072 §2.3 / §2.6）。
+
+    **下げる向きしか表せない。** `rollback_authority` は `SHADOW`（Baseline）へ、
+    `lower_authority` は `to_stage` へ下げる上限を入れる。いまの実効 stage とは比べない
+    （受付の時点の stage は古いことがある。適用するかは loop が決める。0072 §2.3 / §2.6）。
+
+    journal には人の変更として残るので、主体（`uid.<数値>`）と理由を運ぶ（0072 §2.7）。
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid", strict=True)
+
+    command_id: int = Field(ge=1)
+    op: Literal["lower_authority", "rollback_authority"]
+    to_stage: AuthorityStage
+    actor: str = Field(pattern=r"^uid\.[0-9]+$")
+    reason: str = Field(min_length=1, max_length=1000)
+
+    @model_validator(mode="after")
+    def _rollback_goes_to_the_baseline(self) -> Self:
+        if self.op == "rollback_authority" and self.to_stage is not BASELINE_STAGE:
+            raise ValueError("rollback_authority は Baseline（SHADOW）へ戻す")
+        return self
+
+    def deeper_than(self, other: AdminAuthorityCommand) -> bool:
+        """`other` より低い行き先か（枠の合成は**最も低い行き先**を採る。0072 §2.2）。"""
+        return stage_rank(self.to_stage) < stage_rank(other.to_stage)
+
+
+@dataclass(frozen=True, slots=True)
+class MailboxTake:
+    """loop が1 tick の先頭で、受け渡し口の2枠から**同じ lock の中で**取り出したもの。"""
+
+    mode: AdminModeCommand | None = None
+    authority: AdminAuthorityCommand | None = None
+
+
 class ModeOutcomeKind(StrEnum):
     """loop が受け渡し口へ返す事実（監査の表の事象の行になる。0072 §2.7）。"""
 
@@ -135,6 +185,8 @@ class ModeStatus:
     """`MANUAL` の期限（この process の単調時計）。残りは受付スレッドが同じ時計で数える。"""
     authority_stage: AuthorityStage
     admin_receiver_dead: bool
+    authority: AuthorityRecord | None = None
+    """その tick の制御権の出どころ（journal の stage・上限・永続化の失敗。0072 §2.7）。"""
 
 
 class ModeMailbox(Protocol):
@@ -148,8 +200,11 @@ class ModeMailbox(Protocol):
         """受付スレッドが生きているか。**lock を取らない。**"""
         ...
 
-    def take_mode(self) -> AdminModeCommand | None:
-        """モードの枠を取り出す。空、または lock が取れなければ None（直前のモードを保つ）。"""
+    def take(self) -> MailboxTake | None:
+        """モードの枠と authority の枠を**同じ lock の中で**取り出す。
+
+        lock が取れなければ None（その tick は直前のモード・stage のまま進む。0072 §2.2）。
+        """
         ...
 
     def report(self, outcome: ModeOutcome) -> None:
@@ -167,6 +222,8 @@ class ModeResolution:
 
     command: ModeCommand
     record: ModeCommandRecord
+    authority: AdminAuthorityCommand | None = None
+    """この tick の先頭で loop が `AuthorityRuntime` へ入れる降格（0072 §2.6）。"""
 
 
 class AdminModeTracker:
@@ -201,9 +258,10 @@ class AdminModeTracker:
         """この tick のモード。**例外を外へ出さない**（入口の不具合で冷却を止めない）。"""
         if self._dead or not self._receiver_alive():
             return self._hold_max_after_receiver_death(tick_id)
-        self._take(tick_id=tick_id, now_mono_ms=now_mono_ms)
+        authority = self._take(tick_id=tick_id, now_mono_ms=now_mono_ms)
         expired = self._expire_lease(tick_id=tick_id, now_mono_ms=now_mono_ms)
         return ModeResolution(
+            authority=authority,
             command=self._command,
             record=ModeCommandRecord(
                 entry="control_admin",
@@ -213,7 +271,17 @@ class AdminModeTracker:
             ),
         )
 
-    def publish(self, *, tick_id: int, authority_stage: AuthorityStage) -> None:
+    def authority_applied(self, *, command_id: int, tick_id: int) -> None:
+        """loop が authority の降格を `AuthorityRuntime` へ入れたことを受付スレッドへ返す。"""
+        self._report(ModeOutcome(ModeOutcomeKind.APPLIED, command_id, tick_id))
+
+    def publish(
+        self,
+        *,
+        tick_id: int,
+        authority_stage: AuthorityStage,
+        authority: AuthorityRecord | None = None,
+    ) -> None:
         """`status` のための写しを受け渡し口へ置く。失敗しても制御は止めない。"""
         status = ModeStatus(
             tick_id=tick_id,
@@ -222,6 +290,7 @@ class AdminModeTracker:
             lease_deadline_mono_ms=self._lease_deadline_mono_ms,
             authority_stage=authority_stage,
             admin_receiver_dead=self._dead,
+            authority=authority,
         )
         try:
             self._mailbox.publish(status)
@@ -264,18 +333,25 @@ class AdminModeTracker:
             ),
         )
 
-    def _take(self, *, tick_id: int, now_mono_ms: int) -> None:
+    def _take(self, *, tick_id: int, now_mono_ms: int) -> AdminAuthorityCommand | None:
+        """2枠を取り出し、モードを適用する。authority の降格は loop へ返す（loop が入れる）。"""
         try:
-            taken = self._mailbox.take_mode()
+            both = self._mailbox.take()
         except Exception:
-            # 読めない tick は直前のモードを保つ（0060 §2.3）
+            # 読めない tick は直前のモード・stage を保つ（0060 §2.3）
             LOGGER.exception(
                 "control-admin の受け渡し口を読めなかった; 直前のモードを保つ",
                 extra={logs.FIELDS_KEY: {"tick_id": tick_id, "mode": self._command.mode.value}},
             )
-            return
-        if taken is None:
-            return
+            return None
+        if both is None:
+            return None
+        taken = both.mode
+        if taken is not None:
+            self._apply_mode(taken, tick_id=tick_id, now_mono_ms=now_mono_ms)
+        return both.authority
+
+    def _apply_mode(self, taken: AdminModeCommand, *, tick_id: int, now_mono_ms: int) -> None:
         self._command = taken.to_mode_command()
         self._command_id = taken.command_id
         self._lease_deadline_mono_ms = (

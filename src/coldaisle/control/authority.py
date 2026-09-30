@@ -21,13 +21,16 @@ import しない。出せるのは「いまの stage」までで、Critical Safe
 
 from __future__ import annotations
 
+import logging
 import os
+import re
 import secrets
 import stat
 import time
 from collections import deque
 from collections.abc import Iterator
 from contextlib import ExitStack, contextmanager, suppress
+from dataclasses import dataclass
 from enum import StrEnum
 from fcntl import LOCK_EX, LOCK_NB, LOCK_UN, flock
 from hashlib import sha256
@@ -36,6 +39,7 @@ from typing import Literal, Self
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
+from coldaisle import logs
 from coldaisle.clock import Clock, WallClock
 from coldaisle.control.config import ControlConfig, FanPolicyConfig
 from coldaisle.control.evaluation.model import (
@@ -58,6 +62,7 @@ from coldaisle.control.model_registry import (
 from coldaisle.control.schema import (
     BASELINE_STAGE,
     STAGE_ORDER,
+    AuthorityRecord,
     AuthorityStage,
     AuthorityStageSource,
     ConfidenceLevel,
@@ -94,6 +99,7 @@ __all__ = [
     "AuthorityStoreError",
     "AuthorityTrigger",
     "AutomaticCause",
+    "JournalSignature",
     "RolloutEvidence",
     "StageApproval",
     "StaticAuthorityStage",
@@ -103,13 +109,18 @@ __all__ = [
     "stage_rank",
 ]
 
-AUTHORITY_JOURNAL_SCHEMA_VERSION: Literal[2] = 2
+AUTHORITY_JOURNAL_SCHEMA_VERSION: Literal[3] = 3
 """journal 1つの形の版。**欄の意味を変えたら上げる。**
 
 - v2（#81 / 決定記録 0073 §2.6）: 昇格 event の証拠（`RolloutEvidence`）に
   `air_balance_config_sha256` と `fan_hardware_config_sha256` を足した。v2 の journal に
   新しく書く昇格は両方を必ず持つ。v1 の event は持たないまま読む（過去の記録として読むだけで、
   新しい昇格の根拠にはならない）。既に残った event は書き換えない
+- v3（#92 / 決定記録 0072 §2.6）: 自動降格の理由に `authority_journal_unreadable` を足した
+  （走行中に journal が読めなかったので `SHADOW` へ下げた）。**この理由を持つ event は v3 の
+  journal にだけ置ける。** v2 までの reader はこの値を知らないので、版を上げて「知らない
+  journal」として拒ませる（黙って読み違えさせない）。v1 / v2 の journal はそのまま読み、
+  次に書くときに v3 で書く（既に残った event は書き換えない）
 """
 
 AUTHORITY_STATE_FILENAME = "authority.json"
@@ -132,6 +143,11 @@ MAX_JOURNAL_EVENTS = 4_096
 """1つの journal に残す変更の件数。超えたら**昇格を拒む**（黙って古い記録を捨てない）。"""
 
 _ACTOR_PATTERN = r"^[a-z][a-z0-9_.-]*$"
+_ACTOR_MAX_CHARS = 120
+_REASON_MAX_CHARS = 1000
+"""journal の event の actor / reason の上限。資源の境界であり、調整値ではない。"""
+
+_LOGGER = logging.getLogger("coldaisle.control")
 
 
 class AuthorityError(Exception):
@@ -177,6 +193,14 @@ class AutomaticCause(StrEnum):
     PERSISTENT_OOD = "persistent_ood"
     SAFETY_EMERGENCY = "safety_emergency"
     """Critical Safety が `EMERGENCY` を出した。Baseline へ戻す。"""
+    AUTHORITY_JOURNAL_UNREADABLE = "authority_journal_unreadable"
+    """走行中に journal が読めない・壊れている。Baseline へ戻す（0072 §2.6。journal v3）。"""
+
+
+_CAUSES_ADDED_IN_V3: frozenset[AutomaticCause] = frozenset(
+    {AutomaticCause.AUTHORITY_JOURNAL_UNREADABLE}
+)
+"""journal v3 で足した自動降格の理由。v2 までの journal には置けない。"""
 
 
 class _Frozen(BaseModel):
@@ -264,8 +288,8 @@ class AuthorityEvent(_Frozen):
     trigger: AuthorityTrigger
     from_stage: AuthorityStage
     to_stage: AuthorityStage
-    actor: str = Field(pattern=_ACTOR_PATTERN, max_length=120)
-    reason: str = Field(min_length=1, max_length=1000)
+    actor: str = Field(pattern=_ACTOR_PATTERN, max_length=_ACTOR_MAX_CHARS)
+    reason: str = Field(min_length=1, max_length=_REASON_MAX_CHARS)
     cause: AutomaticCause | None = None
     approval: StageApproval | None = None
 
@@ -306,7 +330,7 @@ class AuthorityJournal(_Frozen):
     **stage は event から再現できなければならない。** 再現できない journal は読まない。
     """
 
-    schema_version: Literal[1, 2] = AUTHORITY_JOURNAL_SCHEMA_VERSION
+    schema_version: Literal[1, 2, 3] = AUTHORITY_JOURNAL_SCHEMA_VERSION
     revision: int = Field(ge=0)
     stage: AuthorityStage = BASELINE_STAGE
     events: tuple[AuthorityEvent, ...] = ()
@@ -317,6 +341,8 @@ class AuthorityJournal(_Frozen):
             raise ValueError("revision と event 数が一致しない")
         bound_seen = False
         for event in self.events:
+            if event.cause in _CAUSES_ADDED_IN_V3 and self.schema_version < 3:
+                raise ValueError(f"{event.cause} の降格を記録する journal は v3 にする")
             if event.approval is None:
                 continue
             if event.approval.evidence.binds_air_balance:
@@ -552,6 +578,15 @@ def _check_learned_arms(
     return named
 
 
+@dataclass(frozen=True, slots=True)
+class JournalSignature:
+    """`authority.json` を読み直すかを決める `stat` の写し（決定記録 0072 §2.6）。"""
+
+    inode: int
+    size: int
+    mtime_ns: int
+
+
 class AuthorityStore:
     """journal を1つの JSON file として持つ、排他・原子置換つきの保管庫。
 
@@ -598,6 +633,28 @@ class AuthorityStore:
             if root_fd is None:
                 return AuthorityJournal(revision=0)
             return self._read(root_fd)
+
+    def journal_signature(self) -> JournalSignature | None:
+        """`authority.json` の `stat`（inode・大きさ・`mtime_ns`）。無ければ None。
+
+        **flock を取らない**（決定記録 0072 §2.6）。control loop が毎 tick、heartbeat の後に
+        呼び、変わっていたら `read()` し直す。journal は原子置換で書かれるので、書き換えは
+        inode の変化として必ず現れる。regular file でないものは読めないものとして扱う。
+        """
+        with self._open_root(create=False) as root_fd:
+            if root_fd is None:
+                return None
+            try:
+                status = os.stat(AUTHORITY_STATE_FILENAME, dir_fd=root_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                return None
+            except OSError as error:
+                raise AuthorityStoreError("authority journal の stat を取れない") from error
+        if not stat.S_ISREG(status.st_mode):
+            raise AuthorityStoreError("authority journal が regular file ではない")
+        return JournalSignature(
+            inode=status.st_ino, size=status.st_size, mtime_ns=status.st_mtime_ns
+        )
 
     def raise_stage(
         self,
@@ -1139,6 +1196,26 @@ class AuthorityDemotion(_Frozen):
         return self
 
 
+@dataclass(frozen=True, slots=True)
+class _PendingDemotion:
+    """memory 上では効いていて、まだ journal へ書き残していない降格（0057 §2.6）。"""
+
+    to_stage: AuthorityStage
+    actor: str
+    reason: str
+    trigger: AuthorityTrigger
+    cause: AutomaticCause | None
+
+
+_SIGNATURE_UNKNOWN = object()
+"""次の点検で必ず読み直す印。この process が journal を書いた直後に置く。
+
+書いた直後の `stat` を覚えると、その間に他 process が書いた変化を見逃しうる。"""
+
+JOURNAL_UNREADABLE_ACTOR = "control_runtime"
+"""走行中に journal を読めなかったときの降格を書き残す主体（自動降格と同じ）。"""
+
+
 class AuthorityRuntime:
     """いまの stage を制御ループへ渡し、不健全が続いたら**その場で**下げる。
 
@@ -1146,17 +1223,27 @@ class AuthorityRuntime:
     次の tick から効き、設定を上げても journal は上がらない（0057 §2.2）。
 
     **上げる経路を持たない。** 昇格は `AuthorityStore.raise_stage()` だけが行い、
-    この型は runtime から呼べる範囲に置かない（AGENTS.md ルール2 / 3）。
+    この型は runtime から呼べる範囲に置かない（AGENTS.md ルール2 / 3）。外の process
+    （人の CLI）が journal を上げたときは、`maintain()` の読み直しで journal の stage が
+    上がりうるが、実効 stage は設定の上限とこの process が書き残せずに持っている上限を
+    超えない（0072 §2.6）。
+
+    管理ソケット（決定記録 0072）からの降格は `apply_lowering()` が memory 上で先に効かせ、
+    書き残しは heartbeat の後の `maintain()` が行う（「先に in-memory、あとで journal」。
+    0057 §2.6）。
     """
 
     __slots__ = (
         "_demotion_consumed",
         "_journal",
+        "_journal_unreadable",
         "_last_mono_ms",
         "_low_confidence",
         "_ood",
+        "_pending",
         "_persist_failure",
         "_policy",
+        "_signature",
         "_store",
         "_unpersisted_ceiling",
     )
@@ -1167,6 +1254,9 @@ class AuthorityRuntime:
         store には**必ず lock の待ち上限を持たせる**（決定記録 0060 §2.7）。この runtime は
         control tick の中から呼ばれるので、待ち続ける store を渡すと、降格の書き残しが
         2つの heartbeat のあいだに居座って deadman が鳴る。
+
+        起動時に journal を読めなければ `AuthorityStateError` / `AuthorityStoreError` で止まる
+        （0057 §2.1。壊れた journal を「記録の無い状態」と読み替えない）。
         """
         if store.lock_timeout_ms is None:
             raise AuthorityStoreError(
@@ -1174,11 +1264,16 @@ class AuthorityRuntime:
             )
         self._store = store
         self._policy = policy
+        # **stat を先に取ってから読む。** 読んだ後に書き換わっても、覚えた stat と違うので
+        # 次の点検で読み直す（逆順だと、読んでから stat までの書き換えを見逃す）。
+        self._signature: object = store.journal_signature()
         self._journal = store.read()
         # **書き残せなかった降格だけ**を memory 上の上限として持つ（0057 §2.6）。
         # 書けた降格は journal がそのまま表しているので、二重に持たない。持つと、
         # あとから承認された昇格が再起動まで効かなくなる（codex #4056968495）。
         self._unpersisted_ceiling = AuthorityStage.FULL
+        self._pending: list[_PendingDemotion] = []
+        self._journal_unreadable = False
         # Gate の降格推奨を、立ち下がるまで1回だけ消費するための記憶。
         self._demotion_consumed = False
         self._last_mono_ms: int | None = None
@@ -1200,6 +1295,11 @@ class AuthorityRuntime:
     def persist_failure(self) -> Reason | None:
         """直近の降格を書き残せなかった理由。**運用者が見て直す。**"""
         return self._persist_failure
+
+    @property
+    def journal_unreadable(self) -> bool:
+        """走行中に journal を読めなかったので `SHADOW` に下げたまま、まだ書き残していない。"""
+        return self._journal_unreadable
 
     def current_stage(self) -> AuthorityStage:
         """この tick に与えてよい制御権。**上限を超えることはない。**"""
@@ -1291,6 +1391,64 @@ class AuthorityRuntime:
             trigger=AuthorityTrigger.HUMAN,
         )
 
+    def apply_lowering(self, *, to_stage: AuthorityStage, actor: str, reason: str) -> bool:
+        """管理ソケットの降格（人の指令）を **memory 上で先に**効かせる（決定記録 0072 §2.6）。
+
+        **古い snapshot で no-op と判断しない。** `to_stage` をいまの実効 stage と比べずに
+        無条件で上限として入れ、journal への書き残しを予約する（書くのは heartbeat の後の
+        `maintain()`）。外の process が直前に journal を上げていても、この上限は `reload()` で
+        外れないので、後から届いた降格が捨てられて authority が上がることはない。
+
+        返すのは、上限を入れた後の実効 stage が入れる前より下がったか（下がらなくても上限は残る）。
+        disk も lock も待たない（loop は tick の先頭でこれを呼ぶ）。
+        """
+        # 書き残す記録の形は journal の event と同じ規則で先に確かめる（書く時点で落とさない）
+        _check_actor_and_reason(actor, reason)
+        before = self.current_stage()
+        self._unpersisted_ceiling = lowest_stage(self._unpersisted_ceiling, to_stage)
+        self._enqueue(
+            _PendingDemotion(
+                to_stage=to_stage,
+                actor=actor,
+                reason=reason,
+                trigger=AuthorityTrigger.HUMAN,
+                cause=None,
+            )
+        )
+        return stage_rank(self.current_stage()) < stage_rank(before)
+
+    def maintain(self) -> None:
+        """heartbeat の後に1回呼ぶ。**効くのは次の tick から**（決定記録 0072 §2.6）。
+
+        1. 予約した降格を**1件だけ**書き残す（lock の待ち上限つき。0060 §2.7）。書けたら、
+           journal がその上限以下を表していれば memory 上の上限を手放す。書けなければ持ち続け、
+           次の tick で書き直す
+        2. `authority.json` の `stat` を見て、変わっていれば読み直す（flock を取らない）。
+           読めない・壊れているときは memory 上の上限を `SHADOW` に下げ、書き残しを予約する
+           （`authority_journal_unreadable`）。**読めるようになっただけでは外さない**
+
+        例外を外へ出さない（入口の不具合で冷却を止めない）。結果は構造化ログに残す。
+        """
+        self._flush_one()
+        self._check_journal()
+
+    def trace_record(self, *, command_id: int | None) -> AuthorityRecord:
+        """decision trace（`ControlTick` v13）へ残す、この時点の制御権の出どころ。"""
+        return AuthorityRecord(
+            entry="journal",
+            journal_stage=self._journal.stage,
+            journal_revision=self._journal.revision,
+            config_ceiling=self.configured_ceiling,
+            unpersisted_ceiling=(
+                None
+                if self._unpersisted_ceiling is AuthorityStage.FULL
+                else self._unpersisted_ceiling
+            ),
+            journal_unreadable=self._journal_unreadable,
+            command_id=command_id,
+            persist_failure=self._persist_failure,
+        )
+
     def trace_metadata(self) -> dict[str, object]:
         """#82 へ渡す stage の記録。**model version を含めない**（0057 §2.7）。"""
         metadata = self._journal.trace_metadata()
@@ -1305,6 +1463,7 @@ class AuthorityRuntime:
         metadata["authority_persist_failure"] = (
             None if self._persist_failure is None else self._persist_failure.model_dump(mode="json")
         )
+        metadata["authority_journal_unreadable"] = self._journal_unreadable
         return metadata
 
     @staticmethod
@@ -1341,25 +1500,15 @@ class AuthorityRuntime:
         self._unpersisted_ceiling = lowest_stage(self._unpersisted_ceiling, to_stage)
         self._low_confidence.clear()
         self._ood.clear()
-        persist_failure: Reason | None = None
-        try:
-            self._journal = self._store.lower_stage(
+        persist_failure = self._write(
+            _PendingDemotion(
                 to_stage=to_stage,
                 actor=actor,
                 reason=f"{code}: {detail}" if detail else code,
                 trigger=trigger,
                 cause=cause,
             )
-        except (AuthorityError, OSError) as error:
-            # 書き残せなかった。上の上限をそのまま持ち続ける（`reload()` でも外れない）。
-            persist_failure = Reason(code="authority_persist_failed", detail=str(error)[:500])
-            self._persist_failure = persist_failure
-        else:
-            self._persist_failure = None
-            # 書けた降格は journal が表すので、memory 上の上限は手放す。持ち続けると、
-            # あとから承認された昇格が再起動まで効かない（codex #4056968495）。
-            # `to_stage` は必ずいまの上限以下なので、手放しても authority は上がらない。
-            self._unpersisted_ceiling = AuthorityStage.FULL
+        )
         return AuthorityDemotion(
             from_stage=from_stage,
             to_stage=to_stage,
@@ -1369,8 +1518,154 @@ class AuthorityRuntime:
             persist_failure=persist_failure,
         )
 
+    def _write(self, demotion: _PendingDemotion) -> Reason | None:
+        """1件の降格を journal へ書く。書けなければ理由を返す（上限はそのまま持ち続ける）。"""
+        try:
+            journal = self._store.lower_stage(
+                to_stage=demotion.to_stage,
+                actor=demotion.actor,
+                reason=demotion.reason,
+                trigger=demotion.trigger,
+                cause=demotion.cause,
+            )
+        except (AuthorityError, OSError, ValidationError) as error:
+            # 書き残せなかった。上の上限をそのまま持ち続ける（`reload()` でも外れない）。
+            failure = Reason(code="authority_persist_failed", detail=str(error)[:500])
+            self._persist_failure = failure
+            return failure
+        self._journal = journal
+        self._signature = _SIGNATURE_UNKNOWN
+        self._persist_failure = None
+        self._release_if_represented()
+        return None
+
+    def _release_if_represented(self) -> None:
+        """journal が memory 上の上限以下を表していれば上限を手放す（0057 §2.6「書けたら手放す」）。
+
+        **予約した書き残しが残っている間は手放さない。** 手放すのは、journal の stage が
+        上限以下であることを**書いた直後の journal で**確かめられたときだけなので、手放しても
+        authority は上がらない。
+        """
+        if self._pending:
+            return
+        if stage_rank(self._journal.stage) <= stage_rank(self._unpersisted_ceiling):
+            self._unpersisted_ceiling = AuthorityStage.FULL
+            self._journal_unreadable = False
+
+    def _enqueue(self, demotion: _PendingDemotion) -> None:
+        """書き残しを予約する。**同じ深さ以上へ下げる予約が先にあれば足さない。**
+
+        先の予約が書ければ journal はそれ以下を表すので、後の予約は journal で no-op になる。
+        予約の数は stage の段数で抑えられる（無制限に積まない）。
+        """
+        if any(
+            stage_rank(item.to_stage) <= stage_rank(demotion.to_stage) for item in self._pending
+        ):
+            return
+        self._pending.append(demotion)
+
+    def _flush_one(self) -> None:
+        if not self._pending:
+            return
+        demotion = self._pending[0]
+        # 書く前に予約から外す（書けたら _release_if_represented が残りの予約を見る）
+        del self._pending[0]
+        failure = self._write(demotion)
+        if failure is None:
+            _LOGGER.warning(
+                "authority の降格を journal へ書き残した",
+                extra={
+                    logs.FIELDS_KEY: {
+                        "to_stage": demotion.to_stage.value,
+                        "trigger": demotion.trigger.value,
+                        "cause": None if demotion.cause is None else demotion.cause.value,
+                        "journal_stage": self._journal.stage.value,
+                        "journal_revision": self._journal.revision,
+                    }
+                },
+            )
+            return
+        # 書けなかった。予約の先頭へ戻し、次の tick で書き直す（上限は持ち続ける）
+        self._pending.insert(0, demotion)
+        _LOGGER.error(
+            "authority の降格を journal へ書き残せなかった（memory 上では下げたまま）",
+            extra={
+                logs.FIELDS_KEY: {
+                    "to_stage": demotion.to_stage.value,
+                    "trigger": demotion.trigger.value,
+                    "cause": None if demotion.cause is None else demotion.cause.value,
+                    "persist_failure": failure.model_dump(mode="json"),
+                }
+            },
+        )
+
+    def _check_journal(self) -> None:
+        """`stat` が変わっていれば読み直す。読めなければ `SHADOW` に下げる（0072 §2.6）。"""
+        try:
+            signature: object = self._store.journal_signature()
+            if signature == self._signature:
+                return
+            journal = self._store.read()
+        except (AuthorityError, OSError, ValidationError) as error:
+            self._on_journal_unreadable(error)
+            return
+        previous = self._journal
+        self._journal = journal
+        self._signature = signature
+        if journal != previous:
+            _LOGGER.info(
+                "authority journal を読み直した（次の tick から効く）",
+                extra={
+                    logs.FIELDS_KEY: {
+                        "journal_stage": journal.stage.value,
+                        "journal_revision": journal.revision,
+                        "previous_journal_stage": previous.stage.value,
+                        "previous_journal_revision": previous.revision,
+                        "authority_stage": self.current_stage().value,
+                    }
+                },
+            )
+
+    def _on_journal_unreadable(self, error: BaseException) -> None:
+        """読めない間は制御権を最小にする。**止めない**（止めると冷却が止まる。0072 §4 M）。"""
+        already = self._journal_unreadable
+        self._journal_unreadable = True
+        self._unpersisted_ceiling = BASELINE_STAGE
+        self._enqueue(
+            _PendingDemotion(
+                to_stage=BASELINE_STAGE,
+                actor=JOURNAL_UNREADABLE_ACTOR,
+                reason=AutomaticCause.AUTHORITY_JOURNAL_UNREADABLE.value,
+                trigger=AuthorityTrigger.AUTOMATIC,
+                cause=AutomaticCause.AUTHORITY_JOURNAL_UNREADABLE,
+            )
+        )
+        if already:
+            return
+        _LOGGER.error(
+            "authority journal を読めないため、書き残せるまで SHADOW に下げる",
+            extra={
+                logs.FIELDS_KEY: {
+                    "reason": AutomaticCause.AUTHORITY_JOURNAL_UNREADABLE.value,
+                    "error": f"{type(error).__name__}: {error}"[:500],
+                    "journal_stage": self._journal.stage.value,
+                }
+            },
+        )
+
     def _expire(self, now_mono_ms: int) -> None:
         cutoff = now_mono_ms - self._policy.authority_rollout.unhealthy_window_ms.value
         for history in (self._low_confidence, self._ood):
             while history and history[0] < cutoff:
                 history.popleft()
+
+
+def _check_actor_and_reason(actor: str, reason: str) -> None:
+    """journal の event と同じ規則（`AuthorityEvent.actor` / `reason`）で先に確かめる。
+
+    書く時点（heartbeat の後）で形の誤りが分かると、予約が永久に書けないまま残る。
+    """
+    if re.fullmatch(_ACTOR_PATTERN, actor) is None or len(actor) > _ACTOR_MAX_CHARS:
+        raise ValueError("actor が journal の形に合わない")
+    if not 1 <= len(reason) <= _REASON_MAX_CHARS:
+        raise ValueError("reason の長さが journal の形に合わない")

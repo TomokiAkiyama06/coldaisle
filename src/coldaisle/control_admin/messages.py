@@ -6,8 +6,8 @@
 送っても、どちらも未知として拒否する。
 
 受理する `op` はホワイトリストで持つ。**`raise_authority` は存在しない**（管理ソケットは
-制御権を増やせない。0072 §2.1）。段階 1（#74）では `lower_authority` / `rollback_authority` を
-`unsupported_op` で拒否する（0072 §2.10）。
+制御権を増やせない。0072 §2.1）。`lower_authority` / `rollback_authority` は段階 2（#92）から
+受理する（0072 §2.10）。どちらも**下げる向きしか表せない。**
 
 拒否の理由は固定の code にし、**入力をそのまま反射しない。**
 """
@@ -27,8 +27,8 @@ REASON_MAX_CHARS = 200
 KNOWN_OPS = frozenset({"set_mode", "lower_authority", "rollback_authority", "status"})
 """プロトコルが定める `op`（0072 §2.3）。"""
 
-UNSUPPORTED_OPS = frozenset({"lower_authority", "rollback_authority"})
-"""形は決まっているが、この段階では受理しない `op`（0072 §2.10 段階 2 で受理する）。"""
+UNSUPPORTED_OPS: frozenset[str] = frozenset()
+"""形は決まっているが、この段階では受理しない `op`。段階 2（#92）で空になった（0072 §2.10）。"""
 
 RESERVED_MODES = frozenset({"calibration"})
 """#75 の測定計画の参照形が決まるまで拒否するモード（0072 §2.3 / §2.10 段階 4）。"""
@@ -65,6 +65,13 @@ class ManualRequested(BaseModel):
     top: float = Field(ge=0.0, le=1.0, allow_inf_nan=False)
 
 
+def _without_control_characters(value: str) -> str:
+    # 改行や端末の制御列を通すと、ログや監査・journal の表示で別の行・別の表示に化ける
+    if any(unicodedata.category(ch).startswith("C") for ch in value):
+        raise ValueError("reason contains control characters")
+    return value
+
+
 class SetModeRequest(_Request):
     """`set_mode`（0072 §2.3）。時刻・操作者名・設定値・path を受け取らない。"""
 
@@ -78,10 +85,7 @@ class SetModeRequest(_Request):
     @field_validator("reason")
     @classmethod
     def _reason_has_no_control_characters(cls, value: str) -> str:
-        # 改行や端末の制御列を通すと、ログや監査の表示で別の行・別の表示に化ける
-        if any(unicodedata.category(ch).startswith("C") for ch in value):
-            raise ValueError("reason contains control characters")
-        return value
+        return _without_control_characters(value)
 
     @property
     def weakens_cooling(self) -> bool:
@@ -97,13 +101,56 @@ class SetModeRequest(_Request):
         return self.model_dump(mode="json", exclude_none=True)
 
 
+class LowerAuthorityRequest(_Request):
+    """`lower_authority`（0072 §2.3）。`to_stage` へ下げる上限を入れる。
+
+    受付スレッドは実効 stage と比べて拒否しない（受付時点の stage は古いことがある）。
+    **安全側の指令**で、監査の書き込みを待たずに受け渡し口へ置く（0072 §2.7）。
+
+    `full` は行き先に取らない（どの stage からも下げる向きにならず、受理すると「full にした」と
+    読み違えうる）。
+    """
+
+    op: Literal["lower_authority"]
+    to_stage: Literal["shadow", "limited", "expanded"]
+    reason: str = Field(min_length=1, max_length=REASON_MAX_CHARS)
+
+    @field_validator("reason")
+    @classmethod
+    def _reason_has_no_control_characters(cls, value: str) -> str:
+        return _without_control_characters(value)
+
+    def body(self) -> dict[str, Any]:
+        """監査の表へ残す検証済みの本文。"""
+        return self.model_dump(mode="json")
+
+
+class RollbackAuthorityRequest(_Request):
+    """`rollback_authority`（0072 §2.3）。Baseline（`SHADOW`）へ戻す。安全側の指令。"""
+
+    op: Literal["rollback_authority"]
+    reason: str = Field(min_length=1, max_length=REASON_MAX_CHARS)
+
+    @field_validator("reason")
+    @classmethod
+    def _reason_has_no_control_characters(cls, value: str) -> str:
+        return _without_control_characters(value)
+
+    def body(self) -> dict[str, Any]:
+        """監査の表へ残す検証済みの本文。"""
+        return self.model_dump(mode="json")
+
+
+AuthorityRequest = LowerAuthorityRequest | RollbackAuthorityRequest
+
+
 class StatusRequest(_Request):
     """`status`（読むだけ）。"""
 
     op: Literal["status"]
 
 
-AdminRequest = SetModeRequest | StatusRequest
+AdminRequest = SetModeRequest | AuthorityRequest | StatusRequest
 
 
 def parse_request(line: bytes) -> AdminRequest:
@@ -135,6 +182,10 @@ def parse_request(line: bytes) -> AdminRequest:
         raise RequestError("unsupported_op")
     if op == "status":
         return _validate(StatusRequest, decoded)
+    if op == "lower_authority":
+        return _validate(LowerAuthorityRequest, decoded)
+    if op == "rollback_authority":
+        return _validate(RollbackAuthorityRequest, decoded)
     mode = decoded.get("mode")
     # list / dict は hash できず membership 判定で TypeError になる。文字列のときだけ比べ、
     # それ以外は pydantic の検証に任せて invalid_fields で拒否する（受付を落とさない）

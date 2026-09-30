@@ -23,6 +23,7 @@ from coldaisle.control import (
     SCHEMA_VERSION,
     AirBalanceRecord,
     AuthorityLimitSource,
+    AuthorityRecord,
     AuthorityStage,
     BoundBy,
     ConfidenceLevel,
@@ -575,6 +576,12 @@ AIR_BALANCE_RECORD = AirBalanceRecord.disabled(
 MODE_COMMAND_RECORD = ModeCommandRecord.without_entry()
 """v12 の `ControlTick` に必須のモードの出どころ（入口を開いていない構成。決定記録 0072 §2.7）。"""
 
+AUTHORITY_RECORD = AuthorityRecord(entry="static", config_ceiling=AuthorityStage.FULL)
+"""v13 の `ControlTick` に必須の制御権の出どころ（journal を持たない構成。決定記録 0072 §2.6）。
+
+設定の上限を `full` にして、どの試験の stage も上限を超えないようにする。
+"""
+
 
 def runtime_for(schema_version: int) -> ControlTickRuntime | None:
     """その版の `ControlTick` が持つべき runtime（v8 未満は無し、v11 からは v2）。"""
@@ -644,6 +651,7 @@ def tick(demand: EffectiveZoneDemand, faults=(), **state_overrides) -> ControlTi
         registry=REGISTRY_PROVENANCE,
         air_balance=AIR_BALANCE_RECORD,
         mode_command=MODE_COMMAND_RECORD,
+        authority=AUTHORITY_RECORD,
     )
 
 
@@ -756,6 +764,7 @@ def test_a_front_or_rear_stall_can_stay_degraded():
         registry=REGISTRY_PROVENANCE,
         air_balance=AIR_BALANCE_RECORD,
         mode_command=MODE_COMMAND_RECORD,
+        authority=AUTHORITY_RECORD,
     )
     assert recorded.state.safety_state is SafetyState.DEGRADED
 
@@ -787,6 +796,7 @@ def test_stale_cpu_temperature_drives_top_to_max():
         registry=REGISTRY_PROVENANCE,
         air_balance=AIR_BALANCE_RECORD,
         mode_command=MODE_COMMAND_RECORD,
+        authority=AUTHORITY_RECORD,
     )
     assert recorded.zones.top.demand.forced_max
 
@@ -803,7 +813,7 @@ def test_the_stored_v1_record_still_loads_unchanged():
     stored = FIXTURE.read_text(encoding="utf-8")
     tick = ControlTick.model_validate_json(stored)
     assert tick.schema_version == 1
-    assert SCHEMA_VERSION == 12
+    assert SCHEMA_VERSION == 13
     assert json.loads(tick.model_dump_json()) == json.loads(stored)
 
 
@@ -874,6 +884,7 @@ def test_current_trace_stores_workload_regime_and_confidence_together():
         registry=REGISTRY_PROVENANCE,
         air_balance=AIR_BALANCE_RECORD,
         mode_command=MODE_COMMAND_RECORD,
+        authority=AUTHORITY_RECORD,
     )
 
     payload = json.loads(recorded.model_dump_json())
@@ -908,6 +919,7 @@ def test_v2_trace_keeps_simultaneous_transient_load_distinct():
         registry=REGISTRY_PROVENANCE,
         air_balance=AIR_BALANCE_RECORD,
         mode_command=MODE_COMMAND_RECORD,
+        authority=AUTHORITY_RECORD,
     )
 
     payload = json.loads(recorded.model_dump_json())
@@ -927,6 +939,7 @@ def test_fallback_trace_remains_valid_when_regime_is_not_available():
         registry=REGISTRY_PROVENANCE,
         air_balance=AIR_BALANCE_RECORD,
         mode_command=MODE_COMMAND_RECORD,
+        authority=AUTHORITY_RECORD,
     )
 
     assert recorded.schema_version == SCHEMA_VERSION
@@ -974,6 +987,7 @@ def test_v3_supervisor_policy_requires_a_matching_decision():
             registry=REGISTRY_PROVENANCE,
             air_balance=AIR_BALANCE_RECORD,
             mode_command=MODE_COMMAND_RECORD,
+            authority=AUTHORITY_RECORD,
         )
 
 
@@ -1085,6 +1099,7 @@ def test_the_v9_trace_keeps_disabled_inputs_and_the_provisional_flag():
         registry=REGISTRY_PROVENANCE,
         air_balance=AIR_BALANCE_RECORD,
         mode_command=MODE_COMMAND_RECORD,
+        authority=AUTHORITY_RECORD,
     )
     payload = json.loads(recorded.model_dump_json())
     assert payload["schema_version"] == SCHEMA_VERSION
@@ -1157,6 +1172,7 @@ def registry_tick(registry: RegistryProvenance, **overrides: object) -> ControlT
         "registry": registry,
         "air_balance": AIR_BALANCE_RECORD,
         "mode_command": MODE_COMMAND_RECORD,
+        "authority": AUTHORITY_RECORD,
     }
     return ControlTick(**(values | overrides))
 
@@ -1166,7 +1182,7 @@ def test_a_v10_tick_round_trips_the_registry_pointer_it_used():
     recorded = registry_tick(bound_registry())
 
     payload = json.loads(recorded.model_dump_json())
-    assert payload["schema_version"] == SCHEMA_VERSION == 12
+    assert payload["schema_version"] == SCHEMA_VERSION == 13
     assert payload["registry"]["revision"] == 3
     thermal = payload["registry"]["production"]["thermal_model"]
     assert thermal["artifact_sha256"] == REGISTRY_SHA
@@ -1515,10 +1531,13 @@ def learned_tick(**overrides) -> ControlTick:
         # v11 を名乗る記録は Air Balance の記録を省けない（#81）。
         "air_balance": AIR_BALANCE_RECORD,
         "mode_command": MODE_COMMAND_RECORD,
+        "authority": AUTHORITY_RECORD,
     }
     version = overrides.get("schema_version", SCHEMA_VERSION)
     assert isinstance(version, int)
     values["runtime"] = runtime_for(version)
+    if version < 13:
+        values.pop("authority")
     if version < 12:
         values.pop("mode_command")
     if version < 11:
@@ -1720,6 +1739,7 @@ def test_a_tick_cannot_claim_two_different_artifacts():
             registry=REGISTRY_PROVENANCE,
             air_balance=AIR_BALANCE_RECORD,
             mode_command=MODE_COMMAND_RECORD,
+            authority=AUTHORITY_RECORD,
             state=fallback_state(
                 authority_stage=AuthorityStage.LIMITED,
                 fallback_reason=Reason(code="low_confidence"),

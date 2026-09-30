@@ -5,10 +5,15 @@ uv run coldaisle-control status
 uv run coldaisle-control max --reason "GPU 負荷試験の前に全開にする"
 uv run coldaisle-control manual --front 0.6 --rear 0.5 --top 0.7 --lease 30m --reason "騒音の比較"
 uv run coldaisle-control auto --reason "比較の終了"
+uv run coldaisle-control lower-authority --to-stage limited --reason "夜間の OOD が多い"
+uv run coldaisle-control rollback-authority --reason "新しい artifact の挙動を見直す"
 ```
 
 **人が使う入口である。** LLM のツール・読み取り API・`coldaisle-eventd` からは到達できない
 （0072 §2.9）。管理ソケットは制御権を増やせない（authority の昇格の操作は存在しない）。
+authority の降格（`lower-authority` / `rollback-authority`）は次の tick の先頭で効き、
+`coldaisle-fand` が journal（`authority.json`）へ人の変更（`uid.<数値>`）として書き残す
+（0072 §2.6）。
 
 - `MANUAL` の値は demand（`0.0..1.0`）で渡す。PWM は受け取らない。Guard と Critical Safety の
   floor・`forced_max`・`ramp_down` はすべて掛かる（0072 §2.4）
@@ -83,7 +88,10 @@ def build_parser() -> argparse.ArgumentParser:
     """CLI を組み立てる。"""
     parser = argparse.ArgumentParser(
         prog="coldaisle-control",
-        description="coldaisle-fand の運転モードを切り替える（管理ソケット。決定記録 0072）",
+        description=(
+            "coldaisle-fand の運転モードを切り替え、Authority Stage を下げる"
+            "（管理ソケット。決定記録 0072）"
+        ),
     )
     parser.add_argument(
         "--config",
@@ -106,6 +114,17 @@ def build_parser() -> argparse.ArgumentParser:
         "--lease", type=_duration_s, required=True, help="期限（例: 30m, 2h, 1800）"
     )
     manual.add_argument("--reason", required=True, help="理由（1〜200文字）")
+    lower = commands.add_parser(
+        "lower-authority", help="Authority Stage を下げる上限を入れる（上げる操作は無い）"
+    )
+    lower.add_argument(
+        "--to-stage", required=True, choices=("shadow", "limited", "expanded"), help="下げ先"
+    )
+    lower.add_argument("--reason", required=True, help="理由（1〜200文字）")
+    rollback = commands.add_parser(
+        "rollback-authority", help="Authority Stage を Baseline（shadow）へ戻す"
+    )
+    rollback.add_argument("--reason", required=True, help="理由（1〜200文字）")
     return parser
 
 
@@ -120,6 +139,15 @@ def _duration_s(text: str) -> int:
 def _body(args: argparse.Namespace) -> dict[str, Any]:
     if args.command == "status":
         return {"v": PROTOCOL_VERSION, "op": "status"}
+    if args.command == "lower-authority":
+        return {
+            "v": PROTOCOL_VERSION,
+            "op": "lower_authority",
+            "to_stage": args.to_stage,
+            "reason": args.reason,
+        }
+    if args.command == "rollback-authority":
+        return {"v": PROTOCOL_VERSION, "op": "rollback_authority", "reason": args.reason}
     body: dict[str, Any] = {
         "v": PROTOCOL_VERSION,
         "op": "set_mode",

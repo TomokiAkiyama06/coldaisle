@@ -46,8 +46,10 @@ uv run coldaisle-fand --config-dir var/control-config  # 4ファイル（air-bal
 #   管理ソケットは config/control-admin.yaml（--admin-config）。不正なら開かず AUTO で運転。--no-admin で開かない（決定記録 0072）
 #   既定の設定は同じ uid を認めない（socket.group は仮の名前。配置先の専用グループへ置き換える）
 uv run coldaisle-fand --admin-config config/control-admin.dev.yaml  # 開発用: 同じ uid から操作できる（**本番で使わない**）
+uv run coldaisle-fand --authority-root var/authority  # Authority Stage の journal（authority.json）の場所。起動時に読めなければ制御を取らない（#92 / 決定記録 0057 / 0072 §2.6）
 uv run coldaisle-control status     # coldaisle-fand の運転モードを読む（管理ソケット。#74 / 決定記録 0072。**人が使う**）
 uv run coldaisle-control max --reason "負荷試験の前に全開"  # MAX（期限なし）。manual は --front/--rear/--top と --lease が必須
+uv run coldaisle-control rollback-authority --reason "挙動を見直す"  # Authority を Baseline へ（lower-authority --to-stage も。**上げる操作は無い**。#92）
 COLDAISLE_DB=var/coldaisle.db uv run uvicorn coldaisle.api:app --host 127.0.0.1 --port 8000
 COLDAISLE_DB=var/coldaisle.db uv run uvicorn coldaisle.server:app --port 8000  # + AI ツールの窓口
 # エアフロー画面: http://127.0.0.1:8000/airflow.html（制御の状態は /api/v1/control/latest の trace から。
@@ -244,7 +246,7 @@ src/coldaisle/
   evaluate.py # 合成の起点: Controller構成の比較レポート（読み取りのみ）。#91
   supervisor_shadow.py # 合成の起点: 保存済み trace から Supervisor の Shadow 集計（読み取りのみ。制御へ届かない）。#89
   event_entry/ # 合成の起点: 書き込み専用の Unix ソケット入口。AI 層・API から import しない。#67
-  control_admin/ # 合成の起点: coldaisle-fand の管理ソケット（運転モード）。AI 層・API・eventd・control から import しない。#74 / 決定記録 0072
+  control_admin/ # 合成の起点: coldaisle-fand の管理ソケット（運転モードと Authority の降格。昇格は受けない）。AI 層・API・eventd・control から import しない。#74 / #92 / 決定記録 0072
   local_socket.py # レイヤ横断: Unix ソケット入口に共通の門（SO_PEERCRED・権限・起動時の検査）。0045 / 0072 §2.5
   rollup_job.py # 合成の起点: `coldaisle-rollup` の入口（周期メトリクスを Store へ渡す）。#65
   control_daemon.py # 合成の起点: Fan制御デーモン。**hwmonへ書くのはこのプロセスだけ**。#74
@@ -253,7 +255,8 @@ src/coldaisle/
   rules/      # L2: アラート用ルールエンジン（決定論的。LLM非依存）
   control/    # Fan制御。Supervisor / MPC / Guard / Safety / Fallback / hardware mapping
     loop.py     # 1 tickの順序・期限・例外の翻訳（閾値もdemandの計算も持たない）。#74
-    operating_mode.py # 管理ソケットの受け渡し口から tick の先頭でモードを決める（lease・受付の死で MAX）。#74 / 決定記録 0072
+    operating_mode.py # 管理ソケットの受け渡し口（モードと authority の2枠）から tick の先頭でモードと降格を取り出す（lease・受付の死で MAX）。#74 / #92 / 決定記録 0072
+    authority.py      # Authority Stage の journal（authority.json）と AuthorityRuntime（降格は即時・書き残しは heartbeat の後・journal の変化を毎 tick 検知。**上げる経路を持たない**）。#92 / 決定記録 0057 / 0072 §2.6
     air_balance.py       # Air Balance Model と air-balance.yaml（v2）の形。Safety ではない。#81
     air_balance_trace.py # applied demand から Air Balance を trace へ記録するだけ（制御へ効かない）。#81 / 決定記録 0073
     supervisor/ # RulePolicy / RLPolicy / Workload Regime

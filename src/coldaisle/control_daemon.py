@@ -20,6 +20,12 @@ Critical Safety と Reactive Guard は変わらない。
 
 どの場合も `STARTUP` の Max を通ってから通常の制御へ入る。
 
+制御権（Authority Stage）の正本は `--authority-root` の `authority.json`（`AuthorityStore`。
+決定記録 0057）で、`AuthorityRuntime` が毎 tick 読み、管理ソケットの降格を受け、外の process
+（人の CLI）が journal を変えたことを heartbeat の後の `stat` で知る（決定記録 0072 §2.6）。
+**起動時に journal を読めなければ制御を取らない**（0057 §2.1。壊れた journal を「記録の無い
+状態」と読み替えない）。走行中に読めなくなったら止めずに `SHADOW` へ下げる。
+
 運転モードは管理ソケット（`config/control-admin.yaml`。決定記録 0072）から受ける。
 **入口を開けなくても制御は止めない**（設定が不正・`SO_PEERCRED` が無いときは `AUTO` のまま
 運転し、error を残す）。受付スレッドが走行中に死んだら、loop が自分で全 zone を Max にして
@@ -45,6 +51,7 @@ from types import FrameType
 
 from coldaisle import logs
 from coldaisle.clock import Clock, MonotonicClock, SystemMonotonicClock, WallClock
+from coldaisle.control.authority import AuthorityRuntime, AuthorityStore
 from coldaisle.control.config import (
     CONFIG_FILENAMES,
     ControlConfig,
@@ -59,7 +66,6 @@ from coldaisle.control.logging import ControlTraceLogger
 from coldaisle.control.loop import (
     ControlLoop,
     ControlTickResult,
-    StaticAuthority,
     StaticOperatingMode,
     TelemetrySample,
     Watchdog,
@@ -90,6 +96,11 @@ DEFAULT_DB = Path("var/coldaisle.db")
 DEFAULT_METRICS = Path("config/metrics.yaml")
 DEFAULT_QUALITY_RULES = Path("config/quality.yaml")
 DEFAULT_ADMIN_CONFIG = Path("config/control-admin.yaml")
+DEFAULT_AUTHORITY_ROOT = Path("var/authority")
+"""`authority.json` を置くディレクトリ（`--db` と同じく場所であって閾値ではない）。
+
+本番は `coldaisle-fand` の実行ユーザーと昇格を行う人だけが書ける場所を指定する（0072 §2.5）。
+"""
 
 UNCONFIGURED_MODEL_VERSION = "unconfigured"
 """Learned MPC の worker を配線していない起動で Gate に渡す期待版。
@@ -366,6 +377,8 @@ class Config:
     """外部の deadman へ通知できないときに起動を拒むか（本番の service では真にする）。"""
     admin_config: Path | None = None
     """管理ソケットの設定（決定記録 0072 §2.8）。None は入口を開かない（`AUTO` のまま運転する）。"""
+    authority_root: Path = DEFAULT_AUTHORITY_ROOT
+    """`authority.json` のディレクトリ（0057 §2.1）。相対 path は起動時の作業場所が基準。"""
 
 
 @dataclass(slots=True)
@@ -570,7 +583,11 @@ def build(
     except Exception as error:
         raise StartupEnvironmentError(f"{type(error).__name__}: {error}") from error
     binding = create_control_runtime_binding(control)
-    authority = StaticAuthority()
+    try:
+        authority = open_authority_runtime(config.authority_root, control, clock=clock)
+    except Exception as error:
+        store.close()
+        raise StartupEnvironmentError(f"{type(error).__name__}: {error}") from error
     # **deadman を必ず配線する。** ここを省くと hang しても heartbeat の欠落が起きず、
     # `watchdog_timeout_ms` が一度も効かない（0028 §2.6 / 決定記録 0060 §2.7）。
     deadman = (
@@ -604,6 +621,34 @@ def build(
             admin.stop()
         raise
     return ControlDaemon(loop=loop, monotonic=monotonic, store=store, admin=admin)
+
+
+def open_authority_runtime(root: Path, control: ControlConfig, *, clock: Clock) -> AuthorityRuntime:
+    """`authority.json` を読む `AuthorityRuntime`（決定記録 0057 / 0072 §2.6）。
+
+    **lock の待ち上限は `tick_deadline_ms`**（decision trace の保存の busy timeout と同じ。
+    0060 §2.7）。書き残しは heartbeat の後に行うので、待ちは次の tick の開始を遅らせるだけで、
+    Fan の書き込みと heartbeat は待たない。上限で諦めた降格は memory 上で下げたまま残る。
+
+    journal が無ければ `SHADOW` から始まる。読めない・壊れているときは例外で止まる（0057 §2.1）。
+    """
+    store = AuthorityStore(
+        root.absolute(), clock, lock_timeout_ms=control.safety.tick_deadline_ms.value
+    )
+    runtime = AuthorityRuntime(store, control.policy)
+    LOGGER.info(
+        "authority journal を読み込んだ",
+        extra={
+            logs.FIELDS_KEY: {
+                "authority_root": str(root),
+                "journal_stage": runtime.journal.stage.value,
+                "journal_revision": runtime.journal.revision,
+                "authority_config_ceiling": runtime.configured_ceiling.value,
+                "authority_stage": runtime.current_stage().value,
+            }
+        },
+    )
+    return runtime
 
 
 def _open_admin(
@@ -642,7 +687,7 @@ def _build_loop(
     catalog: MetricCatalog,
     contract: ControlInputContract,
     binding: ControlRuntimeBinding,
-    authority: StaticAuthority,
+    authority: AuthorityRuntime,
     deadman: Watchdog,
     store: SqliteStore,
     clock: Clock,
@@ -799,6 +844,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="管理ソケットの設定（決定記録 0072 §2.8）。不正なら入口を開かず AUTO で運転する",
     )
     parser.add_argument(
+        "--authority-root",
+        type=Path,
+        default=DEFAULT_AUTHORITY_ROOT,
+        help="authority.json のディレクトリ（決定記録 0057）。読めなければ制御を取らない",
+    )
+    parser.add_argument(
         "--no-admin",
         action="store_true",
         help="管理ソケットを開かない（AUTO のまま運転する。試験・Replay 用）",
@@ -820,6 +871,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         record_trace=not args.no_trace,
         require_watchdog=args.require_watchdog,
         admin_config=None if args.no_admin else args.admin_config,
+        authority_root=args.authority_root,
     )
     monotonic: MonotonicClock = SystemMonotonicClock()
 

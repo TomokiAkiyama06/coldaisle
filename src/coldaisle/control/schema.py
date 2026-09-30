@@ -24,7 +24,7 @@ from typing import Annotated, Literal, Protocol, Self, runtime_checkable
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-SCHEMA_VERSION: Literal[12] = 12
+SCHEMA_VERSION: Literal[13] = 13
 """`ControlTick` の形の版。**フィールドの名前や意味を変えたら上げる。**
 
 #82 が保存したデータを読み違えないため。
@@ -63,6 +63,11 @@ SCHEMA_VERSION: Literal[12] = 12
   管理ソケットの指令の `command_id` と起動ごとの `run_id`、`MANUAL` の期限切れ、
   受付スレッドの死による `MAX`（`admin_receiver_dead`）。**v12 には必須**で、
   保存済みの v1〜v11 は欄なしのまま読める（「記録が無い」であって「入口が無かった」ではない）
+- v13（#92 / 決定記録 0072 §2.6 / §2.10 段階 2）: その tick の制御権の出どころ（`authority`）。
+  journal の stage と revision、設定の上限、この process が書き残せずに持っている上限、
+  走行中に journal を読めなかったことによる `SHADOW`（`journal_unreadable`）、この tick の先頭で
+  適用した管理ソケットの降格の `command_id`、直近の永続化の失敗。**v13 には必須**で、
+  保存済みの v1〜v12 は欄なしのまま読める（「記録が無い」であって「journal が無かった」ではない）
 """
 
 Demand = Annotated[float, Field(ge=0.0, le=1.0, allow_inf_nan=False)]
@@ -1755,10 +1760,74 @@ class ModeCommandRecord(_Frozen):
         return self
 
 
+AUTHORITY_RECORD_SCHEMA_VERSION: Literal[1] = 1
+"""`AuthorityRecord` の形の版。"""
+
+
+class AuthorityRecord(_Frozen):
+    """その tick の制御権の出どころ（`ControlTick` v13。#92 / 決定記録 0072 §2.6 / 0057 §2.7）。
+
+    **この tick の Gate が stage を読んだ時点**の写しである（tick の先頭で管理ソケットの降格を
+    入れた後）。heartbeat の後に行う journal の読み直し・書き残しの結果は、次の tick の記録に現れる
+    （効くのが次の tick からなので）。
+
+    - ``entry``: ``journal`` は `authority.json`（`AuthorityRuntime`）から読む構成。``static`` は
+      journal を持たない固定 stage の構成（試験・journal を配線しない入口）で、
+      journal の欄を持たない
+    - ``journal_stage`` / ``journal_revision``: 最後に読めた journal
+    - ``config_ceiling``: 検証済み設定の上限（`fan-policy.yaml` の `authority_stage`）
+    - ``unpersisted_ceiling``: この process が下げて、まだ journal が表していない上限。無ければ None
+    - ``journal_unreadable``: 走行中に journal を読めなかったので ``SHADOW`` に下げている
+      （書き残せるまで外さない。0072 §2.6）
+    - ``command_id``: **この tick の先頭で**適用した管理ソケットの降格（`lower_authority` /
+      `rollback_authority`）。``ModeCommandRecord.run_id`` との組で監査の表の行と対応する
+    - ``persist_failure``: 直近の降格を書き残せなかった理由（0057 §2.6）
+
+    **model version を含めない**（0057 §2.7。stage と model は独立に残す）。
+    """
+
+    schema_version: Literal[1] = AUTHORITY_RECORD_SCHEMA_VERSION
+    entry: Literal["static", "journal"]
+    journal_stage: AuthorityStage | None = None
+    journal_revision: int | None = Field(default=None, ge=0)
+    config_ceiling: AuthorityStage
+    unpersisted_ceiling: AuthorityStage | None = None
+    journal_unreadable: bool = False
+    command_id: int | None = Field(default=None, ge=1)
+    persist_failure: Reason | None = None
+
+    @model_validator(mode="after")
+    def _describes_one_source(self) -> Self:
+        if (self.journal_stage is None) != (self.journal_revision is None):
+            raise ValueError("journal の stage と revision は一緒に記録する")
+        if self.entry == "static":
+            if self.journal_stage is not None or self.journal_unreadable:
+                raise ValueError("journal を持たない構成は journal の欄を持たない")
+            if self.persist_failure is not None:
+                raise ValueError("journal を持たない構成は書き残しに失敗しない")
+        elif self.journal_stage is None:
+            raise ValueError("journal の構成は journal の stage を記録する")
+        if self.unpersisted_ceiling is AuthorityStage.FULL:
+            # FULL の上限は「上限なし」と同じ事実。2通りの書き方を作らない
+            raise ValueError("上限の無い状態は None で表す")
+        if self.journal_unreadable and self.unpersisted_ceiling is not BASELINE_STAGE:
+            raise ValueError("journal を読めない間は SHADOW の上限を持つ（0072 §2.6）")
+        return self
+
+    def ceiling(self) -> AuthorityStage:
+        """記録した上限のうち最も低いもの。実効 stage はこれを超えない（0057 §2.2）。"""
+        stages = [self.config_ceiling]
+        if self.journal_stage is not None:
+            stages.append(self.journal_stage)
+        if self.unpersisted_ceiling is not None:
+            stages.append(self.unpersisted_ceiling)
+        return lowest_stage(*stages)
+
+
 class ControlTick(_Frozen):
     """1 tick の判断の記録（decision trace。0028 §2.3）。#82 が保存し、#90 / #91 が読む。"""
 
-    schema_version: Literal[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12] = SCHEMA_VERSION
+    schema_version: Literal[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13] = SCHEMA_VERSION
     tick_id: int = Field(ge=0)
     ts_ms: int = Field(ge=0)
     """記録の時刻（壁時計。0028 §2.6）。"""
@@ -1801,6 +1870,11 @@ class ControlTick(_Frozen):
 
     保存済みの v1〜v11 では None。入口を開いていない構成の v12 も ``None`` ではなく
     ``ModeCommandRecord.without_entry()`` を持つ。
+    """
+    authority: AuthorityRecord | None = Field(default=None, exclude_if=lambda value: value is None)
+    """その tick の制御権の出どころ（v13。#92 / 決定記録 0072 §2.6）。保存済みの v1〜v12 では None。
+
+    journal を持たない構成の v13 も ``None`` ではなく ``entry="static"`` の記録を持つ。
     """
     faults: tuple[Fault, ...] = ()
     """いま有効な故障。
@@ -1853,6 +1927,7 @@ class ControlTick(_Frozen):
             raise ValueError("registry を記録する ControlTick は schema version 10 にする")
         self._check_air_balance()
         self._check_mode_command()
+        self._check_authority()
         self._check_model_gate()
         self._check_registry_binds_model()
         self._check_shadow()
@@ -2016,6 +2091,20 @@ class ControlTick(_Frozen):
         ):
             # 指令に由来しないモードは、起動直後と lease 切れの AUTO だけ（0028 §2.5 (a)）
             raise ValueError("指令に由来しない AUTO 以外のモードは記録できない")
+
+    def _check_authority(self) -> None:
+        """v13 の ``authority`` が ``ControlState`` の stage を超えない上限を指すか。"""
+        record = self.authority
+        if record is None:
+            if self.schema_version >= 13:
+                # 版が中身を表さない記録を作らない（0060 §2.4）。
+                raise ValueError("v13 の ControlTick には authority が要る")
+            return
+        if self.schema_version < 13:
+            raise ValueError("authority を記録する ControlTick は schema version 13 にする")
+        if stage_rank(self.state.authority_stage) > stage_rank(record.ceiling()):
+            # 実効 stage は journal・設定・この process の上限の最小を超えない（0057 §2.2）
+            raise ValueError("authority_stage が記録した上限を超えている")
 
     def _check_model_gate(self) -> None:
         """v5 の ``model_gate`` が ControlState と同じ判断を指しているか。"""

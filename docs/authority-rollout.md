@@ -94,9 +94,12 @@ lock を手放す `inspect()` だけでは、A の証拠を持ったまま B が
 
 同じ承認は2回使えない（`expected_revision` に束縛する）。
 
-`AuthorityJournal` は v2 である。v2 で新しく書く昇格の証拠（`RolloutEvidence`）は
+`AuthorityJournal` は v3 である。v2 から、新しく書く昇格の証拠（`RolloutEvidence`）は
 `air_balance_config_sha256` と `fan_hardware_config_sha256` を必ず持つ。既に残った v1 の event は
-書き換えずに読むが、新しい昇格の根拠にはならない。Air Balance が無効（`uncalibrated`）の間に
+書き換えずに読むが、新しい昇格の根拠にはならない。v3（#92 / 決定記録 0072 §2.6）は自動降格の
+理由に `authority_journal_unreadable` を足した版で、この理由の event は v3 の journal にだけ置ける
+（v2 までの reader には「知らない journal」として拒ませる）。v1 / v2 の journal はそのまま読み、
+次に書くときに v3 で書く。Air Balance が無効（`uncalibrated`）の間に
 集めた証拠もその未校正ファイルに束縛されるので、`calibrated` へ差し替えた後は使えない。
 
 ## 下げる（承認は要らない）
@@ -119,18 +122,45 @@ lock を手放す `inspect()` だけでは、A の証拠を持ったまま B が
 **記録の無い降格の上限だけ**が `reload()` でも外れない（process を作り直すまで残る）。
 下がったあとに自動で戻る経路は無い。戻すには新しい承認が要る。
 
+## `coldaisle-fand` での配線（決定記録 0072 §2.6 / §2.10 段階 2）
+
+`coldaisle-fand` は `--authority-root`（既定 `var/authority`）の `authority.json` を
+`AuthorityRuntime` で読み、Controller Gate と control loop に同じ runtime を渡す。
+
+- **起動時に journal を読めなければ制御を取らない**（終了コード 5。0057 §2.1）。journal が無ければ `SHADOW`
+- control runtime の store の lock の待ち上限は `safety.yaml` の `tick_deadline_ms`（0060 §2.7）
+- 管理ソケットの `lower_authority` / `rollback_authority`（`docs/control-admin.md`）は、次の tick の
+  先頭で **memory 上の上限として無条件に**入る（いまの stage と比べない）。Gate はその tick から
+  下がった stage を読む。journal へは heartbeat と decision trace の保存の後に、人の変更
+  （`actor = uid.<数値>`、`trigger = human`）として書く。書けなければ上限を持ち続け、次の tick で書き直す
+- 毎 tick、heartbeat と trace の保存の後に `authority.json` の `stat`（inode・大きさ・`mtime_ns`）を見て、
+  変わっていたら読み直す（flock を取らない）。外の process の rollback・昇格は**次の tick から**効く。
+  実効 stage は journal・設定の上限・この process が書き残せずに持っている上限の最小のまま
+- **走行中に journal が読めない・壊れているときは止めずに `SHADOW` へ下げ**、`authority_journal_unreadable`
+  の自動降格として journal へ書き残しを試みる。**読めるようになっただけでは戻さない。** 書けたら
+  journal が `SHADOW` を表すので上限を手放す（authority は上がらない）。戻すには承認による昇格が要る
+- 予約した書き残しは同じ深さ以上のものを重ねない（stage の段数で抑えられる）。1 tick に書くのは1件
+
+**runtime に authority を上げる経路は無い。** 外の process（人の CLI）の昇格が journal に入っても、
+それは 0057 §2.3 の承認を経たものだけである。
+
 ## 記録
 
 - `ControllerSelection.authority_stage`: 提案の無い tick にも残る
 - `MpcProposal.binding_authority_stage` → `LearnedControlStatus`: worker が照合した stage を
   Gate まで運ぶ。覆っていなければ `binding_authority_not_covered` で Fallback にする
 - `AuthorityRuntime.trace_metadata()`: 実効 stage・journal の stage・設定の上限・
-  直近の変更（種別・主体・理由・時刻）・永続化の失敗。**model version を含めない**
+  直近の変更（種別・主体・理由・時刻）・永続化の失敗・journal を読めないこと。**model version を含めない**
+- `ControlTick` v13 の `authority`（`AuthorityRecord`）: その tick の Gate が stage を読んだ時点の
+  journal の stage と revision・設定の上限・書き残せずに持っている上限・`journal_unreadable`・
+  その tick の先頭で入れた管理ソケットの降格の `command_id`・直近の永続化の失敗。
+  実効 stage（`state.authority_stage`）はこれらの最小を超えない（schema が拒む）
 
 ## まだ無いもの
 
 - **decision trace への、適用した tick の model artifact の記録。** これが無い間は
   適用側の実績で昇格できないため、**LIMITED 以降の昇格の証拠を作れない**（別 Issue）
-- 昇格・rollback の管理操作の入口（CLI / ソケット）。読み取り API（#23）は制御を変えない
+- 昇格・rollback の CLI（`coldaisle-authority raise` / `rollback`。決定記録 0072 §2.10 段階 3）。
+  走っている `coldaisle-fand` の降格・rollback は管理ソケット（段階 2）で行える。読み取り API（#23）は制御を変えない
 - 各段に必要な運転期間の下限
 - 実機での rollout。GPU サーバーが要る（#92 の `requires:server`）

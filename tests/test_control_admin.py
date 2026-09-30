@@ -1,7 +1,8 @@
 """`coldaisle-fand` の管理ソケット（#74 / 決定記録 0072 §2.10 段階 1）。
 
 1. 設定（§2.8）: 入口の形だけを持ち、`safety.yaml` の周期・締め切りと起動時に照合する
-2. プロトコル（§2.3）: ホワイトリスト。`raise_authority` は無く、段階 1 では降格も受けない
+2. プロトコル（§2.3）: ホワイトリスト。`raise_authority` は無い（降格は段階 2 の
+   `tests/test_authority_admin.py`）
 3. 受け渡し口（§2.2）: モードの枠は `command_id` が最大の1件。loop は待たない
 4. loop（§2.2 / §2.4）: 次の tick の先頭で入る。`MANUAL` の lease は単調時計だけで数える。
    受付スレッドが死んだら `MANUAL` を解除して `forced_max`、**再起動まで保つ**
@@ -36,8 +37,10 @@ from pydantic import ValidationError
 from coldaisle.clock import SimulatedClock, SystemMonotonicClock
 from coldaisle.control.operating_mode import (
     MANUAL_COMMAND_REASON,
+    AdminAuthorityCommand,
     AdminModeCommand,
     AdminModeTracker,
+    MailboxTake,
     ModeOutcome,
     ModeOutcomeKind,
     ModeStatus,
@@ -279,8 +282,16 @@ def test_the_three_modes_parse():
     [
         ({"v": 1, "op": "raise_authority", "reason": "x"}, "unknown_op"),
         ({"v": 1, "type": "gpu_mode", "mode": "ai"}, "unknown_op"),
-        ({"v": 1, "op": "lower_authority", "to_stage": "limited", "reason": "x"}, "unsupported_op"),
-        ({"v": 1, "op": "rollback_authority", "reason": "x"}, "unsupported_op"),
+        # 降格は段階 2（#92）から受理する。形が違えば拒否する（full は行き先に取らない）
+        ({"v": 1, "op": "lower_authority", "to_stage": "full", "reason": "x"}, "invalid_fields"),
+        ({"v": 1, "op": "lower_authority", "reason": "x"}, "invalid_fields"),
+        ({"v": 1, "op": "lower_authority", "to_stage": "shadow"}, "invalid_fields"),
+        (
+            {"v": 1, "op": "rollback_authority", "to_stage": "shadow", "reason": "x"},
+            "invalid_fields",
+        ),
+        ({"v": 1, "op": "rollback_authority", "reason": "a\nb"}, "invalid_fields"),
+        ({"v": 1, "op": "rollback_authority", "reason": "x", "actor": "root"}, "invalid_fields"),
         ({"v": 1, "op": "set_mode", "mode": "calibration", "reason": "x"}, "unsupported_mode"),
         ({"v": 2, "op": "status"}, "unsupported_version"),
         ({"v": True, "op": "status"}, "unsupported_version"),
@@ -463,6 +474,7 @@ class FakeMailbox:
     def __init__(self) -> None:
         self.alive = True
         self.pending: AdminModeCommand | None = None
+        self.pending_authority: AdminAuthorityCommand | None = None
         self.locked = False
         self.outcomes: list[ModeOutcome] = []
         self.status: ModeStatus | None = None
@@ -470,10 +482,12 @@ class FakeMailbox:
     def receiver_alive(self) -> bool:
         return self.alive
 
-    def take_mode(self) -> AdminModeCommand | None:
+    def take(self) -> MailboxTake | None:
         if self.locked:
             return None
-        taken, self.pending = self.pending, None
+        taken = MailboxTake(mode=self.pending, authority=self.pending_authority)
+        self.pending = None
+        self.pending_authority = None
         return taken
 
     def report(self, outcome: ModeOutcome) -> None:
@@ -507,7 +521,7 @@ def test_a_command_takes_effect_at_the_start_of_the_next_tick(catalog):
         assert record.demand.requested == pytest.approx(0.9)
     assert mailbox.outcomes == [ModeOutcome(ModeOutcomeKind.APPLIED, 1, tick.tick_id)]
     assert mailbox.status is not None and mailbox.status.command_id == 1
-    assert tick.schema_version == 12
+    assert tick.schema_version == 13
     assert ControlTick.model_validate_json(tick.model_dump_json()) == tick
 
 
@@ -1127,13 +1141,13 @@ def test_a_slow_sender_is_cut_at_the_read_timeout(short_dir, rules):
 @pytest.mark.parametrize(
     ("body", "code"),
     [
-        ({"v": 1, "op": "rollback_authority", "reason": "x"}, "unsupported_op"),
-        ({"v": 1, "op": "lower_authority", "to_stage": "shadow", "reason": "x"}, "unsupported_op"),
         ({"v": 1, "op": "raise_authority", "reason": "x"}, "unknown_op"),
+        ({"v": 1, "op": "raise_authority", "to_stage": "full", "reason": "x"}, "unknown_op"),
         ({**manual_body(), "lease_s": 10**7}, "lease_too_long"),
     ],
 )
-def test_authority_changes_are_not_accepted_in_stage_1(entry, body, code):
+def test_authority_is_never_raised_through_the_socket(entry, body, code):
+    """管理ソケットは制御権を増やせない（0072 §2.1）。`raise_authority` は存在しない。"""
     assert entry.send(body) == {"ok": False, "error": code}
     assert entry.tick().record.command_id is None
     assert entry.rows() == []
@@ -1262,8 +1276,13 @@ def test_an_audit_row_carries_only_the_fields_of_its_event():
         )
     with pytest.raises(ValidationError):
         ControlAdminAuditRecord(
-            run_id=RUN_ID, command_id=2, event="superseded", ts_ms=1, superseded_by=1
+            run_id=RUN_ID, command_id=2, event="superseded", ts_ms=1, superseded_by=2
         )
+    # authority の枠は最も低い行き先を採るので、先に届いた降格が後の降格を置き換えうる
+    # （0072 §2.2。migration 0009）
+    ControlAdminAuditRecord(
+        run_id=RUN_ID, command_id=2, event="superseded", ts_ms=1, superseded_by=1
+    )
 
 
 # ================================================================ 起動（0072 §2.5 / §2.8）
@@ -1310,6 +1329,9 @@ def test_a_thread_that_cannot_start_leaves_no_socket_and_no_thread(
     config.write_text(yaml.safe_dump(admin_document(socket_path)), "utf-8")
     started: list[threading.Thread] = []
     original_start = threading.Thread.start
+    # 前の試験が drain なしで止めた受付スレッド（daemon thread）が残っていることがある。
+    # この試験が確かめるのは「この起動の試みがスレッドを残さない」ことなので、既存のものは除く
+    existing = set(threading.enumerate())
 
     def start(self: threading.Thread) -> None:
         if self.name == failing:
@@ -1325,7 +1347,7 @@ def test_a_thread_that_cannot_start_leaves_no_socket_and_no_thread(
     assert not any(thread.is_alive() for thread in started)
     assert not any(
         thread.name.startswith("control-admin") and thread.is_alive()
-        for thread in threading.enumerate()
+        for thread in set(threading.enumerate()) - existing
     )
     assert any(
         "スレッドを起動できない" in getattr(record, "fields", {}).get("reason", "")

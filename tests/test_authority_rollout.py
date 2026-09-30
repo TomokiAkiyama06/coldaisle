@@ -1429,11 +1429,11 @@ def test_the_two_config_bindings_are_recorded_together() -> None:
         evidence_for(document, fan_hardware_sha=None)
 
 
-def test_a_promotion_is_written_as_a_v2_journal_with_both_hashes(tmp_path: Path) -> None:
+def test_a_promotion_is_written_as_a_current_journal_with_both_hashes(tmp_path: Path) -> None:
     document = report_document()
     journal = raise_stage(store(tmp_path), approval=approval_for(document), document=document)
 
-    assert journal.schema_version == AUTHORITY_JOURNAL_SCHEMA_VERSION == 2
+    assert journal.schema_version == AUTHORITY_JOURNAL_SCHEMA_VERSION == 3
     event = journal.events[-1]
     assert event.approval is not None
     assert event.approval.evidence.air_balance_config_sha256 == AIR_BALANCE_SHA
@@ -1441,7 +1441,7 @@ def test_a_promotion_is_written_as_a_v2_journal_with_both_hashes(tmp_path: Path)
 
 
 def test_a_stored_v1_journal_still_loads_and_can_be_appended(tmp_path: Path) -> None:
-    """既に残った v1 の昇格 event は書き換えずに読む。新しい event は v2 で書く。"""
+    """既に残った v1 の昇格 event は書き換えずに読む。新しい event は現行の版（v3）で書く。"""
     document = report_document()
     journal = raise_stage(store(tmp_path), approval=approval_for(document), document=document)
     payload = json.loads(journal.model_dump_json())
@@ -1463,7 +1463,7 @@ def test_a_stored_v1_journal_still_loads_and_can_be_appended(tmp_path: Path) -> 
     root = tmp_path / "authority"
     (root / AUTHORITY_STATE_FILENAME).write_text(json.dumps(payload), encoding="utf-8")
     lowered = store(tmp_path).rollback_to_baseline(actor=APPROVER, reason="試験の rollback")
-    assert lowered.schema_version == 2
+    assert lowered.schema_version == AUTHORITY_JOURNAL_SCHEMA_VERSION == 3
     assert lowered.events[0] == legacy.events[0]
 
 
