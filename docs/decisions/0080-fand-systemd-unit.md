@@ -3,10 +3,15 @@
 - **種別**: Decision Record
 - **Status**: Proposed
 - **Date**: 2026-09-30
-- **Supersedes**: なし。ただし承認されると、[`0060`](0060-control-loop-runtime.md) §2.7
-  「deadman が『ある』と言える条件」の表の4行目（`WATCHDOG_USEC` と `watchdog_timeout_ms` が違うときは
-  warning で環境側を採る）のうち、**環境側が長い場合だけ**を §2.3 で置き換える。
-  0060 側への `Superseded by` の追記は所有者の判断で行う（PR の「所有者に判断してほしい点」9）
+- **Supersedes**（承認されたときに効く）:
+  - [`0060`](0060-control-loop-runtime.md) §2.7「deadman が『ある』と言える条件」の表の4行目
+    （`WATCHDOG_USEC` と `watchdog_timeout_ms` が違うときは warning で環境側を採る）のうち、
+    **環境側が長い場合のみ**（§2.3 で起動拒否に置き換える）
+  - [`0028`](0028-fan-control-contracts.md) §2.7「正常停止」の条件（SIGTERM かつ `SERVICE_RESULT=success`）のうち、
+    **引き継ぎ実行部が正常停止を見分ける方法のみ**（§2.8 で「引き継ぎ記録の有無」に置き換える。
+    戻す・戻さないの規則と通知は変えない）
+
+  旧記録側への `Superseded by` の追記の時期は所有者の判断で行う（PR の「所有者に判断してほしい点」9）
 - **関連**: [`0028-fan-control-contracts.md`](0028-fan-control-contracts.md) §2.2 / §2.6 / §2.7 / §2.8 / §2.9、未決 6 / 7 /
   [`0060-control-loop-runtime.md`](0060-control-loop-runtime.md) §2.1 / §2.7 / §2.9、未決 1 / 7 /
   [`0069-ubuntu-deploy-templates.md`](0069-ubuntu-deploy-templates.md) §2.2 / §2.3 / §2.4、未決 3 /
@@ -66,14 +71,33 @@ unit の書き方次第で、決めた安全の性質が**黙って崩れる**�
 | 名前（仮） | 何か | 誰が入る |
 |---|---|---|
 | `coldaisle-fan` | **fand 専用のユーザーと主グループ**。hwmon の対象属性の書き込み権限（§2.6）はこのグループに渡す | fand だけ |
-| `coldaisle-admin` | 管理ソケットのグループ（0072 §2.5。`config/control-admin.yaml` の仮の値と同じ） | 操作する人だけ。**`coldaisle`（API / 取り込み）と AI 層のユーザーは入れない** |
+| `coldaisle-admin` | 管理ソケットのグループ（0072 §2.5。`config/control-admin.yaml` の仮の値と同じ） | **fand（ソケットの所有のため）** と操作する人だけ。**`coldaisle`（API / 取り込み）と AI 層のユーザーは入れない** |
 | `coldaisle` | 既存の取り込み・API・rollup・report のユーザー（0069） | 変えない |
 
 - **fand を `coldaisle` と同じ uid で動かさない。** 0072 §2.5 の配置の必須条件（API / AI サーバと同じユーザーにしない）
 - **fand を root で動かさない。** 書き込みの権限は hwmon の対象属性だけに絞る（§2.6）
-- fand は `SupplementaryGroups=coldaisle` で DB（`/var/lib/coldaisle`）と `/etc/coldaisle` を読み書きする。
-  decision trace（0030）と管理操作の監査（0072 §2.7）は同じ DB に書くためである。
-  SQLite の `-wal` / `-shm` をグループで共有するため、DB を書く unit（取り込み・fand）は `UMask=0007` にする
+- fand は `SupplementaryGroups=coldaisle coldaisle-admin` を持つ。
+  - `coldaisle`: DB（`/var/lib/coldaisle`）を読み書きし、`/etc/coldaisle` を読む。
+    decision trace（0030）と管理操作の監査（0072 §2.7）は同じ DB に書くためである
+  - `coldaisle-admin`: 管理ソケットは bind の後に `os.chown(path, -1, <socket.group の gid>)` で
+    グループを付け替える（`control_admin/server.py`）。capability を持たない非 root のプロセスは
+    **自分が属するグループにしか付け替えられない**ので、所属が無いと管理ソケットの起動が EPERM で失敗する。
+    fand が入っても、fand と同じ uid の接続は出荷設定で拒否される（0072 §2.5 / 0076）ので、
+    モードを変えられる者は増えない
+- **DB のディレクトリをグループで共有できるようにする**（既存の unit も変える。§2.10 の段階 1）。
+  0069 のテンプレートは `StateDirectoryMode=0750` で、systemd はどれかの unit が起動するたびに
+  `/var/lib/coldaisle` をこの mode に戻す。0750 ではグループに書き込み権が無く、fand は SQLite の
+  `-wal` / `-shm` / `-journal` を作れない。作れても、setgid の無いディレクトリでは fand が作ったファイルの
+  gid が主グループ（`coldaisle-fan`）になり、取り込みが開けなくなる（EACCES）。そこで:
+  - `/var/lib/coldaisle` を使う**すべての unit**（daemon / api / rollup / report / fand）で
+    `StateDirectoryMode=2770`（setgid 付き。どの unit の起動でも同じ mode に戻る）にそろえる。
+    fand は `StateDirectory=coldaisle` を持たないので（§2.2）、mode を決めるのは既存の4つの unit である
+  - DB を開く**すべての unit** に `UMask=0007` を付ける（SQLite は `-wal` / `-journal` を DB ファイルと同じ
+    権限ビットで作るので、最初の DB ファイルがグループで書ける必要がある）
+  - 段階 1 の静的試験で、全 unit の `StateDirectoryMode` と `UMask` がこの値であることを確かめる。
+    setgid が実際の systemd で保たれることは段階 5 で確かめる（保たれなければ下の代替へ移る）
+  - 代替: fand の主グループを `Group=coldaisle` にし、`coldaisle-fan` を補助グループにする
+    （setgid に頼らないが、fand のファイルが既定で `coldaisle` のグループになる）。PR の「所有者に判断してほしい点」11
 - `authority.json`（0057）は **`/var/lib/coldaisle` に置かない。** そこは `coldaisle` のグループが書けるので、
   API のユーザーが journal を書き換えられる。fand 専用の `StateDirectory=coldaisle-fand`
   （`/var/lib/coldaisle-fand`、所有者 `coldaisle-fan`、`0700`）の下に置き、`--authority-root` で指す。
@@ -88,6 +112,7 @@ unit の書き方次第で、決めた安全の性質が**黙って崩れる**�
 | `NotifyAccess=` | **`main` を明示** | 将来の worker や子プロセスが `WATCHDOG=1` を送れないようにする。main loop の hang を子が隠さない |
 | `ExecStart=` | `coldaisle-fand --require-watchdog --config-dir <root 所有の制御設定> --admin-config <root 所有の管理設定> --db /var/lib/coldaisle/coldaisle.db --authority-root /var/lib/coldaisle-fand/authority` | `--require-watchdog` で「deadman が無いなら制御を取らない」（0060 §2.7）。**制御の4ファイルは root 所有**にし、fand 自身が `safety.yaml` を緩められないようにする |
 | `WorkingDirectory=` | `/opt/coldaisle`（0069 と同じ。root 所有） | — |
+| `User=` / `Group=` / `SupplementaryGroups=` / `UMask=` | `coldaisle-fan` / `coldaisle-fan` / `coldaisle coldaisle-admin` / `0007` | §2.1 |
 | `KillMode=` | `control-group`（既定。**明示する**） | `ExecStopPost` の前に cgroup の全プロセスを止め、書き手を1つにする（0028 §2.7） |
 | `WatchdogSec=` | `safety.yaml` の `watchdog_timeout_ms` と**同じ値**（§2.3） | — |
 | `Restart=` | `always` | 0028 §2.7 で決定済み。起動のたびに `STARTUP` の Max を通る |
@@ -114,7 +139,10 @@ unit の書き方次第で、決めた安全の性質が**黙って崩れる**�
 - 環境側が**長い**と、所有者が承認した値より遅い deadman で運転することになる。0060 §2.7 は
   「実際に効くのは環境側」として warning で続けるが、それは安全でない側への食い違いを
   運用者の目視に任せることになる。**長い向きだけを起動拒否に締める**（Supersedes 欄）。
-  拒否は takeover より前なので、BIOS の制御（Safety-0）のまま残る
+  拒否は takeover より前である。止まった状態は2通りになる。同じ OS の起動のあいだに以前の実行が
+  制御を取っておらず引き継ぎ記録が無ければ **BIOS の制御（Safety-0）のまま**、以前の実行の記録が
+  `RuntimeDirectoryPreserve=yes`（§2.7）で残っていれば、この実行の `ExecStopPost` も Max・manual を書くので
+  **Max のまま**になる（§2.4 の最後の箇条書き）。どちらも安全側である
 - `sd_notify` の `WATCHDOG_USEC=` で fand が値を設定し直す方式は採らない（§4 の W3）。
   0060 §2.7 の「固定 datagram だけ」を崩す
 - hang から Max までの最悪時間は
@@ -181,7 +209,12 @@ cgroup の残りを停止（`KillMode=control-group`）→ `ExecStopPost`（引�
 
 **hwmon の書き込み権限は udev で渡す。** `deploy/udev/` に hwmon 用のテンプレートを足し、
 `SUBSYSTEM=="hwmon"` と driver 名で chip を選び、**対象 zone の `pwmN` と `pwmN_enable` だけ**の
-グループを `coldaisle-fan`、権限を `0664` にする。driver 名と channel 番号は仮の値
+グループを `coldaisle-fan`、権限を `0664` にする。udev の `GROUP=` / `MODE=` は `/dev` のデバイスノード
+にしか効かず、hwmon には `/dev` のノードが無いので、**sysfs の属性を `RUN+=` で直接変える**
+（例: `RUN+="/bin/chgrp coldaisle-fan /sys%p/pwmN /sys%p/pwmN_enable"` と
+`RUN+="/bin/chmod 0664 /sys%p/pwmN /sys%p/pwmN_enable"`）。段階 1 の試験で、テンプレートがこの形であり
+`GROUP=` / `MODE=` に頼っていないことを確かめる。権限が付かなかった場合、fand の takeover は EPERM で失敗するが、
+記録を先に書く順序（§2.7）なので `ExecStopPost` が Max を書く（安全側）。driver 名と channel 番号は仮の値
 （`REPLACE-WITH-DRIVER-NAME` など）で置き、実機の値は導入先の `/etc/udev/rules.d/` にだけ書く（0069 §2.2 と同じ）。
 ドライバの再 bind で属性が作り直されると権限は元に戻るが、その時点で `pwmN_enable` もドライバの既定
 （通常は自動制御）に戻るので、制御は BIOS へ返っている。fand は書き込み失敗を
@@ -196,7 +229,8 @@ cgroup の残りを停止（`KillMode=control-group`）→ `ExecStopPost`（引�
   fand の正常停止（§2.8）だけで、`/run` は再起動（OS）で必ず空になる
 - `RuntimeDirectoryMode=0711`。管理ソケット（`0660`、グループ `coldaisle-admin`）は other の `x` で
   たどれ（0045 §2.2 の親ディレクトリの検査を満たす）、一覧は見せない。記録は `0600`（fand のユーザーと root だけが読む）
-- 管理ソケットの本番の `socket.path` も `/run/coldaisle/` の下にする
+- 管理ソケットの本番の `socket.path` も `/run/coldaisle/` の下にする。いまの `config/control-admin.yaml` は
+  開発用の相対 path（`var/run/...`）なので、導入先の設定を `/run/coldaisle/` の下にすることを段階 1 の手順書に書く
 
 **書き手**（Hardware Backend。#77）
 
@@ -221,14 +255,22 @@ cgroup の残りを停止（`KillMode=control-group`）→ `ExecStopPost`（引�
 | 元の `pwmN_enable` | fand の停止の手順 | 記録 | `ExecStopPost` の結果 |
 |---|---|---|---|
 | すべて `0` または `2` 以上 | PWM を下げずに元の値へ戻し、読み戻しで確かめる | **全 zone を戻せたときだけ消す** | 何もしない（BIOS の制御） |
-| いずれかが `1`（manual） | 戻さない。Max のまま | 消さない | Max を書き直す（同じ値） |
+| いずれかが `1`（manual） | 戻さない。Max のまま。**通知する**（0028 §2.7） | 消さない | Max を書き直す（同じ値） |
 | 戻す途中で失敗・timeout・SIGKILL | — | 消さない | Max |
 
 - 実行部は変えない（「記録が無ければ何もしない」「あれば Max」）。`SERVICE_RESULT` を読まないので、
   **fand が戻さずに 0 で終わる不具合があっても Max になる**
 - 戻した後、記録を消す前に死んだ場合は `ExecStopPost` が Max を書く（安全側に重なる）
-- 0028 §2.7 の「正常停止」の条件（SIGTERM かつ `SERVICE_RESULT=success`）を、実行部から見た判定として
-  言い換えたものであり、戻す・戻さないの規則そのものは変えない
+- 元が manual で Max のまま終えたときの通知は、fand が停止の手順の中で journal に構造化ログの event
+  （名前は仮に `shutdown_left_max_manual`、zone を含む）を残す。通知層（0013）への渡し方は §5 の 5 で
+  実行部の失敗と一緒に決める
+- **これは 0028 §2.7 の「正常停止」の条件（SIGTERM かつ `SERVICE_RESULT=success`）の一部の置き換えである**
+  （Supersedes 欄）。戻す・戻さないの規則と通知は変えないが、次の2つの場面で挙動が 0028 の文言と変わる。
+  - 返却して記録を消した後に fand が非 0 で落ちた: 0028 の文言では異常終了で Max だが、本記録では何もしない。
+    記録を消す時点で全 zone の `pwmN_enable` は読み戻しで BIOS の自動制御へ戻っていることを確かめており、
+    書き手はもう居ないので、BIOS の制御のまま残るのは Safety-0 と同じ安全側の状態である
+  - `SERVICE_RESULT=success` なのに記録が残っている: 0028 の文言では何もしないが、本記録では Max。安全側に倒れる
+  - Critical Safety の引き継ぎの発火条件を変えるので、0028 §2.9 の承認点に準じて所有者の承認を要する（PR の 4）
 
 ### 2.9 取り込み・Telemetry との順序
 
@@ -246,14 +288,15 @@ fand のテンプレートを先に置いてよい。
 
 | 段階 | 担当 Issue（1段階ずつ別の PR） | 内容 | 前提 |
 |---|---|---|---|
-| 1 | #57 | `deploy/systemd/coldaisle-fand.service` と `deploy/udev/` の hwmon テンプレート（仮の値）。`tests/test_deploy_templates.py` の `test_fand_is_not_templated_here` を、§2.2〜§2.9 を確かめる静的試験に置き換える（`Type=notify`・`NotifyAccess=main`・`--require-watchdog`・`KillMode=control-group`・`StartLimitIntervalSec=0`・`RestartPreventExitStatus` が `{3, 4}` ちょうど・`ExecStopPost` が `+` と `-I -S` で引数なし・`ProtectKernelTunables` が `yes` でない・`StateDirectory=coldaisle` が無い・`RuntimeDirectory=coldaisle` が fand にだけある・取り込みへの強い依存が無い・`User` が `coldaisle` でも root でもない・時間切れ3つが明示されている）。`docs/ubuntu-deploy.md` に導入手順を足すが、**`enable` はしない**と書く | 本記録の承認。`--authority-root` は PR #192 のマージ後に使える |
+| 1 | #57 | `deploy/systemd/coldaisle-fand.service` と `deploy/udev/` の hwmon テンプレート（仮の値）。`tests/test_deploy_templates.py` の `test_fand_is_not_templated_here` を、§2.2〜§2.9 を確かめる静的試験に置き換える（`Type=notify`・`NotifyAccess=main`・`--require-watchdog`・`KillMode=control-group`・`StartLimitIntervalSec=0`・`RestartPreventExitStatus` が `{3, 4}` ちょうど・`ExecStopPost` が `+` と `-I -S` で引数なし・`ProtectKernelTunables` が `yes` でない・`StateDirectory=coldaisle` が無い・`RuntimeDirectory=coldaisle` が fand にだけある・取り込みへの強い依存が無い・`User` が `coldaisle` でも root でもない・`SupplementaryGroups` に `coldaisle` と `control-admin.yaml` の `socket.group` が含まれる・時間切れ3つが明示されている・udev のテンプレートが `RUN+=` の chgrp / chmod で `GROUP=` / `MODE=` に頼らない）。**既存の daemon / api / rollup / report の unit を §2.1 に合わせて変える**（`StateDirectoryMode=2770`・`UMask=0007`。全 unit でそろっていることも試験する）。`docs/ubuntu-deploy.md` に導入手順（管理ソケットの `socket.path` を `/run/coldaisle/` の下にすることを含む）を足すが、**`enable` はしない**と書く | 本記録の承認。`--authority-root` は PR #192 のマージ後に使える |
 | 2 | #74 | `create_watchdog` に §2.3 の「環境側が長ければ終了コード 4」を足す（`environ` を渡す既存の試験の形で、等しい・短い・長いの3通り）。fand の起動時に `faulthandler` を有効にする | 段階 1 と独立。`control_daemon.py` を触るので PR #192 のマージ後 |
 | 3 | #78 | 実行部を `python -I -S <ファイル>` で起動できることの試験（subprocess。記録の無い環境で何も書かずに 0 で終わる）。標準ライブラリだけを import する試験は既にある | 段階 1 |
 | 4 | #77 | 実機 backend の記録の書き手（§2.7 の 1〜6）と正常停止の返却（§2.8）。偽の sysfs（`tmp_path`）で、書いた記録を `emergency_handoff` が読んで Max にできること・既存記録の値の引き継ぎ・返却の成功で記録が消え失敗で残ること・記録を書けなければ `pwmN_enable` に触らないことを確かめる | #75 の profile、段階 1〜3 |
 | 5 | 人（所有者） | simulated backend のまま、systemd のある環境（VM 可）で unit を動かし、`kill -STOP`（watchdog）・`kill -KILL`・`systemctl stop`・再起動の連続で、`ExecStopPost` が走ること・`/run/coldaisle` が残ること・順序を確かめる。その後 0028 §2.9 の承認点 3（実機で kill・watchdog・正常停止・引き継ぎを確認）を経て `enable` する | 段階 1〜4 |
 
 - **どの段階も `ControlTick` の版を上げない。** 実効の `WatchdogSec` や記録の状態を decision trace に
-  載せると決めた場合（§5）は、PR #192 の v13 の後に直列で v14 とし、
+  載せると決めた場合（§5）は、**マージ時点の次の空き番号**（#192 が v13 を使えば v14 以降）とし、
+  ほかの版上げの PR と直列にする。
   `src/coldaisle/web/airflow-trace.js` の `KNOWN_VERSIONS` と fixture を同じ PR で更新する
 - 段階 1 のテンプレートを置いただけでは Fan 制御は有効にならない（`docs/critical-safety.md` の
   「統合と実機検証までサービスで有効化しない」を保つ）
@@ -282,6 +325,8 @@ fand のテンプレートを先に置いてよい。
 | `RuntimeDirectoryPreserve=yes` で、正常停止で返せなかった記録が OS の再起動まで残る | 残った記録が指すのは照合済みの header で、次の `ExecStopPost` が書くのは Max だけ |
 | fand の DB へのアクセスを `coldaisle` グループと共有する | decision trace と監査は同じ DB に置く既存の決定（0030 / 0072）に従う。`authority.json` だけは別のディレクトリにする |
 | `WatchdogSec` と `safety.yaml` を人が揃える必要がある | 長い向きは起動しない（§2.3）ので、揃え忘れは「制御を取らない」で表に出る |
+| 既存の unit の `StateDirectoryMode` を 0750 から 2770 へ広げ、`UMask=0007` を足す（§2.1） | 広がるのは `coldaisle` グループの書き込みだけで、other は変わらない。全 unit でそろっていることを試験する |
+| **API / AI のユーザー（`coldaisle`）は、fand が制御入力として読む Telemetry の DB を書ける。** `authority.json` は別のディレクトリで守る（§2.1）が、同じ論理で制御入力は守っていない | 0069 の既存の構成から来る残るリスクとして明記する。制御入力の改ざんへの対策は本記録の範囲外（§5 の 14） |
 
 ---
 
@@ -315,14 +360,15 @@ fand のテンプレートを先に置いてよい。
 |---|---|---|
 | 1 | **値の確定**（実機の測定待ち）: `WatchdogSec`（= `watchdog_timeout_ms` の確定値）、`TimeoutAbortSec`、`TimeoutStopSec`、`TimeoutStartSec`、`RestartSec`。hang から Max までの最悪時間（§2.3）が熱の時定数に対して許されるか | #50 / #75 の後、0028 §2.9 の承認点 2 と合わせて所有者 |
 | 2 | CPU フルロード時の overrun を抑える `Nice=` / `CPUWeight=`、GPU 学習時のメモリ圧迫で殺されにくくする `OOMScoreAdjust=` の要否と値 | #50（CPU / GPU の負荷試験で overrun と OOM を見る） |
-| 3 | 実際の systemd で、後片付けと `ExecStopPost` の順序・SIGABRT と `faulthandler` の出力・D 状態の hang の振る舞いを確かめる | 段階 5（人） |
+| 3 | 実際の systemd で、後片付けと `ExecStopPost` の順序・SIGABRT と `faulthandler` の出力・D 状態の hang の振る舞い・`StateDirectoryMode=2770` の setgid が保たれるかを確かめる。**導入先の `kernel.core_pattern`（apport / systemd-coredump への pipe）のもとで、SIGABRT から `ExecStopPost` の開始までの時間**も測る（`LimitCORE=0` でも pipe 側の処理は走りうる）。遅れるなら §2.3 の最悪時間の式に加えるか、S1（SIGKILL）へ移るかを所有者が決める | 段階 5（人） |
 | 4 | `ExecStopPost` が動かないとき、チップが PWM をどう保つか | 0028 未決 6（#74 の実機確認） |
-| 5 | 引き継ぎ実行部の失敗・再起動の繰り返しの通知（`OnFailure=` の unit から通知層へ渡すか） | 通知（0013）と合わせて別途 |
+| 5 | 引き継ぎ実行部の失敗・再起動の繰り返し・元が manual で Max のまま正常停止したこと（§2.8 の `shutdown_left_max_manual`）の通知（`OnFailure=` の unit や journal の event から通知層へどう渡すか） | 通知（0013）と合わせて別途 |
 | 6 | `config_invalid` の Max を周期的に書き直すか（本記録の再起動で結果として書き直されるが、決定としては未決） | 0060 未決 1 |
 | 7 | 終了コード 1 が `config_invalid` と未捕捉例外で重なっている。分けるか（分けても再起動の扱いは変わらない） | #74 |
 | 8 | `authority.json` への昇格を人がどう書くか（`/var/lib/coldaisle-fand` の権限と承認者の uid の束縛） | 0072 未決 5 / #92 の段階 3 |
-| 9 | 実効の `WATCHDOG_USEC` や記録の状態を decision trace に載せるか。載せるなら `ControlTick` を PR #192 の v13 の後に直列で上げ、`KNOWN_VERSIONS` を更新する | 必要になったら（#82） |
+| 9 | 実効の `WATCHDOG_USEC` や記録の状態を decision trace に載せるか。載せるなら `ControlTick` をマージ時点の次の空き番号へ、ほかの版上げの PR と直列に上げ、`KNOWN_VERSIONS` を更新する | 必要になったら（#82） |
 | 10 | `MemoryDenyWriteExecute` と `SystemCallFilter` の絞り込み | worker（#86 / #89）を入れるとき |
 | 11 | hwmon の udev ルールの driver 名と channel 番号（実機の値は導入先だけ） | #75 / `docs/fan-header-mapping.md` |
 | 12 | `coldaisle-telemetry` / `coldaisle-eventd` の unit（`RuntimeDirectory` は `coldaisle` 以外の名前にする） | 0069 未決 3 / 0045 未決 4 |
 | 13 | コンテナ化（#64）で fand をホストで直接動かすか。本記録はホストで直接動かす前提 | 0028 未決 7 / #64 |
+| 14 | API / AI のユーザーが Telemetry の DB を書ける（§3）。制御入力の書き手を取り込みに限るか（DB の分離・読み取り専用の接続など） | 所有者が別の Issue を立てる（本記録の範囲外） |
