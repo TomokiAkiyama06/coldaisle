@@ -1,7 +1,7 @@
 # 決定記録 0078: Air Balance の `coordinate()` を Fallback / Baseline の requested に掛ける位置・条件・上限・段階
 
 - **種別**: Decision Record
-- **Status**: Proposed
+- **Status**: FINAL（2026-09-30、リポジトリ所有者が承認）
 - **Date**: 2026-09-30
 - **Supersedes**: なし
 - **関連**: [`0073-air-balance-control-config-integration.md`](0073-air-balance-control-config-integration.md) §2.2 / §2.3 / §2.6 / §5（1行目）、
@@ -46,31 +46,34 @@ Baseline が動いている時間のほとんどで「Top の排気が強い CPU
 **本記録は #75 の実測値を決めない。** 上限の値・保持時間・shadow の合否の基準は、実測の後に
 値として決める（§5）。本記録が決めるのは、その値を入れる**枠**と、値が無い間の**安全側の既定**である。
 
-### 所有者に承認を求める判断（FINAL にする前に）
+### 所有者の判断（2026-09-30 オーナーが推奨案で承認）
 
-各項目の **（推奨）** が本記録の §2 の内容である。代替を選ぶ場合は、対応する §2 の節と §4 の行を差し替える。
+2026-09-30 に所有者が「推奨案で直してから承認」と判断した（Status: FINAL）。提示したすべての論点で
+推奨案を採り、最終レビュー（765c728）で残った3件の指摘も推奨の直し方で本文へ入れた。
+以下は決着した内容の一覧で、正本は §2 である。代替案とその得失は §4 に残す。
 
-1. **Baseline（Fallback）の requested に協調を掛けるか。**
-   **（推奨）掛ける**（§2.1〜§2.2）／ 代替: 掛けない（§4 の A。本記録を Rejected にし、0073 §5 の1行目を「掛けない」で閉じる記録にする）
-2. **有効化の仕方と既定。**
-   **（推奨）`fan-policy.yaml` の `mode`、既定 `off`、`shadow` → `apply` を人が設定と再起動で進める**（§2.1 / §2.8）／
-   代替: `calibrated` なら即適用（§4 の E）、authority journal で段を管理（§4 の N）
-3. **`mode: shadow / apply` と `uncalibrated` の組み合わせ。**
-   **（推奨）Control Config の不正（`config_invalid`、全 zone Max）**（§2.4）／ 代替: 黙って `off` として起動（§4 の J）
-4. **`mode: apply` の協調の例外（`coordinate()` の不具合・下げる値の検出）。**
-   **（推奨）0028 §2.7 の「Fallback Controller の例外」と同じ扱い**＝ `fallback_exception` の fault にし、
-   その tick は raw baseline、次 tick の Critical Safety が `EMERGENCY`（全 zone Max）。`mode: shadow` では記録だけ（§2.6）／
-   代替: raw baseline のまま続け Safety へつながない（§4 の I。0028 §2.7 の一部を置き換える記録になり、0028 へ `Superseded by` を追記する）
-5. **協調の設定を変えた後の昇格の証拠。**
-   **（推奨）Offline Evaluation の報告に `fan_policy_trace_binding`（0073 §2.6 と同じ形）を加え、
-   不一致・欠落が 1 件でもあれば `_check_evidence()` が拒む**（§2.5）／
-   代替: 本記録では束縛せず、0073 §5 の未決のまま残す（§4 の P。その間、`mode: off` の trace を `mode: apply` の設定で評価した報告が昇格の証拠に通りうる）
-6. **Critical Safety が zone ごとに `forced_max` を出している tick（`DEGRADED` の CPU Telemetry stale・Fan fault）。**
-   **（推奨）CPU Telemetry の stale による Top の `forced_max` は `projected_top_floor = 1.0` として協調を続け、
-   どの zone でも Fan fault（Top を含む）があれば `skipped`**（§2.3）／
-   代替: どの zone でも `forced_max` なら `skipped`（§4 の O）
+1. **Baseline（Fallback）の requested に協調を掛ける**（§2.1〜§2.2）。代替 A（掛けない）は採らない
+2. **有効化は `fan-policy.yaml` の `air_balance_coordination.mode`、既定 `off`、`shadow` → `apply` を人が設定と再起動で進める**（§2.1 / §2.8）。
+   代替 E（`calibrated` なら即適用）・F（`air-balance.yaml` に置く）・N（authority journal で段を管理）は採らない
+3. **`mode: shadow / apply` と `uncalibrated` の組み合わせは Control Config の不正（`config_invalid`、全 zone Max）**（§2.4）。代替 J は採らない
+4. **`mode: apply` の協調の例外（`coordinate()` の不具合・下げる値の検出）は 0028 §2.7 の「Fallback Controller の例外」と同じ扱い**＝
+   `fallback_exception` の fault にし、その tick は raw baseline、次 tick の Critical Safety が `EMERGENCY`（全 zone Max）。
+   `mode: shadow` では記録だけ（§2.6）。代替 I は採らない（0028 は置き換えない）
+5. **昇格の証拠を `fan-policy.yaml` の trace に束縛する**（`fan_policy_trace_binding`。§2.5）。代替 P は採らない
+6. **CPU Telemetry の stale による Top の `forced_max` は `projected_top_floor = 1.0` として協調を続け、
+   Top を含むどの zone でも Fan fault（確定前の tach 無応答を含む。下の 11）があれば `skipped`**（§2.3）。代替 O は採らない
+7. **LIMITED / EXPANDED の帯の中心は coordinated baseline**（§2.5）。代替 K は採らない
+8. **協調を掛ける Safety の状態は `NORMAL` と `DEGRADED`**（§2.3）
+9. **最初の apply では Top の `max_raise` を 0 にし、Front / Rear だけで始める**（§2.8）。値そのものは #75 の後（§5）
+10. **shadow → apply の合否の基準は、shadow の実データを見てから別の記録か PR で決める**（§5）。
+    shadow の `counterfactual_output` が開ループである（apply の閉ループを再現しない）ことの扱いも、その基準と一緒に決める（§2.4 / §5）
+11. **最終レビューの指摘への対応**（いずれも推奨の直し方）:
+    - Top の風量の見積もりは requested でなく、**合成の下限（Safety の floor・Guard の floor・`ramp_down` の下限）込みの effective の見込み**で行う（§2.2 / §2.4）
+    - **backend の生の `TACH_STALL` 報告と、`stall_window_ms` が満ちる前の tach 無応答**を Critical Safety の裁定に露出し
+      （`CriticalSafetyDecision.tach_unconfirmed_zones`）、最初の報告の tick から `skipped` にする（§2.3）
+    - **適用した zone ごとの `max_raise` を trace に記録**し、trace だけで `output - candidate <= max_raise` を検査できるようにする（§2.7）
 
-## 2. Decision（推奨案）
+## 2. Decision
 
 ### 2.1 掛ける。ただし既定は `off` で、`shadow` → `apply` の順に人が設定で開く
 
@@ -86,8 +89,8 @@ Baseline が動いている時間のほとんどで「Top の排気が強い CPU
 ```text
 Fallback.propose()                       … raw baseline（いまの requested）
 Critical Safety.evaluate()               … requested を見ない（いまと同じ位置）
-  ↓ Top の safety floor を読むだけ
-AirBalanceCoordinator.apply(raw baseline, snapshot, safety の Top floor)   ← 本記録
+  ↓ Top の safety floor・forced_max と、合成の Guard floor・ramp_down の下限を読むだけ
+AirBalanceCoordinator.apply(raw baseline, snapshot, Top の effective の下限の見込み)   ← 本記録
   ↓ coordinated baseline（mode: apply のときだけ raw と違いうる）
 ControllerGate.select(fallback = coordinated baseline, learned = …)
   ↓ requested
@@ -100,16 +103,27 @@ ControllerGate.select(fallback = coordinated baseline, learned = …)
   Critical Safety の floor・`ramp_down`・`forced_max` は、協調後の requested にもいまと同じく掛かる
   （AGENTS.md ルール2・5）。**合成の後・Backend の前に値を足す経路は作らない**
 - Critical Safety の裁定を先に評価するのは、いまの loop の順序のまま（Safety は requested を見ない）。
-  協調はその裁定の **Top の出力を読み、`projected_top_floor` として渡すだけ**で、裁定を作り直さない・
-  書き換えない（`CriticalSafetyDecision` は発行済みの不変オブジェクト）。`projected_top_floor` は
-  Top の `forced_max` が真なら **1.0**、偽なら Top の `floor` とする（所有者の判断 6）。
-  `DEGRADED` のまま Top だけを Max にする裁定（CPU Telemetry の stale。`_zone_outputs()` の `forced_by_fault`）が
-  あり、`floor` だけを渡すと Top の排気を過小に見積もり、Top が Max の最中に Front make-up air を出し損ねるため。
-  同じ `forced_by_fault` には Top の Fan fault（stall・書き込み失敗）も入るが、そのときの Top の実際の排気は
-  不明か 0 で、1.0 と見積もると存在しない排気をでっち上げる。そのため Fan fault の tick は §2.3 で `skipped` にし、
-  **1.0 と見積もるのは CPU Telemetry の stale による Top の `forced_max` だけ**になる。
-  Top の実際の排気は `max(case_aux_exhaust, safety_floor)`（`forced_max` なら 1.0）なので、CPU cooling floor による
-  排気過多も Front make-up air の判断に入る（`docs/air-balance-model.md`）。floor は `requested.top` に写さない（所有者は Critical Safety のまま）
+  協調はその裁定の **Top の出力と合成の下限を読み、`projected_top_floor` として渡すだけ**で、裁定を作り直さない・
+  書き換えない（`CriticalSafetyDecision` は発行済みの不変オブジェクト）。`projected_top_floor` は、
+  Top の `forced_max` が真なら **1.0**、偽なら **合成（0028 §2.4）が requested に掛ける下限の最大値**
+  `max(Guard の Top floor, Safety の Top floor, Top の ramp_down の下限)` とする（所有者の判断 6・11）。
+  - **ramp_down の下限を入れる**（最終レビュー 765c728 の指摘1）: Top が高い demand から下がる途中は、
+    `DemandComposer` が前 tick の effective から `ramp_down_per_s` の下限を掛けるので、実際の Top の排気は
+    requested（や Safety の floor）より大きい。requested だけで見積もると、requested が 0.2 でも実効は 1.0 近い
+    tick に Front make-up air を足し損ねる。下限の値は **合成と同じ式・同じ前 tick の effective・同じ経過時間**で求める。
+    `DemandComposer` に読み取り専用の `ramp_floor(zone, monotonic_ms)`（前 tick の effective が無ければ `None`）を足し、
+    `_compose_effective_demands()` の ramp の下限と**同じ関数**を呼ぶ（式を写さない。値が合成とずれない）。
+    新しい閾値は足さない（`ramp_down_per_s` は `safety.yaml` の既存の値）
+  - Guard の ceiling は requested を切り詰めるだけで下限の後には掛からないので、見込みに入れない。
+    Top の requested 自身は `coordinate()` が candidate から読む（`projected_top_floor` との `max()`）
+  - `DEGRADED` のまま Top だけを Max にする裁定（CPU Telemetry の stale。`_zone_outputs()` の `forced_by_fault`）が
+    あり、`floor` だけを渡すと Top の排気を過小に見積もり、Top が Max の最中に Front make-up air を出し損ねるため 1.0 とする。
+    同じ `forced_by_fault` には Top の Fan fault（stall・書き込み失敗）も入るが、そのときの Top の実際の排気は
+    不明か 0 で、1.0 と見積もると存在しない排気をでっち上げる。そのため Fan fault の tick は §2.3 で `skipped` にし、
+    **1.0 と見積もるのは CPU Telemetry の stale による Top の `forced_max` だけ**になる
+  - Top の実際の排気は `max(case_aux_exhaust, 上の下限)`（`forced_max` なら 1.0）なので、CPU cooling floor や
+    ramp-down 中の残りの排気による排気過多も Front make-up air の判断に入る（`docs/air-balance-model.md`）。
+    見込みは `requested.top` に写さない（下限の所有者は Critical Safety と合成のまま）
 - 協調は **Fallback の中に入れない**。別の部品（`control/air_balance_coordination.py` の
   `AirBalanceCoordinator`。`control/air_balance.py` を import し、`fallback/` は import しない）にする。
   Fallback は ML にも characterization にも依存しない最後の拠り所のまま残し、raw baseline を常に記録できるようにする
@@ -132,6 +146,20 @@ ControllerGate.select(fallback = coordinated baseline, learned = …)
 | Fallback が提案を返した（例外で `None` でない） | `baseline_unavailable` | `_requested()` の Max の経路を変えない |
 | Critical Safety の `state` が `NORMAL` か `DEGRADED` | `safety_state` | `STARTUP` / `EMERGENCY` は `forced_max` で全 zone Max。協調しても effective は変わらず、trace を読みにくくするだけ |
 | Critical Safety の裁定の `faults` に、zone つきの Fan fault（`TACH_STALL` / `WRITE_FAILURE` / `READBACK_MISMATCH` / `ENABLE_REVERTED`。`critical.py` の `_FAN_FAULTS`）が **Top を含めてどの zone にも無い**。かつ Front / Rear に `forced_max` が無い | `zone_fan_fault` | Fan fault の zone の `forced_max` は、その zone の実際の風量が demand から言えない（不明か 0）裁定で、Front / Rear でも Top でも同じ。Top の Fan fault を 1.0 と見積もると、存在しない Top の排気で Rear / Top の熱の排気を抑えたり、不要な Front make-up air を足したりする。ほかの zone は `fault_demand` が既に上げている（0028 §2.7）。判定は `CriticalSafetyDecision.faults` の fault code で行い、`SafetyZoneOutput.reason` の文字列は読まない。Front / Rear の `forced_max` は `NORMAL` / `DEGRADED` では Fan fault からしか生じないが、将来の裁定の追加に備えて明示的にも確かめる。CPU Telemetry の stale による Top の `forced_max` は skip せず、`projected_top_floor = 1.0` として扱う（§2.2。所有者の判断 6） |
+| Critical Safety の裁定の `tach_unconfirmed_zones`（下記）が**空**（Top を含むどの zone にも無い） | `tach_unconfirmed` | backend の `TACH_STALL` は1回の帰還にすぎず、Critical Safety は `stall_window_ms` が満ちるまで `faults` に出さない（0028 §2.7 / 0034 §2。`critical.py` の `_stall_faults()`）。その間も tach が返っていない Fan を demand から見積もって協調すると、上の行と同じく存在しない風量で比を採点する（最終レビュー 765c728 の指摘2）。**最初の報告の tick から** `skipped` にする。Safety の fault の確定（`stall_window_ms` の窓）は変えない |
+
+**`CriticalSafetyDecision.tach_unconfirmed_zones` を足す**（所有者の判断 6・11）。Critical Safety の裁定に、
+その tick の評価で次のどちらかに当たった zone の集合（`frozenset[Zone]`、既定は空）を載せる。
+
+- 評価に渡された backend の fault（`external_faults`）に、その zone の `TACH_STALL` がある（いまの `backend_stall_zones`）
+- その zone の stall の timer（`_stall_started_ms`）が動いている＝ demand が `stall_check_min_demand` 以上で、
+  tach が `stall_min_rpm` 以上の有効な応答を返していない（窓が満ちて `TACH_STALL` が確定した後も含む）
+
+どちらも Critical Safety が**いま既に計算している**値を外へ見せるだけで、新しい閾値を足さない
+（`stall_window_ms` / `stall_min_rpm` / `stall_check_min_demand` は `safety.yaml` の既存の値）。
+この欄は Safety の `state`・floor・`forced_max`・`faults` を変えない（読むのは協調だけで、Safety の判定には戻さない）。
+裁定は trace へそのまま記録されるので、欄の追加は §2.7 の `ControlTick` の版上げに含める（新しい版の tick は欄を必ず持ち、旧版は持たない）。
+協調が Critical Safety の内部状態を直接読む経路は作らず、発行済みの裁定だけを読む（§2.2 と同じ）。
 
 Telemetry の鮮度は**協調の側で別の閾値を持たない**。熱の入力は 0073 §2.4 の入力契約（`ADVISORY`、
 許容遅延は同じ源の必須入力に揃える）を通った値で、stale / missing は `None` になる。
@@ -145,7 +173,8 @@ zone `z` の raw baseline を `c_z`、`coordinate()` の提案を `p_z` とす�
 
 ```text
 s     = FanHardwareConfig.stable_demands(c)               … 0073 §2.3 の純粋関数（backend と同じ引き上げ）
-top   = 1.0 if safety.zones.top.forced_max else safety.zones.top.floor   … §2.2（Fan fault の tick は §2.3 で skipped 済み）
+top   = 1.0 if safety.zones.top.forced_max
+        else max(guard.top.floor, safety.zones.top.floor, composer.ramp_floor(top))   … §2.2（Fan fault・tach 未確認の tick は §2.3 で skipped 済み）
 coord = coordinate(s, thermal, projected_top_floor = top)
 p_z   = coord.requested.z  if coord.requested.z > s_z  else c_z     … 引き上げの無い zone は raw のまま
 r_z   = max(0, min(p_z, c_z + max_raise_z) - c_z)                     … この tick の引き上げ幅（上げるだけ・上限つき）
@@ -190,7 +219,7 @@ air_balance_coordination:
   max_raise:                # demand（0.0..1.0）。0 はその zone を動かさない
     front: <#75 の後>
     rear: <#75 の後>
-    top: <#75 の後>          # 推奨: 最初の apply では 0（§5）
+    top: <#75 の後>          # 最初の apply では 0（所有者の判断 9）
   release_hold_ms: <#75 の RPM 応答時間の後>
 ```
 
@@ -262,15 +291,18 @@ air_balance_coordination:
   mode: off | shadow | apply                         # 設定の値をそのまま写す
   status: off | skipped | not_needed | shadow | applied | failed
   skip_reason: air_balance_disabled | operating_mode | snapshot_unavailable
-             | baseline_unavailable | safety_state | zone_fan_fault | null    # skipped のときだけ非 null
+             | baseline_unavailable | safety_state | zone_fan_fault
+             | tach_unconfirmed | null                                     # skipped のときだけ非 null
   demand_basis: stable_candidate                     # 固定値。何の demand で評価したか
   candidate:  {front, rear, top} | null              # raw baseline（c）
   proposed:   {front, rear, top} | null              # 上限を掛ける前の p
   output:     {front, rear, top} | null              # 実際に Gate へ渡した値（apply 以外は candidate と同じ）
   counterfactual_output: {front, rear, top} | null   # 保持込みの値 held_z。shadow / apply で記録（apply では output と同じ）
+  max_raise:  {front, rear, top} | null              # この tick に適用した fan-policy.yaml の max_raise（mode が shadow / apply なら status によらず記録）
   bounded_by_max_raise: {front, rear, top: bool} | null
   held:       {front, rear, top: bool} | null        # release_hold_ms の保持で h_z > r_z だった zone（shadow は模擬の保持）
-  projected_top_floor: demand | null                 # 渡した Top の値（Safety の Top floor。forced_max なら 1.0）
+  projected_top_floor: demand | null                 # 渡した Top の値（forced_max なら 1.0、ほかは合成の下限の最大値。§2.2）
+  projected_top_basis: forced_max | safety_floor | guard_floor | ramp_down | none | null   # projected_top_floor を決めた下限
   before_state / before_ratio / projected_state / projected_ratio   # AirBalanceCoordination.before / projected から
   reasons: [front_makeup_air | rear_thermal_exhaust | top_case_aux_exhaust ...]
   failure: {type, detail(≤500)} | null               # failed のときだけ
@@ -280,14 +312,18 @@ air_balance_coordination:
 
 | 条件 | 内容 |
 |---|---|
-| `mode: off` | `status: off`、ほかの欄はすべて `null` / 空 |
+| `mode: off` | `status: off`、ほかの欄はすべて `null` / 空（`max_raise` も `null`） |
+| `mode: shadow` / `apply` | `max_raise` は非 null で、各 zone が 0.0..1.0 の有限値 |
 | `status: skipped` / `failed` | `output == candidate`（raw baseline を使った）、`counterfactual_output` は `null`。`skip_reason` / `failure` はそれぞれのときだけ非 null。`held` はすべて偽（保持を解いた。§2.4） |
 | `status: shadow` | `mode: shadow` と同値（`mode: shadow` で `coordinate()` を呼んだ tick は、上げる必要の有無によらず常に `shadow`。`not_needed` / `applied` にはならない）。`output == candidate`、`proposed` と `counterfactual_output` は記録する（適用しない）。apply なら上げていたかは `counterfactual_output > candidate` で読む。`held` は模擬の保持（§2.4） |
 | `status: not_needed` | `mode: apply`、すべての zone で `output == candidate`、`counterfactual_output == output` |
 | `status: applied` | `mode: apply`、少なくとも1 zone で `output > candidate`（保持による場合を含む）、`counterfactual_output == output` |
-| すべて | 各 zone で `output >= candidate` かつ `output - candidate <= max_raise`。`counterfactual_output` があれば同じく `>= candidate` かつ `- candidate <= max_raise`（保持中も。§2.4 は引き上げ幅を保持する） |
+| すべて | 各 zone で `output >= candidate` かつ `output - candidate <= max_raise`（**同じ tick に記録した `max_raise` の値**で検査する。最終レビュー 765c728 の指摘3）。`counterfactual_output` があれば同じく `>= candidate` かつ `- candidate <= max_raise`（保持中も。§2.4 は引き上げ幅を保持する） |
 | Gate が Fallback を選んだ tick | `ZoneRecord` の requested が zone ごとに `output` **以上**。等しくないのは、その zone の `controller_reason` が `fallback_transition_floor` のときだけ |
 
+- **`max_raise` を tick ごとに記録する理由**: trace が `fan-policy.yaml` の hash と `bounded_by_max_raise` の真偽値しか
+  持たないと、読む側は `output - candidate <= max_raise` を trace だけで検査できず、hash から設定ファイルを探し当てる必要がある。
+  値は3つの数で小さく、`mode` と同じく設定の写しなので、塊の中に置く（`fan-policy.yaml` の束縛 §2.5 とは別に、読む側の検算のため）
 - Gate が Fallback を選んだ tick の requested は、ふつうは `output` と一致する。例外は Learned MPC から Fallback へ
   移った最初の tick で、`ControllerGate._prevent_transition_drop()` が各 zone を直前の requested まで引き上げる
   （`fallback_transition_floor`）。**順序は協調が先、Gate の遷移の floor が後**である（Gate は coordinated baseline を
@@ -309,7 +345,7 @@ air_balance_coordination:
 |---|---|---|---|
 | 0 | `mode: off`（雛形の既定） | なし（いまと同じ） | — |
 | 1 | `mode: shadow` | **なし**。毎 tick `proposed` と保持込みの `counterfactual_output` を記録するだけ | #75 の校正済み `air-balance.yaml` がある（§2.9 の A）。`uncalibrated` では起動しない（§2.4） |
-| 2 | `mode: apply`、控えめな `max_raise`（Top は 0 を推奨） | Baseline の requested が上がりうる（下がらない） | shadow の集計（§5 の基準）を所有者が確認し承認する。承認と値は決定記録か PR に残す |
+| 2 | `mode: apply`、控えめな `max_raise`（Top は 0。所有者の判断 9） | Baseline の requested が上がりうる（下がらない） | shadow の集計（§5 の基準）を所有者が確認し承認する。承認と値は決定記録か PR に残す |
 | 3 | `max_raise` の見直し（Top を含む） | 同上 | apply 期間の trace と #75 の response matrix を見て所有者が承認 |
 
 - 段を進めるのは**人の設定変更と再起動だけ**。自動では進まない。戻すのは `mode: off`（または shadow）にして再起動
@@ -342,6 +378,12 @@ air_balance_coordination:
   Top の Fan fault と CPU Telemetry の stale が同じ tick に重なっても `skipped` であること
 - **Top の `forced_max`**: `DEGRADED` で CPU Telemetry が stale（Top だけ Max）の tick に `projected_top_floor == 1.0` が渡り、
   Top の floor だけを渡した場合より Front make-up air が小さくならないこと
+- **Top の ramp-down**: Top が高い effective から下がる途中（requested は低い）の tick で、`projected_top_floor` が
+  合成の ramp_down の下限と一致し（`DemandComposer.ramp_floor()` と合成の結果の `bound_by: ramp_down` の値が同じ）、
+  requested だけで見積もった場合より Front make-up air が小さくならないこと。最初の tick（前 tick の effective が無い）は下限なし
+- **tach 未確認**: simulated backend が `TACH_STALL` を返した**最初の tick**から、`stall_window_ms` が満ちて
+  `faults` に確定するまでの各 tick が `skipped`（`tach_unconfirmed`）で `output == candidate` であること。
+  Front / Rear / Top のそれぞれで確かめる。`tach_unconfirmed_zones` の有無で Safety の `state`・floor・`forced_max`・`faults` が変わらないこと
 - **合成を迂回しない**: 協調で上げた requested に Guard の ceiling が掛かること、Safety の floor・`forced_max`・
   `ramp_down` がいまと同じく掛かること、Top の CPU cooling floor が協調の有無で変わらないこと
 - **失敗**: `coordinate()` が例外を投げる・下げる値を返す偽の model を差し込み、その tick は `failed`・raw baseline・
@@ -353,7 +395,7 @@ air_balance_coordination:
   保持中も `output - candidate <= max_raise` であること、`skipped` / `failed` の tick で即座に解けること。
   同じ入力列で `shadow` の `counterfactual_output` が `apply` の `output` と tick ごとに一致すること（開ループの入力で比べる）
 - **設定**: `shadow` / `apply` + `uncalibrated` が `config_invalid`、旧版の `fan-policy.yaml` の拒否、範囲外の `max_raise` の拒否
-- **trace**: §2.7 の不変条件の正負の試験、新しい版の fixture と `airflow-trace.js` の読み取り試験
+- **trace**: §2.7 の不変条件の正負の試験（記録した `max_raise` を超える `output` の記録が拒まれることを含む）、新しい版の fixture と `airflow-trace.js` の読み取り試験
 - **Gate**: LIMITED の帯の中心が coordinated baseline になること、FULL で MPC の requested に協調が掛からないこと、
   Learned MPC から Fallback へ移った最初の tick で `fallback_transition_floor` が coordinated baseline の上に掛かり、
   trace の検証（requested ≥ `output`）を通ること
@@ -364,9 +406,9 @@ air_balance_coordination:
 
 | 順 | Issue / PR | 内容 | 版 |
 |---|---|---|---|
-| 1 | 本記録（docs） | 所有者の承認で FINAL | — |
+| 1 | 本記録（docs） | 2026-09-30 に所有者が推奨案で承認（FINAL） | — |
 | 2 | #81 の実装 PR（a） | `fan-policy.yaml` の `air_balance_coordination` と検証（`uncalibrated` との組み合わせの拒否を含む）、純粋な `AirBalanceCoordinator`（上限・保持・下げない検証）と単体試験、`docs/control-config.md` の移行手順。**loop へは配線しない** | `fan-policy.yaml` 9 → 次、`CONTROL_CONFIG_VERSION` 11 → 次 |
-| 3 | #81 の実装 PR（b） | loop への配線（§2.2 の位置・§2.3 の条件・§2.6 の失敗）、Gate へ coordinated baseline を渡す、`ControlTick` の新しい版と `air_balance_coordination`、`airflow-trace.js` の `KNOWN_VERSIONS`、fixture、`docs/air-balance-model.md` の更新 | `ControlTick` 次の空いた番号（#192 の v13 の後なら v14）。**他の版上げの PR と直列** |
+| 3 | #81 の実装 PR（b） | loop への配線（§2.2 の位置・§2.3 の条件・§2.6 の失敗）、`DemandComposer.ramp_floor()` と `CriticalSafetyDecision.tach_unconfirmed_zones`（Safety の判定は変えない）、Gate へ coordinated baseline を渡す、`ControlTick` の新しい版と `air_balance_coordination`、`airflow-trace.js` の `KNOWN_VERSIONS`、fixture、`docs/air-balance-model.md` の更新 | `ControlTick` 次の空いた番号（#192 の v13 の後なら v14）。**他の版上げの PR と直列** |
 | 4 | #91（または #81 の追加 PR） | `fan_policy_trace_binding` と `_check_evidence()` の拒否（§2.5）、offline 評価の Baseline の arm が `mode` に応じて coordinated baseline を再現する、shadow の集計（§5）。**段 6 より前に入れる** | 評価報告と `MIN_EVIDENCE_REPORT_SCHEMA_VERSION` を次の空いた番号へ |
 | 5 | #75（人・実機） | 校正済み `air-balance.yaml`（§2.9 の A）、続いて B | — |
 | 6 | 運用（人） | `mode: shadow` へ変更・再起動、集計を所有者が確認 | 設定のみ |
@@ -397,39 +439,43 @@ air_balance_coordination:
 | 協調の設定を変えるとそれまでの昇格の証拠が使えなくなり、評価報告の版上げ（`fan_policy_trace_binding`）が要る | 止まる側に倒れるだけで安全側は弱めない（0057 / 0073 §2.6 と同じ形）。段の切り替えは頻繁に行わない |
 | LIMITED / EXPANDED の帯の中心が上がり、MPC が下げられる範囲が狭まる | 上げる向きなので安全側。MPC の balance の項と向きは揃う。帯の幅は変えない |
 | `apply` の協調の不具合1つで全 zone Max になり、再起動まで騒音が続く | 0028 §2.7 の決定論的な層と同じ扱いで、不具合を黙って続けない。`shadow` の期間に同じコードを実データで回して失敗を先に洗い出す。戻すのは `mode: off` と再起動 |
-| Top が `forced_max` の tick に Front make-up air が出る | CPU Telemetry の stale で Top が Max のときの排気過多を補うためで、上げるだけ・`max_raise` の範囲。Fan fault（Top を含むどの zone でも）の tick では協調しない |
+| Top が `forced_max` の tick・ramp-down の途中に Front make-up air が出る | CPU Telemetry の stale で Top が Max のとき、Top が下がり切る前の排気過多を補うためで、上げるだけ・`max_raise` の範囲。Fan fault と tach 未確認（Top を含むどの zone でも）の tick では協調しない |
+| Critical Safety の裁定に協調のための欄（`tach_unconfirmed_zones`）が増え、`ControlTick` の版上げに含まれる | 既に計算している値を見せるだけで、Safety の判定には戻さない。§2.10 で判定が変わらないことを試験する |
 
 ## 4. 却下した代替案
 
 | 案 | 利点 | 却下理由 |
 |---|---|---|
-| **A. Fallback には掛けない**（Air Balance は MPC の cost だけ） | Baseline が最も単純なまま。characterization の誤りが Baseline に届かない | Baseline が動く時間のほとんどで Air Balance が効かず、#81 の協調（Front make-up air）が FULL まで実現しない。上限と shadow で Baseline への影響を閉じられるので、掛けない理由が弱い。**所有者がこちらを選ぶ場合は、本記録を Rejected にし 0073 §5 の1行目を「掛けない」で閉じる記録にする。所有者の判断 1 で選べる** |
+| **A. Fallback には掛けない**（Air Balance は MPC の cost だけ） | Baseline が最も単純なまま。characterization の誤りが Baseline に届かない | Baseline が動く時間のほとんどで Air Balance が効かず、#81 の協調（Front make-up air）が FULL まで実現しない。上限と shadow で Baseline への影響を閉じられるので、掛けない理由が弱い。所有者は判断 1 で推奨案（掛ける）を採った（2026-09-30） |
 | B. Gate の後で、選ばれた requested（Fallback でも MPC でも）に掛ける | 1か所で全制御器に効く | MPC は balance の項を cost に持つので二重に数える。authority の帯と昇格の証拠の外で MPC の出力を変える |
 | C. 合成の後（effective）や Backend の直前で足す | 実際の値に直接効く | AGENTS.md ルール2・5 と 0028 §2.3 に反する。Guard の ceiling と `ramp_down` の外で値が変わる。**禁止** |
 | D. `FallbackController` の中で掛ける | 部品が増えない | 最後の拠り所が characterization に依存し、raw baseline を記録できない。Fallback の `decrease_hold` と協調の保持が絡む |
-| E. `calibrated` になったら shadow 無しで即適用（0073 の `source.status` だけで決める） | 設定が1つ減る | 校正の存在は制御の効果を示さない。実 Fan を変える前に shadow で確かめる段を飛ばす。**所有者の判断 2 で選べる** |
+| E. `calibrated` になったら shadow 無しで即適用（0073 の `source.status` だけで決める） | 設定が1つ減る | 校正の存在は制御の効果を示さない。実 Fan を変える前に shadow で確かめる段を飛ばす。所有者は判断 2 で推奨案を採った（2026-09-30） |
 | F. 有効化のフラグを `air-balance.yaml` に置く | Air Balance の設定が1ファイルにまとまる | `air-balance.yaml` は #75 の測定の成果物（characterization）で、制御の方針ではない。0073 §4 が Air Balance の有効化に別フラグを置かないと決めたのと混ざる |
 | G. 上限を設けない（`coordinate()` の目標まで上げる） | 目標比に最も早く届く | 曲線の外れ1つで Front が 1.0 へ跳ぶ。騒音と影響の幅を設定で閉じられない |
 | H. 双方向に掛ける（Intake 過多で Front を下げるなど） | 騒音を下げられる | 既存の不変条件（協調は cooling demand を下げない）に反する。まだ検証されない model で冷却を下げる |
-| I. `apply` の協調の例外でも raw baseline のまま続け、Safety へつながない | Air Balance の不具合で Max の騒音が続かない。raw baseline はいまの承認済みの挙動 | 0028 §2.7（FINAL）は決定論的な層の例外を全 zone Max にすると決めており、`apply` の協調はその層である。選ぶなら 0028 §2.7 の一部を置き換える記録にし、0028 へ `Superseded by` を追記する必要がある（本記録は `Supersedes: なし`）。**所有者の判断 4 で選べる** |
-| J. `shadow` / `apply` + `uncalibrated` を黙って `off` として起動 | 起動が止まらない | 協調を掛けたつもりで掛かっていない状態が見えにくい（0073 §2.2 が「無い」を「無効」と読まない理由と同じ）。**所有者の判断 3 で選べる** |
-| K. LIMITED / EXPANDED の帯の中心を raw baseline にする | MPC の自由度を変えない | Gate が Fallback を選んだときの値（coordinated）と、帯の基準（raw）が別の Baseline になり、「Baseline」が2つの意味を持つ |
+| I. `apply` の協調の例外でも raw baseline のまま続け、Safety へつながない | Air Balance の不具合で Max の騒音が続かない。raw baseline はいまの承認済みの挙動 | 0028 §2.7（FINAL）は決定論的な層の例外を全 zone Max にすると決めており、`apply` の協調はその層である。選ぶなら 0028 §2.7 の一部を置き換える記録にし、0028 へ `Superseded by` を追記する必要がある（本記録は `Supersedes: なし`）。所有者は判断 4 で推奨案を採った（2026-09-30） |
+| J. `shadow` / `apply` + `uncalibrated` を黙って `off` として起動 | 起動が止まらない | 協調を掛けたつもりで掛かっていない状態が見えにくい（0073 §2.2 が「無い」を「無効」と読まない理由と同じ）。所有者は判断 3 で推奨案を採った（2026-09-30） |
+| K. LIMITED / EXPANDED の帯の中心を raw baseline にする | MPC の自由度を変えない | Gate が Fallback を選んだときの値（coordinated）と、帯の基準（raw）が別の Baseline になり、「Baseline」が2つの意味を持つ。所有者は判断 7 で推奨案を採った（2026-09-30） |
 | L. 前 tick の applied demand（実測側）を基準に協調する | 実際に回った風量に近い | 1 tick 遅れの帰還になり、協調自身の出力を次の入力にする。candidate を `stable_demands()` に通せば backend の引き上げは反映できる |
+| Q. Top の風量を requested（と Safety の floor）だけで見積もる | 合成の状態を読まない | ramp-down の途中は実際の排気が requested より大きく、Front make-up air を足し損ねる（最終レビュー 765c728 の指摘1） |
+| R. tach の無応答は `stall_window_ms` で確定した `TACH_STALL` だけを見る | Critical Safety の裁定に欄を足さない | 確定までの窓の間、tach が返らない Fan を demand から見積もって協調する（同 指摘2） |
+| S. trace には `max_raise` の値を載せず、`fan-policy.yaml` の hash と `bounded_by_max_raise` だけにする | trace が小さい | trace だけで `output - candidate <= max_raise` を検査できない（同 指摘3） |
 | M. 協調専用の Telemetry 鮮度の閾値を持つ | 明示的 | 0073 §2.4 の入力契約と二重になる。stale は `None` になり、熱による引き上げは起きない側に倒れる |
-| O. どの zone でも Critical Safety の `forced_max` があれば `skipped` にする | 単純。Safety が Max を握る tick に協調を重ねない | CPU Telemetry の stale で Top だけが Max になる `DEGRADED` の最中こそ排気過多で Front make-up air が要る（Codex #4141058794）。Top は 1.0 と見積もれば足りる。**所有者の判断 6 で選べる** |
-| P. 昇格の証拠を `fan-policy.yaml` の trace に束縛しない（0073 §5 の未決のまま） | 評価報告の版上げが要らない | `mode: off` の trace を `mode: apply` の設定で評価した報告が照合を通り、raw baseline の証拠が coordinated baseline の証拠を名乗れる。LIMITED / EXPANDED の帯の中心が変わるので MPC の評価も変わる。**所有者の判断 5 で選べる** |
-| N. 0057 の authority journal で協調の段（shadow / apply）を管理する | 昇格の仕組みを再利用できる | journal は Learned MPC の制御権のためのもので、決定論的な Baseline の方針を混ぜると役割が混ざる（AGENTS.md ルール5）。設定と再起動で足りる。**所有者の判断 2 で選べる** |
+| O. どの zone でも Critical Safety の `forced_max` があれば `skipped` にする | 単純。Safety が Max を握る tick に協調を重ねない | CPU Telemetry の stale で Top だけが Max になる `DEGRADED` の最中こそ排気過多で Front make-up air が要る（Codex #4141058794）。Top は 1.0 と見積もれば足りる。所有者は判断 6 で推奨案を採った（2026-09-30） |
+| P. 昇格の証拠を `fan-policy.yaml` の trace に束縛しない（0073 §5 の未決のまま） | 評価報告の版上げが要らない | `mode: off` の trace を `mode: apply` の設定で評価した報告が照合を通り、raw baseline の証拠が coordinated baseline の証拠を名乗れる。LIMITED / EXPANDED の帯の中心が変わるので MPC の評価も変わる。所有者は判断 5 で推奨案を採った（2026-09-30） |
+| N. 0057 の authority journal で協調の段（shadow / apply）を管理する | 昇格の仕組みを再利用できる | journal は Learned MPC の制御権のためのもので、決定論的な Baseline の方針を混ぜると役割が混ざる（AGENTS.md ルール5）。設定と再起動で足りる。所有者は判断 2 で推奨案を採った（2026-09-30） |
 
 ## 5. 未決事項
 
 | 論点 | どこで決めるか | 実測待ちか |
 |---|---|---|
-| `max_raise` の zone ごとの値（最初の apply で Top を 0 にするかを含む） | 段 2 の承認時（PR か決定記録） | **#75 の B と shadow の集計を待つ** |
+| `max_raise` の zone ごとの値（最初の apply の Top は 0 と決定済み。所有者の判断 9） | 段 2 の承認時（PR か決定記録） | **#75 の B と shadow の集計を待つ** |
 | `release_hold_ms` の値 | 同上 | **#75 の RPM 応答時間を待つ** |
 | `balance` の target / min / max、`thermal_inputs` の束縛、`thermal_limits`（0073 §5 から継続） | #75 / #81 の実測後、`air-balance.yaml` の値として | **#75 の A を待つ** |
-| shadow → apply の合否の基準（期間、引き上げの頻度・大きさの上限、`not_needed` ↔ `applied` の切り替わりの回数、熱の指標との対応） | 段 6 の前に所有者と（決定記録か PR） | **shadow の実データを待つ** |
+| shadow → apply の合否の基準（期間、引き上げの頻度・大きさの上限、`not_needed` ↔ `applied` の切り替わりの回数、熱の指標との対応）。shadow の実データを見てから決めることは決定済み（所有者の判断 10） | 段 6 の前に所有者と（決定記録か PR） | **shadow の実データを待つ** |
 | shadow の集計の道具（新しい CLI か、#91 の offline 評価に足すか） | 実装の段 4 | いいえ |
-| shadow の `counterfactual_output` は開ループ（Fan は raw baseline のまま）の値で、apply の閉ループ（上げた Fan が次の熱の入力を変える）は再現しない。その差を合否の基準でどう扱うか | 段 6 の前に所有者と | **shadow の実データを待つ** |
+| shadow の `counterfactual_output` は開ループ（Fan は raw baseline のまま）の値で、apply の閉ループ（上げた Fan が次の熱の入力を変える）は再現しない。その差を合否の基準でどう扱うか（合否の基準と一緒に決めることは決定済み。所有者の判断 10） | 段 6 の前に所有者と | **shadow の実データを待つ** |
 | offline 評価の Baseline の arm が coordinated baseline を再現する形（0054 の attribution との関係） | #91 | いいえ |
 | 協調の側に帯のヒステリシス（戻る側の閾値を target 寄りにする等）を持たせるか | shadow の集計で `release_hold_ms` だけでは切り替わりが多いと分かった場合、別の記録 | **shadow の実データを待つ** |
 | `safety.yaml` の trace との束縛（0073 §5 の残り） | 別の記録（本記録は `fan-policy.yaml` だけを決める。§2.5） | いいえ |
