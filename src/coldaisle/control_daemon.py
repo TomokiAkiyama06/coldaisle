@@ -72,6 +72,7 @@ from coldaisle.control.loop import (
     air_balance_input_metrics,
     build_input_contract,
 )
+from coldaisle.control.operating_mode import AdminAuthorityCommand
 from coldaisle.control.reactive.guard import ReactiveGuard
 from coldaisle.control.safety.critical import (
     ControlRuntimeBinding,
@@ -476,16 +477,53 @@ class ControlDaemon:
 
         ``drain=False`` は `run()` が例外で抜けたとき。管理ソケットのスレッドを待たずに閉じ、
         process の終了（引き継ぎで Max。0028 §2.7）を遅らせない。
+
+        受付スレッドを止めたあとで authority の枠に残っていた降格は、`AuthorityRuntime` へ
+        入れてから既存の1回だけの書き残しに回す（SIGTERM が置いた直後に来ても、受理した
+        降格を捨てない。0072 §2.6）。
         """
+        leftover: AdminAuthorityCommand | None = None
         if self.admin is not None:
-            self.admin.stop(drain=drain)
+            leftover = self.admin.stop(drain=drain)
             self.admin = None
         if self.authority is not None:
+            if leftover is not None:
+                self._lower_left_in_mailbox(leftover, drain=drain)
             self._flush_authority(drain=drain)
             self.authority = None
+        elif leftover is not None:
+            _log_lowering_lost(leftover, "authority runtime が無い")
         if self.store is not None:
             self.store.close()
             self.store = None
+
+    def _lower_left_in_mailbox(self, command: AdminAuthorityCommand, *, drain: bool) -> None:
+        """どの tick にも取り出されなかった管理ソケットの降格を、停止の前に入れる（0072 §2.6）。
+
+        tick の経路と同じく、いまの stage と比べずに**無条件で**上限として入れる。journal へは
+        続く `_flush_authority()` が書く。監査には `applied` を足さない（`applied` は適用した
+        tick を持つ事象で、この降格はどの tick でも効いていない）。受付の行だけがある
+        「受理済み・未確定」として残り、journal の人の event と構造化ログで追える。
+        """
+        assert self.authority is not None
+        try:
+            changed = self.authority.apply_lowering(
+                to_stage=command.to_stage, actor=command.actor, reason=command.journal_reason()
+            )
+        except Exception:
+            LOGGER.exception(
+                "停止時に control-admin の authority の降格を入れられなかった（再起動で戻る）",
+                extra={logs.FIELDS_KEY: _lowering_fields(command)},
+            )
+            return
+        LOGGER.warning(
+            "停止時に、tick に取り出されなかった control-admin の authority の降格を入れた",
+            extra={logs.FIELDS_KEY: {**_lowering_fields(command), "changed": changed}},
+        )
+        if not drain:
+            # 例外での停止では journal へ書かない（下の `_flush_authority`）。何が残ったかを
+            # 主体と理由つきで残す
+            _log_lowering_lost(command, "例外での停止のため journal へ書かない")
 
     def _flush_authority(self, *, drain: bool) -> None:
         """書き残せていない降格を、停止の前に1回だけ書き直す（lock の待ち上限つき）。
@@ -555,6 +593,23 @@ class ControlDaemon:
                 }
             },
         )
+
+
+def _lowering_fields(command: AdminAuthorityCommand) -> dict[str, object]:
+    return {
+        "command_id": command.command_id,
+        "op": command.op,
+        "to_stage": command.to_stage.value,
+        "actor": command.actor,
+        "reason": command.reason[:500],
+    }
+
+
+def _log_lowering_lost(command: AdminAuthorityCommand, why: str) -> None:
+    LOGGER.error(
+        "停止までに control-admin の authority の降格を journal へ書き残せなかった（再起動で戻る）",
+        extra={logs.FIELDS_KEY: {**_lowering_fields(command), "why": why}},
+    )
 
 
 def build(

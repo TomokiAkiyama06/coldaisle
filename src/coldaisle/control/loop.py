@@ -930,7 +930,7 @@ class ControlLoop:
                 changed = self._authority.apply_lowering(
                     to_stage=command.to_stage,
                     actor=command.actor,
-                    reason=f"control_admin command_id={command.command_id}: {command.reason}",
+                    reason=command.journal_reason(),
                 )
             except Exception:
                 LOGGER.exception(

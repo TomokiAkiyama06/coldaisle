@@ -27,6 +27,7 @@ from typing import Any
 import pytest
 from pydantic import ValidationError
 
+from coldaisle import logs
 from coldaisle.clock import SimulatedClock, SystemMonotonicClock
 from coldaisle.control.authority import (
     AUTHORITY_STATE_FILENAME,
@@ -908,6 +909,164 @@ def test_the_daemon_close_logs_a_lowering_it_could_not_write(tmp_path, held_lock
 
     assert other_store(tmp_path).read().stage is AuthorityStage.FULL
     assert any("再起動で戻る" in record.getMessage() for record in caplog.records)
+
+
+class LeftoverAdmin:
+    """停止の手順で、どの tick にも取り出されなかった降格を返す管理ソケットの代わり。"""
+
+    def __init__(self, command: AdminAuthorityCommand | None) -> None:
+        self.command = command
+        self.drains: list[bool] = []
+
+    def stop(self, *, drain: bool = True) -> AdminAuthorityCommand | None:
+        self.drains.append(drain)
+        return self.command
+
+
+def leftover_lowering(command_id: int = 7) -> AdminAuthorityCommand:
+    return AdminAuthorityCommand(
+        command_id=command_id,
+        op="lower_authority",
+        to_stage=AuthorityStage.LIMITED,
+        actor=ACTOR,
+        reason="停止の直前に届いた",
+    )
+
+
+@needs_peercred
+def test_the_daemon_close_persists_a_lowering_left_in_the_mailbox(short_dir, rules, tmp_path):
+    """SIGTERM が枠に置かれた直後に来ても、受理した降格を journal へ書き残す（0072 §2.6）。"""
+    from coldaisle.control_admin import runtime as admin_runtime
+    from coldaisle.control_daemon import ControlDaemon
+
+    running = RunningEntry(short_dir, rules)
+    runtime = raised_runtime(tmp_path, stage=AuthorityStage.FULL)
+    running.send_async(LOWER)
+    wait_until(lambda: running.mailbox._authority is not None)
+    wait_until(lambda: [row[:2] for row in running.rows()] == [("accepted", 1)])
+    admin = admin_runtime.ControlAdminEntry(
+        settings=running.settings,
+        mailbox=running.mailbox,
+        server=running.server,
+        audit=running.audit,
+        tracker=running.tracker,
+        run_id=RUN_ID,
+        shutdown_wait_ms=3_000,
+    )
+    daemon = ControlDaemon(
+        loop=None,  # type: ignore[arg-type]
+        monotonic=SystemMonotonicClock(),
+        admin=admin,
+        authority=runtime,
+    )
+    try:
+        daemon.close(drain=True)
+    finally:
+        running.pool.shutdown(wait=False, cancel_futures=True)
+
+    journal = other_store(tmp_path).read()
+    assert journal.stage is AuthorityStage.LIMITED, "再起動しても降格した stage で始まる"
+    event = journal.events[-1]
+    assert event.trigger is AuthorityTrigger.HUMAN
+    assert event.actor == f"uid.{os.getuid()}"
+    assert "command_id=1" in event.reason
+    assert runtime.pending_stages == ()
+    # どの tick でも効いていないので `applied` は足さない（受理済み・未確定のまま）
+    assert [row[:2] for row in running.rows()] == [("accepted", 1)]
+
+
+def test_the_daemon_close_logs_a_left_lowering_it_could_not_write_within_the_bound(
+    tmp_path, held_lock, caplog
+):
+    from coldaisle.control_daemon import ControlDaemon
+
+    runtime = raised_runtime(tmp_path, stage=AuthorityStage.FULL)
+    held_lock.hold()
+    daemon = ControlDaemon(
+        loop=None,  # type: ignore[arg-type]
+        monotonic=SystemMonotonicClock(),
+        admin=LeftoverAdmin(leftover_lowering()),  # type: ignore[arg-type]
+        authority=runtime,
+    )
+
+    started = time.monotonic()
+    with caplog.at_level("WARNING"):
+        daemon.close(drain=True)
+    elapsed = time.monotonic() - started
+
+    # 待つのは既存の書き残し1回ぶん（lock の待ち上限 500 ms）だけ
+    assert elapsed < 2.0
+    assert other_store(tmp_path).read().stage is AuthorityStage.FULL
+    assert runtime.current_stage() is AuthorityStage.LIMITED, "memory 上では下げてから止まる"
+    lost = [
+        record
+        for record in caplog.records
+        if record.levelname == "ERROR" and "再起動で戻る" in record.getMessage()
+    ]
+    assert lost
+    fields = getattr(lost[-1], logs.FIELDS_KEY)
+    assert fields["to_stage"] == "limited"
+    assert fields["actor"] == ACTOR
+    assert "command_id=7" in fields["reason"]
+
+
+def test_the_daemon_close_after_an_exception_logs_a_left_lowering_without_waiting(
+    tmp_path, held_lock, caplog
+):
+    from coldaisle.control_daemon import ControlDaemon
+
+    runtime = raised_runtime(tmp_path, stage=AuthorityStage.FULL)
+    held_lock.hold()
+    admin = LeftoverAdmin(leftover_lowering())
+    daemon = ControlDaemon(
+        loop=None,  # type: ignore[arg-type]
+        monotonic=SystemMonotonicClock(),
+        admin=admin,  # type: ignore[arg-type]
+        authority=runtime,
+    )
+
+    started = time.monotonic()
+    with caplog.at_level("ERROR"):
+        daemon.close(drain=False)
+    elapsed = time.monotonic() - started
+
+    assert admin.drains == [False]
+    assert elapsed < 0.4, "例外での停止では lock を待たない"
+    assert other_store(tmp_path).read().stage is AuthorityStage.FULL
+    fields = [
+        getattr(record, logs.FIELDS_KEY)
+        for record in caplog.records
+        if record.levelname == "ERROR" and "再起動で戻る" in record.getMessage()
+    ]
+    assert any(
+        item.get("command_id") == 7
+        and item.get("to_stage") == "limited"
+        and item.get("actor") == ACTOR
+        and item.get("reason") == "停止の直前に届いた"
+        for item in fields
+    )
+
+
+def test_the_admin_entry_stop_hands_back_the_authority_slot_and_drops_the_mode_slot():
+    from unittest.mock import MagicMock
+
+    from coldaisle.control_admin import runtime as admin_runtime
+
+    mailbox = AdminMailbox()
+    command = leftover_lowering(command_id=3)
+    assert isinstance(mailbox.place_authority(command), Placed)
+    admin = admin_runtime.ControlAdminEntry(
+        settings=MagicMock(),
+        mailbox=mailbox,
+        server=MagicMock(),
+        audit=MagicMock(failures=0),
+        tracker=MagicMock(),
+        run_id=RUN_ID,
+        shutdown_wait_ms=100,
+    )
+
+    assert admin.stop(drain=False) == command
+    assert mailbox.take() == MailboxTake(), "取り出した後の枠は空"
 
 
 # ================================================================ 8. 構造（0072 §2.9）

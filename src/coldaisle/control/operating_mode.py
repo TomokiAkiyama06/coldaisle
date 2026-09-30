@@ -142,6 +142,10 @@ class AdminAuthorityCommand(BaseModel):
             raise ValueError("rollback_authority は Baseline（SHADOW）へ戻す")
         return self
 
+    def journal_reason(self) -> str:
+        """journal の event に残す理由（`command_id` と入力した理由。0072 §2.7）。"""
+        return f"control_admin command_id={self.command_id}: {self.reason}"
+
     def deeper_than(self, other: AdminAuthorityCommand) -> bool:
         """`other` より低い行き先か（枠の合成は**最も低い行き先**を採る。0072 §2.2）。"""
         return stage_rank(self.to_stage) < stage_rank(other.to_stage)
