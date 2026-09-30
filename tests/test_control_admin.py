@@ -17,6 +17,7 @@ import errno
 import grp
 import json
 import os
+import pwd
 import selectors
 import shutil
 import socket
@@ -187,6 +188,40 @@ def test_the_default_admin_config_does_not_admit_the_same_uid():
         group_gid=unused_gid,
     )
     assert not authorizer.allows(os.geteuid())
+
+
+def test_the_server_uid_is_refused_before_the_group_check_even_as_a_member():
+    """fand はグループの付け替えのためにそのグループへ入るが、同じ uid は拒否（0080 §2.1）。"""
+    from coldaisle.local_socket import Authorizer
+
+    me = pwd.getpwuid(os.geteuid())
+    member_of_the_group = Authorizer(
+        server_uid=os.geteuid(), allow_same_user=False, group_gid=me.pw_gid
+    )
+    assert not member_of_the_group.allows(os.geteuid())
+
+
+def test_the_server_uid_is_allowed_only_when_same_user_is_allowed():
+    from coldaisle.local_socket import Authorizer
+
+    me = pwd.getpwuid(os.geteuid())
+    assert Authorizer(server_uid=os.geteuid(), allow_same_user=True, group_gid=None).allows(
+        os.geteuid()
+    )
+    assert Authorizer(server_uid=os.geteuid(), allow_same_user=True, group_gid=me.pw_gid).allows(
+        os.geteuid()
+    )
+
+
+def test_another_uid_in_the_group_is_still_allowed_when_same_user_is_not():
+    from coldaisle.local_socket import Authorizer
+
+    me = pwd.getpwuid(os.geteuid())
+    server_elsewhere = Authorizer(
+        server_uid=os.geteuid() + 4242, allow_same_user=False, group_gid=me.pw_gid
+    )
+    assert server_elsewhere.allows(os.geteuid())
+    assert not server_elsewhere.allows(0), "root を暗黙に認めない"
 
 
 def test_the_dev_config_differs_from_the_default_only_in_who_may_connect():

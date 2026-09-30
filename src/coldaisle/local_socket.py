@@ -127,6 +127,11 @@ class Authorizer:
 
     root を暗黙に認めない。グループの判定は接続のたびに引き直すので、
     グループから外した利用者はサーバを再起動しなくても書けなくなる。
+
+    ``allow_same_user`` が false のとき、サーバと同じ uid は**グループの判定より前に**
+    拒否する。サーバのユーザーがそのグループのメンバーでも同じ（決定記録 0080 §2.1）。
+    `coldaisle-fand` はソケットのグループを付け替えるためにそのグループへ入るので、
+    グループの判定だけでは fand と同じ uid で動く任意のプロセスが管理操作を送れてしまう。
     """
 
     server_uid: int
@@ -135,8 +140,8 @@ class Authorizer:
 
     def allows(self, uid: int) -> bool:
         """この uid の接続を受けてよいか。"""
-        if self.allow_same_user and uid == self.server_uid:
-            return True
+        if uid == self.server_uid:
+            return self.allow_same_user
         if self.group_gid is None:
             return False
         try:
