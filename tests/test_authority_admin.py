@@ -587,24 +587,55 @@ def test_a_dead_receiver_still_hands_over_a_lowering_it_had_placed(catalog, tmp_
     assert journal.stage is AuthorityStage.SHADOW, "再起動しても降格した stage で始まる"
     assert "command_id=2" in journal.events[-1].reason
 
-    # 2 tick 目以降は読まない
+    # 取り出せた後は読まない
     mailbox.pending_authority = authority_command(3, AuthorityStage.SHADOW)
     later = harness.tick().tick
     assert later.authority is not None and later.authority.command_id is None
     assert mailbox.pending_authority is not None
 
 
-def test_a_dead_receiver_with_a_locked_mailbox_still_forces_max(catalog, tmp_path):
+def test_a_dead_receiver_retries_the_drain_until_the_lock_is_free(catalog, tmp_path):
+    """lock を取れなかった tick の後も、取り出せるまで毎 tick 試す（決定記録 0081）。"""
     harness, mailbox, _runtime = journal_harness(catalog, tmp_path)
     harness.tick()
     mailbox.pending_authority = authority_command(2, AuthorityStage.SHADOW)
     mailbox.locked = True
     mailbox.alive = False
 
-    tick = harness.tick().tick
+    for _ in range(3):
+        tick = harness.tick().tick
+        assert tick.state.operating_mode is OperatingMode.MAX
+        assert tick.state.authority_stage is AuthorityStage.FULL
 
-    assert tick.state.operating_mode is OperatingMode.MAX
-    assert tick.state.authority_stage is AuthorityStage.FULL
+    mailbox.locked = False
+    drained = harness.tick().tick
+    assert drained.state.operating_mode is OperatingMode.MAX
+    assert drained.state.authority_stage is AuthorityStage.SHADOW
+    assert drained.authority is not None and drained.authority.command_id == 2
+    assert other_store(tmp_path).read().stage is AuthorityStage.SHADOW
+
+    # 取り出せた後は読まない
+    mailbox.pending_authority = authority_command(3, AuthorityStage.SHADOW)
+    harness.tick()
+    assert mailbox.pending_authority is not None
+
+
+def test_a_dead_receiver_retries_the_drain_after_an_exception(catalog, tmp_path):
+    harness, mailbox, _runtime = journal_harness(catalog, tmp_path)
+    harness.tick()
+    mailbox.pending_authority = authority_command(2, AuthorityStage.SHADOW)
+    mailbox.alive = False
+    original = mailbox.take
+
+    def broken() -> Any:
+        raise RuntimeError("読めない")
+
+    mailbox.take = broken  # type: ignore[method-assign]
+    assert harness.tick().tick.state.operating_mode is OperatingMode.MAX
+
+    mailbox.take = original  # type: ignore[method-assign]
+    drained = harness.tick().tick
+    assert drained.state.authority_stage is AuthorityStage.SHADOW
 
 
 def test_an_external_change_takes_effect_from_the_next_tick(catalog, tmp_path):
