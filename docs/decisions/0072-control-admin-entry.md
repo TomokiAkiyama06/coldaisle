@@ -4,7 +4,7 @@
 - **Status**: FINAL（2026-09-29、リポジトリ所有者が承認）
 - **Date**: 2026-09-29
 - **Supersedes**: なし
-- **Superseded by**: [0076](0076-implementation-settled-points.md)（§2.3 の「応答」の項のうち、受理の応答の形のみ。§2.2 の `superseded` になった指令の受理の応答に `superseded_by`（置き換えた指令の `command_id`）を加える。§2.3 の残りと他の節は有効） / [0081](0081-drain-authority-on-receiver-death.md)（§2.2 の「死んだあとは受け渡し口を読まない」のうち authority の枠に残った降格のみ。死を検知した tick で authority の枠だけを1回取り出して journal へ書き残す。モードの枠と他の節は有効）
+- **Superseded by**: [0076](0076-implementation-settled-points.md)（§2.3 の「応答」の項のうち、受理の応答の形のみ。§2.2 の `superseded` になった指令の受理の応答に `superseded_by`（置き換えた指令の `command_id`）を加える。§2.3 の残りと他の節は有効） / [0081](0081-drain-authority-on-receiver-death.md)（§2.2 の「死んだあとは受け渡し口を読まない」のうち authority の枠に残った降格のみ。死を検知したら authority の枠だけを取り出せるまで試して journal へ書き残す。モードの枠と他の節は有効）
 - **関連**: [0009](0009-read-api.md) §3（GET-only） /
   [0015](0015-llm-tools.md) / [0018](0018-tool-exposure.md) /
   [0027](0027-fan-control-architecture.md) §2.3（Manual safety override は Critical Safety の持ち物） /
