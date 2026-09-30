@@ -326,7 +326,7 @@ coldaisle のエアフロー画面（`/airflow.html`、#106）が使う**表示�
   "schema_version": 1,
   "air_temperature": {"unit": "C", "thresholds_c": [27.0, 28.0, 29.0, 30.0], "provisional": true},
   "cpu_utilization": {"measured": true},
-  "control_trace": {"stale_after_tick_periods": 3.0, "provisional": true}
+  "control_trace": {"stale_after_tick_periods": 3.0, "provisional": false}
 }
 ```
 
@@ -347,8 +347,9 @@ coldaisle のエアフロー画面（`/airflow.html`、#106）が使う**表示�
 決定記録 0071 §2.6 / §5 #1）。`GET /api/v1/control/latest` の `age_ms` が、その trace 自身の
 `body.runtime.tick_period_ms`（v8 以降）のこの倍を超えたら、画面は「古い」と出し、制御の状態を
 いまの状態として見せません（正常の緑を外し、値に取り消し線を引く）。v1〜v7 の trace は周期を持たないので
-経過時間だけを出し、`age_ms` が負のときは判定不能とします。1 より大きい有限の値で、
-`provisional: true` の間は仮の値です。**API は古さを判定しません**（`safety.yaml` も読みません）。
+経過時間だけを出し、`age_ms` が負のときは判定不能とします。1 より大きい有限の値です。
+出荷時の `3.0` は確定値です（決定記録 0071 §5 #1 が #106 に委ねた値を、2026-09-30 にオーナーが確定。
+`provisional: false`）。**API は古さを判定しません**（`safety.yaml` も読みません）。
 
 ### `GET /api/v1/events`
 

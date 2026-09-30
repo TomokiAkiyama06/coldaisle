@@ -717,16 +717,29 @@ def test_a_v11_tick_cannot_carry_a_mode_command():
 
 
 class GatedSink:
-    """監査の DB の代わり。`gate` が開くまで書き込みを待たせ、`fail` なら失敗させる。"""
+    """監査の DB の代わり。`gate` が開くまで書き込みを待たせ、`fail` なら失敗させる。
 
-    def __init__(self, db: Path, rules: QualityRules, gate: threading.Event, fail: bool) -> None:
+    書き込みに入ったら `writing` を立てる。監査書き込みスレッドが依頼を queue から取り出した
+    ことを、試験が時間ではなくこの合図で待てるようにする。
+    """
+
+    def __init__(
+        self,
+        db: Path,
+        rules: QualityRules,
+        gate: threading.Event,
+        writing: threading.Event,
+        fail: bool,
+    ) -> None:
         self._store = SqliteStore(db, rules=rules, clock=SimulatedClock(TEST_EPOCH_MS))
         self._gate = gate
+        self._writing = writing
         self._fail = fail
 
     def record_control_admin_audit(
         self, record: ControlAdminAuditRecord
     ) -> ControlAdminAuditRecord:
+        self._writing.set()
         self._gate.wait(timeout=10)
         if self._fail:
             raise sqlite3.OperationalError("database is locked")
@@ -753,9 +766,11 @@ class RunningEntry:
         self.db = directory / "audit.db"
         self.gate = threading.Event()
         self.gate.set()
+        self.writing = threading.Event()
+        """監査書き込みスレッドが1件目の依頼を取り出して書き込みに入った。"""
         self.mailbox = AdminMailbox()
         self.audit = AuditWriter(
-            open_sink=lambda: GatedSink(self.db, rules, self.gate, audit_fails),
+            open_sink=lambda: GatedSink(self.db, rules, self.gate, self.writing, audit_fails),
             queue_max=self.settings.limits.audit_queue_max,
             on_done=self.mailbox.wake,
         )
@@ -881,7 +896,7 @@ def test_stopping_without_drain_does_not_wait_for_a_blocked_audit(short_dir, rul
     running = RunningEntry(short_dir, rules, apply_ack_timeout_ms=3_000)
     running.gate.clear()  # 監査の DB が lock されている
     running.send_async(AUTO)
-    time.sleep(0.2)  # 監査書き込みスレッドが gate で止まるまで
+    assert running.writing.wait(timeout=5), "監査書き込みスレッドが gate で止まるまで"
     admin = admin_runtime.ControlAdminEntry(
         settings=running.settings,
         mailbox=running.mailbox,
@@ -1059,6 +1074,9 @@ def test_a_full_audit_queue_refuses_weakening_but_still_applies_max(short_dir, r
         running.gate.clear()
         blocked = running.send_async(AUTO)  # 書き込み中で止まる
         wait_until(lambda: 1 in running.server._auditing)
+        # 1件目が queue に残ったままだと、2件目は queue の1枠に入れず audit_unavailable で
+        # 拒否され、`_auditing` に入らない。書き込みスレッドが取り出して gate で止まるまで待つ
+        assert running.writing.wait(timeout=5), "監査書き込みスレッドが1件目を取り出していない"
         queued = running.send_async(AUTO)  # queue の1枠を埋める
         wait_until(lambda: 2 in running.server._auditing)
         assert running.send(manual_body()) == {"ok": False, "error": "audit_unavailable"}
@@ -1328,10 +1346,10 @@ def test_a_thread_that_cannot_start_leaves_no_socket_and_no_thread(
     socket_path = short_dir / "run" / "admin.sock"
     config.write_text(yaml.safe_dump(admin_document(socket_path)), "utf-8")
     started: list[threading.Thread] = []
+    # 前の試験（drain=False の停止など）が残した daemon thread は数えない。この試験が起動した
+    # スレッドだけを見る
+    earlier = set(threading.enumerate())
     original_start = threading.Thread.start
-    # 前の試験が drain なしで止めた受付スレッド（daemon thread）が残っていることがある。
-    # この試験が確かめるのは「この起動の試みがスレッドを残さない」ことなので、既存のものは除く
-    existing = set(threading.enumerate())
 
     def start(self: threading.Thread) -> None:
         if self.name == failing:
@@ -1347,7 +1365,8 @@ def test_a_thread_that_cannot_start_leaves_no_socket_and_no_thread(
     assert not any(thread.is_alive() for thread in started)
     assert not any(
         thread.name.startswith("control-admin") and thread.is_alive()
-        for thread in set(threading.enumerate()) - existing
+        for thread in threading.enumerate()
+        if thread not in earlier
     )
     assert any(
         "スレッドを起動できない" in getattr(record, "fields", {}).get("reason", "")
