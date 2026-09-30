@@ -221,7 +221,10 @@ def test_another_uid_in_the_group_is_still_allowed_when_same_user_is_not():
         server_uid=os.geteuid() + 4242, allow_same_user=False, group_gid=me.pw_gid
     )
     assert server_elsewhere.allows(os.geteuid())
-    assert not server_elsewhere.allows(0), "root を暗黙に認めない"
+    # root の確認はグループを持たない認可で行う（root で試験を走らせると、自分の主グループが
+    # root のグループになり、上の設定では root もメンバーとして正しく認められるため）
+    no_group = Authorizer(server_uid=os.geteuid() + 4242, allow_same_user=False, group_gid=None)
+    assert not no_group.allows(0), "root を暗黙に認めない"
 
 
 def test_the_dev_config_differs_from_the_default_only_in_who_may_connect():
