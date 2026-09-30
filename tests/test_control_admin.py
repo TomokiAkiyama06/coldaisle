@@ -262,11 +262,25 @@ def test_a_v1_config_is_refused_with_a_version_message(short_dir, rules, caplog)
     )
 
 
-@pytest.mark.parametrize("multiplier", [1, 1.0, 0.5, 0, -2])
-def test_an_accept_backoff_multiplier_must_grow(multiplier):
+@pytest.mark.parametrize(
+    "multiplier", [1, 1.0, 0.5, 0, -2, 16.5, 1e308, float("inf"), float("-inf"), float("nan")]
+)
+def test_an_accept_backoff_multiplier_must_grow_and_be_finite_and_bounded(multiplier):
     with pytest.raises(ValidationError, match="multiplier"):
         admin_settings(accept_backoff__multiplier=multiplier)
     admin_settings(accept_backoff__multiplier=1.5)
+    admin_settings(accept_backoff__multiplier=16)
+
+
+@pytest.mark.parametrize("literal", [".inf", ".nan", "-.inf"])
+def test_a_non_finite_multiplier_in_the_yaml_is_refused_at_load(short_dir, literal):
+    document = yaml.safe_dump(admin_document())
+    document = document.replace("multiplier: 2", f"multiplier: {literal}")
+    assert f"multiplier: {literal}" in document
+    config = short_dir / "control-admin.yaml"
+    config.write_text(document, "utf-8")
+    with pytest.raises(ValidationError, match="multiplier"):
+        ControlAdminSettings.from_yaml(config)
 
 
 def test_the_escalation_must_come_after_the_longest_backoff():
@@ -1040,6 +1054,24 @@ def test_the_backoff_grows_by_the_configured_multiplier():
         assert server._accept_backoff_ms is not None
         backoffs.append(server._accept_backoff_ms)
     assert backoffs == [100, 150, 225, 338, 507, 761, 1_000, 1_000]
+    server.close()
+
+
+@needs_peercred
+@pytest.mark.parametrize("multiplier", [1e308, float("inf"), float("nan")])
+def test_a_huge_multiplier_clamps_to_max_ms_without_raising(multiplier):
+    """起動時の検証を通り抜けた値でも、受付スレッドを落とさず `max_ms` で頭打ちにする。"""
+    monotonic = ManualMonotonicClock(0)
+    server = idle_server(monotonic, accept_backoff__initial_ms=100, accept_backoff__max_ms=1_000)
+    backoff = server._settings.accept_backoff.model_copy(update={"multiplier": multiplier})
+    server._settings = server._settings.model_copy(update={"accept_backoff": backoff})
+    backoffs: list[int] = []
+    for _ in range(4):
+        server._accept(FailingListener())  # type: ignore[arg-type]
+        assert server._accept_backoff_ms is not None
+        backoffs.append(server._accept_backoff_ms)
+    assert backoffs == [100, 1_000, 1_000, 1_000]
+    assert not server._accept_exhausted
     server.close()
 
 

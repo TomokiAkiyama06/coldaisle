@@ -349,11 +349,7 @@ class ControlAdminServer:
         """
         backoff = self._settings.accept_backoff
         previous = self._accept_backoff_ms
-        current = (
-            backoff.initial_ms
-            if previous is None
-            else min(math.ceil(previous * backoff.multiplier), backoff.max_ms)
-        )
+        current = backoff.initial_ms if previous is None else self._grow(previous)
         self._accept_backoff_ms = current
         self._accept_failures += 1
         self._accept_resume_mono_ms = self._monotonic.monotonic_ms() + current
@@ -425,6 +421,18 @@ class ControlAdminServer:
         if listener is not None:
             with contextlib.suppress(OSError):
                 listener.close()
+
+    def _grow(self, previous: int) -> int:
+        """次の休みの長さ。`max_ms` で頭打ちにし、桁あふれを受付の外へ出さない。
+
+        倍率は起動時に有限・上限付きで検証するが、ここでも float の積が inf / nan になる経路で
+        `math.ceil` の OverflowError / ValueError を起こさない（受付スレッドを落とさない）。
+        """
+        backoff = self._settings.accept_backoff
+        grown = previous * backoff.multiplier
+        if not math.isfinite(grown) or grown >= backoff.max_ms:
+            return backoff.max_ms
+        return min(math.ceil(grown), backoff.max_ms)
 
     def _on_accept_succeeded(self) -> None:
         """失敗が続いた後の成功で休みの長さと時間の起点を戻し、回復を1行だけ残す。"""

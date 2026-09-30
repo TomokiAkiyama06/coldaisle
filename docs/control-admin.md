@@ -65,7 +65,7 @@ uv run coldaisle-control auto --reason "比較の終了"
 | `apply_ack_timeout_ms` | `>= tick_ms + tick_deadline_ms`（起動時に照合） |
 | `manual.max_lease_s` | `status` / `basis` 付きの暫定値 |
 | `version` | `2`。v1 は読まない（下の「v1 からの移行」） |
-| `accept_backoff.initial_ms` / `max_ms` / `multiplier` | `accept()` が失敗し続けるときに待ち受けを休む間隔。`initial_ms <= max_ms <= tick_ms`（`safety.yaml` と起動時に照合）、`multiplier > 1`。`status` / `basis` 付きの暫定値 |
+| `accept_backoff.initial_ms` / `max_ms` / `multiplier` | `accept()` が失敗し続けるときに待ち受けを休む間隔。`initial_ms <= max_ms <= tick_ms`（`safety.yaml` と起動時に照合）、`1 < multiplier <= 16`（有限。inf / nan は拒否）。`status` / `basis` 付きの暫定値 |
 | `accept_backoff.escalate_after_ms` | 途切れない失敗がこの時間に届いたら受付スレッドを終わらせる（→ 再起動まで `MAX`）。`> max_ms` |
 
 ### v1 からの移行

@@ -57,7 +57,7 @@ manual:
 # 休んでいる間も**接続済みの接続は読み続ける**（max は遅れずに受け渡し口へ置く）。
 # 途切れずに escalate_after_ms 失敗し続けたら受付スレッドを終わらせ、loop が「受付スレッドの死」として
 # 再起動まで MAX にする（MANUAL は解除。decision trace に admin_receiver_dead）。
-# 規則: initial_ms <= max_ms <= **safety.yaml の tick_ms**（起動時に照合）、multiplier > 1、
+# 規則: initial_ms <= max_ms <= **safety.yaml の tick_ms**（起動時に照合）、1 < multiplier <= 16（有限）、
 # escalate_after_ms > max_ms。
 accept_backoff:
   initial_ms: 100

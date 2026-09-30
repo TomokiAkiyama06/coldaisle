@@ -82,8 +82,12 @@ class AcceptBackoff(_Strict):
     """最初の失敗のあとに待ち受けを休む時間（ミリ秒）。"""
     max_ms: int = Field(ge=1)
     """休む時間の上限（ミリ秒）。`initial_ms` 以上、`tick_ms` 以下（起動時に照合する）。"""
-    multiplier: float = Field(gt=1)
-    """失敗のたびに休む時間を何倍にするか。1 より大きい。"""
+    multiplier: float = Field(gt=1, le=16, allow_inf_nan=False)
+    """失敗のたびに休む時間を何倍にするか。1 より大きく 16 以下の有限の値。
+
+    上限は検証の規則（inf / nan / 桁外れの値を起動時に拒否する）。休む長さは `max_ms` で
+    頭打ちなので、16 倍を超える倍率に実用上の意味は無く、設定の誤りと見なす。
+    """
     escalate_after_ms: int = Field(ge=1)
     """途切れずに失敗し続けたら受付スレッドを終わらせる（→ `MAX`）までの時間。`max_ms` より長い。"""
     status: Literal["provisional", "confirmed"]
