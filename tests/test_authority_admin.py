@@ -30,6 +30,8 @@ from pydantic import ValidationError
 from coldaisle.clock import SimulatedClock, SystemMonotonicClock
 from coldaisle.control.authority import (
     AUTHORITY_STATE_FILENAME,
+    INVALID_LOWERING_ACTOR,
+    INVALID_LOWERING_REASON,
     AuthorityChangeKind,
     AuthorityJournal,
     AuthorityRuntime,
@@ -61,6 +63,8 @@ from coldaisle.metrics import MetricCatalog
 from test_authority_rollout import NOW_MS
 from test_authority_rollout import runtime as raised_runtime
 from test_control_admin import (
+    AUTO,
+    MAX,
     RUN_ID,
     FakeMailbox,
     RunningEntry,
@@ -205,11 +209,57 @@ def test_repeated_lowerings_do_not_pile_up_unbounded(tmp_path, held_lock):
     assert len(lowered) == 1
 
 
-def test_a_malformed_actor_is_refused_before_anything_changes(tmp_path):
+def test_a_malformed_actor_still_lowers_and_is_recorded_with_a_safe_actor(tmp_path):
+    """形の不備を理由に降格そのものを捨てない（0072 §2.6「無条件に上限として入れる」）。"""
     runtime = raised_runtime(tmp_path, stage=AuthorityStage.FULL)
-    with pytest.raises(ValueError, match="actor"):
-        runtime.apply_lowering(to_stage=AuthorityStage.SHADOW, actor="Root", reason="x")
-    assert runtime.current_stage() is AuthorityStage.FULL
+
+    changed = runtime.apply_lowering(to_stage=AuthorityStage.SHADOW, actor="Root", reason="")
+
+    assert changed is True
+    assert runtime.current_stage() is AuthorityStage.SHADOW
+    runtime.maintain()
+    journal = other_store(tmp_path).read()
+    assert journal.stage is AuthorityStage.SHADOW
+    event = journal.events[-1]
+    assert event.actor == INVALID_LOWERING_ACTOR
+    assert event.reason == INVALID_LOWERING_REASON
+    assert event.trigger is AuthorityTrigger.HUMAN
+
+
+def test_a_human_lowering_is_kept_apart_from_a_pending_automatic_one(tmp_path, held_lock):
+    """主体の違う予約は吸収しない。ただし journal で no-op になれば人の event は残らない。"""
+    runtime = raised_runtime(tmp_path, stage=AuthorityStage.FULL)
+    held_lock.hold()
+    journal_path(tmp_path).write_bytes(b"{broken")
+    runtime.maintain()  # 読めない → SHADOW の自動降格を予約（lock で書けない）
+    runtime.apply_lowering(to_stage=AuthorityStage.SHADOW, actor=ACTOR, reason="rollback")
+
+    assert runtime.pending_stages == (AuthorityStage.SHADOW, AuthorityStage.SHADOW)
+
+
+def test_an_observed_demotion_uses_the_only_lock_wait_after_the_heartbeat(
+    tmp_path, held_lock, monkeypatch
+):
+    """同じ tick で `observe()` が lock を待ったら、予約の書き残しは次の tick へ（0060 §2.7）。"""
+    from coldaisle.control.schema import SafetyState
+
+    runtime = raised_runtime(tmp_path, stage=AuthorityStage.FULL)
+    held_lock.hold()
+    runtime.apply_lowering(to_stage=AuthorityStage.EXPANDED, actor=ACTOR, reason="x")
+    calls: list[AuthorityStage] = []
+    original = AuthorityStore.lower_stage
+
+    def counting(self: AuthorityStore, **kwargs: Any) -> AuthorityJournal:
+        calls.append(kwargs["to_stage"])
+        return original(self, **kwargs)
+
+    monkeypatch.setattr(AuthorityStore, "lower_stage", counting)
+    runtime.observe(safety_state=SafetyState.EMERGENCY, now_mono_ms=1)
+    runtime.maintain()
+    assert calls == [AuthorityStage.SHADOW], "1 tick で lock を待つのは1回だけ"
+
+    runtime.maintain()  # 次の tick では予約を書き直す
+    assert calls == [AuthorityStage.SHADOW, AuthorityStage.EXPANDED]
 
 
 # ================================================================ 2. 外の process（0072 §2.6）
@@ -279,6 +329,61 @@ def test_an_unreadable_journal_drops_to_shadow_and_reading_again_does_not_restor
     assert runtime.journal_unreadable is False
     assert runtime.current_stage() is AuthorityStage.SHADOW
     # 戻すには 0057 §2.3 の承認による昇格（SHADOW から1段ずつ）が要る
+
+
+def test_a_journal_whose_revision_went_back_is_not_trusted(tmp_path):
+    """古いバックアップの書き戻しで、承認を経ずに FULL が戻ってこない（0072 §2.6 / 0057 §2.6）。"""
+    runtime = raised_runtime(tmp_path, stage=AuthorityStage.FULL)
+    backup = journal_path(tmp_path).read_bytes()
+    runtime.apply_lowering(to_stage=AuthorityStage.SHADOW, actor=ACTOR, reason="rollback")
+    runtime.maintain()
+    assert runtime.trace_record(command_id=None).unpersisted_ceiling is None
+
+    journal_path(tmp_path).write_bytes(backup)  # rev が戻った FULL の journal
+    runtime.maintain()
+
+    assert runtime.current_stage() is AuthorityStage.SHADOW
+    assert runtime.journal_unreadable is True
+    assert runtime.journal.stage is AuthorityStage.SHADOW, "知っている journal を持ち続ける"
+    for _ in range(3):
+        runtime.maintain()
+    assert runtime.current_stage() is AuthorityStage.SHADOW
+    journal = other_store(tmp_path).read()
+    assert journal.stage is AuthorityStage.SHADOW
+    assert journal.events[-1].cause is AutomaticCause.AUTHORITY_JOURNAL_UNREADABLE
+
+
+def test_a_journal_with_a_replaced_history_is_not_trusted(tmp_path):
+    runtime = raised_runtime(tmp_path, stage=AuthorityStage.LIMITED)
+    runtime.apply_lowering(to_stage=AuthorityStage.SHADOW, actor=ACTOR, reason="rollback")
+    runtime.maintain()
+    runtime.maintain()
+    payload = json.loads(journal_path(tmp_path).read_text("utf-8"))
+    payload["events"][-1]["reason"] = "別の履歴"  # 同じ revision で履歴だけ違う
+    # 形は正しい（読める）が、この process が知っている event 列を延長していない
+    AuthorityJournal.model_validate_json(json.dumps(payload))
+    journal_path(tmp_path).write_text(json.dumps(payload), encoding="utf-8")
+
+    runtime.maintain()
+
+    assert runtime.journal_unreadable is True
+    assert runtime.trace_record(command_id=None).unpersisted_ceiling is AuthorityStage.SHADOW
+    assert runtime.journal.events[-1].reason != "別の履歴", "差し替えた履歴は採らない"
+
+
+def test_an_approved_raise_by_another_process_is_still_accepted(tmp_path):
+    """正しい昇格（`raise_stage` の追記）は履歴を延長するので通る。"""
+    runtime = raised_runtime(tmp_path, stage=AuthorityStage.LIMITED)
+    runtime.maintain()
+    known = runtime.journal
+    journal_path(tmp_path).write_bytes(full_journal_bytes(tmp_path))
+    raised = other_store(tmp_path).read()
+    assert raised.events[: known.revision] == known.events, "試験の前提: 追記だけで届いた"
+
+    runtime.maintain()
+
+    assert runtime.journal_unreadable is False
+    assert runtime.current_stage() is AuthorityStage.FULL
 
 
 def test_a_journal_that_disappears_is_not_a_reason_to_raise(tmp_path):
@@ -666,6 +771,45 @@ def test_a_demotion_does_not_wait_for_the_audit_database(short_dir, rules):
 
 
 @needs_peercred
+def test_a_full_pending_slot_does_not_make_a_demotion_busy(short_dir, rules):
+    """受信後の枠が埋まっていても、降格は busy にならず次の tick で loop へ届く（0072 §2.2）。"""
+    running = RunningEntry(short_dir, rules, limits__max_pending_commands=1)
+    try:
+        waiting = running.send_async(MAX)
+        wait_until(lambda: 1 in running.server._awaiting_ack)
+        reply = running.send_async(ROLLBACK)
+        command = tick_until_authority(running)
+        assert command.to_stage is AuthorityStage.SHADOW
+        response = reply.result(timeout=5)
+        assert response["ok"] is True
+        assert response.get("error") != "busy"
+        waiting.result(timeout=5)
+    finally:
+        running.stop()
+
+
+@needs_peercred
+def test_a_full_audit_queue_does_not_delay_a_demotion(short_dir, rules):
+    """監査の queue が溢れていても、降格は次の tick で loop へ届く（0072 §2.7）。"""
+    running = RunningEntry(short_dir, rules, limits__audit_queue_max=1)
+    try:
+        running.gate.clear()
+        blocked = running.send_async(AUTO)
+        wait_until(lambda: 1 in running.server._auditing)
+        queued = running.send_async(AUTO)
+        wait_until(lambda: 2 in running.server._auditing)
+        reply = running.send_async(LOWER)
+        command = tick_until_authority(running)
+        assert command.to_stage is AuthorityStage.LIMITED
+        assert reply.result(timeout=5)["ok"] is True
+        running.gate.set()
+        blocked.result(timeout=5)
+        queued.result(timeout=5)
+    finally:
+        running.stop()
+
+
+@needs_peercred
 def test_status_reports_the_journal_and_the_unpersisted_ceiling(entry):
     socket_tick(entry)
     status = entry.send({"v": 1, "op": "status"})
@@ -735,6 +879,35 @@ def test_the_daemon_takes_the_authority_root_from_the_command_line():
     args = build_parser().parse_args(["--authority-root", "var/test-authority"])
     assert args.authority_root == Path("var/test-authority")
     assert build_parser().parse_args([]).authority_root == DEFAULT_AUTHORITY_ROOT
+
+
+def test_the_daemon_close_retries_an_unwritten_lowering_once(tmp_path, caplog):
+    """停止の直前に予約を1回だけ書き直す。書けたら再起動しても降格した stage を保つ。"""
+    from coldaisle.control_daemon import ControlDaemon
+
+    runtime = raised_runtime(tmp_path, stage=AuthorityStage.FULL)
+    runtime.apply_lowering(to_stage=AuthorityStage.LIMITED, actor=ACTOR, reason="停止前")
+    daemon = ControlDaemon(loop=None, monotonic=SystemMonotonicClock(), authority=runtime)  # type: ignore[arg-type]
+
+    daemon.close()
+
+    assert other_store(tmp_path).read().stage is AuthorityStage.LIMITED
+    assert runtime.pending_stages == ()
+
+
+def test_the_daemon_close_logs_a_lowering_it_could_not_write(tmp_path, held_lock, caplog):
+    from coldaisle.control_daemon import ControlDaemon
+
+    runtime = raised_runtime(tmp_path, stage=AuthorityStage.FULL)
+    runtime.apply_lowering(to_stage=AuthorityStage.SHADOW, actor=ACTOR, reason="停止前")
+    held_lock.hold()
+    daemon = ControlDaemon(loop=None, monotonic=SystemMonotonicClock(), authority=runtime)  # type: ignore[arg-type]
+
+    with caplog.at_level("ERROR", logger="coldaisle.control"):
+        daemon.close()
+
+    assert other_store(tmp_path).read().stage is AuthorityStage.FULL
+    assert any("再起動で戻る" in record.getMessage() for record in caplog.records)
 
 
 # ================================================================ 8. 構造（0072 §2.9）

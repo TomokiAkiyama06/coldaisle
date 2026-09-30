@@ -99,7 +99,14 @@ lock を手放す `inspect()` だけでは、A の証拠を持ったまま B が
 書き換えずに読むが、新しい昇格の根拠にはならない。v3（#92 / 決定記録 0072 §2.6）は自動降格の
 理由に `authority_journal_unreadable` を足した版で、この理由の event は v3 の journal にだけ置ける
 （v2 までの reader には「知らない journal」として拒ませる）。v1 / v2 の journal はそのまま読み、
-次に書くときに v3 で書く。Air Balance が無効（`uncalibrated`）の間に
+次に書くときに v3 で書く（新しい原因を含まない降格・昇格でも v3 で書く）。
+
+**切り戻しの注意:** v3 を書く `coldaisle-fand` が1回でも journal へ書くと、#92 より前のバイナリは
+その journal を読めず、起動を拒む（終了コード 5。引き継ぎの Max のまま止まる）。旧版へ戻すときは、
+先に `authority.json` を退避し、旧版では journal の無い状態（`SHADOW`）から始める。昇格はやり直しになる
+（旧 reader は未知の `cause` を enum の検証でどのみち拒むので、原因を含む event だけ v3 にしても
+切り戻しの安全は変わらない。版を常に上げるのは「知らない journal」として一律に拒ませるためである）。
+Air Balance が無効（`uncalibrated`）の間に
 集めた証拠もその未校正ファイルに束縛されるので、`calibrated` へ差し替えた後は使えない。
 
 ## 下げる（承認は要らない）
@@ -139,7 +146,15 @@ lock を手放す `inspect()` だけでは、A の証拠を持ったまま B が
 - **走行中に journal が読めない・壊れているときは止めずに `SHADOW` へ下げ**、`authority_journal_unreadable`
   の自動降格として journal へ書き残しを試みる。**読めるようになっただけでは戻さない。** 書けたら
   journal が `SHADOW` を表すので上限を手放す（authority は上がらない）。戻すには承認による昇格が要る
-- 予約した書き残しは同じ深さ以上のものを重ねない（stage の段数で抑えられる）。1 tick に書くのは1件
+- **読み直した journal が既知の履歴を延長していない**（revision が戻った・event 列が差し替わった。
+  古いバックアップの書き戻しなど）ときも、読めない journal と同じく `SHADOW` へ下げて
+  `authority_journal_unreadable` を書き残す。承認を経ずに高い stage が戻ってくる経路にしない。
+  追記で届いた昇格（`raise_stage`）だけがそのまま効く
+- 予約した書き残しは、同じ主体（trigger・actor・cause）の同じ深さ以上のものを重ねない（主体 × stage の
+  段数で抑えられる）。1 tick に書くのは1件で、**同じ tick で自動降格が既に lock を待っていれば次の tick に
+  回す**（heartbeat の後の待ちを trace の保存と合わせて2回までに抑える。0060 §2.7）
+- 停止（`SIGTERM`）の直前に、残った予約を1回だけ書き直す。それでも書けなければ行き先を error ログに残す
+  （再起動すると journal の stage で運転が再開する）
 
 **runtime に authority を上げる経路は無い。** 外の process（人の CLI）の昇格が journal に入っても、
 それは 0057 §2.3 の承認を経たものだけである。

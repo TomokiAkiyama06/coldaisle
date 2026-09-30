@@ -50,6 +50,9 @@ uv run coldaisle-control rollback-authority --reason "新しい artifact の挙�
 - journal（`authority.json`）へは heartbeat と decision trace の保存の後に、人の変更
   （`actor = uid.<数値>`、`trigger = human`、理由に `command_id` と入力した理由）として書きます。
   書けなければ memory 上の上限を持ち続け、次の tick で書き直します（`status` の `persist_failure`）
+- **journal に人の event が残らない場合があります。** 書く時点で journal が既にその stage 以下
+  （例: 読めない journal による自動降格が先に `shadow` を書いた）なら、journal の上では何も変わらないので
+  event を足しません。人の指令は監査の表（`accepted` / `applied`）に残ります
 - 同じ tick までに降格が複数届いたら、**最も低い行き先**を採ります。採らなかった指令は `superseded_by`
   を返します（後から届いた浅い降格は、先に届いた深い降格に置き換えられる）
 - モードの枠とは別の枠なので、`max` と `rollback-authority` は同じ tick で両方効きます

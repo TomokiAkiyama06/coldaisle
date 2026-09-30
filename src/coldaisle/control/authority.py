@@ -81,6 +81,8 @@ __all__ = [
     "AUTHORITY_JOURNAL_SCHEMA_VERSION",
     "AUTHORITY_STATE_FILENAME",
     "BASELINE_STAGE",
+    "INVALID_LOWERING_ACTOR",
+    "INVALID_LOWERING_REASON",
     "MAX_JOURNAL_EVENTS",
     "MIN_EVIDENCE_REPORT_SCHEMA_VERSION",
     "STAGE_ORDER",
@@ -1215,6 +1217,11 @@ _SIGNATURE_UNKNOWN = object()
 JOURNAL_UNREADABLE_ACTOR = "control_runtime"
 """走行中に journal を読めなかったときの降格を書き残す主体（自動降格と同じ）。"""
 
+INVALID_LOWERING_ACTOR = "control_admin"
+"""actor が journal の形に合わない人の降格を書き残すときの主体（上限は形に依らず入れる）。"""
+INVALID_LOWERING_REASON = "control_admin lowering (actor or reason replaced: invalid form)"
+"""reason / actor が journal の形に合わない人の降格の reason。監査の行が元の値を持つ。"""
+
 
 class AuthorityRuntime:
     """いまの stage を制御ループへ渡し、不健全が続いたら**その場で**下げる。
@@ -1238,6 +1245,7 @@ class AuthorityRuntime:
         "_journal",
         "_journal_unreadable",
         "_last_mono_ms",
+        "_lock_waited",
         "_low_confidence",
         "_ood",
         "_pending",
@@ -1280,6 +1288,8 @@ class AuthorityRuntime:
         self._low_confidence: deque[int] = deque()
         self._ood: deque[int] = deque()
         self._persist_failure: Reason | None = None
+        # この tick で `observe()` が既に lock を待ったか（`maintain()` で2回目を待たない）。
+        self._lock_waited = False
 
     @property
     def configured_ceiling(self) -> AuthorityStage:
@@ -1402,10 +1412,26 @@ class AuthorityRuntime:
         返すのは、上限を入れた後の実効 stage が入れる前より下がったか（下がらなくても上限は残る）。
         disk も lock も待たない（loop は tick の先頭でこれを呼ぶ）。
         """
-        # 書き残す記録の形は journal の event と同じ規則で先に確かめる（書く時点で落とさない）
-        _check_actor_and_reason(actor, reason)
         before = self.current_stage()
+        # **上限は形の検証より先に、無条件で入れる**（0072 §2.6）。journal へ書く形の不備を
+        # 理由に、安全側の降格そのものを捨てない。
         self._unpersisted_ceiling = lowest_stage(self._unpersisted_ceiling, to_stage)
+        try:
+            # 書き残す記録の形は journal の event と同じ規則で先に確かめる（書く時点で落とさない）
+            _check_actor_and_reason(actor, reason)
+        except ValueError as error:
+            # 形が合わないものは安全な固定値に置き換えて予約する（降格の記録は残す）
+            _LOGGER.error(
+                "authority の降格の actor / reason が journal の形に合わないので置き換えて残す",
+                extra={
+                    logs.FIELDS_KEY: {
+                        "to_stage": to_stage.value,
+                        "error": str(error)[:500],
+                    }
+                },
+            )
+            actor = INVALID_LOWERING_ACTOR
+            reason = INVALID_LOWERING_REASON
         self._enqueue(
             _PendingDemotion(
                 to_stage=to_stage,
@@ -1427,10 +1453,49 @@ class AuthorityRuntime:
            読めない・壊れているときは memory 上の上限を `SHADOW` に下げ、書き残しを予約する
            （`authority_journal_unreadable`）。**読めるようになっただけでは外さない**
 
+        **同じ tick で `observe()` が既に lock を待っていれば、1 は次の tick に回す**
+        （0060 §2.7）。heartbeat の後の待ちを「自動降格の書き残し（≤ d）＋ trace の保存（≤ d）」の
+        2回に抑え、`watchdog ≥ 2(t+d)` の予算（heartbeat の間隔 ≤ t+3d）を越えないためである。
+
         例外を外へ出さない（入口の不具合で冷却を止めない）。結果は構造化ログに残す。
         """
-        self._flush_one()
+        waited = self._lock_waited
+        self._lock_waited = False
+        if not waited:
+            self._flush_one()
         self._check_journal()
+
+    def flush_pending_on_shutdown(self) -> tuple[AuthorityStage, ...]:
+        """停止の直前に、予約した降格を**それぞれ1回だけ**書き残す（lock の待ち上限つき）。
+
+        loop が止まった後に呼ぶ。書けずに残った予約の行き先を返す（呼び出し側が error に残す。
+        **再起動すると journal の stage で運転が再開する**ので、黙って捨てない）。
+        """
+        remaining: list[_PendingDemotion] = []
+        while self._pending:
+            demotion = self._pending.pop(0)
+            if self._write(demotion) is not None:
+                remaining.append(demotion)
+        self._pending = remaining
+        for demotion in remaining:
+            _LOGGER.error(
+                "停止までに authority の降格を journal へ書き残せなかった（再起動で戻る）",
+                extra={
+                    logs.FIELDS_KEY: {
+                        "to_stage": demotion.to_stage.value,
+                        "trigger": demotion.trigger.value,
+                        "actor": demotion.actor,
+                        "reason": demotion.reason[:500],
+                        "cause": None if demotion.cause is None else demotion.cause.value,
+                    }
+                },
+            )
+        return tuple(item.to_stage for item in remaining)
+
+    @property
+    def pending_stages(self) -> tuple[AuthorityStage, ...]:
+        """まだ journal へ書き残していない降格の行き先（予約の順）。"""
+        return tuple(item.to_stage for item in self._pending)
 
     def trace_record(self, *, command_id: int | None) -> AuthorityRecord:
         """decision trace（`ControlTick` v13）へ残す、この時点の制御権の出どころ。"""
@@ -1500,6 +1565,8 @@ class AuthorityRuntime:
         self._unpersisted_ceiling = lowest_stage(self._unpersisted_ceiling, to_stage)
         self._low_confidence.clear()
         self._ood.clear()
+        # この tick の lock の待ちはここで使った（`maintain()` は書き残しを次の tick に回す）
+        self._lock_waited = True
         persist_failure = self._write(
             _PendingDemotion(
                 to_stage=to_stage,
@@ -1553,13 +1620,20 @@ class AuthorityRuntime:
             self._journal_unreadable = False
 
     def _enqueue(self, demotion: _PendingDemotion) -> None:
-        """書き残しを予約する。**同じ深さ以上へ下げる予約が先にあれば足さない。**
+        """書き残しを予約する。**同じ主体の、同じ深さ以上へ下げる予約が先にあれば足さない。**
 
-        先の予約が書ければ journal はそれ以下を表すので、後の予約は journal で no-op になる。
-        予約の数は stage の段数で抑えられる（無制限に積まない）。
+        主体（trigger・actor・cause）の違う予約は別に残す。自動降格が書けずに残っている間に
+        届いた人の降格を、自動降格の予約に吸収させないためである（0072 §2.7）。ただし書く時点で
+        journal が既にその stage 以下なら `lower_stage()` は no-op なので、**人の event が
+        journal に残らない場合はある**（人の指令は管理ソケットの監査の行に残る。
+        docs/control-admin.md）。予約の数は「主体 × stage の段数」で抑えられる。
         """
         if any(
-            stage_rank(item.to_stage) <= stage_rank(demotion.to_stage) for item in self._pending
+            item.trigger is demotion.trigger
+            and item.actor == demotion.actor
+            and item.cause is demotion.cause
+            and stage_rank(item.to_stage) <= stage_rank(demotion.to_stage)
+            for item in self._pending
         ):
             return
         self._pending.append(demotion)
@@ -1610,6 +1684,18 @@ class AuthorityRuntime:
             self._on_journal_unreadable(error)
             return
         previous = self._journal
+        if not _extends(journal, previous):
+            # **revision の後退・履歴の差し替えを信じない**（0072 §2.6 / 0057 §2.6）。古い
+            # バックアップの書き戻しで、承認を経ずに高い stage が戻ってくるのを防ぐ。
+            # 読めない journal と同じく SHADOW に下げ、書き残せるまで外さない。知っている
+            # journal はそのまま持つ（`_signature` も更新しないので、毎 tick 確かめ直す）。
+            self._on_journal_unreadable(
+                AuthorityStateError(
+                    "authority journal が既知の履歴を延長していない"
+                    f"（known_revision={previous.revision}; read_revision={journal.revision}）"
+                )
+            )
+            return
         self._journal = journal
         self._signature = signature
         if journal != previous:
@@ -1658,6 +1744,13 @@ class AuthorityRuntime:
         for history in (self._low_confidence, self._ood):
             while history and history[0] < cutoff:
                 history.popleft()
+
+
+def _extends(journal: AuthorityJournal, known: AuthorityJournal) -> bool:
+    """`journal` が `known` の event 列をそのまま先頭に持つ（追記だけで届いた）か。"""
+    if journal.revision < known.revision:
+        return False
+    return journal.events[: known.revision] == known.events
 
 
 def _check_actor_and_reason(actor: str, reason: str) -> None:

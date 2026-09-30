@@ -461,6 +461,8 @@ class ControlDaemon:
     store: SqliteStore | None = None
     admin: ControlAdminEntry | None = None
     """開いた管理ソケット。**loop が止まった後に**閉じる（`close()`）。"""
+    authority: AuthorityRuntime | None = None
+    """制御権の runtime。`close()` で書き残せていない降格を1回だけ書き直す（0057 §2.6）。"""
     sleep: Callable[[float], None] = time.sleep
     stats: ControlStats = field(default_factory=ControlStats)
     _stop: bool = field(default=False, init=False, repr=False)
@@ -478,9 +480,33 @@ class ControlDaemon:
         if self.admin is not None:
             self.admin.stop(drain=drain)
             self.admin = None
+        if self.authority is not None:
+            self._flush_authority(drain=drain)
+            self.authority = None
         if self.store is not None:
             self.store.close()
             self.store = None
+
+    def _flush_authority(self, *, drain: bool) -> None:
+        """書き残せていない降格を、停止の前に1回だけ書き直す（lock の待ち上限つき）。
+
+        **再起動すると journal の stage で運転が再開する**ので、残った降格を黙って捨てない。
+        ``drain=False``（例外での停止）では待たずに、残った降格を error に残すだけにする。
+        """
+        assert self.authority is not None
+        try:
+            if drain:
+                self.authority.flush_pending_on_shutdown()
+                return
+            pending = self.authority.pending_stages
+        except Exception:
+            LOGGER.exception("停止時に authority の降格を書き残せなかった")
+            return
+        if pending:
+            LOGGER.error(
+                "停止までに authority の降格を journal へ書き残せなかった（再起動で戻る）",
+                extra={logs.FIELDS_KEY: {"to_stages": [stage.value for stage in pending]}},
+            )
 
     def run(self, *, max_ticks: int | None = None) -> ControlStats:
         """止めるまで tick を回す。`max_ticks` は試験と Replay のための上限。"""
@@ -620,7 +646,9 @@ def build(
         if admin is not None:
             admin.stop()
         raise
-    return ControlDaemon(loop=loop, monotonic=monotonic, store=store, admin=admin)
+    return ControlDaemon(
+        loop=loop, monotonic=monotonic, store=store, admin=admin, authority=authority
+    )
 
 
 def open_authority_runtime(root: Path, control: ControlConfig, *, clock: Clock) -> AuthorityRuntime:
