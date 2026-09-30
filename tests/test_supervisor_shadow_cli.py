@@ -29,6 +29,8 @@ from coldaisle.control.config import CONTROL_CONFIG_VERSION, ControlConfig
 from coldaisle.control.model_registry import ModelRegistry
 from coldaisle.control.schema import (
     AirBalanceRecord,
+    AuthorityRecord,
+    AuthorityStage,
     ControlConfigDigest,
     ControlTick,
     ControlTickRuntime,
@@ -260,6 +262,7 @@ class Fixture:
                 config_sha256=self.control.sources.air_balance.sha256,
             ),
             mode_command=ModeCommandRecord.without_entry(),
+            authority=AuthorityRecord(entry="static", config_ceiling=AuthorityStage.FULL),
         )
 
 

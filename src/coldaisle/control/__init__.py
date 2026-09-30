@@ -192,6 +192,7 @@ from coldaisle.control.mpc import (
     ZoneBound,
 )
 from coldaisle.control.operating_mode import (
+    AdminAuthorityCommand,
     AdminModeCommand,
     AdminModeTracker,
     ModeCommand,
@@ -244,6 +245,7 @@ from coldaisle.control.schema import (
     AirBalanceRecord,
     AirBalanceTraceState,
     AuthorityLimitSource,
+    AuthorityRecord,
     AuthorityStage,
     BoundBy,
     ConfidenceLevel,
@@ -413,6 +415,7 @@ __all__ = [
     "AcousticModelConfig",
     "AcousticModelSource",
     "ActionPlan",
+    "AdminAuthorityCommand",
     "AdminModeCommand",
     "AdminModeTracker",
     "AirBalanceConfig",
@@ -449,6 +452,7 @@ __all__ = [
     "AuthorityJournal",
     "AuthorityLimitSource",
     "AuthorityObserver",
+    "AuthorityRecord",
     "AuthorityRuntime",
     "AuthorityStage",
     "AuthorityStageSource",

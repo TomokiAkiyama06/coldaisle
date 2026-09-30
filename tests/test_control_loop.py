@@ -330,6 +330,15 @@ class RecordingAuthority:
     def observe(self, **kwargs: Any) -> None:
         self.order.append("authority")
 
+    def apply_lowering(self, **kwargs: Any) -> bool:
+        return self.inner.apply_lowering(**kwargs)
+
+    def maintain(self) -> None:
+        self.order.append("authority_maintain")
+
+    def trace_record(self, *, command_id: int | None) -> Any:
+        return self.inner.trace_record(command_id=command_id)
+
 
 @dataclass(frozen=True)
 class StubProposalOrigin:
@@ -1064,7 +1073,7 @@ def test_invariant_12_every_tick_records_that_no_registry_was_read(catalog) -> N
     for result in results:
         assert result.tick.registry == RegistryProvenance.unbound()
     recorded = json.loads(harness.trace.rows[-1])
-    assert recorded["schema_version"] == SCHEMA_VERSION == 12
+    assert recorded["schema_version"] == SCHEMA_VERSION == 13
     assert recorded["registry"] == {"schema_version": 1, "revision": None, "production": {}}
 
 
@@ -1455,6 +1464,15 @@ def test_invariant_28_a_demotion_that_cannot_be_persisted_is_visible(catalog, ca
                 persist_failure=Reason(code="authority_persist_failed", detail="disk full"),
             )
 
+        def apply_lowering(self, **kwargs: Any) -> bool:
+            return self.inner.apply_lowering(**kwargs)
+
+        def maintain(self) -> None:
+            return None
+
+        def trace_record(self, *, command_id: int | None) -> Any:
+            return self.inner.trace_record(command_id=command_id)
+
     harness = Harness(catalog, authority=FailingAuthority(StaticAuthority()))
     with caplog.at_level("ERROR"):
         result = harness.tick()
@@ -1770,7 +1788,8 @@ def test_invariant_21_the_heartbeat_is_sent_before_any_persistence(catalog) -> N
     harness = Harness(catalog)
     harness.tick()
 
-    assert harness.order == ["watchdog", "authority", "trace"]
+    # journal の書き残しと変化の検知（#92 / 決定記録 0072 §2.6）も trace の保存の後
+    assert harness.order == ["watchdog", "authority", "trace", "authority_maintain"]
     assert harness.watchdog.beats == 1
 
 

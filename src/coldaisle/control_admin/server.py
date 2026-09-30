@@ -11,12 +11,14 @@
   `limits.read_timeout_s` でも必ず閉じる
 - **受信後**（監査の書き込み待ち・適用の確認待ち・応答の送信中）:
   上限 `limits.max_pending_commands`。
-  埋まっていれば**向きで分ける。** 冷却を弱めうる指令は `busy` で拒否し、安全側の指令（`MAX`）は
-  先に受け渡し口へ置いて `pending` を返す
+  埋まっていれば**向きで分ける。** 冷却を弱めうる指令は `busy` で拒否し、安全側の指令（`MAX`・
+  `lower_authority`・`rollback_authority`）は先に受け渡し口へ置いて `pending` を返す
 
-置く順番も向きで分ける（0072 §2.7）。`MAX` は採番したら**先に受け渡し口へ置き**、そのあとで受付の
-行の書き込みを依頼する（失敗しても取り消さない）。弱めうる指令は受付の行を**書けたと分かってから**
+置く順番も向きで分ける（0072 §2.7）。安全側の指令は採番したら**先に受け渡し口へ置き**、そのあとで
+受付の行の書き込みを依頼する（失敗しても取り消さない）。弱めうる指令は受付の行を**書けたと分かってから**
 置く（書けなければ置かずに拒否する）。
+
+authority の降格（段階 2。#92）は authority の枠へ置く。**上げる操作は無い**（0072 §2.1）。
 
 `accept()` が失敗し続けるとき（fd の枯渇など）は、待ち受けのソケットだけを selector から
 外して `accept_backoff` の間隔で休む（失敗のたびに `multiplier` 倍、`max_ms` で頭打ち、成功で
@@ -45,12 +47,25 @@ from typing import Any, Literal
 
 from coldaisle import logs
 from coldaisle.clock import Clock, MonotonicClock
-from coldaisle.control.operating_mode import AdminModeCommand, ModeOutcomeKind
-from coldaisle.control.schema import AuthorityStage, Demand, OperatingMode, PerZone
+from coldaisle.control.operating_mode import (
+    ADMIN_ACTOR_PREFIX,
+    AdminAuthorityCommand,
+    AdminModeCommand,
+    ModeOutcomeKind,
+)
+from coldaisle.control.schema import (
+    BASELINE_STAGE,
+    AuthorityStage,
+    Demand,
+    OperatingMode,
+    PerZone,
+)
 from coldaisle.control_admin.audit import AuditWriter
 from coldaisle.control_admin.config import ControlAdminSettings
-from coldaisle.control_admin.mailbox import AdminMailbox, Placed, Superseded
+from coldaisle.control_admin.mailbox import AdminMailbox, Placed, Sealed, Superseded
 from coldaisle.control_admin.messages import (
+    AuthorityRequest,
+    LowerAuthorityRequest,
     RequestError,
     SetModeRequest,
     StatusRequest,
@@ -512,7 +527,71 @@ class ControlAdminServer:
         if isinstance(request, StatusRequest):
             self._finish(conn, self._status_body(), result="accepted", code=None)
             return
-        self._handle_set_mode(conn, request)
+        if isinstance(request, SetModeRequest):
+            self._handle_set_mode(conn, request)
+            return
+        self._handle_authority(conn, request)
+
+    def _handle_authority(self, conn: _Connection, request: AuthorityRequest) -> None:
+        """authority の降格（0072 §2.6 / §2.7）。**安全側の指令**として監査を待たずに置く。
+
+        受付の時点の実効 stage とは比べない（古いことがある）。適用するかは loop が決める。
+        """
+        pending_full = self._pending_count() >= self._settings.limits.max_pending_commands
+        command_id = self._take_command_id()
+        conn.command_id = command_id
+        to_stage = (
+            AuthorityStage(request.to_stage)
+            if isinstance(request, LowerAuthorityRequest)
+            else BASELINE_STAGE
+        )
+        command = AdminAuthorityCommand(
+            command_id=command_id,
+            op=request.op,
+            to_stage=to_stage,
+            # 操作者は peer credential から決める（名前解決の結果を記録に使わない。0072 §2.5）
+            actor=f"{ADMIN_ACTOR_PREFIX}{conn.uid}",
+            reason=request.reason,
+        )
+        accepted = ControlAdminAuditRecord(
+            run_id=self._run_id,
+            command_id=command_id,
+            event="accepted",
+            ts_ms=self._clock.now_ms(),
+            peer_uid=conn.uid,
+            op=request.op,
+            body_json=encode(request.body()).decode("utf-8").rstrip("\n"),
+        )
+        # **安全側は記録を待たない。** 先に置き、そのあとで受付の行を依頼する。結末の行は
+        # 受付の行の後に依頼する（同じ指令の受付の行が結末の行より先に書かれる）
+        placement = self._mailbox.place_authority(command)
+        if isinstance(placement, Sealed):
+            # 停止の手順が枠を取り出し終えている。置いていないので `pending` も受付の行も
+            # 残さず、停止の手順が残りの接続を閉じるのと同じく応答せずに閉じる（0072 §2.6）
+            LOGGER.warning(
+                "停止の手順の途中に届いた authority の降格を置かずに閉じた",
+                extra={logs.FIELDS_KEY: {"run_id": self._run_id, "command_id": command_id}},
+            )
+            self._drop(conn)
+            return
+        if not self._audit.submit(accepted):
+            self._log_audit_failure(command_id, "accepted")
+        if isinstance(placement, Superseded):
+            # すでに枠にある同じかより低い行き先の降格が効く（0072 §2.2 の合成）
+            self._submit_outcome(command_id, "superseded", superseded_by=placement.by, tick_id=None)
+            self._finish(
+                conn,
+                self._superseded_body(command_id, placement.by),
+                result="accepted",
+                code="superseded",
+            )
+            return
+        if placement.replaced is not None:
+            self._supersede(placement.replaced.command_id, by=command_id)
+        if pending_full:
+            self._finish(conn, self._pending_body(command_id), result="accepted", code="pending")
+            return
+        self._await_ack(conn, command_id)
 
     def _handle_set_mode(self, conn: _Connection, request: SetModeRequest) -> None:
         max_lease_s = self._settings.manual.max_lease_s.value
@@ -606,21 +685,20 @@ class ControlAdminServer:
             return placement
         replaced = placement.replaced
         if replaced is not None:
-            self._submit_outcome(
-                replaced.command_id,
-                "superseded",
-                superseded_by=command.command_id,
-                tick_id=None,
-            )
-            waiting = self._awaiting_ack.pop(replaced.command_id, None)
-            if waiting is not None:
-                self._finish(
-                    waiting,
-                    self._superseded_body(replaced.command_id, command.command_id),
-                    result="accepted",
-                    code="superseded",
-                )
+            self._supersede(replaced.command_id, by=command.command_id)
         return placement
+
+    def _supersede(self, command_id: int, *, by: int) -> None:
+        """取り出される前に置き換えられた指令を `superseded` として残し、待っている接続へ返す。"""
+        self._submit_outcome(command_id, "superseded", superseded_by=by, tick_id=None)
+        waiting = self._awaiting_ack.pop(command_id, None)
+        if waiting is not None:
+            self._finish(
+                waiting,
+                self._superseded_body(command_id, by),
+                result="accepted",
+                code="superseded",
+            )
 
     def _await_ack(self, conn: _Connection, command_id: int) -> None:
         conn.stage = "awaiting_ack"
@@ -744,6 +822,7 @@ class ControlAdminServer:
         remaining: int | None = None
         if status is not None and status.lease_deadline_mono_ms is not None:
             remaining = max(0, status.lease_deadline_mono_ms - self._monotonic.monotonic_ms())
+        authority = None if status is None else status.authority
         return {
             "ok": True,
             "run_id": self._run_id,
@@ -752,10 +831,31 @@ class ControlAdminServer:
             "command_id": None if status is None else status.command_id,
             "manual_lease_remaining_ms": remaining,
             "authority_stage": None if status is None else status.authority_stage.value,
-            # 段階 1（#74）では journal を配線していない。段階 2（#92）で埋める（0072 §2.10）
-            "authority_journal_stage": None,
-            "authority_ceiling": self._authority_ceiling.value,
-            "persist_failure": None,
+            # 最後に loop が置いた写し（0072 §2.7）。journal を持たない構成では null
+            "authority_journal_stage": (
+                None
+                if authority is None or authority.journal_stage is None
+                else authority.journal_stage.value
+            ),
+            "authority_journal_revision": None if authority is None else authority.journal_revision,
+            "authority_ceiling": (
+                self._authority_ceiling.value
+                if authority is None
+                else authority.config_ceiling.value
+            ),
+            "authority_unpersisted_ceiling": (
+                None
+                if authority is None or authority.unpersisted_ceiling is None
+                else authority.unpersisted_ceiling.value
+            ),
+            "authority_journal_unreadable": (
+                None if authority is None else authority.journal_unreadable
+            ),
+            "persist_failure": (
+                None
+                if authority is None or authority.persist_failure is None
+                else authority.persist_failure.model_dump(mode="json")
+            ),
             "entry": "open",
             "audit_failures": self._audit.failures,
         }

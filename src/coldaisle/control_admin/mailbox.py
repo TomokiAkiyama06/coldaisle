@@ -1,11 +1,16 @@
 """受付スレッドと loop の受け渡し口（mailbox。決定記録 0072 §2.2）。
 
-- **状態の軸ごとに1枠。** 段階 1（#74）はモードの枠だけを持つ（authority の枠は段階 2 の #92）
+- **状態の軸ごとに1枠。** モードの枠（段階 1 の #74）と authority の枠（段階 2 の #92）。
+  **別の軸の指令は互いに消さない**（`MAX` のあとの rollback は両方が同じ tick で効く）
 - モードの枠は **`command_id` が最大の1件**を採る。これまでに置いた最大の `command_id` を
   覚え（loop が取り出したあとも保つ）、それより小さい指令は置かずに `superseded` とする。
   安全側の `MAX` は監査を待たずに置き、弱めうる指令は監査を書けてから置くので、先に届いた
   弱めうる指令が後から届いて先に置かれた `MAX` を上書きしうるためである
-- loop は **非ブロッキングで**覗く（`take_mode`）。lock が取れなければその tick は直前のまま
+- authority の枠は置き換えずに**合成する。** `lower_authority` と `rollback_authority` はどちらも
+  下げる向きなので、届いた指令のうち**最も低い行き先**を採る（後から来た浅い降格が先の rollback を
+  打ち消さない）。同じ深さなら先に置いた指令を残す。採らなかった指令は `superseded`
+- loop は **非ブロッキングで**覗き、2枠を**同じ lock の中で**取り出す（`take`）。lock が取れなければ
+  その tick は直前のモード・stage のまま
 - loop が返す結果（適用・lease 切れ）は lock の要らない FIFO に積み、受付スレッドを起こす
 - 受付スレッドの生存は **lock を取らずに**答える（`receiver_alive`）
 
@@ -19,34 +24,55 @@ import socket
 import threading
 from dataclasses import dataclass
 
-from coldaisle.control.operating_mode import AdminModeCommand, ModeOutcome, ModeStatus
+from coldaisle.control.operating_mode import (
+    AdminAuthorityCommand,
+    AdminModeCommand,
+    MailboxTake,
+    ModeOutcome,
+    ModeStatus,
+)
 
 
 @dataclass(frozen=True, slots=True)
 class Placed:
-    """枠へ置けた。``replaced`` は取り出される前に置き換えた、より古い指令。"""
+    """枠へ置けた。``replaced`` は取り出される前に置き換えた指令（採らなかった側）。"""
 
-    replaced: AdminModeCommand | None
+    replaced: AdminModeCommand | AdminAuthorityCommand | None
 
 
 @dataclass(frozen=True, slots=True)
 class Superseded:
-    """置かなかった。``by`` はすでに置いた、より新しい指令の `command_id`。"""
+    """置かなかった。``by`` はすでに枠にある、採られた指令の `command_id`。
+
+    モードの枠では、より新しい指令。authority の枠では、同じかより低い行き先の指令
+    （先に届いた指令のこともある。0072 §2.2 の合成）。
+    """
 
     by: int
 
 
+@dataclass(frozen=True, slots=True)
+class Sealed:
+    """置かなかった。停止の手順が authority の枠を取り出し終えている（0072 §2.6）。
+
+    取り出した後に置いた降格は、どの tick にも journal にも届かない。置いたことにして
+    `pending` を返すと、受理した降格が再起動で失われる。
+    """
+
+
 class AdminMailbox:
-    """モードの枠1つと、loop からの結果の FIFO、`status` の写し。"""
+    """モードの枠と authority の枠、loop からの結果の FIFO、`status` の写し。"""
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._mode: AdminModeCommand | None = None
+        self._authority: AdminAuthorityCommand | None = None
         self._max_mode_command_id = 0
         self._outcomes: queue.SimpleQueue[ModeOutcome] = queue.SimpleQueue()
         self._status: ModeStatus | None = None
         self._receiver: threading.Thread | None = None
         self._stopping = False
+        self._authority_sealed = False
         # loop・監査スレッドから受付スレッドを起こす（selectors で待っている）。
         # 書き込みは非ブロッキングで、詰まっていれば捨てる（起こす必要はもう満たされている）
         self._wake_reader, self._wake_writer = socket.socketpair()
@@ -80,6 +106,21 @@ class AdminMailbox:
             self._mode = command
             self._max_mode_command_id = command.command_id
             return Placed(replaced=replaced)
+
+    def place_authority(self, command: AdminAuthorityCommand) -> Placed | Superseded | Sealed:
+        """authority の枠へ置く。**最も低い行き先**の1件を残す（0072 §2.2）。
+
+        受付の時点の実効 stage とは比べない（適用するかは loop が決める。0072 §2.3）。
+        停止の手順が枠を取り出した後（`seal_authority`）は置かない。
+        """
+        with self._lock:
+            if self._authority_sealed:
+                return Sealed()
+            current = self._authority
+            if current is not None and not command.deeper_than(current):
+                return Superseded(by=current.command_id)
+            self._authority = command
+            return Placed(replaced=current)
 
     def drain_outcomes(self) -> list[ModeOutcome]:
         """loop が返した結果を、返された順に取り出す。"""
@@ -122,8 +163,42 @@ class AdminMailbox:
         receiver = self._receiver
         return receiver is not None and receiver.is_alive()
 
+    def take(self) -> MailboxTake | None:
+        """2枠を**同じ lock の中で**取り出す。lock を取れなければ None（直前のまま）。"""
+        if not self._lock.acquire(blocking=False):
+            return None
+        try:
+            taken = MailboxTake(mode=self._mode, authority=self._authority)
+            self._mode = None
+            self._authority = None
+            return taken
+        finally:
+            self._lock.release()
+
+    def seal_authority(self, *, timeout_s: float) -> MailboxTake | None:
+        """停止の手順で authority の枠を取り出し、**以後は置かせない**（0072 §2.6）。
+
+        受付スレッドが時間内に止まらなくても、取り出した後に置かれた降格が黙って消えない。
+        封は lock の外で先に立てる。lock の中にいる `place_authority` は置き終えてから放すので、
+        その降格はこの取り出しに入る。lock を持つのは枠の出し入れの間だけなので、待つのは
+        ``timeout_s`` まで。取れなければ None（封は立ったまま）。
+        """
+        self._authority_sealed = True
+        acquired = (
+            self._lock.acquire(timeout=timeout_s) if timeout_s > 0 else self._lock.acquire(False)
+        )
+        if not acquired:
+            return None
+        try:
+            taken = MailboxTake(mode=self._mode, authority=self._authority)
+            self._mode = None
+            self._authority = None
+            return taken
+        finally:
+            self._lock.release()
+
     def take_mode(self) -> AdminModeCommand | None:
-        """モードの枠を取り出す。lock を取れなければ None（直前のモードを保つ）。"""
+        """モードの枠だけを取り出す（authority の枠は残す）。lock を取れなければ None。"""
         if not self._lock.acquire(blocking=False):
             return None
         try:

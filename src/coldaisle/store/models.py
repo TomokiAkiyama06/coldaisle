@@ -387,8 +387,10 @@ class ControlAdminAuditRecord(BaseModel):
             raise ValueError("tick_id を持つのは applied / lease_expired の行だけ")
         if (self.event == "superseded") != (self.superseded_by is not None):
             raise ValueError("superseded_by を持つのは superseded の行だけ")
-        if self.superseded_by is not None and self.superseded_by <= self.command_id:
-            raise ValueError("置き換えるのは後から受け付けた指令だけ")
+        if self.superseded_by is not None and self.superseded_by == self.command_id:
+            # モードの枠は後から受け付けた指令が置き換えるが、authority の枠は最も低い行き先を
+            # 採るので、先に届いた深い降格が後の浅い降格を置き換えうる（0072 §2.2。migration 0009）
+            raise ValueError("指令は自分自身には置き換えられない")
         if self.body_json is not None:
             try:
                 decoded = json.loads(self.body_json)

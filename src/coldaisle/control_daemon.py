@@ -20,6 +20,12 @@ Critical Safety と Reactive Guard は変わらない。
 
 どの場合も `STARTUP` の Max を通ってから通常の制御へ入る。
 
+制御権（Authority Stage）の正本は `--authority-root` の `authority.json`（`AuthorityStore`。
+決定記録 0057）で、`AuthorityRuntime` が毎 tick 読み、管理ソケットの降格を受け、外の process
+（人の CLI）が journal を変えたことを heartbeat の後の `stat` で知る（決定記録 0072 §2.6）。
+**起動時に journal を読めなければ制御を取らない**（0057 §2.1。壊れた journal を「記録の無い
+状態」と読み替えない）。走行中に読めなくなったら止めずに `SHADOW` へ下げる。
+
 運転モードは管理ソケット（`config/control-admin.yaml`。決定記録 0072）から受ける。
 **入口を開けなくても制御は止めない**（設定が不正・`SO_PEERCRED` が無いときは `AUTO` のまま
 運転し、error を残す）。受付スレッドが走行中に死んだら、loop が自分で全 zone を Max にして
@@ -45,6 +51,7 @@ from types import FrameType
 
 from coldaisle import logs
 from coldaisle.clock import Clock, MonotonicClock, SystemMonotonicClock, WallClock
+from coldaisle.control.authority import AuthorityRuntime, AuthorityStore
 from coldaisle.control.config import (
     CONFIG_FILENAMES,
     ControlConfig,
@@ -59,13 +66,13 @@ from coldaisle.control.logging import ControlTraceLogger
 from coldaisle.control.loop import (
     ControlLoop,
     ControlTickResult,
-    StaticAuthority,
     StaticOperatingMode,
     TelemetrySample,
     Watchdog,
     air_balance_input_metrics,
     build_input_contract,
 )
+from coldaisle.control.operating_mode import AdminAuthorityCommand
 from coldaisle.control.reactive.guard import ReactiveGuard
 from coldaisle.control.safety.critical import (
     ControlRuntimeBinding,
@@ -90,6 +97,11 @@ DEFAULT_DB = Path("var/coldaisle.db")
 DEFAULT_METRICS = Path("config/metrics.yaml")
 DEFAULT_QUALITY_RULES = Path("config/quality.yaml")
 DEFAULT_ADMIN_CONFIG = Path("config/control-admin.yaml")
+DEFAULT_AUTHORITY_ROOT = Path("var/authority")
+"""`authority.json` を置くディレクトリ（`--db` と同じく場所であって閾値ではない）。
+
+本番は `coldaisle-fand` の実行ユーザーと昇格を行う人だけが書ける場所を指定する（0072 §2.5）。
+"""
 
 UNCONFIGURED_MODEL_VERSION = "unconfigured"
 """Learned MPC の worker を配線していない起動で Gate に渡す期待版。
@@ -366,6 +378,8 @@ class Config:
     """外部の deadman へ通知できないときに起動を拒むか（本番の service では真にする）。"""
     admin_config: Path | None = None
     """管理ソケットの設定（決定記録 0072 §2.8）。None は入口を開かない（`AUTO` のまま運転する）。"""
+    authority_root: Path = DEFAULT_AUTHORITY_ROOT
+    """`authority.json` のディレクトリ（0057 §2.1）。相対 path は起動時の作業場所が基準。"""
 
 
 @dataclass(slots=True)
@@ -448,6 +462,8 @@ class ControlDaemon:
     store: SqliteStore | None = None
     admin: ControlAdminEntry | None = None
     """開いた管理ソケット。**loop が止まった後に**閉じる（`close()`）。"""
+    authority: AuthorityRuntime | None = None
+    """制御権の runtime。`close()` で書き残せていない降格を1回だけ書き直す（0057 §2.6）。"""
     sleep: Callable[[float], None] = time.sleep
     stats: ControlStats = field(default_factory=ControlStats)
     _stop: bool = field(default=False, init=False, repr=False)
@@ -461,10 +477,20 @@ class ControlDaemon:
 
         ``drain=False`` は `run()` が例外で抜けたとき。管理ソケットのスレッドを待たずに閉じ、
         process の終了（引き継ぎで Max。0028 §2.7）を遅らせない。
+
+        受付スレッドを止めたあとで authority の枠に残っていた降格は、`AuthorityRuntime` へ
+        入れてから既存の1回だけの書き残しに回す（SIGTERM が置いた直後に来ても、受理した
+        降格を捨てない。0072 §2.6）。
         """
+        leftover: AdminAuthorityCommand | None = None
         if self.admin is not None:
-            self.admin.stop(drain=drain)
+            leftover = self.admin.stop(drain=drain)
             self.admin = None
+        if self.authority is not None:
+            _settle_authority_on_stop(self.authority, leftover, drain=drain)
+            self.authority = None
+        elif leftover is not None:
+            _log_lowering_lost(leftover, "authority runtime が無い")
         if self.store is not None:
             self.store.close()
             self.store = None
@@ -516,6 +542,88 @@ class ControlDaemon:
                 }
             },
         )
+
+
+def _settle_authority_on_stop(
+    authority: AuthorityRuntime, leftover: AdminAuthorityCommand | None, *, drain: bool
+) -> None:
+    """停止の前に、枠に残った降格を入れてから、書き残せていない降格を1回だけ書き直す。
+
+    `ControlDaemon.close()` と、`build()` が管理ソケットを開いた後に組み立てに失敗した経路の
+    両方が通る。どちらでも、クライアントに `pending` を返し監査に `accepted` がある降格を
+    捨てると、再起動で高い stage に戻る（0072 §2.6）。
+    """
+    if leftover is not None:
+        _lower_left_in_mailbox(authority, leftover, drain=drain)
+    _flush_authority(authority, drain=drain)
+
+
+def _lower_left_in_mailbox(
+    authority: AuthorityRuntime, command: AdminAuthorityCommand, *, drain: bool
+) -> None:
+    """どの tick にも取り出されなかった管理ソケットの降格を、停止の前に入れる（0072 §2.6）。
+
+    tick の経路と同じく、いまの stage と比べずに**無条件で**上限として入れる。journal へは
+    続く `_flush_authority` が書く。監査には `applied` を足さない（`applied` は適用した
+    tick を持つ事象で、この降格はどの tick でも効いていない）。受付の行だけがある
+    「受理済み・未確定」として残り、journal の人の event と構造化ログで追える。
+    """
+    try:
+        changed = authority.apply_lowering(
+            to_stage=command.to_stage, actor=command.actor, reason=command.journal_reason()
+        )
+    except Exception:
+        LOGGER.exception(
+            "停止時に control-admin の authority の降格を入れられなかった（再起動で戻る）",
+            extra={logs.FIELDS_KEY: _lowering_fields(command)},
+        )
+        return
+    LOGGER.warning(
+        "停止時に、tick に取り出されなかった control-admin の authority の降格を入れた",
+        extra={logs.FIELDS_KEY: {**_lowering_fields(command), "changed": changed}},
+    )
+    if not drain:
+        # 例外での停止では journal へ書かない（下の `_flush_authority`）。何が残ったかを
+        # 主体と理由つきで残す
+        _log_lowering_lost(command, "例外での停止のため journal へ書かない")
+
+
+def _flush_authority(authority: AuthorityRuntime, *, drain: bool) -> None:
+    """書き残せていない降格を、停止の前に1回だけ書き直す（lock の待ち上限つき）。
+
+    **再起動すると journal の stage で運転が再開する**ので、残った降格を黙って捨てない。
+    ``drain=False``（例外での停止）では待たずに、残った降格を error に残すだけにする。
+    """
+    try:
+        if drain:
+            authority.flush_pending_on_shutdown()
+            return
+        pending = authority.pending_stages
+    except Exception:
+        LOGGER.exception("停止時に authority の降格を書き残せなかった")
+        return
+    if pending:
+        LOGGER.error(
+            "停止までに authority の降格を journal へ書き残せなかった（再起動で戻る）",
+            extra={logs.FIELDS_KEY: {"to_stages": [stage.value for stage in pending]}},
+        )
+
+
+def _lowering_fields(command: AdminAuthorityCommand) -> dict[str, object]:
+    return {
+        "command_id": command.command_id,
+        "op": command.op,
+        "to_stage": command.to_stage.value,
+        "actor": command.actor,
+        "reason": command.reason[:500],
+    }
+
+
+def _log_lowering_lost(command: AdminAuthorityCommand, why: str) -> None:
+    LOGGER.error(
+        "停止までに control-admin の authority の降格を journal へ書き残せなかった（再起動で戻る）",
+        extra={logs.FIELDS_KEY: {**_lowering_fields(command), "why": why}},
+    )
 
 
 def build(
@@ -570,7 +678,11 @@ def build(
     except Exception as error:
         raise StartupEnvironmentError(f"{type(error).__name__}: {error}") from error
     binding = create_control_runtime_binding(control)
-    authority = StaticAuthority()
+    try:
+        authority = open_authority_runtime(config.authority_root, control, clock=clock)
+    except Exception as error:
+        store.close()
+        raise StartupEnvironmentError(f"{type(error).__name__}: {error}") from error
     # **deadman を必ず配線する。** ここを省くと hang しても heartbeat の欠落が起きず、
     # `watchdog_timeout_ms` が一度も効かない（0028 §2.6 / 決定記録 0060 §2.7）。
     deadman = (
@@ -601,9 +713,40 @@ def build(
         )
     except BaseException:
         if admin is not None:
-            admin.stop()
+            # 開いてから組み立てに失敗するまでに受理した降格も書き残す（0072 §2.6）
+            _settle_authority_on_stop(authority, admin.stop(), drain=True)
         raise
-    return ControlDaemon(loop=loop, monotonic=monotonic, store=store, admin=admin)
+    return ControlDaemon(
+        loop=loop, monotonic=monotonic, store=store, admin=admin, authority=authority
+    )
+
+
+def open_authority_runtime(root: Path, control: ControlConfig, *, clock: Clock) -> AuthorityRuntime:
+    """`authority.json` を読む `AuthorityRuntime`（決定記録 0057 / 0072 §2.6）。
+
+    **lock の待ち上限は `tick_deadline_ms`**（decision trace の保存の busy timeout と同じ。
+    0060 §2.7）。書き残しは heartbeat の後に行うので、待ちは次の tick の開始を遅らせるだけで、
+    Fan の書き込みと heartbeat は待たない。上限で諦めた降格は memory 上で下げたまま残る。
+
+    journal が無ければ `SHADOW` から始まる。読めない・壊れているときは例外で止まる（0057 §2.1）。
+    """
+    store = AuthorityStore(
+        root.absolute(), clock, lock_timeout_ms=control.safety.tick_deadline_ms.value
+    )
+    runtime = AuthorityRuntime(store, control.policy)
+    LOGGER.info(
+        "authority journal を読み込んだ",
+        extra={
+            logs.FIELDS_KEY: {
+                "authority_root": str(root),
+                "journal_stage": runtime.journal.stage.value,
+                "journal_revision": runtime.journal.revision,
+                "authority_config_ceiling": runtime.configured_ceiling.value,
+                "authority_stage": runtime.current_stage().value,
+            }
+        },
+    )
+    return runtime
 
 
 def _open_admin(
@@ -642,7 +785,7 @@ def _build_loop(
     catalog: MetricCatalog,
     contract: ControlInputContract,
     binding: ControlRuntimeBinding,
-    authority: StaticAuthority,
+    authority: AuthorityRuntime,
     deadman: Watchdog,
     store: SqliteStore,
     clock: Clock,
@@ -799,6 +942,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="管理ソケットの設定（決定記録 0072 §2.8）。不正なら入口を開かず AUTO で運転する",
     )
     parser.add_argument(
+        "--authority-root",
+        type=Path,
+        default=DEFAULT_AUTHORITY_ROOT,
+        help="authority.json のディレクトリ（決定記録 0057）。読めなければ制御を取らない",
+    )
+    parser.add_argument(
         "--no-admin",
         action="store_true",
         help="管理ソケットを開かない（AUTO のまま運転する。試験・Replay 用）",
@@ -820,6 +969,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         record_trace=not args.no_trace,
         require_watchdog=args.require_watchdog,
         admin_config=None if args.no_admin else args.admin_config,
+        authority_root=args.authority_root,
     )
     monotonic: MonotonicClock = SystemMonotonicClock()
 

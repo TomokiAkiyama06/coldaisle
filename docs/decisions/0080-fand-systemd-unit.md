@@ -1,9 +1,9 @@
 # 決定記録 0080: `coldaisle-fand` の systemd unit（deadman・引き継ぎ・権限・順序）
 
 - **種別**: Decision Record
-- **Status**: Proposed
+- **Status**: FINAL（2026-09-30、リポジトリ所有者が承認）
 - **Date**: 2026-09-30
-- **Supersedes**（承認されたときに効く）:
+- **Supersedes**:
   - [`0060`](0060-control-loop-runtime.md) §2.7「deadman が『ある』と言える条件」の表の4行目
     （`WATCHDOG_USEC` と `watchdog_timeout_ms` が違うときは warning で環境側を採る）のうち、
     **環境側が長い場合のみ**（§2.3 で起動拒否に置き換える）
@@ -14,7 +14,7 @@
     「deadman が使えない（通知先・時間切れ・送信のいずれか）→ 終了コード 4」のうち、
     **通知の I/O の失敗（socket を作れない・送信できない）のみ**（§2.4 で再起動する終了コード 6 に分ける）
 
-  旧記録側への `Superseded by` の追記は、本記録を FINAL にする PR で同時に行う（所有者の選択 9 (a)。下の「所有者の選択」）
+  旧記録側への `Superseded by` の追記は、本記録を FINAL にした PR で行った（所有者の選択 9 (a)。下の「所有者の選択」）
 - **関連**: [`0028-fan-control-contracts.md`](0028-fan-control-contracts.md) §2.2 / §2.6 / §2.7 / §2.8 / §2.9、未決 6 / 7 /
   [`0060-control-loop-runtime.md`](0060-control-loop-runtime.md) §2.1 / §2.7 / §2.9、未決 1 / 7 /
   [`0069-ubuntu-deploy-templates.md`](0069-ubuntu-deploy-templates.md) §2.2 / §2.3 / §2.4、未決 3 /
@@ -26,7 +26,7 @@
   `docs/critical-safety.md`「deadman / 異常停止」/ `docs/fan-hardware-backend.md` / `docs/ubuntu-deploy.md` /
   AGENTS.md「絶対に守るルール」1〜4・6・7・9・10
 - **対象 Issue**: #57（Ubuntu 常駐化）/ #78（Critical Safety の deadman と引き継ぎの配線）
-- **所有者の選択（2026-09-30。最終レビュー待ち）**: 所有者は PR の「所有者に判断してほしい点」1〜13 の
+- **所有者の選択（2026-09-30。同日の最終レビューで承認）**: 所有者は PR の「所有者に判断してほしい点」1〜13 の
   **すべてで推奨案（(a)）を選び**、最終レビュー（97d7470）で残った2つの指摘を推奨の方向で直すよう求めた
   （§2.4 の終了コード 6 / 7、§2.6「書き込みが続けて失敗したら終わる」）。**修正後の本記録を所有者が
   もう一度読んでから承認する**ので、Status は Proposed のままとする。新しい設定値
@@ -98,7 +98,7 @@ unit の書き方次第で、決めた安全の性質が**黙って崩れる**�
     `uid == server_uid` をグループの判定より前に拒否することを求める（段階 1 の前提。§2.10 の段階 0）。
     この変更は 0072 §2.5 の意図をコードに合わせるもので、`allow_same_user: true` の開発用設定と
     eventd（0045、既定 `true`）の挙動は変えない。所有者はこの方式（判断点 13 の (a)）を選んだ
-    （2026-09-30。最終レビュー待ち）。fand を `coldaisle-admin` に入れない方式は §4 の A2 として残す
+    （2026-09-30。同日に承認）。fand を `coldaisle-admin` に入れない方式は §4 の A2 として残す
 - **DB のディレクトリをグループで共有できるようにする**（既存の unit も変える。§2.10 の段階 1）。
   0069 のテンプレートは `StateDirectoryMode=0750` で、systemd はどれかの unit が起動するたびに
   `/var/lib/coldaisle` をこの mode に戻す。0750 ではグループに書き込み権が無く、fand は SQLite の
@@ -495,4 +495,4 @@ fand のテンプレートを先に置いてよい。
 | 12 | `coldaisle-telemetry` / `coldaisle-eventd` の unit（`RuntimeDirectory` は `coldaisle` 以外の名前にする） | 0069 未決 3 / 0045 未決 4 |
 | 13 | コンテナ化（#64）で fand をホストで直接動かすか。本記録はホストで直接動かす前提 | 0028 未決 7 / #64 |
 | 14 | API / AI のユーザーが Telemetry の DB を書ける（§3）。制御入力の書き手を取り込みに限るか（DB の分離・読み取り専用の接続など） | 所有者が別の Issue を立てる（本記録の範囲外） |
-| 15 | 管理ソケットのグループ付け替えのために fand を `coldaisle-admin` に入れる方式（§2.1）。所有者は 2026-09-30 に同じ uid の拒否を認可に足す方式（判断点 13 の (a)、段階 0）を選んだ（最終レビュー待ち）。段階 0 がマージされるまで fand の unit は `enable` しない | #74（段階 0） |
+| 15 | 管理ソケットのグループ付け替えのために fand を `coldaisle-admin` に入れる方式（§2.1）。所有者は 2026-09-30 に同じ uid の拒否を認可に足す方式（判断点 13 の (a)、段階 0）を選んだ（同日に承認）。段階 0 がマージされるまで fand の unit は `enable` しない | #74（段階 0） |

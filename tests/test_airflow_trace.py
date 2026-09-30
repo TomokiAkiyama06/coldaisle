@@ -2,7 +2,7 @@
 
 `airflow-trace.js` の変換を node で実際に動かして確かめる（決定記録 0044。CI では node が必須）。
 
-1. **版の解釈は1か所**（`airflow-trace.js`）。v1〜v12 の fixture を読める
+1. **版の解釈は1か所**（`airflow-trace.js`）。v1〜v13 の fixture を読める
    （schema.py に無い版は「未対応の版」）
 2. **3つの状態を混ぜない**: その版に欄が無い／欄はあるが値が無い／画面が知らない版
 3. Safety override・Fallback・OOD を通常状態と区別して出す
@@ -38,7 +38,7 @@ AIRFLOW_UI_PATH = CONFIG_DIR / "airflow-ui.yaml"
 NOW_MS = 1_787_616_020_000
 
 NOT_IN_VERSION = "この版の記録には無い"
-FIXTURE_VERSIONS = range(1, 13)
+FIXTURE_VERSIONS = range(1, 14)
 
 
 def _node() -> str:
@@ -113,7 +113,7 @@ def _steps(result: Any, zone: str) -> dict[str, dict[str, Any]]:
 
 @pytest.mark.parametrize("version", FIXTURE_VERSIONS)
 def test_every_stored_version_is_read(version):
-    """保存済みの v1〜v12 の fixture を、同じ `page.control` の形にできる。"""
+    """保存済みの v1〜v13 の fixture を、同じ `page.control` の形にできる。"""
     result = _convert(_body(version))
     assert result["status"] == "ok"
     assert result["schema_version"] == version
@@ -182,11 +182,11 @@ def test_workload_regime_absent_in_v1_only():
     assert _chip(_convert(_body(2)), "負荷の傾向")["v"] != NOT_IN_VERSION
 
 
-@pytest.mark.parametrize("version", [13, 999])
+@pytest.mark.parametrize("version", [14, 999])
 def test_an_unknown_version_is_not_shown(version):
     """画面が知らない版は「未対応の版」。**制御由来の項目を出さない。**
 
-    v13 は schema.py にまだ無い。中身は先にマージされた PR で決まるので、推測で読まない。
+    v14 は schema.py にまだ無い。中身は先にマージされた PR で決まるので、推測で読まない。
     """
     body = _body(10)
     body["schema_version"] = version
@@ -763,3 +763,56 @@ def test_v12_lease_expiry_is_named():
         "v": "手動の期限切れで自動へ戻した（指令 #2）",
         "tone": "warn",
     }
+
+
+# ------------------------------------------------------------ v13: 制御権の出どころ（0072 §2.6）
+
+
+def _v13(document: dict[str, Any]) -> dict[str, Any]:
+    """schema.py の ControlTick として検証を通した v13 の本文。**実在しない形を試さない。**"""
+    tick = ControlTick.model_validate_json(json.dumps(document))
+    assert tick.schema_version == 13
+    loaded: dict[str, Any] = json.loads(tick.model_dump_json())
+    return loaded
+
+
+def test_v12_has_no_authority_source():
+    assert _chip(_convert(_body(12)), "制御権の出どころ")["v"] == NOT_IN_VERSION
+
+
+def test_v13_reads_the_journal_as_the_normal_source():
+    chip = _chip(_convert(_v13(_body(13))), "制御権の出どころ")
+    assert chip == {"k": "制御権の出どころ", "v": "権限の記録（journal）"}
+
+
+def test_v13_an_unreadable_journal_is_shown_as_bad():
+    """journal を読めずに SHADOW へ下げている運転を、通常状態に見せない（0072 §2.6）。"""
+    body = _body(13)
+    body["authority"].update({"journal_unreadable": True, "unpersisted_ceiling": "shadow"})
+    chip = _chip(_convert(_v13(body)), "制御権の出どころ")
+    assert chip["tone"] == "bad"
+    assert "読めない" in chip["v"]
+
+
+def test_v13_an_admin_demotion_is_named():
+    body = _body(13)
+    body["authority"].update({"command_id": 4, "unpersisted_ceiling": "shadow"})
+    chip = _chip(_convert(_v13(body)), "制御権の出どころ")
+    assert chip == {
+        "k": "制御権の出どころ",
+        "v": "管理ソケットの降格 #4 を入れた",
+        "tone": "warn",
+    }
+
+
+def test_v13_an_unpersisted_demotion_is_shown_as_bad():
+    body = _body(13)
+    body["authority"].update(
+        {
+            "unpersisted_ceiling": "shadow",
+            "persist_failure": {"code": "authority_persist_failed", "detail": "disk full"},
+        }
+    )
+    chip = _chip(_convert(_v13(body)), "制御権の出どころ")
+    assert chip["tone"] == "bad"
+    assert "再起動で戻る" in chip["v"]

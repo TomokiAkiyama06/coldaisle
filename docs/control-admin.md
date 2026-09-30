@@ -1,13 +1,14 @@
 # 管理ソケット（control-admin）: 運転モードの切り替え
 
-走っている `coldaisle-fand` へ、人が運転モード（`AUTO` / `MANUAL` / `MAX`）を届ける入口です。
-決定記録 [0072](decisions/0072-control-admin-entry.md) の §2.10 段階 1（#74）を実装しています。
+走っている `coldaisle-fand` へ、人が運転モード（`AUTO` / `MANUAL` / `MAX`）と Authority Stage の
+降格を届ける入口です。決定記録 [0072](decisions/0072-control-admin-entry.md) の §2.10 段階 1（#74）と
+段階 2（#92。`lower_authority` / `rollback_authority` と journal の配線）を実装しています。
 
 - 読み取り API（`coldaisle.api` / `coldaisle.server`）とも、`coldaisle-eventd`（決定記録 0045）とも別の入口です
 - LLM のツールからは到達できません（`coldaisle.ai` / `coldaisle.api` / `coldaisle.server` /
   `coldaisle.event_entry` は `coldaisle.control_admin` を import しない。`tests/test_control_admin.py` が走査）
-- **制御権を増やせません。** authority の昇格の操作はありません。段階 1 では
-  `lower_authority` / `rollback_authority` も `unsupported_op` で拒否します（段階 2 の #92 で受理）
+- **制御権を増やせません。** authority の昇格の操作はありません（`raise_authority` は `unknown_op`）。
+  昇格は段階 3 の `coldaisle-authority raise`（人が実行する CLI。未実装）だけが行います
 - `CALIBRATION` は #75 の測定計画の形が決まるまで `unsupported_mode` で拒否します（段階 4）
 
 ## 使い方
@@ -17,6 +18,8 @@ uv run coldaisle-control status
 uv run coldaisle-control max --reason "GPU 負荷試験の前に全開にする"
 uv run coldaisle-control manual --front 0.6 --rear 0.5 --top 0.7 --lease 30m --reason "騒音の比較"
 uv run coldaisle-control auto --reason "比較の終了"
+uv run coldaisle-control lower-authority --to-stage limited --reason "夜間の OOD が多い"
+uv run coldaisle-control rollback-authority --reason "新しい artifact の挙動を見直す"
 ```
 
 終了コードは 0 = 受理 / 1 = 拒否 / 2 = 接続できない・応答が壊れている・設定を読めない。
@@ -32,6 +35,34 @@ uv run coldaisle-control auto --reason "比較の終了"
 - 後から来た指令に置き換えられた指令は `superseded_by` を返します
 - `coldaisle-fand` を再起動すると `AUTO` に戻ります（モードは永続化しない）
 - `MANUAL` の期限は `coldaisle-fand` の**単調時計**だけで数えます（壁時計が動いても変わらない）
+
+## Authority Stage の降格（段階 2。#92）
+
+| 操作 | 意味 |
+|---|---|
+| `lower-authority --to-stage shadow\|limited\|expanded` | 実効 stage をその stage 以下にする上限を入れる（`full` は行き先に取らない） |
+| `rollback-authority` | Baseline（`shadow`）へ戻す |
+
+- どちらも**安全側の指令**です。受付スレッドは採番したら監査の書き込みを待たずに受け渡し口の
+  **authority の枠**へ置き、そのあとで受付の行を依頼します（監査を書けなくても取り消さない）
+- 受付の時点の stage とは比べません。loop が次の tick の先頭で `AuthorityRuntime` へ**無条件に**
+  上限として入れ、その tick の Gate から下がった stage が効きます（応答の `applied_tick_id`）
+- journal（`authority.json`）へは heartbeat と decision trace の保存の後に、人の変更
+  （`actor = uid.<数値>`、`trigger = human`、理由に `command_id` と入力した理由）として書きます。
+  書けなければ memory 上の上限を持ち続け、次の tick で書き直します（`status` の `persist_failure`）
+- **journal に人の event が残らない場合があります。** 書く時点で journal が既にその stage 以下
+  （例: 読めない journal による自動降格が先に `shadow` を書いた）なら、journal の上では何も変わらないので
+  event を足しません。人の指令は監査の表（`accepted` / `applied`）に残ります
+- 同じ tick までに降格が複数届いたら、**最も低い行き先**を採ります。採らなかった指令は `superseded_by`
+  を返します（後から届いた浅い降格は、先に届いた深い降格に置き換えられる）
+- モードの枠とは別の枠なので、`max` と `rollback-authority` は同じ tick で両方効きます
+- `coldaisle-fand` の停止の手順では、どの tick にも取り出されなかった降格を枠から取り出し、
+  journal へ書き残してから止まります。取り出した後は枠を閉じ、そのあとに届いた降格は置かずに、
+  応答せずに接続を閉じます（受付の行も残しません）。CLI には「接続できない」（終了コード 2）と出るので、
+  次に起動した `coldaisle-fand` へ送り直してください
+- 走っている `coldaisle-fand` は、外の process（人の CLI）が journal を変えたことを毎 tick の `stat` で知り、
+  次の tick から効かせます。走行中に journal が読めなければ `shadow` へ下げ、読めるようになっただけでは
+  戻しません（`docs/authority-rollout.md`）
 
 ## 設定（`config/control-admin.yaml`）
 
@@ -114,26 +145,33 @@ loop は毎 tick の先頭で受付スレッドの生存を lock を取らずに
 この `MAX` は **`coldaisle-fand` の再起動まで**保ちます（受け渡し口も読まない）。入口を最初から
 開かなかった場合は対象外です。
 
+ただし、死を検知したら **authority の枠を取り出せるまで毎 tick 試し**（lock を待たない）、死ぬ前に受理していた降格を
+いつもの tick と同じく効かせて journal へ書き残します（決定記録 0081）。再起動しても降格した stage で
+始まります。モードの枠に残った指令は適用せずに捨てます（warning に `command_id` を残す）。
+
 ## 監査（`control_admin_audit` 表。migration 0008）
 
-状態を変える指令（`set_mode`）の経過を、行を書き換えずに事象の行として追記します。更新・削除はトリガで拒否します。
+状態を変える指令（`set_mode` / `lower_authority` / `rollback_authority`）の経過を、行を書き換えずに
+事象の行として追記します。更新・削除はトリガで拒否します。
 
 | `event` | 持つ欄 | いつ |
 |---|---|---|
 | `accepted` | `peer_uid`・`op`・`body`（検証済みの本文） | 受付。`max` は受け渡し口へ置いた後、弱めうる指令は置く前 |
 | `applied` | `tick_id` | loop が適用した |
-| `superseded` | `superseded_by` | 後の指令に置き換えられた |
+| `superseded` | `superseded_by` | 採られなかった（モードの枠は後の指令、authority の枠はより低い行き先の指令に置き換えられた） |
 | `lease_expired` | `tick_id` | `MANUAL` の期限切れで `AUTO` へ戻した |
 
 - `(run_id, command_id)` で一意です。`run_id` は起動ごとの 32 桁の16進の乱数で、`command_id` は起動ごとに 1 から振り直します
 - 書くのは `coldaisle-fand` の**監査書き込みスレッド1本**だけで、別の SQLite 接続を使います
-- `max` は監査の書き込みを待たずに効きます。書けなかったときは構造化ログと `status` の `audit_failures` に残ります
+- `max`・`lower_authority`・`rollback_authority` は監査の書き込みを待たずに効きます。書けなかったときは構造化ログと `status` の `audit_failures` に残ります
+- migration 0009 で `superseded_by` の条件を「自分自身ではない」に緩めました（authority の枠では、
+  先に受け付けた深い降格が後の浅い降格を置き換えるため）
 - 弱めうる指令（`auto`・`manual`）は、受付の行を書けなければ受理しません（`audit_unavailable`）
 - 受付の時刻（`ts_ms`）は壁時計で、記録にだけ使います（lease の計算には使わない）
 
-## decision trace（`ControlTick` v12）
+## decision trace（`ControlTick` v12 / v13）
 
-各 tick に `mode_command` を残します。
+各 tick に `mode_command`（v12）と `authority`（v13）を残します。
 
 | 欄 | 意味 |
 |---|---|
@@ -143,10 +181,16 @@ loop は毎 tick の先頭で受付スレッドの生存を lock を取らずに
 | `manual_lease_expired_command_id` | その tick で期限が切れた `MANUAL` の指令 |
 | `admin_receiver_dead` | 受付スレッドの死による `MAX`（再起動まで毎 tick 真） |
 
-エアフロー画面は「モードの出どころ」として表示します（受付の停止による最大は `bad` の色）。
+v13 の `authority` は `entry`（`journal` / `static`）・`journal_stage` / `journal_revision`・`config_ceiling`・
+`unpersisted_ceiling`（書き残せずに持っている上限）・`journal_unreadable`・`command_id`（その tick の先頭で
+入れた降格）・`persist_failure` です。`state.authority_stage` はこれらの上限の最小を超えません。
+
+エアフロー画面は「モードの出どころ」と「制御権の出どころ」として表示します（受付の停止による最大、
+journal を読めない・書き残せないことは `bad` の色）。
 
 ## `status` の欄
 
-`mode`・`command_id`・`manual_lease_remaining_ms`・`authority_stage`（実効）・`authority_journal_stage`
-（段階 1 では null）・`authority_ceiling`（`fan-policy.yaml` の上限）・`persist_failure`（段階 1 では null）・
-`entry`・`audit_failures`・`run_id`・`tick_id`。**読み取り API には出しません。**
+`mode`・`command_id`・`manual_lease_remaining_ms`・`authority_stage`（実効）・`authority_journal_stage`・
+`authority_journal_revision`・`authority_ceiling`（`fan-policy.yaml` の上限）・`authority_unpersisted_ceiling`・
+`authority_journal_unreadable`・`persist_failure`・`entry`・`audit_failures`・`run_id`・`tick_id`。
+authority の欄は loop が最後に置いた写しです（まだ1 tick も回っていなければ null）。**読み取り API には出しません。**

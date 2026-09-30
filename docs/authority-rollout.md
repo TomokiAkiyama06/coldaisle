@@ -98,9 +98,19 @@ lock を手放す `inspect()` だけでは、A の証拠を持ったまま B が
 
 同じ承認は2回使えない（`expected_revision` に束縛する）。
 
-`AuthorityJournal` は v2 である。v2 で新しく書く昇格の証拠（`RolloutEvidence`）は
+`AuthorityJournal` は v3 である。v2 から、新しく書く昇格の証拠（`RolloutEvidence`）は
 `air_balance_config_sha256` と `fan_hardware_config_sha256` を必ず持つ。既に残った v1 の event は
-書き換えずに読むが、新しい昇格の根拠にはならない。Air Balance が無効（`uncalibrated`）の間に
+書き換えずに読むが、新しい昇格の根拠にはならない。v3（#92 / 決定記録 0072 §2.6）は自動降格の
+理由に `authority_journal_unreadable` を足した版で、この理由の event は v3 の journal にだけ置ける
+（v2 までの reader には「知らない journal」として拒ませる）。v1 / v2 の journal はそのまま読み、
+次に書くときに v3 で書く（新しい原因を含まない降格・昇格でも v3 で書く）。
+
+**切り戻しの注意:** v3 を書く `coldaisle-fand` が1回でも journal へ書くと、#92 より前のバイナリは
+その journal を読めず、起動を拒む（終了コード 5。引き継ぎの Max のまま止まる）。旧版へ戻すときは、
+先に `authority.json` を退避し、旧版では journal の無い状態（`SHADOW`）から始める。昇格はやり直しになる
+（旧 reader は未知の `cause` を enum の検証でどのみち拒むので、原因を含む event だけ v3 にしても
+切り戻しの安全は変わらない。版を常に上げるのは「知らない journal」として一律に拒ませるためである）。
+Air Balance が無効（`uncalibrated`）の間に
 集めた証拠もその未校正ファイルに束縛されるので、`calibrated` へ差し替えた後は使えない。
 
 ## 下げる（承認は要らない）
@@ -123,21 +133,56 @@ lock を手放す `inspect()` だけでは、A の証拠を持ったまま B が
 **記録の無い降格の上限だけ**が `reload()` でも外れない（process を作り直すまで残る）。
 下がったあとに自動で戻る経路は無い。戻すには新しい承認が要る。
 
+## `coldaisle-fand` での配線（決定記録 0072 §2.6 / §2.10 段階 2）
+
+`coldaisle-fand` は `--authority-root`（既定 `var/authority`）の `authority.json` を
+`AuthorityRuntime` で読み、Controller Gate と control loop に同じ runtime を渡す。
+
+- **起動時に journal を読めなければ制御を取らない**（終了コード 5。0057 §2.1）。journal が無ければ `SHADOW`
+- control runtime の store の lock の待ち上限は `safety.yaml` の `tick_deadline_ms`（0060 §2.7）
+- 管理ソケットの `lower_authority` / `rollback_authority`（`docs/control-admin.md`）は、次の tick の
+  先頭で **memory 上の上限として無条件に**入る（いまの stage と比べない）。Gate はその tick から
+  下がった stage を読む。journal へは heartbeat と decision trace の保存の後に、人の変更
+  （`actor = uid.<数値>`、`trigger = human`）として書く。書けなければ上限を持ち続け、次の tick で書き直す
+- 毎 tick、heartbeat と trace の保存の後に `authority.json` の `stat`（inode・大きさ・`mtime_ns`）を見て、
+  変わっていたら読み直す（flock を取らない）。外の process の rollback・昇格は**次の tick から**効く。
+  実効 stage は journal・設定の上限・この process が書き残せずに持っている上限の最小のまま
+- **走行中に journal が読めない・壊れているときは止めずに `SHADOW` へ下げ**、`authority_journal_unreadable`
+  の自動降格として journal へ書き残しを試みる。**読めるようになっただけでは戻さない。** 書けたら
+  journal が `SHADOW` を表すので上限を手放す（authority は上がらない）。戻すには承認による昇格が要る
+- **読み直した journal が既知の履歴を延長していない**（revision が戻った・event 列が差し替わった。
+  古いバックアップの書き戻しなど）ときも、読めない journal と同じく `SHADOW` へ下げて
+  `authority_journal_unreadable` を書き残す。承認を経ずに高い stage が戻ってくる経路にしない。
+  追記で届いた昇格（`raise_stage`）だけがそのまま効く
+- 予約した書き残しは、同じ主体（trigger・actor・cause）の同じ深さ以上のものを重ねない（主体 × stage の
+  段数で抑えられる）。1 tick に書くのは1件で、**同じ tick で自動降格が既に lock を待っていれば次の tick に
+  回す**（heartbeat の後の待ちを trace の保存と合わせて2回までに抑える。0060 §2.7）
+- 停止（`SIGTERM`）の直前に、残った予約を1回だけ書き直す。それでも書けなければ行き先を error ログに残す
+  （再起動すると journal の stage で運転が再開する）
+
+**runtime に authority を上げる経路は無い。** 外の process（人の CLI）の昇格が journal に入っても、
+それは 0057 §2.3 の承認を経たものだけである。
+
 ## 記録
 
 - `ControllerSelection.authority_stage`: 提案の無い tick にも残る
 - `MpcProposal.binding_authority_stage` → `LearnedControlStatus`: worker が照合した stage を
   Gate まで運ぶ。覆っていなければ `binding_authority_not_covered` で Fallback にする
 - `AuthorityRuntime.trace_metadata()`: 実効 stage・journal の stage・設定の上限・
-  直近の変更（種別・主体・理由・時刻）・永続化の失敗。**model version を含めない**
+  直近の変更（種別・主体・理由・時刻）・永続化の失敗・journal を読めないこと。**model version を含めない**
+- `ControlTick` v13 の `authority`（`AuthorityRecord`）: その tick の Gate が stage を読んだ時点の
+  journal の stage と revision・設定の上限・書き残せずに持っている上限・`journal_unreadable`・
+  その tick の先頭で入れた管理ソケットの降格の `command_id`・直近の永続化の失敗。
+  実効 stage（`state.authority_stage`）はこれらの最小を超えない（schema が拒む）
 
 ## まだ無いもの
 
 decision trace への、適用した tick の model artifact の記録は #159（PR #160 / 決定記録 0059）で入った。
+走っている `coldaisle-fand` の authority stage を下げる・rollback する入口は、管理ソケット
+（`coldaisle-control lower-authority` / `rollback-authority`。決定記録 0072 §2.10 段階 2。#92）で入った。
 
-- 走行中の `coldaisle-fand` の authority stage を下げる・rollback する入口（`coldaisle-control` の
-  `lower_authority` / `rollback_authority`）。決定記録 0072 §2.10 段階 2（#92）で入る予定で、まだ main に無い
-- authority stage を**上げる**入口（`coldaisle-authority raise`）。0072 §2.10 段階 3（#92）。
+- authority stage を**上げる**入口（`coldaisle-authority raise`）と、`coldaisle-fand` が止まっている
+  ときの rollback（`coldaisle-authority rollback`）。0072 §2.10 段階 3（#92）。
   読み取り API（#23）は制御を変えない
 - 各段に必要な運転期間の下限
 - 実機での rollout。GPU サーバーが要る（#92 の `requires:server`）

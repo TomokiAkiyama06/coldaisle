@@ -4,6 +4,7 @@
 - **Status**: FINAL（2026-09-13、リポジトリ所有者が承認）
 - **Date**: 2026-09-13
 - **Supersedes**: なし
+- **Superseded by**: [0080](0080-fand-systemd-unit.md)（§2.7「正常停止」のうち、引き継ぎ実行部が正常停止を見分ける方法のみ＝引き継ぎ記録の有無に。戻す・戻さないの規則と通知は有効）
 - **関連**: [`0027-fan-control-architecture.md`](0027-fan-control-architecture.md) /
   [`0026-three-zone-fan-control.md`](0026-three-zone-fan-control.md) /
   [`0001-initial-project-decisions.md`](0001-initial-project-decisions.md)（D-07） /

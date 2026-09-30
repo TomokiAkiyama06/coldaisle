@@ -45,7 +45,7 @@ from coldaisle.control.fallback.gate import (
 from coldaisle.control.hardware.simulated import FanHardwareBackend, FanHardwareResult
 from coldaisle.control.logging import ControlTraceLogger
 from coldaisle.control.mpc.controller import MpcProposal
-from coldaisle.control.operating_mode import AdminModeTracker
+from coldaisle.control.operating_mode import AdminAuthorityCommand, AdminModeTracker
 from coldaisle.control.operating_mode import ModeCommand as ModeCommand  # 既存の import 先を保つ
 from coldaisle.control.reactive.guard import (
     ReactiveGuard,
@@ -67,6 +67,7 @@ from coldaisle.control.schema import (
     CONTROL_TICK_RUNTIME_SCHEMA_VERSION,
     SCHEMA_VERSION,
     AirBalanceRecord,
+    AuthorityRecord,
     AuthorityStage,
     ConfidenceLevel,
     ControlConfigDigest,
@@ -94,6 +95,7 @@ from coldaisle.control.schema import (
     ZoneRecord,
     ZoneRequest,
     lowest_stage,
+    stage_rank,
 )
 from coldaisle.control.shadow.record import ShadowRecorder
 from coldaisle.control.state import (
@@ -244,6 +246,24 @@ class AuthorityObserver(Protocol):
         """この tick の健全性を渡す。下げたときだけ結果を返す。"""
         ...
 
+    def apply_lowering(self, *, to_stage: AuthorityStage, actor: str, reason: str) -> bool:
+        """人の降格（管理ソケット）を**memory 上で先に**入れる。待たない（決定記録 0072 §2.6）。
+
+        返すのは実効 stage が下がったか。下がらなくても上限は残る。**上げる向きは無い。**
+        """
+        ...
+
+    def maintain(self) -> None:
+        """heartbeat の後に1回。予約した降格の書き残しと journal の変化の検知（0072 §2.6）。
+
+        待つのは lock の待ち上限まで。例外を外へ出さない。効くのは次の tick から。
+        """
+        ...
+
+    def trace_record(self, *, command_id: int | None) -> AuthorityRecord:
+        """decision trace（v13）へ残す、この時点の制御権の出どころ。"""
+        ...
+
 
 class StaticAuthority:
     """journal を持たない構成に使う、**固定 stage の** authority（既定は `SHADOW`）。
@@ -252,16 +272,45 @@ class StaticAuthority:
     そのまま制御権にすると、`full` と書かれた設定だけで Learned MPC が実 Fan を握る
     （#79 `ControllerGate.__init__` と同じ理由）。降格の記録は持たないので `observe` は
     何もしない。昇格の経路はどこにも無い。
+
+    人の降格（管理ソケット）は memory 上の上限として受ける（書き残す journal が無いので、
+    再起動で戻る）。**受けた降格を黙って捨てない。**
     """
 
-    __slots__ = ("_stage",)
+    __slots__ = ("_ceiling", "_config_ceiling", "_stage")
 
-    def __init__(self, stage: AuthorityStage = BASELINE_STAGE) -> None:
+    def __init__(
+        self,
+        stage: AuthorityStage = BASELINE_STAGE,
+        *,
+        config_ceiling: AuthorityStage | None = None,
+    ) -> None:
         self._stage = stage
+        self._ceiling = AuthorityStage.FULL
+        # trace に残す設定の上限。渡されなければ固定 stage と同じ（それ以上は与えない）
+        self._config_ceiling = stage if config_ceiling is None else config_ceiling
 
     def current_stage(self) -> AuthorityStage:
-        """固定された stage を返す。"""
-        return self._stage
+        """固定された stage（人が下げていればその上限）を返す。"""
+        return lowest_stage(self._stage, self._ceiling)
+
+    def apply_lowering(self, *, to_stage: AuthorityStage, actor: str, reason: str) -> bool:
+        """memory 上の上限だけを入れる（journal は無い）。"""
+        before = self.current_stage()
+        self._ceiling = lowest_stage(self._ceiling, to_stage)
+        return stage_rank(self.current_stage()) < stage_rank(before)
+
+    def maintain(self) -> None:
+        """journal を持たないので何もしない。"""
+
+    def trace_record(self, *, command_id: int | None) -> AuthorityRecord:
+        """journal を持たない構成の記録（`entry="static"`）。"""
+        return AuthorityRecord(
+            entry="static",
+            config_ceiling=self._config_ceiling,
+            unpersisted_ceiling=None if self._ceiling is AuthorityStage.FULL else self._ceiling,
+            command_id=command_id,
+        )
 
     def observe(
         self,
@@ -649,7 +698,10 @@ class ControlLoop:
         ts_ms = self._clock.now_ms()
         # **tick の先頭でモードを決める**（決定記録 0072 §2.2 / 0060 §2.5）。受付スレッドの
         # 生存の確認は受け渡し口を覗く前に行い、tick の途中ではモードを変えない。
-        mode, mode_record = self._resolve_mode(tick_id, started_mono_ms)
+        mode, mode_record, authority_command = self._resolve_mode(tick_id, started_mono_ms)
+        # **降格は Gate がこの tick の stage を読む前に効かせる**（決定記録 0072 §2.6）。
+        # memory 上の上限を入れるだけで、journal への書き残しは heartbeat の後に回す。
+        authority_record = self._apply_authority_command(tick_id, authority_command)
 
         snapshot, snapshot_status = self._snapshot(tick_id, ts_ms, started_mono_ms)
         self._snapshots.append(
@@ -730,7 +782,9 @@ class ControlLoop:
         )
         if self._admin_mode is not None:
             # `status` のための写しを置くだけ（待たない）。heartbeat の後に置く。
-            self._admin_mode.publish(tick_id=tick_id, authority_stage=state.authority_stage)
+            self._admin_mode.publish(
+                tick_id=tick_id, authority_stage=state.authority_stage, authority=authority_record
+            )
         flows, air_balance = self._air_balance_record(
             snapshot, hardware=hardware, faults=safety_decision.faults
         )
@@ -775,8 +829,13 @@ class ControlLoop:
             air_balance=air_balance,
             # **その tick のモードの出どころを残す**（v12。#74 / 決定記録 0072 §2.7）。
             mode_command=mode_record,
+            # **その tick の制御権の出どころを残す**（v13。#92 / 決定記録 0072 §2.6）。
+            authority=authority_record,
         )
         recorded, trace_failed = self._record(tick)
+        # **journal の書き残しと変化の検知は heartbeat と trace の保存の後**（0072 §2.6 /
+        # 0060 §2.7）。lock の待ち上限つきで、効くのは次の tick から。
+        self._maintain_authority()
         self._log_guard_events(guard_decision)
 
         if overrun:
@@ -849,13 +908,62 @@ class ControlLoop:
 
     def _resolve_mode(
         self, tick_id: int, now_mono_ms: int
-    ) -> tuple[ModeCommand, ModeCommandRecord]:
-        """この tick のモードと、その出どころの記録。"""
+    ) -> tuple[ModeCommand, ModeCommandRecord, AdminAuthorityCommand | None]:
+        """この tick のモードと、その出どころの記録、authority の枠から取り出した降格。"""
         if self._admin_mode is not None:
             resolution = self._admin_mode.resolve(tick_id=tick_id, now_mono_ms=now_mono_ms)
             self._mode = resolution.command
-            return resolution.command, resolution.record
-        return self._mode_command(), ModeCommandRecord.without_entry()
+            return resolution.command, resolution.record, resolution.authority
+        return self._mode_command(), ModeCommandRecord.without_entry(), None
+
+    def _apply_authority_command(
+        self, tick_id: int, command: AdminAuthorityCommand | None
+    ) -> AuthorityRecord:
+        """管理ソケットの降格を memory 上で入れ、この tick の制御権の記録を作る。
+
+        **入れられなかった降格を適用したと返さない。** 例外は捕まえて記録し、制御は続ける
+        （降格が入らなくても authority は上がらない）。
+        """
+        applied_id: int | None = None
+        if command is not None:
+            try:
+                changed = self._authority.apply_lowering(
+                    to_stage=command.to_stage,
+                    actor=command.actor,
+                    reason=command.journal_reason(),
+                )
+            except Exception:
+                LOGGER.exception(
+                    "control-admin の authority の降格を入れられなかった",
+                    extra={logs.FIELDS_KEY: {"tick_id": tick_id, "command_id": command.command_id}},
+                )
+            else:
+                applied_id = command.command_id
+                LOGGER.warning(
+                    "control-admin の authority の降格を入れた（journal へは heartbeat の後）",
+                    extra={
+                        logs.FIELDS_KEY: {
+                            "tick_id": tick_id,
+                            "command_id": command.command_id,
+                            "op": command.op,
+                            "to_stage": command.to_stage.value,
+                            "changed": changed,
+                            "authority_stage": self._authority.current_stage().value,
+                        }
+                    },
+                )
+                if self._admin_mode is not None:
+                    self._admin_mode.authority_applied(
+                        command_id=command.command_id, tick_id=tick_id
+                    )
+        return self._authority.trace_record(command_id=applied_id)
+
+    def _maintain_authority(self) -> None:
+        try:
+            self._authority.maintain()
+        except Exception:
+            # 書き残し・読み直しに失敗しても制御は続ける。上げる経路は無い。
+            LOGGER.exception("authority runtime maintenance failed")
 
     def _mode_command(self) -> ModeCommand:
         """人が決めたモード。読めなければ**直前のモードを保つ。**
