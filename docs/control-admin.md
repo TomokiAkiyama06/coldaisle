@@ -69,6 +69,9 @@ uv run coldaisle-control rollback-authority --reason "新しい artifact の挙�
 `coldaisle-fand` は `--admin-config` を省くと `config/control-admin.yaml` を読みます。**この既定の設定は
 同じ uid の接続を認めません**（`allow_same_user: false`。0072 §2.5）。同じ uid で動く別のサービス
 （読み取り API・AI 層など）から `manual` / `max` を送れないようにするためです。
+**`coldaisle-fand` のユーザー自身が `socket.group` のメンバーでも、同じ uid は拒否します**
+（グループの判定より前に拒否する。決定記録 0080 §2.1）。fand はソケットのグループを付け替えるために
+そのグループへ入るので、グループの判定だけでは fand と同じ uid で動く任意のプロセスが操作できてしまうためです。
 
 - `socket.group` の値は**仮の名前**です。配置先で作った専用グループ名に置き換え、操作する人だけをそのグループに
   入れてください。グループを解決できなければ入口は開かず、`coldaisle-fand` は `AUTO` で運転を続けます
