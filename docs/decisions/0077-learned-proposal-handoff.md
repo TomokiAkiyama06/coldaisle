@@ -167,11 +167,15 @@ frame は tick ごとに1つ、その tick の**同じ snapshot**から作る。
    `mpc.valid_ms` の意味は変えない**（Supersede しない）。読み込み時に次の2つの不変条件を
    確かめ、満たさなければ Control Config の一括検証（0073）として `config_invalid` にする
    - 上限: `mpc.max_source_age_ms <= mpc.valid_ms`
-   - **下限**: `mpc.max_source_age_ms >= safety.tick_ms + mpc.period_ms + mpc.budget_ms`
-     （`safety.yaml` と `fan-policy.yaml` をまたぐ照合）。frame が届くまでの最大1 tick、
-     worker が最後の frame を拾うまでの最大1周期、optimizer の予算を足した値より短いと、
-     健全な worker の提案も毎回期限切れになり、Learned が**黙って一度も使われない**構成を
-     許してしまうため（安全側には倒れるが、設定の誤りを起動時に見せる）
+   - **下限**: `mpc.max_source_age_ms >= 2 * safety.tick_ms + mpc.period_ms + mpc.budget_ms`
+     （`safety.yaml` と `fan-policy.yaml` をまたぐ照合）。遅れは往きと還りの両方にある。
+     往きは元 snapshot から frame が worker へ届くまでの最大1 tick（frame は同じ tick の中で送り、
+     tick の処理は `tick_deadline_ms <= tick_ms` に収まる。0060 §2.1）、worker が最後の frame を
+     拾うまでの最大1周期、optimizer の予算。還りは、結果がループの `poll()` の直後に届いたときに
+     次の tick の `poll()` まで待つ最大1 tick（`poll()` は tick ごとに1回で、
+     Critical Safety より前。0060 §2.5 の順序）。これらを足した値より短いと、健全な worker の提案も期限切れになりえ、
+     Learned が**黙って一度も使われない**構成を許してしまうため（安全側には倒れるが、設定の誤りを
+     起動時に見せる）。overrun した tick は締め切り（5）で ML を通さないので、この下限の前提に入れない
 
    （→ 所有者判断 6）
 5. **締め切り**は 0060 §2.6 のまま。締め切りを過ぎた tick では ML を通さない。ループは
@@ -271,8 +275,17 @@ frame は tick ごとに1つ、その tick の**同じ snapshot**から作る。
   `mpc` を名乗れ、乗っ取られた RL worker が本物の MPC worker より先に接続して Demand を含む
   `MpcProposal` を送れてしまう（authority が `SHADOW` より上のとき実 Fan の requested に届く）
   （→ 所有者判断 12）
-- 2つのグループは**重ねない**（同じ uid を両方に入れない）。設定の読み込み時に、2つのグループ名が
-  同じ・同じソケット path を指す構成を拒む。実行ユーザーも役割ごとに分ける（§2.1）
+- 2つのグループは**重ねない**（同じ uid を両方に入れない）。名前が違っても同じ uid を含む2つの
+  グループは、その uid に両方の役割を与えてしまうので、**名前と path の比較だけでは足りない**。
+  次の3つで確かめる。実行ユーザーも役割ごとに分ける（§2.1）
+  - 設定の読み込み時に、2つのグループ名が同じ・同じソケット path を指す構成を拒む
+  - **起動時に2つのグループを解決し、所属する uid の集合が重なれば拒む。** 所属は 0072 §2.5 の門
+    （`local_socket` の `allows`）と同じ規則で数える（補助グループの `gr_mem` と、主グループが
+    そのグループであるユーザーの両方）。gid が同じ2つの名前も重なりとして拒む。重なりは設定の
+    不正と同じ扱い（本節の末尾。Learned を無効にして起動を続け、error を残す）
+  - **接続ごとにも、相手がもう一方の役割のグループに属していれば拒む。** グループの所属は走行中に
+    変わりうる（起動時の検査の後に uid が足される）ので、起動時の検査だけに頼らない。拒んだ接続は
+    接続ごとのログに残す
 - 封筒の `role` は残すが、**そのソケットの役割と一致しなければ捨てる**（照合であって認可ではない）
 - **`coldaisle-fand` と同じ uid も root も暗黙には認めない**（0072 §2.5 と同じ理由）
 - 役割ごとに**同時に1接続**だけ。既に生きた接続がある役割への新しい接続は拒否し、接続ごとの
@@ -354,7 +367,7 @@ frame は tick ごとに1つ、その tick の**同じ snapshot**から作る。
 | 受付スレッドの死で Learned だけが閉じ、Max にはならない | スレッドを止め、次の tick から `learned_proposal_unavailable`・`forced_max` が立たないこと |
 | どの経路でも effective は Guard と Critical Safety を通る | 既存の合成の性質試験を、採った Learned 提案を含む入力で回す（requested に 0.0 を置いても floor が残る） |
 | 再起動をまたいだ結果を使わない | 同じ `tick_id` / `ts_ms` を持つ前の `run_id` の結果を送る |
-| 認可 | 0072 の試験と同じ（他 uid・同じ uid・root の接続を拒む。`SO_PEERCRED` を偽装した試験用の門）。加えて、RL のグループの相手が MPC のソケットへ接続できないこと・封筒の `role` がソケットの役割と違えば捨てること・2つのグループが同じ設定を拒むこと |
+| 認可 | 0072 の試験と同じ（他 uid・同じ uid・root の接続を拒む。`SO_PEERCRED` を偽装した試験用の門）。加えて、RL のグループの相手が MPC のソケットへ接続できないこと・封筒の `role` がソケットの役割と違えば捨てること・2つのグループが同じ設定を拒むこと・**名前の違う2つのグループが同じ uid を含む（補助グループ・主グループのどちらでも）とき起動時に Learned を無効にすること**・**起動後に両方のグループへ足された uid の接続をどちらのソケットでも拒むこと** |
 | heartbeat と idle | 提案を送らず heartbeat だけ送る偽 worker が `worker_idle_timeout_ms` を過ぎても切られず、受け渡し口の値と受信時刻が変わらないこと。heartbeat も止めた偽 worker は `worker_idle` で切られること |
 | 設定の不変条件 | `mpc.max_source_age_ms` の上限・下限、`worker_idle_timeout_ms >= 3 * heartbeat_interval_ms` を外した設定が読み込み時に拒まれること |
 | worker が読む入力が frame だけ | worker の package の import 試験（`sqlite3`・`serial`・`coldaisle.store`・`coldaisle.ai` を import しない） |
@@ -466,7 +479,7 @@ frame は tick ごとに1つ、その tick の**同じ snapshot**から作る。
    - (a) **【推奨】** Learned の経路だけを閉じる（Max にしない）
    - (b) 0072 の管理ソケットと揃えて `MAX`
 6. **MPC の提案の新しさをどう判定するか。**（§2.4 の4）
-   - (a) **【推奨】** `mpc.max_source_age_ms` を `fan-policy.yaml` に新設し、受信起点と元 snapshot 起点の両方を掛ける。上限 `<= mpc.valid_ms` と下限 `>= tick_ms + mpc.period_ms + mpc.budget_ms` を読み込み時に確かめ、`fan-policy.yaml` の schema と束ねた版 `CONTROL_CONFIG_VERSION` を上げる
+   - (a) **【推奨】** `mpc.max_source_age_ms` を `fan-policy.yaml` に新設し、受信起点と元 snapshot 起点の両方を掛ける。上限 `<= mpc.valid_ms` と下限 `>= 2 * tick_ms + mpc.period_ms + mpc.budget_ms`（往きと還りの tick を1つずつ） を読み込み時に確かめ、`fan-policy.yaml` の schema と束ねた版 `CONTROL_CONFIG_VERSION` を上げる
    - (b) 受信起点のまま（0028 §2.6 だけ）
    - (c) 0028 §2.6 を Supersede して元 snapshot 起点へ置き換える
 7. **`--registry-root` を与えたのに registry が読めない・壊れているとき、起動をどうするか。**（§2.6）
