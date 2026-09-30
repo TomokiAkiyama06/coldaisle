@@ -120,7 +120,7 @@ v1 の `ModelBinding.artifact_sha256` は「artifact 全体の hash」なので�
 | 項目 | v1 | v2 |
 |---|---|---|
 | model への束縛 | artifact 全体の SHA-256 | **model payload の canonical SHA-256**（manifest の `payload_sha256` と同じ値）と feature / target / action schema の checksum・split checksum |
-| action の学習範囲 | anchor action の zone ごとの effective demand の範囲（`fan_ranges`） | v1 の欄に加え、**学習した action 列の範囲**（§2.5）: zone ごとの計画 demand の min / max、anchor → 最初の step の変化量の min / max と件数、step 間の変化量の min / max と件数 |
+| action の学習範囲 | anchor action の zone ごとの effective demand の範囲（`fan_ranges`） | v1 の欄に加え、**学習した action 列の範囲**（§2.5）: zone ごとの計画 demand の min / max、anchor → 最初の step の変化量の min / max と件数、step 間の変化量の min / max と件数、**zone をまたぐ同時の support**（§2.5「zone をまたぐ同時の support」: 全 zone の計画 demand の組の cell と件数、anchor の cell → 最初の step の cell の組と件数、step 間の cell の組と件数） |
 | 置き場所 | 単独の JSON | artifact v2 の `confidence_profile` 区画。manifest が `confidence_profile_sha256` を持つ |
 
 作り方は 0050 §2.1 のまま（範囲・欠測・support は train だけ、residual の基準だけは validation、
@@ -301,8 +301,39 @@ Confidence / OOD（0050）は **anchor 推論**を判定する。反実仮想モ
   掛けると、たとえば観測 0.2〜0.8・margin 0.05 のとき約 0.17〜0.83 の学習していない action を
   optimizer が選べ、外挿の予測がそのまま Demand の選択に効く（最終レビュー 5e1b742 の P1）。
   専用の margin の設定値も足さない（§6 の質問 7）
+- **zone ごとの範囲に加えて、zone をまたぐ同時の support の外の候補も評価しない**（下の小節）。
+  zone ごとの min / max は周辺の範囲でしかなく、たとえば train の計画 action が (Front, Rear) = (0.1, 0.1) と
+  (0.9, 0.9) だけなら、zone ごとの照合は (0.9, 0.1) を通す。その組で Fan の効きを独立に動かした応答は
+  学習していない（最終レビュー e13b890 の P1）
 - 0052 §2.4 のとおり、**これは安全上の保証ではない。** 後段の Reactive Guard と Critical Safety は
   常に掛かる。ここは「外挿の予測で Demand を選ばない」ための写しである
+
+#### zone をまたぐ同時の support（最終レビュー e13b890 の P1）
+
+新しい仕組みを作らず、0050 §2.1 の **support cell**（呼び出し側が指定した軸を bin に分けた組と件数。
+train だけから作る）を、候補の action に**全 zone 同時に**当てる。
+
+- **cell の分け方**: action schema の全 zone について、0050 §2.1 の support 軸 `fan.<zone>` の bin の境界を使う。
+  Profile v2 の作成時に action schema の全 zone の `fan.<zone>` の境界が明示されていなければ、Profile の
+  作成を拒否する（0050 §2.1 のとおり既定値を置かない。anchor 推論の support 軸と同じ境界を共有し、
+  候補専用の分け方を持たない）。**境界の実値は本記録では決めない**。0050 §5 #2 のとおり実機 dataset
+  （#50 / #83）の後に決まるまで、Dataset v2 と artifact v2 は実機の値で作らない
+- **記録するもの**（train だけから数える。0050 §2.1）:
+  (a) 各 sample の各計画 step の、全 zone の demand の組が落ちる cell と件数、
+  (b) anchor の effective demand の cell → 最初の step の cell の組と件数、
+  (c) 隣り合う step の cell の組と件数。
+  cell 数・組の数には 0050 の cell 数の構造上の上限（0050 §3）を当て、超えれば Profile の作成（したがって artifact の登録）を拒否する。
+  黙って切らない
+- **候補の照合**: 候補の各 step の cell が (a) に、anchor からの遷移が (b) に、step 間の遷移が (c) に
+  **1件以上記録されていなければ評価しない**。zone ごとの範囲の照合（上の項）と両方を通った候補だけを評価する。
+  件数の下限は足さない（「観測した範囲の外は評価しない」と同じ基準。`min_support_count` は従来どおり
+  anchor 推論の score（0050 §2.2）にだけ効く）。**margin も掛けない**（上の項と §6 の質問 7 と同じ）
+- **Fallback の requested も同じ照合を受ける。** 外れれば `plan_out_of_learned_range`（detail に外れた
+  step と cell）として上の項と同じく optimizer が `error` を返す
+- **新しい数値のしきい値・設定値は足さない。** 使うのは 0050 の support 軸の bin の境界（Profile 作成時の
+  明示の値）と構造上の上限だけで、`fan-policy.yaml` の版も上げない
+- 限界: cell の中の「穴」（同じ cell の中で学習点から離れた組）は見逃しうる。これは 0050 §3 の既知の
+  限界（箱型の範囲と格子の support）と同じで、細かくするには境界を変えて Profile を作り直す（model の版が上がる。§2.1）
 
 ### 2.6 失敗時の意味（fail-safe）
 
@@ -332,6 +363,10 @@ Confidence / OOD（0050）は **anchor 推論**を判定する。反実仮想モ
 - 範囲外の候補が評価されない（評価回数と選ばれた解で確かめる）。観測した範囲の端をわずかに越える
   （`range_margin` の幅の中に入る）候補も評価されない。**anchor から最初の step への跳びだけが
   範囲外で、各 step の値と step 間の変化量は範囲内の held plan** も評価されない
+- zone をまたぐ同時の support: train の計画 action が (Front, Rear) = (0.1, 0.1) と (0.9, 0.9) の cell だけの
+  Profile で、zone ごとの範囲には入る (0.9, 0.1) の候補が評価されない。anchor の cell から最初の step の cell への
+  組が未記録の候補と、Fallback の requested が未記録の cell にある場合（`plan_out_of_learned_range`）も同じ。
+  action schema の全 zone の `fan.<zone>` の境界が無い Profile v2 の作成は拒否される
 - model binding: 同じ model ID・版で別の bytes の artifact から出た予測（`artifact_sha256` だけ違う）を
   v2 の判定器へ渡すと、model binding の構成要素が OOD になる。Profile の `payload_sha256` だけを
   書き換えた artifact は L6 / L7 で型にならない
@@ -427,6 +462,8 @@ Confidence / OOD（0050）は **anchor 推論**を判定する。反実仮想モ
 | 範囲外の Fallback requested を範囲内へ丸めて探索を続ける | 丸めた値は Fallback ではなく ML の外挿で選んだ値になる。`error` として Fallback にする |
 | 候補 plan の範囲の照合に `range_margin` を掛ける | 候補は anchor の OOD 判定を通らないので、margin の幅だけ学習していない action を optimizer が選べる（§2.5） |
 | 候補 plan の範囲の照合に専用の margin の設定値を足す | 外挿を許す幅を新しく作ることになり、`fan-policy.yaml` の版も上がる。観測した範囲の外は評価しない |
+| 候補 plan を zone ごとの min / max だけで照合する | 周辺の範囲しか見ないので、zone の組として学習していない action（(0.1, 0.1) と (0.9, 0.9) だけの学習での (0.9, 0.1)）を通す（§2.5、最終レビュー e13b890 の P1） |
+| 候補の同時の support に専用の cell の分け方や件数の下限を足す | 新しいしきい値を作ることになる。0050 の support 軸の境界を共有し、1件以上の観測を基準にする |
 | 候補 plan の範囲外を OOD として confidence を 0 にする | anchor 推論の判定（0050）と plan の探索の話を混ぜる。候補を除くほうが「狭める向きだけ」（0052 §2.4）と整合する |
 
 ### Registry の健全性の通知（§2.8 で開いたまま。どれも却下はしていない）
@@ -448,7 +485,7 @@ Confidence / OOD（0050）は **anchor 推論**を判定する。反実仮想モ
 | 3 | 較正の digest。**決着**：不一致は拒否して Fallback（§6 の質問 4）、取り込みが使った較正の digest は store へ記録しない（§6 の質問 5） | 較正の頻度が実運用で分かった後、見直すなら新しい記録 |
 | 4 | 反実仮想 capability を登録時に申告してよい条件。**決着**：Dataset v2 由来なら申告してよい。SHADOW より上は既存の gate（0054）と人の承認（0057）で止める（§6 の質問 11）。action の励起の量・分布を登録の条件に足すかと、励起の実験（安全範囲内の step 応答など）の設計は開いたまま | #83 / #84 / #91。**実機で測った後**、足すなら新しい記録 |
 | 5 | model family・ridge lambda・window / horizon / step 格子・target metric 集合の実値（0048 §5 / 0052 §5 / Q-22） | 実機 dataset の評価の後、#103 の設定と後続の記録 |
-| 6 | 候補の plan の範囲の margin。**決着**：margin を掛けない（観測した範囲の外は評価しない）。専用の設定値も足さない（§2.5、§6 の質問 7） | — |
+| 6 | 候補の plan の範囲の margin。**決着**：margin を掛けない（観測した範囲の外は評価しない）。専用の設定値も足さない（§2.5、§6 の質問 7）。zone をまたぐ同時の support も同じ基準で照合する（§2.5。cell の境界の実値は 0050 §5 #2 で開いたまま） | — |
 | 7 | §2.5 で除いた候補の件数や理由、`plan_out_of_learned_range` を trace や Gate の `fallback_reason` の detail に載せるか。**決着**：載せない（§6 の質問 6） | 載せるなら新しい記録（Gate の変更と `ControlTick` の版上げ。§2.9 の直列化の規則に従う）。実装は #86 / #82 |
 | 8 | #105 の episode で同梱 Profile が OOD と判定した step を `promotable` の条件に入れるか（0058 §2.3 の7条件を変えるので新しい記録が要る）。段 6 は記録だけにする | #105 の後続の記録 |
 | 9 | Registry の健全性を Rule Engine / Notification へ流す経路（§2.8。H1〜H3）。本記録では決めないことを承認した（§6 の質問 9） | #82 / #20 の統合時（方向は H2） |
@@ -480,7 +517,10 @@ Confidence / OOD（0050）は **anchor 推論**を判定する。反実仮想モ
 - **質問 7. plan の範囲の margin**（§5 #6）→ **候補の plan には margin を掛けない**（観測した範囲の外は評価しない）。
   提案時の推奨は「既存の `model_confidence.range_margin` を使う」だったが、最終レビュー（5e1b742）の P1
   （margin が学習データの外の action を許す）への推奨「候補の action には margin を掛けない」を採って承認した。
-  専用の設定値を足す案も採らない（§2.5、§4）
+  専用の設定値を足す案も採らない（§2.5、§4）。
+  追加の修正（2026-09-30、オーナーの指示で1回。最終レビュー e13b890 の P1）: zone ごとの範囲に加えて、0050 の
+  support cell を全 zone 同時に候補へ当て、train で観測していない cell・cell の遷移を含む候補も評価しない（§2.5）。
+  新しい数値や設定値は足していない
 - **質問 8.** 削除。提案時の問い「本記録の承認を PR #193（0037 / 0048 を FINAL にする）のマージの後にするか」は、
   #193 のマージで前提が満たされたので問う必要が無くなった（最終レビュー 5e1b742 の P2）
 - **質問 9. Registry の健全性の通知経路**（§2.8、§5 #9）→ **本記録では決めない**。#82 / #20 の統合時に決める（方向は H2）
