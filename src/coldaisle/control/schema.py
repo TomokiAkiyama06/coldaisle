@@ -24,7 +24,7 @@ from typing import Annotated, Literal, Protocol, Self, runtime_checkable
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-SCHEMA_VERSION: Literal[11] = 11
+SCHEMA_VERSION: Literal[12] = 12
 """`ControlTick` の形の版。**フィールドの名前や意味を変えたら上げる。**
 
 #82 が保存したデータを読み違えないため。
@@ -59,6 +59,10 @@ SCHEMA_VERSION: Literal[11] = 11
   `estimated_flow`。`runtime` は schema version 2（4ファイルの版と SHA-256）を要求する。
   **v11 には `air_balance` が必須**で、保存済みの v1〜v10 は欄なしのまま読める。
   決定記録 0073 は「v10」と書くが、先に #104 が v10 を使ったため次の空き番号にした（0073 §5）
+- v12（#74 / 決定記録 0072 §2.2 / §2.7）: その tick に効いていたモードの出どころ（`mode_command`）。
+  管理ソケットの指令の `command_id` と起動ごとの `run_id`、`MANUAL` の期限切れ、
+  受付スレッドの死による `MAX`（`admin_receiver_dead`）。**v12 には必須**で、
+  保存済みの v1〜v11 は欄なしのまま読める（「記録が無い」であって「入口が無かった」ではない）
 """
 
 Demand = Annotated[float, Field(ge=0.0, le=1.0, allow_inf_nan=False)]
@@ -1695,10 +1699,66 @@ v1〜v3 の reader は知らないため v3 以前には記録しない。
 """
 
 
+MODE_COMMAND_RECORD_SCHEMA_VERSION: Literal[1] = 1
+"""`ModeCommandRecord` の形の版。"""
+
+RUN_ID_PATTERN = r"^[0-9a-f]{32}$"
+"""`coldaisle-fand` の起動ごとの識別子の形（決定記録 0072 §2.7）。個体識別子を含まない乱数。"""
+
+
+class ModeCommandRecord(_Frozen):
+    """その tick に効いていた運転モードの出どころ（`ControlTick` v12。#74 / 決定記録 0072 §2.7）。
+
+    - ``entry``: ``control_admin`` は管理ソケットの受け渡し口からモードを読む構成。
+      ``none`` は入口を開いていない構成（入口の設定が不正・`SO_PEERCRED` が無い・試験の入口）で、
+      ``command_id`` を持たない
+    - ``command_id``: この tick のモードを決めた指令（``run_id`` との組で監査の表の行と対応する）。
+      起動直後の ``AUTO``・lease 切れで戻った ``AUTO``・受付スレッドの死による ``MAX`` では None
+    - ``manual_lease_expired_command_id``: **この tick で** lease が切れて ``AUTO`` へ戻した
+      ``MANUAL`` の指令（0072 §2.4）
+    - ``admin_receiver_dead``: 受付スレッドの死で ``MAX`` に倒している（0072 §2.2）。
+      再起動まで毎 tick 真のまま
+    """
+
+    schema_version: Literal[1] = MODE_COMMAND_RECORD_SCHEMA_VERSION
+    entry: Literal["none", "control_admin"]
+    run_id: str | None = Field(default=None, pattern=RUN_ID_PATTERN)
+    command_id: int | None = Field(default=None, ge=1)
+    manual_lease_expired_command_id: int | None = Field(default=None, ge=1)
+    admin_receiver_dead: bool = False
+
+    @classmethod
+    def without_entry(cls) -> ModeCommandRecord:
+        """管理ソケットを開いていない構成の記録。"""
+        return cls(entry="none")
+
+    @model_validator(mode="after")
+    def _one_source_per_tick(self) -> Self:
+        if self.entry == "none":
+            if (
+                self.run_id is not None
+                or self.command_id is not None
+                or self.manual_lease_expired_command_id is not None
+                or self.admin_receiver_dead
+            ):
+                raise ValueError("入口の無い構成は command_id・lease・受付スレッドの状態を持たない")
+            return self
+        if self.run_id is None:
+            raise ValueError("control_admin の記録には run_id が要る（監査の行と突き合わせる）")
+        if self.admin_receiver_dead and (
+            self.command_id is not None or self.manual_lease_expired_command_id is not None
+        ):
+            # 死んだあとは受け渡し口を読まず、MANUAL も解除している（0072 §2.2）
+            raise ValueError("受付スレッドの死による MAX は指令にも lease にも由来しない")
+        if self.manual_lease_expired_command_id is not None and self.command_id is not None:
+            raise ValueError("lease 切れで戻した AUTO は指令に由来しない")
+        return self
+
+
 class ControlTick(_Frozen):
     """1 tick の判断の記録（decision trace。0028 §2.3）。#82 が保存し、#90 / #91 が読む。"""
 
-    schema_version: Literal[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11] = SCHEMA_VERSION
+    schema_version: Literal[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12] = SCHEMA_VERSION
     tick_id: int = Field(ge=0)
     ts_ms: int = Field(ge=0)
     """記録の時刻（壁時計。0028 §2.6）。"""
@@ -1733,6 +1793,14 @@ class ControlTick(_Frozen):
     """Air Balance の記録（v11。#81 / 決定記録 0073 §2.5 (b)）。保存済みの v1〜v10 では None。
 
     無効（未校正）の起動も ``None`` ではなく ``AirBalanceRecord.disabled()`` を持つ。
+    """
+    mode_command: ModeCommandRecord | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
+    """その tick に効いていたモードの出どころ（v12。#74 / 決定記録 0072 §2.7）。
+
+    保存済みの v1〜v11 では None。入口を開いていない構成の v12 も ``None`` ではなく
+    ``ModeCommandRecord.without_entry()`` を持つ。
     """
     faults: tuple[Fault, ...] = ()
     """いま有効な故障。
@@ -1784,6 +1852,7 @@ class ControlTick(_Frozen):
         elif self.schema_version < 10:
             raise ValueError("registry を記録する ControlTick は schema version 10 にする")
         self._check_air_balance()
+        self._check_mode_command()
         self._check_model_gate()
         self._check_registry_binds_model()
         self._check_shadow()
@@ -1923,6 +1992,30 @@ class ControlTick(_Frozen):
             ):
                 # 回っていない Fan に風量を書かない（0073 §2.5 (a)）。
                 raise ValueError(f"{zone.value}: stall の zone に風量を残さない")
+
+    def _check_mode_command(self) -> None:
+        """v12 の ``mode_command`` が ``ControlState`` のモードと同じ事実を指すか。"""
+        record = self.mode_command
+        if record is None:
+            if self.schema_version >= 12:
+                # 版が中身を表さない記録を作らない（0060 §2.4）。
+                raise ValueError("v12 の ControlTick には mode_command が要る")
+            return
+        if self.schema_version < 12:
+            raise ValueError("mode_command を記録する ControlTick は schema version 12 にする")
+        mode = self.state.operating_mode
+        if record.admin_receiver_dead and mode is not OperatingMode.MAX:
+            raise ValueError("受付スレッドの死を記録する tick は MAX にする（0072 §2.2）")
+        if record.manual_lease_expired_command_id is not None and mode is not OperatingMode.AUTO:
+            raise ValueError("lease 切れを記録する tick は AUTO へ戻す（0072 §2.4）")
+        if (
+            record.entry == "control_admin"
+            and record.command_id is None
+            and not record.admin_receiver_dead
+            and mode is not OperatingMode.AUTO
+        ):
+            # 指令に由来しないモードは、起動直後と lease 切れの AUTO だけ（0028 §2.5 (a)）
+            raise ValueError("指令に由来しない AUTO 以外のモードは記録できない")
 
     def _check_model_gate(self) -> None:
         """v5 の ``model_gate`` が ControlState と同じ判断を指しているか。"""

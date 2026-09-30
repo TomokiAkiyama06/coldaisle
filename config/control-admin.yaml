@@ -1,0 +1,55 @@
+# coldaisle-fand の管理ソケット（control-admin）の設定（#74 / 決定記録 0072 §2.8）
+#
+# 走っている coldaisle-fand へ、人が運転モード（auto / manual / max）を届ける入口です。
+# 読み取り API とも coldaisle-eventd（0045）とも別の入口で、TCP では待ち受けません。
+# クライアントは `uv run coldaisle-control`。
+#
+# **制御の閾値ではなく入口の形だけを持ちます。** 制御の4ファイル
+# （fan-hardware / safety / fan-policy / air-balance）には入れません。
+# 起動時に1回だけ読み、不正なら管理ソケットを開かずに AUTO で運転を続けます
+# （入口の設定が壊れているだけで Max を書いたり、制御を手放したりしません）。
+#
+# 配置の必須条件（0072 §2.5）: 読み取り API と AI 層を動かすユーザーを socket.group に入れない。
+# API / AI サーバを coldaisle-fand と同じユーザーで動かさない。
+
+version: 1
+
+socket:
+  # 規則は event-entry.yaml と同じ（0045 §2.2）。本番は systemd の RuntimeDirectory 配下を指定する。
+  # other が書ける親ディレクトリ、ソケット以外の既存ファイル、既に応答するソケットでは開かない。
+  path: var/run/coldaisle-fand-admin.sock
+  # 8進の文字列。other のビットと setuid / setgid / sticky は拒否する。
+  mode: "0660"
+  # 本番は専用グループが必須（誰がモードを変えられるかを、グループのメンバーという1つの事実に集める）。
+  # null は下の allow_same_user: true と組にした開発用の起動だけ。
+  group: null
+
+authorization:
+  # coldaisle-fand と同じ uid の接続を認めるか。**本番は false**（socket.group を必ず指定する）。
+  # true は socket.group: null の開発用のときだけ許す（0072 §2.5）。
+  allow_same_user: true
+
+limits:
+  # 1行（1要求）の上限バイト数。
+  max_message_bytes: 4096
+  # 受信中の接続が1行を送り切るまでの上限秒数。**safety.yaml の tick_ms 以下**
+  # （read_timeout_s * 1000 <= tick_ms。起動時に照合し、満たさなければ管理ソケットを開かない）。
+  read_timeout_s: 0.5
+  # 同時に持つ受信中の接続の上限。埋まっていれば最も長く受信を続けている接続を閉じて新しい接続を受ける。
+  max_connections: 8
+  # 要求を読み終えた後（監査の書き込み待ち・適用の確認待ち・応答の送信中）の接続の上限。
+  # 埋まっていれば、冷却を弱めうる指令は busy で拒否し、max は先に受け渡し口へ置く。
+  max_pending_commands: 8
+  # 監査書き込みスレッドの FIFO の上限。溢れた依頼は書き込みの失敗として扱う。
+  audit_queue_max: 64
+
+# 受付スレッドが適用の確認を待つ上限（ミリ秒）。**tick_ms + tick_deadline_ms 以上**
+# （起動時に safety.yaml と照合する）。時間内に適用されなければ pending を返し、適用は取り消さない。
+apply_ack_timeout_ms: 3000
+
+manual:
+  # MANUAL の lease_s に書ける上限（秒）。期限が来たら AUTO へ戻す。MAX には期限を付けない。
+  max_lease_s:
+    value: 14400
+    status: provisional
+    basis: "決定記録 0072 §5 の 4。段階 1 の暫定値（4時間）。運用後に所有者が決める"

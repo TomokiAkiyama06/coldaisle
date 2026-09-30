@@ -85,6 +85,7 @@ from coldaisle.store.models import Quality
 from test_control_schema import (
     AIR_BALANCE_RECORD,
     CONTROL_TICK_RUNTIME,
+    MODE_COMMAND_RECORD,
     REGISTRY_PROVENANCE,
     SAFETY_PROVENANCE,
 )
@@ -859,6 +860,7 @@ def test_v5_trace_requires_consistent_model_gate_for_learned_ticks() -> None:
     payload.pop("safety_provenance", None)
     payload.pop("registry", None)
     payload.pop("air_balance", None)
+    payload.pop("mode_command", None)
     with pytest.raises(ValidationError, match="schema version 5"):
         ControlTick.model_validate_json(json.dumps(payload))
 
@@ -933,6 +935,7 @@ def _trace_tick(selection) -> ControlTick:
         safety_provenance=SAFETY_PROVENANCE,
         registry=REGISTRY_PROVENANCE,
         air_balance=AIR_BALANCE_RECORD,
+        mode_command=MODE_COMMAND_RECORD,
     )
 
 

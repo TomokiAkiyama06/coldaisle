@@ -7,8 +7,6 @@
 
 from __future__ import annotations
 
-import re
-import stat
 from pathlib import Path
 from typing import Any, Literal
 
@@ -16,59 +14,19 @@ import yaml
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from coldaisle.event_entry.messages import IMPLEMENTED_HINT_VERSIONS, WorkloadHintLimits
+from coldaisle.local_socket import SOCKET_PATH_MAX_BYTES, SocketSettings
+
+__all__ = [
+    "DEFAULT_CONFIG",
+    "SOCKET_PATH_MAX_BYTES",
+    "AuthorizationSettings",
+    "EventEntrySettings",
+    "LimitSettings",
+    "SocketSettings",
+    "WorkloadHintSettings",
+]
 
 DEFAULT_CONFIG = Path("config/event-entry.yaml")
-
-SOCKET_PATH_MAX_BYTES = 107
-"""Linux の `sun_path` は 108 バイトで、終端の NUL を含む。"""
-
-_MODE_PATTERN = re.compile(r"^0[0-7]{3}$")
-_GROUP_PATTERN = re.compile(r"^[a-z_][a-z0-9_-]{0,31}$")
-
-
-class SocketSettings(BaseModel):
-    """ソケットの場所と権限。"""
-
-    model_config = ConfigDict(extra="forbid", frozen=True)
-
-    path: Path
-    mode: str = Field(description='8進の文字列（例: "0660"）')
-    group: str | None = None
-
-    @field_validator("path")
-    @classmethod
-    def _path_fits_sun_path(cls, value: Path) -> Path:
-        if not str(value):
-            raise ValueError("socket.path が空")
-        if len(bytes(value)) > SOCKET_PATH_MAX_BYTES:
-            raise ValueError(f"socket.path が長すぎる（{SOCKET_PATH_MAX_BYTES} バイトまで）")
-        return value
-
-    @field_validator("mode")
-    @classmethod
-    def _mode_is_not_world_accessible(cls, value: str) -> str:
-        if not _MODE_PATTERN.match(value):
-            raise ValueError('socket.mode は "0660" のような4桁の8進文字列で書く')
-        bits = int(value, 8)
-        if bits & stat.S_IRWXO:
-            # other に1ビットでも開けると、同じホストの全利用者が門の手前まで来られる
-            raise ValueError(f"socket.mode に other の権限を含めない: {value}")
-        if bits & (stat.S_ISUID | stat.S_ISGID | stat.S_ISVTX):
-            raise ValueError(f"socket.mode に setuid / setgid / sticky を含めない: {value}")
-        if not bits & stat.S_IWUSR:
-            raise ValueError(f"socket.mode は所有者が書ける値にする: {value}")
-        return value
-
-    @field_validator("group")
-    @classmethod
-    def _group_is_a_plain_name(cls, value: str | None) -> str | None:
-        if value is not None and not _GROUP_PATTERN.match(value):
-            raise ValueError(f"socket.group の書式が不正: {value!r}")
-        return value
-
-    @property
-    def mode_bits(self) -> int:
-        return int(self.mode, 8)
 
 
 class AuthorizationSettings(BaseModel):

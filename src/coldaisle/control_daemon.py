@@ -18,7 +18,12 @@
 「ほか」は `safety.yaml` / `fan-policy.yaml` / `air-balance.yaml`。Air Balance を無効にしても
 Critical Safety と Reactive Guard は変わらない。
 
-どの場合も `STARTUP` の Max を通ってから通常の制御へ入る。`air-balance.yaml` の扱いは
+どの場合も `STARTUP` の Max を通ってから通常の制御へ入る。
+
+運転モードは管理ソケット（`config/control-admin.yaml`。決定記録 0072）から受ける。
+**入口を開けなくても制御は止めない**（設定が不正・`SO_PEERCRED` が無いときは `AUTO` のまま
+運転し、error を残す）。受付スレッドが走行中に死んだら、loop が自分で全 zone を Max にして
+再起動まで保つ（0072 §2.2）。`air-balance.yaml` の扱いは
 決定記録 0073 §2.2 に従う。「無い」を「無効」と読まない。
 
 **動作中に設定を読み直さない**（0028 §2.7）。反映は再起動で行い、再起動は必ず
@@ -71,9 +76,10 @@ from coldaisle.control.safety.critical import (
 )
 from coldaisle.control.schema import RegistryProvenance, Zone
 from coldaisle.control.shadow.record import ShadowRecorder
-from coldaisle.control.state import ControlStateEstimator
+from coldaisle.control.state import ControlInputContract, ControlStateEstimator
 from coldaisle.control.supervisor.policy import SupervisorCoordinator
 from coldaisle.control.supervisor.regime import WorkloadRegimeEstimator
+from coldaisle.control_admin import ControlAdminEntry, open_control_admin
 from coldaisle.metrics import MetricCatalog
 from coldaisle.store import QualityRules, SqliteStore
 
@@ -83,6 +89,7 @@ DEFAULT_CONFIG_DIR = Path("config")
 DEFAULT_DB = Path("var/coldaisle.db")
 DEFAULT_METRICS = Path("config/metrics.yaml")
 DEFAULT_QUALITY_RULES = Path("config/quality.yaml")
+DEFAULT_ADMIN_CONFIG = Path("config/control-admin.yaml")
 
 UNCONFIGURED_MODEL_VERSION = "unconfigured"
 """Learned MPC の worker を配線していない起動で Gate に渡す期待版。
@@ -357,6 +364,8 @@ class Config:
     record_trace: bool = True
     require_watchdog: bool = False
     """外部の deadman へ通知できないときに起動を拒むか（本番の service では真にする）。"""
+    admin_config: Path | None = None
+    """管理ソケットの設定（決定記録 0072 §2.8）。None は入口を開かない（`AUTO` のまま運転する）。"""
 
 
 @dataclass(slots=True)
@@ -437,6 +446,8 @@ class ControlDaemon:
     loop: ControlLoop
     monotonic: MonotonicClock
     store: SqliteStore | None = None
+    admin: ControlAdminEntry | None = None
+    """開いた管理ソケット。**loop が止まった後に**閉じる（`close()`）。"""
     sleep: Callable[[float], None] = time.sleep
     stats: ControlStats = field(default_factory=ControlStats)
     _stop: bool = field(default=False, init=False, repr=False)
@@ -444,6 +455,15 @@ class ControlDaemon:
     def request_stop(self) -> None:
         """次の tick の前に止める。**tick の途中では止めない。**"""
         self._stop = True
+
+    def close(self) -> None:
+        """管理ソケット、ストアの順に閉じる。**loop が止まった後に呼ぶ**（0072 §2.2）。"""
+        if self.admin is not None:
+            self.admin.stop()
+            self.admin = None
+        if self.store is not None:
+            self.store.close()
+            self.store = None
 
     def run(self, *, max_ticks: int | None = None) -> ControlStats:
         """止めるまで tick を回す。`max_ticks` は試験と Replay のための上限。"""
@@ -559,6 +579,73 @@ def build(
             require=config.require_watchdog,
         )
     )
+    admin = _open_admin(config, control, rules=rules, clock=clock, monotonic=monotonic)
+    try:
+        loop = _build_loop(
+            config,
+            control,
+            catalog=catalog,
+            contract=contract,
+            binding=binding,
+            authority=authority,
+            deadman=deadman,
+            store=store,
+            clock=clock,
+            monotonic=monotonic,
+            backend_factory=backend_factory,
+            admin=admin,
+        )
+    except BaseException:
+        if admin is not None:
+            admin.stop()
+        raise
+    return ControlDaemon(loop=loop, monotonic=monotonic, store=store, admin=admin)
+
+
+def _open_admin(
+    config: Config,
+    control: ControlConfig,
+    *,
+    rules: QualityRules,
+    clock: Clock,
+    monotonic: MonotonicClock,
+) -> ControlAdminEntry | None:
+    """管理ソケットを開く。**開けなくても起動は続ける**（0072 §2.8）。"""
+    if config.admin_config is None:
+        LOGGER.error(
+            "管理ソケットの設定が指定されていないため入口を開かない（AUTO のまま運転する）",
+            extra={logs.FIELDS_KEY: {"reason": "admin_config_not_given"}},
+        )
+        return None
+    db = config.db
+    return open_control_admin(
+        config.admin_config,
+        tick_ms=control.safety.tick_ms.value,
+        tick_deadline_ms=control.safety.tick_deadline_ms.value,
+        authority_ceiling=control.policy.authority_stage,
+        # 監査の表は**別の接続**で書く（0072 §2.7 / 0066 の前例）。接続は監査書き込みスレッドの
+        # 中で開く。待ってよいのはこのスレッドだけなので、busy timeout は既定のままにする
+        open_audit_sink=lambda: SqliteStore(db, rules=rules, clock=clock),
+        clock=clock,
+        monotonic=monotonic,
+    )
+
+
+def _build_loop(
+    config: Config,
+    control: ControlConfig,
+    *,
+    catalog: MetricCatalog,
+    contract: ControlInputContract,
+    binding: ControlRuntimeBinding,
+    authority: StaticAuthority,
+    deadman: Watchdog,
+    store: SqliteStore,
+    clock: Clock,
+    monotonic: MonotonicClock,
+    backend_factory: BackendFactory,
+    admin: ControlAdminEntry | None,
+) -> ControlLoop:
     safety = CriticalSafety(
         control.safety,
         input_contract=contract,
@@ -592,7 +679,10 @@ def build(
         # 設定に無い。worker を配線するときは、起動時に読んだ snapshot の
         # `RegistrySnapshot.trace_provenance()` を渡す（Gate の期待版と同じ snapshot から作る）。
         registry=RegistryProvenance.unbound(),
-        mode_source=StaticOperatingMode(),
+        # **モードの出どころは1つ。** 管理ソケットを開けたら受け渡し口、開けなければ常に AUTO
+        # （0072 §2.2。開かなかった入口は死んだとは扱わない）
+        mode_source=None if admin is not None else StaticOperatingMode(),
+        admin_mode=None if admin is None else admin.tracker,
         supervisor=SupervisorCoordinator(control.policy.supervisor, clock),
         regime=WorkloadRegimeEstimator(control.policy.workload_regime, catalog, clock),
         shadow=ShadowRecorder(control.policy.shadow),
@@ -601,7 +691,7 @@ def build(
         watchdog=deadman,
     )
     _log_configuration(control, safety)
-    return ControlDaemon(loop=loop, monotonic=monotonic, store=store)
+    return loop
 
 
 class ActuationNotApprovedError(RuntimeError):
@@ -698,6 +788,17 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help=f"{NOTIFY_SOCKET_ENV} が無ければ起動しない（systemd の Type=notify で使う）",
     )
+    parser.add_argument(
+        "--admin-config",
+        type=Path,
+        default=DEFAULT_ADMIN_CONFIG,
+        help="管理ソケットの設定（決定記録 0072 §2.8）。不正なら入口を開かず AUTO で運転する",
+    )
+    parser.add_argument(
+        "--no-admin",
+        action="store_true",
+        help="管理ソケットを開かない（AUTO のまま運転する。試験・Replay 用）",
+    )
     parser.add_argument("--log-level", default="INFO")
     return parser
 
@@ -714,6 +815,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         t_sensor_metric=args.t_sensor_metric,
         record_trace=not args.no_trace,
         require_watchdog=args.require_watchdog,
+        admin_config=None if args.no_admin else args.admin_config,
     )
     monotonic: MonotonicClock = SystemMonotonicClock()
 
@@ -760,8 +862,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         stats = daemon.run(max_ticks=args.max_ticks)
     finally:
-        if daemon.store is not None:
-            daemon.store.close()
+        daemon.close()
     LOGGER.info("control daemon を終了する", extra={logs.FIELDS_KEY: stats.as_fields()})
     return 0
 

@@ -85,7 +85,7 @@ def test_an_uncalibrated_file_disables_air_balance_on_every_tick(catalog: Metric
 
     for result in results:
         tick = result.tick
-        assert tick.schema_version == 11
+        assert tick.schema_version == 12
         record = tick.air_balance
         assert record is not None
         assert record.status == "disabled"

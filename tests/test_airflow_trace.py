@@ -2,7 +2,7 @@
 
 `airflow-trace.js` の変換を node で実際に動かして確かめる（決定記録 0044。CI では node が必須）。
 
-1. **版の解釈は1か所**（`airflow-trace.js`）。v1〜v11 の fixture を読める
+1. **版の解釈は1か所**（`airflow-trace.js`）。v1〜v12 の fixture を読める
    （schema.py に無い版は「未対応の版」）
 2. **3つの状態を混ぜない**: その版に欄が無い／欄はあるが値が無い／画面が知らない版
 3. Safety override・Fallback・OOD を通常状態と区別して出す
@@ -38,7 +38,7 @@ AIRFLOW_UI_PATH = CONFIG_DIR / "airflow-ui.yaml"
 NOW_MS = 1_787_616_020_000
 
 NOT_IN_VERSION = "この版の記録には無い"
-FIXTURE_VERSIONS = range(1, 12)
+FIXTURE_VERSIONS = range(1, 13)
 
 
 def _node() -> str:
@@ -113,7 +113,7 @@ def _steps(result: Any, zone: str) -> dict[str, dict[str, Any]]:
 
 @pytest.mark.parametrize("version", FIXTURE_VERSIONS)
 def test_every_stored_version_is_read(version):
-    """保存済みの v1〜v11 の fixture を、同じ `page.control` の形にできる。"""
+    """保存済みの v1〜v12 の fixture を、同じ `page.control` の形にできる。"""
     result = _convert(_body(version))
     assert result["status"] == "ok"
     assert result["schema_version"] == version
@@ -182,11 +182,11 @@ def test_workload_regime_absent_in_v1_only():
     assert _chip(_convert(_body(2)), "負荷の傾向")["v"] != NOT_IN_VERSION
 
 
-@pytest.mark.parametrize("version", [12, 999])
+@pytest.mark.parametrize("version", [13, 999])
 def test_an_unknown_version_is_not_shown(version):
     """画面が知らない版は「未対応の版」。**制御由来の項目を出さない。**
 
-    v12 は schema.py にまだ無い。中身は先にマージされた PR で決まるので、推測で読まない。
+    v13 は schema.py にまだ無い。中身は先にマージされた PR で決まるので、推測で読まない。
     """
     body = _body(10)
     body["schema_version"] = version
@@ -703,3 +703,62 @@ def test_the_mock_mode_does_not_say_loading_forever():
     absence = script[script.index("function controlAbsence(") :]
     absence = absence[: absence.index("\n}\n")]
     assert absence.index("page.mockName") < absence.index("読み込み中")
+
+
+# ------------------------------------------------------------ v12: モードの出どころ（0072 §2.7）
+
+
+def _v12(document: dict[str, Any]) -> dict[str, Any]:
+    """schema.py の ControlTick として検証を通した v12 の本文。**実在しない形を試さない。**"""
+    tick = ControlTick.model_validate_json(json.dumps(document))
+    assert tick.schema_version == 12
+    loaded: dict[str, Any] = json.loads(tick.model_dump_json())
+    return loaded
+
+
+def test_v11_has_no_mode_source():
+    assert _chip(_convert(_body(11)), "モードの出どころ")["v"] == NOT_IN_VERSION
+
+
+def test_v12_names_the_admin_command_that_set_the_mode():
+    chip = _chip(_convert(_v12(_body(12))), "モードの出どころ")
+    assert chip["v"] == "管理ソケットの指令 #3"
+    assert chip.get("tone") is None
+
+
+def test_v12_receiver_death_is_shown_as_bad_not_as_a_normal_max():
+    """受付スレッドの死による最大は、人が選んだ最大と見分けて目立たせる（0072 §2.2）。"""
+    body = _body(12)
+    body["mode_command"] = {
+        "schema_version": 1,
+        "entry": "control_admin",
+        "run_id": body["mode_command"]["run_id"],
+        "command_id": None,
+        "manual_lease_expired_command_id": None,
+        "admin_receiver_dead": True,
+    }
+    body["state"]["operating_mode"] = "max"
+    for zone in body["zones"].values():
+        zone["demand"].update(
+            {
+                "effective": 1.0,
+                "bound_by": "forced_max",
+                "forced_max": True,
+                "reasons": [{"code": "manual_max", "detail": "safety_state=normal"}],
+            }
+        )
+    chip = _chip(_convert(_v12(body)), "モードの出どころ")
+    assert chip["tone"] == "bad"
+    assert "再起動まで" in chip["v"]
+
+
+def test_v12_lease_expiry_is_named():
+    body = _body(12)
+    body["mode_command"]["command_id"] = None
+    body["mode_command"]["manual_lease_expired_command_id"] = 2
+    chip = _chip(_convert(_v12(body)), "モードの出どころ")
+    assert chip == {
+        "k": "モードの出どころ",
+        "v": "手動の期限切れで自動へ戻した（指令 #2）",
+        "tone": "warn",
+    }

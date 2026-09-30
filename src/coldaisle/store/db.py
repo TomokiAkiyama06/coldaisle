@@ -24,6 +24,7 @@ from coldaisle.store import migrations
 from coldaisle.store.models import (
     AlertRecord,
     AlertSeverity,
+    ControlAdminAuditRecord,
     ControlTraceCursorPrunedError,
     ControlTracePage,
     ControlTracePruneState,
@@ -483,6 +484,36 @@ class SqliteStore:
             raise RuntimeError("event の採番に失敗した")
         return event.model_copy(update={"id": int(event_id)})
 
+    def record_control_admin_audit(
+        self, record: ControlAdminAuditRecord
+    ) -> ControlAdminAuditRecord:
+        """管理ソケットの指令の事象を1行追記する（#74 / 決定記録 0072 §2.7）。
+
+        **追記のみ。** 更新・削除は DB のトリガが拒否し、同じ指令の受付・結末・lease 切れの
+        重複は一意制約が拒否する。書くのは `coldaisle-fand` の監査書き込みスレッドだけ。
+        """
+        if record.id is not None:
+            raise ValueError("採番前の監査の行を渡す（id は保存時に決まる）")
+        cursor = self._conn.execute(
+            "INSERT INTO control_admin_audit (run_id, command_id, event, ts_ms, peer_uid, op,"
+            " body, tick_id, superseded_by) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                record.run_id,
+                record.command_id,
+                record.event,
+                record.ts_ms,
+                record.peer_uid,
+                record.op,
+                record.body_json,
+                record.tick_id,
+                record.superseded_by,
+            ),
+        )
+        row_id = cursor.lastrowid
+        if row_id is None:
+            raise RuntimeError("監査の行の採番に失敗した")
+        return record.model_copy(update={"id": int(row_id)})
+
     # ------------------------------------------------------------------ 読み出し
 
     def device(self, device_id: str) -> DeviceRecord | None:
@@ -683,6 +714,30 @@ class SqliteStore:
                 kind=row["kind"],
                 payload_json=row["payload"],
                 peer_uid=row["peer_uid"],
+            )
+            for row in rows
+        )
+
+    def control_admin_audit(self, run_id: str | None = None) -> tuple[ControlAdminAuditRecord, ...]:
+        """管理ソケットの監査の行を書いた順に返す。``run_id`` で1回の起動に絞れる。"""
+        where, params = ("WHERE run_id = ?", (run_id,)) if run_id is not None else ("", ())
+        rows = self._conn.execute(
+            "SELECT id, run_id, command_id, event, ts_ms, peer_uid, op, body, tick_id,"
+            f" superseded_by FROM control_admin_audit {where} ORDER BY id",
+            params,
+        ).fetchall()
+        return tuple(
+            ControlAdminAuditRecord(
+                id=row["id"],
+                run_id=row["run_id"],
+                command_id=row["command_id"],
+                event=row["event"],
+                ts_ms=row["ts_ms"],
+                peer_uid=row["peer_uid"],
+                op=row["op"],
+                body_json=row["body"],
+                tick_id=row["tick_id"],
+                superseded_by=row["superseded_by"],
             )
             for row in rows
         )
