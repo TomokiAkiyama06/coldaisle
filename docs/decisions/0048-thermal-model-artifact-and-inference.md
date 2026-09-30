@@ -1,7 +1,7 @@
 # 決定記録 0048: Thermal Model v1 artifactと読み取り専用推論境界
 
 - **種別**: Decision Record
-- **Status**: Proposed
+- **Status**: FINAL（2026-09-19、PR #143 のマージ）
 - **Date**: 2026-09-18
 - **Supersedes**: なし
 - **関連**: [`0027-fan-control-architecture.md`](0027-fan-control-architecture.md) /

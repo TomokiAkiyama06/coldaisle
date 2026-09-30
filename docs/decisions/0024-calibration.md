@@ -1,7 +1,7 @@
 # 決定記録 0024: 較正の手順と記録
 
 - **種別**: Decision Record
-- **Status**: Proposed（本 PR のマージをもって FINAL。**実機での較正は別**。§5-1）
+- **Status**: FINAL（2026-09-10、PR #30 のマージ。**実機での較正は別**。§5-1）
 - **Date**: 2026-09-10
 - **Supersedes**: なし
 - **関連**: `docs/spec-review.md` W-02 / [`0007-ingest-pipeline.md`](0007-ingest-pipeline.md) /

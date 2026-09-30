@@ -1,7 +1,7 @@
 # 決定記録 0011: 開発用ダッシュボードの方針
 
 - **種別**: Decision Record
-- **Status**: Proposed（本 PR のマージをもって FINAL）
+- **Status**: FINAL（2026-08-25、PR #17 のマージ）
 - **Date**: 2026-08-25
 - **Supersedes**: なし
 - **Superseded by**: [`0039-dashboard-labels-and-catalog.md`](0039-dashboard-labels-and-catalog.md)（§2.4 のうち `stale` の文言バッジのみ）

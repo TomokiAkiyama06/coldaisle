@@ -145,11 +145,31 @@ manual 固定しない。enable 後にも PWM / enable を再確認する。1 zo
 zone の Max を試み、全 zone の結果を構造化する。不一致・revert・I/O 失敗は phase 付きの
 zone別 JSON log と非0終了で通知する。record が無いときは何もしない。
 
-このリポジトリにはまだ `watchdog_timeout_ms` の consumer、systemd `WatchdogSec` / heartbeat、
-`ExecStopPost` unit、handoff record producer が無い。この PR の standalone executor だけでは
-deadman は完成しない。#74 / #57 でこれらを接続し、startup / restart / shutdown / kill / hang
-を実機検証することを、本番サービスを有効にする統合 PR の merge 条件とする。この #78 PR の
-merge だけでは #78 を完了扱いにせず、それまではサービスで Fan 制御を有効化しない。
+heartbeat を出す側は `src/coldaisle/control_daemon.py`（`coldaisle-fand`）にある
+（#74 / 決定記録 0060 §2.7）。
+
+- `NOTIFY_SOCKET` と、この process 宛に有効な `WATCHDOG_USEC` がそろったときだけ
+  `SystemdWatchdog` を使い、起動時に `READY=1`、tick の書き込みと検証の直後に `WATCHDOG=1`
+  を送る（`control/loop.py`）。送れる datagram は固定値だけ
+- deadman の有無は `NOTIFY_SOCKET` の有無ではなく sd_watchdog_enabled(3) と同じ判定
+  （`WATCHDOG_USEC` / `WATCHDOG_PID`）で決める
+- `WATCHDOG_USEC` が heartbeat の最悪間隔（`tick_ms + tick_deadline_ms`）の2倍に満たなければ
+  起動しない。`safety.yaml` の `watchdog_timeout_ms` と違う値なら warning を残す
+- deadman が無い環境では `UnsupervisedWatchdog` が起動時に error を残し、heartbeat の間隔が
+  `watchdog_timeout_ms` を超えるたびに記録する（プロセスを止める力は無い）。
+  `--require-watchdog` を付けると、deadman が無いときは制御を取らずに終了する
+
+まだ無いものは次のとおりで、これらが揃うまで deadman は完成しない。
+
+- `coldaisle-fand` の systemd unit（`Type=notify` / `WatchdogSec` / `Restart` /
+  `ExecStopPost` と `--require-watchdog`）。中身は決定記録 0060 未決7 のまま（#57 / #64）で、
+  `deploy/systemd/` にも置いていない（決定記録 0069 §2.4）
+- handoff record（`/run/coldaisle/fan-handoff.json`）の producer。実機の hwmon backend が
+  まだ無い（#57 / #75）
+
+これらを接続し、startup / restart / shutdown / kill / hang を実機検証することを、
+本番サービスを有効にする統合 PR の merge 条件とする。それまでは #78 を完了扱いにせず、
+サービスで Fan 制御を有効化しない。
 
 `CriticalSafetyDecision.disabled_inputs` と `config_is_provisional` は decision trace と起動ログへ
 永続化した（#78）。
