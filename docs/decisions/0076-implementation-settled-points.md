@@ -217,8 +217,27 @@ Critical Safety（`src/coldaisle/control/safety/critical.py`）では、人が `
 - 起動時の照合を満たさなければ、0072 §2.8 の他の照合と同じく**管理ソケットを開かず**、
   `coldaisle-fand` は `AUTO` で運転を続ける
 - これらの暫定値は §2.3 の値と同じく、運用後に所有者が見直す（§5 #1 の見直しの対象に加える）
-- 実装は #74 の fix PR #190（`src/coldaisle/control_admin/server.py` / `src/coldaisle/control_admin/config.py` /
-  `config/control-admin.yaml` / `config/control-admin.dev.yaml` / `docs/control-admin.md`）。本記録のマージの後に入る
+
+**(d) 設定の版: `config/control-admin.yaml` の `version` を 1 → 2 に上げる**
+
+`accept_backoff` は必須の塊で、既定値をコードに置かない（AGENTS.md ルール 9）。`version: 1` のまま
+必須の塊を足すと、古い v1 のファイルは「`accept_backoff` が無い」という一般的な形の誤りで拒まれ、
+版が古いことが読み取れない。そこで版を上げる。
+
+- 本節の変更で、`config/control-admin.yaml` の `version` は **2** にする。v2 は `accept_backoff`
+  （(c) の4項目と `status` / `basis`）を必須にする
+- **v1 は拒否し、自動補完しない。** 拒否の理由は「版が合わない（v1。v2 が必要）」と明示する
+  （形の誤りとして一般的なメッセージに埋もれさせない）。0073 §2.1 が `air-balance.yaml` の v1 → v2 で
+  決めた「v1 は起動前に拒否し、自動補完しない（`docs/control-config.md` の各版の移行と同じ規則）」と同じ扱い
+- 拒否の経路は既存のまま: 0072 §2.8 の「設定が不正」と同じく**管理ソケットを開かず**、`coldaisle-fand` は
+  `AUTO` と journal の stage で運転を続け、error の構造化ログを残す（`src/coldaisle/control_admin/runtime.py` の
+  `_log_not_opened`）。`--no-admin` での起動は設定を読まないので影響を受けない
+- 出荷する2つのファイル（`config/control-admin.yaml` / `config/control-admin.dev.yaml`）はどちらも `version: 2` にする
+- **移行の手順**: 既存の v1 のファイルに `accept_backoff` の塊を足し、`version: 2` にする。
+  この手順を `docs/control-admin.md` に書くことを実装 PR（#190）の要件とする
+
+**実装**: §2.7 の (a)〜(d) は #74 の fix PR #190（`src/coldaisle/control_admin/server.py` / `src/coldaisle/control_admin/config.py` /
+`config/control-admin.yaml` / `config/control-admin.dev.yaml` / `docs/control-admin.md`）が行う。本記録のマージの後に入る
 
 ### 2.8 0071 §5 #1: 画面の「古い」の倍数は `stale_after_tick_periods: 3.0` で確定する
 
