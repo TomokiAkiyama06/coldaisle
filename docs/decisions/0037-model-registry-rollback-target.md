@@ -1,7 +1,7 @@
 # 決定記録 0037: Model Registry の promotion 時の rollback target
 
 - **種別**: Decision Record
-- **Status**: Proposed
+- **Status**: FINAL（2026-09-18、PR #123 のマージ）
 - **Date**: 2026-09-18
 - **Supersedes**: なし
 - **関連**: [`docs/model-registry.md`](../model-registry.md)、

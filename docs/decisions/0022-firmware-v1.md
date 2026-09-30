@@ -1,7 +1,7 @@
 # 決定記録 0022: 本番ファームウェア v1
 
 - **種別**: Decision Record
-- **Status**: Proposed（本 PR のマージをもって FINAL。**実機確認は別**。§5-1）
+- **Status**: FINAL（2026-09-10、PR #28 のマージ。**実機確認は別**。§5-1）
 - **Date**: 2026-09-10
 - **Supersedes**: なし
 - **関連**: [`0003-device-json-schema.md`](0003-device-json-schema.md) /

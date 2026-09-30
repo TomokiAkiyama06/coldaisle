@@ -1,7 +1,7 @@
 # 決定記録 0003: デバイス出力 JSON スキーマ v1
 
 - **種別**: Decision Record
-- **Status**: Proposed
+- **Status**: FINAL（2026-08-24、PR #6 のマージ）
 - **Date**: 2026-08-24
 - **Supersedes**: なし
 - **関連**: `docs/requirements.md` §5.2 / §5.3 / FR-103 / FR-105 / FR-106 /

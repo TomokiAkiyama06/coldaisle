@@ -1,7 +1,7 @@
 # 決定記録 0009: 読み取り API の契約
 
 - **種別**: Decision Record
-- **Status**: Proposed（本 PR のマージをもって FINAL）
+- **Status**: FINAL（2026-08-25、PR #15 のマージ）
 - **Date**: 2026-08-25
 - **Supersedes**: なし
 - **Superseded by**: [0040](0040-server-health-api.md)（§5 未決事項1 のみ。他の節は有効）

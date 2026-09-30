@@ -1,7 +1,7 @@
 # 決定記録 0013: 通知の規約
 
 - **種別**: Decision Record
-- **Status**: Proposed（本 PR のマージをもって FINAL）
+- **Status**: FINAL（2026-08-25、PR #19 のマージ）
 - **Date**: 2026-08-25
 - **Supersedes**: なし
 - **関連**: [`0001-initial-project-decisions.md`](0001-initial-project-decisions.md) D-03 / D-04 /

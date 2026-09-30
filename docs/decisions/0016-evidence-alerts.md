@@ -1,7 +1,7 @@
 # 決定記録 0016: アラート説明の Evidence 形式
 
 - **種別**: Decision Record
-- **Status**: Proposed（本 PR のマージをもって FINAL）
+- **Status**: FINAL（2026-08-25、PR #22 のマージ）
 - **Date**: 2026-08-25
 - **Supersedes**: なし
 - **関連**: [`0013-notifications.md`](0013-notifications.md) §2.2 / §2.3 /
