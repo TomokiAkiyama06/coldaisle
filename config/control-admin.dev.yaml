@@ -10,7 +10,8 @@
 # 項目の意味は config/control-admin.yaml と同じです。違いは socket.group と
 # authorization.allow_same_user の2つだけ（下の limits などは本番の設定と揃える）。
 
-version: 1
+# v2（#74 / 決定記録 0076 §2.7）で accept_backoff を必須にした。v1 は読まない。
+version: 2
 
 socket:
   # 規則は event-entry.yaml と同じ（0045 §2.2）。本番は systemd の RuntimeDirectory 配下を指定する。
@@ -49,3 +50,19 @@ manual:
     value: 14400
     status: provisional
     basis: "決定記録 0072 §5 の 4。段階 1 の暫定値（4時間）。運用後に所有者が決める"
+
+# accept() が失敗し続けるとき（fd の枯渇 EMFILE / ENFILE・ECONNABORTED など）の扱い（決定記録 0076 §2.7）。
+# 待ち受けのソケットは読める状態のままなので、休まないと受付スレッドが空回りしてログを溢れさせる。
+# 失敗のたびに initial_ms から multiplier 倍にして max_ms で頭打ちにし、accept() が成功したら戻す。
+# 休んでいる間も**接続済みの接続は読み続ける**（max は遅れずに受け渡し口へ置く）。
+# 途切れずに escalate_after_ms 失敗し続けたら受付スレッドを終わらせ、loop が「受付スレッドの死」として
+# 再起動まで MAX にする（MANUAL は解除。decision trace に admin_receiver_dead）。
+# 規則: initial_ms <= max_ms <= **safety.yaml の tick_ms**（起動時に照合）、1 < multiplier <= 16（有限）、
+# escalate_after_ms > max_ms。
+accept_backoff:
+  initial_ms: 100
+  max_ms: 1000
+  multiplier: 2
+  escalate_after_ms: 30000
+  status: provisional
+  basis: "決定記録 0076 §2.7 の暫定値。受付の空回りを止めつつ新しい接続を 1 tick を超えて待たせず、30 秒続けば MAX へ上げる。運用後に所有者が決める"
