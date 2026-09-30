@@ -82,8 +82,15 @@ unit の書き方次第で、決めた安全の性質が**黙って崩れる**�
   - `coldaisle-admin`: 管理ソケットは bind の後に `os.chown(path, -1, <socket.group の gid>)` で
     グループを付け替える（`control_admin/server.py`）。capability を持たない非 root のプロセスは
     **自分が属するグループにしか付け替えられない**ので、所属が無いと管理ソケットの起動が EPERM で失敗する。
-    fand が入っても、fand と同じ uid の接続は出荷設定で拒否される（0072 §2.5 / 0076）ので、
-    モードを変えられる者は増えない
+  - **ただし、いまの認可はこの所属で fand 自身の uid を通してしまう。** `local_socket.Authorizer.allows()` は
+    `allow_same_user: false` のとき同じ uid の自動の許可を飛ばすだけで、その後のグループの判定
+    （`pw_gid` / `gr_mem`）で fand の uid を認める。このままでは `coldaisle-fan` で動く任意のプロセスが
+    `manual` / `max` を送れ、0072 §2.5 の「同じ uid も暗黙には認めない」と 0076 §2.6 の出荷設定の意図に反する
+  - そこで本記録は、**fand を `coldaisle-admin` に入れる前提として**、`allow_same_user: false` のとき
+    `uid == server_uid` をグループの判定より前に拒否することを求める（段階 1 の前提。§2.10 の段階 0）。
+    この変更は 0072 §2.5 の意図をコードに合わせるもので、`allow_same_user: true` の開発用設定と
+    eventd（0045、既定 `true`）の挙動は変えない。どの方式にするかは所有者が決める
+    （PR の「所有者に判断してほしい点」13。代替は fand を `coldaisle-admin` に入れない方式）
 - **DB のディレクトリをグループで共有できるようにする**（既存の unit も変える。§2.10 の段階 1）。
   0069 のテンプレートは `StateDirectoryMode=0750` で、systemd はどれかの unit が起動するたびに
   `/var/lib/coldaisle` をこの mode に戻す。0750 ではグループに書き込み権が無く、fand は SQLite の
@@ -288,7 +295,8 @@ fand のテンプレートを先に置いてよい。
 
 | 段階 | 担当 Issue（1段階ずつ別の PR） | 内容 | 前提 |
 |---|---|---|---|
-| 1 | #57 | `deploy/systemd/coldaisle-fand.service` と `deploy/udev/` の hwmon テンプレート（仮の値）。`tests/test_deploy_templates.py` の `test_fand_is_not_templated_here` を、§2.2〜§2.9 を確かめる静的試験に置き換える（`Type=notify`・`NotifyAccess=main`・`--require-watchdog`・`KillMode=control-group`・`StartLimitIntervalSec=0`・`RestartPreventExitStatus` が `{3, 4}` ちょうど・`ExecStopPost` が `+` と `-I -S` で引数なし・`ProtectKernelTunables` が `yes` でない・`StateDirectory=coldaisle` が無い・`RuntimeDirectory=coldaisle` が fand にだけある・取り込みへの強い依存が無い・`User` が `coldaisle` でも root でもない・`SupplementaryGroups` に `coldaisle` と `control-admin.yaml` の `socket.group` が含まれる・時間切れ3つが明示されている・udev のテンプレートが `RUN+=` の chgrp / chmod で `GROUP=` / `MODE=` に頼らない）。**既存の daemon / api / rollup / report の unit を §2.1 に合わせて変える**（`StateDirectoryMode=2770`・`UMask=0007`。全 unit でそろっていることも試験する）。`docs/ubuntu-deploy.md` に導入手順（管理ソケットの `socket.path` を `/run/coldaisle/` の下にすることを含む）を足すが、**`enable` はしない**と書く | 本記録の承認。`--authority-root` は PR #192 のマージ後に使える |
+| 0 | #74 | `local_socket.Authorizer.allows()` が `allow_same_user: false` のとき `uid == server_uid` をグループの判定より前に拒否する（§2.1）。試験は「サーバと同じ uid がグループのメンバーでも拒否」「`allow_same_user: true` なら許可」「別の uid のメンバーは許可」の3通り。管理ソケット（`control_admin`）と eventd の両方の既存試験が通ること | 本記録の承認（所有者の判断 13 が (a) のとき） |
+| 1 | #57 | `deploy/systemd/coldaisle-fand.service` と `deploy/udev/` の hwmon テンプレート（仮の値）。`tests/test_deploy_templates.py` の `test_fand_is_not_templated_here` を、§2.2〜§2.9 を確かめる静的試験に置き換える（`Type=notify`・`NotifyAccess=main`・`--require-watchdog`・`KillMode=control-group`・`StartLimitIntervalSec=0`・`RestartPreventExitStatus` が `{3, 4}` ちょうど・`ExecStopPost` が `+` と `-I -S` で引数なし・`ProtectKernelTunables` が `yes` でない・`StateDirectory=coldaisle` が無い・`RuntimeDirectory=coldaisle` が fand にだけある・取り込みへの強い依存が無い・`User` が `coldaisle` でも root でもない・`SupplementaryGroups` に `coldaisle` と `control-admin.yaml` の `socket.group` が含まれる・時間切れ3つが明示されている・udev のテンプレートが `RUN+=` の chgrp / chmod で `GROUP=` / `MODE=` に頼らない）。**既存の daemon / api / rollup / report の unit を §2.1 に合わせて変える**（`StateDirectoryMode=2770`・`UMask=0007`。全 unit でそろっていることも試験する）。`docs/ubuntu-deploy.md` に導入手順（管理ソケットの `socket.path` を `/run/coldaisle/` の下にすることを含む）を足すが、**`enable` はしない**と書く | 本記録の承認・段階 0（fand を `coldaisle-admin` に入れるため）。`--authority-root` は PR #192 のマージ後に使える |
 | 2 | #74 | `create_watchdog` に §2.3 の「環境側が長ければ終了コード 4」を足す（`environ` を渡す既存の試験の形で、等しい・短い・長いの3通り）。fand の起動時に `faulthandler` を有効にする | 段階 1 と独立。`control_daemon.py` を触るので PR #192 のマージ後 |
 | 3 | #78 | 実行部を `python -I -S <ファイル>` で起動できることの試験（subprocess。記録の無い環境で何も書かずに 0 で終わる）。標準ライブラリだけを import する試験は既にある | 段階 1 |
 | 4 | #77 | 実機 backend の記録の書き手（§2.7 の 1〜6）と正常停止の返却（§2.8）。偽の sysfs（`tmp_path`）で、書いた記録を `emergency_handoff` が読んで Max にできること・既存記録の値の引き継ぎ・返却の成功で記録が消え失敗で残ること・記録を書けなければ `pwmN_enable` に触らないことを確かめる | #75 の profile、段階 1〜3 |
@@ -372,3 +380,4 @@ fand のテンプレートを先に置いてよい。
 | 12 | `coldaisle-telemetry` / `coldaisle-eventd` の unit（`RuntimeDirectory` は `coldaisle` 以外の名前にする） | 0069 未決 3 / 0045 未決 4 |
 | 13 | コンテナ化（#64）で fand をホストで直接動かすか。本記録はホストで直接動かす前提 | 0028 未決 7 / #64 |
 | 14 | API / AI のユーザーが Telemetry の DB を書ける（§3）。制御入力の書き手を取り込みに限るか（DB の分離・読み取り専用の接続など） | 所有者が別の Issue を立てる（本記録の範囲外） |
+| 15 | 管理ソケットのグループ付け替えのために fand を `coldaisle-admin` に入れる方式（§2.1）。同じ uid の拒否を認可に足す（段階 0）か、fand をグループに入れない所有の仕方（root が setgid の `RuntimeDirectory` を用意する等）にするか | 所有者（PR の判断点 13）。決まるまで fand の unit は `enable` しない |
