@@ -4,6 +4,7 @@
 - **Status**: FINAL（2026-09-20、リポジトリ所有者が承認）
 - **Date**: 2026-09-20
 - **Supersedes**: なし
+- **Superseded by**: [0079](0079-model-artifact-formats.md)（§2.1 の attestation の表の `artifact_sha256` の行の「生成時: Confidence Profile の binding と照合」を、反実仮想 Thermal Model artifact v2 では Registry の検証経路だけが作る封をした型が同じ bytes から model と Profile を作る保証へ替える部分のみ。他の節は有効。0079 §2.5 は §2.4 の探索範囲へ狭める向きの写しを足すだけで、§2.4 を置き換えない）
 - **関連**: [0027](0027-fan-control-architecture.md) / [0028](0028-fan-control-contracts.md) §2.3〜§2.6 /
   [0031](0031-thermal-dataset-contract.md) / [0033](0033-air-balance-config-boundary.md) /
   [0048](0048-thermal-model-artifact-and-inference.md) §2.1 / [0050](0050-model-confidence-ood-and-authority.md) /

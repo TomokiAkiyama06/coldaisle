@@ -118,9 +118,9 @@ docs/decisions/NNNN-<slug>.md      例: 0002-metric-naming.md
 | [0047](0047-cpu-utilization-metric.md) | CPU 使用率のメトリクス名（`cpu.utilization`） | FINAL |
 | [0048](0048-thermal-model-artifact-and-inference.md) | Thermal Model v1 artifactと読み取り専用推論境界 | FINAL |
 | [0049](0049-internal-telemetry-source-kind.md) | 内部テレメトリの出どころの種類（`sys.telemetry_kind`: hardware / mock）を記録し、いまの値にだけ「実測」と書く | FINAL |
-| [0050](0050-model-confidence-ood-and-authority.md) | Model Confidence / OOD の判定方式と confidence に応じた Authority 制限 | FINAL |
+| [0050](0050-model-confidence-ood-and-authority.md) | Model Confidence / OOD の判定方式と confidence に応じた Authority 制限 | FINAL（§2.1 のうち Profile v2 の束縛の対象を model payload の SHA-256 にする部分は [0079](0079-model-artifact-formats.md)） |
 | [0051](0051-airflow-cpu-utilization-display.md) | エアフロー画面の CPU 使用率の表示（`cpu.utilization` と「未計測」の判断） | FINAL |
-| [0052](0052-learned-mpc-optimizer-and-hard-constraints.md) | Learned MPC optimizer の内部モデル要件（反実仮想 capability）と Hard Constraints の扱い | FINAL |
+| [0052](0052-learned-mpc-optimizer-and-hard-constraints.md) | Learned MPC optimizer の内部モデル要件（反実仮想 capability）と Hard Constraints の扱い | FINAL（§2.1 の `artifact_sha256` の生成時照合を artifact v2 で封をした型の保証へ替える部分は [0079](0079-model-artifact-formats.md)） |
 | [0053](0053-control-shadow-mode-and-counterfactual-logging.md) | Control Shadow Mode の記録内容（counterfactual の置き場所・予測と実測の突き合わせ・export） | FINAL |
 | [0054](0054-offline-evaluation-attribution-and-gates.md) | Offline Evaluation の帰属規則（適用と counterfactual を分ける）・coverage の扱い・rollout gate | FINAL |
 | [0055](0055-shadow-duplicate-observation-rule.md) | Shadow の照合は同じ metric・同じ時刻の食い違う観測を受け取らない（同じ値の重複は1つに畳む） | FINAL |
@@ -145,4 +145,4 @@ docs/decisions/NNNN-<slug>.md      例: 0002-metric-naming.md
 | [0074](0074-supervisor-shadow-wiring-and-episode-evaluation.md) | 運転中の Supervisor decision を Shadow 台帳へ流す配線（制御プロセスの外の CLI が保存済み trace から集計・鍵は `(ts_ms, tick_id)`）と、RL episode 結果を別の report 型 `PolicyEpisodeReport` の `episode:` arm として出す接続（`for_active` の条件は範囲外） | FINAL |
 | [0075](0075-trace-registry-block-reason-digest.md) | decision trace の registry の塊では自由記述の `reason` を全文でなく `reason_sha256`（UTF-8 の SHA-256）にする（毎 tick の保存量を抑える・全文は registry の audit が正本・`previous_artifact` / `rollback_target` の長さも閉じる。0071 §2.5 の一部を置き換え） | FINAL |
 | [0076](0076-implementation-settled-points.md) | 0071 / 0072 / 0073 の実装で決着した点（Air Balance の記録は `ControlTick` v11 で入った＝0073 の「v10」の読み替え・監査の表 `control_admin_audit` の DDL と起動ごとの `run_id`・`ControlTick` v12 の `mode_command` と `admin_receiver_dead`・`control-admin.yaml` の暫定値・応答の `superseded_by`（0072 §2.3 の一部を置き換え）・受付スレッドの死は Safety では `manual_max` のまま・出荷設定は同じ uid を認めない・`accept()` の失敗は待ち受けだけを上限付きで休み、`escalate_after_ms` 続いたら受付スレッドの死として `MAX`・`control-admin.yaml` は版 2（v1 は拒否）・画面の古さの倍数 3.0 を確定） | FINAL |
-| [0079](0079-model-artifact-formats.md) | Confidence Profile を反実仮想 Thermal Model artifact v2 に同梱して組で昇格・rollback する・artifact v2 の形式（action 列の格子・学習データの時間窓・metric と単位と較正の束縛・4層の digest）・Registry の検証経路だけが作る封をした型と読み込み時検査 L1〜L9・学習した action 列の外は探索しない・失敗は Fallback（暗黙の降格なし）・anchor から最初の step への遷移も照合・Registry の健全性の通知は開いたまま（承認時に 0050 §2.1 / 0052 §2.1 の Profile の束縛の一部を置き換える。0050 §2.2 の推論ごとの照合は残す） | Proposed |
+| [0079](0079-model-artifact-formats.md) | Confidence Profile を反実仮想 Thermal Model artifact v2 に同梱して組で昇格・rollback する・artifact v2 の形式（action 列の格子・学習データの時間窓・metric と単位と較正の束縛・4層の digest）・Registry の検証経路だけが作る封をした型と読み込み時検査 L1〜L10・学習した action 列の外（margin なし）は探索しない・失敗は Fallback（暗黙の降格なし）・anchor から最初の step への遷移も照合・Registry の健全性の通知は開いたまま（0050 §2.1 / 0052 §2.1 の Profile の束縛の一部を置き換える。0050 §2.2 の推論ごとの照合は残す） | FINAL |
