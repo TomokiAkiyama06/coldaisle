@@ -33,7 +33,7 @@ import pytest
 import yaml
 from pydantic import ValidationError
 
-from coldaisle.clock import SimulatedClock, SystemMonotonicClock
+from coldaisle.clock import ManualMonotonicClock, SimulatedClock, SystemMonotonicClock
 from coldaisle.control.operating_mode import (
     MANUAL_COMMAND_REASON,
     AdminModeCommand,
@@ -153,6 +153,8 @@ def test_the_repository_config_is_valid_and_fits_the_test_safety_timing(path):
     settings.check_against(tick_ms=TICK_MS, tick_deadline_ms=TICK_DEADLINE_MS)
     assert settings.manual.max_lease_s.status == "provisional"
     assert settings.manual.max_lease_s.basis
+    assert settings.accept_backoff.status == "provisional"
+    assert settings.accept_backoff.basis
 
 
 def test_the_default_admin_config_does_not_admit_the_same_uid():
@@ -223,8 +225,32 @@ def test_a_world_accessible_socket_mode_is_refused(mode):
         admin_settings(socket__mode=mode)
 
 
+def test_an_accept_backoff_longer_than_a_tick_is_refused_at_startup():
+    """休んでいる間に届いた新しい接続（`MAX` を含む）を 1 tick を超えて待たせない。"""
+    settings = admin_settings(accept_backoff__max_ms=TICK_MS + 1)
+    with pytest.raises(ControlAdminConfigError, match=r"accept_backoff\.max_ms"):
+        settings.check_against(tick_ms=TICK_MS, tick_deadline_ms=TICK_DEADLINE_MS)
+    admin_settings(accept_backoff__max_ms=TICK_MS).check_against(
+        tick_ms=TICK_MS, tick_deadline_ms=TICK_DEADLINE_MS
+    )
+
+
+def test_an_accept_backoff_whose_max_is_below_its_initial_is_refused():
+    with pytest.raises(ValidationError, match="max_ms"):
+        admin_settings(accept_backoff__initial_ms=200, accept_backoff__max_ms=100)
+    with pytest.raises(ValidationError):
+        admin_settings(accept_backoff__initial_ms=0)
+
+
 @pytest.mark.parametrize(
-    "missing", ["apply_ack_timeout_ms", "manual", "limits__max_pending_commands"]
+    "missing",
+    [
+        "apply_ack_timeout_ms",
+        "manual",
+        "limits__max_pending_commands",
+        "accept_backoff",
+        "accept_backoff__max_ms",
+    ],
 )
 def test_values_have_no_defaults_in_code(missing):
     """値はすべて設定に置き、コードに既定値を置かない（AGENTS.md ルール9）。"""
@@ -866,15 +892,209 @@ def test_a_malformed_mode_is_refused_and_the_receiver_stays_alive(entry, raw):
     assert entry.send({"v": 1, "op": "status"})["ok"] is True
 
 
-def test_a_transient_accept_failure_does_not_kill_the_receiver(entry):
-    """fd の一時的な枯渇などは、今回の accept を打ち切るだけにする。"""
+class FailingListener:
+    def __init__(self) -> None:
+        self.calls = 0
 
-    class FailingListener:
-        def accept(self) -> tuple[Any, Any]:
-            raise OSError(errno.EMFILE, "Too many open files")
+    def accept(self) -> tuple[Any, Any]:
+        self.calls += 1
+        raise OSError(errno.EMFILE, "Too many open files")
 
-    entry.server._accept(FailingListener())  # type: ignore[arg-type]
-    assert entry.mailbox.receiver_alive()
+
+class OnceListener:
+    """1回だけ接続を返し、あとは待ち行列が空（`BlockingIOError`）。"""
+
+    def __init__(self, sock: socket.socket) -> None:
+        self._sock: socket.socket | None = sock
+
+    def accept(self) -> tuple[Any, Any]:
+        sock, self._sock = self._sock, None
+        if sock is None:
+            raise BlockingIOError
+        return sock, None
+
+
+def idle_server(monotonic: ManualMonotonicClock, **changes: Any) -> ControlAdminServer:
+    """bind も start もしない受付（selector を持たない）。休みの長さとログだけを見る。"""
+    settings = admin_settings(Path("/nonexistent/admin.sock"), **changes)
+    mailbox = AdminMailbox()
+    return ControlAdminServer(
+        settings=settings,
+        mailbox=mailbox,
+        audit=AuditWriter(
+            open_sink=lambda: pytest.fail("監査は開かない"),
+            queue_max=settings.limits.audit_queue_max,
+            on_done=mailbox.wake,
+        ),
+        clock=SimulatedClock(TEST_EPOCH_MS),
+        monotonic=monotonic,
+        run_id=RUN_ID,
+        authority_ceiling=AuthorityStage.SHADOW,
+    )
+
+
+@needs_peercred
+def test_repeated_accept_failures_back_off_on_the_monotonic_clock_and_log_sparsely(caplog):
+    """失敗のたびに休みを倍にし、`max_ms` で頭打ちにする。ログは伸びたときと 2 の冪だけ。"""
+    monotonic = ManualMonotonicClock(10_000)
+    server = idle_server(monotonic, accept_backoff__initial_ms=100, accept_backoff__max_ms=1_000)
+    listener = FailingListener()
+    caplog.set_level("INFO", logger="coldaisle.control_admin")
+    backoffs: list[int] = []
+    for _ in range(12):
+        server._accept(listener)  # type: ignore[arg-type]
+        assert server._accept_backoff_ms is not None
+        backoffs.append(server._accept_backoff_ms)
+        resume = server._accept_resume_mono_ms
+        assert resume == monotonic.monotonic_ms() + server._accept_backoff_ms
+        # 期限の前には戻さず、期限で戻す（sleep しない。loop の周回で単調時計を見るだけ）
+        monotonic.advance_ms(server._accept_backoff_ms - 1)
+        server._resume_accept_if_due()
+        assert server._accept_resume_mono_ms == resume
+        monotonic.advance_ms(1)
+        server._resume_accept_if_due()
+        assert server._accept_resume_mono_ms is None
+    assert listener.calls == 12, "1回の失敗で打ち切り、同じ周回で accept を繰り返さない"
+    assert backoffs == [100, 200, 400, 800, 1_000, 1_000, 1_000, 1_000, 1_000, 1_000, 1_000, 1_000]
+    failures = [
+        record
+        for record in caplog.records
+        if record.getMessage().startswith("接続の受け付けに失敗")
+    ]
+    # 伸びた5回（1, 2, 3, 4, 5 回目）+ 頭打ちの後の 2 の冪（8 回目）
+    assert [record.fields["consecutive_failures"] for record in failures] == [1, 2, 3, 4, 5, 8]
+    assert failures[-1].fields["suppressed_since_last_log"] == 2
+    assert failures[0].fields["errno"] == "EMFILE"
+    assert failures[0].exc_info
+    assert not any(record.exc_info for record in failures[1:])
+
+    # 成功したら休みの長さを戻す（次の失敗は initial_ms から）
+    ours, theirs = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        server._accept(OnceListener(ours))  # type: ignore[arg-type]
+        assert server._accept_backoff_ms is None
+        assert server._accept_failures == 0
+        assert any(
+            record.getMessage() == "接続の受け付けが回復した"
+            and record.fields["consecutive_failures"] == 12
+            for record in caplog.records
+        )
+        server._accept(listener)  # type: ignore[arg-type]
+        assert server._accept_backoff_ms == 100
+    finally:
+        server.close()
+        theirs.close()
+
+
+class AcceptSwitch:
+    """待ち受けの `accept()` だけを EMFILE で失敗させ、呼ばれた回数を数える。"""
+
+    def __init__(self, monkeypatch: pytest.MonkeyPatch, listener: socket.socket) -> None:
+        self.failing = False
+        self.failures = 0
+        original = socket.socket.accept
+        switch = self
+
+        def accept(sock: socket.socket) -> tuple[socket.socket, Any]:
+            if sock is listener and switch.failing:
+                switch.failures += 1
+                raise OSError(errno.EMFILE, "Too many open files")
+            return original(sock)
+
+        monkeypatch.setattr(socket.socket, "accept", accept)
+
+
+def connect(path: Path) -> socket.socket:
+    conn = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    conn.settimeout(5)
+    conn.connect(str(path))
+    return conn
+
+
+@needs_peercred
+def test_a_persistent_accept_failure_does_not_spin_the_receiver(short_dir, rules, monkeypatch):
+    """待ち受けが読める状態のまま accept が失敗し続けても、空回りせずログも溢れない。"""
+    running = RunningEntry(
+        short_dir, rules, accept_backoff__initial_ms=50, accept_backoff__max_ms=200
+    )
+    pending: socket.socket | None = None
+    try:
+        assert running.server._listener is not None
+        switch = AcceptSwitch(monkeypatch, running.server._listener)
+        switch.failing = True
+        pending = connect(running.path)  # カーネルの待ち行列に残り、待ち受けは読める状態が続く
+        time.sleep(1.0)
+        # 休まなければ 1 秒で数千回。休みは 50, 100, 200, 200, ... ms なので 1 秒で 7 回前後
+        assert 1 <= switch.failures <= 12
+        assert running.mailbox.receiver_alive()
+    finally:
+        if pending is not None:
+            pending.close()
+        running.stop()
+
+
+@needs_peercred
+def test_max_on_an_existing_connection_is_delivered_while_accept_is_backing_off(
+    short_dir, rules, monkeypatch
+):
+    """休んでいるのは待ち受けだけ。接続済みの接続の `MAX` は遅れずに受け渡し口へ置く。"""
+    running = RunningEntry(
+        short_dir,
+        rules,
+        limits__read_timeout_s=1.0,
+        accept_backoff__initial_ms=5_000,
+        accept_backoff__max_ms=5_000,
+    )
+    existing: socket.socket | None = None
+    newcomer: socket.socket | None = None
+    try:
+        assert running.server._listener is not None
+        switch = AcceptSwitch(monkeypatch, running.server._listener)
+        existing = connect(running.path)
+        wait_until(lambda: len(running.server._connections) == 1)
+        switch.failing = True
+        newcomer = connect(running.path)
+        wait_until(lambda: running.server._accept_resume_mono_ms is not None)
+        paused_at = time.monotonic()
+        existing.sendall(encode(MAX))
+        running.tick_until(OperatingMode.MAX)
+        reply = json.loads(existing.recv(1_000).split(b"\n")[0])
+        assert reply["applied"] is True
+        assert time.monotonic() - paused_at < 2.0, "休みの 5 秒を待たずに届く"
+        assert running.server._accept_resume_mono_ms is not None, "まだ休んでいる"
+        assert switch.failures == 1
+    finally:
+        for conn in (existing, newcomer):
+            if conn is not None:
+                conn.close()
+        running.stop()
+
+
+@needs_peercred
+def test_accept_resumes_after_the_backoff_and_resets_it(short_dir, rules, monkeypatch):
+    """休みが明けたら待ち受けを戻し、待たされていた接続にも答える。成功で休みの長さを戻す。"""
+    running = RunningEntry(
+        short_dir, rules, accept_backoff__initial_ms=200, accept_backoff__max_ms=200
+    )
+    waiting: socket.socket | None = None
+    try:
+        assert running.server._listener is not None
+        switch = AcceptSwitch(monkeypatch, running.server._listener)
+        switch.failing = True
+        waiting = connect(running.path)
+        waiting.sendall(encode({"v": 1, "op": "status"}))
+        wait_until(lambda: running.server._accept_resume_mono_ms is not None)
+        switch.failing = False  # fd が空いた
+        reply = json.loads(waiting.recv(1_000).split(b"\n")[0])
+        assert reply["ok"] is True
+        assert switch.failures == 1
+        assert running.server._accept_backoff_ms is None
+        assert running.server._accept_failures == 0
+        assert running.send({"v": 1, "op": "status"})["ok"] is True
+    finally:
+        if waiting is not None:
+            waiting.close()
+        running.stop()
 
 
 def test_stopping_without_drain_does_not_wait_for_a_blocked_audit(short_dir, rules):

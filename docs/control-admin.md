@@ -64,6 +64,7 @@ uv run coldaisle-control auto --reason "比較の終了"
 | `limits.audit_queue_max` | 監査書き込みスレッドの FIFO の上限 |
 | `apply_ack_timeout_ms` | `>= tick_ms + tick_deadline_ms`（起動時に照合） |
 | `manual.max_lease_s` | `status` / `basis` 付きの暫定値 |
+| `accept_backoff.initial_ms` / `accept_backoff.max_ms` | `accept()` が失敗し続けるときに待ち受けを休む間隔。`initial_ms <= max_ms <= tick_ms`（`safety.yaml` と起動時に照合）。`status` / `basis` 付きの暫定値 |
 
 **設定が不正・無い、`SO_PEERCRED` が無い、ソケットを作れない、受付・監査のスレッドを起動できない**ときは入口を開かず、`coldaisle-fand` は
 `AUTO` で運転を続けます（error を構造化ログに残す）。`--no-admin` で明示的に開かないこともできます。
@@ -71,6 +72,22 @@ uv run coldaisle-control auto --reason "比較の終了"
 認可はファイル権限と `SO_PEERCRED` の2つの門です（0072 §2.5）。**同じ uid も root も暗黙には認めません。**
 配置の必須条件: 読み取り API と AI 層を動かすユーザーを `socket.group` に入れない。API / AI サーバを
 `coldaisle-fand` と同じユーザーで動かさない。
+
+## 接続の受け付けが失敗し続けるとき
+
+fd の枯渇（`EMFILE` / `ENFILE`）や `ECONNABORTED` などで `accept()` が失敗しても、受付スレッドは死なせません。
+待ち受けのソケットは読める状態のままなので、そのまま監視を続けると受付スレッドが空回りしてログを溢れさせます。
+そこで失敗したら**待ち受けのソケットだけ**を selector から外し、単調時計の期限が来たら戻します。
+
+- 休む長さは最初が `accept_backoff.initial_ms`、失敗のたびに倍にして `accept_backoff.max_ms` で頭打ち。
+  `accept()` が1回でも成功したら戻します（回復を info で1行残す）
+- **`sleep` しません。** 休んでいる間も接続済みの接続は読み続け、`max` は遅れずに受け渡し口へ置きます。
+  待たされるのは新しい接続だけで、その待ちは `max_ms`（`tick_ms` 以下）を超えません
+- **`MAX` には倒しません**（入口の不調で Fan を動かさない。所有者の判断）。受付スレッドが死んだときとは扱いが違います
+- ログ（warning。`reason: admin_accept_failed`）は最初の失敗と、休みが伸びたとき、頭打ちの後は連続の失敗の回数が
+  2 の冪に届いたときだけ出します。`consecutive_failures`・`suppressed_since_last_log`（出さなかった回数）・
+  `backoff_ms`・`errno` を持ちます。スタックトレースは最初の1回だけです
+- `initial_ms = 100` / `max_ms = 1000` は暫定値です（`status: provisional`）
 
 ## 受付スレッドが死んだとき
 

@@ -58,6 +58,32 @@ class ProvisionalSeconds(_Strict):
     basis: str = Field(min_length=1)
 
 
+class AcceptBackoff(_Strict):
+    """`accept()` が失敗し続けるときに待ち受けを休む間隔（#74）。`status` / `basis` 付きの暫定値。
+
+    EMFILE / ENFILE / ECONNABORTED などで `accept()` が失敗しても待ち受けのソケットは読める状態の
+    ままなので、休まずに監視し続けると受付スレッドが空回りしてログを溢れさせる。失敗のたびに
+    `initial_ms` から倍にして `max_ms` で頭打ちにし、成功したら戻す。**`MAX` には倒さない**
+    （入口の不調で Fan を動かさない。所有者の判断）。
+    """
+
+    initial_ms: int = Field(ge=1)
+    """最初の失敗のあとに待ち受けを休む時間（ミリ秒）。"""
+    max_ms: int = Field(ge=1)
+    """休む時間の上限（ミリ秒）。`initial_ms` 以上、`tick_ms` 以下（起動時に照合する）。"""
+    status: Literal["provisional", "confirmed"]
+    basis: str = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def _max_is_not_below_initial(self) -> Self:
+        if self.max_ms < self.initial_ms:
+            raise ValueError(
+                "accept_backoff.max_ms は accept_backoff.initial_ms 以上にする: "
+                f"initial_ms={self.initial_ms}; max_ms={self.max_ms}"
+            )
+        return self
+
+
 class ManualSettings(_Strict):
     """`MANUAL` の期限（0072 §2.4）。"""
 
@@ -74,6 +100,7 @@ class ControlAdminSettings(_Strict):
     apply_ack_timeout_ms: int = Field(ge=1)
     """受付スレッドが適用の確認を待つ上限。`tick_ms + tick_deadline_ms` 以上（起動時に照合）。"""
     manual: ManualSettings
+    accept_backoff: AcceptBackoff
 
     @model_validator(mode="after")
     def _a_production_entry_names_its_group(self) -> Self:
@@ -95,6 +122,8 @@ class ControlAdminSettings(_Strict):
         - `read_timeout_s * 1000 <= tick_ms`: 受信中の接続が1 tick を超えて枠を占めない（§2.2）
         - `apply_ack_timeout_ms >= tick_ms + tick_deadline_ms`: 次の tick の先頭で入る指令の
           適用の確認を待てる（§2.6）
+        - `accept_backoff.max_ms <= tick_ms`: `accept()` の失敗で休んでいる間に届いた新しい接続
+          （`MAX` を含む）を、1 tick を超えて待たせない（#74）
         """
         if self.limits.read_timeout_s * 1_000 > tick_ms:
             raise ControlAdminConfigError(
@@ -106,6 +135,11 @@ class ControlAdminSettings(_Strict):
             raise ControlAdminConfigError(
                 "apply_ack_timeout_ms は safety.yaml の tick_ms + tick_deadline_ms 以上にする: "
                 f"apply_ack_timeout_ms={self.apply_ack_timeout_ms}; required>={required}"
+            )
+        if self.accept_backoff.max_ms > tick_ms:
+            raise ControlAdminConfigError(
+                "accept_backoff.max_ms は safety.yaml の tick_ms 以下にする: "
+                f"max_ms={self.accept_backoff.max_ms}; tick_ms={tick_ms}"
             )
 
     @classmethod

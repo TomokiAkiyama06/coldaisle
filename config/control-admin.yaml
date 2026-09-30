@@ -57,3 +57,14 @@ manual:
     value: 14400
     status: provisional
     basis: "決定記録 0072 §5 の 4。段階 1 の暫定値（4時間）。運用後に所有者が決める"
+
+# accept() が失敗し続けるとき（fd の枯渇 EMFILE / ENFILE・ECONNABORTED など）に待ち受けを休む間隔（ミリ秒）。
+# 待ち受けのソケットは読める状態のままなので、休まないと受付スレッドが空回りしてログを溢れさせる。
+# 失敗のたびに initial_ms から倍にして max_ms で頭打ちにし、accept() が成功したら戻す。
+# 休んでいる間も**接続済みの接続は読み続ける**（max は遅れずに受け渡し口へ置く）。MAX には倒さない。
+# max_ms は initial_ms 以上、**safety.yaml の tick_ms 以下**（起動時に照合する）。
+accept_backoff:
+  initial_ms: 100
+  max_ms: 1000
+  status: provisional
+  basis: "#74 の暫定値。受付の空回りを止めつつ、新しい接続を 1 tick を超えて待たせない。運用後に所有者が決める"
