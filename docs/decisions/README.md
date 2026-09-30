@@ -97,7 +97,7 @@ docs/decisions/NNNN-<slug>.md      例: 0002-metric-naming.md
 | [0025](0025-probe-identity.md) | プローブの同定 | FINAL |
 | [0026](0026-three-zone-fan-control.md) | Front / Rear / Top を独立Fan zoneとして制御する | FINAL |
 | [0027](0027-fan-control-architecture.md) | Fan 制御アーキテクチャ（Supervisor + Learned MPC + Reactive Guard + Critical Safety） | FINAL |
-| [0028](0028-fan-control-contracts.md) | Fan 制御の層間契約（入出力・優先順位・状態遷移・周期・故障時の扱い・設定・承認点） | FINAL |
+| [0028](0028-fan-control-contracts.md) | Fan 制御の層間契約（入出力・優先順位・状態遷移・周期・故障時の扱い・設定・承認点） | FINAL（§2.7 の正常停止の見分け方は [0080](0080-fand-systemd-unit.md) で置き換え） |
 | [0029](0029-telemetry-loss-classes.md) | 制御入力の欠測の分類（Critical / Degraded / Advisory） | FINAL |
 | [0030](0030-control-decision-trace-storage.md) | Control decision trace の保存先 | FINAL |
 | [0031](0031-thermal-dataset-contract.md) | Thermal Dataset v1 の時刻対応と再生成契約 | FINAL |
@@ -128,7 +128,7 @@ docs/decisions/NNNN-<slug>.md      例: 0002-metric-naming.md
 | [0057](0057-authority-rollout-stage-changes.md) | Authority Rollout の stage 変更（人の承認・証拠の束縛・自動降格・設定は上限） | FINAL（§3 の帰結1項と §5 の未決1項は [0059](0059-decision-trace-model-artifact.md)） |
 | [0058](0058-rl-supervisor-training-environment.md) | RL Supervisor 学習環境の責務（action は戦略まで・dynamics の出どころ・Safety 違反は terminal） | FINAL |
 | [0059](0059-decision-trace-model-artifact.md) | decision trace が tick ごとに model artifact を記録する（適用側の証拠を artifact へ束縛し、LIMITED 以降の昇格を通す） | FINAL（§2.1 の照合対象と §2.2 の入れ子の版は [0065](0065-assessment-identity-and-nested-gate-version.md)） |
-| [0060](0060-control-loop-runtime.md) | Control Loop の実行時契約（`tick_ms` は safety.yaml・Telemetry はストア経由・モードは読み取り port・deadman の配線・実行の記録を trace へ） | FINAL |
+| [0060](0060-control-loop-runtime.md) | Control Loop の実行時契約（`tick_ms` は safety.yaml・Telemetry はストア経由・モードは読み取り port・deadman の配線・実行の記録を trace へ） | FINAL（§2.7 の一部は [0080](0080-fand-systemd-unit.md) で置き換え） |
 | [0061](0061-rl-supervisor-policy-artifact-and-binding.md) | RL Supervisor policy の artifact 形式（全 regime の表・Demand を表現できない）・束縛（active は開かない門・shadow 用の提案は active slot を通らない）・shadow 集計の規律 | FINAL |
 | [0062](0062-model-registry-operations.md) | Model Registry の運用入口（CLI）と起動時検証、lifecycle 監査の追跡 | FINAL |
 | [0063](0063-compute-mode-advisory.md) | Compute Mode 切替時の環境条件アドバイザリ（助言のみ・実測フルロードとの比較・欠けた材料の明示） | FINAL |
@@ -148,4 +148,5 @@ docs/decisions/NNNN-<slug>.md      例: 0002-metric-naming.md
 | [0077](0077-learned-proposal-handoff.md) | Learned MPC / RL Supervisor の worker から制御ループへの提案の受け渡し（役割ごとの別 unit・`coldaisle-fand` が持つ役割ごとの `SOCK_SEQPACKET` ソケットと役割ごとのグループ・受付スレッド・worker の heartbeat・worker の入力は毎 tick の frame だけ・`run_id` と元 snapshot への束縛・起動時に1回読む registry から provenance と Gate の期待値を作る・worker の異常はすべて Fallback で Max にしない・authority の昇格で worker は束縛を作り直す） | FINAL（2026-09-30、所有者が推奨案で承認） |
 | [0078](0078-air-balance-fallback-coordination.md) | Air Balance の `coordinate()` を Fallback / Baseline の requested に掛ける（Fallback の直後・Gate の前・合成の前、`fan-policy.yaml` の `mode: off / shadow / apply` で人が開く・上げるだけで zone ごとの `max_raise` と下げる前の保持・`uncalibrated` とは組めない・CPU Telemetry の stale による Top の `forced_max` は 1.0 と見積もり Top の見積もりは合成の下限（`ramp_down` を含む）込み・Fan fault と確定前の tach 無応答（`tach_unconfirmed_zones`。Top を含む）の tick は協調しない・`shadow` も保持を模擬して `counterfactual_output` を記録・`apply` の失敗は 0028 §2.7 どおり `fallback_exception`（`shadow` は記録のみ）・昇格の証拠を `fan-policy.yaml` の trace に束縛・trace に `candidate` / `proposed` / `output` と適用した `max_raise`・最初の apply の Top は `max_raise` 0・値は #75 の後） | FINAL |
 | [0079](0079-model-artifact-formats.md) | Confidence Profile を反実仮想 Thermal Model artifact v2 に同梱して組で昇格・rollback する・artifact v2 の形式（action 列の格子・学習データの時間窓・metric と単位と較正の束縛・4層の digest）・Registry の検証経路だけが作る封をした型と読み込み時検査 L1〜L10・学習した action 列の外（margin なし）は探索しない・失敗は Fallback（暗黙の降格なし）・anchor から最初の step への遷移も照合・Registry の健全性の通知は開いたまま（0050 §2.1 / 0052 §2.1 の Profile の束縛の一部を置き換える。0050 §2.2 の推論ごとの照合は残す） | FINAL |
+| [0080](0080-fand-systemd-unit.md) | `coldaisle-fand` の systemd unit（`Type=notify` と `NotifyAccess=main`・`WatchdogSec` は `safety.yaml` を写し長ければ起動しない・`Restart=always` と諦めない再起動・終了コード 3 / 4 だけ再起動しない・`ExecStopPost` は root の引き継ぎ実行部をソースから直接・正常停止は記録の削除で伝える・専用の非 root ユーザーと udev で hwmon の属性だけ書ける・`ProtectKernelTunables` は使わない・`/run/coldaisle` は fand だけが持つ・取り込みへは `After=` + `Wants=` だけ・`/var/lib/coldaisle` を 2770 と `UMask=0007` でグループ共有・fand は管理ソケットのグループにも入る。0060 §2.7 と 0028 §2.7 の一部を置き換え） | FINAL |
 | [0081](0081-drain-authority-on-receiver-death.md) | 受付スレッドの死を検知したら authority の枠だけを取り出せるまで非ブロッキングで試し、受理済みの降格を journal へ書き残す（モードの枠は読まない・`MAX` は再起動まで保つ。0072 §2.2 の一部を置き換え） | FINAL |

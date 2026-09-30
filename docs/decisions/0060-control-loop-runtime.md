@@ -4,6 +4,7 @@
 - **Status**: FINAL（2026-09-20、リポジトリ所有者が承認。`safety.yaml` の schema 変更を含むため 0028 §2.9 の承認点 2 に当たる）
 - **Date**: 2026-09-20
 - **Supersedes**: なし
+- **Superseded by**: [0080](0080-fand-systemd-unit.md)（§2.7「deadman が『ある』と言える条件」の表の4行目のうち環境側が長い場合のみ＝起動拒否に。§2.7「起動時の失敗」の表の終了コード 4 のうち通知の I/O の失敗のみ＝再起動する終了コード 6 に。他は有効）
 - **関連**: [`0028-fan-control-contracts.md`](0028-fan-control-contracts.md)（§2.2 / §2.5 / §2.6 / §2.7 / §2.8、未決 3 と 8） /
   [`0027-fan-control-architecture.md`](0027-fan-control-architecture.md) /
   [`0004-storage-read-contract.md`](0004-storage-read-contract.md) /
