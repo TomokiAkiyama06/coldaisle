@@ -682,7 +682,7 @@ class ControlDaemon:
         """次の tick の前に止める。**tick の途中では止めない。**"""
         self._stop = True
 
-    def close(self, *, drain: bool = True) -> None:
+    def close(self, *, drain: bool = True, persist_without_wait: bool = False) -> None:
         """管理ソケット、ストアの順に閉じる。**loop が止まった後に呼ぶ**（0072 §2.2）。
 
         ``drain=False`` は `run()` が例外で抜けたとき。管理ソケットのスレッドを待たずに閉じ、
@@ -691,13 +691,19 @@ class ControlDaemon:
         受付スレッドを止めたあとで authority の枠に残っていた降格は、`AuthorityRuntime` へ
         入れてから既存の1回だけの書き残しに回す（SIGTERM が置いた直後に来ても、受理した
         降格を捨てない。0072 §2.6）。
+
+        ``persist_without_wait=True`` は ``drain=False`` と組み合わせる終了コード 7 の経路
+        （決定記録 0080 §2.6 / 0083）。スレッドは待たないが、残った降格は journal へ
+        **lock を待たずに1回だけ**書き残しを試す（取れなければ error に残す）。
         """
         leftover: AdminAuthorityCommand | None = None
         if self.admin is not None:
             leftover = self.admin.stop(drain=drain)
             self.admin = None
         if self.authority is not None:
-            _settle_authority_on_stop(self.authority, leftover, drain=drain)
+            _settle_authority_on_stop(
+                self.authority, leftover, drain=drain, persist_without_wait=persist_without_wait
+            )
             self.authority = None
         elif leftover is not None:
             _log_lowering_lost(leftover, "authority runtime が無い")
@@ -781,7 +787,11 @@ def _confirmed_writes(
 
 
 def _settle_authority_on_stop(
-    authority: AuthorityRuntime, leftover: AdminAuthorityCommand | None, *, drain: bool
+    authority: AuthorityRuntime,
+    leftover: AdminAuthorityCommand | None,
+    *,
+    drain: bool,
+    persist_without_wait: bool = False,
 ) -> None:
     """停止の前に、枠に残った降格を入れてから、書き残せていない降格を1回だけ書き直す。
 
@@ -789,13 +799,14 @@ def _settle_authority_on_stop(
     両方が通る。どちらでも、クライアントに `pending` を返し監査に `accepted` がある降格を
     捨てると、再起動で高い stage に戻る（0072 §2.6）。
     """
+    persists = drain or persist_without_wait
     if leftover is not None:
-        _lower_left_in_mailbox(authority, leftover, drain=drain)
-    _flush_authority(authority, drain=drain)
+        _lower_left_in_mailbox(authority, leftover, persists=persists)
+    _flush_authority(authority, drain=drain, persist_without_wait=persist_without_wait)
 
 
 def _lower_left_in_mailbox(
-    authority: AuthorityRuntime, command: AdminAuthorityCommand, *, drain: bool
+    authority: AuthorityRuntime, command: AdminAuthorityCommand, *, persists: bool
 ) -> None:
     """どの tick にも取り出されなかった管理ソケットの降格を、停止の前に入れる（0072 §2.6）。
 
@@ -818,21 +829,27 @@ def _lower_left_in_mailbox(
         "停止時に、tick に取り出されなかった control-admin の authority の降格を入れた",
         extra={logs.FIELDS_KEY: {**_lowering_fields(command), "changed": changed}},
     )
-    if not drain:
+    if not persists:
         # 例外での停止では journal へ書かない（下の `_flush_authority`）。何が残ったかを
         # 主体と理由つきで残す
         _log_lowering_lost(command, "例外での停止のため journal へ書かない")
 
 
-def _flush_authority(authority: AuthorityRuntime, *, drain: bool) -> None:
+def _flush_authority(
+    authority: AuthorityRuntime, *, drain: bool, persist_without_wait: bool = False
+) -> None:
     """書き残せていない降格を、停止の前に1回だけ書き直す（lock の待ち上限つき）。
 
     **再起動すると journal の stage で運転が再開する**ので、残った降格を黙って捨てない。
     ``drain=False``（例外での停止）では待たずに、残った降格を error に残すだけにする。
+    ``persist_without_wait`` なら lock を待たずに1回だけ試す（終了コード 7。0083）。
     """
     try:
         if drain:
             authority.flush_pending_on_shutdown()
+            return
+        if persist_without_wait:
+            authority.flush_pending_on_shutdown(wait=False)
             return
         pending = authority.pending_stages
     except Exception:
@@ -1320,7 +1337,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     except HardwareWriteFailureExitError as error:
         # **返却（0080 §2.8）をしない。引き継ぎ記録を消さない。** BIOS へ戻す書き込みも同じ理由で
         # 失敗しうる。ExecStopPost が root で Max・manual を書き、Restart=always で takeover から
-        # やり直す（決定記録 0080 §2.6）。後片付けは例外の経路と同じく待たない。
+        # やり直す（決定記録 0080 §2.6）。後片付けは例外の経路と同じくスレッドを待たないが、
+        # 受理済みの降格は lock を待たずに1回だけ journal へ書き残しを試す（0083）。
         LOGGER.critical(
             "Fan の書き込みが続けて失敗したため終了する"
             "（引き継ぎ記録を残し、ExecStopPost の Max に任せる）",
@@ -1335,7 +1353,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 }
             },
         )
-        daemon.close(drain=False)
+        daemon.close(drain=False, persist_without_wait=True)
         return EXIT_HARDWARE_WRITE_FAILED
     except BaseException:
         # 例外で抜けた経路では管理ソケットの後片付けを待たない（終了と引き継ぎを遅らせない）

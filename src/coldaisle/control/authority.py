@@ -597,7 +597,7 @@ class AuthorityStore:
     状態を動かせてしまう（0057 §2.3）。
     """
 
-    __slots__ = ("_clock", "_lock_timeout_ms", "_root")
+    __slots__ = ("_clock", "_lock_timeout_ms", "_no_wait", "_root")
 
     def __init__(
         self,
@@ -623,11 +623,26 @@ class AuthorityStore:
         self._root = root
         self._clock = clock if clock is not None else WallClock()
         self._lock_timeout_ms = lock_timeout_ms
+        self._no_wait = False
 
     @property
     def lock_timeout_ms(self) -> int | None:
         """排他 lock を待てる上限。`None` は「待ち続ける」。"""
         return self._lock_timeout_ms
+
+    @contextmanager
+    def without_lock_wait(self) -> Iterator[None]:
+        """ブロックの間だけ、排他 lock を**1回だけ試して待たない**。
+
+        process の終了を遅らせられない停止の経路（`coldaisle-fand` の終了コード 7。
+        決定記録 0080 §2.6）で、書けるなら書き、取れなければ諦めるために使う。
+        """
+        previous = self._no_wait
+        self._no_wait = True
+        try:
+            yield
+        finally:
+            self._no_wait = previous
 
     def read(self) -> AuthorityJournal:
         """いまの journal。file が無ければ Baseline から始まったものとして返す。"""
@@ -1088,6 +1103,12 @@ class AuthorityStore:
         ここで使う時計は control loop の単調時計ではない。判断の期限ではなく
         **syscall の再試行の上限**なので、注入した時計に合わせる必要がない。
         """
+        if self._no_wait:
+            try:
+                flock(lock_fd, LOCK_EX | LOCK_NB)
+            except BlockingIOError:
+                raise AuthorityStoreError("authority lock を待たずに取れなかった") from None
+            return
         timeout_ms = self._lock_timeout_ms
         if timeout_ms is None:
             flock(lock_fd, LOCK_EX)
@@ -1465,12 +1486,19 @@ class AuthorityRuntime:
             self._flush_one()
         self._check_journal()
 
-    def flush_pending_on_shutdown(self) -> tuple[AuthorityStage, ...]:
+    def flush_pending_on_shutdown(self, *, wait: bool = True) -> tuple[AuthorityStage, ...]:
         """停止の直前に、予約した降格を**それぞれ1回だけ**書き残す（lock の待ち上限つき）。
 
         loop が止まった後に呼ぶ。書けずに残った予約の行き先を返す（呼び出し側が error に残す。
         **再起動すると journal の stage で運転が再開する**ので、黙って捨てない）。
+        ``wait=False`` では lock を待たずに1回だけ試す（終了を遅らせられない経路）。
         """
+        if not wait:
+            with self._store.without_lock_wait():
+                return self._flush_pending_once()
+        return self._flush_pending_once()
+
+    def _flush_pending_once(self) -> tuple[AuthorityStage, ...]:
         remaining: list[_PendingDemotion] = []
         while self._pending:
             demotion = self._pending.pop(0)

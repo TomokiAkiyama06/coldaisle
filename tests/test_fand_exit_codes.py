@@ -407,6 +407,17 @@ def test_main_exits_with_code_7_without_returning_control(
         return daemon
 
     monkeypatch.setattr(control_daemon, "build", fake_build)
+    closes: list[dict[str, bool]] = []
+    original_close = ControlDaemon.close
+
+    def recording_close(
+        self: ControlDaemon, *, drain: bool = True, persist_without_wait: bool = False
+    ) -> None:
+        closes.append({"drain": drain, "persist_without_wait": persist_without_wait})
+        original_close(self, drain=drain, persist_without_wait=persist_without_wait)
+
+    # slots の dataclass なのでインスタンスには差し込めない。クラスの側で記録する
+    monkeypatch.setattr(ControlDaemon, "close", recording_close)
     argv = [*_argv(tmp_path)[:-2], "--max-ticks", "100"]
 
     with caplog.at_level("INFO", logger="coldaisle"):
@@ -414,6 +425,8 @@ def test_main_exits_with_code_7_without_returning_control(
 
     assert code == EXIT_HARDWARE_WRITE_FAILED
     assert len(built) == 1
+    # スレッドは待たないが、受理済みの降格は lock を待たずに1回書き残しを試す（決定記録 0083）
+    assert closes == [{"drain": False, "persist_without_wait": True}]
     events = _events(caplog, "hardware_write_fail_exit")
     assert len(events) == 1
     assert events[0]["zones"] == [zone.value for zone in Zone]
