@@ -33,7 +33,12 @@ import pytest
 import yaml
 from pydantic import ValidationError
 
-from coldaisle.clock import ManualMonotonicClock, SimulatedClock, SystemMonotonicClock
+from coldaisle.clock import (
+    ManualMonotonicClock,
+    MonotonicClock,
+    SimulatedClock,
+    SystemMonotonicClock,
+)
 from coldaisle.control.operating_mode import (
     MANUAL_COMMAND_REASON,
     AdminModeCommand,
@@ -242,6 +247,37 @@ def test_an_accept_backoff_whose_max_is_below_its_initial_is_refused():
         admin_settings(accept_backoff__initial_ms=0)
 
 
+def test_a_v1_config_is_refused_with_a_version_message(short_dir, rules, caplog):
+    """v2 で `accept_backoff` を必須にした。v1 は補わずに拒否し、入口を開かない。"""
+    document = admin_document(short_dir / "run" / "admin.sock", version=1)
+    del document["accept_backoff"]
+    with pytest.raises(ValidationError, match=r"version.*expected=2"):
+        ControlAdminSettings.model_validate(document)
+    config = short_dir / "control-admin.yaml"
+    config.write_text(yaml.safe_dump(document), "utf-8")
+    assert _open(config, short_dir / "a.db", rules) is None
+    assert not (short_dir / "run" / "admin.sock").exists()
+    assert any(
+        "expected=2" in getattr(record, "fields", {}).get("reason", "") for record in caplog.records
+    )
+
+
+@pytest.mark.parametrize("multiplier", [1, 1.0, 0.5, 0, -2])
+def test_an_accept_backoff_multiplier_must_grow(multiplier):
+    with pytest.raises(ValidationError, match="multiplier"):
+        admin_settings(accept_backoff__multiplier=multiplier)
+    admin_settings(accept_backoff__multiplier=1.5)
+
+
+def test_the_escalation_must_come_after_the_longest_backoff():
+    """`escalate_after_ms > max_ms`。休みの上限より先に `MAX` へ上げない。"""
+    with pytest.raises(ValidationError, match="escalate_after_ms"):
+        admin_settings(accept_backoff__max_ms=1_000, accept_backoff__escalate_after_ms=1_000)
+    with pytest.raises(ValidationError):
+        admin_settings(accept_backoff__escalate_after_ms=0)
+    admin_settings(accept_backoff__max_ms=1_000, accept_backoff__escalate_after_ms=1_001)
+
+
 @pytest.mark.parametrize(
     "missing",
     [
@@ -250,6 +286,8 @@ def test_an_accept_backoff_whose_max_is_below_its_initial_is_refused():
         "limits__max_pending_commands",
         "accept_backoff",
         "accept_backoff__max_ms",
+        "accept_backoff__multiplier",
+        "accept_backoff__escalate_after_ms",
     ],
 )
 def test_values_have_no_defaults_in_code(missing):
@@ -771,6 +809,7 @@ class RunningEntry:
         *,
         server_uid: int | None = None,
         audit_fails: bool = False,
+        monotonic: MonotonicClock | None = None,
         **changes: Any,
     ) -> None:
         changes.setdefault("apply_ack_timeout_ms", 2_000)
@@ -791,7 +830,7 @@ class RunningEntry:
             mailbox=self.mailbox,
             audit=self.audit,
             clock=SimulatedClock(TEST_EPOCH_MS),
-            monotonic=SystemMonotonicClock(),
+            monotonic=SystemMonotonicClock() if monotonic is None else monotonic,
             run_id=RUN_ID,
             authority_ceiling=AuthorityStage.SHADOW,
             server_uid=server_uid,
@@ -986,6 +1025,85 @@ def test_repeated_accept_failures_back_off_on_the_monotonic_clock_and_log_sparse
         theirs.close()
 
 
+@needs_peercred
+def test_the_backoff_grows_by_the_configured_multiplier():
+    monotonic = ManualMonotonicClock(0)
+    server = idle_server(
+        monotonic,
+        accept_backoff__initial_ms=100,
+        accept_backoff__max_ms=1_000,
+        accept_backoff__multiplier=1.5,
+    )
+    backoffs: list[int] = []
+    for _ in range(8):
+        server._accept(FailingListener())  # type: ignore[arg-type]
+        assert server._accept_backoff_ms is not None
+        backoffs.append(server._accept_backoff_ms)
+    assert backoffs == [100, 150, 225, 338, 507, 761, 1_000, 1_000]
+    server.close()
+
+
+def fail_at(server: ControlAdminServer, monotonic: ManualMonotonicClock, at_ms: int) -> None:
+    monotonic.advance_ms(at_ms - monotonic.monotonic_ms())
+    server._accept(FailingListener())  # type: ignore[arg-type]
+
+
+@needs_peercred
+def test_an_unbroken_run_of_accept_failures_is_escalated_only_at_escalate_after_ms(caplog):
+    """起点は途切れずに続く失敗の最初。`escalate_after_ms` に届く前は休むだけ。"""
+    monotonic = ManualMonotonicClock(10_000)
+    server = idle_server(
+        monotonic,
+        accept_backoff__initial_ms=100,
+        accept_backoff__max_ms=1_000,
+        accept_backoff__escalate_after_ms=5_000,
+    )
+    caplog.set_level("INFO", logger="coldaisle.control_admin")
+    for at_ms in (10_000, 11_000, 12_000, 14_999):
+        fail_at(server, monotonic, at_ms)
+        assert not server._accept_exhausted
+        assert server._accept_resume_mono_ms is not None
+    fail_at(server, monotonic, 15_000)
+    assert server._accept_exhausted
+    assert server._accept_resume_mono_ms is None, "待ち受けを戻さない"
+    exhausted = [
+        record
+        for record in caplog.records
+        if getattr(record, "fields", {}).get("reason") == "admin_accept_exhausted"
+    ]
+    assert len(exhausted) == 1
+    assert exhausted[0].levelname == "ERROR"
+    assert exhausted[0].fields["consecutive_failures"] == 5
+    assert exhausted[0].fields["failing_for_ms"] == 5_000
+    assert exhausted[0].fields["errno"] == "EMFILE"
+    server.close()
+
+
+@needs_peercred
+def test_a_successful_accept_restarts_the_escalation_clock():
+    monotonic = ManualMonotonicClock(10_000)
+    server = idle_server(
+        monotonic,
+        accept_backoff__initial_ms=100,
+        accept_backoff__max_ms=1_000,
+        accept_backoff__escalate_after_ms=5_000,
+    )
+    ours, theirs = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        fail_at(server, monotonic, 10_000)
+        fail_at(server, monotonic, 14_000)
+        server._accept(OnceListener(ours))  # type: ignore[arg-type]
+        assert server._accept_first_failure_mono_ms is None
+        fail_at(server, monotonic, 16_000)  # 最初の失敗から 6 秒だが、成功の後は 0 秒
+        fail_at(server, monotonic, 20_999)
+        assert not server._accept_exhausted
+        fail_at(server, monotonic, 21_000)
+        assert server._accept_exhausted
+    finally:
+        server.close()
+        theirs.close()
+
+
 class AcceptSwitch:
     """待ち受けの `accept()` だけを EMFILE で失敗させ、呼ばれた回数を数える。"""
 
@@ -1068,6 +1186,66 @@ def test_max_on_an_existing_connection_is_delivered_while_accept_is_backing_off(
             if conn is not None:
                 conn.close()
         running.stop()
+
+
+@needs_peercred
+def test_persistent_accept_failures_end_the_receiver_and_the_loop_holds_max(
+    short_dir, rules, catalog, monkeypatch
+):
+    """0076 §2.7: 途切れない失敗が `escalate_after_ms` に届いたら受付スレッドを終わらせ、
+    loop は既存の「受付スレッドの死」の経路で `MANUAL` を解除し、再起動まで `MAX` にする。"""
+    monotonic = ManualMonotonicClock(1_000_000)
+    running = RunningEntry(
+        short_dir,
+        rules,
+        monotonic=monotonic,
+        accept_backoff__initial_ms=100,
+        accept_backoff__max_ms=100,
+        accept_backoff__escalate_after_ms=300,
+    )
+    harness = Harness(catalog, admin_mode=running.tracker)
+    pending: socket.socket | None = None
+    try:
+        harness.settle()
+        future = running.send_async(manual_body(lease_s=3_600))
+        wait_until(lambda: 1 in running.server._awaiting_ack)
+        assert harness.tick().tick.state.operating_mode is OperatingMode.MANUAL
+        assert future.result(timeout=5)["applied"] is True
+
+        assert running.server._listener is not None
+        switch = AcceptSwitch(monkeypatch, running.server._listener)
+        switch.failing = True
+        pending = connect(running.path)  # 待ち受けが読める状態を続ける
+        wait_until(lambda: switch.failures == 1)
+        # 失敗が escalate_after_ms に届くまでは休むだけ。受付は生きていて、モードも変わらない
+        for expected in (2, 3):
+            monotonic.advance_ms(100)
+            running.mailbox.wake()  # 次の周回で期限を見て待ち受けを戻す
+            wait_until(lambda n=expected: switch.failures == n)
+            assert running.server.thread.is_alive()
+            assert harness.tick().tick.state.operating_mode is OperatingMode.MANUAL
+
+        monotonic.advance_ms(100)  # 最初の失敗から 300 ms
+        running.mailbox.wake()
+        running.server.thread.join(timeout=5)
+        assert not running.server.thread.is_alive(), "受付スレッドを終わらせる"
+        assert switch.failures == 4
+        assert running.server._listener is None, "待ち受けを閉じる"
+        assert running.server._connections == set()
+
+        dead = harness.tick().tick
+        assert dead.state.operating_mode is OperatingMode.MAX
+        assert dead.mode_command is not None and dead.mode_command.admin_receiver_dead
+        assert all(dead.zones.get(zone).demand.forced_max for zone in Zone)
+        for result in harness.run(5):
+            assert result.tick.state.operating_mode is OperatingMode.MAX
+            assert result.tick.mode_command is not None
+            assert result.tick.mode_command.admin_receiver_dead is True
+    finally:
+        if pending is not None:
+            pending.close()
+        running.stop()
+    assert not running.path.exists(), "停止の手順でソケットのファイルを消す"
 
 
 @needs_peercred
@@ -1524,7 +1702,7 @@ def _open(path: Path, db: Path, rules: QualityRules) -> Any:
     [
         {"limits__read_timeout_s": 2.0},
         {"apply_ack_timeout_ms": 10},
-        {"version": 2},
+        {"version": 3},
     ],
 )
 def test_an_invalid_entry_config_does_not_open_the_socket(short_dir, rules, changes, caplog):

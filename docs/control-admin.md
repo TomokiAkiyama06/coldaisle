@@ -64,7 +64,15 @@ uv run coldaisle-control auto --reason "比較の終了"
 | `limits.audit_queue_max` | 監査書き込みスレッドの FIFO の上限 |
 | `apply_ack_timeout_ms` | `>= tick_ms + tick_deadline_ms`（起動時に照合） |
 | `manual.max_lease_s` | `status` / `basis` 付きの暫定値 |
-| `accept_backoff.initial_ms` / `accept_backoff.max_ms` | `accept()` が失敗し続けるときに待ち受けを休む間隔。`initial_ms <= max_ms <= tick_ms`（`safety.yaml` と起動時に照合）。`status` / `basis` 付きの暫定値 |
+| `version` | `2`。v1 は読まない（下の「v1 からの移行」） |
+| `accept_backoff.initial_ms` / `max_ms` / `multiplier` | `accept()` が失敗し続けるときに待ち受けを休む間隔。`initial_ms <= max_ms <= tick_ms`（`safety.yaml` と起動時に照合）、`multiplier > 1`。`status` / `basis` 付きの暫定値 |
+| `accept_backoff.escalate_after_ms` | 途切れない失敗がこの時間に届いたら受付スレッドを終わらせる（→ 再起動まで `MAX`）。`> max_ms` |
+
+### v1 からの移行
+
+v2（#74 / 決定記録 0076 §2.7）で `accept_backoff` を必須にしました。v1 のファイルは既定値で補わずに
+`version` の違いとして拒否し、入口を開きません（`coldaisle-fand` は `AUTO` で運転を続ける）。配置先の設定は
+`version: 2` にして、`config/control-admin.yaml` の `accept_backoff` の塊を足してください。
 
 **設定が不正・無い、`SO_PEERCRED` が無い、ソケットを作れない、受付・監査のスレッドを起動できない**ときは入口を開かず、`coldaisle-fand` は
 `AUTO` で運転を続けます（error を構造化ログに残す）。`--no-admin` で明示的に開かないこともできます。
@@ -75,19 +83,25 @@ uv run coldaisle-control auto --reason "比較の終了"
 
 ## 接続の受け付けが失敗し続けるとき
 
-fd の枯渇（`EMFILE` / `ENFILE`）や `ECONNABORTED` などで `accept()` が失敗しても、受付スレッドは死なせません。
-待ち受けのソケットは読める状態のままなので、そのまま監視を続けると受付スレッドが空回りしてログを溢れさせます。
-そこで失敗したら**待ち受けのソケットだけ**を selector から外し、単調時計の期限が来たら戻します。
+決定記録 0076 §2.7 に従います。fd の枯渇（`EMFILE` / `ENFILE`）や `ECONNABORTED` などで `accept()` が失敗しても、
+すぐには受付スレッドを死なせません。待ち受けのソケットは読める状態のままなので、そのまま監視を続けると
+受付スレッドが空回りしてログを溢れさせます。そこで失敗したら**待ち受けのソケットだけ**を selector から外し、
+単調時計の期限が来たら戻します。
 
-- 休む長さは最初が `accept_backoff.initial_ms`、失敗のたびに倍にして `accept_backoff.max_ms` で頭打ち。
-  `accept()` が1回でも成功したら戻します（回復を info で1行残す）
+- 休む長さは最初が `accept_backoff.initial_ms`、失敗のたびに `accept_backoff.multiplier` 倍にして
+  `accept_backoff.max_ms` で頭打ち。`accept()` が1回でも成功したら戻します（回復を info で1行残す）
 - **`sleep` しません。** 休んでいる間も接続済みの接続は読み続け、`max` は遅れずに受け渡し口へ置きます。
   待たされるのは新しい接続だけで、その待ちは `max_ms`（`tick_ms` 以下）を超えません
-- **`MAX` には倒しません**（入口の不調で Fan を動かさない。所有者の判断）。受付スレッドが死んだときとは扱いが違います
 - ログ（warning。`reason: admin_accept_failed`）は最初の失敗と、休みが伸びたとき、頭打ちの後は連続の失敗の回数が
   2 の冪に届いたときだけ出します。`consecutive_failures`・`suppressed_since_last_log`（出さなかった回数）・
   `backoff_ms`・`errno` を持ちます。スタックトレースは最初の1回だけです
-- `initial_ms = 100` / `max_ms = 1000` は暫定値です（`status: provisional`）
+- **途切れずに `accept_backoff.escalate_after_ms` 失敗し続けたら、受付スレッドを終わらせます**
+  （error。`reason: admin_accept_exhausted`、`consecutive_failures`・`failing_for_ms`・`errno`）。
+  起点は途切れない失敗の最初の時刻（単調時計）で、`accept()` が1回でも成功したら数え直します。
+  終わる前に接続と待ち受けを閉じ、ソケットのファイルは停止の手順で消します。そのあとは下の
+  「受付スレッドが死んだとき」と同じ経路です（`MANUAL` を解除し、再起動まで `MAX`、`admin_receiver_dead`）。
+  `MAX` の経路を別に作っていません
+- `initial_ms = 100` / `max_ms = 1000` / `multiplier = 2` / `escalate_after_ms = 30000` は暫定値です（`status: provisional`）
 
 ## 受付スレッドが死んだとき
 
