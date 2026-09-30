@@ -105,7 +105,7 @@ docs/decisions/NNNN-<slug>.md      例: 0002-metric-naming.md
 | [0033](0033-air-balance-config-boundary.md) | Air Balance characterization の設定境界 | FINAL（§2 の「`uncalibrated` を runtime controller は起動時に拒否する」の一文は [0073](0073-air-balance-control-config-integration.md)） |
 | [0034](0034-unavailable-fan-tach-safety.md) | 制御対象 Fan の tach 読み取り不能を Safety fault にする | FINAL |
 | [0036](0036-transient-cpu-gpu-regime.md) | Workload Regime に TRANSIENT_CPU_GPU を加える | FINAL |
-| [0037](0037-model-registry-rollback-target.md) | Model Registry の promotion 時の rollback target | Proposed |
+| [0037](0037-model-registry-rollback-target.md) | Model Registry の promotion 時の rollback target | FINAL |
 | [0038](0038-internal-telemetry-outage-counting.md) | Internal Telemetry の欠測の数え方（有効な間の停止は欠測、無効期間は数えない） | FINAL |
 | [0039](0039-dashboard-labels-and-catalog.md) | ダッシュボードの表示名と `GET /api/v1/metrics` | FINAL |
 | [0040](0040-server-health-api.md) | Server Health API の契約（`/server-health` への一本化、signal 規則、機種が公開しない metric の扱い） | FINAL |
@@ -116,7 +116,7 @@ docs/decisions/NNNN-<slug>.md      例: 0002-metric-naming.md
 | [0045](0045-local-socket-write-entry.md) | 書き込み専用のローカル Unix ソケット入口（GPU Mode イベント / Workload Hint） | FINAL |
 | [0046](0046-airflow-ui.md) | エアフロー / ファン制御の可視化画面（置き場所・模擬データの分離・色分けの設定） | FINAL |
 | [0047](0047-cpu-utilization-metric.md) | CPU 使用率のメトリクス名（`cpu.utilization`） | FINAL |
-| [0048](0048-thermal-model-artifact-and-inference.md) | Thermal Model v1 artifactと読み取り専用推論境界 | Proposed |
+| [0048](0048-thermal-model-artifact-and-inference.md) | Thermal Model v1 artifactと読み取り専用推論境界 | FINAL |
 | [0049](0049-internal-telemetry-source-kind.md) | 内部テレメトリの出どころの種類（`sys.telemetry_kind`: hardware / mock）を記録し、いまの値にだけ「実測」と書く | FINAL |
 | [0050](0050-model-confidence-ood-and-authority.md) | Model Confidence / OOD の判定方式と confidence に応じた Authority 制限 | FINAL |
 | [0051](0051-airflow-cpu-utilization-display.md) | エアフロー画面の CPU 使用率の表示（`cpu.utilization` と「未計測」の判断） | FINAL |

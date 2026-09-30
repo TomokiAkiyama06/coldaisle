@@ -129,8 +129,8 @@ lock を手放す `inspect()` だけでは、A の証拠を持ったまま B が
 
 ## まだ無いもの
 
-- **decision trace への、適用した tick の model artifact の記録。** これが無い間は
-  適用側の実績で昇格できないため、**LIMITED 以降の昇格の証拠を作れない**（別 Issue）
+decision trace への、適用した tick の model artifact の記録は #159（PR #160 / 決定記録 0059）で入った。
+
 - 昇格・rollback の管理操作の入口（CLI / ソケット）。読み取り API（#23）は制御を変えない
 - 各段に必要な運転期間の下限
 - 実機での rollout。GPU サーバーが要る（#92 の `requires:server`）
