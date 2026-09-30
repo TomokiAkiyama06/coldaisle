@@ -487,64 +487,13 @@ class ControlDaemon:
             leftover = self.admin.stop(drain=drain)
             self.admin = None
         if self.authority is not None:
-            if leftover is not None:
-                self._lower_left_in_mailbox(leftover, drain=drain)
-            self._flush_authority(drain=drain)
+            _settle_authority_on_stop(self.authority, leftover, drain=drain)
             self.authority = None
         elif leftover is not None:
             _log_lowering_lost(leftover, "authority runtime が無い")
         if self.store is not None:
             self.store.close()
             self.store = None
-
-    def _lower_left_in_mailbox(self, command: AdminAuthorityCommand, *, drain: bool) -> None:
-        """どの tick にも取り出されなかった管理ソケットの降格を、停止の前に入れる（0072 §2.6）。
-
-        tick の経路と同じく、いまの stage と比べずに**無条件で**上限として入れる。journal へは
-        続く `_flush_authority()` が書く。監査には `applied` を足さない（`applied` は適用した
-        tick を持つ事象で、この降格はどの tick でも効いていない）。受付の行だけがある
-        「受理済み・未確定」として残り、journal の人の event と構造化ログで追える。
-        """
-        assert self.authority is not None
-        try:
-            changed = self.authority.apply_lowering(
-                to_stage=command.to_stage, actor=command.actor, reason=command.journal_reason()
-            )
-        except Exception:
-            LOGGER.exception(
-                "停止時に control-admin の authority の降格を入れられなかった（再起動で戻る）",
-                extra={logs.FIELDS_KEY: _lowering_fields(command)},
-            )
-            return
-        LOGGER.warning(
-            "停止時に、tick に取り出されなかった control-admin の authority の降格を入れた",
-            extra={logs.FIELDS_KEY: {**_lowering_fields(command), "changed": changed}},
-        )
-        if not drain:
-            # 例外での停止では journal へ書かない（下の `_flush_authority`）。何が残ったかを
-            # 主体と理由つきで残す
-            _log_lowering_lost(command, "例外での停止のため journal へ書かない")
-
-    def _flush_authority(self, *, drain: bool) -> None:
-        """書き残せていない降格を、停止の前に1回だけ書き直す（lock の待ち上限つき）。
-
-        **再起動すると journal の stage で運転が再開する**ので、残った降格を黙って捨てない。
-        ``drain=False``（例外での停止）では待たずに、残った降格を error に残すだけにする。
-        """
-        assert self.authority is not None
-        try:
-            if drain:
-                self.authority.flush_pending_on_shutdown()
-                return
-            pending = self.authority.pending_stages
-        except Exception:
-            LOGGER.exception("停止時に authority の降格を書き残せなかった")
-            return
-        if pending:
-            LOGGER.error(
-                "停止までに authority の降格を journal へ書き残せなかった（再起動で戻る）",
-                extra={logs.FIELDS_KEY: {"to_stages": [stage.value for stage in pending]}},
-            )
 
     def run(self, *, max_ticks: int | None = None) -> ControlStats:
         """止めるまで tick を回す。`max_ticks` は試験と Replay のための上限。"""
@@ -592,6 +541,71 @@ class ControlDaemon:
                     },
                 }
             },
+        )
+
+
+def _settle_authority_on_stop(
+    authority: AuthorityRuntime, leftover: AdminAuthorityCommand | None, *, drain: bool
+) -> None:
+    """停止の前に、枠に残った降格を入れてから、書き残せていない降格を1回だけ書き直す。
+
+    `ControlDaemon.close()` と、`build()` が管理ソケットを開いた後に組み立てに失敗した経路の
+    両方が通る。どちらでも、クライアントに `pending` を返し監査に `accepted` がある降格を
+    捨てると、再起動で高い stage に戻る（0072 §2.6）。
+    """
+    if leftover is not None:
+        _lower_left_in_mailbox(authority, leftover, drain=drain)
+    _flush_authority(authority, drain=drain)
+
+
+def _lower_left_in_mailbox(
+    authority: AuthorityRuntime, command: AdminAuthorityCommand, *, drain: bool
+) -> None:
+    """どの tick にも取り出されなかった管理ソケットの降格を、停止の前に入れる（0072 §2.6）。
+
+    tick の経路と同じく、いまの stage と比べずに**無条件で**上限として入れる。journal へは
+    続く `_flush_authority` が書く。監査には `applied` を足さない（`applied` は適用した
+    tick を持つ事象で、この降格はどの tick でも効いていない）。受付の行だけがある
+    「受理済み・未確定」として残り、journal の人の event と構造化ログで追える。
+    """
+    try:
+        changed = authority.apply_lowering(
+            to_stage=command.to_stage, actor=command.actor, reason=command.journal_reason()
+        )
+    except Exception:
+        LOGGER.exception(
+            "停止時に control-admin の authority の降格を入れられなかった（再起動で戻る）",
+            extra={logs.FIELDS_KEY: _lowering_fields(command)},
+        )
+        return
+    LOGGER.warning(
+        "停止時に、tick に取り出されなかった control-admin の authority の降格を入れた",
+        extra={logs.FIELDS_KEY: {**_lowering_fields(command), "changed": changed}},
+    )
+    if not drain:
+        # 例外での停止では journal へ書かない（下の `_flush_authority`）。何が残ったかを
+        # 主体と理由つきで残す
+        _log_lowering_lost(command, "例外での停止のため journal へ書かない")
+
+
+def _flush_authority(authority: AuthorityRuntime, *, drain: bool) -> None:
+    """書き残せていない降格を、停止の前に1回だけ書き直す（lock の待ち上限つき）。
+
+    **再起動すると journal の stage で運転が再開する**ので、残った降格を黙って捨てない。
+    ``drain=False``（例外での停止）では待たずに、残った降格を error に残すだけにする。
+    """
+    try:
+        if drain:
+            authority.flush_pending_on_shutdown()
+            return
+        pending = authority.pending_stages
+    except Exception:
+        LOGGER.exception("停止時に authority の降格を書き残せなかった")
+        return
+    if pending:
+        LOGGER.error(
+            "停止までに authority の降格を journal へ書き残せなかった（再起動で戻る）",
+            extra={logs.FIELDS_KEY: {"to_stages": [stage.value for stage in pending]}},
         )
 
 
@@ -699,7 +713,8 @@ def build(
         )
     except BaseException:
         if admin is not None:
-            admin.stop()
+            # 開いてから組み立てに失敗するまでに受理した降格も書き残す（0072 §2.6）
+            _settle_authority_on_stop(authority, admin.stop(), drain=True)
         raise
     return ControlDaemon(
         loop=loop, monotonic=monotonic, store=store, admin=admin, authority=authority

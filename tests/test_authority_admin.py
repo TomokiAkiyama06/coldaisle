@@ -797,6 +797,9 @@ def test_a_full_audit_queue_does_not_delay_a_demotion(short_dir, rules):
         running.gate.clear()
         blocked = running.send_async(AUTO)
         wait_until(lambda: 1 in running.server._auditing)
+        # 1件目が queue に残ったままだと、2件目は queue の1枠に入れず audit_unavailable で
+        # 拒否され、`_auditing` に入らない。書き込みスレッドが取り出して gate で止まるまで待つ
+        assert running.writing.wait(timeout=5), "監査書き込みスレッドが1件目を取り出していない"
         queued = running.send_async(AUTO)
         wait_until(lambda: 2 in running.server._auditing)
         reply = running.send_async(LOWER)
@@ -1045,6 +1048,32 @@ def test_the_daemon_close_after_an_exception_logs_a_left_lowering_without_waitin
         and item.get("reason") == "停止の直前に届いた"
         for item in fields
     )
+
+
+def test_the_daemon_build_persists_a_lowering_left_when_the_loop_cannot_be_built(
+    tmp_path, monkeypatch
+):
+    """管理ソケットを開いた後に組み立てに失敗しても、受理した降格を書き残す（0072 §2.6）。"""
+    from coldaisle import control_daemon
+    from coldaisle.control.loop import NullWatchdog
+
+    raised_runtime(tmp_path, stage=AuthorityStage.FULL)
+    admin = LeftoverAdmin(leftover_lowering())
+    monkeypatch.setattr(control_daemon, "_open_admin", lambda *args, **kwargs: admin)
+
+    def broken_loop(*args: Any, **kwargs: Any) -> Any:
+        raise RuntimeError("組み立ての途中で失敗")
+
+    monkeypatch.setattr(control_daemon, "_build_loop", broken_loop)
+
+    with pytest.raises(RuntimeError, match="組み立ての途中で失敗"):
+        control_daemon.build(daemon_config(tmp_path), watchdog=NullWatchdog())
+
+    assert admin.drains == [True]
+    journal = other_store(tmp_path).read()
+    assert journal.stage is AuthorityStage.LIMITED, "再起動しても降格した stage で始まる"
+    assert journal.events[-1].trigger is AuthorityTrigger.HUMAN
+    assert "command_id=7" in journal.events[-1].reason
 
 
 def test_the_admin_entry_stop_hands_back_the_authority_slot_and_drops_the_mode_slot():
