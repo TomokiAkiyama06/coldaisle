@@ -625,7 +625,8 @@ def test_the_config_returns_the_stale_multiplier(tmp_path, rules):
     with _app(tmp_path, rules, []) as client:
         body = client.get("/api/v1/airflow/config").json()
     assert body["control_trace"] == shipped
-    assert shipped["provisional"] is True, "0071 §5 #1 の値は仮（実運用で見直す）"
+    assert shipped["provisional"] is False, "0071 §5 #1 の値は 2026-09-30 にオーナーが確定した"
+    assert shipped["stale_after_tick_periods"] == 3.0
 
 
 def _settings(control_trace: object) -> dict[str, object]:
