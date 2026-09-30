@@ -35,13 +35,29 @@ uv run coldaisle-control auto --reason "比較の終了"
 
 ## 設定（`config/control-admin.yaml`）
 
+`coldaisle-fand` は `--admin-config` を省くと `config/control-admin.yaml` を読みます。**この既定の設定は
+同じ uid の接続を認めません**（`allow_same_user: false`。0072 §2.5）。同じ uid で動く別のサービス
+（読み取り API・AI 層など）から `manual` / `max` を送れないようにするためです。
+
+- `socket.group` の値は**仮の名前**です。配置先で作った専用グループ名に置き換え、操作する人だけをそのグループに
+  入れてください。グループを解決できなければ入口は開かず、`coldaisle-fand` は `AUTO` で運転を続けます
+- 開発で同じ uid から操作するときだけ、開発用の設定を**明示して**渡します（本番では使わない）
+
+  ```bash
+  uv run coldaisle-fand --admin-config config/control-admin.dev.yaml
+  ```
+
+  `control-admin.dev.yaml` は `socket.group: null` + `allow_same_user: true` で、それ以外の値は既定の設定と
+  揃えています（`tests/test_control_admin.py` が確かめる）。ソケットの場所も同じなので、
+  `coldaisle-control` は `--config` を省いたままで接続できます
+
 入口の形だけを持ちます。制御の4ファイル（`fan-hardware.yaml` / `safety.yaml` / `fan-policy.yaml` /
 `air-balance.yaml`）には入れません（0072 §2.8）。
 
 | 設定 | 規則 |
 |---|---|
 | `socket.path` / `socket.mode` / `socket.group` | `event-entry.yaml` と同じ規則（other のビット・setuid / setgid / sticky は拒否） |
-| `authorization.allow_same_user` | 本番は `false`。`true` は `socket.group: null` の開発用のときだけ |
+| `authorization.allow_same_user` | 既定（`config/control-admin.yaml`）は `false`。`true` は `socket.group: null` の開発用のときだけ |
 | `limits.read_timeout_s` | `read_timeout_s * 1000 <= tick_ms`（`safety.yaml` と起動時に照合） |
 | `limits.max_connections` | 受信中の接続の上限。埋まれば最も長く受信を続けている接続を閉じる（`evicted`） |
 | `limits.max_pending_commands` | 要求を読み終えた後の接続の上限。埋まれば弱めうる指令は `busy`、`max` は先に置いて `pending` |
@@ -49,7 +65,7 @@ uv run coldaisle-control auto --reason "比較の終了"
 | `apply_ack_timeout_ms` | `>= tick_ms + tick_deadline_ms`（起動時に照合） |
 | `manual.max_lease_s` | `status` / `basis` 付きの暫定値 |
 
-**設定が不正・無い、`SO_PEERCRED` が無い、ソケットを作れない**ときは入口を開かず、`coldaisle-fand` は
+**設定が不正・無い、`SO_PEERCRED` が無い、ソケットを作れない、受付・監査のスレッドを起動できない**ときは入口を開かず、`coldaisle-fand` は
 `AUTO` で運転を続けます（error を構造化ログに残す）。`--no-admin` で明示的に開かないこともできます。
 
 認可はファイル権限と `SO_PEERCRED` の2つの門です（0072 §2.5）。**同じ uid も root も暗黙には認めません。**

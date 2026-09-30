@@ -1,8 +1,9 @@
 """管理ソケットを開いて、受付スレッドと監査書き込みスレッドを束ねる（決定記録 0072 §2.2 / §2.8）。
 
 **開けなかったら None を返し、`coldaisle-fand` は止めない。** 入口の設定が不正、`SO_PEERCRED` が
-無い、ソケットを作れない、のいずれでも、`coldaisle-fand` は `AUTO` と journal の stage で運転を
-続ける（冷却を入口の有無に依存させない）。入口が無いことは error として残す。
+無い、ソケットを作れない、スレッドを起動できない、のいずれでも、`coldaisle-fand` は `AUTO` と
+journal の stage で運転を続ける（冷却を入口の有無に依存させない）。
+入口が無いことは error として残す。
 このとき loop は受付スレッドの死とは扱わない（`MANUAL` に入る経路が無いため）。
 """
 
@@ -113,8 +114,20 @@ def open_control_admin(
         mailbox.close()
         _log_not_opened(f"管理ソケットを開けない: {type(error).__name__}: {error}", config_path)
         return None
-    audit.start()
-    server.start()
+    try:
+        audit.start()
+        server.start()
+    except Exception as error:
+        # スレッドを起動できない（"can't start new thread" など）ときも、build() を止めずに
+        # 入口なし・AUTO で運転を続ける（0072 §2.8）。起動できた監査スレッドは止め、
+        # 作ったソケットは消す（残すと次の起動の検査で「既にあるソケット」に当たる）
+        audit.stop(timeout_s=tick_deadline_ms / 1_000)
+        server.close()
+        mailbox.close()
+        _log_not_opened(
+            f"管理ソケットのスレッドを起動できない: {type(error).__name__}: {error}", config_path
+        )
+        return None
     return ControlAdminEntry(
         settings=settings,
         mailbox=mailbox,

@@ -44,6 +44,8 @@ uv run coldaisle-telemetry --once   # NVML / hwmon を1回収集（#65）
 uv run coldaisle-fand --max-ticks 5 # 3系統Fan制御デーモン（simulated backend。#74 / 決定記録 0028）
 uv run coldaisle-fand --config-dir var/control-config  # 4ファイル（air-balance.yaml を含む）を置いた設定で起動。無ければ全 zone Max（決定記録 0073）
 #   管理ソケットは config/control-admin.yaml（--admin-config）。不正なら開かず AUTO で運転。--no-admin で開かない（決定記録 0072）
+#   既定の設定は同じ uid を認めない（socket.group は仮の名前。配置先の専用グループへ置き換える）
+uv run coldaisle-fand --admin-config config/control-admin.dev.yaml  # 開発用: 同じ uid から操作できる（**本番で使わない**）
 uv run coldaisle-control status     # coldaisle-fand の運転モードを読む（管理ソケット。#74 / 決定記録 0072。**人が使う**）
 uv run coldaisle-control max --reason "負荷試験の前に全開"  # MAX（期限なし）。manual は --front/--rear/--top と --lease が必須
 COLDAISLE_DB=var/coldaisle.db uv run uvicorn coldaisle.api:app --host 127.0.0.1 --port 8000
@@ -272,7 +274,7 @@ src/coldaisle/
   web/        # L4: 静的アセット。airflow-trace.js が decision trace の版の解釈を1か所で持つ（0071 §2.3）
 firmware/     # ESP32-S3 Arduino スケッチ。**コンパイルは人の手**（#11 / 決定記録 0022 §2.9）
 deploy/       # Ubuntu 常駐化のテンプレート（systemd / udev）。**仮の値だけ**。手順は docs/ubuntu-deploy.md（#57）
-config/       # rules.yaml, calibration.json, coldaisle.toml, evaluation.yaml, drift.yaml, rl-training.yaml, soak.yaml, control-admin.yaml（Control Config の4ファイル fan-hardware / safety / fan-policy / air-balance は実運用のものを置かない。docs/control-config.md）
+config/       # rules.yaml, calibration.json, coldaisle.toml, evaluation.yaml, drift.yaml, rl-training.yaml, soak.yaml, control-admin.yaml / control-admin.dev.yaml（Control Config の4ファイル fan-hardware / safety / fan-policy / air-balance は実運用のものを置かない。docs/control-config.md）
 memory/       # 運用メモリ（いまの閾値・較正値）。`coldaisle-memory` が更新案を出す
 docs/         # 要件定義、仕様レビュー、ADR
 tests/

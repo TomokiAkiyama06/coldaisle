@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import ast
 import errno
+import grp
 import json
 import os
 import shutil
@@ -69,6 +70,12 @@ from test_control_loop import METRICS_PATH, Harness
 
 SRC = Path(__file__).resolve().parents[1] / "src" / "coldaisle"
 ADMIN_CONFIG = CONFIG_DIR / "control-admin.yaml"
+"""`--admin-config` の既定。同じ uid を認めない（0072 §2.5 / §2.8）。"""
+DEV_ADMIN_CONFIG = CONFIG_DIR / "control-admin.dev.yaml"
+"""開発用に明示して渡す設定（`group: null` + `allow_same_user: true`）。
+
+試験の入口はこれを基にする。
+"""
 RUN_ID = "0123456789abcdef0123456789abcdef"
 TICK_MS = 1_000
 TICK_DEADLINE_MS = 100
@@ -100,8 +107,11 @@ def rules() -> QualityRules:
 
 
 def admin_document(path: Path | None = None, **changes: Any) -> dict[str, Any]:
-    """本番の設定ファイルを読み、指定した値だけを差し替える（`limits.x` のように書く）。"""
-    document: dict[str, Any] = yaml.safe_load(ADMIN_CONFIG.read_text(encoding="utf-8"))
+    """開発用の設定ファイルを読み、指定した値だけを差し替える（`limits.x` のように書く）。
+
+    試験は同じ uid のクライアントから接続するため、`--admin-config` で明示する開発用の設定を使う。
+    """
+    document: dict[str, Any] = yaml.safe_load(DEV_ADMIN_CONFIG.read_text(encoding="utf-8"))
     if path is not None:
         document["socket"]["path"] = str(path)
     for dotted, value in changes.items():
@@ -137,11 +147,46 @@ def manual_command(command_id: int, *, lease_ms: int = 60_000, demand: float = 0
 # ================================================================ 1. 設定（0072 §2.8）
 
 
-def test_the_repository_config_is_valid_and_fits_the_test_safety_timing():
-    settings = ControlAdminSettings.from_yaml(ADMIN_CONFIG)
+@pytest.mark.parametrize("path", [ADMIN_CONFIG, DEV_ADMIN_CONFIG])
+def test_the_repository_config_is_valid_and_fits_the_test_safety_timing(path):
+    settings = ControlAdminSettings.from_yaml(path)
     settings.check_against(tick_ms=TICK_MS, tick_deadline_ms=TICK_DEADLINE_MS)
     assert settings.manual.max_lease_s.status == "provisional"
     assert settings.manual.max_lease_s.basis
+
+
+def test_the_default_admin_config_does_not_admit_the_same_uid():
+    """既定で読む設定は同じ uid を認めない。
+
+    API / AI 層が fand と同じ uid で動いていても manual / max を送れない（0072 §2.5）。
+    """
+    from coldaisle.control_daemon import DEFAULT_ADMIN_CONFIG
+    from coldaisle.local_socket import Authorizer
+
+    assert CONFIG_DIR / DEFAULT_ADMIN_CONFIG.name == ADMIN_CONFIG
+    settings = ControlAdminSettings.from_yaml(ADMIN_CONFIG)
+    assert settings.authorization.allow_same_user is False
+    assert settings.socket.group is not None
+    # 同じ uid でグループのメンバーでない接続（存在しない gid = どのグループのメンバーでもない）
+    unused_gid = max(entry.gr_gid for entry in grp.getgrall()) + 1
+    authorizer = Authorizer(
+        server_uid=os.geteuid(),
+        allow_same_user=settings.authorization.allow_same_user,
+        group_gid=unused_gid,
+    )
+    assert not authorizer.allows(os.geteuid())
+
+
+def test_the_dev_config_differs_from_the_default_only_in_who_may_connect():
+    """開発用の設定は `socket.group` と `allow_same_user` だけが違う（上限などを別に育てない）。"""
+    default = yaml.safe_load(ADMIN_CONFIG.read_text(encoding="utf-8"))
+    dev = yaml.safe_load(DEV_ADMIN_CONFIG.read_text(encoding="utf-8"))
+    assert dev["socket"]["group"] is None
+    assert dev["authorization"]["allow_same_user"] is True
+    for document in (default, dev):
+        del document["socket"]["group"]
+        del document["authorization"]["allow_same_user"]
+    assert default == dev
 
 
 def test_a_read_timeout_longer_than_a_tick_is_refused_at_startup():
@@ -1252,6 +1297,45 @@ def test_an_invalid_entry_config_does_not_open_the_socket(short_dir, rules, chan
     assert _open(config, short_dir / "a.db", rules) is None
     assert not (short_dir / "run" / "admin.sock").exists()
     assert any("管理ソケットを開かずに運転する" in record.getMessage() for record in caplog.records)
+
+
+@needs_peercred
+@pytest.mark.parametrize("failing", ["control-admin-audit", "control-admin-receiver"])
+def test_a_thread_that_cannot_start_leaves_no_socket_and_no_thread(
+    short_dir, rules, monkeypatch, caplog, failing
+):
+    """スレッドを起動できなくても build() を止めず、入口なし（AUTO）へ退く（0072 §2.8）。"""
+    config = short_dir / "control-admin.yaml"
+    socket_path = short_dir / "run" / "admin.sock"
+    config.write_text(yaml.safe_dump(admin_document(socket_path)), "utf-8")
+    started: list[threading.Thread] = []
+    original_start = threading.Thread.start
+
+    def start(self: threading.Thread) -> None:
+        if self.name == failing:
+            raise RuntimeError("can't start new thread")
+        started.append(self)
+        original_start(self)
+
+    monkeypatch.setattr(threading.Thread, "start", start)
+    assert _open(config, short_dir / "a.db", rules) is None
+    assert not socket_path.exists()
+    for thread in started:
+        thread.join(timeout=5.0)
+    assert not any(thread.is_alive() for thread in started)
+    assert not any(
+        thread.name.startswith("control-admin") and thread.is_alive()
+        for thread in threading.enumerate()
+    )
+    assert any(
+        "スレッドを起動できない" in getattr(record, "fields", {}).get("reason", "")
+        for record in caplog.records
+    )
+    # 同じ場所でもう一度開ける（ロックもソケットも残っていない）
+    monkeypatch.setattr(threading.Thread, "start", original_start)
+    entry = _open(config, short_dir / "a.db", rules)
+    assert entry is not None
+    entry.stop()
 
 
 def test_a_missing_entry_config_does_not_open_the_socket(short_dir, rules):
