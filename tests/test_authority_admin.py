@@ -568,6 +568,45 @@ def test_max_and_a_rollback_in_the_same_tick_both_apply(catalog, tmp_path):
     assert tick.authority is not None and tick.authority.command_id == 2
 
 
+def test_a_dead_receiver_still_hands_over_a_lowering_it_had_placed(catalog, tmp_path):
+    """死を検知した tick で authority の枠だけを1回取り出す。モードの枠は捨てる（0081）。"""
+    harness, mailbox, _runtime = journal_harness(catalog, tmp_path)
+    harness.tick()
+    mailbox.pending = AdminModeCommand(command_id=1, mode=OperatingMode.AUTO)
+    mailbox.pending_authority = authority_command(2, AuthorityStage.SHADOW)
+    mailbox.alive = False
+
+    tick = harness.tick().tick
+
+    assert tick.state.operating_mode is OperatingMode.MAX
+    assert tick.mode_command is not None and tick.mode_command.admin_receiver_dead is True
+    assert tick.mode_command.command_id is None, "モードの指令は適用しない"
+    assert tick.state.authority_stage is AuthorityStage.SHADOW
+    assert tick.authority is not None and tick.authority.command_id == 2
+    journal = other_store(tmp_path).read()
+    assert journal.stage is AuthorityStage.SHADOW, "再起動しても降格した stage で始まる"
+    assert "command_id=2" in journal.events[-1].reason
+
+    # 2 tick 目以降は読まない
+    mailbox.pending_authority = authority_command(3, AuthorityStage.SHADOW)
+    later = harness.tick().tick
+    assert later.authority is not None and later.authority.command_id is None
+    assert mailbox.pending_authority is not None
+
+
+def test_a_dead_receiver_with_a_locked_mailbox_still_forces_max(catalog, tmp_path):
+    harness, mailbox, _runtime = journal_harness(catalog, tmp_path)
+    harness.tick()
+    mailbox.pending_authority = authority_command(2, AuthorityStage.SHADOW)
+    mailbox.locked = True
+    mailbox.alive = False
+
+    tick = harness.tick().tick
+
+    assert tick.state.operating_mode is OperatingMode.MAX
+    assert tick.state.authority_stage is AuthorityStage.FULL
+
+
 def test_an_external_change_takes_effect_from_the_next_tick(catalog, tmp_path):
     harness, _mailbox, _runtime = journal_harness(catalog, tmp_path)
     other_store(tmp_path).lower_stage(

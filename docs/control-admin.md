@@ -145,6 +145,10 @@ loop は毎 tick の先頭で受付スレッドの生存を lock を取らずに
 この `MAX` は **`coldaisle-fand` の再起動まで**保ちます（受け渡し口も読まない）。入口を最初から
 開かなかった場合は対象外です。
 
+ただし、死を検知した tick だけは **authority の枠を1回取り出し**、死ぬ前に受理していた降格を
+いつもの tick と同じく効かせて journal へ書き残します（決定記録 0081）。再起動しても降格した stage で
+始まります。モードの枠に残った指令は適用せずに捨てます（warning に `command_id` を残す）。
+
 ## 監査（`control_admin_audit` 表。migration 0008）
 
 状態を変える指令（`set_mode` / `lower_authority` / `rollback_authority`）の経過を、行を書き換えずに

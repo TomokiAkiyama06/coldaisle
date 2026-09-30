@@ -312,10 +312,14 @@ class AdminModeTracker:
     def _hold_max_after_receiver_death(self, tick_id: int) -> ModeResolution:
         """受付スレッドが死んだら `MANUAL` を解除して `MAX` にし、**再起動まで保つ**（0072 §2.2）。
 
-        死んだあとは受け渡し口を読まない（残った指令も適用しない）。lease も付けない。
+        モードの枠は読まない（残った指令も適用しない）。lease も付けない。ただし死を最初に
+        検知した tick だけは **authority の枠を1回取り出す**（決定記録 0081）。受理済みの降格を
+        再起動で失わないためで、降格は冷却を弱めない。
         """
+        authority: AdminAuthorityCommand | None = None
         if not self._dead:
             self._dead = True
+            authority = self._take_authority_once(tick_id)
             LOGGER.error(
                 "control-admin の受付スレッドが死んだため、再起動まで全 zone を Max にする",
                 extra={
@@ -331,11 +335,43 @@ class AdminModeTracker:
         self._command_id = None
         self._lease_deadline_mono_ms = None
         return ModeResolution(
+            authority=authority,
             command=self._command,
             record=ModeCommandRecord(
                 entry="control_admin", run_id=self._run_id, admin_receiver_dead=True
             ),
         )
+
+    def _take_authority_once(self, tick_id: int) -> AdminAuthorityCommand | None:
+        """死を検知した tick で authority の枠だけを取り出す。失敗しても `MAX` は妨げない。"""
+        try:
+            both = self._mailbox.take()
+        except Exception:
+            LOGGER.exception(
+                "受付スレッドの死の後に authority の枠を読めなかった（残った降格は再起動で戻る）",
+                extra={logs.FIELDS_KEY: {"tick_id": tick_id}},
+            )
+            return None
+        if both is None:
+            LOGGER.error(
+                "受付スレッドの死の後に authority の枠の lock を取れなかった"
+                "（残った降格は再起動で戻る）",
+                extra={logs.FIELDS_KEY: {"tick_id": tick_id}},
+            )
+            return None
+        if both.mode is not None:
+            # モードは適用しない（0072 §2.2）。何を捨てたかだけを残す
+            LOGGER.warning(
+                "受付スレッドの死の後に残ったモードの指令を適用せずに捨てた",
+                extra={
+                    logs.FIELDS_KEY: {
+                        "tick_id": tick_id,
+                        "command_id": both.mode.command_id,
+                        "mode": both.mode.mode.value,
+                    }
+                },
+            )
+        return both.authority
 
     def _take(self, *, tick_id: int, now_mono_ms: int) -> AdminAuthorityCommand | None:
         """2枠を取り出し、モードを適用する。authority の降格は loop へ返す（loop が入れる）。"""
