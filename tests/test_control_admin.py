@@ -1612,6 +1612,82 @@ def test_an_unauthorized_peer_is_refused_and_never_evicts_anyone(short_dir, rule
         running.stop()
 
 
+class _WriteAfterSocket(socket.socket):
+    """`sendall` を合図まで待たせる。サーバが先に応答して閉じる順序を毎回つくる。"""
+
+    gate: threading.Event
+
+    def sendall(self, data: Any, flags: int = 0) -> None:  # type: ignore[override]
+        assert self.gate.wait(timeout=5)
+        super().sendall(data, flags)
+
+
+def _client_writes_after(monkeypatch: pytest.MonkeyPatch, gate: threading.Event) -> None:
+    """クライアントの `socket` だけを差し替える（受付スレッドのソケットには触れない）。"""
+    delayed = type("DelayedSocket", (_WriteAfterSocket,), {"gate": gate})
+    namespace = type(
+        "SocketModule",
+        (),
+        {"AF_UNIX": socket.AF_UNIX, "SOCK_STREAM": socket.SOCK_STREAM, "socket": delayed},
+    )
+    monkeypatch.setattr(admin_client, "socket", namespace)
+
+
+@needs_peercred
+def test_an_unauthorized_peer_sees_unauthorized_even_if_the_server_closed_first(
+    short_dir, rules, monkeypatch
+):
+    """拒否の応答を書いて閉じたあとにクライアントが書く順序（EPIPE）でも「拒否」と分かる。
+
+    CI で間欠的に「接続できない: Broken pipe」になった順序を、合図で毎回つくる。
+    """
+    running = RunningEntry(short_dir, rules, server_uid=os.getuid() + 1)
+    closed = threading.Event()
+    reply_and_close = running.server._reply_and_close
+
+    def reply_then_signal(sock: socket.socket, body: dict[str, Any]) -> None:
+        reply_and_close(sock, body)
+        closed.set()
+
+    running.server._reply_and_close = reply_then_signal  # type: ignore[method-assign]
+    _client_writes_after(monkeypatch, closed)
+    try:
+        assert running.send(MAX) == {"ok": False, "error": "unauthorized"}
+        assert running.tick().record.command_id is None
+    finally:
+        running.stop()
+
+
+def test_the_client_reads_a_reply_already_sent_when_its_write_fails(short_dir, monkeypatch):
+    """書き込みが EPIPE でも、届いている応答の1行を読む。応答が無ければ「接続できない」。"""
+    path = short_dir / "peer.sock"
+    listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    listener.bind(str(path))
+    listener.listen(4)
+    closed = threading.Event()
+    replies = [b'{"ok": false, "error": "unauthorized"}\n', b""]
+
+    def refuse() -> None:
+        for reply in replies:
+            peer, _ = listener.accept()
+            peer.sendall(reply)
+            peer.close()
+            closed.set()
+
+    server = threading.Thread(target=refuse, daemon=True)
+    server.start()
+    _client_writes_after(monkeypatch, closed)
+    try:
+        response = admin_client.send(encode(MAX), path, timeout_s=5)
+        assert response == {"ok": False, "error": "unauthorized"}
+        closed.clear()
+        with pytest.raises(admin_client.AdminUnavailableError, match="接続できない"):
+            admin_client.send(encode(MAX), path, timeout_s=5)
+    finally:
+        server.join(timeout=5)
+        listener.close()
+
+
 @needs_peercred
 def test_the_lease_expiry_is_audited_as_its_own_event(entry):
     future = entry.send_async(manual_body(lease_s=1))
