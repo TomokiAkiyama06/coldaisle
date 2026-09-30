@@ -72,29 +72,29 @@ docs/decisions/NNNN-<slug>.md      例: 0002-metric-naming.md
 |---|---|---|
 | [0001](0001-initial-project-decisions.md) | プロジェクト初期の決定（D-01〜D-19、V-01） | FINAL |
 | [0002](0002-metric-naming.md) | メトリクス命名規約とDBスキーマ（ロング形式） | FINAL |
-| [0003](0003-device-json-schema.md) | デバイス出力 JSON スキーマ v1 | Proposed |
+| [0003](0003-device-json-schema.md) | デバイス出力 JSON スキーマ v1 | FINAL |
 | [0004](0004-storage-read-contract.md) | ストレージ層の読み出し契約 | FINAL |
 | [0005](0005-model-selection.md) | ローカルモデルは Qwen3.8-27B 単体構成 | FINAL |
 | [0006](0006-gpu-mode-and-mixed-state.md) | GPU Mode を2段階にし `mixed` を異常として扱う | FINAL |
-| [0007](0007-ingest-pipeline.md) | 取り込みパイプラインの規約 | Proposed |
-| [0008](0008-rollup-and-retention.md) | ロールアップ・保持期間・日次CSVの規約 | Proposed |
-| [0009](0009-read-api.md) | 読み取り API の契約 | Proposed |
-| [0010](0010-csv-replay.md) | CSV 再生の規約 | Proposed |
-| [0011](0011-dashboard.md) | 開発用ダッシュボードの方針 | Proposed |
+| [0007](0007-ingest-pipeline.md) | 取り込みパイプラインの規約 | FINAL |
+| [0008](0008-rollup-and-retention.md) | ロールアップ・保持期間・日次CSVの規約 | FINAL |
+| [0009](0009-read-api.md) | 読み取り API の契約 | FINAL |
+| [0010](0010-csv-replay.md) | CSV 再生の規約 | FINAL |
+| [0011](0011-dashboard.md) | 開発用ダッシュボードの方針 | FINAL |
 | [0012](0012-rule-engine.md) | ルールエンジンの規約 | FINAL |
-| [0013](0013-notifications.md) | 通知の規約 | Proposed |
-| [0014](0014-llm-provider.md) | LLM Provider の規約 | Proposed |
-| [0015](0015-llm-tools.md) | 読み取り専用ツールの規約 | Proposed |
-| [0016](0016-evidence-alerts.md) | アラート説明の Evidence 形式 | Proposed |
-| [0017](0017-daily-report.md) | 日次レポートの規約 | Proposed |
-| [0018](0018-tool-exposure.md) | AI 向けツールの公開方法 | Proposed |
-| [0019](0019-claude-escalation.md) | Claude へのエスカレーション | Proposed |
-| [0020](0020-decision-memory.md) | 運用メモリへの記録 | Proposed |
-| [0021](0021-public-repo-hygiene.md) | public リポジトリの衛生 | Proposed |
-| [0022](0022-firmware-v1.md) | 本番ファームウェア v1 | Proposed |
-| [0023](0023-serial-source.md) | シリアル取り込み | Proposed |
-| [0024](0024-calibration.md) | 較正の手順と記録 | Proposed |
-| [0025](0025-probe-identity.md) | プローブの同定 | Proposed |
+| [0013](0013-notifications.md) | 通知の規約 | FINAL |
+| [0014](0014-llm-provider.md) | LLM Provider の規約 | FINAL |
+| [0015](0015-llm-tools.md) | 読み取り専用ツールの規約 | FINAL |
+| [0016](0016-evidence-alerts.md) | アラート説明の Evidence 形式 | FINAL |
+| [0017](0017-daily-report.md) | 日次レポートの規約 | FINAL |
+| [0018](0018-tool-exposure.md) | AI 向けツールの公開方法 | FINAL |
+| [0019](0019-claude-escalation.md) | Claude へのエスカレーション | FINAL |
+| [0020](0020-decision-memory.md) | 運用メモリへの記録 | FINAL |
+| [0021](0021-public-repo-hygiene.md) | public リポジトリの衛生 | FINAL |
+| [0022](0022-firmware-v1.md) | 本番ファームウェア v1 | FINAL |
+| [0023](0023-serial-source.md) | シリアル取り込み | FINAL |
+| [0024](0024-calibration.md) | 較正の手順と記録 | FINAL |
+| [0025](0025-probe-identity.md) | プローブの同定 | FINAL |
 | [0026](0026-three-zone-fan-control.md) | Front / Rear / Top を独立Fan zoneとして制御する | FINAL |
 | [0027](0027-fan-control-architecture.md) | Fan 制御アーキテクチャ（Supervisor + Learned MPC + Reactive Guard + Critical Safety） | FINAL |
 | [0028](0028-fan-control-contracts.md) | Fan 制御の層間契約（入出力・優先順位・状態遷移・周期・故障時の扱い・設定・承認点） | FINAL |
@@ -105,7 +105,7 @@ docs/decisions/NNNN-<slug>.md      例: 0002-metric-naming.md
 | [0033](0033-air-balance-config-boundary.md) | Air Balance characterization の設定境界 | FINAL（§2 の「`uncalibrated` を runtime controller は起動時に拒否する」の一文は [0073](0073-air-balance-control-config-integration.md)） |
 | [0034](0034-unavailable-fan-tach-safety.md) | 制御対象 Fan の tach 読み取り不能を Safety fault にする | FINAL |
 | [0036](0036-transient-cpu-gpu-regime.md) | Workload Regime に TRANSIENT_CPU_GPU を加える | FINAL |
-| [0037](0037-model-registry-rollback-target.md) | Model Registry の promotion 時の rollback target | Proposed |
+| [0037](0037-model-registry-rollback-target.md) | Model Registry の promotion 時の rollback target | FINAL |
 | [0038](0038-internal-telemetry-outage-counting.md) | Internal Telemetry の欠測の数え方（有効な間の停止は欠測、無効期間は数えない） | FINAL |
 | [0039](0039-dashboard-labels-and-catalog.md) | ダッシュボードの表示名と `GET /api/v1/metrics` | FINAL |
 | [0040](0040-server-health-api.md) | Server Health API の契約（`/server-health` への一本化、signal 規則、機種が公開しない metric の扱い） | FINAL |
@@ -116,7 +116,7 @@ docs/decisions/NNNN-<slug>.md      例: 0002-metric-naming.md
 | [0045](0045-local-socket-write-entry.md) | 書き込み専用のローカル Unix ソケット入口（GPU Mode イベント / Workload Hint） | FINAL |
 | [0046](0046-airflow-ui.md) | エアフロー / ファン制御の可視化画面（置き場所・模擬データの分離・色分けの設定） | FINAL |
 | [0047](0047-cpu-utilization-metric.md) | CPU 使用率のメトリクス名（`cpu.utilization`） | FINAL |
-| [0048](0048-thermal-model-artifact-and-inference.md) | Thermal Model v1 artifactと読み取り専用推論境界 | Proposed |
+| [0048](0048-thermal-model-artifact-and-inference.md) | Thermal Model v1 artifactと読み取り専用推論境界 | FINAL |
 | [0049](0049-internal-telemetry-source-kind.md) | 内部テレメトリの出どころの種類（`sys.telemetry_kind`: hardware / mock）を記録し、いまの値にだけ「実測」と書く | FINAL |
 | [0050](0050-model-confidence-ood-and-authority.md) | Model Confidence / OOD の判定方式と confidence に応じた Authority 制限 | FINAL |
 | [0051](0051-airflow-cpu-utilization-display.md) | エアフロー画面の CPU 使用率の表示（`cpu.utilization` と「未計測」の判断） | FINAL |
@@ -140,7 +140,8 @@ docs/decisions/NNNN-<slug>.md      例: 0002-metric-naming.md
 | [0069](0069-ubuntu-deploy-templates.md) | Ubuntu 常駐化のテンプレート（固定名 `/dev/server-sensors` を名前の順より先に選ぶ・systemd / udev は `deploy/` に仮の値で置く・`coldaisle-fand` の unit は含めない） | FINAL |
 | [0070](0070-soak-acceptance-interpretation.md) | 連続運転テスト（soak）の受入基準の読み方（欠測率は最も悪いチャネルで判定・母数は期間÷送信周期で周期不明なら判定不能・再起動はすべて意図しないものとみなす・DB を読み取り専用で開く） | FINAL |
 | [0071](0071-control-trace-read-api.md) | decision trace の読み取り API（`/api/v1/control/latest` と `/control/traces`・記録した順の `seq` によるページングと保持期間の境界の明示・本文は保存した JSON のまま版の解釈は読む側・registry の版を毎 tick 載せる・AI ツールに足さない。0030 §2 / §5 の1項目めの承認が前提） | FINAL（§2.5 のうち `reason` の全文を毎 tick 載せる部分は [0075](0075-trace-registry-block-reason-digest.md)） |
-| [0072](0072-control-admin-entry.md) | 制御デーモンの管理操作の入口（`coldaisle-fand` の専用ソケットでモード設定と authority の降格だけを受ける・昇格は CLI・同じ uid と root を暗黙に認めない・次の tick で反映・journal は毎 tick の stat で読み直す・監査は追記専用） | FINAL |
-| [0073](0073-air-balance-control-config-integration.md) | `air-balance.yaml` を4つ目の Control Config として一括検証に統合する（束ねた版 11・不在は `config_invalid`・未校正は Air Balance を無効にして起動・`ControlTick` v10 に applied demand 基準の `estimated_flow` と Air Balance の記録・trace に4ファイルの版と hash・昇格の証拠を `air-balance.yaml` に束縛） | FINAL |
+| [0072](0072-control-admin-entry.md) | 制御デーモンの管理操作の入口（`coldaisle-fand` の専用ソケットでモード設定と authority の降格だけを受ける・昇格は CLI・同じ uid と root を暗黙に認めない・次の tick で反映・journal は毎 tick の stat で読み直す・監査は追記専用） | FINAL（§2.3 の受理の応答の形は [0076](0076-implementation-settled-points.md) §2.4 で `superseded_by` を追加） |
+| [0073](0073-air-balance-control-config-integration.md) | `air-balance.yaml` を4つ目の Control Config として一括検証に統合する（束ねた版 11・不在は `config_invalid`・未校正は Air Balance を無効にして起動・`ControlTick` v10 に applied demand 基準の `estimated_flow` と Air Balance の記録・trace に4ファイルの版と hash・昇格の証拠を `air-balance.yaml` に束縛） | FINAL（実装では `ControlTick` v11。版番号の読み替えは [0076](0076-implementation-settled-points.md) §2.1） |
 | [0074](0074-supervisor-shadow-wiring-and-episode-evaluation.md) | 運転中の Supervisor decision を Shadow 台帳へ流す配線（制御プロセスの外の CLI が保存済み trace から集計・鍵は `(ts_ms, tick_id)`）と、RL episode 結果を別の report 型 `PolicyEpisodeReport` の `episode:` arm として出す接続（`for_active` の条件は範囲外） | FINAL |
 | [0075](0075-trace-registry-block-reason-digest.md) | decision trace の registry の塊では自由記述の `reason` を全文でなく `reason_sha256`（UTF-8 の SHA-256）にする（毎 tick の保存量を抑える・全文は registry の audit が正本・`previous_artifact` / `rollback_target` の長さも閉じる。0071 §2.5 の一部を置き換え） | FINAL |
+| [0076](0076-implementation-settled-points.md) | 0071 / 0072 / 0073 の実装で決着した点（Air Balance の記録は `ControlTick` v11 で入った＝0073 の「v10」の読み替え・監査の表 `control_admin_audit` の DDL と起動ごとの `run_id`・`ControlTick` v12 の `mode_command` と `admin_receiver_dead`・`control-admin.yaml` の暫定値・応答の `superseded_by`（0072 §2.3 の一部を置き換え）・受付スレッドの死は Safety では `manual_max` のまま・出荷設定は同じ uid を認めない・`accept()` の失敗は待ち受けだけを上限付きで休み、`escalate_after_ms` 続いたら受付スレッドの死として `MAX`・`control-admin.yaml` は版 2（v1 は拒否）・画面の古さの倍数 3.0 を確定） | FINAL |

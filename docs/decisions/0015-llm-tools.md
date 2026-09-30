@@ -1,7 +1,7 @@
 # 決定記録 0015: 読み取り専用ツールの規約
 
 - **種別**: Decision Record
-- **Status**: Proposed（本 PR のマージをもって FINAL）
+- **Status**: FINAL（2026-08-25、PR #21 のマージ）
 - **Date**: 2026-08-25
 - **Supersedes**: なし
 - **関連**: [`0014-llm-provider.md`](0014-llm-provider.md) /

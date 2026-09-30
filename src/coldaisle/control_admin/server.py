@@ -20,6 +20,12 @@
 
 authority の降格（段階 2。#92）は authority の枠へ置く。**上げる操作は無い**（0072 §2.1）。
 
+`accept()` が失敗し続けるとき（fd の枯渇など）は、待ち受けのソケットだけを selector から
+外して `accept_backoff` の間隔で休む（失敗のたびに `multiplier` 倍、`max_ms` で頭打ち、成功で
+戻す）。`sleep` はしないので、休んでいる間も接続済みの接続は読み続け、`MAX` は遅れずに受け渡し口へ
+置く。途切れずに `escalate_after_ms` 失敗し続けたら受付スレッドを自分で終わらせ、loop の生存の
+確認による既存の `MAX` の経路に任せる（決定記録 0076 §2.7。2つ目の `MAX` の経路は作らない）。
+
 **受付スレッドは loop の状態に一切触れない。** 受け渡し口（`AdminMailbox`）へ置き、loop が返した
 結果を読むだけである。受付スレッドの例外で `coldaisle-fand` を終わらせない。死んだら loop が
 自分で `MAX` に倒す（`coldaisle.control.operating_mode`）。
@@ -28,7 +34,9 @@ authority の降格（段階 2。#92）は authority の枠へ置く。**上げ�
 from __future__ import annotations
 
 import contextlib
+import errno
 import logging
+import math
 import os
 import selectors
 import socket
@@ -149,6 +157,18 @@ class ControlAdminServer:
         self._connections: set[_Connection] = set()
         self._auditing: dict[int, tuple[_Connection, AdminModeCommand]] = {}
         self._awaiting_ack: dict[int, _Connection] = {}
+        self._accept_backoff_ms: int | None = None
+        """いまの休みの長さ。None は失敗が続いていない（成功で戻す）。"""
+        self._accept_resume_mono_ms: int | None = None
+        """待ち受けを selector へ戻す時刻。None は待ち受けを監視している。"""
+        self._accept_failures = 0
+        """最後の成功から数えた `accept()` の失敗の回数。"""
+        self._accept_failures_logged = 0
+        """そのうちログに出した時点の回数（出さなかった分を次のログでまとめて数える）。"""
+        self._accept_first_failure_mono_ms: int | None = None
+        """途切れずに続いている失敗の最初の時刻。成功で None に戻す。"""
+        self._accept_exhausted = False
+        """失敗が `escalate_after_ms` 続いた。受付スレッドを終わらせる（→ loop が `MAX`）。"""
 
     @property
     def path(self) -> Path:
@@ -259,7 +279,7 @@ class ControlAdminServer:
         self._selector = selector
         selector.register(listener, selectors.EVENT_READ, "accept")
         selector.register(self._mailbox.wake_reader, selectors.EVENT_READ, "wake")
-        while not self._stop:
+        while not self._stop and not self._accept_exhausted:
             for key, _events in selector.select(self._select_timeout_s()):
                 if key.data == "accept":
                     self._accept(listener)
@@ -270,12 +290,17 @@ class ControlAdminServer:
             self._on_audit_completions()
             self._on_loop_outcomes()
             self._expire()
+            self._resume_accept_if_due()
+        if self._accept_exhausted:
+            self._close_after_exhaustion()
 
     def _select_timeout_s(self) -> float | None:
         """次の締め切りまでの秒数。締め切りの無い間は起こされるまで待つ。"""
         deadlines = [
             conn.deadline_mono_ms for conn in self._connections if conn.deadline_mono_ms is not None
         ]
+        if self._accept_resume_mono_ms is not None:
+            deadlines.append(self._accept_resume_mono_ms)
         if not deadlines:
             return None
         return max(0.0, (min(deadlines) - self._monotonic.monotonic_ms()) / 1_000)
@@ -295,11 +320,14 @@ class ControlAdminServer:
                 sock, _ = listener.accept()
             except (BlockingIOError, InterruptedError):
                 return
-            except OSError:
-                # EMFILE / ENFILE / ECONNABORTED などは一時的で回復しうる。受付を死なせず、
-                # 今回の accept だけを打ち切る（接続は次の select で改めて受ける）
-                LOGGER.warning("接続の受け付けに失敗したため今回は打ち切る", exc_info=True)
+            except OSError as exc:
+                # EMFILE / ENFILE / ECONNABORTED などは一時的で回復しうる。まずは受付を死なせず、
+                # 待ち受けだけを少し休む（待ち受けは読める状態のままなので、休まないと空回りする）。
+                # 途切れずに escalate_after_ms 続いたら受付スレッドを終わらせる
+                if not self._escalate_if_exhausted(exc):
+                    self._pause_accept(exc)
                 return
+            self._on_accept_succeeded()
             sock.setblocking(False)
             try:
                 uid = peer_uid(sock)
@@ -326,6 +354,135 @@ class ControlAdminServer:
             )
             self._connections.add(conn)
             self._register(conn, selectors.EVENT_READ)
+
+    def _pause_accept(self, exc: OSError) -> None:
+        """待ち受けを selector から外し、次の休みの長さを決める。**`sleep` はしない。**
+
+        接続済みの接続は selector に残るので、休んでいる間も読み続ける。ログは最初の失敗と、
+        休みが伸びたとき・頭打ちの後は失敗の回数が 2 の冪に届いたときだけ出す（出さなかった
+        回数は次のログにまとめる）。
+        """
+        backoff = self._settings.accept_backoff
+        previous = self._accept_backoff_ms
+        current = backoff.initial_ms if previous is None else self._grow(previous)
+        self._accept_backoff_ms = current
+        self._accept_failures += 1
+        self._accept_resume_mono_ms = self._monotonic.monotonic_ms() + current
+        self._unwatch_listener()
+        failures = self._accept_failures
+        if current != previous or failures & (failures - 1) == 0:
+            LOGGER.warning(
+                "接続の受け付けに失敗したため待ち受けを休む",
+                exc_info=failures == 1,
+                extra={
+                    logs.FIELDS_KEY: {
+                        "reason": "admin_accept_failed",
+                        "errno": None if exc.errno is None else errno.errorcode.get(exc.errno),
+                        "consecutive_failures": failures,
+                        "suppressed_since_last_log": failures - self._accept_failures_logged - 1,
+                        "backoff_ms": current,
+                        "run_id": self._run_id,
+                    }
+                },
+            )
+            self._accept_failures_logged = failures
+
+    def _escalate_if_exhausted(self, exc: OSError) -> bool:
+        """途切れずに続く失敗が `escalate_after_ms` に届いたら、受付スレッドを終わらせる印を立てる。
+
+        終わった受付スレッドは loop が毎 tick の生存の確認で見つけ、`MANUAL` を解除して
+        再起動まで `MAX`（`forced_max`）にし、decision trace に `admin_receiver_dead` を残す
+        （0072 §2.2 の経路をそのまま使う。0076 §2.7）。
+        """
+        now_ms = self._monotonic.monotonic_ms()
+        if self._accept_first_failure_mono_ms is None:
+            self._accept_first_failure_mono_ms = now_ms
+        failing_for_ms = now_ms - self._accept_first_failure_mono_ms
+        escalate_after_ms = self._settings.accept_backoff.escalate_after_ms
+        if failing_for_ms < escalate_after_ms:
+            return False
+        self._accept_failures += 1
+        self._accept_exhausted = True
+        self._accept_resume_mono_ms = None
+        self._unwatch_listener()
+        LOGGER.error(
+            "接続の受け付けが失敗し続けたため受付スレッドを終わらせる（再起動まで MAX）",
+            exc_info=(type(exc), exc, exc.__traceback__),
+            extra={
+                logs.FIELDS_KEY: {
+                    "reason": "admin_accept_exhausted",
+                    "errno": None if exc.errno is None else errno.errorcode.get(exc.errno),
+                    "consecutive_failures": self._accept_failures,
+                    "failing_for_ms": failing_for_ms,
+                    "escalate_after_ms": escalate_after_ms,
+                    "run_id": self._run_id,
+                }
+            },
+        )
+        return True
+
+    def _close_after_exhaustion(self) -> None:
+        """受付スレッドを終わらせる前に、接続と待ち受けを閉じる。
+
+        ソケットのファイルとロックは残し、停止の手順の `close()` が消す（自分が作ったものだけを
+        消す規則を1か所に保つ）。監査書き込みスレッドは受付スレッドの死と同じく触らない。
+        """
+        for conn in list(self._connections):
+            self._drop(conn)
+        self._auditing.clear()
+        self._awaiting_ack.clear()
+        listener = self._listener
+        self._listener = None
+        if listener is not None:
+            with contextlib.suppress(OSError):
+                listener.close()
+
+    def _grow(self, previous: int) -> int:
+        """次の休みの長さ。`max_ms` で頭打ちにし、桁あふれを受付の外へ出さない。
+
+        倍率は起動時に有限・上限付きで検証するが、ここでも float の積が inf / nan になる経路で
+        `math.ceil` の OverflowError / ValueError を起こさない（受付スレッドを落とさない）。
+        """
+        backoff = self._settings.accept_backoff
+        grown = previous * backoff.multiplier
+        if not math.isfinite(grown) or grown >= backoff.max_ms:
+            return backoff.max_ms
+        return min(math.ceil(grown), backoff.max_ms)
+
+    def _on_accept_succeeded(self) -> None:
+        """失敗が続いた後の成功で休みの長さと時間の起点を戻し、回復を1行だけ残す。"""
+        self._accept_first_failure_mono_ms = None
+        if self._accept_failures == 0:
+            return
+        LOGGER.info(
+            "接続の受け付けが回復した",
+            extra={
+                logs.FIELDS_KEY: {
+                    "reason": "admin_accept_recovered",
+                    "consecutive_failures": self._accept_failures,
+                    "run_id": self._run_id,
+                }
+            },
+        )
+        self._accept_backoff_ms = None
+        self._accept_failures = 0
+        self._accept_failures_logged = 0
+
+    def _resume_accept_if_due(self) -> None:
+        """休みの期限（単調時計）が来たら待ち受けを selector へ戻す。休みの長さは成功まで保つ。"""
+        resume = self._accept_resume_mono_ms
+        if resume is None or self._monotonic.monotonic_ms() < resume:
+            return
+        self._accept_resume_mono_ms = None
+        if self._selector is not None and self._listener is not None:
+            with contextlib.suppress(KeyError):
+                self._selector.register(self._listener, selectors.EVENT_READ, "accept")
+
+    def _unwatch_listener(self) -> None:
+        if self._selector is None or self._listener is None:
+            return
+        with contextlib.suppress(KeyError, ValueError):
+            self._selector.unregister(self._listener)
 
     def _on_ready(self, conn: _Connection) -> None:
         if conn.stage == "receiving":

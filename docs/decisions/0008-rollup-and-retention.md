@@ -1,7 +1,7 @@
 # 決定記録 0008: ロールアップ・保持期間・日次CSVの規約
 
 - **種別**: Decision Record
-- **Status**: Proposed（本 PR のマージをもって FINAL）
+- **Status**: FINAL（2026-08-25、PR #14 のマージ）
 - **Date**: 2026-08-25
 - **Supersedes**: なし
 - **関連**: [`0002-metric-naming.md`](0002-metric-naming.md) §2.4 / §2.8 /
