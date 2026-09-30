@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import ast
+import errno
 import json
 import os
 import shutil
@@ -314,6 +315,23 @@ def test_requests_outside_the_whitelist_are_refused(body, code):
             b'{"v": 1, "op": "set_mode", "mode": "manual", "reason": "x", "lease_s": 1,'
             b' "requested": {"front": NaN, "rear": 0, "top": 0}}\n',
             "non_finite_number",
+        ),
+        # hash できない型・数値を mode / op / requested に入れても TypeError にしない
+        (b'{"v": 1, "op": "set_mode", "mode": [], "reason": "x"}\n', "invalid_fields"),
+        (b'{"v": 1, "op": "set_mode", "mode": {}, "reason": "x"}\n', "invalid_fields"),
+        (b'{"v": 1, "op": "set_mode", "mode": 1, "reason": "x"}\n', "invalid_fields"),
+        (b'{"v": 1, "op": [], "mode": "max", "reason": "x"}\n', "unknown_op"),
+        (b'{"v": 1, "op": {}, "mode": "max", "reason": "x"}\n', "unknown_op"),
+        (b'{"v": 1, "op": 1, "mode": "max", "reason": "x"}\n', "unknown_op"),
+        (
+            b'{"v": 1, "op": "set_mode", "mode": "manual", "reason": "x", "lease_s": 1,'
+            b' "requested": []}\n',
+            "invalid_fields",
+        ),
+        (
+            b'{"v": 1, "op": "set_mode", "mode": "manual", "reason": "x", "lease_s": 1,'
+            b' "requested": {"front": [], "rear": {}, "top": 0}}\n',
+            "invalid_fields",
         ),
     ],
 )
@@ -768,6 +786,73 @@ def manual_body(lease_s: int = 60) -> dict[str, Any]:
         "lease_s": lease_s,
         "reason": "騒音の比較",
     }
+
+
+@needs_peercred
+@pytest.mark.parametrize(
+    "raw",
+    [
+        b'{"v": 1, "op": "set_mode", "mode": [], "reason": "x"}\n',
+        b'{"v": 1, "op": "set_mode", "mode": {}, "reason": "x"}\n',
+        b'{"v": 1, "op": [], "reason": "x"}\n',
+    ],
+)
+def test_a_malformed_mode_is_refused_and_the_receiver_stays_alive(entry, raw):
+    """形の壊れた1行で受付スレッドを死なせない（死ぬと再起動まで全 zone が MAX になる）。"""
+    response = admin_client.send(raw, entry.path, timeout_s=5)
+    assert response["ok"] is False
+    assert response["error"] in {"invalid_fields", "unknown_op"}
+    assert entry.mailbox.receiver_alive()
+    assert entry.send({"v": 1, "op": "status"})["ok"] is True
+
+
+def test_a_transient_accept_failure_does_not_kill_the_receiver(entry):
+    """fd の一時的な枯渇などは、今回の accept を打ち切るだけにする。"""
+
+    class FailingListener:
+        def accept(self) -> tuple[Any, Any]:
+            raise OSError(errno.EMFILE, "Too many open files")
+
+    entry.server._accept(FailingListener())  # type: ignore[arg-type]
+    assert entry.mailbox.receiver_alive()
+
+
+def test_stopping_without_drain_does_not_wait_for_a_blocked_audit(short_dir, rules):
+    """loop が例外で抜けた経路は、監査の DB が詰まっていても終了を遅らせない。"""
+    running = RunningEntry(short_dir, rules, apply_ack_timeout_ms=3_000)
+    running.gate.clear()  # 監査の DB が lock されている
+    running.send_async(AUTO)
+    time.sleep(0.2)  # 監査書き込みスレッドが gate で止まるまで
+    admin = admin_runtime.ControlAdminEntry(
+        settings=running.settings,
+        mailbox=running.mailbox,
+        server=running.server,
+        audit=running.audit,
+        tracker=running.tracker,
+        run_id=RUN_ID,
+        shutdown_wait_ms=3_000,
+    )
+    started = time.monotonic()
+    admin.stop(drain=False)
+    elapsed = time.monotonic() - started
+    running.gate.set()
+    running.pool.shutdown(wait=False, cancel_futures=True)
+    assert elapsed < 0.5
+
+
+def test_the_daemon_close_passes_the_drain_choice_to_the_entry():
+    from coldaisle.control_daemon import ControlDaemon
+
+    calls: list[bool] = []
+
+    class StubAdmin:
+        def stop(self, *, drain: bool = True) -> None:
+            calls.append(drain)
+
+    daemon = ControlDaemon(loop=None, monotonic=SystemMonotonicClock(), admin=StubAdmin())  # type: ignore[arg-type]
+    daemon.close(drain=False)
+    assert calls == [False]
+    assert daemon.admin is None
 
 
 @needs_peercred

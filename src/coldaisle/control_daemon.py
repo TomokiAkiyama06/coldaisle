@@ -456,10 +456,14 @@ class ControlDaemon:
         """次の tick の前に止める。**tick の途中では止めない。**"""
         self._stop = True
 
-    def close(self) -> None:
-        """管理ソケット、ストアの順に閉じる。**loop が止まった後に呼ぶ**（0072 §2.2）。"""
+    def close(self, *, drain: bool = True) -> None:
+        """管理ソケット、ストアの順に閉じる。**loop が止まった後に呼ぶ**（0072 §2.2）。
+
+        ``drain=False`` は `run()` が例外で抜けたとき。管理ソケットのスレッドを待たずに閉じ、
+        process の終了（引き継ぎで Max。0028 §2.7）を遅らせない。
+        """
         if self.admin is not None:
-            self.admin.stop()
+            self.admin.stop(drain=drain)
             self.admin = None
         if self.store is not None:
             self.store.close()
@@ -861,8 +865,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     signal.signal(signal.SIGINT, _stop)
     try:
         stats = daemon.run(max_ticks=args.max_ticks)
-    finally:
-        daemon.close()
+    except BaseException:
+        # 例外で抜けた経路では管理ソケットの後片付けを待たない（終了と引き継ぎを遅らせない）
+        daemon.close(drain=False)
+        raise
+    daemon.close()
     LOGGER.info("control daemon を終了する", extra={logs.FIELDS_KEY: stats.as_fields()})
     return 0
 

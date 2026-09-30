@@ -135,7 +135,10 @@ def parse_request(line: bytes) -> AdminRequest:
         raise RequestError("unsupported_op")
     if op == "status":
         return _validate(StatusRequest, decoded)
-    if decoded.get("mode") in RESERVED_MODES:
+    mode = decoded.get("mode")
+    # list / dict は hash できず membership 判定で TypeError になる。文字列のときだけ比べ、
+    # それ以外は pydantic の検証に任せて invalid_fields で拒否する（受付を落とさない）
+    if isinstance(mode, str) and mode in RESERVED_MODES:
         raise RequestError("unsupported_mode")
     request = _validate(SetModeRequest, decoded)
     manual = request.mode == "manual"

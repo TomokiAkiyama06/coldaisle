@@ -42,11 +42,22 @@ class ControlAdminEntry:
     audit: AuditWriter
     tracker: AdminModeTracker
     run_id: str
+    shutdown_wait_ms: int
+    """停止の手順で受付・監査の各スレッドを待つ上限。`tick_deadline_ms` を渡す。
 
-    def stop(self) -> None:
-        """`coldaisle-fand` の停止の手順。**loop が止まった後に呼ぶ**（死んだとは扱わない）。"""
+    `apply_ack_timeout_ms` で待つと、監査の DB が lock されているときに process の終了
+    （と引き継ぎの Max）が秒単位で遅れる。その間 loop は止まり PWM は最後の値のままになる。
+    """
+
+    def stop(self, *, drain: bool = True) -> None:
+        """`coldaisle-fand` の停止の手順。**loop が止まった後に呼ぶ**（死んだとは扱わない）。
+
+        ``drain=False`` は loop が例外で抜けたときの経路（0028 §2.7 の「終わらせて引き継ぎで
+        Max」）。スレッドを待たずに閉じる（どちらも daemon thread なので終了を妨げない）。
+        書き終えていない監査の依頼は失われうるが、構造化ログには残っている。
+        """
         self.mailbox.mark_stopping()
-        timeout_s = self.settings.apply_ack_timeout_ms / 1_000
+        timeout_s = self.shutdown_wait_ms / 1_000 if drain else 0.0
         self.server.request_stop()
         self.server.join(timeout_s=timeout_s)
         self.audit.stop(timeout_s=timeout_s)
@@ -111,6 +122,7 @@ def open_control_admin(
         audit=audit,
         tracker=AdminModeTracker(mailbox, run_id=run_id),
         run_id=run_id,
+        shutdown_wait_ms=tick_deadline_ms,
     )
 
 

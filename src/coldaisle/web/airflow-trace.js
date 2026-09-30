@@ -308,7 +308,7 @@
     }
     if (record.entry === "none") return { k: key, v: "管理ソケットなし（自動のまま）", tone: "warn" };
     if (typeof record.command_id === "number") return { k: key, v: `管理ソケットの指令 #${record.command_id}` };
-    return { k: key, v: "起動時の既定（自動）" };
+    return { k: key, v: "指令なし（自動）" };
   }
 
   function number(value) {

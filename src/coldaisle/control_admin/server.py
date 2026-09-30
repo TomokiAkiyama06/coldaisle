@@ -280,6 +280,11 @@ class ControlAdminServer:
                 sock, _ = listener.accept()
             except (BlockingIOError, InterruptedError):
                 return
+            except OSError:
+                # EMFILE / ENFILE / ECONNABORTED などは一時的で回復しうる。受付を死なせず、
+                # 今回の accept だけを打ち切る（接続は次の select で改めて受ける）
+                LOGGER.warning("接続の受け付けに失敗したため今回は打ち切る", exc_info=True)
+                return
             sock.setblocking(False)
             try:
                 uid = peer_uid(sock)
