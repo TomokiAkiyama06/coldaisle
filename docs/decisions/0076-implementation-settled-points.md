@@ -3,8 +3,10 @@
 - **種別**: Decision Record
 - **Status**: FINAL（2026-09-30、リポジトリ所有者が承認）
 - **Date**: 2026-09-30
-- **Supersedes**: なし（各記録が実装 PR へ委ねた点と、実装で記録の文面と異なった事実を記録する。
-  どの記録の決定も置き換えない）
+- **Supersedes**: [0072](0072-control-admin-entry.md) §2.3 の「応答」の項のうち、受理の応答の形のみ
+  （§2.4 で `superseded_by` を加える）。0072 の §2.3 の残りと他の節は有効。
+  本記録の他の節は、各記録が実装 PR へ委ねた点（0071 §5 #1、0072 §5 #4 / #6）と、
+  0073 §5 が許した版番号の繰り上げを記録するもので、どの記録の決定も置き換えない
 - **関連**: [0060](0060-control-loop-runtime.md) §5 /
   [0071](0071-control-trace-read-api.md) §2.6 / §5 #1 /
   [0072](0072-control-admin-entry.md) §2.2 / §2.3 / §2.4 / §2.5 / §2.7 / §2.8 / §5 #3 / #4 / #6 /
@@ -104,7 +106,7 @@ README が旧記録へ許す追記は `Superseded by` だけである）。0073 
 - `config/control-admin.dev.yaml` も同じ値を持つ（違いは §2.6 の2項目だけ）
 - `limits.max_message_bytes`（4096）は 0072 §5 #4 の列挙に無く、0045 と同じ意味の値として置いた
 
-### 2.4 応答の `superseded_by` を 0072 §2.3 の表に加える
+### 2.4 応答の `superseded_by` を 0072 §2.3 の表に加える（0072 §2.3 の一部を置き換える）
 
 0072 §2.3 の受理の応答は `{"ok": true, "command_id", "applied", "applied_tick_id"}` だけを定めていた。
 実装は、冷却を弱めうる指令が監査の受付の行を書けた時点で、モードの軸にそれより大きい `command_id` が
@@ -117,6 +119,14 @@ README が旧記録へ許す追記は `Superseded by` だけである）。0073 
 この欄の追加を受け入れる（`src/coldaisle/control_admin/server.py` の `_superseded_body`）。
 `applied: false` だけでは「確認待ちで時間切れ（`pending`）」と「後の指令に置き換えられた」を
 クライアントが区別できないためである。値は監査の表の `superseded_by` と同じ `command_id` を指す。
+
+0072 §2.2 は「採られなかった指令は `superseded` として応答・監査に残す」と決めていたが、
+§2.3 の受理の応答の形はそれを表す欄を持たなかった。本節は FINAL の 0072 §2.3 が定めた応答の形を
+変えるため、委ねられた未決の穴埋めではなく**0072 §2.3 の一部の置き換え**として扱う
+（ヘッダの `Supersedes`、0072 側の `Superseded by`）。
+
+- 置き換えるのは、受理の応答が `superseded` の場合に `superseded_by` を持つ点だけ。
+  `ok` / `command_id` / `applied` / `applied_tick_id` の意味、拒否の応答、`status` の応答は 0072 のまま
 
 ### 2.5 受付スレッドの死による `MAX` は、Critical Safety では既存の `manual_max` として現れる
 
