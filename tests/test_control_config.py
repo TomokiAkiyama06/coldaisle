@@ -187,7 +187,7 @@ def valid_documents() -> dict[str, dict[str, object]]:
             },
         },
         "safety.yaml": {
-            "schema_version": 3,
+            "schema_version": 4,
             "absolute_temp_ceiling_c": provisional(85.0),
             "zone_min_demand": {
                 "front": provisional(0.4),
@@ -230,6 +230,8 @@ def valid_documents() -> dict[str, dict[str, object]]:
             "tick_deadline_ms": provisional(100),
             "overrun_consecutive_limit": provisional(3),
             "watchdog_timeout_ms": provisional(5000),
+            # 決定記録 0080 §2.6 の暫定値（watchdog_timeout_ms と同じ値）
+            "hardware_write_fail_exit_ms": provisional(5000),
         },
         "fan-policy.yaml": {
             "schema_version": 9,
@@ -368,12 +370,12 @@ def load_config(tmp_path: Path) -> ControlConfig:
 def test_complete_config_has_traceable_sources_and_is_not_actuation_ready(tmp_path: Path) -> None:
     config = load_config(tmp_path)
 
-    assert CONTROL_CONFIG_VERSION == 11
+    assert CONTROL_CONFIG_VERSION == 12
     assert config.actuation_permitted is False
-    assert config.trace_metadata()["control_config_version"] == 11
+    assert config.trace_metadata()["control_config_version"] == 12
     metadata = config.trace_metadata()["control_config"]
     assert metadata["fan_hardware"]["name"] == "fan-hardware.yaml"
-    assert metadata["safety"]["schema_version"] == 3
+    assert metadata["safety"]["schema_version"] == 4
     assert metadata["policy"]["schema_version"] == 9
     assert metadata["air_balance"]["name"] == "air-balance.yaml"
     assert metadata["air_balance"]["schema_version"] == 2
@@ -446,6 +448,67 @@ def test_safety_v1_is_rejected_without_defaulting_new_safety_fields(tmp_path: Pa
     write_documents(tmp_path, documents)
 
     with pytest.raises(ValidationError, match="schema_version"):
+        ControlConfig.from_directory(tmp_path)
+
+
+def test_safety_v3_is_rejected_without_defaulting_the_write_fail_exit(tmp_path: Path) -> None:
+    """v3 を v4 として補完しない（決定記録 0080 §2.6）。
+
+    `hardware_write_fail_exit_ms` を黙って補うと、所有者が見ていない時間で
+    「書けないまま制御を持ち続ける」上限が決まる。版だけ上げて欄を欠く v4 も拒否する。
+    """
+    documents = valid_documents()
+    del documents["safety.yaml"]["hardware_write_fail_exit_ms"]
+    documents["safety.yaml"]["schema_version"] = 3
+    write_documents(tmp_path, documents)
+    with pytest.raises(ValidationError, match="schema_version"):
+        ControlConfig.from_directory(tmp_path)
+
+    documents["safety.yaml"]["schema_version"] = 4
+    write_documents(tmp_path, documents)
+    with pytest.raises(ValidationError, match="hardware_write_fail_exit_ms"):
+        ControlConfig.from_directory(tmp_path)
+
+
+@pytest.mark.parametrize(
+    ("exit_ms", "accepted"),
+    [
+        # 下限: (tick_ms 1000 + tick_deadline_ms 100) * write_fail_emergency_after 3 = 3300
+        (3_299, False),
+        (3_300, True),
+        # 上限: watchdog_timeout_ms 5000
+        (5_000, True),
+        (5_001, False),
+    ],
+)
+def test_the_write_fail_exit_is_bounded_by_the_retry_and_the_deadman(
+    tmp_path: Path, exit_ms: int, accepted: bool
+) -> None:
+    """`(tick_ms + tick_deadline_ms) * write_fail_emergency_after <= 値 <= watchdog_timeout_ms`。
+
+    下限は fand の中の再試行と EMERGENCY を先に試すため、上限は書けないまま制御を持つ時間を
+    hang の deadman より長くしないため（決定記録 0080 §2.6）。
+    """
+    documents = valid_documents()
+    documents["safety.yaml"]["hardware_write_fail_exit_ms"] = provisional(exit_ms)
+    write_documents(tmp_path, documents)
+
+    if accepted:
+        config = ControlConfig.from_directory(tmp_path)
+        assert config.safety.hardware_write_fail_exit_ms.value == exit_ms
+    else:
+        with pytest.raises(ValidationError, match="hardware_write_fail_exit_ms"):
+            ControlConfig.from_directory(tmp_path)
+
+
+def test_the_write_fail_exit_follows_the_retry_count(tmp_path: Path) -> None:
+    """下限は `write_fail_emergency_after` と一緒に動く（回数を増やせば期間も要る）。"""
+    documents = valid_documents()
+    documents["safety.yaml"]["write_fail_emergency_after"] = provisional(5)
+    write_documents(tmp_path, documents)
+
+    # (1000 + 100) * 5 = 5500 > 5000（期間の値と watchdog の上限を超える）
+    with pytest.raises(ValidationError, match="hardware_write_fail_exit_ms"):
         ControlConfig.from_directory(tmp_path)
 
 
@@ -674,6 +737,7 @@ def test_provisional_values_identify_safety_and_policy_without_exposing_values(
     assert any(item.path == "fault_demand" for item in values)
     assert any(item.path == "stall_check_min_demand.front" for item in values)
     assert any(item.path == "write_fail_emergency_after" for item in values)
+    assert any(item.path == "hardware_write_fail_exit_ms" for item in values)
     assert any(item.path == "telemetry.t_sensor.enabled" for item in values)
     assert any(item.path == "cpu_power_cooling_floor[0].power_w" for item in values)
     assert any(item.path == "telemetry.cpu_power_ms" for item in values)

@@ -174,6 +174,38 @@ Model を Production へ昇格させても authority は動かない（#104 と 
 v8からv9へは `authority_rollout` を追加してから `schema_version: 9` へ上げる。
 v1〜v8は自動補完せず起動前に拒否する。
 
+## Control Config v12 と `safety.yaml` v4（#74 / 決定記録 0080 §2.6）
+
+束ねた版 `CONTROL_CONFIG_VERSION` を 11 → 12 に上げ、`safety.yaml` を schema version 3 → 4 にした
+（ほかのファイルの版は変えない。`fan-hardware.yaml` 1、`fan-policy.yaml` 9、`air-balance.yaml` 2）。
+v4 は最上位の `watchdog_timeout_ms` の隣に `hardware_write_fail_exit_ms`（ほかの Safety の値と
+同じ `{value, status, basis}`）を必須にする。takeover の後、ある zone の書き込みと読み戻しが
+一度も成功しないままこの時間続いたら、`coldaisle-fand` は引き継ぎ記録を消さずに終了コード 7 で
+終わり、`ExecStopPost` が root で Max を書く。
+
+読み込み時に次の不変条件を検証し、満たさなければ Control Config の不正として扱う。
+
+```text
+(tick_ms + tick_deadline_ms) * write_fail_emergency_after <= hardware_write_fail_exit_ms <= watchdog_timeout_ms
+```
+
+下限は fand の中の再試行と `EMERGENCY` への昇格を先に試すため、上限は「書けないまま制御を
+持ち続ける」時間を hang の deadman より長くしないためである。
+
+**暫定値**は `value` = その `safety.yaml` の `watchdog_timeout_ms` と同じ値、`status: provisional`、
+`basis` なし（決定記録 0080 §2.6）。新しい数を作らず承認待ちの既存の値に揃えたもので、**実機で使う前に
+#50 の熱の時定数と #75 の書き込み・読み戻しの失敗の実測から導き、所有者の承認（0028 §2.9 の承認点 2）を
+経て `confirmed` にする。** 承認まではほかの `provisional` の値と同じく `provisional_values()` で起動時の
+一覧に出る。
+
+**移行手順**: v3 を v4 として補完しない（読み込み時に拒否する）。
+
+1. 運用の `safety.yaml` に `hardware_write_fail_exit_ms` を足す（暫定値なら
+   `{value: <watchdog_timeout_ms と同じ値>, status: provisional}`）
+2. 最後に `schema_version: 4` へ上げる。欄を欠く v4 と v3 のままのファイルはどちらも拒否され、
+   `config_invalid` の全 zone Max で止まる
+3. 新しいコードへ更新して再起動する
+
 ## Control Config v11 と `air-balance.yaml` v2（#81 / 決定記録 0073）
 
 束ねた版 `CONTROL_CONFIG_VERSION` を 10 → 11 に上げ、`air-balance.yaml` を4つ目のファイルにした。
@@ -208,7 +240,7 @@ SHA-256 を毎 tick 残す。Offline Evaluation の報告は v3 になり、`air
 昇格（`AuthorityJournal` v2）は、この2ファイルについても承認の証拠・報告・いまの設定の一致を求める
 （`docs/authority-rollout.md`）。
 
-現行 Control Config v11 は設定の live reload を行わない。設定変更は候補全体を別オブジェクトで検証したうえで
+現行 Control Config v12 は設定の live reload を行わない。設定変更は候補全体を別オブジェクトで検証したうえで
 **次回再起動時**にだけ反映する。これにより、変更後の設定も必ず `STARTUP` の Max を通る。
 `trace_metadata()` は、採用されたsource名・schema version・SHA-256を #82 の decision traceへ渡す。
 Confidence / OOD の判断（`model_gate`）には検証済み assessment の値だけを書き、裏付けの無い tick は

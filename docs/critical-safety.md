@@ -154,7 +154,19 @@ heartbeat を出す側は `src/coldaisle/control_daemon.py`（`coldaisle-fand`�
 - deadman の有無は `NOTIFY_SOCKET` の有無ではなく sd_watchdog_enabled(3) と同じ判定
   （`WATCHDOG_USEC` / `WATCHDOG_PID`）で決める
 - `WATCHDOG_USEC` が heartbeat の最悪間隔（`tick_ms + tick_deadline_ms`）の2倍に満たなければ
-  起動しない。`safety.yaml` の `watchdog_timeout_ms` と違う値なら warning を残す
+  起動しない。`safety.yaml` の `watchdog_timeout_ms` より**長ければ起動しない**（終了コード 4。
+  決定記録 0080 §2.3）。短いときは起動して warning を残す
+- 通知の I/O の失敗（通知用 socket を作れない・`READY=1` を送れない）は終了コード 6 で、
+  恒久的な食い違いの 4 とは分ける（再起動で再試行する。決定記録 0080 §2.4）
+- takeover の後、ある zone の書き込みと読み戻しが一度も成功しないまま `safety.yaml` の
+  `hardware_write_fail_exit_ms` 続いたら、**返却も引き継ぎ記録の削除もせずに**終了コード 7 で終える。
+  `ExecStopPost` の引き継ぎ実行部が root で Max を書く（決定記録 0080 §2.6。
+  `write_fail_emergency_after` の `EMERGENCY` の後ろの段。1回成功すれば数え直す）
+- 起動時に `faulthandler` を有効にし、watchdog の SIGABRT で全スレッドの traceback を残す（0080 §2.5）
+- 制御を取る前に DB へ書けるか（ディレクトリ・DB・`-wal` / `-shm` / `-journal` の `os.access` と
+  `BEGIN IMMEDIATE` → `ROLLBACK`）を確かめ、権限で書けなければ `db_not_writable` の event
+  （path・mode・所有者・gid・fand の uid と補助グループ）を出して終了コード 5 で終える。
+  `SQLITE_BUSY` は lock を取れないだけとして別の文言にする（0080 §2.1）
 - deadman が無い環境では `UnsupervisedWatchdog` が起動時に error を残し、heartbeat の間隔が
   `watchdog_timeout_ms` を超えるたびに記録する（プロセスを止める力は無い）。
   `--require-watchdog` を付けると、deadman が無いときは制御を取らずに終了する

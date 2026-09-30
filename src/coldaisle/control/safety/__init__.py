@@ -16,6 +16,10 @@ from coldaisle.control.safety.critical import (
     create_emergency_control_runtime,
     invalid_config_decision,
 )
+from coldaisle.control.safety.write_fail_exit import (
+    HardwareWriteFailureExit,
+    HardwareWriteFailureExitError,
+)
 from coldaisle.safety_handoff import (
     HandoffRecordError,
     HandoffResult,
@@ -38,6 +42,8 @@ __all__ = [
     "HandoffRecordError",
     "HandoffResult",
     "HandoffZoneResult",
+    "HardwareWriteFailureExit",
+    "HardwareWriteFailureExitError",
     "create_control_runtime_binding",
     "create_emergency_control_runtime",
     "emergency_handoff",

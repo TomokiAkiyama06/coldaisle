@@ -1083,6 +1083,50 @@ def test_the_daemon_close_logs_a_left_lowering_it_could_not_write_within_the_bou
     assert "command_id=7" in fields["reason"]
 
 
+def test_the_write_fail_exit_persists_a_left_lowering_without_waiting_for_threads(tmp_path):
+    """終了コード 7 の経路: スレッドは待たないが、残った降格は lock を待たずに1回書く（0083）。"""
+    from coldaisle.control_daemon import ControlDaemon
+
+    runtime = raised_runtime(tmp_path, stage=AuthorityStage.FULL)
+    admin = LeftoverAdmin(leftover_lowering())
+    daemon = ControlDaemon(
+        loop=None,  # type: ignore[arg-type]
+        monotonic=SystemMonotonicClock(),
+        admin=admin,  # type: ignore[arg-type]
+        authority=runtime,
+    )
+
+    daemon.close(drain=False, persist_without_wait=True)
+
+    assert admin.drains == [False], "受付スレッドは待たない"
+    journal = other_store(tmp_path).read()
+    assert journal.stage is AuthorityStage.LIMITED, "再起動しても降格した stage で始まる"
+    assert "command_id=7" in journal.events[-1].reason
+    assert runtime.pending_stages == ()
+
+
+def test_the_write_fail_exit_does_not_wait_for_a_held_lock(tmp_path, held_lock, caplog):
+    from coldaisle.control_daemon import ControlDaemon
+
+    runtime = raised_runtime(tmp_path, stage=AuthorityStage.FULL)
+    held_lock.hold()
+    daemon = ControlDaemon(
+        loop=None,  # type: ignore[arg-type]
+        monotonic=SystemMonotonicClock(),
+        admin=LeftoverAdmin(leftover_lowering()),  # type: ignore[arg-type]
+        authority=runtime,
+    )
+
+    started = time.monotonic()
+    with caplog.at_level("ERROR"):
+        daemon.close(drain=False, persist_without_wait=True)
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 0.2, "lock の待ち上限（500 ms）を待たない"
+    assert other_store(tmp_path).read().stage is AuthorityStage.FULL
+    assert any("再起動で戻る" in record.getMessage() for record in caplog.records)
+
+
 def test_the_daemon_close_after_an_exception_logs_a_left_lowering_without_waiting(
     tmp_path, held_lock, caplog
 ):

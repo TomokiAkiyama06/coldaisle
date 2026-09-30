@@ -34,15 +34,31 @@ Critical Safety と Reactive Guard は変わらない。
 
 **動作中に設定を読み直さない**（0028 §2.7）。反映は再起動で行い、再起動は必ず
 `STARTUP` の Max を通る。
+
+終了コードは決定記録 0080 §2.4 に従う。unit の `RestartPreventExitStatus=3 4` と対になる
+（3 と 4 は人が直すまで結果が変わらない失敗だけに使い、一時的でありうる失敗は 5〜7 にする）。
+
+| 終了 | 意味 | 制御を取ったか | 再起動 |
+|---|---|---|---|
+| 1 | `config_invalid` で Max を書いた（未捕捉の例外も 1） | 取った | する |
+| 2 | `fan-hardware.yaml` が不正 | 取っていない | する |
+| 3 | hardware mapping が `provisional` | 取っていない | しない |
+| 4 | deadman が恒久的に使えない（`WATCHDOG_USEC` の不在・不正・長短） | 取っていない | しない |
+| 5 | 制御設定以外（DB に書けない `db_not_writable` を含む） | 取っていない | する |
+| 6 | 通知の I/O の失敗（socket を作れない・`READY=1` を送れない） | 取っていない | する |
+| 7 | takeover 後に書き込みの失敗が `hardware_write_fail_exit_ms` 続いた | 取った | する |
 """
 
 from __future__ import annotations
 
 import argparse
+import faulthandler
 import logging
 import os
 import signal
 import socket
+import sqlite3
+import stat
 import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -61,7 +77,11 @@ from coldaisle.control.config import (
 )
 from coldaisle.control.fallback.controller import FallbackController
 from coldaisle.control.fallback.gate import ControllerGate
-from coldaisle.control.hardware.simulated import FanHardwareBackend, SimulatedFanBackend
+from coldaisle.control.hardware.simulated import (
+    FanHardwareBackend,
+    FanHardwareResult,
+    SimulatedFanBackend,
+)
 from coldaisle.control.logging import ControlTraceLogger
 from coldaisle.control.loop import (
     ControlLoop,
@@ -81,7 +101,11 @@ from coldaisle.control.safety.critical import (
     create_control_runtime_binding,
     create_emergency_control_runtime,
 )
-from coldaisle.control.schema import RegistryProvenance, Zone
+from coldaisle.control.safety.write_fail_exit import (
+    HardwareWriteFailureExit,
+    HardwareWriteFailureExitError,
+)
+from coldaisle.control.schema import PerZone, RegistryProvenance, Zone
 from coldaisle.control.shadow.record import ShadowRecorder
 from coldaisle.control.state import ControlInputContract, ControlStateEstimator
 from coldaisle.control.supervisor.policy import SupervisorCoordinator
@@ -117,10 +141,32 @@ EXIT_ACTUATION_NOT_APPROVED = 3
 """hardware mapping が `provisional` で、実機の制御を取る承認が無い（0028 §2.9）。"""
 
 EXIT_WATCHDOG_UNAVAILABLE = 4
-"""外部の deadman が使えない（0028 §2.6 / 決定記録 0060 §2.7）。"""
+"""外部の deadman が**恒久的に**使えない（0028 §2.6 / 決定記録 0060 §2.7 / 0080 §2.3・§2.4）。
+
+unit か `safety.yaml` の食い違いで、人が直すまで結果が変わらない。**4 はこの意味だけに使う**
+（`RestartPreventExitStatus` で再起動しない）。
+"""
 
 EXIT_STARTUP_ENVIRONMENT = 5
-"""制御設定**以外**の理由で起動できない。**制御を取らない**（BIOS の制御のまま）。"""
+"""制御設定**以外**の理由で起動できない。**制御を取らない**（BIOS の制御のまま）。
+
+DB に書けない（`db_not_writable`。決定記録 0080 §2.1）もここに入る。人が権限を直せば次の
+起動でそのまま戻れるよう、再起動する側の終了コードにする。
+"""
+
+EXIT_NOTIFY_IO_FAILED = 6
+"""通知の I/O の失敗（socket を作れない・`READY=1` を送れない。決定記録 0080 §2.4）。
+
+fd の枯渇や systemd 側の一時的な不調など、同じ設定で次は通りうる。4 に混ぜると
+`RestartPreventExitStatus` で一時的な失敗のまま制御が戻らない。**制御は取っていない**
+（`READY=1` は takeover の前に送る）。
+"""
+
+EXIT_HARDWARE_WRITE_FAILED = 7
+"""takeover 後、hwmon へ書けない状態が `hardware_write_fail_exit_ms` 続いた（0080 §2.6）。
+
+**引き継ぎ記録を消さずに**終わり、`ExecStopPost` が root で Max を書いてから再起動する。
+"""
 
 NOTIFY_SOCKET_ENV = "NOTIFY_SOCKET"
 """systemd が `Type=notify` のサービスへ渡す通知先。**この名前は ABI で、調整値ではない。**"""
@@ -153,7 +199,40 @@ def heartbeat_interval_ms(safety: SafetyConfig) -> int:
 
 
 class WatchdogUnavailableError(RuntimeError):
-    """外部の deadman が使えない（通知先が無い・時間切れが無効・間隔が足りない・送れない）。"""
+    """外部の deadman が**恒久的に**使えない（終了コード 4。決定記録 0080 §2.4）。
+
+    通知先が無い・時間切れが無効・間隔が足りない・`safety.yaml` より長い、のどれか。
+    **通知の I/O の失敗はここに入れない**（`WatchdogNotifyIoError`）。
+    """
+
+
+class WatchdogNotifyIoError(RuntimeError):
+    """通知の I/O の失敗（socket を作れない・送れない。終了コード 6。決定記録 0080 §2.4）。
+
+    **`WatchdogUnavailableError` の派生にしない。** 派生にすると、呼び出し側の
+    `except WatchdogUnavailableError` に吸われて終了コード 4（再起動しない）になり、
+    一時的な失敗のまま制御が戻らない。
+    """
+
+
+class DbNotWritableError(RuntimeError):
+    """DB（`--db`）に権限の理由で書けない（`db_not_writable`。決定記録 0080 §2.1）。
+
+    ``fields`` は構造化ログにそのまま載せる。書けなかった path・mode・所有者・gid と、
+    fand の uid・gid・補助グループを持つ。
+    """
+
+    def __init__(self, message: str, *, fields: dict[str, object]) -> None:
+        super().__init__(message)
+        self.fields = fields
+
+
+class DbLockUnavailableError(RuntimeError):
+    """DB の書き込みの lock を `busy_timeout` の間に取れなかった（`SQLITE_BUSY`）。
+
+    **権限の失敗と取り違えない**（決定記録 0080 §2.1）。取り込みの書き込みと重なっただけで、
+    権限を直す必要は無い。
+    """
 
 
 class ControlConfigInvalidError(RuntimeError):
@@ -191,7 +270,8 @@ class SystemdWatchdog:
         try:
             self._socket = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM | socket.SOCK_CLOEXEC)
         except OSError as error:
-            raise WatchdogUnavailableError(f"通知用 socket を作れない: {error}") from error
+            # fd の枯渇など一時的でありうる。再起動する終了コード 6（決定記録 0080 §2.4）
+            raise WatchdogNotifyIoError(f"通知用 socket を作れない: {error}") from error
 
     def ready(self) -> None:
         """起動を伝える（`Type=notify` の service が待っている）。"""
@@ -214,9 +294,8 @@ class SystemdWatchdog:
         try:
             self._socket.sendto(payload, self._address)
         except OSError as error:
-            raise WatchdogUnavailableError(
-                f"{NOTIFY_SOCKET_ENV} へ通知できない: {error}"
-            ) from error
+            # 設定の食い違いではなく I/O の失敗。再起動する終了コード 6（決定記録 0080 §2.4）
+            raise WatchdogNotifyIoError(f"{NOTIFY_SOCKET_ENV} へ通知できない: {error}") from error
 
 
 class UnsupervisedWatchdog:
@@ -263,11 +342,21 @@ class UnsupervisedWatchdog:
 
 
 def enabled_watchdog_interval_ms(environ: Mapping[str, str]) -> int | None:
-    """systemd が**この process に対して**有効にした deadman の時間切れ（ミリ秒）。
+    """systemd が**この process に対して**有効にした deadman の時間切れ（ミリ秒。切り捨て）。
 
     **`NOTIFY_SOCKET` の有無を deadman の証拠にしない。** 通知先は `Type=notify` なら
     `WatchdogSec` が無くても渡るので、それだけを見ると「`WATCHDOG=1` は届くが誰も
     見ていない」状態を「deadman あり」と誤認する（sd_watchdog_enabled(3) と同じ判定にする）。
+    """
+    usec = enabled_watchdog_usec(environ)
+    return None if usec is None else usec // 1_000
+
+
+def enabled_watchdog_usec(environ: Mapping[str, str]) -> int | None:
+    """`enabled_watchdog_interval_ms` と同じ判定で、値をマイクロ秒のまま返す。
+
+    `safety.yaml` より長いかの比較（決定記録 0080 §2.3）はこちらで行う。ミリ秒へ切り捨てて
+    から比べると、1ms 未満だけ長い `WatchdogSec` を「等しい」と読んで通してしまう。
     """
     raw = environ.get(WATCHDOG_USEC_ENV, "")
     if not raw:
@@ -299,7 +388,7 @@ def enabled_watchdog_interval_ms(environ: Mapping[str, str]) -> int | None:
                 extra={logs.FIELDS_KEY: {WATCHDOG_PID_ENV: owner_pid, "pid": os.getpid()}},
             )
             return None
-    return usec // 1_000
+    return usec
 
 
 def create_watchdog(
@@ -314,11 +403,20 @@ def create_watchdog(
 
     `timeout_ms` は `safety.yaml` が意図した時間切れ、実際に効くのは systemd が渡す
     `WATCHDOG_USEC` である。**効くほうで間隔を検証する。**
+
+    `WATCHDOG_USEC` が `safety.yaml` の `watchdog_timeout_ms` より**長い**ときは起動しない
+    （終了コード 4。決定記録 0080 §2.3）。所有者が承認した deadman より遅い deadman で
+    運転することになるからである。短いときは起動する（より厳しい deadman）が warning を残す。
+    どちらの検査も `READY=1` を送る前（takeover の前）に行う。
+
+    恒久的な食い違いは `WatchdogUnavailableError`（終了コード 4）、通知の I/O の失敗は
+    `WatchdogNotifyIoError`（終了コード 6）で返す（0080 §2.4）。
     """
     env = os.environ if environ is None else environ
     address = env.get(NOTIFY_SOCKET_ENV, "")
-    enabled_ms = enabled_watchdog_interval_ms(env)
-    if enabled_ms is not None:
+    enabled_usec = enabled_watchdog_usec(env)
+    enabled_ms = None if enabled_usec is None else enabled_usec // 1_000
+    if enabled_usec is not None and enabled_ms is not None:
         # 時間切れが有効でも、heartbeat が tick ごとにしか出ない以上、間隔が足りなければ
         # 健全な運転でも殺される。**再起動を繰り返す構成で制御を取らない。**
         required_ms = interval_ms * HEARTBEAT_INTERVALS_PER_TIMEOUT
@@ -328,7 +426,13 @@ def create_watchdog(
                 f"watchdog={enabled_ms}ms; heartbeat_interval={interval_ms}ms; "
                 f"required>={required_ms}ms"
             )
-        if enabled_ms != timeout_ms:
+        if enabled_usec > timeout_ms * 1_000:
+            raise WatchdogUnavailableError(
+                f"{WATCHDOG_USEC_ENV} が safety.yaml の watchdog_timeout_ms より長い: "
+                f"watchdog={enabled_usec}us; watchdog_timeout_ms={timeout_ms}ms"
+                "（WatchdogSec を watchdog_timeout_ms と同じ値にする。決定記録 0080 §2.3）"
+            )
+        if enabled_usec < timeout_ms * 1_000:
             LOGGER.warning(
                 "systemd の WatchdogSec と safety.yaml の watchdog_timeout_ms が違う",
                 extra={
@@ -362,6 +466,110 @@ def create_watchdog(
             f"--require-watchdog が指定されているのに deadman が無い（{', '.join(missing)}）"
         )
     return UnsupervisedWatchdog(timeout_ms=timeout_ms, monotonic=monotonic)
+
+
+DB_SIDE_FILE_SUFFIXES = ("-wal", "-shm", "-journal")
+"""SQLite が DB の隣に作るファイル（ABI。調整値ではない）。1つでも書けなければ DB に書けない。"""
+
+_SQLITE_PERMISSION_CODES = frozenset(
+    {sqlite3.SQLITE_READONLY, sqlite3.SQLITE_CANTOPEN, sqlite3.SQLITE_PERM, sqlite3.SQLITE_AUTH}
+)
+"""権限による失敗として報告する SQLite の主エラーコード（拡張コードの下位 8 bit）。"""
+
+_SQLITE_BUSY_CODES = frozenset({sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED})
+"""lock を取れなかっただけの失敗。**権限の問題と誤って報告しない**（決定記録 0080 §2.1）。"""
+
+
+def _process_identity() -> dict[str, object]:
+    """fand の uid・gid・補助グループ。権限の失敗の原因を journal だけで追えるようにする。"""
+    return {
+        "uid": os.geteuid(),
+        "gid": os.getegid(),
+        "supplementary_groups": sorted(os.getgroups()),
+    }
+
+
+def _path_fields(path: Path) -> dict[str, object]:
+    """path の mode・所有者・gid。読めなければその理由を残す（推測で埋めない）。"""
+    try:
+        info = path.stat()
+    except OSError as error:
+        return {"path": str(path), "stat_error": f"{type(error).__name__}: {error}"}
+    return {
+        "path": str(path),
+        "mode": f"{stat.S_IMODE(info.st_mode):04o}",
+        "owner_uid": info.st_uid,
+        "gid": info.st_gid,
+    }
+
+
+def _not_writable(path: Path, reason: str) -> DbNotWritableError:
+    fields: dict[str, object] = {
+        "event": "db_not_writable",
+        **_path_fields(path),
+        "reason": reason,
+        "fand": _process_identity(),
+    }
+    return DbNotWritableError(f"DB に書けない: {path}（{reason}）", fields=fields)
+
+
+def check_db_paths_writable(db: Path) -> None:
+    """DB のディレクトリ・DB・あれば `-wal` / `-shm` / `-journal` に書けるかを見る（0080 §2.1）。
+
+    **SQLite を開く前に見る。** 開いてから権限で落ちると、どのファイルが原因かが SQLite の
+    文言からは分からない。既存の導入先で `-shm` だけが古い mode のまま残る場合を名指しできる
+    ようにする。書けなければ `DbNotWritableError`（終了コード 5）。
+
+    root では `os.access` が常に真になるので、この検査は何も見つけない（試験は skip する）。
+    """
+    directory = db.parent if str(db.parent) else Path(".")
+    if not directory.is_dir():
+        # 権限ではなく配置の誤り。db_not_writable と取り違えない（終了コード 5 は同じ）
+        raise StartupEnvironmentError(f"DB のディレクトリが無い: {directory}")
+    # ファイルを作るには書き込み権、名前を引くには実行権が要る
+    if not os.access(directory, os.W_OK | os.X_OK):
+        raise _not_writable(directory, "DB のディレクトリに書き込み・実行の権限が無い")
+    for path in (db, *(db.with_name(db.name + suffix) for suffix in DB_SIDE_FILE_SUFFIXES)):
+        if path.exists() and not os.access(path, os.R_OK | os.W_OK):
+            raise _not_writable(path, "読み書きの権限が無い")
+
+
+def classify_sqlite_open_error(db: Path, error: sqlite3.Error) -> RuntimeError:
+    """SQLite の失敗を「権限」「lock を取れない」「その他」に分ける（0080 §2.1）。
+
+    返すのは `DbNotWritableError` / `DbLockUnavailableError` / `StartupEnvironmentError`。
+    どれも終了コード 5 だが、**報告の文言と event を取り違えない。**
+    """
+    code = getattr(error, "sqlite_errorcode", None)
+    primary = None if code is None else code & 0xFF
+    detail = f"{type(error).__name__}: {error}"
+    if primary in _SQLITE_BUSY_CODES:
+        return DbLockUnavailableError(
+            f"DB の書き込みの lock を busy_timeout の間に取れなかった（権限の問題ではない）: "
+            f"{db}: {detail}"
+        )
+    if primary in _SQLITE_PERMISSION_CODES:
+        return _not_writable(db, detail)
+    return StartupEnvironmentError(f"DB を開けない: {db}: {detail}")
+
+
+def check_db_write_lock(store: SqliteStore, db: Path) -> None:
+    """SQLite に実際に書き込みの lock を取らせる（`BEGIN IMMEDIATE` → `ROLLBACK`。行は書かない）。
+
+    `os.access` は ACL・読み取り専用の mount・SELinux などを見落とす。**制御を取る前に**、
+    decision trace と監査を書く経路が本当に書けるかを確かめる（決定記録 0080 §2.1）。
+    待ちの上限は接続の `busy_timeout`（`tick_deadline_ms`）で、取れなければ
+    `DbLockUnavailableError`（権限の失敗とは別の文言）。
+    """
+    connection = store.connection
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+    except sqlite3.Error as error:
+        raise classify_sqlite_open_error(db, error) from error
+    try:
+        connection.execute("ROLLBACK")
+    except sqlite3.Error as error:
+        raise classify_sqlite_open_error(db, error) from error
 
 
 @dataclass(frozen=True, slots=True)
@@ -464,6 +672,8 @@ class ControlDaemon:
     """開いた管理ソケット。**loop が止まった後に**閉じる（`close()`）。"""
     authority: AuthorityRuntime | None = None
     """制御権の runtime。`close()` で書き残せていない降格を1回だけ書き直す（0057 §2.6）。"""
+    write_fail_exit: HardwareWriteFailureExit | None = None
+    """書き込みの失敗が続いたら終える判定（決定記録 0080 §2.6）。None は試験の足場だけ。"""
     sleep: Callable[[float], None] = time.sleep
     stats: ControlStats = field(default_factory=ControlStats)
     _stop: bool = field(default=False, init=False, repr=False)
@@ -472,7 +682,7 @@ class ControlDaemon:
         """次の tick の前に止める。**tick の途中では止めない。**"""
         self._stop = True
 
-    def close(self, *, drain: bool = True) -> None:
+    def close(self, *, drain: bool = True, persist_without_wait: bool = False) -> None:
         """管理ソケット、ストアの順に閉じる。**loop が止まった後に呼ぶ**（0072 §2.2）。
 
         ``drain=False`` は `run()` が例外で抜けたとき。管理ソケットのスレッドを待たずに閉じ、
@@ -481,13 +691,19 @@ class ControlDaemon:
         受付スレッドを止めたあとで authority の枠に残っていた降格は、`AuthorityRuntime` へ
         入れてから既存の1回だけの書き残しに回す（SIGTERM が置いた直後に来ても、受理した
         降格を捨てない。0072 §2.6）。
+
+        ``persist_without_wait=True`` は ``drain=False`` と組み合わせる終了コード 7 の経路
+        （決定記録 0080 §2.6 / 0083）。スレッドは待たないが、残った降格は journal へ
+        **lock を待たずに1回だけ**書き残しを試す（取れなければ error に残す）。
         """
         leftover: AdminAuthorityCommand | None = None
         if self.admin is not None:
             leftover = self.admin.stop(drain=drain)
             self.admin = None
         if self.authority is not None:
-            _settle_authority_on_stop(self.authority, leftover, drain=drain)
+            _settle_authority_on_stop(
+                self.authority, leftover, drain=drain, persist_without_wait=persist_without_wait
+            )
             self.authority = None
         elif leftover is not None:
             _log_lowering_lost(leftover, "authority runtime が無い")
@@ -496,7 +712,11 @@ class ControlDaemon:
             self.store = None
 
     def run(self, *, max_ticks: int | None = None) -> ControlStats:
-        """止めるまで tick を回す。`max_ticks` は試験と Replay のための上限。"""
+        """止めるまで tick を回す。`max_ticks` は試験と Replay のための上限。
+
+        書き込みの失敗が `hardware_write_fail_exit_ms` 続いたら `HardwareWriteFailureExitError`
+        で抜ける（決定記録 0080 §2.6）。**捕まえて運転を続けない。**
+        """
         period_ms = self.loop.tick_period_ms
         deadline_ms = self.monotonic.monotonic_ms()
         while not self._stop and (max_ticks is None or self.stats.ticks < max_ticks):
@@ -504,9 +724,16 @@ class ControlDaemon:
             if now_ms < deadline_ms:
                 self.sleep((deadline_ms - now_ms) / 1_000)
                 continue
-            self._record(self.loop.tick())
+            result = self.loop.tick()
+            self._record(result)
             deadline_ms += period_ms
             after_ms = self.monotonic.monotonic_ms()
+            if self.write_fail_exit is not None:
+                self.write_fail_exit.observe(
+                    _confirmed_writes(result.hardware),
+                    tick_started_mono_ms=now_ms,
+                    now_mono_ms=after_ms,
+                )
             while deadline_ms <= after_ms:
                 deadline_ms += period_ms
                 self.stats.skipped_slots += 1
@@ -544,8 +771,27 @@ class ControlDaemon:
         )
 
 
+def _confirmed_writes(
+    hardware: PerZone[FanHardwareResult] | None,
+) -> dict[Zone, bool] | None:
+    """zone ごとの「書き込みと読み戻しが成功したか」（trace の `write_ok` / `readback_ok`）。
+
+    None は Backend が例外で結果を返さなかった tick（全 zone の失敗として数える）。
+    """
+    if hardware is None:
+        return None
+    return {
+        zone: hardware.get(zone).readback.write_ok and hardware.get(zone).readback.readback_ok
+        for zone in Zone
+    }
+
+
 def _settle_authority_on_stop(
-    authority: AuthorityRuntime, leftover: AdminAuthorityCommand | None, *, drain: bool
+    authority: AuthorityRuntime,
+    leftover: AdminAuthorityCommand | None,
+    *,
+    drain: bool,
+    persist_without_wait: bool = False,
 ) -> None:
     """停止の前に、枠に残った降格を入れてから、書き残せていない降格を1回だけ書き直す。
 
@@ -553,13 +799,14 @@ def _settle_authority_on_stop(
     両方が通る。どちらでも、クライアントに `pending` を返し監査に `accepted` がある降格を
     捨てると、再起動で高い stage に戻る（0072 §2.6）。
     """
+    persists = drain or persist_without_wait
     if leftover is not None:
-        _lower_left_in_mailbox(authority, leftover, drain=drain)
-    _flush_authority(authority, drain=drain)
+        _lower_left_in_mailbox(authority, leftover, persists=persists)
+    _flush_authority(authority, drain=drain, persist_without_wait=persist_without_wait)
 
 
 def _lower_left_in_mailbox(
-    authority: AuthorityRuntime, command: AdminAuthorityCommand, *, drain: bool
+    authority: AuthorityRuntime, command: AdminAuthorityCommand, *, persists: bool
 ) -> None:
     """どの tick にも取り出されなかった管理ソケットの降格を、停止の前に入れる（0072 §2.6）。
 
@@ -582,21 +829,27 @@ def _lower_left_in_mailbox(
         "停止時に、tick に取り出されなかった control-admin の authority の降格を入れた",
         extra={logs.FIELDS_KEY: {**_lowering_fields(command), "changed": changed}},
     )
-    if not drain:
+    if not persists:
         # 例外での停止では journal へ書かない（下の `_flush_authority`）。何が残ったかを
         # 主体と理由つきで残す
         _log_lowering_lost(command, "例外での停止のため journal へ書かない")
 
 
-def _flush_authority(authority: AuthorityRuntime, *, drain: bool) -> None:
+def _flush_authority(
+    authority: AuthorityRuntime, *, drain: bool, persist_without_wait: bool = False
+) -> None:
     """書き残せていない降格を、停止の前に1回だけ書き直す（lock の待ち上限つき）。
 
     **再起動すると journal の stage で運転が再開する**ので、残った降格を黙って捨てない。
     ``drain=False``（例外での停止）では待たずに、残った降格を error に残すだけにする。
+    ``persist_without_wait`` なら lock を待たずに1回だけ試す（終了コード 7。0083）。
     """
     try:
         if drain:
             authority.flush_pending_on_shutdown()
+            return
+        if persist_without_wait:
+            authority.flush_pending_on_shutdown(wait=False)
             return
         pending = authority.pending_stages
     except Exception:
@@ -665,18 +918,9 @@ def build(
     try:
         contract = build_input_contract(control, catalog, t_sensor_metric=config.t_sensor_metric)
         rules = QualityRules.from_yaml(config.quality_rules)
-        store = SqliteStore(
-            config.db,
-            rules=rules,
-            clock=clock,
-            # **decision trace の保存で待てる上限を tick の締め切りに収める。**
-            # 既定の 5 秒待つと、保存が終わるまで次の tick が始まらず、heartbeat の
-            # 間隔が deadman の時間切れを超える（決定記録 0060 §2.7）。待てなかった
-            # 書き込みは失敗として記録に残る（制御は止めない）。
-            busy_timeout_ms=control.safety.tick_deadline_ms.value,
-        )
     except Exception as error:
         raise StartupEnvironmentError(f"{type(error).__name__}: {error}") from error
+    store = open_writable_store(config.db, rules=rules, clock=clock, control=control)
     binding = create_control_runtime_binding(control)
     try:
         authority = open_authority_runtime(config.authority_root, control, clock=clock)
@@ -685,16 +929,20 @@ def build(
         raise StartupEnvironmentError(f"{type(error).__name__}: {error}") from error
     # **deadman を必ず配線する。** ここを省くと hang しても heartbeat の欠落が起きず、
     # `watchdog_timeout_ms` が一度も効かない（0028 §2.6 / 決定記録 0060 §2.7）。
-    deadman = (
-        watchdog
-        if watchdog is not None
-        else create_watchdog(
-            interval_ms=heartbeat_interval_ms(control.safety),
-            timeout_ms=control.safety.watchdog_timeout_ms.value,
-            monotonic=monotonic,
-            require=config.require_watchdog,
+    try:
+        deadman = (
+            watchdog
+            if watchdog is not None
+            else create_watchdog(
+                interval_ms=heartbeat_interval_ms(control.safety),
+                timeout_ms=control.safety.watchdog_timeout_ms.value,
+                monotonic=monotonic,
+                require=config.require_watchdog,
+            )
         )
-    )
+    except BaseException:
+        store.close()
+        raise
     admin = _open_admin(config, control, rules=rules, clock=clock, monotonic=monotonic)
     try:
         loop = _build_loop(
@@ -717,8 +965,47 @@ def build(
             _settle_authority_on_stop(authority, admin.stop(), drain=True)
         raise
     return ControlDaemon(
-        loop=loop, monotonic=monotonic, store=store, admin=admin, authority=authority
+        loop=loop,
+        monotonic=monotonic,
+        store=store,
+        admin=admin,
+        authority=authority,
+        # **書けないまま制御を持ち続けない**（決定記録 0080 §2.6）。時間は safety.yaml が持つ
+        write_fail_exit=HardwareWriteFailureExit(control.safety.hardware_write_fail_exit_ms.value),
     )
+
+
+def open_writable_store(
+    db: Path, *, rules: QualityRules, clock: Clock, control: ControlConfig
+) -> SqliteStore:
+    """制御を取る前に DB を開き、**書けることを確かめてから**返す（決定記録 0080 §2.1）。
+
+    権限の失敗は `DbNotWritableError`（`db_not_writable`）、lock を取れないだけの失敗は
+    `DbLockUnavailableError`、それ以外は `StartupEnvironmentError`。どれも終了コード 5 で
+    制御を取らない（BIOS の制御のまま。人が直せば次の起動で戻れる）。
+    """
+    check_db_paths_writable(db)
+    try:
+        store = SqliteStore(
+            db,
+            rules=rules,
+            clock=clock,
+            # **decision trace の保存で待てる上限を tick の締め切りに収める。**
+            # 既定の 5 秒待つと、保存が終わるまで次の tick が始まらず、heartbeat の
+            # 間隔が deadman の時間切れを超える（決定記録 0060 §2.7）。待てなかった
+            # 書き込みは失敗として記録に残る（制御は止めない）。
+            busy_timeout_ms=control.safety.tick_deadline_ms.value,
+        )
+    except sqlite3.Error as error:
+        raise classify_sqlite_open_error(db, error) from error
+    except Exception as error:
+        raise StartupEnvironmentError(f"{type(error).__name__}: {error}") from error
+    try:
+        check_db_write_lock(store, db)
+    except BaseException:
+        store.close()
+        raise
+    return store
 
 
 def open_authority_runtime(root: Path, control: ControlConfig, *, clock: Clock) -> AuthorityRuntime:
@@ -956,10 +1243,26 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _enable_faulthandler() -> None:
+    """watchdog の SIGABRT で全スレッドの traceback を journal へ残す（決定記録 0080 §2.5）。
+
+    hang の原因（どのスレッドがどこで止まったか）を後から追うためのもので、制御には効かない。
+    **有効にできなくても起動は止めない**（診断の欠落で冷却の制御を失わない）。既に有効
+    （`PYTHONFAULTHANDLER` など）なら出力先を変えない。
+    """
+    if faulthandler.is_enabled():
+        return
+    try:
+        faulthandler.enable(all_threads=True)
+    except (RuntimeError, ValueError, OSError, AttributeError):
+        LOGGER.exception("faulthandler を有効にできなかった（hang の traceback が残らない）")
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     """`coldaisle-fand` の入口。"""
     args = build_parser().parse_args(argv)
     logs.configure(args.log_level)
+    _enable_faulthandler()
     config = Config(
         config_dir=args.config_dir,
         db=args.db,
@@ -988,6 +1291,22 @@ def main(argv: Sequence[str] | None = None) -> int:
     except WatchdogUnavailableError:
         LOGGER.exception("外部の deadman が使えないため起動しない（決定記録 0028 §2.6）")
         return EXIT_WATCHDOG_UNAVAILABLE
+    except WatchdogNotifyIoError:
+        LOGGER.exception(
+            "systemd への通知の I/O に失敗したため制御を取らずに終える（再起動で再試行する。"
+            "決定記録 0080 §2.4）"
+        )
+        return EXIT_NOTIFY_IO_FAILED
+    except DbNotWritableError as error:
+        LOGGER.error(
+            "DB に書けないため制御を取らない（権限を直せば次の起動で戻る。決定記録 0080 §2.1）",
+            exc_info=True,
+            extra={logs.FIELDS_KEY: error.fields},
+        )
+        return EXIT_STARTUP_ENVIRONMENT
+    except DbLockUnavailableError:
+        LOGGER.exception("DB の書き込みの lock を取れないため制御を取らない（権限の問題ではない）")
+        return EXIT_STARTUP_ENVIRONMENT
     except ControlConfigInvalidError:
         LOGGER.exception(
             "safety.yaml / fan-policy.yaml / air-balance.yaml が無い・不正なため"
@@ -1015,6 +1334,27 @@ def main(argv: Sequence[str] | None = None) -> int:
     signal.signal(signal.SIGINT, _stop)
     try:
         stats = daemon.run(max_ticks=args.max_ticks)
+    except HardwareWriteFailureExitError as error:
+        # **返却（0080 §2.8）をしない。引き継ぎ記録を消さない。** BIOS へ戻す書き込みも同じ理由で
+        # 失敗しうる。ExecStopPost が root で Max・manual を書き、Restart=always で takeover から
+        # やり直す（決定記録 0080 §2.6）。後片付けは例外の経路と同じくスレッドを待たないが、
+        # 受理済みの降格は lock を待たずに1回だけ journal へ書き残しを試す（0083）。
+        LOGGER.critical(
+            "Fan の書き込みが続けて失敗したため終了する"
+            "（引き継ぎ記録を残し、ExecStopPost の Max に任せる）",
+            exc_info=True,
+            extra={
+                logs.FIELDS_KEY: {
+                    "event": "hardware_write_fail_exit",
+                    "zones": [zone.value for zone in error.zones],
+                    "failing_ms": {zone.value: ms for zone, ms in error.failing_ms.items()},
+                    "hardware_write_fail_exit_ms": error.limit_ms,
+                    **daemon.stats.as_fields(),
+                }
+            },
+        )
+        daemon.close(drain=False, persist_without_wait=True)
+        return EXIT_HARDWARE_WRITE_FAILED
     except BaseException:
         # 例外で抜けた経路では管理ソケットの後片付けを待たない（終了と引き継ぎを遅らせない）
         daemon.close(drain=False)
