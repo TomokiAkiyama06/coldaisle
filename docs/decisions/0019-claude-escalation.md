@@ -1,7 +1,7 @@
 # 決定記録 0019: Claude へのエスカレーション
 
 - **種別**: Decision Record
-- **Status**: Proposed（本 PR のマージをもって FINAL）
+- **Status**: FINAL（2026-08-25、PR #25 のマージ）
 - **Date**: 2026-08-25
 - **Supersedes**: なし
 - **関連**: [`0005-model-selection.md`](0005-model-selection.md) /
