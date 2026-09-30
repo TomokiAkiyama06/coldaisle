@@ -1,7 +1,7 @@
 # 決定記録 0021: public リポジトリの衛生
 
 - **種別**: Decision Record
-- **Status**: Proposed（本 PR のマージをもって FINAL）
+- **Status**: FINAL（2026-09-10、PR #27 のマージ）
 - **Date**: 2026-09-10
 - **Supersedes**: なし
 - **関連**: [`0013-notifications.md`](0013-notifications.md)（秘匿情報は環境変数）/

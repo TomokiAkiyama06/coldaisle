@@ -135,6 +135,9 @@ lock を手放す `inspect()` だけでは、A の証拠を持ったまま B が
 
 decision trace への、適用した tick の model artifact の記録は #159（PR #160 / 決定記録 0059）で入った。
 
-- 昇格・rollback の管理操作の入口（CLI / ソケット）。読み取り API（#23）は制御を変えない
+- 走行中の `coldaisle-fand` の authority stage を下げる・rollback する入口（`coldaisle-control` の
+  `lower_authority` / `rollback_authority`）。決定記録 0072 §2.10 段階 2（#92）で入る予定で、まだ main に無い
+- authority stage を**上げる**入口（`coldaisle-authority raise`）。0072 §2.10 段階 3（#92）。
+  読み取り API（#23）は制御を変えない
 - 各段に必要な運転期間の下限
 - 実機での rollout。GPU サーバーが要る（#92 の `requires:server`）

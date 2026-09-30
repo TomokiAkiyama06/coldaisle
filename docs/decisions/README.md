@@ -72,29 +72,29 @@ docs/decisions/NNNN-<slug>.md      例: 0002-metric-naming.md
 |---|---|---|
 | [0001](0001-initial-project-decisions.md) | プロジェクト初期の決定（D-01〜D-19、V-01） | FINAL |
 | [0002](0002-metric-naming.md) | メトリクス命名規約とDBスキーマ（ロング形式） | FINAL |
-| [0003](0003-device-json-schema.md) | デバイス出力 JSON スキーマ v1 | Proposed |
+| [0003](0003-device-json-schema.md) | デバイス出力 JSON スキーマ v1 | FINAL |
 | [0004](0004-storage-read-contract.md) | ストレージ層の読み出し契約 | FINAL |
 | [0005](0005-model-selection.md) | ローカルモデルは Qwen3.8-27B 単体構成 | FINAL |
 | [0006](0006-gpu-mode-and-mixed-state.md) | GPU Mode を2段階にし `mixed` を異常として扱う | FINAL |
-| [0007](0007-ingest-pipeline.md) | 取り込みパイプラインの規約 | Proposed |
-| [0008](0008-rollup-and-retention.md) | ロールアップ・保持期間・日次CSVの規約 | Proposed |
-| [0009](0009-read-api.md) | 読み取り API の契約 | Proposed |
-| [0010](0010-csv-replay.md) | CSV 再生の規約 | Proposed |
-| [0011](0011-dashboard.md) | 開発用ダッシュボードの方針 | Proposed |
+| [0007](0007-ingest-pipeline.md) | 取り込みパイプラインの規約 | FINAL |
+| [0008](0008-rollup-and-retention.md) | ロールアップ・保持期間・日次CSVの規約 | FINAL |
+| [0009](0009-read-api.md) | 読み取り API の契約 | FINAL |
+| [0010](0010-csv-replay.md) | CSV 再生の規約 | FINAL |
+| [0011](0011-dashboard.md) | 開発用ダッシュボードの方針 | FINAL |
 | [0012](0012-rule-engine.md) | ルールエンジンの規約 | FINAL |
-| [0013](0013-notifications.md) | 通知の規約 | Proposed |
-| [0014](0014-llm-provider.md) | LLM Provider の規約 | Proposed |
-| [0015](0015-llm-tools.md) | 読み取り専用ツールの規約 | Proposed |
-| [0016](0016-evidence-alerts.md) | アラート説明の Evidence 形式 | Proposed |
-| [0017](0017-daily-report.md) | 日次レポートの規約 | Proposed |
-| [0018](0018-tool-exposure.md) | AI 向けツールの公開方法 | Proposed |
-| [0019](0019-claude-escalation.md) | Claude へのエスカレーション | Proposed |
-| [0020](0020-decision-memory.md) | 運用メモリへの記録 | Proposed |
-| [0021](0021-public-repo-hygiene.md) | public リポジトリの衛生 | Proposed |
-| [0022](0022-firmware-v1.md) | 本番ファームウェア v1 | Proposed |
-| [0023](0023-serial-source.md) | シリアル取り込み | Proposed |
-| [0024](0024-calibration.md) | 較正の手順と記録 | Proposed |
-| [0025](0025-probe-identity.md) | プローブの同定 | Proposed |
+| [0013](0013-notifications.md) | 通知の規約 | FINAL |
+| [0014](0014-llm-provider.md) | LLM Provider の規約 | FINAL |
+| [0015](0015-llm-tools.md) | 読み取り専用ツールの規約 | FINAL |
+| [0016](0016-evidence-alerts.md) | アラート説明の Evidence 形式 | FINAL |
+| [0017](0017-daily-report.md) | 日次レポートの規約 | FINAL |
+| [0018](0018-tool-exposure.md) | AI 向けツールの公開方法 | FINAL |
+| [0019](0019-claude-escalation.md) | Claude へのエスカレーション | FINAL |
+| [0020](0020-decision-memory.md) | 運用メモリへの記録 | FINAL |
+| [0021](0021-public-repo-hygiene.md) | public リポジトリの衛生 | FINAL |
+| [0022](0022-firmware-v1.md) | 本番ファームウェア v1 | FINAL |
+| [0023](0023-serial-source.md) | シリアル取り込み | FINAL |
+| [0024](0024-calibration.md) | 較正の手順と記録 | FINAL |
+| [0025](0025-probe-identity.md) | プローブの同定 | FINAL |
 | [0026](0026-three-zone-fan-control.md) | Front / Rear / Top を独立Fan zoneとして制御する | FINAL |
 | [0027](0027-fan-control-architecture.md) | Fan 制御アーキテクチャ（Supervisor + Learned MPC + Reactive Guard + Critical Safety） | FINAL |
 | [0028](0028-fan-control-contracts.md) | Fan 制御の層間契約（入出力・優先順位・状態遷移・周期・故障時の扱い・設定・承認点） | FINAL |
