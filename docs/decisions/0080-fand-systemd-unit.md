@@ -131,8 +131,16 @@ unit の書き方次第で、決めた安全の性質が**黙って崩れる**�
      `-shm` だけ `0640` で残ると、fand は WAL の索引を開けずに同じ失敗になる。setgid はこれから作る
      ファイルの gid にしか効かないので、既存のファイルの gid も明示して揃える
   4. 確かめる: 上のファイルとディレクトリの所有者・グループ・mode を `stat` で一覧し、fand のユーザーで
-     書き込み権があること（`sudo -u <fand のユーザー> test -w`）をディレクトリと各ファイルについて見る。
-     1つでも違えば fand を起動しない
+     書き込み権があることをディレクトリと各ファイルについて見る。1つでも違えば fand を起動しない。
+     **確かめは unit と同じ主グループ・補助グループで行う。** fand が `coldaisle` グループを得るのは unit の
+     `SupplementaryGroups=` からで、アカウントの所属からではない（§2.1。`coldaisle` には入れない）。
+     `sudo -u <fand のユーザー> test -w` はアカウントのグループ一覧で別のプロセスを起こすので、
+     unit だけが持つ `coldaisle` が欠け、実際の fand は書けるのに確かめだけが落ちる。そこで unit と同じ
+     `User=` / `Group=` / `SupplementaryGroups=` を渡した一時的な unit で確かめる:
+     `sudo systemd-run --pipe --wait --quiet -p User=coldaisle-fan -p Group=coldaisle-fan -p "SupplementaryGroups=coldaisle coldaisle-admin" test -w <対象>`
+     （名前は §2.1 の仮の値。`systemd-run` は終了コードを返すので、0 以外なら起動しない）。
+     アカウントを `coldaisle` グループに入れて `sudo -u` で済ませる方法は採らない（所属を増やすと unit の外でも
+     DB を書けてしまう。変えるなら本記録を改める）
   5. 既存の unit とタイマーを戻し、取り込みが DB を書き続けていること（`-wal` / `-shm` が作り直されても
      グループ `coldaisle`・`0660` であること）をもう一度 `stat` で見てから、fand を起動する（`enable` は段階 5）
 
@@ -171,7 +179,7 @@ unit の書き方次第で、決めた安全の性質が**黙って崩れる**�
 |---|---|---|
 | `Type=` | `notify` | 0060 §2.7。`READY=1` は fand が送る |
 | `NotifyAccess=` | **`main` を明示** | 将来の worker や子プロセスが `WATCHDOG=1` を送れないようにする。main loop の hang を子が隠さない |
-| `ExecStart=` | `coldaisle-fand --require-watchdog --config-dir <root 所有の制御設定> --admin-config <root 所有の管理設定> --db /var/lib/coldaisle/coldaisle.db --authority-root /var/lib/coldaisle-fand/authority` | `--require-watchdog` で「deadman が無いなら制御を取らない」（0060 §2.7）。**制御の4ファイルは root 所有**にし、fand 自身が `safety.yaml` を緩められないようにする |
+| `ExecStart=` | `/opt/coldaisle/.venv/bin/coldaisle-fand --require-watchdog --config-dir <root 所有の制御設定> --admin-config <root 所有の管理設定> --db /var/lib/coldaisle/coldaisle.db --authority-root /var/lib/coldaisle-fand/authority` | `--require-watchdog` で「deadman が無いなら制御を取らない」（0060 §2.7）。**制御の4ファイルは root 所有**にし、fand 自身が `safety.yaml` を緩められないようにする。実行ファイルは**導入先の venv の絶対パス**で書く。`uv sync` は `/opt/coldaisle/.venv/bin` に入口を置くだけで、systemd の実行ファイルの探索パスには入らず、`WorkingDirectory=` も探索には効かない（素の `coldaisle-fand` は `systemd-analyze verify` で `is not executable` になり、fand が `READY=1` に届かず deadman も tach 監視も動かない）。既存の daemon / rollup / report と同じ形 |
 | `WorkingDirectory=` | `/opt/coldaisle`（0069 と同じ。root 所有） | — |
 | `User=` / `Group=` / `SupplementaryGroups=` / `UMask=` | `coldaisle-fan` / `coldaisle-fan` / `coldaisle coldaisle-admin` / `0007` | §2.1 |
 | `KillMode=` | `control-group`（既定。**明示する**） | `ExecStopPost` の前に cgroup の全プロセスを止め、書き手を1つにする（0028 §2.7） |
@@ -386,7 +394,7 @@ fand のテンプレートを先に置いてよい。
 | 段階 | 担当 Issue（1段階ずつ別の PR） | 内容 | 前提 |
 |---|---|---|---|
 | 0 | #74 | `local_socket.Authorizer.allows()` が `allow_same_user: false` のとき `uid == server_uid` をグループの判定より前に拒否する（§2.1）。試験は「サーバと同じ uid がグループのメンバーでも拒否」「`allow_same_user: true` なら許可」「別の uid のメンバーは許可」の3通り。管理ソケット（`control_admin`）と eventd の両方の既存試験が通ること | 本記録の承認（所有者の判断 13 が (a) のとき） |
-| 1 | #57 | `deploy/systemd/coldaisle-fand.service` と `deploy/udev/` の hwmon テンプレート（仮の値）。`tests/test_deploy_templates.py` の `test_fand_is_not_templated_here` を、§2.2〜§2.9 を確かめる静的試験に置き換える（`Type=notify`・`NotifyAccess=main`・`--require-watchdog`・`KillMode=control-group`・`StartLimitIntervalSec=0`・`RestartPreventExitStatus` が `{3, 4}` ちょうど・`ExecStopPost` が `+` と `-I -S` で引数なし・`ProtectKernelTunables` が `yes` でない・`StateDirectory=coldaisle` が無い・`RuntimeDirectory=coldaisle` が fand にだけある・取り込みへの強い依存が無い・`User` が `coldaisle` でも root でもない・`SupplementaryGroups` に `coldaisle` と `control-admin.yaml` の `socket.group` が含まれる・時間切れ3つが明示されている・udev のテンプレートが `RUN+=` の chgrp / chmod で `GROUP=` / `MODE=` に頼らない）。**既存の daemon / api / rollup / report の unit を §2.1 に合わせて変える**（`StateDirectoryMode=2770`・`UMask=0007`。全 unit でそろっていることも試験する）。`docs/ubuntu-deploy.md` に導入手順（管理ソケットの `socket.path` を `/run/coldaisle/` の下にすることを含む）を足すが、**`enable` はしない**と書く。同じ PR で `docs/ubuntu-deploy.md` に**既存の導入先の移行**（§2.1。DB と `-wal` / `-shm` / `-journal` のグループと mode を揃えて `stat` と `test -w` で確かめる。fand の起動より前）を足し、既存の移行手順の `install ... -m 0640` を `0660` に直す | 本記録の承認・段階 0（fand を `coldaisle-admin` に入れるため）。`--authority-root` は PR #192 のマージ後に使える |
+| 1 | #57 | `deploy/systemd/coldaisle-fand.service` と `deploy/udev/` の hwmon テンプレート（仮の値）。`tests/test_deploy_templates.py` の `test_fand_is_not_templated_here` を、§2.2〜§2.9 を確かめる静的試験に置き換える（`Type=notify`・`NotifyAccess=main`・`ExecStart` の実行ファイルが `/opt/coldaisle/.venv/bin/coldaisle-fand` ちょうどで、`coldaisle-fand` が `pyproject.toml` の入口にある（既存の `test_exec_start_points_at_a_real_entry_point` に fand を足す）・`--require-watchdog`・`KillMode=control-group`・`StartLimitIntervalSec=0`・`RestartPreventExitStatus` が `{3, 4}` ちょうど・`ExecStopPost` が `+` と `-I -S` で引数なし・`ProtectKernelTunables` が `yes` でない・`StateDirectory=coldaisle` が無い・`RuntimeDirectory=coldaisle` が fand にだけある・取り込みへの強い依存が無い・`User` が `coldaisle` でも root でもない・`SupplementaryGroups` に `coldaisle` と `control-admin.yaml` の `socket.group` が含まれる・時間切れ3つが明示されている・udev のテンプレートが `RUN+=` の chgrp / chmod で `GROUP=` / `MODE=` に頼らない）。CI に `systemd-analyze` は無いので（`tests/test_deploy_templates.py` の冒頭）、導入先では fand の unit を置いた後・起動する前に `systemd-analyze verify` を人が走らせ、`ExecStart` の実行ファイルが実行できること（`is not executable` が出ないこと）を確かめる手順を `docs/ubuntu-deploy.md` に書く。**既存の daemon / api / rollup / report の unit を §2.1 に合わせて変える**（`StateDirectoryMode=2770`・`UMask=0007`。全 unit でそろっていることも試験する）。`docs/ubuntu-deploy.md` に導入手順（管理ソケットの `socket.path` を `/run/coldaisle/` の下にすることを含む）を足すが、**`enable` はしない**と書く。同じ PR で `docs/ubuntu-deploy.md` に**既存の導入先の移行**（§2.1。DB と `-wal` / `-shm` / `-journal` のグループと mode を揃えて `stat` と、unit と同じグループを渡した `systemd-run ... test -w` で確かめる。fand の起動より前）を足し、既存の移行手順の `install ... -m 0640` を `0660` に直す | 本記録の承認・段階 0（fand を `coldaisle-admin` に入れるため）。`--authority-root` は PR #192 のマージ後に使える |
 | 2 | #74 | `create_watchdog` に §2.3 の「環境側が長ければ終了コード 4」を足す（`environ` を渡す既存の試験の形で、等しい・短い・長いの3通り）。通知の I/O の失敗（socket の作成・`READY=1` の送信）を別の例外にして終了コード 6 で終える（§2.4。4 のままでない試験）。`safety.yaml` v4 に `hardware_write_fail_exit_ms`（§2.6）を足し、不変条件の下限・上限を読み込みで検証し、書き込みの失敗が続いたら記録を消さずに終了コード 7 で終える（simulated backend に失敗を注入。途中で1回成功すれば数え直す試験を含む）。fand の起動時に `faulthandler` を有効にする。§2.1「起動時の書き込み確認」（`db_not_writable` で終了コード 5。`SQLITE_BUSY` と区別する。権限の試験は root では skip） | 段階 1 と独立。`control_daemon.py` を触るので PR #192 のマージ後 |
 | 3 | #78 | 実行部を `python -I -S <ファイル>` で起動できることの試験（subprocess。記録の無い環境で何も書かずに 0 で終わる）。標準ライブラリだけを import する試験は既にある | 段階 1 |
 | 4 | #77 | 実機 backend の記録の書き手（§2.7 の 1〜6）と正常停止の返却（§2.8）。偽の sysfs（`tmp_path`）で、書いた記録を `emergency_handoff` が読んで Max にできること・既存記録の値の引き継ぎ・返却の成功で記録が消え失敗で残ること・記録を書けなければ `pwmN_enable` に触らないことを確かめる | #75 の profile、段階 1〜3 |
@@ -426,7 +434,7 @@ fand のテンプレートを先に置いてよい。
 | 書き込みの失敗が続くと、fand が再起動と `ExecStopPost` の Max を繰り返す（終了コード 7） | 書くのは Max だけで安全側に重なる。繰り返しの通知は §5 の 5。期間の下限（§2.6）で、一時的な失敗1回では再起動しない |
 | Safety の設定値が1つ増え、`safety.yaml` の schema が v4 になる | 値は既存の `watchdog_timeout_ms` に揃えた暫定値で、上限・下限を既存の値との不変条件で縛る。承認までは `provisional` として一覧に出る |
 | 既存の unit の `StateDirectoryMode` を 0750 から 2770 へ広げ、`UMask=0007` を足す（§2.1） | 広がるのは `coldaisle` グループの書き込みだけで、other は変わらない。全 unit でそろっていることを試験する |
-| 既存の導入先では、fand を起動する前に DB と `-wal` / `-shm` の権限を人が移行する必要がある（§2.1） | 手順を `docs/ubuntu-deploy.md` に置き、`stat` と `test -w` で確かめてから起動する。忘れても fand は制御を取らずに `db_not_writable` で原因を報告する（BIOS の制御のまま） |
+| 既存の導入先では、fand を起動する前に DB と `-wal` / `-shm` の権限を人が移行する必要がある（§2.1） | 手順を `docs/ubuntu-deploy.md` に置き、`stat` と、unit と同じグループを渡した `systemd-run ... test -w` で確かめてから起動する。忘れても fand は制御を取らずに `db_not_writable` で原因を報告する（BIOS の制御のまま） |
 | **API / AI のユーザー（`coldaisle`）は、fand が制御入力として読む Telemetry の DB を書ける。** `authority.json` は別のディレクトリで守る（§2.1）が、同じ論理で制御入力は守っていない | 0069 の既存の構成から来る残るリスクとして明記する。制御入力の改ざんへの対策は本記録の範囲外（§5 の 14） |
 
 ---
