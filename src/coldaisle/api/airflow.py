@@ -64,7 +64,10 @@ class ControlTraceFreshness(BaseModel):
     1 以下を拒む。1 以下だと、周期どおりに記録していても tick の直前には毎回「古い」になる。
     """
     provisional: bool
-    """仮の値か（0071 §5 #1 は値を実装 PR に委ねた）。"""
+    """仮の値か（0071 §5 #1 は値を実装 PR に委ねた）。
+
+    出荷時の 3.0 は 2026-09-30 にオーナーが確定した（`false`）。
+    """
 
 
 class AirflowUiSettings(BaseModel):
