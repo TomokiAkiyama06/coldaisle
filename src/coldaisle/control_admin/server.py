@@ -153,6 +153,10 @@ class ControlAdminServer:
             target=self._run, name="control-admin-receiver", daemon=True
         )
         self._stop = False
+        # close() と受付スレッドの終わりのどちらが後かで、selector に載る fd を閉じる側を決める
+        self._close_lock = threading.Lock()
+        self._receiver_exited = False
+        self._close_deferred = False
         self._next_command_id = 0
         self._connections: set[_Connection] = set()
         self._auditing: dict[int, tuple[_Connection, AdminModeCommand]] = {}
@@ -243,12 +247,19 @@ class ControlAdminServer:
             self._thread.join(timeout=timeout_s)
 
     def close(self) -> None:
-        """待ち受けを閉じ、**自分が作ったソケットだけ**を消す。"""
-        for conn in list(self._connections):
-            self._drop(conn)
-        if self._listener is not None:
-            self._listener.close()
-            self._listener = None
+        """待ち受けを閉じ、**自分が作ったソケットだけ**を消す。**待たない。**
+
+        受付スレッドがまだ生きていれば（`drain=False` の停止や、時間内に止まらなかったとき）、
+        待ち受けと接続の fd は閉じずに受付スレッドの終わりへ任せる。selector に載ったままの fd を
+        別のスレッドから閉じると、受付スレッドの selector から黙って消え、接続の集合も2つの
+        スレッドから同時に触ることになる。ソケットのファイルとロックはここで片付ける
+        （次の起動の検査に当たらないように。待ち受けの fd が残っていても新しい bind は妨げない）。
+        """
+        with self._close_lock:
+            if self._thread.is_alive() and not self._receiver_exited:
+                self._close_deferred = True
+            else:
+                self._release_descriptors()
         unlink_if_same(self._path, self._bound)
         self._bound = None
         if self._lock_fd is not None:
@@ -271,6 +282,21 @@ class ControlAdminServer:
             if self._selector is not None:
                 self._selector.close()
                 self._selector = None
+            with self._close_lock:
+                self._receiver_exited = True
+                if self._close_deferred:
+                    self._release_descriptors()
+            self._mailbox.receiver_exited()
+
+    def _release_descriptors(self) -> None:
+        """接続と待ち受けの fd を閉じる。受付スレッドが動いていないときだけ呼ぶ。"""
+        for conn in list(self._connections):
+            self._drop(conn)
+        listener = self._listener
+        self._listener = None
+        if listener is not None:
+            with contextlib.suppress(OSError):
+                listener.close()
 
     def _serve(self) -> None:
         listener = self._listener

@@ -78,6 +78,10 @@ class AdminMailbox:
         self._wake_reader, self._wake_writer = socket.socketpair()
         self._wake_reader.setblocking(False)
         self._wake_writer.setblocking(False)
+        # 起こされる側の端を閉じる時機（close() と受付スレッドの終わりのどちらが後か）を決める
+        self._wake_close_lock = threading.Lock()
+        self._closed = False
+        self._receiver_exited = False
 
     # ---------------------------------------------------------------- 受付スレッドの側
 
@@ -146,9 +150,28 @@ class AdminMailbox:
             pass
 
     def close(self) -> None:
-        """起こすための socket を閉じる。"""
-        self._wake_reader.close()
-        self._wake_writer.close()
+        """起こすための socket を閉じる。**待たない。**
+
+        受付スレッドがまだ生きていれば、起こされる側の端は閉じずに受付スレッドの終わり
+        （`receiver_exited`）へ任せる。selector に載ったままの fd を別のスレッドから閉じると
+        epoll からその fd が消え、停止を知らせるために書いた起こしも一緒に消える。そのあと
+        select に入った受付スレッドは何にも起こされずに待ち続ける（`drain=False` の停止で
+        受付スレッドが残った。PR #192 のレビュー 10）。書く側の端はここで閉じる
+        （起こされる側が EOF で読める状態になるので、起こしを重ねる働きもある）。
+        """
+        with self._wake_close_lock:
+            self._closed = True
+            self._wake_writer.close()
+            receiver = self._receiver
+            if receiver is None or self._receiver_exited or not receiver.is_alive():
+                self._wake_reader.close()
+
+    def receiver_exited(self) -> None:
+        """受付スレッドが selector を閉じた後に呼ぶ。`close` が済んでいれば残りの端を閉じる。"""
+        with self._wake_close_lock:
+            self._receiver_exited = True
+            if self._closed:
+                self._wake_reader.close()
 
     # ---------------------------------------------------------------- loop の側（待たない）
 
