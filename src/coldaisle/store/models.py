@@ -13,8 +13,9 @@ from __future__ import annotations
 import json
 import re
 from enum import StrEnum
+from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 METRIC_PATTERN = re.compile(r"^[a-z][a-z0-9_]*(\.([a-z][a-z0-9_]*|[0-9]+)){1,3}$")
 """決定記録 0002 §2.1 の文法。`gpu.0.core` のような添字セグメントを許す。"""
@@ -348,3 +349,51 @@ class EventRecord(BaseModel):
         if not isinstance(decoded, dict):
             raise ValueError("event payload はJSON objectでなければならない")
         return value
+
+
+AdminAuditEvent = Literal["accepted", "applied", "superseded", "lease_expired"]
+"""管理ソケットの指令の事象（決定記録 0072 §2.7）。"""
+
+
+class ControlAdminAuditRecord(BaseModel):
+    """管理ソケットの指令の経過の1行（#74 / 決定記録 0072 §2.7）。**追記のみ。**
+
+    行を書き換えずに事象の行を足す。受付（``accepted``）だけが接続の uid・op・本文を持ち、
+    結末（``applied`` / ``superseded``）と lease 切れ（``lease_expired``）は同じ
+    ``(run_id, command_id)`` に1行ずつ足す。表の CHECK と同じ条件をここでも確かめる。
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    id: int | None = None
+    run_id: str = Field(pattern=r"^[0-9a-f]{32}$")
+    command_id: int = Field(ge=1)
+    event: AdminAuditEvent
+    ts_ms: int = Field(ge=0)
+    peer_uid: int | None = None
+    op: str | None = Field(default=None, pattern=r"^[a-z][a-z_]*$")
+    body_json: str | None = None
+    tick_id: int | None = Field(default=None, ge=0)
+    superseded_by: int | None = Field(default=None, ge=1)
+
+    @model_validator(mode="after")
+    def _fields_match_the_event(self) -> ControlAdminAuditRecord:
+        accepted = self.event == "accepted"
+        if accepted != (
+            self.peer_uid is not None and self.op is not None and self.body_json is not None
+        ) or (not accepted and (self.peer_uid, self.op, self.body_json) != (None, None, None)):
+            raise ValueError("peer_uid・op・本文を持つのは accepted の行だけ")
+        if (self.event in {"applied", "lease_expired"}) != (self.tick_id is not None):
+            raise ValueError("tick_id を持つのは applied / lease_expired の行だけ")
+        if (self.event == "superseded") != (self.superseded_by is not None):
+            raise ValueError("superseded_by を持つのは superseded の行だけ")
+        if self.superseded_by is not None and self.superseded_by <= self.command_id:
+            raise ValueError("置き換えるのは後から受け付けた指令だけ")
+        if self.body_json is not None:
+            try:
+                decoded = json.loads(self.body_json)
+            except json.JSONDecodeError as exc:
+                raise ValueError("本文は JSON object にする") from exc
+            if not isinstance(decoded, dict):
+                raise ValueError("本文は JSON object にする")
+        return self

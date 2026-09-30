@@ -80,6 +80,7 @@ from coldaisle.store.models import ControlTraceRecord, Quality
 from test_control_schema import (
     AIR_BALANCE_RECORD,
     CONTROL_TICK_RUNTIME,
+    MODE_COMMAND_RECORD,
     REGISTRY_PROVENANCE,
     SAFETY_PROVENANCE,
 )
@@ -259,6 +260,7 @@ def tick_with(
         safety_provenance=SAFETY_PROVENANCE,
         registry=REGISTRY_PROVENANCE,
         air_balance=AIR_BALANCE_RECORD,
+        mode_command=MODE_COMMAND_RECORD,
     )
 
 
@@ -555,6 +557,7 @@ def test_invariant_1_g_a_shadow_record_is_refused_in_modes_people_drive() -> Non
             safety_provenance=SAFETY_PROVENANCE,
             registry=REGISTRY_PROVENANCE,
             air_balance=AIR_BALANCE_RECORD,
+            mode_command=MODE_COMMAND_RECORD,
         )
     # 記録器自身も、その mode では何も作らない。
     assert (
@@ -1428,6 +1431,7 @@ def solved_shadow_tick(*, applied: float, ts_ms: int = SCORED_ACTION_TS_MS) -> C
         safety_provenance=SAFETY_PROVENANCE,
         registry=REGISTRY_PROVENANCE,
         air_balance=AIR_BALANCE_RECORD,
+        mode_command=MODE_COMMAND_RECORD,
     )
 
 
@@ -1448,6 +1452,7 @@ def follow_up_tick(*, tick_id: int, ts_ms: int, applied: float) -> ControlTick:
         safety_provenance=SAFETY_PROVENANCE,
         registry=REGISTRY_PROVENANCE,
         air_balance=AIR_BALANCE_RECORD,
+        mode_command=MODE_COMMAND_RECORD,
     )
 
 
@@ -1895,6 +1900,7 @@ def test_the_counterfactual_artifact_comes_from_the_gate_not_the_assessment() ->
         safety_provenance=SAFETY_PROVENANCE,
         registry=REGISTRY_PROVENANCE,
         air_balance=AIR_BALANCE_RECORD,
+        mode_command=MODE_COMMAND_RECORD,
     )
     assert tick.model_gate is not None
     assert tick.model_gate.artifact_sha256 == item.artifact_sha256

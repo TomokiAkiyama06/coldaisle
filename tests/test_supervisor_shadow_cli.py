@@ -32,6 +32,7 @@ from coldaisle.control.schema import (
     ControlConfigDigest,
     ControlTick,
     ControlTickRuntime,
+    ModeCommandRecord,
     SupervisorDecision,
     SupervisorPolicyEvaluation,
     SupervisorPolicyIdentity,
@@ -258,6 +259,7 @@ class Fixture:
                 model_id=self.control.air_balance.model_id,
                 config_sha256=self.control.sources.air_balance.sha256,
             ),
+            mode_command=ModeCommandRecord.without_entry(),
         )
 
 

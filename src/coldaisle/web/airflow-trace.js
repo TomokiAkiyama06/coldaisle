@@ -21,8 +21,9 @@
 (function (root) {
   // 版ごとに**初めて現れた**欄（control/schema.py の SCHEMA_VERSION の説明）。
   // **schema.py にある版だけを知っている版にする。** 版の番号は先にマージされた PR で決まる
-  // （0064 §2.9 / 0071 §2.5）ため、推測で先取りしない。v12 以降は「未対応の版」。
+  // （0064 §2.9 / 0071 §2.5）ため、推測で先取りしない。v13 以降は「未対応の版」。
   // v11（#81 / 決定記録 0073 §2.5）: `air_balance` と `zones.*.applied_demand`。
+  // v12（#74 / 決定記録 0072 §2.7）: `mode_command`（モードの出どころ・lease 切れ・受付の停止）。
   const SINCE = {
     workload_regime: 2,
     supervisor: 3,
@@ -33,8 +34,9 @@
     registry: 10,
     air_balance: 11,
     applied_demand: 11,
+    mode_command: 12,
   };
-  const KNOWN_VERSIONS = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11];
+  const KNOWN_VERSIONS = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12];
 
   const NOT_IN_VERSION = "この版の記録には無い";
   const ZONE_KEYS = ["front", "rear", "top"];
@@ -292,6 +294,23 @@
     };
   }
 
+  // モードの出どころ（v12。決定記録 0072 §2.2 / §2.7）。**受付の停止による最大は通常状態に見せない。**
+  function modeSourceChip(version, body) {
+    const key = "モードの出どころ";
+    if (!has(version, "mode_command")) return { k: key, v: NOT_IN_VERSION, tone: "absent" };
+    const record = body.mode_command;
+    if (!isObject(record)) return { k: key, v: UNKNOWN_VALUE, tone: "warn" };
+    if (record.admin_receiver_dead === true) {
+      return { k: key, v: "管理ソケットの受付が止まったため最大に固定（再起動まで）", tone: "bad" };
+    }
+    if (typeof record.manual_lease_expired_command_id === "number") {
+      return { k: key, v: `手動の期限切れで自動へ戻した（指令 #${record.manual_lease_expired_command_id}）`, tone: "warn" };
+    }
+    if (record.entry === "none") return { k: key, v: "管理ソケットなし（自動のまま）", tone: "warn" };
+    if (typeof record.command_id === "number") return { k: key, v: `管理ソケットの指令 #${record.command_id}` };
+    return { k: key, v: "指令なし（自動）" };
+  }
+
   function number(value) {
     return typeof value === "number" && Number.isFinite(value) ? value : null;
   }
@@ -515,6 +534,7 @@
         ? { k: "故障", v: faults.map(faultText).join(" ・ "), tone: "bad" }
         : { k: "故障", v: "なし", tone: "ok" },
       safetyProvenanceChip(version, body),
+      modeSourceChip(version, body),
     ];
     return {
       ...base,

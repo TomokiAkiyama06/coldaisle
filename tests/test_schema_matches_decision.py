@@ -96,6 +96,12 @@ def test_migration_creates_exactly_the_decided_objects():
         ("trigger", "control_trace_prune_no_delete"),
         ("trigger", "control_traces_require_seq"),
         ("index", "ix_control_traces_ts_seq"),
+        ("table", "control_admin_audit"),
+        ("index", "ux_control_admin_audit_accepted"),
+        ("index", "ux_control_admin_audit_outcome"),
+        ("index", "ux_control_admin_audit_lease"),
+        ("trigger", "control_admin_audit_no_update"),
+        ("trigger", "control_admin_audit_no_delete"),
     }
 
 

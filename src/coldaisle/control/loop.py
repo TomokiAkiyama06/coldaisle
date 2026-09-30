@@ -45,6 +45,8 @@ from coldaisle.control.fallback.gate import (
 from coldaisle.control.hardware.simulated import FanHardwareBackend, FanHardwareResult
 from coldaisle.control.logging import ControlTraceLogger
 from coldaisle.control.mpc.controller import MpcProposal
+from coldaisle.control.operating_mode import AdminModeTracker
+from coldaisle.control.operating_mode import ModeCommand as ModeCommand  # 既存の import 先を保つ
 from coldaisle.control.reactive.guard import (
     ReactiveGuard,
     ReactiveGuardDecision,
@@ -78,6 +80,7 @@ from coldaisle.control.schema import (
     Fault,
     FaultCode,
     GuardZoneOutput,
+    ModeCommandRecord,
     OperatingMode,
     PerZone,
     Reason,
@@ -157,29 +160,11 @@ class TelemetrySource(Protocol):
         ...
 
 
-class ModeCommand(_Frozen):
-    """人が決めた運転モードと、人が決めた requested（0028 §2.5 (a)）。
-
-    `MANUAL` / `CALIBRATION` では人が requested を決めるので、その値をここで運ぶ。
-    `MAX` は **requested では表さない**（Critical Safety の `forced_max` が所有する）。
-    """
-
-    mode: OperatingMode = OperatingMode.AUTO
-    requested: PerZone[ZoneRequest] | None = None
-
-    @model_validator(mode="after")
-    def _people_set_demands_only_where_they_own_them(self) -> Self:
-        owns_requested = self.mode in {OperatingMode.MANUAL, OperatingMode.CALIBRATION}
-        if owns_requested != (self.requested is not None):
-            raise ValueError("requested を持てるのは MANUAL / CALIBRATION だけ（0028 §2.5 (a)）")
-        return self
-
-
 class OperatingModeSource(Protocol):
     """運転モードの読み取り専用の窓口。**LLM からは到達できない**（AGENTS.md ルール1）。"""
 
     def current(self) -> ModeCommand:
-        """いまのモード。入口（ローカル Unix ソケット）の配線は #60（0028 未決 3）。
+        """いまのモード。管理ソケットの入口は `AdminModeTracker`（決定記録 0072）が別に持つ。
 
         **待たない。** この呼び出しは Critical Safety より前にあるので、ここで待つと
         安全側の裁定ごと止まる。手元に無ければ直前の値を返し、失敗は例外で返す。
@@ -547,6 +532,7 @@ class ControlLoop:
         monotonic: MonotonicClock,
         registry: RegistryProvenance,
         mode_source: OperatingModeSource | None = None,
+        admin_mode: AdminModeTracker | None = None,
         supervisor: SupervisorCoordinator | None = None,
         regime: WorkloadRegimeEstimator | None = None,
         learned_source: LearnedProposalSource | None = None,
@@ -560,6 +546,9 @@ class ControlLoop:
             raise ValueError("Supervisor と Workload Regime 推定は一緒に配線する")
         if rl_supervisor_source is not None and supervisor is None:
             raise ValueError("RL Supervisor worker を配線するなら Supervisor も配線する")
+        if mode_source is not None and admin_mode is not None:
+            # モードの出どころを1つにする。2つあると、どちらが人の最新の意図か決まらない
+            raise ValueError("mode_source と admin_mode は同時に配線しない")
         self._config = config
         self._estimator = estimator
         self._fallback = fallback
@@ -574,6 +563,8 @@ class ControlLoop:
         self._mode_source: OperatingModeSource = (
             mode_source if mode_source is not None else StaticOperatingMode()
         )
+        # **管理ソケットの受け渡し口**（決定記録 0072 §2.2）。None は入口を開いていない構成。
+        self._admin_mode = admin_mode
         self._supervisor = supervisor
         self._regime = regime
         self._learned_source = learned_source
@@ -656,6 +647,9 @@ class ControlLoop:
         self._tick_id += 1
         started_mono_ms = self._monotonic.monotonic_ms()
         ts_ms = self._clock.now_ms()
+        # **tick の先頭でモードを決める**（決定記録 0072 §2.2 / 0060 §2.5）。受付スレッドの
+        # 生存の確認は受け渡し口を覗く前に行い、tick の途中ではモードを変えない。
+        mode, mode_record = self._resolve_mode(tick_id, started_mono_ms)
 
         snapshot, snapshot_status = self._snapshot(tick_id, ts_ms, started_mono_ms)
         self._snapshots.append(
@@ -666,7 +660,6 @@ class ControlLoop:
                 monotonic_ms=snapshot.monotonic_ms,
             )
         )
-        mode = self._mode_command()
         supervisor_decision, regime_estimate = self._run_supervisor(
             snapshot, now_mono_ms=snapshot.monotonic_ms
         )
@@ -735,6 +728,9 @@ class ControlLoop:
             supervisor_decision=supervisor_decision,
             regime_estimate=regime_estimate,
         )
+        if self._admin_mode is not None:
+            # `status` のための写しを置くだけ（待たない）。heartbeat の後に置く。
+            self._admin_mode.publish(tick_id=tick_id, authority_stage=state.authority_stage)
         flows, air_balance = self._air_balance_record(
             snapshot, hardware=hardware, faults=safety_decision.faults
         )
@@ -777,6 +773,8 @@ class ControlLoop:
             # **Air Balance の推定を毎 tick 残す**（v11。#81 / 決定記録 0073 §2.5 (b)）。
             # 未校正で無効な起動も `disabled` の形で残す。
             air_balance=air_balance,
+            # **その tick のモードの出どころを残す**（v12。#74 / 決定記録 0072 §2.7）。
+            mode_command=mode_record,
         )
         recorded, trace_failed = self._record(tick)
         self._log_guard_events(guard_decision)
@@ -848,6 +846,16 @@ class ControlLoop:
             )
         self._previous_snapshot = snapshot
         return snapshot, status
+
+    def _resolve_mode(
+        self, tick_id: int, now_mono_ms: int
+    ) -> tuple[ModeCommand, ModeCommandRecord]:
+        """この tick のモードと、その出どころの記録。"""
+        if self._admin_mode is not None:
+            resolution = self._admin_mode.resolve(tick_id=tick_id, now_mono_ms=now_mono_ms)
+            self._mode = resolution.command
+            return resolution.command, resolution.record
+        return self._mode_command(), ModeCommandRecord.without_entry()
 
     def _mode_command(self) -> ModeCommand:
         """人が決めたモード。読めなければ**直前のモードを保つ。**

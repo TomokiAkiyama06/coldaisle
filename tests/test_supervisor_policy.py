@@ -44,6 +44,7 @@ from coldaisle.control.supervisor import (
 from test_control_schema import (
     AIR_BALANCE_RECORD,
     CONTROL_TICK_RUNTIME,
+    MODE_COMMAND_RECORD,
     REGISTRY_PROVENANCE,
     SAFETY_PROVENANCE,
 )
@@ -625,6 +626,7 @@ def control_tick(decision: SupervisorDecision, current: SupervisorInput) -> Cont
         safety_provenance=SAFETY_PROVENANCE,
         registry=REGISTRY_PROVENANCE,
         air_balance=AIR_BALANCE_RECORD,
+        mode_command=MODE_COMMAND_RECORD,
     )
 
 
@@ -666,6 +668,7 @@ def test_decision_can_be_embedded_in_v3_control_trace_with_shadow_output() -> No
         safety_provenance=SAFETY_PROVENANCE,
         registry=REGISTRY_PROVENANCE,
         air_balance=AIR_BALANCE_RECORD,
+        mode_command=MODE_COMMAND_RECORD,
     )
 
     # v3 で Supervisor decision を追加した。以後の版（v4: #78 の fault code）でもそのまま載る。

@@ -66,6 +66,8 @@ coldaisle-safety-handoff = "coldaisle.safety_handoff:main"
 coldaisle-telemetry = "coldaisle.telemetry_daemon:main"
 # 3系統 Fan 制御デーモン。**hwmon へ書き込むのはこのプロセスの Backend だけ**（#74 / 0028 §2.2）
 coldaisle-fand = "coldaisle.control_daemon:main"
+# coldaisle-fand の管理ソケットへ運転モードを送るクライアント。**人が使う**（#74 / 決定記録 0072）
+coldaisle-control = "coldaisle.control_admin.client:main"
 # 書き込み専用のローカル Unix ソケット入口。読み取り API とは別（#67 / 決定記録 0045）
 coldaisle-eventd = "coldaisle.event_entry.server:main"
 # 上の入口へ1件送るクライアント（例: coldaisle-event gpu-mode compute）

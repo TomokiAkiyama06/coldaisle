@@ -73,6 +73,7 @@ from coldaisle.control.schema import (
     ControlTick,
     EffectiveZoneDemand,
     HardwareReadback,
+    ModeCommandRecord,
     ModelGateDecision,
     OperatingMode,
     OptimizerStatus,
@@ -177,8 +178,10 @@ def strip_v3_provenance(document: dict[str, Any]) -> None:
 
 
 def strip_v11_fields(document: dict[str, Any]) -> None:
-    """v11 で足した欄（`air_balance` と zone の `applied_demand`）を旧い版の形へ戻す。"""
+    """v11 以降で足した欄（`air_balance`・zone の `applied_demand`・v12 の `mode_command`）を
+    旧い版の形へ戻す。"""
     document.pop("air_balance", None)
+    document.pop("mode_command", None)
     for zone in ("front", "rear", "top"):
         document["zones"][zone].pop("applied_demand", None)
 
@@ -370,6 +373,7 @@ def tick_at(
             else REGISTRY_PROVENANCE
         ),
         air_balance=air_balance_for(flow),
+        mode_command=ModeCommandRecord.without_entry(),
     )
 
 
