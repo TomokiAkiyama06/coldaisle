@@ -124,6 +124,12 @@ requested = raw baseline の requested（zone ごとの値も reason もその�
 7. **捕まえる範囲**: 迂回の分岐を入れた後も、Critical Safety の評価と合成の例外が loop の外へ出ること
 8. **trace の不変条件**: §2.3 の各行の正負の試験（`mode: apply`・`failed` で `model_gate` が非 null、
    requested が `candidate` と違う、`air_balance_coordination_failed` が `failed` でない tick に付く、の各記録が拒まれること）
+9. **失敗が続く場合の解除と再試行（§2.6）**: 毎回 `coordinate()` が例外を投げる偽の model で、simulated clock を
+   `fault_clear_hold_ms` より長く進める。(a) 失敗した tick の次 tick から `EMERGENCY` になり、その間 `coordinate()` が
+   呼ばれない（spy で確かめる）こと、(b) `fault_clear_hold_ms` の後に `fallback_exception` が解除されて
+   `NORMAL`（ほかの fault が無いとき）に戻り、その tick で協調が再び呼ばれて失敗し、§2.1 のとおり迂回すること、
+   (c) その迂回した tick の effective が直前の Max から `ramp_down` の分しか下がらず、次 tick が再び `EMERGENCY` になること、
+   (d) この繰り返しのどの tick でも Learned MPC が選ばれないこと
 
 ### 2.5 実装の段階との関係
 
@@ -132,6 +138,32 @@ requested = raw baseline の requested（zone ごとの値も reason もその�
   呼び出し側へ返すだけでよい
 - 本記録の内容は段 3（PR（b）: loop への配線と `ControlTick` の新しい版）で実装する。**`ControlTick` の版を本記録のために
   別に上げない**（段 3 の版上げに含める）
+
+### 2.6 失敗が続く場合: Max は再起動まで続かず、解除と再試行を繰り返す
+
+本記録は fault の解除の規則を変えない。`fallback_exception` は 0028 §2.5 のとおり、`fault_clear_hold_ms` の間ずっと
+観測されなければ解除される（再起動まで解除しないのは `config_invalid` だけ。0028 §2.5 / §2.7）。
+協調は 0078 §2.3 の条件で Critical Safety が `NORMAL` か `DEGRADED` の tick だけ呼ばれ、`EMERGENCY` の間は呼ばれない。
+したがって `coordinate()` の不具合が続くとき（毎回失敗する入力・不具合が直らない場合）は、次を繰り返す。
+
+```text
+tick n      : 協調が failed → §2.1 の迂回（requested = raw baseline。effective は ramp_down で制限）
+tick n+1 〜 : fallback_exception → EMERGENCY（全 zone Max）。協調は呼ばれず、fault は新たに観測されない
+             … fault_clear_hold_ms の間
+解除の tick : fallback_exception が解除され NORMAL / DEGRADED に戻る → 協調を再び呼ぶ → 失敗 → tick n と同じ
+```
+
+- **Gate の失敗とはここが違う。** Gate は `EMERGENCY` の tick も毎 tick 呼ばれる（Safety の `EMERGENCY` を受けて
+  Fallback を選ぶ）ので、Gate の不具合が続けば `fallback_exception` が毎 tick 観測され、解除されず Max が続く。
+  協調の失敗は `EMERGENCY` の間に観測されないので、`fault_clear_hold_ms` ごとに1 tick だけ Max を離れる
+- **離れる tick の Fan は Max の近くに留まる。** その tick も合成を迂回しないので、effective は直前の Max から
+  `ramp_down_per_s × tick の経過時間` までしか下がらず、次 tick で再び Max になる。Learned MPC はその tick も選ばれない（§2.1）
+- **原因は trace で読める。** 繰り返しのたびに `air_balance_coordination` の `status: failed` の tick と
+  `fallback_exception`（detail `air_balance_coordination: …`）が1件ずつ記録される
+- 0078 §3 の「`apply` の協調の不具合1つで全 zone Max になり、再起動まで騒音が続く」「正しい設定で再起動するか
+  `mode: off` に戻して再起動するまで」は、この繰り返しを含めて読む（Max からほとんど下がらない状態が、
+  人が `mode: off` にして再起動するまで続く。厳密に連続した Max ではない）。0078 自体は書き換えない
+- 再起動まで解除しない fault（`config_invalid` と同じ扱い）にするかは本記録で決めない（§5）
 
 ## 3. Consequences
 
@@ -148,7 +180,8 @@ requested = raw baseline の requested（zone ごとの値も reason もその�
 | トレードオフ | 緩和策 |
 |---|---|
 | 迂回した tick は Gate の `fallback_transition_floor` が掛からず、直前に Learned MPC が高く回していた zone の requested が raw baseline まで下がりうる | effective の下げは Critical Safety の `ramp_down` が制限する（合成は迂回しない）。次 tick は `EMERGENCY` で全 zone Max になる。Gate の失敗の tick といまも同じ挙動である |
-| Gate の内部状態が1 tick 分更新されない | 次 tick は Safety が `EMERGENCY` で、再起動か `mode: off` までは Max が続く。Gate の失敗と同じ |
+| Gate の内部状態が1 tick 分更新されない | 次 tick は Safety が `EMERGENCY` で全 zone Max になり、Gate は Fallback を選ぶ。`fault_clear_hold_ms` の後に解除されて戻る tick の Gate は、Max の間に Fallback を選び続けた状態から再開する（§2.6） |
+| 不具合が続くと、Max が連続せず `fault_clear_hold_ms` ごとに1 tick だけ迂回の tick（requested = raw baseline）が入る（§2.6。Gate の失敗は解除されず Max が続くのと違う） | 迂回の tick も合成を通るので effective は `ramp_down` の分しか下がらず、次 tick で Max に戻る。Learned MPC はどの tick でも選ばれない。繰り返しは trace の `failed` と `fallback_exception` で見える。止めるのは人が `mode: off` にして再起動（0078 §2.8）。試験は §2.4 の 9 |
 | `ControlState.fallback_reason` の許す code が1つ増える | 段 3 の `ControlTick` の版上げに含め、別の版上げを作らない。offline 評価は code を数えるだけ |
 | 迂回した tick は 0053 の shadow の記録が無い | 協調の失敗は `fallback_exception` の fault で、その tick は比較の対象として意味が薄い。Gate の失敗の tick と同じ |
 
@@ -167,4 +200,5 @@ requested = raw baseline の requested（zone ごとの値も reason もその�
 | 論点 | どこで決めるか | 実測待ちか |
 |---|---|---|
 | `ControlTick` の版番号（段 3 の版上げに含める） | 段 3（PR（b））の実装の時点で次の空いた番号 | いいえ |
+| 協調の失敗の `fallback_exception` を再起動まで解除しない fault（`config_invalid` と同じ扱い）にするか（§2.6） | 所有者の判断。決めるなら 0028 §2.5 の解除の例外を足す新しい決定記録で | いいえ |
 | 協調の失敗を `airflow.html` に表示するか | 0078 §5 の「協調の状態を `airflow.html` に表示するか」と一緒に #106 の後続で | いいえ |
