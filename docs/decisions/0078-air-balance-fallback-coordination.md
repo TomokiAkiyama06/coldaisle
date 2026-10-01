@@ -4,7 +4,7 @@
 - **Status**: FINAL（2026-09-30、リポジトリ所有者が承認）
 - **Date**: 2026-09-30
 - **Supersedes**: なし
-- **Superseded by**: [0085](0085-coordination-failure-bypasses-gate.md)（§2.2 の流れ図と §2.6 のうち、`mode: apply` で協調が `failed` になった tick に raw baseline を Gate へ渡す点のみ。その tick は Gate を迂回して raw baseline を選ぶ。他の点は有効）
+- **Superseded by**: [0085](0085-coordination-failure-bypasses-gate.md)（§2.2 の流れ図と §2.6 のうち、`mode: apply` で協調が `failed` になった tick に raw baseline を Gate へ渡す点と、§2.7 の `output` の欄の定義「実際に Gate へ渡した値」のみ。その tick は Gate を迂回して raw baseline を選び、`output` は「協調の段が Baseline の値として出した値」と読み替える（迂回した tick は raw baseline ＝ `candidate`）。他の点は有効）
 - **関連**: [`0073-air-balance-control-config-integration.md`](0073-air-balance-control-config-integration.md) §2.2 / §2.3 / §2.6 / §5（1行目）、
   [`0033-air-balance-config-boundary.md`](0033-air-balance-config-boundary.md)、
   [`0026-three-zone-fan-control.md`](0026-three-zone-fan-control.md)、

@@ -5,7 +5,8 @@
 - **Date**: 2026-10-01
 - **Supersedes**: [0078](0078-air-balance-fallback-coordination.md) §2.2 の流れ図と §2.6 のうち、
   **`mode: apply` で協調が `failed` になった tick に、raw baseline を `ControllerGate.select()` の `fallback` として渡す
-  （その tick も Gate を通す）点のみ**。その tick は Gate を呼ばず、raw baseline をそのまま requested にする（§2.1）。
+  （その tick も Gate を通す）点と、§2.7 の trace の `output` の欄の定義（「実際に Gate へ渡した値」）のみ**。
+  その tick は Gate を呼ばず、raw baseline をそのまま requested にする（§2.1）。`output` は §2.3 で定義し直す。
   0078 の他の点（協調の位置・条件・上限・保持・`fallback_exception` への翻訳と次 tick の `EMERGENCY`・
   `mode: shadow` の失敗は記録だけ・`try` / `except` は `AirBalanceCoordinator.apply()` だけを囲む・trace の塊の形）は有効
 - **関連**: [0028](0028-fan-control-contracts.md) §2.5 (c) / §2.7 /
@@ -90,7 +91,28 @@ requested = raw baseline の requested（zone ごとの値も reason もその�
 | `fallback_transition_floor` | 掛からない | Gate の `_prevent_transition_drop()` を通らない。直前に Learned MPC が握っていた zone も、requested は raw baseline まで下がりうる（§3） |
 | authority の観測（`_observe_authority()`） | `selection` 無しとして観測（降格の推奨なし） | Gate の失敗と同じ。昇格の経路は無い（0057） |
 
-### 2.3 trace の検証（0078 §2.7 の不変条件に足す）
+### 2.3 trace の `output` の定義と検証（0078 §2.7 の欄の定義の一部を置き換え、不変条件に足す）
+
+**`output` の定義の置き換え。** 0078 §2.7 は `air_balance_coordination.output` を「実際に Gate へ渡した値」と定義したが、
+迂回した tick は Gate を呼ばないので、この定義では値が決まらない（`candidate` とも `null` とも読める）。本記録は欄の定義を次に置き換える。
+
+```text
+  output:     {front, rear, top} | null              # 協調の段が Baseline の値として出した値。Gate を通る tick は Gate へ渡した値と同じ。
+                                                     # mode: apply・status: failed で Gate を迂回した tick は、requested にした raw baseline（= candidate）
+```
+
+- **`null` にせず `candidate` にする。** 理由:
+  (1) 0078 §2.7 の既存の不変条件「`status: skipped` / `failed` は `output == candidate`」「すべての tick で `output >= candidate` かつ
+  `output - candidate <= max_raise`」をそのまま保てる。`null` にすると、`failed` の行を `mode` で分け、「すべて」の行にも例外を足すことになる、
+  (2) 値の意味が「その tick に Baseline として使った値」で一貫し、迂回した tick の requested（raw baseline）と一致する。下の1行目の検査
+  「requested = `candidate`（= `output`）」もこの定義に基づく、
+  (3) Gate の失敗の tick（`selection` が無い）も Fallback の値をそのまま requested にしており、同じ読み方になる
+- 欄の型（`{front, rear, top} | null`）と `null` になる条件（`mode: off` など 0078 §2.7 のとおり）は変えない。値を変えるのは迂回した tick の読み方だけで、
+  `mode: shadow` と Gate を通る `mode: apply` の tick の値は 0078 と同じである
+- trace の読み手（`air_balance_trace.py` と `airflow-trace.js`）は、いま `air_balance_coordination.output` を読んでいない。
+  0078 §2.11 の段 3（PR（b））で版を上げるときに、この定義で書き、読む
+
+**検証の不変条件の追加。**
 
 0078 §2.11 の段 3（PR（b））で入れる `ControlTick` の新しい版の検証に、次を加える（新しい版だけ。旧版は書き換えない）。
 
