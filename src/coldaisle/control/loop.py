@@ -78,6 +78,8 @@ from coldaisle.control.safety.critical import (
 )
 from coldaisle.control.schema import (
     AIR_BALANCE_COORDINATION_FAILED,
+    AIR_BALANCE_RELEASE_HOLD_REASON,
+    AIR_BALANCE_ZONE_REASONS,
     BASELINE_STAGE,
     CONTROL_TICK_RUNTIME_SCHEMA_VERSION,
     SCHEMA_VERSION,
@@ -578,21 +580,6 @@ class _TelemetryAgeTracker:
             source_ts_ms=sample.source_ts_ms,
             last_changed_mono_ms=self._observed[sample.metric][1],
         )
-
-
-_ZONE_COORDINATION_REASON: dict[Zone, str] = {
-    Zone.FRONT: "air_balance_front_makeup_air",
-    Zone.REAR: "air_balance_rear_thermal_exhaust",
-    Zone.TOP: "air_balance_top_case_aux_exhaust",
-}
-"""協調が zone の requested を決めたときの理由（決定記録 0078 §2.7）。
-
-Front を上げるのは make-up air、Rear は熱の排気、Top は case auxiliary exhaust だけである
-（``ConfiguredAirBalanceModel.coordinate()``）。
-"""
-
-_RELEASE_HOLD_REASON = "air_balance_release_hold"
-"""``release_hold_ms`` の保持（``h_z > r_z``）が値を決めた zone の理由（決定記録 0078 §2.7）。"""
 
 
 @dataclass(frozen=True, slots=True)
@@ -1887,7 +1874,11 @@ def _coordinated_baseline(
         if output <= raw.demand:
             requests[zone] = raw
             continue
-        code = _RELEASE_HOLD_REASON if result.held.get(zone) else _ZONE_COORDINATION_REASON[zone]
+        code = (
+            AIR_BALANCE_RELEASE_HOLD_REASON
+            if result.held.get(zone)
+            else AIR_BALANCE_ZONE_REASONS[zone]
+        )
         detail = "; ".join(
             (
                 f"candidate={raw.demand:.6f}",

@@ -1028,6 +1028,57 @@ def test_a_v13_tick_cannot_carry_the_coordination(catalog: MetricCatalog) -> Non
     del document["air_balance_coordination"]
     with pytest.raises(ValidationError, match="schema version 14"):
         _validate(document)
+    # 塊を消しても、協調の理由だけが残る旧版の tick は作れない。
+    del document["tach_unconfirmed_zones"]
+    with pytest.raises(ValidationError, match="schema version 14"):
+        _validate(document)
+
+
+def _set_reason(document: dict[str, Any], zone: str, code: str) -> None:
+    document["zones"][zone]["controller_reason"]["code"] = code
+
+
+def test_the_applied_document_binds_reasons_to_the_raised_zone(catalog: MetricCatalog) -> None:
+    """前提: 試験の文書は Front だけを上げ、保持していない。"""
+    document = _applied_document(catalog)
+    block = document["air_balance_coordination"]
+    assert block["output"]["front"] > block["candidate"]["front"]
+    assert block["output"]["rear"] == block["candidate"]["rear"]
+    assert block["held"] == {"front": False, "rear": False, "top": False}
+    assert document["zones"]["front"]["controller_reason"]["code"] == "air_balance_front_makeup_air"
+    _validate(document)
+
+
+@pytest.mark.parametrize(
+    "code", ["air_balance_rear_thermal_exhaust", "air_balance_release_hold", "fallback"]
+)
+def test_a_raised_zone_carries_its_own_reason_unless_held(
+    catalog: MetricCatalog, code: str
+) -> None:
+    """協調が上げた zone の理由は zone 固有（保持していなければ）。0078 §2.7。"""
+    document = _applied_document(catalog)
+    _set_reason(document, "front", code)
+    with pytest.raises(ValidationError, match="協調が上げた zone の理由"):
+        _validate(document)
+
+
+def test_a_held_zone_carries_the_release_hold_reason(catalog: MetricCatalog) -> None:
+    document = _applied_document(catalog)
+    document["air_balance_coordination"]["held"]["front"] = True
+    with pytest.raises(ValidationError, match="air_balance_release_hold"):
+        _validate(document)
+    _set_reason(document, "front", "air_balance_release_hold")
+    _validate(document)
+
+
+@pytest.mark.parametrize("code", ["air_balance_rear_thermal_exhaust", "air_balance_release_hold"])
+def test_a_zone_the_coordination_did_not_raise_has_no_coordination_reason(
+    catalog: MetricCatalog, code: str
+) -> None:
+    document = _applied_document(catalog)
+    _set_reason(document, "rear", code)
+    with pytest.raises(ValidationError, match="上げていない zone"):
+        _validate(document)
 
 
 @pytest.mark.parametrize(

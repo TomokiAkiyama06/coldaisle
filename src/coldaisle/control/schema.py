@@ -1768,13 +1768,22 @@ AirBalanceCoordinationReasonCode = Literal[
 AIR_BALANCE_COORDINATION_FAILED = "air_balance_coordination_failed"
 """``mode: apply`` の協調の失敗で Gate を迂回した tick の ``fallback_reason``（0085 §2.2）。"""
 
+AIR_BALANCE_ZONE_REASONS: dict[Zone, str] = {
+    Zone.FRONT: "air_balance_front_makeup_air",
+    Zone.REAR: "air_balance_rear_thermal_exhaust",
+    Zone.TOP: "air_balance_top_case_aux_exhaust",
+}
+"""協調が zone の requested を決めたときの理由（決定記録 0078 §2.7）。
+
+Front を上げるのは make-up air、Rear は熱の排気、Top は case auxiliary exhaust だけである
+（``ConfiguredAirBalanceModel.coordinate()``）。
+"""
+
+AIR_BALANCE_RELEASE_HOLD_REASON = "air_balance_release_hold"
+"""``release_hold_ms`` の保持（``h_z > r_z``）が値を決めた zone の理由（決定記録 0078 §2.7）。"""
+
 AIR_BALANCE_CONTROLLER_REASONS: frozenset[str] = frozenset(
-    {
-        "air_balance_front_makeup_air",
-        "air_balance_rear_thermal_exhaust",
-        "air_balance_top_case_aux_exhaust",
-        "air_balance_release_hold",
-    }
+    {*AIR_BALANCE_ZONE_REASONS.values(), AIR_BALANCE_RELEASE_HOLD_REASON}
 )
 """協調が requested の値を決めた zone の ``ZoneRecord.controller_reason``（決定記録 0078 §2.7）。"""
 
@@ -2462,7 +2471,15 @@ class ControlTick(_Frozen):
                     "v14 の ControlTick には air_balance_coordination と "
                     "tach_unconfirmed_zones が要る"
                 )
-            if record is not None or self.tach_unconfirmed_zones is not None or failed_reason:
+            if (
+                record is not None
+                or self.tach_unconfirmed_zones is not None
+                or failed_reason
+                or any(
+                    self.zones.get(zone).controller_reason.code in AIR_BALANCE_CONTROLLER_REASONS
+                    for zone in Zone
+                )
+            ):
                 raise ValueError(
                     "Air Balance の協調を記録する ControlTick は schema version 14 にする"
                 )
@@ -2479,6 +2496,7 @@ class ControlTick(_Frozen):
             )
         else:
             self._check_requested_covers_output(record)
+            self._check_coordination_reasons(record)
 
     def _check_tach_unconfirmed(self, record: AirBalanceCoordinationRecord) -> None:
         zones = self.tach_unconfirmed_zones
@@ -2547,16 +2565,48 @@ class ControlTick(_Frozen):
             code = zone_record.controller_reason.code
             if requested < output.get(zone):
                 raise ValueError(f"{zone.value}: Fallback の requested が協調の output を下回る")
-            if requested != output.get(zone):
-                if code != "fallback_transition_floor":
+            if requested != output.get(zone) and code != "fallback_transition_floor":
+                raise ValueError(
+                    f"{zone.value}: requested と output が違うのは fallback_transition_floor だけ"
+                )
+
+    def _check_coordination_reasons(self, record: AirBalanceCoordinationRecord) -> None:
+        """協調の理由を、協調が値を決めた zone と保持に束縛する（決定記録 0078 §2.7）。
+
+        協調が値を決めた zone は、Gate が Fallback を選び、requested がそのまま ``output`` で、
+        ``output > candidate`` の zone だけである（``fallback_transition_floor`` の zone を除く）。
+        その zone の理由は、保持（``held``。``h_z > r_z``）なら ``air_balance_release_hold``、
+        そうでなければ zone 固有の理由。それ以外の zone に協調の理由を残さない
+        （上げていない zone や別の zone の理由を、協調が決めた値と読ませない）。
+        """
+        output = record.output
+        candidate = record.candidate
+        fallback = self.state.active_controller is ControllerKind.FALLBACK
+        for zone in Zone:
+            zone_record = self.zones.get(zone)
+            code = zone_record.controller_reason.code
+            raised = (
+                fallback
+                and output is not None
+                and candidate is not None
+                and zone_record.demand.requested == output.get(zone)
+                and output.get(zone) > candidate.get(zone)
+            )
+            if not raised:
+                if code in AIR_BALANCE_CONTROLLER_REASONS:
                     raise ValueError(
-                        f"{zone.value}: requested と output が違うのは"
-                        " fallback_transition_floor だけ"
+                        f"{zone.value}: 協調が上げていない zone に協調の理由を残さない"
                     )
-            elif output.get(zone) > candidate.get(zone) and (
-                code not in AIR_BALANCE_CONTROLLER_REASONS
-            ):
-                raise ValueError(f"{zone.value}: 協調が上げた zone は協調の理由を残す")
+                continue
+            if record.held is None:
+                raise ValueError(f"{zone.value}: 協調が上げた zone には held の記録が要る")
+            expected = (
+                AIR_BALANCE_RELEASE_HOLD_REASON
+                if record.held.get(zone)
+                else AIR_BALANCE_ZONE_REASONS[zone]
+            )
+            if code != expected:
+                raise ValueError(f"{zone.value}: 協調が上げた zone の理由は {expected}")
 
     def _check_model_gate(self) -> None:
         """v5 の ``model_gate`` が ControlState と同じ判断を指しているか。"""

@@ -99,6 +99,9 @@ class ScriptedModel:
         self.requested: PerZone[Demand] | None = None
         self.error: Exception | None = None
         self.lower = False
+        # 渡された下限と違う projected_floors を返す不具合を模す（"keep" なら渡された値のまま）。
+        self.floors_override: PerZone[Demand] | str | None = "keep"
+        self.candidate_override: PerZone[Demand] | None = None
         self.calls: list[dict[str, Any]] = []
 
     @property
@@ -119,6 +122,14 @@ class ScriptedModel:
         if self.error is not None:
             raise self.error
         base = self._inner.coordinate(demands, thermal, projected_floors=projected_floors)
+        if self.floors_override != "keep":
+            base = AirBalanceCoordination.model_construct(
+                **{**dict(base), "projected_floors": self.floors_override}
+            )
+        if self.candidate_override is not None:
+            base = AirBalanceCoordination.model_construct(
+                **{**dict(base), "candidate": self.candidate_override}
+            )
         if self.lower:
             # AirBalanceCoordination の検証を迂回して「下げる」不具合を模す。
             lowered = zones(0.0, demands.rear, demands.top)
@@ -493,6 +504,31 @@ def test_a_lowering_proposal_is_an_error_and_releases_the_hold(tmp_path: Path) -
 
     model.lower = False
     assert run(unit, zones(0.4, 0.4, 0.4), 2).output == zones(0.4, 0.4, 0.4)
+
+
+@pytest.mark.parametrize("returned", [None, zones(0.0, 0.0, 0.0)])
+def test_a_model_that_drops_the_projected_floors_is_an_error(
+    tmp_path: Path, returned: PerZone[Demand] | None
+) -> None:
+    """差し替えた model が渡した下限と違う下限で見積もったら、協調の失敗にして保持を解く。"""
+    unit, model = scripted(tmp_path)
+    model.requested = zones(0.9, 0.4, 0.4)
+    run(unit, zones(0.4, 0.4, 0.4), 0)
+
+    model.requested = None
+    model.floors_override = returned
+    with pytest.raises(AirBalanceCoordinationError, match="projected_floors"):
+        run(unit, zones(0.4, 0.4, 0.4), 1, floors=zones(0.5, 0.0, 0.0))
+
+    model.floors_override = "keep"
+    assert run(unit, zones(0.4, 0.4, 0.4), 2).output == zones(0.4, 0.4, 0.4)
+
+
+def test_a_model_that_returns_another_candidate_is_an_error(tmp_path: Path) -> None:
+    unit, model = scripted(tmp_path)
+    model.candidate_override = zones(0.1, 0.1, 0.1)
+    with pytest.raises(AirBalanceCoordinationError, match="candidate"):
+        run(unit, zones(0.4, 0.4, 0.4), 0)
 
 
 def test_a_backwards_monotonic_clock_is_an_error(tmp_path: Path) -> None:

@@ -273,6 +273,14 @@ class AirBalanceCoordinator:
             raise AirBalanceCoordinationError(
                 "coordinate() が渡した demand と違う candidate を返した"
             )
+        if coordination.projected_floors != projected_floors:
+            # 風量の見積もりは zone ごとに max(requested_z, projected_floors.z) で行う
+            # （0078 §2.2）。
+            # 差し替えた model が下限を落とした（None を含む）なら、記録した下限と評価が食い違うので
+            # candidate と同じく協調の失敗にする。
+            raise AirBalanceCoordinationError(
+                "coordinate() が渡した projected_floors と違う下限で見積もった"
+            )
         max_raise = self.max_raise()
 
         proposed: dict[Zone, float] = {}
