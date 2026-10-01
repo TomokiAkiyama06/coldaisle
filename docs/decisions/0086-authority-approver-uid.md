@@ -100,7 +100,11 @@
 
 ### 2.3 承認できない uid：root と fand の実行ユーザー
 
-`raise` は次のとき拒む（journal を読む前に、終了コードで区別できる error にする）。
+昇格は次のとき拒む（journal を読む前に、終了コードで区別できる error にする）。
+**この拒否は `AuthorityStore.raise_stage()` の中で行う**（§2.5 の束縛の確認と同じ場所）。CLI だけで
+確かめると、fand の実行ユーザーとして Python から `raise_stage()` を直接呼べば、`uid.<fand の uid>` の
+承認を組み立てて通せてしまう（§2.5 の束縛はその承認を実行者と一致するので通す）。CLI は error を
+表示と終了コードへ写すだけにする。
 
 - `uid == 0`（root）
 - `uid` が authority のディレクトリ（`--authority-root`）の所有者と同じ（= fand の実行ユーザー。
@@ -126,9 +130,10 @@ fand が lock を `O_RDWR` で開けない（降格を書き残せなくなる�
 
 ### 2.5 束縛を確かめる場所：`AuthorityStore` が実行者を自分で知る。承認ファイルに承認者を書かない
 
-- `AuthorityStore` は時計と同じく**実行者の source**（`ProcessIdentity`。既定は §2.1 の取り方。
-  試験では差し替える）を持つ。`raise_stage()` は `approval.approver` がこの source の `uid.<数値>` と
-  一致しなければ `AuthorityApprovalError` で拒む。0057 §2.3 の「承認者が値を持ち込む余地を残さない」を
+- `AuthorityStore` は時計と同じく**実行者の source**（`ProcessIdentity`。`uid` と `euid` を返す。
+  既定は §2.1 の取り方。試験では差し替える）を持つ。`raise_stage()` は、まず §2.3 の3つ（`uid == 0`・
+  authority のディレクトリの所有者と同じ uid・`uid != euid`）を journal を読む前に拒み、次に
+  `approval.approver` がこの source の `uid.<数値>` と一致しなければ `AuthorityApprovalError` で拒む。0057 §2.3 の「承認者が値を持ち込む余地を残さない」を
   承認者の欄にも当てはめる
 - CLI に `--approver` は作らない。承認は 0062 §2.2 と同じくファイルで渡すが、そのファイルに
   `approver` の欄を**置かない**（あれば拒む）。CLI が §2.1 の uid で `StageApproval` を組み立てる
@@ -185,7 +190,8 @@ fand が lock を `O_RDWR` で開けない（降格を書き残せなくなる�
 
 - 昇格の event の `actor` / `approver` が `uid.<n>`・`approver_binding = "process_uid"` になる
 - `approval.approver` が実行者と違えば拒む。`uid == 0`・ディレクトリの所有者と同じ uid・
-  `getuid != geteuid` を、それぞれ journal を書かずに拒む
+  `getuid != geteuid` を、それぞれ journal を書かずに拒む。**CLI を通さず `AuthorityStore.raise_stage()` を
+  直接呼んでも**、実行者と一致する承認（`uid.<ディレクトリの所有者の uid>` など）で同じく拒む
 - 環境変数 `SUDO_UID` を別の値にしても、記録される uid が変わらない
 - CLI の引数に `--approver` が無い。承認ファイルに `approver` があれば拒む
 - rollback は root（差し替えで uid 0）でも通り、`uid.0` が残る
@@ -201,8 +207,8 @@ fand が lock を `O_RDWR` で開けない（降格を書き残せなくなる�
 
 | 段階 | 担当 Issue | 内容 |
 |---|---|---|
-| 3a | #92 | `ProcessIdentity`・journal v4（§2.7）・`raise_stage()` の束縛の確認（§2.5）・store の `0660`（§2.4）と試験 |
-| 3b | #92 | `coldaisle-authority raise` / `rollback` の CLI（§2.1〜§2.3・§2.6・§2.8）と `docs/authority-rollout.md` |
+| 3a | #92 | `ProcessIdentity`・journal v4（§2.7）・`raise_stage()` の拒否（§2.3）と束縛の確認（§2.5）・store の `0660`（§2.4）と試験 |
+| 3b | #92 | `coldaisle-authority raise` / `rollback` の CLI（§2.1・§2.6・§2.8。§2.3 の拒否は store の error を表示と終了コードへ写すだけ）と `docs/authority-rollout.md` |
 | 3c | #57（PR #209 の中、またはその直後の追従 PR） | fand の unit の3つの値（§2.2）とその静的試験・`docs/ubuntu-deploy.md` の承認者のグループとディレクトリ、置き場所の移行（§2.7） |
 
 3a と 3b は1つの PR でもよい（いずれも #92。分けるかは実装の大きさで決める）。
@@ -255,6 +261,8 @@ fand が lock を `O_RDWR` で開けない（降格を書き残せなくなる�
 
 - root を認め、`SUDO_UID` があればそれを承認者にする: §2.1 の却下と同じ理由
 - 許す uid の一覧を設定に置く: グループの所属と二重管理になり、食い違ったときにどちらが正しいかが決まらない
+- 拒否を CLI だけで行い、store は承認者と実行者の一致だけを見る: fand の実行ユーザーが Python から
+  `raise_stage()` を直接呼ぶと、自分の uid の承認で昇格を書ける（§2.5 の「CLI だけで確かめる」の却下と同じ理由）
 
 **ファイルの mode（§2.4）**
 
@@ -299,3 +307,7 @@ fand が lock を `O_RDWR` で開けない（降格を書き残せなくなる�
 
 **2026-10-01、リポジトリ所有者がこの記録を承認した。** 承認の対象は §2.1〜§2.9 の細部すべて
 （PR #208 で示した判断点 1〜9 を、いずれも推奨案で）と、0080 §2.1 / §2.2 の一部の置き換えである。
+
+承認の後、マージ前のレビューで、§2.3 の拒否を行う場所を CLI から `AuthorityStore.raise_stage()` へ移した
+（§2.3 / §2.5 / §2.9 / §2.10、§4 に1項目）。拒む条件は変えておらず、§2.5 で承認された「束縛を store で
+確かめる」理由を §2.3 にも当てはめた締め付けである。
