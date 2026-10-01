@@ -289,6 +289,7 @@ sudo usermod -aG coldaisle-admin <操作する人のユーザー名>
 # Authority の昇格・rollback を行う人のグループ（決定記録 0086 §2.2）。入れるのは昇格を任せる人だけ
 # （coldaisle と AI 層のユーザーは入れない）
 sudo groupadd --system coldaisle-authority
+# ログインし直すと反映される（いま開いている shell には新しいグループが付かない）
 sudo usermod -aG coldaisle-authority <昇格を行う人のユーザー名>
 # authority.json の置き場所。所有者 coldaisle-fan・グループ coldaisle-authority・2770（setgid）。
 # systemd の StateDirectory= にはしない（グループが coldaisle-fan へ付け替えられる）ので、ここで作る
@@ -305,6 +306,9 @@ sudo install -d -o coldaisle-fan -g coldaisle-authority -m 2770 /var/lib/coldais
   （`coldaisle` と同じ考え方。アカウントに入れると unit の外でも journal を書けてしまいます）
 - **`coldaisle-authority` の CLI はまだありません**（0086 §2.10 の段階 3b。#92）。下の2項目と 6.6 の
   CLI に関わる記述は、段階 3b が入ってから使えます。それまでの昇格の手段は増えません
+- グループへの所属は、`usermod` の後に**ログインし直してから**効きます（`dialout` と同じ）。
+  いまの shell のまま CLI を実行すると `2770` のディレクトリへ入れず、権限の error で止まります。
+  `id -nG` に `coldaisle-authority` が出ることを確かめてから使います
 - **承認者は自分の uid のまま** `coldaisle-authority raise` / `rollback` を実行します（`sudo` も
   `sudo -u coldaisle-fan` も使いません）。記録される承認者は実行した人の `uid.<数値>` です
   （0086 §2.1）。root と fand のユーザー（= `/var/lib/coldaisle-authority` の所有者）の昇格は拒まれます
@@ -468,12 +472,10 @@ sudo /usr/bin/python3 -I -S /opt/coldaisle/src/coldaisle/safety_handoff.py; echo
 
 ### 6.6 authority.json を専用のディレクトリへ移す（以前のテンプレートで fand を動かした導入先）
 
-> **前提: 導入先のコードに 0086 §2.10 の段階 3a（#92）が入っていること。** 段階 3a より前の
-> `AuthorityStore` は journal と lock を `0600` で作ります。その版の fand がこのディレクトリで一度でも
-> 書く（降格を書き残す・lock を作る）と、ファイルは fand のユーザーだけが開ける状態になり、
-> 承認者のグループは journal を読めず lock も取れません。段階 3a が入るまでは、この節の移行も
-> 新しい unit への差し替えも行いません（0086 §2.2 のとおり、テンプレートを導入に使うのは揃ってから。
-> `enable` は 0080 §2.10 の段階 5 と承認点 3 の後）。
+> **前提: 導入先のコードが 0086 §2.10 の段階 3a（#92。journal と lock を `0660` で作る `AuthorityStore`）を
+> 含むこと。** それより前の版の fand は `0600` で作るので、このディレクトリで一度でも書くと承認者のグループが
+> journal を読めず lock も取れなくなります。古いコードのまま、この節の移行も新しい unit への差し替えも
+> 行いません（`enable` は 0080 §2.10 の段階 5 と承認点 3 の後）。
 
 以前のテンプレート（決定記録 0080 のまま）は `authority.json` を fand 専用の状態ディレクトリ
 （`/var/lib/coldaisle-fand/authority`。`0700`）に置いていました。決定記録 0086 §2.2 で、承認者のグループと
