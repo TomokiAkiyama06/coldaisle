@@ -922,8 +922,18 @@ def build(
         raise StartupEnvironmentError(f"{type(error).__name__}: {error}") from error
     store = open_writable_store(config.db, rules=rules, clock=clock, control=control)
     binding = create_control_runtime_binding(control)
+    # **Gate と authority runtime が照らす artifact は1つの変数から渡す**（決定記録 0089 §2.1）。
+    # Learned MPC の worker を配線していないので束縛する artifact は無い。authority は journal が
+    # 上がっていても Baseline より上を有効にしない（0089 §2.2）。worker を配線するときは、起動時に
+    # 読んだ registry の snapshot の production artifact をここへ置く（0077 §2.6）。
+    loaded_artifact_sha256: str | None = None
     try:
-        authority = open_authority_runtime(config.authority_root, control, clock=clock)
+        authority = open_authority_runtime(
+            config.authority_root,
+            control,
+            clock=clock,
+            loaded_artifact_sha256=loaded_artifact_sha256,
+        )
     except Exception as error:
         store.close()
         raise StartupEnvironmentError(f"{type(error).__name__}: {error}") from error
@@ -952,6 +962,7 @@ def build(
             contract=contract,
             binding=binding,
             authority=authority,
+            loaded_artifact_sha256=loaded_artifact_sha256,
             deadman=deadman,
             store=store,
             clock=clock,
@@ -1008,7 +1019,13 @@ def open_writable_store(
     return store
 
 
-def open_authority_runtime(root: Path, control: ControlConfig, *, clock: Clock) -> AuthorityRuntime:
+def open_authority_runtime(
+    root: Path,
+    control: ControlConfig,
+    *,
+    clock: Clock,
+    loaded_artifact_sha256: str | None,
+) -> AuthorityRuntime:
     """`authority.json` を読む `AuthorityRuntime`（決定記録 0057 / 0072 §2.6）。
 
     **lock の待ち上限は `tick_deadline_ms`**（decision trace の保存の busy timeout と同じ。
@@ -1016,11 +1033,13 @@ def open_authority_runtime(root: Path, control: ControlConfig, *, clock: Clock) 
     Fan の書き込みと heartbeat は待たない。上限で諦めた降格は memory 上で下げたまま残る。
 
     journal が無ければ `SHADOW` から始まる。読めない・壊れているときは例外で止まる（0057 §2.1）。
+    ``loaded_artifact_sha256`` は Gate の ``expected_artifact_sha256`` と同じ値
+    （決定記録 0089 §2.1）。
     """
     store = AuthorityStore(
         root.absolute(), clock, lock_timeout_ms=control.safety.tick_deadline_ms.value
     )
-    runtime = AuthorityRuntime(store, control.policy)
+    runtime = AuthorityRuntime(store, control.policy, loaded_artifact_sha256=loaded_artifact_sha256)
     LOGGER.info(
         "authority journal を読み込んだ",
         extra={
@@ -1030,6 +1049,8 @@ def open_authority_runtime(root: Path, control: ControlConfig, *, clock: Clock) 
                 "journal_revision": runtime.journal.revision,
                 "authority_config_ceiling": runtime.configured_ceiling.value,
                 "authority_stage": runtime.current_stage().value,
+                "authority_artifact_ceiling": runtime.artifact_ceiling.value,
+                "loaded_artifact_sha256": loaded_artifact_sha256,
             }
         },
     )
@@ -1073,6 +1094,7 @@ def _build_loop(
     contract: ControlInputContract,
     binding: ControlRuntimeBinding,
     authority: AuthorityRuntime,
+    loaded_artifact_sha256: str | None,
     deadman: Watchdog,
     store: SqliteStore,
     clock: Clock,
@@ -1094,11 +1116,12 @@ def _build_loop(
         gate=ControllerGate(
             control.policy,
             expected_model_version=UNCONFIGURED_MODEL_VERSION,
-            # **束縛した artifact が無いことを明示する**（#159 / 決定記録 0059 §2.1）。
+            # **束縛した artifact が無いことを明示する**（いまは None。#159 / 決定記録 0059 §2.1）。
             # worker を配線していないので提案は1件も来ないが、仮に来ても採らない。
             # 既定値を置かず必須の引数にしてあるのは、渡し忘れが「何にも照らさない
             # Gate」を作らないためである。
-            expected_artifact_sha256=None,
+            # authority runtime と同じ値（決定記録 0089 §2.1）。
+            expected_artifact_sha256=loaded_artifact_sha256,
             authority=authority,
         ),
         guard=ReactiveGuard(control.policy.reactive_guard, catalog),

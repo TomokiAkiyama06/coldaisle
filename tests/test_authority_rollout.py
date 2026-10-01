@@ -19,7 +19,9 @@
 
 from __future__ import annotations
 
+import inspect
 import json
+import logging
 import os
 from fcntl import LOCK_EX, LOCK_NB, LOCK_UN, flock
 from hashlib import sha256
@@ -30,6 +32,7 @@ from typing import Any
 import pytest
 from pydantic import ValidationError
 
+from coldaisle import logs
 from coldaisle.clock import SimulatedClock
 from coldaisle.control import (
     AUTHORITY_JOURNAL_SCHEMA_VERSION,
@@ -94,6 +97,7 @@ from coldaisle.control.evaluation.model import (
     WorstCaseKind,
 )
 from coldaisle.control.model.confidence import ConfidenceAssessor
+from coldaisle.control.model.thermal import canonical_artifact_bytes
 from coldaisle.control.mpc import LearnedMpcController, MpcModelBinding
 from coldaisle.control.shadow import SHADOW_EXPORT_SCHEMA_VERSION
 from test_control_config import valid_documents, write_documents
@@ -592,8 +596,12 @@ def runtime(
     stage: AuthorityStage = AuthorityStage.FULL,
     ceiling: str = "full",
     settings: Any = None,
+    loaded: str | None = ARTIFACT_SHA,
 ) -> AuthorityRuntime:
-    """`stage` まで上げた journal を持つ runtime。昇格はすべて承認を経由する。"""
+    """`stage` まで上げた journal を持つ runtime。昇格はすべて承認を経由する。
+
+    ``loaded`` は runtime が使っている artifact（決定記録 0089）。既定は承認の証拠と同じ artifact。
+    """
     authority = store(tmp_path)
     document = report_document()
     current = BASELINE_STAGE
@@ -615,6 +623,7 @@ def runtime(
     return AuthorityRuntime(
         authority,
         settings if settings is not None else policy(authority=ceiling),
+        loaded_artifact_sha256=loaded,
     )
 
 
@@ -635,6 +644,7 @@ def unwritable_runtime(
     return AuthorityRuntime(
         UnwritableStore(tmp_path / "authority", SimulatedClock(NOW_MS), lock_timeout_ms=500),
         policy(authority="full"),
+        loaded_artifact_sha256=ARTIFACT_SHA,
     )
 
 
@@ -1855,7 +1865,9 @@ def test_invariant_6_i_recovering_after_an_automatic_demotion_needs_a_new_approv
     authority = store(tmp_path)
     document = report_document()
     raise_stage(authority, approval=approval_for(document), document=document)
-    control = AuthorityRuntime(authority, policy(authority="full"))
+    control = AuthorityRuntime(
+        authority, policy(authority="full"), loaded_artifact_sha256=ARTIFACT_SHA
+    )
     control.observe(safety_state=SafetyState.EMERGENCY, now_mono_ms=0)
     assert control.current_stage() is BASELINE_STAGE
 
@@ -1999,6 +2011,7 @@ def test_invariant_6_o_a_demotion_takes_effect_before_it_is_persisted(tmp_path: 
     control = AuthorityRuntime(
         WatchingStore(tmp_path / "authority", SimulatedClock(NOW_MS), lock_timeout_ms=500),
         policy(authority="full"),
+        loaded_artifact_sha256=ARTIFACT_SHA,
     )
     holder.append(control)
     assert control.current_stage() is AuthorityStage.FULL
@@ -2023,6 +2036,7 @@ def test_invariant_6_p_an_unexpected_persist_failure_still_lowers(tmp_path: Path
     control = AuthorityRuntime(
         ExplodingStore(tmp_path / "authority", SimulatedClock(NOW_MS), lock_timeout_ms=500),
         policy(authority="full"),
+        loaded_artifact_sha256=ARTIFACT_SHA,
     )
 
     with pytest.raises(RuntimeError):
@@ -2058,7 +2072,9 @@ def test_invariant_7_b_raising_the_configured_ceiling_does_not_raise_the_journal
     """**設定を上げただけでは制御権は増えない。** 昇格は承認の記録が要る。"""
     authority = store(tmp_path)
 
-    control = AuthorityRuntime(authority, policy(authority="full"))
+    control = AuthorityRuntime(
+        authority, policy(authority="full"), loaded_artifact_sha256=ARTIFACT_SHA
+    )
 
     assert control.configured_ceiling is AuthorityStage.FULL
     assert control.current_stage() is BASELINE_STAGE
@@ -2221,8 +2237,190 @@ def test_invariant_8_a_promoting_a_model_does_not_change_the_authority_stage(
     assert after == before
     assert after.stage is AuthorityStage.LIMITED
     assert registry.inspect().production[ArtifactKind.THERMAL_MODEL].active.version == "1.0.0"
-    control = AuthorityRuntime(authority, policy(authority="full"))
+    control = AuthorityRuntime(
+        authority, policy(authority="full"), loaded_artifact_sha256=ARTIFACT_SHA
+    )
     assert control.current_stage() is AuthorityStage.LIMITED
+    # **入れ替えた artifact で動く fand には、前の artifact の承認を渡さない**（決定記録 0089）。
+    # journal は動かない（上の after == before）が、実効 stage は Baseline になる。
+    snapshot = registry.inspect()
+    promoted = snapshot.artifacts[snapshot.production[ArtifactKind.THERMAL_MODEL].active.key]
+    assert promoted.metadata.sha256 != ARTIFACT_SHA
+    swapped = AuthorityRuntime(
+        authority, policy(authority="full"), loaded_artifact_sha256=promoted.metadata.sha256
+    )
+    assert swapped.current_stage() is BASELINE_STAGE
+    assert authority.read() == before
+
+
+# --- 決定記録 0089: fand が使っている artifact に対して承認された分だけ有効にする ----------
+
+
+def raise_with_other_artifact(
+    authority: AuthorityStore, tmp_path: Path, *, from_stage: AuthorityStage, revision: int
+) -> str:
+    """**別の artifact（B）が Production の Registry** で、B の証拠により1段上げる。
+
+    返すのは B の sha256。
+
+    CLI が「いま Production の B」に対して正しく検証して上げる経路そのもの（Codex P1、PR #216）。
+    """
+    registry_b, sha_b = production_registry(
+        tmp_path, version=f"2.0.{revision}", name=f"registry-b-{revision}"
+    )
+    document = report_document(artifacts=(sha_b,), stages=(from_stage.value,), arm_stage=from_stage)
+    raise_stage(
+        authority,
+        approval=approval_for(
+            document,
+            from_stage=from_stage,
+            revision=revision,
+            evidence=evidence_for(document, arm=learned_arm(from_stage).key, artifact=sha_b),
+        ),
+        document=document,
+        registry=registry_b,
+    )
+    return sha_b
+
+
+def control_runtime(tmp_path: Path, *, loaded: str | None = ARTIFACT_SHA) -> AuthorityRuntime:
+    """fand と同じく lock の待ち上限を持つ store で読む runtime。"""
+    return AuthorityRuntime(
+        AuthorityStore(tmp_path / "authority", SimulatedClock(NOW_MS), lock_timeout_ms=500),
+        policy(authority="full"),
+        loaded_artifact_sha256=loaded,
+    )
+
+
+def test_0089_a_raise_with_another_artifacts_evidence_is_baseline_for_the_running_artifact(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """**B の証拠で上げた journal を、A で動いている runtime が読むと Baseline**。
+
+    Codex P1（PR #216）の再現。
+
+    fand（A）が動いている間に Production が B へ入れ替わり、CLI が B の証拠で上げた。
+    runtime は journal の変化を次の点検で読むが、実効 stage は上がらない。journal は書かない。
+    """
+    authority = store(tmp_path)
+    control = control_runtime(tmp_path)
+    assert control.current_stage() is BASELINE_STAGE
+
+    sha_b = raise_with_other_artifact(authority, tmp_path, from_stage=BASELINE_STAGE, revision=0)
+    assert sha_b != ARTIFACT_SHA
+    written = authority.read()
+    assert written.stage is AuthorityStage.LIMITED
+
+    caplog.set_level(logging.INFO, logger="coldaisle.control")
+    control.maintain()
+
+    assert control.journal == written, "journal の変化は読む（0072 §2.6）"
+    assert control.artifact_ceiling is BASELINE_STAGE
+    assert control.current_stage() is BASELINE_STAGE
+    assert authority.read() == written, "journal は書かない（0089 §2.4）"
+    metadata = control.trace_metadata()
+    assert metadata["authority_stage"] == BASELINE_STAGE.value
+    assert metadata["authority_journal_stage"] == AuthorityStage.LIMITED.value
+    assert metadata["authority_artifact_ceiling"] == BASELINE_STAGE.value
+    assert "authority_loaded_artifact" not in metadata, "model を含めない（0057 §2.7）"
+    fields = [
+        getattr(record, logs.FIELDS_KEY)
+        for record in caplog.records
+        if isinstance(getattr(record, logs.FIELDS_KEY, None), dict)
+    ]
+    mismatches = [item for item in fields if item.get("event") == "authority_artifact_mismatch"]
+    assert len(mismatches) == 1
+    assert mismatches[0]["mismatched_revision"] == 1
+    assert mismatches[0]["approved_artifact_sha256"] == sha_b
+    assert mismatches[0]["loaded_artifact_sha256"] == ARTIFACT_SHA
+
+    # Baseline にいる間は自動降格も起きない（実効 stage を見る）。journal はそのまま
+    assert control.observe(safety_state=SafetyState.EMERGENCY, now_mono_ms=0) is None
+    control.maintain()
+    assert authority.read() == written
+    assert control.current_stage() is BASELINE_STAGE
+
+
+def test_0089_b_a_runtime_without_an_artifact_never_rises_above_baseline(tmp_path: Path) -> None:
+    """**束縛する artifact を持たない構成は、journal が上がっていても Baseline**（0089 §2.2）。"""
+    for stage in (AuthorityStage.LIMITED, AuthorityStage.EXPANDED, AuthorityStage.FULL):
+        root = tmp_path / stage.value
+        root.mkdir()
+        control = runtime(root, stage=stage, loaded=None)
+        assert control.journal.stage is stage
+        assert control.artifact_ceiling is BASELINE_STAGE
+        assert control.current_stage() is BASELINE_STAGE
+        assert control.loaded_artifact_sha256 is None
+
+
+def test_0089_c_a_matching_artifact_keeps_the_journal_stage(tmp_path: Path) -> None:
+    """**一致すれば従来どおり。** 上限は掛からず、実効 stage は journal・設定の最小のまま。"""
+    control = runtime(tmp_path, stage=AuthorityStage.FULL, ceiling="expanded")
+
+    assert control.artifact_ceiling is AuthorityStage.FULL
+    assert control.current_stage() is AuthorityStage.EXPANDED
+    assert control.trace_metadata()["authority_artifact_ceiling"] == AuthorityStage.FULL.value
+
+    # 外の process が同じ artifact の証拠で上げた journal は、読み直しでそのまま効く
+    fresh = tmp_path / "fresh"
+    fresh.mkdir()
+    authority = store(fresh)
+    watching = control_runtime(fresh)
+    document = report_document()
+    raise_stage(authority, approval=approval_for(document), document=document)
+    watching.maintain()
+    assert watching.current_stage() is AuthorityStage.LIMITED
+
+
+def test_0089_d_a_partially_matching_climb_is_baseline(tmp_path: Path) -> None:
+    """**連なりの1件でも違えば Baseline。** A の LIMITED までも有効にしない（§2.2）。"""
+    runtime(tmp_path, stage=AuthorityStage.LIMITED)
+    control = control_runtime(tmp_path)
+    assert control.current_stage() is AuthorityStage.LIMITED
+    raise_with_other_artifact(
+        store(tmp_path), tmp_path, from_stage=AuthorityStage.LIMITED, revision=1
+    )
+    control.maintain()
+
+    assert control.journal.stage is AuthorityStage.EXPANDED
+    assert control.current_stage() is BASELINE_STAGE
+
+
+def test_0089_e_a_climb_after_a_rollback_is_judged_on_its_own(tmp_path: Path) -> None:
+    """**Baseline へ戻った後の昇格だけを見る。** 前の連なりの B の承認は効かない。"""
+    authority = store(tmp_path)
+    raise_with_other_artifact(authority, tmp_path, from_stage=BASELINE_STAGE, revision=0)
+    authority.rollback_to_baseline(actor="uid.1000", reason="B をやめて A へ戻す")
+    document = report_document()
+    raise_stage(authority, approval=approval_for(document, revision=2), document=document)
+
+    control = control_runtime(tmp_path)
+    assert control.journal.stage is AuthorityStage.LIMITED
+    assert control.current_stage() is AuthorityStage.LIMITED
+
+
+def test_0089_f_the_loaded_artifact_must_be_a_sha256(tmp_path: Path) -> None:
+    """**形の誤った artifact を受け取らない**（照合が常に食い違い、黙って Baseline になる）。"""
+    with pytest.raises(AuthorityStoreError):
+        control_runtime(tmp_path, loaded="A" * 64)
+
+
+def test_0089_g_the_runtime_has_no_default_for_the_loaded_artifact() -> None:
+    """**既定値を置かない。** 渡し忘れが「何にも照らさない runtime」を作らない（0089 §2.1）。"""
+    parameter = inspect.signature(AuthorityRuntime.__init__).parameters["loaded_artifact_sha256"]
+
+    assert parameter.default is inspect.Parameter.empty
+    assert parameter.kind is inspect.Parameter.KEYWORD_ONLY
+
+
+def test_0089_h_fand_passes_one_artifact_to_the_gate_and_the_runtime() -> None:
+    """**Gate と runtime は1つの変数から同じ artifact を受け取る**（0089 §2.1）。"""
+    source = Path("src/coldaisle/control_daemon.py").read_text(encoding="utf-8")
+
+    assert "expected_artifact_sha256=loaded_artifact_sha256" in source
+    # open_authority_runtime と _build_loop へ同じ変数を渡す
+    assert source.count("            loaded_artifact_sha256=loaded_artifact_sha256,") == 2
+    assert "expected_artifact_sha256=None" not in source
 
 
 def test_invariant_8_b_an_approval_for_the_retired_artifact_is_refused_after_promotion(
@@ -2608,7 +2806,10 @@ def test_the_first_promotion_can_actually_be_walked(tmp_path: Path, trained) -> 
     base, profile, attestation = trained
     settings = mpc_policy(authority="limited")
     authority = store(tmp_path)
-    control = AuthorityRuntime(authority, settings)
+    # **runtime と Gate は worker が束縛した artifact に照らす**（決定記録 0089 §2.1）。
+    control = AuthorityRuntime(
+        authority, settings, loaded_artifact_sha256=attestation.artifact_sha256
+    )
 
     assert control.configured_ceiling is AuthorityStage.LIMITED
     assert control.current_stage() is AuthorityStage.SHADOW, "journal が無ければ Baseline"
@@ -2651,7 +2852,17 @@ def test_the_first_promotion_can_actually_be_walked(tmp_path: Path, trained) -> 
 
     # 3. その区間の証拠で昇格する。証拠はいまの設定・いまの artifact のものである。
     config = control_config(tmp_path, ceiling="limited")
-    registry, production_sha = production_registry(tmp_path, version="9.0.0", name="registry-e2e")
+    # Registry の production は、worker が束縛した artifact そのもの（同じ bytes を登録する）。
+    # 別の artifact の証拠で上げると、runtime は Baseline のままにする（決定記録 0089）。
+    production_sha = issue_attestation(
+        tmp_path / "registry-e2e",
+        model_id=base.manifest.model_id,
+        version=base.manifest.model_version,
+        stage=AuthorityStage.SHADOW,
+        payload=canonical_artifact_bytes(base._artifact),
+    ).artifact_sha256
+    assert production_sha == attestation.artifact_sha256
+    registry = ModelRegistry(tmp_path / "registry-e2e", limits=REGISTRY_LIMITS)
     document = report_document(
         artifacts=(production_sha,),
         policy_sha=config.sources.policy.sha256,

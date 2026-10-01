@@ -8,7 +8,7 @@
 - LLM のツールからは到達できません（`coldaisle.ai` / `coldaisle.api` / `coldaisle.server` /
   `coldaisle.event_entry` は `coldaisle.control_admin` を import しない。`tests/test_control_admin.py` が走査）
 - **制御権を増やせません。** authority の昇格の操作はありません（`raise_authority` は `unknown_op`）。
-  昇格は段階 3 の `coldaisle-authority raise`（人が実行する CLI。未実装）だけが行います
+  昇格は段階 3 の `coldaisle-authority raise`（人が自分の uid で実行する CLI。`docs/authority-rollout.md`）だけが行います
 - `CALIBRATION` は #75 の測定計画の形が決まるまで `unsupported_mode` で拒否します（段階 4）
 
 ## 使い方
