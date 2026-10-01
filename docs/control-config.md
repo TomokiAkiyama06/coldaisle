@@ -174,6 +174,46 @@ Model を Production へ昇格させても authority は動かない（#104 と 
 v8からv9へは `authority_rollout` を追加してから `schema_version: 9` へ上げる。
 v1〜v8は自動補完せず起動前に拒否する。
 
+## Control Config v13 と `fan-policy.yaml` v10（#81 / 決定記録 0078 §2.4）
+
+束ねた版 `CONTROL_CONFIG_VERSION` を 12 → 13 に上げ、`fan-policy.yaml` を schema version 9 → 10 にした
+（ほかのファイルの版は変えない。`fan-hardware.yaml` 1、`safety.yaml` 4、`air-balance.yaml` 2）。
+v10 は Air Balance の協調を Baseline（Fallback）の requested に掛けるかの方針
+`air_balance_coordination` を**必須**にする。
+
+```yaml
+air_balance_coordination:
+  mode: "off"                # off | shadow | apply。雛形の既定は off
+  max_raise:                 # zone ごとに raw baseline から上げてよい幅（demand、0.0..1.0）。0 は動かさない
+    front: {value: <#75 の後>, status: provisional}
+    rear: {value: <#75 の後>, status: provisional}
+    top: {value: 0.0, status: provisional}        # 最初の apply では 0（0078 所有者の判断 9）
+  release_hold_ms: {value: <#75 の RPM 応答時間の後>, status: provisional}   # 0 以上の整数
+```
+
+- `mode` は Air Balance そのものの有効・無効ではない（それは `air-balance.yaml` の `source.status`。0073 §2.2）。
+  「有効な Air Balance の協調提案を Baseline に適用するか」で、`off` → `shadow` → `apply` を**人が設定と再起動で**進める
+  （0078 §2.8。authority journal を経ない）
+- YAML 1.1 では引用符の無い `off` が真偽値の偽になる。偽だけを `off` と読み、真（`on` / `yes` / `true`）は
+  `shadow` か `apply` か決められないので拒否する。迷わないよう `"off"` と引用符で書く
+- `max_raise` / `release_hold_ms` は `{value, status, basis}` で、値は #75 の実測と shadow の集計の後に決める（0078 §5）。
+  `provisional` の間は起動時の一覧（`provisional_values()`）に出る
+- **`mode: shadow` / `apply` で `air-balance.yaml` が `uncalibrated` なら Control Config の不正**として扱い、
+  全 zone Max（`config_invalid`）で止まる（黙って `off` と読まない。0078 §2.4）。校正済みのまま協調だけを止めるときは `mode: "off"`
+
+**協調はまだ loop へ配線していない**（0078 §2.11 の段 2）。v10 の設定は検証されるだけで、どの `mode` でも
+Fan の挙動と decision trace は v9 のときと変わらない。純粋な `AirBalanceCoordinator`
+（`control/air_balance_coordination.py`。上げるだけ・zone ごとの上限・下げる前の保持）は段 3 で
+Fallback の後・Gate の前に配線し、`ControlTick` の新しい版に記録する。
+
+**移行手順**: v9 を v10 として補完しない（読み込み時に拒否する）。
+
+1. 運用の `fan-policy.yaml` に `air_balance_coordination` を足す（`mode: "off"`、`max_raise` と
+   `release_hold_ms` は `provisional` の仮の値）
+2. 最後に `schema_version: 10` へ上げる。塊を欠く v10 と v9 のままのファイルはどちらも拒否され、
+   `config_invalid` の全 zone Max で止まる
+3. 新しいコードへ更新して再起動する
+
 ## Control Config v12 と `safety.yaml` v4（#74 / 決定記録 0080 §2.6）
 
 束ねた版 `CONTROL_CONFIG_VERSION` を 11 → 12 に上げ、`safety.yaml` を schema version 3 → 4 にした
@@ -240,7 +280,7 @@ SHA-256 を毎 tick 残す。Offline Evaluation の報告は v3 になり、`air
 昇格（`AuthorityJournal` v2）は、この2ファイルについても承認の証拠・報告・いまの設定の一致を求める
 （`docs/authority-rollout.md`）。
 
-現行 Control Config v12 は設定の live reload を行わない。設定変更は候補全体を別オブジェクトで検証したうえで
+現行 Control Config v13 は設定の live reload を行わない。設定変更は候補全体を別オブジェクトで検証したうえで
 **次回再起動時**にだけ反映する。これにより、変更後の設定も必ず `STARTUP` の Max を通る。
 `trace_metadata()` は、採用されたsource名・schema version・SHA-256を #82 の decision traceへ渡す。
 Confidence / OOD の判断（`model_gate`）には検証済み assessment の値だけを書き、裏付けの無い tick は
