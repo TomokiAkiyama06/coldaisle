@@ -13,8 +13,16 @@
     「候補の照合」のうち、(a) / (c) の集合を全 step で共有する部分（本記録 §2.2）
   - §2.4 の検査の表の L8 の行（各 entry の検査に、キー集合の一致を加える。本記録 §2.3）
   - 本記録が足すだけで 0079 を置き換えない点: §2.4 の検査の表への L11 / L12 の追加（§2.1 / §2.2）、
-    §2.3 の feature schema の項への anchor 推論の action 列の規則の追加（§2.1）、0050 §2.2 の `support` の OOD の条件への「held の列が step ごとの support の外」の追加（Profile v2 についてだけ。狭める向きで 0050 を置き換えない。§2.1）、0050 §2.1 の residual の基準の母集団から held の列が step ごとの support の外にある validation example を除くことと、除いた件数の記録・残りが無い出力での Profile の作成の拒否（Profile v2 についてだけ。§2.1）、§2.7 の試験の追加（§2.4）
-  - 旧記録側への `Superseded by` の追記（README「追記のみ」）は本 PR で 0079 に行った
+    §2.3 の feature schema の項への anchor 推論の action 列の規則の追加（§2.1）、§2.7 の試験の追加（§2.4）
+
+  [0050](0050-model-confidence-ood-and-authority.md) の次の部分だけを、**Profile v2 についてだけ**置き換える。
+  v1 の Profile には 0050 をそのまま適用する。0050 の他の点は有効。
+  - §2.1 の「residual の基準（出力ごとの RMS）だけは validation から作る」の項と Profile の表の「residual scale」の
+    行のうち、validation の**全 example** から作る部分（本記録 §2.1 で、held の列が step ごとの support の外にある
+    validation example を除き、除いた件数を Profile に記録し、ある出力で残りが0件なら Profile の作成を拒否する）
+  - §2.2 の判定の構成要素の表の `support` の行の「OOD にする条件」（本記録 §2.1 で、anchor 推論の held の列が
+    step ごとの support の外であることを条件に加える。構成要素の enum と assessment の形は変えない）
+  - 旧記録側への `Superseded by` の追記（README「追記のみ」）は本 PR で 0079 と 0050 に行った
 - **関連**: [0031](0031-thermal-dataset-contract.md) §2.2 /
   [0048](0048-thermal-model-artifact-and-inference.md) §2.1 / §2.4 /
   [0050](0050-model-confidence-ood-and-authority.md) §2.1 / §2.2 / §3 / §5 #2 /
