@@ -986,6 +986,18 @@ class AuthorityStore:
             trigger=AuthorityTrigger.HUMAN,
         )
 
+    def approver_credentials(self) -> ProcessCredentials:
+        """承認者になれる実行者なら、その uid と euid を返す。なれなければ拒む（0086 §2.3）。
+
+        CLI が承認を組み立てる**前に**呼ぶ。root の `uid.0` は承認の型が受け付けないので、
+        組み立ててから `raise_stage()` に渡すと、拒否の理由が「承認の形の誤り」になってしまう。
+        **判断は store が持つ**（CLI は結果を写すだけ）。`raise_stage()` は同じ確認を改めて行う。
+        所有者の確認はディレクトリを開く `raise_stage()` の中で行う。
+        """
+        credentials = self._identity.credentials()
+        self._check_process(credentials)
+        return credentials
+
     @staticmethod
     def _check_process(credentials: ProcessCredentials) -> None:
         """root と setuid 経由の実行を拒む（決定記録 0086 §2.1 / §2.3）。"""
