@@ -39,6 +39,11 @@ from coldaisle.control.air_balance import (
     ZoneFlowCurve,
     ZoneFlowEstimate,
 )
+from coldaisle.control.air_balance_coordination import (
+    AirBalanceCoordinationError,
+    AirBalanceCoordinator,
+    CoordinatorResult,
+)
 from coldaisle.control.air_balance_trace import AirBalanceRecorder
 from coldaisle.control.authority import (
     AUTHORITY_JOURNAL_SCHEMA_VERSION,
@@ -75,6 +80,8 @@ from coldaisle.control.config import (
     MAX_MPC_EVALUATIONS,
     MAX_MPC_HORIZON_STEPS,
     SAFETY_CONFIG_VERSION,
+    AirBalanceCoordinationConfig,
+    AirBalanceCoordinationMode,
     ControlConfig,
     GuardThresholdBand,
     MpcCostMetrics,
@@ -420,6 +427,10 @@ __all__ = [
     "AdminModeTracker",
     "AirBalanceConfig",
     "AirBalanceCoordination",
+    "AirBalanceCoordinationConfig",
+    "AirBalanceCoordinationError",
+    "AirBalanceCoordinationMode",
+    "AirBalanceCoordinator",
     "AirBalanceEstimate",
     "AirBalanceMetadata",
     "AirBalanceModel",
@@ -486,6 +497,7 @@ __all__ = [
     "ControllerKind",
     "ControllerProposal",
     "ControllerSelection",
+    "CoordinatorResult",
     "CostTerms",
     "CounterfactualModelIdentity",
     "CounterfactualThermalModel",
