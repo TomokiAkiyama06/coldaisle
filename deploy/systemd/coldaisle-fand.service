@@ -1,0 +1,120 @@
+# coldaisle 3系統 Fan 制御デーモン（#57 / #74 / #78 / 決定記録 0080）のテンプレート。
+#
+# **テンプレートである。** ユーザー名・グループ名・設定の置き場所は仮の値。
+# 時間切れ・WatchdogSec・RestartSec は**暫定値**で、実機の測定と所有者の承認（0028 §2.9 の
+# 承認点 2）を経て決める（0080 §5 の 1）。手順は docs/ubuntu-deploy.md。
+#
+# **置いても `systemctl enable` しない。** 有効化は 0080 §2.10 の段階 5（systemd のある環境での
+# kill・watchdog・正常停止の確認）と、0028 §2.9 の承認点 3 の後（docs/critical-safety.md の
+# 「統合と実機検証までサービスで Fan 制御を有効化しない」）。
+#
+# hwmon へ書くのはこのプロセスだけ（AGENTS.md / control_daemon.py）。書き込みの権限は
+# deploy/udev/99-coldaisle-hwmon.rules が対象の pwmN / pwmN_enable にだけ渡す（0080 §2.6）。
+
+[Unit]
+Description=coldaisle 3-zone fan control daemon
+Documentation=file:///opt/coldaisle/docs/ubuntu-deploy.md
+# DB と入力を先に動かす。**Requires= / BindsTo= / PartOf= / Requisite= は使わない**（0080 §2.9）。
+# 取り込みの停止・再起動で冷却の制御まで止めない。入力の欠測は Critical Safety が安全側へ倒す。
+# coldaisle-telemetry.service はまだ無い（0069 未決 3）。無い unit への Wants= は無視される。
+# 停止は After= の逆順なので、OS の停止では fand が先に止まり、入力が生きているうちに BIOS へ返す
+Wants=coldaisle-daemon.service coldaisle-telemetry.service
+After=coldaisle-daemon.service coldaisle-telemetry.service systemd-modules-load.service
+# 再起動を諦めない。諦めると tach の stall も pwmN_enable の書き戻しも見る者が居なくなる（0080 §2.4）
+StartLimitIntervalSec=0
+
+[Service]
+# READY=1 / WATCHDOG=1 は fand が送る（0060 §2.7）。子や将来の worker には送らせない（0080 §2.2）
+Type=notify
+NotifyAccess=main
+
+# fand 専用のユーザー（仮の値）。coldaisle（API / 取り込み）とも root とも分ける（0080 §2.1 / 0072 §2.5）。
+# coldaisle: DB を読み書きし /etc/coldaisle を読む。coldaisle-admin: 管理ソケットのグループ
+# （/etc/coldaisle/control-admin.yaml の socket.group と同じ名前にする）
+User=coldaisle-fan
+Group=coldaisle-fan
+SupplementaryGroups=coldaisle coldaisle-admin
+# SQLite の -wal / -shm / -journal を取り込みと同じグループで書けるようにする（0080 §2.1）
+UMask=0007
+WorkingDirectory=/opt/coldaisle
+
+# 実行ファイルは導入先の venv の絶対パスで書く（素の名前は systemd の探索パスに無い）。
+# 制御の4ファイルと管理ソケットの設定は root 所有の場所に置き、fand 自身が safety.yaml を緩められないようにする
+ExecStart=/opt/coldaisle/.venv/bin/coldaisle-fand --require-watchdog --config-dir /etc/coldaisle/control-config --admin-config /etc/coldaisle/control-admin.yaml --db /var/lib/coldaisle/coldaisle.db --authority-root /var/lib/coldaisle-fand/authority
+
+# 異常終了・watchdog・SIGKILL の後に root・sandbox なしで Max を書く引き継ぎ実行部（0028 §2.7 / 0080 §2.5）。
+# venv と coldaisle パッケージに依存しないよう、システムの python3 でソースを直接、引数なしで実行する。
+# 正常停止かどうかは引き継ぎ記録の有無だけで決める（SERVICE_RESULT を読まない。0080 §2.8）
+ExecStopPost=+/usr/bin/python3 -I -S /opt/coldaisle/src/coldaisle/safety_handoff.py
+
+# ExecStopPost の前に cgroup の全プロセスを止め、書き手を1つにする（0028 §2.7）。既定だが明示する
+KillMode=control-group
+
+# **暫定値。** 導入先の safety.yaml の watchdog_timeout_ms と同じ値にする（正本は safety.yaml。
+# 長ければ fand は終了コード 4 で制御を取らない。0080 §2.3）。下の 5s は試験の fixture と同じ仮の値
+WatchdogSec=5s
+# SIGABRT（既定）で faulthandler が全スレッドの traceback を journal へ残す（0080 §2.5）
+WatchdogSignal=SIGABRT
+# core の書き出しで ExecStopPost の Max を遅らせない
+LimitCORE=0
+
+# 時間切れは既定（90 秒）に任せず明示する。**暫定値**（0080 §2.3 / §5 の 1）。
+# TimeoutStopSec は tick_ms + tick_deadline_ms と正常停止の返却の合計より長くする。超えれば SIGKILL の後に Max
+TimeoutStartSec=30s
+TimeoutStopSec=10s
+TimeoutAbortSec=5s
+
+# 起動のたびに STARTUP の Max を通る（0028 §2.7）。RestartSec は暫定値
+Restart=always
+RestartSec=2
+# 3: hardware mapping が provisional（承認点 3 が要る）。4: deadman が恒久的に使えない（unit か
+# safety.yaml の食い違い）。どちらも人が直すまで結果が変わらない。**他の終了コードは入れない**（0080 §2.4）
+RestartPreventExitStatus=3 4
+
+# 引き継ぎ記録（/run/coldaisle/fan-handoff.json）と管理ソケットの置き場所。
+# **/run/coldaisle を RuntimeDirectory に持つのはこの unit だけ**（0080 §2.7）。
+# 0711: 管理ソケットのグループは other の x でたどれ、一覧は見せない。
+# Preserve=yes: 記録を消すのは fand の正常停止だけ（systemd の後片付けに任せない）
+RuntimeDirectory=coldaisle
+RuntimeDirectoryMode=0711
+RuntimeDirectoryPreserve=yes
+
+# authority.json（0057）の置き場所。**StateDirectory=coldaisle は書かない**（書くと
+# /var/lib/coldaisle の所有者が fand に付け替えられ、取り込み・API が DB を書けなくなる。0080 §2.1）
+StateDirectory=coldaisle-fand
+StateDirectoryMode=0700
+# DB。ProtectSystem=strict の下で必要な分だけ開ける。/var/lib/coldaisle は既存の unit の StateDirectory=
+ReadWritePaths=/var/lib/coldaisle
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=coldaisle-fand
+
+# hardening（0080 §2.6）。**ProtectKernelTunables=yes にしない**（/sys が読み取り専用になり hwmon へ書けない）
+ProtectKernelTunables=no
+ProtectSystem=strict
+# fand は /dev を開かない。シリアルを開くのは取り込みだけ（AGENTS.md ルール6）
+PrivateDevices=yes
+# sd_notify と管理ソケットだけ。TCP を持たない（AGENTS.md ルール1）
+RestrictAddressFamilies=AF_UNIX
+IPAddressDeny=any
+# 非 root。書き込みはファイルの権限だけで行う
+CapabilityBoundingSet=
+AmbientCapabilities=
+NoNewPrivileges=yes
+ProtectHome=yes
+PrivateTmp=yes
+# hwmon のドライバは modules-load.d で起動時に読み込む（fand に読み込ませない）
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+# MemoryDenyWriteExecute と SystemCallFilter は入れない（worker の数値ライブラリと未確認。0080 §5 の 10）
+
+[Install]
+WantedBy=multi-user.target

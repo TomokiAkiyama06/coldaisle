@@ -18,7 +18,11 @@ User=coldaisle
 Group=coldaisle
 WorkingDirectory=/opt/coldaisle
 StateDirectory=coldaisle
-StateDirectoryMode=0750
+# 2770（setgid）: coldaisle-fand も補助グループ coldaisle で DB を書く。どの unit の起動でも
+# 同じ mode に戻るので、/var/lib/coldaisle を使う unit すべてで揃える（決定記録 0080 §2.1）
+StateDirectoryMode=2770
+# SQLite の -wal / -journal を DB と同じグループで書けるようにする（0080 §2.1）
+UMask=0007
 EnvironmentFile=-/etc/coldaisle/coldaisle.env
 ExecStart=/opt/coldaisle/.venv/bin/coldaisle-report --db /var/lib/coldaisle/coldaisle.db
 
