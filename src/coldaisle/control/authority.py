@@ -4,7 +4,7 @@
 Model Registry（#104）が決め、この module は一切関与しない。Production の入れ替えで
 authority は動かない（0057 §2.3。試験で確かめる）。
 
-この module が持つ不変条件は7つある。
+この module が持つ不変条件は8つある。
 
 1. 既定は Shadow。journal が無ければ Shadow から始まる
 2. **stage を上げられるのは人の承認だけ。** 承認には承認者・理由・時刻が要る
@@ -13,6 +13,8 @@ authority は動かない（0057 §2.3。試験で確かめる）。
 5. **降格に承認は要らない。** Baseline（Shadow）への rollback は常に1手で行える
 6. 設定（#103 の `authority_stage`）は**上限**として働く。実効 stage がこれを超えない
 7. stage は model version と独立に decision trace へ残る
+8. **昇格の承認者は、実行した process の uid に束縛する**（決定記録 0086）。root・
+   authority のディレクトリの所有者（fand の実行ユーザー）・`uid != euid` は承認できない
 
 **Fan へ届く経路を持たない。** demand も PWM も作らず、Reactive Guard / Critical Safety を
 import しない。出せるのは「いまの stage」までで、Critical Safety は全 stage で同一である
@@ -35,7 +37,7 @@ from enum import StrEnum
 from fcntl import LOCK_EX, LOCK_NB, LOCK_UN, flock
 from hashlib import sha256
 from pathlib import Path
-from typing import Literal, Self
+from typing import Literal, Protocol, Self
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
@@ -78,6 +80,7 @@ from coldaisle.control.schema import (
 )
 
 __all__ = [
+    "APPROVER_BINDING_PROCESS_UID",
     "AUTHORITY_JOURNAL_SCHEMA_VERSION",
     "AUTHORITY_STATE_FILENAME",
     "BASELINE_STAGE",
@@ -86,7 +89,9 @@ __all__ = [
     "MAX_JOURNAL_EVENTS",
     "MIN_EVIDENCE_REPORT_SCHEMA_VERSION",
     "STAGE_ORDER",
+    "ApproverRejection",
     "AuthorityApprovalError",
+    "AuthorityApproverError",
     "AuthorityChangeKind",
     "AuthorityDemotion",
     "AuthorityError",
@@ -102,6 +107,9 @@ __all__ = [
     "AuthorityTrigger",
     "AutomaticCause",
     "JournalSignature",
+    "OsProcessIdentity",
+    "ProcessCredentials",
+    "ProcessIdentity",
     "RolloutEvidence",
     "StageApproval",
     "StaticAuthorityStage",
@@ -111,7 +119,7 @@ __all__ = [
     "stage_rank",
 ]
 
-AUTHORITY_JOURNAL_SCHEMA_VERSION: Literal[3] = 3
+AUTHORITY_JOURNAL_SCHEMA_VERSION: Literal[4] = 4
 """journal 1つの形の版。**欄の意味を変えたら上げる。**
 
 - v2（#81 / 決定記録 0073 §2.6）: 昇格 event の証拠（`RolloutEvidence`）に
@@ -123,6 +131,28 @@ AUTHORITY_JOURNAL_SCHEMA_VERSION: Literal[3] = 3
   journal にだけ置ける。** v2 までの reader はこの値を知らないので、版を上げて「知らない
   journal」として拒ませる（黙って読み違えさせない）。v1 / v2 の journal はそのまま読み、
   次に書くときに v3 で書く（既に残った event は書き換えない）
+- v4（#92 / 決定記録 0086 §2.7）: 昇格の承認に `approver_binding`（`"process_uid"`）を足した。
+  欄があれば `approver` は「CLI を実行した process の uid」（`uid.<数値>`）に束縛済みである。
+  **この欄を持つ承認は v4 の journal にだけ置ける**（v3 までの reader に黙って読み違えさせない）。
+  束縛は一度入ったら外せない。v1〜v3 の journal はそのまま読み、次に書くときに v4 で書く
+  （既に残った event は書き換えない）
+"""
+
+APPROVER_BINDING_PROCESS_UID: Literal["process_uid"] = "process_uid"
+"""承認者を実行した process の uid に束縛したことを示す値（決定記録 0086 §2.7）。"""
+
+_MAX_UID = 4_294_967_294
+"""記録できる uid の上限。`uid_t` の `-1`（4294967295）は「無効」の意味なので除く（0086 §2.1）。"""
+
+_PROCESS_UID_ACTOR = re.compile(r"^uid\.(0|[1-9][0-9]*)$")
+"""束縛した承認者の形。管理ソケットの操作者（0072 §2.5）と同じ `uid.<数値>` に揃える。"""
+
+_SHARED_FILE_MODE = 0o660
+"""journal・一時ファイル・lock の mode（0086 §2.4）。
+
+人（承認者のグループ）と fand の両方が読み書きする。人の shell の `umask` は `0022` が多く、
+そのまま作ると `0640` になって fand が lock を `O_RDWR` で開けず、**降格を書き残せなくなる**。
+`umask` に依らないよう、作った直後に `fchmod` する。
 """
 
 AUTHORITY_STATE_FILENAME = "authority.json"
@@ -170,6 +200,82 @@ class AuthorityStateError(AuthorityError):
 
 class AuthorityStoreError(AuthorityError):
     """journal を安全に読み書きできない（path・権限・I/O）。"""
+
+
+class ApproverRejection(StrEnum):
+    """昇格の承認者として認めない理由（決定記録 0086 §2.3 / §2.5）。
+
+    CLI（段階 3b）がこの値を表示と終了コードへ写す。**値は記録・ログの code なので変えない。**
+    """
+
+    ROOT = "approver_is_root"
+    """`uid == 0`。root は journal を直接書けるので、承認者の帰属を言えない。"""
+    AUTHORITY_ROOT_OWNER = "approver_owns_authority_root"
+    """authority のディレクトリの所有者（= fand の実行ユーザー）。
+
+    fand が乗っ取られても、自分で昇格を書けないようにする。
+    """
+    UID_EUID_MISMATCH = "uid_differs_from_euid"
+    """setuid のラッパー経由。実行した人と書いた権限が食い違う。"""
+    INVALID_UID = "invalid_uid"
+    """`0..4294967294` の外の uid。"""
+    UNBOUND_APPROVAL = "approval_not_bound_to_process"
+    """承認に `approver_binding` が無い（自己申告の承認）。新しい昇格には書かない。"""
+    APPROVER_MISMATCH = "approver_is_not_the_process_uid"
+    """承認の `approver` が、いま実行している process の `uid.<数値>` と違う。"""
+
+
+class AuthorityApproverError(AuthorityApprovalError):
+    """承認者を認めない。**journal を読む前に拒む**（決定記録 0086 §2.3 / §2.5）。"""
+
+    def __init__(self, code: ApproverRejection, message: str) -> None:
+        super().__init__(f"{message}（code={code.value}）")
+        self.code = code
+
+
+@dataclass(frozen=True, slots=True)
+class ProcessCredentials:
+    """実行している process の実 uid と実効 uid（決定記録 0086 §2.1）。
+
+    **環境変数（`SUDO_UID` など）から作らない。** カーネルが知っている値だけを使う。
+    """
+
+    uid: int
+    euid: int
+
+    def __post_init__(self) -> None:
+        for value in (self.uid, self.euid):
+            if isinstance(value, bool) or not 0 <= value <= _MAX_UID:
+                raise AuthorityApproverError(
+                    ApproverRejection.INVALID_UID, f"uid が記録できる範囲の外にある（{value}）"
+                )
+
+    @property
+    def actor(self) -> str:
+        """journal に残す形（`uid.<数値>`）。**名前解決の結果は記録に使わない**（0086 §2.8）。"""
+        return f"uid.{self.uid}"
+
+
+class ProcessIdentity(Protocol):
+    """実行者の source。時計と同じく store が持ち、試験では差し替える（決定記録 0086 §2.5）。
+
+    昇格の承認者を呼び出し側の引数から受け取ると、別の人の名前で承認を書けてしまう。
+    store が自分で実行者を知ることで、承認者の欄にも「値を持ち込む余地を残さない」（0057 §2.3）。
+    """
+
+    def credentials(self) -> ProcessCredentials:
+        """いまの実 uid と実効 uid。"""
+        ...
+
+
+class OsProcessIdentity:
+    """`os.getuid()` / `os.geteuid()` をそのまま返す既定の source（決定記録 0086 §2.1）。"""
+
+    __slots__ = ()
+
+    def credentials(self) -> ProcessCredentials:
+        """カーネルの値。`SUDO_UID` / `SUDO_USER` / `LOGNAME` / `USER` は読まない。"""
+        return ProcessCredentials(uid=os.getuid(), euid=os.geteuid())
 
 
 class AuthorityChangeKind(StrEnum):
@@ -273,12 +379,39 @@ class StageApproval(_Frozen):
     approved_at_ms: int = Field(ge=0)
     reason: str = Field(min_length=1, max_length=1000)
     evidence: RolloutEvidence
+    approver_binding: Literal["process_uid"] | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
+    """`approver` が実行した process の uid に束縛済みであること（決定記録 0086 §2.7。journal v4）。
+
+    欄が無い承認は v3 までの自己申告で、過去の記録として読むだけである。
+    **新しい昇格は必ずこの欄を持つ**（`raise_stage` が欠けた承認を拒む）。欄が無いときに
+    出力へ書かないのは、v3 までの event を v4 で書き直しても同じ内容のまま残すため。
+    """
 
     @model_validator(mode="after")
     def _raises_exactly_one_stage(self) -> Self:
         if stage_above(self.from_stage) is not self.to_stage:
             raise ValueError("昇格は1段ずつにする（0057 §2.5）")
         return self
+
+    @model_validator(mode="after")
+    def _a_bound_approver_is_a_process_uid(self) -> Self:
+        if self.approver_binding is None:
+            return self
+        matched = _PROCESS_UID_ACTOR.fullmatch(self.approver)
+        if matched is None:
+            raise ValueError("束縛した承認者は uid.<数値> の形にする（0086 §2.7）")
+        uid = int(matched.group(1))
+        # uid.0（root）は raise_stage が作らない。journal に現れたら書き換えを疑う（0086 §2.3）。
+        if not 1 <= uid <= _MAX_UID:
+            raise ValueError("束縛した承認者の uid が範囲の外にある（root を含む。0086 §2.7）")
+        return self
+
+    @property
+    def binds_process_uid(self) -> bool:
+        """承認者が実行した process の uid に束縛された承認か（journal v4）。"""
+        return self.approver_binding is not None
 
 
 class AuthorityEvent(_Frozen):
@@ -332,7 +465,7 @@ class AuthorityJournal(_Frozen):
     **stage は event から再現できなければならない。** 再現できない journal は読まない。
     """
 
-    schema_version: Literal[1, 2, 3] = AUTHORITY_JOURNAL_SCHEMA_VERSION
+    schema_version: Literal[1, 2, 3, 4] = AUTHORITY_JOURNAL_SCHEMA_VERSION
     revision: int = Field(ge=0)
     stage: AuthorityStage = BASELINE_STAGE
     events: tuple[AuthorityEvent, ...] = ()
@@ -342,11 +475,19 @@ class AuthorityJournal(_Frozen):
         if len(self.events) != self.revision:
             raise ValueError("revision と event 数が一致しない")
         bound_seen = False
+        approver_bound_seen = False
         for event in self.events:
             if event.cause in _CAUSES_ADDED_IN_V3 and self.schema_version < 3:
                 raise ValueError(f"{event.cause} の降格を記録する journal は v3 にする")
             if event.approval is None:
                 continue
+            if event.approval.binds_process_uid:
+                if self.schema_version < 4:
+                    raise ValueError("実行者に束縛した承認を記録する journal は v4 にする")
+                approver_bound_seen = True
+            elif approver_bound_seen:
+                # 束縛は一度入ったら外せない（0086 §2.7）。後の昇格が自己申告へ戻る記録を作らない。
+                raise ValueError("実行者に束縛した昇格のあとに、束縛の無い昇格を記録しない")
             if event.approval.evidence.binds_air_balance:
                 if self.schema_version < 2:
                     raise ValueError("設定に束縛した証拠を記録する journal は v2 にする")
@@ -597,7 +738,14 @@ class AuthorityStore:
     状態を動かせてしまう（0057 §2.3）。
     """
 
-    __slots__ = ("_clock", "_lock_timeout_ms", "_no_wait", "_root")
+    __slots__ = (
+        "_clock",
+        "_identity",
+        "_lock_timeout_ms",
+        "_no_wait",
+        "_require_shared_root",
+        "_root",
+    )
 
     def __init__(
         self,
@@ -605,6 +753,8 @@ class AuthorityStore:
         clock: Clock | None = None,
         *,
         lock_timeout_ms: int | None = None,
+        identity: ProcessIdentity | None = None,
+        require_shared_root: bool = False,
     ) -> None:
         """**時刻は store が持つ時計から取る。**
 
@@ -615,6 +765,15 @@ class AuthorityStore:
         には必ず指定する**（決定記録 0060 §2.7）。指定しないと `flock` が無期限に待ち、
         降格の書き残しが control tick のあいだに居座って heartbeat が途切れる。
         人の操作（昇格）のように deadman の無い経路では、待ち続けてよいので省略できる。
+
+        **実行者も store が自分で知る**（``identity``。既定は ``os.getuid()`` /
+        ``os.geteuid()``。決定記録 0086 §2.5）。昇格の承認者を引数で受け取らない。
+
+        ``require_shared_root`` は人が CLI から使う store の指定である（0086 §2.4）。
+        authority のディレクトリを**作らず**（無ければ error）、書く前にそれが
+        「ディレクトリ・other に権限が無い・setgid 付き」であることを確かめる。CLI が
+        `0700` で作ると、人の uid が所有する fand の読めないディレクトリができてしまう。
+        fand の store は従来どおり無ければ作る（開発用の `var/authority`）。
         """
         if not root.is_absolute():
             raise AuthorityStoreError("authority store の root は絶対 path にする")
@@ -624,6 +783,8 @@ class AuthorityStore:
         self._clock = clock if clock is not None else WallClock()
         self._lock_timeout_ms = lock_timeout_ms
         self._no_wait = False
+        self._identity: ProcessIdentity = identity if identity is not None else OsProcessIdentity()
+        self._require_shared_root = require_shared_root
 
     @property
     def lock_timeout_ms(self) -> int | None:
@@ -701,8 +862,23 @@ class AuthorityStore:
 
         **降格は Registry の lock を取らない。** registry が壊れていても、使えなくても、
         安全側（stage を下げる）へは常に動ける。
+
+        **承認者は実行した process の uid に束縛する**（決定記録 0086 §2.3 / §2.5）。
+        root・authority のディレクトリの所有者（fand の実行ユーザー）・`uid != euid` を、
+        journal を読む前に `AuthorityApproverError` で拒み、次に `approval.approver` が
+        `uid.<実行者の uid>` でなければ拒む。CLI だけで確かめると、fand の実行ユーザーとして
+        Python からこの関数を直接呼べば、自分の uid の承認で昇格を書けてしまう。
         """
         policy = config.policy
+        # **実行者は1回だけ読む。** 検証の途中で変わった値で書かない。
+        credentials = self._identity.credentials()
+        self._check_process(credentials)
+        # 所有者は lock の前にも見る（Registry の lock を待たせる前に弾く）。
+        # 判断は lock の中で、実際に書くディレクトリについて行う。
+        with self._open_root(create=False) as early_root_fd:
+            if early_root_fd is not None:
+                self._check_root_owner(early_root_fd, credentials)
+        self._check_approver_binding(approval, credentials)
         # lock を待たせる前に、明らかに駄目なものは弾く。**判断はこれではない**（下を見る）。
         self._check_approval_freshness(approval, policy, self._clock.now_ms())
         if stage_rank(approval.to_stage) > stage_rank(policy.authority_stage):
@@ -714,6 +890,9 @@ class AuthorityStore:
         with self._pinned_production(registry, artifact_kind) as pinned:
             production, registry_revision = pinned
             with self._exclusive_lock() as root_fd:
+                # **journal を読む前に**、いま開いているディレクトリの所有者で判断する
+                # （lock の前に見たディレクトリと入れ替わっていても、ここが正しい）。
+                self._check_root_owner(root_fd, credentials)
                 journal = self._read(root_fd)
                 if approval.expected_revision != journal.revision:
                     raise AuthorityApprovalError(
@@ -806,6 +985,53 @@ class AuthorityStore:
             reason=reason,
             trigger=AuthorityTrigger.HUMAN,
         )
+
+    @staticmethod
+    def _check_process(credentials: ProcessCredentials) -> None:
+        """root と setuid 経由の実行を拒む（決定記録 0086 §2.1 / §2.3）。"""
+        if credentials.uid != credentials.euid:
+            raise AuthorityApproverError(
+                ApproverRejection.UID_EUID_MISMATCH,
+                "実 uid と実効 uid が違う process からは昇格を書かない"
+                f"（uid={credentials.uid}; euid={credentials.euid}）",
+            )
+        if credentials.uid == 0:
+            raise AuthorityApproverError(
+                ApproverRejection.ROOT, "root は昇格を承認できない（journal を直接書けるため）"
+            )
+
+    @staticmethod
+    def _check_root_owner(root_fd: int, credentials: ProcessCredentials) -> None:
+        """authority のディレクトリの所有者（= fand の実行ユーザー）を承認者にしない（0086 §2.3）。
+
+        許す uid の一覧は設定に置かない。誰が承認できるかは承認者のグループの所属という
+        1つの事実に集める（0086 §2.3）。ここで見るのは「fand 自身ではない」ことだけである。
+        """
+        try:
+            owner = os.fstat(root_fd).st_uid
+        except OSError as error:
+            raise AuthorityStoreError("authority のディレクトリの所有者を読めない") from error
+        if owner == credentials.uid:
+            raise AuthorityApproverError(
+                ApproverRejection.AUTHORITY_ROOT_OWNER,
+                "authority のディレクトリの所有者（fand の実行ユーザー）は昇格を承認できない"
+                f"（uid={credentials.uid}）",
+            )
+
+    @staticmethod
+    def _check_approver_binding(approval: StageApproval, credentials: ProcessCredentials) -> None:
+        """承認者の欄が、いま実行している process の uid と一致することを確かめる（0086 §2.5）。"""
+        if not approval.binds_process_uid:
+            raise AuthorityApproverError(
+                ApproverRejection.UNBOUND_APPROVAL,
+                "実行者に束縛していない承認では昇格を書かない（自己申告の承認者を残さない）",
+            )
+        if approval.approver != credentials.actor:
+            raise AuthorityApproverError(
+                ApproverRejection.APPROVER_MISMATCH,
+                "承認者が実行した process の uid と違う"
+                f"（approver={approval.approver}; process={credentials.actor}）",
+            )
 
     @contextmanager
     def _pinned_production(
@@ -1073,14 +1299,15 @@ class AuthorityStore:
 
     @contextmanager
     def _exclusive_lock(self) -> Iterator[int]:
-        with self._open_root(create=True) as root_fd:
-            assert root_fd is not None
-            try:
-                lock_fd = os.open(
-                    _LOCK_FILENAME, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600, dir_fd=root_fd
+        with self._open_root(create=not self._require_shared_root) as root_fd:
+            if root_fd is None:
+                # CLI の store はディレクトリを作らない（決定記録 0086 §2.4）。導入手順で作る。
+                raise AuthorityStoreError(
+                    "authority のディレクトリが無い（CLI からは作らない。導入手順で作る）"
                 )
-            except OSError as error:
-                raise AuthorityStoreError("authority lock が symlink である") from error
+            if self._require_shared_root:
+                self._check_shared_root(root_fd)
+            lock_fd = self._open_lock(root_fd)
             try:
                 if not stat.S_ISREG(os.fstat(lock_fd).st_mode):
                     raise AuthorityStoreError("authority lock が regular file ではない")
@@ -1091,6 +1318,54 @@ class AuthorityStore:
                     flock(lock_fd, LOCK_UN)
             finally:
                 os.close(lock_fd)
+
+    @staticmethod
+    def _check_shared_root(root_fd: int) -> None:
+        """人と fand が共有するディレクトリの形を、書く前に確かめる（決定記録 0086 §2.4）。
+
+        導入の誤りを、fand が journal を読めなくなる前（運転中に `SHADOW` へ落ちる前）に見つける。
+        """
+        try:
+            mode = os.fstat(root_fd).st_mode
+        except OSError as error:
+            raise AuthorityStoreError("authority のディレクトリの mode を読めない") from error
+        if not stat.S_ISDIR(mode):
+            raise AuthorityStoreError("authority の root がディレクトリではない")
+        if mode & stat.S_IRWXO:
+            raise AuthorityStoreError(
+                f"authority のディレクトリに other の権限がある（mode={stat.S_IMODE(mode):04o}）"
+            )
+        if not mode & stat.S_ISGID:
+            raise AuthorityStoreError(
+                "authority のディレクトリに setgid が無い"
+                f"（mode={stat.S_IMODE(mode):04o}。人が書いた journal のグループが揃わない）"
+            )
+
+    @staticmethod
+    def _open_lock(root_fd: int) -> int:
+        """lock を開く。**新しく作ったときだけ** `0660` にする（決定記録 0086 §2.4）。
+
+        既にある lock の mode は変えない。他人の作った lock の mode を変えようとすると
+        `EPERM` で止まり、降格を書けなくなるため（mode は導入手順で揃える）。
+        """
+        flags = os.O_RDWR | os.O_NOFOLLOW
+        try:
+            lock_fd = os.open(
+                _LOCK_FILENAME, flags | os.O_CREAT | os.O_EXCL, _SHARED_FILE_MODE, dir_fd=root_fd
+            )
+        except FileExistsError:
+            try:
+                return os.open(_LOCK_FILENAME, flags, dir_fd=root_fd)
+            except OSError as error:
+                raise AuthorityStoreError("authority lock が symlink である") from error
+        except OSError as error:
+            raise AuthorityStoreError("authority lock を作れない") from error
+        try:
+            os.fchmod(lock_fd, _SHARED_FILE_MODE)
+        except BaseException:
+            os.close(lock_fd)
+            raise
+        return lock_fd
 
     def _acquire(self, lock_fd: int) -> None:
         """排他 lock を取る。上限が指定されていれば、そこで諦める。
@@ -1183,9 +1458,12 @@ class AuthorityStore:
             raise AuthorityStoreError(f"authority の書込先が regular file ではない: {name}")
         temporary_name = f".{name}.{secrets.token_hex(12)}.tmp"
         flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
-        temporary_fd = os.open(temporary_name, flags, 0o600, dir_fd=directory_fd)
+        temporary_fd = os.open(temporary_name, flags, _SHARED_FILE_MODE, dir_fd=directory_fd)
         try:
             try:
+                # `umask` に依らず `0660` にする（決定記録 0086 §2.4）。
+                # 置換後の journal の mode になる。
+                os.fchmod(temporary_fd, _SHARED_FILE_MODE)
                 remaining = memoryview(payload)
                 while remaining:
                     written = os.write(temporary_fd, remaining)
