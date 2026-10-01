@@ -1046,3 +1046,18 @@ def test_record_invariants_are_enforced(
     document["air_balance_coordination"].update(change)
     with pytest.raises(ValidationError, match=message):
         _validate(document)
+
+
+@pytest.mark.parametrize("held", [None, {"front": True, "rear": False, "top": False}])
+def test_a_skipped_tick_must_record_an_explicit_release(
+    catalog: MetricCatalog, held: dict[str, bool] | None
+) -> None:
+    """``skipped`` / ``failed`` の ``held`` は null を許さず、3 zone とも偽（0088 §2.2）。"""
+    harness = Harness(catalog, config=coordination_config("apply"))
+    document: dict[str, Any] = json.loads(harness.tick().tick.model_dump_json())
+    block = document["air_balance_coordination"]
+    assert block["status"] == "skipped"
+    assert block["held"] == {"front": False, "rear": False, "top": False}
+    block["held"] = held
+    with pytest.raises(ValidationError, match="保持を解く"):
+        _validate(document)

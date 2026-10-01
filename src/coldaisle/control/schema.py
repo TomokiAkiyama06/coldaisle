@@ -1894,8 +1894,10 @@ class AirBalanceCoordinationRecord(_Frozen):
             raise ValueError("skipped / failed の tick は raw baseline（candidate）を使う")
         if self.counterfactual_output is not None:
             raise ValueError("skipped / failed の tick に counterfactual_output を残さない")
-        if self.held is not None and any(self.held.get(zone) for zone in Zone):
-            raise ValueError("skipped / failed の tick は保持を解く")
+        # 「解いた」を null（不明）と区別するため、3 zone とも明示的な偽を要る
+        # （0078 §2.7 / 0088 §2.2）。
+        if self.held is None or any(self.held.get(zone) for zone in Zone):
+            raise ValueError("skipped / failed の tick は保持を解く（held はすべて偽）")
         if self.status is AirBalanceCoordinationStatus.FAILED and self.candidate is None:
             raise ValueError("failed は coordinate() を呼んだ tick だけ（raw baseline がある）")
         if self.status is AirBalanceCoordinationStatus.SKIPPED and (
