@@ -537,7 +537,7 @@ def test_a_socket_rollback_applies_before_the_gate_reads_the_stage(catalog, tmp_
     mailbox.pending_authority = authority_command(7, AuthorityStage.SHADOW)
     tick = harness.tick().tick
 
-    assert tick.schema_version == 13
+    assert tick.schema_version == 14
     assert tick.state.authority_stage is AuthorityStage.SHADOW, "同じ tick の Gate から効く"
     assert tick.authority is not None
     assert tick.authority.command_id == 7

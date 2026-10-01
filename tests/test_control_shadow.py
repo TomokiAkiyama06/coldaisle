@@ -81,6 +81,7 @@ from test_control_schema import (
     AIR_BALANCE_RECORD,
     AUTHORITY_RECORD,
     CONTROL_TICK_RUNTIME,
+    COORDINATION_RECORD,
     MODE_COMMAND_RECORD,
     REGISTRY_PROVENANCE,
     SAFETY_PROVENANCE,
@@ -263,6 +264,8 @@ def tick_with(
         air_balance=AIR_BALANCE_RECORD,
         mode_command=MODE_COMMAND_RECORD,
         authority=AUTHORITY_RECORD,
+        air_balance_coordination=COORDINATION_RECORD,
+        tach_unconfirmed_zones=(),
     )
 
 
@@ -561,6 +564,8 @@ def test_invariant_1_g_a_shadow_record_is_refused_in_modes_people_drive() -> Non
             air_balance=AIR_BALANCE_RECORD,
             mode_command=MODE_COMMAND_RECORD,
             authority=AUTHORITY_RECORD,
+            air_balance_coordination=COORDINATION_RECORD,
+            tach_unconfirmed_zones=(),
         )
     # 記録器自身も、その mode では何も作らない。
     assert (
@@ -1436,6 +1441,8 @@ def solved_shadow_tick(*, applied: float, ts_ms: int = SCORED_ACTION_TS_MS) -> C
         air_balance=AIR_BALANCE_RECORD,
         mode_command=MODE_COMMAND_RECORD,
         authority=AUTHORITY_RECORD,
+        air_balance_coordination=COORDINATION_RECORD,
+        tach_unconfirmed_zones=(),
     )
 
 
@@ -1458,6 +1465,8 @@ def follow_up_tick(*, tick_id: int, ts_ms: int, applied: float) -> ControlTick:
         air_balance=AIR_BALANCE_RECORD,
         mode_command=MODE_COMMAND_RECORD,
         authority=AUTHORITY_RECORD,
+        air_balance_coordination=COORDINATION_RECORD,
+        tach_unconfirmed_zones=(),
     )
 
 
@@ -1907,6 +1916,8 @@ def test_the_counterfactual_artifact_comes_from_the_gate_not_the_assessment() ->
         air_balance=AIR_BALANCE_RECORD,
         mode_command=MODE_COMMAND_RECORD,
         authority=AUTHORITY_RECORD,
+        air_balance_coordination=COORDINATION_RECORD,
+        tach_unconfirmed_zones=(),
     )
     assert tick.model_gate is not None
     assert tick.model_gate.artifact_sha256 == item.artifact_sha256

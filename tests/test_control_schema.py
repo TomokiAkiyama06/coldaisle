@@ -57,6 +57,7 @@ from coldaisle.control import (
 from coldaisle.control.schema import (
     MODEL_GATE_ASSESSMENT_COMPONENTS,
     REGISTRY_ARTIFACT_KINDS,
+    AirBalanceCoordinationRecord,
     registry_reason_sha256,
 )
 
@@ -576,6 +577,9 @@ AIR_BALANCE_RECORD = AirBalanceRecord.disabled(
 MODE_COMMAND_RECORD = ModeCommandRecord.without_entry()
 """v12 の `ControlTick` に必須のモードの出どころ（入口を開いていない構成。決定記録 0072 §2.7）。"""
 
+COORDINATION_RECORD = AirBalanceCoordinationRecord.off()
+"""v14 の `ControlTick` に必須の Air Balance の協調の記録（`mode: off`。決定記録 0078 §2.7）。"""
+
 AUTHORITY_RECORD = AuthorityRecord(entry="static", config_ceiling=AuthorityStage.FULL)
 """v13 の `ControlTick` に必須の制御権の出どころ（journal を持たない構成。決定記録 0072 §2.6）。
 
@@ -652,6 +656,8 @@ def tick(demand: EffectiveZoneDemand, faults=(), **state_overrides) -> ControlTi
         air_balance=AIR_BALANCE_RECORD,
         mode_command=MODE_COMMAND_RECORD,
         authority=AUTHORITY_RECORD,
+        air_balance_coordination=COORDINATION_RECORD,
+        tach_unconfirmed_zones=(),
     )
 
 
@@ -765,6 +771,8 @@ def test_a_front_or_rear_stall_can_stay_degraded():
         air_balance=AIR_BALANCE_RECORD,
         mode_command=MODE_COMMAND_RECORD,
         authority=AUTHORITY_RECORD,
+        air_balance_coordination=COORDINATION_RECORD,
+        tach_unconfirmed_zones=(),
     )
     assert recorded.state.safety_state is SafetyState.DEGRADED
 
@@ -797,6 +805,8 @@ def test_stale_cpu_temperature_drives_top_to_max():
         air_balance=AIR_BALANCE_RECORD,
         mode_command=MODE_COMMAND_RECORD,
         authority=AUTHORITY_RECORD,
+        air_balance_coordination=COORDINATION_RECORD,
+        tach_unconfirmed_zones=(),
     )
     assert recorded.zones.top.demand.forced_max
 
@@ -813,7 +823,7 @@ def test_the_stored_v1_record_still_loads_unchanged():
     stored = FIXTURE.read_text(encoding="utf-8")
     tick = ControlTick.model_validate_json(stored)
     assert tick.schema_version == 1
-    assert SCHEMA_VERSION == 13
+    assert SCHEMA_VERSION == 14
     assert json.loads(tick.model_dump_json()) == json.loads(stored)
 
 
@@ -885,6 +895,8 @@ def test_current_trace_stores_workload_regime_and_confidence_together():
         air_balance=AIR_BALANCE_RECORD,
         mode_command=MODE_COMMAND_RECORD,
         authority=AUTHORITY_RECORD,
+        air_balance_coordination=COORDINATION_RECORD,
+        tach_unconfirmed_zones=(),
     )
 
     payload = json.loads(recorded.model_dump_json())
@@ -920,6 +932,8 @@ def test_v2_trace_keeps_simultaneous_transient_load_distinct():
         air_balance=AIR_BALANCE_RECORD,
         mode_command=MODE_COMMAND_RECORD,
         authority=AUTHORITY_RECORD,
+        air_balance_coordination=COORDINATION_RECORD,
+        tach_unconfirmed_zones=(),
     )
 
     payload = json.loads(recorded.model_dump_json())
@@ -940,6 +954,8 @@ def test_fallback_trace_remains_valid_when_regime_is_not_available():
         air_balance=AIR_BALANCE_RECORD,
         mode_command=MODE_COMMAND_RECORD,
         authority=AUTHORITY_RECORD,
+        air_balance_coordination=COORDINATION_RECORD,
+        tach_unconfirmed_zones=(),
     )
 
     assert recorded.schema_version == SCHEMA_VERSION
@@ -988,6 +1004,8 @@ def test_v3_supervisor_policy_requires_a_matching_decision():
             air_balance=AIR_BALANCE_RECORD,
             mode_command=MODE_COMMAND_RECORD,
             authority=AUTHORITY_RECORD,
+            air_balance_coordination=COORDINATION_RECORD,
+            tach_unconfirmed_zones=(),
         )
 
 
@@ -1100,6 +1118,8 @@ def test_the_v9_trace_keeps_disabled_inputs_and_the_provisional_flag():
         air_balance=AIR_BALANCE_RECORD,
         mode_command=MODE_COMMAND_RECORD,
         authority=AUTHORITY_RECORD,
+        air_balance_coordination=COORDINATION_RECORD,
+        tach_unconfirmed_zones=(),
     )
     payload = json.loads(recorded.model_dump_json())
     assert payload["schema_version"] == SCHEMA_VERSION
@@ -1173,6 +1193,8 @@ def registry_tick(registry: RegistryProvenance, **overrides: object) -> ControlT
         "air_balance": AIR_BALANCE_RECORD,
         "mode_command": MODE_COMMAND_RECORD,
         "authority": AUTHORITY_RECORD,
+        "air_balance_coordination": COORDINATION_RECORD,
+        "tach_unconfirmed_zones": (),
     }
     return ControlTick(**(values | overrides))
 
@@ -1182,7 +1204,7 @@ def test_a_v10_tick_round_trips_the_registry_pointer_it_used():
     recorded = registry_tick(bound_registry())
 
     payload = json.loads(recorded.model_dump_json())
-    assert payload["schema_version"] == SCHEMA_VERSION == 13
+    assert payload["schema_version"] == SCHEMA_VERSION == 14
     assert payload["registry"]["revision"] == 3
     thermal = payload["registry"]["production"]["thermal_model"]
     assert thermal["artifact_sha256"] == REGISTRY_SHA
@@ -1532,10 +1554,15 @@ def learned_tick(**overrides) -> ControlTick:
         "air_balance": AIR_BALANCE_RECORD,
         "mode_command": MODE_COMMAND_RECORD,
         "authority": AUTHORITY_RECORD,
+        "air_balance_coordination": COORDINATION_RECORD,
+        "tach_unconfirmed_zones": (),
     }
     version = overrides.get("schema_version", SCHEMA_VERSION)
     assert isinstance(version, int)
     values["runtime"] = runtime_for(version)
+    if version < 14:
+        values.pop("air_balance_coordination")
+        values.pop("tach_unconfirmed_zones")
     if version < 13:
         values.pop("authority")
     if version < 12:
@@ -1740,6 +1767,8 @@ def test_a_tick_cannot_claim_two_different_artifacts():
             air_balance=AIR_BALANCE_RECORD,
             mode_command=MODE_COMMAND_RECORD,
             authority=AUTHORITY_RECORD,
+            air_balance_coordination=COORDINATION_RECORD,
+            tach_unconfirmed_zones=(),
             state=fallback_state(
                 authority_stage=AuthorityStage.LIMITED,
                 fallback_reason=Reason(code="low_confidence"),

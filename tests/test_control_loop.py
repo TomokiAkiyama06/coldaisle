@@ -415,6 +415,7 @@ class Harness:
         t_sensor_metric: str | None = None,
         registry: RegistryProvenance | None = None,
         admin_mode: Any = None,
+        air_balance_coordinator: Any = None,
     ) -> None:
         self.config = config if config is not None else control_config()
         self.clock = SimulatedClock(TEST_EPOCH_MS)
@@ -476,6 +477,7 @@ class Harness:
             trace=ControlTraceLogger(self.trace) if with_trace else None,
             authority=authority or RecordingAuthority(self.authority, self.order),
             watchdog=self.watchdog,
+            air_balance_coordinator=air_balance_coordinator,
         )
 
     def tick(self, *, advance_ms: int | None = None) -> Any:
@@ -1074,7 +1076,7 @@ def test_invariant_12_every_tick_records_that_no_registry_was_read(catalog) -> N
     for result in results:
         assert result.tick.registry == RegistryProvenance.unbound()
     recorded = json.loads(harness.trace.rows[-1])
-    assert recorded["schema_version"] == SCHEMA_VERSION == 13
+    assert recorded["schema_version"] == SCHEMA_VERSION == 14
     assert recorded["registry"] == {"schema_version": 1, "revision": None, "production": {}}
 
 

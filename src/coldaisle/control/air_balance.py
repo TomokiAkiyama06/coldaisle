@@ -304,9 +304,11 @@ class AirBalanceCoordination(_Frozen):
     candidate: PerZone[Demand]
     requested: PerZone[Demand]
     top_request_role: Literal["case_aux_exhaust"] = "case_aux_exhaust"
-    # 後段の Critical Safety が Top に掛けると見込まれる floor（CPU cooling floor を含む）。
-    # 風量の見積もりにだけ使い、requested.top には含めない。所有者は Critical Safety のまま。
-    projected_top_floor: Demand | None = None
+    # 後段の合成（Critical Safety の floor・forced_max、Reactive Guard の floor、
+    # ramp_down の下限）が zone ごとに requested へ掛けると見込まれる下限（決定記録 0078 §2.2）。
+    # 風量の見積もりにだけ使い、requested には写さない。下限の所有者は Critical Safety と
+    # 合成のまま。
+    projected_floors: PerZone[Demand] | None = None
     before: AirBalanceEstimate
     projected: AirBalanceEstimate
     reasons: tuple[Reason, ...]
@@ -343,7 +345,7 @@ class AirBalanceModel(Protocol):
         demands: PerZone[Demand],
         thermal: ThermalInputs,
         *,
-        projected_top_floor: Demand | None = None,
+        projected_floors: PerZone[Demand] | None = None,
     ) -> AirBalanceCoordination:
         """安全層より前の requested demand を提案する。"""
 
@@ -440,19 +442,25 @@ class ConfiguredAirBalanceModel:
         demands: PerZone[Demand],
         thermal: ThermalInputs,
         *,
-        projected_top_floor: Demand | None = None,
+        projected_floors: PerZone[Demand] | None = None,
     ) -> AirBalanceCoordination:
         """Exhaust 過多なら Front、熱を伴う Intake 過多なら Rear→Top を上げる。
 
-        ``projected_top_floor`` は後段の Critical Safety が Top に掛けると見込まれる
-        floor（CPU cooling floor を含む）で、呼び出し側が ``safety.yaml`` を制約として
-        読んで渡す（決定記録 0028 §2.4 / §2.8）。Top の実際の排気は
-        ``max(case_aux_exhaust, safety_floor)`` になるため、風量の評価はその値で行う。
-        requested.top へは入れず、floor の所有者は Critical Safety のまま。
+        ``projected_floors`` は後段の合成（決定記録 0028 §2.4）が zone ごとに requested へ掛けると
+        見込まれる下限で、呼び出し側が Critical Safety の裁定・Reactive Guard の floor・
+        ``ramp_down`` の下限から求めて渡す（決定記録 0078 §2.2）。各 zone の実際の風量は
+        ``max(requested_z, projected_floors.z)`` の demand になるため、風量の評価（``before`` と
+        ``projected``）も引き上げの目標もその値で行う。目標の demand が
+        ``max(requested_z, projected_floors.z)`` 以下の zone は、下限が既にその風量を出しているので
+        引き上げない。下限は requested へ写さず、その所有者は Critical Safety と合成のまま。
         """
-        if projected_top_floor is not None and not 0.0 <= projected_top_floor <= 1.0:
-            raise ValueError("projected_top_floor は 0.0..1.0 の demand で渡す")
-        before = self.evaluate(self._airflow_demands(demands, projected_top_floor), thermal)
+        if projected_floors is not None and not all(
+            0.0 <= projected_floors.get(zone) <= 1.0 for zone in Zone
+        ):
+            # NaN は max() で黙って落ちるので、範囲の比較で明示的に拒む。
+            raise ValueError("projected_floors は 0.0..1.0 の demand で渡す")
+        airflow = self._airflow_demands(demands, projected_floors)
+        before = self.evaluate(airflow, thermal)
         requested = demands
         reasons: list[Reason] = []
         ratio = before.balance_ratio
@@ -471,12 +479,14 @@ class ConfiguredAirBalanceModel:
             exhaust_flow = before.q_rear + before.q_top
             target_front_flow = exhaust_flow / self._config.balance.target_ratio
             front_demand = self._config.zones.front.demand_for_effective_flow(target_front_flow)
-            requested = PerZone[Demand](
-                front=max(requested.front, front_demand),
-                rear=requested.rear,
-                top=requested.top,
-            )
-            if requested.front > demands.front:
+            # 下限が既に目標の風量を出している（front_demand <= airflow.front）なら上げない。
+            # floor を requested に写さない（0078 §2.2）。
+            if front_demand > airflow.front:
+                requested = PerZone[Demand](
+                    front=front_demand,
+                    rear=requested.rear,
+                    top=requested.top,
+                )
                 reasons.append(
                     Reason(
                         code="front_makeup_air",
@@ -492,39 +502,41 @@ class ConfiguredAirBalanceModel:
             and ratio < self._config.balance.minimum_ratio
             and before.thermal_limited
         ):
-            requested, reasons = self._increase_exhaust(demands, before)
+            requested, reasons = self._increase_exhaust(demands, airflow, before)
 
         return AirBalanceCoordination(
             candidate=demands,
             requested=requested,
-            projected_top_floor=projected_top_floor,
+            projected_floors=projected_floors,
             before=before,
-            projected=self.evaluate(self._airflow_demands(requested, projected_top_floor), thermal),
+            projected=self.evaluate(self._airflow_demands(requested, projected_floors), thermal),
             reasons=tuple(reasons),
         )
 
     @staticmethod
     def _airflow_demands(
         demands: PerZone[Demand],
-        projected_top_floor: Demand | None,
+        projected_floors: PerZone[Demand] | None,
     ) -> PerZone[Demand]:
-        """後段の Top floor を反映した、風量見積もり用の demand を返す。"""
-        if projected_top_floor is None or projected_top_floor <= demands.top:
+        """後段の下限を反映した、風量見積もり用の demand（zone ごとに大きい方）を返す。"""
+        if projected_floors is None:
             return demands
         return PerZone[Demand](
-            front=demands.front,
-            rear=demands.rear,
-            top=projected_top_floor,
+            front=max(demands.front, projected_floors.front),
+            rear=max(demands.rear, projected_floors.rear),
+            top=max(demands.top, projected_floors.top),
         )
 
     def _increase_exhaust(
         self,
         demands: PerZone[Demand],
+        airflow: PerZone[Demand],
         estimate: AirBalanceEstimate,
     ) -> tuple[PerZone[Demand], list[Reason]]:
         # Rear を先に使い切り、不足分だけ Top を上げる順序は決定記録 0026（FINAL）の
         # 「通常のケース換気は Front + Rear、Top の case_aux_exhaust_demand は不足時のみ」に従う。
         # response matrix による zone 選択へ変えるなら、0026 を置き換える決定記録が先に要る。
+        # 風量はどれも合成の下限込みの demand（airflow）で見積もる（決定記録 0078 §2.2）。
         assert estimate.q_front is not None
         assert estimate.q_rear is not None
         assert estimate.q_top is not None
@@ -534,10 +546,9 @@ class ConfiguredAirBalanceModel:
             self._config.zones.rear.maximum_effective_flow,
             estimate.q_rear + extra_flow,
         )
-        rear_demand = max(
-            demands.rear,
-            self._config.zones.rear.demand_for_effective_flow(rear_target),
-        )
+        rear_target_demand = self._config.zones.rear.demand_for_effective_flow(rear_target)
+        # 下限が既に目標の風量を出している zone は上げない（requested は candidate のまま）。
+        rear_demand = rear_target_demand if rear_target_demand > airflow.rear else demands.rear
         requested = PerZone[Demand](
             front=demands.front,
             rear=rear_demand,
@@ -552,20 +563,19 @@ class ConfiguredAirBalanceModel:
                 )
             )
 
-        rear_flow = self._config.zones.rear.estimate(requested.rear).effective_flow
+        rear_flow = self._config.zones.rear.estimate(
+            max(requested.rear, airflow.rear)
+        ).effective_flow
         remaining = max(0.0, required_exhaust - rear_flow - estimate.q_top)
         if remaining > 0.0:
             top_target = estimate.q_top + remaining
-            top_demand = max(
-                demands.top,
-                self._config.zones.top.demand_for_effective_flow(top_target),
-            )
-            requested = PerZone[Demand](
-                front=requested.front,
-                rear=requested.rear,
-                top=top_demand,
-            )
-            if top_demand > demands.top:
+            top_target_demand = self._config.zones.top.demand_for_effective_flow(top_target)
+            if top_target_demand > airflow.top:
+                requested = PerZone[Demand](
+                    front=requested.front,
+                    rear=requested.rear,
+                    top=top_target_demand,
+                )
                 reasons.append(
                     Reason(
                         code="top_case_aux_exhaust",
