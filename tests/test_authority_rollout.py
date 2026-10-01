@@ -57,6 +57,7 @@ from coldaisle.control import (
     FallbackCause,
     ModelRegistry,
     OperatingMode,
+    ProcessCredentials,
     RolloutEvidence,
     SafetyState,
     StageApproval,
@@ -135,7 +136,25 @@ from test_model_registry import (
 NOW_MS = 1_800_000_000_000
 """固定の壁時計。**実時計に依存させない。**"""
 
-APPROVER = "rack-owner"
+
+class FixedIdentity:
+    """差し替えた実行者（決定記録 0086 §2.5 / §2.9）。**実 root を要さずに**試す。"""
+
+    __slots__ = ("_euid", "_uid")
+
+    def __init__(self, uid: int, euid: int | None = None) -> None:
+        self._uid = uid
+        self._euid = uid if euid is None else euid
+
+    def credentials(self) -> ProcessCredentials:
+        return ProcessCredentials(uid=self._uid, euid=self._euid)
+
+
+APPROVER_UID = 4242 if os.geteuid() != 4242 else 4243
+"""承認者の uid。試験の process（= tmp_path の所有者 = fand の役）とは違う値にする。"""
+
+APPROVER = f"uid.{APPROVER_UID}"
+APPROVER_IDENTITY = FixedIdentity(APPROVER_UID)
 CONDITIONS_SHA = "3" * 64
 EVIDENCE_END_MS = NOW_MS - 3_600_000
 """証拠の最後の観測は1時間前。既定の `evidence_max_age_ms`（7日）の中に収まる。"""
@@ -143,7 +162,12 @@ EVIDENCE_END_MS = NOW_MS - 3_600_000
 
 def store(tmp_path: Path, *, now_ms: int = NOW_MS) -> AuthorityStore:
     # control runtime から使う store は lock の待ち上限が要る（決定記録 0060 §2.7）。
-    return AuthorityStore(tmp_path / "authority", SimulatedClock(now_ms), lock_timeout_ms=500)
+    return AuthorityStore(
+        tmp_path / "authority",
+        SimulatedClock(now_ms),
+        lock_timeout_ms=500,
+        identity=APPROVER_IDENTITY,
+    )
 
 
 _FIXTURES = TemporaryDirectory(prefix="pr92-authority-")
@@ -542,6 +566,7 @@ def approval_for(
         approved_at_ms=approved_at_ms,
         reason=reason,
         evidence=evidence if evidence is not None else evidence_for(document),
+        approver_binding="process_uid",
     )
 
 
@@ -796,7 +821,11 @@ def test_invariant_3_f_an_approval_that_expires_while_waiting_for_the_locks_is_r
     limit_ms = DEFAULT_CONFIG.policy.authority_rollout.approval_max_age_ms.value
     document = report_document()
     approval = approval_for(document, approved_at_ms=NOW_MS - limit_ms)
-    authority = AuthorityStore(tmp_path / "authority", WaitingClock(NOW_MS, NOW_MS + limit_ms + 1))
+    authority = AuthorityStore(
+        tmp_path / "authority",
+        WaitingClock(NOW_MS, NOW_MS + limit_ms + 1),
+        identity=APPROVER_IDENTITY,
+    )
 
     with pytest.raises(AuthorityApprovalError, match="承認が古い"):
         raise_stage(authority, approval=approval, document=document)
@@ -812,7 +841,11 @@ def test_invariant_3_g_evidence_that_expires_while_waiting_for_the_locks_is_refu
     approval = approval_for(
         document, evidence=evidence_for(document, end_ms=NOW_MS - evidence_limit_ms)
     )
-    authority = AuthorityStore(tmp_path / "authority", WaitingClock(NOW_MS, NOW_MS + 60_000))
+    authority = AuthorityStore(
+        tmp_path / "authority",
+        WaitingClock(NOW_MS, NOW_MS + 60_000),
+        identity=APPROVER_IDENTITY,
+    )
 
     with pytest.raises(AuthorityEvidenceError, match="証拠が古い"):
         raise_stage(authority, approval=approval, document=document)
@@ -1433,7 +1466,7 @@ def test_a_promotion_is_written_as_a_current_journal_with_both_hashes(tmp_path: 
     document = report_document()
     journal = raise_stage(store(tmp_path), approval=approval_for(document), document=document)
 
-    assert journal.schema_version == AUTHORITY_JOURNAL_SCHEMA_VERSION == 3
+    assert journal.schema_version == AUTHORITY_JOURNAL_SCHEMA_VERSION == 4
     event = journal.events[-1]
     assert event.approval is not None
     assert event.approval.evidence.air_balance_config_sha256 == AIR_BALANCE_SHA
@@ -1441,12 +1474,13 @@ def test_a_promotion_is_written_as_a_current_journal_with_both_hashes(tmp_path: 
 
 
 def test_a_stored_v1_journal_still_loads_and_can_be_appended(tmp_path: Path) -> None:
-    """既に残った v1 の昇格 event は書き換えずに読む。新しい event は現行の版（v3）で書く。"""
+    """既に残った v1 の昇格 event は書き換えずに読む。新しい event は現行の版（v4）で書く。"""
     document = report_document()
     journal = raise_stage(store(tmp_path), approval=approval_for(document), document=document)
     payload = json.loads(journal.model_dump_json())
     payload["schema_version"] = 1
     for event in payload["events"]:
+        del event["approval"]["approver_binding"]
         evidence = event["approval"]["evidence"]
         del evidence["air_balance_config_sha256"]
         del evidence["fan_hardware_config_sha256"]
@@ -1457,13 +1491,15 @@ def test_a_stored_v1_journal_still_loads_and_can_be_appended(tmp_path: Path) -> 
 
     # v1 の journal に、設定に束縛した証拠を持つ event は置けない。
     bound = json.loads(journal.model_dump_json()) | {"schema_version": 1}
+    for event in bound["events"]:
+        del event["approval"]["approver_binding"]
     with pytest.raises(ValidationError, match="v2"):
         AuthorityJournal.model_validate_json(json.dumps(bound))
 
     root = tmp_path / "authority"
     (root / AUTHORITY_STATE_FILENAME).write_text(json.dumps(payload), encoding="utf-8")
     lowered = store(tmp_path).rollback_to_baseline(actor=APPROVER, reason="試験の rollback")
-    assert lowered.schema_version == AUTHORITY_JOURNAL_SCHEMA_VERSION == 3
+    assert lowered.schema_version == AUTHORITY_JOURNAL_SCHEMA_VERSION == 4
     assert lowered.events[0] == legacy.events[0]
 
 

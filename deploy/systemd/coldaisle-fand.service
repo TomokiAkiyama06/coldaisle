@@ -30,17 +30,20 @@ NotifyAccess=main
 
 # fand 専用のユーザー（仮の値）。coldaisle（API / 取り込み）とも root とも分ける（0080 §2.1 / 0072 §2.5）。
 # coldaisle: DB を読み書きし /etc/coldaisle を読む。coldaisle-admin: 管理ソケットのグループ
-# （/etc/coldaisle/control-admin.yaml の socket.group と同じ名前にする）
+# （/etc/coldaisle/control-admin.yaml の socket.group と同じ名前にする）。
+# coldaisle-authority: 昇格・rollback を行う人のグループ（仮の値）。人が CLI で書いた 0660 の
+# authority.json と lock を fand が読み書きするため（決定記録 0086 §2.2）
 User=coldaisle-fan
 Group=coldaisle-fan
-SupplementaryGroups=coldaisle coldaisle-admin
+SupplementaryGroups=coldaisle coldaisle-admin coldaisle-authority
 # SQLite の -wal / -shm / -journal を取り込みと同じグループで書けるようにする（0080 §2.1）
 UMask=0007
 WorkingDirectory=/opt/coldaisle
 
 # 実行ファイルは導入先の venv の絶対パスで書く（素の名前は systemd の探索パスに無い）。
-# 制御の4ファイルと管理ソケットの設定は root 所有の場所に置き、fand 自身が safety.yaml を緩められないようにする
-ExecStart=/opt/coldaisle/.venv/bin/coldaisle-fand --require-watchdog --config-dir /etc/coldaisle/control-config --admin-config /etc/coldaisle/control-admin.yaml --db /var/lib/coldaisle/coldaisle.db --authority-root /var/lib/coldaisle-fand/authority
+# 制御の4ファイルと管理ソケットの設定は root 所有の場所に置き、fand 自身が safety.yaml を緩められないようにする。
+# --authority-root は承認者のグループと共有する専用のディレクトリ（決定記録 0086 §2.2。下の ReadWritePaths=）
+ExecStart=/opt/coldaisle/.venv/bin/coldaisle-fand --require-watchdog --config-dir /etc/coldaisle/control-config --admin-config /etc/coldaisle/control-admin.yaml --db /var/lib/coldaisle/coldaisle.db --authority-root /var/lib/coldaisle-authority
 
 # 異常終了・watchdog・SIGKILL の後に root・sandbox なしで Max を書く引き継ぎ実行部（0028 §2.7 / 0080 §2.5）。
 # venv と coldaisle パッケージに依存しないよう、システムの python3 でソースを直接、引数なしで実行する。
@@ -81,12 +84,17 @@ RuntimeDirectory=coldaisle
 RuntimeDirectoryMode=0711
 RuntimeDirectoryPreserve=yes
 
-# authority.json（0057）の置き場所。**StateDirectory=coldaisle は書かない**（書くと
+# fand 専用の状態ディレクトリ（0080 §2.1）。authority.json はもうここに置かない（決定記録 0086 §2.2）が、
+# StateDirectory= と 0700 は変えない（中身が無ければ空でよい）。**StateDirectory=coldaisle は書かない**（書くと
 # /var/lib/coldaisle の所有者が fand に付け替えられ、取り込み・API が DB を書けなくなる。0080 §2.1）
 StateDirectory=coldaisle-fand
 StateDirectoryMode=0700
 # DB。ProtectSystem=strict の下で必要な分だけ開ける。/var/lib/coldaisle は既存の unit の StateDirectory=
 ReadWritePaths=/var/lib/coldaisle
+# authority.json（0057）の置き場所（決定記録 0086 §2.2）。所有者 coldaisle-fan・グループ coldaisle-authority・
+# 2770（setgid）で、導入手順（docs/ubuntu-deploy.md 6.1）が作る。**StateDirectory= にしない**
+# （systemd がグループを Group= へ付け替え、承認者が書けなくなる）。無いと unit は起動に失敗する
+ReadWritePaths=/var/lib/coldaisle-authority
 
 StandardOutput=journal
 StandardError=journal
