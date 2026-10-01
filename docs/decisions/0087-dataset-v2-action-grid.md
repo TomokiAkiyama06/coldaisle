@@ -97,12 +97,13 @@ model へ渡す」と同じ意味になる。
   向きを揃える。§2.7 の `prior_action` の元の tick も同じ上限で検査する（`t_a − 元の tick の ts_ms ≥
   action_stale_after_ms` なら作らない）
 - 作らなかった example の**件数を理由ごとに** Dataset v2 の manifest に記録する（2026-10-01 所有者承認。§5 #8）。
-  理由は次の3つで、どれも 0 件なら 0 と記録する。1つの example が複数の理由に当たるときは、下の順で最初に当たった
+  理由は次の4つで、どれも 0 件なら 0 と記録する。1つの example が複数の理由に当たるときは、下の順で最初に当たった
   理由だけに数える（合計が除いた example の数と一致するように）
   1. **鮮度**: 格子の時刻の as-of の tick が古い、`prior_action` の元の tick が古い、または anchor の tick より前に
      tick が無い（§2.7）
   2. **連続**: 下の「tick の連続」の検査に外れた
   3. **区間内の変化**: §2.3 の検査に外れた
+  4. **再起動**: 下の「再起動をまたがない」の検査に外れた
 
   件数は dataset の bytes（manifest）に入るので、同じ DB と spec からは同じ件数になる。どの step で外れたかの
   内訳は記録してよいが、型の必須は理由ごとの件数だけとする（0084 §2.1 で除いた validation example の件数を
@@ -116,6 +117,14 @@ model へ渡す」と同じ意味になる。
 
   1つでも満たさなければ、その example を作らず、除外件数の「連続」に数える。区間の中の tick は**存在だけ**を見て、
   値は使わない（§2.3）。格子の時刻ごとの as-of の鮮度の検査（上の項）は、この検査に含まれるが、別に残してよい
+- **再起動をまたがない**（2026-10-01 所有者承認。PR #212 の 023e55c への Codex P2）。`coldaisle-fand` が
+  `action_stale_after_ms` より短い間に再起動すると、上の連続の検査は時刻の差しか見ないので通る。しかし古い process の
+  最後の tick と新しい process の最初の tick の間に、systemd の引き継ぎ（0080）が Fan を Max や BIOS の制御へ切り替え
+  うる。その action は trace に無く、直前の demand として学習されてしまう。そこで、`prior_action` の元の tick から
+  最大の horizon `t_a + steps × step_ms` までの間で、`seq` の順に隣り合う ControlTick の `tick_id` が**狭義単調増加**で
+  あることを求める。`tick_id` は再起動で 0 に戻る（`control/loop.py`）ので、減少または同値は再起動とみなす。
+  満たさなければ、その example を作らず、除外件数の「再起動」に数える。**trace の版は上げない**（既存の `tick_id`
+  だけを使う。§2.8）
 - 既存の `stale_after_ms`（Telemetry の鮮度）とは共用しない。ControlTick の周期と Telemetry の周期は別物であり、
   片方の都合でもう片方の判定を変えないため
 - **実際の値は本記録では決めない。** 実機の ControlTick の周期と、tick の欠け方（再起動・停止の間隔）を
@@ -262,7 +271,11 @@ demand を変える候補がすべて評価されなくなる。直前の tick �
   最大の horizon までの差が `action_stale_after_ms` 以上になる example ができない。途中の step の区間の中で、隣り合う
   tick の差が `action_stale_after_ms` 以上になる（次の格子の時刻の前に再開する）example もできない。`prior_action` の
   元の tick と anchor の tick の差も同じく検査される。差がすべて未満なら example ができる
-- **除外の件数**（§2.2 / §2.3 / §2.7）: 「鮮度」「連続」「区間内の変化」の理由ごとの件数が manifest に記録され、
+- **再起動**（§2.2）: `prior_action` の元の tick から最大の horizon までの間で、`seq` の順に `tick_id` が減る
+  （0 に戻る）tick 列、同じ `tick_id` が続く tick 列で、時刻の差がすべて `action_stale_after_ms` 未満でも example が
+  できず、除外件数の「再起動」に数えられる。その区間の外（`prior_action` の元の tick より前、または最大の horizon より
+  後）の再起動では除外されない。`tick_id` が狭義単調増加なら example ができる
+- **除外の件数**（§2.2 / §2.3 / §2.7）: 「鮮度」「連続」「区間内の変化」「再起動」の理由ごとの件数が manifest に記録され、
   それぞれの場合の数と一致する。複数の理由に当たる example は §2.2 の順で最初の理由だけに数えられる。除外が無ければ
   すべて 0 と記録される。理由ごとの件数を持たない manifest は型にならない
 - **決定性**: 同じ DB と spec から、同じ bytes の Dataset v2 ができる。manifest の `examples_sha256` と除外の件数が一致する
@@ -323,9 +336,9 @@ demand を変える候補がすべて評価されなくなる。直前の tick �
 | 5 | step ごとの context（mode・Safety の状態など）を持つか。本記録は step ごとに値と元の tick だけを持ち、context は anchor の tick のものだけとする（0031 §2.1 のまま） | 必要になったら新しい記録。Shadow・評価（#90 / #91）で Guard / Safety が値を変えた step の扱いが問題になった時 |
 | 6 | 0079 §5 #5（window / horizon / step 格子の実値）と 0050 §5 #2（support 軸と bin の境界）は変わらず開いたまま | 実機 dataset（#50 / #83）の後 |
 | 7 | **決着**（§2.2。2026-10-01 所有者承認。PR #212 の 6d584e6 への Codex P2）: `prior_action` の元の tick から最大の horizon までの間で、`seq` の順に隣り合う ControlTick の差と、最後の tick から最大の horizon までの差が、すべて `action_stale_after_ms` 未満であることを求める。外れた example は作らず、除外件数に数える | 決着（本記録 §2.2） |
-| 8 | **決着**（§2.3 / §2.2。2026-10-01 所有者承認。PR #212 の 7b2783b への Codex P1）: step の区間の中で、どれか1つの zone の effective が step の開始の値と違う example は作らない。除外件数は理由ごと（鮮度・連続・区間内の変化）に記録する | 決着（本記録 §2.3） |
+| 8 | **決着**（§2.3 / §2.2。2026-10-01 所有者承認。PR #212 の 7b2783b への Codex P1）: step の区間の中で、どれか1つの zone の effective が step の開始の値と違う example は作らない。除外件数は理由ごと（鮮度・連続・区間内の変化。後に再起動を加えた）に記録する | 決着（本記録 §2.3） |
 | 9 | **決着**（§2.4。2026-10-01 所有者承認。PR #212 の 7b2783b への Codex P1）: v2 の target は `t_a + h − tol ≤ source_ts ≤ t_a + h` の観測だけから採り、`label_end_ms = t_a + 最大の horizon` とする。0031 §2.2 を v2 についてだけ部分的に置き換える | 決着（本記録 §2.4） |
-| 10 | **段 1 の実装の前に決める必要がある**（PR #212 の 023e55c への Codex P2）。`coldaisle-fand` が `action_stale_after_ms` より短い間に再起動すると、§2.2 の連続の検査は時刻の差しか見ないので通る。しかし古い process の最後の tick と新しい process の最初の tick の間に、systemd の引き継ぎ（0080）が Fan を Max や BIOS の制御へ切り替えうる。その action は trace に無く、直前の demand として学習される。`tick_id` は再起動で 0 に戻る（`control/loop.py`）。**推奨案**: `prior_action` の元の tick から最大の horizon までの間で、`seq` の順に隣り合う ControlTick の `tick_id` が狭義単調増加であることを求める（減少・同値は再起動とみなす）。外れた example は作らず、除外件数に4つ目の理由「再起動」として数える。代替案: ControlTick に process ごとの識別子を足して照合する（trace の版上げが要る） | 所有者の判断。本 PR のレビュー中の修正、またはマージ後なら新しい記録 |
+| 10 | **決着**（§2.2。2026-10-01 所有者承認。PR #212 の 023e55c への Codex P2）: `prior_action` の元の tick から最大の horizon までの間で、`seq` の順に隣り合う ControlTick の `tick_id` が狭義単調増加であることを求める（減少・同値は再起動）。外れた example は作らず、除外件数の4つ目の理由「再起動」に数える。trace の版は上げない | 決着（本記録 §2.2） |
 
 ## 6. 所有者の決定（2026-10-01）
 
@@ -362,7 +375,11 @@ demand を変える候補がすべて評価されなくなる。直前の tick �
 同日、PR #212 のレビュー（7b2783b への Codex P1 の2件）を受けて、次を承認した。
 
 - **step の区間の中の変化**（§5 #8）→ 区間の中で、どれか1つの zone の effective が step の開始の値と違う example は
-  作らない。除外件数は理由ごと（鮮度・連続・区間内の変化）に記録する（§2.2 / §2.3）。初版で承認した点 3 の
+  作らない。除外件数は理由ごと（鮮度・連続・区間内の変化。後に再起動を加えた）に記録する（§2.2 / §2.3）。初版で承認した点 3 の
   「途中で値が変わった example も除かない」を、本 PR のレビュー中に置き換えた
 - **target の時刻**（§5 #9）→ v2 の target は `t_a + h − target_tolerance_ms ≤ source_ts ≤ t_a + h` の観測だけから採り、
   `label_end_ms = t_a + 最大の horizon` とする。0031 §2.2 を v2 についてだけ部分的に置き換える（§2.4。Supersedes）
+
+同日、PR #212 のレビュー（023e55c への Codex P2）を受けて、`prior_action` の元の tick から最大の horizon までの間で
+`seq` の順に隣り合う ControlTick の `tick_id` が狭義単調増加であることを求め（減少・同値は再起動とみなす）、外れた
+example は作らずに除外件数の4つ目の理由「再起動」に数えることを承認した。trace の版は上げない（§2.2、§5 #10）。
