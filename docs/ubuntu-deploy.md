@@ -304,8 +304,8 @@ sudo install -d -o coldaisle-fan -g coldaisle-authority -m 2770 /var/lib/coldais
 - `coldaisle-fan` を **`coldaisle-authority` グループにも入れません。** fand が人の書いた `0660` の
   `authority.json` と lock を読み書きするための所属は、unit の `SupplementaryGroups=` だけで与えます
   （`coldaisle` と同じ考え方。アカウントに入れると unit の外でも journal を書けてしまいます）
-- **`coldaisle-authority` の CLI はまだありません**（0086 §2.10 の段階 3b。#92）。下の2項目と 6.6 の
-  CLI に関わる記述は、段階 3b が入ってから使えます。それまでの昇格の手段は増えません
+- 昇格と、fand が止まっているときの rollback は `coldaisle-authority raise` / `rollback`
+  （0086 §2.10 の段階 3b。#92）で行います。使い方・終了コードは `docs/authority-rollout.md`
 - グループへの所属は、`usermod` の後に**ログインし直してから**効きます（`dialout` と同じ）。
   いまの shell のまま CLI を実行すると `2770` のディレクトリへ入れず、権限の error で止まります。
   `id -nG` に `coldaisle-authority` が出ることを確かめてから使います

@@ -957,13 +957,32 @@ class AuthorityStore:
 
         すでに `to_stage` 以下なら何もせず、いまの journal をそのまま返す。
         """
+        journal, _ = self._lower(
+            to_stage=to_stage, actor=actor, reason=reason, trigger=trigger, cause=cause
+        )
+        return journal
+
+    def _lower(
+        self,
+        *,
+        to_stage: AuthorityStage,
+        actor: str,
+        reason: str,
+        trigger: AuthorityTrigger,
+        cause: AutomaticCause | None,
+    ) -> tuple[AuthorityJournal, AuthorityEvent | None]:
+        """下げた journal と、**この呼び出しが追記した** event（何もしなければ None）。
+
+        追記したかどうかは lock の中で決まる。lock の外で読んだ journal と比べると、
+        間に別の書き手が下げた変更を自分の操作として記録してしまう。
+        """
         now_ms = self._clock.now_ms()
         if now_ms < 0:
             raise AuthorityStoreError("authority の時刻は負にできない")
         with self._exclusive_lock() as root_fd:
             journal = self._read(root_fd)
             if stage_rank(to_stage) >= stage_rank(journal.stage):
-                return journal
+                return journal, None
             event = AuthorityEvent(
                 revision=journal.revision + 1,
                 occurred_at_ms=max(now_ms, self._last_ms(journal)),
@@ -975,7 +994,22 @@ class AuthorityStore:
                 reason=reason,
                 cause=cause,
             )
-            return self._append(root_fd, journal, event)
+            return self._append(root_fd, journal, event), event
+
+    def rollback_to_baseline_with_outcome(
+        self, *, actor: str, reason: str
+    ) -> tuple[AuthorityJournal, AuthorityEvent | None]:
+        """`rollback_to_baseline()` と同じ。**この呼び出しが追記した event も返す**。
+
+        人の CLI が「自分が戻したのか、既に戻っていたのか」を監査のために正しく言うため。
+        """
+        return self._lower(
+            to_stage=BASELINE_STAGE,
+            actor=actor,
+            reason=reason,
+            trigger=AuthorityTrigger.HUMAN,
+            cause=None,
+        )
 
     def rollback_to_baseline(self, *, actor: str, reason: str) -> AuthorityJournal:
         """1手で Baseline（Shadow）へ戻す。**承認も段階も経由しない。**"""

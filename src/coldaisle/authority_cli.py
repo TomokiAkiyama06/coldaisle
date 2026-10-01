@@ -34,6 +34,7 @@ from hashlib import sha256
 from pathlib import Path
 from typing import Any
 
+import yaml
 from pydantic import ValidationError
 
 from coldaisle import logs
@@ -185,12 +186,14 @@ def run_rollback(args: argparse.Namespace, identity: ProcessIdentity, clock: Clo
     """Baseline（Shadow）へ1手で戻す。**承認も uid による拒否も無い**（0057 §2.6 / 0086 §2.6）。"""
     credentials = identity.credentials()
     authority = _store(args, identity, clock)
-    # 変えたかどうかの判定のためだけに先に読む（判断は lock の中の store が行う）。
-    before = authority.read()
-    journal = authority.rollback_to_baseline(actor=credentials.actor, reason=args.reason)
-    changed = journal.revision != before.revision
+    # **自分が追記したかは store が lock の中で決めたものを使う。** lock の外で読んだ journal と
+    # 比べると、間に別の書き手（自動降格・別の rollback）が下げた変更を自分の操作として記録する。
+    journal, appended = authority.rollback_to_baseline_with_outcome(
+        actor=credentials.actor, reason=args.reason
+    )
+    changed = appended is not None
     event = "rolled_back" if changed else "already_baseline"
-    from_stage = _from_stage(journal) if changed else journal.stage.value
+    from_stage = appended.from_stage.value if appended is not None else journal.stage.value
     _log_change(
         "authority stage を Baseline へ戻した" if changed else "すでに Baseline だった",
         event,
@@ -199,7 +202,15 @@ def run_rollback(args: argparse.Namespace, identity: ProcessIdentity, clock: Clo
         None,
         from_stage=from_stage,
     )
-    emit(_result(event, credentials, journal, from_stage=from_stage))
+    emit(
+        _result(
+            event,
+            credentials,
+            journal,
+            from_stage=from_stage,
+            reason=None if appended is None else appended.reason,
+        )
+    )
     return EXIT_OK
 
 
@@ -210,8 +221,12 @@ def _result(
     *,
     report_sha256: str | None = None,
     from_stage: str | None = None,
+    reason: str | None = None,
 ) -> dict[str, object]:
     last = journal.last_change
+    if reason is None and event == "raised" and last is not None:
+        # 昇格は lock の中で追記した直後の journal なので、最後の event が自分のものである。
+        reason = last.reason
     return {
         "event": event,
         "actor": display_actor(credentials.uid),
@@ -219,7 +234,7 @@ def _result(
         "to_stage": journal.stage.value,
         "revision": journal.revision,
         "schema_version": journal.schema_version,
-        "reason": None if last is None else last.reason,
+        "reason": reason,
         "report_sha256": report_sha256,
     }
 
@@ -346,7 +361,19 @@ def main(
     source: ProcessIdentity = identity if identity is not None else OsProcessIdentity()
     try:
         exit_code: int = args.handler(args, source, clock if clock is not None else WallClock())
-    except (AuthorityError, ValidationError, ValueError, OSError, ModelRegistryError) as error:
+    except (
+        AuthorityError,
+        ValidationError,
+        ValueError,
+        OSError,
+        ModelRegistryError,
+        yaml.YAMLError,
+        RecursionError,
+    ) as error:
+        # YAML の構文の誤り（`yaml.YAMLError` は ValueError ではない）と、深い入れ子が PyYAML の
+        # 再帰を尽くす `RecursionError` も、設定の誤りとして終了コード 1 と構造化ログにする
+        # （`coldaisle-registry` の `as_configuration_error` と同じ扱い）。
+        # traceback で終わらせない。
         # 握りつぶさない。操作は行われなかったことを、理由の code とともに残す（0086 §2.8）。
         exit_code, code = _failure(error)
         fields: dict[str, object] = {"event": f"{args.command}_failed", "code": code}

@@ -20,6 +20,7 @@ from __future__ import annotations
 import ast
 import json
 import os
+import shutil
 import stat
 from pathlib import Path
 from typing import Any
@@ -35,7 +36,7 @@ from coldaisle.authority_cli import (
     main,
 )
 from coldaisle.clock import SimulatedClock
-from coldaisle.control import AUTHORITY_STATE_FILENAME, AuthorityStage
+from coldaisle.control import AUTHORITY_STATE_FILENAME, AuthorityStage, AutomaticCause
 from test_authority_rollout import (
     _FIXTURES,
     APPROVER,
@@ -351,3 +352,76 @@ def test_nothing_imports_the_cli() -> None:
     )
     assert importers == []
     assert authority_cli.__name__ == "coldaisle.authority_cli"
+
+
+# ================================================================ 7. 境界の失敗（codex）
+
+
+@pytest.mark.parametrize("target", ["registry_limits", "control_config"])
+def test_malformed_yaml_is_a_configuration_failure_not_a_traceback(
+    tmp_path: Path, target: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """`yaml.YAMLError` は ValueError ではない。終了コード 1 と構造化ログで止める。"""
+    shared_root(tmp_path)
+    approval, report = write_inputs(tmp_path)
+    broken = tmp_path / "broken"
+    if target == "registry_limits":
+        broken.mkdir()
+        (broken / "model-registry.yaml").write_text("a: [1, 2\n", encoding="utf-8")
+        argv = raise_argv(tmp_path, approval, report)
+        argv[argv.index("--registry-limits") + 1] = str(broken)
+    else:
+        shutil.copytree(CONFIG_DIR, broken)
+        (broken / "safety.yaml").write_text("a: [1, 2\n", encoding="utf-8")
+        argv = raise_argv(tmp_path, approval, report)
+        argv[argv.index("--config-dir") + 1] = str(broken)
+
+    assert run(argv) == EXIT_FAILED
+
+    assert not journal_path(tmp_path).exists()
+    [line] = log_lines(capsys.readouterr().err)
+    assert (line["event"], line["code"]) == ("raise_failed", "io_or_config_error")
+
+
+def test_a_rollback_already_done_by_someone_else_is_not_claimed(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """**別の書き手が先に下げた変更を、自分の rollback として記録しない**（codex）。
+
+    追記したかは store が lock の中で決める。CLI が lock の外で読んだ journal と比べると、
+    間に入った自動降格の event を自分の `rolled_back` として出してしまう。
+    """
+    shared_root(tmp_path)
+    approval, report = write_inputs(tmp_path)
+    assert run(raise_argv(tmp_path, approval, report)) == EXIT_OK
+    store(tmp_path).lower_stage(
+        to_stage=AuthorityStage.SHADOW,
+        actor="control_runtime",
+        reason="自動降格",
+        cause=AutomaticCause.SAFETY_EMERGENCY,
+    )
+    capsys.readouterr()
+
+    assert run(rollback_argv(tmp_path)) == EXIT_OK
+
+    journal = store(tmp_path).read()
+    assert journal.revision == 2 and journal.events[-1].actor == "control_runtime"
+    captured = capsys.readouterr()
+    result = json.loads(captured.out)
+    assert (result["event"], result["reason"]) == ("already_baseline", None)
+    [line] = log_lines(captured.err)
+    assert line["event"] == "already_baseline"
+
+
+def test_the_store_reports_whether_this_call_appended(tmp_path: Path) -> None:
+    authority = store(tmp_path)
+    shared_root(tmp_path)
+    approval, report = write_inputs(tmp_path)
+    assert run(raise_argv(tmp_path, approval, report)) == EXIT_OK
+
+    first, appended = authority.rollback_to_baseline_with_outcome(actor="uid.1", reason="戻す")
+    again, none = authority.rollback_to_baseline_with_outcome(actor="uid.2", reason="戻す")
+
+    assert appended is not None and appended.actor == "uid.1"
+    assert appended == first.events[-1]
+    assert none is None and again == first
