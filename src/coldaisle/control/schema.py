@@ -1900,14 +1900,23 @@ class AirBalanceCoordinationRecord(_Frozen):
             raise ValueError("skipped / failed の tick は保持を解く（held はすべて偽）")
         if self.status is AirBalanceCoordinationStatus.FAILED and self.candidate is None:
             raise ValueError("failed は coordinate() を呼んだ tick だけ（raw baseline がある）")
-        if self.status is AirBalanceCoordinationStatus.SKIPPED and (
+        # 協調の結果が無い tick（skipped / failed）に、結果の欄を残さない（決定記録 0088 §2.2）。
+        # 残せると、作られていない推定を offline の読み手が正しい記録として扱う。
+        if (
             self.proposed is not None
             or self.bounded_by_max_raise is not None
             or self.before_state is not None
+            or self.before_ratio is not None
             or self.projected_state is not None
+            or self.projected_ratio is not None
             or self.reasons
         ):
-            raise ValueError("skipped の tick は coordinate() を呼んでいない")
+            raise ValueError("skipped / failed の tick は協調の結果の欄を持たない")
+        if self.status is AirBalanceCoordinationStatus.SKIPPED:
+            if self.projected_floors is not None:
+                raise ValueError("skipped の tick は下限を見込まない（projected_floors は null）")
+        elif self.projected_floors is None:
+            raise ValueError("failed の tick は apply() へ渡した projected_floors を記録する")
 
     def _check_coordinated(self) -> None:
         """``shadow`` / ``not_needed`` / ``applied``: ``coordinate()`` を呼んだ tick。"""

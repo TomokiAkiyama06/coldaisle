@@ -1061,3 +1061,67 @@ def test_a_skipped_tick_must_record_an_explicit_release(
     block["held"] = held
     with pytest.raises(ValidationError, match="保持を解く"):
         _validate(document)
+
+
+def _skipped_document(catalog: MetricCatalog) -> dict[str, Any]:
+    harness = Harness(catalog, config=coordination_config("apply"))
+    document: dict[str, Any] = json.loads(harness.tick().tick.model_dump_json())
+    assert document["air_balance_coordination"]["status"] == "skipped"
+    return document
+
+
+def _failed_document(catalog: MetricCatalog) -> dict[str, Any]:
+    config = coordination_config("apply")
+    coordinator, model = scripted_coordinator(config)
+    harness = Harness(catalog, config=config, air_balance_coordinator=coordinator)
+    harness.settle()
+    model.error = RuntimeError("coordinate の不具合")
+    document: dict[str, Any] = json.loads(harness.tick().tick.model_dump_json())
+    assert document["air_balance_coordination"]["status"] == "failed"
+    return document
+
+
+FLOORS = {"front": 0.4, "rear": 0.4, "top": 0.5}
+BASIS = {"front": "safety_floor", "rear": "safety_floor", "top": "safety_floor"}
+
+
+@pytest.mark.parametrize("kind", ["skipped", "failed"])
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"proposed": FLOORS},
+        {"bounded_by_max_raise": {"front": False, "rear": False, "top": False}},
+        {"before_state": "balanced"},
+        {"before_ratio": 0.9},
+        {"projected_state": "balanced"},
+        {"projected_ratio": 0.9},
+        {"reasons": ["front_makeup_air"]},
+    ],
+)
+def test_records_without_a_result_cannot_carry_result_fields(
+    catalog: MetricCatalog, kind: str, change: dict[str, Any]
+) -> None:
+    """``skipped`` / ``failed`` は協調の結果の欄を持たない（0088 §2.2）。"""
+    document = _skipped_document(catalog) if kind == "skipped" else _failed_document(catalog)
+    _validate(document)
+    document["air_balance_coordination"].update(change)
+    with pytest.raises(ValidationError, match="結果の欄"):
+        _validate(document)
+
+
+def test_projected_floors_are_null_when_skipped_and_kept_when_failed(
+    catalog: MetricCatalog,
+) -> None:
+    skipped = _skipped_document(catalog)
+    skipped["air_balance_coordination"].update(
+        {"projected_floors": FLOORS, "projected_floor_basis": BASIS}
+    )
+    with pytest.raises(ValidationError, match="下限を見込まない"):
+        _validate(skipped)
+    failed = _failed_document(catalog)
+    assert failed["air_balance_coordination"]["projected_floors"] is not None
+    failed["air_balance_coordination"].update(
+        {"projected_floors": None, "projected_floor_basis": None}
+    )
+    with pytest.raises(ValidationError, match="projected_floors を記録する"):
+        _validate(failed)
