@@ -92,7 +92,8 @@ artifact の上限は**実行時の上限**で、journal へ降格 event を書�
 - 上限が掛かった・外れたとき（起動時を含む）に、構造化ログを1行出す（`event`:
   `authority_artifact_mismatch` / `authority_artifact_unbound` / `authority_artifact_matched`、
   journal の stage と revision、loaded artifact、食い違った昇格の revision と `artifact_sha256`）
-- `AuthorityRuntime.trace_metadata()` に `authority_artifact_ceiling` と `authority_loaded_artifact` を足す
+- `AuthorityRuntime.trace_metadata()` に `authority_artifact_ceiling`（上限だけ）を足す。照らした artifact の
+  hash は載せない（0057 §2.7「stage と model は独立に残す」。artifact は Gate と registry の記録が持つ）
 - `ControlTick` の `authority`（`AuthorityRecord` v1）には**欄を足さない**。足すと `AuthorityRecord` と
   `ControlTick` の版上げになり、本記録の範囲（#216）を超える。いまの trace でも実効 stage
   （`state.authority_stage`）は記録した上限の最小**以下**であればよい（schema が拒むのは超えたときだけ）ので、

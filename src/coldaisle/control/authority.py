@@ -180,6 +180,9 @@ _ACTOR_MAX_CHARS = 120
 _REASON_MAX_CHARS = 1000
 """journal の event の actor / reason の上限。資源の境界であり、調整値ではない。"""
 
+_SHA256_HEX = re.compile(r"^[0-9a-f]{64}$")
+"""loaded artifact の形（`Sha256Hex` と同じ）。"""
+
 _LOGGER = logging.getLogger("coldaisle.control")
 
 
@@ -1610,13 +1613,20 @@ class AuthorityRuntime:
     管理ソケット（決定記録 0072）からの降格は `apply_lowering()` が memory 上で先に効かせ、
     書き残しは heartbeat の後の `maintain()` が行う（「先に in-memory、あとで journal」。
     0057 §2.6）。
+
+    **journal の stage は、この process が使っている artifact に対して承認された分だけ有効にする**
+    （決定記録 0089）。いまの stage へ至る昇格の承認の `evidence.artifact_sha256` が
+    ``loaded_artifact_sha256`` と1件でも違えば、また artifact を持たない構成では、実効 stage の
+    上限を Baseline にする。journal は書かない（承認そのものは正しい）。
     """
 
     __slots__ = (
+        "_artifact_ceiling",
         "_demotion_consumed",
         "_journal",
         "_journal_unreadable",
         "_last_mono_ms",
+        "_loaded_artifact",
         "_lock_waited",
         "_low_confidence",
         "_ood",
@@ -1628,8 +1638,20 @@ class AuthorityRuntime:
         "_unpersisted_ceiling",
     )
 
-    def __init__(self, store: AuthorityStore, policy: FanPolicyConfig) -> None:
+    def __init__(
+        self,
+        store: AuthorityStore,
+        policy: FanPolicyConfig,
+        *,
+        loaded_artifact_sha256: str | None,
+    ) -> None:
         """**時計は持たない。** 記録の時刻は store が自分の時計で決める。
+
+        ``loaded_artifact_sha256`` は、この process が起動時に束縛して使い続けている model artifact
+        （Controller Gate の ``expected_artifact_sha256`` と同じ値・同じ出どころ。
+        決定記録 0089 §2.1）。
+        **既定値を置かない。** 渡し忘れが「何にも照らさない runtime」を作らないためである。
+        束縛する artifact が無い構成は ``None`` を明示し、Baseline より上を有効にしない。
 
         store には**必ず lock の待ち上限を持たせる**（決定記録 0060 §2.7）。この runtime は
         control tick の中から呼ばれるので、待ち続ける store を渡すと、降格の書き残しが
@@ -1642,12 +1664,18 @@ class AuthorityRuntime:
             raise AuthorityStoreError(
                 "control runtime の AuthorityStore には lock の待ち上限（lock_timeout_ms）が要る"
             )
+        if loaded_artifact_sha256 is not None and not _SHA256_HEX.fullmatch(loaded_artifact_sha256):
+            raise AuthorityStoreError("loaded artifact の sha256 は 64 桁の小文字 16 進にする")
         self._store = store
         self._policy = policy
+        self._loaded_artifact = loaded_artifact_sha256
+        # 起動時は「前の状態」が無いので、最初の照合の結果を必ずログに出す（0089 §2.5）。
+        self._artifact_ceiling: AuthorityStage | None = None
         # **stat を先に取ってから読む。** 読んだ後に書き換わっても、覚えた stat と違うので
         # 次の点検で読み直す（逆順だと、読んでから stat までの書き換えを見逃す）。
         self._signature: object = store.journal_signature()
         self._journal = store.read()
+        self._bind_artifact()
         # **書き残せなかった降格だけ**を memory 上の上限として持つ（0057 §2.6）。
         # 書けた降格は journal がそのまま表しているので、二重に持たない。持つと、
         # あとから承認された昇格が再起動まで効かなくなる（codex #4056968495）。
@@ -1683,9 +1711,25 @@ class AuthorityRuntime:
         """走行中に journal を読めなかったので `SHADOW` に下げたまま、まだ書き残していない。"""
         return self._journal_unreadable
 
+    @property
+    def loaded_artifact_sha256(self) -> str | None:
+        """この process が使っている model artifact（決定記録 0089）。無ければ None。"""
+        return self._loaded_artifact
+
+    @property
+    def artifact_ceiling(self) -> AuthorityStage:
+        """journal の承認と loaded artifact の照合から決まる上限（決定記録 0089 §2.2）。"""
+        assert self._artifact_ceiling is not None, "__init__ で必ず照合している"
+        return self._artifact_ceiling
+
     def current_stage(self) -> AuthorityStage:
         """この tick に与えてよい制御権。**上限を超えることはない。**"""
-        return lowest_stage(self._journal.stage, self.configured_ceiling, self._unpersisted_ceiling)
+        return lowest_stage(
+            self._journal.stage,
+            self.configured_ceiling,
+            self._unpersisted_ceiling,
+            self.artifact_ceiling,
+        )
 
     def reload(self) -> None:
         """外（管理操作）で変わった journal を読み直す。
@@ -1694,6 +1738,7 @@ class AuthorityRuntime:
         書き残せなかった降格を「読み直すだけ」で取り消せてしまう。
         """
         self._journal = self._store.read()
+        self._bind_artifact()
 
     def observe(
         self,
@@ -1908,7 +1953,52 @@ class AuthorityRuntime:
             None if self._persist_failure is None else self._persist_failure.model_dump(mode="json")
         )
         metadata["authority_journal_unreadable"] = self._journal_unreadable
+        # 上限だけを載せ、照らした artifact の hash は載せない（stage と model は独立に残す。
+        # 0057 §2.7 / 0089 §2.5）。artifact は Gate と registry の記録が持つ。
+        metadata["authority_artifact_ceiling"] = self.artifact_ceiling.value
         return metadata
+
+    def _bind_artifact(self) -> None:
+        """いまの journal を loaded artifact と照合し直す（0089 §2.3）。
+
+        上限が変わったときだけログに出す（§2.5）。
+
+        **上げる向きには働かない。** 返すのは上限で、journal の stage を超えて有効にすることは無い。
+        journal は書かない（0089 §2.4）。
+        """
+        mismatch = _first_artifact_mismatch(self._journal, self._loaded_artifact)
+        ceiling = BASELINE_STAGE if mismatch is not None else AuthorityStage.FULL
+        previous = self._artifact_ceiling
+        self._artifact_ceiling = ceiling
+        if previous is ceiling:
+            return
+        if mismatch is None:
+            event = "authority_artifact_matched"
+        elif mismatch is _NO_LOADED_ARTIFACT:
+            event = "authority_artifact_unbound"
+        else:
+            event = "authority_artifact_mismatch"
+        fields: dict[str, object] = {
+            "event": event,
+            "journal_stage": self._journal.stage.value,
+            "journal_revision": self._journal.revision,
+            "loaded_artifact_sha256": self._loaded_artifact,
+            "authority_artifact_ceiling": ceiling.value,
+        }
+        if isinstance(mismatch, AuthorityEvent):
+            assert mismatch.approval is not None
+            fields["mismatched_revision"] = mismatch.revision
+            fields["approved_artifact_sha256"] = mismatch.approval.evidence.artifact_sha256
+        if mismatch is None:
+            _LOGGER.info(
+                "authority の artifact の照合で上限を掛けない（Baseline か、承認が一致）",
+                extra={logs.FIELDS_KEY: fields},
+            )
+            return
+        _LOGGER.warning(
+            "authority の承認が loaded artifact のものではないため、Baseline より上を有効にしない",
+            extra={logs.FIELDS_KEY: fields},
+        )
 
     @staticmethod
     def _one_below(stage: AuthorityStage) -> AuthorityStage:
@@ -1980,6 +2070,7 @@ class AuthorityRuntime:
             self._persist_failure = failure
             return failure
         self._journal = journal
+        self._bind_artifact()
         self._signature = _SIGNATURE_UNKNOWN
         self._persist_failure = None
         self._release_if_represented()
@@ -2076,6 +2167,7 @@ class AuthorityRuntime:
             )
             return
         self._journal = journal
+        self._bind_artifact()
         self._signature = signature
         if journal != previous:
             _LOGGER.info(
@@ -2123,6 +2215,38 @@ class AuthorityRuntime:
         for history in (self._low_confidence, self._ood):
             while history and history[0] < cutoff:
                 history.popleft()
+
+
+_NO_LOADED_ARTIFACT = object()
+"""照合の結果: journal は Baseline より上なのに、この process が artifact を持たない。"""
+
+
+def _first_artifact_mismatch(
+    journal: AuthorityJournal, loaded_artifact_sha256: str | None
+) -> AuthorityEvent | object | None:
+    """いまの stage へ至る昇格のうち、loaded artifact のものでない最初の1件（決定記録 0089 §2.2）。
+
+    None は「上限を掛けない」（journal が Baseline、または連なりの昇格がすべて一致）。
+    journal が最後に Baseline にいた時点より**後**の昇格をすべて見る。一部だけ一致しても上限は
+    Baseline である（一致した段までを有効にしない）。
+    """
+    if journal.stage is BASELINE_STAGE:
+        return None
+    if loaded_artifact_sha256 is None:
+        return _NO_LOADED_ARTIFACT
+    climb: list[AuthorityEvent] = []
+    for event in reversed(journal.events):
+        if event.to_stage is BASELINE_STAGE:
+            break
+        climb.append(event)
+    for event in reversed(climb):
+        approval = event.approval
+        if approval is None:
+            # 降格。連なりの中の降格は承認を持たない（0057 §2.6）
+            continue
+        if approval.evidence.artifact_sha256 != loaded_artifact_sha256:
+            return event
+    return None
 
 
 def _extends(journal: AuthorityJournal, known: AuthorityJournal) -> bool:

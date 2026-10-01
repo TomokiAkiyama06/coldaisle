@@ -25,8 +25,29 @@ SHADOW  →  LIMITED  →  EXPANDED  →  FULL
 | `authority.json`（`AuthorityStore`） | 与えている制御権の正本。人の承認で上がり、自動降格で下がる |
 | `fan-policy.yaml` の `authority_stage`（#103） | 設定が許す**上限**。下げれば再起動後に効き、上げても journal は上がらない |
 | `AuthorityRuntime` が下げた上限 | この process が自動降格で下げた分。**永続化できなくても保持する** |
+| artifact の上限（決定記録 0089） | journal の承認が、この process が使っている artifact のものでなければ Baseline |
 
-実効 stage は3つのうち**もっとも低いもの**である。`ControllerGate` 側でも上限を掛ける。
+実効 stage は4つのうち**もっとも低いもの**である。`ControllerGate` 側でも上限を掛ける。
+
+### いま使っている artifact との照合（決定記録 0089）
+
+`coldaisle-fand` は Registry を起動時に1回だけ読み、その artifact を再起動まで使う。一方
+`coldaisle-authority raise` は**実行した時点の** Production の artifact の証拠で journal を上げる。
+走行中に Production が A → B へ入れ替わると、B の証拠で上げた authority を A が得てしまうので、
+`AuthorityRuntime` は journal を読むたびに照合する。
+
+- 照らす値は、fand が束縛した artifact（`loaded_artifact_sha256`。Controller Gate の
+  `expected_artifact_sha256` と同じ変数から渡す。既定値は無い）
+- journal が最後に Baseline にいた後の昇格**すべて**の `approval.evidence.artifact_sha256` が一致すれば
+  上限を掛けない。1件でも違えば、また artifact を持たない構成では、実効 stage の上限を Baseline にする
+- **journal は書かない**（承認は正しい）。正しい artifact で再起動すれば journal どおりに戻る
+- 上限が変わったとき（起動時を含む）に構造化ログ（`authority_artifact_mismatch` /
+  `authority_artifact_unbound` / `authority_artifact_matched`）を1行出す
+- **いまの `coldaisle-fand` は Learned MPC の worker を配線しておらず artifact を持たないので、
+  journal が上がっていても常に Baseline で動く**（提案が来ないので制御の結果は変わらない）
+
+Production を入れ替えたら、新しい artifact について SHADOW から1段ずつ上げ直す（入れ替えの前に
+`rollback` しておくと、journal と実効 stage が食い違わない）。
 
 `ControllerGate` と `LearnedMpcController` は stage の供給元（`AuthorityStageSource`）を
 **必須の引数**にしている。既定値を置くと、配線を忘れた起動が設定の**上限**を
@@ -252,11 +273,14 @@ CLI で書いた rollback も、動いている fand は次の tick で journal 
 - `MpcProposal.binding_authority_stage` → `LearnedControlStatus`: worker が照合した stage を
   Gate まで運ぶ。覆っていなければ `binding_authority_not_covered` で Fallback にする
 - `AuthorityRuntime.trace_metadata()`: 実効 stage・journal の stage・設定の上限・
-  直近の変更（種別・主体・理由・時刻）・永続化の失敗・journal を読めないこと。**model version を含めない**
+  直近の変更（種別・主体・理由・時刻）・永続化の失敗・journal を読めないこと・artifact の上限
+  （`authority_artifact_ceiling`。0089）。**model version も照らした artifact の hash も含めない**
 - `ControlTick` v13 の `authority`（`AuthorityRecord`）: その tick の Gate が stage を読んだ時点の
   journal の stage と revision・設定の上限・書き残せずに持っている上限・`journal_unreadable`・
   その tick の先頭で入れた管理ソケットの降格の `command_id`・直近の永続化の失敗。
-  実効 stage（`state.authority_stage`）はこれらの最小を超えない（schema が拒む）
+  実効 stage（`state.authority_stage`）はこれらの最小を超えない（schema が拒む）。
+  **artifact の上限（0089）は `AuthorityRecord` に欄が無い**（足すと版上げになる。0089 §5 の 1）。
+  journal より低い理由は fand の構造化ログで見る
 
 ## まだ無いもの
 
