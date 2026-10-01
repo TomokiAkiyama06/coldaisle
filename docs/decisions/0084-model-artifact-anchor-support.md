@@ -13,7 +13,7 @@
     「候補の照合」のうち、(a) / (c) の集合を全 step で共有する部分（本記録 §2.2）
   - §2.4 の検査の表の L8 の行（各 entry の検査に、キー集合の一致を加える。本記録 §2.3）
   - 本記録が足すだけで 0079 を置き換えない点: §2.4 の検査の表への L11 / L12 の追加（§2.1 / §2.2）、
-    §2.3 の feature schema の項への anchor 推論の action 列の規則の追加（§2.1）、§2.7 の試験の追加（§2.4）
+    §2.3 の feature schema の項への anchor 推論の action 列の規則の追加（§2.1）、0050 §2.2 の `support` の OOD の条件への「held の列が step ごとの support の外」の追加（Profile v2 についてだけ。狭める向きで 0050 を置き換えない。§2.1）、§2.7 の試験の追加（§2.4）
   - 旧記録側への `Superseded by` の追記（README「追記のみ」）は本 PR で 0079 に行った
 - **関連**: [0031](0031-thermal-dataset-contract.md) §2.2 /
   [0048](0048-thermal-model-artifact-and-inference.md) §2.1 / §2.4 /
