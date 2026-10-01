@@ -266,9 +266,11 @@ sudo systemctl start coldaisle-rollup.timer coldaisle-report.timer
 
 ## 6. coldaisle-fand（Fan 制御）の unit
 
-決定の理由は決定記録 [`0080`](decisions/0080-fand-systemd-unit.md) を見てください。
-ここに書く名前（ユーザー `coldaisle-fan`・グループ `coldaisle-admin`・`/etc/coldaisle/` の下の
-置き場所）は**すべて仮の値**です。変えるなら unit・udev ルール・`control-admin.yaml` を揃えます。
+決定の理由は決定記録 [`0080`](decisions/0080-fand-systemd-unit.md) と、authority の journal の置き場所・
+承認者のグループについては [`0086`](decisions/0086-authority-approver-uid.md) §2.2 / §2.7 を見てください。
+ここに書く名前（ユーザー `coldaisle-fan`・グループ `coldaisle-admin` / `coldaisle-authority`・
+`/etc/coldaisle/` の下の置き場所・`/var/lib/coldaisle-authority`）は**すべて仮の値**です。
+変えるなら unit・udev ルール・`control-admin.yaml` を揃えます。
 **実機のユーザー名・ホスト名・path・driver 名・channel 番号はコミットしません**（AGENTS.md ルール10）。
 
 > **この節の手順で `systemctl enable` も `systemctl start` もしません。** 有効化は 0080 §2.10 の
@@ -283,6 +285,15 @@ sudo useradd --system --user-group --no-create-home --shell /usr/sbin/nologin co
 sudo groupadd --system coldaisle-admin
 sudo usermod -aG coldaisle-admin coldaisle-fan
 sudo usermod -aG coldaisle-admin <操作する人のユーザー名>
+
+# Authority の昇格・rollback を行う人のグループ（決定記録 0086 §2.2）。入れるのは昇格を任せる人だけ
+# （coldaisle と AI 層のユーザーは入れない）
+sudo groupadd --system coldaisle-authority
+# ログインし直すと反映される（いま開いている shell には新しいグループが付かない）
+sudo usermod -aG coldaisle-authority <昇格を行う人のユーザー名>
+# authority.json の置き場所。所有者 coldaisle-fan・グループ coldaisle-authority・2770（setgid）。
+# systemd の StateDirectory= にはしない（グループが coldaisle-fan へ付け替えられる）ので、ここで作る
+sudo install -d -o coldaisle-fan -g coldaisle-authority -m 2770 /var/lib/coldaisle-authority
 ```
 
 - `coldaisle-fan` を **`coldaisle` グループには入れません。** DB を書く `coldaisle` は unit の
@@ -290,6 +301,24 @@ sudo usermod -aG coldaisle-admin <操作する人のユーザー名>
 - `coldaisle-admin` への所属は、管理ソケットのグループを付け替えるために要ります
   （非 root のプロセスは自分の属するグループにしか付け替えられない）。同じ uid の接続は
   `allow_same_user: false` のもとで拒否されます（0080 §2.10 の段階 0）
+- `coldaisle-fan` を **`coldaisle-authority` グループにも入れません。** fand が人の書いた `0660` の
+  `authority.json` と lock を読み書きするための所属は、unit の `SupplementaryGroups=` だけで与えます
+  （`coldaisle` と同じ考え方。アカウントに入れると unit の外でも journal を書けてしまいます）
+- **`coldaisle-authority` の CLI はまだありません**（0086 §2.10 の段階 3b。#92）。下の2項目と 6.6 の
+  CLI に関わる記述は、段階 3b が入ってから使えます。それまでの昇格の手段は増えません
+- グループへの所属は、`usermod` の後に**ログインし直してから**効きます（`dialout` と同じ）。
+  いまの shell のまま CLI を実行すると `2770` のディレクトリへ入れず、権限の error で止まります。
+  `id -nG` に `coldaisle-authority` が出ることを確かめてから使います
+- **承認者は自分の uid のまま** `coldaisle-authority raise` / `rollback` を実行します（`sudo` も
+  `sudo -u coldaisle-fan` も使いません）。記録される承認者は実行した人の `uid.<数値>` です
+  （0086 §2.1）。root と fand のユーザー（= `/var/lib/coldaisle-authority` の所有者）の昇格は拒まれます
+  （0086 §2.3。rollback は誰でも通ります）
+- `/var/lib/coldaisle-authority` は **setgid（`2770`）が要ります。** 人が書いたファイルのグループが
+  `coldaisle-authority` になり、fand が読み書きできるためです。CLI は書く前にディレクトリが
+  「ディレクトリ・other に権限が無い・setgid 付き」であることを確かめ、違えば書かずに止まります。
+  CLI はこのディレクトリを作りません（無ければ error。0086 §2.4）
+- unit の `ReadWritePaths=` がこのディレクトリを指すので、**作る前に fand の unit を起動すると、
+  起動の段階で失敗します**（制御は取りません）
 
 ### 6.2 設定の置き場所（root 所有）
 
@@ -387,7 +416,7 @@ hwmon には `/dev` のノードが無いので、udev の `GROUP=` / `MODE=` �
      sudo stat -c '%A %U:%G %n' "$f"
      sudo systemd-run --pipe --wait --quiet \
           -p User=coldaisle-fan -p Group=coldaisle-fan \
-          -p "SupplementaryGroups=coldaisle coldaisle-admin" \
+          -p "SupplementaryGroups=coldaisle coldaisle-admin coldaisle-authority" \
           test -w "$f" || echo "書けない: $f"
    done
    ```
@@ -440,3 +469,88 @@ sudo /usr/bin/python3 -I -S /opt/coldaisle/src/coldaisle/safety_handoff.py; echo
   `/run/coldaisle` が残ること・順序を確かめる）と、0028 §2.9 の承認点 3 の後に行います。
   時間切れ（`TimeoutStartSec` / `TimeoutStopSec` / `TimeoutAbortSec`）・`WatchdogSec`・`RestartSec` は
   暫定値で、実機の測定と所有者の承認で決めます（0080 §5 の 1）
+
+### 6.6 authority.json を専用のディレクトリへ移す（以前のテンプレートで fand を動かした導入先）
+
+> **前提: 導入先のコードが 0086 §2.10 の段階 3a（#92。journal と lock を `0660` で作る `AuthorityStore`）を
+> 含むこと。** それより前の版の fand は `0600` で作るので、このディレクトリで一度でも書くと承認者のグループが
+> journal を読めず lock も取れなくなります。古いコードのまま、この節の移行も新しい unit への差し替えも
+> 行いません（`enable` は 0080 §2.10 の段階 5 と承認点 3 の後）。
+
+以前のテンプレート（決定記録 0080 のまま）は `authority.json` を fand 専用の状態ディレクトリ
+（`/var/lib/coldaisle-fand/authority`。`0700`）に置いていました。決定記録 0086 §2.2 で、承認者のグループと
+共有する `/var/lib/coldaisle-authority` へ移しました。以前のテンプレートで fand を一度でも起動した導入先は、
+**新しい unit で起動する前に** journal と lock を移します（0086 §2.7）。fand をまだ起動したことが無ければ、
+6.1 でディレクトリを作るだけで構いません。
+
+**順序**: コード（パッケージ）を更新し → この手順で journal を移して unit を差し替え → fand を起動し →
+それから `coldaisle-authority` の CLI を使います。journal v4（0086 §2.7）を読めない古い fand が
+CLI の書いた journal を読むと、走行中なら `SHADOW` へ下がり、起動時なら終了コード 5 で止まります
+（安全側ですが制御を取れません）。切り戻しの手順は `docs/authority-rollout.md` を見てください。
+
+1. fand を止めます（6.1 のグループとディレクトリは先に作っておきます）
+
+   ```bash
+   sudo systemctl stop coldaisle-fand
+   ```
+
+2. 退避を取ってから、`authority.json` と、あれば `.authority.lock` を新しいディレクトリへ移します。
+   退避は fand 専用の `0700` のディレクトリの中に置きます（他のユーザーから読めない場所）。
+   手順 2〜5 は `old` / `new` を使うので、**同じシェルで続けて**実行します
+
+   ```bash
+   old=/var/lib/coldaisle-fand/authority
+   new=/var/lib/coldaisle-authority
+   if sudo test -d "$old"; then sudo cp -a "$old" /var/lib/coldaisle-fand/authority.before-0086; fi
+   for name in authority.json .authority.lock; do
+     if sudo test -e "$old/$name"; then sudo mv "$old/$name" "$new/$name"; fi
+   done
+   ```
+
+3. グループを `coldaisle-authority`・mode を `0660` に揃えます。setgid はこれから作るファイルの gid にしか
+   効かないので、移したファイルの gid も明示します
+
+   ```bash
+   for name in authority.json .authority.lock; do
+     if sudo test -e "$new/$name"; then
+       sudo chown coldaisle-fan:coldaisle-authority "$new/$name" && sudo chmod 0660 "$new/$name"
+     fi
+   done
+   sudo stat -c '%A %U:%G %n' "$new" "$new"/authority.json "$new"/.authority.lock
+   ```
+
+   ディレクトリは `drwxrws---`（`2770`）・`coldaisle-fan:coldaisle-authority`、ファイルは
+   `-rw-rw----`（`0660`）・グループ `coldaisle-authority` であること。6.4 の手順 4 と同じく、
+   unit と同じグループを渡した一時的な unit で fand から書けることも確かめます
+
+   ```bash
+   for f in "$new" "$new"/authority.json "$new"/.authority.lock; do
+     sudo test -e "$f" || continue
+     sudo systemd-run --pipe --wait --quiet \
+          -p User=coldaisle-fan -p Group=coldaisle-fan \
+          -p "SupplementaryGroups=coldaisle coldaisle-admin coldaisle-authority" \
+          test -w "$f" || echo "書けない: $f"
+   done
+   ```
+
+   **1つでも「書けない」が出たら fand を起動しません。**
+
+4. 新しい unit（`--authority-root /var/lib/coldaisle-authority`・`SupplementaryGroups=` と
+   `ReadWritePaths=` に1つずつ足したもの）を 6.5 の手順で置き、`daemon-reload` と
+   `systemd-analyze verify` を通します。導入先で unit を書き換えていた場合（`WatchdogSec=` など）は、
+   その変更を新しいテンプレートへ移してから置きます
+
+5. 古い置き場所が空になったことを確かめ、空のサブディレクトリを消します。何か残っていれば
+   消さずに中身を確かめます（`rmdir` は空でなければ失敗します）。
+   `/var/lib/coldaisle-fand` 自体と手順 2 の退避は `0700` のまま残します（unit の `StateDirectory=` が持つ）
+
+   ```bash
+   if sudo test -d "$old"; then sudo ls -A "$old"; sudo rmdir "$old"; fi
+   ```
+
+6. fand を起動し、`authority.json` を読めたことをログ（`journalctl -u coldaisle-fand`）で確かめます。
+   起動時に `authority.json` を読めなければ fand は制御を取らずに終了コード 5 で終わります（0072 §2.6）。
+   **`enable` はしません**（6 節の冒頭のとおり）
+
+承認者が Model Registry の lock を取り、報告と制御設定を読むための権限（Registry のディレクトリの
+グループ）は、決定記録 0086 §5 の 3 で未決です。この節では扱いません。
