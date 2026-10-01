@@ -34,6 +34,7 @@ from coldaisle.authority_cli import (
     EXIT_APPROVAL_REJECTED,
     EXIT_APPROVER_REJECTED,
     EXIT_FAILED,
+    EXIT_NOT_DURABLE,
     EXIT_OK,
     main,
 )
@@ -437,10 +438,20 @@ class ClosedStdout(io.StringIO):
         raise BrokenPipeError(32, "Broken pipe")
 
 
+class AsciiStdout(io.StringIO):
+    """`PYTHONIOENCODING=ascii` の stdout。日本語の理由を書けない。"""
+
+    def write(self, text: str) -> int:
+        text.encode("ascii")
+        return super().write(text)
+
+
+@pytest.mark.parametrize("stdout", [ClosedStdout, AsciiStdout])
 @pytest.mark.parametrize("command", ["raise", "rollback"])
 def test_a_closed_stdout_after_the_commit_is_still_success(
     tmp_path: Path,
     command: str,
+    stdout: type[io.StringIO],
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
@@ -453,7 +464,7 @@ def test_a_closed_stdout_after_the_commit_is_still_success(
     else:
         argv = raise_argv(tmp_path, approval, report)
     capsys.readouterr()
-    monkeypatch.setattr(sys, "stdout", ClosedStdout())
+    monkeypatch.setattr(sys, "stdout", stdout())
 
     assert run(argv) == EXIT_OK
 
@@ -513,7 +524,9 @@ def test_a_failed_directory_fsync_after_replace_is_not_reported_as_no_change(
 
     monkeypatch.setattr(os, "fsync", fsync)
 
-    assert run(argv) == EXIT_OK
+    # 成功（0）とも失敗（1）とも分ける。失われた rollback は上げた authority を黙って戻すので、
+    # 終了コードで気づけるようにする（2026-10-01 所有者の決定）。
+    assert run(argv) == EXIT_NOT_DURABLE
 
     monkeypatch.setattr(os, "fsync", real)
     expected = AuthorityStage.SHADOW if command == "rollback" else AuthorityStage.LIMITED

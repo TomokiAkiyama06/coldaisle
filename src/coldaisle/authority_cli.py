@@ -74,6 +74,13 @@ EXIT_APPROVER_REJECTED = 3
 """実行者を承認者として認めない（決定記録 0086 §2.3 / §2.5）。理由は `code` で区別する。"""
 EXIT_APPROVAL_REJECTED = 4
 """承認・証拠を受け入れない（期限・revision・遷移・上限・証拠の不足。0057 §2.3 / §2.4）。"""
+EXIT_NOT_DURABLE = 5
+"""書いた（他の process に見えている）が、ディレクトリの `fsync` に失敗し、永続化を確かめられない。
+
+成功（0）とは分ける（2026-10-01 所有者の決定。#216）。失われた rollback は、上げた authority を
+**黙って元に戻す**ので、人もスクリプトも終了コードで気づけなければならない。結果の
+`durable: false` と warning の構造化ログも出す。失敗（1）とも分ける（変更は見えている）。
+"""
 
 _SELF_DECLARED_FIELDS = ("approver", "approver_binding")
 """承認ファイルに置かせない欄。CLI が実行者から組み立てる（0086 §2.5）。"""
@@ -99,14 +106,17 @@ def emit(payload: object) -> None:
 def emit_after_commit(payload: object) -> None:
     """journal を書き終えた**後**の結果の出力。書けなくても操作の成否を変えない（codex P1）。
 
-    stdout が閉じている（早く終わる consumer への pipe など）と `BrokenPipeError` になる。
+    stdout が閉じている（早く終わる consumer への pipe など）と `BrokenPipeError` に、
+    encoding が日本語を表せないと `UnicodeEncodeError` になる。
     それを失敗として終了コード 1 にすると、**authority は変わったのに「変わらなかった」と伝え**、
     運用者がやり直しや逆向きの操作に進みかねない。変更の記録は journal と stderr の構造化ログ
     （先に出している）にあるので、ここでは警告だけ残して成功として終える。
     """
     try:
         emit(payload)
-    except OSError as error:
+    except (OSError, ValueError) as error:
+        # `UnicodeEncodeError`（ValueError）: stdout の encoding が日本語の理由を表せない
+        # （`PYTHONIOENCODING=ascii` など）。これも書いた後の出力の失敗で、操作の失敗ではない。
         LOGGER.warning(
             "結果を stdout へ書けなかった（authority の変更は完了している）",
             extra={logs.FIELDS_KEY: {"event": "result_not_written", "error": str(error)}},
@@ -224,7 +234,7 @@ def run_raise(args: argparse.Namespace, identity: ProcessIdentity, clock: Clock)
     emit_after_commit(
         _result("raised", credentials, journal, report_sha256=report_sha256, durable=durable)
     )
-    return EXIT_OK
+    return EXIT_OK if durable else EXIT_NOT_DURABLE
 
 
 def run_rollback(args: argparse.Namespace, identity: ProcessIdentity, clock: Clock) -> int:
@@ -264,7 +274,7 @@ def run_rollback(args: argparse.Namespace, identity: ProcessIdentity, clock: Clo
             durable=durable,
         )
     )
-    return EXIT_OK
+    return EXIT_OK if durable else EXIT_NOT_DURABLE
 
 
 def _result(

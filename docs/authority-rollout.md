@@ -57,6 +57,11 @@ uv run coldaisle-authority raise \
 （path は仮の値。導入先の値に置き換える。`--registry-limits` は `model-registry.yaml` の
 ディレクトリで、既定は `config`）
 
+**`docs/ubuntu-deploy.md` の導入手順のままでは、`raise` はまだ通らない。** 承認者は自分の uid で
+制御設定（`/etc/coldaisle/control-config`）を読み、Model Registry の lock を取る必要があるが、その権限は
+決定記録 0086 §5 の未決 3 で決まっていない（設定は `root:coldaisle-fan`・`0640`）。`rollback` は
+authority のディレクトリだけを使うので、導入手順のままで使える。
+
 - **承認者は実行した uid（`uid.<os.getuid()>`）。** `--approver` は無い。承認ファイルに
   `approver` / `approver_binding` があれば拒む（0086 §2.5）。`SUDO_UID` などの環境変数は読まない（§2.1）
 - 承認ファイルは `StageApproval` から承認者の欄を除いたもの（`from_stage` / `to_stage` /
@@ -79,11 +84,14 @@ uv run coldaisle-authority raise \
 | 2 | 引数の誤り（argparse） | — |
 | 3 | 実行者を承認者として認めない（0086 §2.3 / §2.5） | `approver_is_root` / `approver_owns_authority_root` / `uid_differs_from_euid` / `invalid_uid` / `approval_not_bound_to_process` / `approver_is_not_the_process_uid` |
 | 4 | 承認・証拠を受け入れない（下の一覧） | `invalid_approval` / `approval_rejected` / `evidence_rejected` |
+| 5 | **書いた（他の process に見えている）が、ディレクトリの `fsync` に失敗し、永続化を確かめられない**（raise / rollback とも） | —（結果の `durable: false`・warning のログ） |
 
-- journal を置き換えた**後**の失敗は、変更しなかったことにしない（終了コード 0）。
-  ディレクトリの `fsync` に失敗したときは、結果の `durable` を `false` にし、構造化ログを warning で出す
-  （変更は他の process に見えているが、電源断で失われうる。もう一度同じ操作をするか、journal を確かめる）。
-  stdout に書けないとき（閉じた pipe など）は `result_not_written` の警告だけを残す
+- journal を置き換えた**後**の失敗は、変更しなかったこと（1）にしない。
+  ディレクトリの `fsync` に失敗したときは**終了コード 5**で、結果の `durable` を `false` にし、構造化ログを
+  warning で出す（変更は他の process に見えているが、電源断で失われうる。もう一度同じ操作をするか、
+  journal を確かめる）。成功（0）と分けるのは、**失われた rollback は上げた authority を黙って元に戻す**ので、
+  人もスクリプトも終了コードで気づけなければならないため（2026-10-01 所有者の決定。#216）。
+  stdout に書けないとき（閉じた pipe など）は `result_not_written` の警告だけを残す（終了コードは変えない）
 
 ### `AuthorityStore.raise_stage()`
 

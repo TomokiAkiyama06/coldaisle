@@ -305,7 +305,9 @@ sudo install -d -o coldaisle-fan -g coldaisle-authority -m 2770 /var/lib/coldais
   `authority.json` と lock を読み書きするための所属は、unit の `SupplementaryGroups=` だけで与えます
   （`coldaisle` と同じ考え方。アカウントに入れると unit の外でも journal を書けてしまいます）
 - 昇格と、fand が止まっているときの rollback は `coldaisle-authority raise` / `rollback`
-  （0086 §2.10 の段階 3b。#92）で行います。使い方・終了コードは `docs/authority-rollout.md`
+  （0086 §2.10 の段階 3b。#92）で行います。使い方・終了コードは `docs/authority-rollout.md`。
+  **ただし `raise` は、承認者が制御設定を読み Model Registry の lock を取る権限（0086 §5 の未決 3。
+  この文書の末尾）が決まるまで、この手順のままでは通りません。** `rollback` は使えます
 - グループへの所属は、`usermod` の後に**ログインし直してから**効きます（`dialout` と同じ）。
   いまの shell のまま CLI を実行すると `2770` のディレクトリへ入れず、権限の error で止まります。
   `id -nG` に `coldaisle-authority` が出ることを確かめてから使います
