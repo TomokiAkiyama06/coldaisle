@@ -822,6 +822,7 @@ class ControlLoop:
             if gate_fault is not None:
                 self._pending_faults += (gate_fault,)
         # Gate を通せなかった tick（迂回・Gate の例外）は Gate へ渡すはずだった Baseline を使う。
+        # Gate の例外の tick は、apply で上げていれば coordinated baseline（決定記録 0088 §2.1）。
         # 迂回した tick のそれは raw baseline である（決定記録 0085 §2.1）。
         requested = self._requested(mode, coordination.gate_baseline, selection)
         composed = self._composer.compose(
