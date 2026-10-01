@@ -6,6 +6,8 @@ import ast
 import json
 import logging
 import os
+import subprocess
+import sys
 import tomllib
 from pathlib import Path
 from typing import Any
@@ -522,3 +524,107 @@ def test_entrypoint_does_not_hide_unexpected_programming_errors(
 
     with pytest.raises(RuntimeError, match="injected bug"):
         handoff_module.main()
+
+
+# --- 0080 §2.10 段階 3: ExecStopPost と同じ `python -I -S <ファイル>` での起動 ---
+
+_ISOLATED_RUN_TIMEOUT_S = 30
+"""subprocess が戻らないときに試験を止めるための上限（Safety の値ではない）。"""
+
+
+def _standalone_source() -> Path:
+    """ExecStopPost が指すのと同じ相対位置（``src/coldaisle/safety_handoff.py``）のソース。"""
+    source = Path(__file__).parents[1] / "src/coldaisle/safety_handoff.py"
+    # 試験しているファイルと、import して試験しているモジュールが同じ実体であること。
+    assert source.samefile(handoff_module.__file__)
+    return source
+
+
+def _skip_if_real_handoff_record_exists() -> None:
+    # 実行部は引数を取らず固定の path を読む（0080 §2.5）。記録がある環境で走らせると
+    # 本物の hwmon へ Max を書きにいくので、その環境では走らせない。
+    if os.path.lexists(handoff_module.HANDOFF_RECORD_PATH):
+        pytest.skip(
+            f"{handoff_module.HANDOFF_RECORD_PATH} が存在する環境では、"
+            "実機の hwmon へ書きうるので subprocess で実行部を起動しない"
+        )
+
+
+def _run_isolated(cwd: Path, env: dict[str, str]) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [sys.executable, "-I", "-S", str(_standalone_source())],
+        cwd=cwd,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=_ISOLATED_RUN_TIMEOUT_S,
+        check=False,
+    )
+
+
+def _assert_absent_record_completion(completed: subprocess.CompletedProcess[str]) -> None:
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stdout == ""
+    lines = completed.stderr.splitlines()
+    assert len(lines) == 1, completed.stderr
+    assert json.loads(lines[0]) == {
+        "event": "safety_handoff_completed",
+        "record_found": False,
+        "success": True,
+        "zones": [],
+    }
+
+
+def test_isolated_no_site_entrypoint_exits_zero_without_record(tmp_path: Path) -> None:
+    """記録の無い環境では `python -I -S <ファイル>` で起動し、何も書かずに 0 で終わる。
+
+    venv と ``coldaisle`` パッケージに依存しないこと（0028 §2.7「壊れた環境でも動く」、
+    0080 §2.5 / §2.10 の段階 3）を、systemd の ``ExecStopPost`` と同じ起動方法で確かめる。
+    """
+    _skip_if_real_handoff_record_exists()
+    workdir = tmp_path / "cwd"
+    workdir.mkdir()
+
+    completed = _run_isolated(workdir, env={"PATH": os.environ.get("PATH", "")})
+
+    _assert_absent_record_completion(completed)
+    # 作業ディレクトリにも何も作らない（bytecode・ログファイルなど）。
+    assert list(workdir.iterdir()) == []
+
+
+def test_isolated_entrypoint_ignores_environment_and_cwd_module_shadows(tmp_path: Path) -> None:
+    """`-I -S` により、環境変数・作業ディレクトリ・site の差し込みを読まない。
+
+    ``ExecStopPost`` は root で動くので、``PYTHONPATH`` や作業ディレクトリに置かれた
+    同名のモジュール、``sitecustomize`` が読まれると、root でのコード実行の経路になる。
+    どれかが読まれれば印のファイルが作られ、終了コードも 0 でなくなる。
+    """
+    _skip_if_real_handoff_record_exists()
+    marker = tmp_path / "shadow-imported"
+    shadow_body = (
+        "import pathlib\n"
+        f"pathlib.Path({str(marker)!r}).write_text(__name__, encoding='utf-8')\n"
+        "raise SystemExit(97)\n"
+    )
+    shadow_dirs = (tmp_path / "pythonpath", tmp_path / "cwd")
+    for directory in shadow_dirs:
+        directory.mkdir()
+        for module in ("json", "logging", "re", "stat", "sitecustomize", "usercustomize"):
+            (directory / f"{module}.py").write_text(shadow_body, encoding="utf-8")
+        package = directory / "coldaisle"
+        package.mkdir()
+        (package / "__init__.py").write_text(shadow_body, encoding="utf-8")
+    startup = tmp_path / "startup.py"
+    startup.write_text(shadow_body, encoding="utf-8")
+    env = {
+        "PATH": os.environ.get("PATH", ""),
+        "PYTHONPATH": str(shadow_dirs[0]),
+        "PYTHONSTARTUP": str(startup),
+        "PYTHONHOME": str(tmp_path / "no-such-home"),
+        "PYTHONUSERBASE": str(shadow_dirs[0]),
+    }
+
+    completed = _run_isolated(shadow_dirs[1], env=env)
+
+    _assert_absent_record_completion(completed)
+    assert not marker.exists()
