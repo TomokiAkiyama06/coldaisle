@@ -303,6 +303,8 @@ sudo install -d -o coldaisle-fan -g coldaisle-authority -m 2770 /var/lib/coldais
 - `coldaisle-fan` を **`coldaisle-authority` グループにも入れません。** fand が人の書いた `0660` の
   `authority.json` と lock を読み書きするための所属は、unit の `SupplementaryGroups=` だけで与えます
   （`coldaisle` と同じ考え方。アカウントに入れると unit の外でも journal を書けてしまいます）
+- **`coldaisle-authority` の CLI はまだありません**（0086 §2.10 の段階 3b。#92）。下の2項目と 6.6 の
+  CLI に関わる記述は、段階 3b が入ってから使えます。それまでの昇格の手段は増えません
 - **承認者は自分の uid のまま** `coldaisle-authority raise` / `rollback` を実行します（`sudo` も
   `sudo -u coldaisle-fan` も使いません）。記録される承認者は実行した人の `uid.<数値>` です
   （0086 §2.1）。root と fand のユーザー（= `/var/lib/coldaisle-authority` の所有者）の昇格は拒まれます
@@ -465,6 +467,13 @@ sudo /usr/bin/python3 -I -S /opt/coldaisle/src/coldaisle/safety_handoff.py; echo
   暫定値で、実機の測定と所有者の承認で決めます（0080 §5 の 1）
 
 ### 6.6 authority.json を専用のディレクトリへ移す（以前のテンプレートで fand を動かした導入先）
+
+> **前提: 導入先のコードに 0086 §2.10 の段階 3a（#92）が入っていること。** 段階 3a より前の
+> `AuthorityStore` は journal と lock を `0600` で作ります。その版の fand がこのディレクトリで一度でも
+> 書く（降格を書き残す・lock を作る）と、ファイルは fand のユーザーだけが開ける状態になり、
+> 承認者のグループは journal を読めず lock も取れません。段階 3a が入るまでは、この節の移行も
+> 新しい unit への差し替えも行いません（0086 §2.2 のとおり、テンプレートを導入に使うのは揃ってから。
+> `enable` は 0080 §2.10 の段階 5 と承認点 3 の後）。
 
 以前のテンプレート（決定記録 0080 のまま）は `authority.json` を fand 専用の状態ディレクトリ
 （`/var/lib/coldaisle-fand/authority`。`0700`）に置いていました。決定記録 0086 §2.2 で、承認者のグループと
