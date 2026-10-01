@@ -16,13 +16,16 @@
 | `deploy/systemd/coldaisle-rollup.service` / `.timer` | ロールアップと保持期間の適用。毎日 03:00 |
 | `deploy/systemd/coldaisle-report.service` / `.timer` | 前日の日次レポート。毎朝 08:05（ロールアップのあと） |
 | `deploy/udev/99-coldaisle-sensors.rules` | センサー基板に `/dev/server-sensors` の固定名を付ける |
+| `deploy/systemd/coldaisle-fand.service` | 3系統 Fan 制御デーモン。**置くだけで `enable` しない**（6 節） |
+| `deploy/udev/99-coldaisle-hwmon.rules` | fand に、対象 zone の hwmon の `pwmN` / `pwmN_enable` だけの書き込み権限を渡す |
 
-## この PR に含めないもの
+## まだ含めないもの
 
-- **`coldaisle-fand`（3系統 Fan 制御）の unit は含めません。** `Type=notify` /
-  `WatchdogSec` / `Restart` / `ExecStopPost`（Max への引き継ぎ）の中身は
-  Critical Safety の deadman そのものであり、決定記録 0060 の未決 7 として
-  **人の判断が必要な安全系の論点**です。別の Issue で決めます。
+- **`coldaisle-fand`（3系統 Fan 制御）は、テンプレートを置くだけで有効化しません。**
+  unit の中身は決定記録 [`0080`](decisions/0080-fand-systemd-unit.md) で決めました。
+  サービスとして `systemctl enable` するのは、0080 §2.10 の段階 5（systemd のある環境での
+  kill・watchdog・正常停止の確認）と、0028 §2.9 の承認点 3 の後です
+  （`docs/critical-safety.md`「統合と実機検証までサービスで Fan 制御を有効化しない」）。
 - `coldaisle-telemetry`（Internal Telemetry）と `coldaisle-eventd`（書き込みソケット。
   決定記録 0045 未決 4）の unit も含めません。
 - 日次 CSV（`coldaisle-rollup --export-day`）の自動実行は配線していません。
@@ -59,7 +62,9 @@ sudo usermod -aG dialout coldaisle
 # 手で試験するユーザーも dialout へ（ログインし直すと反映される）
 sudo usermod -aG dialout "$USER"
 
-sudo install -d -o coldaisle -g coldaisle -m 0750 /var/lib/coldaisle
+# 2770（setgid）: coldaisle-fand も補助グループ coldaisle で DB を書く（決定記録 0080 §2.1。
+# unit の StateDirectoryMode=2770 と同じ。どの unit の起動でもこの mode に戻る）
+sudo install -d -o coldaisle -g coldaisle -m 2770 /var/lib/coldaisle
 # コードと config/ は root の所有のまま置く（coldaisle からは読み取りだけ）
 sudo git clone <このリポジトリの URL> /opt/coldaisle
 sudo ln -s /var/lib/coldaisle /opt/coldaisle/var
@@ -80,6 +85,11 @@ sudo UV_PYTHON_DOWNLOADS=never "$(command -v uv)" sync --no-dev --python /usr/bi
 システムに Python 3.12 が無い場合は、uv の管理する Python を `/opt` 側に置きます
 （`UV_PYTHON_INSTALL_DIR=/opt/coldaisle-python`）。サービス用ユーザーのホーム
 （`/var/lib/coldaisle`。データの置き場所）の下へ Python を入れないためです。
+
+**ただし `coldaisle-fand` の引き継ぎ実行部（`ExecStopPost=`）は、uv の管理する Python を使いません。**
+venv と uv の置き場所が壊れていても Max を書けるよう、システムの `/usr/bin/python3` で動きます
+（決定記録 0080 §2.5）。`/usr/bin/python3` が 3.12 より古い導入先では、fand の unit を置く前に
+6.5 の確かめが通りません（3.9 以前では import の時点で落ち、異常終了の後に Max を書けません）。
 
 秘匿情報を使う場合（通知の宛先など）。
 
@@ -115,12 +125,20 @@ sudoedit /etc/coldaisle/coldaisle.env
 ## 4. systemd
 
 ```bash
-sudo cp /opt/coldaisle/deploy/systemd/coldaisle-*.service \
-        /opt/coldaisle/deploy/systemd/coldaisle-*.timer /etc/systemd/system/
+# coldaisle-fand.service はここでは置かない（6 節。置くだけで enable しない）
+cd /opt/coldaisle/deploy/systemd
+sudo cp coldaisle-daemon.service coldaisle-api.service \
+        coldaisle-rollup.service coldaisle-rollup.timer \
+        coldaisle-report.service coldaisle-report.timer /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable --now coldaisle-daemon.service coldaisle-api.service
 sudo systemctl enable --now coldaisle-rollup.timer coldaisle-report.timer
 ```
+
+DB を開く unit はどれも `StateDirectoryMode=2770` と `UMask=0007` を持ちます。
+新しく作る DB は `0660`（グループ `coldaisle`）になり、SQLite の `-wal` / `-shm` / `-journal` も
+同じ mode で作られます（決定記録 0080 §2.1）。0069 のテンプレート（`0750`）で動かしてきた
+導入先は、fand を起動する前に 6.4 の移行が要ります。
 
 タイマーの時刻は OS の時刻帯で解釈されます（`timedatectl` で確認）。
 日境界は `Asia/Tokyo`（`coldaisle-rollup --timezone` / `config/report.yaml`）なので、
@@ -218,7 +236,8 @@ sudo systemctl start coldaisle-rollup.timer coldaisle-report.timer
         coldaisle-daemon coldaisle-api
    rsync -av <mac>:/tmp/coldaisle-migrate.db /tmp/coldaisle.db
    sudo rm -f /var/lib/coldaisle/coldaisle.db-wal /var/lib/coldaisle/coldaisle.db-shm
-   sudo install -o coldaisle -g coldaisle -m 0640 /tmp/coldaisle.db /var/lib/coldaisle/coldaisle.db
+   # 0660: coldaisle-fand も補助グループで書く（決定記録 0080 §2.1。0640 では fand が書けない）
+   sudo install -o coldaisle -g coldaisle -m 0660 /tmp/coldaisle.db /var/lib/coldaisle/coldaisle.db
    sudo systemctl start coldaisle-daemon coldaisle-api
    sudo systemctl start coldaisle-rollup.timer coldaisle-report.timer
    ```
@@ -244,3 +263,180 @@ sudo systemctl start coldaisle-rollup.timer coldaisle-report.timer
    コピーします
 7. 移行後に1回 `sudo systemctl start coldaisle-rollup.service` を実行し、
    `journalctl -u coldaisle-rollup` でロールアップが通ることを確かめます
+
+## 6. coldaisle-fand（Fan 制御）の unit
+
+決定の理由は決定記録 [`0080`](decisions/0080-fand-systemd-unit.md) を見てください。
+ここに書く名前（ユーザー `coldaisle-fan`・グループ `coldaisle-admin`・`/etc/coldaisle/` の下の
+置き場所）は**すべて仮の値**です。変えるなら unit・udev ルール・`control-admin.yaml` を揃えます。
+**実機のユーザー名・ホスト名・path・driver 名・channel 番号はコミットしません**（AGENTS.md ルール10）。
+
+> **この節の手順で `systemctl enable` も `systemctl start` もしません。** 有効化は 0080 §2.10 の
+> 段階 5 と、0028 §2.9 の承認点 3 の後です。テンプレートを置いただけでは Fan 制御は有効になりません。
+
+### 6.1 ユーザーとグループ
+
+```bash
+# fand 専用のユーザーと主グループ。coldaisle（API / 取り込み）と同じ uid にも root にもしない
+sudo useradd --system --user-group --no-create-home --shell /usr/sbin/nologin coldaisle-fan
+# 管理ソケットのグループ。入れるのは fand と操作する人だけ（coldaisle と AI 層のユーザーは入れない）
+sudo groupadd --system coldaisle-admin
+sudo usermod -aG coldaisle-admin coldaisle-fan
+sudo usermod -aG coldaisle-admin <操作する人のユーザー名>
+```
+
+- `coldaisle-fan` を **`coldaisle` グループには入れません。** DB を書く `coldaisle` は unit の
+  `SupplementaryGroups=` だけで与えます。アカウントに入れると、unit の外でも DB を書けてしまいます
+- `coldaisle-admin` への所属は、管理ソケットのグループを付け替えるために要ります
+  （非 root のプロセスは自分の属するグループにしか付け替えられない）。同じ uid の接続は
+  `allow_same_user: false` のもとで拒否されます（0080 §2.10 の段階 0）
+
+### 6.2 設定の置き場所（root 所有）
+
+制御の4ファイル（`fan-hardware.yaml` / `safety.yaml` / `fan-policy.yaml` / `air-balance.yaml`。
+[`docs/control-config.md`](control-config.md)）と管理ソケットの設定は **root の所有**にし、fand 自身が
+`safety.yaml` を緩められないようにします。
+
+```bash
+sudo install -d -o root -g coldaisle-fan -m 0750 /etc/coldaisle/control-config
+# 4ファイルを置く（中身は docs/control-config.md。実運用のものをリポジトリに置かない）
+sudo install -o root -g coldaisle-fan -m 0640 <用意した4ファイル> /etc/coldaisle/control-config/
+sudo install -o root -g coldaisle-fan -m 0640 /opt/coldaisle/config/control-admin.yaml \
+     /etc/coldaisle/control-admin.yaml
+sudoedit /etc/coldaisle/control-admin.yaml
+```
+
+`/etc/coldaisle/control-admin.yaml` では次の2つを変えます。
+
+- **`socket.path` を `/run/coldaisle/` の下にする**（例: `/run/coldaisle/fand-admin.sock`）。
+  リポジトリの `config/control-admin.yaml` は開発用の相対 path（`var/run/...`）です。
+  `/run/coldaisle` は fand の unit の `RuntimeDirectory=`（`0711`）で、引き継ぎ記録
+  `/run/coldaisle/fan-handoff.json` と同じ場所です。`/var/run` はリンクなので使いません
+  （親までのリンクを拒否します）
+- `socket.group` を 6.1 で作ったグループ名にする（unit の `SupplementaryGroups=` と同じ名前）
+
+`/etc/coldaisle` は 2 節で `root:coldaisle`・`0750` にしてあります。fand は補助グループ
+`coldaisle` でたどります。
+
+**unit の `WatchdogSec=` は `safety.yaml` の `watchdog_timeout_ms` と同じ値にします。**
+テンプレートの `5s` は試験の fixture と同じ仮の値です。unit の側が長いと fand は終了コード 4 で
+制御を取らず、再起動もしません（0080 §2.3 / §2.4）。
+
+### 6.3 hwmon の書き込み権限（udev）とドライバ
+
+```bash
+# hwmon のドライバは起動時に読み込む（fand は ProtectKernelModules=yes で読み込めない）
+echo '<ドライバ名>' | sudo tee /etc/modules-load.d/coldaisle-hwmon.conf
+
+sudo cp /opt/coldaisle/deploy/udev/99-coldaisle-hwmon.rules /etc/udev/rules.d/
+# 導入先のファイルだけを、docs/fan-header-mapping.md で調べた driver 名と各 zone の pwmN に書き換える
+sudoedit /etc/udev/rules.d/99-coldaisle-hwmon.rules
+sudo udevadm control --reload-rules && sudo udevadm trigger --subsystem-match=hwmon
+# 対象の pwmN / pwmN_enable だけが coldaisle-fan・0664 になったことを見る
+ls -l /sys/class/hwmon/hwmon*/pwm*
+```
+
+hwmon には `/dev` のノードが無いので、udev の `GROUP=` / `MODE=` は効きません。テンプレートは
+`RUN+=` の `chgrp` / `chmod` で sysfs の属性を直接変えます（0080 §2.6）。
+
+### 6.4 既存の導入先の移行（fand を起動する前に1回）
+
+0069 のテンプレート（`StateDirectoryMode=0750`）や、以前の手順（`install ... -m 0640`）で置いた DB は
+`0640` のままで、補助グループで `coldaisle` を持つだけの fand は書けません。unit の変更は
+ディレクトリの mode しか変えず、`UMask` はこれから作るファイルにしか効かないためです。
+**新規の導入でも、手順の途中で DB を置いたなら同じことを行います。**
+
+1. DB に触る unit とタイマーを全部止めます（動いたままだと `-wal` / `-shm` が古い mode で作り直されます）
+
+   ```bash
+   sudo systemctl stop coldaisle-rollup.timer coldaisle-report.timer
+   sudo systemctl stop coldaisle-rollup.service coldaisle-report.service \
+        coldaisle-daemon coldaisle-api
+   ```
+
+2. 新しい unit（`StateDirectoryMode=2770`・`UMask=0007`）を置きます（4 節の `cp`）
+
+   ```bash
+   sudo systemctl daemon-reload
+   ```
+
+3. ディレクトリを `2770`・グループ `coldaisle` にし、DB と、あれば `-wal` / `-shm` / `-journal` を
+   **すべて**グループ `coldaisle`・`0660` にします。`-shm` だけ `0640` で残ると fand は WAL の索引を
+   開けません。setgid はこれから作るファイルの gid にしか効かないので、既存のファイルの gid も揃えます
+
+   ```bash
+   sudo chgrp coldaisle /var/lib/coldaisle
+   sudo chmod 2770 /var/lib/coldaisle
+   for f in /var/lib/coldaisle/coldaisle.db /var/lib/coldaisle/coldaisle.db-wal \
+            /var/lib/coldaisle/coldaisle.db-shm /var/lib/coldaisle/coldaisle.db-journal; do
+     # ディレクトリは coldaisle グループ以外から中を見られないので、存在の確認も sudo で行う
+     if sudo test -e "$f"; then sudo chgrp coldaisle "$f" && sudo chmod 0660 "$f"; fi
+   done
+   ```
+
+4. 確かめます。所有者・グループ・mode を一覧し、**unit と同じ主グループ・補助グループで**書き込み権を
+   見ます。fand が `coldaisle` グループを得るのは unit の `SupplementaryGroups=` からなので、
+   `sudo -u coldaisle-fan test -w` では確かめられません（アカウントのグループ一覧で動くため、
+   実際の fand は書けるのに確かめだけが落ちます）。一時的な unit で同じグループを渡します
+
+   ```bash
+   for f in /var/lib/coldaisle /var/lib/coldaisle/coldaisle.db \
+            /var/lib/coldaisle/coldaisle.db-wal /var/lib/coldaisle/coldaisle.db-shm \
+            /var/lib/coldaisle/coldaisle.db-journal; do
+     sudo test -e "$f" || continue
+     sudo stat -c '%A %U:%G %n' "$f"
+     sudo systemd-run --pipe --wait --quiet \
+          -p User=coldaisle-fan -p Group=coldaisle-fan \
+          -p "SupplementaryGroups=coldaisle coldaisle-admin" \
+          test -w "$f" || echo "書けない: $f"
+   done
+   ```
+
+   `systemd-run` は終了コードを返します。**1つでも「書けない」が出たら fand を起動しません。**
+   ディレクトリは `drwxrws---`（`2770`）、ファイルは `-rw-rw----`（`0660`）・グループ `coldaisle` であること
+
+5. 既存の unit とタイマーを戻し、取り込みが書き続けていること（`-wal` / `-shm` が作り直されても
+   グループ `coldaisle`・`0660` であること）をもう一度 `stat` で見ます
+
+   ```bash
+   sudo systemctl start coldaisle-daemon coldaisle-api
+   sudo systemctl start coldaisle-rollup.timer coldaisle-report.timer
+   sudo sh -c "stat -c '%A %U:%G %n' /var/lib/coldaisle/coldaisle.db*"
+   ```
+
+移行を忘れても、fand は制御を取らずに起動時に `db_not_writable` を報告して終わります
+（BIOS の制御のまま。終了コード 5 で再起動を繰り返します）。
+
+### 6.5 unit を置いて検証する（`enable` しない）
+
+```bash
+sudo cp /opt/coldaisle/deploy/systemd/coldaisle-fand.service /etc/systemd/system/
+sudoedit /etc/systemd/system/coldaisle-fand.service   # WatchdogSec= を safety.yaml に揃える（6.2）
+sudo systemctl daemon-reload
+# 実行ファイル・ExecStopPost・設定の構文を確かめる
+sudo systemd-analyze verify /etc/systemd/system/coldaisle-fand.service
+# 引き継ぎ実行部が導入先のシステムの Python で動くことを確かめる（unit の ExecStopPost= と同じ形）
+/usr/bin/python3 --version
+sudo /usr/bin/python3 -I -S /opt/coldaisle/src/coldaisle/safety_handoff.py; echo "exit=$?"
+```
+
+- `systemd-analyze verify` は CI に無いので（`tests/test_deploy_templates.py` は静的な試験だけ）、
+  **導入先で人が走らせます。** 何も出なければ通っています。特に
+  `... is not executable` が出ないこと（`ExecStart=` の `/opt/coldaisle/.venv/bin/coldaisle-fand` と
+  `ExecStopPost=` の `/usr/bin/python3` が実在すること）を確かめます。出たまま起動すると fand は
+  `READY=1` に届かず、deadman も tach の監視も動きません
+- 引き継ぎ実行部（`ExecStopPost=`）は venv を使わず、システムの `/usr/bin/python3` で
+  `/opt/coldaisle/src/coldaisle/safety_handoff.py` を引数なしで実行します。`/opt/coldaisle` は
+  root の所有のままにします（fand のユーザーが書き換えられないように）
+- 上の `safety_handoff.py` の実行は、`/usr/bin/python3` が **3.12 以上**（`pyproject.toml` の
+  `requires-python` と同じ）で、`"record_found":false` と `exit=0` が出れば通っています。fand を
+  まだ起動していないので引き継ぎ記録（`/run/coldaisle/fan-handoff.json`）は無く、何も書きません
+  （記録が残っていれば Max・manual を書きます。冷却を弱める方向には書きません）。
+  **3.12 より古い、または `exit=0` にならない導入先では fand の unit を置きません。**
+  uv の管理する Python（2 節）や venv の `python` を `ExecStopPost=` に書き換えないでください
+  （0080 §2.5 の「venv と `coldaisle` パッケージに依存しない」を崩します）
+- **`sudo systemctl enable coldaisle-fand` は実行しません。** 0080 §2.10 の段階 5（simulated backend
+  のまま、`kill -STOP`・`kill -KILL`・`systemctl stop`・再起動の連続で `ExecStopPost` が走ること・
+  `/run/coldaisle` が残ること・順序を確かめる）と、0028 §2.9 の承認点 3 の後に行います。
+  時間切れ（`TimeoutStartSec` / `TimeoutStopSec` / `TimeoutAbortSec`）・`WatchdogSec`・`RestartSec` は
+  暫定値で、実機の測定と所有者の承認で決めます（0080 §5 の 1）

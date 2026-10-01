@@ -5,7 +5,9 @@
 アプリを経由せずに確かめる。制約が無くてもアプリ経由のテストは緑になるため。
 """
 
+import os
 import sqlite3
+import stat
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -95,6 +97,59 @@ def test_wal_and_synchronous_are_enabled(store):
     """WAL でなければ読み出しが取り込みを止める。ファイル DB でのみ確認できる。"""
     assert store.connection.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
     assert store.connection.execute("PRAGMA synchronous").fetchone()[0] == 1  # NORMAL
+
+
+@pytest.fixture
+def group_umask():
+    """unit の `UMask=0007` と同じ umask で開く（決定記録 0080 §2.1）。"""
+    previous = os.umask(0o007)
+    try:
+        yield
+    finally:
+        os.umask(previous)
+
+
+def _mode(path) -> int:
+    return stat.S_IMODE(path.stat().st_mode)
+
+
+def test_new_db_and_its_wal_files_are_group_writable(db_path, rules, clock, group_umask):
+    """**新しく作る DB は 0660**（0080 §2.1）。
+
+    SQLite に作らせると 0640 になり、補助グループで DB を書く fand が書けない。
+    """
+    with SqliteStore(db_path, rules=rules, clock=clock) as opened:
+        opened.insert_sample(sample(1_000, **{"air.room": 25.0}))
+        wal = db_path.with_name(db_path.name + "-wal")
+        shm = db_path.with_name(db_path.name + "-shm")
+        assert wal.exists() and shm.exists()
+        assert {path.name: _mode(path) for path in (db_path, wal, shm)} == {
+            db_path.name: 0o660,
+            wal.name: 0o660,
+            shm.name: 0o660,
+        }
+
+
+def test_existing_db_mode_is_left_alone(db_path, rules, clock, group_umask):
+    """既にある DB の権限は変えない。移行は手順書で人が行う（0080 §2.1）。"""
+    with SqliteStore(db_path, rules=rules, clock=clock):
+        pass
+    os.chmod(db_path, 0o640)
+    with SqliteStore(db_path, rules=rules, clock=clock):
+        assert _mode(db_path) == 0o640
+
+
+def test_missing_directory_still_fails_as_a_sqlite_error(tmp_path, rules, clock):
+    """作れない理由は `sqlite3.Error` のまま報告する（fand の分類の契約を変えない）。"""
+    with pytest.raises(sqlite3.OperationalError):
+        SqliteStore(tmp_path / "missing" / "coldaisle.db", rules=rules, clock=clock)
+
+
+def test_memory_database_creates_no_file(tmp_path, rules, clock, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    with SqliteStore(":memory:", rules=rules, clock=clock):
+        pass
+    assert list(tmp_path.iterdir()) == []
 
 
 def test_database_newer_than_code_is_refused(db_path, store, rules, clock):

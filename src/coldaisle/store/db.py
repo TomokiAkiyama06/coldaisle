@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import math
+import os
 import re
 import sqlite3
 import time
@@ -143,6 +144,43 @@ WHERE metrics.metric IS NOT NULL
 """
 
 
+DB_FILE_MODE = 0o660
+"""新しく作る DB ファイルの権限（決定記録 0080 §2.1）。
+
+`coldaisle-fand` は補助グループ `coldaisle` で同じ DB を書く。SQLite に作らせると `0644`
+（`UMask=0007` のもとで `0640`）になり、グループで書けない。`-wal` / `-shm` / `-journal` は
+SQLite が本体と同じ権限ビットで作るので、本体をこの mode で作れば揃う。
+実際の mode は umask を引いた値。
+"""
+
+_NON_FILE_DATABASES = frozenset({"", ":memory:"})
+"""ファイルを作らない SQLite の名前（一時 DB とメモリ DB）。"""
+
+
+def _create_db_file(path: Path | str) -> None:
+    """DB ファイルが無ければ `DB_FILE_MODE` で空のファイルを作る。あれば何もしない。
+
+    `O_EXCL` で作るので、既存の DB の権限や中身には触らない（既存の導入先の移行は
+    `docs/ubuntu-deploy.md` の手順で人が行う）。空のファイルは SQLite が新しい DB として扱う。
+
+    作れない理由が「既にある」以外（ディレクトリが無い・権限が無い）のときは、**ここでは
+    例外にせず `sqlite3.connect()` に同じ失敗を報告させる。** 呼び出し側（`coldaisle-fand` の
+    `classify_sqlite_open_error` など）は DB を開けない理由を `sqlite3.Error` で分類しており、
+    その契約を変えないためである。
+    """
+    name = str(path)
+    if name in _NON_FILE_DATABASES or name.startswith("file:"):
+        return
+    try:
+        fd = os.open(name, os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_CLOEXEC, DB_FILE_MODE)
+    except FileExistsError:
+        return
+    except OSError:
+        # 握りつぶすのではなく、直後の sqlite3.connect() が同じ原因で sqlite3.Error を出す
+        return
+    os.close(fd)
+
+
 def _enable_wal(conn: sqlite3.Connection, busy_timeout_ms: int) -> None:
     """WAL へ切り替える。切り替え済みなら何もしない。
 
@@ -219,6 +257,9 @@ class SqliteStore:
         self._clock = clock
         self._dataset_writer = False
         """このインスタンスがdataset source runをbindした取り込みか（#83）。"""
+        # 新しい DB はグループで書ける mode で先に作る（決定記録 0080 §2.1）。
+        # 取り込みが先でも coldaisle-fand が先でも、同じこの経路を通る
+        _create_db_file(path)
         self._conn = sqlite3.connect(str(path), isolation_level=None)
         self._conn.row_factory = sqlite3.Row
         # busy_timeout を最初に設定する。WAL への切り替えは一瞬だけ排他ロックを取るため、
