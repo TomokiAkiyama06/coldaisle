@@ -16,10 +16,12 @@
     v2 の `label_end_ms` は「最大の horizon + 許容誤差」ではなく `anchor + 最大の horizon` とする
 
   旧記録（0079 / 0031）側への `Superseded by` の追記は本 PR で行った。
-- **関連**: [0031](0031-thermal-dataset-contract.md) §2.1 / §2.2 / §2.6 /
+- **関連**: [0031](0031-thermal-dataset-contract.md) §2.1 / §2.2 / §2.3 / §2.6 /
   [0048](0048-thermal-model-artifact-and-inference.md) §2.1 /
   [0052](0052-learned-mpc-optimizer-and-hard-constraints.md) §2.2 / §2.3 / §2.4 /
   [0056](0056-model-drift-detection-and-retraining-triggers.md) §2.5 /
+  [0060](0060-control-loop-runtime.md) §2.6 / §2.7 /
+  [0071](0071-control-trace-read-api.md) §2.2 / §2.2a /
   [0079](0079-model-artifact-formats.md) §2.3 / §2.5 / §2.9 /
   [0084](0084-model-artifact-anchor-support.md) §2.1 / §2.2 /
   AGENTS.md「絶対に守るルール」9
@@ -76,12 +78,20 @@ anchor の ControlTick の時刻を `t_a` とする。step `k`（`k` = 0 .. `ste
   そこで次のとおりにする
   - source run の ControlTick を `seq` の昇順に並べたとき、`ts_ms` が狭義単調増加でなければ、その run からの
     Dataset v2 の生成を**拒否する**。`seq` や `ts_ms` で黙って並べ替えない。example の除外ではなく、生成全体の拒否とする
-  - 移行前の行（0071 §2.2a の `legacy_until_ms` 以前の `ts_ms` を持つ ControlTick）を含む run も拒否する。移行前の
-    行の `seq` は記録した順を表さず、順序を確かめられないからである。`legacy_until_ms` は移行前の行の `ts_ms` の
-    上限（0071 §2.2a）なので、等しい時刻も移行前の行でありうるものとして含める
-  - **見直しの提起あり**（PR #212 の 3165109 への Codex P1）: 空の DB でも migration が `legacy_until_ms` を
-    ストアの時計で書くので、移行後の最初の tick が同じ時刻を持つと（`SimulatedClock` で起きうる）正しい run を
-    拒否する。段 1 の実装の前に、所有者が移行前の行の見分け方を決める（§5 #12）
+  - 移行前の行を含む run も拒否する。移行前の行の `seq` は migration が `(ts_ms, tick_id)` の順に振ったもので
+    （`0007_control_trace_seq.sql`）、記録した順を表さず、順序を確かめられないからである
+  - **移行前の行は時刻ではなく `seq` で見分ける**（2026-10-01 所有者承認。PR #212 の 3165109 への Codex P1。§5 #12）。
+    新しい migration で `control_trace_prune` に `legacy_through_seq`（移行前の行の `seq` の上限。0 以上の整数）を足す
+    - 行が無い DB に適用するときは 0 とする（0007 と同時に適用する新しい DB を含む）
+    - 0007 を適用済みの DB では、`ts_ms ≤ legacy_until_ms` の行の `MAX(seq)`（行が無ければ 0）で埋める。0007 の後に
+      同じ時刻で記録された行を含みうるが、狭める向き（拒否が増える向き）にだけずれる安全側の上限である
+    - Dataset v2 は、`seq ≤ legacy_through_seq` の ControlTick を含む run からの生成を拒否する。0031 §2.3 のとおり
+      dataset 用の DB は run の前に新しく作るので、通常は 0 で、どの run も拒否されない
+    - **この migration は段 1（#83）の実装 PR に同梱する。** 本記録は規則だけを決め、migration を書かない
+    - 初版で確認した「`ts_ms ≤ legacy_until_ms` の行を含む run を拒否」という読み方は、Dataset v2 については
+      これで置き換える（§6）。理由: 空の DB でも 0007 が `legacy_until_ms` をストアの時計（`:now_ms`）で書くので、
+      `SimulatedClock` が進む前に記録した最初の tick がその時刻と等しくなり、正しい mock / replay の run を拒否する
+      （AGENTS.md ルール7 の経路を壊す）。0071 §2.2a の `legacy_until_ms` の意味と、読み取り API での使い方は変えない
   - 同じ問題は v1 の builder（`ORDER BY ts_ms, tick_id`）にもある。v1 の扱いは本記録では変えない（§5 #3）
 - 値は丸め・補間・clamp をしない。ControlTick の `effective` は既に 0.0..1.0 で検証されている
 - 0031 §2.2 の window と同じ規則（「その時点以前の直近観測だけを as-of で使う」「元の時刻を残す」）を
@@ -100,13 +110,14 @@ model へ渡す」と同じ意味になる。
   向きを揃える。§2.7 の `prior_action` の元の tick も同じ上限で検査する（`t_a − 元の tick の ts_ms ≥
   action_stale_after_ms` なら作らない）
 - 作らなかった example の**件数を理由ごとに** Dataset v2 の manifest に記録する（2026-10-01 所有者承認。§5 #8）。
-  理由は次の4つで、どれも 0 件なら 0 と記録する。1つの example が複数の理由に当たるときは、下の順で最初に当たった
+  理由は次の5つで、どれも 0 件なら 0 と記録する。1つの example が複数の理由に当たるときは、下の順で最初に当たった
   理由だけに数える（合計が除いた example の数と一致するように）
   1. **鮮度**: 格子の時刻の as-of の tick が古い、`prior_action` の元の tick が古い、または anchor の tick より前に
      tick が無い（§2.7）
   2. **連続**: 下の「tick の連続」の検査に外れた
   3. **区間内の変化**: §2.3 の検査に外れた
-  4. **再起動**: 下の「再起動をまたがない」の検査に外れた
+  4. **再起動**: 下の「再起動をまたがない」の検査に外れた（`tick_id` の減少・同値）
+  5. **欠番**: 下の「`tick_id` の欠番を許さない」の検査に外れた（`tick_id` の 2 以上の増加）
 
   件数は dataset の bytes（manifest）に入るので、同じ DB と spec からは同じ件数になる。どの step で外れたかの
   内訳は記録してよいが、型の必須は理由ごとの件数だけとする（0084 §2.1 で除いた validation example の件数を
@@ -128,10 +139,17 @@ model へ渡す」と同じ意味になる。
   あることを求める。`tick_id` は再起動で 0 に戻る（`control/loop.py`）ので、減少または同値は再起動とみなす。
   満たさなければ、その example を作らず、除外件数の「再起動」に数える。**trace の版は上げない**（既存の `tick_id`
   だけを使う。§2.8）
-- **見直しの提起あり**（PR #212 の 3165109 への Codex P1）: trace の保存に失敗しても制御は続く
-  （`ControlLoop._record`、0060 §2.6）ので、保存された隣り合う行の `tick_id` が `n` と `n + 2` になりうる。
-  狭義単調増加だけでは、保存されなかった tick が掛けた action を見逃す。段 1 の実装の前に、所有者が欠番の扱いを
-  決める（§5 #11）
+- **`tick_id` の欠番を許さない**（2026-10-01 所有者承認。PR #212 の 3165109 への Codex P1。§5 #11）。trace の保存に
+  失敗しても制御は続く（`ControlLoop._record`、0060 §2.6）。`tick_id` は保存の成否によらず tick ごとに1つ進むので、
+  保存された隣り合う行の `tick_id` が `n` と `n + 2` になりうる。保存されなかった tick は別の demand を掛けて
+  戻したかもしれず、時刻の差しか見ない連続の検査も、保存された tick だけを見る §2.3 の検査も通ってしまう。そこで、
+  上の「再起動をまたがない」を強め、`prior_action` の元の tick から最大の horizon までの間で、`seq` の順に隣り合う
+  ControlTick の `tick_id` が**ちょうど 1 ずつ**増えることを求める
+  - 差が 0 以下（減少・同値）なら「再起動」、2 以上なら「欠番」に数える。両者を分けるのは、trace の保存の失敗の量を
+    再起動と混ぜずに見えるようにするためである
+  - **trace の版は上げない**（既存の `tick_id` と `seq` だけを使う。§2.8）
+  - 残る点: この検査が見るのは範囲の中で**隣り合う2つの保存された行**だけである。範囲の中で最後に保存された tick と
+    最大の horizon の間に、保存されなかった tick や再起動があっても見えない（§5 #13）
 - 既存の `stale_after_ms`（Telemetry の鮮度）とは共用しない。ControlTick の周期と Telemetry の周期は別物であり、
   片方の都合でもう片方の判定を変えないため
 - **実際の値は本記録では決めない。** 実機の ControlTick の周期と、tick の欠け方（再起動・停止の間隔）を
@@ -241,7 +259,9 @@ demand を変える候補がすべて評価されなくなる。直前の tick �
 
 ### 2.8 変えないこと
 
-- **`ControlTick` の版を上げない。** 段 1 は ControlTick を読むだけで、trace へ何も足さない（0079 §2.9 の段 1 の行のまま）
+- **`ControlTick` の版を上げない。** 段 1 は ControlTick を読むだけで、trace へ何も足さない（0079 §2.9 の段 1 の行のまま）。
+  段 1 が store に足すのは、`control_trace_prune` の `legacy_through_seq` の migration だけである（§2.1）。
+  `control_traces` の表と `legacy_until_ms` の意味は変えない
 - v1 の dataset を v2 として読み替えない。v2 は `schema_version` 2 の別の型とし、v1 の builder と artifact は変えない
 - 0031 §2.1〜§2.6 の規律（時刻対応・mask・split・source run・値を既定しない）はそのまま当てる
 
@@ -264,8 +284,12 @@ demand を変える候補がすべて評価されなくなる。直前の tick �
 - **step の番号**（§2.5）: Dataset v2 の step `k` の区間が `ActionPlan.held(..., step_ms, steps)` の `steps[k]` と
   同じ区間であることを、格子の時刻と `offset_ms − step_ms` の一致で確かめる
 - **時刻が単調でない run**（§2.1）: `seq` の順で `ts_ms` が戻る run、同じ `ts_ms` の tick を2つ持つ run、
-  `legacy_until_ms` 以前（等しい時刻を含む）の ControlTick を含む run からの生成が、それぞれ拒否される。
-  単調な run は通る。v1 の builder の出力は変わらない
+  `seq ≤ legacy_through_seq` の ControlTick を含む run からの生成が、それぞれ拒否される。単調な run は通る。
+  v1 の builder の出力は変わらない
+- **移行前の行の見分け方**（§2.1。migration は段 1 の実装 PR に同梱）: 行が無い DB に migration を適用すると
+  `legacy_through_seq` が 0 になる。0007 の適用時に行があった DB では、`ts_ms ≤ legacy_until_ms` の行の `MAX(seq)` に
+  なる。新しい DB で、`SimulatedClock` が進む前に `ts_ms = legacy_until_ms` の tick を記録した run が拒否されない。
+  `legacy_until_ms` の値と 0071 の読み取り API の結果は migration の前後で変わらない
 - **較正**（§2.6）: 全 example の期間の中に `calibration_changed` の宣言があると、生成が拒否される。期間の外
   なら通る。`calibration_changed` 以外の宣言では拒否しない。宣言を渡さない呼び出しは型にならない。
   `control/model` が `control/drift` を import しないことを、既存の import 走査試験の方式で確かめる
@@ -281,8 +305,12 @@ demand を変える候補がすべて評価されなくなる。直前の tick �
 - **再起動**（§2.2）: `prior_action` の元の tick から最大の horizon までの間で、`seq` の順に `tick_id` が減る
   （0 に戻る）tick 列、同じ `tick_id` が続く tick 列で、時刻の差がすべて `action_stale_after_ms` 未満でも example が
   できず、除外件数の「再起動」に数えられる。その区間の外（`prior_action` の元の tick より前、または最大の horizon より
-  後）の再起動では除外されない。`tick_id` が狭義単調増加なら example ができる
-- **除外の件数**（§2.2 / §2.3 / §2.7）: 「鮮度」「連続」「区間内の変化」「再起動」の理由ごとの件数が manifest に記録され、
+  後）の再起動では除外されない
+- **欠番**（§2.2）: `prior_action` の元の tick から最大の horizon までの間で、`seq` の順に隣り合う行の `tick_id` が
+  `n` と `n + 2` になる tick 列（保存に失敗した tick がある）で、時刻の差がすべて `action_stale_after_ms` 未満で
+  区間内の値も変わらなくても example ができず、除外件数の「欠番」に数えられる（「再起動」には数えない）。その区間の
+  外の欠番では除外されない。`tick_id` がちょうど 1 ずつ増えるなら example ができる
+- **除外の件数**（§2.2 / §2.3 / §2.7）: 「鮮度」「連続」「区間内の変化」「再起動」「欠番」の理由ごとの件数が manifest に記録され、
   それぞれの場合の数と一致する。複数の理由に当たる example は §2.2 の順で最初の理由だけに数えられる。除外が無ければ
   すべて 0 と記録される。理由ごとの件数を持たない manifest は型にならない
 - **決定性**: 同じ DB と spec から、同じ bytes の Dataset v2 ができる。manifest の `examples_sha256` と除外の件数が一致する
@@ -299,6 +327,8 @@ demand を変える候補がすべて評価されなくなる。直前の tick �
 - 学習と runtime で anchor action の意味（いま掛かっている effective）が揃い、「anchor → 最初の step」の照合が意味を持つ
 - 鮮度で除いた件数が manifest に残り、除外がどれだけ効いたかを後から確かめられる
 - `control/model` と `control/drift` の依存が増えない
+- trace の保存に失敗した tick が掛けたかもしれない action を学習せず、その量が「欠番」の件数として再起動と分けて見える
+- 移行前の行を `seq` で見分けるので、新しい DB の mock / replay の run が、最初の tick の時刻だけで拒否されない
 
 悪くなること（と緩和策）。
 
@@ -309,6 +339,9 @@ demand を変える候補がすべて評価されなくなる。直前の tick �
 | `action_stale_after_ms` の値が決まるまで、実機の Dataset v2 は作れない | 0079 §5 #5 / 0050 §5 #2 のとおり、実機の値で作るのは実データの後である。試験と合成 dataset は明示の値で進められる |
 | horizon が `step_ms` の整数倍に縛られる | 0079 §2.3 が既に horizon と格子の一致を求めている。新しい制約ではない |
 | 較正の検査が全 example の期間で行われ、purge される example の期間の中の変更でも拒否される | 狭める向きにだけ厳しい。窓を分けて作り直すのは人の判断（0079 §2.3 のまま） |
+| trace の保存の失敗が多い運用では、欠番で除く example が増える | 「欠番」の件数で量が見える。保存の失敗は 0060 §2.6 / §2.7 のとおりログにも出る（`trace_failed` / `trace_dropped`）ので、原因を直すのが先である |
+| 段 1 で store の migration が1つ増える（`legacy_through_seq`） | 列を1つ足すだけで、`control_traces` の表と `legacy_until_ms` の意味は変えない。既存の DB では安全側の上限で埋める |
+| 0007 を適用済みの DB では、0007 の直後に `legacy_until_ms` と同じ時刻で記録した正しい行も移行前の行として数える | 拒否が増える向きにだけずれる。dataset 用の DB は run の前に新しく作る（0031 §2.3）ので、通常は 0 になる |
 
 ## 4. 却下した代替案
 
@@ -331,6 +364,12 @@ demand を変える候補がすべて評価されなくなる。直前の tick �
 | `prior_action` を anchor の tick と同じ時刻の tick まで含めて取る | 同じ時刻の tick は anchor の tick 自身（または同時刻の別の決定）であり、「決める前の値」にならない |
 | 鮮度で除いた件数を記録しない | 除外が増えても dataset から見えず、`action_stale_after_ms` の値を選ぶ根拠が残らない |
 | 較正の検査を split の後（学習の段）で行う | 0079 §2.3 は「Dataset v2 の生成は拒否する」と決めている。生成された dataset が較正をまたいでいれば、後で何に使っても同じ問題が残る |
+| `tick_id` は狭義単調増加だけを求める（§5 #10 の当初の規則のまま） | 保存されなかった tick（`n` と `n + 2` の間）が掛けた action を見逃す（PR #212 の Codex P1） |
+| 欠番も「再起動」に数える | 理由が混ざり、trace の保存の失敗の量と再起動の量を分けて見られない |
+| trace の版を上げて、保存に失敗した tick を後で記録する | 段 1 は trace へ何も足さない（§2.8）。保存に失敗した tick を後から書けるとは限らない。既存の `tick_id` で欠番は検出できる |
+| 移行前の行を `ts_ms ≤ legacy_until_ms` で見分ける（初版で確認した読み方） | 空の DB でも `legacy_until_ms` がストアの時計で書かれるので、`SimulatedClock` で最初の tick の時刻が等しい正しい run を拒否する（PR #212 の Codex P1） |
+| dataset 用の DB では `legacy_until_ms` が run の開始より前であることを求める | 時計が同じなら同じ問題が残る |
+| `ts_ms < legacy_until_ms`（等しい時刻を含めない）に戻す | 移行前の行の最大の `ts_ms` と等しい時刻の移行前の行を見逃す |
 
 ## 5. 未決事項
 
@@ -338,16 +377,17 @@ demand を変える候補がすべて評価されなくなる。直前の tick �
 |---|---|---|
 | 1 | **決着**（§2.7）: v2 の anchor action は、anchor の tick より厳密に前で直近の ControlTick の effective（`prior_action`）とし、元の tick を記録し、`action_stale_after_ms` で鮮度を検査する（2026-10-01 所有者承認） | 決着（本記録 §2.7） |
 | 2 | **決着**（§2.2）: 鮮度で作らなかった example の件数を manifest に記録する（2026-10-01 所有者承認） | 決着（本記録 §2.2） |
-| 3 | **v2 は決着**（§2.1。2026-10-01 所有者承認）: `seq` の順の `ts_ms` が狭義単調増加でない run と、移行前の行を含む run からの Dataset v2 の生成を拒否する。**v1 の builder の同じ問題は開いたまま**: v1 の builder（`ORDER BY ts_ms, tick_id`）は時刻が単調でない run でも anchor の tick を `ts_ms` の順に選ぶ。v1 にも同じ拒否を足すかは、v1 の dataset を作り直す影響（既存 artifact の再生成で bytes が変わりうる）とあわせて別に決める。以下は初版の記録。§2.1 の as-of の前提（`seq` の順に並べた ControlTick の `ts_ms` が狭義単調増加）が崩れた run をどう扱うか。**推奨案**: その run からの Dataset v2 の生成を拒否する（fail closed。黙って並べ替えない）。`seq` を持たない移行前の行（0071 §2.2a の `legacy_until_ms` より前）を含む run も、順序を確かめられないので拒否する。代替案: `seq` の順で「直近」を選ぶ（壁時計が戻った区間では、格子の時刻と action の時刻の対応自体が崩れるので推奨しない）。v1 の builder（`ORDER BY ts_ms, tick_id`）にも同じ問題があるが、v1 を変えるかは別に決める | v2 は決着（本記録 §2.1）。v1 は #83 で別の Issue コメントまたは記録として扱う |
+| 3 | **v2 は決着**（§2.1。2026-10-01 所有者承認）: `seq` の順の `ts_ms` が狭義単調増加でない run と、移行前の行を含む run からの Dataset v2 の生成を拒否する（移行前の行の見分け方は #12）。**v1 の builder の同じ問題は開いたまま**: v1 の builder（`ORDER BY ts_ms, tick_id`）は時刻が単調でない run でも anchor の tick を `ts_ms` の順に選ぶ。v1 にも同じ拒否を足すかは、v1 の dataset を作り直す影響（既存 artifact の再生成で bytes が変わりうる）とあわせて別に決める。以下は初版の記録。§2.1 の as-of の前提（`seq` の順に並べた ControlTick の `ts_ms` が狭義単調増加）が崩れた run をどう扱うか。**推奨案**: その run からの Dataset v2 の生成を拒否する（fail closed。黙って並べ替えない）。`seq` を持たない移行前の行（0071 §2.2a の `legacy_until_ms` より前）を含む run も、順序を確かめられないので拒否する。代替案: `seq` の順で「直近」を選ぶ（壁時計が戻った区間では、格子の時刻と action の時刻の対応自体が崩れるので推奨しない）。v1 の builder（`ORDER BY ts_ms, tick_id`）にも同じ問題があるが、v1 を変えるかは別に決める | v2 は決着（本記録 §2.1）。v1 は #83 で別の Issue コメントまたは記録として扱う |
 | 4 | `action_stale_after_ms` の値 | 実機の ControlTick の周期と欠け方を見た後（#50 / #83） |
 | 5 | step ごとの context（mode・Safety の状態など）を持つか。本記録は step ごとに値と元の tick だけを持ち、context は anchor の tick のものだけとする（0031 §2.1 のまま） | 必要になったら新しい記録。Shadow・評価（#90 / #91）で Guard / Safety が値を変えた step の扱いが問題になった時 |
 | 6 | 0079 §5 #5（window / horizon / step 格子の実値）と 0050 §5 #2（support 軸と bin の境界）は変わらず開いたまま | 実機 dataset（#50 / #83）の後 |
 | 7 | **決着**（§2.2。2026-10-01 所有者承認。PR #212 の 6d584e6 への Codex P2）: `prior_action` の元の tick から最大の horizon までの間で、`seq` の順に隣り合う ControlTick の差と、最後の tick から最大の horizon までの差が、すべて `action_stale_after_ms` 未満であることを求める。外れた example は作らず、除外件数に数える | 決着（本記録 §2.2） |
 | 8 | **決着**（§2.3 / §2.2。2026-10-01 所有者承認。PR #212 の 7b2783b への Codex P1）: step の区間の中で、どれか1つの zone の effective が step の開始の値と違う example は作らない。除外件数は理由ごと（鮮度・連続・区間内の変化。後に再起動を加えた）に記録する | 決着（本記録 §2.3） |
 | 9 | **決着**（§2.4。2026-10-01 所有者承認。PR #212 の 7b2783b への Codex P1）: v2 の target は `t_a + h − tol ≤ source_ts ≤ t_a + h` の観測だけから採り、`label_end_ms = t_a + 最大の horizon` とする。0031 §2.2 を v2 についてだけ部分的に置き換える | 決着（本記録 §2.4） |
-| 10 | **決着**（§2.2。2026-10-01 所有者承認。PR #212 の 023e55c への Codex P2）: `prior_action` の元の tick から最大の horizon までの間で、`seq` の順に隣り合う ControlTick の `tick_id` が狭義単調増加であることを求める（減少・同値は再起動）。外れた example は作らず、除外件数の4つ目の理由「再起動」に数える。trace の版は上げない | 決着（本記録 §2.2） |
-| 11 | **段 1 の実装の前に決める必要がある**（PR #212 の 3165109 への Codex P1）。`ControlLoop` は tick ごとに `tick_id` を1つ進め、trace の保存に失敗しても例外を記録して制御を続ける（`_record`。0060 §2.6）。そのため、保存された隣り合う行の `tick_id` が `n` と `n + 2` になり、時刻の差は `action_stale_after_ms` 未満でありうる。保存されなかった tick は別の demand を掛けて戻したかもしれず、§2.2 の連続の検査と §2.3 の区間内の変化の検査をどちらも通ってしまう。**推奨案**: `prior_action` の元の tick から最大の horizon までの間で、`seq` の順に隣り合う ControlTick の `tick_id` が**ちょうど 1 ずつ**増えることを求める（§2.2 の「狭義単調増加」を強める）。欠番は除外件数の理由「再起動」とは別の5つ目の理由「欠番」に数える（trace の保存の失敗の量が見えるように）。代替案: 欠番も「再起動」に数える（理由が混ざる）。trace の版は上げない | 所有者の判断。本 PR のレビュー中の修正 |
-| 12 | **段 1 の実装の前に決める必要がある**（PR #212 の 3165109 への Codex P1）。migration `0007_control_trace_seq.sql` は、行が無い DB でも `legacy_until_ms` をストアの時計（`:now_ms`）で書く。`SimulatedClock` が進む前に最初の tick を記録すると、その tick の `ts_ms` が `legacy_until_ms` と等しくなり、§2.1 の「`ts_ms ≤ legacy_until_ms` の行を含む run は拒否」が正しい mock / replay の run を拒否する（AGENTS.md ルール7 の経路を壊す）。**推奨案**: 移行前の行を時刻でなく記録した順で見分ける。新しい migration で `control_trace_prune` に `legacy_through_seq`（移行前の行の `seq` の上限）を足す。行が無いときは 0 とし、既に 0007 を適用した DB では `ts_ms ≤ legacy_until_ms` の行の `MAX(seq)` で埋める（安全側の上限）。Dataset v2 は `seq ≤ legacy_through_seq` の行を含む run を拒否する。0031 §2.3 のとおり dataset 用の DB は run の前に新しく作るので、通常は 0 になる。代替案: (a) dataset 用の DB では `legacy_until_ms` を run の開始より前に限ることを求める（時計が同じなら同じ問題が残る）、(b) `ts_ms < legacy_until_ms`（等しい時刻を含めない）に戻す（移行前の行の最大の `ts_ms` と等しい行を見逃す。所有者が確認した読み方を覆す） | 所有者の判断。store の migration を足すので、段 1 の実装の PR に含めるか別の PR にするかもあわせて決める |
+| 10 | **決着**（§2.2。2026-10-01 所有者承認。PR #212 の 023e55c への Codex P2）: `prior_action` の元の tick から最大の horizon までの間で、`seq` の順に隣り合う ControlTick の `tick_id` が狭義単調増加であることを求める（減少・同値は再起動）。外れた example は作らず、除外件数の4つ目の理由「再起動」に数える。trace の版は上げない。後に #11 で「ちょうど 1 ずつ」に強めた | 決着（本記録 §2.2） |
+| 11 | **決着**（§2.2。2026-10-01 所有者承認。PR #212 の 3165109 への Codex P1）: `prior_action` の元の tick から最大の horizon までの間で、`seq` の順に隣り合う ControlTick の `tick_id` が**ちょうど 1 ずつ**増えることを求める（#10 の「狭義単調増加」を強める）。差が 2 以上の欠番は除外件数の5つ目の理由「欠番」に数える（減少・同値の「再起動」とは別）。trace の版は上げない。以下は判断前の記録。`ControlLoop` は tick ごとに `tick_id` を1つ進め、trace の保存に失敗しても例外を記録して制御を続ける（`_record`。0060 §2.6）。そのため、保存された隣り合う行の `tick_id` が `n` と `n + 2` になり、時刻の差は `action_stale_after_ms` 未満でありうる。保存されなかった tick は別の demand を掛けて戻したかもしれず、§2.2 の連続の検査と §2.3 の区間内の変化の検査をどちらも通ってしまう。代替案: 欠番も「再起動」に数える（理由が混ざる） | 決着（本記録 §2.2） |
+| 12 | **決着**（§2.1。2026-10-01 所有者承認。PR #212 の 3165109 への Codex P1）: 移行前の行を時刻ではなく `seq` で見分ける。新しい migration で `control_trace_prune` に `legacy_through_seq` を足す（行が無い DB では 0、0007 を適用済みの DB では `ts_ms ≤ legacy_until_ms` の行の `MAX(seq)` で埋める安全側の上限）。Dataset v2 は `seq ≤ legacy_through_seq` の行を含む run を拒否する。**migration は段 1（#83）の実装 PR に同梱する**（本記録は規則だけを決める）。初版で確認した「`ts_ms ≤ legacy_until_ms` の行を含む run を拒否」の読み方を、v2 についてこれで置き換える（§6）。以下は判断前の記録。migration `0007_control_trace_seq.sql` は、行が無い DB でも `legacy_until_ms` をストアの時計（`:now_ms`）で書く。`SimulatedClock` が進む前に最初の tick を記録すると、その tick の `ts_ms` が `legacy_until_ms` と等しくなり、正しい mock / replay の run を拒否する（AGENTS.md ルール7 の経路を壊す）。代替案: (a) dataset 用の DB では `legacy_until_ms` を run の開始より前に限ることを求める（時計が同じなら同じ問題が残る）、(b) `ts_ms < legacy_until_ms` に戻す（移行前の行の最大の `ts_ms` と等しい行を見逃す） | 決着（本記録 §2.1）。migration は段 1 の実装 PR |
+| 13 | **段 1 の実装の前に決めるのが望ましい**（本 PR で #11 を反映した際に見つけた点）。§2.2 の再起動・欠番の検査は、範囲の中で隣り合う2つの保存された行だけを見る。範囲の中で最後に保存された tick（`tick_id = n`）と最大の horizon の間に、保存されなかった tick `n + 1` や再起動があり、その tick が最後の step の区間で別の demand を掛けても見えない（連続の検査は最後の tick から最大の horizon までの時刻の差しか見ない）。**推奨案**: 検査の対象を、最大の horizon より後で `seq` の順に最初の ControlTick まで1つ延ばし、その `tick_id` が `n + 1` であることを求める（その tick は as-of の定義から最大の horizon より後なので、値は使わない）。その tick がまだ無い（run の末尾）example は作らず「連続」に数える。代替案: run の末尾の example を残すために、末尾だけ検査を省く（保存の失敗と停止を見逃す） | 所有者の判断。規則の変更なので段 1 の前が望ましいが、段 1 の PR で新しい記録として決めてもよい |
 
 ## 6. 所有者の決定（2026-10-01）
 
@@ -376,6 +416,7 @@ demand を変える候補がすべて評価されなくなる。直前の tick �
 同日、PR #212 のレビュー（6d584e6 時点の §5 #3。Codex P2）を受けて、`seq` の順の `ts_ms` が狭義単調増加でない run と、
 移行前の行を含む run からの Dataset v2 の生成を拒否することを承認した。黙って並べ替えない。v1 の builder の同じ問題は
 開いたまま別に扱う（§2.1、§5 #3）。移行前の行は `ts_ms ≤ legacy_until_ms`（等しい時刻を含む）と読むことも、同日に確認した。
+この読み方は、Dataset v2 については下の §5 #12 の決定（`seq ≤ legacy_through_seq`）で置き換えた。
 
 同日、PR #212 のレビュー（6d584e6 への Codex P2）を受けて、`prior_action` の元の tick から最大の horizon までの間で、
 `seq` の順に隣り合う ControlTick の差と、最後の tick から最大の horizon までの差がすべて `action_stale_after_ms` 未満で
@@ -392,3 +433,15 @@ demand を変える候補がすべて評価されなくなる。直前の tick �
 同日、PR #212 のレビュー（023e55c への Codex P2）を受けて、`prior_action` の元の tick から最大の horizon までの間で
 `seq` の順に隣り合う ControlTick の `tick_id` が狭義単調増加であることを求め（減少・同値は再起動とみなす）、外れた
 example は作らずに除外件数の4つ目の理由「再起動」に数えることを承認した。trace の版は上げない（§2.2、§5 #10）。
+「狭義単調増加」は、下の §5 #11 の決定で「ちょうど 1 ずつ」に強めた。
+
+同日、PR #212 のレビュー（3165109 への Codex P1 の2件）を受けて、次を推奨案で承認した。
+
+- **`tick_id` の欠番**（§5 #11）→ `prior_action` の元の tick から最大の horizon までの間で、`seq` の順に隣り合う ControlTick の
+  `tick_id` がちょうど 1 ずつ増えることを求める。差が 2 以上の欠番は、除外件数の5つ目の理由「欠番」として manifest に件数を
+  記録する（減少・同値の「再起動」とは別の理由）。trace の版は上げない（§2.2）
+- **移行前の行の見分け方**（§5 #12）→ 時刻ではなく `seq` で見分ける。新しい migration で `control_trace_prune` に
+  `legacy_through_seq` を足す（行が無い DB では 0、0007 を適用済みの DB では `ts_ms ≤ legacy_until_ms` の行の `MAX(seq)` で
+  埋める安全側の上限）。Dataset v2 は `seq ≤ legacy_through_seq` の行を含む run を拒否する。**migration は段 1（#83）の
+  実装 PR に同梱する**（本 PR は規則を決めるだけで migration を書かない）。これにより、上で確認した「`ts_ms ≤ legacy_until_ms`
+  の行を含む run を拒否」の読み方を、Dataset v2 については置き換える（§2.1）
