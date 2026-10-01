@@ -1732,6 +1732,21 @@ SKIP_REASONS_BEFORE_TACH: frozenset[AirBalanceCoordinationSkipReason] = frozense
 """
 
 
+_SKIP_REASONS_AFTER_SNAPSHOT: frozenset[AirBalanceCoordinationSkipReason] = frozenset(
+    {
+        AirBalanceCoordinationSkipReason.BASELINE_UNAVAILABLE,
+        AirBalanceCoordinationSkipReason.SAFETY_STATE,
+        AirBalanceCoordinationSkipReason.ZONE_FAN_FAULT,
+        AirBalanceCoordinationSkipReason.TACH_UNCONFIRMED,
+    }
+)
+"""0078 §2.3 の表で ``baseline_unavailable`` とその後の行。
+
+ここに当たる tick は ``baseline_unavailable`` なら raw baseline が無く、ほかは必ずある。
+それより上の行（``air_balance_disabled`` など）は baseline の有無を問わない。
+"""
+
+
 class ProjectedFloorBasis(StrEnum):
     """zone ごとの下限の見込み ``f_z`` を決めた下限（決定記録 0078 §2.7）。
 
@@ -1913,6 +1928,14 @@ class AirBalanceCoordinationRecord(_Frozen):
         ):
             raise ValueError("skipped / failed の tick は協調の結果の欄を持たない")
         if self.status is AirBalanceCoordinationStatus.SKIPPED:
+            # 0078 §2.3 の表の順: baseline_unavailable は raw baseline が無い tick、それより後の行は
+            # raw baseline がある tick でしか当たらない（決定記録 0088 §2.2）。
+            if (self.skip_reason is AirBalanceCoordinationSkipReason.BASELINE_UNAVAILABLE) != (
+                self.candidate is None
+            ) and self.skip_reason in _SKIP_REASONS_AFTER_SNAPSHOT:
+                raise ValueError(
+                    "baseline_unavailable の tick だけが raw baseline（candidate）を持たない"
+                )
             if self.projected_floors is not None:
                 raise ValueError("skipped の tick は下限を見込まない（projected_floors は null）")
         elif self.projected_floors is None:
@@ -1930,6 +1953,16 @@ class AirBalanceCoordinationRecord(_Frozen):
             or self.projected_floors is None
         ):
             raise ValueError("協調した tick は candidate / proposed / output と保持込みの値を持つ")
+        # 協調の結果（AirBalanceCoordination）は before / projected の推定を必ず持つ。比は状態が
+        # unknown のときだけ無い（AirBalanceEstimate と同じ不変条件）。
+        for name, state, ratio in (
+            ("before", self.before_state, self.before_ratio),
+            ("projected", self.projected_state, self.projected_ratio),
+        ):
+            if state is None:
+                raise ValueError(f"協調した tick は {name}_state を持つ")
+            if (state is AirBalanceTraceState.UNKNOWN) != (ratio is None):
+                raise ValueError(f"{name}_ratio は {name}_state が unknown のときだけ無い")
         shadow = self.status is AirBalanceCoordinationStatus.SHADOW
         if shadow != (self.mode is AirBalanceCoordinationMode.SHADOW):
             raise ValueError("mode: shadow で協調した tick は常に status: shadow")

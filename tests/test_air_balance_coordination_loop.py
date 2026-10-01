@@ -1125,3 +1125,37 @@ def test_projected_floors_are_null_when_skipped_and_kept_when_failed(
     )
     with pytest.raises(ValidationError, match="projected_floors を記録する"):
         _validate(failed)
+
+
+def test_a_skip_reason_after_the_baseline_check_needs_the_baseline(catalog: MetricCatalog) -> None:
+    """表の順（0078 §2.3）と raw baseline の有無を突き合わせる（0088 §2.2）。"""
+    document = _skipped_document(catalog)
+    block = document["air_balance_coordination"]
+    assert block["skip_reason"] == "safety_state"
+    without = json.loads(json.dumps(document))
+    without["air_balance_coordination"].update({"candidate": None, "output": None})
+    with pytest.raises(ValidationError, match="baseline_unavailable"):
+        _validate(without)
+    fabricated = json.loads(json.dumps(document))
+    fabricated["air_balance_coordination"]["skip_reason"] = "baseline_unavailable"
+    with pytest.raises(ValidationError, match="baseline_unavailable"):
+        _validate(fabricated)
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"before_state": None, "before_ratio": None},
+        {"projected_state": None, "projected_ratio": None},
+        {"before_state": "unknown"},
+        {"projected_ratio": None},
+    ],
+)
+def test_a_coordinated_record_carries_both_estimates(
+    catalog: MetricCatalog, change: dict[str, Any]
+) -> None:
+    document = _applied_document(catalog)
+    _validate(document)
+    document["air_balance_coordination"].update(change)
+    with pytest.raises(ValidationError, match=r"_state|_ratio"):
+        _validate(document)
