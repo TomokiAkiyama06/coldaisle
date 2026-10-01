@@ -1,0 +1,20 @@
+# coldaisle-fand に、対象 zone の hwmon の pwmN / pwmN_enable だけの書き込み権限を渡す（#57 / 決定記録 0080 §2.6）。
+#
+# **テンプレートである。** driver 名（REPLACE-WITH-DRIVER-NAME）と channel 番号（pwmN の N）は
+# 明らかな仮の値で、このままではどの chip にも当たらない。実機の値は `docs/fan-header-mapping.md` の
+# 手順で調べ、**導入先の /etc/udev/rules.d/ でだけ**書き換える。実機の値をコミットしない
+# （AGENTS.md ルール10 / 決定記録 0021）。グループ名 coldaisle-fan は fand の unit の Group= と同じ仮の値。
+#
+# udev の GROUP= / MODE= は /dev のデバイスノードにしか効かない。hwmon には /dev のノードが無いので、
+# **sysfs の属性を RUN+= で直接変える。** 対象は Front / Rear / Top の各 zone の pwmN と pwmN_enable だけで、
+# それ以外の属性（ほかの channel・fanN_input など）の権限は変えない。zone ごとに pwmN を書き換え、
+# 必要なら同じ形の行を足す（3つの zone が別の chip にあるなら、chip ごとに1行）。
+#
+# ドライバの再 bind で属性が作り直されると権限は元に戻る（ACTION=="add" で付け直す）。
+# 権限が付かなければ fand の takeover は EPERM で失敗し、ExecStopPost が root で Max を書く（安全側）。
+#
+#   sudo cp deploy/udev/99-coldaisle-hwmon.rules /etc/udev/rules.d/
+#   sudoedit /etc/udev/rules.d/99-coldaisle-hwmon.rules
+#   sudo udevadm control --reload-rules && sudo udevadm trigger --subsystem-match=hwmon
+
+ACTION=="add|change", SUBSYSTEM=="hwmon", ATTR{name}=="REPLACE-WITH-DRIVER-NAME", RUN+="/bin/chgrp coldaisle-fan /sys%p/pwmN /sys%p/pwmN_enable", RUN+="/bin/chmod 0664 /sys%p/pwmN /sys%p/pwmN_enable"
