@@ -57,10 +57,13 @@ uv run coldaisle-authority raise \
 （path は仮の値。導入先の値に置き換える。`--registry-limits` は `model-registry.yaml` の
 ディレクトリで、既定は `config`）
 
-**`docs/ubuntu-deploy.md` の導入手順のままでは、`raise` はまだ通らない。** 承認者は自分の uid で
-制御設定（`/etc/coldaisle/control-config`）を読み、Model Registry の lock を取る必要があるが、その権限は
-決定記録 0086 §5 の未決 3 で決まっていない（設定は `root:coldaisle-fan`・`0640`）。`rollback` は
-authority のディレクトリだけを使うので、導入手順のままで使える。
+**本番（`docs/ubuntu-deploy.md` の導入先）での `raise` は、操作者に制御設定の読み取りと Model Registry の
+lock の最小権限を与える設計が決まるまで使えない（#217。`rollback` は使える）。** 承認者は自分の uid で
+制御設定（`/etc/coldaisle/control-config`。`root:coldaisle-fan`・`0640`）を読み、Model Registry の lock を
+取る必要があるが、導入手順はその権限を与えていない（決定記録 0086 §5 の未決 3。2026-10-01 所有者の判断で、
+#216 では文書で制限し、権限の設計は #217 で行う）。権限を個別に足して回避しない。
+`rollback` は authority のディレクトリ（`authority.json` と lock）だけを使い、制御設定も Registry も
+読まないので、導入手順のままで使える。
 
 - **承認者は実行した uid（`uid.<os.getuid()>`）。** `--approver` は無い。承認ファイルに
   `approver` / `approver_binding` があれば拒む（0086 §2.5）。`SUDO_UID` などの環境変数は読まない（§2.1）

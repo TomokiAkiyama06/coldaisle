@@ -306,8 +306,10 @@ sudo install -d -o coldaisle-fan -g coldaisle-authority -m 2770 /var/lib/coldais
   （`coldaisle` と同じ考え方。アカウントに入れると unit の外でも journal を書けてしまいます）
 - 昇格と、fand が止まっているときの rollback は `coldaisle-authority raise` / `rollback`
   （0086 §2.10 の段階 3b。#92）で行います。使い方・終了コードは `docs/authority-rollout.md`。
-  **ただし `raise` は、承認者が制御設定を読み Model Registry の lock を取る権限（0086 §5 の未決 3。
-  この文書の末尾）が決まるまで、この手順のままでは通りません。** `rollback` は使えます
+  **本番での `raise` は、操作者に制御設定の読み取りと Model Registry の lock の最小権限を与える設計が
+  決まるまで使えません（#217。0086 §5 の未決 3。この文書の末尾）。** この手順のままでは承認者が制御設定も
+  Registry の lock も読めず、必ず失敗します。個別に権限を足して回避しないでください。
+  `rollback` は authority のディレクトリだけを使うので、この手順のままで使えます
 - グループへの所属は、`usermod` の後に**ログインし直してから**効きます（`dialout` と同じ）。
   いまの shell のまま CLI を実行すると `2770` のディレクトリへ入れず、権限の error で止まります。
   `id -nG` に `coldaisle-authority` が出ることを確かめてから使います
@@ -555,4 +557,5 @@ CLI の書いた journal を読むと、走行中なら `SHADOW` へ下がり、
    **`enable` はしません**（6 節の冒頭のとおり）
 
 承認者が Model Registry の lock を取り、報告と制御設定を読むための権限（Registry のディレクトリの
-グループ）は、決定記録 0086 §5 の 3 で未決です。この節では扱いません。
+グループ）は、決定記録 0086 §5 の 3 で未決です（#217）。この節では扱いません。**それが決まるまで、本番での
+`coldaisle-authority raise` は使えません**（`rollback` は使えます）。
