@@ -1,7 +1,8 @@
 """Air Balance の協調の設定と純粋な Coordinator（#81 / 決定記録 0078）。
 
-0078 §2.11 の段 2 の試験。**loop へは配線しない**ので、ここでは設定の検証と
-`AirBalanceCoordinator` の計算（上げるだけ・上限・保持・失敗）だけを確かめる。
+0078 §2.11 の段 2 の試験。ここでは設定の検証と `AirBalanceCoordinator` の計算
+（上げるだけ・上限・保持・失敗）だけを確かめる。loop への配線（段 3）は
+`test_air_balance_coordination_loop.py` が確かめる。
 校正済みの値は試験用に `calibrated` を名乗らせた characterization で、実機の値ではない。
 """
 
@@ -112,12 +113,12 @@ class ScriptedModel:
         demands: PerZone[Demand],
         thermal: ThermalInputs,
         *,
-        projected_top_floor: Demand | None = None,
+        projected_floors: PerZone[Demand] | None = None,
     ) -> AirBalanceCoordination:
-        self.calls.append({"demands": demands, "projected_top_floor": projected_top_floor})
+        self.calls.append({"demands": demands, "projected_floors": projected_floors})
         if self.error is not None:
             raise self.error
-        base = self._inner.coordinate(demands, thermal, projected_top_floor=projected_top_floor)
+        base = self._inner.coordinate(demands, thermal, projected_floors=projected_floors)
         if self.lower:
             # AirBalanceCoordination の検証を迂回して「下げる」不具合を模す。
             lowered = zones(0.0, demands.rear, demands.top)
@@ -364,11 +365,12 @@ def test_coordinate_sees_stable_demands_but_untouched_zones_keep_the_raw_value(
     assert result.status == "not_needed"
 
 
-def test_projected_top_floor_is_passed_and_floors_are_recorded(tmp_path: Path) -> None:
+def test_projected_floors_of_every_zone_are_passed_and_recorded(tmp_path: Path) -> None:
+    """Front / Rear / Top の下限をすべて ``coordinate()`` へ渡す（決定記録 0078 §2.2）。"""
     unit, model = scripted(tmp_path)
     floors = zones(0.6, 0.4, 1.0)
     result = run(unit, zones(0.5, 0.5, 0.5), 0, floors=floors)
-    assert model.calls[-1]["projected_top_floor"] == 1.0
+    assert model.calls[-1]["projected_floors"] == floors
     assert result.projected_floors == floors
 
 

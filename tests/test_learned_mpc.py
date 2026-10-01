@@ -1483,7 +1483,7 @@ class StubAirBalance:
             ),
         )
 
-    def coordinate(self, demands, thermal, *, projected_top_floor=None):  # type: ignore[no-untyped-def]
+    def coordinate(self, demands, thermal, *, projected_floors=None):  # type: ignore[no-untyped-def]
         """MPC は使わない。"""
         raise NotImplementedError
 

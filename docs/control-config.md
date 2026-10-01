@@ -201,10 +201,15 @@ air_balance_coordination:
 - **`mode: shadow` / `apply` で `air-balance.yaml` が `uncalibrated` なら Control Config の不正**として扱い、
   全 zone Max（`config_invalid`）で止まる（黙って `off` と読まない。0078 §2.4）。校正済みのまま協調だけを止めるときは `mode: "off"`
 
-**協調はまだ loop へ配線していない**（0078 §2.11 の段 2）。v10 の設定は検証されるだけで、どの `mode` でも
-Fan の挙動と decision trace は v9 のときと変わらない。純粋な `AirBalanceCoordinator`
-（`control/air_balance_coordination.py`。上げるだけ・zone ごとの上限・下げる前の保持）は段 3 で
-Fallback の後・Gate の前に配線し、`ControlTick` の新しい版に記録する。
+**協調は loop へ配線済み**（0078 §2.11 の段 3 / 決定記録 0085）。`AirBalanceCoordinator`
+（`control/air_balance_coordination.py`。上げるだけ・zone ごとの上限・下げる前の保持）を
+Fallback の後・Critical Safety の評価の後・Gate の前に置き、毎 tick を `ControlTick` v14 の
+`air_balance_coordination` に記録する。
+
+- `mode: "off"`（雛形の既定）: 協調の部品を作らない。Fan の挙動は v9 のときと同じで、trace には `status: off` だけが残る
+- `mode: "shadow"`: Fan の挙動は `off` と同じ。毎 tick `proposed` と保持込みの `counterfactual_output` を記録する
+- `mode: "apply"`: Baseline の requested が `max_raise` まで上がりうる（下がらない）。協調の失敗は
+  `fallback_exception`（次 tick は全 zone Max）で、その tick は Gate を迂回して raw baseline を使う
 
 **移行手順**: v9 を v10 として補完しない（読み込み時に拒否する）。
 
