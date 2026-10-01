@@ -13,7 +13,7 @@
     「候補の照合」のうち、(a) / (c) の集合を全 step で共有する部分（本記録 §2.2）
   - §2.4 の検査の表の L8 の行（各 entry の検査に、キー集合の一致を加える。本記録 §2.3）
   - 本記録が足すだけで 0079 を置き換えない点: §2.4 の検査の表への L11 / L12 の追加（§2.1 / §2.2）、
-    §2.3 の feature schema の項への anchor 推論の action 列の規則の追加（§2.1）、0050 §2.2 の `support` の OOD の条件への「held の列が step ごとの support の外」の追加（Profile v2 についてだけ。狭める向きで 0050 を置き換えない。§2.1）、§2.7 の試験の追加（§2.4）
+    §2.3 の feature schema の項への anchor 推論の action 列の規則の追加（§2.1）、0050 §2.2 の `support` の OOD の条件への「held の列が step ごとの support の外」の追加（Profile v2 についてだけ。狭める向きで 0050 を置き換えない。§2.1）、0050 §2.1 の residual の基準の母集団から held の列が step ごとの support の外にある validation example を除くことと、除いた件数の記録・残りが無い出力での Profile の作成の拒否（Profile v2 についてだけ。§2.1）、§2.7 の試験の追加（§2.4）
   - 旧記録側への `Superseded by` の追記（README「追記のみ」）は本 PR で 0079 に行った
 - **関連**: [0031](0031-thermal-dataset-contract.md) §2.2 /
   [0048](0048-thermal-model-artifact-and-inference.md) §2.1 / §2.4 /
@@ -85,7 +85,7 @@ zone `z` ∈ Front / Rear / Top）に、すべての `k` について `observed.
 | 使う場所 | 計画 action の列 |
 |---|---|
 | runtime の anchor 推論（0052 §2.2 の 1.） | `hold_effective` |
-| Profile v2 の residual の基準（validation の各 example の anchor 推論。0050 §2.1） | `hold_effective`。example の anchor action（`ObservedThermalInput.from_example(example).action`）から作り、Dataset v2 に記録した action 列は使わない。held の列が step ごとの support の外にある example を基準から除くかは**本記録では決めない**（§5 #1。決まるまで段 3 でこの基準を作る部分を実装しない） |
+| Profile v2 の residual の基準（validation の各 example の anchor 推論。0050 §2.1） | `hold_effective`。example の anchor action（`ObservedThermalInput.from_example(example).action`）から作り、Dataset v2 に記録した action 列は使わない。held の列が step ごとの support の外にある example は基準から**除く**（下記。§5 #1 の決着） |
 | offline の評価・Shadow の照合で「anchor 推論」として扱う予測（0053 / 0054） | `hold_effective` |
 | 候補 plan の評価（`predict_plan`）・trainer の係数の当てはめ | 対象外。候補は `ActionPlan` の列、当てはめは Dataset v2 に記録した action 列（0079 §2.9 段 1）のまま |
 
@@ -94,6 +94,19 @@ validation の residual が、記録した（実際に掛かった）action 列�
 意味が違い、正規化 residual の比が model の当たり外れでなく入力の違いを測ってしまう。両方を
 `hold_effective` に揃えると、「いまの demand を保つと仮定した予測が、その後の実際の運転でどれだけ外れるか」
 を同じ意味で比べられる。
+
+**residual の基準から support の外の validation example を除く**（2026-10-01 所有者承認。§6 の追加）。
+
+- validation の各 example の held の列を、上の runtime の照合と**同じ関数**で、train から数えた step ごとの support
+  （§2.2）に当てる。1つでも外れた example は、Profile v2 の residual の基準（出力ごとの validation residual RMS。
+  0050 §2.1）の計算に入れない。runtime ではその入力は `support` の OOD になり予測を使わないので、その外挿の誤差で
+  residual scale を広げると、support の中の予測の residual drift が見えにくくなる（PR #205 の Codex P1）
+- 除いた example の件数を Profile v2 に記録する（基準に使った件数とともに）。除いた理由の内訳は detail と同じく
+  step の番号（遷移なら step の組）・zone・cell で数えてよいが、型の必須は件数だけとする
+- 除いた後、ある出力について基準に使える example が **1件も残らない**なら、Profile の作成（したがって artifact の
+  登録）を拒否する。黙って基準を作らない・既定値で埋めない。「0件」は構造上の条件であり、新しい数値の
+  しきい値は足さない（件数が少ない基準の扱いは 0050 の `residual_scale_floor` のまま）
+- この除外は Profile v2 だけに当てる。v1 の Profile の作り方は変えない
 
 **読み込み時の検査（0079 §2.4 への追加 L11）**: manifest と Profile v2 は、この規則を `anchor_action_rule`
 として持つ。v2 で取れる値は `hold_effective` だけの Literal とする（規則を変えるなら schema の版を上げ、
@@ -168,6 +181,9 @@ Profile v2 の「action の学習範囲」（0079 §2.1 の表）を次のとお
   Gate が Fallback の requested を選ぶ。anchor action の `fan range` と support cell には入っている（0050 の既存の
   判定だけなら通る）入力で確かめる。組 `(k, k + 1)` の (c) にだけ無い held の遷移も同じく OOD になる。
   step ごとの support の範囲に入る held の列は、この照合で OOD にならない。v1 の Profile の判定は変わらない
+- residual の基準の除外（§2.1）: held の列が step ごとの support の外にある validation example を含む合成 dataset で、
+  その example が基準の RMS に入らず、除いた件数が Profile に記録される。ある出力の validation example がすべて
+  support の外のとき、Profile の作成が拒否され artifact が登録されない
 - L11: `anchor_action_rule` が manifest と Profile で食い違う・Literal 外の値の artifact が型にならず、
   runtime が `MODEL_LOAD_FAILURE` として Fallback の requested を出す（0079 §2.7 の L1〜L10 と同じ確かめ方）
 - step ごとの support: train の計画 action で、ある demand（または cell）を step 0 でだけ観測した Profile で、
@@ -216,7 +232,7 @@ Profile v2 の「action の学習範囲」（0079 §2.1 の表）を次のとお
 
 | # | 内容 | 決める場所 |
 |---|---|---|
-| 1 | **決着**（§2.1）: held の列が step ごとの support の外なら anchor 推論を `support` の OOD にし Fallback へ。残る論点は、Profile v2 の residual の基準を作るとき、held の列が support の外にある validation example を除くか。除かないと、runtime では OOD になる（予測を使わない）入力の外挿誤差が residual scale を広げ、support の中の予測の residual drift を見えにくくしうる（PR #205 の Codex P1）。除くなら、除いた後に example が残らない出力の扱い（Profile の作成を拒否するか）も同時に決める | 段 3（#85）の実装の前。除くなら新しい記録 |
+| 1 | **決着**（§2.1）: held の列が step ごとの support の外なら anchor 推論を `support` の OOD にし Fallback へ。Profile v2 の residual の基準からも、held の列が support の外にある validation example を同じ関数で除き、除いた件数を記録し、残りが無い出力があれば Profile の作成を拒否する（2026-10-01 所有者承認。PR #205 の 488f918 への Codex P1 の解消） | 決着（本記録 §2.1） |
 | 2 | step ごとの集合の合計に、0050 §3 の上限とは別の構造上の上限が要るか | 段 3（#85）の実装で Profile の大きさを測った後。数値を足すなら新しい記録 |
 | 3 | 運転方針（MPC の authority）が学習時と大きく変わったとき、held を仮定した residual の比がどれだけ動くか | #90 / #91 の Shadow・評価と 0056 の drift の運用で測る |
 | 4 | 0079 §5 #5（window / horizon / step 格子・target metric 集合の実値）と 0050 §5 #2（support 軸と bin の境界）は変わらず開いたまま | 実機 dataset（#50 / #83）の後 |
@@ -243,3 +259,7 @@ Issue #104 の 2026-09-30 のコメントで示した推奨案を、2026-10-01 �
 
 同日、PR #205 のレビュー（Codex P1）を受けて、held の anchor の列にも step ごとの support の照合を当て、外れれば
 `support` の OOD として Fallback にすることを承認した（§2.1。初版では §5 #1 に先送りしていた）。
+
+同日、PR #205 のレビュー（488f918 への Codex P1）を受けて、Profile v2 の residual の基準から held の列が step ごとの
+support の外にある validation example を同じ照合関数で除き、除いた件数を Profile に記録し、ある出力で残りが0件なら
+Profile の作成（artifact の登録）を拒否することを承認した（§2.1。新しい数値のしきい値は足さない。§5 #1 の決着）。
