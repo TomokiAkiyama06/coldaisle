@@ -295,6 +295,17 @@ def test_the_handoff_runs_as_root_from_the_source_file_without_arguments():
     assert source.endswith("/coldaisle/safety_handoff.py")
 
 
+def test_the_deploy_guide_runs_the_handoff_exactly_as_the_unit_does():
+    """導入先のシステムの Python で実行部が動くことを、unit と同じ形で確かめさせる（0080 §2.5）。
+
+    uv の管理する Python の導入先（docs/ubuntu-deploy.md 2 節）でも `/usr/bin/python3` が
+    使われるため、unit を変えたら手順も変える。
+    """
+    command = one(fand(), "Service", "ExecStopPost").removeprefix("+")
+    guide = (ROOT / "docs" / "ubuntu-deploy.md").read_text(encoding="utf-8")
+    assert f"sudo {command};" in guide
+
+
 def test_fand_keeps_the_kernel_tunables_writable():
     """`ProtectKernelTunables=yes` は `/sys` を読み取り専用にする（0080 §2.6）。
 

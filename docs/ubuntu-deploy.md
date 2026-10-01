@@ -86,6 +86,11 @@ sudo UV_PYTHON_DOWNLOADS=never "$(command -v uv)" sync --no-dev --python /usr/bi
 （`UV_PYTHON_INSTALL_DIR=/opt/coldaisle-python`）。サービス用ユーザーのホーム
 （`/var/lib/coldaisle`。データの置き場所）の下へ Python を入れないためです。
 
+**ただし `coldaisle-fand` の引き継ぎ実行部（`ExecStopPost=`）は、uv の管理する Python を使いません。**
+venv と uv の置き場所が壊れていても Max を書けるよう、システムの `/usr/bin/python3` で動きます
+（決定記録 0080 §2.5）。`/usr/bin/python3` が 3.12 より古い導入先では、fand の unit を置く前に
+6.5 の確かめが通りません（3.9 以前では import の時点で落ち、異常終了の後に Max を書けません）。
+
 秘匿情報を使う場合（通知の宛先など）。
 
 ```bash
@@ -410,6 +415,9 @@ sudoedit /etc/systemd/system/coldaisle-fand.service   # WatchdogSec= を safety.
 sudo systemctl daemon-reload
 # 実行ファイル・ExecStopPost・設定の構文を確かめる
 sudo systemd-analyze verify /etc/systemd/system/coldaisle-fand.service
+# 引き継ぎ実行部が導入先のシステムの Python で動くことを確かめる（unit の ExecStopPost= と同じ形）
+/usr/bin/python3 --version
+sudo /usr/bin/python3 -I -S /opt/coldaisle/src/coldaisle/safety_handoff.py; echo "exit=$?"
 ```
 
 - `systemd-analyze verify` は CI に無いので（`tests/test_deploy_templates.py` は静的な試験だけ）、
@@ -420,6 +428,13 @@ sudo systemd-analyze verify /etc/systemd/system/coldaisle-fand.service
 - 引き継ぎ実行部（`ExecStopPost=`）は venv を使わず、システムの `/usr/bin/python3` で
   `/opt/coldaisle/src/coldaisle/safety_handoff.py` を引数なしで実行します。`/opt/coldaisle` は
   root の所有のままにします（fand のユーザーが書き換えられないように）
+- 上の `safety_handoff.py` の実行は、`/usr/bin/python3` が **3.12 以上**（`pyproject.toml` の
+  `requires-python` と同じ）で、`"record_found":false` と `exit=0` が出れば通っています。fand を
+  まだ起動していないので引き継ぎ記録（`/run/coldaisle/fan-handoff.json`）は無く、何も書きません
+  （記録が残っていれば Max・manual を書きます。冷却を弱める方向には書きません）。
+  **3.12 より古い、または `exit=0` にならない導入先では fand の unit を置きません。**
+  uv の管理する Python（2 節）や venv の `python` を `ExecStopPost=` に書き換えないでください
+  （0080 §2.5 の「venv と `coldaisle` パッケージに依存しない」を崩します）
 - **`sudo systemctl enable coldaisle-fand` は実行しません。** 0080 §2.10 の段階 5（simulated backend
   のまま、`kill -STOP`・`kill -KILL`・`systemctl stop`・再起動の連続で `ExecStopPost` が走ること・
   `/run/coldaisle` が残ること・順序を確かめる）と、0028 §2.9 の承認点 3 の後に行います。

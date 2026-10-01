@@ -44,6 +44,8 @@ ExecStart=/opt/coldaisle/.venv/bin/coldaisle-fand --require-watchdog --config-di
 
 # 異常終了・watchdog・SIGKILL の後に root・sandbox なしで Max を書く引き継ぎ実行部（0028 §2.7 / 0080 §2.5）。
 # venv と coldaisle パッケージに依存しないよう、システムの python3 でソースを直接、引数なしで実行する。
+# /usr/bin/python3 は 3.12 以上が要る（uv の管理する Python へ書き換えない）。導入前に
+# docs/ubuntu-deploy.md 6.5 の手順でこの形のまま exit 0 になることを確かめる。
 # 正常停止かどうかは引き継ぎ記録の有無だけで決める（SERVICE_RESULT を読まない。0080 §2.8）
 ExecStopPost=+/usr/bin/python3 -I -S /opt/coldaisle/src/coldaisle/safety_handoff.py
 
