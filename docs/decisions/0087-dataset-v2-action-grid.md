@@ -44,7 +44,13 @@ Thermal Dataset v2 を入力にする。2026-10-01 時点の main には段 1 �
    `[k × step_ms, (k + 1) × step_ms)` とする。`control/mpc/plan.py` は `offset_ms = step_ms × (k + 1)` である）
 6. 較正の変更の検査（0079 §2.3）を、どの層で行うか
 
-2026-10-01、リポジトリ所有者が6点とも推奨案で承認した。本記録はそれを、実装が参照できる具体性で書く。
+さらに本記録の初版のレビューで、7つ目の点が見つかった（§2.7）。
+
+7. v2 の example の anchor action（0084 §2.1 の `hold_effective` の起点、0079 §2.5 の「anchor → 最初の step」と
+   (b) の起点）を、どの tick の effective とするか
+
+2026-10-01、リポジトリ所有者が7点とも推奨案で承認した（初版のレビューで残った点も含む。§6）。本記録はそれを、
+実装が参照できる具体性で書く。
 **数値のしきい値・設定値は新しく決めない**（§2.2 の `action_stale_after_ms` は欄を作るだけで、値は実データの後に決める）。
 
 ## 2. Decision
@@ -58,6 +64,11 @@ anchor の ControlTick の時刻を `t_a` とする。step `k`（`k` = 0 .. `ste
 - 元にした tick の時刻（`ts_ms`）と `tick_id` を step ごとに記録する。zone ごとには記録しない。1つの tick が
   全 zone の値を持つからである
 - step 0 は時刻 `t_a` の as-of なので、anchor の tick 自身である
+- **前提**: 「直近」は ControlTick の `ts_ms` の順で決まる。これが実行の順と一致するのは、run の中で記録した順
+  （`seq`。0071 §2.2a）に並べた `ts_ms` が狭義単調増加のときだけである。壁時計が戻った run、同じ `ts_ms` の
+  tick を持つ run では、`ts_ms` の順で「直近」を選ぶと、後で掛かった action や、その時刻に掛かっていなかった
+  action を選びうる（`tick_id` も再起動で 0 に戻る。0071 §2.2）。**この前提が崩れた run の扱いは未決**であり、
+  段 1 の実装の前に決める（§5 #3）
 - 値は丸め・補間・clamp をしない。ControlTick の `effective` は既に 0.0..1.0 で検証されている
 - 0031 §2.2 の window と同じ規則（「その時点以前の直近観測だけを as-of で使う」「元の時刻を残す」）を
   action にも当てる。window と action で別の時刻対応を持たない
@@ -72,7 +83,11 @@ model へ渡す」と同じ意味になる。
   設定（呼び出し側が渡す spec）で毎回明示させる（0031 §2.6「実測前に固定しない値」と AGENTS.md ルール9）
 - step `k` について `(t_a + k × step_ms) − 元にした tick の ts_ms ≥ action_stale_after_ms` なら、その anchor の
   example を**作らない**。不等号は window の `stale_mask` の判定（`frame.ts_ms − source_ts ≥ stale_after_ms`）と
-  向きを揃える
+  向きを揃える。§2.7 の `prior_action` の元の tick も同じ上限で検査する（`t_a − 元の tick の ts_ms ≥
+  action_stale_after_ms` なら作らない）
+- 鮮度で作らなかった example の**件数**を Dataset v2 の manifest に記録する。0 件でも 0 と記録する。件数は
+  dataset の bytes（manifest）に入るので、同じ DB と spec からは同じ件数になる。どの step で外れたかの内訳は
+  記録してよいが、型の必須は件数だけとする（0084 §2.1 で除いた validation example の件数を記録するのと同じ向き）
 - 既存の `stale_after_ms`（Telemetry の鮮度）とは共用しない。ControlTick の周期と Telemetry の周期は別物であり、
   片方の都合でもう片方の判定を変えないため
 - **実際の値は本記録では決めない。** 実機の ControlTick の周期と、tick の欠け方（再起動・停止の間隔）を
@@ -132,19 +147,41 @@ target の許容誤差の分（最大の horizon から `label_end_ms` まで）
 - 検査する期間は、生成した**全 example** の `[history_start_ms の最小, label_end_ms の最大]` とする。その中に
   較正の変更が1つでもあれば、dataset の生成を拒否する。split は dataset の生成より後に決まる。全 example の
   期間は、どの split の集合の期間も含む。したがって 0079 §2.3 の「全 split を通した期間」の条件は、
-  これで満たされる（後で purge される example の期間も含むので、狭める向きにだけ厳しい）
+  これで満たされる（後で purge される example の期間も含むので、0079 より厳しい。狭める向きにだけ厳しい
+  ことを、2026-10-01 に所有者が承認した。§6）
 
 理由: `control/drift` は既に `control/model`（`confidence` / `thermal`）を import している。`control/model` から
 `control/drift` を import すると循環する。宣言された変更の型を `control/model` へ持ち込むと、drift の型の変更が
 dataset の schema に波及する。時刻の列だけを渡せば、どちらの依存も生まない。
 
-### 2.7 変えないこと
+### 2.7 v2 の anchor action は、anchor の tick より厳密に前の直近の ControlTick の effective（`prior_action`）
+
+- Dataset v2 の example に `prior_action` を足す。値は、anchor の tick の時刻 `t_a` より**厳密に前**（`ts_ms < t_a`）で
+  直近の ControlTick（同じ source run の中）の、zone ごとの `effective` とする。元にした tick の時刻と `tick_id` を記録する
+- v2 の anchor action はこの `prior_action` とする。具体的には次の3つがすべて `prior_action` を起点にする
+  - v2 の example から作る `ObservedThermalInput` の `action`（`from_example` の v2 版。0084 §2.1 の residual の基準の
+    「example の anchor action」）
+  - 0084 §2.1 の `hold_effective` の列
+  - 0079 §2.5 の「anchor → 最初の step」の変化量と (b) の cell の組（Profile v2 は train の `prior_action` → step 0 から数える）
+- step 0 は §2.1 のとおり anchor の tick 自身の effective である（`prior_action` とは別の値になりうる）
+- 鮮度は §2.2 と同じ `action_stale_after_ms` で検査する。anchor の tick より前に tick が1つも無い（run の最初の tick
+  など）場合も、その example を作らない。どちらも §2.2 の除外の件数に数える
+- v1 と同じ `action` の欄（anchor の tick 自身の requested / effective と介入理由。0031 §2.1）は、v2 でも分析用に
+  そのまま持つ。ただし v2 の anchor action としては使わない
+
+理由: runtime の anchor 推論が受け取る action は「いま掛かっている effective demand」（0052 §2.2）で、その tick が
+demand を決める**前**の値である。v1 の意味（anchor の tick 自身の effective）のままでは、§2.1 の step 0 と同じ値に
+なる。すると「anchor → step 0」の変化量が常に 0 になり、0079 §2.5 の (b) は対角の cell だけになる。その結果、
+demand を変える候補がすべて評価されなくなる。直前の tick の effective を anchor にすれば、学習と runtime で anchor の
+意味が揃う。
+
+### 2.8 変えないこと
 
 - **`ControlTick` の版を上げない。** 段 1 は ControlTick を読むだけで、trace へ何も足さない（0079 §2.9 の段 1 の行のまま）
 - v1 の dataset を v2 として読み替えない。v2 は `schema_version` 2 の別の型とし、v1 の builder と artifact は変えない
 - 0031 §2.1〜§2.6 の規律（時刻対応・mask・split・source run・値を既定しない）はそのまま当てる
 
-### 2.8 段 1 の試験（すべて `-m "not hardware"`。合成の ControlTick と Telemetry で確かめる）
+### 2.9 段 1 の試験（すべて `-m "not hardware"`。合成の ControlTick と Telemetry で確かめる）
 
 - **as-of**（§2.1）: tick の時刻が格子の時刻と一致する場合、ずれる場合、同じ時刻に等しい場合のそれぞれで、
   step `k` の値が `t_a + k × step_ms` 以前で直近の tick の `effective` になり、元の tick の時刻と `tick_id` が
@@ -162,7 +199,15 @@ dataset の schema に波及する。時刻の列だけを渡せば、どちら�
 - **較正**（§2.6）: 全 example の期間の中に `calibration_changed` の宣言があると、生成が拒否される。期間の外
   なら通る。`calibration_changed` 以外の宣言では拒否しない。宣言を渡さない呼び出しは型にならない。
   `control/model` が `control/drift` を import しないことを、既存の import 走査試験の方式で確かめる
-- **決定性**: 同じ DB と spec から、同じ bytes の Dataset v2 ができる。manifest の `examples_sha256` が一致する
+- **`prior_action`**（§2.7）: `prior_action` が `t_a` より厳密に前で直近の tick の `effective` になり、元の tick の
+  時刻と `tick_id` が記録される。anchor の tick と同じ時刻の別の tick は使わない。step 0（anchor の tick 自身）と
+  違う値になる tick 列で、v2 の example から作る `ObservedThermalInput` の `action` が `prior_action` と一致する。
+  前に tick が無い anchor と、`prior_action` の元の tick が `action_stale_after_ms` 以上古い anchor では、example が
+  できない
+- **除外の件数**（§2.2 / §2.7）: step の鮮度、`prior_action` の鮮度、前の tick が無いことで作らなかった example の
+  件数が manifest に記録され、合計がそれぞれの場合の数と一致する。除外が無ければ 0 と記録される。件数を持たない
+  manifest は型にならない
+- **決定性**: 同じ DB と spec から、同じ bytes の Dataset v2 ができる。manifest の `examples_sha256` と除外の件数が一致する
 - **v1 を読み替えない**: v1 の manifest / example を v2 の型で読むと拒否される。v1 の builder の出力は変わらない
 
 ## 3. Consequences
@@ -173,6 +218,8 @@ dataset の schema に波及する。時刻の列だけを渡せば、どちら�
   同じ意味の action を数える
 - tick が途切れた区間の「確かでない action」を学習しない
 - horizon と格子のずれを、spec の段階で拒否できる
+- 学習と runtime で anchor action の意味（いま掛かっている effective）が揃い、「anchor → 最初の step」の照合が意味を持つ
+- 鮮度で除いた件数が manifest に残り、除外がどれだけ効いたかを後から確かめられる
 - `control/model` と `control/drift` の依存が増えない
 
 悪くなること（と緩和策）。
@@ -197,17 +244,21 @@ dataset の schema に波及する。時刻の列だけを渡せば、どちら�
 | action 列を `label_end_ms` まで持つ（0079 の段 1 の文言のまま） | 許容誤差の分の列は因果の mask の外で、どの予測にも使えない。example の範囲が延びて件数が減る |
 | `PlanStep.offset_ms` を区間の始端（`step_ms × k`）に変える | `ActionPlan` の検証・digest・既存の試験と、`offsets_ms` の docstring の「予測時刻」の意味を変える。終端と読めば矛盾しない |
 | `control/model/dataset.py` が `DeclaredChange` を直接受け取る | `control/drift` が `control/model` を import しているので循環する。drift の型の変更が dataset の schema に波及する |
+| v2 の anchor action を v1 のまま anchor の tick 自身の effective とし、0079 §2.5 の「anchor → 最初の step」の照合を外す | runtime の anchor（いま掛かっている effective）と学習の anchor の意味が違うままになる。0079 の照合を外すと、anchor の effective から plan の最初の step への跳びが、範囲の両端の値だけで評価されてしまう（0079 §2.5 で足した理由そのもの） |
+| `prior_action` を anchor の tick と同じ時刻の tick まで含めて取る | 同じ時刻の tick は anchor の tick 自身（または同時刻の別の決定）であり、「決める前の値」にならない |
+| 鮮度で除いた件数を記録しない | 除外が増えても dataset から見えず、`action_stale_after_ms` の値を選ぶ根拠が残らない |
 | 較正の検査を split の後（学習の段）で行う | 0079 §2.3 は「Dataset v2 の生成は拒否する」と決めている。生成された dataset が較正をまたいでいれば、後で何に使っても同じ問題が残る |
 
 ## 5. 未決事項
 
 | # | 内容 | 決める場所 |
 |---|---|---|
-| 1 | **段 1 の実装の前に決める必要がある。** v2 の example の「anchor action」（`ObservedThermalInput.from_example(example).action`。0084 §2.1 の `hold_effective` の起点、0079 §2.5 の「anchor → 最初の step」と (b) の起点）を、どの tick の effective とするか。v1 の `example.action` は anchor の tick **自身**の effective である。§2.1 のとおり step 0 も anchor の tick 自身なので、v1 の意味のままでは「anchor → step 0」の変化量が常に 0 になる。すると (b) は対角の cell だけになり、demand を変える候補がすべて評価されなくなる。runtime の anchor 推論の action は「いま掛かっている effective demand」（0052 §2.2）、つまり今の tick が決める前の値である。**推奨案**: v2 の example に、anchor の tick より厳密に前で直近の ControlTick の effective（`prior_action`。元の tick の時刻と `tick_id` を持ち、§2.2 と同じ `action_stale_after_ms` で鮮度を検査する）を足し、v2 の anchor action はこれとする。step 0 は anchor の tick 自身の effective（§2.1 のまま）。代替案: v1 の意味のまま anchor = step 0 とし、0079 §2.5 の「anchor → 最初の step」の照合を外す（0079 の置き換えになる） | 所有者の判断。決まったら本記録を置き換える新しい記録（または本 PR のレビュー中の修正） |
-| 2 | §2.2 で除いた example の件数を manifest に記録するか（推奨: 記録する。0084 §2.1 で除いた validation example の件数を記録するのと同じ向き） | 段 1 の実装の PR のレビュー |
-| 3 | `action_stale_after_ms` の値 | 実機の ControlTick の周期と欠け方を見た後（#50 / #83） |
-| 4 | step ごとの context（mode・Safety の状態など）を持つか。本記録は step ごとに値と元の tick だけを持ち、context は anchor の tick のものだけとする（0031 §2.1 のまま） | 必要になったら新しい記録。Shadow・評価（#90 / #91）で Guard / Safety が値を変えた step の扱いが問題になった時 |
-| 5 | 0079 §5 #5（window / horizon / step 格子の実値）と 0050 §5 #2（support 軸と bin の境界）は変わらず開いたまま | 実機 dataset（#50 / #83）の後 |
+| 1 | **決着**（§2.7）: v2 の anchor action は、anchor の tick より厳密に前で直近の ControlTick の effective（`prior_action`）とし、元の tick を記録し、`action_stale_after_ms` で鮮度を検査する（2026-10-01 所有者承認） | 決着（本記録 §2.7） |
+| 2 | **決着**（§2.2）: 鮮度で作らなかった example の件数を manifest に記録する（2026-10-01 所有者承認） | 決着（本記録 §2.2） |
+| 3 | **段 1 の実装の前に決める必要がある**（PR #212 の Codex P2）。§2.1 の as-of の前提（`seq` の順に並べた ControlTick の `ts_ms` が狭義単調増加）が崩れた run をどう扱うか。**推奨案**: その run からの Dataset v2 の生成を拒否する（fail closed。黙って並べ替えない）。`seq` を持たない移行前の行（0071 §2.2a の `legacy_until_ms` より前）を含む run も、順序を確かめられないので拒否する。代替案: `seq` の順で「直近」を選ぶ（壁時計が戻った区間では、格子の時刻と action の時刻の対応自体が崩れるので推奨しない）。v1 の builder（`ORDER BY ts_ms, tick_id`）にも同じ問題があるが、v1 を変えるかは別に決める | 所有者の判断。決まったら本記録を置き換える新しい記録（または本 PR のレビュー中の修正） |
+| 4 | `action_stale_after_ms` の値 | 実機の ControlTick の周期と欠け方を見た後（#50 / #83） |
+| 5 | step ごとの context（mode・Safety の状態など）を持つか。本記録は step ごとに値と元の tick だけを持ち、context は anchor の tick のものだけとする（0031 §2.1 のまま） | 必要になったら新しい記録。Shadow・評価（#90 / #91）で Guard / Safety が値を変えた step の扱いが問題になった時 |
+| 6 | 0079 §5 #5（window / horizon / step 格子の実値）と 0050 §5 #2（support 軸と bin の境界）は変わらず開いたまま | 実機 dataset（#50 / #83）の後 |
 
 ## 6. 所有者の決定（2026-10-01）
 
@@ -222,3 +273,13 @@ dataset の schema に波及する。時刻の列だけを渡せば、どちら�
 - **6. 較正の検査** → 合成の起点の `src/coldaisle/dataset.py` で行い、`control/model` には時刻の列だけを渡す（§2.6）
 
 あわせて、記録を先に作ってマージし、その後に段 1（#83）を実装する順で進めることも承認した。
+
+### 追加で承認した点（2026-10-01）
+
+本記録の初版（PR #212）のレビューで残した4点を、同日、リポジトリ所有者が推奨案で承認した。
+
+- **anchor action の起点** → anchor の tick より厳密に前で直近の ControlTick の effective を `prior_action` として持ち、
+  v2 の anchor にする。元の tick を記録し、`action_stale_after_ms` で鮮度を検査する（§2.7。初版の §5 #1）
+- **較正の検査の期間** → 全 example の期間で検査する（0079 の「全 split を通した期間」より厳しい。§2.6）
+- **除外の件数** → 鮮度で作らなかった example の件数を manifest に記録する（§2.2。初版の §5 #2）
+- **0079 の扱い** → 0079 §2.9 の段 1 の行のうち、action 列の範囲の文言だけを部分的に置き換える（Supersedes。§2.4）
