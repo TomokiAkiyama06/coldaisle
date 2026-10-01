@@ -469,3 +469,60 @@ def test_the_audit_log_level_cannot_be_lowered(capsys: pytest.CaptureFixture[str
         main(["--log-level", "CRITICAL", "rollback", "--authority-root", "/x", "--reason", "r"])
     assert caught.value.code == 2
     capsys.readouterr()
+
+
+def test_a_failing_name_service_falls_back_to_the_number(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """LDAP・SSSD が使えず `getpwuid` が OSError でも、書いた変更を失敗にしない（codex P1）。"""
+
+    def unavailable(uid: int) -> object:
+        raise OSError(5, "nss backend unavailable")
+
+    monkeypatch.setattr(authority_cli.pwd, "getpwuid", unavailable)
+    shared_root(tmp_path)
+    approval, report = write_inputs(tmp_path)
+
+    assert run(raise_argv(tmp_path, approval, report)) == EXIT_OK
+
+    assert json.loads(capsys.readouterr().out)["actor"] == APPROVER
+
+
+@pytest.mark.parametrize("command", ["raise", "rollback"])
+def test_a_failed_directory_fsync_after_replace_is_not_reported_as_no_change(
+    tmp_path: Path,
+    command: str,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """**置き換えた journal は見えている。** 「行わなかった」と伝えない（codex P1）。"""
+    shared_root(tmp_path)
+    approval, report = write_inputs(tmp_path)
+    if command == "rollback":
+        assert run(raise_argv(tmp_path, approval, report)) == EXIT_OK
+        argv = rollback_argv(tmp_path)
+    else:
+        argv = raise_argv(tmp_path, approval, report)
+    capsys.readouterr()
+    real = os.fsync
+
+    def fsync(fd: int) -> None:
+        if stat.S_ISDIR(os.fstat(fd).st_mode):
+            raise OSError(5, "Input/output error")
+        real(fd)
+
+    monkeypatch.setattr(os, "fsync", fsync)
+
+    assert run(argv) == EXIT_OK
+
+    monkeypatch.setattr(os, "fsync", real)
+    expected = AuthorityStage.SHADOW if command == "rollback" else AuthorityStage.LIMITED
+    journal = store(tmp_path).read()
+    assert journal.stage is expected
+    assert journal.events[-1].actor == APPROVER
+    captured = capsys.readouterr()
+    result = json.loads(captured.out)
+    assert result["durable"] is False
+    assert result["event"] == ("rolled_back" if command == "rollback" else "raised")
+    [line] = log_lines(captured.err)
+    assert (line["level"], line["event"], line["durable"]) == ("warning", result["event"], False)

@@ -48,6 +48,7 @@ from coldaisle.control.authority import (
     AuthorityError,
     AuthorityEvidenceError,
     AuthorityJournal,
+    AuthorityNotDurableError,
     AuthorityStateError,
     AuthorityStore,
     AuthorityStoreError,
@@ -133,7 +134,9 @@ def display_actor(uid: int) -> str:
     """
     try:
         name = pwd.getpwuid(uid).pw_name
-    except (KeyError, OverflowError):
+    except (KeyError, OverflowError, OSError):
+        # NSS の backend（LDAP・SSSD など）が使えないと OSError になる。表示名が無いだけで、
+        # 書き終えた変更の成否を変えない（codex P1）。
         return f"uid.{uid}"
     return f"uid.{uid}（{name}）"
 
@@ -204,15 +207,23 @@ def run_raise(args: argparse.Namespace, identity: ProcessIdentity, clock: Clock)
     report = read_bounded(args.report, limits.max_artifact_bytes)
     config = ControlConfig.from_directory(args.config_dir)
     registry = ModelRegistry(args.registry_root, limits=limits)
-    journal = authority.raise_stage(
-        approval=approval,
-        evaluation_report=report,
-        config=config,
-        registry=registry,
-    )
+    durable = True
+    try:
+        journal = authority.raise_stage(
+            approval=approval,
+            evaluation_report=report,
+            config=config,
+            registry=registry,
+        )
+    except AuthorityNotDurableError as error:
+        journal, durable = error.journal, False
     report_sha256 = sha256(report).hexdigest()
-    _log_change("authority stage を上げた", "raised", credentials, journal, report_sha256)
-    emit_after_commit(_result("raised", credentials, journal, report_sha256=report_sha256))
+    _log_change(
+        "authority stage を上げた", "raised", credentials, journal, report_sha256, durable=durable
+    )
+    emit_after_commit(
+        _result("raised", credentials, journal, report_sha256=report_sha256, durable=durable)
+    )
     return EXIT_OK
 
 
@@ -222,9 +233,15 @@ def run_rollback(args: argparse.Namespace, identity: ProcessIdentity, clock: Clo
     authority = _store(args, identity, clock)
     # **自分が追記したかは store が lock の中で決めたものを使う。** lock の外で読んだ journal と
     # 比べると、間に別の書き手（自動降格・別の rollback）が下げた変更を自分の操作として記録する。
-    journal, appended = authority.rollback_to_baseline_with_outcome(
-        actor=credentials.actor, reason=args.reason
-    )
+    durable = True
+    try:
+        journal, appended = authority.rollback_to_baseline_with_outcome(
+            actor=credentials.actor, reason=args.reason
+        )
+    except AuthorityNotDurableError as error:
+        # 自分の追記の直後に出る error なので、最後の event が自分のものである。
+        journal, durable = error.journal, False
+        appended = journal.last_change
     changed = appended is not None
     event = "rolled_back" if changed else "already_baseline"
     from_stage = appended.from_stage.value if appended is not None else journal.stage.value
@@ -235,6 +252,7 @@ def run_rollback(args: argparse.Namespace, identity: ProcessIdentity, clock: Clo
         journal,
         None,
         from_stage=from_stage,
+        durable=durable,
     )
     emit_after_commit(
         _result(
@@ -243,6 +261,7 @@ def run_rollback(args: argparse.Namespace, identity: ProcessIdentity, clock: Clo
             journal,
             from_stage=from_stage,
             reason=None if appended is None else appended.reason,
+            durable=durable,
         )
     )
     return EXIT_OK
@@ -256,6 +275,7 @@ def _result(
     report_sha256: str | None = None,
     from_stage: str | None = None,
     reason: str | None = None,
+    durable: bool = True,
 ) -> dict[str, object]:
     last = journal.last_change
     if reason is None and event == "raised" and last is not None:
@@ -270,6 +290,7 @@ def _result(
         "schema_version": journal.schema_version,
         "reason": reason,
         "report_sha256": report_sha256,
+        "durable": durable,
     }
 
 
@@ -286,10 +307,17 @@ def _log_change(
     report_sha256: str | None,
     *,
     from_stage: str | None = None,
+    durable: bool = True,
 ) -> None:
-    """1操作1行の構造化ログ（0086 §2.8）。名前は残さず uid だけを残す。"""
-    LOGGER.info(
-        message,
+    """1操作1行の構造化ログ（0086 §2.8）。名前は残さず uid だけを残す。
+
+    ``durable`` が偽なら、journal は置き換えた（変更は見えている）がディレクトリの `fsync` に
+    失敗した。**変更したことは変わらない**ので成功として残し、警告の level で知らせる
+    （「行わなかった」と伝えると、運用者が逆の結果を信じる。codex P1）。
+    """
+    LOGGER.log(
+        logging.INFO if durable else logging.WARNING,
+        message if durable else f"{message}（ただし journal の fsync に失敗した）",
         extra={
             logs.FIELDS_KEY: {
                 "event": event,
@@ -299,6 +327,7 @@ def _log_change(
                 "to_stage": journal.stage.value,
                 "revision": journal.revision,
                 "report_sha256": report_sha256,
+                "durable": durable,
             }
         },
     )

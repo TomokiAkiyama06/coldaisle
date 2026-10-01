@@ -74,11 +74,16 @@ uv run coldaisle-authority raise \
 
 | 終了コード | 意味 | `code` |
 |---|---|---|
-| 0 | 書いた（rollback で既に Baseline だったときも 0） | — |
+| 0 | 書いた（rollback で既に Baseline だったときも 0） | —（下の注記） |
 | 1 | 読めない・書けない（ディレクトリが無い／形が違う・壊れた journal・設定・Registry・I/O） | `store_error` / `journal_invalid` / `registry_error` / `input_too_large` / `io_or_config_error` |
 | 2 | 引数の誤り（argparse） | — |
 | 3 | 実行者を承認者として認めない（0086 §2.3 / §2.5） | `approver_is_root` / `approver_owns_authority_root` / `uid_differs_from_euid` / `invalid_uid` / `approval_not_bound_to_process` / `approver_is_not_the_process_uid` |
 | 4 | 承認・証拠を受け入れない（下の一覧） | `invalid_approval` / `approval_rejected` / `evidence_rejected` |
+
+- journal を置き換えた**後**の失敗は、変更しなかったことにしない（終了コード 0）。
+  ディレクトリの `fsync` に失敗したときは、結果の `durable` を `false` にし、構造化ログを warning で出す
+  （変更は他の process に見えているが、電源断で失われうる。もう一度同じ操作をするか、journal を確かめる）。
+  stdout に書けないとき（閉じた pipe など）は `result_not_written` の警告だけを残す
 
 ### `AuthorityStore.raise_stage()`
 

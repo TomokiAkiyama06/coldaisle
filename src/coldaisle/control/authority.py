@@ -98,6 +98,7 @@ __all__ = [
     "AuthorityEvent",
     "AuthorityEvidenceError",
     "AuthorityJournal",
+    "AuthorityNotDurableError",
     "AuthorityRuntime",
     "AuthorityStage",
     "AuthorityStageSource",
@@ -200,6 +201,25 @@ class AuthorityStateError(AuthorityError):
 
 class AuthorityStoreError(AuthorityError):
     """journal を安全に読み書きできない（path・権限・I/O）。"""
+
+
+class AuthorityNotDurableError(AuthorityStoreError):
+    """journal は置き換えた（**変更は見えている**）が、ディレクトリの `fsync` に失敗した。
+
+    「書けなかった」とは違う。他の process は新しい journal を読むが、電源断で失われうる。
+    呼び出し側が「変更しなかった」と伝えないよう、書いた journal を持たせる（codex P1）。
+    """
+
+    def __init__(self, journal: AuthorityJournal) -> None:
+        super().__init__(
+            "authority journal は置き換えたが、ディレクトリの fsync に失敗した"
+            "（変更は見えているが、電源断で失われうる）"
+        )
+        self.journal = journal
+
+
+class _DirectorySyncError(Exception):
+    """`os.replace()` の**後**のディレクトリの `fsync` の失敗（`_append` が包み直す）。"""
 
 
 class ApproverRejection(StrEnum):
@@ -1298,7 +1318,10 @@ class AuthorityStore:
         payload = updated.model_dump_json(indent=2).encode("utf-8") + b"\n"
         if len(payload) > _MAX_JOURNAL_BYTES:
             raise AuthorityStateError("journal が size 上限を超える")
-        self._atomic_write(root_fd, AUTHORITY_STATE_FILENAME, payload)
+        try:
+            self._atomic_write(root_fd, AUTHORITY_STATE_FILENAME, payload)
+        except _DirectorySyncError as error:
+            raise AuthorityNotDurableError(updated) from error.__cause__
         return updated
 
     def _read(self, root_fd: int) -> AuthorityJournal:
@@ -1518,7 +1541,11 @@ class AuthorityStore:
             finally:
                 os.close(temporary_fd)
             os.replace(temporary_name, name, src_dir_fd=directory_fd, dst_dir_fd=directory_fd)
-            os.fsync(directory_fd)
+            # ここから先の失敗は「書けなかった」ではない。置き換えた journal は既に見えている。
+            try:
+                os.fsync(directory_fd)
+            except OSError as error:
+                raise _DirectorySyncError from error
         finally:
             with suppress(FileNotFoundError):
                 os.unlink(temporary_name, dir_fd=directory_fd)
