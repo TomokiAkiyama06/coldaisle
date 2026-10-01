@@ -14,7 +14,7 @@
     v2 でも同じ強さで残す（§2.1）
   - 旧記録側への `Superseded by` の追記（README「追記のみ」）は、2026-09-30 の所有者の承認を受けて
     本 PR で 0050 / 0052 に行った（§6 の質問 1）
-- **Superseded by**: [0084](0084-model-artifact-anchor-support.md)（§2.1 の Profile v2 の「action の学習範囲」と §2.5 の候補の照合のうち、計画 demand の範囲・step 間の変化量・(a) / (c) の cell の集合を全 step で1つにまとめて持つ部分（step の番号ごと・step の組ごとに持つ）と、§2.4 の L8 の行（`metric_binding` のキー集合が feature と target の metric の和集合と一致することを加える）のみ。0084 は §2.4 に L11 / L12 を、§2.3 に anchor 推論の action 列の規則 `hold_effective` とその列への step ごとの support の照合（外れれば `support` の OOD）を足す。他の節は有効）
+- **Superseded by**: [0084](0084-model-artifact-anchor-support.md)（§2.1 の Profile v2 の「action の学習範囲」と §2.5 の候補の照合のうち、計画 demand の範囲・step 間の変化量・(a) / (c) の cell の集合を全 step で1つにまとめて持つ部分（step の番号ごと・step の組ごとに持つ）と、§2.4 の L8 の行（`metric_binding` のキー集合が feature と target の metric の和集合と一致することを加える）のみ。0084 は §2.4 に L11 / L12 を、§2.3 に anchor 推論の action 列の規則 `hold_effective` とその列への step ごとの support の照合（外れれば `support` の OOD）を足す。他の節は有効）／ [0087](0087-dataset-v2-action-grid.md)（§2.9 の段 1 の行のうち、action 列の範囲を「anchor から `label_end_ms` まで」とする部分のみ。格子 `[anchor, anchor + steps × step_ms)` に置き換える。0087 は段 1 の action 列を格子へ写す規則と、step の番号と `PlanStep.offset_ms` の対応を足す。他の節は有効）
 - **関連**: [0027](0027-fan-control-architecture.md) / [0028](0028-fan-control-contracts.md) §2.4 / §2.7 / §2.9 /
   [0031](0031-thermal-dataset-contract.md) §2.1 / §2.2 / §2.6 /
   [0037](0037-model-registry-rollback-target.md) §2 / §5 /
