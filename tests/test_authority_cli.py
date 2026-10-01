@@ -18,10 +18,12 @@ authority のディレクトリの所有者（= fand の役）である。
 from __future__ import annotations
 
 import ast
+import io
 import json
 import os
 import shutil
 import stat
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -425,3 +427,45 @@ def test_the_store_reports_whether_this_call_appended(tmp_path: Path) -> None:
     assert appended is not None and appended.actor == "uid.1"
     assert appended == first.events[-1]
     assert none is None and again == first
+
+
+# ======================================================= 8. 書いた後の出力と監査ログ（codex）
+
+
+class ClosedStdout(io.StringIO):
+    def write(self, text: str) -> int:
+        raise BrokenPipeError(32, "Broken pipe")
+
+
+@pytest.mark.parametrize("command", ["raise", "rollback"])
+def test_a_closed_stdout_after_the_commit_is_still_success(
+    tmp_path: Path,
+    command: str,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """**書いた変更を「失敗」と伝えない。** stdout が閉じていても終了コード 0（codex P1）。"""
+    shared_root(tmp_path)
+    approval, report = write_inputs(tmp_path)
+    if command == "rollback":
+        assert run(raise_argv(tmp_path, approval, report)) == EXIT_OK
+        argv = rollback_argv(tmp_path)
+    else:
+        argv = raise_argv(tmp_path, approval, report)
+    capsys.readouterr()
+    monkeypatch.setattr(sys, "stdout", ClosedStdout())
+
+    assert run(argv) == EXIT_OK
+
+    expected = AuthorityStage.SHADOW if command == "rollback" else AuthorityStage.LIMITED
+    assert store(tmp_path).read().stage is expected
+    events = [line["event"] for line in log_lines(capsys.readouterr().err)]
+    assert events == ["rolled_back" if command == "rollback" else "raised", "result_not_written"]
+
+
+def test_the_audit_log_level_cannot_be_lowered(capsys: pytest.CaptureFixture[str]) -> None:
+    """監査の1行（0086 §2.8）を `--log-level` で消せない（codex P2）。"""
+    with pytest.raises(SystemExit) as caught:
+        main(["--log-level", "CRITICAL", "rollback", "--authority-root", "/x", "--reason", "r"])
+    assert caught.value.code == 2
+    capsys.readouterr()

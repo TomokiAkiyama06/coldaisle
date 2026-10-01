@@ -29,7 +29,9 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import pwd
+import sys
 from hashlib import sha256
 from pathlib import Path
 from typing import Any
@@ -89,7 +91,39 @@ def emit(payload: object) -> None:
 
     ログ（stderr）は運転の記録で、stdout は操作の答えである。混ぜない。
     """
-    print(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))  # noqa: T201
+    # flush まで行い、書けないことをこの呼び出しの中で表に出す（終了時の flush に回さない）。
+    print(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True), flush=True)  # noqa: T201
+
+
+def emit_after_commit(payload: object) -> None:
+    """journal を書き終えた**後**の結果の出力。書けなくても操作の成否を変えない（codex P1）。
+
+    stdout が閉じている（早く終わる consumer への pipe など）と `BrokenPipeError` になる。
+    それを失敗として終了コード 1 にすると、**authority は変わったのに「変わらなかった」と伝え**、
+    運用者がやり直しや逆向きの操作に進みかねない。変更の記録は journal と stderr の構造化ログ
+    （先に出している）にあるので、ここでは警告だけ残して成功として終える。
+    """
+    try:
+        emit(payload)
+    except OSError as error:
+        LOGGER.warning(
+            "結果を stdout へ書けなかった（authority の変更は完了している）",
+            extra={logs.FIELDS_KEY: {"event": "result_not_written", "error": str(error)}},
+        )
+        _discard_stdout()
+
+
+def _discard_stdout() -> None:
+    """以後の stdout を捨てる。終了時の flush が再び失敗して終了コードを変えないようにする。"""
+    try:
+        devnull = os.open(os.devnull, os.O_WRONLY)
+        try:
+            os.dup2(devnull, sys.stdout.fileno())
+        finally:
+            os.close(devnull)
+    except (OSError, ValueError, AttributeError):
+        # fileno を持たない stdout（試験の差し替えなど）。捨てられなくても成否は変えない。
+        return
 
 
 def display_actor(uid: int) -> str:
@@ -178,7 +212,7 @@ def run_raise(args: argparse.Namespace, identity: ProcessIdentity, clock: Clock)
     )
     report_sha256 = sha256(report).hexdigest()
     _log_change("authority stage を上げた", "raised", credentials, journal, report_sha256)
-    emit(_result("raised", credentials, journal, report_sha256=report_sha256))
+    emit_after_commit(_result("raised", credentials, journal, report_sha256=report_sha256))
     return EXIT_OK
 
 
@@ -202,7 +236,7 @@ def run_rollback(args: argparse.Namespace, identity: ProcessIdentity, clock: Clo
         None,
         from_stage=from_stage,
     )
-    emit(
+    emit_after_commit(
         _result(
             event,
             credentials,
@@ -297,7 +331,8 @@ def build_parser() -> argparse.ArgumentParser:
         prog="coldaisle-authority",
         description="Authority Stage の昇格と rollback（#92 / 決定記録 0057 / 0086）",
     )
-    parser.add_argument("--log-level", default="INFO")
+    # **`--log-level` は持たない**（codex P2）。昇格・rollback の1行の構造化ログは 0086 §2.8 の
+    # 監査の記録で、WARNING 以上に絞ると変更を書いたのに記録が出なくなる。INFO に固定する。
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     raise_parser = subparsers.add_parser(
@@ -357,7 +392,7 @@ def main(
     ``identity`` / ``clock`` は試験で差し替えるためだけにある（実 root を要さない。0086 §2.9）。
     """
     args = build_parser().parse_args(argv)
-    logs.configure(args.log_level)
+    logs.configure("INFO")
     source: ProcessIdentity = identity if identity is not None else OsProcessIdentity()
     try:
         exit_code: int = args.handler(args, source, clock if clock is not None else WallClock())
