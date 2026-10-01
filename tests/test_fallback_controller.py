@@ -166,7 +166,7 @@ def policy(
     mpc: dict[str, object] | None = None,
 ) -> FanPolicyConfig:
     document: dict[str, object] = {
-        "schema_version": 9,
+        "schema_version": 10,
         "fallback_curve": [
             {"temperature_c": 20.0, "demand": 0.2},
             {"temperature_c": 80.0, "demand": 0.8},
@@ -263,6 +263,15 @@ def policy(
             "enabled": True,
             "outcome_match_tolerance_ms": provisional(500),
             "applied_demand_tolerance": provisional(0.01),
+        },
+        "air_balance_coordination": {
+            "mode": "off",
+            "max_raise": {
+                "front": provisional(0.0),
+                "rear": provisional(0.0),
+                "top": provisional(0.0),
+            },
+            "release_hold_ms": provisional(0),
         },
         "recovery_hold_ms": recovery_hold_ms,
         "demote_window_ms": demote_window_ms,

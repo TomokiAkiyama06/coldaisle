@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import re
+from enum import StrEnum
 from hashlib import sha256
 from pathlib import Path
 from typing import Annotated, Any, Literal, Self, cast
@@ -29,14 +30,17 @@ from coldaisle.control.schema import (
 )
 from coldaisle.store.models import validate_metric
 
-CONTROL_CONFIG_VERSION: Literal[12] = 12
+CONTROL_CONFIG_VERSION: Literal[13] = 13
 """4ファイルを束ねた Control Config の版。
 
 - v11（#81 / 決定記録 0073 §2.1）: ``air-balance.yaml``（v2）を4つ目のファイルにした。
   各ファイルの版は変えていない
 - v12（#74 / 決定記録 0080 §2.6）: ``safety.yaml`` を v4 にした（``hardware_write_fail_exit_ms``）
+- v13（#81 / 決定記録 0078 §2.4）: ``fan-policy.yaml`` を v10 にした
+  （``air_balance_coordination``）。
+  ``mode: shadow / apply`` と ``air-balance.yaml`` の ``uncalibrated`` の組み合わせを拒否する
 """
-FAN_POLICY_CONFIG_VERSION: Literal[9] = 9
+FAN_POLICY_CONFIG_VERSION: Literal[10] = 10
 SAFETY_CONFIG_VERSION: Literal[4] = 4
 CONFIG_FILENAMES = {
     "fan_hardware": "fan-hardware.yaml",
@@ -995,8 +999,44 @@ class ShadowConfig(_ConfigModel):
         return self
 
 
+class AirBalanceCoordinationMode(StrEnum):
+    """Air Balance の協調を Baseline の requested に掛けるか（決定記録 0078 §2.1）。"""
+
+    OFF = "off"
+    SHADOW = "shadow"
+    APPLY = "apply"
+
+
+def _yaml_coordination_mode(value: object) -> object:
+    """YAML の ``mode`` を列挙値に正規化する。
+
+    YAML 1.1 は引用符の無い ``off`` を真偽値の偽として読む（``yaml.safe_load``）。
+    0078 §2.4 の雛形どおり ``mode: off`` と書いた設定を拒否しないよう、**偽だけ**を ``off`` と読む。
+    真（``on`` / ``yes`` / ``true``）は ``shadow`` / ``apply`` のどちらか決められないので拒否する
+    （協調を開く向きの値を推測しない）。
+    """
+    if value is False:
+        return AirBalanceCoordinationMode.OFF
+    return AirBalanceCoordinationMode(value) if isinstance(value, str) else value
+
+
+class AirBalanceCoordinationConfig(_ConfigModel):
+    """Baseline（Fallback）の requested への Air Balance の協調の方針（#81 / 決定記録 0078 §2.4）。
+
+    有効化は ``mode`` を人が ``off`` → ``shadow`` → ``apply`` と設定して再起動するだけで進む
+    （0078 §2.8。authority journal を経ない）。Air Balance そのものの有効・無効は
+    ``air-balance.yaml`` の ``source.status`` が決め、ここでは決めない（0073 §2.2）。
+    """
+
+    mode: Annotated[AirBalanceCoordinationMode, BeforeValidator(_yaml_coordination_mode)]
+    max_raise: PerZone[PolicyDemand]
+    """zone ごとに協調が raw baseline から上げてよい幅（demand）。0 はその zone を動かさない。"""
+    release_hold_ms: ConfigValue[NonNegativeMilliseconds]
+    """引き上げ幅が消えた・縮んだ後も、直近の最大の幅を保つ時間（単調時計）。0 は保持しない。"""
+
+
 class FanPolicyConfig(_ConfigModel):
-    schema_version: Literal[9]
+    schema_version: Literal[10]
     fallback_curve: Annotated[
         tuple[FallbackPoint, ...], BeforeValidator(_yaml_sequence_to_tuple), Field(min_length=2)
     ]
@@ -1018,6 +1058,8 @@ class FanPolicyConfig(_ConfigModel):
     authority_limits: AuthorityLimits
     authority_rollout: AuthorityRolloutConfig
     shadow: ShadowConfig
+    air_balance_coordination: AirBalanceCoordinationConfig
+    """v10（#81 / 決定記録 0078 §2.4）。**必須。** v9 以前を補完しない。"""
     recovery_hold_ms: PositiveMilliseconds
     demote_window_ms: PositiveMilliseconds
     demote_after: Annotated[int, Field(gt=0)]
@@ -1133,6 +1175,19 @@ class ControlConfig(_ConfigModel):
         for source, name, version in expected:
             if source.name != name or source.schema_version != version:
                 raise ValueError(f"ConfigSource が検証済み設定と一致しない: {name}")
+        return self
+
+    @model_validator(mode="after")
+    def _coordination_requires_calibrated_air_balance(self) -> Self:
+        # 協調を掛けたつもりで掛かっていない構成を、黙って off と読まない（決定記録 0078 §2.4）。
+        # 不正として全 zone Max（config_invalid）に倒し、置き忘れと同じく
+        # 大きな音で気付ける側にする。
+        mode = self.policy.air_balance_coordination.mode
+        if mode is not AirBalanceCoordinationMode.OFF and not self.air_balance.calibrated:
+            raise ValueError(
+                "air_balance_coordination.mode が shadow / apply のときは "
+                "air-balance.yaml の source.status を calibrated にする（止めるなら mode: off）"
+            )
         return self
 
     @property
@@ -1341,6 +1396,18 @@ class ControlConfig(_ConfigModel):
             "fan-policy.yaml",
             "shadow.applied_demand_tolerance",
             self.policy.shadow.applied_demand_tolerance,
+        )
+        coordination = self.policy.air_balance_coordination
+        for zone in Zone:
+            append(
+                "fan-policy.yaml",
+                f"air_balance_coordination.max_raise.{zone.value}",
+                coordination.max_raise.get(zone),
+            )
+        append(
+            "fan-policy.yaml",
+            "air_balance_coordination.release_hold_ms",
+            coordination.release_hold_ms,
         )
         for zone in Zone:
             bound = optimizer.zone_bounds.get(zone)
