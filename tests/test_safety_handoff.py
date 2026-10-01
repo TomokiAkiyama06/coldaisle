@@ -531,28 +531,73 @@ def test_entrypoint_does_not_hide_unexpected_programming_errors(
 _ISOLATED_RUN_TIMEOUT_S = 30
 """subprocess が戻らないときに試験を止めるための上限（Safety の値ではない）。"""
 
+_RECORD_CONSTANT_LINE = 'HANDOFF_RECORD_PATH = Path("/run/coldaisle/fan-handoff.json")'
+_HWMON_CONSTANT_LINE = 'HWMON_ROOT = Path("/sys/class/hwmon")'
+
 
 def _standalone_source() -> Path:
     """ExecStopPost が指すのと同じ相対位置（``src/coldaisle/safety_handoff.py``）のソース。"""
     source = Path(__file__).parents[1] / "src/coldaisle/safety_handoff.py"
-    # 試験しているファイルと、import して試験しているモジュールが同じ実体であること。
+    # 写しの元が、import して試験しているモジュールと同じ実体であること。
     assert source.samefile(handoff_module.__file__)
     return source
 
 
-def _skip_if_real_handoff_record_exists() -> None:
-    # 実行部は引数を取らず固定の path を読む（0080 §2.5）。記録がある環境で走らせると
-    # 本物の hwmon へ Max を書きにいくので、その環境では走らせない。
-    if os.path.lexists(handoff_module.HANDOFF_RECORD_PATH):
-        pytest.skip(
-            f"{handoff_module.HANDOFF_RECORD_PATH} が存在する環境では、"
-            "実機の hwmon へ書きうるので subprocess で実行部を起動しない"
-        )
+def _isolated_copy(tmp_path: Path) -> tuple[Path, Path, Path]:
+    """固定の path の定数2つだけを ``tmp_path`` の下へ書き換えた実行部の写しを作る。
+
+    実行部は引数を取らず固定の path を読む（0080 §2.5）。本物のファイルをそのまま
+    subprocess で走らせると、存在の確認の後に fand が記録を作った場合に本物の
+    ``/sys/class/hwmon`` へ書きうる（確認と起動の間の競合）。写しは live の path を
+    文字として持たないので、子は本物の記録も hwmon にも届かない。
+
+    写しが元と**定数の2行だけ**違うことを確かめるので、子が走らせるのは本物の
+    ファイルのコードそのものである。戻り値は（写し・記録の path・偽の sysfs）。
+    """
+    source = _standalone_source()
+    original = source.read_text(encoding="utf-8")
+    original_lines = original.splitlines(keepends=True)
+    for constant in (_RECORD_CONSTANT_LINE, _HWMON_CONSTANT_LINE):
+        assert [line.rstrip("\n") for line in original_lines].count(constant) == 1
+
+    record_path = tmp_path / "run" / "fan-handoff.json"
+    record_path.parent.mkdir()
+    sysfs = tmp_path / "sysfs"
+    sysfs.mkdir()
+    replacements = {
+        _RECORD_CONSTANT_LINE: f"HANDOFF_RECORD_PATH = Path({str(record_path)!r})",
+        _HWMON_CONSTANT_LINE: f"HWMON_ROOT = Path({str(sysfs)!r})",
+    }
+    copied_lines = [
+        replacements[line.rstrip("\n")] + "\n" if line.rstrip("\n") in replacements else line
+        for line in original_lines
+    ]
+    copied = "".join(copied_lines)
+
+    # 違うのは定数の2行だけで、それ以外は1行も変えていない。
+    differing = [
+        (before, after)
+        for before, after in zip(original_lines, copied_lines, strict=True)
+        if before != after
+    ]
+    assert [before.rstrip("\n") for before, _ in differing] == [
+        _RECORD_CONSTANT_LINE,
+        _HWMON_CONSTANT_LINE,
+    ]
+    # 写しには live の path が文字として残っていない（docstring の説明文も含めて）。
+    assert "/run/coldaisle" not in copied
+    assert "/sys/" not in copied.replace(str(sysfs), "")
+
+    executable_dir = tmp_path / "exec"
+    executable_dir.mkdir()
+    copy = executable_dir / "safety_handoff.py"
+    copy.write_text(copied, encoding="utf-8")
+    return copy, record_path, sysfs
 
 
-def _run_isolated(cwd: Path, env: dict[str, str]) -> subprocess.CompletedProcess[str]:
+def _run_isolated(script: Path, cwd: Path, env: dict[str, str]) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
-        [sys.executable, "-I", "-S", str(_standalone_source())],
+        [sys.executable, "-I", "-S", str(script)],
         cwd=cwd,
         env=env,
         capture_output=True,
@@ -562,16 +607,28 @@ def _run_isolated(cwd: Path, env: dict[str, str]) -> subprocess.CompletedProcess
     )
 
 
-def _assert_absent_record_completion(completed: subprocess.CompletedProcess[str]) -> None:
-    assert completed.returncode == 0, completed.stderr
+def _single_event(completed: subprocess.CompletedProcess[str]) -> Any:
     assert completed.stdout == ""
     lines = completed.stderr.splitlines()
     assert len(lines) == 1, completed.stderr
-    assert json.loads(lines[0]) == {
+    return json.loads(lines[0])
+
+
+def _assert_absent_record_completion(completed: subprocess.CompletedProcess[str]) -> None:
+    assert completed.returncode == 0, completed.stderr
+    assert _single_event(completed) == {
         "event": "safety_handoff_completed",
         "record_found": False,
         "success": True,
         "zones": [],
+    }
+
+
+def _sysfs_snapshot(sysfs: Path) -> dict[str, str]:
+    return {
+        str(path.relative_to(sysfs)): path.read_text(encoding="utf-8")
+        for path in sorted(sysfs.rglob("*"))
+        if path.is_file()
     }
 
 
@@ -581,15 +638,41 @@ def test_isolated_no_site_entrypoint_exits_zero_without_record(tmp_path: Path) -
     venv と ``coldaisle`` パッケージに依存しないこと（0028 §2.7「壊れた環境でも動く」、
     0080 §2.5 / §2.10 の段階 3）を、systemd の ``ExecStopPost`` と同じ起動方法で確かめる。
     """
-    _skip_if_real_handoff_record_exists()
+    script, record_path, sysfs = _isolated_copy(tmp_path)
+    create_sysfs(sysfs)
+    before = _sysfs_snapshot(sysfs)
     workdir = tmp_path / "cwd"
     workdir.mkdir()
 
-    completed = _run_isolated(workdir, env={"PATH": os.environ.get("PATH", "")})
+    completed = _run_isolated(script, workdir, env={"PATH": os.environ.get("PATH", "")})
 
     _assert_absent_record_completion(completed)
-    # 作業ディレクトリにも何も作らない（bytecode・ログファイルなど）。
+    assert not record_path.exists()
+    assert _sysfs_snapshot(sysfs) == before
+    # 作業ディレクトリにも、写しの隣にも何も作らない（bytecode・ログファイルなど）。
     assert list(workdir.iterdir()) == []
+    assert list(script.parent.iterdir()) == [script]
+
+
+def test_isolated_no_site_entrypoint_writes_max_from_record(tmp_path: Path) -> None:
+    """記録があれば、`-I -S` の下でも照合した header を Max・manual にして 0 で終わる。"""
+    script, record_path, sysfs = _isolated_copy(tmp_path)
+    create_sysfs(sysfs)
+    write_record(record_path, record())
+    workdir = tmp_path / "cwd"
+    workdir.mkdir()
+
+    completed = _run_isolated(script, workdir, env={"PATH": os.environ.get("PATH", "")})
+
+    assert completed.returncode == 0, completed.stderr
+    payload = _single_event(completed)
+    assert payload["event"] == "safety_handoff_completed"
+    assert payload["record_found"] is True
+    assert payload["success"] is True
+    assert [zone["status"] for zone in payload["zones"]] == ["applied"] * 3
+    for index in (1, 2, 3):
+        assert (sysfs / f"hwmon{index}/pwm{index}").read_text(encoding="ascii") == "255\n"
+        assert (sysfs / f"hwmon{index}/pwm{index}_enable").read_text(encoding="ascii") == "1\n"
 
 
 def test_isolated_entrypoint_ignores_environment_and_cwd_module_shadows(tmp_path: Path) -> None:
@@ -599,7 +682,7 @@ def test_isolated_entrypoint_ignores_environment_and_cwd_module_shadows(tmp_path
     同名のモジュール、``sitecustomize`` が読まれると、root でのコード実行の経路になる。
     どれかが読まれれば印のファイルが作られ、終了コードも 0 でなくなる。
     """
-    _skip_if_real_handoff_record_exists()
+    script, _record_path, _sysfs = _isolated_copy(tmp_path)
     marker = tmp_path / "shadow-imported"
     shadow_body = (
         "import pathlib\n"
@@ -624,7 +707,7 @@ def test_isolated_entrypoint_ignores_environment_and_cwd_module_shadows(tmp_path
         "PYTHONUSERBASE": str(shadow_dirs[0]),
     }
 
-    completed = _run_isolated(shadow_dirs[1], env=env)
+    completed = _run_isolated(script, shadow_dirs[1], env=env)
 
     _assert_absent_record_completion(completed)
     assert not marker.exists()
