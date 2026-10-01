@@ -50,17 +50,22 @@ coordinated baseline、それ以外（`off`・`shadow`・`skipped`・`not_needed
 - `skipped` の tick は下限の見込みを計算しない。条件が欠けた tick（Fan fault・tach 未確認など）の
   見込みは、計算しても意味を持たないためである
 - trace の検証は、`skipped` の tick に `proposed`・`bounded_by_max_raise`・before / projected の状態・`reasons` が
-  あれば拒む。`held` は `null` か、すべて偽なら受け入れる
+  あれば拒む
+- `skipped` / `failed` の `held` は **`null` を許さず、3 zone とも明示的な偽**を要る（0078 §2.7 の「`held` は
+  すべて偽（保持を解いた）」のとおり）。`null` を許すと、「解いた」と「記録が無い・不明」を区別できない
 
 ### 2.3 Top の Fan fault の `skip_reason`
 
 0078 §2.3 の表は**上の行から順に判定し、最初に欠けた条件を `skip_reason` にする**と読む。
 
 - Top の Fan fault（`TACH_STALL`・`WRITE_FAILURE`・`READBACK_MISMATCH`・`ENABLE_REVERTED`）は、0028 §2.7 で
-  無条件に `EMERGENCY` になる。そのため Top の Fan fault が確定した tick の `skip_reason` は、`zone_fan_fault` ではなく、
-  表で先に来る `safety_state` になる。Front / Rear の Fan fault（`EMERGENCY` にならない間）は `zone_fan_fault` である
-- 確定前の tach 無応答（`tach_unconfirmed_zones`）は Safety の状態を変えないので、Top でも
-  `tach_unconfirmed` になる
+  無条件に `EMERGENCY` になる。そのため Top の Fan fault が確定した tick の `skip_reason` は、`zone_fan_fault` ではなく
+  `safety_state` になる。**ただし表で `safety_state` より上の行（`air_balance_disabled`・`operating_mode`・
+  `snapshot_unavailable`・`baseline_unavailable`）がすべて満たされている tick に限る。** 同じ tick にそれらの
+  条件の欠け（例: `MANUAL`・snapshot の不在・Fallback の例外）が重なれば、その上の行の理由になる。
+  Front / Rear の Fan fault（`EMERGENCY` にならない間）も同じく、上の行がすべて満たされた tick で `zone_fan_fault` である
+- 確定前の tach 無応答（`tach_unconfirmed_zones`）は Safety の状態を変えないので、上の行がすべて満たされた tick では
+  Top でも `tach_unconfirmed` になる
 - どちらでも協調は `skipped` で raw baseline を使う（0078 §2.3 の帰結は変わらない）
 
 ## 3. Consequences
