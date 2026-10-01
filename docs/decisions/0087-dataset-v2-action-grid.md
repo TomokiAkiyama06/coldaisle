@@ -94,8 +94,15 @@ model へ渡す」と同じ意味になる。
 - 鮮度で作らなかった example の**件数**を Dataset v2 の manifest に記録する。0 件でも 0 と記録する。件数は
   dataset の bytes（manifest）に入るので、同じ DB と spec からは同じ件数になる。どの step で外れたかの内訳は
   記録してよいが、型の必須は件数だけとする（0084 §2.1 で除いた validation example の件数を記録するのと同じ向き）
-- 鮮度は格子の時刻でだけ見る。最後の step の区間の終わり（最大の horizon）までと、区間の中で tick が途切れた場合を
-  どう扱うかは未決で、段 1 の実装の前に決める（§5 #7）
+- **tick の連続も求める**（2026-10-01 所有者承認。PR #212 の 6d584e6 への Codex P2）。格子の時刻だけを見ると、
+  最後の step の区間の途中で `coldaisle-fand` が止まり、外部の deadman / 引き継ぎが Fan を Max にした場合や、
+  途中の区間の中で止まって再開した場合を見逃す。そこで、`prior_action`（§2.7）の元の tick から最大の horizon
+  `t_a + steps × step_ms` までの間で、次の差が**すべて** `action_stale_after_ms` 未満であることを求める
+  - `seq` の順に隣り合う ControlTick の `ts_ms` の差（§2.1 で `ts_ms` は `seq` の順に狭義単調増加である）
+  - 最後の ControlTick（最大の horizon 以前で直近）の `ts_ms` から、最大の horizon までの差
+
+  1つでも満たさなければ、その example を作らず、上の除外件数に数える。区間の中の tick は**存在だけ**を見て、
+  値は使わない（§2.3）。格子の時刻ごとの as-of の鮮度の検査（上の項）は、この検査に含まれるが、別に残してよい
 - 既存の `stale_after_ms`（Telemetry の鮮度）とは共用しない。ControlTick の周期と Telemetry の周期は別物であり、
   片方の都合でもう片方の判定を変えないため
 - **実際の値は本記録では決めない。** 実機の ControlTick の周期と、tick の欠け方（再起動・停止の間隔）を
@@ -110,6 +117,8 @@ model へ渡す」と同じ意味になる。
 - step `k` の値は §2.1 の1点だけで決める。区間 `(t_a + k × step_ms, t_a + (k + 1) × step_ms)` の中の
   別の tick は、その step の値に使わない。平均も取らない
 - 区間の途中で値が変わった example も除かない
+- **見直しの提起あり**（PR #212 の 7b2783b への Codex P1）: 区間の途中の変化を表さないと、同じ action の特徴量に、
+  入力に無い別の軌道で生じた label が付く。段 1 の実装の前に、所有者が本項を維持するか置き換えるかを決める（§5 #8）
 
 理由: model の入力は「step の間は一定の demand」（`ActionPlan.held`、0052 §2.3）である。学習側も1つの step を
 1つの値で表すのが入力の意味と揃う。tick の周期が `step_ms` より短い運用では、途中で値が変わる example は
@@ -129,6 +138,10 @@ Dataset v2 の spec の検証に、次を加える。
 target が使える step（0079 §2.3 の因果の mask。`k × step_ms < h`）は、ちょうど `h / step_ms` 個になる。
 target の許容誤差の分（最大の horizon から `label_end_ms` まで）の action は持たない。どの horizon の予測にも
 使えない列だからである（因果の mask の外。0079 の段 1 の行の「`label_end_ms` まで」を置き換える部分。Supersedes）。
+
+- **見直しの提起あり**（PR #212 の 7b2783b への Codex P1）: 0031 §2.2 は target に、期待時刻 `t_a + h` の**後ろ**の
+  観測も許容誤差の中で採る。その場合、`t_a + h` から実際の観測時刻までの action が label に効くのに、model の入力
+  （因果の mask で `k × step_ms < h` の step だけ）には無い。段 1 の実装の前に、所有者が扱いを決める（§5 #9）
 
 理由: 0079 §2.3 の「target schema の horizon 列もこの格子と一致させる」を、spec の段階で検査できる形にした。
 最大の horizon より先の列を持つと、使われない列のために example の範囲が延び、作れる example がその分だけ減る。
@@ -215,7 +228,11 @@ demand を変える候補がすべて評価されなくなる。直前の tick �
   違う値になる tick 列で、v2 の example から作る `ObservedThermalInput` の `action` が `prior_action` と一致する。
   前に tick が無い anchor と、`prior_action` の元の tick が `action_stale_after_ms` 以上古い anchor では、example が
   できない
-- **除外の件数**（§2.2 / §2.7）: step の鮮度、`prior_action` の鮮度、前の tick が無いことで作らなかった example の
+- **tick の連続**（§2.2）: 格子の時刻ごとの tick は新しいが、最後の step の区間の途中で tick が途切れ、最後の tick から
+  最大の horizon までの差が `action_stale_after_ms` 以上になる example ができない。途中の step の区間の中で、隣り合う
+  tick の差が `action_stale_after_ms` 以上になる（次の格子の時刻の前に再開する）example もできない。`prior_action` の
+  元の tick と anchor の tick の差も同じく検査される。差がすべて未満なら example ができる
+- **除外の件数**（§2.2 / §2.7）: step の鮮度、tick の連続、`prior_action` の鮮度、前の tick が無いことで作らなかった example の
   件数が manifest に記録され、合計がそれぞれの場合の数と一致する。除外が無ければ 0 と記録される。件数を持たない
   manifest は型にならない
 - **決定性**: 同じ DB と spec から、同じ bytes の Dataset v2 ができる。manifest の `examples_sha256` と除外の件数が一致する
@@ -270,7 +287,9 @@ demand を変える候補がすべて評価されなくなる。直前の tick �
 | 4 | `action_stale_after_ms` の値 | 実機の ControlTick の周期と欠け方を見た後（#50 / #83） |
 | 5 | step ごとの context（mode・Safety の状態など）を持つか。本記録は step ごとに値と元の tick だけを持ち、context は anchor の tick のものだけとする（0031 §2.1 のまま） | 必要になったら新しい記録。Shadow・評価（#90 / #91）で Guard / Safety が値を変えた step の扱いが問題になった時 |
 | 6 | 0079 §5 #5（window / horizon / step 格子の実値）と 0050 §5 #2（support 軸と bin の境界）は変わらず開いたまま | 実機 dataset（#50 / #83）の後 |
-| 7 | **段 1 の実装の前に決める必要がある**（PR #212 の 6d584e6 への Codex P2）。§2.2 の鮮度は格子の時刻（各 step の開始）でしか見ない。最後の step の開始時点で新しい tick があっても、その後 `coldaisle-fand` が止まり、最大の horizon までの間に外部の deadman / 引き継ぎが Fan を Max にすると、dataset は最後の step の開始の値を持ち続ける。target は分からない（違う）action の下で学習される。途中の step の区間の中で止まって再開した場合も、次の格子の時刻に新しい tick があれば見逃す。**推奨案**: `prior_action` の元の tick から `t_a + steps × step_ms`（最大の horizon）までの間で、`seq` の順に隣り合う ControlTick の時刻の差と、最後の tick から最大の horizon までの差が、すべて `action_stale_after_ms` 未満であることを求める（tick の連続の証拠）。外れた example は作らず、§2.2 の除外件数に数える。§2.3 のとおり区間の中の tick の**値**は使わず、tick の**存在**だけを見る。代替案: 格子の時刻に加えて最大の horizon の時刻でも as-of の鮮度を見る（終端だけを塞ぎ、区間の中の停止は見逃す） | 所有者の判断。決まったら本 PR のレビュー中の修正、またはマージ後なら新しい記録 |
+| 7 | **決着**（§2.2。2026-10-01 所有者承認。PR #212 の 6d584e6 への Codex P2）: `prior_action` の元の tick から最大の horizon までの間で、`seq` の順に隣り合う ControlTick の差と、最後の tick から最大の horizon までの差が、すべて `action_stale_after_ms` 未満であることを求める。外れた example は作らず、除外件数に数える | 決着（本記録 §2.2） |
+| 8 | **段 1 の実装の前に決める必要がある**（PR #212 の 7b2783b への Codex P1）。§2.3 は step の区間の途中で effective が変わった example を除かない（初版で所有者が承認した点 3）。しかし tick の周期が `step_ms` より短く、途中で値が変わると、target は入力に無い軌道の結果になる。同じ action の特徴量に別の軌道の label が付き、MPC が使う「step の間は保つ」という反実仮想の意味を係数が支えない。**推奨案**: step の区間 `[t_a + k × step_ms, t_a + (k + 1) × step_ms)` の中の ControlTick の effective が、どれか1つの zone でも step の開始の as-of 値と違う example を作らず、除外件数に**理由ごとに**数える（鮮度・連続・区間内の変化を分けて記録し、`step_ms` の選び方の根拠にする）。tick の周期を `step_ms` と同じに選べば除外は起きない。代替案: (a) 初版のまま除かない（label の意味が崩れる）、(b) 区間内の tick をすべて保持し step の値を mask する（model の入力の形が変わり、0079 の feature schema の版上げが要る） | 所有者の判断。点 3 を置き換えるので、本 PR のレビュー中の修正として §2.3 を書き換えるか、マージ後なら新しい記録 |
+| 9 | **段 1 の実装の前に決める必要がある**（PR #212 の 7b2783b への Codex P1）。0031 §2.2 は target に、期待時刻の後ろの観測も許容誤差の中で採る（同じ距離なら過去側）。期待時刻 `t_a + h` より後ろの観測を採ると、`t_a + h` から観測時刻までの action が label に効くが、因果の mask で入力に無い。**推奨案**: Dataset v2 の target は期待時刻**以前**の観測だけを許容誤差の中で採る（`t_a + h − target_tolerance_ms ≤ source_ts ≤ t_a + h`。0031 §2.2 の v2 についての部分的な置き換え）。入力にあって label に効かない action が `[source_ts, t_a + h)` に入りうるが、入力に無い action が label に効くよりは安全側である。あわせて `label_end_ms` は `t_a + 最大の horizon` になる。代替案: (a) 後ろの観測を採る場合は、観測時刻まで action が変わらず tick が連続していたことを求める（規則が増える）、(b) 格子を `label_end_ms` まで延ばして入力に入れる（0079 §2.3 の因果の mask の定義を変える） | 所有者の判断。0031 §2.2 を v2 について置き換えるので、Supersedes に 0031 を加える |
 
 ## 6. 所有者の決定（2026-10-01）
 
@@ -298,4 +317,8 @@ demand を変える候補がすべて評価されなくなる。直前の tick �
 
 同日、PR #212 のレビュー（6d584e6 時点の §5 #3。Codex P2）を受けて、`seq` の順の `ts_ms` が狭義単調増加でない run と、
 移行前の行を含む run からの Dataset v2 の生成を拒否することを承認した。黙って並べ替えない。v1 の builder の同じ問題は
-開いたまま別に扱う（§2.1、§5 #3）。
+開いたまま別に扱う（§2.1、§5 #3）。移行前の行は `ts_ms ≤ legacy_until_ms`（等しい時刻を含む）と読むことも、同日に確認した。
+
+同日、PR #212 のレビュー（6d584e6 への Codex P2）を受けて、`prior_action` の元の tick から最大の horizon までの間で、
+`seq` の順に隣り合う ControlTick の差と、最後の tick から最大の horizon までの差がすべて `action_stale_after_ms` 未満で
+あることを求め、外れた example は作らずに除外件数へ数えることを承認した（§2.2、§5 #7）。
