@@ -323,7 +323,7 @@ def test_an_unreadable_journal_drops_to_shadow_and_reading_again_does_not_restor
 
     journal = other_store(tmp_path).read()
     assert journal.stage is AuthorityStage.SHADOW
-    assert journal.schema_version == 3
+    assert journal.schema_version == 4, "書くたびに現行の版（v4。決定記録 0086 §2.7）で書き直す"
     last = journal.events[-1]
     assert last.cause is AutomaticCause.AUTHORITY_JOURNAL_UNREADABLE
     assert last.trigger is AuthorityTrigger.AUTOMATIC
@@ -408,7 +408,11 @@ def test_the_unreadable_cause_needs_a_v3_journal(tmp_path):
     journal_path(tmp_path).write_bytes(good)
     runtime.maintain()
     payload = json.loads(journal_path(tmp_path).read_text("utf-8"))
-    assert payload["schema_version"] == 3
+    assert payload["schema_version"] == 4
+    # v4 の束縛（0086 §2.7）を外して、v3 で足した降格の理由だけを v2 に置いた形にする。
+    for event in payload["events"]:
+        if event["approval"] is not None:
+            del event["approval"]["approver_binding"]
     payload["schema_version"] = 2
     with pytest.raises(ValidationError, match="v3"):
         AuthorityJournal.model_validate_json(json.dumps(payload))

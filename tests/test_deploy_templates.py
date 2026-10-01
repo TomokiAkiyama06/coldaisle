@@ -7,6 +7,8 @@
 3. udev ルールが**仮の値のまま**であること（実機の値をコミットしない。0021）
 4. `coldaisle-fand` の unit が決定記録 0080 §2.2〜§2.9 の約束を守ること（段階 1 / #57）
 5. DB を共有する unit の `StateDirectoryMode` と `UMask` がそろっていること（0080 §2.1）
+6. authority の journal を承認者のグループと共有する専用のディレクトリ
+   （決定記録 0086 §2.2。段階 3c）
 """
 
 import re
@@ -30,6 +32,15 @@ JOBS = ("coldaisle-rollup", "coldaisle-report")
 
 FAND = "coldaisle-fand"
 """3系統 Fan 制御デーモン（決定記録 0080）。`/var/lib/coldaisle` を StateDirectory に持たない。"""
+
+AUTHORITY_DIR = "/var/lib/coldaisle-authority"
+"""authority.json の置き場所（決定記録 0086 §2.2。**仮の値**）。
+
+fand と承認者のグループが共有する。
+"""
+
+AUTHORITY_GROUP = "coldaisle-authority"
+"""昇格・rollback を行う人のグループ（決定記録 0086 §2.2。**仮の値**）。"""
 
 DB_UNITS = (*SERVICES, *JOBS)
 """`StateDirectory=coldaisle` を持ち、`/var/lib/coldaisle` の mode を決める unit（0080 §2.1）。"""
@@ -256,9 +267,11 @@ def test_fand_refuses_to_run_without_the_deadman_and_uses_the_shared_db():
     exec_start = one(fand(), "Service", "ExecStart").split()
     assert "--require-watchdog" in exec_start
     assert exec_start[exec_start.index("--db") + 1] == "/var/lib/coldaisle/coldaisle.db"
-    # authority.json は API のグループが書ける /var/lib/coldaisle に置かない（0080 §2.1）
+    # authority.json は承認者のグループと共有する専用のディレクトリに置く（決定記録 0086 §2.2）。
+    # API のグループが書ける /var/lib/coldaisle にも、fand 専用（0700）の StateDirectory にも
+    # 置かない
     authority = exec_start[exec_start.index("--authority-root") + 1]
-    assert authority.startswith("/var/lib/coldaisle-fand/")
+    assert authority == AUTHORITY_DIR
     # 制御の設定と管理ソケットの設定は fand が書けない場所（0080 §2.2）
     for option in ("--config-dir", "--admin-config"):
         assert not exec_start[exec_start.index(option) + 1].startswith("/var/lib/")
@@ -324,7 +337,7 @@ def test_fand_is_sandboxed_away_from_serial_and_tcp():
     assert service["CapabilityBoundingSet"] == [""]
     assert service["AmbientCapabilities"] == [""]
     assert service["NoNewPrivileges"] == ["yes"]
-    assert words(fand(), "Service", "ReadWritePaths") == ["/var/lib/coldaisle"]
+    assert words(fand(), "Service", "ReadWritePaths") == ["/var/lib/coldaisle", AUTHORITY_DIR]
 
 
 def test_fand_does_not_take_over_the_shared_state_directory():
@@ -371,8 +384,49 @@ def test_fand_runs_as_its_own_user_with_the_db_and_admin_groups():
     assert user not in {"coldaisle", "root", "0"}
     assert one(unit, "Service", "Group") not in {"coldaisle", "root", "0"}
     admin = yaml.safe_load((ROOT / "config" / "control-admin.yaml").read_text(encoding="utf-8"))
-    groups = set(words(unit, "Service", "SupplementaryGroups"))
-    assert {"coldaisle", admin["socket"]["group"]} <= groups
+    groups = words(unit, "Service", "SupplementaryGroups")
+    assert sorted(groups) == sorted({"coldaisle", admin["socket"]["group"], AUTHORITY_GROUP})
+
+
+def test_the_authority_journal_lives_in_its_own_shared_directory():
+    """journal は承認者のグループと共有する専用のディレクトリ（決定記録 0086 §2.2）。
+
+    - `--authority-root` と `ReadWritePaths=` が同じディレクトリを指す
+      （`ProtectSystem=strict` の下で開ける）
+    - そのディレクトリを `StateDirectory=` にしない（systemd がグループを `Group=` へ付け替え、
+      承認者が書けなくなる）
+    - DB の `/var/lib/coldaisle`（API のグループが書ける）とも、fand 専用の `0700` の
+      状態ディレクトリとも分ける
+    """
+    unit = fand()
+    exec_start = one(unit, "Service", "ExecStart").split()
+    root = exec_start[exec_start.index("--authority-root") + 1]
+    assert root in words(unit, "Service", "ReadWritePaths")
+    state = [f"/var/lib/{name}" for name in words(unit, "Service", "StateDirectory")]
+    for other in (*state, "/var/lib/coldaisle"):
+        assert root != other
+        assert not root.startswith(f"{other}/")
+    # 承認者のグループは fand の主グループとも、DB・管理ソケットのグループとも別
+    admin = yaml.safe_load((ROOT / "config" / "control-admin.yaml").read_text(encoding="utf-8"))
+    assert AUTHORITY_GROUP not in {
+        one(unit, "Service", "Group"),
+        "coldaisle",
+        admin["socket"]["group"],
+    }
+
+
+def test_the_deploy_guide_creates_the_authority_directory_the_unit_uses():
+    """unit の値を変えたら導入手順も変える（決定記録 0086 §2.2 / §2.7）。
+
+    所有者は fand のユーザー、グループは承認者のグループ、`2770`（setgid）。
+    """
+    unit = fand()
+    guide = (ROOT / "docs" / "ubuntu-deploy.md").read_text(encoding="utf-8")
+    user = one(unit, "Service", "User")
+    assert f"install -d -o {user} -g {AUTHORITY_GROUP} -m 2770 {AUTHORITY_DIR}" in guide
+    # 一時的な unit で書き込み権を確かめる手順は、unit と同じ補助グループを渡す（0080 §2.1）
+    supplementary = " ".join(words(unit, "Service", "SupplementaryGroups"))
+    assert f'"SupplementaryGroups={supplementary}"' in guide
 
 
 def test_fand_states_every_timeout():
