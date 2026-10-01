@@ -4,6 +4,7 @@
 - **Status**: FINAL（2026-09-18、リポジトリ所有者が承認）
 - **Date**: 2026-09-18
 - **Supersedes**: なし
+- **Superseded by**: [0087](0087-dataset-v2-action-grid.md)（§2.2 の target の採り方のうち、期待時刻より後ろの観測を採りうる部分を、**Thermal Dataset v2 についてだけ**置き換える。v2 は期待時刻以前の観測だけを採り、`label_end_ms` は anchor + 最大の horizon。v1 には本記録をそのまま適用する。他の節は有効）
 - **関連**: [`0010-csv-replay.md`](0010-csv-replay.md)、
   [`0028-fan-control-contracts.md`](0028-fan-control-contracts.md)、
   [`0030-control-decision-trace-storage.md`](0030-control-decision-trace-storage.md)
