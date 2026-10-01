@@ -64,11 +64,17 @@ anchor の ControlTick の時刻を `t_a` とする。step `k`（`k` = 0 .. `ste
 - 元にした tick の時刻（`ts_ms`）と `tick_id` を step ごとに記録する。zone ごとには記録しない。1つの tick が
   全 zone の値を持つからである
 - step 0 は時刻 `t_a` の as-of なので、anchor の tick 自身である
-- **前提**: 「直近」は ControlTick の `ts_ms` の順で決まる。これが実行の順と一致するのは、run の中で記録した順
-  （`seq`。0071 §2.2a）に並べた `ts_ms` が狭義単調増加のときだけである。壁時計が戻った run、同じ `ts_ms` の
-  tick を持つ run では、`ts_ms` の順で「直近」を選ぶと、後で掛かった action や、その時刻に掛かっていなかった
-  action を選びうる（`tick_id` も再起動で 0 に戻る。0071 §2.2）。**この前提が崩れた run の扱いは未決**であり、
-  段 1 の実装の前に決める（§5 #3）
+- **ControlTick の時刻が単調でない run からは生成しない**（2026-10-01 所有者承認。PR #212 の Codex P2）。
+  「直近」は `ts_ms` の順で決める。これが実行の順と一致するのは、記録した順（`seq`。0071 §2.2a）に並べた
+  `ts_ms` が狭義単調増加のときだけである。壁時計が戻った run や、同じ `ts_ms` の tick を持つ run では、後で
+  掛かった action や、その時刻に掛かっていなかった action を選びうる（`tick_id` も再起動で 0 に戻る。0071 §2.2）。
+  そこで次のとおりにする
+  - source run の ControlTick を `seq` の昇順に並べたとき、`ts_ms` が狭義単調増加でなければ、その run からの
+    Dataset v2 の生成を**拒否する**。`seq` や `ts_ms` で黙って並べ替えない。example の除外ではなく、生成全体の拒否とする
+  - 移行前の行（0071 §2.2a の `legacy_until_ms` 以前の `ts_ms` を持つ ControlTick）を含む run も拒否する。移行前の
+    行の `seq` は記録した順を表さず、順序を確かめられないからである。`legacy_until_ms` は移行前の行の `ts_ms` の
+    上限（0071 §2.2a）なので、等しい時刻も移行前の行でありうるものとして含める
+  - 同じ問題は v1 の builder（`ORDER BY ts_ms, tick_id`）にもある。v1 の扱いは本記録では変えない（§5 #3）
 - 値は丸め・補間・clamp をしない。ControlTick の `effective` は既に 0.0..1.0 で検証されている
 - 0031 §2.2 の window と同じ規則（「その時点以前の直近観測だけを as-of で使う」「元の時刻を残す」）を
   action にも当てる。window と action で別の時刻対応を持たない
@@ -88,6 +94,8 @@ model へ渡す」と同じ意味になる。
 - 鮮度で作らなかった example の**件数**を Dataset v2 の manifest に記録する。0 件でも 0 と記録する。件数は
   dataset の bytes（manifest）に入るので、同じ DB と spec からは同じ件数になる。どの step で外れたかの内訳は
   記録してよいが、型の必須は件数だけとする（0084 §2.1 で除いた validation example の件数を記録するのと同じ向き）
+- 鮮度は格子の時刻でだけ見る。最後の step の区間の終わり（最大の horizon）までと、区間の中で tick が途切れた場合を
+  どう扱うかは未決で、段 1 の実装の前に決める（§5 #7）
 - 既存の `stale_after_ms`（Telemetry の鮮度）とは共用しない。ControlTick の周期と Telemetry の周期は別物であり、
   片方の都合でもう片方の判定を変えないため
 - **実際の値は本記録では決めない。** 実機の ControlTick の周期と、tick の欠け方（再起動・停止の間隔）を
@@ -196,6 +204,9 @@ demand を変える候補がすべて評価されなくなる。直前の tick �
   horizon から `label_end_ms` までの列を持たない
 - **step の番号**（§2.5）: Dataset v2 の step `k` の区間が `ActionPlan.held(..., step_ms, steps)` の `steps[k]` と
   同じ区間であることを、格子の時刻と `offset_ms − step_ms` の一致で確かめる
+- **時刻が単調でない run**（§2.1）: `seq` の順で `ts_ms` が戻る run、同じ `ts_ms` の tick を2つ持つ run、
+  `legacy_until_ms` 以前（等しい時刻を含む）の ControlTick を含む run からの生成が、それぞれ拒否される。
+  単調な run は通る。v1 の builder の出力は変わらない
 - **較正**（§2.6）: 全 example の期間の中に `calibration_changed` の宣言があると、生成が拒否される。期間の外
   なら通る。`calibration_changed` 以外の宣言では拒否しない。宣言を渡さない呼び出しは型にならない。
   `control/model` が `control/drift` を import しないことを、既存の import 走査試験の方式で確かめる
@@ -255,10 +266,11 @@ demand を変える候補がすべて評価されなくなる。直前の tick �
 |---|---|---|
 | 1 | **決着**（§2.7）: v2 の anchor action は、anchor の tick より厳密に前で直近の ControlTick の effective（`prior_action`）とし、元の tick を記録し、`action_stale_after_ms` で鮮度を検査する（2026-10-01 所有者承認） | 決着（本記録 §2.7） |
 | 2 | **決着**（§2.2）: 鮮度で作らなかった example の件数を manifest に記録する（2026-10-01 所有者承認） | 決着（本記録 §2.2） |
-| 3 | **段 1 の実装の前に決める必要がある**（PR #212 の Codex P2）。§2.1 の as-of の前提（`seq` の順に並べた ControlTick の `ts_ms` が狭義単調増加）が崩れた run をどう扱うか。**推奨案**: その run からの Dataset v2 の生成を拒否する（fail closed。黙って並べ替えない）。`seq` を持たない移行前の行（0071 §2.2a の `legacy_until_ms` より前）を含む run も、順序を確かめられないので拒否する。代替案: `seq` の順で「直近」を選ぶ（壁時計が戻った区間では、格子の時刻と action の時刻の対応自体が崩れるので推奨しない）。v1 の builder（`ORDER BY ts_ms, tick_id`）にも同じ問題があるが、v1 を変えるかは別に決める | 所有者の判断。決まったら本記録を置き換える新しい記録（または本 PR のレビュー中の修正） |
+| 3 | **v2 は決着**（§2.1。2026-10-01 所有者承認）: `seq` の順の `ts_ms` が狭義単調増加でない run と、移行前の行を含む run からの Dataset v2 の生成を拒否する。**v1 の builder の同じ問題は開いたまま**: v1 の builder（`ORDER BY ts_ms, tick_id`）は時刻が単調でない run でも anchor の tick を `ts_ms` の順に選ぶ。v1 にも同じ拒否を足すかは、v1 の dataset を作り直す影響（既存 artifact の再生成で bytes が変わりうる）とあわせて別に決める。以下は初版の記録。§2.1 の as-of の前提（`seq` の順に並べた ControlTick の `ts_ms` が狭義単調増加）が崩れた run をどう扱うか。**推奨案**: その run からの Dataset v2 の生成を拒否する（fail closed。黙って並べ替えない）。`seq` を持たない移行前の行（0071 §2.2a の `legacy_until_ms` より前）を含む run も、順序を確かめられないので拒否する。代替案: `seq` の順で「直近」を選ぶ（壁時計が戻った区間では、格子の時刻と action の時刻の対応自体が崩れるので推奨しない）。v1 の builder（`ORDER BY ts_ms, tick_id`）にも同じ問題があるが、v1 を変えるかは別に決める | v2 は決着（本記録 §2.1）。v1 は #83 で別の Issue コメントまたは記録として扱う |
 | 4 | `action_stale_after_ms` の値 | 実機の ControlTick の周期と欠け方を見た後（#50 / #83） |
 | 5 | step ごとの context（mode・Safety の状態など）を持つか。本記録は step ごとに値と元の tick だけを持ち、context は anchor の tick のものだけとする（0031 §2.1 のまま） | 必要になったら新しい記録。Shadow・評価（#90 / #91）で Guard / Safety が値を変えた step の扱いが問題になった時 |
 | 6 | 0079 §5 #5（window / horizon / step 格子の実値）と 0050 §5 #2（support 軸と bin の境界）は変わらず開いたまま | 実機 dataset（#50 / #83）の後 |
+| 7 | **段 1 の実装の前に決める必要がある**（PR #212 の 6d584e6 への Codex P2）。§2.2 の鮮度は格子の時刻（各 step の開始）でしか見ない。最後の step の開始時点で新しい tick があっても、その後 `coldaisle-fand` が止まり、最大の horizon までの間に外部の deadman / 引き継ぎが Fan を Max にすると、dataset は最後の step の開始の値を持ち続ける。target は分からない（違う）action の下で学習される。途中の step の区間の中で止まって再開した場合も、次の格子の時刻に新しい tick があれば見逃す。**推奨案**: `prior_action` の元の tick から `t_a + steps × step_ms`（最大の horizon）までの間で、`seq` の順に隣り合う ControlTick の時刻の差と、最後の tick から最大の horizon までの差が、すべて `action_stale_after_ms` 未満であることを求める（tick の連続の証拠）。外れた example は作らず、§2.2 の除外件数に数える。§2.3 のとおり区間の中の tick の**値**は使わず、tick の**存在**だけを見る。代替案: 格子の時刻に加えて最大の horizon の時刻でも as-of の鮮度を見る（終端だけを塞ぎ、区間の中の停止は見逃す） | 所有者の判断。決まったら本 PR のレビュー中の修正、またはマージ後なら新しい記録 |
 
 ## 6. 所有者の決定（2026-10-01）
 
@@ -283,3 +295,7 @@ demand を変える候補がすべて評価されなくなる。直前の tick �
 - **較正の検査の期間** → 全 example の期間で検査する（0079 の「全 split を通した期間」より厳しい。§2.6）
 - **除外の件数** → 鮮度で作らなかった example の件数を manifest に記録する（§2.2。初版の §5 #2）
 - **0079 の扱い** → 0079 §2.9 の段 1 の行のうち、action 列の範囲の文言だけを部分的に置き換える（Supersedes。§2.4）
+
+同日、PR #212 のレビュー（6d584e6 時点の §5 #3。Codex P2）を受けて、`seq` の順の `ts_ms` が狭義単調増加でない run と、
+移行前の行を含む run からの Dataset v2 の生成を拒否することを承認した。黙って並べ替えない。v1 の builder の同じ問題は
+開いたまま別に扱う（§2.1、§5 #3）。
