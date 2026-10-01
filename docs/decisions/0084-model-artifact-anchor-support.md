@@ -43,7 +43,8 @@
    binding から**抜けている**ことを検出しない。抜けた metric の単位は束縛されず、0079 §2.3 の
    「単位の変更を黙って通さない」が破れる
 
-2026-10-01 にリポジトリ所有者が、3点とも Issue のコメントの推奨案で承認した。本記録はそれを
+2026-10-01 にリポジトリ所有者が、3点とも Issue のコメントの推奨案で承認した。さらに同日、本記録の初版で
+推奨案の文言を超えて決めた3点（§6 の「追加で承認した点」）も、所有者が承認した。本記録はそれを
 実装が参照できる具体性で書く。**数値のしきい値・設定値は新しく決めない。**
 
 ## 2. Decision
@@ -61,9 +62,23 @@ zone `z` ∈ Front / Rear / Top）に、すべての `k` について `observed.
   評価した予測値と一致しなければならない**（試験で確かめる。§2.4）
 - 値は丸め・補間・clamp をしない。`effective_demand` は既に 0.0..1.0 で検証されている（`ObservedFanAction`）
 - 因果の mask（0079 §2.3）はそのまま掛かる。held の列であっても horizon より後の step の係数は 0 である
-- **anchor 推論は §2.2 / 0079 §2.5 の候補の照合を受けない。** anchor 推論の OOD は従来どおり 0050 の判定
-  （anchor action の `fan range` と support cell を含む）が見る。held の列の遅い step が step ごとの support の
-  外にあるとき anchor 推論をどう扱うかは、本記録では決めない（§5 #1）
+- **held の列も、候補と同じ step ごとの support の照合を受ける（margin なし）。** 0050 の判定は anchor action
+  （action 時点の値）の `fan range` と support cell しか見ないので、held の列の遅い step の値が、その step で
+  学習していない値であっても通ってしまう。そのまま予測を出すと、外挿の予測が通常の confidence を得て
+  Learned MPC の提案を通しうる（AGENTS.md ルール4 に反する）。そこで次のとおりにする（2026-10-01 所有者承認。
+  §6 の追加）
+  - 照合は §2.2 の候補の照合と**同じ関数**で行う。held の列について、step `k` ごとの範囲と (a)、
+    anchor → 最初の step の変化量の範囲と (b)、組 `(k, k + 1)` ごとの変化量の範囲と (c) のすべてを当てる。
+    held の変化量は 0 なので、変化量の照合は「その step の組で変化量 0 が観測された範囲に入るか」になる。
+    margin も件数の下限も掛けない（§2.2 と同じ）
+  - 1つでも外れれば、その anchor 推論を **OOD** とする。0050 §2.2 の既存の構成要素 **`support`**
+    （`ConfidenceComponent.SUPPORT`）の OOD の条件に、Profile v2 についてだけ「held の列が step ごとの support の外」を
+    加え、score は 0、`ood = true`、confidence は 0 とする（0050 §2.2「1つでも OOD なら confidence は 0」）。
+    detail には外れた step の番号（遷移なら step の組）・zone・cell を入れる。**構成要素の enum と assessment の
+    形は変えない**（新しい reason code を足さない）
+  - confidence 0 の anchor 推論からは、0050 / 0052 の既存の経路どおり Gate が Learned MPC の提案を通さず、
+    Baseline / Fallback で運転する。新しい経路は作らない
+  - この照合は Profile v2（同梱）を持つ判定器だけが行う。v1 の Profile の判定は変えない
 
 **学習と検証も同じ規則で行う。** 同じ関数を、次のすべてで使う（別の実装を持たない）。
 
@@ -148,6 +163,11 @@ Profile v2 の「action の学習範囲」（0079 §2.1 の表）を次のとお
 - anchor 推論: 同じ `ObservedThermalInput` について、anchor 推論の予測値が `ActionPlan.held(現在の
   effective demand, ...)` を候補として評価した予測値と一致する。Profile v2 の residual の基準を、合成 dataset で
   記録した action 列が held と**違う** validation example から作ったとき、基準が held の予測から計算されている
+- held の列の support（§2.1）: train で demand 0.8 を step 0 でだけ観測し、遅い step では観測していない Profile で、
+  現在の effective demand が 0.8 の anchor 推論が `support` の OOD（confidence 0、detail に step の番号）になり、
+  Gate が Fallback の requested を選ぶ。anchor action の `fan range` と support cell には入っている（0050 の既存の
+  判定だけなら通る）入力で確かめる。組 `(k, k + 1)` の (c) にだけ無い held の遷移も同じく OOD になる。
+  step ごとの support の範囲に入る held の列は、この照合で OOD にならない。v1 の Profile の判定は変わらない
 - L11: `anchor_action_rule` が manifest と Profile で食い違う・Literal 外の値の artifact が型にならず、
   runtime が `MODEL_LOAD_FAILURE` として Fallback の requested を出す（0079 §2.7 の L1〜L10 と同じ確かめ方）
 - step ごとの support: train の計画 action で、ある demand（または cell）を step 0 でだけ観測した Profile で、
@@ -196,7 +216,7 @@ Profile v2 の「action の学習範囲」（0079 §2.1 の表）を次のとお
 
 | # | 内容 | 決める場所 |
 |---|---|---|
-| 1 | anchor 推論の held の列が、遅い step で step ごとの support（§2.2）の外にあるとき、anchor 推論の confidence を下げるか（0050 の判定の構成要素を増やすことになる） | 実機 dataset で頻度を見た後（#85 / #91）。足すなら新しい記録 |
+| 1 | **決着**（§2.1）: held の列が step ごとの support の外なら anchor 推論を `support` の OOD にし Fallback へ。残る論点は、Profile v2 の residual の基準を作るとき、held の列が support の外にある validation example を除くか | 段 3（#85）の実装の前。除くなら新しい記録 |
 | 2 | step ごとの集合の合計に、0050 §3 の上限とは別の構造上の上限が要るか | 段 3（#85）の実装で Profile の大きさを測った後。数値を足すなら新しい記録 |
 | 3 | 運転方針（MPC の authority）が学習時と大きく変わったとき、held を仮定した residual の比がどれだけ動くか | #90 / #91 の Shadow・評価と 0056 の drift の運用で測る |
 | 4 | 0079 §5 #5（window / horizon / step 格子・target metric 集合の実値）と 0050 §5 #2（support 軸と bin の境界）は変わらず開いたまま | 実機 dataset（#50 / #83）の後 |
@@ -211,3 +231,15 @@ Issue #104 の 2026-09-30 のコメントで示した推奨案を、2026-10-01 �
   外れた候補は評価しない（margin なし。0079 のまま）（§2.2）
 - **3. `metric_binding` の網羅** → 推奨案「binding の metric のキー集合が feature と target の metric の和集合と一致することを
   L8 で検査する」（各 entry の検査に加える）（§2.3）
+
+### 追加で承認した点（2026-10-01）
+
+初版（44dc9b9）で推奨案の文言を超えて決めた次の3点を、2026-10-01 にリポジトリ所有者が承認した。
+
+- 係数の当てはめは Dataset v2 に記録した action 列のままとし、「学習と検証も同じ規則」は Profile の residual の基準と
+  anchor 予測の評価に当てる（§2.1 の表）
+- zone ごとの計画 demand の min / max と step 間の変化量も、cell と同じく step ごと・step の組ごとに持つ（§2.2）
+- 0050 §3 の cell 数の上限を step ごと・step の組ごとの集合それぞれに当てる（合計の上限は §5 #2）
+
+同日、PR #205 のレビュー（Codex P1）を受けて、held の anchor の列にも step ごとの support の照合を当て、外れれば
+`support` の OOD として Fallback にすることを承認した（§2.1。初版では §5 #1 に先送りしていた）。
