@@ -249,9 +249,10 @@ def run_rollback(args: argparse.Namespace, identity: ProcessIdentity, clock: Clo
             actor=credentials.actor, reason=args.reason
         )
     except AuthorityNotDurableError as error:
-        # 自分の追記の直後に出る error なので、最後の event が自分のものである。
+        # 追記したかは store が lock の中で決めたもの（None は「既に Baseline だったが、
+        # 前の置き換えを fsync し直せなかった」。codex P1。PR #216）。
         journal, durable = error.journal, False
-        appended = journal.last_change
+        appended = error.appended
     changed = appended is not None
     event = "rolled_back" if changed else "already_baseline"
     from_stage = appended.from_stage.value if appended is not None else journal.stage.value

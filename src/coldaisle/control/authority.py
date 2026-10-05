@@ -213,12 +213,21 @@ class AuthorityNotDurableError(AuthorityStoreError):
     呼び出し側が「変更しなかった」と伝えないよう、書いた journal を持たせる（codex P1）。
     """
 
-    def __init__(self, journal: AuthorityJournal) -> None:
-        super().__init__(
+    def __init__(
+        self,
+        journal: AuthorityJournal,
+        *,
+        appended: AuthorityEvent | None,
+        message: str = (
             "authority journal は置き換えたが、ディレクトリの fsync に失敗した"
             "（変更は見えているが、電源断で失われうる）"
-        )
+        ),
+    ) -> None:
+        super().__init__(message)
         self.journal = journal
+        self.appended = appended
+        """**この呼び出しが**追記した event。None は「既に目標の stage で、追記しなかった」
+        （前の操作の置き換えを永続化し直そうとして、ディレクトリの fsync に失敗した）。"""
 
 
 class _DirectorySyncError(Exception):
@@ -1023,6 +1032,11 @@ class AuthorityStore:
         with self._exclusive_lock() as root_fd:
             journal = self._read(root_fd)
             if stage_rank(to_stage) >= stage_rank(journal.stage):
+                # **何も書かない分岐でも、「永続化している」と言う前にディレクトリを fsync し直す**
+                # （codex P1。PR #216）。前の降格（rollback）が置き換えの後の fsync に失敗して
+                # いれば、読めた journal は既に下がっているが、電源断で置き換えが失われうる。
+                # やり直した操作が fsync せずに成功を返すと、その置き換えを誰も永続化しない。
+                self._resync_directory(root_fd, journal)
                 return journal, None
             event = AuthorityEvent(
                 revision=journal.revision + 1,
@@ -1342,8 +1356,27 @@ class AuthorityStore:
         try:
             self._atomic_write(root_fd, AUTHORITY_STATE_FILENAME, payload)
         except _DirectorySyncError as error:
-            raise AuthorityNotDurableError(updated) from error.__cause__
+            raise AuthorityNotDurableError(updated, appended=event) from error.__cause__
         return updated
+
+    @staticmethod
+    def _resync_directory(root_fd: int, journal: AuthorityJournal) -> None:
+        """書かずに返す前に、いま見えている journal のディレクトリ項目を永続化し直す。
+
+        失敗したら `AuthorityNotDurableError`（``appended=None``）。呼び出し側は「書いた後の
+        fsync の失敗」と同じく非 durable として扱う（CLI は終了コード 5）。
+        """
+        try:
+            os.fsync(root_fd)
+        except OSError as error:
+            raise AuthorityNotDurableError(
+                journal,
+                appended=None,
+                message=(
+                    "authority journal は既に目標の stage だが、ディレクトリの fsync に失敗した"
+                    "（前の置き換えが電源断で失われうる）"
+                ),
+            ) from error
 
     def _read(self, root_fd: int) -> AuthorityJournal:
         try:

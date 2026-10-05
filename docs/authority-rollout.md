@@ -130,17 +130,21 @@ lock の最小権限を与える設計が決まるまで使えない（#217。`r
 
 | 終了コード | 意味 | `code` |
 |---|---|---|
-| 0 | 書いた（rollback で既に Baseline だったときも 0） | —（下の注記） |
+| 0 | 書いた（rollback で既に Baseline だったときも、ディレクトリの `fsync` をやり直して通れば 0） | —（下の注記） |
 | 1 | 読めない・書けない（ディレクトリが無い／形が違う・壊れた journal・設定・Registry・I/O） | `store_error` / `journal_invalid` / `registry_error` / `input_too_large` / `io_or_config_error` |
 | 2 | 引数の誤り（argparse） | — |
 | 3 | 実行者を承認者として認めない（0086 §2.3 / §2.5） | `approver_is_root` / `approver_owns_authority_root` / `uid_differs_from_euid` / `invalid_uid` / `approval_not_bound_to_process` / `approver_is_not_the_process_uid` |
 | 4 | 承認・証拠を受け入れない（下の一覧） | `invalid_approval` / `approval_rejected` / `evidence_rejected` |
-| 5 | **書いた（他の process に見えている）が、ディレクトリの `fsync` に失敗し、永続化を確かめられない**（raise / rollback とも） | —（結果の `durable: false`・warning のログ） |
+| 5 | **書いた（他の process に見えている）が、ディレクトリの `fsync` に失敗し、永続化を確かめられない**（raise / rollback とも。既に Baseline の rollback で `fsync` し直せなかったときも） | —（結果の `durable: false`・warning のログ） |
 
 - journal を置き換えた**後**の失敗は、変更しなかったこと（1）にしない。
   ディレクトリの `fsync` に失敗したときは**終了コード 5**で、結果の `durable` を `false` にし、構造化ログを
-  warning で出す（変更は他の process に見えているが、電源断で失われうる。もう一度同じ操作をするか、
-  journal を確かめる）。成功（0）と分けるのは、**失われた rollback は上げた authority を黙って元に戻す**ので、
+  warning で出す（変更は他の process に見えているが、電源断で失われうる）。**rollback は、終了コード 0 に
+  なるまでやり直せばよい**。既に Baseline のとき（`already_baseline`）も、store は何も書かずに返す前に
+  ディレクトリの `fsync` をやり直し、通ったときだけ `durable: true`・終了コード 0 を返す（通らなければ
+  再び 5。codex P1、PR #216）。管理ソケットの `lower-authority` / `rollback-authority` が既に目標の stage で
+  何も書かないときも同じく `fsync` し直す（fand は通るまで上限を保持する）。raise は同じ承認では
+  やり直せない（revision が進んでいる）ので、journal を確かめ、必要なら rollback する。成功（0）と分けるのは、**失われた rollback は上げた authority を黙って元に戻す**ので、
   人もスクリプトも終了コードで気づけなければならないため（2026-10-01 所有者の決定。#216）。
   stdout に書けないとき（閉じた pipe など）は `result_not_written` の警告だけを残す（終了コードは変えない）
 

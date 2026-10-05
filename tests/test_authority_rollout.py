@@ -46,6 +46,7 @@ from coldaisle.control import (
     AuthorityEvent,
     AuthorityEvidenceError,
     AuthorityJournal,
+    AuthorityNotDurableError,
     AuthorityRuntime,
     AuthorityStage,
     AuthorityStateError,
@@ -2154,6 +2155,43 @@ def test_invariant_6_s_shutdown_reports_a_demotion_that_never_became_durable(
     control.observe(safety_state=SafetyState.EMERGENCY, now_mono_ms=0)
 
     assert control.flush_pending_on_shutdown() == (BASELINE_STAGE,)
+
+
+def test_invariant_6_t_a_no_op_lowering_resyncs_the_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """**既に目標の stage でも、fsync し直してから成功を返す**（codex P1。PR #216）。
+
+    別の process（CLI の rollback）の置き換えが fsync に失敗した後、管理ソケットの降格
+    （`lower-authority` / `rollback-authority`）が no-op で成功すると、置き換えを誰も永続化しない。
+    """
+    control = runtime(tmp_path, stage=AuthorityStage.FULL)
+    authority = store(tmp_path)
+    fsync = DirectoryFsync(monkeypatch)
+    with pytest.raises(AuthorityNotDurableError) as caught:
+        authority.rollback_to_baseline(actor="operator", reason="戻す")
+    assert caught.value.appended is not None
+    control.maintain()  # 外の rollback を読む
+    assert control.journal.stage is BASELINE_STAGE
+
+    # no-op の降格も fsync をやり直す。失敗すれば非 durable（追記はしていない）
+    with pytest.raises(AuthorityNotDurableError) as caught:
+        authority.lower_stage(to_stage=BASELINE_STAGE, actor="operator", reason="もう一度")
+    assert caught.value.appended is None
+    # 既に Baseline なので実効 stage は下がらない（False）が、書き残しは予約する
+    assert not control.apply_lowering(to_stage=BASELINE_STAGE, actor="operator", reason="もう一度")
+    assert control.pending_stages == (BASELINE_STAGE,)
+    calls = fsync.directory_calls
+    control.maintain()
+    assert fsync.directory_calls > calls
+    assert control.persist_failure is not None
+    assert control.trace_record(command_id=None).unpersisted_ceiling is BASELINE_STAGE
+
+    fsync.failing = False
+    control.maintain()
+    assert control.persist_failure is None
+    assert control.trace_record(command_id=None).unpersisted_ceiling is None
+    assert authority.read().revision == control.journal.revision
 
 
 # --- 不変条件 7: 設定は上限 ----------------------------------------------------

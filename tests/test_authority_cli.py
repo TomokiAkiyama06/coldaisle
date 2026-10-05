@@ -474,6 +474,58 @@ def test_a_closed_stdout_after_the_commit_is_still_success(
     assert events == ["rolled_back" if command == "rollback" else "raised", "result_not_written"]
 
 
+@pytest.mark.parametrize("second_fsync_fails", [False, True])
+def test_a_repeated_rollback_resyncs_the_directory_before_claiming_durable(
+    tmp_path: Path,
+    second_fsync_fails: bool,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """**やり直した rollback は、既に Baseline でも fsync し直してから durable と言う**。
+
+    1回目の rollback が置き換えの後の fsync に失敗した（終了コード 5）。手順どおりやり直すと
+    journal は既に SHADOW なので何も書かないが、fsync せずに成功を返すと、1回目の置き換えを
+    誰も永続化しない。
+    """
+    shared_root(tmp_path)
+    approval, report = write_inputs(tmp_path)
+    assert run(raise_argv(tmp_path, approval, report)) == EXIT_OK
+    real = os.fsync
+    directory_calls: list[bool] = []
+    failing = [True]
+
+    def fsync(fd: int) -> None:
+        if stat.S_ISDIR(os.fstat(fd).st_mode):
+            directory_calls.append(failing[0])
+            if failing[0]:
+                raise OSError(5, "Input/output error")
+        real(fd)
+
+    monkeypatch.setattr(os, "fsync", fsync)
+    assert run(rollback_argv(tmp_path)) == EXIT_NOT_DURABLE
+    capsys.readouterr()
+    failing[0] = second_fsync_fails
+    before = len(directory_calls)
+
+    exit_code = run(rollback_argv(tmp_path))
+
+    assert len(directory_calls) > before, "no-op の分岐でもディレクトリを fsync し直す"
+    captured = capsys.readouterr()
+    result = json.loads(captured.out)
+    assert result["event"] == "already_baseline"
+    [line] = log_lines(captured.err)
+    assert line["event"] == "already_baseline"
+    if second_fsync_fails:
+        assert exit_code == EXIT_NOT_DURABLE
+        assert result["durable"] is False
+        assert line["durable"] is False
+    else:
+        assert exit_code == EXIT_OK
+        assert result["durable"] is True
+    monkeypatch.setattr(os, "fsync", real)
+    assert store(tmp_path).read().stage is AuthorityStage.SHADOW
+
+
 @pytest.mark.parametrize("command", ["raise", "rollback"])
 def test_the_audit_line_survives_an_ascii_only_stderr(
     tmp_path: Path, command: str, monkeypatch: pytest.MonkeyPatch
