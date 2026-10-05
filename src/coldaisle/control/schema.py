@@ -24,7 +24,7 @@ from typing import Annotated, Literal, Protocol, Self, runtime_checkable
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-SCHEMA_VERSION: Literal[13] = 13
+SCHEMA_VERSION: Literal[14] = 14
 """`ControlTick` の形の版。**フィールドの名前や意味を変えたら上げる。**
 
 #82 が保存したデータを読み違えないため。
@@ -68,6 +68,13 @@ SCHEMA_VERSION: Literal[13] = 13
   走行中に journal を読めなかったことによる `SHADOW`（`journal_unreadable`）、この tick の先頭で
   適用した管理ソケットの降格の `command_id`、直近の永続化の失敗。**v13 には必須**で、
   保存済みの v1〜v12 は欄なしのまま読める（「記録が無い」であって「journal が無かった」ではない）
+- v14（#81 / 決定記録 0078 §2.7 / 0085 §2.3）: Baseline（Fallback）の requested への Air Balance の
+  協調の記録（`air_balance_coordination`。raw baseline・提案・Gate へ渡した値・保持込みの値・
+  適用した `max_raise`・zone ごとの下限の見込み）と、Critical Safety の裁定の写し
+  `tach_unconfirmed_zones`（確定前の tach 無応答の zone）。`mode: apply` の協調の失敗で
+  Gate を迂回した tick の `fallback_reason` に `air_balance_coordination_failed` を許す。
+  **v14 には両方が必須**で、保存済みの v1〜v13 は欄なしのまま読める
+  （「記録が無い」であって「協調していなかった」ではない）
 """
 
 Demand = Annotated[float, Field(ge=0.0, le=1.0, allow_inf_nan=False)]
@@ -1672,6 +1679,334 @@ class AirBalanceRecord(_Frozen):
         return self
 
 
+AIR_BALANCE_COORDINATION_RECORD_SCHEMA_VERSION: Literal[1] = 1
+"""`AirBalanceCoordinationRecord` の形の版（決定記録 0078 §2.7）。"""
+
+
+class AirBalanceCoordinationMode(StrEnum):
+    """Air Balance の協調を Baseline の requested に掛けるか（決定記録 0078 §2.1）。
+
+    ``fan-policy.yaml`` の ``air_balance_coordination.mode`` と trace の ``mode`` が同じ値を
+    指すよう、型はここに1つだけ置く（``config`` はこれを import する）。
+    """
+
+    OFF = "off"
+    SHADOW = "shadow"
+    APPLY = "apply"
+
+
+class AirBalanceCoordinationStatus(StrEnum):
+    """1 tick の協調の結果（決定記録 0078 §2.7）。"""
+
+    OFF = "off"
+    SKIPPED = "skipped"
+    """0078 §2.3 の条件が欠け、``coordinate()`` を呼ばなかった（raw baseline のまま）。"""
+    NOT_NEEDED = "not_needed"
+    SHADOW = "shadow"
+    APPLIED = "applied"
+    FAILED = "failed"
+    """協調の部品が例外を投げたか、出力の検証に失敗した（0078 §2.6 / 決定記録 0085）。"""
+
+
+class AirBalanceCoordinationSkipReason(StrEnum):
+    """``skipped`` の理由（決定記録 0078 §2.3 の表の順）。"""
+
+    AIR_BALANCE_DISABLED = "air_balance_disabled"
+    OPERATING_MODE = "operating_mode"
+    SNAPSHOT_UNAVAILABLE = "snapshot_unavailable"
+    BASELINE_UNAVAILABLE = "baseline_unavailable"
+    SAFETY_STATE = "safety_state"
+    ZONE_FAN_FAULT = "zone_fan_fault"
+    TACH_UNCONFIRMED = "tach_unconfirmed"
+
+
+SKIP_REASONS_BEFORE_TACH: frozenset[AirBalanceCoordinationSkipReason] = frozenset(
+    reason
+    for reason in AirBalanceCoordinationSkipReason
+    if reason is not AirBalanceCoordinationSkipReason.TACH_UNCONFIRMED
+)
+"""0078 §2.3 の表で ``tach_unconfirmed`` より上の行。
+
+未確認の tach があっても、先に別の条件で ``skipped`` になった tick はその理由を残す
+（判定は表の順に行う）。
+"""
+
+
+_SKIP_REASONS_AFTER_SNAPSHOT: frozenset[AirBalanceCoordinationSkipReason] = frozenset(
+    {
+        AirBalanceCoordinationSkipReason.BASELINE_UNAVAILABLE,
+        AirBalanceCoordinationSkipReason.SAFETY_STATE,
+        AirBalanceCoordinationSkipReason.ZONE_FAN_FAULT,
+        AirBalanceCoordinationSkipReason.TACH_UNCONFIRMED,
+    }
+)
+"""0078 §2.3 の表で ``baseline_unavailable`` とその後の行。
+
+ここに当たる tick は ``baseline_unavailable`` なら raw baseline が無く、ほかは必ずある。
+それより上の行（``air_balance_disabled`` など）は baseline の有無を問わない。
+"""
+
+
+class ProjectedFloorBasis(StrEnum):
+    """zone ごとの下限の見込み ``f_z`` を決めた下限（決定記録 0078 §2.7）。
+
+    同値なら ``forced_max`` → ``safety_floor`` → ``guard_floor`` → ``ramp_down`` の順で1つを選ぶ。
+    """
+
+    FORCED_MAX = "forced_max"
+    SAFETY_FLOOR = "safety_floor"
+    GUARD_FLOOR = "guard_floor"
+    RAMP_DOWN = "ramp_down"
+    NONE = "none"
+
+
+AirBalanceCoordinationReasonCode = Literal[
+    "front_makeup_air", "rear_thermal_exhaust", "top_case_aux_exhaust"
+]
+"""``coordinate()`` が付ける理由の code（``air_balance.ConfiguredAirBalanceModel``）。"""
+
+AIR_BALANCE_COORDINATION_FAILED = "air_balance_coordination_failed"
+"""``mode: apply`` の協調の失敗で Gate を迂回した tick の ``fallback_reason``（0085 §2.2）。"""
+
+AIR_BALANCE_ZONE_REASONS: dict[Zone, str] = {
+    Zone.FRONT: "air_balance_front_makeup_air",
+    Zone.REAR: "air_balance_rear_thermal_exhaust",
+    Zone.TOP: "air_balance_top_case_aux_exhaust",
+}
+"""協調が zone の requested を決めたときの理由（決定記録 0078 §2.7）。
+
+Front を上げるのは make-up air、Rear は熱の排気、Top は case auxiliary exhaust だけである
+（``ConfiguredAirBalanceModel.coordinate()``）。
+"""
+
+AIR_BALANCE_RELEASE_HOLD_REASON = "air_balance_release_hold"
+"""``release_hold_ms`` の保持（``h_z > r_z``）が値を決めた zone の理由（決定記録 0078 §2.7）。"""
+
+AIR_BALANCE_CONTROLLER_REASONS: frozenset[str] = frozenset(
+    {*AIR_BALANCE_ZONE_REASONS.values(), AIR_BALANCE_RELEASE_HOLD_REASON}
+)
+"""協調が requested の値を決めた zone の ``ZoneRecord.controller_reason``（決定記録 0078 §2.7）。"""
+
+
+class AirBalanceCoordinationFailure(_Frozen):
+    """``failed`` の tick の原因（例外の型と、500 字までの説明）。"""
+
+    type: str = Field(min_length=1, max_length=120)
+    detail: str = Field(default="", max_length=500)
+
+
+class AirBalanceCoordinationRecord(_Frozen):
+    """1 tick の Air Balance の協調の記録（``ControlTick`` v14。#81 / 決定記録 0078 §2.7）。
+
+    - ``candidate`` は raw baseline（Fallback の requested）、``proposed`` は上限を掛ける前の値
+    - ``output`` は協調の段が Baseline の値として出した値。Gate を通る tick は Gate へ渡した値で、
+      ``mode: apply``・``status: failed`` で Gate を迂回した tick は requested にした raw baseline
+      （= ``candidate``）である（決定記録 0085 §2.3）
+    - ``counterfactual_output`` は保持込みの値（shadow では「apply ならこう渡していた」値）
+    - ``max_raise`` はその tick に適用した ``fan-policy.yaml`` の値。trace だけで
+      ``output - candidate <= max_raise`` を検算できるように記録する
+    """
+
+    schema_version: Literal[1] = AIR_BALANCE_COORDINATION_RECORD_SCHEMA_VERSION
+    mode: AirBalanceCoordinationMode
+    status: AirBalanceCoordinationStatus
+    skip_reason: AirBalanceCoordinationSkipReason | None = None
+    demand_basis: Literal["stable_candidate"] = "stable_candidate"
+    """何の demand で評価したか。
+
+    ``FanHardwareConfig.stable_demands()`` を通した candidate（固定）。
+    """
+    candidate: PerZone[Demand] | None = None
+    proposed: PerZone[Demand] | None = None
+    output: PerZone[Demand] | None = None
+    counterfactual_output: PerZone[Demand] | None = None
+    max_raise: PerZone[Demand] | None = None
+    bounded_by_max_raise: PerZone[bool] | None = None
+    held: PerZone[bool] | None = None
+    projected_floors: PerZone[Demand] | None = None
+    projected_floor_basis: PerZone[ProjectedFloorBasis] | None = None
+    before_state: AirBalanceTraceState | None = None
+    before_ratio: EffectiveFlowUnit | None = None
+    projected_state: AirBalanceTraceState | None = None
+    projected_ratio: EffectiveFlowUnit | None = None
+    reasons: tuple[AirBalanceCoordinationReasonCode, ...] = ()
+    failure: AirBalanceCoordinationFailure | None = None
+
+    @classmethod
+    def off(cls) -> AirBalanceCoordinationRecord:
+        """``mode: off`` の tick の記録（協調の経路そのものを持たない）。"""
+        return cls(mode=AirBalanceCoordinationMode.OFF, status=AirBalanceCoordinationStatus.OFF)
+
+    @property
+    def bypassed_gate(self) -> bool:
+        """``mode: apply`` の協調が失敗し、Gate を迂回した tick か（決定記録 0085 §2.1）。"""
+        return (
+            self.mode is AirBalanceCoordinationMode.APPLY
+            and self.status is AirBalanceCoordinationStatus.FAILED
+        )
+
+    @model_validator(mode="after")
+    def _status_matches_the_values(self) -> Self:
+        self._check_off()
+        if self.mode is AirBalanceCoordinationMode.OFF:
+            return self
+        if self.max_raise is None:
+            raise ValueError("mode が shadow / apply の tick は適用した max_raise を記録する")
+        self._check_projected_floors()
+        if (self.skip_reason is not None) != (self.status is AirBalanceCoordinationStatus.SKIPPED):
+            raise ValueError("skip_reason は skipped の tick にだけ付ける")
+        if (self.failure is not None) != (self.status is AirBalanceCoordinationStatus.FAILED):
+            raise ValueError("failure は failed の tick にだけ付ける")
+        if (self.candidate is None) != (self.output is None):
+            raise ValueError("candidate と output は一緒に記録する")
+        for state in (self.before_state, self.projected_state):
+            if state is AirBalanceTraceState.DISABLED:
+                raise ValueError("協調の評価の状態に disabled を使わない")
+        if self.status in {
+            AirBalanceCoordinationStatus.SKIPPED,
+            AirBalanceCoordinationStatus.FAILED,
+        }:
+            self._check_raw_baseline_was_used()
+        else:
+            self._check_coordinated()
+        self._check_bounds()
+        return self
+
+    def _check_off(self) -> None:
+        if (self.mode is AirBalanceCoordinationMode.OFF) != (
+            self.status is AirBalanceCoordinationStatus.OFF
+        ):
+            raise ValueError("status: off は mode: off の tick だけ")
+        if self.mode is not AirBalanceCoordinationMode.OFF:
+            return
+        values = (
+            self.skip_reason,
+            self.candidate,
+            self.proposed,
+            self.output,
+            self.counterfactual_output,
+            self.max_raise,
+            self.bounded_by_max_raise,
+            self.held,
+            self.projected_floors,
+            self.projected_floor_basis,
+            self.before_state,
+            self.before_ratio,
+            self.projected_state,
+            self.projected_ratio,
+            self.failure,
+        )
+        if any(value is not None for value in values) or self.reasons:
+            raise ValueError("mode: off の tick は協調の値を持たない")
+
+    def _check_projected_floors(self) -> None:
+        floors = self.projected_floors
+        basis = self.projected_floor_basis
+        if (floors is None) != (basis is None):
+            raise ValueError("projected_floors と projected_floor_basis は一緒に記録する")
+        if floors is None or basis is None:
+            return
+        for zone in Zone:
+            if basis.get(zone) is ProjectedFloorBasis.FORCED_MAX and floors.get(zone) != 1.0:
+                raise ValueError(f"{zone.value}: forced_max の下限の見込みは 1.0")
+            if basis.get(zone) is ProjectedFloorBasis.NONE and floors.get(zone) != 0.0:
+                raise ValueError(f"{zone.value}: 下限の無い zone の見込みは 0.0")
+
+    def _check_raw_baseline_was_used(self) -> None:
+        """``skipped`` / ``failed``: raw baseline を使い、保持を解いた（0078 §2.4 / §2.7）。"""
+        if self.output != self.candidate:
+            raise ValueError("skipped / failed の tick は raw baseline（candidate）を使う")
+        if self.counterfactual_output is not None:
+            raise ValueError("skipped / failed の tick に counterfactual_output を残さない")
+        # 「解いた」を null（不明）と区別するため、3 zone とも明示的な偽を要る
+        # （0078 §2.7 / 0088 §2.2）。
+        if self.held is None or any(self.held.get(zone) for zone in Zone):
+            raise ValueError("skipped / failed の tick は保持を解く（held はすべて偽）")
+        if self.status is AirBalanceCoordinationStatus.FAILED and self.candidate is None:
+            raise ValueError("failed は coordinate() を呼んだ tick だけ（raw baseline がある）")
+        # 協調の結果が無い tick（skipped / failed）に、結果の欄を残さない（決定記録 0088 §2.2）。
+        # 残せると、作られていない推定を offline の読み手が正しい記録として扱う。
+        if (
+            self.proposed is not None
+            or self.bounded_by_max_raise is not None
+            or self.before_state is not None
+            or self.before_ratio is not None
+            or self.projected_state is not None
+            or self.projected_ratio is not None
+            or self.reasons
+        ):
+            raise ValueError("skipped / failed の tick は協調の結果の欄を持たない")
+        if self.status is AirBalanceCoordinationStatus.SKIPPED:
+            # 0078 §2.3 の表の順: baseline_unavailable は raw baseline が無い tick、それより後の行は
+            # raw baseline がある tick でしか当たらない（決定記録 0088 §2.2）。
+            if (self.skip_reason is AirBalanceCoordinationSkipReason.BASELINE_UNAVAILABLE) != (
+                self.candidate is None
+            ) and self.skip_reason in _SKIP_REASONS_AFTER_SNAPSHOT:
+                raise ValueError(
+                    "baseline_unavailable の tick だけが raw baseline（candidate）を持たない"
+                )
+            if self.projected_floors is not None:
+                raise ValueError("skipped の tick は下限を見込まない（projected_floors は null）")
+        elif self.projected_floors is None:
+            raise ValueError("failed の tick は apply() へ渡した projected_floors を記録する")
+
+    def _check_coordinated(self) -> None:
+        """``shadow`` / ``not_needed`` / ``applied``: ``coordinate()`` を呼んだ tick。"""
+        if (
+            self.candidate is None
+            or self.output is None
+            or self.proposed is None
+            or self.counterfactual_output is None
+            or self.bounded_by_max_raise is None
+            or self.held is None
+            or self.projected_floors is None
+        ):
+            raise ValueError("協調した tick は candidate / proposed / output と保持込みの値を持つ")
+        # 協調の結果（AirBalanceCoordination）は before / projected の推定を必ず持つ。比は状態が
+        # unknown のときだけ無い（AirBalanceEstimate と同じ不変条件）。
+        for name, state, ratio in (
+            ("before", self.before_state, self.before_ratio),
+            ("projected", self.projected_state, self.projected_ratio),
+        ):
+            if state is None:
+                raise ValueError(f"協調した tick は {name}_state を持つ")
+            if (state is AirBalanceTraceState.UNKNOWN) != (ratio is None):
+                raise ValueError(f"{name}_ratio は {name}_state が unknown のときだけ無い")
+        shadow = self.status is AirBalanceCoordinationStatus.SHADOW
+        if shadow != (self.mode is AirBalanceCoordinationMode.SHADOW):
+            raise ValueError("mode: shadow で協調した tick は常に status: shadow")
+        if shadow:
+            if self.output != self.candidate:
+                raise ValueError("mode: shadow は Gate へ raw baseline を渡す")
+            return
+        if self.counterfactual_output != self.output:
+            raise ValueError("mode: apply では counterfactual_output と output が一致する")
+        raised = any(self.output.get(zone) > self.candidate.get(zone) for zone in Zone)
+        if raised != (self.status is AirBalanceCoordinationStatus.APPLIED):
+            raise ValueError("applied は少なくとも1 zone を上げた tick、not_needed は上げない tick")
+
+    def _check_bounds(self) -> None:
+        """上げるだけ・``max_raise`` 以内（同じ tick に記録した値で検算する。0078 §2.7）。"""
+        candidate = self.candidate
+        limits = self.max_raise
+        if candidate is None or limits is None:
+            return
+        for name, values in (
+            ("output", self.output),
+            ("counterfactual_output", self.counterfactual_output),
+        ):
+            if values is None:
+                continue
+            for zone in Zone:
+                value = values.get(zone)
+                base = candidate.get(zone)
+                # AirBalanceCoordinator と同じ形で比べる（c + max_raise を浮動小数で足した上限）。
+                if value < base:
+                    raise ValueError(f"{name}.{zone.value} が raw baseline を下回る")
+                if value > min(1.0, base + limits.get(zone)):
+                    raise ValueError(f"{name}.{zone.value} が記録した max_raise を超えている")
+
+
 EMERGENCY_FAULTS: frozenset[FaultCode] = frozenset(
     {
         FaultCode.ABSOLUTE_TEMPERATURE_LIMIT,
@@ -1827,7 +2162,7 @@ class AuthorityRecord(_Frozen):
 class ControlTick(_Frozen):
     """1 tick の判断の記録（decision trace。0028 §2.3）。#82 が保存し、#90 / #91 が読む。"""
 
-    schema_version: Literal[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13] = SCHEMA_VERSION
+    schema_version: Literal[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14] = SCHEMA_VERSION
     tick_id: int = Field(ge=0)
     ts_ms: int = Field(ge=0)
     """記録の時刻（壁時計。0028 §2.6）。"""
@@ -1875,6 +2210,23 @@ class ControlTick(_Frozen):
     """その tick の制御権の出どころ（v13。#92 / 決定記録 0072 §2.6）。保存済みの v1〜v12 では None。
 
     journal を持たない構成の v13 も ``None`` ではなく ``entry="static"`` の記録を持つ。
+    """
+    air_balance_coordination: AirBalanceCoordinationRecord | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
+    """Baseline への Air Balance の協調の記録（v14。#81 / 決定記録 0078 §2.7）。
+
+    保存済みの v1〜v13 では None。``mode: off`` の構成の v14 も ``None`` ではなく
+    ``AirBalanceCoordinationRecord.off()`` を持つ。
+    """
+    tach_unconfirmed_zones: tuple[Zone, ...] | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
+    """その tick の ``CriticalSafetyDecision.tach_unconfirmed_zones`` の写し（v14。0078 §2.3）。
+
+    zone 名の昇順・重複なし。保存済みの v1〜v13 では None、v14 では空の配列を含めて必須。
+    どの zone の未確認の tach が協調の ``skipped``（``tach_unconfirmed``）の原因かを
+    trace だけで読む。
     """
     faults: tuple[Fault, ...] = ()
     """いま有効な故障。
@@ -1928,6 +2280,7 @@ class ControlTick(_Frozen):
         self._check_air_balance()
         self._check_mode_command()
         self._check_authority()
+        self._check_air_balance_coordination()
         self._check_model_gate()
         self._check_registry_binds_model()
         self._check_shadow()
@@ -2105,6 +2458,155 @@ class ControlTick(_Frozen):
         if stage_rank(self.state.authority_stage) > stage_rank(record.ceiling()):
             # 実効 stage は journal・設定・この process の上限の最小を超えない（0057 §2.2）
             raise ValueError("authority_stage が記録した上限を超えている")
+
+    def _check_air_balance_coordination(self) -> None:
+        """v14 の協調の記録が、同じ tick の Gate・requested・Safety の写しと同じ事実を指すか。"""
+        record = self.air_balance_coordination
+        reason = self.state.fallback_reason
+        failed_reason = reason is not None and reason.code == AIR_BALANCE_COORDINATION_FAILED
+        if record is None or self.tach_unconfirmed_zones is None:
+            if self.schema_version >= 14:
+                # 版が中身を表さない記録を作らない（0060 §2.4）。
+                raise ValueError(
+                    "v14 の ControlTick には air_balance_coordination と "
+                    "tach_unconfirmed_zones が要る"
+                )
+            if (
+                record is not None
+                or self.tach_unconfirmed_zones is not None
+                or failed_reason
+                or any(
+                    self.zones.get(zone).controller_reason.code in AIR_BALANCE_CONTROLLER_REASONS
+                    for zone in Zone
+                )
+            ):
+                raise ValueError(
+                    "Air Balance の協調を記録する ControlTick は schema version 14 にする"
+                )
+            return
+        if self.schema_version < 14:
+            raise ValueError("Air Balance の協調を記録する ControlTick は schema version 14 にする")
+        self._check_tach_unconfirmed(record)
+        if record.bypassed_gate:
+            self._check_bypassed_gate(record)
+        elif failed_reason:
+            raise ValueError(
+                "air_balance_coordination_failed は mode: apply の協調が failed の tick だけ"
+                "（0085 §2.3）"
+            )
+        else:
+            self._check_requested_covers_output(record)
+            self._check_coordination_reasons(record)
+
+    def _check_tach_unconfirmed(self, record: AirBalanceCoordinationRecord) -> None:
+        zones = self.tach_unconfirmed_zones
+        assert zones is not None
+        if list(zones) != sorted(set(zones), key=lambda zone: zone.value):
+            raise ValueError("tach_unconfirmed_zones は zone 名の昇順・重複なしで記録する")
+        tach_reason = record.skip_reason is AirBalanceCoordinationSkipReason.TACH_UNCONFIRMED
+        if tach_reason and not zones:
+            raise ValueError("skip_reason: tach_unconfirmed の tick には未確認の zone がある")
+        if not zones or record.mode is AirBalanceCoordinationMode.OFF:
+            return
+        if record.status is not AirBalanceCoordinationStatus.SKIPPED or not (
+            tach_reason or record.skip_reason in SKIP_REASONS_BEFORE_TACH
+        ):
+            # tach が返らない Fan の風量で比を採点しない（決定記録 0078 §2.3）。
+            raise ValueError("tach が未確認の zone がある tick は協調を skipped にする")
+
+    def _check_bypassed_gate(self, record: AirBalanceCoordinationRecord) -> None:
+        """``mode: apply`` の協調の失敗で Gate を迂回した tick（決定記録 0085 §2.2 / §2.3）。"""
+        state = self.state
+        if self.model_gate is not None or self.shadow is not None:
+            raise ValueError("Gate を迂回した tick に model_gate / shadow を残さない（0085 §2.2）")
+        if state.active_controller is not ControllerKind.FALLBACK:
+            raise ValueError("Gate を迂回した tick の active_controller は fallback")
+        candidate = record.candidate
+        assert candidate is not None  # failed は raw baseline がある tick だけ（record の検証）
+        for zone in Zone:
+            zone_record = self.zones.get(zone)
+            if zone_record.demand.requested != candidate.get(zone):
+                raise ValueError(f"{zone.value}: Gate を迂回した tick の requested は raw baseline")
+            code = zone_record.controller_reason.code
+            if code == "fallback_transition_floor" or code in AIR_BALANCE_CONTROLLER_REASONS:
+                raise ValueError(f"{zone.value}: Gate を迂回した tick は raw baseline の理由のまま")
+        ml_could_run = (
+            state.operating_mode is OperatingMode.AUTO
+            and state.authority_stage is not AuthorityStage.SHADOW
+            and state.safety_state is SafetyState.NORMAL
+        )
+        reason = state.fallback_reason
+        if ml_could_run:
+            if reason is None or reason.code != AIR_BALANCE_COORDINATION_FAILED:
+                raise ValueError(
+                    "ML を使えたはずの迂回した tick の fallback_reason は "
+                    "air_balance_coordination_failed"
+                )
+        elif reason is not None:
+            raise ValueError("ML を使えない迂回した tick に fallback_reason を付けない")
+
+    def _check_requested_covers_output(self, record: AirBalanceCoordinationRecord) -> None:
+        """Gate が Fallback を選んだ tick の requested は ``output`` 以上（決定記録 0078 §2.7）。
+
+        等しくないのは Gate の ``fallback_transition_floor`` の zone だけ。協調が値を決めた zone
+        （``output > candidate`` で requested がそのまま ``output``）は協調の理由を持つ。
+        """
+        output = record.output
+        candidate = record.candidate
+        if (
+            output is None
+            or candidate is None
+            or self.state.active_controller is not ControllerKind.FALLBACK
+        ):
+            return
+        for zone in Zone:
+            zone_record = self.zones.get(zone)
+            requested = zone_record.demand.requested
+            code = zone_record.controller_reason.code
+            if requested < output.get(zone):
+                raise ValueError(f"{zone.value}: Fallback の requested が協調の output を下回る")
+            if requested != output.get(zone) and code != "fallback_transition_floor":
+                raise ValueError(
+                    f"{zone.value}: requested と output が違うのは fallback_transition_floor だけ"
+                )
+
+    def _check_coordination_reasons(self, record: AirBalanceCoordinationRecord) -> None:
+        """協調の理由を、協調が値を決めた zone と保持に束縛する（決定記録 0078 §2.7）。
+
+        協調が値を決めた zone は、Gate が Fallback を選び、requested がそのまま ``output`` で、
+        ``output > candidate`` の zone だけである（``fallback_transition_floor`` の zone を除く）。
+        その zone の理由は、保持（``held``。``h_z > r_z``）なら ``air_balance_release_hold``、
+        そうでなければ zone 固有の理由。それ以外の zone に協調の理由を残さない
+        （上げていない zone や別の zone の理由を、協調が決めた値と読ませない）。
+        """
+        output = record.output
+        candidate = record.candidate
+        fallback = self.state.active_controller is ControllerKind.FALLBACK
+        for zone in Zone:
+            zone_record = self.zones.get(zone)
+            code = zone_record.controller_reason.code
+            raised = (
+                fallback
+                and output is not None
+                and candidate is not None
+                and zone_record.demand.requested == output.get(zone)
+                and output.get(zone) > candidate.get(zone)
+            )
+            if not raised:
+                if code in AIR_BALANCE_CONTROLLER_REASONS:
+                    raise ValueError(
+                        f"{zone.value}: 協調が上げていない zone に協調の理由を残さない"
+                    )
+                continue
+            if record.held is None:
+                raise ValueError(f"{zone.value}: 協調が上げた zone には held の記録が要る")
+            expected = (
+                AIR_BALANCE_RELEASE_HOLD_REASON
+                if record.held.get(zone)
+                else AIR_BALANCE_ZONE_REASONS[zone]
+            )
+            if code != expected:
+                raise ValueError(f"{zone.value}: 協調が上げた zone の理由は {expected}")
 
     def _check_model_gate(self) -> None:
         """v5 の ``model_gate`` が ControlState と同じ判断を指しているか。"""

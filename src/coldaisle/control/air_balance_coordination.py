@@ -1,9 +1,10 @@
 """Baseline（Fallback）の requested に Air Balance の協調を掛ける部品（#81 / 決定記録 0078）。
 
-**まだ loop へ配線しない**（0078 §2.11 の段 2）。ここにあるのは、raw baseline と
-`coordinate()` の提案から、上げるだけ・zone ごとの上限つき・下げる前の保持つきの値を作る
-純粋な計算と、その検証だけである。loop の中の位置（Fallback の後・Gate の前・合成の前）、
-掛ける条件（0078 §2.3）、失敗の翻訳（0078 §2.6 / 決定記録 0085）は段 3 で配線する。
+ここにあるのは、raw baseline と `coordinate()` の提案から、上げるだけ・zone ごとの上限つき・
+下げる前の保持つきの値を作る計算と、その検証、合成の下限の見込み（``projected_floors``）を
+組み立てる純粋関数だけである。loop の中の位置（Fallback の後・Gate の前・合成の前）、
+掛ける条件（0078 §2.3）、失敗の翻訳（0078 §2.6 / 決定記録 0085）は ``ControlLoop`` が持つ
+（0078 §2.11 の段 3）。
 
 - **上げるだけ。** どの zone も raw baseline（``candidate``）を下回らない。破れたら例外にする
 - **上限は保持中も守る。** 保持するのは値ではなく、tick ごとの上限つきの**引き上げ幅**である
@@ -30,7 +31,14 @@ from coldaisle.control.config import (
     AirBalanceCoordinationMode,
     FanHardwareConfig,
 )
-from coldaisle.control.schema import Demand, PerZone, Zone
+from coldaisle.control.schema import (
+    Demand,
+    GuardZoneOutput,
+    PerZone,
+    ProjectedFloorBasis,
+    SafetyZoneOutput,
+    Zone,
+)
 
 
 class AirBalanceCoordinationError(RuntimeError):
@@ -105,6 +113,61 @@ trace だけで上限を検算するために記録する（0078 §2.7）。
         return self
 
 
+class ProjectedFloors(_Frozen):
+    """合成が zone ごとに requested へ掛けると見込まれる下限 ``f_z`` と、それを決めた下限。"""
+
+    floors: PerZone[Demand]
+    basis: PerZone[ProjectedFloorBasis]
+
+
+def project_floors(
+    *,
+    safety: PerZone[SafetyZoneOutput],
+    guard: PerZone[GuardZoneOutput],
+    ramp: PerZone[float | None],
+) -> ProjectedFloors:
+    """合成（0028 §2.4）が requested に掛ける下限の見込み（決定記録 0078 §2.2 / §2.4）。
+
+    ```text
+    f_z = 1.0                                              … safety.z.forced_max
+        = max(guard.z.floor, safety.z.floor, ramp_down の下限)  … それ以外（どれも無ければ 0.0）
+    ```
+
+    Front / Rear / Top に同じ式を掛ける。Guard の ceiling は下限の後には掛からないので入れない。
+    **裁定を作り直さない・書き換えない**（発行済みの値を読むだけ）。``ramp`` は
+    ``DemandComposer.ramp_floor()`` が合成と同じ関数で求めた値を渡す。basis は同値なら
+    ``forced_max`` → ``safety_floor`` → ``guard_floor`` → ``ramp_down`` の順で1つ選ぶ（0078 §2.7）。
+    """
+    floors: dict[Zone, float] = {}
+    basis: dict[Zone, ProjectedFloorBasis] = {}
+    for zone in Zone:
+        if safety.get(zone).forced_max:
+            floors[zone] = 1.0
+            basis[zone] = ProjectedFloorBasis.FORCED_MAX
+            continue
+        candidates: tuple[tuple[ProjectedFloorBasis, float | None], ...] = (
+            (ProjectedFloorBasis.SAFETY_FLOOR, safety.get(zone).floor),
+            (ProjectedFloorBasis.GUARD_FLOOR, guard.get(zone).floor),
+            (ProjectedFloorBasis.RAMP_DOWN, ramp.get(zone)),
+        )
+        present = [(name, value) for name, value in candidates if value is not None]
+        if not present:
+            floors[zone] = 0.0
+            basis[zone] = ProjectedFloorBasis.NONE
+            continue
+        value = max(item for _, item in present)
+        floors[zone] = value
+        basis[zone] = next(name for name, item in present if item == value)
+    return ProjectedFloors(
+        floors=PerZone[Demand](
+            front=floors[Zone.FRONT], rear=floors[Zone.REAR], top=floors[Zone.TOP]
+        ),
+        basis=PerZone[ProjectedFloorBasis](
+            front=basis[Zone.FRONT], rear=basis[Zone.REAR], top=basis[Zone.TOP]
+        ),
+    )
+
+
 class AirBalanceCoordinator:
     """raw baseline に協調を掛ける（0078 §2.4）。保持の窓だけを状態として持つ。
 
@@ -172,11 +235,9 @@ class AirBalanceCoordinator:
     ) -> CoordinatorResult:
         """raw baseline ``candidate`` に協調を掛けた結果を返す。
 
-        ``projected_floors`` は合成が requested に掛ける下限の見込み（0078 §2.2）。
-        **段 2 では Top だけを ``coordinate()`` へ渡す**（``projected_top_floor``）。
-        いまの ``coordinate()`` は Front / Rear の下限を受け取らず、zone ごとの
-        ``projected_floors`` へ広げるのは段 3 の PR（b）である（0078 §2.11）。Front / Rear の値は
-        結果に記録するだけで、風量の見積もりにはまだ使わない。
+        ``projected_floors`` は合成が requested に掛ける zone ごとの下限の見込み（0078 §2.2。
+        ``project_floors()`` で作る）。``coordinate()`` は風量を zone ごとに
+        ``max(requested_z, projected_floors.z)`` の demand で見積もる。
 
         **例外を握りつぶさない。** ``coordinate()`` の例外も、出力の不変条件の破れ
         （``AirBalanceCoordinationError``）も、保持を解いてから呼び出し側へ投げる。
@@ -207,12 +268,18 @@ class AirBalanceCoordinator:
         self._last_mono_ms = now_mono_ms
 
         stable = self._fan_hardware.stable_demands(candidate)
-        coordination = self._model.coordinate(
-            stable, thermal, projected_top_floor=projected_floors.top
-        )
+        coordination = self._model.coordinate(stable, thermal, projected_floors=projected_floors)
         if coordination.candidate != stable:
             raise AirBalanceCoordinationError(
                 "coordinate() が渡した demand と違う candidate を返した"
+            )
+        if coordination.projected_floors != projected_floors:
+            # 風量の見積もりは zone ごとに max(requested_z, projected_floors.z) で行う
+            # （0078 §2.2）。
+            # 差し替えた model が下限を落とした（None を含む）なら、記録した下限と評価が食い違うので
+            # candidate と同じく協調の失敗にする。
+            raise AirBalanceCoordinationError(
+                "coordinate() が渡した projected_floors と違う下限で見積もった"
             )
         max_raise = self.max_raise()
 

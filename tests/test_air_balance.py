@@ -23,6 +23,11 @@ from coldaisle.control.air_balance import (
 TEST_CONFIG_FILENAME = "air-balance.yaml"
 
 
+def top_floor(value: float) -> PerZone[float]:
+    """Top だけに合成の下限を見込む ``projected_floors``（Front / Rear は下限なし）。"""
+    return PerZone[float](front=0.0, rear=0.0, top=value)
+
+
 def document() -> dict[str, Any]:
     """物理 CFM を含まない、Mock 用の未校正 EFU characterization。"""
     return {
@@ -253,12 +258,12 @@ def test_top_proposal_is_case_aux_only_and_cannot_lower_cpu_floor(tmp_path: Path
     assert max(proposal.requested.top, cpu_cooling_floor) == cpu_cooling_floor
 
 
-def test_projected_top_floor_counts_toward_exhaust_and_triggers_makeup_air(
+def test_a_top_floor_counts_toward_exhaust_and_triggers_makeup_air(
     tmp_path: Path,
 ) -> None:
     candidate = PerZone[float](front=0.5, rear=0.5, top=0.1)
     without_floor = model(tmp_path).coordinate(candidate, cool())
-    with_floor = model(tmp_path).coordinate(candidate, cool(), projected_top_floor=0.6)
+    with_floor = model(tmp_path).coordinate(candidate, cool(), projected_floors=top_floor(0.6))
 
     assert without_floor.before.state is AirBalanceState.BALANCED
     assert without_floor.requested == candidate
@@ -270,25 +275,25 @@ def test_projected_top_floor_counts_toward_exhaust_and_triggers_makeup_air(
     assert [reason.code for reason in with_floor.reasons] == ["front_makeup_air"]
     # floor は風量の見積もりにだけ使い、requested.top（case aux）へは入れない。
     assert with_floor.requested.top == candidate.top
-    assert with_floor.projected_top_floor == 0.6
+    assert with_floor.projected_floors == top_floor(0.6)
     assert with_floor.top_request_role == "case_aux_exhaust"
 
 
-def test_projected_top_floor_below_candidate_top_changes_nothing(tmp_path: Path) -> None:
+def test_a_top_floor_below_candidate_top_changes_nothing(tmp_path: Path) -> None:
     candidate = PerZone[float](front=0.5, rear=0.5, top=0.5)
     baseline = model(tmp_path).coordinate(candidate, cool())
-    floored = model(tmp_path).coordinate(candidate, cool(), projected_top_floor=0.2)
+    floored = model(tmp_path).coordinate(candidate, cool(), projected_floors=top_floor(0.2))
 
     assert floored.requested == baseline.requested
     assert floored.before == baseline.before
     assert floored.projected == baseline.projected
 
 
-def test_projected_top_floor_airflow_covers_top_case_aux_shortfall(tmp_path: Path) -> None:
+def test_a_top_floor_airflow_covers_top_case_aux_shortfall(tmp_path: Path) -> None:
     thermal = ThermalInputs(case_delta_c=15.0)
     candidate = PerZone[float](front=1.0, rear=0.0, top=0.0)
     without_floor = model(tmp_path).coordinate(candidate, thermal)
-    with_floor = model(tmp_path).coordinate(candidate, thermal, projected_top_floor=0.8)
+    with_floor = model(tmp_path).coordinate(candidate, thermal, projected_floors=top_floor(0.8))
 
     assert without_floor.requested.top > 0.0
     assert without_floor.requested.top < 0.8
@@ -300,14 +305,68 @@ def test_projected_top_floor_airflow_covers_top_case_aux_shortfall(tmp_path: Pat
     assert [reason.code for reason in with_floor.reasons] == ["rear_thermal_exhaust"]
 
 
+@pytest.mark.parametrize("zone", ["front", "rear", "top"])
 @pytest.mark.parametrize("floor", [-0.1, 1.1, float("nan")])
-def test_projected_top_floor_must_be_a_demand(tmp_path: Path, floor: float) -> None:
-    with pytest.raises(ValueError, match="projected_top_floor"):
+def test_projected_floors_must_be_demands(tmp_path: Path, zone: str, floor: float) -> None:
+    floors = {"front": 0.0, "rear": 0.0, "top": 0.0} | {zone: floor}
+    with pytest.raises(ValueError, match="projected_floors"):
         model(tmp_path).coordinate(
             PerZone[float](front=0.5, rear=0.5, top=0.5),
             cool(),
-            projected_top_floor=floor,
+            projected_floors=PerZone[float](**floors),
         )
+
+
+def test_a_high_front_floor_calls_for_exhaust_with_heat(tmp_path: Path) -> None:
+    """Front が下限で raw より高く回る tick は、その風量で比を採点する（決定記録 0078 §2.2）。
+
+    requested だけでは釣り合っていても、Front の下限込みでは Intake 過多になり、
+    熱制約があれば Rear の排気を見込む。
+    """
+    thermal = ThermalInputs(case_delta_c=15.0)
+    candidate = PerZone[float](front=0.5, rear=0.5, top=0.1)
+    without_floor = model(tmp_path).coordinate(candidate, thermal)
+    with_floor = model(tmp_path).coordinate(
+        candidate, thermal, projected_floors=PerZone[float](front=1.0, rear=0.0, top=0.0)
+    )
+
+    assert without_floor.requested == candidate
+    assert with_floor.before.state is AirBalanceState.THERMALLY_LIMITED
+    assert with_floor.before.q_front == pytest.approx(5.0)
+    assert with_floor.requested.rear > candidate.rear
+    assert with_floor.requested.front == candidate.front
+    assert with_floor.reasons[0].code == "rear_thermal_exhaust"
+
+
+def test_a_high_rear_floor_calls_for_front_makeup_air(tmp_path: Path) -> None:
+    """Rear が下限で raw より高い tick に Front make-up air を見込む（決定記録 0078 §2.2）。"""
+    candidate = PerZone[float](front=0.5, rear=0.3, top=0.3)
+    without_floor = model(tmp_path).coordinate(candidate, cool())
+    with_floor = model(tmp_path).coordinate(
+        candidate, cool(), projected_floors=PerZone[float](front=0.0, rear=1.0, top=0.0)
+    )
+
+    assert without_floor.requested.front == candidate.front
+    assert with_floor.before.state is AirBalanceState.EXHAUST_HEAVY
+    assert with_floor.requested.front > candidate.front
+    assert with_floor.requested.rear == candidate.rear
+    assert with_floor.projected.balance_ratio == pytest.approx(0.9)
+
+
+def test_a_zone_whose_floor_already_gives_the_target_is_not_raised(tmp_path: Path) -> None:
+    """下限が既に目標の風量を出している zone は引き上げない。floor を requested に写さない。"""
+    candidate = PerZone[float](front=0.5, rear=0.5, top=0.5)
+    exhaust_heavy = PerZone[float](front=0.0, rear=1.0, top=0.0)
+    target = model(tmp_path).coordinate(candidate, cool(), projected_floors=exhaust_heavy)
+    assert target.requested.front > candidate.front
+    covered = model(tmp_path).coordinate(
+        candidate,
+        cool(),
+        projected_floors=PerZone[float](front=1.0, rear=1.0, top=0.0),
+    )
+
+    assert covered.requested == candidate
+    assert covered.reasons == ()
 
 
 def test_intake_heavy_without_thermal_accumulation_does_not_raise_exhaust(tmp_path: Path) -> None:

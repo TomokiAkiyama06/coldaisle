@@ -86,6 +86,7 @@ from test_control_schema import (
     AIR_BALANCE_RECORD,
     AUTHORITY_RECORD,
     CONTROL_TICK_RUNTIME,
+    COORDINATION_RECORD,
     MODE_COMMAND_RECORD,
     REGISTRY_PROVENANCE,
     SAFETY_PROVENANCE,
@@ -863,6 +864,8 @@ def test_v5_trace_requires_consistent_model_gate_for_learned_ticks() -> None:
     payload.pop("air_balance", None)
     payload.pop("mode_command", None)
     payload.pop("authority", None)
+    payload.pop("air_balance_coordination", None)
+    payload.pop("tach_unconfirmed_zones", None)
     with pytest.raises(ValidationError, match="schema version 5"):
         ControlTick.model_validate_json(json.dumps(payload))
 
@@ -939,6 +942,8 @@ def _trace_tick(selection) -> ControlTick:
         air_balance=AIR_BALANCE_RECORD,
         mode_command=MODE_COMMAND_RECORD,
         authority=AUTHORITY_RECORD,
+        air_balance_coordination=COORDINATION_RECORD,
+        tach_unconfirmed_zones=(),
     )
 
 

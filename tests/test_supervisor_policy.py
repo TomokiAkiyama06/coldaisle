@@ -45,6 +45,7 @@ from test_control_schema import (
     AIR_BALANCE_RECORD,
     AUTHORITY_RECORD,
     CONTROL_TICK_RUNTIME,
+    COORDINATION_RECORD,
     MODE_COMMAND_RECORD,
     REGISTRY_PROVENANCE,
     SAFETY_PROVENANCE,
@@ -629,6 +630,8 @@ def control_tick(decision: SupervisorDecision, current: SupervisorInput) -> Cont
         air_balance=AIR_BALANCE_RECORD,
         mode_command=MODE_COMMAND_RECORD,
         authority=AUTHORITY_RECORD,
+        air_balance_coordination=COORDINATION_RECORD,
+        tach_unconfirmed_zones=(),
     )
 
 
@@ -672,6 +675,8 @@ def test_decision_can_be_embedded_in_v3_control_trace_with_shadow_output() -> No
         air_balance=AIR_BALANCE_RECORD,
         mode_command=MODE_COMMAND_RECORD,
         authority=AUTHORITY_RECORD,
+        air_balance_coordination=COORDINATION_RECORD,
+        tach_unconfirmed_zones=(),
     )
 
     # v3 で Supervisor decision を追加した。以後の版（v4: #78 の fault code）でもそのまま載る。

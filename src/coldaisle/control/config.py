@@ -9,7 +9,6 @@
 from __future__ import annotations
 
 import re
-from enum import StrEnum
 from hashlib import sha256
 from pathlib import Path
 from typing import Annotated, Any, Literal, Self, cast
@@ -18,6 +17,10 @@ import yaml
 from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, field_validator, model_validator
 
 from coldaisle.control.air_balance import AirBalanceConfig
+
+# 協調の mode の型は trace と同じ値を指すよう schema に1つだけ置き、
+# ここから再公開する（決定記録 0078 §2.7）。
+from coldaisle.control.schema import AirBalanceCoordinationMode as AirBalanceCoordinationMode
 from coldaisle.control.schema import (
     AuthorityStage,
     Demand,
@@ -997,14 +1000,6 @@ class ShadowConfig(_ConfigModel):
             # demand の全域を許すと、どんな適用値も「plan どおり」になり判定が意味を失う。
             raise ValueError("shadow.applied_demand_tolerance は 1.0 未満にする")
         return self
-
-
-class AirBalanceCoordinationMode(StrEnum):
-    """Air Balance の協調を Baseline の requested に掛けるか（決定記録 0078 §2.1）。"""
-
-    OFF = "off"
-    SHADOW = "shadow"
-    APPLY = "apply"
 
 
 def _yaml_coordination_mode(value: object) -> object:
