@@ -50,6 +50,8 @@ uv run coldaisle-fand --authority-root var/authority  # Authority Stage の jour
 uv run coldaisle-control status     # coldaisle-fand の運転モードを読む（管理ソケット。#74 / 決定記録 0072。**人が使う**）
 uv run coldaisle-control max --reason "負荷試験の前に全開"  # MAX（期限なし）。manual は --front/--rear/--top と --lease が必須
 uv run coldaisle-control rollback-authority --reason "挙動を見直す"  # Authority を Baseline へ（lower-authority --to-stage も。**上げる操作は無い**。#92）
+uv run coldaisle-authority raise --authority-root <dir> --approval <承認.json> --report <報告.json> --config-dir var/control-config --registry-root var/model-registry  # Authority を1段上げる。**人が自分の uid で実行する唯一の昇格の入口**。承認者は実行した uid（`--approver` は無い。#92 / 決定記録 0086）
+uv run coldaisle-authority rollback --authority-root <dir> --reason "fand 停止中に戻す"  # fand が止まっているときの rollback（uid で拒まない）
 COLDAISLE_DB=var/coldaisle.db uv run uvicorn coldaisle.api:app --host 127.0.0.1 --port 8000
 COLDAISLE_DB=var/coldaisle.db uv run uvicorn coldaisle.server:app --port 8000  # + AI ツールの窓口
 # エアフロー画面: http://127.0.0.1:8000/airflow.html（制御の状態は /api/v1/control/latest の trace から。
@@ -250,6 +252,7 @@ src/coldaisle/
   event_entry/ # 合成の起点: 書き込み専用の Unix ソケット入口。AI 層・API から import しない。#67
   control_admin/ # 合成の起点: coldaisle-fand の管理ソケット（運転モードと Authority の降格。昇格は受けない）。AI 層・API・eventd・control から import しない。#74 / #92 / 決定記録 0072
   local_socket.py # レイヤ横断: Unix ソケット入口に共通の門（SO_PEERCRED・権限・起動時の検査）。0045 / 0072 §2.5
+  authority_cli.py # 合成の起点: `coldaisle-authority raise` / `rollback`。`raise_stage()` を呼ぶ唯一の場所。**どこからも import しない**。#92 / 決定記録 0086
   rollup_job.py # 合成の起点: `coldaisle-rollup` の入口（周期メトリクスを Store へ渡す）。#65
   control_daemon.py # 合成の起点: Fan制御デーモン。**hwmonへ書くのはこのプロセスだけ**。#74
   store/      # L1: SQLite、ロールアップ、CSVエクスポート

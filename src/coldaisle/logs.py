@@ -22,7 +22,15 @@ FIELDS_KEY = "fields"
 
 
 class JsonLinesFormatter(logging.Formatter):
-    """1レコードを1行の JSON にする。"""
+    """1レコードを1行の JSON にする。
+
+    ``ensure_ascii`` を真にすると、非 ASCII を ``\\uXXXX`` へ逃がす（JSON としては同じ値）。
+    出力先の encoding が日本語を表せなくても、行が欠けない。
+    """
+
+    def __init__(self, *, ensure_ascii: bool = False) -> None:
+        super().__init__()
+        self._ensure_ascii = ensure_ascii
 
     def format(self, record: logging.LogRecord) -> str:
         payload: dict[str, Any] = {
@@ -38,17 +46,23 @@ class JsonLinesFormatter(logging.Formatter):
         if record.exc_info:
             # 例外は握りつぶさない。取り込みループだけは継続するが、痕跡は残す
             payload["error"] = self.formatException(record.exc_info)
-        return json.dumps(payload, ensure_ascii=False, default=str)
+        return json.dumps(payload, ensure_ascii=self._ensure_ascii, default=str)
 
 
-def configure(level: str = "INFO", stream: TextIO | None = None) -> None:
+def configure(
+    level: str = "INFO", stream: TextIO | None = None, *, ensure_ascii: bool = False
+) -> None:
     """ルートロガーを JSON Lines へ差し替える。
 
     既存のハンドラを置き換える。二重に出ると、行数を数えて欠測を推定する
     運用（NFR-02）が狂う。
+
+    ``ensure_ascii`` は、行が欠けると困る監査の記録（`coldaisle-authority`）のためにある。
+    `StreamHandler` は encode の失敗を内部で握って traceback を出すだけなので、
+    `PYTHONIOENCODING=ascii` の stderr では日本語の行が**黙って欠ける**。
     """
     handler = logging.StreamHandler(sys.stderr if stream is None else stream)
-    handler.setFormatter(JsonLinesFormatter())
+    handler.setFormatter(JsonLinesFormatter(ensure_ascii=ensure_ascii))
     root = logging.getLogger()
     root.handlers = [handler]
     root.setLevel(level.upper())

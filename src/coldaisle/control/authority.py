@@ -43,7 +43,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_valida
 
 from coldaisle import logs
 from coldaisle.clock import Clock, WallClock
-from coldaisle.control.config import ControlConfig, FanPolicyConfig
+from coldaisle.control.config import ConfigSources, ControlConfig, FanPolicyConfig
 from coldaisle.control.evaluation.model import (
     AppliedArm,
     CounterfactualArm,
@@ -98,6 +98,7 @@ __all__ = [
     "AuthorityEvent",
     "AuthorityEvidenceError",
     "AuthorityJournal",
+    "AuthorityNotDurableError",
     "AuthorityRuntime",
     "AuthorityStage",
     "AuthorityStageSource",
@@ -179,6 +180,9 @@ _ACTOR_MAX_CHARS = 120
 _REASON_MAX_CHARS = 1000
 """journal の event の actor / reason の上限。資源の境界であり、調整値ではない。"""
 
+_SHA256_HEX = re.compile(r"^[0-9a-f]{64}$")
+"""loaded artifact の形（`Sha256Hex` と同じ）。"""
+
 _LOGGER = logging.getLogger("coldaisle.control")
 
 
@@ -200,6 +204,34 @@ class AuthorityStateError(AuthorityError):
 
 class AuthorityStoreError(AuthorityError):
     """journal を安全に読み書きできない（path・権限・I/O）。"""
+
+
+class AuthorityNotDurableError(AuthorityStoreError):
+    """journal は置き換えた（**変更は見えている**）が、ディレクトリの `fsync` に失敗した。
+
+    「書けなかった」とは違う。他の process は新しい journal を読むが、電源断で失われうる。
+    呼び出し側が「変更しなかった」と伝えないよう、書いた journal を持たせる（codex P1）。
+    """
+
+    def __init__(
+        self,
+        journal: AuthorityJournal,
+        *,
+        appended: AuthorityEvent | None,
+        message: str = (
+            "authority journal は置き換えたが、ディレクトリの fsync に失敗した"
+            "（変更は見えているが、電源断で失われうる）"
+        ),
+    ) -> None:
+        super().__init__(message)
+        self.journal = journal
+        self.appended = appended
+        """**この呼び出しが**追記した event。None は「既に目標の stage で、追記しなかった」
+        （前の操作の置き換えを永続化し直そうとして、ディレクトリの fsync に失敗した）。"""
+
+
+class _DirectorySyncError(Exception):
+    """`os.replace()` の**後**のディレクトリの `fsync` の失敗（`_append` が包み直す）。"""
 
 
 class ApproverRejection(StrEnum):
@@ -834,6 +866,24 @@ class AuthorityStore:
             inode=status.st_ino, size=status.st_size, mtime_ns=status.st_mtime_ns
         )
 
+    def sync_directory(self) -> None:
+        """authority のディレクトリを `fsync` し直す（**flock を取らない**）。
+
+        `AuthorityNotDurableError` の後、置き換えた journal のディレクトリ項目を永続化し直すために
+        制御ループが呼ぶ。journal が既に新しい内容でも `lower_stage()` は何も書かず `fsync` も
+        しないので、「書き直せた」ことを永続化の確認にできない（codex P1。PR #216）。
+        ディレクトリの `fsync` は lock と無関係に、その時点の項目をまとめて永続化する。
+        """
+        with self._open_root(create=False) as root_fd:
+            if root_fd is None:
+                raise AuthorityStoreError("authority のディレクトリが無い（fsync し直せない）")
+            try:
+                os.fsync(root_fd)
+            except OSError as error:
+                raise AuthorityStoreError(
+                    "authority のディレクトリの fsync に失敗した（降格はまだ永続化していない）"
+                ) from error
+
     def raise_stage(
         self,
         *,
@@ -957,13 +1007,37 @@ class AuthorityStore:
 
         すでに `to_stage` 以下なら何もせず、いまの journal をそのまま返す。
         """
+        journal, _ = self._lower(
+            to_stage=to_stage, actor=actor, reason=reason, trigger=trigger, cause=cause
+        )
+        return journal
+
+    def _lower(
+        self,
+        *,
+        to_stage: AuthorityStage,
+        actor: str,
+        reason: str,
+        trigger: AuthorityTrigger,
+        cause: AutomaticCause | None,
+    ) -> tuple[AuthorityJournal, AuthorityEvent | None]:
+        """下げた journal と、**この呼び出しが追記した** event（何もしなければ None）。
+
+        追記したかどうかは lock の中で決まる。lock の外で読んだ journal と比べると、
+        間に別の書き手が下げた変更を自分の操作として記録してしまう。
+        """
         now_ms = self._clock.now_ms()
         if now_ms < 0:
             raise AuthorityStoreError("authority の時刻は負にできない")
         with self._exclusive_lock() as root_fd:
             journal = self._read(root_fd)
             if stage_rank(to_stage) >= stage_rank(journal.stage):
-                return journal
+                # **何も書かない分岐でも、「永続化している」と言う前にディレクトリを fsync し直す**
+                # （codex P1。PR #216）。前の降格（rollback）が置き換えの後の fsync に失敗して
+                # いれば、読めた journal は既に下がっているが、電源断で置き換えが失われうる。
+                # やり直した操作が fsync せずに成功を返すと、その置き換えを誰も永続化しない。
+                self._resync_directory(root_fd, journal)
+                return journal, None
             event = AuthorityEvent(
                 revision=journal.revision + 1,
                 occurred_at_ms=max(now_ms, self._last_ms(journal)),
@@ -975,7 +1049,22 @@ class AuthorityStore:
                 reason=reason,
                 cause=cause,
             )
-            return self._append(root_fd, journal, event)
+            return self._append(root_fd, journal, event), event
+
+    def rollback_to_baseline_with_outcome(
+        self, *, actor: str, reason: str
+    ) -> tuple[AuthorityJournal, AuthorityEvent | None]:
+        """`rollback_to_baseline()` と同じ。**この呼び出しが追記した event も返す**。
+
+        人の CLI が「自分が戻したのか、既に戻っていたのか」を監査のために正しく言うため。
+        """
+        return self._lower(
+            to_stage=BASELINE_STAGE,
+            actor=actor,
+            reason=reason,
+            trigger=AuthorityTrigger.HUMAN,
+            cause=None,
+        )
 
     def rollback_to_baseline(self, *, actor: str, reason: str) -> AuthorityJournal:
         """1手で Baseline（Shadow）へ戻す。**承認も段階も経由しない。**"""
@@ -985,6 +1074,18 @@ class AuthorityStore:
             reason=reason,
             trigger=AuthorityTrigger.HUMAN,
         )
+
+    def approver_credentials(self) -> ProcessCredentials:
+        """承認者になれる実行者なら、その uid と euid を返す。なれなければ拒む（0086 §2.3）。
+
+        CLI が承認を組み立てる**前に**呼ぶ。root の `uid.0` は承認の型が受け付けないので、
+        組み立ててから `raise_stage()` に渡すと、拒否の理由が「承認の形の誤り」になってしまう。
+        **判断は store が持つ**（CLI は結果を写すだけ）。`raise_stage()` は同じ確認を改めて行う。
+        所有者の確認はディレクトリを開く `raise_stage()` の中で行う。
+        """
+        credentials = self._identity.credentials()
+        self._check_process(credentials)
+        return credentials
 
     @staticmethod
     def _check_process(credentials: ProcessCredentials) -> None:
@@ -1252,8 +1353,30 @@ class AuthorityStore:
         payload = updated.model_dump_json(indent=2).encode("utf-8") + b"\n"
         if len(payload) > _MAX_JOURNAL_BYTES:
             raise AuthorityStateError("journal が size 上限を超える")
-        self._atomic_write(root_fd, AUTHORITY_STATE_FILENAME, payload)
+        try:
+            self._atomic_write(root_fd, AUTHORITY_STATE_FILENAME, payload)
+        except _DirectorySyncError as error:
+            raise AuthorityNotDurableError(updated, appended=event) from error.__cause__
         return updated
+
+    @staticmethod
+    def _resync_directory(root_fd: int, journal: AuthorityJournal) -> None:
+        """書かずに返す前に、いま見えている journal のディレクトリ項目を永続化し直す。
+
+        失敗したら `AuthorityNotDurableError`（``appended=None``）。呼び出し側は「書いた後の
+        fsync の失敗」と同じく非 durable として扱う（CLI は終了コード 5）。
+        """
+        try:
+            os.fsync(root_fd)
+        except OSError as error:
+            raise AuthorityNotDurableError(
+                journal,
+                appended=None,
+                message=(
+                    "authority journal は既に目標の stage だが、ディレクトリの fsync に失敗した"
+                    "（前の置き換えが電源断で失われうる）"
+                ),
+            ) from error
 
     def _read(self, root_fd: int) -> AuthorityJournal:
         try:
@@ -1472,7 +1595,11 @@ class AuthorityStore:
             finally:
                 os.close(temporary_fd)
             os.replace(temporary_name, name, src_dir_fd=directory_fd, dst_dir_fd=directory_fd)
-            os.fsync(directory_fd)
+            # ここから先の失敗は「書けなかった」ではない。置き換えた journal は既に見えている。
+            try:
+                os.fsync(directory_fd)
+            except OSError as error:
+                raise _DirectorySyncError from error
         finally:
             with suppress(FileNotFoundError):
                 os.unlink(temporary_name, dir_fd=directory_fd)
@@ -1537,13 +1664,26 @@ class AuthorityRuntime:
     管理ソケット（決定記録 0072）からの降格は `apply_lowering()` が memory 上で先に効かせ、
     書き残しは heartbeat の後の `maintain()` が行う（「先に in-memory、あとで journal」。
     0057 §2.6）。
+
+    **journal の stage は、この process が使っている artifact に対して承認された分だけ有効にする**
+    （決定記録 0089）。いまの stage へ至る昇格の承認の `evidence.artifact_sha256` が
+    ``loaded_artifact_sha256`` と1件でも違えば、また artifact を持たない構成では、実効 stage の
+    上限を Baseline にする。journal は書かない（承認そのものは正しい）。
+
+    **同じく、この process が起動時に読んだ Control Config に対して承認された分だけ有効にする**
+    （決定記録 0090）。いまの stage へ至る昇格の証拠の4つの設定の hash が
+    ``loaded_config_sources`` と1件・1ファイルでも違えば、実効 stage の上限を Baseline にする。
     """
 
     __slots__ = (
+        "_artifact_ceiling",
+        "_config_binding_ceiling",
         "_demotion_consumed",
         "_journal",
         "_journal_unreadable",
         "_last_mono_ms",
+        "_loaded_artifact",
+        "_loaded_config",
         "_lock_waited",
         "_low_confidence",
         "_ood",
@@ -1552,11 +1692,29 @@ class AuthorityRuntime:
         "_policy",
         "_signature",
         "_store",
+        "_undurable_stage",
         "_unpersisted_ceiling",
     )
 
-    def __init__(self, store: AuthorityStore, policy: FanPolicyConfig) -> None:
+    def __init__(
+        self,
+        store: AuthorityStore,
+        policy: FanPolicyConfig,
+        *,
+        loaded_artifact_sha256: str | None,
+        loaded_config_sources: ConfigSources,
+    ) -> None:
         """**時計は持たない。** 記録の時刻は store が自分の時計で決める。
+
+        ``loaded_config_sources`` は、この process が起動時に読んで使い続けている Control Config の
+        4ファイルの hash（制御に使う ``ControlConfig.sources`` そのもの。決定記録 0090 §2.1）。
+        **既定値を置かない**（``loaded_artifact_sha256`` と同じ理由）。
+
+        ``loaded_artifact_sha256`` は、この process が起動時に束縛して使い続けている model artifact
+        （Controller Gate の ``expected_artifact_sha256`` と同じ値・同じ出どころ。
+        決定記録 0089 §2.1）。
+        **既定値を置かない。** 渡し忘れが「何にも照らさない runtime」を作らないためである。
+        束縛する artifact が無い構成は ``None`` を明示し、Baseline より上を有効にしない。
 
         store には**必ず lock の待ち上限を持たせる**（決定記録 0060 §2.7）。この runtime は
         control tick の中から呼ばれるので、待ち続ける store を渡すと、降格の書き残しが
@@ -1569,17 +1727,30 @@ class AuthorityRuntime:
             raise AuthorityStoreError(
                 "control runtime の AuthorityStore には lock の待ち上限（lock_timeout_ms）が要る"
             )
+        if loaded_artifact_sha256 is not None and not _SHA256_HEX.fullmatch(loaded_artifact_sha256):
+            raise AuthorityStoreError("loaded artifact の sha256 は 64 桁の小文字 16 進にする")
         self._store = store
         self._policy = policy
+        self._loaded_artifact = loaded_artifact_sha256
+        self._loaded_config = loaded_config_sources
+        # 起動時は「前の状態」が無いので、最初の照合の結果を必ずログに出す
+        # （0089 §2.5 / 0090 §2.5）。
+        self._artifact_ceiling: AuthorityStage | None = None
+        self._config_binding_ceiling: AuthorityStage | None = None
         # **stat を先に取ってから読む。** 読んだ後に書き換わっても、覚えた stat と違うので
         # 次の点検で読み直す（逆順だと、読んでから stat までの書き換えを見逃す）。
         self._signature: object = store.journal_signature()
         self._journal = store.read()
+        self._bind_approvals()
         # **書き残せなかった降格だけ**を memory 上の上限として持つ（0057 §2.6）。
         # 書けた降格は journal がそのまま表しているので、二重に持たない。持つと、
         # あとから承認された昇格が再起動まで効かなくなる（codex #4056968495）。
         self._unpersisted_ceiling = AuthorityStage.FULL
         self._pending: list[_PendingDemotion] = []
+        # journal は置き換えたがディレクトリの fsync に失敗した降格の行き先（無ければ None）。
+        # **fsync し直せるまで「書けた」と扱わない**（codex P1。PR #216）。電源断で置き換えが
+        # 失われうるので、memory 上の上限を手放すと再起動前に高い stage へ戻りうる。
+        self._undurable_stage: AuthorityStage | None = None
         self._journal_unreadable = False
         # Gate の降格推奨を、立ち下がるまで1回だけ消費するための記憶。
         self._demotion_consumed = False
@@ -1610,9 +1781,40 @@ class AuthorityRuntime:
         """走行中に journal を読めなかったので `SHADOW` に下げたまま、まだ書き残していない。"""
         return self._journal_unreadable
 
+    @property
+    def loaded_artifact_sha256(self) -> str | None:
+        """この process が使っている model artifact（決定記録 0089）。無ければ None。"""
+        return self._loaded_artifact
+
+    @property
+    def artifact_ceiling(self) -> AuthorityStage:
+        """journal の承認と loaded artifact の照合から決まる上限（決定記録 0089 §2.2）。"""
+        assert self._artifact_ceiling is not None, "__init__ で必ず照合している"
+        return self._artifact_ceiling
+
+    @property
+    def loaded_config_sources(self) -> ConfigSources:
+        """この process が起動時に読んだ Control Config の4ファイルの hash（決定記録 0090）。"""
+        return self._loaded_config
+
+    @property
+    def config_binding_ceiling(self) -> AuthorityStage:
+        """journal の承認と loaded config の照合から決まる上限（決定記録 0090 §2.2）。
+
+        `configured_ceiling`（`fan-policy.yaml` の `authority_stage`）とは別物である。
+        """
+        assert self._config_binding_ceiling is not None, "__init__ で必ず照合している"
+        return self._config_binding_ceiling
+
     def current_stage(self) -> AuthorityStage:
         """この tick に与えてよい制御権。**上限を超えることはない。**"""
-        return lowest_stage(self._journal.stage, self.configured_ceiling, self._unpersisted_ceiling)
+        return lowest_stage(
+            self._journal.stage,
+            self.configured_ceiling,
+            self._unpersisted_ceiling,
+            self.artifact_ceiling,
+            self.config_binding_ceiling,
+        )
 
     def reload(self) -> None:
         """外（管理操作）で変わった journal を読み直す。
@@ -1621,6 +1823,7 @@ class AuthorityRuntime:
         書き残せなかった降格を「読み直すだけ」で取り消せてしまう。
         """
         self._journal = self._store.read()
+        self._bind_approvals()
 
     def observe(
         self,
@@ -1761,7 +1964,12 @@ class AuthorityRuntime:
         waited = self._lock_waited
         self._lock_waited = False
         if not waited:
-            self._flush_one()
+            if self._pending:
+                # 予約の書き残し（`_write`）が、先に永続化し直しを試みる
+                self._flush_one()
+            elif self._undurable_stage is not None and self._make_durable() is None:
+                # 予約の無い降格（`observe()` の自動降格）の fsync も毎 tick やり直す
+                self._release_if_represented()
         self._check_journal()
 
     def flush_pending_on_shutdown(self, *, wait: bool = True) -> tuple[AuthorityStage, ...]:
@@ -1783,6 +1991,21 @@ class AuthorityRuntime:
             if self._write(demotion) is not None:
                 remaining.append(demotion)
         self._pending = remaining
+        undurable = self._undurable_stage
+        if undurable is not None and self._make_durable() is not None:
+            # 置き換えた journal を永続化し直せなかった。黙って捨てない（再起動で戻りうる）
+            _LOGGER.error(
+                "停止までに authority の降格を永続化し直せなかった（電源断で戻りうる）",
+                extra={
+                    logs.FIELDS_KEY: {
+                        "to_stage": undurable.value,
+                        "journal_stage": self._journal.stage.value,
+                        "journal_revision": self._journal.revision,
+                    }
+                },
+            )
+            if undurable not in (item.to_stage for item in remaining):
+                return (*(item.to_stage for item in remaining), undurable)
         for demotion in remaining:
             _LOGGER.error(
                 "停止までに authority の降格を journal へ書き残せなかった（再起動で戻る）",
@@ -1835,7 +2058,95 @@ class AuthorityRuntime:
             None if self._persist_failure is None else self._persist_failure.model_dump(mode="json")
         )
         metadata["authority_journal_unreadable"] = self._journal_unreadable
+        # 上限だけを載せ、照らした artifact の hash は載せない（stage と model は独立に残す。
+        # 0057 §2.7 / 0089 §2.5）。artifact は Gate と registry の記録が持つ。
+        metadata["authority_artifact_ceiling"] = self.artifact_ceiling.value
+        # config の照合の上限だけを載せる（0090 §2.5）。設定の hash は trace の `sources` が持つ。
+        # `authority_config_ceiling`（fan-policy.yaml の上限）とは別の欄にする。
+        metadata["authority_config_binding_ceiling"] = self.config_binding_ceiling.value
         return metadata
+
+    def _bind_approvals(self) -> None:
+        """いまの journal を loaded artifact と loaded config に照合し直す（0089 / 0090 §2.3）。"""
+        self._bind_artifact()
+        self._bind_config()
+
+    def _bind_config(self) -> None:
+        """いまの journal を loaded config と照合し直す（決定記録 0090）。
+
+        上限が変わったときだけログに出す（§2.5）。**上げる向きには働かない。** journal は書かない。
+        """
+        mismatch = _first_config_mismatch(self._journal, self._loaded_config)
+        ceiling = BASELINE_STAGE if mismatch is not None else AuthorityStage.FULL
+        previous = self._config_binding_ceiling
+        self._config_binding_ceiling = ceiling
+        if previous is ceiling:
+            return
+        matched = mismatch is None
+        fields: dict[str, object] = {
+            "event": "authority_config_matched" if matched else "authority_config_mismatch",
+            "journal_stage": self._journal.stage.value,
+            "journal_revision": self._journal.revision,
+            "loaded_config_sha256": _loaded_config_digests(self._loaded_config),
+            "authority_config_binding_ceiling": ceiling.value,
+        }
+        if mismatch is None:
+            _LOGGER.info(
+                "authority の config の照合で上限を掛けない（Baseline か、承認が一致）",
+                extra={logs.FIELDS_KEY: fields},
+            )
+            return
+        event, approved, files = mismatch
+        fields["mismatched_revision"] = event.revision
+        fields["approved_config_sha256"] = approved
+        fields["mismatched_files"] = list(files)
+        _LOGGER.warning(
+            "authority の承認が起動時に読んだ Control Config のものではないため、"
+            "Baseline より上を有効にしない",
+            extra={logs.FIELDS_KEY: fields},
+        )
+
+    def _bind_artifact(self) -> None:
+        """いまの journal を loaded artifact と照合し直す（0089 §2.3）。
+
+        上限が変わったときだけログに出す（§2.5）。
+
+        **上げる向きには働かない。** 返すのは上限で、journal の stage を超えて有効にすることは無い。
+        journal は書かない（0089 §2.4）。
+        """
+        mismatch = _first_artifact_mismatch(self._journal, self._loaded_artifact)
+        ceiling = BASELINE_STAGE if mismatch is not None else AuthorityStage.FULL
+        previous = self._artifact_ceiling
+        self._artifact_ceiling = ceiling
+        if previous is ceiling:
+            return
+        if mismatch is None:
+            event = "authority_artifact_matched"
+        elif mismatch is _NO_LOADED_ARTIFACT:
+            event = "authority_artifact_unbound"
+        else:
+            event = "authority_artifact_mismatch"
+        fields: dict[str, object] = {
+            "event": event,
+            "journal_stage": self._journal.stage.value,
+            "journal_revision": self._journal.revision,
+            "loaded_artifact_sha256": self._loaded_artifact,
+            "authority_artifact_ceiling": ceiling.value,
+        }
+        if isinstance(mismatch, AuthorityEvent):
+            assert mismatch.approval is not None
+            fields["mismatched_revision"] = mismatch.revision
+            fields["approved_artifact_sha256"] = mismatch.approval.evidence.artifact_sha256
+        if mismatch is None:
+            _LOGGER.info(
+                "authority の artifact の照合で上限を掛けない（Baseline か、承認が一致）",
+                extra={logs.FIELDS_KEY: fields},
+            )
+            return
+        _LOGGER.warning(
+            "authority の承認が loaded artifact のものではないため、Baseline より上を有効にしない",
+            extra={logs.FIELDS_KEY: fields},
+        )
 
     @staticmethod
     def _one_below(stage: AuthorityStage) -> AuthorityStage:
@@ -1892,7 +2203,15 @@ class AuthorityRuntime:
         )
 
     def _write(self, demotion: _PendingDemotion) -> Reason | None:
-        """1件の降格を journal へ書く。書けなければ理由を返す（上限はそのまま持ち続ける）。"""
+        """1件の降格を journal へ書く。書けなければ理由を返す（上限はそのまま持ち続ける）。
+
+        **永続化し直せていない降格が残っていれば、先にディレクトリを `fsync` し直す。**
+        journal が既に新しい内容なら `lower_stage()` は何も書かずに返るので、それを
+        「書けた」と扱うと、永続化していない降格の上限を手放してしまう（codex P1。PR #216）。
+        """
+        failure = self._make_durable()
+        if failure is not None:
+            return failure
         try:
             journal = self._store.lower_stage(
                 to_stage=demotion.to_stage,
@@ -1901,15 +2220,64 @@ class AuthorityRuntime:
                 trigger=demotion.trigger,
                 cause=demotion.cause,
             )
+        except AuthorityNotDurableError as error:
+            # journal は置き換えた（他の process に見えている）が、電源断で失われうる。
+            # 見えている journal は持つ（下げた側なので上げる向きには働かない）が、
+            # **上限は手放さない**。次の tick から `_make_durable()` が fsync をやり直す。
+            self._journal = error.journal
+            self._bind_approvals()
+            self._signature = _SIGNATURE_UNKNOWN
+            previous = self._undurable_stage
+            self._undurable_stage = (
+                demotion.to_stage if previous is None else lowest_stage(previous, demotion.to_stage)
+            )
+            detail = f"journal は置き換えたがディレクトリの fsync に失敗した: {error.__cause__}"
+            failure = Reason(code="authority_persist_failed", detail=detail[:500])
+            self._persist_failure = failure
+            return failure
         except (AuthorityError, OSError, ValidationError) as error:
             # 書き残せなかった。上の上限をそのまま持ち続ける（`reload()` でも外れない）。
             failure = Reason(code="authority_persist_failed", detail=str(error)[:500])
             self._persist_failure = failure
             return failure
         self._journal = journal
+        self._bind_approvals()
         self._signature = _SIGNATURE_UNKNOWN
         self._persist_failure = None
         self._release_if_represented()
+        return None
+
+    def _make_durable(self) -> Reason | None:
+        """永続化し直せていない降格があれば、ディレクトリを `fsync` し直す。
+
+        成功（または何も残っていない）なら None、失敗なら理由を返す。**上限には触れない**
+        （手放すのは呼び出し側の `_release_if_represented()`）。lock を取らないので、
+        0060 §2.7 の lock の待ちの予算を使わない。
+        """
+        undurable = self._undurable_stage
+        if undurable is None:
+            return None
+        try:
+            self._store.sync_directory()
+        except (AuthorityError, OSError) as error:
+            failure = Reason(
+                code="authority_persist_failed",
+                detail=f"journal のディレクトリの fsync をやり直せなかった: {error}"[:500],
+            )
+            self._persist_failure = failure
+            return failure
+        self._undurable_stage = None
+        self._persist_failure = None
+        _LOGGER.warning(
+            "authority の降格を永続化し直した（ディレクトリの fsync に成功）",
+            extra={
+                logs.FIELDS_KEY: {
+                    "to_stage": undurable.value,
+                    "journal_stage": self._journal.stage.value,
+                    "journal_revision": self._journal.revision,
+                }
+            },
+        )
         return None
 
     def _release_if_represented(self) -> None:
@@ -1919,7 +2287,7 @@ class AuthorityRuntime:
         上限以下であることを**書いた直後の journal で**確かめられたときだけなので、手放しても
         authority は上がらない。
         """
-        if self._pending:
+        if self._pending or self._undurable_stage is not None:
             return
         if stage_rank(self._journal.stage) <= stage_rank(self._unpersisted_ceiling):
             self._unpersisted_ceiling = AuthorityStage.FULL
@@ -2003,6 +2371,7 @@ class AuthorityRuntime:
             )
             return
         self._journal = journal
+        self._bind_approvals()
         self._signature = signature
         if journal != previous:
             _LOGGER.info(
@@ -2050,6 +2419,86 @@ class AuthorityRuntime:
         for history in (self._low_confidence, self._ood):
             while history and history[0] < cutoff:
                 history.popleft()
+
+
+_NO_LOADED_ARTIFACT = object()
+"""照合の結果: journal は Baseline より上なのに、この process が artifact を持たない。"""
+
+
+def _first_artifact_mismatch(
+    journal: AuthorityJournal, loaded_artifact_sha256: str | None
+) -> AuthorityEvent | object | None:
+    """いまの stage へ至る昇格のうち、loaded artifact のものでない最初の1件（決定記録 0089 §2.2）。
+
+    None は「上限を掛けない」（journal が Baseline、または連なりの昇格がすべて一致）。
+    journal が最後に Baseline にいた時点より**後**の昇格をすべて見る。一部だけ一致しても上限は
+    Baseline である（一致した段までを有効にしない）。
+    """
+    if journal.stage is BASELINE_STAGE:
+        return None
+    if loaded_artifact_sha256 is None:
+        return _NO_LOADED_ARTIFACT
+    for event in _climb_since_baseline(journal):
+        approval = event.approval
+        if approval is None:
+            # 降格。連なりの中の降格は承認を持たない（0057 §2.6）
+            continue
+        if approval.evidence.artifact_sha256 != loaded_artifact_sha256:
+            return event
+    return None
+
+
+def _loaded_config_digests(sources: ConfigSources) -> dict[str, str | None]:
+    """loaded config の4つの hash を、証拠の欄の名前で並べる（照合とログで同じ形にする）。"""
+    return {
+        "fan_policy_config_sha256": sources.policy.sha256,
+        "safety_config_sha256": sources.safety.sha256,
+        "air_balance_config_sha256": sources.air_balance.sha256,
+        "fan_hardware_config_sha256": sources.fan_hardware.sha256,
+    }
+
+
+def _approved_config_digests(evidence: RolloutEvidence) -> dict[str, str | None]:
+    """証拠が束縛している4つの hash。journal v1 の証拠は後ろの2つが None（0073 §2.6）。"""
+    return {
+        "fan_policy_config_sha256": evidence.fan_policy_config_sha256,
+        "safety_config_sha256": evidence.safety_config_sha256,
+        "air_balance_config_sha256": evidence.air_balance_config_sha256,
+        "fan_hardware_config_sha256": evidence.fan_hardware_config_sha256,
+    }
+
+
+def _first_config_mismatch(
+    journal: AuthorityJournal, loaded: ConfigSources
+) -> tuple[AuthorityEvent, dict[str, str | None], tuple[str, ...]] | None:
+    """いまの stage へ至る昇格のうち、loaded config のものでない最初の1件（決定記録 0090 §2.2）。
+
+    None は「上限を掛けない」。返すのは食い違った昇格、その証拠の4つの hash、食い違った欄の名前。
+    証拠に hash が無い欄（journal v1 の event）は一致を言えないので、食い違いとして扱う（§5 の 2）。
+    """
+    if journal.stage is BASELINE_STAGE:
+        return None
+    expected = _loaded_config_digests(loaded)
+    for event in _climb_since_baseline(journal):
+        approval = event.approval
+        if approval is None:
+            continue
+        approved = _approved_config_digests(approval.evidence)
+        files = tuple(name for name, digest in expected.items() if approved[name] != digest)
+        if files:
+            return event, approved, files
+    return None
+
+
+def _climb_since_baseline(journal: AuthorityJournal) -> list[AuthorityEvent]:
+    """journal が最後に Baseline にいた時点より後の event（古い順）。"""
+    climb: list[AuthorityEvent] = []
+    for event in reversed(journal.events):
+        if event.to_stage is BASELINE_STAGE:
+            break
+        climb.append(event)
+    climb.reverse()
+    return climb
 
 
 def _extends(journal: AuthorityJournal, known: AuthorityJournal) -> bool:
