@@ -857,6 +857,24 @@ class AuthorityStore:
             inode=status.st_ino, size=status.st_size, mtime_ns=status.st_mtime_ns
         )
 
+    def sync_directory(self) -> None:
+        """authority のディレクトリを `fsync` し直す（**flock を取らない**）。
+
+        `AuthorityNotDurableError` の後、置き換えた journal のディレクトリ項目を永続化し直すために
+        制御ループが呼ぶ。journal が既に新しい内容でも `lower_stage()` は何も書かず `fsync` も
+        しないので、「書き直せた」ことを永続化の確認にできない（codex P1。PR #216）。
+        ディレクトリの `fsync` は lock と無関係に、その時点の項目をまとめて永続化する。
+        """
+        with self._open_root(create=False) as root_fd:
+            if root_fd is None:
+                raise AuthorityStoreError("authority のディレクトリが無い（fsync し直せない）")
+            try:
+                os.fsync(root_fd)
+            except OSError as error:
+                raise AuthorityStoreError(
+                    "authority のディレクトリの fsync に失敗した（降格はまだ永続化していない）"
+                ) from error
+
     def raise_stage(
         self,
         *,
@@ -1635,6 +1653,7 @@ class AuthorityRuntime:
         "_policy",
         "_signature",
         "_store",
+        "_undurable_stage",
         "_unpersisted_ceiling",
     )
 
@@ -1681,6 +1700,10 @@ class AuthorityRuntime:
         # あとから承認された昇格が再起動まで効かなくなる（codex #4056968495）。
         self._unpersisted_ceiling = AuthorityStage.FULL
         self._pending: list[_PendingDemotion] = []
+        # journal は置き換えたがディレクトリの fsync に失敗した降格の行き先（無ければ None）。
+        # **fsync し直せるまで「書けた」と扱わない**（codex P1。PR #216）。電源断で置き換えが
+        # 失われうるので、memory 上の上限を手放すと再起動前に高い stage へ戻りうる。
+        self._undurable_stage: AuthorityStage | None = None
         self._journal_unreadable = False
         # Gate の降格推奨を、立ち下がるまで1回だけ消費するための記憶。
         self._demotion_consumed = False
@@ -1879,7 +1902,12 @@ class AuthorityRuntime:
         waited = self._lock_waited
         self._lock_waited = False
         if not waited:
-            self._flush_one()
+            if self._pending:
+                # 予約の書き残し（`_write`）が、先に永続化し直しを試みる
+                self._flush_one()
+            elif self._undurable_stage is not None and self._make_durable() is None:
+                # 予約の無い降格（`observe()` の自動降格）の fsync も毎 tick やり直す
+                self._release_if_represented()
         self._check_journal()
 
     def flush_pending_on_shutdown(self, *, wait: bool = True) -> tuple[AuthorityStage, ...]:
@@ -1901,6 +1929,21 @@ class AuthorityRuntime:
             if self._write(demotion) is not None:
                 remaining.append(demotion)
         self._pending = remaining
+        undurable = self._undurable_stage
+        if undurable is not None and self._make_durable() is not None:
+            # 置き換えた journal を永続化し直せなかった。黙って捨てない（再起動で戻りうる）
+            _LOGGER.error(
+                "停止までに authority の降格を永続化し直せなかった（電源断で戻りうる）",
+                extra={
+                    logs.FIELDS_KEY: {
+                        "to_stage": undurable.value,
+                        "journal_stage": self._journal.stage.value,
+                        "journal_revision": self._journal.revision,
+                    }
+                },
+            )
+            if undurable not in (item.to_stage for item in remaining):
+                return (*(item.to_stage for item in remaining), undurable)
         for demotion in remaining:
             _LOGGER.error(
                 "停止までに authority の降格を journal へ書き残せなかった（再起動で戻る）",
@@ -2055,7 +2098,15 @@ class AuthorityRuntime:
         )
 
     def _write(self, demotion: _PendingDemotion) -> Reason | None:
-        """1件の降格を journal へ書く。書けなければ理由を返す（上限はそのまま持ち続ける）。"""
+        """1件の降格を journal へ書く。書けなければ理由を返す（上限はそのまま持ち続ける）。
+
+        **永続化し直せていない降格が残っていれば、先にディレクトリを `fsync` し直す。**
+        journal が既に新しい内容なら `lower_stage()` は何も書かずに返るので、それを
+        「書けた」と扱うと、永続化していない降格の上限を手放してしまう（codex P1。PR #216）。
+        """
+        failure = self._make_durable()
+        if failure is not None:
+            return failure
         try:
             journal = self._store.lower_stage(
                 to_stage=demotion.to_stage,
@@ -2064,6 +2115,21 @@ class AuthorityRuntime:
                 trigger=demotion.trigger,
                 cause=demotion.cause,
             )
+        except AuthorityNotDurableError as error:
+            # journal は置き換えた（他の process に見えている）が、電源断で失われうる。
+            # 見えている journal は持つ（下げた側なので上げる向きには働かない）が、
+            # **上限は手放さない**。次の tick から `_make_durable()` が fsync をやり直す。
+            self._journal = error.journal
+            self._bind_artifact()
+            self._signature = _SIGNATURE_UNKNOWN
+            previous = self._undurable_stage
+            self._undurable_stage = (
+                demotion.to_stage if previous is None else lowest_stage(previous, demotion.to_stage)
+            )
+            detail = f"journal は置き換えたがディレクトリの fsync に失敗した: {error.__cause__}"
+            failure = Reason(code="authority_persist_failed", detail=detail[:500])
+            self._persist_failure = failure
+            return failure
         except (AuthorityError, OSError, ValidationError) as error:
             # 書き残せなかった。上の上限をそのまま持ち続ける（`reload()` でも外れない）。
             failure = Reason(code="authority_persist_failed", detail=str(error)[:500])
@@ -2076,6 +2142,39 @@ class AuthorityRuntime:
         self._release_if_represented()
         return None
 
+    def _make_durable(self) -> Reason | None:
+        """永続化し直せていない降格があれば、ディレクトリを `fsync` し直す。
+
+        成功（または何も残っていない）なら None、失敗なら理由を返す。**上限には触れない**
+        （手放すのは呼び出し側の `_release_if_represented()`）。lock を取らないので、
+        0060 §2.7 の lock の待ちの予算を使わない。
+        """
+        undurable = self._undurable_stage
+        if undurable is None:
+            return None
+        try:
+            self._store.sync_directory()
+        except (AuthorityError, OSError) as error:
+            failure = Reason(
+                code="authority_persist_failed",
+                detail=f"journal のディレクトリの fsync をやり直せなかった: {error}"[:500],
+            )
+            self._persist_failure = failure
+            return failure
+        self._undurable_stage = None
+        self._persist_failure = None
+        _LOGGER.warning(
+            "authority の降格を永続化し直した（ディレクトリの fsync に成功）",
+            extra={
+                logs.FIELDS_KEY: {
+                    "to_stage": undurable.value,
+                    "journal_stage": self._journal.stage.value,
+                    "journal_revision": self._journal.revision,
+                }
+            },
+        )
+        return None
+
     def _release_if_represented(self) -> None:
         """journal が memory 上の上限以下を表していれば上限を手放す（0057 §2.6「書けたら手放す」）。
 
@@ -2083,7 +2182,7 @@ class AuthorityRuntime:
         上限以下であることを**書いた直後の journal で**確かめられたときだけなので、手放しても
         authority は上がらない。
         """
-        if self._pending:
+        if self._pending or self._undurable_stage is not None:
             return
         if stage_rank(self._journal.stage) <= stage_rank(self._unpersisted_ceiling):
             self._unpersisted_ceiling = AuthorityStage.FULL

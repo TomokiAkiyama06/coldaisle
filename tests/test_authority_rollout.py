@@ -23,6 +23,7 @@ import inspect
 import json
 import logging
 import os
+import stat
 from fcntl import LOCK_EX, LOCK_NB, LOCK_UN, flock
 from hashlib import sha256
 from pathlib import Path
@@ -2043,6 +2044,107 @@ def test_invariant_6_p_an_unexpected_persist_failure_still_lowers(tmp_path: Path
         control.observe(safety_state=SafetyState.EMERGENCY, now_mono_ms=0)
 
     assert control.current_stage() is BASELINE_STAGE
+
+
+class DirectoryFsync:
+    """ディレクトリの `fsync` だけを失敗させる注入点（`test_authority_cli` と同じ作り）。
+
+    呼ばれた回数を数える。**journal が既に新しい内容でも fsync をやり直した**ことを確かめる。
+    """
+
+    def __init__(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        self.failing = True
+        self.directory_calls = 0
+        self._real = os.fsync
+        monkeypatch.setattr(os, "fsync", self)
+
+    def __call__(self, fd: int) -> None:
+        if stat.S_ISDIR(os.fstat(fd).st_mode):
+            self.directory_calls += 1
+            if self.failing:
+                raise OSError(5, "Input/output error")
+        self._real(fd)
+
+
+def test_invariant_6_q_a_demotion_is_not_released_until_the_directory_fsync_succeeds(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """**durable になるまで「書けた」と扱わない**（codex P1。PR #216）。
+
+    置き換えた journal は既に新しい内容なので、次の tick の `lower_stage()` は何も書かず
+    fsync もしない。それを成功と扱うと、電源断で失われうる降格の上限を手放してしまう。
+    """
+    control = runtime(tmp_path, stage=AuthorityStage.FULL)
+    authority = store(tmp_path)
+    fsync = DirectoryFsync(monkeypatch)
+
+    assert control.apply_lowering(to_stage=BASELINE_STAGE, actor="operator", reason="切り分け")
+    control.maintain()
+
+    assert authority.read().stage is BASELINE_STAGE, "置き換えは見えている"
+    assert control.pending_stages == (BASELINE_STAGE,), "降格は保留のまま"
+    assert control.persist_failure is not None
+    assert control.trace_record(command_id=None).unpersisted_ceiling is BASELINE_STAGE
+
+    # 次の tick も fsync が失敗する。journal は既に下がっているが、成功扱いにしない
+    calls = fsync.directory_calls
+    control.maintain()
+    assert fsync.directory_calls > calls, "毎 tick ディレクトリの fsync をやり直す"
+    assert control.pending_stages == (BASELINE_STAGE,)
+    assert control.persist_failure is not None
+    assert control.trace_record(command_id=None).unpersisted_ceiling is BASELINE_STAGE
+    assert control.current_stage() is BASELINE_STAGE
+
+    # fsync が通って初めて手放す
+    fsync.failing = False
+    calls = fsync.directory_calls
+    control.maintain()
+    assert fsync.directory_calls > calls
+    assert control.pending_stages == ()
+    assert control.persist_failure is None
+    assert control.trace_record(command_id=None).unpersisted_ceiling is None
+    assert control.current_stage() is BASELINE_STAGE
+    assert authority.read().revision == control.journal.revision, "降格は1件だけ書いた"
+
+
+def test_invariant_6_r_an_automatic_demotion_retries_the_directory_fsync_every_tick(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """予約を持たない自動降格（`observe()`）も、fsync が通るまで上限を手放さない。"""
+    control = runtime(tmp_path, stage=AuthorityStage.FULL)
+    fsync = DirectoryFsync(monkeypatch)
+
+    demotion = control.observe(safety_state=SafetyState.EMERGENCY, now_mono_ms=0)
+
+    assert demotion is not None
+    assert demotion.persisted is False
+    assert control.journal.stage is BASELINE_STAGE, "見えている journal は持つ（下げた側）"
+    control.maintain()  # 同じ tick は lock を使ったので書き残しを回さない（0060 §2.7）
+    for tick in range(1, 4):
+        calls = fsync.directory_calls
+        control.observe(safety_state=SafetyState.NORMAL, now_mono_ms=tick * 1_000)
+        control.maintain()
+        assert fsync.directory_calls > calls, "毎 tick ディレクトリの fsync をやり直す"
+        assert control.persist_failure is not None
+        assert control.trace_record(command_id=None).unpersisted_ceiling is BASELINE_STAGE
+
+    fsync.failing = False
+    control.maintain()
+    assert control.persist_failure is None
+    assert control.trace_record(command_id=None).unpersisted_ceiling is None
+    assert control.current_stage() is BASELINE_STAGE
+
+
+def test_invariant_6_s_shutdown_reports_a_demotion_that_never_became_durable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """停止までに fsync し直せなかった降格を、黙って「書けた」としない。"""
+    control = runtime(tmp_path, stage=AuthorityStage.FULL)
+    DirectoryFsync(monkeypatch)
+
+    control.observe(safety_state=SafetyState.EMERGENCY, now_mono_ms=0)
+
+    assert control.flush_pending_on_shutdown() == (BASELINE_STAGE,)
 
 
 # --- 不変条件 7: 設定は上限 ----------------------------------------------------
