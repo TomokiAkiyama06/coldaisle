@@ -53,14 +53,17 @@ still raises Front make-up air rather than leaving Front at zero.
   not contain a safety floor. Critical Safety still computes
   `max(case_aux_exhaust, cpu_cooling_floor)` later in the fixed pipeline, so this model has no path
   that can lower the CPU floor.
-- Because Top actually runs at `max(case_aux_exhaust, safety_floor)`, `coordinate()` accepts an
-  optional `projected_top_floor`: the Top floor the caller expects Critical Safety to apply,
-  derived by reading `safety.yaml` as a constraint (decision record 0028 §2.4 / §2.8). It is used
-  only to estimate `q_top` for `before` and `projected`, so a floor that makes the case
-  exhaust-heavy still triggers Front make-up air (`docs/airflow-model.md` "Top → Front make-up
-  air"), and floor airflow counts toward any Top case-auxiliary shortfall. It is never copied
-  into `requested.top`; ownership of the floor stays with Critical Safety, and omitting it keeps
-  the previous behaviour.
+- Every zone actually runs at `max(requested_z, lower bounds of the composition)`, so
+  `coordinate()` accepts optional per-zone `projected_floors` (decision record 0078 §2.2): for
+  zone `z`, `1.0` when Critical Safety forces it to Max, otherwise
+  `max(Guard floor, Safety floor, ramp_down floor)` (`0.0` when none exists). Airflow for `before`
+  and `projected`, and the raise targets (Front make-up air, Rear → Top shortfall), are estimated
+  at `max(requested_z, projected_floors.z)`. A floor that makes the case exhaust-heavy (for
+  example a CPU cooling floor or a ramp-down on Top, or a high Rear floor) still triggers Front
+  make-up air (`docs/airflow-model.md` "Top → Front make-up air"), and a high Front floor can call
+  for Rear exhaust when a thermal limit is active. A zone whose floor already delivers the target
+  airflow is not raised. The floors are never copied into `requested`; their ownership stays with
+  Critical Safety and the composition, and omitting them keeps the previous behaviour.
 
 The model is pure and uses no hardware I/O, which lets Mock and Replay exercise all state changes
 without a sensor module.
@@ -117,5 +120,44 @@ scores the ratio the hardware would actually produce. Passing Air Balance withou
 profile is rejected at construction (`MpcCostUnusableError`). The mapping never changes the plan's
 requested demand.
 
-Applying `coordinate()` to the Fallback controller's requested demand is **not** done: decision
-record 0073 leaves it open because it changes Baseline behaviour (0073 §5).
+## Coordinating the Baseline (#81 / decision records 0078 / 0085)
+
+Decision record 0078 applies `coordinate()` to the Fallback (Baseline) requested demand, never to
+the Learned MPC proposal (the MPC already carries the balance term). `fan-policy.yaml`
+`air_balance_coordination.mode` selects `off` (default) / `shadow` / `apply`, changed only by a
+person and a restart. The loop order is:
+
+```text
+Fallback.propose()            → raw baseline
+Critical Safety.evaluate()    → unchanged (does not read requested)
+AirBalanceCoordinator.apply() → coordinated baseline (differs from raw only in mode: apply)
+ControllerGate.select(fallback = coordinated baseline, learned = …)
+composition (0028 §2.4)       → Guard ceiling / floors, Safety floor, ramp_down, forced_max
+```
+
+- Coordination runs only when every condition of 0078 §2.3 holds: Air Balance enabled, `AUTO`,
+  snapshot available, a Fallback proposal, Safety `NORMAL` / `DEGRADED`, no zone Fan fault and no
+  unconfirmed tach (`CriticalSafetyDecision.tach_unconfirmed_zones`: a backend `TACH_STALL` or a
+  running stall timer, from the first report). Otherwise the tick is `skipped`, the raw baseline
+  is used and the release hold is cleared.
+- The applied value only raises, by at most `max_raise` per zone, and keeps the largest recent
+  raise for `release_hold_ms`. `shadow` records the same held value as `counterfactual_output`
+  and hands the raw baseline to the Gate, so the fans see exactly what `off` would give them.
+- In LIMITED / EXPANDED the authority band is centred on the coordinated baseline. With FULL
+  authority the selected Learned MPC request is used as is. The Gate's
+  `fallback_transition_floor` is applied after coordination.
+- Failures: in `apply`, an exception from the coordinator (including a lowering value) is recorded
+  as `failed`, translated into a `fallback_exception` fault (the next tick's Safety goes
+  `EMERGENCY`), and that tick **bypasses the Gate** and uses the raw baseline (0085), with
+  `fallback_reason: air_balance_coordination_failed` when ML could otherwise have run. A persisting
+  failure alternates between `EMERGENCY` and one bypassed tick every `fault_clear_hold_ms`
+  (0085 §2.6). In `shadow`, a failure is only recorded. The `try` covers the coordinator call only;
+  Critical Safety and composition exceptions still end the process.
+- `ControlTick` v14 records the `air_balance_coordination` block (`mode`, `status`,
+  `skip_reason`, `candidate` / `proposed` / `output` / `counterfactual_output`, the applied
+  `max_raise`, `bounded_by_max_raise`, `held`, `projected_floors` and their basis, the before /
+  projected state and ratio, `reasons`, `failure`) and `tach_unconfirmed_zones` copied from the
+  Safety decision. `output` is what the coordination stage produced as the Baseline value; on a
+  bypassed tick it is the raw baseline (`candidate`).
+- Promotion evidence bound to the `fan-policy.yaml` trace (`fan_policy_trace_binding`, 0078 §2.5)
+  and the shadow summary are stage 4 (#91) and are not part of this wiring.

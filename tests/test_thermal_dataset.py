@@ -1263,6 +1263,11 @@ def _tick_for_schema_version(version: int, *, ts_ms: int, tick_id: int) -> Contr
     if version >= 13:
         # v13も同じく、制御権の出どころを省いた記録を作れない（#92 / 決定記録 0072 §2.6）
         raw["authority"] = {"schema_version": 1, "entry": "static", "config_ceiling": "full"}
+    if version >= 14:
+        # v14も同じく、Air Balance の協調の記録と未確認の tach を省いた記録を作れない
+        # （#81 / 決定記録 0078 §2.7）
+        raw["air_balance_coordination"] = {"schema_version": 1, "mode": "off", "status": "off"}
+        raw["tach_unconfirmed_zones"] = []
     return ControlTick.model_validate_json(json.dumps(raw))
 
 

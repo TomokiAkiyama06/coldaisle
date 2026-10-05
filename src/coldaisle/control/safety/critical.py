@@ -88,6 +88,12 @@ _WRITE_FAULTS = frozenset(
     {FaultCode.WRITE_FAILURE, FaultCode.READBACK_MISMATCH, FaultCode.ENABLE_REVERTED}
 )
 _FAN_FAULTS = _WRITE_FAULTS | {FaultCode.TACH_STALL}
+FAN_FAULT_CODES: frozenset[FaultCode] = frozenset(_FAN_FAULTS)
+"""zone の Fan の故障（stall・書き込み失敗）。その zone の実際の風量は demand から言えない。
+
+Air Balance の協調が ``zone_fan_fault`` で ``skipped`` にする判定に使う（決定記録 0078 §2.3）。
+Safety の判定は ``_FAN_FAULTS`` を使い、この公開名は読む側のための写しである。
+"""
 
 
 _SAFETY_DECISION_AUTHORITY = object()
@@ -264,6 +270,16 @@ class CriticalSafetyDecision(BaseModel):
     disabled_inputs: tuple[Reason, ...] = ()
     config_validated: bool = True
     config_is_provisional: bool
+    tach_unconfirmed_zones: frozenset[Zone] = frozenset()
+    """この tick の評価で tach の有効な応答を確かめられていない zone（決定記録 0078 §2.3）。
+
+    backend がこの tick に ``TACH_STALL`` を報告した zone と、stall の timer が動いている zone
+    （demand が ``stall_check_min_demand`` 以上で、tach が ``stall_min_rpm`` 以上の応答を
+    返していない。
+    ``stall_window_ms`` が満ちて ``TACH_STALL`` が確定した後も含む）。いま既に計算している値を
+    外へ見せるだけで、``state``・floor・``forced_max``・``faults`` を変えない。
+    読むのは Air Balance の協調だけで、Safety の判定には戻さない。
+    """
     _authority: object | None = PrivateAttr(default=None)
     _config_payload: str | None = PrivateAttr(default=None)
     _issued_payload: str | None = PrivateAttr(default=None)
@@ -618,6 +634,9 @@ class CriticalSafety:
             (fault, self._fault_is_emergency(fault))
             for fault in self._stall_faults(snapshot, backend_stall_zones)
         )
+        # 確定前の tach 無応答を裁定に露出する（決定記録 0078 §2.3）。_stall_faults() が
+        # 更新した timer をそのまま読むだけで、新しい閾値も判定も足さない。
+        tach_unconfirmed = backend_stall_zones | frozenset(self._stall_started_ms)
 
         if self._overrun_count >= self._config.overrun_consecutive_limit.value:
             observed.append(
@@ -653,6 +672,7 @@ class CriticalSafety:
             faults=faults,
             disabled_inputs=self._disabled_inputs,
             config_is_provisional=self._config_is_provisional,
+            tach_unconfirmed_zones=tach_unconfirmed,
         )._mark_issued(
             _SAFETY_DECISION_AUTHORITY,
             config_payload=self._config_payload,
@@ -1065,6 +1085,25 @@ class DemandComposer:
         composer._invalid_config_only = True
         return composer
 
+    def ramp_floor(self, zone: Zone, monotonic_ms: int) -> float | None:
+        """次の合成が ``zone`` の requested に掛ける ``ramp_down`` の下限（読み取り専用）。
+
+        Air Balance の協調が風量を見積もるために読む（決定記録 0078 §2.2）。合成と**同じ関数**・
+        同じ前 tick の effective・同じ経過時間で求め、式を写さない。前 tick の effective が無ければ
+        None。状態は変えない。``monotonic_ms`` には次に合成する Safety 裁定の時刻を渡す。
+        """
+        if self._invalid_config_only:
+            raise ValueError("設定不正時の composer は ramp の下限を持たない")
+        if self._previous is None or self._last_monotonic_ms is None:
+            return None
+        if monotonic_ms <= self._last_monotonic_ms:
+            raise ValueError("Safety 裁定の単調時計は合成ごとに前進させる")
+        return _ramp_floor(
+            previous_effective=self._previous.get(zone).effective,
+            elapsed_ms=monotonic_ms - self._last_monotonic_ms,
+            ramp_down_per_s=self._ramp_down_per_s,
+        )
+
     def compose(
         self,
         *,
@@ -1190,9 +1229,10 @@ def _compose_effective_demands(
         x3 = max(x2, zone_safety.floor)
         ramp_floor: float | None = None
         if previous is not None:
-            ramp_floor = max(
-                0.0,
-                previous.get(zone).effective - ramp_down_per_s * elapsed_ms / 1_000,
+            ramp_floor = _ramp_floor(
+                previous_effective=previous.get(zone).effective,
+                elapsed_ms=elapsed_ms,
+                ramp_down_per_s=ramp_down_per_s,
             )
         x4 = x3 if ramp_floor is None else max(x3, ramp_floor)
         forced_max = zone_safety.forced_max or mode is OperatingMode.MAX
@@ -1255,6 +1295,14 @@ def _compose_effective_demands(
         rear=compose(Zone.REAR),
         top=compose(Zone.TOP),
     )
+
+
+def _ramp_floor(*, previous_effective: float, elapsed_ms: int, ramp_down_per_s: float) -> float:
+    """前 tick の effective から ``ramp_down_per_s`` で下げてよい下限（0028 §2.4）。
+
+    合成と ``DemandComposer.ramp_floor()`` の両方がこの1つの式を使う（決定記録 0078 §2.2）。
+    """
+    return max(0.0, previous_effective - ramp_down_per_s * elapsed_ms / 1_000)
 
 
 def _signal_available(snapshot: ControlStateSnapshot, metric: str) -> bool:

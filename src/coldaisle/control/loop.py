@@ -20,6 +20,11 @@ Telemetry → State Estimator(#102) → Supervisor(#88) → Controller(#79/#86)
 Safety の裁定は requested を見ないので、**Gate より先に評価する**。こうすると Gate は
 「この tick の `safety_state`」を見て選べる（0028 §2.5 (c) の条件）。合成はそのあとで、
 requested・Guard・Safety の3つを 0028 §2.4 の優先順で1回だけ束ねる。
+
+Air Balance の協調（決定記録 0078 §2.2）は Safety の評価の後・Gate の前に置き、raw baseline
+（Fallback の requested）を上げるだけの coordinated baseline を Gate へ渡す。合成の後に値を
+足す経路は持たない。`mode: apply` の協調が失敗した tick は Gate を迂回して raw baseline を
+requested にする（決定記録 0085）。
 """
 
 from __future__ import annotations
@@ -27,12 +32,19 @@ from __future__ import annotations
 import logging
 from collections import deque
 from dataclasses import dataclass
-from typing import Protocol, Self
+from typing import Protocol, Self, cast
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from coldaisle import logs
 from coldaisle.clock import Clock, MonotonicClock
+from coldaisle.control.air_balance import ConfiguredAirBalanceModel
+from coldaisle.control.air_balance_coordination import (
+    AirBalanceCoordinator,
+    CoordinatorResult,
+    ProjectedFloors,
+    project_floors,
+)
 from coldaisle.control.air_balance_trace import AirBalanceRecorder
 from coldaisle.control.config import CONTROL_CONFIG_VERSION, ControlConfig, FanPolicyConfig
 from coldaisle.control.fallback.controller import FallbackController
@@ -57,16 +69,28 @@ from coldaisle.control.safety.critical import (
     AIR_TEMPERATURE_METRICS,
     CPU_POWER_METRIC,
     CPU_TEMPERATURE_METRIC,
+    FAN_FAULT_CODES,
     GPU_TEMPERATURE_METRIC,
     ComposedDemands,
     CriticalSafety,
+    CriticalSafetyDecision,
     DemandComposer,
 )
 from coldaisle.control.schema import (
+    AIR_BALANCE_COORDINATION_FAILED,
+    AIR_BALANCE_RELEASE_HOLD_REASON,
+    AIR_BALANCE_ZONE_REASONS,
     BASELINE_STAGE,
     CONTROL_TICK_RUNTIME_SCHEMA_VERSION,
     SCHEMA_VERSION,
+    AirBalanceCoordinationFailure,
+    AirBalanceCoordinationMode,
+    AirBalanceCoordinationReasonCode,
+    AirBalanceCoordinationRecord,
+    AirBalanceCoordinationSkipReason,
+    AirBalanceCoordinationStatus,
     AirBalanceRecord,
+    AirBalanceTraceState,
     AuthorityRecord,
     AuthorityStage,
     ConfidenceLevel,
@@ -558,6 +582,22 @@ class _TelemetryAgeTracker:
         )
 
 
+@dataclass(frozen=True, slots=True)
+class _Coordination:
+    """1 tick の Air Balance の協調の結果（決定記録 0078 / 0085）。"""
+
+    record: AirBalanceCoordinationRecord
+    gate_baseline: ControllerProposal | None
+    """Gate へ渡す Baseline。``mode: apply`` で上げた tick は coordinated baseline、ほかは raw。"""
+    bypass_gate: bool
+    """``mode: apply`` の協調が失敗した tick。
+
+    Gate を呼ばず raw baseline を requested にする（決定記録 0085）。
+    """
+    fault: Fault | None
+    """``mode: apply`` の失敗を翻訳した ``fallback_exception``。次 tick の Safety へ渡す。"""
+
+
 class ControlLoop:
     """1 tick を通す合成の起点。**状態は memory 上だけで、再起動で引き継がない。**
 
@@ -590,7 +630,13 @@ class ControlLoop:
         trace: ControlTraceLogger | None = None,
         authority: AuthorityObserver | None = None,
         watchdog: Watchdog | None = None,
+        air_balance_coordinator: AirBalanceCoordinator | None = None,
     ) -> None:
+        """``air_balance_coordinator`` は試験で偽の model を差し込むときだけ渡す。
+
+        渡さなければ ``fan-policy.yaml`` の ``air_balance_coordination.mode`` から作る
+        （``off`` なら作らない）。渡すなら設定と同じ ``mode`` でなければ拒む。
+        """
         if (supervisor is None) != (regime is None):
             raise ValueError("Supervisor と Workload Regime 推定は一緒に配線する")
         if rl_supervisor_source is not None and supervisor is None:
@@ -669,6 +715,7 @@ class ControlLoop:
         # **未校正なら推定モデルを作らない**（決定記録 0073 §2.2）。記録するだけで、requested・
         # Guard・Safety へは値を返さない。
         self._air_balance = AirBalanceRecorder.from_control_config(config)
+        self._coordinator = self._build_coordinator(config, air_balance_coordinator)
 
     @property
     def tick_period_ms(self) -> int:
@@ -735,19 +782,36 @@ class ControlLoop:
             external_faults=external,
             tick_overrun=self._previous_overrun,
         )
-        selection, gate_fault = self._select(
+        # **協調は Safety の評価の後・Gate の前**（決定記録 0078 §2.2）。裁定と合成の下限を
+        # 読むだけで、作り直さない。try が囲むのは協調の部品の呼び出しだけ（0078 §2.6）。
+        coordination = self._coordinate(
+            mode=mode,
             snapshot=snapshot,
             snapshot_status=snapshot_status,
-            mode=mode,
             baseline=baseline,
-            learned=learned,
-            safety_state=safety_decision.state,
-            supervisor_available=supervisor_output is not None,
-            started_mono_ms=started_mono_ms,
+            safety=safety_decision,
+            guard=guard_zones,
         )
-        if gate_fault is not None:
-            self._pending_faults += (gate_fault,)
-        requested = self._requested(mode, baseline, selection)
+        if coordination.fault is not None:
+            self._pending_faults += (coordination.fault,)
+        selection: ControllerSelection | None = None
+        if not coordination.bypass_gate:
+            selection, gate_fault = self._select(
+                snapshot=snapshot,
+                snapshot_status=snapshot_status,
+                mode=mode,
+                baseline=coordination.gate_baseline,
+                learned=learned,
+                safety_state=safety_decision.state,
+                supervisor_available=supervisor_output is not None,
+                started_mono_ms=started_mono_ms,
+            )
+            if gate_fault is not None:
+                self._pending_faults += (gate_fault,)
+        # Gate を通せなかった tick（迂回・Gate の例外）は Gate へ渡すはずだった Baseline を使う。
+        # Gate の例外の tick は、apply で上げていれば coordinated baseline（決定記録 0088 §2.1）。
+        # 迂回した tick のそれは raw baseline である（決定記録 0085 §2.1）。
+        requested = self._requested(mode, coordination.gate_baseline, selection)
         composed = self._composer.compose(
             requested=requested,
             guard=guard_zones,
@@ -779,6 +843,7 @@ class ControlLoop:
             safety_state=safety_decision.state,
             supervisor_decision=supervisor_decision,
             regime_estimate=regime_estimate,
+            coordination_bypassed=coordination.bypass_gate,
         )
         if self._admin_mode is not None:
             # `status` のための写しを置くだけ（待たない）。heartbeat の後に置く。
@@ -802,7 +867,8 @@ class ControlLoop:
                 state=state,
                 effective=effective,
                 selection=selection,
-                baseline=baseline,
+                # 0053 の Fallback の値は、その tick の coordinated baseline（決定記録 0078 §2.5）
+                baseline=coordination.gate_baseline,
                 learned=learned,
                 supervisor=supervisor_output,
             ),
@@ -831,6 +897,13 @@ class ControlLoop:
             mode_command=mode_record,
             # **その tick の制御権の出どころを残す**（v13。#92 / 決定記録 0072 §2.6）。
             authority=authority_record,
+            # **Baseline への協調と、Safety の裁定の未確認の tach を残す**
+            # （v14。#81 / 決定記録 0078 §2.7）。
+            # 裁定は直列化しないので、writer がこの tick の裁定から明示的に写す。
+            air_balance_coordination=coordination.record,
+            tach_unconfirmed_zones=tuple(
+                sorted(safety_decision.tach_unconfirmed_zones, key=lambda zone: zone.value)
+            ),
         )
         recorded, trace_failed = self._record(tick)
         # **journal の書き残しと変化の検知は heartbeat と trace の保存の後**（0072 §2.6 /
@@ -1155,6 +1228,201 @@ class ControlLoop:
                 detail=f"{type(error).__name__}: {error}"[:500],
             )
 
+    @staticmethod
+    def _build_coordinator(
+        config: ControlConfig, injected: AirBalanceCoordinator | None
+    ) -> AirBalanceCoordinator | None:
+        """``fan-policy.yaml`` の ``mode`` から協調の部品を作る（決定記録 0078 §2.1）。"""
+        settings = config.policy.air_balance_coordination
+        if injected is not None:
+            if injected.mode is not settings.mode:
+                # 設定と違う mode の部品を差し込むと、trace の mode と実際の扱いが食い違う。
+                raise ValueError("Air Balance の協調の部品は fan-policy.yaml と同じ mode にする")
+            return injected
+        if settings.mode is AirBalanceCoordinationMode.OFF:
+            return None
+        # `shadow` / `apply` と `uncalibrated` の組は ControlConfig が既に拒んでいる（0078 §2.4）。
+        # 部品の側も未校正なら作らない（AirBalanceCoordinator の検証）。
+        model = ConfiguredAirBalanceModel(config.air_balance, config.sources.air_balance.sha256)
+        return AirBalanceCoordinator(
+            settings=settings, model=model, fan_hardware=config.fan_hardware
+        )
+
+    def _coordinate(
+        self,
+        *,
+        mode: ModeCommand,
+        snapshot: ControlStateSnapshot,
+        snapshot_status: SnapshotStatus,
+        baseline: ControllerProposal | None,
+        safety: CriticalSafetyDecision,
+        guard: PerZone[GuardZoneOutput],
+    ) -> _Coordination:
+        """raw baseline に Air Balance の協調を掛ける（決定記録 0078 §2.2〜§2.6 / 0085）。
+
+        条件（0078 §2.3）が1つでも欠ければ ``skipped`` で raw baseline のまま、保持を解く。
+        **例外を捕まえるのは ``AirBalanceCoordinator.apply()`` の呼び出しだけ**で、
+        Critical Safety の裁定の読み取りや合成の下限の計算が投げる例外は捕まえない
+        （0028 §2.7）。
+        """
+        coordinator = self._coordinator
+        if coordinator is None:
+            return _Coordination(
+                record=AirBalanceCoordinationRecord.off(),
+                gate_baseline=baseline,
+                bypass_gate=False,
+                fault=None,
+            )
+        max_raise = coordinator.max_raise()
+        candidate = None if baseline is None else _proposal_demands(baseline)
+        skip_reason = self._coordination_skip_reason(
+            mode=mode, snapshot_status=snapshot_status, baseline=baseline, safety=safety
+        )
+        released = PerZone[bool](front=False, rear=False, top=False)
+        if skip_reason is not None:
+            # 条件が崩れた tick は次の tick で保持を即座に解く（0078 §2.4）。
+            coordinator.release()
+            return _Coordination(
+                record=AirBalanceCoordinationRecord(
+                    mode=coordinator.mode,
+                    status=AirBalanceCoordinationStatus.SKIPPED,
+                    skip_reason=skip_reason,
+                    candidate=candidate,
+                    output=candidate,
+                    max_raise=max_raise,
+                    held=released,
+                ),
+                gate_baseline=baseline,
+                bypass_gate=False,
+                fault=None,
+            )
+        assert baseline is not None and candidate is not None
+        projected = self._projected_floors(safety, guard)
+        thermal = self._air_balance.thermal_inputs(snapshot)
+        try:
+            result = coordinator.apply(
+                candidate=candidate,
+                thermal=thermal,
+                projected_floors=projected.floors,
+                now_mono_ms=snapshot.monotonic_ms,
+            )
+        except Exception as error:
+            return self._coordination_failed(
+                error,
+                tick_id=snapshot.tick_id,
+                mode=coordinator.mode,
+                baseline=baseline,
+                candidate=candidate,
+                max_raise=max_raise,
+                held=released,
+                projected=projected,
+            )
+        return _Coordination(
+            record=_coordination_record(result, projected),
+            gate_baseline=_coordinated_baseline(baseline, result),
+            bypass_gate=False,
+            fault=None,
+        )
+
+    def _coordination_skip_reason(
+        self,
+        *,
+        mode: ModeCommand,
+        snapshot_status: SnapshotStatus,
+        baseline: ControllerProposal | None,
+        safety: CriticalSafetyDecision,
+    ) -> AirBalanceCoordinationSkipReason | None:
+        """0078 §2.3 の表を上から順に見て、最初に欠けた条件を返す。"""
+        if not self._air_balance.enabled:
+            return AirBalanceCoordinationSkipReason.AIR_BALANCE_DISABLED
+        if mode.mode is not OperatingMode.AUTO:
+            return AirBalanceCoordinationSkipReason.OPERATING_MODE
+        if snapshot_status is not SnapshotStatus.AVAILABLE:
+            return AirBalanceCoordinationSkipReason.SNAPSHOT_UNAVAILABLE
+        if baseline is None:
+            return AirBalanceCoordinationSkipReason.BASELINE_UNAVAILABLE
+        if safety.state not in {SafetyState.NORMAL, SafetyState.DEGRADED}:
+            return AirBalanceCoordinationSkipReason.SAFETY_STATE
+        # Fan fault の zone の実際の風量は demand から言えない（不明か 0）。Top でも同じで、
+        # 判定は fault code で行い、SafetyZoneOutput.reason の文字列は読まない（0078 §2.3）。
+        # Front / Rear の forced_max は NORMAL / DEGRADED では Fan fault からしか生じないが、
+        # 将来の裁定の追加に備えて明示的にも確かめる。
+        if (
+            any(fault.code in FAN_FAULT_CODES and fault.zone is not None for fault in safety.faults)
+            or safety.zones.front.forced_max
+            or safety.zones.rear.forced_max
+        ):
+            return AirBalanceCoordinationSkipReason.ZONE_FAN_FAULT
+        if safety.tach_unconfirmed_zones:
+            return AirBalanceCoordinationSkipReason.TACH_UNCONFIRMED
+        return None
+
+    def _projected_floors(
+        self, safety: CriticalSafetyDecision, guard: PerZone[GuardZoneOutput]
+    ) -> ProjectedFloors:
+        """合成が requested に掛ける zone ごとの下限の見込み（決定記録 0078 §2.2）。
+
+        ramp_down の下限は合成と同じ関数・同じ前 tick の effective・同じ経過時間で求める。
+        経過時間は、このあと合成に渡す Safety 裁定の時刻から数える。
+        """
+        ramp = PerZone[float | None](
+            front=self._composer.ramp_floor(Zone.FRONT, safety.monotonic_ms),
+            rear=self._composer.ramp_floor(Zone.REAR, safety.monotonic_ms),
+            top=self._composer.ramp_floor(Zone.TOP, safety.monotonic_ms),
+        )
+        return project_floors(safety=safety.zones, guard=guard, ramp=ramp)
+
+    @staticmethod
+    def _coordination_failed(
+        error: Exception,
+        *,
+        tick_id: int,
+        mode: AirBalanceCoordinationMode,
+        baseline: ControllerProposal,
+        candidate: PerZone[Demand],
+        max_raise: PerZone[Demand],
+        held: PerZone[bool],
+        projected: ProjectedFloors,
+    ) -> _Coordination:
+        """協調の失敗を握りつぶさず ``failed`` として残す（決定記録 0078 §2.6 / 0085）。
+
+        ``mode: apply`` では ``fallback_exception`` へ翻訳し（次 tick の Safety が EMERGENCY）、
+        この tick は Gate を迂回して raw baseline を requested にする。
+        ``mode: shadow`` は記録だけで、raw baseline を持って Gate を通す（shadow は Fan を
+        変えない）。保持は ``apply()`` が解いた。
+        """
+        LOGGER.exception(
+            "air balance coordination failed",
+            extra={logs.FIELDS_KEY: {"tick_id": tick_id, "mode": mode.value}},
+        )
+        description = f"{type(error).__name__}: {error}"
+        apply_mode = mode is AirBalanceCoordinationMode.APPLY
+        return _Coordination(
+            record=AirBalanceCoordinationRecord(
+                mode=mode,
+                status=AirBalanceCoordinationStatus.FAILED,
+                candidate=candidate,
+                output=candidate,
+                max_raise=max_raise,
+                held=held,
+                projected_floors=projected.floors,
+                projected_floor_basis=projected.basis,
+                failure=AirBalanceCoordinationFailure(
+                    type=type(error).__name__[:120], detail=str(error)[:500]
+                ),
+            ),
+            gate_baseline=baseline,
+            bypass_gate=apply_mode,
+            fault=(
+                Fault(
+                    code=FaultCode.FALLBACK_EXCEPTION,
+                    detail=f"air_balance_coordination: {description}"[:500],
+                )
+                if apply_mode
+                else None
+            ),
+        )
+
     def _select(
         self,
         *,
@@ -1378,6 +1646,7 @@ class ControlLoop:
         safety_state: SafetyState,
         supervisor_decision: SupervisorDecision | None,
         regime_estimate: WorkloadRegimeEstimate | None,
+        coordination_bypassed: bool,
     ) -> ControlState:
         set_by_people = mode.mode in {OperatingMode.MANUAL, OperatingMode.CALIBRATION}
         stage = self._effective_stage(selection)
@@ -1394,9 +1663,17 @@ class ControlLoop:
             and safety_state is SafetyState.NORMAL
         ):
             # Gate を通せなかった tick。理由の無い Fallback を trace に残さない。
-            fallback_reason = Reason(
-                code="controller_gate_unavailable",
-                detail="Controller Gate がこの tick の選択を返さなかった",
+            # 協調の失敗で迂回した tick は Gate の失敗と分ける（決定記録 0085 §2.2）。
+            fallback_reason = (
+                Reason(
+                    code=AIR_BALANCE_COORDINATION_FAILED,
+                    detail="Air Balance の協調が失敗したため Controller Gate を迂回した",
+                )
+                if coordination_bypassed
+                else Reason(
+                    code="controller_gate_unavailable",
+                    detail="Controller Gate がこの tick の選択を返さなかった",
+                )
             )
         selected = None if supervisor_decision is None else supervisor_decision.selected_output
         return ControlState(
@@ -1541,6 +1818,85 @@ class ControlLoop:
                 extra={logs.FIELDS_KEY: {"tick_id": tick.tick_id}},
             )
             return False, True
+
+
+def _proposal_demands(proposal: ControllerProposal) -> PerZone[Demand]:
+    """提案の zone ごとの requested demand。"""
+    return PerZone[Demand](
+        front=proposal.requested.front.demand,
+        rear=proposal.requested.rear.demand,
+        top=proposal.requested.top.demand,
+    )
+
+
+def _coordination_record(
+    result: CoordinatorResult, projected: ProjectedFloors
+) -> AirBalanceCoordinationRecord:
+    """``coordinate()`` を呼んだ tick の trace の塊（決定記録 0078 §2.7）。"""
+    coordination = result.coordination
+    return AirBalanceCoordinationRecord(
+        mode=result.mode,
+        status=AirBalanceCoordinationStatus(result.status),
+        candidate=result.candidate,
+        proposed=result.proposed,
+        output=result.output,
+        counterfactual_output=result.counterfactual_output,
+        max_raise=result.max_raise,
+        bounded_by_max_raise=result.bounded_by_max_raise,
+        held=result.held,
+        projected_floors=result.projected_floors,
+        projected_floor_basis=projected.basis,
+        before_state=AirBalanceTraceState(coordination.before.state.value),
+        before_ratio=coordination.before.balance_ratio,
+        projected_state=AirBalanceTraceState(coordination.projected.state.value),
+        projected_ratio=coordination.projected.balance_ratio,
+        # code の値は record の型（Literal）が検証する。
+        reasons=cast(
+            tuple[AirBalanceCoordinationReasonCode, ...],
+            tuple(reason.code for reason in coordination.reasons),
+        ),
+    )
+
+
+def _coordinated_baseline(
+    baseline: ControllerProposal, result: CoordinatorResult
+) -> ControllerProposal:
+    """協調の ``output`` を requested にした Fallback の提案（Gate へ渡す Baseline）。
+
+    上げた zone だけ値と理由を差し替え、detail に raw baseline の理由と ``candidate`` /
+    ``output`` を残す（``fallback_coordinated_max`` と同じ形。決定記録 0078 §2.7）。
+    shadow と ``not_needed`` は ``output == candidate`` なので raw baseline のまま返す。
+    """
+    requests: dict[Zone, ZoneRequest] = {}
+    for zone in Zone:
+        raw = baseline.requested.get(zone)
+        output = result.output.get(zone)
+        if output <= raw.demand:
+            requests[zone] = raw
+            continue
+        code = (
+            AIR_BALANCE_RELEASE_HOLD_REASON
+            if result.held.get(zone)
+            else AIR_BALANCE_ZONE_REASONS[zone]
+        )
+        detail = "; ".join(
+            (
+                f"candidate={raw.demand:.6f}",
+                f"output={output:.6f}",
+                f"baseline_reason={raw.reason.code}",
+                f"baseline_detail={raw.reason.detail}",
+            )
+        )
+        requests[zone] = ZoneRequest(demand=output, reason=Reason(code=code, detail=detail[:500]))
+    if all(requests[zone] is baseline.requested.get(zone) for zone in Zone):
+        return baseline
+    return baseline.model_copy(
+        update={
+            "requested": PerZone[ZoneRequest](
+                front=requests[Zone.FRONT], rear=requests[Zone.REAR], top=requests[Zone.TOP]
+            )
+        }
+    )
 
 
 def _fan_state(demand: EffectiveZoneDemand, result: FanHardwareResult) -> FanState:

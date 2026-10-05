@@ -261,6 +261,7 @@ src/coldaisle/
     authority.py      # Authority Stage の journal（authority.json）と AuthorityRuntime（降格は即時・書き残しは heartbeat の後・journal の変化を毎 tick 検知。**上げる経路を持たない**）。#92 / 決定記録 0057 / 0072 §2.6
     air_balance.py       # Air Balance Model と air-balance.yaml（v2）の形。Safety ではない。#81
     air_balance_trace.py # applied demand から Air Balance を trace へ記録するだけ（制御へ効かない）。#81 / 決定記録 0073
+    air_balance_coordination.py # Baseline（Fallback）の requested への Air Balance の協調（上げるだけ・max_raise・保持。Gate の前・合成の前）。#81 / 決定記録 0078 / 0085
     supervisor/ # RulePolicy / RLPolicy / Workload Regime
     model/      # Learned Thermal Model、Confidence / OOD
     mpc/        # Optimizer / horizon制御

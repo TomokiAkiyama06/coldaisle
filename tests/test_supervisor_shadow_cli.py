@@ -28,6 +28,7 @@ from coldaisle.clock import SimulatedClock
 from coldaisle.control.config import CONTROL_CONFIG_VERSION, ControlConfig
 from coldaisle.control.model_registry import ModelRegistry
 from coldaisle.control.schema import (
+    AirBalanceCoordinationRecord,
     AirBalanceRecord,
     AuthorityRecord,
     AuthorityStage,
@@ -263,6 +264,8 @@ class Fixture:
             ),
             mode_command=ModeCommandRecord.without_entry(),
             authority=AuthorityRecord(entry="static", config_ceiling=AuthorityStage.FULL),
+            air_balance_coordination=AirBalanceCoordinationRecord.off(),
+            tach_unconfirmed_zones=(),
         )
 
 

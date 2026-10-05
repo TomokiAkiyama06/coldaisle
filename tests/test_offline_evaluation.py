@@ -62,6 +62,7 @@ from coldaisle.control.schema import (
     MAX_SHADOW_PREDICTION_METRICS,
     MODEL_GATE_ASSESSMENT_COMPONENTS,
     SCHEMA_VERSION,
+    AirBalanceCoordinationRecord,
     AirBalanceRecord,
     AirBalanceTraceState,
     AuthorityLimitSource,
@@ -180,11 +181,13 @@ def strip_v3_provenance(document: dict[str, Any]) -> None:
 
 def strip_v11_fields(document: dict[str, Any]) -> None:
     """v11 以降で足した欄（`air_balance`・zone の `applied_demand`・v12 の `mode_command`・
-    v13 の `authority`）を
+    v13 の `authority`・v14 の `air_balance_coordination` / `tach_unconfirmed_zones`）を
     旧い版の形へ戻す。"""
     document.pop("air_balance", None)
     document.pop("mode_command", None)
     document.pop("authority", None)
+    document.pop("air_balance_coordination", None)
+    document.pop("tach_unconfirmed_zones", None)
     for zone in ("front", "rear", "top"):
         document["zones"][zone].pop("applied_demand", None)
 
@@ -378,6 +381,8 @@ def tick_at(
         air_balance=air_balance_for(flow),
         mode_command=ModeCommandRecord.without_entry(),
         authority=AuthorityRecord(entry="static", config_ceiling=AuthorityStage.FULL),
+        air_balance_coordination=AirBalanceCoordinationRecord.off(),
+        tach_unconfirmed_zones=(),
     )
 
 

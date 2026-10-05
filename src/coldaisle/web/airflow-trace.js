@@ -21,10 +21,13 @@
 (function (root) {
   // 版ごとに**初めて現れた**欄（control/schema.py の SCHEMA_VERSION の説明）。
   // **schema.py にある版だけを知っている版にする。** 版の番号は先にマージされた PR で決まる
-  // （0064 §2.9 / 0071 §2.5）ため、推測で先取りしない。v14 以降は「未対応の版」。
+  // （0064 §2.9 / 0071 §2.5）ため、推測で先取りしない。v15 以降は「未対応の版」。
   // v11（#81 / 決定記録 0073 §2.5）: `air_balance` と `zones.*.applied_demand`。
   // v12（#74 / 決定記録 0072 §2.7）: `mode_command`（モードの出どころ・lease 切れ・受付の停止）。
   // v13（#92 / 決定記録 0072 §2.6）: `authority`（制御権の出どころ・journal を読めない・降格の指令）。
+  // v14（#81 / 決定記録 0078 §2.7）: `air_balance_coordination`（Baseline への Air Balance の協調）と
+  //   `tach_unconfirmed_zones`。協調の状態を画面に出すかは 0078 §5 のとおり #106 の後続で決める
+  //   ので、ここでは版を読めるようにするだけで表示しない。
   const SINCE = {
     workload_regime: 2,
     supervisor: 3,
@@ -37,8 +40,10 @@
     applied_demand: 11,
     mode_command: 12,
     authority: 13,
+    air_balance_coordination: 14,
+    tach_unconfirmed_zones: 14,
   };
-  const KNOWN_VERSIONS = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13];
+  const KNOWN_VERSIONS = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14];
 
   const NOT_IN_VERSION = "この版の記録には無い";
   const ZONE_KEYS = ["front", "rear", "top"];
