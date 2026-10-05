@@ -24,10 +24,11 @@ SHADOW  →  LIMITED  →  EXPANDED  →  FULL
 |---|---|
 | `authority.json`（`AuthorityStore`） | 与えている制御権の正本。人の承認で上がり、自動降格で下がる |
 | `fan-policy.yaml` の `authority_stage`（#103） | 設定が許す**上限**。下げれば再起動後に効き、上げても journal は上がらない |
-| `AuthorityRuntime` が下げた上限 | この process が自動降格で下げた分。**永続化できなくても保持する** |
+| `AuthorityRuntime` が下げた上限 | この process が自動降格で下げた分。**永続化できなくても保持する**（journal を置き換えた後のディレクトリの `fsync` に失敗した降格も、毎 tick `fsync` をやり直し、通るまで保持する） |
 | artifact の上限（決定記録 0089） | journal の承認が、この process が使っている artifact のものでなければ Baseline |
+| config の上限（決定記録 0090） | journal の承認が、この process が起動時に読んだ Control Config のものでなければ Baseline |
 
-実効 stage は4つのうち**もっとも低いもの**である。`ControllerGate` 側でも上限を掛ける。
+実効 stage は5つのうち**もっとも低いもの**である。`ControllerGate` 側でも上限を掛ける。
 
 ### いま使っている artifact との照合（決定記録 0089）
 
@@ -48,6 +49,32 @@ SHADOW  →  LIMITED  →  EXPANDED  →  FULL
 
 Production を入れ替えたら、新しい artifact について SHADOW から1段ずつ上げ直す（入れ替えの前に
 `rollback` しておくと、journal と実効 stage が食い違わない）。
+
+### 起動時に読んだ Control Config との照合（決定記録 0090）
+
+`coldaisle-fand` は Control Config の4ファイル（`fan-hardware.yaml` / `safety.yaml` / `fan-policy.yaml` /
+`air-balance.yaml`）を起動時に1回だけ読む。一方 `coldaisle-authority raise` は**実行した時点の**
+`--config-dir` の4ファイルで証拠を検証する。走行中に4ファイルを A → B へ差し替えると、B の証拠で
+上げた authority を A の設定で動く fand が得てしまうので、artifact と同じく照合する。
+
+- 照らす値は、fand が制御に使う `ControlConfig.sources`（4ファイルそれぞれの bytes の SHA-256。
+  `loaded_config_sources`。既定値は無い）
+- journal が最後に Baseline にいた後の昇格**すべて**の証拠の4つの hash（`fan_policy_config_sha256` /
+  `safety_config_sha256` / `air_balance_config_sha256` / `fan_hardware_config_sha256`）が一致すれば上限を
+  掛けない。1件・1ファイルでも違えば、また証拠に hash が無ければ（journal v1 の event）、Baseline
+- **journal は書かない**。承認どおりの設定で再起動すれば journal どおりに戻る
+- 上限が変わったとき（起動時を含む）に構造化ログ（`authority_config_mismatch` /
+  `authority_config_matched`）を1行出す。食い違ったファイルは `mismatched_files` に出る
+
+### artifact・設定を入れ替えるときの手順
+
+| 入れ替えるもの | 手順 |
+|---|---|
+| Production の artifact（0089） | 入れ替えの前に `rollback` し、新しい artifact について SHADOW から1段ずつ上げ直す |
+| Control Config の4ファイル（0090） | **差し替えの前に `rollback` し**、fand を再起動してから、新しい設定で取った Shadow の証拠で SHADOW から1段ずつ上げ直す。コメントや空白だけの変更でも hash が変わるので同じ |
+
+rollback しないまま入れ替えても、fand は Baseline より上を有効にしない（安全側）。ただし journal の
+stage と実効 stage が食い違ったままになり、構造化ログを見ないと理由が分からない。
 
 `ControllerGate` と `LearnedMpcController` は stage の供給元（`AuthorityStageSource`）を
 **必須の引数**にしている。既定値を置くと、配線を忘れた起動が設定の**上限**を
@@ -274,14 +301,17 @@ CLI で書いた rollback も、動いている fand は次の tick で journal 
   Gate まで運ぶ。覆っていなければ `binding_authority_not_covered` で Fallback にする
 - `AuthorityRuntime.trace_metadata()`: 実効 stage・journal の stage・設定の上限・
   直近の変更（種別・主体・理由・時刻）・永続化の失敗・journal を読めないこと・artifact の上限
-  （`authority_artifact_ceiling`。0089）。**model version も照らした artifact の hash も含めない**
+  （`authority_artifact_ceiling`。0089）・config の上限（`authority_config_binding_ceiling`。0090。
+  `authority_config_ceiling` は `fan-policy.yaml` の上限で別物）。**model version も照らした artifact や
+  設定の hash も含めない**
 - `ControlTick` v13 以降（いまは v14）の `authority`（`AuthorityRecord`）: その tick の Gate が stage を読んだ時点の
   journal の stage と revision・設定の上限・書き残せずに持っている上限・`journal_unreadable`・
   その tick の先頭で入れた管理ソケットの降格の `command_id`・直近の永続化の失敗。
   実効 stage（`state.authority_stage`）はこれらの最小を超えない（schema が拒む）。
   **artifact の上限（0089）は `AuthorityRecord` に欄が無い**（足すと版上げになる）。所有者の判断（2026-10-05。
   0089 §5 の 1 / §6）により、trace の次の版上げのときに `AuthorityRecord` v2 で欄を足す。それまで
-  journal より低い理由は fand の構造化ログ（`authority_artifact_mismatch` / `_unbound` / `_matched`）で見る
+  journal より低い理由は fand の構造化ログ（`authority_artifact_mismatch` / `_unbound` / `_matched`）で見る。
+  config の上限（0090）も同じ扱い（`authority_config_mismatch` / `_matched`。0090 §5 の 3）
 
 ## まだ無いもの
 

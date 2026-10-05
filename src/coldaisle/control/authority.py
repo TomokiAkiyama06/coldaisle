@@ -43,7 +43,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_valida
 
 from coldaisle import logs
 from coldaisle.clock import Clock, WallClock
-from coldaisle.control.config import ControlConfig, FanPolicyConfig
+from coldaisle.control.config import ConfigSources, ControlConfig, FanPolicyConfig
 from coldaisle.control.evaluation.model import (
     AppliedArm,
     CounterfactualArm,
@@ -1636,15 +1636,21 @@ class AuthorityRuntime:
     （決定記録 0089）。いまの stage へ至る昇格の承認の `evidence.artifact_sha256` が
     ``loaded_artifact_sha256`` と1件でも違えば、また artifact を持たない構成では、実効 stage の
     上限を Baseline にする。journal は書かない（承認そのものは正しい）。
+
+    **同じく、この process が起動時に読んだ Control Config に対して承認された分だけ有効にする**
+    （決定記録 0090）。いまの stage へ至る昇格の証拠の4つの設定の hash が
+    ``loaded_config_sources`` と1件・1ファイルでも違えば、実効 stage の上限を Baseline にする。
     """
 
     __slots__ = (
         "_artifact_ceiling",
+        "_config_binding_ceiling",
         "_demotion_consumed",
         "_journal",
         "_journal_unreadable",
         "_last_mono_ms",
         "_loaded_artifact",
+        "_loaded_config",
         "_lock_waited",
         "_low_confidence",
         "_ood",
@@ -1663,8 +1669,13 @@ class AuthorityRuntime:
         policy: FanPolicyConfig,
         *,
         loaded_artifact_sha256: str | None,
+        loaded_config_sources: ConfigSources,
     ) -> None:
         """**時計は持たない。** 記録の時刻は store が自分の時計で決める。
+
+        ``loaded_config_sources`` は、この process が起動時に読んで使い続けている Control Config の
+        4ファイルの hash（制御に使う ``ControlConfig.sources`` そのもの。決定記録 0090 §2.1）。
+        **既定値を置かない**（``loaded_artifact_sha256`` と同じ理由）。
 
         ``loaded_artifact_sha256`` は、この process が起動時に束縛して使い続けている model artifact
         （Controller Gate の ``expected_artifact_sha256`` と同じ値・同じ出どころ。
@@ -1688,13 +1699,16 @@ class AuthorityRuntime:
         self._store = store
         self._policy = policy
         self._loaded_artifact = loaded_artifact_sha256
-        # 起動時は「前の状態」が無いので、最初の照合の結果を必ずログに出す（0089 §2.5）。
+        self._loaded_config = loaded_config_sources
+        # 起動時は「前の状態」が無いので、最初の照合の結果を必ずログに出す
+        # （0089 §2.5 / 0090 §2.5）。
         self._artifact_ceiling: AuthorityStage | None = None
+        self._config_binding_ceiling: AuthorityStage | None = None
         # **stat を先に取ってから読む。** 読んだ後に書き換わっても、覚えた stat と違うので
         # 次の点検で読み直す（逆順だと、読んでから stat までの書き換えを見逃す）。
         self._signature: object = store.journal_signature()
         self._journal = store.read()
-        self._bind_artifact()
+        self._bind_approvals()
         # **書き残せなかった降格だけ**を memory 上の上限として持つ（0057 §2.6）。
         # 書けた降格は journal がそのまま表しているので、二重に持たない。持つと、
         # あとから承認された昇格が再起動まで効かなくなる（codex #4056968495）。
@@ -1745,6 +1759,20 @@ class AuthorityRuntime:
         assert self._artifact_ceiling is not None, "__init__ で必ず照合している"
         return self._artifact_ceiling
 
+    @property
+    def loaded_config_sources(self) -> ConfigSources:
+        """この process が起動時に読んだ Control Config の4ファイルの hash（決定記録 0090）。"""
+        return self._loaded_config
+
+    @property
+    def config_binding_ceiling(self) -> AuthorityStage:
+        """journal の承認と loaded config の照合から決まる上限（決定記録 0090 §2.2）。
+
+        `configured_ceiling`（`fan-policy.yaml` の `authority_stage`）とは別物である。
+        """
+        assert self._config_binding_ceiling is not None, "__init__ で必ず照合している"
+        return self._config_binding_ceiling
+
     def current_stage(self) -> AuthorityStage:
         """この tick に与えてよい制御権。**上限を超えることはない。**"""
         return lowest_stage(
@@ -1752,6 +1780,7 @@ class AuthorityRuntime:
             self.configured_ceiling,
             self._unpersisted_ceiling,
             self.artifact_ceiling,
+            self.config_binding_ceiling,
         )
 
     def reload(self) -> None:
@@ -1761,7 +1790,7 @@ class AuthorityRuntime:
         書き残せなかった降格を「読み直すだけ」で取り消せてしまう。
         """
         self._journal = self._store.read()
-        self._bind_artifact()
+        self._bind_approvals()
 
     def observe(
         self,
@@ -1999,7 +2028,50 @@ class AuthorityRuntime:
         # 上限だけを載せ、照らした artifact の hash は載せない（stage と model は独立に残す。
         # 0057 §2.7 / 0089 §2.5）。artifact は Gate と registry の記録が持つ。
         metadata["authority_artifact_ceiling"] = self.artifact_ceiling.value
+        # config の照合の上限だけを載せる（0090 §2.5）。設定の hash は trace の `sources` が持つ。
+        # `authority_config_ceiling`（fan-policy.yaml の上限）とは別の欄にする。
+        metadata["authority_config_binding_ceiling"] = self.config_binding_ceiling.value
         return metadata
+
+    def _bind_approvals(self) -> None:
+        """いまの journal を loaded artifact と loaded config に照合し直す（0089 / 0090 §2.3）。"""
+        self._bind_artifact()
+        self._bind_config()
+
+    def _bind_config(self) -> None:
+        """いまの journal を loaded config と照合し直す（決定記録 0090）。
+
+        上限が変わったときだけログに出す（§2.5）。**上げる向きには働かない。** journal は書かない。
+        """
+        mismatch = _first_config_mismatch(self._journal, self._loaded_config)
+        ceiling = BASELINE_STAGE if mismatch is not None else AuthorityStage.FULL
+        previous = self._config_binding_ceiling
+        self._config_binding_ceiling = ceiling
+        if previous is ceiling:
+            return
+        matched = mismatch is None
+        fields: dict[str, object] = {
+            "event": "authority_config_matched" if matched else "authority_config_mismatch",
+            "journal_stage": self._journal.stage.value,
+            "journal_revision": self._journal.revision,
+            "loaded_config_sha256": _loaded_config_digests(self._loaded_config),
+            "authority_config_binding_ceiling": ceiling.value,
+        }
+        if mismatch is None:
+            _LOGGER.info(
+                "authority の config の照合で上限を掛けない（Baseline か、承認が一致）",
+                extra={logs.FIELDS_KEY: fields},
+            )
+            return
+        event, approved, files = mismatch
+        fields["mismatched_revision"] = event.revision
+        fields["approved_config_sha256"] = approved
+        fields["mismatched_files"] = list(files)
+        _LOGGER.warning(
+            "authority の承認が起動時に読んだ Control Config のものではないため、"
+            "Baseline より上を有効にしない",
+            extra={logs.FIELDS_KEY: fields},
+        )
 
     def _bind_artifact(self) -> None:
         """いまの journal を loaded artifact と照合し直す（0089 §2.3）。
@@ -2120,7 +2192,7 @@ class AuthorityRuntime:
             # 見えている journal は持つ（下げた側なので上げる向きには働かない）が、
             # **上限は手放さない**。次の tick から `_make_durable()` が fsync をやり直す。
             self._journal = error.journal
-            self._bind_artifact()
+            self._bind_approvals()
             self._signature = _SIGNATURE_UNKNOWN
             previous = self._undurable_stage
             self._undurable_stage = (
@@ -2136,7 +2208,7 @@ class AuthorityRuntime:
             self._persist_failure = failure
             return failure
         self._journal = journal
-        self._bind_artifact()
+        self._bind_approvals()
         self._signature = _SIGNATURE_UNKNOWN
         self._persist_failure = None
         self._release_if_represented()
@@ -2266,7 +2338,7 @@ class AuthorityRuntime:
             )
             return
         self._journal = journal
-        self._bind_artifact()
+        self._bind_approvals()
         self._signature = signature
         if journal != previous:
             _LOGGER.info(
@@ -2333,12 +2405,7 @@ def _first_artifact_mismatch(
         return None
     if loaded_artifact_sha256 is None:
         return _NO_LOADED_ARTIFACT
-    climb: list[AuthorityEvent] = []
-    for event in reversed(journal.events):
-        if event.to_stage is BASELINE_STAGE:
-            break
-        climb.append(event)
-    for event in reversed(climb):
+    for event in _climb_since_baseline(journal):
         approval = event.approval
         if approval is None:
             # 降格。連なりの中の降格は承認を持たない（0057 §2.6）
@@ -2346,6 +2413,59 @@ def _first_artifact_mismatch(
         if approval.evidence.artifact_sha256 != loaded_artifact_sha256:
             return event
     return None
+
+
+def _loaded_config_digests(sources: ConfigSources) -> dict[str, str | None]:
+    """loaded config の4つの hash を、証拠の欄の名前で並べる（照合とログで同じ形にする）。"""
+    return {
+        "fan_policy_config_sha256": sources.policy.sha256,
+        "safety_config_sha256": sources.safety.sha256,
+        "air_balance_config_sha256": sources.air_balance.sha256,
+        "fan_hardware_config_sha256": sources.fan_hardware.sha256,
+    }
+
+
+def _approved_config_digests(evidence: RolloutEvidence) -> dict[str, str | None]:
+    """証拠が束縛している4つの hash。journal v1 の証拠は後ろの2つが None（0073 §2.6）。"""
+    return {
+        "fan_policy_config_sha256": evidence.fan_policy_config_sha256,
+        "safety_config_sha256": evidence.safety_config_sha256,
+        "air_balance_config_sha256": evidence.air_balance_config_sha256,
+        "fan_hardware_config_sha256": evidence.fan_hardware_config_sha256,
+    }
+
+
+def _first_config_mismatch(
+    journal: AuthorityJournal, loaded: ConfigSources
+) -> tuple[AuthorityEvent, dict[str, str | None], tuple[str, ...]] | None:
+    """いまの stage へ至る昇格のうち、loaded config のものでない最初の1件（決定記録 0090 §2.2）。
+
+    None は「上限を掛けない」。返すのは食い違った昇格、その証拠の4つの hash、食い違った欄の名前。
+    証拠に hash が無い欄（journal v1 の event）は一致を言えないので、食い違いとして扱う（§5 の 2）。
+    """
+    if journal.stage is BASELINE_STAGE:
+        return None
+    expected = _loaded_config_digests(loaded)
+    for event in _climb_since_baseline(journal):
+        approval = event.approval
+        if approval is None:
+            continue
+        approved = _approved_config_digests(approval.evidence)
+        files = tuple(name for name, digest in expected.items() if approved[name] != digest)
+        if files:
+            return event, approved, files
+    return None
+
+
+def _climb_since_baseline(journal: AuthorityJournal) -> list[AuthorityEvent]:
+    """journal が最後に Baseline にいた時点より後の event（古い順）。"""
+    climb: list[AuthorityEvent] = []
+    for event in reversed(journal.events):
+        if event.to_stage is BASELINE_STAGE:
+            break
+        climb.append(event)
+    climb.reverse()
+    return climb
 
 
 def _extends(journal: AuthorityJournal, known: AuthorityJournal) -> bool:

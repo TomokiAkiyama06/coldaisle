@@ -1446,6 +1446,7 @@ def test_invariant_28_the_authority_store_does_not_wait_forever_for_its_lock(
             AuthorityStore(root, SimulatedClock(TEST_EPOCH_MS)),
             control_config().policy,
             loaded_artifact_sha256=None,
+            loaded_config_sources=control_config().sources,
         )
 
 

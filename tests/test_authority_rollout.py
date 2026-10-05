@@ -345,6 +345,8 @@ POLICY_SHA = DEFAULT_CONFIG.sources.policy.sha256
 SAFETY_SHA = DEFAULT_CONFIG.sources.safety.sha256
 AIR_BALANCE_SHA = DEFAULT_CONFIG.sources.air_balance.sha256
 FAN_HARDWARE_SHA = DEFAULT_CONFIG.sources.fan_hardware.sha256
+LOADED_CONFIG = DEFAULT_CONFIG.sources
+"""fand が起動時に読んだ Control Config（決定記録 0090）。既定は承認の証拠と同じ設定。"""
 
 ALL_MATCHED = TraceConfigBinding(matched=1_000, mismatched=0, missing=0)
 """消費した tick がすべていまの設定で記録されていた、という突き合わせ（決定記録 0073 §2.6）。"""
@@ -625,6 +627,7 @@ def runtime(
         authority,
         settings if settings is not None else policy(authority=ceiling),
         loaded_artifact_sha256=loaded,
+        loaded_config_sources=LOADED_CONFIG,
     )
 
 
@@ -646,6 +649,7 @@ def unwritable_runtime(
         UnwritableStore(tmp_path / "authority", SimulatedClock(NOW_MS), lock_timeout_ms=500),
         policy(authority="full"),
         loaded_artifact_sha256=ARTIFACT_SHA,
+        loaded_config_sources=LOADED_CONFIG,
     )
 
 
@@ -1867,7 +1871,10 @@ def test_invariant_6_i_recovering_after_an_automatic_demotion_needs_a_new_approv
     document = report_document()
     raise_stage(authority, approval=approval_for(document), document=document)
     control = AuthorityRuntime(
-        authority, policy(authority="full"), loaded_artifact_sha256=ARTIFACT_SHA
+        authority,
+        policy(authority="full"),
+        loaded_artifact_sha256=ARTIFACT_SHA,
+        loaded_config_sources=LOADED_CONFIG,
     )
     control.observe(safety_state=SafetyState.EMERGENCY, now_mono_ms=0)
     assert control.current_stage() is BASELINE_STAGE
@@ -2013,6 +2020,7 @@ def test_invariant_6_o_a_demotion_takes_effect_before_it_is_persisted(tmp_path: 
         WatchingStore(tmp_path / "authority", SimulatedClock(NOW_MS), lock_timeout_ms=500),
         policy(authority="full"),
         loaded_artifact_sha256=ARTIFACT_SHA,
+        loaded_config_sources=LOADED_CONFIG,
     )
     holder.append(control)
     assert control.current_stage() is AuthorityStage.FULL
@@ -2038,6 +2046,7 @@ def test_invariant_6_p_an_unexpected_persist_failure_still_lowers(tmp_path: Path
         ExplodingStore(tmp_path / "authority", SimulatedClock(NOW_MS), lock_timeout_ms=500),
         policy(authority="full"),
         loaded_artifact_sha256=ARTIFACT_SHA,
+        loaded_config_sources=LOADED_CONFIG,
     )
 
     with pytest.raises(RuntimeError):
@@ -2175,7 +2184,10 @@ def test_invariant_7_b_raising_the_configured_ceiling_does_not_raise_the_journal
     authority = store(tmp_path)
 
     control = AuthorityRuntime(
-        authority, policy(authority="full"), loaded_artifact_sha256=ARTIFACT_SHA
+        authority,
+        policy(authority="full"),
+        loaded_artifact_sha256=ARTIFACT_SHA,
+        loaded_config_sources=LOADED_CONFIG,
     )
 
     assert control.configured_ceiling is AuthorityStage.FULL
@@ -2340,7 +2352,10 @@ def test_invariant_8_a_promoting_a_model_does_not_change_the_authority_stage(
     assert after.stage is AuthorityStage.LIMITED
     assert registry.inspect().production[ArtifactKind.THERMAL_MODEL].active.version == "1.0.0"
     control = AuthorityRuntime(
-        authority, policy(authority="full"), loaded_artifact_sha256=ARTIFACT_SHA
+        authority,
+        policy(authority="full"),
+        loaded_artifact_sha256=ARTIFACT_SHA,
+        loaded_config_sources=LOADED_CONFIG,
     )
     assert control.current_stage() is AuthorityStage.LIMITED
     # **入れ替えた artifact で動く fand には、前の artifact の承認を渡さない**（決定記録 0089）。
@@ -2349,7 +2364,10 @@ def test_invariant_8_a_promoting_a_model_does_not_change_the_authority_stage(
     promoted = snapshot.artifacts[snapshot.production[ArtifactKind.THERMAL_MODEL].active.key]
     assert promoted.metadata.sha256 != ARTIFACT_SHA
     swapped = AuthorityRuntime(
-        authority, policy(authority="full"), loaded_artifact_sha256=promoted.metadata.sha256
+        authority,
+        policy(authority="full"),
+        loaded_artifact_sha256=promoted.metadata.sha256,
+        loaded_config_sources=LOADED_CONFIG,
     )
     assert swapped.current_stage() is BASELINE_STAGE
     assert authority.read() == before
@@ -2391,6 +2409,7 @@ def control_runtime(tmp_path: Path, *, loaded: str | None = ARTIFACT_SHA) -> Aut
         AuthorityStore(tmp_path / "authority", SimulatedClock(NOW_MS), lock_timeout_ms=500),
         policy(authority="full"),
         loaded_artifact_sha256=loaded,
+        loaded_config_sources=LOADED_CONFIG,
     )
 
 
@@ -2706,6 +2725,197 @@ def test_invariant_8_d_the_two_states_live_in_separate_files(tmp_path: Path) -> 
     assert not (tmp_path / "registry" / "authority.json").exists()
 
 
+# --- 決定記録 0090: fand が起動時に読んだ Control Config に対して承認された分だけ有効にする ------
+
+
+OTHER_CONFIG = control_config(Path(_FIXTURES.name), ceiling="full", ood_after=7)
+"""差し替えた後の設定（B）。``fan-policy.yaml`` だけが違う（rollout の値を1つ変えた）。"""
+
+
+def raise_with_config(
+    authority: AuthorityStore, config: ControlConfig, *, from_stage: AuthorityStage
+) -> AuthorityJournal:
+    """``config`` で取った証拠により1段上げる（CLI が ``--config-dir`` の設定で検証する経路）。"""
+    document = report_document(
+        stages=(from_stage.value,),
+        arm_stage=from_stage,
+        policy_sha=config.sources.policy.sha256,
+        safety_sha=config.sources.safety.sha256,
+    )
+    return raise_stage(
+        authority,
+        approval=approval_for(
+            document,
+            from_stage=from_stage,
+            revision=authority.read().revision,
+            evidence=evidence_for(
+                document,
+                arm=learned_arm(from_stage).key,
+                policy_sha=config.sources.policy.sha256,
+                safety_sha=config.sources.safety.sha256,
+                air_balance_sha=config.sources.air_balance.sha256,
+                fan_hardware_sha=config.sources.fan_hardware.sha256,
+            ),
+        ),
+        document=document,
+        config=config,
+    )
+
+
+def config_log_fields(caplog: pytest.LogCaptureFixture, event: str) -> list[dict[str, Any]]:
+    return [
+        fields
+        for record in caplog.records
+        if isinstance(fields := getattr(record, logs.FIELDS_KEY, None), dict)
+        and fields.get("event") == event
+    ]
+
+
+def test_0090_a_raise_with_another_configs_evidence_is_baseline_for_the_running_config(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """**設定 B の証拠で上げた journal を、設定 A で動く runtime が読むと Baseline**（0090 §2.2）。
+
+    Codex P1（PR #216）の再現。fand（A）が動いている間に4ファイルが B へ差し替わり、CLI が
+    B の証拠で上げた。runtime は journal の変化を次の点検で読むが、実効 stage は上がらない。
+    """
+    assert OTHER_CONFIG.sources.policy.sha256 != LOADED_CONFIG.policy.sha256
+    authority = store(tmp_path)
+    control = control_runtime(tmp_path)
+    assert control.current_stage() is BASELINE_STAGE
+
+    written = raise_with_config(authority, OTHER_CONFIG, from_stage=BASELINE_STAGE)
+    assert written.stage is AuthorityStage.LIMITED
+
+    caplog.set_level(logging.INFO, logger="coldaisle.control")
+    control.maintain()
+
+    assert control.journal == written, "journal の変化は読む（0072 §2.6）"
+    assert control.artifact_ceiling is AuthorityStage.FULL, "artifact は一致している"
+    assert control.config_binding_ceiling is BASELINE_STAGE
+    assert control.current_stage() is BASELINE_STAGE
+    assert authority.read() == written, "journal は書かない（0090 §2.4）"
+    metadata = control.trace_metadata()
+    assert metadata["authority_stage"] == BASELINE_STAGE.value
+    assert metadata["authority_config_binding_ceiling"] == BASELINE_STAGE.value
+    assert metadata["authority_config_ceiling"] == AuthorityStage.FULL.value, "設定の上限は別の欄"
+    [mismatch] = config_log_fields(caplog, "authority_config_mismatch")
+    assert mismatch["mismatched_revision"] == 1
+    assert mismatch["mismatched_files"] == ["fan_policy_config_sha256"]
+    assert (
+        mismatch["approved_config_sha256"]["fan_policy_config_sha256"]
+        == OTHER_CONFIG.sources.policy.sha256
+    )
+    assert (
+        mismatch["loaded_config_sha256"]["fan_policy_config_sha256"] == LOADED_CONFIG.policy.sha256
+    )
+
+    # Baseline にいる間は自動降格も起きない（実効 stage を見る）。journal はそのまま
+    assert control.observe(safety_state=SafetyState.EMERGENCY, now_mono_ms=0) is None
+    control.maintain()
+    assert authority.read() == written
+
+
+def test_0090_b_a_matching_config_keeps_the_journal_stage(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """一致すれば従来どおり journal の stage が実効 stage になる。"""
+    caplog.set_level(logging.INFO, logger="coldaisle.control")
+    control = runtime(tmp_path, stage=AuthorityStage.FULL)
+
+    assert control.config_binding_ceiling is AuthorityStage.FULL
+    assert control.current_stage() is AuthorityStage.FULL
+    assert control.trace_metadata()["authority_config_binding_ceiling"] == "full"
+    assert len(config_log_fields(caplog, "authority_config_matched")) == 1, "起動時は必ず出す"
+
+
+def test_0090_c_a_partly_matching_climb_is_baseline(tmp_path: Path) -> None:
+    """**連なりの一部だけが一致しても Baseline**（0090 §2.2。0089 §2.2 と同じ）。"""
+    authority = store(tmp_path)
+    raise_with_config(authority, DEFAULT_CONFIG, from_stage=BASELINE_STAGE)
+    climbed = raise_with_config(authority, OTHER_CONFIG, from_stage=AuthorityStage.LIMITED)
+    assert climbed.stage is AuthorityStage.EXPANDED
+
+    for loaded in (LOADED_CONFIG, OTHER_CONFIG.sources):
+        control = AuthorityRuntime(
+            authority,
+            policy(authority="full"),
+            loaded_artifact_sha256=ARTIFACT_SHA,
+            loaded_config_sources=loaded,
+        )
+        assert control.config_binding_ceiling is BASELINE_STAGE
+        assert control.current_stage() is BASELINE_STAGE
+
+
+def test_0090_d_only_the_climb_since_the_last_baseline_is_compared(tmp_path: Path) -> None:
+    """Baseline へ戻った**前の**昇格は照らさない。B で上げ直した連なりは B で動く fand に有効。"""
+    authority = store(tmp_path)
+    raise_with_config(authority, DEFAULT_CONFIG, from_stage=BASELINE_STAGE)
+    authority.rollback_to_baseline(actor="operator", reason="設定を差し替える")
+    raise_with_config(authority, OTHER_CONFIG, from_stage=BASELINE_STAGE)
+
+    control = AuthorityRuntime(
+        authority,
+        policy(authority="full"),
+        loaded_artifact_sha256=ARTIFACT_SHA,
+        loaded_config_sources=OTHER_CONFIG.sources,
+    )
+
+    assert control.current_stage() is AuthorityStage.LIMITED
+
+
+def test_0090_e_evidence_without_the_air_balance_and_hardware_hashes_is_baseline(
+    tmp_path: Path,
+) -> None:
+    """hash の無い証拠（journal v1 の event）は一致を言えないので Baseline（0090 §5 の 2）。"""
+    runtime(tmp_path, stage=AuthorityStage.LIMITED)
+    path = tmp_path / "authority" / "authority.json"
+    document = json.loads(path.read_text(encoding="utf-8"))
+    evidence = document["events"][0]["approval"]["evidence"]
+    del evidence["air_balance_config_sha256"]
+    del evidence["fan_hardware_config_sha256"]
+    path.write_text(json.dumps(document), encoding="utf-8")
+
+    control = control_runtime(tmp_path)
+
+    assert control.journal.stage is AuthorityStage.LIMITED, "journal は読める"
+    assert control.config_binding_ceiling is BASELINE_STAGE
+    assert control.current_stage() is BASELINE_STAGE
+
+
+def test_0090_f_fand_binds_the_runtime_to_the_config_it_controls_with(tmp_path: Path) -> None:
+    """**fand は制御に使う ControlConfig の sources を照合元に渡す**（0090 §2.1）。"""
+    from coldaisle.control_daemon import open_authority_runtime
+
+    config = control_config(tmp_path, ceiling="full", ood_after=9)
+    authority = store(tmp_path)
+    raise_with_config(authority, config, from_stage=BASELINE_STAGE)
+
+    control = open_authority_runtime(
+        tmp_path / "authority",
+        config,
+        clock=SimulatedClock(NOW_MS),
+        loaded_artifact_sha256=ARTIFACT_SHA,
+    )
+
+    assert control.loaded_config_sources == config.sources
+    assert control.current_stage() is AuthorityStage.LIMITED
+    other = open_authority_runtime(
+        tmp_path / "authority",
+        DEFAULT_CONFIG,
+        clock=SimulatedClock(NOW_MS),
+        loaded_artifact_sha256=ARTIFACT_SHA,
+    )
+    assert other.current_stage() is BASELINE_STAGE
+
+
+def test_0090_g_the_loaded_config_has_no_default() -> None:
+    """**照合元に既定値を置かない**（渡し忘れが「何にも照らさない runtime」を作らない）。"""
+    parameter = inspect.signature(AuthorityRuntime).parameters["loaded_config_sources"]
+    assert parameter.default is inspect.Parameter.empty
+    assert parameter.kind is inspect.Parameter.KEYWORD_ONLY
+
+
 # --- 不変条件 9: stage は model version と独立に残る ---------------------------
 
 
@@ -2908,9 +3118,14 @@ def test_the_first_promotion_can_actually_be_walked(tmp_path: Path, trained) -> 
     base, profile, attestation = trained
     settings = mpc_policy(authority="limited")
     authority = store(tmp_path)
+    # fand が起動時に読んだ設定。昇格の証拠もこの設定で取る（決定記録 0090 §2.1）。
+    config = control_config(tmp_path, ceiling="limited")
     # **runtime と Gate は worker が束縛した artifact に照らす**（決定記録 0089 §2.1）。
     control = AuthorityRuntime(
-        authority, settings, loaded_artifact_sha256=attestation.artifact_sha256
+        authority,
+        settings,
+        loaded_artifact_sha256=attestation.artifact_sha256,
+        loaded_config_sources=config.sources,
     )
 
     assert control.configured_ceiling is AuthorityStage.LIMITED
@@ -2953,7 +3168,6 @@ def test_the_first_promotion_can_actually_be_walked(tmp_path: Path, trained) -> 
     assert shadow_tick.active_controller is ControllerKind.FALLBACK
 
     # 3. その区間の証拠で昇格する。証拠はいまの設定・いまの artifact のものである。
-    config = control_config(tmp_path, ceiling="limited")
     # Registry の production は、worker が束縛した artifact そのもの（同じ bytes を登録する）。
     # 別の artifact の証拠で上げると、runtime は Baseline のままにする（決定記録 0089）。
     production_sha = issue_attestation(

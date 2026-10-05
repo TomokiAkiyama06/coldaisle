@@ -1039,7 +1039,13 @@ def open_authority_runtime(
     store = AuthorityStore(
         root.absolute(), clock, lock_timeout_ms=control.safety.tick_deadline_ms.value
     )
-    runtime = AuthorityRuntime(store, control.policy, loaded_artifact_sha256=loaded_artifact_sha256)
+    runtime = AuthorityRuntime(
+        store,
+        control.policy,
+        loaded_artifact_sha256=loaded_artifact_sha256,
+        # 照らす config は制御に使う ControlConfig そのものから渡す（決定記録 0090 §2.1）
+        loaded_config_sources=control.sources,
+    )
     LOGGER.info(
         "authority journal を読み込んだ",
         extra={
