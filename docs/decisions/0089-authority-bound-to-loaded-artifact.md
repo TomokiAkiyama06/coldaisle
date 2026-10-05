@@ -1,7 +1,7 @@
 # 決定記録 0089: fand は、いま使っている artifact に対して承認された分だけ authority を有効にする
 
 - **種別**: Decision Record
-- **Status**: Proposed（2026-10-01、リポジトリ所有者が方針を承認。PR #216 のマージで FINAL）
+- **Status**: FINAL（2026-10-01、リポジトリ所有者が方針を承認。2026-10-05、PR #216 の判断点 10〜12 を推奨案で承認。§6）
 - **Date**: 2026-10-01
 - **Supersedes**: なし（0057 / 0072 / 0086 の規定は変えない。実効 stage の上限を1つ足すだけ）
 - **関連**: [0057](0057-authority-rollout-stage-changes.md) §2.2 / §2.3 / §2.7 /
@@ -66,7 +66,7 @@
 - 一部だけ一致する連なり（例: SHADOW→LIMITED は A、LIMITED→EXPANDED は B）も Baseline にする。
   「A に対して承認された LIMITED までは有効」とはしない。B の証拠は B が LIMITED で走った実績に
   束縛されている前提で集められ、A の LIMITED の上に積んだ判断ではないため（所有者の指示「違えば
-  Baseline に倒す」を、部分一致にも適用する）
+  Baseline に倒す」を、部分一致にも適用する）。**2026-10-05、所有者が承認した**（PR #216 の判断点 10。§6）
 
 ### 2.3 照合する時点
 
@@ -118,7 +118,8 @@ artifact の上限は**実行時の上限**で、journal へ降格 event を書�
 - Production を入れ替えた後は、新しい artifact について SHADOW から承認をやり直すことになる
   （0057 の「Production の入れ替えで journal は動かない」は変わらないが、journal の stage が新しい artifact に
   対して有効でなくなる）。緩和: 入れ替えの前に rollback するか、入れ替えた artifact の Shadow の証拠で
-  1段ずつ上げ直す。運用手順は `docs/authority-rollout.md` に書く
+  1段ずつ上げ直す。運用手順は `docs/authority-rollout.md` に書く。**2026-10-05、所有者がこの運用を
+  承認した**（PR #216 の判断点 11。§6）
 - trace の `AuthorityRecord` が artifact の上限を表さない（§2.5 / §5）
 
 ## 4. 却下した代替案
@@ -136,6 +137,18 @@ artifact の上限は**実行時の上限**で、journal へ降格 event を書�
 
 | # | 内容 | 決める場所 |
 |---|---|---|
-| 1 | `AuthorityRecord` に artifact の上限（と loaded artifact）を足すか（`AuthorityRecord` v2・`ControlTick` の版上げ） | trace の次の版上げのとき。必要なら別の記録 |
+| 1 | **方針は決着**（2026-10-05 所有者承認。PR #216 の判断点 12）: 「実効 stage が journal より低い理由」（artifact の上限）は、trace の次の版上げのときに `AuthorityRecord` v2 で欄を足す。それまでは構造化ログ（`authority_artifact_mismatch` / `_unbound` / `_matched`）で見る。本記録の PR（#216）では `ControlTick` の版を上げない。以下は判断前の記録。`AuthorityRecord` に artifact の上限（と loaded artifact）を足すか（`AuthorityRecord` v2・`ControlTick` の版上げ） | **後続**: trace の次の版上げの PR。欄の形（上限だけか、loaded artifact も載せるか。§2.5 の 0057 §2.7 との関係）はそのときに決め、必要なら別の記録 |
 | 2 | RL Supervisor の policy artifact へ authority を渡すときの照合（kind ごとの loaded artifact） | RL Supervisor を active にする記録（0061 の側） |
 | 3 | `raise` が「fand が今使っている artifact」でないことを、承認の前に人へ知らせる手段（`coldaisle-control status` に loaded artifact を出す等） | 運用の後 |
+
+## 6. 承認記録
+
+**2026-10-05、リポジトリ所有者は PR #216 の「人間レビューが必要な点」10〜12 を、すべて推奨案（実装どおり）で決めた。**
+
+| PR #216 の判断点 | 決定 | 本記録 |
+|---|---|---|
+| 10 | 昇格の連なりの一部だけが loaded artifact と一致する場合も、実効 stage の上限を Baseline にする（実装のまま） | §2.2 |
+| 11 | Production の artifact を入れ替えたら、新しい artifact については SHADOW から上げ直す運用にする（実装と `docs/authority-rollout.md` の手順のまま。入れ替えの前の rollback を勧める） | §3 |
+| 12 | 「実効 stage が journal より低い理由」を trace に載せるのは、trace の次の版上げのときに `AuthorityRecord` v2 で欄を足す。それまでは構造化ログで見る。本 PR では `ControlTick` の版を上げない | §2.5 / §5 #1 |
+
+これにより本記録を FINAL とした。§5 の 2・3 は開いたまま。

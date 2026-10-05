@@ -275,12 +275,13 @@ CLI で書いた rollback も、動いている fand は次の tick で journal 
 - `AuthorityRuntime.trace_metadata()`: 実効 stage・journal の stage・設定の上限・
   直近の変更（種別・主体・理由・時刻）・永続化の失敗・journal を読めないこと・artifact の上限
   （`authority_artifact_ceiling`。0089）。**model version も照らした artifact の hash も含めない**
-- `ControlTick` v13 の `authority`（`AuthorityRecord`）: その tick の Gate が stage を読んだ時点の
+- `ControlTick` v13 以降（いまは v14）の `authority`（`AuthorityRecord`）: その tick の Gate が stage を読んだ時点の
   journal の stage と revision・設定の上限・書き残せずに持っている上限・`journal_unreadable`・
   その tick の先頭で入れた管理ソケットの降格の `command_id`・直近の永続化の失敗。
   実効 stage（`state.authority_stage`）はこれらの最小を超えない（schema が拒む）。
-  **artifact の上限（0089）は `AuthorityRecord` に欄が無い**（足すと版上げになる。0089 §5 の 1）。
-  journal より低い理由は fand の構造化ログで見る
+  **artifact の上限（0089）は `AuthorityRecord` に欄が無い**（足すと版上げになる）。所有者の判断（2026-10-05。
+  0089 §5 の 1 / §6）により、trace の次の版上げのときに `AuthorityRecord` v2 で欄を足す。それまで
+  journal より低い理由は fand の構造化ログ（`authority_artifact_mismatch` / `_unbound` / `_matched`）で見る
 
 ## まだ無いもの
 
