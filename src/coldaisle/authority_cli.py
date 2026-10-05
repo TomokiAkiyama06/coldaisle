@@ -431,7 +431,9 @@ def main(
     ``identity`` / ``clock`` は試験で差し替えるためだけにある（実 root を要さない。0086 §2.9）。
     """
     args = build_parser().parse_args(argv)
-    logs.configure("INFO")
+    # **監査の行は端末の encoding に依存させない**（codex P2。PR #216）。stderr が ASCII だと
+    # 日本語の行を logging が黙って落とし、journal だけが変わる（0086 §2.8 の1操作1行が欠ける）。
+    logs.configure("INFO", ensure_ascii=True)
     source: ProcessIdentity = identity if identity is not None else OsProcessIdentity()
     try:
         exit_code: int = args.handler(args, source, clock if clock is not None else WallClock())

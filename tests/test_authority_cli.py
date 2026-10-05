@@ -474,6 +474,36 @@ def test_a_closed_stdout_after_the_commit_is_still_success(
     assert events == ["rolled_back" if command == "rollback" else "raised", "result_not_written"]
 
 
+@pytest.mark.parametrize("command", ["raise", "rollback"])
+def test_the_audit_line_survives_an_ascii_only_stderr(
+    tmp_path: Path, command: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`PYTHONIOENCODING=ascii` の stderr でも監査の1行（0086 §2.8）が欠けない（codex P2）。
+
+    `StreamHandler` は encode の失敗を内部で握るので、日本語のままだと journal だけが変わる。
+    """
+    shared_root(tmp_path)
+    approval, report = write_inputs(tmp_path)
+    if command == "rollback":
+        assert run(raise_argv(tmp_path, approval, report)) == EXIT_OK
+        argv = rollback_argv(tmp_path)
+    else:
+        argv = raise_argv(tmp_path, approval, report)
+    raw = io.BytesIO()
+    stderr = io.TextIOWrapper(raw, encoding="ascii", errors="strict", write_through=True)
+    monkeypatch.setattr(sys, "stderr", stderr)
+    monkeypatch.setattr(sys, "stdout", AsciiStdout())
+
+    assert run(argv) == EXIT_OK
+
+    text = raw.getvalue().decode("ascii")
+    assert "Traceback" not in text, "logging が encode の失敗を握っていない"
+    lines = log_lines(text)
+    expected = "rolled_back" if command == "rollback" else "raised"
+    assert [line["event"] for line in lines] == [expected, "result_not_written"]
+    assert "authority stage" in lines[0]["msg"], "日本語の msg は JSON の escape で元に戻る"
+
+
 def test_the_audit_log_level_cannot_be_lowered(capsys: pytest.CaptureFixture[str]) -> None:
     """監査の1行（0086 §2.8）を `--log-level` で消せない（codex P2）。"""
     with pytest.raises(SystemExit) as caught:
