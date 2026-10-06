@@ -127,6 +127,8 @@ lock の最小権限を与える設計が決まるまで使えない（#217。`r
 - stdout に結果を1件の JSON で出す（`actor` は名前を引けたら `uid.<数値>（<名前>）`。**名前は記録に
   書かない**）。stderr に JSON Lines の構造化ログを1行出す（`event`・`uid`・`euid`・`from_stage` /
   `to_stage`・`revision`・`report_sha256`。失敗は `code` 付き）。DB は開かない（0086 §2.8）
+- 結果の JSON には `durable` と `audit_logged`（監査の1行を stderr へ書けたか。**常に出す**）がある
+  （決定記録 0091）
 
 | 終了コード | 意味 | `code` |
 |---|---|---|
@@ -135,7 +137,8 @@ lock の最小権限を与える設計が決まるまで使えない（#217。`r
 | 2 | 引数の誤り（argparse） | — |
 | 3 | 実行者を承認者として認めない（0086 §2.3 / §2.5） | `approver_is_root` / `approver_owns_authority_root` / `uid_differs_from_euid` / `invalid_uid` / `approval_not_bound_to_process` / `approver_is_not_the_process_uid` |
 | 4 | 承認・証拠を受け入れない（下の一覧） | `invalid_approval` / `approval_rejected` / `evidence_rejected` |
-| 5 | **書いた（他の process に見えている）が、ディレクトリの `fsync` に失敗し、永続化を確かめられない**（raise / rollback とも。既に Baseline の rollback で `fsync` し直せなかったときも） | —（結果の `durable: false`・warning のログ） |
+| 5 | **書いた（他の process に見えている）が、ディレクトリの `fsync` に失敗し、永続化を確かめられない**（raise / rollback とも。既に Baseline の rollback で `fsync` し直せなかったときも）。監査の記録の失敗（6）と重なったら 5 | —（結果の `durable: false`・warning のログ。6 と重なったら `audit_logged: false` も） |
+| 6 | **journal の変更は確定した（`durable`）が、監査の記録（stderr の JSONL）に失敗した**（閉じたパイプ・切れた journald の stream・`ENOSPC` など。raise / rollback とも。既に Baseline の rollback も。決定記録 0091） | —（結果の `audit_logged: false`。終了直前の flush だけが失敗したときは結果が `true` のまま 6 になりうる。終了コードを正とする） |
 
 - journal を置き換えた**後**の失敗は、変更しなかったこと（1）にしない。
   ディレクトリの `fsync` に失敗したときは**終了コード 5**で、結果の `durable` を `false` にし、構造化ログを
@@ -147,6 +150,21 @@ lock の最小権限を与える設計が決まるまで使えない（#217。`r
   やり直せない（revision が進んでいる）ので、journal を確かめ、必要なら rollback する。成功（0）と分けるのは、**失われた rollback は上げた authority を黙って元に戻す**ので、
   人もスクリプトも終了コードで気づけなければならないため（2026-10-01 所有者の決定。#216）。
   stdout に書けないとき（閉じた pipe など）は `result_not_written` の警告だけを残す（終了コードは変えない）
+- 監査の1行（stderr の JSONL）を書けなかったときは**終了コード 6** で、結果の `audit_logged` を `false` に
+  する（決定記録 0091）。`StreamHandler` は書き込みの例外を内部で握るので、`coldaisle-authority` は失敗を
+  数える handler を使い、操作の行を書いてから終了直前の flush までの失敗を拾う。**journal の変更は確定して
+  いるので、操作をやり直さない**（raise は同じ承認ではやり直せず、別の承認で上げ直すと2段上がる）。
+  journal（v4 は承認者の uid と event を持つ）で何が起きたかを確かめ、監査の記録の欠けを補う。rollback は
+  やり直しても no-op（`already_baseline`）で安全である。`fsync` の失敗（5）と重なったら **5 を優先**し
+  （結果は `durable: false`・`audit_logged: false`）、5 の手順に従う。操作が行われなかった失敗（1 / 3 / 4）は、
+  監査の行を書けなくても従来の終了コードのまま（知らせない。0091 §5 の 2）
+- **結果の `audit_logged` と終了コードが食い違ったら、終了コードを正とする**（0091 §5 の 1）。結果は終了直前の
+  flush より先に出すので、その flush だけが失敗したときは `audit_logged: true` のまま終了コード 6 になりうる。
+  この場合も 6 として扱う（操作をやり直さず journal で確かめる）
+- **終了コード 5 のときは、監査の記録の有無も別途確かめる**（0091 §5 の 3。Codex P2）。5 の経路でも終了直前の
+  flush を行い、失敗すれば warning（`audit_not_flushed`）を残すが、終了コードは 5 のままで、結果の
+  `audit_logged` は真のままになる（結果は flush より先に出す）。5 は永続化を確かめられないことを示すだけで、
+  `audit_logged: true` は監査の行が残ったことを保証しない
 
 ### `AuthorityStore.raise_stage()`
 

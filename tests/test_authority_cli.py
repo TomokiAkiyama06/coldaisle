@@ -20,6 +20,7 @@ from __future__ import annotations
 import ast
 import io
 import json
+import logging
 import os
 import shutil
 import stat
@@ -29,10 +30,11 @@ from typing import Any
 
 import pytest
 
-from coldaisle import authority_cli
+from coldaisle import authority_cli, logs
 from coldaisle.authority_cli import (
     EXIT_APPROVAL_REJECTED,
     EXIT_APPROVER_REJECTED,
+    EXIT_AUDIT_NOT_LOGGED,
     EXIT_FAILED,
     EXIT_NOT_DURABLE,
     EXIT_OK,
@@ -621,3 +623,201 @@ def test_a_failed_directory_fsync_after_replace_is_not_reported_as_no_change(
     assert result["event"] == ("rolled_back" if command == "rollback" else "raised")
     [line] = log_lines(captured.err)
     assert (line["level"], line["event"], line["durable"]) == ("warning", result["event"], False)
+
+
+# ============================================ 9. 監査ログを書けない（#218 / 決定記録 0091）
+
+
+class BrokenPipeStderr(io.StringIO):
+    """閉じたパイプ・切れた journald の stream。"""
+
+    def write(self, text: str) -> int:
+        raise BrokenPipeError(32, "Broken pipe")
+
+
+class FullDiskStderr(io.StringIO):
+    """`ENOSPC` の出力先。"""
+
+    def write(self, text: str) -> int:
+        raise OSError(28, "No space left on device")
+
+
+class FailingFlushStderr(io.StringIO):
+    """書き込みは受けるが、flush で失敗する（buffer を書き出せない）。"""
+
+    def flush(self) -> None:
+        raise OSError(5, "Input/output error")
+
+
+class FailingFinalFlushStderr(io.StringIO):
+    """操作の行の flush（1回目）は通るが、終了直前の flush で失敗する。"""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.flushes = 0
+
+    def flush(self) -> None:
+        self.flushes += 1
+        if self.flushes > 1:
+            raise OSError(5, "Input/output error")
+
+
+def _argv_for(tmp_path: Path, command: str) -> list[str]:
+    """``rollback`` は LIMITED から戻す。``noop`` は既に Baseline の rollback。"""
+    shared_root(tmp_path)
+    approval, report = write_inputs(tmp_path)
+    if command == "raise":
+        return raise_argv(tmp_path, approval, report)
+    if command == "rollback":
+        assert run(raise_argv(tmp_path, approval, report)) == EXIT_OK
+    return rollback_argv(tmp_path)
+
+
+_EXPECTED_EVENT = {"raise": "raised", "rollback": "rolled_back", "noop": "already_baseline"}
+_EXPECTED_STAGE = {
+    "raise": AuthorityStage.LIMITED,
+    "rollback": AuthorityStage.SHADOW,
+    "noop": AuthorityStage.SHADOW,
+}
+
+
+@pytest.mark.parametrize("command", ["raise", "rollback", "noop"])
+def test_a_successful_operation_reports_audit_logged(
+    tmp_path: Path, command: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """結果の `audit_logged` は常に出る。書けたら `true`・終了コード 0。"""
+    argv = _argv_for(tmp_path, command)
+    capsys.readouterr()
+
+    assert run(argv) == EXIT_OK
+
+    result = json.loads(capsys.readouterr().out)
+    assert result["event"] == _EXPECTED_EVENT[command]
+    assert result["audit_logged"] is True
+
+
+@pytest.mark.parametrize("stderr", [BrokenPipeStderr, FullDiskStderr, FailingFlushStderr])
+@pytest.mark.parametrize("command", ["raise", "rollback", "noop"])
+def test_an_unwritable_audit_sink_is_exit_6_not_success(
+    tmp_path: Path,
+    command: str,
+    stderr: type[io.StringIO],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """**監査の行を書けなかったことを握りつぶさない**（0091 §2.2 / §2.3）。
+
+    journal の変更は確定しているので 1 にはしない。raise と rollback（no-op を含む）を分けない。
+    """
+    argv = _argv_for(tmp_path, command)
+    capsys.readouterr()
+    monkeypatch.setattr(sys, "stderr", stderr())
+
+    assert run(argv) == EXIT_AUDIT_NOT_LOGGED
+
+    assert store(tmp_path).read().stage is _EXPECTED_STAGE[command]
+    result = json.loads(capsys.readouterr().out)
+    assert result["event"] == _EXPECTED_EVENT[command]
+    assert (result["durable"], result["audit_logged"]) == (True, False)
+
+
+def test_a_failure_of_the_final_flush_is_exit_6(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """判定は終了直前の flush まで含める（0091 §2.2）。終了コードを正とする。"""
+    argv = _argv_for(tmp_path, "rollback")
+    capsys.readouterr()
+    sink = FailingFinalFlushStderr()
+    monkeypatch.setattr(sys, "stderr", sink)
+
+    assert run(argv) == EXIT_AUDIT_NOT_LOGGED
+
+    assert sink.flushes >= 2
+    assert "rolled_back" in sink.getvalue(), "操作の行そのものは書けている"
+    assert store(tmp_path).read().stage is AuthorityStage.SHADOW
+
+
+@pytest.mark.parametrize("command", ["raise", "rollback"])
+def test_a_failed_fsync_takes_precedence_over_a_failed_audit_line(
+    tmp_path: Path,
+    command: str,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """5 と 6 が重なったら 5。結果には `audit_logged: false` を出す（0091 §2.2）。"""
+    argv = _argv_for(tmp_path, command)
+    capsys.readouterr()
+    real = os.fsync
+
+    def fsync(fd: int) -> None:
+        if stat.S_ISDIR(os.fstat(fd).st_mode):
+            raise OSError(5, "Input/output error")
+        real(fd)
+
+    monkeypatch.setattr(os, "fsync", fsync)
+    monkeypatch.setattr(sys, "stderr", BrokenPipeStderr())
+
+    assert run(argv) == EXIT_NOT_DURABLE
+
+    monkeypatch.setattr(os, "fsync", real)
+    assert store(tmp_path).read().stage is _EXPECTED_STAGE[command]
+    result = json.loads(capsys.readouterr().out)
+    assert (result["durable"], result["audit_logged"]) == (False, False)
+
+
+@pytest.mark.parametrize("command", ["raise", "rollback"])
+def test_an_operation_not_performed_keeps_its_exit_code(
+    tmp_path: Path, command: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """行われなかった失敗（1）は、監査の行を書けなくても 1 のまま（0091 §2.2）。"""
+    approval, report = write_inputs(tmp_path)
+    argv = raise_argv(tmp_path, approval, report) if command == "raise" else rollback_argv(tmp_path)
+    monkeypatch.setattr(sys, "stderr", BrokenPipeStderr())
+
+    assert run(argv) == EXIT_FAILED
+
+    assert not journal_path(tmp_path).exists()
+
+
+def test_other_commands_keep_the_plain_stream_handler() -> None:
+    """handler を差し替えるのは `coldaisle-authority` だけ（0091 §2.1）。"""
+    stream = io.StringIO()
+    logs.configure("INFO", stream)
+    try:
+        [handler] = logging.getLogger().handlers
+        assert type(handler) is logging.StreamHandler
+    finally:
+        logs.configure("INFO")
+
+
+@pytest.mark.parametrize("command", ["raise", "rollback"])
+def test_the_final_flush_is_checked_even_when_fsync_failed(
+    tmp_path: Path,
+    command: str,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """5 の経路でも終了直前の flush を行い、失敗を検出する（codex P2。0091 §5 の 3）。
+
+    終了コードは 5 のまま。結果は flush より先に出すので `audit_logged` は真のままになる。
+    """
+    argv = _argv_for(tmp_path, command)
+    capsys.readouterr()
+    real = os.fsync
+
+    def fsync(fd: int) -> None:
+        if stat.S_ISDIR(os.fstat(fd).st_mode):
+            raise OSError(5, "Input/output error")
+        real(fd)
+
+    monkeypatch.setattr(os, "fsync", fsync)
+    sink = FailingFinalFlushStderr()
+    monkeypatch.setattr(sys, "stderr", sink)
+
+    assert run(argv) == EXIT_NOT_DURABLE
+
+    monkeypatch.setattr(os, "fsync", real)
+    assert sink.flushes >= 2, "5 の経路でも終了直前の flush を行う"
+    assert store(tmp_path).read().stage is _EXPECTED_STAGE[command]
+    result = json.loads(capsys.readouterr().out)
+    assert (result["durable"], result["audit_logged"]) == (False, True)

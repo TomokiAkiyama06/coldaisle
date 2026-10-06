@@ -49,8 +49,44 @@ class JsonLinesFormatter(logging.Formatter):
         return json.dumps(payload, ensure_ascii=self._ensure_ascii, default=str)
 
 
+class FailureRecordingStreamHandler(logging.StreamHandler[TextIO]):
+    """書き込み（`emit` の中の write / flush）と `flush()` の失敗を数える `StreamHandler`。
+
+    `StreamHandler` は書き込みの例外を `handleError()` で握り、呼び出し元へ返さない。
+    閉じたパイプ・`ENOSPC` の stderr では、行が欠けても誰も気づけない。監査の記録
+    （`coldaisle-authority`。決定記録 0091）のために、失敗を ``failures`` に残す。
+
+    **例外は投げない。** 呼び出し側（journal の操作・結果の出力）を止めないため。
+    traceback も出さない（書けない stderr へもう一度書こうとするだけで意味が無い）。
+    """
+
+    def __init__(self, stream: TextIO) -> None:
+        super().__init__(stream)
+        self.failures = 0
+
+    def handleError(self, record: logging.LogRecord) -> None:
+        """書き込みの失敗を数えるだけ。"""
+        self.failures += 1
+
+    def flush(self) -> None:
+        """flush し、失敗を数える。
+
+        `emit()` の外（終了直前・`logging.shutdown()`）から呼ばれた flush は `handleError()` を
+        通らないので、ここで拾う。
+        """
+        try:
+            super().flush()
+        except (OSError, ValueError):
+            # ValueError: 閉じた stream への flush。
+            self.failures += 1
+
+
 def configure(
-    level: str = "INFO", stream: TextIO | None = None, *, ensure_ascii: bool = False
+    level: str = "INFO",
+    stream: TextIO | None = None,
+    *,
+    ensure_ascii: bool = False,
+    handler: logging.StreamHandler[TextIO] | None = None,
 ) -> None:
     """ルートロガーを JSON Lines へ差し替える。
 
@@ -60,8 +96,13 @@ def configure(
     ``ensure_ascii`` は、行が欠けると困る監査の記録（`coldaisle-authority`）のためにある。
     `StreamHandler` は encode の失敗を内部で握って traceback を出すだけなので、
     `PYTHONIOENCODING=ascii` の stderr では日本語の行が**黙って欠ける**。
+
+    ``handler`` を渡すとその handler を使う（``stream`` は無視する）。書き込みの失敗を
+    知る必要がある監査の記録（`FailureRecordingStreamHandler`。決定記録 0091）のためにあり、
+    渡さない呼び出しの挙動は変わらない。
     """
-    handler = logging.StreamHandler(sys.stderr if stream is None else stream)
+    if handler is None:
+        handler = logging.StreamHandler(sys.stderr if stream is None else stream)
     handler.setFormatter(JsonLinesFormatter(ensure_ascii=ensure_ascii))
     root = logging.getLogger()
     root.handlers = [handler]
