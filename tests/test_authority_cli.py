@@ -788,3 +788,36 @@ def test_other_commands_keep_the_plain_stream_handler() -> None:
         assert type(handler) is logging.StreamHandler
     finally:
         logs.configure("INFO")
+
+
+@pytest.mark.parametrize("command", ["raise", "rollback"])
+def test_the_final_flush_is_checked_even_when_fsync_failed(
+    tmp_path: Path,
+    command: str,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """5 の経路でも終了直前の flush を行い、失敗を検出する（codex P2。0091 §5 の 3）。
+
+    終了コードは 5 のまま。結果は flush より先に出すので `audit_logged` は真のままになる。
+    """
+    argv = _argv_for(tmp_path, command)
+    capsys.readouterr()
+    real = os.fsync
+
+    def fsync(fd: int) -> None:
+        if stat.S_ISDIR(os.fstat(fd).st_mode):
+            raise OSError(5, "Input/output error")
+        real(fd)
+
+    monkeypatch.setattr(os, "fsync", fsync)
+    sink = FailingFinalFlushStderr()
+    monkeypatch.setattr(sys, "stderr", sink)
+
+    assert run(argv) == EXIT_NOT_DURABLE
+
+    monkeypatch.setattr(os, "fsync", real)
+    assert sink.flushes >= 2, "5 の経路でも終了直前の flush を行う"
+    assert store(tmp_path).read().stage is _EXPECTED_STAGE[command]
+    result = json.loads(capsys.readouterr().out)
+    assert (result["durable"], result["audit_logged"]) == (False, True)
