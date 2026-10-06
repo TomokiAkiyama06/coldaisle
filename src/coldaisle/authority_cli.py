@@ -32,6 +32,7 @@ import logging
 import os
 import pwd
 import sys
+from collections.abc import Callable
 from hashlib import sha256
 from pathlib import Path
 from typing import Any
@@ -80,6 +81,14 @@ EXIT_NOT_DURABLE = 5
 成功（0）とは分ける（2026-10-01 所有者の決定。#216）。失われた rollback は、上げた authority を
 **黙って元に戻す**ので、人もスクリプトも終了コードで気づけなければならない。結果の
 `durable: false` と warning の構造化ログも出す。失敗（1）とも分ける（変更は見えている）。
+"""
+EXIT_AUDIT_NOT_LOGGED = 6
+"""journal の変更は確定した（`durable`）が、監査の記録（stderr の JSONL）に失敗した（0091）。
+
+閉じたパイプ・`ENOSPC` の stderr では `StreamHandler` が書き込みの例外を握るので、黙って 0 を返すと
+0086 §2.8 の1操作1行が欠けたことに誰も気づけない。変更は確定しているので失敗（1）にはしない。
+raise と rollback（no-op を含む）を分けない。fsync の失敗（5）と重なったら 5 を優先する。
+結果の `audit_logged` も `false` にする。**操作をやり直さず、journal で何が起きたかを確かめる。**
 """
 
 _SELF_DECLARED_FIELDS = ("approver", "approver_binding")
@@ -228,13 +237,29 @@ def run_raise(args: argparse.Namespace, identity: ProcessIdentity, clock: Clock)
     except AuthorityNotDurableError as error:
         journal, durable = error.journal, False
     report_sha256 = sha256(report).hexdigest()
-    _log_change(
-        "authority stage を上げた", "raised", credentials, journal, report_sha256, durable=durable
+    audit: logs.FailureRecordingStreamHandler = args.audit_handler
+    audit_logged = _audited(
+        audit,
+        lambda: _log_change(
+            "authority stage を上げた",
+            "raised",
+            credentials,
+            journal,
+            report_sha256,
+            durable=durable,
+        ),
     )
     emit_after_commit(
-        _result("raised", credentials, journal, report_sha256=report_sha256, durable=durable)
+        _result(
+            "raised",
+            credentials,
+            journal,
+            report_sha256=report_sha256,
+            durable=durable,
+            audit_logged=audit_logged,
+        )
     )
-    return EXIT_OK if durable else EXIT_NOT_DURABLE
+    return _committed_exit_code(audit, durable=durable, audit_logged=audit_logged)
 
 
 def run_rollback(args: argparse.Namespace, identity: ProcessIdentity, clock: Clock) -> int:
@@ -256,14 +281,18 @@ def run_rollback(args: argparse.Namespace, identity: ProcessIdentity, clock: Clo
     changed = appended is not None
     event = "rolled_back" if changed else "already_baseline"
     from_stage = appended.from_stage.value if appended is not None else journal.stage.value
-    _log_change(
-        "authority stage を Baseline へ戻した" if changed else "すでに Baseline だった",
-        event,
-        credentials,
-        journal,
-        None,
-        from_stage=from_stage,
-        durable=durable,
+    audit: logs.FailureRecordingStreamHandler = args.audit_handler
+    audit_logged = _audited(
+        audit,
+        lambda: _log_change(
+            "authority stage を Baseline へ戻した" if changed else "すでに Baseline だった",
+            event,
+            credentials,
+            journal,
+            None,
+            from_stage=from_stage,
+            durable=durable,
+        ),
     )
     emit_after_commit(
         _result(
@@ -273,9 +302,38 @@ def run_rollback(args: argparse.Namespace, identity: ProcessIdentity, clock: Clo
             from_stage=from_stage,
             reason=None if appended is None else appended.reason,
             durable=durable,
+            audit_logged=audit_logged,
         )
     )
-    return EXIT_OK if durable else EXIT_NOT_DURABLE
+    return _committed_exit_code(audit, durable=durable, audit_logged=audit_logged)
+
+
+def _audited(audit: logs.FailureRecordingStreamHandler, write: Callable[[], None]) -> bool:
+    """監査の行を書き、書けたか（handler が書き込みの失敗を数えなかったか）を返す（0091 §2.1）。
+
+    `StreamHandler.emit()` は行ごとに flush するので、buffer を書き出せない失敗もここで見える。
+    """
+    before = audit.failures
+    write()
+    return audit.failures == before
+
+
+def _committed_exit_code(
+    audit: logs.FailureRecordingStreamHandler, *, durable: bool, audit_logged: bool
+) -> int:
+    """journal を書いた後の終了コード。5（fsync）を 6（監査）より優先する（0091 §2.2）。
+
+    監査の判定は**終了直前の flush まで**含める。結果（stdout）は先に出しているので、この flush
+    だけが失敗したときは結果の `audit_logged` が真のまま 6 になる。
+    終了コードを正とする（0091 §5 の 1）。
+    """
+    if not durable:
+        return EXIT_NOT_DURABLE
+    before = audit.failures
+    audit.flush()
+    if not audit_logged or audit.failures != before:
+        return EXIT_AUDIT_NOT_LOGGED
+    return EXIT_OK
 
 
 def _result(
@@ -287,6 +345,7 @@ def _result(
     from_stage: str | None = None,
     reason: str | None = None,
     durable: bool = True,
+    audit_logged: bool = True,
 ) -> dict[str, object]:
     last = journal.last_change
     if reason is None and event == "raised" and last is not None:
@@ -302,6 +361,9 @@ def _result(
         "reason": reason,
         "report_sha256": report_sha256,
         "durable": durable,
+        # 常に出す（0091 §2.2）。結果を出す時点までの判定で、終了直前の flush は
+        # 終了コードだけが表す。
+        "audit_logged": audit_logged,
     }
 
 
@@ -434,7 +496,11 @@ def main(
     args = build_parser().parse_args(argv)
     # **監査の行は端末の encoding に依存させない**（codex P2。PR #216）。stderr が ASCII だと
     # 日本語の行を logging が黙って落とし、journal だけが変わる（0086 §2.8 の1操作1行が欠ける）。
-    logs.configure("INFO", ensure_ascii=True)
+    # **書き込みの失敗も握りつぶさない**（決定記録 0091）。閉じたパイプ・`ENOSPC` の stderr では
+    # `StreamHandler` が例外を握るので、失敗を数える handler にして終了コード 6 へ写す。
+    audit = logs.FailureRecordingStreamHandler(sys.stderr)
+    logs.configure("INFO", ensure_ascii=True, handler=audit)
+    args.audit_handler = audit
     source: ProcessIdentity = identity if identity is not None else OsProcessIdentity()
     try:
         exit_code: int = args.handler(args, source, clock if clock is not None else WallClock())
