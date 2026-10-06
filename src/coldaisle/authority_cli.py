@@ -326,12 +326,22 @@ def _committed_exit_code(
     監査の判定は**終了直前の flush まで**含める。結果（stdout）は先に出しているので、この flush
     だけが失敗したときは結果の `audit_logged` が真のまま 6 になる。
     終了コードを正とする（0091 §5 の 1）。
+
+    **5 の経路でも先に flush する**（codex P2。0091 §5 の 3）。終了コードは 5 のままで、結果の
+    `audit_logged` も書き直せないが、失敗を検出して warning を残す（壊れた stderr へ書くだけかも
+    しれないが、handler は例外を投げない）。
     """
-    if not durable:
-        return EXIT_NOT_DURABLE
     before = audit.failures
     audit.flush()
-    if not audit_logged or audit.failures != before:
+    flushed = audit.failures == before
+    if not durable:
+        if not flushed:
+            LOGGER.warning(
+                "監査の記録の終了直前の flush に失敗した（journal の fsync にも失敗している）",
+                extra={logs.FIELDS_KEY: {"event": "audit_not_flushed", "durable": False}},
+            )
+        return EXIT_NOT_DURABLE
+    if not audit_logged or not flushed:
         return EXIT_AUDIT_NOT_LOGGED
     return EXIT_OK
 
