@@ -18,7 +18,6 @@ from coldaisle.control.mpc.cost import CostTerms, MpcCostModel, MpcCostUnusableE
 from coldaisle.control.mpc.counterfactual import (
     COUNTERFACTUAL_CAPABILITIES,
     CounterfactualModelIdentity,
-    CounterfactualThermalModel,
     MpcModelBinding,
     MpcModelUnusableError,
     PlannedTarget,
@@ -39,7 +38,6 @@ __all__ = [
     "ActionPlan",
     "CostTerms",
     "CounterfactualModelIdentity",
-    "CounterfactualThermalModel",
     "HardConstraintSet",
     "InfeasiblePlanError",
     "LearnedMpcController",

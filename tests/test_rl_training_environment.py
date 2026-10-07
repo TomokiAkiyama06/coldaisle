@@ -8,7 +8,8 @@
 3. action から demand を作るのは **MPC と Gate だけ**。環境は独自に demand を作らない
 4. 設定範囲外の action は **丸めず terminal / invalid**
 5. Critical Safety 違反に相当する state / action は **terminal**（探索を続けない）
-6. 近似 simulator は **Registry の証拠を名乗れない**。反実仮想 artifact は1つも存在しない
+6. 近似 simulator は **Registry の証拠を名乗れない**。learned simulator は反実仮想 artifact v2 の
+   封をした型からだけ作れ、v1 / 壊れた artifact / 較正の違う runtime では作れない（0079 段 6）
 7. 記録済み trajectory では、**記録に無い action の結果を作らない**（coverage になる）
 8. coverage が下限に満たない episode は **比較に使わない**（fail closed）
 9. 同じ条件・同じ seed からは **同じ結果**。条件が変われば条件 hash が変わる
@@ -16,6 +17,9 @@
 11. reward の採点基準は **設定が持つ**。action の target band では採点しない
 12. 安全は reward の項にできない。比較は **辞書式**で安全が先に立つ
 13. 環境は **壁時計を持たない**
+14. 反実仮想 artifact を束縛できない runtime でも環境は回る（偽の attestation を作らない）
+15. learned simulator の step は同梱 Profile v2 による判定（OOD・step ごとの support）を
+    **必ず記録**し、その記録は遷移・採点・`promotable` を変えない（0079 §2.9 段 6 / §5 #8）
 """
 
 from __future__ import annotations
@@ -33,15 +37,22 @@ from pydantic import ValidationError
 from coldaisle.clock import SimulatedClock
 from coldaisle.control.config import FanPolicyConfig, SafetyConfig
 from coldaisle.control.fallback import FallbackController
+from coldaisle.control.model.calibration_digest import RuntimeCalibration
+from coldaisle.control.model.confidence import ConfidenceComponent
+from coldaisle.control.model.counterfactual import RegistryCounterfactualThermalModel
+from coldaisle.control.model.counterfactual_confidence import (
+    CounterfactualConfidenceAssessor,
+    SupportViolationKind,
+)
 from coldaisle.control.model.thermal import (
     ArtifactVerification,
-    InferenceCapability,
     ObservedThermalInput,
     ObservedWindowFrame,
-    canonical_artifact_bytes,
 )
-from coldaisle.control.model_registry import ArtifactCapability
+from coldaisle.control.model_registry import ArtifactCapability, VerifiedArtifact
+from coldaisle.control.mpc import MpcModelBinding
 from coldaisle.control.rl import (
+    EPISODE_SCHEMA_VERSION,
     ActionSpace,
     AttestedThermalDynamics,
     DependencyIdentity,
@@ -93,21 +104,25 @@ from coldaisle.control.supervisor import RulePolicy, SupervisorInput
 from coldaisle.store.models import Quality
 from test_learned_mpc import (
     ACTION_TS_MS,
-    HORIZONS,
+    CATALOG,
+    CELLS,
+    RUNTIME_CALIBRATION,
     STEP_MS,
-    TARGETS,
+    STEPS,
+    UNAVAILABLE_CALIBRATION,
     MpcArtifact,
-    PlanningModel,
     ScriptedClock,
+    action_support,
     build_controller,
-    issue_attestation,
     make_artifact,
     observed_input,
+    ranges,
+    register_v1,
+    register_v2,
+    v1_model,
 )
 from test_learned_mpc import safety as mpc_safety
-from test_model_confidence import AIR, GPU, dataset, fit_confidence_profile, profile_spec
-from test_model_confidence import split as split_dataset
-from test_model_confidence import train as train_model
+from test_model_confidence import AIR, GPU
 
 RL_PACKAGE = Path(__file__).resolve().parents[1] / "src" / "coldaisle" / "control" / "rl"
 
@@ -261,19 +276,39 @@ def trained(tmp_path_factory: pytest.TempPathFactory) -> MpcArtifact:
 
 
 @pytest.fixture(scope="module")
-def trained_v1(tmp_path_factory: pytest.TempPathFactory):
-    """#105 の学習 dynamics の試験用（0079 段 6 で v2 の型へ切り替えるまで v1 のまま）。"""
-    data = dataset(HORIZONS, TARGETS)
-    parts = split_dataset(data)
-    model = train_model(data, parts)
-    profile = fit_confidence_profile(model, data, parts, profile_spec())
-    attestation = issue_attestation(
-        tmp_path_factory.mktemp("pr105-registry-v1") / "registry",
-        model_id=model.manifest.model_id,
-        version=model.manifest.model_version,
-        payload=canonical_artifact_bytes(model._artifact),
+def attested_artifact(tmp_path_factory: pytest.TempPathFactory) -> VerifiedArtifact:
+    """learned simulator にする反実仮想 artifact v2（決定記録 0079 段 6）。
+
+    MPC の試験用 artifact と同じ合成 Dataset v2 だが、target を window の metric
+    （`AIR` / `GPU`）にそろえる。dynamics は最初の horizon の予測で window を1 frame 進めるので、
+    window の全 metric を予測しなければならない。**production へは昇格しない**
+    （学習 dynamics は `production_active` を要求しない。0058 §2.3）。
+    """
+    return register_v2(
+        tmp_path_factory.mktemp("pr105-dynamics-v2") / "registry",
+        targets=WINDOW_METRICS,
+        promoted=False,
     )
-    return model, profile, attestation
+
+
+def confidence_policy():
+    """環境と同じ `fan-policy.yaml` の `model_confidence`。"""
+    return _mpc_policy("limited").model_confidence
+
+
+def attested_dynamics(
+    verified: VerifiedArtifact,
+    *,
+    calibration: RuntimeCalibration = RUNTIME_CALIBRATION,
+    policy: Any = None,
+) -> AttestedThermalDynamics:
+    """runtime と同じ1つの呼び出しで learned simulator を作る。"""
+    return AttestedThermalDynamics.from_verified_artifact(
+        verified,
+        metric_catalog=CATALOG,
+        calibration=calibration,
+        confidence_policy=policy or confidence_policy(),
+    )
 
 
 def default_action(*, strategy: str = "balanced", gpu_weight: float = 1.0) -> SupervisorAction:
@@ -718,38 +753,126 @@ def test_invariant_6_b_the_configured_simulator_is_always_provisional() -> None:
     assert attested_evidence(simulator) is None
 
 
-def test_invariant_6_c_todays_artifacts_cannot_be_a_learned_simulator(trained_v1, tmp_path) -> None:
-    """**観測再生だけの artifact を learned simulator にしない**（決定記録 0048 §2.1）。
+def test_invariant_6_c_a_v1_artifact_cannot_be_a_learned_simulator(tmp_path) -> None:
+    """**v1 artifact（観測再生だけ）を learned simulator にしない**（0079 §2.2 / 0058 §2.3）。
 
-    いま Registry へ登録できるのは `observational_replay` だけなので、この経路は
-    **決定論的にすべて拒む**。0052 §2.1 の規律を環境側にもそのまま置いている。
+    v1 の bytes は、申告が `observational_replay` なら L1、`counterfactual_action` と偽って
+    登録しても L4（v1 を v2 として読み替えない）で封をした型にならない。v1 の model を
+    そのまま `bind` へ渡しても受け取らない。
     """
-    base, _profile, _attestation = trained_v1
-    observational = issue_attestation(
-        tmp_path / "observational",
-        model_id=base.manifest.model_id,
-        version=base.manifest.model_version,
-        capability=ArtifactCapability.OBSERVATIONAL_REPLAY,
-        payload=canonical_artifact_bytes(base._artifact),
+    observational = register_v1(
+        tmp_path / "observational", capability=ArtifactCapability.OBSERVATIONAL_REPLAY
     )
-    assert observational.capability is ArtifactCapability.OBSERVATIONAL_REPLAY
+    with pytest.raises(DynamicsUnusableError, match=r"（L1）.*反実仮想を申告していない"):
+        attested_dynamics(observational)
 
-    with pytest.raises(DynamicsUnusableError, match="反実仮想予測を申告していない"):
+    claimed = register_v1(tmp_path / "claimed", capability=ArtifactCapability.COUNTERFACTUAL_ACTION)
+    with pytest.raises(DynamicsUnusableError, match=r"（L4）"):
+        attested_dynamics(claimed)
+
+    with pytest.raises(DynamicsUnusableError, match="封をした型"):
         AttestedThermalDynamics.bind(
-            PlanningModel(base, capability=InferenceCapability.OBSERVATIONAL_REPLAY),
-            attestation=observational,
+            v1_model(),  # type: ignore[arg-type]
+            attestation=claimed.attestation,
+            confidence_policy=confidence_policy(),
         )
 
 
-def test_invariant_6_d_a_wrapper_around_another_artifact_is_refused(trained_v1) -> None:
-    """別の artifact を包んだ wrapper が、借りた証拠で learned simulator になれない。"""
-    base, _profile, attestation = trained_v1
-    with pytest.raises(DynamicsUnusableError, match="model_id"):
+def test_invariant_6_d_a_broken_or_borrowed_artifact_is_refused(
+    attested_artifact, trained, tmp_path
+) -> None:
+    """壊れた artifact・較正の違う runtime・借りた証拠では learned simulator にならない。"""
+
+    def unmasked(doc: dict[str, Any]) -> None:
+        # horizon 1 step の出力に、step 1 の計画 action の係数を入れる（因果の mask の外。L10）。
+        plan_start = len(doc["feature_schema"]["columns"]) - STEPS * 3
+        output = next(item for item in doc["payload"]["outputs"] if item["horizon_ms"] == STEP_MS)
+        output["coefficients"][plan_start + 3] = 1.0
+
+    broken = register_v2(tmp_path / "broken", targets=WINDOW_METRICS, edit=unmasked)
+    with pytest.raises(DynamicsUnusableError, match=r"（L10）"):
+        attested_dynamics(broken)
+
+    # 学習時と違う較正の runtime（L9。不一致は拒否。0079 §6 の質問 4）。
+    with pytest.raises(DynamicsUnusableError, match=r"（L9）"):
+        attested_dynamics(
+            attested_artifact,
+            calibration=RuntimeCalibration.available({"front_intake": 0.5, "room_temp": -0.31}),
+        )
+    with pytest.raises(DynamicsUnusableError, match=r"（L9）"):
+        attested_dynamics(attested_artifact, calibration=UNAVAILABLE_CALIBRATION)
+
+    # 別の artifact の証拠を借りて束ねさせない（同じ model ID・版でも bytes の hash が違う）。
+    model = RegistryCounterfactualThermalModel.from_verified_artifact(
+        attested_artifact, metric_catalog=CATALOG, calibration=RUNTIME_CALIBRATION
+    )
+    with pytest.raises(DynamicsUnusableError, match="artifact_sha256"):
         AttestedThermalDynamics.bind(
-            PlanningModel(base, model_id="other-thermal"), attestation=attestation
+            model, attestation=trained.attestation, confidence_policy=confidence_policy()
         )
     with pytest.raises(TypeError, match="bind"):
         AttestedThermalDynamics()
+
+
+def test_invariant_6_h_an_artifact_that_does_not_predict_the_window_is_refused(trained) -> None:
+    """window の metric を予測しない artifact は束縛で拒む（feature に AIR、target は CPU / GPU）。
+
+    次の window は予測だけで作り、予測しない metric を埋めない（0058 §2.2）。
+    step で落ちる前に止める。
+    """
+    with pytest.raises(DynamicsUnusableError, match=AIR.replace(".", r"\.")):
+        attested_dynamics(trained.verified)
+
+
+def test_invariant_6_i_an_artifact_sampled_off_the_action_grid_is_refused(
+    attested_artifact, monkeypatch
+) -> None:
+    """window の刻みが action の刻みと違う artifact は束縛で拒む（再標本化しない。0079 §2.3）。
+
+    Dataset v2 は2つの刻みが違う組を許すが、合成 artifact で作るには feature の列と係数を
+    作り直す必要がある。ここでは封をした型が返す feature schema の刻みだけを変えて、束縛の
+    検査そのものを確かめる。
+    """
+    original = RegistryCounterfactualThermalModel.feature_schema
+
+    def coarse(self: RegistryCounterfactualThermalModel) -> Any:
+        schema = original.fget(self)  # type: ignore[attr-defined]
+        return schema.model_copy(update={"sample_period_ms": 2 * STEP_MS})
+
+    monkeypatch.setattr(RegistryCounterfactualThermalModel, "feature_schema", property(coarse))
+    with pytest.raises(DynamicsUnusableError, match="window の刻み"):
+        attested_dynamics(attested_artifact)
+
+
+def test_invariant_6_j_an_artifact_without_a_one_step_horizon_is_refused(
+    attested_artifact, monkeypatch
+) -> None:
+    """最初の horizon が action の刻みと違う artifact は束縛で拒む（1 step 後を補間しない）。"""
+    original = RegistryCounterfactualThermalModel.target_schema
+
+    def later(self: RegistryCounterfactualThermalModel) -> Any:
+        schema = original.fget(self)  # type: ignore[attr-defined]
+        return schema.model_copy(update={"horizons_ms": schema.horizons_ms[1:]})
+
+    monkeypatch.setattr(RegistryCounterfactualThermalModel, "target_schema", property(later))
+    with pytest.raises(DynamicsUnusableError, match="最初の horizon"):
+        attested_dynamics(attested_artifact)
+
+
+def test_invariant_15_h_every_screened_metric_is_in_the_simulated_window(
+    trained, attested_artifact
+) -> None:
+    """safety screen の metric を learned simulator の window が持たなければ環境は受け取らない。
+
+    持たない metric は screen が照らせず、絶対上限の超過を数えないまま episode が進む（0058 §2.5）。
+    """
+    screen = {"temperature_metrics": [AIR, GPU, "cpu.package"]}
+    with pytest.raises(EnvironmentUsageError, match="safety screen"):
+        build_environment(
+            trained,
+            dynamics=attested_dynamics(attested_artifact),
+            config_overrides={"safety_screen": screen},
+        )
 
 
 def test_invariant_6_e_a_simulated_episode_is_not_promotable(trained) -> None:
@@ -1225,17 +1348,21 @@ def test_invariant_6_f_a_self_declared_registry_provenance_grants_nothing(traine
     assert not result.promotable
 
 
-def test_invariant_6_g_an_attested_binding_is_the_only_source_of_evidence(trained_v1) -> None:
+def test_invariant_6_g_an_attested_binding_is_the_only_source_of_evidence(
+    attested_artifact,
+) -> None:
     """Registry の証拠に裏づけられた dynamics だけが `attested_evidence` を満たす。"""
-    base, _profile, attestation = trained_v1
-    dynamics = AttestedThermalDynamics.bind(PlanningModel(base), attestation=attestation)
+    dynamics = attested_dynamics(attested_artifact)
+    attestation = attested_artifact.attestation
 
     assert dynamics.attestation is attestation
+    assert not attestation.production_active  # 学習 dynamics は production を要求しない
     evidence = attested_evidence(dynamics)
     assert evidence is not None
     assert evidence.provenance is DynamicsProvenance.REGISTRY_ATTESTED
     assert evidence.attestation is attestation
     assert dynamics.identity.artifact_sha256 == attestation.artifact_sha256
+    assert dynamics.model.artifact_sha256 == attestation.artifact_sha256
 
 
 def test_invariant_7_e_the_logged_tolerance_comes_from_the_validated_policy() -> None:
@@ -1868,3 +1995,215 @@ def test_invariant_17_a_the_identification_tolerance_is_recorded(trained) -> Non
         EpisodeResult.model_validate(
             result.model_dump(mode="python") | {"applied_demand_tolerance": None}
         )
+
+
+# ------------------------- 不変条件 15: learned simulator の判定の記録（決定記録 0079 段 6）
+
+
+NARROW_LATER_STEPS = (0.0, 0.1)
+"""step 1 以降で観測したことにする demand の範囲。floor（0.2）以上の要求はすべて外れる。"""
+
+
+@pytest.fixture(scope="module")
+def narrow_artifact(tmp_path_factory: pytest.TempPathFactory) -> VerifiedArtifact:
+    """step 0 でしか高い demand を観測していない Profile を同梱した artifact v2。
+
+    payload（係数）は `attested_artifact` と同じで、同梱 Profile の step ごとの support だけが
+    狭い。**予測は同じで、判定の記録だけが違う**組を作るために使う。
+    """
+    narrow = ranges(*NARROW_LATER_STEPS)
+    return register_v2(
+        tmp_path_factory.mktemp("pr105-dynamics-narrow") / "registry",
+        targets=WINDOW_METRICS,
+        promoted=False,
+        support=action_support(
+            steps=((ranges(0.0, 1.0), CELLS), (narrow, CELLS), (narrow, CELLS)),
+        ),
+    )
+
+
+def attested_run(trained, verified: VerifiedArtifact, *, with_mpc: bool = True) -> EpisodeResult:
+    environment, *_ = build_environment(
+        trained, dynamics=attested_dynamics(verified), with_mpc=with_mpc
+    )
+    return run_all(environment, episode_spec(max_steps=4))
+
+
+def test_invariant_15_a_every_learned_step_records_the_bundled_profile_judgement(
+    trained, attested_artifact
+) -> None:
+    """learned simulator の step は**必ず**同梱 Profile v2 による判定の記録を持つ。"""
+    dynamics = attested_dynamics(attested_artifact)
+    environment, *_ = build_environment(trained, dynamics=dynamics)
+    result = run_all(environment, episode_spec(max_steps=4))
+
+    assert result.mode is TrainingMode.LEARNED_SIMULATOR
+    assert result.termination is TerminationReason.HORIZON
+    assert len(result.steps) == 4
+    for step in result.steps:
+        assert step.provenance is DynamicsProvenance.REGISTRY_ATTESTED
+        assessment = step.simulator_assessment
+        assert assessment is not None
+        # 広い support の Profile では、掛けた action 列は support の中。
+        assert assessment.plan_support is None
+    assert result.simulator_out_of_support_steps == ()
+    # 記録は運転時と同じ判定器（同梱 Profile + `model_confidence`）が入力 window に出す判定である。
+    window = episode_spec().initial_window
+    expected = CounterfactualConfidenceAssessor.for_model(
+        dynamics.model, confidence_policy()
+    ).assess(window, dynamics.model.predict(window), None)
+    first = result.steps[0].simulator_assessment
+    assert first is not None
+    assert (first.confidence, first.ood) == (expected.confidence, expected.ood)
+    assert first.ood_components == tuple(item for item in expected.components if item.ood)
+    # 判定の記録に効く Profile と設定は条件 hash に入る。
+    conditions = result.other_conditions["dynamics_conditions"]
+    assert isinstance(conditions, dict)
+    assert conditions["confidence_profile_sha256"] == dynamics.model.confidence_profile.sha256()
+    assert conditions["confidence_policy"] == confidence_policy().model_dump(mode="json")
+
+
+def test_invariant_15_b_out_of_support_steps_are_recorded_but_change_nothing(
+    trained, attested_artifact, narrow_artifact
+) -> None:
+    """step ごとの support の外・OOD は**記録される**が、遷移・採点・`promotable` は変わらない。
+
+    0079 §5 #8: 段 6 は記録だけ（`promotable` の条件を変えるなら新しい記録）。
+    """
+    broad = attested_run(trained, attested_artifact)
+    narrow = attested_run(trained, narrow_artifact)
+
+    assert narrow.simulator_out_of_support_steps == tuple(range(4))
+    assert narrow.simulator_ood_steps == tuple(range(4))
+    for step in narrow.steps:
+        assessment = step.simulator_assessment
+        assert assessment is not None
+        violation = assessment.plan_support
+        assert violation is not None
+        # detail に外れた step の番号・zone が入る（0084 §2.2）。
+        assert violation.kind is SupportViolationKind.STEP_DEMAND
+        assert violation.step == 1
+        assert violation.zone is Zone.FRONT
+        # 入力 window の anchor 推論も、held の列が support の外なので `support` の OOD（0084）。
+        assert assessment.confidence == 0.0
+        components = {item.component: item for item in assessment.ood_components}
+        assert ConfidenceComponent.SUPPORT in components
+        assert "step=1" in components[ConfidenceComponent.SUPPORT].detail
+
+    # 判定の記録以外は同じ（予測も reward も終端も promotable も）。
+    def without_records(result: EpisodeResult) -> list[dict[str, Any]]:
+        return [
+            step.model_dump(mode="json", exclude={"simulator_assessment"}) for step in result.steps
+        ]
+
+    assert without_records(narrow) == without_records(broad)
+    assert narrow.termination is broad.termination
+    assert narrow.promotable == broad.promotable
+    assert narrow.promotable  # OOD の記録だけでは昇格の条件は変わらない
+    # Profile が違えば条件 hash は違う（同じ表に並べない）。
+    assert narrow.conditions_sha256 != broad.conditions_sha256
+
+
+def test_invariant_15_c_learned_simulator_episodes_are_deterministic(
+    trained, narrow_artifact
+) -> None:
+    """同じ条件・同じ seed からは、判定の記録まで含めて同じ結果になる。"""
+    first = attested_run(trained, narrow_artifact, with_mpc=False)
+    second = attested_run(trained, narrow_artifact, with_mpc=False)
+
+    assert first.digest() == second.digest()
+    assert first.model_dump(mode="json") == second.model_dump(mode="json")
+
+
+def test_invariant_15_d_a_learned_step_cannot_drop_or_borrow_the_record(
+    trained, attested_artifact
+) -> None:
+    """learned simulator の step から記録を落とせず、ほかの出どころの step は記録を名乗れない。"""
+    attested = attested_run(trained, attested_artifact)
+    scored = attested.steps[0]
+    with pytest.raises(ValidationError, match="同梱 Profile の判定"):
+        type(scored).model_validate(
+            scored.model_dump(mode="python") | {"simulator_assessment": None}
+        )
+
+    simulated = run_all(build_environment(trained)[0], episode_spec(max_steps=2)).steps[0]
+    assert simulated.simulator_assessment is None
+    with pytest.raises(ValidationError, match="同梱 Profile の判定"):
+        type(simulated).model_validate(
+            simulated.model_dump(mode="python")
+            | {"simulator_assessment": scored.simulator_assessment}
+        )
+
+    # registry_attested を自称するだけの dynamics は、記録を持たない step を作れず止まる。
+    config, config_sha = rl_config()
+    forged = ForgedAttestedDynamics(
+        SimulatedThermalDynamics(config.simulator, config_sha256=config_sha)
+    )
+    result = run_all(build_environment(trained, dynamics=forged)[0], episode_spec(max_steps=3))
+    assert result.termination is TerminationReason.DYNAMICS_UNUSABLE
+    assert not result.promotable
+
+
+def test_invariant_15_e_the_environment_refuses_a_mismatched_simulator(
+    trained, attested_artifact
+) -> None:
+    """判定の設定が環境と違う・刻みが action の格子と違う learned simulator を受け取らない。"""
+    current = confidence_policy()
+    other = current.model_copy(update={"min_support_count": current.full_support_count})
+    assert other != current
+    with pytest.raises(EnvironmentUsageError, match="model_confidence"):
+        build_environment(trained, dynamics=attested_dynamics(attested_artifact, policy=other))
+
+    episode = rl_document()["episode"] | {"step_ms": provisional(2 * STEP_MS)}
+    with pytest.raises(EnvironmentUsageError, match="action の格子"):
+        build_environment(
+            trained,
+            dynamics=attested_dynamics(attested_artifact),
+            config_overrides={"episode": episode},
+        )
+
+
+def test_invariant_15_f_the_learned_simulator_has_no_path_to_control(attested_artifact) -> None:
+    """learned simulator は制御へ届かない。MPC の束縛へ変換する口も、Demand を作る口も無い。
+
+    次の window の action は、環境が渡した applied をそのまま写すだけである。
+    """
+    dynamics = attested_dynamics(attested_artifact)
+    public = [name for name in dir(dynamics) if not name.startswith("_")]
+    assert not any(isinstance(getattr(dynamics, name), MpcModelBinding) for name in public)
+    demand_like = [name for name in public if "demand" in name.lower()]
+    assert demand_like == ["applied_demand_tolerance"]
+
+    applied = PerZone[Demand](front=0.45, rear=0.5, top=0.55)
+    step = dynamics.advance(
+        DynamicsRequest(
+            window=observed_input(0.4),
+            applied=applied,
+            workload=workload_trace(1).samples[0],
+            step_ms=STEP_MS,
+            step_index=0,
+        ),
+        rng=Random(0),
+    )
+    assert step.window is not None
+    assert tuple(step.window.action.get(zone).effective_demand for zone in Zone) == (
+        0.45,
+        0.5,
+        0.55,
+    )
+
+
+def test_invariant_15_g_a_learned_simulator_episode_is_versioned(trained, narrow_artifact) -> None:
+    """記録を持つ episode は版 3 で往復し、版 2 を名乗る形は版の不一致で拒まれる（0106 §2.4）。"""
+    result = attested_run(trained, narrow_artifact)
+    assert result.schema_version == EPISODE_SCHEMA_VERSION == 3
+    restored = EpisodeResult.model_validate_json(result.model_dump_json())
+    assert restored == result
+    assert restored.digest() == result.digest()
+    assert restored.simulator_ood_steps == result.simulator_ood_steps
+
+    document = json.loads(result.model_dump_json())
+    document["schema_version"] = 2
+    with pytest.raises(ValidationError) as caught:
+        EpisodeResult.model_validate_json(json.dumps(document))
+    assert any(error["loc"] == ("schema_version",) for error in caught.value.errors())

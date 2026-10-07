@@ -118,7 +118,7 @@ def with_mpc(trained: Any) -> Setup:
 
 def test_invariant_1_episode_conditions_are_two_level_and_readable(unbacked: Setup) -> None:
     episode = unbacked.comparison.arms[0].episodes[0]
-    assert episode.schema_version == EPISODE_SCHEMA_VERSION == 2
+    assert episode.schema_version == EPISODE_SCHEMA_VERSION == 3
     assert episode.config_digests == EpisodeConfigDigests(
         rl_training=config_digest(unbacked.config),
         fan_policy=config_digest(unbacked.settings),
@@ -190,11 +190,31 @@ def test_invariant_1_c_rewriting_both_sides_breaks_the_rebuilt_hash(unbacked: Se
         EpisodeResult.model_validate_json(json.dumps(document))
 
 
-def test_invariant_1_d_a_v1_episode_is_not_read(unbacked: Setup) -> None:
+@pytest.mark.parametrize("version", [1, 2])
+def test_invariant_1_d_an_older_episode_is_refused_by_its_version(
+    unbacked: Setup, version: int
+) -> None:
+    """v1 / v2 の episode と比較は**版の不一致として**読まない（0074 §2.2 / 0106 §2.4）。"""
     document = json.loads(unbacked.comparison.arms[0].episodes[0].model_dump_json())
-    document["schema_version"] = 1
-    with pytest.raises(ValidationError):
+    document["schema_version"] = version
+    with pytest.raises(ValidationError) as caught:
         EpisodeResult.model_validate_json(json.dumps(document))
+    assert any(error["loc"] == ("schema_version",) for error in caught.value.errors())
+
+    comparison = json.loads(unbacked.comparison.model_dump_json())
+    comparison["schema_version"] = version
+    with pytest.raises(ValidationError) as caught:
+        PolicyComparison.model_validate_json(json.dumps(comparison))
+    assert any(error["loc"] == ("schema_version",) for error in caught.value.errors())
+
+
+def test_invariant_1_e_a_v3_comparison_round_trips(unbacked: Setup) -> None:
+    """v3 の比較は JSON を経ても同じ値・同じ digest に戻る。"""
+    comparison = unbacked.comparison
+    assert comparison.schema_version == 3
+    restored = PolicyComparison.model_validate_json(comparison.model_dump_json())
+    assert restored == comparison
+    assert all(episode.schema_version == 3 for arm in restored.arms for episode in arm.episodes)
 
 
 # ---------------------------------------------------------------- 2〜4. 報告の構築

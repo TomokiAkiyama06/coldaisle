@@ -73,7 +73,7 @@ from coldaisle.control.supervisor.policy_config import (
 )
 from coldaisle.control.supervisor.rule_identity import rule_probe_input
 
-TRAINING_REPORT_SCHEMA_VERSION: Literal[2] = 2
+TRAINING_REPORT_SCHEMA_VERSION: Literal[3] = 3
 """`SupervisorPolicyTrainingReport` の形の版。**入れ子の比較の形が変わったら上げる。**
 
 - v2（#105 / 決定記録 0074 §2.2）: 中の `PolicyComparison` / `EpisodeResult` が
@@ -81,6 +81,9 @@ TRAINING_REPORT_SCHEMA_VERSION: Literal[2] = 2
   **v1 の報告は版の不一致として拒む**（入れ子の欄の不足で落ちるのではなく、報告の版で拒む）。
   v1 の報告に入っていた artifact の `training_evidence.conditions_sha256` は v1 の算出であり、
   v2 の条件 hash と同じ名前でも値を比べられない
+- v3（#105 / 決定記録 0106 §2.4）: 中の `EpisodeResult` / `PolicyComparison` が
+  `EPISODE_SCHEMA_VERSION` 3（`StepRecord.simulator_assessment`）になった。
+  **v2 の報告は版の不一致として拒む**
 """
 
 """Rule policy の表をそのまま RL artifact として回す候補の識別子。
@@ -309,7 +312,7 @@ def training_counterfactual_backed(
 class SupervisorPolicyTrainingReport(_Frozen):
     """探索1回の結果。**同じ入力からは同じ bytes になる。**"""
 
-    schema_version: Literal[2] = TRAINING_REPORT_SCHEMA_VERSION
+    schema_version: Literal[3] = TRAINING_REPORT_SCHEMA_VERSION
     search_family: str = Field(pattern=r"^[a-z][a-z0-9_]*$", max_length=64)
     seed: int = Field(ge=0)
     candidate_order: tuple[str, ...] = Field(min_length=1)
