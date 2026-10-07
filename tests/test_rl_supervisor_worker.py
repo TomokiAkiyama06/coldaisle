@@ -57,6 +57,7 @@ from coldaisle.learned_worker.cli import SupervisorWorker
 from coldaisle.learned_worker.client import WorkerChannel
 from coldaisle.learned_worker.registry import RegistryProductionCheck
 from coldaisle.learned_worker.supervisor import (
+    PolicyLoadFailure,
     PolicySource,
     RegistryPolicySource,
     SupervisorWorkerCore,
@@ -288,16 +289,35 @@ class CountingProduction:
 
 
 class CountingPolicies:
-    def __init__(self, inner: PolicySource | None = None, *, refuse: str | None = None) -> None:
+    """読み込みを数え、``failures`` を先頭から順に返してから ``inner`` へ渡す。"""
+
+    def __init__(
+        self, inner: PolicySource | None = None, *, failures: list[PolicyLoadFailure] | None = None
+    ) -> None:
         self.inner = inner
-        self.refuse = refuse
+        self.failures = list(failures or [])
         self.loads = 0
 
-    def load(self, pinned: PinnedArtifact) -> VerifiedArtifact | str:
+    def load(self, pinned: PinnedArtifact) -> VerifiedArtifact | PolicyLoadFailure:
         self.loads += 1
-        if self.refuse is not None or self.inner is None:
-            return self.refuse or "refused"
+        if self.failures:
+            return self.failures.pop(0)
+        assert self.inner is not None
         return self.inner.load(pinned)
+
+
+class FlakyRegistry:
+    """``load_version`` の最初の ``failures`` 回だけ例外を出す registry（一時的に読めない）。"""
+
+    def __init__(self, inner: ModelRegistry, failures: int) -> None:
+        self.inner = inner
+        self.failures = failures
+
+    def load_version(self, *args: Any, **kwargs: Any) -> Any:
+        if self.failures > 0:
+            self.failures -= 1
+            raise OSError("一時的に読めない")
+        return self.inner.load_version(*args, **kwargs)
 
 
 def test_production_is_checked_every_period_before_inference(
@@ -382,7 +402,11 @@ def test_a_config_without_rl_sends_nothing(catalog: MetricCatalog, registry: Reg
 def test_a_binding_failure_is_not_retried_until_the_next_run(
     catalog: MetricCatalog, registry: Registry
 ) -> None:
-    policies = CountingPolicies(refuse="registry から読めない")
+    """読めたうえで使えない policy は別の run_id まで読み直さない（0114 §2.1 の2）。"""
+    unusable = PolicyLoadFailure(detail="checksum が合わない", transient=False)
+    policies = CountingPolicies(
+        RegistryPolicySource(registry.registry), failures=[unusable, unusable]
+    )
     core = registry.core(policies=policies)
     frames = loop_frames(catalog, registry)
     assert feed(core, frames[-2]) is None
@@ -390,6 +414,55 @@ def test_a_binding_failure_is_not_retried_until_the_next_run(
     assert policies.loads == 1
     assert feed(core, frames[-1], run_id=OTHER_RUN_ID) is None
     assert policies.loads == 2
+    assert not core.stopped
+
+
+def test_a_transient_read_failure_is_retried_every_period_and_recovers(
+    catalog: MetricCatalog, registry: Registry
+) -> None:
+    """registry を**読めない**一時的な失敗だけは周期ごとに読み直す（0114 §2.1 の2）。"""
+    flaky = FlakyRegistry(registry.registry, failures=2)
+    core = registry.core(policies=RegistryPolicySource(flaky))  # type: ignore[arg-type]
+    frames = loop_frames(catalog, registry)
+    assert feed(core, frames[-3]) is None
+    assert feed(core, frames[-2]) is None
+    assert not core.bound and not core.stopped
+    delivered = feed(core, frames[-1])
+    assert delivered is not None and delivered.identity == registry.identity
+
+
+def test_load_failures_are_classified_as_unreadable_or_unusable(registry: Registry) -> None:
+    source = RegistryPolicySource(FlakyRegistry(registry.registry, failures=1))  # type: ignore[arg-type]
+    raised = source.load(registry.pins)
+    assert isinstance(raised, PolicyLoadFailure) and raised.transient
+
+    real = RegistryPolicySource(registry.registry)
+    unknown = real.load(registry.pins.model_copy(update={"version": "9.9.9"}))
+    assert isinstance(unknown, PolicyLoadFailure) and not unknown.transient
+    other_sha = real.load(registry.pins.model_copy(update={"artifact_sha256": "e" * 64}))
+    assert isinstance(other_sha, PolicyLoadFailure) and not other_sha.transient
+
+    # registry の snapshot を読めない（壊れた registry.json）は読み直す側
+    (registry.root / "registry.json").write_text("{", "utf-8")
+    broken = real.load(registry.pins)
+    assert isinstance(broken, PolicyLoadFailure) and broken.transient
+
+
+def test_an_unreadable_artifact_is_retried_but_a_moved_production_still_stops(
+    catalog: MetricCatalog, registry: Registry
+) -> None:
+    """読み直すのは読み込みだけ。production でなくなれば従来どおり別の run_id まで止まる。"""
+    transient = PolicyLoadFailure(detail="artifact bytes を読み取れない", transient=True)
+    policies = CountingPolicies(RegistryPolicySource(registry.registry), failures=[transient])
+    core = registry.core(policies=policies)
+    frames = loop_frames(catalog, registry)
+    assert feed(core, frames[-3]) is None
+    assert feed(core, frames[-2]) is not None
+    assert policies.loads == 2
+
+    register_policy(registry.root, artifact(BOUNDS, model_version="0.2.0"), promoted=True)
+    assert feed(core, frames[-1]) is None and core.stopped
+    assert feed(core, frames[-1]) is None
 
 
 def test_another_sha_under_the_pinned_version_is_not_bound(
@@ -399,7 +472,7 @@ def test_another_sha_under_the_pinned_version_is_not_bound(
     latest = loop_frames(catalog, registry)[-1]
     forged = registry.pins.model_copy(update={"artifact_sha256": "e" * 64})
     loaded = RegistryPolicySource(registry.registry).load(forged)
-    assert isinstance(loaded, str)
+    assert isinstance(loaded, PolicyLoadFailure) and not loaded.transient
     assert latest.expected_artifacts.supervisor_policy == registry.pins
 
 

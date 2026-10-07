@@ -36,6 +36,7 @@ from coldaisle.control.config import ControlConfig
 from coldaisle.control.learned_handoff import LearnedFrame, PinnedArtifact
 from coldaisle.control.model_registry import (
     ArtifactKind,
+    ArtifactLoadStatus,
     ArtifactRef,
     ModelCompatibility,
     ModelRegistry,
@@ -69,17 +70,41 @@ class SkipCode:
 
     別の run_id まで止まる。
     """
+    POLICY_UNREADABLE = "policy_unreadable"
+    """registry を一時的に読めない（例外・`invalid_registry`・`artifact_unavailable`）。
+
+    **止まらず、次の周期に読み直す**（決定記録 0114 §2.1 の2。2026-10-08 所有者の決定）。
+    """
     POLICY_UNUSABLE = "policy_unusable"
-    """registry から読めない・束縛の検査に外れた（別の run_id まで作り直さない）。"""
+    """読めたが使えない（登録が無い・checksum・schema・形式・固定との SHA-256 の食い違い・
+    束縛の検査に外れた）。別の run_id まで作り直さない（0114 §2.1 の2）。"""
     WORKLOAD_UNAVAILABLE = "workload_unavailable"
     """frame に Workload Regime の推定が無い・snapshot と揃わない。"""
+
+
+@dataclass(frozen=True, slots=True)
+class PolicyLoadFailure:
+    """policy を読めなかった理由（path を含まない）。
+
+    ``transient`` は registry を**読めなかった**（読み直せば通りうる）とき True。読めたうえで
+    使えない（形・checksum・固定との食い違い）ときは False（0114 §2.1 の2）。
+    """
+
+    detail: str
+    transient: bool
+
+
+TRANSIENT_LOAD_STATUSES = frozenset(
+    {ArtifactLoadStatus.INVALID_REGISTRY, ArtifactLoadStatus.ARTIFACT_UNAVAILABLE}
+)
+"""registry の snapshot・artifact の bytes を読めなかった状態（一時的な失敗として読み直す）。"""
 
 
 class PolicySource(Protocol):
     """固定された policy を registry の検証経路で読む（bytes の checksum と schema）。"""
 
-    def load(self, pinned: PinnedArtifact) -> VerifiedArtifact | str:
-        """検証済みの artifact か、読めなかった理由（path を含まない）。**例外を出さない。**"""
+    def load(self, pinned: PinnedArtifact) -> VerifiedArtifact | PolicyLoadFailure:
+        """検証済みの artifact か、読めなかった理由。**例外を出さない。**"""
 
 
 class RegistryPolicySource:
@@ -88,7 +113,7 @@ class RegistryPolicySource:
     def __init__(self, registry: ModelRegistry) -> None:
         self._registry = registry
 
-    def load(self, pinned: PinnedArtifact) -> VerifiedArtifact | str:
+    def load(self, pinned: PinnedArtifact) -> VerifiedArtifact | PolicyLoadFailure:
         """shadow の stage で読む（`for_shadow` と同じ契約。`supervisor_shadow` の CLI と同じ）。"""
         try:
             result = self._registry.load_version(
@@ -104,12 +129,19 @@ class RegistryPolicySource:
                 ),
             )
         except Exception as error:
-            return f"registry から読めない: {type(error).__name__}"
+            return PolicyLoadFailure(
+                detail=f"registry から読めない: {type(error).__name__}", transient=True
+            )
         if result.artifact is None:
-            return f"registry から読めない（status={result.status.value}）: {result.detail}"
+            return PolicyLoadFailure(
+                detail=f"registry から読めない（status={result.status.value}）: {result.detail}",
+                transient=result.status in TRANSIENT_LOAD_STATUSES,
+            )
         if result.artifact.attestation.artifact_sha256 != pinned.artifact_sha256:
             # 同じ版を名乗る別の bytes を使わない（frame の固定は3つ組。0077 §2.6）
-            return "registry の artifact の SHA-256 が frame の固定と違う"
+            return PolicyLoadFailure(
+                detail="registry の artifact の SHA-256 が frame の固定と違う", transient=False
+            )
         return result.artifact
 
 
@@ -238,11 +270,18 @@ class SupervisorWorkerCore:
         )
 
     def _bind(self, pinned: PinnedArtifact, expected_version: str) -> RegimeTableRlPolicy | None:
-        """固定された policy を読み、**shadow 用に**束縛する。失敗は別の run_id まで覚える。"""
+        """固定された policy を読み、**shadow 用に**束縛する。
+
+        registry を一時的に読めないときは覚えずに次の周期で読み直す。読めたうえで使えないときは
+        別の run_id まで覚える（決定記録 0114 §2.1 の2）。
+        """
         loaded = self._policies.load(pinned)
         detail: str | None = None
-        if isinstance(loaded, str):
-            detail = loaded
+        if isinstance(loaded, PolicyLoadFailure):
+            if loaded.transient:
+                self._skip(SkipCode.POLICY_UNREADABLE)
+                return None
+            detail = loaded.detail
         else:
             try:
                 binding = SupervisorPolicyBinding.for_shadow(
