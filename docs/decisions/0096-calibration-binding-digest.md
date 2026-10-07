@@ -134,17 +134,28 @@ digest は次の2つだけから決まる。
 
 ### 2.5 規則の版
 
-`calibration-digest-v1` の名前や版は bytes にも manifest にも入れない。規則を変えるときは新しい決定記録を作り、
-その時点の v2 artifact はすべて作り直す（規則が違えば digest は一致しないので、古い artifact は L9 で
-拒否され Fallback に落ちる。危険側へは外れない）。manifest の形（`{sha256 | null}`）は変えないので、
-artifact の `schema_version` は上げない。
+artifact v2（`schema_version` 2）の `calibration_binding.sha256` の意味を **`calibration-digest-v1` と定義する**。
+いまは規則が1つしか無いので、規則の名前を bytes にも manifest にも入れない。manifest の形（`{sha256 | null}`）は
+変えないので、本記録で artifact の `schema_version` は上げない。
+
+**規則を変えるときは 0079 §2.3 の「形式の意味を変えるときは `schema_version` を上げる」に従い、artifact の
+`schema_version` を上げる**（または manifest に規則の欄を足す。どちらも新しい決定記録で決める）。
+「規則が違えば digest は必ず一致しないので古い artifact は L9 で拒否される」とは言えない。投影が変わらない入力
+（特に `null`）や、新旧で同じ bytes になる入力では、新旧どちらの規則でも同じ値になり、版が無いと runtime は
+どちらの規則で作った digest かを見分けられないためである（PR #229 の Codex の指摘）。
 
 ### 2.6 trainer と loader の引数を替える
 
 PR #226 の引数（`calibration_sha256: Sha256 | None`）を次へ替える。どちらも**既定値を持たない**。
 
 - `CounterfactualTrainingSpec`: `calibration_sha256` を廃し、チャネル名 → offset の値を受け取る
-- `from_verified_artifact` / `_load_checked`: `calibration_sha256` を廃し、runtime の較正の値を受け取る
+- `from_verified_artifact` / `_load_checked`: `calibration_sha256` を廃し、runtime の較正を受け取る。型は
+  「読めた較正の値（チャネル名 → offset）」と「**読めなかった**」を区別する2状態とする（仮に
+  `RuntimeCalibration.available(offsets)` / `RuntimeCalibration.unavailable(reason)`）。空の `Mapping` で「読めなかった」を
+  表さない。空の値は全チャネル 0.0 と同じ digest になり、0.0 で学習した `null` でない artifact が L9 を通ってしまうため
+  （PR #229 の Codex の指摘）
+  - L9 は、`unavailable` なら manifest の digest が `null` でない artifact を**digest を比べる前に**拒否し、`null` の
+    artifact は通す（§5 #8）。`available` なら §2.4 のとおり計算して比べる
 - `check_artifact_contents` の `check_calibration=False`（作成時に L9 を飛ばす）はそのまま
 
 実装は #84 の後続の PR とし、#86（段 4）の束縛の切り替えより前にマージする（§5 #6）。
@@ -186,6 +197,8 @@ PR #226 の引数（`calibration_sha256: Sha256 | None`）を次へ替える。�
 - **学習と読み込みの一致**: trainer が作った artifact を同じ較正の値で読み込むと L9 を通り、1つの offset を変えた値で
   読み込むと `ArtifactCheck.CALIBRATION` で拒否される
 - `d.*` を展開した先がまた `d.*` である entry を与えると、digest を作らず例外になる
+- **読めなかった較正**: `unavailable` を渡すと、全 offset が 0.0 で学習した `null` でない artifact も L9 で拒否され、
+  `null` の artifact は通る。`available({})`（空）は `unavailable` と別に扱われる
 
 ## 3. Consequences
 
@@ -214,7 +227,7 @@ PR #226 の引数（`calibration_sha256: Sha256 | None`）を次へ替える。�
 | 派生値を展開せず、派生値の名前のまま入れる | 派生値の値は minuend / subtrahend の較正に依存する。名前だけでは較正の変化を捉えられない |
 | offset を小数3桁などに丸めてから入れる | `Normalizer` は丸めずに足す。丸めると store の値が違う2つの較正が同じ digest になる |
 | `offsets_c` に明示されたチャネルだけを入れる（無いチャネルは入れない） | 「無い」と「0.0」は store の値が同じなのに digest が違う。§5 #2 で確認する |
-| 規則の版や区切りの文字列を bytes に含める | 規則を変えれば digest は必ず変わり、古い artifact は L9 で安全側に拒否される（§2.5）。いま足す利益が無い。§5 #7 |
+| 規則の版を今から bytes や manifest に含める | 規則が1つのうちは区別する相手が無い。規則を変えるときに `schema_version` を上げれば（§2.5）、版の無い v2 を新しい規則で読まない。§5 #7 |
 | 呼び出し側が digest を計算して渡す（PR #226 のまま） | runtime は artifact の metric の集合を知る前に digest を決められず、学習側と別の実装になりやすい（§2.4） |
 
 ## 5. 未決事項（所有者に確認する点）
@@ -229,8 +242,8 @@ PR #226 の引数（`calibration_sha256: Sha256 | None`）を次へ替える。�
 | 4 | 学習データの期間の**後**に較正を変えてから学習したとき、合成の起点がいまの較正ファイルを渡すと、古い較正のデータで学習した artifact が新しい較正の runtime の L9 を通ってしまう | **学習の合成の起点は、期間の先頭から学習の時点までの宣言された変更（0056 §2.5）を受け取り、期間の後に `calibration_changed` があれば学習を拒否する**。古い較正の値を正しく渡して作った artifact も、新しい較正の runtime では L9 で拒否されるので、作る利益が無い。学習の CLI を作る PR（0094 §2.4（PR #225）の CLI の v2 対応の後）で入れる | 呼び出し側の責任とし、手順書に書くだけにする |
 | 5 | 0090 の config 束縛に較正ファイルを足すか | **足さない**（§2.7）。L9 → artifact 無し → 0089 で Baseline に落ちる経路で足りる | 足す（証拠に較正ファイルの hash を入れ、較正を変えたら authority の上限を直接 Baseline にする） |
 | 6 | §2.6 の実装をどの PR で行うか | **#84 の後続 PR**（`calibration_digest` と引数の置き換え・試験・golden vector）。#86 の段 4 より前 | #86 の段 4 の PR に含める |
-| 7 | 規則の版（`calibration-digest-v1`）を bytes や manifest に入れるか | **入れない**（§2.5） | bytes の先頭に版の文字列を入れる、または `calibration_binding` に `rule` の欄を足す（manifest の形が変わり、artifact の `schema_version` を上げることになる） |
-| 8 | runtime で較正ファイルを読めなかったとき | **`fand` の起動は止めず、`null` でない artifact を L9 で拒否して Fallback**（`null` の artifact は通す）。読めないことは構造化ログに出す | 起動を止める（較正ファイルが無いと Baseline でも動かない） |
+| 7 | 規則の版（`calibration-digest-v1`）を bytes や manifest に入れるか | **いまは入れない。** v2 の digest の意味を `calibration-digest-v1` と定義し、規則を変えるときは artifact の `schema_version` を上げる（§2.5。0079 §2.3 のまま） | いまのうちに `calibration_binding` に `rule` の欄を足す（manifest の形が変わる。実データの artifact が無い今なら移行の費用は小さい） |
+| 8 | runtime で較正ファイルを読めなかったとき | **`fand` の起動は止めず、loader へ `unavailable` を渡し、`null` でない artifact を L9 で拒否して Fallback**（`null` の artifact は通す。§2.6）。読めないことは構造化ログに出す | 起動を止める（較正ファイルが無いと Baseline でも動かない） |
 
 ## 6. 承認記録
 
