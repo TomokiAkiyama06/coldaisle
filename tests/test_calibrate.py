@@ -375,6 +375,16 @@ def test_apply_writes_the_offsets(ready):
     assert written.offset_for("front_intake") == pytest.approx(0.19, abs=0.02)
 
 
+def test_apply_says_to_restart_fand_before_the_ingest(ready, capsys):
+    """**取り込みより先に fand を再起動する**（決定記録 0096 §2.7 / §5 #9）。"""
+    db, target = ready
+    assert main([*_argv(db, target), "--apply"]) == 0
+    out = capsys.readouterr().out
+    fand = out.index("`coldaisle-fand` を再起動し")
+    ingest = out.index("取り込みを再起動")
+    assert fand < ingest
+
+
 def test_a_refused_calibration_is_not_written(tmp_path, rules, monkeypatch, capsys):
     """**受け付けられない理由があれば `--apply` でも書かない。**"""
     monkeypatch.setattr("coldaisle.calibrate.WallClock", lambda: SimulatedClock(NOW_MS))

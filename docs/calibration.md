@@ -42,7 +42,7 @@ gpu_intake      air.gpu_intake      ds18b20   2     28FF............
 1. ラベルを貼り直す（現物と役割を合わせる）
 2. この手順の 1 → 4 を実行する（**較正をやり直す**）
 3. `--apply` が**差し替えを記録として受け入れます**（出力に出ます）
-4. 取り込みを再起動すると、次の起動バナーで `PROBE_CHANGED` が解けます
+4. `coldaisle-fand` を再起動してから取り込みを再起動すると（順番は §4）、次の起動バナーで `PROBE_CHANGED` が解けます
 
 **ROM だけを受け入れる手段はありません。** 記録された ROM が意味するのは
 「いまのオフセットが対応している個体」です。較正し直さずに受け入れると、
@@ -117,8 +117,17 @@ uv run coldaisle-calibrate --minutes 10
 uv run coldaisle-calibrate --minutes 10 --apply
 ```
 
-`config/calibration.json` が更新されます。**取り込みデーモンを再起動してください**
-（較正値は起動時に読みます）。
+`config/calibration.json` が更新されます。**取り込みより先に `coldaisle-fand` を再起動し、
+そのあと取り込みデーモンを再起動してください**（どちらも較正値は起動時に読みます）。
+
+順番に意味があります（決定記録 0096 §2.7 / §5 #9）。
+
+- `coldaisle-fand` は起動時に較正を読み、Learned Thermal Model の artifact をその値で照合します（L9）。
+  較正の掛かる metric の offset が変わっていれば、その artifact は使われず Fallback になります
+  （fand が artifact を読む配線は決定記録 0079 段 4（#86）で入ります。それより前から、この順番で運用してください）
+- **取り込みだけを再起動すると、fand は古い較正で照合済みの artifact のまま、新しい較正の値を読み続けます。**
+  L9 による拒否は起きません
+- fand を先に再起動すれば、新しい較正の値で照合し直してから、新しい較正の値が store に入ります
 
 ```bash
 # 何が変わったかを残す（#40）
