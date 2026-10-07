@@ -1,7 +1,7 @@
 # 決定記録 0104: 承認者が本番で `coldaisle-authority raise` を使うための、制御設定の読み取りと Model Registry の lock の最小権限
 
 - **種別**: Decision Record
-- **Status**: Proposed
+- **Status**: FINAL（2026-10-07、リポジトリ所有者が §5 の判断点 1〜11 をすべて推奨案で承認。§6）
 - **Date**: 2026-10-07
 - **Supersedes**: なし（0086 §5 の未決 3 を閉じる。0080 / 0086 の決定した値は変えない。§2.8）
 - **関連**: [0086](0086-authority-approver-uid.md) §2.1〜§2.4・§2.8、§5 の未決 2・3 /
@@ -75,7 +75,7 @@ PR #216（0086 段階 3b）で `coldaisle-authority raise` / `rollback` が入�
 本記録の権限はすべて**読み取り**と **flock** だけで、上の4つのどれにも触れない。承認者を root にする経路も、
 承認者を fand のユーザーにする経路も作らない。
 
-## 2. Decision（案。所有者の判断待ち。§5 の各項目に推奨案と代替案）
+## 2. Decision（2026-10-07、所有者が §5 の推奨案をすべて承認。§6）
 
 名前（ユーザー・グループ・path）はすべて**仮の値**である。実機のユーザー名・ホスト名・path は
 リポジトリに書かない（AGENTS.md ルール 10、0086 §5 の 4）。
@@ -348,18 +348,38 @@ sudo setfacl -m g:coldaisle-authority:r-- /var/lib/coldaisle-registry/.registry.
 - **`--config-dir` を消し、path を固定値にする**: 開発・試験で別の path を使えなくなる。path をコードに持つと
   ルール 9 にも反する
 
-## 5. 未決事項（所有者の判断。いずれも推奨案つき）
+## 5. 判断点（2026-10-07、すべて推奨案で決着。判断前の記録として推奨案と代替案を残す）
 
 | # | 判断点 | 推奨案 | 代替案 |
 |---|---|---|---|
-| 1 | 制御設定の読み取りの与え方 | **POSIX ACL で `coldaisle-authority` に読み取り**（§2.2。所有者・mode を変えない） | 別グループへ付け替え（0080 の unit の値と 6.2 を変え、`/etc/coldaisle` にも別の手当てが要る） |
-| 2 | Registry の書き手の形 | **書き手のグループ `coldaisle-registry` の人が自分の uid で書く**（§2.3。root は `root:coldaisle-registry`・`2770`、読み手は ACL） | 専用のシステムユーザーを所有者にし `sudo -u` で書く（ACL 不要。§4） |
-| 3 | 同じ人が `coldaisle-registry` と `coldaisle-authority` の両方に入ってよいか（model の promote と authority の raise の兼任） | **認める**（1人で運用する規模。分けてもコードでは強制しない。導入手順に「分けられるなら分ける」と書く） | 導入手順で禁止する（強制はできない） |
-| 4 | fand の uid が補助グループ `coldaisle-authority` 経由で Registry の lock を flock できることを許すか | **許す**（§3 の緩和。fand は既に authority と hwmon を書ける） | lock のグループだけを承認者専用の別グループにする（承認者が入るグループが1つ増える） |
-| 5 | 承認者の lock の権限 | **`r` だけ。共有の root モードは lock を `O_RDONLY` で開く**（§2.4） | Issue のとおり `rw`（コードは `O_RDWR` のまま） |
-| 6 | Learned worker（0077 段階 6 の unit）が artifact を読む権限 | **本記録では決めない。** 0077 段階 6 の unit を決めるときに、役割ごとのグループへ ACL の読み取りを足す（`coldaisle-authority` には入れない。journal を書けてしまう） | 本記録で読み手の共通グループを作る |
-| 7 | §2.9 の実機の確認に、本物の `raise` を1回含めるか | **含めない。** 承認の拒否（終了コード 4）まで届くことで読み取りと lock を確かめる。本物の `raise` は所有者が authority を上げると決めたとき | 含める（SHADOW → LIMITED を1回。fand の実効 stage は 0089 / 0090 の照合で決まる） |
-| 8 | 評価報告を作る側の権限（`coldaisle-evaluate` などが DB を読む） | **本記録の範囲外。** 承認者は渡された報告を検証するだけ。DB の読み取りを承認者へ渡すかは別に決める | 本記録で決める |
-| 9 | journal の改ざん検知（0086 §5 の 1）・Registry の承認者の uid の束縛（0086 §5 の 2） | 変えない（それぞれの場所で決める）。本記録の §2.3 は後者を妨げない形にした | — |
-| 10 | 名前（グループ・path）の実際の値 | 導入先で決める（リポジトリには仮の値だけ。0086 §5 の 4） | — |
-| 11 | Registry を読めない（権限・lock が無い・root の形が違う）ときの `raise` の終了コード。**いまの実装は `raise_stage()` が `ModelRegistryError` / `OSError` を `AuthorityEvidenceError`（「Model Registry の状態を読めない」）に包むので、終了コード 4・`evidence_rejected`** になり、`docs/authority-rollout.md` の終了コードの表（1 の行に「Registry」）と食い違って読める | **段階 A で、Registry を読めないことを終了コード 1・`registry_error` に揃える**（承認・証拠の拒否と、導入の誤りを終了コードで分ける。store が「Registry を読めない」を `AuthorityEvidenceError` と区別できる error の種類で出し、CLI はそれを写すだけ） | いまのまま（終了コード 4。表の「Registry」は上限の設定の読み込みを指すと注記する） |
+| 1 | **決着（2026-10-07 所有者の決定、推奨案）。** 制御設定の読み取りの与え方 | **POSIX ACL で `coldaisle-authority` に読み取り**（§2.2。所有者・mode を変えない） | 別グループへ付け替え（0080 の unit の値と 6.2 を変え、`/etc/coldaisle` にも別の手当てが要る） |
+| 2 | **決着（2026-10-07 所有者の決定、推奨案）。** Registry の書き手の形 | **書き手のグループ `coldaisle-registry` の人が自分の uid で書く**（§2.3。root は `root:coldaisle-registry`・`2770`、読み手は ACL） | 専用のシステムユーザーを所有者にし `sudo -u` で書く（ACL 不要。§4） |
+| 3 | **決着（2026-10-07 所有者の決定、推奨案）。** 同じ人が `coldaisle-registry` と `coldaisle-authority` の両方に入ってよいか（model の promote と authority の raise の兼任） | **認める**（1人で運用する規模。分けてもコードでは強制しない。導入手順に「分けられるなら分ける」と書く） | 導入手順で禁止する（強制はできない） |
+| 4 | **決着（2026-10-07 所有者の決定、推奨案）。** fand の uid が補助グループ `coldaisle-authority` 経由で Registry の lock を flock できることを許すか | **許す**（§3 の緩和。fand は既に authority と hwmon を書ける） | lock のグループだけを承認者専用の別グループにする（承認者が入るグループが1つ増える） |
+| 5 | **決着（2026-10-07 所有者の決定、推奨案）。** 承認者の lock の権限 | **`r` だけ。共有の root モードは lock を `O_RDONLY` で開く**（§2.4） | Issue のとおり `rw`（コードは `O_RDWR` のまま） |
+| 6 | **決着（2026-10-07 所有者の決定、推奨案）。** Learned worker（0077 段階 6 の unit）が artifact を読む権限 | **本記録では決めない。** 0077 段階 6 の unit を決めるときに、役割ごとのグループへ ACL の読み取りを足す（`coldaisle-authority` には入れない。journal を書けてしまう） | 本記録で読み手の共通グループを作る |
+| 7 | **決着（2026-10-07 所有者の決定、推奨案）。** §2.9 の実機の確認に、本物の `raise` を1回含めるか | **含めない。** 承認の拒否（終了コード 4）まで届くことで読み取りと lock を確かめる。本物の `raise` は所有者が authority を上げると決めたとき | 含める（SHADOW → LIMITED を1回。fand の実効 stage は 0089 / 0090 の照合で決まる） |
+| 8 | **決着（2026-10-07 所有者の決定、推奨案）。** 評価報告を作る側の権限（`coldaisle-evaluate` などが DB を読む） | **本記録の範囲外。** 承認者は渡された報告を検証するだけ。DB の読み取りを承認者へ渡すかは別に決める | 本記録で決める |
+| 9 | **決着（2026-10-07 所有者の決定、推奨案）。** journal の改ざん検知（0086 §5 の 1）・Registry の承認者の uid の束縛（0086 §5 の 2） | 変えない（それぞれの場所で決める）。本記録の §2.3 は後者を妨げない形にした | — |
+| 10 | **決着（2026-10-07 所有者の決定、推奨案）。** 名前（グループ・path）の実際の値 | 導入先で決める（リポジトリには仮の値だけ。0086 §5 の 4） | — |
+| 11 | **決着（2026-10-07 所有者の決定、推奨案）。** Registry を読めない（権限・lock が無い・root の形が違う）ときの `raise` の終了コード。**いまの実装は `raise_stage()` が `ModelRegistryError` / `OSError` を `AuthorityEvidenceError`（「Model Registry の状態を読めない」）に包むので、終了コード 4・`evidence_rejected`** になり、`docs/authority-rollout.md` の終了コードの表（1 の行に「Registry」）と食い違って読める | **段階 A で、Registry を読めないことを終了コード 1・`registry_error` に揃える**（承認・証拠の拒否と、導入の誤りを終了コードで分ける。store が「Registry を読めない」を `AuthorityEvidenceError` と区別できる error の種類で出し、CLI はそれを写すだけ） | いまのまま（終了コード 4。表の「Registry」は上限の設定の読み込みを指すと注記する） |
+
+## 6. 承認記録
+
+**2026-10-07、リポジトリ所有者は §5 の判断点 1〜11 をすべて推奨案で承認し、本記録を FINAL にした**（PR #245）。
+
+| 判断点 | 決定 | 本記録 |
+|---|---|---|
+| 1 | 制御設定は所有者・mode を変えず、POSIX ACL で `coldaisle-authority` に読み取りだけ（`/etc/coldaisle` は `x` だけ） | §2.2 |
+| 2 | Registry は `root:coldaisle-registry`・`2770` の専用ディレクトリ。書き手のグループの人が自分の uid で書き、承認者と fand は ACL で読む | §2.3 |
+| 3 | Registry の書き手と承認者の兼任を認める（コードでは強制しない。導入手順に「分けられるなら分ける」） | §2.1 / §2.3 |
+| 4 | fand の uid が補助グループ `coldaisle-authority` 経由で Registry の lock を flock できることを許す | §2.4 / §3 |
+| 5 | 承認者の lock の権限は `r` だけ。共有の root モードは lock を `O_RDONLY` で開く | §2.4 |
+| 6 | Learned worker の artifact の読み取りは 0077 段階 6 で決める（`coldaisle-authority` には入れない） | §2.1 |
+| 7 | §2.9 の実機の確認に本物の `raise` を含めない（`expected_revision` の不一致の拒否まで届くことで確かめる） | §2.9 |
+| 8 | 評価報告を作る側（DB の読み取り）の権限は本記録の範囲外 | — |
+| 9 | journal の改ざん検知・Registry の承認者の uid の束縛は、それぞれの場所で決める（0086 §5 の 1・2） | §2.3 |
+| 10 | グループ名・path の実際の値は導入先で決める（リポジトリには仮の値だけ） | §2 |
+| 11 | `raise` で Registry を読めないときは終了コード 1・`registry_error`（段階 A で揃える） | §2.4 / §2.7 |
+
+これにより段階 A（#217）に着手する。段階 B（`docs/ubuntu-deploy.md` ほか）は段階 A の後、段階 C（実機の確認）は人が行う。
