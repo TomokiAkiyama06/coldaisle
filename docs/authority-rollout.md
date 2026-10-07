@@ -105,6 +105,25 @@ uv run coldaisle-authority raise \
 （path は仮の値。導入先の値に置き換える。`--registry-limits` は `model-registry.yaml` の
 ディレクトリで、既定は `config`）
 
+**本番では `--config-dir` と `--registry-root` に fand の unit と同じ path を渡す**（決定記録 0104 §2.6 / §2.7）。
+`--config-dir` は fand の unit の `ExecStart=` の `--config-dir`（`docs/ubuntu-deploy.md` の例では
+`/etc/coldaisle/control-config`）、`--registry-root` は fand に Registry を渡す unit の値（例では
+`/var/lib/coldaisle-registry`）。CLI は path が fand と同じかを確かめない。取り違えた、または fand の起動後に
+差し替えた設定・artifact で上げても journal は上がるが、fand が起動時に読んだ設定・artifact と照らして実効 stage の
+上限を Baseline にする（0089 / 0090。安全側だが、上げたつもりの authority が効かない）。
+
+**上げた後に、効いていることを fand のログで確かめる。**
+
+```bash
+journalctl -u coldaisle-fand -o cat | grep -E 'authority_(config|artifact)_(matched|mismatch|unbound)' | tail -n 4
+```
+
+`authority_config_matched` と `authority_artifact_matched` が出ていれば効いている。`authority_config_mismatch` /
+`authority_artifact_mismatch` / `authority_artifact_unbound` なら、journal は上がっていても実効は Baseline
+（decision trace の `authority_config_binding_ceiling` / `authority_artifact_ceiling` でも見られる）。その場合は
+rollback し、fand が使っている設定・artifact について証拠を集め直して上げ直す（上の「artifact・設定を入れ替える
+ときの手順」）。導入先の権限と確認の手順は `docs/ubuntu-deploy.md` 6.7。
+
 **本番（`docs/ubuntu-deploy.md` の導入先）での `raise` は、`docs/ubuntu-deploy.md` 6.7 の手順 9（実機での確認。
 決定記録 0104 の段階 C）が導入先で通り、結果を #217 に残すまで使えない（`rollback` は使える）。** 承認者に
 制御設定の読み取り（POSIX ACL）と Model Registry の読み取り・lock の flock を与える手順は 6.7（0104 / 0105）。
