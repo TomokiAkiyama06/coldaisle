@@ -35,6 +35,7 @@ from coldaisle.control.model.dataset import (
 from coldaisle.dataset import ThermalDatasetBuilder, ThermalDatasetV2Builder, write_dataset
 from coldaisle.drift import DATASET_EXAMPLES_FILENAME, DATASET_MANIFEST_FILENAME, load_inputs
 from coldaisle.store import Quality, QualityRules, Reading, Sample, SqliteStore
+from test_thermal_dataset_v2 import T0, covering_history
 from test_thermal_model_v2 import (
     CATALOG,
     published,
@@ -49,7 +50,9 @@ RUN_ALIAS = "run-00000000000000000000000000000224"
 OTHER_RUN_ALIAS = "run-00000000000000000000000000000225"
 SOURCE_ALIAS = "source-00000000000000000000000000000224"
 ARTIFACT = "dataset-00000000000000000000000000000224"
-END_MS = 16_000
+START_MS = T0
+"""較正の記録の行が期間の先頭を覆うように、``T0`` から始める（0099 §2.6）。"""
+END_MS = START_MS + 16_000
 DUPLICATE_ANCHOR = "同じ anchor"
 CONFLICT = "同じ観測"
 
@@ -60,7 +63,7 @@ def source_run(run_id: str = RUN_ALIAS) -> SourceRun:
     return SourceRun(
         run_id=run_id,
         kind=DatasetSourceKind.REPLAY,
-        start_ms=0,
+        start_ms=START_MS,
         end_ms=END_MS,
         source_refs=(SOURCE_ALIAS,),
         source_sha256=SHA256,
@@ -108,7 +111,7 @@ def readings() -> tuple[Sample, ...]:
                 Reading(metric="air.gpu_exhaust", value=40.0 + ts_ms / 500, quality=Quality.OK),
             ),
         )
-        for ts_ms in range(0, END_MS, 1_500)
+        for ts_ms in range(START_MS, END_MS, 1_500)
     )
 
 
@@ -144,7 +147,9 @@ def make_store(
         store.close()
 
 
-SEQUENTIAL_TICKS = tuple((ts_ms, ts_ms // 1_000) for ts_ms in range(1_000, END_MS, 1_000))
+SEQUENTIAL_TICKS = tuple(
+    (ts_ms, ts_ms // 1_000) for ts_ms in range(START_MS + 1_000, END_MS, 1_000)
+)
 
 
 @pytest.fixture
@@ -156,8 +161,14 @@ def v1_dataset(make_store) -> ThermalDataset:
 
 @pytest.fixture
 def v2_dataset(make_store) -> ThermalDatasetV2:
-    return ThermalDatasetV2Builder(make_store(SEQUENTIAL_TICKS)).build(
-        source_run=source_run(), spec=v2_spec(), declared_changes=()
+    store = make_store(SEQUENTIAL_TICKS)
+    return ThermalDatasetV2Builder(store).build(
+        source_run=source_run(),
+        spec=v2_spec(),
+        declared_changes=(),
+        calibration_history=covering_history(
+            store.connection.execute("PRAGMA database_list").fetchone()[2]
+        ),
     )
 
 
@@ -293,13 +304,13 @@ def test_stale_mask_may_differ_between_frames_using_one_observation(dataset) -> 
 
 def test_v1_ticks_at_one_time_or_with_a_reused_tick_id_are_distinct_anchors(make_store) -> None:
     """v1 は同じ時刻の別の tick も、再起動で振り直された同じ tick_id も正当に作る（0103 §2.1）。"""
-    ticks = ((5_000, 1), (5_000, 2), (6_000, 1), (7_000, 0))
+    ticks = ((T0 + 5_000, 1), (T0 + 5_000, 2), (T0 + 6_000, 1), (T0 + 7_000, 0))
     built = ThermalDatasetBuilder(make_store(ticks)).build(source_run=source_run(), spec=v1_spec())
     assert [(item.action_ts_ms, item.control_tick_id) for item in built.examples] == [
-        (5_000, 1),
-        (5_000, 2),
-        (6_000, 1),
-        (7_000, 0),
+        (T0 + 5_000, 1),
+        (T0 + 5_000, 2),
+        (T0 + 6_000, 1),
+        (T0 + 7_000, 0),
     ]
     load(built, built.model_dump(mode="json"))
 
@@ -440,7 +451,7 @@ def test_drift_inputs_reject_a_v1_artifact_with_conflicting_observations(
     (directory / DATASET_MANIFEST_FILENAME).write_text(json.dumps(raw["manifest"]))
     (directory / DATASET_EXAMPLES_FILENAME).write_bytes(examples_jsonl_bytes(examples))
     with pytest.raises(ValidationError, match=CONFLICT):
-        load_inputs(directory, start_ms=0, end_ms=END_MS)
+        load_inputs(directory, start_ms=START_MS, end_ms=END_MS)
 
 
 def test_counterfactual_trainer_rejects_a_v2_dataset_with_a_copied_anchor(tmp_path: Path) -> None:
