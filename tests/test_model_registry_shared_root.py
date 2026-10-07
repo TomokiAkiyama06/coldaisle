@@ -17,6 +17,7 @@ from pathlib import Path
 
 import pytest
 
+import coldaisle.control.model_registry as registry_module
 from coldaisle.clock import SimulatedClock
 from coldaisle.control import ModelRegistry, RegistrySharedRootError, RegistrySnapshot
 from test_model_registry import ACTOR, LIMITS, NOW_MS, artifact_path, metadata, payload
@@ -188,6 +189,32 @@ def test_a_root_created_under_a_setgid_parent_is_not_taken_for_a_shared_root(
     for directory in (parent / "var", root):
         assert stat.S_IMODE(os.stat(directory).st_mode) == 0o700, directory
     assert (root / LOCK).is_file()
+
+
+def test_a_new_directory_gets_its_final_mode_before_its_parent_is_synced(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """親の fsync（作ったことの永続化）より先に mode を決める（codex P2。PR #248）。
+
+    逆順だと、その間に止まったときに継いだ setgid の root が残り、やり直しでも直らない。
+    """
+    parent = tmp_path / "workspace"
+    parent.mkdir()
+    os.chmod(parent, 0o2775)
+    if not os.stat(parent).st_mode & stat.S_ISGID:
+        pytest.skip("この環境ではディレクトリに setgid を付けられない")
+    real_fsync = os.fsync
+    parent_inode = os.stat(parent).st_ino
+    modes_when_parent_synced: list[int] = []
+
+    def recording_fsync(fd: int) -> None:
+        if os.fstat(fd).st_ino == parent_inode:
+            modes_when_parent_synced.append(stat.S_IMODE(os.stat(parent / "registry").st_mode))
+        real_fsync(fd)
+
+    monkeypatch.setattr(registry_module.os, "fsync", recording_fsync)
+    register(writer(parent / "registry"))
+    assert modes_when_parent_synced == [0o700]
 
 
 # --- 作るファイルとディレクトリの mode ----------------------------------------------------

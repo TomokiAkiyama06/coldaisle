@@ -2016,12 +2016,12 @@ class ModelRegistry:
                         created = False
                     else:
                         created = True
-                        # The directory entry lives in the parent; without this fsync a
-                        # crash can drop it even after an artifact / snapshot fsync inside.
-                        os.fsync(current_fd)
                     child_fd = os.open(part, flags, dir_fd=current_fd)
                     if created:
                         try:
+                            # **mode を決めてから、子と親を fsync する**（codex P2。PR #248）。
+                            # 親を先に fsync すると、mode を直す前に止まったとき、継いだ
+                            # setgid の付いた root が残り、やり直しでも直らない。
                             if inherit_mode:
                                 parent_mode = stat.S_IMODE(os.fstat(current_fd).st_mode)
                                 os.fchmod(child_fd, parent_mode & _DIRECTORY_MODE_MASK)
@@ -2030,6 +2030,10 @@ class ModelRegistry:
                                 # だと、いま作った開発用の root を「導入手順で作った共有の root」と
                                 # 取り違え、lock を作らずに止まる（codex P2。PR #248）。
                                 os.fchmod(child_fd, 0o700)
+                            os.fsync(child_fd)
+                            # The directory entry lives in the parent; without this fsync a
+                            # crash can drop it even after an artifact / snapshot fsync inside.
+                            os.fsync(current_fd)
                         except BaseException:
                             os.close(child_fd)
                             raise
