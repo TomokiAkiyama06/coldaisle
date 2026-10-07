@@ -31,8 +31,8 @@ from coldaisle.control.fallback import (
     LearnedControlStatus,
     LearnedFailure,
 )
-from coldaisle.control.model.confidence import ConfidenceAssessment, fit_confidence_profile
-from coldaisle.control.model.thermal import ArtifactVerification, canonical_artifact_bytes
+from coldaisle.control.model.confidence import ConfidenceAssessment
+from coldaisle.control.model.thermal import ArtifactVerification
 from coldaisle.control.mpc import MpcProposal
 from coldaisle.control.schema import (
     AuthorityStage,
@@ -95,16 +95,14 @@ from test_fallback_controller import (
 )
 from test_learned_mpc import (
     ACTION_TS_MS,
-    HORIZONS,
-    TARGETS,
+    MpcArtifact,
     build_controller,
     demands,
-    issue_attestation,
+    make_artifact,
     mpc_policy,
     propose,
     supervisor_output,
 )
-from test_model_confidence import dataset, profile_spec, split, train
 from test_simulated_fan_backend import runtime
 
 GPU = "gpu.0.core"
@@ -126,19 +124,9 @@ DISABLED_SHADOW_CONFIG = _shadow_config(enabled=False)
 
 
 @pytest.fixture(scope="module")
-def trained_model(tmp_path_factory: pytest.TempPathFactory):
-    """合成 dataset で学習した #84 モデル・Profile・Registry の証拠（#86 と同じ組み立て）。"""
-    data = dataset(HORIZONS, TARGETS)
-    parts = split(data)
-    model = train(data, parts)
-    profile = fit_confidence_profile(model, data, parts, profile_spec())
-    attestation = issue_attestation(
-        tmp_path_factory.mktemp("pr90-registry") / "registry",
-        model_id=model.manifest.model_id,
-        version=model.manifest.model_version,
-        payload=canonical_artifact_bytes(model._artifact),
-    )
-    return model, profile, attestation
+def trained_model(tmp_path_factory: pytest.TempPathFactory) -> MpcArtifact:
+    """Registry に登録・昇格した反実仮想 artifact v2（#86 と同じ組み立て。決定記録 0079 段 4）。"""
+    return make_artifact(tmp_path_factory.mktemp("pr90-registry") / "registry")
 
 
 # ---------------------------------------------------------------- 組み立ての補助

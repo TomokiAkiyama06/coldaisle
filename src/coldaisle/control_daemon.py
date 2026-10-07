@@ -92,6 +92,7 @@ from coldaisle.control.loop import (
     air_balance_input_metrics,
     build_input_contract,
 )
+from coldaisle.control.model.calibration_digest import RuntimeCalibration
 from coldaisle.control.operating_mode import AdminAuthorityCommand
 from coldaisle.control.reactive.guard import ReactiveGuard
 from coldaisle.control.registry_binding import RegistryBinding
@@ -113,6 +114,7 @@ from coldaisle.control.supervisor.policy import SupervisorCoordinator
 from coldaisle.control.supervisor.regime import WorkloadRegimeEstimator
 from coldaisle.control_admin import ControlAdminEntry, open_control_admin
 from coldaisle.control_admin.runtime import new_run_id
+from coldaisle.ingest.calibration import Calibration
 from coldaisle.learned_channel import (
     DisabledLearnedChannel,
     LearnedChannelEntry,
@@ -609,6 +611,14 @@ class Config:
     """
     registry_limits: Path = DEFAULT_REGISTRY_LIMITS
     """`model-registry.yaml` のあるディレクトリ（registry を読むときの上限）。"""
+    calibration: Path | None = None
+    """取り込みと同じ較正ファイル（`config/calibration.json`）。**起動時に1回だけ読む**。
+
+    反実仮想 Thermal Model artifact v2 の読み込み時の検査 L9 が使う runtime の較正
+    （決定記録 0079 §2.4 / 0096 §2.4）。**既定の path を制御側に置かない**（0079 §2.4）ので、
+    None は「読まなかった」として `RuntimeCalibration.unavailable` になり、較正の掛かる
+    metric を使う artifact は L9 で拒まれる（0096 §5 #8）。起動は止めない。
+    """
 
 
 @dataclass(slots=True)
@@ -697,6 +707,12 @@ class ControlDaemon:
     """制御権の runtime。`close()` で書き残せていない降格を1回だけ書き直す（0057 §2.6）。"""
     write_fail_exit: HardwareWriteFailureExit | None = None
     """書き込みの失敗が続いたら終える判定（決定記録 0080 §2.6）。None は試験の足場だけ。"""
+    runtime_calibration: RuntimeCalibration | None = None
+    """起動時に1回だけ読んだ runtime の較正（決定記録 0079 §2.4 / 0096 §5 #8）。
+
+    反実仮想 artifact v2 の L9 に渡す値で、制御ループ（Gate / Guard / Safety）は使わない。
+    再起動まで読み直さない（較正を変えたら取り込みより先に fand を再起動する。0096 §2.7）。
+    """
     sleep: Callable[[float], None] = time.sleep
     stats: ControlStats = field(default_factory=ControlStats)
     _stop: bool = field(default=False, init=False, repr=False)
@@ -946,6 +962,9 @@ def build(
         rules = QualityRules.from_yaml(config.quality_rules)
     except Exception as error:
         raise StartupEnvironmentError(f"{type(error).__name__}: {error}") from error
+    # **較正は起動時に1回だけ読む**（決定記録 0079 §2.4）。読めなくても起動は止めない
+    # （0096 §5 #8。`unavailable` になり、較正の掛かる artifact が L9 で拒まれるだけ）。
+    runtime_calibration = read_runtime_calibration(config.calibration)
     store = open_writable_store(config.db, rules=rules, clock=clock, control=control)
     binding = create_control_runtime_binding(control)
     # **registry は起動時に1回だけ読み、1つの snapshot から provenance・Gate の期待値・
@@ -1025,7 +1044,53 @@ def build(
         authority=authority,
         # **書けないまま制御を持ち続けない**（決定記録 0080 §2.6）。時間は safety.yaml が持つ
         write_fail_exit=HardwareWriteFailureExit(control.safety.hardware_write_fail_exit_ms.value),
+        runtime_calibration=runtime_calibration,
     )
+
+
+def read_runtime_calibration(path: Path | None) -> RuntimeCalibration:
+    """反実仮想 artifact v2 の L9 に渡す runtime の較正を読む（決定記録 0079 §2.4 / 0096 §5 #8）。
+
+    **例外で起動を止めない。** 読めない・壊れている・path が無いときは
+    `RuntimeCalibration.unavailable`（理由付き）を返し、構造化ログに残す。空の値で
+    「読めなかった」を表さない（全チャネル 0.0 と同じ digest になるため。0096 §2.6）。
+    読むのは `offsets_c` だけで、`note` / `calibrated_at` などは L9 に効かない（0096 §2.1）。
+    """
+    if path is None:
+        reason = "較正ファイルの path が指定されていない（--calibration）"
+        LOGGER.warning(
+            "較正ファイルを読まないため、較正の掛かる metric を使う Thermal Model は使わない",
+            extra={logs.FIELDS_KEY: {"reason": "calibration_path_not_given"}},
+        )
+        return RuntimeCalibration.unavailable(reason)
+    try:
+        loaded = Calibration.from_json(path)
+        runtime = RuntimeCalibration.available(loaded.offsets_c)
+    except Exception as error:
+        # 何が起きても「読めなかった」として扱う（L9 が較正の掛かる artifact を拒む）。
+        reason = f"{type(error).__name__}: {error}"[:500]
+        LOGGER.error(
+            "較正ファイルを読めないため、較正の掛かる metric を使う Thermal Model は使わない",
+            extra={
+                logs.FIELDS_KEY: {
+                    "reason": "calibration_unreadable",
+                    "calibration": str(path),
+                    "error": reason,
+                }
+            },
+        )
+        return RuntimeCalibration.unavailable(reason)
+    LOGGER.info(
+        "較正ファイルを読み込んだ（再起動まで読み直さない）",
+        extra={
+            logs.FIELDS_KEY: {
+                "calibration": str(path),
+                "channels": sorted(loaded.offsets_c),
+                "calibrated_at": loaded.calibrated_at,
+            }
+        },
+    )
+    return runtime
 
 
 def open_writable_store(
@@ -1390,6 +1455,16 @@ def build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_REGISTRY_LIMITS,
         help="model-registry.yaml のあるディレクトリ",
     )
+    parser.add_argument(
+        "--calibration",
+        type=Path,
+        default=None,
+        help=(
+            "取り込みと同じ較正ファイル（例: config/calibration.json。決定記録 0079 §2.4）。"
+            "起動時に1回だけ読む。省く・読めないときは、較正の掛かる metric を使う "
+            "Thermal Model を使わない（起動は止めない）"
+        ),
+    )
     parser.add_argument("--log-level", default="INFO")
     return parser
 
@@ -1427,6 +1502,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         learned_channel_config=args.learned_channel_config,
         registry_root=args.registry_root,
         registry_limits=args.registry_limits,
+        calibration=args.calibration,
     )
     monotonic: MonotonicClock = SystemMonotonicClock()
 

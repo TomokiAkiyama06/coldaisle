@@ -1,10 +1,10 @@
-"""#86 Learned MPC optimizer と Hard Constraints の連携。実機不要（合成 dataset / 試験用モデル）。
+"""#86 Learned MPC optimizer と Hard Constraints の連携。実機不要（合成 Dataset v2 / artifact v2）。
 
 **ここでは「守れているか」ではなく「破れないか」を試す。** MPC の提案が Reactive Guard に
 届くまでに成り立っていなければならない不変条件を並べ、1つずつ破ろうとする試験を置く。
 
 1. 提案は**必ず1回の検証済み推論に束ねられている**（提案・assessment・解の identity が一致）
-2. 内部モデルは **Registry 検証済み** かつ **反実仮想を主張する** ものだけ（決定記録 0048 §2.1）
+2. 内部モデルは **Registry 検証済み**の反実仮想 artifact v2 の封をした型だけ（決定記録 0079 §2.4）
 3. optimizer が出せるのは **plan の最初の step だけ**（receding horizon）
 4. 要求は **Hard Constraints の中**。Critical Safety の floor を下回れない
 5. 実行不能なら**当て推量を返さない**（`ERROR` → Fallback）
@@ -15,17 +15,29 @@
 10. 採用する解は内部モデルの上で **Baseline 以下のコスト**
 11. `control/mpc` は Guard / Safety / Hardware を **import しない**
 12. 別時刻の観測 window は使わない（#102 の Snapshot と時刻が揃わなければ失敗）
+13. 学習した action 列（同梱 Profile v2 の step ごとの support）の外の候補は**評価しない**。
+    Fallback の requested が外なら `plan_out_of_learned_range` で Fallback（0079 §2.5 / 0084 §2.2）
+14. 読み込み時の検査（L1〜L12。較正の L9 を含む）に外れた artifact は**型にならず**、runtime は
+    `MODEL_LOAD_FAILURE` として Fallback で運転を続ける（0079 §2.6 / 0096 §5 #8）
+
+内部モデルの試験用 artifact は、`test_model_confidence` と同じ合成データから作った Dataset v2 で
+学習し、計画 action の列の係数だけを決定論的な値（demand を上げるほど温度が下がる）に置き換えて
+**本物の Model Registry に登録・昇格**したものを使う。係数の置き換えは試験のためで、本番の
+artifact ではない。
 """
 
 from __future__ import annotations
 
 import ast
+import inspect
 import json
 import tempfile
-from collections.abc import Sequence
+from collections.abc import Callable, Iterator, Sequence
+from dataclasses import dataclass
 from functools import cache
 from hashlib import sha256
 from pathlib import Path
+from typing import Any
 
 import pytest
 from pydantic import ValidationError
@@ -56,12 +68,47 @@ from coldaisle.control.fallback import (
     LearnedControlStatus,
     LearnedFailure,
 )
+from coldaisle.control.model.calibration_digest import RuntimeCalibration
 from coldaisle.control.model.confidence import (
-    ConfidenceAssessor,
-    ModelConfidenceProfile,
+    ConfidenceProfileSpec,
     ResidualEvidence,
-    fit_confidence_profile,
+    SupportAxis,
+    ValueRange,
     inference_id,
+)
+from coldaisle.control.model.counterfactual import (
+    ActionCellCount,
+    ActionCellTransitionCount,
+    ActionSupportV2,
+    ActionTrajectory,
+    AnchorTransitionSupport,
+    ConfidenceProfileV2,
+    RegistryCounterfactualThermalModel,
+    StepActionSupport,
+    StepTransitionSupport,
+)
+from coldaisle.control.model.counterfactual_confidence import fit_confidence_profile_v2
+from coldaisle.control.model.counterfactual_training import (
+    CounterfactualTrainedModel,
+    CounterfactualTrainingSpec,
+    VerifiedTrainingDatasetArtifactV2,
+    assemble_counterfactual_artifact,
+    train_counterfactual_ridge,
+    verify_training_dataset_artifact_v2,
+)
+from coldaisle.control.model.dataset import (
+    ActionExclusionCounts,
+    ActionStepV2,
+    DatasetExample,
+    DatasetExampleV2,
+    DatasetManifestV2,
+    DatasetSpecV2,
+    DatasetSplitV2,
+    PriorAction,
+    ThermalDatasetV2,
+    examples_jsonl_bytes,
+    examples_sha256,
+    split_temporally_v2,
 )
 from coldaisle.control.model.thermal import (
     MAX_TARGET_HORIZONS,
@@ -85,6 +132,7 @@ from coldaisle.control.model_registry import (
     HumanApproval,
     ModelCompatibility,
     ModelRegistry,
+    VerifiedArtifact,
     load_model_registry_limits,
 )
 from coldaisle.control.mpc import (
@@ -94,6 +142,7 @@ from coldaisle.control.mpc import (
     InfeasiblePlanError,
     LearnedMpcController,
     LearnedMpcOptimizer,
+    LearnedMpcRuntime,
     MpcCostModel,
     MpcCostUnusableError,
     MpcModelBinding,
@@ -105,9 +154,11 @@ from coldaisle.control.mpc import (
     PlanStep,
 )
 from coldaisle.control.schema import (
+    STAGE_ORDER,
     AuthorityStage,
     ConfidenceLevel,
     ControllerKind,
+    ControllerProposal,
     Demand,
     OperatingMode,
     OptimizerStatus,
@@ -124,211 +175,311 @@ from coldaisle.control.schema import (
     Zone,
 )
 from coldaisle.control.state import ControlStateSnapshot, TelemetryHealth
+from coldaisle.metrics import MetricCatalog
 from test_control_config import valid_documents
 from test_critical_safety import safety_config
 from test_fallback_controller import fallback_proposal, gate_for, policy
 from test_model_confidence import (
+    AIR,
     GPU,
+    TEST_START_MS,
+    VALIDATION_START_MS,
     dataset,
     evidence,
-    profile_spec,
     shifted,
-    split,
-    train,
 )
+from test_model_confidence import split as split_v1
+from test_model_confidence import train as train_v1
+from test_thermal_model_v2 import document, encode, metadata_for, reseal
 
 CPU = "cpu.package"
+FEATURES = (AIR, GPU)
 HORIZONS = (1_000, 2_000, 3_000)
 TARGETS = (CPU, GPU)
 STEP_MS = 1_000
+STEPS = len(HORIZONS)
 ACTION_TS_MS = 10_000 + 3 * 5_000
 """試験に使う anchor の時刻（`test_model_confidence` の合成 dataset の刻み）。"""
 
-type Trained = tuple[object, ModelConfidenceProfile, ArtifactAttestation]
-"""学習済み #84 モデル・Confidence Profile・Registry 発行の証拠。"""
+CONFIG_DIR = Path(__file__).resolve().parents[1] / "config"
+CATALOG = MetricCatalog.from_yaml(CONFIG_DIR / "metrics.yaml")
+"""runtime の `config/metrics.yaml`（L8 の照合相手）。"""
+CALIBRATION_OFFSETS: dict[str, float] = {"front_intake": 0.191, "room_temp": -0.31}
+"""学習時の較正の値。試験用 artifact で較正の掛かる metric は ``air.front_intake`` だけ。"""
+RUNTIME_CALIBRATION = RuntimeCalibration.available(CALIBRATION_OFFSETS)
+UNAVAILABLE_CALIBRATION = RuntimeCalibration.unavailable("試験: 較正ファイルを読めなかった")
+GAIN = 30.0
+"""計画 action の列の係数（3 zone の demand を 1 上げると予測温度が GAIN だけ下がる）。"""
+FAN_EDGES = (0.5,)
+"""support 軸 `fan.<zone>` の bin の境界（cell は zone ごとに 0.5 未満 / 以上の2つ）。"""
+MODEL_ID = "rack-thermal"
+DATASET_ALIAS = "dataset-00000000000000000000000000000086"
+REGISTRY_LIMITS = load_model_registry_limits(CONFIG_DIR)
+ALL_STAGES: tuple[AuthorityStage, ...] = STAGE_ORDER
+Cell = tuple[int, int, int]
+CELLS: tuple[Cell, ...] = tuple(
+    (front, rear, top) for front in (0, 1) for rear in (0, 1) for top in (0, 1)
+)
+EVERY_TRANSITION: tuple[tuple[Cell, Cell], ...] = tuple(
+    (source, target) for source in CELLS for target in CELLS
+)
 
 
-# ---------------------------------------------------------------- 試験用の内部モデル
+# ---------------------------------------------------------------- 合成 Dataset v2
 
 
-class PlanningModel:
-    """試験用の反実仮想モデル。
-
-    anchor 推論は #84 の実装（ridge baseline）に委ね、候補 action 列に対しては
-    「demand を上げるほど温度が下がる」単調で決定論的な応答を返す。
-    **本番の artifact ではない**。`identity` を自由に作れるのは試験だけで、
-    `MpcModelBinding.for_control` が受け入れる条件そのものを検査するために置く。
-    """
-
-    def __init__(
-        self,
-        base: object,
-        *,
-        capability: InferenceCapability = InferenceCapability.COUNTERFACTUAL_ACTION,
-        model_id: str | None = None,
-        model_version: str | None = None,
-        verification: ArtifactVerification = ArtifactVerification.REGISTRY_VERIFIED,
-        gain: float = 30.0,
-        plan_error: Exception | None = None,
-        forged_anchor_id: str | None = None,
-        forged_offsets: tuple[int, ...] | None = None,
-        forged_artifact_sha256: str | None = None,
-        forged_anchor_sha256: str | None = None,
-        stale_plan: ActionPlan | None = None,
-    ) -> None:
-        self._base = base
-        self._identity = CounterfactualModelIdentity(
-            model_id=model_id or base.manifest.model_id,  # type: ignore[attr-defined]
-            model_version=(
-                model_version or base.manifest.model_version  # type: ignore[attr-defined]
-            ),
-            capability=capability,
-        )
-        self._verification = verification
-        self._gain = gain
-        self._plan_error = plan_error
-        self._forged_anchor_id = forged_anchor_id
-        self._forged_offsets = forged_offsets
-        self._forged_artifact_sha256 = forged_artifact_sha256
-        self._forged_anchor_sha256 = forged_anchor_sha256
-        self._stale_plan = stale_plan
-        self.plan_calls = 0
-
-    @property
-    def identity(self) -> CounterfactualModelIdentity:
-        """束縛の判断に使う identity。"""
-        return self._identity
-
-    @property
-    def feature_schema(self) -> ThermalFeatureSchema:
-        """入力契約。"""
-        return self._base.feature_schema  # type: ignore[attr-defined,no-any-return]
-
-    @property
-    def target_schema(self) -> ThermalTargetSchema:
-        """出力契約。"""
-        return self._base.target_schema  # type: ignore[attr-defined,no-any-return]
-
-    def predict(self, observed: ObservedThermalInput) -> ThermalPrediction:
-        """anchor 推論。artifact の出どころだけ identity に合わせる。"""
-        prediction = self._base.predict(observed)  # type: ignore[attr-defined]
-        overrides: dict[str, object] = {"artifact_verification": self._verification}
-        if self._forged_anchor_sha256 is not None:
-            # 「同じ ID / 版だが別の bytes へ委譲する model」の代役。
-            overrides["artifact_sha256"] = self._forged_anchor_sha256
-        return ThermalPrediction.model_validate(prediction.model_dump(mode="python") | overrides)
-
-    def predict_plan(self, planned: PlannedThermalInput) -> PlanPrediction:
-        """候補 action 列に対する単調な応答を返す。"""
-        self.plan_calls += 1
-        if self._plan_error is not None:
-            raise self._plan_error
-        # 別の候補の予測を返す（キャッシュの取り違えの再現）。
-        scored = (
-            planned
-            if self._stale_plan is None
-            else PlannedThermalInput(observed=planned.observed, plan=self._stale_plan)
-        )
-        anchor = self.predict(scored.observed)
-        anchor_mean = _mean(
-            tuple(scored.observed.action.get(zone).effective_demand for zone in Zone)
-        )
-        by_offset = {target.horizon_ms: target.values for target in anchor.targets}
-        offsets = self._forged_offsets or scored.plan.offsets_ms
-        targets = []
-        for index, step in enumerate(scored.plan.steps):
-            offset = offsets[index]
-            delta = _mean(tuple(step.demands.get(zone) for zone in Zone)) - anchor_mean
-            weight = (index + 1) / len(scored.plan.steps)
-            base_values = by_offset[step.offset_ms]
-            targets.append(
-                PlannedTarget(
-                    offset_ms=offset,
-                    expected_ts_ms=scored.observed.action_ts_ms + offset,
-                    values={
-                        metric: value - self._gain * delta * weight
-                        for metric, value in base_values.items()
-                    },
-                )
+def _as_v2(item: DatasetExample, index: int) -> DatasetExampleV2:
+    """v1 の合成 example に、anchor の effective を保った action 列を足す（決定論的）。"""
+    tick = 10 + 5 * index
+    fan = item.action.front.effective_demand
+    current = PerZone[float](front=fan, rear=fan, top=fan)
+    return DatasetExampleV2(
+        example_id=item.example_id,
+        source_run_id=item.source_run_id,
+        history_start_ms=item.history_start_ms,
+        action_ts_ms=item.action_ts_ms,
+        label_end_ms=item.label_end_ms,
+        control_tick_id=tick,
+        control_schema_version=12,
+        window=item.window,
+        action=item.action,
+        context=item.context,
+        prior_action=PriorAction(
+            source_ts_ms=item.action_ts_ms - 1_000,
+            source_tick_id=tick - 1,
+            effective_demand=current,
+        ),
+        action_steps=tuple(
+            ActionStepV2(
+                step=step,
+                ts_ms=item.action_ts_ms + step * STEP_MS,
+                source_ts_ms=item.action_ts_ms + step * STEP_MS,
+                source_tick_id=tick + step,
+                effective_demand=current,
             )
-        return PlanPrediction(
-            model_id=anchor.model_id,
-            model_version=anchor.model_version,
-            artifact_sha256=self._forged_artifact_sha256 or anchor.artifact_sha256,
-            artifact_verification=anchor.artifact_verification,
-            capability=InferenceCapability.COUNTERFACTUAL_ACTION,
-            anchor_inference_id=(self._forged_anchor_id or inference_id(scored.observed, anchor)),
-            input_action_ts_ms=anchor.input_action_ts_ms,
-            # **評価した plan そのもの**の識別子を返す。取り違えれば呼び出し側が弾く。
-            plan_digest=scored.plan.digest(),
-            targets=tuple(targets),
+            for step in range(STEPS)
+        ),
+        targets=item.targets,
+    )
+
+
+def thermal_dataset_v2(features: tuple[str, ...] = FEATURES) -> ThermalDatasetV2:
+    """`test_model_confidence` と同じ観測・label の Dataset v2（``features`` に絞れる）。"""
+    data = dataset(HORIZONS, TARGETS)
+    examples = tuple(
+        _narrowed(_as_v2(item, index), features) for index, item in enumerate(data.examples)
+    )
+    spec = data.manifest.spec
+    return ThermalDatasetV2(
+        manifest=DatasetManifestV2(
+            spec=DatasetSpecV2(
+                window_ms=spec.window_ms,
+                sample_period_ms=spec.sample_period_ms,
+                horizons_ms=HORIZONS,
+                target_tolerance_ms=spec.target_tolerance_ms,
+                stale_after_ms=spec.stale_after_ms,
+                feature_metrics=features,
+                target_metrics=TARGETS,
+                action_step_ms=STEP_MS,
+                action_steps=STEPS,
+                action_stale_after_ms=2_000,
+            ),
+            source_runs=data.manifest.source_runs,
+            telemetry_sha256=data.manifest.telemetry_sha256,
+            control_trace_sha256=data.manifest.control_trace_sha256,
+            examples_sha256=examples_sha256(examples),
+            example_count=len(examples),
+            excluded=ActionExclusionCounts(
+                stale=0, discontinuity=0, in_step_change=0, restart=0, tick_id_gap=0
+            ),
+        ),
+        examples=examples,
+    )
+
+
+def _narrowed(item: DatasetExampleV2, features: tuple[str, ...]) -> DatasetExampleV2:
+    if features == FEATURES:
+        return item
+    fields = ("values", "source_ts_ms", "quality", "missing_mask", "stale_mask")
+    frames = tuple(
+        frame.model_copy(
+            update={
+                name: {metric: getattr(frame, name)[metric] for metric in features}
+                for name in fields
+            }
         )
+        for frame in item.window
+    )
+    return DatasetExampleV2.model_validate(
+        item.model_copy(update={"window": frames}).model_dump(mode="python")
+    )
 
 
-def _mean(values: Sequence[float]) -> float:
-    return sum(values) / len(values)
+@dataclass(frozen=True)
+class _Training:
+    trained: CounterfactualTrainedModel
+    source: VerifiedTrainingDatasetArtifactV2
+    split: DatasetSplitV2
 
 
-class ScriptedClock:
-    """試験用の単調時計。値を使い切ったら最後の値を返し続ける。"""
+@cache
+def _training(features: tuple[str, ...] = FEATURES) -> _Training:
+    """学習は feature の組ごとに1回だけ（同じ合成データから同じ係数）。"""
+    data = thermal_dataset_v2(features)
+    parts = split_temporally_v2(
+        data.examples, validation_start_ms=VALIDATION_START_MS, test_start_ms=TEST_START_MS
+    )
+    directory = Path(tempfile.mkdtemp(prefix="pr86-dataset")) / DATASET_ALIAS
+    directory.mkdir()
+    (directory / "manifest.json").write_bytes(
+        (data.manifest.model_dump_json(indent=2) + "\n").encode("utf-8")
+    )
+    (directory / "examples.jsonl").write_bytes(examples_jsonl_bytes(data.examples))
+    source = verify_training_dataset_artifact_v2(
+        data, directory / "manifest.json", directory / "examples.jsonl"
+    )
+    trained_model = train_counterfactual_ridge(
+        source,
+        parts,
+        CounterfactualTrainingSpec(
+            model_id=MODEL_ID,
+            model_version="0.1.0",
+            created_at="2026-10-07T10:00:00+09:00",
+            ridge_lambda=0.1,
+            authority_compatibility=ALL_STAGES,
+            calibration_offsets_c=dict(CALIBRATION_OFFSETS),
+            code_commit="0123456789abcdef",
+        ),
+        metric_catalog=CATALOG,
+    )
+    return _Training(trained=trained_model, source=source, split=parts)
 
-    def __init__(self, *values: int) -> None:
-        self._values = list(values) or [0]
-        self._index = 0
 
-    def __call__(self) -> int:
-        value = self._values[min(self._index, len(self._values) - 1)]
-        self._index += 1
-        return value
+# ---------------------------------------------------------------- Profile v2 と係数
 
 
-# ---------------------------------------------------------------- 下ごしらえ
+def ranges(low: float, high: float, *, count: int = 10_000) -> PerZone[ValueRange]:
+    """3 zone とも同じ観測範囲。"""
+    return PerZone[ValueRange](
+        front=ValueRange(source="fan.front", minimum=low, maximum=high, observed_count=count),
+        rear=ValueRange(source="fan.rear", minimum=low, maximum=high, observed_count=count),
+        top=ValueRange(source="fan.top", minimum=low, maximum=high, observed_count=count),
+    )
 
 
-REGISTRY_LIMITS = load_model_registry_limits(Path(__file__).resolve().parents[1] / "config")
-ALL_STAGES: tuple[AuthorityStage, ...] = tuple(AuthorityStage)
+StepItem = tuple[PerZone[ValueRange], Sequence[Cell]]
+PairItem = tuple[PerZone[ValueRange], Sequence[tuple[Cell, Cell]]]
 
 
-def issue_attestation(
-    root: Path,
+def action_support(
     *,
-    model_id: str = "rack-thermal",
-    version: str = "0.1.0",
-    authority: tuple[AuthorityStage, ...] = ALL_STAGES,
-    feature_schema_version: str = "thermal-features-v1",
-    target_schema_version: str = "thermal-targets-v1",
-    kind: ArtifactKind = ArtifactKind.THERMAL_MODEL,
-    stage: AuthorityStage = AuthorityStage.FULL,
-    promoted: bool = True,
-    payload: bytes | None = None,
-    capability: ArtifactCapability = ArtifactCapability.COUNTERFACTUAL_ACTION,
-) -> ArtifactAttestation:
-    """**本物の Model Registry（#104）に登録し、検証経路から attestation を受け取る。**
+    steps: Sequence[StepItem] | None = None,
+    anchor: PairItem | None = None,
+    pairs: Sequence[PairItem] | None = None,
+) -> ActionSupportV2:
+    """step ごと・step の組ごとの support。省いた欄は「全範囲・全 cell・全遷移」を観測した扱い。"""
+    step_items = steps or tuple((ranges(0.0, 1.0), CELLS) for _ in range(STEPS))
+    anchor_item = anchor or (ranges(-1.0, 1.0), EVERY_TRANSITION)
+    pair_items = pairs or tuple((ranges(-1.0, 1.0), EVERY_TRANSITION) for _ in range(STEPS - 1))
+    return ActionSupportV2(
+        steps=tuple(
+            StepActionSupport(
+                step=index,
+                demand_ranges=zone_ranges,
+                cells=tuple(ActionCellCount(cell=cell, count=1) for cell in cells),
+            )
+            for index, (zone_ranges, cells) in enumerate(step_items)
+        ),
+        anchor_to_first=AnchorTransitionSupport(
+            delta_ranges=anchor_item[0],
+            cells=tuple(
+                ActionCellTransitionCount(source=source, target=target, count=1)
+                for source, target in anchor_item[1]
+            ),
+        ),
+        transitions=tuple(
+            StepTransitionSupport(
+                from_step=index,
+                delta_ranges=delta_ranges,
+                cells=tuple(
+                    ActionCellTransitionCount(source=source, target=target, count=1)
+                    for source, target in transitions
+                ),
+            )
+            for index, (delta_ranges, transitions) in enumerate(pair_items)
+        ),
+    )
 
-    テストが自分で証拠を組み立てないようにする。ここで登録するのは、反実仮想 artifact 形式が
-    #84 に入るまでの置き換えとしての最小の JSON payload で、`ArtifactMetadata` の identity と
-    schema version だけが #86 の束縛に効く。
+
+def profile_spec(features: tuple[str, ...] = FEATURES) -> ConfidenceProfileSpec:
+    """`test_model_confidence` の support 軸に、全 zone の `fan.<zone>` 軸を足したもの。"""
+    observed = {
+        AIR: SupportAxis(source=AIR, edges=(22.0, 24.0, 26.0)),
+        GPU: SupportAxis(source=GPU, edges=(44.0, 48.0, 52.0)),
+    }
+    return ConfidenceProfileSpec(
+        support_axes=(
+            *(observed[metric] for metric in features),
+            SupportAxis(source="fan.front", edges=FAN_EDGES),
+            SupportAxis(source="fan.rear", edges=FAN_EDGES),
+            SupportAxis(source="fan.top", edges=FAN_EDGES),
+        ),
+        residual_scale_floor=0.01,
+    )
+
+
+def _artifact_bytes(
+    *,
+    version: str,
+    authority: tuple[AuthorityStage, ...],
+    support: ActionSupportV2 | None,
+    features: tuple[str, ...],
+    edit: Callable[[dict[str, Any]], None] | None,
+) -> bytes:
+    training = _training(features)
+    trained_model = training.trained.model_copy(
+        update={"model_version": version, "authority_compatibility": authority}
+    )
+    fitted = fit_confidence_profile_v2(
+        training.trained, training.source, training.split, profile_spec(features)
+    )
+    # 学習データの action 列は anchor を保つだけなので、候補の探索を試すために action の support を
+    # 置き換える（anchor 推論の判定に使う範囲・cell・residual の基準は生成したまま）。
+    profile = ConfidenceProfileV2.model_validate(
+        fitted.model_dump(mode="python")
+        | {
+            "action_support": (support or action_support()).model_dump(mode="python"),
+            "binding": trained_model.profile_binding().model_dump(mode="python"),
+        }
+    )
+    doc = document(assemble_counterfactual_artifact(trained_model, profile))
+    _plan_gain(doc)
+    if edit is not None:
+        edit(doc)
+    return encode(reseal(doc))
+
+
+def _plan_gain(doc: dict[str, Any]) -> None:
+    """計画 action の列の係数を「demand を上げるほど温度が下がる」決定論的な値にする。
+
+    horizon `h` の出力が使ってよい step（`k × step_ms < h`。因果の mask）の列だけに置く。
     """
-    payload = (
-        payload or json.dumps({"model": model_id, "version": version}, sort_keys=True).encode()
-    )
-    metadata = ArtifactMetadata(
-        kind=kind,
-        artifact_format=ArtifactFormat.JSON,
-        capability=capability,
-        model_id=model_id,
-        version=version,
-        created_at="2026-09-20T10:00:00+09:00",
-        training_dataset_version="dataset-00000000000000000000000000000086",
-        source_runs=("run-00000000000000000000000000000086",),
-        feature_schema_version=feature_schema_version,
-        target_schema_version=target_schema_version,
-        code_commit="0123456789abcdef",
-        sha256=sha256(payload).hexdigest(),
-        model_family="ridge_linear_v1",
-        hyperparameters={"ridge_lambda": 0.1},
-        authority_compatibility=authority,
-    )
+    columns = doc["feature_schema"]["columns"]
+    plan_start = len(columns) - STEPS * 3
+    scales = doc["payload"]["feature_scales"]
+    for output in doc["payload"]["outputs"]:
+        allowed = sum(1 for step in range(STEPS) if step * STEP_MS < output["horizon_ms"])
+        for step in range(STEPS):
+            for zone in range(3):
+                index = plan_start + step * 3 + zone
+                output["coefficients"][index] = (
+                    -GAIN * scales[index] / (3 * allowed) if step < allowed else 0.0
+                )
+
+
+def _promote(
+    root: Path, metadata: ArtifactMetadata, payload: bytes, *, stage: AuthorityStage, promoted: bool
+) -> VerifiedArtifact:
     registry = ModelRegistry(root, limits=REGISTRY_LIMITS)
     registry.register_candidate(metadata, payload, actor="trainer", reason="training completed")
     registry.mark_validated(
@@ -339,8 +490,8 @@ def issue_attestation(
         expected_revision=registry.inspect().revision,
     )
     compatibility = ModelCompatibility(
-        feature_schema_version=feature_schema_version,
-        target_schema_version=target_schema_version,
+        feature_schema_version=metadata.feature_schema_version,
+        target_schema_version=metadata.target_schema_version,
         authority_stage=stage,
     )
     if promoted:
@@ -362,30 +513,140 @@ def issue_attestation(
         )
     result = registry.load_version(metadata.ref, compatibility)
     assert result.artifact is not None, result.detail
-    return result.artifact.attestation
+    return result.artifact
+
+
+def register_v2(
+    root: Path,
+    *,
+    version: str = "0.1.0",
+    authority: tuple[AuthorityStage, ...] = ALL_STAGES,
+    stage: AuthorityStage = AuthorityStage.FULL,
+    promoted: bool = True,
+    support: ActionSupportV2 | None = None,
+    features: tuple[str, ...] = FEATURES,
+    edit: Callable[[dict[str, Any]], None] | None = None,
+) -> VerifiedArtifact:
+    """**本物の Model Registry（#104）に登録し、検証経路から `VerifiedArtifact` を受け取る。**"""
+    payload = _artifact_bytes(
+        version=version, authority=authority, support=support, features=features, edit=edit
+    )
+    return _promote(root, metadata_for(payload), payload, stage=stage, promoted=promoted)
+
+
+def register_payload(
+    root: Path, payload: bytes, *, stage: AuthorityStage = AuthorityStage.FULL
+) -> VerifiedArtifact:
+    """artifact v2 の bytes をそのまま別の Registry へ登録・昇格する（同じ bytes・同じ hash）。"""
+    return _promote(root, metadata_for(payload), payload, stage=stage, promoted=True)
+
+
+@dataclass(frozen=True)
+class MpcArtifact:
+    """Registry が発行した反実仮想 artifact v2 と、その registry の場所。"""
+
+    verified: VerifiedArtifact
+    root: Path
+
+    @property
+    def attestation(self) -> ArtifactAttestation:
+        """Registry 発行の証拠。"""
+        return self.verified.attestation
+
+    @property
+    def model(self) -> RegistryCounterfactualThermalModel:
+        """同じ bytes から作った封をした型（試験で予測や Profile を読むため）。"""
+        return RegistryCounterfactualThermalModel.from_verified_artifact(
+            self.verified, metric_catalog=CATALOG, calibration=RUNTIME_CALIBRATION
+        )
+
+    @property
+    def profile(self) -> ConfidenceProfileV2:
+        """同梱 Profile v2。"""
+        return self.model.confidence_profile
+
+
+def make_artifact(root: Path, **kwargs: Any) -> MpcArtifact:
+    """`register_v2` の結果を `MpcArtifact` に包む。"""
+    return MpcArtifact(verified=register_v2(root, **kwargs), root=root)
 
 
 @pytest.fixture(scope="module")
-def trained(tmp_path_factory: pytest.TempPathFactory) -> Trained:
-    """合成 dataset で学習した #84 モデル、その Confidence Profile、Registry 発行の証拠。"""
-    data = dataset(HORIZONS, TARGETS)
-    parts = split(data)
-    model = train(data, parts)
-    profile = fit_confidence_profile(model, data, parts, profile_spec())
-    attestation = issue_attestation(
-        tmp_path_factory.mktemp("pr151-registry") / "registry",
-        model_id=model.manifest.model_id,
-        version=model.manifest.model_version,
-        # **実際の #84 artifact bytes を登録する。** attestation の artifact hash が
-        # anchor 推論と Confidence Profile の hash と一致することまで試験で通す。
-        payload=canonical_artifact_bytes(model._artifact),
+def trained(tmp_path_factory: pytest.TempPathFactory) -> MpcArtifact:
+    """production に昇格した反実仮想 artifact v2（全 stage 互換・広い action の support）。"""
+    return make_artifact(tmp_path_factory.mktemp("pr86-registry") / "registry")
+
+
+def issue_verified(
+    root: Path,
+    *,
+    model_id: str = MODEL_ID,
+    version: str = "0.1.0",
+    authority: tuple[AuthorityStage, ...] = ALL_STAGES,
+    feature_schema_version: str = "thermal-features-v1",
+    target_schema_version: str = "thermal-targets-v1",
+    kind: ArtifactKind = ArtifactKind.THERMAL_MODEL,
+    stage: AuthorityStage = AuthorityStage.FULL,
+    promoted: bool = True,
+    payload: bytes | None = None,
+    capability: ArtifactCapability = ArtifactCapability.COUNTERFACTUAL_ACTION,
+) -> VerifiedArtifact:
+    """任意の payload を本物の Registry に登録し、`VerifiedArtifact` を受け取る。"""
+    payload = (
+        payload or json.dumps({"model": model_id, "version": version}, sort_keys=True).encode()
     )
-    return model, profile, attestation
+    metadata = ArtifactMetadata(
+        kind=kind,
+        artifact_format=ArtifactFormat.JSON,
+        capability=capability,
+        model_id=model_id,
+        version=version,
+        created_at="2026-09-20T10:00:00+09:00",
+        training_dataset_version="dataset-00000000000000000000000000000086",
+        source_runs=("run-00000000000000000000000000000086",),
+        feature_schema_version=feature_schema_version,
+        target_schema_version=target_schema_version,
+        code_commit="0123456789abcdef",
+        sha256=sha256(payload).hexdigest(),
+        model_family="ridge_linear_v1",
+        hyperparameters={"ridge_lambda": 0.1},
+        authority_compatibility=authority,
+    )
+    return _promote(root, metadata, payload, stage=stage, promoted=promoted)
+
+
+def issue_attestation(root: Path, **kwargs: Any) -> ArtifactAttestation:
+    """`issue_verified` の attestation だけを返す（他の試験が使う）。
+
+    #105 の学習 dynamics（0079 段 6 で v2 の型へ切り替える）・fand の registry 束縛・
+    Gate の試験は、artifact の中身を読まずに attestation だけを使う。
+    """
+    return issue_verified(root, **kwargs).attestation
+
+
+# ---------------------------------------------------------------- 試験用の部品
+
+
+class ScriptedClock:
+    """試験用の単調時計。値を使い切ったら最後の値を返し続ける。"""
+
+    def __init__(self, *values: int) -> None:
+        self._values = list(values) or [0]
+        self._index = 0
+
+    def __call__(self) -> int:
+        value = self._values[min(self._index, len(self._values) - 1)]
+        self._index += 1
+        return value
+
+
+def _mean(values: Sequence[float]) -> float:
+    return sum(values) / len(values)
 
 
 def optimizer_document(**overrides: object) -> dict[str, object]:
-    """試験用の `mpc.optimizer` 設定。値はすべて暫定扱い。"""
-    document: dict[str, object] = {
+    """試験用の `mpc.optimizer` 設定。格子は試験用 artifact の action schema と同じ。"""
+    values: dict[str, object] = {
         "horizon_ms": _provisional(STEP_MS * len(HORIZONS)),
         "step_ms": _provisional(STEP_MS),
         "candidate_levels": _provisional(5),
@@ -405,8 +666,8 @@ def optimizer_document(**overrides: object) -> dict[str, object]:
         "cost_metrics": {"cpu_temperature": CPU, "gpu_temperature": GPU},
         "unknown_balance_cost": _provisional(1.0),
     }
-    document.update(overrides)
-    return document
+    values.update(overrides)
+    return values
 
 
 def _provisional(value: float | int) -> dict[str, object]:
@@ -504,36 +765,67 @@ def _with_action(observed: ObservedThermalInput, demand: float) -> ObservedTherm
     )
 
 
-def build_controller(
-    trained: Trained,
+def bind(
+    trained: MpcArtifact,
     *,
-    model: PlanningModel | None = None,
+    authority_stage: AuthorityStage = AuthorityStage.FULL,
+    calibration: RuntimeCalibration = RUNTIME_CALIBRATION,
+    expected_model_version: str | None = None,
+    catalog: MetricCatalog = CATALOG,
+) -> MpcModelBinding:
+    """`VerifiedArtifact` から束縛を作る（runtime と同じ1つの呼び出し）。"""
+    return MpcModelBinding.from_verified_artifact(
+        trained.verified,
+        metric_catalog=catalog,
+        calibration=calibration,
+        authority_stage=authority_stage,
+        expected_model_version=expected_model_version or trained.attestation.version,
+    )
+
+
+def build_controller(
+    trained: MpcArtifact,
+    *,
     policy_config: FanPolicyConfig | None = None,
     clock: ScriptedClock | None = None,
     acoustic: bool = False,
     authority_stage: AuthorityStage | None = None,
-) -> tuple[LearnedMpcController, PlanningModel, FanPolicyConfig]:
+) -> tuple[LearnedMpcController, MpcModelBinding, FanPolicyConfig]:
     """束縛済みの MPC controller を組み立てる。"""
-    base, profile, attestation = trained
-    planning = model or PlanningModel(base)
     settings = policy_config or mpc_policy()
-    binding = MpcModelBinding.for_control(
-        planning,
-        attestation=attestation,
-        authority_stage=settings.authority_stage,
-        expected_model_version=attestation.version,
-    )
+    binding = bind(trained, authority_stage=settings.authority_stage)
     controller = LearnedMpcController(
         binding,
         settings,
         safety(),
-        assessor=ConfidenceAssessor(profile, settings.model_confidence),
         monotonic_ms=clock or ScriptedClock(0),
         # #92: 実効 stage は journal が決める。試験では設定の stage をそのまま使う。
         authority=StaticAuthorityStage(authority_stage or settings.authority_stage),
         acoustic=acoustic_model() if acoustic else None,
     )
-    return controller, planning, settings
+    return controller, binding, settings
+
+
+def load_runtime(
+    verified: VerifiedArtifact,
+    *,
+    settings: FanPolicyConfig | None = None,
+    calibration: RuntimeCalibration = RUNTIME_CALIBRATION,
+    expected_model_version: str | None = None,
+    catalog: MetricCatalog = CATALOG,
+) -> LearnedMpcRuntime:
+    """worker と同じ入口（`LearnedMpcRuntime.load`）で読み込む。"""
+    config = settings or mpc_policy()
+    return LearnedMpcRuntime.load(
+        verified,
+        config,
+        safety(),
+        metric_catalog=catalog,
+        calibration=calibration,
+        expected_model_version=expected_model_version or verified.attestation.version,
+        monotonic_ms=ScriptedClock(0),
+        authority=StaticAuthorityStage(config.authority_stage),
+    )
 
 
 def acoustic_model() -> ConfiguredAcousticCostModel:
@@ -554,7 +846,7 @@ def acoustic_model() -> ConfiguredAcousticCostModel:
 
 
 def propose(
-    controller: LearnedMpcController,
+    controller: LearnedMpcController | LearnedMpcRuntime,
     *,
     action: float | None = None,
     baseline: float = 0.4,
@@ -575,186 +867,268 @@ def propose(
     )
 
 
-# ---------------------------------------------------------------- 不変条件 2: 内部モデル
+def select_with(
+    settings: FanPolicyConfig,
+    attestation: ArtifactAttestation,
+    result: MpcProposal,
+    *,
+    fallback: ControllerProposal | None = None,
+    now_mono_ms: int = 0,
+) -> Any:
+    """Gate（#79）に1回だけ選ばせる。期待値は runtime と同じく attestation から取る。"""
+    gate = gate_for(
+        settings,
+        expected_model_version=attestation.version,
+        expected_artifact_sha256=attestation.artifact_sha256,
+    )
+    return gate.select(
+        now_mono_ms=now_mono_ms,
+        fallback=fallback or fallback_proposal(0.4),
+        learned=result.to_status(received_at_mono_ms=now_mono_ms),
+        operating_mode=OperatingMode.AUTO,
+        safety_state=SafetyState.NORMAL,
+    )
 
 
-def test_invariant_2_a_dataset_v1_artifact_is_refused_as_the_internal_model(trained) -> None:
-    """**観測再生だけの artifact を MPC の内部モデルにしない**（決定記録 0048 §2.1）。
+@pytest.fixture
+def plan_calls(monkeypatch: pytest.MonkeyPatch) -> Iterator[list[ActionPlan]]:
+    """`predict_plan` に渡った候補 plan を順に記録する（評価した候補の数と中身）。"""
+    seen: list[ActionPlan] = []
+    original = MpcModelBinding.predict_plan
 
-    いま存在する artifact は manifest の capability が `observational_replay` に固定されている。
-    束縛を許すと、後続 action 列を学習していない係数を Fan action の因果効果として使ってしまう。
+    def recording(self: MpcModelBinding, planned: PlannedThermalInput) -> PlanPrediction:
+        seen.append(planned.plan)
+        return original(self, planned)
+
+    monkeypatch.setattr(MpcModelBinding, "predict_plan", recording)
+    yield seen
+
+
+Rewrite = Callable[[PlannedThermalInput, PlanPrediction], PlanPrediction]
+
+
+def break_predict_plan(monkeypatch: pytest.MonkeyPatch, replace: Rewrite | BaseException) -> None:
+    """`predict_plan` の結果を差し替える（取り違え・異常の再現）。"""
+    original = MpcModelBinding.predict_plan
+
+    def broken(self: MpcModelBinding, planned: PlannedThermalInput) -> PlanPrediction:
+        if isinstance(replace, BaseException):
+            raise replace
+        return replace(planned, original(self, planned))
+
+    monkeypatch.setattr(MpcModelBinding, "predict_plan", broken)
+
+
+def rewritten(prediction: PlanPrediction, **updates: object) -> PlanPrediction:
+    """予測の一部を書き換えた複製（検証を通す）。"""
+    return PlanPrediction.model_validate(prediction.model_dump(mode="python") | updates)
+
+
+# ------------------------------------- #105 の学習 dynamics の試験用（0079 段 6 まで v1 のまま）
+
+
+class PlanningModel:
+    """**#105 の学習 dynamics の試験だけ**が使う、v1 の model を包んだ試験用の反実仮想モデル。
+
+    MPC の束縛（`MpcModelBinding`）はこの型を受け取らない（決定記録 0079 段 4）。
+    `AttestedThermalDynamics.bind` を段 2 の型へ切り替えるのは段 6（#105）。
     """
-    base, _profile, _attestation = trained
-    identity = CounterfactualModelIdentity.from_manifest(base.manifest)
-    assert identity.capability is InferenceCapability.OBSERVATIONAL_REPLAY
 
-    # 実際に Registry へ登録できるのは、いまは observational_replay だけである。
-    observational = issue_attestation(
-        Path(tempfile.mkdtemp(prefix="pr151-observational")) / "registry",
+    def __init__(
+        self,
+        base: object,
+        *,
+        capability: InferenceCapability = InferenceCapability.COUNTERFACTUAL_ACTION,
+        model_id: str | None = None,
+        model_version: str | None = None,
+        gain: float = GAIN,
+    ) -> None:
+        self._base = base
+        self._identity = CounterfactualModelIdentity(
+            model_id=model_id or base.manifest.model_id,  # type: ignore[attr-defined]
+            model_version=(
+                model_version or base.manifest.model_version  # type: ignore[attr-defined]
+            ),
+            capability=capability,
+        )
+        self._gain = gain
+
+    @property
+    def identity(self) -> CounterfactualModelIdentity:
+        """束縛の判断に使う identity。"""
+        return self._identity
+
+    @property
+    def feature_schema(self) -> ThermalFeatureSchema:
+        """入力契約。"""
+        return self._base.feature_schema  # type: ignore[attr-defined,no-any-return]
+
+    @property
+    def target_schema(self) -> ThermalTargetSchema:
+        """出力契約。"""
+        return self._base.target_schema  # type: ignore[attr-defined,no-any-return]
+
+    def predict(self, observed: ObservedThermalInput) -> ThermalPrediction:
+        """anchor 推論。artifact の出どころだけ Registry 検証済みにそろえる。"""
+        prediction = self._base.predict(observed)  # type: ignore[attr-defined]
+        return ThermalPrediction.model_validate(
+            prediction.model_dump(mode="python")
+            | {"artifact_verification": ArtifactVerification.REGISTRY_VERIFIED}
+        )
+
+    def predict_plan(self, planned: PlannedThermalInput) -> PlanPrediction:
+        """候補 action 列に対する単調な応答を返す。"""
+        anchor = self.predict(planned.observed)
+        anchor_mean = _mean(
+            tuple(planned.observed.action.get(zone).effective_demand for zone in Zone)
+        )
+        by_offset = {target.horizon_ms: target.values for target in anchor.targets}
+        targets = []
+        for index, step in enumerate(planned.plan.steps):
+            delta = _mean(tuple(step.demands.get(zone) for zone in Zone)) - anchor_mean
+            weight = (index + 1) / len(planned.plan.steps)
+            targets.append(
+                PlannedTarget(
+                    offset_ms=step.offset_ms,
+                    expected_ts_ms=planned.observed.action_ts_ms + step.offset_ms,
+                    values={
+                        metric: value - self._gain * delta * weight
+                        for metric, value in by_offset[step.offset_ms].items()
+                    },
+                )
+            )
+        return PlanPrediction(
+            model_id=anchor.model_id,
+            model_version=anchor.model_version,
+            artifact_sha256=anchor.artifact_sha256,
+            artifact_verification=anchor.artifact_verification,
+            capability=InferenceCapability.COUNTERFACTUAL_ACTION,
+            anchor_inference_id=inference_id(planned.observed, anchor),
+            input_action_ts_ms=anchor.input_action_ts_ms,
+            plan_digest=planned.plan.digest(),
+            targets=tuple(targets),
+        )
+
+
+@cache
+def v1_model() -> Any:
+    """#84 の v1 artifact（`observational_replay`）。MPC に束縛できないことを試すために使う。"""
+    data = dataset(HORIZONS, TARGETS)
+    return train_v1(data, split_v1(data))
+
+
+def register_v1(root: Path, *, capability: ArtifactCapability) -> VerifiedArtifact:
+    """v1 artifact の bytes を本物の Registry に登録する（capability は申告どおり）。"""
+    base = v1_model()
+    return issue_verified(
+        root,
         model_id=base.manifest.model_id,
         version=base.manifest.model_version,
-        capability=ArtifactCapability.OBSERVATIONAL_REPLAY,
+        capability=capability,
         payload=canonical_artifact_bytes(base._artifact),
     )
 
-    assert observational.capability is ArtifactCapability.OBSERVATIONAL_REPLAY
-    with pytest.raises(MpcModelUnusableError, match="反実仮想予測を申告していない"):
-        MpcModelBinding.for_control(
-            PlanningModel(base, capability=identity.capability),
-            attestation=observational,
-            authority_stage=AuthorityStage.FULL,
-            expected_model_version=observational.version,
-        )
+
+# ---------------------------------------------------------------- 不変条件 2: 内部モデル
 
 
-def test_invariant_2_b_verification_comes_from_the_registry_not_from_the_model(
-    trained, tmp_path: Path
+def test_invariant_2_a_dataset_v1_artifact_is_refused_as_the_internal_model(
+    tmp_path: Path,
 ) -> None:
+    """**観測再生だけの artifact を MPC の内部モデルにしない**（決定記録 0048 §2.1 / 0079 §2.2）。
+
+    v1 の bytes は、申告が `observational_replay` なら L1、`counterfactual_action` と偽って
+    登録しても L4（v1 を v2 として読み替えない）で拒まれる。
+    """
+    observational = register_v1(
+        tmp_path / "observational", capability=ArtifactCapability.OBSERVATIONAL_REPLAY
+    )
+    assert observational.attestation.capability is ArtifactCapability.OBSERVATIONAL_REPLAY
+    with pytest.raises(MpcModelUnusableError, match=r"（L1）.*反実仮想を申告していない"):
+        bind(MpcArtifact(observational, tmp_path))
+
+    claimed = register_v1(tmp_path / "claimed", capability=ArtifactCapability.COUNTERFACTUAL_ACTION)
+    with pytest.raises(MpcModelUnusableError, match=r"（L4）"):
+        bind(MpcArtifact(claimed, tmp_path))
+
+
+def test_invariant_2_b_verification_comes_from_the_registry_not_from_the_model(trained) -> None:
     """**モデルの自称ではなく、Registry が発行した証拠に束縛する。**
 
-    `ArtifactAttestation` は #104 の検証経路だけが発行する。呼び出し側が作れないので、
-    検証していない artifact を取り違えて渡す配線ミスは型で止まる（決定記録 0052 §2.1）。
+    `ArtifactAttestation` / `VerifiedArtifact` は #104 の検証経路だけが発行する。束縛は
+    `VerifiedArtifact` を1つ受け取る入口しか持たない（決定記録 0079 §2.4）。
     """
-    base, _profile, attestation = trained
-
     with pytest.raises(TypeError, match="検証経路"):
         ArtifactAttestation()
 
-    # 自称の artifact_verification が OFFLINE でも、Registry の証拠があれば束縛は成立する。
-    # 逆に、証拠なしで REGISTRY_VERIFIED を名乗る道はそもそも型として存在しない。
-    binding = MpcModelBinding.for_control(
-        PlanningModel(base, verification=ArtifactVerification.OFFLINE_UNVERIFIED),
-        attestation=attestation,
-        authority_stage=AuthorityStage.FULL,
-        expected_model_version=attestation.version,
-    )
+    binding = bind(trained)
 
     assert binding.artifact_verification is ArtifactVerification.REGISTRY_VERIFIED
-    assert binding.model_version == attestation.version
-    assert binding.artifact_sha256 == attestation.artifact_sha256
-    del tmp_path
+    assert binding.model_version == trained.attestation.version
+    assert binding.artifact_sha256 == trained.attestation.artifact_sha256
+    assert binding.model.artifact_sha256 == trained.attestation.artifact_sha256
+    assert binding.identity.capability is InferenceCapability.COUNTERFACTUAL_ACTION
 
 
-def test_invariant_2_c_a_wrapper_around_another_artifact_is_refused(
-    trained, tmp_path: Path
-) -> None:
-    """**別の artifact を包んだ wrapper が、借りてきた証拠で authority を得られない。**"""
-    base, _profile, attestation = trained
+def test_invariant_2_c_the_binding_takes_no_separately_built_model() -> None:
+    """**別に組み立てた model / Profile を並べて渡す口が無い**（決定記録 0079 §2.4）。
 
-    with pytest.raises(MpcModelUnusableError, match="model_id"):
-        MpcModelBinding.for_control(
-            PlanningModel(base, model_id="other-thermal"),
-            attestation=attestation,
-            authority_stage=AuthorityStage.FULL,
-            expected_model_version=attestation.version,
-        )
-
-    # schema version が食い違う model も、証拠だけ借りて通れない。
-    other = issue_attestation(
-        tmp_path / "other-schema",
-        model_id=base.manifest.model_id,
-        version=base.manifest.model_version,
-        feature_schema_version="thermal-features-v2",
-        target_schema_version="thermal-targets-v2",
-    )
-    with pytest.raises(MpcModelUnusableError, match="schema_version"):
-        MpcModelBinding.for_control(
-            PlanningModel(base),
-            attestation=other,
-            authority_stage=AuthorityStage.FULL,
-            expected_model_version=other.version,
-        )
+    v1 の wrapper を受け取っていた `for_control` は無くなり、入口は `VerifiedArtifact` だけ。
+    controller も判定器を受け取らない（同梱 Profile からだけ作る）。
+    """
+    assert not hasattr(MpcModelBinding, "for_control")
+    parameters = inspect.signature(MpcModelBinding.from_verified_artifact).parameters
+    assert "model" not in parameters
+    assert "profile" not in parameters
+    assert "assessor" not in inspect.signature(LearnedMpcController).parameters
+    with pytest.raises(TypeError):
+        MpcModelBinding()
+    with pytest.raises(TypeError):
+        RegistryCounterfactualThermalModel()
 
 
-def test_invariant_2_d_the_registry_decides_the_permitted_authority(
-    trained, tmp_path: Path
-) -> None:
+def test_invariant_2_d_the_registry_decides_the_permitted_authority(tmp_path: Path) -> None:
     """**authority 互換は Registry metadata の値で判断する。** 自称値では広げられない。"""
-    base, _profile, _attestation = trained
-    shadow_only = issue_attestation(
+    shadow_only = make_artifact(
         tmp_path / "shadow-only",
-        model_id=base.manifest.model_id,
-        version=base.manifest.model_version,
         authority=(AuthorityStage.SHADOW,),
         stage=AuthorityStage.SHADOW,
     )
 
     with pytest.raises(MpcModelUnusableError, match="authority"):
-        MpcModelBinding.for_control(
-            PlanningModel(base),
-            attestation=shadow_only,
-            authority_stage=AuthorityStage.FULL,
-            expected_model_version=shadow_only.version,
-        )
+        bind(shadow_only, authority_stage=AuthorityStage.FULL)
+    assert bind(shadow_only, authority_stage=AuthorityStage.SHADOW) is not None
 
 
-def test_invariant_2_e_a_non_thermal_artifact_is_refused(trained, tmp_path: Path) -> None:
+def test_invariant_2_e_a_non_thermal_artifact_is_refused(tmp_path: Path) -> None:
     """thermal model 以外の artifact の証拠では束縛しない。"""
-    base, _profile, _attestation = trained
-    other_kind = issue_attestation(
-        tmp_path / "supervisor",
-        model_id=base.manifest.model_id,
-        version=base.manifest.model_version,
-        kind=ArtifactKind.SUPERVISOR_POLICY,
-    )
+    other_kind = issue_verified(tmp_path / "supervisor", kind=ArtifactKind.SUPERVISOR_POLICY)
 
-    with pytest.raises(MpcModelUnusableError, match="thermal model"):
-        MpcModelBinding.for_control(
-            PlanningModel(base),
-            attestation=other_kind,
-            authority_stage=AuthorityStage.FULL,
-            expected_model_version=other_kind.version,
-        )
+    with pytest.raises(MpcModelUnusableError, match="thermal model 以外"):
+        bind(MpcArtifact(other_kind, tmp_path))
 
 
 def test_invariant_2_f_a_version_mismatch_is_refused_before_any_inference(trained) -> None:
     """runtime が期待する版と違うモデルで**推論すら始めない**。"""
-    _base, _profile, attestation = trained
     with pytest.raises(MpcModelUnusableError, match="版"):
-        MpcModelBinding.for_control(
-            PlanningModel(_base),
-            attestation=attestation,
-            authority_stage=AuthorityStage.FULL,
-            expected_model_version="9.9.9",
-        )
+        bind(trained, expected_model_version="9.9.9")
 
 
-def test_invariant_2_g_a_refused_model_degrades_to_fallback_without_stopping(trained) -> None:
+def test_invariant_2_g_a_refused_model_degrades_to_fallback_without_stopping(
+    tmp_path: Path,
+) -> None:
     """束縛できないモデルでも**運転は止まらない**。Gate は理由付きで Fallback にする。"""
-    base, _profile, _attestation = trained
     settings = mpc_policy()
-    observational = issue_attestation(
-        Path(tempfile.mkdtemp(prefix="pr151-degrade")) / "registry",
-        model_id=base.manifest.model_id,
-        version=base.manifest.model_version,
-        capability=ArtifactCapability.OBSERVATIONAL_REPLAY,
-        payload=canonical_artifact_bytes(base._artifact),
+    observational = register_v1(
+        tmp_path / "degrade", capability=ArtifactCapability.OBSERVATIONAL_REPLAY
     )
-    with pytest.raises(MpcModelUnusableError) as refusal:
-        MpcModelBinding.for_control(
-            PlanningModel(base, capability=InferenceCapability.OBSERVATIONAL_REPLAY),
-            attestation=observational,
-            authority_stage=settings.authority_stage,
-            expected_model_version=observational.version,
-        )
-    status = MpcProposal(
-        failure=LearnedFailure.MODEL_LOAD_FAILURE,
-        failure_reason=Reason(code="model_unusable", detail=str(refusal.value)),
-    ).to_status(received_at_mono_ms=0)
-    gate = gate_for(
-        settings,
-        expected_model_version=observational.version,
-        expected_artifact_sha256=observational.artifact_sha256,
-    )
+    runtime = load_runtime(observational, settings=settings)
+    assert runtime.controller is None
 
-    selection = gate.select(
-        now_mono_ms=0,
-        fallback=fallback_proposal(0.4),
-        learned=status,
-        operating_mode=OperatingMode.AUTO,
-        safety_state=SafetyState.NORMAL,
-    )
+    result = propose(runtime)
+    selection = select_with(settings, observational.attestation, result)
 
+    assert result.failure is LearnedFailure.MODEL_LOAD_FAILURE
     assert selection.active_controller is ControllerKind.FALLBACK
     assert selection.fallback_reason is not None
     assert selection.fallback_reason.code == FallbackCause.MODEL_LOAD_FAILURE.value
@@ -766,16 +1140,12 @@ def test_invariant_2_g_a_refused_model_degrades_to_fallback_without_stopping(tra
 
 def test_invariant_2_h_the_binding_cannot_be_swapped_after_it_is_verified(trained) -> None:
     """検証済みの束を**後から差し替えられない**。検査を1度通せば済む形にしない。"""
-    base, _profile, attestation = trained
-    binding = MpcModelBinding.for_control(
-        PlanningModel(base),
-        attestation=attestation,
-        authority_stage=AuthorityStage.FULL,
-        expected_model_version=attestation.version,
-    )
+    binding = bind(trained)
 
     with pytest.raises(AttributeError):
-        binding._model = PlanningModel(base)  # type: ignore[misc]
+        binding._model = trained.model  # type: ignore[misc]
+    with pytest.raises(AttributeError):
+        binding._checker = None  # type: ignore[misc]
     with pytest.raises(AttributeError):
         binding.attestation._model_id = "other"  # type: ignore[misc]
     with pytest.raises(TypeError):
@@ -787,7 +1157,7 @@ def test_invariant_2_h_the_binding_cannot_be_swapped_after_it_is_verified(traine
 
 def test_invariant_1_a_the_proposal_carries_its_own_assessment(trained) -> None:
     """提案の `inference_id` は、判定した assessment と**同じ推論**を指す。"""
-    controller, _model, _settings = build_controller(trained)
+    controller, _binding, _settings = build_controller(trained)
 
     result = propose(controller)
 
@@ -797,11 +1167,14 @@ def test_invariant_1_a_the_proposal_carries_its_own_assessment(trained) -> None:
     assert result.proposal.ood == result.assessment.ood
     assert result.solution is not None
     assert result.solution.anchor_inference_id == result.proposal.inference_id
+    # 判定器は束縛した artifact の同梱 Profile から作られている（0079 §2.4）。
+    assert result.assessment.profile_sha256 == trained.profile.sha256()
+    assert result.assessment.prediction.artifact_sha256 == trained.attestation.artifact_sha256
 
 
 def test_invariant_1_b_a_proposal_cannot_be_paired_with_another_inference(trained) -> None:
     """**別の推論の判定を付け替えられない。** OOD の入力が in-distribution に見えてしまう。"""
-    controller, _model, _settings = build_controller(trained)
+    controller, _binding, _settings = build_controller(trained)
     first = propose(controller, action=0.4)
     second = propose(controller, action=0.5)
     assert first.assessment is not None and second.proposal is not None
@@ -813,22 +1186,25 @@ def test_invariant_1_b_a_proposal_cannot_be_paired_with_another_inference(traine
 
 def test_invariant_1_c_a_proposal_without_an_assessment_cannot_be_built(trained) -> None:
     """判定の付いていない提案を worker が**作れない**ようにする。"""
-    controller, _model, _settings = build_controller(trained)
+    controller, _binding, _settings = build_controller(trained)
     result = propose(controller)
 
     with pytest.raises(ValidationError, match="assessment"):
         MpcProposal(proposal=result.proposal)
 
 
-def test_invariant_1_d_a_plan_prediction_from_another_inference_is_rejected(trained) -> None:
+def test_invariant_1_d_a_plan_prediction_from_another_inference_is_rejected(
+    trained, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """optimizer は**別の anchor に属する予測**でコストを測らない。
 
     解を返さず `ERROR` にするので、Gate は Fallback へ落とす。
     """
-    base, _profile, _attestation = trained
-    controller, _model, settings = build_controller(
-        trained, model=PlanningModel(base, forged_anchor_id="9" * 64)
+    break_predict_plan(
+        monkeypatch,
+        lambda _planned, prediction: rewritten(prediction, anchor_inference_id="9" * 64),
     )
+    controller, _binding, settings = build_controller(trained)
 
     result = propose(controller)
 
@@ -836,29 +1212,33 @@ def test_invariant_1_d_a_plan_prediction_from_another_inference_is_rejected(trai
     assert result.proposal is not None
     assert result.proposal.optimizer_status is OptimizerStatus.ERROR
 
-    gate = gate_for(
-        settings,
-        expected_model_version=base.manifest.model_version,
-        expected_artifact_sha256=_attestation.artifact_sha256,
-    )
-    selection = gate.select(
-        now_mono_ms=0,
-        fallback=fallback_proposal(0.4),
-        learned=result.to_status(received_at_mono_ms=0),
-        operating_mode=OperatingMode.AUTO,
-        safety_state=SafetyState.NORMAL,
-    )
-
+    selection = select_with(settings, trained.attestation, result)
     assert selection.active_controller is ControllerKind.FALLBACK
     assert selection.fallback_reason is not None
     assert selection.fallback_reason.code == FallbackCause.OPTIMIZER_ERROR.value
 
 
-def test_invariant_1_e_a_prediction_for_other_steps_is_rejected(trained) -> None:
+def test_invariant_1_e_a_prediction_for_other_steps_is_rejected(
+    trained, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """**候補と違う step 列の予測**を受け取ったまま最適化しない。"""
-    base, _profile, _attestation = trained
-    forged = PlanningModel(base, forged_offsets=(1_000, 2_000, 4_000))
-    controller, _model, _settings = build_controller(trained, model=forged)
+
+    def other_steps(planned: PlannedThermalInput, prediction: PlanPrediction) -> PlanPrediction:
+        offsets = (1_000, 2_000, 4_000)
+        return rewritten(
+            prediction,
+            targets=tuple(
+                target.model_dump(mode="python")
+                | {
+                    "offset_ms": offset,
+                    "expected_ts_ms": planned.observed.action_ts_ms + offset,
+                }
+                for target, offset in zip(prediction.targets, offsets, strict=True)
+            ),
+        )
+
+    break_predict_plan(monkeypatch, other_steps)
+    controller, _binding, _settings = build_controller(trained)
 
     result = propose(controller)
 
@@ -872,7 +1252,7 @@ def test_invariant_1_e_a_prediction_for_other_steps_is_rejected(trained) -> None
 
 def test_invariant_3_a_only_the_first_step_becomes_the_request(trained) -> None:
     """**実行するのは plan の最初の step だけ**（receding horizon）。"""
-    controller, _model, settings = build_controller(trained)
+    controller, _binding, settings = build_controller(trained)
 
     result = propose(controller)
 
@@ -982,7 +1362,7 @@ def test_invariant_4_a_the_request_never_goes_below_the_safety_floor(trained) ->
 
     後段の #78 が必ず引き上げるが、そもそも下回る候補を評価しない。
     """
-    controller, _model, _settings = build_controller(trained)
+    controller, _binding, _settings = build_controller(trained)
 
     for floor in (0.2, 0.5, 0.75, 0.95):
         result = propose(controller, baseline=0.3, safety_floor=floor)
@@ -1049,7 +1429,7 @@ def test_invariant_5_b_an_infeasible_tick_degrades_to_fallback(trained) -> None:
             zone.value: {"floor": _provisional(0.2), "ceiling": _provisional(0.5)} for zone in Zone
         }
     )
-    controller, _model, _settings = build_controller(trained, policy_config=settings)
+    controller, _binding, _settings = build_controller(trained, policy_config=settings)
 
     result = propose(controller, safety_floor=0.9)
 
@@ -1064,7 +1444,7 @@ def test_invariant_5_b_an_infeasible_tick_degrades_to_fallback(trained) -> None:
 
 def test_invariant_6_a_an_exhausted_budget_yields_no_solution(trained) -> None:
     """budget を使い切ったら**解を返さない**。中途半端な探索結果を制御に使わない。"""
-    controller, _model, _settings = build_controller(
+    controller, _binding, _settings = build_controller(
         trained, clock=ScriptedClock(0, 0, 10_000), policy_config=mpc_policy(budget_ms=10)
     )
 
@@ -1077,7 +1457,7 @@ def test_invariant_6_a_an_exhausted_budget_yields_no_solution(trained) -> None:
 
 def test_invariant_6_b_an_evaluation_limit_stops_the_search_deterministically(trained) -> None:
     """時計に頼らない**決定論的な打ち切り**も効く（replay で同じ結果になる）。"""
-    controller, _model, _settings = build_controller(
+    controller, _binding, _settings = build_controller(
         trained, policy_config=mpc_policy(max_evaluations=_provisional(2))
     )
 
@@ -1090,24 +1470,12 @@ def test_invariant_6_b_an_evaluation_limit_stops_the_search_deterministically(tr
 
 def test_invariant_6_c_a_timed_out_proposal_is_never_made_active(trained) -> None:
     """`TIMEOUT` の提案を Gate が active controller にしない。"""
-    base, _profile, _attestation = trained
-    controller, _model, settings = build_controller(
+    controller, _binding, settings = build_controller(
         trained, clock=ScriptedClock(0, 0, 10_000), policy_config=mpc_policy(budget_ms=10)
     )
     result = propose(controller)
-    gate = gate_for(
-        settings,
-        expected_model_version=base.manifest.model_version,
-        expected_artifact_sha256=_attestation.artifact_sha256,
-    )
 
-    selection = gate.select(
-        now_mono_ms=0,
-        fallback=fallback_proposal(0.4),
-        learned=result.to_status(received_at_mono_ms=0),
-        operating_mode=OperatingMode.AUTO,
-        safety_state=SafetyState.NORMAL,
-    )
+    selection = select_with(settings, trained.attestation, result)
 
     assert selection.active_controller is ControllerKind.FALLBACK
     assert selection.fallback_reason is not None
@@ -1119,11 +1487,12 @@ def test_invariant_6_c_a_timed_out_proposal_is_never_made_active(trained) -> Non
 # ---------------------------------------------------------------- 不変条件 7 / 12: 失敗と入力
 
 
-def test_invariant_7_a_a_model_exception_becomes_a_failure_not_a_crash(trained) -> None:
+def test_invariant_7_a_a_model_exception_becomes_a_failure_not_a_crash(
+    trained, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """内部モデルが落ちても**制御ループを落とさない**（AGENTS.md ルール4）。"""
-    base, _profile, _attestation = trained
-    broken = PlanningModel(base, plan_error=ValueError("model exploded"))
-    controller, _model, _settings = build_controller(trained, model=broken)
+    break_predict_plan(monkeypatch, ValueError("model exploded"))
+    controller, _binding, _settings = build_controller(trained)
 
     result = propose(controller)
 
@@ -1135,7 +1504,7 @@ def test_invariant_7_a_a_model_exception_becomes_a_failure_not_a_crash(trained) 
 
 def test_invariant_7_b_the_worker_keeps_running_after_a_failed_tick(trained) -> None:
     """失敗した次の tick は**通常どおり提案できる**。"""
-    controller, _model, _settings = build_controller(trained)
+    controller, _binding, _settings = build_controller(trained)
     broken = propose(controller, ts_ms=0)
     assert broken.failure is LearnedFailure.OPTIMIZER_EXCEPTION
 
@@ -1146,7 +1515,7 @@ def test_invariant_7_b_the_worker_keeps_running_after_a_failed_tick(trained) -> 
 
 def test_invariant_12_a_a_window_from_another_time_is_refused(trained) -> None:
     """**MPC は別時刻の Telemetry を使わない**（#102 の共通入力を守る）。"""
-    controller, _model, _settings = build_controller(trained)
+    controller, _binding, _settings = build_controller(trained)
 
     result = propose(controller, ts_ms=ACTION_TS_MS + 1_000)
 
@@ -1161,8 +1530,7 @@ def test_invariant_12_a_a_window_from_another_time_is_refused(trained) -> None:
 
 def test_invariant_8_a_an_ood_input_is_handed_to_the_gate_as_ood(trained) -> None:
     """学習範囲の外の入力は **OOD として Gate へ渡る**。提案の数値も判定と揃う。"""
-    base, _profile, _attestation = trained
-    controller, _model, settings = build_controller(trained)
+    controller, _binding, settings = build_controller(trained)
     ood_window = shifted(observed_input(), air=200.0)
 
     result = propose(controller, observed=ood_window)
@@ -1172,19 +1540,7 @@ def test_invariant_8_a_an_ood_input_is_handed_to_the_gate_as_ood(trained) -> Non
     assert result.proposal.ood is True
     assert result.proposal.confidence == 0.0
 
-    gate = gate_for(
-        settings,
-        expected_model_version=base.manifest.model_version,
-        expected_artifact_sha256=_attestation.artifact_sha256,
-    )
-    selection = gate.select(
-        now_mono_ms=0,
-        fallback=fallback_proposal(0.4),
-        learned=result.to_status(received_at_mono_ms=0),
-        operating_mode=OperatingMode.AUTO,
-        safety_state=SafetyState.NORMAL,
-    )
-
+    selection = select_with(settings, trained.attestation, result)
     assert selection.fallback_reason is not None
     assert selection.fallback_reason.code == FallbackCause.OOD.value
     assert selection.model_gate is not None
@@ -1198,7 +1554,7 @@ def test_invariant_8_b_an_inflated_confidence_cannot_be_written_into_the_proposa
     trained,
 ) -> None:
     """**提案が判定より高い confidence を名乗れない。** 名乗れば型が拒む。"""
-    controller, _model, _settings = build_controller(trained)
+    controller, _binding, _settings = build_controller(trained)
     result = propose(controller)
     assert result.proposal is not None
 
@@ -1209,23 +1565,11 @@ def test_invariant_8_b_an_inflated_confidence_cannot_be_written_into_the_proposa
 
 def test_invariant_8_c_a_shadow_stage_records_the_proposal_without_selecting_it(trained) -> None:
     """Shadow Mode は**実機を操作せず提案だけを記録する**。"""
-    base, _profile, _attestation = trained
     settings = mpc_policy(authority="shadow")
-    controller, _model, _settings = build_controller(trained, policy_config=settings)
+    controller, _binding, _settings = build_controller(trained, policy_config=settings)
     result = propose(controller)
-    gate = gate_for(
-        settings,
-        expected_model_version=base.manifest.model_version,
-        expected_artifact_sha256=_attestation.artifact_sha256,
-    )
 
-    selection = gate.select(
-        now_mono_ms=0,
-        fallback=fallback_proposal(0.4),
-        learned=result.to_status(received_at_mono_ms=0),
-        operating_mode=OperatingMode.AUTO,
-        safety_state=SafetyState.NORMAL,
-    )
+    selection = select_with(settings, trained.attestation, result)
 
     assert selection.active_controller is ControllerKind.FALLBACK
     assert selection.model_gate is not None
@@ -1234,14 +1578,50 @@ def test_invariant_8_c_a_shadow_stage_records_the_proposal_without_selecting_it(
     assert selection.model_gate.limits == ()
 
 
+def test_invariant_8_d_a_held_anchor_outside_the_step_support_is_ood(tmp_path: Path) -> None:
+    """**anchor 推論の held の列が step ごとの support の外なら `support` の OOD**（0084 §2.1）。
+
+    demand 0.45 を step 0 でだけ観測した Profile では、いま 0.45 が掛かっている anchor 推論の
+    held の列（全 step 0.45）は遅い step で support の外になる。anchor action の fan range と
+    support cell には入っている（0050 の既存の判定だけなら通る）入力で確かめる。
+    """
+    early_only = make_artifact(
+        tmp_path / "early-only",
+        support=action_support(
+            steps=(
+                (ranges(0.0, 1.0), CELLS),
+                (ranges(0.0, 0.4), CELLS),
+                (ranges(0.0, 0.4), CELLS),
+            )
+        ),
+    )
+    controller, _binding, settings = build_controller(early_only)
+
+    result = propose(controller)
+
+    assert result.assessment is not None and result.assessment.ood is True
+    support = next(
+        item for item in result.assessment.components if item.component.value == "support"
+    )
+    assert support.ood is True
+    assert "step=1" in support.detail
+    fan_range = next(
+        item for item in result.assessment.components if item.component.value == "fan_state_range"
+    )
+    assert fan_range.ood is False
+    selection = select_with(settings, early_only.attestation, result)
+    assert selection.active_controller is ControllerKind.FALLBACK
+    assert selection.fallback_reason is not None
+    assert selection.fallback_reason.code == FallbackCause.OOD.value
+
+
 # ---------------------------------------------------------------- 不変条件 9 / 10: 再現性と改善
 
 
 def test_invariant_9_a_the_same_inputs_give_the_same_proposal(trained) -> None:
     """同じ Snapshot / window / model / 設定 / 時計から**同じ提案**が出る（replay 再現性）。"""
-    base, _profile, _attestation = trained
-    first_controller, _first_model, _ = build_controller(trained, model=PlanningModel(base))
-    second_controller, _second_model, _ = build_controller(trained, model=PlanningModel(base))
+    first_controller, _first, _ = build_controller(trained)
+    second_controller, _second, _ = build_controller(trained)
 
     first = propose(first_controller)
     second = propose(second_controller)
@@ -1250,30 +1630,32 @@ def test_invariant_9_a_the_same_inputs_give_the_same_proposal(trained) -> None:
     assert first.proposal.model_dump_json() == second.proposal.model_dump_json()
     assert first.solution is not None and second.solution is not None
     assert first.solution.model_dump_json() == second.solution.model_dump_json()
+    assert first.result_digest() == second.result_digest()
 
 
 def test_invariant_10_a_the_chosen_plan_is_never_worse_than_the_baseline(trained) -> None:
     """採用する解は内部モデルの上で **Baseline 以下のコスト**。探索は Baseline から始める。"""
-    controller, _model, _settings = build_controller(trained, acoustic=True)
+    controller, _binding, _settings = build_controller(trained, acoustic=True)
 
     result = propose(controller, baseline=0.3)
 
     assert result.solution is not None
     assert result.solution.cost.total <= result.solution.baseline_cost.total
     # Baseline 自身も制約に収める。下げる速さは safety.ramp_down_per_s（0.1/s）× step（1s）。
+    # 観測 window の action は dataset のまま（0.45）。
     assert result.solution.baseline_requested == demands(0.35)
 
 
 def test_invariant_10_b_the_optimizer_improves_the_total_cost_over_the_baseline(trained) -> None:
     """予測温度が target band を超えている状況では、Baseline より**総合コストを下げる**。"""
-    controller, _model, _settings = build_controller(trained, acoustic=True)
+    controller, _binding, _settings = build_controller(trained, acoustic=True)
 
     result = propose(controller, baseline=0.3)
 
     assert result.solution is not None
     assert result.solution.improvement > 0.0
     # 温度が高い局面なので、より強い冷却を選ぶ（音響と変化のコストを払ってでも）。
-    assert result.solution.requested.front > 0.3
+    assert result.solution.requested.front > 0.35
     assert result.solution.cost.terms.gpu_temperature < (
         result.solution.baseline_cost.terms.gpu_temperature
     )
@@ -1281,14 +1663,16 @@ def test_invariant_10_b_the_optimizer_improves_the_total_cost_over_the_baseline(
 
 def test_invariant_10_c_the_acoustic_term_pulls_the_solution_back(trained) -> None:
     """音響コストを入れると**同じ入力でもより静かな解**を選ぶ。項が効いていることを示す。"""
-    loud_controller, _loud_model, _ = build_controller(trained, acoustic=False)
-    quiet_controller, _quiet_model, _ = build_controller(trained, acoustic=True)
+    loud_controller, _loud, _ = build_controller(trained, acoustic=False)
+    quiet_controller, _quiet, _ = build_controller(trained, acoustic=True)
 
     loud = propose(loud_controller, baseline=0.3)
     quiet = propose(quiet_controller, baseline=0.3)
 
     assert loud.solution is not None and quiet.solution is not None
-    assert quiet.solution.requested.front <= loud.solution.requested.front
+    assert sum(quiet.solution.requested.get(zone) for zone in Zone) < sum(
+        loud.solution.requested.get(zone) for zone in Zone
+    )
 
 
 # ---------------------------------------------------------------- 不変条件 11: 迂回路を作らない
@@ -1343,43 +1727,35 @@ def test_invariant_11_b_the_mpc_package_never_names_pwm_or_effective_demand() ->
     assert offenders == []
 
 
-def test_the_optimizer_refuses_a_model_whose_horizons_miss_the_control_steps(trained) -> None:
-    """設定した control step を**覆えないモデル**は生成時に拒む（tick ごとに失敗させない）。"""
-    base, _profile, attestation = trained
-    settings = mpc_policy(step_ms=_provisional(7_000), horizon_ms=_provisional(7_000))
-    binding = MpcModelBinding.for_control(
-        PlanningModel(base),
-        attestation=attestation,
-        authority_stage=settings.authority_stage,
-        expected_model_version=attestation.version,
-    )
+def test_the_optimizer_refuses_a_grid_other_than_the_action_schema(trained) -> None:
+    """**`mpc.optimizer` の格子は action schema と完全に一致させる**（0079 §2.4）。
 
-    with pytest.raises(MpcModelUnusableError, match="horizon"):
-        LearnedMpcOptimizer(
-            binding,
-            settings.mpc.optimizer,
-            MpcCostModel(settings.mpc.optimizer),
-            budget_ms=settings.mpc.budget_ms,
-            monotonic_ms=ScriptedClock(0),
-        )
+    補間・外挿・丸めをしないので、合わない設定は生成時に拒む（tick ごとに失敗させない）。
+    """
+    binding = bind(trained)
+    for settings in (
+        mpc_policy(step_ms=_provisional(7_000), horizon_ms=_provisional(7_000)),
+        mpc_policy(horizon_ms=_provisional(2_000)),
+    ):
+        with pytest.raises(MpcModelUnusableError, match="格子"):
+            LearnedMpcOptimizer(
+                binding,
+                settings.mpc.optimizer,
+                MpcCostModel(settings.mpc.optimizer),
+                budget_ms=settings.mpc.budget_ms,
+                monotonic_ms=ScriptedClock(0),
+            )
 
 
 def test_the_optimizer_refuses_a_model_that_cannot_predict_the_cost_metrics(trained) -> None:
     """目的関数が必要とする metric を**予測できないモデル**も生成時に拒む。"""
-    base, _profile, attestation = trained
     settings = mpc_policy(
         cost_metrics={"cpu_temperature": "air.front_intake", "gpu_temperature": GPU}
-    )
-    binding = MpcModelBinding.for_control(
-        PlanningModel(base),
-        attestation=attestation,
-        authority_stage=settings.authority_stage,
-        expected_model_version=attestation.version,
     )
 
     with pytest.raises(MpcModelUnusableError, match="metric"):
         LearnedMpcOptimizer(
-            binding,
+            bind(trained),
             settings.mpc.optimizer,
             MpcCostModel(settings.mpc.optimizer),
             budget_ms=settings.mpc.budget_ms,
@@ -1393,24 +1769,23 @@ def test_the_whole_chain_hands_a_bounded_request_to_the_guard(trained) -> None:
     ここで作れるのは `requested` までで、この先の Reactive Guard（#80）と
     Critical Safety（#78）は毎 tick 必ず掛かる。
     """
-    _base, profile, attestation = trained
     settings = mpc_policy(max_step_up=_provisional(0.1))
-    controller, _model, _ = build_controller(trained, policy_config=settings, acoustic=True)
+    controller, _binding, _ = build_controller(trained, policy_config=settings, acoustic=True)
     result = propose(
         controller,
-        residual=evidence(profile, 0.5, 10, at=ACTION_TS_MS),
+        residual=evidence(trained.profile, 0.5, 10, at=ACTION_TS_MS),
         safety_floor=0.3,
     )
     assert result.proposal is not None
     assert result.assessment is not None
     assert result.assessment.ood is False
 
+    # 復帰 hold を満たすため、健全なまま2 tick 進める（#79）。
     gate = gate_for(
         settings,
-        expected_model_version=attestation.version,
-        expected_artifact_sha256=attestation.artifact_sha256,
+        expected_model_version=trained.attestation.version,
+        expected_artifact_sha256=trained.attestation.artifact_sha256,
     )
-    # 復帰 hold を満たすため、健全なまま2 tick 進める（#79）。
     for now_mono_ms in (0, settings.recovery_hold_ms):
         selection = gate.select(
             now_mono_ms=now_mono_ms,
@@ -1613,18 +1988,18 @@ def test_a_prediction_without_the_cost_metrics_is_refused(trained) -> None:
 
 
 def _plan_prediction(
-    trained: Trained,
+    trained: MpcArtifact,
     settings: FanPolicyConfig,
 ) -> tuple[ActionPlan, PlanPrediction]:
     """コスト単体の試験に使う plan と、その plan に対する予測。"""
-    base, _profile, _attestation = trained
-    model = PlanningModel(base)
     plan = ActionPlan.held(
         demands(0.5),
         step_ms=settings.mpc.optimizer.step_ms.value,
         steps=settings.mpc.optimizer.steps,
     )
-    return plan, model.predict_plan(PlannedThermalInput(observed=observed_input(), plan=plan))
+    return plan, bind(trained).predict_plan(
+        PlannedThermalInput(observed=observed_input(), plan=plan)
+    )
 
 
 # ------------------------------------------- codex レビュー（PR #151）への修正の回帰試験
@@ -1639,16 +2014,12 @@ def _plan_prediction(
         MemoryError("out of memory"),
     ],
 )
-def test_any_ordinary_exception_from_the_model_becomes_a_fallback(trained, error) -> None:
-    """**種類を問わず、worker 境界の外へ例外を出さない**（codex #4055491980）。
-
-    `ValueError` 系だけを捕まえると、`control/model/thermal.py` が内部の feature layout 異常に
-    使う `RuntimeError` などが素通りして制御ループごと死ぬ。
-    """
-    base, _profile, _attestation = trained
-    controller, _model, _settings = build_controller(
-        trained, model=PlanningModel(base, plan_error=error)
-    )
+def test_any_ordinary_exception_from_the_model_becomes_a_fallback(
+    trained, error, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """**種類を問わず、worker 境界の外へ例外を出さない**（codex #4055491980）。"""
+    break_predict_plan(monkeypatch, error)
+    controller, _binding, _settings = build_controller(trained)
 
     result = propose(controller)
 
@@ -1666,23 +2037,20 @@ def _expected_reason_code(name: str) -> str:
 
 
 @pytest.mark.parametrize("escape", [KeyboardInterrupt, SystemExit])
-def test_base_exceptions_still_propagate_from_the_worker(trained, escape) -> None:
+def test_base_exceptions_still_propagate_from_the_worker(
+    trained, escape, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """**停止の合図は握りつぶさない。** `BaseException` は worker 境界を素通りする。"""
-    base, _profile, _attestation = trained
-    controller, _model, _settings = build_controller(
-        trained, model=PlanningModel(base, plan_error=escape())
-    )
+    break_predict_plan(monkeypatch, escape())
+    controller, _binding, _settings = build_controller(trained)
 
     with pytest.raises(escape):
         propose(controller)
 
 
 def test_the_budget_is_rechecked_after_the_baseline_evaluation(trained) -> None:
-    """**Baseline の評価だけで予算を使い切った tick を OK にしない**（codex #4055491984）。
-
-    候補が1つも無い window では、evaluation を数える打ち切りにも掛からない。
-    """
-    controller, _model, _settings = build_controller(
+    """**Baseline の評価だけで予算を使い切った tick を OK にしない**（codex #4055491984）。"""
+    controller, _binding, _settings = build_controller(
         trained,
         clock=ScriptedClock(0, 10_000),
         policy_config=mpc_policy(budget_ms=10),
@@ -1695,13 +2063,8 @@ def test_the_budget_is_rechecked_after_the_baseline_evaluation(trained) -> None:
     assert result.proposal.optimizer_status is OptimizerStatus.TIMEOUT
 
 
-def test_a_ramp_down_bound_above_the_ceiling_is_infeasible_not_widened(trained) -> None:
-    """**設定した探索 ceiling を MPC 自身が緩めない**（codex #4055491988）。
-
-    forced Max の直後のように直前値が ceiling より上だと、1 step では ceiling まで下げきれない。
-    ここを `[0.9, 0.9]` のような ceiling 超えの単元集合にすると、上限を自分で広げたことになる。
-    """
-    del trained
+def test_a_ramp_down_bound_above_the_ceiling_is_infeasible_not_widened() -> None:
+    """**設定した探索 ceiling を MPC 自身が緩めない**（codex #4055491988）。"""
     settings = mpc_policy(
         max_step_down=_provisional(0.1),
         zone_bounds={
@@ -1718,9 +2081,8 @@ def test_a_ramp_down_bound_above_the_ceiling_is_infeasible_not_widened(trained) 
         )
 
 
-def test_a_floor_above_the_step_up_limit_is_still_allowed(trained) -> None:
+def test_a_floor_above_the_step_up_limit_is_still_allowed() -> None:
     """対になる向き（floor が上げ幅に勝つ）は**実行不能ではない**。floor に合わせる。"""
-    del trained
     settings = mpc_policy(max_step_up=_provisional(0.01), max_step_down=_provisional(0.5))
     constraints = HardConstraintSet.build(
         optimizer=settings.mpc.optimizer,
@@ -1732,29 +2094,16 @@ def test_a_floor_above_the_step_up_limit_is_still_allowed(trained) -> None:
     assert constraints.window(Zone.FRONT) == (pytest.approx(0.9), pytest.approx(0.9))
 
 
-def test_the_worker_failure_detail_reaches_the_fallback_trace(trained) -> None:
+def test_the_worker_failure_detail_reaches_the_fallback_trace(
+    trained, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """**理由を trace の手前で落とさない**（codex #4055491991）。"""
-    base, _profile, attestation = trained
+    break_predict_plan(monkeypatch, RuntimeError("feature layout broken"))
     settings = mpc_policy()
-    controller, _model, _ = build_controller(
-        trained,
-        model=PlanningModel(base, plan_error=RuntimeError("feature layout broken")),
-        policy_config=settings,
-    )
+    controller, _binding, _ = build_controller(trained, policy_config=settings)
     result = propose(controller)
-    gate = gate_for(
-        settings,
-        expected_model_version=attestation.version,
-        expected_artifact_sha256=attestation.artifact_sha256,
-    )
 
-    selection = gate.select(
-        now_mono_ms=0,
-        fallback=fallback_proposal(0.4),
-        learned=result.to_status(received_at_mono_ms=0),
-        operating_mode=OperatingMode.AUTO,
-        safety_state=SafetyState.NORMAL,
-    )
+    selection = select_with(settings, trained.attestation, result)
 
     assert selection.fallback_reason is not None
     assert selection.fallback_reason.code == FallbackCause.OPTIMIZER_EXCEPTION.value
@@ -1765,22 +2114,20 @@ def test_the_worker_failure_detail_reaches_the_fallback_trace(trained) -> None:
     assert "feature layout broken" in str(metadata["detail"])
 
 
-def test_a_status_without_a_failure_cannot_carry_a_failure_reason(trained) -> None:
+def test_a_status_without_a_failure_cannot_carry_a_failure_reason() -> None:
     """失敗していない状態に理由だけを付けられない（trace の読み違いを防ぐ）。"""
-    del trained
     with pytest.raises(ValidationError, match="failure_reason"):
         LearnedControlStatus(failure_reason=Reason(code="made_up"))
 
 
-def test_a_plan_prediction_from_another_artifact_is_rejected(trained) -> None:
-    """**anchor と別の artifact の予測でコストを測らない。**
-
-    版が同じでも、別の bytes の予測を混ぜれば #85 の判定は別の推論に付け替わる。
-    """
-    base, _profile, _attestation = trained
-    controller, _model, _settings = build_controller(
-        trained, model=PlanningModel(base, forged_artifact_sha256="b" * 64)
+def test_a_plan_prediction_from_another_artifact_is_rejected(
+    trained, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """**anchor と別の artifact の予測でコストを測らない。**"""
+    break_predict_plan(
+        monkeypatch, lambda _planned, prediction: rewritten(prediction, artifact_sha256="b" * 64)
     )
+    controller, _binding, _settings = build_controller(trained)
 
     result = propose(controller)
 
@@ -1791,116 +2138,63 @@ def test_a_plan_prediction_from_another_artifact_is_rejected(trained) -> None:
 
 @pytest.mark.parametrize("promoted", [False, True])
 def test_only_the_production_pointer_can_be_bound_for_active_control(
-    trained, tmp_path: Path, promoted: bool
+    tmp_path: Path, promoted: bool
 ) -> None:
-    """**promotion を経ていない artifact に制御権を渡さない**（codex #4055572072）。
+    """**promotion を経ていない artifact に制御権を渡さない**（codex #4055572072）。"""
+    artifact = make_artifact(tmp_path / ("promoted" if promoted else "pinned"), promoted=promoted)
 
-    `load_version()` は Replay / offline 評価のために候補・検証済み・引退も返す。その結果を
-    そのまま controller へ配線できると、人の承認を経ずに active authority を得てしまう。
-    """
-    base, _profile, _attestation = trained
-    attestation = issue_attestation(
-        tmp_path / ("promoted" if promoted else "pinned"),
-        model_id=base.manifest.model_id,
-        version=base.manifest.model_version,
-        promoted=promoted,
-    )
-
-    assert attestation.production_active is promoted
+    assert artifact.attestation.production_active is promoted
     if promoted:
-        assert attestation.status is ArtifactStatus.PRODUCTION
-        binding = MpcModelBinding.for_control(
-            PlanningModel(base),
-            attestation=attestation,
-            authority_stage=AuthorityStage.FULL,
-            expected_model_version=attestation.version,
-        )
-        assert binding.attestation.production_active is True
+        assert artifact.attestation.status is ArtifactStatus.PRODUCTION
+        assert bind(artifact).attestation.production_active is True
         return
 
-    assert attestation.status is ArtifactStatus.VALIDATED
+    assert artifact.attestation.status is ArtifactStatus.VALIDATED
     with pytest.raises(MpcModelUnusableError, match="production pointer"):
-        MpcModelBinding.for_control(
-            PlanningModel(base),
-            attestation=attestation,
-            authority_stage=AuthorityStage.FULL,
-            expected_model_version=attestation.version,
-        )
+        bind(artifact)
 
 
-def test_a_retired_artifact_pinned_by_version_is_refused(trained, tmp_path: Path) -> None:
+def test_a_retired_artifact_pinned_by_version_is_refused(tmp_path: Path) -> None:
     """rollback などで引退した artifact も、version 固定で制御へ戻せない。"""
-    base, _profile, _attestation = trained
     root = tmp_path / "retired"
-    old = issue_attestation(
-        root,
-        model_id=base.manifest.model_id,
-        version=base.manifest.model_version,
-    )
-    assert old.production_active is True
+    old = make_artifact(root)
+    assert old.attestation.production_active is True
 
     # 次の版を promote すると、前の版は production pointer ではなくなる。
-    newer = issue_attestation(
-        root,
-        model_id=base.manifest.model_id,
-        version="0.2.0",
-    )
+    newer = make_artifact(root, version="0.2.0")
     registry = ModelRegistry(root, limits=REGISTRY_LIMITS)
     stale = registry.load_version(
-        ArtifactRef(
-            kind=ArtifactKind.THERMAL_MODEL,
-            model_id=base.manifest.model_id,
-            version=base.manifest.model_version,
-        ),
+        ArtifactRef(kind=ArtifactKind.THERMAL_MODEL, model_id=MODEL_ID, version="0.1.0"),
         ModelCompatibility(
-            feature_schema_version="thermal-features-v1",
-            target_schema_version="thermal-targets-v1",
+            feature_schema_version=old.attestation.feature_schema_version,
+            target_schema_version=old.attestation.target_schema_version,
             authority_stage=AuthorityStage.FULL,
         ),
     )
 
-    assert newer.production_active is True
+    assert newer.attestation.production_active is True
     assert stale.artifact is not None
     assert stale.artifact.attestation.production_active is False
     with pytest.raises(MpcModelUnusableError, match="production pointer"):
-        MpcModelBinding.for_control(
-            PlanningModel(base),
-            attestation=stale.artifact.attestation,
-            authority_stage=AuthorityStage.FULL,
-            expected_model_version=base.manifest.model_version,
-        )
+        bind(MpcArtifact(stale.artifact, root))
 
 
-def test_a_prediction_for_another_candidate_is_rejected(trained) -> None:
-    """**別の候補の予測を今の候補のコストに使わせない**（codex #4055572075）。
-
-    同じ tick の候補は step の刻みが同じなので、時刻だけでは見分けられない。別の demand の
-    温度予測に、今の候補の音響・風量・変化コストを足して選ばせてしまう。
-    """
-    base, _profile, _attestation = trained
-    stale = ActionPlan.held(demands(0.95), step_ms=STEP_MS, steps=len(HORIZONS))
-    controller, _model, settings = build_controller(
-        trained, model=PlanningModel(base, stale_plan=stale)
+def test_a_prediction_for_another_candidate_is_rejected(
+    trained, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """**別の候補の予測を今の候補のコストに使わせない**（codex #4055572075）。"""
+    stale = ActionPlan.held(demands(0.95), step_ms=STEP_MS, steps=STEPS)
+    break_predict_plan(
+        monkeypatch, lambda _planned, prediction: rewritten(prediction, plan_digest=stale.digest())
     )
+    controller, _binding, settings = build_controller(trained)
 
     result = propose(controller)
 
     assert result.solution is None
     assert result.proposal is not None
     assert result.proposal.optimizer_status is OptimizerStatus.ERROR
-
-    gate = gate_for(
-        settings,
-        expected_model_version=_attestation.version,
-        expected_artifact_sha256=_attestation.artifact_sha256,
-    )
-    selection = gate.select(
-        now_mono_ms=0,
-        fallback=fallback_proposal(0.4),
-        learned=result.to_status(received_at_mono_ms=0),
-        operating_mode=OperatingMode.AUTO,
-        safety_state=SafetyState.NORMAL,
-    )
+    selection = select_with(settings, trained.attestation, result)
     assert selection.active_controller is ControllerKind.FALLBACK
 
 
@@ -1924,17 +2218,12 @@ def test_the_plan_digest_covers_the_per_zone_demands() -> None:
     assert first.digest() == ActionPlan.held(demands(0.4), step_ms=STEP_MS, steps=2).digest()
 
 
-def test_an_expired_tick_never_spends_another_model_evaluation(trained) -> None:
-    """**予算を使い切った tick で、さらに1回モデルを回さない**（codex #4055572079）。
-
-    anchor 推論と Confidence 判定だけで予算を越えた場合、`predict_plan()` を1度も呼ばずに
-    `TIMEOUT` を返す。
-    """
-    base, _profile, _attestation = trained
-    model = PlanningModel(base)
-    controller, _model, _settings = build_controller(
+def test_an_expired_tick_never_spends_another_model_evaluation(
+    trained, plan_calls: list[ActionPlan]
+) -> None:
+    """**予算を使い切った tick で、さらに1回モデルを回さない**（codex #4055572079）。"""
+    controller, _binding, _settings = build_controller(
         trained,
-        model=model,
         clock=ScriptedClock(0, 10_000),
         policy_config=mpc_policy(budget_ms=10),
     )
@@ -1944,19 +2233,22 @@ def test_an_expired_tick_never_spends_another_model_evaluation(trained) -> None:
     assert result.solution is None
     assert result.proposal is not None
     assert result.proposal.optimizer_status is OptimizerStatus.TIMEOUT
-    assert model.plan_calls == 0
+    assert plan_calls == []
 
 
-def test_a_model_delegating_to_other_bytes_is_refused(trained) -> None:
-    """**ID と版が同じでも、別の bytes へ委譲する model の推論は使わない**（codex #4055635586）。
+def test_an_anchor_from_other_bytes_is_refused(trained, monkeypatch: pytest.MonkeyPatch) -> None:
+    """**ID と版が同じでも、別の bytes の anchor 推論は使わない**（codex #4055635586）。"""
+    original = MpcModelBinding.predict
 
-    Registry が承認したのは特定の bytes である。ID と版と schema version だけを合わせた
-    別 artifact が、production の証拠の下で提案を出せてはならない。
-    """
-    base, _profile, attestation = trained
-    controller, _model, settings = build_controller(
-        trained, model=PlanningModel(base, forged_anchor_sha256="c" * 64)
-    )
+    def other_bytes(self: MpcModelBinding, observed: ObservedThermalInput) -> ThermalPrediction:
+        prediction = original(self, observed)
+        return ThermalPrediction.model_validate(
+            prediction.model_dump(mode="python") | {"artifact_sha256": "c" * 64}
+        )
+
+    monkeypatch.setattr(MpcModelBinding, "predict", other_bytes)
+    settings = mpc_policy()
+    controller, _binding, _ = build_controller(trained, policy_config=settings)
 
     result = propose(controller)
 
@@ -1964,66 +2256,17 @@ def test_a_model_delegating_to_other_bytes_is_refused(trained) -> None:
     assert result.failure is LearnedFailure.OPTIMIZER_EXCEPTION
     assert result.failure_reason is not None
     assert "artifact_sha256" in result.failure_reason.detail
-
-    gate = gate_for(
-        settings,
-        expected_model_version=attestation.version,
-        expected_artifact_sha256=attestation.artifact_sha256,
-    )
-    selection = gate.select(
-        now_mono_ms=0,
-        fallback=fallback_proposal(0.4),
-        learned=result.to_status(received_at_mono_ms=0),
-        operating_mode=OperatingMode.AUTO,
-        safety_state=SafetyState.NORMAL,
-    )
+    selection = select_with(settings, trained.attestation, result)
     assert selection.active_controller is ControllerKind.FALLBACK
     assert "artifact_sha256" in selection.fallback_reason.detail  # type: ignore[union-attr]
 
 
-def test_an_anchor_from_another_model_version_is_refused(trained, tmp_path: Path) -> None:
-    """anchor の model 版が Registry の証拠と違えば、判定を付ける前に落とす。"""
-    base, profile, _attestation = trained
-    attestation = issue_attestation(
-        tmp_path / "other-version",
-        model_id=base.manifest.model_id,
-        version="0.2.0",
-        payload=canonical_artifact_bytes(base._artifact),
-    )
-    binding = MpcModelBinding.for_control(
-        PlanningModel(base, model_version="0.2.0"),
-        attestation=attestation,
-        authority_stage=AuthorityStage.FULL,
-        expected_model_version=attestation.version,
-    )
-    settings = mpc_policy()
-    # Profile は 0.1.0 に対して作ったので、生成時の照合で落ちる（tick ごとに失敗させない）。
-    with pytest.raises(MpcModelUnusableError, match="Confidence Profile"):
-        LearnedMpcController(
-            binding,
-            settings,
-            safety(),
-            assessor=ConfidenceAssessor(profile, settings.model_confidence),
-            monotonic_ms=ScriptedClock(0),
-            authority=StaticAuthorityStage(AuthorityStage.FULL),
-        )
-
-
 def test_the_binding_must_cover_the_effective_authority_stage(trained) -> None:
-    """**Registry が SHADOW だけを許した artifact を、より高い実効 stage で動かさない。**
+    """**Registry が SHADOW だけを許した束縛を、より高い実効 stage で動かさない。**
 
-    照合の相手は設定の `authority_stage` ではなく**実効 stage**（#92 / 0057 §2.2、
-    codex #4056864031）。設定は v9 から上限なので、上限と照合すると
-    「journal は SHADOW、上限は LIMITED」の初回昇格で SHADOW 互換の artifact が拒まれ、
-    新しい設定での証拠を1件も集められなくなる。
+    照合の相手は設定の `authority_stage` ではなく**実効 stage**（#92 / 0057 §2.2）。
     """
-    base, profile, attestation = trained
-    shadow_binding = MpcModelBinding.for_control(
-        PlanningModel(base),
-        attestation=attestation,
-        authority_stage=AuthorityStage.SHADOW,
-        expected_model_version=attestation.version,
-    )
+    shadow_binding = bind(trained, authority_stage=AuthorityStage.SHADOW)
     full_policy = mpc_policy(authority="full")
 
     with pytest.raises(MpcModelUnusableError, match="authority stage"):
@@ -2031,19 +2274,16 @@ def test_the_binding_must_cover_the_effective_authority_stage(trained) -> None:
             shadow_binding,
             full_policy,
             safety(),
-            assessor=ConfidenceAssessor(profile, full_policy.model_confidence),
             monotonic_ms=ScriptedClock(0),
             authority=StaticAuthorityStage(AuthorityStage.FULL),
         )
 
-    # **上限が LIMITED でも、journal が SHADOW なら SHADOW 互換の artifact は動く。**
-    # ここが通らないと、昇格に要る証拠を集める運転そのものが始められない。
+    # **上限が LIMITED でも、journal が SHADOW なら SHADOW 互換の束縛は動く。**
     limited_ceiling = mpc_policy(authority="limited")
     controller = LearnedMpcController(
         shadow_binding,
         limited_ceiling,
         safety(),
-        assessor=ConfidenceAssessor(profile, limited_ceiling.model_confidence),
         monotonic_ms=ScriptedClock(0),
         authority=StaticAuthorityStage(AuthorityStage.SHADOW),
     )
@@ -2051,18 +2291,8 @@ def test_the_binding_must_cover_the_effective_authority_stage(trained) -> None:
 
 
 def test_a_raised_stage_stops_a_binding_that_no_longer_covers_it(trained) -> None:
-    """**昇格のあと、束縛の覆っていない stage で提案を出し続けない。**
-
-    worker は生成時にしか照合しないと、`AuthorityStore` が stage を上げた瞬間から
-    「検証していない authority で作られた提案」を Gate へ渡すことになる。tick ごとに見る。
-    """
-    base, profile, attestation = trained
-    binding = MpcModelBinding.for_control(
-        PlanningModel(base),
-        attestation=attestation,
-        authority_stage=AuthorityStage.SHADOW,
-        expected_model_version=attestation.version,
-    )
+    """**昇格のあと、束縛の覆っていない stage で提案を出し続けない。**"""
+    binding = bind(trained, authority_stage=AuthorityStage.SHADOW)
     settings = mpc_policy(authority="limited")
 
     class Rising:
@@ -2079,7 +2309,6 @@ def test_a_raised_stage_stops_a_binding_that_no_longer_covers_it(trained) -> Non
         binding,
         settings,
         safety(),
-        assessor=ConfidenceAssessor(profile, settings.model_confidence),
         monotonic_ms=ScriptedClock(0),
         authority=authority,
     )
@@ -2094,62 +2323,54 @@ def test_a_raised_stage_stops_a_binding_that_no_longer_covers_it(trained) -> Non
     assert "authority" in result.failure_reason.detail
 
 
-def test_a_confidence_assessor_from_another_policy_is_refused(trained) -> None:
-    """閾値だけがすり替わった判定器を受け取らない（同じ種類の取り違え）。"""
-    base, profile, attestation = trained
-    settings = mpc_policy()
-    other = settings.model_confidence.model_copy(
-        update={
-            "high_min_confidence": settings.model_confidence.high_min_confidence.model_copy(
-                update={"value": 0.99}
-            )
-        }
-    )
-    binding = MpcModelBinding.for_control(
-        PlanningModel(base),
-        attestation=attestation,
-        authority_stage=settings.authority_stage,
-        expected_model_version=attestation.version,
-    )
+def test_the_confidence_assessor_follows_the_runtime_policy(trained) -> None:
+    """判定器は**runtime の `model_confidence` と同梱 Profile から**作られる（0079 §2.4）。
 
-    with pytest.raises(MpcModelUnusableError, match="Confidence 判定器"):
-        LearnedMpcController(
-            binding,
-            settings,
-            safety(),
-            assessor=ConfidenceAssessor(profile, other),
-            monotonic_ms=ScriptedClock(0),
-            authority=StaticAuthorityStage(settings.authority_stage),
-        )
+    閾値だけがすり替わった判定器を渡す口そのものが無い。
+    """
+    settings = mpc_policy()
+    other = policy(
+        authority="full",
+        high_min_confidence=0.95,
+        mpc={
+            "period_ms": 1_000,
+            "budget_ms": 1_000,
+            "valid_ms": 2_000,
+            "optimizer": optimizer_document(),
+        },
+    )
+    controller, _binding, _ = build_controller(trained, policy_config=settings)
+    stricter, _binding, _ = build_controller(trained, policy_config=other)
+
+    assert controller.conditions()["model_confidence"] == settings.model_confidence.model_dump(
+        mode="json"
+    )
+    assert stricter.conditions()["model_confidence"] == other.model_confidence.model_dump(
+        mode="json"
+    )
+    assert controller.conditions()["confidence_profile_sha256"] == trained.profile.sha256()
 
 
 ATTESTATION_FIELD_CHECKS: dict[str, str] = {
-    "kind": "for_control: thermal_model 以外を拒む",
-    "capability": "for_control: 反実仮想を申告していない artifact を拒む / 自称と照合",
-    "model_id": "for_control: identity と照合 / _check_anchor: anchor と照合",
-    "version": "for_control: identity と期待版 / _check_anchor / _check_prediction",
-    "artifact_sha256": "_check_anchor: anchor と照合 / 生成時: Confidence Profile と照合",
-    "feature_schema_version": "for_control: model.feature_schema と照合",
-    "target_schema_version": "for_control: model.target_schema と照合",
-    "authority_compatibility": "for_control: 要求 stage が含まれるか",
-    "status": "for_control: production_active と一緒に判断",
-    "production_active": "for_control: production pointer 以外を拒む",
+    "kind": "from_verified_artifact: L1 / thermal_model 以外を拒む",
+    "capability": "from_verified_artifact: L1 / 反実仮想を申告していない artifact を拒む",
+    "model_id": "L5 / _check_model_matches_attestation / _check_anchor: anchor と照合",
+    "version": "L5 / 期待版 / _check_anchor / _check_prediction",
+    "artifact_sha256": "L1（bytes の SHA-256）/ _check_anchor / 判定器の model binding",
+    "feature_schema_version": "L5 / model.feature_schema と照合",
+    "target_schema_version": "L5 / model.target_schema と照合",
+    "authority_compatibility": "L5 / from_verified_artifact: 要求 stage が含まれるか",
+    "status": "from_verified_artifact: production_active と一緒に判断",
+    "production_active": "from_verified_artifact: production pointer 以外を拒む",
     "model_version": "trace 用の派生値（model_id@version）。個別の照合は上の2つ",
     "registry_revision": "trace のみ。推論時に対応する申告が無い",
     "trace_metadata": "trace 出力（#82）",
 }
-"""attestation が持つ値ごとに、**どこで模型の申告と突き合わせているか**。
-
-新しい値を #104 が足したときに、照合を書き忘れたまま通らないようにする。
-"""
+"""attestation が持つ値ごとに、**どこで模型の申告と突き合わせているか**。"""
 
 
 def test_every_attested_value_has_a_place_where_it_is_compared() -> None:
-    """**証拠に載っている値を、照合しないまま増やさない。**
-
-    attestation の公開項目が増えたらこの試験が落ちる。落ちたら、その値を推論時の申告と
-    突き合わせる場所を決めてから表に足す（決定記録 0052 §2.1）。
-    """
+    """**証拠に載っている値を、照合しないまま増やさない**（決定記録 0052 §2.1）。"""
     public = {name for name in dir(ArtifactAttestation) if not name.startswith("_")}
 
     assert public == set(ATTESTATION_FIELD_CHECKS)
@@ -2159,51 +2380,31 @@ def test_the_policy_values_with_a_binding_counterpart_are_compared(trained) -> N
     """運転設定と束縛の対応を、生成時にすべて突き合わせていること。
 
     - **実効 authority stage**（#92。設定の `authority_stage` は上限）↔ `binding.authority_stage`
-    - `model_confidence` ↔ 判定器の設定
-    - `mpc.optimizer` の horizon / step / cost_metrics ↔ model の target schema
+    - `mpc.optimizer` の格子・cost_metrics ↔ model の action / target schema
     """
-    base, profile, attestation = trained
     settings = mpc_policy()
-    binding = MpcModelBinding.for_control(
-        PlanningModel(base),
-        attestation=attestation,
-        authority_stage=settings.authority_stage,
-        expected_model_version=attestation.version,
-    )
+    binding = bind(trained, authority_stage=settings.authority_stage)
 
     def build(
         policy_config: FanPolicyConfig,
         *,
         stage: AuthorityStage | None = None,
+        with_binding: MpcModelBinding = binding,
     ) -> LearnedMpcController:
         return LearnedMpcController(
-            binding,
+            with_binding,
             policy_config,
             safety(),
-            assessor=ConfidenceAssessor(profile, policy_config.model_confidence),
             monotonic_ms=ScriptedClock(0),
             authority=StaticAuthorityStage(stage or policy_config.authority_stage),
         )
 
     assert build(settings) is not None
-    # 束縛は settings の stage（full）。低い実効 stage は通り、覆えない stage は拒む。
     assert build(mpc_policy(authority="shadow"), stage=AuthorityStage.SHADOW) is not None
-    shadow_binding = MpcModelBinding.for_control(
-        PlanningModel(base),
-        attestation=attestation,
-        authority_stage=AuthorityStage.SHADOW,
-        expected_model_version=attestation.version,
-    )
+    shadow_binding = bind(trained, authority_stage=AuthorityStage.SHADOW)
     with pytest.raises(MpcModelUnusableError, match="authority stage"):
-        LearnedMpcController(
-            shadow_binding,
-            settings,
-            safety(),
-            assessor=ConfidenceAssessor(profile, settings.model_confidence),
-            monotonic_ms=ScriptedClock(0),
-            authority=StaticAuthorityStage(AuthorityStage.EXPANDED),
-        )
-    with pytest.raises(MpcModelUnusableError, match="horizon"):
+        build(settings, stage=AuthorityStage.EXPANDED, with_binding=shadow_binding)
+    with pytest.raises(MpcModelUnusableError, match="格子"):
         build(mpc_policy(step_ms=_provisional(7_000), horizon_ms=_provisional(7_000)))
     with pytest.raises(MpcModelUnusableError, match="metric"):
         build(
@@ -2211,58 +2412,8 @@ def test_the_policy_values_with_a_binding_counterpart_are_compared(trained) -> N
         )
 
 
-def test_the_capability_comes_from_the_registry_not_from_the_model(trained, tmp_path: Path) -> None:
-    """**自称の capability では束縛できない**（codex #4055686513）。
-
-    #104 の metadata と attestation が capability を持つようになったので、推論器がいくら
-    `counterfactual_action` を名乗っても、登録時の申告が `observational_replay` なら拒否される。
-    現行の #84 artifact はすべてこちらなので、**いまは常に拒否されるのが期待どおりの結果**である。
-    """
-    base, _profile, _attestation = trained
-    observational = issue_attestation(
-        tmp_path / "observational",
-        model_id=base.manifest.model_id,
-        version=base.manifest.model_version,
-        capability=ArtifactCapability.OBSERVATIONAL_REPLAY,
-        payload=canonical_artifact_bytes(base._artifact),
-    )
-
-    # 自称だけ counterfactual に書き換えても通らない。
-    with pytest.raises(MpcModelUnusableError, match="反実仮想予測を申告していない"):
-        MpcModelBinding.for_control(
-            PlanningModel(base, capability=InferenceCapability.COUNTERFACTUAL_ACTION),
-            attestation=observational,
-            authority_stage=AuthorityStage.FULL,
-            expected_model_version=observational.version,
-        )
-
-
-def test_a_model_contradicting_the_attested_capability_is_refused(trained, tmp_path: Path) -> None:
-    """attested と自称が食い違う model も拒む（どちらが正かを黙って決めない）。"""
-    base, _profile, _attestation = trained
-    counterfactual = issue_attestation(
-        tmp_path / "counterfactual",
-        model_id=base.manifest.model_id,
-        version=base.manifest.model_version,
-        capability=ArtifactCapability.COUNTERFACTUAL_ACTION,
-        payload=canonical_artifact_bytes(base._artifact),
-    )
-
-    with pytest.raises(MpcModelUnusableError, match="食い違っている"):
-        MpcModelBinding.for_control(
-            PlanningModel(base, capability=InferenceCapability.OBSERVATIONAL_REPLAY),
-            attestation=counterfactual,
-            authority_stage=AuthorityStage.FULL,
-            expected_model_version=counterfactual.version,
-        )
-
-
 def test_the_configured_step_limit_cannot_exceed_the_prediction_contract() -> None:
-    """**設定の上限を、予測の契約より大きくしない**（codex #4055686520）。
-
-    内部モデルの target schema と plan prediction は 32 horizon までしか表現できない。
-    設定だけが 64 step を通すと、検証に通っても決して動かない組み合わせを作れてしまう。
-    """
+    """**設定の上限を、予測の契約より大きくしない**（codex #4055686520）。"""
     assert MAX_MPC_HORIZON_STEPS <= MAX_TARGET_HORIZONS
     assert MAX_MPC_HORIZON_STEPS == 32
 
@@ -2283,17 +2434,10 @@ def test_the_configured_step_limit_cannot_exceed_the_prediction_contract() -> No
 
 
 def test_the_rate_limit_origin_comes_from_the_observed_action(trained) -> None:
-    """**変化幅の起点を呼び出し側から受け取らない**（codex #4055749781）。
-
-    anchor が見ている action と違う値を渡せると、rate limit と変化コストだけが別の前提で
-    計算される。起点は観測 window の action（= いま実際に掛かっている effective demand）から取る。
-    """
-    import inspect
-
-    controller, _model, settings = build_controller(trained)
+    """**変化幅の起点を呼び出し側から受け取らない**（codex #4055749781）。"""
+    controller, _binding, settings = build_controller(trained)
     signature = inspect.signature(controller.propose)
 
-    # 渡す口が無いこと自体を固定する（将来また受け取り始めたら落ちる）。
     assert "current_demand" not in signature.parameters
 
     applied = 0.45
@@ -2301,7 +2445,6 @@ def test_the_rate_limit_origin_comes_from_the_observed_action(trained) -> None:
     result = propose(controller, observed=window, safety_floor=0.2)
     assert result.solution is not None
 
-    # 起点が window の action なら、許される範囲は applied を中心にした帯になる。
     constraints = HardConstraintSet.build(
         optimizer=settings.mpc.optimizer,
         safety=safety(),
@@ -2315,19 +2458,14 @@ def test_the_rate_limit_origin_comes_from_the_observed_action(trained) -> None:
 
 
 def test_a_window_action_outside_the_search_bounds_fails_closed(trained) -> None:
-    """window の action が探索 ceiling より上なら、勝手に広げず実行不能にする。
-
-    起点を window から取るので、`HardConstraintSet` の交わりの規則がそのまま効く。
-    """
-    base, _profile, _attestation = trained
+    """window の action が探索 ceiling より上なら、勝手に広げず実行不能にする。"""
     settings = mpc_policy(
         max_step_down=_provisional(0.1),
         zone_bounds={
             zone.value: {"floor": _provisional(0.2), "ceiling": _provisional(0.5)} for zone in Zone
         },
     )
-    controller, _model, _ = build_controller(trained, policy_config=settings)
-    del base
+    controller, _binding, _ = build_controller(trained, policy_config=settings)
 
     result = propose(controller, observed=observed_input(1.0), safety_floor=0.2)
 
@@ -2335,3 +2473,369 @@ def test_a_window_action_outside_the_search_bounds_fails_closed(trained) -> None
     assert result.failure is LearnedFailure.OPTIMIZER_EXCEPTION
     assert result.failure_reason is not None
     assert "ceiling" in result.failure_reason.detail
+
+
+# ------------------------------- 0079 段 4: PlanPrediction と格子（0079 §2.3 / 0087 §2.5）
+
+
+def test_a_plan_prediction_follows_the_action_grid_of_the_artifact(trained) -> None:
+    """候補 plan の予測は **action schema の格子の上**で、offset と plan の step が対応する。
+
+    `ActionPlan.steps[k]` は Dataset v2 / artifact v2 の step `k`（区間の終端が `offset_ms`）と
+    同じ区間である（0087 §2.5）。予測は plan の識別子と anchor 推論に束ねられる。
+    """
+    binding = bind(trained)
+    observed = observed_input()
+    plan = ActionPlan(
+        step_ms=STEP_MS,
+        steps=tuple(
+            PlanStep(offset_ms=STEP_MS * (index + 1), demands=demands(value))
+            for index, value in enumerate((0.4, 0.6, 0.8))
+        ),
+    )
+
+    prediction = binding.predict_plan(PlannedThermalInput(observed=observed, plan=plan))
+    anchor = binding.predict(observed)
+
+    assert prediction.matches(plan)
+    assert prediction.plan_digest == plan.digest()
+    assert prediction.capability is InferenceCapability.COUNTERFACTUAL_ACTION
+    assert prediction.artifact_sha256 == trained.attestation.artifact_sha256
+    assert prediction.anchor_inference_id == inference_id(observed, anchor)
+    assert tuple(target.offset_ms for target in prediction.targets) == HORIZONS
+    # step k の action は horizon (k + 1) × step_ms の予測から効き始める（因果の mask）。
+    expected = trained.model.predict_trajectory(
+        observed,
+        ActionTrajectory(step_ms=plan.step_ms, demands=tuple(step.demands for step in plan.steps)),
+    )
+    for target, reference in zip(prediction.targets, expected.targets, strict=True):
+        assert target.values == reference.values
+
+
+def test_the_anchor_inference_equals_the_held_plan_of_the_current_demand(trained) -> None:
+    """anchor 推論（`hold_effective`）は、いまの effective を保つ held plan の予測と一致する。"""
+    binding = bind(trained)
+    observed = observed_input(0.45)
+    held = ActionPlan.held(demands(0.45), step_ms=STEP_MS, steps=STEPS)
+
+    anchor = binding.predict(observed)
+    planned = binding.predict_plan(PlannedThermalInput(observed=observed, plan=held))
+
+    assert [target.values for target in anchor.targets] == [
+        target.values for target in planned.targets
+    ]
+
+
+@pytest.mark.parametrize(
+    "plan",
+    [
+        ActionPlan.held(demands(0.5), step_ms=STEP_MS, steps=STEPS - 1),
+        ActionPlan.held(demands(0.5), step_ms=STEP_MS * 2, steps=STEPS),
+    ],
+    ids=["fewer-steps", "other-step-ms"],
+)
+def test_a_plan_off_the_action_grid_is_never_predicted(trained, plan: ActionPlan) -> None:
+    """**plan の格子が action schema と違えば予測しない**（0079 §2.3）。"""
+    binding = bind(trained)
+
+    with pytest.raises(ValueError, match="格子"):
+        binding.predict_plan(PlannedThermalInput(observed=observed_input(), plan=plan))
+    with pytest.raises(ValueError, match="格子"):
+        binding.plan_support_violation(observed_input(), plan)
+
+
+# ------------------------- 0079 段 4: 学習した action 列の外は探索しない（0079 §2.5 / 0084 §2.2）
+
+
+def zone_ranges(front: tuple[float, float], other: tuple[float, float]) -> PerZone[ValueRange]:
+    """Front だけ別の範囲にした step の support。"""
+    whole = ranges(other[0], other[1])
+    return whole.model_copy(
+        update={
+            "front": ValueRange(
+                source="fan.front", minimum=front[0], maximum=front[1], observed_count=10_000
+            )
+        }
+    )
+
+
+def _evaluated_fronts(plans: Sequence[ActionPlan]) -> set[float]:
+    return {round(plan.first.front, 6) for plan in plans}
+
+
+def test_candidates_outside_the_learned_step_ranges_are_not_evaluated(
+    tmp_path: Path, plan_calls: list[ActionPlan]
+) -> None:
+    """**観測した demand の範囲の外の候補は評価しない**（margin を掛けない。0079 §2.5）。
+
+    Front の計画 demand を 0.2〜0.6 でだけ観測した Profile では、Front 0.8 / 1.0 の候補は
+    評価されない（`range_margin` の幅に入る 0.6 を少し越える値も同じ）。
+    """
+    narrow = make_artifact(
+        tmp_path / "narrow",
+        support=action_support(
+            steps=tuple((zone_ranges((0.2, 0.6), (0.0, 1.0)), CELLS) for _ in range(STEPS))
+        ),
+    )
+    controller, binding, _settings = build_controller(narrow)
+
+    result = propose(controller, baseline=0.4)
+
+    assert result.solution is not None
+    assert plan_calls, "Baseline は範囲内なので評価される"
+    assert all(0.2 <= plan.steps[k].demands.front <= 0.6 for plan in plan_calls for k in range(3))
+    assert 0.2 <= result.solution.requested.front <= 0.6
+    # 端をわずかに越える値（margin の幅の中）も評価しない。
+    just_outside = ActionPlan.held(
+        PerZone[Demand](front=0.6 + 1e-9, rear=0.45, top=0.45), step_ms=STEP_MS, steps=STEPS
+    )
+    assert binding.plan_support_violation(observed_input(), just_outside) is not None
+    full_controller, _full, _ = build_controller(
+        MpcArtifact(register_v2(tmp_path / "wide"), tmp_path)
+    )
+    plan_calls.clear()
+    propose(full_controller, baseline=0.4)
+    assert max(plan.first.front for plan in plan_calls) > 0.6
+
+
+def test_an_anchor_jump_outside_the_learned_change_is_not_evaluated(
+    tmp_path: Path, plan_calls: list[ActionPlan]
+) -> None:
+    """**anchor → 最初の step の跳び**だけが範囲外の held plan も評価しない（0079 §2.5）。
+
+    held plan は step 間の変化量が 0 なので、step 間だけを見ると常に通る。
+    """
+    small_jumps = make_artifact(
+        tmp_path / "small-jumps",
+        support=action_support(anchor=(ranges(-0.1, 0.1), EVERY_TRANSITION)),
+    )
+    controller, binding, _settings = build_controller(small_jumps)
+
+    result = propose(controller, baseline=0.45)
+
+    assert result.solution is not None
+    anchor = observed_input().action.front.effective_demand
+    for plan in plan_calls:
+        for zone in Zone:
+            assert abs(plan.first.get(zone) - anchor) <= 0.1 + 1e-12
+    jump = ActionPlan.held(demands(0.9), step_ms=STEP_MS, steps=STEPS)
+    violation = binding.plan_support_violation(observed_input(), jump)
+    assert violation is not None and violation.kind.value == "anchor_delta"
+
+
+def test_a_cross_zone_combination_outside_the_joint_cells_is_not_evaluated(
+    tmp_path: Path, plan_calls: list[ActionPlan]
+) -> None:
+    """**zone ごとの範囲に入っても、zone の組として学習していない候補は評価しない**（0079 §2.5）。
+
+    全 zone が同じ側（すべて 0.5 未満か、すべて 0.5 以上）の cell だけを観測した Profile では、
+    Front だけを上げた (1, 0, 0) の候補は評価されない。
+    """
+    same_side = ((0, 0, 0), (1, 1, 1))
+    joint = make_artifact(
+        tmp_path / "joint",
+        support=action_support(
+            steps=tuple((ranges(0.0, 1.0), same_side) for _ in range(STEPS)),
+            anchor=(ranges(-1.0, 1.0), tuple((a, b) for a in same_side for b in same_side)),
+            pairs=tuple(
+                (ranges(-1.0, 1.0), tuple((a, b) for a in same_side for b in same_side))
+                for _ in range(STEPS - 1)
+            ),
+        ),
+    )
+    controller, binding, _settings = build_controller(joint)
+
+    result = propose(controller, baseline=0.4)
+
+    assert result.proposal is not None
+    for plan in plan_calls:
+        bins = {int(plan.first.get(zone) >= 0.5) for zone in Zone}
+        assert len(bins) == 1, plan.first
+    mixed = ActionPlan.held(
+        PerZone[Demand](front=0.9, rear=0.3, top=0.3), step_ms=STEP_MS, steps=STEPS
+    )
+    violation = binding.plan_support_violation(observed_input(), mixed)
+    assert violation is not None and violation.kind.value == "step_cell"
+
+
+def test_a_value_learned_only_at_step_zero_is_not_accepted_at_a_later_step(tmp_path: Path) -> None:
+    """**step ごとの support**: step 0 でだけ観測した値を遅い step に持つ候補は評価しない。"""
+    early = make_artifact(
+        tmp_path / "early",
+        support=action_support(
+            steps=(
+                (ranges(0.0, 1.0), CELLS),
+                (ranges(0.0, 0.6), CELLS),
+                (ranges(0.0, 0.6), CELLS),
+            )
+        ),
+    )
+    binding = bind(early)
+    observed = observed_input(0.45)
+    rising = ActionPlan(
+        step_ms=STEP_MS,
+        steps=tuple(
+            PlanStep(offset_ms=STEP_MS * (index + 1), demands=demands(value))
+            for index, value in enumerate((0.8, 0.5, 0.5))
+        ),
+    )
+    late = ActionPlan(
+        step_ms=STEP_MS,
+        steps=tuple(
+            PlanStep(offset_ms=STEP_MS * (index + 1), demands=demands(value))
+            for index, value in enumerate((0.5, 0.5, 0.8))
+        ),
+    )
+
+    assert binding.plan_support_violation(observed, rising) is None
+    violation = binding.plan_support_violation(observed, late)
+    assert violation is not None
+    assert (violation.kind.value, violation.step) == ("step_demand", 2)
+
+
+def test_a_fallback_request_outside_the_learned_range_is_an_optimizer_error(
+    tmp_path: Path, plan_calls: list[ActionPlan]
+) -> None:
+    """**Fallback の requested 自体が範囲外なら解を返さない**（`plan_out_of_learned_range`）。
+
+    範囲内へ丸めて探索を続けない。`MpcProposal` の不変条件（提案のある結果に
+    `failure_reason` を付けない）を破らず、理由は requested の理由に載る。Gate は
+    `optimizer_error` として Fallback を選ぶ（0079 §2.5 / §6 の質問 6）。
+    """
+    settings = mpc_policy()
+    upper_only = make_artifact(
+        tmp_path / "upper-only",
+        support=action_support(
+            steps=(
+                (ranges(0.0, 1.0), CELLS),
+                (ranges(0.0, 1.0), CELLS),
+                (ranges(0.4, 1.0), CELLS),
+            )
+        ),
+    )
+    controller, _binding, _ = build_controller(upper_only, policy_config=settings)
+
+    result = propose(controller, baseline=0.35)
+
+    assert plan_calls == []
+    assert result.failure is None and result.failure_reason is None
+    assert result.solution is None
+    assert result.proposal is not None
+    assert result.proposal.optimizer_status is OptimizerStatus.ERROR
+    reason = result.proposal.requested.front.reason
+    assert reason.code == "plan_out_of_learned_range"
+    assert "step=2" in reason.detail and "zone=front" in reason.detail
+    # Fallback の requested をそのまま運ぶ（丸めた値を ML の提案にしない）。
+    assert result.proposal.requested.front.demand == pytest.approx(0.35)
+
+    selection = select_with(
+        settings, upper_only.attestation, result, fallback=fallback_proposal(0.35)
+    )
+    assert selection.active_controller is ControllerKind.FALLBACK
+    assert selection.fallback_reason is not None
+    assert selection.fallback_reason.code == FallbackCause.OPTIMIZER_ERROR.value
+    assert selection.proposal == fallback_proposal(0.35)
+
+    # 同じ artifact で、範囲内の Fallback requested なら探索する。
+    assert propose(controller, baseline=0.45).solution is not None
+
+
+# ------------------------ 0079 段 4: 読み込みの失敗は MODEL_LOAD_FAILURE → Fallback（§2.6）
+
+
+def _assert_degrades_to_fallback(
+    runtime: LearnedMpcRuntime, attestation: ArtifactAttestation, *, needle: str
+) -> None:
+    settings = mpc_policy()
+    assert runtime.controller is None
+    assert runtime.failure_reason is not None
+    assert needle in runtime.failure_reason.detail
+
+    for ts_ms in (ACTION_TS_MS, ACTION_TS_MS):
+        result = propose(runtime, ts_ms=ts_ms)
+        assert result.failure is LearnedFailure.MODEL_LOAD_FAILURE
+        assert result.failure_reason == runtime.failure_reason
+    fallback = fallback_proposal(0.4)
+    selection = select_with(settings, attestation, result, fallback=fallback)
+
+    assert selection.active_controller is ControllerKind.FALLBACK
+    assert selection.fallback_reason is not None
+    assert selection.fallback_reason.code == FallbackCause.MODEL_LOAD_FAILURE.value
+    assert needle in selection.fallback_reason.detail
+    # Gate は Fallback の requested をそのまま後段へ渡す。Guard / Safety の入力は変わらない。
+    assert selection.proposal == fallback
+
+
+def test_a_calibration_mismatch_degrades_to_fallback(trained) -> None:
+    """**較正の digest が runtime の較正と違えば L9 で拒否して Fallback**（0079 §6 の質問 4）。"""
+    changed = RuntimeCalibration.available({**CALIBRATION_OFFSETS, "front_intake": 0.2})
+
+    runtime = load_runtime(trained.verified, calibration=changed)
+
+    _assert_degrades_to_fallback(runtime, trained.attestation, needle="L9")
+    # 使わないチャネルだけの変更では digest が変わらない（0096 §2.9 の感度）。
+    unrelated = RuntimeCalibration.available({**CALIBRATION_OFFSETS, "room_temp": 1.0})
+    assert load_runtime(trained.verified, calibration=unrelated).controller is not None
+
+
+def test_an_unreadable_calibration_refuses_a_calibrated_artifact(trained) -> None:
+    """**読めなかった較正では、較正の掛かる metric を使う artifact を使わない**（0096 §5 #8）。"""
+    runtime = load_runtime(trained.verified, calibration=UNAVAILABLE_CALIBRATION)
+
+    _assert_degrades_to_fallback(runtime, trained.attestation, needle="L9")
+    assert "読めなかった" in (runtime.failure_reason.detail if runtime.failure_reason else "")
+
+
+def test_an_artifact_without_calibrated_metrics_loads_without_a_calibration(
+    tmp_path: Path,
+) -> None:
+    """**較正の掛からない metric だけの artifact は、較正を読めなくても使える**（0096 §5 #8）。"""
+    uncalibrated = register_v2(tmp_path / "gpu-only", features=(GPU,))
+    model = RegistryCounterfactualThermalModel.from_verified_artifact(
+        uncalibrated, metric_catalog=CATALOG, calibration=UNAVAILABLE_CALIBRATION
+    )
+    assert model.manifest.calibration_binding.sha256 is None
+
+    runtime = load_runtime(uncalibrated, calibration=UNAVAILABLE_CALIBRATION)
+
+    assert runtime.failure_reason is None
+    assert runtime.controller is not None
+    assert runtime.controller.binding.artifact_sha256 == uncalibrated.attestation.artifact_sha256
+
+
+def test_a_v1_artifact_degrades_to_fallback_and_is_never_read_as_v2(tmp_path: Path) -> None:
+    """**v1 artifact は v2 として読み替えず、Fallback で運転を続ける**（0079 §2.2）。"""
+    claimed = register_v1(tmp_path / "v1", capability=ArtifactCapability.COUNTERFACTUAL_ACTION)
+
+    _assert_degrades_to_fallback(load_runtime(claimed), claimed.attestation, needle="L4")
+
+
+def test_a_unit_change_in_the_runtime_catalog_degrades_to_fallback(trained) -> None:
+    """**runtime の単位が学習時と違えば L8 で拒否**して Fallback（0079 §2.4）。"""
+    document_ = json.loads(json.dumps(CATALOG.model_dump(mode="json")))
+    document_["metrics"][GPU]["unit"] = "F"
+    changed = MetricCatalog.model_validate(document_)
+
+    _assert_degrades_to_fallback(
+        load_runtime(trained.verified, catalog=changed), trained.attestation, needle="L8"
+    )
+
+
+def test_a_grid_mismatch_with_the_config_degrades_to_fallback(trained) -> None:
+    """**格子が合わない設定**も、起動を止めずに `MODEL_LOAD_FAILURE` で Fallback（0079 §2.6）。"""
+    settings = mpc_policy(step_ms=_provisional(1_500), horizon_ms=_provisional(4_500))
+
+    runtime = load_runtime(trained.verified, settings=settings)
+
+    _assert_degrades_to_fallback(runtime, trained.attestation, needle="格子")
+
+
+def test_a_healthy_runtime_proposes_like_the_controller(trained) -> None:
+    """読み込みに成功した runtime は、controller と同じ提案を出す（経路を増やさない）。"""
+    runtime = load_runtime(trained.verified)
+    controller, _binding, _settings = build_controller(trained)
+
+    assert runtime.failure_reason is None
+    assert propose(runtime).result_digest() == propose(controller).result_digest()
+    with pytest.raises(ValueError, match="どちらか一方"):
+        LearnedMpcRuntime(controller=None, failure_reason=None)

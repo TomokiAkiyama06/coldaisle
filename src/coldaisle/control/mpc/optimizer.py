@@ -7,6 +7,12 @@
 探索は決定論的な座標降下で、**出発点は必ず Fallback（Baseline）の demand**。採用する解は
 必ず incumbent なので、内部モデルの上では Baseline 以下のコストにしかならない。
 乱数は使わず、同じ入力・同じ単調時計の列からは同じ解を返す（決定記録 0052 §2.3）。
+
+**学習した action 列の外は探索しない**（決定記録 0079 §2.5 / 0084 §2.2。0052 §2.4 への4つ目の
+「狭める写し」）。同梱 Profile v2 の step ごとの support に入らない候補は評価しない（評価回数にも
+数えない）。出発点（制約へ収めた Fallback の requested）自体が外れていれば、解を返さず
+``error``（``plan_out_of_learned_range``）にする。範囲内へ丸めて探索を続けない（丸めた値は
+Fallback ではなく ML の外挿で選んだ値になるため）。margin は掛けない。
 """
 
 from __future__ import annotations
@@ -133,7 +139,17 @@ class LearnedMpcOptimizer:
         合わない組み合わせは tick ごとに失敗させず、生成時に拒む。runtime はこれを
         model 読込の失敗として Fallback にする。
         """
-        schema = self._binding.model.target_schema
+        action = self._binding.action_schema
+        configured = (self._config.step_ms.value, self._config.steps)
+        if configured != (action.step_ms, action.steps):
+            # 0079 §2.4: `mpc.optimizer` の格子は action schema と**完全に一致**させる。
+            # 補間・外挿・丸めはしないので、合わない設定では1つも予測できない。
+            raise MpcModelUnusableError(
+                "mpc.optimizer の格子が内部モデルの action schema と一致しない"
+                f"（optimizer={configured[0]}ms×{configured[1]}; "
+                f"action={action.step_ms}ms×{action.steps}）"
+            )
+        schema = self._binding.target_schema
         available = set(schema.horizons_ms)
         needed = {self._config.step_ms.value * (index + 1) for index in range(self._config.steps)}
         missing = sorted(needed - available)
@@ -180,6 +196,18 @@ class LearnedMpcOptimizer:
             if self._out_of_budget(started_ms):
                 # 制約の組み立てで越えた場合も、モデルを呼ぶ前に止める。
                 return self._timed_out(started_ms, evaluations)
+            outside = self._binding.plan_support_violation(observed, self._plan(baseline_requested))
+            if outside is not None:
+                # 0079 §2.5 / 0084 §2.2: 出発点が学習した action 列の外なら解を返さない。
+                # `MpcProposal.failure_reason` には書かない（提案のある結果に付けられない）。
+                # 理由は提案の requested の理由に載り、Gate は `optimizer_error` で Fallback へ。
+                return self._failed(
+                    OptimizerStatus.ERROR,
+                    "plan_out_of_learned_range",
+                    f"fallback requested: {outside.describe()}",
+                    started_ms,
+                    0,
+                )
             baseline_cost, baseline_prediction = self._evaluate(
                 baseline_requested,
                 observed,
@@ -208,6 +236,13 @@ class LearnedMpcOptimizer:
                 for candidate_demand in levels[zone]:
                     candidate = self._with_zone(incumbent, zone, candidate_demand)
                     if candidate == incumbent:
+                        continue
+                    if (
+                        self._binding.plan_support_violation(observed, self._plan(candidate))
+                        is not None
+                    ):
+                        # 学習した action 列の外の候補は**評価しない**（外挿の予測で選ばない）。
+                        # 件数は trace に出さない（0079 §6 の質問 6）。
                         continue
                     if evaluations >= max_evaluations or self._out_of_budget(started_ms):
                         return self._timed_out(started_ms, evaluations)
@@ -254,6 +289,9 @@ class LearnedMpcOptimizer:
             if not improved:
                 break
 
+        # 評価しなかった候補だけが続いた場合も、予算を越えたまま OK を返さない。
+        if self._out_of_budget(started_ms):
+            return self._timed_out(started_ms, evaluations)
         plan = self._plan(incumbent)
         solution = MpcSolution(
             plan=plan,
@@ -317,9 +355,7 @@ class LearnedMpcOptimizer:
         if violations:
             raise InfeasiblePlanError("; ".join(violations))
         plan = self._plan(demands)
-        prediction = self._binding.model.predict_plan(
-            PlannedThermalInput(observed=observed, plan=plan)
-        )
+        prediction = self._binding.predict_plan(PlannedThermalInput(observed=observed, plan=plan))
         self._check_prediction(prediction, anchor, anchor_inference_id)
         cost = self._cost_model.evaluate(
             plan=plan,

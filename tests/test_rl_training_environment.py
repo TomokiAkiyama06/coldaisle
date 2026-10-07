@@ -96,10 +96,12 @@ from test_learned_mpc import (
     HORIZONS,
     STEP_MS,
     TARGETS,
+    MpcArtifact,
     PlanningModel,
     ScriptedClock,
     build_controller,
     issue_attestation,
+    make_artifact,
     observed_input,
 )
 from test_learned_mpc import safety as mpc_safety
@@ -253,14 +255,20 @@ class StubRlPolicy:
 
 
 @pytest.fixture(scope="module")
-def trained(tmp_path_factory: pytest.TempPathFactory):
-    """合成 dataset で学習した #84 モデル・Confidence Profile・Registry 発行の証拠。"""
+def trained(tmp_path_factory: pytest.TempPathFactory) -> MpcArtifact:
+    """MPC が束縛する反実仮想 artifact v2（Registry に登録・昇格済み。決定記録 0079 段 4）。"""
+    return make_artifact(tmp_path_factory.mktemp("pr105-registry") / "registry")
+
+
+@pytest.fixture(scope="module")
+def trained_v1(tmp_path_factory: pytest.TempPathFactory):
+    """#105 の学習 dynamics の試験用（0079 段 6 で v2 の型へ切り替えるまで v1 のまま）。"""
     data = dataset(HORIZONS, TARGETS)
     parts = split_dataset(data)
     model = train_model(data, parts)
     profile = fit_confidence_profile(model, data, parts, profile_spec())
     attestation = issue_attestation(
-        tmp_path_factory.mktemp("pr105-registry") / "registry",
+        tmp_path_factory.mktemp("pr105-registry-v1") / "registry",
         model_id=model.manifest.model_id,
         version=model.manifest.model_version,
         payload=canonical_artifact_bytes(model._artifact),
@@ -344,7 +352,7 @@ def build_environment(
     `with_mpc=False` にすると、**反実仮想 artifact が無くて束縛できなかった runtime** を作る。
     """
     config, config_sha = rl_config(**(config_overrides or {}))
-    _model, _profile, attestation = trained
+    attestation = trained.attestation
     settings = _mpc_policy(authority)
     controller = None
     unavailable = None
@@ -533,7 +541,8 @@ def test_invariant_3_b_uncertain_and_ood_steps_are_distinguishable(trained) -> N
     記録として満たす。
     """
     environment, *_ = build_environment(trained)
-    result = run_all(environment, episode_spec(max_steps=5))
+    # 初期の demand 0.8 は学習した fan の範囲（合成 dataset の 0.30〜0.65）の外。
+    result = run_all(environment, episode_spec(max_steps=5, demand=0.8))
 
     ood_steps = [step for step in result.steps if step.ood]
     assert ood_steps, "OOD の step が1つも出ていない（試験用 profile の前提が変わった）"
@@ -549,7 +558,7 @@ def test_invariant_3_c_the_real_fallback_controller_satisfies_the_baseline_contr
     """Baseline の契約は **本物の #79 Fallback Controller** がそのまま満たす。"""
     from test_fallback_controller import catalog
 
-    _model, _profile, attestation = trained
+    attestation = trained.attestation
     config, config_sha = rl_config()
     controller, _planning, settings = build_controller(
         trained, policy_config=_mpc_policy("limited"), clock=ScriptedClock(0)
@@ -709,13 +718,13 @@ def test_invariant_6_b_the_configured_simulator_is_always_provisional() -> None:
     assert attested_evidence(simulator) is None
 
 
-def test_invariant_6_c_todays_artifacts_cannot_be_a_learned_simulator(trained, tmp_path) -> None:
+def test_invariant_6_c_todays_artifacts_cannot_be_a_learned_simulator(trained_v1, tmp_path) -> None:
     """**観測再生だけの artifact を learned simulator にしない**（決定記録 0048 §2.1）。
 
     いま Registry へ登録できるのは `observational_replay` だけなので、この経路は
     **決定論的にすべて拒む**。0052 §2.1 の規律を環境側にもそのまま置いている。
     """
-    base, _profile, _attestation = trained
+    base, _profile, _attestation = trained_v1
     observational = issue_attestation(
         tmp_path / "observational",
         model_id=base.manifest.model_id,
@@ -732,9 +741,9 @@ def test_invariant_6_c_todays_artifacts_cannot_be_a_learned_simulator(trained, t
         )
 
 
-def test_invariant_6_d_a_wrapper_around_another_artifact_is_refused(trained) -> None:
+def test_invariant_6_d_a_wrapper_around_another_artifact_is_refused(trained_v1) -> None:
     """別の artifact を包んだ wrapper が、借りた証拠で learned simulator になれない。"""
-    base, _profile, attestation = trained
+    base, _profile, attestation = trained_v1
     with pytest.raises(DynamicsUnusableError, match="model_id"):
         AttestedThermalDynamics.bind(
             PlanningModel(base, model_id="other-thermal"), attestation=attestation
@@ -1175,7 +1184,7 @@ def test_invariant_14_b_an_episode_without_a_controller_cannot_be_promotable(tra
 def test_invariant_14_c_the_controller_state_must_be_stated_exactly_once(trained) -> None:
     """controller と「使えない理由」を両方 / どちらも渡さない、は受け取らない。"""
     config, config_sha = rl_config()
-    _model, _profile, attestation = trained
+    attestation = trained.attestation
     controller, _planning, settings = build_controller(
         trained, policy_config=_mpc_policy("limited"), clock=ScriptedClock(0)
     )
@@ -1216,10 +1225,9 @@ def test_invariant_6_f_a_self_declared_registry_provenance_grants_nothing(traine
     assert not result.promotable
 
 
-def test_invariant_6_g_an_attested_binding_is_the_only_source_of_evidence(trained) -> None:
+def test_invariant_6_g_an_attested_binding_is_the_only_source_of_evidence(trained_v1) -> None:
     """Registry の証拠に裏づけられた dynamics だけが `attested_evidence` を満たす。"""
-    _model, _profile, attestation = trained
-    base, _p, _a = trained
+    base, _profile, attestation = trained_v1
     dynamics = AttestedThermalDynamics.bind(PlanningModel(base), attestation=attestation)
 
     assert dynamics.attestation is attestation
@@ -1734,7 +1742,7 @@ def test_invariant_16_c_conditions_cover_the_bound_controller(trained) -> None:
 
     別の artifact・別の Confidence Profile・別の任意依存は、同じ入力から違う提案を作る。
     """
-    _model, _profile, attestation = trained
+    attestation = trained.attestation
     config, config_sha = rl_config()
     plain, *_ = build_environment(trained)
 
