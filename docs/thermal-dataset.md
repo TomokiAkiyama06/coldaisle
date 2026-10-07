@@ -157,6 +157,9 @@ v1 との違い（規則の正本は [0087](decisions/0087-dataset-v2-action-gri
   足した列で、行が無い DB では 0、0007 を適用済みの DB では `ts_ms ≤ legacy_until_ms` の行の `MAX(seq)` である
 - **較正の変更**: 呼び出し側は宣言された変更（`DeclaredChange`。0056 §2.5）を必ず渡す（無ければ空の tuple）。
   `calibration_changed` が全 example の期間 `[history_start_ms の最小, label_end_ms の最大]` の中にあれば生成を拒否する
+- **再生の timezone**: v2 の学習に使う再生（`--source replay`）は、日次 CSV を書き出したときと同じ `--timezone` で行う。
+  CSV の時刻はオフセットを持たず、違う timezone では較正の変更の記録（決定記録 [0099](decisions/0099-calibration-change-log.md)）との
+  照合が狂う（照合の仕組みは #237 で決める）
 - `control_trace_sha256` は run の全 ControlTick を `seq` 付きで hash する（v2 は anchor 以外の tick も使うため）
 
 ## 実データ収集後に残る作業
