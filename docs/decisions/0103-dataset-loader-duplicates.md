@@ -74,7 +74,8 @@ dataset 全体で一意であることを求める。** 2つ以上の example �
 - 観測時刻の無い cell（`source_ts_ms = null`）は照合しない（観測を指さない）
 - 値の比較は Python の `==`（`FiniteValue` なので NaN は無い）。`-0.0` と `0.0` は同じ値として扱う（§5 #5）
 - `missing_mask` は観測時刻のある cell では `value is None` と同値（0031 §2.1）なので値の比較に含まれるが、
-  拒否の理由を読めるように欄として明示して照合する
+  拒否の理由を読めるように欄として明示して照合する（`missing_mask` だけが違う組は cell の既存の検査が先に拒むので、
+  この照合で独立には起きない）
 - run をキーに含めるので、別の run の同じ `(metric, source_ts_ms)` は照合しない（run は別の DB で、時刻が重なっても別の観測）
 
 ### 2.3 版を上げない・builder を変えない
@@ -143,7 +144,10 @@ v1 / v2 のそれぞれで、次を確かめる。
 2. **正当な近い anchor は通る（v1）**: 同じ `action_ts_ms` で `control_tick_id` の違う2つの example、同じ `control_tick_id` で
    `action_ts_ms` の違う2つの example（再起動の前後）は通る
 3. **window の中の食い違いの拒否**: 1つの example の2つの frame が同じ `(metric, source_ts_ms)` を使い、`value` / `quality` /
-   `missing_mask` のどれか1つだけが違う dataset を、それぞれ拒否する（missing は `value = null` の suspect との組で作る）
+   `quality` は同じで `value` だけが違う dataset、`value` は同じで `quality` だけが違う dataset、片方が値のある suspect で
+   もう片方が `value = null` の suspect（`missing_mask` も違う）の dataset を、それぞれ新しい検査で拒否する。
+   `missing_mask` だけが違う組は、cell の既存の検査（`missing_mask` と `value is None` の同値。0031 §2.1）が先に拒むので
+   作れない。新しい検査の試験に数えない（PR #246 の Codex の指摘）
 4. **`stale_mask` の違いは通る**: 同じ観測を使う frame の `stale_mask` だけが、spec の鮮度どおりに違う dataset は通る
 5. **example の間の食い違いの拒否**: 重なる2つの example の window 同士、ある example の target と別の example の window、
    1つの example の horizon の違う2つの target、別の example の target 同士で、同じ観測の値が違う dataset を拒否する
