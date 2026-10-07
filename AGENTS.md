@@ -242,6 +242,7 @@ git worktree list
 src/coldaisle/
   clock.py    # レイヤ横断: 時刻ソース（WallClock / SimulatedClock）。#42
   channels.py # レイヤ横断: チャネル名とメトリクス名の対応。#10
+  csv_export_manifest.py # レイヤ横断: 日次 CSV の時刻の写像と export manifest の形（export と再生が共有）。#237 / 決定記録 0100
   calibration_offsets.py # レイヤ横断: 較正を当てる metric の判定と実効の offset の写像（Normalizer と較正の digest が共有）。決定記録 0096
   metrics.py  # レイヤ横断: 単位・表示名・派生値の定義。#9
   daemon.py   # 合成の起点: Source→Normalizer→Store→Rules を束ねる。#8 / #18
@@ -261,6 +262,7 @@ src/coldaisle/
   local_socket.py # レイヤ横断: Unix ソケット入口に共通の門（SO_PEERCRED・権限・起動時の検査）。0045 / 0072 §2.5
   authority_cli.py # 合成の起点: `coldaisle-authority raise` / `rollback`。`raise_stage()` を呼ぶ唯一の場所。**どこからも import しない**。#92 / 決定記録 0086
   rollup_job.py # 合成の起点: `coldaisle-rollup` の入口（周期メトリクスを Store へ渡す）。#65
+  calibration_log.py # 合成の起点の部品: 較正の変更の記録（取り込みの起動時の lock と追記・運転中の時刻の下限・Dataset v2 と学習の入口の検査）。書き手は取り込みだけ。#233 / 決定記録 0099
   control_daemon.py # 合成の起点: Fan制御デーモン。**hwmonへ書くのはこのプロセスだけ**。#74
   store/      # L1: SQLite、ロールアップ、CSVエクスポート
   api/        # L2: FastAPI、WebSocket

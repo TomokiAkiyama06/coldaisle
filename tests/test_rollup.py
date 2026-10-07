@@ -343,7 +343,9 @@ def test_cli_runs_and_writes_csv(tmp_path, rules):
 
     retention = tmp_path / "retention.yaml"
     retention.write_text(
-        f"raw_days: 30\ncontrol_trace_days: 30\ncsv_dir: {tmp_path / 'csv'}\n", encoding="utf-8"
+        f"raw_days: 30\ncontrol_trace_days: 30\ncsv_dir: {tmp_path / 'csv'}\n"
+        "csv_timezone: Asia/Tokyo\ncsv_export_lock_timeout_s: 5\n",
+        encoding="utf-8",
     )
     code = main(
         [
@@ -356,7 +358,114 @@ def test_cli_runs_and_writes_csv(tmp_path, rules):
     )
     assert code == 0
     assert (tmp_path / "csv" / "sensors_2026-08-25.csv").exists()
+    assert (tmp_path / "csv" / "sensors_2026-08-25.export.json").exists()
     assert Path(database).exists()
+
+
+# ---------------------------------------------------------------- export の timezone（0100 §2.2）
+
+
+def export_cli(tmp_path, rules, extra_yaml: str, *argv: str) -> tuple[int, Path, Path]:
+    """readings を1行書いた DB に `--export-day` を付けて CLI を走らせる。"""
+    database = tmp_path / "cli.db"
+    with SqliteStore(database, rules=rules, clock=SimulatedClock(0)) as store:
+        write(store, "air.room", 1_787_616_000_000, 26.0)  # 2026-08-25 09:00 JST
+    retention = tmp_path / "retention.yaml"
+    retention.write_text(
+        f"raw_days: 30\ncontrol_trace_days: 30\ncsv_dir: {tmp_path / 'csv'}\n" + extra_yaml,
+        encoding="utf-8",
+    )
+    code = main(
+        [
+            f"--db={database}",
+            f"--retention={retention}",
+            f"--quality-rules={QUALITY_RULES_PATH}",
+            "--export-day=2026-08-25",
+            *argv,
+        ]
+    )
+    return code, database, tmp_path / "csv"
+
+
+def assert_nothing_exported(database: Path, csv_dir: Path, rules) -> None:
+    """CSV も manifest も `csv_exports` の行も無い。ロールアップは行われている。"""
+    assert not csv_dir.exists() or not list(csv_dir.glob("sensors_*"))
+    with SqliteStore(database, rules=rules, clock=SimulatedClock(0)) as store:
+        assert store.connection.execute("SELECT COUNT(*) FROM csv_exports").fetchone()[0] == 0
+        assert store.connection.execute("SELECT COUNT(*) FROM readings_1m").fetchone()[0] > 0
+
+
+LOCK_YAML = "csv_export_lock_timeout_s: 5\n"
+
+
+@pytest.mark.parametrize(
+    "timezone_yaml",
+    [
+        "",
+        "csv_timezone: null\n",
+        "csv_timezone: ''\n",
+        "csv_timezone: Not/A_Zone\n",
+        "csv_timezone: ../../etc/passwd\n",
+    ],
+    ids=["missing", "null", "empty", "unknown", "path"],
+)
+def test_export_without_a_readable_configured_timezone_is_refused(
+    tmp_path, rules, timezone_yaml, capsys
+):
+    """コードに既定の timezone を置かない。export だけを止め、ロールアップは行う。"""
+    code, database, csv_dir = export_cli(tmp_path, rules, timezone_yaml + LOCK_YAML)
+    assert code == 1
+    assert_nothing_exported(database, csv_dir, rules)
+    assert "日次CSVを書き出さなかった" in capsys.readouterr().err
+
+
+def test_export_without_a_lock_limit_is_refused(tmp_path, rules):
+    code, database, csv_dir = export_cli(tmp_path, rules, "csv_timezone: Asia/Tokyo\n")
+    assert code == 1
+    assert_nothing_exported(database, csv_dir, rules)
+
+
+def test_timezone_flag_that_differs_from_the_config_is_refused(tmp_path, rules):
+    """同じオフセットの別名でも、文字列で違えば拒否する（0100 §2.2 / §5 #3）。"""
+    code, database, csv_dir = export_cli(
+        tmp_path, rules, "csv_timezone: Asia/Tokyo\n" + LOCK_YAML, "--timezone", "Etc/GMT-9"
+    )
+    assert code == 1
+    assert_nothing_exported(database, csv_dir, rules)
+
+
+def test_timezone_flag_equal_to_the_config_is_accepted(tmp_path, rules):
+    code, _, csv_dir = export_cli(
+        tmp_path, rules, "csv_timezone: Asia/Tokyo\n" + LOCK_YAML, "--timezone", "Asia/Tokyo"
+    )
+    assert code == 0
+    manifest = (csv_dir / "sensors_2026-08-25.export.json").read_text(encoding="utf-8")
+    assert '"timezone":"Asia/Tokyo"' in manifest
+
+
+def test_the_configured_timezone_is_used_without_the_flag(tmp_path, rules):
+    """日境界と時刻は設定の timezone で決まる（`Etc/GMT-9` の 09:00 の行がその日に入る）。"""
+    code, _, csv_dir = export_cli(tmp_path, rules, "csv_timezone: Etc/GMT-9\n" + LOCK_YAML)
+    assert code == 0
+    assert (csv_dir / "sensors_2026-08-25.csv").read_text(encoding="utf-8").splitlines()[1][
+        :19
+    ] == "2026-08-25T09:00:00"
+    manifest = (csv_dir / "sensors_2026-08-25.export.json").read_text(encoding="utf-8")
+    assert '"timezone":"Etc/GMT-9"' in manifest
+
+
+def test_retention_without_export_settings_still_loads(tmp_path):
+    """export の2つのキーが無くても、ロールアップと保持期間の設定は読める。"""
+    path = tmp_path / "retention.yaml"
+    path.write_text("raw_days: 30\ncontrol_trace_days: 30\ncsv_dir: x\n", encoding="utf-8")
+    loaded = RetentionRules.from_yaml(path)
+    assert loaded.csv_timezone is None
+    assert loaded.csv_export_lock_timeout_s is None
+
+
+def test_shipped_config_names_the_export_timezone(rules_30d):
+    assert rules_30d.csv_timezone == "Asia/Tokyo"
+    assert rules_30d.csv_export_lock_timeout_s is not None
 
 
 # ---------------------------------------------------------------- 受入基準

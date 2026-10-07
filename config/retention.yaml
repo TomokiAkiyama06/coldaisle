@@ -12,3 +12,13 @@ control_trace_days: 30
 
 # 日次CSV（FR-205）の出力先。`~` は展開する
 csv_dir: "~/server_sensor_logs"
+
+# 日次CSVの日境界と時刻に使う IANA の timezone 名（決定記録 0100 §2.2）。
+# **必須**: 無い・読めないときは `--export-day` だけを拒否する（ロールアップは行う）。
+# コードに既定値は無い。`coldaisle-rollup --timezone` は確認用で、ここと文字列で違えば拒否する。
+# 書いた文字列がそのまま export manifest と `csv_exports` に残る（別名を正規化しない）
+csv_timezone: "Asia/Tokyo"
+
+# 同じ日の export のプロセス間 lock を待つ上限（秒。決定記録 0100 §2.1 / §5 #17）。
+# 1日ぶんの export は1秒もかからない。上限を過ぎたら何も書かずに拒否する
+csv_export_lock_timeout_s: 60

@@ -181,18 +181,24 @@ def window_frame(ts_ms: int) -> WindowFrame:
     )
 
 
-def target_values(anchor_tick: int, horizon_ms: int) -> dict[str, float | None]:
-    anchor_ms = anchor_tick * 1_000
-    step0 = demands(anchor_tick)
-    last = demands(anchor_tick + horizon_ms // STEP_MS - 1)
+def observed_target(tick: int) -> dict[str, float | None]:
+    """時刻 ``tick`` 秒の target の観測。**時刻だけの関数**にする（決定記録 0103 §2.2）。
+
+    隣り合う anchor の target は同じ観測を指す（anchor ``a`` の 2 s 先と ``a + 1`` の 1 s 先）。
+    1つの観測は1つの値しか持たないので、anchor や horizon に依存させない。値は直前の2つの
+    tick の demand と、その前の GPU の温度で決まる（どの horizon でも入力の中にある）。
+    """
+    earlier = demands(tick - 2)
+    latest = demands(tick - 1)
+    gpu = gpu_core((tick - 2) * 1_000)
     return {
-        "cpu.package": 40.0
-        + 0.5 * gpu_core(anchor_ms)
-        - 6.0 * step0.front
-        - 3.0 * last.rear
-        + horizon_ms / 1_000,
-        "d.gpu_rise": 10.0 - 4.0 * step0.top + 0.2 * gpu_core(anchor_ms),
+        "cpu.package": 40.0 + 0.5 * gpu - 6.0 * earlier.front - 3.0 * latest.rear,
+        "d.gpu_rise": 10.0 - 4.0 * latest.top + 0.2 * gpu,
     }
+
+
+def target_values(anchor_tick: int, horizon_ms: int) -> dict[str, float | None]:
+    return observed_target(anchor_tick + horizon_ms // 1_000)
 
 
 def action_zone(value: float) -> ActionZone:
@@ -535,18 +541,17 @@ def test_validation_and_test_values_do_not_affect_the_payload(tmp_path: Path) ->
     baseline = train_counterfactual_ridge(
         published(dataset, tmp_path / "a"), parts, training_spec(), metric_catalog=CATALOG
     )
-    changed_ticks = {
-        item.action_ts_ms // 1_000 for item in (*parts.validation, *parts.test, *parts.purged)
-    }
+    # train の label より後の観測だけを変える。1つの観測は example の間で同じ値を持つ（0103 §2.2）
+    # ので、train の example と共有する観測（purge された example の前半の label など）は変えない
+    train_end_ms = max(item.label_end_ms for item in parts.train)
+    assert any(item.label_end_ms > train_end_ms for item in parts.validation)
 
     def shifted(tick: int) -> DatasetExampleV2:
         original = example(tick)
-        if tick not in changed_ticks:
-            return original
         targets = tuple(
-            target.model_copy(
-                update={"values": {metric: 99.0 for metric in TARGETS}},
-            )
+            target.model_copy(update={"values": {metric: 99.0 for metric in TARGETS}})
+            if target.expected_ts_ms > train_end_ms
+            else target
             for target in original.targets
         )
         return original.model_copy(update={"targets": targets})

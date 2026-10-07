@@ -17,14 +17,11 @@ Registry が発行した ``VerifiedArtifact`` から :meth:`MpcModelBinding.from
 検査に外れた artifact は ``MpcModelUnusableError`` になる。拒否は例外的な事態ではなく通常経路で、
 runtime はそれを ``LearnedFailure.MODEL_LOAD_FAILURE`` として Gate（#79 / #85）へ渡し、
 Fallback で走り続ける（0079 §2.6）。
-
-``CounterfactualThermalModel``（Protocol）は #105 の学習 dynamics（0079 段 6 で同じ型へ
-切り替える）がまだ使うので残す。**MPC の束縛はこの Protocol を受け取らない。**
 """
 
 from __future__ import annotations
 
-from typing import Annotated, Protocol, Self
+from typing import Annotated, Self
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -46,7 +43,6 @@ from coldaisle.control.model.thermal import (
     ArtifactVerification,
     InferenceCapability,
     ObservedThermalInput,
-    ThermalFeatureSchema,
     ThermalModelManifest,
     ThermalPrediction,
     ThermalTargetSchema,
@@ -83,8 +79,8 @@ class _Frozen(BaseModel):
 class CounterfactualModelIdentity(_Frozen):
     """内部モデルが自分について主張する事実。
 
-    **これは自称であって証拠ではない。** ``MpcModelBinding.for_control`` は、Registry（#104）が
-    発行した ``ArtifactAttestation`` と突き合わせ、食い違えば束縛しない。
+    **これは自称であって証拠ではない。** ``MpcModelBinding.from_verified_artifact`` は、
+    Registry（#104）が発行した ``ArtifactAttestation`` と突き合わせ、食い違えば束縛しない。
     verification / authority / model 版は attestation 側を正とし、自称値は照合にだけ使う。
     """
 
@@ -101,8 +97,8 @@ class CounterfactualModelIdentity(_Frozen):
     def from_manifest(cls, manifest: ThermalModelManifest) -> CounterfactualModelIdentity:
         """#84 の manifest をそのまま写す。**capability を書き換えない。**
 
-        v1 artifact は必ず ``observational_replay`` になるので、この identity で
-        ``for_control`` を呼ぶと拒否される。それが正しい振る舞いである。
+        v1 artifact は必ず ``observational_replay`` になるので、v1 は MPC に束縛されない
+        （``MpcModelBinding.from_verified_artifact`` が拒否する）。それが正しい振る舞いである。
         """
         return cls(
             model_id=manifest.model_id,
@@ -178,37 +174,6 @@ class PlanPrediction(_Frozen):
         if self.plan_digest != plan.digest():
             return False
         return tuple(target.offset_ms for target in self.targets) == plan.offsets_ms
-
-
-class CounterfactualThermalModel(Protocol):
-    """MPC が内部モデルとして受け入れる読み取り専用の契約。
-
-    #84 の ``ThermalModel`` に ``identity`` と ``predict_plan`` を足したもので、
-    Fan Demand も PWM も返さない。Reactive Guard / Critical Safety / Hardware を呼ばない。
-    """
-
-    @property
-    def identity(self) -> CounterfactualModelIdentity:
-        """束縛の判断に使う model identity を返す。"""
-        ...
-
-    @property
-    def feature_schema(self) -> ThermalFeatureSchema:
-        """入力の順序付き契約を返す。"""
-        ...
-
-    @property
-    def target_schema(self) -> ThermalTargetSchema:
-        """出力の順序付き契約を返す。"""
-        ...
-
-    def predict(self, observed: ObservedThermalInput) -> ThermalPrediction:
-        """いま掛かっている action に対する観測予測を返す（anchor 推論）。"""
-        ...
-
-    def predict_plan(self, planned: PlannedThermalInput) -> PlanPrediction:
-        """候補 action 列に対する将来観測を返す。制御・hardware の状態は変えない。"""
-        ...
 
 
 class MpcModelUnusableError(RuntimeError):

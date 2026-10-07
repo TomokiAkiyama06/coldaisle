@@ -83,7 +83,7 @@ stage と実効 stage が食い違ったままになり、構造化ログを見�
 
 Registry の互換 stage（`MpcModelBinding.authority_stage`）との照合も**実効 stage**と行う。
 実効 stage がそれを超えたら拒み、下回るぶんは通す。`load_production()` /
-`MpcModelBinding.for_control()` へ渡す stage も実効 stage である（上限を渡すと、
+`MpcModelBinding.from_verified_artifact()` の `authority_stage` へ渡す stage も実効 stage である（上限を渡すと、
 journal がまだ SHADOW の初日に SHADOW 互換の artifact が拒まれ、昇格の証拠を集められない）。
 
 ## 上げる（人の承認が要る）

@@ -102,6 +102,14 @@ def test_migration_creates_exactly_the_decided_objects():
         ("index", "ux_control_admin_audit_lease"),
         ("trigger", "control_admin_audit_no_update"),
         ("trigger", "control_admin_audit_no_delete"),
+        ("table", "calibration_activations"),
+        ("trigger", "calibration_activations_chain"),
+        ("trigger", "calibration_activations_no_update"),
+        ("trigger", "calibration_activations_no_delete"),
+        ("table", "csv_exports"),
+        ("index", "ix_csv_exports_day"),
+        ("trigger", "csv_exports_no_update"),
+        ("trigger", "csv_exports_no_delete"),
     }
 
 

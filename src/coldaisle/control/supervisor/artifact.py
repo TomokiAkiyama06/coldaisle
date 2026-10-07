@@ -204,7 +204,7 @@ class PolicyTrainingEvidence(_Frozen):
 
     #105（決定記録 0074 §2.2）から、episode の条件 hash は2段（設定の digest と他の条件）で
     作る。**それより前に作った artifact の値は v1 の算出**であり、同じ名前でも v2 の値と
-    比べられない（学習報告の版 `TRAINING_REPORT_SCHEMA_VERSION` 2 で区別する）。
+    比べられない（学習報告の版 `TRAINING_REPORT_SCHEMA_VERSION` で区別する。v2 以降が2段の算出）。
     """
 
     @model_validator(mode="after")
