@@ -9,6 +9,7 @@
   CSV だけを使う」。旧記録側への `Superseded by`（段 3 のマージをもって、の条件つき）の
   追記は本 PR で行った（README「追記のみ」の例外。§5 #8）。0008 §2.8 の CSV の形と 0010 §2.7 の「タイムゾーンは呼び出し側から受け取る」は
   変えない。dataset 用の再生と Dataset v2 の生成にだけ、export の manifest との照合を**足す**（§5 #1 / #4）
+- **Superseded by**: [0112](0112-training-replay-path-required.md)（部分。§2.8 の「export の記録の digest と `ReplayBindingV2` の中身」の最後の項（学習の入口は元の CSV の bytes を読み直さず、`--replay-path` は任意）と、§5 #15 のうち代替 (a)「学習時に `--replay-path` を必須にする」を採らなかった部分のみ。学習の入口は `--replay-path` を必須にして fingerprint と manifest の束縛を照合する。§5 #15 の推奨と他の節は有効）
 - **関連**: [0099](0099-calibration-change-log.md) §2.6（「再生の timezone」と「再生の入力と記録の DB の束縛」）/
   [0087](0087-dataset-v2-action-grid.md) §2.6 / [0094](0094-dataset-v2-settled-points.md) §2.4 /
   [0031](0031-thermal-dataset-contract.md) §2.3（1 source run 専用の DB と `dataset_source_run`）/
