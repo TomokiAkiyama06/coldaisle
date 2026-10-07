@@ -422,15 +422,23 @@ def test_plain_replay_without_manifests_still_reads_and_warns_once(tmp_path, cap
     assert err.count("timezone を照合していない") == 1
 
 
-def test_plain_replay_mixing_inputs_refuses_a_different_effective_timezone(two_days, tmp_path):
+def test_plain_replay_mixing_inputs_refuses_a_different_effective_timezone(two_days):
     out_dir, _ = two_days
     manifest_path(csv_of(out_dir, DAY_25)).unlink()
     refused("timezone_flag", out_dir, tz=ZoneInfo("UTC"), timezone_explicit=True)
-    # 省略時は既定値（Asia/Tokyo）が実効の timezone。manifest の UTC と違えば拒否する
-    for day in (DAY_24,):
-        rewrite_manifest(csv_of(out_dir, day), timezone="UTC")
-    with pytest.raises(ReplayBindingError):
-        replay(out_dir, tz=JST, timezone_explicit=False)
+
+
+def test_plain_replay_mixing_inputs_compares_the_default_timezone(tmp_path, rules):
+    """`--timezone` を省けば、manifest の無い CSV には既定値を当てる。manifest と違えば拒否する。"""
+    utc = ZoneInfo("UTC")
+    out_dir = export_days(
+        tmp_path,
+        rules,
+        [(DAY_24, utc, noon_stamps(DAY_24, utc)), (DAY_25, utc, noon_stamps(DAY_25, utc))],
+    )
+    manifest_path(csv_of(out_dir, DAY_25)).unlink()
+    refused("timezone_flag", out_dir, tz=JST, timezone_explicit=False)
+    assert replay(out_dir, tz=utc, timezone_explicit=True)._tz.key == "UTC"
 
 
 def test_plain_replay_mixing_inputs_with_the_same_timezone_continues(two_days, tmp_path, rules):
