@@ -9,7 +9,11 @@
   [0096](0096-calibration-binding-digest.md) §2.7 の3つ目の項と §5 #5 の推奨の列のうち、0090 に較正ファイルを足さない
   **理由**として書いた「L9 → artifact を読み込めない → 0089 の『artifact を持たない構成は Baseline より上を有効にしない』で
   既に authority が Baseline に落ちる」の部分のみ（L9 は worker で働くので、fand の authority は下がらない。Learned の提案が
-  届かず Fallback になる。§2.4）。結論（0090 の束縛に較正ファイルを足さない）は変えない。
+  届かず Fallback になる。§2.4）。結論（0090 の束縛に較正ファイルを足さない）は変えない／
+  [0096](0096-calibration-binding-digest.md) §2.7 の最後の項の1文目「L9 は `coldaisle-fand` の起動時にしか働かない」のみ
+  （L9 は MPC worker が束縛を作るたび（`run_id` の最初の frame・`run_id` の変化・`authority_stage` の上昇）に働き、
+  照合に使う較正は fand が起動時に読んだ値だけである。較正の変更が効くのは fand の再起動からで、取り込みだけを
+  再起動しても L9 による拒否は起きない点は変えない。§2.3 / §2.5）。
   0077 / 0096 の他の節は有効。旧記録側への `Superseded by` の追記は本 PR で行った。
   ほかは 0077 §2.3 / §2.10 段階 3 と 0079 §2.4 / §2.5 が決めていなかった点への追加
 - **関連**: [0077](0077-learned-proposal-handoff.md) §2.3 / §2.5 / §2.6 / §2.10 /
@@ -69,7 +73,9 @@ PR #239 は fand で読むところと loader の入口までを入れ、fand �
 
 - `LearnedFrame` に必須の欄 `calibration` を足す（既定値を持たない）。形は `RuntimeCalibration` の2状態をそのまま
   写す判別共用体とする
-  - 読めた: `status = "available"` と `offsets_c`（チャネル名 → ℃。`RuntimeCalibration.available` と同じく有限値だけ）
+  - 読めた: `status = "available"` と `offsets_c`（チャネル名 → ℃。`RuntimeCalibration.available` と同じく有限値だけ）。
+    較正ファイルが正しく `"offsets_c": {}` を持つときの `available({})`（全チャネル 0.0 として扱う正当な較正。
+    0096 §2.6 / §2.9）は、そのまま空の `offsets_c` の `available` として運び、`unavailable` と区別する
   - 読めなかった: `status = "unavailable"` と理由。**空の `offsets_c` で「読めなかった」を表さない**（0096 §2.6 と同じ理由。
     空の値は全チャネル 0.0 と同じ digest になる）
 - **毎 tick 同じ値**を載せる（fand は較正を起動時にしか読まない。`expected_artifacts` と同じ扱い。0077 §2.6）。
@@ -106,6 +112,12 @@ PR #239 は fand で読むところと loader の入口までを入れ、fand �
     `unavailable`（`null` の artifact は通す）より保守側であり、安全側＝Fallback の向きに一致する
 - 同じ `run_id` の中で frame の `calibration` が変わったとき（fand は起動時にしか読まないので正常では起きない）の
   扱いは §5 #2
+
+- **L9 が働く時点**は上の束縛を作る時点（`run_id` の最初の frame・`run_id` の変化・`authority_stage` の上昇）で、
+  fand の起動時だけではない。照合に使う較正は、どの時点でも fand が起動時に読んだ値（その `run_id` の frame の
+  `calibration`）だけなので、較正の変更が効くのは fand の再起動からである。0096 §2.7 の最後の項の1文目
+  「L9 は `coldaisle-fand` の起動時にしか働かない」はこの意味に読み替える（ヘッダの Supersedes）。同じ項の
+  「取り込みだけを再起動すると L9 による拒否は起きない」と、手順で閉じる決定（0096 §5 #9）は変えない
 
 ### 2.4 L9 に外れたときの帰結と authority
 
@@ -172,8 +184,9 @@ support（zone ごとの範囲・step ごとの cell・anchor からの遷移・
     ・壊れているときは `unavailable` が載り、理由に path を含まない（§5 #1 の形）
   - 往復: frame の `calibration` から復元した `RuntimeCalibration` で、fand が読んだ値と同じ digest になり L9 が通る・
     変えた offset で拒否される・`unavailable` で較正の掛かる artifact が拒否され `null` の artifact が通る
-  - worker: v2 の frame・`calibration` の欠けた / 型の違う frame・空の `offsets_c` を `available` と偽る形は使われず、
-    束縛が作られない（`available({})` や 0.0 で埋めない）
+  - worker: v2 の frame・`calibration` の欠けた / 型の違う frame は使われず、束縛が作られない（`available({})` や
+    0.0 で埋めない）。一方、fand が正しく読んだ `available({})` を運んだ frame は `available({})` として復元され、
+    `unavailable` と別に扱われる（0096 §2.9 の「`available({})`（空）は `unavailable` と別に扱われる」）
   - worker: `run_id` が変わると、`expected_artifacts` が同じでも新しい較正で束縛を作り直し、変えた offset で L9 に外れる
   - worker は較正ファイルを開かない（較正ファイルを置いた状態で frame に `unavailable` を載せると、較正の掛かる
     artifact は拒否される）
