@@ -655,6 +655,33 @@ class SqliteStore:
             legacy_until_ms=row["legacy_until_ms"],
         )
 
+    def control_trace_legacy_through_seq(self) -> int:
+        """移行前の行の ``seq`` の上限（決定記録 0087 §2.1）。移行前の行が無ければ 0。
+
+        ``ControlTracePruneState`` には載せない。読み取り API の応答（0071）を変えないためである。
+        """
+        row = self._conn.execute("SELECT legacy_through_seq FROM control_trace_prune").fetchone()
+        if row is None:  # pragma: no cover - migration が必ず1行入れ、削除はトリガが拒否する
+            raise RuntimeError("control_trace_prune の行が無い")
+        return int(row["legacy_through_seq"])
+
+    def control_traces_in_seq_order(
+        self, start_ms: int, end_ms: int
+    ) -> tuple[SequencedControlTrace, ...]:
+        """``ts_ms`` が半開区間 ``[start_ms, end_ms)`` の trace を記録した順（``seq``）で返す。
+
+        Thermal Dataset v2（決定記録 0087 §2.1）は「直近」を ``seq`` の順で確かめる。
+        ``ts_ms`` で並べ替えると、壁時計が戻った run を黙って並べ直してしまう。
+        """
+        if start_ms < 0 or end_ms < start_ms:
+            raise ValueError("control traceの期間が不正")
+        rows = self._conn.execute(
+            f"SELECT {_SEQUENCED_TRACE_COLUMNS} FROM control_traces "
+            "WHERE ts_ms >= ? AND ts_ms < ? ORDER BY seq",
+            (start_ms, end_ms),
+        ).fetchall()
+        return tuple(_sequenced_trace(row) for row in rows)
+
     def latest_control_trace(self) -> SequencedControlTrace | None:
         """最後に記録した trace（``seq`` が最大の行。決定記録 0071 §2.2）。
 
