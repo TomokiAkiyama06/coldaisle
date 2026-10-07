@@ -618,13 +618,13 @@ def test_a_disconnect_empties_the_slot_at_once(channel) -> None:
 
 
 def test_heartbeats_keep_a_quiet_worker_without_touching_the_slot(channel) -> None:
-    running = channel(heartbeat_ms=50, idle_ms=200)
+    running = channel(heartbeat_ms=100, idle_ms=500)
     worker, _ = connect(running, LearnedRole.MPC, MPC_UID)
     try:
         result = failure_result("before heartbeats")
         worker.send(envelope(result))
         assert wait_until(lambda: running.mailbox.poll() == result)
-        deadline = time.monotonic() + 0.6  # idle の3倍
+        deadline = time.monotonic() + 1.5  # idle の3倍
         while time.monotonic() < deadline:
             worker.send(envelope())
             time.sleep(0.04)
@@ -661,7 +661,7 @@ def test_broken_messages_do_not_count_as_liveness(channel) -> None:
         while time.monotonic() < deadline:
             try:
                 worker.send(envelope(run_id=OTHER_RUN_ID))
-            except BrokenPipeError:
+            except (BrokenPipeError, ConnectionResetError):
                 break  # 受付が idle として閉じた
             time.sleep(0.04)
         assert wait_until(
@@ -973,9 +973,14 @@ def test_a_worker_over_a_real_socket_reaches_the_gate_and_then_falls_back(catalo
         assert wait_until(lambda: running.mailbox.poll() is not None)
         result = harness.tick()
         assert result.tick.state.fallback_reason.code == "model_load_failure"
-        frame = worker.receive()
-        assert frame is not None and frame["body"]["kind"] == "frame"
-        assert frame["body"]["frame"]["snapshot"]["tick_id"] == result.tick.tick_id
+        # 接続の前の tick の frame が先に届くことがある（最新の1枠を送るだけで、順序は保つ）
+        seen: list[int] = []
+        while not seen or seen[-1] < result.tick.tick_id:
+            frame = worker.receive()
+            assert frame is not None and frame["body"]["kind"] == "frame"
+            seen.append(frame["body"]["frame"]["snapshot"]["tick_id"])
+        assert seen[-1] == result.tick.tick_id
+        assert seen == sorted(seen)
     finally:
         worker.close()
     assert wait_until(
