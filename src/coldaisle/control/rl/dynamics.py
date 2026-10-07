@@ -863,6 +863,14 @@ class AttestedThermalDynamics:
             raise DynamicsUnusableError(
                 f"model が検証済み artifact と一致しない: {','.join(mismatches)}"
             )
+        uncovered = sorted(set(model.feature_schema.metrics) - set(model.target_schema.metrics))
+        if uncovered:
+            # 次の window は最初の horizon の予測だけで作る（観測を作り直さない。0058 §2.2）。
+            # 予測しない feature の metric は埋められないので、step で落ちる前に束縛で拒む。
+            raise DynamicsUnusableError(
+                "learned simulator は window の全 metric を予測する artifact に限る"
+                f"（target に無い feature の metric: {uncovered}）"
+            )
         bound = object.__new__(cls)
         bound_identity = DynamicsIdentity(
             provenance=DynamicsProvenance.REGISTRY_ATTESTED,

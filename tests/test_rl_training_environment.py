@@ -814,6 +814,16 @@ def test_invariant_6_d_a_broken_or_borrowed_artifact_is_refused(
         AttestedThermalDynamics()
 
 
+def test_invariant_6_h_an_artifact_that_does_not_predict_the_window_is_refused(trained) -> None:
+    """window の metric を予測しない artifact は束縛で拒む（feature に AIR、target は CPU / GPU）。
+
+    次の window は予測だけで作り、予測しない metric を埋めない（0058 §2.2）。
+    step で落ちる前に止める。
+    """
+    with pytest.raises(DynamicsUnusableError, match=AIR.replace(".", r"\.")):
+        attested_dynamics(trained.verified)
+
+
 def test_invariant_6_e_a_simulated_episode_is_not_promotable(trained) -> None:
     """**近似 simulator の episode を昇格の根拠にしない。**"""
     environment, *_ = build_environment(trained)
