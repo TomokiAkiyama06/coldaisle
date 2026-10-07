@@ -79,8 +79,8 @@ class _Frozen(BaseModel):
 class CounterfactualModelIdentity(_Frozen):
     """内部モデルが自分について主張する事実。
 
-    **これは自称であって証拠ではない。** ``MpcModelBinding.for_control`` は、Registry（#104）が
-    発行した ``ArtifactAttestation`` と突き合わせ、食い違えば束縛しない。
+    **これは自称であって証拠ではない。** ``MpcModelBinding.from_verified_artifact`` は、
+    Registry（#104）が発行した ``ArtifactAttestation`` と突き合わせ、食い違えば束縛しない。
     verification / authority / model 版は attestation 側を正とし、自称値は照合にだけ使う。
     """
 
@@ -97,8 +97,8 @@ class CounterfactualModelIdentity(_Frozen):
     def from_manifest(cls, manifest: ThermalModelManifest) -> CounterfactualModelIdentity:
         """#84 の manifest をそのまま写す。**capability を書き換えない。**
 
-        v1 artifact は必ず ``observational_replay`` になるので、この identity で
-        ``for_control`` を呼ぶと拒否される。それが正しい振る舞いである。
+        v1 artifact は必ず ``observational_replay`` になるので、v1 は MPC に束縛されない
+        （``MpcModelBinding.from_verified_artifact`` が拒否する）。それが正しい振る舞いである。
         """
         return cls(
             model_id=manifest.model_id,

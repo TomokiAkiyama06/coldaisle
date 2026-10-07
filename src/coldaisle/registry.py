@@ -17,11 +17,11 @@ uv run coldaisle-registry validate --root var/model-registry \\
     --actor evaluator --reason "offline gates passed" --expected-revision 1
 uv run coldaisle-registry promote  --root var/model-registry --approval var/approval.json \\
     --shadow-evaluation-ref evaluation/shadow/1.2.0 \\
-    --feature-schema thermal-features-v1 --target-schema thermal-targets-v1 \\
+    --feature-schema thermal-features-v2 --target-schema thermal-targets-v1 \\
     --authority-stage shadow --expected-revision 2
 uv run coldaisle-registry rollback --root var/model-registry --kind thermal_model \\
     --approval var/rollback-approval.json \\
-    --feature-schema thermal-features-v1 --target-schema thermal-targets-v1 \\
+    --feature-schema thermal-features-v2 --target-schema thermal-targets-v1 \\
     --authority-stage shadow --expected-revision 3
 ```
 
