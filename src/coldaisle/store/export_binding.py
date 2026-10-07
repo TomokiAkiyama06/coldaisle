@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import sqlite3
 from collections.abc import Iterable, Mapping
+from dataclasses import dataclass
 from pathlib import Path
 
 from coldaisle.csv_export_manifest import ExportRecord, export_binding_sha256
@@ -23,6 +24,7 @@ from coldaisle.store.calibration_history import (
     read_calibration_history_with,
 )
 from coldaisle.store.csv_export import TABLE, read_csv_export
+from coldaisle.store.models import SequencedControlTrace
 
 
 class ExportBindingError(ValueError):
@@ -105,10 +107,21 @@ def read_production_records(
     ``row_seconds_sha256``）が一致しなければ :class:`ExportBindingError`（0100 §2.6 の 1 / 2）。
     呼び出し側はこれを通るまで被覆と変更の検査（0099 §2.6）へ進まない（同 3）。
     """
+    manifests = _require_manifests(records)
+    history, rows = read_training_records(path, (record.export_id for record in manifests))
+    return history, _bind(manifests, rows)
+
+
+def _require_manifests(records: Iterable[ExportRecord]) -> tuple[ExportRecord, ...]:
     manifests = tuple(records)
     if not manifests:
         raise ExportBindingError("照合する export が無い")
-    history, rows = read_training_records(path, (record.export_id for record in manifests))
+    return manifests
+
+
+def _bind(
+    manifests: tuple[ExportRecord, ...], rows: Mapping[str, ExportRecord | None]
+) -> ExportBinding:
     for record in manifests:
         row = rows.get(record.export_id)
         if row is None:
@@ -125,4 +138,76 @@ def read_production_records(
             raise ExportBindingError(
                 f"csv_exports の行が manifest と違う: {record.export_id} の {differing}"
             )
-    return history, ExportBinding(_SEAL, manifests)
+    return ExportBinding(_SEAL, manifests)
+
+
+@dataclass(frozen=True)
+class TrainingProduction:
+    """学習の入口が本番の DB から1つの read transaction で読んだもの（決定記録 0112 §2.3）。"""
+
+    history: CalibrationHistory
+    binding: ExportBinding
+    rows: Mapping[str, ExportRecord | None]
+    """``csv_exports`` の行（入力の manifest の ``export_id`` ごと）。"""
+    traces: tuple[SequencedControlTrace, ...]
+    """run の期間 ``[start_ms, end_ms)`` の ControlTick の trace（記録した順）。"""
+    pruned_before_ms: int | None
+    """trace の削除の境界。これより前の ``ts_ms`` の行は消したことがある（0071 §2.2a）。"""
+    legacy_through_seq: int
+    """移行前の行の ``seq`` の上限（0087 §2.1）。"""
+
+
+def read_training_production(
+    path: Path, records: Iterable[ExportRecord], *, start_ms: int, end_ms: int
+) -> TrainingProduction:
+    """学習の入口: 較正の記録・``csv_exports``・run の期間の trace を同じ read transaction で読む。
+
+    入力の manifest は :func:`read_production_records` と同じく全欄で照合する（0100 §2.6）。
+    ControlTick の出どころは本番の DB の trace（決定記録 0112 §2.3）。削除の境界と移行前の
+    境界も同じ transaction で読み、呼び出し側が「trace が消えた期間」を判定する。
+    """
+    manifests = _require_manifests(records)
+    if start_ms < 0 or end_ms <= start_ms:
+        raise ValueError("run の期間が不正")
+
+    def read(
+        conn: sqlite3.Connection,
+    ) -> tuple[dict[str, ExportRecord | None], tuple[SequencedControlTrace, ...], int | None, int]:
+        rows = _read_rows(conn, (record.export_id for record in manifests))
+        traces = tuple(
+            SequencedControlTrace(
+                seq=int(row[0]),
+                ts_ms=int(row[1]),
+                tick_id=int(row[2]),
+                schema_version=int(row[3]),
+                trace_json=str(row[4]),
+            )
+            for row in conn.execute(
+                "SELECT seq, ts_ms, tick_id, schema_version, trace_json FROM control_traces "
+                "WHERE ts_ms >= ? AND ts_ms < ? ORDER BY seq",
+                (start_ms, end_ms),
+            )
+        )
+        prune = conn.execute(
+            "SELECT pruned_before_ms, legacy_through_seq FROM control_trace_prune"
+        ).fetchone()
+        if prune is None:
+            raise ExportBindingError("本番の DB に control_trace_prune の行が無い")
+        return rows, traces, None if prune[0] is None else int(prune[0]), int(prune[1])
+
+    try:
+        history, (rows, traces, pruned_before_ms, legacy_through_seq) = (
+            read_calibration_history_with(path, read)
+        )
+    except (CalibrationHistoryError, ExportBindingError):
+        raise
+    except ValueError as error:
+        raise ExportBindingError(f"本番の DB の行を読めない: {error}") from error
+    return TrainingProduction(
+        history=history,
+        binding=_bind(manifests, rows),
+        rows=rows,
+        traces=traces,
+        pruned_before_ms=pruned_before_ms,
+        legacy_through_seq=legacy_through_seq,
+    )

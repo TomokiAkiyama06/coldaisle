@@ -181,16 +181,23 @@ v1 との違い（規則の正本は [0087](decisions/0087-dataset-v2-action-gri
 - **`replay_bindings`**（v2 の manifest。決定記録 0100 §2.8）: source run ごとに、再生の timezone・
   `export_binding_sha256`・export ごとの `export_id` / `export_record_sha256` / 日の区間 / `csv_sha256` /
   `row_seconds_sha256` を持つ。CSV の basename は書かない。v1 の manifest と `SourceRun` は変わらない
-- **学習の入口**（`calibration_log.verify_training_export_binding`）: `replay_bindings` の無い dataset を拒否し、
-  各 `export_id` の `csv_exports` の行（較正の記録と同じ読み取り専用の接続・同じ read transaction で
-  `store.export_binding.read_training_records` が読む）から `export_record_sha256` と `export_binding_sha256` を
-  計算し直して照合し、すべての example の期間が束縛した export の日の区間の和に収まることを確かめる。
-  さらに source run ごとに**元の再生の入力（`--replay-path`。日次 CSV と manifest）を必須**で受け取り、
-  fingerprint が `SourceRun.source_sha256` と、manifest から計算した `(timezone, export_binding_sha256)` が
-  `ReplayBindingV2` と一致することを確かめる（決定記録 [0112](decisions/0112-training-replay-path-required.md)。
-  同じ日を覆う別の正当な export の束縛を写した dataset を、元の CSV の bytes まで遡って拒否する）。
-  **学習には元の日次 CSV と manifest が要る**（公開済みの dataset だけでは学習しない）。学習の CLI はまだ無く、
-  関数の入口まで（CLI への配線は学習の CLI の PR）
+- **学習の入口**（`training_entry.verify_training_dataset_v2`。決定記録 [0112](decisions/0112-training-replay-path-required.md)）:
+  dataset・本番の DB・**元の再生の入力（`--replay-path`。日次 CSV と manifest）**・dataset を作ったときと同じ宣言・
+  品質の設定を必須で受け取り、次を確かめる。1つでも外れれば学習しない
+  1. `replay_bindings` があり、source run が1つ。元の入力の fingerprint が `SourceRun.source_sha256` と、manifest
+     から計算した `(timezone, export_binding_sha256)` が `ReplayBindingV2` と一致する
+  2. 本番の DB を読み取り専用で開き、較正の記録・`csv_exports` の行・run の期間の ControlTick の trace を同じ read
+     transaction で読む（`store.export_binding.read_training_production`）。manifest を行と全欄で照合し、
+     `calibration_log.verify_training_export_binding` で `export_record_sha256` / `export_binding_sha256` / 写した欄 /
+     example の期間を確かめる。trace が保持期間で消えた期間（`pruned_before_ms` が run の開始より後）と移行前の行を
+     含む期間は拒否する
+  3. 元の入力を一時の専用 DB（OS の一時ディレクトリ。検査の後に消す）へ dataset 用の再生で取り込み、本番の trace を
+     `seq` ごと写し（`SqliteStore.copy_control_traces`）、同じ spec と宣言で builder を走らせ、作り直した公開物の bytes
+     （manifest と `examples.jsonl`）が渡された dataset と完全に一致することを求める
+  **学習には元の日次 CSV と manifest が要る**。`control_trace_sha256` は `seq` を含むので、学習に使う dataset の専用 DB の
+  ControlTick も、本番の trace を `copy_control_traces` で `seq` ごと写したものにする（`coldaisle-dataset` 側の配線は
+  未決。0112 §5）。学習の CLI はまだ無く、関数の入口まで。較正ファイルとの照合（`verify_training_calibration`）は
+  返した記録で続けて行う
 - `control_trace_sha256` は run の全 ControlTick を `seq` 付きで hash する（v2 は anchor 以外の tick も使うため）
 
 ### v2 の CLI（決定記録 0109）
