@@ -10,6 +10,7 @@
 
 from __future__ import annotations
 
+import stat
 from pathlib import Path
 from typing import Any, Literal, Self
 
@@ -57,6 +58,9 @@ class RoleSocket(SocketSettings):
     def _a_role_names_its_group(self) -> Self:
         if self.group is None:
             raise ValueError("Learned のソケットには役割の専用グループ（group）を必ず設定する")
+        if not self.mode_bits & stat.S_IWGRP:
+            # worker は別の uid で、同じ uid は拒む。グループが書けなければ誰も接続できない
+            raise ValueError(f"Learned のソケットの mode はグループが書ける値にする: {self.mode}")
         return self
 
 

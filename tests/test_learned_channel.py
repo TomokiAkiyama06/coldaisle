@@ -348,6 +348,8 @@ def test_the_shipped_config_is_valid_and_names_a_group_per_role() -> None:
         (lambda d: d["sockets"]["supervisor"].update(path=d["sockets"]["mpc"]["path"]), "path"),
         (lambda d: d["sockets"]["mpc"].update(group=None), "専用グループ"),
         (lambda d: d["sockets"]["mpc"].update(mode="0666"), "other"),
+        (lambda d: d["sockets"]["mpc"].update(mode="0640"), "グループが書ける"),
+        (lambda d: d["sockets"]["supervisor"].update(mode="0600"), "グループが書ける"),
         (lambda d: d.update(extra=1), "extra"),
     ],
 )
