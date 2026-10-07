@@ -9,7 +9,9 @@ Thermal Dataset v2（0087）の train だけから、計画 action の列（step
   基準に使う）
 - anchor action は ``prior_action``（anchor の tick より厳密に前で直近の tick の effective。
   0087 §2.7）
-- window 幅・horizon・格子・ridge lambda・authority の互換・較正の digest に既定値を置かない
+- window 幅・horizon・格子・ridge lambda・authority の互換・較正の値に既定値を置かない
+- 較正の digest は呼び出し側から受け取らず、渡された**較正の値**と自分が作った ``metric_binding``
+  から loader の L9 と同じ関数で計算する（決定記録 0096 §2.4 / §2.6）
 
 trainer が返すのは **Profile v2 を含まない学習結果**である。Profile v2 を train / validation から
 作るのは段 3（#85）で、:func:`assemble_counterfactual_artifact` が両者を1つの artifact に封じる。
@@ -22,10 +24,11 @@ import os
 import re
 from itertools import pairwise
 from pathlib import Path
-from typing import Self
+from typing import Annotated, Self
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from coldaisle.control.model.calibration_digest import calibration_digest
 from coldaisle.control.model.counterfactual import (
     ANCHOR_ACTION_RULE,
     DATASET_V2,
@@ -68,7 +71,6 @@ from coldaisle.control.model.thermal import (
     RidgeModelPayload,
     RidgeOutput,
     SemanticVersion,
-    Sha256,
     ThermalTargetSchema,
     TrainingSourceProvenance,
     _target_outputs,
@@ -205,8 +207,12 @@ class CounterfactualTrainingSpec(_Frozen):
     ridge_lambda: float = Field(gt=0.0, allow_inf_nan=False)
     authority_compatibility: tuple[AuthorityStage, ...] = Field(min_length=1)
     """実測評価で裏づけた stage だけを SHADOW から順に（0079 §2.3）。"""
-    calibration_sha256: Sha256 | None
-    """学習データに効いていた較正値の digest。dataset を作る側が明示する（0079 §2.3）。"""
+    calibration_offsets_c: dict[str, Annotated[float, Field(allow_inf_nan=False)]]
+    """学習データの期間に効いていた較正の値（``Calibration.offsets_c``。チャネル名 → ℃）。
+
+    合成の起点がその期間の較正ファイルを明示して読んで渡す（既定の path も既定値も置かない。
+    0079 §2.3 / 0096 §2.4）。digest は trainer が計算する（0096 §2.6）。
+    """
     code_commit: str | None = Field(default=None, pattern=r"^[0-9a-f]{7,64}$")
 
     @field_validator("created_at")
@@ -445,7 +451,9 @@ def train_counterfactual_ridge(
         authority_compatibility=training.authority_compatibility,
         training_data=training_data,
         metric_binding=metric_binding,
-        calibration_binding=CalibrationBinding(sha256=training.calibration_sha256),
+        calibration_binding=CalibrationBinding(
+            sha256=calibration_digest(metric_binding.entries, training.calibration_offsets_c)
+        ),
         hyperparameters=RidgeHyperparameters(ridge_lambda=training.ridge_lambda),
         code_commit=training.code_commit,
         feature_schema=feature_schema,

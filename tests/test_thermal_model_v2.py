@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -18,6 +19,7 @@ import coldaisle.control.model.counterfactual as counterfactual_module
 import coldaisle.control.model.counterfactual_training as training_v2_module
 import coldaisle.control.model_registry as registry_module
 from coldaisle.clock import SimulatedClock
+from coldaisle.control.model.calibration_digest import RuntimeCalibration
 from coldaisle.control.model.confidence import (
     ConfidenceProfileSpec,
     MissingPatternCount,
@@ -109,7 +111,15 @@ SOURCE_ID = "source-00000000000000000000000000000002"
 DATASET_ID = "dataset-00000000000000000000000000000002"
 SHA_A = "a" * 64
 SHA_B = "b" * 64
-CALIBRATION_SHA = "c" * 64
+CALIBRATION_OFFSETS: dict[str, float] = {
+    "front_intake": 0.191,
+    "room_temp": -0.31,
+    "gpu_exhaust": 0.05,
+}
+"""学習時の較正の値。fixture の artifact で較正の掛かる metric は ``air.front_intake`` だけ。"""
+RUNTIME = RuntimeCalibration.available(CALIBRATION_OFFSETS)
+FIXTURE_CALIBRATION_BYTES = b'{"air.front_intake":0.191}\n'
+"""fixture の artifact の digest の元（0096 §2.3）。``d.gpu_rise`` は2つに展開される。"""
 FEATURES = ("air.front_intake", "gpu.0.core")
 TARGETS = ("cpu.package", "d.gpu_rise")
 HORIZONS = (1_000, 2_000)
@@ -319,7 +329,7 @@ def training_spec(**updates: Any) -> CounterfactualTrainingSpec:
         "created_at": "2026-10-07T10:00:00+09:00",
         "ridge_lambda": 0.25,
         "authority_compatibility": (AuthorityStage.SHADOW,),
-        "calibration_sha256": CALIBRATION_SHA,
+        "calibration_offsets_c": dict(CALIBRATION_OFFSETS),
         "code_commit": "0123456789abcdef",
     }
     values.update(updates)
@@ -364,7 +374,7 @@ def profile_for(trained: CounterfactualTrainedModel) -> ConfidenceProfileV2:
         train_example_count=trained.training_data.train_example_count,
         feature_ranges=tuple(
             ValueRange(source=metric, minimum=0.0, maximum=100.0, observed_count=1)
-            for metric in FEATURES
+            for metric in trained.feature_schema.metrics
         ),
         fan_ranges=zone_ranges(0.0, 1.0),
         missing_patterns=(MissingPatternCount(unavailable_metrics=(), count=1),),
@@ -466,12 +476,12 @@ def load(
     verified_artifact: object,
     *,
     catalog: MetricCatalog = CATALOG,
-    calibration: str | None = CALIBRATION_SHA,
+    calibration: RuntimeCalibration = RUNTIME,
 ) -> RegistryCounterfactualThermalModel:
     return RegistryCounterfactualThermalModel.from_verified_artifact(
         verified_artifact,  # type: ignore[arg-type]
         metric_catalog=catalog,
-        calibration_sha256=calibration,
+        calibration=calibration,
     )
 
 
@@ -561,7 +571,10 @@ def test_trainer_records_provenance_windows_and_bindings(
     assert data.window.validation.start_ms >= VALIDATION_START_MS
     variation = data.action_variation_summary.front
     assert variation.transitions == 24 * STEPS and 0 < variation.changed <= variation.transitions
-    assert trained.calibration_binding.sha256 == CALIBRATION_SHA
+    # digest は trainer が較正の値から計算する（0096 §2.6）。湿度・未使用チャネルは入らない
+    assert (
+        trained.calibration_binding.sha256 == hashlib.sha256(FIXTURE_CALIBRATION_BYTES).hexdigest()
+    )
     entries = {entry.metric: entry for entry in trained.metric_binding.entries}
     assert set(entries) == set(FEATURES) | set(TARGETS)
     derived = entries["d.gpu_rise"].derived
@@ -597,11 +610,22 @@ def test_authority_compatibility_must_start_at_shadow_without_gaps(
         training_spec(authority_compatibility=stages)
 
 
-def test_calibration_digest_has_no_default() -> None:
+def test_calibration_values_have_no_default() -> None:
     values = training_spec().model_dump()
-    values.pop("calibration_sha256")
-    with pytest.raises(ValidationError, match="calibration_sha256"):
+    values.pop("calibration_offsets_c")
+    with pytest.raises(ValidationError, match="calibration_offsets_c"):
         CounterfactualTrainingSpec(**values)
+
+
+def test_trainer_no_longer_accepts_a_digest_from_the_caller() -> None:
+    # 呼び出し側が digest を手で作る経路は残さない（0096 §2.6）
+    with pytest.raises(ValidationError, match="calibration_sha256"):
+        training_spec(calibration_sha256=SHA_A)
+
+
+def test_trainer_refuses_non_finite_calibration_values() -> None:
+    with pytest.raises(ValidationError):
+        training_spec(calibration_offsets_c={"front_intake": float("nan")})
 
 
 def test_trainer_requires_the_published_v2_dataset(tmp_path: Path) -> None:
@@ -978,21 +1002,170 @@ def test_l8_is_also_checked_when_the_artifact_is_created(
     assert caught.value.check is ArtifactCheck.METRIC_BINDING
 
 
-@pytest.mark.parametrize("runtime", [SHA_A, None])
-def test_l9_rejects_a_calibration_digest_that_differs_from_runtime(
-    artifact: CounterfactualThermalModelArtifact, runtime: str | None
+# ------------------------------------------------ L9（較正の digest。決定記録 0096）
+
+
+def renamed_dataset(name: str) -> ThermalDatasetV2:
+    """fixture の dataset の ``air.front_intake`` を ``name`` に置き換える（metric の集合だけ）。"""
+    raw = thermal_dataset().model_dump_json().replace('"air.front_intake"', json.dumps(name))
+    doc = json.loads(raw)
+    items = tuple(DatasetExampleV2.model_validate_json(json.dumps(e)) for e in doc["examples"])
+    doc["manifest"]["examples_sha256"] = examples_sha256(items)
+    manifest = DatasetManifestV2.model_validate_json(json.dumps(doc["manifest"]))
+    return ThermalDatasetV2(manifest=manifest, examples=items)
+
+
+def renamed_catalog(name: str) -> MetricCatalog:
+    values = CATALOG.model_dump(mode="python")
+    values["metrics"][name] = {"unit": "°C", "label": name}
+    values["derived"]["d.gpu_rise"]["subtrahend"] = name
+    return MetricCatalog.model_validate(values)
+
+
+def artifact_using(
+    tmp_path: Path, name: str, offsets: dict[str, float] | None = None
+) -> tuple[bytes, MetricCatalog]:
+    """``air.front_intake`` の代わりに ``name`` を使う artifact の bytes と、それに合う catalog。"""
+    dataset = renamed_dataset(name)
+    catalog = renamed_catalog(name)
+    trained = train_counterfactual_ridge(
+        published(dataset, tmp_path),
+        split(dataset),
+        training_spec(
+            calibration_offsets_c=dict(CALIBRATION_OFFSETS) if offsets is None else offsets
+        ),
+        metric_catalog=catalog,
+    )
+    payload = canonical_counterfactual_artifact_bytes(
+        assemble_counterfactual_artifact(trained, profile_for(trained))
+    )
+    return payload, catalog
+
+
+UNAVAILABLE = RuntimeCalibration.unavailable("config/calibration.json を読めなかった（試験）")
+
+
+def test_l9_accepts_the_artifact_with_the_calibration_it_was_trained_with(
+    artifact: CounterfactualThermalModelArtifact,
 ) -> None:
     payload = canonical_counterfactual_artifact_bytes(artifact)
-    rejected(ArtifactCheck.CALIBRATION, verified(payload), calibration=runtime)
-
-
-def test_l9_accepts_null_only_when_both_sides_use_no_calibration(tmp_path: Path) -> None:
-    trained_without = train(tmp_path, calibration_sha256=None)
-    payload = canonical_counterfactual_artifact_bytes(
-        assemble_counterfactual_artifact(trained_without, profile_for(trained_without))
+    load(verified(payload))
+    # 使わないチャネルの再較正と、明示の 0.0 / 欠落の違いでは失効しない（0096 §2.9 の感度・実効値）
+    load(
+        verified(payload),
+        calibration=RuntimeCalibration.available(
+            {"front_intake": 0.191, "room_temp": 5.0, "room_humidity": 9.0, "top_exhaust": 0.0}
+        ),
     )
-    load(verified(payload), calibration=None)
-    rejected(ArtifactCheck.CALIBRATION, verified(payload), calibration=CALIBRATION_SHA)
+
+
+@pytest.mark.parametrize(
+    "offsets",
+    [
+        {**CALIBRATION_OFFSETS, "front_intake": math.nextafter(0.191, math.inf)},
+        {**CALIBRATION_OFFSETS, "front_intake": math.nextafter(0.191, -math.inf)},
+        {"room_temp": -0.31},
+    ],
+)
+def test_l9_rejects_when_a_used_offset_changes(
+    artifact: CounterfactualThermalModelArtifact, offsets: dict[str, float]
+) -> None:
+    payload = canonical_counterfactual_artifact_bytes(artifact)
+    rejected(
+        ArtifactCheck.CALIBRATION,
+        verified(payload),
+        calibration=RuntimeCalibration.available(offsets),
+    )
+
+
+def test_l9_rejects_a_calibrated_artifact_when_runtime_calibration_is_unavailable(
+    tmp_path: Path,
+) -> None:
+    # 全 offset 0.0 で学習した null でない artifact。available({}) は通り、unavailable は通らない
+    payload, catalog = artifact_using(tmp_path, "air.front_intake", offsets={})
+    parsed = CounterfactualThermalModelArtifact.model_validate_json(payload)
+    assert parsed.manifest.calibration_binding.sha256 is not None
+    load(verified(payload), catalog=catalog, calibration=RuntimeCalibration.available({}))
+    detail = rejected(
+        ArtifactCheck.CALIBRATION, verified(payload), catalog=catalog, calibration=UNAVAILABLE
+    )
+    assert "読めなかった" in detail
+
+
+@pytest.mark.parametrize("name", ["gpu.0.board", "air.room_humidity"])
+def test_l9_accepts_null_artifacts_regardless_of_runtime_calibration(
+    tmp_path: Path, name: str
+) -> None:
+    payload, catalog = artifact_using(tmp_path, name)
+    parsed = CounterfactualThermalModelArtifact.model_validate_json(payload)
+    assert parsed.manifest.calibration_binding.sha256 is None
+    for runtime in (
+        RUNTIME,
+        RuntimeCalibration.available({}),
+        RuntimeCalibration.available({"room_humidity": 3.0, "front_intake": 1.0}),
+        UNAVAILABLE,
+    ):
+        load(verified(payload), catalog=catalog, calibration=runtime)
+
+
+def _declare_null(doc: dict[str, Any]) -> None:
+    doc["manifest"]["calibration_binding"]["sha256"] = None
+
+
+def _declare_digest(doc: dict[str, Any]) -> None:
+    doc["manifest"]["calibration_binding"]["sha256"] = SHA_A
+
+
+@pytest.mark.parametrize("runtime", [RUNTIME, RuntimeCalibration.available({}), UNAVAILABLE])
+def test_l9_does_not_trust_a_null_declaration_for_calibrated_metrics(
+    artifact: CounterfactualThermalModelArtifact, runtime: RuntimeCalibration
+) -> None:
+    detail = rejected(
+        ArtifactCheck.CALIBRATION, tampered(artifact, _declare_null), calibration=runtime
+    )
+    assert "null である" in detail
+
+
+@pytest.mark.parametrize("name", ["gpu.0.board", "air.room_humidity"])
+@pytest.mark.parametrize("runtime", [RUNTIME, UNAVAILABLE])
+def test_l9_rejects_a_digest_declared_for_an_artifact_without_calibrated_metrics(
+    tmp_path: Path, name: str, runtime: RuntimeCalibration
+) -> None:
+    payload, catalog = artifact_using(tmp_path, name)
+    parsed = CounterfactualThermalModelArtifact.model_validate_json(payload)
+    detail = rejected(
+        ArtifactCheck.CALIBRATION,
+        tampered(parsed, _declare_digest),
+        catalog=catalog,
+        calibration=runtime,
+    )
+    assert "null でない" in detail
+
+
+def test_l9_rejects_a_nested_derived_expansion(
+    artifact: CounterfactualThermalModelArtifact,
+) -> None:
+    # runtime の catalog では L8 が先に拒否するので、L9 だけを直接確かめる
+    doc = document(artifact)
+    for entry in doc["manifest"]["metric_binding"]["entries"]:
+        if entry["derived"] is not None:
+            entry["derived"]["subtrahend"] = "d.intake_rise"
+    reseal(doc)
+    parsed = CounterfactualThermalModelArtifact.model_validate_json(encode(doc))
+    with pytest.raises(CounterfactualArtifactRejectedError) as caught:
+        counterfactual_module.check_artifact_contents(
+            parsed, metric_catalog=None, calibration=RUNTIME, check_calibration=True
+        )
+    assert caught.value.check is ArtifactCheck.CALIBRATION
+
+
+def test_l9_requires_a_runtime_calibration_object(
+    artifact: CounterfactualThermalModelArtifact,
+) -> None:
+    payload = canonical_counterfactual_artifact_bytes(artifact)
+    for value in (None, {}, SHA_A):
+        with pytest.raises(TypeError):
+            load(verified(payload), calibration=value)  # type: ignore[arg-type]
 
 
 def test_l10_rejects_a_nonzero_coefficient_on_a_plan_step_after_the_horizon(

@@ -12,6 +12,7 @@ import math
 from dataclasses import dataclass
 
 from coldaisle import channels
+from coldaisle.calibration_offsets import calibration_applies
 from coldaisle.clock import Clock
 from coldaisle.ingest.calibration import Calibration
 from coldaisle.ingest.protocol import RawSample
@@ -40,8 +41,6 @@ DEVICE_RESTART_METRIC = channels.DEVICE_RESTART_METRIC
 イベント表（#36）はまだ無い。ログだけに残すと後から集計できないため、
 当面は `readings` に置く。#36 で表ができたら移す。
 """
-
-HUMIDITY_SUFFIX = "_humidity"
 
 
 @dataclass(frozen=True)
@@ -151,8 +150,9 @@ class Normalizer:
             return Reading(metric=metric, value=None, quality=quality)
         if quality is not Quality.OK or value is None:
             return Reading(metric=metric, value=value, quality=quality)
-        if metric.endswith(HUMIDITY_SUFFIX):
-            # 較正値の単位は℃。%RH には当てない（#13 で扱うのは温度チャネルのみ）
+        if not calibration_applies(metric):
+            # 較正値の単位は℃。%RH には当てない（#13 で扱うのは温度チャネルのみ）。
+            # 判定は較正の digest と共有する（決定記録 0096 §5 #3）
             return Reading(metric=metric, value=value, quality=quality)
         return Reading(
             metric=metric, value=value + self._calibration.offset_for(channel), quality=quality
