@@ -769,6 +769,22 @@ def test_poll_returns_nothing_once_the_worker_is_gone_even_without_the_lock() ->
     mailbox.close()
 
 
+def test_poll_does_not_return_a_proposal_between_the_state_change_and_the_slot_clear() -> None:
+    """受付スレッドが状態を変えてから枠を空にするまでの間に lock を取っても古い提案を返さない。"""
+    mailbox = LearnedMailbox()
+    mailbox.mark_stopping()
+    mailbox.connected(LearnedRole.MPC)
+    mailbox.place_mpc(failure_result())
+    assert mailbox.poll() is not None
+    # disconnected() の前半（状態だけを変えた）
+    mailbox._states[LearnedRole.MPC] = LearnedChannelState.WORKER_DISCONNECTED
+    assert mailbox.poll() is None
+    mailbox.connected(LearnedRole.MPC)
+    with mailbox._lock:
+        assert mailbox.poll() is None, "lock を取れない tick にも古い写しを返さない"
+    mailbox.close()
+
+
 def test_the_frame_is_built_from_the_same_tick_after_the_heartbeat(catalog) -> None:
     sink = RecordingSink()
     harness = Harness(

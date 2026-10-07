@@ -127,6 +127,11 @@ class LearnedMailbox:
                 return None
             return self._last_polled
         try:
+            # **lock の中でも状態を確かめ直す。** 受付スレッドは状態を先に変えてから lock を
+            # 待つので、その間に lock を取った tick が切断済みの古い提案を返さないため
+            if self.state(LearnedRole.MPC) is not LearnedChannelState.CONNECTED:
+                self._last_polled = None
+                return None
             self._last_polled = self._mpc
             return self._mpc
         finally:
