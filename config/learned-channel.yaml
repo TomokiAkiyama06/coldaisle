@@ -1,0 +1,59 @@
+# coldaisle-fand と Learned worker（Learned MPC / RL Supervisor）の経路の設定（#86 / 決定記録 0077 §2.7）
+#
+# coldaisle-fand が役割ごとの SOCK_SEQPACKET の Unix ソケットで待ち受け、worker が接続します。
+# worker から受け取るのは提案（MpcProposal）と heartbeat だけで、coldaisle-fand から送るのは
+# 毎 tick の frame だけです。worker の提案が出せるのは requested まで（Reactive Guard と
+# Critical Safety は迂回できません）。
+#
+# **制御の閾値ではなく経路の形だけを持ちます。** safety.yaml にも、Control Config の4ファイル
+# （fan-hardware / safety / fan-policy / air-balance）にも入れません。
+# coldaisle-fand は `--learned-channel-config` で与えたときだけ読みます（省くと経路を開きません）。
+# 不正・ソケットを開けない・グループを解決できない・2つのグループに同じ uid が属するときは、
+# 経路を開かずに Fallback / RulePolicy で運転を続けます（decision trace の detail に channel_disabled）。
+#
+# 配置の必須条件（0077 §2.7）:
+# - 役割ごとに専用のグループを作り、2つのグループに同じ uid を入れない（起動時と接続ごとに確かめます）
+# - coldaisle-fand と同じ uid・root は暗黙には認めません（グループに入れなければ接続できません）
+# - 読み取り API・AI 層・coldaisle-eventd の実行ユーザーを worker のグループに入れない（ルール1）
+
+version: 1
+
+sockets:
+  # 規則は control-admin.yaml と同じ（0045 §2.2 / 0072 §2.5）。本番は systemd の RuntimeDirectory 配下を
+  # 指定します。other が書ける親ディレクトリ、ソケット以外の既存ファイル、既に応答するソケットでは開きません。
+  # **group の値は仮の名前です。** 配置先で作った専用グループ名に置き換えてください（null は不可）。
+  # **親ディレクトリは役割ごとに分けます**（決定記録 0095）。親は役割のグループで 0750 として作られ、
+  # 共通の親にすると、もう一方の役割のグループがたどれずに経路全体を開けません。
+  # **共通の祖先（開発では var/run、本番では systemd の RuntimeDirectory）は起動前に用意し、両方の役割の
+  # グループがたどれる（g+x か o+x）ようにしてください。** 無い祖先は最初に待ち受ける役割のグループで 0750 として
+  # 作られ、もう一方がたどれなくなります（決定記録 0095 §2.7。本番の値は worker の unit テンプレートで確定）。
+  mpc:
+    path: var/run/learned-mpc/mpc.sock
+    mode: "0660"
+    group: coldaisle-learn-mpc
+  supervisor:
+    path: var/run/learned-rl/supervisor.sock
+    mode: "0660"
+    group: coldaisle-learn-rl
+
+limits:
+  # 1メッセージ（両方向）の上限バイト数。超えた提案は受け取らずに捨て、超えた frame は送らずに捨てます。
+  max_message_bytes:
+    value: 65536
+    status: provisional
+    basis: "決定記録 0077 §5（実測を待つ値）。段階 1 の試験用の設定で frame は約 6 KB。10 倍の余裕を取った暫定値"
+  # listen() の待ち行列。同時に持つ接続は役割ごとに1つ（0077 §2.7）で、これはその手前の待ち行列です。
+  listen_backlog: 4
+
+# worker が提案・失敗を送らない間も heartbeat を送る間隔（ミリ秒）。接続を認めた最初の応答で worker へ知らせます。
+heartbeat_interval_ms:
+  value: 1000
+  status: provisional
+  basis: "決定記録 0077 §5（実測を待つ値）。safety.yaml の tick_ms と同じ桁の暫定値"
+
+# 最後の有効なメッセージ（提案・失敗・heartbeat）からこの時間黙った接続を閉じます（worker_idle）。
+# **heartbeat_interval_ms の3倍以上**（読み込み時に確かめ、満たさなければ経路を開きません）。
+worker_idle_timeout_ms:
+  value: 5000
+  status: provisional
+  basis: "決定記録 0077 §5（実測を待つ値）。heartbeat を4回取りこぼすまで待つ暫定値"

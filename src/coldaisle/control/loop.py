@@ -55,6 +55,13 @@ from coldaisle.control.fallback.gate import (
     SnapshotStatus,
 )
 from coldaisle.control.hardware.simulated import FanHardwareBackend, FanHardwareResult
+from coldaisle.control.learned_handoff import (
+    LearnedChannelHealth,
+    LearnedChannelState,
+    LearnedFrame,
+    LearnedFrameSink,
+    LearnedRole,
+)
 from coldaisle.control.logging import ControlTraceLogger
 from coldaisle.control.mpc.controller import MpcProposal
 from coldaisle.control.operating_mode import AdminAuthorityCommand, AdminModeTracker
@@ -626,6 +633,8 @@ class ControlLoop:
         regime: WorkloadRegimeEstimator | None = None,
         learned_source: LearnedProposalSource | None = None,
         rl_supervisor_source: SupervisorOutputSource | None = None,
+        learned_sink: LearnedFrameSink | None = None,
+        learned_health: LearnedChannelHealth | None = None,
         shadow: ShadowRecorder | None = None,
         trace: ControlTraceLogger | None = None,
         authority: AuthorityObserver | None = None,
@@ -636,11 +645,19 @@ class ControlLoop:
 
         渡さなければ ``fan-policy.yaml`` の ``air_balance_coordination.mode`` から作る
         （``off`` なら作らない）。渡すなら設定と同じ ``mode`` でなければ拒む。
+
+        ``learned_sink`` / ``learned_health`` は Learned worker との経路（決定記録 0077 §2.2）。
+        ``coldaisle-fand`` は ``learned_health`` を ``learned_source`` と必ず一緒に渡す
+        （経路の状態を見ずに提案を読むと、受付スレッドの死や worker の切断の後も古い提案を
+        読みうる）。
+        ``learned_source`` だけを渡すのは、経路を持たない試験の偽の worker だけである。
         """
         if (supervisor is None) != (regime is None):
             raise ValueError("Supervisor と Workload Regime 推定は一緒に配線する")
         if rl_supervisor_source is not None and supervisor is None:
             raise ValueError("RL Supervisor worker を配線するなら Supervisor も配線する")
+        if learned_health is not None and learned_source is None:
+            raise ValueError("Learned の経路の状態は提案の口と一緒に配線する（決定記録 0077 §2.2）")
         if mode_source is not None and admin_mode is not None:
             # モードの出どころを1つにする。2つあると、どちらが人の最新の意図か決まらない
             raise ValueError("mode_source と admin_mode は同時に配線しない")
@@ -664,6 +681,10 @@ class ControlLoop:
         self._regime = regime
         self._learned_source = learned_source
         self._rl_supervisor_source = rl_supervisor_source
+        self._learned_sink = learned_sink
+        self._learned_health = learned_health
+        # **受付スレッドの死は再起動まで覚える**（決定記録 0077 §2.2）。以後は提案を1件も読まない。
+        self._learned_channel_dead = False
         self._shadow = shadow
         self._trace = trace
         self._authority: AuthorityObserver = (
@@ -768,7 +789,7 @@ class ControlLoop:
         guard_decision, guard_fault = self._run_guard(snapshot)
         guard_zones = self._guard_zones(guard_decision)
         baseline, controller_fault = self._run_fallback(snapshot, snapshot_status)
-        learned = self._poll_learned(snapshot.monotonic_ms)
+        learned, learned_unavailable = self._poll_learned(snapshot.monotonic_ms)
 
         external = self._pending_faults + tuple(
             fault for fault in (guard_fault, controller_fault) if fault is not None
@@ -802,6 +823,7 @@ class ControlLoop:
                 mode=mode,
                 baseline=coordination.gate_baseline,
                 learned=learned,
+                learned_unavailable=learned_unavailable,
                 safety_state=safety_decision.state,
                 supervisor_available=supervisor_output is not None,
                 started_mono_ms=started_mono_ms,
@@ -910,6 +932,17 @@ class ControlLoop:
         # 0060 §2.7）。lock の待ち上限つきで、効くのは次の tick から。
         self._maintain_authority()
         self._log_guard_events(guard_decision)
+        # **worker への frame は tick の最後**（heartbeat の後。決定記録 0077 §2.2）。
+        # 置くだけで待たない。
+        self._offer_learned_frame(
+            snapshot=snapshot,
+            workload=regime_estimate,
+            supervisor=supervisor_output,
+            baseline=baseline,
+            safety=safety_decision,
+            hardware=hardware,
+            authority_stage=state.authority_stage,
+        )
 
         if overrun:
             LOGGER.warning(
@@ -1431,6 +1464,7 @@ class ControlLoop:
         mode: ModeCommand,
         baseline: ControllerProposal | None,
         learned: MpcProposal | None,
+        learned_unavailable: LearnedChannelState | None,
         safety_state: SafetyState,
         supervisor_available: bool,
         started_mono_ms: int,
@@ -1450,6 +1484,7 @@ class ControlLoop:
             )
             status = self._learned_status(
                 learned,
+                unavailable=learned_unavailable,
                 snapshot_status=snapshot_status,
                 supervisor_available=supervisor_available,
                 control_deadline_exceeded=deadline_exceeded,
@@ -1496,31 +1531,102 @@ class ControlLoop:
         )
         return PerZone[ZoneRequest](front=request, rear=request, top=request)
 
-    def _poll_learned(self, now_mono_ms: int) -> MpcProposal | None:
+    def _poll_learned(
+        self, now_mono_ms: int
+    ) -> tuple[MpcProposal | None, LearnedChannelState | None]:
         """worker 結果を読み、**初めて見た結果にだけ**受信時刻を押す。
 
         毎 tick 現在時刻を押すと、worker が止まって同じ結果を返し続けても永久に期限切れに
         ならない。識別子（`MpcProposal.result_digest()`）で新旧を見分ける。
+
+        **受け渡し口を覗く前に経路の状態を読む**（決定記録 0077 §2.2 / §2.5）。受付スレッドが
+        死んでいれば再起動まで1件も読まない。worker が切れた・黙った tick では読まずに
+        Fallback へ倒し、その状態を2つ目の値として返す（Gate が `Reason.detail` に入れる）。
         """
         if self._learned_source is None:
-            return None
+            return None, None
+        unavailable = self._learned_channel_unavailable()
+        if unavailable is not None:
+            return None, unavailable
         try:
             result = self._learned_source.poll()
         except Exception:
             LOGGER.exception("learned worker poll failed")
-            return None
+            return None, None
         if result is None:
             # **識別子と受信時刻を消さない。** 消すと、worker が一時的に読めなくなった
             # あとで同じ提案が出てきたときに新しい受信時刻を押してしまい、止まった worker の
             # 古い提案が何度でも有効期限を取り戻す（決定記録 0060 §2.6）。
-            return None
+            return None, None
         if not self._result_is_bound_to_our_snapshot(result):
-            return None
+            return None, None
         digest = result.result_digest()
         if digest != self._learned_digest:
             self._learned_digest = digest
             self._learned_received_mono_ms = now_mono_ms
-        return result
+        return result, None
+
+    def _learned_channel_unavailable(self) -> LearnedChannelState | None:
+        """経路が提案を渡せない状態ならその値。渡せる（`connected`）なら None。"""
+        if self._learned_health is None:
+            return None
+        if self._learned_channel_dead:
+            return LearnedChannelState.CHANNEL_DEAD
+        try:
+            state = self._learned_health.state(LearnedRole.MPC)
+        except Exception:
+            # 状態を答えられない経路の提案は読まない（読める根拠が無い）。再起動まで閉じる
+            LOGGER.exception("learned channel health failed; closing the learned channel")
+            state = LearnedChannelState.CHANNEL_DEAD
+        if state is LearnedChannelState.CHANNEL_DEAD:
+            self._learned_channel_dead = True
+            LOGGER.error(
+                "learned channel の受付スレッドが止まった。再起動まで Learned を読まない",
+                extra={logs.FIELDS_KEY: {"reason": "learned_channel_dead"}},
+            )
+        if state is LearnedChannelState.CONNECTED:
+            return None
+        return state
+
+    def _offer_learned_frame(
+        self,
+        *,
+        snapshot: ControlStateSnapshot,
+        workload: WorkloadRegimeEstimate | None,
+        supervisor: SupervisorOutput | None,
+        baseline: ControllerProposal | None,
+        safety: CriticalSafetyDecision,
+        hardware: PerZone[FanHardwareResult] | None,
+        authority_stage: AuthorityStage,
+    ) -> None:
+        """その tick の入力を送り出し用の1枠へ置く（決定記録 0077 §2.2 / §2.3）。**待たない。**
+
+        失敗しても制御には何も返さない（frame が届かないのは worker の window の欠けであり、
+        Confidence / OOD と Gate が Fallback へ倒す）。
+        """
+        if self._learned_sink is None:
+            return
+        try:
+            frame = LearnedFrame(
+                snapshot=snapshot,
+                workload=workload,
+                supervisor=supervisor,
+                baseline=baseline,
+                safety_floor=PerZone[Demand](
+                    front=safety.zones.front.floor,
+                    rear=safety.zones.rear.floor,
+                    top=safety.zones.top.floor,
+                ),
+                applied=_applied_demands(hardware),
+                authority_stage=authority_stage,
+                config=self._config_digest,
+            )
+            self._learned_sink.offer(frame)
+        except Exception:
+            LOGGER.exception(
+                "learned worker への frame を置けなかった",
+                extra={logs.FIELDS_KEY: {"tick_id": snapshot.tick_id}},
+            )
 
     def _result_is_bound_to_our_snapshot(self, result: MpcProposal) -> bool:
         """worker 結果が、**この process が出した snapshot**から作られたか（0060 §2.6）。
@@ -1554,6 +1660,7 @@ class ControlLoop:
         self,
         learned: MpcProposal | None,
         *,
+        unavailable: LearnedChannelState | None,
         snapshot_status: SnapshotStatus,
         supervisor_available: bool,
         control_deadline_exceeded: bool,
@@ -1563,6 +1670,7 @@ class ControlLoop:
                 supervisor_available=supervisor_available,
                 control_deadline_exceeded=control_deadline_exceeded,
                 snapshot_status=snapshot_status,
+                unavailable_detail=unavailable,
             )
         received_mono_ms = self._learned_received_mono_ms
         assert received_mono_ms is not None
@@ -1896,6 +2004,21 @@ def _coordinated_baseline(
                 front=requests[Zone.FRONT], rear=requests[Zone.REAR], top=requests[Zone.TOP]
             )
         }
+    )
+
+
+def _applied_demands(hardware: PerZone[FanHardwareResult] | None) -> PerZone[Demand | None]:
+    """frame の `applied`（決定記録 0092）。**確かめられない zone は欠測のまま**にする。
+
+    結果が無い tick（Backend の例外）は3 zone とも None。zone の `applied_demand` が None
+    （書き込み・readback を確かめられない）ならその zone だけ None。effective demand で埋めない。
+    """
+    if hardware is None:
+        return PerZone[Demand | None](front=None, rear=None, top=None)
+    return PerZone[Demand | None](
+        front=hardware.front.applied_demand,
+        rear=hardware.rear.applied_demand,
+        top=hardware.top.applied_demand,
     )
 
 

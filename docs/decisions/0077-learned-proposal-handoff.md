@@ -4,6 +4,7 @@
 - **Status**: FINAL（2026-09-30、リポジトリ所有者が推奨案で承認）
 - **Date**: 2026-09-30
 - **Supersedes**: なし
+- **Superseded by**: [0092](0092-learned-frame-applied-from-hardware-result.md)（§2.3 の表の `applied` の行の出どころのみ。各 zone の `FanHardwareResult.applied_demand` から作り、結果が無い・確かめられないときは欠測のまま渡す。他の節は有効）
 - **関連**: [`0028-fan-control-contracts.md`](0028-fan-control-contracts.md)（§2.2 / §2.3 / §2.5 (c) / §2.6） /
   [`0041-supervisor-proposal-freshness.md`](0041-supervisor-proposal-freshness.md) /
   [`0050-model-confidence-ood-and-authority.md`](0050-model-confidence-ood-and-authority.md)（§5 #5） /

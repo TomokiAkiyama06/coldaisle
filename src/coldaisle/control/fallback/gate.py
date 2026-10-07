@@ -10,6 +10,7 @@ from typing import Self
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from coldaisle.control.config import FanPolicyConfig
+from coldaisle.control.learned_handoff import LearnedChannelState
 from coldaisle.control.model.confidence import ConfidenceAssessment
 from coldaisle.control.model.thermal import ArtifactVerification
 from coldaisle.control.schema import (
@@ -161,8 +162,22 @@ class LearnedControlStatus(_Frozen):
     同じ worker 結果か」を照らすために使う。提案・assessment・解のすべてを覆う。
     """
 
+    unavailable_detail: LearnedChannelState | None = None
+    """提案が無い理由として経路が答えた状態（#86 / 決定記録 0077 §2.5）。
+
+    loop は `poll()` が何も返さないとき、経路の状態が `connected` 以外ならその値をここへ写す。
+    Gate は `learned_proposal_unavailable` の `Reason.detail` にこの文字列だけを入れる
+    （`FallbackCause` / `LearnedFailure` に値を足さない。trace の版を上げない）。
+    """
+
     @model_validator(mode="after")
     def _proposal_and_receipt_match(self) -> Self:
+        if self.unavailable_detail is not None and (
+            self.proposal is not None or self.failure is not None
+        ):
+            raise ValueError("提案・失敗が届いた状態に経路の不在の理由を付けない")
+        if self.unavailable_detail is LearnedChannelState.CONNECTED:
+            raise ValueError("connected は提案が無い理由にならない")
         if self.result_digest is not None and self.proposal is None:
             raise ValueError("提案の無い状態に worker 結果の識別子を付けない")
         if self.failure_reason is not None and self.failure is None:
@@ -393,7 +408,10 @@ class ControllerGate:
             return self._reason(FallbackCause.OPTIMIZER_EXCEPTION, self._failure_detail(learned))
         proposal = learned.proposal
         if proposal is None:
-            return self._reason(FallbackCause.LEARNED_PROPOSAL_UNAVAILABLE)
+            detail = learned.unavailable_detail
+            return self._reason(
+                FallbackCause.LEARNED_PROPOSAL_UNAVAILABLE, "" if detail is None else detail.value
+            )
 
         assert learned.received_at_mono_ms is not None
         age_ms = now_mono_ms - learned.received_at_mono_ms

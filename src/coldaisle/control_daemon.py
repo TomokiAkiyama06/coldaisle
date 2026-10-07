@@ -111,6 +111,13 @@ from coldaisle.control.state import ControlInputContract, ControlStateEstimator
 from coldaisle.control.supervisor.policy import SupervisorCoordinator
 from coldaisle.control.supervisor.regime import WorkloadRegimeEstimator
 from coldaisle.control_admin import ControlAdminEntry, open_control_admin
+from coldaisle.control_admin.runtime import new_run_id
+from coldaisle.learned_channel import (
+    DisabledLearnedChannel,
+    LearnedChannelEntry,
+    open_learned_channel,
+)
+from coldaisle.learned_channel.mailbox import LearnedMailbox
 from coldaisle.metrics import MetricCatalog
 from coldaisle.store import QualityRules, SqliteStore
 
@@ -588,6 +595,11 @@ class Config:
     """管理ソケットの設定（決定記録 0072 §2.8）。None は入口を開かない（`AUTO` のまま運転する）。"""
     authority_root: Path = DEFAULT_AUTHORITY_ROOT
     """`authority.json` のディレクトリ（0057 §2.1）。相対 path は起動時の作業場所が基準。"""
+    learned_channel_config: Path | None = None
+    """Learned worker との経路の設定（決定記録 0077 §2.7）。
+
+    None は経路を開かない（いまの運転のまま）。
+    """
 
 
 @dataclass(slots=True)
@@ -670,6 +682,8 @@ class ControlDaemon:
     store: SqliteStore | None = None
     admin: ControlAdminEntry | None = None
     """開いた管理ソケット。**loop が止まった後に**閉じる（`close()`）。"""
+    learned: LearnedChannelEntry | None = None
+    """開いた Learned の経路（決定記録 0077）。**loop が止まった後に**閉じる（`close()`）。"""
     authority: AuthorityRuntime | None = None
     """制御権の runtime。`close()` で書き残せていない降格を1回だけ書き直す（0057 §2.6）。"""
     write_fail_exit: HardwareWriteFailureExit | None = None
@@ -697,6 +711,9 @@ class ControlDaemon:
         **lock を待たずに1回だけ**書き残しを試す（取れなければ error に残す）。
         """
         leftover: AdminAuthorityCommand | None = None
+        if self.learned is not None:
+            self.learned.stop(drain=drain)
+            self.learned = None
         if self.admin is not None:
             leftover = self.admin.stop(drain=drain)
             self.admin = None
@@ -953,7 +970,13 @@ def build(
     except BaseException:
         store.close()
         raise
-    admin = _open_admin(config, control, rules=rules, clock=clock, monotonic=monotonic)
+    # **起動ごとの `run_id` は1つ**（決定記録 0077 §2.3）。管理ソケットの監査と
+    # Learned の経路の封筒が同じ値を使う。
+    run_id = new_run_id()
+    admin = _open_admin(
+        config, control, rules=rules, clock=clock, monotonic=monotonic, run_id=run_id
+    )
+    learned = _open_learned(config, control, monotonic=monotonic, run_id=run_id)
     try:
         loop = _build_loop(
             config,
@@ -969,8 +992,11 @@ def build(
             monotonic=monotonic,
             backend_factory=backend_factory,
             admin=admin,
+            learned=learned,
         )
     except BaseException:
+        if isinstance(learned, LearnedChannelEntry):
+            learned.stop()
         if admin is not None:
             # 開いてから組み立てに失敗するまでに受理した降格も書き残す（0072 §2.6）
             _settle_authority_on_stop(authority, admin.stop(), drain=True)
@@ -980,6 +1006,7 @@ def build(
         monotonic=monotonic,
         store=store,
         admin=admin,
+        learned=learned if isinstance(learned, LearnedChannelEntry) else None,
         authority=authority,
         # **書けないまま制御を持ち続けない**（決定記録 0080 §2.6）。時間は safety.yaml が持つ
         write_fail_exit=HardwareWriteFailureExit(control.safety.hardware_write_fail_exit_ms.value),
@@ -1070,6 +1097,7 @@ def _open_admin(
     rules: QualityRules,
     clock: Clock,
     monotonic: MonotonicClock,
+    run_id: str,
 ) -> ControlAdminEntry | None:
     """管理ソケットを開く。**開けなくても起動は続ける**（0072 §2.8）。"""
     if config.admin_config is None:
@@ -1089,7 +1117,36 @@ def _open_admin(
         open_audit_sink=lambda: SqliteStore(db, rules=rules, clock=clock),
         clock=clock,
         monotonic=monotonic,
+        run_id=run_id,
     )
+
+
+def _open_learned(
+    config: Config,
+    control: ControlConfig,
+    *,
+    monotonic: MonotonicClock,
+    run_id: str,
+) -> LearnedChannelEntry | DisabledLearnedChannel | None:
+    """Learned worker との経路を開く（決定記録 0077 §2.2 / §2.7）。**開けなくても起動は続ける。**
+
+    設定が与えられていなければ None（いまと同じ運転。loop に経路を配線しない）。与えられたのに
+    開けなければ `DisabledLearnedChannel`（loop は `channel_disabled` を理由に
+    Fallback / RulePolicy）。
+    """
+    if config.learned_channel_config is None:
+        LOGGER.info(
+            "Learned の経路の設定が指定されていないため開かない（Fallback / RulePolicy で運転）",
+            extra={logs.FIELDS_KEY: {"reason": "learned_channel_config_not_given"}},
+        )
+        return None
+    entry = open_learned_channel(
+        config.learned_channel_config,
+        run_id=run_id,
+        tick_deadline_ms=control.safety.tick_deadline_ms.value,
+        monotonic=monotonic,
+    )
+    return entry if entry is not None else DisabledLearnedChannel()
 
 
 def _build_loop(
@@ -1107,6 +1164,7 @@ def _build_loop(
     monotonic: MonotonicClock,
     backend_factory: BackendFactory,
     admin: ControlAdminEntry | None,
+    learned: LearnedChannelEntry | DisabledLearnedChannel | None,
 ) -> ControlLoop:
     safety = CriticalSafety(
         control.safety,
@@ -1148,6 +1206,11 @@ def _build_loop(
         admin_mode=None if admin is None else admin.tracker,
         supervisor=SupervisorCoordinator(control.policy.supervisor, clock),
         regime=WorkloadRegimeEstimator(control.policy.workload_regime, catalog, clock),
+        # **Learned の経路は提案の口・状態の口・送り出しの口を同じ object から渡す**（0077 §2.2）。
+        # worker の提案が出せるのは requested まで。Guard と Critical Safety は迂回できない。
+        learned_source=_learned_port(learned),
+        learned_health=_learned_port(learned),
+        learned_sink=_learned_port(learned),
         shadow=ShadowRecorder(control.policy.shadow),
         trace=ControlTraceLogger(store) if config.record_trace else None,
         authority=authority,
@@ -1155,6 +1218,14 @@ def _build_loop(
     )
     _log_configuration(control, safety)
     return loop
+
+
+def _learned_port(
+    learned: LearnedChannelEntry | DisabledLearnedChannel | None,
+) -> LearnedMailbox | DisabledLearnedChannel | None:
+    if isinstance(learned, LearnedChannelEntry):
+        return learned.mailbox
+    return learned
 
 
 class ActuationNotApprovedError(RuntimeError):
@@ -1268,6 +1339,15 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="管理ソケットを開かない（AUTO のまま運転する。試験・Replay 用）",
     )
+    parser.add_argument(
+        "--learned-channel-config",
+        type=Path,
+        default=None,
+        help=(
+            "Learned worker との経路の設定（決定記録 0077 §2.7。例: config/learned-channel.yaml）。"
+            "省くと経路を開かない。不正なら経路を開かず Fallback / RulePolicy で運転する"
+        ),
+    )
     parser.add_argument("--log-level", default="INFO")
     return parser
 
@@ -1302,6 +1382,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         require_watchdog=args.require_watchdog,
         admin_config=None if args.no_admin else args.admin_config,
         authority_root=args.authority_root,
+        learned_channel_config=args.learned_channel_config,
     )
     monotonic: MonotonicClock = SystemMonotonicClock()
 
