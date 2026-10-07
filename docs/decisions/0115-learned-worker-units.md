@@ -203,8 +203,11 @@ MPC worker のグループ `coldaisle-learn-mpc` に**読み取りだけ**を足
   - MPC worker: fand の有効化（0080 §2.10 段階 5・0028 §2.9 の承認点 3）の後に、所有者の判断で `enable` する。
     それまでは段階 5 の確認で `start` して、接続・heartbeat・`model_load_failure`（現行の artifact は
     `observational_replay`）を確かめるだけにする
-  - RL worker: `--role supervisor` が終了コード 2 で拒まれる間（0077 段階 4 / #89 まで）は `enable` も `start` も
-    しない。誤って起動しても `RestartPreventExitStatus=2` で1回で止まる
+  - RL worker: `--role supervisor` が終了コード 2 で拒まれる間（0077 段階 4 / #89 まで）は、テンプレートを
+    リポジトリに置くだけで、**導入先の `/etc/systemd/system` へ置かない**（`enable` も `start` もしない）。
+    #89 までは RL のユーザーを作らない（§2.2）ので、置いて起動すると systemd が資格の設定で失敗し
+    （終了コード 217/USER）、`RestartPreventExitStatus=2` では止まらず `RestartSec` ごとに再試行を続ける。
+    置かなければ起動もできない。ユーザーと unit は #89 で同時に置く
 - `[Install]` は `WantedBy=multi-user.target`（有効にしたときの形を先に決めておく）
 
 ### 2.10 既存記録との関係
@@ -295,7 +298,7 @@ MPC worker のグループ `coldaisle-learn-mpc` に**読み取りだけ**を足
 | 9 | 依存 | `After=coldaisle-fand.service` だけ（§2.5） | §4 の F・`PartOf=`（fand の停止で worker も止まる。終了コード 3 で同じことが起きるので要らない） |
 | 10 | worker の制御設定の読み取り（§1 の 2） | 0104 §2.2 と同じ形の ACL を役割のグループに（§2.8） | fand が frame で設定の中身を運ぶ（0107 の照合の意味が変わる。別の記録が要る） |
 | 11 | RL のグループ・ディレクトリ・ユーザーをいつ作るか（§1 の 3） | グループとディレクトリはいま（空のグループ）、ユーザーと ACL は #89 で（§2.2 / §2.8） | すべて #89 まで作らない（その間 MPC を含む経路全体が開かない） |
-| 12 | 有効化 | どちらも `enable` しない。MPC は fand の有効化の後に所有者が判断、RL は #89 の後（§2.9） | MPC だけ先に `enable`（fand が無効の間は終了コード 3 を繰り返すだけ） |
+| 12 | 有効化 | どちらも `enable` しない。MPC は fand の有効化の後に所有者が判断、RL は unit を導入先へ置くこと自体を #89 まで行わない（§2.9） | MPC だけ先に `enable`（fand が無効の間は終了コード 3 を繰り返すだけ） |
 
 ### 実測を待つ値（`status: provisional` に相当。テンプレートに「暫定値」と書く）
 
