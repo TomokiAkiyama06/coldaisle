@@ -31,6 +31,11 @@ from zoneinfo import ZoneInfo
 
 from coldaisle import logs
 from coldaisle.ai import AiSettings, Explainer, ToolRegistry, provider_from_env
+from coldaisle.calibration_log import (
+    CalibrationActivationRefused,
+    IngestCalibrationGate,
+    calibration_file_sha256,
+)
 from coldaisle.channels import OBSERVED_PROBES_KEY, QUEUE_DROPS_METRIC
 from coldaisle.clock import Clock, WallClock
 from coldaisle.ingest import (
@@ -62,6 +67,9 @@ LOGGER = logging.getLogger("coldaisle.ingest")
 
 MAX_LOGGED_DUPLICATES = 10
 """重複を個別に記録する上限。総数は終了時にまとめて出す。"""
+
+MAX_LOGGED_BEFORE_CALIBRATION_RECORD = 10
+"""較正の記録より前の時刻で捨てた sample を個別に記録する上限。総数は終了時にまとめて出す。"""
 
 QUEUE_SIZE = 256
 """読み取りスレッドとの待ち行列。**有界にする**（常駐メモリ。NFR-05）。"""
@@ -104,6 +112,9 @@ class Stats:
     """送った通知の数（#20）。抑制されたぶんは含まない。"""
     explanations: int = 0
     """後追いで送った Evidence 形式の説明の数（#38）。"""
+    before_calibration_record: int = 0
+    """較正の記録の最後の行の時刻より前の時刻で届き、保存せずに捨てた sample 数
+    （運転中に壁時計が戻った。決定記録 0099 §2.2 / §5 #11）。"""
     unknown_channels: set[str] = field(default_factory=set)
     dataset_incomplete: bool = False
     """dataset用Replayが入力の最後まで届かずに止まった、または途中のsampleを捨てた（#83）。
@@ -122,6 +133,7 @@ class Stats:
             "queue_drops": self.queue_drops,
             "notifications": self.notifications,
             "explanations": self.explanations,
+            "before_calibration_record": self.before_calibration_record,
             "unknown_channels": sorted(self.unknown_channels),
             "dataset_incomplete": self.dataset_incomplete,
         }
@@ -142,6 +154,7 @@ class Daemon:
         notifier: Router | None = None,
         explainer_factory: Callable[[], Explainer] | None = None,
         tick_s: float = 1.0,
+        calibration_gate: IngestCalibrationGate | None = None,
     ) -> None:
         self._source = source
         self._store = store
@@ -154,6 +167,9 @@ class Daemon:
         self._explain_queue: queue.Queue[int | None] = queue.Queue(maxsize=32)
         self._explain_thread: threading.Thread | None = None
         self._tick_s = tick_s
+        self._calibration_gate = calibration_gate
+        self._calibration_floor_ms: int | None = None
+        """較正の記録の最後の行の時刻。これより前の sample は保存しない（0099 §2.2）。"""
         self._latest_values: dict[str, float | None] = {}
         self._stop = False
         self._source_exhausted = False
@@ -184,6 +200,23 @@ class Daemon:
 
     def run(self, *, max_samples: int | None = None) -> Stats:
         """取り込みループ。
+
+        較正を当てる取り込み（serial / mock）は、**ソースを読む前に**DB ごとの書き手の lock を取り、
+        較正の変更を記録する（決定記録 0099 §2.2）。lock が取れない・記録できない・時計が戻った
+        ときは :class:`CalibrationActivationRefused` で起動しない。lock は取り込みが終わるまで持つ。
+        """
+        if self._calibration_gate is None:
+            return self._run(max_samples=max_samples)
+        self._calibration_floor_ms = self._calibration_gate.open(
+            self._store, self._normalizer.clock
+        )
+        try:
+            return self._run(max_samples=max_samples)
+        finally:
+            self._calibration_gate.close()
+
+    def _run(self, *, max_samples: int | None) -> Stats:
+        """取り込みループの本体。
 
         ソースは**別スレッド**で読む。同じスレッドで読むと `stream()` の待機中は
         何もできず、**サンプルが来ないこと自体を検出できない**（FR-401 の無音は
@@ -564,6 +597,22 @@ class Daemon:
             self._record(self._engine.on_hello(observed, recorded, at_ms=at_ms))
 
     def _on_sample(self, raw: RawSample, received_ms: int) -> None:
+        if self._calibration_floor_ms is not None and received_ms < self._calibration_floor_ms:
+            # 運転中に壁時計が戻った。保存すると新しい較正の値が記録より前の時刻に入り、
+            # 古い較正の値に見える。取り込みは止めず、時計が追いつけば保存を再開する（0099 §2.2）
+            self.stats.before_calibration_record += 1
+            if self.stats.before_calibration_record <= MAX_LOGGED_BEFORE_CALIBRATION_RECORD:
+                LOGGER.warning(
+                    "較正の記録より前の時刻の sample を保存せずに捨てた（時計が戻った）",
+                    extra={
+                        logs.FIELDS_KEY: {
+                            "ts_ms": received_ms,
+                            "calibration_record_ts_ms": self._calibration_floor_ms,
+                            "discarded": self.stats.before_calibration_record,
+                        }
+                    },
+                )
+            return
         normalized = self._normalizer.normalize(raw, ts_ms=received_ms)
         stored_sample = self._with_queue_drops(normalized.sample)
         expected = len(stored_sample.readings)
@@ -665,10 +714,22 @@ def build(config: Config) -> Daemon:
         raise SystemExit("--dataset-run-alias は --source replay だけで使える")
     source = _build_source(config)
     rules = QualityRules.from_yaml(config.quality_rules)
-    calibration = _calibration_for(config)
+    calibration, calibration_sha256 = _calibration_for(config)
     config.db.parent.mkdir(parents=True, exist_ok=True)
     clock: Clock = source.clock
     store = SqliteStore(config.db, rules=rules, clock=clock)
+    # 較正を当てる取り込み（serial / mock）だけが較正の変更を記録する（決定記録 0099 §2.2）。
+    # replay は較正を当てないので記録を読みも書きもしない（0010 §2.9）
+    calibration_gate = (
+        None
+        if calibration_sha256 is None
+        else IngestCalibrationGate(
+            db_path=config.db,
+            source_kind=config.source,
+            calibration=calibration,
+            calibration_file_sha256=calibration_sha256,
+        )
+    )
     return Daemon(
         source=source,
         store=store,
@@ -691,6 +752,7 @@ def build(config: Config) -> Daemon:
             clock=clock,
         ),
         tick_s=config.tick_s,
+        calibration_gate=calibration_gate,
     )
 
 
@@ -718,8 +780,10 @@ def _explainer_factory(
     return build
 
 
-def _calibration_for(config: Config) -> Calibration:
-    """再生では較正を当てない（決定記録 0010 §2.9）。
+def _calibration_for(config: Config) -> tuple[Calibration, str | None]:
+    """較正と、読んだ較正ファイルの bytes の SHA-256 を返す。再生では較正を当てない（0010 §2.9）。
+
+    hash は較正の変更の記録（決定記録 0099 §2.4）に残す説明用の値で、再生では ``None``。
 
     CSV に入っているのは**保存済みの値**である（日次CSV は `readings` の値を
     書き出す。決定記録 0008 §2.8）。そこへ較正オフセットを当てると**二重になり、
@@ -727,8 +791,10 @@ def _calibration_for(config: Config) -> Calibration:
     記録済みの値へ後から重ねるものではない。
     """
     if config.source == "replay":
-        return Calibration(note="再生では較正を当てない（決定記録 0010 §2.9）")
-    calibration = Calibration.from_json(config.calibration)
+        return Calibration(note="再生では較正を当てない（決定記録 0010 §2.9）"), None
+    # 同じ bytes から較正を作り hash を取る（読み直すと、間に書き換えられた別の版を指しうる）
+    data = config.calibration.read_bytes()
+    calibration = Calibration.from_json_bytes(data, origin=str(config.calibration))
     policy = CalibrationPolicy.from_yaml(config.calibration_policy)
     now_ms = WallClock().now_ms()
     if calibration.is_expired(now_ms, after_days=policy.revalidate_after_days):
@@ -745,7 +811,7 @@ def _calibration_for(config: Config) -> Calibration:
                 }
             },
         )
-    return calibration
+    return calibration, calibration_file_sha256(data)
 
 
 def _build_source(config: Config) -> Source:
@@ -850,6 +916,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     signal.signal(signal.SIGINT, _stop)
     try:
         stats = daemon.run(max_samples=args.max_samples)
+    except CalibrationActivationRefused as error:
+        # 記録を残さずに新しい較正の値を保存し始めると、後から見分けられない。
+        # 理由を構造化ログに出して終了し、再起動はサービス管理に任せる（決定記録 0099 §5 #3）
+        LOGGER.error(
+            "取り込みを起動しない（較正の記録）",
+            extra={logs.FIELDS_KEY: {"reason": str(error), "db": str(args.db)}},
+        )
+        return 1
     finally:
         daemon.store.close()
     # 途中停止したdataset Replayを成功として終えると、後段が完了済みと誤認する

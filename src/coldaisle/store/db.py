@@ -22,6 +22,8 @@ from types import TracebackType
 from coldaisle.channels import METRIC_TO_CHANNEL
 from coldaisle.clock import Clock
 from coldaisle.store import migrations
+from coldaisle.store.calibration_history import SELECT_ROWS as SELECT_CALIBRATION_ACTIVATIONS
+from coldaisle.store.calibration_history import CalibrationActivation, verify_activation_rows
 from coldaisle.store.models import (
     AlertRecord,
     AlertSeverity,
@@ -555,6 +557,29 @@ class SqliteStore:
             raise RuntimeError("監査の行の採番に失敗した")
         return record.model_copy(update={"id": int(row_id)})
 
+    def append_calibration_activation(self, row: CalibrationActivation) -> None:
+        """較正の変更の記録を1行追記する（#233 / 決定記録 0099 §2.2 / §2.5）。
+
+        **追記のみ。** 時刻の単調・鎖・写像の変化は DB のトリガが検査し、更新・削除は拒否する。
+        書くのは取り込み（``coldaisle-daemon`` の serial / mock）だけ。比較と追記を1つの
+        書き込みトランザクションにそろえるのは呼び出し側（:meth:`transaction`）の責任。
+        """
+        self._conn.execute(
+            "INSERT INTO calibration_activations (ts_ms, source_kind, offsets_json, offsets_sha256,"
+            " previous_row_sha256, calibrated_at, calibration_file_sha256, row_sha256)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                row.ts_ms,
+                row.source_kind,
+                row.offsets_json,
+                row.offsets_sha256,
+                row.previous_row_sha256,
+                row.calibrated_at,
+                row.calibration_file_sha256,
+                row.row_sha256,
+            ),
+        )
+
     # ------------------------------------------------------------------ 読み出し
 
     def device(self, device_id: str) -> DeviceRecord | None:
@@ -809,6 +834,29 @@ class SqliteStore:
             )
             for row in rows
         )
+
+    def calibration_activations(self) -> tuple[CalibrationActivation, ...]:
+        """較正の変更の記録の全行を、0099 §2.5 の検証を通して id の順に返す。
+
+        検証に外れれば :class:`CalibrationHistoryError`（取り込みは起動しない。0099 §2.7）。
+        """
+        return verify_activation_rows(self._conn.execute(SELECT_CALIBRATION_ACTIVATIONS))
+
+    def max_reading_ts_ms(self) -> int | None:
+        """``readings`` の最大の ``ts_ms``。行が無ければ ``None``（0099 §2.2 の4）。
+
+        主キー ``(metric, ts_ms)`` の索引で metric ごとの最大を引く（全行を走査しない）。
+        """
+        row = self._conn.execute(
+            "WITH RECURSIVE m(metric) AS ("
+            " SELECT MIN(metric) FROM readings"
+            " UNION ALL"
+            " SELECT (SELECT MIN(metric) FROM readings WHERE readings.metric > m.metric)"
+            " FROM m WHERE m.metric IS NOT NULL"
+            ") SELECT MAX((SELECT MAX(ts_ms) FROM readings WHERE readings.metric = m.metric))"
+            " FROM m WHERE m.metric IS NOT NULL"
+        ).fetchone()
+        return None if row[0] is None else int(row[0])
 
     def metrics(self) -> tuple[str, ...]:
         """保存済みのメトリクス名。走査量はメトリクス数に比例する（決定記録 0004 §2.11）。
