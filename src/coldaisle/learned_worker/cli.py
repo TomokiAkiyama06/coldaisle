@@ -108,8 +108,12 @@ class MpcWorker:
                 periods += 1
                 if max_periods is not None and periods >= max_periods:
                     return
-                # 遅れた周期を詰めて取り戻さない（最後の frame に1回だけ。0077 §2.3）
-                next_due = max(next_due + self._period_ms, now)
+                # 遅れた周期を詰めて取り戻さない（最後の frame に1回だけ。0077 §2.3）。
+                # 推論や送信が周期を超えたら、**終わった時刻から**次の周期を数える
+                next_due += self._period_ms
+                finished = self._monotonic.monotonic_ms()
+                if next_due <= finished:
+                    next_due = finished + self._period_ms
         finally:
             self._stop.set()
             heartbeat.join(timeout=hello.heartbeat_interval_ms / 1_000)

@@ -201,6 +201,8 @@ class MpcWorkerCore:
         self._run_id: str | None = None
         self._stopped = False
         self._calibration: FrameCalibration | None = None
+        """この `run_id` で最初に受け取った frame の較正（束縛と照合の基準）。"""
+        self._calibration_changed = False
         self._runtime: LearnedMpcRuntime | None = None
         self._runtime_failure: Reason | None = None
         self._bound_stage: AuthorityStage | None = None
@@ -223,6 +225,14 @@ class MpcWorkerCore:
 
     def receive(self, run_id: str, frame: LearnedFrame) -> None:
         """検証を通った v3 の frame を受け取る（壊れた frame はここへ来ない。0101 §2.3）。"""
+        if run_id != self._run_id:
+            self._start_run(run_id)
+        # **受け取った frame ごとに**較正を照らす。周期の間に複数届いても、最新の frame だけを
+        # 見ると途中の変化（A → B → A）を見落とし、食い違った frame で window を作りうる
+        if self._calibration is None:
+            self._calibration = frame.calibration
+        elif frame.calibration != self._calibration:
+            self._calibration_changed = True
         self._history.add(run_id, frame)
         schema_window = self._window_ms()
         self._history.prune(schema_window)
@@ -233,8 +243,6 @@ class MpcWorkerCore:
         run_id = self._history.run_id
         if frame is None or run_id is None:
             return None
-        if run_id != self._run_id:
-            self._start_run(run_id)
         if self._stopped:
             return None
         if frame.config != self._digest:
@@ -244,9 +252,7 @@ class MpcWorkerCore:
                 FailureCode.METRIC_CATALOG_MISMATCH,
                 "frame の metric_catalog_sha256 が worker の Metric Catalog と違う",
             )
-        if self._calibration is None:
-            self._calibration = frame.calibration
-        elif frame.calibration != self._calibration:
+        if self._calibration_changed:
             # 束縛を黙って作り直さない。fand の不具合を隠さない（0101 §5 #2）
             return self._stop(
                 FailureCode.CALIBRATION_CHANGED,
@@ -294,6 +300,7 @@ class MpcWorkerCore:
         self._run_id = run_id
         self._stopped = False
         self._calibration = None
+        self._calibration_changed = False
         self._runtime = None
         self._runtime_failure = None
         self._bound_stage = None

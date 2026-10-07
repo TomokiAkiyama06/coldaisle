@@ -506,6 +506,29 @@ def test_a_calibration_change_within_a_run_stops_until_the_next_run(trained: Mpc
     assert resumed is not None and resumed.failure is None
 
 
+def test_a_calibration_change_between_periods_is_caught_frame_by_frame(
+    trained: MpcArtifact,
+) -> None:
+    """周期の間に複数の frame が届いても、frame ごとに較正を照らす（Codex P2）。
+
+    最新の frame だけを見ると、最初の束で A → B なら B で束縛し、A → B → A なら見落とす。
+    """
+    pins = pinned_of(trained)
+    changed = available(dict(CALIBRATION_OFFSETS) | {"room_temp": 0.0})
+
+    first_batch = core_for(trained)
+    for item in (frame(10, pins=pins), frame(11, pins=pins, calibration=changed)):
+        first_batch.receive(RUN_ID, item)
+    assert failure_code(first_batch.step()) == FailureCode.CALIBRATION_CHANGED
+
+    transient = core_for(trained)
+    assert feed(transient, *ticks(10, 2, pins=pins)) is not None
+    for item in (frame(12, pins=pins, calibration=changed), frame(13, pins=pins)):
+        transient.receive(RUN_ID, item)
+    assert failure_code(transient.step()) == FailureCode.CALIBRATION_CHANGED
+    assert transient.stopped
+
+
 def test_a_config_mismatch_fails_every_period_without_stopping(trained: MpcArtifact) -> None:
     other = control_config(policy={"authority_stage": "limited"})
     core = core_for(trained)
@@ -696,6 +719,66 @@ def test_only_frames_are_taken_from_fand_after_hello(trained: MpcArtifact) -> No
     received = fake.channel.receive_frames(timeout_s=0.2)
     assert [entry.frame.snapshot.tick_id for entry in received] == [11]
     assert fake.channel.dropped == {"unexpected_body": 1, "role_mismatch": 1}
+
+
+class ManualClock:
+    def __init__(self) -> None:
+        self.now = 0
+
+    def monotonic_ms(self) -> int:
+        return self.now
+
+
+class SlowCore:
+    """1回の周期が `cost_ms` かかる core（推論の遅れの再現）。"""
+
+    def __init__(self, clock: ManualClock, cost_ms: int) -> None:
+        self.clock = clock
+        self.cost_ms = cost_ms
+        self.started: list[int] = []
+        self.history = FrameHistory()
+
+    def receive(self, run_id: str, item: LearnedFrame) -> None:
+        raise AssertionError("frame は来ない")
+
+    def step(self) -> None:
+        self.started.append(self.clock.now)
+        self.clock.now += self.cost_ms
+
+
+class QuietChannel:
+    """hello を返し、frame の待ちでは時計を進めるだけの偽の経路。"""
+
+    def __init__(self, clock: ManualClock) -> None:
+        self.clock = clock
+
+    def receive_hello(self, *, timeout_s: float) -> Any:
+        from coldaisle.learned_worker.client import Hello
+
+        return Hello(run_id=RUN_ID, heartbeat_interval_ms=60_000)
+
+    def receive_frames(self, *, timeout_s: float) -> list[Any]:
+        self.clock.now += round(timeout_s * 1_000)
+        return []
+
+    def send_heartbeat(self, run_id: str) -> None:
+        pass
+
+
+def test_an_overrun_reschedules_from_the_end_of_the_work() -> None:
+    """推論が周期を超えても、詰めて連続実行しない（Codex P2。0077 §2.3 の「周期ごとに1回」）。"""
+    clock = ManualClock()
+    core = SlowCore(clock, cost_ms=250)
+    worker = MpcWorker(
+        core,  # type: ignore[arg-type]
+        QuietChannel(clock),  # type: ignore[arg-type]
+        period_ms=100,
+        hello_timeout_ms=1_000,
+        monotonic=clock,
+    )
+    worker.run(max_periods=4)
+    gaps = [later - earlier for earlier, later in zip(core.started, core.started[1:], strict=False)]
+    assert gaps and all(gap >= 250 + 100 for gap in gaps), core.started
 
 
 def test_the_role_supervisor_is_refused_until_stage_4() -> None:
