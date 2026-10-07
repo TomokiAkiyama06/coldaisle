@@ -490,7 +490,8 @@ class LearnedMpcRuntime:
     :meth:`load` は ``VerifiedArtifact`` を ``MpcModelBinding.from_verified_artifact`` と
     ``LearnedMpcController`` に通し、どこかで ``MpcModelUnusableError``（L1〜L12 の検査・
     較正の不一致や読めなかった較正・production でない・authority・版・格子・目的関数の metric）
-    になれば、以後の :meth:`propose` は毎回 ``LearnedFailure.MODEL_LOAD_FAILURE``
+    になれば（目的関数の任意依存の組み立ての ``MpcCostUnusableError`` も同じ）、
+    以後の :meth:`propose` は毎回 ``LearnedFailure.MODEL_LOAD_FAILURE``
     （``failure_reason`` 付き）を返す。Gate はそれを Fallback にする。
 
     暗黙の降格はしない（Profile なしで使う・observational として使う経路を持たない）。
@@ -555,7 +556,9 @@ class LearnedMpcRuntime:
                 balance_band=balance_band,
                 fan_hardware=fan_hardware,
             )
-        except MpcModelUnusableError as error:
+        except (MpcModelUnusableError, MpcCostUnusableError) as error:
+            # 目的関数の任意依存の組み立ての失敗（Air Balance に profile が無いなど）も、
+            # 起動を止めずに読み込みの失敗として Fallback にする（0079 §2.6 / AGENTS.md ルール4）。
             reason = Reason(code="model_unusable", detail=str(error)[:500])
             LOGGER.error(
                 "Learned MPC の内部モデルを使えないため、提案を出さず Fallback にする",

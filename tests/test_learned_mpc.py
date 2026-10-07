@@ -2895,3 +2895,25 @@ def dataset_observed(action_ts_ms: int) -> ObservedThermalInput:
     data = dataset(HORIZONS, TARGETS)
     example = next(item for item in data.examples if item.action_ts_ms == action_ts_ms)
     return ObservedThermalInput.from_example(example)
+
+
+def test_incomplete_cost_wiring_degrades_to_fallback(trained) -> None:
+    """**目的関数の任意依存の組み立ての失敗**も `MODEL_LOAD_FAILURE`（PR #239 の Codex P2）。
+
+    Air Balance を渡して `fan-hardware.yaml` の profile を渡さない組み合わせ（決定記録 0073 §2.3）。
+    """
+    settings = mpc_policy()
+    runtime = LearnedMpcRuntime.load(
+        trained.verified,
+        settings,
+        safety(),
+        metric_catalog=CATALOG,
+        calibration=RUNTIME_CALIBRATION,
+        expected_model_version=trained.attestation.version,
+        monotonic_ms=ScriptedClock(0),
+        authority=StaticAuthorityStage(settings.authority_stage),
+        air_balance=StubAirBalance(1.0),
+        balance_band=_balance_band(),
+    )
+
+    _assert_degrades_to_fallback(runtime, trained.attestation, needle="fan-hardware.yaml")
