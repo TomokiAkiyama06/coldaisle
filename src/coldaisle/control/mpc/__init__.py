@@ -9,7 +9,11 @@ timeout・実行不能・モデル読込失敗・低 Confidence / OOD では提�
 運転を続ける（AGENTS.md ルール4）。
 """
 
-from coldaisle.control.mpc.controller import LearnedMpcController, MpcProposal
+from coldaisle.control.mpc.controller import (
+    LearnedMpcController,
+    LearnedMpcRuntime,
+    MpcProposal,
+)
 from coldaisle.control.mpc.cost import CostTerms, MpcCostModel, MpcCostUnusableError, PlanCost
 from coldaisle.control.mpc.counterfactual import (
     COUNTERFACTUAL_CAPABILITIES,
@@ -40,6 +44,7 @@ __all__ = [
     "InfeasiblePlanError",
     "LearnedMpcController",
     "LearnedMpcOptimizer",
+    "LearnedMpcRuntime",
     "MpcCostModel",
     "MpcCostUnusableError",
     "MpcModelBinding",
