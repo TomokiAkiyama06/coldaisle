@@ -22,7 +22,11 @@ from pathlib import Path
 
 from pydantic import ValidationError
 
-from coldaisle.calibration_log import calibration_change_points, require_history_covers
+from coldaisle.calibration_log import (
+    calibration_change_points,
+    reject_changes_overlapping,
+    require_history_covers,
+)
 from coldaisle.clock import WallClock
 from coldaisle.control.drift.model import ChangeKind, DeclaredChange
 from coldaisle.control.model.dataset import (
@@ -352,8 +356,12 @@ class ThermalDatasetV2Builder:
                 )
         built = tuple(examples)
         if built:
-            require_history_covers(
-                calibration_history, min(example.history_start_ms for example in built)
+            start_ms = min(example.history_start_ms for example in built)
+            require_history_covers(calibration_history, start_ms)
+            reject_changes_overlapping(
+                calibration_history,
+                start_ms=start_ms,
+                end_ms=max(example.label_end_ms for example in built),
             )
             calibration_changes += calibration_change_points(calibration_history)
         reject_calibration_changes(built, calibration_changes)

@@ -30,6 +30,7 @@ from coldaisle.calibration_log import (
     activate_calibration,
     calibration_change_points,
     ingest_lock_path,
+    reject_changes_overlapping,
     verify_training_calibration,
 )
 from coldaisle.calibration_offsets import (
@@ -1006,3 +1007,26 @@ def test_a_hard_linked_db_is_refused(tmp_path, rules):
             gate.open(db, clock)
         assert rows(db) == ()
         assert not ingest_lock_path(real).exists()
+
+
+@pytest.mark.parametrize(
+    ("start_ms", "end_ms", "refused"),
+    [
+        # 期間が区間 [2000, 2999] の中にすっぽり入る（端の点はどちらも期間の外。
+        # PR #240 の Codex の指摘）
+        pytest.param(2_100, 2_200, True, id="period-inside-the-interval"),
+        pytest.param(2_000, 2_000, True, id="period-at-the-floor"),
+        pytest.param(2_999, 3_500, True, id="period-at-the-row"),
+        pytest.param(3_000, 4_000, False, id="after"),
+        pytest.param(1_001, 1_999, False, id="between-rows"),
+    ],
+)
+def test_change_interval_overlapping_a_short_period_is_refused(tmp_path, start_ms, end_ms, refused):
+    history = read_calibration_history(history_rows(tmp_path / "prod.db", 1_000, 2_999))
+    points = calibration_change_points(history)
+    if refused:
+        with pytest.raises(ValueError, match="較正の変更"):
+            reject_changes_overlapping(history, start_ms=start_ms, end_ms=end_ms)
+    else:
+        reject_changes_overlapping(history, start_ms=start_ms, end_ms=end_ms)
+        assert not any(start_ms <= point <= end_ms for point in points)

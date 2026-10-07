@@ -246,6 +246,35 @@ def calibration_change_points(
     return tuple(points)
 
 
+def reject_changes_overlapping(
+    history: CalibrationHistory,
+    *,
+    start_ms: int,
+    end_ms: int,
+    resolution_ms: int = TIMESTAMP_RESOLUTION_MS,
+) -> None:
+    """区間 ``[floor(ts_ms), ts_ms]`` が期間 ``[start_ms, end_ms]`` と交われば拒否する。
+
+    0099 §2.6。
+
+    両端の点だけを渡す検査は、期間が区間の中にすっぽり入る（期間が CSV の精度より短い）と
+    見逃す。``DatasetSpecV2`` は期間の長さの下限を持たないので、交わりを直接見る
+    （PR #240 の Codex の指摘）。
+    """
+    if resolution_ms <= 0:
+        raise ValueError(f"時刻の精度は正: {resolution_ms}")
+    overlapping = [
+        row.ts_ms
+        for row in history.rows
+        if row.ts_ms // resolution_ms * resolution_ms <= end_ms and start_ms <= row.ts_ms
+    ]
+    if overlapping:
+        raise ValueError(
+            "Dataset v2 の期間の中に較正の変更がある（CSV の時刻の切り捨ての区間が期間と交わる）: "
+            f"{overlapping}"
+        )
+
+
 def verify_training_calibration(
     history: CalibrationHistory,
     *,
