@@ -98,9 +98,7 @@ from coldaisle.control.evaluation.model import (
     WorstCase,
     WorstCaseKind,
 )
-from coldaisle.control.model.confidence import ConfidenceAssessor
-from coldaisle.control.model.thermal import canonical_artifact_bytes
-from coldaisle.control.mpc import LearnedMpcController, MpcModelBinding
+from coldaisle.control.mpc import LearnedMpcController
 from coldaisle.control.shadow import SHADOW_EXPORT_SCHEMA_VERSION
 from test_control_config import valid_documents, write_documents
 from test_critical_safety import (
@@ -121,11 +119,12 @@ from test_fallback_controller import (
 from test_learned_mpc import (
     ALL_STAGES,
     REGISTRY_LIMITS,
-    PlanningModel,
     ScriptedClock,
+    bind,
     issue_attestation,
     mpc_policy,
     propose,
+    register_payload,
     trained,  # noqa: F401 （pytest fixture として使う）
 )
 from test_learned_mpc import (
@@ -3196,7 +3195,7 @@ def test_the_first_promotion_can_actually_be_walked(tmp_path: Path, trained) -> 
     4. **昇格前に作った提案は、そのままでは LIMITED で使えない**（codex #4056903566）
     5. LIMITED を覆う束縛で worker を作り直すと、帯の中で Learned MPC を採る
     """
-    base, profile, attestation = trained
+    attestation = trained.attestation
     settings = mpc_policy(authority="limited")
     authority = store(tmp_path)
     # fand が起動時に読んだ設定。昇格の証拠もこの設定で取る（決定記録 0090 §2.1）。
@@ -3213,17 +3212,11 @@ def test_the_first_promotion_can_actually_be_walked(tmp_path: Path, trained) -> 
     assert control.current_stage() is AuthorityStage.SHADOW, "journal が無ければ Baseline"
 
     # 1. 上限が LIMITED でも、実効 stage が SHADOW なら SHADOW 互換の artifact で動かせる。
-    shadow_binding = MpcModelBinding.for_control(
-        PlanningModel(base),
-        attestation=attestation,
-        authority_stage=AuthorityStage.SHADOW,
-        expected_model_version=attestation.version,
-    )
+    shadow_binding = bind(trained, authority_stage=AuthorityStage.SHADOW)
     shadow_worker = LearnedMpcController(
         shadow_binding,
         settings,
         mpc_safety(),
-        assessor=ConfidenceAssessor(profile, settings.model_confidence),
         monotonic_ms=ScriptedClock(0),
         authority=control,
     )
@@ -3251,13 +3244,9 @@ def test_the_first_promotion_can_actually_be_walked(tmp_path: Path, trained) -> 
     # 3. その区間の証拠で昇格する。証拠はいまの設定・いまの artifact のものである。
     # Registry の production は、worker が束縛した artifact そのもの（同じ bytes を登録する）。
     # 別の artifact の証拠で上げると、runtime は Baseline のままにする（決定記録 0089）。
-    production_sha = issue_attestation(
-        tmp_path / "registry-e2e",
-        model_id=base.manifest.model_id,
-        version=base.manifest.model_version,
-        stage=AuthorityStage.SHADOW,
-        payload=canonical_artifact_bytes(base._artifact),
-    ).artifact_sha256
+    production_sha = register_payload(
+        tmp_path / "registry-e2e", trained.verified.payload, stage=AuthorityStage.SHADOW
+    ).attestation.artifact_sha256
     assert production_sha == attestation.artifact_sha256
     registry = ModelRegistry(tmp_path / "registry-e2e", limits=REGISTRY_LIMITS)
     document = report_document(
@@ -3298,15 +3287,9 @@ def test_the_first_promotion_can_actually_be_walked(tmp_path: Path, trained) -> 
 
     # 5. LIMITED を覆う束縛で作り直せば、帯の中で Learned MPC を採る。
     limited_worker = LearnedMpcController(
-        MpcModelBinding.for_control(
-            PlanningModel(base),
-            attestation=attestation,
-            authority_stage=AuthorityStage.LIMITED,
-            expected_model_version=attestation.version,
-        ),
+        bind(trained, authority_stage=AuthorityStage.LIMITED),
         settings,
         mpc_safety(),
-        assessor=ConfidenceAssessor(profile, settings.model_confidence),
         monotonic_ms=ScriptedClock(0),
         authority=control,
     )

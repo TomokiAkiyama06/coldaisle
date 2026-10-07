@@ -14,25 +14,26 @@ Gate（#79）へ渡し、Fallback で運転を続ける。
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Callable
 from typing import Self
 
 from pydantic import BaseModel, ConfigDict, model_validator
 
+from coldaisle import logs
 from coldaisle.control.acoustic import AcousticCostModel
 from coldaisle.control.air_balance import AirBalanceModel, BalanceBand
 from coldaisle.control.config import FanHardwareConfig, FanPolicyConfig, SafetyConfig
 from coldaisle.control.fallback.gate import LearnedControlStatus, LearnedFailure, SnapshotStatus
-from coldaisle.control.model.confidence import (
-    ConfidenceAssessment,
-    ConfidenceAssessor,
-    ResidualEvidence,
-)
+from coldaisle.control.model.calibration_digest import RuntimeCalibration
+from coldaisle.control.model.confidence import ConfidenceAssessment, ResidualEvidence
+from coldaisle.control.model.counterfactual_confidence import CounterfactualConfidenceAssessor
 from coldaisle.control.model.thermal import (
     ObservedThermalInput,
     ThermalPrediction,
     canonical_sha256,
 )
+from coldaisle.control.model_registry import VerifiedArtifact
 from coldaisle.control.mpc.cost import MpcCostModel, MpcCostUnusableError, PlanCost
 from coldaisle.control.mpc.counterfactual import MpcModelBinding, MpcModelUnusableError
 from coldaisle.control.mpc.optimizer import LearnedMpcOptimizer, MpcSolution
@@ -52,6 +53,9 @@ from coldaisle.control.schema import (
     stage_rank,
 )
 from coldaisle.control.state import ControlStateSnapshot
+from coldaisle.metrics import MetricCatalog
+
+LOGGER = logging.getLogger("coldaisle.control.mpc")
 
 
 class _Frozen(BaseModel):
@@ -205,7 +209,6 @@ class LearnedMpcController:
         policy: FanPolicyConfig,
         safety: SafetyConfig,
         *,
-        assessor: ConfidenceAssessor,
         monotonic_ms: Callable[[], int],
         authority: AuthorityStageSource,
         acoustic: AcousticCostModel | None = None,
@@ -223,10 +226,21 @@ class LearnedMpcController:
 
         ``authority`` は**いま与えている制御権**（#92 / 決定記録 0057 §2.2）。設定の
         ``authority_stage`` は v9 から**上限**なので、そちらとは照合しない。
+
+        **Confidence 判定器は外から受け取らない**（決定記録 0079 §2.4）。束縛した封をした型の
+        同梱 Profile v2 と、runtime の ``model_confidence`` から作る。別の Profile・別の設定の
+        判定器を渡す引数を制御側に持たせない。
         """
         self._authority = authority
         self._check_binding_covers_authority(binding, authority.current_stage())
-        self._check_binding_matches_policy(binding, policy, assessor)
+        try:
+            assessor = CounterfactualConfidenceAssessor.for_model(
+                binding.model, policy.model_confidence
+            )
+        except (TypeError, ValueError) as error:
+            raise MpcModelUnusableError(
+                f"同梱 Profile v2 から Confidence 判定器を作れない: {error}"
+            ) from error
         # **目的関数を外から受け取らない。** 別の設定で作った cost model を渡されると、
         # 重みや基準量だけが運転設定とずれる。任意依存（#94 / #81）だけを受け取る。
         cost_model = MpcCostModel(
@@ -321,34 +335,6 @@ class LearnedMpcController:
                 f"effective={effective_stage.value}）"
             )
 
-    @staticmethod
-    def _check_binding_matches_policy(
-        binding: MpcModelBinding,
-        policy: FanPolicyConfig,
-        assessor: ConfidenceAssessor,
-    ) -> None:
-        """束縛・判定器・運転設定が**同じ前提で作られているか**を生成時に確かめる。"""
-        if assessor.policy != policy.model_confidence:
-            # 別の設定で作った判定器を渡されると、閾値だけがすり替わる。
-            raise MpcModelUnusableError("Confidence 判定器が runtime と別の設定で作られている")
-        attestation = binding.attestation
-        profile = assessor.profile.binding
-        mismatches = [
-            name
-            for name, attested, fitted in (
-                ("model_id", attestation.model_id, profile.model_id),
-                ("model_version", attestation.version, profile.model_version),
-                ("artifact_sha256", attestation.artifact_sha256, profile.artifact_sha256),
-            )
-            if attested != fitted
-        ]
-        if mismatches:
-            # Profile は特定の artifact に対して作る。別の artifact のものを使うと、
-            # 学習範囲も residual の基準も違う値で confidence を出してしまう。
-            raise MpcModelUnusableError(
-                f"Confidence Profile が束縛した artifact のものではない: {','.join(mismatches)}"
-            )
-
     def propose(
         self,
         *,
@@ -407,7 +393,7 @@ class LearnedMpcController:
         # 制御権は運転中に動く（#92）。生成時の照合だけだと、昇格のあとに作り直されなかった
         # worker が、束縛の覆っていない stage で提案を出し続ける。tick ごとに見る。
         self._check_binding_covers_authority(self._binding, self._authority.current_stage())
-        anchor = self._binding.model.predict(observed)
+        anchor = self._binding.predict(observed)
         self._check_anchor(anchor, observed)
         assessment = self._assessor.assess(observed, anchor, residual)
         constraints = HardConstraintSet.build(
@@ -494,6 +480,133 @@ class LearnedMpcController:
         return MpcProposal(
             failure=failure,
             failure_reason=Reason(code=_reason_code(code), detail=detail[:500]),
+        )
+
+
+class LearnedMpcRuntime:
+    """artifact の読み込みから毎 tick の提案までを1つにまとめた worker の本体（#86）。
+
+    **読み込みに失敗しても例外で止まらない**（決定記録 0079 §2.6 / 0052 §2.1）。
+    :meth:`load` は ``VerifiedArtifact`` を ``MpcModelBinding.from_verified_artifact`` と
+    ``LearnedMpcController`` に通し、どこかで ``MpcModelUnusableError``（L1〜L12 の検査・
+    較正の不一致や読めなかった較正・production でない・authority・版・格子・目的関数の metric）
+    になれば（目的関数の任意依存の組み立ての ``MpcCostUnusableError`` も同じ）、
+    以後の :meth:`propose` は毎回 ``LearnedFailure.MODEL_LOAD_FAILURE``
+    （``failure_reason`` 付き）を返す。Gate はそれを Fallback にする。
+
+    暗黙の降格はしない（Profile なしで使う・observational として使う経路を持たない）。
+    MPC worker のプロセス（決定記録 0077 段階 3）はこの型を使う想定で、ここは worker の外で
+    単体に試験できるようにした境界である。
+    """
+
+    __slots__ = ("_controller", "_failure_reason")
+
+    def __init__(
+        self,
+        *,
+        controller: LearnedMpcController | None,
+        failure_reason: Reason | None,
+    ) -> None:
+        """:meth:`load` を使う。直接作るときも、どちらか一方だけを持たせる。"""
+        if (controller is None) == (failure_reason is None):
+            raise ValueError("LearnedMpcRuntime は controller か読み込みの失敗のどちらか一方")
+        self._controller = controller
+        self._failure_reason = failure_reason
+
+    @classmethod
+    def load(
+        cls,
+        verified: VerifiedArtifact,
+        policy: FanPolicyConfig,
+        safety: SafetyConfig,
+        *,
+        metric_catalog: MetricCatalog,
+        calibration: RuntimeCalibration,
+        expected_model_version: str,
+        monotonic_ms: Callable[[], int],
+        authority: AuthorityStageSource,
+        acoustic: AcousticCostModel | None = None,
+        air_balance: AirBalanceModel | None = None,
+        balance_band: BalanceBand | None = None,
+        fan_hardware: FanHardwareConfig | None = None,
+    ) -> LearnedMpcRuntime:
+        """artifact を束縛して controller を作る。使えなければ失敗を持った runtime を返す。
+
+        ``calibration`` は runtime の較正（起動時に1回だけ読んだ値）。読めなかったときは
+        ``RuntimeCalibration.unavailable`` を渡す。較正の掛かる metric を使う artifact は L9 で
+        拒まれ、使わない（``null`` の）artifact だけが通る（決定記録 0096 §5 #8）。
+        束縛の authority stage は**いまの実効 stage**（``authority.current_stage()``）。
+        """
+        try:
+            binding = MpcModelBinding.from_verified_artifact(
+                verified,
+                metric_catalog=metric_catalog,
+                calibration=calibration,
+                authority_stage=authority.current_stage(),
+                expected_model_version=expected_model_version,
+            )
+            controller = LearnedMpcController(
+                binding,
+                policy,
+                safety,
+                monotonic_ms=monotonic_ms,
+                authority=authority,
+                acoustic=acoustic,
+                air_balance=air_balance,
+                balance_band=balance_band,
+                fan_hardware=fan_hardware,
+            )
+        except (MpcModelUnusableError, MpcCostUnusableError) as error:
+            # 目的関数の任意依存の組み立ての失敗（Air Balance に profile が無いなど）も、
+            # 起動を止めずに読み込みの失敗として Fallback にする（0079 §2.6 / AGENTS.md ルール4）。
+            reason = Reason(code="model_unusable", detail=str(error)[:500])
+            LOGGER.error(
+                "Learned MPC の内部モデルを使えないため、提案を出さず Fallback にする",
+                extra={
+                    logs.FIELDS_KEY: {
+                        "reason": "model_load_failure",
+                        "detail": reason.detail,
+                        "calibration_available": calibration.is_available,
+                    }
+                },
+            )
+            return cls(controller=None, failure_reason=reason)
+        return cls(controller=controller, failure_reason=None)
+
+    @property
+    def controller(self) -> LearnedMpcController | None:
+        """束縛できたときの controller。読み込みに失敗したときは None。"""
+        return self._controller
+
+    @property
+    def failure_reason(self) -> Reason | None:
+        """読み込みに失敗した理由。使えるときは None。"""
+        return self._failure_reason
+
+    def propose(
+        self,
+        *,
+        snapshot: ControlStateSnapshot,
+        observed: ObservedThermalInput,
+        supervisor: SupervisorOutput,
+        baseline: ControllerProposal,
+        safety_floor: PerZone[Demand],
+        residual: ResidualEvidence | None = None,
+    ) -> MpcProposal:
+        """この tick の結果。読み込みに失敗していれば ``MODEL_LOAD_FAILURE`` を返す。"""
+        if self._controller is None:
+            assert self._failure_reason is not None
+            return MpcProposal(
+                failure=LearnedFailure.MODEL_LOAD_FAILURE,
+                failure_reason=self._failure_reason,
+            )
+        return self._controller.propose(
+            snapshot=snapshot,
+            observed=observed,
+            supervisor=supervisor,
+            baseline=baseline,
+            safety_floor=safety_floor,
+            residual=residual,
         )
 
 

@@ -1,15 +1,25 @@
 """Learned MPC の内部モデル契約（#86）。
 
-#84 の ``ThermalModel`` は**観測の再生**だけを主張する。Dataset v1 は anchor action から
-label 時刻までの後続 Fan action 列を持たないため、決定記録 0048 §2.1 は
-「anchor action を任意の candidate action へ変えた反実仮想予測や、#86 optimizer の内部 model
-として使えるとは宣言しない」と明記している。
+MPC は内部モデルに ``InferenceCapability.COUNTERFACTUAL_ACTION`` を要求する。決定記録 0079 §2.9 の
+**段 4** から、束縛は反実仮想 Thermal Model artifact v2 の封をした型
+``RegistryCounterfactualThermalModel``（0079 §2.4）だけを受け取る。``MpcModelBinding`` は
+Registry が発行した ``VerifiedArtifact`` から :meth:`MpcModelBinding.from_verified_artifact` の
+1つの呼び出しで作り、model と同梱 Confidence Profile v2 は同じ bytes から組み立てる。
 
-そこで MPC は内部モデルに ``InferenceCapability.COUNTERFACTUAL_ACTION`` を要求する。
-現行の artifact は manifest の capability が ``observational_replay`` に固定されているため、
-``MpcModelBinding.for_control`` は**いまあるすべての artifact を決定論的に拒む**。
-拒否は例外的な事態ではなく通常経路で、runtime はそれを
-``LearnedFailure.MODEL_LOAD_FAILURE`` として Gate（#79 / #85）へ渡し、Fallback で走り続ける。
+- v1 artifact（``observational_replay``）は loader の L4 と attestation の capability で拒まれる
+  （0079 §2.2。v1 を v2 として読み替えない）
+- 候補 plan は action schema の格子と**完全に一致**するものだけを予測する（0079 §2.3。補間・外挿・
+  丸めをしない）。``ActionPlan.steps[k]`` は Dataset v2 / artifact v2 の step ``k`` と同じ区間である
+  （0087 §2.5）
+- 候補 plan と Fallback の requested は、同梱 Profile v2 の step ごとの support で照らす
+  （0079 §2.5 / 0084 §2.2。:meth:`MpcModelBinding.plan_support_violation`）
+
+検査に外れた artifact は ``MpcModelUnusableError`` になる。拒否は例外的な事態ではなく通常経路で、
+runtime はそれを ``LearnedFailure.MODEL_LOAD_FAILURE`` として Gate（#79 / #85）へ渡し、
+Fallback で走り続ける（0079 §2.6）。
+
+``CounterfactualThermalModel``（Protocol）は #105 の学習 dynamics（0079 段 6 で同じ型へ
+切り替える）がまだ使うので残す。**MPC の束縛はこの Protocol を受け取らない。**
 """
 
 from __future__ import annotations
@@ -18,6 +28,18 @@ from typing import Annotated, Protocol, Self
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from coldaisle.control.model.calibration_digest import RuntimeCalibration
+from coldaisle.control.model.confidence import inference_id
+from coldaisle.control.model.counterfactual import (
+    ActionTrajectory,
+    CounterfactualArtifactRejectedError,
+    RegistryCounterfactualThermalModel,
+    ThermalActionSchema,
+)
+from coldaisle.control.model.counterfactual_confidence import (
+    StepSupportChecker,
+    StepSupportViolation,
+)
 from coldaisle.control.model.thermal import (
     MAX_TARGET_HORIZONS,
     MAX_TARGET_METRICS,
@@ -33,9 +55,11 @@ from coldaisle.control.model_registry import (
     ArtifactAttestation,
     ArtifactCapability,
     ArtifactKind,
+    VerifiedArtifact,
 )
 from coldaisle.control.mpc.plan import ActionPlan
-from coldaisle.control.schema import AuthorityStage
+from coldaisle.control.schema import AuthorityStage, PerZone
+from coldaisle.metrics import MetricCatalog
 
 Sha256 = Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
 FiniteFloat = Annotated[float, Field(allow_inf_nan=False)]
@@ -47,8 +71,8 @@ COUNTERFACTUAL_CAPABILITIES: frozenset[ArtifactCapability] = frozenset(
 )
 """MPC の内部モデルにできる、**Registry へ登録時に申告された** capability。
 
-``observational_replay`` は入っていない。**現行の artifact はすべてそちら**なので、後続
-action 列を持つ Dataset 版と実測評価が揃うまで、active 制御に使える内部モデルは存在しない。
+``observational_replay`` は入っていない。v1 artifact はすべてそちらで、MPC に束縛できるのは
+Dataset v2 から学習した反実仮想 artifact v2 だけ（決定記録 0079 §2.2 / §2.3）。
 """
 
 
@@ -195,50 +219,66 @@ class MpcModelUnusableError(RuntimeError):
 
 
 class MpcModelBinding:
-    """Registry の証拠で裏づけた内部モデルと、それを使ってよい authority の束（#86）。
+    """Registry の証拠で裏づけた反実仮想 artifact v2 と、それを使ってよい authority の束（#86）。
 
     optimizer と controller は **この型を通してしか** モデルに触れない。生成時に一度だけ
     検査し、以後 tick ごとに条件が変わらないようにする。
 
+    **作れるのは :meth:`from_verified_artifact` だけ**（決定記録 0079 §2.4 / §2.9 の段 4）。
+    Registry が発行した ``VerifiedArtifact`` を1つ受け取り、同じ bytes から封をした型
+    ``RegistryCounterfactualThermalModel``（model と同梱 Profile v2）と、step ごとの support の
+    照合（0084 §2.2）を作る。``VerifiedArtifact`` と別に組み立てた model / Profile を並べて
+    受け取る経路は持たない。
+
     **verification / authority / 版・schema は ``ArtifactAttestation`` から取る。**
-    モデル objectの自称値は照合のためだけに読み、食い違えば束縛しない。
     """
 
-    __slots__ = ("_attestation", "_authority_stage", "_identity", "_model")
-    _model: CounterfactualThermalModel
-    _identity: CounterfactualModelIdentity
+    __slots__ = ("_attestation", "_authority_stage", "_checker", "_model")
+    _model: RegistryCounterfactualThermalModel
     _attestation: ArtifactAttestation
     _authority_stage: AuthorityStage
+    _checker: StepSupportChecker
 
     def __init__(self) -> None:
-        raise TypeError("MpcModelBinding は for_control からだけ作る")
+        raise TypeError("MpcModelBinding は from_verified_artifact からだけ作る")
 
     @classmethod
-    def for_control(
+    def from_verified_artifact(
         cls,
-        model: CounterfactualThermalModel,
+        verified: VerifiedArtifact,
         *,
-        attestation: ArtifactAttestation,
+        metric_catalog: MetricCatalog,
+        calibration: RuntimeCalibration,
         authority_stage: AuthorityStage,
         expected_model_version: str,
     ) -> MpcModelBinding:
-        """制御へ提案を出すための束を作る。条件を1つでも欠けば拒む。
+        """``VerifiedArtifact`` から制御へ提案を出すための束を作る。条件を1つでも欠けば拒む。
+
+        読み込み時の検査（0079 §2.4 の L1〜L10、0084 の L11 / L12）は封をした型の loader が行う。
+        ``metric_catalog`` は runtime の ``config/metrics.yaml``、``calibration`` は runtime の較正
+        （起動時に1回だけ読んだ値。読めなければ ``RuntimeCalibration.unavailable``。0096 §5 #8）。
+        どちらも既定値を持たない。検査に外れた artifact は ``MpcModelUnusableError`` になり、
+        runtime はそれを ``MODEL_LOAD_FAILURE`` として Fallback にする（0079 §2.6）。
 
         ``authority_stage`` は**いま与えられている実効 stage**（#92 / 決定記録 0057 §2.2）で、
-        設定の `authority_stage`（v9 からは上限）ではない。上限を渡すと、journal がまだ
-        SHADOW の初日に SHADOW 互換の artifact が拒まれ、昇格に要る証拠を集められなくなる。
+        設定の `authority_stage`（v9 からは上限）ではない。
 
-        ``attestation`` は Model Registry（#104）の検証経路だけが発行する。呼び出し側が
-        作れないため、**検証していない artifact を取り違えて渡す配線ミスは型で止まる。**
-        同一プロセス内の悪意ある偽造までは防げない（決定記録 0050 §3 / 0052 §2.1）。
-
-        **暗黙の降格はしない。** 条件を満たせないモデルは「弱い権限で使う」のではなく使わない。
+        **暗黙の降格はしない。** 条件を満たせない artifact は「弱い権限で使う」「Profile なしで
+        使う」のではなく使わない（0079 §2.6）。
         """
-        # model_copy(update=...) は検証を通らないため、ここで必ず検証し直す。
-        identity = CounterfactualModelIdentity.model_validate(
-            model.identity.model_dump(mode="python")
-        )
+        try:
+            model = RegistryCounterfactualThermalModel.from_verified_artifact(
+                verified, metric_catalog=metric_catalog, calibration=calibration
+            )
+        except CounterfactualArtifactRejectedError as error:
+            # **検査の番号を理由に残す。** 何に外れたのか（較正・単位・格子など）を後から読める。
+            raise MpcModelUnusableError(
+                f"反実仮想 artifact v2 の読み込み時の検査に外れた（{error.check.value}）: "
+                f"{error.detail}"
+            ) from error
+        attestation = verified.attestation
         if attestation.kind is not ArtifactKind.THERMAL_MODEL:
+            # L1 でも拒むが、束縛の条件として独立に見る（0052 §2.1 の表）。
             raise MpcModelUnusableError(
                 f"thermal model 以外の artifact を MPC の内部モデルにしない"
                 f"（kind={attestation.kind.value}）"
@@ -251,15 +291,10 @@ class MpcModelBinding:
                 f"（status={attestation.status.value}）"
             )
         if attestation.capability not in COUNTERFACTUAL_CAPABILITIES:
-            # **登録時に申告された能力だけを見る。** 推論器の自称では判断しない。
+            # **登録時に申告された能力だけを見る。** L1 と同じ条件を束縛の側でも持つ。
             raise MpcModelUnusableError(
                 "反実仮想予測を申告していない artifact を MPC の内部モデルにしない"
                 f"（attested capability={attestation.capability.value}。決定記録 0048 §2.1）"
-            )
-        if identity.capability.value != attestation.capability.value:
-            raise MpcModelUnusableError(
-                "model の自称 capability が Registry の申告と食い違っている"
-                f"（model={identity.capability.value}; attested={attestation.capability.value}）"
             )
         if authority_stage not in attestation.authority_compatibility:
             raise MpcModelUnusableError(
@@ -272,30 +307,35 @@ class MpcModelBinding:
                 "内部モデルの版が runtime の期待と違う"
                 f"（expected={expected_model_version}; attested={attestation.version}）"
             )
-        cls._check_model_matches_attestation(model, identity, attestation)
+        cls._check_model_matches_attestation(model, attestation)
         binding = object.__new__(cls)
         object.__setattr__(binding, "_model", model)
-        object.__setattr__(binding, "_identity", identity)
         object.__setattr__(binding, "_attestation", attestation)
         object.__setattr__(binding, "_authority_stage", authority_stage)
+        object.__setattr__(
+            binding,
+            "_checker",
+            # 同梱 Profile からだけ作る。held の列・residual の基準と**同じ照合**（0084 §2.2）。
+            StepSupportChecker(model.confidence_profile, model.action_schema),
+        )
         return binding
 
     @staticmethod
     def _check_model_matches_attestation(
-        model: CounterfactualThermalModel,
-        identity: CounterfactualModelIdentity,
-        attestation: ArtifactAttestation,
+        model: RegistryCounterfactualThermalModel, attestation: ArtifactAttestation
     ) -> None:
-        """モデル object が、検証された artifact そのものを表しているか確かめる。
+        """封をした型が、attestation の示す artifact そのものから作られたかを確かめる。
 
-        別の artifact を包んだ wrapper が attestation だけを借りて authority を得ないように、
-        model ID・版・feature / target schema version を突き合わせる。
+        loader の L5 が同じ bytes から導いた metadata を照合済みだが、束縛の条件として
+        独立にもう一度見る（0052 §2.1 の表を v2 でも同じ強さで残す）。
         """
+        manifest = model.manifest
         mismatches = [
             name
             for name, attested, declared in (
-                ("model_id", attestation.model_id, identity.model_id),
-                ("model_version", attestation.version, identity.model_version),
+                ("model_id", attestation.model_id, manifest.model_id),
+                ("model_version", attestation.version, manifest.model_version),
+                ("artifact_sha256", attestation.artifact_sha256, model.artifact_sha256),
                 (
                     "feature_schema_version",
                     attestation.feature_schema_version,
@@ -319,14 +359,29 @@ class MpcModelBinding:
         raise AttributeError("MpcModelBinding は不変")
 
     @property
-    def model(self) -> CounterfactualThermalModel:
-        """検証済みの内部モデル。"""
+    def model(self) -> RegistryCounterfactualThermalModel:
+        """検証済みの封をした型（model と同梱 Profile v2）。判定器はここから作る。"""
         return self._model
 
     @property
     def identity(self) -> CounterfactualModelIdentity:
-        """束縛したときに検証した、モデル自身の申告。"""
-        return self._identity
+        """束縛した artifact の manifest が申告する identity。"""
+        manifest = self._model.manifest
+        return CounterfactualModelIdentity(
+            model_id=manifest.model_id,
+            model_version=manifest.model_version,
+            capability=manifest.capability,
+        )
+
+    @property
+    def target_schema(self) -> ThermalTargetSchema:
+        """出力の順序付き契約。"""
+        return self._model.target_schema
+
+    @property
+    def action_schema(self) -> ThermalActionSchema:
+        """action の格子（``step_ms``・step 数・zone の順）。plan はこの格子と完全に一致させる。"""
+        return self._model.action_schema
 
     @property
     def attestation(self) -> ArtifactAttestation:
@@ -357,6 +412,86 @@ class MpcModelBinding:
     def capability(self) -> ArtifactCapability:
         """Registry へ登録時に申告された能力。"""
         return self._attestation.capability
+
+    def predict(self, observed: ObservedThermalInput) -> ThermalPrediction:
+        """anchor 推論。計画 action の列は ``hold_effective``（0084 §2.1）で封をした型が作る。"""
+        return self._model.predict(observed)
+
+    def predict_plan(
+        self, planned: PlannedThermalInput, *, anchor: ThermalPrediction
+    ) -> PlanPrediction:
+        """候補 plan に対する予測（0079 §2.3 / 0087 §2.5）。Demand も authority も返さない。
+
+        plan の ``steps[k]`` は action schema の step ``k``
+        （区間 ``[k × step_ms, (k + 1) × step_ms)``）の action で、その値が effective として
+        掛かった仮定として model へ渡す（0079 §2.3）。
+        **plan の格子が action schema と違えば予測しない**（補間・外挿・丸めをしない）。
+        予測の horizon も plan の offset 列と完全に一致しなければならない。
+
+        ``anchor`` はこの tick に :meth:`predict` で1回だけ作った anchor 推論で、
+        ``anchor_inference_id`` はそこから作る。候補ごとに anchor 推論をやり直さない（予算を
+        候補の評価に使う）。束縛した artifact とこの観測の anchor 推論でなければ予測しない。
+        """
+        plan = planned.plan
+        trajectory = self._trajectory(plan)
+        if (anchor.artifact_sha256, anchor.input_action_ts_ms) != (
+            self._model.artifact_sha256,
+            planned.observed.action_ts_ms,
+        ):
+            raise ValueError("anchor 推論が束縛した artifact とこの観測のものではない")
+        prediction = self._model.predict_trajectory(planned.observed, trajectory)
+        horizons = tuple(target.horizon_ms for target in prediction.targets)
+        if horizons != plan.offsets_ms:
+            raise ValueError(
+                "予測の horizon が plan の offset 列と一致しない"
+                f"（horizons={list(horizons)}; offsets={list(plan.offsets_ms)}）"
+            )
+        return PlanPrediction(
+            model_id=prediction.model_id,
+            model_version=prediction.model_version,
+            artifact_sha256=prediction.artifact_sha256,
+            artifact_verification=prediction.artifact_verification,
+            capability=prediction.capability,
+            anchor_inference_id=inference_id(planned.observed, anchor),
+            input_action_ts_ms=prediction.input_action_ts_ms,
+            plan_digest=plan.digest(),
+            targets=tuple(
+                PlannedTarget(
+                    offset_ms=target.horizon_ms,
+                    expected_ts_ms=target.expected_ts_ms,
+                    values=dict(target.values),
+                )
+                for target in prediction.targets
+            ),
+        )
+
+    def plan_support_violation(
+        self, observed: ObservedThermalInput, plan: ActionPlan
+    ) -> StepSupportViolation | None:
+        """候補 plan を同梱 Profile v2 の step ごとの support に照らす（0079 §2.5 / 0084 §2.2）。
+
+        anchor は観測 window の action（いま掛かっている effective demand）。外れた最初の点を返す。
+        **margin も件数の下限も掛けない**（観測した値・cell・組の外は評価しない）。
+        held の列（anchor 推論）と residual の基準の除外と同じ ``StepSupportChecker`` を使う。
+        """
+        anchor = PerZone[float](
+            front=observed.action.front.effective_demand,
+            rear=observed.action.rear.effective_demand,
+            top=observed.action.top.effective_demand,
+        )
+        return self._checker.check(anchor, self._trajectory(plan))
+
+    def _trajectory(self, plan: ActionPlan) -> ActionTrajectory:
+        schema = self._model.action_schema
+        if plan.step_ms != schema.step_ms or len(plan.steps) != schema.steps:
+            raise ValueError(
+                "plan の格子が action schema と一致しない（補間・外挿・丸めはしない）"
+                f"（plan={plan.step_ms}ms×{len(plan.steps)}; "
+                f"action={schema.step_ms}ms×{schema.steps}）"
+            )
+        return ActionTrajectory(
+            step_ms=plan.step_ms, demands=tuple(step.demands for step in plan.steps)
+        )
 
     def trace_metadata(self) -> dict[str, object]:
         """#82 の decision trace へ載せられる、束縛の出どころ。"""
