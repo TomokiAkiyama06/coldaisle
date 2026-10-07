@@ -701,6 +701,31 @@ class ThermalDatasetV2(_Frozen):
         if len({example.example_id for example in self.examples}) != len(self.examples):
             raise ValueError("example_idが重複している")
         spec = self.manifest.spec
+        # 1つの ControlTick は1つの tick_id と effective しか持たない（0087 §2.1）。
+        # 重なる example が同じ tick を使うので、run と時刻をキーに全 example を通して照合する
+        ticks: dict[tuple[str, int], tuple[int, PerZone[float]]] = {}
+        for example in self.examples:
+            anchor = PerZone(
+                front=example.action.front.effective_demand,
+                rear=example.action.rear.effective_demand,
+                top=example.action.top.effective_demand,
+            )
+            uses = (
+                (example.action_ts_ms, example.control_tick_id, anchor),
+                (
+                    example.prior_action.source_ts_ms,
+                    example.prior_action.source_tick_id,
+                    example.prior_action.effective_demand,
+                ),
+                *(
+                    (step.source_ts_ms, step.source_tick_id, step.effective_demand)
+                    for step in example.action_steps
+                ),
+            )
+            for ts_ms, tick_id, demands in uses:
+                seen = ticks.setdefault((example.source_run_id, ts_ms), (tick_id, demands))
+                if seen != (tick_id, demands):
+                    raise ValueError("同じ元の tick の tick_id か値が example の間で食い違っている")
         for example in self.examples:
             run = runs[example.source_run_id]
             _check_example_against_run_and_spec(

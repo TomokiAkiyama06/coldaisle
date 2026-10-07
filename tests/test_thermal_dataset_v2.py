@@ -30,6 +30,7 @@ from coldaisle.control.model.dataset import (
     SourceRun,
     ThermalDataset,
     ThermalDatasetV2,
+    examples_sha256,
     split_temporally_v2,
 )
 from coldaisle.control.model.thermal import ObservedThermalInput
@@ -984,3 +985,40 @@ def test_steps_sharing_a_source_tick_must_agree(build_ticks, field, value):
     raw["examples"][0]["action_steps"][1][field] = value
     with pytest.raises(ValidationError, match="同じ元の tick"):
         DatasetExampleV2.model_validate_json(json.dumps(raw["examples"][0]))
+
+
+@pytest.mark.parametrize(
+    ("where", "field", "value"),
+    [
+        pytest.param("action_steps", "source_tick_id", 99, id="step-tick-id"),
+        pytest.param(
+            "action_steps",
+            "effective_demand",
+            {"front": 0.9, "rear": 0.6, "top": 0.6},
+            id="step-value",
+        ),
+        pytest.param("prior_action", "source_tick_id", 99, id="prior-tick-id"),
+    ],
+)
+def test_source_ticks_must_agree_across_examples(build_ticks, where, field, value):
+    """重なる example が同じ tick を使うとき、example の間でも tick_id と値が一致する。"""
+    ticks = tuple((4_000 + 1_000 * index, 10 + index, A if index % 2 else B) for index in range(6))
+    dataset = build_ticks(ticks, end_ms=9_001, spec=spec_v2(window_ms=1_000))
+    first, second = dataset.examples[:2]
+    assert second.prior_action.source_ts_ms == first.action_ts_ms
+    assert second.action_steps[0].source_ts_ms == first.action_steps[1].source_ts_ms
+
+    raw = dataset.model_dump(mode="json")
+    # 1つ目の step 1（6000）は2つ目の anchor、2つ目の prior_action（5000）は1つ目の anchor
+    target = (
+        raw["examples"][0]["action_steps"][1]
+        if where == "action_steps"
+        else raw["examples"][1][where]
+    )
+    target[field] = value
+    examples = tuple(
+        DatasetExampleV2.model_validate_json(json.dumps(item)) for item in raw["examples"]
+    )
+    raw["manifest"]["examples_sha256"] = examples_sha256(examples)
+    with pytest.raises(ValidationError, match="example の間で食い違っている"):
+        ThermalDatasetV2.model_validate_json(json.dumps(raw))
