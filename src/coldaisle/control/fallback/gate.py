@@ -132,6 +132,12 @@ class LearnedControlStatus(_Frozen):
 
     proposal: ControllerProposal | None = None
     received_at_mono_ms: int | None = Field(default=None, ge=0)
+    source_snapshot_mono_ms: int | None = Field(default=None, ge=0)
+    """提案の元 snapshot の単調時刻（loop の時計。#86 / 決定記録 0077 §2.4 の4）。
+
+    loop が「この process が出した snapshot」として特定した記録から取る。worker は決めない。
+    Gate はここから `mpc.max_source_age_ms` を数え、受信起点の `mpc.valid_ms` に**足して**掛ける。
+    """
     failure: LearnedFailure | None = None
     supervisor_available: bool = True
     control_deadline_exceeded: bool = False
@@ -184,6 +190,9 @@ class LearnedControlStatus(_Frozen):
             raise ValueError("失敗していない状態に failure_reason を付けない")
         if (self.proposal is None) != (self.received_at_mono_ms is None):
             raise ValueError("Learned proposal と受信単調時刻は一緒に指定する")
+        if (self.proposal is None) != (self.source_snapshot_mono_ms is None):
+            # 元 snapshot の時刻を持たない提案は、どれだけ前の観測から作られたか言えない。
+            raise ValueError("Learned proposal と元 snapshot の単調時刻は一緒に指定する")
         if self.proposal is None and self.assessment is not None:
             raise ValueError("Learned proposal が無いときに assessment を付けない")
         if (self.proposal is None) != (self.binding_authority_stage is None):
@@ -419,6 +428,16 @@ class ControllerGate:
             return self._reason(
                 FallbackCause.PROPOSAL_EXPIRED,
                 f"age_ms={age_ms}; valid_ms={self._policy.mpc.valid_ms}",
+            )
+        assert learned.source_snapshot_mono_ms is not None
+        # **受信起点に加えて元 snapshot 起点でも数える**（0077 §2.4 の4）。受信起点だけだと、
+        # worker の中で長く滞留した提案が受信した瞬間に新しく見える。
+        source_age_ms = now_mono_ms - learned.source_snapshot_mono_ms
+        max_source_age_ms = self._policy.mpc.max_source_age_ms.value
+        if source_age_ms < 0 or source_age_ms > max_source_age_ms:
+            return self._reason(
+                FallbackCause.PROPOSAL_EXPIRED,
+                f"source_age_ms={source_age_ms}; max_source_age_ms={max_source_age_ms}",
             )
         if proposal.optimizer_status is OptimizerStatus.TIMEOUT:
             return self._reason(FallbackCause.OPTIMIZER_TIMEOUT)

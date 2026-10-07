@@ -33,7 +33,7 @@ from coldaisle.control.schema import (
 )
 from coldaisle.store.models import validate_metric
 
-CONTROL_CONFIG_VERSION: Literal[13] = 13
+CONTROL_CONFIG_VERSION: Literal[14] = 14
 """4ファイルを束ねた Control Config の版。
 
 - v11（#81 / 決定記録 0073 §2.1）: ``air-balance.yaml``（v2）を4つ目のファイルにした。
@@ -42,8 +42,11 @@ CONTROL_CONFIG_VERSION: Literal[13] = 13
 - v13（#81 / 決定記録 0078 §2.4）: ``fan-policy.yaml`` を v10 にした
   （``air_balance_coordination``）。
   ``mode: shadow / apply`` と ``air-balance.yaml`` の ``uncalibrated`` の組み合わせを拒否する
+- v14（#86 / 決定記録 0077 §2.4 の4・§2.10 段階 3）: ``fan-policy.yaml`` を v11 にした
+  （``mpc.max_source_age_ms``）。上限 ``<= mpc.valid_ms`` と、``safety.yaml`` をまたぐ下限
+  ``>= 2 * safety.tick_ms + mpc.period_ms + mpc.budget_ms`` を一括検証で確かめる
 """
-FAN_POLICY_CONFIG_VERSION: Literal[10] = 10
+FAN_POLICY_CONFIG_VERSION: Literal[11] = 11
 SAFETY_CONFIG_VERSION: Literal[4] = 4
 CONFIG_FILENAMES = {
     "fan_hardware": "fan-hardware.yaml",
@@ -759,6 +762,13 @@ class MpcTiming(_ConfigModel):
     period_ms: PositiveMilliseconds
     budget_ms: PositiveMilliseconds
     valid_ms: PositiveMilliseconds
+    max_source_age_ms: PolicyMilliseconds
+    """元 snapshot の単調時刻から数えた提案の寿命（v11。#86 / 決定記録 0077 §2.4 の4）。
+
+    受信から ``valid_ms`` の条件（0028 §2.6）に**足す**条件で、置き換えない。worker の中で長く
+    滞留した提案が、受信した瞬間に新しく見えることを塞ぐ。上限 ``<= valid_ms`` はここで、
+    ``safety.yaml`` をまたぐ下限は ``ControlConfig`` の一括検証で確かめる。
+    """
     optimizer: MpcOptimizerConfig
 
     @model_validator(mode="after")
@@ -768,6 +778,12 @@ class MpcTiming(_ConfigModel):
         if self.valid_ms < self.period_ms:
             # 再計算の周期より短い有効期限では、健全な提案でも毎 tick 期限切れになる。
             raise ValueError("mpc.valid_ms は mpc.period_ms 以上にする")
+        if self.max_source_age_ms.value > self.valid_ms:
+            # 受信起点の期限より長い元 snapshot 起点の期限は、何も塞がない（0077 §2.4 の4）。
+            raise ValueError(
+                "mpc.max_source_age_ms は mpc.valid_ms 以下にする: "
+                f"max_source_age_ms={self.max_source_age_ms.value}; valid_ms={self.valid_ms}"
+            )
         return self
 
 
@@ -1031,7 +1047,7 @@ class AirBalanceCoordinationConfig(_ConfigModel):
 
 
 class FanPolicyConfig(_ConfigModel):
-    schema_version: Literal[10]
+    schema_version: Literal[11]
     fallback_curve: Annotated[
         tuple[FallbackPoint, ...], BeforeValidator(_yaml_sequence_to_tuple), Field(min_length=2)
     ]
@@ -1054,7 +1070,10 @@ class FanPolicyConfig(_ConfigModel):
     authority_rollout: AuthorityRolloutConfig
     shadow: ShadowConfig
     air_balance_coordination: AirBalanceCoordinationConfig
-    """v10（#81 / 決定記録 0078 §2.4）。**必須。** v9 以前を補完しない。"""
+    """v10（#81 / 決定記録 0078 §2.4）。**必須。** v9 以前を補完しない。
+
+    v11（#86 / 決定記録 0077 §2.4）は ``mpc.max_source_age_ms`` を足した。v10 以前を補完しない。
+    """
     recovery_hold_ms: PositiveMilliseconds
     demote_window_ms: PositiveMilliseconds
     demote_after: Annotated[int, Field(gt=0)]
@@ -1182,6 +1201,22 @@ class ControlConfig(_ConfigModel):
             raise ValueError(
                 "air_balance_coordination.mode が shadow / apply のときは "
                 "air-balance.yaml の source.status を calibrated にする（止めるなら mode: off）"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _mpc_source_age_covers_a_healthy_round_trip(self) -> Self:
+        # 往き（元 snapshot から frame が worker へ届くまでの最大1 tick・worker が最後の frame を
+        # 拾うまでの最大1周期・optimizer の予算）と還り（poll の直後に届いた結果が次の tick の
+        # poll まで待つ最大1 tick）を足した値より短いと、健全な worker の提案も期限切れになりうる。
+        # Learned が黙って一度も使われない構成を起動時に見せる（決定記録 0077 §2.4 の4）。
+        mpc = self.policy.mpc
+        required = 2 * self.safety.tick_ms.value + mpc.period_ms + mpc.budget_ms
+        if mpc.max_source_age_ms.value < required:
+            raise ValueError(
+                "mpc.max_source_age_ms は 2 * safety.tick_ms + mpc.period_ms + mpc.budget_ms "
+                f"以上にする: max_source_age_ms={mpc.max_source_age_ms.value}; "
+                f"required>={required}"
             )
         return self
 
@@ -1355,6 +1390,7 @@ class ControlConfig(_ConfigModel):
             "model_confidence.medium_limit.limit_down",
             confidence.medium_limit.limit_down,
         )
+        append("fan-policy.yaml", "mpc.max_source_age_ms", self.policy.mpc.max_source_age_ms)
         optimizer = self.policy.mpc.optimizer
         for name in (
             "horizon_ms",

@@ -1633,6 +1633,18 @@ class ControlLoop:
                 extra={logs.FIELDS_KEY: {"tick_id": snapshot.tick_id}},
             )
 
+    def _learned_source_mono_ms(self, result: MpcProposal) -> int | None:
+        """提案の元 snapshot の単調時刻（**この loop の時計**。決定記録 0077 §2.4 の4）。
+
+        `_result_is_bound_to_our_snapshot` を通った結果だけがここへ来る。worker が名乗る時刻は
+        使わず、この process が出した snapshot の記録から引く。提案の無い結果（失敗）は None。
+        """
+        proposal = result.proposal
+        if proposal is None:
+            return None
+        source = self._issued_snapshot(proposal.seq, proposal.computed_at_ms)
+        return None if source is None else source.monotonic_ms
+
     def _result_is_bound_to_our_snapshot(self, result: MpcProposal) -> bool:
         """worker 結果が、**この process が出した snapshot**から作られたか（0060 §2.6）。
 
@@ -1670,6 +1682,11 @@ class ControlLoop:
         supervisor_available: bool,
         control_deadline_exceeded: bool,
     ) -> LearnedControlStatus:
+        source_mono_ms = None if learned is None else self._learned_source_mono_ms(learned)
+        if learned is not None and learned.proposal is not None and source_mono_ms is None:
+            # `_poll_learned` で元 snapshot を特定した結果だけが来るので、ここへは来ない想定。
+            # 来ても元 snapshot の時刻を言えない提案は使わない（新しさを確かめられない）
+            learned = None
         if learned is None:
             return LearnedControlStatus(
                 supervisor_available=supervisor_available,
@@ -1681,6 +1698,7 @@ class ControlLoop:
         assert received_mono_ms is not None
         return learned.to_status(
             received_at_mono_ms=received_mono_ms,
+            source_snapshot_mono_ms=source_mono_ms,
             snapshot_status=snapshot_status,
             supervisor_available=supervisor_available,
             control_deadline_exceeded=control_deadline_exceeded,

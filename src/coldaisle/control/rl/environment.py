@@ -866,7 +866,11 @@ class SupervisorTrainingEnvironment:
                     safety_floor=self._floor,
                 )
                 ood = proposal.assessment.ood if proposal.assessment is not None else None
-                learned = proposal.to_status(received_at_mono_ms=snapshot.monotonic_ms)
+                learned = proposal.to_status(
+                    received_at_mono_ms=snapshot.monotonic_ms,
+                    # 提案はこの step の snapshot から作った。元 snapshot は同じもの
+                    source_snapshot_mono_ms=snapshot.monotonic_ms,
+                )
             selection = self._gate.select(
                 now_mono_ms=snapshot.monotonic_ms,
                 fallback=baseline,

@@ -357,6 +357,7 @@ class StubWorkerResult:
     proposal: Any = None
     """この結果が読んだ snapshot（`seq` / `computed_at_ms`）。None は worker の失敗。"""
     seen_received_ms: list[int] = field(default_factory=list)
+    seen_source_ms: list[int | None] = field(default_factory=list)
     seen_deadline_exceeded: list[bool] = field(default_factory=list)
     seen_snapshot_status: list[SnapshotStatus] = field(default_factory=list)
 
@@ -367,11 +368,13 @@ class StubWorkerResult:
         self,
         *,
         received_at_mono_ms: int,
+        source_snapshot_mono_ms: int | None,
         snapshot_status: SnapshotStatus = SnapshotStatus.AVAILABLE,
         supervisor_available: bool = True,
         control_deadline_exceeded: bool = False,
     ) -> LearnedControlStatus:
         self.seen_received_ms.append(received_at_mono_ms)
+        self.seen_source_ms.append(source_snapshot_mono_ms)
         self.seen_deadline_exceeded.append(control_deadline_exceeded)
         self.seen_snapshot_status.append(snapshot_status)
         return LearnedControlStatus(
@@ -1398,6 +1401,40 @@ def test_invariant_27_a_learned_result_from_another_process_is_not_accepted(cata
     harness.tick()
 
     assert stale.seen_received_ms == [], "別 process の snapshot の結果を Gate へ渡している"
+
+
+def test_invariant_27_the_source_snapshot_time_comes_from_the_loop_record(catalog) -> None:
+    """元 snapshot の単調時刻は**この loop が出した snapshot の記録**から取る（0077 §2.4 の4）。
+
+    受信時刻を使えば滞留した提案が新しく見え、worker の名乗りを使えば worker が鮮度を決める。
+    """
+    source = StubWorkerSource(result=None)
+    harness = Harness(catalog, learned_source=source)
+    first = harness.tick()
+    first_mono_ms = harness.monotonic.monotonic_ms()
+    harness.tick()
+    harness.tick()
+
+    late = StubWorkerResult(
+        digest="d" * 64,
+        proposal=StubProposalOrigin(seq=first.tick.tick_id, computed_at_ms=first.tick.ts_ms),
+    )
+    source.result = late
+    harness.tick()
+    harness.tick()
+
+    received = late.seen_received_ms[0]
+    assert received > first_mono_ms
+    assert late.seen_source_ms == [first_mono_ms, first_mono_ms]
+
+
+def test_invariant_27_a_worker_failure_has_no_source_snapshot_time(catalog) -> None:
+    """提案の無い結果（失敗）には元 snapshot が無い。None のまま Gate へ渡す。"""
+    stub = StubWorkerResult()
+    harness = Harness(catalog, learned_source=StubWorkerSource(result=stub))
+    harness.tick()
+
+    assert stub.seen_source_ms and set(stub.seen_source_ms) == {None}
 
 
 def test_invariant_27_a_worker_failure_still_reaches_the_gate(catalog) -> None:
