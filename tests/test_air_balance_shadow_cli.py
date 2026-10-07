@@ -440,6 +440,24 @@ def test_an_out_that_aliases_an_input_is_refused(setup: Fixture, target: str) ->
     assert (alias.read_bytes() if alias.exists() else None) == before
 
 
+@pytest.mark.parametrize("target", ["evidence", "config", "policy"])
+def test_an_aliased_input_is_refused_before_it_is_read(setup: Fixture, target: str) -> None:
+    """壊れた入力を `--out` が指していても、読んで落ちる前に exit 1 で拒む（Codex P2）。"""
+    alias = {
+        "evidence": setup.evidence,
+        "config": setup.config_dir / "pr81-shadow.yaml",
+        "policy": setup.config_dir / "fan-policy.yaml",
+    }[target]
+    alias.write_text("{not yaml", encoding="utf-8")
+    argv = setup.argv()
+    argv[argv.index("--out") + 1] = str(alias)
+    if target == "config":
+        argv[argv.index("--config") + 1] = str(alias)
+
+    assert main(argv) == 1
+    assert alias.read_text(encoding="utf-8") == "{not yaml"
+
+
 def test_an_out_through_a_symlink_to_the_db_is_refused(setup: Fixture) -> None:
     setup.store(mixed_ticks(setup))
     db_before = setup.db.read_bytes()

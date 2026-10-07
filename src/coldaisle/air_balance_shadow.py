@@ -701,18 +701,26 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     logs.configure(args.log_level)
 
-    manifest = AirBalanceShadowManifest.from_file(args.evidence)
-    settings = AirBalanceShadowConfig.from_file(args.config)
-    control = ControlConfig.from_directory(args.control_config)
     report_format: ReportFormat = args.report_format
     out: Path = args.out if args.out is not None else DEFAULT_OUT[report_format]
-    period = manifest.period
     try:
+        # **どの入力を開くより前に**確かめる（壊れた・特殊な入力を読んで落ちる前に拒む）。
         check_out_is_not_an_input(
             out,
             db=args.db,
             inputs=(args.evidence, args.config, *control_config_files(args.control_config)),
         )
+    except AirBalanceShadowInputError as error:
+        LOGGER.error(
+            "Air Balance の shadow 集計を拒否した（何も書かない）",
+            extra={logs.FIELDS_KEY: {"reason": str(error), "out": str(out)}},
+        )
+        return 1
+    manifest = AirBalanceShadowManifest.from_file(args.evidence)
+    settings = AirBalanceShadowConfig.from_file(args.config)
+    control = ControlConfig.from_directory(args.control_config)
+    period = manifest.period
+    try:
         # **証拠の DB は読み取り専用で開く**（`immutable=1`。添え file に中身があれば開かない）。
         with EvidenceDatabase(args.db) as store, store.snapshot():
             traces = store.control_traces(period.start_ms, period.end_ms)
