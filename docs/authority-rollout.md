@@ -105,11 +105,10 @@ uv run coldaisle-authority raise \
 （path は仮の値。導入先の値に置き換える。`--registry-limits` は `model-registry.yaml` の
 ディレクトリで、既定は `config`）
 
-**本番（`docs/ubuntu-deploy.md` の導入先）での `raise` は、操作者に制御設定の読み取りと Model Registry の
-lock の最小権限を与える設計が決まるまで使えない（#217。`rollback` は使える）。** 承認者は自分の uid で
-制御設定（`/etc/coldaisle/control-config`。`root:coldaisle-fan`・`0640`）を読み、Model Registry の lock を
-取る必要があるが、導入手順はその権限を与えていない（決定記録 0086 §5 の未決 3。2026-10-01 所有者の判断で、
-#216 では文書で制限し、権限の設計は #217 で行う）。権限を個別に足して回避しない。
+**本番（`docs/ubuntu-deploy.md` の導入先）での `raise` は、`docs/ubuntu-deploy.md` 6.7 の手順 9（実機での確認。
+決定記録 0104 の段階 C）が導入先で通り、結果を #217 に残すまで使えない（`rollback` は使える）。** 承認者に
+制御設定の読み取り（POSIX ACL）と Model Registry の読み取り・lock の flock を与える手順は 6.7（0104 / 0105）。
+6.7 の外で権限を個別に足して回避しない。
 `rollback` は authority のディレクトリ（`authority.json` と lock）だけを使い、制御設定も Registry も
 読まないので、導入手順のままで使える。
 
