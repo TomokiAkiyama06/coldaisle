@@ -333,6 +333,9 @@ def test_the_shipped_config_is_valid_and_names_a_group_per_role() -> None:
     assert settings.sockets.mpc.group != settings.sockets.supervisor.group
     assert settings.sockets.mpc.path != settings.sockets.supervisor.path
     assert settings.worker_idle_timeout_ms.value >= 3 * settings.heartbeat_interval_ms.value
+    # 親ディレクトリは役割ごと（決定記録 0095）。共通の親は先に作った役割のグループで 0750 になり、
+    # もう一方の役割がたどれない
+    assert settings.sockets.mpc.path.parent != settings.sockets.supervisor.path.parent
 
 
 @pytest.mark.parametrize(

@@ -22,12 +22,14 @@ sockets:
   # 規則は control-admin.yaml と同じ（0045 §2.2 / 0072 §2.5）。本番は systemd の RuntimeDirectory 配下を
   # 指定します。other が書ける親ディレクトリ、ソケット以外の既存ファイル、既に応答するソケットでは開きません。
   # **group の値は仮の名前です。** 配置先で作った専用グループ名に置き換えてください（null は不可）。
+  # **親ディレクトリは役割ごとに分けます**（決定記録 0095）。親は役割のグループで 0750 として作られ、
+  # 共通の親にすると、もう一方の役割のグループがたどれずに経路全体を開けません。
   mpc:
-    path: var/run/coldaisle-learned-mpc.sock
+    path: var/run/learned-mpc/mpc.sock
     mode: "0660"
     group: coldaisle-learn-mpc
   supervisor:
-    path: var/run/coldaisle-learned-supervisor.sock
+    path: var/run/learned-rl/supervisor.sock
     mode: "0660"
     group: coldaisle-learn-rl
 
