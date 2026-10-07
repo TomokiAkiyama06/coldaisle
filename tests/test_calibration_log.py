@@ -953,3 +953,37 @@ def test_reading_opens_the_db_in_read_only_mode(tmp_path, monkeypatch):
     read_calibration_history(path)
     assert len(opened) == 1
     assert opened[0].startswith("file:") and opened[0].endswith("?mode=ro")
+
+
+def test_a_symlink_to_the_same_db_shares_the_lock(tmp_path, rules):
+    """同じ DB を別の path（symlink）で指しても同じ lock になる（PR #240 の Codex の指摘）。"""
+    real = tmp_path / "data" / "prod.db"
+    real.parent.mkdir()
+    alias = tmp_path / "alias.db"
+    clock = ManualClock(1_000)
+    with SqliteStore(real, rules=rules, clock=clock) as one:
+        alias.symlink_to(real)
+        first = IngestCalibrationGate(
+            db_path=real,
+            source_kind="mock",
+            calibration=Calibration(),
+            calibration_file_sha256=FILE_SHA,
+        )
+        second = IngestCalibrationGate(
+            db_path=alias,
+            source_kind="mock",
+            calibration=Calibration(offsets_c={"front_intake": 0.1}),
+            calibration_file_sha256=FILE_SHA,
+        )
+        first.open(one, clock)
+        clock.now = 2_000
+        try:
+            with (
+                SqliteStore(alias, rules=rules, clock=clock) as two,
+                pytest.raises(CalibrationActivationRefused, match="lock"),
+            ):
+                second.open(two, clock)
+        finally:
+            first.close()
+        assert len(rows(one)) == 1
+    assert ingest_lock_path(alias) == ingest_lock_path(real)

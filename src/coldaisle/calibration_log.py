@@ -48,8 +48,14 @@ class CalibrationActivationRefused(RuntimeError):
 
 
 def ingest_lock_path(db_path: Path) -> Path:
-    """DB に対応する取り込みの lock ファイル。"""
-    return db_path.with_name(db_path.name + INGEST_LOCK_SUFFIX)
+    """DB に対応する取り込みの lock ファイル（実体の path の隣）。
+
+    symlink や相対 path で同じ DB を指しても同じ lock になるよう、実体の path から導く。
+    DB ファイル自体は開かない（同じプロセスで DB の別の fd を閉じると SQLite の POSIX lock が
+    外れる）。
+    """
+    resolved = db_path.resolve()
+    return resolved.with_name(resolved.name + INGEST_LOCK_SUFFIX)
 
 
 class IngestCalibrationGate:
