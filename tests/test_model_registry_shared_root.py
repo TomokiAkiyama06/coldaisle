@@ -170,6 +170,26 @@ def test_writer_still_creates_a_development_root_and_lock(tmp_path: Path) -> Non
     assert (root / LOCK).is_file()
 
 
+def test_a_root_created_under_a_setgid_parent_is_not_taken_for_a_shared_root(
+    tmp_path: Path,
+) -> None:
+    """setgid の親の下で作った root は setgid を継ぐが、開発用の root として扱う（codex P2）。
+
+    継いだ setgid のままだと「共有の root」と取り違え、lock を作らずに止まる。
+    """
+    parent = tmp_path / "workspace"
+    parent.mkdir()
+    os.chmod(parent, 0o2775)
+    if not os.stat(parent).st_mode & stat.S_ISGID:
+        pytest.skip("この環境ではディレクトリに setgid を付けられない")
+    root = parent / "var" / "model-registry"
+    with umask(0o022):
+        register(writer(root))
+    for directory in (parent / "var", root):
+        assert stat.S_IMODE(os.stat(directory).st_mode) == 0o700, directory
+    assert (root / LOCK).is_file()
+
+
 # --- 作るファイルとディレクトリの mode ----------------------------------------------------
 
 

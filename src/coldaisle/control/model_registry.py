@@ -2020,10 +2020,16 @@ class ModelRegistry:
                         # crash can drop it even after an artifact / snapshot fsync inside.
                         os.fsync(current_fd)
                     child_fd = os.open(part, flags, dir_fd=current_fd)
-                    if created and inherit_mode:
+                    if created:
                         try:
-                            parent_mode = stat.S_IMODE(os.fstat(current_fd).st_mode)
-                            os.fchmod(child_fd, parent_mode & _DIRECTORY_MODE_MASK)
+                            if inherit_mode:
+                                parent_mode = stat.S_IMODE(os.fstat(current_fd).st_mode)
+                                os.fchmod(child_fd, parent_mode & _DIRECTORY_MODE_MASK)
+                            else:
+                                # setgid の親の下では Linux が `S_ISGID` を子へ継ぐ。そのまま
+                                # だと、いま作った開発用の root を「導入手順で作った共有の root」と
+                                # 取り違え、lock を作らずに止まる（codex P2。PR #248）。
+                                os.fchmod(child_fd, 0o700)
                         except BaseException:
                             os.close(child_fd)
                             raise
