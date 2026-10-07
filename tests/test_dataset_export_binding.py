@@ -20,6 +20,7 @@ from zoneinfo import ZoneInfo
 import pytest
 from pydantic import ValidationError
 
+import coldaisle.calibration_log as calibration_log
 import coldaisle.dataset as dataset_module
 from coldaisle.calibration_log import training_export_ids, verify_training_export_binding
 from coldaisle.clock import SimulatedClock
@@ -368,32 +369,47 @@ def built(tmp_path, rules, clock) -> tuple[ThermalDatasetV2, Path]:
     return dataset, history
 
 
+@pytest.fixture
+def rows_only(monkeypatch):
+    """元の入力の照合（0112 §2.1。下の節で試す）を外し、``csv_exports`` の行の検査だけを試す。"""
+    monkeypatch.setattr(calibration_log, "_verify_replay_input", lambda *args: None)
+
+    def verify(dataset: ThermalDatasetV2, rows) -> None:
+        verify_training_export_binding(
+            dataset,
+            rows,
+            replay_paths={run.run_id: Path("unused") for run in dataset.manifest.source_runs},
+        )
+
+    return verify
+
+
 def rows_of(history: Path, dataset: ThermalDatasetV2):
     return read_training_records(history, training_export_ids(dataset))[1]
 
 
-def test_training_entry_accepts_the_built_dataset_without_manifests(built):
+def test_training_entry_accepts_the_built_dataset_rows(built, rows_only):
     dataset, history = built
-    verify_training_export_binding(dataset, rows_of(history, dataset))
+    rows_only(dataset, rows_of(history, dataset))
 
 
-def test_training_entry_refuses_a_dataset_without_a_binding(built):
+def test_training_entry_refuses_a_dataset_without_a_binding(built, rows_only):
     dataset, history = built
     bare = dataset.model_copy(
         update={"manifest": dataset.manifest.model_copy(update={"replay_bindings": None})}
     )
     with pytest.raises(ValueError, match="ReplayBindingV2"):
-        verify_training_export_binding(bare, rows_of(history, dataset))
+        rows_only(bare, rows_of(history, dataset))
 
 
-def test_training_entry_refuses_a_missing_row(built, tmp_path):
+def test_training_entry_refuses_a_missing_row(built, tmp_path, rows_only):
     dataset, _ = built
     other = Path(history_db(tmp_path / "other.db", COVERING_ROW_MS))
     with pytest.raises(ValueError, match="行が無い"):
-        verify_training_export_binding(dataset, rows_of(other, dataset))
+        rows_only(dataset, rows_of(other, dataset))
 
 
-def test_training_entry_refuses_a_row_with_another_record(built, tmp_path):
+def test_training_entry_refuses_a_row_with_another_record(built, tmp_path, rows_only):
     """同じ export_id でも、行の中身が違えば export_record_sha256 が合わない。"""
     dataset, _ = built
     other = Path(history_db(tmp_path / "other.db", COVERING_ROW_MS))
@@ -401,7 +417,7 @@ def test_training_entry_refuses_a_row_with_another_record(built, tmp_path):
         other, (fixture_export_record().model_copy(update={"csv_sha256": "c" * 64}),)
     )
     with pytest.raises(ValueError, match="export_record_sha256"):
-        verify_training_export_binding(dataset, rows_of(other, dataset))
+        rows_only(dataset, rows_of(other, dataset))
 
 
 def rebound(dataset: ThermalDatasetV2, records: tuple[ExportRecord, ...]) -> ThermalDatasetV2:
@@ -428,30 +444,30 @@ def rebound(dataset: ThermalDatasetV2, records: tuple[ExportRecord, ...]) -> The
     return ThermalDatasetV2.model_validate_json(json.dumps(raw))
 
 
-def test_training_entry_refuses_ids_borrowed_from_another_day(built):
+def test_training_entry_refuses_ids_borrowed_from_another_day(built, rows_only):
     """関係の無い正当な export の ID だけを借りた dataset は、期間の検査で拒否する。"""
     dataset, history = built
     add_fixture_exports(history, (other_record(),))
     borrowed = rebound(dataset, (other_record(),))
     with pytest.raises(ValueError, match="日の区間"):
-        verify_training_export_binding(borrowed, rows_of(history, borrowed))
+        rows_only(borrowed, rows_of(history, borrowed))
 
 
-def test_training_entry_accepts_adjacent_days_that_cover_the_period(built):
+def test_training_entry_accepts_adjacent_days_that_cover_the_period(built, rows_only):
     dataset, history = built
     add_fixture_exports(history, (other_record(),))
     both = rebound(dataset, (fixture_export_record(), other_record()))
-    verify_training_export_binding(both, rows_of(history, both))
+    rows_only(both, rows_of(history, both))
 
 
-def test_training_entry_refuses_listed_fields_that_differ_from_the_row(built):
+def test_training_entry_refuses_listed_fields_that_differ_from_the_row(built, rows_only):
     """digest は合っても、写した欄（日の区間など）が行と違えば拒否する。"""
     dataset, history = built
     raw = json.loads(dataset.model_dump_json())
     raw["manifest"]["replay_bindings"][0]["exports"][0]["day_end_ms"] = 86_400_001
     tampered = ThermalDatasetV2.model_validate_json(json.dumps(raw))
     with pytest.raises(ValueError, match="欄が csv_exports の行と違う"):
-        verify_training_export_binding(tampered, rows_of(history, dataset))
+        rows_only(tampered, rows_of(history, dataset))
 
 
 def test_training_entry_uses_the_same_read_as_the_calibration_history(built):
@@ -469,7 +485,7 @@ def test_fixture_binding_matches_its_digest():
     assert fixture_export_binding  # conftest の補助が import できる
 
 
-def test_training_entry_joins_adjacent_day_spans(built):
+def test_training_entry_joins_adjacent_day_spans(built, rows_only):
     """example の期間が2つの export の境目をまたいでも、つながった区間に収まれば通る。"""
     dataset, history = built
     middle = T0 + 3_000  # ALIGNED の唯一の example の期間 [T0, T0 + 7000] の中
@@ -479,12 +495,12 @@ def test_training_entry_joins_adjacent_day_spans(built):
     second = other_record(export_id="export-" + "2" * 32, day_start_ms=middle)
     add_fixture_exports(history, (first, second))
     split = rebound(dataset, (first, second))
-    verify_training_export_binding(split, rows_of(history, split))
+    rows_only(split, rows_of(history, split))
     gap = other_record(export_id="export-" + "3" * 32, day_start_ms=middle + 1)
     add_fixture_exports(history, (gap,))
     holed = rebound(dataset, (first, gap))
     with pytest.raises(ValueError, match="日の区間"):
-        verify_training_export_binding(holed, rows_of(history, holed))
+        rows_only(holed, rows_of(history, holed))
 
 
 def test_each_source_run_has_exactly_one_binding(built):
@@ -497,3 +513,104 @@ def test_each_source_run_has_exactly_one_binding(built):
     raw["manifest"]["replay_bindings"] *= 2
     with pytest.raises(ValidationError, match="source run ごと"):
         ThermalDatasetV2.model_validate_json(json.dumps(raw))
+
+
+# ---------------------------------------------------------- 学習の入口の元の入力（0112 §2.1）
+
+UTC_DAY = date(1970, 1, 1)
+
+
+def export_utc_day(prod: Path, out: Path, rules, value: float) -> ExportRecord:
+    """試験の専用 DB と同じ 1970-01-01（UTC）を、本番の DB から実際に export する。"""
+    with SqliteStore(prod, rules=rules, clock=SimulatedClock(10**13)) as store:
+        store.insert_sample(
+            Sample(
+                ts_ms=T0 + 1_000,
+                readings=(Reading(metric="air.room", value=value, quality=Quality.OK),),
+            )
+        )
+        export_day(store, UTC_DAY, tz=ZoneInfo("UTC"), out_dir=out, lock_timeout_s=5.0)
+    return ExportRecord.from_manifest_bytes((out / "sensors_1970-01-01.export.json").read_bytes())
+
+
+def claiming(
+    dataset: ThermalDatasetV2, record: ExportRecord, source_sha256: str
+) -> ThermalDatasetV2:
+    """``record`` の束縛と ``source_sha256`` を名乗る dataset（builder を通さずに組んだもの）。"""
+    raw = json.loads(rebound(dataset, (record,)).model_dump_json())
+    raw["manifest"]["source_runs"][0]["source_sha256"] = source_sha256
+    return ThermalDatasetV2.model_validate_json(json.dumps(raw))
+
+
+@pytest.fixture
+def real_export(tmp_path, rules, built):
+    dataset, _ = built
+    prod, out = tmp_path / "prod.db", tmp_path / "csv"
+    record = export_utc_day(prod, out, rules, 20.0)
+    return dataset, prod, out, record
+
+
+def verify_with(dataset: ThermalDatasetV2, prod: Path, replay_paths: dict[str, Path]) -> None:
+    verify_training_export_binding(
+        dataset,
+        read_training_records(prod, training_export_ids(dataset))[1],
+        replay_paths=replay_paths,
+    )
+
+
+def test_training_entry_accepts_the_original_input(real_export):
+    dataset, prod, out, record = real_export
+    honest = claiming(dataset, record, replay_sha256(out))
+    verify_with(honest, prod, {RUN_ALIAS: out})
+
+
+def test_training_entry_requires_a_replay_path_for_every_run(real_export, tmp_path):
+    dataset, prod, out, record = real_export
+    honest = claiming(dataset, record, replay_sha256(out))
+    with pytest.raises(ValueError, match="過不足なく"):
+        verify_with(honest, prod, {})
+    with pytest.raises(ValueError, match="過不足なく"):
+        verify_with(honest, prod, {RUN_ALIAS: out, "run-" + "9" * 32: out})
+    with pytest.raises(TypeError):
+        verify_training_export_binding(honest, {})  # type: ignore[call-arg]
+
+
+def test_training_entry_refuses_a_fingerprint_that_differs(real_export):
+    dataset, prod, out, record = real_export
+    with pytest.raises(ValueError, match="fingerprint"):
+        verify_with(claiming(dataset, record, "0" * 64), prod, {RUN_ALIAS: out})
+
+
+def test_training_entry_refuses_an_input_without_manifests(real_export):
+    dataset, prod, out, record = real_export
+    (out / "sensors_1970-01-01.export.json").unlink()
+    without = claiming(dataset, record, replay_sha256(out))
+    with pytest.raises(ValueError, match="manifest が無い"):
+        verify_with(without, prod, {RUN_ALIAS: out})
+
+
+def test_training_entry_refuses_a_rewritten_csv(real_export):
+    dataset, prod, out, record = real_export
+    honest = claiming(dataset, record, replay_sha256(out))
+    csv_path = out / "sensors_1970-01-01.csv"
+    csv_path.write_bytes(csv_path.read_bytes().replace(b"20.0", b"25.0"))
+    with pytest.raises(ValueError, match="csv_sha256"):
+        verify_with(honest, prod, {RUN_ALIAS: out})
+
+
+def test_training_entry_refuses_another_legitimate_export_of_the_same_day(real_export, rules):
+    """#237 の Codex P1: 同じ日を覆う別の正当な export B の束縛を写した dataset。
+
+    A と B はどちらも本番の DB の csv_exports に行があり、digest も期間も合う。--replay-path の
+    元の入力（B の CSV と manifest）と照合して初めて食い違いが分かる。
+    """
+    dataset, prod, out, record_a = real_export
+    record_b = export_utc_day(prod, out, rules, 30.0)  # 同じ日の書き直し（別の export_id）
+    assert record_a.export_id != record_b.export_id and record_a.day == record_b.day
+    # 行と digest と期間の検査だけなら通る（0100 §2.8 の残っていた穴）
+    forged = claiming(dataset, record_a, replay_sha256(out))
+    rows = read_training_records(prod, training_export_ids(forged))[1]
+    assert rows[record_a.export_id] == record_a
+    with pytest.raises(ValueError, match="ReplayBindingV2 と一致しない"):
+        verify_with(forged, prod, {RUN_ALIAS: out})
+    verify_with(claiming(dataset, record_b, replay_sha256(out)), prod, {RUN_ALIAS: out})

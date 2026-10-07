@@ -185,7 +185,12 @@ v1 との違い（規則の正本は [0087](decisions/0087-dataset-v2-action-gri
   各 `export_id` の `csv_exports` の行（較正の記録と同じ読み取り専用の接続・同じ read transaction で
   `store.export_binding.read_training_records` が読む）から `export_record_sha256` と `export_binding_sha256` を
   計算し直して照合し、すべての example の期間が束縛した export の日の区間の和に収まることを確かめる。
-  元の manifest と CSV は要らない
+  さらに source run ごとに**元の再生の入力（`--replay-path`。日次 CSV と manifest）を必須**で受け取り、
+  fingerprint が `SourceRun.source_sha256` と、manifest から計算した `(timezone, export_binding_sha256)` が
+  `ReplayBindingV2` と一致することを確かめる（決定記録 [0112](decisions/0112-training-replay-path-required.md)。
+  同じ日を覆う別の正当な export の束縛を写した dataset を、元の CSV の bytes まで遡って拒否する）。
+  **学習には元の日次 CSV と manifest が要る**（公開済みの dataset だけでは学習しない）。学習の CLI はまだ無く、
+  関数の入口まで（CLI への配線は学習の CLI の PR）
 - `control_trace_sha256` は run の全 ControlTick を `seq` 付きで hash する（v2 は anchor 以外の tick も使うため）
 
 ### v2 の CLI（決定記録 0109）

@@ -232,6 +232,23 @@ def export_binding_sha256(records: Iterable[ExportRecord]) -> str:
     )
 
 
+def replay_binding_of_records(
+    records: Iterable[ExportRecord] | None,
+) -> tuple[str | None, str | None]:
+    """再生の入力の manifest から ``(timezone, export_binding_sha256)`` を計算する。
+
+    manifest の無い入力（``None``）は ``(None, None)``（照合していない run と同じ値）。timezone の
+    違う manifest が混ざる入力は、timezone を ``None`` にして食い違いにする（再生が拒否している）。
+    builder（0100 §2.8 の (c)）と学習の入口（0112 §2.1 の 3）が同じ関数を使う。
+    """
+    if records is None:
+        return (None, None)
+    listed = tuple(records)
+    timezones = {record.timezone for record in listed}
+    timezone = next(iter(timezones)) if len(timezones) == 1 else None
+    return (timezone, export_binding_sha256(listed))
+
+
 def export_binding_sha256_of_pairs(pairs: Iterable[tuple[str, str]]) -> str:
     """``(export_id, export_record_sha256)`` の組から ``export_binding_sha256`` を計算する。
 

@@ -60,7 +60,7 @@ from coldaisle.control.model.dataset import (
     reject_calibration_changes,
 )
 from coldaisle.control.schema import ControlTick, PerZone, Zone
-from coldaisle.csv_export_manifest import export_binding_sha256
+from coldaisle.csv_export_manifest import replay_binding_of_records
 from coldaisle.declared_changes import DeclaredChangesError, read_declared_changes
 from coldaisle.ingest.replay import (
     ReplayBindingError,
@@ -574,15 +574,10 @@ def _require_db_binding(store: SqliteStore, expected: tuple[str | None, str | No
 def replay_binding_of(inputs: ReplayExportInputs) -> tuple[str | None, str | None]:
     """``--replay-path`` の manifest から ``(timezone, export_binding_sha256)`` を計算する。
 
-    manifest の無い入力は ``(None, None)``（照合していない run と同じ値）。timezone の違う
-    manifest が混ざる入力は、再生が拒否しているので DB の値と一致しない（``None`` を返して
-    食い違いにする）。
+    :func:`~coldaisle.csv_export_manifest.replay_binding_of_records` に委ねる（学習の入口と
+    同じ関数）。
     """
-    if inputs.records is None:
-        return (None, None)
-    timezones = {record.timezone for record in inputs.records}
-    timezone = next(iter(timezones)) if len(timezones) == 1 else None
-    return (timezone, export_binding_sha256(inputs.records))
+    return replay_binding_of_records(inputs.records)
 
 
 def _validate_dedicated_source_db(store: SqliteStore, source_run: SourceRun) -> None:

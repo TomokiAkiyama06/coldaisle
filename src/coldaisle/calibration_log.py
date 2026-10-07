@@ -7,7 +7,9 @@
 - **Dataset v2**: 記録が期間を覆うこと（被覆）と、変更の時刻（CSV の秒の切り捨ての区間の両端）
 - **学習の入口**: 期間の後の変更と、較正ファイルと最後の行の食い違いを拒否する（0096 §5 #4）。
   dataset に残した export の束縛（``ReplayBindingV2``）を本番の DB の ``csv_exports`` から
-  計算し直して照合し、example の期間が束縛した日に収まることを確かめる（決定記録 0100 §2.8）
+  計算し直して照合し、example の期間が束縛した日に収まることを確かめる（決定記録 0100 §2.8）。
+  元の再生の入力（``--replay-path``）を必須で読み直し、fingerprint と manifest の束縛も
+  照合する（決定記録 0112）
 
 ``CalibrationHistory`` は store と合成の起点だけが扱う。``control/model`` へは時刻の列だけを渡す
 （0087 §2.6）。API・AI・control・``coldaisle-calibrate`` はここを使わない（書き手は取り込みだけ）。
@@ -26,13 +28,15 @@ from pathlib import Path
 from coldaisle import logs
 from coldaisle.calibration_offsets import effective_metric_offsets, offsets_sha256
 from coldaisle.clock import Clock
-from coldaisle.control.model.dataset import ThermalDatasetV2
+from coldaisle.control.model.dataset import ReplayBindingV2, SourceRun, ThermalDatasetV2
 from coldaisle.csv_export_manifest import (
     ExportRecord,
     export_binding_sha256,
     export_record_sha256,
+    replay_binding_of_records,
 )
 from coldaisle.ingest.calibration import Calibration
+from coldaisle.ingest.replay import read_replay_export_inputs
 from coldaisle.store import SqliteStore
 from coldaisle.store.calibration_history import (
     SOURCE_KINDS,
@@ -376,12 +380,17 @@ def training_export_ids(dataset: ThermalDatasetV2) -> tuple[str, ...]:
 
 
 def verify_training_export_binding(
-    dataset: ThermalDatasetV2, rows: Mapping[str, ExportRecord | None]
+    dataset: ThermalDatasetV2,
+    rows: Mapping[str, ExportRecord | None],
+    *,
+    replay_paths: Mapping[str, Path],
 ) -> None:
-    """学習の入口の export の照合（決定記録 0100 §2.8）。元の manifest と CSV は要らない。
+    """学習の入口の export の照合（決定記録 0100 §2.8 / 0112 §2.1）。
 
     ``rows`` は較正の記録と同じ読み取り専用の接続・同じ read transaction で読んだ
     ``csv_exports`` の行（:func:`~coldaisle.store.export_binding.read_training_records`）。
+    ``replay_paths`` は source run の ``run_id`` → 元の再生の入力（日次 CSV と manifest。
+    ``--replay-path``）で、**必須**（0112 §2.1。dataset の source run と過不足なく渡す）。
 
     - ``ReplayBindingV2`` の無い dataset は拒否する
     - 各 export の行が無い・行から計算した ``export_record_sha256`` が違う・束縛に写した欄
@@ -391,11 +400,23 @@ def verify_training_export_binding(
       日の区間 ``[day_start_ms, day_end_ms)`` の和に収まらなければ拒否する（ID だけを借りた
       dataset を、その export が覆わない期間の example で見つける）
 
+    - 各 source run の元の入力について、fingerprint が ``SourceRun.source_sha256`` と、
+      manifest から計算した ``(timezone, export_binding_sha256)`` が ``ReplayBindingV2`` と
+      一致しなければ拒否する。
+      manifest の無い・一部にだけある入力、``csv_sha256`` の食い違う入力も拒否する（0112 §2.1。
+      手で組んだ dataset を元の CSV の bytes まで遡って見つける）
+
     呼び出し側はこれを通ってから :func:`verify_training_calibration` へ進む。
     """
     training_export_ids(dataset)
     bindings = dataset.manifest.replay_bindings
     assert bindings is not None
+    runs = {run.run_id: run for run in dataset.manifest.source_runs}
+    if set(replay_paths) != set(runs):
+        raise ValueError(
+            "学習の入口には source run ごとに元の再生の入力（--replay-path）を過不足なく渡す"
+            f"（決定記録 0112 §2.1）: 渡した {sorted(replay_paths)} / run {sorted(runs)}"
+        )
     spans: dict[str, list[tuple[int, int]]] = {}
     for binding in bindings:
         bound_rows: list[ExportRecord] = []
@@ -432,6 +453,7 @@ def verify_training_export_binding(
             raise ValueError(
                 f"export_binding_sha256 が csv_exports の行から計算した値と違う: {binding.run_id}"
             )
+        _verify_replay_input(binding, runs[binding.run_id], replay_paths[binding.run_id])
         spans[binding.run_id] = _merged_spans(
             [(export.day_start_ms, export.day_end_ms) for export in binding.exports]
         )
@@ -442,6 +464,27 @@ def verify_training_export_binding(
                 "example の期間が束縛した export の日の区間に収まらない"
                 f"（決定記録 0100 §2.8）: {example.example_id}"
             )
+
+
+def _verify_replay_input(binding: ReplayBindingV2, run: SourceRun, replay_path: Path) -> None:
+    """元の再生の入力を読み直し、fingerprint と manifest の束縛を照合する（決定記録 0112 §2.1）。"""
+    inputs = read_replay_export_inputs(replay_path)
+    if inputs.source_sha256 != run.source_sha256:
+        raise ValueError(
+            f"--replay-path の fingerprint が SourceRun.source_sha256 と一致しない: {run.run_id}"
+        )
+    if inputs.records is None:
+        raise ValueError(
+            f"--replay-path に export の manifest が無い（決定記録 0112 §2.1）: {run.run_id}"
+        )
+    if replay_binding_of_records(inputs.records) != (
+        binding.local_timezone,
+        binding.export_binding_sha256,
+    ):
+        raise ValueError(
+            "--replay-path の manifest から計算した束縛が ReplayBindingV2 と一致しない"
+            f"（決定記録 0112 §2.1）: {run.run_id}"
+        )
 
 
 def _merged_spans(spans: list[tuple[int, int]]) -> list[tuple[int, int]]:
