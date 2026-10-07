@@ -3,8 +3,11 @@
 - **種別**: Decision Record
 - **Status**: Proposed
 - **Date**: 2026-10-07
-- **Supersedes**: なし（0008 §2.8 の CSV の形と 0010 §2.7 の「タイムゾーンは呼び出し側から受け取る」は変えない。
-  dataset 用の再生にだけ、export の manifest との照合を**足す**。§5 #1 / #4）
+- **Supersedes**: 0099 §2.6 の「再生の timezone」の項のうち、暫定運用（「それまで、v2 の学習に使う再生は本番（export）と
+  同じ timezone で行う」）の部分のみ（§2.8。段 3 のマージをもって、人の手順をコードの検査に置き換える）。旧記録側への
+  `Superseded by` の追記は、0099（PR #234）がマージされた後、本記録を FINAL にする PR で行う（README「追記のみ」の例外。
+  §5 #8）。0008 §2.8 の CSV の形と 0010 §2.7 の「タイムゾーンは呼び出し側から受け取る」は変えない。dataset 用の再生に
+  だけ、export の manifest との照合を**足す**（§5 #1 / #4）
 - **関連**: [0099](0099-calibration-change-log.md) §2.6（「再生の timezone」の暫定運用。PR #234）/
   [0087](0087-dataset-v2-action-grid.md) §2.6 / [0094](0094-dataset-v2-settled-points.md) §2.4 /
   [0031](0031-thermal-dataset-contract.md) §2.3（1 source run 専用の DB と `dataset_source_run`）/
@@ -159,7 +162,7 @@ dataset 用でない再生（デバッグや画面の確認。0010）は次の�
 - **fingerprint**: `replay_fingerprint`（`replay_sha256`）に manifest の bytes も含める（CSV ごとに、CSV の後に
   manifest を、basename・長さ・内容で hash する）。同じ CSV でも manifest（timezone）が違えば fingerprint が変わる。
   fingerprint の規則に版を付け、manifest の無い入力の値はいまの規則のまま変えない（§5 #7）
-- **`dataset_source_run`**: bind のときに再生に使った timezone も記録する（migration で列を足す。適用済みの
+- **`dataset_source_run`**: bind のときに再生に使った timezone も記録する（段 2。migration で列を足す。適用済みの
   migration は書き換えない。0002 §2.11）。builder は DB の timezone と `SourceRun` の timezone の一致を
   `_validate_dedicated_source_db` で求める
 - **`SourceRun` と Dataset v2 の manifest**: `SourceRun` に `local_timezone`（manifest 由来の IANA 名）を足す。
@@ -178,16 +181,21 @@ dataset 用でない再生（デバッグや画面の確認。0010）は次の�
 3. fingerprint・`dataset_source_run`・`SourceRun` の束縛（§2.7）と、v2 の builder の検査
 
 その PR で `docs/thermal-dataset.md` の「再生の timezone」の注意を「照合される（決定記録 0100）」に書き換える。
-0099 は書き換えない（暫定運用は「それまで」の条件付きで書かれており、条件が満たされれば失効する。
-`Superseded by` も付けない。§5 #8）。
+0099 の本文は書き換えない。ただし 0099 だけを読んだ人が失効した手順に従わないよう、本記録の Supersedes に
+その部分を書き、0099 のヘッダへ `Superseded by` を追記する（README「追記のみ」の例外。追記は 0099 のマージ後、
+本記録を FINAL にする PR で行い、「段 3 のマージをもって」と条件を添える。§5 #8。PR #238 の Codex の指摘）。
 
 ### 2.9 実装の段
 
 | 段 | 内容 | 依存 |
 |---|---|---|
 | 1 | 写像の関数（§2.4）・export の manifest と timezone の必須化（§2.1 / §2.2） | なし |
-| 2 | 再生の照合（§2.3 / §2.5 / §2.6）と fingerprint の版（§2.7） | 段 1 |
-| 3 | `dataset_source_run` の migration・`SourceRun.local_timezone`・v2 の builder の検査（§2.7）、`docs/thermal-dataset.md` の更新（§2.8） | 段 2、0099 の実装（`CalibrationHistory`） |
+| 2 | 再生の照合（§2.3 / §2.5 / §2.6）と fingerprint の版（§2.7）、`dataset_source_run` の timezone の migration と bind 時の記録（§2.7） | 段 1 |
+| 3 | `SourceRun.local_timezone`・builder の DB との照合・v2 の builder と学習の入口の検査（§2.7）、`docs/thermal-dataset.md` の更新（§2.8） | 段 2、0099 の実装（`CalibrationHistory`） |
+
+`dataset_source_run` の timezone の記録は段 2 に含める。照合した値を段 2 で DB に残さないと、段 2 と段 3 の間に作った
+専用 DB は照合を通ったのに timezone を持たず、段 3 の検査を通れない。manifest の path は DB に残らず、後から推測で
+埋めることも認めない（§2.6）ので、再生し直すしかなくなる（PR #238 の Codex の指摘）。
 
 ### 2.10 試験すべき性質
 
@@ -215,9 +223,10 @@ export（段 1）:
   manifest があり食い違えば拒否する
 - fingerprint: manifest の無い入力の値は本記録の前と同じ。manifest の bytes を変えると値が変わる
 
-source run（段 3）:
+source run（段 2 / 段 3）:
 
-- `dataset_source_run` の timezone と `SourceRun.local_timezone` が違えば builder が拒否する
+- 段 2: dataset 用の再生は、照合した timezone を bind と同じ transaction で `dataset_source_run` に記録する
+- 段 3: `dataset_source_run` の timezone と `SourceRun.local_timezone` が違えば builder が拒否する
 - v2 の builder は `local_timezone` の無い source run を拒否する。v1 の builder の挙動は変わらない
 - migration は追記のみで、既存の行と読み取り API を変えない
 
@@ -267,6 +276,6 @@ source run（段 3）:
 | 5 | 1 run に timezone の違う CSV が混ざるとき | **拒否**（§2.3 の 3）。`SourceRun` に1つの timezone を持たせる | ファイルごとに manifest の値で読む（照合は効くが、source run の timezone が1つに定まらない） |
 | 6 | dataset 用でない再生で、manifest があり食い違うとき | **拒否**（§2.3）。デバッグ用でも、ずれた時刻の DB を作る利益が無い | 警告して `--timezone` の値で続ける（0010 §2.7 のまま。デバッグの自由度を残す） |
 | 7 | fingerprint と source run への束縛 | **3つとも行う**: fingerprint に manifest を含める（版を付け、manifest の無い入力の値は変えない）・`dataset_source_run` に列を足す・`SourceRun.local_timezone` を v2 で必須にする（§2.7） | (a) fingerprint だけ（manifest が timezone を持つので推移的に束縛される。migration が要らないが、DB と artifact から timezone が直接読めない）。(b) fingerprint は変えず `SourceRun` だけ（同じ CSV に別の manifest を付けた入力を区別できない） |
-| 8 | 0099 の暫定運用の扱い | **0099 を書き換えず、`Superseded by` も付けない**。§2.8 の段 3 がマージされた時点で失効し、`docs/thermal-dataset.md` を更新する | 0100 の Supersedes に 0099 §2.6 の「再生の timezone」の項を書き、0099 へ `Superseded by` を追記する（読む人は辿れるが、条件付きの運用に置き換えを付けることになる） |
+| 8 | 0099 の暫定運用の扱い | **0100 の Supersedes に 0099 §2.6 の「再生の timezone」の暫定運用の部分を書き、0099 へ `Superseded by`（「段 3 のマージをもって」の条件つき）を追記する**（§2.8）。0099 だけを読んだ人が失効した手順に従わないため（AGENTS.md「決定記録」。PR #238 の Codex の指摘）。追記は 0099 のマージ後、本記録を FINAL にする PR で行う | 0099 を書き換えず `Superseded by` も付けない（暫定運用は「それまで」の条件付きなので段 3 で自然に失効する。ただし 0099 から辿れない） |
 | 9 | DST の扱い（行ごとのオフセットへ移すか） | **移さない。曖昧・存在しない時刻を含む CSV は dataset 用の再生で拒否する**（§2.5）。本番は `Asia/Tokyo` で DST が無い | (a) CSV に `timestamp_utc_ms` の列を足し、再生はそれを正とする（DST と秒の切り捨てが両方消える。0008 §2.8 の「従来の列だけ」を変える。0099 §5 #9 の判断と整合させる必要がある）。(b) 時刻をオフセット付きにする（§4） |
 | 10 | 実装の Issue の切り方 | **#237 で段 1〜3 を順に別 PR**（§2.9）。段 3 は 0099 の実装の後 | 段 1 / 段 2 を1つの PR にする |
