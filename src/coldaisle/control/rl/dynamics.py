@@ -871,6 +871,14 @@ class AttestedThermalDynamics:
                 "learned simulator は window の全 metric を予測する artifact に限る"
                 f"（target に無い feature の metric: {uncovered}）"
             )
+        first_horizon_ms = model.target_schema.horizons_ms[0]
+        if first_horizon_ms != model.action_schema.step_ms:
+            # 次の frame は1 step 後（action の刻み）の予測から作る。その horizon を持たない
+            # artifact は、最初の遷移で必ず使えなくなるので束縛で拒む（補間しない。0079 §2.3）。
+            raise DynamicsUnusableError(
+                "learned simulator は最初の horizon が action の刻みと等しい artifact に限る"
+                f"（first_horizon={first_horizon_ms}ms; action={model.action_schema.step_ms}ms）"
+            )
         sample_period_ms = model.feature_schema.sample_period_ms
         if sample_period_ms != model.action_schema.step_ms:
             # 1 step で window を1 frame（action の刻み）だけ進めるので、window の刻みが違うと

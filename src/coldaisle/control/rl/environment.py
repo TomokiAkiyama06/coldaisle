@@ -356,6 +356,17 @@ class SupervisorTrainingEnvironment:
                 raise EnvironmentUsageError(
                     "learned simulator の判定の設定が fan-policy.yaml の model_confidence と違う"
                 )
+            # learned simulator の window は artifact の feature の metric だけを持つ。screen の
+            # metric が無いと、その温度を絶対上限と照らさないまま episode が進む（0058 §2.5）。
+            unscreened = sorted(
+                set(config.safety_screen.temperature_metrics)
+                - set(dynamics.model.feature_schema.metrics)
+            )
+            if unscreened:
+                raise EnvironmentUsageError(
+                    "safety screen の metric を learned simulator の window が持たない"
+                    f"（{unscreened}）"
+                )
             # 格子と刻みが違う artifact は、補間・外挿・丸めをせずに使わない（0079 §2.3）。
             if dynamics.action_schema.step_ms != config.episode.step_ms.value:
                 raise EnvironmentUsageError(

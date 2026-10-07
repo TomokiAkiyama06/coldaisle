@@ -844,6 +844,37 @@ def test_invariant_6_i_an_artifact_sampled_off_the_action_grid_is_refused(
         attested_dynamics(attested_artifact)
 
 
+def test_invariant_6_j_an_artifact_without_a_one_step_horizon_is_refused(
+    attested_artifact, monkeypatch
+) -> None:
+    """最初の horizon が action の刻みと違う artifact は束縛で拒む（1 step 後を補間しない）。"""
+    original = RegistryCounterfactualThermalModel.target_schema
+
+    def later(self: RegistryCounterfactualThermalModel) -> Any:
+        schema = original.fget(self)  # type: ignore[attr-defined]
+        return schema.model_copy(update={"horizons_ms": schema.horizons_ms[1:]})
+
+    monkeypatch.setattr(RegistryCounterfactualThermalModel, "target_schema", property(later))
+    with pytest.raises(DynamicsUnusableError, match="最初の horizon"):
+        attested_dynamics(attested_artifact)
+
+
+def test_invariant_15_h_every_screened_metric_is_in_the_simulated_window(
+    trained, attested_artifact
+) -> None:
+    """safety screen の metric を learned simulator の window が持たなければ環境は受け取らない。
+
+    持たない metric は screen が照らせず、絶対上限の超過を数えないまま episode が進む（0058 §2.5）。
+    """
+    screen = {"temperature_metrics": [AIR, GPU, "cpu.package"]}
+    with pytest.raises(EnvironmentUsageError, match="safety screen"):
+        build_environment(
+            trained,
+            dynamics=attested_dynamics(attested_artifact),
+            config_overrides={"safety_screen": screen},
+        )
+
+
 def test_invariant_6_e_a_simulated_episode_is_not_promotable(trained) -> None:
     """**近似 simulator の episode を昇格の根拠にしない。**"""
     environment, *_ = build_environment(trained)
