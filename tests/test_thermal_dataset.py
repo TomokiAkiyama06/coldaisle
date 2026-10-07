@@ -97,6 +97,8 @@ def dataset_store(tmp_path, rules, clock):
             source_kind="replay",
             source_sha256=SHA256,
             at_ms=0,
+            local_timezone=None,
+            export_binding_sha256=None,
         )
         store.insert_samples(
             (
@@ -375,6 +377,8 @@ def test_dataset_source_run_binding_is_immutable_even_at_the_same_timestamp(data
             source_kind="replay",
             source_sha256="b" * 64,
             at_ms=0,
+            local_timezone=None,
+            export_binding_sha256=None,
         )
 
     with pytest.raises(sqlite3.IntegrityError, match="immutable"):
@@ -402,6 +406,8 @@ def test_dataset_source_run_must_bind_before_any_source_rows(tmp_path, rules, cl
                 source_kind="replay",
                 source_sha256=SHA256,
                 at_ms=0,
+                local_timezone=None,
+                export_binding_sha256=None,
             )
 
 

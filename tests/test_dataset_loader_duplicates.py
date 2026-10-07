@@ -133,7 +133,12 @@ def make_store(
         stores.append(store)
         store.set_system_state("sys.ingest_source", "replay", at_ms=0)
         store.bind_dataset_source_run(
-            run_alias=RUN_ALIAS, source_kind="replay", source_sha256=SHA256, at_ms=0
+            run_alias=RUN_ALIAS,
+            source_kind="replay",
+            source_sha256=SHA256,
+            at_ms=0,
+            local_timezone=None,
+            export_binding_sha256=None,
         )
         store.insert_samples(readings())
         store.complete_dataset_source_run(at_ms=END_MS)

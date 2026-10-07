@@ -16,6 +16,7 @@ CSV はローカル時刻でオフセットを持たない（決定記録 0008 �
 from __future__ import annotations
 
 import csv
+import errno
 import hashlib
 import io
 import logging
@@ -24,15 +25,25 @@ import stat
 import tempfile
 import time
 from collections.abc import Callable, Iterator
+from dataclasses import dataclass
 from datetime import datetime
 from itertools import islice
 from pathlib import Path
 from typing import TYPE_CHECKING, BinaryIO, TextIO
-from zoneinfo import ZoneInfo
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from coldaisle import logs
 from coldaisle.channels import SAMPLE_CHANNELS
 from coldaisle.clock import SimulatedClock
+from coldaisle.csv_export_manifest import (
+    ExportRecord,
+    export_binding_sha256,
+    local_time_problem,
+    manifest_name_for_csv,
+    parse_local,
+    parse_naive,
+    row_seconds_sha256,
+)
 from coldaisle.ingest.protocol import RawHello, RawMessage, RawSample, RawSensor
 
 if TYPE_CHECKING:
@@ -72,6 +83,39 @@ LOGGER = logging.getLogger("coldaisle.ingest.replay")
 COPY_CHUNK_BYTES = 1024 * 1024
 """dataset provenance用snapshotを定数memoryで作るchunk size。"""
 
+FINGERPRINT_V2_TAG = b"coldaisle.replay_fingerprint\x00v2\x00"
+"""manifest を含む入力の fingerprint の規則の版（決定記録 0100 §2.8 / §5 #7）。
+
+v1（manifest の無い入力）は CSV の名前の長さ（8 bytes）から hash を始める。v2 はこの印から
+始めるので、同じ bytes 列が v1 と v2 で同じ digest になることはない。manifest の無い入力の
+値は v1 のまま変えない。
+"""
+
+MAX_MANIFEST_BYTES = 64 * 1024
+"""export manifest の大きさの上限。manifest は数百 bytes で、これは形の上限（運用の値ではない）。"""
+
+
+class ReplayBindingError(ValueError):
+    """再生の入力が export の manifest と食い違う（決定記録 0100 §2.3）。DB には何も書いていない。
+
+    ``file`` はどの CSV か（basename）、``check`` はどの検査か、``value`` は食い違った
+    最初の1行の値。
+    """
+
+    def __init__(self, file: str, check: str, message: str, value: str | None = None) -> None:
+        super().__init__(f"{file}: {check}: {message}")
+        self.file = file
+        self.check = check
+        self.value = value
+
+
+@dataclass(frozen=True)
+class _ManifestInput:
+    """CSV の横で読んだ manifest の bytes（CSV と同じく1回だけ開いて取り込んだもの）。"""
+
+    name: str
+    raw: bytes
+
 
 def normalize_column(name: str) -> str:
     """列名を正規化する。大文字・空白・BOM・別名を吸収する。"""
@@ -93,9 +137,18 @@ def csv_files(path: Path) -> list[Path]:
 
 
 def replay_sha256(path: Path) -> str:
-    """Replay対象のbasename・file境界・内容を順序付きでhashする。"""
-    _snapshot, _segments, digest = _snapshot_and_hash(csv_files(path), make_snapshot=False)
-    return digest
+    """Replay対象のbasename・file境界・内容を順序付きでhashする。
+
+    manifest の無い入力は従来の規則（v1）。すべての CSV に manifest があれば、CSV ごとに
+    CSV の後に manifest を basename・長さ・内容で hash する（v2。決定記録 0100 §2.8）。
+    一部の CSV にだけ manifest がある入力は拒否する（0100 §2.3。照合した入力としていない入力を
+    1つの run に混ぜない）。
+    """
+    files = csv_files(path)
+    manifests = _read_manifests(files)
+    _refuse_partial_manifests(files, manifests)
+    snapshot = _snapshot_and_hash(files, manifests, make_snapshot=False)
+    return snapshot.digest
 
 
 class _SnapshotSegment(io.RawIOBase):
@@ -125,21 +178,87 @@ class _SnapshotSegment(io.RawIOBase):
         return len(chunk)
 
 
+@dataclass
+class _Snapshot:
+    """入力の bytes の写し。照合も取り込みもここから読む（0031 §2.3 / 0100 §2.3）。"""
+
+    file: BinaryIO | None
+    segments: list[tuple[int, int]]
+    """各 CSV の snapshot 内の ``(開始 offset, 長さ)``。"""
+    csv_sha256: list[str]
+    """各 CSV の bytes の SHA-256（manifest の ``csv_sha256`` と照合する）。"""
+    digest: str
+    """入力全体の fingerprint（manifest があれば v2）。"""
+
+
+def _read_manifests(files: list[Path]) -> list[_ManifestInput | None]:
+    """各 CSV の横の manifest を1回だけ開いて読む。無ければ ``None``。
+
+    CSV と同じく ``O_NOFOLLOW`` で開き、regular file でなければ拒否する（0100 §2.3 の 1）。
+    存在の確認と読み出しを分けない（確かめた後に差し替えられた別物を読まないため）。
+    """
+    return [_read_manifest(csv_path) for csv_path in files]
+
+
+def _read_manifest(csv_path: Path) -> _ManifestInput | None:
+    name = manifest_name_for_csv(csv_path.name)
+    if name is None:
+        return None
+    path = csv_path.with_name(name)
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW | os.O_CLOEXEC)
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        if exc.errno == errno.ELOOP:
+            raise ReplayBindingError(
+                csv_path.name, "manifest_regular_file", "manifest が symlink"
+            ) from exc
+        raise
+    with os.fdopen(fd, "rb") as handle:
+        if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
+            raise ReplayBindingError(
+                csv_path.name, "manifest_regular_file", "manifest が regular file でない"
+            )
+        raw = handle.read(MAX_MANIFEST_BYTES + 1)
+    if len(raw) > MAX_MANIFEST_BYTES:
+        raise ReplayBindingError(csv_path.name, "manifest_format", "manifest が大きすぎる")
+    return _ManifestInput(name=name, raw=raw)
+
+
+def _refuse_partial_manifests(files: list[Path], manifests: list[_ManifestInput | None]) -> None:
+    """一部の CSV にだけ manifest がある入力を拒否する（dataset 用の再生と fingerprint）。"""
+    present = [manifest is not None for manifest in manifests]
+    if any(present) and not all(present):
+        missing = next(path.name for path, has in zip(files, present, strict=True) if not has)
+        raise ReplayBindingError(
+            missing,
+            "manifest_partial",
+            "manifest のある CSV と無い CSV を1つの run に混ぜない（決定記録 0100 §2.3）",
+        )
+
+
 def _snapshot_and_hash(
-    files: list[Path], *, make_snapshot: bool
-) -> tuple[BinaryIO | None, list[tuple[int, int]], str]:
+    files: list[Path], manifests: list[_ManifestInput | None], *, make_snapshot: bool
+) -> _Snapshot:
     """CSVをchunk単位でhashし、指定時は同じbytesを1つのprivate snapshotへ連結して書く。
 
-    返す区間は各CSVのsnapshot内`(開始offset, 長さ)`。
+    fingerprint は manifest が1つも無ければ v1、すべてにあれば v2（決定記録 0100 §2.8）。
+    一部にだけある入力の fingerprint は使わない（呼び出し側が拒否する）。
     """
+    with_manifests = all(manifest is not None for manifest in manifests) and bool(manifests)
     digest = hashlib.sha256()
+    if with_manifests:
+        digest.update(FINGERPRINT_V2_TAG)
     segments: list[tuple[int, int]] = []
+    csv_digests: list[str] = []
     # dataset sourceの寿命まで保持し、各CSVは区間viewで読む。
     snapshot = tempfile.TemporaryFile(mode="w+b") if make_snapshot else None  # noqa: SIM115
     offset = 0
     try:
-        for csv_path in files:
+        for csv_path, manifest in zip(files, manifests, strict=True):
             encoded_name = csv_path.name.encode("utf-8")
+            file_digest = hashlib.sha256()
             source_fd = os.open(
                 csv_path,
                 os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW | os.O_CLOEXEC,
@@ -155,6 +274,7 @@ def _snapshot_and_hash(
                 while chunk := source.read(COPY_CHUNK_BYTES):
                     copied += len(chunk)
                     digest.update(chunk)
+                    file_digest.update(chunk)
                     if snapshot is not None:
                         snapshot.write(chunk)
                 after = os.fstat(source.fileno())
@@ -162,7 +282,14 @@ def _snapshot_and_hash(
             identity_after = (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
             if identity_before != identity_after or copied != before.st_size:
                 raise ValueError(f"hash中にReplay CSVが変更された: {csv_path}")
+            if with_manifests and manifest is not None:
+                encoded_manifest = manifest.name.encode("utf-8")
+                digest.update(len(encoded_manifest).to_bytes(8, "big"))
+                digest.update(encoded_manifest)
+                digest.update(len(manifest.raw).to_bytes(8, "big"))
+                digest.update(manifest.raw)
             segments.append((offset, copied))
+            csv_digests.append(file_digest.hexdigest())
             offset += copied
         if snapshot is not None:
             snapshot.flush()
@@ -171,7 +298,9 @@ def _snapshot_and_hash(
         if snapshot is not None:
             snapshot.close()
         raise
-    return snapshot, segments, digest.hexdigest()
+    return _Snapshot(
+        file=snapshot, segments=segments, csv_sha256=csv_digests, digest=digest.hexdigest()
+    )
 
 
 class ReplaySource:
@@ -194,26 +323,79 @@ class ReplaySource:
         path: Path,
         *,
         tz: ZoneInfo,
+        timezone_explicit: bool = True,
         speed: float = 1.0,
         bulk: bool = False,
         sleep: Callable[[float], None] = time.sleep,
         dataset_provenance: bool = False,
     ) -> None:
+        """``tz`` は manifest の無い CSV に当てる timezone。
+
+        ``timezone_explicit`` は ``tz`` を人が明示したか（``--timezone``）。manifest のある
+        入力では manifest の timezone を使い、明示した ``tz`` と文字列で違えば拒否する
+        （決定記録 0100 §2.3）。
+        manifest のある入力は、照合も取り込みも同じ snapshot から読む。食い違いは
+        :class:`ReplayBindingError`（何も取り込まない）。
+        """
         if speed <= 0:
             raise ValueError(f"speed は正の数（一括投入は bulk=True）: {speed}")
         source_files = csv_files(path)
         if not source_files:
             raise ValueError(f"CSV が見つからない: {path}")
-        self._snapshot: BinaryIO | None = None
-        self._snapshot_segments: list[tuple[int, int]] = []
-        self._source_sha256: str | None = None
-        if dataset_provenance:
-            self._snapshot, self._snapshot_segments, self._source_sha256 = _snapshot_and_hash(
-                source_files,
-                make_snapshot=True,
+        try:
+            manifests = _read_manifests(source_files)
+            if dataset_provenance:
+                _refuse_partial_manifests(source_files, manifests)
+            verified = [manifest is not None for manifest in manifests]
+            self._snapshot: BinaryIO | None = None
+            self._snapshot_segments: list[tuple[int, int]] = []
+            self._source_sha256: str | None = None
+            if dataset_provenance or any(verified):
+                snapshot = _snapshot_and_hash(source_files, manifests, make_snapshot=True)
+                self._snapshot = snapshot.file
+                self._snapshot_segments = snapshot.segments
+                if dataset_provenance:
+                    self._source_sha256 = snapshot.digest
+            self._files = source_files
+            self._verified = verified
+            self._tz = tz
+            self._local_timezone: str | None = None
+            self._export_binding_sha256: str | None = None
+            if any(verified):
+                records = self._verify_manifests(
+                    manifests,
+                    snapshot.csv_sha256,
+                    timezone_explicit=timezone_explicit,
+                    dataset_provenance=dataset_provenance,
+                )
+                if dataset_provenance:
+                    self._local_timezone = self._tz.key
+                    self._export_binding_sha256 = export_binding_sha256(records)
+        except ReplayBindingError as error:
+            # どの CSV の、どの検査か（行の値は最初の1行だけ。決定記録 0100 §2.3）
+            LOGGER.error(
+                "再生の入力が export の manifest と食い違う。取り込まない",
+                extra={
+                    logs.FIELDS_KEY: {
+                        "file": error.file,
+                        "check": error.check,
+                        "value": error.value,
+                        "reason": str(error),
+                    }
+                },
             )
-        self._files = source_files
-        self._tz = tz
+            self._close_snapshot()
+            raise
+        if not all(verified):
+            LOGGER.warning(
+                "manifest の無い CSV の timezone を照合していない（決定記録 0100 §2.3 / §2.7）",
+                extra={
+                    logs.FIELDS_KEY: {
+                        "files": sum(1 for has in verified if not has),
+                        "timezone": tz.key,
+                    }
+                },
+            )
         self._speed = speed
         self._bulk = bulk
         self._sleep = sleep
@@ -226,6 +408,150 @@ class ReplaySource:
         self.header_collisions = 0
         """同じ列名に正規化される見出しの重複数（fileごとに1回数える）。後の列だけが残る。"""
         self._clock = SimulatedClock(self._first_timestamp_ms())
+
+    def _close_snapshot(self) -> None:
+        snapshot = getattr(self, "_snapshot", None)
+        if snapshot is not None:
+            snapshot.close()
+
+    def _verify_manifests(
+        self,
+        manifests: list[_ManifestInput | None],
+        csv_sha256: list[str],
+        *,
+        timezone_explicit: bool,
+        dataset_provenance: bool,
+    ) -> list[ExportRecord]:
+        """決定記録 0100 §2.3 の 1〜7 を、取り込みの前に snapshot から確かめる。
+
+        通過したら ``self._tz`` を manifest の timezone にする。1つでも外れれば
+        :class:`ReplayBindingError`。7（``export_id`` の重複）は dataset 用の再生だけで見る。
+        """
+        records: list[tuple[int, ExportRecord]] = []
+        for index, manifest in enumerate(manifests):
+            if manifest is None:
+                continue
+            name = self._files[index].name
+            try:
+                record = ExportRecord.from_manifest_bytes(manifest.raw)
+            except ValueError as exc:
+                raise ReplayBindingError(name, "manifest_format", str(exc)) from exc
+            if record.csv_name != name:
+                raise ReplayBindingError(
+                    name, "csv_name", f"manifest の csv_name が違う: {record.csv_name}"
+                )
+            if record.csv_sha256 != csv_sha256[index]:
+                raise ReplayBindingError(name, "csv_sha256", "CSV の bytes が manifest と違う")
+            records.append((index, record))
+
+        timezones = sorted({record.timezone for _, record in records})
+        if len(timezones) != 1:
+            raise ReplayBindingError(
+                self._files[records[0][0]].name,
+                "timezone_mixed",
+                f"1 run に timezone の違う manifest が混ざる: {timezones}",
+            )
+        manifest_timezone = timezones[0]
+        partial = len(records) != len(manifests)
+        # 明示した --timezone、または manifest の無い CSV に当てる実効の timezone（省略時は
+        # 既定値）が manifest と文字列で違えば拒否する。2つの時刻の写像を1つの DB に混ぜない
+        if (timezone_explicit or partial) and self._tz.key != manifest_timezone:
+            raise ReplayBindingError(
+                self._files[records[0][0]].name,
+                "timezone_flag",
+                f"--timezone {self._tz.key!r} が manifest の {manifest_timezone!r} と違う",
+            )
+        try:
+            zone = ZoneInfo(manifest_timezone)
+        except (ZoneInfoNotFoundError, ValueError) as exc:
+            raise ReplayBindingError(
+                self._files[records[0][0]].name,
+                "timezone_unreadable",
+                f"manifest の timezone を読めない: {manifest_timezone!r}",
+            ) from exc
+        for index, record in records:
+            self._verify_rows(index, record, zone)
+        if dataset_provenance:
+            seen: set[str] = set()
+            for index, record in records:
+                if record.export_id in seen:
+                    raise ReplayBindingError(
+                        self._files[index].name, "export_id_duplicate", "export_id が重複している"
+                    )
+                seen.add(record.export_id)
+        self._tz = zone
+        return [record for _, record in records]
+
+    def _verify_rows(self, index: int, record: ExportRecord, zone: ZoneInfo) -> None:
+        """全行を manifest の timezone で絶対時刻へ写し、秒の列の hash・行数・日の区間を照合する。
+
+        DST の曖昧な時刻・存在しない時刻が1行でもあれば拒否する（0100 §2.5）。snapshot を
+        1回読み通すだけで、行は持たない（定数メモリ）。
+        """
+        name = self._files[index].name
+        count = 0
+
+        def seconds(handle: TextIO) -> Iterator[int]:
+            nonlocal count
+            reader = csv.DictReader(handle)
+            fields = [normalize_column(field) for field in reader.fieldnames or []]
+            stamp_column = next((field for field in TIMESTAMP_COLUMNS if field in fields), None)
+            if stamp_column is None:
+                raise ReplayBindingError(name, "row_time", "時刻の列が無い")
+            for raw_row in reader:
+                row = {normalize_column(k): v for k, v in raw_row.items() if k is not None}
+                stamp = (row.get(stamp_column) or "").strip()
+                try:
+                    naive = parse_naive(stamp)
+                except ValueError as exc:
+                    raise ReplayBindingError(
+                        name, "row_time", "時刻として読めない行", stamp
+                    ) from exc
+                problem = local_time_problem(naive, zone)
+                if problem is not None:
+                    raise ReplayBindingError(
+                        name, f"dst_{problem}", "DST の曖昧な時刻か存在しない時刻", stamp
+                    )
+                second = parse_local(stamp, zone)
+                if not record.day_start_ms <= second * 1000 < record.day_end_ms:
+                    raise ReplayBindingError(name, "day_range", "行の時刻がその日の外", stamp)
+                count += 1
+                yield second
+
+        with self._open_snapshot_segment(index) as handle:
+            digest = row_seconds_sha256(seconds(handle))
+        if count != record.row_count:
+            raise ReplayBindingError(
+                name, "row_count", f"行数が manifest と違う: {count} != {record.row_count}"
+            )
+        if digest != record.row_seconds_sha256:
+            raise ReplayBindingError(
+                name, "row_seconds_sha256", "全行の絶対時刻が export と一致しない"
+            )
+
+    def _open_snapshot_segment(self, index: int) -> TextIO:
+        assert self._snapshot is not None
+        segment_start, segment_length = self._snapshot_segments[index]
+        return io.TextIOWrapper(
+            io.BufferedReader(
+                _SnapshotSegment(self._snapshot.fileno(), segment_start, segment_length)
+            ),
+            encoding="utf-8-sig",
+            newline="",
+        )
+
+    @property
+    def local_timezone(self) -> str | None:
+        """dataset 用の再生で manifest と照合した timezone の名前。照合していなければ ``None``。"""
+        return self._local_timezone
+
+    @property
+    def export_binding_sha256(self) -> str | None:
+        """dataset 用の再生で照合した入力の export の束縛の digest（0100 §2.8）。
+
+        照合していなければ ``None``。
+        """
+        return self._export_binding_sha256
 
     @property
     def clock(self) -> SimulatedClock:
@@ -295,14 +621,7 @@ class ReplaySource:
             dropped = 0
             handle_context: TextIO
             if self._snapshot is not None:
-                segment_start, segment_length = self._snapshot_segments[index]
-                handle_context = io.TextIOWrapper(
-                    io.BufferedReader(
-                        _SnapshotSegment(self._snapshot.fileno(), segment_start, segment_length)
-                    ),
-                    encoding="utf-8-sig",
-                    newline="",
-                )
+                handle_context = self._open_snapshot_segment(index)
             else:
                 handle_context = path.open(encoding="utf-8-sig", newline="")
             with handle_context as handle:
@@ -329,7 +648,7 @@ class ReplaySource:
                         for key, value in raw_row.items()
                         if key is not None
                     }
-                    parsed = self._parse_row(row, stamp_column)
+                    parsed = self._parse_row(row, stamp_column, verified=self._verified[index])
                     if parsed is not None:
                         row_ms, values, unparsed = parsed
                         if report:
@@ -359,18 +678,26 @@ class ReplaySource:
                 )
 
     def _parse_row(
-        self, row: dict[str, str | None], stamp_column: str
+        self, row: dict[str, str | None], stamp_column: str, *, verified: bool
     ) -> tuple[int, dict[str, float | None], int] | None:
-        """行を`(時刻, 値, 数値として読めなかった非空cell数)`にする。時刻が無ければ`None`。"""
+        """行を`(時刻, 値, 数値として読めなかった非空cell数)`にする。時刻が無ければ`None`。
+
+        manifest と照合した CSV（``verified``）は、照合と同じ写像（``parse_local``）で読む
+        （決定記録 0100 §2.4）。照合していない CSV は従来どおり（0010 §2.7）。
+        """
         stamp = row.get(stamp_column)
         if not stamp:
             return None
-        try:
-            when = datetime.fromisoformat(stamp.strip())
-        except ValueError:
-            return None
-        if when.tzinfo is None:
-            when = when.replace(tzinfo=self._tz)
+        if verified:
+            row_ms = parse_local(stamp.strip(), self._tz) * 1000
+        else:
+            try:
+                when = datetime.fromisoformat(stamp.strip())
+            except ValueError:
+                return None
+            if when.tzinfo is None:
+                when = when.replace(tzinfo=self._tz)
+            row_ms = int(when.timestamp() * 1000)
         values: dict[str, float | None] = {}
         unparsed = 0
         for channel in SAMPLE_CHANNELS:
@@ -380,7 +707,7 @@ class ReplaySource:
             values[channel] = _to_float(raw_value)
             if values[channel] is None and raw_value is not None and raw_value.strip():
                 unparsed += 1
-        return int(when.timestamp() * 1000), values, unparsed
+        return row_ms, values, unparsed
 
     def _first_timestamp_ms(self) -> int:
         for row_ms, _ in self._rows():

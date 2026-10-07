@@ -63,6 +63,23 @@ def lock_name_for(day: date) -> str:
     return f".{CSV_PREFIX}{day.isoformat()}.export.lock"
 
 
+def manifest_name_for_csv(csv_name: str) -> str | None:
+    """CSV の basename に対になる manifest の basename。日次 CSV の名前でなければ ``None``。
+
+    ``sensors_2026-08-24.csv`` → ``sensors_2026-08-24.export.json``。export が書く名前
+    （:func:`csv_name_for`）に戻せる名前だけを対にする。
+    """
+    if not (csv_name.startswith(CSV_PREFIX) and csv_name.endswith(CSV_SUFFIX)):
+        return None
+    try:
+        day = date.fromisoformat(csv_name[len(CSV_PREFIX) : -len(CSV_SUFFIX)])
+    except ValueError:
+        return None
+    if csv_name_for(day) != csv_name:
+        return None
+    return manifest_name_for(day)
+
+
 # ---------------------------------------------------------------- 写像（0100 §2.4）
 
 
@@ -84,10 +101,33 @@ def parse_local(text: str, tz: ZoneInfo) -> int:
     DST の曖昧な時刻・存在しない時刻の検出はここでは行わない（``fold=0`` で当てはめる。0100 §2.5 は
     再生の照合（段 2）が行う）。
     """
+    when = parse_naive(text)
+    return (when.replace(tzinfo=tz) - _EPOCH) // _ONE_SECOND
+
+
+def parse_naive(text: str) -> datetime:
+    """CSV の時刻の文字列を、オフセットを持たないローカル時刻として読む（``fromisoformat``）。"""
     when = datetime.fromisoformat(text)
     if when.tzinfo is not None:
         raise ValueError(f"CSV の時刻にオフセットが付いている: {text!r}")
-    return (when.replace(tzinfo=tz) - _EPOCH) // _ONE_SECOND
+    return when
+
+
+def local_time_problem(naive: datetime, tz: ZoneInfo) -> str | None:
+    """DST の曖昧な時刻（``"ambiguous"``）・存在しない時刻（``"nonexistent"``）なら理由を返す。
+
+    0100 §2.5 の判定: ``fold=0`` と ``fold=1`` の UTC オフセットが違うか、ローカル → UTC →
+    ローカルの往復で元に戻らないか。往復で戻らなければ存在しない時刻（時計が進む区間）、
+    戻るのにオフセットが違えば曖昧な時刻（時計が戻る区間）。どちらでもなければ ``None``。
+    """
+    first = naive.replace(tzinfo=tz, fold=0)
+    second = naive.replace(tzinfo=tz, fold=1)
+    round_trip = first.astimezone(UTC).astimezone(tz).replace(tzinfo=None)
+    if round_trip != naive:
+        return "nonexistent"
+    if first.utcoffset() != second.utcoffset():
+        return "ambiguous"
+    return None
 
 
 def row_seconds_sha256(seconds: Iterable[int]) -> str:
@@ -177,6 +217,30 @@ def export_record_sha256(record: ExportRecord) -> str:
     """
     fields: dict[str, object] = {"schema_version": SCHEMA_VERSION, **record.model_dump()}
     return hashlib.sha256(canonical_json_bytes(fields)).hexdigest()
+
+
+def export_binding_sha256(records: Iterable[ExportRecord]) -> str:
+    """入力の export の束縛の digest ``export_binding_sha256``（0100 §2.8）。
+
+    ``export_id`` の順に並べた ``[export_id, export_record_sha256]`` の組の列（JSON の
+    配列の配列）を、0096 §2.3 と同じ規約（区切り・末尾改行。``ensure_ascii=False``）で
+    直列化した bytes の SHA-256。
+    ``export_id`` の重複は ``ValueError``（0100 §2.3 の 7。呼び出し側が先に拒否している）。
+    """
+    pairs = sorted((record.export_id, export_record_sha256(record)) for record in records)
+    ids = [export_id for export_id, _ in pairs]
+    if len(set(ids)) != len(ids):
+        raise ValueError("export_id が重複している")
+    payload = (
+        json.dumps(
+            [list(pair) for pair in pairs],
+            ensure_ascii=False,
+            allow_nan=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        + b"\n"
+    )
+    return hashlib.sha256(payload).hexdigest()
 
 
 EXPORT_FIELDS: Final[tuple[str, ...]] = tuple(ExportRecord.model_fields)

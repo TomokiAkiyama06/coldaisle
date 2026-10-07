@@ -87,6 +87,11 @@ DEFAULT_RULES = Path("config/rules.yaml")
 DEFAULT_NOTIFY = Path("config/notify.yaml")
 DEFAULT_AI = Path("config/ai.yaml")
 DEFAULT_METRICS = Path("config/metrics.yaml")
+DEFAULT_REPLAY_TIMEZONE = "Asia/Tokyo"
+"""manifest の無い CSV を再生するときの既定の timezone（従来の `--timezone` の既定。0010 §2.7）。
+
+manifest のある入力には使わない（決定記録 0100 §2.3。manifest の timezone を使う）。
+"""
 
 
 @dataclass
@@ -245,11 +250,17 @@ class Daemon:
             if not isinstance(getattr(self._source, "losses", None), dict):
                 # 取りこぼしを報告できないsourceでは、完了を判定できない
                 raise ValueError("dataset run bindには取りこぼし件数を報告するsourceが必要")
+            # 再生が export の manifest と照合した timezone と束縛の digest（決定記録 0100 §2.8）。
+            # 照合していない入力（manifest の無い CSV）は両方 None で bind する
+            local_timezone = getattr(self._source, "local_timezone", None)
+            export_binding = getattr(self._source, "export_binding_sha256", None)
             self._store.bind_dataset_source_run(
                 run_alias=self._dataset_run_alias,
                 source_kind=self._source_name,
                 source_sha256=source_sha256,
                 at_ms=self._normalizer.clock.now_ms(),
+                local_timezone=local_timezone if isinstance(local_timezone, str) else None,
+                export_binding_sha256=export_binding if isinstance(export_binding, str) else None,
             )
 
         # API がソース種別を答えられるようにする（FR-305）。状態は変化時だけ書く
@@ -694,8 +705,13 @@ class Config:
     baud: int = SERIAL_BAUD
     bulk: bool = False
     """一括投入。待たずに流す（`--speed` は無視される）。"""
-    timezone: str = "Asia/Tokyo"
-    """CSV の時刻の解釈に使う。ファイルにオフセットが無いため（決定記録 0008 §2.8）。"""
+    timezone: str | None = None
+    """CSV の時刻の解釈に使う。ファイルにオフセットが無いため（決定記録 0008 §2.8）。
+
+    ``None`` は「指定しない」。manifest のある入力では manifest の timezone を使い、
+    manifest の無い CSV には :data:`DEFAULT_REPLAY_TIMEZONE` を当てる（決定記録 0100 §2.3）。
+    明示した値が manifest と違えば再生を拒否する。
+    """
     rules: Path = DEFAULT_RULES
     notify: Path = DEFAULT_NOTIFY
     ai: Path = DEFAULT_AI
@@ -821,7 +837,8 @@ def _build_source(config: Config) -> Source:
         try:
             return ReplaySource(
                 config.csv,
-                tz=ZoneInfo(config.timezone),
+                tz=ZoneInfo(config.timezone or DEFAULT_REPLAY_TIMEZONE),
+                timezone_explicit=config.timezone is not None,
                 speed=config.speed,
                 bulk=config.bulk,
                 dataset_provenance=config.dataset_run_alias is not None,
@@ -867,7 +884,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="dataset専用Replay DBへbindする run-<32 hex> alias",
     )
     parser.add_argument("--bulk", action="store_true", help="replay を待たずに流す（一括投入）")
-    parser.add_argument("--timezone", default="Asia/Tokyo", help="CSV の時刻の解釈")
+    parser.add_argument(
+        "--timezone",
+        default=None,
+        help=(
+            "manifest の無い CSV の時刻の解釈（省略時は "
+            f"{DEFAULT_REPLAY_TIMEZONE}）。manifest のある入力では manifest と違えば拒否する"
+        ),
+    )
     parser.add_argument("--max-samples", type=int, default=None, help="試験用。件数で止める")
     parser.add_argument("--log-level", default="INFO")
     return parser
