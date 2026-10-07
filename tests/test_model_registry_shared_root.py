@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import ast
 import os
+import signal
 import stat
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -134,6 +135,26 @@ def test_shared_mode_takes_the_lock_through_a_read_only_open(tmp_path: Path) -> 
     os.chmod(root / LOCK, 0o440)
     with reader(root).pinned() as snapshot:
         assert snapshot == RegistrySnapshot(revision=0)
+
+
+@pytest.mark.parametrize("shared", [True, False])
+def test_a_fifo_lock_is_rejected_without_hanging(tmp_path: Path, shared: bool) -> None:
+    """FIFO の lock を開いて止まらず、regular file でないとして拒む（codex P2。PR #248）。"""
+    root = make_shared_root(tmp_path, with_lock=False)
+    os.mkfifo(root / LOCK, 0o660)
+    registry = reader(root) if shared else writer(root)
+
+    def timed_out(signum: int, frame: object) -> None:
+        raise TimeoutError("lock を開いて止まった")
+
+    previous = signal.signal(signal.SIGALRM, timed_out)
+    signal.alarm(5)
+    try:
+        with pytest.raises(UnsafeRegistryPathError, match="regular"), registry.pinned():
+            pass
+    finally:
+        signal.alarm(0)
+        signal.signal(signal.SIGALRM, previous)
 
 
 def test_shared_mode_lock_excludes_other_holders(tmp_path: Path) -> None:

@@ -1960,6 +1960,9 @@ class ModelRegistry:
             flags = os.O_RDWR | os.O_NOFOLLOW
         else:
             flags = os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW
+        # FIFO に置き換えられた lock を `O_RDONLY` で開くと書き手を待って止まり、続く `fstat` の
+        # 種類の確認まで届かない（codex P2。PR #248）。`flock` の待ちは `O_NONBLOCK` に依らない。
+        flags |= os.O_NONBLOCK
         try:
             return os.open(_LOCK_FILENAME, flags, 0o600, dir_fd=root_fd)
         except FileNotFoundError:
