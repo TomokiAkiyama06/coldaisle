@@ -45,6 +45,7 @@ from coldaisle.control.rl.action import (
 )
 from coldaisle.control.rl.config import RlTrainingConfig
 from coldaisle.control.rl.dynamics import (
+    AttestedThermalDynamics,
     DynamicsRequest,
     DynamicsUnusableError,
     EnvironmentDynamics,
@@ -348,6 +349,31 @@ class SupervisorTrainingEnvironment:
         if (acoustic is None) != (acoustic_identity is None):
             # 条件 hash に載らない依存を黙って受け取らない。
             raise EnvironmentUsageError("Acoustic Model と その identity は一緒に渡す")
+        if isinstance(dynamics, AttestedThermalDynamics):
+            # learned simulator の判定の記録は、この環境が回す `fan-policy.yaml` と同じ
+            # `model_confidence` で作る（別の設定で判定した記録を同じ episode に並べない）。
+            if dynamics.confidence_policy != policy.model_confidence:
+                raise EnvironmentUsageError(
+                    "learned simulator の判定の設定が fan-policy.yaml の model_confidence と違う"
+                )
+            # learned simulator の window は artifact の feature の metric だけを持つ。screen の
+            # metric が無いと、その温度を絶対上限と照らさないまま episode が進む（0058 §2.5）。
+            unscreened = sorted(
+                set(config.safety_screen.temperature_metrics)
+                - set(dynamics.model.feature_schema.metrics)
+            )
+            if unscreened:
+                raise EnvironmentUsageError(
+                    "safety screen の metric を learned simulator の window が持たない"
+                    f"（{unscreened}）"
+                )
+            # 格子と刻みが違う artifact は、補間・外挿・丸めをせずに使わない（0079 §2.3）。
+            if dynamics.action_schema.step_ms != config.episode.step_ms.value:
+                raise EnvironmentUsageError(
+                    "episode の刻みが learned simulator の action の格子と違う"
+                    f"（episode={config.episode.step_ms.value}ms; "
+                    f"action={dynamics.action_schema.step_ms}ms）"
+                )
         self._config = config
         self._config_sha256 = config_sha256
         self._policy = policy
@@ -807,6 +833,7 @@ class SupervisorTrainingEnvironment:
             confidence=proposal_facts.confidence,
             ood=proposal_facts.ood,
             provenance=outcome.provenance,
+            simulator_assessment=outcome.assessment,
             supported=True,
             observed=dict(observed),
             reward=reward,
@@ -866,7 +893,11 @@ class SupervisorTrainingEnvironment:
                     safety_floor=self._floor,
                 )
                 ood = proposal.assessment.ood if proposal.assessment is not None else None
-                learned = proposal.to_status(received_at_mono_ms=snapshot.monotonic_ms)
+                learned = proposal.to_status(
+                    received_at_mono_ms=snapshot.monotonic_ms,
+                    # 提案はこの step の snapshot から作った。元 snapshot は同じもの
+                    source_snapshot_mono_ms=snapshot.monotonic_ms,
+                )
             selection = self._gate.select(
                 now_mono_ms=snapshot.monotonic_ms,
                 fallback=baseline,

@@ -81,6 +81,21 @@ def shared_root(tmp_path: Path) -> Path:
     return root
 
 
+def shared_registry(tmp_path: Path) -> Path:
+    """導入手順が作る形の Registry（`2770`・lock は作ってある。決定記録 0104 §2.3）。
+
+    `REGISTRY_ROOT`（他の試験と共有する fixture）の写し。CLI は Registry を共有の root モードで
+    開くので、setgid の無い fixture のままでは読めない。
+    """
+    root = tmp_path / "registry"
+    if not root.exists():
+        shutil.copytree(REGISTRY_ROOT, root)
+        os.chmod(root, 0o2770)
+        if not os.stat(root).st_mode & stat.S_ISGID:
+            pytest.skip("この環境ではディレクトリに setgid を付けられない")
+    return root
+
+
 def write_inputs(tmp_path: Path, **overrides: Any) -> tuple[Path, Path]:
     """人が書く承認ファイル（approver を含まない）と、承認が指した報告。"""
     document = report_document()
@@ -107,7 +122,7 @@ def raise_argv(tmp_path: Path, approval: Path, report: Path) -> list[str]:
         "--config-dir",
         str(CONFIG_DIR),
         "--registry-root",
-        str(REGISTRY_ROOT),
+        str(shared_registry(tmp_path)),
         "--registry-limits",
         str(REPO / "config"),
     ]
@@ -386,6 +401,37 @@ def test_malformed_yaml_is_a_configuration_failure_not_a_traceback(
     assert not journal_path(tmp_path).exists()
     [line] = log_lines(capsys.readouterr().err)
     assert (line["event"], line["code"]) == ("raise_failed", "io_or_config_error")
+
+
+@pytest.mark.parametrize("breakage", ["no_lock", "no_setgid", "other_permissions", "no_root"])
+def test_an_unreadable_registry_is_exit_1_registry_error_not_an_evidence_rejection(
+    tmp_path: Path, breakage: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Registry を読めないのは導入の誤りで、証拠の拒否（4）ではない（決定記録 0104 §5 の 11）。
+
+    承認者の側は root も lock も作らない（0104 §2.4）。
+    """
+    shared_root(tmp_path)
+    approval, report = write_inputs(tmp_path)
+    argv = raise_argv(tmp_path, approval, report)
+    registry = shared_registry(tmp_path)
+    if breakage == "no_lock":
+        (registry / ".registry.lock").unlink()
+    elif breakage == "no_setgid":
+        os.chmod(registry, 0o770)
+    elif breakage == "other_permissions":
+        os.chmod(registry, 0o2775)
+    else:
+        argv[argv.index("--registry-root") + 1] = str(tmp_path / "missing")
+    before = sorted(os.listdir(registry))
+
+    assert run(argv) == EXIT_FAILED
+
+    assert not journal_path(tmp_path).exists()
+    assert sorted(os.listdir(registry)) == before
+    assert not (tmp_path / "missing").exists()
+    [line] = log_lines(capsys.readouterr().err)
+    assert (line["event"], line["code"]) == ("raise_failed", "registry_error")
 
 
 def test_a_rollback_already_done_by_someone_else_is_not_claimed(

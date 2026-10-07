@@ -22,6 +22,7 @@ from coldaisle.control.model.confidence import (
     ConfidenceProfileSpec,
     OodEvaluationCase,
     ResidualObservation,
+    ResidualScale,
     SupportAxis,
     ValueRange,
     evaluate_ood_detection,
@@ -151,17 +152,19 @@ def with_override(demand_of: Demands, overrides: dict[int, PerZone[float]]) -> D
     return demand
 
 
-def targets(anchor_tick: int, horizon_ms: int, demand_of: Demands) -> dict[str, float | None]:
-    anchor_ms = anchor_tick * 1_000
-    step0 = demand_of(anchor_tick)
-    last = demand_of(anchor_tick + horizon_ms // STEP_MS - 1)
+def targets(tick: int, demand_of: Demands) -> dict[str, float | None]:
+    """時刻 ``tick`` 秒の target の観測。**時刻だけの関数**にする（決定記録 0103 §2.2）。
+
+    隣り合う anchor の target は同じ観測を指すので、anchor や horizon に依存させない。
+    値は直前の2つの tick の demand と、その前の GPU の温度で決まる
+    （どの horizon でも入力の中にある）。
+    """
+    earlier = demand_of(tick - 2)
+    latest = demand_of(tick - 1)
+    gpu = gpu_core((tick - 2) * 1_000)
     return {
-        "cpu.package": 40.0
-        + 0.5 * gpu_core(anchor_ms)
-        - 6.0 * step0.front
-        - 3.0 * last.front
-        + horizon_ms / 1_000,
-        "d.gpu_rise": 10.0 - 4.0 * step0.front + 0.2 * gpu_core(anchor_ms),
+        "cpu.package": 40.0 + 0.5 * gpu - 6.0 * earlier.front - 3.0 * latest.front,
+        "d.gpu_rise": 10.0 - 4.0 * latest.front + 0.2 * gpu,
     }
 
 
@@ -169,7 +172,7 @@ def make_example(
     anchor_tick: int,
     demand_of: Demands,
     *,
-    target_shift: float = 0.0,
+    target_shift: dict[int, float],
 ) -> DatasetExampleV2:
     anchor_ms = anchor_tick * 1_000
     current = demand_of(anchor_tick)
@@ -218,8 +221,12 @@ def make_example(
                 horizon_ms=horizon,
                 expected_ts_ms=anchor_ms + horizon,
                 values={
-                    metric: (None if value is None else value + target_shift)
-                    for metric, value in targets(anchor_tick, horizon, demand_of).items()
+                    metric: (
+                        None
+                        if value is None
+                        else value + target_shift.get(anchor_tick + horizon // 1_000, 0.0)
+                    )
+                    for metric, value in targets(anchor_tick + horizon // 1_000, demand_of).items()
                 },
                 source_ts_ms={metric: anchor_ms + horizon for metric in TARGETS},
                 quality={metric: Quality.OK for metric in TARGETS},
@@ -233,10 +240,10 @@ def make_example(
 def make_dataset(
     demand_of: Demands, *, target_shift: dict[int, float] | None = None
 ) -> ThermalDatasetV2:
+    """``target_shift`` は観測の時刻（秒）ごとの label のずらし。どの example から見ても同じ観測を
+    同じだけずらす（1つの観測は1つの値しか持たない。0103 §2.2）。"""
     shifts = target_shift or {}
-    items = tuple(
-        make_example(tick, demand_of, target_shift=shifts.get(tick, 0.0)) for tick in ANCHOR_TICKS
-    )
+    items = tuple(make_example(tick, demand_of, target_shift=shifts) for tick in ANCHOR_TICKS)
     return ThermalDatasetV2(
         manifest=DatasetManifestV2(
             spec=dataset_spec(),
@@ -310,6 +317,12 @@ class Fitted:
         return ObservedThermalInput.from_example_v2(example)
 
 
+def scales_at(fitted: Fitted, horizon_ms: int) -> tuple[ResidualScale, ...]:
+    return tuple(
+        scale for scale in fitted.profile.residual_scales if scale.horizon_ms == horizon_ms
+    )
+
+
 def component(assessment: Any, name: ConfidenceComponent) -> Any:
     return next(item for item in assessment.components if item.component is name)
 
@@ -345,7 +358,15 @@ def test_ranges_and_action_support_come_from_train_only(tmp_path: Path) -> None:
     moved_ticks = test_ticks - validation_ticks - train_ticks
     assert moved_ticks
     moved = with_override(base, {tick: zones(0.95) for tick in moved_ticks})
-    other = Fitted(tmp_path / "b", moved, target_shift={tick: 3.0 for tick in validation_ticks})
+    # validation の label の観測を動かす（train の label より後の観測だけ。0103 §2.2）
+    train_end_s = max(item.label_end_ms for item in reference.split.train) // 1_000
+    label_ticks = {
+        tick + horizon // 1_000
+        for tick in validation_ticks
+        for horizon in HORIZONS
+        if tick + horizon // 1_000 > train_end_s
+    }
+    other = Fitted(tmp_path / "b", moved, target_shift={tick: 3.0 for tick in label_ticks})
     assert other.profile.residual_scales != reference.profile.residual_scales
     for name in (
         "feature_ranges",
@@ -478,20 +499,29 @@ def test_residual_base_excludes_validation_examples_outside_the_step_support(
     # （prior_action を保つ）が step ごとの support の外になる
     outlier = with_override(base, {VALIDATION_TICK: zones(0.95)})
     calm = Fitted(tmp_path / "a", outlier)
-    # 除いた example の label だけを大きく外しても、基準は変わらない（基準に入っていない）
-    noisy = Fitted(tmp_path / "b", outlier, target_shift={VALIDATION_TICK + 1: 500.0})
+    # 除いた example の 1 s 先の label だけを大きく外しても、1 s 先の基準は変わらない
+    # （基準に入っていない）。1つの観測は example の間で同じ値を持つ（0103 §2.2）ので、
+    # その観測は VALIDATION_TICK の 2 s 先の label でもあり、2 s 先の基準は変わる。
+    # horizon ごとに分けて比べる
+    noisy = Fitted(
+        tmp_path / "b", outlier, target_shift={VALIDATION_TICK + 1 + HORIZONS[0] // 1_000: 500.0}
+    )
     excluded = calm.observed(VALIDATION_TICK + 1)
     assert calm.assessor().held_support(excluded) is not None
     assert calm.profile.residual_excluded_example_count == 1
     assert calm.profile.residual_validation_example_count == len(calm.split.validation) - 1
-    assert noisy.profile.residual_scales == calm.profile.residual_scales
+    assert scales_at(noisy, HORIZONS[0]) == scales_at(calm, HORIZONS[0])
+    assert scales_at(noisy, HORIZONS[1]) != scales_at(calm, HORIZONS[1])
     assert all(
         scale.validation_samples == len(calm.split.validation) - 1
         for scale in calm.profile.residual_scales
     )
-    # 対照: support の中の example の label を外せば、基準は変わる
-    kept = Fitted(tmp_path / "c", outlier, target_shift={VALIDATION_TICK - 1: 500.0})
-    assert kept.profile.residual_scales != calm.profile.residual_scales
+    # 対照: support の中の example（VALIDATION_TICK）の 1 s 先の label を外せば、
+    # 1 s 先の基準は変わる
+    kept = Fitted(
+        tmp_path / "c", outlier, target_shift={VALIDATION_TICK + HORIZONS[0] // 1_000: 500.0}
+    )
+    assert scales_at(kept, HORIZONS[0]) != scales_at(calm, HORIZONS[0])
 
 
 def test_profile_is_refused_when_no_validation_example_is_inside_the_step_support(

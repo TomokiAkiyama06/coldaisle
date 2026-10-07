@@ -147,6 +147,7 @@ class MpcProposal(_Frozen):
         self,
         *,
         received_at_mono_ms: int,
+        source_snapshot_mono_ms: int | None,
         snapshot_status: SnapshotStatus = SnapshotStatus.AVAILABLE,
         supervisor_available: bool = True,
         control_deadline_exceeded: bool = False,
@@ -154,6 +155,9 @@ class MpcProposal(_Frozen):
         """Gate（#79）へ渡す状態に変換する。
 
         受信の単調時刻は control loop 自身の時計で、worker は決めない（0028 §2.6）。
+        元 snapshot の単調時刻も loop が自分の出した snapshot の記録から取る（0077 §2.4 の4）。
+        提案の無い結果（失敗）では使わないので None でよい。提案があるのに None なら
+        ``LearnedControlStatus`` の検証で落ちる。
         """
         if self.proposal is None:
             return LearnedControlStatus(
@@ -168,6 +172,7 @@ class MpcProposal(_Frozen):
         return LearnedControlStatus(
             proposal=self.proposal,
             received_at_mono_ms=received_at_mono_ms,
+            source_snapshot_mono_ms=source_snapshot_mono_ms,
             assessment=self.assessment,
             supervisor_available=supervisor_available,
             control_deadline_exceeded=control_deadline_exceeded,

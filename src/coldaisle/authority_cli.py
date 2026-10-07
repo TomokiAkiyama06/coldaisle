@@ -50,6 +50,7 @@ from coldaisle.control.authority import (
     AuthorityEvidenceError,
     AuthorityJournal,
     AuthorityNotDurableError,
+    AuthorityRegistryUnavailableError,
     AuthorityStateError,
     AuthorityStore,
     AuthorityStoreError,
@@ -225,7 +226,9 @@ def run_raise(args: argparse.Namespace, identity: ProcessIdentity, clock: Clock)
     approval = load_approval(read_bounded(args.approval, limits.max_snapshot_bytes), credentials)
     report = read_bounded(args.report, limits.max_artifact_bytes)
     config = ControlConfig.from_directory(args.config_dir)
-    registry = ModelRegistry(args.registry_root, limits=limits)
+    # **Registry を作らず、lock は `O_RDONLY` で flock だけを取る**（決定記録 0104 §2.4）。
+    # 承認者は Registry を書かない。root や lock が無ければ作らずに止まる。
+    registry = ModelRegistry(args.registry_root, limits=limits, require_shared_root=True)
     durable = True
     try:
         journal = authority.raise_stage(
@@ -420,6 +423,9 @@ def _failure(error: BaseException) -> tuple[int, str]:
     """error を終了コードと理由の code へ写す。**判断はしない**（判断は store が行う）。"""
     if isinstance(error, AuthorityApproverError):
         return EXIT_APPROVER_REJECTED, error.code.value
+    if isinstance(error, AuthorityRegistryUnavailableError):
+        # 導入の誤り（権限・lock が無い）を、証拠の拒否（4）と分ける（決定記録 0104 §5 の 11）。
+        return EXIT_FAILED, "registry_error"
     if isinstance(error, AuthorityEvidenceError):
         return EXIT_APPROVAL_REJECTED, "evidence_rejected"
     if isinstance(error, AuthorityApprovalError):

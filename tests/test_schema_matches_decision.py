@@ -106,6 +106,10 @@ def test_migration_creates_exactly_the_decided_objects():
         ("trigger", "calibration_activations_chain"),
         ("trigger", "calibration_activations_no_update"),
         ("trigger", "calibration_activations_no_delete"),
+        ("table", "csv_exports"),
+        ("index", "ix_csv_exports_day"),
+        ("trigger", "csv_exports_no_update"),
+        ("trigger", "csv_exports_no_delete"),
     }
 
 

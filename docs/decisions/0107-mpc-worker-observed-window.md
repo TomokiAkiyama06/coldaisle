@@ -1,7 +1,7 @@
 # 決定記録 0107: MPC worker（0077 段階 3）が frame の列から推論の入力を作る規則（観測 window・anchor の action・提案を作らない周期・residual・worker の入力）
 
 - **種別**: Decision Record
-- **Status**: Proposed
+- **Status**: FINAL（2026-10-07、リポジトリ所有者が §5 の7点すべてを推奨案で承認。§6）
 - **Date**: 2026-10-07
 - **Supersedes**: なし（0077 / 0092 / 0101 が決めていなかった点への追加。どの記録も置き換えない）
 - **関連**: [0077](0077-learned-proposal-handoff.md) §2.3 / §2.5 / §2.6 / §2.7 / §2.10 段階 3 /
@@ -33,7 +33,7 @@ frame の列から組み立てる」「届かなかった frame を補間しな�
 | E | artifact の feature metric が frame の snapshot の signal に無いとき | Dataset の feature は保存された readings のどの metric でもよいが、snapshot の signal は制御の入力契約（`ControlInputContract`）の metric だけ。無い metric は毎回欠測になる |
 | F | worker の目的関数の任意依存（Air Balance・`fan_hardware`・acoustic）の作り方 | 0077 §2.3 は worker が自分で Control Config を読み frame の `config` と照合すると決めたが、そこから何を作るかは書いていない |
 
-## 2. Decision（推奨案。所有者の承認で FINAL）
+## 2. Decision（2026-10-07 所有者が推奨案で承認）
 
 ### 2.1 観測 window（点 A）
 
@@ -104,7 +104,7 @@ frame の列から組み立てる」「届かなかった frame を補間しな�
 - registry は `--registry-root` / `--registry-limits` で読み、frame の `expected_artifacts.thermal_model` の3つ組だけを
   検証して読み込む（0077 §2.6 / 0098 §2.1）
 - worker は L8（metric の単位・派生の定義の照合。0079 §2.4）に要る Metric Catalog を `--metrics` で読む。**fand と同じ
-  catalog であることの束縛**は §5 #7 の判断による（推奨: frame v3 に catalog の SHA-256 を載せ、worker は自分が読んだ catalog の
+  catalog であることの束縛**は §5 #7 で決着した（frame v3 に catalog の SHA-256 を載せ、worker は自分が読んだ catalog の
   SHA-256 と違えば束縛を作らず `model_load_failure`（理由 `metric_catalog_mismatch`）を返す。`config_mismatch` と同じく一致する
   まで毎周期）。frame には SHA-256 だけを載せ、path を載せない（AGENTS.md ルール10）
 - `--role supervisor` は段階 4（#89）まで起動を拒む
@@ -143,9 +143,11 @@ frame の列から組み立てる」「届かなかった frame を補間しな�
 | worker が residual の照合を段階 3 から持つ | 照合の出どころと保持の設計が要り、段階 3 の範囲（0077 §2.10）を超える |
 | feature metric が無いときも束縛を作り、毎回 missing で推論する | 構成の誤りが OOD に紛れ、原因が trace から読めない |
 
-## 5. 未決事項（所有者の判断を要する）
+## 5. 未決事項
 
-| # | 判断点 | 推奨 | 代替 |
+2026-10-07、所有者が7点すべてを推奨案で決めた（§6）。「代替」の列は判断前の記録である。開いている点は無い。
+
+| # | 判断点 | 決着（2026-10-07 所有者の決定、推奨案） | 代替（判断前の記録） |
 |---|---|---|---|
 | 1 | 観測 window で欠けた frame を飛び越えて as-of するか（§2.1） | **飛び越えない**（欠けた tick 以後の格子時刻は missing） | Dataset と同じく古い frame へ as-of し、stale mask に任せる |
 | 2 | anchor の action の時点（§2.2） | **tick `N - 1` の `applied`**（Dataset v2 の `prior_action` と同じ） | tick `N` の `applied` |
@@ -157,3 +159,19 @@ frame の列から組み立てる」「届かなかった frame を補間しな�
 
 frame の列を再現のために保存するか（0077 §5「別の場所で決める点」）は、段階 3 では保存しない（#86 の再現性の受入基準は
 試験で記録した frame の列から確かめる）。保存先・保持期間は別の記録で決める。
+
+## 6. 承認記録
+
+**2026-10-07、リポジトリ所有者が §5 の7点すべてを推奨案で承認し、本記録を FINAL にした。**
+
+| §5 の判断点 | 決定 | 本記録 |
+|---|---|---|
+| 1 | 観測 window で欠けた frame を飛び越えて as-of しない（`tick_id` の飛びで証明できる欠けの格子時刻は missing。最新の frame に後続を求めない） | §2.1 |
+| 2 | anchor の action は直前の tick（`N - 1`）の `applied`（Dataset v2 の `prior_action` と同じ時点） | §2.2 |
+| 3 | 提案を作れない周期（立ち上がり中・anchor の action の欠測・`supervisor` / `baseline` が `null` など）は何も送らない（heartbeat だけ）。途中の欠けは missing の cell として `propose()` へ渡す | §2.3 |
+| 4 | 段階 3 は `residual=None` | §2.4 |
+| 5 | feature metric が snapshot に無い artifact は束縛の時点で `model_load_failure`（`feature_metric_not_in_snapshot`） | §2.5 |
+| 6 | 任意依存は同じ Control Config から fand と同じ規則で作る・heartbeat は別スレッド・`--role supervisor` は段階 4 まで拒む | §2.6 / §2.7 |
+| 7 | frame v3 に `metric_catalog_sha256` を足し、worker は違えば `model_load_failure`（`metric_catalog_mismatch`） | §2.6 |
+
+§5 に開いている点は無い。

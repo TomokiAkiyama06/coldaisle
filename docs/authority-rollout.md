@@ -124,6 +124,12 @@ lock の最小権限を与える設計が決まるまで使えない（#217。`r
   導入手順で `2770`（setgid）で作る（`docs/ubuntu-deploy.md`）。**CLI はディレクトリを作らず**、
   書く前に「ディレクトリ・other に権限が無い・setgid 付き」を確かめる。journal と新しく作る lock は
   `umask` に依らず `0660`（0086 §2.4）
+- **Model Registry も共有の root として開く**（決定記録 0104 §2.4）。CLI は Registry の root も
+  `.registry.lock` も作らず（無ければ終了コード 1・`registry_error`）、root が「ディレクトリ・other に
+  権限が無い・setgid 付き」であることを確かめ、lock は `O_RDONLY` で開いて `flock` だけを取る（承認者に
+  lock の `w` は要らない）。開発でも `--registry-root` は `chmod 2770` 済みで lock のある root を指す。
+  Registry を読めないこと（権限・lock が無い・形が違う・壊れた snapshot）は、証拠の拒否（4）ではなく
+  終了コード 1・`registry_error` になる（0104 §5 の 11）
 - stdout に結果を1件の JSON で出す（`actor` は名前を引けたら `uid.<数値>（<名前>）`。**名前は記録に
   書かない**）。stderr に JSON Lines の構造化ログを1行出す（`event`・`uid`・`euid`・`from_stage` /
   `to_stage`・`revision`・`report_sha256`。失敗は `code` 付き）。DB は開かない（0086 §2.8）

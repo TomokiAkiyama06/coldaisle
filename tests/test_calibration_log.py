@@ -930,7 +930,8 @@ def test_migration_is_append_only_and_idempotent(tmp_path, rules):
             "SELECT version, applied_ms FROM schema_version"
         ).fetchall()
     assert latest["air.room"].value == 25.0
-    assert [tuple(row) for row in versions][-1] == (11, 5_000)
+    # 0011 より後の migration（0012 の csv_exports。決定記録 0100）も同じ起動で当たる
+    assert (11, 5_000) in [tuple(row) for row in versions]
 
     with SqliteStore(path, rules=rules, clock=SimulatedClock(9_000)) as again:
         assert [

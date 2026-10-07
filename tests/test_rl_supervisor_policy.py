@@ -958,15 +958,18 @@ def test_the_training_report_cannot_claim_promotable_it_does_not_derive(trained:
         )
 
 
-def test_a_v1_training_report_is_refused_by_its_own_version(trained: Any) -> None:
-    """#105 で入れ子の比較の形が変わったので、v1 の報告は**報告の版**で拒む（0074 §2.2）。"""
+@pytest.mark.parametrize("version", [1, 2])
+def test_an_older_training_report_is_refused_by_its_own_version(trained: Any, version: int) -> None:
+    """入れ子の比較の形が変わったので、v1 / v2 の報告は**報告の版**で拒む（0074 / 0106 §2.4）。"""
     report = report_for(trained, (episode_spec(episode_id="pr105-v", seed=3),))
-    assert report.schema_version == TRAINING_REPORT_SCHEMA_VERSION == 2
+    assert report.schema_version == TRAINING_REPORT_SCHEMA_VERSION == 3
     with pytest.raises(ValidationError) as caught:
         SupervisorPolicyTrainingReport.model_validate_json(
-            json.dumps({**json.loads(report.model_dump_json()), "schema_version": 1})
+            json.dumps({**json.loads(report.model_dump_json()), "schema_version": version})
         )
     assert any(error["loc"] == ("schema_version",) for error in caught.value.errors())
+    # v3 は往復しても同じ報告に戻る。
+    assert SupervisorPolicyTrainingReport.model_validate_json(report.model_dump_json()) == report
 
 
 def test_the_training_report_cannot_claim_an_improvement_it_does_not_derive(

@@ -239,6 +239,7 @@ def test_the_gate_accepts_only_the_pinned_production_artifact(tmp_path: Path) ->
         status = LearnedControlStatus(
             proposal=proposal,
             received_at_mono_ms=0,
+            source_snapshot_mono_ms=0,
             assessment=assessment_for(proposal, artifact_sha256=artifact),
             binding_authority_stage=AuthorityStage.FULL,
         )
