@@ -67,7 +67,10 @@ frame の列から組み立てる」「届かなかった frame を補間しな�
 次のときは、その周期に `propose()` を呼ばず、**結果を送らない**（heartbeat だけ送る。0077 §2.7）。Gate はこれまでどおり
 直前の結果の期限切れか `learned_proposal_unavailable` で Fallback にする。`LearnedFailure` / `FallbackCause` に値を足さない。
 
-- window・anchor の action に要る frame が足りない（立ち上がり中・欠け）
+- **立ち上がり中**: 同じ `run_id` で受け取った最も古い frame の `snapshot.ts_ms` が、window の最も古い格子時刻より後
+  （格子の先頭に当てる frame がまだ無い）。window の**途中の**欠けはここに含めない。途中の欠けは §2.1 のとおり missing の cell
+  として `propose()` へ渡し、Confidence / OOD と Gate に判断させる
+- anchor の action に要る tick `N - 1` の frame が無い、またはどれかの zone の `applied` が `null`（§2.2）
 - 使う frame の `supervisor` か `baseline` が `null`（`propose()` はどちらも必須）
 - frame の `expected_artifacts.thermal_model` が `null`（0077 §2.6。production が無い）
 - 検証を通った v3 の frame がまだ無い `run_id`（0101 §2.3）
@@ -100,6 +103,10 @@ frame の列から組み立てる」「届かなかった frame を補間しな�
 - 較正ファイル・Telemetry・SQLite・API は読まない（0077 §2.3 / 0101 §2.1）。worker の CLI に較正の path を持たせない
 - registry は `--registry-root` / `--registry-limits` で読み、frame の `expected_artifacts.thermal_model` の3つ組だけを
   検証して読み込む（0077 §2.6 / 0098 §2.1）
+- worker は L8（metric の単位・派生の定義の照合。0079 §2.4）に要る Metric Catalog を `--metrics` で読む。**fand と同じ
+  catalog であることの束縛**は §5 #7 の判断による（推奨: frame v3 に catalog の SHA-256 を載せ、worker は自分が読んだ catalog の
+  SHA-256 と違えば束縛を作らず `model_load_failure`（理由 `metric_catalog_mismatch`）を返す。`config_mismatch` と同じく一致する
+  まで毎周期）。frame には SHA-256 だけを載せ、path を載せない（AGENTS.md ルール10）
 - `--role supervisor` は段階 4（#89）まで起動を拒む
 
 ### 2.7 実行単位
@@ -146,6 +153,7 @@ frame の列から組み立てる」「届かなかった frame を補間しな�
 | 4 | residual の証拠（§2.4） | **段階 3 は `None`**（HIGH にしない。照合は別の記録） | 段階 3 で worker に residual の照合を持たせる |
 | 5 | feature metric が snapshot に無い artifact（§2.5） | **束縛の時点で `model_load_failure`（`feature_metric_not_in_snapshot`）** | 束縛して毎回 missing の window で推論し、OOD に任せる |
 | 6 | 任意依存と CLI（§2.6 / §2.7） | **同じ Control Config から fand と同じ規則で作る・heartbeat は別スレッド・`--role supervisor` は段階 4 まで拒む** | — |
+| 7 | worker の Metric Catalog を fand のものに束縛するか（§2.6。Codex の指摘） | **frame v3 に `metric_catalog_sha256` を足し、worker は違えば `metric_catalog_mismatch` の `model_load_failure`**（0101 の v3 の形に欄が1つ増える。v3 は同じ PR で入れるので版は 3 のまま） | 束縛せず、同じパッケージ・同じ配備の catalog を使う運用に任せ、起動ログに SHA-256 を残すだけにする |
 
 frame の列を再現のために保存するか（0077 §5「別の場所で決める点」）は、段階 3 では保存しない（#86 の再現性の受入基準は
 試験で記録した frame の列から確かめる）。保存先・保持期間は別の記録で決める。
