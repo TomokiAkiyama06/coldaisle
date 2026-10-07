@@ -642,6 +642,34 @@ def test_the_disconnect_is_published_before_the_socket_is_torn_down(channel) -> 
     assert seen == [(LearnedChannelState.WORKER_DISCONNECTED, None)]
 
 
+def test_a_fatal_receiver_error_is_published_before_cleanup(channel, monkeypatch) -> None:
+    """受付スレッドの後片付けの間も `channel_dead` を答え、古い提案を返さない（Codex P1）。"""
+    running = channel()
+    worker, _ = connect(running, LearnedRole.MPC, MPC_UID)
+    try:
+        worker.send(envelope(failure_result()))
+        assert wait_until(lambda: running.mailbox.poll() is not None)
+        seen: list[Any] = []
+        closing = running.server._selector
+        assert closing is not None
+        original_close = closing.close
+
+        def close() -> None:
+            seen.append((running.mailbox.state(LearnedRole.MPC), running.mailbox.poll()))
+            original_close()
+
+        def boom(conn: Any) -> None:
+            raise RuntimeError("受付スレッドの不具合")
+
+        monkeypatch.setattr(closing, "close", close)
+        monkeypatch.setattr(running.server, "_on_readable", boom)
+        worker.send(envelope())
+        assert wait_until(lambda: not running.server.thread.is_alive())
+        assert seen == [(LearnedChannelState.CHANNEL_DEAD, None)]
+    finally:
+        worker.close()
+
+
 def test_heartbeats_keep_a_quiet_worker_without_touching_the_slot(channel) -> None:
     running = channel(heartbeat_ms=100, idle_ms=500)
     worker, _ = connect(running, LearnedRole.MPC, MPC_UID)

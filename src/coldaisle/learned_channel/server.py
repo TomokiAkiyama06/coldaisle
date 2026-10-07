@@ -282,7 +282,9 @@ class LearnedChannelServer:
             self._serve()
         except BaseException:
             # 受付スレッドの例外で coldaisle-fand を終わらせない。loop が毎 tick の確認で気づき、
-            # 再起動まで Learned を読まない（0077 §2.2。Max にはしない）
+            # 再起動まで Learned を読まない（0077 §2.2。Max にはしない）。**後片付けの前に**
+            # channel_dead を公開する（片付けの間の tick に古い提案を読ませない）
+            self._mailbox.receiver_failed()
             LOGGER.exception(
                 "Learned の経路の受付スレッドが止まった",
                 extra={logs.FIELDS_KEY: {"reason": "learned_channel_dead"}},

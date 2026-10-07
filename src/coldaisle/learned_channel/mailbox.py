@@ -34,6 +34,7 @@ class LearnedMailbox:
         self._outgoing: LearnedFrame | None = None
         self._receiver: threading.Thread | None = None
         self._stopping = False
+        self._failed = False
         self._wake_reader, self._wake_writer = socket.socketpair()
         self._wake_reader.setblocking(False)
         self._wake_writer.setblocking(False)
@@ -52,6 +53,17 @@ class LearnedMailbox:
     def mark_stopping(self) -> None:
         """`coldaisle-fand` 自身の停止の手順（死んだとは扱わない）。"""
         self._stopping = True
+
+    def receiver_failed(self) -> None:
+        """受付スレッドが致命的な例外で止まる。**後片付けの前に**呼ぶ（Codex P1）。
+
+        スレッドが生きている間の後片付けで、loop が `connected` を見て古い提案を読まないよう、
+        先に `channel_dead` を答えるようにしてから枠を空にする。
+        """
+        self._failed = True
+        with self._lock:
+            self._mpc = None
+            self._last_polled = None
 
     def connected(self, role: LearnedRole) -> None:
         """その役割の worker の接続を認めた。"""
@@ -106,6 +118,8 @@ class LearnedMailbox:
 
         停止の手順の途中は生きているとみなす。
         """
+        if self._failed:
+            return False
         if self._stopping:
             return True
         receiver = self._receiver
