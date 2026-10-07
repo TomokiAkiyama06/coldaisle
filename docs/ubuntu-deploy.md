@@ -614,7 +614,11 @@ CLI の書いた journal を読むと、走行中なら `SHADOW` へ下がり、
    # 制御設定のディレクトリと4ファイル。default ACL で、install で置き直したファイルにも付ける
    sudo setfacl -m g:coldaisle-authority:r-x /etc/coldaisle/control-config
    sudo setfacl -d -m g:coldaisle-authority:r-- /etc/coldaisle/control-config
-   sudo setfacl -m g:coldaisle-authority:r-- /etc/coldaisle/control-config/*.yaml
+   # 4ファイルは名前で指す。導入する人の shell は 0750 の /etc/coldaisle をたどれないので、
+   # `*.yaml` は sudo の前に展開されず、setfacl に文字のまま渡って失敗する
+   for f in fan-hardware.yaml safety.yaml fan-policy.yaml air-balance.yaml; do
+     sudo setfacl -m g:coldaisle-authority:r-- "/etc/coldaisle/control-config/$f"
+   done
    ```
 
    - 書き込みは誰にも足しません。root の所有のままなので、fand も承認者も `safety.yaml` を緩められません
@@ -690,14 +694,19 @@ CLI の書いた journal を読むと、走行中なら `SHADOW` へ下がり、
 8. **形を確かめます**
 
    ```bash
-   sudo getfacl /etc/coldaisle /etc/coldaisle/control-config /etc/coldaisle/control-config/*.yaml \
+   sudo getfacl /etc/coldaisle /etc/coldaisle/control-config \
+        /etc/coldaisle/control-config/{fan-hardware,safety,fan-policy,air-balance}.yaml \
         /var/lib/coldaisle-registry /var/lib/coldaisle-registry/.registry.lock
    sudo stat -c '%A %U:%G %n' /var/lib/coldaisle-registry /var/lib/coldaisle-registry/.registry.lock
    ```
 
    `group:coldaisle-authority` の行が手順 1・3・4 のとおりで、`mask::` が実効の権限を削っていないこと
-   （ファイルの `mask::r--`・ディレクトリの `mask::rwx` / `r-x`）。Registry の root は `drwxrws---+`・
-   `root:coldaisle-registry`、lock は `-rw-rw----+`・`root:coldaisle-registry` であること
+   （制御設定の4ファイルと Registry のデータのファイル（`registry.json`・`artifact.payload`）は `mask::r--`、
+   ディレクトリは `mask::rwx` / `r-x`、**`.registry.lock` は `mask::rw-`**）。lock の mask を `r--` に下げないで
+   ください。書き手は lock を `O_RDWR` で開くので、グループ `coldaisle-registry` の書き込みが削られると Registry の
+   書き込みがすべて lock を開くところで失敗します（承認者の `group:coldaisle-authority:r--` は mask に依らず `r`）。
+   Registry の root は `drwxrws---+`・`root:coldaisle-registry`、lock は `-rw-rw----+`・`root:coldaisle-registry`
+   であること
 
 9. **実機での確認**（0104 §2.9。段階 C。**人が行います**）。どれか1つでも期待と違えば `raise` は使いません
 
