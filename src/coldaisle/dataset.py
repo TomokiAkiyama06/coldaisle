@@ -77,7 +77,8 @@ from coldaisle.store.csv_export import TIMESTAMP_RESOLUTION_MS
 from coldaisle.store.export_binding import (
     ExportBinding,
     ExportBindingError,
-    read_production_records,
+    TrainingProduction,
+    read_training_production,
 )
 from coldaisle.store.models import ControlTraceRecord, SequencedControlTrace
 
@@ -578,6 +579,44 @@ def replay_binding_of(inputs: ReplayExportInputs) -> tuple[str | None, str | Non
     同じ関数）。
     """
     return replay_binding_of_records(inputs.records)
+
+
+_ALL_TRACES_END_MS = 2**62
+"""専用 DB の全 trace を読むときの期間の上端（``ts_ms`` の上限ではなく、全体を指すための値）。"""
+
+
+def check_production_traces(production: TrainingProduction, *, start_ms: int) -> None:
+    """本番の DB の trace から dataset を作れる期間か（決定記録 0112 §2.3 の 4 / 0116 §2.1）。
+
+    trace が保持期間で消えた期間（削除の境界が run の開始より後）と、移行前の行を含む期間は
+    ``ValueError``。``coldaisle-dataset`` の v2 と学習の入口が同じ関数を使う（0116 §2.2 の 3）。
+    """
+    if production.pruned_before_ms is not None and production.pruned_before_ms > start_ms:
+        raise ValueError(
+            "本番の DB の trace が run の期間で保持期間により消えている（決定記録 0112 §2.3 の 4）"
+        )
+    if any(trace.seq <= production.legacy_through_seq for trace in production.traces):
+        raise ValueError("移行前の ControlTick を含む期間からは作らない（0087 §2.1）")
+
+
+def copy_or_match_production_traces(
+    store: SqliteStore, traces: tuple[SequencedControlTrace, ...]
+) -> None:
+    """専用 DB の ControlTick を本番の DB の trace にそろえる（決定記録 0116 §2.1 / §2.2 の 1）。
+
+    trace の無い専用 DB へは ``seq`` を保って写す。既に trace があれば、全 trace が本番の trace と
+    ``seq``・時刻・``tick_id``・版・``trace_json`` と順序まで完全に一致するときだけそのまま使う。
+    1件でも違えば ``ValueError``（上書きも混ぜることもしない）。
+    """
+    existing = store.control_traces_in_seq_order(0, _ALL_TRACES_END_MS)
+    if not existing:
+        store.copy_control_traces(traces)
+        return
+    if existing != traces:
+        raise ValueError(
+            "専用 DB の ControlTick が本番の DB の trace と一致しない（決定記録 0116 §2.2 の 1）。"
+            "新しい専用 DB で再生し直す"
+        )
 
 
 def _validate_dedicated_source_db(store: SqliteStore, source_run: SourceRun) -> None:
@@ -1181,9 +1220,15 @@ def _main_v2(args: argparse.Namespace) -> int:
         }
     )
     try:
-        history, export_binding = read_production_records(
-            args.calibration_history_db, inputs.records
+        # 較正の記録・csv_exports の行・run の期間の trace を同じ read transaction で読む
+        # （決定記録 0100 §2.6 / 0116 §2.1）
+        production = read_training_production(
+            args.calibration_history_db,
+            inputs.records,
+            start_ms=source_run.start_ms,
+            end_ms=source_run.end_ms,
         )
+        check_production_traces(production, start_ms=source_run.start_ms)
     except CalibrationHistoryError as error:
         LOGGER.error(
             "較正の変更の記録を読めない（dataset を作らない）",
@@ -1196,15 +1241,24 @@ def _main_v2(args: argparse.Namespace) -> int:
             extra={logs.FIELDS_KEY: {"reason": str(error)}},
         )
         return 1
+    except ValueError as error:
+        LOGGER.error(
+            "本番の DB の trace から作れない期間（dataset を作らない）",
+            extra={logs.FIELDS_KEY: {"reason": str(error)}},
+        )
+        return 1
+    history = production.history
     rules = QualityRules.from_yaml(args.quality_config)
     try:
         with SqliteStore(args.db, rules=rules, clock=WallClock()) as store:
+            # ControlTick の出どころは本番の DB の trace（決定記録 0116 §2.1）
+            copy_or_match_production_traces(store, production.traces)
             dataset = ThermalDatasetV2Builder(store).build(
                 source_run=source_run,
                 spec=spec,
                 declared_changes=declared.changes,
                 calibration_history=history,
-                export_binding=export_binding,
+                export_binding=production.binding,
             )
     except ValueError as error:
         LOGGER.error(

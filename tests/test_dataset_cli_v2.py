@@ -11,10 +11,13 @@ from pathlib import Path
 import pytest
 
 import coldaisle.dataset as dataset_module
+from coldaisle.clock import SimulatedClock
+from coldaisle.control import ControlTraceLogger
 from coldaisle.control.drift.model import MAX_DECLARED_CHANGES, ChangeKind, DeclaredChange
 from coldaisle.declared_changes import DeclaredChangesError, read_declared_changes
 from coldaisle.drift import DriftEvidenceManifest
 from coldaisle.ingest.replay import ReplayExportInputs
+from coldaisle.store import QualityRules, SqliteStore
 from conftest import QUALITY_RULES_PATH, add_fixture_exports, fixture_export_record
 from test_thermal_dataset_v2 import (
     ALIGNED,
@@ -26,6 +29,7 @@ from test_thermal_dataset_v2 import (
     T0,
     history_db,
     run_store,
+    tick,
 )
 
 END_MS = 7_501
@@ -200,6 +204,16 @@ def test_drift_evidence_shares_the_item_shape():
 # ---------------------------------------------------------------- CLI（0109 §5 #6 / §7）
 
 
+def add_production_traces(path: Path) -> None:
+    """本番の DB の代わりに、専用 DB（``run_store``）と同じ trace を同じ順で記録する（0116）。"""
+    with SqliteStore(
+        path, rules=QualityRules.from_yaml(QUALITY_RULES_PATH), clock=SimulatedClock(0)
+    ) as store:
+        logger = ControlTraceLogger(store)
+        for item in ALIGNED:
+            logger.record(tick(*item).model_copy(update={"ts_ms": T0 + item[0]}))
+
+
 @pytest.fixture
 def cli_env(tmp_path, rules, clock, monkeypatch):
     """専用 DB・本番の DB（記録）・宣言のファイル・出力先を用意する。"""
@@ -208,6 +222,7 @@ def cli_env(tmp_path, rules, clock, monkeypatch):
         pass
     history = history_db(tmp_path / "history.db", COVERING_ROW_MS)
     add_fixture_exports(history)
+    add_production_traces(history)
     replay = tmp_path / "replay"
     replay.mkdir()
     # 専用 DB は試験の fixture が仮の fingerprint と仮の export の束縛で bind している
@@ -369,7 +384,7 @@ def test_invalid_declaration_is_refused_before_opening_any_db(cli_env, tmp_path,
     def must_not_open(*args: object, **kwargs: object) -> None:
         raise AssertionError("宣言の検証より前に DB を開いた")
 
-    monkeypatch.setattr(dataset_module, "read_production_records", must_not_open)
+    monkeypatch.setattr(dataset_module, "read_training_production", must_not_open)
     monkeypatch.setattr(dataset_module, "SqliteStore", must_not_open)
     assert dataset_module.main(v2_args(cli_env, declared_changes=str(bad))) == 1
     assert not (cli_env["out"] / ARTIFACT_ONE).exists()
@@ -390,6 +405,7 @@ def test_declared_calibration_change_in_the_period_refuses_generation(cli_env, t
 def test_recorded_change_is_reported_as_a_record(cli_env, tmp_path, capsys):
     history = history_db(tmp_path / "changed.db", COVERING_ROW_MS, T0 + 3_000)
     add_fixture_exports(history)
+    add_production_traces(history)
     assert dataset_module.main(v2_args(cli_env, calibration_history_db=str(history))) == 1
     refused = [line for line in log_lines(capsys.readouterr().err) if "拒否" in line["msg"]]
     assert refused and "記録の行" in str(refused[0]["reason"])
