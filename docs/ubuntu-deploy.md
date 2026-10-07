@@ -701,6 +701,15 @@ CLI の書いた journal を読むと、走行中なら `SHADOW` へ下がり、
 
 9. **実機での確認**（0104 §2.9。段階 C。**人が行います**）。どれか1つでも期待と違えば `raise` は使いません
 
+   **役割ごとの確認は、その役割のグループだけを持つアカウントで行います。** 同じ人が `coldaisle-authority` と
+   `coldaisle-registry` を兼ねる（上の表の下の注記で認めている）アカウントでは、2 の「書けない」と 3 の
+   「authority のディレクトリへ書けない」は成り立ちません（もう一方のグループの権限で書けるため）。兼任の
+   アカウントしか無い導入先では、確認のためだけの一時アカウントを役割ごとに作り（`useradd --system
+   --no-create-home --shell /usr/sbin/nologin`。それぞれ片方のグループにだけ入れる）、`sudo -u <一時アカウント>`
+   で 2 と 3 を実行し、確認の後に `userdel` で消します。この `sudo -u` は権限の形を確かめるためだけで、
+   本物の `raise` や Registry への書き込みには使いません（承認者は自分の uid で実行する。0086 §2.1）。
+   3 の書き込み（`register`）は、一時アカウントではなく実際の書き手の uid で行います
+
    1. 手順 8 の `getfacl` の形が期待どおりであること
    2. **承認者の uid で**（ログインし直し、`id -nG` に `coldaisle-authority` が出てから。`sudo` を使わない）
       - 読める: `cat /etc/coldaisle/control-config/*.yaml > /dev/null`、
