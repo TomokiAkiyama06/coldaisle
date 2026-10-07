@@ -138,3 +138,31 @@ versioned derived-target契約が必要である。
 - workload regime別・室温帯別評価
 - window / horizon / feature・target / ridge lambdaとmodel familyの比較
 - action trajectoryを含むcounterfactual契約、Confidence / OOD、MPC、Registry shadow評価
+
+## 反実仮想 artifact v2（決定記録 0079 段 2 / 0084）
+
+Thermal Dataset v2（#83 / 決定記録 0087）の action 列を使い、候補の Fan action 列に対する予測を
+申告する artifact v2（`coldaisle.thermal_model` v2、capability `counterfactual_action`）を足した。
+v1 artifact は変えず、v1 を v2 として読み替えない。
+
+- **形式**: feature schema `thermal-features-v2`（v1 の列 + 計画 action の列 `plan[k].<zone>`）・
+  target schema `thermal-targets-v1`（`dataset_schema_version` 2）・action schema `thermal-actions-v1`
+  （`step_ms`・step 数・zone の順・単位・`action_source = effective_demand`）。manifest は学習データの
+  時間窓・action の変化の件数・`metric_binding`（単位と派生値の定義。表示名は含めない）・
+  `calibration_binding`・`anchor_action_rule = hold_effective`・`payload_sha256`・
+  `confidence_profile_sha256` を持つ
+- **trainer**（`train_counterfactual_ridge`）: train だけから、記録した action 列で当てはめる。
+  horizon `h` の head は `k × step_ms < h` の step の列だけで当てはめ、それ以外の係数を厳密に 0 にする
+  （因果の mask）。window・horizon・格子・ridge lambda・authority の互換・較正の digest に既定値は無い
+- **Profile v2 の同梱**: trainer の結果（`CounterfactualTrainedModel`）は Profile v2 を含まない。
+  `assemble_counterfactual_artifact(trained, profile)` が両者を1つの artifact に封じ、読み込み時と同じ
+  検査を作成時にも行う。Profile v2 を train / validation から作る処理は段 3（#85）
+- **読み込み**（`RegistryCounterfactualThermalModel.from_verified_artifact`）: Registry が発行した
+  `VerifiedArtifact` だけを受け取り、L1〜L12 を順に検査する。外れたら
+  `CounterfactualArtifactRejectedError`（`check` に番号）。runtime の `MetricCatalog` と較正の digest は
+  呼び出し側が明示する
+- **anchor 推論**（`predict`）: 計画 action の列は `hold_effective`（いま掛かっている effective demand を
+  全 step で保つ）。`predict_trajectory` は action schema の格子と完全に一致する列だけを予測する
+
+MPC への束縛（`MpcModelBinding`・`PlanPrediction`・§2.5 の探索範囲の写し）は段 4（#86）、
+runtime contract の例と `docs/model-registry.md` の更新は段 5（#104）で行う。
