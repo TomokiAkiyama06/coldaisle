@@ -617,6 +617,31 @@ def test_a_disconnect_empties_the_slot_at_once(channel) -> None:
     assert running.mailbox.poll() is None
 
 
+def test_the_disconnect_is_published_before_the_socket_is_torn_down(channel) -> None:
+    """後片付けの間に回った tick が `connected` を見て古い提案を読まない（Codex P1）。"""
+    running = channel()
+    running.server.request_stop()
+    running.server.join(timeout_s=WAIT_S)
+    running.mailbox.mark_stopping()
+    running.mailbox.connected(LearnedRole.MPC)
+    running.mailbox.place_mpc(failure_result())
+    seen: list[Any] = []
+
+    class Sock:
+        def close(self) -> None:
+            seen.append((running.mailbox.state(LearnedRole.MPC), running.mailbox.poll()))
+
+    conn = learned_server._Connection(
+        role=LearnedRole.MPC,
+        sock=Sock(),
+        uid=MPC_UID,
+        last_valid_mono_ms=0,  # type: ignore[arg-type]
+    )
+    running.server._connections[LearnedRole.MPC] = conn
+    running.server._disconnect(conn, LearnedChannelState.WORKER_DISCONNECTED, "eof")
+    assert seen == [(LearnedChannelState.WORKER_DISCONNECTED, None)]
+
+
 def test_heartbeats_keep_a_quiet_worker_without_touching_the_slot(channel) -> None:
     running = channel(heartbeat_ms=100, idle_ms=500)
     worker, _ = connect(running, LearnedRole.MPC, MPC_UID)

@@ -435,7 +435,12 @@ class LearnedChannelServer:
                 self._disconnect(conn, LearnedChannelState.WORKER_IDLE, "idle")
 
     def _disconnect(self, conn: _Connection, state: LearnedChannelState, reason: str) -> None:
-        """接続を閉じ、**その時点で**受け渡し口を空にする（0077 §2.5）。"""
+        """接続を閉じ、**その時点で**受け渡し口を空にする（0077 §2.5）。
+
+        **状態の変更と受け渡し口の消去を先に行う。** ソケットの後片付けの間に回った tick が
+        `connected` を見て古い提案を読まないため。
+        """
+        self._mailbox.disconnected(conn.role, state)
         if self._connections.get(conn.role) is conn:
             del self._connections[conn.role]
         if self._selector is not None:
@@ -443,7 +448,6 @@ class LearnedChannelServer:
                 self._selector.unregister(conn.sock)
         with contextlib.suppress(OSError):
             conn.sock.close()
-        self._mailbox.disconnected(conn.role, state)
         self._log_connection(conn.role, conn.uid, "closed", reason)
 
     # ---------------------------------------------------------------- 送信
