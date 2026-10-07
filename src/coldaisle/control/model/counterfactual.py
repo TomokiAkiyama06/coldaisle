@@ -30,6 +30,11 @@ from typing import Literal, Self
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 
+from coldaisle.control.model.calibration_digest import (
+    RuntimeCalibration,
+    calibrated_metrics,
+    calibration_digest,
+)
 from coldaisle.control.model.confidence import (
     FAN_SOURCE_PREFIX,
     MAX_MISSING_PATTERNS,
@@ -298,8 +303,10 @@ class MetricBinding(_Frozen):
 class CalibrationBinding(_Frozen):
     """学習データに効いていた較正値のうち、使った metric に関わるものの digest。
 
-    較正を使わない metric だけなら ``None``。store は較正の出どころを記録しないので、
-    値は dataset を作る側が明示して渡す（0079 §2.3。既定値を置かない）。
+    意味は ``calibration-digest-v1``（決定記録 0096）。較正の掛かる metric を使わなければ ``None``。
+    store は較正の出どころを記録しないので、呼び出し側は**較正の値**を明示して trainer へ渡し、
+    digest は trainer と loader が同じ関数（:func:`calibration_digest`）で計算する
+    （0079 §2.3 を 0096 §2.6 で部分的に置き換えた。既定値を置かない）。
     """
 
     sha256: Sha256 | None
@@ -712,20 +719,25 @@ def check_artifact_contents(
     artifact: CounterfactualThermalModelArtifact,
     *,
     metric_catalog: MetricCatalog | None,
-    calibration_sha256: str | None,
+    calibration: RuntimeCalibration | None,
     check_calibration: bool,
 ) -> None:
     """L6〜L12 を順に検査する。作成時と読み込み時で**同じ関数**を使う（0084 §2.3）。
 
     ``metric_catalog`` が ``None`` のときは L8 の (3)（runtime の catalog との照合）を飛ばし、
     ``check_calibration`` が偽のときは L9 を飛ばす。どちらも作成時だけの使い方で、
-    読み込み時は必ず両方を渡す。
+    読み込み時は必ず両方を渡す（``check_calibration`` が真なら ``calibration`` は必須）。
     """
+    runtime: RuntimeCalibration | None = None
+    if check_calibration:
+        if not isinstance(calibration, RuntimeCalibration):
+            raise TypeError("L9 には runtime の較正（RuntimeCalibration）を渡す")
+        runtime = calibration
     _check_digests(artifact)
     _check_profile_binding(artifact)
     _check_metric_binding(artifact, metric_catalog)
-    if check_calibration:
-        _check_calibration(artifact, calibration_sha256)
+    if runtime is not None:
+        _check_calibration(artifact, runtime)
     _check_causal_mask(artifact)
     _check_anchor_action_rule(artifact)
     _check_profile_steps(artifact)
@@ -877,9 +889,39 @@ def _check_metric_binding(
 
 
 def _check_calibration(
-    artifact: CounterfactualThermalModelArtifact, calibration_sha256: str | None
+    artifact: CounterfactualThermalModelArtifact, calibration: RuntimeCalibration
 ) -> None:
-    if artifact.manifest.calibration_binding.sha256 != calibration_sha256:
+    """L9（0096 §2.4 / §2.6）。L8 の後に artifact の ``metric_binding`` から計算して照合する。
+
+    ``null`` は manifest の申告だけで信じない。先に較正の掛かる metric の集合を導き、
+    ``null`` / 非 ``null`` がそれと合うかを見る。runtime の較正を読めなかったときは、
+    集合が空の artifact だけを通し、空でなければ digest を比べずに拒否する（0096 §5 #8）。
+    """
+    entries = artifact.manifest.metric_binding.entries
+    declared = artifact.manifest.calibration_binding.sha256
+    try:
+        metrics = calibrated_metrics(entries)
+    except ValueError as error:
+        raise CounterfactualArtifactRejectedError(ArtifactCheck.CALIBRATION, str(error)) from error
+    if not metrics:
+        if declared is not None:
+            raise CounterfactualArtifactRejectedError(
+                ArtifactCheck.CALIBRATION,
+                "較正の掛かる metric を使わないのに calibration_binding が null でない",
+            )
+        return
+    if declared is None:
+        raise CounterfactualArtifactRejectedError(
+            ArtifactCheck.CALIBRATION,
+            f"較正の掛かる metric を使うのに calibration_binding が null である: {sorted(metrics)}",
+        )
+    if calibration.offsets_c is None:
+        raise CounterfactualArtifactRejectedError(
+            ArtifactCheck.CALIBRATION,
+            "runtime の較正を読めなかったので、較正の掛かる metric を使う artifact を使わない"
+            f"（{calibration.unavailable_reason}）",
+        )
+    if calibration_digest(entries, calibration.offsets_c) != declared:
         # 不一致は拒否して Fallback（0079 §6 の質問 4）
         raise CounterfactualArtifactRejectedError(
             ArtifactCheck.CALIBRATION, "較正の digest が runtime の較正と一致しない"
@@ -1013,7 +1055,7 @@ def canonical_counterfactual_artifact_bytes(artifact: CounterfactualThermalModel
     """
     artifact = CounterfactualThermalModelArtifact.model_validate(artifact.model_dump(mode="python"))
     check_artifact_contents(
-        artifact, metric_catalog=None, calibration_sha256=None, check_calibration=False
+        artifact, metric_catalog=None, calibration=None, check_calibration=False
     )
     encoded = canonical_json_bytes(artifact)
     if len(encoded) > MAX_ARTIFACT_BYTES:
@@ -1176,18 +1218,19 @@ class RegistryCounterfactualThermalModel:
         verified: VerifiedArtifact,
         *,
         metric_catalog: MetricCatalog,
-        calibration_sha256: str | None,
+        calibration: RuntimeCalibration,
     ) -> RegistryCounterfactualThermalModel:
         """``VerifiedArtifact`` を L1〜L12 の順に検査し、すべて通ったときだけ型を作る。
 
-        ``metric_catalog`` は runtime の ``config/metrics.yaml``、``calibration_sha256`` は
-        runtime の較正の digest（使った metric に関わる値。
-        較正を使わなければ ``None``）。
+        ``metric_catalog`` は runtime の ``config/metrics.yaml``、``calibration`` は runtime の較正
+        （起動時に1回だけ読んだ値。読めなければ :meth:`RuntimeCalibration.unavailable`）。
+        L9 は artifact の ``metric_binding`` とこの値から digest を計算して照合する
+        （決定記録 0096）。
         どちらも既定値を持たない。外れたら
         :class:`CounterfactualArtifactRejectedError`（``check`` に番号）。
         """
         artifact, digest = _load_checked(
-            verified, metric_catalog=metric_catalog, calibration_sha256=calibration_sha256
+            verified, metric_catalog=metric_catalog, calibration=calibration
         )
         model = object.__new__(cls)
         object.__setattr__(model, "_artifact", artifact)
@@ -1266,7 +1309,7 @@ def _load_checked(
     verified: VerifiedArtifact,
     *,
     metric_catalog: MetricCatalog,
-    calibration_sha256: str | None,
+    calibration: RuntimeCalibration,
 ) -> tuple[CounterfactualThermalModelArtifact, str]:
     # L1: Registry の検証経路が発行した VerifiedArtifact と attestation
     if type(verified) is not VerifiedArtifact:
@@ -1374,7 +1417,7 @@ def _load_checked(
     check_artifact_contents(
         artifact,
         metric_catalog=metric_catalog,
-        calibration_sha256=calibration_sha256,
+        calibration=calibration,
         check_calibration=True,
     )
     return artifact, digest

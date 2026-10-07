@@ -1,5 +1,10 @@
 """Learned Thermal Model のdataset、artifact、読み取り専用推論契約と Confidence / OOD。"""
 
+from coldaisle.control.model.calibration_digest import (
+    RuntimeCalibration,
+    calibrated_metrics,
+    calibration_digest,
+)
 from coldaisle.control.model.confidence import (
     CONFIDENCE_PROFILE_SCHEMA_VERSION,
     ComponentResult,
@@ -160,6 +165,7 @@ __all__ = [
     "RidgeOutput",
     "RidgeThermalModel",
     "RidgeTrainingSpec",
+    "RuntimeCalibration",
     "SourceRun",
     "StepSupportChecker",
     "StepSupportViolation",
@@ -181,6 +187,8 @@ __all__ = [
     "VerifiedTrainingDatasetArtifactV2",
     "WindowFrame",
     "assemble_counterfactual_artifact",
+    "calibrated_metrics",
+    "calibration_digest",
     "canonical_artifact_bytes",
     "canonical_counterfactual_artifact_bytes",
     "counterfactual_registry_metadata",

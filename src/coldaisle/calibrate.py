@@ -166,6 +166,14 @@ def check(result: Result, policy: CalibrationPolicy) -> list[str]:
     return problems
 
 
+RESTART_ORDER = (
+    "**取り込みより先に `coldaisle-fand` を再起動し、そのあと取り込みを再起動してください。**"
+    "（fand が新しい較正の値で artifact を照合し直してから、新しい較正の値を store に入れる。"
+    "決定記録 0096 §2.7）"
+)
+"""`--apply` の後の再起動の順（決定記録 0096 §5 #9）。"""
+
+
 NOTE = (
     "較正オフセット（FR-107 / #13）。`coldaisle-calibrate` が算出。"
     "手順は docs/calibration.md。値を手で変えたら決定記録に残すこと"
@@ -331,7 +339,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             }
         },
     )
-    print(f"\n{args.calibration} を更新しました。**取り込みを再起動してください。**")  # noqa: T201
+    # **取り込みより先に fand を再起動する**（決定記録 0096 §2.7 / §5 #9）。fand は較正を
+    # 起動時にしか読まず、L9 も起動時にしか働かない。取り込みだけを再起動すると、fand は
+    # 古い較正で照合済みの artifact のまま、新しい較正の値を読み続ける
+    print(f"\n{args.calibration} を更新しました。")  # noqa: T201
+    print(RESTART_ORDER)  # noqa: T201
     return 0
 
 

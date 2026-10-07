@@ -241,6 +241,7 @@ git worktree list
 src/coldaisle/
   clock.py    # レイヤ横断: 時刻ソース（WallClock / SimulatedClock）。#42
   channels.py # レイヤ横断: チャネル名とメトリクス名の対応。#10
+  calibration_offsets.py # レイヤ横断: 較正を当てる metric の判定と実効の offset の写像（Normalizer と較正の digest が共有）。決定記録 0096
   metrics.py  # レイヤ横断: 単位・表示名・派生値の定義。#9
   daemon.py   # 合成の起点: Source→Normalizer→Store→Rules を束ねる。#8 / #18
   ingest/     # L0: Source実装（serial / mock / replay）、正規化
