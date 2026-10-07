@@ -29,6 +29,7 @@ Type=notify
 NotifyAccess=main
 
 # fand 専用のユーザー（仮の値）。coldaisle（API / 取り込み）とも root とも分ける（0080 §2.1 / 0072 §2.5）。
+# **Learned worker のグループ（coldaisle-learn-*）には入れない**（0077 §2.7 の重なりの検査で経路が開かなくなる。0115 §2.1）。
 # coldaisle: DB を読み書きし /etc/coldaisle を読む。coldaisle-admin: 管理ソケットのグループ
 # （/etc/coldaisle/control-admin.yaml の socket.group と同じ名前にする）。
 # coldaisle-authority: 昇格・rollback を行う人のグループ（仮の値）。人が CLI で書いた 0660 の
@@ -43,7 +44,16 @@ WorkingDirectory=/opt/coldaisle
 # 実行ファイルは導入先の venv の絶対パスで書く（素の名前は systemd の探索パスに無い）。
 # 制御の4ファイルと管理ソケットの設定は root 所有の場所に置き、fand 自身が safety.yaml を緩められないようにする。
 # --authority-root は承認者のグループと共有する専用のディレクトリ（決定記録 0086 §2.2。下の ReadWritePaths=）
-ExecStart=/opt/coldaisle/.venv/bin/coldaisle-fand --require-watchdog --config-dir /etc/coldaisle/control-config --admin-config /etc/coldaisle/control-admin.yaml --db /var/lib/coldaisle/coldaisle.db --authority-root /var/lib/coldaisle-authority
+# Learned と較正の3つは常に渡す（決定記録 0115 §2.3）。**どれも失敗は安全側**で、読めなければ Learned を
+# 使わないだけで冷却の制御は止まらない。
+#   --calibration: 取り込みと同じ較正ファイル（0101 §2.6 (b)。WorkingDirectory の既定 config/calibration.json と同じ）
+#   --registry-root: Model Registry（0077 §2.6 / 0104 §2.3。補助グループ coldaisle-authority の ACL で読む。書かない）
+#   --learned-channel-config: Learned worker の経路（0077 §2.7。ソケットは deploy/tmpfiles.d/coldaisle-learned.conf
+#     が作る /run/coldaisle/learned-* の下。fand を worker のグループに入れない。0115 §2.2）
+# --t-sensor-metric は入れない。導入先の safety.yaml で telemetry.t_sensor を有効にしたときだけ、
+# 置いた unit の ExecStart= の末尾に「--t-sensor-metric board.connector_12v2x6」を足す（決定記録 0110 §2.8。
+# safety.yaml と食い違うと起動時に拒否される）
+ExecStart=/opt/coldaisle/.venv/bin/coldaisle-fand --require-watchdog --config-dir /etc/coldaisle/control-config --admin-config /etc/coldaisle/control-admin.yaml --db /var/lib/coldaisle/coldaisle.db --authority-root /var/lib/coldaisle-authority --calibration /opt/coldaisle/config/calibration.json --registry-root /var/lib/coldaisle-registry --learned-channel-config /etc/coldaisle/learned-channel.yaml
 
 # 異常終了・watchdog・SIGKILL の後に root・sandbox なしで Max を書く引き継ぎ実行部（0028 §2.7 / 0080 §2.5）。
 # venv と coldaisle パッケージに依存しないよう、システムの python3 でソースを直接、引数なしで実行する。
@@ -76,7 +86,9 @@ RestartSec=2
 # safety.yaml の食い違い）。どちらも人が直すまで結果が変わらない。**他の終了コードは入れない**（0080 §2.4）
 RestartPreventExitStatus=3 4
 
-# 引き継ぎ記録（/run/coldaisle/fan-handoff.json）と管理ソケットの置き場所。
+# 引き継ぎ記録（/run/coldaisle/fan-handoff.json）と管理ソケットと Learned worker のソケットの置き場所。
+# Learned の役割ごとのディレクトリは tmpfiles.d が作る（0115 §2.2）。その /run/coldaisle の行は
+# ここの User= / Group= / RuntimeDirectoryMode= と同じ値にする（食い違うと systemd が中身ごと付け替える）。
 # **/run/coldaisle を RuntimeDirectory に持つのはこの unit だけ**（0080 §2.7）。
 # 0711: 管理ソケットのグループは other の x でたどれ、一覧は見せない。
 # Preserve=yes: 記録を消すのは fand の正常停止だけ（systemd の後片付けに任せない）

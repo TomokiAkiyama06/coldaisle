@@ -9,6 +9,7 @@
 5. DB を共有する unit の `StateDirectoryMode` と `UMask` がそろっていること（0080 §2.1）
 6. authority の journal を承認者のグループと共有する専用のディレクトリ
    （決定記録 0086 §2.2。段階 3c）
+7. Learned worker の unit と `tmpfiles.d`、fand の Learned・較正の引数（決定記録 0115。0077 段階 6）
 """
 
 import re
@@ -23,6 +24,7 @@ from coldaisle.safety_handoff import HANDOFF_RECORD_PATH
 ROOT = Path(__file__).resolve().parents[1]
 SYSTEMD = ROOT / "deploy" / "systemd"
 UDEV = ROOT / "deploy" / "udev"
+TMPFILES = ROOT / "deploy" / "tmpfiles.d" / "coldaisle-learned.conf"
 
 SERVICES = ("coldaisle-daemon", "coldaisle-api")
 """常駐するもの。**落ちたら戻す**（NFR-01）。"""
@@ -41,6 +43,9 @@ fand と承認者のグループが共有する。
 
 AUTHORITY_GROUP = "coldaisle-authority"
 """昇格・rollback を行う人のグループ（決定記録 0086 §2.2。**仮の値**）。"""
+
+WORKERS = {"mpc": "coldaisle-learnd-mpc", "supervisor": "coldaisle-learnd-supervisor"}
+"""Learned worker の unit（決定記録 0115 §2.1）。`--role` の値 → unit の名前。"""
 
 DB_UNITS = (*SERVICES, *JOBS)
 """`StateDirectory=coldaisle` を持ち、`/var/lib/coldaisle` の mode を決める unit（0080 §2.1）。"""
@@ -92,7 +97,7 @@ def unit_files() -> list[Path]:
 
 def test_the_expected_units_exist():
     names = {path.name for path in unit_files()}
-    expected = {f"{name}.service" for name in (*SERVICES, *JOBS, FAND)}
+    expected = {f"{name}.service" for name in (*SERVICES, *JOBS, FAND, *WORKERS.values())}
     expected |= {f"{name}.timer" for name in JOBS}
     assert names == expected
 
@@ -476,3 +481,232 @@ def test_the_hwmon_rule_carries_placeholders_only():
     for rule in udev_rules(HWMON_RULES):
         assert re.findall(r'ATTR\{name\}=="([^"]*)"', rule) == ["REPLACE-WITH-DRIVER-NAME"]
         assert set(re.findall(r"/sys%p/(pwm\w+)", rule)) == {"pwmN", "pwmN_enable"}
+
+
+# ---------------------------------------------------------------- Learned worker（決定記録 0115）
+
+
+def worker(role: str) -> dict[str, dict[str, list[str]]]:
+    return parse_unit(SYSTEMD / f"{WORKERS[role]}.service")
+
+
+def learned_channel() -> dict:
+    return yaml.safe_load((ROOT / "config" / "learned-channel.yaml").read_text(encoding="utf-8"))
+
+
+def option(exec_start: list[str], name: str) -> str:
+    assert exec_start.count(name) == 1, f"{name} がちょうど1回ない"
+    return exec_start[exec_start.index(name) + 1]
+
+
+@pytest.mark.parametrize("role", WORKERS)
+def test_worker_exec_start_points_at_the_learnd_entry_point(role):
+    exec_start = one(worker(role), "Service", "ExecStart").split()
+    assert exec_start[0] == "/opt/coldaisle/.venv/bin/coldaisle-learnd"
+    assert "coldaisle-learnd" in scripts()
+    assert option(exec_start, "--role") == role
+
+
+def test_the_two_worker_units_differ_only_in_role_identity():
+    """役割・ユーザー・グループ・説明・ログの名前以外は同じ（0115 §2.1）。
+
+    片方だけ直す取り違えを防ぐ。
+    """
+    mpc, rl = worker("mpc"), worker("supervisor")
+    identity = {("Service", "User"), ("Service", "Group"), ("Unit", "Description")}
+    identity |= {("Service", "SyslogIdentifier"), ("Service", "ExecStart")}
+    assert mpc.keys() == rl.keys()
+    for section in mpc:
+        assert mpc[section].keys() == rl[section].keys()
+        for key in mpc[section]:
+            if (section, key) not in identity:
+                assert mpc[section][key] == rl[section][key], f"{section}.{key}"
+    a = one(mpc, "Service", "ExecStart").replace("--role mpc", "--role supervisor")
+    assert a == one(rl, "Service", "ExecStart")
+
+
+@pytest.mark.parametrize("role", WORKERS)
+def test_worker_runs_as_the_role_group_of_the_learned_channel(role):
+    """主グループが役割のグループ（受付はアカウントの所属で認可する。0077 §2.7 / 0115 §2.1）。"""
+    unit = worker(role)
+    group = learned_channel()["sockets"][role]["group"]
+    assert one(unit, "Service", "User") == group
+    assert one(unit, "Service", "Group") == group
+    assert group not in {"coldaisle", "root", "0", one(fand(), "Service", "Group")}
+    assert "SupplementaryGroups" not in unit["Service"]
+
+
+def test_worker_groups_are_disjoint_and_fand_is_in_neither():
+    """fand を worker のグループに入れると、重なりの検査で経路が開かない（0115 §1 の 1）。"""
+    groups = {learned_channel()["sockets"][role]["group"] for role in WORKERS}
+    assert len(groups) == 2
+    users = {one(worker(role), "Service", "User") for role in WORKERS}
+    assert len(users) == 2
+    fand_groups = {
+        one(fand(), "Service", "Group"),
+        *words(fand(), "Service", "SupplementaryGroups"),
+    }
+    assert not groups & fand_groups
+    assert one(fand(), "Service", "User") not in users
+
+
+@pytest.mark.parametrize("role", WORKERS)
+def test_worker_reads_the_same_inputs_as_fand(role):
+    """frame の config / metric_catalog_sha256 の照合が外れない（0107 §2.6 / 0115 §2.4）。"""
+    unit = worker(role)
+    exec_start = one(unit, "Service", "ExecStart").split()
+    fand_exec = one(fand(), "Service", "ExecStart").split()
+    for name in ("--config-dir", "--registry-root", "--learned-channel-config"):
+        assert option(exec_start, name) == option(fand_exec, name)
+    assert one(unit, "Service", "WorkingDirectory") == one(fand(), "Service", "WorkingDirectory")
+    # 既定（作業ディレクトリ基準）を fand と共有する。fand も渡していない
+    for name in ("--metrics", "--registry-limits"):
+        assert name not in exec_start
+        assert name not in fand_exec
+    # 較正は frame で受け取る（0101 §2.1）
+    assert "--calibration" not in exec_start
+
+
+@pytest.mark.parametrize("role", WORKERS)
+def test_worker_restarts_except_for_an_unsupported_role(role):
+    """3（接続が切れた）は通常の経路、5 は一時的な失敗も含む。止めるのは 2 だけ（0115 §2.5）。"""
+    from coldaisle.learned_worker import cli
+
+    unit = worker(role)
+    assert one(unit, "Service", "Type") == "simple"
+    assert one(unit, "Service", "Restart") == "on-failure"
+    assert one(unit, "Unit", "StartLimitIntervalSec") == "0"
+    assert words(unit, "Service", "RestartPreventExitStatus") == [str(cli.EXIT_ROLE_NOT_SUPPORTED)]
+    assert cli.EXIT_CHANNEL_CLOSED != cli.EXIT_ROLE_NOT_SUPPORTED
+    assert cli.EXIT_STARTUP != cli.EXIT_ROLE_NOT_SUPPORTED
+    assert float(one(unit, "Service", "RestartSec")) > 0
+    assert one(unit, "Install", "WantedBy") == "multi-user.target"
+
+
+@pytest.mark.parametrize("role", WORKERS)
+def test_worker_does_not_pull_in_fand_and_fand_does_not_reference_workers(role):
+    """worker の起動で Fan 制御を引き起こさない（0077 §2.1 / 0115 §2.5）。
+
+    fand も worker に依存しない。
+    """
+    unit = worker(role)
+    for key in ("Wants", "Requires", "BindsTo", "PartOf", "Requisite"):
+        assert key not in unit["Unit"], f"{key}= を使わない"
+    assert words(unit, "Unit", "After") == [f"{FAND}.service"]
+    fand_text = (SYSTEMD / f"{FAND}.service").read_text(encoding="utf-8")
+    for name in WORKERS.values():
+        assert name not in fand_text
+
+
+@pytest.mark.parametrize("role", WORKERS)
+def test_worker_cannot_reach_hardware_network_or_shared_state(role):
+    """hwmon・シリアル・TCP・DB・authority に届かない（ルール 1・2・6、0115 §2.7）。"""
+    service = worker(role)["Service"]
+    assert service["ProtectKernelTunables"] == ["yes"]
+    assert service["ProtectSystem"] == ["strict"]
+    assert service["PrivateDevices"] == ["yes"]
+    assert service["PrivateNetwork"] == ["yes"]
+    assert service["RestrictAddressFamilies"] == ["AF_UNIX"]
+    assert service["IPAddressDeny"] == ["any"]
+    assert service["CapabilityBoundingSet"] == [""]
+    assert service["AmbientCapabilities"] == [""]
+    assert service["NoNewPrivileges"] == ["yes"]
+    assert "NotifyAccess" not in service
+    for key in ("ReadWritePaths", "RuntimeDirectory", "StateDirectory", "ExecStopPost"):
+        assert key not in service, f"{key}= を持たない"
+    inaccessible = words(worker(role), "Service", "InaccessiblePaths")
+    for path in ("/var/lib/coldaisle", AUTHORITY_DIR):
+        assert f"-{path}" in inaccessible
+
+
+@pytest.mark.parametrize("role", WORKERS)
+def test_worker_states_its_resource_limits(role):
+    """片方の暴走でもう片方と fand を巻き込まない（0077 §2.1。値は暫定。0115 §2.6）。"""
+    service = worker(role)["Service"]
+    for key in ("MemoryMax", "TasksMax", "CPUWeight", "IOWeight", "Nice", "OOMScoreAdjust"):
+        assert len(service.get(key, [])) == 1, f"{key} を明示する"
+    assert int(one(worker(role), "Service", "CPUWeight")) < 100  # fand（既定 100）より低い
+    assert int(one(worker(role), "Service", "OOMScoreAdjust")) > 0
+
+
+# ---------------------------------------------------------------- tmpfiles.d（決定記録 0115 §2.2）
+
+
+def tmpfiles_lines() -> dict[str, list[str]]:
+    lines: dict[str, list[str]] = {}
+    for raw in TMPFILES.read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        fields = line.split()
+        assert len(fields) == 6, f"読めない行: {line}"
+        assert fields[0] == "d"
+        assert fields[1] not in lines
+        lines[fields[1]] = fields[2:]
+    return lines
+
+
+def test_tmpfiles_declares_the_runtime_directory_exactly_as_fand_owns_it():
+    """食い違うと systemd が `RuntimeDirectory=` の中身ごと所有者を付け替える（0115 §2.2）。"""
+    unit = fand()
+    root = tmpfiles_lines()[str(HANDOFF_RECORD_PATH.parent)]
+    assert root == [
+        one(unit, "Service", "RuntimeDirectoryMode"),
+        one(unit, "Service", "User"),
+        one(unit, "Service", "Group"),
+        "-",
+    ]
+
+
+def test_tmpfiles_role_directories_match_the_production_sockets():
+    """役割ごとの setgid の親（0095 §2.7 / 0115 §2.2）。fand が所有し、グループは役割のもの。"""
+    lines = tmpfiles_lines()
+    runtime = HANDOFF_RECORD_PATH.parent
+    guide = (ROOT / "docs" / "ubuntu-deploy.md").read_text(encoding="utf-8")
+    parents = set()
+    for role in WORKERS:
+        group = learned_channel()["sockets"][role]["group"]
+        socket_name = Path(learned_channel()["sockets"][role]["path"]).name
+        matched = [path for path, fields in lines.items() if fields[2] == group]
+        assert len(matched) == 1
+        parent = Path(matched[0])
+        assert parent.parent == runtime
+        assert lines[matched[0]] == ["2750", one(fand(), "Service", "User"), group, "-"]
+        parents.add(parent)
+        # 導入手順の本番の path は、このディレクトリの下の、開発用の設定と同じ名前のソケット
+        assert f"`{parent / socket_name}`" in guide
+    assert len(parents) == 2
+    assert len(lines) == 3
+
+
+def test_the_deploy_guide_keeps_the_registry_lock_away_from_workers():
+    """worker が lock を握ると Registry の書き込みを止められる（0115 §2.8）。"""
+    guide = (ROOT / "docs" / "ubuntu-deploy.md").read_text(encoding="utf-8")
+    group = learned_channel()["sockets"]["mpc"]["group"]
+    assert f"setfacl -x g:{group} /var/lib/coldaisle-registry/.registry.lock" in guide
+    assert f"setfacl -d -m g:{group}:r-X /var/lib/coldaisle-registry" in guide
+    assert "setfacl -R -m" not in guide.replace(
+        f"setfacl -R -m g:{group}:r-X /var/lib/coldaisle-registry/artifacts", ""
+    )
+    assert (
+        f"install -m 0644 /opt/coldaisle/deploy/tmpfiles.d/{TMPFILES.name} /etc/tmpfiles.d/"
+        in guide
+    )
+
+
+# -------------------------------------------------------- fand の Learned の引数（0115 §2.3）
+
+
+def test_fand_passes_the_learned_and_calibration_inputs():
+    exec_start = one(fand(), "Service", "ExecStart").split()
+    # 取り込みと同じ較正ファイル（作業ディレクトリ基準の既定と同じ。0101 §2.6 (b)）
+    from coldaisle.daemon import DEFAULT_CALIBRATION
+
+    working = Path(one(fand(), "Service", "WorkingDirectory"))
+    assert option(exec_start, "--calibration") == str(working / DEFAULT_CALIBRATION)
+    assert option(exec_start, "--registry-root") == "/var/lib/coldaisle-registry"
+    assert option(exec_start, "--learned-channel-config").startswith("/etc/coldaisle/")
+    # safety.yaml と食い違うと起動を拒否されるので、テンプレートには入れない（0110 §2.8）
+    assert "--t-sensor-metric" not in exec_start
+    # 読み取りだけ。ReadWritePaths= は変えない
+    assert words(fand(), "Service", "ReadWritePaths") == ["/var/lib/coldaisle", AUTHORITY_DIR]
