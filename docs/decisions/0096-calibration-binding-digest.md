@@ -213,8 +213,9 @@ PR #226 の引数（`calibration_sha256: Sha256 | None`）を次へ替える。�
 - `d.*` を展開した先がまた `d.*` である entry を与えると、digest を作らず例外になる
 - **読めなかった較正**: `unavailable` を渡すと、全 offset が 0.0 で学習した `null` でない artifact も L9 で拒否され、
   較正の掛かる metric を使わない `null` の artifact は通る。`available({})`（空）は `unavailable` と別に扱われる
-- **`null` の申告の検査**: `air.*` を使うのに manifest が `null` の artifact は、`available` でも `unavailable` でも
-  L9 で拒否される。`gpu.*` だけを使うのに manifest が `null` でない artifact も拒否される
+- **`null` の申告の検査**: §2.2 の1〜3で残る（較正を当てる）metric、すなわち湿度を除く `air.*` を使うのに manifest が
+  `null` の artifact は、`available` でも `unavailable` でも L9 で拒否される。`gpu.*` だけ、または `air.room_humidity` と
+  `gpu.*` だけを使うのに manifest が `null` でない artifact も拒否される。湿度だけの artifact は `null` で、`unavailable` でも通る
 
 ## 3. Consequences
 
