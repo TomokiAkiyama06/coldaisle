@@ -1,0 +1,10 @@
+# Air Balance の協調の shadow 集計（coldaisle-air-balance-shadow。#81 / 決定記録 0093）
+#
+# **合否の閾値はここに置かない。** shadow → apply の基準は shadow の実データを見てから
+# 所有者と決める（決定記録 0078 §5）。ここにあるのは集計の表し方だけ。
+# コード側に既定値は無いので、ここを消すと集計は動かない（AGENTS.md ルール9）。
+
+schema_version: 1
+
+# 引き上げ幅（counterfactual_output - candidate）の分布で出す percentile（nearest-rank）。
+percentiles: [0.5, 0.9, 0.99]
