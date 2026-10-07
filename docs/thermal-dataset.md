@@ -160,6 +160,8 @@ v1 との違い（規則の正本は [0087](decisions/0087-dataset-v2-action-gri
 - **再生の timezone**: v2 の学習に使う再生（`--source replay`）は、日次 CSV を書き出したときと同じ `--timezone` で行う。
   CSV の時刻はオフセットを持たず、違う timezone では較正の変更の記録（決定記録 [0099](decisions/0099-calibration-change-log.md)）との
   照合が狂う（照合の仕組みは #237 で決める）
+- **再生する CSV**: v2 の学習には、較正の変更の記録（`--calibration-history-db` に渡す DB）と同じ本番の DB から
+  書き出した CSV だけを使う（束縛の仕組みは #237 で決める）
 - `control_trace_sha256` は run の全 ControlTick を `seq` 付きで hash する（v2 は anchor 以外の tick も使うため）
 
 ## 実データ収集後に残る作業
