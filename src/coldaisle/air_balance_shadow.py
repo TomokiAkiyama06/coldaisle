@@ -641,9 +641,11 @@ def check_out_is_not_an_input(out: Path, *, db: Path, inputs: Iterable[Path]) ->
     `write()` は `os.replace()` で置き換えるので、`--out` が DB を指すと**証拠を報告で
     上書きする**。読むだけの CLI を破壊的な操作にしないため、読む前に拒む。
     """
+    # 添え file は symlink の隣と実体の隣の両方で数える。SQLite が使うのは実体の隣である。
+    bases = (db, db.resolve())
     candidates = [
         db,
-        *(db.with_name(db.name + suffix) for suffix in _SQLITE_SIDECARS),
+        *(base.with_name(base.name + suffix) for base in bases for suffix in _SQLITE_SIDECARS),
         *inputs,
     ]
     for path in candidates:

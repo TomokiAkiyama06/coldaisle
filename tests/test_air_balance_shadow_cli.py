@@ -440,6 +440,22 @@ def test_an_out_that_aliases_an_input_is_refused(setup: Fixture, target: str) ->
     assert (alias.read_bytes() if alias.exists() else None) == before
 
 
+def test_an_out_on_the_sidecar_of_a_symlinked_db_target_is_refused(setup: Fixture) -> None:
+    """`--db` が symlink なら、実体の隣の添え file も `--out` に取らせない（Codex P1）。"""
+    setup.store(mixed_ticks(setup))
+    link_dir = setup.db.parent / "pr81-link-dir"
+    link_dir.mkdir()
+    link = link_dir / "linked.db"
+    link.symlink_to(setup.db)
+    wal = setup.db.with_name(setup.db.name + "-wal")
+    argv = setup.argv()
+    argv[argv.index("--db") + 1] = str(link)
+    argv[argv.index("--out") + 1] = str(wal)
+
+    assert main(argv) == 1
+    assert not wal.exists()
+
+
 @pytest.mark.parametrize("target", ["evidence", "config", "policy"])
 def test_an_aliased_input_is_refused_before_it_is_read(setup: Fixture, target: str) -> None:
     """壊れた入力を `--out` が指していても、読んで落ちる前に exit 1 で拒む（Codex P2）。"""
