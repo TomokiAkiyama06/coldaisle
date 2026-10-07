@@ -871,6 +871,15 @@ class AttestedThermalDynamics:
                 "learned simulator は window の全 metric を予測する artifact に限る"
                 f"（target に無い feature の metric: {uncovered}）"
             )
+        sample_period_ms = model.feature_schema.sample_period_ms
+        if sample_period_ms != model.action_schema.step_ms:
+            # 1 step で window を1 frame（action の刻み）だけ進めるので、window の刻みが違うと
+            # 次の step の推論で window が feature schema に合わなくなる。再標本化はしない
+            # （補間・外挿をしない。0079 §2.3）。step で落ちる前に束縛で拒む。
+            raise DynamicsUnusableError(
+                "learned simulator は window の刻みが action の刻みと等しい artifact に限る"
+                f"（sample_period={sample_period_ms}ms; action={model.action_schema.step_ms}ms）"
+            )
         bound = object.__new__(cls)
         bound_identity = DynamicsIdentity(
             provenance=DynamicsProvenance.REGISTRY_ATTESTED,

@@ -824,6 +824,26 @@ def test_invariant_6_h_an_artifact_that_does_not_predict_the_window_is_refused(t
         attested_dynamics(trained.verified)
 
 
+def test_invariant_6_i_an_artifact_sampled_off_the_action_grid_is_refused(
+    attested_artifact, monkeypatch
+) -> None:
+    """window の刻みが action の刻みと違う artifact は束縛で拒む（再標本化しない。0079 §2.3）。
+
+    Dataset v2 は2つの刻みが違う組を許すが、合成 artifact で作るには feature の列と係数を
+    作り直す必要がある。ここでは封をした型が返す feature schema の刻みだけを変えて、束縛の
+    検査そのものを確かめる。
+    """
+    original = RegistryCounterfactualThermalModel.feature_schema
+
+    def coarse(self: RegistryCounterfactualThermalModel) -> Any:
+        schema = original.fget(self)  # type: ignore[attr-defined]
+        return schema.model_copy(update={"sample_period_ms": 2 * STEP_MS})
+
+    monkeypatch.setattr(RegistryCounterfactualThermalModel, "feature_schema", property(coarse))
+    with pytest.raises(DynamicsUnusableError, match="window の刻み"):
+        attested_dynamics(attested_artifact)
+
+
 def test_invariant_6_e_a_simulated_episode_is_not_promotable(trained) -> None:
     """**近似 simulator の episode を昇格の根拠にしない。**"""
     environment, *_ = build_environment(trained)
