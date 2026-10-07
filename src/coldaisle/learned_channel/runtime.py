@@ -21,6 +21,7 @@ from coldaisle.control.learned_handoff import LearnedChannelState, LearnedFrame,
 from coldaisle.control.mpc.controller import MpcProposal
 from coldaisle.learned_channel.config import LearnedChannelSettings
 from coldaisle.learned_channel.mailbox import LearnedMailbox
+from coldaisle.learned_channel.registry_watch import RegistryWatch
 from coldaisle.learned_channel.server import GroupDirectory, LearnedChannelServer
 from coldaisle.local_socket import peer_credentials_supported, peer_uid
 
@@ -78,8 +79,14 @@ def open_learned_channel(
     server_uid: int | None = None,
     groups: GroupDirectory | None = None,
     peer: Callable[[socket.socket], int] = peer_uid,
+    registry_watch: RegistryWatch | None = None,
+    registry_check_interval_ms: int | None = None,
 ) -> LearnedChannelEntry | None:
-    """経路を開き、受付スレッドを起動する。開けなければ None（呼び出し側が無効の口を渡す）。"""
+    """経路を開き、受付スレッドを起動する。開けなければ None（呼び出し側が無効の口を渡す）。
+
+    ``registry_watch`` を渡すと、受付スレッドが ``registry_check_interval_ms``（`safety.tick_ms`）
+    ごとに registry の production を確かめ、移動した役割を再起動まで閉じる（0077 §2.6）。
+    """
     if not peer_credentials_supported():
         _log_not_opened(
             "SO_PEERCRED が無いプラットフォームでは Learned の経路を開かない", config_path
@@ -100,6 +107,8 @@ def open_learned_channel(
             server_uid=server_uid,
             groups=groups,
             peer=peer,
+            registry_watch=registry_watch,
+            registry_check_interval_ms=registry_check_interval_ms,
         )
         server.bind()
     except Exception as error:

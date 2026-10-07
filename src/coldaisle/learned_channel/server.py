@@ -14,6 +14,10 @@
   （`worker_idle`）。EOF は `worker_disconnected`。どちらも**その時点で**受け渡し口を空にする
 - loop が置いた frame を、接続している役割へ非ブロッキングで送る。送れなければ捨てる（再送も待ちも
   しない）
+- `registry_watch` を渡されたら、`registry_check_interval_ms`（`safety.tick_ms`）ごとに registry の
+  production を起動時の固定と比べ、移動・消失・読めない役割を**再起動まで閉じる**
+  （`registry_superseded`。0077 §2.6）。閉じた役割に届いたメッセージは検証の前に捨てる。
+  I/O はこのスレッドで行い、loop の tick に入れない（0060 §2.3）
 
 **受付スレッドは loop の状態に一切触れない。** 受付スレッドの例外で `coldaisle-fand` を
 終わらせない。死んだら loop が毎 tick の確認でそれを見て、再起動まで Learned を読まない
@@ -50,6 +54,7 @@ from coldaisle.learned_channel.messages import (
     encode_outbound,
     parse_inbound,
 )
+from coldaisle.learned_channel.registry_watch import RegistryWatch
 from coldaisle.local_socket import (
     SocketStartupError,
     acquire_lock,
@@ -137,7 +142,13 @@ class LearnedChannelServer:
         server_uid: int | None = None,
         groups: GroupDirectory | None = None,
         peer: Callable[[socket.socket], int] = peer_uid,
+        registry_watch: RegistryWatch | None = None,
+        registry_check_interval_ms: int | None = None,
     ) -> None:
+        if registry_watch is not None and (
+            registry_check_interval_ms is None or registry_check_interval_ms < 1
+        ):
+            raise ValueError("registry を監視するなら確認の間隔（safety.tick_ms）を渡す")
         if not peer_credentials_supported():
             raise SocketStartupError(
                 "SO_PEERCRED が無いプラットフォームでは Learned の経路を開かない"
@@ -158,6 +169,12 @@ class LearnedChannelServer:
         self._selector: selectors.BaseSelector | None = None
         self._thread = threading.Thread(target=self._run, name="learned-channel", daemon=True)
         self._stop = False
+        self._registry_watch = registry_watch
+        self._registry_interval_ms = registry_check_interval_ms or 0
+        # 起動直後に1回確かめる（起動時の読み込みから受付の開始までの間の移動も拾う）
+        self._next_registry_check_ms: int | None = (
+            None if registry_watch is None else self._monotonic.monotonic_ms()
+        )
 
     @property
     def thread(self) -> threading.Thread:
@@ -313,16 +330,63 @@ class LearnedChannelServer:
                     self._accept(key.data)
                 elif isinstance(key.data, _Connection):
                     self._on_readable(key.data)
+            self._check_registry()
             self._expire_idle()
             self._send_outgoing()
 
     def _select_timeout_s(self) -> float | None:
-        """最も早い idle の締め切りまでの秒数。接続が無ければ起こされるまで待つ。"""
-        if not self._connections:
+        """最も早い締め切り（idle・registry の確認）までの秒数。無ければ起こされるまで待つ。"""
+        deadlines: list[int] = []
+        if self._connections:
+            timeout_ms = self._settings.worker_idle_timeout_ms.value
+            earliest = min(conn.last_valid_mono_ms for conn in self._connections.values())
+            deadlines.append(earliest + timeout_ms)
+        if self._next_registry_check_ms is not None:
+            deadlines.append(self._next_registry_check_ms)
+        if not deadlines:
             return None
-        timeout_ms = self._settings.worker_idle_timeout_ms.value
-        earliest = min(conn.last_valid_mono_ms for conn in self._connections.values())
-        return max(0.0, (earliest + timeout_ms - self._monotonic.monotonic_ms()) / 1_000)
+        return max(0.0, (min(deadlines) - self._monotonic.monotonic_ms()) / 1_000)
+
+    # ---------------------------------------------------------------- registry の監視
+
+    def _check_registry(self) -> None:
+        """`safety.tick_ms` ごとに、固定した artifact がいまも production か確かめる（0077 §2.6）。
+
+        移動・消失・読めない役割を再起動まで閉じる。**Gate の期待値も trace の provenance も
+        変えない**（ここでは古い期待値に一致する結果が届かないようにするだけ）。
+        """
+        watch, due = self._registry_watch, self._next_registry_check_ms
+        if watch is None or due is None:
+            return
+        now_ms = self._monotonic.monotonic_ms()
+        if now_ms < due:
+            return
+        self._next_registry_check_ms = now_ms + self._registry_interval_ms
+        try:
+            moved = watch.check()
+        except Exception:
+            # check() は例外を出さない約束だが、出たら読めなかったのと同じに扱う（保守側）
+            LOGGER.exception("registry の確認に失敗した。Learned の役割を再起動まで閉じる")
+            moved = frozenset(LearnedRole)
+        for role in moved:
+            if self._mailbox.superseded(role):
+                continue
+            self._mailbox.supersede(role)
+            pinned = watch.pins.for_role(role)
+            LOGGER.error(
+                "固定した artifact が production でなくなったため、再起動まで役割を閉じる",
+                extra={
+                    logs.FIELDS_KEY: {
+                        "reason": LearnedChannelState.REGISTRY_SUPERSEDED.value,
+                        "role": role.value,
+                        "pinned": None if pinned is None else pinned.model_dump(),
+                        "run_id": self._run_id,
+                    }
+                },
+            )
+        if all(self._mailbox.superseded(role) for role in LearnedRole):
+            # すべて閉じたら確かめ続ける理由は無い（再起動まで戻さない）
+            self._next_registry_check_ms = None
 
     # ---------------------------------------------------------------- 受け付けと認可
 
@@ -406,6 +470,10 @@ class LearnedChannelServer:
             return
         if len(data) > limit or flags & socket.MSG_TRUNC:
             self._drop(conn.role, "too_long")
+            return
+        if self._mailbox.superseded(conn.role):
+            # 閉じた役割に届いたものは**検証の前に**捨てる（0077 §2.6）。生存の知らせにも数えない
+            self._drop(conn.role, "registry_superseded")
             return
         try:
             envelope = parse_inbound(data)
