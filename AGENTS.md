@@ -37,6 +37,7 @@ uv run coldaisle-calibrate --apply  # 確認してから書く。手順は docs/
 uv run coldaisle-evaluate --runs var/evaluation-runs.yaml --out var/evaluation.json  # Controller構成の比較（読み取りのみ）
 uv run coldaisle-drift --evidence var/drift-evidence.yaml --profile var/confidence-profile.json  # Model driftの検知（読み取りのみ・書き込みはしない。`--format markdown` で trend を人が読む表に）
 uv run coldaisle-supervisor-shadow --evidence var/supervisor-shadow-runs.yaml --registry-root var/model-registry --out var/supervisor-shadow.json  # Supervisor の Shadow 集計（DB と Registry を読むだけ。昇格は CLI の外）
+uv run coldaisle-air-balance-shadow --evidence var/air-balance-shadow-evidence.yaml --control-config var/control-config --out var/air-balance-shadow.json  # Air Balance の協調の shadow 集計（DB を読むだけ。**合否は出さない**。`--format markdown` で表に。決定記録 0093）
 uv run coldaisle-eventd             # 書き込み専用の Unix ソケット入口（決定記録 0045。API とは別）
 uv run coldaisle-event gpu-mode compute  # GPU Mode の切り替えを記録する（#67）
 uv run coldaisle-event workload-hint training --expected-duration 4h  # Workload Hint を記録する（記録のみ。#107 / 決定記録 0064）
@@ -249,6 +250,7 @@ src/coldaisle/
   calibrate.py# 合成の起点: 較正オフセットの算出（確認を経由する）。#13
   evaluate.py # 合成の起点: Controller構成の比較レポート（読み取りのみ）。#91
   supervisor_shadow.py # 合成の起点: 保存済み trace から Supervisor の Shadow 集計（読み取りのみ。制御へ届かない）。#89
+  air_balance_shadow.py # 合成の起点: 保存済み trace から Air Balance の協調の shadow 集計（読み取りのみ・合否なし。制御へ届かない）。#81 / 決定記録 0093
   event_entry/ # 合成の起点: 書き込み専用の Unix ソケット入口。AI 層・API から import しない。#67
   control_admin/ # 合成の起点: coldaisle-fand の管理ソケット（運転モードと Authority の降格。昇格は受けない）。AI 層・API・eventd・control から import しない。#74 / #92 / 決定記録 0072
   local_socket.py # レイヤ横断: Unix ソケット入口に共通の門（SO_PEERCRED・権限・起動時の検査）。0045 / 0072 §2.5
@@ -283,7 +285,7 @@ src/coldaisle/
   web/        # L4: 静的アセット。airflow-trace.js が decision trace の版の解釈を1か所で持つ（0071 §2.3）
 firmware/     # ESP32-S3 Arduino スケッチ。**コンパイルは人の手**（#11 / 決定記録 0022 §2.9）
 deploy/       # Ubuntu 常駐化のテンプレート（systemd / udev）。**仮の値だけ**。手順は docs/ubuntu-deploy.md（#57）
-config/       # rules.yaml, calibration.json, coldaisle.toml, evaluation.yaml, drift.yaml, rl-training.yaml, soak.yaml, control-admin.yaml / control-admin.dev.yaml（Control Config の4ファイル fan-hardware / safety / fan-policy / air-balance は実運用のものを置かない。docs/control-config.md）
+config/       # rules.yaml, calibration.json, coldaisle.toml, evaluation.yaml, drift.yaml, air-balance-shadow.yaml, rl-training.yaml, soak.yaml, control-admin.yaml / control-admin.dev.yaml（Control Config の4ファイル fan-hardware / safety / fan-policy / air-balance は実運用のものを置かない。docs/control-config.md）
 memory/       # 運用メモリ（いまの閾値・較正値）。`coldaisle-memory` が更新案を出す
 docs/         # 要件定義、仕様レビュー、ADR
 tests/
