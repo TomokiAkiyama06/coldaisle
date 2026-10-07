@@ -654,8 +654,13 @@ CLI の書いた journal を読むと、走行中なら `SHADOW` へ下がり、
 
    - 承認者に要るのは `r` だけです。`coldaisle-authority raise` は lock を `O_RDONLY` で開いて `flock` だけを
      取ります（0104 §5 の 5）
-   - lock が消えたら、同じ2行で作り直します。lock を作り直すまで Registry の書き込みも `raise` も止まります
-     （壊れずに止まる）
+   - lock が消えたら、Registry の書き込みも `raise` も止まります（壊れずに止まる）。**作り直す前に、消えた lock を
+     まだ握っているプロセスが無いことを確かめます。** 消えた lock を握ったままの書き手がいる間に同じ名前で作り直すと、
+     新しい lock は別の inode なので、次の書き手がそれを取れてしまい、2つの書き込みが同じ revision を見て互いの
+     snapshot を上書きしうるためです。Registry の書き手と `coldaisle-authority raise` をすべて終わらせ、
+     `/proc/locks` に消えた inode の `FLOCK` が残っていないこと（下の「書き手のコマンドが返ってこないとき」の
+     見方。消えたファイルの inode は `sudo ls -l /proc/<pid>/fd` の `(deleted)` でも分かる）を確かめてから、
+     上の2行で作り直します
    - Registry はローカルのファイルシステムに置きます（NFS に置かない。`flock` の前提）
    - **書き手のコマンドが返ってこないとき**は、誰かが lock を握っている可能性があります（書き手は lock を
      待ち続けます。0104 §2.4）。握っているプロセスを見つけます
@@ -684,16 +689,12 @@ CLI の書いた journal を読むと、走行中なら `SHADOW` へ下がり、
    `--registry-root` は fand に Registry を渡す unit（0077 の段階 6）の値と同じ `/var/lib/coldaisle-registry`）。
    CLI は path が fand と同じかを確かめません。取り違えた・fand の起動後に差し替えた設定や artifact で上げても、
    fand は起動時に読んだ設定・artifact と照らして実効 stage の上限を Baseline にします（0089 / 0090。安全側）。
-   上げた後に、上げた stage が**効いている**ことを fand のログで確かめます
-
-   ```bash
-   journalctl -u coldaisle-fand -o cat | grep -E 'authority_(config|artifact)_(matched|mismatch|unbound)' | tail -n 4
-   ```
-
-   `authority_config_matched` と `authority_artifact_matched` が出ていれば効いています。`_mismatch` /
-   `_unbound` なら journal は上がっていても実効は Baseline です（trace の `authority_config_binding_ceiling` /
-   `authority_artifact_ceiling` でも見られます）。設定や artifact を入れ替えるときの手順は
-   `docs/authority-rollout.md` を見てください
+   上げた後は、上げた stage が**効いている**ことを確かめます。`raise` の結果の `revision` を fand が読んだことを
+   `coldaisle-control status` の `authority_journal_revision` で待ち、`authority_stage`（実効）が
+   `authority_journal_stage` と同じであることを見ます。低ければ、`raise` の後の fand のログの
+   `authority_config_mismatch` / `authority_artifact_mismatch` / `authority_artifact_unbound` を見ます（照合の
+   結果は変わったときにしか出ないので、起動時の古い `_matched` を証拠にしません）。手順の詳細と、設定や
+   artifact を入れ替えるときの手順は `docs/authority-rollout.md` を見てください
 7. **途中で止まったディレクトリを直す**（0105 §2.3）。Registry はディレクトリを作ってから mode を決めます。
    その間でプロセスが止まると、`artifacts/...` の下に `2700` のディレクトリが残り、他の書き手や読み手が入れない
    ことがあります（自動では直しません。壊れずに止まる）。該当を一覧し、親と同じ `2770` に揃えます

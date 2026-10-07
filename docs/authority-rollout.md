@@ -112,17 +112,32 @@ uv run coldaisle-authority raise \
 差し替えた設定・artifact で上げても journal は上がるが、fand が起動時に読んだ設定・artifact と照らして実効 stage の
 上限を Baseline にする（0089 / 0090。安全側だが、上げたつもりの authority が効かない）。
 
-**上げた後に、効いていることを fand のログで確かめる。**
+**上げた後に、効いていることを確かめる。** `raise` の結果の `revision`（N とする）を fand が読んだことを
+管理ソケットの `status` で待ち、実効の stage を journal の stage と比べる（`coldaisle-control` は
+`coldaisle-admin` グループの人が使う。`docs/ubuntu-deploy.md` 6.1）。
 
 ```bash
-journalctl -u coldaisle-fand -o cat | grep -E 'authority_(config|artifact)_(matched|mismatch|unbound)' | tail -n 4
+coldaisle-control status   # authority_journal_revision が N になるまで、数 tick おいて繰り返す
 ```
 
-`authority_config_matched` と `authority_artifact_matched` が出ていれば効いている。`authority_config_mismatch` /
-`authority_artifact_mismatch` / `authority_artifact_unbound` なら、journal は上がっていても実効は Baseline
-（decision trace の `authority_config_binding_ceiling` / `authority_artifact_ceiling` でも見られる）。その場合は
-rollback し、fand が使っている設定・artifact について証拠を集め直して上げ直す（上の「artifact・設定を入れ替える
-ときの手順」）。導入先の権限と確認の手順は `docs/ubuntu-deploy.md` 6.7。
+- `authority_journal_revision` が N で、`authority_stage`（実効）が `authority_journal_stage`（journal）と同じなら効いている
+- `authority_stage` のほうが低ければ、何かの上限が掛かっている。`authority_ceiling`（`fan-policy.yaml` の上限）・
+  `authority_unpersisted_ceiling`・`authority_journal_unreadable` を見て、どれでもなければ artifact か config の照合
+  （0089 / 0090）。fand のログを**`raise` の後に絞って**見る（照合の結果は変わったときにしか出ないので、
+  起動時の古い `_matched` を「効いている」証拠にしない）
+
+  ```bash
+  journalctl -u coldaisle-fand -o cat --since "<raise を実行した時刻>" \
+    | grep -E 'authority_(config|artifact)_(mismatch|unbound)'
+  ```
+
+  `authority_config_mismatch`（`mismatched_files` に食い違ったファイル）/ `authority_artifact_mismatch` /
+  `authority_artifact_unbound` が出ていれば、journal は上がっていても実効は Baseline。rollback し、fand が使っている
+  設定・artifact について証拠を集め直して上げ直す（上の「artifact・設定を入れ替えるときの手順」）
+- decision trace（`/api/v1/control/latest`）でも、tick の `state.authority_stage`（実効）と `authority.journal_revision` /
+  `authority.journal_stage` で同じ比較ができる（artifact と config の上限そのものは trace に載らない。0089 §5 の 1）
+
+導入先の権限と確認の手順は `docs/ubuntu-deploy.md` 6.7。
 
 **本番（`docs/ubuntu-deploy.md` の導入先）での `raise` は、`docs/ubuntu-deploy.md` 6.7 の手順 9（実機での確認。
 決定記録 0104 の段階 C）が導入先で通り、結果を #217 に残すまで使えない（`rollback` は使える）。** 承認者に
