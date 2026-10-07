@@ -2019,21 +2019,15 @@ class ModelRegistry:
                     child_fd = os.open(part, flags, dir_fd=current_fd)
                     if created:
                         try:
-                            # **mode を決めてから、子と親を fsync する**（codex P2。PR #248）。
-                            # 親を先に fsync すると、mode を直す前に止まったとき、継いだ
-                            # setgid の付いた root が残り、やり直しでも直らない。
-                            if inherit_mode:
-                                parent_mode = stat.S_IMODE(os.fstat(current_fd).st_mode)
-                                os.fchmod(child_fd, parent_mode & _DIRECTORY_MODE_MASK)
-                            else:
-                                # setgid の親の下では Linux が `S_ISGID` を子へ継ぐ。そのまま
-                                # だと、いま作った開発用の root を「導入手順で作った共有の root」と
-                                # 取り違え、lock を作らずに止まる（codex P2。PR #248）。
-                                os.fchmod(child_fd, 0o700)
-                            os.fsync(child_fd)
-                            # The directory entry lives in the parent; without this fsync a
-                            # crash can drop it even after an artifact / snapshot fsync inside.
-                            os.fsync(current_fd)
+                            ModelRegistry._finish_created_directory(
+                                current_fd, child_fd, inherit_mode=inherit_mode
+                            )
+                        except OSError as exc:
+                            os.close(child_fd)
+                            raise UnsafeRegistryPathError(
+                                "registry の作ったディレクトリの mode を決められない、"
+                                f"または永続化できない: {part}"
+                            ) from exc
                         except BaseException:
                             os.close(child_fd)
                             raise
@@ -2047,6 +2041,24 @@ class ModelRegistry:
         except BaseException:
             os.close(current_fd)
             raise
+
+    @staticmethod
+    def _finish_created_directory(parent_fd: int, child_fd: int, *, inherit_mode: bool) -> None:
+        """新しく作ったディレクトリの mode を決め、子と親を fsync する（決定記録 0104 §2.3）。"""
+        # **mode を決めてから、子と親を fsync する**（codex P2。PR #248）。親を先に fsync すると、
+        # mode を直す前に止まったとき、継いだ setgid の付いた root が残り、やり直しでも直らない。
+        if inherit_mode:
+            parent_mode = stat.S_IMODE(os.fstat(parent_fd).st_mode)
+            os.fchmod(child_fd, parent_mode & _DIRECTORY_MODE_MASK)
+        else:
+            # setgid の親の下では Linux が `S_ISGID` を子へ継ぐ。そのままだと、いま作った
+            # 開発用の root を「導入手順で作った共有の root」と取り違え、lock を作らずに止まる
+            # （codex P2。PR #248）。
+            os.fchmod(child_fd, 0o700)
+        os.fsync(child_fd)
+        # The directory entry lives in the parent; without this fsync a crash can drop it even
+        # after an artifact / snapshot fsync inside.
+        os.fsync(parent_fd)
 
     @staticmethod
     def _read_regular_file(

@@ -19,7 +19,12 @@ import pytest
 
 import coldaisle.control.model_registry as registry_module
 from coldaisle.clock import SimulatedClock
-from coldaisle.control import ModelRegistry, RegistrySharedRootError, RegistrySnapshot
+from coldaisle.control import (
+    ModelRegistry,
+    RegistrySharedRootError,
+    RegistrySnapshot,
+    UnsafeRegistryPathError,
+)
 from test_model_registry import ACTOR, LIMITS, NOW_MS, artifact_path, metadata, payload
 
 REPO = Path(__file__).resolve().parents[1]
@@ -215,6 +220,20 @@ def test_a_new_directory_gets_its_final_mode_before_its_parent_is_synced(
     monkeypatch.setattr(registry_module.os, "fsync", recording_fsync)
     register(writer(parent / "registry"))
     assert modes_when_parent_synced == [0o700]
+
+
+def test_a_failed_chmod_of_a_new_directory_is_reported_as_such(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """mode を決められない失敗を「symlink または directory ではない」と言わない（PR #248）。"""
+
+    def failing_fchmod(fd: int, mode: int) -> None:
+        raise PermissionError("fchmod")
+
+    monkeypatch.setattr(registry_module.os, "fchmod", failing_fchmod)
+    with pytest.raises(UnsafeRegistryPathError, match="mode を決められない") as caught:
+        register(writer(tmp_path / "registry"))
+    assert "symlink" not in str(caught.value)
 
 
 # --- 作るファイルとディレクトリの mode ----------------------------------------------------

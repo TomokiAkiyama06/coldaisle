@@ -82,6 +82,34 @@ symlinkまたは非regular fileを拒否する。artifact IDから組み立て�
 権限が無い・setgid 付き）を開くたびに確かめ、lock を `O_RDONLY` で開いて `flock` だけを取る
 （決定記録 0104 §2.3 / §2.4）。導入先の置き場所・グループ・ACL は `docs/ubuntu-deploy.md`（0104 の段階 B）。
 
+### mode を決める前に止まったディレクトリを直す
+
+Registry はディレクトリを `mkdir` してから mode を決める（`fchmod`）。**その間でプロセスが止まると**
+（kill・電源断・`fchmod` の失敗）、setgid の親の下では、親から継いだ setgid の付いたディレクトリ（`2700` など）が
+残ることがある。次の実行は既にあるディレクトリとして開くので、mode を直さない（決定記録 0105 §2.3。自動では直さない）。
+どちらも**壊れずに止まる**（安全側）が、人が直すまで同じ error になる。
+
+- **開発用の root**（setgid の親の下で自動で作られた root）が `RegistrySharedRootError`（`registry lock が無い`）で
+  止まる: 継いだ setgid のために、共有の root と取り違えている。中身が無い（`registry.json` も `artifacts/` も無い）
+  ことを確かめてから、root を消して作り直させるか、setgid を外す
+
+  ```bash
+  ls -lA <root>                 # registry.json・artifacts・.registry.lock の有無を見る
+  chmod 0700 <root>             # 中身が無い開発用の root なら setgid を外す（または rmdir して作り直させる）
+  ```
+
+  中身があるなら消さない。共有の root として使うつもりなら、導入手順のとおり lock を作る
+- **共有の root の下**の `artifacts/...` のディレクトリが `2700` のまま残り、他の書き手や読み手が入れない:
+  親と同じ `2770` に揃える（グループの書き手の uid か root で。所有者だけが mode を変えられる）
+
+  ```bash
+  find <root>/artifacts -type d -perm -2000 ! -perm -0070 -exec ls -ld {} +   # 該当を一覧する
+  chmod 2770 <該当するディレクトリ>
+  ```
+
+  中のファイルは作り直していないので、`registry.json`・`artifact.payload` の mode（`0640`）はそのまま。
+  直した後は `coldaisle-registry status --root <root>` で読めることを確かめる
+
 新しいProductionへのpromotion時、旧Productionは`retired`になる。rollback targetには、旧Production、
 それまでのrollback targetの順に、checksumとformatの再検証を通った最初のartifactを残す。どちらも
 通らなければtargetは無く（`None`）、promotion自体は続行する。選ばれたtargetはpromotion auditの
