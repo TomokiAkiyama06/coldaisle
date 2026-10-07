@@ -417,7 +417,9 @@ class MpcModelBinding:
         """anchor 推論。計画 action の列は ``hold_effective``（0084 §2.1）で封をした型が作る。"""
         return self._model.predict(observed)
 
-    def predict_plan(self, planned: PlannedThermalInput) -> PlanPrediction:
+    def predict_plan(
+        self, planned: PlannedThermalInput, *, anchor: ThermalPrediction
+    ) -> PlanPrediction:
         """候補 plan に対する予測（0079 §2.3 / 0087 §2.5）。Demand も authority も返さない。
 
         plan の ``steps[k]`` は action schema の step ``k``
@@ -426,11 +428,17 @@ class MpcModelBinding:
         **plan の格子が action schema と違えば予測しない**（補間・外挿・丸めをしない）。
         予測の horizon も plan の offset 列と完全に一致しなければならない。
 
-        ``anchor_inference_id`` は同じ観測の anchor 推論（``hold_effective``）から作る。
+        ``anchor`` はこの tick に :meth:`predict` で1回だけ作った anchor 推論で、
+        ``anchor_inference_id`` はそこから作る。候補ごとに anchor 推論をやり直さない（予算を
+        候補の評価に使う）。束縛した artifact とこの観測の anchor 推論でなければ予測しない。
         """
         plan = planned.plan
         trajectory = self._trajectory(plan)
-        anchor = self._model.predict(planned.observed)
+        if (anchor.artifact_sha256, anchor.input_action_ts_ms) != (
+            self._model.artifact_sha256,
+            planned.observed.action_ts_ms,
+        ):
+            raise ValueError("anchor 推論が束縛した artifact とこの観測のものではない")
         prediction = self._model.predict_trajectory(planned.observed, trajectory)
         horizons = tuple(target.horizon_ms for target in prediction.targets)
         if horizons != plan.offsets_ms:

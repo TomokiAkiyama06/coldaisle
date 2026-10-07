@@ -355,7 +355,9 @@ class LearnedMpcOptimizer:
         if violations:
             raise InfeasiblePlanError("; ".join(violations))
         plan = self._plan(demands)
-        prediction = self._binding.predict_plan(PlannedThermalInput(observed=observed, plan=plan))
+        prediction = self._binding.predict_plan(
+            PlannedThermalInput(observed=observed, plan=plan), anchor=anchor
+        )
         self._check_prediction(prediction, anchor, anchor_inference_id)
         cost = self._cost_model.evaluate(
             plan=plan,

@@ -896,9 +896,11 @@ def plan_calls(monkeypatch: pytest.MonkeyPatch) -> Iterator[list[ActionPlan]]:
     seen: list[ActionPlan] = []
     original = MpcModelBinding.predict_plan
 
-    def recording(self: MpcModelBinding, planned: PlannedThermalInput) -> PlanPrediction:
+    def recording(
+        self: MpcModelBinding, planned: PlannedThermalInput, *, anchor: ThermalPrediction
+    ) -> PlanPrediction:
         seen.append(planned.plan)
-        return original(self, planned)
+        return original(self, planned, anchor=anchor)
 
     monkeypatch.setattr(MpcModelBinding, "predict_plan", recording)
     yield seen
@@ -911,10 +913,12 @@ def break_predict_plan(monkeypatch: pytest.MonkeyPatch, replace: Rewrite | BaseE
     """`predict_plan` の結果を差し替える（取り違え・異常の再現）。"""
     original = MpcModelBinding.predict_plan
 
-    def broken(self: MpcModelBinding, planned: PlannedThermalInput) -> PlanPrediction:
+    def broken(
+        self: MpcModelBinding, planned: PlannedThermalInput, *, anchor: ThermalPrediction
+    ) -> PlanPrediction:
         if isinstance(replace, BaseException):
             raise replace
-        return replace(planned, original(self, planned))
+        return replace(planned, original(self, planned, anchor=anchor))
 
     monkeypatch.setattr(MpcModelBinding, "predict_plan", broken)
 
@@ -1997,9 +2001,14 @@ def _plan_prediction(
         step_ms=settings.mpc.optimizer.step_ms.value,
         steps=settings.mpc.optimizer.steps,
     )
-    return plan, bind(trained).predict_plan(
-        PlannedThermalInput(observed=observed_input(), plan=plan)
+    return plan, _with_anchor(
+        bind(trained), PlannedThermalInput(observed=observed_input(), plan=plan)
     )
+
+
+def _with_anchor(binding: MpcModelBinding, planned: PlannedThermalInput) -> PlanPrediction:
+    """この観測の anchor 推論を1回作って候補の予測へ渡す（optimizer と同じ使い方）。"""
+    return binding.predict_plan(planned, anchor=binding.predict(planned.observed))
 
 
 # ------------------------------------------- codex レビュー（PR #151）への修正の回帰試験
@@ -2494,8 +2503,10 @@ def test_a_plan_prediction_follows_the_action_grid_of_the_artifact(trained) -> N
         ),
     )
 
-    prediction = binding.predict_plan(PlannedThermalInput(observed=observed, plan=plan))
     anchor = binding.predict(observed)
+    prediction = binding.predict_plan(
+        PlannedThermalInput(observed=observed, plan=plan), anchor=anchor
+    )
 
     assert prediction.matches(plan)
     assert prediction.plan_digest == plan.digest()
@@ -2519,7 +2530,7 @@ def test_the_anchor_inference_equals_the_held_plan_of_the_current_demand(trained
     held = ActionPlan.held(demands(0.45), step_ms=STEP_MS, steps=STEPS)
 
     anchor = binding.predict(observed)
-    planned = binding.predict_plan(PlannedThermalInput(observed=observed, plan=held))
+    planned = binding.predict_plan(PlannedThermalInput(observed=observed, plan=held), anchor=anchor)
 
     assert [target.values for target in anchor.targets] == [
         target.values for target in planned.targets
@@ -2539,7 +2550,7 @@ def test_a_plan_off_the_action_grid_is_never_predicted(trained, plan: ActionPlan
     binding = bind(trained)
 
     with pytest.raises(ValueError, match="格子"):
-        binding.predict_plan(PlannedThermalInput(observed=observed_input(), plan=plan))
+        _with_anchor(binding, PlannedThermalInput(observed=observed_input(), plan=plan))
     with pytest.raises(ValueError, match="格子"):
         binding.plan_support_violation(observed_input(), plan)
 
@@ -2839,3 +2850,48 @@ def test_a_healthy_runtime_proposes_like_the_controller(trained) -> None:
     assert propose(runtime).result_digest() == propose(controller).result_digest()
     with pytest.raises(ValueError, match="どちらか一方"):
         LearnedMpcRuntime(controller=None, failure_reason=None)
+
+
+def test_the_anchor_inference_runs_once_per_tick(trained, monkeypatch: pytest.MonkeyPatch) -> None:
+    """**候補ごとに anchor 推論をやり直さない**（予算を候補の評価に使う。PR #239 の Codex P2）。"""
+    calls: list[int] = []
+    original = RegistryCounterfactualThermalModel.predict
+
+    def counting(
+        self: RegistryCounterfactualThermalModel, observed: ObservedThermalInput
+    ) -> ThermalPrediction:
+        calls.append(observed.action_ts_ms)
+        return original(self, observed)
+
+    monkeypatch.setattr(RegistryCounterfactualThermalModel, "predict", counting)
+    controller, _binding, _settings = build_controller(trained)
+
+    result = propose(controller)
+
+    assert result.solution is not None and result.solution.evaluations > 1
+    # anchor 推論1回 + 判定器が held の列を照らすだけ（予測はしない）。
+    assert calls == [ACTION_TS_MS]
+
+
+def test_a_plan_prediction_needs_the_anchor_of_the_same_artifact_and_input(trained) -> None:
+    """別の観測・別の artifact の anchor 推論を渡されたら予測しない。"""
+    binding = bind(trained)
+    plan = ActionPlan.held(demands(0.5), step_ms=STEP_MS, steps=STEPS)
+    planned = PlannedThermalInput(observed=observed_input(), plan=plan)
+    anchor = binding.predict(observed_input())
+
+    for other in (
+        ThermalPrediction.model_validate(
+            anchor.model_dump(mode="python") | {"artifact_sha256": "c" * 64}
+        ),
+        binding.predict(dataset_observed(ACTION_TS_MS + 5_000)),
+    ):
+        with pytest.raises(ValueError, match="anchor"):
+            binding.predict_plan(planned, anchor=other)
+
+
+def dataset_observed(action_ts_ms: int) -> ObservedThermalInput:
+    """別の anchor 時刻の観測 window。"""
+    data = dataset(HORIZONS, TARGETS)
+    example = next(item for item in data.examples if item.action_ts_ms == action_ts_ms)
+    return ObservedThermalInput.from_example(example)
