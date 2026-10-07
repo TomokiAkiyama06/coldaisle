@@ -85,8 +85,9 @@ dataset 全体で一意であることを求める。** 2つ以上の example �
 - **builder と artifact の形を変えない**（0087 §2.8 の「v1 の builder と artifact は変えない」を保つ）。変えるのは loader の検証だけ
 - 検証の置き場所は `control/model/dataset.py` の `ThermalDataset` / `ThermalDatasetV2` の model validator とし、
   v1 / v2 に共通の関数を1つ置いて両方から呼ぶ（今の `_check_example_against_run_and_spec` と同じ構成）。
-  そのため、dataset を読み直す入口（`write_dataset` の公開前の再検証、`coldaisle-drift` の `load_inputs`、学習・Confidence Profile・
-  反実仮想の trainer の再検証）はすべて同じ検査を通る
+  そのため、dataset を読み直す入口はすべて同じ検査を通る。v1: `write_dataset` の公開前の再検証、`coldaisle-drift` の
+  `load_inputs`（v1 だけを読む）、Confidence Profile v1 の再検証。v2: `write_dataset` の再検証、反実仮想の trainer
+  （`counterfactual_training`）の `ThermalDatasetV2` の再検証
 - 計算量は example の cell の総数に線形、追加のメモリは run ごとの異なる観測の数と anchor の数に比例する
   （0094 §2.6 #2 の tick の写像と同じ程度）
 
@@ -150,7 +151,9 @@ v1 / v2 のそれぞれで、次を確かめる。
 7. **builder の出力は通る**: 既存の builder の試験（`tests/test_thermal_dataset.py` / `tests/test_thermal_dataset_v2.py`）がすべて通る。
    加えて、window が重なり（`sample_period_ms` < anchor の間隔 < `window_ms`）、同じ観測が複数の frame と target に採られる
    合成の run から作った dataset が通ることを確かめる
-8. **入口が同じ検査を通る**: `coldaisle-drift` の `load_inputs` と `write_dataset` の再検証で、複製・食い違いの artifact が拒まれる
+8. **入口が同じ検査を通る**: v1 は `coldaisle-drift` の `load_inputs` と `write_dataset` の再検証で、v2 は `write_dataset` の再検証と
+   反実仮想の trainer（`counterfactual_training`）の再検証で、複製・食い違いの dataset が拒まれる（`load_inputs` は v1 だけを読むので
+   v2 の試験には使わない。PR #246 の Codex の指摘）
 9. **fixture の直し**: §2.4 の2ファイルの fixture を `(metric, source_ts_ms)` の関数に直した後、既存の学習・Profile の試験が通る
 
 ## 3. Consequences
