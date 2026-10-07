@@ -88,7 +88,12 @@ digest は次の2つだけから決まる。
 `canonical_json_bytes`（`control/model/thermal.py`）と同じ規約で直列化する。
 
 ```python
-json.dumps(obj, ensure_ascii=False, allow_nan=False, separators=(",", ":"), sort_keys=True).encode("utf-8") + b"\n"
+(
+    json.dumps(
+        obj, ensure_ascii=False, allow_nan=False, separators=(",", ":"), sort_keys=True
+    ).encode("utf-8")
+    + b"\n"
+)
 ```
 
 - **キー**: metric 名（`air.front_intake` など）。チャネル名ではない。`sort_keys=True` による Python の文字列順
