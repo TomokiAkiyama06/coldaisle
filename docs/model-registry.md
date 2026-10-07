@@ -129,11 +129,11 @@ uv run coldaisle-registry validate --root var/model-registry \
     --actor evaluator --reason "offline gates passed" --expected-revision 1
 uv run coldaisle-registry promote  --root var/model-registry --approval var/approval.json \
     --shadow-evaluation-ref evaluation/shadow/1.2.0 \
-    --feature-schema thermal-features-v1 --target-schema thermal-targets-v1 \
+    --feature-schema thermal-features-v2 --target-schema thermal-targets-v1 \
     --authority-stage shadow --expected-revision 2
 uv run coldaisle-registry rollback --root var/model-registry --kind thermal_model \
     --approval var/rollback-approval.json \
-    --feature-schema thermal-features-v1 --target-schema thermal-targets-v1 \
+    --feature-schema thermal-features-v2 --target-schema thermal-targets-v1 \
     --authority-stage shadow --expected-revision 3
 ```
 
@@ -162,10 +162,25 @@ uv run coldaisle-registry rollback --root var/model-registry --kind thermal_mode
 schema_version: 1
 contracts:
   thermal_model:
-    feature_schema_version: thermal-features-v1
+    feature_schema_version: thermal-features-v2
     target_schema_version: thermal-targets-v1
     authority_stage: shadow
 ```
+
+（`config/model-runtime.yaml` はリポジトリに置いていない。上の形で作り、`authority_stage` は導入先で
+実際に運転する stage に置き換える）
+
+`thermal_model` の schema には、Learned MPC が束縛できる**反実仮想 artifact v2**（`coldaisle.thermal_model`
+v2、capability `counterfactual_action`）の組 `thermal-features-v2` / `thermal-targets-v1` を書く
+（決定記録 0079 §2.3）。`promote` / `rollback` の `--feature-schema` / `--target-schema` にも同じ値を渡す。
+v1 artifact（`thermal-features-v1`、`observational_replay`）が production のままこの contract で `verify` すると、
+schema 不一致で `unusable` と報告される。これは Fallback を意味し、正しい（決定記録 0079 §2.6）。
+v1 を v2 として読み替える経路は無い（同 §2.2）。
+
+`verify` が見るのは checksum / format と、contract の schema・authority の互換だけである（v2 でも
+`verify` の挙動は変えていない。決定記録 0079 §2.9 の段 5）。artifact v2 の中身の検査（下の「後続Issueとの
+接続」の L1〜L12）は `verify` では行わない。L1〜L12 に外れる artifact は、`verify` が `ok` でも Learned MPC の
+読み込みで拒まれ、Fallback になる。
 
 CLIが読むファイル（artifact本体・metadata・承認・contract）は、**読む前に上限で切る**。
 artifact本体は `max_artifact_bytes`、それ以外は `max_snapshot_bytes` を上限とし、上限＋1 byteだけを
@@ -209,8 +224,32 @@ MemoryErrorで落とさないためである。壊れたYAML・JSONやファイ�
   役割を**再起動まで閉じる**（`registry_superseded`）。期待値と provenance は書き換えないので、
   promotion / rollback は「registryを変える → `coldaisle-fand` を再起動する」を1組の手順にする。
   `coldaisle-fand` は registry に書かず、artifact の bytes も読まない（検証は worker の仕事）。
-- #84 / #85 / #89: 各format固有loaderと推論interfaceを実装し、`VerifiedArtifact.payload` だけを
+- #84 / #85 / #89: 各format固有loaderと推論interfaceを実装し、Registryが発行した `VerifiedArtifact` だけを
   入力にする。Registry内に任意コード実行経路を追加しない。
+- 反実仮想 Thermal Model artifact v2（決定記録 0079 / 0084 / 0096 / 0097。形式と各段の詳細は
+  `docs/thermal-model.md`）: Confidence Profile v2 を**同じ artifact の中に同梱**し、既存の `thermal_model`
+  kind・`counterfactual_action` capability で登録する。Profile を `confidence_model` kind の別 artifact として
+  登録しない。model と Profile は1つの bytes なので、promotion / rollback で必ず組のまま動き、0037 の
+  rollback target の選び方がそのまま「正しい組」を選ぶ。Profile を作り直すと model の版が上がる（0079 §2.1）。
+  - **登録**: 登録する bytes は `canonical_counterfactual_artifact_bytes(artifact)` そのもの（同じ artifact が
+    2通りの bytes を持たない）。`register --metadata` の JSON は
+    `counterfactual_registry_metadata_json_bytes(counterfactual_registry_metadata(artifact, bytes))` で
+    manifest から導く。読み込み時の L5 が、artifact が決める metadata の全欄を照合する（0079 §2.3）
+  - **読み込み**: `RegistryCounterfactualThermalModel.from_verified_artifact(verified, metric_catalog=,
+    calibration=)` だけが封をした型（model と同梱 Profile v2）を作る。0079 §2.4 の L1〜L10 と 0084 の
+    L11 / L12 を検査し（順は 0097 §2.4）、1つでも外れたら `CounterfactualArtifactRejectedError`（`check` に
+    番号）で型を作らない。L8 は runtime の `MetricCatalog`、L9 は runtime の較正の digest（計算は 0096。
+    不一致は拒否）と照合する。どちらも呼び出し側が明示し、既定値は無い
+  - **MPC への束縛**（0079 §2.9 の段 4）: `MpcModelBinding.from_verified_artifact(verified, metric_catalog=,
+    calibration=, authority_stage=, expected_model_version=)` だけが束縛を作る。上の読み込みを通った同じ bytes
+    から model と同梱 Profile を作り、別に組み立てた model / Profile を受け取る経路は持たない（旧
+    `for_control` は廃した）。`authority_stage` は**実効 stage**（0057 §2.2）。外れたら
+    `MpcModelUnusableError` で、`LearnedMpcRuntime.load` はそれを以後の提案の `MODEL_LOAD_FAILURE`
+    （`failure_reason` に理由）にし、Gate が Fallback を選ぶ。起動は止めない（0079 §2.6）
+  - **runtime の較正**: `coldaisle-fand --calibration <path>` が取り込みと同じ較正ファイルを起動時に1回だけ
+    読む（既定の path は置かない。読めなければ `RuntimeCalibration.unavailable` で、較正の掛かる metric を
+    使う artifact は L9 で拒まれる。0096 §5 #8）。worker の loader へ渡す経路は worker の実装と合わせて決める
+    （#86）。較正を書き換えたら、取り込みより先に `coldaisle-fand` を再起動する（`docs/calibration.md`）
 - #86 Learned MPC: `VerifiedArtifact.attestation`（`ArtifactAttestation`）を内部モデルの束縛に使う。
   この値はpublic constructorを持たず、Registryの検証経路だけが発行する。受け取った側は
   verification / authority / 版 / schema versionをモデルの自称ではなくこの値から読む
@@ -218,8 +257,8 @@ MemoryErrorで落とさないためである。壊れたYAML・JSONやファイ�
   attestationは lifecycle 状態（`status`）と、その kind の**いまのproduction pointerそのものか**
   （`production_active`）も載せる。`load_version()` はReplay / offline評価のために候補・検証済み・
   引退も返すため、これを載せないと、promotionの承認を経ていないartifactをactive制御へ配線できて
-  しまう。#86 の `for_control` は `production_active` を要求し、Replay / offline評価は
-  productionでないattestationをそのまま使う。
+  しまう。#86 の `MpcModelBinding.from_verified_artifact` は `production_active` を要求し、Replay /
+  offline評価はproductionでないattestationをそのまま使う。
   さらに `ArtifactMetadata.capability`（`ArtifactCapability`: `observational_replay` / `counterfactual_action`）を
   必須項目として登録時に申告し、attestationがそれを載せる。#86 はこの申告だけを見て内部モデルの
   可否を決め、推論器の自称では判断しない。capabilityの追加にともない Registry schema version を
