@@ -18,6 +18,7 @@
 from __future__ import annotations
 
 import contextlib
+import errno
 import fcntl
 import grp
 import os
@@ -144,13 +145,41 @@ class Authorizer:
             return self.allow_same_user
         if self.group_gid is None:
             return False
+        return uid_in_group(uid, self.group_gid)
+
+
+def uid_in_group(uid: int, gid: int) -> bool:
+    """uid がそのグループに属するか（主グループか、補助グループの `gr_mem` に名前がある）。
+
+    接続のたびに引き直す（グループから外した利用者は再起動しなくても認めない）。名前を引けない
+    uid・gid はメンバーと判定できないので、認めない側へ倒す。
+    """
+    try:
+        user = pwd.getpwuid(uid)
+        group = grp.getgrgid(gid)
+    except KeyError:
+        return False
+    return user.pw_gid == gid or user.pw_name in group.gr_mem
+
+
+def group_member_uids(gid: int) -> frozenset[int]:
+    """そのグループに属する uid の集合（`uid_in_group` と同じ規則。決定記録 0077 §2.7）。
+
+    補助グループの `gr_mem` の名前と、主グループがそのグループであるユーザーの両方を数える。
+    `gr_mem` にあってもユーザーとして引けない名前は uid を持たないので数えない。
+    """
+    try:
+        group = grp.getgrgid(gid)
+    except KeyError:
+        return frozenset()
+    uids: set[int] = set()
+    for name in group.gr_mem:
         try:
-            user = pwd.getpwuid(uid)
-            group = grp.getgrgid(self.group_gid)
+            uids.add(pwd.getpwnam(name).pw_uid)
         except KeyError:
-            # 名前を引けない uid はメンバーと判定できない。認めない側へ倒す
-            return False
-        return user.pw_gid == self.group_gid or user.pw_name in group.gr_mem
+            continue
+    uids.update(user.pw_uid for user in pwd.getpwall() if user.pw_gid == gid)
+    return frozenset(uids)
 
 
 @contextlib.contextmanager
@@ -280,10 +309,18 @@ def check_group_can_traverse(parent: Path, group_gid: int) -> None:
         )
 
 
-def prepare_path(path: Path, *, service: str) -> None:
+def prepare_path(
+    path: Path, *, service: str, sock_type: socket.SocketKind = socket.SOCK_STREAM
+) -> None:
     """既存のソケットを確かめる。危ないものは消さずに止まる。
 
     **`acquire_lock()` を持ってから呼ぶ。** 古いソケットの判定と削除を直列にするため。
+
+    ``sock_type`` は待ち受けるソケットの種類（決定記録 0077 §2.7）。probe を同じ種類で作るので、
+    残ったソケットは `ECONNREFUSED`、生きた待ち受けは接続の成功で見分けられる。既定の
+    `SOCK_STREAM` の挙動（0045 / 0072）は変えない。同じ種類で probe しても `EPROTOTYPE` が返るのは
+    **別の種類の待ち受けがその path にいる**ときなので、消さずに `SocketStartupError` にする
+    （生の `OSError` を呼び出し側へ漏らさない）。
     """
     try:
         existing = os.lstat(path)
@@ -292,7 +329,7 @@ def prepare_path(path: Path, *, service: str) -> None:
     if not stat.S_ISSOCK(existing.st_mode):
         # 設定の誤りで任意のファイルを消さない
         raise SocketStartupError(f"ソケットの位置にソケット以外がある: {path}")
-    probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    probe = socket.socket(socket.AF_UNIX, sock_type)
     try:
         probe.settimeout(1.0)
         probe.connect(str(path))
@@ -301,6 +338,12 @@ def prepare_path(path: Path, *, service: str) -> None:
         # 確かめたものと同じ場合だけ消す（ロックの外から差し替えられても触らない）
         unlink_if_same(path, identity(existing))
         return
+    except OSError as exc:
+        if exc.errno == errno.EPROTOTYPE:
+            raise SocketStartupError(
+                f"別の種類のソケットが待ち受けている（{service} とは種類が違う）: {path}"
+            ) from exc
+        raise
     finally:
         probe.close()
     raise SocketStartupError(f"別の {service} が待ち受けている: {path}")

@@ -348,6 +348,11 @@ sudoedit /etc/coldaisle/control-admin.yaml
   （親までのリンクを拒否します）
 - `socket.group` を 6.1 で作ったグループ名にする（unit の `SupplementaryGroups=` と同じ名前）
 
+Learned worker の経路（`config/learned-channel.yaml`。#86）を使うときも、2つの役割のソケットの
+共通の祖先は起動前に用意し、両方の役割のグループがたどれるようにします（`0711` の
+`RuntimeDirectory=` の下に役割ごとのディレクトリを置く。決定記録 0095 §2.7。unit テンプレートは
+0077 の段階 6 で確定します）。
+
 `/etc/coldaisle` は 2 節で `root:coldaisle`・`0750` にしてあります。fand は補助グループ
 `coldaisle` でたどります。
 

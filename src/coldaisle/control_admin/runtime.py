@@ -108,8 +108,13 @@ def open_control_admin(
     clock: Clock,
     monotonic: MonotonicClock,
     server_uid: int | None = None,
+    run_id: str | None = None,
 ) -> ControlAdminEntry | None:
-    """管理ソケットを開き、受付スレッドと監査書き込みスレッドを起動する。開けなければ None。"""
+    """管理ソケットを開き、受付スレッドと監査書き込みスレッドを起動する。開けなければ None。
+
+    ``run_id`` は起動ごとの識別子。`coldaisle-fand` は Learned の経路（決定記録 0077 §2.3）と
+    同じ値を渡す。渡さなければここで作る。
+    """
     if not peer_credentials_supported():
         _log_not_opened("SO_PEERCRED が無いプラットフォームでは管理ソケットを開かない", config_path)
         return None
@@ -119,7 +124,8 @@ def open_control_admin(
     except Exception as error:
         _log_not_opened(f"管理ソケットの設定が不正: {type(error).__name__}: {error}", config_path)
         return None
-    run_id = new_run_id()
+    if run_id is None:
+        run_id = new_run_id()
     mailbox = AdminMailbox()
     audit = AuditWriter(
         open_sink=open_audit_sink,
