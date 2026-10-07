@@ -164,4 +164,39 @@ composition (0028 §2.4)       → Guard ceiling / floors, Safety floor, ramp_do
   `fan-policy.yaml` (`fan_policy_trace_binding`), and `_check_evidence()` refuses a report with any
   mismatched or missing tick (`MIN_EVIDENCE_REPORT_SCHEMA_VERSION` 4). Changing only the
   coordination `mode` therefore stops promotion until traces recorded under the new file exist.
-  The shadow summary tool and the Baseline arm of the offline evaluation remain open (0078 §5).
+  The Baseline arm of the offline evaluation is not recomputed: the evaluator reads the values the
+  loop recorded (the coordinated baseline on both the applied side and the 0053 shadow Fallback
+  value), and the arm key does not include the coordination `mode` (decision record 0093 §2.2).
+
+### Shadow summary (`coldaisle-air-balance-shadow`, decision record 0093)
+
+Before moving from `shadow` to `apply` (0078 §2.8), the owner reads a summary of the stored
+decision traces. The tool only reads the evidence database (`EvidenceDatabase`, `immutable=1`),
+writes one output file and **gives no verdict**: the shadow → apply criteria are decided with the
+owner after seeing real shadow data (0078 §5).
+
+```bash
+# var/air-balance-shadow-evidence.yaml
+#   schema_version: 1
+#   period: {start_ms: <start>, end_ms: <end>}   # [start_ms, end_ms)
+uv run coldaisle-air-balance-shadow --evidence var/air-balance-shadow-evidence.yaml \
+  --control-config var/control-config --out var/air-balance-shadow.json
+uv run coldaisle-air-balance-shadow --evidence var/air-balance-shadow-evidence.yaml \
+  --control-config var/control-config --format markdown --out var/air-balance-shadow.md
+```
+
+- Output: tick counts per `status` and per `skip_reason` (every key, zeros included); per zone,
+  the distribution of `counterfactual_output - candidate` over the ticks that recorded a
+  counterfactual (all of them, and the raised ones only), the number of raised ticks
+  (`counterfactual_output > candidate`) and how often raised / not raised switched between
+  consecutive evaluated ticks (skipped / failed ticks are left out of that sequence); the same for
+  "any zone raised"; and per zone the `skipped` ticks caused by a Fan fault of that zone.
+  A Top Fan fault is an unconditional `EMERGENCY`, so its tick reads `skip_reason: safety_state`;
+  the tool counts it from the same tick's `faults` (0088 §3).
+- Percentiles come from `config/air-balance-shadow.yaml` (no defaults in code).
+- The whole run is refused (nothing written, exit code 1) on a row outside the period, an index
+  that disagrees with the body, a trace older than `ControlTick` v14, or a tick whose
+  `fan-policy.yaml` / `air-balance.yaml` / `fan-hardware.yaml` hash differs from the given Control
+  Config. Pass separate periods instead.
+- The output is for a person. It is not promotion evidence, and nothing on the control side
+  imports the tool.
