@@ -1,0 +1,91 @@
+# coldaisle Learned MPC worker（#57 / #86 / 決定記録 0077 段階 6・0115）のテンプレート。
+#
+# **テンプレートである。** ユーザー名・グループ名・path は仮の値。RestartSec と資源の上限は**暫定値**。
+# 手順は docs/ubuntu-deploy.md 6.8。
+#
+# **置いても `systemctl enable` しない。** fand の有効化（0080 §2.10 の段階 5・0028 §2.9 の承認点 3）の後に、
+# 所有者の判断で有効にする（0115 §2.9）。それまでは段階 5 の確認で start するだけにする。
+#
+# worker が書けるのは coldaisle-fand への提案メッセージだけ（0077 §2.1）。提案は requested までで、
+# Reactive Guard と Critical Safety を迂回しない（AGENTS.md ルール2）。hwmon・シリアル・NVML・DB・
+# 管理ソケット・authority.json に触れない。
+[Unit]
+Description=coldaisle Learned MPC worker (proposals only, no hardware access)
+Documentation=file:///opt/coldaisle/docs/ubuntu-deploy.md
+# fand の後に起動するだけ。**Wants= / Requires= / BindsTo= / PartOf= / Requisite= を使わない**（0115 §2.5）。
+# worker の起動で Fan 制御を引き起こさない。fand の側も worker を参照しない（0077 §2.1）
+After=coldaisle-fand.service
+# fand の長い停止の後でも再起動を諦めない（0115 §2.5）
+StartLimitIntervalSec=0
+
+[Service]
+# sd_notify を送らない。deadman を養うのは fand だけ（0080 §2.2）
+Type=simple
+
+# 役割のグループを主グループに持つ専用のユーザー（仮の値。0077 §2.1 / §2.7・0115 §2.1）。
+# 受付の認可はアカウントの所属（主グループか gr_mem）で数えるので、SupplementaryGroups= で与えない。
+# coldaisle・coldaisle-fan・coldaisle-admin・coldaisle-authority・coldaisle-registry・dialout に入れない
+User=coldaisle-learn-mpc
+Group=coldaisle-learn-mpc
+# 何も書かない
+UMask=0077
+WorkingDirectory=/opt/coldaisle
+
+# --config-dir・--registry-root・--learned-channel-config と WorkingDirectory= は coldaisle-fand の unit と
+# **同じ値**にする。--metrics / --registry-limits は渡さず、作業ディレクトリ基準の既定（fand と同じファイル）を使う。
+# frame の config と metric_catalog_sha256 の照合が取り違えで外れ続けないようにするため（0107 §2.6・0115 §2.4）。
+# 較正ファイルは読まない（frame で受け取る。0101 §2.1）
+ExecStart=/opt/coldaisle/.venv/bin/coldaisle-learnd --role mpc --config-dir /etc/coldaisle/control-config --registry-root /var/lib/coldaisle-registry --learned-channel-config /etc/coldaisle/learned-channel.yaml
+
+# fand の再起動・停止で接続が切れると終了コード 3 で終わる（0113 §2.1）。それが通常の経路なので戻す。
+# 2（--role が未対応）は人が直すまで変わらないので戻さない。**3 と 5 は入れない**（5 は一時的な失敗も含む。0115 §2.5）
+Restart=on-failure
+# **暫定値**（0115 §2.5 / §5 の 7）
+RestartSec=5
+RestartPreventExitStatus=2
+
+# 資源の上限（**すべて暫定値**。段階 3 の shadow と 0080 段階 5 の実機の確認で決める。0115 §2.6）。
+# 片方の worker の暴走で、もう片方と fand を巻き込まない
+MemoryMax=1G
+TasksMax=32
+CPUWeight=20
+IOWeight=20
+Nice=10
+OOMScoreAdjust=500
+LimitCORE=0
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=coldaisle-learnd-mpc
+
+# hardening（0115 §2.7）。fand と違い ProtectKernelTunables=yes で /sys を読み取り専用にし、
+# hwmon へ書けないことを unit でも保証する（AGENTS.md ルール2）
+ProtectKernelTunables=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+# NVML・シリアルを開かない（ルール6）
+PrivateDevices=yes
+# ファイルの path の Unix ソケットは network namespace を越えて使える。TCP を持たない（ルール1）
+PrivateNetwork=yes
+RestrictAddressFamilies=AF_UNIX
+IPAddressDeny=any
+CapabilityBoundingSet=
+AmbientCapabilities=
+NoNewPrivileges=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+# DB・fand の状態・authority の journal。ファイル権限でも読めないが、権限の設定の誤りに備えて二重にする
+InaccessiblePaths=-/var/lib/coldaisle -/var/lib/coldaisle-fand -/var/lib/coldaisle-authority
+# MemoryDenyWriteExecute と SystemCallFilter は入れない（数値ライブラリと未確認。0080 §5 の 10）
+# RuntimeDirectory= / StateDirectory= を持たない（/run/coldaisle を持つのは fand だけ。0080 §2.7）
+
+[Install]
+WantedBy=multi-user.target
