@@ -664,7 +664,7 @@ CLI の書いた journal を読むと、走行中なら `SHADOW` へ下がり、
      sudo fuser -v /var/lib/coldaisle-registry/.registry.lock
      # fuser が無い・判別できないときは、lock の inode を /proc/locks で探す
      ino=$(sudo stat -c '%i' /var/lib/coldaisle-registry/.registry.lock)
-     grep ":$ino " /proc/locks    # 3列目が FLOCK、5列目が握っている pid
+     grep ":$ino " /proc/locks    # 2列目が FLOCK、5列目が握っている pid
      ps -o pid,user,etime,cmd -p <pid>
      ```
 
