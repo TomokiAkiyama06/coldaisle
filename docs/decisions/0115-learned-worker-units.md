@@ -184,7 +184,7 @@ MPC worker のグループ `coldaisle-learn-mpc` に**読み取りだけ**を足
 | `/etc/coldaisle/control-config` と4ファイル | ディレクトリ `r-x`・default `r--`・ファイル `r--` | §1 の 2。frame の `config` との照合（0107 §2.6）。書けない（root の所有） |
 | `/etc/coldaisle/learned-channel.yaml`（`root:coldaisle-fan`・`0640`） | `r--` | worker もソケットの path・`max_message_bytes` を読む |
 | `/var/lib/coldaisle-registry` | `r-x`・default `r-X` | 0104 §5 の 6。`registry.json` は書き手が原子置換で作り直すので、default ACL で新しいファイルへ継がせる |
-| 既にある `registry.json` と `artifacts/`（`-R`） | `r-X` | `inspect()` / `load_version()` で読む（lock を取らない・作らない）。**`-R` を root に掛けない**（`.registry.lock` に付いてしまう） |
+| 既にある `registry.json` と `artifacts/`（`-R`） | `r-X`。加えて `artifacts/` の下の**既にあるディレクトリすべて**に default `r-X`（`find artifacts -type d` に `setfacl -d -m`） | `inspect()` / `load_version()` で読む（lock を取らない・作らない）。`-R -m` は access ACL しか付けないので、default を別に付けないと、既にある `artifacts/…` の下に後から登録された版を worker が読めず `model_unusable` になる（0104 §2.2 が `-d` を別の行にしているのと同じ）。**`-R` を root に掛けない**（`.registry.lock` に付いてしまう） |
 | `/var/lib/coldaisle-registry/.registry.lock` | **worker のエントリを持たせない**（default ACL から継いだ分を `setfacl -x g:coldaisle-learn-mpc` で外す） | Linux の `flock(2)` は `O_RDONLY` の fd でも排他 lock を取れる（0104 §2.4 が承認者に `r` だけを与える理由と同じ）。worker が `r` を持つと、乗っ取られた・不具合のある worker が lock を握り続け、Registry の登録・promotion を止められる。worker は lock を使わない（0104 §2.4。制御は待たない） |
 
 - `coldaisle-authority` には入れない（0104 §5 の 6。journal を書けてしまう）
