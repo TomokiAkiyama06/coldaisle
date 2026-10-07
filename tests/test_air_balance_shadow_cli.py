@@ -456,6 +456,24 @@ def test_an_out_on_the_sidecar_of_a_symlinked_db_target_is_refused(setup: Fixtur
     assert not wal.exists()
 
 
+def test_a_symlinked_db_with_a_live_wal_beside_its_target_is_refused(setup: Fixture) -> None:
+    """symlink の `--db` でも、実体の隣に中身のある WAL があれば開かない（Codex P1）。"""
+    from coldaisle.evaluate import EvidenceDatabaseError
+
+    setup.store(mixed_ticks(setup))
+    link_dir = setup.db.parent / "pr81-link-dir"
+    link_dir.mkdir()
+    link = link_dir / "linked.db"
+    link.symlink_to(setup.db)
+    setup.db.with_name(setup.db.name + "-wal").write_bytes(b"uncheckpointed")
+    argv = setup.argv()
+    argv[argv.index("--db") + 1] = str(link)
+
+    with pytest.raises(EvidenceDatabaseError, match="静止していない"):
+        main(argv)
+    assert not setup.out.exists()
+
+
 @pytest.mark.parametrize("target", ["evidence", "config", "policy"])
 def test_an_aliased_input_is_refused_before_it_is_read(setup: Fixture, target: str) -> None:
     """壊れた入力を `--out` が指していても、読んで落ちる前に exit 1 で拒む（Codex P2）。"""

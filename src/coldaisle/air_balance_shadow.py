@@ -724,7 +724,9 @@ def main(argv: list[str] | None = None) -> int:
     period = manifest.period
     try:
         # **証拠の DB は読み取り専用で開く**（`immutable=1`。添え file に中身があれば開かない）。
-        with EvidenceDatabase(args.db) as store, store.snapshot():
+        # 実体の path で開く。`EvidenceDatabase` は添え file を渡した path の隣で確かめるので、
+        # symlink のまま渡すと実体の隣の未 checkpoint の WAL を見落として古い断面を読む。
+        with EvidenceDatabase(args.db.resolve()) as store, store.snapshot():
             traces = store.control_traces(period.start_ms, period.end_ms)
         report = build_report(
             traces, binding=config_binding(control), period=period, settings=settings
