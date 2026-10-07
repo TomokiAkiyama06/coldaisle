@@ -125,6 +125,8 @@ def test_empty_declaration_is_explicit(tmp_path):
             id="duplicate-item-key",
         ),
         pytest.param("schema_version: 1\nchanges: [\n", id="not-yaml"),
+        pytest.param("schema_version: 1\nchanges: []\n? [a, b]\n: 1\n", id="unhashable-key"),
+        pytest.param("schema_version: 1\nchanges: []\n1: x\n", id="non-string-key"),
     ],
 )
 def test_invalid_declaration_files_are_refused(tmp_path, text):

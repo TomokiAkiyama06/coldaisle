@@ -100,9 +100,14 @@ class _UniqueKeySafeLoader(yaml.SafeLoader):
 def _construct_unique_mapping(
     loader: _UniqueKeySafeLoader, node: yaml.MappingNode, deep: bool = False
 ) -> dict[Any, Any]:
-    seen: set[object] = set()
+    seen: set[str] = set()
     for key_node, _ in node.value:
         key = loader.construct_object(key_node, deep=deep)
+        if not isinstance(key, str):
+            # 鍵は文字列だけ（`? [a, b]` のような複合の鍵は hash できず、拒否の経路を外れる）
+            raise DeclaredChangesError(
+                f"mapping の鍵は文字列にする: {key!r}（行 {key_node.start_mark.line + 1}）"
+            )
         if key in seen:
             raise DeclaredChangesError(
                 f"重複した鍵がある: {key!r}（行 {key_node.start_mark.line + 1}）"
