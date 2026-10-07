@@ -183,10 +183,14 @@ MPC worker のグループ `coldaisle-learn-mpc` に**読み取りだけ**を足
 | `/etc/coldaisle` | `g:coldaisle-learn-mpc:--x` | たどるだけ。`coldaisle.env`（秘匿情報）と `control-admin.yaml` は読めないまま |
 | `/etc/coldaisle/control-config` と4ファイル | ディレクトリ `r-x`・default `r--`・ファイル `r--` | §1 の 2。frame の `config` との照合（0107 §2.6）。書けない（root の所有） |
 | `/etc/coldaisle/learned-channel.yaml`（`root:coldaisle-fan`・`0640`） | `r--` | worker もソケットの path・`max_message_bytes` を読む |
-| `/var/lib/coldaisle-registry` と中身 | `r-x`・default `r-X`（既にある中身には `-R` で `r-X`） | 0104 §5 の 6。`registry.json` と artifact を `inspect()` / `load_version()` で読む（lock を取らない・作らない） |
-| `/var/lib/coldaisle-registry/.registry.lock` | **足さない** | worker は lock を使わない（0104 §2.4。制御は待たない） |
+| `/var/lib/coldaisle-registry` | `r-x`・default `r-X` | 0104 §5 の 6。`registry.json` は書き手が原子置換で作り直すので、default ACL で新しいファイルへ継がせる |
+| 既にある `registry.json` と `artifacts/`（`-R`） | `r-X` | `inspect()` / `load_version()` で読む（lock を取らない・作らない）。**`-R` を root に掛けない**（`.registry.lock` に付いてしまう） |
+| `/var/lib/coldaisle-registry/.registry.lock` | **worker のエントリを持たせない**（default ACL から継いだ分を `setfacl -x g:coldaisle-learn-mpc` で外す） | Linux の `flock(2)` は `O_RDONLY` の fd でも排他 lock を取れる（0104 §2.4 が承認者に `r` だけを与える理由と同じ）。worker が `r` を持つと、乗っ取られた・不具合のある worker が lock を握り続け、Registry の登録・promotion を止められる。worker は lock を使わない（0104 §2.4。制御は待たない） |
 
 - `coldaisle-authority` には入れない（0104 §5 の 6。journal を書けてしまう）
+- **lock を作り直したとき（0104 §2.3 の導入手順・`docs/ubuntu-deploy.md` 6.7 の手順 4）も、worker のエントリを外す行を
+  同じ手順に並べる。** root の default ACL から継ぐため、外し忘れると上の穴が戻る。導入手順の `getfacl` の確認に
+  「lock に `group:coldaisle-learn-*` の行が無いこと」を足し、テンプレートの試験と同じく手順書の試験で並びを固定する
 - RL のグループ `coldaisle-learn-rl` への同じ ACL は、#89 で RL worker を動かすときに足す（いまは何も読めなくてよい）
 - `/opt/coldaisle`（コード・`config/metrics.yaml`・`config/model-registry.yaml`）は root の所有で誰でも読める
   （`docs/ubuntu-deploy.md` 2 節）ので、足すものは無い
