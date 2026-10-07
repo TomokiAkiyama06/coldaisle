@@ -1,7 +1,7 @@
 # 決定記録 0100: 再生の入力を export と照合する（日次 CSV の横に export の manifest を置いて timezone と元の DB を束縛し、dataset 用の再生と Dataset v2 の生成で照合して食い違えば拒否する）
 
 - **種別**: Decision Record
-- **Status**: FINAL（2026-10-07、リポジトリ所有者が §5 の14点をすべて推奨案で承認。§6。本記録が頼る 0099 は同日 FINAL）
+- **Status**: FINAL（2026-10-07、リポジトリ所有者が §5 の17点をすべて推奨案で承認。§6。本記録が頼る 0099 は同日 FINAL）
 - **Date**: 2026-10-07
 - **Supersedes**: 0099 §2.6 の2つの暫定運用の部分のみ（§2.9。段 3 のマージをもって、人の手順をコードの検査に置き換える）。
   (1)「再生の timezone」の項の「それまで、v2 の学習に使う再生は本番（export）と同じ timezone で行う」、
@@ -104,6 +104,11 @@ manifest の欄（仮。実装の PR で型と golden vector を固定する）:
   か「どの CSV とも対にならない `csv_exports` の行」で、どちらも §2.7 / §2.6 で v2 の学習に使えない側（安全側）に倒れる。
   同じ日を書き直すときは、rename の前に古い manifest を消す。`csv_exports` の古い行は消さない（追記のみ。新しい
   export は別の `export_id` の行になる）
+- **プロセス間の lock**（§5 #17）: `--export-day` は、出力ディレクトリに置く**日ごとの lock ファイル**（仮に
+  `.sensors_YYYY-MM-DD.export.lock`。`flock` の排他）を取ってから、一時ファイルの作成・DB の commit・古い manifest の
+  削除・CSV と manifest の2つの rename までを行い、その後で離す。同じ日の export が並行すると、SQLite は DB の commit を
+  順に並べても rename の順序は守らないので、CSV B と manifest A が対になって残りうる（PR #238 の Codex の指摘）。
+  lock を待つ上限は設定で持ち（コードに値を置かない）、取れなければ何も書かずに拒否する
 
 ### 2.2 export では timezone を必須にする
 
@@ -157,6 +162,10 @@ dataset 用でない再生（デバッグや画面の確認。0010）は次の�
   CSV を差し替えられると、照合を通っていない bytes が入る。PR #238 の Codex の指摘）
 - manifest が**無い** CSV は、従来どおり `--timezone` で当てはめる（0010 §2.7 のまま）。起動時に
   「timezone を照合していない」警告を1回出す
+- **manifest のある CSV と無い CSV が混ざる**とき（§5 #16）: manifest のある CSV の timezone（すべて同じ文字列で
+  なければ拒否）と、無い CSV に当てる実効の timezone（`--timezone`。省略時はその既定値）が文字列で違えば拒否する。
+  1つの再生の DB に2つの時刻の写像を混ぜない（PR #238 の Codex の指摘）。一致すれば、無い CSV にもその timezone を
+  当てて続ける
 
 ### 2.4 manifest と再生で同じ写像を使う
 
@@ -221,16 +230,42 @@ dataset 用でない再生（デバッグや画面の確認。0010）は次の�
 - **fingerprint**: `replay_fingerprint`（`replay_sha256`）に manifest の bytes も含める（CSV ごとに、CSV の後に
   manifest を、basename・長さ・内容で hash する）。同じ CSV でも manifest（timezone・`export_id`）が違えば
   fingerprint が変わる。fingerprint の規則に版を付け、manifest の無い入力の値はいまの規則のまま変えない（§5 #7）
-- **`dataset_source_run`**: bind のときに、再生に使った timezone と、入力の `export_id` の集合の digest（`export_id` を
-  並べ替えて連結した列の SHA-256）も記録する（段 2。migration で列を足す。manifest の無い run は両方 `NULL`。§2.3）。
+- **`dataset_source_run`**: bind のときに、再生に使った timezone と、入力の export の束縛の digest
+  （`export_binding_sha256`。下の「export の記録の digest」）も記録する（段 2。migration で列を足す。manifest の無い run は
+  両方 `NULL`。§2.3）。
   builder は DB の値と、`--replay-path` の manifest から計算した値（manifest が無ければ `NULL`）の一致を
   `_validate_dedicated_source_db` で求める。v1 の builder は `NULL` を受け入れ、v2 の builder は拒否する
 - **Dataset v2 の manifest**: v1 と共有している `SourceRun` には**足さない**。v1 の `DatasetManifest` と v2 の
   `DatasetManifestV2` は同じ `SourceRun` を埋め込み、`model_dump_json()` で書くので、`SourceRun` に欄を足すと
   版を上げないまま v1 の artifact に知らない欄が入り、`extra="forbid"` の古い v1 の reader が拒否する
-  （PR #238 の Codex の指摘）。代わりに v2 専用の型（仮に `ReplayBindingV2`: `local_timezone` と `export_ids`）を
+  （PR #238 の Codex の指摘）。代わりに v2 専用の型（仮に `ReplayBindingV2`）を
   `DatasetManifestV2` の source run ごとの欄として持つ。v2 の builder と学習の入口（0099 §2.6）は、この欄の無い・
   `--calibration-history-db` との照合（§2.6）を経ていない dataset を拒否する。v1 の型と書き出しは変えない
+- **export の記録の digest と `ReplayBindingV2` の中身**（§5 #15。PR #238 の Codex の指摘）: 学習の入口は公開済みの
+  dataset を読むだけで、`--replay-path` も manifest も持たない。そこで学習の入口が**元の manifest 無しで**
+  `csv_exports` と全欄を照合できるものを dataset に残す
+  - `export_record_sha256`: 1つの export の全欄（`schema_version` / `export_id` / `csv_name` / `csv_sha256` / `day` /
+    `timezone` / `day_start_ms` / `day_end_ms` / `timestamp_format` / `row_count` / `row_seconds_sha256`）の canonical JSON
+    （0096 §2.3 と同じキー順・区切り・末尾改行）の SHA-256。manifest からも `csv_exports` の行からも同じ関数で計算する
+  - `export_binding_sha256`: `export_id` の順に並べた `(export_id, export_record_sha256)` の列の canonical JSON の SHA-256
+  - `ReplayBindingV2` は `local_timezone`・`export_binding_sha256`・export ごとの `export_id` / `export_record_sha256` /
+    `day_start_ms` / `day_end_ms` / `csv_sha256` / `row_seconds_sha256` を持つ。`csv_name`（basename）は artifact に
+    書かず、digest の入力にだけ使う（0031 §2.3）
+  - **`SourceRun.source_sha256` との結びつき**: builder は (a) `--replay-path` の fingerprint が `source_sha256` と
+    一致すること（0031 §2.3）、(b) その入力に含まれる manifest の `csv_sha256` が対の CSV と一致すること、(c) その
+    manifest から計算した `export_binding_sha256` が `dataset_source_run` の値と一致すること、(d) §2.6 の `csv_exports`
+    との照合を、**同じ呼び出しの中で**確かめてから `ReplayBindingV2` を書く。fingerprint の入力は manifest の bytes を
+    含むので、`source_sha256` と `export_binding_sha256` は同じ入力の bytes から導かれる。dataset の manifest は
+    0031 §2.4 の checksum とともに公開され、二者は同じ公開物の中で組になる
+  - **学習の入口**は、`ReplayBindingV2` の各 `export_id` について `--calibration-history-db` の `csv_exports` の行を読み
+    （0099 §2.6 の `CalibrationHistory` と同じ読み取り専用の接続・同じ read transaction）、行から計算した
+    `export_record_sha256` が一致すること、`export_binding_sha256` を計算し直して一致すること、dataset のすべての
+    example の期間 `[history_start_ms, label_end_ms]` が束縛した export の日の区間 `[day_start_ms, day_end_ms)` の和に
+    収まることを確かめ、1つでも外れれば拒否する。期間の検査は、関係の無い正当な export の ID を名乗った dataset
+    （ID だけを他から借りた dataset）を、その export が覆わない期間の example で見つける
+  - それでも、学習の入口だけでは元の CSV の bytes を読み直せない。ID も期間も digest もそろえて手で組み立てた
+    dataset までは見分けられない（0031 §2.4 の公開物の checksum と、dataset を作る経路を1つに限ることに頼る）。
+    学習の入口に `--replay-path` を任意で渡せば、fingerprint を計算し直して `source_sha256` と照合する
 - `coldaisle-dataset` の CLI は `--replay-path` の manifest から timezone と `export_id` を読み、引数では受け取らない
   （人が打つ値を増やさない。食い違う値を入れる経路を作らない）
 
@@ -249,9 +284,9 @@ FINAL にした PR #238 で行い、「段 3 のマージをもって」と条�
 
 | 段 | 内容 | 依存 |
 |---|---|---|
-| 1 | 写像の関数（§2.4）・export の manifest と timezone の必須化（§2.1 / §2.2）・`csv_exports` の migration と export による追記（§2.6） | 0099 の migration（番号の順） |
-| 2 | 再生の照合（§2.3 / §2.5 / §2.7）と fingerprint の版（§2.8）、`dataset_source_run` の timezone と `export_id` の digest の migration と bind 時の記録（§2.8） | 段 1 |
-| 3 | `ReplayBindingV2`・builder の DB との照合・`csv_exports` との照合（§2.6）・v2 の builder と学習の入口の検査（§2.8）、`docs/thermal-dataset.md` の更新（§2.9） | 段 2、0099 の実装（`CalibrationHistory`） |
+| 1 | 写像の関数（§2.4）・export の manifest と timezone の必須化（§2.1 / §2.2）・日ごとの lock（§2.1）・`csv_exports` の migration と export による追記（§2.6）・`export_record_sha256` の関数（§2.8） | 0099 の migration（番号の順） |
+| 2 | 再生の照合（§2.3 / §2.5 / §2.7）と fingerprint の版（§2.8）、`dataset_source_run` の timezone と `export_binding_sha256` の migration と bind 時の記録（§2.8） | 段 1 |
+| 3 | `ReplayBindingV2`（export の記録の digest を含む）・builder の DB との照合・`csv_exports` との照合（§2.6）・v2 の builder と学習の入口の検査（§2.8）、`docs/thermal-dataset.md` の更新（§2.9） | 段 2、0099 の実装（`CalibrationHistory`） |
 
 `dataset_source_run` への記録は段 2 に含める。照合した値を段 2 で DB に残さないと、段 2 と段 3 の間に作った
 専用 DB は照合を通ったのに値を持たず、段 3 の検査を通れない。後から推測で埋めることも認めない（§2.7）ので、
@@ -271,6 +306,8 @@ export（段 1）:
 - 同じ日を書き直したとき、古い manifest が新しい CSV と対にならず、`csv_exports` には2行が残る
 - `csv_exports` の UPDATE / DELETE を trigger が拒否する。保持期間の削除で消えない。bind 済みの dataset DB では export を拒否する
 - 各段階（一時ファイル・DB の commit・rename）で落としたとき、残るものが §2.1 のとおり安全側である
+- 同じ日の export を2つ並行させても、残る CSV と manifest は同じ export の組である（lock）。lock を上限内に取れなければ何も書かない
+- `export_record_sha256` は manifest と `csv_exports` の行から同じ値になる（golden vector）
 
 再生（段 2）:
 
@@ -290,7 +327,9 @@ export（段 1）:
 - dataset 用でない再生: manifest の無い CSV は従来どおり読める（いまの `tests/test_replay.py` が通る）。
   manifest があり食い違えば拒否する
 - fingerprint: manifest の無い入力の値は本記録の前と同じ。manifest の bytes を変えると値が変わる
-- 照合した timezone と `export_id` の digest を、bind と同じ transaction で `dataset_source_run` に記録する
+- 照合した timezone と `export_binding_sha256` を、bind と同じ transaction で `dataset_source_run` に記録する
+- 通常の再生で manifest のある CSV と無い CSV が混ざり、manifest の timezone と `--timezone`（省略時は既定値）が
+  違えば拒否する。同じなら通る
 
 Dataset v2 の生成（段 3）:
 
@@ -301,6 +340,10 @@ Dataset v2 の生成（段 3）:
 - `dataset_source_run` の timezone・`export_id` の digest が manifest から計算した値と違えば拒否する
 - v2 の builder は `ReplayBindingV2` の無い source run と、「照合していない」（`NULL`）run を拒否する。v1 の manifest の bytes と型は本記録の前と同じ
   （v1 の golden の試験がそのまま通る）
+- 学習の入口: `ReplayBindingV2` の `export_record_sha256` が `csv_exports` の行と1つでも違う・行が無い・
+  `export_binding_sha256` が計算し直した値と違う・example の期間が束縛した日の区間の外にはみ出す、のどれでも拒否する。
+  元の manifest と CSV が無くても照合できる。別の正当な export の ID だけを借りた dataset は期間の検査で拒否される
+- `ReplayBindingV2` に CSV の basename が入らない
 - migration は追記のみで、既存の行と読み取り API を変えない
 
 ## 3. Consequences
@@ -346,7 +389,7 @@ Dataset v2 の生成（段 3）:
 
 ## 5. 未決事項（所有者に確認した点）
 
-2026-10-07、所有者が14点すべてを推奨案で決めた（§6）。番号は本文からの参照を保つため提案時のまま残し、各行の論点の先頭に「決着」と書いた。「代替」の列は判断前の記録である。
+2026-10-07、所有者が17点すべてを推奨案で決めた（§6。#15〜#17 は PR #238 の Codex の指摘を受けて同日に足した）。番号は本文からの参照を保つため提案時のまま残し、各行の論点の先頭に「決着」と書いた。「代替」の列は判断前の記録である。
 
 | # | 論点 | 推奨 | 代替 |
 |---|---|---|---|
@@ -364,10 +407,13 @@ Dataset v2 の生成（段 3）:
 | 12 | **決着**（2026-10-07 所有者の決定、推奨案）。`csv_exports` の書き手と置き場所 | **`coldaisle-rollup --export-day` だけが、readings を読んだのと同じ DB に書く**（§2.6）。保持期間の削除の対象にしない | export を別の CLI に分け、その CLI だけを書き手にする（書き手の境界ははっきりするが、運用の手順が1つ増える） |
 | 13 | **決着**（2026-10-07 所有者の決定、推奨案）。export の書く順序 | **一時ファイル → DB の commit → CSV の rename → manifest の rename**（§2.1）。どこで落ちても安全側 | DB の commit を最後にする（rename の後に落ちると、manifest はあるのに DB に行が無い CSV が残る。これも生成で拒否されるので安全側だが、export の成否の見分けが遅れる） |
 | 14 | **決着**（2026-10-07 所有者の決定、推奨案）。manifest の無い dataset 用の再生 | **「照合していない」run として bind し、v1 には使え、v2 の builder と学習の入口で拒否する**（§2.3）。混在は拒否 | 再生の時点で拒否する（v1 の再生成と既存の試験が止まる。PR #238 の Codex の指摘） |
+| 15 | **決着**（2026-10-07 所有者の決定、推奨案）。学習の入口で export の束縛を確かめる方法（PR #238 の Codex の指摘） | **dataset（`ReplayBindingV2`）と `dataset_source_run` に export ごとの全欄の digest `export_record_sha256` と、その列の digest `export_binding_sha256` を残し、学習の入口は較正の記録の DB の `csv_exports` から計算し直して照合する。example の期間が束縛した日の区間に収まることも確かめる。`source_sha256` とは builder が同じ入力の bytes から導いて組にする**（§2.8） | (a) 学習時に元の manifest と CSV（`--replay-path`）を必須にする（公開済みの dataset だけで学習できなくなる）。(b) `export_id` だけを残す（他の正当な export の ID を借りた dataset を見分けられない） |
+| 16 | **決着**（2026-10-07 所有者の決定、推奨案）。通常の再生で manifest のある CSV と無い CSV が混ざるとき（PR #238 の Codex の指摘） | **manifest の timezone と、無い CSV に当てる実効の timezone（`--timezone`、省略時は既定値）が違えば拒否する。同じなら続ける**（§2.3） | manifest の timezone を再生全体に当てる（無い CSV に人の指定と違う timezone を黙って当てる） |
+| 17 | **決着**（2026-10-07 所有者の決定、推奨案）。並行する export の扱い（PR #238 の Codex の指摘） | **出力ディレクトリの日ごとの lock ファイル（`flock`）の中で、一時ファイルの作成〜DB の commit〜古い manifest の削除〜2つの rename までを行う。待つ上限は設定、取れなければ何も書かず拒否**（§2.1） | DB ごとの lock（別の日の export まで直列になる。DB を共有しない出力ディレクトリには効かない） |
 
 ## 6. 承認記録
 
-**2026-10-07、リポジトリ所有者が §5 の14点をすべて推奨案で承認し、本記録を FINAL にした。**
+**2026-10-07、リポジトリ所有者が §5 の17点をすべて推奨案で承認し、本記録を FINAL にした。**
 
 | §5 の判断点 | 決定 | 本記録 |
 |---|---|---|
@@ -385,3 +431,6 @@ Dataset v2 の生成（段 3）:
 | 12 | `csv_exports` の書き手は `coldaisle-rollup --export-day` だけで、readings を読んだ DB に書く。保持期間の削除の対象にしない | §2.6 |
 | 13 | export は一時ファイル → DB の commit → CSV の rename → manifest の rename の順に書く | §2.1 |
 | 14 | manifest の無い dataset 用の再生は「照合していない」run として bind し、v1 には使え、v2 の builder と学習の入口で拒否する。混在は拒否 | §2.3 |
+| 15 | 学習の入口は、dataset に残した export ごとの全欄の digest と束縛の digest を、較正の記録の DB の `csv_exports` から計算し直して照合し、example の期間が束縛した日の区間に収まることも確かめる。`source_sha256` とは builder が同じ入力から組にする | §2.8 |
+| 16 | 通常の再生で manifest の有無が混在し、実効の timezone が食い違えば拒否する | §2.3 |
+| 17 | `--export-day` は日ごとのプロセス間 lock の中で、一時ファイルの作成から2つの rename までを行う | §2.1 |
