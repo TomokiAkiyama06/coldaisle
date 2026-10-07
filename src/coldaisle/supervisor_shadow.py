@@ -40,6 +40,7 @@ from coldaisle.clock import SimulatedClock
 from coldaisle.control.config import ControlConfig, SupervisorOutputBounds
 from coldaisle.control.model.thermal import canonical_json_bytes
 from coldaisle.control.model_registry import (
+    MODEL_REGISTRY_CONFIG_FILENAME,
     ArtifactKind,
     ArtifactRef,
     ModelCompatibility,
@@ -66,7 +67,12 @@ from coldaisle.control.supervisor import (
     SupervisorShadowUsageError,
     rule_policy_table,
 )
-from coldaisle.evaluate import EvidenceDatabase
+from coldaisle.evaluate import (
+    EvidenceDatabase,
+    EvidenceOutputError,
+    control_config_files,
+    refuse_output_on_inputs,
+)
 from coldaisle.store.models import ControlTraceRecord
 
 LOGGER = logging.getLogger("coldaisle.supervisor_shadow")
@@ -406,6 +412,26 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     logs.configure(args.log_level)
 
+    try:
+        # **どの入力を開くより前に**確かめる（#227）。`write()` は `os.replace()` で
+        # 置き換えるので、`--out` が DB を指すと証拠を報告で上書きする。
+        refuse_output_on_inputs(
+            args.out,
+            db=args.db,
+            inputs=(
+                args.evidence,
+                args.registry_limits / MODEL_REGISTRY_CONFIG_FILENAME,
+                *control_config_files(args.control_config),
+                args.rl_policy,
+            ),
+            input_roots=(args.registry_root,),
+        )
+    except EvidenceOutputError as error:
+        LOGGER.error(
+            "Supervisor の shadow 集計を拒否した（何も書かない）",
+            extra={logs.FIELDS_KEY: {"reason": str(error), "out": str(args.out)}},
+        )
+        return 1
     manifest = SupervisorShadowManifest.from_file(args.evidence)
     control = ControlConfig.from_directory(args.control_config)
     rl_policy, rl_policy_sha256 = RlPolicyConfig.from_file(args.rl_policy)

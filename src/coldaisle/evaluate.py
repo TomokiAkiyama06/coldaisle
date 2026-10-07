@@ -15,8 +15,9 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 import sqlite3
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
 from hashlib import sha256
 from pathlib import Path
@@ -125,6 +126,72 @@ SQLITE_MAGIC = b"SQLite format 3\x00"
 SIDECAR_SUFFIXES = ("-wal", "-journal")
 """書き込みが途中である／WAL に未 checkpoint の内容がある、ことを示す添え file。"""
 
+SQLITE_SIDECARS = ("-wal", "-journal", "-shm")
+"""SQLite が DB の隣に置く添え file すべて。`--out` がこれらを指しても DB を壊しうる。"""
+
+
+def sidecar_bases(path: Path) -> tuple[Path, ...]:
+    """添え file を探す基準: 渡された path と、**その実体**（symlink を解いた path）。
+
+    SQLite が添え file を置くのは**実体の隣**である。symlink の隣だけを見ると、
+    実体の隣にある未 checkpoint の WAL を見落とす（#227）。
+    """
+    return tuple(dict.fromkeys((path, path.resolve())))
+
+
+class EvidenceOutputError(ValueError):
+    """`--out` が入力（証拠の DB・添え file・manifest・設定）を指している（#227）。"""
+
+
+def control_config_files(directory: Path) -> tuple[Path, ...]:
+    """`--control-config` の4ファイル（`--out` で上書きさせない入力）。"""
+    return tuple(
+        directory / name
+        for name in ("fan-hardware.yaml", "safety.yaml", "fan-policy.yaml", "air-balance.yaml")
+    )
+
+
+def _same_file(left: Path, right: Path) -> bool:
+    if left.exists() and right.exists():
+        return os.path.samefile(left, right)
+    return left.resolve() == right.resolve()
+
+
+def refuse_output_on_inputs(
+    out: Path,
+    *,
+    db: Path,
+    inputs: Iterable[Path] = (),
+    input_roots: Iterable[Path] = (),
+) -> None:
+    """`--out` が入力を指していれば `EvidenceOutputError` で拒む（#227）。
+
+    証拠を読むだけの CLI は報告を `--out` へ書く（`write_text` / `os.replace()`）。
+    `--out` が DB を指すと**証拠を報告で上書きする**。読むだけの CLI を破壊的な操作に
+    しないため、**どの入力を読むより前に**呼ぶ（壊れた入力を読んで落ちる前に拒む）。
+
+    - `db` とその添え file（symlink の隣と実体の隣の両方）
+    - `inputs`: 読む file（manifest・設定など）
+    - `input_roots`: 中身をすべて入力として読むディレクトリ（Model Registry など）。
+      `--out` がこの下にあれば拒む
+    """
+    candidates = [
+        db,
+        *(
+            base.with_name(base.name + suffix)
+            for base in sidecar_bases(db)
+            for suffix in SQLITE_SIDECARS
+        ),
+        *inputs,
+    ]
+    for path in candidates:
+        if _same_file(out, path):
+            raise EvidenceOutputError(f"--out が入力のファイルを指している: {path}")
+    resolved = out.resolve()
+    for root in input_roots:
+        if resolved.is_relative_to(root.resolve()):
+            raise EvidenceOutputError(f"--out が入力のディレクトリの中を指している: {root}")
+
 
 class EvidenceDatabase:
     """評価が読む decision trace と観測。**開いても何も作らず、何も変えない。**
@@ -153,8 +220,13 @@ class EvidenceDatabase:
         header = path.read_bytes()[: len(SQLITE_MAGIC)]
         if header != SQLITE_MAGIC:
             raise EvidenceDatabaseError(f"証拠の DB が SQLite の file ではない: {path}")
-        for suffix in SIDECAR_SUFFIXES:
-            sidecar = path.with_name(path.name + suffix)
+        # 実体の隣も確かめる。呼び出し側が symlink のまま渡しても、SQLite が使う
+        # 添え file は実体の隣にある（#227）。
+        for sidecar in (
+            base.with_name(base.name + suffix)
+            for base in sidecar_bases(path)
+            for suffix in SIDECAR_SUFFIXES
+        ):
             if sidecar.is_file() and sidecar.stat().st_size > 0:
                 raise EvidenceDatabaseError(
                     f"証拠の DB が静止していない（{sidecar.name} が残っている）: {path}。"
@@ -369,7 +441,36 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     logs.configure(args.log_level)
 
-    manifest = RunsManifest.from_file(args.runs)
+    try:
+        # **どの入力を開くより前に**確かめる（#227）。
+        refuse_output_on_inputs(
+            args.out,
+            db=args.db,
+            inputs=(
+                args.runs,
+                args.config,
+                *control_config_files(args.control_config),
+                args.metrics,
+                *(() if args.acoustic is None else (args.acoustic,)),
+            ),
+        )
+        manifest = RunsManifest.from_file(args.runs)
+        # manifest が名指す export も入力。読む前に確かめる。
+        refuse_output_on_inputs(
+            args.out,
+            db=args.db,
+            inputs=(
+                args.runs.parent / spec.shadow_jsonl
+                for spec in manifest.runs
+                if spec.shadow_jsonl is not None
+            ),
+        )
+    except EvidenceOutputError as error:
+        LOGGER.error(
+            "Offline Evaluation を拒否した（何も書かない）",
+            extra={logs.FIELDS_KEY: {"reason": str(error), "out": str(args.out)}},
+        )
+        return 1
     context = build_context(
         config_path=args.config,
         control_dir=args.control_config,
