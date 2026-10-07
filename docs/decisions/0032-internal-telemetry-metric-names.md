@@ -4,6 +4,7 @@
 - **Status**: FINAL（2026-09-18、リポジトリ所有者が承認）
 - **Date**: 2026-09-18
 - **Supersedes**: なし（決定記録 0002 §2.1 の命名規約を具体化する）
+- **Superseded by**: [0110](0110-t-sensor-ceiling-and-enablement.md)（§2 の T_SENSOR の段落のうち、#50 の較正を有効化の前提にする点のみ。metric 名は有効）
 - **関連**: [`0002-metric-naming.md`](0002-metric-naming.md) / `docs/requirements.md` §5.1 /
   [`0029-telemetry-loss-classes.md`](0029-telemetry-loss-classes.md) §2.2・§2.4
 - **対象 Issue**: #65

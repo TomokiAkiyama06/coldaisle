@@ -70,10 +70,9 @@ class HwmonAdapter:
         if not math.isfinite(value):
             return Reading(metric=sensor.metric, value=None, quality=Quality.SUSPECT)
         quality = Quality.OK
-        if (
-            sensor.minimum is not None
-            and sensor.maximum is not None
-            and not sensor.minimum <= value <= sensor.maximum
+        # 範囲は片側だけのこともある（決定記録 0110 §2.4。T_SENSOR は下限 0 °C だけ）。
+        if (sensor.minimum is not None and value < sensor.minimum) or (
+            sensor.maximum is not None and value > sensor.maximum
         ):
             quality = Quality.SUSPECT
         return Reading(metric=sensor.metric, value=value, quality=quality)

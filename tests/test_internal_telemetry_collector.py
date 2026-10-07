@@ -297,11 +297,15 @@ def test_startup_audit_logs_disabled_reason_and_confirmation(caplog):
         getattr(record, logs.FIELDS_KEY)["metric"]: getattr(record, logs.FIELDS_KEY)
         for record in hwmon_records
     }
-    fields = by_metric["board.connector_12v2x6"]
-    assert fields["metric"] == "board.connector_12v2x6"
+    # 無効な入力は理由を残す（board.chipset は実機で常に 0 °C のため無効）。
+    fields = by_metric["board.chipset"]
+    assert fields["metric"] == "board.chipset"
     assert fields["enabled"] is False
-    assert fields["selector"] == "none"
-    assert fields["disabled_reason"].startswith("not installed")
+    assert fields["disabled_reason"].startswith("2026-09-18")
+    # T_SENSOR は決定記録 0110 で有効にした。
+    t_sensor = by_metric["board.connector_12v2x6"]
+    assert t_sensor["enabled"] is True
+    assert t_sensor["confirmation_status"] == "confirmed"
     confirmed = by_metric["fan.front.rpm"]
     assert confirmed["enabled"] is True
     assert confirmed["confirmation_status"] == "confirmed"
@@ -321,8 +325,10 @@ def test_periodic_metric_intervals_follow_the_configured_interval():
     for metric in ("cpu.tctl", "cpu.ccd1", "cpu.ccd2", "gpu.0.tlimit_margin", "gpu.0.fan_speed"):
         assert intervals[metric] == config.interval_ms
     assert intervals["gpu.0.throttle.hw_thermal"] == config.interval_ms
-    # 無効な T_SENSOR には期待値を作らない（未設置は欠測ではない）
-    assert "board.connector_12v2x6" not in intervals
+    # 無効な入力には期待値を作らない（無効の間は欠測ではない。決定記録 0038）
+    assert "board.chipset" not in intervals
+    # T_SENSOR は有効にした（決定記録 0110）ので欠測を数える
+    assert intervals["board.connector_12v2x6"] == config.interval_ms
 
 
 def test_rollup_entry_point_registers_internal_metrics(tmp_path: Path, rules):

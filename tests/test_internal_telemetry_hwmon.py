@@ -199,9 +199,55 @@ def test_stable_selector_rejects_hwmon_number_and_path():
         HwmonConfig(enabled=True, root=Path("/sys/class/hwmon/hwmon2"))
 
 
-def test_enabled_t_sensor_requires_calibrated_range():
-    with pytest.raises(ValidationError, match="#50"):
+def test_enabled_t_sensor_requires_a_minimum():
+    with pytest.raises(ValidationError, match="minimum"):
         sensor("board.connector_12v2x6", HwmonMeasurement.TEMPERATURE)
+    with pytest.raises(ValidationError, match="minimum"):
+        sensor("board.connector_12v2x6", HwmonMeasurement.TEMPERATURE, maximum=125.0)
+
+
+def test_range_may_be_one_sided_but_not_inverted():
+    """片側だけの範囲を許す（決定記録 0110 §2.4）。両方あるなら minimum < maximum。"""
+    assert sensor("cpu.package", HwmonMeasurement.TEMPERATURE, minimum=0.0).maximum is None
+    assert sensor("cpu.package", HwmonMeasurement.TEMPERATURE, maximum=125.0).minimum is None
+    with pytest.raises(ValidationError, match="minimum は maximum"):
+        sensor("cpu.package", HwmonMeasurement.TEMPERATURE, minimum=10.0, maximum=10.0)
+
+
+@pytest.mark.parametrize(
+    ("raw", "value", "quality"),
+    [
+        ("-40000", -40.0, Quality.SUSPECT),
+        ("-500", -0.5, Quality.SUSPECT),
+        ("0", 0.0, Quality.OK),
+        ("49500", 49.5, Quality.OK),
+        ("200000", 200.0, Quality.OK),
+    ],
+)
+def test_t_sensor_below_zero_is_suspect_and_there_is_no_upper_bound(
+    tmp_path: Path, raw: str, value: float, quality: Quality
+):
+    """断線時の負の値は suspect（使えない入力）。上限は置かない（0110 §2.4）。"""
+    device = tmp_path / "hwmon4"
+    write(device / "name", "example_ec")
+    write(device / "temp9_label", "T Sensor")
+    write(device / "temp9_input", raw)
+    reader = adapter(
+        tmp_path,
+        sensor(
+            "board.connector_12v2x6",
+            HwmonMeasurement.TEMPERATURE,
+            driver="example_ec",
+            label="T Sensor",
+            required=True,
+            minimum=0.0,
+        ),
+    )
+
+    reading = reader.poll().readings[0]
+
+    assert reading.value == value
+    assert reading.quality is quality
 
 
 def test_enabled_t_sensor_requires_confirmed_measurement_and_owner_approval():
@@ -235,7 +281,8 @@ def test_hwmon_poll_has_no_write_path(tmp_path: Path, monkeypatch: pytest.Monkey
     assert result.readings[0].value == 42.0
 
 
-def test_repository_config_keeps_uninstalled_t_sensor_disabled():
+def test_repository_config_enables_t_sensor_from_asusec_label():
+    """0110 §2.1 / §2.4: asusec の T_Sensor、下限 0 °C、上限なし、所有者承認の confirmed。"""
     config = InternalTelemetryConfig.from_yaml(
         CONFIG_DIR / "internal-telemetry.yaml",
         catalog=MetricCatalog.from_yaml(CONFIG_DIR / "metrics.yaml"),
@@ -244,14 +291,18 @@ def test_repository_config_keeps_uninstalled_t_sensor_disabled():
         item for item in config.hwmon.sensors if item.metric == "board.connector_12v2x6"
     )
 
-    assert not t_sensor.enabled
-    assert t_sensor.driver is None
-    assert t_sensor.label is None
+    assert t_sensor.enabled
+    assert t_sensor.driver == "asusec"
+    assert t_sensor.label == "T_Sensor"
     assert t_sensor.channel is None
-    assert t_sensor.minimum is None
+    assert t_sensor.required
+    assert t_sensor.minimum == 0
     assert t_sensor.maximum is None
-    assert t_sensor.confirmation is None
-    assert t_sensor.disabled_reason is not None
+    assert t_sensor.confirmation is not None
+    assert t_sensor.confirmation.status is ConfirmationStatus.CONFIRMED
+    assert t_sensor.confirmation.basis is not None
+    assert "2026-10-08" in t_sensor.confirmation.basis
+    assert t_sensor.disabled_reason is None
 
 
 def test_k10temp_labels_resolve_to_cpu_die_metrics(tmp_path: Path):

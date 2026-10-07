@@ -249,6 +249,12 @@ class TSensorTelemetry(_ConfigModel):
 
     enabled: ConfigValue[bool]
     stale_after_ms: SafetyMilliseconds | None = None
+    absolute_ceiling_c: SafetyFloat | None = None
+    """T_SENSOR 専用の絶対温度上限（決定記録 0110 §2.2）。
+
+    T_SENSOR はこの値だけで判定し、共通の ``absolute_temp_ceiling_c`` は使わない。
+    コネクタの外装温度は GPU / CPU / 空気の温度と許せる温度が違うため。
+    """
 
     @model_validator(mode="after")
     def _enabled_sensor_is_confirmed_and_timed(self) -> Self:
@@ -258,6 +264,13 @@ class TSensorTelemetry(_ConfigModel):
             raise ValueError("有効な T_SENSOR には stale_after_ms が必要")
         if not self.enabled.value and self.stale_after_ms is not None:
             raise ValueError("無効な T_SENSOR に stale_after_ms は指定しない")
+        # 有効なのに専用の上限が無いと、どの上限で判定するかが決まらない。旧い版 4 の
+        # 「共通の上限で T_SENSOR も判定する」意味で黙って読まないために必須にする
+        # （決定記録 0110 §2.6）。無効なのに上限があると、効いていない値を承認済みと読み違える。
+        if self.enabled.value and self.absolute_ceiling_c is None:
+            raise ValueError("有効な T_SENSOR には absolute_ceiling_c が必要")
+        if not self.enabled.value and self.absolute_ceiling_c is not None:
+            raise ValueError("無効な T_SENSOR に absolute_ceiling_c は指定しない")
         return self
 
 
@@ -286,6 +299,10 @@ class SafetyConfig(_ConfigModel):
     持ち続ける」上限が決まる（0028 §2.8 / ``docs/control-config.md`` の移行の規則）。
     """
     absolute_temp_ceiling_c: SafetyFloat
+    """T_SENSOR **以外**の温度の絶対上限（決定記録 0110 §2.2）。
+
+    T_SENSOR は ``telemetry.t_sensor.absolute_ceiling_c`` で判定する。
+    """
     zone_min_demand: PerZone[SafetyDemand]
     cpu_cooling_floor: Annotated[
         tuple[TemperatureDemandPoint, ...],
@@ -1333,6 +1350,12 @@ class ControlConfig(_ConfigModel):
                 "safety.yaml",
                 "telemetry.t_sensor.stale_after_ms",
                 safety.telemetry.t_sensor.stale_after_ms,
+            )
+        if safety.telemetry.t_sensor.absolute_ceiling_c is not None:
+            append(
+                "safety.yaml",
+                "telemetry.t_sensor.absolute_ceiling_c",
+                safety.telemetry.t_sensor.absolute_ceiling_c,
             )
 
         guard = self.policy.reactive_guard

@@ -35,7 +35,8 @@ T_SENSOR を有効化するときに `approved_t_sensor_metric` として承認�
 入力名と衝突せず、同時に注入する検証済み Metric Catalog に単位 `C` で存在することも
 起動時に検証する。
 設定で無効なあいだは欠測と絶対温度上限の対象にせず、
-`disabled_inputs` に理由を残す。有効化後だけ Critical とする。DS18B20 は一部欠測で
+`disabled_inputs` に理由を残す。有効化後だけ Critical とする。
+T_SENSOR の扱いは下の「T_SENSOR（決定記録 0110）」にまとめる。DS18B20 は一部欠測で
 `telemetry_health=DEGRADED` になっても Safety state と demand を変えず、
 State Estimator が `critical_unavailable` に `air_telemetry` を出す全滅時だけ
 Front / Rear へ fault demand を適用する。Critical Safety の構築時に
@@ -68,6 +69,24 @@ Hardware Backend が `external_faults` で報告する `TACH_STALL` も直接 la
 （readback の RPM が閾値以上でも timer を reset しない）。`stall_check_min_demand`
 未満では数えず、window 経過後に通常の tach stall と同じ応答にする。
 同じ tick は Startup の tach 応答確認にも数えない（確認は一度付くと消えないため）。
+
+## T_SENSOR（決定記録 0110）
+
+2026-10-08 に所有者が有効化を決めた（driver `asusec`・label `T_Sensor`。#50 の較正は未了）。
+
+- **上限は T_SENSOR 専用。** `safety.yaml` の `telemetry.t_sensor.absolute_ceiling_c`（本番 80 °C）だけで判定し、
+  共通の `absolute_temp_ceiling_c` は T_SENSOR **以外**の温度（CPU / GPU / 空気など）だけに使う。
+  欄は T_SENSOR が有効なら必須、無効なら指定不可（`stale_after_ms` と同じ）
+- 超えたときの扱いは既存の絶対温度上限と同じ（`値 >= 上限` で `absolute_temperature_limit`・`EMERGENCY`・全 zone Max。
+  解除は下の「合成と復帰」の規則）
+- fault の `detail` は metric ごとに `metric=値C (ceiling 上限C)` を残す。trace の `faults` に毎 tick 保存される
+- **ありえない値（0 °C 未満）は collector が判定する。** `config/internal-telemetry.yaml` の `minimum: 0` で
+  `suspect` になり、State Estimator が使えない入力とし、Critical Safety は `t_sensor_stale`
+  （Front / Rear を `fault_demand`、`DEGRADED`）にする。Critical Safety 自身は下限を持たない。上限側の妥当範囲は無い
+- 許容遅延は `telemetry.t_sensor.stale_after_ms`（本番 5000 ms = 収集周期 2500 ms の2倍）
+- 数え方（所有者の運用: 何度も超えるなら値を直す）: `GET /api/v1/control/traces` の `faults` で `code` が
+  `absolute_temperature_limit` かつ `detail` に `board.connector_12v2x6` を含む tick を拾い、直前の tick に無かったものを1回と数える
+- 本番での有効化の手順は `docs/control-config.md` の「T_SENSOR の有効化」
 
 ## 合成と復帰
 
