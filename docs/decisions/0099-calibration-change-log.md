@@ -74,8 +74,10 @@ mock（`--speed` の `SimulatedClock` を含む）の DB には mock の記録�
      圧縮再生の mock が時刻を先へ進めた DB を再び開いた、など）、**記録を書かず取り込みを起動しない**。記録の時刻だけを
      先へずらすと、時計は進まないので新しい較正の sample が記録より前の時刻で保存され、古い較正の値に見える
      （PR #234 の Codex の指摘）。時計を記録に合わせて進めることもしない（`WallClock` は進められず、ホストの時刻と
-     ずれた値を保存することになる）。この判定は**較正が変わらず記録を書かない起動では行わない**（値の意味が
-     変わらないので、時刻の前後は本記録の関心ではない）
+     ずれた値を保存することになる）
+  5. **較正が変わらず記録を書かない起動でも**、`clock.now_ms()` が最後の行の `ts_ms` **以下**なら取り込みを起動しない。
+     許すと、最後の行（A→B）の時刻より前の時刻で B の値が保存され、Dataset v2 は「B より前」の期間に B の値を含めて
+     しまう（PR #234 の Codex の指摘）。readings の最大の `ts_ms` との比較は、較正が変わる起動（4）だけで行う
   これで記録の時刻は、古い較正で保存した最後の値より**厳密に後**、新しい較正の最初の値**以前**になる
 - **`coldaisle-calibrate --apply` は記録を書かない。** ファイルを書いた時刻は store の値の意味が変わる時刻ではない
   （R4）。手で書き換えたファイルも、取り込みの起動時の比較で同じように記録される。`--apply` の出力と
@@ -118,15 +120,16 @@ mock（`--speed` の `SimulatedClock` を含む）の DB には mock の記録�
 | 列 | 内容 |
 |---|---|
 | `id` | `INTEGER PRIMARY KEY` |
-| `ts_ms` | §2.2 の3 / 4 の時刻（Unix ms, UTC）。直前の行より厳密に大きい |
+| `ts_ms` | §2.2 の3 / 4 / 5 の時刻（Unix ms, UTC）。直前の行より厳密に大きい |
 | `source_kind` | `serial` / `mock`（`replay` は書かない） |
 | `offsets_json` | §2.3 の canonical bytes を**そのまま**（末尾の改行 `\n` を含む）UTF-8 の文字列として持つ。`offsets_sha256` はこの文字列の UTF-8 の bytes の SHA-256 で、両者は同じ bytes を指す。**後の値**。前の値は直前の行の `offsets_json` |
 | `offsets_sha256` | §2.3 の4 の digest |
-| `previous_sha256` | 直前の行の `offsets_sha256`。最初の行だけ `NULL` |
+| `previous_row_sha256` | 直前の行の `row_sha256`。最初の行だけ `NULL` |
 | `calibrated_at` | 読んだ `calibration.json` の `calibrated_at`（説明用。比べない） |
 | `calibration_file_sha256` | 読んだ `calibration.json` の bytes の SHA-256（説明用。どのファイルの版かを git と突き合わせるため。比べない） |
+| `row_sha256` | 行の digest。`{ts_ms, source_kind, offsets_sha256, previous_row_sha256, calibrated_at, calibration_file_sha256}`（`id` と自身を除く全欄）を §2.3 の4 と同じ canonical JSON にした bytes の SHA-256。時刻を含む全欄を鎖に結ぶ（PR #234 の Codex の指摘） |
 
-- 「前後の実効 offset」は、`previous_sha256` で直前の行を指し、前の値を複製しない（複製すると食い違いうる）
+- 「前後の実効 offset」は、`previous_row_sha256` で直前の行を指し、前の値を複製しない（複製すると食い違いうる）
 - **自由記述の理由は持たない**（§5 #4）。理由は `calibration.json` の `note` と git の履歴、`coldaisle-memory` の
   運用メモリに残す
 - 実機の個体識別子（ROM・ホスト名・絶対パス）は入れない（AGENTS.md ルール 10）。`calibration_file_sha256` は
@@ -135,14 +138,16 @@ mock（`--speed` の `SimulatedClock` を含む）の DB には mock の記録�
 ### 2.5 追記のみの保証
 
 - UPDATE / DELETE を trigger で拒否する（`events` / `control_admin_audit` と同じ）
-- INSERT の trigger で、`ts_ms` が直前の行より大きいこと、`previous_sha256` が直前の行の `offsets_sha256` と
-  一致すること（表が空なら `NULL`）、`offsets_sha256 <> previous_sha256`（同じ値の行を足さない。R2）を検査する
+- INSERT の trigger で、`ts_ms` が直前の行より大きいこと、`previous_row_sha256` が直前の行の `row_sha256` と
+  一致すること（表が空なら `NULL`）、`offsets_sha256` が直前の行の `offsets_sha256` と違うこと（同じ値の行を
+  足さない。R2）を検査する（`row_sha256` 自体の計算は SQLite では検査せず、読む側が検証する）
 - CHECK で `json_valid(offsets_json)` / `json_type = 'object'` / digest の形（64桁の小文字16進）/ `ts_ms >= 0` /
   `source_kind IN ('serial', 'mock')` を持つ
 - 保持期間の削除（0008）の対象にしない。行は較正の変更ごとに1行で、量は問題にならない
 - trigger を外した DB を読んでも気づけるよう、読む側（§2.6）が**全行を検証**する: 各行の `offsets_json` を
   §2.3 の規約で解析・再直列化して同じ文字列（末尾の `\n` を含む）になること、その UTF-8 の bytes の SHA-256 が `offsets_sha256` と一致すること、
-  `previous_sha256` の鎖と `ts_ms` の単調増加。途中の行の削除・改変は鎖で見つかる。**最後の行の削除は
+  各行の `row_sha256` を全欄から計算し直して一致すること、`previous_row_sha256` の鎖、`ts_ms` の単調増加、
+  隣り合う行の `offsets_sha256` が違うこと。途中の行の削除・改変（`ts_ms` を隣の行の間で動かす改変を含む）は鎖で見つかる。**最後の行の削除は
   鎖では見つからない**（§3 の表）
 
 ### 2.6 Dataset v2 と学習の入口が必ず読む
@@ -192,7 +197,7 @@ mock（`--speed` の `SimulatedClock` を含む）の DB には mock の記録�
 
 - migration は空の表を作るだけで、**過去の履歴を埋めない**（いつどの較正が効いていたかを示す記録が無い。推測で
   埋めない）
-- migration の後の最初の取り込みの起動で、`previous_sha256 = NULL` の最初の行が入る。それより前のデータは
+- migration の後の最初の取り込みの起動で、`previous_row_sha256 = NULL` の最初の行が入る。それより前のデータは
   §2.6 の「被覆」を満たさないので Dataset v2 に使えない
 - 実データから作った v2 の dataset と artifact はまだ無い（0079 §1 / 0096 §2.8）。失うものは小さいが、
   migration 前に取り込んだデータを v2 の学習に使いたい場合の扱いは §5 #5 で確認する
@@ -207,12 +212,13 @@ mock（`--speed` の `SimulatedClock` を含む）の DB には mock の記録�
 - **全温度 metric**: どの温度チャネルの offset を `math.nextafter` だけ変えても行が増える（artifact の有無に依らない）
 - **時点**: 行の `ts_ms` は、その起動より前に保存した readings の最大の `ts_ms` より大きく、その起動で保存した最初の
   sample の `ts_ms` 以下。較正を変えて、時計（`SimulatedClock`）を保存済みの最後の時刻以下へ戻して起動すると、
-  記録を書かず起動しない。較正を変えずに同じ条件で起動すると、起動する
+  記録を書かず起動しない。較正を変えずに、時計を最後の行の `ts_ms` 以下へ戻して起動しても起動しない。較正を変えず、
+  時計が最後の行より後で readings の最大の `ts_ms` 以下なら起動する
 - **`--apply` と手の書き換え**: `--apply` は行を足さない。ファイルを書いた後、取り込みを再起動した時点で1行入る。
   手で書き換えたファイルも同じ
 - **replay**: `--source replay` は表を読みも書きもしない
 - **追記のみ**: UPDATE / DELETE / 鎖の合わない INSERT / 同じ digest の INSERT / `ts_ms` が戻る INSERT が拒否される
-- **読む側の検証**: trigger を外して途中の行を改変・削除した DB、非 canonical な `offsets_json`、digest の不一致を
+- **読む側の検証**: trigger を外して途中の行を改変（`ts_ms` だけを隣の行の間で動かす改変を含む）・削除した DB、非 canonical な `offsets_json`、digest の不一致を
   それぞれ拒否する。`mode=ro` で開き、読み込みで schema を進めない（`schema_version` が変わらない）
 - **Dataset v2**: 期間の中に行がある・区間 `[floor, ts]` の下端だけが期間に入る・期間の先頭以前に行が無い・表が無い、
   のそれぞれで拒否する。期間の外にだけ行があれば作れる。`declared_changes` を空にしても記録の行は効く。
@@ -235,7 +241,7 @@ mock（`--speed` の `SimulatedClock` を含む）の DB には mock の記録�
 | 悪くなること | 緩和策 |
 |---|---|
 | 取り込みが起動時に DB へ1行書く経路が増え、失敗すると起動しない（§5 #3 の推奨） | 書けない DB には readings も書けない。行は変化のときだけで、起動の大半は比較だけ |
-| 較正を変えたとき、時計が保存済みの最後の時刻より進んでいなければ取り込みが起動しない（§2.2 の4。圧縮再生で時刻を先へ進めた mock の DB など） | 較正が変わらない起動では判定しない。mock の DB は作り直せる。本番では壁時計が大きく戻ったときだけで、そのとき保存を始めると時刻の順も壊れる |
+| 較正を変えたとき、時計が保存済みの最後の時刻より進んでいなければ取り込みが起動しない（§2.2 の4。圧縮再生で時刻を先へ進めた mock の DB など） | 較正が変わらない起動では readings との比較はせず、最後の行の時刻とだけ比べる（§2.2 の5）。mock の DB は作り直せる。本番では壁時計が大きく戻ったときだけで、そのとき保存を始めると時刻の順も壊れる |
 | migration より前のデータは v2 の学習に使えない | 実データの v2 dataset はまだ無い。§5 #5 で例外の手順を確認する |
 | 最後の行の削除は鎖では見つからない（trigger を外した場合） | trigger で拒否する。学習の入口は較正ファイルと最後の行の一致を見るので、削除後にファイルだけ新しい状態は拒否される。完全には閉じない（DB への書き込み権限を持つ人を信頼する前提。`events` / `control_admin_audit` と同じ） |
 | Dataset の CLI が本番の DB の path を必須で受け取る（専用 DB と2つの DB を扱う） | 読み取り専用で開き、migration を当てない |
@@ -280,7 +286,7 @@ mock（`--speed` の `SimulatedClock` を含む）の DB には mock の記録�
 |---|---|---|
 | 1 | 記録先は、取り込みが書く SQLite DB の追記のみの新しい表 `calibration_activations` | §2.1 / §2.5 |
 | 2 | 書き手は `coldaisle-daemon`（serial / mock）だけで、起動時・ソースを読む前に、実効の写像が変わったときだけ1行。`--apply` は書かない。手で `calibration.json` を編集した変更も同じ経路で記録する（0096 §5 #4 の論点） | §2.2 |
-| 3 | 起動時に比較・追記に失敗したとき、または較正が変わったのに時計が保存済みの最後の時刻より進んでいないときは、取り込みを起動しない | §2.2 の4 / §2.7 |
+| 3 | 起動時に比較・追記に失敗したとき、または較正が変わったのに時計が保存済みの最後の時刻より進んでいないときは、取り込みを起動しない（較正が変わらない起動でも、時計が最後の行の時刻以下なら起動しない。§2.2 の5 は所有者の承認の後、PR #234 の Codex の指摘を受けて足した記録の訂正で、承認時に確認を求める） | §2.2 の4 / §2.7 |
 | 4 | 自由記述の理由は持たない | §2.4 |
 | 5 | migration より前に取り込んだデータは v2 の学習に使わない | §2.8 |
 | 6 | 0087 §2.6 は置き換えず、記録と呼び出し側の宣言の和集合を使う | §2.6 |
