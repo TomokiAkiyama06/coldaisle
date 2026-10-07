@@ -77,6 +77,8 @@
   - `runtime.config` の `fan-policy.yaml` / `air-balance.yaml` / `fan-hardware.yaml` の hash が、渡した
     Control Config の hash と違う tick（PR #220 の束縛と同じ3つ。`max_raise`・`mode`・較正・stable demand が
     違う区間を1つの分布に混ぜない。期間を分けて渡す）
+  - `--out` が入力（証拠の DB とその添え file・manifest・`config/air-balance-shadow.yaml`・Control Config の
+    4ファイル）を指す（symlink を含む）。書き出しは置き換えなので、読むだけの CLI が証拠を壊さないよう読む前に拒む
 
 #### 2.1.2 数え方
 

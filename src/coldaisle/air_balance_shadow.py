@@ -617,6 +617,40 @@ def write(
     return path
 
 
+_SQLITE_SIDECARS = ("-wal", "-journal", "-shm")
+"""証拠の DB の添え file。`--out` がこれらを指しても DB を壊しうる。"""
+
+
+def control_config_files(directory: Path) -> tuple[Path, ...]:
+    """`--control-config` の4ファイル（`--out` で上書きさせない入力）。"""
+    return tuple(
+        directory / name
+        for name in ("fan-hardware.yaml", "safety.yaml", "fan-policy.yaml", "air-balance.yaml")
+    )
+
+
+def _same_file(left: Path, right: Path) -> bool:
+    if left.exists() and right.exists():
+        return os.path.samefile(left, right)
+    return left.resolve() == right.resolve()
+
+
+def check_out_is_not_an_input(out: Path, *, db: Path, inputs: Iterable[Path]) -> None:
+    """`--out` が入力（証拠の DB とその添え file・manifest・設定）を指していれば拒む。
+
+    `write()` は `os.replace()` で置き換えるので、`--out` が DB を指すと**証拠を報告で
+    上書きする**。読むだけの CLI を破壊的な操作にしないため、読む前に拒む。
+    """
+    candidates = [
+        db,
+        *(db.with_name(db.name + suffix) for suffix in _SQLITE_SIDECARS),
+        *inputs,
+    ]
+    for path in candidates:
+        if _same_file(out, path):
+            raise AirBalanceShadowInputError(f"--out が入力のファイルを指している: {path}")
+
+
 def build_parser() -> argparse.ArgumentParser:
     """CLI の引数。**合否の閾値を受け取る口は作らない**（0093 §2.1）。"""
     parser = argparse.ArgumentParser(
@@ -674,6 +708,11 @@ def main(argv: list[str] | None = None) -> int:
     out: Path = args.out if args.out is not None else DEFAULT_OUT[report_format]
     period = manifest.period
     try:
+        check_out_is_not_an_input(
+            out,
+            db=args.db,
+            inputs=(args.evidence, args.config, *control_config_files(args.control_config)),
+        )
         # **証拠の DB は読み取り専用で開く**（`immutable=1`。添え file に中身があれば開かない）。
         with EvidenceDatabase(args.db) as store, store.snapshot():
             traces = store.control_traces(period.start_ms, period.end_ms)

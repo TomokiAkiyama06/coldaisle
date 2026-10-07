@@ -420,6 +420,38 @@ def test_a_rejected_run_writes_nothing(setup: Fixture) -> None:
     assert not setup.out.exists()
 
 
+@pytest.mark.parametrize("target", ["db", "wal", "evidence", "policy"])
+def test_an_out_that_aliases_an_input_is_refused(setup: Fixture, target: str) -> None:
+    """`--out` が DB・添え file・manifest・設定を指せば、読む前に拒んで何も書かない（Codex P1）。"""
+    setup.store(mixed_ticks(setup))
+    alias = {
+        "db": setup.db,
+        "wal": setup.db.with_name(setup.db.name + "-wal"),
+        "evidence": setup.evidence,
+        "policy": setup.config_dir / "fan-policy.yaml",
+    }[target]
+    before = alias.read_bytes() if alias.exists() else None
+    db_before = setup.db.read_bytes()
+    argv = setup.argv()
+    argv[argv.index("--out") + 1] = str(alias)
+
+    assert main(argv) == 1
+    assert setup.db.read_bytes() == db_before
+    assert (alias.read_bytes() if alias.exists() else None) == before
+
+
+def test_an_out_through_a_symlink_to_the_db_is_refused(setup: Fixture) -> None:
+    setup.store(mixed_ticks(setup))
+    db_before = setup.db.read_bytes()
+    link = setup.db.with_name("pr81-link.json")
+    link.symlink_to(setup.db)
+    argv = setup.argv()
+    argv[argv.index("--out") + 1] = str(link)
+
+    assert main(argv) == 1
+    assert setup.db.read_bytes() == db_before
+
+
 def test_an_index_that_disagrees_with_the_body_rejects_the_run(setup: Fixture) -> None:
     tick = setup.tick(0, shadow_record(0.0, 0.0, 0.0))
     row = as_row(tick).model_copy(update={"tick_id": 99})
