@@ -26,6 +26,8 @@ from coldaisle.control.schema import (
 )
 from coldaisle.control.state import (
     ControlInputContract,
+    ControlInputFrame,
+    ControlStateEstimator,
     ControlStateSnapshot,
     CriticalTelemetryGroup,
     FanState,
@@ -33,6 +35,7 @@ from coldaisle.control.state import (
     SnapshotSignal,
     TelemetryHealth,
     TelemetryImportance,
+    TelemetryReading,
 )
 from coldaisle.metrics import MetricCatalog, MetricMeta
 from coldaisle.store.models import Quality
@@ -62,6 +65,8 @@ def safety_config(
     write_limit: int = 3,
     ramp_down_per_s: float = 0.1,
     uniform_zone_min: float | None = None,
+    t_sensor_ceiling: float = 80.0,
+    t_sensor_stale_ms: int = 1_000,
 ) -> SafetyConfig:
     def value(raw: object) -> dict[str, object]:
         return tracked(raw, status)
@@ -73,7 +78,8 @@ def safety_config(
         )
     }
     if t_sensor_enabled:
-        t_sensor["stale_after_ms"] = value(1_000)
+        t_sensor["stale_after_ms"] = value(t_sensor_stale_ms)
+        t_sensor["absolute_ceiling_c"] = value(t_sensor_ceiling)
     zone_min = (
         {"front": 0.4, "rear": 0.4, "top": 0.5}
         if uniform_zone_min is None
@@ -127,7 +133,9 @@ def safety_config(
     )
 
 
-def input_contract(*, t_sensor_metric: str | None = None) -> ControlInputContract:
+def input_contract(
+    *, t_sensor_metric: str | None = None, t_sensor_stale_ms: int = 1_000
+) -> ControlInputContract:
     specs = [
         SignalSpec(
             metric="cpu.package",
@@ -149,7 +157,7 @@ def input_contract(*, t_sensor_metric: str | None = None) -> ControlInputContrac
                 SignalSpec(
                     metric=t_sensor_metric,
                     importance=TelemetryImportance.CRITICAL,
-                    stale_after_ms=1_000,
+                    stale_after_ms=t_sensor_stale_ms,
                 )
             ]
             if t_sensor_metric is not None
@@ -175,10 +183,13 @@ def critical_safety(
     *,
     approved_t_sensor_metric: str | None = None,
     metric_catalog: MetricCatalog | None = None,
+    t_sensor_stale_ms: int = 1_000,
 ) -> CriticalSafety:
     return CriticalSafety(
         config,
-        input_contract=input_contract(t_sensor_metric=approved_t_sensor_metric),
+        input_contract=input_contract(
+            t_sensor_metric=approved_t_sensor_metric, t_sensor_stale_ms=t_sensor_stale_ms
+        ),
         approved_t_sensor_metric=approved_t_sensor_metric,
         metric_catalog=metric_catalog,
     )
@@ -611,6 +622,239 @@ def test_t_sensor_disabled_is_ignored_but_enabled_loss_is_critical() -> None:
     assert enabled_result.state is SafetyState.DEGRADED
     assert enabled_result.faults[0].code is FaultCode.T_SENSOR_STALE
     assert enabled_result.zones.front.floor == 0.9
+
+
+# ------------------------------------------------ 決定記録 0110: T_SENSOR 専用の上限
+
+
+def t_sensor_safety(**config: object) -> CriticalSafety:
+    """T_SENSOR を有効にし、settle（STARTUP → NORMAL）まで進めた Critical Safety。"""
+    stale_ms = config.get("t_sensor_stale_ms", 1_000)
+    assert isinstance(stale_ms, int)
+    safety = critical_safety(
+        safety_config(t_sensor_enabled=True, fault_demand=0.9, **config),  # type: ignore[arg-type]
+        approved_t_sensor_metric=PROPOSED_T_SENSOR_METRIC,
+        metric_catalog=t_sensor_catalog(),
+        t_sensor_stale_ms=stale_ms,
+    )
+    cool = (signal(PROPOSED_T_SENSOR_METRIC, 50.0),)
+    first = safety.evaluate(snapshot(tick=1, mono=0, extra_signals=cool), mode=OperatingMode.AUTO)
+    assert first.state is SafetyState.STARTUP
+    settled = safety.evaluate(
+        snapshot(tick=2, mono=1_000, extra_signals=cool), mode=OperatingMode.AUTO
+    )
+    assert settled.state is SafetyState.NORMAL
+    return safety
+
+
+def t_sensor_at(value: float | None, quality: Quality = Quality.OK) -> tuple[SnapshotSignal, ...]:
+    return (signal(PROPOSED_T_SENSOR_METRIC, value, quality=quality),)
+
+
+@pytest.mark.parametrize(
+    ("value", "emergency"),
+    [(79.9, False), (80.0, True), (80.1, True)],
+)
+def test_t_sensor_uses_its_own_ceiling_at_the_boundary(value: float, emergency: bool) -> None:
+    """T_SENSOR は専用の上限（80 °C）で判定する。共通の上限（85 °C）未満でも緊急 Max。"""
+    safety = t_sensor_safety()
+
+    result = safety.evaluate(
+        snapshot(tick=3, mono=2_000, extra_signals=t_sensor_at(value)),
+        mode=OperatingMode.AUTO,
+    )
+
+    if emergency:
+        assert result.state is SafetyState.EMERGENCY
+        assert [fault.code for fault in result.faults] == [FaultCode.ABSOLUTE_TEMPERATURE_LIMIT]
+        assert all(result.zones.get(zone).forced_max for zone in Zone)
+        # trace だけで「どの metric が・何度で・どの上限に」触れたかを読める（0110 §2.3）。
+        assert f"{PROPOSED_T_SENSOR_METRIC}={value:g}C (ceiling 80C)" in result.faults[0].detail
+    else:
+        assert result.state is SafetyState.NORMAL
+        assert result.faults == ()
+
+
+@pytest.mark.parametrize("metric", ["gpu.0.core", "gpu.0.hotspot", "cpu.package"])
+def test_other_temperatures_below_the_common_ceiling_ignore_the_t_sensor_ceiling(
+    metric: str,
+) -> None:
+    """81 °C は T_SENSOR の上限（80）以上だが共通の上限（85）未満。T_SENSOR 以外は緊急にしない。"""
+    safety = t_sensor_safety()
+    if metric == "gpu.0.core":
+        current = snapshot(tick=3, mono=2_000, gpu=81.0, extra_signals=t_sensor_at(50.0))
+    elif metric == "cpu.package":
+        current = snapshot(tick=3, mono=2_000, cpu=81.0, extra_signals=t_sensor_at(50.0))
+    else:
+        current = snapshot(
+            tick=3,
+            mono=2_000,
+            extra_signals=(
+                *t_sensor_at(50.0),
+                signal(metric, 81.0, importance=TelemetryImportance.ADVISORY),
+            ),
+        )
+
+    result = safety.evaluate(current, mode=OperatingMode.AUTO)
+
+    assert FaultCode.ABSOLUTE_TEMPERATURE_LIMIT not in {fault.code for fault in result.faults}
+    assert not any(result.zones.get(zone).forced_max for zone in Zone)
+
+
+def test_gpu_at_the_common_ceiling_still_uses_the_common_ceiling() -> None:
+    safety = t_sensor_safety()
+
+    result = safety.evaluate(
+        snapshot(tick=3, mono=2_000, gpu=85.0, extra_signals=t_sensor_at(50.0)),
+        mode=OperatingMode.AUTO,
+    )
+
+    assert result.state is SafetyState.EMERGENCY
+    assert "gpu.0.core=85C (ceiling 85C)" in result.faults[0].detail
+
+
+def test_t_sensor_is_not_judged_by_the_common_ceiling() -> None:
+    """専用の上限が共通の上限より高いとき、共通の上限で T_SENSOR を緊急にしない。
+
+    T_SENSOR を共通の上限から外したことの確認（決定記録 0110 §2.2）。
+    """
+    safety = t_sensor_safety(t_sensor_ceiling=90.0)
+
+    above_common = safety.evaluate(
+        snapshot(tick=3, mono=2_000, extra_signals=t_sensor_at(87.0)),
+        mode=OperatingMode.AUTO,
+    )
+    at_own = safety.evaluate(
+        snapshot(tick=4, mono=3_000, extra_signals=t_sensor_at(90.0)),
+        mode=OperatingMode.AUTO,
+    )
+
+    assert above_common.state is SafetyState.NORMAL
+    assert above_common.faults == ()
+    assert at_own.state is SafetyState.EMERGENCY
+    assert "(ceiling 90C)" in at_own.faults[0].detail
+
+
+def test_t_sensor_ceiling_keeps_the_existing_hold_and_clear_rules() -> None:
+    """超えた後の stale は解消に数えず、fresh な上限未満が fault_clear_hold_ms 続いて解除。"""
+    safety = t_sensor_safety()
+
+    hot = safety.evaluate(
+        snapshot(tick=3, mono=2_000, extra_signals=t_sensor_at(80.0)), mode=OperatingMode.AUTO
+    )
+    stale = safety.evaluate(
+        snapshot(
+            tick=4,
+            mono=3_000,
+            critical=(PROPOSED_T_SENSOR_METRIC,),
+            extra_signals=t_sensor_at(None, Quality.STALE),
+        ),
+        mode=OperatingMode.AUTO,
+    )
+    fresh_below = safety.evaluate(
+        snapshot(tick=5, mono=4_000, extra_signals=t_sensor_at(70.0)), mode=OperatingMode.AUTO
+    )
+    before_hold = safety.evaluate(
+        snapshot(tick=6, mono=5_999, extra_signals=t_sensor_at(70.0)), mode=OperatingMode.AUTO
+    )
+    cleared = safety.evaluate(
+        snapshot(tick=7, mono=6_000, extra_signals=t_sensor_at(70.0)), mode=OperatingMode.AUTO
+    )
+
+    assert hot.state is SafetyState.EMERGENCY
+    assert stale.state is SafetyState.EMERGENCY
+    assert {fault.code for fault in stale.faults} == {
+        FaultCode.ABSOLUTE_TEMPERATURE_LIMIT,
+        FaultCode.T_SENSOR_STALE,
+    }
+    assert PROPOSED_T_SENSOR_METRIC in next(
+        fault.detail for fault in stale.faults if fault.code is FaultCode.ABSOLUTE_TEMPERATURE_LIMIT
+    )
+    assert fresh_below.state is SafetyState.EMERGENCY
+    assert before_hold.state is SafetyState.EMERGENCY
+    assert cleared.state is SafetyState.NORMAL
+    assert cleared.faults == ()
+
+
+def test_negative_t_sensor_reading_marked_suspect_is_critical_not_over_temperature() -> None:
+    """断線の負の値は collector の minimum（0 °C）で suspect になる。Critical（Front / Rear を
+    fault_demand）であって、絶対温度上限の fault ではない（決定記録 0110 §2.4 / 0029）。"""
+    safety = t_sensor_safety()
+
+    result = safety.evaluate(
+        snapshot(
+            tick=3,
+            mono=2_000,
+            critical=(PROPOSED_T_SENSOR_METRIC,),
+            extra_signals=t_sensor_at(-40.0, Quality.SUSPECT),
+        ),
+        mode=OperatingMode.AUTO,
+    )
+
+    assert result.state is SafetyState.DEGRADED
+    assert [fault.code for fault in result.faults] == [FaultCode.T_SENSOR_STALE]
+    assert result.zones.front.floor == 0.9
+    assert result.zones.rear.floor == 0.9
+    assert not result.zones.top.forced_max
+
+
+@pytest.mark.parametrize(("age_ms", "stale"), [(5_000, False), (5_001, True)])
+def test_t_sensor_stale_after_5000_ms_is_critical(age_ms: int, stale: bool) -> None:
+    """0110 §2.5 の 5000 ms（収集周期 2500 ms の2倍）。
+
+    State Estimator が stale を付け、Critical Safety が Critical（Front / Rear を fault_demand）
+    にする。
+    """
+    safety = t_sensor_safety(t_sensor_stale_ms=5_000)
+    contract = input_contract(t_sensor_metric=PROPOSED_T_SENSOR_METRIC, t_sensor_stale_ms=5_000)
+    estimator = ControlStateEstimator(contract, t_sensor_catalog())
+    now = 10_000
+
+    def reading(metric: str, value: float, changed: int = now) -> TelemetryReading:
+        return TelemetryReading(
+            metric=metric,
+            value=value,
+            quality=Quality.OK,
+            source_ts_ms=changed,
+            last_changed_mono_ms=changed,
+        )
+
+    frame = ControlInputFrame(
+        tick_id=3,
+        ts_ms=1_700_000_000_003,
+        monotonic_ms=now,
+        readings=(
+            reading("cpu.package", 60.0),
+            reading("gpu.0.core", 60.0),
+            reading("power.cpu.package", 50.0),
+            *(reading(metric, 25.0) for metric in AIR_METRICS),
+            reading(PROPOSED_T_SENSOR_METRIC, 50.0, changed=now - age_ms),
+        ),
+        fans=fans(),
+    )
+
+    result = safety.evaluate(estimator.build(frame), mode=OperatingMode.AUTO)
+
+    if stale:
+        assert result.state is SafetyState.DEGRADED
+        assert [fault.code for fault in result.faults] == [FaultCode.T_SENSOR_STALE]
+        assert result.zones.front.floor == 0.9
+    else:
+        assert result.state is SafetyState.NORMAL
+        assert result.faults == ()
+
+
+def test_disabled_t_sensor_keeps_the_common_ceiling_for_everything_else() -> None:
+    """無効なら従来どおり。GPU 81 °C は共通の上限（85）未満で NORMAL、85 °C で緊急。"""
+    safety = critical_safety(safety_config(t_sensor_enabled=False))
+    settle(safety)
+
+    below = safety.evaluate(snapshot(tick=3, mono=2_000, gpu=81.0), mode=OperatingMode.AUTO)
+    at = safety.evaluate(snapshot(tick=4, mono=3_000, gpu=85.0), mode=OperatingMode.AUTO)
+
+    assert below.state is SafetyState.NORMAL
+    assert at.state is SafetyState.EMERGENCY
+    assert "gpu.0.core=85C (ceiling 85C)" in at.faults[0].detail
 
 
 @pytest.mark.parametrize(

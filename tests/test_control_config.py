@@ -706,6 +706,7 @@ def test_disabled_t_sensor_has_no_stale_delay_and_enabled_sensor_needs_approval(
     documents["safety.yaml"]["telemetry"]["t_sensor"] = {
         "enabled": provisional(True),
         "stale_after_ms": provisional(1000),
+        "absolute_ceiling_c": provisional(80.0),
     }
     write_documents(tmp_path, documents)
     with pytest.raises(ValidationError, match="confirmed"):
@@ -718,6 +719,47 @@ def test_disabled_t_sensor_has_no_stale_delay_and_enabled_sensor_needs_approval(
     }
     write_documents(tmp_path, documents)
     assert ControlConfig.from_directory(tmp_path).safety.telemetry.t_sensor.enabled.value is True
+
+
+def test_enabled_t_sensor_needs_its_own_ceiling_and_disabled_sensor_must_not_have_one(
+    tmp_path: Path,
+) -> None:
+    """T_SENSOR 専用の上限は有効なら必須・無効なら指定不可（決定記録 0110 §2.2 / §2.6）。
+
+    有効なのに欄が無い旧い版 4 の書き方を、共通の上限で T_SENSOR も判定する意味で黙って読まない。
+    """
+    confirmed = {"value": True, "status": "confirmed", "basis": "docs/decisions/0110"}
+    documents = valid_documents()
+    documents["safety.yaml"]["telemetry"]["t_sensor"] = {
+        "enabled": confirmed,
+        "stale_after_ms": provisional(5000),
+    }
+    write_documents(tmp_path, documents)
+    with pytest.raises(ValidationError, match="absolute_ceiling_c"):
+        ControlConfig.from_directory(tmp_path)
+
+    documents["safety.yaml"]["telemetry"]["t_sensor"] = {
+        "enabled": provisional(False),
+        "absolute_ceiling_c": provisional(80.0),
+    }
+    write_documents(tmp_path, documents)
+    with pytest.raises(ValidationError, match="absolute_ceiling_c"):
+        ControlConfig.from_directory(tmp_path)
+
+    documents["safety.yaml"]["telemetry"]["t_sensor"] = {
+        "enabled": confirmed,
+        "stale_after_ms": {"value": 5000, "status": "confirmed", "basis": "0110 §2.5"},
+        "absolute_ceiling_c": provisional(80.0),
+    }
+    write_documents(tmp_path, documents)
+    config = ControlConfig.from_directory(tmp_path)
+    t_sensor = config.safety.telemetry.t_sensor
+    assert t_sensor.stale_after_ms is not None and t_sensor.stale_after_ms.value == 5000
+    assert t_sensor.absolute_ceiling_c is not None and t_sensor.absolute_ceiling_c.value == 80.0
+    # 暫定のままなら起動時の一覧に出る（確定値と混同しない）。
+    assert "telemetry.t_sensor.absolute_ceiling_c" in {
+        item.path for item in config.provisional_values()
+    }
 
 
 def test_enable_attribute_must_match_pwm_channel(tmp_path: Path) -> None:

@@ -23,19 +23,23 @@ hwmon:
   enabled: true
   root: /sys/class/hwmon
   sensors:
-    # T_SENSOR は未設置のため無効。設置と #50 の較正後に driver / label と
-    # 妥当範囲を記録し、人の承認を経て enabled にします（決定記録 0029 §2.4）。
+    # T_SENSOR（12V-2x6 コネクタ外装温度）。決定記録 0110。
+    # 同じ値が nct6799 の AUXTIN5 にも出るが、label で特定できる asusec の T_Sensor を使う。
+    # 断線時は負の値になるため、0 °C 未満を suspect（使えない入力）にする。上限側は根拠が無いので
+    # 置かない（safety.yaml の telemetry.t_sensor.absolute_ceiling_c で緊急 Max になる）。
+    # #50 の較正（誤差の測定）は未了。
     - metric: board.connector_12v2x6
-      enabled: false
-      driver: null
-      label: null
+      enabled: true
+      driver: asusec
+      label: T_Sensor
       channel: null
       measurement: temperature
       required: true
-      minimum: null
+      minimum: 0
       maximum: null
-      confirmation: null
-      disabled_reason: "not installed; enable only after #50 measurement and owner approval"
+      confirmation:
+        status: confirmed
+        basis: "2026-10-08 に実機で driver と label を読み取り確認、同日に所有者が承認。断線時は負の値（所有者の申告）、妥当範囲の下限 0 °C は所有者の承認"
 
     # --- 2026-09-18 所有者確認済みの対応（ASUS ProArt X870E-CREATOR WIFI）---
     # nct6799 のファン入力には label が無いため、driver 内の channel で指定する。

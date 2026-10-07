@@ -207,6 +207,7 @@ def confirmed_safety_document() -> dict[str, Any]:
     document["telemetry"]["t_sensor"] = {
         "enabled": {"value": True, "status": "confirmed", "basis": "test fixture"},
         "stale_after_ms": {"value": 1_000, "status": "confirmed", "basis": "test fixture"},
+        "absolute_ceiling_c": {"value": 80.0, "status": "confirmed", "basis": "test fixture"},
     }
     return document
 
@@ -1072,6 +1073,29 @@ def test_invariant_12_a_confirmed_safety_with_t_sensor_records_an_empty_premise(
     recorded = json.loads(harness.trace.rows[-1])
     assert recorded["safety_provenance"]["disabled_inputs"] == []
     assert recorded["safety_provenance"]["config_is_provisional"] is False
+
+
+def test_t_sensor_over_its_ceiling_is_recorded_in_the_trace(catalog) -> None:
+    """T_SENSOR が専用の上限に達した tick は trace の faults に値と上限が残る（0110 §2.3）。
+
+    所有者は超えた回数を trace から数えて値を見直す。数えられる形で保存されていることを確かめる。
+    """
+    harness = Harness(
+        catalog,
+        config=control_config(safety=confirmed_safety_document()),
+        t_sensor_metric=T_SENSOR_METRIC,
+    )
+    harness.telemetry.values[T_SENSOR_METRIC] = 40.0
+    harness.settle()
+
+    harness.telemetry.values[T_SENSOR_METRIC] = 80.0
+    result = harness.tick()
+
+    assert result.tick.state.safety_state is SafetyState.EMERGENCY
+    recorded = json.loads(harness.trace.rows[-1])
+    over = [fault for fault in recorded["faults"] if fault["code"] == "absolute_temperature_limit"]
+    assert len(over) == 1
+    assert f"{T_SENSOR_METRIC}=80C (ceiling 80C)" in over[0]["detail"]
 
 
 def test_invariant_12_every_tick_records_that_no_registry_was_read(catalog) -> None:
