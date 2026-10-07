@@ -129,7 +129,9 @@ digest は次の2つだけから決まる。
     これが loader に digest ではなく較正の値を渡す理由である
   - L8 が runtime の `MetricCatalog` と派生値の定義の一致を保証した後に計算するので、artifact の `derived` と
     runtime の定義は同じである
-  - `null` の artifact（較正の掛かる metric を使わない）は、runtime の較正の値に依らず L9 を通る
+  - **`null` は manifest の申告だけで信じない。** L9 はまず artifact の `metric_binding` から §2.2 の1〜3で較正の掛かる
+    metric の集合を導く。集合が空なら期待値は `null` で、manifest も `null` なら runtime の較正の値に依らず通る。
+    集合が空でないのに manifest が `null`、または集合が空なのに manifest が `null` でなければ拒否する
 - 照合は artifact を読み込むときだけで、tick ごとには行わない（0052 §2.6 と同じ。較正は起動時にしか読まない）
 
 ### 2.5 規則の版
@@ -154,8 +156,11 @@ PR #226 の引数（`calibration_sha256: Sha256 | None`）を次へ替える。�
   `RuntimeCalibration.available(offsets)` / `RuntimeCalibration.unavailable(reason)`）。空の `Mapping` で「読めなかった」を
   表さない。空の値は全チャネル 0.0 と同じ digest になり、0.0 で学習した `null` でない artifact が L9 を通ってしまうため
   （PR #229 の Codex の指摘）
-  - L9 は、`unavailable` なら manifest の digest が `null` でない artifact を**digest を比べる前に**拒否し、`null` の
-    artifact は通す（§5 #8）。`available` なら §2.4 のとおり計算して比べる
+  - L9 は、どちらの状態でも先に `metric_binding` から較正の掛かる metric の集合を導き、manifest の `null` /
+    非 `null` がそれと合うかを見る（§2.4）。`unavailable` のときは、集合が空（かつ manifest が `null`）の artifact
+    だけを通し、集合が空でない artifact は**digest を比べずに**拒否する（§5 #8）。manifest の `null` の申告だけで
+    通さない。本規則より前に任意の値で作られた、`air.*` を使うのに `null` の artifact を通さないため（PR #229 の
+    Codex の指摘）。`available` なら §2.4 のとおり計算して比べる
 - `check_artifact_contents` の `check_calibration=False`（作成時に L9 を飛ばす）はそのまま
 
 実装は #84 の後続の PR とし、#86（段 4）の束縛の切り替えより前にマージする（§5 #6）。
@@ -201,7 +206,9 @@ PR #226 の引数（`calibration_sha256: Sha256 | None`）を次へ替える。�
   読み込むと `ArtifactCheck.CALIBRATION` で拒否される
 - `d.*` を展開した先がまた `d.*` である entry を与えると、digest を作らず例外になる
 - **読めなかった較正**: `unavailable` を渡すと、全 offset が 0.0 で学習した `null` でない artifact も L9 で拒否され、
-  `null` の artifact は通る。`available({})`（空）は `unavailable` と別に扱われる
+  較正の掛かる metric を使わない `null` の artifact は通る。`available({})`（空）は `unavailable` と別に扱われる
+- **`null` の申告の検査**: `air.*` を使うのに manifest が `null` の artifact は、`available` でも `unavailable` でも
+  L9 で拒否される。`gpu.*` だけを使うのに manifest が `null` でない artifact も拒否される
 
 ## 3. Consequences
 
@@ -246,7 +253,7 @@ PR #226 の引数（`calibration_sha256: Sha256 | None`）を次へ替える。�
 | 5 | 0090 の config 束縛に較正ファイルを足すか | **足さない**（§2.7）。L9 → artifact 無し → 0089 で Baseline に落ちる経路で足りる | 足す（証拠に較正ファイルの hash を入れ、較正を変えたら authority の上限を直接 Baseline にする） |
 | 6 | §2.6 の実装をどの PR で行うか | **#84 の後続 PR**（`calibration_digest` と引数の置き換え・試験・golden vector）。#86 の段 4 より前 | #86 の段 4 の PR に含める |
 | 7 | 規則の版（`calibration-digest-v1`）を bytes や manifest に入れるか | **いまは入れない。** v2 の digest の意味を `calibration-digest-v1` と定義し、規則を変えるときは artifact の `schema_version` を上げる（§2.5。0079 §2.3 のまま） | いまのうちに `calibration_binding` に `rule` の欄を足す（manifest の形が変わる。実データの artifact が無い今なら移行の費用は小さい） |
-| 8 | runtime で較正ファイルを読めなかったとき | **`fand` の起動は止めず、loader へ `unavailable` を渡し、`null` でない artifact を L9 で拒否して Fallback**（`null` の artifact は通す。§2.6）。読めないことは構造化ログに出す | 起動を止める（較正ファイルが無いと Baseline でも動かない） |
+| 8 | runtime で較正ファイルを読めなかったとき | **`fand` の起動は止めず、loader へ `unavailable` を渡し、`null` でない artifact を L9 で拒否して Fallback**（較正の掛かる metric を使わない `null` の artifact だけ通す。`null` の申告だけでは通さない。§2.4 / §2.6）。読めないことは構造化ログに出す | 起動を止める（較正ファイルが無いと Baseline でも動かない） |
 
 ## 6. 承認記録
 
