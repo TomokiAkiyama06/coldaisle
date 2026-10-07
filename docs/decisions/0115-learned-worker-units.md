@@ -142,7 +142,7 @@
 | `Restart=` | `on-failure` | fand の再起動・停止で接続が切れると worker は終了コード 3 で終わる（0113 §2.1 の 1）。それが通常の経路なので戻す。SIGTERM の正常停止（0）では戻さない |
 | `RestartSec=` | `5`（**暫定値**） | fand の再起動（`STARTUP` の Max を通る）より遅れて接続すればよい。fand が止まっている間は5秒ごとに終了コード 3 を繰り返す |
 | `StartLimitIntervalSec=` | `0` | fand の長い停止の後でも、worker が諦めて戻らない状態を作らない |
-| `RestartPreventExitStatus=` | `2 5` | 2: `--role` が未対応（RL は #89 まで）。5: 設定・Metric Catalog・`learned-channel.yaml`・registry の設定を読めない。どちらも人が直すまで結果が変わらない（0080 §2.4 の `3 4` と同じ考え方）。3 は入れない |
+| `RestartPreventExitStatus=` | `2` | 2: `--role` が未対応（RL は #89 まで）。人が直すまで結果が変わらない（0080 §2.4 の `3 4` と同じ考え方）。**3 と 5 は入れない。** 3 は通常の経路。5（設定・Metric Catalog・`learned-channel.yaml`・registry の設定を読めない）は いまの CLI が起動時の読み込みの**すべての例外**を 5 にしており、一時的な I/O・資源の失敗と恒久的な設定の誤りを区別しない。止めると、原因が直っても人が再起動するまで Learned が戻らない。fand も終了コード 5 では再起動する（0080 §2.4）。設定の誤りでは `RestartSec` ごとに error のログを繰り返すが、Fallback に倒れるだけ（区別するなら CLI の終了コードを分ける別の Issue） |
 | 依存 | `After=coldaisle-fand.service` だけ。**`Wants=` / `Requires=` / `BindsTo=` / `PartOf=` / `Requisite=` を使わない** | worker の起動で fand（Fan 制御）を引き起こさない（fand の有効化は 0080 段階 5 の後）。fand の側も worker を参照しない（0077 §2.1「fand は worker に依存しない」。試験で禁止） |
 
 ### 2.6 資源の上限（すべて**暫定値**。段階 3 の shadow で測ってから決める）
@@ -239,7 +239,7 @@ MPC worker のグループ `coldaisle-learn-mpc` に**読み取りだけ**を足
   root でないこと。`SupplementaryGroups=` が無いこと。fand の `SupplementaryGroups=` に worker のグループが無いこと
 - `--config-dir`・`--registry-root`・`--learned-channel-config` と `WorkingDirectory=` が fand と同じで、
   `--metrics` / `--registry-limits` を渡さない（既定を共有する）こと。worker に `--calibration` が無いこと
-- `Restart=on-failure`・`StartLimitIntervalSec=0`・`RestartPreventExitStatus` が `{2, 5}` ちょうどで、その値が
+- `Restart=on-failure`・`StartLimitIntervalSec=0`・`RestartPreventExitStatus` が `{2}` ちょうどで、その値が
   `coldaisle.learned_worker.cli` の定数と一致すること
 - worker の unit に `Requires=` / `BindsTo=` / `PartOf=` / `Requisite=` / `Wants=` が無く、fand の unit が worker を
   参照しないこと
@@ -290,7 +290,7 @@ MPC worker のグループ `coldaisle-learn-mpc` に**読み取りだけ**を足
 | 4 | fand の `ExecStart` | `--calibration`・`--registry-root`・`--learned-channel-config` を常に入れ、`--t-sensor-metric` はコメント（§2.3） | §4 の B（drop-in）・Learned の2つもコメントにする |
 | 5 | unit の分け方と名前 | 役割ごとの2ファイル `coldaisle-learnd-mpc` / `coldaisle-learnd-supervisor`（§2.1） | §4 の E |
 | 6 | 実行ユーザー | 役割のグループを主グループに持つ専用ユーザー `coldaisle-learn-mpc` / `coldaisle-learn-rl`（§2.1） | 1つの worker ユーザーを補助グループで分ける（0077 §2.1 の「別のユーザー」に反する） |
-| 7 | `Restart` | `on-failure`・`RestartSec=5`（暫定）・`StartLimitIntervalSec=0`・`RestartPreventExitStatus=2 5`（§2.5） | `RestartSteps=` での伸長・`Restart=always` |
+| 7 | `Restart` | `on-failure`・`RestartSec=5`（暫定）・`StartLimitIntervalSec=0`・`RestartPreventExitStatus=2`（§2.5。5 は再起動する） | 5 も止める（一時的な失敗の後に戻らない）・`RestartSteps=` での伸長・`Restart=always` |
 | 8 | 資源の上限 | §2.6 の暫定値 | 上限を置かない（片方の暴走が fand を巻き込む） |
 | 9 | 依存 | `After=coldaisle-fand.service` だけ（§2.5） | §4 の F・`PartOf=`（fand の停止で worker も止まる。終了コード 3 で同じことが起きるので要らない） |
 | 10 | worker の制御設定の読み取り（§1 の 2） | 0104 §2.2 と同じ形の ACL を役割のグループに（§2.8） | fand が frame で設定の中身を運ぶ（0107 の照合の意味が変わる。別の記録が要る） |
