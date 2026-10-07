@@ -58,9 +58,14 @@ class Calibration(BaseModel):
         黙って「補正なし」へ落ちない。較正済みのつもりで生値を保存していると、
         あとから見分ける手段が無い。
         """
-        loaded: Any = json.loads(path.read_text(encoding="utf-8"))
+        return cls.from_json_bytes(path.read_bytes(), origin=str(path))
+
+    @classmethod
+    def from_json_bytes(cls, data: bytes, *, origin: str) -> Calibration:
+        """読んだ bytes から作る。取り込みは同じ bytes の hash を較正の記録に残す（0099 §2.4）。"""
+        loaded: Any = json.loads(data.decode("utf-8"))
         if not isinstance(loaded, dict):
-            raise ValueError(f"較正ファイルが辞書ではない: {path}")
+            raise ValueError(f"較正ファイルが辞書ではない: {origin}")
         return cls.model_validate(loaded)
 
     def offset_for(self, channel: str) -> float:

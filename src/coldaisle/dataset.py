@@ -22,6 +22,7 @@ from pathlib import Path
 
 from pydantic import ValidationError
 
+from coldaisle.calibration_log import calibration_change_points, require_history_covers
 from coldaisle.clock import WallClock
 from coldaisle.control.drift.model import ChangeKind, DeclaredChange
 from coldaisle.control.model.dataset import (
@@ -50,6 +51,7 @@ from coldaisle.control.model.dataset import (
 from coldaisle.control.schema import ControlTick, PerZone, Zone
 from coldaisle.ingest.replay import replay_sha256
 from coldaisle.store import Quality, QualityRules, SeriesPoint, SqliteStore
+from coldaisle.store.calibration_history import CalibrationHistory
 from coldaisle.store.models import ControlTraceRecord, SequencedControlTrace
 
 MANIFEST_FILENAME = "manifest.json"
@@ -267,12 +269,24 @@ class ThermalDatasetV2Builder:
         source_run: SourceRun,
         spec: DatasetSpecV2,
         declared_changes: tuple[DeclaredChange, ...],
+        calibration_history: CalibrationHistory,
     ) -> ThermalDatasetV2:
         """1 source run を決定的に変換する。
 
         ``declared_changes`` は 0056 §2.5 の宣言された変更で、**既定値を持たない**。宣言が無い場合も
         空の tuple を明示する（0087 §2.6）。そのうち ``calibration_changed`` が全 example の期間に
         あれば生成を拒否する。
+
+        ``calibration_history`` は本番の DB から読み取り専用で読んだ較正の変更の記録で、**既定値を
+        持たない**（決定記録 0099 §2.6）。専用 DB（再生）には記録が無いので別に渡す。example が
+        1件以上あれば、
+
+        - 全 example の期間の先頭以前に記録の行が無ければ拒否する（被覆）
+        - 各行を CSV の秒の切り捨ての区間 ``[floor(ts), ts]`` とし、両端を変更の時刻として
+          宣言との**和集合**で 0087 §2.6 の検査へ渡す
+
+        example が0件の dataset では被覆と変更の検査を行わない（記録の読み込みの検証は
+        :func:`~coldaisle.store.calibration_history.read_calibration_history` が済ませている）。
 
         次の run からは生成しない（example の除外ではなく、生成全体の拒否。0087 §2.1）。
 
@@ -287,6 +301,10 @@ class ThermalDatasetV2Builder:
             isinstance(change, DeclaredChange) for change in declared_changes
         ):
             raise TypeError("declared_changes は DeclaredChange の tuple を明示して渡す")
+        if not isinstance(calibration_history, CalibrationHistory):
+            raise TypeError(
+                "calibration_history は read_calibration_history() の結果を明示して渡す"
+            )
         calibration_changes = tuple(
             change.ts_ms
             for change in declared_changes
@@ -333,6 +351,11 @@ class ThermalDatasetV2Builder:
                     )
                 )
         built = tuple(examples)
+        if built:
+            require_history_covers(
+                calibration_history, min(example.history_start_ms for example in built)
+            )
+            calibration_changes += calibration_change_points(calibration_history)
         reject_calibration_changes(built, calibration_changes)
         return ThermalDatasetV2(
             manifest=DatasetManifestV2(
