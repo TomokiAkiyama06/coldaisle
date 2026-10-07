@@ -47,6 +47,7 @@ uv run coldaisle-fand --config-dir var/control-config  # 4ファイル（air-bal
 #   既定の設定は同じ uid を認めない（socket.group は仮の名前。配置先の専用グループへ置き換える）
 uv run coldaisle-fand --admin-config config/control-admin.dev.yaml  # 開発用: 同じ uid から操作できる（**本番で使わない**）
 uv run coldaisle-fand --authority-root var/authority  # Authority Stage の journal（authority.json）の場所。起動時に読めなければ制御を取らない（#92 / 決定記録 0057 / 0072 §2.6）
+uv run coldaisle-fand --learned-channel-config config/learned-channel.yaml  # Learned worker との経路を開く（役割ごとの SOCK_SEQPACKET。省くと開かない。不正なら Learned だけ無効で運転。#86 / 決定記録 0077）
 uv run coldaisle-control status     # coldaisle-fand の運転モードを読む（管理ソケット。#74 / 決定記録 0072。**人が使う**）
 uv run coldaisle-control max --reason "負荷試験の前に全開"  # MAX（期限なし）。manual は --front/--rear/--top と --lease が必須
 uv run coldaisle-control rollback-authority --reason "挙動を見直す"  # Authority を Baseline へ（lower-authority --to-stage も。**上げる操作は無い**。#92）
@@ -251,6 +252,7 @@ src/coldaisle/
   supervisor_shadow.py # 合成の起点: 保存済み trace から Supervisor の Shadow 集計（読み取りのみ。制御へ届かない）。#89
   event_entry/ # 合成の起点: 書き込み専用の Unix ソケット入口。AI 層・API から import しない。#67
   control_admin/ # 合成の起点: coldaisle-fand の管理ソケット（運転モードと Authority の降格。昇格は受けない）。AI 層・API・eventd・control から import しない。#74 / #92 / 決定記録 0072
+  learned_channel/ # 合成の起点: Learned worker と coldaisle-fand の経路（役割ごとのソケット・受付スレッド・frame の送り出し）。control・AI 層・API・control_admin から import しない。#86 / 決定記録 0077
   local_socket.py # レイヤ横断: Unix ソケット入口に共通の門（SO_PEERCRED・権限・起動時の検査）。0045 / 0072 §2.5
   authority_cli.py # 合成の起点: `coldaisle-authority raise` / `rollback`。`raise_stage()` を呼ぶ唯一の場所。**どこからも import しない**。#92 / 決定記録 0086
   rollup_job.py # 合成の起点: `coldaisle-rollup` の入口（周期メトリクスを Store へ渡す）。#65
@@ -283,7 +285,7 @@ src/coldaisle/
   web/        # L4: 静的アセット。airflow-trace.js が decision trace の版の解釈を1か所で持つ（0071 §2.3）
 firmware/     # ESP32-S3 Arduino スケッチ。**コンパイルは人の手**（#11 / 決定記録 0022 §2.9）
 deploy/       # Ubuntu 常駐化のテンプレート（systemd / udev）。**仮の値だけ**。手順は docs/ubuntu-deploy.md（#57）
-config/       # rules.yaml, calibration.json, coldaisle.toml, evaluation.yaml, drift.yaml, rl-training.yaml, soak.yaml, control-admin.yaml / control-admin.dev.yaml（Control Config の4ファイル fan-hardware / safety / fan-policy / air-balance は実運用のものを置かない。docs/control-config.md）
+config/       # rules.yaml, calibration.json, coldaisle.toml, evaluation.yaml, drift.yaml, rl-training.yaml, soak.yaml, control-admin.yaml / control-admin.dev.yaml, learned-channel.yaml（Control Config の4ファイル fan-hardware / safety / fan-policy / air-balance は実運用のものを置かない。docs/control-config.md）
 memory/       # 運用メモリ（いまの閾値・較正値）。`coldaisle-memory` が更新案を出す
 docs/         # 要件定義、仕様レビュー、ADR
 tests/
