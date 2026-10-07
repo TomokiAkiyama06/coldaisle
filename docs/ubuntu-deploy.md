@@ -704,7 +704,7 @@ CLI の書いた journal を読むと、走行中なら `SHADOW` へ下がり、
    （制御設定の4ファイルと Registry のデータのファイル（`registry.json`・`artifact.payload`）は `mask::r--`、
    ディレクトリは `mask::rwx` / `r-x`、**`.registry.lock` は `mask::rw-`**）。lock の mask を `r--` に下げないで
    ください。書き手は lock を `O_RDWR` で開くので、グループ `coldaisle-registry` の書き込みが削られると Registry の
-   書き込みがすべて lock を開くところで失敗します（承認者の `group:coldaisle-authority:r--` は mask に依らず `r`）。
+   書き込みがすべて lock を開くところで失敗します（承認者の `group:coldaisle-authority:r--` は mask `rw-` の下でも `r` のまま効く）。
    Registry の root は `drwxrws---+`・`root:coldaisle-registry`、lock は `-rw-rw----+`・`root:coldaisle-registry`
    であること
 
