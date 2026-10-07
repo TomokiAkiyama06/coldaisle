@@ -35,7 +35,7 @@ from coldaisle.control.model.dataset import (
 from coldaisle.dataset import ThermalDatasetBuilder, ThermalDatasetV2Builder, write_dataset
 from coldaisle.drift import DATASET_EXAMPLES_FILENAME, DATASET_MANIFEST_FILENAME, load_inputs
 from coldaisle.store import Quality, QualityRules, Reading, Sample, SqliteStore
-from test_thermal_dataset_v2 import T0, covering_history
+from test_thermal_dataset_v2 import FIXTURE_BINDING, T0, covering_export_binding, covering_history
 from test_thermal_model_v2 import (
     CATALOG,
     published,
@@ -137,8 +137,8 @@ def make_store(
             source_kind="replay",
             source_sha256=SHA256,
             at_ms=0,
-            local_timezone=None,
-            export_binding_sha256=None,
+            local_timezone=FIXTURE_BINDING[0],
+            export_binding_sha256=FIXTURE_BINDING[1],
         )
         store.insert_samples(readings())
         store.complete_dataset_source_run(at_ms=END_MS)
@@ -167,13 +167,13 @@ def v1_dataset(make_store) -> ThermalDataset:
 @pytest.fixture
 def v2_dataset(make_store) -> ThermalDatasetV2:
     store = make_store(SEQUENTIAL_TICKS)
+    dedicated = store.connection.execute("PRAGMA database_list").fetchone()[2]
     return ThermalDatasetV2Builder(store).build(
         source_run=source_run(),
         spec=v2_spec(),
         declared_changes=(),
-        calibration_history=covering_history(
-            store.connection.execute("PRAGMA database_list").fetchone()[2]
-        ),
+        calibration_history=covering_history(dedicated),
+        export_binding=covering_export_binding(dedicated),
     )
 
 
@@ -333,6 +333,11 @@ def test_same_observation_in_another_run_is_not_compared(dataset) -> None:
                     frame["values"][metric] = value + 1.0
     raw["examples"].extend(copies)
     raw["manifest"]["source_runs"].append(source_run(OTHER_RUN_ALIAS).model_dump(mode="json"))
+    if raw["manifest"].get("replay_bindings"):
+        # v2 は source run ごとに export の束縛を持つ（決定記録 0100 §2.8）
+        other = json.loads(json.dumps(raw["manifest"]["replay_bindings"][0]))
+        other["run_id"] = OTHER_RUN_ALIAS
+        raw["manifest"]["replay_bindings"].append(other)
     load(dataset, raw)
 
 

@@ -19,7 +19,7 @@ import json
 import math
 import re
 import sqlite3
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Final
@@ -268,6 +268,19 @@ def read_calibration_history(path: Path) -> CalibrationHistory:
     （migration 前の DB）・検証に外れる、はすべて :class:`CalibrationHistoryError`。
     表が空のときは行の無い記録を返す（被覆が無いので Dataset v2 の側で拒否される）。
     """
+    history, _ = read_calibration_history_with(path, lambda _conn: None)
+    return history
+
+
+def read_calibration_history_with[T](
+    path: Path, also_read: Callable[[sqlite3.Connection], T]
+) -> tuple[CalibrationHistory, T]:
+    """:func:`read_calibration_history` と同じ読み取り専用の接続・同じ read transaction で、
+    ``also_read`` にも読ませる（0100 §2.6 の ``csv_exports``）。
+
+    ``also_read`` は読み出しだけを行うこと（接続は ``mode=ro``）。その中の ``sqlite3.Error`` も
+    :class:`CalibrationHistoryError` にする。
+    """
     if not isinstance(path, Path):
         raise TypeError("較正の記録の DB の path を明示して渡す")
     if not path.is_file():
@@ -290,9 +303,10 @@ def read_calibration_history(path: Path) -> CalibrationHistory:
                     "記録が無いことを変更なしと扱わない"
                 )
             raw_rows = conn.execute(SELECT_ROWS).fetchall()
+            extra = also_read(conn)
             conn.execute("COMMIT")
         except sqlite3.Error as error:
             raise CalibrationHistoryError(f"較正の記録を読めない: {error}") from error
-        return CalibrationHistory(_SEAL, verify_activation_rows(raw_rows))
+        return CalibrationHistory(_SEAL, verify_activation_rows(raw_rows)), extra
     finally:
         conn.close()

@@ -220,20 +220,31 @@ def export_record_sha256(record: ExportRecord) -> str:
 
 
 def export_binding_sha256(records: Iterable[ExportRecord]) -> str:
-    """入力の export の束縛の digest ``export_binding_sha256``（0100 §2.8）。
+    """入力の export の束縛の digest ``export_binding_sha256``（0100 §2.8。形は PR #256 で固定）。
 
     ``export_id`` の順に並べた ``[export_id, export_record_sha256]`` の組の列（JSON の
     配列の配列）を、0096 §2.3 と同じ規約（区切り・末尾改行。``ensure_ascii=False``）で
-    直列化した bytes の SHA-256。
-    ``export_id`` の重複は ``ValueError``（0100 §2.3 の 7。呼び出し側が先に拒否している）。
+    直列化した bytes の SHA-256。``export_id`` の重複は ``ValueError``（0100 §2.3 の 7。
+    呼び出し側が先に拒否している）。
     """
-    pairs = sorted((record.export_id, export_record_sha256(record)) for record in records)
-    ids = [export_id for export_id, _ in pairs]
+    return export_binding_sha256_of_pairs(
+        (record.export_id, export_record_sha256(record)) for record in records
+    )
+
+
+def export_binding_sha256_of_pairs(pairs: Iterable[tuple[str, str]]) -> str:
+    """``(export_id, export_record_sha256)`` の組から ``export_binding_sha256`` を計算する。
+
+    dataset に残した組（``ReplayBindingV2``）から、元の manifest 無しで計算し直すために使う
+    （0100 §2.8）。:func:`export_binding_sha256` と同じ値になる。
+    """
+    ordered = sorted(pairs)
+    ids = [export_id for export_id, _ in ordered]
     if len(set(ids)) != len(ids):
         raise ValueError("export_id が重複している")
     payload = (
         json.dumps(
-            [list(pair) for pair in pairs],
+            [list(pair) for pair in ordered],
             ensure_ascii=False,
             allow_nan=False,
             separators=(",", ":"),

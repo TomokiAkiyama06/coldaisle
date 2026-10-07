@@ -48,6 +48,8 @@ from coldaisle.control.model.dataset import (
     DatasetSpecV2,
     DatasetWorkloadRegime,
     PriorAction,
+    ReplayBindingV2,
+    ReplayExportV2,
     SourceRun,
     TargetFrame,
     ThermalDataset,
@@ -58,15 +60,25 @@ from coldaisle.control.model.dataset import (
     reject_calibration_changes,
 )
 from coldaisle.control.schema import ControlTick, PerZone, Zone
+from coldaisle.csv_export_manifest import export_binding_sha256
 from coldaisle.declared_changes import DeclaredChangesError, read_declared_changes
-from coldaisle.ingest.replay import replay_sha256
+from coldaisle.ingest.replay import (
+    ReplayBindingError,
+    ReplayExportInputs,
+    read_replay_export_inputs,
+    replay_sha256,
+)
 from coldaisle.store import Quality, QualityRules, SeriesPoint, SqliteStore
 from coldaisle.store.calibration_history import (
     CalibrationHistory,
     CalibrationHistoryError,
-    read_calibration_history,
 )
 from coldaisle.store.csv_export import TIMESTAMP_RESOLUTION_MS
+from coldaisle.store.export_binding import (
+    ExportBinding,
+    ExportBindingError,
+    read_production_records,
+)
 from coldaisle.store.models import ControlTraceRecord, SequencedControlTrace
 
 MANIFEST_FILENAME = "manifest.json"
@@ -95,15 +107,28 @@ class ThermalDatasetBuilder:
     def __init__(self, store: SqliteStore) -> None:
         self._store = store
 
-    def build(self, *, source_run: SourceRun, spec: DatasetSpec) -> ThermalDataset:
+    def build(
+        self,
+        *,
+        source_run: SourceRun,
+        spec: DatasetSpec,
+        replay_binding: tuple[str | None, str | None] | None = None,
+    ) -> ThermalDataset:
         """1 source runを決定的に変換する。
 
         action候補はrun内のControlTickである。完全なhistoryとtarget探索範囲をrun内に
         持てない端のtickは採用しない。target観測そのものが無い場合は、行を捨てずに
         ``missing_mask`` を立てる。
+
+        ``replay_binding`` は ``--replay-path`` の manifest から計算した
+        ``(timezone, export_binding_sha256)``（manifest が無ければ ``(None, None)``）。渡せば
+        専用 DB の ``dataset_source_run`` の値との一致を求める（決定記録 0100 §2.8）。
+        v1 は照合していない run（``NULL``）も受け入れる。CLI は必ず渡す。
         """
         with self._store.read_snapshot():
             _validate_dedicated_source_db(self._store, source_run)
+            if replay_binding is not None:
+                _require_db_binding(self._store, replay_binding)
             earliest_action_ms = source_run.start_ms + spec.window_ms
             latest_label_margin_ms = spec.horizons_ms[-1] + spec.target_tolerance_ms
             traces = self._store.control_traces(earliest_action_ms, source_run.end_ms)
@@ -286,6 +311,7 @@ class ThermalDatasetV2Builder:
         spec: DatasetSpecV2,
         declared_changes: tuple[DeclaredChange, ...],
         calibration_history: CalibrationHistory,
+        export_binding: ExportBinding,
     ) -> ThermalDatasetV2:
         """1 source run を決定的に変換する。
 
@@ -304,6 +330,11 @@ class ThermalDatasetV2Builder:
         example が0件の dataset では被覆と変更の検査を行わない（記録の読み込みの検証は
         :func:`~coldaisle.store.calibration_history.read_calibration_history` が済ませている）。
 
+        ``export_binding`` は ``--replay-path`` の manifest を本番の DB の ``csv_exports`` と全欄で
+        照合した結果（決定記録 0100 §2.6）。専用 DB の ``dataset_source_run`` の timezone と
+        ``export_binding_sha256`` が一致しなければ拒否し、照合していない run（``NULL``）も拒否する
+        （0100 §2.8）。通れば source run ごとの ``ReplayBindingV2`` を manifest に書く。
+
         次の run からは生成しない（example の除外ではなく、生成全体の拒否。0087 §2.1）。
 
         - ``seq`` の順に並べた ControlTick の ``ts_ms`` が狭義単調増加でない
@@ -321,6 +352,8 @@ class ThermalDatasetV2Builder:
             raise TypeError(
                 "calibration_history は read_calibration_history() の結果を明示して渡す"
             )
+        if not isinstance(export_binding, ExportBinding):
+            raise TypeError("export_binding は read_production_records() の結果を明示して渡す")
         declared_calibration = tuple(
             sorted(
                 {
@@ -333,6 +366,17 @@ class ThermalDatasetV2Builder:
         calibration_changes: tuple[int, ...] = ()
         with self._store.read_snapshot():
             _validate_dedicated_source_db(self._store, source_run)
+            # csv_exports との照合（export_binding）と専用 DB の束縛が合わなければ、被覆と
+            # 変更の検査（0099 §2.6）へ進まない（0100 §2.6 の 3）
+            db_binding = self._store.dataset_source_run_export_binding()
+            if db_binding is None or db_binding == (None, None):
+                raise ValueError(
+                    "export の manifest と照合していない run から Dataset v2 は作らない"
+                    "（決定記録 0100 §2.3 / §2.8）"
+                )
+            _require_db_binding(
+                self._store, (export_binding.timezone, export_binding.export_binding_sha256)
+            )
             traces = self._store.control_traces_in_seq_order(source_run.start_ms, source_run.end_ms)
             legacy_through_seq = self._store.control_trace_legacy_through_seq()
             if any(trace.seq <= legacy_through_seq for trace in traces):
@@ -400,6 +444,7 @@ class ThermalDatasetV2Builder:
                     restart=excluded[ActionExclusionReason.RESTART],
                     tick_id_gap=excluded[ActionExclusionReason.TICK_ID_GAP],
                 ),
+                replay_bindings=(_replay_binding_v2(source_run, export_binding),),
             ),
             examples=built,
         )
@@ -489,6 +534,55 @@ def _action_context(tick: ControlTick, raw: dict[str, object]) -> ActionContext:
         regime_confidence=regime_confidence,
         fault_codes=tuple(fault.code.value for fault in tick.faults),
     )
+
+
+def _replay_binding_v2(source_run: SourceRun, binding: ExportBinding) -> ReplayBindingV2:
+    """照合を通った export から ``ReplayBindingV2`` を作る。
+
+    CSV の basename は書かない（0100 §2.8）。
+    """
+    return ReplayBindingV2(
+        run_id=source_run.run_id,
+        local_timezone=binding.timezone,
+        export_binding_sha256=binding.export_binding_sha256,
+        exports=tuple(
+            ReplayExportV2(
+                export_id=record.export_id,
+                export_record_sha256=record.record_sha256(),
+                day_start_ms=record.day_start_ms,
+                day_end_ms=record.day_end_ms,
+                csv_sha256=record.csv_sha256,
+                row_seconds_sha256=record.row_seconds_sha256,
+            )
+            for record in binding.records
+        ),
+    )
+
+
+def _require_db_binding(store: SqliteStore, expected: tuple[str | None, str | None]) -> None:
+    """専用 DB の ``dataset_source_run`` の束縛が、入力の manifest から計算した値と一致する。
+
+    決定記録 0100 §2.8。
+    """
+    if store.dataset_source_run_export_binding() != expected:
+        raise ValueError(
+            "専用 DB の再生の timezone / export_binding_sha256 が --replay-path の manifest と"
+            "一致しない（決定記録 0100 §2.8）"
+        )
+
+
+def replay_binding_of(inputs: ReplayExportInputs) -> tuple[str | None, str | None]:
+    """``--replay-path`` の manifest から ``(timezone, export_binding_sha256)`` を計算する。
+
+    manifest の無い入力は ``(None, None)``（照合していない run と同じ値）。timezone の違う
+    manifest が混ざる入力は、再生が拒否しているので DB の値と一致しない（``None`` を返して
+    食い違いにする）。
+    """
+    if inputs.records is None:
+        return (None, None)
+    timezones = {record.timezone for record in inputs.records}
+    timezone = next(iter(timezones)) if len(timezones) == 1 else None
+    return (timezone, export_binding_sha256(inputs.records))
 
 
 def _validate_dedicated_source_db(store: SqliteStore, source_run: SourceRun) -> None:
@@ -1018,14 +1112,14 @@ def _overlaps(ts_ms: int, start_ms: int, end_ms: int) -> bool:
     return floor_ms <= end_ms and start_ms <= ts_ms
 
 
-def _source_run(args: argparse.Namespace) -> SourceRun:
+def _source_run(args: argparse.Namespace, source_sha256: str) -> SourceRun:
     return SourceRun(
         run_id=args.run_alias,
         kind=DatasetSourceKind(args.source_kind),
         start_ms=args.start_ms,
         end_ms=args.end_ms,
         source_refs=tuple(args.source_alias),
-        source_sha256=replay_fingerprint(args.replay_path),
+        source_sha256=source_sha256,
     )
 
 
@@ -1042,11 +1136,15 @@ def _common_spec(args: argparse.Namespace) -> dict[str, object]:
 
 
 def _main_v1(args: argparse.Namespace) -> int:
-    source_run = _source_run(args)
+    # fingerprint と manifest を同じ1回の読み出しから得る（決定記録 0100 §2.8）
+    inputs = read_replay_export_inputs(args.replay_path)
+    source_run = _source_run(args, inputs.source_sha256)
     spec = DatasetSpec.model_validate(_common_spec(args))
     rules = QualityRules.from_yaml(args.quality_config)
     with SqliteStore(args.db, rules=rules, clock=WallClock()) as store:
-        dataset = ThermalDatasetBuilder(store).build(source_run=source_run, spec=spec)
+        dataset = ThermalDatasetBuilder(store).build(
+            source_run=source_run, spec=spec, replay_binding=replay_binding_of(inputs)
+        )
     write_dataset(dataset, args.output_root, args.artifact_name)
     return 0
 
@@ -1062,7 +1160,23 @@ def _main_v2(args: argparse.Namespace) -> int:
             extra={logs.FIELDS_KEY: {"reason": str(error)}},
         )
         return 1
-    source_run = _source_run(args)
+    # 読む順序: fingerprint と manifest（同じ1回の読み出し）→ 本番の DB の較正の記録と
+    # csv_exports（同じ read transaction）→ 専用 DB（決定記録 0100 §2.6 / §2.8）
+    try:
+        inputs = read_replay_export_inputs(args.replay_path)
+    except ReplayBindingError as error:
+        LOGGER.error(
+            "--replay-path の manifest を拒否した（dataset を作らない）",
+            extra={logs.FIELDS_KEY: {"reason": str(error), "check": error.check}},
+        )
+        return 1
+    if inputs.records is None:
+        LOGGER.error(
+            "export の manifest の無い入力から Dataset v2 は作らない（決定記録 0100 §2.7）",
+            extra={logs.FIELDS_KEY: {"reason": "manifest が無い"}},
+        )
+        return 1
+    source_run = _source_run(args, inputs.source_sha256)
     spec = DatasetSpecV2.model_validate(
         {
             **_common_spec(args),
@@ -1072,10 +1186,18 @@ def _main_v2(args: argparse.Namespace) -> int:
         }
     )
     try:
-        history = read_calibration_history(args.calibration_history_db)
+        history, export_binding = read_production_records(
+            args.calibration_history_db, inputs.records
+        )
     except CalibrationHistoryError as error:
         LOGGER.error(
             "較正の変更の記録を読めない（dataset を作らない）",
+            extra={logs.FIELDS_KEY: {"reason": str(error)}},
+        )
+        return 1
+    except ExportBindingError as error:
+        LOGGER.error(
+            "入力の export を本番の DB の csv_exports と照合できない（dataset を作らない）",
             extra={logs.FIELDS_KEY: {"reason": str(error)}},
         )
         return 1
@@ -1087,6 +1209,7 @@ def _main_v2(args: argparse.Namespace) -> int:
                 spec=spec,
                 declared_changes=declared.changes,
                 calibration_history=history,
+                export_binding=export_binding,
             )
     except ValueError as error:
         LOGGER.error(
