@@ -859,8 +859,26 @@ def test_migration_keeps_the_read_api_result_unchanged(tmp_path, rules):
             True,
             id="at-label-end",
         ),
+        # 宣言も記録の行と同じ区間 [floor(ts), ts] で見る（0109 §2.4 / §5 #1）。
+        # 下端 T0 + 7000 が期間の終端
         pytest.param(
-            DeclaredChange(kind=ChangeKind.CALIBRATION_CHANGED, ts_ms=T0 + 7_001), False, id="after"
+            DeclaredChange(kind=ChangeKind.CALIBRATION_CHANGED, ts_ms=T0 + 7_001),
+            True,
+            id="same-second-after-label-end",
+        ),
+        pytest.param(
+            DeclaredChange(kind=ChangeKind.CALIBRATION_CHANGED, ts_ms=T0 + 7_999),
+            True,
+            id="only-the-floor-inside",
+        ),
+        pytest.param(
+            DeclaredChange(kind=ChangeKind.CALIBRATION_CHANGED, ts_ms=T0 + 8_000), False, id="after"
+        ),
+        # 区間の上端が期間の先頭の直前（下端 T0 - 1000 も前）
+        pytest.param(
+            DeclaredChange(kind=ChangeKind.CALIBRATION_CHANGED, ts_ms=T0 - 1),
+            False,
+            id="just-before",
         ),
         pytest.param(
             DeclaredChange(kind=ChangeKind.FAN_REPLACED, ts_ms=T0 + 6_000),

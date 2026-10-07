@@ -34,6 +34,7 @@ uv run coldaisle-memory             # 運用メモリの更新案（**既定で�
 uv run coldaisle-memory --apply --commit  # 確認してから書く
 uv run coldaisle-calibrate          # 較正オフセットの算出（**既定では書かない**）
 uv run coldaisle-calibrate --apply  # 確認してから書く。手順は docs/calibration.md
+uv run coldaisle-dataset --dataset-version 2 --declared-changes var/declared-changes.yaml --calibration-history-db var/coldaisle.db ...  # Thermal Dataset v2（版は必須。手順は docs/thermal-dataset.md。決定記録 0109）
 uv run coldaisle-evaluate --runs var/evaluation-runs.yaml --out var/evaluation.json  # Controller構成の比較（読み取りのみ）
 uv run coldaisle-drift --evidence var/drift-evidence.yaml --profile var/confidence-profile.json  # Model driftの検知（読み取りのみ・書き込みはしない。`--format markdown` で trend を人が読む表に）
 uv run coldaisle-supervisor-shadow --evidence var/supervisor-shadow-runs.yaml --registry-root var/model-registry --out var/supervisor-shadow.json  # Supervisor の Shadow 集計（DB と Registry を読むだけ。昇格は CLI の外）
@@ -258,6 +259,7 @@ src/coldaisle/
   event_entry/ # 合成の起点: 書き込み専用の Unix ソケット入口。AI 層・API から import しない。#67
   control_admin/ # 合成の起点: coldaisle-fand の管理ソケット（運転モードと Authority の降格。昇格は受けない）。AI 層・API・eventd・control から import しない。#74 / #92 / 決定記録 0072
   learned_channel/ # 合成の起点: Learned worker と coldaisle-fand の経路（役割ごとのソケット・受付スレッド・frame の送り出し・registry の production の監視）。control・AI 層・API・control_admin から import しない。#86 / #104 / 決定記録 0077
+  declared_changes.py # 合成の起点が共有: 宣言された変更（DeclaredChange）の YAML の形と検証（drift / dataset v2）。0109
   local_socket.py # レイヤ横断: Unix ソケット入口に共通の門（SO_PEERCRED・権限・起動時の検査）。0045 / 0072 §2.5
   authority_cli.py # 合成の起点: `coldaisle-authority raise` / `rollback`。`raise_stage()` を呼ぶ唯一の場所。**どこからも import しない**。#92 / 決定記録 0086
   rollup_job.py # 合成の起点: `coldaisle-rollup` の入口（周期メトリクスを Store へ渡す）。#65

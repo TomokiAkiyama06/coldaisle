@@ -10,11 +10,13 @@ import argparse
 import fcntl
 import hashlib
 import json
+import logging
 import os
 import re
 import secrets
 import stat
 from bisect import bisect_left, bisect_right
+from collections import Counter
 from collections.abc import Sequence
 from contextlib import suppress
 from enum import StrEnum
@@ -22,9 +24,12 @@ from pathlib import Path
 
 from pydantic import ValidationError
 
+from coldaisle import logs
 from coldaisle.calibration_log import (
     calibration_change_points,
+    declared_calibration_change_points,
     reject_changes_overlapping,
+    reject_declared_changes_overlapping,
     require_history_covers,
 )
 from coldaisle.clock import WallClock
@@ -53,9 +58,15 @@ from coldaisle.control.model.dataset import (
     reject_calibration_changes,
 )
 from coldaisle.control.schema import ControlTick, PerZone, Zone
+from coldaisle.declared_changes import DeclaredChangesError, read_declared_changes
 from coldaisle.ingest.replay import replay_sha256
 from coldaisle.store import Quality, QualityRules, SeriesPoint, SqliteStore
-from coldaisle.store.calibration_history import CalibrationHistory
+from coldaisle.store.calibration_history import (
+    CalibrationHistory,
+    CalibrationHistoryError,
+    read_calibration_history,
+)
+from coldaisle.store.csv_export import TIMESTAMP_RESOLUTION_MS
 from coldaisle.store.models import ControlTraceRecord, SequencedControlTrace
 
 MANIFEST_FILENAME = "manifest.json"
@@ -65,6 +76,7 @@ _DIRECTORY_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
 _FILE_WRITE_FLAGS = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC
 _LOCK_FLAGS = os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK
 _LOCK_FILENAME = ".coldaisle-dataset.lock"
+LOGGER = logging.getLogger("coldaisle.dataset")
 SeriesIndex = tuple[tuple[int, ...], tuple[SeriesPoint, ...]]
 
 
@@ -278,8 +290,8 @@ class ThermalDatasetV2Builder:
         """1 source run を決定的に変換する。
 
         ``declared_changes`` は 0056 §2.5 の宣言された変更で、**既定値を持たない**。宣言が無い場合も
-        空の tuple を明示する（0087 §2.6）。そのうち ``calibration_changed`` が全 example の期間に
-        あれば生成を拒否する。
+        空の tuple を明示する（0087 §2.6）。そのうち ``calibration_changed`` は記録の行と同じく
+        区間 ``[floor(ts), ts]`` とし、全 example の期間と交われば生成を拒否する（0109 §2.4）。
 
         ``calibration_history`` は本番の DB から読み取り専用で読んだ較正の変更の記録で、**既定値を
         持たない**（決定記録 0099 §2.6）。専用 DB（再生）には記録が無いので別に渡す。example が
@@ -309,11 +321,16 @@ class ThermalDatasetV2Builder:
             raise TypeError(
                 "calibration_history は read_calibration_history() の結果を明示して渡す"
             )
-        calibration_changes = tuple(
-            change.ts_ms
-            for change in declared_changes
-            if change.kind is ChangeKind.CALIBRATION_CHANGED
+        declared_calibration = tuple(
+            sorted(
+                {
+                    change.ts_ms
+                    for change in declared_changes
+                    if change.kind is ChangeKind.CALIBRATION_CHANGED
+                }
+            )
         )
+        calibration_changes: tuple[int, ...] = ()
         with self._store.read_snapshot():
             _validate_dedicated_source_db(self._store, source_run)
             traces = self._store.control_traces_in_seq_order(source_run.start_ms, source_run.end_ms)
@@ -358,12 +375,15 @@ class ThermalDatasetV2Builder:
         if built:
             start_ms = min(example.history_start_ms for example in built)
             require_history_covers(calibration_history, start_ms)
-            reject_changes_overlapping(
-                calibration_history,
-                start_ms=start_ms,
-                end_ms=max(example.label_end_ms for example in built),
+            end_ms = max(example.label_end_ms for example in built)
+            reject_changes_overlapping(calibration_history, start_ms=start_ms, end_ms=end_ms)
+            # 宣言も記録の行と同じ区間で見る（0109 §2.4 / §5 #1。宣言は足せるが記録を消せない）
+            reject_declared_changes_overlapping(
+                declared_calibration, start_ms=start_ms, end_ms=end_ms
             )
-            calibration_changes += calibration_change_points(calibration_history)
+            calibration_changes = calibration_change_points(
+                calibration_history
+            ) + declared_calibration_change_points(declared_calibration)
         reject_calibration_changes(built, calibration_changes)
         return ThermalDatasetV2(
             manifest=DatasetManifestV2(
@@ -917,10 +937,27 @@ def write_dataset(
         os.close(root_fd)
 
 
+_V2_ONLY_OPTIONS = (
+    "action_step_ms",
+    "action_steps",
+    "action_stale_after_ms",
+    "declared_changes",
+    "calibration_history_db",
+)
+"""v2 でだけ必須、v1 では渡すと拒否する引数（0109 §5 #6）。"""
+
+
 def build_parser() -> argparse.ArgumentParser:
-    """実測で選ぶ値をすべて必須にしたCLI parserを返す。"""
+    """実測で選ぶ値をすべて必須にしたCLI parserを返す。版も既定値なしで選ばせる（0109 §5 #6）。"""
     parser = argparse.ArgumentParser(
-        prog="coldaisle-dataset", description="SQLiteからThermal Dataset v1を生成"
+        prog="coldaisle-dataset", description="SQLiteからThermal Dataset v1 / v2を生成"
+    )
+    parser.add_argument(
+        "--dataset-version",
+        type=int,
+        choices=(1, 2),
+        required=True,
+        help="作る dataset の版。既定値は無い（決定記録 0109 §5 #6）",
     )
     parser.add_argument("--db", type=Path, required=True)
     parser.add_argument("--quality-config", type=Path, required=True)
@@ -943,39 +980,188 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--stale-after-ms", type=int, required=True)
     parser.add_argument("--feature-metric", action="append", required=True)
     parser.add_argument("--target-metric", action="append", required=True)
+    v2 = parser.add_argument_group("v2（--dataset-version 2 で必須。v1 では渡さない）")
+    v2.add_argument("--action-step-ms", type=int)
+    v2.add_argument("--action-steps", type=int)
+    v2.add_argument("--action-stale-after-ms", type=int)
+    v2.add_argument(
+        "--declared-changes",
+        type=Path,
+        help="宣言された変更の YAML（schema_version: 1 と changes:。無ければ changes: []）",
+    )
+    v2.add_argument(
+        "--calibration-history-db",
+        type=Path,
+        help="較正の変更の記録を持つ本番の DB（読み取り専用で開く。決定記録 0099 §2.6）",
+    )
+    parser.add_argument("--log-level", default="INFO")
     return parser
 
 
-def main(argv: Sequence[str] | None = None) -> None:
-    """CLI entry point。"""
-    parser = build_parser()
-    args = parser.parse_args(argv)
-    source_kind = DatasetSourceKind(args.source_kind)
-    if args.replay_path is None:
-        parser.error("source-kind=replay には --replay-path が要る")
-    source_sha256 = replay_fingerprint(args.replay_path)
-    source_run = SourceRun(
+def _option_name(dest: str) -> str:
+    return "--" + dest.replace("_", "-")
+
+
+def _same_file(left: Path, right: Path) -> bool:
+    """同じ実体か（symlink・相対 path・hard link の別名を含む）。"""
+    if left.resolve() == right.resolve():
+        return True
+    try:
+        a, b = left.stat(), right.stat()
+    except OSError:
+        return False
+    return (a.st_dev, a.st_ino) == (b.st_dev, b.st_ino)
+
+
+def _overlaps(ts_ms: int, start_ms: int, end_ms: int) -> bool:
+    floor_ms = ts_ms // TIMESTAMP_RESOLUTION_MS * TIMESTAMP_RESOLUTION_MS
+    return floor_ms <= end_ms and start_ms <= ts_ms
+
+
+def _source_run(args: argparse.Namespace) -> SourceRun:
+    return SourceRun(
         run_id=args.run_alias,
-        kind=source_kind,
+        kind=DatasetSourceKind(args.source_kind),
         start_ms=args.start_ms,
         end_ms=args.end_ms,
         source_refs=tuple(args.source_alias),
-        source_sha256=source_sha256,
+        source_sha256=replay_fingerprint(args.replay_path),
     )
-    spec = DatasetSpec(
-        window_ms=args.window_ms,
-        sample_period_ms=args.sample_period_ms,
-        horizons_ms=tuple(args.horizon_ms),
-        target_tolerance_ms=args.target_tolerance_ms,
-        stale_after_ms=args.stale_after_ms,
-        feature_metrics=tuple(args.feature_metric),
-        target_metrics=tuple(args.target_metric),
-    )
+
+
+def _common_spec(args: argparse.Namespace) -> dict[str, object]:
+    return {
+        "window_ms": args.window_ms,
+        "sample_period_ms": args.sample_period_ms,
+        "horizons_ms": tuple(args.horizon_ms),
+        "target_tolerance_ms": args.target_tolerance_ms,
+        "stale_after_ms": args.stale_after_ms,
+        "feature_metrics": tuple(args.feature_metric),
+        "target_metrics": tuple(args.target_metric),
+    }
+
+
+def _main_v1(args: argparse.Namespace) -> int:
+    source_run = _source_run(args)
+    spec = DatasetSpec.model_validate(_common_spec(args))
     rules = QualityRules.from_yaml(args.quality_config)
     with SqliteStore(args.db, rules=rules, clock=WallClock()) as store:
         dataset = ThermalDatasetBuilder(store).build(source_run=source_run, spec=spec)
     write_dataset(dataset, args.output_root, args.artifact_name)
+    return 0
+
+
+def _main_v2(args: argparse.Namespace) -> int:
+    # 読む順序: 宣言のファイル → fingerprint → 較正の記録 → 専用 DB（0109 §7）。
+    # DB を開く前に引数とファイルの誤りで止める。
+    try:
+        declared = read_declared_changes(args.declared_changes)
+    except DeclaredChangesError as error:
+        LOGGER.error(
+            "宣言された変更のファイルを拒否した（dataset を作らない）",
+            extra={logs.FIELDS_KEY: {"reason": str(error)}},
+        )
+        return 1
+    source_run = _source_run(args)
+    spec = DatasetSpecV2.model_validate(
+        {
+            **_common_spec(args),
+            "action_step_ms": args.action_step_ms,
+            "action_steps": args.action_steps,
+            "action_stale_after_ms": args.action_stale_after_ms,
+        }
+    )
+    try:
+        history = read_calibration_history(args.calibration_history_db)
+    except CalibrationHistoryError as error:
+        LOGGER.error(
+            "較正の変更の記録を読めない（dataset を作らない）",
+            extra={logs.FIELDS_KEY: {"reason": str(error)}},
+        )
+        return 1
+    rules = QualityRules.from_yaml(args.quality_config)
+    try:
+        with SqliteStore(args.db, rules=rules, clock=WallClock()) as store:
+            dataset = ThermalDatasetV2Builder(store).build(
+                source_run=source_run,
+                spec=spec,
+                declared_changes=declared.changes,
+                calibration_history=history,
+            )
+    except ValueError as error:
+        LOGGER.error(
+            "Dataset v2 の生成を拒否した",
+            extra={
+                logs.FIELDS_KEY: {
+                    "reason": str(error),
+                    "declared_changes_sha256": declared.file_sha256,
+                }
+            },
+        )
+        return 1
+    in_period: list[DeclaredChange] = []
+    if dataset.examples:
+        start_ms = min(example.history_start_ms for example in dataset.examples)
+        end_ms = max(example.label_end_ms for example in dataset.examples)
+        in_period = [
+            change for change in declared.changes if _overlaps(change.ts_ms, start_ms, end_ms)
+        ]
+    ignored = [change for change in in_period if change.kind is not ChangeKind.CALIBRATION_CHANGED]
+    if ignored:
+        # 0087 §2.6 のまま生成には効かせない。人が気づけるよう警告だけ出す（0109 §5 #2）
+        LOGGER.warning(
+            "検査に使わない種別の宣言が期間の中にある（生成は拒否しない）",
+            extra={
+                logs.FIELDS_KEY: {
+                    "changes": [
+                        {"kind": change.kind.value, "ts_ms": change.ts_ms} for change in ignored
+                    ]
+                }
+            },
+        )
+    write_dataset(dataset, args.output_root, args.artifact_name)
+    LOGGER.info(
+        "Dataset v2 を書き出した",
+        extra={
+            logs.FIELDS_KEY: {
+                "artifact_name": args.artifact_name,
+                "example_count": dataset.manifest.example_count,
+                "excluded": dataset.manifest.excluded.model_dump(),
+                "declared_changes_sha256": declared.file_sha256,
+                "declared_changes": len(declared.changes),
+                "declared_changes_by_kind": dict(
+                    sorted(Counter(change.kind.value for change in declared.changes).items())
+                ),
+                "declared_changes_in_period": len(in_period),
+                "calibration_history_rows": len(history.rows),
+            }
+        },
+    )
+    return 0
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    """CLI entry point。"""
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    logs.configure(args.log_level)
+    if args.replay_path is None:
+        parser.error("source-kind=replay には --replay-path が要る")
+    if args.dataset_version == 1:
+        # v1 には較正の検査が無い。渡しても効かない値を黙って受け取らない（0109 §5 #6）
+        given = [_option_name(dest) for dest in _V2_ONLY_OPTIONS if getattr(args, dest) is not None]
+        if given:
+            parser.error(f"--dataset-version 1 では渡さない: {', '.join(given)}")
+        return _main_v1(args)
+    missing = [_option_name(dest) for dest in _V2_ONLY_OPTIONS if getattr(args, dest) is None]
+    if missing:
+        parser.error(f"--dataset-version 2 には必須: {', '.join(missing)}")
+    if _same_file(args.calibration_history_db, args.db):
+        # 専用 DB は空の calibration_activations を持ちうる。0件の dataset では被覆の検査を
+        # 素通りするので、取り違えとして先に拒否する（0109 §7）
+        parser.error("--calibration-history-db に専用 DB（--db）と同じ DB は渡さない")
+    return _main_v2(args)
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
