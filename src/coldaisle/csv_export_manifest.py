@@ -220,7 +220,7 @@ def export_record_sha256(record: ExportRecord) -> str:
 
 
 def export_binding_sha256(records: Iterable[ExportRecord]) -> str:
-    """入力の export の束縛の digest ``export_binding_sha256``（0100 §2.8 / 0111 §2.1）。
+    """入力の export の束縛の digest ``export_binding_sha256``（0100 §2.8。形は PR #256 で固定）。
 
     ``export_id`` の順に並べた ``[export_id, export_record_sha256]`` の組の列（JSON の
     配列の配列）を、0096 §2.3 と同じ規約（区切り・末尾改行。``ensure_ascii=False``）で

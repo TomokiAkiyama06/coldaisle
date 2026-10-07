@@ -178,7 +178,7 @@ v1 との違い（規則の正本は [0087](decisions/0087-dataset-v2-action-gri
   専用 DB の `dataset_source_run` に再生が記録した timezone と `export_binding_sha256` との一致も確かめる。
   別の DB から export した CSV、書き換えた CSV、manifest の無い CSV、照合していない run は拒否する。
   `csv_exports` の照合に失敗したら、較正の記録の被覆と変更の検査へ進まない
-- **`replay_bindings`**（v2 の manifest。決定記録 0100 §2.8 / 0111）: source run ごとに、再生の timezone・
+- **`replay_bindings`**（v2 の manifest。決定記録 0100 §2.8）: source run ごとに、再生の timezone・
   `export_binding_sha256`・export ごとの `export_id` / `export_record_sha256` / 日の区間 / `csv_sha256` /
   `row_seconds_sha256` を持つ。CSV の basename は書かない。v1 の manifest と `SourceRun` は変わらない
 - **学習の入口**（`calibration_log.verify_training_export_binding`）: `replay_bindings` の無い dataset を拒否し、
@@ -225,7 +225,7 @@ uv run coldaisle-dataset \
   SHA-256・件数・種別ごとの件数・期間の中の件数を出す。拒否したときは、宣言と記録のどちらで拒否したかを理由に出す
 - `detail` に実機の個体識別子（ROM・ホスト名・絶対パス）を書かない
 - `--replay-path` の CSV は manifest と一緒に置く（CSV だけを複写すると v2 には使えない）。fingerprint は manifest の
-  bytes も含み（決定記録 0111 §2.2）、manifest と CSV は同じ1回の読み出しで照合する
+  bytes も含み（決定記録 0100 §2.8。形は PR #256 で固定）、manifest と CSV は同じ1回の読み出しで照合する
 
 ## 実データ収集後に残る作業
 

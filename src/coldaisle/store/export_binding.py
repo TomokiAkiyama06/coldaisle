@@ -62,7 +62,7 @@ class ExportBinding:
 
     @property
     def export_binding_sha256(self) -> str:
-        """入力の export の束縛の digest（0100 §2.8 / 0111 §2.1）。"""
+        """入力の export の束縛の digest（0100 §2.8。形は PR #256 で固定）。"""
         return self._digest
 
 

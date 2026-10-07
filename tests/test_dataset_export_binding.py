@@ -462,7 +462,7 @@ def test_training_entry_uses_the_same_read_as_the_calibration_history(built):
 
 
 def test_fixture_binding_matches_its_digest():
-    """試験の前提: 仮の export の束縛は 0111 §2.1 の形の digest。"""
+    """試験の前提: 仮の export の束縛は PR #256 で固定した形の digest。"""
     record = fixture_export_record()
     payload = f'[["{record.export_id}","{export_record_sha256(record)}"]]\n'.encode()
     assert ("UTC", hashlib.sha256(payload).hexdigest()) == FIXTURE_BINDING
