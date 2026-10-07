@@ -54,7 +54,12 @@ from coldaisle.control.schema import (
     PerZone,
     Zone,
 )
-from coldaisle.evaluate import EvidenceDatabase
+from coldaisle.evaluate import (
+    EvidenceDatabase,
+    EvidenceOutputError,
+    control_config_files,
+    refuse_output_on_inputs,
+)
 from coldaisle.store.models import ControlTraceRecord
 
 LOGGER = logging.getLogger("coldaisle.air_balance_shadow")
@@ -617,42 +622,6 @@ def write(
     return path
 
 
-_SQLITE_SIDECARS = ("-wal", "-journal", "-shm")
-"""証拠の DB の添え file。`--out` がこれらを指しても DB を壊しうる。"""
-
-
-def control_config_files(directory: Path) -> tuple[Path, ...]:
-    """`--control-config` の4ファイル（`--out` で上書きさせない入力）。"""
-    return tuple(
-        directory / name
-        for name in ("fan-hardware.yaml", "safety.yaml", "fan-policy.yaml", "air-balance.yaml")
-    )
-
-
-def _same_file(left: Path, right: Path) -> bool:
-    if left.exists() and right.exists():
-        return os.path.samefile(left, right)
-    return left.resolve() == right.resolve()
-
-
-def check_out_is_not_an_input(out: Path, *, db: Path, inputs: Iterable[Path]) -> None:
-    """`--out` が入力（証拠の DB とその添え file・manifest・設定）を指していれば拒む。
-
-    `write()` は `os.replace()` で置き換えるので、`--out` が DB を指すと**証拠を報告で
-    上書きする**。読むだけの CLI を破壊的な操作にしないため、読む前に拒む。
-    """
-    # 添え file は symlink の隣と実体の隣の両方で数える。SQLite が使うのは実体の隣である。
-    bases = (db, db.resolve())
-    candidates = [
-        db,
-        *(base.with_name(base.name + suffix) for base in bases for suffix in _SQLITE_SIDECARS),
-        *inputs,
-    ]
-    for path in candidates:
-        if _same_file(out, path):
-            raise AirBalanceShadowInputError(f"--out が入力のファイルを指している: {path}")
-
-
 def build_parser() -> argparse.ArgumentParser:
     """CLI の引数。**合否の閾値を受け取る口は作らない**（0093 §2.1）。"""
     parser = argparse.ArgumentParser(
@@ -707,12 +676,12 @@ def main(argv: list[str] | None = None) -> int:
     out: Path = args.out if args.out is not None else DEFAULT_OUT[report_format]
     try:
         # **どの入力を開くより前に**確かめる（壊れた・特殊な入力を読んで落ちる前に拒む）。
-        check_out_is_not_an_input(
+        refuse_output_on_inputs(
             out,
             db=args.db,
             inputs=(args.evidence, args.config, *control_config_files(args.control_config)),
         )
-    except AirBalanceShadowInputError as error:
+    except EvidenceOutputError as error:
         LOGGER.error(
             "Air Balance の shadow 集計を拒否した（何も書かない）",
             extra={logs.FIELDS_KEY: {"reason": str(error), "out": str(out)}},
@@ -724,9 +693,8 @@ def main(argv: list[str] | None = None) -> int:
     period = manifest.period
     try:
         # **証拠の DB は読み取り専用で開く**（`immutable=1`。添え file に中身があれば開かない）。
-        # 実体の path で開く。`EvidenceDatabase` は添え file を渡した path の隣で確かめるので、
-        # symlink のまま渡すと実体の隣の未 checkpoint の WAL を見落として古い断面を読む。
-        with EvidenceDatabase(args.db.resolve()) as store, store.snapshot():
+        # symlink の `--db` でも、実体の隣の添え file は `EvidenceDatabase` が確かめる（#227）。
+        with EvidenceDatabase(args.db) as store, store.snapshot():
             traces = store.control_traces(period.start_ms, period.end_ms)
         report = build_report(
             traces, binding=config_binding(control), period=period, settings=settings
