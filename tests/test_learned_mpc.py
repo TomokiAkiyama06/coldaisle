@@ -2917,3 +2917,32 @@ def test_incomplete_cost_wiring_degrades_to_fallback(trained) -> None:
     )
 
     _assert_degrades_to_fallback(runtime, trained.attestation, needle="fan-hardware.yaml")
+
+
+def test_the_budget_is_checked_after_the_baseline_support_check(
+    trained, monkeypatch: pytest.MonkeyPatch, plan_calls: list[ActionPlan]
+) -> None:
+    """support の照合で予算を使い切った tick に、Baseline の予測を回さない（Codex P2）。"""
+    now = [0]
+    original = MpcModelBinding.plan_support_violation
+
+    def slow(self: MpcModelBinding, observed: ObservedThermalInput, plan: ActionPlan) -> Any:
+        now[0] = 10_000
+        return original(self, observed, plan)
+
+    monkeypatch.setattr(MpcModelBinding, "plan_support_violation", slow)
+    settings = mpc_policy(budget_ms=10)
+    binding = bind(trained)
+    controller = LearnedMpcController(
+        binding,
+        settings,
+        safety(),
+        monotonic_ms=lambda: now[0],
+        authority=StaticAuthorityStage(settings.authority_stage),
+    )
+
+    result = propose(controller)
+
+    assert result.proposal is not None
+    assert result.proposal.optimizer_status is OptimizerStatus.TIMEOUT
+    assert plan_calls == []

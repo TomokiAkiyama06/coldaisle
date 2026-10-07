@@ -193,9 +193,6 @@ class LearnedMpcOptimizer:
             # 格子の算出も制約の交わりを読むので、実行不能はここで捕まえる。
             levels = {zone: self._levels(constraints, zone) for zone in _ZONE_ORDER}
             baseline_requested = self._clamped(constraints, baseline)
-            if self._out_of_budget(started_ms):
-                # 制約の組み立てで越えた場合も、モデルを呼ぶ前に止める。
-                return self._timed_out(started_ms, evaluations)
             outside = self._binding.plan_support_violation(observed, self._plan(baseline_requested))
             if outside is not None:
                 # 0079 §2.5 / 0084 §2.2: 出発点が学習した action 列の外なら解を返さない。
@@ -208,6 +205,10 @@ class LearnedMpcOptimizer:
                     started_ms,
                     0,
                 )
+            if self._out_of_budget(started_ms):
+                # 制約の組み立てと support の照合で越えた場合も、**モデルを呼ぶ直前に**止める
+                # （0052 §2.5）。
+                return self._timed_out(started_ms, evaluations)
             baseline_cost, baseline_prediction = self._evaluate(
                 baseline_requested,
                 observed,
