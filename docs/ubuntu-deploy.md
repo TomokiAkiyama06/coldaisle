@@ -657,6 +657,20 @@ CLI の書いた journal を読むと、走行中なら `SHADOW` へ下がり、
    - lock が消えたら、同じ2行で作り直します。lock を作り直すまで Registry の書き込みも `raise` も止まります
      （壊れずに止まる）
    - Registry はローカルのファイルシステムに置きます（NFS に置かない。`flock` の前提）
+   - **書き手のコマンドが返ってこないとき**は、誰かが lock を握っている可能性があります（書き手は lock を
+     待ち続けます。0104 §2.4）。握っているプロセスを見つけます
+
+     ```bash
+     sudo fuser -v /var/lib/coldaisle-registry/.registry.lock
+     # fuser が無い・判別できないときは、lock の inode を /proc/locks で探す
+     ino=$(sudo stat -c '%i' /var/lib/coldaisle-registry/.registry.lock)
+     grep ":$ino " /proc/locks    # 3列目が FLOCK、5列目が握っている pid
+     ps -o pid,user,etime,cmd -p <pid>
+     ```
+
+     `coldaisle-authority raise` が承認と証拠の検証中であれば、終わるまで待ちます。止まったまま
+     （`kill -STOP` された・端末で一時停止したなど）のプロセスなら、その持ち主に終わらせてもらいます。
+     **制御（fand）は Registry の lock を取らない**ので、この待ちは Fan 制御を止めません（0104 §2.4）
 5. **Registry の書き手の使い方。** 自分の uid のまま `--root /var/lib/coldaisle-registry` を指します
    （使い方は `docs/model-registry.md`。承認は 0062 のとおりファイルで渡す）
 
