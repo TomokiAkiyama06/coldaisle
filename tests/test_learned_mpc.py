@@ -694,6 +694,7 @@ def mpc_policy(
             "period_ms": 1_000,
             "budget_ms": budget_ms,
             "valid_ms": 2_000,
+            "max_source_age_ms": _provisional(2_000),
             "optimizer": optimizer_document(**optimizer),
         },
     )
@@ -891,7 +892,9 @@ def select_with(
     return gate.select(
         now_mono_ms=now_mono_ms,
         fallback=fallback or fallback_proposal(0.4),
-        learned=result.to_status(received_at_mono_ms=now_mono_ms),
+        learned=result.to_status(
+            received_at_mono_ms=now_mono_ms, source_snapshot_mono_ms=now_mono_ms
+        ),
         operating_mode=OperatingMode.AUTO,
         safety_state=SafetyState.NORMAL,
     )
@@ -1715,7 +1718,9 @@ def test_the_whole_chain_hands_a_bounded_request_to_the_guard(trained) -> None:
         selection = gate.select(
             now_mono_ms=now_mono_ms,
             fallback=fallback_proposal(0.4),
-            learned=result.to_status(received_at_mono_ms=now_mono_ms),
+            learned=result.to_status(
+                received_at_mono_ms=now_mono_ms, source_snapshot_mono_ms=now_mono_ms
+            ),
             operating_mode=OperatingMode.AUTO,
             safety_state=SafetyState.NORMAL,
         )
@@ -2266,6 +2271,7 @@ def test_the_confidence_assessor_follows_the_runtime_policy(trained) -> None:
             "period_ms": 1_000,
             "budget_ms": 1_000,
             "valid_ms": 2_000,
+            "max_source_age_ms": _provisional(2_000),
             "optimizer": optimizer_document(),
         },
     )

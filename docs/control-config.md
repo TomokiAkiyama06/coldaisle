@@ -26,8 +26,9 @@ T_SENSORのstale判定を持たず、`true` にするには `confirmed` と承�
 `write_fail_emergency_after` も `safety.yaml` の承認対象とし、stallや連続書き込み失敗の
 判定値をコードに埋め込まない。`stall_check_min_demand` は zone の最低安全 demand
 以下でなければ設定検証で拒否し、通常の安全 floor で回っている fan も監視対象にする。
-`fan-policy.yaml` は、MPCの `period_ms`・`budget_ms`・`valid_ms`、Supervisorの
+`fan-policy.yaml` は、MPCの `period_ms`・`budget_ms`・`valid_ms`・`max_source_age_ms`（v11）、Supervisorの
 `period_ms`・`valid_ms` を持つ。期限は制御デーモンが受信時刻から単調時計で判定する。
+MPC は受信時刻からの `valid_ms` に加えて、元 snapshot の単調時刻からの `max_source_age_ms` でも判定する（v11）。
 Fallback v2 の shape に Reactive Guard の閾値バンドを追加した
 `fan-policy.yaml` の schema version 3 を土台とする。
 Reactive Guard の `floor` / `hold_ms` と、温度・Power・吸気温度差の各 trigger は
@@ -173,6 +174,41 @@ Model を Production へ昇格させても authority は動かない（#104 と 
 
 v8からv9へは `authority_rollout` を追加してから `schema_version: 9` へ上げる。
 v1〜v8は自動補完せず起動前に拒否する。
+
+## Control Config v14 と `fan-policy.yaml` v11（#86 / 決定記録 0077 §2.4 の4）
+
+束ねた版 `CONTROL_CONFIG_VERSION` を 13 → 14 に上げ、`fan-policy.yaml` を schema version 10 → 11 にした
+（ほかのファイルの版は変えない。`fan-hardware.yaml` 1、`safety.yaml` 4、`air-balance.yaml` 2）。
+v11 は `mpc.max_source_age_ms`（`{value, status, basis}`）を**必須**にする。
+
+```yaml
+mpc:
+  period_ms: 10000
+  budget_ms: 2000
+  valid_ms: 20000
+  max_source_age_ms: {value: <下限〜valid_ms>, status: provisional}   # 実測前は provisional
+```
+
+- Learned MPC の提案は、**受信してから `mpc.valid_ms`**（0028 §2.6。変えない）に加えて、**元 snapshot の
+  単調時刻から `mpc.max_source_age_ms`** を超えても期限切れ（`learned_proposal_expired`、detail に
+  `source_age_ms` と `max_source_age_ms`）になる。worker の中で長く滞留した提案が、受信した瞬間に新しく
+  見えることを塞ぐ。元 snapshot の時刻は `coldaisle-fand` が自分の出した snapshot の記録から取り、worker の名乗りは使わない
+- 読み込み時に2つの不変条件を確かめ、満たさなければ Control Config の不正（`config_invalid` の全 zone Max）にする
+  - 上限: `mpc.max_source_age_ms <= mpc.valid_ms`
+  - 下限: `mpc.max_source_age_ms >= 2 * safety.tick_ms + mpc.period_ms + mpc.budget_ms`（`safety.yaml` をまたぐ）。
+    往き（frame が worker へ届くまでの最大1 tick・worker が最後の frame を拾うまでの最大1周期・optimizer の予算）と
+    還り（結果が次の tick の poll まで待つ最大1 tick）を足した値より短いと、健全な worker の提案も期限切れになり、
+    Learned が黙って一度も使われない構成を許してしまう
+- `provisional` の間は起動時の一覧（`provisional_values()`）に `mpc.max_source_age_ms` として出る。値は本番機での
+  推論・optimizer の所要時間の実測の後に決める（0077 §5「実測を待つ値」）
+
+**移行手順**: v10 を v11 として補完しない（読み込み時に拒否する）。
+
+1. 運用の `fan-policy.yaml` の `mpc` に `max_source_age_ms` を足す（下限と上限の間の値。上の例の暫定値なら
+   `safety.tick_ms` 1000 で下限は 14000、上限は 20000）
+2. 最後に `schema_version: 11` へ上げる。欄を欠く v11 と v10 のままのファイルはどちらも拒否され、
+   `config_invalid` の全 zone Max で止まる
+3. 新しいコードへ更新して再起動する
 
 ## Control Config v13 と `fan-policy.yaml` v10（#81 / 決定記録 0078 §2.4）
 

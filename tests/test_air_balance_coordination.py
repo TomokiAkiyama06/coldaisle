@@ -182,11 +182,11 @@ def run(
 # --- 設定（fan-policy.yaml v10） ---
 
 
-def test_fan_policy_v10_requires_the_coordination_block_and_defaults_to_nothing(
+def test_fan_policy_v11_still_requires_the_coordination_block(
     tmp_path: Path,
 ) -> None:
-    """v10 は塊を必須にする。v9 を補完しない（0078 §2.4）。"""
-    assert FAN_POLICY_CONFIG_VERSION == 10
+    """v10 から塊を必須にした（v11 でも同じ）。v9 を補完しない（0078 §2.4）。"""
+    assert FAN_POLICY_CONFIG_VERSION == 11
     documents = valid_documents()
     del documents["fan-policy.yaml"]["air_balance_coordination"]
     write_documents(tmp_path, documents)

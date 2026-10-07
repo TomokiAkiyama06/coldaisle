@@ -1067,6 +1067,61 @@ def test_a_worker_over_a_real_socket_reaches_the_gate_and_then_falls_back(catalo
     )
 
 
+def test_a_result_held_in_the_worker_too_long_expires_on_arrival(catalog, channel) -> None:
+    """**受信した瞬間に新しく見せない**（#86 / 決定記録 0077 §2.4 の4）。
+
+    偽 worker が古い snapshot から作った結果を実ソケットで今送る。受信からの経過は 0 でも、
+    元 snapshot から `mpc.max_source_age_ms` を超えていれば loop は期限切れで Fallback にする。
+    """
+    documents = valid_documents()
+    mpc = dict(documents["fan-policy.yaml"]["mpc"])  # type: ignore[call-overload]
+    mpc["valid_ms"] = 8_000
+    mpc["max_source_age_ms"] = {"value": 3_100, "status": "provisional"}
+    config = control_config(policy={"authority_stage": "limited", "mpc": mpc})
+    authority = StaticAuthority(AuthorityStage.LIMITED, config_ceiling=AuthorityStage.LIMITED)
+    gate = ControllerGate(
+        config.policy,
+        expected_model_version="thermal-vtest",
+        expected_artifact_sha256=None,
+        authority=authority,
+    )
+    running = channel()
+    harness = Harness(
+        catalog,
+        config=config,
+        gate=gate,
+        authority=authority,
+        learned_source=running.mailbox,
+        learned_health=running.mailbox,
+        learned_sink=running.mailbox,
+    )
+    old = harness.settle().tick
+    for _ in range(4):
+        harness.tick()
+    held = proposal_result()
+    assert held.proposal is not None
+    stale_proposal = held.proposal.model_copy(
+        update={"seq": old.tick_id, "computed_at_ms": old.ts_ms}
+    )
+    stale = MpcProposal(
+        proposal=stale_proposal,
+        assessment=assessment_for(stale_proposal),
+        binding_authority_stage=AuthorityStage.SHADOW,
+    )
+    worker, _ = connect(running, LearnedRole.MPC, MPC_UID)
+    try:
+        worker.send(envelope(stale))
+        assert wait_until(lambda: running.mailbox.poll() is not None)
+        result = harness.tick()
+    finally:
+        worker.close()
+
+    reason = result.tick.state.fallback_reason
+    assert reason.code == "learned_proposal_expired"
+    # 5 tick 前の snapshot（1 tick = 1000 ms）。受信からの経過は 0
+    assert reason.detail == "source_age_ms=5000; max_source_age_ms=3100"
+
+
 def test_the_daemon_runs_with_a_broken_channel_config(tmp_path: Path) -> None:
     """設定が不正なら経路を開かず、Learned だけを無効にして運転する（0077 §2.7）。"""
     documents = valid_documents()

@@ -695,6 +695,7 @@ def _select(
         learned=LearnedControlStatus(
             proposal=proposal,
             received_at_mono_ms=now,
+            source_snapshot_mono_ms=now,
             assessment=attached,  # type: ignore[arg-type]
             binding_authority_stage=AuthorityStage.FULL,
         ),
@@ -1388,6 +1389,7 @@ def test_a1_learned_confidence_requires_a_matching_verified_assessment(
             LearnedControlStatus(
                 proposal=proposal.model_copy(update={"confidence": 1.0}),
                 received_at_mono_ms=0,
+                source_snapshot_mono_ms=0,
                 assessment=forged,
                 binding_authority_stage=AuthorityStage.FULL,
             )
