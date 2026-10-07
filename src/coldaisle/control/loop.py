@@ -46,7 +46,7 @@ from coldaisle.control.air_balance_coordination import (
     project_floors,
 )
 from coldaisle.control.air_balance_trace import AirBalanceRecorder
-from coldaisle.control.config import CONTROL_CONFIG_VERSION, ControlConfig, FanPolicyConfig
+from coldaisle.control.config import ControlConfig, FanPolicyConfig
 from coldaisle.control.fallback.controller import FallbackController
 from coldaisle.control.fallback.gate import (
     ControllerGate,
@@ -56,12 +56,14 @@ from coldaisle.control.fallback.gate import (
 )
 from coldaisle.control.hardware.simulated import FanHardwareBackend, FanHardwareResult
 from coldaisle.control.learned_handoff import (
+    AvailableCalibration,
     LearnedChannelHealth,
     LearnedChannelState,
     LearnedExpectedArtifacts,
     LearnedFrame,
     LearnedFrameSink,
     LearnedRole,
+    UnavailableCalibration,
 )
 from coldaisle.control.logging import ControlTraceLogger
 from coldaisle.control.mpc.controller import MpcProposal
@@ -102,7 +104,6 @@ from coldaisle.control.schema import (
     AuthorityRecord,
     AuthorityStage,
     ConfidenceLevel,
-    ControlConfigDigest,
     ControllerKind,
     ControllerProposal,
     ControlState,
@@ -636,6 +637,8 @@ class ControlLoop:
         rl_supervisor_source: SupervisorOutputSource | None = None,
         learned_sink: LearnedFrameSink | None = None,
         learned_health: LearnedChannelHealth | None = None,
+        learned_calibration: AvailableCalibration | UnavailableCalibration | None = None,
+        metric_catalog_sha256: str | None = None,
         shadow: ShadowRecorder | None = None,
         trace: ControlTraceLogger | None = None,
         authority: AuthorityObserver | None = None,
@@ -652,7 +655,17 @@ class ControlLoop:
         （経路の状態を見ずに提案を読むと、受付スレッドの死や worker の切断の後も古い提案を
         読みうる）。
         ``learned_source`` だけを渡すのは、経路を持たない試験の偽の worker だけである。
+
+        ``learned_calibration`` / ``metric_catalog_sha256`` は frame v3 の欄（決定記録 0101 §2.2 /
+        0107 §2.6）。fand が起動時に読んだ値で、``learned_sink`` を渡すなら**両方とも必須**
+        （既定値で「読めなかった」や別の catalog を名乗らせない）。
         """
+        if learned_sink is not None and (
+            learned_calibration is None or metric_catalog_sha256 is None
+        ):
+            raise ValueError(
+                "frame を送るなら起動時の較正と Metric Catalog の SHA-256 も渡す（0101 / 0107）"
+            )
         if (supervisor is None) != (regime is None):
             raise ValueError("Supervisor と Workload Regime 推定は一緒に配線する")
         if rl_supervisor_source is not None and supervisor is None:
@@ -683,6 +696,8 @@ class ControlLoop:
         self._learned_source = learned_source
         self._rl_supervisor_source = rl_supervisor_source
         self._learned_sink = learned_sink
+        self._learned_calibration = learned_calibration
+        self._metric_catalog_sha256 = metric_catalog_sha256
         self._learned_health = learned_health
         # **受付スレッドの死は再起動まで覚える**（決定記録 0077 §2.2）。以後は提案を1件も読まない。
         self._learned_channel_dead = False
@@ -725,18 +740,7 @@ class ControlLoop:
         self._snapshots: deque[_SnapshotIdentity] = deque(maxlen=window)
         # **4ファイルの版と SHA-256 を `ControlConfig.sources` から写す**（runtime v2。
         # 決定記録 0073 §2.5 (c)）。手で書かない（起動ログの `trace_metadata()` と同じ出どころ）。
-        sources = config.sources
-        self._config_digest = ControlConfigDigest(
-            fan_hardware_sha256=sources.fan_hardware.sha256,
-            safety_sha256=sources.safety.sha256,
-            policy_sha256=sources.policy.sha256,
-            air_balance_sha256=sources.air_balance.sha256,
-            control_config_version=CONTROL_CONFIG_VERSION,
-            fan_hardware_schema_version=sources.fan_hardware.schema_version,
-            safety_schema_version=sources.safety.schema_version,
-            policy_schema_version=sources.policy.schema_version,
-            air_balance_schema_version=sources.air_balance.schema_version,
-        )
+        self._config_digest = config.runtime_digest()
         # **未校正なら推定モデルを作らない**（決定記録 0073 §2.2）。記録するだけで、requested・
         # Guard・Safety へは値を返さない。
         self._air_balance = AirBalanceRecorder.from_control_config(config)
@@ -1610,6 +1614,7 @@ class ControlLoop:
         """
         if self._learned_sink is None:
             return
+        assert self._learned_calibration is not None and self._metric_catalog_sha256 is not None
         try:
             frame = LearnedFrame(
                 snapshot=snapshot,
@@ -1625,6 +1630,9 @@ class ControlLoop:
                 authority_stage=authority_stage,
                 expected_artifacts=self._expected_artifacts,
                 config=self._config_digest,
+                # **毎 tick 同じ値**（fand は較正も catalog も起動時にしか読まない。0101 §2.2）
+                calibration=self._learned_calibration,
+                metric_catalog_sha256=self._metric_catalog_sha256,
             )
             self._learned_sink.offer(frame)
         except Exception:

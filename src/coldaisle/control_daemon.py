@@ -82,6 +82,11 @@ from coldaisle.control.hardware.simulated import (
     FanHardwareResult,
     SimulatedFanBackend,
 )
+from coldaisle.control.learned_handoff import (
+    AvailableCalibration,
+    CalibrationUnavailableCode,
+    UnavailableCalibration,
+)
 from coldaisle.control.logging import ControlTraceLogger
 from coldaisle.control.loop import (
     ControlLoop,
@@ -948,7 +953,8 @@ def build(
     clock: Clock = WallClock()
     monotonic: MonotonicClock = SystemMonotonicClock()
     try:
-        catalog = MetricCatalog.from_yaml(config.metrics)
+        # frame v3 の `metric_catalog_sha256` は**読んだのと同じ bytes** の hash（0107 §2.6）
+        catalog, metric_catalog_sha256 = MetricCatalog.from_yaml_with_sha256(config.metrics)
     except Exception as error:
         raise StartupEnvironmentError(f"{type(error).__name__}: {error}") from error
     try:
@@ -964,7 +970,7 @@ def build(
         raise StartupEnvironmentError(f"{type(error).__name__}: {error}") from error
     # **較正は起動時に1回だけ読む**（決定記録 0079 §2.4）。読めなくても起動は止めない
     # （0096 §5 #8。`unavailable` になり、較正の掛かる artifact が L9 で拒まれるだけ）。
-    runtime_calibration = read_runtime_calibration(config.calibration)
+    runtime_calibration, learned_calibration = read_startup_calibration(config.calibration)
     store = open_writable_store(config.db, rules=rules, clock=clock, control=control)
     binding = create_control_runtime_binding(control)
     # **registry は起動時に1回だけ読み、1つの snapshot から provenance・Gate の期待値・
@@ -1027,6 +1033,8 @@ def build(
             backend_factory=backend_factory,
             admin=admin,
             learned=learned,
+            learned_calibration=learned_calibration,
+            metric_catalog_sha256=metric_catalog_sha256,
         )
     except BaseException:
         if isinstance(learned, LearnedChannelEntry):
@@ -1049,7 +1057,18 @@ def build(
 
 
 def read_runtime_calibration(path: Path | None) -> RuntimeCalibration:
-    """反実仮想 artifact v2 の L9 に渡す runtime の較正を読む（決定記録 0079 §2.4 / 0096 §5 #8）。
+    """反実仮想 artifact v2 の L9 に渡す runtime の較正を読む（0079 §2.4 / 0096 §5 #8）。"""
+    return read_startup_calibration(path)[0]
+
+
+def read_startup_calibration(
+    path: Path | None,
+) -> tuple[RuntimeCalibration, AvailableCalibration | UnavailableCalibration]:
+    """起動時に1回だけ較正を読み、`RuntimeCalibration` と frame v3 の `calibration` を返す。
+
+    frame の側（決定記録 0101 §2.2）は同じ読み込みの結果を写すだけで、`unavailable` の理由は
+    閉じた code（`calibration_path_not_given` / `calibration_unreadable`）だけにする。例外の文字列と
+    path は構造化ログにだけ残す（AGENTS.md ルール10）。
 
     **例外で起動を止めない。** 読めない・壊れている・path が無いときは
     `RuntimeCalibration.unavailable`（理由付き）を返し、構造化ログに残す。空の値で
@@ -1062,7 +1081,9 @@ def read_runtime_calibration(path: Path | None) -> RuntimeCalibration:
             "較正ファイルを読まないため、較正の掛かる metric を使う Thermal Model は使わない",
             extra={logs.FIELDS_KEY: {"reason": "calibration_path_not_given"}},
         )
-        return RuntimeCalibration.unavailable(reason)
+        return RuntimeCalibration.unavailable(reason), UnavailableCalibration(
+            reason=CalibrationUnavailableCode.PATH_NOT_GIVEN
+        )
     try:
         loaded = Calibration.from_json(path)
         runtime = RuntimeCalibration.available(loaded.offsets_c)
@@ -1079,7 +1100,9 @@ def read_runtime_calibration(path: Path | None) -> RuntimeCalibration:
                 }
             },
         )
-        return RuntimeCalibration.unavailable(reason)
+        return RuntimeCalibration.unavailable(reason), UnavailableCalibration(
+            reason=CalibrationUnavailableCode.UNREADABLE
+        )
     LOGGER.info(
         "較正ファイルを読み込んだ（再起動まで読み直さない）",
         extra={
@@ -1090,7 +1113,9 @@ def read_runtime_calibration(path: Path | None) -> RuntimeCalibration:
             }
         },
     )
-    return runtime
+    # frame へは同じ値を写す（fand は artifact の `metric_binding` も digest も計算しない。
+    # 0101 §2.1）
+    return runtime, AvailableCalibration(offsets_c=dict(runtime.offsets_c or {}))
 
 
 def open_writable_store(
@@ -1251,6 +1276,8 @@ def _build_loop(
     backend_factory: BackendFactory,
     admin: ControlAdminEntry | None,
     learned: LearnedChannelEntry | DisabledLearnedChannel | None,
+    learned_calibration: AvailableCalibration | UnavailableCalibration,
+    metric_catalog_sha256: str,
 ) -> ControlLoop:
     safety = CriticalSafety(
         control.safety,
@@ -1302,6 +1329,9 @@ def _build_loop(
         learned_source=_learned_port(learned),
         learned_health=_learned_port(learned),
         learned_sink=_learned_port(learned),
+        # frame v3 の欄（決定記録 0101 §2.2 / 0107 §2.6）。起動時に読んだ値を毎 tick 同じに載せる
+        learned_calibration=learned_calibration,
+        metric_catalog_sha256=metric_catalog_sha256,
         shadow=ShadowRecorder(control.policy.shadow),
         trace=ControlTraceLogger(store) if config.record_trace else None,
         authority=authority,

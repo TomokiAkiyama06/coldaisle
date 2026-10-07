@@ -383,7 +383,7 @@ def test_the_frame_carries_the_pinned_artifacts_from_the_trace_provenance(
     harness.settle()
 
     frame = sink.frames[-1]
-    assert frame.schema_version == LEARNED_FRAME_SCHEMA_VERSION == 2
+    assert frame.schema_version == LEARNED_FRAME_SCHEMA_VERSION == 3
     assert frame.expected_artifacts == LearnedExpectedArtifacts.from_provenance(provenance)
     assert frame.expected_artifacts.thermal_model is not None
     assert frame.expected_artifacts.thermal_model.artifact_sha256 == thermal_sha(registry)

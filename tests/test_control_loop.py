@@ -35,6 +35,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -51,6 +52,7 @@ from coldaisle.control.config import ControlConfig, FanPolicyConfig, SafetyConfi
 from coldaisle.control.fallback.controller import FallbackController
 from coldaisle.control.fallback.gate import ControllerGate, LearnedControlStatus, SnapshotStatus
 from coldaisle.control.hardware.simulated import SimulatedFanBackend, SimulatedFaultPlan
+from coldaisle.control.learned_handoff import CalibrationUnavailableCode, UnavailableCalibration
 from coldaisle.control.logging import ControlTraceLogger
 from coldaisle.control.loop import (
     ControlLoop,
@@ -133,6 +135,8 @@ from test_simulated_fan_backend import hardware_config
 
 CONFIG_DIR = Path(__file__).resolve().parents[1] / "config"
 METRICS_PATH = CONFIG_DIR / "metrics.yaml"
+METRIC_CATALOG_SHA256 = hashlib.sha256(METRICS_PATH.read_bytes()).hexdigest()
+"""fand が `config/metrics.yaml` から作る frame の `metric_catalog_sha256`（0107 §2.6）。"""
 
 READINGS = {
     "cpu.package": 50.0,
@@ -410,6 +414,7 @@ class Harness:
         learned_source: Any = None,
         learned_health: Any = None,
         learned_sink: Any = None,
+        learned_calibration: Any = None,
         watchdog: Any = None,
         authority: Any = None,
         guard: Any = None,
@@ -481,6 +486,14 @@ class Harness:
             learned_source=learned_source,
             learned_health=learned_health,
             learned_sink=learned_sink,
+            # frame v3 の欄（決定記録 0101 / 0107）。既定は `--calibration` を省いた起動と同じ
+            learned_calibration=(
+                None
+                if learned_sink is None
+                else learned_calibration
+                or UnavailableCalibration(reason=CalibrationUnavailableCode.PATH_NOT_GIVEN)
+            ),
+            metric_catalog_sha256=(None if learned_sink is None else METRIC_CATALOG_SHA256),
             shadow=ShadowRecorder(self.config.policy.shadow),
             trace=ControlTraceLogger(self.trace) if with_trace else None,
             authority=authority or RecordingAuthority(self.authority, self.order),

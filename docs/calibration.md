@@ -122,10 +122,11 @@ uv run coldaisle-calibrate --minutes 10 --apply
 
 順番に意味があります（決定記録 0096 §2.7 / §5 #9）。
 
-- `coldaisle-fand` は起動時に較正を読み、Learned Thermal Model の artifact をその値で照合します（L9）。
-  較正の掛かる metric の offset が変わっていれば、その artifact は使われず Fallback になります
-  （fand は `--calibration` で渡した較正ファイルを起動時に読みます。照合を行う MPC worker はまだありませんが、
-  それより前から、この順番で運用してください）
+- `coldaisle-fand` は起動時に較正を読み（`--calibration`）、その値を毎 tick の frame で MPC worker
+  （`coldaisle-learnd --role mpc`）へ運びます。worker は fand の再起動（新しい `run_id`）を見て、新しい較正で
+  Learned Thermal Model の artifact を照合し直します（L9。決定記録 0101）。較正の掛かる metric の offset が
+  変わっていれば、その artifact は使われず Fallback になります。worker は較正ファイルを読まないので、
+  worker の再起動は要りません
 - **取り込みだけを再起動すると、fand は古い較正で照合済みの artifact のまま、新しい較正の値を読み続けます。**
   L9 による拒否は起きません
 - fand を先に再起動すれば、新しい較正の値で照合し直してから、新しい較正の値が store に入ります
