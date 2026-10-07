@@ -38,16 +38,17 @@ from coldaisle.control.schema import (
     WorkloadRegime,
 )
 
-EPISODE_SCHEMA_VERSION: Literal[2] = 2
+EPISODE_SCHEMA_VERSION: Literal[3] = 3
 """`EpisodeResult` の形の版。**欄の意味を変えたら上げる。**
 
 - v2（#105 / 決定記録 0074 §2.2）: 条件 hash を2段にした。`config_digests`（3つの検証済み設定の
   digest）と `other_conditions`（それ以外の条件）を**読める欄**として持ち、`conditions_sha256` は
   その2つから作り直せる。**v1 の episode は読まない**（report の入力にしない。0074 §3）。
   v1 は同じ条件・同じ seed から回し直せば v2 として同じ意味の結果になる（0058）
-- v2 のまま `StepRecord.simulator_assessment` を足した（決定記録 0079 §2.9 の段 6）。既存の欄の
-  意味は変えていない。`registry_attested` の step だけが必ず持ち、それ以外の step は `None`
-  なので、近似 simulator・記録再生の v2 episode はそのまま読める
+- v3（#105 / 決定記録 0106 §2.4）: `StepRecord.simulator_assessment`（learned simulator の step の、
+  同梱 Profile v2 による判定の記録。0079 §2.9 の段 6）を足した。`registry_attested` の step だけが
+  必ず持つ。**v2 の episode は版の不一致として読まない**（0074 §2.2 の v1 → v2 と同じ扱い）。
+  同じ条件・同じ seed から回し直せば v3 として同じ意味の結果になる（0058）
 """
 
 EPISODE_MIRRORED_CONDITIONS: tuple[str, ...] = (
@@ -277,7 +278,7 @@ class EpisodeSafety(_Frozen):
 class EpisodeResult(_Frozen):
     """1 episode の結果。**同じ条件・同じ seed からは同じ bytes になる。**"""
 
-    schema_version: Literal[2] = EPISODE_SCHEMA_VERSION
+    schema_version: Literal[3] = EPISODE_SCHEMA_VERSION
     episode_id: str = Field(pattern=r"^[a-z0-9][a-z0-9_.-]*$", max_length=120)
     seed: int = Field(ge=0)
     mode: TrainingMode
@@ -553,7 +554,7 @@ class PolicyArm(_Frozen):
 class PolicyComparison(_Frozen):
     """同じ条件・同じ episode 群で複数の policy を比べた結果。"""
 
-    schema_version: Literal[2] = EPISODE_SCHEMA_VERSION
+    schema_version: Literal[3] = EPISODE_SCHEMA_VERSION
     conditions_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     arms: tuple[PolicyArm, ...] = Field(min_length=2, max_length=8)
 

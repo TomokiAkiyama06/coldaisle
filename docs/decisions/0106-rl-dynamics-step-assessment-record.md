@@ -1,7 +1,7 @@
 # 決定記録 0106: learned simulator の step の判定の記録の中身と、episode / 学習報告の schema 版
 
 - **種別**: Decision Record
-- **Status**: Proposed
+- **Status**: FINAL（2026-10-07、リポジトリ所有者が推奨案で承認。§6）
 - **Date**: 2026-10-07
 - **Supersedes**: なし（[0074](0074-supervisor-shadow-wiring-and-episode-evaluation.md) §2.2 の episode の版 2 の上に版 3 を足す。0074 の他の点は変えない）
 - **関連**: [0050](0050-model-confidence-ood-and-authority.md) §2.2 /
@@ -25,12 +25,12 @@
    step を拒むので、版を上げるべきだと指摘した。`TRAINING_REPORT_SCHEMA_VERSION` の docstring も
    「入れ子の比較の形が変わったら上げる」としている
 
-**本記録は実装より先に所有者の承認を得るためのもの**で、承認までは PR #247 の版の扱い（4.）を変えない。
-数値のしきい値・設定値は新しく決めない。
+2026-10-07 にリポジトリ所有者が §2 の4点をすべて推奨案で承認した（§6）。版の扱い（§2.4）は承認の後に
+PR #247 で実装した。数値のしきい値・設定値は新しく決めない。
 
-## 2. Decision（推奨案）
+## 2. Decision
 
-### 2.1 記録の中身（PR #247 の実装のまま）
+### 2.1 記録の中身（決着（2026-10-07 所有者の決定、推奨案））
 
 `StepRecord.simulator_assessment`（`LearnedStepAssessment`）に、step ごとに次の2つを残す。
 
@@ -44,27 +44,28 @@
 `registry_attested` の採点できる step は記録を**必ず**持ち、他の出どころの step は持てない。記録は遷移・採点・
 `promotable` の条件に効かない（0079 §5 #8 のまま）。
 
-### 2.2 residual の証拠は渡さない
+### 2.2 residual の証拠は渡さない（決着（2026-10-07 所有者の決定、推奨案））
 
 simulator の中に実測は無く、自分の予測と照らしても drift は測れない。`residual=None` で判定する
 （`cap_before_residual_evidence` が掛かる）。記録の `confidence` は運転時の値と同じ意味ではないので、
 読むときは `ood` と構成要素を見る。
 
-### 2.3 設定は `fan-policy.yaml` の `model_confidence` を `bind` に明示して渡す
+### 2.3 設定は `fan-policy.yaml` の `model_confidence` を `bind` に明示して渡す（決着（2026-10-07 所有者の決定、推奨案））
 
 環境は生成時に、dynamics の設定が自分の `fan-policy.yaml` の `model_confidence` と一致すること、
 環境の `episode.step_ms` が artifact の action schema の `step_ms` と一致することを確かめ、違えば受け取らない。
 条件 hash（`dynamics.conditions()`）に同梱 Profile の hash と設定を入れる。
 
-### 2.4 schema 版を上げる（Codex P1 への推奨）
+### 2.4 schema 版を上げる（決着（2026-10-07 所有者の決定、推奨案）。PR #247 の Codex P1 への対応）
 
 - `EPISODE_SCHEMA_VERSION` を 2 → **3** に上げ、`PolicyComparison` も同じ版を持つ
 - `TRAINING_REPORT_SCHEMA_VERSION` を 2 → **3** に上げる（入れ子の比較の形が変わったため）
 - **版 2 の episode と学習報告は、版の不一致として読まない。** 0074 §2.2 が v1 → v2 で採った扱いと同じで、
   同じ条件・同じ seed から回し直せば版 3 として同じ意味の結果になる（0058）
-- `PolicyEpisodeReport`（`POLICY_EPISODE_REPORT_SCHEMA_VERSION` 1）と supervisor policy artifact（版 1）は、
-  入れ子に `EpisodeResult` の形を持たず、報告の版と digest で照合するだけなら版を上げない。実装時に
-  入れ子の形を持つことが分かれば、同じ PR で版を上げる
+- `PolicyEpisodeReport`（`POLICY_EPISODE_REPORT_SCHEMA_VERSION` 1）と supervisor policy artifact（版 1）は
+  版を上げない。実装時に確かめたとおり、どちらも入れ子に `EpisodeResult` / `PolicyComparison` の形を持たず、
+  比較の digest と条件 hash（`comparison_sha256` / `conditions_sha256`）を持つだけである。v3 の比較から作った
+  報告は、その digest が v3 の比較を指す
 - 版 3 で `promotable` の意味は変えない
 
 ## 3. Consequences
@@ -92,3 +93,14 @@ simulator の中に実測は無く、自分の予測と照らしても drift は
 
 - OOD / support 外の step を `promotable` の条件に入れるか（0079 §5 #8）。#105 の後続の記録
 - `PolicyEpisodeReport`（#91）が learned simulator の OOD の数を表に出すか。#91 / #92 側の記録
+
+## 6. 所有者の決定（2026-10-07）
+
+PR #247 で示した推奨案を、2026-10-07 にリポジトリ所有者がすべて承認した。
+
+| # | 判断点 | 決定 |
+|---|---|---|
+| 1 | 記録の中身（§2.1） | 推奨案: (a) 入力 window の anchor 推論の判定と (b) 掛けた action 列の step ごとの support の両方を記録する。記録だけで `promotable` の条件は変えない |
+| 2 | residual の証拠（§2.2） | 推奨案: simulator の中では渡さない（`residual=None`） |
+| 3 | 判定の設定の出どころ（§2.3） | 推奨案: `fan-policy.yaml` の `model_confidence` を `bind` に明示して渡し、環境が自分の設定との一致と刻みの一致を確かめる |
+| 4 | schema 版（§2.4） | 推奨案: `EPISODE_SCHEMA_VERSION` と `TRAINING_REPORT_SCHEMA_VERSION` を 3 に上げ、版 2 は版の不一致として読まない。`PolicyEpisodeReport` と policy artifact は入れ子の形を持たないので据え置く |

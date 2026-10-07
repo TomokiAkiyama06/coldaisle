@@ -52,6 +52,7 @@ from coldaisle.control.model.thermal import (
 from coldaisle.control.model_registry import ArtifactCapability, VerifiedArtifact
 from coldaisle.control.mpc import MpcModelBinding
 from coldaisle.control.rl import (
+    EPISODE_SCHEMA_VERSION,
     ActionSpace,
     AttestedThermalDynamics,
     DependencyIdentity,
@@ -2129,3 +2130,19 @@ def test_invariant_15_f_the_learned_simulator_has_no_path_to_control(attested_ar
         0.5,
         0.55,
     )
+
+
+def test_invariant_15_g_a_learned_simulator_episode_is_versioned(trained, narrow_artifact) -> None:
+    """記録を持つ episode は版 3 で往復し、版 2 を名乗る形は版の不一致で拒まれる（0106 §2.4）。"""
+    result = attested_run(trained, narrow_artifact)
+    assert result.schema_version == EPISODE_SCHEMA_VERSION == 3
+    restored = EpisodeResult.model_validate_json(result.model_dump_json())
+    assert restored == result
+    assert restored.digest() == result.digest()
+    assert restored.simulator_ood_steps == result.simulator_ood_steps
+
+    document = json.loads(result.model_dump_json())
+    document["schema_version"] = 2
+    with pytest.raises(ValidationError) as caught:
+        EpisodeResult.model_validate_json(json.dumps(document))
+    assert any(error["loc"] == ("schema_version",) for error in caught.value.errors())
