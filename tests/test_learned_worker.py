@@ -49,15 +49,15 @@ from coldaisle.learned_channel.messages import (
     encode_outbound,
     parse_inbound,
 )
-from coldaisle.learned_worker.cli import EXIT_ROLE_NOT_SUPPORTED, MpcWorker, main
+from coldaisle.learned_worker.cli import EXIT_STARTUP, MpcWorker, main
 from coldaisle.learned_worker.client import WorkerChannel
 from coldaisle.learned_worker.mpc import (
     FailureCode,
     MpcWorkerCore,
     RegistryArtifactSource,
-    RegistryProductionCheck,
     WorkerInputs,
 )
+from coldaisle.learned_worker.registry import RegistryProductionCheck
 from coldaisle.learned_worker.window import (
     FrameHistory,
     WindowUnavailable,
@@ -781,10 +781,30 @@ def test_an_overrun_reschedules_from_the_end_of_the_work() -> None:
     assert gaps and all(gap >= 250 + 100 for gap in gaps), core.started
 
 
-def test_the_role_supervisor_is_refused_until_stage_4() -> None:
-    assert main(
-        ["--role", "supervisor", "--registry-root", "x", "--learned-channel-config", "y"]
-    ) == (EXIT_ROLE_NOT_SUPPORTED)
+def test_an_unknown_role_is_refused_by_the_parser() -> None:
+    with pytest.raises(SystemExit) as exited:
+        main(["--role", "pwm", "--registry-root", "x", "--learned-channel-config", "y"])
+    assert exited.value.code == 2
+
+
+@pytest.mark.parametrize("role", ["mpc", "supervisor"])
+def test_a_role_whose_settings_cannot_be_read_does_not_start(tmp_path: Path, role: str) -> None:
+    """段階 4（#89）で `--role supervisor` も起動するが、設定を読めなければ接続しない。"""
+    assert (
+        main(
+            [
+                "--role",
+                role,
+                "--config-dir",
+                str(tmp_path / "missing"),
+                "--registry-root",
+                str(tmp_path / "registry"),
+                "--learned-channel-config",
+                str(tmp_path / "missing.yaml"),
+            ]
+        )
+        == EXIT_STARTUP
+    )
 
 
 # ============================================================ 境界（AGENTS.md ルール1・2・6・10）

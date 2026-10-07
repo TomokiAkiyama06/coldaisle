@@ -143,6 +143,7 @@ from coldaisle.control.state import (
     TelemetryReading,
 )
 from coldaisle.control.supervisor.policy import (
+    DeliveredSupervisorOutput,
     ReceivedSupervisorOutput,
     SupervisorCoordinator,
     SupervisorInput,
@@ -233,10 +234,15 @@ class LearnedProposalSource(Protocol):
 
 
 class SupervisorOutputSource(Protocol):
-    """worker が置いた最新の RL Supervisor 出力を読むだけの窓口。"""
+    """worker が置いた最新の RL Supervisor 出力を読むだけの窓口（決定記録 0077 §2.8）。
 
-    def poll(self) -> SupervisorOutput | None:
-        """最新の RL 出力。**同じ出力を何度返してもよい。**"""
+    返すのは出力と、それを作った artifact の識別（`SupervisorPolicyIdentity`）。識別は loop が
+    `ReceivedSupervisorOutput.identity` へ写し、Coordinator が `expected_rl_identity` と照合する。
+    **束縛の用途（`origin`）は運ばない。** loop は `unverified` のままにする（0061 §2.4）。
+    """
+
+    def poll(self) -> DeliveredSupervisorOutput | None:
+        """最新の RL 出力。**同じ出力を何度返してもよい。** **待たない。**"""
         ...
 
 
@@ -729,7 +735,7 @@ class ControlLoop:
         self._mode = ModeCommand()
         self._learned_digest: str | None = None
         self._learned_received_mono_ms: int | None = None
-        self._rl_output: SupervisorOutput | None = None
+        self._rl_output: DeliveredSupervisorOutput | None = None
         self._rl_received_mono_ms: int | None = None
         # RL 出力の元 snapshot を loop 自身の単調時計で特定するための窓。有効期限より
         # 長く持っても使えないので、設定から幅を決める（固定長にしない）。
@@ -1129,21 +1135,31 @@ class ControlLoop:
     def _rl_candidate(
         self, now_mono_ms: int
     ) -> tuple[ReceivedSupervisorOutput | None, Reason | None]:
-        """RL worker の出力を、**loop 自身の単調時計に束縛してから**渡す。"""
+        """RL worker の出力を、**loop 自身の単調時計に束縛してから**渡す。
+
+        **受け渡し口を覗く前に経路の状態を読む**（決定記録 0077 §2.5 の RL の行）。受付スレッドが
+        死んだ・worker が切れた・黙った・registry の移動で閉じた tick では読まない。`poll()` が
+        何も返さないのと同じく Coordinator は RL を未受信として扱い、active なら RulePolicy へ戻る。
+        """
         if self._rl_supervisor_source is None:
             return None, None
+        if self._learned_channel_unavailable(LearnedRole.SUPERVISOR) is not None:
+            return None, None
         try:
-            output = self._rl_supervisor_source.poll()
+            delivered = self._rl_supervisor_source.poll()
         except Exception:
             LOGGER.exception("supervisor worker poll failed")
             return None, Reason(code="supervisor_unavailable", detail="worker poll failed")
-        if output is None:
+        if delivered is None:
+            # **識別子と受信時刻を消さない**（MPC と同じ。0060 §2.6）。消すと、一時的に読めなかった
+            # 後で同じ出力が出てきたときに新しい受信時刻を押してしまう
             return None, None
-        if output != self._rl_output:
-            self._rl_output = output
+        if delivered != self._rl_output:
+            self._rl_output = delivered
             self._rl_received_mono_ms = now_mono_ms
         received_mono_ms = self._rl_received_mono_ms
         assert received_mono_ms is not None
+        output = delivered.output
         # **tick 番号だけで照合しない。** 番号は再起動で 0 に戻るので、前の process の出力が
         # 新しい process の無関係な snapshot に結び付く。壁時計の時刻と snapshot の形まで
         # 一致した記録だけを「この loop が出した snapshot」とみなす（0060 §2.6）。
@@ -1164,13 +1180,15 @@ class ControlLoop:
                 output=output,
                 source_monotonic_ms=source.monotonic_ms,
                 received_monotonic_ms=received_mono_ms,
-                # **origin は `unverified` のままにする**（既定値。#89 / 決定記録 0061 §2.4）。
-                # `SupervisorOutputSource.poll()` が返すのは素の `SupervisorOutput` で、
-                # それがどの用途で束縛された policy から出たかを loop は知らない。
-                # 知らないまま `active_binding` を名乗らせると、shadow 用の提案が
-                # active slot を通る。結果として `active_policy: rl_policy` の構成では
-                # Rule へ落ちるが、**それが正しい**（証明できない提案に制御権を渡さない）。
-                # worker が用途を運べる形にするのは、`for_active` の門を開くときに一緒に決める。
+                # 識別は worker が経路で運んだ値を写すだけ。照合は Coordinator が
+                # `expected_rl_identity`（起動時の registry。0077 §2.6）と行う
+                identity=delivered.identity,
+                # **origin は `unverified` のままにする**（既定値。#89 / 決定記録 0061 §2.4 /
+                # 0077 §2.8）。別プロセスの worker が `for_shadow` / `for_active` のどちらで
+                # 束縛したかを loop は証明できない。`shadow_binding` を押すとその値の意味が変わり、
+                # `active_binding` を名乗らせると証明できない提案に制御権を渡す。結果として
+                # `active_policy: rl_policy` の構成では Rule へ落ちるが、**それが正しい**。
+                # 用途を経路で証明して運ぶ形は、`for_active` の門を開く別の決定記録で決める。
             ),
             None,
         )
@@ -1553,7 +1571,7 @@ class ControlLoop:
         """
         if self._learned_source is None:
             return None, None
-        unavailable = self._learned_channel_unavailable()
+        unavailable = self._learned_channel_unavailable(LearnedRole.MPC)
         if unavailable is not None:
             return None, unavailable
         try:
@@ -1574,14 +1592,17 @@ class ControlLoop:
             self._learned_received_mono_ms = now_mono_ms
         return result, None
 
-    def _learned_channel_unavailable(self) -> LearnedChannelState | None:
-        """経路が提案を渡せない状態ならその値。渡せる（`connected`）なら None。"""
+    def _learned_channel_unavailable(self, role: LearnedRole) -> LearnedChannelState | None:
+        """その役割の経路が結果を渡せない状態ならその値。渡せる（`connected`）なら None。
+
+        受付スレッドの死は役割をまたいで再起動まで覚える（受付スレッドは1本。0077 §2.2）。
+        """
         if self._learned_health is None:
             return None
         if self._learned_channel_dead:
             return LearnedChannelState.CHANNEL_DEAD
         try:
-            state = self._learned_health.state(LearnedRole.MPC)
+            state = self._learned_health.state(role)
         except Exception:
             # 状態を答えられない経路の提案は読まない（読める根拠が無い）。再起動まで閉じる
             LOGGER.exception("learned channel health failed; closing the learned channel")

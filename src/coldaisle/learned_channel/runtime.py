@@ -19,6 +19,7 @@ from coldaisle import logs
 from coldaisle.clock import MonotonicClock
 from coldaisle.control.learned_handoff import LearnedChannelState, LearnedFrame, LearnedRole
 from coldaisle.control.mpc.controller import MpcProposal
+from coldaisle.control.supervisor.policy import DeliveredSupervisorOutput
 from coldaisle.learned_channel.config import LearnedChannelSettings
 from coldaisle.learned_channel.mailbox import LearnedMailbox
 from coldaisle.learned_channel.registry_watch import RegistryWatch
@@ -30,6 +31,10 @@ LOGGER = logging.getLogger("coldaisle.learned_channel")
 
 class DisabledLearnedChannel:
     """開かなかった経路。提案は無く、状態は常に `channel_disabled`、frame は捨てる。"""
+
+    def __init__(self) -> None:
+        self.supervisor_source = _NoSupervisorOutput()
+        """RL の出力も届かない（`SupervisorOutputSource`）。"""
 
     def poll(self) -> MpcProposal | None:
         """提案は届かない。"""
@@ -144,3 +149,9 @@ def _log_not_opened(reason: str, config_path: Path) -> None:
             }
         },
     )
+
+
+class _NoSupervisorOutput:
+    def poll(self) -> DeliveredSupervisorOutput | None:
+        """RL の出力は届かない。"""
+        return None

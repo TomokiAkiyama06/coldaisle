@@ -92,6 +92,7 @@ from coldaisle.control.loop import (
     ControlLoop,
     ControlTickResult,
     StaticOperatingMode,
+    SupervisorOutputSource,
     TelemetrySample,
     Watchdog,
     air_balance_input_metrics,
@@ -1329,6 +1330,10 @@ def _build_loop(
         learned_source=_learned_port(learned),
         learned_health=_learned_port(learned),
         learned_sink=_learned_port(learned),
+        # RL Supervisor worker の出力の口（決定記録 0077 §2.8 / 段階 4）。出力は候補の
+        # `SupervisorOutput` までで、Rule / RL の選択は Coordinator が決める。経路から来た出力は
+        # `unverified` なので active slot を通らない（0061 §2.4）
+        rl_supervisor_source=_rl_port(learned),
         # frame v3 の欄（決定記録 0101 §2.2 / 0107 §2.6）。起動時に読んだ値を毎 tick 同じに載せる
         learned_calibration=learned_calibration,
         metric_catalog_sha256=metric_catalog_sha256,
@@ -1347,6 +1352,14 @@ def _learned_port(
     if isinstance(learned, LearnedChannelEntry):
         return learned.mailbox
     return learned
+
+
+def _rl_port(
+    learned: LearnedChannelEntry | DisabledLearnedChannel | None,
+) -> SupervisorOutputSource | None:
+    """RL の枠の口。経路を配線しない起動（`--learned-channel-config` を省いた）は None。"""
+    port = _learned_port(learned)
+    return None if port is None else port.supervisor_source
 
 
 class ActuationNotApprovedError(RuntimeError):

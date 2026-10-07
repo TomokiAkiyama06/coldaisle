@@ -8,8 +8,9 @@
   同じ uid は認めない。root も暗黙には認めない（グループに入っていなければ拒む）
 - 役割ごとに**同時に1接続**。生きた接続がある役割への新しい接続は拒む
 - 受信・長さの上限の確認・JSON の解釈・pydantic の検証・`run_id` と `role` の照合までをここで行い、
-  検証を通った MPC の結果だけを受け渡し口へ置く。壊れたメッセージは捨てて数える（受け渡し口は
-  変えない。最後の有効なメッセージの時刻も変えない）
+  検証を通った結果だけを**その役割の**受け渡し口へ置く（MPC のソケットには `mpc_result`、RL の
+  ソケットには `supervisor_result`。別の役割の本文は捨てて数える）。壊れたメッセージは捨てて
+  数える（受け渡し口は変えない。最後の有効なメッセージの時刻も変えない）
 - 最後の**有効な**メッセージ（結果・heartbeat）から `worker_idle_timeout_ms` 黙った接続は閉じる
   （`worker_idle`）。EOF は `worker_disconnected`。どちらも**その時点で**受け渡し口を空にする
 - loop が置いた frame を、接続している役割へ非ブロッキングで送る。送れなければ捨てる（再送も待ちも
@@ -51,6 +52,7 @@ from coldaisle.learned_channel.messages import (
     HelloBody,
     MpcResultBody,
     OutboundEnvelope,
+    SupervisorResultBody,
     encode_outbound,
     parse_inbound,
 )
@@ -494,6 +496,12 @@ class LearnedChannelServer:
                 self._drop(conn.role, "unsupported_body")
                 return
             self._mailbox.place_mpc(body.result)
+        elif isinstance(body, SupervisorResultBody):
+            if conn.role is not LearnedRole.SUPERVISOR:
+                # MPC のソケットから Supervisor 出力を受け取らない（役割はソケットで決まる）
+                self._drop(conn.role, "unsupported_body")
+                return
+            self._mailbox.place_supervisor(body.result)
         # heartbeat は idle を数え直すだけで、受け渡し口の値も受信時刻も変えない
         conn.last_valid_mono_ms = self._monotonic.monotonic_ms()
 
