@@ -19,7 +19,8 @@ from pydantic import BaseModel, BeforeValidator, ConfigDict, ValidationError, fi
 
 from coldaisle.control.drift.model import MAX_DECLARED_CHANGES, ChangeKind, DeclaredChange
 
-_READ_FLAGS = os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC
+# O_NONBLOCK: 書き手の無い FIFO を開いて止まらない（regular file の読み込みには効かない）
+_READ_FLAGS = os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK
 
 
 class DeclaredChangesError(ValueError):

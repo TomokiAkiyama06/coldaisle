@@ -149,6 +149,11 @@ def test_symlink_and_directory_are_refused(tmp_path):
         read_declared_changes(link)
     with pytest.raises(DeclaredChangesError, match="regular file"):
         read_declared_changes(tmp_path)
+    fifo = tmp_path / "fifo.yaml"
+    os.mkfifo(fifo)
+    # 書き手の無い FIFO で止まらず、regular file でないとして拒否する（PR #255 の Codex の指摘）
+    with pytest.raises(DeclaredChangesError, match="regular file"):
+        read_declared_changes(fifo)
 
 
 def _changes_yaml(ts_values: list[int]) -> str:
