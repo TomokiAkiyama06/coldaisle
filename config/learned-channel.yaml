@@ -26,7 +26,9 @@ sockets:
   # 共通の親にすると、もう一方の役割のグループがたどれずに経路全体を開けません。
   # **共通の祖先（開発では var/run、本番では systemd の RuntimeDirectory）は起動前に用意し、両方の役割の
   # グループがたどれる（g+x か o+x）ようにしてください。** 無い祖先は最初に待ち受ける役割のグループで 0750 として
-  # 作られ、もう一方がたどれなくなります（決定記録 0095 §2.7。本番の値は worker の unit テンプレートで確定）。
+  # 作られ、もう一方がたどれなくなります（決定記録 0095 §2.7）。本番は /run/coldaisle/learned-mpc/mpc.sock と
+  # /run/coldaisle/learned-rl/supervisor.sock で、親は deploy/tmpfiles.d/coldaisle-learned.conf が setgid（2750）で作ります。
+  # coldaisle-fand の実行ユーザーを役割のグループに入れないでください（重なりの検査で経路が開きません。決定記録 0115）。
   mpc:
     path: var/run/learned-mpc/mpc.sock
     mode: "0660"
