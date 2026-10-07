@@ -73,6 +73,15 @@ Productionとして暗黙loadすることはない。`mark_validated()` はoffli
 root配下のdirectory・lock・snapshot・artifactは`openat`相当の`dir_fd`と`O_NOFOLLOW`で開き、
 symlinkまたは非regular fileを拒否する。artifact IDから組み立てたpathでroot外を読み書きしない。
 
+作るファイル（`registry.json`・`artifact.payload`）は `umask` に依らず `0640`、root の下に作る
+ディレクトリは親の permission の bit を `2770` の mask で写す（開発用の `0700` の root の下では `0700`、
+導入手順の `2770` の root の下では `2770`）。root そのものは従来どおり `0700` で作る。root が setgid 付き
+（導入手順で作った共有の root）なら、書き手も `.registry.lock` を作らない（無ければ
+`RegistrySharedRootError`）。`ModelRegistry(..., require_shared_root=True)` は Registry を書かない人
+（`coldaisle-authority raise`）のためのモードで、root も lock も作らず、root の形（ディレクトリ・other に
+権限が無い・setgid 付き）を開くたびに確かめ、lock を `O_RDONLY` で開いて `flock` だけを取る
+（決定記録 0104 §2.3 / §2.4）。導入先の置き場所・グループ・ACL は `docs/ubuntu-deploy.md`（0104 の段階 B）。
+
 新しいProductionへのpromotion時、旧Productionは`retired`になる。rollback targetには、旧Production、
 それまでのrollback targetの順に、checksumとformatの再検証を通った最初のartifactを残す。どちらも
 通らなければtargetは無く（`None`）、promotion自体は続行する。選ばれたtargetはpromotion auditの
