@@ -31,6 +31,7 @@ import tempfile
 import threading
 from collections.abc import Iterator
 from pathlib import Path
+from typing import Any
 
 import pytest
 from fastapi.testclient import TestClient
@@ -432,6 +433,89 @@ def test_same_user_is_rejected_when_not_allowed(short_dir, db, rules):
         assert entry.send(encode_gpu_mode("ai")) == {"ok": False, "error": "unauthorized"}
     finally:
         entry.stop()
+
+
+class _WriteAfterSocket(socket.socket):
+    """`sendall` を合図まで待たせる。入口が先に応答して閉じる順序を毎回つくる。"""
+
+    gate: threading.Event
+
+    def sendall(self, data: Any, flags: int = 0) -> None:  # type: ignore[override]
+        assert self.gate.wait(timeout=5)
+        super().sendall(data, flags)
+
+
+def _client_writes_after(monkeypatch: pytest.MonkeyPatch, gate: threading.Event) -> None:
+    """クライアントの `socket` だけを差し替える（入口のスレッドのソケットには触れない）。"""
+    delayed = type("DelayedSocket", (_WriteAfterSocket,), {"gate": gate})
+    namespace = type(
+        "SocketModule",
+        (),
+        {"AF_UNIX": socket.AF_UNIX, "SOCK_STREAM": socket.SOCK_STREAM, "socket": delayed},
+    )
+    monkeypatch.setattr(event_client, "socket", namespace)
+
+
+@needs_peercred
+def test_unauthorized_uid_sees_unauthorized_even_if_the_entry_closed_first(
+    short_dir, db, rules, monkeypatch
+):
+    """拒否の応答を書いて閉じたあとにクライアントが書く順序（EPIPE）でも「拒否」と分かる。
+
+    CI で間欠的に「Broken pipe」で落ちた順序（#241）を、合図で毎回つくる。
+    """
+    entry = RunningServer(
+        settings_for(short_dir / "events.sock"), db, rules, server_uid=os.geteuid() + 4242
+    )
+    assert entry.server is not None
+    closed = threading.Event()
+    handle = entry.server.handle
+
+    def handle_close_then_signal(conn: socket.socket) -> None:
+        handle(conn)
+        conn.close()
+        closed.set()
+
+    entry.server.handle = handle_close_then_signal  # type: ignore[method-assign]
+    _client_writes_after(monkeypatch, closed)
+    try:
+        assert entry.send(encode_gpu_mode("compute")) == {"ok": False, "error": "unauthorized"}
+        assert closed.is_set()
+    finally:
+        entry.stop()
+    assert entry.server.rejected == 1
+    assert entry.server.accepted == 0
+    assert stored_events(db, rules) == ()
+
+
+def test_the_client_reads_a_reply_already_sent_when_its_write_fails(short_dir, monkeypatch):
+    """書き込みが EPIPE でも、届いている応答の1行を読む。応答が無ければ「接続できない」。"""
+    path = short_dir / "peer.sock"
+    listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    listener.bind(str(path))
+    listener.listen(4)
+    closed = threading.Event()
+    replies = [b'{"ok": false, "error": "unauthorized"}\n', b""]
+
+    def refuse() -> None:
+        for reply in replies:
+            peer, _ = listener.accept()
+            peer.sendall(reply)
+            peer.close()
+            closed.set()
+
+    server = threading.Thread(target=refuse, daemon=True)
+    server.start()
+    _client_writes_after(monkeypatch, closed)
+    try:
+        line = encode_gpu_mode("compute")
+        assert event_client.send(line, path, timeout_s=5) == {"ok": False, "error": "unauthorized"}
+        closed.clear()
+        with pytest.raises(event_client.EntryUnavailableError, match="接続できない"):
+            event_client.send(line, path, timeout_s=5)
+    finally:
+        server.join(timeout=5)
+        listener.close()
 
 
 @needs_peercred
