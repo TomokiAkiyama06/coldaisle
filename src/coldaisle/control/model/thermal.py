@@ -167,7 +167,14 @@ class ThermalTargetSchema(_Frozen):
     """Ordered multi-horizon / multi-output target layout."""
 
     schema_version: Literal["thermal-targets-v1"] = TARGET_SCHEMA_VERSION
-    dataset_schema_version: Literal[1] = DATASET_SCHEMA_VERSION
+    dataset_schema_version: Literal[1, 2] = DATASET_SCHEMA_VERSION
+    """target の layout を作った Dataset の版。
+
+    target の layout（horizon × metric）は Dataset v1 / v2 で同じなので、artifact v2 も
+    ``thermal-targets-v1`` を使う（決定記録 0079 §2.3）。版の欄だけが出どころを区別する。
+    v1 artifact は 1 だけを受け付ける（``ThermalModelArtifact``）。既定値 1 の canonical bytes は
+    変わらない。
+    """
     horizons_ms: tuple[PositiveDurationMs, ...] = Field(
         min_length=1, max_length=MAX_TARGET_HORIZONS
     )
@@ -334,7 +341,14 @@ class ThermalPrediction(_Frozen):
     model_version: SemanticVersion
     artifact_sha256: Sha256
     artifact_verification: ArtifactVerification
-    capability: Literal[InferenceCapability.OBSERVATIONAL_REPLAY]
+    capability: Literal[
+        InferenceCapability.OBSERVATIONAL_REPLAY, InferenceCapability.COUNTERFACTUAL_ACTION
+    ]
+    """予測を出した artifact の申告。v1 は ``observational_replay`` だけ。
+
+    反実仮想 artifact v2（決定記録 0079）の anchor 推論は ``counterfactual_action`` を名乗る。
+    **可否の判断には使わない**（Registry の attestation を見る。0052 §2.1）。
+    """
     input_action_ts_ms: TimestampMs
     targets: tuple[PredictedTarget, ...] = Field(min_length=1, max_length=MAX_TARGET_HORIZONS)
     uncertainty: None = None
@@ -482,6 +496,9 @@ class ThermalModelArtifact(_Frozen):
             raise ValueError("manifestとfeature schema versionが一致しない")
         if self.manifest.target_schema_version != self.target_schema.schema_version:
             raise ValueError("manifestとtarget schema versionが一致しない")
+        if self.target_schema.dataset_schema_version != DATASET_SCHEMA_VERSION:
+            # v1 artifact は Dataset v1 からだけ作る。v2 の layout を v1 として読み替えない
+            raise ValueError("v1 artifactのtarget schemaはDataset v1由来に限定する")
         if self.manifest.feature_schema_sha256 != canonical_sha256(self.feature_schema):
             raise ValueError("feature schema checksumが一致しない")
         if self.manifest.target_schema_sha256 != canonical_sha256(self.target_schema):
