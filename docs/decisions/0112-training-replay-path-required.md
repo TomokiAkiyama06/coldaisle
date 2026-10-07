@@ -1,7 +1,7 @@
 # 決定記録 0112: 学習の入口で `--replay-path` の照合を必須にする（#237 の Codex P1）／0100 段 3（PR #259）の実装で決着した点
 
 - **種別**: Decision Record
-- **Status**: FINAL（2026-10-08、リポジトリ所有者が §2.1 を案1で、§2.2 の6点を推奨案で承認）
+- **Status**: FINAL（2026-10-08、リポジトリ所有者が §2.1 を案1で、§2.2 の6点を推奨案で、§2.3 を案A で承認。§2.3 の表の細部は確認待ち。§6）
 - **Date**: 2026-10-08
 - **Supersedes**: [0100](0100-replay-export-binding.md) の部分のみ。§2.8 の「export の記録の digest と `ReplayBindingV2` の中身」の
   最後の項（「それでも、学習の入口だけでは元の CSV の bytes を読み直せない。…学習の入口に `--replay-path` を任意で
@@ -72,6 +72,37 @@ telemetry から計算し直せて `source_sha256` と結びつく digest を残
    隣り合う・重なるものどうしつないだ区間のどれか1つに収まることとする
 6. **`ExportBinding` は1つの timezone を要求する**（違う timezone の export が混ざる入力は、再生が既に拒否している）
 
+### 2.3 学習の入口は元の入力から dataset を作り直し、公開物と完全に一致することを求める
+
+**決着（2026-10-08 所有者の決定、案A）。** §2.1 の照合だけでは、export A の example に、別の正当な export B の
+`SourceRun.source_sha256` と `ReplayBindingV2` を組み合わせた dataset（`--replay-path` には B の元の入力を渡す）を
+見分けられない（PR #264 の Codex の指摘）。fingerprint も束縛も dataset の中の値で、example の値そのものを元の bytes と
+照合していないためである。そこで学習の入口は次を行う。
+
+1. 渡された `--replay-path` を**一時の専用 DB**へ dataset 用の再生（0100 §2.3 の照合を含む）で取り込み、再生した
+   入力の fingerprint・timezone・`export_binding_sha256` が dataset の `SourceRun` / `ReplayBindingV2` と一致することを
+   確かめる（§2.1 は再生した bytes そのものに対して行う）
+2. **ControlTick の出どころは本番の DB の trace** とする。較正の記録・`csv_exports` と**同じ読み取り専用の接続・同じ
+   read transaction**で、run の期間 `[start_ms, end_ms)` の trace を記録した順（`seq`）で読み、一時の専用 DB へ
+   `seq` を保って写す
+3. 同じ `spec`（dataset の manifest の値）と同じ宣言（`DeclaredChange`。dataset には書かれないので呼び出し側が渡す。
+   0109）で builder を走らせ、作り直した dataset の**公開物の bytes（manifest と `examples.jsonl`）**が渡された dataset と
+   完全に一致することを求める。1 byte でも違えば学習を拒否する
+4. **trace が保持期間で消えた期間の dataset は学習に使えない。** 本番の DB の削除の境界（`control_trace_prune` の
+   `pruned_before_ms`）が run の開始より後なら拒否する。移行前の行（`seq ≤ legacy_through_seq`）を含む期間も拒否する
+   （0087 §2.1。一時の DB へ写すと境界が失われるため、本番の DB の値で判定する）
+
+実装の細部（案A の決定に書かれていない点。PR #264 で推奨案として実装し、**所有者の確認待ち**。確認されたら
+「決着」に改める。本記録は PR #264 で新設したので、マージ前の書き換えは「追記のみ」に当たらない）:
+
+| # | 論点 | 推奨案（実装済み） |
+|---|---|---|
+| 1 | 一時の専用 DB の置き場所と後始末 | OS の一時ディレクトリ（`tempfile.TemporaryDirectory`。所有者だけが読める）に作り、成否にかかわらず検査の終わりに消す |
+| 2 | 時間の上限 | 置かない（入力の大きさで決まる。学習の前に1回で、一括投入で待たない） |
+| 3 | source run の数 | builder が作るのは 1 run なので、source run が1つの dataset だけを学習の入口で受け付ける（複数 run の dataset は拒否） |
+| 4 | 比べる範囲 | 公開物の全体（manifest の bytes と `examples.jsonl` の bytes）。`control_trace_sha256` は `seq` を含むので、元の専用 DB の trace も本番の trace を `seq` ごと写したものでなければ一致しない（そうでない dataset は拒否される側に倒れる） |
+| 5 | 学習の入口の引数 | dataset・本番の DB の path・`--replay-path`・宣言・品質の設定（`QualityRules`。再生と builder が使う）を必須で受け取る。較正ファイルとの照合（`verify_training_calibration`）は従来どおり呼び出し側が続けて行う |
+
 ## 3. Consequences
 
 ### 良くなること
@@ -86,6 +117,9 @@ telemetry から計算し直せて `source_sha256` と結びつく digest を残
 | 学習に元の日次 CSV と manifest が要る（公開済みの dataset だけでは学習できない） | 日次 CSV と manifest は `csv_dir` に残る（保持期間の削除の対象外）。複写するときは manifest も一緒に複写する（`docs/thermal-dataset.md`） |
 | 学習の入口が入力を1回読み直す | hash を取るだけ（定数メモリ）。学習の前に1回 |
 | 学習の CLI ができるまで、必須の引数を強制する入口が無い | 学習の CLI の PR で必須の引数として配線する（0102 §2.3 と同じ） |
+| 学習の入口が再生と builder をもう1回走らせる（§2.3） | 一時の DB に一括投入する。学習の前に1回 |
+| 本番の DB の trace が保持期間（0030）で消えた期間の dataset は学習に使えない（§2.3 の 4） | 学習に使う期間は trace の保持期間の中で作る。消えた期間は作り直せないので拒否する側に倒す |
+| 元の専用 DB の trace が本番の trace を `seq` ごと写したものでないと一致しない（§2.3 の表 4） | 専用 DB へ trace を写す関数（`SqliteStore.copy_control_traces`）を使う。`coldaisle-dataset` 側の配線は別に決める |
 
 ## 4. 却下した代替案
 
@@ -98,4 +132,15 @@ telemetry から計算し直せて `source_sha256` と結びつく digest を残
 
 ## 5. 未決事項
 
-なし（学習の CLI への配線は学習の CLI の PR）。
+- §2.3 の表の細部 1〜5（推奨案で実装済み。所有者の確認待ち）
+- `coldaisle-dataset` の v2 で、専用 DB の ControlTick を本番の DB の trace から写す（または一致を確かめる）配線
+  （§2.3 の表 4。それまでは本番の trace を `seq` ごと写した専用 DB から作った dataset だけが学習の入口を通る）
+- 学習の CLI への配線は学習の CLI の PR
+
+## 6. 承認記録
+
+| 日付 | 決定 | 本記録 |
+|---|---|---|
+| 2026-10-08 | #237 の Codex P1 を案1（学習時に `--replay-path` を必須） | §2.1 |
+| 2026-10-08 | PR #259 の判断点 1〜6 を推奨案 | §2.2 |
+| 2026-10-08 | PR #264 の Codex P1 を案A（元の入力から作り直して公開物と比べる。ControlTick は本番の DB の trace。trace の消えた期間は拒否）。§2.3 の表の細部 1〜5 は確認待ち | §2.3 |
