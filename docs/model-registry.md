@@ -199,8 +199,16 @@ MemoryErrorで落とさないためである。壊れたYAML・JSONやファイ�
   過去のtraceも読み直さない。promotion / rollbackがtraceに現れるのは、それを反映して再起動した
   最初のtickからである。再起動のあいだの変更は、隣り合うtraceの `revision` の飛びとして検出し、
   全件は `coldaisle-registry audit --pointer-changes` の `registry_revision` で範囲に絞って引く
-  （正本はaudit）。いまの `coldaisle-fand` はregistryを読まない（Learned MPCのworkerを配線して
-  いない）ので、`revision: null`・`production: {}` の塊（`RegistryProvenance.unbound()`）を載せる。
+  （正本はaudit）。`coldaisle-fand` は `--registry-root` を与えたときだけ registry を**起動時に1回**
+  読み、その1つのsnapshotから trace の `registry`・Gate の期待値（`thermal_model` の production の版と
+  `artifact_sha256`。authority の束縛（決定記録 0089）と同じ値）・`expected_rl_identity`・worker への
+  frame の `expected_artifacts` を作る（決定記録 0077 §2.6）。省いた・読めない起動は
+  `revision: null`・`production: {}` の塊（`RegistryProvenance.unbound()`）を載せ、Learned を使わない
+  （読めないときは起動ログに error を残す）。走行中に固定した artifact が production でなくなった・
+  registryが読めなくなったときは、Learned の経路の受付スレッドが `safety.tick_ms` ごとの確認でその
+  役割を**再起動まで閉じる**（`registry_superseded`）。期待値と provenance は書き換えないので、
+  promotion / rollback は「registryを変える → `coldaisle-fand` を再起動する」を1組の手順にする。
+  `coldaisle-fand` は registry に書かず、artifact の bytes も読まない（検証は worker の仕事）。
 - #84 / #85 / #89: 各format固有loaderと推論interfaceを実装し、`VerifiedArtifact.payload` だけを
   入力にする。Registry内に任意コード実行経路を追加しない。
 - #86 Learned MPC: `VerifiedArtifact.attestation`（`ArtifactAttestation`）を内部モデルの束縛に使う。

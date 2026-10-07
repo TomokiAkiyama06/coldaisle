@@ -58,6 +58,7 @@ from coldaisle.control.hardware.simulated import FanHardwareBackend, FanHardware
 from coldaisle.control.learned_handoff import (
     LearnedChannelHealth,
     LearnedChannelState,
+    LearnedExpectedArtifacts,
     LearnedFrame,
     LearnedFrameSink,
     LearnedRole,
@@ -698,6 +699,9 @@ class ControlLoop:
         # 同じ記録になるのを防ぐため（読んでいない構成は `RegistryProvenance.unbound()` を
         # 明示する）。
         self._registry = registry
+        # **frame の `expected_artifacts` は trace の `registry` と同じ値から作る**（決定記録 0077
+        # §2.6）。別々に渡すと、worker が読む artifact と trace が名乗る版が食い違いうる。
+        self._expected_artifacts = LearnedExpectedArtifacts.from_provenance(registry)
 
         self._ages = _TelemetryAgeTracker()
         self._tick_id = 0
@@ -1619,6 +1623,7 @@ class ControlLoop:
                 ),
                 applied=_applied_demands(hardware),
                 authority_stage=authority_stage,
+                expected_artifacts=self._expected_artifacts,
                 config=self._config_digest,
             )
             self._learned_sink.offer(frame)
