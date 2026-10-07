@@ -238,12 +238,36 @@ def calibration_change_points(
 
     再生した専用 DB の時刻は CSV の書式で切り捨てられている。幅は CSV の書式から導いた値。
     """
+    return _interval_points(tuple(row.ts_ms for row in history.rows), resolution_ms)
+
+
+def declared_calibration_change_points(
+    declared_ts_ms: tuple[int, ...], *, resolution_ms: int = TIMESTAMP_RESOLUTION_MS
+) -> tuple[int, ...]:
+    """宣言の ``calibration_changed`` を区間 ``[floor(ts), ts]`` の両端にする（0109 §2.4）。"""
+    return _interval_points(declared_ts_ms, resolution_ms)
+
+
+def _interval_points(ts_values: tuple[int, ...], resolution_ms: int) -> tuple[int, ...]:
     if resolution_ms <= 0:
         raise ValueError(f"時刻の精度は正: {resolution_ms}")
     points: list[int] = []
-    for row in history.rows:
-        points.extend((row.ts_ms // resolution_ms * resolution_ms, row.ts_ms))
+    for ts_ms in ts_values:
+        points.extend((ts_ms // resolution_ms * resolution_ms, ts_ms))
     return tuple(points)
+
+
+def _overlapping(
+    ts_values: tuple[int, ...], *, start_ms: int, end_ms: int, resolution_ms: int
+) -> list[int]:
+    """区間 ``[floor(ts), ts]`` が期間 ``[start_ms, end_ms]`` と交わる時刻。"""
+    if resolution_ms <= 0:
+        raise ValueError(f"時刻の精度は正: {resolution_ms}")
+    return sorted(
+        ts_ms
+        for ts_ms in ts_values
+        if ts_ms // resolution_ms * resolution_ms <= end_ms and start_ms <= ts_ms
+    )
 
 
 def reject_changes_overlapping(
@@ -261,17 +285,38 @@ def reject_changes_overlapping(
     見逃す。``DatasetSpecV2`` は期間の長さの下限を持たないので、交わりを直接見る
     （PR #240 の Codex の指摘）。
     """
-    if resolution_ms <= 0:
-        raise ValueError(f"時刻の精度は正: {resolution_ms}")
-    overlapping = [
-        row.ts_ms
-        for row in history.rows
-        if row.ts_ms // resolution_ms * resolution_ms <= end_ms and start_ms <= row.ts_ms
-    ]
+    overlapping = _overlapping(
+        tuple(row.ts_ms for row in history.rows),
+        start_ms=start_ms,
+        end_ms=end_ms,
+        resolution_ms=resolution_ms,
+    )
     if overlapping:
         raise ValueError(
-            "Dataset v2 の期間の中に較正の変更がある（CSV の時刻の切り捨ての区間が期間と交わる）: "
-            f"{overlapping}"
+            "Dataset v2 の期間の中に較正の変更がある（記録の行。CSV の時刻の切り捨ての区間が"
+            f"期間と交わる）: {overlapping}"
+        )
+
+
+def reject_declared_changes_overlapping(
+    declared_ts_ms: tuple[int, ...],
+    *,
+    start_ms: int,
+    end_ms: int,
+    resolution_ms: int = TIMESTAMP_RESOLUTION_MS,
+) -> None:
+    """宣言の ``calibration_changed`` の区間 ``[floor(ts), ts]`` が期間と交われば拒否する。
+
+    0109 §2.4 / §5 #1。宣言の時刻は本番の ms の軸で、専用 DB の時刻は CSV の書式で切り捨て
+    られているので、点のままだと同じ秒の中の変更が期間の終端をすり抜ける。記録の行と同じ規則。
+    """
+    overlapping = _overlapping(
+        declared_ts_ms, start_ms=start_ms, end_ms=end_ms, resolution_ms=resolution_ms
+    )
+    if overlapping:
+        raise ValueError(
+            "Dataset v2 の期間の中に較正の変更がある（宣言。CSV の時刻の切り捨ての区間が"
+            f"期間と交わる）: {overlapping}"
         )
 
 

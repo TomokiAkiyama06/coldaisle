@@ -34,7 +34,6 @@ from pydantic_core import to_json
 from coldaisle import logs
 from coldaisle.control.config import ControlConfig
 from coldaisle.control.drift import (
-    ChangeKind,
     DeclaredChange,
     DriftConfig,
     DriftCoverage,
@@ -64,6 +63,7 @@ from coldaisle.control.shadow import (
     read_shadow_jsonl,
     shadow_rows,
 )
+from coldaisle.declared_changes import normalize_declared_changes
 from coldaisle.evaluate import (
     EvidenceDatabase,
     EvidenceOutputError,
@@ -80,23 +80,6 @@ DATASET_MANIFEST_FILENAME = "manifest.json"
 DATASET_EXAMPLES_FILENAME = "examples.jsonl"
 
 
-def _declared_changes(value: object) -> object:
-    """YAML の変更一覧を `DeclaredChange` へ正規化する。
-
-    記録の型は strict なので、`kind` の文字列は**ここで明示的に写す**。未知の種別は
-    `ChangeKind` が拒む（黙って落とすと、宣言したはずの交換が無かったことになる）。
-    """
-    if not isinstance(value, list):
-        return value
-    normalized: list[object] = []
-    for item in value:
-        if isinstance(item, dict) and isinstance(item.get("kind"), str):
-            normalized.append({**item, "kind": ChangeKind(item["kind"])})
-        else:
-            normalized.append(item)
-    return tuple(normalized)
-
-
 class _Manifest(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid", strict=True)
 
@@ -111,7 +94,7 @@ class DriftEvidenceManifest(_Manifest):
     """#90 の export。省略すると同じ照合器で trace から作り直す。"""
     dataset: str | None = Field(default=None, min_length=1, max_length=500)
     """入力分布を見るための Dataset artifact ディレクトリ。省略すると入力分布は判定しない。"""
-    changes: Annotated[tuple[DeclaredChange, ...], BeforeValidator(_declared_changes)] = ()
+    changes: Annotated[tuple[DeclaredChange, ...], BeforeValidator(normalize_declared_changes)] = ()
 
     @model_validator(mode="after")
     def _window_is_ordered(self) -> Self:

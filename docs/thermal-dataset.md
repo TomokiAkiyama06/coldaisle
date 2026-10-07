@@ -22,11 +22,14 @@ Learned Thermal Model / MPC向けのdatasetは、保存済みTelemetryとControl
 
 以下の数値とmetricは説明用の短い例であり、本番確定値ではない。実データで選んだ値を
 すべて明示して実行する。CLIにはwindow / horizon等の既定値が無い。
+作る版も `--dataset-version 1|2` で明示する（既定値は無い。決定記録 0109 §5 #6）。v2 は下の
+「Thermal Dataset v2」の節を参照。
 現在のCLIは、実機なしで入力bytesのhashを開始前に固定できるReplayだけを受け付ける。
 Serial / Mock / Importのprovenance bindは、各収集経路を接続する残作業である。
 
 ```bash
 uv run coldaisle-dataset \
+  --dataset-version 1 \
   --db var/replay.db \
   --quality-config config/quality.yaml \
   --output-root data/thermal \
@@ -127,7 +130,7 @@ Replay中にControl Engineが出したtrace、または保存済みtraceが必�
 
 v2 は v1 と別の型（`schema_version` 2）で、v1 を v2 として読み替えない。型は
 `coldaisle.control.model.dataset` の `DatasetSpecV2` / `DatasetExampleV2` / `ThermalDatasetV2`、
-生成は `coldaisle.dataset.ThermalDatasetV2Builder` にある。CLI（`coldaisle-dataset`）はまだ v1 だけを作る。
+生成は `coldaisle.dataset.ThermalDatasetV2Builder` にあり、CLI は `coldaisle-dataset --dataset-version 2` で作る（下の「v2 の CLI」）。
 
 v1 との違い（規則の正本は [0087](decisions/0087-dataset-v2-action-grid.md)）:
 
@@ -156,7 +159,9 @@ v1 との違い（規則の正本は [0087](decisions/0087-dataset-v2-action-gri
   （`seq ≤ legacy_through_seq`）を含む run。`legacy_through_seq` は migration `0010` が `control_trace_prune` に
   足した列で、行が無い DB では 0、0007 を適用済みの DB では `ts_ms ≤ legacy_until_ms` の行の `MAX(seq)` である
 - **較正の変更**: 呼び出し側は宣言された変更（`DeclaredChange`。0056 §2.5）を必ず渡す（無ければ空の tuple）。
-  `calibration_changed` が全 example の期間 `[history_start_ms の最小, label_end_ms の最大]` の中にあれば生成を拒否する
+  `calibration_changed` は記録の行と同じく区間 `[floor(ts_ms), ts_ms]` とし、全 example の期間
+  `[history_start_ms の最小, label_end_ms の最大]` と交われば生成を拒否する（決定記録 0109 §2.4）。他の種別は
+  生成に効かない（0087 §2.6）。CLI は期間の中にあれば警告をログに出す
 - **較正の変更の記録**（決定記録 [0099](decisions/0099-calibration-change-log.md) §2.6）: 呼び出し側は本番の DB から
   `read_calibration_history(path)`（読み取り専用。migration を当てない）で読んだ `CalibrationHistory` を
   `calibration_history` に必ず渡す（既定値は無い。専用 DB には記録が無い）。example が1件以上あれば、
@@ -170,6 +175,44 @@ v1 との違い（規則の正本は [0087](decisions/0087-dataset-v2-action-gri
 - **再生する CSV**: v2 の学習には、較正の変更の記録（`--calibration-history-db` に渡す DB）と同じ本番の DB から
   書き出した CSV だけを使う（束縛の仕組みは #237 で決める）
 - `control_trace_sha256` は run の全 ControlTick を `seq` 付きで hash する（v2 は anchor 以外の tick も使うため）
+
+### v2 の CLI（決定記録 0109）
+
+v1 の引数に加えて、次を**すべて必須**で渡す（既定値は無い。v1 で渡すと拒否する）。
+
+- `--action-step-ms` / `--action-steps` / `--action-stale-after-ms`: `DatasetSpecV2` の欄
+- `--declared-changes <path>`: 宣言された変更の YAML。宣言が無いときも `changes: []` と書いたファイルを渡す
+- `--calibration-history-db <path>`: 較正の変更の記録（`calibration_activations`）を持つ本番の DB。読み取り専用で
+  開き、migration を当てない。専用 DB（`--db`）と同じ実体（symlink・hard link の別名を含む）は拒否する
+
+```yaml
+# var/declared-changes.yaml（数値は説明用の仮の値）
+schema_version: 1
+changes:
+  - kind: calibration_changed     # fan_replaced / sensor_replaced / hardware_config_changed も書ける
+    ts_ms: 1790000000000          # 整数の Unix ms（UTC）だけ。日時の文字列は受け付けない
+    detail: "プローブを差し替えて再較正した"
+```
+
+```bash
+uv run coldaisle-dataset \
+  --dataset-version 2 \
+  --declared-changes var/declared-changes.yaml \
+  --calibration-history-db var/coldaisle.db \
+  --action-step-ms 1000 \
+  --action-steps 10 \
+  --action-stale-after-ms 3000 \
+  ...                          # v1 と同じ引数（--db / --replay-path / --horizon-ms ほか）
+```
+
+- 宣言のファイルは DB を開く前に検証し、外れれば終了コード 1 で何も書かない。拒否するもの: 空のファイル・`null`・
+  `changes` の鍵の欠け・未知の種別・`bool` / 浮動小数 / 文字列の `ts_ms`・負の `ts_ms`・知らない鍵・重複した鍵・
+  symlink や regular file でないもの・重複をまとめた後に `MAX_DECLARED_CHANGES` を超える件数。1件の形は
+  `coldaisle-drift` の証拠 YAML の `changes:` と同じで、写し方の関数も共有する（`coldaisle.declared_changes`）
+- 宣言は manifest に書かない（生成の可否にだけ効き、dataset の bytes は変わらない）。構造化ログに、ファイルの
+  SHA-256・件数・種別ごとの件数・期間の中の件数を出す。拒否したときは、宣言と記録のどちらで拒否したかを理由に出す
+- `detail` に実機の個体識別子（ROM・ホスト名・絶対パス）を書かない
+- 上の2つの注意（再生の timezone・再生する CSV）は、決定記録 0100 の段 3 が入るまで v2 の CLI にもそのまま当てはまる
 
 ## 実データ収集後に残る作業
 
