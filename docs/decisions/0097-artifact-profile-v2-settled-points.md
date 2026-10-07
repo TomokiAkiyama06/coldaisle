@@ -64,12 +64,16 @@ manifest の `action_variation_summary`（0079 では「zone ごとの action �
 - 起点は `prior_action`（0087 §2.7 の v2 の anchor action）。v1 の `action`（anchor の tick 自身の値）は数えない
 - train だけから数える（validation / test は数えない。0050 §2.1 と同じ向き）
 
-### 2.4 L11 は L4 より前に生の JSON で見分ける
+### 2.4 L11 は schema 全体の読み込みより前に、生の JSON で見分ける
 
-manifest / Profile v2 の `anchor_action_rule` が Literal（`hold_effective`）の外の値のとき、schema の読み込み（L4〜）の
-型の検査で落とさず、**生の JSON の段で L11 として拒否する**。したがって L5〜L10 より先に報告される。
+manifest / Profile v2 の `anchor_action_rule` が Literal（`hold_effective`）の外の値のとき、schema 全体の読み込み
+（Pydantic の型の検査。失敗は L4 として報告する）で落とさず、**生の JSON の段で L11 として拒否する**。
 
-- 理由: Literal 外の値を schema の読み込みの失敗に混ぜると、検査の番号（`check`）から原因が L11 だと読めなくなる
+- 順は L1〜L3 → L4 のうち `schema_name` / `schema_version` の照合（生の JSON） → **L11**（生の JSON） →
+  schema 全体の読み込み（失敗は L4） → L5〜L10 / L12。したがって L11 は L5〜L10 より先に報告され、
+  版の照合（L4 の前半）には後れる。版も規則も外れた artifact は L4 で拒否される
+- 理由: Literal 外の値を schema 全体の読み込みの失敗に混ぜると、検査の番号（`check`）から原因が L11 だと読めなくなる。
+  版の照合を先にするのは、v2 でない artifact に v2 の欄を探しに行かないため
 
 ### 2.5 loader は authority stage を受け取らない
 
