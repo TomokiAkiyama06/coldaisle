@@ -9,9 +9,15 @@ episode の結果に必ず出る。**
 | `registry_attested` | Registry が反実仮想を申告した artifact | できる。**該当 artifact は無い** |
 | `simulated_provisional` | 設定した近似式 | **できない。** 実測に裏づけが無い |
 
-`registry_attested` は `ArtifactCapability.COUNTERFACTUAL_ACTION` を要求する。現行の
-artifact はすべて `observational_replay` なので（決定記録 0048 §2.1 / 0052 §2.1）、
-**この経路はいまのところ決定論的にすべて拒む。** 拒否は不具合ではなく、0052 と同じ規律である。
+`registry_attested` は反実仮想 Thermal Model artifact v2 の封をした型
+`RegistryCounterfactualThermalModel`（決定記録 0079 §2.4）**だけ**を受け取る（0079 §2.9 の段 6）。
+v1 artifact（`observational_replay`）は loader の L1 / L4 で型にならず、学習 dynamics にも
+決定論的に束縛できない（0079 §2.2 / 0058 §2.3）。拒否は不具合ではなく、0052 と同じ規律である。
+
+learned simulator は各 step で、同梱 Confidence Profile v2 による判定（anchor 推論の OOD と、
+その step で掛けた action 列の step ごとの support。0050 / 0084）を **記録する**
+（`LearnedStepAssessment`）。**記録だけで、遷移・採点・`promotable` の条件は変えない**
+（0079 §2.9 段 6 / §5 #8）。
 
 近似 simulator は `simulated_provisional` としか名乗れず、`DynamicsIdentity` の不変条件が
 Registry の証拠（artifact hash）を持たせない。**「検証済みの学習 simulator」に見える道は無い。**
@@ -27,22 +33,37 @@ from typing import Protocol, Self
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from coldaisle.control.config import ShadowConfig
+from coldaisle.control.config import ModelConfidencePolicy, ShadowConfig
+from coldaisle.control.model.calibration_digest import RuntimeCalibration
+from coldaisle.control.model.confidence import ComponentResult, ConfidenceComponent
+from coldaisle.control.model.counterfactual import (
+    ActionTrajectory,
+    CounterfactualArtifactRejectedError,
+    RegistryCounterfactualThermalModel,
+    ThermalActionSchema,
+)
+from coldaisle.control.model.counterfactual_confidence import (
+    CounterfactualConfidenceAssessor,
+    StepSupportChecker,
+    StepSupportViolation,
+)
 from coldaisle.control.model.thermal import (
+    InferenceCapability,
     ObservedFanAction,
     ObservedThermalInput,
     ObservedWindowFrame,
     ThermalMetricName,
     canonical_sha256,
 )
-from coldaisle.control.model_registry import ArtifactAttestation, ArtifactCapability, ArtifactKind
-from coldaisle.control.mpc import (
-    ActionPlan,
-    CounterfactualThermalModel,
-    PlannedThermalInput,
+from coldaisle.control.model_registry import (
+    ArtifactAttestation,
+    ArtifactCapability,
+    ArtifactKind,
+    VerifiedArtifact,
 )
 from coldaisle.control.rl.config import MAX_EPISODE_STEPS, SimulatorConfig
 from coldaisle.control.schema import Demand, PerZone, Reason, WorkloadRegime, Zone
+from coldaisle.metrics import MetricCatalog
 
 Sha256 = str
 
@@ -240,18 +261,64 @@ class DynamicsRequest(_Frozen):
     step_index: int = Field(ge=0)
 
 
+class LearnedStepAssessment(_Frozen):
+    """learned simulator が1 step を作ったときの、同梱 Profile v2 による判定の**記録**。
+
+    決定記録 0079 §2.9 の段 6（「同梱 Profile で step の OOD を記録する」）。**記録だけ**で、
+    遷移も採点も `promotable` の条件も変えない（0079 §5 #8。条件に入れるなら新しい記録）。
+
+    - `confidence` / `ood` / `ood_components`: その step の入力 window に対する anchor 推論
+      （規則 `hold_effective`。0084 §2.1）を、運転時と同じ判定器
+      `CounterfactualConfidenceAssessor`（同梱 Profile v2 と `fan-policy.yaml` の
+      `model_confidence`）で判定した結果（0050 §2.2 の構成要素の形のまま）。simulator の中には
+      実測が無いので residual の証拠は渡さない（residual drift は判定できない、として扱う）
+    - `plan_support`: その step で掛けた demand を action schema の格子の間保った列を、anchor
+      （window の action）から同梱 Profile v2 の step ごとの support に照らし、外れた最初の点
+      （0079 §2.5 / 0084 §2.2。候補 plan の照合と**同じ関数**・margin なし）。外れていれば、
+      その step の次の観測は学習した action 列の外の外挿である
+    """
+
+    confidence: float = Field(ge=0.0, le=1.0, allow_inf_nan=False)
+    ood: bool
+    ood_components: tuple[ComponentResult, ...] = Field(max_length=len(ConfidenceComponent))
+    """OOD と判定された構成要素（detail 付き）。OOD でなければ空。"""
+    plan_support: StepSupportViolation | None
+    """掛けた action 列が step ごとの support の外なら、外れた最初の点。中なら `None`。"""
+
+    @model_validator(mode="after")
+    def _ood_matches_the_components(self) -> Self:
+        if any(not component.ood for component in self.ood_components):
+            raise ValueError("OOD でない構成要素を ood_components に入れない")
+        if self.ood != bool(self.ood_components):
+            raise ValueError("ood と OOD の構成要素の有無を食い違わせない")
+        if self.ood and self.confidence != 0.0:
+            # 0050 §2.2「1つでも OOD なら confidence は 0」。
+            raise ValueError("OOD の step の confidence は 0 にする")
+        return self
+
+    @property
+    def outside_support(self) -> bool:
+        """掛けた action 列が step ごとの support の外だったか。"""
+        return self.plan_support is not None
+
+
 class DynamicsStep(_Frozen):
     """1 step の遷移。**採点できないときは観測を作らない。**
 
     **観測の出どころは `window` ひとつだけ。** 値を別の欄でも返せると、window の品質 mask と
     食い違う値を渡せてしまう。環境は `window` の最後の frame から、**使える cell だけ**を
     読む（決定記録 0058 §2.2）。
+
+    `registry_attested` の採点できる step は、同梱 Profile v2 による判定の記録 `assessment` を
+    **必ず**持つ（0079 段 6）。それ以外の step は持たない（近似 simulator や記録再生に
+    Profile の判定を名乗らせない）。
     """
 
     provenance: DynamicsProvenance
     supported: bool
     window: ObservedThermalInput | None = None
     reason: Reason | None = None
+    assessment: LearnedStepAssessment | None = None
 
     @model_validator(mode="after")
     def _unsupported_steps_carry_no_observation(self) -> Self:
@@ -260,12 +327,19 @@ class DynamicsStep(_Frozen):
                 raise ValueError("採点できる step には次の観測が要る")
             if self.reason is not None:
                 raise ValueError("採点できた step に失敗の理由を付けない")
+            attested = self.provenance is DynamicsProvenance.REGISTRY_ATTESTED
+            if attested and self.assessment is None:
+                raise ValueError("learned simulator の step には同梱 Profile の判定の記録が要る")
+            if not attested and self.assessment is not None:
+                raise ValueError("learned simulator 以外の step に Profile の判定を付けない")
             return self
         if self.window is not None:
             # 「記録に無い action の結果」を作ってはならない（決定記録 0053 §2.3 / 0054 §2.2）。
             raise ValueError("採点できない step に観測を作らない")
         if self.reason is None:
             raise ValueError("採点できない step には理由を残す")
+        if self.assessment is not None:
+            raise ValueError("採点できない step に Profile の判定を付けない")
         return self
 
 
@@ -666,20 +740,34 @@ class HybridDynamics:
 
 
 class AttestedThermalDynamics:
-    """Registry が反実仮想能力を申告した artifact を learned simulator として使う。
+    """Registry が検証した反実仮想 Thermal Model artifact v2 を learned simulator として使う。
 
-    **いまこの経路を通れる artifact は1つも無い。** 現行の #84 artifact は manifest の
-    capability が `observational_replay` に固定されているため（決定記録 0048 §2.1）、
-    `bind` は決定論的にすべて拒む。0052 §2.1 と同じ規律を、環境側にもそのまま置く。
+    **受け取るのは封をした型 `RegistryCounterfactualThermalModel` だけ**（決定記録 0079 §2.4 /
+    §2.9 の段 6）。この型は Registry の検証経路が発行した `VerifiedArtifact` から、読み込み時の
+    検査（L1〜L12。較正の L9 を含む）をすべて通ったときだけ作られ、model と同梱 Confidence
+    Profile v2 を同じ bytes から持つ。v1 artifact（`observational_replay`）はこの型にならない
+    ので、学習 dynamics にも束縛できない（0079 §2.2）。
 
     `production_active` は**要求しない**。0052 §2.1 が「Replay / offline 評価は production で
-    ない attestation をそのまま使う」としているためで、ここは制御経路ではない。
+    ない attestation をそのまま使う」としているためで、ここは制御経路ではない（0058 §2.3）。
     代わりに、この束は `MpcModelBinding` へ変換できない（制御へ配線する API を持たない）。
+
+    **各 step で同梱 Profile v2 による判定を記録する**（`LearnedStepAssessment`）。記録だけで、
+    遷移・採点・`promotable` の条件は変えない（0079 §5 #8）。
     """
 
-    __slots__ = ("_attestation", "_evidence", "_identity", "_model")
-    _model: CounterfactualThermalModel
+    __slots__ = (
+        "_assessor",
+        "_attestation",
+        "_checker",
+        "_evidence",
+        "_identity",
+        "_model",
+    )
+    _model: RegistryCounterfactualThermalModel
     _attestation: ArtifactAttestation
+    _assessor: CounterfactualConfidenceAssessor
+    _checker: StepSupportChecker
     _identity: DynamicsIdentity
     _evidence: DynamicsEvidence
 
@@ -687,35 +775,77 @@ class AttestedThermalDynamics:
         raise TypeError("AttestedThermalDynamics は bind からだけ作る")
 
     @classmethod
+    def from_verified_artifact(
+        cls,
+        verified: VerifiedArtifact,
+        *,
+        metric_catalog: MetricCatalog,
+        calibration: RuntimeCalibration,
+        confidence_policy: ModelConfidencePolicy,
+    ) -> AttestedThermalDynamics:
+        """`VerifiedArtifact` から封をした型を作り、同じ証拠と束ねる（1つの呼び出し）。
+
+        `metric_catalog` は `config/metrics.yaml`、`calibration` は較正の値（読めなければ
+        `RuntimeCalibration.unavailable`）。どちらも既定値を持たない（0079 §2.4 / 0096）。
+        読み込み時の検査に外れた artifact は `DynamicsUnusableError`（検査の番号つき）になる。
+        """
+        try:
+            model = RegistryCounterfactualThermalModel.from_verified_artifact(
+                verified, metric_catalog=metric_catalog, calibration=calibration
+            )
+        except CounterfactualArtifactRejectedError as error:
+            raise DynamicsUnusableError(
+                f"反実仮想 artifact v2 の読み込み時の検査に外れた（{error.check.value}）: "
+                f"{error.detail}"
+            ) from error
+        return cls.bind(
+            model, attestation=verified.attestation, confidence_policy=confidence_policy
+        )
+
+    @classmethod
     def bind(
         cls,
-        model: CounterfactualThermalModel,
+        model: RegistryCounterfactualThermalModel,
         *,
         attestation: ArtifactAttestation,
+        confidence_policy: ModelConfidencePolicy,
     ) -> AttestedThermalDynamics:
-        """Registry の証拠と突き合わせて束ねる。条件を1つでも欠けば拒む。"""
-        identity = model.identity
+        """Registry の証拠と突き合わせて束ねる。条件を1つでも欠けば拒む。
+
+        `confidence_policy` は `fan-policy.yaml` の `model_confidence`（運転時と同じ判定の設定）。
+        各 step の判定の記録にだけ使う。
+        """
+        if type(model) is not RegistryCounterfactualThermalModel:
+            # **v1 の model や、それを包んだ wrapper を受け取らない**（0079 §2.4 / §2.2）。
+            raise DynamicsUnusableError(
+                "learned simulator は Registry の検証経路が作った反実仮想 artifact v2 の"
+                f"封をした型だけから作る（type={type(model).__name__}）"
+            )
         if attestation.kind is not ArtifactKind.THERMAL_MODEL:
             raise DynamicsUnusableError(
                 "thermal model 以外の artifact を dynamics にしない"
                 f"（kind={attestation.kind.value}）"
             )
         if attestation.capability is not ArtifactCapability.COUNTERFACTUAL_ACTION:
-            # **登録時に申告された能力だけを見る。** 推論器の自称では判断しない。
+            # **登録時に申告された能力だけを見る。** 封をした型の L1 と同じ条件を束縛でも持つ。
             raise DynamicsUnusableError(
                 "反実仮想予測を申告していない artifact を learned simulator にしない"
                 f"（attested capability={attestation.capability.value}。決定記録 0048 §2.1）"
             )
-        if identity.capability.value != attestation.capability.value:
+        manifest = model.manifest
+        if manifest.capability is not InferenceCapability.COUNTERFACTUAL_ACTION:
             raise DynamicsUnusableError(
-                "model の自称 capability が Registry の申告と食い違っている"
-                f"（model={identity.capability.value}; attested={attestation.capability.value}）"
+                "model の capability が Registry の申告と食い違っている"
+                f"（model={manifest.capability.value}; attested={attestation.capability.value}）"
             )
         mismatches = [
             name
             for name, attested, declared in (
-                ("model_id", attestation.model_id, identity.model_id),
-                ("model_version", attestation.version, identity.model_version),
+                ("model_id", attestation.model_id, manifest.model_id),
+                ("model_version", attestation.version, manifest.model_version),
+                # **借りた証拠を別の bytes の model に付けさせない。** 封をした型は同じ bytes
+                # から artifact hash を持つので、一致しなければ別の artifact である。
+                ("artifact_sha256", attestation.artifact_sha256, model.artifact_sha256),
                 (
                     "feature_schema_version",
                     attestation.feature_schema_version,
@@ -742,6 +872,17 @@ class AttestedThermalDynamics:
         )
         object.__setattr__(bound, "_model", model)
         object.__setattr__(bound, "_attestation", attestation)
+        # 判定器も support の照合も**同梱 Profile からだけ**作る（別の Profile を渡す口が無い）。
+        object.__setattr__(
+            bound,
+            "_assessor",
+            CounterfactualConfidenceAssessor.for_model(model, confidence_policy),
+        )
+        object.__setattr__(
+            bound,
+            "_checker",
+            StepSupportChecker(model.confidence_profile, model.action_schema),
+        )
         object.__setattr__(bound, "_identity", bound_identity)
         object.__setattr__(
             bound,
@@ -770,6 +911,21 @@ class AttestedThermalDynamics:
         return self._attestation
 
     @property
+    def model(self) -> RegistryCounterfactualThermalModel:
+        """束ねた封をした型（model と同梱 Profile v2）。"""
+        return self._model
+
+    @property
+    def action_schema(self) -> ThermalActionSchema:
+        """artifact の action の格子。環境の刻みはこの `step_ms` と一致しなければならない。"""
+        return self._model.action_schema
+
+    @property
+    def confidence_policy(self) -> ModelConfidencePolicy:
+        """判定の記録に使っている `model_confidence` の設定。"""
+        return self._assessor.policy
+
+    @property
     def evidence(self) -> DynamicsEvidence | None:
         """Registry の証拠に封をしたもの。**`bind` だけが発行している。**"""
         return self._evidence
@@ -790,30 +946,75 @@ class AttestedThermalDynamics:
         return frozenset({DynamicsProvenance.REGISTRY_ATTESTED})
 
     def conditions(self) -> dict[str, object]:
-        """条件 hash へ載せる値。Registry の証拠をそのまま覆う。"""
+        """条件 hash へ載せる値。Registry の証拠と、判定の記録に効く Profile と設定を覆う。"""
         return {
             "identity": self._identity.model_dump(mode="json"),
             "attestation": self._attestation.trace_metadata(),
+            "confidence_profile_sha256": self._model.confidence_profile.sha256(),
+            "confidence_policy": self._assessor.policy.model_dump(mode="json"),
         }
 
     def advance(self, request: DynamicsRequest, *, rng: Random) -> DynamicsStep:
-        """1 step 分の反実仮想予測を次の観測として使う。"""
+        """1 step 分の反実仮想予測を次の観測として使い、同梱 Profile での判定を記録する。
+
+        掛けた demand を action schema の格子の間保った列（`ActionPlan.held` と同じ形）を
+        model へ渡し、最初の horizon（= 1 step 後）の予測を次の frame にする。因果の mask
+        （0079 §2.3）により、最初の horizon は step 0 の action しか使わない。
+        **格子が環境の刻みと違えば予測しない**（補間・外挿・丸めをしない。0079 §2.3）。
+        """
         del rng  # 学習済み simulator は決定論的。揺らぎを足すなら別の model として束ねる。
-        plan = ActionPlan.held(request.applied, step_ms=request.step_ms, steps=1)
-        prediction = self._model.predict_plan(
-            PlannedThermalInput(observed=request.window, plan=plan)
+        schema = self._model.action_schema
+        horizons = self._model.target_schema.horizons_ms
+        if request.step_ms != schema.step_ms or horizons[0] != request.step_ms:
+            raise DynamicsUnusableError(
+                "環境の刻みが artifact の action の格子と一致しない（補間・外挿・丸めはしない）"
+                f"（step_ms={request.step_ms}; action={schema.step_ms}ms×{schema.steps}; "
+                f"first_horizon={horizons[0]}ms）"
+            )
+        window = request.window
+        trajectory = ActionTrajectory(
+            step_ms=schema.step_ms,
+            demands=tuple(
+                PerZone[Demand](
+                    front=request.applied.front,
+                    rear=request.applied.rear,
+                    top=request.applied.top,
+                )
+                for _ in range(schema.steps)
+            ),
         )
-        if not prediction.matches(plan):
-            raise DynamicsUnusableError("learned simulator が別の候補 plan の予測を返した")
-        values = {metric: float(value) for metric, value in prediction.targets[0].values.items()}
-        ts_ms = request.window.action_ts_ms + request.step_ms
+        anchor = PerZone[float](
+            front=window.action.front.effective_demand,
+            rear=window.action.rear.effective_demand,
+            top=window.action.top.effective_demand,
+        )
+        # **運転時と同じ判定器で、入力 window の anchor 推論を判定する。** simulator の中に実測は
+        # 無いので residual の証拠は渡さない（自分の予測と照らしても drift は測れない）。
+        assessment = self._assessor.assess(window, self._model.predict(window), None)
+        prediction = self._model.predict_trajectory(window, trajectory)
+        if prediction.artifact_sha256 != self._model.artifact_sha256:
+            raise DynamicsUnusableError("learned simulator が束ねた artifact と別の予測を返した")
+        first = prediction.targets[0]
+        if first.horizon_ms != request.step_ms:
+            raise DynamicsUnusableError("learned simulator の最初の horizon が環境の刻みと違う")
+        values = {metric: float(value) for metric, value in first.values.items()}
+        ts_ms = window.action_ts_ms + request.step_ms
         return DynamicsStep(
             provenance=DynamicsProvenance.REGISTRY_ATTESTED,
             supported=True,
             window=_advance_window(
-                request.window,
-                frame=_synthesized_frame(request.window, ts_ms=ts_ms, values=values),
+                window,
+                frame=_synthesized_frame(window, ts_ms=ts_ms, values=values),
                 applied=request.applied,
+            ),
+            assessment=LearnedStepAssessment(
+                confidence=assessment.confidence,
+                ood=assessment.ood,
+                ood_components=tuple(
+                    component for component in assessment.components if component.ood
+                ),
+                # 候補 plan・held の列と**同じ照合**（0084 §2.2）。margin も件数の下限も掛けない。
+                plan_support=self._checker.check(anchor, trajectory),
             ),
         )
 

@@ -45,6 +45,7 @@ from coldaisle.control.rl.action import (
 )
 from coldaisle.control.rl.config import RlTrainingConfig
 from coldaisle.control.rl.dynamics import (
+    AttestedThermalDynamics,
     DynamicsRequest,
     DynamicsUnusableError,
     EnvironmentDynamics,
@@ -348,6 +349,20 @@ class SupervisorTrainingEnvironment:
         if (acoustic is None) != (acoustic_identity is None):
             # 条件 hash に載らない依存を黙って受け取らない。
             raise EnvironmentUsageError("Acoustic Model と その identity は一緒に渡す")
+        if isinstance(dynamics, AttestedThermalDynamics):
+            # learned simulator の判定の記録は、この環境が回す `fan-policy.yaml` と同じ
+            # `model_confidence` で作る（別の設定で判定した記録を同じ episode に並べない）。
+            if dynamics.confidence_policy != policy.model_confidence:
+                raise EnvironmentUsageError(
+                    "learned simulator の判定の設定が fan-policy.yaml の model_confidence と違う"
+                )
+            # 格子と刻みが違う artifact は、補間・外挿・丸めをせずに使わない（0079 §2.3）。
+            if dynamics.action_schema.step_ms != config.episode.step_ms.value:
+                raise EnvironmentUsageError(
+                    "episode の刻みが learned simulator の action の格子と違う"
+                    f"（episode={config.episode.step_ms.value}ms; "
+                    f"action={dynamics.action_schema.step_ms}ms）"
+                )
         self._config = config
         self._config_sha256 = config_sha256
         self._policy = policy
@@ -807,6 +822,7 @@ class SupervisorTrainingEnvironment:
             confidence=proposal_facts.confidence,
             ood=proposal_facts.ood,
             provenance=outcome.provenance,
+            simulator_assessment=outcome.assessment,
             supported=True,
             observed=dict(observed),
             reward=reward,

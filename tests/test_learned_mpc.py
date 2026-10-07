@@ -115,9 +115,7 @@ from coldaisle.control.model.thermal import (
     ArtifactVerification,
     InferenceCapability,
     ObservedThermalInput,
-    ThermalFeatureSchema,
     ThermalPrediction,
-    ThermalTargetSchema,
     canonical_artifact_bytes,
 )
 from coldaisle.control.model_registry import (
@@ -137,7 +135,6 @@ from coldaisle.control.model_registry import (
 )
 from coldaisle.control.mpc import (
     ActionPlan,
-    CounterfactualModelIdentity,
     HardConstraintSet,
     InfeasiblePlanError,
     LearnedMpcController,
@@ -263,9 +260,11 @@ def _as_v2(item: DatasetExample, index: int) -> DatasetExampleV2:
     )
 
 
-def thermal_dataset_v2(features: tuple[str, ...] = FEATURES) -> ThermalDatasetV2:
-    """`test_model_confidence` と同じ観測・label の Dataset v2（``features`` に絞れる）。"""
-    data = dataset(HORIZONS, TARGETS)
+def thermal_dataset_v2(
+    features: tuple[str, ...] = FEATURES, targets: tuple[str, ...] = TARGETS
+) -> ThermalDatasetV2:
+    """`test_model_confidence` と同じ観測・label の Dataset v2（feature / target を選べる）。"""
+    data = dataset(HORIZONS, targets)
     examples = tuple(
         _narrowed(_as_v2(item, index), features) for index, item in enumerate(data.examples)
     )
@@ -279,7 +278,7 @@ def thermal_dataset_v2(features: tuple[str, ...] = FEATURES) -> ThermalDatasetV2
                 target_tolerance_ms=spec.target_tolerance_ms,
                 stale_after_ms=spec.stale_after_ms,
                 feature_metrics=features,
-                target_metrics=TARGETS,
+                target_metrics=targets,
                 action_step_ms=STEP_MS,
                 action_steps=STEPS,
                 action_stale_after_ms=2_000,
@@ -323,9 +322,11 @@ class _Training:
 
 
 @cache
-def _training(features: tuple[str, ...] = FEATURES) -> _Training:
-    """学習は feature の組ごとに1回だけ（同じ合成データから同じ係数）。"""
-    data = thermal_dataset_v2(features)
+def _training(
+    features: tuple[str, ...] = FEATURES, targets: tuple[str, ...] = TARGETS
+) -> _Training:
+    """学習は feature / target の組ごとに1回だけ（同じ合成データから同じ係数）。"""
+    data = thermal_dataset_v2(features, targets)
     parts = split_temporally_v2(
         data.examples, validation_start_ms=VALIDATION_START_MS, test_start_ms=TEST_START_MS
     )
@@ -434,9 +435,10 @@ def _artifact_bytes(
     authority: tuple[AuthorityStage, ...],
     support: ActionSupportV2 | None,
     features: tuple[str, ...],
+    targets: tuple[str, ...] = TARGETS,
     edit: Callable[[dict[str, Any]], None] | None,
 ) -> bytes:
-    training = _training(features)
+    training = _training(features, targets)
     trained_model = training.trained.model_copy(
         update={"model_version": version, "authority_compatibility": authority}
     )
@@ -525,11 +527,17 @@ def register_v2(
     promoted: bool = True,
     support: ActionSupportV2 | None = None,
     features: tuple[str, ...] = FEATURES,
+    targets: tuple[str, ...] = TARGETS,
     edit: Callable[[dict[str, Any]], None] | None = None,
 ) -> VerifiedArtifact:
     """**本物の Model Registry（#104）に登録し、検証経路から `VerifiedArtifact` を受け取る。**"""
     payload = _artifact_bytes(
-        version=version, authority=authority, support=support, features=features, edit=edit
+        version=version,
+        authority=authority,
+        support=support,
+        features=features,
+        targets=targets,
+        edit=edit,
     )
     return _promote(root, metadata_for(payload), payload, stage=stage, promoted=promoted)
 
@@ -618,8 +626,7 @@ def issue_verified(
 def issue_attestation(root: Path, **kwargs: Any) -> ArtifactAttestation:
     """`issue_verified` の attestation だけを返す（他の試験が使う）。
 
-    #105 の学習 dynamics（0079 段 6 で v2 の型へ切り替える）・fand の registry 束縛・
-    Gate の試験は、artifact の中身を読まずに attestation だけを使う。
+    fand の registry 束縛・Gate の試験は、artifact の中身を読まずに attestation だけを使う。
     """
     return issue_verified(root, **kwargs).attestation
 
@@ -926,92 +933,6 @@ def break_predict_plan(monkeypatch: pytest.MonkeyPatch, replace: Rewrite | BaseE
 def rewritten(prediction: PlanPrediction, **updates: object) -> PlanPrediction:
     """予測の一部を書き換えた複製（検証を通す）。"""
     return PlanPrediction.model_validate(prediction.model_dump(mode="python") | updates)
-
-
-# ------------------------------------- #105 の学習 dynamics の試験用（0079 段 6 まで v1 のまま）
-
-
-class PlanningModel:
-    """**#105 の学習 dynamics の試験だけ**が使う、v1 の model を包んだ試験用の反実仮想モデル。
-
-    MPC の束縛（`MpcModelBinding`）はこの型を受け取らない（決定記録 0079 段 4）。
-    `AttestedThermalDynamics.bind` を段 2 の型へ切り替えるのは段 6（#105）。
-    """
-
-    def __init__(
-        self,
-        base: object,
-        *,
-        capability: InferenceCapability = InferenceCapability.COUNTERFACTUAL_ACTION,
-        model_id: str | None = None,
-        model_version: str | None = None,
-        gain: float = GAIN,
-    ) -> None:
-        self._base = base
-        self._identity = CounterfactualModelIdentity(
-            model_id=model_id or base.manifest.model_id,  # type: ignore[attr-defined]
-            model_version=(
-                model_version or base.manifest.model_version  # type: ignore[attr-defined]
-            ),
-            capability=capability,
-        )
-        self._gain = gain
-
-    @property
-    def identity(self) -> CounterfactualModelIdentity:
-        """束縛の判断に使う identity。"""
-        return self._identity
-
-    @property
-    def feature_schema(self) -> ThermalFeatureSchema:
-        """入力契約。"""
-        return self._base.feature_schema  # type: ignore[attr-defined,no-any-return]
-
-    @property
-    def target_schema(self) -> ThermalTargetSchema:
-        """出力契約。"""
-        return self._base.target_schema  # type: ignore[attr-defined,no-any-return]
-
-    def predict(self, observed: ObservedThermalInput) -> ThermalPrediction:
-        """anchor 推論。artifact の出どころだけ Registry 検証済みにそろえる。"""
-        prediction = self._base.predict(observed)  # type: ignore[attr-defined]
-        return ThermalPrediction.model_validate(
-            prediction.model_dump(mode="python")
-            | {"artifact_verification": ArtifactVerification.REGISTRY_VERIFIED}
-        )
-
-    def predict_plan(self, planned: PlannedThermalInput) -> PlanPrediction:
-        """候補 action 列に対する単調な応答を返す。"""
-        anchor = self.predict(planned.observed)
-        anchor_mean = _mean(
-            tuple(planned.observed.action.get(zone).effective_demand for zone in Zone)
-        )
-        by_offset = {target.horizon_ms: target.values for target in anchor.targets}
-        targets = []
-        for index, step in enumerate(planned.plan.steps):
-            delta = _mean(tuple(step.demands.get(zone) for zone in Zone)) - anchor_mean
-            weight = (index + 1) / len(planned.plan.steps)
-            targets.append(
-                PlannedTarget(
-                    offset_ms=step.offset_ms,
-                    expected_ts_ms=planned.observed.action_ts_ms + step.offset_ms,
-                    values={
-                        metric: value - self._gain * delta * weight
-                        for metric, value in by_offset[step.offset_ms].items()
-                    },
-                )
-            )
-        return PlanPrediction(
-            model_id=anchor.model_id,
-            model_version=anchor.model_version,
-            artifact_sha256=anchor.artifact_sha256,
-            artifact_verification=anchor.artifact_verification,
-            capability=InferenceCapability.COUNTERFACTUAL_ACTION,
-            anchor_inference_id=inference_id(planned.observed, anchor),
-            input_action_ts_ms=anchor.input_action_ts_ms,
-            plan_digest=planned.plan.digest(),
-            targets=tuple(targets),
-        )
 
 
 @cache

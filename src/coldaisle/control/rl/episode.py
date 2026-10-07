@@ -20,7 +20,12 @@ from pydantic import BaseModel, ConfigDict, Field, JsonValue, model_validator
 
 from coldaisle.control.model.thermal import ThermalMetricName, canonical_sha256
 from coldaisle.control.rl.action import SupervisorAction
-from coldaisle.control.rl.dynamics import DynamicsIdentity, DynamicsProvenance, TrainingMode
+from coldaisle.control.rl.dynamics import (
+    DynamicsIdentity,
+    DynamicsProvenance,
+    LearnedStepAssessment,
+    TrainingMode,
+)
 from coldaisle.control.rl.reward import RewardBreakdown, SafetyLedgerEntry
 from coldaisle.control.schema import (
     ConfidenceLevel,
@@ -40,6 +45,9 @@ EPISODE_SCHEMA_VERSION: Literal[2] = 2
   digest）と `other_conditions`（それ以外の条件）を**読める欄**として持ち、`conditions_sha256` は
   その2つから作り直せる。**v1 の episode は読まない**（report の入力にしない。0074 §3）。
   v1 は同じ条件・同じ seed から回し直せば v2 として同じ意味の結果になる（0058）
+- v2 のまま `StepRecord.simulator_assessment` を足した（決定記録 0079 §2.9 の段 6）。既存の欄の
+  意味は変えていない。`registry_attested` の step だけが必ず持ち、それ以外の step は `None`
+  なので、近似 simulator・記録再生の v2 episode はそのまま読める
 """
 
 EPISODE_MIRRORED_CONDITIONS: tuple[str, ...] = (
@@ -179,6 +187,15 @@ class StepRecord(_Frozen):
     ood: bool | None = None
     provenance: DynamicsProvenance | None = None
     """遷移の出どころ。採点できなかった step では `None`。"""
+    simulator_assessment: LearnedStepAssessment | None = None
+    """learned simulator（`registry_attested`）がこの step を作ったときの、同梱 Profile v2 による
+    判定の記録（決定記録 0079 §2.9 の段 6）。
+
+    **`confidence` / `ood`（MPC の anchor 推論を Gate が使った判定）とは別物である。** こちらは
+    dynamics の入力 window の判定と、掛けた action 列の step ごとの support の照合で、
+    **記録だけ**（遷移・採点・`promotable` の条件に効かない。0079 §5 #8）。`registry_attested` の
+    step だけが持ち、それ以外の step は `None`。
+    """
     supported: bool
     unsupported_reason: Reason | None = None
     observed: dict[ThermalMetricName, float] = Field(default_factory=dict)
@@ -194,12 +211,24 @@ class StepRecord(_Frozen):
                 raise ValueError("採点できた step には観測・出どころ・reward が要る")
             if self.applied is None:
                 raise ValueError("採点できた step には実際に掛かっていた demand が要る")
+            attested = self.provenance is DynamicsProvenance.REGISTRY_ATTESTED
+            if attested != (self.simulator_assessment is not None):
+                # learned simulator の step から判定の記録を落とさない。ほかの出どころの step に
+                # Profile の判定を名乗らせない（0079 段 6）。
+                raise ValueError(
+                    "learned simulator の step だけが、同梱 Profile の判定の記録を必ず持つ"
+                )
             return self
         if self.unsupported_reason is None:
             raise ValueError("採点できない step には理由を残す")
         if self.applied is not None:
             raise ValueError("採点できない step に実際の demand を書かない")
-        if self.reward is not None or self.observed or self.provenance is not None:
+        if (
+            self.reward is not None
+            or self.observed
+            or self.provenance is not None
+            or self.simulator_assessment is not None
+        ):
             # 採点できない step に結果を作ると、「記録に無い action の成果」が生える。
             raise ValueError("採点できない step に観測・reward を作らない")
         return self
@@ -410,6 +439,30 @@ class EpisodeResult(_Frozen):
     def violations(self) -> int:
         """安全側の違反の総数。"""
         return self.safety.ceiling_exceedances + self.safety.floor_shortfalls
+
+    @property
+    def simulator_ood_steps(self) -> tuple[int, ...]:
+        """learned simulator の判定の記録で OOD だった step の番号（決定記録 0079 段 6）。
+
+        **記録を読むためだけ**の値で、`promotable` の条件ではない（0079 §5 #8）。
+        """
+        return tuple(
+            step.step_index
+            for step in self.steps
+            if step.simulator_assessment is not None and step.simulator_assessment.ood
+        )
+
+    @property
+    def simulator_out_of_support_steps(self) -> tuple[int, ...]:
+        """掛けた action 列が同梱 Profile の step ごとの support の外だった step の番号。
+
+        `simulator_ood_steps` と同じく記録を読むためだけの値（0079 §5 #8）。
+        """
+        return tuple(
+            step.step_index
+            for step in self.steps
+            if step.simulator_assessment is not None and step.simulator_assessment.outside_support
+        )
 
     def discounted_reward_over(self, steps: int) -> float:
         """**最初の `steps` 個の採点できた step だけ**で割り引いた reward。
