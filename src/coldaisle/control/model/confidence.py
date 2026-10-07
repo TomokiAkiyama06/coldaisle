@@ -18,9 +18,9 @@ import json
 import math
 from bisect import bisect_right
 from collections import deque
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from enum import StrEnum
-from typing import Annotated, Literal, Self
+from typing import Annotated, Literal, Protocol, Self
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -486,13 +486,23 @@ class ResidualDriftMonitor:
     """
 
     def __init__(self, profile: ModelConfidenceProfile, policy: ModelConfidencePolicy) -> None:
-        self._profile = ModelConfidenceProfile.model_validate(profile.model_dump(mode="python"))
-        self._profile_sha256 = self._profile.sha256()
+        self._setup(_basis_from_profile(profile), policy)
+
+    @classmethod
+    def _from_basis(cls, basis: _ProfileBasis, policy: ModelConfidencePolicy) -> Self:
+        """同梱 Profile（v2）から作るための入口。呼び出し側は封をした型からだけ basis を作る。"""
+        monitor = cls.__new__(cls)
+        monitor._setup(basis, policy)
+        return monitor
+
+    def _setup(self, basis: _ProfileBasis, policy: ModelConfidencePolicy) -> None:
+        self._identity = basis.identity
+        self._profile_sha256 = basis.profile_sha256
         self._scales = {
-            (scale.horizon_ms, scale.metric): scale.scale for scale in profile.residual_scales
+            (scale.horizon_ms, scale.metric): scale.scale for scale in basis.residual_scales
         }
         self._tolerance_ms = policy.residual_match_tolerance_ms.value
-        shortest_horizon_ms = self._profile.target_schema.horizons_ms[0]
+        shortest_horizon_ms = basis.shortest_horizon_ms
         if self._tolerance_ms >= shortest_horizon_ms:
             # DatasetSpec と同じ不変条件（target_tolerance_ms < 最短 horizon）。許容幅が action に
             # 届くと、予測より前の観測を「予測が当たった証拠」に数えてしまう。
@@ -514,12 +524,11 @@ class ResidualDriftMonitor:
         Profile と別のモデルの予測は受け付けない。同じ action を2回数えないよう、
         action 時刻は狭義単調増加に限る（重複した予測で証拠の件数を水増ししない）。
         """
-        binding = self._profile.binding
-        if (prediction.model_id, prediction.model_version, prediction.artifact_sha256) != (
-            binding.model_id,
-            binding.model_version,
-            binding.artifact_sha256,
-        ):
+        if (
+            prediction.model_id,
+            prediction.model_version,
+            prediction.artifact_sha256,
+        ) != self._identity:
             raise ValueError("Profile と別のモデルの予測を drift の照合に混ぜない")
         if self._last_action_ms is not None and prediction.input_action_ts_ms <= (
             self._last_action_ms
@@ -808,31 +817,91 @@ class ConfidenceAssessment(_Frozen):
         return proposal.model_copy(update={"confidence": self.confidence, "ood": self.ood})
 
 
-class ConfidenceAssessor:
-    """Profile と設定から、入力・予測ごとの Confidence / OOD を決定論的に出す。"""
+class _ProfileBasis:
+    """判定器と residual の照合が読む Profile の値（v1 / v2 共通の素材）。
 
-    def __init__(self, profile: ModelConfidenceProfile, policy: ModelConfidencePolicy) -> None:
-        self._profile = ModelConfidenceProfile.model_validate(profile.model_dump(mode="python"))
-        self._profile_sha256 = self._profile.sha256()
+    v1 は :class:`ModelConfidenceProfile` から、v2 は封をした型
+    ``RegistryCounterfactualThermalModel`` の同梱 Profile から作る（0079 §2.1 / §2.4）。
+    **判定の規則は1つ**（:class:`_AssessorCore`）で、Profile の版ごとに別の実装を持たない。
+    """
+
+    __slots__ = (
+        "cells",
+        "fan_ranges",
+        "feature_ranges",
+        "feature_schema",
+        "identity",
+        "patterns",
+        "profile_sha256",
+        "residual_scales",
+        "shortest_horizon_ms",
+        "support_axes",
+    )
+
+    def __init__(
+        self,
+        *,
+        identity: tuple[str, str, str],
+        profile_sha256: str,
+        feature_schema: ThermalFeatureSchema,
+        feature_ranges: Sequence[ValueRange],
+        fan_ranges: PerZone[ValueRange],
+        missing_patterns: Sequence[MissingPatternCount],
+        support_axes: tuple[SupportAxis, ...],
+        support_cells: Sequence[SupportCellCount],
+        residual_scales: tuple[ResidualScale, ...],
+        shortest_horizon_ms: int,
+    ) -> None:
+        self.identity = identity
+        """推論ごとに照らす (model_id, model_version, artifact_sha256)。0050 §2.2。"""
+        self.profile_sha256 = profile_sha256
+        self.feature_schema = feature_schema
+        self.feature_ranges = {item.source: item for item in feature_ranges}
+        self.fan_ranges = fan_ranges
+        self.patterns = {item.unavailable_metrics: item.count for item in missing_patterns}
+        self.support_axes = support_axes
+        self.cells = {item.bins: item.count for item in support_cells}
+        self.residual_scales = residual_scales
+        self.shortest_horizon_ms = shortest_horizon_ms
+
+
+def _basis_from_profile(profile: ModelConfidenceProfile) -> _ProfileBasis:
+    profile = ModelConfidenceProfile.model_validate(profile.model_dump(mode="python"))
+    binding = profile.binding
+    return _ProfileBasis(
+        identity=(binding.model_id, binding.model_version, binding.artifact_sha256),
+        profile_sha256=profile.sha256(),
+        feature_schema=profile.feature_schema,
+        feature_ranges=profile.feature_ranges,
+        fan_ranges=profile.fan_ranges,
+        missing_patterns=profile.missing_patterns,
+        support_axes=profile.spec.support_axes,
+        support_cells=profile.support_cells,
+        residual_scales=profile.residual_scales,
+        shortest_horizon_ms=profile.target_schema.horizons_ms[0],
+    )
+
+
+class _AssessorCore:
+    """Profile の値と設定から、入力・予測ごとの Confidence / OOD を決定論的に出す本体。
+
+    ``held_support`` は Profile v2 だけが渡す（0084 §2.1）。anchor 推論の held の列が
+    step ごとの support の外なら、その理由（step・zone・cell）を返す関数で、返れば
+    ``support`` の構成要素を OOD にする。v1 は渡さず、判定は従来のまま。
+    """
+
+    __slots__ = ("_basis", "_policy")
+
+    def __init__(self, basis: _ProfileBasis, policy: ModelConfidencePolicy) -> None:
+        self._basis = basis
         self._policy = policy
-        self._patterns = {
-            item.unavailable_metrics: item.count for item in self._profile.missing_patterns
-        }
-        self._cells = {item.bins: item.count for item in self._profile.support_cells}
-        self._ranges = {item.source: item for item in self._profile.feature_ranges}
 
     @property
-    def profile(self) -> ModelConfidenceProfile:
-        """検証済みの Profile。"""
-        return self._profile
+    def basis(self) -> _ProfileBasis:
+        return self._basis
 
     @property
     def policy(self) -> ModelConfidencePolicy:
-        """この判定器が使っている設定。
-
-        呼び出し側（#86）が「runtime の設定と同じものか」を確かめられるようにする。
-        別の設定で作った判定器を渡されると、閾値だけがすり替わる。
-        """
         return self._policy
 
     def assess(
@@ -840,15 +909,13 @@ class ConfidenceAssessor:
         observed: ObservedThermalInput,
         prediction: ThermalPrediction,
         residual: ResidualEvidence | None,
+        *,
+        held_support: Callable[[ObservedThermalInput], str | None] | None,
     ) -> ConfidenceAssessment:
-        """1回の推論を判定する。同じ入力からは必ず同じ結果を返す。
-
-        入力の形が feature schema と合わない場合は例外にする（予測自体も失敗する）。
-        呼び出し側（worker）はそれを ``LearnedFailure`` として Gate へ渡し、Fallback になる。
-        """
         observed = ObservedThermalInput.model_validate(observed.model_dump(mode="python"))
-        _check_window_shape(observed, self._profile.feature_schema)
+        _check_window_shape(observed, self._basis.feature_schema)
         coverage = self._coverage(observed)
+        held = None if held_support is None else held_support(observed)
         components = (
             self._model_binding(observed, prediction),
             self._range_result(
@@ -861,7 +928,7 @@ class ConfidenceAssessor:
                 coverage.worst_fan_excess,
                 coverage.worst_fan_source,
             ),
-            self._support(coverage),
+            self._support(coverage, held),
             self._missing_pattern(coverage),
             self._uncertainty(prediction),
             self._residual_drift(residual, observed.action_ts_ms),
@@ -872,7 +939,7 @@ class ConfidenceAssessor:
             model_version=prediction.model_version,
             artifact_sha256=prediction.artifact_sha256,
             artifact_verification=prediction.artifact_verification,
-            profile_sha256=self._profile_sha256,
+            profile_sha256=self._basis.profile_sha256,
             input_action_ts_ms=observed.action_ts_ms,
             input_sha256=digest,
             prediction=prediction,
@@ -882,16 +949,21 @@ class ConfidenceAssessor:
             components=components,
         )
 
+    def coverage(self, observed: ObservedThermalInput) -> ProfileCoverage:
+        observed = ObservedThermalInput.model_validate(observed.model_dump(mode="python"))
+        _check_window_shape(observed, self._basis.feature_schema)
+        return self._coverage(observed)
+
     def _model_binding(
         self, observed: ObservedThermalInput, prediction: ThermalPrediction
     ) -> ComponentResult:
-        binding = self._profile.binding
+        model_id, model_version, artifact_sha256 = self._basis.identity
         mismatches = [
             name
             for name, expected, actual in (
-                ("model_id", binding.model_id, prediction.model_id),
-                ("model_version", binding.model_version, prediction.model_version),
-                ("artifact_sha256", binding.artifact_sha256, prediction.artifact_sha256),
+                ("model_id", model_id, prediction.model_id),
+                ("model_version", model_version, prediction.model_version),
+                ("artifact_sha256", artifact_sha256, prediction.artifact_sha256),
                 ("input_action_ts_ms", observed.action_ts_ms, prediction.input_action_ts_ms),
             )
             if expected != actual
@@ -905,23 +977,13 @@ class ConfidenceAssessor:
             )
         return ComponentResult(component=ConfidenceComponent.MODEL_BINDING, score=1.0, ood=False)
 
-    def coverage(self, observed: ObservedThermalInput) -> ProfileCoverage:
-        """入力を Profile と照らす。**判定はせず、素材だけを返す。**
-
-        offline の drift 検知（#93）が同じ照合を使うための入口である。判定器を通さずに
-        自前で範囲・support を数え直すと、runtime と offline が別の規則で動く。
-        入力の形が feature schema と合わなければ ``assess`` と同じく例外にする。
-        """
-        observed = ObservedThermalInput.model_validate(observed.model_dump(mode="python"))
-        _check_window_shape(observed, self._profile.feature_schema)
-        return self._coverage(observed)
-
     def _coverage(self, observed: ObservedThermalInput) -> ProfileCoverage:
         """検証済みの入力を Profile と照らす。"""
+        basis = self._basis
         worst_feature = 0.0
         worst_feature_source = ""
-        for metric in self._profile.feature_schema.metrics:
-            known = self._ranges[metric]
+        for metric in basis.feature_schema.metrics:
+            known = basis.feature_ranges[metric]
             for frame in observed.window:
                 value = _usable(frame, metric)
                 if value is None:
@@ -932,21 +994,21 @@ class ConfidenceAssessor:
         worst_fan = 0.0
         worst_fan_source = ""
         for zone in _ZONE_ORDER:
-            known = self._profile.fan_ranges.get(zone)
+            known = basis.fan_ranges.get(zone)
             excess = _excess(known, observed.action.get(zone).effective_demand)
             if excess > worst_fan:
                 worst_fan, worst_fan_source = excess, known.source
-        cell = _support_cell(observed, self._profile.spec.support_axes)
-        pattern = _missing_pattern(observed, self._profile.feature_schema)
+        cell = _support_cell(observed, basis.support_axes)
+        pattern = _missing_pattern(observed, basis.feature_schema)
         return ProfileCoverage(
             worst_feature_excess=worst_feature,
             worst_feature_source=worst_feature_source,
             worst_fan_excess=worst_fan,
             worst_fan_source=worst_fan_source,
             support_bins=cell,
-            support_count=0 if cell is None else self._cells.get(cell, 0),
+            support_count=0 if cell is None else basis.cells.get(cell, 0),
             missing_pattern=pattern,
-            missing_pattern_count=self._patterns.get(pattern, 0),
+            missing_pattern_count=basis.patterns.get(pattern, 0),
         )
 
     def _range_result(
@@ -965,14 +1027,15 @@ class ConfidenceAssessor:
         detail = "" if worst == 0.0 else f"source={source}; excess={worst:.6f}"
         return ComponentResult(component=component, score=score, ood=False, detail=detail)
 
-    def _support(self, coverage: ProfileCoverage) -> ComponentResult:
+    def _support(self, coverage: ProfileCoverage, held: str | None) -> ComponentResult:
         cell = coverage.support_bins
+        held_detail = "" if held is None else f"; held_out_of_step_support: {held}"
         if cell is None:
             return ComponentResult(
                 component=ConfidenceComponent.SUPPORT,
                 score=0.0,
                 ood=True,
-                detail="support axis value is unavailable",
+                detail=_bounded_detail(f"support axis value is unavailable{held_detail}"),
             )
         count = coverage.support_count
         minimum = self._policy.min_support_count.value
@@ -983,7 +1046,16 @@ class ConfidenceAssessor:
                 component=ConfidenceComponent.SUPPORT,
                 score=0.0,
                 ood=True,
-                detail=f"{detail}; min={minimum}",
+                detail=_bounded_detail(f"{detail}; min={minimum}{held_detail}"),
+            )
+        if held is not None:
+            # held の列が step ごとの support の外（Profile v2 だけ。0084 §2.1）。件数の下限も
+            # margin も掛けない。構成要素の enum と assessment の形は変えない
+            return ComponentResult(
+                component=ConfidenceComponent.SUPPORT,
+                score=0.0,
+                ood=True,
+                detail=_bounded_detail(f"{detail}{held_detail}"),
             )
         return ComponentResult(
             component=ConfidenceComponent.SUPPORT,
@@ -1026,7 +1098,7 @@ class ConfidenceAssessor:
         self, residual: ResidualEvidence | None, action_ts_ms: int
     ) -> ComponentResult:
         if residual is not None:
-            if residual.profile_sha256 != self._profile_sha256:
+            if residual.profile_sha256 != self._basis.profile_sha256:
                 # 別の Profile の証拠で上限を外すと、照合していないモデルへ authority を渡す。
                 # （モデルを差し替えた直後など）
                 raise ValueError("residual の証拠が assessment の Profile と一致しない")
@@ -1073,6 +1145,63 @@ class ConfidenceAssessor:
         )
 
 
+_MAX_COMPONENT_DETAIL = 400
+
+
+def _bounded_detail(detail: str) -> str:
+    """``ComponentResult.detail`` の上限に収める（理由の先頭は残す）。"""
+    return detail[:_MAX_COMPONENT_DETAIL]
+
+
+class ConfidenceAssessor:
+    """Profile（v1）と設定から、入力・予測ごとの Confidence / OOD を決定論的に出す。
+
+    Profile v2（反実仮想 artifact に同梱）の判定器は ``CounterfactualConfidenceAssessor``
+    （``control/model/counterfactual_confidence.py``）で、封をした型からだけ作る（0079 §2.4）。
+    判定の規則は両者で同じ :class:`_AssessorCore` を使う。
+    """
+
+    def __init__(self, profile: ModelConfidenceProfile, policy: ModelConfidencePolicy) -> None:
+        self._profile = ModelConfidenceProfile.model_validate(profile.model_dump(mode="python"))
+        self._core = _AssessorCore(_basis_from_profile(self._profile), policy)
+
+    @property
+    def profile(self) -> ModelConfidenceProfile:
+        """検証済みの Profile。"""
+        return self._profile
+
+    @property
+    def policy(self) -> ModelConfidencePolicy:
+        """この判定器が使っている設定。
+
+        呼び出し側（#86）が「runtime の設定と同じものか」を確かめられるようにする。
+        別の設定で作った判定器を渡されると、閾値だけがすり替わる。
+        """
+        return self._core.policy
+
+    def assess(
+        self,
+        observed: ObservedThermalInput,
+        prediction: ThermalPrediction,
+        residual: ResidualEvidence | None,
+    ) -> ConfidenceAssessment:
+        """1回の推論を判定する。同じ入力からは必ず同じ結果を返す。
+
+        入力の形が feature schema と合わない場合は例外にする（予測自体も失敗する）。
+        呼び出し側（worker）はそれを ``LearnedFailure`` として Gate へ渡し、Fallback になる。
+        """
+        return self._core.assess(observed, prediction, residual, held_support=None)
+
+    def coverage(self, observed: ObservedThermalInput) -> ProfileCoverage:
+        """入力を Profile と照らす。**判定はせず、素材だけを返す。**
+
+        offline の drift 検知（#93）が同じ照合を使うための入口である。判定器を通さずに
+        自前で範囲・support を数え直すと、runtime と offline が別の規則で動く。
+        入力の形が feature schema と合わなければ ``assess`` と同じく例外にする。
+        """
+        return self._core.coverage(observed)
+
+
 # ---------------------------------------------------------------- Offline evaluation
 
 
@@ -1101,12 +1230,38 @@ class OodEvaluationReport(_Frozen):
     false_negative_labels: tuple[str, ...] = Field(max_length=MAX_EVALUATION_MISSES)
 
 
+class AnchorPredictor(Protocol):
+    """anchor 推論を1つ返すもの（v1 の ``ThermalModel`` と v2 の封をした型）。"""
+
+    def predict(self, observed: ObservedThermalInput, /) -> ThermalPrediction:
+        """anchor 推論。v2 は計画 action の列を ``hold_effective`` で作る（0084 §2.1）。"""
+        ...
+
+
+class Assessor(Protocol):
+    """推論1回を判定するもの（``ConfidenceAssessor`` と ``CounterfactualConfidenceAssessor``）。"""
+
+    def assess(
+        self,
+        observed: ObservedThermalInput,
+        prediction: ThermalPrediction,
+        residual: ResidualEvidence | None,
+        /,
+    ) -> ConfidenceAssessment:
+        """1回の推論を判定する。"""
+        ...
+
+
 def evaluate_ood_detection(
-    model: ThermalModel,
-    assessor: ConfidenceAssessor,
+    model: ThermalModel | AnchorPredictor,
+    assessor: Assessor,
     cases: Sequence[OodEvaluationCase],
 ) -> OodEvaluationReport:
-    """offline dataset（Replay・合成）で OOD 判定の誤り率を数える。制御には使わない。"""
+    """offline dataset（Replay・合成）で OOD 判定の誤り率を数える。制御には使わない。
+
+    v2（反実仮想 artifact）の予測は ``predict``（anchor 推論。``hold_effective``）で作る。
+    offline の評価で「anchor 推論」として扱う予測は runtime と同じ規則にする（0084 §2.1 の表）。
+    """
     if len(cases) > MAX_EVALUATION_CASES:
         raise ValueError("OOD 評価の件数が上限を超えている")
     tp = fp = tn = fn = 0
