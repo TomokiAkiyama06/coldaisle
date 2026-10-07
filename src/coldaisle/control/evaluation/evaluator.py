@@ -238,6 +238,9 @@ def evaluate(runs: Sequence[EvaluationRun], *, context: EvaluationContext) -> Ev
     sources = context.control.sources
     air_balance_binding = _TraceBindingCounter(sources.air_balance.sha256)
     fan_hardware_binding = _TraceBindingCounter(sources.fan_hardware.sha256)
+    # **fan-policy.yaml も trace に束縛する**（決定記録 0078 §2.5）。協調の ``mode`` が違う設定で
+    # 記録した trace は、Fallback の値（raw / coordinated baseline）と帯の中心が違う。
+    fan_policy_binding = _TraceBindingCounter(sources.policy.sha256)
     for unchecked in sorted(runs, key=lambda item: item.run_id):
         # **同じ証拠を1つに畳んでから数える。** 以降はこの run だけを使う。
         run = _check_observations(unchecked)
@@ -249,6 +252,7 @@ def evaluate(runs: Sequence[EvaluationRun], *, context: EvaluationContext) -> Ev
             config = None if tick.runtime is None else tick.runtime.config
             air_balance_binding.add(None if config is None else config.air_balance_sha256)
             fan_hardware_binding.add(None if config is None else config.fan_hardware_sha256)
+            fan_policy_binding.add(None if config is None else config.policy_sha256)
         for row in rows:
             versions.add_shadow(row.shadow)
         for segment in _segments(run, parsed, rows, context):
@@ -264,6 +268,7 @@ def evaluate(runs: Sequence[EvaluationRun], *, context: EvaluationContext) -> Ev
             versions.collected(),
             air_balance_trace_binding=air_balance_binding.collected(),
             fan_hardware_trace_binding=fan_hardware_binding.collected(),
+            fan_policy_trace_binding=fan_policy_binding.collected(),
         ),
         segments=report_segments,
         worst_cases=worst,
@@ -1545,7 +1550,10 @@ def _observation_order(observation: OutcomeObservation) -> tuple[str, int, bool,
 
 
 class _TraceBindingCounter:
-    """消費した tick の設定 hash を、評価時の hash と突き合わせて数える（決定記録 0073 §2.6）。"""
+    """消費した tick の設定 hash を、評価時の hash と突き合わせて数える。
+
+    決定記録 0073 §2.6（air-balance.yaml / fan-hardware.yaml）と 0078 §2.5（fan-policy.yaml）。
+    """
 
     def __init__(self, expected: str) -> None:
         self._expected = expected
@@ -1574,6 +1582,7 @@ def _provenance(
     *,
     air_balance_trace_binding: TraceConfigBinding,
     fan_hardware_trace_binding: TraceConfigBinding,
+    fan_policy_trace_binding: TraceConfigBinding,
 ) -> EvaluationProvenance:
     shadow = context.control.policy.shadow
     sources = context.control.sources
@@ -1589,6 +1598,9 @@ def _provenance(
                 sources.air_balance.sha256,
                 json.loads(air_balance_trace_binding.model_dump_json()),
                 json.loads(fan_hardware_trace_binding.model_dump_json()),
+                # 協調の mode だけが違う trace から作った2つの評価を、同じ条件と名乗らせない
+                # （決定記録 0078 §2.5）。
+                json.loads(fan_policy_trace_binding.model_dump_json()),
                 context.catalog_sha256,
                 context.acoustic_sha256,
                 # **出力の形を決めるコード側の版も条件に入れる。** 設定の hash だけでは
@@ -1616,6 +1628,7 @@ def _provenance(
         air_balance_config_sha256=sources.air_balance.sha256,
         air_balance_trace_binding=air_balance_trace_binding,
         fan_hardware_trace_binding=fan_hardware_trace_binding,
+        fan_policy_trace_binding=fan_policy_trace_binding,
     )
 
 
