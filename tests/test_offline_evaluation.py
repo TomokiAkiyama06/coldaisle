@@ -19,6 +19,7 @@
 from __future__ import annotations
 
 import ast
+import hashlib
 import json
 from pathlib import Path
 from typing import Any
@@ -27,6 +28,12 @@ import pytest
 import yaml
 from pydantic import ValidationError
 
+from coldaisle.control.authority import (
+    AuthorityEvidenceError,
+    AuthorityStore,
+    RolloutEvidence,
+    StageApproval,
+)
 from coldaisle.control.config import ControlConfig
 from coldaisle.control.evaluation import (
     EvaluationConfig,
@@ -104,7 +111,11 @@ from coldaisle.control.shadow import (
 from coldaisle.evaluate import RunsManifest, build_context, main, render
 from coldaisle.metrics import MetricCatalog
 from coldaisle.store.models import ControlTraceRecord, Quality
-from test_control_config import valid_documents, write_documents
+from test_control_config import (
+    calibrated_air_balance_document,
+    valid_documents,
+    write_documents,
+)
 from test_control_schema import (
     AIR_BALANCE_RECORD,
     AIR_BALANCE_SHA256,
@@ -170,13 +181,19 @@ def zone_records(
 
 
 def strip_v3_provenance(document: dict[str, Any]) -> None:
-    """報告 v3 で足した provenance の欄を、v2 以前の報告の形へ戻す。"""
+    """報告 v3 / v4 で足した provenance の欄を、v2 以前の報告の形へ戻す。"""
+    strip_v4_provenance(document)
     for key in (
         "air_balance_config_sha256",
         "air_balance_trace_binding",
         "fan_hardware_trace_binding",
     ):
         del document["provenance"][key]
+
+
+def strip_v4_provenance(document: dict[str, Any]) -> None:
+    """報告 v4 で足した provenance の欄を、v3 の報告の形へ戻す。"""
+    del document["provenance"]["fan_policy_trace_binding"]
 
 
 def strip_v11_fields(document: dict[str, Any]) -> None:
@@ -1605,7 +1622,7 @@ def test_the_cli_writes_a_deterministic_report(tmp_path: Path) -> None:
     assert out.read_text(encoding="utf-8") == first
 
     document = json.loads(first)
-    assert document["schema_version"] == 3
+    assert document["schema_version"] == 4
     assert document["segments"][0]["run_id"] == "pr91-cli"
     assert "generated_at" not in document
 
@@ -2763,15 +2780,15 @@ def test_invariant_17_i_a_report_without_a_schema_version_is_refused(
         [run_of(_applied_learned_run(artifacts=("a" * 64,) * 3), [])], context=context
     )
     document = json.loads(report.model_dump_json())
-    assert document["schema_version"] == 3
-    # v3 はそのまま往復する。
+    assert document["schema_version"] == 4
+    # v4 はそのまま往復する。
     assert EvaluationReport.model_validate_json(json.dumps(document)) == report
 
     del document["schema_version"]
     with pytest.raises(ValidationError, match="schema_version"):
         EvaluationReport.model_validate_json(json.dumps(document))
     # 既定値を省いて書き出しても、版は必ず残る（省ける既定値が無い）。
-    assert json.loads(report.model_dump_json(exclude_defaults=True))["schema_version"] == 3
+    assert json.loads(report.model_dump_json(exclude_defaults=True))["schema_version"] == 4
 
 
 def test_invariant_17_g_a_v1_report_cannot_carry_the_fields_added_in_v2(
@@ -2782,7 +2799,7 @@ def test_invariant_17_g_a_v1_report_cannot_carry_the_fields_added_in_v2(
         [run_of(_applied_learned_run(artifacts=("a" * 64,) * 3), [])], context=context
     )
     document = json.loads(report.model_dump_json())
-    assert document["schema_version"] == 3
+    assert document["schema_version"] == 4
     document["schema_version"] = 1
     strip_v3_provenance(document)
 
@@ -2800,6 +2817,7 @@ def _bound_to(tick: ControlTick, context: EvaluationContext) -> ControlTick:
     document["runtime"]["config"].update(
         fan_hardware_sha256=sources.fan_hardware.sha256,
         air_balance_sha256=sources.air_balance.sha256,
+        policy_sha256=sources.policy.sha256,
     )
     document["air_balance"]["config_sha256"] = sources.air_balance.sha256
     return ControlTick.model_validate_json(json.dumps(document))
@@ -2830,7 +2848,7 @@ def test_the_report_counts_traces_recorded_under_the_evaluated_config(
     report = evaluate([run_of(traces, [])], context=context)
     provenance = report.provenance
 
-    assert report.schema_version == 3
+    assert report.schema_version == 4
     assert provenance.air_balance_config_sha256 == context.control.sources.air_balance.sha256
     assert provenance.air_balance_trace_binding == TraceConfigBinding(
         matched=2, mismatched=1, missing=1
@@ -2838,6 +2856,11 @@ def test_the_report_counts_traces_recorded_under_the_evaluated_config(
     # fan-hardware.yaml の hash は runtime v1 から持つので、v10 の tick も突き合わせられる。
     assert provenance.fan_hardware_trace_binding == TraceConfigBinding(
         matched=3, mismatched=1, missing=0
+    )
+    # fan-policy.yaml の hash も runtime v1 から持つ。v10 の tick は runtime を差し替えたので
+    # 不一致になる。
+    assert provenance.fan_policy_trace_binding == TraceConfigBinding(
+        matched=2, mismatched=2, missing=0
     )
     assert provenance.consumed_traces == 4
     assert not provenance.air_balance_trace_binding.complete_for(provenance.consumed_traces)
@@ -2896,6 +2919,203 @@ def test_disabled_air_balance_is_counted_apart_from_an_unknown_flow(
     }
     assert "no_estimated_flow" in codes
     assert "air_balance_disabled" not in codes
+
+
+# ------------------------------ fan-policy.yaml の trace の束縛（#81 / 決定記録 0078 §2.5）
+
+
+def _context_with_coordination_mode(
+    context: EvaluationContext, tmp_path: Path, mode: str
+) -> EvaluationContext:
+    """``air_balance_coordination.mode`` **だけ**が違う fan-policy.yaml の context。
+
+    ``shadow`` / ``apply`` は校正済みの air-balance.yaml を要るので（0078 §2.4）、``off`` も含めて
+    同じ試験用の characterization を使う（air-balance.yaml の hash は mode によらず同じ）。
+    """
+    documents = valid_documents()
+    documents["air-balance.yaml"] = calibrated_air_balance_document()
+    coordination = documents["fan-policy.yaml"]["air_balance_coordination"]
+    assert isinstance(coordination, dict)
+    coordination["mode"] = mode
+    directory = tmp_path / f"pr81-coordination-{mode}"
+    directory.mkdir()
+    write_documents(directory, documents)
+    return EvaluationContext.build(
+        config=context.config,
+        config_sha256=context.config_sha256,
+        control=ControlConfig.from_directory(directory),
+        catalog=context.catalog,
+        catalog_sha256=context.catalog_sha256,
+    )
+
+
+def _coordination_traces(
+    recorded_under: list[EvaluationContext],
+) -> list[ControlTraceRecord]:
+    """``recorded_under[i]`` の設定で記録した i 番目の tick。"""
+    return [
+        trace_of(_bound_to(tick_at(TICK_TS_MS + index * STEP_MS, index), recorded))
+        for index, recorded in enumerate(recorded_under)
+    ]
+
+
+def test_traces_recorded_under_another_coordination_mode_are_counted_as_mismatched(
+    context: EvaluationContext, tmp_path: Path
+) -> None:
+    """**協調の mode だけを変えても、変える前の trace は一致しない**（0078 §2.5）。
+
+    ``mode: off`` で記録した trace（raw baseline）を ``mode: shadow`` / ``apply`` の設定で
+    評価し直した報告が、いまの設定の証拠を名乗れないようにする。
+    """
+    off = _context_with_coordination_mode(context, tmp_path, "off")
+    shadow = _context_with_coordination_mode(context, tmp_path, "shadow")
+    assert off.control.sources.policy.sha256 != shadow.control.sources.policy.sha256
+    assert off.control.sources.air_balance.sha256 == shadow.control.sources.air_balance.sha256
+    # 変える前（off）の trace が1 tick だけ混ざる。
+    mixed = evaluate(
+        [run_of(_coordination_traces([off, shadow, shadow, shadow]), [])], context=shadow
+    ).provenance
+    clean = evaluate(
+        [run_of(_coordination_traces([shadow, shadow, shadow, shadow]), [])], context=shadow
+    ).provenance
+
+    assert mixed.fan_policy_trace_binding == TraceConfigBinding(matched=3, mismatched=1, missing=0)
+    assert not mixed.fan_policy_trace_binding.complete_for(mixed.consumed_traces)
+    assert clean.fan_policy_trace_binding == TraceConfigBinding(matched=4, mismatched=0, missing=0)
+    assert clean.fan_policy_trace_binding.complete_for(clean.consumed_traces)
+    # 他の2つの束縛は mode の変更と関係なく揃っている（fan-policy.yaml だけが理由で止まる）。
+    for provenance in (mixed, clean):
+        assert provenance.air_balance_trace_binding is not None
+        assert provenance.air_balance_trace_binding.complete_for(provenance.consumed_traces)
+        assert provenance.fan_hardware_trace_binding is not None
+        assert provenance.fan_hardware_trace_binding.complete_for(provenance.consumed_traces)
+    # 突き合わせの件数は比較条件に入る。
+    assert mixed.conditions_sha256 != clean.conditions_sha256
+
+
+def test_traces_without_a_runtime_are_counted_as_missing_for_the_fan_policy(
+    context: EvaluationContext,
+) -> None:
+    """runtime を持たない（v7 以前の）tick は、どの fan-policy.yaml で記録されたか言えない。"""
+    document = json.loads(tick_at(TICK_TS_MS, 0).model_dump_json())
+    document["schema_version"] = 7
+    for key in ("runtime", "safety_provenance", "registry"):
+        document.pop(key, None)
+    strip_v11_fields(document)
+    legacy = ControlTick.model_validate_json(json.dumps(document))
+    provenance = evaluate([run_of([trace_of(legacy)], [])], context=context).provenance
+
+    assert provenance.fan_policy_trace_binding == TraceConfigBinding(
+        matched=0, mismatched=0, missing=1
+    )
+
+
+@pytest.mark.parametrize("old_ticks", [1, 4])
+def test_a_report_mixing_traces_of_the_previous_coordination_mode_cannot_promote(
+    context: EvaluationContext, tmp_path: Path, old_ticks: int
+) -> None:
+    """**0078 §2.10「昇格の証拠」。** mode だけを変えた fan-policy.yaml で評価した報告が、
+    変える前の trace を1 tick でも含めば ``_check_evidence()`` に拒まれる。
+
+    照合の相手（承認の証拠・報告の provenance・いま動いている設定）はすべて変えた後の設定に
+    揃えてある。止まる理由は ``fan_policy_trace_binding`` の不一致だけである。
+    """
+    off = _context_with_coordination_mode(context, tmp_path, "off")
+    shadow = _context_with_coordination_mode(context, tmp_path, "shadow")
+    recorded = [off] * old_ticks + [shadow] * (4 - old_ticks)
+    report = evaluate([run_of(_coordination_traces(recorded), [])], context=shadow)
+
+    with pytest.raises(
+        AuthorityEvidenceError, match=r"いまの fan-policy\.yaml で記録されたと言えない"
+    ):
+        _check_evidence_against(report, shadow)
+
+
+def test_a_report_of_traces_recorded_under_the_current_mode_passes_the_fan_policy_binding(
+    context: EvaluationContext, tmp_path: Path
+) -> None:
+    """対照: すべての trace が変えた後の設定で記録されていれば、fan-policy.yaml の束縛で止まらない。
+
+    この最小の報告は Learned MPC の実績を持たないので、後段（artifact の照合）で止まる。
+    """
+    shadow = _context_with_coordination_mode(context, tmp_path, "shadow")
+    report = evaluate([run_of(_coordination_traces([shadow] * 4), [])], context=shadow)
+
+    with pytest.raises(AuthorityEvidenceError) as caught:
+        _check_evidence_against(report, shadow)
+    assert "fan-policy.yaml" not in str(caught.value)
+    assert "記録されたと言えない" not in str(caught.value)
+
+
+def _check_evidence_against(report: EvaluationReport, current: EvaluationContext) -> None:
+    """報告を bytes にし、いまの設定（``current``）で ``_check_evidence()`` に掛ける。"""
+    document = report.model_dump_json().encode("utf-8")
+    sources = current.control.sources
+    provenance = report.provenance
+    approval = StageApproval(
+        from_stage=AuthorityStage.SHADOW,
+        to_stage=AuthorityStage.LIMITED,
+        expected_revision=0,
+        approver="uid.4242",
+        approved_at_ms=TICK_TS_MS,
+        reason="0078 §2.10 の昇格の証拠の試験",
+        evidence=RolloutEvidence(
+            report_sha256=hashlib.sha256(document).hexdigest(),
+            conditions_sha256=provenance.conditions_sha256,
+            arm_key="counterfactual:learned_mpc+none@shadow",
+            artifact_sha256="a" * 64,
+            evidence_end_ms=TICK_TS_MS,
+            fan_policy_config_sha256=sources.policy.sha256,
+            safety_config_sha256=sources.safety.sha256,
+            air_balance_config_sha256=sources.air_balance.sha256,
+            fan_hardware_config_sha256=sources.fan_hardware.sha256,
+        ),
+        approver_binding="process_uid",
+    )
+    AuthorityStore._check_evidence(
+        approval,
+        document,
+        policy=current.control.policy,
+        fan_policy_config_sha256=sources.policy.sha256,
+        safety_config_sha256=sources.safety.sha256,
+        air_balance_config_sha256=sources.air_balance.sha256,
+        fan_hardware_config_sha256=sources.fan_hardware.sha256,
+        production_artifact_sha256="a" * 64,
+        now_ms=TICK_TS_MS,
+    )
+
+
+def test_a_v4_report_must_carry_the_fan_policy_binding(context: EvaluationContext) -> None:
+    """v4 を名乗りながら fan-policy.yaml の trace の突き合わせを持たない報告を作らない。"""
+    report = evaluate([run_of([trace_of(tick_at(TICK_TS_MS, 0))], [])], context=context)
+    document = json.loads(report.model_dump_json())
+    strip_v4_provenance(document)
+    with pytest.raises(ValidationError, match="v4 の報告"):
+        EvaluationReport.model_validate_json(json.dumps(document))
+
+
+def test_a_v3_report_cannot_carry_the_fan_policy_binding(context: EvaluationContext) -> None:
+    """古い版に、後から意味の違う欄を足して読ませない。v3 の形は読める。"""
+    report = evaluate([run_of([trace_of(tick_at(TICK_TS_MS, 0))], [])], context=context)
+    document = json.loads(report.model_dump_json())
+    document["schema_version"] = 3
+    with pytest.raises(ValidationError, match="schema version 4"):
+        EvaluationReport.model_validate_json(json.dumps(document))
+    strip_v4_provenance(document)
+    assert EvaluationReport.model_validate_json(json.dumps(document)).schema_version == 3
+
+
+def test_a_truncated_fan_policy_binding_count_is_rejected(context: EvaluationContext) -> None:
+    """件数を消費した trace の数に縛る（codex #4134851497 と同じ規則）。"""
+    report = evaluate([run_of([trace_of(tick_at(TICK_TS_MS, 0))], [])], context=context)
+    document = json.loads(report.model_dump_json())
+    document["provenance"]["fan_policy_trace_binding"] = {
+        "matched": 2,
+        "mismatched": 0,
+        "missing": 0,
+    }
+    with pytest.raises(ValidationError, match="fan_policy_trace_binding の件数"):
+        EvaluationReport.model_validate_json(json.dumps(document))
 
 
 def test_a_v3_report_must_carry_the_config_bindings(context: EvaluationContext) -> None:
