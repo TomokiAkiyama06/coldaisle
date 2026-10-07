@@ -172,7 +172,11 @@ contracts:
 
 `thermal_model` の schema には、Learned MPC が束縛できる**反実仮想 artifact v2**（`coldaisle.thermal_model`
 v2、capability `counterfactual_action`）の組 `thermal-features-v2` / `thermal-targets-v1` を書く
-（決定記録 0079 §2.3）。`promote` / `rollback` の `--feature-schema` / `--target-schema` にも同じ値を渡す。
+（決定記録 0079 §2.3）。v2 の artifact を `promote` するときの `--feature-schema` / `--target-schema` も同じ値を渡す。
+`rollback` の `--feature-schema` / `--target-schema` は**戻り先の artifact** の schema を渡す（`rollback` は戻り先を
+渡した互換性で検証する）。上の CLI の例は v2 の戻り先を前提にしている。最初の v2 を v1 の production の上に
+promote した直後は戻り先が v1 のことがあり、そのときは `thermal-features-v1` を渡さないと schema 不一致で拒まれる。
+v1 へ戻すと Learned MPC は v1 を束縛しないので、その kind は Fallback で運転する（決定記録 0079 §2.2 / §2.6）。
 v1 artifact（`thermal-features-v1`、`observational_replay`）が production のままこの contract で `verify` すると、
 schema 不一致で `unusable` と報告される。これは Fallback を意味し、正しい（決定記録 0079 §2.6）。
 v1 を v2 として読み替える経路は無い（同 §2.2）。

@@ -44,6 +44,10 @@ def test_the_documented_runtime_contract_parses_and_names_the_v2_schemas() -> No
 
 
 def test_documented_promote_and_rollback_examples_use_the_v2_schemas() -> None:
+    """例は v2 の production と v2 の戻り先を前提にする。
+
+    v1 へ戻す場合は、文書の注記のとおり戻り先の v1 の schema を渡す。
+    """
     for text in (_DOC.read_text(encoding="utf-8"), cli.__doc__ or ""):
         pairs = _SCHEMA_FLAGS.findall(text)
         assert pairs, "promote / rollback の例が見つからない"
