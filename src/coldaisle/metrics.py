@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from hashlib import sha256
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -60,12 +61,23 @@ class MetricCatalog(BaseModel):
 
     @classmethod
     def from_yaml(cls, path: Path) -> MetricCatalog:
-        loaded: Any = yaml.safe_load(path.read_text(encoding="utf-8"))
+        return cls.from_yaml_with_sha256(path)[0]
+
+    @classmethod
+    def from_yaml_with_sha256(cls, path: Path) -> tuple[MetricCatalog, str]:
+        """catalog と、**同じ bytes** の SHA-256（決定記録 0107 §2.6）。
+
+        fand と Learned MPC worker が同じ catalog を読んだことを、frame の
+        `metric_catalog_sha256` で照合するために使う。読み直して hash を取ると、間で書き換わった
+        別の bytes の hash になりうるので、1回だけ読む。
+        """
+        payload = path.read_bytes()
+        loaded: Any = yaml.safe_load(payload.decode("utf-8"))
         if not isinstance(loaded, dict):
             raise ValueError(f"メトリクス定義が辞書ではない: {path}")
         catalog = cls.model_validate(loaded)
         catalog._validate_names()
-        return catalog
+        return catalog, sha256(payload).hexdigest()
 
     def _validate_names(self) -> None:
         """命名規約（決定記録 0002 §2.1）と `d.` の予約を守らせる。"""

@@ -17,8 +17,24 @@ from typing import Any
 import pytest
 
 from coldaisle.control.fallback import LearnedFailure
-from coldaisle.control_daemon import build, build_parser, read_runtime_calibration
+from coldaisle.control.learned_handoff import (
+    AvailableCalibration,
+    CalibrationUnavailableCode,
+    UnavailableCalibration,
+)
+from coldaisle.control_daemon import (
+    build,
+    build_parser,
+    read_runtime_calibration,
+    read_startup_calibration,
+)
+from coldaisle.metrics import MetricCatalog
+from test_control_loop import METRIC_CATALOG_SHA256, Harness, catalog
 from test_fand_registry import daemon_config
+from test_learned_channel import RecordingSink, StaticSource
+
+__all__ = ["catalog"]
+
 from test_learned_mpc import (
     CALIBRATION_OFFSETS,
     MpcArtifact,
@@ -145,3 +161,73 @@ def test_the_value_fand_read_decides_l9(trained: MpcArtifact, tmp_path: Path) ->
         result = propose(runtime)
         assert result.failure is LearnedFailure.MODEL_LOAD_FAILURE
         assert result.failure_reason is not None and "L9" in result.failure_reason.detail
+
+
+# ======================================================== frame v3 の `calibration`（0101 §2.2）
+
+
+def test_the_frame_calibration_copies_what_fand_read(tmp_path: Path) -> None:
+    path = write_calibration(tmp_path / "calibration.json", CALIBRATION_OFFSETS)
+
+    runtime, frame = read_startup_calibration(path)
+
+    assert isinstance(frame, AvailableCalibration)
+    assert frame.offsets_c == CALIBRATION_OFFSETS == dict(runtime.offsets_c or {})
+
+
+def test_an_empty_calibration_is_carried_as_available_not_unavailable(tmp_path: Path) -> None:
+    """正しく `"offsets_c": {}` を持つ較正は `available({})`（0096 §2.9 / 0101 §2.2）。"""
+    _runtime, frame = read_startup_calibration(write_calibration(tmp_path / "c.json", {}))
+    assert frame == AvailableCalibration(offsets_c={})
+
+
+def test_no_path_is_the_closed_code_path_not_given() -> None:
+    _runtime, frame = read_startup_calibration(None)
+    assert frame == UnavailableCalibration(reason=CalibrationUnavailableCode.PATH_NOT_GIVEN)
+
+
+@pytest.mark.parametrize("content", [None, "{ broken"], ids=["missing", "broken"])
+def test_an_unreadable_calibration_is_the_closed_code_without_the_path(
+    tmp_path: Path, content: str | None
+) -> None:
+    """frame の理由は閉じた code だけ。例外の文字列と path を載せない（0101 §2.2、ルール10）。"""
+    path = tmp_path / "secret-location" / "calibration.json"
+    path.parent.mkdir()
+    if content is not None:
+        path.write_text(content, encoding="utf-8")
+
+    runtime, frame = read_startup_calibration(path)
+
+    assert frame == UnavailableCalibration(reason=CalibrationUnavailableCode.UNREADABLE)
+    assert not runtime.is_available
+    assert "secret-location" not in frame.model_dump_json()
+
+
+def test_fand_wires_the_calibration_and_the_catalog_hash_into_the_frame(tmp_path: Path) -> None:
+    path = write_calibration(tmp_path / "calibration.json", CALIBRATION_OFFSETS)
+    daemon = build(daemon_config(tmp_path, calibration=path))
+    try:
+        loop: Any = daemon.loop
+        assert loop._learned_calibration == AvailableCalibration(offsets_c=CALIBRATION_OFFSETS)
+        assert loop._metric_catalog_sha256 == METRIC_CATALOG_SHA256
+    finally:
+        daemon.close()
+
+
+def test_every_frame_carries_the_same_calibration(catalog: MetricCatalog) -> None:
+    """毎 tick 同じ値を載せる（fand は較正を起動時にしか読まない。0101 §2.2）。"""
+    sink = RecordingSink()
+    calibration = AvailableCalibration(offsets_c=CALIBRATION_OFFSETS)
+    harness = Harness(
+        catalog,
+        learned_source=StaticSource(),
+        learned_health=sink,
+        learned_sink=sink,
+        learned_calibration=calibration,
+    )
+    harness.settle()
+    harness.tick()
+
+    assert len(sink.frames) >= 2
+    assert all(frame.calibration == calibration for frame in sink.frames)
+    assert {frame.metric_catalog_sha256 for frame in sink.frames} == {METRIC_CATALOG_SHA256}

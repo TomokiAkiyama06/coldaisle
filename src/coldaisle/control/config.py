@@ -23,6 +23,7 @@ from coldaisle.control.air_balance import AirBalanceConfig
 from coldaisle.control.schema import AirBalanceCoordinationMode as AirBalanceCoordinationMode
 from coldaisle.control.schema import (
     AuthorityStage,
+    ControlConfigDigest,
     Demand,
     PerZone,
     SupervisorObjectiveWeights,
@@ -1264,6 +1265,26 @@ class ControlConfig(_ConfigModel):
                 policy=contents["policy"][1],
                 air_balance=contents["air_balance"][1],
             ),
+        )
+
+    def runtime_digest(self) -> ControlConfigDigest:
+        """trace の `runtime.config` と frame の `config` に載せる値（決定記録 0073 §2.5 (c)）。
+
+        4ファイルの版と SHA-256 を `sources` から写す（手で書かない）。fand の loop と Learned MPC
+        worker が**同じ関数**で作り、worker は frame の値と照合する
+        （0077 §2.3 の `config_mismatch`）。
+        """
+        sources = self.sources
+        return ControlConfigDigest(
+            fan_hardware_sha256=sources.fan_hardware.sha256,
+            safety_sha256=sources.safety.sha256,
+            policy_sha256=sources.policy.sha256,
+            air_balance_sha256=sources.air_balance.sha256,
+            control_config_version=CONTROL_CONFIG_VERSION,
+            fan_hardware_schema_version=sources.fan_hardware.schema_version,
+            safety_schema_version=sources.safety.schema_version,
+            policy_schema_version=sources.policy.schema_version,
+            air_balance_schema_version=sources.air_balance.schema_version,
         )
 
     def trace_metadata(self) -> dict[str, object]:

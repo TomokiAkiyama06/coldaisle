@@ -47,6 +47,7 @@ uv run coldaisle-fand --config-dir var/control-config  # 4ファイル（air-bal
 #   管理ソケットは config/control-admin.yaml（--admin-config）。不正なら開かず AUTO で運転。--no-admin で開かない（決定記録 0072）
 #   既定の設定は同じ uid を認めない（socket.group は仮の名前。配置先の専用グループへ置き換える）
 uv run coldaisle-fand --admin-config config/control-admin.dev.yaml  # 開発用: 同じ uid から操作できる（**本番で使わない**）
+uv run coldaisle-learnd --role mpc --config-dir var/control-config --registry-root var/model-registry --learned-channel-config config/learned-channel.yaml  # Learned MPC worker。fand の frame だけを入力にし提案だけを返す（較正は frame が運ぶ。#86 / 決定記録 0077 段階 3 / 0101 / 0107）
 uv run coldaisle-fand --authority-root var/authority  # Authority Stage の journal（authority.json）の場所。起動時に読めなければ制御を取らない（#92 / 決定記録 0057 / 0072 §2.6）
 uv run coldaisle-fand --calibration config/calibration.json  # 較正を起動時に1回だけ読む（反実仮想 artifact の L9。読めなくても起動は止めない。決定記録 0079 §2.4 / 0096）
 uv run coldaisle-fand --learned-channel-config config/learned-channel.yaml  # Learned worker との経路を開く（役割ごとの SOCK_SEQPACKET。省くと開かない。不正なら Learned だけ無効で運転。#86 / 決定記録 0077）
@@ -259,6 +260,7 @@ src/coldaisle/
   air_balance_shadow.py # 合成の起点: 保存済み trace から Air Balance の協調の shadow 集計（読み取りのみ・合否なし。制御へ届かない）。#81 / 決定記録 0093
   event_entry/ # 合成の起点: 書き込み専用の Unix ソケット入口。AI 層・API から import しない。#67
   control_admin/ # 合成の起点: coldaisle-fand の管理ソケット（運転モードと Authority の降格。昇格は受けない）。AI 層・API・eventd・control から import しない。#74 / #92 / 決定記録 0072
+  learned_worker/ # 合成の起点: Learned MPC worker（`coldaisle-learnd`）。frame の列から window を作り提案を返す。Telemetry・SQLite・較正ファイル・hwmon・AI 層を import しない。#86 / 決定記録 0077 / 0101 / 0107
   learned_channel/ # 合成の起点: Learned worker と coldaisle-fand の経路（役割ごとのソケット・受付スレッド・frame の送り出し・registry の production の監視）。control・AI 層・API・control_admin から import しない。#86 / #104 / 決定記録 0077
   local_socket.py # レイヤ横断: Unix ソケット入口に共通の門（SO_PEERCRED・権限・起動時の検査）。0045 / 0072 §2.5
   authority_cli.py # 合成の起点: `coldaisle-authority raise` / `rollback`。`raise_stage()` を呼ぶ唯一の場所。**どこからも import しない**。#92 / 決定記録 0086

@@ -1,4 +1,4 @@
-"""Learned worker との受け渡しで loop が知る型（決定記録 0077 §2.2 / §2.3 / §2.5、0092）。
+"""Learned worker との受け渡しで loop が知る型（決定記録 0077 §2.2 / §2.3 / §2.5、0092、0101）。
 
 `coldaisle.control` は**受け渡しの Protocol と frame の形だけ**を知る。ソケット・受付スレッド・
 認可の実装は `coldaisle.learned_channel`（合成の起点）にあり、この package はそれを import しない
@@ -17,10 +17,11 @@ worker からの経路で運べるのは `MpcProposal`（と段階 4 の Supervi
 from __future__ import annotations
 
 from enum import StrEnum
-from typing import Literal, Protocol
+from typing import Annotated, Literal, Protocol
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from coldaisle.control.model.calibration_digest import RuntimeCalibration
 from coldaisle.control.schema import (
     AuthorityStage,
     ControlConfigDigest,
@@ -33,12 +34,15 @@ from coldaisle.control.schema import (
 from coldaisle.control.state import ControlStateSnapshot
 from coldaisle.control.supervisor.regime import WorkloadRegimeEstimate
 
-LEARNED_FRAME_SCHEMA_VERSION: Literal[2] = 2
+LEARNED_FRAME_SCHEMA_VERSION: Literal[3] = 3
 """`LearnedFrame` の版。
 
 - v1（#86 / 0077 段階 1）: `expected_artifacts` は持たない
 - v2（#104 / 0077 段階 2）: `expected_artifacts`（起動時に読んだ registry の production の識別）
   を足した
+- v3（#86 / 0077 段階 3）: `calibration`（fand が起動時に読んだ較正。決定記録 0101 §2.2）と
+  `metric_catalog_sha256`（fand が読んだ Metric Catalog の SHA-256。決定記録 0107 §2.6）を足した。
+  **v2 以前は受け取らない**（0101 §2.3。どの欄も信用できない frame から較正だけを拾わない）
 """
 
 THERMAL_MODEL_KIND = "thermal_model"
@@ -127,6 +131,56 @@ def _pinned(provenance: RegistryProvenance, kind: str) -> PinnedArtifact | None:
     )
 
 
+class CalibrationUnavailableCode(StrEnum):
+    """frame の `unavailable` の理由（決定記録 0101 §2.2 / §5 #1）。**この2値だけ**。
+
+    例外の文字列（path を含みうる）は frame に載せず、fand の構造化ログにだけ残す
+    （AGENTS.md ルール10）。
+    """
+
+    PATH_NOT_GIVEN = "calibration_path_not_given"
+    UNREADABLE = "calibration_unreadable"
+
+
+class _FrozenStrict(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid", strict=True)
+
+
+class AvailableCalibration(_FrozenStrict):
+    """読めた較正（チャネル名 → ℃。有限値だけ）。空の `offsets_c` も正当な較正（0096 §2.9）。"""
+
+    status: Literal["available"] = "available"
+    offsets_c: dict[
+        Annotated[str, Field(min_length=1)], Annotated[float, Field(allow_inf_nan=False)]
+    ]
+
+
+class UnavailableCalibration(_FrozenStrict):
+    """読めなかった較正。理由は閉じた code だけ（決定記録 0101 §2.2）。"""
+
+    status: Literal["unavailable"] = "unavailable"
+    reason: CalibrationUnavailableCode
+
+
+LearnedCalibration = Annotated[
+    AvailableCalibration | UnavailableCalibration, Field(discriminator="status")
+]
+"""frame の `calibration`（`RuntimeCalibration` の2状態をそのまま写す判別共用体。0101 §2.2）。"""
+
+
+def calibration_to_runtime(
+    calibration: AvailableCalibration | UnavailableCalibration,
+) -> RuntimeCalibration:
+    """frame の較正を loader（L9）に渡す `RuntimeCalibration` へ戻す（決定記録 0101 §2.3）。
+
+    `unavailable` は code から `RuntimeCalibration.unavailable(<code>)` を作る。欠けた較正を
+    `available({})`・0.0 で埋めない（0096 §2.6）。
+    """
+    if isinstance(calibration, AvailableCalibration):
+        return RuntimeCalibration.available(calibration.offsets_c)
+    return RuntimeCalibration.unavailable(calibration.reason.value)
+
+
 class LearnedFrame(BaseModel):
     """1 tick の worker の入力（0077 §2.3、`applied` は 0092）。
 
@@ -137,7 +191,7 @@ class LearnedFrame(BaseModel):
 
     model_config = ConfigDict(frozen=True, extra="forbid", strict=True)
 
-    schema_version: Literal[2] = LEARNED_FRAME_SCHEMA_VERSION
+    schema_version: Literal[3] = LEARNED_FRAME_SCHEMA_VERSION
     snapshot: ControlStateSnapshot
     """その tick の `ControlStateSnapshot`（層をまたいで同じ object。0060 §2.5）。"""
     workload: WorkloadRegimeEstimate | None
@@ -165,6 +219,17 @@ class LearnedFrame(BaseModel):
     """
     config: ControlConfigDigest
     """`runtime.config` と同じ値。worker は自分の設定と食い違えば提案を作らない。"""
+    calibration: LearnedCalibration
+    """fand が起動時に読んだ較正（v3。決定記録 0101 §2.2）。**毎 tick 同じ値**。既定値を持たない。
+
+    worker は束縛を作るたびにこれを `RuntimeCalibration` に戻して loader（L9）に渡す。
+    """
+    metric_catalog_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    """fand が読んだ Metric Catalog の bytes の SHA-256（v3。決定記録 0107 §2.6）。
+
+    worker は自分が読んだ catalog の SHA-256 と違えば束縛を作らない（`metric_catalog_mismatch`）。
+    path は載せない（AGENTS.md ルール10）。
+    """
 
 
 class LearnedFrameSink(Protocol):
