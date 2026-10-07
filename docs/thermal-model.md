@@ -156,7 +156,7 @@ v1 artifact は変えず、v1 を v2 として読み替えない。
   （因果の mask）。window・horizon・格子・ridge lambda・authority の互換・較正の digest に既定値は無い
 - **Profile v2 の同梱**: trainer の結果（`CounterfactualTrainedModel`）は Profile v2 を含まない。
   `assemble_counterfactual_artifact(trained, profile)` が両者を1つの artifact に封じ、読み込み時と同じ
-  検査を作成時にも行う。Profile v2 を train / validation から作る処理は段 3（#85）
+  検査を作成時にも行う。Profile v2 を train / validation から作る処理は段 3（#85。次の節）
 - **読み込み**（`RegistryCounterfactualThermalModel.from_verified_artifact`）: Registry が発行した
   `VerifiedArtifact` だけを受け取り、L1〜L12 を順に検査する。外れたら
   `CounterfactualArtifactRejectedError`（`check` に番号）。runtime の `MetricCatalog` と較正の digest は
@@ -166,3 +166,34 @@ v1 artifact は変えず、v1 を v2 として読み替えない。
 
 MPC への束縛（`MpcModelBinding`・`PlanPrediction`・§2.5 の探索範囲の写し）は段 4（#86）、
 runtime contract の例と `docs/model-registry.md` の更新は段 5（#104）で行う。
+
+## Confidence Profile v2 と判定器（決定記録 0079 段 3 / 0084）
+
+`control/model/counterfactual_confidence.py`。制御経路（Gate / Guard / Safety）・`ControlTick`・
+Registry の schema・`fan-policy.yaml` は変えない。新しいしきい値・設定値は足していない。
+
+- **生成**（`fit_confidence_profile_v2(trained, source, split, spec)`）: 段 2 の学習結果と、その学習に
+  使った Dataset v2・split（checksum と train の件数を照合）から作る。範囲・欠測・support cell・
+  action 列の範囲は train だけ（anchor action は `prior_action`、action 列は記録した列）。action 列の
+  範囲は step ごと（demand の範囲と全 zone の cell (a)）・anchor → step 0（変化量と cell の組 (b)）・
+  step の組 `(k, k + 1)` ごと（変化量と cell の組 (c)）に持つ。cell は `spec` の `fan.<zone>` 軸の境界で
+  分け、全 zone の軸が無ければ作らない。cell の数の上限（0050 §3）は集合ごとに当て、超えれば作らない
+- **residual の基準**: validation の各 example の anchor 推論（`hold_effective`）から作る。held の列が
+  step ごとの support の外にある example は基準から除き、件数を `residual_excluded_example_count` に
+  残す。ある出力で残りが0件なら Profile を作らない（artifact も作れない）
+- **同梱**: `seal_counterfactual_artifact(trained, source, split, spec)` が生成と
+  `assemble_counterfactual_artifact` をまとめて行う
+- **step ごとの support の照合**（`StepSupportChecker`）: action 列を、観測した値・cell・組の外を通さず
+  照らす（margin も件数の下限も掛けない）。外れた最初の点を `StepSupportViolation`（step の番号・
+  zone・cell）で返す。held の列の照合・residual の基準の除外・段 4 の候補 plan の照合が同じ関数を使う
+- **判定器**（`CounterfactualConfidenceAssessor.for_model(model, policy)`）: 封をした型
+  `RegistryCounterfactualThermalModel` の同梱 Profile からだけ作る（別の Profile を渡す引数は無い）。
+  判定の規則は v1 と同じ実装を共有し、予測の model ID・版・`artifact_sha256` を封をした型の束縛と
+  照らす。anchor 推論の held の列が step ごとの support の外なら `support` を OOD（confidence 0）に
+  する。OOD の判定を受けた提案は既存の Gate が Fallback にする
+- **residual の照合**（`counterfactual_residual_monitor(model, policy)`）: 同梱 Profile の基準で数える。
+  判定器と同じ Profile の証拠だけが受け付けられる
+- **offline 評価**: `evaluate_ood_detection` は v2 の封をした型と判定器も受け取る（予測は anchor 推論）
+
+MPC worker への配線・候補 plan の照合（`plan_out_of_learned_range`）は段 4（#86）、episode での
+step の OOD の記録は段 6（#105）で行う。
