@@ -7,7 +7,7 @@
   明示して渡す」の部分のみ（§2.6。呼び出し側は**較正の値**を明示して渡し、digest は trainer と loader が同じ関数で計算する。
   既定値を置かないことは変えない。§5 #1）。0079 の他の節は有効。旧記録側への `Superseded by` の追記は本 PR で行った。
   ほかは 0079 §2.3 が計算方法を決めていなかった点への追加
-- **Superseded by**: [0099](0099-calibration-change-log.md)（§5 #4 の推奨のうち「(ii) `--apply` は … そこへ追記し」の書き手の部分のみ。書き手は取り込み（`coldaisle-daemon`）が起動時に実効の写像の変化を検知して記録し、`--apply` は書かない。§5 #4 の他の部分と他の節は有効）
+- **Superseded by**: [0099](0099-calibration-change-log.md)（§5 #4 の推奨のうち「(ii) `--apply` は … そこへ追記し」の書き手の部分のみ。書き手は取り込み（`coldaisle-daemon`）が起動時に実効の写像の変化を検知して記録し、`--apply` は書かない。§5 #4 の他の部分と他の節は有効）／ [0101](0101-calibration-via-learned-frame.md)（§2.7 の3つ目の項と §5 #5 の推奨の列のうち、0090 に較正ファイルを足さない理由「L9 → artifact を読み込めない → 0089 で authority が Baseline に落ちる」の部分のみ。L9 は MPC worker で働くので fand の authority は下がらず、Learned の提案が届かず Fallback になる。結論（足さない）と他の節は有効）
 - **関連**: [0079](0079-model-artifact-formats.md) §1 / §2.3 / §2.4（L9）/ §5 #3 / §6 の質問 4・5 /
   [0084](0084-model-artifact-anchor-support.md) §2.3（L8 の `metric_binding` のキー集合）/
   [0087](0087-dataset-v2-action-grid.md) §2.6（較正の変更の検査の置き場所）/
