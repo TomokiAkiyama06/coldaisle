@@ -64,7 +64,12 @@ from coldaisle.control.shadow import (
     read_shadow_jsonl,
     shadow_rows,
 )
-from coldaisle.evaluate import EvidenceDatabase
+from coldaisle.evaluate import (
+    EvidenceDatabase,
+    EvidenceOutputError,
+    control_config_files,
+    refuse_output_on_inputs,
+)
 from coldaisle.store.models import ControlTraceRecord
 
 LOGGER = logging.getLogger("coldaisle.drift")
@@ -667,7 +672,35 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     logs.configure(args.log_level)
 
-    manifest = DriftEvidenceManifest.from_file(args.evidence)
+    report_format: ReportFormat = args.report_format
+    out: Path = args.out if args.out is not None else DEFAULT_OUT[report_format]
+    try:
+        # **どの入力を開くより前に**確かめる（#227）。
+        refuse_output_on_inputs(
+            out,
+            db=args.db,
+            inputs=(
+                args.evidence,
+                args.profile,
+                args.config,
+                *control_config_files(args.control_config),
+            ),
+        )
+        manifest = DriftEvidenceManifest.from_file(args.evidence)
+        # manifest が名指す export と dataset も入力。読む前に確かめる。
+        base = args.evidence.parent
+        refuse_output_on_inputs(
+            out,
+            db=args.db,
+            inputs=(() if manifest.shadow_jsonl is None else (base / manifest.shadow_jsonl,)),
+            input_roots=(() if manifest.dataset is None else (base / manifest.dataset,)),
+        )
+    except EvidenceOutputError as error:
+        LOGGER.error(
+            "Model drift の報告を拒否した（何も書かない）",
+            extra={logs.FIELDS_KEY: {"reason": str(error), "out": str(out)}},
+        )
+        return 1
     config, config_sha256 = DriftConfig.from_file(args.config)
     control = ControlConfig.from_directory(args.control_config)
     profile = ModelConfidenceProfile.model_validate_json(args.profile.read_bytes())
@@ -698,8 +731,6 @@ def main(argv: list[str] | None = None) -> int:
             window_end_ms=manifest.end_ms,
         )
     )
-    report_format: ReportFormat = args.report_format
-    out: Path = args.out if args.out is not None else DEFAULT_OUT[report_format]
     path = write(report, out, report_format=report_format)
     LOGGER.info(
         "Model drift の報告を書き出した",

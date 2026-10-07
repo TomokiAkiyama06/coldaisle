@@ -9,7 +9,8 @@ L8 のキー集合の照合、L11 / L12）を実装する。
 - Confidence Profile v2 は artifact の**1区画**として同梱する（0079 §2.1）。この module は
   Profile v2 の**形**と、読み込み時にその形を検査する部分（L6 / L7 / L11 / L12）だけを持つ。
   Profile v2 を train / validation から**作る**処理と、同梱 Profile から作る判定器、step ごとの
-  support の照合関数は段 3（#85）、MPC への束縛と候補の照合は段 4（#86）が足す
+  support の照合関数は段 3（#85。``counterfactual_confidence.py``）、MPC への束縛と候補の照合は
+  段 4（#86）が足す
 - ここは Demand・PWM・authority を返さず、``control.hardware`` / ``control.safety`` /
   ``control.reactive`` を import しない（0079 §2.6）。LLM 層へは何も出さない
 
@@ -1099,17 +1100,38 @@ def _predict_targets(
     observed: ObservedThermalInput,
     trajectory: ActionTrajectory,
 ) -> tuple[PredictedTarget, ...]:
-    raw = feature_row_v2(observed, trajectory, artifact.feature_schema, artifact.action_schema)
-    payload = artifact.payload
+    return predict_targets(
+        payload=artifact.payload,
+        feature_schema=artifact.feature_schema,
+        target_schema=artifact.target_schema,
+        action_schema=artifact.action_schema,
+        observed=observed,
+        trajectory=trajectory,
+    )
+
+
+def predict_targets(
+    *,
+    payload: RidgeModelPayload,
+    feature_schema: ThermalFeatureSchemaV2,
+    target_schema: ThermalTargetSchema,
+    action_schema: ThermalActionSchema,
+    observed: ObservedThermalInput,
+    trajectory: ActionTrajectory,
+) -> tuple[PredictedTarget, ...]:
+    """payload と schema から、観測と action 列に対する target を計算する（推論の本体）。
+
+    封をした型の推論と、artifact へ封じる前の Profile v2 の residual の基準（段 3。0084 §2.1）が
+    **同じ関数**を使う。制御へ渡す予測（``ThermalPrediction``）は封をした型だけが作る。
+    """
+    raw = feature_row_v2(observed, trajectory, feature_schema, action_schema)
     normalized = tuple(
         0.0 if value is None else (value - mean) / scale
         for value, mean, scale in zip(
             raw, payload.feature_means, payload.feature_scales, strict=True
         )
     )
-    by_horizon: dict[int, dict[str, float]] = {
-        horizon: {} for horizon in artifact.target_schema.horizons_ms
-    }
+    by_horizon: dict[int, dict[str, float]] = {horizon: {} for horizon in target_schema.horizons_ms}
     for output in payload.outputs:
         try:
             value = output.intercept + math.fsum(
@@ -1127,7 +1149,7 @@ def _predict_targets(
             expected_ts_ms=observed.action_ts_ms + horizon,
             values=by_horizon[horizon],
         )
-        for horizon in artifact.target_schema.horizons_ms
+        for horizon in target_schema.horizons_ms
     )
 
 
