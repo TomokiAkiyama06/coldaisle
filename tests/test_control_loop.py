@@ -404,6 +404,8 @@ class Harness:
         with_trace: bool = True,
         fault_plan: SimulatedFaultPlan | None = None,
         learned_source: Any = None,
+        learned_health: Any = None,
+        learned_sink: Any = None,
         watchdog: Any = None,
         authority: Any = None,
         guard: Any = None,
@@ -473,6 +475,8 @@ class Harness:
                 else None
             ),
             learned_source=learned_source,
+            learned_health=learned_health,
+            learned_sink=learned_sink,
             shadow=ShadowRecorder(self.config.policy.shadow),
             trace=ControlTraceLogger(self.trace) if with_trace else None,
             authority=authority or RecordingAuthority(self.authority, self.order),
