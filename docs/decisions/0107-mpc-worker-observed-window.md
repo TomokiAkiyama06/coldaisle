@@ -44,9 +44,12 @@ frame の列から組み立てる」「届かなかった frame を補間しな�
   - `value` / `source_ts_ms` はその signal の値。signal が無い・`value` が無い → missing（`source_ts_ms` が無ければ `null`）
   - stale: `quality` が `stale`、または `t - source_ts_ms >= stale_after_ms`（feature schema の値）
   - suspect: `quality` が `suspect` で値がある
-- **欠けた frame を飛び越えて as-of しない。** 当てる frame の次の tick（`tick_id + 1`）の frame を受け取っていない
-  （捨てられた・worker が止まっていた）なら、その格子時刻の cell はすべて missing（`source_ts_ms = null`）にする。
+- **欠けた frame を飛び越えて as-of しない。** 欠けは**受け取った frame の `tick_id` が飛んだことで証明できるとき**だけ
+  とする。当てる frame `f` の後に受け取った frame があり、その中で最も古いものの `tick_id` が `f.tick_id + 1` でない
+  （間の tick が捨てられた・worker が止まっていた）なら、その格子時刻の cell はすべて missing（`source_ts_ms = null`）にする。
   これが 0077 §2.3 の「補間しない。欠けは欠けとして window に残す」の読み方で、Confidence / OOD（0050）と Gate が Fallback へ倒す
+  - **window に使う最新の frame（anchor）には後続を求めない。** 後続はまだ届いていないのが正常であり、欠けの証拠ではない。
+    anchor の frame が当たる格子時刻（`t = action_ts_ms`）の cell は、その frame の signal から作る
 - frame は `tick_id` の昇順で持ち、`tick_id` が戻る・`snapshot.ts_ms` が戻る frame を受け取ったら、それより前の列を捨てる
   （同じ `run_id` の中では起きない想定。起きたら安全側＝window の作り直し）。`run_id` が変われば列を捨てる（0101 §2.3）
 - 列の長さは feature schema の `window_ms` と anchor の action（§2.2）に要る分だけ持つ。window が足りない間は提案を作らない（§2.3）
