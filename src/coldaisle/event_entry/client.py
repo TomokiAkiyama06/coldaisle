@@ -64,23 +64,35 @@ class EntryUnavailableError(RuntimeError):
 
 
 def send(line: bytes, socket_path: Path, *, timeout_s: float) -> dict[str, Any]:
-    """1行を送り、1行の応答を JSON object として返す。"""
+    """1行を送り、1行の応答を JSON object として返す。
+
+    書き込みが EPIPE / ECONNRESET で失敗しても、応答を読みに行く。入口は認可されなかった
+    接続を本文を読まずに拒否して閉じる（0045）ので、クライアントが書き終える前に
+    `unauthorized` の1行が届いていることがある。それを「接続できない」と見せると書き手が
+    原因（権限）を取り違えるため、届いた1行があればそれを返す（管理ソケットと同じ。#241）。
+    """
     conn = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     try:
         conn.settimeout(timeout_s)
         try:
             conn.connect(str(socket_path))
-            conn.sendall(line)
-            buffer = bytearray()
-            while b"\n" not in buffer and len(buffer) <= RESPONSE_MAX_BYTES:
-                chunk = conn.recv(1024)
-                if not chunk:
-                    break
-                buffer += chunk
         except OSError as exc:
             raise EntryUnavailableError(f"書き込み入口へ接続できない: {exc}") from exc
+        write_error: OSError | None = None
+        try:
+            conn.sendall(line)
+        except (BrokenPipeError, ConnectionResetError) as exc:
+            write_error = exc
+        except OSError as exc:
+            raise EntryUnavailableError(f"書き込み入口へ接続できない: {exc}") from exc
+        buffer, read_error = _read_line(conn)
     finally:
         conn.close()
+    if b"\n" not in buffer:
+        # 書き込みか読み込みが失敗し、応答の1行が揃っていない
+        failure = write_error or read_error
+        if failure is not None:
+            raise EntryUnavailableError(f"書き込み入口へ接続できない: {failure}") from failure
     try:
         decoded: Any = json.loads(bytes(buffer).split(b"\n", 1)[0].decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
@@ -88,6 +100,20 @@ def send(line: bytes, socket_path: Path, *, timeout_s: float) -> dict[str, Any]:
     if not isinstance(decoded, dict) or not isinstance(decoded.get("ok"), bool):
         raise EntryUnavailableError("書き込み入口の応答が壊れている")
     return decoded
+
+
+def _read_line(conn: socket.socket) -> tuple[bytearray, OSError | None]:
+    """応答の1行を読む。失敗しても、それまでに読めた分と失敗を返す（呼び出し側が裁く）。"""
+    buffer = bytearray()
+    try:
+        while b"\n" not in buffer and len(buffer) <= RESPONSE_MAX_BYTES:
+            chunk = conn.recv(1024)
+            if not chunk:
+                break
+            buffer += chunk
+    except OSError as exc:
+        return buffer, exc
+    return buffer, None
 
 
 def build_parser() -> argparse.ArgumentParser:
