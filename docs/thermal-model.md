@@ -83,7 +83,9 @@ Runtime loaderは#104がchecksum検証して返した`VerifiedArtifact`と、呼
 authority stageを直接要求する。metadataとpayloadのどちらかだけを差し替えてもloadせず、LIMITED
 以上をSHADOWへ読み替えない。`RidgeThermalModel`はこの経路からしか構築できない。
 in-memory artifactを使う評価は別型`OfflineRidgeThermalModel`になり、predictionにも
-`offline_unverified`を明示する。#85 / #86のdeployment consumerは`RegistryThermalModel`だけを受ける。
+`offline_unverified`を明示する。#85 / #86のdeployment consumerは`RegistryThermalModel`だけを受ける
+（**更新（決定記録 0079 段 4）**: #86 の MPC は v1 を受けず、反実仮想 artifact v2 の封をした型だけを
+`MpcModelBinding.from_verified_artifact` で束縛する。後述の「Learned MPC への束縛」）。
 offline / shadow evaluation referenceとpromotion / rollbackは#104が管理し、payloadへ埋め込まない。
 
 **更新（#86 / 決定記録 0052 §2.1）**: #104に`ArtifactAttestation`を追加し、`VerifiedArtifact`は
@@ -165,7 +167,7 @@ v1 artifact は変えず、v1 を v2 として読み替えない。
   全 step で保つ）。`predict_trajectory` は action schema の格子と完全に一致する列だけを予測する
 
 MPC への束縛（`MpcModelBinding`・`PlanPrediction`・§2.5 の探索範囲の写し）は段 4（#86。次の次の節）、
-runtime contract の例と `docs/model-registry.md` の更新は段 5（#104）で行う。
+runtime contract の例と `docs/model-registry.md` は段 5（#104）で v2 に合わせた。
 
 ## Confidence Profile v2 と判定器（決定記録 0079 段 3 / 0084）
 
