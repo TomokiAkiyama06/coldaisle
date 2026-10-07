@@ -983,7 +983,7 @@ def test_steps_sharing_a_source_tick_must_agree(build_ticks, field, value):
 
     raw = dataset.model_dump(mode="json")
     raw["examples"][0]["action_steps"][1][field] = value
-    with pytest.raises(ValidationError, match="同じ元の tick"):
+    with pytest.raises(ValidationError, match=r"同じ元の tick|時刻の順と一致しない"):
         DatasetExampleV2.model_validate_json(json.dumps(raw["examples"][0]))
 
 
@@ -997,7 +997,12 @@ def test_steps_sharing_a_source_tick_must_agree(build_ticks, field, value):
             {"front": 0.9, "rear": 0.6, "top": 0.6},
             id="step-value",
         ),
-        pytest.param("prior_action", "source_tick_id", 99, id="prior-tick-id"),
+        pytest.param(
+            "prior_action",
+            "effective_demand",
+            {"front": 0.9, "rear": 0.5, "top": 0.5},
+            id="prior-value",
+        ),
     ],
 )
 def test_source_ticks_must_agree_across_examples(build_ticks, where, field, value):
@@ -1022,3 +1027,22 @@ def test_source_ticks_must_agree_across_examples(build_ticks, where, field, valu
     raw["manifest"]["examples_sha256"] = examples_sha256(examples)
     with pytest.raises(ValidationError, match="example の間で食い違っている"):
         ThermalDatasetV2.model_validate_json(json.dumps(raw))
+
+
+@pytest.mark.parametrize(
+    ("path", "value", "match"),
+    [
+        pytest.param(("prior_action", "source_tick_id"), 3, "anchor の tick_id − 1", id="prior"),
+        pytest.param(("action_steps", 1, "source_tick_id"), 11, "時刻の順と一致しない", id="step"),
+    ],
+)
+def test_loaded_source_tick_ids_follow_the_consecutive_rule(build_ticks, path, value, match):
+    """作られた example では tick_id がちょうど 1 ずつ増える（PR #221 の Codex P2 の3件目）。"""
+    dataset = build_ticks(ALIGNED)
+    raw = dataset.model_dump(mode="json")["examples"][0]
+    target = raw
+    for key in path[:-1]:
+        target = target[key]
+    target[path[-1]] = value
+    with pytest.raises(ValidationError, match=match):
+        DatasetExampleV2.model_validate_json(json.dumps(raw))

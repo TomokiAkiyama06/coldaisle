@@ -639,6 +639,12 @@ class DatasetExampleV2(_Frozen):
             raise ValueError("v2 の target に期待時刻より後の観測を入れない")
         if self.prior_action.source_ts_ms >= self.action_ts_ms:
             raise ValueError("prior_action は anchor の tick より厳密に前の tick から取る")
+        # prior_action の元の tick から tick_id はちょうど 1 ずつ増える（0087 §2.2）ので、
+        # prior_action の元の tick は anchor の tick の直前の tick である
+        if self.prior_action.source_tick_id != self.control_tick_id - 1:
+            raise ValueError(
+                "prior_action の元の tick_id は anchor の tick_id − 1 でなければならない"
+            )
         if tuple(step.step for step in self.action_steps) != tuple(range(len(self.action_steps))):
             raise ValueError("action_steps の step 番号は 0 から連続していなければならない")
         first = self.action_steps[0]
@@ -659,6 +665,13 @@ class DatasetExampleV2(_Frozen):
             raise ValueError("action_steps の元の tick の時刻が逆行している")
         # 同じ元の tick（同じ ts_ms）を複数の step が使うなら、tick_id も値も同じにする。
         # 1つの tick は1つの effective しか持たない（0087 §2.1）
+        # tick_id は ts_ms の順にちょうど 1 ずつ増える（0087 §2.2）ので、元の tick の時刻が進めば
+        # tick_id も進む
+        for earlier, later in zip(self.action_steps, self.action_steps[1:], strict=False):
+            if (later.source_ts_ms > earlier.source_ts_ms) != (
+                later.source_tick_id > earlier.source_tick_id
+            ):
+                raise ValueError("action_steps の元の tick の tick_id が時刻の順と一致しない")
         sources: dict[int, tuple[int, PerZone[float]]] = {}
         for step in self.action_steps:
             seen = sources.setdefault(
