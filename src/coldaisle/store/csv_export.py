@@ -38,6 +38,22 @@ TIMESTAMP_FORMAT = "%Y-%m-%dT%H:%M:%S"
 """従来の出力に合わせる。オフセットもミリ秒も付かない。"""
 
 
+def _timestamp_resolution_ms(timestamp_format: str) -> int:
+    """書式が落とす時刻の幅（ms）。秒までの書式なら 1000、ミリ秒まで残る書式なら 1。
+
+    再生した時刻は CSV の書式で切り捨てられている。較正の変更の記録（0099 §2.6）は、本番の
+    ms の時刻を切り捨ての区間として扱うので、その幅を**書式から導く**（AGENTS.md ルール 9。
+    書式と幅を別々に書くと片方だけ直る）。秒の直前の時刻を書式に通し、読み戻して失った分を測る。
+    """
+    probe = datetime(2000, 1, 1, 0, 0, 59, 999_999)
+    lost = probe - datetime.strptime(probe.strftime(timestamp_format), timestamp_format)
+    return int(lost.total_seconds() * 1000) + 1
+
+
+TIMESTAMP_RESOLUTION_MS = _timestamp_resolution_ms(TIMESTAMP_FORMAT)
+"""CSV の時刻の精度（ms）。決定記録 0099 §2.6 / §5 #9。"""
+
+
 def day_bounds_ms(day: date, tz: ZoneInfo) -> tuple[int, int]:
     """その日の `[開始, 終了)` を Unix ミリ秒で返す。"""
     start = datetime.combine(day, time.min, tzinfo=tz)

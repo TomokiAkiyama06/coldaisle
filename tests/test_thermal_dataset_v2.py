@@ -18,6 +18,7 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
+from coldaisle.calibration_offsets import effective_metric_offsets
 from coldaisle.clock import SimulatedClock
 from coldaisle.control import ControlTick, ControlTraceLogger
 from coldaisle.control.drift.model import ChangeKind, DeclaredChange
@@ -38,6 +39,13 @@ from coldaisle.control.mpc.plan import ActionPlan
 from coldaisle.control.schema import PerZone
 from coldaisle.dataset import ThermalDatasetBuilder, ThermalDatasetV2Builder, write_dataset
 from coldaisle.store import Quality, QualityRules, Reading, Sample, SqliteStore, migrations
+from coldaisle.store.calibration_history import (
+    CalibrationActivation,
+    CalibrationHistory,
+    CalibrationHistoryError,
+    read_calibration_history,
+)
+from conftest import QUALITY_RULES_PATH
 
 CONTROL_FIXTURE = Path(__file__).resolve().parent / "fixtures" / "control_tick_v1.json"
 MODEL_PACKAGE = Path(__file__).resolve().parents[1] / "src" / "coldaisle" / "control" / "model"
@@ -47,6 +55,15 @@ SOURCE_ALIAS = "source-00000000000000000000000000000001"
 ARTIFACT_ONE = "dataset-00000000000000000000000000000001"
 ARTIFACT_TWO = "dataset-00000000000000000000000000000002"
 NO_CHANGES: tuple[DeclaredChange, ...] = ()
+T0 = 100_000
+"""専用 DB の時刻の起点。筋書きの時刻（tick・readings・source run）はこれからの相対で書く。
+
+較正の記録の行は ``ts_ms >= 0`` で、期間の先頭以前に行が無ければ Dataset v2 を作らない
+（決定記録 0099 §2.6 の被覆）。起点を 0 にすると、期間の先頭（0）を覆う行の区間
+``[floor, ts]`` が期間に入ってしまう。
+"""
+COVERING_ROW_MS = 1_000
+"""既定の記録の唯一の行の時刻（``T0`` より前で、区間も期間の外）。"""
 
 Demands = tuple[float, float, float]
 TickSpec = tuple[int, int, Demands]
@@ -90,8 +107,8 @@ def source_run(*, end_ms: int) -> SourceRun:
     return SourceRun(
         run_id=RUN_ALIAS,
         kind=DatasetSourceKind.REPLAY,
-        start_ms=0,
-        end_ms=end_ms,
+        start_ms=T0,
+        end_ms=T0 + end_ms,
         source_refs=(SOURCE_ALIAS,),
         source_sha256=SHA256,
     )
@@ -156,11 +173,15 @@ def run_store(
         store.bind_dataset_source_run(
             run_alias=RUN_ALIAS, source_kind="replay", source_sha256=SHA256, at_ms=0
         )
-        store.insert_samples(tuple(regular_readings(end_ms) if readings is None else readings))
+        relative = regular_readings(end_ms) if readings is None else readings
+        store.insert_samples(
+            tuple(Sample(ts_ms=T0 + item.ts_ms, readings=item.readings) for item in relative)
+        )
         store.complete_dataset_source_run(at_ms=end_ms)
         logger = ControlTraceLogger(store)
         for item in ticks:
-            logger.record(item if isinstance(item, ControlTick) else tick(*item))
+            recorded = item if isinstance(item, ControlTick) else tick(*item)
+            logger.record(recorded.model_copy(update={"ts_ms": T0 + recorded.ts_ms}))
         yield store
 
 
@@ -170,12 +191,45 @@ def build(
     end_ms: int,
     spec: DatasetSpecV2 | None = None,
     declared_changes: tuple[DeclaredChange, ...] = NO_CHANGES,
+    calibration_history: CalibrationHistory | None = None,
 ) -> ThermalDatasetV2:
     return ThermalDatasetV2Builder(store).build(
         source_run=source_run(end_ms=end_ms),
         spec=spec_v2() if spec is None else spec,
         declared_changes=declared_changes,
+        calibration_history=(
+            covering_history(store.connection.execute("PRAGMA database_list").fetchone()[2])
+            if calibration_history is None
+            else calibration_history
+        ),
     )
+
+
+def history_db(path: Path, *rows_ms: int) -> Path:
+    """本番の DB の代わり。``rows_ms`` の各時刻に、写像を変えながら記録の行を足す。"""
+    with SqliteStore(
+        path, rules=QualityRules.from_yaml(QUALITY_RULES_PATH), clock=SimulatedClock(0)
+    ) as db:
+        previous: CalibrationActivation | None = None
+        for index, ts_ms in enumerate(rows_ms):
+            previous = CalibrationActivation.next_after(
+                previous,
+                ts_ms=ts_ms,
+                source_kind="mock",
+                offsets=effective_metric_offsets({"front_intake": 0.25 * index}),
+                calibrated_at=None,
+                calibration_file_sha256="f" * 64,
+            )
+            db.append_calibration_activation(previous)
+    return path
+
+
+def covering_history(dedicated_db: str) -> CalibrationHistory:
+    """専用 DB の隣に、期間を覆う1行だけの記録を作って読む。"""
+    path = Path(dedicated_db).with_name(Path(dedicated_db).stem + "-history.db")
+    if not path.exists():
+        history_db(path, COVERING_ROW_MS)
+    return read_calibration_history(path)
 
 
 def excluded(dataset: ThermalDatasetV2) -> dict[str, int]:
@@ -219,13 +273,13 @@ def test_steps_take_the_as_of_effective_and_record_the_source_tick(build_ticks):
 
     assert dataset.manifest.schema_version == 2
     (example,) = dataset.examples
-    assert example.action_ts_ms == 5_000
+    assert example.action_ts_ms == T0 + 5_000
     assert [
         (step.step, step.ts_ms, step.source_ts_ms, step.source_tick_id)
         for step in example.action_steps
     ] == [
-        (0, 5_000, 5_000, 11),
-        (1, 6_000, 6_000, 12),
+        (0, T0 + 5_000, T0 + 5_000, 11),
+        (1, T0 + 6_000, T0 + 6_000, 12),
     ]
     assert example.action_steps[0].effective_demand == per_zone(A), "step 0 は anchor の tick 自身"
     assert example.action_steps[1].effective_demand == per_zone(B)
@@ -249,7 +303,11 @@ def test_offset_ticks_use_the_latest_tick_at_or_before_the_grid_time(build_ticks
 
     (example,) = dataset.examples
     second = example.action_steps[1]
-    assert (second.ts_ms, second.source_ts_ms, second.source_tick_id) == (6_000, 5_900, 12)
+    assert (second.ts_ms, second.source_ts_ms, second.source_tick_id) == (
+        T0 + 6_000,
+        T0 + 5_900,
+        12,
+    )
     assert second.effective_demand == per_zone(A)
 
 
@@ -277,7 +335,7 @@ def test_prior_action_is_the_latest_tick_strictly_before_the_anchor(build_ticks)
 
     (example,) = dataset.examples
     prior = example.prior_action
-    assert (prior.source_ts_ms, prior.source_tick_id) == (4_000, 10)
+    assert (prior.source_ts_ms, prior.source_tick_id) == (T0 + 4_000, 10)
     assert prior.effective_demand == per_zone(PRIOR)
     assert prior.effective_demand != example.action_steps[0].effective_demand
 
@@ -315,7 +373,7 @@ def test_prior_action_just_inside_the_limit_is_kept(build_ticks):
     dataset = build_ticks(ticks, spec=spec_v2(action_stale_after_ms=2_001))
 
     (example,) = dataset.examples
-    assert example.prior_action.source_ts_ms == 3_000
+    assert example.prior_action.source_ts_ms == T0 + 3_000
 
 
 # ---------------------------------------------------------------- §2.2 鮮度
@@ -494,7 +552,7 @@ def test_tick_id_gap_inside_the_checked_range_drops_the_example(build_ticks, tic
 def test_restart_or_gap_before_the_prior_tick_is_ignored(build_ticks, before):
     dataset = build_ticks((before, *ALIGNED))
 
-    assert [example.action_ts_ms for example in dataset.examples] == [5_000]
+    assert [example.action_ts_ms for example in dataset.examples] == [T0 + 5_000]
     assert excluded(dataset) == zero_excluded()
 
 
@@ -506,7 +564,7 @@ def test_restart_or_gap_after_the_first_tick_past_the_horizon_is_ignored(build_t
     """anchor 5000 の検査は最大の horizon（7000）の後の最初の tick（7500）まで。8000 は外。"""
     dataset = build_ticks((*ALIGNED, after), end_ms=8_001)
 
-    assert [example.action_ts_ms for example in dataset.examples] == [5_000]
+    assert [example.action_ts_ms for example in dataset.examples] == [T0 + 5_000]
     # anchor 6000 も run に収まるが、最大の horizon（8000）の後に tick が無いので「連続」
     assert excluded(dataset) == zero_excluded(discontinuity=1)
 
@@ -541,9 +599,9 @@ def test_action_columns_cover_exactly_the_grid(build_ticks):
     ticks = tuple((4_000 + 500 * index, 10 + index, A) for index in range(9))
     dataset = build_ticks(ticks, end_ms=8_001, spec=spec)
 
-    (example,) = (item for item in dataset.examples if item.action_ts_ms == 5_000)
+    (example,) = (item for item in dataset.examples if item.action_ts_ms == T0 + 5_000)
     assert len(example.action_steps) == spec.action_steps
-    assert [step.ts_ms for step in example.action_steps] == [5_000, 5_500, 6_000, 6_500]
+    assert [step.ts_ms - T0 for step in example.action_steps] == [5_000, 5_500, 6_000, 6_500]
 
 
 def _target_readings() -> list[Sample]:
@@ -578,13 +636,17 @@ def test_target_uses_only_observations_at_or_before_the_expected_time(tmp_path, 
 
     (example,) = dataset.examples
     first, second = example.targets
-    assert first.source_ts_ms["air.gpu_exhaust"] == 5_950, "後ろの 6010 のほうが近くても採らない"
+    assert first.source_ts_ms["air.gpu_exhaust"] == T0 + 5_950, (
+        "後ろの 6010 のほうが近くても採らない"
+    )
     assert second.missing_mask["air.gpu_exhaust"] is True, "期待時刻 7000 の後ろ（7050）にしか無い"
-    assert example.label_end_ms == 7_000, "anchor + 最大の horizon（許容誤差を足さない）"
+    assert example.label_end_ms == T0 + 7_000, "anchor + 最大の horizon（許容誤差を足さない）"
 
-    (v1_example,) = (item for item in v1.examples if item.action_ts_ms == 5_000)
-    assert v1_example.targets[0].source_ts_ms["air.gpu_exhaust"] == 6_010, "v1 の採り方は変えない"
-    assert v1_example.targets[1].source_ts_ms["air.gpu_exhaust"] == 7_050
+    (v1_example,) = (item for item in v1.examples if item.action_ts_ms == T0 + 5_000)
+    assert v1_example.targets[0].source_ts_ms["air.gpu_exhaust"] == T0 + 6_010, (
+        "v1 の採り方は変えない"
+    )
+    assert v1_example.targets[1].source_ts_ms["air.gpu_exhaust"] == T0 + 7_050
 
 
 def test_loaded_v2_target_after_the_expected_time_is_rejected(build_ticks):
@@ -651,13 +713,13 @@ def test_runs_with_pre_migration_rows_are_refused(tmp_path, rules, clock):
 
 def test_new_db_whose_first_tick_equals_legacy_until_ms_is_not_refused(tmp_path, rules):
     """空の DB でも legacy_until_ms はストアの時計で書かれる。時刻で見分けると正しい run を拒む。"""
-    clock = SimulatedClock(5_000)
+    clock = SimulatedClock(T0 + 5_000)
     with run_store(tmp_path / "sim.db", rules, clock, ALIGNED, end_ms=7_501) as store:
-        assert store.control_trace_prune_state().legacy_until_ms == 5_000
+        assert store.control_trace_prune_state().legacy_until_ms == T0 + 5_000
         assert store.control_trace_legacy_through_seq() == 0
         dataset = build(store, end_ms=7_501)
 
-    assert [example.action_ts_ms for example in dataset.examples] == [5_000]
+    assert [example.action_ts_ms for example in dataset.examples] == [T0 + 5_000]
 
 
 # ---------------------------------------------------------------- §2.1 legacy_through_seq
@@ -785,23 +847,25 @@ def test_migration_keeps_the_read_api_result_unchanged(tmp_path, rules):
     ("change", "refused"),
     [
         pytest.param(
-            DeclaredChange(kind=ChangeKind.CALIBRATION_CHANGED, ts_ms=0),
+            DeclaredChange(kind=ChangeKind.CALIBRATION_CHANGED, ts_ms=T0),
             True,
             id="at-history-start",
         ),
         pytest.param(
-            DeclaredChange(kind=ChangeKind.CALIBRATION_CHANGED, ts_ms=6_000), True, id="inside"
+            DeclaredChange(kind=ChangeKind.CALIBRATION_CHANGED, ts_ms=T0 + 6_000), True, id="inside"
         ),
         pytest.param(
-            DeclaredChange(kind=ChangeKind.CALIBRATION_CHANGED, ts_ms=7_000),
+            DeclaredChange(kind=ChangeKind.CALIBRATION_CHANGED, ts_ms=T0 + 7_000),
             True,
             id="at-label-end",
         ),
         pytest.param(
-            DeclaredChange(kind=ChangeKind.CALIBRATION_CHANGED, ts_ms=7_001), False, id="after"
+            DeclaredChange(kind=ChangeKind.CALIBRATION_CHANGED, ts_ms=T0 + 7_001), False, id="after"
         ),
         pytest.param(
-            DeclaredChange(kind=ChangeKind.FAN_REPLACED, ts_ms=6_000), False, id="not-calibration"
+            DeclaredChange(kind=ChangeKind.FAN_REPLACED, ts_ms=T0 + 6_000),
+            False,
+            id="not-calibration",
         ),
     ],
 )
@@ -817,15 +881,127 @@ def test_calibration_change_inside_the_dataset_period_is_refused(
 
 
 def test_declared_changes_must_be_passed_explicitly(tmp_path, rules, clock):
+    history = read_calibration_history(history_db(tmp_path / "history.db", COVERING_ROW_MS))
     with run_store(tmp_path / "decl.db", rules, clock, ALIGNED, end_ms=7_501) as store:
         builder = ThermalDatasetV2Builder(store)
         with pytest.raises(TypeError):
-            builder.build(source_run=source_run(end_ms=7_501), spec=spec_v2())  # type: ignore[call-arg]
+            builder.build(  # type: ignore[call-arg]
+                source_run=source_run(end_ms=7_501), spec=spec_v2(), calibration_history=history
+            )
         with pytest.raises(TypeError, match="DeclaredChange"):
             builder.build(
                 source_run=source_run(end_ms=7_501),
                 spec=spec_v2(),
                 declared_changes=[],  # type: ignore[arg-type]
+                calibration_history=history,
+            )
+
+
+# ---------------------------------------------------------------- 0099 §2.6 較正の変更の記録
+
+ALIGNED_PERIOD = (T0, T0 + 7_000)
+"""ALIGNED の唯一の example の期間 ``[history_start, label_end]``。"""
+
+
+def build_with_history(tmp_path, rules, clock, *rows_ms, ticks=ALIGNED, spec=None):
+    history = read_calibration_history(history_db(tmp_path / "history.db", *rows_ms))
+    with run_store(tmp_path / "run.db", rules, clock, ticks, end_ms=7_501) as store:
+        return build(store, end_ms=7_501, spec=spec, calibration_history=history)
+
+
+def test_alignment_of_the_default_period():
+    """以降の試験の前提（ALIGNED の example の期間）を固定する。"""
+    assert ALIGNED_PERIOD == (T0 + 5_000 - 5_000, T0 + 5_000 + 2_000)
+
+
+@pytest.mark.parametrize(
+    "rows_ms",
+    [
+        pytest.param((COVERING_ROW_MS, T0 + 3_000), id="row-inside"),
+        pytest.param((COVERING_ROW_MS, T0), id="row-at-the-period-start"),
+        pytest.param((COVERING_ROW_MS, T0 + 7_000), id="row-at-the-period-end"),
+        # 区間 [floor(ts), ts] の下端（T0 + 7000）だけが期間に入る（秒の切り捨て。0099 §5 #9）
+        pytest.param((COVERING_ROW_MS, T0 + 7_999), id="only-the-floor-inside"),
+    ],
+)
+def test_recorded_calibration_change_inside_the_period_is_refused(tmp_path, rules, clock, rows_ms):
+    """``declared_changes`` が空でも記録の行は効く（宣言との和集合。0099 §2.6 / §5 #6）。"""
+    with pytest.raises(ValueError, match="較正の変更"):
+        build_with_history(tmp_path, rules, clock, *rows_ms)
+
+
+@pytest.mark.parametrize(
+    "rows_ms",
+    [
+        pytest.param((COVERING_ROW_MS,), id="one-covering-row"),
+        pytest.param((COVERING_ROW_MS, T0 + 8_000), id="row-after-the-period"),
+        # 区間の上端だけが期間の前（T0 - 1）。下端（T0 - 1000）も期間の前
+        pytest.param((COVERING_ROW_MS, T0 - 1), id="row-just-before-the-period"),
+    ],
+)
+def test_rows_only_outside_the_period_build(tmp_path, rules, clock, rows_ms):
+    dataset = build_with_history(tmp_path, rules, clock, *rows_ms)
+    assert [example.action_ts_ms for example in dataset.examples] == [T0 + 5_000]
+
+
+@pytest.mark.parametrize(
+    "rows_ms",
+    [
+        pytest.param((), id="empty-table"),
+        pytest.param((T0 + 1,), id="first-row-after-the-period-start"),
+        pytest.param((T0 + 9_000,), id="only-a-row-after-the-period"),
+    ],
+)
+def test_history_that_does_not_cover_the_period_is_refused(tmp_path, rules, clock, rows_ms):
+    with pytest.raises(ValueError, match="期間を覆っていない"):
+        build_with_history(tmp_path, rules, clock, *rows_ms)
+
+
+def test_declared_calibration_change_is_still_refused_with_a_covering_history(
+    tmp_path, rules, clock
+):
+    history = read_calibration_history(history_db(tmp_path / "history.db", COVERING_ROW_MS))
+    change = DeclaredChange(kind=ChangeKind.CALIBRATION_CHANGED, ts_ms=T0 + 6_000)
+    with (
+        run_store(tmp_path / "run.db", rules, clock, ALIGNED, end_ms=7_501) as store,
+        pytest.raises(ValueError, match="較正の変更"),
+    ):
+        build(store, end_ms=7_501, declared_changes=(change,), calibration_history=history)
+
+
+def test_zero_example_dataset_skips_coverage_and_change_checks(tmp_path, rules, clock):
+    """action の規則ですべて除外された dataset（0094 §2.1）は、被覆が無くても0件で返る。"""
+    no_prior = ((5_000, 11, A), (6_000, 12, B), (7_000, 13, C), (7_500, 14, D))
+    dataset = build_with_history(tmp_path, rules, clock, ticks=no_prior)
+    assert dataset.examples == ()
+    assert excluded(dataset) == zero_excluded(stale=1)
+
+
+def test_zero_example_dataset_still_needs_a_readable_history(tmp_path, rules, clock):
+    """表が無い DB（migration 前）は、0件の dataset でも読み込みで拒否する（0099 §2.7）。"""
+    legacy = tmp_path / "legacy.db"
+    conn = sqlite3.connect(legacy, isolation_level=None)
+    try:
+        migrations.apply_pending(conn, now_ms=0, directory=_migrations_through(tmp_path / "m", 10))
+    finally:
+        conn.close()
+    with pytest.raises(CalibrationHistoryError, match="calibration_activations が無い"):
+        read_calibration_history(legacy)
+
+
+def test_calibration_history_must_be_passed_explicitly(tmp_path, rules, clock):
+    with run_store(tmp_path / "run.db", rules, clock, ALIGNED, end_ms=7_501) as store:
+        builder = ThermalDatasetV2Builder(store)
+        with pytest.raises(TypeError, match="calibration_history"):
+            builder.build(  # type: ignore[call-arg]
+                source_run=source_run(end_ms=7_501), spec=spec_v2(), declared_changes=NO_CHANGES
+            )
+        with pytest.raises(TypeError, match="calibration_history"):
+            builder.build(
+                source_run=source_run(end_ms=7_501),
+                spec=spec_v2(),
+                declared_changes=NO_CHANGES,
+                calibration_history=(),  # type: ignore[arg-type]
             )
 
 
@@ -872,7 +1048,7 @@ def test_exclusion_counts_add_up_over_many_anchors(build_ticks):
     counts = excluded(dataset)
     eligible = [ts for ts, _id, _values in ticks if ts >= 1_000 and ts + 2_000 < 13_500]
     assert sum(counts.values()) + len(dataset.examples) == len(eligible)
-    assert [example.action_ts_ms for example in dataset.examples] == [2_000, 3_000, 5_500]
+    assert [example.action_ts_ms - T0 for example in dataset.examples] == [2_000, 3_000, 5_500]
     assert counts == zero_excluded(
         stale=1, discontinuity=1, in_step_change=2, restart=2, tick_id_gap=3
     )
@@ -940,7 +1116,7 @@ def test_v1_is_not_read_as_v2_and_v2_is_not_read_as_v1(tmp_path, rules, clock, b
 def test_loaded_v2_steps_must_stay_on_the_grid_and_fresh(build_ticks):
     dataset = build_ticks(ALIGNED)
     raw = dataset.model_dump(mode="json")
-    raw["examples"][0]["action_steps"][1]["ts_ms"] = 6_500
+    raw["examples"][0]["action_steps"][1]["ts_ms"] = T0 + 6_500
     with pytest.raises(ValidationError, match="格子"):
         ThermalDatasetV2.model_validate_json(json.dumps(raw))
 
@@ -950,16 +1126,18 @@ def test_loaded_v2_steps_must_stay_on_the_grid_and_fresh(build_ticks):
         ThermalDatasetV2.model_validate_json(json.dumps(raw))
 
     raw = dataset.model_dump(mode="json")
-    raw["examples"][0]["prior_action"]["source_ts_ms"] = 5_000
+    raw["examples"][0]["prior_action"]["source_ts_ms"] = T0 + 5_000
     with pytest.raises(ValidationError, match="厳密に前"):
         ThermalDatasetV2.model_validate_json(json.dumps(raw))
 
 
 def test_v2_split_uses_the_v2_label_end(build_ticks):
     (example,) = build_ticks(ALIGNED).examples
-    assert example.label_end_ms == 7_000
+    assert example.label_end_ms == T0 + 7_000
     # v1 なら label_end は 7100 で validation 境界 7050 を跨ぐが、v2 は 7000 で train に入る
-    split = split_temporally_v2((example,), validation_start_ms=7_050, test_start_ms=9_000)
+    split = split_temporally_v2(
+        (example,), validation_start_ms=T0 + 7_050, test_start_ms=T0 + 9_000
+    )
     assert split.train == (example,)
 
 
@@ -978,7 +1156,7 @@ def test_steps_sharing_a_source_tick_must_agree(build_ticks, field, value):
     )
     (example,) = dataset.examples
     first, second = example.action_steps
-    assert second.source_ts_ms == first.source_ts_ms == 5_000
+    assert second.source_ts_ms == first.source_ts_ms == T0 + 5_000
     assert second.source_tick_id == first.source_tick_id
 
     raw = dataset.model_dump(mode="json")
