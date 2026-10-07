@@ -169,11 +169,23 @@ v1 との違い（規則の正本は [0087](decisions/0087-dataset-v2-action-gri
   CSV の秒の切り捨ての区間 `[floor(ts_ms), ts_ms]`（幅は `csv_export.TIMESTAMP_FORMAT` から導く）の両端を
   変更の時刻とし、宣言との和集合で検査する。example が0件の dataset では被覆と変更の検査をしない（記録の
   読み込みの検証は省かない）。表が無い（migration 0011 の前）・空・検証に外れる記録は「変更なし」と読み替えない
-- **再生の timezone**: v2 の学習に使う再生（`--source replay`）は、日次 CSV を書き出したときと同じ `--timezone` で行う。
-  CSV の時刻はオフセットを持たず、違う timezone では較正の変更の記録（決定記録 [0099](decisions/0099-calibration-change-log.md)）との
-  照合が狂う（照合の仕組みは #237 で決める）
-- **再生する CSV**: v2 の学習には、較正の変更の記録（`--calibration-history-db` に渡す DB）と同じ本番の DB から
-  書き出した CSV だけを使う（束縛の仕組みは #237 で決める）
+- **再生の timezone**: 照合される（決定記録 [0100](decisions/0100-replay-export-binding.md)）。日次 CSV の横の
+  export manifest（`sensors_YYYY-MM-DD.export.json`）の timezone で再生し、全行の絶対時刻の秒の列を export と
+  照合する。`--timezone` を manifest と違う値で明示すると再生を拒否する。DST の曖昧な時刻・存在しない時刻を含む
+  CSV も拒否する。manifest の無い CSV の再生は「照合していない」run になり、v2 には使えない（v1 には使える）
+- **再生する CSV**: 照合される（決定記録 0100 §2.6）。v2 の生成は、`--replay-path` の manifest を
+  `--calibration-history-db` の `csv_exports`（`coldaisle-rollup --export-day` が書いた行）と全欄で照合し、
+  専用 DB の `dataset_source_run` に再生が記録した timezone と `export_binding_sha256` との一致も確かめる。
+  別の DB から export した CSV、書き換えた CSV、manifest の無い CSV、照合していない run は拒否する。
+  `csv_exports` の照合に失敗したら、較正の記録の被覆と変更の検査へ進まない
+- **`replay_bindings`**（v2 の manifest。決定記録 0100 §2.8 / 0111）: source run ごとに、再生の timezone・
+  `export_binding_sha256`・export ごとの `export_id` / `export_record_sha256` / 日の区間 / `csv_sha256` /
+  `row_seconds_sha256` を持つ。CSV の basename は書かない。v1 の manifest と `SourceRun` は変わらない
+- **学習の入口**（`calibration_log.verify_training_export_binding`）: `replay_bindings` の無い dataset を拒否し、
+  各 `export_id` の `csv_exports` の行（較正の記録と同じ読み取り専用の接続・同じ read transaction で
+  `store.export_binding.read_training_records` が読む）から `export_record_sha256` と `export_binding_sha256` を
+  計算し直して照合し、すべての example の期間が束縛した export の日の区間の和に収まることを確かめる。
+  元の manifest と CSV は要らない
 - `control_trace_sha256` は run の全 ControlTick を `seq` 付きで hash する（v2 は anchor 以外の tick も使うため）
 
 ### v2 の CLI（決定記録 0109）
@@ -212,7 +224,8 @@ uv run coldaisle-dataset \
 - 宣言は manifest に書かない（生成の可否にだけ効き、dataset の bytes は変わらない）。構造化ログに、ファイルの
   SHA-256・件数・種別ごとの件数・期間の中の件数を出す。拒否したときは、宣言と記録のどちらで拒否したかを理由に出す
 - `detail` に実機の個体識別子（ROM・ホスト名・絶対パス）を書かない
-- 上の2つの注意（再生の timezone・再生する CSV）は、決定記録 0100 の段 3 が入るまで v2 の CLI にもそのまま当てはまる
+- `--replay-path` の CSV は manifest と一緒に置く（CSV だけを複写すると v2 には使えない）。fingerprint は manifest の
+  bytes も含み（決定記録 0111 §2.2）、manifest と CSV は同じ1回の読み出しで照合する
 
 ## 実データ収集後に残る作業
 

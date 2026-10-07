@@ -5,7 +5,9 @@
   運転中は、覚えた最後の行の時刻より前の sample を保存しない
   （:attr:`IngestCalibrationGate.floor_ms`）
 - **Dataset v2**: 記録が期間を覆うこと（被覆）と、変更の時刻（CSV の秒の切り捨ての区間の両端）
-- **学習の入口**: 期間の後の変更と、較正ファイルと最後の行の食い違いを拒否する（0096 §5 #4）
+- **学習の入口**: 期間の後の変更と、較正ファイルと最後の行の食い違いを拒否する（0096 §5 #4）。
+  dataset に残した export の束縛（``ReplayBindingV2``）を本番の DB の ``csv_exports`` から
+  計算し直して照合し、example の期間が束縛した日に収まることを確かめる（決定記録 0100 §2.8）
 
 ``CalibrationHistory`` は store と合成の起点だけが扱う。``control/model`` へは時刻の列だけを渡す
 （0087 §2.6）。API・AI・control・``coldaisle-calibrate`` はここを使わない（書き手は取り込みだけ）。
@@ -24,6 +26,12 @@ from pathlib import Path
 from coldaisle import logs
 from coldaisle.calibration_offsets import effective_metric_offsets, offsets_sha256
 from coldaisle.clock import Clock
+from coldaisle.control.model.dataset import ThermalDatasetV2
+from coldaisle.csv_export_manifest import (
+    ExportRecord,
+    export_binding_sha256,
+    export_record_sha256,
+)
 from coldaisle.ingest.calibration import Calibration
 from coldaisle.store import SqliteStore
 from coldaisle.store.calibration_history import (
@@ -352,3 +360,96 @@ def verify_training_calibration(
             "（取り込みを再起動していない、またはファイルの取り違え。決定記録 0099 §2.6）"
         )
     return last
+
+
+def training_export_ids(dataset: ThermalDatasetV2) -> tuple[str, ...]:
+    """学習の入口が ``csv_exports`` から読む ``export_id``（dataset の ``ReplayBindingV2`` から）。
+
+    束縛の無い dataset は ``ValueError``（0100 §2.8。v2 の学習には使わない）。
+    """
+    bindings = dataset.manifest.replay_bindings
+    if bindings is None:
+        raise ValueError(
+            "export の束縛（ReplayBindingV2）の無い Dataset v2 では学習しない（決定記録 0100 §2.8）"
+        )
+    return tuple(sorted({export.export_id for b in bindings for export in b.exports}))
+
+
+def verify_training_export_binding(
+    dataset: ThermalDatasetV2, rows: Mapping[str, ExportRecord | None]
+) -> None:
+    """学習の入口の export の照合（決定記録 0100 §2.8）。元の manifest と CSV は要らない。
+
+    ``rows`` は較正の記録と同じ読み取り専用の接続・同じ read transaction で読んだ
+    ``csv_exports`` の行（:func:`~coldaisle.store.export_binding.read_training_records`）。
+
+    - ``ReplayBindingV2`` の無い dataset は拒否する
+    - 各 export の行が無い・行から計算した ``export_record_sha256`` が違う・束縛に写した欄
+      （日の区間・``csv_sha256``・``row_seconds_sha256``・timezone）が行と違う、のどれでも拒否する
+    - 行から ``export_binding_sha256`` を計算し直して一致しなければ拒否する
+    - すべての example の期間 ``[history_start_ms, label_end_ms]`` が、その run に束縛した export の
+      日の区間 ``[day_start_ms, day_end_ms)`` の和に収まらなければ拒否する（ID だけを借りた
+      dataset を、その export が覆わない期間の example で見つける）
+
+    呼び出し側はこれを通ってから :func:`verify_training_calibration` へ進む。
+    """
+    training_export_ids(dataset)
+    bindings = dataset.manifest.replay_bindings
+    assert bindings is not None
+    spans: dict[str, list[tuple[int, int]]] = {}
+    for binding in bindings:
+        bound_rows: list[ExportRecord] = []
+        for export in binding.exports:
+            row = rows.get(export.export_id)
+            if row is None:
+                raise ValueError(
+                    f"csv_exports に export_id の行が無い（決定記録 0100 §2.8）: {export.export_id}"
+                )
+            if export_record_sha256(row) != export.export_record_sha256:
+                raise ValueError(
+                    f"export_record_sha256 が csv_exports の行と一致しない: {export.export_id}"
+                )
+            copied = (
+                row.day_start_ms,
+                row.day_end_ms,
+                row.csv_sha256,
+                row.row_seconds_sha256,
+                row.timezone,
+            )
+            listed = (
+                export.day_start_ms,
+                export.day_end_ms,
+                export.csv_sha256,
+                export.row_seconds_sha256,
+                binding.local_timezone,
+            )
+            if copied != listed:
+                raise ValueError(
+                    f"ReplayBindingV2 の欄が csv_exports の行と違う: {export.export_id}"
+                )
+            bound_rows.append(row)
+        if export_binding_sha256(bound_rows) != binding.export_binding_sha256:
+            raise ValueError(
+                f"export_binding_sha256 が csv_exports の行から計算した値と違う: {binding.run_id}"
+            )
+        spans[binding.run_id] = _merged_spans(
+            [(export.day_start_ms, export.day_end_ms) for export in binding.exports]
+        )
+    for example in dataset.examples:
+        start, end = example.history_start_ms, example.label_end_ms
+        if not any(low <= start and end < high for low, high in spans[example.source_run_id]):
+            raise ValueError(
+                "example の期間が束縛した export の日の区間に収まらない"
+                f"（決定記録 0100 §2.8）: {example.example_id}"
+            )
+
+
+def _merged_spans(spans: list[tuple[int, int]]) -> list[tuple[int, int]]:
+    """``[start, end)`` の区間を、隣り合う・重なるものどうしでつなぐ。"""
+    merged: list[tuple[int, int]] = []
+    for low, high in sorted(spans):
+        if merged and low <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], high))
+        else:
+            merged.append((low, high))
+    return merged

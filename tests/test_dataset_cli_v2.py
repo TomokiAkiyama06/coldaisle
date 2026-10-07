@@ -14,7 +14,8 @@ import coldaisle.dataset as dataset_module
 from coldaisle.control.drift.model import MAX_DECLARED_CHANGES, ChangeKind, DeclaredChange
 from coldaisle.declared_changes import DeclaredChangesError, read_declared_changes
 from coldaisle.drift import DriftEvidenceManifest
-from conftest import QUALITY_RULES_PATH
+from coldaisle.ingest.replay import ReplayExportInputs
+from conftest import QUALITY_RULES_PATH, add_fixture_exports, fixture_export_record
 from test_thermal_dataset_v2 import (
     ALIGNED,
     ARTIFACT_ONE,
@@ -206,10 +207,15 @@ def cli_env(tmp_path, rules, clock, monkeypatch):
     with run_store(db, rules, clock, ALIGNED, end_ms=END_MS):
         pass
     history = history_db(tmp_path / "history.db", COVERING_ROW_MS)
+    add_fixture_exports(history)
     replay = tmp_path / "replay"
     replay.mkdir()
-    # 専用 DB は試験の fixture が仮の fingerprint で bind している
-    monkeypatch.setattr(dataset_module, "replay_fingerprint", lambda path: SHA256)
+    # 専用 DB は試験の fixture が仮の fingerprint と仮の export の束縛で bind している
+    monkeypatch.setattr(
+        dataset_module,
+        "read_replay_export_inputs",
+        lambda path: ReplayExportInputs(source_sha256=SHA256, records=(fixture_export_record(),)),
+    )
     output = tmp_path / "out"
     output.mkdir(mode=0o700)
     output.chmod(0o700)
@@ -363,7 +369,7 @@ def test_invalid_declaration_is_refused_before_opening_any_db(cli_env, tmp_path,
     def must_not_open(*args: object, **kwargs: object) -> None:
         raise AssertionError("宣言の検証より前に DB を開いた")
 
-    monkeypatch.setattr(dataset_module, "read_calibration_history", must_not_open)
+    monkeypatch.setattr(dataset_module, "read_production_records", must_not_open)
     monkeypatch.setattr(dataset_module, "SqliteStore", must_not_open)
     assert dataset_module.main(v2_args(cli_env, declared_changes=str(bad))) == 1
     assert not (cli_env["out"] / ARTIFACT_ONE).exists()
@@ -383,6 +389,7 @@ def test_declared_calibration_change_in_the_period_refuses_generation(cli_env, t
 
 def test_recorded_change_is_reported_as_a_record(cli_env, tmp_path, capsys):
     history = history_db(tmp_path / "changed.db", COVERING_ROW_MS, T0 + 3_000)
+    add_fixture_exports(history)
     assert dataset_module.main(v2_args(cli_env, calibration_history_db=str(history))) == 1
     refused = [line for line in log_lines(capsys.readouterr().err) if "拒否" in line["msg"]]
     assert refused and "記録の行" in str(refused[0]["reason"])

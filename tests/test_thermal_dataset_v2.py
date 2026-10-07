@@ -45,7 +45,8 @@ from coldaisle.store.calibration_history import (
     CalibrationHistoryError,
     read_calibration_history,
 )
-from conftest import QUALITY_RULES_PATH
+from coldaisle.store.export_binding import ExportBinding
+from conftest import QUALITY_RULES_PATH, fixture_export_binding, fixture_replay_binding
 
 CONTROL_FIXTURE = Path(__file__).resolve().parent / "fixtures" / "control_tick_v1.json"
 MODEL_PACKAGE = Path(__file__).resolve().parents[1] / "src" / "coldaisle" / "control" / "model"
@@ -55,6 +56,8 @@ SOURCE_ALIAS = "source-00000000000000000000000000000001"
 ARTIFACT_ONE = "dataset-00000000000000000000000000000001"
 ARTIFACT_TWO = "dataset-00000000000000000000000000000002"
 NO_CHANGES: tuple[DeclaredChange, ...] = ()
+FIXTURE_BINDING = fixture_replay_binding()
+"""専用 DB を bind する仮の export の束縛（決定記録 0100 §2.8）。"""
 T0 = 100_000
 """専用 DB の時刻の起点。筋書きの時刻（tick・readings・source run）はこれからの相対で書く。
 
@@ -175,8 +178,8 @@ def run_store(
             source_kind="replay",
             source_sha256=SHA256,
             at_ms=0,
-            local_timezone=None,
-            export_binding_sha256=None,
+            local_timezone=FIXTURE_BINDING[0],
+            export_binding_sha256=FIXTURE_BINDING[1],
         )
         relative = regular_readings(end_ms) if readings is None else readings
         store.insert_samples(
@@ -197,16 +200,19 @@ def build(
     spec: DatasetSpecV2 | None = None,
     declared_changes: tuple[DeclaredChange, ...] = NO_CHANGES,
     calibration_history: CalibrationHistory | None = None,
+    export_binding: ExportBinding | None = None,
 ) -> ThermalDatasetV2:
+    dedicated = store.connection.execute("PRAGMA database_list").fetchone()[2]
     return ThermalDatasetV2Builder(store).build(
         source_run=source_run(end_ms=end_ms),
         spec=spec_v2() if spec is None else spec,
         declared_changes=declared_changes,
         calibration_history=(
-            covering_history(store.connection.execute("PRAGMA database_list").fetchone()[2])
-            if calibration_history is None
-            else calibration_history
+            covering_history(dedicated) if calibration_history is None else calibration_history
         ),
+        export_binding=covering_export_binding(dedicated)
+        if export_binding is None
+        else export_binding,
     )
 
 
@@ -235,6 +241,14 @@ def covering_history(dedicated_db: str) -> CalibrationHistory:
     if not path.exists():
         history_db(path, COVERING_ROW_MS)
     return read_calibration_history(path)
+
+
+def covering_export_binding(dedicated_db: str) -> ExportBinding:
+    """専用 DB の隣の記録の DB に仮の export の行を足し、照合済みの export を読む（0100 §2.6）。"""
+    path = Path(dedicated_db).with_name(Path(dedicated_db).stem + "-history.db")
+    if not path.exists():
+        history_db(path, COVERING_ROW_MS)
+    return fixture_export_binding(path)[1]
 
 
 def excluded(dataset: ThermalDatasetV2) -> dict[str, int]:
@@ -917,6 +931,7 @@ def test_declared_changes_must_be_passed_explicitly(tmp_path, rules, clock):
                 spec=spec_v2(),
                 declared_changes=[],  # type: ignore[arg-type]
                 calibration_history=history,
+                export_binding=covering_export_binding(str(tmp_path / "decl.db")),
             )
 
 
@@ -1025,6 +1040,7 @@ def test_calibration_history_must_be_passed_explicitly(tmp_path, rules, clock):
                 spec=spec_v2(),
                 declared_changes=NO_CHANGES,
                 calibration_history=(),  # type: ignore[arg-type]
+                export_binding=covering_export_binding(str(tmp_path / "run.db")),
             )
 
 

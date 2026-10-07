@@ -23,6 +23,11 @@ from coldaisle.control.schema import (
     PerZone,
     SafetyState,
 )
+from coldaisle.csv_export_manifest import (
+    EXPORT_ID_PATTERN,
+    SHA256_PATTERN,
+    export_binding_sha256_of_pairs,
+)
 from coldaisle.store.models import Quality
 
 DATASET_SCHEMA_VERSION: Literal[1] = 1
@@ -720,6 +725,53 @@ class DatasetExampleV2(_Frozen):
         return self
 
 
+class ReplayExportV2(_Frozen):
+    """source run の入力の1つの export（日次 CSV）の記録（決定記録 0100 §2.8）。
+
+    CSV の basename は書かない（0031 §2.3。digest の入力にだけ使う）。
+    """
+
+    export_id: str = Field(pattern=EXPORT_ID_PATTERN)
+    export_record_sha256: str = Field(pattern=SHA256_PATTERN)
+    day_start_ms: int = Field(ge=0)
+    day_end_ms: int = Field(gt=0)
+    csv_sha256: str = Field(pattern=SHA256_PATTERN)
+    row_seconds_sha256: str = Field(pattern=SHA256_PATTERN)
+
+    @model_validator(mode="after")
+    def _valid_day(self) -> Self:
+        if self.day_end_ms <= self.day_start_ms:
+            raise ValueError("export の day_end_ms は day_start_ms より後でなければならない")
+        return self
+
+
+class ReplayBindingV2(_Frozen):
+    """Dataset v2 専用の、source run と入力の export の束縛（決定記録 0100 §2.8 / §5 #7 / §5 #15）。
+
+    v1 と共有する ``SourceRun`` には足さない（版を上げずに v1 の artifact の形が変わるため）。
+    builder が ``--replay-path`` の manifest・専用 DB の ``dataset_source_run``・本番の DB の
+    ``csv_exports`` を同じ呼び出しの中で照合してから書く。学習の入口は元の manifest 無しで、
+    ``csv_exports`` の行から ``export_record_sha256`` を計算し直して照合する。
+    """
+
+    run_id: RunAlias
+    local_timezone: str = Field(min_length=1)
+    export_binding_sha256: str = Field(pattern=SHA256_PATTERN)
+    exports: tuple[ReplayExportV2, ...] = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def _binding_matches_exports(self) -> Self:
+        ids = [export.export_id for export in self.exports]
+        if ids != sorted(set(ids)):
+            raise ValueError("ReplayBindingV2 の exports は export_id の順に重複なく並べる")
+        recomputed = export_binding_sha256_of_pairs(
+            (export.export_id, export.export_record_sha256) for export in self.exports
+        )
+        if recomputed != self.export_binding_sha256:
+            raise ValueError("ReplayBindingV2 の export_binding_sha256 が exports と一致しない")
+        return self
+
+
 class DatasetManifestV2(_Frozen):
     """Dataset v2 の再生成条件と、action の規則で除いた件数。"""
 
@@ -732,6 +784,22 @@ class DatasetManifestV2(_Frozen):
     examples_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     example_count: int = Field(ge=0)
     excluded: ActionExclusionCounts
+    replay_bindings: tuple[ReplayBindingV2, ...] | None = None
+    """source run ごとの export の束縛（決定記録 0100 §2.8）。
+
+    ``None`` は束縛の無い dataset（0100 の段 3 より前に作った、または照合していない run）。
+    読み込みは拒否しないが、v2 の builder は書かずに作らず、学習の入口は拒否する。
+    """
+
+    @model_validator(mode="after")
+    def _one_binding_per_source_run(self) -> Self:
+        if self.replay_bindings is None:
+            return self
+        bound = [binding.run_id for binding in self.replay_bindings]
+        runs = [run.run_id for run in self.source_runs]
+        if sorted(bound) != sorted(runs) or len(set(bound)) != len(bound):
+            raise ValueError("replay_bindings は source run ごとに1つずつ持つ")
+        return self
 
 
 class ThermalDatasetV2(_Frozen):

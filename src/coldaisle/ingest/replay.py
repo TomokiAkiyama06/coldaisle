@@ -178,6 +178,54 @@ class _SnapshotSegment(io.RawIOBase):
         return len(chunk)
 
 
+@dataclass(frozen=True)
+class ReplayExportInputs:
+    """再生の入力の fingerprint と、その入力の manifest（同じ1回の読み出しから。0100 §2.8）。"""
+
+    source_sha256: str
+    """入力全体の fingerprint（``replay_sha256`` と同じ値）。"""
+    records: tuple[ExportRecord, ...] | None
+    """各 CSV の manifest。manifest の無い入力は ``None``（照合していない入力）。"""
+
+
+def read_replay_export_inputs(path: Path) -> ReplayExportInputs:
+    """Dataset の生成で ``--replay-path`` を読み、fingerprint と manifest を同じ bytes から得る。
+
+    0100 §2.8 の (a)(b): fingerprint は manifest の bytes を含み、manifest の ``csv_name`` と
+    ``csv_sha256`` が対の CSV と一致することをここで確かめる。一部にだけ manifest がある入力、
+    形の壊れた manifest、``export_id`` の重複は :class:`ReplayBindingError`。行の照合
+    （§2.3 の 5 / 6）は再生が済ませており、その結果は専用 DB の ``dataset_source_run`` に
+    残っている（呼び出し側が ``export_binding_sha256`` で照合する）。
+    """
+    files = csv_files(path)
+    if not files:
+        raise ValueError(f"CSV が見つからない: {path}")
+    manifests = _read_manifests(files)
+    _refuse_partial_manifests(files, manifests)
+    snapshot = _snapshot_and_hash(files, manifests, make_snapshot=False)
+    if all(manifest is None for manifest in manifests):
+        return ReplayExportInputs(source_sha256=snapshot.digest, records=None)
+    records: list[ExportRecord] = []
+    for index, manifest in enumerate(manifests):
+        assert manifest is not None
+        name = files[index].name
+        try:
+            record = ExportRecord.from_manifest_bytes(manifest.raw)
+        except ValueError as exc:
+            raise ReplayBindingError(name, "manifest_format", str(exc)) from exc
+        if record.csv_name != name:
+            raise ReplayBindingError(
+                name, "csv_name", f"manifest の csv_name が違う: {record.csv_name}"
+            )
+        if record.csv_sha256 != snapshot.csv_sha256[index]:
+            raise ReplayBindingError(name, "csv_sha256", "CSV の bytes が manifest と違う")
+        records.append(record)
+    ids = [record.export_id for record in records]
+    if len(set(ids)) != len(ids):
+        raise ReplayBindingError(files[0].name, "export_id_duplicate", "export_id が重複している")
+    return ReplayExportInputs(source_sha256=snapshot.digest, records=tuple(records))
+
+
 @dataclass
 class _Snapshot:
     """入力の bytes の写し。照合も取り込みもここから読む（0031 §2.3 / 0100 §2.3）。"""
