@@ -131,7 +131,11 @@ DB を作ります。証拠として読む DB をそれで開くと、**古い r
   `air_balance_config_sha256` と、消費した tick の `runtime.config` の hash を評価時の
   `air-balance.yaml` / `fan-hardware.yaml` と突き合わせた件数（`air_balance_trace_binding` /
   `fan_hardware_trace_binding` の `matched` / `mismatched` / `missing`）を持つ。一致しない tick を
-  除外せずに数え、1件でも不一致・欠落があれば報告は出るが昇格の証拠にはならない
+  除外せずに数え、1件でも不一致・欠落があれば報告は出るが昇格の証拠にはならない。
+  報告 v4（#81 / 決定記録 0078 §2.5）で、`runtime.config.policy_sha256` を評価時の `fan-policy.yaml` と
+  突き合わせた件数（`fan_policy_trace_binding`）を足した。Air Balance の協調の `mode` だけを変えた
+  設定でも、変える前に記録した tick は `mismatched` になり、`conditions_sha256` にも入る。
+  runtime を持たない tick は `missing`。v3 以前の報告は読めるが、昇格の証拠にはならない
 - 適用 arm の `gaps` の `air_balance_disabled` は、Air Balance を無効（未校正）で回していた tick が
   あったこと。`no_estimated_flow`（有効だったが推定できなかった）とは別に数える
 - `segments[]` — run × 区間。`role` は `calibration` / `holdout`。`purged_outcomes` は

@@ -25,7 +25,7 @@ from coldaisle.control.schema import (
     Zone,
 )
 
-EVALUATION_REPORT_SCHEMA_VERSION: Literal[3] = 3
+EVALUATION_REPORT_SCHEMA_VERSION: Literal[4] = 4
 """報告1つの形の版。**欄の意味を変えたら上げる。**
 
 - v2（#159）: 適用 arm の `model_artifacts` / `unbound_attested_ticks`。
@@ -39,6 +39,11 @@ EVALUATION_REPORT_SCHEMA_VERSION: Literal[3] = 3
   trace の設定 hash の突き合わせ（`air_balance_trace_binding` / `fan_hardware_trace_binding`）。
   **v3 ではすべて必須、v2 以前は持たない。** v2 以前は Air Balance の設定を言えないので、
   読めるが昇格の証拠には使えない（#92 が拒む）
+- v4（#81 / 決定記録 0078 §2.5）: provenance の `fan_policy_trace_binding`（消費した tick の
+  `runtime.config.policy_sha256` と評価時の `fan-policy.yaml` の hash の突き合わせ）。
+  **v4 では必須、v3 以前は持たない。** v3 以前は、消費した trace がどの `fan-policy.yaml`
+  （Air Balance の協調の `mode` を含む）で記録されたかを言えないので、読めるが昇格の証拠には
+  使えない（#92 が拒む）
 """
 
 
@@ -716,6 +721,14 @@ class EvaluationProvenance(_Frozen):
         default=None, exclude_if=lambda value: value is None
     )
     """消費した tick の ``fan_hardware_sha256`` と評価時の hash の突き合わせ（v3）。"""
+    fan_policy_trace_binding: TraceConfigBinding | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
+    """消費した tick の ``policy_sha256`` と評価時の hash の突き合わせ（v4。決定記録 0078 §2.5）。
+
+    ``mode: off`` で記録した trace を ``mode: apply`` の設定で評価し直した報告が、raw baseline の
+    証拠で coordinated baseline の証拠を名乗れないようにする。
+    """
 
     @model_validator(mode="after")
     def _trace_bindings_cover_every_consumed_trace(self) -> Self:
@@ -726,6 +739,7 @@ class EvaluationProvenance(_Frozen):
         for name, binding in (
             ("air_balance_trace_binding", self.air_balance_trace_binding),
             ("fan_hardware_trace_binding", self.fan_hardware_trace_binding),
+            ("fan_policy_trace_binding", self.fan_policy_trace_binding),
         ):
             if binding is not None and binding.total != consumed:
                 raise ValueError(
@@ -754,6 +768,7 @@ class EvaluationProvenance(_Frozen):
             self.air_balance_config_sha256 is None
             and self.air_balance_trace_binding is None
             and self.fan_hardware_trace_binding is None
+            and self.fan_policy_trace_binding is None
         )
 
 
@@ -836,7 +851,7 @@ class EvaluationReport(_Frozen):
     **同じ入力からは同じ bytes になる。** 生成時刻を持たず、時刻はすべて証拠から来る。
     """
 
-    schema_version: Literal[1, 2, 3]
+    schema_version: Literal[1, 2, 3, 4]
     """報告の形の版。**入力では必須で、既定値を持たない**（codex #4092017585）。
 
     既定値があると、既定値を省いて書き出した v1 の報告（`exclude_defaults` など）が
@@ -857,6 +872,14 @@ class EvaluationReport(_Frozen):
             raise ValueError("v3 の報告には air-balance.yaml の hash と trace の突き合わせが要る")
         if self.schema_version < 3 and not self.provenance.config_unbound:
             raise ValueError("設定の突き合わせを記録する報告は schema version 3 にする")
+        if self.schema_version >= 4 and self.provenance.fan_policy_trace_binding is None:
+            # v4 を名乗りながら、消費した trace の fan-policy.yaml を言えない報告を作らない
+            # （決定記録 0078 §2.5）。
+            raise ValueError("v4 の報告には fan-policy.yaml の trace の突き合わせが要る")
+        if self.schema_version < 4 and self.provenance.fan_policy_trace_binding is not None:
+            raise ValueError(
+                "fan-policy.yaml の trace の突き合わせを記録する報告は schema version 4 にする"
+            )
         previous: tuple[str, int] | None = None
         for segment in self.segments:
             current = (segment.run_id, segment.index)

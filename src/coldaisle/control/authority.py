@@ -161,7 +161,7 @@ _LOCK_FILENAME = ".authority.lock"
 _MAX_JOURNAL_BYTES = 4 * 1024 * 1024
 """journal の読み書きに許す大きさ。資源の境界であり、調整値ではない。"""
 
-MIN_EVIDENCE_REPORT_SCHEMA_VERSION = 3
+MIN_EVIDENCE_REPORT_SCHEMA_VERSION = 4
 """昇格の証拠に使える Offline Evaluation 報告の最小 version（#159 / 決定記録 0059 §2.5）。
 
 v1 は適用 arm の `model_artifacts` / `unbound_attested_ticks` を持たない。欄の無さが
@@ -170,6 +170,10 @@ v1 は適用 arm の `model_artifacts` / `unbound_attested_ticks` を持たな�
 
 v2 は `air-balance.yaml` の設定と、消費した trace の設定 hash の突き合わせを言えない
 （#81 / 決定記録 0073 §2.6）。同じ理由で昇格の根拠にしない。
+
+v3 は、消費した trace がどの `fan-policy.yaml` で記録されたかを言えない
+（#81 / 決定記録 0078 §2.5）。Air Balance の協調の `mode` が違う trace から作った報告が、
+いまの設定の証拠を名乗れてしまうので、同じく昇格の根拠にしない。
 """
 
 MAX_JOURNAL_EVENTS = 4_096
@@ -1283,6 +1287,10 @@ class AuthorityStore:
         for name, binding in (
             ("air-balance.yaml", provenance.air_balance_trace_binding),
             ("fan-hardware.yaml", provenance.fan_hardware_trace_binding),
+            # **fan-policy.yaml も同じ規則で束縛する**（決定記録 0078 §2.5）。`mode: off` で
+            # 記録した trace を `mode: apply` の設定で評価し直した報告に、coordinated baseline の
+            # 証拠を名乗らせない。
+            ("fan-policy.yaml", provenance.fan_policy_trace_binding),
         ):
             if binding is None or not binding.complete_for(provenance.consumed_traces):
                 raise AuthorityEvidenceError(
