@@ -99,6 +99,7 @@ __all__ = [
     "AuthorityEvidenceError",
     "AuthorityJournal",
     "AuthorityNotDurableError",
+    "AuthorityRegistryUnavailableError",
     "AuthorityRuntime",
     "AuthorityStage",
     "AuthorityStageSource",
@@ -208,6 +209,15 @@ class AuthorityStateError(AuthorityError):
 
 class AuthorityStoreError(AuthorityError):
     """journal を安全に読み書きできない（path・権限・I/O）。"""
+
+
+class AuthorityRegistryUnavailableError(AuthorityStoreError):
+    """Model Registry を読めない（権限・root や lock が無い・形が違う・壊れた snapshot）。
+
+    **証拠の拒否（`AuthorityEvidenceError`）と分ける**（決定記録 0104 §5 の 11）。承認と証拠が
+    正しくても導入の誤りで止まったことを、`coldaisle-authority` が終了コード 1・`registry_error`
+    で伝えられるようにする。昇格は通さない（どちらも上げる向きには働かない）。
+    """
 
 
 class AuthorityNotDurableError(AuthorityStoreError):
@@ -1155,7 +1165,9 @@ class AuthorityStore:
                 production = self._production_of(snapshot, artifact_kind)
             except (OSError, ValueError, ModelRegistryError) as error:
                 # Registry を読めないことを「production が無い」と読み替えない。止める。
-                raise AuthorityEvidenceError("Model Registry の状態を読めない") from error
+                raise AuthorityRegistryUnavailableError(
+                    "Model Registry の状態を読めない"
+                ) from error
             # **yield を try の外に置く。** 中に入れると、authority 側の OSError まで
             # 「Registry を読めない」として報告してしまう（codex #4056992240）。
             # どの部品が落ちたのかを、その部品の理由で残す。
@@ -1169,7 +1181,7 @@ class AuthorityStore:
         try:
             snapshot = registry.inspect()
         except (OSError, ValueError, ModelRegistryError) as error:
-            raise AuthorityEvidenceError("Model Registry の状態を読めない") from error
+            raise AuthorityRegistryUnavailableError("Model Registry の状態を読めない") from error
         return AuthorityStore._production_of(snapshot, artifact_kind)
 
     @staticmethod

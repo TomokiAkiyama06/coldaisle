@@ -60,6 +60,19 @@ REGISTRY_STATE_FILENAME = "registry.json"
 `stat` の同一性で先に絞ってから読み直して確かめる（決定記録 0077 §2.6）。"""
 _STATE_FILENAME = REGISTRY_STATE_FILENAME
 _LOCK_FILENAME = ".registry.lock"
+_SHARED_FILE_MODE = 0o640
+"""Registry が作るファイル（`registry.json`・artifact）の mode（決定記録 0104 §2.3）。
+
+`umask` に依らないよう、作った直後に `fchmod` する。`0600` のままだと、書き手が1回書いた
+時点で `registry.json` が書き手だけのファイルに置き換わり、グループや ACL で渡した読み取り
+（承認者・fand）が効かなくなる（ACL があっても、作成時の mode が mask を 0 にする）。
+"""
+_DIRECTORY_MODE_MASK = 0o2770
+"""root の下に作るディレクトリは、親の permission の bit をこの mask で写す（0104 §2.3）。
+
+共有の root（`2770`）の下では `2770`、開発用の `0700` の root の下では `0700` のままになる。
+other には何も渡さない。
+"""
 _ARTIFACT_FILENAME = "artifact.payload"
 _READ_CHUNK_BYTES = 1024 * 1024
 # One JSON lexical unit relevant to structure: a string, a bracket, or a scalar run.
@@ -1057,6 +1070,10 @@ class RegistryCorruptError(ModelRegistryError):
     """The registry snapshot cannot be trusted."""
 
 
+class RegistrySharedRootError(ModelRegistryError):
+    """共有の root モードで、root・lock が無い、または root の形が導入手順と違う（0104 §2.4）。"""
+
+
 class UnsafeRegistryPathError(ModelRegistryError):
     """A symlink or non-regular registry path could escape the registry root."""
 
@@ -1156,13 +1173,28 @@ class ModelRegistry:
         clock: Clock | None = None,
         *,
         limits: ModelRegistryLimits,
+        require_shared_root: bool = False,
     ) -> None:
+        """``require_shared_root`` は、Registry を**書かない**人が使う指定である。
+
+        決定記録 0104 §2.4。
+        いまの使い手は `coldaisle-authority raise`（承認者）だけ。root も lock も**作らず**
+        （無ければ `RegistrySharedRootError`）、root を開くたびに「ディレクトリ・other に権限が
+        無い・setgid 付き」であることを確かめ、lock は `O_RDONLY` で開いて `flock` だけを取る。
+        承認者が Registry を作ると、承認者の uid が所有する `0700` / `0600` の root・lock ができ、
+        書き手が lock を取れなくなる。Linux の `flock(2)` は fd の開き方に依らず排他 lock を取れる
+        （Registry をローカルのファイルシステムに置く前提。NFS に置かない）。
+
+        既定（False）では、従来どおり root が無ければ作る（開発用の `var/model-registry`）。
+        ただし root が既にあって setgid 付き（共有の root）なら、lock は作らない（0104 §2.4）。
+        """
         # Bind relative roots to the construction-time working directory without resolving
         # symlinks.  Each component is opened with O_NOFOLLOW below, so an ancestor symlink
         # cannot silently move the registry outside the configured path.
         self._root = Path(os.path.abspath(root))
         self._clock = clock or WallClock()
         self._limits = limits
+        self._require_shared_root = require_shared_root
 
     def inspect(self) -> RegistrySnapshot:
         """Read the current snapshot without changing filesystem state."""
@@ -1848,6 +1880,8 @@ class ModelRegistry:
 
     @contextmanager
     def _open_root(self, *, create: bool) -> Iterator[int | None]:
+        # 共有の root モードは root を作らない（決定記録 0104 §2.4）。
+        create = create and not self._require_shared_root
         flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
         try:
             anchor_fd = os.open(self._root.anchor, flags)
@@ -1855,14 +1889,21 @@ class ModelRegistry:
             raise UnsafeRegistryPathError("registry root のanchorを開けない") from exc
         try:
             try:
+                # root そのもの（と祖先）は従来どおり `0700` で作る。親の mode を写すのは
+                # root の下だけ（祖先の `0755` などを Registry の root へ写さない）。
                 root_fd = self._open_directory_chain(
                     anchor_fd,
                     tuple(self._root.parts[1:]),
                     create=create,
+                    inherit_mode=False,
                 )
             except FileNotFoundError:
                 if create:
                     raise UnsafeRegistryPathError("registry root を作成できない") from None
+                if self._require_shared_root:
+                    raise RegistrySharedRootError(
+                        "registry の root が無い（承認者の側からは作らない。導入手順で作る）"
+                    ) from None
                 yield None
                 return
             except OSError as exc:
@@ -1872,19 +1913,70 @@ class ModelRegistry:
         finally:
             os.close(anchor_fd)
         try:
+            if self._require_shared_root:
+                self._check_shared_root(root_fd)
             yield root_fd
         finally:
             os.close(root_fd)
+
+    @staticmethod
+    def _root_is_shared(root_fd: int) -> bool:
+        """root が setgid 付き（導入手順で作った共有の root）か。"""
+        return bool(os.fstat(root_fd).st_mode & stat.S_ISGID)
+
+    @staticmethod
+    def _check_shared_root(root_fd: int) -> None:
+        """共有の root の形を、lock を取る前・読む前に確かめる（決定記録 0104 §2.4）。
+
+        authority のディレクトリ（0086 §2.4）と同じ確認。導入の誤りを、Registry を壊す前・
+        承認を検証する前に見つける。
+        """
+        try:
+            mode = os.fstat(root_fd).st_mode
+        except OSError as exc:
+            raise RegistrySharedRootError("registry の root の mode を読めない") from exc
+        if not stat.S_ISDIR(mode):
+            raise RegistrySharedRootError("registry の root がディレクトリではない")
+        if mode & stat.S_IRWXO:
+            raise RegistrySharedRootError(
+                f"registry の root に other の権限がある（mode={stat.S_IMODE(mode):04o}）"
+            )
+        if not mode & stat.S_ISGID:
+            raise RegistrySharedRootError(
+                f"registry の root に setgid が無い（mode={stat.S_IMODE(mode):04o}）"
+            )
+
+    def _open_lock(self, root_fd: int) -> int:
+        """lock を開く。**共有の root では作らない**（決定記録 0104 §2.4）。
+
+        - 共有の root モード（承認者）: `O_RDONLY`・作らない。`flock` だけを取る
+        - 既定で、root が setgid 付き（共有の root）: `O_RDWR`・作らない。消えた lock を書き手が
+          `0600` で作り直すと、承認者が `flock` を取れなくなる
+        - 既定で、それ以外（開発用）: 従来どおり無ければ `0600` で作る
+        """
+        if self._require_shared_root:
+            flags = os.O_RDONLY | os.O_NOFOLLOW
+        elif self._root_is_shared(root_fd):
+            flags = os.O_RDWR | os.O_NOFOLLOW
+        else:
+            flags = os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW
+        # FIFO に置き換えられた lock を `O_RDONLY` で開くと書き手を待って止まり、続く `fstat` の
+        # 種類の確認まで届かない（codex P2。PR #248）。`flock` の待ちは `O_NONBLOCK` に依らない。
+        flags |= os.O_NONBLOCK
+        try:
+            return os.open(_LOCK_FILENAME, flags, 0o600, dir_fd=root_fd)
+        except FileNotFoundError:
+            raise RegistrySharedRootError(
+                "registry lock が無い（共有の root では作らない。導入手順で作る）"
+            ) from None
+        except OSError as exc:
+            raise UnsafeRegistryPathError("registry lock がsymlinkである") from exc
 
     @contextmanager
     def _exclusive_lock(self) -> Iterator[int]:
         with self._open_root(create=True) as root_fd:
             assert root_fd is not None
-            flags = os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW
-            try:
-                lock_fd = os.open(_LOCK_FILENAME, flags, 0o600, dir_fd=root_fd)
-            except OSError as exc:
-                raise UnsafeRegistryPathError("registry lock がsymlinkである") from exc
+            lock_fd = self._open_lock(root_fd)
             try:
                 if not stat.S_ISREG(os.fstat(lock_fd).st_mode):
                     raise UnsafeRegistryPathError("registry lock がregular fileではない")
@@ -1897,7 +1989,19 @@ class ModelRegistry:
                 os.close(lock_fd)
 
     @staticmethod
-    def _open_directory_chain(root_fd: int, parts: tuple[str, ...], *, create: bool) -> int:
+    def _open_directory_chain(
+        root_fd: int,
+        parts: tuple[str, ...],
+        *,
+        create: bool,
+        inherit_mode: bool = True,
+    ) -> int:
+        """``parts`` を `O_NOFOLLOW` で1つずつ開く。
+
+        ``inherit_mode`` が真なら、新しく作ったディレクトリの permission の bit を親から
+        `_DIRECTORY_MODE_MASK` で写す（決定記録 0104 §2.3。`umask` に依らない）。root の下で
+        使う。root そのものと祖先を作るときは偽にして、従来どおり `0700` で作る。
+        """
         current_fd = os.dup(root_fd)
         try:
             for part in parts:
@@ -1912,12 +2016,24 @@ class ModelRegistry:
                     try:
                         os.mkdir(part, 0o700, dir_fd=current_fd)
                     except FileExistsError:
-                        pass
+                        created = False
                     else:
-                        # The directory entry lives in the parent; without this fsync a
-                        # crash can drop it even after an artifact / snapshot fsync inside.
-                        os.fsync(current_fd)
+                        created = True
                     child_fd = os.open(part, flags, dir_fd=current_fd)
+                    if created:
+                        try:
+                            ModelRegistry._finish_created_directory(
+                                current_fd, child_fd, inherit_mode=inherit_mode
+                            )
+                        except OSError as exc:
+                            os.close(child_fd)
+                            raise UnsafeRegistryPathError(
+                                "registry の作ったディレクトリの mode を決められない、"
+                                f"または永続化できない: {part}"
+                            ) from exc
+                        except BaseException:
+                            os.close(child_fd)
+                            raise
                 except OSError as exc:
                     raise UnsafeRegistryPathError(
                         f"registry path component がsymlinkまたはdirectoryではない: {part}"
@@ -1928,6 +2044,24 @@ class ModelRegistry:
         except BaseException:
             os.close(current_fd)
             raise
+
+    @staticmethod
+    def _finish_created_directory(parent_fd: int, child_fd: int, *, inherit_mode: bool) -> None:
+        """新しく作ったディレクトリの mode を決め、子と親を fsync する（決定記録 0104 §2.3）。"""
+        # **mode を決めてから、子と親を fsync する**（codex P2。PR #248）。親を先に fsync すると、
+        # mode を直す前に止まったとき、継いだ setgid の付いた root が残り、やり直しでも直らない。
+        if inherit_mode:
+            parent_mode = stat.S_IMODE(os.fstat(parent_fd).st_mode)
+            os.fchmod(child_fd, parent_mode & _DIRECTORY_MODE_MASK)
+        else:
+            # setgid の親の下では Linux が `S_ISGID` を子へ継ぐ。そのままだと、いま作った
+            # 開発用の root を「導入手順で作った共有の root」と取り違え、lock を作らずに止まる
+            # （codex P2。PR #248）。
+            os.fchmod(child_fd, 0o700)
+        os.fsync(child_fd)
+        # The directory entry lives in the parent; without this fsync a crash can drop it even
+        # after an artifact / snapshot fsync inside.
+        os.fsync(parent_fd)
 
     @staticmethod
     def _read_regular_file(
@@ -1985,6 +2119,9 @@ class ModelRegistry:
         temporary_fd = os.open(temporary_name, flags, 0o600, dir_fd=directory_fd)
         try:
             try:
+                # 決定記録 0104 §2.3: `umask` に依らず `0640`。置き換えた後に読み手（承認者・
+                # fand）が読めるように、内容を書く前に mode を決める。
+                os.fchmod(temporary_fd, _SHARED_FILE_MODE)
                 remaining = memoryview(payload)
                 while remaining:
                     written = os.write(temporary_fd, remaining)
