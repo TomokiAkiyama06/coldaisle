@@ -118,12 +118,21 @@ manifest の欄（仮。実装の PR で型と golden vector を固定する）:
 
 ### 2.3 再生の照合（dataset 用の再生）
 
-`--dataset-run-alias` を付けた再生（0031 §2.3。dataset の専用 DB を作る再生）では、`ReplaySource` の constructor が
-**DB に何かを書く前**（`bind_dataset_source_run` の前）に次をすべて確かめ、1つでも満たさなければ拒否する
-（`SystemExit`。DB は空のまま残り、作り直せる）。
+`--dataset-run-alias` を付けた再生（0031 §2.3。dataset の専用 DB を作る再生）では、まず入力の manifest の有無で
+2つに分ける。再生の時点ではどの版の dataset を作るかが決まっていない（builder を選ぶのは後の `coldaisle-dataset`）ので、
+manifest の無い入力を再生で拒否すると Dataset v1 の再生成まで止まる（PR #238 の Codex の指摘）。
 
-1. 入力のすべての CSV に、対になる manifest がある。manifest は CSV と同じく `O_NOFOLLOW` で開き、regular file で
-   なければ拒否する。CSV と同じ snapshot に取り込む（0031 §2.3 の「path を再 open しない」を manifest にも当てる）
+- **すべての CSV に manifest が無い**: 従来どおり `--timezone` で再生し、`dataset_source_run` には「照合していない」
+  （timezone と `export_id` の digest を `NULL`）として bind する。v1 の builder は従来どおり使える。**v2 の builder と
+  学習の入口は拒否する**（§2.8）。いまの v1 の手順と `test_replay_can_regenerate_the_same_dataset_without_hardware` は
+  そのまま通る
+- **一部の CSV にだけ manifest がある**: 拒否する（照合した入力としていない入力を1つの run に混ぜない）
+- **すべての CSV に manifest がある**: `ReplaySource` の constructor が**DB に何かを書く前**
+  （`bind_dataset_source_run` の前）に次をすべて確かめ、1つでも満たさなければ拒否する（`SystemExit`。DB は空のまま
+  残り、作り直せる）
+
+1. 各 manifest を CSV と同じく `O_NOFOLLOW` で開き、regular file でなければ拒否する。CSV と同じ snapshot に取り込む
+   （0031 §2.3 の「path を再 open しない」を manifest にも当てる）
 2. manifest の `csv_name` と `csv_sha256` が対の CSV と一致する
 3. すべての manifest の `timezone` が同じ文字列である（1 run に1つの timezone。§5 #5）
 4. 再生に使う timezone は**manifest の `timezone`**とする。`--timezone` を明示して、それが manifest と
@@ -142,7 +151,10 @@ manifest の欄（仮。実装の PR で型と golden vector を固定する）:
 
 dataset 用でない再生（デバッグや画面の確認。0010）は次のとおりとする。
 
-- manifest が**ある** CSV は、上の 2〜6 を同じく行い、食い違えば拒否する（§5 #6）
+- manifest が**ある** CSV は、上の 1〜6 を同じく行い、食い違えば拒否する（§5 #6）。dataset 用でなくても、
+  照合した bytes と取り込む bytes が同じであるよう、manifest のある入力では CSV と manifest の snapshot を取り、
+  照合も取り込みもその snapshot から読む（いまの通常の再生は取り込みのときに path を開き直すので、照合の後に
+  CSV を差し替えられると、照合を通っていない bytes が入る。PR #238 の Codex の指摘）
 - manifest が**無い** CSV は、従来どおり `--timezone` で当てはめる（0010 §2.7 のまま）。起動時に
   「timezone を照合していない」警告を1回出す
 
@@ -194,7 +206,8 @@ dataset 用でない再生（デバッグや画面の確認。0010）は次の�
 ### 2.7 timezone と出どころの情報の無い CSV
 
 - manifest の無い CSV（試作時の `~/server_sensor_logs` の記録、本記録の実装前に書いた日次 CSV、rename の途中で
-  落ちた CSV）は、**dataset 用の再生では拒否する**（§2.3 の 1）。したがって **v2 の学習には使わない**
+  落ちた CSV）は、dataset 用の再生では「照合していない」run として bind され（§2.3）、**v2 の builder と学習の入口が
+  拒否する**。したがって **v2 の学習には使わない**。v1 には従来どおり使える
 - manifest はあるが `csv_exports` の行が無い CSV（段 1 の前の DB から export したもの、別の DB から export したもの）は、
   dataset 用の再生は通るが **Dataset v2 の生成で拒否する**（§2.6）
 - 人が後から manifest や `csv_exports` の行を書いて足す経路は作らない（「この CSV はこの timezone で、この DB から
@@ -209,8 +222,9 @@ dataset 用でない再生（デバッグや画面の確認。0010）は次の�
   manifest を、basename・長さ・内容で hash する）。同じ CSV でも manifest（timezone・`export_id`）が違えば
   fingerprint が変わる。fingerprint の規則に版を付け、manifest の無い入力の値はいまの規則のまま変えない（§5 #7）
 - **`dataset_source_run`**: bind のときに、再生に使った timezone と、入力の `export_id` の集合の digest（`export_id` を
-  並べ替えて連結した列の SHA-256）も記録する（段 2。migration で列を足す）。builder は DB の値と、`--replay-path` の
-  manifest から計算した値の一致を `_validate_dedicated_source_db` で求める
+  並べ替えて連結した列の SHA-256）も記録する（段 2。migration で列を足す。manifest の無い run は両方 `NULL`。§2.3）。
+  builder は DB の値と、`--replay-path` の manifest から計算した値（manifest が無ければ `NULL`）の一致を
+  `_validate_dedicated_source_db` で求める。v1 の builder は `NULL` を受け入れ、v2 の builder は拒否する
 - **Dataset v2 の manifest**: v1 と共有している `SourceRun` には**足さない**。v1 の `DatasetManifest` と v2 の
   `DatasetManifestV2` は同じ `SourceRun` を埋め込み、`model_dump_json()` で書くので、`SourceRun` に欄を足すと
   版を上げないまま v1 の artifact に知らない欄が入り、`extra="forbid"` の古い v1 の reader が拒否する
@@ -260,7 +274,11 @@ export（段 1）:
 
 再生（段 2）:
 
-- dataset 用の再生で、manifest の無い CSV が1つでもあれば、`dataset_source_run` に行を書く前に拒否する（DB は空）
+- dataset 用の再生で、manifest のある CSV と無い CSV が混ざれば、`dataset_source_run` に行を書く前に拒否する（DB は空）
+- dataset 用の再生で、すべての CSV に manifest が無ければ「照合していない」run として bind し、v1 の dataset は従来どおり
+  再生成できる（`test_replay_can_regenerate_the_same_dataset_without_hardware` が通る）
+- 通常の再生でも、manifest のある入力は snapshot から照合し取り込む。照合の後に CSV の path を差し替えても、取り込む
+  bytes は照合した bytes のまま
 - `--timezone` を manifest と違う値で明示すると拒否する。同じ値、または省略なら通る
 - manifest の `timezone` だけを書き換える（CSV はそのまま）と、`row_seconds_sha256` の照合で拒否する
 - `csv_sha256` の食い違い、`csv_name` の食い違い、manifest が symlink・FIFO、`export_id` の重複なら拒否する
@@ -281,7 +299,7 @@ Dataset v2 の生成（段 3）:
 - `csv_exports` の行の欄が manifest と1つでも違えば拒否する。行が無ければ拒否する
 - `csv_exports` の照合に失敗したら、被覆と変更の検査へ進まない
 - `dataset_source_run` の timezone・`export_id` の digest が manifest から計算した値と違えば拒否する
-- v2 の builder は `ReplayBindingV2` の無い source run を拒否する。v1 の manifest の bytes と型は本記録の前と同じ
+- v2 の builder は `ReplayBindingV2` の無い source run と、「照合していない」（`NULL`）run を拒否する。v1 の manifest の bytes と型は本記録の前と同じ
   （v1 の golden の試験がそのまま通る）
 - migration は追記のみで、既存の行と読み取り API を変えない
 
@@ -300,7 +318,7 @@ Dataset v2 の生成（段 3）:
 
 | トレードオフ | 緩和策 |
 |---|---|
-| CSV と manifest の2ファイルになり、CSV だけを複写すると v2 に使えなくなる | 安全側（拒否）に倒れる。拒否の理由に「manifest が無い」と出す。複写の手順は `docs/thermal-dataset.md` に書く |
+| CSV と manifest の2ファイルになり、CSV だけを複写すると v2 に使えなくなる（v1 には使える） | 安全側（拒否）に倒れる。拒否の理由に「manifest が無い」と出す。複写の手順は `docs/thermal-dataset.md` に書く |
 | 既存の CSV は v2 の学習に使えない | action が無く、もともと dataset を作れない（§2.7）。dataset 用でない再生には使える |
 | export が本番の DB に書くようになる（いまは読むだけ） | `coldaisle-rollup` は既にロールアップと削除で同じ DB に書いている。行は1日1つ |
 | Dataset v2 の生成に、本番の DB（の読み取り専用の複製でもよい）が要る | 0099 §2.6 で既に `--calibration-history-db` は必須。同じ接続で読む |
@@ -335,7 +353,7 @@ Dataset v2 の生成（段 3）:
 | 3 | export の timezone の出どころ | **`config/retention.yaml` の `csv_timezone`（必須・既定値なし）**。`--timezone` は残し、設定と違えば拒否（§2.2） | (a) `--timezone` を `--export-day` のとき必須にし、設定には置かない。(b) `--timezone` を廃止する（呼び出しが壊れる） |
 | 4 | dataset 用の再生の timezone の決め方 | **manifest の値を使い、`--timezone` を明示して食い違えば拒否**（§2.3 の 4） | `--timezone` を必須にし、manifest と一致しなければ拒否（人が打つ値が1つ増え、意味は同じ） |
 | 5 | 1 run に timezone の違う CSV が混ざるとき | **拒否**（§2.3 の 3）。source run に1つの timezone を持たせる | ファイルごとに manifest の値で読む（照合は効くが、source run の timezone が1つに定まらない） |
-| 6 | dataset 用でない再生で、manifest があり食い違うとき | **拒否**（§2.3）。デバッグ用でも、ずれた時刻の DB を作る利益が無い | 警告して `--timezone` の値で続ける（0010 §2.7 のまま。デバッグの自由度を残す） |
+| 6 | dataset 用でない再生で、manifest があり食い違うとき | **拒否し、照合と取り込みを同じ snapshot から読む**（§2.3）。デバッグ用でも、ずれた時刻の DB を作る利益が無い | 警告して `--timezone` の値で続ける（0010 §2.7 のまま。デバッグの自由度を残す） |
 | 7 | fingerprint と source run への束縛 | **3つとも行う**: fingerprint に manifest を含める（版を付け、manifest の無い入力の値は変えない）・`dataset_source_run` に列を足す（段 2）・v2 専用の `ReplayBindingV2` を `DatasetManifestV2` に持たせる（`SourceRun` は変えない）（§2.8） | (a) fingerprint だけ（manifest が timezone と `export_id` を持つので推移的に束縛される。migration が要らないが、DB と artifact から直接読めない）。(b) fingerprint は変えず v2 の manifest だけ（同じ CSV に別の manifest を付けた入力を区別できない） |
 | 8 | 0099 の暫定運用の扱い | **0100 の Supersedes に 0099 §2.6 の2つの暫定運用の部分を書き、0099 へ `Superseded by`（「段 3 のマージをもって」の条件つき）を追記する**（§2.9）。0099 だけを読んだ人が失効した手順に従わないため（AGENTS.md「決定記録」。PR #238 の Codex の指摘）。追記は 0099 のマージ後、本記録を FINAL にする PR で行う | 0099 を書き換えず `Superseded by` も付けない（暫定運用は「それまで」の条件付きなので段 3 で自然に失効する。ただし 0099 から辿れない） |
 | 9 | DST の扱い（行ごとのオフセットへ移すか） | **移さない。曖昧・存在しない時刻を含む CSV は dataset 用の再生で拒否する**（§2.5）。本番は `Asia/Tokyo` で DST が無い | (a) CSV に `timestamp_utc_ms` の列を足し、再生はそれを正とする（DST と秒の切り捨てが両方消える。0008 §2.8 の「従来の列だけ」を変える。0099 §5 #9 の判断と整合させる必要がある）。(b) 時刻をオフセット付きにする（§4） |
@@ -343,3 +361,4 @@ Dataset v2 の生成（段 3）:
 | 11 | (D) の束縛の形 | **export ごとに `export_id` を払い出し、manifest と同じ内容を元の DB の追記のみの表 `csv_exports` に残す。Dataset v2 の生成で、`--calibration-history-db` の `csv_exports` と manifest を全欄で照合する**（§2.6） | (a) DB に1つの `db_id` を持たせ manifest に写す（CSV の書き換えを見つけられない）。(b) `csv_exports` に加えて `db_id` も持つ（複製の区別はできないので、得るものが小さい）。(c) 較正の記録の写しを manifest に入れ、DB を読まない（記録の鎖（0099 §2.5）の検証が manifest の写しに対してはできない） |
 | 12 | `csv_exports` の書き手と置き場所 | **`coldaisle-rollup --export-day` だけが、readings を読んだのと同じ DB に書く**（§2.6）。保持期間の削除の対象にしない | export を別の CLI に分け、その CLI だけを書き手にする（書き手の境界ははっきりするが、運用の手順が1つ増える） |
 | 13 | export の書く順序 | **一時ファイル → DB の commit → CSV の rename → manifest の rename**（§2.1）。どこで落ちても安全側 | DB の commit を最後にする（rename の後に落ちると、manifest はあるのに DB に行が無い CSV が残る。これも生成で拒否されるので安全側だが、export の成否の見分けが遅れる） |
+| 14 | manifest の無い dataset 用の再生 | **「照合していない」run として bind し、v1 には使え、v2 の builder と学習の入口で拒否する**（§2.3）。混在は拒否 | 再生の時点で拒否する（v1 の再生成と既存の試験が止まる。PR #238 の Codex の指摘） |
