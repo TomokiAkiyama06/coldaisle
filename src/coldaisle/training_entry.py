@@ -30,7 +30,11 @@ from coldaisle.control.drift.model import DeclaredChange
 from coldaisle.control.model.dataset import ThermalDatasetV2, examples_jsonl_bytes
 from coldaisle.csv_export_manifest import replay_binding_of_records
 from coldaisle.daemon import Daemon
-from coldaisle.dataset import ThermalDatasetV2Builder
+from coldaisle.dataset import (
+    ThermalDatasetV2Builder,
+    check_production_traces,
+    copy_or_match_production_traces,
+)
 from coldaisle.ingest.calibration import Calibration
 from coldaisle.ingest.normalize import Normalizer
 from coldaisle.ingest.replay import ReplaySource, read_replay_export_inputs
@@ -106,12 +110,10 @@ def verify_training_dataset_v2(
         dataset,
         {export_id: production.rows.get(export_id) for export_id in training_export_ids(dataset)},
     )
-    if production.pruned_before_ms is not None and production.pruned_before_ms > run.start_ms:
-        raise TrainingDatasetRefused(
-            "本番の DB の trace が run の期間で保持期間により消えている（決定記録 0112 §2.3 の 4）"
-        )
-    if any(trace.seq <= production.legacy_through_seq for trace in production.traces):
-        raise TrainingDatasetRefused("移行前の ControlTick を含む期間では学習しない（0087 §2.1）")
+    try:
+        check_production_traces(production, start_ms=run.start_ms)
+    except ValueError as error:
+        raise TrainingDatasetRefused(str(error)) from error
 
     # 0112 §2.3: 一時の専用 DB で作り直して公開物の bytes を比べる
     with tempfile.TemporaryDirectory(prefix="coldaisle-training-") as directory:
@@ -147,7 +149,7 @@ def verify_training_dataset_v2(
             ).run()
             if stats.dataset_incomplete:
                 raise TrainingDatasetRefused("元の入力を欠けなく再生できない")
-            store.copy_control_traces(production.traces)
+            copy_or_match_production_traces(store, production.traces)
             rebuilt = ThermalDatasetV2Builder(store).build(
                 source_run=run,
                 spec=dataset.manifest.spec,
