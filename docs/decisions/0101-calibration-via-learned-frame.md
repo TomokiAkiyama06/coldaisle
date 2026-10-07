@@ -1,7 +1,7 @@
 # 決定記録 0101: `coldaisle-fand` が起動時に読んだ較正を LearnedFrame で MPC worker へ運び、worker が L9 に渡す（あわせて PR #239 で決着した2点）
 
 - **種別**: Decision Record
-- **Status**: FINAL（2026-10-07、リポジトリ所有者が推奨案で承認。§6）
+- **Status**: FINAL（2026-10-07、リポジトリ所有者が §5 の6点すべてを推奨案で承認。§6）
 - **Date**: 2026-10-07
 - **Supersedes**: [0077](0077-learned-proposal-handoff.md) §2.3 の最後の項のうち「frame に含めてよいのは Telemetry の値と
   制御の状態だけ」の部分のみ（起動時に読んだ較正の値と、読めなかったことを表す理由の code も含めてよい。path・個体識別子を
@@ -84,7 +84,9 @@ PR #239 は fand で読むところと loader の入口までを入れ、fand �
   封筒（`OutboundEnvelope`）の版は変えない
 - frame に path・個体識別子を入れない（0077 §2.3、AGENTS.md ルール10）。**`unavailable` の理由に、PR #239 の
   `read_runtime_calibration` が作る例外の文字列（`f"{type(error).__name__}: {error}"`）をそのまま載せない。**
-  `FileNotFoundError` などの文字列は較正ファイルの path を含むためである。理由の表し方は §5 #1
+  `FileNotFoundError` などの文字列は較正ファイルの path を含むためである。**frame の `unavailable` の理由は閉じた code
+  `calibration_path_not_given` / `calibration_unreadable` の2値だけ**とし、詳細（例外の文字列・path）は fand の構造化ログに
+  だけ残す。worker は code から `RuntimeCalibration.unavailable(<code>)` を作る（§5 #1）
 - 較正の値はチャネル名と offset だけで、Telemetry ではないが制御の状態でもない。0077 §2.3 の「frame に含めて
   よいのは Telemetry の値と制御の状態だけ」に、**起動時に読んだ較正の値と、読めなかったことを表す理由**を加える
   （ヘッダの Supersedes）。frame を LLM のプロンプトへ渡さない点（ルール8）は変えない
@@ -110,8 +112,10 @@ PR #239 は fand で読むところと loader の入口までを入れ、fand �
     `learned_proposal_unavailable` で Fallback にする（0077 §2.5）
   - 帰結として、版が食い違う fand と worker の組では、較正の掛かる artifact に限らず Learned は一切使われない。
     `unavailable`（`null` の artifact は通す）より保守側であり、安全側＝Fallback の向きに一致する
-- 同じ `run_id` の中で frame の `calibration` が変わったとき（fand は起動時にしか読まないので正常では起きない）の
-  扱いは §5 #2
+- **同じ `run_id` の中で frame の `calibration` が前の frame と変わったとき**（fand は起動時にしか読まないので正常では
+  起きない）は異常として、0077 §2.6 の `artifact_not_production` と同じ形で止まる。その周期の結果を作らず、失敗
+  （`model_load_failure`、理由 `calibration_changed_within_run`）を1回返し、別の `run_id` の frame まで再開しない。
+  束縛を黙って作り直さない（§5 #2）
 
 - **L9 が働く時点**は上の束縛を作る時点（`run_id` の最初の frame・`run_id` の変化・`authority_stage` の上昇）で、
   fand の起動時だけではない。照合に使う較正は、どの時点でも fand が起動時に読んだ値（その `run_id` の frame の
@@ -130,7 +134,9 @@ PR #239 は fand で読むところと loader の入口までを入れ、fand �
 - 0096 §2.7 の3つ目の項と §5 #5 が 0090 の束縛に較正ファイルを足さない**理由**として書いた「L9 → artifact を
   読み込めない → 0089 で authority が Baseline に落ちる」は、この経路では成り立たない（ヘッダの Supersedes）。
   **結論（足さない）は変えない。** 較正が食い違う runtime で Learned の提案が Demand の選択に効かないことは、
-  worker の L9 と Gate の Fallback で保たれる。trace の実効 stage が journal のまま見えることの扱いは §5 #3
+  worker の L9 と Gate の Fallback で保たれる。trace の実効 stage が journal のまま見えることは**いまは変えない**。制御の結果が Fallback であることは worker の
+  `failure_reason` と Gate の `fallback_reason` で示し、見え方が運用で問題になれば、0089 が予定する `AuthorityRecord` v2 の
+  版上げと一緒に新しい記録で扱う（§5 #3）
 
 ### 2.5 再起動の順番（`docs/calibration.md` §4）が保たれる
 
@@ -181,7 +187,9 @@ support（zone ごとの範囲・step ごとの cell・anchor からの遷移・
   の注記の更新を含める
 - 試験（hardware なし。0077 §2.10 と同じく試験の偽 fand / 偽 worker で確かめる）
   - fand: `available` の較正を読んだ起動では毎 tick の frame に同じ `offsets_c` が載る。`--calibration` 無し・読めない
-    ・壊れているときは `unavailable` が載り、理由に path を含まない（§5 #1 の形）
+    ・壊れているときは `unavailable` が閉じた code（§2.2）で載り、path を含まない
+  - worker: 同じ `run_id` の中で `calibration` の変わった frame を受け取ると、`calibration_changed_within_run` の失敗を
+    1回返して止まり、別の `run_id` の frame で再開する（§2.3）
   - 往復: frame の `calibration` から復元した `RuntimeCalibration` で、fand が読んだ値と同じ digest になり L9 が通る・
     変えた offset で拒否される・`unavailable` で較正の掛かる artifact が拒否され `null` の artifact が通る
   - worker: v2 の frame・`calibration` の欠けた / 型の違う frame は使われず、束縛が作られない（`available({})` や
@@ -208,7 +216,7 @@ support（zone ごとの範囲・step ごとの cell・anchor からの遷移・
 | 悪くなること | 緩和 |
 |---|---|
 | frame が毎 tick 較正の値を運び、大きさが少し増える | チャネルは数個（いまは6）で、`max_message_bytes`（0077 §2.2）の範囲に収まる。段階 3 で frame の大きさを測る |
-| L9 に外れても fand の authority は下がらず、trace の実効 stage が journal のまま見える（§2.4） | 制御の結果は Fallback と同じ。理由は worker の `MODEL_LOAD_FAILURE` の `failure_reason` と Gate の `fallback_reason` が示す。見え方を変えるかは §5 #3 |
+| L9 に外れても fand の authority は下がらず、trace の実効 stage が journal のまま見える（§2.4） | 制御の結果は Fallback と同じ。理由は worker の `MODEL_LOAD_FAILURE` の `failure_reason` と Gate の `fallback_reason` が示す。見え方はいまは変えない（§2.4 / §5 #3） |
 | fand と worker の版が食い違うと、`null` の artifact も含めて Learned が使われない（§2.3） | 両者は同じパッケージから配備する。安全側（Fallback）にしか倒れない |
 | `--calibration` を付けない配備では較正の掛かる artifact が使われない（§2.6 (b)） | 起動時の warning の構造化ログで見える。テンプレートへの追加は 0077 段階 6 |
 
@@ -224,6 +232,9 @@ support（zone ごとの範囲・step ごとの cell・anchor からの遷移・
 
 ## 5. 未決事項
 
+2026-10-07、所有者が6点すべてを推奨案で決めた（§6）。A〜C は PR #239 の判断点、1〜3 は本記録を書く中で見つかった点で、
+番号は本文からの参照を保つため提案時のまま残した。「代替」の列は判断前の記録である。開いている点は無い。
+
 ### 所有者が決めた点（2026-10-07 オーナーが推奨案で承認）
 
 | # | 判断点 | 決着（2026-10-07 所有者の決定、推奨案） | 代替（判断前の記録） |
@@ -232,22 +243,26 @@ support（zone ごとの範囲・step ごとの cell・anchor からの遷移・
 | B | Fallback の requested の support の照合の対象（PR #239 の判断点 2） | 制約へ収めた後の値（incumbent の出発点）で照合する（§2.6 (a)） | 制約へ収める前の生の Fallback の requested で照合する |
 | C | `--calibration` を省いた起動（PR #239 の判断点 3） | `unavailable`（warning）として扱い、起動は止めない。systemd テンプレートへの追加は 0077 段階 6（§2.6 (b)） | 省いた起動を拒否する（既定の path を置かない以上、較正を使わない構成も起動できなくなる） |
 
-### 本記録を書く中で見つかった点（実装 PR（0077 段階 3）の前に所有者が決める）
+### 本記録を書く中で見つかった点（2026-10-07 オーナーが推奨案で承認）
 
-| # | 論点 | 推奨 | 代替 |
+| # | 論点 | 決着（2026-10-07 所有者の決定、推奨案） | 代替（判断前の記録） |
 |---|---|---|---|
-| 1 | frame の `unavailable` の理由の表し方。PR #239 の `RuntimeCalibration.unavailable(reason)` は例外の文字列（path を含みうる）を持つので、そのまま frame に載せると 0077 §2.3 / AGENTS.md ルール10 に反する（§2.2） | **閉じた code にする。** 構造化ログの理由の code と同じ `calibration_path_not_given` / `calibration_unreadable` の2値だけを frame に載せ、詳細（例外の文字列・path）は fand の構造化ログにだけ残す。worker は code から `RuntimeCalibration.unavailable(<code>)` を作る | 自由記述のまま載せ、fand が path を伏せ字にしてから送る（伏せ字の漏れを試験で網羅しにくい） |
-| 2 | 同じ `run_id` の中で frame の `calibration` が前の frame と変わったとき（fand は起動時にしか読まないので正常では起きない） | **異常として、0077 §2.6 の `artifact_not_production` と同じ形で止まる。** その周期の結果を作らず、失敗（`model_load_failure`、理由 `calibration_changed_within_run`）を1回返し、別の `run_id` の frame まで再開しない。束縛を黙って作り直さない | 変わった frame を壊れた入力として捨て、束縛を作ったときの較正のまま続ける（fand の不具合を隠す） |
-| 3 | L9 に外れても fand の authority の上限が下がらず、trace の実効 stage が journal のまま見えること（§2.4。0096 §5 #5 の理由が成り立たなくなった点） | **いまは変えない。** 0096 §5 #5 の結論（0090 の束縛に較正ファイルを足さない）を保ち、制御の結果が Fallback であることは worker の `failure_reason` と Gate の `fallback_reason` で示す。見え方が運用で問題になれば、0089 が予定する `AuthorityRecord` v2 の版上げと一緒に新しい記録で扱う | worker が L9 の失敗を fand へ知らせ、fand が 0089 と同じく authority の上限を Baseline に落とす（worker → fand の経路に結果以外の型が増え、0077 §2.4 の6「worker の経路は提案の型しか運ばない」に触れる）。または 0090 の束縛に較正ファイルの hash を足す（0096 §5 #5 の代替） |
+| 1 | **決着**（2026-10-07 所有者の決定、推奨案）。frame の `unavailable` の理由の表し方。PR #239 の `RuntimeCalibration.unavailable(reason)` は例外の文字列（path を含みうる）を持つので、そのまま frame に載せると 0077 §2.3 / AGENTS.md ルール10 に反する（§2.2） | **閉じた code にする。** 構造化ログの理由の code と同じ `calibration_path_not_given` / `calibration_unreadable` の2値だけを frame に載せ、詳細（例外の文字列・path）は fand の構造化ログにだけ残す。worker は code から `RuntimeCalibration.unavailable(<code>)` を作る | 自由記述のまま載せ、fand が path を伏せ字にしてから送る（伏せ字の漏れを試験で網羅しにくい） |
+| 2 | **決着**（2026-10-07 所有者の決定、推奨案）。同じ `run_id` の中で frame の `calibration` が前の frame と変わったとき（fand は起動時にしか読まないので正常では起きない） | **異常として、0077 §2.6 の `artifact_not_production` と同じ形で止まる。** その周期の結果を作らず、失敗（`model_load_failure`、理由 `calibration_changed_within_run`）を1回返し、別の `run_id` の frame まで再開しない。束縛を黙って作り直さない | 変わった frame を壊れた入力として捨て、束縛を作ったときの較正のまま続ける（fand の不具合を隠す） |
+| 3 | **決着**（2026-10-07 所有者の決定、推奨案）。L9 に外れても fand の authority の上限が下がらず、trace の実効 stage が journal のまま見えること（§2.4。0096 §5 #5 の理由が成り立たなくなった点） | **いまは変えない。** 0096 §5 #5 の結論（0090 の束縛に較正ファイルを足さない）を保ち、制御の結果が Fallback であることは worker の `failure_reason` と Gate の `fallback_reason` で示す。見え方が運用で問題になれば、0089 が予定する `AuthorityRecord` v2 の版上げと一緒に新しい記録で扱う | worker が L9 の失敗を fand へ知らせ、fand が 0089 と同じく authority の上限を Baseline に落とす（worker → fand の経路に結果以外の型が増え、0077 §2.4 の6「worker の経路は提案の型しか運ばない」に触れる）。または 0090 の束縛に較正ファイルの hash を足す（0096 §5 #5 の代替） |
 
 ## 6. 承認記録
 
-**2026-10-07、リポジトリ所有者が §5 の A・B・C を推奨案で承認し、本記録を FINAL にした。**
+**2026-10-07、リポジトリ所有者が §5 の A・B・C を推奨案で承認し、本記録を FINAL にした。同日、本記録を書く中で見つかった
+§5 の 1〜3 も推奨案で承認した。**
 
 | §5 の判断点 | 決定 | 本記録 |
 |---|---|---|
 | A | fand が読んだ較正を `LearnedFrame` v3 で worker へ運び、worker が loader（L9）に渡す。実装は MPC worker（0077 段階 3）と同じ PR | §2.1〜§2.5 / §2.7 |
 | B | Fallback の requested は制約へ収めた後の値で support と照合する | §2.6 (a) |
 | C | `--calibration` を省いた起動は `unavailable`（warning）。テンプレートへの追加は 0077 段階 6 | §2.6 (b) |
+| 1 | frame の `unavailable` の理由は閉じた code（`calibration_path_not_given` / `calibration_unreadable`）だけ。詳細は fand の構造化ログだけ | §2.2 |
+| 2 | 同じ `run_id` の中で `calibration` が変われば worker は `calibration_changed_within_run` の失敗を1回返して止まり、別の `run_id` まで再開しない | §2.3 |
+| 3 | L9 に外れても fand の authority の上限は下げない（0096 §5 #5 の結論を保つ） | §2.4 |
 
-§5 の 1〜3 は本記録を書く中で見つかった点で、開いたままである。0077 段階 3 の実装 PR の前に所有者が決める。
+§5 に開いている点は無い。
