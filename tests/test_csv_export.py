@@ -33,6 +33,8 @@ HISTORICAL_HEADER = [
 ]
 DAY = date(2026, 8, 25)
 NOON_JST_MS = 1_787_626_800_000  # 2026-08-25T12:00:00+09:00
+LOCK_S = 5.0
+"""同じ日の lock を待つ上限（決定記録 0100 §2.1）。ここでは並行しないので値に意味は無い。"""
 
 
 @pytest.fixture
@@ -61,14 +63,14 @@ def rows_of(path) -> list[list[str]]:
 def test_header_matches_the_historical_format(store, tmp_path):
     """列名は**デバイスのチャネル名**。`air.` を付けない。列順も従来どおり。"""
     write(store, NOON_JST_MS, **{"air.room": 26.0})
-    path = export_day(store, DAY, tz=JST, out_dir=tmp_path / "out")
+    path = export_day(store, DAY, tz=JST, out_dir=tmp_path / "out", lock_timeout_s=LOCK_S)
     assert path.name == "sensors_2026-08-25.csv"
     assert rows_of(path)[0] == HISTORICAL_HEADER
 
 
 def test_timestamp_has_no_offset_and_second_resolution(store, tmp_path):
     write(store, NOON_JST_MS, **{"air.room": 26.0})
-    path = export_day(store, DAY, tz=JST, out_dir=tmp_path / "out")
+    path = export_day(store, DAY, tz=JST, out_dir=tmp_path / "out", lock_timeout_s=LOCK_S)
     assert rows_of(path)[1][0] == "2026-08-25T12:00:00"
 
 
@@ -78,7 +80,7 @@ def test_values_land_in_their_channel_columns(store, tmp_path):
         NOON_JST_MS,
         **{"air.room": 24.5, "air.room_humidity": 60.0, "air.rear_exhaust": 24.19},
     )
-    path = export_day(store, DAY, tz=JST, out_dir=tmp_path / "out")
+    path = export_day(store, DAY, tz=JST, out_dir=tmp_path / "out", lock_timeout_s=LOCK_S)
     row = dict(zip(HISTORICAL_HEADER, rows_of(path)[1], strict=True))
     assert row["room_temp"] == "24.5"
     assert row["room_humidity"] == "60.0"
@@ -102,7 +104,7 @@ def test_non_ok_values_are_blank(store, tmp_path):
             ),
         )
     )
-    path = export_day(store, DAY, tz=JST, out_dir=tmp_path / "out")
+    path = export_day(store, DAY, tz=JST, out_dir=tmp_path / "out", lock_timeout_s=LOCK_S)
     row = dict(zip(HISTORICAL_HEADER, rows_of(path)[1], strict=True))
     assert row["rear_exhaust"] == ""
     assert row["gpu_exhaust"] == ""
@@ -113,7 +115,7 @@ def test_non_ok_values_are_blank(store, tmp_path):
 def test_device_derived_metrics_only(store, tmp_path):
     """`sys.*` は書かない。従来の列だけを保つ。"""
     write(store, NOON_JST_MS, **{"air.room": 26.0, "sys.dropped_samples": 4.0})
-    path = export_day(store, DAY, tz=JST, out_dir=tmp_path / "out")
+    path = export_day(store, DAY, tz=JST, out_dir=tmp_path / "out", lock_timeout_s=LOCK_S)
     assert rows_of(path)[0] == HISTORICAL_HEADER
 
 
@@ -125,13 +127,13 @@ def test_day_is_cut_in_local_time(store, tmp_path):
     write(store, start_ms - 1, **{"air.room": 3.0})  # 前日の23:59:59.999
     write(store, end_ms, **{"air.room": 4.0})  # 翌日の00:00
 
-    path = export_day(store, DAY, tz=JST, out_dir=tmp_path / "out")
+    path = export_day(store, DAY, tz=JST, out_dir=tmp_path / "out", lock_timeout_s=LOCK_S)
     values = [row[1] for row in rows_of(path)[1:]]
     assert values == ["1.0", "2.0"]
 
 
 def test_empty_day_still_writes_a_header(store, tmp_path):
-    path = export_day(store, DAY, tz=JST, out_dir=tmp_path / "out")
+    path = export_day(store, DAY, tz=JST, out_dir=tmp_path / "out", lock_timeout_s=LOCK_S)
     assert rows_of(path) == [HISTORICAL_HEADER]
 
 
@@ -139,5 +141,5 @@ def test_one_row_per_sample_time(store, tmp_path):
     """1サンプルの全メトリクスは同じ `ts_ms`（決定記録 0002 §2.3）。横に並ぶ。"""
     write(store, NOON_JST_MS, **{"air.room": 26.0, "air.front_intake": 27.0})
     write(store, NOON_JST_MS + 2_500, **{"air.room": 26.1, "air.front_intake": 27.1})
-    path = export_day(store, DAY, tz=JST, out_dir=tmp_path / "out")
+    path = export_day(store, DAY, tz=JST, out_dir=tmp_path / "out", lock_timeout_s=LOCK_S)
     assert len(rows_of(path)) == 3

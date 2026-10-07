@@ -20,7 +20,7 @@ from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
 from typing import Any
-from zoneinfo import ZoneInfo
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import yaml
 from pydantic import BaseModel, ConfigDict, Field
@@ -28,7 +28,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from coldaisle import logs
 from coldaisle.channels import METRIC_TO_CHANNEL
 from coldaisle.clock import Clock, WallClock
-from coldaisle.store.csv_export import export_day
+from coldaisle.store.csv_export import CsvExportError, export_day
 from coldaisle.store.db import HOUR_MS, MINUTE_MS, SqliteStore, combine_minutes_sql
 from coldaisle.store.quality import QualityRules
 
@@ -50,6 +50,20 @@ class RetentionRules(BaseModel):
 
     csv_dir: str
     """日次CSV（FR-205）の出力先。`~` を含んでよい。"""
+
+    csv_timezone: str | None = None
+    """日次CSVの日境界と時刻に使う IANA の timezone 名（決定記録 0100 §2.2）。
+
+    **コードに既定値を置かない。** 無い（``None``）・``ZoneInfo`` で読めないときは
+    ``--export-day`` だけを拒否し、ロールアップと保持期間の適用は従来どおり行う。
+    ``None`` は「設定されていない」の印で、どの timezone の代わりにもならない。
+    """
+
+    csv_export_lock_timeout_s: float | None = Field(default=None, gt=0)
+    """同じ日の export のプロセス間 lock を待つ上限（秒。0100 §2.1 / §5 #17）。
+
+    無ければ ``--export-day`` を拒否する（``csv_timezone`` と同じ扱い）。
+    """
 
     @classmethod
     def from_yaml(cls, path: Path) -> RetentionRules:
@@ -487,7 +501,10 @@ def main(
     parser.add_argument("--quality-rules", type=Path, default=Path("config/quality.yaml"))
     parser.add_argument("--vacuum", action="store_true", help="ファイルを縮める。書き込みを止める")
     parser.add_argument("--export-day", type=date.fromisoformat, help="YYYY-MM-DD の日次CSV")
-    parser.add_argument("--timezone", default="Asia/Tokyo", help="日境界とCSVの時刻に使う")
+    parser.add_argument(
+        "--timezone",
+        help="日次CSVの timezone の確認用。設定の csv_timezone と文字列で違えば export を拒否する",
+    )
     parser.add_argument("--log-level", default="INFO")
     args = parser.parse_args(argv)
 
@@ -517,20 +534,66 @@ def main(
                 }
             },
         )
+        code = 0
         if args.export_day is not None:
-            path = export_day(
-                store,
-                args.export_day,
-                tz=ZoneInfo(args.timezone),
-                out_dir=Path(rules.csv_dir).expanduser(),
-            )
-            LOGGER.info("日次CSVを書き出した", extra={logs.FIELDS_KEY: {"path": str(path)}})
+            code = _export(store, rules, args.export_day, args.timezone)
         if args.vacuum:
             vacuum(store)
             LOGGER.info("VACUUM を実行した")
     finally:
         store.close()
+    return code
+
+
+def _export(store: SqliteStore, rules: RetentionRules, day: date, timezone: str | None) -> int:
+    """日次CSVを書き出す。拒否したら理由を記録して 1 を返す（ロールアップは済んでいる）。
+
+    拒否のときは CSV も manifest も ``csv_exports`` の行も書かない（決定記録 0100 §2.2）。
+    """
+    try:
+        zone = _export_zone(rules, timezone)
+        if rules.csv_export_lock_timeout_s is None:
+            raise CsvExportError(
+                "設定に csv_export_lock_timeout_s が無い。日次CSVを書き出さない"
+                "（決定記録 0100 §2.1）"
+            )
+        path = export_day(
+            store,
+            day,
+            tz=zone,
+            out_dir=Path(rules.csv_dir).expanduser(),
+            lock_timeout_s=rules.csv_export_lock_timeout_s,
+        )
+    except CsvExportError as exc:
+        LOGGER.error(
+            "日次CSVを書き出さなかった",
+            extra={logs.FIELDS_KEY: {"day": day.isoformat(), "reason": str(exc)}},
+        )
+        return 1
+    LOGGER.info("日次CSVを書き出した", extra={logs.FIELDS_KEY: {"path": str(path)}})
     return 0
+
+
+def _export_zone(rules: RetentionRules, timezone: str | None) -> ZoneInfo:
+    """export の timezone を設定の ``csv_timezone`` だけから決める（決定記録 0100 §2.2 / §5 #3）。
+
+    ``--timezone`` は確認用で、設定と**文字列で**違えば拒否する。別名（``Japan`` と
+    ``Asia/Tokyo``）を同じと見なさない。manifest にも設定の文字列をそのまま書く。
+    """
+    configured = rules.csv_timezone
+    if configured is None or not configured:
+        raise CsvExportError(
+            "設定に csv_timezone が無い。日次CSVを書き出さない（決定記録 0100 §2.2）"
+        )
+    if timezone is not None and timezone != configured:
+        raise CsvExportError(
+            f"--timezone {timezone!r} が設定の csv_timezone {configured!r} と違う"
+            "（決定記録 0100 §2.2）"
+        )
+    try:
+        return ZoneInfo(configured)
+    except (ZoneInfoNotFoundError, ValueError) as exc:
+        raise CsvExportError(f"csv_timezone を timezone として読めない: {configured!r}") from exc
 
 
 if __name__ == "__main__":  # pragma: no cover - `python -m coldaisle.store.rollup`

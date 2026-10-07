@@ -159,6 +159,7 @@ def learned_status(proposal: ControllerProposal, *, attested: bool = True) -> Le
     return LearnedControlStatus(
         proposal=proposal,
         received_at_mono_ms=0,
+        source_snapshot_mono_ms=0,
         assessment=assessment_for(proposal) if attested else None,
         binding_authority_stage=AuthorityStage.FULL,
     )
@@ -196,7 +197,7 @@ def mpc_result(
 
 def worker_status(result: MpcProposal) -> LearnedControlStatus:
     """worker 結果から Gate へ渡す状態（**識別子ごと**運ばれる実際の経路）。"""
-    return result.to_status(received_at_mono_ms=0)
+    return result.to_status(received_at_mono_ms=0, source_snapshot_mono_ms=0)
 
 
 def control_state(selection, *, stage: AuthorityStage = AuthorityStage.SHADOW) -> ControlState:
@@ -779,6 +780,7 @@ def test_invariant_3_g_a_tolerance_that_reaches_another_step_is_refused() -> Non
                 "period_ms": 1_000,
                 "budget_ms": 100,
                 "valid_ms": 2_000,
+                "max_source_age_ms": {"value": 2_000, "status": "provisional"},
                 "optimizer": _optimizer_with_step(500),
             }
         )

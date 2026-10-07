@@ -30,6 +30,10 @@
   決定記録 0045 未決 4）の unit も含めません。
 - 日次 CSV（`coldaisle-rollup --export-day`）の自動実行は配線していません。
   対象日を毎回渡す必要があり、自動化の方法はまだ決めていません（手で実行はできます）。
+  export は CSV の横に `sensors_YYYY-MM-DD.export.json`（manifest）と、隠しの lock ファイル
+  `.sensors_YYYY-MM-DD.export.lock` を置き、DB の `csv_exports` に1行を足します（決定記録 0100 §2.1）。
+  CSV を複写するときは manifest も一緒に複写してください。`config/retention.yaml` の `csv_timezone` と
+  `csv_export_lock_timeout_s` が無いと export だけを拒否します（ロールアップは行う）。
 
 ---
 
@@ -148,7 +152,8 @@ DB ごとに取り込みを1つに限ります（決定記録 0099 §2.2 / 0102 
 較正の記録が壊れうる）。
 
 タイマーの時刻は OS の時刻帯で解釈されます（`timedatectl` で確認）。
-日境界は `Asia/Tokyo`（`coldaisle-rollup --timezone` / `config/report.yaml`）なので、
+日境界は `Asia/Tokyo`（日次 CSV は `config/retention.yaml` の `csv_timezone`、レポートは
+`config/report.yaml`）なので、
 OS の時刻帯が異なるなら `OnCalendar=` を合わせてください。
 
 `coldaisle-report.service` は `Wants=` + `After=coldaisle-rollup.service` を持ちます。

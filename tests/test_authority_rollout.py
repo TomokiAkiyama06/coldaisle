@@ -3234,7 +3234,7 @@ def test_the_first_promotion_can_actually_be_walked(tmp_path: Path, trained) -> 
     shadow_tick = gate.select(
         now_mono_ms=0,
         fallback=fallback_proposal(0.4),
-        learned=shadow_result.to_status(received_at_mono_ms=0),
+        learned=shadow_result.to_status(received_at_mono_ms=0, source_snapshot_mono_ms=0),
         operating_mode=OperatingMode.AUTO,
         safety_state=SafetyState.NORMAL,
     )
@@ -3277,7 +3277,7 @@ def test_the_first_promotion_can_actually_be_walked(tmp_path: Path, trained) -> 
     stale_tick = gate.select(
         now_mono_ms=1_000,
         fallback=fallback_proposal(0.4),
-        learned=shadow_result.to_status(received_at_mono_ms=1_000),
+        learned=shadow_result.to_status(received_at_mono_ms=1_000, source_snapshot_mono_ms=1_000),
         operating_mode=OperatingMode.AUTO,
         safety_state=SafetyState.NORMAL,
     )
@@ -3298,14 +3298,14 @@ def test_the_first_promotion_can_actually_be_walked(tmp_path: Path, trained) -> 
     gate.select(
         now_mono_ms=2_000,
         fallback=fallback_proposal(0.4),
-        learned=limited_result.to_status(received_at_mono_ms=2_000),
+        learned=limited_result.to_status(received_at_mono_ms=2_000, source_snapshot_mono_ms=2_000),
         operating_mode=OperatingMode.AUTO,
         safety_state=SafetyState.NORMAL,
     )
     limited_tick = gate.select(
         now_mono_ms=3_000,
         fallback=fallback_proposal(0.4),
-        learned=limited_result.to_status(received_at_mono_ms=3_000),
+        learned=limited_result.to_status(received_at_mono_ms=3_000, source_snapshot_mono_ms=3_000),
         operating_mode=OperatingMode.AUTO,
         safety_state=SafetyState.NORMAL,
     )

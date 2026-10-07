@@ -638,7 +638,11 @@ def test_each_created_directory_is_fsynced_in_its_parent_before_descending(
     for index, (kind, parent_inode, _) in enumerate(events):
         if kind == "mkdir":
             # The new entry must be durable in its parent before anything is created inside.
-            assert events[index + 1] == ("fsync", parent_inode, "")
+            # 決定記録 0104 §2.3 / codex P2（PR #248）: その前に新しいディレクトリの mode を決めて
+            # 子を fsync する（親の fsync は子の fsync の直後）。
+            child_fsync, parent_fsync = events[index + 1], events[index + 2]
+            assert child_fsync[0] == "fsync" and child_fsync[1] != parent_inode
+            assert parent_fsync == ("fsync", parent_inode, "")
 
 
 def test_invalid_json_artifact_is_never_registered(tmp_path: Path) -> None:

@@ -55,6 +55,7 @@ uv run coldaisle-control status     # coldaisle-fand の運転モードを読む
 uv run coldaisle-control max --reason "負荷試験の前に全開"  # MAX（期限なし）。manual は --front/--rear/--top と --lease が必須
 uv run coldaisle-control rollback-authority --reason "挙動を見直す"  # Authority を Baseline へ（lower-authority --to-stage も。**上げる操作は無い**。#92）
 uv run coldaisle-authority raise --authority-root <dir> --approval <承認.json> --report <報告.json> --config-dir var/control-config --registry-root var/model-registry  # Authority を1段上げる。**人が自分の uid で実行する唯一の昇格の入口**。承認者は実行した uid（`--approver` は無い。#92 / 決定記録 0086）
+#   --registry-root は開発でも共有の root の形にする（`chmod 2770` 済み・`.registry.lock` がある）。CLI は Registry を作らず、lock は O_RDONLY で flock だけ（決定記録 0104 §2.4 / 0105）
 uv run coldaisle-authority rollback --authority-root <dir> --reason "fand 停止中に戻す"  # fand が止まっているときの rollback（uid で拒まない）
 COLDAISLE_DB=var/coldaisle.db uv run uvicorn coldaisle.api:app --host 127.0.0.1 --port 8000
 COLDAISLE_DB=var/coldaisle.db uv run uvicorn coldaisle.server:app --port 8000  # + AI ツールの窓口
@@ -242,6 +243,7 @@ git worktree list
 src/coldaisle/
   clock.py    # レイヤ横断: 時刻ソース（WallClock / SimulatedClock）。#42
   channels.py # レイヤ横断: チャネル名とメトリクス名の対応。#10
+  csv_export_manifest.py # レイヤ横断: 日次 CSV の時刻の写像と export manifest の形（export と再生が共有）。#237 / 決定記録 0100
   calibration_offsets.py # レイヤ横断: 較正を当てる metric の判定と実効の offset の写像（Normalizer と較正の digest が共有）。決定記録 0096
   metrics.py  # レイヤ横断: 単位・表示名・派生値の定義。#9
   daemon.py   # 合成の起点: Source→Normalizer→Store→Rules を束ねる。#8 / #18

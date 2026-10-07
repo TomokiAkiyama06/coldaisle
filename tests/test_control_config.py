@@ -247,7 +247,7 @@ def valid_documents() -> dict[str, dict[str, object]]:
             "hardware_write_fail_exit_ms": provisional(5000),
         },
         "fan-policy.yaml": {
-            "schema_version": 10,
+            "schema_version": 11,
             "fallback_curve": [
                 {"temperature_c": 25.0, "demand": 0.3},
                 {"temperature_c": 80.0, "demand": 1.0},
@@ -295,7 +295,9 @@ def valid_documents() -> dict[str, dict[str, object]]:
             "mpc": {
                 "period_ms": 1000,
                 "budget_ms": 100,
-                "valid_ms": 2000,
+                # 下限 2 * tick_ms + period_ms + budget_ms = 3100 を満たす（0077 §2.4 の4）
+                "valid_ms": 4000,
+                "max_source_age_ms": provisional(4000),
                 "optimizer": mpc_optimizer_config(),
             },
             "supervisor": supervisor_config(),
@@ -384,13 +386,13 @@ def load_config(tmp_path: Path) -> ControlConfig:
 def test_complete_config_has_traceable_sources_and_is_not_actuation_ready(tmp_path: Path) -> None:
     config = load_config(tmp_path)
 
-    assert CONTROL_CONFIG_VERSION == 13
+    assert CONTROL_CONFIG_VERSION == 14
     assert config.actuation_permitted is False
-    assert config.trace_metadata()["control_config_version"] == 13
+    assert config.trace_metadata()["control_config_version"] == 14
     metadata = config.trace_metadata()["control_config"]
     assert metadata["fan_hardware"]["name"] == "fan-hardware.yaml"
     assert metadata["safety"]["schema_version"] == 4
-    assert metadata["policy"]["schema_version"] == 10
+    assert metadata["policy"]["schema_version"] == 11
     assert metadata["air_balance"]["name"] == "air-balance.yaml"
     assert metadata["air_balance"]["schema_version"] == 2
     assert len(metadata["safety"]["sha256"]) == 64
@@ -749,6 +751,9 @@ def test_provisional_values_identify_safety_and_policy_without_exposing_values(
         "fan-policy.yaml",
     }
     assert any(item.path == "fault_demand" for item in values)
+    assert any(
+        (item.source, item.path) == ("fan-policy.yaml", "mpc.max_source_age_ms") for item in values
+    )
     assert any(item.path == "stall_check_min_demand.front" for item in values)
     assert any(item.path == "write_fail_emergency_after" for item in values)
     assert any(item.path == "hardware_write_fail_exit_ms" for item in values)
@@ -901,7 +906,7 @@ def test_supervisor_selection_and_output_bounds_are_validated(tmp_path: Path) ->
         ControlConfig.from_directory(tmp_path)
 
 
-@pytest.mark.parametrize("old_version", [1, 2, 3, 4, 5])
+@pytest.mark.parametrize("old_version", [1, 2, 3, 4, 5, 10])
 def test_previous_policy_versions_are_rejected_until_explicitly_migrated(
     tmp_path: Path,
     old_version: int,
@@ -924,9 +929,9 @@ def test_v4_to_v5_migration_requires_explicit_supervisor_policy_values(tmp_path:
         ControlConfig.from_directory(tmp_path)
 
     documents["fan-policy.yaml"]["supervisor"] = supervisor
-    documents["fan-policy.yaml"]["schema_version"] = 10
+    documents["fan-policy.yaml"]["schema_version"] = 11
     write_documents(tmp_path, documents)
-    assert ControlConfig.from_directory(tmp_path).policy.schema_version == 10
+    assert ControlConfig.from_directory(tmp_path).policy.schema_version == 11
 
     del documents["fan-policy.yaml"]["supervisor"]["active_policy"]
     write_documents(tmp_path, documents)
@@ -1019,6 +1024,71 @@ def test_mpc_validity_window_cannot_be_shorter_than_the_recalculation_period(
 
     with pytest.raises(ValidationError, match=r"mpc.valid_ms"):
         ControlConfig.from_directory(tmp_path)
+
+
+# --- mpc.max_source_age_ms（fan-policy.yaml v11。#86 / 決定記録 0077 §2.4 の4） ---
+
+
+def test_fan_policy_v11_requires_the_mpc_source_age(tmp_path: Path) -> None:
+    """v11 は `mpc.max_source_age_ms` を必須にする。欠けた設定を補完しない。"""
+    documents = valid_documents()
+    del documents["fan-policy.yaml"]["mpc"]["max_source_age_ms"]
+    write_documents(tmp_path, documents)
+
+    with pytest.raises(ValidationError, match="max_source_age_ms"):
+        ControlConfig.from_directory(tmp_path)
+
+
+@pytest.mark.parametrize(("value", "accepted"), [(4000, True), (4001, False)])
+def test_the_mpc_source_age_cannot_exceed_the_receipt_validity(
+    tmp_path: Path, value: int, accepted: bool
+) -> None:
+    """上限: `mpc.max_source_age_ms <= mpc.valid_ms`（受信起点より長い条件は何も塞がない）。"""
+    documents = valid_documents()
+    documents["fan-policy.yaml"]["mpc"]["max_source_age_ms"] = provisional(value)
+    write_documents(tmp_path, documents)
+
+    if accepted:
+        assert ControlConfig.from_directory(tmp_path).policy.mpc.max_source_age_ms.value == value
+    else:
+        with pytest.raises(ValidationError, match=r"mpc.max_source_age_ms は mpc.valid_ms 以下"):
+            ControlConfig.from_directory(tmp_path)
+
+
+@pytest.mark.parametrize(("value", "accepted"), [(3100, True), (3099, False)])
+def test_the_mpc_source_age_covers_a_healthy_round_trip(
+    tmp_path: Path, value: int, accepted: bool
+) -> None:
+    """下限: `>= 2 * safety.tick_ms + mpc.period_ms + mpc.budget_ms`（1000 * 2 + 1000 + 100）。
+
+    短いと健全な worker の提案も期限切れになり、Learned が黙って一度も使われない構成を許す。
+    """
+    documents = valid_documents()
+    documents["fan-policy.yaml"]["mpc"]["max_source_age_ms"] = provisional(value)
+    write_documents(tmp_path, documents)
+
+    if accepted:
+        assert ControlConfig.from_directory(tmp_path).policy.mpc.max_source_age_ms.value == value
+    else:
+        with pytest.raises(ValidationError, match=r"required>=3100"):
+            ControlConfig.from_directory(tmp_path)
+
+
+@pytest.mark.parametrize(("tick_ms", "accepted"), [(1450, True), (1451, False)])
+def test_the_lower_bound_of_the_mpc_source_age_reads_the_tick_from_safety_yaml(
+    tmp_path: Path, tick_ms: int, accepted: bool
+) -> None:
+    """下限は `safety.yaml` をまたぐ。fan-policy.yaml を変えずに tick を延ばしても拒む。"""
+    documents = valid_documents()
+    documents["safety.yaml"]["tick_ms"] = provisional(tick_ms)
+    write_documents(tmp_path, documents)
+
+    if accepted:
+        assert ControlConfig.from_directory(tmp_path).safety.tick_ms.value == tick_ms
+    else:
+        # 2 * 1451 + 1000 + 100 = 4002 > max_source_age_ms 4000
+        with pytest.raises(ValidationError, match=r"required>=4002"):
+            ControlConfig.from_directory(tmp_path)
 
 
 def test_mpc_optimizer_cost_metrics_must_be_stored_and_distinct(tmp_path: Path) -> None:

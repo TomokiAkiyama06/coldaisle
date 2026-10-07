@@ -343,6 +343,7 @@ class ThermalDataset(_Frozen):
         example_ids = {example.example_id for example in self.examples}
         if len(example_ids) != len(self.examples):
             raise ValueError("example_idが重複している")
+        _check_anchors_and_observations(self.examples)
         spec = self.manifest.spec
         for example in self.examples:
             _check_example_against_run_and_spec(
@@ -360,6 +361,43 @@ class ThermalDataset(_Frozen):
         if self.manifest.examples_sha256 != examples_sha256(self.examples):
             raise ValueError("manifest の examples_sha256 と実データが一致しない")
         return self
+
+
+def _check_anchors_and_observations(
+    examples: tuple[DatasetExample, ...] | tuple[DatasetExampleV2, ...],
+) -> None:
+    """同じ anchor の複製と、同じ観測の食い違いを dataset 全体で拒否する（v1 / v2 共通。0103）。
+
+    anchor は ``(source_run_id, action_ts_ms, control_tick_id)`` で一意にする（0103 §2.1）。
+    ``control_traces`` の主キー ``(ts_ms, tick_id)`` に run を足したもので、v1 では同じ時刻の
+    別の tick も、再起動で振り直された同じ ``tick_id`` も正当にありうるため、どちらも外さない。
+
+    ``(source_run_id, metric, source_ts_ms)`` は保存された1つの読み取りを指す（``readings`` の
+    主キー）ので、全 example の window と target を通して ``(value, quality, missing_mask)`` を
+    一致させる（0103 §2.2）。``stale_mask`` は frame の時刻で正当に変わるので照合しない。
+    """
+    anchors: set[tuple[str, int, int]] = set()
+    observations: dict[tuple[str, str, int], tuple[float | None, Quality | None, bool]] = {}
+    for example in examples:
+        anchor = (example.source_run_id, example.action_ts_ms, example.control_tick_id)
+        if anchor in anchors:
+            raise ValueError(
+                "同じ anchor（source_run_id・action_ts_ms・control_tick_id）の"
+                "example が重複している"
+            )
+        anchors.add(anchor)
+        frames: tuple[WindowFrame | TargetFrame, ...] = (*example.window, *example.targets)
+        for frame in frames:
+            for metric, source_ts in frame.source_ts_ms.items():
+                if source_ts is None:
+                    continue
+                cell = (frame.values[metric], frame.quality[metric], frame.missing_mask[metric])
+                seen = observations.setdefault((example.source_run_id, metric, source_ts), cell)
+                if seen != cell:
+                    raise ValueError(
+                        "同じ観測（metric・source_ts_ms）の value・quality・missing_mask が"
+                        "食い違っている"
+                    )
 
 
 def _check_example_against_run_and_spec(
@@ -713,6 +751,7 @@ class ThermalDatasetV2(_Frozen):
             raise ValueError("manifest に無い source_run_id が使われている")
         if len({example.example_id for example in self.examples}) != len(self.examples):
             raise ValueError("example_idが重複している")
+        _check_anchors_and_observations(self.examples)
         spec = self.manifest.spec
         # 1つの ControlTick は1つの tick_id と effective しか持たない（0087 §2.1）。
         # 重なる example が同じ tick を使うので、run と時刻をキーに全 example を通して照合する

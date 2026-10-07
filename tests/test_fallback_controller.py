@@ -166,7 +166,7 @@ def policy(
     mpc: dict[str, object] | None = None,
 ) -> FanPolicyConfig:
     document: dict[str, object] = {
-        "schema_version": 10,
+        "schema_version": 11,
         "fallback_curve": [
             {"temperature_c": 20.0, "demand": 0.2},
             {"temperature_c": 80.0, "demand": 0.8},
@@ -193,6 +193,7 @@ def policy(
             "period_ms": 1_000,
             "budget_ms": 100,
             "valid_ms": 2_000,
+            "max_source_age_ms": provisional(2_000),
             "optimizer": mpc_optimizer_config(),
         },
         "supervisor": supervisor_config(),
@@ -502,10 +503,14 @@ def assessment_for(
 def healthy_status(
     *,
     received: int = 0,
+    source: int | None = None,
     proposal: ControllerProposal | None = None,
     binding_stage: AuthorityStage = AuthorityStage.FULL,
 ):
-    """**束縛が覆う stage も添える**（#92）。既定は「どの stage でも使える artifact」。"""
+    """**束縛が覆う stage も添える**（#92）。既定は「どの stage でも使える artifact」。
+
+    ``source`` は元 snapshot の単調時刻（0077 §2.4 の4）。省けば受信と同じ時刻。
+    """
     selected = proposal or learned_proposal()
     if selected.ood:
         # OOD の assessment の confidence は 0。提案も同じ値にする
@@ -513,6 +518,7 @@ def healthy_status(
     return LearnedControlStatus(
         proposal=selected,
         received_at_mono_ms=received,
+        source_snapshot_mono_ms=received if source is None else source,
         assessment=assessment_for(selected),
         binding_authority_stage=binding_stage,
     )
@@ -806,6 +812,85 @@ def test_every_fallback_condition_has_a_structured_reason(
     assert decision.trace_metadata()["fallback_reason"]["code"] == expected
 
 
+def _source_age_policy() -> FanPolicyConfig:
+    """受信起点（4000）より短い元 snapshot 起点（2000）の期限を持つ設定。"""
+    return policy(
+        recovery_hold_ms=1,
+        mpc={
+            "period_ms": 1_000,
+            "budget_ms": 100,
+            "valid_ms": 4_000,
+            "max_source_age_ms": provisional(2_000),
+            "optimizer": mpc_optimizer_config(),
+        },
+    )
+
+
+def test_a_proposal_from_an_old_snapshot_expires_even_when_it_was_just_received() -> None:
+    """**受信した瞬間に新しく見せない**（#86 / 決定記録 0077 §2.4 の4）。
+
+    worker の中で滞留した提案は、受信からの経過（`mpc.valid_ms`）だけでは期限切れにならない。
+    元 snapshot の単調時刻から `mpc.max_source_age_ms` を超えたら Fallback にする。
+    """
+    gate = gate_for(_source_age_policy(), expected_model_version="0.1.0")
+    select(gate, now=2_999, learned=healthy_status(received=2_999, source=2_999))
+
+    stale = select(gate, now=3_000, learned=healthy_status(received=3_000, source=999))
+
+    assert stale.active_controller is ControllerKind.FALLBACK
+    assert stale.fallback_reason is not None
+    assert stale.fallback_reason.code == "learned_proposal_expired"
+    assert stale.fallback_reason.detail == "source_age_ms=2001; max_source_age_ms=2000"
+
+
+def test_a_proposal_exactly_at_the_source_age_limit_is_still_used() -> None:
+    """境界: 元 snapshot から `max_source_age_ms` ちょうどは使える（超えたら期限切れ）。"""
+    gate = gate_for(_source_age_policy(), expected_model_version="0.1.0")
+    select(gate, now=2_999, learned=healthy_status(received=2_999, source=2_999))
+
+    fresh = select(gate, now=3_000, learned=healthy_status(received=3_000, source=1_000))
+
+    assert fresh.active_controller is ControllerKind.LEARNED_MPC
+    assert fresh.fallback_reason is None
+
+
+def test_the_source_age_is_added_to_the_receipt_age_and_does_not_replace_it() -> None:
+    """**受信起点の条件は残す**（0028 §2.6 を Supersede しない）。新しい snapshot でも、
+    受信から `mpc.valid_ms` を超えた提案は期限切れ。"""
+    gate = gate_for(_source_age_policy(), expected_model_version="0.1.0")
+
+    old_receipt = select(gate, now=5_000, learned=healthy_status(received=999, source=4_000))
+
+    assert old_receipt.fallback_reason is not None
+    assert old_receipt.fallback_reason.code == "learned_proposal_expired"
+    assert old_receipt.fallback_reason.detail == "age_ms=4001; valid_ms=4000"
+
+
+def test_a_source_snapshot_in_the_future_is_not_fresh() -> None:
+    """元 snapshot の時刻が今より後なら、どれだけ前の観測か言えない。使わない。"""
+    gate = gate_for(_source_age_policy(), expected_model_version="0.1.0")
+
+    future = select(gate, now=3_000, learned=healthy_status(received=3_000, source=3_001))
+
+    assert future.fallback_reason is not None
+    assert future.fallback_reason.code == "learned_proposal_expired"
+    assert future.fallback_reason.detail == "source_age_ms=-1; max_source_age_ms=2000"
+
+
+def test_a_proposal_without_its_source_snapshot_time_cannot_reach_the_gate() -> None:
+    """元 snapshot の時刻を持たない提案は、状態の型で作れない（0077 §2.4 の4）。"""
+    proposal = learned_proposal()
+    with pytest.raises(ValidationError, match="元 snapshot"):
+        LearnedControlStatus(
+            proposal=proposal,
+            received_at_mono_ms=0,
+            assessment=assessment_for(proposal),
+            binding_authority_stage=AuthorityStage.FULL,
+        )
+    with pytest.raises(ValidationError, match="元 snapshot"):
+        LearnedControlStatus(source_snapshot_mono_ms=0)
+
+
 def test_unavailable_proposal_and_non_normal_safety_have_structured_reasons() -> None:
     unavailable_gate = gate_for(policy(), expected_model_version="0.1.0")
     unavailable = select(unavailable_gate, now=0, learned=LearnedControlStatus())
@@ -1059,6 +1144,7 @@ def test_an_assessment_the_registry_did_not_verify_leaves_the_artifact_unknown()
         learned=LearnedControlStatus(
             proposal=proposal,
             received_at_mono_ms=0,
+            source_snapshot_mono_ms=0,
             assessment=offline,
             binding_authority_stage=AuthorityStage.FULL,
         ),
@@ -1101,6 +1187,7 @@ def test_an_assessment_from_another_artifact_cannot_be_relabelled_as_the_bound_o
         LearnedControlStatus(
             proposal=b_proposal,
             received_at_mono_ms=0,
+            source_snapshot_mono_ms=0,
             assessment=relabelled,
             binding_authority_stage=AuthorityStage.FULL,
         )
@@ -1126,6 +1213,7 @@ def test_an_assessment_from_another_artifact_cannot_be_relabelled_as_the_bound_o
         learned=LearnedControlStatus(
             proposal=b_proposal,
             received_at_mono_ms=0,
+            source_snapshot_mono_ms=0,
             assessment=a_assessment,
             binding_authority_stage=AuthorityStage.FULL,
         ),
@@ -1146,6 +1234,7 @@ def test_an_assessment_from_another_artifact_cannot_be_relabelled_as_the_bound_o
         learned=LearnedControlStatus(
             proposal=b_proposal,
             received_at_mono_ms=1,
+            source_snapshot_mono_ms=1,
             assessment=b_assessment,
             binding_authority_stage=AuthorityStage.FULL,
         ),
@@ -1219,6 +1308,7 @@ def test_an_assessment_for_another_inference_cannot_lend_its_artifact() -> None:
         learned=LearnedControlStatus(
             proposal=proposal,
             received_at_mono_ms=0,
+            source_snapshot_mono_ms=0,
             assessment=other,
             binding_authority_stage=AuthorityStage.FULL,
         ),
@@ -1255,6 +1345,7 @@ def test_a_model_version_cannot_be_restated_independently_of_the_prediction() ->
                 version=TEST_MODEL_VERSION, inference_id=b_assessment.inference_id
             ),
             received_at_mono_ms=0,
+            source_snapshot_mono_ms=0,
             assessment=relabelled,
             binding_authority_stage=AuthorityStage.FULL,
         )
