@@ -164,7 +164,7 @@ v1 artifact は変えず、v1 を v2 として読み替えない。
 - **anchor 推論**（`predict`）: 計画 action の列は `hold_effective`（いま掛かっている effective demand を
   全 step で保つ）。`predict_trajectory` は action schema の格子と完全に一致する列だけを予測する
 
-MPC への束縛（`MpcModelBinding`・`PlanPrediction`・§2.5 の探索範囲の写し）は段 4（#86）、
+MPC への束縛（`MpcModelBinding`・`PlanPrediction`・§2.5 の探索範囲の写し）は段 4（#86。次の次の節）、
 runtime contract の例と `docs/model-registry.md` の更新は段 5（#104）で行う。
 
 ## Confidence Profile v2 と判定器（決定記録 0079 段 3 / 0084）
@@ -195,5 +195,32 @@ Registry の schema・`fan-policy.yaml` は変えない。新しいしきい値�
   判定器と同じ Profile の証拠だけが受け付けられる
 - **offline 評価**: `evaluate_ood_detection` は v2 の封をした型と判定器も受け取る（予測は anchor 推論）
 
-MPC worker への配線・候補 plan の照合（`plan_out_of_learned_range`）は段 4（#86）、episode での
+候補 plan の照合（`plan_out_of_learned_range`）は段 4（#86。次の節）、episode での
 step の OOD の記録は段 6（#105）で行う。
+
+## Learned MPC への束縛（決定記録 0079 段 4 / 0084 / 0087 §2.5）
+
+`control/mpc/`。Gate / Guard / Safety・`ControlTick`・`fan-policy.yaml` の版は変えない。新しいしきい値・
+設定値は足していない。MPC worker のプロセス（決定記録 0077 段階 3）はまだ無いので、ここは worker の外で
+試験できる境界までである。
+
+- **束縛**（`MpcModelBinding.from_verified_artifact(verified, metric_catalog=, calibration=,
+  authority_stage=, expected_model_version=)`）: Registry が発行した `VerifiedArtifact` を1つ受け取り、
+  L1〜L12 を通った封をした型だけを束縛する（model と同梱 Profile は同じ bytes から）。外れたら
+  `MpcModelUnusableError`（理由に検査の番号）。production pointer・authority の互換・版の照合は従来どおり。
+  別に組み立てた model / Profile を受け取る `for_control` は廃した
+- **候補 plan の予測**（`predict_plan`）: plan の格子（`step_ms`・step 数）が action schema と完全に一致
+  するときだけ予測し、`PlanPrediction`（plan の識別子と anchor 推論に束ねる）を返す。`ActionPlan.steps[k]`
+  は Dataset v2 / artifact v2 の step `k` と同じ区間（0087 §2.5）。`mpc.optimizer` の格子が合わない設定は
+  optimizer の生成時に拒む
+- **探索範囲の写し**（`plan_support_violation`）: 候補 plan を同梱 Profile v2 の `StepSupportChecker` で
+  照らし、外れた候補は評価しない（評価回数にも数えない。margin なし）。出発点（制約へ収めた Fallback の
+  requested）が外れれば、optimizer は `error`（`plan_out_of_learned_range`、detail に外れた step・zone・
+  cell）を返し、Gate は `optimizer_error` として Fallback を選ぶ。範囲内へ丸めて探索を続けない
+- **判定器**: `LearnedMpcController` は判定器を受け取らず、束縛した封をした型と runtime の
+  `model_confidence` から `CounterfactualConfidenceAssessor` を作る
+- **読み込みの失敗**（`LearnedMpcRuntime.load`）: 検査・較正・格子・authority・版のどれで外れても
+  起動を止めず、以後の提案を `MODEL_LOAD_FAILURE`（`failure_reason` 付き）にする。Gate は Fallback を選ぶ
+- **runtime の較正**: `coldaisle-fand --calibration <path>` が起動時に1回だけ読み、`RuntimeCalibration`
+  （読めなければ `unavailable` と構造化ログ）を作る。既定の path は置かない。worker の loader へ渡す経路は
+  worker の実装と合わせて決める（Issue #86）

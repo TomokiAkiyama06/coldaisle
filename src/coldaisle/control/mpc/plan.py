@@ -79,7 +79,12 @@ class ActionPlan(_Frozen):
 
     @property
     def offsets_ms(self) -> tuple[int, ...]:
-        """各 step の予測時刻（action からの相対）。"""
+        """各 step の予測時刻（action からの相対）。
+
+        ``offsets_ms[k] = step_ms × (k + 1)`` は step ``k`` の区間
+        ``[k × step_ms, (k + 1) × step_ms)`` の**終端**（決定記録 0087 §2.5）。
+        反実仮想 artifact v2 の target の horizon と一致させる。
+        """
         return tuple(step.offset_ms for step in self.steps)
 
     def digest(self) -> str:
