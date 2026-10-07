@@ -140,6 +140,13 @@ DB を開く unit はどれも `StateDirectoryMode=2770` と `UMask=0007` を持
 同じ mode で作られます（決定記録 0080 §2.1）。0069 のテンプレート（`0750`）で動かしてきた
 導入先は、fand を起動する前に 6.4 の移行が要ります。
 
+取り込み（`coldaisle-daemon` の serial / mock）は、DB の実体の path の隣に `<db>.ingest.lock` を作り、
+DB ごとに取り込みを1つに限ります（決定記録 0099 §2.2 / 0102 §2.1）。lock ファイルも同じ mode で作られ、
+消さずに残ります。symlink（`/opt/coldaisle/var` → `/var/lib/coldaisle` を含む）は実体の path に揃うので
+構いません。hard link の別名がある DB では取り込みは起動しません。**DB ファイルだけを bind mount した別名は
+検出できない**ので、DB をそのような形で配置しないでください（別名から起動した取り込みとは lock を共有できず、
+較正の記録が壊れうる）。
+
 タイマーの時刻は OS の時刻帯で解釈されます（`timedatectl` で確認）。
 日境界は `Asia/Tokyo`（`coldaisle-rollup --timezone` / `config/report.yaml`）なので、
 OS の時刻帯が異なるなら `OnCalendar=` を合わせてください。
