@@ -110,6 +110,7 @@ def test_migration_creates_exactly_the_decided_objects():
         ("index", "ix_csv_exports_day"),
         ("trigger", "csv_exports_no_update"),
         ("trigger", "csv_exports_no_delete"),
+        ("trigger", "dataset_source_run_export_binding_pair"),
     }
 
 

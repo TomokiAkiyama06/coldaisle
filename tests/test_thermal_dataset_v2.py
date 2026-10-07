@@ -171,7 +171,12 @@ def run_store(
     with SqliteStore(path, rules=rules, clock=clock) as store:
         store.set_system_state("sys.ingest_source", "replay", at_ms=0)
         store.bind_dataset_source_run(
-            run_alias=RUN_ALIAS, source_kind="replay", source_sha256=SHA256, at_ms=0
+            run_alias=RUN_ALIAS,
+            source_kind="replay",
+            source_sha256=SHA256,
+            at_ms=0,
+            local_timezone=None,
+            export_binding_sha256=None,
         )
         relative = regular_readings(end_ms) if readings is None else readings
         store.insert_samples(

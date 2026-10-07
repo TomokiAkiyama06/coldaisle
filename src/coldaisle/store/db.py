@@ -909,8 +909,22 @@ class SqliteStore:
         source_kind: str,
         source_sha256: str,
         at_ms: int,
+        local_timezone: str | None,
+        export_binding_sha256: str | None,
     ) -> None:
-        """このDBを1つのdataset source runへ、上書き不能で1回だけ結び付ける。"""
+        """このDBを1つのdataset source runへ、上書き不能で1回だけ結び付ける。
+
+        ``local_timezone`` と ``export_binding_sha256`` は、再生が入力の export の manifest と
+        照合した timezone と束縛の digest（決定記録 0100 §2.8）。照合していない run
+        （manifest の無い入力）は両方 ``None`` で、片方だけは受け付けない。bind と同じ
+        transaction で記録する。
+        """
+        if (local_timezone is None) != (export_binding_sha256 is None):
+            raise ValueError("local_timezoneとexport_binding_sha256は組で渡す（0100 §2.8）")
+        if local_timezone is not None and not local_timezone:
+            raise ValueError("dataset source runのlocal_timezoneが空")
+        if export_binding_sha256 is not None and _SHA256.fullmatch(export_binding_sha256) is None:
+            raise ValueError("dataset source runのexport_binding_sha256が不正")
         if _DATASET_RUN_ALIAS.fullmatch(run_alias) is None:
             raise ValueError("dataset run aliasは run-<32 hex> でなければならない")
         if source_kind not in _DATASET_SOURCE_KINDS:
@@ -933,9 +947,17 @@ class SqliteStore:
                     raise ValueError("dataset source runは空の専用DBへ先にbindする")
                 self._conn.execute(
                     "INSERT INTO dataset_source_run "
-                    "(singleton, run_alias, source_kind, source_sha256, bound_ms) "
-                    "VALUES (1, ?, ?, ?, ?)",
-                    (run_alias, source_kind, source_sha256, at_ms),
+                    "(singleton, run_alias, source_kind, source_sha256, bound_ms, "
+                    " local_timezone, export_binding_sha256) "
+                    "VALUES (1, ?, ?, ?, ?, ?, ?)",
+                    (
+                        run_alias,
+                        source_kind,
+                        source_sha256,
+                        at_ms,
+                        local_timezone,
+                        export_binding_sha256,
+                    ),
                 )
         except sqlite3.IntegrityError as exc:
             raise ValueError("dataset DBは既に別のsource runへbindされている") from exc
@@ -966,6 +988,24 @@ class SqliteStore:
         if row is None:
             return None
         return (str(row["run_alias"]), str(row["source_kind"]), str(row["source_sha256"]))
+
+    def dataset_source_run_export_binding(self) -> tuple[str | None, str | None] | None:
+        """bind済みrunの(再生のtimezone, export_binding_sha256)。未bindなら`None`。
+
+        照合していないrun（manifestの無い入力。決定記録 0100 §2.3）は`(None, None)`。
+        """
+        row = self._conn.execute(
+            "SELECT local_timezone, export_binding_sha256 FROM dataset_source_run "
+            "WHERE singleton = 1"
+        ).fetchone()
+        if row is None:
+            return None
+        timezone = row["local_timezone"]
+        binding = row["export_binding_sha256"]
+        return (
+            None if timezone is None else str(timezone),
+            None if binding is None else str(binding),
+        )
 
     def complete_dataset_source_run(self, *, at_ms: int) -> None:
         """bind済みrunが入力を最後まで取り込んだことを、上書き不能で1回だけ記録する。

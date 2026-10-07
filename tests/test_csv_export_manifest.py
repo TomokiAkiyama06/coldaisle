@@ -442,7 +442,12 @@ def test_a_bound_dataset_db_is_refused_and_nothing_is_written(tmp_path, rules, o
     with SqliteStore(tmp_path / "dataset.db", rules=rules, clock=SimulatedClock(0)) as store:
         store.set_system_state("sys.ingest_source", "replay", at_ms=0)
         store.bind_dataset_source_run(
-            run_alias=RUN_ALIAS, source_kind="replay", source_sha256="b" * 64, at_ms=0
+            run_alias=RUN_ALIAS,
+            source_kind="replay",
+            source_sha256="b" * 64,
+            at_ms=0,
+            local_timezone=None,
+            export_binding_sha256=None,
         )
         with pytest.raises(CsvExportError, match="dataset専用DB"):
             export(store, out_dir)
@@ -688,7 +693,8 @@ def test_migration_is_append_only_and_idempotent(tmp_path, rules):
             tuple(row)
             for row in store.connection.execute("SELECT version, applied_ms FROM schema_version")
         ]
-    assert versions[-1] == (12, 5_000)
+    # 0012 より後の migration（0013。決定記録 0100 段 2）も同じ起動で当たる
+    assert (12, 5_000) in versions
 
     with SqliteStore(path, rules=rules, clock=SimulatedClock(9_000)) as again:
         assert [

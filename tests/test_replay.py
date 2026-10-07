@@ -444,10 +444,10 @@ def test_interval_estimation_reads_only_two_rows(logs, monkeypatch):
     parsed = 0
     original = ReplaySource._parse_row
 
-    def counting(self, row, stamp_column):
+    def counting(self, row, stamp_column, *, verified):
         nonlocal parsed
         parsed += 1
-        return original(self, row, stamp_column)
+        return original(self, row, stamp_column, verified=verified)
 
     monkeypatch.setattr(ReplaySource, "_parse_row", counting)
     assert replay.hello.interval_ms == 3_000
