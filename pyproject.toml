@@ -56,6 +56,9 @@ coldaisle-drift = "coldaisle.drift:main"
 # 保存済み trace から Supervisor の Shadow 集計を作る。**DB と Registry を読むだけで、制御へ届かない**
 # （#89 / 決定記録 0074 §2.1）
 coldaisle-supervisor-shadow = "coldaisle.supervisor_shadow:main"
+# 保存済み trace から Air Balance の協調の shadow 集計を作る。**DB を読むだけで、合否は出さない**
+# （#81 / 決定記録 0093）
+coldaisle-air-balance-shadow = "coldaisle.air_balance_shadow:main"
 # Control Model Registry の lifecycle 操作。**読み取りが既定**で、promotion / rollback は
 # 人が書いた承認ファイルを要求する（#104 / 決定記録 0062）
 coldaisle-registry = "coldaisle.registry:main"
