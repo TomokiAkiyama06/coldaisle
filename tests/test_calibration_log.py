@@ -987,3 +987,22 @@ def test_a_symlink_to_the_same_db_shares_the_lock(tmp_path, rules):
             first.close()
         assert len(rows(one)) == 1
     assert ingest_lock_path(alias) == ingest_lock_path(real)
+
+
+def test_a_hard_linked_db_is_refused(tmp_path, rules):
+    """hard link の別名は lock を共有できないので起動しない（PR #240 の Codex の指摘）。"""
+    real = tmp_path / "prod.db"
+    clock = ManualClock(1_000)
+    with SqliteStore(real, rules=rules, clock=clock) as db:
+        (tmp_path / "other").mkdir()
+        (tmp_path / "other" / "prod.db").hardlink_to(real)
+        gate = IngestCalibrationGate(
+            db_path=real,
+            source_kind="mock",
+            calibration=Calibration(),
+            calibration_file_sha256=FILE_SHA,
+        )
+        with pytest.raises(CalibrationActivationRefused, match="hard link"):
+            gate.open(db, clock)
+        assert rows(db) == ()
+        assert not ingest_lock_path(real).exists()

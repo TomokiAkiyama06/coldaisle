@@ -117,6 +117,19 @@ class IngestCalibrationGate:
     def _acquire_lock(self) -> None:
         if self._lock_fd is not None:
             raise RuntimeError("lock は取得済み")
+        try:
+            links = self._db_path.stat().st_nlink
+        except OSError as error:
+            raise CalibrationActivationRefused(
+                f"DB の状態を読めない: {self._db_path}: {error}"
+            ) from error
+        if links != 1:
+            # hard link の別名からは別の lock ファイルになり、排他が効かない
+            # （PR #240 の Codex の指摘）
+            raise CalibrationActivationRefused(
+                f"DB に hard link の別名がある（リンク数 {links}）。"
+                f"取り込みの lock を共有できないので起動しない: {self._db_path}"
+            )
         path = ingest_lock_path(self._db_path)
         try:
             fd = os.open(path, _LOCK_FLAGS, DB_FILE_MODE)
