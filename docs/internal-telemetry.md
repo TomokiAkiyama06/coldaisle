@@ -25,7 +25,7 @@ v1 の `gpu.0` は「実機に1台だけある GPU」という論理 role であ
 
 - **有効な間の停止は欠測**とする。ingest も同時に止まっていても、ジョブの時計で最後に
   完了した分まで埋める（進行中の分は数えない）
-- **無効だった期間は欠測にしない。** 無効な入力（未設置の T_SENSOR など）には期待値を
+- **無効だった期間は欠測にしない。** 無効な入力（実値を返さない `board.chipset` など）には期待値を
   作らない。登録状態は実行ごとに Store の `periodic_metric_registrations` に残り、
   無効から戻った入力は再開後の最初の観測から数え直す。まだ観測が無ければ埋めない
 - 無効化を検出した実行では、先に前回の周期で検出時点（完了した分）まで埋めてから登録を
@@ -44,7 +44,7 @@ v1 の `gpu.0` は「実機に1台だけある GPU」という論理 role であ
 
 有効な sensor には `confirmation.status: confirmed` と、物理入力の実機確認・所有者承認を
 指す `confirmation.basis` が必須である。`channel` fallback も例外にしない。T_SENSOR の
-`basis` は #50 の測定・較正と所有者承認を含める。無効な sensor には
+`basis` は実機での確認と所有者承認を含める（#50 の較正は未了。決定記録 0110 §2.7）。無効な sensor には
 `disabled_reason` を必須とし、有効状態・確認根拠とともに起動時の構造化ログへ残す。
 
 測定種別と保存単位は次のとおり。
@@ -88,22 +88,26 @@ repository には実機の `hwmonN` や個体識別子を追加しない。
   disabled_reason: null
 ```
 
+`minimum` / `maximum` は片側だけでもよい（両方あるときは `minimum < maximum`）。範囲外は `suspect` になる。
+
 同じ selector が複数見つかった場合は推測で選ばず `missing` にする。T_SENSOR の metric
 は決定記録0032（FINAL）で、取得端子名ではなく測定位置を表す
-`board.connector_12v2x6` とした。未設置の間は
-`enabled: false` のままなので Critical 入力には含めない。有効化には #50 で確認した
-`minimum` / `maximum` と #50 の測定・所有者承認を指す confirmed の `basis` が必要で、
-範囲外は `suspect` になる。collector 自体が止まった場合は既存 Store の鮮度判定で最後の
+`board.connector_12v2x6` とした。決定記録 0110 で有効にした（driver `asusec`・label `T_Sensor`。
+同じ値が nct6799 の `AUXTIN5` にも出るが使わない）。T_SENSOR を有効にするには `minimum` が必須で、
+いまの値は `minimum: 0`・`maximum: null`。断線時は負の値になるので、0 °C 未満は `suspect` として保存され、
+制御側では使えない入力（Critical。Front / Rear を `fault_demand`）になる。上限側は `safety.yaml` の
+`telemetry.t_sensor.absolute_ceiling_c`（80 °C）で緊急 Max になるので、妥当範囲の上限は置かない。collector 自体が止まった場合は既存 Store の鮮度判定で最後の
 値が `stale` になる。#102 はこの enable 状態から制御入力 contract を作り、#82 は
 T_SENSOR の無効理由を decision trace に引き継ぐ（collector 自身は制御判断を行わない）。
 
 ## 実機で残る確認
 
-- CPU Power / chipset（実値を返す入力）/ T_SENSOR の driver と label。CPU Package と VRM は
-  2026-09-18 に確認済み（[`fan-header-mapping.md`](fan-header-mapping.md) の「温度」）
+- CPU Power / chipset（実値を返す入力）の driver と label。CPU Package と VRM は
+  2026-09-18 に確認済み（[`fan-header-mapping.md`](fan-header-mapping.md) の「温度」）。
+  T_SENSOR は 2026-10-08 に確認済み（決定記録 0110）
 - Front / Rear / Top、AIO Pump、VRM Fan の label と RPM/PWM の物理対応
 - GPU driver が hotspot / memory temperature を NVML で公開するか
-- T_SENSOR の断線時の値と #50 の較正に基づく妥当範囲
+- T_SENSOR の #50 の較正（誤差）と、それに基づく上限・下限の見直し（決定記録 0110 未決 1 / 2）
 
 これらは観測事実なしに repository へ仮置きしない。fake NVML と一時 hwmon fixture で、
 欠測・一部故障・番号変更・曖昧な対応・単位変換を実機なしで検証する。

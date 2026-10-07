@@ -20,8 +20,9 @@ BIOS制御のまま終了、特定済みなら安全側へ引継ぎ）へ接続�
 根拠として確認する。`hwmonN`、絶対パス、個体識別子は設定に書かない。
 
 `telemetry.t_sensor.enabled` は温度計モジュールの未設置を明示する。`false` のときは
-T_SENSORのstale判定を持たず、`true` にするには `confirmed` と承認根拠、および許容遅延が必要である。
-有効化も再起動時にだけ反映する。
+T_SENSORのstale判定を持たず、`true` にするには `confirmed` と承認根拠、許容遅延（`stale_after_ms`）、
+および T_SENSOR 専用の絶対温度上限（`absolute_ceiling_c`。決定記録 0110）が必要である。
+無効のときはどちらも指定しない。有効化も再起動時にだけ反映する。手順は下の「T_SENSOR の有効化」。
 `stall_check_min_demand` / `stall_min_rpm` / `stall_window_ms` と
 `write_fail_emergency_after` も `safety.yaml` の承認対象とし、stallや連続書き込み失敗の
 判定値をコードに埋め込まない。`stall_check_min_demand` は zone の最低安全 demand
@@ -254,6 +255,34 @@ Fallback の後・Critical Safety の評価の後・Gate の前に置き、毎 t
 2. 最後に `schema_version: 10` へ上げる。塊を欠く v10 と v9 のままのファイルはどちらも拒否され、
    `config_invalid` の全 zone Max で止まる
 3. 新しいコードへ更新して再起動する
+
+## T_SENSOR の有効化（決定記録 0110。`safety.yaml` は v4 のまま）
+
+`telemetry.t_sensor` に `absolute_ceiling_c`（`{value, status, basis}`）を足した。T_SENSOR はこの上限**だけ**で
+判定し、最上位の `absolute_temp_ceiling_c` は T_SENSOR 以外の温度に使う。**有効なら必須、無効なら指定不可。**
+`safety.yaml` の schema version は上げない（4 のまま）。版 4 で T_SENSOR を有効にしたファイルは欄が無いので拒否され
+（`config_invalid` の全 zone Max）、旧い意味（共通の上限で T_SENSOR も判定する）で黙って読まれない。無効のファイルは
+意味が変わらないので、そのまま使える（0110 §2.6）。
+
+本番の値（所有者の承認。2026-10-08）:
+
+```yaml
+telemetry:
+  # ほかの欄（cpu_ms / cpu_power_ms / gpu_ms / air_ms / air_sensor_period_ms）は変えない
+  t_sensor:
+    enabled: {value: true, status: confirmed, basis: "決定記録 0110。2026-10-08 所有者が承認"}
+    stale_after_ms: {value: 5000, status: confirmed, basis: "決定記録 0110 §2.5（収集周期 2500 ms の2倍）"}
+    absolute_ceiling_c: {value: 80.0, status: confirmed, basis: "決定記録 0110 §2.2"}
+```
+
+**手順**:
+
+1. `config/internal-telemetry.yaml` の `board.connector_12v2x6`（driver `asusec`・label `T_Sensor`・`minimum: 0`）で
+   `coldaisle-telemetry` を再起動し、値が `ok` で記録されることを確かめる（0 °C 未満は `suspect`）
+2. 運用の `safety.yaml` の `telemetry.t_sensor` を上のとおりにする
+3. `coldaisle-fand` に `--t-sensor-metric board.connector_12v2x6` を付けて再起動する。`safety.yaml` で有効なのに
+   引数が無い、または無効なのに引数がある組み合わせは、起動時に拒否される
+4. 起動ログの `safety_disabled_inputs` から `t_sensor_disabled` が消えたことを確かめる
 
 ## Control Config v12 と `safety.yaml` v4（#74 / 決定記録 0080 §2.6）
 

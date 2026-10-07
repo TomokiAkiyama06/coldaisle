@@ -473,6 +473,15 @@ class CriticalSafety:
             spec.metric for spec in input_contract.signals if spec.enabled
         )
         self._t_sensor_metric = approved_t_sensor_metric
+        t_sensor_ceiling = config.telemetry.t_sensor.absolute_ceiling_c
+        # 有効なら SafetyConfig の検証が専用の上限を必須にしている（決定記録 0110 §2.2）。
+        self._t_sensor_ceiling_c: float | None = (
+            None
+            if approved_t_sensor_metric is None or t_sensor_ceiling is None
+            else t_sensor_ceiling.value
+        )
+        if approved_t_sensor_metric is not None and self._t_sensor_ceiling_c is None:
+            raise ValueError("有効な T_SENSOR には専用の absolute_ceiling_c が必要")
         self._disabled_inputs = (
             ()
             if t_sensor_enabled
@@ -774,21 +783,25 @@ class CriticalSafety:
         return tuple(faults)
 
     def _absolute_temperature_fault(self, snapshot: ControlStateSnapshot) -> Fault | None:
-        ceiling = self._config.absolute_temp_ceiling_c.value
         exceeded = sorted(
-            (signal.metric, signal.value)
+            (signal.metric, signal.value, ceiling)
             for signal in snapshot.signals
-            if self._is_absolute_temperature_metric(signal.metric)
+            if (ceiling := self._absolute_ceiling_for(signal.metric)) is not None
             and signal.available
             and signal.value is not None
             and signal.value >= ceiling
         )
         if exceeded:
-            self._over_temperature_metrics.update(metric for metric, _ in exceeded)
-            detail = ", ".join(f"{metric}={value:g}C" for metric, value in exceeded)
+            self._over_temperature_metrics.update(metric for metric, _, _ in exceeded)
+            # 値と**使った上限**を metric ごとに残す。T_SENSOR は共通の上限と別の値で
+            # 判定するので、trace だけでどちらの上限で緊急になったかを読めるようにする
+            # （決定記録 0110 §2.2 / §2.3）。
+            detail = ", ".join(
+                f"{metric}={value:g}C (ceiling {ceiling:g}C)" for metric, value, ceiling in exceeded
+            )
             return Fault(
                 code=FaultCode.ABSOLUTE_TEMPERATURE_LIMIT,
-                detail=f"absolute ceiling {ceiling:g}C reached: {detail}",
+                detail=f"absolute ceiling reached: {detail}",
             )
         # 上限を超えた metric が stale / missing になっても、温度が下がった証拠ではない。
         # fresh な上限未満の値を観測するまで fault を観測し続け、clear hold を始めない。
@@ -803,13 +816,22 @@ class CriticalSafety:
         return Fault(
             code=FaultCode.ABSOLUTE_TEMPERATURE_LIMIT,
             detail=(
-                f"absolute ceiling {ceiling:g}C reached; no fresh reading below the "
+                "absolute ceiling reached; no fresh reading below the "
                 f"ceiling yet: {', '.join(unconfirmed)}"
             ),
         )
 
-    def _is_absolute_temperature_metric(self, metric: str) -> bool:
-        return metric in ABSOLUTE_TEMPERATURE_METRICS or metric == self._t_sensor_metric
+    def _absolute_ceiling_for(self, metric: str) -> float | None:
+        """metric に掛ける絶対温度上限。温度上限の対象でなければ None。
+
+        T_SENSOR は専用の上限**だけ**で判定し、共通の ``absolute_temp_ceiling_c`` は
+        T_SENSOR 以外の温度に使う（決定記録 0110 §2.2）。
+        """
+        if metric == self._t_sensor_metric:
+            return self._t_sensor_ceiling_c
+        if metric in ABSOLUTE_TEMPERATURE_METRICS:
+            return self._config.absolute_temp_ceiling_c.value
+        return None
 
     def _observe_startup_tach(
         self, snapshot: ControlStateSnapshot, backend_stall_zones: frozenset[Zone]

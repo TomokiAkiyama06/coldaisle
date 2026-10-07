@@ -116,12 +116,12 @@ class HwmonSensorConfig(_ConfigModel):
             raise ValueError("driver に hwmonN や path を指定しない")
         if self.label is not None and "/" in self.label:
             raise ValueError("label に path を指定しない")
-        if (self.minimum is None) != (self.maximum is None):
-            raise ValueError("minimum と maximum は両方指定する")
+        # 片側だけの範囲を許す。T_SENSOR は断線時の負の値という下限の根拠しか無く、
+        # 上限側に根拠の無い値を置かないため（決定記録 0110 §2.4）。
         if self.minimum is not None and self.maximum is not None and self.minimum >= self.maximum:
             raise ValueError("minimum は maximum より小さくする")
         if self.enabled and self.metric == CONNECTOR_TEMPERATURE_METRIC and self.minimum is None:
-            raise ValueError("T_SENSOR を有効にするには #50 で確認した妥当範囲が必要")
+            raise ValueError("T_SENSOR を有効にするには妥当範囲の minimum が必要")
         if self.enabled and (
             self.confirmation is None
             or self.confirmation.status is not ConfirmationStatus.CONFIRMED
