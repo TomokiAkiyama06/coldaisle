@@ -176,6 +176,11 @@ PR #226 の引数（`calibration_sha256: Sha256 | None`）を次へ替える。�
   （`ControlConfig.sources`）で、較正ファイルはそれに含まれない。較正の変化は L9 → artifact を読み込めない
   → 0089 の「artifact を持たない構成は Baseline より上を有効にしない」で既に authority が Baseline に落ちる（§5 #5）
 - 較正ファイルを書き換えてから取り込みを再起動するまでの隙は、0079 §2.4 のとおり本記録でも閉じない
+- **L9 は `coldaisle-fand` の起動時にしか働かない。** 較正を変えて取り込みだけを再起動すると、fand は古い較正の値と
+  それで照合済みの artifact のまま、新しい較正の値を読み続け、L9 による拒否と Fallback は起きない。0079 §2.4 は
+  「取り込みと `coldaisle-fand` を両方再起動する手順で運用する」と決めたが、いまの `docs/calibration.md` の手順と
+  `coldaisle-calibrate --apply` の出力は取り込みの再起動しか言わない（PR #229 の Codex の指摘）。この食い違いを
+  どう閉じるかは §5 #9 で確認する
 
 ### 2.8 移行
 
@@ -254,6 +259,7 @@ PR #226 の引数（`calibration_sha256: Sha256 | None`）を次へ替える。�
 | 6 | §2.6 の実装をどの PR で行うか | **#84 の後続 PR**（`calibration_digest` と引数の置き換え・試験・golden vector）。#86 の段 4 より前 | #86 の段 4 の PR に含める |
 | 7 | 規則の版（`calibration-digest-v1`）を bytes や manifest に入れるか | **いまは入れない。** v2 の digest の意味を `calibration-digest-v1` と定義し、規則を変えるときは artifact の `schema_version` を上げる（§2.5。0079 §2.3 のまま） | いまのうちに `calibration_binding` に `rule` の欄を足す（manifest の形が変わる。実データの artifact が無い今なら移行の費用は小さい） |
 | 8 | runtime で較正ファイルを読めなかったとき | **`fand` の起動は止めず、loader へ `unavailable` を渡し、`null` でない artifact を L9 で拒否して Fallback**（較正の掛かる metric を使わない `null` の artifact だけ通す。`null` の申告だけでは通さない。§2.4 / §2.6）。読めないことは構造化ログに出す | 起動を止める（較正ファイルが無いと Baseline でも動かない） |
+| 9 | 較正を変えたのに fand を再起動しない運用で、L9 が働かないこと（§2.7） | **手順で閉じる。** `docs/calibration.md` と `coldaisle-calibrate --apply` の出力に「**取り込みより先に** `coldaisle-fand` を再起動する（新しい較正の値で L9 をやり直してから、新しい較正の値を store に入れる）」を書く。本記録の実装 PR（§5 #6）と同じ PR で行う | fand が較正ファイルの変化を周期的に検知して L9 をやり直す（制御側が較正ファイルを監視する経路が増える）、または取り込みが使った較正の digest を store に記録して fand が照合する（0079 §6 の質問 5 を覆すので新しい記録が要る） |
 
 ## 6. 承認記録
 
