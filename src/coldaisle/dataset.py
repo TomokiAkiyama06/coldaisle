@@ -17,30 +17,40 @@ import stat
 from bisect import bisect_left, bisect_right
 from collections.abc import Sequence
 from contextlib import suppress
+from enum import StrEnum
 from pathlib import Path
 
 from pydantic import ValidationError
 
 from coldaisle.clock import WallClock
+from coldaisle.control.drift.model import ChangeKind, DeclaredChange
 from coldaisle.control.model.dataset import (
     ActionContext,
+    ActionExclusionCounts,
+    ActionStepV2,
     ActionZone,
     DatasetExample,
+    DatasetExampleV2,
     DatasetManifest,
+    DatasetManifestV2,
     DatasetSourceKind,
     DatasetSpec,
+    DatasetSpecV2,
     DatasetWorkloadRegime,
+    PriorAction,
     SourceRun,
     TargetFrame,
     ThermalDataset,
+    ThermalDatasetV2,
     WindowFrame,
     examples_jsonl_bytes,
     examples_sha256,
+    reject_calibration_changes,
 )
 from coldaisle.control.schema import ControlTick, PerZone, Zone
 from coldaisle.ingest.replay import replay_sha256
 from coldaisle.store import Quality, QualityRules, SeriesPoint, SqliteStore
-from coldaisle.store.models import ControlTraceRecord
+from coldaisle.store.models import ControlTraceRecord, SequencedControlTrace
 
 MANIFEST_FILENAME = "manifest.json"
 EXAMPLES_FILENAME = "examples.jsonl"
@@ -124,33 +134,8 @@ class ThermalDatasetBuilder:
             _target_frame(tick.ts_ms, horizon, spec=spec, points=points)
             for horizon in spec.horizons_ms
         )
-        action = PerZone(
-            front=_action_zone(tick, Zone.FRONT),
-            rear=_action_zone(tick, Zone.REAR),
-            top=_action_zone(tick, Zone.TOP),
-        )
-        state_json = raw.get("state")
-        workload_regime: DatasetWorkloadRegime | None = None
-        regime_confidence: float | None = None
-        if isinstance(state_json, dict):
-            raw_regime = state_json.get("workload_regime")
-            raw_confidence = state_json.get("regime_confidence")
-            if raw_regime is not None or raw_confidence is not None:
-                if not isinstance(raw_regime, str) or not isinstance(raw_confidence, (int, float)):
-                    raise ValueError("workload_regime と regime_confidence のtrace表現が不正")
-                workload_regime = DatasetWorkloadRegime(raw_regime)
-                regime_confidence = float(raw_confidence)
-        context = ActionContext(
-            operating_mode=tick.state.operating_mode,
-            authority_stage=tick.state.authority_stage,
-            active_controller=tick.state.active_controller,
-            safety_state=tick.state.safety_state,
-            fallback_active=tick.state.fallback_active,
-            supervisor_policy=tick.state.supervisor_policy,
-            workload_regime=workload_regime,
-            regime_confidence=regime_confidence,
-            fault_codes=tuple(fault.code.value for fault in tick.faults),
-        )
+        action = _per_zone_action(tick)
+        context = _action_context(tick, raw)
         label_end_ms = tick.ts_ms + spec.horizons_ms[-1] + spec.target_tolerance_ms
         return DatasetExample(
             example_id=f"{source_run.run_id}:{tick.ts_ms}:{tick.tick_id}",
@@ -165,6 +150,294 @@ class ThermalDatasetBuilder:
             context=context,
             targets=targets,
         )
+
+
+class ActionExclusionReason(StrEnum):
+    """action の規則で example を作らなかった理由（0087 §2.2）。定義の順が数える優先順である。"""
+
+    STALE = "stale"
+    DISCONTINUITY = "discontinuity"
+    IN_STEP_CHANGE = "in_step_change"
+    RESTART = "restart"
+    TICK_ID_GAP = "tick_id_gap"
+
+
+_ZoneDemands = tuple[float, float, float]
+
+
+class _RunTicks:
+    """1 source run の ControlTick を記録した順（``seq``）に並べたもの。
+
+    構築時に ``ts_ms`` が ``seq`` の順に狭義単調増加であることを確かめてあるので、
+    ``ts_ms`` の二分探索で「直近」を引ける（0087 §2.1）。
+    """
+
+    def __init__(self, traces: tuple[SequencedControlTrace, ...]) -> None:
+        self.traces = traces
+        self.ticks = tuple(_parse_tick(trace) for trace in traces)
+        self.ts = tuple(trace.ts_ms for trace in traces)
+        self.tick_ids = tuple(trace.tick_id for trace in traces)
+        self.effective: tuple[_ZoneDemands, ...] = tuple(
+            (
+                tick.zones.front.demand.effective,
+                tick.zones.rear.demand.effective,
+                tick.zones.top.demand.effective,
+            )
+            for tick, _raw in self.ticks
+        )
+        if any(later <= earlier for earlier, later in zip(self.ts, self.ts[1:], strict=False)):
+            # 黙って並べ替えない。壁時計が戻った run では「直近」が実行の順と一致しない
+            raise ValueError(
+                "seq の順に並べた ControlTick の ts_ms が狭義単調増加でない run から"
+                " Dataset v2 は作らない"
+            )
+
+    def as_of(self, ts_ms: int) -> int:
+        """``ts_ms`` 以前で直近の tick の位置。無ければ -1。"""
+        return bisect_right(self.ts, ts_ms) - 1
+
+
+def _assess_anchor(
+    ticks: _RunTicks, index: int, spec: DatasetSpecV2
+) -> tuple[ActionExclusionReason | None, tuple[int, ...]]:
+    """anchor ``index`` の example を作れるかを 0087 §2.2 / §2.3 / §2.7 の順で判定する。
+
+    作れるなら ``(None, step ごとの as-of の tick の位置)`` を返す。作れなければ、最初に当たった
+    理由を返す（理由の順は :class:`ActionExclusionReason` の定義の順）。
+    """
+    stale_after = spec.action_stale_after_ms
+    step_ms = spec.action_step_ms
+    anchor_ms = ticks.ts[index]
+    horizon_end_ms = anchor_ms + spec.action_steps * step_ms
+    prior = index - 1
+
+    # 1. 鮮度: prior_action（厳密に前で直近の tick）と、格子の時刻ごとの as-of の tick
+    if prior < 0 or anchor_ms - ticks.ts[prior] >= stale_after:
+        return ActionExclusionReason.STALE, ()
+    as_of: list[int] = []
+    for step in range(spec.action_steps):
+        grid_ms = anchor_ms + step * step_ms
+        source = ticks.as_of(grid_ms)
+        if grid_ms - ticks.ts[source] >= stale_after:
+            return ActionExclusionReason.STALE, ()
+        as_of.append(source)
+
+    # 2. 連続: prior_action の元の tick から最大の horizon まで、隣り合う tick の差と、
+    #    最後の tick から最大の horizon までの差。最大の horizon より後の tick が無い
+    #    run の末尾もここに数える
+    last = ticks.as_of(horizon_end_ms)
+    if any(
+        ticks.ts[position + 1] - ticks.ts[position] >= stale_after
+        for position in range(prior, last)
+    ):
+        return ActionExclusionReason.DISCONTINUITY, ()
+    if horizon_end_ms - ticks.ts[last] >= stale_after or last + 1 >= len(ticks.ts):
+        return ActionExclusionReason.DISCONTINUITY, ()
+
+    # 3. 区間内の変化: 区間 [開始, 終端) の中の tick の effective が step の値と違う。
+    #    終端（次の step の開始時刻）の tick は数えない
+    for step, source in enumerate(as_of):
+        start_ms = anchor_ms + step * step_ms
+        value = ticks.effective[source]
+        inside = range(bisect_left(ticks.ts, start_ms), bisect_left(ticks.ts, start_ms + step_ms))
+        if any(ticks.effective[position] != value for position in inside):
+            return ActionExclusionReason.IN_STEP_CHANGE, ()
+
+    # 4 / 5. tick_id は最大の horizon より後の最初の tick まで、ちょうど 1 ずつ増える
+    differences = tuple(
+        ticks.tick_ids[position + 1] - ticks.tick_ids[position]
+        for position in range(prior, last + 1)
+    )
+    if any(difference <= 0 for difference in differences):
+        return ActionExclusionReason.RESTART, ()
+    if any(difference >= 2 for difference in differences):
+        return ActionExclusionReason.TICK_ID_GAP, ()
+    return None, tuple(as_of)
+
+
+class ThermalDatasetV2Builder:
+    """SQLite の raw readings と ControlTick から Thermal Dataset v2 を作る（0079 段 1 / 0087）。"""
+
+    def __init__(self, store: SqliteStore) -> None:
+        self._store = store
+
+    def build(
+        self,
+        *,
+        source_run: SourceRun,
+        spec: DatasetSpecV2,
+        declared_changes: tuple[DeclaredChange, ...],
+    ) -> ThermalDatasetV2:
+        """1 source run を決定的に変換する。
+
+        ``declared_changes`` は 0056 §2.5 の宣言された変更で、**既定値を持たない**。宣言が無い場合も
+        空の tuple を明示する（0087 §2.6）。そのうち ``calibration_changed`` が全 example の期間に
+        あれば生成を拒否する。
+
+        次の run からは生成しない（example の除外ではなく、生成全体の拒否。0087 §2.1）。
+
+        - ``seq`` の順に並べた ControlTick の ``ts_ms`` が狭義単調増加でない
+        - 移行前の行（``seq ≤ legacy_through_seq``）を含む
+
+        完全な window と target をrun内に持てない端の tick は v1 と同じく anchor にしない。
+        anchor にできる tick のうち、action の規則（0087 §2.2 / §2.3 / §2.7）に外れたものは
+        作らず、理由ごとの件数を manifest に記録する。
+        """
+        if not isinstance(declared_changes, tuple) or not all(
+            isinstance(change, DeclaredChange) for change in declared_changes
+        ):
+            raise TypeError("declared_changes は DeclaredChange の tuple を明示して渡す")
+        calibration_changes = tuple(
+            change.ts_ms
+            for change in declared_changes
+            if change.kind is ChangeKind.CALIBRATION_CHANGED
+        )
+        with self._store.read_snapshot():
+            _validate_dedicated_source_db(self._store, source_run)
+            traces = self._store.control_traces_in_seq_order(source_run.start_ms, source_run.end_ms)
+            legacy_through_seq = self._store.control_trace_legacy_through_seq()
+            if any(trace.seq <= legacy_through_seq for trace in traces):
+                # 移行前の行の seq は記録した順を表さない（0007 が (ts_ms, tick_id) の順に振った）
+                raise ValueError("移行前の ControlTick を含む run から Dataset v2 は作らない")
+            ticks = _RunTicks(traces)
+            earliest_action_ms = source_run.start_ms + spec.window_ms
+            eligible = tuple(
+                index
+                for index, ts_ms in enumerate(ticks.ts)
+                if ts_ms >= earliest_action_ms and ts_ms + spec.horizons_ms[-1] < source_run.end_ms
+            )
+            if not eligible:
+                raise ValueError("source run内に完全なwindow/targetを持つControlTickが無い")
+
+            metrics = tuple(dict.fromkeys((*spec.feature_metrics, *spec.target_metrics)))
+            points: dict[str, SeriesIndex] = {}
+            for metric in metrics:
+                metric_points = self._store.series(metric, source_run.start_ms, source_run.end_ms)
+                points[metric] = (tuple(point.ts_ms for point in metric_points), metric_points)
+
+            excluded = dict.fromkeys(ActionExclusionReason, 0)
+            examples: list[DatasetExampleV2] = []
+            for index in eligible:
+                reason, as_of = _assess_anchor(ticks, index, spec)
+                if reason is not None:
+                    excluded[reason] += 1
+                    continue
+                examples.append(
+                    _example_v2(
+                        ticks=ticks,
+                        index=index,
+                        as_of=as_of,
+                        source_run=source_run,
+                        spec=spec,
+                        points=points,
+                    )
+                )
+        built = tuple(examples)
+        reject_calibration_changes(built, calibration_changes)
+        return ThermalDatasetV2(
+            manifest=DatasetManifestV2(
+                spec=spec,
+                source_runs=(source_run,),
+                telemetry_sha256=_telemetry_digest(metrics, points),
+                control_trace_sha256=_sequenced_trace_digest(traces),
+                examples_sha256=examples_sha256(built),
+                example_count=len(built),
+                excluded=ActionExclusionCounts(
+                    stale=excluded[ActionExclusionReason.STALE],
+                    discontinuity=excluded[ActionExclusionReason.DISCONTINUITY],
+                    in_step_change=excluded[ActionExclusionReason.IN_STEP_CHANGE],
+                    restart=excluded[ActionExclusionReason.RESTART],
+                    tick_id_gap=excluded[ActionExclusionReason.TICK_ID_GAP],
+                ),
+            ),
+            examples=built,
+        )
+
+
+def _zone_demands(values: _ZoneDemands) -> PerZone[float]:
+    front, rear, top = values
+    return PerZone(front=front, rear=rear, top=top)
+
+
+def _example_v2(
+    *,
+    ticks: _RunTicks,
+    index: int,
+    as_of: tuple[int, ...],
+    source_run: SourceRun,
+    spec: DatasetSpecV2,
+    points: dict[str, SeriesIndex],
+) -> DatasetExampleV2:
+    tick, raw = ticks.ticks[index]
+    history_start_ms = tick.ts_ms - spec.window_ms
+    frame_times = range(history_start_ms, tick.ts_ms + 1, spec.sample_period_ms)
+    window = tuple(_window_frame(ts_ms, spec=spec, points=points) for ts_ms in frame_times)
+    targets = tuple(
+        _target_frame_at_or_before(tick.ts_ms, horizon, spec=spec, points=points)
+        for horizon in spec.horizons_ms
+    )
+    prior = index - 1
+    return DatasetExampleV2(
+        example_id=f"{source_run.run_id}:{tick.ts_ms}:{tick.tick_id}",
+        source_run_id=source_run.run_id,
+        history_start_ms=history_start_ms,
+        action_ts_ms=tick.ts_ms,
+        label_end_ms=tick.ts_ms + spec.horizons_ms[-1],
+        control_tick_id=tick.tick_id,
+        control_schema_version=tick.schema_version,
+        window=window,
+        action=_per_zone_action(tick),
+        context=_action_context(tick, raw),
+        prior_action=PriorAction(
+            source_ts_ms=ticks.ts[prior],
+            source_tick_id=ticks.tick_ids[prior],
+            effective_demand=_zone_demands(ticks.effective[prior]),
+        ),
+        action_steps=tuple(
+            ActionStepV2(
+                step=step,
+                ts_ms=tick.ts_ms + step * spec.action_step_ms,
+                source_ts_ms=ticks.ts[source],
+                source_tick_id=ticks.tick_ids[source],
+                effective_demand=_zone_demands(ticks.effective[source]),
+            )
+            for step, source in enumerate(as_of)
+        ),
+        targets=targets,
+    )
+
+
+def _per_zone_action(tick: ControlTick) -> PerZone[ActionZone]:
+    return PerZone(
+        front=_action_zone(tick, Zone.FRONT),
+        rear=_action_zone(tick, Zone.REAR),
+        top=_action_zone(tick, Zone.TOP),
+    )
+
+
+def _action_context(tick: ControlTick, raw: dict[str, object]) -> ActionContext:
+    state_json = raw.get("state")
+    workload_regime: DatasetWorkloadRegime | None = None
+    regime_confidence: float | None = None
+    if isinstance(state_json, dict):
+        raw_regime = state_json.get("workload_regime")
+        raw_confidence = state_json.get("regime_confidence")
+        if raw_regime is not None or raw_confidence is not None:
+            if not isinstance(raw_regime, str) or not isinstance(raw_confidence, (int, float)):
+                raise ValueError("workload_regime と regime_confidence のtrace表現が不正")
+            workload_regime = DatasetWorkloadRegime(raw_regime)
+            regime_confidence = float(raw_confidence)
+    return ActionContext(
+        operating_mode=tick.state.operating_mode,
+        authority_stage=tick.state.authority_stage,
+        active_controller=tick.state.active_controller,
+        safety_state=tick.state.safety_state,
+        fallback_active=tick.state.fallback_active,
+        supervisor_policy=tick.state.supervisor_policy,
+        workload_regime=workload_regime,
+        regime_confidence=regime_confidence,
+        fault_codes=tuple(fault.code.value for fault in tick.faults),
+    )
 
 
 def _validate_dedicated_source_db(store: SqliteStore, source_run: SourceRun) -> None:
@@ -207,7 +480,9 @@ def _validate_dedicated_source_db(store: SqliteStore, source_run: SourceRun) -> 
         raise ValueError("dataset source runの完了後にreadingsが変更されている")
 
 
-def _parse_tick(trace: ControlTraceRecord) -> tuple[ControlTick, dict[str, object]]:
+def _parse_tick(
+    trace: ControlTraceRecord | SequencedControlTrace,
+) -> tuple[ControlTick, dict[str, object]]:
     try:
         loaded = json.loads(trace.trace_json)
         # 対応versionの判断はControlTickに委ねる。最新versionとの単純比較にすると、
@@ -273,7 +548,7 @@ def _trace_digest(traces: tuple[ControlTraceRecord, ...]) -> str:
 def _window_frame(
     ts_ms: int,
     *,
-    spec: DatasetSpec,
+    spec: DatasetSpec | DatasetSpecV2,
     points: dict[str, SeriesIndex],
 ) -> WindowFrame:
     values: dict[str, float | None] = {}
@@ -329,6 +604,71 @@ def _target_frame(
             after_ms=action_ts_ms,
         )
         if point is None:
+            values[metric] = None
+            source_times[metric] = None
+            qualities[metric] = None
+            missing[metric] = True
+            continue
+        values[metric] = point.value
+        source_times[metric] = point.ts_ms
+        qualities[metric] = point.quality
+        # 値の無いsuspect（非有限値）もmissingと同じく使えない観測としてmaskする
+        missing[metric] = point.value is None
+    return TargetFrame(
+        horizon_ms=horizon_ms,
+        expected_ts_ms=expected_ts_ms,
+        values=values,
+        source_ts_ms=source_times,
+        quality=qualities,
+        missing_mask=missing,
+    )
+
+
+def _sequenced_trace_digest(traces: tuple[SequencedControlTrace, ...]) -> str:
+    """Dataset v2 の生成に読んだ ControlTick 全体（記録した順）の SHA-256。
+
+    v2 は anchor の tick だけでなく、prior_action・格子の as-of・連続と tick_id の検査に run の全
+    tick を使うので、run の全 tick を ``seq`` 付きで hash する。
+    """
+    digest = hashlib.sha256()
+    for trace in traces:
+        _update_digest(
+            digest,
+            [
+                trace.seq,
+                trace.ts_ms,
+                trace.tick_id,
+                trace.schema_version,
+                json.loads(trace.trace_json),
+            ],
+        )
+    return digest.hexdigest()
+
+
+def _target_frame_at_or_before(
+    action_ts_ms: int,
+    horizon_ms: int,
+    *,
+    spec: DatasetSpecV2,
+    points: dict[str, SeriesIndex],
+) -> TargetFrame:
+    """v2 の target: ``[期待時刻 − 許容誤差, 期待時刻]`` の観測のうち最も遅いもの（0087 §2.4）。
+
+    期待時刻より後ろの観測は、それがより近くても採らない。後ろの観測には入力に無い action が効く。
+    """
+    expected_ts_ms = action_ts_ms + horizon_ms
+    values: dict[str, float | None] = {}
+    source_times: dict[str, int | None] = {}
+    qualities: dict[str, Quality | None] = {}
+    missing: dict[str, bool] = {}
+    for metric in spec.target_metrics:
+        stamps, metric_points = points[metric]
+        point = _latest_at(stamps, metric_points, expected_ts_ms)
+        if (
+            point is None
+            or point.ts_ms < expected_ts_ms - spec.target_tolerance_ms
+            or point.ts_ms <= action_ts_ms
+        ):
             values[metric] = None
             source_times[metric] = None
             qualities[metric] = None
@@ -470,11 +810,11 @@ def _cleanup_staging(root_fd: int, name: str, directory_fd: int) -> None:
 
 
 def write_dataset(
-    dataset: ThermalDataset,
+    dataset: ThermalDataset | ThermalDatasetV2,
     output_root: Path,
     artifact_name: str,
 ) -> tuple[Path, Path]:
-    """検証済み2ファイルをstagingから原子的に公開する。
+    """検証済み2ファイルをstagingから原子的に公開する（v1 / v2 共通）。
 
     既存artifactは常に拒否する。全writerが同じparent lockを保持して不存在を確認し、
     同じparent内のstaging directoryをmacOS / Ubuntu共通の``os.rename``で公開する。
@@ -482,7 +822,11 @@ def write_dataset(
     if _ARTIFACT_ALIAS.fullmatch(artifact_name) is None:
         raise ValueError("artifact_nameは公開用の dataset-<32 hex> aliasにする")
     # model_copy(update=...)等でvalidationを迂回したinstanceも書き出し境界で拒否する。
-    dataset = ThermalDataset.model_validate_json(dataset.model_dump_json())
+    # 版は入力の型で決め、v1 を v2 として（またはその逆に）読み替えない（0087 §2.8）
+    if isinstance(dataset, ThermalDatasetV2):
+        dataset = ThermalDatasetV2.model_validate_json(dataset.model_dump_json())
+    else:
+        dataset = ThermalDataset.model_validate_json(dataset.model_dump_json())
     examples_payload = examples_jsonl_bytes(dataset.examples)
     if hashlib.sha256(examples_payload).hexdigest() != dataset.manifest.examples_sha256:
         raise ValueError("manifestのexamples_sha256が書き出すbytesと一致しない")

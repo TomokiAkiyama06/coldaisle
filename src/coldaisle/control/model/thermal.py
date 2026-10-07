@@ -21,6 +21,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 from coldaisle.control.model.dataset import (
     DATASET_SCHEMA_VERSION,
     DatasetExample,
+    DatasetExampleV2,
     DatasetSpec,
 )
 from coldaisle.control.schema import AuthorityStage, PerZone, Zone
@@ -275,31 +276,33 @@ class ObservedThermalInput(_Frozen):
     @classmethod
     def from_example(cls, example: DatasetExample) -> ObservedThermalInput:
         """Drop labels and training-only context from a validated Dataset example."""
-        _validate_example_input_container_sizes(example)
         return cls(
             action_ts_ms=example.action_ts_ms,
-            window=tuple(
-                ObservedWindowFrame(
-                    ts_ms=frame.ts_ms,
-                    values=frame.values,
-                    source_ts_ms=frame.source_ts_ms,
-                    missing_mask=frame.missing_mask,
-                    stale_mask=frame.stale_mask,
-                    # suspect maskは「値はあるが疑わしい」を表す。値の無いsuspect
-                    # （inf等。決定記録 0031 §2.1）はdataset側でmissing_maskが立つため、
-                    # ここではmissingとして扱い、missingとsuspectを同時に立てない
-                    suspect_mask={
-                        metric: frame.quality[metric] is Quality.SUSPECT
-                        and frame.values[metric] is not None
-                        for metric in frame.values
-                    },
-                )
-                for frame in example.window
-            ),
+            window=_observed_window(example),
             action=PerZone(
                 front=ObservedFanAction(effective_demand=example.action.front.effective_demand),
                 rear=ObservedFanAction(effective_demand=example.action.rear.effective_demand),
                 top=ObservedFanAction(effective_demand=example.action.top.effective_demand),
+            ),
+        )
+
+    @classmethod
+    def from_example_v2(cls, example: DatasetExampleV2) -> ObservedThermalInput:
+        """Dataset v2 の example から anchor 推論の入力を作る（決定記録 0087 §2.7）。
+
+        v2 の anchor action は ``prior_action``（anchor の tick より厳密に前で直近の tick の
+        effective）である。anchor の tick 自身の effective（v1 の ``action``）は step 0 であり、
+        runtime の「いま掛かっている effective」（その tick が demand を決める前の値）ではない。
+        action 列（``action_steps``）は使わない。
+        """
+        prior = example.prior_action.effective_demand
+        return cls(
+            action_ts_ms=example.action_ts_ms,
+            window=_observed_window(example),
+            action=PerZone(
+                front=ObservedFanAction(effective_demand=prior.front),
+                rear=ObservedFanAction(effective_demand=prior.rear),
+                top=ObservedFanAction(effective_demand=prior.top),
             ),
         )
 
@@ -973,7 +976,34 @@ def _validate_feature_schema_container_sizes(schema: ThermalFeatureSchema) -> No
         raise ValueError("feature column名がartifact安全上限を超えている")
 
 
-def _validate_example_input_container_sizes(example: DatasetExample) -> None:
+def _observed_window(
+    example: DatasetExample | DatasetExampleV2,
+) -> tuple[ObservedWindowFrame, ...]:
+    """Dataset の window から推論入力の window を作る（v1 / v2 共通）。"""
+    _validate_example_input_container_sizes(example)
+    return tuple(
+        ObservedWindowFrame(
+            ts_ms=frame.ts_ms,
+            values=frame.values,
+            source_ts_ms=frame.source_ts_ms,
+            missing_mask=frame.missing_mask,
+            stale_mask=frame.stale_mask,
+            # suspect maskは「値はあるが疑わしい」を表す。値の無いsuspect
+            # （inf等。決定記録 0031 §2.1）はdataset側でmissing_maskが立つため、
+            # ここではmissingとして扱い、missingとsuspectを同時に立てない
+            suspect_mask={
+                metric: frame.quality[metric] is Quality.SUSPECT
+                and frame.values[metric] is not None
+                for metric in frame.values
+            },
+        )
+        for frame in example.window
+    )
+
+
+def _validate_example_input_container_sizes(
+    example: DatasetExample | DatasetExampleV2,
+) -> None:
     if len(example.window) > MAX_WINDOW_FRAMES:
         raise ValueError("observed window frame数が安全上限を超えている")
     metric_text_bytes = 0
