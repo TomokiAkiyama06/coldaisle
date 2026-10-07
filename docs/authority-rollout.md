@@ -105,11 +105,44 @@ uv run coldaisle-authority raise \
 （path は仮の値。導入先の値に置き換える。`--registry-limits` は `model-registry.yaml` の
 ディレクトリで、既定は `config`）
 
-**本番（`docs/ubuntu-deploy.md` の導入先）での `raise` は、操作者に制御設定の読み取りと Model Registry の
-lock の最小権限を与える設計が決まるまで使えない（#217。`rollback` は使える）。** 承認者は自分の uid で
-制御設定（`/etc/coldaisle/control-config`。`root:coldaisle-fan`・`0640`）を読み、Model Registry の lock を
-取る必要があるが、導入手順はその権限を与えていない（決定記録 0086 §5 の未決 3。2026-10-01 所有者の判断で、
-#216 では文書で制限し、権限の設計は #217 で行う）。権限を個別に足して回避しない。
+**本番では `--config-dir` と `--registry-root` に fand の unit と同じ path を渡す**（決定記録 0104 §2.6 / §2.7）。
+`--config-dir` は fand の unit の `ExecStart=` の `--config-dir`（`docs/ubuntu-deploy.md` の例では
+`/etc/coldaisle/control-config`）、`--registry-root` は fand に Registry を渡す unit の値（例では
+`/var/lib/coldaisle-registry`）。CLI は path が fand と同じかを確かめない。取り違えた、または fand の起動後に
+差し替えた設定・artifact で上げても journal は上がるが、fand が起動時に読んだ設定・artifact と照らして実効 stage の
+上限を Baseline にする（0089 / 0090。安全側だが、上げたつもりの authority が効かない）。
+
+**上げた後に、効いていることを確かめる。** `raise` の結果の `revision`（N とする）を fand が読んだことを
+管理ソケットの `status` で待ち、実効の stage を journal の stage と比べる（`coldaisle-control` は
+`coldaisle-admin` グループの人が使う。`docs/ubuntu-deploy.md` 6.1）。
+
+```bash
+coldaisle-control status   # authority_journal_revision が N になるまで、数 tick おいて繰り返す
+```
+
+- `authority_journal_revision` が N で、`authority_stage`（実効）が `authority_journal_stage`（journal）と同じなら効いている
+- `authority_stage` のほうが低ければ、何かの上限が掛かっている。`authority_ceiling`（`fan-policy.yaml` の上限）・
+  `authority_unpersisted_ceiling`・`authority_journal_unreadable` を見て、どれでもなければ artifact か config の照合
+  （0089 / 0090）。fand のログを**`raise` の後に絞って**見る（照合の結果は変わったときにしか出ないので、
+  起動時の古い `_matched` を「効いている」証拠にしない）
+
+  ```bash
+  journalctl -u coldaisle-fand -o cat --since "<raise を実行した時刻>" \
+    | grep -E 'authority_(config|artifact)_(mismatch|unbound)'
+  ```
+
+  `authority_config_mismatch`（`mismatched_files` に食い違ったファイル）/ `authority_artifact_mismatch` /
+  `authority_artifact_unbound` が出ていれば、journal は上がっていても実効は Baseline。rollback し、fand が使っている
+  設定・artifact について証拠を集め直して上げ直す（上の「artifact・設定を入れ替えるときの手順」）
+- decision trace（`/api/v1/control/latest`）でも、tick の `state.authority_stage`（実効）と `authority.journal_revision` /
+  `authority.journal_stage` で同じ比較ができる（artifact と config の上限そのものは trace に載らない。0089 §5 の 1）
+
+導入先の権限と確認の手順は `docs/ubuntu-deploy.md` 6.7。
+
+**本番（`docs/ubuntu-deploy.md` の導入先）での `raise` は、`docs/ubuntu-deploy.md` 6.7 の手順 9（実機での確認。
+決定記録 0104 の段階 C）が導入先で通り、結果を #217 に残すまで使えない（`rollback` は使える）。** 承認者に
+制御設定の読み取り（POSIX ACL）と Model Registry の読み取り・lock の flock を与える手順は 6.7（0104 / 0105）。
+6.7 の外で権限を個別に足して回避しない。
 `rollback` は authority のディレクトリ（`authority.json` と lock）だけを使い、制御設定も Registry も
 読まないので、導入手順のままで使える。
 
