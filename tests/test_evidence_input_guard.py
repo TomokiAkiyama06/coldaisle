@@ -358,3 +358,38 @@ def test_drift_refuses_an_out_inside_the_dataset_the_manifest_names(tmp_path: Pa
 
     assert case.main(case.with_arg("--out", victim)) == 1
     assert victim.read_text(encoding="utf-8") == "{not json"
+
+
+def test_drift_refuses_an_out_hard_linked_to_a_dataset_file(tmp_path: Path) -> None:
+    """dataset の外にある hard link でも、中の file を切り詰めさせない（Codex P2）。"""
+    case = drift_case(tmp_path)
+    manifest = case.inputs["manifest"]
+    document = yaml.safe_load(manifest.read_text(encoding="utf-8"))
+    document["dataset"] = "guard-dataset"
+    manifest.write_text(yaml.safe_dump(document), encoding="utf-8")
+    victim = manifest.parent / "guard-dataset" / "examples.jsonl"
+    victim.parent.mkdir()
+    victim.write_text("{not json\n", encoding="utf-8")
+    link = tmp_path / "guard-out" / "drift.json"
+    link.parent.mkdir()
+    link.hardlink_to(victim)
+
+    assert case.main(case.with_arg("--out", link)) == 1
+    assert victim.read_text(encoding="utf-8") == "{not json\n"
+
+
+def test_supervisor_shadow_refuses_an_out_hard_linked_into_the_registry(tmp_path: Path) -> None:
+    from coldaisle.supervisor_shadow import main
+    from test_supervisor_shadow_cli import Fixture, restart_rows
+
+    setup = Fixture(tmp_path)
+    setup.store(restart_rows(setup))
+    victim = next(path for path in sorted(setup.registry_root.rglob("*")) if path.is_file())
+    before = victim.read_bytes()
+    link = tmp_path / "guard-hardlink.json"
+    link.hardlink_to(victim)
+    argv = setup.argv()
+    argv[argv.index("--out") + 1] = str(link)
+
+    assert main(argv) == 1
+    assert victim.read_bytes() == before

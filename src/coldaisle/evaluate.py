@@ -191,6 +191,12 @@ def refuse_output_on_inputs(
     for root in input_roots:
         if resolved.is_relative_to(root.resolve()):
             raise EvidenceOutputError(f"--out が入力のディレクトリの中を指している: {root}")
+        # hard link は resolve しても外の path のまま。既存の `--out` は中の file と
+        # inode で照らす（書き出しが中の入力を切り詰めないように）。
+        if out.is_file() and root.is_dir():
+            for path in root.rglob("*"):
+                if path.is_file() and os.path.samefile(out, path):
+                    raise EvidenceOutputError(f"--out が入力のファイルを指している: {path}")
 
 
 class EvidenceDatabase:
