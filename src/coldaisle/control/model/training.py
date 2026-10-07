@@ -16,10 +16,13 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from coldaisle.control.model.dataset import (
     DatasetExample,
+    DatasetExampleV2,
     DatasetManifest,
     DatasetSpec,
     DatasetSplit,
+    DatasetSplitV2,
     ThermalDataset,
+    ThermalDatasetV2,
 )
 from coldaisle.control.model.thermal import (
     MAX_FEATURE_COLUMNS,
@@ -336,8 +339,11 @@ def train_ridge_baseline(
     )
 
 
-def split_sha256(split: DatasetSplit) -> str:
-    """Hash bucket membership and every example's complete observed time interval."""
+def split_sha256(split: DatasetSplit | DatasetSplitV2) -> str:
+    """Hash bucket membership and every example's complete observed time interval.
+
+    Dataset v1 / v2 で同じ規則を使う（どちらの example も同じ時刻の欄を持つ）。
+    """
     value = {
         bucket: [
             {
@@ -364,8 +370,12 @@ def split_sha256(split: DatasetSplit) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
-def _validate_split(dataset: ThermalDataset, split: DatasetSplit) -> None:
-    expected = {example.example_id: example for example in dataset.examples}
+def _validate_split(
+    dataset: ThermalDataset | ThermalDatasetV2, split: DatasetSplit | DatasetSplitV2
+) -> None:
+    expected: dict[str, DatasetExample | DatasetExampleV2] = {
+        example.example_id: example for example in dataset.examples
+    }
     seen: set[str] = set()
     buckets = (split.train, split.validation, split.test, split.purged)
     for bucket in buckets:
@@ -379,7 +389,7 @@ def _validate_split(dataset: ThermalDataset, split: DatasetSplit) -> None:
         raise ValueError("dataset splitは元datasetの全exampleを一度ずつ分類する必要がある")
 
     ordered_buckets = (split.train, split.validation, split.test)
-    previous: tuple[DatasetExample, ...] = ()
+    previous: tuple[DatasetExample, ...] | tuple[DatasetExampleV2, ...] = ()
     for current in ordered_buckets:
         if not current:
             continue
@@ -416,8 +426,8 @@ def _validate_dataset_spec_container_sizes(spec: DatasetSpec) -> None:
 
 def _validate_training_resource_limits(
     *,
-    dataset: ThermalDataset,
-    split: DatasetSplit,
+    dataset: ThermalDataset | ThermalDatasetV2,
+    split: DatasetSplit | DatasetSplitV2,
     feature_count: int,
     output_count: int,
 ) -> None:
@@ -479,7 +489,7 @@ def _validate_training_resource_limits(
             raise ValueError("split text総byte数がbaseline trainerの安全上限を超えている")
 
 
-def _validate_source_run_container_sizes(dataset: ThermalDataset) -> None:
+def _validate_source_run_container_sizes(dataset: ThermalDataset | ThermalDatasetV2) -> None:
     total_refs = 0
     total_text_bytes = 0
     for source in dataset.manifest.source_runs:
@@ -501,7 +511,7 @@ def _validate_source_run_container_sizes(dataset: ThermalDataset) -> None:
 
 
 def _validate_examples_container_sizes(
-    examples: tuple[DatasetExample, ...],
+    examples: tuple[DatasetExample, ...] | tuple[DatasetExampleV2, ...],
     *,
     expected_frame_count: int,
     feature_metric_count: int,
@@ -794,7 +804,7 @@ def _solve_linear_system(matrix: list[list[float]], values: list[float]) -> tupl
     return tuple(augmented[row][size] for row in range(size))
 
 
-def _example_order(example: DatasetExample) -> tuple[str, int, int, str]:
+def _example_order(example: DatasetExample | DatasetExampleV2) -> tuple[str, int, int, str]:
     return (
         example.source_run_id,
         example.action_ts_ms,

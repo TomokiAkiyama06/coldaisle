@@ -38,7 +38,13 @@ class InfeasiblePlanError(ValueError):
 
 
 class PlanStep(_Frozen):
-    """1 control step の候補 demand。``offset_ms`` は action 時刻からの相対時間。"""
+    """1 control step の候補 demand。``offset_ms`` は action 時刻からの相対時間。
+
+    ``steps[k]`` の ``demands`` は区間 ``[k × step_ms, (k + 1) × step_ms)`` に掛かる demand で、
+    ``offset_ms = step_ms × (k + 1)`` は**その区間の終端**（その step の予測時刻）を指す。
+    Thermal Dataset v2 の step ``k`` と反実仮想 artifact v2 の計画 action の列 ``plan[k]`` は
+    同じ区間である（決定記録 0087 §2.5 / 0079 §2.3）。
+    """
 
     offset_ms: PositiveMilliseconds
     demands: PerZone[Demand]

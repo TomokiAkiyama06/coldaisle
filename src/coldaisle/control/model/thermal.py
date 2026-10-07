@@ -21,6 +21,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 from coldaisle.control.model.dataset import (
     DATASET_SCHEMA_VERSION,
     DatasetExample,
+    DatasetExampleV2,
     DatasetSpec,
 )
 from coldaisle.control.schema import AuthorityStage, PerZone, Zone
@@ -166,7 +167,14 @@ class ThermalTargetSchema(_Frozen):
     """Ordered multi-horizon / multi-output target layout."""
 
     schema_version: Literal["thermal-targets-v1"] = TARGET_SCHEMA_VERSION
-    dataset_schema_version: Literal[1] = DATASET_SCHEMA_VERSION
+    dataset_schema_version: Literal[1, 2] = DATASET_SCHEMA_VERSION
+    """target の layout を作った Dataset の版。
+
+    target の layout（horizon × metric）は Dataset v1 / v2 で同じなので、artifact v2 も
+    ``thermal-targets-v1`` を使う（決定記録 0079 §2.3）。版の欄だけが出どころを区別する。
+    v1 artifact は 1 だけを受け付ける（``ThermalModelArtifact``）。既定値 1 の canonical bytes は
+    変わらない。
+    """
     horizons_ms: tuple[PositiveDurationMs, ...] = Field(
         min_length=1, max_length=MAX_TARGET_HORIZONS
     )
@@ -275,31 +283,33 @@ class ObservedThermalInput(_Frozen):
     @classmethod
     def from_example(cls, example: DatasetExample) -> ObservedThermalInput:
         """Drop labels and training-only context from a validated Dataset example."""
-        _validate_example_input_container_sizes(example)
         return cls(
             action_ts_ms=example.action_ts_ms,
-            window=tuple(
-                ObservedWindowFrame(
-                    ts_ms=frame.ts_ms,
-                    values=frame.values,
-                    source_ts_ms=frame.source_ts_ms,
-                    missing_mask=frame.missing_mask,
-                    stale_mask=frame.stale_mask,
-                    # suspect maskは「値はあるが疑わしい」を表す。値の無いsuspect
-                    # （inf等。決定記録 0031 §2.1）はdataset側でmissing_maskが立つため、
-                    # ここではmissingとして扱い、missingとsuspectを同時に立てない
-                    suspect_mask={
-                        metric: frame.quality[metric] is Quality.SUSPECT
-                        and frame.values[metric] is not None
-                        for metric in frame.values
-                    },
-                )
-                for frame in example.window
-            ),
+            window=_observed_window(example),
             action=PerZone(
                 front=ObservedFanAction(effective_demand=example.action.front.effective_demand),
                 rear=ObservedFanAction(effective_demand=example.action.rear.effective_demand),
                 top=ObservedFanAction(effective_demand=example.action.top.effective_demand),
+            ),
+        )
+
+    @classmethod
+    def from_example_v2(cls, example: DatasetExampleV2) -> ObservedThermalInput:
+        """Dataset v2 の example から anchor 推論の入力を作る（決定記録 0087 §2.7）。
+
+        v2 の anchor action は ``prior_action``（anchor の tick より厳密に前で直近の tick の
+        effective）である。anchor の tick 自身の effective（v1 の ``action``）は step 0 であり、
+        runtime の「いま掛かっている effective」（その tick が demand を決める前の値）ではない。
+        action 列（``action_steps``）は使わない。
+        """
+        prior = example.prior_action.effective_demand
+        return cls(
+            action_ts_ms=example.action_ts_ms,
+            window=_observed_window(example),
+            action=PerZone(
+                front=ObservedFanAction(effective_demand=prior.front),
+                rear=ObservedFanAction(effective_demand=prior.rear),
+                top=ObservedFanAction(effective_demand=prior.top),
             ),
         )
 
@@ -331,7 +341,14 @@ class ThermalPrediction(_Frozen):
     model_version: SemanticVersion
     artifact_sha256: Sha256
     artifact_verification: ArtifactVerification
-    capability: Literal[InferenceCapability.OBSERVATIONAL_REPLAY]
+    capability: Literal[
+        InferenceCapability.OBSERVATIONAL_REPLAY, InferenceCapability.COUNTERFACTUAL_ACTION
+    ]
+    """予測を出した artifact の申告。v1 は ``observational_replay`` だけ。
+
+    反実仮想 artifact v2（決定記録 0079）の anchor 推論は ``counterfactual_action`` を名乗る。
+    **可否の判断には使わない**（Registry の attestation を見る。0052 §2.1）。
+    """
     input_action_ts_ms: TimestampMs
     targets: tuple[PredictedTarget, ...] = Field(min_length=1, max_length=MAX_TARGET_HORIZONS)
     uncertainty: None = None
@@ -479,6 +496,9 @@ class ThermalModelArtifact(_Frozen):
             raise ValueError("manifestとfeature schema versionが一致しない")
         if self.manifest.target_schema_version != self.target_schema.schema_version:
             raise ValueError("manifestとtarget schema versionが一致しない")
+        if self.target_schema.dataset_schema_version != DATASET_SCHEMA_VERSION:
+            # v1 artifact は Dataset v1 からだけ作る。v2 の layout を v1 として読み替えない
+            raise ValueError("v1 artifactのtarget schemaはDataset v1由来に限定する")
         if self.manifest.feature_schema_sha256 != canonical_sha256(self.feature_schema):
             raise ValueError("feature schema checksumが一致しない")
         if self.manifest.target_schema_sha256 != canonical_sha256(self.target_schema):
@@ -973,7 +993,34 @@ def _validate_feature_schema_container_sizes(schema: ThermalFeatureSchema) -> No
         raise ValueError("feature column名がartifact安全上限を超えている")
 
 
-def _validate_example_input_container_sizes(example: DatasetExample) -> None:
+def _observed_window(
+    example: DatasetExample | DatasetExampleV2,
+) -> tuple[ObservedWindowFrame, ...]:
+    """Dataset の window から推論入力の window を作る（v1 / v2 共通）。"""
+    _validate_example_input_container_sizes(example)
+    return tuple(
+        ObservedWindowFrame(
+            ts_ms=frame.ts_ms,
+            values=frame.values,
+            source_ts_ms=frame.source_ts_ms,
+            missing_mask=frame.missing_mask,
+            stale_mask=frame.stale_mask,
+            # suspect maskは「値はあるが疑わしい」を表す。値の無いsuspect
+            # （inf等。決定記録 0031 §2.1）はdataset側でmissing_maskが立つため、
+            # ここではmissingとして扱い、missingとsuspectを同時に立てない
+            suspect_mask={
+                metric: frame.quality[metric] is Quality.SUSPECT
+                and frame.values[metric] is not None
+                for metric in frame.values
+            },
+        )
+        for frame in example.window
+    )
+
+
+def _validate_example_input_container_sizes(
+    example: DatasetExample | DatasetExampleV2,
+) -> None:
     if len(example.window) > MAX_WINDOW_FRAMES:
         raise ValueError("observed window frame数が安全上限を超えている")
     metric_text_bytes = 0
