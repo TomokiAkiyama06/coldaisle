@@ -610,13 +610,23 @@ def test_concurrent_exports_of_the_same_day_leave_a_matching_pair(
         return payload + f"# {secrets.token_hex(8)}\n".encode(), seconds
 
     def slow_replace(src: object, dst: object) -> None:
-        time.sleep(0.02)
+        # 間隔をばらつかせて、export どうしの rename の順序を入れ違わせる
+        time.sleep(secrets.randbelow(30) / 1000)
         real_replace(src, dst)  # type: ignore[arg-type]
 
     monkeypatch.setattr(csv_export_module, "_render", render)
     monkeypatch.setattr(csv_export_module.os, "replace", slow_replace)
+    for _ in range(8):
+        run_concurrent_exports(db_path, rules, out_dir, workers=6)
+        record = manifest_of(out_dir / "sensors_2026-08-25.csv")
+        assert record.csv_sha256 == sha256((out_dir / "sensors_2026-08-25.csv").read_bytes())
+        assert_safe(out_dir, store)
+    assert len(rows(store)) == 48
+
+
+def run_concurrent_exports(db_path: Path, rules, out_dir: Path, *, workers: int) -> None:
     errors: list[BaseException] = []
-    barrier = threading.Barrier(6)
+    barrier = threading.Barrier(workers)
 
     def worker() -> None:
         try:
@@ -626,16 +636,12 @@ def test_concurrent_exports_of_the_same_day_leave_a_matching_pair(
         except BaseException as exc:  # 試験のスレッドから持ち帰る
             errors.append(exc)
 
-    threads = [threading.Thread(target=worker) for _ in range(6)]
+    threads = [threading.Thread(target=worker) for _ in range(workers)]
     for thread in threads:
         thread.start()
     for thread in threads:
         thread.join(timeout=60)
     assert errors == []
-    assert len(rows(store)) == 6
-    record = manifest_of(out_dir / "sensors_2026-08-25.csv")
-    assert record.csv_sha256 == sha256((out_dir / "sensors_2026-08-25.csv").read_bytes())
-    assert_safe(out_dir, store)
 
 
 # ---------------------------------------------------------------- migration 0012
