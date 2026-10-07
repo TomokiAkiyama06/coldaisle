@@ -11,6 +11,7 @@
   `export_record_sha256` / `export_binding_sha256` を残し、`csv_exports` から計算し直して照合し、期間を確かめる）は
   有効で、§2.1 はその上に**足す**。0100 の他の節は有効。旧記録側への `Superseded by`（部分）の追記は本 PR で行った
   （README「追記のみ」の例外）
+- **Superseded by**: [0116](0116-dataset-cli-copies-production-traces.md)（部分。§5 の1つ目の未決「`coldaisle-dataset` の v2 で、専用 DB の ControlTick を本番の DB の trace から写す配線」の決着のみ。`coldaisle-dataset` の v2 は本番の trace を `seq` ごと写してから作る。他の節は有効）
 - **関連**: [0100](0100-replay-export-binding.md) §2.8 / §5 #15 / [0108](0108-export-manifest-settled-points.md) /
   [0111](0111-replay-binding-settled-points.md) / [0102](0102-calibration-change-log-settled-points.md) §2.3 /
   [0031](0031-thermal-dataset-contract.md) §2.4 / `src/coldaisle/calibration_log.py` / `src/coldaisle/dataset.py` /
