@@ -159,5 +159,9 @@ composition (0028 §2.4)       → Guard ceiling / floors, Safety floor, ramp_do
   projected state and ratio, `reasons`, `failure`) and `tach_unconfirmed_zones` copied from the
   Safety decision. `output` is what the coordination stage produced as the Baseline value; on a
   bypassed tick it is the raw baseline (`candidate`).
-- Promotion evidence bound to the `fan-policy.yaml` trace (`fan_policy_trace_binding`, 0078 §2.5)
-  and the shadow summary are stage 4 (#91) and are not part of this wiring.
+- Promotion evidence is bound to the `fan-policy.yaml` trace (0078 §2.5, stage 4): evaluation
+  report v4 counts each consumed tick's `runtime.config.policy_sha256` against the evaluated
+  `fan-policy.yaml` (`fan_policy_trace_binding`), and `_check_evidence()` refuses a report with any
+  mismatched or missing tick (`MIN_EVIDENCE_REPORT_SCHEMA_VERSION` 4). Changing only the
+  coordination `mode` therefore stops promotion until traces recorded under the new file exist.
+  The shadow summary tool and the Baseline arm of the offline evaluation remain open (0078 §5).
