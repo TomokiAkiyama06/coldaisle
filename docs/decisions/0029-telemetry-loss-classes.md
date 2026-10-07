@@ -4,6 +4,7 @@
 - **Status**: FINAL（2026-09-16、リポジトリ所有者が承認）
 - **Date**: 2026-09-13
 - **Supersedes**: なし（決定記録 0028 §2.7 の「必須の `air.*`」を具体化する補足。0028 の対応そのものは変えない）
+- **Superseded by**: [0110](0110-t-sensor-ceiling-and-enablement.md)（§2.4 の「有効にするのは、設置と #50 の較正の確認の後」のうち、#50 の較正を有効化の前提にする点のみ。有効化を所有者の承認点にすること、有効化後に使えなければ Critical とすることは有効）
 - **関連**: [`0028-fan-control-contracts.md`](0028-fan-control-contracts.md) /
   [`0026-three-zone-fan-control.md`](0026-three-zone-fan-control.md) /
   [`0004-storage-read-contract.md`](0004-storage-read-contract.md) /
