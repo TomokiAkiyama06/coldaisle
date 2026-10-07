@@ -741,7 +741,16 @@ CLI の書いた journal を読むと、走行中なら `SHADOW` へ下がり、
       Registry の lock と authority の lock を取った**後**に拒みます（期限切れの承認は Registry を読む前に拒まれるので
       確認に使えません）。期待する結果は終了コード 4・`code` が `approval_rejected`（revision の不一致）で、
       journal は変わりません。終了コード 1 の `io_or_config_error`（制御設定を読めない）や `registry_error`
-      （Registry を読めない。0105 §2.4）なら権限が足りていません
+      （Registry を読めない。0105 §2.4）なら権限が足りていません。
+
+      **前提: Registry に thermal_model の Production artifact があること。** `raise` は Registry の lock を
+      取って Production を読んだ直後、authority の lock と `expected_revision` を見る**前**に、Production が無ければ
+      拒みます。Production がまだ無い導入先（3 で candidate を登録しただけ、など）では、期待する結果は
+      終了コード 4・`code` が `evidence_rejected` で、構造化ログの `error` が「Production の artifact が無い」
+      ことです。これでも制御設定の読み取りと Registry の読み取り・lock は確かめられますが、authority の lock までは
+      届かないので、Production を置いた後に `approval_rejected` の確認をもう一度行ってから `raise` を使います。
+      どちらの場合も承認の期限内であることと、承認の `to_stage` が `fan-policy.yaml` の上限以下であることが要ります
+      （それより前の検査で拒まれるため）
    6. 結果（どの確認が通ったか・`getfacl` の形）を #217 に残します。**実機のユーザー名・ホスト名・path は
       書きません**（仮の名前に置き換える）
 
