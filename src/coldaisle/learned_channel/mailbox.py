@@ -7,6 +7,8 @@
 - worker が切れた・黙ったときは、**状態を先に変えてから**枠を空にする。loop は状態を見てから
   覗くので、切れた tick から古い提案を読まない（0077 §2.5 の表）
 - 送り出し用の1枠（`offer`）。loop は置くだけで、送るのは受付スレッド。置けなければ捨てる
+- 固定した artifact が production でなくなった役割は、**再起動まで** `registry_superseded` を答え、
+  枠を空にし、以後の結果を置かない（0077 §2.6）。接続・切断の知らせでは戻らない
 
 loop の状態（`ControlLoop` / `ControllerGate`）には触れない。
 """
@@ -30,6 +32,8 @@ class LearnedMailbox:
         self._states: dict[LearnedRole, LearnedChannelState] = {
             role: LearnedChannelState.WORKER_DISCONNECTED for role in LearnedRole
         }
+        # 受付スレッドだけが置き換え、loop は lock を取らずに読む（frozenset の差し替えは原子的）
+        self._superseded: frozenset[LearnedRole] = frozenset()
         self._outgoing_lock = threading.Lock()
         self._outgoing: LearnedFrame | None = None
         self._receiver: threading.Thread | None = None
@@ -81,9 +85,29 @@ class LearnedMailbox:
                 # lock を取れなかった tick に返す写しも捨てる（再接続の後に古い提案を返さない）
                 self._last_polled = None
 
+    def supersede(self, role: LearnedRole) -> None:
+        """その役割を `coldaisle-fand` の再起動まで閉じる（0077 §2.6 の `registry_superseded`）。
+
+        **状態を先に変えてから**枠を空にする（`disconnected` と同じ順。loop は状態を見てから覗く）。
+        """
+        self._superseded = self._superseded | {role}
+        if role is LearnedRole.MPC:
+            with self._lock:
+                self._mpc = None
+                self._last_polled = None
+
+    def superseded(self, role: LearnedRole) -> bool:
+        """その役割を registry の移動で閉じたか。**lock を取らない。**"""
+        return role in self._superseded
+
     def place_mpc(self, result: MpcProposal) -> None:
-        """検証を通った MPC の結果を置く。前の結果は置き換える（積まない）。"""
+        """検証を通った MPC の結果を置く。前の結果は置き換える（積まない）。
+
+        閉じた役割（`registry_superseded`）には置かない（受付が検証の前に捨てるのに加えた二重の守り）。
+        """
         with self._lock:
+            if LearnedRole.MPC in self._superseded:
+                return
             self._mpc = result
 
     def take_outgoing(self) -> LearnedFrame | None:
@@ -129,6 +153,8 @@ class LearnedMailbox:
         """経路の状態（`LearnedChannelHealth`）。**lock を取らない。**"""
         if not self.receiver_alive():
             return LearnedChannelState.CHANNEL_DEAD
+        if role in self._superseded:
+            return LearnedChannelState.REGISTRY_SUPERSEDED
         return self._states[role]
 
     def poll(self) -> MpcProposal | None:

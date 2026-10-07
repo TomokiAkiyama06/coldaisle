@@ -94,6 +94,7 @@ from coldaisle.control.loop import (
 )
 from coldaisle.control.operating_mode import AdminAuthorityCommand
 from coldaisle.control.reactive.guard import ReactiveGuard
+from coldaisle.control.registry_binding import RegistryBinding
 from coldaisle.control.safety.critical import (
     ControlRuntimeBinding,
     CriticalSafety,
@@ -105,7 +106,7 @@ from coldaisle.control.safety.write_fail_exit import (
     HardwareWriteFailureExit,
     HardwareWriteFailureExitError,
 )
-from coldaisle.control.schema import PerZone, RegistryProvenance, Zone
+from coldaisle.control.schema import PerZone, Zone
 from coldaisle.control.shadow.record import ShadowRecorder
 from coldaisle.control.state import ControlInputContract, ControlStateEstimator
 from coldaisle.control.supervisor.policy import SupervisorCoordinator
@@ -118,6 +119,7 @@ from coldaisle.learned_channel import (
     open_learned_channel,
 )
 from coldaisle.learned_channel.mailbox import LearnedMailbox
+from coldaisle.learned_channel.registry_watch import RegistryWatch, read_startup_registry
 from coldaisle.metrics import MetricCatalog
 from coldaisle.store import QualityRules, SqliteStore
 
@@ -134,11 +136,10 @@ DEFAULT_AUTHORITY_ROOT = Path("var/authority")
 本番は `coldaisle-fand` の実行ユーザーと昇格を行う人だけが書ける場所を指定する（0072 §2.5）。
 """
 
-UNCONFIGURED_MODEL_VERSION = "unconfigured"
-"""Learned MPC の worker を配線していない起動で Gate に渡す期待版。
+DEFAULT_REGISTRY_LIMITS = Path("config")
+"""`model-registry.yaml`（Registry の読み込みの上限）のディレクトリ。
 
-**値そのものに意味は無い。** worker が無い構成では提案が1件も来ないので Gate は必ず
-Fallback を選ぶ。worker を配線するときは、Registry の production 版を明示的に渡す。
+`coldaisle-authority` の `--registry-limits` と同じ既定。
 """
 
 EXIT_HARDWARE_CONFIG_INVALID = 2
@@ -600,6 +601,14 @@ class Config:
 
     None は経路を開かない（いまの運転のまま）。
     """
+    registry_root: Path | None = None
+    """Model Registry の root（決定記録 0077 §2.6）。起動時に1回だけ読む。
+
+    None は registry を読まない（いまの運転のまま。Gate は番兵、trace は `unbound()`）。
+    読めない・壊れているときは起動を止めずに Learned を無効にする。
+    """
+    registry_limits: Path = DEFAULT_REGISTRY_LIMITS
+    """`model-registry.yaml` のあるディレクトリ（registry を読むときの上限）。"""
 
 
 @dataclass(slots=True)
@@ -939,11 +948,14 @@ def build(
         raise StartupEnvironmentError(f"{type(error).__name__}: {error}") from error
     store = open_writable_store(config.db, rules=rules, clock=clock, control=control)
     binding = create_control_runtime_binding(control)
+    # **registry は起動時に1回だけ読み、1つの snapshot から provenance・Gate の期待値・
+    # `expected_rl_identity`・frame の `expected_artifacts` を作る**（決定記録 0077 §2.6）。
+    # 読めなければ Learned を無効にして起動を続ける（例外を出さない）。
+    registry = read_startup_registry(config.registry_root, limits_dir=config.registry_limits)
     # **Gate と authority runtime が照らす artifact は1つの変数から渡す**（決定記録 0089 §2.1）。
-    # Learned MPC の worker を配線していないので束縛する artifact は無い。authority は journal が
-    # 上がっていても Baseline より上を有効にしない（0089 §2.2）。worker を配線するときは、起動時に
-    # 読んだ registry の snapshot の production artifact をここへ置く（0077 §2.6）。
-    loaded_artifact_sha256: str | None = None
+    # 束縛する `thermal_model` が無ければ None で、authority は journal が上がっていても Baseline
+    # より上を有効にしない（0089 §2.2）。
+    loaded_artifact_sha256 = registry.binding.expected_artifact_sha256
     try:
         authority = open_authority_runtime(
             config.authority_root,
@@ -976,7 +988,9 @@ def build(
     admin = _open_admin(
         config, control, rules=rules, clock=clock, monotonic=monotonic, run_id=run_id
     )
-    learned = _open_learned(config, control, monotonic=monotonic, run_id=run_id)
+    learned = _open_learned(
+        config, control, monotonic=monotonic, run_id=run_id, registry_watch=registry.watch
+    )
     try:
         loop = _build_loop(
             config,
@@ -985,6 +999,7 @@ def build(
             contract=contract,
             binding=binding,
             authority=authority,
+            registry_binding=registry.binding,
             loaded_artifact_sha256=loaded_artifact_sha256,
             deadman=deadman,
             store=store,
@@ -1127,12 +1142,14 @@ def _open_learned(
     *,
     monotonic: MonotonicClock,
     run_id: str,
+    registry_watch: RegistryWatch | None,
 ) -> LearnedChannelEntry | DisabledLearnedChannel | None:
     """Learned worker との経路を開く（決定記録 0077 §2.2 / §2.7）。**開けなくても起動は続ける。**
 
     設定が与えられていなければ None（いまと同じ運転。loop に経路を配線しない）。与えられたのに
     開けなければ `DisabledLearnedChannel`（loop は `channel_disabled` を理由に
-    Fallback / RulePolicy）。
+    Fallback / RulePolicy）。registry を読めたら、受付スレッドが `safety.tick_ms` ごとに
+    production の移動を確かめる（0077 §2.6 の `registry_superseded`）。
     """
     if config.learned_channel_config is None:
         LOGGER.info(
@@ -1145,6 +1162,9 @@ def _open_learned(
         run_id=run_id,
         tick_deadline_ms=control.safety.tick_deadline_ms.value,
         monotonic=monotonic,
+        registry_watch=registry_watch,
+        # 新しい値を足さず、ループの周期に結び付ける（0077 §2.6）
+        registry_check_interval_ms=control.safety.tick_ms.value,
     )
     return entry if entry is not None else DisabledLearnedChannel()
 
@@ -1157,6 +1177,7 @@ def _build_loop(
     contract: ControlInputContract,
     binding: ControlRuntimeBinding,
     authority: AuthorityRuntime,
+    registry_binding: RegistryBinding,
     loaded_artifact_sha256: str | None,
     deadman: Watchdog,
     store: SqliteStore,
@@ -1179,11 +1200,11 @@ def _build_loop(
         fallback=FallbackController(control.policy, catalog),
         gate=ControllerGate(
             control.policy,
-            expected_model_version=UNCONFIGURED_MODEL_VERSION,
-            # **束縛した artifact が無いことを明示する**（いまは None。#159 / 決定記録 0059 §2.1）。
-            # worker を配線していないので提案は1件も来ないが、仮に来ても採らない。
+            # 起動時の registry の `thermal_model` の production（無ければ番兵
+            # `UNCONFIGURED_MODEL_VERSION`。どの提案も採らない。決定記録 0077 §2.6）。
+            expected_model_version=registry_binding.expected_model_version,
             # 既定値を置かず必須の引数にしてあるのは、渡し忘れが「何にも照らさない
-            # Gate」を作らないためである。
+            # Gate」を作らないためである（#159 / 決定記録 0059 §2.1）。
             # authority runtime と同じ値（決定記録 0089 §2.1）。
             expected_artifact_sha256=loaded_artifact_sha256,
             authority=authority,
@@ -1195,16 +1216,21 @@ def _build_loop(
         telemetry=StoreTelemetrySource(store, frozenset(spec.metric for spec in contract.signals)),
         clock=clock,
         monotonic=monotonic,
-        # **registry を読んでいないことを明示する**（#104 / 決定記録 0071 §2.5）。Learned MPC の
-        # worker を配線していない構成では束縛する artifact が無く、registry の root も
-        # 設定に無い。worker を配線するときは、起動時に読んだ snapshot の
-        # `RegistrySnapshot.trace_provenance()` を渡す（Gate の期待版と同じ snapshot から作る）。
-        registry=RegistryProvenance.unbound(),
+        # **Gate の期待版と同じ snapshot から作った版を毎 tick 載せる**（決定記録 0071 §2.5 /
+        # 0077 §2.6）。registry を読んでいない・読めない起動は `unbound()`。走行中に production が
+        # 移っても書き換えない（役割を閉じるだけ）。frame の `expected_artifacts` も loop が
+        # ここから作る
+        registry=registry_binding.provenance,
         # **モードの出どころは1つ。** 管理ソケットを開けたら受け渡し口、開けなければ常に AUTO
         # （0072 §2.2。開かなかった入口は死んだとは扱わない）
         mode_source=None if admin is not None else StaticOperatingMode(),
         admin_mode=None if admin is None else admin.tracker,
-        supervisor=SupervisorCoordinator(control.policy.supervisor, clock),
+        supervisor=SupervisorCoordinator(
+            control.policy.supervisor,
+            clock,
+            # 起動時の registry の `supervisor_policy` の production（文字列から作らない。0074 §5）
+            expected_rl_identity=registry_binding.expected_rl_identity,
+        ),
         regime=WorkloadRegimeEstimator(control.policy.workload_regime, catalog, clock),
         # **Learned の経路は提案の口・状態の口・送り出しの口を同じ object から渡す**（0077 §2.2）。
         # worker の提案が出せるのは requested まで。Guard と Critical Safety は迂回できない。
@@ -1348,6 +1374,22 @@ def build_parser() -> argparse.ArgumentParser:
             "省くと経路を開かない。不正なら経路を開かず Fallback / RulePolicy で運転する"
         ),
     )
+    parser.add_argument(
+        "--registry-root",
+        type=Path,
+        default=None,
+        help=(
+            "Model Registry の root（決定記録 0077 §2.6）。起動時に1回だけ読み、"
+            "再起動まで読み直さない。"
+            "省くと registry を読まない。読めなければ Learned を無効にして運転する"
+        ),
+    )
+    parser.add_argument(
+        "--registry-limits",
+        type=Path,
+        default=DEFAULT_REGISTRY_LIMITS,
+        help="model-registry.yaml のあるディレクトリ",
+    )
     parser.add_argument("--log-level", default="INFO")
     return parser
 
@@ -1383,6 +1425,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         admin_config=None if args.no_admin else args.admin_config,
         authority_root=args.authority_root,
         learned_channel_config=args.learned_channel_config,
+        registry_root=args.registry_root,
+        registry_limits=args.registry_limits,
     )
     monotonic: MonotonicClock = SystemMonotonicClock()
 

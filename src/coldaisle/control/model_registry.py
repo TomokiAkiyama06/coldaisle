@@ -55,7 +55,10 @@ Fallback へ落ちる（#89 レビュー）。**v2 は読み、次の書き込�
 """
 MODEL_REGISTRY_CONFIG_FILENAME = "model-registry.yaml"
 
-_STATE_FILENAME = "registry.json"
+REGISTRY_STATE_FILENAME = "registry.json"
+"""root 直下の snapshot の file 名。`coldaisle-fand` は production の移動を、この file の
+`stat` の同一性で先に絞ってから読み直して確かめる（決定記録 0077 §2.6）。"""
+_STATE_FILENAME = REGISTRY_STATE_FILENAME
 _LOCK_FILENAME = ".registry.lock"
 _ARTIFACT_FILENAME = "artifact.payload"
 _READ_CHUNK_BYTES = 1024 * 1024
