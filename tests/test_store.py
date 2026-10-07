@@ -69,7 +69,7 @@ def sample(ts_ms: int, **values: float | None) -> Sample:
 
 def test_open_applies_migrations(store):
     applied = store.connection.execute("SELECT version FROM schema_version").fetchall()
-    assert [row["version"] for row in applied] == [1, 2, 3, 4, 5, 6, 7, 8, 9]
+    assert [row["version"] for row in applied] == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
 
 
 def test_reopen_does_not_reapply(db_path, rules):
@@ -88,6 +88,7 @@ def test_reopen_does_not_reapply(db_path, rules):
             (7, 111),
             (8, 111),
             (9, 111),
+            (10, 111),
         ]
         # 適用済みの DB を開き直してもデータは残る
         assert second.latest(at_ms=1_000)["air.room"].value == 26.0
@@ -507,7 +508,7 @@ def test_concurrent_open_does_not_break(tmp_path, rules):
         futures = [pool.submit(open_store) for _ in range(2)]
         counts = [future.result(timeout=30) for future in futures]
 
-    assert counts == [9, 9], "どちらの接続から見ても全マイグレーションが1回ずつ適用される"
+    assert counts == [10, 10], "どちらの接続から見ても全マイグレーションが1回ずつ適用される"
 
 
 def test_version_is_rechecked_after_taking_the_lock(tmp_path, rules, monkeypatch):

@@ -123,6 +123,42 @@ Replay中にControl Engineが出したtrace、または保存済みtraceが必�
 `history_start_ms`から`label_end_ms`までが境界を跨ぐ場合、その例は`purged`へ入り、学習・
 評価には使われない。ランダムsplitは隣接windowが観測を共有するため使用しない。
 
+## Thermal Dataset v2（action 列。決定記録 0079 段 1 / 0087）
+
+v2 は v1 と別の型（`schema_version` 2）で、v1 を v2 として読み替えない。型は
+`coldaisle.control.model.dataset` の `DatasetSpecV2` / `DatasetExampleV2` / `ThermalDatasetV2`、
+生成は `coldaisle.dataset.ThermalDatasetV2Builder` にある。CLI（`coldaisle-dataset`）はまだ v1 だけを作る。
+
+v1 との違い（規則の正本は [0087](decisions/0087-dataset-v2-action-grid.md)）:
+
+- **action 列**: anchor の tick の時刻 `t_a` から、格子 `[t_a, t_a + action_steps × action_step_ms)` の
+  step ごとに、区間の開始時刻以前で直近の ControlTick の `effective` を持つ（as-of。丸め・補間をしない）。
+  元にした tick の時刻と `tick_id` を step ごとに残す。step 0 は anchor の tick 自身である。
+  step `k` は `ActionPlan.steps[k]`（`offset_ms` は区間の終端）と同じ区間である
+- **`prior_action`**: anchor の tick より厳密に前で直近の tick の `effective`。v2 の anchor action はこれで、
+  `ObservedThermalInput.from_example_v2` はこの値を action に使う。v1 と同じ `action`（anchor の tick 自身）は
+  分析用に残す
+- **spec の必須の欄**: `action_step_ms` / `action_steps` / `action_stale_after_ms`。**既定値は無い**（値は実データの後に
+  選ぶ。0087 §2.2）。各 horizon は `action_step_ms` の整数倍、`action_steps × action_step_ms` は最大の horizon と等しい
+- **target**: `[期待時刻 − 許容誤差, 期待時刻]` の観測のうち最も遅いものだけを採る（後ろの観測は、近くても採らない）。
+  `label_end_ms` は `t_a + 最大の horizon`
+- **作らない example と件数**: 次のどれかに当たる anchor の example は作らず、manifest の `excluded` に理由ごとの
+  件数を残す（複数に当たるときは、この順で最初の理由だけに数える）
+  1. `stale`: `prior_action` の元の tick、または格子の時刻の as-of の tick が `action_stale_after_ms` 以上古い。
+     anchor より前に tick が無い
+  2. `discontinuity`: `prior_action` の元の tick から最大の horizon までの隣り合う tick の差、または最後の tick から
+     最大の horizon までの差が `action_stale_after_ms` 以上。最大の horizon より後に tick が無い（run の末尾）
+  3. `in_step_change`: step の区間の中の tick の `effective` が、どれか1つの zone でも step の値と違う
+  4. `restart`: 検査の範囲（`prior_action` の元の tick から、最大の horizon より後の最初の tick まで）で、
+     `seq` の順に隣り合う tick の `tick_id` が減る、または同じ
+  5. `tick_id_gap`: 同じ範囲で `tick_id` が 2 以上増える（trace の保存に失敗した tick がある）
+- **生成全体を拒否する run**: `seq` の順に並べた ControlTick の `ts_ms` が狭義単調増加でない run と、移行前の行
+  （`seq ≤ legacy_through_seq`）を含む run。`legacy_through_seq` は migration `0010` が `control_trace_prune` に
+  足した列で、行が無い DB では 0、0007 を適用済みの DB では `ts_ms ≤ legacy_until_ms` の行の `MAX(seq)` である
+- **較正の変更**: 呼び出し側は宣言された変更（`DeclaredChange`。0056 §2.5）を必ず渡す（無ければ空の tuple）。
+  `calibration_changed` が全 example の期間 `[history_start_ms の最小, label_end_ms の最大]` の中にあれば生成を拒否する
+- `control_trace_sha256` は run の全 ControlTick を `seq` 付きで hash する（v2 は anchor 以外の tick も使うため）
+
 ## 実データ収集後に残る作業
 
 - baseline / characterization / GPU・CPU・同時負荷 / 通常運用runを収集する
