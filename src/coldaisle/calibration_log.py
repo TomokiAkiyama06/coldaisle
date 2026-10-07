@@ -7,7 +7,8 @@
 - **Dataset v2**: 記録が期間を覆うこと（被覆）と、変更の時刻（CSV の秒の切り捨ての区間の両端）
 - **学習の入口**: 期間の後の変更と、較正ファイルと最後の行の食い違いを拒否する（0096 §5 #4）。
   dataset に残した export の束縛（``ReplayBindingV2``）を本番の DB の ``csv_exports`` から
-  計算し直して照合し、example の期間が束縛した日に収まることを確かめる（決定記録 0100 §2.8）
+  計算し直して照合し、example の期間が束縛した日に収まることを確かめる（決定記録 0100 §2.8）。
+  元の入力から dataset を作り直して比べるのは ``training_entry``（決定記録 0112 §2.3）
 
 ``CalibrationHistory`` は store と合成の起点だけが扱う。``control/model`` へは時刻の列だけを渡す
 （0087 §2.6）。API・AI・control・``coldaisle-calibrate`` はここを使わない（書き手は取り込みだけ）。
@@ -378,7 +379,10 @@ def training_export_ids(dataset: ThermalDatasetV2) -> tuple[str, ...]:
 def verify_training_export_binding(
     dataset: ThermalDatasetV2, rows: Mapping[str, ExportRecord | None]
 ) -> None:
-    """学習の入口の export の照合（決定記録 0100 §2.8）。元の manifest と CSV は要らない。
+    """学習の入口の export の照合のうち、本番の DB の行で行う部分（決定記録 0100 §2.8）。
+
+    学習の入口そのものは :func:`coldaisle.training_entry.verify_training_dataset_v2` で、これは
+    その一段（元の入力から dataset を作り直す照合は決定記録 0112 §2.3。そちらが行う）。
 
     ``rows`` は較正の記録と同じ読み取り専用の接続・同じ read transaction で読んだ
     ``csv_exports`` の行（:func:`~coldaisle.store.export_binding.read_training_records`）。
