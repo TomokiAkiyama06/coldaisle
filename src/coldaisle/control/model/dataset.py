@@ -657,6 +657,15 @@ class DatasetExampleV2(_Frozen):
         source_times = tuple(step.source_ts_ms for step in self.action_steps)
         if tuple(sorted(source_times)) != source_times:
             raise ValueError("action_steps の元の tick の時刻が逆行している")
+        # 同じ元の tick（同じ ts_ms）を複数の step が使うなら、tick_id も値も同じにする。
+        # 1つの tick は1つの effective しか持たない（0087 §2.1）
+        sources: dict[int, tuple[int, PerZone[float]]] = {}
+        for step in self.action_steps:
+            seen = sources.setdefault(
+                step.source_ts_ms, (step.source_tick_id, step.effective_demand)
+            )
+            if seen != (step.source_tick_id, step.effective_demand):
+                raise ValueError("同じ元の tick を使う step の tick_id か値が食い違っている")
         return self
 
 

@@ -960,3 +960,27 @@ def test_v2_split_uses_the_v2_label_end(build_ticks):
     # v1 なら label_end は 7100 で validation 境界 7050 を跨ぐが、v2 は 7000 で train に入る
     split = split_temporally_v2((example,), validation_start_ms=7_050, test_start_ms=9_000)
     assert split.train == (example,)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        pytest.param("source_tick_id", 99, id="tick-id"),
+        pytest.param("effective_demand", {"front": 0.9, "rear": 0.5, "top": 0.5}, id="value"),
+    ],
+)
+def test_steps_sharing_a_source_tick_must_agree(build_ticks, field, value):
+    """複数の step が同じ tick を使うとき、tick_id と値は一致する（PR #221 の Codex P2）。"""
+    dataset = build_ticks(
+        ((4_500, 10, PRIOR), (5_000, 11, A), (6_800, 12, A), (7_500, 13, B)),
+        spec=spec_v2(action_stale_after_ms=1_900),
+    )
+    (example,) = dataset.examples
+    first, second = example.action_steps
+    assert second.source_ts_ms == first.source_ts_ms == 5_000
+    assert second.source_tick_id == first.source_tick_id
+
+    raw = dataset.model_dump(mode="json")
+    raw["examples"][0]["action_steps"][1][field] = value
+    with pytest.raises(ValidationError, match="同じ元の tick"):
+        DatasetExampleV2.model_validate_json(json.dumps(raw["examples"][0]))
