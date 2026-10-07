@@ -1,15 +1,15 @@
 # 決定記録 0100: 再生の入力を export と照合する（日次 CSV の横に export の manifest を置いて timezone と元の DB を束縛し、dataset 用の再生と Dataset v2 の生成で照合して食い違えば拒否する）
 
 - **種別**: Decision Record
-- **Status**: Proposed
+- **Status**: FINAL（2026-10-07、リポジトリ所有者が §5 の14点をすべて推奨案で承認。§6。本記録が頼る 0099 は同日 FINAL）
 - **Date**: 2026-10-07
 - **Supersedes**: 0099 §2.6 の2つの暫定運用の部分のみ（§2.9。段 3 のマージをもって、人の手順をコードの検査に置き換える）。
   (1)「再生の timezone」の項の「それまで、v2 の学習に使う再生は本番（export）と同じ timezone で行う」、
   (2)「再生の入力と記録の DB の束縛」の項の「それまでの暫定運用: v2 の学習には、記録と同じ本番の DB から export した
-  CSV だけを使う」。旧記録側への `Superseded by` の追記は、0099（PR #234）がマージされた後、本記録を FINAL にする PR で
-  行う（README「追記のみ」の例外。§5 #8）。0008 §2.8 の CSV の形と 0010 §2.7 の「タイムゾーンは呼び出し側から受け取る」は
+  CSV だけを使う」。旧記録側への `Superseded by`（段 3 のマージをもって、の条件つき）の
+  追記は本 PR で行った（README「追記のみ」の例外。§5 #8）。0008 §2.8 の CSV の形と 0010 §2.7 の「タイムゾーンは呼び出し側から受け取る」は
   変えない。dataset 用の再生と Dataset v2 の生成にだけ、export の manifest との照合を**足す**（§5 #1 / #4）
-- **関連**: [0099](0099-calibration-change-log.md) §2.6（「再生の timezone」と「再生の入力と記録の DB の束縛」。PR #234）/
+- **関連**: [0099](0099-calibration-change-log.md) §2.6（「再生の timezone」と「再生の入力と記録の DB の束縛」）/
   [0087](0087-dataset-v2-action-grid.md) §2.6 / [0094](0094-dataset-v2-settled-points.md) §2.4 /
   [0031](0031-thermal-dataset-contract.md) §2.3（1 source run 専用の DB と `dataset_source_run`）/
   [0010](0010-csv-replay.md) §2.1 / §2.7 / [0008](0008-rollup-and-retention.md) §2.8 /
@@ -242,8 +242,8 @@ dataset 用でない再生（デバッグや画面の確認。0010）は次の�
 
 その PR で `docs/thermal-dataset.md` の2つの注意を「照合される（決定記録 0100）」に書き換える。
 0099 の本文は書き換えない。ただし 0099 だけを読んだ人が失効した手順に従わないよう、本記録の Supersedes に
-その部分を書き、0099 のヘッダへ `Superseded by` を追記する（README「追記のみ」の例外。追記は 0099 のマージ後、
-本記録を FINAL にする PR で行い、「段 3 のマージをもって」と条件を添える。§5 #8。PR #238 の Codex の指摘）。
+その部分を書き、0099 のヘッダへ `Superseded by` を追記する（README「追記のみ」の例外。追記は本記録を
+FINAL にした PR #238 で行い、「段 3 のマージをもって」と条件を添えた。§5 #8。PR #238 の Codex の指摘）。
 
 ### 2.10 実装の段
 
@@ -344,21 +344,44 @@ Dataset v2 の生成（段 3）:
 | 食い違ったときに manifest の timezone で読み替えて続ける | 人が打った値と違う動きを黙ってする。`--timezone` を明示したなら食い違いは人の誤りで、知らせて止めるほうがよい（§5 #4） |
 | `SourceRun` に `local_timezone` を足す | v1 と v2 が共有する型で、版を上げずに v1 の artifact の形が変わる（§2.8。PR #238 の Codex の指摘） |
 
-## 5. 未決事項（所有者に確認したい点）
+## 5. 未決事項（所有者に確認した点）
+
+2026-10-07、所有者が14点すべてを推奨案で決めた（§6）。番号は本文からの参照を保つため提案時のまま残し、各行の論点の先頭に「決着」と書いた。「代替」の列は判断前の記録である。
 
 | # | 論点 | 推奨 | 代替 |
 |---|---|---|---|
-| 1 | timezone の記録先 | **CSV の横の manifest（1日1つ）**（§2.1）。CSV の形を変えない | (a) CSV に UTC の列を足す（#9）。(b) ディレクトリに1つの manifest（日ごとの export と書き直しの単位が合わない） |
-| 2 | manifest のファイル名 | `sensors_YYYY-MM-DD.export.json`（`sensors_*.csv` の glob に掛からず、CSV と並んで見える） | `sensors_YYYY-MM-DD.csv.json`、または `.manifest/` のような隠しディレクトリ |
-| 3 | export の timezone の出どころ | **`config/retention.yaml` の `csv_timezone`（必須・既定値なし）**。`--timezone` は残し、設定と違えば拒否（§2.2） | (a) `--timezone` を `--export-day` のとき必須にし、設定には置かない。(b) `--timezone` を廃止する（呼び出しが壊れる） |
-| 4 | dataset 用の再生の timezone の決め方 | **manifest の値を使い、`--timezone` を明示して食い違えば拒否**（§2.3 の 4） | `--timezone` を必須にし、manifest と一致しなければ拒否（人が打つ値が1つ増え、意味は同じ） |
-| 5 | 1 run に timezone の違う CSV が混ざるとき | **拒否**（§2.3 の 3）。source run に1つの timezone を持たせる | ファイルごとに manifest の値で読む（照合は効くが、source run の timezone が1つに定まらない） |
-| 6 | dataset 用でない再生で、manifest があり食い違うとき | **拒否し、照合と取り込みを同じ snapshot から読む**（§2.3）。デバッグ用でも、ずれた時刻の DB を作る利益が無い | 警告して `--timezone` の値で続ける（0010 §2.7 のまま。デバッグの自由度を残す） |
-| 7 | fingerprint と source run への束縛 | **3つとも行う**: fingerprint に manifest を含める（版を付け、manifest の無い入力の値は変えない）・`dataset_source_run` に列を足す（段 2）・v2 専用の `ReplayBindingV2` を `DatasetManifestV2` に持たせる（`SourceRun` は変えない）（§2.8） | (a) fingerprint だけ（manifest が timezone と `export_id` を持つので推移的に束縛される。migration が要らないが、DB と artifact から直接読めない）。(b) fingerprint は変えず v2 の manifest だけ（同じ CSV に別の manifest を付けた入力を区別できない） |
-| 8 | 0099 の暫定運用の扱い | **0100 の Supersedes に 0099 §2.6 の2つの暫定運用の部分を書き、0099 へ `Superseded by`（「段 3 のマージをもって」の条件つき）を追記する**（§2.9）。0099 だけを読んだ人が失効した手順に従わないため（AGENTS.md「決定記録」。PR #238 の Codex の指摘）。追記は 0099 のマージ後、本記録を FINAL にする PR で行う | 0099 を書き換えず `Superseded by` も付けない（暫定運用は「それまで」の条件付きなので段 3 で自然に失効する。ただし 0099 から辿れない） |
-| 9 | DST の扱い（行ごとのオフセットへ移すか） | **移さない。曖昧・存在しない時刻を含む CSV は dataset 用の再生で拒否する**（§2.5）。本番は `Asia/Tokyo` で DST が無い | (a) CSV に `timestamp_utc_ms` の列を足し、再生はそれを正とする（DST と秒の切り捨てが両方消える。0008 §2.8 の「従来の列だけ」を変える。0099 §5 #9 の判断と整合させる必要がある）。(b) 時刻をオフセット付きにする（§4） |
-| 10 | 実装の Issue の切り方 | **#237 で段 1〜3 を順に別 PR**（§2.10）。段 3 は 0099 の実装の後 | 段 1 / 段 2 を1つの PR にする |
-| 11 | (D) の束縛の形 | **export ごとに `export_id` を払い出し、manifest と同じ内容を元の DB の追記のみの表 `csv_exports` に残す。Dataset v2 の生成で、`--calibration-history-db` の `csv_exports` と manifest を全欄で照合する**（§2.6） | (a) DB に1つの `db_id` を持たせ manifest に写す（CSV の書き換えを見つけられない）。(b) `csv_exports` に加えて `db_id` も持つ（複製の区別はできないので、得るものが小さい）。(c) 較正の記録の写しを manifest に入れ、DB を読まない（記録の鎖（0099 §2.5）の検証が manifest の写しに対してはできない） |
-| 12 | `csv_exports` の書き手と置き場所 | **`coldaisle-rollup --export-day` だけが、readings を読んだのと同じ DB に書く**（§2.6）。保持期間の削除の対象にしない | export を別の CLI に分け、その CLI だけを書き手にする（書き手の境界ははっきりするが、運用の手順が1つ増える） |
-| 13 | export の書く順序 | **一時ファイル → DB の commit → CSV の rename → manifest の rename**（§2.1）。どこで落ちても安全側 | DB の commit を最後にする（rename の後に落ちると、manifest はあるのに DB に行が無い CSV が残る。これも生成で拒否されるので安全側だが、export の成否の見分けが遅れる） |
-| 14 | manifest の無い dataset 用の再生 | **「照合していない」run として bind し、v1 には使え、v2 の builder と学習の入口で拒否する**（§2.3）。混在は拒否 | 再生の時点で拒否する（v1 の再生成と既存の試験が止まる。PR #238 の Codex の指摘） |
+| 1 | **決着**（2026-10-07 所有者の決定、推奨案）。timezone の記録先 | **CSV の横の manifest（1日1つ）**（§2.1）。CSV の形を変えない | (a) CSV に UTC の列を足す（#9）。(b) ディレクトリに1つの manifest（日ごとの export と書き直しの単位が合わない） |
+| 2 | **決着**（2026-10-07 所有者の決定、推奨案）。manifest のファイル名 | `sensors_YYYY-MM-DD.export.json`（`sensors_*.csv` の glob に掛からず、CSV と並んで見える） | `sensors_YYYY-MM-DD.csv.json`、または `.manifest/` のような隠しディレクトリ |
+| 3 | **決着**（2026-10-07 所有者の決定、推奨案）。export の timezone の出どころ | **`config/retention.yaml` の `csv_timezone`（必須・既定値なし）**。`--timezone` は残し、設定と違えば拒否（§2.2） | (a) `--timezone` を `--export-day` のとき必須にし、設定には置かない。(b) `--timezone` を廃止する（呼び出しが壊れる） |
+| 4 | **決着**（2026-10-07 所有者の決定、推奨案）。dataset 用の再生の timezone の決め方 | **manifest の値を使い、`--timezone` を明示して食い違えば拒否**（§2.3 の 4） | `--timezone` を必須にし、manifest と一致しなければ拒否（人が打つ値が1つ増え、意味は同じ） |
+| 5 | **決着**（2026-10-07 所有者の決定、推奨案）。1 run に timezone の違う CSV が混ざるとき | **拒否**（§2.3 の 3）。source run に1つの timezone を持たせる | ファイルごとに manifest の値で読む（照合は効くが、source run の timezone が1つに定まらない） |
+| 6 | **決着**（2026-10-07 所有者の決定、推奨案）。dataset 用でない再生で、manifest があり食い違うとき | **拒否し、照合と取り込みを同じ snapshot から読む**（§2.3）。デバッグ用でも、ずれた時刻の DB を作る利益が無い | 警告して `--timezone` の値で続ける（0010 §2.7 のまま。デバッグの自由度を残す） |
+| 7 | **決着**（2026-10-07 所有者の決定、推奨案）。fingerprint と source run への束縛 | **3つとも行う**: fingerprint に manifest を含める（版を付け、manifest の無い入力の値は変えない）・`dataset_source_run` に列を足す（段 2）・v2 専用の `ReplayBindingV2` を `DatasetManifestV2` に持たせる（`SourceRun` は変えない）（§2.8） | (a) fingerprint だけ（manifest が timezone と `export_id` を持つので推移的に束縛される。migration が要らないが、DB と artifact から直接読めない）。(b) fingerprint は変えず v2 の manifest だけ（同じ CSV に別の manifest を付けた入力を区別できない） |
+| 8 | **決着**（2026-10-07 所有者の決定、推奨案）。0099 の暫定運用の扱い | **0100 の Supersedes に 0099 §2.6 の2つの暫定運用の部分を書き、0099 へ `Superseded by`（「段 3 のマージをもって」の条件つき）を追記する**（§2.9）。0099 だけを読んだ人が失効した手順に従わないため（AGENTS.md「決定記録」。PR #238 の Codex の指摘）。追記は本記録を FINAL にする PR で行う | 0099 を書き換えず `Superseded by` も付けない（暫定運用は「それまで」の条件付きなので段 3 で自然に失効する。ただし 0099 から辿れない） |
+| 9 | **決着**（2026-10-07 所有者の決定、推奨案）。DST の扱い（行ごとのオフセットへ移すか） | **移さない。曖昧・存在しない時刻を含む CSV は dataset 用の再生で拒否する**（§2.5）。本番は `Asia/Tokyo` で DST が無い | (a) CSV に `timestamp_utc_ms` の列を足し、再生はそれを正とする（DST と秒の切り捨てが両方消える。0008 §2.8 の「従来の列だけ」を変える。0099 §5 #9 の判断と整合させる必要がある）。(b) 時刻をオフセット付きにする（§4） |
+| 10 | **決着**（2026-10-07 所有者の決定、推奨案）。実装の Issue の切り方 | **#237 で段 1〜3 を順に別 PR**（§2.10）。段 3 は 0099 の実装の後 | 段 1 / 段 2 を1つの PR にする |
+| 11 | **決着**（2026-10-07 所有者の決定、推奨案）。(D) の束縛の形 | **export ごとに `export_id` を払い出し、manifest と同じ内容を元の DB の追記のみの表 `csv_exports` に残す。Dataset v2 の生成で、`--calibration-history-db` の `csv_exports` と manifest を全欄で照合する**（§2.6） | (a) DB に1つの `db_id` を持たせ manifest に写す（CSV の書き換えを見つけられない）。(b) `csv_exports` に加えて `db_id` も持つ（複製の区別はできないので、得るものが小さい）。(c) 較正の記録の写しを manifest に入れ、DB を読まない（記録の鎖（0099 §2.5）の検証が manifest の写しに対してはできない） |
+| 12 | **決着**（2026-10-07 所有者の決定、推奨案）。`csv_exports` の書き手と置き場所 | **`coldaisle-rollup --export-day` だけが、readings を読んだのと同じ DB に書く**（§2.6）。保持期間の削除の対象にしない | export を別の CLI に分け、その CLI だけを書き手にする（書き手の境界ははっきりするが、運用の手順が1つ増える） |
+| 13 | **決着**（2026-10-07 所有者の決定、推奨案）。export の書く順序 | **一時ファイル → DB の commit → CSV の rename → manifest の rename**（§2.1）。どこで落ちても安全側 | DB の commit を最後にする（rename の後に落ちると、manifest はあるのに DB に行が無い CSV が残る。これも生成で拒否されるので安全側だが、export の成否の見分けが遅れる） |
+| 14 | **決着**（2026-10-07 所有者の決定、推奨案）。manifest の無い dataset 用の再生 | **「照合していない」run として bind し、v1 には使え、v2 の builder と学習の入口で拒否する**（§2.3）。混在は拒否 | 再生の時点で拒否する（v1 の再生成と既存の試験が止まる。PR #238 の Codex の指摘） |
+
+## 6. 承認記録
+
+**2026-10-07、リポジトリ所有者が §5 の14点をすべて推奨案で承認し、本記録を FINAL にした。**
+
+| §5 の判断点 | 決定 | 本記録 |
+|---|---|---|
+| 1 | timezone の記録先は CSV の横の export manifest（1日1つ）。CSV の形は変えない | §2.1 |
+| 2 | manifest の名前は `sensors_YYYY-MM-DD.export.json` | §2.1 |
+| 3 | export の timezone は `config/retention.yaml` の `csv_timezone`（必須・既定値なし）。`--timezone` は残し、設定と違えば拒否 | §2.2 |
+| 4 | dataset 用の再生は manifest の timezone を使い、`--timezone` を明示して食い違えば拒否 | §2.3 の 4 |
+| 5 | 1 run に timezone の違う CSV が混ざれば拒否 | §2.3 の 3 |
+| 6 | dataset 用でない再生でも、manifest があり食い違えば拒否し、照合と取り込みを同じ snapshot から読む | §2.3 |
+| 7 | fingerprint に manifest を含め（版を付け、manifest の無い入力の値は変えない）、`dataset_source_run` に列を足し（段 2）、v2 専用の `ReplayBindingV2` を持つ（`SourceRun` は変えない） | §2.8 |
+| 8 | 0099 §2.6 の2つの暫定運用を Supersedes に書き、0099 へ条件つきの `Superseded by` を追記する（本 PR で追記した） | ヘッダ / §2.9 |
+| 9 | 行ごとのオフセットへは移さず、曖昧・存在しない時刻を含む CSV は dataset 用の再生で拒否する | §2.5 |
+| 10 | #237 で段 1〜3 を順に別 PR。段 3 は 0099 の実装の後 | §2.10 |
+| 11 | (D) は `export_id` と元の DB の追記のみの表 `csv_exports` で束縛し、Dataset v2 の生成で全欄を照合する | §2.6 |
+| 12 | `csv_exports` の書き手は `coldaisle-rollup --export-day` だけで、readings を読んだ DB に書く。保持期間の削除の対象にしない | §2.6 |
+| 13 | export は一時ファイル → DB の commit → CSV の rename → manifest の rename の順に書く | §2.1 |
+| 14 | manifest の無い dataset 用の再生は「照合していない」run として bind し、v1 には使え、v2 の builder と学習の入口で拒否する。混在は拒否 | §2.3 |
