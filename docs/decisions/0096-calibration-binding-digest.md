@@ -178,7 +178,10 @@ PR #226 の引数（`calibration_sha256: Sha256 | None`）を次へ替える。�
   登録済みの v2 artifact も無い前提で、移行の手順は置かない
 - 試験の fixture が使っている任意の digest（`tests/test_thermal_model_v2.py` の `CALIBRATION_SHA`）は、
   §2.6 の実装 PR で本規則の計算値に置き換える
-- 本規則より前の手順で作った v2 artifact が仮にあれば、L9 で拒否される（§2.5）。作り直す
+- 本規則より前の手順（呼び出し側が任意の digest を渡す）で作った v2 artifact が仮にあっても、L9 で拒否されるとは
+  限らない（渡した値が本規則の値と偶然一致する、特に `null` の artifact は通る。§2.5 と同じ理由）。L9 に頼らず、
+  そうした artifact は Registry に production として登録・昇格しない。あれば本規則の trainer で作り直し、古いものは
+  retire する（PR #229 の Codex の指摘）
 
 ### 2.9 試験すべき性質
 
