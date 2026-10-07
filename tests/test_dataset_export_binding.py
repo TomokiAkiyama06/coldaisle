@@ -368,32 +368,38 @@ def built(tmp_path, rules, clock) -> tuple[ThermalDatasetV2, Path]:
     return dataset, history
 
 
+@pytest.fixture
+def rows_only():
+    """``csv_exports`` の行で行う検査（0100 §2.8）。作り直す照合は test_training_entry。"""
+    return verify_training_export_binding
+
+
 def rows_of(history: Path, dataset: ThermalDatasetV2):
     return read_training_records(history, training_export_ids(dataset))[1]
 
 
-def test_training_entry_accepts_the_built_dataset_without_manifests(built):
+def test_training_entry_accepts_the_built_dataset_rows(built, rows_only):
     dataset, history = built
-    verify_training_export_binding(dataset, rows_of(history, dataset))
+    rows_only(dataset, rows_of(history, dataset))
 
 
-def test_training_entry_refuses_a_dataset_without_a_binding(built):
+def test_training_entry_refuses_a_dataset_without_a_binding(built, rows_only):
     dataset, history = built
     bare = dataset.model_copy(
         update={"manifest": dataset.manifest.model_copy(update={"replay_bindings": None})}
     )
     with pytest.raises(ValueError, match="ReplayBindingV2"):
-        verify_training_export_binding(bare, rows_of(history, dataset))
+        rows_only(bare, rows_of(history, dataset))
 
 
-def test_training_entry_refuses_a_missing_row(built, tmp_path):
+def test_training_entry_refuses_a_missing_row(built, tmp_path, rows_only):
     dataset, _ = built
     other = Path(history_db(tmp_path / "other.db", COVERING_ROW_MS))
     with pytest.raises(ValueError, match="行が無い"):
-        verify_training_export_binding(dataset, rows_of(other, dataset))
+        rows_only(dataset, rows_of(other, dataset))
 
 
-def test_training_entry_refuses_a_row_with_another_record(built, tmp_path):
+def test_training_entry_refuses_a_row_with_another_record(built, tmp_path, rows_only):
     """同じ export_id でも、行の中身が違えば export_record_sha256 が合わない。"""
     dataset, _ = built
     other = Path(history_db(tmp_path / "other.db", COVERING_ROW_MS))
@@ -401,7 +407,7 @@ def test_training_entry_refuses_a_row_with_another_record(built, tmp_path):
         other, (fixture_export_record().model_copy(update={"csv_sha256": "c" * 64}),)
     )
     with pytest.raises(ValueError, match="export_record_sha256"):
-        verify_training_export_binding(dataset, rows_of(other, dataset))
+        rows_only(dataset, rows_of(other, dataset))
 
 
 def rebound(dataset: ThermalDatasetV2, records: tuple[ExportRecord, ...]) -> ThermalDatasetV2:
@@ -428,30 +434,30 @@ def rebound(dataset: ThermalDatasetV2, records: tuple[ExportRecord, ...]) -> The
     return ThermalDatasetV2.model_validate_json(json.dumps(raw))
 
 
-def test_training_entry_refuses_ids_borrowed_from_another_day(built):
+def test_training_entry_refuses_ids_borrowed_from_another_day(built, rows_only):
     """関係の無い正当な export の ID だけを借りた dataset は、期間の検査で拒否する。"""
     dataset, history = built
     add_fixture_exports(history, (other_record(),))
     borrowed = rebound(dataset, (other_record(),))
     with pytest.raises(ValueError, match="日の区間"):
-        verify_training_export_binding(borrowed, rows_of(history, borrowed))
+        rows_only(borrowed, rows_of(history, borrowed))
 
 
-def test_training_entry_accepts_adjacent_days_that_cover_the_period(built):
+def test_training_entry_accepts_adjacent_days_that_cover_the_period(built, rows_only):
     dataset, history = built
     add_fixture_exports(history, (other_record(),))
     both = rebound(dataset, (fixture_export_record(), other_record()))
-    verify_training_export_binding(both, rows_of(history, both))
+    rows_only(both, rows_of(history, both))
 
 
-def test_training_entry_refuses_listed_fields_that_differ_from_the_row(built):
+def test_training_entry_refuses_listed_fields_that_differ_from_the_row(built, rows_only):
     """digest は合っても、写した欄（日の区間など）が行と違えば拒否する。"""
     dataset, history = built
     raw = json.loads(dataset.model_dump_json())
     raw["manifest"]["replay_bindings"][0]["exports"][0]["day_end_ms"] = 86_400_001
     tampered = ThermalDatasetV2.model_validate_json(json.dumps(raw))
     with pytest.raises(ValueError, match="欄が csv_exports の行と違う"):
-        verify_training_export_binding(tampered, rows_of(history, dataset))
+        rows_only(tampered, rows_of(history, dataset))
 
 
 def test_training_entry_uses_the_same_read_as_the_calibration_history(built):
@@ -469,7 +475,7 @@ def test_fixture_binding_matches_its_digest():
     assert fixture_export_binding  # conftest の補助が import できる
 
 
-def test_training_entry_joins_adjacent_day_spans(built):
+def test_training_entry_joins_adjacent_day_spans(built, rows_only):
     """example の期間が2つの export の境目をまたいでも、つながった区間に収まれば通る。"""
     dataset, history = built
     middle = T0 + 3_000  # ALIGNED の唯一の example の期間 [T0, T0 + 7000] の中
@@ -479,12 +485,12 @@ def test_training_entry_joins_adjacent_day_spans(built):
     second = other_record(export_id="export-" + "2" * 32, day_start_ms=middle)
     add_fixture_exports(history, (first, second))
     split = rebound(dataset, (first, second))
-    verify_training_export_binding(split, rows_of(history, split))
+    rows_only(split, rows_of(history, split))
     gap = other_record(export_id="export-" + "3" * 32, day_start_ms=middle + 1)
     add_fixture_exports(history, (gap,))
     holed = rebound(dataset, (first, gap))
     with pytest.raises(ValueError, match="日の区間"):
-        verify_training_export_binding(holed, rows_of(history, holed))
+        rows_only(holed, rows_of(history, holed))
 
 
 def test_each_source_run_has_exactly_one_binding(built):

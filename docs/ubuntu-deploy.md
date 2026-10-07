@@ -45,6 +45,7 @@
 | DB・レポート・案件資料など実行時のデータ | `/var/lib/coldaisle`（`/opt/coldaisle/var` からリンクする） |
 | 日次 CSV | `/var/lib/coldaisle/server_sensor_logs`（下の注記） |
 | 秘匿情報（`.env.example` の変数） | `/etc/coldaisle/coldaisle.env`（任意） |
+| Model Registry（Fan 制御の artifact。6.7） | `/var/lib/coldaisle-registry`（仮の名前） |
 | ログ | journald（`journalctl -u coldaisle-daemon` など） |
 
 `config/retention.yaml` の `csv_dir` は `~/server_sensor_logs` です。サービス用
@@ -318,9 +319,9 @@ sudo install -d -o coldaisle-fan -g coldaisle-authority -m 2770 /var/lib/coldais
   （`coldaisle` と同じ考え方。アカウントに入れると unit の外でも journal を書けてしまいます）
 - 昇格と、fand が止まっているときの rollback は `coldaisle-authority raise` / `rollback`
   （0086 §2.10 の段階 3b。#92）で行います。使い方・終了コードは `docs/authority-rollout.md`。
-  **本番での `raise` は、操作者に制御設定の読み取りと Model Registry の lock の最小権限を与える設計が
-  決まるまで使えません（#217。0086 §5 の未決 3。この文書の末尾）。** この手順のままでは承認者が制御設定も
-  Registry の lock も読めず、必ず失敗します。個別に権限を足して回避しないでください。
+  承認者が制御設定を読み、Model Registry の lock を取るための権限は 6.7（決定記録 0104 / 0105）で与えます。
+  **本番での `raise` は、6.7 の手順 9（実機での確認。0104 の段階 C）が導入先で通るまで使えません（#217）。**
+  6.7 の手順の外で個別に権限を足して回避しないでください。
   `rollback` は authority のディレクトリだけを使うので、この手順のままで使えます
 - グループへの所属は、`usermod` の後に**ログインし直してから**効きます（`dialout` と同じ）。
   いまの shell のまま CLI を実行すると `2770` のディレクトリへ入れず、権限の error で止まります。
@@ -366,7 +367,8 @@ Learned worker の経路（`config/learned-channel.yaml`。#86）を使うとき
 0077 の段階 6 で確定します）。
 
 `/etc/coldaisle` は 2 節で `root:coldaisle`・`0750` にしてあります。fand は補助グループ
-`coldaisle` でたどります。
+`coldaisle` でたどります。承認者には 6.7 で POSIX ACL の読み取りだけを足します（所有者・グループ・mode は
+この節のまま変えません）。
 
 **unit の `WatchdogSec=` は `safety.yaml` の `watchdog_timeout_ms` と同じ値にします。**
 テンプレートの `5s` は試験の fixture と同じ仮の値です。unit の側が長いと fand は終了コード 4 で
@@ -573,6 +575,208 @@ CLI の書いた journal を読むと、走行中なら `SHADOW` へ下がり、
    起動時に `authority.json` を読めなければ fand は制御を取らずに終了コード 5 で終わります（0072 §2.6）。
    **`enable` はしません**（6 節の冒頭のとおり）
 
-承認者が Model Registry の lock を取り、報告と制御設定を読むための権限（Registry のディレクトリの
-グループ）は、決定記録 0086 §5 の 3 で未決です（#217）。この節では扱いません。**それが決まるまで、本番での
-`coldaisle-authority raise` は使えません**（`rollback` は使えます）。
+承認者が Model Registry の lock を取り、報告と制御設定を読むための権限は 6.7 で与えます（決定記録 0104）。
+
+### 6.7 承認者の最小権限（制御設定の読み取りと Model Registry。決定記録 0104 / 0105）
+
+決定の理由は決定記録 [`0104`](decisions/0104-authority-raise-least-privilege.md)（§2.1〜§2.6・§2.9）と
+[`0105`](decisions/0105-registry-shared-root-settled-points.md) を見てください。ここに書く名前（グループ
+`coldaisle-registry` / `coldaisle-authority`・`/var/lib/coldaisle-registry`）は**すべて仮の値**です。
+**実機のユーザー名・ホスト名・path はコミットしません**（AGENTS.md ルール10）。
+
+> **本番での `coldaisle-authority raise` は、この節の手順 9（実機での確認。0104 の段階 C）が導入先で通り、
+> 結果を #217 に残すまで使えません。** 手順 1〜8 で権限を置いても、確認が済むまでは `raise` しません。
+> `rollback` はこの節に関係なく使えます。この節の手順でも fand を `enable` も `start` もしません。
+
+**誰が何をできるか**（0104 §2.1）
+
+| 役割（仮の名前） | 制御設定 | Registry（`registry.json`・artifact） | `.registry.lock` | authority のディレクトリ |
+|---|---|---|---|---|
+| fand（`coldaisle-fan`） | 読む（6.2 のまま） | `--registry-root` を渡したときだけ読む（unit の補助グループ `coldaisle-authority` 経由の ACL） | 使わない | 読み書き（6.1） |
+| 承認者（`coldaisle-authority` の人） | **読む**（ACL） | **読む**（ACL） | **flock だけ**（`r`） | 読み書き（6.1） |
+| Registry の書き手（`coldaisle-registry` の人） | 触らない | 読み書き（グループ） | 読み書き（グループ） | 触らない |
+| `coldaisle`（API / 取り込み）・AI 層 | 触らない | 触らない | 触らない | 触らない |
+
+- 承認者も Registry の書き手も**自分の uid のまま**実行します（`sudo` も `sudo -u` も使いません。0086 §2.1）
+- 同じ人が `coldaisle-registry` と `coldaisle-authority` の両方に入ることは認めます（0104 §5 の 3）。
+  分けられるなら分けてください
+- Learned worker の unit が artifact を読む権限は 0077 の段階 6 で決めます。worker を `coldaisle-authority` には
+  入れません（journal を書けてしまうため）
+- POSIX ACL を使います（Ubuntu の ext4 は既定で対応。`getfacl` / `setfacl` は `acl` パッケージ）。
+  ACL が外れたときは `raise` が読めずに止まるだけで、journal も fand も変わりません（安全側）
+
+1. **制御設定の読み取り**（0104 §2.2）。所有者・グループ・mode（6.2 の `root:coldaisle-fan`・`0750` / `0640`）は
+   変えず、名前付きグループの ACL だけを足します
+
+   ```bash
+   # 親はたどれるだけにする（一覧は見せない。coldaisle.env と control-admin.yaml は読めないまま）
+   sudo setfacl -m g:coldaisle-authority:--x /etc/coldaisle
+   # 制御設定のディレクトリと4ファイル。default ACL で、install で置き直したファイルにも付ける
+   sudo setfacl -m g:coldaisle-authority:r-x /etc/coldaisle/control-config
+   sudo setfacl -d -m g:coldaisle-authority:r-- /etc/coldaisle/control-config
+   # 4ファイルは名前で指す。導入する人の shell は 0750 の /etc/coldaisle をたどれないので、
+   # `*.yaml` は sudo の前に展開されず、setfacl に文字のまま渡って失敗する
+   for f in fan-hardware.yaml safety.yaml fan-policy.yaml air-balance.yaml; do
+     sudo setfacl -m g:coldaisle-authority:r-- "/etc/coldaisle/control-config/$f"
+   done
+   ```
+
+   - 書き込みは誰にも足しません。root の所有のままなので、fand も承認者も `safety.yaml` を緩められません
+   - 4ファイルを `install -m 0640` で置き直すと、default ACL から読み取りが付きます。置き直した後は
+     手順 8 の `getfacl` で確かめます
+2. **Registry の書き手のグループ**（0104 §2.3）
+
+   ```bash
+   sudo groupadd --system coldaisle-registry
+   # ログインし直すと反映される。coldaisle と AI 層のユーザー・fand は入れない
+   sudo usermod -aG coldaisle-registry <Registry を書く人のユーザー名>
+   ```
+
+3. **Registry のディレクトリ**（`root:coldaisle-registry`・`2770`・承認者に ACL の読み取り）
+
+   ```bash
+   sudo install -d -o root -g coldaisle-registry -m 2770 /var/lib/coldaisle-registry
+   sudo setfacl -m g:coldaisle-authority:r-x /var/lib/coldaisle-registry
+   sudo setfacl -d -m g:coldaisle-authority:r-X /var/lib/coldaisle-registry
+   ```
+
+   - 所有者は root にします。書き手のグループの人がディレクトリの mode や ACL を変えられないようにするためです
+   - systemd の `StateDirectory=` にはしません（所有者とグループが unit の `User=` / `Group=` へ付け替えられる）
+   - Registry が作るファイルは `umask` に依らず `0640`、root の下に作るディレクトリは `2770`（親の bit を写す）に
+     なります（0104 §2.3 の実装）。default ACL から承認者の読み取りが付きます
+4. **lock は導入手順で作ります。** どの CLI も、共有の root（setgid 付き）では `.registry.lock` を作りません
+   （0104 §2.4 / 0105 §2.5）。無ければ書き手も承認者も `RegistrySharedRootError` で止まります
+
+   ```bash
+   sudo install -o root -g coldaisle-registry -m 0660 /dev/null /var/lib/coldaisle-registry/.registry.lock
+   sudo setfacl -m g:coldaisle-authority:r-- /var/lib/coldaisle-registry/.registry.lock
+   ```
+
+   - 承認者に要るのは `r` だけです。`coldaisle-authority raise` は lock を `O_RDONLY` で開いて `flock` だけを
+     取ります（0104 §5 の 5）
+   - lock が消えたら、Registry の書き込みも `raise` も止まります（壊れずに止まる）。**作り直す前に、消えた lock を
+     まだ握っているプロセスが無いことを確かめます。** 消えた lock を握ったままの書き手がいる間に同じ名前で作り直すと、
+     新しい lock は別の inode なので、次の書き手がそれを取れてしまい、2つの書き込みが同じ revision を見て互いの
+     snapshot を上書きしうるためです。Registry の書き手と `coldaisle-authority raise` をすべて終わらせ、
+     `/proc/locks` に消えた inode の `FLOCK` が残っていないこと（下の「書き手のコマンドが返ってこないとき」の
+     見方。消えたファイルの inode は `sudo ls -l /proc/<pid>/fd` の `(deleted)` でも分かる）を確かめてから、
+     上の2行で作り直します
+   - Registry はローカルのファイルシステムに置きます（NFS に置かない。`flock` の前提）
+   - **書き手のコマンドが返ってこないとき**は、誰かが lock を握っている可能性があります（書き手は lock を
+     待ち続けます。0104 §2.4）。握っているプロセスを見つけます
+
+     ```bash
+     sudo fuser -v /var/lib/coldaisle-registry/.registry.lock
+     # fuser が無い・判別できないときは、lock の inode を /proc/locks で探す
+     ino=$(sudo stat -c '%i' /var/lib/coldaisle-registry/.registry.lock)
+     grep ":$ino " /proc/locks    # 2列目が FLOCK、5列目が握っている pid
+     ps -o pid,user,etime,cmd -p <pid>
+     ```
+
+     `coldaisle-authority raise` が承認と証拠の検証中であれば、終わるまで待ちます。止まったまま
+     （`kill -STOP` された・端末で一時停止したなど）のプロセスなら、その持ち主に終わらせてもらいます。
+     **制御（fand）は Registry の lock を取らない**ので、この待ちは Fan 制御を止めません（0104 §2.4）
+5. **Registry の書き手の使い方。** 自分の uid のまま `--root /var/lib/coldaisle-registry` を指します
+   （使い方は `docs/model-registry.md`。承認は 0062 のとおりファイルで渡す）
+
+   ```bash
+   cd /opt/coldaisle
+   .venv/bin/coldaisle-registry status --root /var/lib/coldaisle-registry
+   ```
+
+6. **承認者の使い方と照合**（0104 §2.6）。`coldaisle-authority raise` の `--config-dir` と `--registry-root` には、
+   **fand の unit の `ExecStart=` と同じ path** を渡します（`--config-dir /etc/coldaisle/control-config`。
+   `--registry-root` は fand に Registry を渡す unit（0077 の段階 6）の値と同じ `/var/lib/coldaisle-registry`）。
+   CLI は path が fand と同じかを確かめません。取り違えた・fand の起動後に差し替えた設定や artifact で上げても、
+   fand は起動時に読んだ設定・artifact と照らして実効 stage の上限を Baseline にします（0089 / 0090。安全側）。
+   上げた後は、上げた stage が**効いている**ことを確かめます。`raise` の結果の `revision` を fand が読んだことを
+   `coldaisle-control status` の `authority_journal_revision` で待ち、`authority_stage`（実効）が
+   `authority_journal_stage` と同じであることを見ます。低ければ、`raise` の後の fand のログの
+   `authority_config_mismatch` / `authority_artifact_mismatch` / `authority_artifact_unbound` を見ます（照合の
+   結果は変わったときにしか出ないので、起動時の古い `_matched` を証拠にしません）。手順の詳細と、設定や
+   artifact を入れ替えるときの手順は `docs/authority-rollout.md` を見てください
+7. **途中で止まったディレクトリを直す**（0105 §2.3）。Registry はディレクトリを作ってから mode を決めます。
+   その間でプロセスが止まると、`artifacts/...` の下に `2700` のディレクトリが残り、他の書き手や読み手が入れない
+   ことがあります（自動では直しません。壊れずに止まる）。該当を一覧し、親と同じ `2770` に揃えます
+   （所有者＝作った書き手の uid か root で）
+
+   ```bash
+   sudo find /var/lib/coldaisle-registry/artifacts -type d -perm -2000 ! -perm -0070 -exec ls -ld {} +
+   sudo chmod 2770 <該当するディレクトリ>
+   ```
+
+   詳しくは `docs/model-registry.md`「mode を決める前に止まったディレクトリを直す」
+8. **形を確かめます**
+
+   ```bash
+   sudo getfacl /etc/coldaisle /etc/coldaisle/control-config \
+        /etc/coldaisle/control-config/{fan-hardware,safety,fan-policy,air-balance}.yaml \
+        /var/lib/coldaisle-registry /var/lib/coldaisle-registry/.registry.lock
+   sudo stat -c '%A %U:%G %n' /var/lib/coldaisle-registry /var/lib/coldaisle-registry/.registry.lock
+   ```
+
+   `group:coldaisle-authority` の行が手順 1・3・4 のとおりで、`mask::` が実効の権限を削っていないこと
+   （制御設定の4ファイルと Registry のデータのファイル（`registry.json`・`artifact.payload`）は `mask::r--`、
+   ディレクトリは `mask::rwx` / `r-x`、**`.registry.lock` は `mask::rw-`**）。lock の mask を `r--` に下げないで
+   ください。書き手は lock を `O_RDWR` で開くので、グループ `coldaisle-registry` の書き込みが削られると Registry の
+   書き込みがすべて lock を開くところで失敗します（承認者の `group:coldaisle-authority:r--` は mask `rw-` の下でも `r` のまま効く）。
+   Registry の root は `drwxrws---+`・`root:coldaisle-registry`、lock は `-rw-rw----+`・`root:coldaisle-registry`
+   であること
+
+9. **実機での確認**（0104 §2.9。段階 C。**人が行います**）。どれか1つでも期待と違えば `raise` は使いません
+
+   **役割ごとの確認は、その役割のグループだけを持つアカウントで行います。** 同じ人が `coldaisle-authority` と
+   `coldaisle-registry` を兼ねる（上の表の下の注記で認めている）アカウントでは、2 の「書けない」と 3 の
+   「authority のディレクトリへ書けない」は成り立ちません（もう一方のグループの権限で書けるため）。兼任の
+   アカウントしか無い導入先では、確認のためだけの一時アカウントを役割ごとに作り（`useradd --system
+   --no-create-home --shell /usr/sbin/nologin`。それぞれ片方のグループにだけ入れる）、`sudo -u <一時アカウント>`
+   で 2 と 3 を実行し、確認の後に `userdel` で消します。この `sudo -u` は権限の形を確かめるためだけで、
+   本物の `raise` や Registry への書き込みには使いません（承認者は自分の uid で実行する。0086 §2.1）。
+   3 の書き込み（`register`）は、一時アカウントではなく実際の書き手の uid で行います
+
+   1. 手順 8 の `getfacl` の形が期待どおりであること
+   2. **承認者の uid で**（ログインし直し、`id -nG` に `coldaisle-authority` が出てから。`sudo` を使わない）
+      - 読める: `cat /etc/coldaisle/control-config/*.yaml > /dev/null`、
+        `cat /var/lib/coldaisle-registry/registry.json > /dev/null`（Registry にまだ何も無ければ、
+        `registry.json` の確認は手順 3 の書き込みの後に行う）
+      - flock を取れる: `flock -n /var/lib/coldaisle-registry/.registry.lock true; echo $?` が `0`
+      - **読めない・書けない**（すべて権限の error になること）: `cat /etc/coldaisle/coldaisle.env`、
+        `cat /etc/coldaisle/control-admin.yaml`、`ls /etc/coldaisle`、`touch /etc/coldaisle/control-config/x`、
+        `touch /var/lib/coldaisle-registry/x`、`sh -c ': >> /var/lib/coldaisle-registry/registry.json'`、
+        `sh -c ': >> /var/lib/coldaisle-registry/.registry.lock'`
+   3. **Registry の書き手の uid で**: `coldaisle-registry status --root /var/lib/coldaisle-registry` が通り、
+      書く操作（開発用の artifact の `register` など）の後も 2 の「読める」が通ること。作られたファイルが `0640`・
+      グループ `coldaisle-registry`・ACL 付きであることを `getfacl` で見る。書き手が authority のディレクトリへ
+      書けないこと（`touch /var/lib/coldaisle-authority/x` が失敗する）
+   4. **fand と同じグループで**（6.4 の手順 4 と同じ `systemd-run`）: 制御設定と `registry.json` を読めて、
+      どちらにも書けないこと
+
+      ```bash
+      for f in /etc/coldaisle/control-config/safety.yaml /var/lib/coldaisle-registry/registry.json; do
+        sudo systemd-run --pipe --wait --quiet \
+             -p User=coldaisle-fan -p Group=coldaisle-fan \
+             -p "SupplementaryGroups=coldaisle coldaisle-admin coldaisle-authority" \
+             sh -c "test -r '$f' && ! test -w '$f'" || echo "期待と違う: $f"
+      done
+      ```
+
+   5. **`raise` が読み取りと lock を通ること**（本物の昇格はしない。0104 §5 の 7）。承認者の uid で、
+      **期限内で形の正しい、`expected_revision` だけが journal と合わない承認**を渡します。`raise` はこれを
+      Registry の lock と authority の lock を取った**後**に拒みます（期限切れの承認は Registry を読む前に拒まれるので
+      確認に使えません）。期待する結果は終了コード 4・`code` が `approval_rejected`（revision の不一致）で、
+      journal は変わりません。終了コード 1 の `io_or_config_error`（制御設定を読めない）や `registry_error`
+      （Registry を読めない。0105 §2.4）なら権限が足りていません。
+
+      **前提: Registry に thermal_model の Production artifact があること。** `raise` は Registry の lock を
+      取って Production を読んだ直後、authority の lock と `expected_revision` を見る**前**に、Production が無ければ
+      拒みます。Production がまだ無い導入先（3 で candidate を登録しただけ、など）では、期待する結果は
+      終了コード 4・`code` が `evidence_rejected` で、構造化ログの `error` が「Production の artifact が無い」
+      ことです。これでも制御設定の読み取りと Registry の読み取り・lock は確かめられますが、authority の lock までは
+      届かないので、Production を置いた後に `approval_rejected` の確認をもう一度行ってから `raise` を使います。
+      どちらの場合も承認の期限内であることと、承認の `to_stage` が `fan-policy.yaml` の上限以下であることが要ります
+      （それより前の検査で拒まれるため）
+   6. 結果（どの確認が通ったか・`getfacl` の形）を #217 に残します。**実機のユーザー名・ホスト名・path は
+      書きません**（仮の名前に置き換える）
+
+   9 がすべて通り、#217 に結果を残したら、この節の冒頭と 6.1 の「本番での `raise` は使えません」の注記を
+   外す PR を作ります（所有者の承認の後）。

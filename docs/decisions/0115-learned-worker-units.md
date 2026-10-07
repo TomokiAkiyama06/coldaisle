@@ -1,7 +1,7 @@
 # 決定記録 0115: Learned worker の systemd unit のテンプレートと、`coldaisle-fand` の unit に Learned・較正の引数を足す形（0077 段階 6）
 
 - **種別**: Decision Record
-- **Status**: Proposed（所有者の承認待ち。§5 の判断点 1〜12 に推奨案を付けた）
+- **Status**: FINAL（2026-10-08、リポジトリ所有者が §5 の判断点 1〜12 をすべて推奨案で承認。§6）
 - **Date**: 2026-10-08
 - **Supersedes**: なし（0077 / 0080 / 0095 / 0101 / 0104 / 0110 が「段階 6 で決める」と送った点を決める。
   既存の決定は置き換えない。§2.10）
@@ -12,7 +12,7 @@
   [0104](0104-authority-raise-least-privilege.md) §2.1 / §2.2 / §2.3 / §5 の 6 /
   [0105](0105-registry-shared-root-settled-points.md) /
   [0110](0110-t-sensor-ceiling-and-enablement.md) §2.8 /
-  0113（PR #262 でレビュー中。worker は接続が切れたら終了し、再起動は unit の `Restart=`・終了コード 2 / 3 / 5） /
+  [0113](0113-mpc-worker-settled-points.md)（worker は接続が切れたら終了し、再起動は unit の `Restart=`・終了コード 2 / 3 / 5） /
   `deploy/systemd/coldaisle-fand.service` / `docs/ubuntu-deploy.md` 6 節 /
   `src/coldaisle/local_socket.py`（`prepare_parent` / `check_group_can_traverse`） /
   `src/coldaisle/learned_channel/server.py`（`_check_groups_do_not_overlap` / `set_socket_group`） /
@@ -53,7 +53,7 @@
 3. **fand は2つの役割のソケットを必ず両方開く**（`LearnedRole` のすべて）。RL worker（#89）がまだ無くても、
    `learned-channel.yaml` が名指す RL のグループが解決できなければ、MPC を含む経路全体が開かない
 
-## 2. Decision（案。§5 の推奨案をまとめたもの）
+## 2. Decision（2026-10-08、所有者が §5 の推奨案をすべて承認。§6）
 
 名前（unit・ユーザー・グループ・path）はすべて**仮の値**である。実機のユーザー名・ホスト名・path・uid は
 リポジトリに書かない（AGENTS.md ルール10）。
@@ -224,7 +224,7 @@ MPC worker のグループ `coldaisle-learn-mpc` に**読み取りだけ**を足
 - **コードは変えない。** テンプレート（`deploy/`）・導入手順（`docs/ubuntu-deploy.md`）・試験
   （`tests/test_deploy_templates.py`）だけで行う
 
-### 2.11 実装（本記録の承認の後、#57 の PR）
+### 2.11 実装（#57。本記録と同じ PR #265）
 
 | 対象 | 内容 |
 |---|---|
@@ -283,7 +283,7 @@ MPC worker のグループ `coldaisle-learn-mpc` に**読み取りだけ**を足
 | **F. worker の unit に `Wants=coldaisle-fand.service`** | worker の起動で Fan 制御が始まる。fand の有効化は 0080 段階 5 の後 |
 | **G. worker を `coldaisle-authority` に入れて 0104 の ACL を共有する** | 0104 §5 の 6 が却下済み（journal を書けてしまう） |
 
-## 5. 未決事項（所有者の判断を待つ点。各項の先頭が推奨案）
+## 5. 判断点（決着、2026-10-08 所有者の決定、推奨案。各項の先頭が採った案）
 
 | # | 判断点 | 推奨案 | 代替案 |
 |---|---|---|---|
@@ -304,3 +304,22 @@ MPC worker のグループ `coldaisle-learn-mpc` に**読み取りだけ**を足
 
 `RestartSec=`・`MemoryMax=`・`TasksMax=`・`CPUWeight=` / `IOWeight=`・`Nice=`・`OOMScoreAdjust=`。
 段階 3 の shadow（0077 §3）と、0080 段階 5 の実機の確認で決める。
+
+## 6. 承認記録
+
+**2026-10-08、リポジトリ所有者は §5 の判断点 1〜12 をすべて推奨案で承認し、本記録を FINAL にした**（PR #265）。
+
+| 判断点 | 決定 | 本記録 |
+|---|---|---|
+| 1 | fand を worker のグループに入れず、setgid の役割のディレクトリでソケットにグループを継がせる | §2.1 / §2.2 |
+| 2 | 役割のディレクトリは `tmpfiles.d` で作る（root の `ExecStartPre` は使わない） | §2.2 |
+| 3 | ソケットは `/run/coldaisle/learned-mpc/mpc.sock`・`/run/coldaisle/learned-rl/supervisor.sock` | §2.2 |
+| 4 | fand の `ExecStart` に `--calibration`・`--registry-root`・`--learned-channel-config` を常に入れ、`--t-sensor-metric` はコメント | §2.3 |
+| 5 | 役割ごとの2つの unit ファイル（`@` テンプレートにしない） | §2.1 |
+| 6 | 役割のグループを主グループに持つ専用のユーザー | §2.1 |
+| 7 | `Restart=on-failure`・`RestartSec=5`（暫定）・`StartLimitIntervalSec=0`・`RestartPreventExitStatus=2`（5 は再起動する） | §2.5 |
+| 8 | 資源の上限は §2.6 の暫定値 | §2.6 |
+| 9 | 依存は `After=coldaisle-fand.service` だけ | §2.5 |
+| 10 | worker の制御設定の読み取りは役割のグループへの ACL（Registry の lock には持たせない） | §2.8 |
+| 11 | RL のグループとディレクトリはいま、ユーザー・ACL・unit の配置は #89 | §2.2 / §2.8 / §2.9 |
+| 12 | どちらも `enable` しない。RL の unit は #89 まで導入先へ置かない | §2.9 |

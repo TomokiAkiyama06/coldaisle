@@ -461,6 +461,29 @@ class SqliteStore:
             )
         return cursor.rowcount == 1
 
+    def copy_control_traces(self, traces: Sequence[SequencedControlTrace]) -> None:
+        """本番の DB の trace を、記録した順（``seq``）を保ってこの DB へ写す（0112 §2.3）。
+
+        dataset の専用 DB の ControlTick の出どころを本番の DB の trace にするための経路。
+        ``seq`` を振り直すと ``control_trace_sha256``（``seq`` を含む）が本番と一致しなくなるので、
+        元の ``seq`` のまま書く。trace の無い DB にだけ、1つの transaction で写す。
+        """
+        rows = tuple(traces)
+        seqs = [trace.seq for trace in rows]
+        if seqs != sorted(seqs) or len(set(seqs)) != len(seqs):
+            raise ValueError("写す trace は seq の順に重複なく並べる")
+        with self.transaction():
+            if self._conn.execute("SELECT 1 FROM control_traces LIMIT 1").fetchone() is not None:
+                raise ValueError("trace のある DB へは写さない（決定記録 0112 §2.3）")
+            self._conn.executemany(
+                "INSERT INTO control_traces (seq, ts_ms, tick_id, schema_version, trace_json) "
+                "VALUES (?, ?, ?, ?, ?)",
+                [
+                    (trace.seq, trace.ts_ms, trace.tick_id, trace.schema_version, trace.trace_json)
+                    for trace in rows
+                ],
+            )
+
     def delete_control_traces_before(self, cutoff_ms: int) -> int:
         """保持期間を過ぎた decision trace を削除して行数を返す（決定記録 0030 §5 / 0071 §2.2a）。
 
