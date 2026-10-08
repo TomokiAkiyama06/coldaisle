@@ -195,8 +195,8 @@ v1 との違い（規則の正本は [0087](decisions/0087-dataset-v2-action-gri
      `seq` ごと写し（`SqliteStore.copy_control_traces`）、同じ spec と宣言で builder を走らせ、作り直した公開物の bytes
      （manifest と `examples.jsonl`）が渡された dataset と完全に一致することを求める
   **学習には元の日次 CSV と manifest が要る**。`control_trace_sha256` は `seq` を含むので、学習に使う dataset の専用 DB の
-  ControlTick も、本番の trace を `copy_control_traces` で `seq` ごと写したものにする（`coldaisle-dataset` 側の配線は
-  未決。0112 §5）。学習の CLI はまだ無く、関数の入口まで。較正ファイルとの照合（`verify_training_calibration`）は
+  ControlTick も、本番の trace を `seq` ごと写したものにする（`coldaisle-dataset` の v2 が写す。決定記録
+  [0116](decisions/0116-dataset-cli-copies-production-traces.md)）。学習の CLI はまだ無く、関数の入口まで。較正ファイルとの照合（`verify_training_calibration`）は
   返した記録で続けて行う
 - `control_trace_sha256` は run の全 ControlTick を `seq` 付きで hash する（v2 は anchor 以外の tick も使うため）
 
@@ -207,7 +207,12 @@ v1 の引数に加えて、次を**すべて必須**で渡す（既定値は無�
 - `--action-step-ms` / `--action-steps` / `--action-stale-after-ms`: `DatasetSpecV2` の欄
 - `--declared-changes <path>`: 宣言された変更の YAML。宣言が無いときも `changes: []` と書いたファイルを渡す
 - `--calibration-history-db <path>`: 較正の変更の記録（`calibration_activations`）を持つ本番の DB。読み取り専用で
-  開き、migration を当てない。専用 DB（`--db`）と同じ実体（symlink・hard link の別名を含む）は拒否する
+  開き、migration を当てない。専用 DB（`--db`）と同じ実体（symlink・hard link の別名を含む）は拒否する。
+  較正の記録・`csv_exports` の行と同じ read transaction で、source run の期間 `[--start-ms, --end-ms)` の
+  ControlTick の trace も読み、**専用 DB へ `seq` ごと写してから作る**（決定記録 0116）。専用 DB に既に trace が
+  あれば、本番の trace と完全に一致するときだけそのまま作り、違えば作らない（新しい専用 DB で再生し直す）。
+  本番の trace が保持期間で消えた期間・移行前の行を含む期間からは作らない。これで作った dataset はそのまま
+  学習の入口（`training_entry.verify_training_dataset_v2`）を通る
 
 ```yaml
 # var/declared-changes.yaml（数値は説明用の仮の値）
