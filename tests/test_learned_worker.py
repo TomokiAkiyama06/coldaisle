@@ -10,6 +10,8 @@ import ast
 import hashlib
 import json
 import socket
+import subprocess
+import sys
 import threading
 from pathlib import Path
 from typing import Any
@@ -841,6 +843,59 @@ def test_the_worker_package_reads_only_frames() -> None:
                     for forbidden in FORBIDDEN_IMPORTS
                 ), f"{path.name} imports {name}"
         assert "calibration.json" not in path.read_text("utf-8")
+
+
+PROCESS_FORBIDDEN_MODULES = (
+    "sqlite3",
+    "_sqlite3",
+    "serial",
+    "coldaisle.store",
+    "coldaisle.ai",
+    "coldaisle.api",
+    "coldaisle.server",
+    "coldaisle.ingest",
+    "coldaisle.control_daemon",
+    "coldaisle.control_admin",
+    "coldaisle.event_entry",
+)
+"""worker の CLI を import したプロセスに載ってはいけない module（#261 / 決定記録 0113 §2.3）。
+
+直接の import の走査（上の試験）では、control 層などを経由した**間接の**読み込みを検出できない。
+``coldaisle.control.hardware`` は simulated backend が control 層から間接に読まれるため、ここには
+入れない（直接の import は上の試験で止めている）。
+"""
+
+
+def test_the_worker_process_loads_neither_store_nor_sqlite() -> None:
+    """新しいプロセスで worker の CLI を import し、``sys.modules`` 全体を確かめる（#261）。
+
+    pytest のプロセスは他の試験が store を読み込んでいるので、別プロセスで見る。
+    """
+    code = (
+        "import sys\n"
+        "import coldaisle.learned_worker.cli\n"
+        f"forbidden = {PROCESS_FORBIDDEN_MODULES!r}\n"
+        "loaded = sorted(\n"
+        "    m for m in sys.modules\n"
+        "    if any(m == f or m.startswith(f + '.') for f in forbidden)\n"
+        ")\n"
+        "assert not loaded, loaded\n"
+        "assert 'coldaisle.learned_worker.mpc' in sys.modules\n"
+    )
+    done = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, check=False)
+    assert done.returncode == 0, done.stderr
+
+
+def test_the_store_models_reexport_the_shared_types() -> None:
+    """store からの既存の import は、レイヤ横断の module と同じオブジェクトを返す（#261）。"""
+    import coldaisle.store as store
+    import coldaisle.store.models as models
+    from coldaisle import measurement
+
+    assert models.Quality is measurement.Quality is store.Quality
+    assert models.validate_metric is measurement.validate_metric
+    assert models.DERIVED_PREFIX is measurement.DERIVED_PREFIX
+    assert models.METRIC_PATTERN is measurement.METRIC_PATTERN
 
 
 def test_the_worker_cli_has_no_calibration_path() -> None:

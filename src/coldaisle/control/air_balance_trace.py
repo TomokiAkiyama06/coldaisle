@@ -26,7 +26,7 @@ from coldaisle.control.schema import (
     Zone,
 )
 from coldaisle.control.state import ControlStateSnapshot
-from coldaisle.store.models import DERIVED_PREFIX
+from coldaisle.measurement import DERIVED_PREFIX
 
 
 class AirBalanceRecorder:

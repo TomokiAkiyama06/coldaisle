@@ -28,7 +28,7 @@ from coldaisle.csv_export_manifest import (
     SHA256_PATTERN,
     export_binding_sha256_of_pairs,
 )
-from coldaisle.store.models import Quality
+from coldaisle.measurement import Quality
 
 DATASET_SCHEMA_VERSION: Literal[1] = 1
 """Thermal dataset schema の版。フィールドの意味を変えたら上げる。"""

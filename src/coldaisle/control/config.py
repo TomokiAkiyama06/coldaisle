@@ -32,7 +32,7 @@ from coldaisle.control.schema import (
     WorkloadRegime,
     Zone,
 )
-from coldaisle.store.models import validate_metric
+from coldaisle.measurement import validate_metric
 
 CONTROL_CONFIG_VERSION: Literal[14] = 14
 """4ファイルを束ねた Control Config の版。

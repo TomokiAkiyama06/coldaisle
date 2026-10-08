@@ -50,7 +50,7 @@ from coldaisle.control.model.thermal import (
     raw_feature_values,
 )
 from coldaisle.control.schema import AuthorityStage
-from coldaisle.store.models import Quality
+from coldaisle.measurement import Quality
 
 MAX_TRAIN_EXAMPLES = 100_000
 MAX_TRAINING_CELLS = 1_000_000

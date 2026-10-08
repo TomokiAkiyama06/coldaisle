@@ -29,7 +29,7 @@ from coldaisle.calibration_offsets import (
     offsets_sha256,
 )
 from coldaisle.channels import METRIC_TO_CHANNEL
-from coldaisle.store.models import DERIVED_PREFIX
+from coldaisle.measurement import DERIVED_PREFIX
 
 
 class _Derived(Protocol):

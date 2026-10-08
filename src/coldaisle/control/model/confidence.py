@@ -45,7 +45,7 @@ from coldaisle.control.schema import (
     Reason,
     Zone,
 )
-from coldaisle.store.models import Quality
+from coldaisle.measurement import Quality
 
 CONFIDENCE_PROFILE_SCHEMA_VERSION: Literal[1] = 1
 
