@@ -25,6 +25,7 @@ from coldaisle.control.supervisor.artifact import (
     validate_supervisor_policy,
 )
 from coldaisle.control.supervisor.policy import (
+    DeliveredSupervisorOutput,
     ReceivedSupervisorOutput,
     RLPolicy,
     RulePolicy,
@@ -85,6 +86,7 @@ __all__ = [
     "RL_POLICY_CONFIG_VERSION",
     "SUPERVISOR_SHADOW_SCHEMA_VERSION",
     "CertifiedPolicyArtifact",
+    "DeliveredSupervisorOutput",
     "PolicyArtifactConfig",
     "PolicyArtifactVerification",
     "PolicyBindingIntent",

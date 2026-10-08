@@ -568,17 +568,24 @@ def test_worker_reads_the_same_inputs_as_fand(role):
 
 
 @pytest.mark.parametrize("role", WORKERS)
-def test_worker_restarts_except_for_an_unsupported_role(role):
-    """3（接続が切れた）は通常の経路、5 は一時的な失敗も含む。止めるのは 2 だけ（0115 §2.5）。"""
+def test_worker_restarts_except_for_a_usage_error(role):
+    """3（接続が切れた）は通常の経路、5 は一時的な失敗も含む。止めるのは 2 だけ（0115 §2.5）。
+
+    2 は引数の誤り（未知の `--role` を含む。argparse）。0114 §2.1 の8。
+    """
     from coldaisle.learned_worker import cli
 
     unit = worker(role)
     assert one(unit, "Service", "Type") == "simple"
     assert one(unit, "Service", "Restart") == "on-failure"
     assert one(unit, "Unit", "StartLimitIntervalSec") == "0"
-    assert words(unit, "Service", "RestartPreventExitStatus") == [str(cli.EXIT_ROLE_NOT_SUPPORTED)]
-    assert cli.EXIT_CHANNEL_CLOSED != cli.EXIT_ROLE_NOT_SUPPORTED
-    assert cli.EXIT_STARTUP != cli.EXIT_ROLE_NOT_SUPPORTED
+    assert words(unit, "Service", "RestartPreventExitStatus") == [str(cli.EXIT_USAGE)]
+    assert cli.EXIT_CHANNEL_CLOSED != cli.EXIT_USAGE
+    assert cli.EXIT_STARTUP != cli.EXIT_USAGE
+    # 未知の --role は argparse の解析で EXIT_USAGE になる（再起動しても変わらない）
+    with pytest.raises(SystemExit) as exited:
+        cli.main(["--role", "pwm", "--registry-root", "x", "--learned-channel-config", "y"])
+    assert exited.value.code == cli.EXIT_USAGE
     assert float(one(unit, "Service", "RestartSec")) > 0
     assert one(unit, "Install", "WantedBy") == "multi-user.target"
 

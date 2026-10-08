@@ -4,14 +4,16 @@
 
 封筒は `schema_version`・`run_id`・`role`・本文（`body`）を持つ。知らない版・知らない本文は捨てる。
 
-- worker → `coldaisle-fand`: `heartbeat`（受け渡し口も受信時刻も変えない）と `mpc_result`
-  （`MpcProposal`。提案か失敗）。**段階 1 で受け取る結果は MPC だけ。** Supervisor 出力の本文は
-  `SupervisorOutputSource` の形を広げる段階 4（#89）で足す（0077 §2.8 / §2.10）
+- worker → `coldaisle-fand`: `heartbeat`（受け渡し口も受信時刻も変えない）と、役割ごとの結果。
+  MPC は `mpc_result`（`MpcProposal`。提案か失敗）、RL Supervisor は `supervisor_result`
+  （`DeliveredSupervisorOutput`。出力と artifact の識別。0077 §2.8 の段階 4 / #89）。
+  **どの本文をどのソケットで受け取るかは受付が役割で決める**（別の役割の本文は捨てる）
 - `coldaisle-fand` → worker: `hello`（接続を認めた最初の応答。`heartbeat_interval_ms` と
   `run_id`）と `frame`（毎 tick の `LearnedFrame`）
 
-worker からの本文は `MpcProposal` の型しか運べず、Demand の上書き・モード・authority を表す型を
-持たない（0077 §2.4 の 6、AGENTS.md ルール2）。
+worker からの本文は `MpcProposal` / `DeliveredSupervisorOutput` の型しか運べず、Demand の
+上書き・モード・authority・束縛の用途（`origin`）を表す型を持たない（0077 §2.4 の 6 / §2.8、
+AGENTS.md ルール2）。
 """
 
 from __future__ import annotations
@@ -22,6 +24,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from coldaisle.control.learned_handoff import LearnedFrame, LearnedRole
 from coldaisle.control.mpc.controller import MpcProposal
+from coldaisle.control.supervisor.policy import DeliveredSupervisorOutput
 
 ENVELOPE_SCHEMA_VERSION: Literal[1] = 1
 
@@ -46,7 +49,16 @@ class MpcResultBody(_Strict):
     result: MpcProposal
 
 
-InboundBody = Annotated[HeartbeatBody | MpcResultBody, Field(discriminator="kind")]
+class SupervisorResultBody(_Strict):
+    """RL Supervisor worker の1回の出力（0077 §2.8）。失敗の本文は無い（送らないだけ。§2.6）。"""
+
+    kind: Literal["supervisor_result"]
+    result: DeliveredSupervisorOutput
+
+
+InboundBody = Annotated[
+    HeartbeatBody | MpcResultBody | SupervisorResultBody, Field(discriminator="kind")
+]
 
 
 class InboundEnvelope(_Strict):

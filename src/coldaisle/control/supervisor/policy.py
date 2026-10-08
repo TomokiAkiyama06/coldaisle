@@ -123,6 +123,31 @@ class ReceivedSupervisorOutput(_Frozen):
         return self
 
 
+class DeliveredSupervisorOutput(_Frozen):
+    """RL Supervisor worker（別プロセス）が経路で運ぶ1件（#89 / 決定記録 0077 §2.8）。
+
+    中身は **`SupervisorOutput` と、それを作った artifact の識別だけ**である。Demand・モード・
+    authority を表す欄を持たず（`extra="forbid"`）、**束縛の用途（`origin`）も運ばない**。
+    用途は `coldaisle-fand` の loop が決め、経路から来た出力はいまと同じ `unverified` のまま
+    （0077 §2.8 / 0061 §2.4）なので、active slot を通らない。
+
+    識別の照合（`expected_rl_identity`）・期限・regime・`output_bounds` の検査は、これまでどおり
+    loop の中の `SupervisorCoordinator` が行う。ここで確かめるのは型として矛盾しないことだけ。
+    """
+
+    output: SupervisorOutput
+    identity: SupervisorPolicyIdentity
+
+    @model_validator(mode="after")
+    def _an_rl_output_names_its_own_version(self) -> Self:
+        if self.output.policy is not SupervisorPolicyKind.RL:
+            # worker の経路から RulePolicy を名乗る出力を受け取らない（Rule は loop の中だけ）
+            raise ValueError("RL Supervisor worker の出力は RLPolicy だけ")
+        if self.identity.version != self.output.version:
+            raise ValueError("出力の版と artifact の識別の版が一致しない")
+        return self
+
+
 class SupervisorPolicy(Protocol):
     """Rule / RL が同じ入力から同じ schema を返す最小 interface。"""
 

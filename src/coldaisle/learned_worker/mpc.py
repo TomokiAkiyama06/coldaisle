@@ -22,7 +22,6 @@ from __future__ import annotations
 import logging
 from collections.abc import Callable
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Protocol
 
 from coldaisle import logs
@@ -31,7 +30,6 @@ from coldaisle.control.config import ControlConfig
 from coldaisle.control.fallback.gate import LearnedFailure
 from coldaisle.control.learned_handoff import (
     AvailableCalibration,
-    LearnedExpectedArtifacts,
     LearnedFrame,
     PinnedArtifact,
     UnavailableCalibration,
@@ -42,7 +40,6 @@ from coldaisle.control.model.counterfactual import (
     TARGET_SCHEMA_V2_VERSION,
 )
 from coldaisle.control.model_registry import (
-    REGISTRY_STATE_FILENAME,
     ArtifactKind,
     ArtifactRef,
     ModelCompatibility,
@@ -51,7 +48,7 @@ from coldaisle.control.model_registry import (
 )
 from coldaisle.control.mpc.controller import LearnedMpcRuntime, MpcProposal
 from coldaisle.control.schema import AuthorityStage, Reason, stage_rank
-from coldaisle.learned_channel.registry_watch import FileIdentity, snapshot_identity
+from coldaisle.learned_worker.registry import ProductionCheck
 from coldaisle.learned_worker.window import FrameHistory, build_observed_input
 from coldaisle.metrics import MetricCatalog
 
@@ -77,56 +74,11 @@ class FailureCode:
     """registry から読めない・束縛の検査に外れた（`LearnedMpcRuntime.load` と同じ code）。"""
 
 
-class ProductionCheck(Protocol):
-    """固定された artifact がいまもその kind の production か（0077 §2.6）。"""
-
-    def is_production(self, pinned: PinnedArtifact) -> bool:
-        """**例外を出さない。** 読めない・壊れているときは False（保守側）。"""
-
-
 class ArtifactSource(Protocol):
     """固定された artifact を registry の検証経路で読む（bytes の checksum と schema）。"""
 
     def load(self, pinned: PinnedArtifact, stage: AuthorityStage) -> VerifiedArtifact | str:
         """検証済みの artifact か、読めなかった理由（path を含まない）。**例外を出さない。**"""
-
-
-class RegistryProductionCheck:
-    """`registry.json` を読み取り専用で確かめる（flock を取らない。0077 §2.6）。
-
-    `stat` の同一性（`st_dev` / `st_ino` / `st_mtime_ns` / `st_size`）と固定が前回と同じなら
-    読み直さない。
-    """
-
-    def __init__(self, registry: ModelRegistry, root: Path) -> None:
-        self._registry = registry
-        self._path = root / REGISTRY_STATE_FILENAME
-        self._cached: tuple[FileIdentity | None, PinnedArtifact, bool] | None = None
-
-    def is_production(self, pinned: PinnedArtifact) -> bool:
-        """固定がいまの `thermal_model` の production の3つ組と一致するか。"""
-        try:
-            identity = snapshot_identity(self._path)
-            cached = self._cached
-            if cached is not None and cached[0] == identity and cached[1] == pinned:
-                return cached[2]
-            snapshot = self._registry.inspect()
-            current = LearnedExpectedArtifacts.from_provenance(snapshot.trace_provenance())
-        except Exception as error:
-            LOGGER.error(
-                "registry を確かめられない。固定した artifact を production とみなさない",
-                extra={
-                    logs.FIELDS_KEY: {
-                        "reason": "registry_unreadable",
-                        "error": type(error).__name__,
-                    }
-                },
-            )
-            self._cached = None
-            return False
-        result = current.thermal_model == pinned
-        self._cached = (identity, pinned, result)
-        return result
 
 
 class RegistryArtifactSource:

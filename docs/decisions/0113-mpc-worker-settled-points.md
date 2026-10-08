@@ -4,6 +4,7 @@
 - **Status**: FINAL（2026-10-08、リポジトリ所有者が推奨案で承認）
 - **Date**: 2026-10-08
 - **Supersedes**: なし（0077 / 0101 / 0107 が決めていなかった点への追加と、文面の読み方の明記。どの記録の決定も置き換えない）
+- **Superseded by**: [0114](0114-rl-supervisor-worker-settled-points.md)（§2.1 の表の4のうち、終了コード 2「`--role` が未対応」の部分のみ。`--role supervisor` を受け付けたので廃止。3 と 5 は有効）
 - **関連**: [0077](0077-learned-proposal-handoff.md) §2.3 / §2.6 / §2.7 / §2.10 /
   [0101](0101-calibration-via-learned-frame.md) / [0107](0107-mpc-worker-observed-window.md) §2.1 / §2.5 / §2.6 / §2.7 /
   [0095](0095-learned-channel-stage1-settled-points.md) / [0098](0098-registry-binding-settled-points.md) /

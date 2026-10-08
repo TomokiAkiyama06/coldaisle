@@ -1,11 +1,13 @@
 """受付スレッドと loop の受け渡し口（決定記録 0077 §2.2 / §2.5）。
 
 - **役割ごとに1枠。** 受付スレッドは検証を通った**最新の1件だけ**を置く（新しいものが古いものを
-  置き換える。積まない）。段階 1 で結果を置くのは MPC の枠だけ
+  置き換える。積まない）。MPC の枠（`MpcProposal`）と RL Supervisor の枠
+  （`DeliveredSupervisorOutput`。段階 4 / #89）
 - loop は **lock を試すだけ**で覗く（`poll`）。取れなければ前回の値。**待たない**（0060 §2.3）
 - 経路の状態（`state`）は **lock を取らずに**答える。受付スレッドが死んでいれば `channel_dead`
-- worker が切れた・黙ったときは、**状態を先に変えてから**枠を空にする。loop は状態を見てから
-  覗くので、切れた tick から古い提案を読まない（0077 §2.5 の表）
+- worker が切れた・黙ったときは、**状態を先に変えてから**その役割の枠を空にする。loop は状態を
+  見てから覗くので、切れた tick から古い結果を読まない（0077 §2.5 の表。RL も直前の出力を
+  `supervisor.valid_ms` まで残さない）
 - 送り出し用の1枠（`offer`）。loop は置くだけで、送るのは受付スレッド。置けなければ捨てる
 - 固定した artifact が production でなくなった役割は、**再起動まで** `registry_superseded` を答え、
   枠を空にし、以後の結果を置かない（0077 §2.6）。接続・切断の知らせでは戻らない
@@ -20,15 +22,24 @@ import threading
 
 from coldaisle.control.learned_handoff import LearnedChannelState, LearnedFrame, LearnedRole
 from coldaisle.control.mpc.controller import MpcProposal
+from coldaisle.control.supervisor.policy import DeliveredSupervisorOutput
 
 
 class LearnedMailbox:
-    """MPC の結果の枠・役割ごとの経路の状態・送り出し用の1枠・受付スレッドを起こす口。"""
+    """役割ごとの結果の枠・役割ごとの経路の状態・送り出し用の1枠・受付スレッドを起こす口。
+
+    `poll()` が MPC の枠（`LearnedProposalSource`）、`supervisor_source.poll()` が RL の枠
+    （`SupervisorOutputSource`）。
+    """
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._mpc: MpcProposal | None = None
         self._last_polled: MpcProposal | None = None
+        self._supervisor: DeliveredSupervisorOutput | None = None
+        self._last_polled_supervisor: DeliveredSupervisorOutput | None = None
+        self.supervisor_source = SupervisorSlot(self)
+        """RL Supervisor の枠を覗く口（`SupervisorOutputSource`）。"""
         self._states: dict[LearnedRole, LearnedChannelState] = {
             role: LearnedChannelState.WORKER_DISCONNECTED for role in LearnedRole
         }
@@ -66,8 +77,8 @@ class LearnedMailbox:
         """
         self._failed = True
         with self._lock:
-            self._mpc = None
-            self._last_polled = None
+            self._clear(LearnedRole.MPC)
+            self._clear(LearnedRole.SUPERVISOR)
 
     def connected(self, role: LearnedRole) -> None:
         """その役割の worker の接続を認めた。"""
@@ -79,11 +90,8 @@ class LearnedMailbox:
         ``state`` は `worker_disconnected`（EOF・送信の失敗）か `worker_idle`（黙った）。
         """
         self._states[role] = state
-        if role is LearnedRole.MPC:
-            with self._lock:
-                self._mpc = None
-                # lock を取れなかった tick に返す写しも捨てる（再接続の後に古い提案を返さない）
-                self._last_polled = None
+        with self._lock:
+            self._clear(role)
 
     def supersede(self, role: LearnedRole) -> None:
         """その役割を `coldaisle-fand` の再起動まで閉じる（0077 §2.6 の `registry_superseded`）。
@@ -91,10 +99,8 @@ class LearnedMailbox:
         **状態を先に変えてから**枠を空にする（`disconnected` と同じ順。loop は状態を見てから覗く）。
         """
         self._superseded = self._superseded | {role}
-        if role is LearnedRole.MPC:
-            with self._lock:
-                self._mpc = None
-                self._last_polled = None
+        with self._lock:
+            self._clear(role)
 
     def superseded(self, role: LearnedRole) -> bool:
         """その役割を registry の移動で閉じたか。**lock を取らない。**"""
@@ -109,6 +115,28 @@ class LearnedMailbox:
             if LearnedRole.MPC in self._superseded:
                 return
             self._mpc = result
+
+    def place_supervisor(self, result: DeliveredSupervisorOutput) -> None:
+        """検証を通った RL Supervisor の出力を置く。前の出力は置き換える（積まない）。
+
+        閉じた役割（`registry_superseded`）には置かない（`place_mpc` と同じ二重の守り）。
+        """
+        with self._lock:
+            if LearnedRole.SUPERVISOR in self._superseded:
+                return
+            self._supervisor = result
+
+    def _clear(self, role: LearnedRole) -> None:
+        """その役割の枠と、lock を取れなかった tick に返す写しを捨てる。**lock の中で呼ぶ。**
+
+        写しも捨てるのは、再接続の後に古い結果を返さないため。
+        """
+        if role is LearnedRole.MPC:
+            self._mpc = None
+            self._last_polled = None
+        else:
+            self._supervisor = None
+            self._last_polled_supervisor = None
 
     def take_outgoing(self) -> LearnedFrame | None:
         """送り出し用の枠から取り出す。"""
@@ -177,6 +205,21 @@ class LearnedMailbox:
         finally:
             self._lock.release()
 
+    def poll_supervisor(self) -> DeliveredSupervisorOutput | None:
+        """RL Supervisor の枠を覗く。**lock を試すだけ。** 取り出さない（`poll` と同じ規則）。"""
+        if not self._lock.acquire(blocking=False):
+            if self.state(LearnedRole.SUPERVISOR) is not LearnedChannelState.CONNECTED:
+                return None
+            return self._last_polled_supervisor
+        try:
+            if self.state(LearnedRole.SUPERVISOR) is not LearnedChannelState.CONNECTED:
+                self._last_polled_supervisor = None
+                return None
+            self._last_polled_supervisor = self._supervisor
+            return self._supervisor
+        finally:
+            self._lock.release()
+
     def offer(self, frame: LearnedFrame) -> None:
         """送り出し用の1枠へ置き、受付スレッドを起こす（`LearnedFrameSink`）。**待たない。**
 
@@ -199,3 +242,16 @@ class LearnedMailbox:
         except OSError:
             # 閉じた後。起こす相手がいない
             pass
+
+
+class SupervisorSlot:
+    """`LearnedMailbox` の RL Supervisor の枠を `SupervisorOutputSource` として見せる口。"""
+
+    __slots__ = ("_mailbox",)
+
+    def __init__(self, mailbox: LearnedMailbox) -> None:
+        self._mailbox = mailbox
+
+    def poll(self) -> DeliveredSupervisorOutput | None:
+        """最新の RL 出力。**待たない。**"""
+        return self._mailbox.poll_supervisor()

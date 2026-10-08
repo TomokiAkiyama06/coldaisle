@@ -598,8 +598,8 @@ def test_a_broken_message_is_dropped_and_counted_without_touching_the_slot(
         worker.close()
 
 
-def test_a_result_on_the_supervisor_socket_is_not_placed(channel) -> None:
-    """段階 1 では Supervisor 出力の本文が無い。MPC の結果を送っても置かない（段階 4 の #89）。"""
+def test_an_mpc_result_on_the_supervisor_socket_is_not_placed(channel) -> None:
+    """役割はソケットで決まる。RL のソケットへ MPC の結果を送っても置かない（段階 4 の #89）。"""
     running = channel()
     worker, _ = connect(running, LearnedRole.SUPERVISOR, RL_UID)
     try:

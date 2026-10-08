@@ -427,6 +427,8 @@ class Harness:
         registry: RegistryProvenance | None = None,
         admin_mode: Any = None,
         air_balance_coordinator: Any = None,
+        rl_supervisor_source: Any = None,
+        expected_rl_identity: Any = None,
     ) -> None:
         self.config = config if config is not None else control_config()
         self.clock = SimulatedClock(TEST_EPOCH_MS)
@@ -474,7 +476,11 @@ class Harness:
             mode_source=self.mode if admin_mode is None else None,
             admin_mode=admin_mode,
             supervisor=(
-                SupervisorCoordinator(self.config.policy.supervisor, self.clock)
+                SupervisorCoordinator(
+                    self.config.policy.supervisor,
+                    self.clock,
+                    expected_rl_identity=expected_rl_identity,
+                )
                 if with_supervisor
                 else None
             ),
@@ -486,6 +492,7 @@ class Harness:
             learned_source=learned_source,
             learned_health=learned_health,
             learned_sink=learned_sink,
+            rl_supervisor_source=rl_supervisor_source,
             # frame v3 の欄（決定記録 0101 / 0107）。既定は `--calibration` を省いた起動と同じ
             learned_calibration=(
                 None
@@ -1366,7 +1373,9 @@ def test_invariant_14_an_rl_output_from_another_process_is_not_bound(catalog) ->
     now_ms = harness.monotonic.monotonic_ms()
     same_tick_id_other_process = _rl_output(tick_id=result.tick.tick_id, ts_ms=1)
 
-    harness.loop._rl_supervisor_source = StubWorkerSource(result=same_tick_id_other_process)
+    harness.loop._rl_supervisor_source = StubWorkerSource(
+        result=_delivered(same_tick_id_other_process)
+    )
     candidate, reason = harness.loop._rl_candidate(now_ms)
 
     assert candidate is None
@@ -1374,11 +1383,26 @@ def test_invariant_14_an_rl_output_from_another_process_is_not_bound(catalog) ->
 
     # 同じ snapshot（tick_id / ts_ms / snapshot schema）を指す出力なら束縛できる。
     matching = _rl_output(tick_id=result.tick.tick_id, ts_ms=result.tick.ts_ms)
-    harness.loop._rl_supervisor_source = StubWorkerSource(result=matching)
+    harness.loop._rl_supervisor_source = StubWorkerSource(result=_delivered(matching))
     candidate, reason = harness.loop._rl_candidate(now_ms)
 
     assert reason is None
-    assert candidate is not None and candidate.output is matching
+    assert candidate is not None and candidate.output == matching
+    # 識別は worker が運んだ値を写す。用途（origin）は loop が `unverified` のまま（0077 §2.8）
+    assert candidate.identity == _delivered(matching).identity
+    assert candidate.origin.value == "unverified"
+
+
+def _delivered(output: Any) -> Any:
+    from coldaisle.control.schema import SupervisorPolicyIdentity
+    from coldaisle.control.supervisor.policy import DeliveredSupervisorOutput
+
+    return DeliveredSupervisorOutput(
+        output=output,
+        identity=SupervisorPolicyIdentity(
+            model_id="rl-test", version=output.version, artifact_sha256="d" * 64
+        ),
+    )
 
 
 def _rl_output(*, tick_id: int, ts_ms: int) -> Any:
