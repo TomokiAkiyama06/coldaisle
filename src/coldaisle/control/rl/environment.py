@@ -101,7 +101,7 @@ from coldaisle.control.supervisor.regime import (
     RegimeReason,
     WorkloadRegimeEstimate,
 )
-from coldaisle.store.models import Quality
+from coldaisle.measurement import Quality
 
 DEMAND_EPSILON = 1e-9
 """floor 比較の丸め許容。構造上の値で、安全の余裕ではない。"""

@@ -14,8 +14,8 @@ from typing import Annotated, Self
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from coldaisle.control.schema import Demand, PerZone
+from coldaisle.measurement import Quality, validate_metric
 from coldaisle.metrics import MetricCatalog, compute_derived
-from coldaisle.store.models import Quality, validate_metric
 
 STATE_SNAPSHOT_SCHEMA_VERSION = 1
 """``ControlStateSnapshot`` の意味を識別する版。#82 が trace に載せる。"""

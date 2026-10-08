@@ -153,8 +153,8 @@ from coldaisle.control.supervisor.regime import (
     WorkloadRegimeEstimator,
     WorkloadRegimeState,
 )
+from coldaisle.measurement import Quality, validate_metric
 from coldaisle.metrics import MetricCatalog
-from coldaisle.store.models import Quality, validate_metric
 
 LOGGER = logging.getLogger("coldaisle.control")
 

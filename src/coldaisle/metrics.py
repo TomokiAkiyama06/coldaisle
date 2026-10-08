@@ -22,7 +22,7 @@ from typing import Any, Protocol
 import yaml
 from pydantic import BaseModel, ConfigDict, Field
 
-from coldaisle.store.models import DERIVED_PREFIX, Quality, validate_metric
+from coldaisle.measurement import DERIVED_PREFIX, Quality, validate_metric
 
 
 class MetricMeta(BaseModel):

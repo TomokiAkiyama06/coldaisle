@@ -25,7 +25,7 @@ from coldaisle.control.model.dataset import (
     DatasetSpec,
 )
 from coldaisle.control.schema import AuthorityStage, PerZone, Zone
-from coldaisle.store.models import Quality
+from coldaisle.measurement import Quality
 
 MODEL_ARTIFACT_SCHEMA_VERSION: Literal[1] = 1
 FEATURE_SCHEMA_VERSION: Literal["thermal-features-v1"] = "thermal-features-v1"

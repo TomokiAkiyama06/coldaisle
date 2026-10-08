@@ -47,8 +47,8 @@ from coldaisle.control.state import (
     SignalSpec,
     TelemetryImportance,
 )
+from coldaisle.measurement import Quality, validate_metric
 from coldaisle.metrics import MetricCatalog
-from coldaisle.store.models import Quality, validate_metric
 
 CPU_TEMPERATURE_METRIC = "cpu.package"
 # 決定記録 0032（FINAL）の CPU Package power。0028 §2.4 の cpu_cooling_floor の Power 項。

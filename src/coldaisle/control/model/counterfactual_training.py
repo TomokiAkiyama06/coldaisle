@@ -92,8 +92,8 @@ from coldaisle.control.model.training import (
     split_sha256,
 )
 from coldaisle.control.schema import AuthorityStage, PerZone
+from coldaisle.measurement import Quality
 from coldaisle.metrics import MetricCatalog
-from coldaisle.store.models import Quality
 
 _DATASET_ARTIFACT_ALIAS = re.compile(r"^dataset-[0-9a-f]{32}$")
 _DATASET_MANIFEST_FILENAME = "manifest.json"

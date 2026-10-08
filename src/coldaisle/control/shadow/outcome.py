@@ -37,7 +37,7 @@ from coldaisle.control.schema import (
     ShadowPrediction,
     Zone,
 )
-from coldaisle.store.models import Quality
+from coldaisle.measurement import Quality
 
 
 class _Frozen(BaseModel):

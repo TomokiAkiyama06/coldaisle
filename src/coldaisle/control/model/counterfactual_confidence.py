@@ -82,7 +82,7 @@ from coldaisle.control.model.thermal import (
 )
 from coldaisle.control.model.training import _example_order, _validate_split, split_sha256
 from coldaisle.control.schema import PerZone, Zone
-from coldaisle.store.models import Quality
+from coldaisle.measurement import Quality
 
 
 class _Frozen(BaseModel):

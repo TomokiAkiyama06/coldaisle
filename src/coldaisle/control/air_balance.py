@@ -20,7 +20,7 @@ import yaml
 from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, model_validator
 
 from coldaisle.control.schema import Demand, PerZone, Reason, Zone
-from coldaisle.store.models import DERIVED_PREFIX, validate_metric
+from coldaisle.measurement import DERIVED_PREFIX, validate_metric
 
 _DERIVED_NAME = re.compile(r"^d\.[a-z][a-z0-9_]*$")
 """派生値（決定記録 0002 §2.2）の名前の形。存在は起動時に Metric Catalog で確かめる。"""
