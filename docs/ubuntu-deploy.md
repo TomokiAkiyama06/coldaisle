@@ -795,8 +795,8 @@ CLI の書いた journal を読むと、走行中なら `SHADOW` へ下がり、
 
 > **この節の手順で worker の unit を `systemctl enable` しません。** MPC worker は fand の有効化（6.5）の後に
 > 所有者の判断で有効にします。それまでは fand の段階 5 の確認で `start` するだけです。
-> **RL worker（`coldaisle-learnd-supervisor.service`）は #89 まで導入先へ置きません**（`--role supervisor` は
-> 終了コード 2 で拒まれ、RL のユーザーも作らないので、置いて起動すると 217/USER で再試行を続けます）。
+> **RL worker（`coldaisle-learnd-supervisor.service`）は RL のユーザーを作るまで導入先へ置きません**
+> （`--role supervisor` は #89 から受け付けますが、ユーザーが無いまま置いて起動すると 217/USER で再試行を続けます）。
 
 **誰が何をできるか**（0115 §2.1 / §2.8）
 

@@ -38,7 +38,7 @@ WorkingDirectory=/opt/coldaisle
 ExecStart=/opt/coldaisle/.venv/bin/coldaisle-learnd --role mpc --config-dir /etc/coldaisle/control-config --registry-root /var/lib/coldaisle-registry --learned-channel-config /etc/coldaisle/learned-channel.yaml
 
 # fand の再起動・停止で接続が切れると終了コード 3 で終わる（0113 §2.1）。それが通常の経路なので戻す。
-# 2（--role が未対応）は人が直すまで変わらないので戻さない。**3 と 5 は入れない**（5 は一時的な失敗も含む。0115 §2.5）
+# 2（引数の誤り。未知の --role を含む。0114 §2.1 の8）は人が直すまで変わらないので戻さない。**3 と 5 は入れない**（5 は一時的な失敗も含む。0115 §2.5）
 Restart=on-failure
 # **暫定値**（0115 §2.5 / §5 の 7）
 RestartSec=5

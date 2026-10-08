@@ -49,6 +49,12 @@ from coldaisle.metrics import MetricCatalog
 LOGGER = logging.getLogger("coldaisle.learned_worker")
 
 EXIT_OK = 0
+EXIT_USAGE = 2
+"""引数の誤り（未知の `--role` を含む）。argparse が使い方を出して終わる値と同じ。
+
+人が直すまで結果が変わらないので、worker の unit は `RestartPreventExitStatus=2` で再起動しない
+（0115 §2.5）。`--role` が未対応を表す専用の値は 0114 §2.1 の8で廃止した。
+"""
 EXIT_CHANNEL_CLOSED = 3
 """fand に接続できない・接続が切れた。"""
 EXIT_STARTUP = 5

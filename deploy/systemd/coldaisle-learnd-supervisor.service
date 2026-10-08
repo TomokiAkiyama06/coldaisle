@@ -2,10 +2,10 @@
 #
 # **テンプレートである。** ユーザー名・グループ名・path は仮の値。RestartSec と資源の上限は**暫定値**。
 #
-# **#89（0077 段階 4）まで導入先の /etc/systemd/system へ置かない**（0115 §2.9）。いまの coldaisle-learnd は
-# --role supervisor を終了コード 2 で拒む。RL のユーザーも #89 まで作らない（0115 §2.2）ので、置いて起動すると
+# **RL のユーザーを作るまで導入先の /etc/systemd/system へ置かない**（0115 §2.9）。coldaisle-learnd は #89
+# （0077 段階 4・0114）から --role supervisor を受け付けるが、RL のユーザーが無いまま置いて起動すると
 # systemd が資格の設定で失敗し（217/USER）、RestartPreventExitStatus=2 では止まらず再試行を続ける。
-# ユーザー・読み取りの ACL・この unit は #89 で同時に置く。
+# ユーザー・読み取りの ACL・この unit は同時に置く。
 #
 # MPC worker の unit（coldaisle-learnd-mpc.service）との差は、役割・ユーザー・グループ・説明だけにする
 # （tests/test_deploy_templates.py が確かめる）。
@@ -38,7 +38,7 @@ WorkingDirectory=/opt/coldaisle
 ExecStart=/opt/coldaisle/.venv/bin/coldaisle-learnd --role supervisor --config-dir /etc/coldaisle/control-config --registry-root /var/lib/coldaisle-registry --learned-channel-config /etc/coldaisle/learned-channel.yaml
 
 # fand の再起動・停止で接続が切れると終了コード 3 で終わる（0113 §2.1）。それが通常の経路なので戻す。
-# 2（--role が未対応）は人が直すまで変わらないので戻さない。**3 と 5 は入れない**（5 は一時的な失敗も含む。0115 §2.5）
+# 2（引数の誤り。未知の --role を含む。0114 §2.1 の8）は人が直すまで変わらないので戻さない。**3 と 5 は入れない**（5 は一時的な失敗も含む。0115 §2.5）
 Restart=on-failure
 # **暫定値**（0115 §2.5 / §5 の 7）
 RestartSec=5

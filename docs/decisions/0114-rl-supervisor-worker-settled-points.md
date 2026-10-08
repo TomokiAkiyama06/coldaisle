@@ -36,6 +36,19 @@ production でなくなったときに「出力を送らず再起動の frame �
 | 7 | 同じ frame への出力 | **周期ごとに最新の frame へ出力を作り直す**（MPC と同じ）。`computed_at_ms`（worker の壁時計）が変わるので loop は受信時刻を押し直すが、期限は元 snapshot の単調時刻から数える（`ReceivedSupervisorOutput.source_monotonic_ms`）ので、古い出力が新しく見えることはない。推奨案で承認 |
 | 8 | 終了コード 2 | **廃止する。** `--role supervisor` を受け付けるので「未対応の役割」の終了コードは要らない。不正な `--role` は引数の解析（`choices`）で同じく 2 で終わる。0113 §2.1 の4の「2: `--role` が未対応」はこの部分だけ本記録で置き換える（3 と 5 は有効）。推奨案で承認 |
 
+### 2.2 0115（worker の unit。FINAL）との関係（注記）
+
+0115 は本記録より前に FINAL になり、次の2か所で終了コード 2 を「`--role` が未対応（RL は #89 まで）」と書いている。
+本記録は 0115 の本文を書き換えず、読み方だけをここに残す（決定の内容は変わらない）。
+
+- **§2.5 の `RestartPreventExitStatus=2` は有効なまま。** 2 は §2.1 の8のとおり引数の誤り（未知の `--role` を含む。
+  argparse の終了コード）で、人が直すまで結果が変わらない点は同じである。CLI はこの値を `EXIT_USAGE` として持ち、
+  `tests/test_deploy_templates.py` が unit の値と照合する
+- **§2.9 の「`--role supervisor` が終了コード 2 で拒まれる間」は PR #266 で終わる。** RL worker の unit を導入先へ
+  置かない理由のうち残るのは「RL のユーザーが無いまま置くと 217/USER で再試行を続ける」だけで、ユーザー・ACL・
+  unit を同時に置く規則（0115 §2.2 / §2.9）は変わらない。テンプレートの注記と `docs/ubuntu-deploy.md` 6.8 の
+  文言はこの読み方に合わせた
+
 ## 3. Consequences
 
 ### 良くなること
