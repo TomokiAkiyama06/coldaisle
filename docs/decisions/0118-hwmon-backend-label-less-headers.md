@@ -53,6 +53,11 @@
 - 実行部は `expected_label` が `null` の zone で、次の2つを確かめてから書く
   - `name` が記録と一致する
   - `/sys/class/hwmon` の下で、同じ `name` の device がちょうど1つ
+- **起動時に既存の記録の元の値を引き継ぐ条件**（0080 §2.7 の4）に、zone・driver 名・label に加えて
+  **`pwm_attribute` と `enable_attribute` の一致**を足す。`label: null` では3 zone の (driver, label) が同じになり、
+  対応表を変えた後に残った記録から、別の header の元の値を引き継ぎうるため。
+  一致しない記録は引き継がず、0080 §2.7 の4のとおり error を残して上書きする
+  （いまの値が実行部の Max なら、元の値は manual か全速になり、正常停止でも Max のまま終える。冷却は弱まらない）
 - **実行部は、書く時点で hwmon の device を探し直す。** 記録の `hwmonN` は監査のためだけに残し、書き込み先の決定には使わない
   - `label: null` の zone は、同じ `name` の device がちょうど1つのときにその device を使う
   - label のある zone は、`name` と、`tach_attribute` の番号の `fanN_label`（無ければ `pwmN_label`）が記録と一致する device が
