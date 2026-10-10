@@ -736,3 +736,18 @@ def test_fand_passes_the_learned_and_calibration_inputs():
     assert "--t-sensor-metric" not in exec_start
     # 読み取りだけ。ReadWritePaths= は変えない
     assert words(fand(), "Service", "ReadWritePaths") == ["/var/lib/coldaisle", AUTHORITY_DIR]
+
+
+# ---------------------------------------------------------- fand の実機 backend（0118 §2.5）
+
+
+def test_fand_drives_the_hwmon_backend_explicitly():
+    """CLI の既定は simulated なので、unit が `--backend hwmon` をちょうど1回明示する。"""
+    exec_start = one(fand(), "Service", "ExecStart").split()
+    assert exec_start.count("--backend") == 1
+    assert option(exec_start, "--backend") == "hwmon"
+    from coldaisle.control_daemon import build_parser
+
+    # 既定は simulated のまま（開発機で引数を付け忘れて実機の Fan に書かない）
+    assert build_parser().parse_args([]).backend == "simulated"
+    assert build_parser().parse_args(exec_start[1:]).backend == "hwmon"
