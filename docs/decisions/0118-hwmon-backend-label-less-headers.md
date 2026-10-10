@@ -46,6 +46,13 @@
   導入先の3 zone はどれも同じ番号である（`docs/fan-header-mapping.md`）
 - 3 zone の重複の検査（driver・label・`pwm_attribute`）は、`null` を1つの値として同じに扱う
 - v1 は v2 として補完しない（読み込み時に拒否し、`fan-hardware.yaml` の不正として扱う）
+- 束ねた版 `CONTROL_CONFIG_VERSION` を **14 → 15** に上げる（ほかの3ファイルの版は変えない）。
+  ファイルの版を上げるたびに束ねた版を上げてきた規約（`control/config.py`・`docs/control-config.md`）に従い、
+  trace と Learned の frame が新しい hardware の形を名乗るようにする
+  - 移行: 運用の `fan-hardware.yaml` を v2 の形（`label` を明示、`tach_attribute` の番号を揃える）に書き直し、
+    最後に `schema_version: 2` へ上げる。いまは導入先に運用のファイルが無い
+  - 束ねた版に依存する保存物（trace の読み手・registry の artifact の束縛など）の扱いは、v13 → v14 のときと同じ手順を
+    段階 B で確かめ、`docs/control-config.md` に「Control Config v15 と `fan-hardware.yaml` v2」の節を足す
 
 ### 2.2 引き継ぎの記録と実行部も label を省ける形にする
 
