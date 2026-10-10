@@ -34,7 +34,7 @@ from coldaisle.control.schema import (
 )
 from coldaisle.measurement import validate_metric
 
-CONTROL_CONFIG_VERSION: Literal[14] = 14
+CONTROL_CONFIG_VERSION: Literal[15] = 15
 """4ファイルを束ねた Control Config の版。
 
 - v11（#81 / 決定記録 0073 §2.1）: ``air-balance.yaml``（v2）を4つ目のファイルにした。
@@ -46,7 +46,11 @@ CONTROL_CONFIG_VERSION: Literal[14] = 14
 - v14（#86 / 決定記録 0077 §2.4 の4・§2.10 段階 3）: ``fan-policy.yaml`` を v11 にした
   （``mpc.max_source_age_ms``）。上限 ``<= mpc.valid_ms`` と、``safety.yaml`` をまたぐ下限
   ``>= 2 * safety.tick_ms + mpc.period_ms + mpc.budget_ms`` を一括検証で確かめる
+- v15（#74 / 決定記録 0118 §2.1）: ``fan-hardware.yaml`` を v2 にした。``label`` は必須のまま
+  ``null``（Fan の label を持たない driver の宣言）を許し、``tach_attribute`` の番号を
+  ``pwm_attribute`` と同じに限る
 """
+FAN_HARDWARE_CONFIG_VERSION: Literal[2] = 2
 FAN_POLICY_CONFIG_VERSION: Literal[11] = 11
 SAFETY_CONFIG_VERSION: Literal[4] = 4
 CONFIG_FILENAMES = {
@@ -186,11 +190,20 @@ class FanProfile(_ConfigModel):
         return max(demand, self.minimum_stable_demand)
 
 
+FanHeaderLabel = Annotated[str, Field(pattern=r"^[A-Za-z0-9_. -]+$", min_length=1, max_length=120)]
+
+
 class FanHeader(_ConfigModel):
-    """sysfs を番号でなく driver・label・属性名で特定する。"""
+    """sysfs を番号でなく driver・label・属性名で特定する。
+
+    ``label`` は省略できない（既定値を持たない）。``null`` は「この driver は Fan の
+    label を持たない」という宣言で、hwmon の ``name`` が driver に一致する device が
+    ちょうど1つのときだけ特定できたとする（決定記録 0118 §2.1）。書き忘れと宣言を
+    区別するため、省略を ``null`` に読み替えない。
+    """
 
     driver: str = Field(pattern=r"^[A-Za-z0-9_.-]+$", max_length=120)
-    label: str = Field(pattern=r"^[A-Za-z0-9_. -]+$", min_length=1, max_length=120)
+    label: FanHeaderLabel | None
     pwm_attribute: str = Field(pattern=r"^pwm[1-9][0-9]*$")
     tach_attribute: str = Field(pattern=r"^fan[1-9][0-9]*_input$")
     enable_attribute: str = Field(pattern=r"^pwm[1-9][0-9]*_enable$")
@@ -198,15 +211,21 @@ class FanHeader(_ConfigModel):
 
     @model_validator(mode="after")
     def _targets_one_header_channel(self) -> Self:
-        if "hwmon" in self.label.lower() or "hwmon" in self.driver.lower():
+        if (self.label is not None and "hwmon" in self.label.lower()) or (
+            "hwmon" in self.driver.lower()
+        ):
             raise ValueError("hwmonN の番号では header を特定しない")
         if self.enable_attribute != f"{self.pwm_attribute}_enable":
             raise ValueError("enable_attribute は pwm_attribute と同じ channel を指定する")
+        # 番号が違うと、label で確かめた Fan とは別の Fan の回転数を読む設定を許し、
+        # 止まった Fan を回っている別の Fan が隠しうる（決定記録 0118 §2.1）。
+        if self.tach_attribute != f"fan{self.pwm_attribute.removeprefix('pwm')}_input":
+            raise ValueError("tach_attribute は pwm_attribute と同じ番号の fanN_input を指定する")
         return self
 
 
 class FanHardwareConfig(_ConfigModel):
-    schema_version: Literal[1]
+    schema_version: Literal[2]
     approval: ConfigApproval
     zones: PerZone[FanHeader]
 
@@ -224,6 +243,7 @@ class FanHardwareConfig(_ConfigModel):
 
     @model_validator(mode="after")
     def _each_zone_targets_a_different_header(self) -> Self:
+        # label の null は1つの値として同じに扱う（決定記録 0118 §2.1）。
         identities = {
             (header.driver, header.label, header.pwm_attribute)
             for header in (self.zones.front, self.zones.rear, self.zones.top)
