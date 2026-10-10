@@ -13,6 +13,7 @@
 |---|---|
 | `deploy/systemd/coldaisle-daemon.service` | 取り込みデーモン（シリアル）。`Restart=always` |
 | `deploy/systemd/coldaisle-api.service` | 読み取り API とダッシュボード（`127.0.0.1:8000`）。`Restart=always` |
+| `deploy/systemd/coldaisle-telemetry.service` | Internal Telemetry（NVML / hwmon / `/proc/stat`）。`Restart=always`。基板が無くても動く（決定記録 [`0117`](decisions/0117-telemetry-unit.md)） |
 | `deploy/systemd/coldaisle-rollup.service` / `.timer` | ロールアップと保持期間の適用。毎日 03:00 |
 | `deploy/systemd/coldaisle-report.service` / `.timer` | 前日の日次レポート。毎朝 08:05（ロールアップのあと） |
 | `deploy/udev/99-coldaisle-sensors.rules` | センサー基板に `/dev/server-sensors` の固定名を付ける |
@@ -28,8 +29,7 @@
   （`docs/critical-safety.md`「統合と実機検証までサービスで Fan 制御を有効化しない」）。
 - **Learned worker（`coldaisle-learnd-mpc` / `coldaisle-learnd-supervisor`）も、テンプレートを置くだけで有効化しません**
   （6.8。決定記録 [`0115`](decisions/0115-learned-worker-units.md) §2.9）。RL worker の unit は #89 まで導入先へ置きません。
-- `coldaisle-telemetry`（Internal Telemetry）と `coldaisle-eventd`（書き込みソケット。
-  決定記録 0045 未決 4）の unit も含めません。
+- `coldaisle-eventd`（書き込みソケット。決定記録 0045 未決 4）の unit も含めません。
 - 日次 CSV（`coldaisle-rollup --export-day`）の自動実行は配線していません。
   対象日を毎回渡す必要があり、自動化の方法はまだ決めていません（手で実行はできます）。
   export は CSV の横に `sensors_YYYY-MM-DD.export.json`（manifest）と、隠しの lock ファイル
@@ -134,11 +134,11 @@ sudoedit /etc/coldaisle/coldaisle.env
 ```bash
 # coldaisle-fand.service はここでは置かない（6 節。置くだけで enable しない）
 cd /opt/coldaisle/deploy/systemd
-sudo cp coldaisle-daemon.service coldaisle-api.service \
+sudo cp coldaisle-daemon.service coldaisle-api.service coldaisle-telemetry.service \
         coldaisle-rollup.service coldaisle-rollup.timer \
         coldaisle-report.service coldaisle-report.timer /etc/systemd/system/
 sudo systemctl daemon-reload
-sudo systemctl enable --now coldaisle-daemon.service coldaisle-api.service
+sudo systemctl enable --now coldaisle-daemon.service coldaisle-api.service coldaisle-telemetry.service
 sudo systemctl enable --now coldaisle-rollup.timer coldaisle-report.timer
 ```
 
@@ -167,7 +167,7 @@ queue され、その完了を待ってから走ります。手で `systemctl st
 確認。
 
 ```bash
-systemctl status coldaisle-daemon coldaisle-api
+systemctl status coldaisle-daemon coldaisle-api coldaisle-telemetry
 systemctl list-timers 'coldaisle-*'
 journalctl -u coldaisle-daemon -f
 curl -s http://127.0.0.1:8000/api/v1/health
@@ -198,10 +198,10 @@ DB の migration は、更新後に**最初にストアを開いたプロセス*
 
 ```bash
 sudo systemctl stop coldaisle-rollup.timer coldaisle-report.timer
-sudo systemctl stop coldaisle-daemon coldaisle-api   # 常駐させている他の書き手も
+sudo systemctl stop coldaisle-daemon coldaisle-api coldaisle-telemetry   # 常駐させている他の書き手も
 # ここでコードを更新する（git pull と venv の同期）
 sudo systemctl start coldaisle-rollup.service        # migration を当てる（終わるまで待つ）
-sudo systemctl start coldaisle-daemon coldaisle-api
+sudo systemctl start coldaisle-daemon coldaisle-api coldaisle-telemetry
 sudo systemctl start coldaisle-rollup.timer coldaisle-report.timer
 ```
 
@@ -248,12 +248,12 @@ sudo systemctl start coldaisle-rollup.timer coldaisle-report.timer
    ```bash
    sudo systemctl stop coldaisle-rollup.timer coldaisle-report.timer
    sudo systemctl stop coldaisle-rollup.service coldaisle-report.service \
-        coldaisle-daemon coldaisle-api
+        coldaisle-daemon coldaisle-api coldaisle-telemetry
    rsync -av <mac>:/tmp/coldaisle-migrate.db /tmp/coldaisle.db
    sudo rm -f /var/lib/coldaisle/coldaisle.db-wal /var/lib/coldaisle/coldaisle.db-shm
    # 0660: coldaisle-fand も補助グループで書く（決定記録 0080 §2.1。0640 では fand が書けない）
    sudo install -o coldaisle -g coldaisle -m 0660 /tmp/coldaisle.db /var/lib/coldaisle/coldaisle.db
-   sudo systemctl start coldaisle-daemon coldaisle-api
+   sudo systemctl start coldaisle-daemon coldaisle-api coldaisle-telemetry
    sudo systemctl start coldaisle-rollup.timer coldaisle-report.timer
    ```
 
@@ -405,7 +405,7 @@ hwmon には `/dev` のノードが無いので、udev の `GROUP=` / `MODE=` �
    ```bash
    sudo systemctl stop coldaisle-rollup.timer coldaisle-report.timer
    sudo systemctl stop coldaisle-rollup.service coldaisle-report.service \
-        coldaisle-daemon coldaisle-api
+        coldaisle-daemon coldaisle-api coldaisle-telemetry
    ```
 
 2. 新しい unit（`StateDirectoryMode=2770`・`UMask=0007`）を置きます（4 節の `cp`）
@@ -453,7 +453,7 @@ hwmon には `/dev` のノードが無いので、udev の `GROUP=` / `MODE=` �
    グループ `coldaisle`・`0660` であること）をもう一度 `stat` で見ます
 
    ```bash
-   sudo systemctl start coldaisle-daemon coldaisle-api
+   sudo systemctl start coldaisle-daemon coldaisle-api coldaisle-telemetry
    sudo systemctl start coldaisle-rollup.timer coldaisle-report.timer
    sudo sh -c "stat -c '%A %U:%G %n' /var/lib/coldaisle/coldaisle.db*"
    ```

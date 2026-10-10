@@ -26,7 +26,7 @@ SYSTEMD = ROOT / "deploy" / "systemd"
 UDEV = ROOT / "deploy" / "udev"
 TMPFILES = ROOT / "deploy" / "tmpfiles.d" / "coldaisle-learned.conf"
 
-SERVICES = ("coldaisle-daemon", "coldaisle-api")
+SERVICES = ("coldaisle-daemon", "coldaisle-api", "coldaisle-telemetry")
 """常駐するもの。**落ちたら戻す**（NFR-01）。"""
 
 JOBS = ("coldaisle-rollup", "coldaisle-report")
@@ -165,7 +165,7 @@ def test_services_do_not_run_as_root(name):
     assert one(unit, "Service", "Group") == "coldaisle"
 
 
-@pytest.mark.parametrize("name", ("coldaisle-daemon", *JOBS, FAND))
+@pytest.mark.parametrize("name", ("coldaisle-daemon", "coldaisle-telemetry", *JOBS, FAND))
 def test_exec_start_points_at_a_real_entry_point(name):
     """**入口の名前を変えたら、テンプレートも落ちる。**"""
     unit = parse_unit(SYSTEMD / f"{name}.service")
@@ -186,6 +186,20 @@ def test_the_ingest_daemon_reads_serial_with_dialout():
     unit = parse_unit(SYSTEMD / "coldaisle-daemon.service")
     assert "--source serial" in one(unit, "Service", "ExecStart")
     assert one(unit, "Service", "SupplementaryGroups") == "dialout"
+
+
+def test_telemetry_reads_nvml_without_serial():
+    """NVML は /dev/nvidia* を開く。シリアルは開かない（決定記録 0117 §2.3）。"""
+    unit = parse_unit(SYSTEMD / "coldaisle-telemetry.service")
+    assert "SupplementaryGroups" not in unit["Service"]
+    assert "PrivateDevices" not in unit["Service"]
+
+
+def test_fand_wants_the_telemetry_unit_that_exists():
+    """fand の `Wants=` が名指す unit が実在する（0080 §2.9 / 0117 §2.1）。"""
+    wants = " ".join(parse_unit(SYSTEMD / f"{FAND}.service")["Unit"]["Wants"]).split()
+    assert "coldaisle-telemetry.service" in wants
+    assert (SYSTEMD / "coldaisle-telemetry.service").is_file()
 
 
 def test_the_api_listens_on_loopback_only():

@@ -1,0 +1,40 @@
+# coldaisle Internal Telemetry（NVML / hwmon / /proc/stat。#65 / #57 / 決定記録 0117）のテンプレート。
+#
+# **テンプレートである。** `User=` / `Group=` は仮の値。導入の手順は docs/ubuntu-deploy.md。
+# 読むのは NVML・hwmon・/proc/stat だけで、hwmon へは書かない（書くのは coldaisle-fand だけ）。
+# シリアルポートも開かない（AGENTS.md ルール6）ので、dialout には入れない。
+
+[Unit]
+Description=coldaisle internal telemetry collector (NVML / hwmon)
+Documentation=file:///opt/coldaisle/docs/ubuntu-deploy.md
+# hwmon のドライバ（nct6799 など）を modules-load.d で読み込む導入先では、その後に始める。
+# 読み込まれる前に始めても落ちないが、最初の周期の hwmon が欠測になる
+After=systemd-modules-load.service
+# 再起動を諦めない。fand は Critical Safety の入力をここから受ける（0060 §2.2）
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=coldaisle
+Group=coldaisle
+WorkingDirectory=/opt/coldaisle
+StateDirectory=coldaisle
+# 2770（setgid）と UMask=0007 は DB を共有する unit すべてで揃える（決定記録 0080 §2.1）
+StateDirectoryMode=2770
+UMask=0007
+ExecStart=/opt/coldaisle/.venv/bin/coldaisle-telemetry --db /var/lib/coldaisle/coldaisle.db
+
+# NFR-01: クラッシュ後10秒以内に復帰する
+Restart=always
+RestartSec=5
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=coldaisle-telemetry
+
+NoNewPrivileges=yes
+PrivateTmp=yes
+# PrivateDevices= は付けない。NVML は /dev/nvidia* を開く（0117 §2.3）
+
+[Install]
+WantedBy=multi-user.target
