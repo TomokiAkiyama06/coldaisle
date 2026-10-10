@@ -5,6 +5,7 @@
 - **Date**: 2026-09-13
 - **Supersedes**: なし
 - **Superseded by**: [0080](0080-fand-systemd-unit.md)（§2.7「正常停止」のうち、引き継ぎ実行部が正常停止を見分ける方法のみ＝引き継ぎ記録の有無に。戻す・戻さないの規則と通知は有効）
+- **Superseded by**: [0118](0118-hwmon-backend-label-less-headers.md)（§2.7「異常終了」の制約の表の1行目＝引き継ぎ実行部が書ける値を `pwmN_enable=0` と `pwmN=255` に、と「制御を取るとき」の Max の書き方＝`pwmN_enable=0` → `1` の順に、のみ。記録を書く時点・記録の中身・正常停止の規則は有効）
 - **関連**: [`0027-fan-control-architecture.md`](0027-fan-control-architecture.md) /
   [`0026-three-zone-fan-control.md`](0026-three-zone-fan-control.md) /
   [`0001-initial-project-decisions.md`](0001-initial-project-decisions.md)（D-07） /

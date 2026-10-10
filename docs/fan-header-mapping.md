@@ -61,3 +61,9 @@ Rear 743 / Front 690 RPM で、上表と整合する。
 `PCH_CHIP_CPU_MAX_TEMP` / `PCH_CPU_TEMP` と同じく常に 0 °C を返した。未配線か driver の未対応とみられる。
 有効にすると 0 °C が `ok` として保存されるため（取得不能値を 0 で正常値扱いしない原則）、
 実値を返す入力が確認できるまで無効にしている。
+
+## `pwmN_enable` の挙動（2026-10-10 に Top で確認）
+
+自動制御（`5`）の間は `pwmN` へ書けない（`EBUSY`）。`0` を書くとすぐ全速になり、manual で `pwmN=255` のときは
+`pwmN_enable` が `0` と読める。`5` を書けば BIOS の曲線へ戻る。詳細と、これに合わせた Max の書き方は
+決定記録 [0118](decisions/0118-hwmon-backend-label-less-headers.md) §2.3 / §2.4 / §2.6。
