@@ -2,10 +2,9 @@
 #
 # **テンプレートである。** ユーザー名・グループ名・path は仮の値。RestartSec と資源の上限は**暫定値**。
 #
-# **RL のユーザーを作るまで導入先の /etc/systemd/system へ置かない**（0115 §2.9）。coldaisle-learnd は #89
-# （0077 段階 4・0114）から --role supervisor を受け付けるが、RL のユーザーが無いまま置いて起動すると
-# systemd が資格の設定で失敗し（217/USER）、RestartPreventExitStatus=2 では止まらず再試行を続ける。
-# ユーザー・読み取りの ACL・この unit は同時に置く。
+# **RL のユーザー・読み取りの ACL と同時に置く**（0115 §2.9。手順は docs/ubuntu-deploy.md 6.8）。
+# RL のユーザーが無いまま置いて起動すると、systemd が資格の設定で失敗し（217/USER）、
+# RestartPreventExitStatus=2 では止まらず再試行を続ける。
 #
 # MPC worker の unit（coldaisle-learnd-mpc.service）との差は、役割・ユーザー・グループ・説明だけにする
 # （tests/test_deploy_templates.py が確かめる）。

@@ -701,13 +701,18 @@ def test_tmpfiles_role_directories_match_the_production_sockets():
 
 
 def test_the_deploy_guide_keeps_the_registry_lock_away_from_workers():
-    """worker が lock を握ると Registry の書き込みを止められる（0115 §2.8）。"""
+    """worker が lock を握ると Registry の書き込みを止められる（0115 §2.8）。
+
+    手順は2つの役割のグループを1つの loop で回す。loop が両方のグループを回し、
+    中の setfacl がその変数を使うことを確かめる。
+    """
     guide = (ROOT / "docs" / "ubuntu-deploy.md").read_text(encoding="utf-8")
-    group = learned_channel()["sockets"]["mpc"]["group"]
-    assert f"setfacl -x g:{group} /var/lib/coldaisle-registry/.registry.lock" in guide
-    assert f"setfacl -d -m g:{group}:r-X /var/lib/coldaisle-registry" in guide
+    groups = [learned_channel()["sockets"][role]["group"] for role in WORKERS]
+    assert f"for g in {' '.join(groups)}; do" in guide
+    assert 'setfacl -x "g:$g" /var/lib/coldaisle-registry/.registry.lock' in guide
+    assert 'setfacl -d -m "g:$g:r-X" /var/lib/coldaisle-registry' in guide
     assert "setfacl -R -m" not in guide.replace(
-        f"setfacl -R -m g:{group}:r-X /var/lib/coldaisle-registry/artifacts", ""
+        'setfacl -R -m "g:$g:r-X" /var/lib/coldaisle-registry/artifacts', ""
     )
     assert (
         f"install -m 0644 /opt/coldaisle/deploy/tmpfiles.d/{TMPFILES.name} /etc/tmpfiles.d/"

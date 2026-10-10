@@ -28,7 +28,7 @@
   kill・watchdog・正常停止の確認）と、0028 §2.9 の承認点 3 の後です
   （`docs/critical-safety.md`「統合と実機検証までサービスで Fan 制御を有効化しない」）。
 - **Learned worker（`coldaisle-learnd-mpc` / `coldaisle-learnd-supervisor`）も、テンプレートを置くだけで有効化しません**
-  （6.8。決定記録 [`0115`](decisions/0115-learned-worker-units.md) §2.9）。RL worker の unit は #89 まで導入先へ置きません。
+  （6.8。決定記録 [`0115`](decisions/0115-learned-worker-units.md) §2.9）。
 - `coldaisle-eventd`（書き込みソケット。決定記録 0045 未決 4）の unit も含めません。
 - 日次 CSV（`coldaisle-rollup --export-day`）の自動実行は配線していません。
   対象日を毎回渡す必要があり、自動化の方法はまだ決めていません（手で実行はできます）。
@@ -801,10 +801,10 @@ CLI の書いた journal を読むと、走行中なら `SHADOW` へ下がり、
 変えるなら unit・`tmpfiles.d`・`learned-channel.yaml`・ACL を揃えます。
 **実機のユーザー名・ホスト名・path はコミットしません**（AGENTS.md ルール10）。
 
-> **この節の手順で worker の unit を `systemctl enable` しません。** MPC worker は fand の有効化（6.5）の後に
+> **この節の手順で worker の unit を `systemctl enable` しません。** 2つの worker は fand の有効化（6.5）の後に
 > 所有者の判断で有効にします。それまでは fand の段階 5 の確認で `start` するだけです。
-> **RL worker（`coldaisle-learnd-supervisor.service`）は RL のユーザーを作るまで導入先へ置きません**
-> （`--role supervisor` は #89 から受け付けますが、ユーザーが無いまま置いて起動すると 217/USER で再試行を続けます）。
+> **RL worker（`coldaisle-learnd-supervisor.service`）は、RL のユーザー・読み取りの ACL と同時に置きます**
+> （ユーザーが無いまま置いて起動すると、systemd が 217/USER で失敗し再試行を続けます。0115 §2.9）。
 
 **誰が何をできるか**（0115 §2.1 / §2.8）
 
@@ -812,7 +812,7 @@ CLI の書いた journal を読むと、走行中なら `SHADOW` へ下がり、
 |---|---|---|---|---|---|
 | fand（`coldaisle-fan`） | 待ち受ける（**worker のグループには入れない**） | 読む（6.2） | 読む（6.7。`coldaisle-authority` の ACL） | 使わない | 6.1〜6.3 のまま |
 | MPC worker（`coldaisle-learn-mpc`） | `learned-mpc/mpc.sock` へ接続 | **読む**（ACL） | **読む**（ACL） | **触らない** | 触らない |
-| RL worker（`coldaisle-learn-rl`。#89 から） | `learned-rl/supervisor.sock` へ接続 | #89 で足す | #89 で足す | 触らない | 触らない |
+| RL worker（`coldaisle-learn-rl`） | `learned-rl/supervisor.sock` へ接続 | **読む**（ACL） | **読む**（ACL） | **触らない** | 触らない |
 
 - **fand を worker のグループに入れません。** 入れると fand の uid が2つのグループの両方に入り、fand は起動時の
   検査（0077 §2.7）で Learned の経路を開きません。ソケットのグループは setgid の役割のディレクトリ（手順 2）から継ぎます
@@ -823,12 +823,14 @@ CLI の書いた journal を読むと、走行中なら `SHADOW` へ下がり、
 1. **ユーザーとグループ**
 
    ```bash
-   # MPC worker 専用のユーザー。主グループが役割のグループ（受付はアカウントの所属で認可する）
+   # 役割ごとの専用ユーザー。主グループが役割のグループ（受付はアカウントの所属で認可する）
    sudo useradd --system --user-group --no-create-home --shell /usr/sbin/nologin coldaisle-learn-mpc
-   # RL のグループは RL worker が無くても要る（fand は2つの役割のソケットを必ず両方開く）。メンバーは入れない。
-   # RL のユーザーは #89 で作る（useradd --system --gid coldaisle-learn-rl ...）
-   sudo groupadd --system coldaisle-learn-rl
+   sudo useradd --system --user-group --no-create-home --shell /usr/sbin/nologin coldaisle-learn-rl
    ```
+
+   以前の手順で `coldaisle-learn-rl` のグループだけを作った導入先では、2行目の `--user-group` を
+   `--gid coldaisle-learn-rl` に替えます（グループが既にあると `--user-group` は失敗します）。
+   2つのグループは RL worker を動かさない間も要ります（fand は2つの役割のソケットを必ず両方開く）
 
 2. **ソケットのディレクトリ**（`tmpfiles.d`。0115 §2.2）
 
@@ -855,31 +857,33 @@ CLI の書いた journal を読むと、走行中なら `SHADOW` へ下がり、
    `/run/coldaisle/learned-rl/supervisor.sock` にします（リポジトリの値は開発用の `var/run/...`）。
    `sockets.*.group` は手順 1 のグループ名にします
 
-4. **MPC worker の読み取り**（POSIX ACL。0115 §2.8。所有者・グループ・mode は変えない）
+4. **worker の読み取り**（POSIX ACL。0115 §2.8。所有者・グループ・mode は変えない）。2つの役割のグループに同じ形で付けます
 
    ```bash
-   # 制御設定（6.7 の手順 1 と同じ形）。親はたどれるだけ（coldaisle.env と control-admin.yaml は読めないまま）
-   sudo setfacl -m g:coldaisle-learn-mpc:--x /etc/coldaisle
-   sudo setfacl -m g:coldaisle-learn-mpc:r-x /etc/coldaisle/control-config
-   sudo setfacl -d -m g:coldaisle-learn-mpc:r-- /etc/coldaisle/control-config
-   sudo setfacl -m g:coldaisle-learn-mpc:r-- /etc/coldaisle/control-config/{fan-hardware,safety,fan-policy,air-balance}.yaml
-   sudo setfacl -m g:coldaisle-learn-mpc:r-- /etc/coldaisle/learned-channel.yaml
-   # Registry（6.7 の手順 3 の後）。root に default ACL を付け、書き手が置き直す registry.json にも継がせる
-   sudo setfacl -m g:coldaisle-learn-mpc:r-x /var/lib/coldaisle-registry
-   sudo setfacl -d -m g:coldaisle-learn-mpc:r-X /var/lib/coldaisle-registry
-   # 既にある中身。**-R を root に掛けない**（.registry.lock に付いてしまう）
-   if [ -e /var/lib/coldaisle-registry/registry.json ]; then
-     sudo setfacl -m g:coldaisle-learn-mpc:r-- /var/lib/coldaisle-registry/registry.json
-   fi
-   if [ -d /var/lib/coldaisle-registry/artifacts ]; then
-     sudo setfacl -R -m g:coldaisle-learn-mpc:r-X /var/lib/coldaisle-registry/artifacts
-     # -R -m は access ACL だけ。既にあるディレクトリにも default を付け、後から登録された版を継がせる
-     sudo find /var/lib/coldaisle-registry/artifacts -type d \
-          -exec setfacl -d -m g:coldaisle-learn-mpc:r-X {} +
-   fi
-   # lock は worker に持たせない（O_RDONLY でも flock を取れ、Registry の書き込みを止められる）。
-   # root の default ACL から継いだ分を外す。**6.7 の手順 4 で lock を作り直したときも、この行を続けて実行する**
-   sudo setfacl -x g:coldaisle-learn-mpc /var/lib/coldaisle-registry/.registry.lock
+   for g in coldaisle-learn-mpc coldaisle-learn-rl; do
+     # 制御設定（6.7 の手順 1 と同じ形）。親はたどれるだけ（coldaisle.env と control-admin.yaml は読めないまま）
+     sudo setfacl -m "g:$g:--x" /etc/coldaisle
+     sudo setfacl -m "g:$g:r-x" /etc/coldaisle/control-config
+     sudo setfacl -d -m "g:$g:r--" /etc/coldaisle/control-config
+     sudo setfacl -m "g:$g:r--" /etc/coldaisle/control-config/{fan-hardware,safety,fan-policy,air-balance}.yaml
+     sudo setfacl -m "g:$g:r--" /etc/coldaisle/learned-channel.yaml
+     # Registry（6.7 の手順 3 の後）。root に default ACL を付け、書き手が置き直す registry.json にも継がせる
+     sudo setfacl -m "g:$g:r-x" /var/lib/coldaisle-registry
+     sudo setfacl -d -m "g:$g:r-X" /var/lib/coldaisle-registry
+     # 既にある中身。**-R を root に掛けない**（.registry.lock に付いてしまう）
+     if [ -e /var/lib/coldaisle-registry/registry.json ]; then
+       sudo setfacl -m "g:$g:r--" /var/lib/coldaisle-registry/registry.json
+     fi
+     if [ -d /var/lib/coldaisle-registry/artifacts ]; then
+       sudo setfacl -R -m "g:$g:r-X" /var/lib/coldaisle-registry/artifacts
+       # -R -m は access ACL だけ。既にあるディレクトリにも default を付け、後から登録された版を継がせる
+       sudo find /var/lib/coldaisle-registry/artifacts -type d \
+            -exec setfacl -d -m "g:$g:r-X" {} +
+     fi
+     # lock は worker に持たせない（O_RDONLY でも flock を取れ、Registry の書き込みを止められる）。
+     # root の default ACL から継いだ分を外す。**6.7 の手順 4 で lock を作り直したときも、この行を続けて実行する**
+     sudo setfacl -x "g:$g" /var/lib/coldaisle-registry/.registry.lock
+   done
    ```
 
    - `/opt/coldaisle`（コード・`config/metrics.yaml`・`config/model-registry.yaml`）は誰でも読めるので足しません
@@ -892,29 +896,34 @@ CLI の書いた journal を読むと、走行中なら `SHADOW` へ下がり、
         /var/lib/coldaisle-registry /var/lib/coldaisle-registry/.registry.lock
    ```
 
-   `group:coldaisle-learn-mpc` の行が手順 4 のとおりで、**`.registry.lock` に `group:coldaisle-learn-*` の行が
-   無いこと**。unit と同じ資格で、読めて書けないことを確かめます（6.4 の手順 4 と同じ `systemd-run`）
+   `group:coldaisle-learn-mpc` と `group:coldaisle-learn-rl` の行が手順 4 のとおりで、**`.registry.lock` に
+   `group:coldaisle-learn-*` の行が無いこと**。unit と同じ資格で、読めて書けないことを確かめます
+   （6.4 の手順 4 と同じ `systemd-run`）
 
    ```bash
-   for f in /etc/coldaisle/control-config/safety.yaml /etc/coldaisle/learned-channel.yaml \
-            /var/lib/coldaisle-registry/registry.json; do
-     sudo systemd-run --pipe --wait --quiet -p User=coldaisle-learn-mpc -p Group=coldaisle-learn-mpc \
-          sh -c "test -r '$f' && ! test -w '$f'" || echo "期待と違う: $f"
-   done
-   # 読めないこと（どれも権限の error になる）
-   for f in /etc/coldaisle/coldaisle.env /etc/coldaisle/control-admin.yaml /var/lib/coldaisle/coldaisle.db \
-            /var/lib/coldaisle-authority/authority.json /var/lib/coldaisle-registry/.registry.lock; do
-     sudo systemd-run --pipe --wait --quiet -p User=coldaisle-learn-mpc -p Group=coldaisle-learn-mpc \
-          sh -c "! test -r '$f'" || echo "期待と違う: $f"
+   for u in coldaisle-learn-mpc coldaisle-learn-rl; do
+     for f in /etc/coldaisle/control-config/safety.yaml /etc/coldaisle/learned-channel.yaml \
+              /var/lib/coldaisle-registry/registry.json; do
+       sudo systemd-run --pipe --wait --quiet -p "User=$u" -p "Group=$u" \
+            sh -c "test -r '$f' && ! test -w '$f'" || echo "期待と違う: $u $f"
+     done
+     # 読めないこと（どれも権限の error になる）
+     for f in /etc/coldaisle/coldaisle.env /etc/coldaisle/control-admin.yaml /var/lib/coldaisle/coldaisle.db \
+              /var/lib/coldaisle-authority/authority.json /var/lib/coldaisle-registry/.registry.lock; do
+       sudo systemd-run --pipe --wait --quiet -p "User=$u" -p "Group=$u" \
+            sh -c "! test -r '$f'" || echo "期待と違う: $u $f"
+     done
    done
    ```
 
-6. **unit を置いて検証する**（`enable` しない。RL の unit は置かない）
+6. **unit を置いて検証する**（`enable` しない）
 
    ```bash
-   sudo cp /opt/coldaisle/deploy/systemd/coldaisle-learnd-mpc.service /etc/systemd/system/
+   sudo cp /opt/coldaisle/deploy/systemd/coldaisle-learnd-mpc.service \
+           /opt/coldaisle/deploy/systemd/coldaisle-learnd-supervisor.service /etc/systemd/system/
    sudo systemctl daemon-reload
-   sudo systemd-analyze verify /etc/systemd/system/coldaisle-learnd-mpc.service
+   sudo systemd-analyze verify /etc/systemd/system/coldaisle-learnd-mpc.service \
+        /etc/systemd/system/coldaisle-learnd-supervisor.service
    ```
 
    - `--config-dir`・`--registry-root`・`--learned-channel-config` と `WorkingDirectory=` は fand の unit と同じ値です。
@@ -924,11 +933,12 @@ CLI の書いた journal を読むと、走行中なら `SHADOW` へ下がり、
      終わり、`RestartSec` ごとに再起動します（Fallback で運転するだけ）
 
 7. **Learned の経路が開くことを確かめる**（fand の段階 5 の確認に含める。**人が行います**）。fand を起動した後、
-   `sudo systemctl start coldaisle-learnd-mpc` し、次を見ます
+   `sudo systemctl start coldaisle-learnd-mpc coldaisle-learnd-supervisor` し、次を見ます
 
    ```bash
    journalctl -u coldaisle-fand -o cat | grep -E 'Learned の経路|channel_disabled|learned_channel' | tail -n 5
    journalctl -u coldaisle-learnd-mpc -o cat | tail -n 5
+   journalctl -u coldaisle-learnd-supervisor -o cat | tail -n 5
    sudo stat -c '%A %U:%G %n' /run/coldaisle/learned-mpc/mpc.sock /run/coldaisle/learned-rl/supervisor.sock
    ```
 
@@ -937,5 +947,8 @@ CLI の書いた journal を読むと、走行中なら `SHADOW` へ下がり、
      worker のグループに入っていない）
    - worker が接続して heartbeat を送り、いまの artifact（`observational_replay`）では `model_load_failure` で
      Fallback になること（0077 段階 3 の通常の経路）
-   - RL のグループのユーザー（#89 の前なら確認のための一時アカウント）が `/run/coldaisle/learned-mpc` をたどれないこと
+   - RL worker が接続して heartbeat を送ること。registry に production の policy が無い間は出力を送らず、fand の Supervisor は
+     RulePolicy のまま動くこと（0114）
+   - `coldaisle-learn-rl` が `/run/coldaisle/learned-mpc` を、`coldaisle-learn-mpc` が `/run/coldaisle/learned-rl` を
+     たどれないこと
    - 結果を #57 に残します。**実機のユーザー名・ホスト名・path は書きません**
