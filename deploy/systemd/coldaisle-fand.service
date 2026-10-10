@@ -16,7 +16,7 @@ Description=coldaisle 3-zone fan control daemon
 Documentation=file:///opt/coldaisle/docs/ubuntu-deploy.md
 # DB と入力を先に動かす。**Requires= / BindsTo= / PartOf= / Requisite= は使わない**（0080 §2.9）。
 # 取り込みの停止・再起動で冷却の制御まで止めない。入力の欠測は Critical Safety が安全側へ倒す。
-# coldaisle-telemetry.service はまだ無い（0069 未決 3）。無い unit への Wants= は無視される。
+# coldaisle-telemetry.service は Internal Telemetry（決定記録 0117）。
 # 停止は After= の逆順なので、OS の停止では fand が先に止まり、入力が生きているうちに BIOS へ返す
 Wants=coldaisle-daemon.service coldaisle-telemetry.service
 After=coldaisle-daemon.service coldaisle-telemetry.service systemd-modules-load.service
