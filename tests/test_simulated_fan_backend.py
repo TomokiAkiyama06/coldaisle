@@ -72,7 +72,7 @@ def hardware_config(*, confirmed: bool = True) -> FanHardwareConfig:
     }
     return FanHardwareConfig.model_validate(
         {
-            "schema_version": 1,
+            "schema_version": 2,
             "approval": (
                 {"status": "confirmed", "basis": "test characterization"}
                 if confirmed
@@ -159,7 +159,7 @@ def control_config(
     # policy の schema 変更にこの test が追従漏れしないようにする。
     policy = FanPolicyConfig.model_validate(valid_documents()["fan-policy.yaml"])
     sources = ConfigSources(
-        fan_hardware=ConfigSource(name="fan-hardware.yaml", schema_version=1, sha256="1" * 64),
+        fan_hardware=ConfigSource(name="fan-hardware.yaml", schema_version=2, sha256="1" * 64),
         safety=ConfigSource(name="safety.yaml", schema_version=4, sha256="2" * 64),
         policy=ConfigSource(
             name="fan-policy.yaml", schema_version=policy.schema_version, sha256="3" * 64

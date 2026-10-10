@@ -229,7 +229,7 @@ def _sources(
         return sha256(yaml.safe_dump(document, sort_keys=True).encode("utf-8")).hexdigest()
 
     return ConfigSources(
-        fan_hardware=ConfigSource(name="fan-hardware.yaml", schema_version=1, sha256="0" * 64),
+        fan_hardware=ConfigSource(name="fan-hardware.yaml", schema_version=2, sha256="0" * 64),
         safety=ConfigSource(
             name="safety.yaml",
             schema_version=int(safety_document["schema_version"]),

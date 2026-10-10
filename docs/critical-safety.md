@@ -147,22 +147,42 @@ deadman は制御プロセス外の systemd watchdog が担当する。異常停
 モデル・外部パッケージを読まず、固定の
 `/run/coldaisle/fan-handoff.json` と `/sys/class/hwmon` だけを使う。
 
-handoff record は schema version 1 と Front / Rear / Top の3レコードを持つ。各レコードは
+handoff record は schema version 2（v1 も読める）と Front / Rear / Top の3レコードを持つ。各レコードは
 sysfs root からの `name_path` / `label_path` / `pwm_path` / `enable_path`、期待する
-driver name / label、元の PWM / enable を持つ。実行部は次を検査する。
+driver name / label、元の PWM / enable を持つ。`fan-hardware.yaml` で `label: null` の header は
+`label_path` / `expected_label` が `null` になる（v2 だけ。決定記録 0118 §2.2）。実行部は次を検査する。
 
 - record は symlink や FIFO を許さず、`O_NOFOLLOW` で1回だけ open した通常ファイルを
   上限サイズまで読む。欠損・不正形式・過大 record は構造化 failure と非0終了にする
-- path は `hwmonN/<attribute>` 形式で、実機の class entry symlink だけを辿る。device directory
-  FD から4属性を `O_NOFOLLOW` で先に開き、read/write FD の inode identity を検証・固定する
-- driver `name` と label が record と一致し、label と PWM の channel 番号も一致する
-- 3 zone が別の PWM / enable の組を指す
+- path は `hwmonN/<attribute>` 形式で、label と PWM・enable の channel 番号が一致する
+- 3 zone が別の PWM / enable の組を指し、探し直しに使う組（driver・label・`pwmN`）も別である
+- driver が**確かめ済みの一覧**（いまは `nct6799` だけ。`VERIFIED_HWMON_DRIVERS`）にある。無ければ
+  `pwmN_enable=0` が Fan を止めうるので、その zone には何も書かず失敗とする（0118 §2.3a）
 
-一致した header には固定済み FD で `pwmN=255` を先に書き、その直後の PWM readback が
-255 のときだけ `pwmN_enable=1` を書く。これにより PWM write が無視された場合に旧値を
-manual 固定しない。enable 後にも PWM / enable を再確認する。1 zone の I/O 失敗後も残り
-zone の Max を試み、全 zone の結果を構造化する。不一致・revert・I/O 失敗は phase 付きの
-zone別 JSON log と非0終了で通知する。record が無いときは何もしない。
+書き込み先の device は**書く時点で探し直す**（0118 §2.2）。record の `hwmonN` は監査のためだけに残し、
+ドライバの再 bind で番号が変わっても Max を書ける。
+
+- `label: null` の zone: `name` が record と一致する device がちょうど1つ
+- label のある zone: `name` と、同じ番号の `fanN_label`（無ければ `pwmN_label`）が record と一致する
+  device がちょうど1つ
+- 0 個・2 個以上、または `name` / label を確かめられない device があれば、その zone には書かず失敗とする
+
+探し直しは実機の class entry symlink だけを辿り、device directory FD から属性を `O_NOFOLLOW` で
+先に開いて read/write FD の inode identity を検証・固定する。書く直前に、開いた FD で
+driver `name` と label を読み直して照合する。
+
+書ける値は `pwmN_enable=0`（hwmon ABI の「制御なし＝全速」）と `pwmN=255` だけで、値を引数・設定・
+record から受け取らない（0118 §2.3）。
+
+1. `pwmN_enable=0` を書く。`pwmN` を読み戻して 255 なら成功
+2. 1 が拒否されたか 255 でなければ `pwmN_enable` を読む。**`1`（manual）のときだけ** `pwmN=255` を書き、
+   `pwmN` が 255 かつ `pwmN_enable` が `0` か `1` なら成功（導入先の driver は manual の 255 を `0` と報告する）
+3. `pwmN_enable` が 2 以上（自動）なら `pwmN` に書かず失敗とする。自動のまま 255 が読めても、
+   実行部が終わった後に自動制御が下げうる。`pwmN_enable=1` は書かない
+
+1 zone の失敗後も残り zone の Max を試み、全 zone の結果を構造化する。不一致・未確認の driver・
+一意に特定できない header・I/O 失敗は phase 付きの zone別 JSON log と非0終了で通知する。
+record が無いときは何もしない。
 
 heartbeat を出す側は `src/coldaisle/control_daemon.py`（`coldaisle-fand`）にある
 （#74 / 決定記録 0060 §2.7）。

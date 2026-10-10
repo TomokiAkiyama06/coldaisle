@@ -10,8 +10,19 @@ M8 では `SimulatedFanBackend` のみを提供する。これは `DemandCompose
 - #57 による `coldaisle-fand` 専用の OS 権限、udev/systemd の allow-list、単一 writer
 - 決定記録 0028 §2.7 の takeover / handoff と異常停止時 Max
 
-`FanHardwareConfig` は driver・label・`pwmN` / `fanN_input` / `pwmN_enable` の組だけを
-受け、`hwmonN` の番号・絶対 path・任意 header の指定を拒否する。backend の公開入口は
+実機 backend は決定記録 0118 に従う（段階 B で実装中）。header の特定・Max の書き方・扱える driver は
+次のとおりで、今は設定と引き継ぎ実行部の側だけが入っている。
+
+- `fan-hardware.yaml` v2 の `label` は必須で、Fan の label を持たない driver（導入先の `nct6799`）は
+  `label: null` と明示する。そのときは hwmon の `name` が driver に一致する device がちょうど1つのときだけ
+  特定できたとする（0118 §2.1。`docs/control-config.md`「Control Config v15」）
+- Max は `pwmN_enable=0`（全速）で書く。導入先の driver は自動制御の間の `pwmN` への書き込みを `EBUSY` で拒み、
+  manual の `pwmN=255` を `pwmN_enable=0` と報告する（0118 §2.3 / §2.6）
+- `pwmN_enable=0` を全速として扱うのは、確かめ済みの driver の一覧（`coldaisle.control.hardware.VERIFIED_HWMON_DRIVERS`。
+  いまは `nct6799` だけ）にある driver だけ。引き継ぎ実行部も同じ一覧を定数で持ち、一致を試験で確かめる（0118 §2.3a）
+
+`FanHardwareConfig` は driver・label（または `null`）・`pwmN` / `fanN_input` / `pwmN_enable` の組だけを
+受け、`hwmonN` の番号・絶対 path・任意 header の指定を拒否する。`fanN_input` の番号は `pwmN` と同じに限る。backend の公開入口は
 検証済みの3 zone の `ComposedDemands` だけなので、上位層が個別の
 `EffectiveZoneDemand`、生 PWM、対象外 header を渡す経路はない。
 

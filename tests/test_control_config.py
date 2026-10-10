@@ -6,7 +6,13 @@ import pytest
 import yaml
 from pydantic import ValidationError
 
-from coldaisle.control.config import CONTROL_CONFIG_VERSION, ConfigSource, ControlConfig
+from coldaisle.control.config import (
+    CONTROL_CONFIG_VERSION,
+    FAN_HARDWARE_CONFIG_VERSION,
+    ConfigSource,
+    ControlConfig,
+    load_fan_hardware_document,
+)
 
 AIR_BALANCE_FIXTURE = Path(__file__).parent / "fixtures" / "air_balance_uncalibrated.yaml"
 
@@ -170,7 +176,7 @@ def valid_documents() -> dict[str, dict[str, object]]:
     return {
         "air-balance.yaml": air_balance_document(),
         "fan-hardware.yaml": {
-            "schema_version": 1,
+            "schema_version": 2,
             "approval": {"status": "provisional"},
             "zones": {
                 "front": {
@@ -386,9 +392,9 @@ def load_config(tmp_path: Path) -> ControlConfig:
 def test_complete_config_has_traceable_sources_and_is_not_actuation_ready(tmp_path: Path) -> None:
     config = load_config(tmp_path)
 
-    assert CONTROL_CONFIG_VERSION == 14
+    assert CONTROL_CONFIG_VERSION == 15
     assert config.actuation_permitted is False
-    assert config.trace_metadata()["control_config_version"] == 14
+    assert config.trace_metadata()["control_config_version"] == 15
     metadata = config.trace_metadata()["control_config"]
     assert metadata["fan_hardware"]["name"] == "fan-hardware.yaml"
     assert metadata["safety"]["schema_version"] == 4
@@ -679,6 +685,97 @@ def test_absolute_path_in_hardware_mapping_is_rejected(tmp_path: Path) -> None:
 
     with pytest.raises(ValidationError, match="pattern"):
         ControlConfig.from_directory(tmp_path)
+
+
+# --- fan-hardware.yaml v2（決定記録 0118 §2.1） ---
+
+
+def labelless_hardware(documents: dict[str, dict[str, object]]) -> dict[str, object]:
+    """導入先の形（label の無い ``nct6799`` の1つの device に3 zone）へ書き換える。"""
+    hardware = documents["fan-hardware.yaml"]
+    zones = hardware["zones"]
+    assert isinstance(zones, dict)
+    for zone, channel in (("front", 6), ("rear", 5), ("top", 2)):
+        zones[zone].update(
+            {
+                "driver": "nct6799",
+                "label": None,
+                "pwm_attribute": f"pwm{channel}",
+                "tach_attribute": f"fan{channel}_input",
+                "enable_attribute": f"pwm{channel}_enable",
+            }
+        )
+    return hardware
+
+
+def test_fan_hardware_v2_accepts_an_explicit_null_label(tmp_path: Path) -> None:
+    documents = valid_documents()
+    labelless_hardware(documents)
+    write_documents(tmp_path, documents)
+
+    config = ControlConfig.from_directory(tmp_path)
+
+    assert FAN_HARDWARE_CONFIG_VERSION == 2
+    assert config.fan_hardware.schema_version == 2
+    assert config.fan_hardware.zones.front.label is None
+    assert config.trace_metadata()["control_config"]["fan_hardware"]["schema_version"] == 2
+
+
+def test_fan_hardware_label_cannot_be_omitted(tmp_path: Path) -> None:
+    """省略は「label が無い」の宣言と区別できないので拒否する（null への補完をしない）。"""
+    documents = valid_documents()
+    zones = labelless_hardware(documents)["zones"]
+    assert isinstance(zones, dict)
+    del zones["rear"]["label"]
+    write_documents(tmp_path, documents)
+
+    with pytest.raises(ValidationError, match=r"zones\.rear\.label"):
+        ControlConfig.from_directory(tmp_path)
+
+
+@pytest.mark.parametrize("label", ["", "hwmon3"])
+def test_fan_hardware_string_label_rules_are_unchanged(tmp_path: Path, label: str) -> None:
+    documents = valid_documents()
+    documents["fan-hardware.yaml"]["zones"]["front"]["label"] = label
+    write_documents(tmp_path, documents)
+
+    with pytest.raises(ValidationError):
+        ControlConfig.from_directory(tmp_path)
+
+
+def test_fan_hardware_v2_requires_the_tach_number_to_match_the_pwm(tmp_path: Path) -> None:
+    """番号が違うと、止まった Fan を別の回っている Fan の回転数が隠しうる。"""
+    documents = valid_documents()
+    documents["fan-hardware.yaml"]["zones"]["top"]["tach_attribute"] = "fan4_input"
+    write_documents(tmp_path, documents)
+
+    with pytest.raises(ValidationError, match="tach_attribute"):
+        ControlConfig.from_directory(tmp_path)
+
+
+def test_fan_hardware_null_labels_are_compared_as_one_value(tmp_path: Path) -> None:
+    """label: null の zone 同士は driver と pwm_attribute だけで区別される。"""
+    documents = valid_documents()
+    zones = labelless_hardware(documents)["zones"]
+    assert isinstance(zones, dict)
+    for key in ("pwm_attribute", "tach_attribute", "enable_attribute"):
+        zones["rear"][key] = zones["front"][key]
+    write_documents(tmp_path, documents)
+
+    with pytest.raises(ValidationError, match="別々の header"):
+        ControlConfig.from_directory(tmp_path)
+
+
+def test_fan_hardware_v1_is_rejected_without_completion(tmp_path: Path) -> None:
+    """v1 を v2 として補完しない。hardware だけの読み込み（制御を取らない経路）でも拒否する。"""
+    documents = valid_documents()
+    documents["fan-hardware.yaml"]["schema_version"] = 1
+    write_documents(tmp_path, documents)
+
+    with pytest.raises(ValidationError, match="schema_version"):
+        ControlConfig.from_directory(tmp_path)
+    with pytest.raises(ValidationError, match="schema_version"):
+        load_fan_hardware_document(tmp_path / "fan-hardware.yaml")
 
 
 def test_new_config_is_validated_separately_and_never_replaces_running_config(

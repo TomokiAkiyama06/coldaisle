@@ -176,6 +176,52 @@ Model を Production へ昇格させても authority は動かない（#104 と 
 v8からv9へは `authority_rollout` を追加してから `schema_version: 9` へ上げる。
 v1〜v8は自動補完せず起動前に拒否する。
 
+## Control Config v15 と `fan-hardware.yaml` v2（#74 / 決定記録 0118 §2.1）
+
+束ねた版 `CONTROL_CONFIG_VERSION` を 14 → 15 に上げ、`fan-hardware.yaml` を schema version 1 → 2 にした
+（ほかのファイルの版は変えない。`safety.yaml` 4、`fan-policy.yaml` 11、`air-balance.yaml` 2）。
+導入先の `nct6799` は Fan の `fanN_label` / `pwmN_label` を持たないため、v1 の「label は必須の文字列」では
+header を書けなかった。
+
+```yaml
+schema_version: 2
+zones:
+  front:
+    driver: nct6799
+    label: null              # 省略は不可。null は「この driver は Fan の label を持たない」という宣言
+    pwm_attribute: pwm6
+    tach_attribute: fan6_input   # 番号は pwm_attribute と同じに限る
+    enable_attribute: pwm6_enable
+    profile: ...
+```
+
+- `label` は**必須のまま**、値に `null` を許す。省略は拒否する（書き忘れを黙って label 無しの特定に落とさない）。
+  文字列のときの規則（文字の種類・`hwmon` を含めない）は v1 と同じ
+- `label: null` の header は、hwmon の `name` が `driver` に一致する device が**ちょうど1つ**のときだけ特定できたとする。
+  0 個・2 個以上なら header を一意に特定できないとして制御を取らない（0028 §2.7）。この照合は実機 backend が行う
+- `tach_attribute` の番号を `pwm_attribute` と同じに限る（`pwm2` なら `fan2_input`）。番号が違うと、label で確かめた
+  Fan とは別の Fan の回転数を読み、止まった Fan を回っている別の Fan が隠しうる
+- 3 zone の重複の検査（`driver`・`label`・`pwm_attribute`）では、`null` を1つの値として同じに扱う。
+  `label: null` の zone 同士は `driver` と `pwm_attribute` で区別される
+- `fan-hardware.yaml` の不正なので、v1 のままのファイル・`label` を欠くファイル・番号の揃わないファイルは
+  **制御を取らない**（BIOS の制御のまま終了コード 2。`config_invalid` の全 zone Max ではない）
+- trace の `runtime.control_config_version` と `ControlConfigDigest` の値が 15 になる。`ControlTick` /
+  `ControlTickRuntime` の形は変えない。保存済みの trace（v14 以前の版を名乗るもの）はそのまま読める。
+  Offline Evaluation・昇格の証拠の突き合わせは、これまでどおり各ファイルの SHA-256 で行う
+  （`fan-hardware.yaml` を書き直せば hash が変わるので、書き直す前の trace と報告は今の設定と一致しない）
+
+**移行手順**: v1 を v2 として補完しない（読み込み時に拒否する）。いまは導入先に運用の `fan-hardware.yaml` は無い。
+
+1. 運用の `fan-hardware.yaml` の各 zone に `label` を明示する。Fan の label を持たない driver は `label: null`、
+   持つ driver は v1 の値のまま（書き換えは要らない）
+2. 各 zone の `tach_attribute` の番号を `pwm_attribute` と揃える
+3. 最後に `schema_version: 2` へ上げる。v1 のままのファイルも、欄を欠く v2 も拒否され、制御を取らずに終わる
+4. 新しいコードへ更新して再起動する
+
+引き継ぎの記録（`/run/coldaisle/fan-handoff.json`）も schema version 2 になり、`label: null` の header では
+`label_path` / `expected_label` が `null` になる。引き継ぎ実行部は v1 の記録も読める
+（`docs/critical-safety.md`「deadman / 異常停止」）。
+
 ## Control Config v14 と `fan-policy.yaml` v11（#86 / 決定記録 0077 §2.4 の4）
 
 束ねた版 `CONTROL_CONFIG_VERSION` を 13 → 14 に上げ、`fan-policy.yaml` を schema version 10 → 11 にした
@@ -350,7 +396,7 @@ SHA-256 を毎 tick 残す。Offline Evaluation の報告は v3 になり、`air
 昇格（`AuthorityJournal` v2）は、この2ファイルについても承認の証拠・報告・いまの設定の一致を求める
 （`docs/authority-rollout.md`）。
 
-現行 Control Config v13 は設定の live reload を行わない。設定変更は候補全体を別オブジェクトで検証したうえで
+現行の Control Config（v15）は設定の live reload を行わない。設定変更は候補全体を別オブジェクトで検証したうえで
 **次回再起動時**にだけ反映する。これにより、変更後の設定も必ず `STARTUP` の Max を通る。
 `trace_metadata()` は、採用されたsource名・schema version・SHA-256を #82 の decision traceへ渡す。
 Confidence / OOD の判断（`model_gate`）には検証済み assessment の値だけを書き、裏付けの無い tick は

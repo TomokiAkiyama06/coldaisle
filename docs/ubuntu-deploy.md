@@ -493,7 +493,8 @@ sudo /usr/bin/python3 -I -S /opt/coldaisle/src/coldaisle/safety_handoff.py; echo
 - 上の `safety_handoff.py` の実行は、`/usr/bin/python3` が **3.12 以上**（`pyproject.toml` の
   `requires-python` と同じ）で、`"record_found":false` と `exit=0` が出れば通っています。fand を
   まだ起動していないので引き継ぎ記録（`/run/coldaisle/fan-handoff.json`）は無く、何も書きません
-  （記録が残っていれば Max・manual を書きます。冷却を弱める方向には書きません）。
+  （記録が残っていれば Max（`pwmN_enable=0`。拒否されて manual のときだけ `pwmN=255`）を書きます。
+  冷却を弱める方向には書きません。決定記録 0118 §2.3）。
   **3.12 より古い、または `exit=0` にならない導入先では fand の unit を置きません。**
   uv の管理する Python（2 節）や venv の `python` を `ExecStopPost=` に書き換えないでください
   （0080 §2.5 の「venv と `coldaisle` パッケージに依存しない」を崩します）

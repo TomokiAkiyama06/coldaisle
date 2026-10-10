@@ -11,8 +11,10 @@ from coldaisle.control.hardware.simulated import (
     SimulatedFanBackend,
     SimulatedFaultPlan,
 )
+from coldaisle.control.hardware.verified_drivers import VERIFIED_HWMON_DRIVERS
 
 __all__ = [
+    "VERIFIED_HWMON_DRIVERS",
     "FanHardwareBackend",
     "FanHardwareResult",
     "SimulatedFanBackend",
