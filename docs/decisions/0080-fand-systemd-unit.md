@@ -15,7 +15,7 @@
     **通知の I/O の失敗（socket を作れない・送信できない）のみ**（§2.4 で再起動する終了コード 6 に分ける）
 
   旧記録側への `Superseded by` の追記は、本記録を FINAL にした PR で行った（所有者の選択 9 (a)。下の「所有者の選択」）
-- **Superseded by**: [0083](0083-fand-exit-settled-points.md)（§2.4 の「運転中の `WATCHDOG=1` の送信の失敗は未捕捉の例外として終了コード 1」のみ。実装どおり捕まえて運転を続け、止めるのは deadman に任せる。他の点は有効） / [0086](0086-authority-approver-uid.md)（§2.1 の `authority.json` の置き場所（`/var/lib/coldaisle-fand` の下）と、§2.2 の表の `ExecStart=` の `--authority-root` の値・`SupplementaryGroups=`・`ReadWritePaths=` のみ。journal を承認者のグループと共有する専用のディレクトリへ移す。他の点は有効）
+- **Superseded by**: [0083](0083-fand-exit-settled-points.md)（§2.4 の「運転中の `WATCHDOG=1` の送信の失敗は未捕捉の例外として終了コード 1」のみ。実装どおり捕まえて運転を続け、止めるのは deadman に任せる。他の点は有効） / [0086](0086-authority-approver-uid.md)（§2.1 の `authority.json` の置き場所（`/var/lib/coldaisle-fand` の下）と、§2.2 の表の `ExecStart=` の `--authority-root` の値・`SupplementaryGroups=`・`ReadWritePaths=` のみ。journal を承認者のグループと共有する専用のディレクトリへ移す。他の点は有効） / [0118](0118-hwmon-backend-label-less-headers.md)（§2.5 の記録の検査のうち、実行部が書き込み先を書く時点で探し直すこと・`label: null` の照合・書ける値が `pwmN_enable=0` と `pwmN=255` になること、§2.7 の書き手の4の照合に `pwm_attribute` / `enable_attribute` を足すことのみ。他の点は有効）
 - **関連**: [`0028-fan-control-contracts.md`](0028-fan-control-contracts.md) §2.2 / §2.6 / §2.7 / §2.8 / §2.9、未決 6 / 7 /
   [`0060-control-loop-runtime.md`](0060-control-loop-runtime.md) §2.1 / §2.7 / §2.9、未決 1 / 7 /
   [`0069-ubuntu-deploy-templates.md`](0069-ubuntu-deploy-templates.md) §2.2 / §2.3 / §2.4、未決 3 /

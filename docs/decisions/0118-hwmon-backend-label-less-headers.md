@@ -3,8 +3,14 @@
 - **種別**: Decision Record
 - **Status**: FINAL（2026-10-10 所有者が承認。段階 A の結果を受けた 2.3 / 2.4 と、Codex の P1 3件を受けた 2.1 / 2.2 / 2.3 の修正も同日に承認。2.3a も同日に承認）
 - **Date**: 2026-10-10
-- **Supersedes**: [0028](0028-fan-control-contracts.md) §2.7「異常終了」の制約の表の1行目（書ける値）と
-  「制御を取るとき」の Max の書き方のみ（2.3）。引き継ぎ記録を書く時点・記録の中身・正常停止の規則は変えない
+- **Supersedes**:
+  - [0028](0028-fan-control-contracts.md) §2.7「異常終了」の制約の表の1行目（書ける値）と
+    「制御を取るとき」の Max の書き方のみ（2.3）。引き継ぎ記録を書く時点・記録の中身・正常停止の規則は変えない
+  - [0080](0080-fand-systemd-unit.md) §2.5 の記録の検査の項（`hwmonN/<属性>` の path へ書く・driver 名と label の照合・
+    書けるのは Max と manual）のうち、**書き込み先を書く時点で探し直すこと（2.2）・`label: null` の照合（2.2）・
+    書ける値が `pwmN_enable=0` と `pwmN=255` になること（2.3）のみ**。実行部の起動方法・記録の有無で決めることは変えない
+  - [0080](0080-fand-systemd-unit.md) §2.7 の書き手の4（既存の記録の元の値を引き継ぐ条件）のうち、
+    **照合に `pwm_attribute` と `enable_attribute` を足すことのみ**（2.2）
 - **関連**: [0028](0028-fan-control-contracts.md)（§2.7 / 未決 6） /
   [0080](0080-fand-systemd-unit.md)（§2.7 / §2.8 / §2.10 段階 4 / §5 の 4・11） /
   [0060](0060-control-loop-runtime.md)（未決 1） / `docs/fan-hardware-backend.md` / `docs/fan-header-mapping.md`
