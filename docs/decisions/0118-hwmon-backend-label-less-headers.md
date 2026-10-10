@@ -11,6 +11,10 @@
     書ける値が `pwmN_enable=0` と `pwmN=255` になること（2.3）のみ**。実行部の起動方法・記録の有無で決めることは変えない
   - [0080](0080-fand-systemd-unit.md) §2.7 の書き手の4（既存の記録の元の値を引き継ぐ条件）のうち、
     **照合に `pwm_attribute` と `enable_attribute` を足すことのみ**（2.2）
+  - [0080](0080-fand-systemd-unit.md) の、引き継ぎ実行部が「Max・manual を書く」とする記述
+    （§2.4 の起動拒否の箇条・§2.5・§2.6 の終了コード 7 の箇条・§2.7 の書き手の4 の「実行部が書いた Max・manual」）の
+    **書く値のみ**。すべて「2.3 の Max（`pwmN_enable=0`。拒否されて manual のときだけ `pwmN=255`）」と読み替える。
+    takeover の失敗を数える規則・記録を消さない規則・再起動の規則は変えない
 - **関連**: [0028](0028-fan-control-contracts.md)（§2.7 / 未決 6） /
   [0080](0080-fand-systemd-unit.md)（§2.7 / §2.8 / §2.10 段階 4 / §5 の 4・11） /
   [0060](0060-control-loop-runtime.md)（未決 1） / `docs/fan-hardware-backend.md` / `docs/fan-header-mapping.md`
