@@ -1,7 +1,7 @@
 # 決定記録 0118: 実機の hwmon backend・label の無い header の特定・Max の書き方
 
 - **種別**: Decision Record
-- **Status**: FINAL（2026-10-10 所有者が承認。段階 A の結果を受けた 2.3 / 2.4 も同日に承認）
+- **Status**: FINAL（2026-10-10 所有者が承認。段階 A の結果を受けた 2.3 / 2.4 と、Codex の P1 3件を受けた 2.1 / 2.2 / 2.3 の修正も同日に承認）
 - **Date**: 2026-10-10
 - **Supersedes**: [0028](0028-fan-control-contracts.md) §2.7「異常終了」の制約の表の1行目（書ける値）と
   「制御を取るとき」の Max の書き方のみ（2.3）。引き継ぎ記録を書く時点・記録の中身・正常停止の規則は変えない
@@ -41,6 +41,9 @@
 - `label: null` の header は、**hwmon の `name` が driver 名に一致する device が、ちょうど1つ**のときだけ特定できたとする。
   0 個・2 個以上なら「header を一意に特定できない」（0028 §2.7）として**制御を取らない**
 - channel は既存の `pwm_attribute` / `tach_attribute` / `enable_attribute` が表す。新しい欄は足さない
+- v2 では **`tach_attribute` の番号を `pwm_attribute` と同じに限る**（`fan2_input` と `pwm2`）。番号が違うと、
+  label で確かめた Fan とは別の Fan の回転数を読む設定を許し、止まった Fan を回っている別の Fan が隠しうる。
+  導入先の3 zone はどれも同じ番号である（`docs/fan-header-mapping.md`）
 - 3 zone の重複の検査（driver・label・`pwm_attribute`）は、`null` を1つの値として同じに扱う
 - v1 は v2 として補完しない（読み込み時に拒否し、`fan-hardware.yaml` の不正として扱う）
 
@@ -50,6 +53,12 @@
 - 実行部は `expected_label` が `null` の zone で、次の2つを確かめてから書く
   - `name` が記録と一致する
   - `/sys/class/hwmon` の下で、同じ `name` の device がちょうど1つ
+- **実行部は、書く時点で hwmon の device を探し直す。** 記録の `hwmonN` は監査のためだけに残し、書き込み先の決定には使わない
+  - `label: null` の zone は、同じ `name` の device がちょうど1つのときにその device を使う
+  - label のある zone は、`name` と、`tach_attribute` の番号の `fanN_label`（無ければ `pwmN_label`）が記録と一致する device が
+    ちょうど1つのときに使う
+  - 0 個・2 個以上なら、その zone には書かず失敗として報告する
+  - ドライバの再 bind で `hwmonN` が変わっても、記録の古い path に書こうとして Max を書けない、ということが無い
 - 標準ライブラリだけで書く・記録が無ければ何もしない、は変えない
 - v1 の記録は読める（label のある header の導入先を壊さない）
 
@@ -62,8 +71,10 @@ hwmon の ABI では `pwmN_enable=0` は「制御なし（全速）」である�
 
 1. `pwmN_enable=0` を書く
 2. `pwmN` を読み戻し、`255` なら成功とする
-3. 1 が拒否されたか、2 が `255` でなければ、従来の順（`pwmN=255` → 読み戻し）を試す。
-   manual のときはこちらで書ける。それでも `255` にならなければ失敗として報告する
+3. 1 が拒否されたか、2 が `255` でなければ、`pwmN_enable` を読む。**`1`（manual）のときだけ**
+   `pwmN=255` を書き、`pwmN` と `pwmN_enable` を読み戻して、`pwmN` が `255` かつ `pwmN_enable` が `0` か `1` なら成功とする。
+   `pwmN_enable` が 2 以上（自動）なら `pwmN` には書かず、失敗として報告する。自動のまま一瞬 `255` が読めても、
+   実行部が終わった後に自動制御が下げうるため、成功と扱わない
 4. `pwmN_enable=1` は書かない（Max を保つのに要らない。導入先では `0` と区別して読めない）
 
 **fand が制御を取るとき**（記録を書いた後の `STARTUP` の Max）
@@ -90,7 +101,7 @@ hwmon の ABI では `pwmN_enable=0` は「制御なし（全速）」である�
 |---|---|
 | 起動 | 2.1 で header を特定し、`pwmN` / `pwmN_enable` が書けて `fanN_input` が読めることを確かめる。元の `pwmN` / `pwmN_enable` を読み、0080 §2.7 の手順で記録を書く。その後に 2.3 の順で `STARTUP` の Max |
 | 毎 tick | `pwmN` を書き、`pwmN` と `pwmN_enable` を読み戻す（2.4）。`fanN_input` を読み、読めなければ `rpm=None` |
-| 特定の再確認 | 毎 tick、header の device の `name` を読み直す。変わっていれば（ドライバの再 bind など）`WRITE_FAILURE` とし、既存の連続失敗の規則（`write_fail_emergency_after` / `hardware_write_fail_exit_ms`）に任せる |
+| 特定の再確認 | 毎 tick、header の device の `name` を読み直す。変わっていれば（ドライバの再 bind など）`WRITE_FAILURE` とし、既存の連続失敗の規則（`write_fail_emergency_after` / `hardware_write_fail_exit_ms`）に任せる。backend 自身は運転中に device を探し直さない（終了の後に実行部が 2.2 で探し直して Max を書く） |
 | 正常停止 | 0080 §2.8 のとおり。導入先では元の `pwmN_enable=5` へ書けば BIOS の曲線へ戻った（2.6） |
 
 - **`pwmN` / `pwmN_enable` 以外の属性には書かない**（`pwmN_mode`・`pwmN_floor`・`pwmN_start`・`pwmN_auto_point*`・
@@ -137,6 +148,9 @@ Top（`nct6799` の `pwm2` / `fan2`）だけで行った。各段の前後で `p
 | `label` を省略可能にする | 書き忘れと「label が無い」の宣言を区別できない |
 | `channel` の欄を新しく足す（Telemetry の設定と同じ形） | `pwm_attribute` と同じことを2か所に書くことになり、食い違いを検査する手間が増える |
 | マザーボード上のヘッダ名（CHA_FAN1 など）を label に書く | sysfs から読めず、照合に使えない。対応も記録されていない |
+| 実行部が記録の `hwmonN` の path にそのまま書く | ドライバの再 bind で番号が変わると Max を書けない。fand は書き込みの失敗の連続で終了するが、終了の後に Max を書く者が居なくなる |
+| fand が運転中に device を探し直して書き続ける | 書き手が別の device へ移る経路を運転中の制御に持たせることになる。終了して実行部に任せれば、Max を書くことだけに限れる |
+| 自動のまま `pwmN=255` が読めたら成功とする | 実行部が終わった後に自動制御が下げうる |
 | hwmon の親 device の名前（`nct6775.<port>` など）でも照合する | 導入先では driver 名が一意で足りる。値が導入先ごとに違い、テンプレートに書けない |
 | 既定の backend を `hwmon` にする | 開発機で引数を付け忘れると、実機の Fan に書く |
 | Max を `pwmN_enable=1` → `pwmN=255` の順で書く | manual に切り替えた瞬間から 255 を書くまで、BIOS が直前に出していた値に固定される。`enable=0` なら下がる瞬間が無い |
@@ -149,5 +163,6 @@ Top（`nct6799` の `pwm2` / `fan2`）だけで行った。各段の前後で `p
 |---|---|---|
 | 1 | Front / Rear で 2.6 と同じ挙動になるか | 段階 C |
 | 2 | 同じ driver 名のチップが複数ある機械での特定 | 必要になったら |
+| 5 | `tach_attribute` と `pwm_attribute` の番号が違うのが正しい導入先での特定 | 必要になったら |
 | 3 | 0028 未決 6（`ExecStopPost` も動かないときにチップが PWM をどう保つか） | 段階 C |
 | 4 | 0060 未決 1（外から `pwmN_enable` を戻されたときに Max を書き直すか） | 段階 C の後 |
