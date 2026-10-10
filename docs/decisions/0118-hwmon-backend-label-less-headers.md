@@ -99,7 +99,9 @@ hwmon の ABI では `pwmN_enable=0` は「制御なし（全速）」である�
 
 1. `pwmN_enable=0` を書く（全速。ここで Max になる）
 2. `pwmN_enable=1` を書く（manual。`pwmN` は 255 のまま残る）
-3. 以降は `pwmN` だけを書く
+3. 以降は毎 tick `pwmN` を書く。ただし **255 未満を書く前に `pwmN_enable` が `0` と読めたら、先に `pwmN_enable=1` を書く**。
+   `0`（全速）のまま `pwmN` だけを書くと、driver によってはモードが変わらず、読み戻しの `pwmN` は下がっても Fan は全速のまま残りうる。
+   導入先では manual の 255 が `0` と読めるので、Max から下げる最初の tick では毎回この手順を通る
 
 `config_invalid` の経路の Max（0080 §2.7 の5）も同じ順にする。
 
@@ -132,7 +134,7 @@ Fan を止める意味になる（例: Linux の `pwm-fan` では PWM と電源�
 | 場面 | 振る舞い |
 |---|---|
 | 起動 | 2.1 で header を特定し、`pwmN` / `pwmN_enable` が書けて `fanN_input` が読めることを確かめる。元の `pwmN` / `pwmN_enable` を読み、0080 §2.7 の手順で記録を書く。その後に 2.3 の順で `STARTUP` の Max |
-| 毎 tick | `pwmN` を書き、`pwmN` と `pwmN_enable` を読み戻す（2.4）。`fanN_input` を読み、読めなければ `rpm=None` |
+| 毎 tick | 2.3 の 3 の手順で `pwmN` を書き、`pwmN` と `pwmN_enable` を読み戻す（2.4）。**255 未満を書いた tick は、`pwmN` が書いた値と一致し、かつ `pwmN_enable` が `1` と読めたときだけ `readback_ok`** とし、そうでなければ `READBACK_MISMATCH`（`applied_demand` を返さない）。`fanN_input` を読み、読めなければ `rpm=None` |
 | 特定の再確認 | 毎 tick、header の device の `name` を読み直す。変わっていれば（ドライバの再 bind など）`WRITE_FAILURE` とし、既存の連続失敗の規則（`write_fail_emergency_after` / `hardware_write_fail_exit_ms`）に任せる。backend 自身は運転中に device を探し直さない（終了の後に実行部が 2.2 で探し直して Max を書く） |
 | 正常停止 | 0080 §2.8 のとおり。導入先では元の `pwmN_enable=5` へ書けば BIOS の曲線へ戻った（2.6） |
 
@@ -159,7 +161,7 @@ Top（`nct6799` の `pwm2` / `fan2`）だけで行った。各段の前後で `p
 | 段階 | 内容 | 誰が |
 |---|---|---|
 | B（実装） | 2.1〜2.5。偽の sysfs で試験する。偽の sysfs は 2.6 の挙動（自動の間の `EBUSY`、manual の 255 が `0` と読める）を再現する | エージェント |
-| C（実装の後） | 0080 §2.10 の段階 4・5 と、0028 §2.9 の承認点 3 | 所有者 |
+| C（実装の後） | 0080 §2.10 の段階 4・5 と、0028 §2.9 の承認点 3。3 zone で、Max から 255 未満へ下げたときに tach の回転数が実際に下がることも確かめる | 所有者 |
 
 ## 3. Consequences
 
@@ -188,6 +190,7 @@ Top（`nct6799` の `pwm2` / `fan2`）だけで行った。各段の前後で `p
 | hwmon の親 device の名前（`nct6775.<port>` など）でも照合する | 導入先では driver 名が一意で足りる。値が導入先ごとに違い、テンプレートに書けない |
 | 既定の backend を `hwmon` にする | 開発機で引数を付け忘れると、実機の Fan に書く |
 | Max を `pwmN_enable=1` → `pwmN=255` の順で書く | manual に切り替えた瞬間から 255 を書くまで、BIOS が直前に出していた値に固定される。`enable=0` なら下がる瞬間が無い |
+| Max の後は `pwmN` だけを書く | `0` のまま `pwmN` を書いてもモードが変わらない driver では、Fan が全速のまま `applied_demand` が下がった値を名乗る |
 | `ENABLE_REVERTED` を `pwmN_enable != 1` のまま残す | 導入先では Max のたびに fault になり、Max から抜けられなくなる |
 | `pwmN=255` のときだけ `0` を許す | 読み戻しの `pwmN` と `pwmN_enable` は別の read で、間にドライバの更新が挟まりうる。全速の `0` を fault にする安全上の理由も無い |
 
