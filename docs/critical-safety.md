@@ -210,17 +210,29 @@ heartbeat を出す側は `src/coldaisle/control_daemon.py`（`coldaisle-fand`�
   `watchdog_timeout_ms` を超えるたびに記録する（プロセスを止める力は無い）。
   `--require-watchdog` を付けると、deadman が無いときは制御を取らずに終了する
 
-まだ無いものは次のとおりで、これらが揃うまで deadman は完成しない。
+handoff record（`/run/coldaisle/fan-handoff.json`）を書くのは実機の hwmon backend
+（`src/coldaisle/control/hardware/hwmon.py` の `HwmonFanBackend`。`coldaisle-fand --backend hwmon`。
+決定記録 0080 §2.7 / 0118 §2.5）である。CLI の既定の `--backend simulated` は sysfs に触れず、記録も書かない。
 
-- `coldaisle-fand` の systemd unit（`Type=notify` / `WatchdogSec` / `Restart` /
-  `ExecStopPost` と `--require-watchdog`）。中身は決定記録 0060 未決7 のまま（#57 / #64）で、
-  `deploy/systemd/` にも置いていない（決定記録 0069 §2.4）
-- handoff record（`/run/coldaisle/fan-handoff.json`）の producer。実機の hwmon backend が
-  まだ無い（#57 / #75）
+- header を特定・検証した**後**、`pwmN_enable` に触る**前**に記録（schema version 2）を書く。同じ
+  ディレクトリの一時ファイル（`O_EXCL | O_NOFOLLOW`、`0600`）へ書いて `rename` する。**書けなければ
+  制御を取らない**（終了コード 5）。path は合成の起点（`control_daemon.py`）が実行部の定数
+  `HANDOFF_RECORD_PATH` を渡す
+- 既存の記録があり、3 zone すべてで zone・driver・label・`pwm_attribute`・`enable_attribute` が一致するときだけ
+  元の `pwmN` / `pwmN_enable` を引き継ぐ（前回が異常終了なら、いまの値は実行部の Max）。一致しなければ
+  error（`handoff_record_overwritten`）を残して今の値で上書きする
+- driver が確かめ済みの一覧に無ければ何も開かず終了コード 5、header を一意に特定できなければ終了コード 2
+  （どちらも `pwmN_enable` に触らない）
+- takeover の Max は記録の後に `pwmN_enable=0` → `pwmN_enable=1`（0118 §2.3）。`config_invalid` の経路も同じ
+- 正常停止（SIGTERM・`--max-ticks`）では、元の `pwmN_enable` がすべて `0` または `2` 以上なら PWM を下げずに
+  元の値へ戻し、読み戻しで確かめ、**全 zone を戻せたときだけ**記録を消す。いずれかが `1`（manual）なら戻さず
+  Max のまま、構造化ログの event `shutdown_left_max_manual`（zone を含む）を出して記録を残す。途中の失敗も
+  記録を残す（`ExecStopPost` が Max を書く。0080 §2.8）。例外・終了コード 7 の経路では返さない
 
-これらを接続し、startup / restart / shutdown / kill / hang を実機検証することを、
-本番サービスを有効にする統合 PR の merge 条件とする。それまでは #78 を完了扱いにせず、
-サービスで Fan 制御を有効化しない。
+`coldaisle-fand` の systemd unit は `deploy/systemd/coldaisle-fand.service`（`--backend hwmon`・
+`--require-watchdog`・`ExecStopPost` の引き継ぎ実行部）にテンプレートとして置いたが、**enable していない**。
+導入先で startup / restart / shutdown / kill / hang を実機検証する（0080 §2.10 の段階 5・0118 の段階 C・
+0028 §2.9 の承認点 3）までは、サービスで Fan 制御を有効化しない。
 
 `CriticalSafetyDecision.disabled_inputs` と `config_is_provisional` は decision trace と起動ログへ
 永続化した（#78）。
