@@ -1,7 +1,7 @@
 # 決定記録 0117: `coldaisle-telemetry` の systemd unit
 
 - **種別**: Decision Record
-- **Status**: Proposed
+- **Status**: FINAL（2026-10-10 所有者が承認）
 - **Date**: 2026-10-10
 - **Supersedes**: なし
 - **関連**: [0069](0069-ubuntu-deploy-templates.md)（§5 未決 3） /

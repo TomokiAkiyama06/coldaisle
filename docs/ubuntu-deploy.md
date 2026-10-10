@@ -200,11 +200,19 @@ DB の migration は、更新後に**最初にストアを開いたプロセス*
 sudo systemctl stop coldaisle-rollup.timer coldaisle-report.timer
 sudo systemctl stop coldaisle-daemon coldaisle-api coldaisle-telemetry   # 常駐させている他の書き手も
 # ここでコードを更新する（git pull と venv の同期）
+# unit が増えた版へ上げるときは、ここで置いて有効にする（下の注記。例は 0117 の telemetry）
+sudo cp /opt/coldaisle/deploy/systemd/coldaisle-telemetry.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable coldaisle-telemetry.service
 sudo systemctl start coldaisle-rollup.service        # migration を当てる（終わるまで待つ）
 sudo systemctl start coldaisle-daemon coldaisle-api coldaisle-telemetry
 sudo systemctl start coldaisle-rollup.timer coldaisle-report.timer
 ```
 
+- **unit が増えた版へ上げるときは、`git pull` だけでは足りません。** `/etc/systemd/system/` へ
+  置いて `daemon-reload` と `enable` をしないと、`start` が `Unit ... not found` で失敗し、
+  次の起動でも動きません。`coldaisle-telemetry.service`（決定記録 0117）より前の版から上げるときは、
+  最初の `stop` からこの unit を外してください（まだ置かれていないので止めるものがありません）
 - **表を作り直す migration は、その間ほかの書き込みを止めます。** たとえば 0007（#106）は
   decision trace の表（保持期間いっぱい、最大30日分の JSON）を作り直し、1つの書き込み
   トランザクションで行います。その間は取り込みも制御の trace も書けません。書き手を止めて
