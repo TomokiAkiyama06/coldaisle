@@ -170,10 +170,10 @@ CPU と GPU のチップの温度は、負荷の立ち上がりで数秒のう�
 
 | 値 | 試験 | `confirmed` にする条件 |
 |---|---|---|
-| `stall_window_ms` | (1) fand を止め BIOS へ返した状態で、人が sysfs で各 zone を停止（PWM 16 以下）から PWM 89（Demand 0.35）と 255 へ上げ、tach が `stall_min_rpm` を超えるまでの時間（閾値の下からの立ち上がり）を測る。(2) fand で Demand を Max → 0.35、0.35 → Max と変え、落ち着くまでの時間を測る。**3 zone で共通の値なので、Top の回だけでは確定しない。** Front / Rear は基板を挿した後の回で測る（Rear は PWM 0 でも止まらないので (1) は最低の PWM から行う） | 3 zone すべてで、(1) の立ち上がりと (2) の過渡が窓より十分短い |
+| `stall_window_ms` | (1) 閾値の下からの立ち上がり（停止に近い PWM から 0.35 / Max へ）の時間。**fand を止めて sysfs へ直接書く方法は取らない**（Guard と Critical Safety を迂回し、BIOS の自動制御の間は `EBUSY` で書けない。0118）。制御の経路と最終の裁定を保った方法（#75 の `CALIBRATION`。0028 承認点 4）で測り、その方法は別の記録で決める。(2) fand で Demand を Max → 0.35、0.35 → Max と変えたときの過渡。**3 zone で共通の値なので、Top の回だけでは確定しない。** Front / Rear は基板を挿した後の回で測る | 3 zone すべてで、(1) の立ち上がりと (2) の過渡が窓より十分短い |
 | `watchdog_timeout_ms` | Top を floor（0.35）に固定した状態で負荷を立ち上げ、約 11 s の間の温度の上がり方を測る。あわせて fand を止めて（SIGSTOP）、watchdog から Max までの実際の時間を測る | floor のまま 11 s の間に、どの温度もそれぞれの上限に届かない（T_SENSOR は専用の 80 °C、ほかは 90 °C。0110 §2.2）。実際の時間が約 11 s を超えない |
 | `tick_deadline_ms` | 運用の unit と同じ引数（Learned の経路を含む）・`--backend hwmon` で運転した間の `duration_ms` | 最大が 250 ms に十分な余裕を持って収まる |
-| `hardware_write_fail_exit_ms` | 書き込みを意図して失敗させる（例: fand の `pwmN` への書き込み権限を一時的に外す）試験で、失敗から `EMERGENCY` と終了コード 7・引き継ぎの Max までの時間を測る。**失敗が自然に起きなかった運転だけでは確定しない** | `write_fail_emergency_after` 回の後に EMERGENCY になり、最初の失敗から終了コード 7 までが 5 s（`hardware_write_fail_exit_ms`）前後、Max の書き込みまでがそれに測った停止と引き継ぎの時間を足した長さに収まり、§2.12 の最悪時間（約 11 s）を超えない。再起動の後に繰り返しの Max の輪にならない |
+| `hardware_write_fail_exit_ms` | 開いたままの書き込み先で書き込みを失敗させる試験で、失敗から `EMERGENCY` と終了コード 7・引き継ぎの Max までの時間を測る。**権限を外す方法では試せない**（`HwmonFanBackend` は起動時に `pwmN` / `pwmN_enable` を開いて持ち続け、起動前に外せば takeover 前の起動の失敗になる）。故障を注入する仕組みは今は無く、別の記録で決める。**失敗が自然に起きなかった運転だけでは確定しない** | `write_fail_emergency_after` 回の後に EMERGENCY になり、最初の失敗から終了コード 7 までが 5 s（`hardware_write_fail_exit_ms`）前後、Max の書き込みまでがそれに測った停止と引き継ぎの時間を足した長さに収まり、§2.12 の最悪時間（約 11 s）を超えない。再起動の後に繰り返しの Max の輪にならない |
 
 ### 2.14 `fan-policy.yaml` の Baseline で効く値
 
@@ -251,3 +251,4 @@ GPU の温度は全 zone に効く（Top も上がる）。平均では BIOS よ
 | 2 | 最低 Demand を下げるか | 運転データの後、別の決定記録 |
 | 3 | `fan-policy.yaml` の §2.14 以外の値と `air-balance.yaml` の校正 | Authority を上げる前（0028 承認点 5）と #75 |
 | 4 | `power.cpu.package` の入力 | 別の Issue |
+| 5 | §2.13 の (1) 閾値の下からの立ち上がりを測る方法と、開いたままの書き込み先への故障の注入の仕組み | 別の決定記録（#75 / #74） |
