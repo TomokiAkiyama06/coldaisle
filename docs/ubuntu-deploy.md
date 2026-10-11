@@ -362,6 +362,26 @@ sudo install -o root -g coldaisle-fan -m 0640 /opt/coldaisle/config/control-admi
 sudoedit /etc/coldaisle/control-admin.yaml
 ```
 
+`fan-hardware.yaml` は schema version 2 です（決定記録 0118 §2.1。形と移行は
+[`docs/control-config.md`](control-config.md)「Control Config v15」）。Fan の label を持たない driver
+（導入先の `nct6799`）は `label: null` と明示し、`tach_attribute` の番号を `pwm_attribute` と揃えます。
+driver と channel は [`docs/fan-header-mapping.md`](fan-header-mapping.md) で調べた値を、導入先のファイルにだけ書きます。
+
+```yaml
+schema_version: 2
+zones:
+  front:
+    driver: nct6799
+    label: null              # 省略は不可（null は「Fan の label を持たない」という宣言）
+    pwm_attribute: pwm6
+    tach_attribute: fan6_input
+    enable_attribute: pwm6_enable
+    profile: ...
+```
+
+`label: null` の header は、hwmon の `name` が driver に一致する device がちょうど1つのときだけ特定できます。
+同じ driver 名のチップが2つある機械では制御を取りません（終了コード 2）。
+
 `/etc/coldaisle/control-admin.yaml` では次の2つを変えます。
 
 - **`socket.path` を `/run/coldaisle/` の下にする**（例: `/run/coldaisle/fand-admin.sock`）。
@@ -498,6 +518,14 @@ sudo /usr/bin/python3 -I -S /opt/coldaisle/src/coldaisle/safety_handoff.py; echo
   **3.12 より古い、または `exit=0` にならない導入先では fand の unit を置きません。**
   uv の管理する Python（2 節）や venv の `python` を `ExecStopPost=` に書き換えないでください
   （0080 §2.5 の「venv と `coldaisle` パッケージに依存しない」を崩します）
+- unit の `ExecStart=` は **`--backend hwmon`** で、実機の `pwmN` / `pwmN_enable` だけに書きます（決定記録 0118 §2.5。
+  CLI の既定は `simulated` で実機に書きません）。起動時に header を特定し、引き継ぎ記録
+  `/run/coldaisle/fan-handoff.json` を書いてから制御を取ります。driver が確かめ済みの一覧（いまは `nct6799` だけ）に
+  無ければ終了コード 5、header を一意に特定できなければ終了コード 2 で、どちらも `pwmN_enable` に触りません。
+  正常停止（`systemctl stop`）では元の自動制御へ戻して記録を消します。元が manual の header があれば Max のまま
+  終え、journal に `shutdown_left_max_manual` が出ます（0080 §2.8）。
+  下の段階 5 を実機の無い環境（VM）で simulated backend のまま行うときは、置いた unit の `ExecStart=` から
+  `--backend hwmon` を外して行い、終わったら戻します
 - **`sudo systemctl enable coldaisle-fand` は実行しません。** 0080 §2.10 の段階 5（simulated backend
   のまま、`kill -STOP`・`kill -KILL`・`systemctl stop`・再起動の連続で `ExecStopPost` が走ること・
   `/run/coldaisle` が残ること・順序を確かめる）と、0028 §2.9 の承認点 3 の後に行います。

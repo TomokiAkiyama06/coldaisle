@@ -50,10 +50,12 @@ WorkingDirectory=/opt/coldaisle
 #   --registry-root: Model Registry（0077 §2.6 / 0104 §2.3。補助グループ coldaisle-authority の ACL で読む。書かない）
 #   --learned-channel-config: Learned worker の経路（0077 §2.7。ソケットは deploy/tmpfiles.d/coldaisle-learned.conf
 #     が作る /run/coldaisle/learned-* の下。fand を worker のグループに入れない。0115 §2.2）
+# --backend hwmon: 実機の pwmN / pwmN_enable へ書く（決定記録 0118 §2.5）。CLI の既定は simulated（実機へ書かない）
+# なので、unit からは必ず明示する。起動時に header を特定して /run/coldaisle/fan-handoff.json を書いてから制御を取る。
 # --t-sensor-metric は入れない。導入先の safety.yaml で telemetry.t_sensor を有効にしたときだけ、
 # 置いた unit の ExecStart= の末尾に「--t-sensor-metric board.connector_12v2x6」を足す（決定記録 0110 §2.8。
 # safety.yaml と食い違うと起動時に拒否される）
-ExecStart=/opt/coldaisle/.venv/bin/coldaisle-fand --require-watchdog --config-dir /etc/coldaisle/control-config --admin-config /etc/coldaisle/control-admin.yaml --db /var/lib/coldaisle/coldaisle.db --authority-root /var/lib/coldaisle-authority --calibration /opt/coldaisle/config/calibration.json --registry-root /var/lib/coldaisle-registry --learned-channel-config /etc/coldaisle/learned-channel.yaml
+ExecStart=/opt/coldaisle/.venv/bin/coldaisle-fand --backend hwmon --require-watchdog --config-dir /etc/coldaisle/control-config --admin-config /etc/coldaisle/control-admin.yaml --db /var/lib/coldaisle/coldaisle.db --authority-root /var/lib/coldaisle-authority --calibration /opt/coldaisle/config/calibration.json --registry-root /var/lib/coldaisle-registry --learned-channel-config /etc/coldaisle/learned-channel.yaml
 
 # 異常終了・watchdog・SIGKILL の後に root・sandbox なしで Max を書く引き継ぎ実行部（0028 §2.7 / 0080 §2.5）。
 # venv と coldaisle パッケージに依存しないよう、システムの python3 でソースを直接、引数なしで実行する。

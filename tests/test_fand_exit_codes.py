@@ -394,19 +394,26 @@ def test_main_exits_with_code_7_without_returning_control(
     """終了コード 7 で終え、構造化ログに `hardware_write_fail_exit` を残す。
 
     終える経路は例外の経路と同じ後片付けだけで、返却（0080 §2.8）も記録の削除もしない。
-    引き継ぎ記録の書き手（#77、段階 4）はまだ無いので、ここでは「返却の経路を通らない」ことを
-    終了コードと event で確かめる。
+    ここでは「返却の経路（`hand_back_hardware`）を通らない」ことを終了コードと event で
+    確かめる（実機 backend の記録が残ることは `test_hwmon_fan_backend.py`）。
     """
     _confirmed_documents(tmp_path)
     harness = Harness(catalog, fault_plan=SimulatedFaultPlan(write_failure=frozenset(Zone)))
     daemon = _daemon(harness)
     built: list[Config] = []
 
-    def fake_build(config: Config) -> ControlDaemon:
+    def fake_build(config: Config, **_kwargs: object) -> ControlDaemon:
         built.append(config)
         return daemon
 
     monkeypatch.setattr(control_daemon, "build", fake_build)
+    hand_backs: list[None] = []
+
+    def recording_hand_back(self: ControlDaemon) -> bool | None:
+        hand_backs.append(None)
+        return None
+
+    monkeypatch.setattr(ControlDaemon, "hand_back_hardware", recording_hand_back)
     closes: list[dict[str, bool]] = []
     original_close = ControlDaemon.close
 
@@ -427,6 +434,7 @@ def test_main_exits_with_code_7_without_returning_control(
     assert len(built) == 1
     # スレッドは待たないが、受理済みの降格は lock を待たずに1回書き残しを試す（決定記録 0083）
     assert closes == [{"drain": False, "persist_without_wait": True}]
+    assert hand_backs == []
     events = _events(caplog, "hardware_write_fail_exit")
     assert len(events) == 1
     assert events[0]["zones"] == [zone.value for zone in Zone]

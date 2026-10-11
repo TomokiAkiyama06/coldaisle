@@ -1,9 +1,14 @@
 """3系統 Fan 制御デーモン（`coldaisle-fand`）の合成と常駐ループ。#74
 
 決定記録 0028 §2.2 のとおり、**hwmon の PWM へ書き込むのはこのプロセスの Hardware Backend
-だけ**である。M8 の時点で実機へ到達する backend は無く（#77）、ここが組み立てるのは
-`SimulatedFanBackend` だけ。実機の backend は #57 の権限・引き継ぎと #75 の実測が揃ってから
-同じ `FanHardwareBackend` として差し込む。
+だけ**である。backend は `--backend` で選ぶ（決定記録 0118 §2.5）。**既定は `simulated`**
+（`SimulatedFanBackend`。実機へ書かない）で、`hwmon` のときだけ実機の `HwmonFanBackend` を組む。
+開発機で引数を付け忘れて実機の Fan に書かないためである。
+
+`hwmon` の backend は起動時に header を特定し、引き継ぎ記録（`safety_handoff.HANDOFF_RECORD_PATH`。
+path はここから渡す。決定記録 0080 §2.7 の 6）を書いてから、最初の tick で takeover の Max を書く。
+正常停止（SIGTERM・`--max-ticks`）では元の制御へ返し、全 zone を返せたときだけ記録を消す
+（0080 §2.8）。例外・終了コード 7 の経路では返さず、記録を残して `ExecStopPost` の Max に任せる。
 
 起動時の設定の扱いは 0028 §2.7 に従う。
 
@@ -41,10 +46,10 @@ Critical Safety と Reactive Guard は変わらない。
 | 終了 | 意味 | 制御を取ったか | 再起動 |
 |---|---|---|---|
 | 1 | `config_invalid` で Max を書いた（未捕捉の例外も 1） | 取った | する |
-| 2 | `fan-hardware.yaml` が不正 | 取っていない | する |
+| 2 | `fan-hardware.yaml` が不正・header を一意に特定できない | 取っていない | する |
 | 3 | hardware mapping が `provisional` | 取っていない | しない |
 | 4 | deadman が恒久的に使えない（`WATCHDOG_USEC` の不在・不正・長短） | 取っていない | しない |
-| 5 | 制御設定以外（DB に書けない `db_not_writable` を含む） | 取っていない | する |
+| 5 | 制御設定以外（`db_not_writable`・未確認の driver・記録の失敗など） | 取っていない | する |
 | 6 | 通知の I/O の失敗（socket を作れない・`READY=1` を送れない） | 取っていない | する |
 | 7 | takeover 後に書き込みの失敗が `hardware_write_fail_exit_ms` 続いた | 取った | する |
 """
@@ -65,7 +70,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from types import FrameType
 
-from coldaisle import logs
+from coldaisle import logs, safety_handoff
 from coldaisle.clock import Clock, MonotonicClock, SystemMonotonicClock, WallClock
 from coldaisle.control.authority import AuthorityRuntime, AuthorityStore
 from coldaisle.control.config import (
@@ -77,9 +82,13 @@ from coldaisle.control.config import (
 )
 from coldaisle.control.fallback.controller import FallbackController
 from coldaisle.control.fallback.gate import ControllerGate
-from coldaisle.control.hardware.simulated import (
+from coldaisle.control.hardware import (
     FanHardwareBackend,
     FanHardwareResult,
+    HandsBackOnStop,
+    HwmonFanBackend,
+    HwmonHeaderNotIdentifiedError,
+    HwmonStartupError,
     SimulatedFanBackend,
 )
 from coldaisle.control.learned_handoff import (
@@ -151,7 +160,7 @@ DEFAULT_REGISTRY_LIMITS = Path("config")
 """
 
 EXIT_HARDWARE_CONFIG_INVALID = 2
-"""`fan-hardware.yaml` が不正で、制御を取らずに終了した（0028 §2.7）。"""
+"""`fan-hardware.yaml` が不正・header を一意に特定できず、制御を取らずに終えた（0028 §2.7）。"""
 
 EXIT_ACTUATION_NOT_APPROVED = 3
 """hardware mapping が `provisional` で、実機の制御を取る承認が無い（0028 §2.9）。"""
@@ -686,12 +695,48 @@ class StoreTelemetrySource:
 
 BackendFactory = Callable[[FanHardwareConfig, ControlRuntimeBinding], FanHardwareBackend]
 
+BACKEND_CHOICES = ("simulated", "hwmon")
+"""`--backend` の選択肢。**既定は simulated**（決定記録 0118 §2.5）。"""
+
+HWMON_HANDOFF_RECORD_PATH = safety_handoff.HANDOFF_RECORD_PATH
+"""実機 backend が書く引き継ぎ記録。**引き継ぎ実行部が読む path と同じ定数**（0080 §2.7 の 6）。"""
+
+HWMON_SYSFS_ROOT = safety_handoff.HWMON_ROOT
+"""実機 backend が header を探す hwmon の class directory（引き継ぎ実行部と同じ）。"""
+
 
 def simulated_backend(
     config: FanHardwareConfig, binding: ControlRuntimeBinding
 ) -> FanHardwareBackend:
-    """M8 の唯一の backend。実機の backend は #57 / #75 のあとで同じ形で差し込む。"""
+    """実機へ書かない backend（`--backend simulated`。既定）。"""
     return SimulatedFanBackend(config=config, runtime_binding=binding)
+
+
+def hwmon_backend_factory(record_path: Path, sysfs_root: Path) -> BackendFactory:
+    """実機の hwmon へ書く backend（`--backend hwmon`。決定記録 0118 §2.5）を作る factory。
+
+    path は合成の起点が渡す。backend（`coldaisle.control.hardware`）は上位の module を
+    import しない（0080 §2.7 の 6）。
+    """
+
+    def factory(config: FanHardwareConfig, binding: ControlRuntimeBinding) -> FanHardwareBackend:
+        return HwmonFanBackend(
+            config=config,
+            runtime_binding=binding,
+            record_path=record_path,
+            sysfs_root=sysfs_root,
+        )
+
+    return factory
+
+
+def backend_factory_for(name: str) -> BackendFactory:
+    """`--backend` の名前から factory を選ぶ。知らない名前は拒む（黙って simulated にしない）。"""
+    if name == "simulated":
+        return simulated_backend
+    if name == "hwmon":
+        return hwmon_backend_factory(HWMON_HANDOFF_RECORD_PATH, HWMON_SYSFS_ROOT)
+    raise ValueError(f"未知の backend: {name!r}")
 
 
 @dataclass(slots=True)
@@ -713,6 +758,8 @@ class ControlDaemon:
     """制御権の runtime。`close()` で書き残せていない降格を1回だけ書き直す（0057 §2.6）。"""
     write_fail_exit: HardwareWriteFailureExit | None = None
     """書き込みの失敗が続いたら終える判定（決定記録 0080 §2.6）。None は試験の足場だけ。"""
+    hardware: FanHardwareBackend | None = None
+    """組み立てた Hardware Backend。正常停止で制御を返すために持つ（決定記録 0080 §2.8）。"""
     runtime_calibration: RuntimeCalibration | None = None
     """起動時に1回だけ読んだ runtime の較正（決定記録 0079 §2.4 / 0096 §5 #8）。
 
@@ -726,6 +773,18 @@ class ControlDaemon:
     def request_stop(self) -> None:
         """次の tick の前に止める。**tick の途中では止めない。**"""
         self._stop = True
+
+    def hand_back_hardware(self) -> bool | None:
+        """正常停止で元の制御へ返す（決定記録 0080 §2.8）。**loop が止まった後に呼ぶ。**
+
+        返す手順を持たない backend（simulated）では何もせず None。例外・終了コード 7 の
+        経路では呼ばない（記録を残し、`ExecStopPost` の Max に任せる）。
+        """
+        hardware: object = self.hardware
+        self.hardware = None
+        if isinstance(hardware, HandsBackOnStop):
+            return hardware.hand_back()
+        return None
 
     def close(self, *, drain: bool = True, persist_without_wait: bool = False) -> None:
         """管理ソケット、ストアの順に閉じる。**loop が止まった後に呼ぶ**（0072 §2.2）。
@@ -1017,6 +1076,15 @@ def build(
     learned = _open_learned(
         config, control, monotonic=monotonic, run_id=run_id, registry_watch=registry.watch
     )
+    built_backends: list[FanHardwareBackend] = []
+
+    def capturing_factory(
+        fan_hardware: FanHardwareConfig, runtime_binding: ControlRuntimeBinding
+    ) -> FanHardwareBackend:
+        backend = backend_factory(fan_hardware, runtime_binding)
+        built_backends.append(backend)
+        return backend
+
     try:
         loop = _build_loop(
             config,
@@ -1031,7 +1099,7 @@ def build(
             store=store,
             clock=clock,
             monotonic=monotonic,
-            backend_factory=backend_factory,
+            backend_factory=capturing_factory,
             admin=admin,
             learned=learned,
             learned_calibration=learned_calibration,
@@ -1051,6 +1119,7 @@ def build(
         admin=admin,
         learned=learned if isinstance(learned, LearnedChannelEntry) else None,
         authority=authority,
+        hardware=built_backends[0] if built_backends else None,
         # **書けないまま制御を持ち続けない**（決定記録 0080 §2.6）。時間は safety.yaml が持つ
         write_fail_exit=HardwareWriteFailureExit(control.safety.hardware_write_fail_exit_ms.value),
         runtime_calibration=runtime_calibration,
@@ -1508,6 +1577,15 @@ def build_parser() -> argparse.ArgumentParser:
             "Thermal Model を使わない（起動は止めない）"
         ),
     )
+    parser.add_argument(
+        "--backend",
+        choices=BACKEND_CHOICES,
+        default="simulated",
+        help=(
+            "Fan Hardware Backend（決定記録 0118 §2.5）。既定は simulated（実機へ書かない）。"
+            "hwmon は実機の pwmN / pwmN_enable へ書く（systemd の unit で使う）"
+        ),
+    )
     parser.add_argument("--log-level", default="INFO")
     return parser
 
@@ -1548,6 +1626,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         calibration=args.calibration,
     )
     monotonic: MonotonicClock = SystemMonotonicClock()
+    backend_factory = backend_factory_for(args.backend)
 
     try:
         load_fan_hardware_document(config.config_dir / CONFIG_FILENAMES["fan_hardware"])
@@ -1557,7 +1636,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         return EXIT_HARDWARE_CONFIG_INVALID
 
     try:
-        daemon = build(config)
+        daemon = build(config, backend_factory=backend_factory)
     except ActuationNotApprovedError:
         LOGGER.exception("実機の制御を取る承認が無いため起動しない（決定記録 0028 §2.9）")
         return EXIT_ACTUATION_NOT_APPROVED
@@ -1586,12 +1665,29 @@ def main(argv: Sequence[str] | None = None) -> int:
             "全 zone を Max にする"
         )
         try:
-            stats = run_config_invalid_max(config, monotonic=monotonic)
+            stats = run_config_invalid_max(
+                config, monotonic=monotonic, backend_factory=backend_factory
+            )
         except ActuationNotApprovedError:
             LOGGER.exception("実機の制御を取る承認が無いため Max も書かない")
             return EXIT_ACTUATION_NOT_APPROVED
+        except HwmonHeaderNotIdentifiedError:
+            LOGGER.exception("header を一意に特定できないため Max も書かない（決定記録 0028 §2.7）")
+            return EXIT_HARDWARE_CONFIG_INVALID
+        except HwmonStartupError:
+            LOGGER.exception("実機の制御を取れないため Max も書かない（BIOS の制御のまま）")
+            return EXIT_STARTUP_ENVIRONMENT
         LOGGER.error("config_invalid で停止", extra={logs.FIELDS_KEY: stats.as_fields()})
         return 1
+    except HwmonHeaderNotIdentifiedError:
+        # 特定できない header へ Max を書くこと自体が危険（0028 §2.7）。
+        LOGGER.exception("header を一意に特定できないため制御を取らない（BIOS の制御のまま）")
+        return EXIT_HARDWARE_CONFIG_INVALID
+    except HwmonStartupError:
+        # 確かめていない driver（0118 §2.3a）・属性を開けない・引き継ぎ記録を書けない
+        # （0080 §2.7 の 3）。pwmN_enable には触っていない。
+        LOGGER.exception("実機の制御を取れないため制御を取らない（BIOS の制御のまま）")
+        return EXIT_STARTUP_ENVIRONMENT
     except Exception:
         # **制御設定の不正と同じ扱いにしない。** Metric Catalog・品質規則・ストアの失敗で
         # Max を書くと、0028 §2.7 が決めていない状況で制御を取ることになる。BIOS の
@@ -1632,6 +1728,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         # 例外で抜けた経路では管理ソケットの後片付けを待たない（終了と引き継ぎを遅らせない）
         daemon.close(drain=False)
         raise
+    # 正常停止だけが元の制御へ返す（決定記録 0080 §2.8）。返せなければ記録が残り、
+    # ExecStopPost が Max を書く。
+    daemon.hand_back_hardware()
     daemon.close()
     LOGGER.info("control daemon を終了する", extra={logs.FIELDS_KEY: stats.as_fields()})
     return 0
