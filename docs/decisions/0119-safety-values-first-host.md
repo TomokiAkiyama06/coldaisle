@@ -47,7 +47,8 @@ BIOS の曲線は Fan を約 39% より下げていなかった。
 ## 2. Decision
 
 導入先の `safety.yaml`（`/etc/coldaisle` に置く。リポジトリには置かない）を次の値にする。
-すべて `status: confirmed`、`basis` に本記録の節を書く。
+§2.6 の `stall_window_ms` と §2.10 の `hardware_write_fail_exit_ms` を除き、すべて `status: confirmed`、`basis` に本記録の節を書く。
+この2つは値を承認したうえで、実機の測定（§2.13）までは `provisional` に置く。
 Demand 0.35 は PWM 約 89 にあたる。
 
 ### 2.1 絶対温度上限
@@ -84,7 +85,8 @@ GPU の T.Limit は実測の core 84 °C・余裕 9 °C から約 93 °C と推�
 
 `stall_min_rpm` は Demand 0.35 で出る回転数（PWM・RPM の実測から補間して Front 約 635 / Rear 約 697 /
 Top 約 968 RPM）の約半分。`stall_check_min_demand` は最低安全 Demand と同じにし、floor で回っている Fan も監視する。
-`stall_window_ms` = **5000**。
+`stall_window_ms` = **5000**（**provisional**。§2.13）。`docs/fan-header-mapping.md` は定常の回転数だけで、
+回転数の応答時間を含まない。窓が短すぎると正常な過渡を stall と読み Max に倒し、長すぎると止まった Fan の検出が遅れる（0034 §5）。
 
 ### 2.7 書き込み失敗
 
@@ -112,7 +114,7 @@ Top 約 968 RPM）の約半分。`stall_check_min_demand` は最低安全 Demand
 | `tick_deadline_ms` | 250 | confirmed（下記の測定） |
 | `overrun_consecutive_limit` | 3 | confirmed |
 | `watchdog_timeout_ms` | **5000** | confirmed（§2.12） |
-| `hardware_write_fail_exit_ms` | 5000 | confirmed（§2.12） |
+| `hardware_write_fail_exit_ms` | 5000 | **provisional**（§2.12・§2.13） |
 
 `tick_deadline_ms` は、承認の時点では導入先で tick の処理時間を測っていなかった。2026-10-11 に導入先の DB の写しへ
 `coldaisle-telemetry`（実機の読み取り）と mock の空気温度を書き込みながら、simulated backend の `coldaisle-fand` を
@@ -152,13 +154,24 @@ CPU と GPU のチップの温度は、負荷の立ち上がりで数秒のう�
 
 所有者は `watchdog_timeout_ms` を **5000** に短くして承認した。最悪時間は **約 11 s** になる。tick の処理時間は
 実測で最大 2 ms（§2.10）なので、hang ではない fand を止める余地は小さい。`hardware_write_fail_exit_ms` は不変条件の
-範囲 3750〜5000 の上端の 5000 のまま承認した。`TimeoutAbortSec`（5 s）の確定は 0080 §5 未決 1 に残る。
+範囲 3750〜5000 の上端の 5000 を値として承認したが、0080 §2.6 は実機の書き込み・読み戻しの失敗の実測から導くことも
+求めるため、§2.13 の測定まで `provisional` に置く。`TimeoutAbortSec`（5 s）の確定は 0080 §5 未決 1 に残る。
+
+### 2.13 承認点 3（Top）で測って確定する値
+
+次の2つは、承認点 3 の Top の確認のときに `--backend hwmon` で測り、測定値を運用の `safety.yaml` の `basis` に書いて
+`confirmed` にする。測定の結果が今の値を支えなければ、値を変える案を所有者に出す。
+
+| 値 | 測ること | `confirmed` にする条件 |
+|---|---|---|
+| `stall_window_ms` | Top の Demand を Max → 0.35、0.35 → Max と段階で変えたときの、tach が新しい回転数に落ち着くまでの時間 | 0.35 以上の Demand で、正常な過渡が `stall_min_rpm`（450）を下回る時間が窓より十分短い |
+| `hardware_write_fail_exit_ms` | 確認の間の `pwmN` / `pwmN_enable` の書き込みと読み戻しの失敗（回数と連続の長さ） | 失敗が無いか、あっても連続が `write_fail_emergency_after`（3）に届かない |
 
 ## 3. Consequences
 
 ### 良くなること
 
-- 承認点 3 へ進める。`safety.yaml` に暫定値が残らず、起動ログの `safety_config_is_provisional` が false になる
+- 承認点 3 へ進める。暫定値は §2.13 で測る2つだけになり、それが済めば起動ログの `safety_config_is_provisional` が false になる
 - 値の根拠が実測と結びつき、後で緩めるときの比較の基準になる
 
 ### 悪くなること・その緩和
