@@ -1,0 +1,161 @@
+# 決定記録 0119: 導入先の `safety.yaml` の値を確定する（0028 承認点 2。`tick_deadline_ms` だけは実測の後）
+
+- **種別**: Decision Record
+- **Status**: Proposed（値は 2026-10-11 にリポジトリ所有者が承認）
+- **Date**: 2026-10-11
+- **Supersedes**: なし（0028 §5 未決 1 のうち `safety.yaml` の値を閉じる。Policy の値は範囲外）
+- **関連**: [`0028`](0028-fan-control-contracts.md) §2.6〜§2.9 /
+  [`0029`](0029-telemetry-loss-classes.md) /
+  [`0080`](0080-fand-systemd-unit.md) §2.6 /
+  [`0110`](0110-t-sensor-ceiling-and-enablement.md) /
+  [`0118`](0118-hwmon-backend-label-less-headers.md) /
+  `docs/fan-header-mapping.md` / `docs/critical-safety.md` / `docs/control-config.md`
+- **対象 Issue**: #50（Safety 閾値の候補）/ #74（実機の確認）
+
+---
+
+## 1. Context
+
+実機の hwmon backend（0118）が入り、0028 §2.9 の承認点 3（実機の Fan の制御を初めて取る）へ進める状態になった。
+その前に `safety.yaml` の値を `confirmed` にする必要がある（承認点 2）。これまでの値は試験用の仮の値しかない。
+
+導入先で 2026-10-09〜10-11 の約2日間に `coldaisle-telemetry` が集めた実測（BIOS の自動制御で運転中。
+GPU の実負荷を含む）と、`docs/fan-header-mapping.md` の PWM・RPM・停止点の実測から候補を作り、所有者が承認した。
+
+実測の要点:
+
+| metric | 最大 | p95 | 平均 |
+|---|---:|---:|---:|
+| `cpu.package` | 88 °C | 72 °C | 55.6 °C |
+| `gpu.0.core` | 84 °C | 78 °C | 56.6 °C |
+| `gpu.0.tlimit_margin` | 最小 9 °C | — | — |
+| `power.gpu.0` | 610 W | 527 W | 289 W |
+| `board.connector_12v2x6` | 53 °C | 52 °C | 41.4 °C |
+| `fan.top.rpm` / `fan.front.rpm` / `fan.rear.rpm` | 最小 1024 / 666 / 701 | — | — |
+
+BIOS の曲線は Fan を約 39% より下げていなかった。
+
+あわせて次が分かった。
+
+- `gpu.0.hotspot` / `gpu.0.mem` は導入先の GPU driver が NVML で公開せず、期間中一度も `ok` にならなかった。
+  絶対温度上限の判定に使える GPU の温度は `gpu.0.core` だけである（どちらも Critical の入力ではないので fault にはならない）。
+- `power.cpu.package` を集める入力が無い。Top の safety floor は温度の曲線だけで決まり、Power 項は
+  `cpu_power_unavailable` として外れる（0029 の Degraded）。
+- センサー基板（`air.*`）が未接続の間は、5本の air signal がすべて欠け `AIR_TELEMETRY_STALE` になり、
+  Front / Rear は `fault_demand` に固定される（`docs/critical-safety.md`）。
+
+## 2. Decision
+
+導入先の `safety.yaml`（`/etc/coldaisle` に置く。リポジトリには置かない）を次の値にする。
+§2.10 の `tick_deadline_ms` を除き、すべて `status: confirmed`、`basis` に本記録の節を書く。
+Demand 0.35 は PWM 約 89 にあたる。
+
+### 2.1 絶対温度上限
+
+`absolute_temp_ceiling_c` = **90.0 °C**。CPU（Ryzen 9 9950X）は 95 °C で自らクロックを下げ始める。
+GPU の T.Limit は実測の core 84 °C・余裕 9 °C から約 93 °C と推定した。実測の CPU 最大 88 °C は下回る。
+超えると全 zone が Max になる。
+
+### 2.2 最低安全 Demand
+
+`zone_min_demand` = Front / Rear / Top とも **0.35**。BIOS のアイドル時（約 39%）に近い保守的な値。
+停止点は Top / Front が PWM 16、Rear は PWM 0 でも約 440 RPM で回る（`docs/fan-header-mapping.md`）。
+下限の候補 PWM 32（約 0.13）までの余裕は大きく取り、下げるのは運転データが貯まってから別の記録で行う。
+
+### 2.3 CPU 温度の cooling floor（Top）
+
+`cpu_cooling_floor` = **60 °C → 0.35、80 °C → 1.0**（線形補間）。実測の p95 72 °C で約 0.74。
+
+### 2.4 CPU Power の cooling floor（Top）
+
+`cpu_power_cooling_floor` = **100 W → 0.35、200 W → 1.0**。200 W は 9950X の PPT。
+必須の項目のため値を置くが、`power.cpu.package` の入力が無い間は効かない（§1）。
+
+### 2.5 故障時の Demand
+
+`fault_demand` = **1.0**。
+
+### 2.6 stall の判定
+
+| 項目 | Front | Rear | Top |
+|---|---:|---:|---:|
+| `stall_check_min_demand` | 0.35 | 0.35 | 0.35 |
+| `stall_min_rpm` | 300 | 350 | 450 |
+
+`stall_min_rpm` は Demand 0.35 で出る回転数（PWM・RPM の実測から補間して Front 約 635 / Rear 約 697 /
+Top 約 968 RPM）の約半分。`stall_check_min_demand` は最低安全 Demand と同じにし、floor で回っている Fan も監視する。
+`stall_window_ms` = **5000**。
+
+### 2.7 書き込み失敗
+
+`write_fail_emergency_after` = **3**。
+
+### 2.8 許容遅延
+
+| 項目 | 値 | 根拠 |
+|---|---:|---|
+| `telemetry.cpu_ms` / `cpu_power_ms` / `gpu_ms` | 5000 | `coldaisle-telemetry` の収集周期 2500 ms の2倍（0110 §2.5 と同じ考え方） |
+| `telemetry.air_sensor_period_ms` | 2500 | firmware の送信周期 `INTERVAL_MS` |
+| `telemetry.air_ms` | 5000 | 送信周期の2倍 |
+| `telemetry.t_sensor` | 有効・5000 ms・80 °C | 0110 で承認済み（変えない） |
+
+### 2.9 復帰と下げる速さ
+
+`ramp_down_per_s` = **0.05**（Max から 0.35 まで約13秒）。`startup_settle_ms` = **5000**。
+`fault_clear_hold_ms` = **30000**（故障の検出と解消が短い間隔で繰り返されないようにする）。
+
+### 2.10 周期と deadman
+
+| 項目 | 値 | status |
+|---|---:|---|
+| `tick_ms` | 1000 | confirmed |
+| `tick_deadline_ms` | 250 | **provisional**（下記） |
+| `overrun_consecutive_limit` | 3 | confirmed |
+| `watchdog_timeout_ms` | 10000 | confirmed |
+| `hardware_write_fail_exit_ms` | 5000 | confirmed |
+
+`tick_deadline_ms` は導入先で tick の処理時間を測っていない。承認点 3 の前に、導入先の DB の写しを読む
+simulated backend の `coldaisle-fand` で `duration_ms` を測り、最大が 250 ms に十分な余裕を持って収まれば
+`confirmed` にする（basis に測定値を書く）。収まらなければ値を変える案を所有者に出す。
+
+0080 §2.6 の不変条件 `(1000 + 250) × 3 = 3750 ≤ 5000 ≤ 10000`、`watchdog_timeout_ms ≥ (1000 + 250) × 2` を満たす。
+
+### 2.11 承認点 3 の進め方
+
+センサー基板の接続を待たず、まず **Top だけ**を下げて確かめる（所有者の選択）。
+Front / Rear は `AIR_TELEMETRY_STALE` で Max のままになる（§1）。これは安全側であり、設定で避けない。
+Front / Rear は基板を挿した後に、承認点 3 の確認をもう一度行う。
+
+## 3. Consequences
+
+### 良くなること
+
+- 承認点 3 へ進める。起動ログの `safety_config_is_provisional` が `tick_deadline_ms` の確定後に false になる
+- 値の根拠が実測と結びつき、後で緩めるときの比較の基準になる
+
+### 悪くなること・その緩和
+
+| 悪くなること | 緩和 |
+|---|---|
+| 最低 Demand 0.35 は BIOS のアイドルとほぼ同じで、騒音は下がらない | 運転データが貯まってから、停止点の実測（PWM 16 / 32）を根拠に別の記録で下げる |
+| 上限 90 °C は CPU の実測最大 88 °C に近く、高負荷で全 zone Max が出うる | Max は安全側。頻発するなら trace を根拠に別の記録で見直す |
+| GPU の hotspot / memory 温度が上限の判定に使えない | core で判定する。driver が公開すれば変更なしで判定に入る |
+| CPU Power の曲線が効かない | 温度の曲線で floor を決める。入力を足すのは別の Issue |
+| 基板が無い間は Front / Rear が Max のまま | 承認点 3 を Top と Front / Rear の2回に分ける（§2.11） |
+
+## 4. 却下した代替案
+
+| 案 | 却下の理由 |
+|---|---|
+| 最低 Demand を下限の候補 PWM 32（約 0.13）にする | 実機で制御を取るのが初めてで、停止点との余裕が小さい。まず BIOS の運転に近い値から始める |
+| 許容遅延を試験用の 1000 ms にする | 収集周期 2500 ms より短く、毎 tick stale になって Max に固定される |
+| 基板の欠測の間も Front / Rear を下げられるようにする | 0029 の Critical の扱いを緩めることになる。安全側の判定を設定で外さない |
+
+## 5. 未決事項
+
+| # | 内容 | 決める場所 |
+|---|---|---|
+| 1 | `tick_deadline_ms` の確定 | 導入先での測定（§2.10）。本記録の basis の更新ではなく、運用の `safety.yaml` に測定値を書く |
+| 2 | 最低 Demand を下げるか | 運転データの後、別の決定記録 |
+| 3 | `fan-policy.yaml` / `air-balance.yaml` の値 | 別途（承認点 3 の前） |
+| 4 | `power.cpu.package` の入力 | 別の Issue |
