@@ -1,4 +1,4 @@
-# 決定記録 0119: 導入先の `safety.yaml` の値を確定する（0028 承認点 2。`tick_deadline_ms` だけは実測の後）
+# 決定記録 0119: 導入先の `safety.yaml` の値と、`fan-policy.yaml` の Baseline で効く値を確定する（0028 承認点 2）
 
 - **種別**: Decision Record
 - **Status**: Proposed（値は 2026-10-11 にリポジトリ所有者が承認）
@@ -167,6 +167,38 @@ CPU と GPU のチップの温度は、負荷の立ち上がりで数秒のう�
 | `stall_window_ms` | Top の Demand を Max → 0.35、0.35 → Max と段階で変えたときの、tach が新しい回転数に落ち着くまでの時間 | 0.35 以上の Demand で、正常な過渡が `stall_min_rpm`（450）を下回る時間が窓より十分短い |
 | `hardware_write_fail_exit_ms` | 確認の間の `pwmN` / `pwmN_enable` の書き込みと読み戻しの失敗（回数と連続の長さ） | 失敗が無いか、あっても連続が `write_fail_emergency_after`（3）に届かない |
 
+### 2.14 `fan-policy.yaml` の Baseline で効く値
+
+最初の運転は Baseline（Fallback が requested を作り、Learned は shadow）なので、実際の回転数は Fallback と
+Reactive Guard が決める。ここは Safety ではないが、所有者が 2026-10-11 に承認した。
+
+**Fallback**: BIOS の自動制御の曲線を実測から写す。約2日の実測では、BIOS は Top / Front / Rear の3つとも
+CPU の温度だけで回していた（CPU 5 °C ごとの PWM の中央値: 40 °C 39% / 50 °C 47% / 60 °C 62% / 65 °C 72% /
+70 °C 95% / 75 °C 100%）。
+
+| 項目 | 値 |
+|---|---|
+| `fallback_curve` | 45 °C → 0.40、55 °C → 0.53、60 °C → 0.62、65 °C → 0.72、72 °C → 1.0 |
+| `fallback_temperature_inputs` | Top: `cpu.package`。Front / Rear: `cpu.package` と `gpu.0.core`（高い方） |
+| `fallback_power_feedforward` | 使わない（`null`） |
+| `fallback_dynamics` | `decrease_hysteresis` 0.05・`decrease_hold_ms` 10000 |
+
+Front / Rear に GPU の温度を足すので、GPU の負荷では BIOS より強く回る。
+
+**Reactive Guard**: 2500 ms ごとの実測の上昇の速さの p99 付近で発火させる。
+
+| 項目 | 値 | 実測 |
+|---|---|---|
+| `floor` / `hold_ms` | 0.7 / 30000 | — |
+| `cpu_temperature_rate_c_per_s` | 発火 6.0・解除 1.0（Degraded 5.0 / 0.5） | p99 5.6 °C/s |
+| `gpu_temperature_rate_c_per_s` | 発火 3.0・解除 0.5（Degraded 2.5 / 0.25） | p99 2.8 °C/s |
+| `gpu_power_rate_w_per_s` | 発火 60・解除 10（Degraded 50 / 5） | p99 55 W/s |
+
+入力が無く発火しない trigger（`cpu_power_rate_w_per_s`・`intake_rise_c`・`gpu_hotspot_c`）と、Baseline では Fan に
+効かない塊（`mpc`・`supervisor`・`workload_regime`・`gate_min_confidence`・`model_confidence`・`authority_*`・
+`shadow`・`air_balance_coordination`）は試験の値のまま `provisional` に置き、Authority を上げる前に別の記録で決める。
+`authority_stage`（上限）は `shadow` にする。`air-balance.yaml` はリポジトリの未校正の雛形のまま（Air Balance は無効）。
+
 ## 3. Consequences
 
 ### 良くなること
@@ -198,5 +230,5 @@ CPU と GPU のチップの温度は、負荷の立ち上がりで数秒のう�
 |---|---|---|
 | 1 | unit の `TimeoutAbortSec` / `TimeoutStopSec` / `TimeoutStartSec` / `RestartSec` の確定（`WatchdogSec` は §2.10 で 5s） | 0080 §5 未決 1。承認点 3 の kill・watchdog の確認の後 |
 | 2 | 最低 Demand を下げるか | 運転データの後、別の決定記録 |
-| 3 | `fan-policy.yaml` / `air-balance.yaml` の値 | 別途（承認点 3 の前） |
+| 3 | `fan-policy.yaml` の §2.14 以外の値と `air-balance.yaml` の校正 | Authority を上げる前（0028 承認点 5）と #75 |
 | 4 | `power.cpu.package` の入力 | 別の Issue |
