@@ -47,8 +47,8 @@ BIOS の曲線は Fan を約 39% より下げていなかった。
 ## 2. Decision
 
 導入先の `safety.yaml`（`/etc/coldaisle` に置く。リポジトリには置かない）を次の値にする。
-§2.6 の `stall_window_ms` と §2.10 の `hardware_write_fail_exit_ms` を除き、すべて `status: confirmed`、`basis` に本記録の節を書く。
-この2つは値を承認したうえで、実機の測定（§2.13）までは `provisional` に置く。
+§2.6 の `stall_window_ms` と §2.10 の `watchdog_timeout_ms` / `hardware_write_fail_exit_ms` を除き、すべて `status: confirmed`、
+`basis` に本記録の節を書く。この3つは値を承認したうえで、実機の試験（§2.13）までは `provisional` に置く。
 Demand 0.35 は PWM 約 89 にあたる。
 
 ### 2.1 絶対温度上限
@@ -113,7 +113,7 @@ Top 約 968 RPM）の約半分。`stall_check_min_demand` は最低安全 Demand
 | `tick_ms` | 1000 | confirmed |
 | `tick_deadline_ms` | 250 | confirmed（下記の測定） |
 | `overrun_consecutive_limit` | 3 | confirmed |
-| `watchdog_timeout_ms` | **5000** | confirmed（§2.12） |
+| `watchdog_timeout_ms` | **5000** | **provisional**（§2.12・§2.13） |
 | `hardware_write_fail_exit_ms` | 5000 | **provisional**（§2.12・§2.13） |
 
 `tick_deadline_ms` は、承認の時点では導入先で tick の処理時間を測っていなかった。2026-10-11 に導入先の DB の写しへ
@@ -152,20 +152,23 @@ CPU と GPU のチップの温度は、負荷の立ち上がりで数秒のう�
 自ら行うクロックの制限が担う。したがって 16 s の窓で問題になるのは「Fan が floor のまま分の単位の冷却が遅れること」で、
 上の表の 60 s の幅と比べて判断する。
 
-所有者は `watchdog_timeout_ms` を **5000** に短くして承認した。最悪時間は **約 11 s** になる。tick の処理時間は
+所有者は `watchdog_timeout_ms` の値を **5000** に短くして承認した。最悪時間は **約 11 s** になる。
+ただし上の表は BIOS が Fan を上げられる状態の実測で、Fan を floor に固定したときの熱の上がり方ではない。
+0080 §2.3 の比較を満たすため、§2.13 の floor に固定した試験を記録するまで `provisional` に置く。tick の処理時間は
 実測で最大 2 ms（§2.10）なので、hang ではない fand を止める余地は小さい。`hardware_write_fail_exit_ms` は不変条件の
 範囲 3750〜5000 の上端の 5000 を値として承認したが、0080 §2.6 は実機の書き込み・読み戻しの失敗の実測から導くことも
 求めるため、§2.13 の測定まで `provisional` に置く。`TimeoutAbortSec`（5 s）の確定は 0080 §5 未決 1 に残る。
 
 ### 2.13 承認点 3（Top）で測って確定する値
 
-次の2つは、承認点 3 の Top の確認のときに `--backend hwmon` で測り、測定値を運用の `safety.yaml` の `basis` に書いて
-`confirmed` にする。測定の結果が今の値を支えなければ、値を変える案を所有者に出す。
+次の3つは、承認点 3 の確認のときに `--backend hwmon` で試験し、結果を運用の `safety.yaml` の `basis` に書いて
+`confirmed` にする。結果が今の値を支えなければ、値を変える案を所有者に出す。
 
-| 値 | 測ること | `confirmed` にする条件 |
+| 値 | 試験 | `confirmed` にする条件 |
 |---|---|---|
-| `stall_window_ms` | Top の Demand を Max → 0.35、0.35 → Max と段階で変えたときの、tach が新しい回転数に落ち着くまでの時間 | 0.35 以上の Demand で、正常な過渡が `stall_min_rpm`（450）を下回る時間が窓より十分短い |
-| `hardware_write_fail_exit_ms` | 確認の間の `pwmN` / `pwmN_enable` の書き込みと読み戻しの失敗（回数と連続の長さ） | 失敗が無いか、あっても連続が `write_fail_emergency_after`（3）に届かない |
+| `stall_window_ms` | 各 zone の Demand を Max → 0.35、0.35 → Max と段階で変え、tach が新しい回転数に落ち着くまでの時間を測る。**3 zone で共通の値なので、Top の回だけでは確定しない。** Front / Rear は基板を挿した後の回で測る | 3 zone すべてで、0.35 以上の Demand の正常な過渡が各 zone の `stall_min_rpm` を下回る時間が窓より十分短い |
+| `watchdog_timeout_ms` | Top を floor（0.35）に固定した状態で負荷を立ち上げ、約 11 s の間の温度の上がり方を測る。あわせて fand を止めて（SIGSTOP）、watchdog から Max までの実際の時間を測る | floor のまま 11 s の間に、どの温度も絶対温度上限（90 °C）に届かない。実際の時間が約 11 s を超えない |
+| `hardware_write_fail_exit_ms` | 書き込みを意図して失敗させる（例: fand の `pwmN` への書き込み権限を一時的に外す）試験で、失敗から `EMERGENCY` と終了コード 7・引き継ぎの Max までの時間を測る。**失敗が自然に起きなかった運転だけでは確定しない** | 失敗から Max までが想定どおり（`write_fail_emergency_after` 回の後に EMERGENCY、5 s 以内に終了と Max）で、再起動の後に繰り返しの Max の輪にならない |
 
 ### 2.14 `fan-policy.yaml` の Baseline で効く値
 
@@ -203,7 +206,7 @@ Front / Rear に GPU の温度を足すので、GPU の負荷では BIOS より�
 
 ### 良くなること
 
-- 承認点 3 へ進める。暫定値は §2.13 で測る2つだけになり、それが済めば起動ログの `safety_config_is_provisional` が false になる
+- 承認点 3 へ進める。暫定値は §2.13 で試験する3つだけになり、それが済めば起動ログの `safety_config_is_provisional` が false になる
 - 値の根拠が実測と結びつき、後で緩めるときの比較の基準になる
 
 ### 悪くなること・その緩和
