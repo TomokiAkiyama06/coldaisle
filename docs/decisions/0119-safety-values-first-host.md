@@ -47,8 +47,11 @@ BIOS の曲線は Fan を約 39% より下げていなかった。
 ## 2. Decision
 
 導入先の `safety.yaml`（`/etc/coldaisle` に置く。リポジトリには置かない）を次の値にする。
-§2.6 の `stall_window_ms` と §2.10 の `watchdog_timeout_ms` / `hardware_write_fail_exit_ms` を除き、すべて `status: confirmed`、
-`basis` に本記録の節を書く。この3つは値を承認したうえで、実機の試験（§2.13）までは `provisional` に置く。
+次の5つを除き、すべて `status: confirmed`、`basis` に本記録の節を書く。除く5つは値を承認したうえで `provisional` に置く。
+
+- §2.4 の `cpu_power_cooling_floor`（入力が無く、実際の Power の振る舞いと照らしていない）
+- §2.6 の `stall_window_ms`、§2.10 の `tick_deadline_ms` / `watchdog_timeout_ms` / `hardware_write_fail_exit_ms`（実機の試験。§2.13）
+
 Demand 0.35 は PWM 約 89 にあたる。
 
 ### 2.1 絶対温度上限
@@ -70,7 +73,8 @@ GPU の T.Limit は実測の core 84 °C・余裕 9 °C から約 93 °C と推�
 ### 2.4 CPU Power の cooling floor（Top）
 
 `cpu_power_cooling_floor` = **100 W → 0.35、200 W → 1.0**。200 W は 9950X の PPT。
-必須の項目のため値を置くが、`power.cpu.package` の入力が無い間は効かない（§1）。
+必須の項目のため値を置くが、`power.cpu.package` の入力が無い間は効かない（§1）。入力を足すと検証していない曲線が
+そのまま効き始めるため、**`provisional` に置き**、入力を足したときに実際の Power の振る舞いと照らして別の記録で確定する。
 
 ### 2.5 故障時の Demand
 
@@ -111,15 +115,15 @@ Top 約 968 RPM）の約半分。`stall_check_min_demand` は最低安全 Demand
 | 項目 | 値 | status |
 |---|---:|---|
 | `tick_ms` | 1000 | confirmed |
-| `tick_deadline_ms` | 250 | confirmed（下記の測定） |
+| `tick_deadline_ms` | 250 | **provisional**（下記・§2.13） |
 | `overrun_consecutive_limit` | 3 | confirmed |
 | `watchdog_timeout_ms` | **5000** | **provisional**（§2.12・§2.13） |
 | `hardware_write_fail_exit_ms` | 5000 | **provisional**（§2.12・§2.13） |
 
 `tick_deadline_ms` は、承認の時点では導入先で tick の処理時間を測っていなかった。2026-10-11 に導入先の DB の写しへ
 `coldaisle-telemetry`（実機の読み取り）と mock の空気温度を書き込みながら、simulated backend の `coldaisle-fand` を
-300 tick 動かし、`duration_ms` は最大 2 ms・overrun 0 だった（Learned の経路は開いていない）。250 ms に十分な余裕が
-あるので `confirmed` にする。
+300 tick 動かし、`duration_ms` は最大 2 ms・overrun 0 だった（Learned の経路は開いていない）。ただしこれは実機の sysfs の書き込みと読み戻しを含まないので、
+§2.13 で `--backend hwmon` と運用の引数（Learned の経路を含む）で測るまで `provisional` に置く。
 
 0080 §2.6 の不変条件 `(1000 + 250) × 3 = 3750 ≤ 5000 ≤ 5000`、`watchdog_timeout_ms ≥ (1000 + 250) × 2 = 2500` を満たす。
 unit の `WatchdogSec` は `watchdog_timeout_ms` と同じ **5s** にする（0080 §2.2）。
@@ -161,13 +165,14 @@ CPU と GPU のチップの温度は、負荷の立ち上がりで数秒のう�
 
 ### 2.13 承認点 3（Top）で測って確定する値
 
-次の3つは、承認点 3 の確認のときに `--backend hwmon` で試験し、結果を運用の `safety.yaml` の `basis` に書いて
+次の4つは、承認点 3 の確認のときに `--backend hwmon` で試験し、結果を運用の `safety.yaml` の `basis` に書いて
 `confirmed` にする。結果が今の値を支えなければ、値を変える案を所有者に出す。
 
 | 値 | 試験 | `confirmed` にする条件 |
 |---|---|---|
-| `stall_window_ms` | 各 zone の Demand を Max → 0.35、0.35 → Max と段階で変え、tach が新しい回転数に落ち着くまでの時間を測る。**3 zone で共通の値なので、Top の回だけでは確定しない。** Front / Rear は基板を挿した後の回で測る | 3 zone すべてで、0.35 以上の Demand の正常な過渡が各 zone の `stall_min_rpm` を下回る時間が窓より十分短い |
+| `stall_window_ms` | (1) fand を止め BIOS へ返した状態で、人が sysfs で各 zone を停止（PWM 16 以下）から PWM 89（Demand 0.35）と 255 へ上げ、tach が `stall_min_rpm` を超えるまでの時間（閾値の下からの立ち上がり）を測る。(2) fand で Demand を Max → 0.35、0.35 → Max と変え、落ち着くまでの時間を測る。**3 zone で共通の値なので、Top の回だけでは確定しない。** Front / Rear は基板を挿した後の回で測る（Rear は PWM 0 でも止まらないので (1) は最低の PWM から行う） | 3 zone すべてで、(1) の立ち上がりと (2) の過渡が窓より十分短い |
 | `watchdog_timeout_ms` | Top を floor（0.35）に固定した状態で負荷を立ち上げ、約 11 s の間の温度の上がり方を測る。あわせて fand を止めて（SIGSTOP）、watchdog から Max までの実際の時間を測る | floor のまま 11 s の間に、どの温度もそれぞれの上限に届かない（T_SENSOR は専用の 80 °C、ほかは 90 °C。0110 §2.2）。実際の時間が約 11 s を超えない |
+| `tick_deadline_ms` | 運用の unit と同じ引数（Learned の経路を含む）・`--backend hwmon` で運転した間の `duration_ms` | 最大が 250 ms に十分な余裕を持って収まる |
 | `hardware_write_fail_exit_ms` | 書き込みを意図して失敗させる（例: fand の `pwmN` への書き込み権限を一時的に外す）試験で、失敗から `EMERGENCY` と終了コード 7・引き継ぎの Max までの時間を測る。**失敗が自然に起きなかった運転だけでは確定しない** | `write_fail_emergency_after` 回の後に EMERGENCY になり、最初の失敗から終了コード 7 までが 5 s（`hardware_write_fail_exit_ms`）前後、Max の書き込みまでがそれに測った停止と引き継ぎの時間を足した長さに収まり、§2.12 の最悪時間（約 11 s）を超えない。再起動の後に繰り返しの Max の輪にならない |
 
 ### 2.14 `fan-policy.yaml` の Baseline で効く値
@@ -217,7 +222,7 @@ GPU の温度は全 zone に効く（Top も上がる）。平均では BIOS よ
 
 ### 良くなること
 
-- 承認点 3 へ進める。暫定値は §2.13 で試験する3つだけになり、それが済めば起動ログの `safety_config_is_provisional` が false になる
+- 承認点 3 へ進める。Safety の暫定値は §2.13 で試験する4つと §2.4 の CPU Power の曲線だけになる（§2.4 は入力を足すまで残るので、起動ログの `safety_config_is_provisional` はそれまで true のまま）
 - 値の根拠が実測と結びつき、後で緩めるときの比較の基準になる
 
 ### 悪くなること・その緩和
