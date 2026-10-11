@@ -167,8 +167,8 @@ CPU と GPU のチップの温度は、負荷の立ち上がりで数秒のう�
 | 値 | 試験 | `confirmed` にする条件 |
 |---|---|---|
 | `stall_window_ms` | 各 zone の Demand を Max → 0.35、0.35 → Max と段階で変え、tach が新しい回転数に落ち着くまでの時間を測る。**3 zone で共通の値なので、Top の回だけでは確定しない。** Front / Rear は基板を挿した後の回で測る | 3 zone すべてで、0.35 以上の Demand の正常な過渡が各 zone の `stall_min_rpm` を下回る時間が窓より十分短い |
-| `watchdog_timeout_ms` | Top を floor（0.35）に固定した状態で負荷を立ち上げ、約 11 s の間の温度の上がり方を測る。あわせて fand を止めて（SIGSTOP）、watchdog から Max までの実際の時間を測る | floor のまま 11 s の間に、どの温度も絶対温度上限（90 °C）に届かない。実際の時間が約 11 s を超えない |
-| `hardware_write_fail_exit_ms` | 書き込みを意図して失敗させる（例: fand の `pwmN` への書き込み権限を一時的に外す）試験で、失敗から `EMERGENCY` と終了コード 7・引き継ぎの Max までの時間を測る。**失敗が自然に起きなかった運転だけでは確定しない** | 失敗から Max までが想定どおり（`write_fail_emergency_after` 回の後に EMERGENCY、5 s 以内に終了と Max）で、再起動の後に繰り返しの Max の輪にならない |
+| `watchdog_timeout_ms` | Top を floor（0.35）に固定した状態で負荷を立ち上げ、約 11 s の間の温度の上がり方を測る。あわせて fand を止めて（SIGSTOP）、watchdog から Max までの実際の時間を測る | floor のまま 11 s の間に、どの温度もそれぞれの上限に届かない（T_SENSOR は専用の 80 °C、ほかは 90 °C。0110 §2.2）。実際の時間が約 11 s を超えない |
+| `hardware_write_fail_exit_ms` | 書き込みを意図して失敗させる（例: fand の `pwmN` への書き込み権限を一時的に外す）試験で、失敗から `EMERGENCY` と終了コード 7・引き継ぎの Max までの時間を測る。**失敗が自然に起きなかった運転だけでは確定しない** | `write_fail_emergency_after` 回の後に EMERGENCY になり、最初の失敗から終了コード 7 までが 5 s（`hardware_write_fail_exit_ms`）前後、Max の書き込みまでがそれに測った停止と引き継ぎの時間を足した長さに収まり、§2.12 の最悪時間（約 11 s）を超えない。再起動の後に繰り返しの Max の輪にならない |
 
 ### 2.14 `fan-policy.yaml` の Baseline で効く値
 
