@@ -47,10 +47,10 @@ BIOS の曲線は Fan を約 39% より下げていなかった。
 ## 2. Decision
 
 導入先の `safety.yaml`（`/etc/coldaisle` に置く。リポジトリには置かない）を次の値にする。
-次の5つを除き、すべて `status: confirmed`、`basis` に本記録の節を書く。除く5つは値を承認したうえで `provisional` に置く。
+次の6つを除き、すべて `status: confirmed`、`basis` に本記録の節を書く。除く6つは値を承認したうえで `provisional` に置く。
 
 - §2.4 の `cpu_power_cooling_floor`（入力が無く、実際の Power の振る舞いと照らしていない）
-- §2.6 の `stall_window_ms`、§2.10 の `tick_deadline_ms` / `watchdog_timeout_ms` / `hardware_write_fail_exit_ms`（実機の試験。§2.13）
+- §2.6 の `stall_window_ms`、§2.9 の `ramp_down_per_s`、§2.10 の `tick_deadline_ms` / `watchdog_timeout_ms` / `hardware_write_fail_exit_ms`（実機の試験。§2.13）
 
 Demand 0.35 は PWM 約 89 にあたる。
 
@@ -107,7 +107,8 @@ Top 約 968 RPM）の約半分。`stall_check_min_demand` は最低安全 Demand
 
 ### 2.9 復帰と下げる速さ
 
-`ramp_down_per_s` = **0.05**（Max から 0.35 まで約13秒）。`startup_settle_ms` = **5000**。
+`ramp_down_per_s` = **0.05**（Max から 0.35 まで約13秒。**provisional**。§2.13）。実測は BIOS の自動制御の下のもので、
+fand が下げたときの温度の応答を測っていない（0028 §5 未決 1）。`startup_settle_ms` = **5000**。
 `fault_clear_hold_ms` = **30000**（故障の検出と解消が短い間隔で繰り返されないようにする）。
 
 ### 2.10 周期と deadman
@@ -165,7 +166,7 @@ CPU と GPU のチップの温度は、負荷の立ち上がりで数秒のう�
 
 ### 2.13 実機の試験まで `provisional` に置く値
 
-次の4つは値を承認したが、実機の試験で裏付けるまで `provisional` に置く。**試験の手順は本記録では決めず、
+次の5つは値を承認したが、実機の試験で裏付けるまで `provisional` に置く。**試験の手順は本記録では決めず、
 承認点 3 の前に別の決定記録で設計して所有者の承認を得る**（§5 未決 5）。試験の結果が今の値を支えなければ、
 値を変える案を所有者に出す。
 
@@ -174,6 +175,7 @@ CPU と GPU のチップの温度は、負荷の立ち上がりで数秒のう�
 | `tick_deadline_ms` | 運用の unit と同じ引数（Learned の経路を含む）・`--backend hwmon` での `duration_ms` が 250 ms に十分な余裕を持って収まる |
 | `stall_window_ms` | 3 zone すべてで、正常な立ち上がりと過渡が窓より十分短い（3 zone で共通の値なので Top だけでは確定しない） |
 | `watchdog_timeout_ms` | hang から Max までの実際の最悪時間（約 11 s）の間の温度の上昇が、各温度の上限（T_SENSOR は 80 °C、ほかは 90 °C）までの余裕に収まる |
+| `ramp_down_per_s` | Max から最低安全 Demand へ下げる間と下げた後に、温度の上昇が 2500 ms の収集周期で捉えられ、floor と Fallback が上げ直すまでにどの温度も上限に近づかない |
 | `hardware_write_fail_exit_ms` | takeover の後の書き込みの失敗から `EMERGENCY`・終了コード 7・引き継ぎの Max までが想定どおりで、再起動の後に Max の輪にならない |
 
 ### 2.14 `fan-policy.yaml` の Baseline で効く値
@@ -223,7 +225,7 @@ GPU の温度は全 zone に効く（Top も上がる）。平均では BIOS よ
 
 ### 良くなること
 
-- 承認点 3 へ進める準備が揃う（§2.13 の試験の手順を別の記録で決めた後）。Safety の暫定値は §2.13 の4つと §2.4 の CPU Power の曲線だけになる（§2.4 は入力を足すまで残るので、起動ログの `safety_config_is_provisional` はそれまで true のまま）
+- 承認点 3 へ進める準備が揃う（§2.13 の試験の手順を別の記録で決めた後）。Safety の暫定値は §2.13 の5つと §2.4 の CPU Power の曲線だけになる（§2.4 は入力を足すまで残るので、起動ログの `safety_config_is_provisional` はそれまで true のまま）
 - 値の根拠が実測と結びつき、後で緩めるときの比較の基準になる
 
 ### 悪くなること・その緩和
