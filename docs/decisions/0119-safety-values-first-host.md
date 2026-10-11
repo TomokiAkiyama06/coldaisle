@@ -47,7 +47,7 @@ BIOS の曲線は Fan を約 39% より下げていなかった。
 ## 2. Decision
 
 導入先の `safety.yaml`（`/etc/coldaisle` に置く。リポジトリには置かない）を次の値にする。
-§2.10 の `watchdog_timeout_ms` / `hardware_write_fail_exit_ms` を除き、すべて `status: confirmed`、`basis` に本記録の節を書く。
+すべて `status: confirmed`、`basis` に本記録の節を書く。
 Demand 0.35 は PWM 約 89 にあたる。
 
 ### 2.1 絶対温度上限
@@ -111,15 +111,16 @@ Top 約 968 RPM）の約半分。`stall_check_min_demand` は最低安全 Demand
 | `tick_ms` | 1000 | confirmed |
 | `tick_deadline_ms` | 250 | confirmed（下記の測定） |
 | `overrun_consecutive_limit` | 3 | confirmed |
-| `watchdog_timeout_ms` | 10000 | **provisional**（§2.12） |
-| `hardware_write_fail_exit_ms` | 5000 | **provisional**（§2.12） |
+| `watchdog_timeout_ms` | **5000** | confirmed（§2.12） |
+| `hardware_write_fail_exit_ms` | 5000 | confirmed（§2.12） |
 
 `tick_deadline_ms` は、承認の時点では導入先で tick の処理時間を測っていなかった。2026-10-11 に導入先の DB の写しへ
 `coldaisle-telemetry`（実機の読み取り）と mock の空気温度を書き込みながら、simulated backend の `coldaisle-fand` を
 300 tick 動かし、`duration_ms` は最大 2 ms・overrun 0 だった（Learned の経路は開いていない）。250 ms に十分な余裕が
 あるので `confirmed` にする。
 
-0080 §2.6 の不変条件 `(1000 + 250) × 3 = 3750 ≤ 5000 ≤ 10000`、`watchdog_timeout_ms ≥ (1000 + 250) × 2` を満たす。
+0080 §2.6 の不変条件 `(1000 + 250) × 3 = 3750 ≤ 5000 ≤ 5000`、`watchdog_timeout_ms ≥ (1000 + 250) × 2 = 2500` を満たす。
+unit の `WatchdogSec` は `watchdog_timeout_ms` と同じ **5s** にする（0080 §2.2）。
 
 ### 2.11 承認点 3 の進め方
 
@@ -130,12 +131,11 @@ Front / Rear は基板を挿した後に、承認点 3 の確認をもう一度�
 ### 2.12 hang から Max までの最悪時間と熱の上がり方（0080 §2.3 / §5 未決 1）
 
 0080 §2.3 は、hang から Max までの最悪時間（`WatchdogSec` + `TimeoutAbortSec` + 引き継ぎ実行部の実行時間）を
-熱の時定数と比べて承認することを求める。値の承認の時点ではこの比較をしていなかったため、
-`watchdog_timeout_ms` と、それを上限に持つ `hardware_write_fail_exit_ms` は、所有者が下の比較を見て承認するまで
-`provisional` に置く。
+熱の時定数と比べて承認することを求める。最初の候補（`watchdog_timeout_ms` 10000）の承認の時点ではこの比較をしていなかったため、
+下の比較を所有者に示し、改めて承認を得た（2026-10-11）。
 
-最悪時間は、`WatchdogSec` = `watchdog_timeout_ms`（10 s）+ `TimeoutAbortSec`（unit の暫定値 5 s）+ 実行部（1 s 未満）で
-**約 16 s**。その間、Fan は最後に書いた値（Top は §2.3 の floor 以上、Front / Rear は §2.2 以上）のまま回る。
+候補の 10 s では、最悪時間は `WatchdogSec`（10 s）+ `TimeoutAbortSec`（unit の暫定値 5 s）+ 実行部（1 s 未満）で
+約 16 s。その間、Fan は最後に書いた値（Top は §2.3 の floor 以上、Front / Rear は §2.2 以上）のまま回る。
 
 導入先の約2日の実測（BIOS の自動制御・2500 ms 周期）で、ある時点から窓の中で温度が最も上がった幅:
 
@@ -150,11 +150,15 @@ CPU と GPU のチップの温度は、負荷の立ち上がりで数秒のう�
 自ら行うクロックの制限が担う。したがって 16 s の窓で問題になるのは「Fan が floor のまま分の単位の冷却が遅れること」で、
 上の表の 60 s の幅と比べて判断する。
 
+所有者は `watchdog_timeout_ms` を **5000** に短くして承認した。最悪時間は **約 11 s** になる。tick の処理時間は
+実測で最大 2 ms（§2.10）なので、hang ではない fand を止める余地は小さい。`hardware_write_fail_exit_ms` は不変条件の
+範囲 3750〜5000 の上端の 5000 のまま承認した。`TimeoutAbortSec`（5 s）の確定は 0080 §5 未決 1 に残る。
+
 ## 3. Consequences
 
 ### 良くなること
 
-- 承認点 3 へ進める。起動ログの `safety_config_is_provisional` は §2.12 の承認の後に false になる
+- 承認点 3 へ進める。`safety.yaml` に暫定値が残らず、起動ログの `safety_config_is_provisional` が false になる
 - 値の根拠が実測と結びつき、後で緩めるときの比較の基準になる
 
 ### 悪くなること・その緩和
@@ -179,7 +183,7 @@ CPU と GPU のチップの温度は、負荷の立ち上がりで数秒のう�
 
 | # | 内容 | 決める場所 |
 |---|---|---|
-| 1 | `watchdog_timeout_ms` / `hardware_write_fail_exit_ms` の確定（あわせて unit の `WatchdogSec` / `TimeoutAbortSec`） | 所有者が §2.12 の比較を見て承認（承認点 3 の前） |
+| 1 | unit の `TimeoutAbortSec` / `TimeoutStopSec` / `TimeoutStartSec` / `RestartSec` の確定（`WatchdogSec` は §2.10 で 5s） | 0080 §5 未決 1。承認点 3 の kill・watchdog の確認の後 |
 | 2 | 最低 Demand を下げるか | 運転データの後、別の決定記録 |
 | 3 | `fan-policy.yaml` / `air-balance.yaml` の値 | 別途（承認点 3 の前） |
 | 4 | `power.cpu.package` の入力 | 別の Issue |
