@@ -171,7 +171,7 @@ CPU と GPU のチップの温度は、負荷の立ち上がりで数秒のう�
 | 値 | 試験 | `confirmed` にする条件 |
 |---|---|---|
 | `stall_window_ms` | (1) 閾値の下からの立ち上がり（停止に近い PWM から 0.35 / Max へ）の時間。**fand を止めて sysfs へ直接書く方法は取らない**（Guard と Critical Safety を迂回し、BIOS の自動制御の間は `EBUSY` で書けない。0118）。制御の経路と最終の裁定を保った方法（#75 の `CALIBRATION`。0028 承認点 4）で測り、その方法は別の記録で決める。(2) fand で Demand を Max → 0.35、0.35 → Max と変えたときの過渡。**3 zone で共通の値なので、Top の回だけでは確定しない。** Front / Rear は基板を挿した後の回で測る | 3 zone すべてで、(1) の立ち上がりと (2) の過渡が窓より十分短い |
-| `watchdog_timeout_ms` | Top を floor（0.35）に固定した状態で負荷を立ち上げ、約 11 s の間の温度の上がり方を測る。あわせて fand を止めて（SIGSTOP）、watchdog から Max までの実際の時間を測る | floor のまま 11 s の間に、どの温度もそれぞれの上限に届かない（T_SENSOR は専用の 80 °C、ほかは 90 °C。0110 §2.2）。実際の時間が約 11 s を超えない |
+| `watchdog_timeout_ms` | **最悪に近い状態から始める。** fand が運転し、Top に当たる Demand がその時点の最小（CPU の floor が上がり始める 60 °C の手前で、Fallback の値）にある状態を作り、**負荷を立ち上げる前に** fand を SIGSTOP する（負荷の後の Safety の tick が floor を上げる前に止め、floor の冷却を測りに混ぜない）。止めた直後に負荷を立ち上げ、watchdog から Max までの実際の時間と、その間の各温度の上昇を測る。止める直前の各温度とそれぞれの上限の差を余裕とする | 実際の時間が約 11 s を超えず、その間のどの温度の上昇も余裕に収まる（T_SENSOR は専用の 80 °C、ほかは 90 °C。0110 §2.2）。上がりきらなかった負荷では確定せず、実測の 16 s の上昇の最大（CPU +31 °C）に近い立ち上がりで確かめる |
 | `tick_deadline_ms` | 運用の unit と同じ引数（Learned の経路を含む）・`--backend hwmon` で運転した間の `duration_ms` | 最大が 250 ms に十分な余裕を持って収まる |
 | `hardware_write_fail_exit_ms` | 開いたままの書き込み先で書き込みを失敗させる試験で、失敗から `EMERGENCY` と終了コード 7・引き継ぎの Max までの時間を測る。**権限を外す方法では試せない**（`HwmonFanBackend` は起動時に `pwmN` / `pwmN_enable` を開いて持ち続け、起動前に外せば takeover 前の起動の失敗になる）。故障を注入する仕組みは今は無く、別の記録で決める。**失敗が自然に起きなかった運転だけでは確定しない** | `write_fail_emergency_after` 回の後に EMERGENCY になり、最初の失敗から終了コード 7 までが 5 s（`hardware_write_fail_exit_ms`）前後、Max の書き込みまでがそれに測った停止と引き継ぎの時間を足した長さに収まり、§2.12 の最悪時間（約 11 s）を超えない。再起動の後に繰り返しの Max の輪にならない |
 
