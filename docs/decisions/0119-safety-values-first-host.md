@@ -1,7 +1,7 @@
 # 決定記録 0119: 導入先の `safety.yaml` の値と、`fan-policy.yaml` の Baseline で効く値を確定する（0028 承認点 2）
 
 - **種別**: Decision Record
-- **Status**: Proposed（値は 2026-10-11 にリポジトリ所有者が承認）
+- **Status**: FINAL（2026-10-11、リポジトリ所有者の承認）
 - **Date**: 2026-10-11
 - **Supersedes**: なし（0028 §5 未決 1 のうち `safety.yaml` の値を閉じる。Policy の値は範囲外）
 - **関連**: [`0028`](0028-fan-control-contracts.md) §2.6〜§2.9 /
@@ -47,10 +47,16 @@ BIOS の曲線は Fan を約 39% より下げていなかった。
 ## 2. Decision
 
 導入先の `safety.yaml`（`/etc/coldaisle` に置く。リポジトリには置かない）を次の値にする。
-次の8つを除き、すべて `status: confirmed`、`basis` に本記録の節を書く。除く8つは値を承認したうえで `provisional` に置く。
+温度・回転数・Demand の値と、事実から決まる値（firmware の送信周期）と 0110 で承認済みの T_SENSOR の値は `status: confirmed`、
+`basis` に本記録の節を書く。次の時間と回数の値は値を承認したうえで `provisional` に置く。
 
 - §2.4 の `cpu_power_cooling_floor`（入力が無く、実際の Power の振る舞いと照らしていない）
-- §2.6 の `stall_window_ms`、§2.7 の `write_fail_emergency_after`、§2.9 の `ramp_down_per_s`、§2.10 の `tick_deadline_ms` / `overrun_consecutive_limit` / `watchdog_timeout_ms` / `hardware_write_fail_exit_ms`（実機の試験。§2.13）
+- 時間と回数の値すべて（実機の試験。§2.13）: §2.6 の `stall_window_ms`、§2.7 の `write_fail_emergency_after`、§2.8 の `telemetry.cpu_ms` / `cpu_power_ms` / `gpu_ms` / `air_ms`、
+  §2.9 の `ramp_down_per_s` / `startup_settle_ms` / `fault_clear_hold_ms`、§2.10 の `tick_ms` / `tick_deadline_ms` / `overrun_consecutive_limit` / `watchdog_timeout_ms` / `hardware_write_fail_exit_ms`
+
+PR #274 のレビューで、時間と回数の値は BIOS の自動制御の下の実測や simulated の測定では裏付けられないという指摘が
+値ごとに続いたため、所有者がまとめて `provisional` に置くことを選んだ（2026-10-11）。provisional の値も保守側の制約として
+そのまま適用される（`docs/critical-safety.md`）。
 
 Demand 0.35 は PWM 約 89 にあたる。
 
@@ -100,22 +106,22 @@ Top 約 968 RPM）の約半分。`stall_check_min_demand` は最低安全 Demand
 
 | 項目 | 値 | 根拠 |
 |---|---:|---|
-| `telemetry.cpu_ms` / `cpu_power_ms` / `gpu_ms` | 5000 | `coldaisle-telemetry` の収集周期 2500 ms の2倍（0110 §2.5 と同じ考え方） |
+| `telemetry.cpu_ms` / `cpu_power_ms` / `gpu_ms` | 5000（provisional） | `coldaisle-telemetry` の収集周期 2500 ms の2倍（0110 §2.5 と同じ考え方） |
 | `telemetry.air_sensor_period_ms` | 2500 | firmware の送信周期 `INTERVAL_MS` |
-| `telemetry.air_ms` | 5000 | 送信周期の2倍 |
+| `telemetry.air_ms` | 5000（provisional） | 送信周期の2倍 |
 | `telemetry.t_sensor` | 有効・5000 ms・80 °C | 0110 で承認済み（変えない） |
 
 ### 2.9 復帰と下げる速さ
 
 `ramp_down_per_s` = **0.05**（Max から 0.35 まで約13秒。**provisional**。§2.13）。実測は BIOS の自動制御の下のもので、
-fand が下げたときの温度の応答を測っていない（0028 §5 未決 1）。`startup_settle_ms` = **5000**。
-`fault_clear_hold_ms` = **30000**（故障の検出と解消が短い間隔で繰り返されないようにする）。
+fand が下げたときの温度の応答を測っていない（0028 §5 未決 1）。`startup_settle_ms` = **5000**（provisional）。
+`fault_clear_hold_ms` = **30000**（provisional。故障の検出と解消が短い間隔で繰り返されないようにする）。
 
 ### 2.10 周期と deadman
 
 | 項目 | 値 | status |
 |---|---:|---|
-| `tick_ms` | 1000 | confirmed |
+| `tick_ms` | 1000 | **provisional**（§2.13） |
 | `tick_deadline_ms` | 250 | **provisional**（下記・§2.13） |
 | `overrun_consecutive_limit` | 3 | **provisional**（§2.13。0060 §5 未決 3 は `tick_deadline_ms` と一緒に確定する） |
 | `watchdog_timeout_ms` | **5000** | **provisional**（§2.12・§2.13） |
@@ -166,7 +172,7 @@ CPU と GPU のチップの温度は、負荷の立ち上がりで数秒のう�
 
 ### 2.13 実機の試験まで `provisional` に置く値
 
-次の7つは値を承認したが、実機の試験で裏付けるまで `provisional` に置く。**試験の手順は本記録では決めず、
+次の値は値を承認したが、実機の試験で裏付けるまで `provisional` に置く。**試験の手順は本記録では決めず、
 承認点 3 の前に別の決定記録で設計して所有者の承認を得る**（§5 未決 5）。試験の結果が今の値を支えなければ、
 値を変える案を所有者に出す。
 
@@ -175,6 +181,9 @@ CPU と GPU のチップの温度は、負荷の立ち上がりで数秒のう�
 | `tick_deadline_ms` | 運用の unit と同じ引数（Learned の経路を含む）・`--backend hwmon` での `duration_ms` が 250 ms に十分な余裕を持って収まる |
 | `stall_window_ms` | 3 zone すべてで、正常な立ち上がりと過渡が窓より十分短い（3 zone で共通の値なので Top だけでは確定しない） |
 | `watchdog_timeout_ms` | hang から Max までの実際の最悪時間（約 11 s）の間の温度の上昇が、各温度の上限（T_SENSOR は 80 °C、ほかは 90 °C）までの余裕に収まる |
+| `tick_ms` | `tick_deadline_ms` と同じ運転で、周期どおりに回り、MPC・Supervisor の期限との不変条件を満たしたまま運用できる |
+| `telemetry.*_ms`（T_SENSOR を除く） | 運用の収集周期と書き込みの遅れの下で、正常な運転が stale と判定されない |
+| `startup_settle_ms` / `fault_clear_hold_ms` | takeover の後と fault の解消の後に、tach と温度が落ち着くまでの時間より長い |
 | `overrun_consecutive_limit` | `tick_deadline_ms` と同じ運転で、遅い tick が続く長さが 3 に届かない（届くなら全 zone Max の理由と頻度を示す） |
 | `write_fail_emergency_after` | `hardware_write_fail_exit_ms` と同じ失敗の試験で、正常な一時的失敗の連続が 3 に届かず、本当の故障では 3 回で `EMERGENCY` に上がる |
 | `ramp_down_per_s` | Max から最低安全 Demand へ下げる間と下げた後に、温度の上昇が 2500 ms の収集周期で捉えられ、floor と Fallback が上げ直すまでにどの温度も上限に近づかない |
@@ -227,7 +236,7 @@ GPU の温度は全 zone に効く（Top も上がる）。平均では BIOS よ
 
 ### 良くなること
 
-- 承認点 3 へ進める準備が揃う（§2.13 の試験の手順を別の記録で決めた後）。Safety の暫定値は §2.13 の7つと §2.4 の CPU Power の曲線だけになる（§2.4 は入力を足すまで残るので、起動ログの `safety_config_is_provisional` はそれまで true のまま）
+- 承認点 3 へ進める準備が揃う（§2.13 の試験の手順を別の記録で決めた後）。Safety の暫定値は §2.13 の時間と回数の値と §2.4 の CPU Power の曲線だけになる（§2.4 は入力を足すまで残るので、起動ログの `safety_config_is_provisional` はそれまで true のまま）
 - 値の根拠が実測と結びつき、後で緩めるときの比較の基準になる
 
 ### 悪くなること・その緩和
