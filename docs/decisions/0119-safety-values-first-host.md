@@ -175,18 +175,29 @@ CPU と GPU のチップの温度は、負荷の立ち上がりで数秒のう�
 最初の運転は Baseline（Fallback が requested を作り、Learned は shadow）なので、実際の回転数は Fallback と
 Reactive Guard が決める。ここは Safety ではないが、所有者が 2026-10-11 に承認した。
 
-**Fallback**: BIOS の自動制御の曲線を実測から写す。約2日の実測では、BIOS は Top / Front / Rear の3つとも
-CPU の温度だけで回していた（CPU 5 °C ごとの PWM の中央値: 40 °C 39% / 50 °C 47% / 60 °C 62% / 65 °C 72% /
-70 °C 95% / 75 °C 100%）。
+**Fallback**: 約2日の実測では、BIOS は Top / Front / Rear の3つとも CPU の温度だけで回していた（CPU 5 °C ごとの
+PWM の中央値: 40 °C 39% / 50 °C 47% / 60 °C 62% / 65 °C 72% / 70 °C 95% / 75 °C 100%）。最初の候補はこの曲線を写した
+もの（72 °C で 1.0）だったが、GPU の温度も入力にすると、Fallback は3 zone の Demand の**最大値を全 zone に当てる**
+（`FallbackController._propose()`）ため、GPU の負荷で Top を含む全 zone が全開になる。実測の温度の推移に当てはめると
+全開の時間が 58% になったため、上端を緩めた曲線を所有者が選んだ（2026-10-11）。
 
 | 項目 | 値 |
 |---|---|
-| `fallback_curve` | 45 °C → 0.40、55 °C → 0.53、60 °C → 0.62、65 °C → 0.72、72 °C → 1.0 |
+| `fallback_curve` | 45 °C → 0.40、55 °C → 0.50、65 °C → 0.65、75 °C → 0.85、82 °C → 1.0 |
 | `fallback_temperature_inputs` | Top: `cpu.package`。Front / Rear: `cpu.package` と `gpu.0.core`（高い方） |
 | `fallback_power_feedforward` | 使わない（`null`） |
 | `fallback_dynamics` | `decrease_hysteresis` 0.05・`decrease_hold_ms` 10000 |
 
-Front / Rear に GPU の温度を足すので、GPU の負荷では BIOS より強く回る。
+実測の推移に当てはめた Top の Demand（Safety の CPU 下限を含む）:
+
+| 曲線 | 平均 | 中央値 | 全開の時間 |
+|---|---:|---:|---:|
+| BIOS（実際の値） | 0.58 | 0.52 | 5.3% |
+| 最初の候補（72 °C で 1.0） | 0.80 | 1.00 | 58% |
+| 採用（82 °C で 1.0） | 0.69 | 0.79 | 1.2% |
+
+GPU の温度は全 zone に効く（Top も上がる）。平均では BIOS より強く回るが、CPU だけが熱いときは BIOS より弱い
+（CPU 72 °C で 0.79、BIOS は約 1.0）。そのときも Safety の CPU 下限（§2.3。72 °C で 0.74）と絶対温度上限（§2.1）は効く。
 
 **Reactive Guard**: 2500 ms ごとの実測の上昇の速さの p99 付近で発火させる。
 
