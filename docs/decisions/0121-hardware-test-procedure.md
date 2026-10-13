@@ -105,7 +105,7 @@ fand が auto で動いている間に、`coldaisle-telemetry` を 30 s 止め�
 |---|---|---|
 | `coldaisle-telemetry` を止めてから `cpu_telemetry_stale` / `gpu_telemetry_stale` まで | `telemetry.cpu_ms` / `gpu_ms` 5000 | 5000 ms + 収集周期以内に上がり、Top が Max・Front / Rear が `fault_demand` 1.0 になる |
 | `coldaisle-daemon` を止めてから `air_telemetry_stale` まで | `telemetry.air_ms` 5000 | 5000 ms + 収集周期以内に上がり、Front / Rear だけが `fault_demand` 1.0 になる。Top は自分の floor と Fallback のまま（Max にならない） |
-| 戻してから fault が消えるまで | `fault_clear_hold_ms` 30000 | 30 s 保持してから消え、その間と後に fault が出入りしない |
+| 新しい sample が届いて stale の状態が観測されなくなった最初の tick から、fault が消えるまで（サービスを戻した時刻からではない。起動と最初の書き込みの遅れを混ぜない） | `fault_clear_hold_ms` 30000 | 30 s（+ 1 tick 以内）保持してから消え、その間と後に fault が出入りしない |
 | 戻した後に温度と tach が落ち着く時間 | 同上 | 30 s より短い |
 
 ### 2.6 T4: 下げる速さと起動の落ち着き
