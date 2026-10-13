@@ -165,6 +165,9 @@ auto のままでは Fallback が 0.40 以上を求めて 0.35 まで下がら�
 
 - **立ち上がり**: 対象の zone だけ `zone_min_demand` / `stall_check_min_demand` / `fan-hardware.yaml` の `minimum_stable_demand`
   を 0.0 に、`stall_window_ms` を 60000 にした設定で、manual で 0.0 にして Fan が止まるのを待ち（30 s 以内）、
+  Top を対象にするときは、manual でも効く `cpu_cooling_floor` の低温側の点（60 °C → 0.35）と、CPU Power の入力を有効にしていれば
+  `cpu_power_cooling_floor` の低電力側の点（100 W → 0.35）も 0.0 にする（高温・高電力側の点はそのまま残し、温度か電力が上がれば
+  floor は戻る。アイドルで CPU 60 °C 未満のときだけ行う）。
   manual で 0.35 にする。0.35 にしてから `fanN_input` が `stall_min_rpm` に届くまでの時間を測る。3 回行う。
   Rear は PWM 0 でも止まらない（約 440〜450 RPM）ので、同じ設定で manual 0.0 の間の最低の回転数が `stall_min_rpm`（350）より
   高いままであることと、0.0 から 0.35 にして 0.35 の回転数の 90% に届くまでの時間を測る
