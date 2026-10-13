@@ -96,6 +96,14 @@ GPU の負荷の下では fand は GPU の温度で全 zone を上げるので�
 | 最初の失敗から終了コード 7 まで | `hardware_write_fail_exit_ms` 5000 | 5000〜6000 ms で終了し、引き継ぎの記録が残り、`ExecStopPost` が3 zone に Max を書く |
 | 再起動の後 | 同上 | takeover が成功し（`enable=1`）、終了コード 7 の繰り返しにならない |
 
+**一時的な失敗からの復帰**: 同じ条件（アイドル・全 zone manual 0.35・`effective` が 0.35）で、Front に `pwmN_enable=5` を書き、
+1.2 s 後に `pwmN_enable=1`（fand が takeover の後に保つ manual の状態）を書き戻す。fand は takeover の後に `1` を書き直さないので、
+書き戻すまでの 1〜2 tick だけ失敗する。書き戻した時点の PWM は BIOS が決めた値（アイドルで約 0.39）で、fand の 0.35 より低くならない。
+
+| 測るもの | 確定する値 | 合格の条件 |
+|---|---|---|
+| 失敗の回数と、その後の tick | `write_fail_emergency_after` 3（正常な側）・`hardware_write_fail_exit_ms` | 失敗は 1〜2 回で、その後の tick で書き込みと読み戻しが成功し、`EMERGENCY` にも終了コード 7 にもならない（数え直しと終了の計時がリセットされる）。3 回に届いた試行は使わずにやり直す |
+
 ### 2.5 T3: データの遅れと復帰
 
 fand が auto で動いている間に、`coldaisle-telemetry` を 30 s 止めて戻す。次に `coldaisle-daemon`（取り込み）を 30 s
