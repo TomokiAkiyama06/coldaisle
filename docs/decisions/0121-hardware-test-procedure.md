@@ -43,7 +43,7 @@
 
 - **制御の経路を迂回しない**（0119 §5 の 5 (a)）。Demand は fand の自動制御か管理ソケットの manual / max / auto で決め、
   Guard と Critical Safety を通す。sysfs へ人が書くのは、§2.4 の故障の注入の `pwmN_enable=5`（その Fan を BIOS の
-  自動制御へ戻す。冷却を弱めない向き）だけとする
+  自動制御へ戻す）だけとし、§2.4 の条件で BIOS の出力が fand の出力を下回らないときに限る
 - **試験専用の設定**は §2.8 の stall の試験だけで使う。`/etc/coldaisle/control-config-test-<名前>/` に4ファイルを置き、
   unit の drop-in で `--config-dir` を差し替える。試験の後に drop-in と設定を消し、unit の `ExecStart` が元に戻ったことを確かめる
 - **所有者が現地にいて**、各試験の開始と終了を行う。操作のスクリプトは事前に内容を示し、所有者が実行する
@@ -55,7 +55,7 @@
 - **負荷**は §2.7 / §2.9 で GPU 600 W（行列計算）と CPU の全スレッド（`stress-ng`）を別々に使い、同時にはかけない
   （所有者の選択。普段の最大まで）
 - **Learned を配備していない**ので、`tick_deadline_ms` / `tick_ms` / `overrun_consecutive_limit` の確定は
-  「Learned の経路を開かない運用」に対してのものとする。Learned を配備するときは §2.2 をやり直す
+  「Learned の経路を開かない運用」に対してのものとする。Learned を配備するときは §2.3 の soak をやり直す
 - 試験の結果が今の値を支えなければ、値を変える案を別の決定記録で所有者に出す（0119 §2.13）
 
 ### 2.2 T0: 0080 段階 5 の残り
@@ -81,7 +81,13 @@ fand に制御させる。終了は `systemctl stop`。
 
 ### 2.4 T2: 書き込みの失敗（0119 §5 の 5 (c)）
 
-fand が auto で動いている間に、所有者が root で1つの zone の `pwmN_enable` に `5` を1回書く。Front・Top で1回ずつ行う。
+アイドル（`cpu.package` 50 °C 未満・`gpu.0.core` 45 °C 未満・`power.gpu.0` 50 W 未満）のときに、manual で全 zone を 0.35 にし、
+`control tick` の `effective` が3 zone とも 0.35 になった（Guard の floor が入っていない）のを確かめてから、所有者が root で
+1つの zone の `pwmN_enable` に `5` を1回書く。Front・Top で1回ずつ行う。
+
+BIOS の自動制御は全 zone を CPU の温度だけで決め、アイドルでも約 0.37 以上で回す（0119 §1・§2.14）。fand の出力を下限の 0.35 に
+しておくことで、注入の後に終了と引き継ぎの Max が来るまでの約 5 s の間も、注入した Fan が fand の出力より遅くならない。
+GPU の負荷の下では fand は GPU の温度で全 zone を上げるので、BIOS へ戻すと遅くなりうる。負荷の下では注入しない。
 
 | 測るもの | 確定する値 | 合格の条件 |
 |---|---|---|
@@ -93,11 +99,12 @@ fand が auto で動いている間に、所有者が root で1つの zone の `
 ### 2.5 T3: データの遅れと復帰
 
 fand が auto で動いている間に、`coldaisle-telemetry` を 30 s 止めて戻す。次に `coldaisle-daemon`（取り込み）を 30 s
-止めて戻す。
+止めて戻す。期待する動きは止めるサービスで違う。
 
 | 測るもの | 確定する値 | 合格の条件 |
 |---|---|---|
-| 止めてから `cpu_telemetry_stale` / `gpu_telemetry_stale` / `air_telemetry_stale` まで | `telemetry.*_ms` 5000 | 5000 ms + 収集周期以内に上がり、Top が Max・Front / Rear が 1.0 になる |
+| `coldaisle-telemetry` を止めてから `cpu_telemetry_stale` / `gpu_telemetry_stale` まで | `telemetry.cpu_ms` / `gpu_ms` 5000 | 5000 ms + 収集周期以内に上がり、Top が Max・Front / Rear が `fault_demand` 1.0 になる |
+| `coldaisle-daemon` を止めてから `air_telemetry_stale` まで | `telemetry.air_ms` 5000 | 5000 ms + 収集周期以内に上がり、Front / Rear だけが `fault_demand` 1.0 になる。Top は自分の floor と Fallback のまま（Max にならない） |
 | 戻してから fault が消えるまで | `fault_clear_hold_ms` 30000 | 30 s 保持してから消え、その間と後に fault が出入りしない |
 | 戻した後に温度と tach が落ち着く時間 | 同上 | 30 s より短い |
 
