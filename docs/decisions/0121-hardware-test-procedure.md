@@ -110,12 +110,14 @@ fand が auto で動いている間に、`coldaisle-telemetry` を 30 s 止め�
 
 ### 2.6 T4: 下げる速さと起動の落ち着き
 
-GPU 300 W の一定の負荷で温度が落ち着いた後、`ctl max` を 2 分、続けて `ctl auto` に戻す。また、T1 / T2 / T3 の起動
-（takeover）の記録を使う。
+アイドルと GPU 300 W の一定の負荷のそれぞれで、温度が落ち着いた後に `ctl max` を 2 分、続けて manual で全 zone 0.35 にし、
+`effective` が実際に 0.35（最低安全 Demand。CPU の floor と Guard が上げる分はそのまま）に届いてから 60 s 見て、`ctl auto` に戻す。
+auto のままでは Fallback が 0.40 以上を求めて 0.35 まで下がらないので、Max から最低安全 Demand までの全区間を manual で通す
+（Guard と Critical Safety は通る）。中止の基準に近づいたら、すぐに `ctl max` に戻す。また、T1 / T2 / T3 の起動（takeover）の記録を使う。
 
 | 測るもの | 確定する値 | 合格の条件 |
 |---|---|---|
-| auto に戻してから下げ終えるまでと、その後 60 s の温度 | `ramp_down_per_s` 0.05 | どの温度も、戻す前の auto の定常より 3 °C 以上上がらず、floor と Fallback が上げ直すまで中止の基準に近づかない |
+| Max から 0.35 へ下げ終えるまでと、0.35 に届いた後 60 s の温度 | `ramp_down_per_s` 0.05 | どの温度も、下げる前の定常より 3 °C 以上上がらず、上がりは 2500 ms の収集周期で捉えられ、中止の基準に近づかない |
 | takeover から tach がその Demand の最終の回転数の ±5% に入るまでと、温度の落ち着き | `startup_settle_ms` 5000 | 5000 ms より短い |
 
 ### 2.7 T5: watchdog（0119 §5 の 5 (d)）
@@ -123,8 +125,9 @@ GPU 300 W の一定の負荷で温度が落ち着いた後、`ctl max` を 2 分
 開始の状態は3種類にする。Max（`pwmN_enable=0`）を確かめたら負荷を止め、`systemctl stop` で戻す。
 
 **止める位相は heartbeat を基準にする。** `control tick` のログは heartbeat（`WATCHDOG=1`）の後、trace の保存などを終えてから
-出るので、ログからの遅れは heartbeat からの位相ではない。各試行の最後の heartbeat の時刻を、systemd の
-`Watchdog timeout` のログの時刻から `WatchdogSec`（5 s）を引いて求め、`SIGSTOP` との差を位相とする。ログの直後を起点に
+出るので、ログからの遅れは heartbeat からの位相ではない。`SIGSTOP` の直前に systemd が最後の通知を受けた時刻
+（`systemctl show -p WatchdogTimestampMonotonic coldaisle-fand`）を読み、`SIGSTOP` の単調時計の時刻との差を位相とする
+（`Watchdog timeout` のログの時刻は systemd の処理の遅れを含むので使わない）。ログの直後を起点に
 遅らせる量を変えて繰り返し、各条件で位相 100 ms 以内の試行を少なくとも1つ得る。各条件の最長（最も長い hang から Max まで）を使う。
 
 - **(i) 負荷の立ち上がり（最悪の候補）**: アイドルで fand の auto の Demand が低く落ち着いた状態で、**先に `SIGSTOP` し、
@@ -169,13 +172,14 @@ GPU 300 W の一定の負荷で温度が落ち着いた後、`ctl max` を 2 分
 ### 2.9 T7: 高温での BIOS との比較
 
 同じ負荷を、BIOS の制御（fand を止めた状態）と fand の auto でそれぞれかける。負荷は GPU 600 W を 10 分、温度が戻ってから
-CPU の全スレッドを 10 分。各負荷の前に 10 分休ませる。
-温度は吸気（`air.front_intake`）との差で比べる。BIOS と fand の試行で、負荷の前の吸気の温度の差が ±1 °C を超えたらやり直す
-（順に行うので室温が変わりうる）。
+CPU の全スレッドを 10 分。
+温度は吸気（`air.front_intake`）との差で比べる。各試行は、`cpu.package` / `gpu.0.core` / `air.*_exhaust` の吸気との差が、最初の
+試行の前に記録したアイドルの値の ±1 °C 以内に戻ってから始める（冷却水と筐体の蓄熱をそろえる）。負荷の前の吸気の温度の差が
+±1 °C を超えたらやり直す。順序の偏りを打ち消すため、負荷ごとに BIOS → fand → fand → BIOS の順で行い、同じ制御の2回の平均で比べる。
 
 | 測るもの | 合格の条件 |
 |---|---|
-| `cpu.package` / `gpu.0.core` / `board.connector_12v2x6` / `air.*_exhaust` の最高と、最後の 2 分の平均 | 吸気との差で、fand の最高が BIOS の最高より 3 °C を超えて高くならず、中止の基準に届かない |
+| `cpu.package` / `gpu.0.core` / `board.connector_12v2x6` / `air.*_exhaust` の最高と、最後の 2 分の平均 | 吸気との差の2回の平均で、fand の最高が BIOS の最高より 3 °C を超えて高くならず、中止の基準に届かない |
 | GPU の throttle の flag | fand でだけ立つことがない |
 
 条件を満たさなければ、0119 §2.14 の曲線を強める案を別の決定記録で出す。この比較は値の確定ではなく、`enable` の判断の材料とする。
