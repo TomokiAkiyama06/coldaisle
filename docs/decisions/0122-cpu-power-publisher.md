@@ -36,8 +36,9 @@
 
 - **中身**: `src/coldaisle/cpu_power_publisher.py`。**標準ライブラリだけ**を使い、`coldaisle` パッケージを import しない
   （引き継ぎ実行部と同じ形。0080 §2.5）。システムの `/usr/bin/python3 -I -S <ファイル>` で動かし、venv に依存しない
-- **読む先**: `/sys/class/powercap/` の下で `name` が `package-0` の zone を**名前で探す**（番号で指定しない）。ちょうど1つでなければ
-  何も書かずに終了コード 2 で終わる。読むのは `energy_uj` と `max_energy_range_uj` だけ
+- **読む先**: `/sys/class/powercap/` の下で `name` が `package-0` の zone を**名前で探す**（番号で指定しない）。起動時は、ちょうど1つ見つかるまで
+  1 s ごとに探し直し、60 s（引数で渡す）を過ぎても見つからなければ何も書かずに終了コード 2 で終わる（driver の読み込みを待つ）。
+  見つかった後に読めなくなったら、終了コード 1 で終わり unit が再起動する。読むのは `energy_uj` と `max_energy_range_uj` だけ
 - **計算**: 1000 ms ごと（単調時計）に `energy_uj` を読み、前回との差を経過時間で割って W にする。差が負なら一周とみなし
   `max_energy_range_uj` を足す。経過時間が 500〜2000 ms の外なら、その回は書かない（停止や遅れで平均の窓が崩れるため）
 - **粗さ**: 窓は 1 s の平均、値は **1 W に丸める**。PLATYPUS は ms 単位の変化を使うので、1 s の平均と 1 W の丸めでは
@@ -57,7 +58,8 @@
   `RestrictAddressFamilies=AF_UNIX`・`ProtectKernelModules=yes`・`ProtectControlGroups=yes`・`LockPersonality=yes`・
   `RestrictRealtime=yes`・`SystemCallArchitectures=native`・`ProtectClock=yes`・`ProtectHostname=yes`。書けるのは
   `RuntimeDirectory` だけ
-- `Restart=always`・`RestartSec=2`・`RestartPreventExitStatus=2`（zone が見つからない導入先で繰り返さない）
+- `After=systemd-modules-load.service`（RAPL の driver を module で読み込む導入先で、先に起動しない）
+- `Restart=always`・`RestartSec=2`・`RestartPreventExitStatus=2`（起動時に 60 s 探しても zone が無い導入先で繰り返さない）
 - `coldaisle-telemetry` からは `Wants=` / `After=` だけで参照し、無くても telemetry は止まらない
 - 監視系と同じく `enable --now` で常駐させる（Fan に書かない）
 
@@ -66,7 +68,8 @@
 - `config/internal-telemetry.yaml` に `cpu_power:` 節（`path`・`stale_after_ms`・`metric: power.cpu.package`・`status` / `basis`）を足す。
   既定は無効で、導入先で所有者の承認とともに有効にする（ほかの sensor と同じ）
 - 読めない・JSON が壊れている・`schema_version` が違う・`watts` が整数でない → `missing`。`ts_ms` が `stale_after_ms`（2500 の 2 倍の
-  5000）より古い → `stale`。値は W のまま保存する
+  5000）より古い → `stale`。`ts_ms` が収集の時刻より `max_future_skew_ms`（1000）を超えて未来 → `missing`（時計の巻き戻しで
+  止まった値を新しいまま扱い続けないため。欠けると健全度は `DEGRADED` に戻り安全側）。値は W のまま保存する
 - fand の側は変えない。`power.cpu.package` はすでに制御入力の契約にある（重要度 `DEGRADED`、`telemetry.cpu_power_ms` 5000）
 
 ### 2.4 有効にすると変わること
