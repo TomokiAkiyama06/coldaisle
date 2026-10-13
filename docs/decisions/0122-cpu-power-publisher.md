@@ -1,7 +1,7 @@
 # 決定記録 0122: CPU Package の消費電力を root の小さなサービスから渡す（RAPL）
 
 - **種別**: Decision Record
-- **Status**: Proposed（所有者の承認待ち）
+- **Status**: FINAL（2026-10-13、リポジトリ所有者の承認）
 - **Date**: 2026-10-13
 - **Supersedes**: なし（0119 §5 未決 4 の入力の取り方を決める）
 - **関連**: [`0047`](0047-cpu-utilization-metric.md) /
