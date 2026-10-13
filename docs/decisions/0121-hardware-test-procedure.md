@@ -74,7 +74,7 @@ fand に制御させる。終了は `systemctl stop`。
 |---|---|---|
 | `duration_ms` の分布（p99.9・最大） | `tick_deadline_ms` 250 | 最大が 125 ms（期限の半分）未満 |
 | `deadline_exceeded` の数と連続の最長 | `overrun_consecutive_limit` 3 | 連続の最長が 1 以下。超過があれば理由を示す |
-| tick の周期の乱れ（`stats.skipped_slots`、`ts_ms` の間隔） | `tick_ms` 1000 | 間隔の p99.9 が 1100 ms 未満。MPC・Supervisor の期限との不変条件は設定の検証が通ること |
+| tick の周期の乱れ（`stats.skipped_slots`、`ts_ms` の間隔） | `tick_ms` 1000 | `skipped_slots` が 0、systemd の watchdog による再起動（`Watchdog timeout`）が 0、`ts_ms` の間隔の最大が 1500 ms 未満で p99.9 が 1100 ms 未満。MPC・Supervisor の期限との不変条件は設定の検証が通ること（`duration_ms` は heartbeat までしか測らないので、間隔と再起動で heartbeat の後の詰まりも捉える） |
 | `*_telemetry_stale` の数 | `telemetry.cpu_ms` / `gpu_ms` / `air_ms` / `cpu_power_ms` 5000 | 0 回（収集が止まった時間を除く）。`cpu_power_ms` は入力が無いので確定しない |
 | `write_failure` / `readback_mismatch` / `enable_reverted` の数と連続の最長 | `write_fail_emergency_after` 3（正常な側） | 0 回。あれば連続の最長が 2 以下 |
 | `tach_stall` の数 | `stall_window_ms` 5000（正常な側） | 0 回 |
@@ -133,7 +133,8 @@ GPU 300 W の一定の負荷で温度が落ち着いた後、`ctl max` を 2 分
   Fan はアイドルの Demand のまま固まり、熱だけが上がる（負荷の始まりから数秒でチップの温度が大きく上がる。0119 §2.12 の
   16 s で +31 °C / +23 °C）
 - **(iii) 熱がこもった状態からの再開**: GPU 600 W を 10 分かけて止め、fand の auto の `effective` がアイドルの値 + 0.05 以内に
-  戻った直後に（冷却水と筐体はまだ温かい）、(i) と同じく先に `SIGSTOP` してから GPU 600 W を再び始める
+  戻った直後に（冷却水と筐体はまだ温かい）、(i) と同じく先に `SIGSTOP` してから GPU 600 W を再び始める。CPU の全スレッドでも
+  同じことを行う（10 分かけて止め、Top の `effective` がアイドルの値 + 0.05 以内に戻った直後に止めて再開する。AIO の冷却水が温かい）
 - **(ii) 定常**: 負荷を4段階（アイドル・GPU 300 W・GPU 600 W・CPU の全スレッド）にし、fand の auto で温度が落ち着いた後に止める。
   Fallback と floor が Demand を上げた後の状態で、(i) と比べて開始の温度が高い側を押さえる
 
