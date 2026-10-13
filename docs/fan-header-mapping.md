@@ -189,20 +189,26 @@ fand の auto で行った。時間は、最後の sample の DB の時刻の直
 - `cpu_power_unavailable` は、どの tick の Top の reason にも出なかった。収集を止めると CPU の温度と電力が同じ tick で古くなり、
   Top が `zone_fault_max` になって safety floor の reason が trace に出ないため
 
-### T6: stall（2026-10-14 02:56〜03:03）
+### T6: stall（2026-10-14 02:56〜03:03、立ち上がりの測り直し 07:46〜07:50）
 
 試験専用の設定（0121 §2.8）を `/etc/coldaisle/control-config-test-<名前>/` に置き、unit の drop-in で `--config-dir` だけを差し替えた。
 対象でない2つの zone は manual で 1.0。試験の後に drop-in と設定を消し、`ExecStart` が本番の `--config-dir` に戻ったことを確かめた。
 
-**立ち上がり**（PWM を書いた時刻から。合格の条件は [0125](decisions/0125-stall-rise-criterion-tach-update.md)）
+**立ち上がり**（合格の条件は [0125](decisions/0125-stall-rise-criterion-tach-update.md)）
 
-| zone | 3 回 | 最長 + tach の更新の周期 1600 ms | 判定 |
+fand の trace で測った値（2026-10-14 07:46〜07:50。試験の側から基板を読まない。収集のサービスは動かしたまま）。
+0.35 を書いた tick から、trace の回転数が `stall_min_rpm` 以上になった tick まで。
+
+| zone | 5 回 | 最長 + driver の更新の閾値 1500 ms | 判定 |
 |---|---|---|---|
-| Top（450 RPM 以上） | 2246 / 2136 / 2688 ms | 4288 ms < 5000 | 合格 |
-| Front（300 RPM 以上） | 1121 / 1457 / 1008 ms | 3057 ms < 5000 | 合格 |
-| Rear | 0.0 の間の最低 439 / 439 / 442 RPM（> 350）。0.35 の 90% まで 3696 / 2915 / 2685 ms（記録だけ） | — | 合格 |
+| Top（450 RPM 以上） | 2000 / 2000 / 2000 / 1999 / 2000 ms（すべて 2 tick。届いた回転数 536〜656 RPM） | 3500 ms < 5000 | 合格 |
+| Front（300 RPM 以上） | 2000 / 2000 / 1999 / 2000 / 2000 ms（すべて 2 tick。届いた回転数 688〜795 RPM） | 3500 ms < 5000 | 合格 |
+| Rear | 0.0 の間の最低 439 / 439 / 442 RPM（> 350）。0.35 の 90% まで 3696 / 2915 / 2685 ms（02:56 の試行。記録だけ） | — | 合格 |
 
-- `fanN_input` は約 1576 ms ごとにしか値が変わらない（3 zone とも）。立ち上がりの時間はこの刻みでしか見えない（0125）
+- 判定に使った tick の組で、trace の `ts_ms` の差と journal の `__MONOTONIC_TIMESTAMP` の差の違いは最大 3 ms（0124 §2.2）
+- trace の回転数が変わる間隔は、ほとんどが 2 tick（ときどき 1 tick。収集のサービスの読み取りが間に入ったとき）
+- 02:56 の試行（試験の側が 0.1 s ごとに `fanN_input` を読んだもの）は、Top 2246 / 2136 / 2688 ms、Front 1121 / 1457 / 1008 ms。
+  このときは値が約 1576 ms ごとに変わったが、読む頻度が更新を変えるので判定に使わない（0125）
 - 立ち上がりの試験の間に fault は出なかった。Top の Guard の floor は起動直後の数 tick だけで、0.0 で止めるのを妨げなかった
 
 **検出**（本番の設定のうち、対象の `stall_min_rpm` だけを Top 1200・Front 900・Rear 1000 にした設定。manual 0.35）
