@@ -40,9 +40,11 @@
   1 s ごとに探し直し、60 s（引数で渡す）を過ぎても見つからなければ何も書かずに終了コード 2 で終わる（driver の読み込みを待つ）。
   見つかった後に読めなくなったら、終了コード 1 で終わり unit が再起動する。読むのは `energy_uj` と `max_energy_range_uj` だけ
 - **計算**: 1000 ms ごと（単調時計）に `energy_uj` を読み、前回との差を経過時間で割って W にする。差が負なら一周とみなし
-  `max_energy_range_uj` を足す。経過時間が 500〜2000 ms の外なら、その回は書かない（停止や遅れで平均の窓が崩れるため）
+  `max_energy_range_uj` を足す。経過時間が周期の半分〜2倍（1000 ms なら 500〜2000 ms）の外なら、その回は書かない（停止や遅れで平均の窓が崩れるため）
 - **粗さ**: 窓は 1 s の平均、値は **1 W に丸める**。PLATYPUS は ms 単位の変化を使うので、1 s の平均と 1 W の丸めでは
-  その情報を渡さない。0〜1000 W の外の値は書かない
+  その情報を渡さない。範囲（0〜1000 W）の外の値は書かない。
+  周期・起動時に zone を待つ時間・値の範囲・読む先・書く先は、**すべて unit が渡す必須の引数**にし、コードに既定値を持たない
+  （AGENTS.md ルール 9。標準ライブラリだけで動くので YAML を読まない）
 - **渡し方**: `/run/coldaisle-power/cpu-package.json` に `{"schema_version": 1, "ts_ms": <wall clock>, "watts": <整数>, "window_ms": <整数>}`
   を書く。一時ファイルに書いて `rename` で置き換える（読み手が書きかけを読まない）
 - **権限**: ディレクトリは unit の `RuntimeDirectory=coldaisle-power`（`0750`）、ファイルは `0640`。グループは unit の `Group=coldaisle`
@@ -70,6 +72,9 @@
 - 読めない・JSON が壊れている・`schema_version` が違う・`watts` が整数でない → `missing`。`ts_ms` が `stale_after_ms`（2500 の 2 倍の
   5000）より古い → `stale`。`ts_ms` が収集の時刻より `max_future_skew_ms`（1000）を超えて未来 → `missing`（時計の巻き戻しで
   止まった値を新しいまま扱い続けないため。欠けると健全度は `DEGRADED` に戻り安全側）。値は W のまま保存する
+- adapter の `expected_metrics` を、周期の metric の登録（`periodic_metric_intervals`。収集が止まった分が rollup で欠測として残る）と、
+  Server Health の signal の監視対象（`/api/v1/server-health`。有効にした CPU 電力が欠けたら green にしない）に含める。
+  無効のときはどちらにも入れない
 - fand の側は変えない。`power.cpu.package` はすでに制御入力の契約にある（重要度 `DEGRADED`、`telemetry.cpu_power_ms` 5000）
 
 ### 2.4 有効にすると変わること
