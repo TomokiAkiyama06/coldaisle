@@ -126,7 +126,7 @@ auto のままでは Fallback が 0.40 以上を求めて 0.35 まで下がら�
 
 | 測るもの | 確定する値 | 合格の条件 |
 |---|---|---|
-| Max から 0.35 へ下げ終えるまでと、0.35 に届いた後 60 s の温度 | `ramp_down_per_s` 0.05 | 各 tick の `effective` の下がり幅を、trace の `ramp_down_limit` の reason にある `elapsed_ms`（fand が下降量の計算に使った tick 開始の単調時刻の差）で割って求めた下降率（trace の `ts_ms` は壁時計、journal の時刻はログの出力時刻なので使わない）。0.35 に届く終端の tick は `bound_by` が `safety_floor` になり `ramp_down_limit` の reason と `elapsed_ms` が出ないので、その tick の下がり幅が `ramp_down_per_s` ×（`tick_ms` + `tick_deadline_ms`）= 0.0625 以下であることで確かめるが全区間で 0.05/s 以下（+ 1 tick の丸め）で、Max から 0.35 に届く直前までの各 tick の `bound_by` が `ramp_down` であること（0.35 に届いた tick は `safety_floor` でよい。即座に下がったら不合格）。どの温度も、下げる前の定常より 3 °C 以上上がらず、上がりは 2500 ms の収集周期で捉えられ、中止の基準に近づかない |
+| Max から 0.35 へ下げ終えるまでと、0.35 に届いた後 60 s の温度 | `ramp_down_per_s` 0.05 | 各 tick の `effective` の下がり幅を、trace の `ramp_down_limit` の reason にある `elapsed_ms`（fand が下降量の計算に使った tick 開始の単調時刻の差）で割って求めた下降率（trace の `ts_ms` は壁時計、journal の時刻はログの出力時刻なので使わない）。0.35 に届く終端の tick は `bound_by` が `safety_floor` になり `ramp_down_limit` の reason と `elapsed_ms` が出ないので、下降率の判定には使わない（その tick の `effective` は safety floor で、ramp の許す値以上なので、下がり幅は作りの上で ramp を超えない）。下降率は `elapsed_ms` のある途中の tick（1.0 から 0.35 まで約 13 tick）の実測だけで判定し、各試行で 10 tick 以上を要するが全区間で 0.05/s 以下（+ 1 tick の丸め）で、Max から 0.35 に届く直前までの各 tick の `bound_by` が `ramp_down` であること（0.35 に届いた tick は `safety_floor` でよい。即座に下がったら不合格）。どの温度も、下げる前の定常より 3 °C 以上上がらず、上がりは 2500 ms の収集周期で捉えられ、中止の基準に近づかない |
 | takeover から tach がその Demand の最終の回転数の ±5% に入るまでと、温度の落ち着き | `startup_settle_ms` 5000 | 5000 ms より短い |
 
 ### 2.7 T5: watchdog（0119 §5 の 5 (d)）
