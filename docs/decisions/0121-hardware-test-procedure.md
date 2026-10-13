@@ -103,8 +103,8 @@ fand が auto で動いている間に、`coldaisle-telemetry` を 30 s 止め�
 
 | 測るもの | 確定する値 | 合格の条件 |
 |---|---|---|
-| `coldaisle-telemetry` を止めてから `cpu_telemetry_stale` / `gpu_telemetry_stale` まで | `telemetry.cpu_ms` / `gpu_ms` 5000 | 5000 ms + 収集周期以内に上がり、Top が Max・Front / Rear が `fault_demand` 1.0 になる |
-| `coldaisle-daemon` を止めてから `air_telemetry_stale` まで | `telemetry.air_ms` 5000 | 5000 ms + 収集周期以内に上がり、Front / Rear だけが `fault_demand` 1.0 になる。Top は自分の floor と Fallback のまま（Max にならない） |
+| 最後に届いた新しい sample（DB に残った最後の行の時刻）から `cpu_telemetry_stale` / `gpu_telemetry_stale` まで（`coldaisle-telemetry` を止める） | `telemetry.cpu_ms` / `gpu_ms` 5000 | 5000 ms 以上・5000 ms + 1 tick（+ 書き込みの遅れ）以内に上がり（早すぎても不合格）、Top が Max・Front / Rear が `fault_demand` 1.0 になる |
+| 最後に届いた新しい air の sample から `air_telemetry_stale` まで（`coldaisle-daemon` を止める） | `telemetry.air_ms` 5000 | 5000 ms 以上・5000 ms + 1 tick（+ 書き込みの遅れ）以内に上がり（早すぎても不合格）、Front / Rear だけが `fault_demand` 1.0 になる。Top は自分の floor と Fallback のまま（Max にならない） |
 | 新しい sample が届いて stale の状態が観測されなくなった最初の tick から、fault が消えるまで（サービスを戻した時刻からではない。起動と最初の書き込みの遅れを混ぜない） | `fault_clear_hold_ms` 30000 | 30 s（+ 1 tick 以内）保持してから消え、その間と後に fault が出入りしない |
 | 戻した後に温度と tach が落ち着く時間 | 同上 | 30 s より短い |
 
@@ -157,8 +157,8 @@ GPU 300 W の一定の負荷で温度が落ち着いた後、`ctl max` を 2 分
   Rear は PWM 0 でも止まらない（約 440〜450 RPM）ので、同じ設定で manual 0.0 の間の最低の回転数が `stall_min_rpm`（350）より
   高いままであることと、0.0 から 0.35 にして 0.35 の回転数の 90% に届くまでの時間を測る
 - **検出**: 本番と同じ設定のうち、対象の zone の `stall_min_rpm` だけを、Demand 0.35 の回転数より高く全開の回転数より低い値
-  （Top 1200、Front 900）にした設定で、manual で 0.35 にする。`tach_stall` が上がり、Top は `EMERGENCY`、Front は自分が Max・
-  ほかが 1.0 になることを見る（検出の側は閾値を上げるので安全側）
+  （Top 1200、Front 900、Rear 1000）にした設定で、manual で 0.35 にする。`tach_stall` が上がり、Top は `EMERGENCY`、Front と Rear は
+  自分が Max・ほかが 1.0（`DEGRADED`）になることを見る（検出の側は閾値を上げるので安全側）
 
 | 測るもの | 確定する値 | 合格の条件 |
 |---|---|---|
