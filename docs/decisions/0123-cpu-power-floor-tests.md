@@ -32,7 +32,8 @@
   そこで T8 は、温度の曲線では説明できない `safety_floor` が現れたことで power の曲線が効いたと判定する（§2.1）
 - CPU Power の収集の側にも古さの判定がある（`internal-telemetry.yaml` の `cpu_power.stale_after_ms` 5000）。専用サービスだけを
   止めると、収集は 2.5 s ごとに行を書き続け、ファイルが古くなると adapter が `stale` で書き、fand はそれを見てすぐ power の項を外す。
-  この場合は fand の側の `telemetry.cpu_power_ms` の計時を通らない。fand の計時を測るには、行そのものを止める（`coldaisle-telemetry` を止める）
+  この場合は fand の側の `telemetry.cpu_power_ms` の計時を通らない。行そのものを止める（`coldaisle-telemetry` を止める）と CPU の温度も
+  同じ tick で古くなり、Top が `zone_fault_max` になって power の項の外れが trace に出ないので、fand の計時はテストで確かめる（§2.2 (a)）
 
 ## 2. Decision
 
@@ -55,20 +56,27 @@ GPU 600 W だけの負荷でも 1 回行う。
 
 ### 2.2 T9: `telemetry.cpu_power_ms` と収集の側の古さの判定
 
-**(a) fand の計時（`telemetry.cpu_power_ms`）**: 0121 の T3 で `coldaisle-telemetry` を止めるときに、あわせて測る（行そのものが止まるので
-fand の age の計時を通る）。
+**(a) fand の計時（`telemetry.cpu_power_ms`）**: 実機では測らず、CI のテストで確かめる。
 
-| 測るもの | 確定する値 | 合格の条件 |
+実機で行の流れを止めるには `coldaisle-telemetry` を止めるしかないが、そうすると CPU の温度（`telemetry.cpu_ms` も 5000）も
+同じ tick で古くなり、`cpu_telemetry_stale` で Top が `zone_fault_max` になる。このとき Top の reason は `zone_fault_max` だけで、
+`cpu_power_unavailable`（floor の detail）は trace に出ない。2026-10-14 の 0121 T3 でも、どの tick の Top の reason にも出なかった
+（`docs/fan-header-mapping.md`「0121 の試験の結果」T3）。
+
+| 確かめるもの | 確定する値 | 合格の条件 |
 |---|---|---|
-| DB に残った最後の `power.cpu.package` の行の時刻から、Top の reason に `cpu_power_unavailable` が出る tick まで（fand がその行を初めて観測した tick は記録に残らず、行の時刻から最大 1 tick 遅れる） | `telemetry.cpu_power_ms` 5000 | 5000 ms 以上・5000 ms + 2 tick 以内（観測の遅れの 1 tick を含める。早すぎても不合格）。CPU Power について fault は上がらない（同時に上がる `cpu_telemetry_stale` / `gpu_telemetry_stale` は T3 のとおり） |
+| `tests/test_control_loop.py` の `test_invariant_13_cpu_power_goes_stale_after_its_own_limit_without_a_fault`（CPU Power の時刻だけを止め、Top の requested を floor より下げて floor の reason を毎 tick 残す） | `telemetry.cpu_power_ms` 5000 | `cpu_power_ms` 以内の tick では `cpu_power_unavailable` が出ず、超えた最初の tick で出る。fault は上がらず、Top は `forced_max` にならず、safety state は `NORMAL` のまま。値の確定は、このテストが CI で通ることと、(b) で fand が古さの判定の結果に追従することの2つで行う |
 
-**(b) 収集の側の判定**: fand が auto で動いている間に、`coldaisle-cpu-power` を `systemctl kill -s SIGSTOP` で 30 s 一時停止し、
+**(b) 収集の側の判定**: fand を manual 0.35（3 zone とも）で動かしている間に、`coldaisle-cpu-power` を `systemctl kill -s SIGSTOP` で 30 s 一時停止し、
 `SIGCONT` で戻す（`systemctl stop` は unit の `RuntimeDirectory` を消し、ファイルが無いと adapter は `stale_after_ms` を待たずに
 `missing` にするため。一時停止ならファイルは最後の内容のまま残り、更新だけが止まる）。
+auto のアイドルでは Top の requested（Fallback）が下限の 0.35 より上にあり、safety floor が値を変えも Demand を決めもしないので、
+floor の reason（`cpu_power_unavailable` はその detail）が trace に出ない。manual 0.35 なら floor と requested が同じ値になり、
+`bound_by` が `safety_floor`（同じ値のときは安全側の項を記録する）になって reason が毎 tick 残る。
 
 | 測るもの | 確かめること | 合格の条件 |
 |---|---|---|
-| 専用サービスの最後の書き込み（ファイルの `ts_ms`）から、Top の reason に `cpu_power_unavailable` が出る tick まで | `cpu_power.stale_after_ms` 5000（収集の設定） | 5000 ms 以上（早すぎても不合格）・5000 ms + 収集の周期 2500 ms + 1 tick 以内。fault は上がらず、Top は温度の floor と Fallback のまま |
+| 専用サービスの最後の書き込み（ファイルの `ts_ms`）から、Top の reason に `cpu_power_unavailable` が出る tick まで | `cpu_power.stale_after_ms` 5000（収集の設定） | 5000 ms 以上（早すぎても不合格）・5000 ms + 収集の周期 2500 ms + 1 tick 以内。fault は上がらず、Top は 0.35 のまま（アイドルなので温度の floor も 0.35 以下） |
 | その間の telemetry の健全度と Guard の閾値 | 健全度の連動 | 健全度が `DEGRADED`、Guard が degraded の閾値（`threshold_profile` が `conservative`）になる |
 | 戻した後 | 復帰 | 新しい sample を観測した tick から power の項が戻り、健全度が `NORMAL`（ほかの入力がそろっているとき）に戻る |
 
@@ -79,7 +87,7 @@ fand の age の計時を通る）。
 
 ### 2.4 順序
 
-T8 と T9 (b) は 0121 の T7 の後、T1 の前に行う。T9 (a) は T3 の中で行う。順序は T0 → T2 → T3 → T6 → T4 → T5 → T7 → T8 → T9 → T1 になる。
+T8 と T9 (b) は 0121 の T7 の後、T1 の前に行う。T9 (a) は実機では行わない（§2.2）。順序は T0 → T2 → T3 → T6 → T4 → T5 → T7 → T8 → T9 → T1 になる。
 
 ## 3. Consequences
 
