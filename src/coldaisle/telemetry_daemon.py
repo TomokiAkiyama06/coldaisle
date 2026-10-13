@@ -20,6 +20,7 @@ from coldaisle.clock import Clock, WallClock
 from coldaisle.internal_telemetry import (
     SOURCE_STATE_PREFIX,
     TELEMETRY_KIND_KEY,
+    CpuPowerAdapter,
     HwmonAdapter,
     InternalTelemetryCollector,
     InternalTelemetryConfig,
@@ -221,6 +222,8 @@ def periodic_metric_intervals(config: InternalTelemetryConfig) -> dict[str, int]
         NvmlAdapter(config.nvml),
         HwmonAdapter(config.hwmon),
         ProcStatAdapter(config.proc_stat),
+        # 時計は expected_metrics には使わない。poll しないので実時計で足りる
+        CpuPowerAdapter(config.cpu_power, clock=WallClock()),
     )
     return {
         metric: config.interval_ms for adapter in adapters for metric in adapter.expected_metrics
@@ -272,6 +275,8 @@ def build(
             NvmlAdapter(telemetry.nvml),
             HwmonAdapter(telemetry.hwmon),
             ProcStatAdapter(telemetry.proc_stat),
+            # stale の判定を collector と同じ時計で行う（決定記録 0122 §2.3）
+            CpuPowerAdapter(telemetry.cpu_power, clock=used_clock),
         )
         if adapters is None
         else adapters
@@ -304,6 +309,18 @@ def _log_configuration(config: InternalTelemetryConfig) -> None:
                 "enabled": config.nvml.enabled,
                 "logical_gpu_indices": config.nvml.gpu_indices,
                 "identity_contract": "single_physical_gpu",
+            }
+        },
+    )
+    LOGGER.info(
+        "CPU power input configuration",
+        extra={
+            logs.FIELDS_KEY: {
+                "enabled": config.cpu_power.enabled,
+                "metric": config.cpu_power.metric,
+                "stale_after_ms": config.cpu_power.stale_after_ms,
+                "confirmation_status": config.cpu_power.confirmation.status.value,
+                "confirmation_basis": config.cpu_power.confirmation.basis,
             }
         },
     )

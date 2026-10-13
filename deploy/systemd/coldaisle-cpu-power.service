@@ -1,0 +1,62 @@
+# coldaisle CPU Package 電力の受け渡し（RAPL。#278 / 決定記録 0122）のテンプレート。
+#
+# **テンプレートである。** グループ名は仮の値。導入の手順は docs/ubuntu-deploy.md。
+# powercap の energy_uj は PLATYPUS（CVE-2020-8694 / 8695）の対策で root だけが読める。
+# root で読み、1 s の平均を 1 W に丸めた値だけを /run/coldaisle-power/cpu-package.json に書く。
+# 読む権限は広げない（0122 §4）。Fan にも hwmon にも書かない。
+
+[Unit]
+Description=coldaisle CPU package power publisher (RAPL)
+Documentation=file:///opt/coldaisle/docs/ubuntu-deploy.md
+# RAPL の driver を module で読み込む導入先で、先に起動しない（0122 §2.2）
+After=systemd-modules-load.service
+# 再起動を諦めない。起動時に 60 s 探しても zone が無い導入先は終了コード 2 で止まる（下の RestartPreventExitStatus=）
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+# uid 0 なら capability なしで energy_uj（0400 root）を読める（0122 §2.2。導入先で CapEff 0 のまま確認済み）。
+# Group=coldaisle で出力のグループが付く（chown を使わない）。coldaisle は仮の値で、
+# coldaisle-telemetry の Group= と同じにする
+User=root
+Group=coldaisle
+WorkingDirectory=/
+# 標準ライブラリだけのソースを、システムの python3 で venv に依存せず動かす（0122 §2.1）。
+# 値は 0122 のとおり: 周期 1000 ms、zone を待つのは起動時の 60000 ms まで、妥当範囲 0〜1000 W
+ExecStart=/usr/bin/python3 -I -S /opt/coldaisle/src/coldaisle/cpu_power_publisher.py --powercap-root /sys/class/powercap --output /run/coldaisle-power/cpu-package.json --interval-ms 1000 --startup-wait-ms 60000 --min-watts 0 --max-watts 1000
+
+Restart=always
+RestartSec=2
+# 2: 起動時の待ちを過ぎても package-0 の zone がちょうど1つでない・引数が不正。人が直すまで結果が変わらない。
+# 見つかった後に読めなくなったら 1 で終わり、ここで再起動して探し直す
+RestartPreventExitStatus=2
+
+# 書けるのはここだけ。読めるのはグループ coldaisle だけ（ファイルは 0640）
+RuntimeDirectory=coldaisle-power
+RuntimeDirectoryMode=0750
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=coldaisle-cpu-power
+
+# capability を持たない（0122 §2.2）
+CapabilityBoundingSet=
+AmbientCapabilities=
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateNetwork=yes
+RestrictAddressFamilies=AF_UNIX
+# /sys は読むだけ。導入先の確認（0122 §2.2）もこの指定の下で読めた
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+LockPersonality=yes
+RestrictRealtime=yes
+SystemCallArchitectures=native
+ProtectClock=yes
+ProtectHostname=yes
+
+[Install]
+WantedBy=multi-user.target

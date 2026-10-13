@@ -10,6 +10,10 @@ Documentation=file:///opt/coldaisle/docs/ubuntu-deploy.md
 # hwmon のドライバ（nct6799 など）を modules-load.d で読み込む導入先では、その後に始める。
 # 読み込まれる前に始めても落ちないが、最初の周期の hwmon が欠測になる
 After=systemd-modules-load.service
+# CPU Package の電力（決定記録 0122）。Wants= / After= だけで、無くても止まっても telemetry は止まらない
+# （config/internal-telemetry.yaml の cpu_power が missing / stale になるだけ）
+Wants=coldaisle-cpu-power.service
+After=coldaisle-cpu-power.service
 # 再起動を諦めない。fand は Critical Safety の入力をここから受ける（0060 §2.2）
 StartLimitIntervalSec=0
 

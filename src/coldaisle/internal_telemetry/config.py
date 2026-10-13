@@ -157,6 +157,37 @@ class ProcStatConfig(_ConfigModel):
     path: Path
 
 
+CPU_POWER_METRIC = "power.cpu.package"
+"""CPU Package の消費電力のメトリクス名（決定記録 0122 §2.3）。"""
+CPU_POWER_UNIT = "W"
+"""``cpu_power`` adapter が保存する単位。publisher の JSON の ``watts`` と対になる。"""
+
+
+class CpuPowerConfig(_ConfigModel):
+    """root の ``coldaisle-cpu-power`` が書く JSON を読む設定（決定記録 0122 §2.3）。
+
+    ``energy_uj`` は root だけが読めるので、telemetry は publisher の出力だけを読む。
+    hwmon の sensor と同じく、有効にするには導入先での確認と所有者の承認を
+    ``confirmed`` の basis 付きで残す。
+    """
+
+    enabled: bool
+    path: Path
+    stale_after_ms: int = Field(gt=0)
+    max_future_skew_ms: int = Field(ge=0)
+    metric: Literal["power.cpu.package"]
+    confirmation: ConfirmationEvidence
+
+    @model_validator(mode="after")
+    def _enabled_requires_confirmation(self) -> Self:
+        if self.enabled and self.confirmation.status is not ConfirmationStatus.CONFIRMED:
+            raise ValueError(
+                "cpu_power を有効にするには、導入先での確認と所有者の承認を "
+                "confirmed の basis 付きで記録する"
+            )
+        return self
+
+
 class InternalTelemetryConfig(_ConfigModel):
     """collector 全体の設定。既定値をコードに持たない。"""
 
@@ -165,6 +196,7 @@ class InternalTelemetryConfig(_ConfigModel):
     nvml: NvmlConfig
     hwmon: HwmonConfig
     proc_stat: ProcStatConfig
+    cpu_power: CpuPowerConfig
 
     @model_validator(mode="after")
     def _interval_divides_a_minute(self) -> Self:
@@ -185,12 +217,22 @@ class InternalTelemetryConfig(_ConfigModel):
         return config
 
     def validate_units(self, catalog: MetricCatalog) -> None:
-        """hwmon の各 sensor について、metric の定義単位と measurement の単位を照合する。
+        """hwmon の各 sensor と cpu_power の、metric の定義単位と読み取りの単位を照合する。
 
         温度の label を ``fan.front.rpm`` に割り当てるような誤設定は、値が妥当な数値の
         まま別の意味で保存され、あとから見分けられない。無効な sensor も対象にする
         （有効化の時点で初めて気づくことを避ける）。
         """
+        cpu_power_unit = (
+            catalog.metrics[self.cpu_power.metric].unit
+            if self.cpu_power.metric in catalog.metrics
+            else None
+        )
+        if cpu_power_unit != CPU_POWER_UNIT:
+            raise ValueError(
+                f"{self.cpu_power.metric} の単位 {cpu_power_unit!r} が "
+                f"cpu_power の単位 {CPU_POWER_UNIT!r} と一致しない"
+            )
         for sensor in self.hwmon.sensors:
             unit = catalog.metrics[sensor.metric].unit if sensor.metric in catalog.metrics else None
             if unit is None:

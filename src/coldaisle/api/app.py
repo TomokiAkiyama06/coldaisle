@@ -79,6 +79,7 @@ from coldaisle.clock import Clock, WallClock
 from coldaisle.internal_telemetry import (
     SOURCE_STATE_PREFIX,
     TELEMETRY_KIND_KEY,
+    CpuPowerAdapter,
     InternalTelemetryConfig,
     NvmlAdapter,
     ProcStatAdapter,
@@ -268,6 +269,7 @@ def create_app(
     health_summarizer: HealthSummarizer | None = None,
     health_hwmon_metrics: tuple[str, ...] | None = None,
     health_nvml_metrics: tuple[str, ...] | None = None,
+    health_cpu_power_metrics: tuple[str, ...] | None = None,
 ) -> FastAPI:
     settings = config or Config.from_env()
     catalog = MetricCatalog.from_yaml(settings.metrics)
@@ -277,7 +279,11 @@ def create_app(
         catalog,
     )
     airflow_ui = AirflowUiSettings.from_yaml(settings.airflow_ui)
-    if health_hwmon_metrics is None or health_nvml_metrics is None:
+    if (
+        health_hwmon_metrics is None
+        or health_nvml_metrics is None
+        or health_cpu_power_metrics is None
+    ):
         internal_telemetry = InternalTelemetryConfig.from_yaml(
             settings.internal_telemetry, catalog=catalog
         )
@@ -290,6 +296,11 @@ def create_app(
         if health_nvml_metrics is None:
             # adapter を作るだけでは NVML を初期化しない（初回 poll まで遅延する）
             health_nvml_metrics = NvmlAdapter(internal_telemetry.nvml).expected_metrics
+        if health_cpu_power_metrics is None:
+            # 有効にした CPU 電力が欠けたら signal を下げる（0122 §2.3）。poll しない
+            health_cpu_power_metrics = CpuPowerAdapter(
+                internal_telemetry.cpu_power, clock=WallClock()
+            ).expected_metrics
     provider = StoreProvider(settings, clock or WallClock())
 
     @asynccontextmanager
@@ -340,6 +351,7 @@ def create_app(
             advisor=advisor,
             hwmon_metrics=health_hwmon_metrics,
             nvml_metrics=health_nvml_metrics,
+            cpu_power_metrics=health_cpu_power_metrics,
         )
 
     @app.get("/api/v1/latest", response_model=LatestResponse, response_model_by_alias=True)
