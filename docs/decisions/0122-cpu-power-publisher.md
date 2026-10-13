@@ -67,8 +67,12 @@
 
 ### 2.3 `coldaisle-telemetry` の adapter
 
-- `config/internal-telemetry.yaml` に `cpu_power:` 節（`path`・`stale_after_ms`・`metric: power.cpu.package`・`status` / `basis`）を足す。
-  既定は無効で、導入先で所有者の承認とともに有効にする（ほかの sensor と同じ）
+- `config/internal-telemetry.yaml` に `cpu_power:` 節を足す。欄はすべて必須で、コードに既定値を持たない:
+  `enabled`（運用で使うか）・`path`・`stale_after_ms`（> 0）・`max_future_skew_ms`（≥ 0）・`metric`（`power.cpu.package` に限り、
+  単位 W を照合）・`confirmation`（`status` / `basis`。hwmon の sensor と同じく、承認と運用の有効・無効を分ける）。
+  `enabled: true` には `confirmation.status: confirmed` を要する。リポジトリの値は `enabled: false`・`provisional` で、
+  導入先で所有者の承認とともに有効にする。rollup と Server Health は、どちらも adapter の `expected_metrics`（`enabled` のときだけ
+  metric を返す）から同じ集合を得る
 - 読めない・JSON が壊れている・`schema_version` が違う・`watts` が整数でない → `missing`。`ts_ms` が `stale_after_ms`（2500 の 2 倍の
   5000）より古い → `stale`。`ts_ms` が収集の時刻より `max_future_skew_ms`（1000）を超えて未来 → `missing`（時計の巻き戻しで
   止まった値を新しいまま扱い続けないため。欠けると健全度は `DEGRADED` に戻り安全側）。値は W のまま保存する
