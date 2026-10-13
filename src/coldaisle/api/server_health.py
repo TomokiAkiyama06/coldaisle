@@ -129,6 +129,7 @@ def build_server_health(
     advisor: ComputeModeAdvisor,
     hwmon_metrics: tuple[str, ...],
     nvml_metrics: tuple[str, ...],
+    cpu_power_metrics: tuple[str, ...] = (),
 ) -> ServerHealthResponse:
     """DB の同じ current view から REST / WS 共通 payload を作る。"""
     # payload 全体を DB の1時点から作る。文ごとに読むと、間に resolve や新しい
@@ -150,7 +151,9 @@ def build_server_health(
         # 無効化・撤去した入力の最後の行は store.latest() に残り続け、やがて stale になる。
         # 監視していない metric で signal を下げないよう、必須 metric と現在有効な入力だけを
         # 見る。パネルは表示専用で、入力が無効なら値が古くても signal に影響させない
-        monitored = settings.required_metrics() | frozenset((*hwmon_metrics, *nvml_metrics))
+        monitored = settings.required_metrics() | frozenset(
+            (*hwmon_metrics, *nvml_metrics, *cpu_power_metrics)
+        )
         signal = _signal(sources, readings, firing, settings.missing_tolerated, sorted(monitored))
         # advisory も同じスナップショットから作る。過去のフルロード実績は別の
         # 読み出しになるため、現在値と食い違う時点を混ぜない（決定記録 0042 §2.6）

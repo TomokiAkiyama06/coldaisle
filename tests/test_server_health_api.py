@@ -160,6 +160,7 @@ def _app(
     *,
     hwmon_metrics=("cpu.package",),
     nvml_metrics=NVML_METRICS,
+    cpu_power_metrics=(),
 ):
     return create_app(
         Config(
@@ -173,6 +174,7 @@ def _app(
         health_summarizer=summarizer,
         health_hwmon_metrics=hwmon_metrics,
         health_nvml_metrics=nvml_metrics,
+        health_cpu_power_metrics=cpu_power_metrics,
     )
 
 
@@ -181,6 +183,33 @@ def healthy_db(tmp_path, rules) -> Path:
     path = tmp_path / "server-health.db"
     _populate(path, rules)
     return path
+
+
+@pytest.mark.parametrize(
+    ("cpu_power_metrics", "expected"),
+    [(("power.cpu.package",), "yellow"), ((), "green")],
+)
+def test_cpu_power_lowers_the_signal_only_when_enabled(
+    tmp_path, rules, cpu_power_metrics, expected
+):
+    """有効にした CPU 電力が欠けたら green にしない。無効なら影響させない（決定記録 0122 §2.3）。"""
+    path = tmp_path / "server-health.db"
+    internals = {k: v for k, v in INTERNAL_VALUES.items() if k != "power.cpu.package"}
+    _populate(path, rules, internal_values=internals)
+    with SqliteStore(path, rules=rules, clock=SimulatedClock(NOW_MS)) as store:
+        store.insert_sample(
+            Sample(
+                ts_ms=NOW_MS,
+                readings=(
+                    Reading(metric="power.cpu.package", value=None, quality=Quality.MISSING),
+                ),
+            )
+        )
+    app = _app(path, SimulatedClock(NOW_MS), cpu_power_metrics=cpu_power_metrics)
+    with TestClient(app) as client:
+        body = client.get("/api/v1/server-health").json()
+
+    assert body["signal"] == expected
 
 
 def test_complete_template_payload_is_green_when_monitoring_sources_are_healthy(
