@@ -46,7 +46,7 @@ GPU 600 W だけの負荷でも 1 回行う。
 | 測るもの | 確定する値 | 合格の条件 |
 |---|---|---|
 | 負荷の開始から、Top の `safety_floor`（trace）が、その tick の前後 2.5 s の `cpu.package`（DB）の最大値から計算した温度の曲線の値より 0.05 以上高くなる最初の tick まで（温度の曲線では説明できず、power の曲線が効いたと分かる） | `cpu_power_cooling_floor` | 各試行で負荷の開始から 5 s 以内に現れる（専用サービスの 1 s 平均・収集の 2.5 s の周期・1 tick を最悪の位相で足した約 4.5 s に余裕を足す） |
-| 全スレッドの定常（約 200 W）での Top の `effective` | 同上 | 1.0。温度と排気の温度が中止の基準に近づかない |
+| 全スレッドの負荷の間で、温度の曲線の値（その tick の前後 2.5 s の `cpu.package` の最大値から計算）が `safety_floor` より 0.05 以上低い tick（power の曲線が決めている tick）の `safety_floor` と、同じ前後 2.5 s の `power.cpu.package` の範囲から計算した power の曲線の値の範囲 | 同上（100 W → 0.35・200 W → 1.0 の点） | そうした tick で `safety_floor` が power の曲線の値の範囲 ±0.03 に入り、その中に 195 W 以上の tick を含む（温度の floor や Fallback で 1.0 になった tick では曲線の上端を確かめたことにしない）。温度と排気の温度が中止の基準に近づかない |
 | GPU 600 W だけの負荷での `power.cpu.package` と Top の power の項 | 同上 | CPU Power が 100 W を超えず、power の floor が Top を上げない（GPU の負荷で誤って Top を全開にしない） |
 | 0121 の T1（soak）で power の floor が Top を決めた時間の割合と、そのときの CPU の使われ方 | 同上 | 値として記録し、所有者が音とのつり合いを判断する（合否にしない） |
 
@@ -65,7 +65,7 @@ fand の age の計時を通る）。
 
 | 測るもの | 確かめること | 合格の条件 |
 |---|---|---|
-| 専用サービスの最後の書き込み（ファイルの `ts_ms`）から、Top の reason に `cpu_power_unavailable` が出る tick まで | `cpu_power.stale_after_ms` 5000（収集の設定） | 5000 ms + 収集の周期 2500 ms + 1 tick 以内。fault は上がらず、Top は温度の floor と Fallback のまま |
+| 専用サービスの最後の書き込み（ファイルの `ts_ms`）から、Top の reason に `cpu_power_unavailable` が出る tick まで | `cpu_power.stale_after_ms` 5000（収集の設定） | 5000 ms 以上（早すぎても不合格）・5000 ms + 収集の周期 2500 ms + 1 tick 以内。fault は上がらず、Top は温度の floor と Fallback のまま |
 | その間の telemetry の健全度と Guard の閾値 | 健全度の連動 | 健全度が `DEGRADED`、Guard が degraded の閾値（`threshold_profile` が `conservative`）になる |
 | 戻した後 | 復帰 | 新しい sample を観測した tick から power の項が戻り、健全度が `NORMAL`（ほかの入力がそろっているとき）に戻る |
 
