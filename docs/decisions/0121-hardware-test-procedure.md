@@ -74,7 +74,7 @@ fand に制御させる。終了は `systemctl stop`。
 |---|---|---|
 | `duration_ms` の分布（p99.9・最大） | `tick_deadline_ms` 250 | 最大が 125 ms（期限の半分）未満 |
 | `deadline_exceeded` の数と連続の最長 | `overrun_consecutive_limit` 3 | 連続の最長が 1 以下。超過があれば理由を示す |
-| tick の周期の乱れ（`stats.skipped_slots`、`ts_ms` の間隔） | `tick_ms` 1000 | `skipped_slots` が 0、systemd の watchdog による再起動（`Watchdog timeout`）が 0、`ts_ms` の間隔の最大が 1500 ms 未満で p99.9 が 1100 ms 未満。MPC・Supervisor の期限との不変条件は設定の検証が通ること（`duration_ms` は heartbeat までしか測らないので、間隔と再起動で heartbeat の後の詰まりも捉える） |
+| tick の周期の乱れ（`stats.skipped_slots`、単調時計での間隔） | `tick_ms` 1000 | `skipped_slots` が 0、systemd の watchdog による再起動（`Watchdog timeout`）が 0、tick の間隔（`control tick` のログの journal の `__MONOTONIC_TIMESTAMP` の差。壁時計の `ts_ms` は時刻同期で飛ぶので使わない）の最大が 1500 ms 未満で p99.9 が 1100 ms 未満。MPC・Supervisor の期限との不変条件は設定の検証が通ること（`duration_ms` は heartbeat までしか測らないので、間隔と再起動で heartbeat の後の詰まりも捉える） |
 | `*_telemetry_stale` の数 | `telemetry.cpu_ms` / `gpu_ms` / `air_ms` / `cpu_power_ms` 5000 | 0 回（収集が止まった時間を除く）。`cpu_power_ms` は入力が無いので確定しない |
 | `write_failure` / `readback_mismatch` / `enable_reverted` の数と連続の最長 | `write_fail_emergency_after` 3（正常な側） | 0 回。あれば連続の最長が 2 以下 |
 | `tach_stall` の数 | `stall_window_ms` 5000（正常な側） | 0 回 |
