@@ -210,19 +210,22 @@ def test_config_rejects_invalid_values(tmp_path: Path, field: str, value: object
         CpuPowerConfig.model_validate(raw)
 
 
-def test_production_config_has_it_disabled_until_the_owner_approves() -> None:
+def test_production_config_is_enabled_only_with_owner_approval() -> None:
     config = InternalTelemetryConfig.from_yaml(
         CONFIG_DIR / "internal-telemetry.yaml",
         catalog=MetricCatalog.from_yaml(CONFIG_DIR / "metrics.yaml"),
     )
 
-    assert config.cpu_power.enabled is False
+    # 2026-10-14 に所有者が導入先での有効化を承認した（決定記録 0122）
+    assert config.cpu_power.enabled is True
+    assert config.cpu_power.confirmation.status is ConfirmationStatus.CONFIRMED
+    assert config.cpu_power.confirmation.basis is not None
+    assert "0122" in config.cpu_power.confirmation.basis
     assert config.cpu_power.path == Path("/run/coldaisle-power/cpu-package.json")
     assert config.cpu_power.stale_after_ms == 2 * config.interval_ms
     assert config.cpu_power.max_future_skew_ms == 1_000
-    assert config.cpu_power.confirmation.status is ConfirmationStatus.PROVISIONAL
-    # 無効のあいだはロールアップの期待サンプルにも入れない
-    assert METRIC not in periodic_metric_intervals(config)
+    # 有効なのでロールアップの期待サンプルに入る
+    assert periodic_metric_intervals(config)[METRIC] == config.interval_ms
 
 
 def test_enabled_config_registers_the_rollup_period() -> None:

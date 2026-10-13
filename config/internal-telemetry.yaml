@@ -25,13 +25,14 @@ proc_stat:
 # ts_ms が max_future_skew_ms を超えて未来（時計の巻き戻し）→ missing。
 # 有効にするのは導入先で unit を動かし、所有者が承認してから（confirmation を confirmed の basis 付きにする）。
 cpu_power:
-  enabled: false
+  enabled: true
   path: /run/coldaisle-power/cpu-package.json
   stale_after_ms: 5000
   max_future_skew_ms: 1000
   metric: power.cpu.package
   confirmation:
-    status: provisional
+    status: confirmed
+    basis: "2026-10-14 に導入先で coldaisle-cpu-power の値が RAPL の直接の読み取りと一致（アイドル 49/51 W・全スレッド 200/204 W）することを確認し、同日に所有者が有効化を承認（決定記録 0122）"
 
 hwmon:
   enabled: true
