@@ -146,6 +146,8 @@ Top を manual で 1.0 に固定し、Front / Rear を下げた。最後に3 zon
 | 写しを `0660`・グループ `coldaisle` に直して起動 | 60 s で 61 tick 動いた |
 | setgid | `/var/lib/coldaisle` は `drwxrws---` のまま。fand が作った `-wal` / `-shm` はグループ `coldaisle`・`0660` |
 
+**未完了:** 0121 §2.2 は fand を数分動かした後に setgid を見ることを求めるが、この試行は 60 s だった。移行して起動と setgid は、5 分動かしてやり直す。
+
 ### T2: 書き込みの失敗（2026-10-14 02:26〜02:28）
 
 アイドル（CPU 40 °C・GPU 29 °C・GPU 7 W）で、manual の全 zone 0.35 から注入した。
@@ -175,8 +177,32 @@ fand の auto で行った。時間は、最後の sample の DB の時刻の直
 
 - stale はほぼ毎回ちょうど 6000 ms に上がる。fand は 5000 ms を超えたら stale とし、tick は 1000 ms ごとなので、6 tick 後になる。
   trace の `ts_ms` は壁時計で ±1 ms 揺れるので 6001 ms も出る（0124）
-- 落ち着き: 収集の停止の後、CPU は約 20 s で 44 → 40 °C に戻り、tach は保持の間 1.0 で一定。取り込みの停止では、空気の温度と
+- 落ち着き: 収集の停止の後、CPU は約 20 s で 44 → 40 °C に戻り、tach は保持の間 1.0 で一定。空気の温度は停止の前後で変わらず（`air.top_exhaust` 26.88 → 26.38〜26.50 °C、`air.rear_exhaust` 25.50 → 25.12〜25.38 °C。再開から 40 s の間の揺れは 0.25 °C 以内）。取り込みの停止では、空気の温度と
   Front / Rear の tach はすぐ一定になった。CPU の温度は、試験の前から別のプロセス（別のセッションのテスト。CPU 約 40%・
   CPU Power 約 40 W）で 45〜59 °C の間を揺れており、0124 §2.3 のとおり合否に使わない
 - `cpu_power_unavailable` は、どの tick の Top の reason にも出なかった。収集を止めると CPU の温度と電力が同じ tick で古くなり、
   Top が `zone_fault_max` になって safety floor の reason が trace に出ないため
+
+### T6: stall（2026-10-14 02:56〜03:03）
+
+試験専用の設定（0121 §2.8）を `/etc/coldaisle/control-config-test-<名前>/` に置き、unit の drop-in で `--config-dir` だけを差し替えた。
+対象でない2つの zone は manual で 1.0。試験の後に drop-in と設定を消し、`ExecStart` が本番の `--config-dir` に戻ったことを確かめた。
+
+**立ち上がり**（PWM を書いた時刻から。合格の条件は [0125](decisions/0125-stall-rise-criterion-tach-update.md)）
+
+| zone | 3 回 | 最長 + tach の更新の周期 1600 ms | 判定 |
+|---|---|---|---|
+| Top（450 RPM 以上） | 2246 / 2136 / 2688 ms | 4288 ms < 5000 | 合格 |
+| Front（300 RPM 以上） | 1121 / 1457 / 1008 ms | 3057 ms < 5000 | 合格 |
+| Rear | 0.0 の間の最低 439 / 439 / 442 RPM（> 350）。0.35 の 90% まで 3696 / 2915 / 2685 ms（記録だけ） | — | 合格 |
+
+- `fanN_input` は約 1576 ms ごとにしか値が変わらない（3 zone とも）。立ち上がりの時間はこの刻みでしか見えない（0125）
+- 立ち上がりの試験の間に fault は出なかった。Top の Guard の floor は起動直後の数 tick だけで、0.0 で止めるのを妨げなかった
+
+**検出**（本番の設定のうち、対象の `stall_min_rpm` だけを Top 1200・Front 900・Rear 1000 にした設定。manual 0.35）
+
+| zone | 計時の開始（`tach_unconfirmed_zones` に初めて出た tick）から `tach_stall` まで | その後 |
+|---|---|---|
+| Top | 5000 ms | `EMERGENCY`。3 zone とも `emergency_max` |
+| Front | 6000 ms | Front が `zone_fault_max`、ほかは `fan_fault_demand` 1.0（`DEGRADED`） |
+| Rear | 5001 ms | Rear が `zone_fault_max`、ほかは `fan_fault_demand` 1.0（`DEGRADED`） |
