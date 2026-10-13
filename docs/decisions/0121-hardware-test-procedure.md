@@ -120,27 +120,34 @@ GPU 300 W の一定の負荷で温度が落ち着いた後、`ctl max` を 2 分
 
 ### 2.7 T5: watchdog（0119 §5 の 5 (d)）
 
-負荷を4段階（アイドル・GPU 300 W・GPU 600 W・CPU の全スレッド）にし、それぞれ fand の auto で温度が落ち着いた後に、
-fand を `SIGSTOP` で止める。止める時刻は `control tick` のログが出た直後を起点に 0 / 300 / 600 ms 遅らせた3つの位相とし、
-各段階の最長を使う。Max（`pwmN_enable=0`）を確かめたら `systemctl stop` で戻す。
+開始の状態は2種類にする。止める時刻はどちらも `control tick` のログが出た直後を起点に 0 / 300 / 600 ms 遅らせた3つの位相とし、
+各条件の最長を使う。Max（`pwmN_enable=0`）を確かめたら負荷を止め、`systemctl stop` で戻す。
 
-開始の状態は、到達しうる「温度が高く Demand が低い」組を掃引するものとして、この4段階にする。Top の Demand が最も低いのは
-CPU 60 °C 以下（floor 0.35）だが、Fallback は全 zone に最大を当てるので、GPU の負荷では Top も上がる。段階ごとの Demand と
-温度を記録して、どの段階が最悪かを示す。Fallback と floor の上げる分は、止めている間は効かない（書き込みが止まるため）。
+- **(i) 負荷の立ち上がり（最悪の候補）**: アイドルで fand の auto の Demand が低く落ち着いた状態から、GPU 600 W の負荷を始め、
+  始めた直後の tick の後に `SIGSTOP` する。CPU の全スレッドでも同じことを行う。Fan はアイドルの Demand のまま固まり、
+  熱だけが上がる。到達しうる「温度が上がっていくのに Demand が低い」組のうち、最も悪いのはこの状態である
+  （負荷の始まりから数秒でチップの温度が大きく上がる。0119 §2.12 の 16 s で +31 °C / +23 °C）
+- **(ii) 定常**: 負荷を4段階（アイドル・GPU 300 W・GPU 600 W・CPU の全スレッド）にし、fand の auto で温度が落ち着いた後に止める。
+  Fallback と floor が Demand を上げた後の状態で、(i) と比べて開始の温度が高い側を押さえる
+
+条件ごとの Demand と温度を記録して、どれが最悪かを示す。Fallback と floor の上げる分は、止めている間は効かない（書き込みが止まるため）。
 
 | 測るもの | 確定する値 | 合格の条件 |
 |---|---|---|
 | `SIGSTOP` から Max まで | `watchdog_timeout_ms` 5000（unit の `WatchdogSec` と `TimeoutAbortSec` を含む） | 約 11 s（0119 §2.12）以内 |
-| その間と Max の後 30 s の温度の上昇 | 同上 | どの段階でも、開始の温度 + 上昇が上限（`absolute_temp_ceiling_c` 90 °C、T_SENSOR 80 °C）より 5 °C 以上低い |
+| その間と Max の後 30 s の温度の上昇 | 同上 | (i) と (ii) のどの条件でも、開始の温度 + 上昇が上限（`absolute_temp_ceiling_c` 90 °C、T_SENSOR 80 °C）より 5 °C 以上低い |
 
 ### 2.8 T6: stall（0119 §5 の 5 (b)）
 
 最低安全 Demand 0.35 の下は制御の経路の中で作れないので、所有者が承認した**試験専用の設定**を使う。対象の zone
-（Top・Front。Rear は PWM 0 でも止まらない）を1つずつ、アイドルのときに、ほかの zone を manual で 1.0 にして行う。
+（Top・Front・Rear）を1つずつ、アイドルのときに、ほかの zone を manual で 1.0 にして行う。`stall_window_ms` は3 zone で共通なので、
+3 zone すべての結果で確定する。
 
 - **立ち上がり**: 対象の zone だけ `zone_min_demand` / `stall_check_min_demand` / `fan-hardware.yaml` の `minimum_stable_demand`
   を 0.0 に、`stall_window_ms` を 60000 にした設定で、manual で 0.0 にして Fan が止まるのを待ち（30 s 以内）、
-  manual で 0.35 にする。0.35 にしてから `fanN_input` が `stall_min_rpm` に届くまでの時間を測る。3 回行う
+  manual で 0.35 にする。0.35 にしてから `fanN_input` が `stall_min_rpm` に届くまでの時間を測る。3 回行う。
+  Rear は PWM 0 でも止まらない（約 440〜450 RPM）ので、同じ設定で manual 0.0 の間の最低の回転数が `stall_min_rpm`（350）より
+  高いままであることと、0.0 から 0.35 にして 0.35 の回転数の 90% に届くまでの時間を測る
 - **検出**: 本番と同じ設定のうち、対象の zone の `stall_min_rpm` だけを、Demand 0.35 の回転数より高く全開の回転数より低い値
   （Top 1200、Front 900）にした設定で、manual で 0.35 にする。`tach_stall` が上がり、Top は `EMERGENCY`、Front は自分が Max・
   ほかが 1.0 になることを見る（検出の側は閾値を上げるので安全側）
@@ -148,6 +155,7 @@ CPU 60 °C 以下（floor 0.35）だが、Fallback は全 zone に最大を当�
 | 測るもの | 確定する値 | 合格の条件 |
 |---|---|---|
 | 止まった状態から `stall_min_rpm` まで | `stall_window_ms` 5000 | 3 回の最長が 2500 ms（窓の半分）未満 |
+| Rear の manual 0.0 の間の最低の回転数と、0.35 の 90% までの時間 | 同上 | 最低が 350 RPM より高く、時間が 2500 ms 未満 |
 | 0.35 にしてから `tach_stall` まで | 同上 | 5000 ms + 1 tick 以内 |
 
 ### 2.9 T7: 高温での BIOS との比較
