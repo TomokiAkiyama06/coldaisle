@@ -132,3 +132,51 @@ Top を manual で 1.0 に固定し、Front / Rear を下げた。最後に3 zon
 - **アイドルでの自動制御は BIOS より Fan が速い。** auto の間の平均の PWM は Top 173・Front / Rear 156（CPU の平均 55 °C）で、
   直前と直後の BIOS の制御は約 100（CPU 42〜46 °C）だった。CPU の温度の跳ねで Fallback が上がって
   ヒステリシスと保持（10 s）で残ることと、Top の Guard の floor 0.7 が重なる。`enable` の前に所有者が判断する材料
+
+## 0121 の試験の結果
+
+決定記録 [0121](decisions/0121-hardware-test-procedure.md) の手順で行った試験の結果（§2.10）。順序は T0 → T2 → T3 → T6 → T4 → T5 → T7 → T1。
+値の `status` を `confirmed` にするのは、すべてそろってから所有者の承認を得て行う。
+
+### T0: 0080 段階 5 の残り（2026-10-14 01:56）
+
+| 確認 | 結果 |
+|---|---|
+| `0640` の DB の写しで起動 | `db_not_writable`・終了コード 5 で、制御を取らずに止まった。ログに、fand の補助グループに `coldaisle` があっても `0640` では書けないことが出る |
+| 写しを `0660`・グループ `coldaisle` に直して起動 | 60 s で 61 tick 動いた |
+| setgid | `/var/lib/coldaisle` は `drwxrws---` のまま。fand が作った `-wal` / `-shm` はグループ `coldaisle`・`0660` |
+
+### T2: 書き込みの失敗（2026-10-14 02:26〜02:28）
+
+アイドル（CPU 40 °C・GPU 29 °C・GPU 7 W）で、manual の全 zone 0.35 から注入した。
+
+| 試験 | 結果 |
+|---|---|
+| Front に `pwm6_enable=5` | `enable_reverted` で `DEGRADED`（Front 以外は `fault_demand` 1.0）が 2 回、3 回目の評価で `EMERGENCY`。最初の失敗から `failing_ms` 5001 で終了コード 7。引き継ぎの実行部が3 zone に Max を書いた（`applied`）。再起動で takeover し、終了コード 7 は繰り返さない |
+| 一時的な失敗（Front に `5`、1.2 s 後に `1`） | 失敗は 1 tick。次の tick で書き込みと読み戻しが成功した。`EMERGENCY` にも終了にもならない。fault は `fault_clear_hold_ms` の 30 s 保持の間 `DEGRADED`（3 zone 1.0）で残り、その後 `normal` |
+| Top に `pwm2_enable=5` | 1 回目の評価で `EMERGENCY`。`failing_ms` 5001 で終了コード 7、引き継ぎで Max、再起動 |
+
+気づいたこと:
+
+- 注入から終了までの約 5 s、注入した Fan は BIOS の値（約 0.38）で回り、fand の出力（0.35）より遅くはならなかった（0121 §2.4 の想定どおり）
+- Max の間、`pwmN_enable` は `0` と読める。この driver は manual の 255 を `0` と読み返す（0118 §2.6）
+- 終了コード 7 のたびに `監査書き込みスレッドが時間内に止まらなかった`（error）が出る。異常終了の経路は待たずに閉じる作りなので毎回出る。監査の内容は構造化ログに残る
+
+### T3: データの遅れと復帰（2026-10-14 02:38〜02:46）
+
+fand の auto で行った。時間は、最後の sample の DB の時刻の直後の tick（fand が初めて観測した tick）から数えた。
+判定には [0124](decisions/0124-trace-wall-clock-tolerance.md) の許容（trace の壁時計の ±50 ms）を使う。
+
+| 試験 | stale まで | その間 | fault が消えるまで |
+|---|---|---|---|
+| `coldaisle-telemetry` を 30 s 停止 | 6000 ms（`cpu_telemetry_stale`・`gpu_telemetry_stale`・`t_sensor_stale`） | Top は `zone_fault_max`、Front / Rear は `critical_telemetry_fault_demand` 1.0 | 30001 ms。途中で出入りしない |
+| `coldaisle-daemon` を 30 s 停止 | 6000 ms（`air_telemetry_stale`） | Front / Rear だけ 1.0。Top は自分の制御のまま（0.40〜0.59） | 31000 ms |
+| 同上のやり直し | 6001 ms | 同上（Top は最大 0.59） | 30001 ms |
+
+- stale はほぼ毎回ちょうど 6000 ms に上がる。fand は 5000 ms を超えたら stale とし、tick は 1000 ms ごとなので、6 tick 後になる。
+  trace の `ts_ms` は壁時計で ±1 ms 揺れるので 6001 ms も出る（0124）
+- 落ち着き: 収集の停止の後、CPU は約 20 s で 44 → 40 °C に戻り、tach は保持の間 1.0 で一定。取り込みの停止では、空気の温度と
+  Front / Rear の tach はすぐ一定になった。CPU の温度は、試験の前から別のプロセス（別のセッションのテスト。CPU 約 40%・
+  CPU Power 約 40 W）で 45〜59 °C の間を揺れており、0124 §2.3 のとおり合否に使わない
+- `cpu_power_unavailable` は、どの tick の Top の reason にも出なかった。収集を止めると CPU の温度と電力が同じ tick で古くなり、
+  Top が `zone_fault_max` になって safety floor の reason が trace に出ないため
