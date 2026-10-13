@@ -68,12 +68,15 @@ Rear 743 / Front 690 RPM で、上表と整合する。
 `pwmN_enable` が `0` と読める。`5` を書けば BIOS の曲線へ戻る。詳細と、これに合わせた Max の書き方は
 決定記録 [0118](decisions/0118-hwmon-backend-label-less-headers.md) §2.3 / §2.4 / §2.6。
 
-## fand の実機確認（2026-10-13）
+## fand の実機の予備確認（2026-10-13）
 
 決定記録 [0080](decisions/0080-fand-systemd-unit.md) §2.10 の段階 5 と、[0028](decisions/0028-fan-control-contracts.md) §2.9 の
-承認点 3 を [0119](decisions/0119-safety-values-first-host.md) §2.11 のとおり Top から行った。設定は 0119 と
-[0120](decisions/0120-fan-hardware-first-host.md) の値。fand の unit は `enable` していない。
-ここの時間は1回ずつの観察で、0119 §2.13 の値を `confirmed` にする試験（0119 §5 の 5）ではない。
+承認点 3 の確認項目を、[0119](decisions/0119-safety-values-first-host.md) §2.11 のとおり Top から、続けて Front / Rear で
+行った。設定は 0119 と [0120](decisions/0120-fan-hardware-first-host.md) の値。fand の unit は `enable` していない。
+
+**これは承認点 3 の完了ではない。** 0119 §2.13 / §5 の 5 は、承認点 3 の前に試験の手順を別の決定記録で設計し
+所有者の承認を得ることを求めるが、その記録はまだ無い。ここの結果はその前の予備確認で、時間は1回ずつの観察である。
+承認点 3 と `enable` は、その記録の承認と、記録の手順による確認の後に行う。
 
 ### 段階 5（simulated backend・本番 DB の写し）
 
@@ -87,7 +90,7 @@ Rear 743 / Front 690 RPM で、上表と整合する。
 
 simulated は引き継ぎ記録を書かないので、実行部は毎回 `record_found:false` で何も書かない（想定どおり）。
 
-### 承認点 3（`--backend hwmon`・Top から）
+### 承認点 3 の確認項目（`--backend hwmon`・Top から）
 
 Front / Rear は管理ソケットの manual で 1.0 に固定し、Top だけを下げた。
 
@@ -109,5 +112,21 @@ Front / Rear は管理ソケットの manual で 1.0 に固定し、Top だけ�
 - **SIGABRT のとき apport が core を受ける。** unit の `LimitCORE=0` でも `kernel.core_pattern` が apport への pipe なので、
   `code=dumped` になり `/var/crash` に約 13 MB の報告が残る。実行部の開始の遅れは 0.06〜0.83 s で、0119 §2.12 の
   最悪時間（`TimeoutAbortSec` 5 s を含む約 11 s）の内側（0080 §5 の 3）
-- Front / Rear を下げる確認は、これから別に行う（0119 §2.11。センサー基板は 2026-10-13 に接続済み）。Max を書くことと BIOS への返却は、
-  上の操作で3 zone とも確かめた
+
+### Front / Rear（同日、センサー基板の接続後）
+
+Top を manual で 1.0 に固定し、Front / Rear を下げた。最後に3 zone を自動制御（Fallback）に任せた。
+
+| 操作 | 結果 |
+|---|---|
+| manual Front / Rear 0.5 | `pwm6` / `pwm5` = 128。Front 約 905・Rear 約 940 RPM（0120 の表は 890 / 938） |
+| manual Front / Rear 0.35 | 128 → 89。Front 約 630・Rear 約 670 RPM |
+| manual Front / Rear 0.2 | 0.35（89）で止まる |
+| auto（約 100 s） | `active_controller` は `fallback`、`faults` は空、`safety_state` は `normal` のまま（`AIR_TELEMETRY_STALE` は出ない） |
+| `systemctl stop` | 3 zone を `enable=5` へ戻し、引き継ぎ記録を消した |
+
+`kill -STOP` / `kill -KILL` で Max を書くことと BIOS への返却は、上の Top の確認で3 zone とも確かめた。
+
+- **アイドルでの自動制御は BIOS より Fan が速い。** auto の間の平均の PWM は Top 173・Front / Rear 156（CPU の平均 55 °C）で、
+  直前と直後の BIOS の制御は約 100（CPU 42〜46 °C）だった。CPU の温度の跳ねで Fallback が上がって
+  ヒステリシスと保持（10 s）で残ることと、Top の Guard の floor 0.7 が重なる。`enable` の前に所有者が判断する材料
