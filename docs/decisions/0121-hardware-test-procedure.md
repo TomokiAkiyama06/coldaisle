@@ -4,6 +4,7 @@
 - **Status**: FINAL（2026-10-14、リポジトリ所有者の承認）
 - **Date**: 2026-10-13
 - **Supersedes**: なし（0119 §5 未決 5 を閉じる）
+- **Superseded by**: §2.5 T3 と §2.8 T6 の時間の条件の境界の読み方（trace の壁時計の ±50 ms）と、T3 の落ち着きの判定は [`0124`](0124-trace-wall-clock-tolerance.md)
 - **関連**: [`0028`](0028-fan-control-contracts.md) §2.6〜§2.9 /
   [`0080`](0080-fand-systemd-unit.md) §2.3 / §2.6 / §2.10 /
   [`0118`](0118-hwmon-backend-label-less-headers.md) /
