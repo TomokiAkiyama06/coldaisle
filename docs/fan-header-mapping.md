@@ -67,3 +67,47 @@ Rear 743 / Front 690 RPM で、上表と整合する。
 自動制御（`5`）の間は `pwmN` へ書けない（`EBUSY`）。`0` を書くとすぐ全速になり、manual で `pwmN=255` のときは
 `pwmN_enable` が `0` と読める。`5` を書けば BIOS の曲線へ戻る。詳細と、これに合わせた Max の書き方は
 決定記録 [0118](decisions/0118-hwmon-backend-label-less-headers.md) §2.3 / §2.4 / §2.6。
+
+## fand の実機確認（2026-10-13）
+
+決定記録 [0080](decisions/0080-fand-systemd-unit.md) §2.10 の段階 5 と、[0028](decisions/0028-fan-control-contracts.md) §2.9 の
+承認点 3 を [0119](decisions/0119-safety-values-first-host.md) §2.11 のとおり Top から行った。設定は 0119 と
+[0120](decisions/0120-fan-hardware-first-host.md) の値。fand の unit は `enable` していない。
+ここの時間は1回ずつの観察で、0119 §2.13 の値を `confirmed` にする試験（0119 §5 の 5）ではない。
+
+### 段階 5（simulated backend・本番 DB の写し）
+
+| 操作 | 結果 |
+|---|---|
+| 起動 | `READY` が届き、watchdog（5 s）への heartbeat が始まる |
+| `kill -STOP` | 5.05 s で watchdog が切れ SIGABRT。そこから引き継ぎ実行部の完了まで 0.86 s（apport が core を受ける。下記） |
+| `kill -KILL` | 終了から引き継ぎ実行部の完了まで 44 ms。`RestartSec` の 2 s 後に再起動 |
+| `systemctl stop` | 0.6 s で停止。引き継ぎ実行部が走る |
+| 再起動の連続 | 毎回 `ExecStopPost` が走り、`/run/coldaisle` は残る |
+
+simulated は引き継ぎ記録を書かないので、実行部は毎回 `record_found:false` で何も書かない（想定どおり）。
+
+### 承認点 3（`--backend hwmon`・Top から）
+
+Front / Rear は管理ソケットの manual で 1.0 に固定し、Top だけを下げた。
+
+| 操作 | 結果 |
+|---|---|
+| 起動 | STARTUP の 5 s は全 zone Max。その後 takeover で `pwmN_enable=1` |
+| manual Top 0.5 | Top `pwm2=128`・約 1350 RPM（0120 の表は 1376） |
+| manual Top 0.35 | Top `pwm2=89`・約 920 RPM |
+| manual Top 0.2 | 0.35（`pwm2=89`）で止まる。最低安全 Demand が効く |
+| `kill -STOP` | 最後の heartbeat から 5.0 s で SIGABRT、その 0.1 s 後に実行部が3 zone に Max を書いた（`record_found:true`、3 zone とも `applied`）。Top は `pwm2=89` から全速 |
+| 再起動 | 前回の記録の元の値（3 zone とも `enable=5`）を引き継ぐ。STARTUP の後は Fallback が全 zone に同じ値を当て、毎秒 0.05 ずつ下げた |
+| `kill -KILL` | 終了から 51 ms で実行部が3 zone に Max を書いた |
+| `systemctl stop` | 3 zone を `enable=5`（BIOS の曲線）へ戻し、引き継ぎ記録を消した |
+
+気づいたこと:
+
+- **Reactive Guard がアイドルでもよく発火する。** CPU の温度が小さな処理（管理ソケットの CLI の起動など）で数秒に 10 °C 以上跳ね、
+  `cpu_temperature_rise` で Top に floor 0.7 が入る。解除まで 30〜60 s。安全側の動きだが、運用では Top が 0.7 にいる時間が長くなりうる
+- **SIGABRT のとき apport が core を受ける。** unit の `LimitCORE=0` でも `kernel.core_pattern` が apport への pipe なので、
+  `code=dumped` になり `/var/crash` に約 13 MB の報告が残る。実行部の開始の遅れは 0.06〜0.83 s で、0119 §2.12 の
+  最悪時間（`TimeoutAbortSec` 5 s を含む約 11 s）の内側（0080 §5 の 3）
+- Front / Rear を下げる確認は、これから別に行う（0119 §2.11。センサー基板は 2026-10-13 に接続済み）。Max を書くことと BIOS への返却は、
+  上の操作で3 zone とも確かめた
