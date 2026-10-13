@@ -1,7 +1,7 @@
 # 決定記録 0121: `provisional` の Safety の値を確定する実機の試験の手順（0119 §5 の 5）
 
 - **種別**: Decision Record
-- **Status**: Proposed（所有者の承認待ち）
+- **Status**: FINAL（2026-10-14、リポジトリ所有者の承認）
 - **Date**: 2026-10-13
 - **Supersedes**: なし（0119 §5 未決 5 を閉じる）
 - **関連**: [`0028`](0028-fan-control-contracts.md) §2.6〜§2.9 /
