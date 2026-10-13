@@ -45,7 +45,7 @@ GPU 600 W だけの負荷でも 1 回行う。
 
 | 測るもの | 確定する値 | 合格の条件 |
 |---|---|---|
-| 負荷の開始から、Top の `safety_floor`（trace）が、その tick の前後 2.5 s の `cpu.package`（DB）の最大値から計算した温度の曲線の値より 0.05 以上高くなる最初の tick まで（温度の曲線では説明できず、power の曲線が効いたと分かる） | `cpu_power_cooling_floor` | 各試行で負荷の開始から 3 s 以内に現れる（電力の収集の 1 s 平均と 2.5 s の周期と 1 tick を足した上限） |
+| 負荷の開始から、Top の `safety_floor`（trace）が、その tick の前後 2.5 s の `cpu.package`（DB）の最大値から計算した温度の曲線の値より 0.05 以上高くなる最初の tick まで（温度の曲線では説明できず、power の曲線が効いたと分かる） | `cpu_power_cooling_floor` | 各試行で負荷の開始から 5 s 以内に現れる（専用サービスの 1 s 平均・収集の 2.5 s の周期・1 tick を最悪の位相で足した約 4.5 s に余裕を足す） |
 | 全スレッドの定常（約 200 W）での Top の `effective` | 同上 | 1.0。温度と排気の温度が中止の基準に近づかない |
 | GPU 600 W だけの負荷での `power.cpu.package` と Top の power の項 | 同上 | CPU Power が 100 W を超えず、power の floor が Top を上げない（GPU の負荷で誤って Top を全開にしない） |
 | 0121 の T1（soak）で power の floor が Top を決めた時間の割合と、そのときの CPU の使われ方 | 同上 | 値として記録し、所有者が音とのつり合いを判断する（合否にしない） |
@@ -57,9 +57,11 @@ fand の age の計時を通る）。
 
 | 測るもの | 確定する値 | 合格の条件 |
 |---|---|---|
-| fand が最後の新しい CPU Power の sample を初めて観測した tick から、Top の reason に `cpu_power_unavailable` が出る tick まで | `telemetry.cpu_power_ms` 5000 | 5000 ms 以上・5000 ms + 1 tick 以内（早すぎても不合格）。CPU Power について fault は上がらない（同時に上がる `cpu_telemetry_stale` / `gpu_telemetry_stale` は T3 のとおり） |
+| DB に残った最後の `power.cpu.package` の行の時刻から、Top の reason に `cpu_power_unavailable` が出る tick まで（fand がその行を初めて観測した tick は記録に残らず、行の時刻から最大 1 tick 遅れる） | `telemetry.cpu_power_ms` 5000 | 5000 ms 以上・5000 ms + 2 tick 以内（観測の遅れの 1 tick を含める。早すぎても不合格）。CPU Power について fault は上がらない（同時に上がる `cpu_telemetry_stale` / `gpu_telemetry_stale` は T3 のとおり） |
 
-**(b) 収集の側の判定**: fand が auto で動いている間に、`coldaisle-cpu-power` だけを 30 s 止めて戻す。
+**(b) 収集の側の判定**: fand が auto で動いている間に、`coldaisle-cpu-power` を `systemctl kill -s SIGSTOP` で 30 s 一時停止し、
+`SIGCONT` で戻す（`systemctl stop` は unit の `RuntimeDirectory` を消し、ファイルが無いと adapter は `stale_after_ms` を待たずに
+`missing` にするため。一時停止ならファイルは最後の内容のまま残り、更新だけが止まる）。
 
 | 測るもの | 確かめること | 合格の条件 |
 |---|---|---|
