@@ -28,8 +28,11 @@
   入力の重要度は `DEGRADED` なので、telemetry の健全度が `DEGRADED` になり、Reactive Guard は degraded の閾値を使う
 - 入力があれば健全度は `NORMAL` になりうる（ほかの非 advisory の入力がそろっているとき）
 - Top の floor の reason は、温度と電力のどちらの曲線が決めても同じ `cpu_cooling_floor` で、どちらかは trace に出ない（大きい方を取る）。
-  そこで T8 は、trace の Top の `safety_floor` を、同じ tick の入力（DB の `cpu.package` と `power.cpu.package` の、その tick に
-  fand が観測した sample）から計算した2つの曲線の値と突き合わせ、どちらが決めたかを求める
+  trace は tick が使った入力の値も持たず、DB の時刻からその tick が観測した sample を 1 tick の精度で決めることもできない。
+  そこで T8 は、温度の曲線では説明できない `safety_floor` が現れたことで power の曲線が効いたと判定する（§2.1）
+- CPU Power の収集の側にも古さの判定がある（`internal-telemetry.yaml` の `cpu_power.stale_after_ms` 5000）。専用サービスだけを
+  止めると、収集は 2.5 s ごとに行を書き続け、ファイルが古くなると adapter が `stale` で書き、fand はそれを見てすぐ power の項を外す。
+  この場合は fand の側の `telemetry.cpu_power_ms` の計時を通らない。fand の計時を測るには、行そのものを止める（`coldaisle-telemetry` を止める）
 
 ## 2. Decision
 
@@ -42,20 +45,27 @@ GPU 600 W だけの負荷でも 1 回行う。
 
 | 測るもの | 確定する値 | 合格の条件 |
 |---|---|---|
-| 負荷の開始から、power の曲線が Top の `safety_floor` を決めた最初の tick と、温度の曲線が同じ値に届いた tick（下記の突き合わせ） | `cpu_power_cooling_floor` | power の曲線が温度の曲線より先に Top を上げる（各試行で 1 tick 以上早い）。`safety_floor` が電力の sample の変化から 1 tick 以内に追う |
+| 負荷の開始から、Top の `safety_floor`（trace）が、その tick の前後 2.5 s の `cpu.package`（DB）の最大値から計算した温度の曲線の値より 0.05 以上高くなる最初の tick まで（温度の曲線では説明できず、power の曲線が効いたと分かる） | `cpu_power_cooling_floor` | 各試行で負荷の開始から 3 s 以内に現れる（電力の収集の 1 s 平均と 2.5 s の周期と 1 tick を足した上限） |
 | 全スレッドの定常（約 200 W）での Top の `effective` | 同上 | 1.0。温度と排気の温度が中止の基準に近づかない |
 | GPU 600 W だけの負荷での `power.cpu.package` と Top の power の項 | 同上 | CPU Power が 100 W を超えず、power の floor が Top を上げない（GPU の負荷で誤って Top を全開にしない） |
 | 0121 の T1（soak）で power の floor が Top を決めた時間の割合と、そのときの CPU の使われ方 | 同上 | 値として記録し、所有者が音とのつり合いを判断する（合否にしない） |
 
-### 2.2 T9: `telemetry.cpu_power_ms`
+### 2.2 T9: `telemetry.cpu_power_ms` と収集の側の古さの判定
 
-fand が auto で動いている間に、`coldaisle-cpu-power` を 30 s 止めて戻す。
+**(a) fand の計時（`telemetry.cpu_power_ms`）**: 0121 の T3 で `coldaisle-telemetry` を止めるときに、あわせて測る（行そのものが止まるので
+fand の age の計時を通る）。
 
 | 測るもの | 確定する値 | 合格の条件 |
 |---|---|---|
-| fand が最後の新しい CPU Power の sample を初めて観測した tick から、Top の reason に `cpu_power_unavailable` が出る tick まで | `telemetry.cpu_power_ms` 5000 | 5000 ms 以上・5000 ms + 1 tick 以内（早すぎても不合格）。fault は上がらず、Top は温度の floor と Fallback のまま |
-| その間の telemetry の健全度と Guard の閾値 | 同上 | 健全度が `DEGRADED`、Guard が degraded の閾値（`threshold_profile` が `conservative`）になる |
-| 戻した後 | 同上 | 新しい sample を観測した tick から power の項が戻り、健全度が `NORMAL`（ほかの入力がそろっているとき）に戻る |
+| fand が最後の新しい CPU Power の sample を初めて観測した tick から、Top の reason に `cpu_power_unavailable` が出る tick まで | `telemetry.cpu_power_ms` 5000 | 5000 ms 以上・5000 ms + 1 tick 以内（早すぎても不合格）。CPU Power について fault は上がらない（同時に上がる `cpu_telemetry_stale` / `gpu_telemetry_stale` は T3 のとおり） |
+
+**(b) 収集の側の判定**: fand が auto で動いている間に、`coldaisle-cpu-power` だけを 30 s 止めて戻す。
+
+| 測るもの | 確かめること | 合格の条件 |
+|---|---|---|
+| 専用サービスの最後の書き込み（ファイルの `ts_ms`）から、Top の reason に `cpu_power_unavailable` が出る tick まで | `cpu_power.stale_after_ms` 5000（収集の設定） | 5000 ms + 収集の周期 2500 ms + 1 tick 以内。fault は上がらず、Top は温度の floor と Fallback のまま |
+| その間の telemetry の健全度と Guard の閾値 | 健全度の連動 | 健全度が `DEGRADED`、Guard が degraded の閾値（`threshold_profile` が `conservative`）になる |
+| 戻した後 | 復帰 | 新しい sample を観測した tick から power の項が戻り、健全度が `NORMAL`（ほかの入力がそろっているとき）に戻る |
 
 ### 2.3 0121 の T1（soak）への追加
 
@@ -64,7 +74,7 @@ fand が auto で動いている間に、`coldaisle-cpu-power` を 30 s 止め�
 
 ### 2.4 順序
 
-T8 と T9 は 0121 の T7 の後、T1 の前に行う。順序は T0 → T2 → T3 → T6 → T4 → T5 → T7 → T8 → T9 → T1 になる。
+T8 と T9 (b) は 0121 の T7 の後、T1 の前に行う。T9 (a) は T3 の中で行う。順序は T0 → T2 → T3 → T6 → T4 → T5 → T7 → T8 → T9 → T1 になる。
 
 ## 3. Consequences
 

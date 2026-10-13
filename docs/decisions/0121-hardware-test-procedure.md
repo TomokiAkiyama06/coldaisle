@@ -4,6 +4,7 @@
 - **Status**: FINAL（2026-10-14、リポジトリ所有者の承認）
 - **Date**: 2026-10-13
 - **Supersedes**: なし（0119 §5 未決 5 を閉じる）
+- **Superseded by**: §2.3 の `*_telemetry_stale` の行のうち `cpu_power_ms` を確定しないとした部分と、§3 の同じ趣旨の項は [`0123`](0123-cpu-power-floor-tests.md)
 - **関連**: [`0028`](0028-fan-control-contracts.md) §2.6〜§2.9 /
   [`0080`](0080-fand-systemd-unit.md) §2.3 / §2.6 / §2.10 /
   [`0118`](0118-hwmon-backend-label-less-headers.md) /
