@@ -269,6 +269,7 @@ src/coldaisle/
   local_socket.py # レイヤ横断: Unix ソケット入口に共通の門（SO_PEERCRED・権限・起動時の検査）。0045 / 0072 §2.5
   authority_cli.py # 合成の起点: `coldaisle-authority raise` / `rollback`。`raise_stage()` を呼ぶ唯一の場所。**どこからも import しない**。#92 / 決定記録 0086
   rollup_job.py # 合成の起点: `coldaisle-rollup` の入口（周期メトリクスを Store へ渡す）。#65
+  cpu_power_publisher.py # root の `coldaisle-cpu-power`: RAPL の CPU Package 電力を 1 s 平均・1 W で `/run` へ書く。**標準ライブラリだけ・coldaisle を import しない**（`python3 -I -S`）。#278 / 決定記録 0122
   calibration_log.py # 合成の起点の部品: 較正の変更の記録（取り込みの起動時の lock と追記・運転中の時刻の下限・Dataset v2 と学習の入口の検査）。書き手は取り込みだけ。#233 / 決定記録 0099
   control_daemon.py # 合成の起点: Fan制御デーモン。**hwmonへ書くのはこのプロセスだけ**。#74
   store/      # L1: SQLite、ロールアップ、CSVエクスポート

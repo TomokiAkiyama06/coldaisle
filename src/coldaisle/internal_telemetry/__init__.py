@@ -1,10 +1,14 @@
-"""NVML / hwmon Internal Telemetry の読み取り専用実装。#65"""
+"""Internal Telemetry（NVML / hwmon / /proc/stat / CPU Package 電力）の読み取り専用実装。
+
+#65 / #278
+"""
 
 from coldaisle.internal_telemetry.collector import CollectionCycle, InternalTelemetryCollector
 from coldaisle.internal_telemetry.config import (
     CONNECTOR_TEMPERATURE_METRIC,
     ConfirmationEvidence,
     ConfirmationStatus,
+    CpuPowerConfig,
     HwmonConfig,
     HwmonMeasurement,
     HwmonSensorConfig,
@@ -12,6 +16,7 @@ from coldaisle.internal_telemetry.config import (
     NvmlConfig,
     ProcStatConfig,
 )
+from coldaisle.internal_telemetry.cpu_power import CPU_POWER_SCHEMA_VERSION, CpuPowerAdapter
 from coldaisle.internal_telemetry.hwmon import HwmonAdapter
 from coldaisle.internal_telemetry.models import (
     SOURCE_STATE_PREFIX,
@@ -37,6 +42,7 @@ from coldaisle.internal_telemetry.proc_stat import (
 
 __all__ = [
     "CONNECTOR_TEMPERATURE_METRIC",
+    "CPU_POWER_SCHEMA_VERSION",
     "CPU_UTILIZATION_METRIC",
     "SOURCE_STATE_PREFIX",
     "TELEMETRY_KIND_KEY",
@@ -46,6 +52,8 @@ __all__ = [
     "CollectionCycle",
     "ConfirmationEvidence",
     "ConfirmationStatus",
+    "CpuPowerAdapter",
+    "CpuPowerConfig",
     "CpuTimes",
     "HwmonAdapter",
     "HwmonConfig",

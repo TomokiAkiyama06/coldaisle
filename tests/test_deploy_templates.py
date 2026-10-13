@@ -10,6 +10,7 @@
 6. authority の journal を承認者のグループと共有する専用のディレクトリ
    （決定記録 0086 §2.2。段階 3c）
 7. Learned worker の unit と `tmpfiles.d`、fand の Learned・較正の引数（決定記録 0115。0077 段階 6）
+8. CPU Package の電力を root で渡す `coldaisle-cpu-power`（決定記録 0122 §2.2）
 """
 
 import re
@@ -46,6 +47,9 @@ AUTHORITY_GROUP = "coldaisle-authority"
 
 WORKERS = {"mpc": "coldaisle-learnd-mpc", "supervisor": "coldaisle-learnd-supervisor"}
 """Learned worker の unit（決定記録 0115 §2.1）。`--role` の値 → unit の名前。"""
+
+CPU_POWER = "coldaisle-cpu-power"
+"""RAPL の電力を root・capability なしで渡すサービス（決定記録 0122）。DB を開かない。"""
 
 DB_UNITS = (*SERVICES, *JOBS)
 """`StateDirectory=coldaisle` を持ち、`/var/lib/coldaisle` の mode を決める unit（0080 §2.1）。"""
@@ -97,7 +101,9 @@ def unit_files() -> list[Path]:
 
 def test_the_expected_units_exist():
     names = {path.name for path in unit_files()}
-    expected = {f"{name}.service" for name in (*SERVICES, *JOBS, FAND, *WORKERS.values())}
+    expected = {
+        f"{name}.service" for name in (*SERVICES, *JOBS, FAND, CPU_POWER, *WORKERS.values())
+    }
     expected |= {f"{name}.timer" for name in JOBS}
     assert names == expected
 
@@ -751,3 +757,105 @@ def test_fand_drives_the_hwmon_backend_explicitly():
     # 既定は simulated のまま（開発機で引数を付け忘れて実機の Fan に書かない）
     assert build_parser().parse_args([]).backend == "simulated"
     assert build_parser().parse_args(exec_start[1:]).backend == "hwmon"
+
+
+# ---------------------------------------------------------------- CPU Package の電力（0122）
+
+
+def cpu_power() -> dict[str, dict[str, list[str]]]:
+    return parse_unit(SYSTEMD / f"{CPU_POWER}.service")
+
+
+def test_cpu_power_runs_as_root_without_any_capability():
+    """uid 0 で `energy_uj`（0400 root）を読むだけ。capability は持たない（0122 §2.2）。"""
+    service = cpu_power()["Service"]
+    assert service["User"] == ["root"]
+    # 出力のグループは Group= で付く。coldaisle-telemetry の Group= と同じ（読み手）
+    assert (
+        service["Group"] == parse_unit(SYSTEMD / "coldaisle-telemetry.service")["Service"]["Group"]
+    )
+    assert service["Group"] == ["coldaisle"]
+    assert service["CapabilityBoundingSet"] == [""]
+    assert service["AmbientCapabilities"] == [""]
+    assert "SupplementaryGroups" not in service
+
+
+def test_cpu_power_is_sandboxed_and_can_write_only_its_runtime_directory():
+    service = cpu_power()["Service"]
+    for key, value in {
+        "NoNewPrivileges": "yes",
+        "ProtectSystem": "strict",
+        "ProtectHome": "yes",
+        "PrivateTmp": "yes",
+        "PrivateNetwork": "yes",
+        "RestrictAddressFamilies": "AF_UNIX",
+        "ProtectKernelModules": "yes",
+        "ProtectControlGroups": "yes",
+        "LockPersonality": "yes",
+        "RestrictRealtime": "yes",
+        "SystemCallArchitectures": "native",
+        "ProtectClock": "yes",
+        "ProtectHostname": "yes",
+    }.items():
+        assert service.get(key) == [value], key
+    assert "ReadWritePaths" not in service
+    assert "StateDirectory" not in service
+    assert service["RuntimeDirectory"] == ["coldaisle-power"]
+    assert service["RuntimeDirectoryMode"] == ["0750"]
+
+
+def test_cpu_power_writes_into_its_runtime_directory():
+    """`--output` は RuntimeDirectory の下で、telemetry の設定が読む path と同じ（0122 §2.3）。"""
+    unit = cpu_power()
+    command = one(unit, "Service", "ExecStart").split()
+    output = Path(command[command.index("--output") + 1])
+    assert output.parent == Path("/run") / one(unit, "Service", "RuntimeDirectory")
+    telemetry = yaml.safe_load((ROOT / "config" / "internal-telemetry.yaml").read_text("utf-8"))
+    assert Path(telemetry["cpu_power"]["path"]) == output
+
+
+def test_cpu_power_runs_the_source_file_with_the_system_python():
+    """venv と `coldaisle` パッケージに依存しない（0122 §2.1。引き継ぎ実行部と同じ形）。"""
+    command = one(cpu_power(), "Service", "ExecStart").split()
+    assert command[0] == "/usr/bin/python3"
+    assert command[1:3] == ["-I", "-S"]
+    source = command[3]
+    assert source.startswith("/opt/coldaisle/")
+    assert (ROOT / source.removeprefix("/opt/coldaisle/")).is_file()
+    assert source.endswith("/coldaisle/cpu_power_publisher.py")
+    # 値は 0122 のとおりに unit が渡す（コードに既定値を持たない）
+    arguments = dict(zip(command[4::2], command[5::2], strict=True))
+    assert arguments == {
+        "--powercap-root": "/sys/class/powercap",
+        "--output": "/run/coldaisle-power/cpu-package.json",
+        "--interval-ms": "1000",
+        "--startup-wait-ms": "60000",
+        "--min-watts": "0",
+        "--max-watts": "1000",
+    }
+
+
+def test_cpu_power_does_not_restart_when_the_zone_is_missing():
+    unit = cpu_power()
+    # RAPL の driver を module で読み込む導入先で、先に起動しない（0122 §2.2）
+    assert "systemd-modules-load.service" in words(unit, "Unit", "After")
+    assert one(unit, "Service", "Restart") == "always"
+    assert one(unit, "Service", "RestartSec") == "2"
+    assert words(unit, "Service", "RestartPreventExitStatus") == ["2"]
+    assert one(unit, "Unit", "StartLimitIntervalSec") == "0"
+    assert one(unit, "Install", "WantedBy") == "multi-user.target"
+    assert one(unit, "Service", "StandardError") == "journal"
+
+
+def test_telemetry_wants_cpu_power_without_depending_on_it():
+    """無くても止まっても telemetry は止まらない（0122 §2.2）。"""
+    unit = parse_unit(SYSTEMD / "coldaisle-telemetry.service")
+    for key in ("Requires", "BindsTo", "PartOf", "Requisite"):
+        assert key not in unit["Unit"], f"{key}= を使わない"
+    assert f"{CPU_POWER}.service" in words(unit, "Unit", "Wants")
+    assert f"{CPU_POWER}.service" in words(unit, "Unit", "After")
+
+
+def test_the_deploy_guide_places_and_enables_cpu_power():
+    guide = (ROOT / "docs" / "ubuntu-deploy.md").read_text(encoding="utf-8")
+    assert f"sudo systemctl enable --now {CPU_POWER}.service" in guide

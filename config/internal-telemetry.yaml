@@ -19,6 +19,20 @@ proc_stat:
   enabled: true
   path: /proc/stat
 
+# CPU Package の消費電力（power.cpu.package。決定記録 0122）。
+# RAPL の energy_uj は root だけが読めるため、root の coldaisle-cpu-power.service が 1 s 平均・1 W 単位で
+# 書いた JSON を読む。読めない・形が違う → missing、ts_ms が stale_after_ms（周期 2500 の2倍）より古い → stale、
+# ts_ms が max_future_skew_ms を超えて未来（時計の巻き戻し）→ missing。
+# 有効にするのは導入先で unit を動かし、所有者が承認してから（confirmation を confirmed の basis 付きにする）。
+cpu_power:
+  enabled: false
+  path: /run/coldaisle-power/cpu-package.json
+  stale_after_ms: 5000
+  max_future_skew_ms: 1000
+  metric: power.cpu.package
+  confirmation:
+    status: provisional
+
 hwmon:
   enabled: true
   root: /sys/class/hwmon

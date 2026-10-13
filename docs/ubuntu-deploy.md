@@ -14,6 +14,7 @@
 | `deploy/systemd/coldaisle-daemon.service` | 取り込みデーモン（シリアル）。`Restart=always` |
 | `deploy/systemd/coldaisle-api.service` | 読み取り API とダッシュボード（`127.0.0.1:8000`）。`Restart=always` |
 | `deploy/systemd/coldaisle-telemetry.service` | Internal Telemetry（NVML / hwmon / `/proc/stat`）。`Restart=always`。基板が無くても動く（決定記録 [`0117`](decisions/0117-telemetry-unit.md)） |
+| `deploy/systemd/coldaisle-cpu-power.service` | CPU Package の電力（RAPL）を root で読み、1 s 平均・1 W 単位で渡す（4.1。決定記録 0122） |
 | `deploy/systemd/coldaisle-rollup.service` / `.timer` | ロールアップと保持期間の適用。毎日 03:00 |
 | `deploy/systemd/coldaisle-report.service` / `.timer` | 前日の日次レポート。毎朝 08:05（ロールアップのあと） |
 | `deploy/udev/99-coldaisle-sensors.rules` | センサー基板に `/dev/server-sensors` の固定名を付ける |
@@ -220,6 +221,30 @@ sudo systemctl start coldaisle-rollup.timer coldaisle-report.timer
 - 手順を守らずに移行前の制御デーモンが動き続けた場合でも、trace は黙って欠けません。
   `control_traces` は `seq` の無い INSERT を trigger で拒否するので、制御ループのログに
   trace の保存失敗として出ます。気付いたら制御デーモンを再起動してください
+
+### 4.1 CPU Package の電力（coldaisle-cpu-power。決定記録 0122）
+
+RAPL の `energy_uj` は root だけが読めます（PLATYPUS の対策）。読む権限は広げず、root・capability なしの
+小さなサービスが 1 s の平均を 1 W に丸めた値だけを `/run/coldaisle-power/cpu-package.json`（グループ
+`coldaisle` だけが読める `0640`）に書きます。標準ライブラリだけのソースをシステムの `/usr/bin/python3 -I -S`
+で動かすので、venv に依存しません。Fan には書きません。
+
+```bash
+sudo cp /opt/coldaisle/deploy/systemd/coldaisle-cpu-power.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now coldaisle-cpu-power.service
+# 1 s ごとに更新され、グループが coldaisle・0640 であることを見る
+sudo ls -l /run/coldaisle-power/ && sudo cat /run/coldaisle-power/cpu-package.json
+```
+
+- 起動時は `name` が `package-0` の powercap zone がちょうど1つ見つかるまで 1 s ごとに探し直します（driver の読み込みを待つ）。
+  60 s 待っても見つからなければ何も書かずに終了コード 2 で止まり、再起動しません
+  （`journalctl -u coldaisle-cpu-power` に `cpu_power_zone_not_unique`）。見つかった後に読めなくなったら 1 で終わり、再起動します
+- `coldaisle-telemetry` は `Wants=` / `After=` だけで参照します。このサービスが無くても止まっても telemetry は止まりません
+- **値を DB に入れるのは、所有者の承認の後です。** 導入先の `config/internal-telemetry.yaml` の `cpu_power` を
+  `enabled: true` にし、`confirmation` を `status: confirmed` と `basis`（確認した日と承認）にしてから
+  `sudo systemctl restart coldaisle-telemetry` します（既定は無効。confirmed でないと起動時に拒否されます）。
+  有効にすると fand の telemetry の健全度と CPU Power の cooling floor が変わります（0122 §2.4）
 
 ## 5. Mac からのデータ移行
 

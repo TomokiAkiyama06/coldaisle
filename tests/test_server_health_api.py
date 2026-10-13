@@ -368,6 +368,14 @@ nvml:
 proc_stat:
   enabled: false
   path: /proc/stat
+cpu_power:
+  enabled: false
+  path: /run/coldaisle-power/cpu-package.json
+  stale_after_ms: 5000
+  max_future_skew_ms: 1000
+  metric: power.cpu.package
+  confirmation:
+    status: provisional
 hwmon:
   enabled: true
   root: /sys/class/hwmon
@@ -641,6 +649,14 @@ nvml:
 proc_stat:
   enabled: false
   path: /proc/stat
+cpu_power:
+  enabled: false
+  path: /run/coldaisle-power/cpu-package.json
+  stale_after_ms: 5000
+  max_future_skew_ms: 1000
+  metric: power.cpu.package
+  confirmation:
+    status: provisional
 hwmon:
   enabled: true
   root: /sys/class/hwmon
