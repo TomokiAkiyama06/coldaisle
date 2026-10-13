@@ -43,7 +43,8 @@
 
 - **制御の経路を迂回しない**（0119 §5 の 5 (a)）。Demand は fand の自動制御か管理ソケットの manual / max / auto で決め、
   Guard と Critical Safety を通す。sysfs へ人が書くのは、§2.4 の故障の注入の `pwmN_enable=5`（その Fan を BIOS の
-  自動制御へ戻す）だけとし、§2.4 の条件で BIOS の出力が fand の出力を下回らないときに限る
+  自動制御へ戻す）と、§2.4 の一時的な失敗の試験で書き戻す `pwmN_enable=1`（fand が takeover の後に保つ状態へ戻す。
+  所有者が試験の間に限って承認、2026-10-14）だけとし、§2.4 の条件で BIOS の出力が fand の出力を下回らないときに限る
 - **試験専用の設定**は §2.8 の stall の試験だけで使う。`/etc/coldaisle/control-config-test-<名前>/` に4ファイルを置き、
   unit の drop-in で `--config-dir` を差し替える。試験の後に drop-in と設定を消し、unit の `ExecStart` が元に戻ったことを確かめる
 - **所有者が現地にいて**、各試験の開始と終了を行う。操作のスクリプトは事前に内容を示し、所有者が実行する
