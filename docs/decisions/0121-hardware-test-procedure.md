@@ -103,8 +103,8 @@ fand が auto で動いている間に、`coldaisle-telemetry` を 30 s 止め�
 
 | 測るもの | 確定する値 | 合格の条件 |
 |---|---|---|
-| 最後に届いた新しい sample（DB に残った最後の行の時刻）から `cpu_telemetry_stale` / `gpu_telemetry_stale` まで（`coldaisle-telemetry` を止める） | `telemetry.cpu_ms` / `gpu_ms` 5000 | 5000 ms 以上・5000 ms + 1 tick（+ 書き込みの遅れ）以内に上がり（早すぎても不合格）、Top が Max・Front / Rear が `fault_demand` 1.0 になる |
-| 最後に届いた新しい air の sample から `air_telemetry_stale` まで（`coldaisle-daemon` を止める） | `telemetry.air_ms` 5000 | 5000 ms 以上・5000 ms + 1 tick（+ 書き込みの遅れ）以内に上がり（早すぎても不合格）、Front / Rear だけが `fault_demand` 1.0 になる。Top は自分の floor と Fallback のまま（Max にならない） |
+| fand が最後の新しい sample を初めて観測した tick（その sample の DB の時刻の直後の tick。fand の age はここから数える）から `cpu_telemetry_stale` / `gpu_telemetry_stale` まで（`coldaisle-telemetry` を止める） | `telemetry.cpu_ms` / `gpu_ms` 5000 | 5000 ms 以上・5000 ms + 1 tick 以内に上がり（早すぎても不合格）、Top が Max・Front / Rear が `fault_demand` 1.0 になる |
+| fand が最後の新しい air の sample を初めて観測した tick から `air_telemetry_stale` まで（`coldaisle-daemon` を止める） | `telemetry.air_ms` 5000 | 5000 ms 以上・5000 ms + 1 tick 以内に上がり（早すぎても不合格）、Front / Rear だけが `fault_demand` 1.0 になる。Top は自分の floor と Fallback のまま（Max にならない） |
 | 新しい sample が届いて stale の状態が観測されなくなった最初の tick から、fault が消えるまで（サービスを戻した時刻からではない。起動と最初の書き込みの遅れを混ぜない） | `fault_clear_hold_ms` 30000 | 30 s（+ 1 tick 以内）保持してから消え、その間と後に fault が出入りしない |
 | 戻した後に温度と tach が落ち着く時間 | 同上 | 30 s より短い |
 
@@ -164,7 +164,7 @@ GPU 300 W の一定の負荷で温度が落ち着いた後、`ctl max` を 2 分
 |---|---|---|
 | 止まった状態から `stall_min_rpm` まで | `stall_window_ms` 5000 | 3 回の最長が 2500 ms（窓の半分）未満 |
 | Rear の manual 0.0 の間の最低の回転数と、0.35 の 90% までの時間 | 同上 | 最低が 350 RPM より高く、時間が 2500 ms 未満 |
-| 0.35 にしてから `tach_stall` まで | 同上 | 5000 ms + 1 tick 以内 |
+| stall の計時が始まった最初の tick（`effective` が `stall_check_min_demand` 以上で RPM が `stall_min_rpm` 未満になり、trace の `tach_unconfirmed_zones` にその zone が初めて出た tick。指示の時刻ではない）から `tach_stall` まで | 同上 | 5000 ms 以上・5000 ms + 1 tick 以内（早すぎても不合格） |
 
 ### 2.9 T7: 高温での BIOS との比較
 
