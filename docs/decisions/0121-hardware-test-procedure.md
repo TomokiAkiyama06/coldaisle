@@ -117,7 +117,7 @@ auto のままでは Fallback が 0.40 以上を求めて 0.35 まで下がら�
 
 | 測るもの | 確定する値 | 合格の条件 |
 |---|---|---|
-| Max から 0.35 へ下げ終えるまでと、0.35 に届いた後 60 s の温度 | `ramp_down_per_s` 0.05 | trace の単調時刻と `effective` から求めた下降率が全区間で 0.05/s 以下（+ 1 tick の丸め）で、Max から 0.35 に届く直前までの各 tick の `bound_by` が `ramp_down` であること（0.35 に届いた tick は `safety_floor` でよい。即座に下がったら不合格）。どの温度も、下げる前の定常より 3 °C 以上上がらず、上がりは 2500 ms の収集周期で捉えられ、中止の基準に近づかない |
+| Max から 0.35 へ下げ終えるまでと、0.35 に届いた後 60 s の温度 | `ramp_down_per_s` 0.05 | 各 tick の `effective`（trace）を同じ `tick_id` の `control tick` のログの journal の `__MONOTONIC_TIMESTAMP` に対応付けて求めた下降率（trace の `ts_ms` は壁時計なので使わない）が全区間で 0.05/s 以下（+ 1 tick の丸め）で、Max から 0.35 に届く直前までの各 tick の `bound_by` が `ramp_down` であること（0.35 に届いた tick は `safety_floor` でよい。即座に下がったら不合格）。どの温度も、下げる前の定常より 3 °C 以上上がらず、上がりは 2500 ms の収集周期で捉えられ、中止の基準に近づかない |
 | takeover から tach がその Demand の最終の回転数の ±5% に入るまでと、温度の落ち着き | `startup_settle_ms` 5000 | 5000 ms より短い |
 
 ### 2.7 T5: watchdog（0119 §5 の 5 (d)）
@@ -179,7 +179,7 @@ CPU の全スレッドを 10 分。
 
 | 測るもの | 合格の条件 |
 |---|---|
-| `cpu.package` / `gpu.0.core` / `board.connector_12v2x6` / `air.*_exhaust` の最高と、最後の 2 分の平均 | 吸気との差の2回の平均で、fand の最高が BIOS の最高より 3 °C を超えて高くならず、中止の基準に届かない |
+| `cpu.package` / `gpu.0.core` / `board.connector_12v2x6` / `air.*_exhaust` の最高と、最後の 2 分の平均 | 吸気との差の2回の平均で、fand の最高と最後の 2 分の平均が、どちらも BIOS の同じ値より 3 °C を超えて高くならず、中止の基準に届かない |
 | GPU の throttle の flag | fand でだけ立つことがない |
 
 条件を満たさなければ、0119 §2.14 の曲線を強める案を別の決定記録で出す。この比較は値の確定ではなく、`enable` の判断の材料とする。
