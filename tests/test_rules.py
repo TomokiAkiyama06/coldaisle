@@ -591,6 +591,73 @@ def test_firing_and_resolution_reach_the_notifier(tmp_path):
     assert fired[0].dashboard_url
 
 
+@pytest.mark.slow
+def test_notify_check_scenario_reaches_each_target_once(tmp_path):
+    """#51: `notify_check` で LINE（critical）と Slack（warning）の両方へ、
+    発火と解除が1回ずつ届く。
+
+    所有者が実物の Webhook / トークンで到達を確かめる手順（docs/notifications.md）の
+    入力なので、**このシナリオで両方の経路が鳴ること**と**連投しないこと**を固定する。
+    外部サービスへは出ない。宛先を差し替えて確かめる。
+    """
+    from coldaisle.daemon import Config, build
+    from coldaisle.notify import Notification, NotifyConfig, Router
+    from conftest import CALIBRATION_PATH, SCENARIOS_PATH
+
+    received: dict[str, list[Notification]] = {"line": [], "slack": [], "stdout": []}
+
+    class Recorder:
+        def __init__(self, name: str) -> None:
+            self.name = name
+
+        def send(self, notification: Notification) -> None:
+            received[self.name].append(notification)
+
+    daemon = build(
+        Config(
+            source="mock",
+            scenario="notify_check",
+            speed=60.0,
+            db=tmp_path / "notify_check.db",
+            scenarios=SCENARIOS_PATH,
+            quality_rules=QUALITY_RULES_PATH,
+            calibration=CALIBRATION_PATH,
+            rules=RULES_PATH,
+            metrics=METRICS_PATH,
+            notify=CONFIG_DIR / "notify.yaml",
+            tick_s=0.05,
+        )
+    )
+    # 夜間の抑制（決定記録 0001 D-04）に掛からないよう、昼の固定時刻で判定させる
+    daemon._notifier = Router(
+        config=NotifyConfig.from_yaml(CONFIG_DIR / "notify.yaml"),
+        notifiers={name: Recorder(name) for name in received},
+        clock=SimulatedClock(1_787_626_800_000),  # 2026-08-25T12:00:00+09:00
+    )
+    try:
+        daemon.run()
+    finally:
+        daemon.store.close()
+
+    def transitions(name: str) -> list[tuple[str, str, str]]:
+        return [
+            (item.rule_id, item.severity.value, item.state)
+            for item in received[name]
+            if item.state in ("firing", "resolved")
+        ]
+
+    assert transitions("line") == [
+        ("RAPID_RISE", "critical", "firing"),
+        ("RAPID_RISE", "critical", "resolved"),
+    ]
+    assert transitions("slack") == [
+        ("INTAKE_HIGH", "warning", "firing"),
+        ("INTAKE_HIGH", "warning", "resolved"),
+    ]
+    # 手順書（docs/notifications.md §3）が終了時のログで見る数
+    assert daemon.stats.notifications == 4
+
+
 def test_resolution_keeps_its_severity(engine, store):
     """**解除したあとに重大度を引かない。**
 
