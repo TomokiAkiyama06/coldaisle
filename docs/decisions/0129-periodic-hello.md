@@ -1,7 +1,7 @@
 # 決定記録 0129: `hello` を起動時と 60 s ごとに出し、取り込みは同じ内容の `hello` を記録し直さない
 
 - **種別**: Decision Record
-- **Status**: Proposed（所有者の承認待ち）
+- **Status**: Proposed（2026-10-14 にリポジトリ所有者が承認。レビューの後に FINAL）
 - **Date**: 2026-10-14
 - **Supersedes**: [`0022`](0022-firmware-v1.md) §2.8（`hello` を読み手が繋がった瞬間に出し直す）と §4 の却下した代替案のうち
   「`hello` を周期的に出し直す」の行 / [`0003`](0003-device-json-schema.md) §2.2 の表の `hello` の行のうち「電源投入時に1回」
