@@ -62,11 +62,18 @@ GPU の熱は主に GPU 自身の Fan で冷える。600 W の負荷が続く間
 
 - **中身**: `src/coldaisle/gpu_fan_curve.py`。0122 と同じく**標準ライブラリだけ**を使い、`coldaisle` パッケージを import しない。
   NVML は `ctypes` で `libnvidia-ml.so.1` を開いて使う（pynvml に依存しない）。システムの `/usr/bin/python3 -I -S <ファイル>` で動かす
-- **対象**: NVML の device がちょうど 1 つのときだけ制御する（知らない構成の GPU に書かない）。
+- **対象**: NVML の device がちょうど 1 つで、その型番が曲線を確かめた GPU のときだけ制御する（知らない構成の GPU に書かない）。
   起動時は、device がちょうど 1 つになるまで 1 s ごとに探し直し、60 s（引数）を過ぎたら何も書かずに終わる。
   終了コードは、最後に見た数が 2 個以上なら 2（人が構成を直すまで変わらない。unit は再起動しない）、
   0 個（NVML が初期化できないときを含む）なら 1（driver の読み込みが遅い・読み込み直しの途中。unit が 2 s 後に起動し直し、
   また 60 s 待つ。GPU が現れたら、人の操作なしに曲線へ戻る）
+- **型番の検査**: device がちょうど 1 つになったら、最初の書き込みの前に `nvmlDeviceGetName` の名前を、unit が渡す必須の引数
+  `--gpu-name` と完全一致で比べる。違えば何も書かずに終了コード 2（GPU を交換した・別の機械に入れた。人が曲線を確かめ直して
+  決定記録と unit を直すまで変わらない）。曲線と「既定の制御より下げない」（2.3）は、この型番の既定の制御と熱の振る舞いで
+  確かめたもので、ほかの型番には当てはまらない。値は型番の名前（`NVIDIA RTX PRO 6000 Blackwell Workstation Edition`）で、
+  同じ型番に共通の値である。シリアル番号・UUID・PCI の bus id など個体を識別する値は使わない（AGENTS.md ルール 10）。
+  driver の更新で名前の表記が変わったときも、書かずに止まる（安全側。GPU 自身の既定の制御のまま）。
+  `--restore-default` は型番を見ない（既定の制御へ戻すのは、どの GPU でも安全側のため）
 - **周期**: 1000 ms ごと（単調時計）に GPU コアの温度（`nvmlDeviceGetTemperature`）を読み、曲線から目標の回転（%）を求める。
   各 Fan の目標（`nvmlDeviceGetTargetFanSpeed`）が求めた値と違えば `nvmlDeviceSetFanSpeed_v2` で書く。
   driver が自動に戻したときも、次の周期で書き直す
@@ -106,10 +113,18 @@ GPU の熱は主に GPU 自身の Fan で冷える。600 W の負荷が続く間
 | driver の読み込み直し・GPU のリセット | NVML が自動に戻す。サービスはエラーで終わり、起動し直して曲線を書き直す |
 
 hang の検出に `WatchdogSec=5s` を使う（`sd_notify` は `socket` で `NOTIFY_SOCKET` に送る。標準ライブラリだけで書ける）。
+systemd の watchdog は起動の完了（`READY=1`）の後にだけ効く。そのため `READY=1` は、型番の検査と Fan の範囲の読み取りが
+済んだ後、**最初の書き込みの前**に送る。最初の周期で 1 つ目の Fan に書いた後に NVML が止まっても、`TimeoutStartSec=` の
+90 s ではなく watchdog の上限で戻す。起動時に device を待つ間（まだ何も書いていない）は `TimeoutStartSec=` が上限になる。
 watchdog の SIGABRT で終わらないとき（`kill -STOP` で止まったまま、など）、systemd は `TimeoutAbortSec=` を待ってから SIGKILL し、
 その後で `ExecStopPost=` を走らせる。既定の 90 s では、低い回転の 600 W で 80 °C に届く約 80 s（Context）より長い。
-そこで unit に `TimeoutAbortSec=2s` と `TimeoutStopSec=5s` を書き、hang から既定の制御へ戻すまでを、おおむね
-5 s（watchdog）+ 2 s（abort）+ `ExecStopPost=` の時間に抑える（2.7 の 1 で、`kill -STOP` から自動に戻るまでの時間を確かめる）。
+そこで unit に `TimeoutAbortSec=2s` と `TimeoutStopSec=3s` を書き、hang から `ExecStopPost=` が終わる（または打ち切られる）までを
+**10 s 以内**（watchdog 5 s + abort 2 s + `ExecStopPost=` の上限 3 s）に抑える。`TimeoutStopSec=` は `ExecStopPost=` の
+上限も兼ねる（導入先で、SIGTERM の後の終了と `ExecStopPost=` はどちらも 35〜170 ms だった）。
+`ExecStopPost=` 自身が止まったとき（NVML が応答しない）は 3 s で打ち切られ、Fan は最後に書いた手動の回転のまま残りうる。
+その後 `Restart=always` で 2 s 後に起動し直し、NVML が応えれば曲線を書き直し、応えなければ同じ上限で戻しを試み続ける。
+NVML が応えない間は、このサービスに Fan を戻す手段は無く、GPU 自身の温度の保護（93 / 95 / 98 °C）と fand の Fallback に委ねる
+（2.7 の 1 で、`kill -STOP` から自動に戻るまでの時間と、戻しの処理が止まったときの打ち切りを確かめる）。
 落ちたときに 100 % へ固定するのではなく自動に戻すのは、自動は GPU 自身が守る状態で、今の運用と同じだからである。
 自動のままだと 600 W の定常では 80 °C を超えうるが、GPU は自分の上限で守り、fand の Fallback が筐体の Fan を上げる。
 
@@ -118,14 +133,22 @@ watchdog の SIGABRT で終わらないとき（`kill -STOP` で止まったま�
 - `User=root`・`CapabilityBoundingSet=CAP_SYS_ADMIN`・`AmbientCapabilities=` なし。NVML の Fan の書き込みと自動への戻しは、
   uid 0 でも `CAP_SYS_ADMIN` が無いと `NVML_ERROR_NO_PERMISSION` で拒まれる（2026-10-14 に導入先の `systemd-run` で確かめた。
   capability なしでは読み取りだけ通り、`CAP_SYS_ADMIN` だけで書き込みと戻しが通った）。`CAP_SYS_ADMIN` は広い権限なので、
-  下の sandbox と device の制限で、使える先を NVIDIA の device だけに絞る
+  下の sandbox と device の制限で、使える先を NVIDIA の device だけに絞る。`CAP_SYS_ADMIN` を持つプロセスは、mount で
+  `ProtectSystem=` などのファイルシステムの保護を外し、`/proc/sys`・`/sys` のカーネルの設定を書き換えうる（`ProtectSystem=strict` は
+  `/dev`・`/proc`・`/sys` を含まない）。そのため mount の系統の system call を拒み、カーネルの設定・ログ・namespace の作成も閉じる（下の sandbox）
 - device: `DevicePolicy=closed`・`DeviceAllow=/dev/nvidiactl rw`・`DeviceAllow=/dev/nvidia0 rw`。この2つだけで、読み取り・書き込み・
   戻しのすべてが通った（`/dev/nvidia-uvm`・`/dev/nvidia-caps/*` は要らない）
 - sandbox は 0122 に合わせる: `NoNewPrivileges=yes`・`ProtectSystem=strict`・`ProtectHome=yes`・`PrivateTmp=yes`・
   `PrivateNetwork=yes`・`RestrictAddressFamilies=AF_UNIX`・`ProtectKernelModules=yes`・`ProtectControlGroups=yes`・
   `LockPersonality=yes`・`RestrictRealtime=yes`・`SystemCallArchitectures=native`・`ProtectClock=yes`・`ProtectHostname=yes`
-- `Type=notify`・`WatchdogSec=5s`・`TimeoutAbortSec=2s`・`TimeoutStopSec=5s`・`Restart=always`・`RestartSec=2`・
-  `RestartPreventExitStatus=2`（2 は引数の不正・device が 2 個以上・NVML の library が無いときだけ。device が 0 個は 1 で再起動する）
+- `CAP_SYS_ADMIN` を持つので、0122 に加えて次を書く: `ProtectKernelTunables=yes`（`/proc/sys`・`/sys` などを読み取りだけにする）・
+  `ProtectKernelLogs=yes`・`RestrictNamespaces=yes`（namespace を作って保護の外へ出ない）・`RestrictSUIDSGID=yes`・
+  `SystemCallFilter=~@mount @swap @reboot @module @raw-io @debug @cpu-emulation @obsolete`（mount で保護を外さない。
+  NVML の device の操作は `ioctl` で、この中に入らない）・`SystemCallErrorNumber=EPERM`。
+  これらの下で NVML の読み取り・書き込み・戻しが通るかは、2.7 の 1 で確かめる
+- `Type=notify`・`WatchdogSec=5s`・`TimeoutAbortSec=2s`・`TimeoutStopSec=3s`・`Restart=always`・`RestartSec=2`・
+  `RestartPreventExitStatus=2`（2 は引数の不正・device が 2 個以上・型番が `--gpu-name` と違う・NVML の library が無いときだけ。
+  device が 0 個は 1 で再起動する）
 - `After=systemd-modules-load.service`。fand・telemetry とは依存させない
 - 導入先では、所有者の承認の後に `enable --now` する（Fan に書くので、監視系と違い自動では有効にしない）
 
@@ -133,12 +156,19 @@ watchdog の SIGABRT で終わらないとき（`kill -STOP` で止まったま�
 
 実機が無くても通るように、NVML の呼び出しを小さな境界に分け、偽の NVML で次を確かめる（AGENTS.md ルール 7）:
 曲線の補間・引数の検査・上げはすぐで下げは 1 %/s とヒステリシス・目標が違うときだけ書く・自動に戻されたら書き直す・
-SIGTERM と `--restore-default` で自動に戻す・device が 0 個・2 個のとき書かない・NVML のエラーで自動に戻して終わる。
+SIGTERM と `--restore-default` で自動に戻す・device が 0 個・2 個のとき書かない・型番が違うとき書かずに 2 で終わる・
+`READY=1` を最初の書き込みより前に送る・NVML のエラーで自動に戻して終わる。
 
 ### 2.7 導入先での確認（実装の後）
 
 1. 起動と停止: `systemctl stop`・`kill -9`・`kill -STOP`（watchdog）で、GPU の Fan が自動（`policy 0`）に戻ること。
-   `kill -STOP` から自動に戻るまでが 10 s 以内であること（2.4 の上限）
+   `kill -STOP` から自動に戻るまでが 10 s 以内であること（2.4 の上限）。あわせて次を確かめる:
+   - 2.5 で足した sandbox（`ProtectKernelTunables=`・`ProtectKernelLogs=`・`RestrictNamespaces=`・`RestrictSUIDSGID=`・
+     `SystemCallFilter=`）の下で、NVML の読み取り・書き込み・戻しがすべて通ること（`journalctl` に `gpu_fan_started` と
+     目標の回転が出て、`nvidia-smi` で policy 1 になる。拒まれた system call があれば `SystemCallErrorNumber=EPERM` で NVML のエラーになる）
+   - `nvmlDeviceGetName` の名前が unit の `--gpu-name` と一致して起動すること。違う名前を drop-in で渡すと、何も書かずに
+     終了コード 2 で止まり、再起動しないこと
+   - 戻しの処理（`ExecStopPost=`）を `kill -STOP` で止めたとき、3 s で打ち切られ、起動し直して曲線へ戻ること
 2. アイドルの回転が 30 % のままであること（音が今と変わらない）
 3. GPU 600 W を 15 分: GPU コアが 80 °C 未満で落ち着くこと（100 % 固定では 74 °C）
 4. その後、0121 T5 の ii-gpu600 と iii-gpu600 を、このサービスを動かした状態で行う。T7 も同じ状態で行う
@@ -156,7 +186,9 @@ SIGTERM と `--restore-default` で自動に戻す・device が 0 個・2 個の
 ### 悪くなること・その緩和
 
 - root で動き、Fan に書くプロセスが1つ増え、`CAP_SYS_ADMIN` を持つ。標準ライブラリだけ・ネットワークなし・使える device は NVIDIA の2つだけ・
-  ファイルシステムは読み取りだけに絞る
+  ファイルシステムとカーネルの設定は読み取りだけ・mount と namespace の作成は拒む、に絞る
+- GPU を交換した・driver の更新で名前の表記が変わったときは、型番の検査で止まり、GPU 自身の既定の制御のままになる。
+  曲線を確かめ直し、決定記録と unit の `--gpu-name` を直すまで戻らない（安全側に止まる）
 - 負荷のときの GPU の Fan の音が大きくなる（600 W の定常では 100 %）
 - fand の外に Fan の制御ができる。役割は GPU の Fan だけに限り、fand・ML・LLM からは触れない。曲線の変更は決定記録と承認を要する
 - 落ちたときは自動に戻るので、その間の 600 W の定常は 80 °C を超えうる。GPU 自身の保護と fand の Fallback に委ね、
