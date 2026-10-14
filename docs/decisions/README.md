@@ -72,7 +72,7 @@ docs/decisions/NNNN-<slug>.md      例: 0002-metric-naming.md
 |---|---|---|
 | [0001](0001-initial-project-decisions.md) | プロジェクト初期の決定（D-01〜D-19、V-01） | FINAL |
 | [0002](0002-metric-naming.md) | メトリクス命名規約とDBスキーマ（ロング形式） | FINAL |
-| [0003](0003-device-json-schema.md) | デバイス出力 JSON スキーマ v1 | FINAL |
+| [0003](0003-device-json-schema.md) | デバイス出力 JSON スキーマ v1 | FINAL（§2.2 の `hello` の「電源投入時に1回」は [0129](0129-periodic-hello.md) で置き換え） |
 | [0004](0004-storage-read-contract.md) | ストレージ層の読み出し契約 | FINAL |
 | [0005](0005-model-selection.md) | ローカルモデルは Qwen3.8-27B 単体構成 | FINAL |
 | [0006](0006-gpu-mode-and-mixed-state.md) | GPU Mode を2段階にし `mixed` を異常として扱う | FINAL |
@@ -91,7 +91,7 @@ docs/decisions/NNNN-<slug>.md      例: 0002-metric-naming.md
 | [0019](0019-claude-escalation.md) | Claude へのエスカレーション | FINAL |
 | [0020](0020-decision-memory.md) | 運用メモリへの記録 | FINAL |
 | [0021](0021-public-repo-hygiene.md) | public リポジトリの衛生 | FINAL |
-| [0022](0022-firmware-v1.md) | 本番ファームウェア v1 | FINAL |
+| [0022](0022-firmware-v1.md) | 本番ファームウェア v1 | FINAL（§2.8 の繋がった瞬間の `hello` の出し直しは [0129](0129-periodic-hello.md) で置き換え） |
 | [0023](0023-serial-source.md) | シリアル取り込み | FINAL |
 | [0024](0024-calibration.md) | 較正の手順と記録 | FINAL |
 | [0025](0025-probe-identity.md) | プローブの同定 | FINAL |
@@ -191,3 +191,4 @@ docs/decisions/NNNN-<slug>.md      例: 0002-metric-naming.md
 | [0120](0120-fan-hardware-first-host.md) | 導入先の `fan-hardware.yaml` を承認する（`nct6799` の `pwm6` / `pwm5` / `pwm2` を `label: null` で特定・profile は `startup_demand` 0.5・`minimum_stable_demand` 0.15・`maximum_rpm` は観測の最大に約 5%・`pwm_to_rpm` は 0.25 が 9月の実測で 0.40 以上は BIOS 運転の中央値・`airflow_index` は RPM の比の近似・`approval` は `confirmed`。0.35 未満の表と `airflow_index` の実測は未決） | FINAL |
 | [0121](0121-hardware-test-procedure.md) | `provisional` の Safety の値を確定する実機の試験の手順（0119 §5 の 5）。制御の経路を迂回せず外から書くのは BIOS へ戻す `pwmN_enable=5` だけ・T0 段階 5 の残り（`0640` の DB と `db_not_writable`・setgid）・T1 24 時間の soak（tick の時間・超過・stale・書き込みの失敗）・T2 `pwmN_enable=5` の注入（3 回で `EMERGENCY`・約 5 s で終了コード 7）・T3 収集を止める（stale と `fault_clear_hold_ms`）・T4 Max から auto へ（`ramp_down`・起動の落ち着き）・T5 4 段階の負荷と3つの位相で `SIGSTOP`（最悪約 11 s と温度の余裕）・T6 試験専用の設定で止めた Fan の立ち上がりと `stall_min_rpm` を上げた検出・T7 GPU 600 W と CPU 全スレッドで BIOS と温度を比べる・中止の基準 CPU 88 / GPU 83 / コネクタ 70 °C | FINAL |
 | [0122](0122-cpu-power-publisher.md) | CPU Package の消費電力（`power.cpu.package`）を RAPL から渡す。`energy_uj` は PLATYPUS 対策で root だけが読めるので、root・capability なし・標準ライブラリだけの専用サービス `coldaisle-cpu-power` が `package-0` を名前で探し、1 s の平均を 1 W に丸めて `/run/coldaisle-power/cpu-package.json`（`0640`・グループ `coldaisle`）に書く。`coldaisle-telemetry` は adapter で読む（既定は無効）。有効にすると fand の健全度が `NORMAL` になり CPU Power の floor が効く | FINAL |
+| [0129](0129-periodic-hello.md) | `hello` を起動時と 60 s ごとに出す（Hardware CDC の `(bool)Serial` は読み手を表さず、繋がった瞬間の出し直しが働かなかった。#43）。取り込みは同じ中身の `hello` を記録し直さず、ログも出さない。サンプルの `err` の集合が変わったときだけ warning で残す。0022 §2.8 と 0003 §2.2 の「電源投入時に1回」を置き換え | Proposed |
