@@ -581,6 +581,68 @@ def test_a_mismatch_records_what_is_connected_now(tmp_path, rules):
     assert recorded["rear_exhaust"] == "28FFFFFFFFFFFF01", "記録の側は動かさない"
 
 
+def rear_banner(rom: str) -> RawHello:
+    return RawHello(
+        fw="1.1.0",
+        dev="dev",
+        interval_ms=2_500,
+        sensors={"rear_exhaust": RawSensor(kind="ds18b20", gpio=7, rom=rom, res=11)},
+    )
+
+
+def test_a_repeated_hello_is_not_recorded_again(tmp_path, rules, log_stream):
+    """**同じ中身の hello は記録もログも更新しない**（#43 / 決定記録 0129 §2.2）。
+
+    デバイスは 60 s ごとに出し直す。毎回書くと記録とログが1日に千回以上書き換わる。
+    """
+    same = rear_banner("28FFFFFFFFFFFF01")
+    daemon = daemon_with([same, same, same], rules, tmp_path, stamps=[1_000, 61_000, 121_000])
+    try:
+        stats = daemon.run()
+        row = daemon.store.connection.execute("SELECT last_hello_ms FROM devices").fetchone()
+    finally:
+        daemon.store.close()
+    assert (stats.hellos, stats.hellos_repeated) == (1, 2)
+    assert row[0] == 1_000, "最初に処理した時刻のまま"
+    banners = [line for line in log_lines(log_stream) if line["msg"] == "起動バナーを受け取った"]
+    assert len(banners) == 1
+
+
+def test_a_changed_hello_is_always_processed(tmp_path, rules):
+    """中身が変わった hello は必ず処理する。**差し替えに気づく役目は変えない**（0129 §2.2）。"""
+    first, swapped = rear_banner("28FFFFFFFFFFFF01"), rear_banner("28FFFFFFFFFFFF09")
+    daemon = daemon_with([first, swapped, swapped, first], rules, tmp_path)
+    try:
+        stats = daemon.run()
+        observed = daemon.store.current_state(OBSERVED_PROBES_KEY)
+    finally:
+        daemon.store.close()
+    assert (stats.hellos, stats.hellos_repeated) == (3, 1)
+    assert not observed, "最後に元のプローブへ戻ったことを処理している"
+
+
+def test_a_change_in_err_is_logged_once(tmp_path, rules, log_stream):
+    """`err` は DB に残らない。**変わったときだけ**ログに残す（#43 / 決定記録 0129 §2.3）。"""
+    pulled = ("rear_exhaust:-127",)
+    messages: list[RawMessage] = [
+        sample(0, 0, rear_exhaust=27.0),
+        RawSample(seq=1, up=2_500, channels={"room_temp": 26.0, "rear_exhaust": None}, err=pulled),
+        RawSample(seq=2, up=5_000, channels={"room_temp": 26.0, "rear_exhaust": None}, err=pulled),
+        sample(3, 7_500, rear_exhaust=27.0),
+    ]
+    daemon = daemon_with(messages, rules, tmp_path)
+    try:
+        daemon.run()
+    finally:
+        daemon.store.close()
+    changes = [line for line in log_lines(log_stream) if line["msg"] == "サンプルの err が変わった"]
+    assert [(c["seq"], c["added"], c["cleared"]) for c in changes] == [
+        (1, ["rear_exhaust:-127"], []),
+        (3, [], ["rear_exhaust:-127"]),
+    ]
+    assert all(c["level"] == "warning" for c in changes)
+
+
 def test_a_matching_hello_clears_the_observed_record(tmp_path, rules):
     """食い違いが解けたら残さない。**古い情報を画面に出し続けない。**"""
 

@@ -26,6 +26,7 @@ SKETCH = ROOT / "firmware" / "coldaisle_sensor" / "coldaisle_sensor.ino"
 SAMPLE_OUTPUT = ROOT / "firmware" / "sample_output.jsonl"
 SCHEMA = ROOT / "schemas" / "device_v1.schema.json"
 SPEC_REVIEW = ROOT / "docs" / "spec-review.md"
+PERIODIC_HELLO_DECISION = ROOT / "docs" / "decisions" / "0129-periodic-hello.md"
 
 
 @pytest.fixture(scope="module")
@@ -266,21 +267,54 @@ def test_no_sensors_does_not_emit_an_invalid_hello(sketch):
     assert "no_sensors" in sketch
 
 
-def test_hello_is_replayed_when_the_host_connects(sketch):
-    """**待つだけでは足りない**（#11 のレビュー指摘）。
+def test_hello_is_resent_every_minute(sketch):
+    """**起動時の1回だけでは足りない**（#43 / 決定記録 0129）。
 
-    デバイスのほうが先に起動していると、誰も読んでいない間に hello が流れて消える。
-    ホストはサンプルだけを受け取り、ROM の一覧も `interval_ms` も知らないまま動く。
+    ホストがポートを開くのは起動より数秒遅く、誰も読んでいない間に hello が流れて消える。
+    Hardware CDC の `(bool)Serial` はホストがポートを開いたことを表さないので、
+    繋がった瞬間を待つ方法は使えなかった。起動時と 60 s ごとに出す。
     """
-    assert "host_connected" in sketch
+    assert re.search(r"static const uint32_t HELLO_INTERVAL_MS = \d+;", sketch)
+    assert sketch.count("send_hello();") == 2  # setup と、周期
     assert re.search(
-        r"if \(connected && !host_connected\) \{" + "\n" + r"\s*send_hello\(\);", sketch
+        r"if \(now_ms >= next_hello_ms\) \{"
+        + "\n"
+        + r"\s*send_hello\(\);"
+        + "\n"
+        + r"\s*next_hello_ms = now_ms \+ HELLO_INTERVAL_MS;",
+        sketch,
     )
 
 
-def test_hello_is_not_sent_periodically(sketch):
-    """**立ち上がりだけで出す。** 周期的に出すと「電源投入時に1回だけ」が崩れる。"""
-    assert sketch.count("send_hello();") == 2  # setup と、接続の立ち上がり
+def test_the_hello_interval_matches_the_decision_record(sketch):
+    """**60 s の唯一の情報源は決定記録 0129 §2.1**（§2.1a / AGENTS.md ルール 9）。
+
+    ファームウェアは `config/*.yaml` を読めないので値はスケッチに置く
+    （ピン番号と同じ。0022 §2.10）。
+    代わりに記録とスケッチの一致をここで縛る。片方だけ変えると落ちる。
+    値を変えるときは新しい決定記録を作り、ここの参照先も同じ PR で直す。
+    """
+    recorded = set(
+        re.findall(
+            r"HELLO_INTERVAL_MS = (\d+)", PERIODIC_HELLO_DECISION.read_text(encoding="utf-8")
+        )
+    )
+    assert len(recorded) == 1, f"0129 に値が1つだけ書かれていない: {recorded}"
+    in_sketch = re.findall(r"static const uint32_t HELLO_INTERVAL_MS = (\d+);", sketch)
+    assert in_sketch == list(recorded)
+
+
+def test_hello_does_not_depend_on_the_usb_connection_state(sketch):
+    """`(bool)Serial` はときどき途切れ、再起動していないのに hello が何度も出た（#43）。"""
+    code = re.sub(r"//.*", "", sketch)  # 理由を書いたコメントは除く
+    assert "(bool)Serial" not in code
+    assert "host_connected" not in code
+
+
+def test_hello_is_sent_between_sample_lines(sketch):
+    """hello は周期の締切を進めた後、サンプルを組む前に出す。**行が混ざらない。**"""
+    loop = sketch[sketch.index("void loop()") :]
+    assert loop.index("next_hello_ms = now_ms") < loop.index("reset_line();")
 
 
 def test_newlines_are_written_without_carriage_return(sketch):
