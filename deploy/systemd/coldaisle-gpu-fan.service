@@ -1,0 +1,67 @@
+# coldaisle GPU の Fan の曲線（NVML。#285 / 決定記録 0128）のテンプレート。
+#
+# **テンプレートである。** 導入の手順は docs/ubuntu-deploy.md。
+# GPU の Fan は fand の Control Pipeline（Front / Rear / Top）の外に置く（0128 §2.1）。
+# GPU コアの温度の曲線で回転を書き、止めたとき・落ちたとき・hang のときは GPU 自身の既定の制御へ戻す。
+# 筐体の Fan にも hwmon にも書かない。Fan に書くので、所有者の承認の後に enable する。
+
+[Unit]
+Description=coldaisle GPU fan curve (NVML)
+Documentation=file:///opt/coldaisle/docs/ubuntu-deploy.md
+# NVIDIA の driver を module で読み込む導入先で、先に起動しない（0128 §2.5）。fand・telemetry とは依存させない
+After=systemd-modules-load.service
+# 再起動を諦めない。device がちょうど1つでない導入先は終了コード 2 で止まる（下の RestartPreventExitStatus=）
+StartLimitIntervalSec=0
+
+[Service]
+# 最初の書き込みの後に READY=1、周期ごとに WATCHDOG=1 を送る。hang は watchdog で止め、
+# ExecStopPost= が既定の制御へ戻す（0128 §2.4）
+Type=notify
+NotifyAccess=main
+WatchdogSec=5s
+# 起動時に device を最大 60 s 待つ（その間も WATCHDOG=1 を送る）。それより長くする
+TimeoutStartSec=90s
+User=root
+WorkingDirectory=/
+# 標準ライブラリだけのソースを、システムの python3 で venv に依存せず動かす（0128 §2.2）。
+# 値は 0128 のとおり（曲線は provisional）: 45 °C 30 % / 55 °C 50 % / 65 °C 80 % / 70 °C 以上 100 %、
+# 周期 1000 ms、device を待つのは起動時の 60000 ms まで、下げるときのヒステリシス 2 °C・1 %/s
+ExecStart=/usr/bin/python3 -I -S /opt/coldaisle/src/coldaisle/gpu_fan_curve.py --curve 45:30,55:50,65:80,70:100 --interval-ms 1000 --startup-wait-ms 60000 --hysteresis-c 2 --down-rate-percent-per-s 1
+# どの止まり方（stop・落ちた・SIGKILL・watchdog）でも走り、GPU 自身の既定の制御へ戻す
+ExecStopPost=/usr/bin/python3 -I -S /opt/coldaisle/src/coldaisle/gpu_fan_curve.py --restore-default
+
+Restart=always
+RestartSec=2
+# 2: 引数が不正・device がちょうど1つでない・曲線が Fan の範囲の外・NVML の library が無い。
+# 人が直すまで結果が変わらない。運転中の NVML のエラーは 1 で終わり、ここで再起動する
+RestartPreventExitStatus=2
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=coldaisle-gpu-fan
+# watchdog の SIGABRT で core を残さない（apport が /var/crash に書く）
+LimitCORE=0
+
+# NVML の Fan の書き込みと既定の制御への戻しは、uid 0 でも CAP_SYS_ADMIN が無いと拒まれる
+# （0128 §2.5。導入先の systemd-run で確認済み）。使える先を下の device と sandbox で絞る
+CapabilityBoundingSet=CAP_SYS_ADMIN
+AmbientCapabilities=
+DevicePolicy=closed
+DeviceAllow=/dev/nvidiactl rw
+DeviceAllow=/dev/nvidia0 rw
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateNetwork=yes
+RestrictAddressFamilies=AF_UNIX
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+LockPersonality=yes
+RestrictRealtime=yes
+SystemCallArchitectures=native
+ProtectClock=yes
+ProtectHostname=yes
+
+[Install]
+WantedBy=multi-user.target

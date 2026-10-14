@@ -11,6 +11,7 @@
    （決定記録 0086 §2.2。段階 3c）
 7. Learned worker の unit と `tmpfiles.d`、fand の Learned・較正の引数（決定記録 0115。0077 段階 6）
 8. CPU Package の電力を root で渡す `coldaisle-cpu-power`（決定記録 0122 §2.2）
+9. GPU の Fan を温度の曲線で書く `coldaisle-gpu-fan`（決定記録 0128 §2.5）
 """
 
 import re
@@ -50,6 +51,9 @@ WORKERS = {"mpc": "coldaisle-learnd-mpc", "supervisor": "coldaisle-learnd-superv
 
 CPU_POWER = "coldaisle-cpu-power"
 """RAPL の電力を root・capability なしで渡すサービス（決定記録 0122）。DB を開かない。"""
+
+GPU_FAN = "coldaisle-gpu-fan"
+"""GPU の Fan を温度の曲線で書くサービス（決定記録 0128）。fand の外。DB を開かない。"""
 
 DB_UNITS = (*SERVICES, *JOBS)
 """`StateDirectory=coldaisle` を持ち、`/var/lib/coldaisle` の mode を決める unit（0080 §2.1）。"""
@@ -102,7 +106,8 @@ def unit_files() -> list[Path]:
 def test_the_expected_units_exist():
     names = {path.name for path in unit_files()}
     expected = {
-        f"{name}.service" for name in (*SERVICES, *JOBS, FAND, CPU_POWER, *WORKERS.values())
+        f"{name}.service"
+        for name in (*SERVICES, *JOBS, FAND, CPU_POWER, GPU_FAN, *WORKERS.values())
     }
     expected |= {f"{name}.timer" for name in JOBS}
     assert names == expected
@@ -859,3 +864,104 @@ def test_telemetry_wants_cpu_power_without_depending_on_it():
 def test_the_deploy_guide_places_and_enables_cpu_power():
     guide = (ROOT / "docs" / "ubuntu-deploy.md").read_text(encoding="utf-8")
     assert f"sudo systemctl enable --now {CPU_POWER}.service" in guide
+
+
+# ---------------------------------------------------------------- GPU の Fan の曲線（0128）
+
+
+def gpu_fan() -> dict[str, dict[str, list[str]]]:
+    return parse_unit(SYSTEMD / f"{GPU_FAN}.service")
+
+
+def test_gpu_fan_runs_as_root_with_only_cap_sys_admin():
+    """NVML の Fan の書き込みは uid 0 でも CAP_SYS_ADMIN が要る（0128 §2.5。導入先で確認済み）。"""
+    service = gpu_fan()["Service"]
+    assert service["User"] == ["root"]
+    assert service["CapabilityBoundingSet"] == ["CAP_SYS_ADMIN"]
+    assert service["AmbientCapabilities"] == [""]
+    assert "SupplementaryGroups" not in service
+
+
+def test_gpu_fan_can_open_only_the_two_nvidia_devices():
+    service = gpu_fan()["Service"]
+    assert service["DevicePolicy"] == ["closed"]
+    assert sorted(service["DeviceAllow"]) == ["/dev/nvidia0 rw", "/dev/nvidiactl rw"]
+    assert "PrivateDevices" not in service
+
+
+def test_gpu_fan_is_sandboxed_and_writes_no_files():
+    service = gpu_fan()["Service"]
+    for key, value in {
+        "NoNewPrivileges": "yes",
+        "ProtectSystem": "strict",
+        "ProtectHome": "yes",
+        "PrivateTmp": "yes",
+        "PrivateNetwork": "yes",
+        "RestrictAddressFamilies": "AF_UNIX",
+        "ProtectKernelModules": "yes",
+        "ProtectControlGroups": "yes",
+        "LockPersonality": "yes",
+        "RestrictRealtime": "yes",
+        "SystemCallArchitectures": "native",
+        "ProtectClock": "yes",
+        "ProtectHostname": "yes",
+        "LimitCORE": "0",
+    }.items():
+        assert service.get(key) == [value], key
+    for key in ("ReadWritePaths", "StateDirectory", "RuntimeDirectory"):
+        assert key not in service, key
+
+
+def test_gpu_fan_runs_the_source_file_with_the_curve_of_0128():
+    """venv と `coldaisle` パッケージに依存しない。値は 0128 のとおりに unit が渡す。"""
+    command = one(gpu_fan(), "Service", "ExecStart").split()
+    assert command[0] == "/usr/bin/python3"
+    assert command[1:3] == ["-I", "-S"]
+    source = command[3]
+    assert source == "/opt/coldaisle/src/coldaisle/gpu_fan_curve.py"
+    assert (ROOT / source.removeprefix("/opt/coldaisle/")).is_file()
+    arguments = dict(zip(command[4::2], command[5::2], strict=True))
+    assert arguments == {
+        "--curve": "45:30,55:50,65:80,70:100",
+        "--interval-ms": "1000",
+        "--startup-wait-ms": "60000",
+        "--hysteresis-c": "2",
+        "--down-rate-percent-per-s": "1",
+    }
+
+
+def test_gpu_fan_restores_default_control_however_it_stops():
+    """stop・落ちた・SIGKILL・watchdog のどれでも ExecStopPost= が既定の制御へ戻す（0128 §2.4）。"""
+    unit = gpu_fan()
+    start = one(unit, "Service", "ExecStart").split()
+    stop_post = one(unit, "Service", "ExecStopPost").split()
+    assert stop_post == [*start[:4], "--restore-default"]
+    assert one(unit, "Service", "Type") == "notify"
+    assert one(unit, "Service", "NotifyAccess") == "main"
+    assert one(unit, "Service", "WatchdogSec") == "5s"
+    # 起動時に device を待つ 60 s より長く待つ
+    assert one(unit, "Service", "TimeoutStartSec") == "90s"
+
+
+def test_gpu_fan_does_not_restart_on_a_configuration_error():
+    unit = gpu_fan()
+    assert "systemd-modules-load.service" in words(unit, "Unit", "After")
+    assert one(unit, "Service", "Restart") == "always"
+    assert one(unit, "Service", "RestartSec") == "2"
+    assert words(unit, "Service", "RestartPreventExitStatus") == ["2"]
+    assert one(unit, "Unit", "StartLimitIntervalSec") == "0"
+    assert one(unit, "Install", "WantedBy") == "multi-user.target"
+    assert one(unit, "Service", "StandardError") == "journal"
+
+
+def test_no_other_unit_depends_on_gpu_fan():
+    """fand・telemetry とは依存させない（0128 §2.5）。"""
+    for path in unit_files():
+        if path.name == f"{GPU_FAN}.service":
+            continue
+        assert GPU_FAN not in path.read_text(encoding="utf-8"), path.name
+
+
+def test_the_deploy_guide_places_gpu_fan_and_enables_it_after_approval():
+    guide = (ROOT / "docs" / "ubuntu-deploy.md").read_text(encoding="utf-8")
+    assert f"sudo systemctl enable --now {GPU_FAN}.service" in guide
