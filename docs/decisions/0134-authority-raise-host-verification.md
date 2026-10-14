@@ -197,15 +197,27 @@ py=/opt/coldaisle/.venv/bin/python
 # find は symlink をたどらない（-P）ので循環しても止まり、roots は増えるだけの有限の集合なので繰り返しも止まる
 while :; do
   while IFS= read -r p; do
+    # path の途中の要素（/opt/coldaisle 自体など）が symlink なら、その1段先を項として足す。
+    # 足した項の祖先も下の検査に掛かり、項はまたここで要素ごとに解決される（-s -m は文字の上だけで整える）
+    q=$p
+    while [ "$q" != / ]; do
+      if [ -L "$q" ]; then
+        t=$(readlink -- "$q")
+        case $t in /*) ;; *) t=$(dirname -- "$q")/$t ;; esac
+        realpath -s -m -- "$t" >&3
+        printf '%s\n' "$q"                    # 解決できるかは下で確かめる
+      fi
+      q=$(dirname -- "$q")
+    done
     [ -e "$p" ] || [ -L "$p" ] || continue   # symlink でもなく存在もしない項は、下の祖先の検査で見る
     find "$p" -type l -print                  # 項そのものが symlink なら、項も出る
-  done < roots.txt | while IFS= read -r l; do
+  done < roots.txt 3>hops.txt | while IFS= read -r l; do
     if t=$(readlink -f -- "$l") && [ -e "$t" ]; then
       printf '%s\n' "$t"
     else
       printf '%s\n' "$l" >> unresolved.txt
     fi
-  done | cat - roots.txt | sort -u > roots.next
+  done | cat - hops.txt roots.txt | sort -u > roots.next
   if cmp -s roots.txt roots.next; then rm -f roots.next; break; fi
   mv roots.next roots.txt
 done
@@ -238,6 +250,9 @@ done < roots.txt
   ディレクトリに書けるかで決まり、それは上のディレクトリの検査で見ている。実体とその祖先は、実体を
   `roots.txt` に足したことで同じ検査に掛かる（venv の `bin/python` は interpreter の実体への symlink で、
   その実体と親もここで見る）
+- path の途中の要素が symlink のとき（`/opt/coldaisle` 自体が別の場所への symlink など）は、その symlink の
+  1段先（文字の上で整えたもの）を項に足す。足した項の祖先（＝途中の symlink の実体の祖先）と、最後まで解決した
+  `readlink -f` の結果とその祖先が、同じ書けないことの検査に掛かる
 - `sys.path` の項が symlink でもなく存在もしない（`python312.zip` など）ときは、その項の祖先のディレクトリに
   書けないことで、承認者が後から作れないことを見る
 - `roots.txt`・`dirs.txt`・`unresolved.txt` は承認者の作業ディレクトリに置き、結果を #217 に残すときは path を仮の名前に置き換える
@@ -320,6 +335,8 @@ Issue で同じ決まりに揃える（§5 の 4）。
 | 4 | 6.4 / 6.8 の `test` の確認 | **別の Issue で同じ決まりに揃える**（1 Issue = 1 PR） | #217 の文書の PR に含める |
 | 5 | 段階 C の分け方と #217 を閉じる時期 | **C1 / C2 に分け、#217 は C2（Production ができた後の `approval_rejected`）まで閉じない**（§2.5） | C1 で #217 を閉じ、C2 を `requires:server` の別 Issue にする |
 | 6 | `coldaisle-admin` だけの資格の確認（§2.4 の 2）を段階 C に足すか | **足す**（日常的に使うグループから authority へ届かないことを見る） | 足さない（0104 §2.9 のまま） |
+
+| 7 | 検査の手順の細部 | **段階 C の実施で見つかった問題は、別の記録・手順の修正で扱う。決定記録の段階のレビューはここで閉じる（2026-10-14 所有者の判断）** | — |
 
 未決のまま残すもの（本記録では決めない）:
 
