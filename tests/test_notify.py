@@ -71,25 +71,31 @@ def router(config, clock, **targets) -> Router:
 
 
 def test_severity_routing(config, tmp_path):
-    """critical は LINE、warning は Slack（決定記録 0001 D-03）。"""
-    assert config.routing[AlertSeverity.CRITICAL] == ["line", "stdout"]
+    """critical も warning も Slack（決定記録 0135。0001 D-03 を置き換え）。
+
+    LINE は使わない。区別は本文の重大度で行う。
+    """
+    assert config.routing[AlertSeverity.CRITICAL] == ["slack", "stdout"]
     assert config.routing[AlertSeverity.WARNING] == ["slack", "stdout"]
 
 
 def test_notification_goes_only_to_its_targets(config):
+    """`routing` に無い宛先へは送らない。LINE は作られていても使わない（決定記録 0135）。"""
     slack, line = Recorder("slack"), Recorder("line")
     sender = router(config, SimulatedClock(NOON_MS), slack=slack, line=line)
     sender.notify(notification(severity="warning"))
-
-    assert len(slack.sent) == 1
-    assert line.sent == [], "warning は LINE へ送らない"
-
-
-def test_critical_reaches_line(config):
-    line = Recorder("line")
-    sender = router(config, SimulatedClock(NIGHT_MS), line=line)
     sender.notify(notification(severity="critical", rule_id="SENSOR_FAULT"))
-    assert len(line.sent) == 1
+
+    assert len(slack.sent) == 2
+    assert line.sent == [], "routing に無い LINE へは送らない"
+
+
+def test_critical_reaches_slack(config):
+    """critical は夜間でも Slack に届く（決定記録 0135 §2.3）。"""
+    slack = Recorder("slack")
+    sender = router(config, SimulatedClock(NIGHT_MS), slack=slack)
+    sender.notify(notification(severity="critical", rule_id="SENSOR_FAULT"))
+    assert [item.severity for item in slack.sent] == [AlertSeverity.CRITICAL]
 
 
 def test_missing_target_is_announced_not_silently_dropped(config, caplog):
@@ -176,9 +182,10 @@ def test_night_suppresses_warning_until_thresholds_are_measured(config):
 
 
 def test_night_never_suppresses_critical(config):
-    line = Recorder("line")
-    sender = router(config, SimulatedClock(NIGHT_MS), line=line)
+    slack = Recorder("slack")
+    sender = router(config, SimulatedClock(NIGHT_MS), slack=slack)
     assert sender.notify(notification(severity="critical")) is True
+    assert len(slack.sent) == 1
 
 
 def test_daytime_warning_is_sent(config):
@@ -215,8 +222,53 @@ def test_body_carries_context_and_dashboard_link():
 
 
 def test_resolution_is_visually_distinct():
-    assert "🔴" in notification().title
+    assert "🔴" in notification(severity="critical").title
+    assert "🟠" in notification(severity="warning").title
     assert "✅" in notification(state="resolved").title
+
+
+SEVERITY_TITLES = [
+    ("critical", "firing", "🔴 [critical] RAPID_RISE [d.intake_rise] — firing"),
+    ("critical", "resolved", "✅ [critical 解除] RAPID_RISE [d.intake_rise] — resolved"),
+    ("warning", "firing", "🟠 [warning] RAPID_RISE [d.intake_rise] — firing"),
+    ("warning", "resolved", "✅ [warning 解除] RAPID_RISE [d.intake_rise] — resolved"),
+]
+
+
+@pytest.mark.parametrize(("severity", "state", "expected"), SEVERITY_TITLES)
+def test_body_starts_with_the_severity_on_slack(severity, state, expected):
+    """**本文の先頭の行に重大度が出る。**
+
+    critical と warning は同じ Slack のチャンネルへ届く（決定記録 0135 §2.2）ため、
+    宛先では見分けられない。実際に POST される本文で確かめる。
+    """
+    posted: list[dict] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        posted.append(json.loads(request.content))
+        return httpx.Response(200)
+
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    item = notification(state=state, severity=severity, rule_id="RAPID_RISE")
+    SlackNotifier("https://example.invalid/hook", client=client).send(item)
+    assert posted[0]["text"].splitlines()[0] == expected
+
+
+@pytest.mark.parametrize(("severity", "state", "expected"), SEVERITY_TITLES)
+def test_body_starts_with_the_severity_on_stdout(severity, state, expected, caplog):
+    """stdout（構造化ログ）の本文にも同じ先頭の行が出る。"""
+    item = notification(state=state, severity=severity, rule_id="RAPID_RISE")
+    with caplog.at_level("WARNING"):
+        StdoutNotifier().send(item)
+    fields = [getattr(record, "fields", None) for record in caplog.records]
+    texts = [entry["text"] for entry in fields if entry]
+    assert texts[0].splitlines()[0] == expected
+
+
+def test_explanation_title_carries_the_severity():
+    """発火に続く説明も同じチャンネルへ届くため、重大度を載せる。"""
+    item = notification(severity="critical", kind="explanation", body="説明")
+    assert item.title == "🔎 [critical] RECIRCULATION の説明"
 
 
 def test_a_failing_target_does_not_stop_the_others(config, caplog):
@@ -319,15 +371,27 @@ def test_resolution_is_not_sent_when_the_firing_was_suppressed(config):
     assert slack.sent == []
 
 
-def test_critical_resolution_reaches_line(config):
-    """**解除の重大度が落ちない。** critical の解除が Slack へ流れてはいけない。"""
-    line, slack = Recorder("line"), Recorder("slack")
-    sender = router(config, SimulatedClock(NOON_MS), line=line, slack=slack)
-    sender.notify(notification(severity="critical", rule_id="SENSOR_FAULT"))
-    sender.notify(notification(severity="critical", rule_id="SENSOR_FAULT", state="resolved"))
+def test_critical_resolution_keeps_its_severity(config):
+    """**解除の重大度が落ちない。** critical の解除が warning として扱われてはいけない。
 
-    assert [item.state for item in line.sent] == ["firing", "resolved"]
-    assert slack.sent == []
+    critical と warning は同じ Slack へ届く（決定記録 0135）ため、宛先では見分けられない。
+    夜間に critical の発火と解除が critical のまま届き、同じ夜間の warning は届かないことで、
+    重大度ごとの方針（0001 D-04 / 0013 §2.5）が解除にも保たれていることを確かめる。
+    """
+    slack = Recorder("slack")
+    sender = router(config, SimulatedClock(NIGHT_MS), slack=slack)
+    assert sender.notify(notification(severity="critical", rule_id="SENSOR_FAULT")) is True
+    assert sender.notify(notification(severity="warning")) is False
+    assert (
+        sender.notify(notification(severity="critical", rule_id="SENSOR_FAULT", state="resolved"))
+        is True
+    )
+    assert sender.notify(notification(severity="warning", state="resolved")) is False
+
+    assert [(item.rule_id, item.severity, item.state) for item in slack.sent] == [
+        ("SENSOR_FAULT", AlertSeverity.CRITICAL, "firing"),
+        ("SENSOR_FAULT", AlertSeverity.CRITICAL, "resolved"),
+    ]
 
 
 def test_invalid_timezone_fails_at_load(tmp_path):

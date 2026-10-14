@@ -107,3 +107,28 @@ scenarios:
       - kind: dropout
         start_s: 200
         end_s: 230
+
+  notify_check:
+    description: 通知の到達確認用。critical（急上昇）と warning（GPU吸気高温）が1回ずつ発火して解除される
+    duration_s: 720
+    effects:
+      # Slack / LINE へ実際に届くかを確かめるための入力（#51 / 決定記録 0013 §2.7）。
+      # 既定の宛先では critical も warning も Slack へ行く（決定記録 0135）。
+      # **閾値は暫定値**（config/rules.yaml）なので、ここで鳴ることは
+      # 「この値が危険」という意味ではない。手順は docs/notifications.md
+      #
+      # gpu_intake は 27.8℃ 前後。60〜180秒で +14℃（7℃/分）上げると
+      # rapid_rise（5℃/分超）が発火し、上昇が止まると解除される。
+      # 41.8℃ が続くので intake_high（40℃ を120秒継続）も発火する
+      - kind: drift
+        channel: gpu_intake
+        start_s: 60
+        end_s: 180
+        delta_c: 14.0
+      # 420〜600秒で 2℃/分 で下げる。下降なので rapid_rise は再発火しない。
+      # 35.8℃ まで下がり、解除値 38℃ を割って intake_high が解除される
+      - kind: drift
+        channel: gpu_intake
+        start_s: 420
+        end_s: 600
+        delta_c: -6.0

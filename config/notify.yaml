@@ -12,9 +12,12 @@
 
 enabled: true
 
-# 重大度ごとの宛先（決定記録 0001 D-03）。複数指定できる
+# 重大度ごとの宛先（決定記録 0135。0001 D-03 を置き換え）。複数指定できる
+# critical も warning と同じ Slack（同じ Webhook・同じチャンネル）へ送り、
+# 本文の重大度（🔴 critical）で区別する。LINE は使わない。
+# 使うときは宛先に `line` を足すだけでよい（LineNotifier は残してある）
 routing:
-  critical: [line, stdout]
+  critical: [slack, stdout]
   warning: [slack, stdout]
   info: [stdout]
 

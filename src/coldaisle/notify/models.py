@@ -80,6 +80,14 @@ class NotifyConfig(BaseModel):
         return config
 
 
+_FIRING_MARKS: dict[AlertSeverity, str] = {
+    AlertSeverity.CRITICAL: "🔴",
+    AlertSeverity.WARNING: "🟠",
+    AlertSeverity.INFO: "🔵",
+}
+"""発火の記号。重大度ごとに変える（決定記録 0135 §2.2）。解除は重大度によらず ✅。"""
+
+
 @dataclass(frozen=True)
 class Notification:
     """1通ぶん。**本文は宛先ごとに組み立て直さない。**"""
@@ -105,13 +113,23 @@ class Notification:
 
     @property
     def title(self) -> str:
+        """先頭の行。**重大度を必ず載せる。**
+
+        critical と warning は同じ Slack のチャンネルへ届く（決定記録 0135）ため、
+        宛先では見分けられない。記号と `[重大度]` で一目で分かるようにする。
+        """
         if self.kind == "explanation":
-            return f"🔎 {self.rule_id} の説明"
+            return f"🔎 [{self.severity.value}] {self.rule_id} の説明"
         if self.kind == "report":
             return f"📄 {self.rule_id}"
-        mark = "🔴" if self.state == "firing" else "✅"
         target = f" [{self.metric}]" if self.metric else ""
-        return f"{mark} {self.rule_id}{target} — {self.state}"
+        if self.state == "firing":
+            mark = _FIRING_MARKS[self.severity]
+            label = self.severity.value
+        else:
+            mark = "✅"
+            label = f"{self.severity.value} 解除"
+        return f"{mark} [{label}] {self.rule_id}{target} — {self.state}"
 
     def as_text(self) -> str:
         """人が読む本文。宛先によらず同じ内容にする。"""
