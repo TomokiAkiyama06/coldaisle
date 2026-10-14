@@ -4,6 +4,7 @@
 - **Status**: FINAL（2026-10-11、リポジトリ所有者の承認）
 - **Date**: 2026-10-11
 - **Supersedes**: なし（0028 §5 未決 1 のうち `safety.yaml` の値を閉じる。Policy の値は範囲外）
+- **Superseded by**: §2.9 の `startup_settle_ms` の値（5000 → 15000）は [`0126`](0126-startup-settle-front-spinup.md)
 - **関連**: [`0028`](0028-fan-control-contracts.md) §2.6〜§2.9 /
   [`0029`](0029-telemetry-loss-classes.md) /
   [`0080`](0080-fand-systemd-unit.md) §2.6 /

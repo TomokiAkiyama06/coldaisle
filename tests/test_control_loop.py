@@ -256,6 +256,7 @@ class FakeTelemetry:
     monotonic: ManualMonotonicClock
     values: dict[str, float] = field(default_factory=lambda: dict(READINGS))
     frozen_ts_ms: int | None = None
+    frozen_metric_ts_ms: dict[str, int] = field(default_factory=dict)
     error: Exception | None = None
     cost_ms: int = 0
     reads: int = 0
@@ -268,7 +269,12 @@ class FakeTelemetry:
             raise self.error
         ts_ms = self.clock.now_ms() if self.frozen_ts_ms is None else self.frozen_ts_ms
         return tuple(
-            TelemetrySample(metric=metric, value=value, quality=Quality.OK, source_ts_ms=ts_ms)
+            TelemetrySample(
+                metric=metric,
+                value=value,
+                quality=Quality.OK,
+                source_ts_ms=self.frozen_metric_ts_ms.get(metric, ts_ms),
+            )
             for metric, value in sorted(self.values.items())
         )
 
@@ -1296,6 +1302,45 @@ def test_invariant_13_an_unchanged_source_timestamp_goes_stale(catalog) -> None:
     codes = {fault.code for fault in result.tick.faults}
     assert FaultCode.CPU_TELEMETRY_STALE in codes
     assert result.tick.zones.top.demand.forced_max is True
+
+
+def test_invariant_13_cpu_power_goes_stale_after_its_own_limit_without_a_fault(catalog) -> None:
+    """CPU Power だけが止まると、`cpu_power_ms` を**超えた** tick で power の項だけを外す。
+
+    決定記録 0123 §2.2 (a)。
+    実機では収集を止めると CPU の温度も同じ tick で古くなり、Top が `zone_fault_max` になって
+    この reason が trace に出ない。境界はここで確かめる。
+    """
+    # 0123 が確定する値（5000 ms）を明示する。既定の試験用の設定（1000 ms）から読み戻すと、
+    # 値が変わってもこのテストは通ってしまい、5000 ms の根拠にならない。
+    limit_ms = 5_000
+    safety_document = valid_documents()["safety.yaml"]
+    safety_document["telemetry"]["cpu_power_ms"] = {"value": limit_ms, "status": "provisional"}
+    harness = Harness(catalog, config=control_config(safety=safety_document))
+    assert harness.config.safety.telemetry.cpu_power_ms.value == limit_ms
+    harness.settle()
+    # Top の requested を floor より下げ、safety floor の reason が毎 tick 残るようにする
+    harness.mode.command = manual(1.0, 1.0, 0.0)
+    frozen_ts_ms = harness.clock.now_ms()
+    harness.telemetry.frozen_metric_ts_ms["power.cpu.package"] = frozen_ts_ms
+
+    tick_ms = harness.config.safety.tick_ms.value
+    for _ in range(limit_ms // tick_ms):
+        top = harness.tick().tick.zones.top.demand
+        floor_reasons = [r for r in top.reasons if r.code == "cpu_cooling_floor"]
+        assert floor_reasons
+        assert all("cpu_power_unavailable" not in reason.detail for reason in floor_reasons)
+    # 古さがちょうど 5000 ms の tick までは外さない（境界を含む）
+    assert harness.clock.now_ms() - frozen_ts_ms == limit_ms
+
+    result = harness.tick()
+
+    assert harness.clock.now_ms() - frozen_ts_ms > limit_ms
+    top = result.tick.zones.top.demand
+    assert any("cpu_power_unavailable" in reason.detail for reason in top.reasons)
+    assert top.forced_max is False
+    assert result.tick.faults == ()
+    assert result.tick.state.safety_state is SafetyState.NORMAL
 
 
 def test_invariant_13_a_telemetry_failure_does_not_stop_the_loop(catalog) -> None:

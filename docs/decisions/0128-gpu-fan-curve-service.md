@@ -1,7 +1,7 @@
 # 決定記録 0128: GPU の Fan を、温度の曲線で書く root の小さな専用サービス（`coldaisle-gpu-fan`）で制御する
 
 - **種別**: Decision Record
-- **Status**: Proposed（2026-10-14 にリポジトリ所有者が承認。レビューの後に FINAL）
+- **Status**: FINAL（2026-10-14、リポジトリ所有者の承認）
 - **Date**: 2026-10-14
 - **Supersedes**: なし
 - **関連**: [`0028`](0028-fan-control-contracts.md) /
