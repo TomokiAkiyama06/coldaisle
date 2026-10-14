@@ -126,7 +126,9 @@
   - 打ち間違いを減らすためにラッパーを置くなら、root の所有・承認者が書けない場所に置き、中身は
     `#!/bin/sh` と `exec /opt/coldaisle/.venv/bin/python -I -m coldaisle.authority_cli "$@"` の2行だけにする
     （ラッパーを置くかは §5 の 2。置かなければ上の1行を手順に書く）
-  - `-I` が防ぐのは Python の起動時の探索だけで、`LD_PRELOAD` など動的リンカの環境変数は防がない。
+  - `-I` は site の処理（`-S`）を止めない。site-packages の `.pth` は `-I` でも実行されるので、承認者が
+    site-packages（や `sys.path` のどこか）に書ければ `-I` は役に立たない。書けないことを C1 で確かめる（§2.4 の 1）
+  - `-I` が防ぐのは Python の起動時の環境変数と作業ディレクトリ・user site からの探索だけで、`LD_PRELOAD` など動的リンカの環境変数は防がない。
     承認者本人の意図した書き換えは §2.3 の (c) の限界のままで、ここで守るのは、手順に従った承認者の環境に
     たまたま残った `PYTHONPATH` や、作業ディレクトリの checkout が検証を黙って置き換えないことである
 - **`uv run` を使わない**（`.venv` と lock を書こうとする。`/opt/coldaisle` は root の所有なので失敗するが、
@@ -171,11 +173,44 @@
 
 | # | 資格 | 期待 |
 |---|---|---|
-| 1 | 承認者（`coldaisle-authority` だけ） | `/opt/coldaisle` の `.venv/bin`・`config`・`src` と、venv の使う interpreter（とラッパーを置くならラッパー）に書けない。`config/model-registry.yaml` を読める |
+| 1 | 承認者（`coldaisle-authority` だけ） | **隔離した interpreter が import に使う場所のすべてに書けない**（下の「1 の確かめ方」。`sys.path` の各ディレクトリ、特に site-packages と、`sys.prefix`（venv）・`sys.base_prefix`（interpreter）の下のすべてと、それらの祖先のディレクトリ）。`/opt/coldaisle/config` に書けず、`config/model-registry.yaml` を読める。ラッパーを置くならラッパーとその親にも書けない |
 | 1b | 承認者（同上） | **`PYTHONPATH` を承認者の書ける場所（中に偽の `coldaisle/__init__.py` を置く。読まれたら目印を出して止まるだけの1行）に向けても、§2.2 の起動の形では root の所有のコードが読まれる**。`/opt/coldaisle/.venv/bin/python -I -c 'import coldaisle; print(coldaisle.__file__)'` が `/opt/coldaisle` の下を指し、`-I -m coldaisle.authority_cli --help` が使い方を出す（目印が出ない）こと。確かめた後に偽の package を消す |
 | 2 | 管理ソケットの人（`coldaisle-admin` だけ） | authority のディレクトリに書けない・`authority.json` に書けない。制御設定の4ファイル・`registry.json`・`.registry.lock` を読めない（`flock -n` も失敗）。`/etc/coldaisle` を一覧できない |
 | 3 | `coldaisle`（API / 取り込みの unit と同じ資格） | 2 と同じ（authority・制御設定・Registry のどれにも触れない） |
 | 4 | 制御設定の4ファイルを置き直した後（導入先の手順で `install` し直したとき） | 0104 §2.9 の 1 の `getfacl` に加えて、承認者の資格で4ファイルを `cat` できること（default ACL が効いたことを、表示ではなく読み取りで確かめる） |
+
+**1 の確かめ方。** `-I` は `-E`・`-s`・`-P` を含むが `-S` を含まない。site の処理は走るので、site-packages の
+`.pth`（`import` で始まる行は実行される。editable の導入の `.pth` は `src` を `sys.path` に足す）は `-I` でも効く
+（開発の環境で、venv の site-packages に置いた `.pth` の `import` の行が `-I` のもとで実行され、`sys.flags` が
+`isolated=1`・`no_site=0` であることを確かめた）。したがって `.venv/bin`・`config`・`src` だけを見るのでは足りず、
+**隔離した interpreter 自身が報告する場所**を、承認者の uid で実際に開いて確かめる（path は仮の値）。
+
+```bash
+py=/opt/coldaisle/.venv/bin/python
+# 隔離した interpreter が使う場所: sys.path の各項と、venv と interpreter の prefix
+"$py" -I -c 'import sys; print("\n".join(p for p in [*sys.path, sys.prefix, sys.base_prefix] if p))' > roots.txt
+# 調べるディレクトリ: 各項の下のすべてと、各項の祖先（/ の手前まで）
+while IFS= read -r p; do
+  [ -e "$p" ] || continue          # 無い項（python312.zip など）は飛ばす。存在の判定だけで権限には使わない
+  [ -d "$p" ] && find "$p" -type d -print
+  d=$p; while [ "$d" != / ]; do d=$(dirname -- "$d"); [ "$d" = / ] || printf '%s\n' "$d"; done
+done < roots.txt | sort -u > dirs.txt
+# ディレクトリ: 作れたら「書ける」（作ったものは消す）
+while IFS= read -r d; do
+  if touch -- "$d/.probe-0134" 2>/dev/null; then rm -f -- "$d/.probe-0134"; echo "書ける: $d"; fi
+done < dirs.txt
+# ファイル（.pth・.py・pyvenv.cfg・interpreter の実体を含む）: 追記で開けたら「書ける」（中身は変わらない）
+while IFS= read -r p; do
+  [ -e "$p" ] || continue
+  find "$p" -type f -exec sh -c 'for f; do if (: >> "$f") 2>/dev/null; then echo "書ける: $f"; fi; done' _ {} +
+done < roots.txt
+```
+
+- 1行でも「書ける」が出たら、本番の `raise` は使わない。`roots.txt` に `/opt/coldaisle` と interpreter の置き場所
+  （`docs/ubuntu-deploy.md` 2）以外の場所が出たときも同じ（承認者の書ける場所が import に使われうる）
+- symlink は `find` がたどらないので、項そのものが symlink のときは実体の側も `roots.txt` に足して見る
+  （venv の `bin/python` は interpreter の実体への symlink で、実体は `sys.base_prefix` の下にある）
+- `roots.txt` と `dirs.txt` は承認者の作業ディレクトリに置き、結果を #217 に残すときは path を仮の名前に置き換える
 
 結果は 0104 §2.9 の 6 のとおり #217 に残し、実機のユーザー名・ホスト名・path は仮の名前に置き換える。
 
