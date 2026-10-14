@@ -15,7 +15,8 @@
 - `COLDAISLE_SLACK_WEBHOOK`: 監視専用チャンネルの Incoming Webhook の URL
 
 critical と warning は**同じ Webhook・同じチャンネル**に届きます（決定記録 0135）。
-見分けるのは本文の重大度の表示（🔴 critical / warning）です。
+見分けるのは本文の先頭の行の記号と `[重大度]` です（発火は critical が 🔴、warning が 🟠、
+解除は ✅ に `[critical 解除]` / `[warning 解除]`。決定記録 0135 §2.2）。
 夜間（22時〜7時）は critical だけが届き、warning は届きません（`night.warning_enabled: false`）。
 
 ### LINE を使う場合
@@ -46,12 +47,12 @@ LINE は今は使っていません。`LineNotifier` のコードは残してあ
 `notify_check` シナリオは、critical（`RAPID_RISE`）と warning（`INTAKE_HIGH`）を
 **1回ずつ発火させて解除します。** Slack へ届くのは次の4通です（届く順）。
 
-| 順 | 重大度 | 届くもの |
-|---|---|---|
-| 1 | critical | 🔴 `RAPID_RISE` の発火 |
-| 2 | critical | ✅ `RAPID_RISE` の解除 |
-| 3 | warning | 🔴 `INTAKE_HIGH` の発火 |
-| 4 | warning | ✅ `INTAKE_HIGH` の解除 |
+| 順 | 重大度 | 届くもの | 本文の先頭の行 |
+|---|---|---|---|
+| 1 | critical | `RAPID_RISE` の発火 | `🔴 [critical] RAPID_RISE [air.gpu_intake] — firing` |
+| 2 | critical | `RAPID_RISE` の解除 | `✅ [critical 解除] RAPID_RISE [air.gpu_intake] — resolved` |
+| 3 | warning | `INTAKE_HIGH` の発火 | `🟠 [warning] INTAKE_HIGH [air.gpu_intake] — firing` |
+| 4 | warning | `INTAKE_HIGH` の解除 | `✅ [warning 解除] INTAKE_HIGH [air.gpu_intake] — resolved` |
 
 正常でも、各アラートには発火と解除の **2通** が届きます。
 **同じ遷移（例: `RAPID_RISE` の発火）が2通以上届いたら**、連投の抑制が効いていません（#51 の受入基準）。

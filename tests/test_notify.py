@@ -222,8 +222,53 @@ def test_body_carries_context_and_dashboard_link():
 
 
 def test_resolution_is_visually_distinct():
-    assert "🔴" in notification().title
+    assert "🔴" in notification(severity="critical").title
+    assert "🟠" in notification(severity="warning").title
     assert "✅" in notification(state="resolved").title
+
+
+SEVERITY_TITLES = [
+    ("critical", "firing", "🔴 [critical] RAPID_RISE [d.intake_rise] — firing"),
+    ("critical", "resolved", "✅ [critical 解除] RAPID_RISE [d.intake_rise] — resolved"),
+    ("warning", "firing", "🟠 [warning] RAPID_RISE [d.intake_rise] — firing"),
+    ("warning", "resolved", "✅ [warning 解除] RAPID_RISE [d.intake_rise] — resolved"),
+]
+
+
+@pytest.mark.parametrize(("severity", "state", "expected"), SEVERITY_TITLES)
+def test_body_starts_with_the_severity_on_slack(severity, state, expected):
+    """**本文の先頭の行に重大度が出る。**
+
+    critical と warning は同じ Slack のチャンネルへ届く（決定記録 0135 §2.2）ため、
+    宛先では見分けられない。実際に POST される本文で確かめる。
+    """
+    posted: list[dict] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        posted.append(json.loads(request.content))
+        return httpx.Response(200)
+
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    item = notification(state=state, severity=severity, rule_id="RAPID_RISE")
+    SlackNotifier("https://example.invalid/hook", client=client).send(item)
+    assert posted[0]["text"].splitlines()[0] == expected
+
+
+@pytest.mark.parametrize(("severity", "state", "expected"), SEVERITY_TITLES)
+def test_body_starts_with_the_severity_on_stdout(severity, state, expected, caplog):
+    """stdout（構造化ログ）の本文にも同じ先頭の行が出る。"""
+    item = notification(state=state, severity=severity, rule_id="RAPID_RISE")
+    with caplog.at_level("WARNING"):
+        StdoutNotifier().send(item)
+    fields = [getattr(record, "fields", None) for record in caplog.records]
+    texts = [entry["text"] for entry in fields if entry]
+    assert texts[0].splitlines()[0] == expected
+
+
+def test_explanation_title_carries_the_severity():
+    """発火に続く説明も同じチャンネルへ届くため、重大度を載せる。"""
+    item = notification(severity="critical", kind="explanation", body="説明")
+    assert item.title == "🔎 [critical] RECIRCULATION の説明"
 
 
 def test_a_failing_target_does_not_stop_the_others(config, caplog):

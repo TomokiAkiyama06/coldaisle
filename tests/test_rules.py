@@ -654,6 +654,14 @@ def test_notify_check_scenario_reaches_each_target_once(tmp_path):
         ("INTAKE_HIGH", "warning", "firing"),
         ("INTAKE_HIGH", "warning", "resolved"),
     ]
+    # 同じチャンネルに来るため、本文の先頭の行で重大度を見分ける（決定記録 0135 §2.2）。
+    # docs/notifications.md §2 の表と同じ文字列
+    assert [item.title for item in received["slack"] if item.kind == "alert"] == [
+        "🔴 [critical] RAPID_RISE [air.gpu_intake] — firing",
+        "✅ [critical 解除] RAPID_RISE [air.gpu_intake] — resolved",
+        "🟠 [warning] INTAKE_HIGH [air.gpu_intake] — firing",
+        "✅ [warning 解除] INTAKE_HIGH [air.gpu_intake] — resolved",
+    ]
     # 手順書（docs/notifications.md §3）が終了時のログで見る数
     assert daemon.stats.notifications == 4
 
