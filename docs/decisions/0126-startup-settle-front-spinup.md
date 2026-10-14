@@ -1,7 +1,7 @@
 # 決定記録 0126: `startup_settle_ms` を 15000 にし、T4 の CPU の温度は操作の直後の跳ねを除いて判定する
 
 - **種別**: Decision Record
-- **Status**: Proposed（所有者の承認待ち）
+- **Status**: Proposed（2026-10-14 にリポジトリ所有者が承認。レビューの後に FINAL）
 - **Date**: 2026-10-14
 - **Supersedes**: [`0119`](0119-safety-values-first-host.md) §2.9 の `startup_settle_ms` = 5000 の値。
   [`0121`](0121-hardware-test-procedure.md) §2.6 T4 の表のうち、温度の上がりの判定で CPU の温度をどの時刻から見るか
