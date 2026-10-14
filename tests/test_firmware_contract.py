@@ -26,6 +26,7 @@ SKETCH = ROOT / "firmware" / "coldaisle_sensor" / "coldaisle_sensor.ino"
 SAMPLE_OUTPUT = ROOT / "firmware" / "sample_output.jsonl"
 SCHEMA = ROOT / "schemas" / "device_v1.schema.json"
 SPEC_REVIEW = ROOT / "docs" / "spec-review.md"
+PERIODIC_HELLO_DECISION = ROOT / "docs" / "decisions" / "0129-periodic-hello.md"
 
 
 @pytest.fixture(scope="module")
@@ -273,7 +274,7 @@ def test_hello_is_resent_every_minute(sketch):
     Hardware CDC の `(bool)Serial` はホストがポートを開いたことを表さないので、
     繋がった瞬間を待つ方法は使えなかった。起動時と 60 s ごとに出す。
     """
-    assert re.search(r"static const uint32_t HELLO_INTERVAL_MS = 60000;", sketch)
+    assert re.search(r"static const uint32_t HELLO_INTERVAL_MS = \d+;", sketch)
     assert sketch.count("send_hello();") == 2  # setup と、周期
     assert re.search(
         r"if \(now_ms >= next_hello_ms\) \{"
@@ -283,6 +284,24 @@ def test_hello_is_resent_every_minute(sketch):
         + r"\s*next_hello_ms = now_ms \+ HELLO_INTERVAL_MS;",
         sketch,
     )
+
+
+def test_the_hello_interval_matches_the_decision_record(sketch):
+    """**60 s の唯一の情報源は決定記録 0129 §2.1**（§2.1a / AGENTS.md ルール 9）。
+
+    ファームウェアは `config/*.yaml` を読めないので値はスケッチに置く
+    （ピン番号と同じ。0022 §2.10）。
+    代わりに記録とスケッチの一致をここで縛る。片方だけ変えると落ちる。
+    値を変えるときは新しい決定記録を作り、ここの参照先も同じ PR で直す。
+    """
+    recorded = set(
+        re.findall(
+            r"HELLO_INTERVAL_MS = (\d+)", PERIODIC_HELLO_DECISION.read_text(encoding="utf-8")
+        )
+    )
+    assert len(recorded) == 1, f"0129 に値が1つだけ書かれていない: {recorded}"
+    in_sketch = re.findall(r"static const uint32_t HELLO_INTERVAL_MS = (\d+);", sketch)
+    assert in_sketch == list(recorded)
 
 
 def test_hello_does_not_depend_on_the_usb_connection_state(sketch):
