@@ -5,6 +5,7 @@
 - **Date**: 2026-10-13
 - **Supersedes**: なし（0119 §5 未決 5 を閉じる）
 - **Superseded by**: §2.3 の `*_telemetry_stale` の行のうち `cpu_power_ms` を確定しないとした部分と、§3 の同じ趣旨の項は [`0123`](0123-cpu-power-floor-tests.md)
+- **Superseded by**: §2.5 T3 と §2.8 T6 の時間の条件の境界の読み方（trace の壁時計の ±50 ms）と、T3 の落ち着きの判定は [`0124`](0124-trace-wall-clock-tolerance.md)。§2.8 T6 の立ち上がりの測り方と合格の条件（fand の trace で測り tach の更新の閾値と fand の 1 tick を足す・Rear の 90% の時間は記録だけ）は [`0125`](0125-stall-rise-criterion-tach-update.md)。§2.6 T4 の温度の判定で `cpu.package` の操作の直後 15 s を除くことは [`0126`](0126-startup-settle-front-spinup.md)
 - **関連**: [`0028`](0028-fan-control-contracts.md) §2.6〜§2.9 /
   [`0080`](0080-fand-systemd-unit.md) §2.3 / §2.6 / §2.10 /
   [`0118`](0118-hwmon-backend-label-less-headers.md) /
