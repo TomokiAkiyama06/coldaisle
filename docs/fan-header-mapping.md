@@ -287,8 +287,9 @@ GPU の Fan のサービスの下で 600 W のまま合格した（下の「GPU 
 - **残り（未完了）: 約 11 s の経路。** `SIGABRT` で fand が終わらない hang では `TimeoutAbortSec` の 5 s も待つので、
   低い Demand のまま約 11 s 続く。上の試行はすべて約 5.2 s で終わり、Max を確かめた直後に負荷を止めたので、その後の約 6 s の
   上がりを測っていない。0119 §2.13 は `watchdog_timeout_ms` に約 11 s の間の余裕を求めるので、上の表は `SIGABRT` で終わる経路の
-  合格で、`watchdog_timeout_ms` はまだ `confirmed` にしない。試験の方法は所有者が「試験専用の設定で再現する」を選んだ（`safety.yaml` の `watchdog_timeout_ms` と unit の `WatchdogSec` を試験の間だけ
-  どちらも 11 s にし、(i) CPU 全スレッド・(iii) CPU・(iii) GPU を少なくとも行う。設定の中身は実施の前に所有者の承認を要する）
+  合格で、`watchdog_timeout_ms` はまだ `confirmed` にしない。所有者は「試験専用の設定で再現する」方向を選んだ（`safety.yaml` の `watchdog_timeout_ms` と unit の `WatchdogSec` を試験の間だけ
+  どちらも 11 s にし、(i) CPU 全スレッド・(iii) CPU・(iii) GPU を少なくとも行う）。0121 §2.1 は試験専用の設定を §2.8 の T6 にしか認めないので、
+  **実施の前に、その例外と設定の中身を決める決定記録を作り、所有者の承認を得る。** それまではこの試験を行わない
 - (i) / (iii) の直前の `effective` は、アイドルで記録した値（0.43）か、それ + 0.05 以内だった
 - (ii) アイドルの CPU の 51 °C は、負荷の無い条件での一瞬の値（止めてから 8.9 s、Max の 3.6 s 後。約 10 s で 40 °C に戻った）。`RestartSec` 2 s で fand が自動で起動し直した時刻と重なるので、その起動（Python の起動と import）によるものと見ている
 - `ii-gpu600`（10:47）は、fand が 0.96 まで上げても、負荷の開始から約 80 s で GPU コアが中止の見張り（80 °C）に届いて止めた
