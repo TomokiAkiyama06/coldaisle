@@ -275,10 +275,10 @@ sudo ls -l /run/coldaisle-power/ && sudo cat /run/coldaisle-power/cpu-package.js
     （sensor の追加など）、写しにも同じ変更を当てます。`diff /opt/coldaisle/config/internal-telemetry.yaml /etc/coldaisle/internal-telemetry.yaml`
     で `cpu_power` の節だけが違うことを確かめます
 
-### 4.2 GPU の Fan の曲線（coldaisle-gpu-fan。決定記録 0128）
+### 4.2 GPU の Fan の曲線（coldaisle-gpu-fan。決定記録 0128 / 0130）
 
 GPU の Fan は fand（Front / Rear / Top）の外で、root の小さなサービスが GPU コアの温度の曲線
-（45 °C 30 % / 55 °C 50 % / 65 °C 80 % / 70 °C 以上 100 %。`provisional`）で書きます。標準ライブラリだけのソースを
+（45 °C 30 % / 60 °C 40 % / 70 °C 50 % / 76 °C 60 % / 80 °C 75 % / 83 °C 以上 100 %。0130。`provisional`）で書きます。標準ライブラリだけのソースを
 システムの `/usr/bin/python3 -I -S` で動かし、NVML は `ctypes` で呼びます。NVML の Fan の書き込みには `CAP_SYS_ADMIN` が
 要るので、unit はそれだけを持ち、使える device を `/dev/nvidiactl` と `/dev/nvidia0` に絞ります。
 `CAP_SYS_ADMIN` で保護を外せないよう、mount の系統の system call・カーネルの設定の書き込み・namespace の作成も拒みます。
