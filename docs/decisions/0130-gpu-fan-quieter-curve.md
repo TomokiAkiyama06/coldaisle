@@ -1,7 +1,7 @@
 # 決定記録 0130: GPU の Fan の曲線を、600 W で 80 °C の手前に落ち着く静音寄りの値にする
 
 - **種別**: Decision Record
-- **Status**: Proposed
+- **Status**: FINAL（2026-10-14、リポジトリ所有者の承認）
 - **Date**: 2026-10-14
 - **Supersedes**: [`0128`](0128-gpu-fan-curve-service.md) §2.3 の曲線の値（形・検査・ヒステリシス・下げる速さは変えない） /
   [`0121`](0121-hardware-test-procedure.md) §2.1 の中止の基準のうち `gpu.0.core` 83 °C
