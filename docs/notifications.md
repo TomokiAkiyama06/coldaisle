@@ -40,7 +40,9 @@
 | LINE | 🔴 `RAPID_RISE` の発火 → ✅ 解除 |
 | Slack | 🔴 `INTAKE_HIGH` の発火 → ✅ 解除 |
 
-同じアラートが2通以上届いたら連投の抑制が効いていません（#51 の受入基準）。
+正常でも、各アラートには発火と解除の **2通** が届きます。
+**同じ遷移（例: `RAPID_RISE` の発火）が2通以上届いたら**、連投の抑制が効いていません（#51 の受入基準）。
+LLM による発火の説明が別に1通届くのは正常で、連投には当たりません（下の注記）。
 同じ流れはテスト `tests/test_rules.py::test_notify_check_scenario_reaches_each_target_once`
 で宛先を差し替えて固定しています。
 
@@ -56,7 +58,8 @@ uv run --env-file .env coldaisle-daemon --source mock --scenario notify_check --
   シナリオ時間で12分進むため、21時45分以降も避けます
 - 鳴る値は暫定の閾値（`config/rules.yaml`）によるもので、「この値が危険」という意味ではありません。
   受け取る側のチャンネル・グループには、試験であることを先に書いておくと取り違えません
-- `config/ai.yaml` で説明を有効にしていて LLM に繋がる場合は、発火の説明が追加で届くことがあります
+- `config/ai.yaml` で説明を有効にしていて LLM に繋がる場合は、発火の説明が追加で届くことがあります。
+  これは正常で、発火1回につき説明は1通までです（終了時の `notifications` の数には含まれません）
 
 導入先の `/etc/coldaisle/coldaisle.env` で確かめる場合は、そのファイルを読めるユーザーで
 同じコマンドを `--env-file /etc/coldaisle/coldaisle.env` にして実行します。
