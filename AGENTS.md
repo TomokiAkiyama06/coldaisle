@@ -81,6 +81,8 @@ API の設定は環境変数（`COLDAISLE_DB` / `COLDAISLE_METRICS` / `COLDAISLE
    `subprocess` / `eval` / 任意SQL を呼ぶツールを追加しない。LLMからFan DemandやPWMを直接変更しない。
 2. **Fan制御は定義済みControl Pipelineを必ず通す。** Learned MPC / Supervisor が出せるのは `requested_demand` まで。
    `Reactive Guard` と `Critical Safety` を迂回してPWM・hwmonへ書き込む経路を作らない。
+   対象は筐体の Front / Rear / Top。例外は GPU の Fan だけで、決定記録 0128 の root の専用サービスが決定論的な曲線で書き、
+   止まったら GPU 自身の既定の制御へ戻す。それ以外の Fan・ポンプへ pipeline の外から書く経路を足すときは、先に決定記録と承認を要する。
 3. **Critical SafetyはMLから独立させる。** 絶対温度上限、最低安全Demand、CPU cooling floor、tach stall、
    telemetry loss、deadman、emergency Max、Manual safety override は決定論的に実装する。
 4. **学習不足・未知状態を通常状態として扱わない。** Model Confidence / OOD 判定を持ち、低信頼時は

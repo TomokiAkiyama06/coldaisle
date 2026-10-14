@@ -47,7 +47,11 @@ GPU の熱は主に GPU 自身の Fan で冷える。600 W の負荷が続く間
 
 - GPU の Fan は fand の Control Pipeline の対象（Front / Rear / Top）に入れない。fand・Learned MPC・Supervisor・LLM は、
   GPU の Fan を読まないし書かない。AGENTS.md の「AIO Pump は通常制御対象外。高い安全側の固定運用」と同じ扱いにする
-  （AGENTS.md ルール 2 の Control Pipeline は筐体の 3 系統に対するもの）
+  （AGENTS.md ルール 2 の Control Pipeline は筐体の 3 系統に対するもの。本記録と同じ PR で、ルール 2 にこの範囲と
+  GPU の Fan の例外を書き足す。正本の不変条件を先に直し、記録の中だけで例外を宣言しない）
+- AIO ポンプとの違い: ポンプは BIOS の固定だが、このサービスは温度で回転を変える能動的な制御である。そのため、
+  fand の Critical Safety の代わりになる決まり（決定論的な曲線・既定の制御より下げない・止まったら既定の制御へ戻す deadman・
+  戻すまでの時間の上限 2.4）を本記録で定め、Learned・LLM から書き込めない形にする
 - 曲線は決定論的で、ML を使わない。GPU 自身の既定の制御より、どの温度でも同じか高い回転にする（2.3）
 - このサービスが止まったときは、GPU 自身の既定の制御に戻す（2.4）。これは今の運用と同じ状態で、GPU は 93 / 95 / 98 °C で自分を守る
 - fand は変えない。fand の Fallback は今までどおり GPU の温度で筐体の Fan を上げる
@@ -58,15 +62,20 @@ GPU の熱は主に GPU 自身の Fan で冷える。600 W の負荷が続く間
 
 - **中身**: `src/coldaisle/gpu_fan_curve.py`。0122 と同じく**標準ライブラリだけ**を使い、`coldaisle` パッケージを import しない。
   NVML は `ctypes` で `libnvidia-ml.so.1` を開いて使う（pynvml に依存しない）。システムの `/usr/bin/python3 -I -S <ファイル>` で動かす
-- **対象**: NVML の device がちょうど 1 つのときだけ制御する。0 個・2 個以上なら何も書かずに終了コード 2 で終わる
-  （知らない構成の GPU に書かない）。起動時は、device が見つかるまで 1 s ごとに探し直し、60 s（引数）を過ぎたら終了コード 2
+- **対象**: NVML の device がちょうど 1 つのときだけ制御する（知らない構成の GPU に書かない）。
+  起動時は、device がちょうど 1 つになるまで 1 s ごとに探し直し、60 s（引数）を過ぎたら何も書かずに終わる。
+  終了コードは、最後に見た数が 2 個以上なら 2（人が構成を直すまで変わらない。unit は再起動しない）、
+  0 個（NVML が初期化できないときを含む）なら 1（driver の読み込みが遅い・読み込み直しの途中。unit が 2 s 後に起動し直し、
+  また 60 s 待つ。GPU が現れたら、人の操作なしに曲線へ戻る）
 - **周期**: 1000 ms ごと（単調時計）に GPU コアの温度（`nvmlDeviceGetTemperature`）を読み、曲線から目標の回転（%）を求める。
   各 Fan の目標（`nvmlDeviceGetTargetFanSpeed`）が求めた値と違えば `nvmlDeviceSetFanSpeed_v2` で書く。
   driver が自動に戻したときも、次の周期で書き直す
 - **上げ下げ**: 上げるのはすぐ。下げるときは、温度にヒステリシス（2 °C）を足した値で曲線を引き、1 s あたり 1 % までしか下げない
   （100 % から 30 % まで約 70 s。温度の小さな揺れで回転が上下しないようにする）
 - **引数**: 曲線・周期・起動時に device を待つ時間・ヒステリシス・下げる速さは、**すべて unit が渡す必須の引数**にし、
-  コードに既定値を持たない（AGENTS.md ルール 9。0122 と同じく YAML を読まない）
+  コードに既定値を持たない（AGENTS.md ルール 9。0122 と同じく YAML を読まない）。値の置き場所は unit であり、導入先の
+  `/etc/systemd/system` の写しと drop-in が設定にあたる。標準ライブラリだけで動かすため `config/*.yaml` は読まない
+  （0122 で承認した形と同じ）。値を変えるときは、本記録の 2.3 と同じく決定記録と所有者の承認を要する
 - **ログ**: JSON Lines を標準エラーへ出す（journal）。目標の回転が変わったとき・書き直したとき・エラーのときだけ出す
 - **出力**: ファイルや socket は持たない。回転は `coldaisle-telemetry` がすでに `gpu.0.fan_speed` として集めている
 
@@ -97,6 +106,10 @@ GPU の熱は主に GPU 自身の Fan で冷える。600 W の負荷が続く間
 | driver の読み込み直し・GPU のリセット | NVML が自動に戻す。サービスはエラーで終わり、起動し直して曲線を書き直す |
 
 hang の検出に `WatchdogSec=5s` を使う（`sd_notify` は `socket` で `NOTIFY_SOCKET` に送る。標準ライブラリだけで書ける）。
+watchdog の SIGABRT で終わらないとき（`kill -STOP` で止まったまま、など）、systemd は `TimeoutAbortSec=` を待ってから SIGKILL し、
+その後で `ExecStopPost=` を走らせる。既定の 90 s では、低い回転の 600 W で 80 °C に届く約 80 s（Context）より長い。
+そこで unit に `TimeoutAbortSec=2s` と `TimeoutStopSec=5s` を書き、hang から既定の制御へ戻すまでを、おおむね
+5 s（watchdog）+ 2 s（abort）+ `ExecStopPost=` の時間に抑える（2.7 の 1 で、`kill -STOP` から自動に戻るまでの時間を確かめる）。
 落ちたときに 100 % へ固定するのではなく自動に戻すのは、自動は GPU 自身が守る状態で、今の運用と同じだからである。
 自動のままだと 600 W の定常では 80 °C を超えうるが、GPU は自分の上限で守り、fand の Fallback が筐体の Fan を上げる。
 
@@ -111,7 +124,8 @@ hang の検出に `WatchdogSec=5s` を使う（`sd_notify` は `socket` で `NOT
 - sandbox は 0122 に合わせる: `NoNewPrivileges=yes`・`ProtectSystem=strict`・`ProtectHome=yes`・`PrivateTmp=yes`・
   `PrivateNetwork=yes`・`RestrictAddressFamilies=AF_UNIX`・`ProtectKernelModules=yes`・`ProtectControlGroups=yes`・
   `LockPersonality=yes`・`RestrictRealtime=yes`・`SystemCallArchitectures=native`・`ProtectClock=yes`・`ProtectHostname=yes`
-- `Type=notify`・`WatchdogSec=5s`・`Restart=always`・`RestartSec=2`・`RestartPreventExitStatus=2`
+- `Type=notify`・`WatchdogSec=5s`・`TimeoutAbortSec=2s`・`TimeoutStopSec=5s`・`Restart=always`・`RestartSec=2`・
+  `RestartPreventExitStatus=2`（2 は引数の不正・device が 2 個以上・NVML の library が無いときだけ。device が 0 個は 1 で再起動する）
 - `After=systemd-modules-load.service`。fand・telemetry とは依存させない
 - 導入先では、所有者の承認の後に `enable --now` する（Fan に書くので、監視系と違い自動では有効にしない）
 
@@ -123,7 +137,8 @@ SIGTERM と `--restore-default` で自動に戻す・device が 0 個・2 個の
 
 ### 2.7 導入先での確認（実装の後）
 
-1. 起動と停止: `systemctl stop`・`kill -9`・`kill -STOP`（watchdog）で、GPU の Fan が自動（`policy 0`）に戻ること
+1. 起動と停止: `systemctl stop`・`kill -9`・`kill -STOP`（watchdog）で、GPU の Fan が自動（`policy 0`）に戻ること。
+   `kill -STOP` から自動に戻るまでが 10 s 以内であること（2.4 の上限）
 2. アイドルの回転が 30 % のままであること（音が今と変わらない）
 3. GPU 600 W を 15 分: GPU コアが 80 °C 未満で落ち着くこと（100 % 固定では 74 °C）
 4. その後、0121 T5 の ii-gpu600 と iii-gpu600 を、このサービスを動かした状態で行う。T7 も同じ状態で行う
