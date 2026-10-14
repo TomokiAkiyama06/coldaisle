@@ -241,10 +241,38 @@ sudo ls -l /run/coldaisle-power/ && sudo cat /run/coldaisle-power/cpu-package.js
   60 s 待っても見つからなければ何も書かずに終了コード 2 で止まり、再起動しません
   （`journalctl -u coldaisle-cpu-power` に `cpu_power_zone_not_unique`）。見つかった後に読めなくなったら 1 で終わり、再起動します
 - `coldaisle-telemetry` は `Wants=` / `After=` だけで参照します。このサービスが無くても止まっても telemetry は止まりません
-- **値を DB に入れるのは、所有者の承認の後です。** 導入先の `config/internal-telemetry.yaml` の `cpu_power` を
-  `enabled: true` にし、`confirmation` を `status: confirmed` と `basis`（確認した日と承認）にしてから
-  `sudo systemctl restart coldaisle-telemetry` します（既定は無効。confirmed でないと起動時に拒否されます）。
+- **値を DB に入れるのは、所有者の承認の後です。** リポジトリの `config/internal-telemetry.yaml` は無効のまま変えず
+  （別の導入先で確認なしに有効にならないように。0122 §2.3）、導入先の写しで有効にします。
   有効にすると fand の telemetry の健全度と CPU Power の cooling floor が変わります（0122 §2.4）
+
+  1. 値が RAPL の直接の読み取りと合うことを確かめる（アイドルと CPU の負荷の両方）
+  2. 写しを置き、`cpu_power` だけを `enabled: true`、`confirmation` を `status: confirmed` と `basis`（確認した日と承認）にする
+
+     ```bash
+     sudo install -d -o root -g coldaisle -m 0750 /etc/coldaisle   # 2 節の秘匿情報を省いた導入先では、まだ無い
+     sudo install -o root -g coldaisle -m 0640 /opt/coldaisle/config/internal-telemetry.yaml /etc/coldaisle/internal-telemetry.yaml
+     sudoedit /etc/coldaisle/internal-telemetry.yaml
+     ```
+
+  3. 収集・API・ロールアップに写しを読ませる drop-in を置き、起動し直す
+
+     ```bash
+     sudo systemctl edit coldaisle-telemetry   # [Service] で ExecStart= を空にし、元の ExecStart に --config /etc/coldaisle/internal-telemetry.yaml を足す
+     sudo systemctl edit coldaisle-api         # [Service] Environment=COLDAISLE_INTERNAL_TELEMETRY=/etc/coldaisle/internal-telemetry.yaml
+     sudo systemctl edit coldaisle-rollup      # [Service] で ExecStart= を空にし、元の ExecStart に --internal-telemetry /etc/coldaisle/internal-telemetry.yaml を足す
+     sudo systemctl restart coldaisle-telemetry coldaisle-api
+     systemctl cat coldaisle-rollup | grep ExecStart   # 空の ExecStart= の後に --internal-telemetry 付きの1行だけがあること
+     ```
+
+     - **ロールアップの drop-in を省かない。** `coldaisle-rollup` は周期メトリクスの一覧を `--internal-telemetry` の設定から作り
+       （`src/coldaisle/rollup_job.py`）、省くとリポジトリの写し（`cpu_power` は無効）を読みます。
+       すると `power.cpu.package` が周期メトリクスに入らず、収集の止まった区間が1分ロールアップに欠測として残りません
+       （生データの保持期間を過ぎると停止の跡が消える）。`coldaisle-rollup` は timer が起動する oneshot なので restart は要りません
+     - 有効にした後に無効へ戻すときも、写しの `cpu_power` を戻すだけで、3つの drop-in はそのままでかまいません
+
+  - **写しはリポジトリの更新に追従しません。** `/opt/coldaisle` を更新して `config/internal-telemetry.yaml` が変わったら
+    （sensor の追加など）、写しにも同じ変更を当てます。`diff /opt/coldaisle/config/internal-telemetry.yaml /etc/coldaisle/internal-telemetry.yaml`
+    で `cpu_power` の節だけが違うことを確かめます
 
 ## 5. Mac からのデータ移行
 
