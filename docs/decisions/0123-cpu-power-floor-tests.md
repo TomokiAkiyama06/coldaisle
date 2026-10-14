@@ -81,6 +81,9 @@ floor の reason（`cpu_power_unavailable` はその detail）が trace に出�
 | その間の telemetry の健全度と Guard の閾値 | 健全度の連動 | 健全度が `DEGRADED`、Guard が degraded の閾値（`threshold_profile` が `conservative`）になる |
 | 戻した後 | 復帰 | 新しい sample を観測した tick から power の項が戻り、健全度が `NORMAL`（ほかの入力がそろっているとき）に戻る |
 
+一時停止の間に Reactive Guard の floor が 0.35 を超えると、Top の `bound_by` が Guard の floor になり、`cpu_power_unavailable` が
+trace に出ない。その試行は「判定できない」として合否に数えず、アイドルでやり直す（2026-10-14 の所有者の判断）。
+
 ### 2.3 0121 の T1（soak）への追加
 
 0121 §2.3 の `*_telemetry_stale` の行は、`cpu_power_ms` も他と同じく数える（`cpu_power_unavailable` が出た回数。収集が止まった時間を除き 0 回）。
