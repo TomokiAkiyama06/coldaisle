@@ -43,6 +43,7 @@ uv run coldaisle-eventd             # 書き込み専用の Unix ソケット入
 uv run coldaisle-event gpu-mode compute  # GPU Mode の切り替えを記録する（#67）
 uv run coldaisle-event workload-hint training --expected-duration 4h  # Workload Hint を記録する（記録のみ。#107 / 決定記録 0064）
 uv run coldaisle-telemetry --once   # NVML / hwmon を1回収集（#65）
+# GPU の Fan の曲線（coldaisle-gpu-fan）は root の unit でだけ動かす。手順は docs/ubuntu-deploy.md 4.2（#285 / 決定記録 0128）
 uv run coldaisle-fand --max-ticks 5 # 3系統Fan制御デーモン（simulated backend。#74 / 決定記録 0028）
 uv run coldaisle-fand --config-dir var/control-config  # 4ファイル（air-balance.yaml を含む）を置いた設定で起動。無ければ全 zone Max（決定記録 0073）
 #   管理ソケットは config/control-admin.yaml（--admin-config）。不正なら開かず AUTO で運転。--no-admin で開かない（決定記録 0072）
@@ -136,6 +137,8 @@ PWM
 
 - Front / Rear / Top は3系統独立制御。ただし推定実効風量とAir Balanceを共有して協調する。
 - AIO Pump は通常制御対象外。BIOS / safety設定で高い安全側の固定運用を基本とする。
+- GPU の Fan も fand の制御対象外。root の専用サービス `coldaisle-gpu-fan` が GPU コアの温度の決定論的な曲線で書き、
+  止まったら GPU 自身の既定の制御へ戻す。fand・Learned・LLM から読まない・書かない（決定記録 0128）。
 - 初期学習中でもアーキテクチャは完成形を使うが、制御権は段階的に解放する。
   Shadow → authority制限 → full authority の順とし、低Confidence時はFallbackへ退避する。
 - Supervisorは「負荷があと何時間続くか」を断定しない。観測履歴から `IDLE / TRANSIENT_* / SUSTAINED_* / COOLDOWN / UNKNOWN`
@@ -272,6 +275,7 @@ src/coldaisle/
   authority_cli.py # 合成の起点: `coldaisle-authority raise` / `rollback`。`raise_stage()` を呼ぶ唯一の場所。**どこからも import しない**。#92 / 決定記録 0086
   rollup_job.py # 合成の起点: `coldaisle-rollup` の入口（周期メトリクスを Store へ渡す）。#65
   cpu_power_publisher.py # root の `coldaisle-cpu-power`: RAPL の CPU Package 電力を 1 s 平均・1 W で `/run` へ書く。**標準ライブラリだけ・coldaisle を import しない**（`python3 -I -S`）。#278 / 決定記録 0122
+  gpu_fan_curve.py # root の `coldaisle-gpu-fan`: GPU の Fan を GPU コアの温度の曲線で書く（NVML を ctypes で。fand の外）。止まったら既定の制御へ戻す。**標準ライブラリだけ・coldaisle を import しない**（`python3 -I -S`）。#285 / 決定記録 0128
   calibration_log.py # 合成の起点の部品: 較正の変更の記録（取り込みの起動時の lock と追記・運転中の時刻の下限・Dataset v2 と学習の入口の検査）。書き手は取り込みだけ。#233 / 決定記録 0099
   control_daemon.py # 合成の起点: Fan制御デーモン。**hwmonへ書くのはこのプロセスだけ**。#74
   store/      # L1: SQLite、ロールアップ、CSVエクスポート

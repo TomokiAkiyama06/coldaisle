@@ -15,6 +15,7 @@
 | `deploy/systemd/coldaisle-api.service` | 読み取り API とダッシュボード（`127.0.0.1:8000`）。`Restart=always` |
 | `deploy/systemd/coldaisle-telemetry.service` | Internal Telemetry（NVML / hwmon / `/proc/stat`）。`Restart=always`。基板が無くても動く（決定記録 [`0117`](decisions/0117-telemetry-unit.md)） |
 | `deploy/systemd/coldaisle-cpu-power.service` | CPU Package の電力（RAPL）を root で読み、1 s 平均・1 W 単位で渡す（4.1。決定記録 0122） |
+| `deploy/systemd/coldaisle-gpu-fan.service` | GPU の Fan を GPU コアの温度の曲線で書く（fand の外。4.2。決定記録 0128）。**Fan に書くので所有者の承認の後に `enable`** |
 | `deploy/systemd/coldaisle-rollup.service` / `.timer` | ロールアップと保持期間の適用。毎日 03:00 |
 | `deploy/systemd/coldaisle-report.service` / `.timer` | 前日の日次レポート。毎朝 08:05（ロールアップのあと） |
 | `deploy/udev/99-coldaisle-sensors.rules` | センサー基板に `/dev/server-sensors` の固定名を付ける |
@@ -273,6 +274,36 @@ sudo ls -l /run/coldaisle-power/ && sudo cat /run/coldaisle-power/cpu-package.js
   - **写しはリポジトリの更新に追従しません。** `/opt/coldaisle` を更新して `config/internal-telemetry.yaml` が変わったら
     （sensor の追加など）、写しにも同じ変更を当てます。`diff /opt/coldaisle/config/internal-telemetry.yaml /etc/coldaisle/internal-telemetry.yaml`
     で `cpu_power` の節だけが違うことを確かめます
+
+### 4.2 GPU の Fan の曲線（coldaisle-gpu-fan。決定記録 0128）
+
+GPU の Fan は fand（Front / Rear / Top）の外で、root の小さなサービスが GPU コアの温度の曲線
+（45 °C 30 % / 55 °C 50 % / 65 °C 80 % / 70 °C 以上 100 %。`provisional`）で書きます。標準ライブラリだけのソースを
+システムの `/usr/bin/python3 -I -S` で動かし、NVML は `ctypes` で呼びます。NVML の Fan の書き込みには `CAP_SYS_ADMIN` が
+要るので、unit はそれだけを持ち、使える device を `/dev/nvidiactl` と `/dev/nvidia0` に絞ります。
+`CAP_SYS_ADMIN` で保護を外せないよう、mount の系統の system call・カーネルの設定の書き込み・namespace の作成も拒みます。
+曲線は `--gpu-name` の型番（`NVIDIA RTX PRO 6000 Blackwell Workstation Edition`）で確かめたもので、NVML の名前が違えば
+何も書かずに終了コード 2 で止まります（`gpu_fan_model_mismatch`。GPU を交換したときは曲線を確かめ直し、決定記録と unit を直す）。
+
+**Fan に書くので、所有者の承認の後に有効にします。**
+
+```bash
+sudo cp /opt/coldaisle/deploy/systemd/coldaisle-gpu-fan.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now coldaisle-gpu-fan.service
+# 目標の回転が journal に出る。アイドルは 30 %（policy 1 = 手動）
+journalctl -u coldaisle-gpu-fan -n 5 --no-pager
+nvidia-smi --query-gpu=temperature.gpu,fan.speed --format=csv
+```
+
+- 止めたとき（`systemctl stop`）・落ちたとき・hang（`WatchdogSec=5s`）・NVML のエラーのときは、GPU 自身の既定の制御へ戻します。
+  落ちたときは unit の `ExecStopPost=`（`--restore-default`）が戻します。hang（`kill -STOP` など）では、watchdog の 5 s と
+  `TimeoutAbortSec=2s` の後に戻します。戻しの処理も `TimeoutStopSec=3s` で打ち切るので、hang から 10 s 以内に終わります
+- 起動時は NVML の device がちょうど1つになるまで 1 s ごとに探し直し、60 s を過ぎたら何も書かずに終わります
+  （`journalctl -u coldaisle-gpu-fan` に `gpu_fan_device_not_unique`）。device が 0 個なら終了コード 1 で、2 s 後に起動し直して
+  また待ちます（driver の読み込みが遅いとき）。2 個以上なら終了コード 2 で止まり、再起動しません
+- 回転は `coldaisle-telemetry` が `gpu.0.fan_speed` として集めます。fand・telemetry とは依存しません
+- 曲線を変えるときは、決定記録と所有者の承認を経て unit の `--curve` を変えます
 
 ## 5. Mac からのデータ移行
 
