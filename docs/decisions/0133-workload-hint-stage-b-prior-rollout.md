@@ -157,8 +157,10 @@ Stage B の骨格は既に FINAL の記録で決まっている。本記録は�
     ヒント有りの solve の進み具合を見ない
   - **Shadow solver は基準のプロセスが起動する子プロセス 1 つ**とする（別の uid でなくてよい。同じ unit・同じ cgroup
     に入るので、unit の停止で一緒に止まる。親が死んだら子も終わる（`PR_SET_PDEATHSIG`））。子は起動の直後に
-    自分の**スケジューリングを `SCHED_IDLE` に下げる**（特権なしで下げられる。下げられなければ `nice` を設定の最大値へ
-    上げ、それも失敗したら子を起動せず `shadow_unavailable` とする）。基準のプロセスの優先度は変えない。
+    自分の**スケジューリングを `SCHED_IDLE` に下げる**（Linux では特権なしで下げられる）。下げたことを
+    `sched_getscheduler` で確かめるまで、artifact の読み込みも solve も始めない。**`SCHED_IDLE` に下げられない・
+    確かめられないときの扱いは1つだけ**: 子は何もせずに終了し、親はその run の間は子を作り直さず、Shadow solver を
+    `shadow_unavailable` とする（＝その run では B1 を使えない。`nice` などで代えない）。基準のプロセスの優先度は変えない。
     これで、CPU が空いていないとき子は基準のプロセスより後に回され、基準が子を待つことは無い
   - 子は fand のソケットを持たない（役割ごとの接続は1つのまま。0077）。子は親が束縛した artifact の識別
     （`expected_artifacts` と digest）を受け取り、自分で読んで digest が一致したときだけ解く。一致しなければ
@@ -167,6 +169,26 @@ Stage B の骨格は既に FINAL の記録で決まっている。本記録は�
     依頼を捨てる（`hint_prior_skipped: shadow_busy`。待ち行列を作らない）。子から親への結果も非同期の pipe で返し、
     親は**基準の solve の外**（frame を待つ間の受信の多重化の中）でだけ読み、fand へ別のメッセージとして転送する。
     転送は I/O だけで、モデルの評価をしない
+  - **転送は期限つき・ノンブロッキングで、詰まったら Shadow の記録を捨てる。** いまの `WorkerChannel._send()`
+    （`learned_worker/client.py`）は、共有の送信 lock（heartbeat のスレッドと共有）の下で期限の無いブロッキングの
+    `send` を行う。基準の `MpcProposal` と heartbeat の送信はこのまま変えず、Shadow の記録には別の送信の入口を設ける:
+    - **転送するのは周期のループのスレッドだけ**（基準の送信と同じスレッド）なので、Shadow の転送と基準の送信が
+      並行することは無い。heartbeat のスレッドとは lock を共有するが、Shadow の転送は lock を
+      **`acquire(blocking=False)`** で取り、取れなければその回は送らない（次の待ちの間に再び試す）。lock を持つ間に
+      行うのは `MSG_DONTWAIT` の `send` 1 回だけで、`EAGAIN` / `EWOULDBLOCK` なら送らずに lock を離す
+      （`ChannelClosed` にしない。経路の切断として扱うのは基準・heartbeat の送信の失敗だけ）
+    - **送る前に、経路の送信待ちが空であることを確かめる**（`SIOCOUTQ` で、fand がまだ読んでいないバイトが 0）。
+      空でなければ送らない。これで Shadow の記録が経路のバッファに積み上がり、次の基準の `MpcProposal` の
+      `send` を待たせることが無い（Shadow の記録が経路に残るのは高々 1 件）。経路の送信バッファは
+      `max_message_bytes + max_shadow_record_bytes` 以上であることを起動時に確かめ、満たさなければ B1 を使わない
+      （`shadow_unavailable`）
+    - **期限**: 親が持てる未転送の記録は 1 件だけ（新しいものが来たら古いものを捨てる）。転送できないまま、その記録の
+      元になった frame の次の基準の周期の開始（`next_due`）を過ぎたら捨てる。いずれも
+      `hint_prior_skipped: shadow_dropped_backpressure` として数える（数は trace のヒントの塊に載せる）
+    - **大きさの上限**: Shadow の記録 1 件の符号化後の大きさを `config/learned-channel.yaml` の
+      `limits.max_shadow_record_bytes`（`max_message_bytes` 以下。ルール 9）で抑える。超えたら切り詰めずに捨てる
+      （`shadow_record_too_large`）。fand の受信側も同じ上限で検査する。全 offset の予測を載せるので、上限は
+      horizon と offset の数から見積もって設定に置く
   - 打ち切り時刻は `min(基準の solve の開始 + mpc.budget_ms, 次の基準の周期の開始 next_due)` を
     `CLOCK_MONOTONIC` の絶対時刻で渡す（同じホストの別プロセスで同じ時計）。子は評価の境目ごとにこれを見て
     自分で打ち切る。親は子を待たない。0066 §2.1 (d) の「予算を共有する」はこの上限として残る
@@ -184,16 +206,22 @@ Stage B の骨格は既に FINAL の記録で決まっている。本記録は�
     流し、Shadow solver を偽物にして遅らせる（周期をまたぐ）・例外にする・死なせる・応答させない各場合で、
     各周期の基準の `MpcProposal` の内容と送信時刻（注入した時計）が、ヒントを扱わない worker と一致すること。
     依頼が溜まらない（`shadow_busy`）こと。子の死で親が終了しないこと。基準の送信が子への依頼より先に起きること
+  - **fand 側の受信が詰まった場合**（試験の偽 fand が読むのを遅らせる・止める・バッファを小さくする）: Shadow の
+    記録を毎周期出させた worker と、ヒントを扱わない worker とで、同じ詰まり方のもとで基準の `MpcProposal` の
+    送信時刻と送信の成否が一致すること。Shadow の記録が `shadow_dropped_backpressure` で捨てられ、経路に
+    2 件以上残らないこと。heartbeat のスレッドが lock を持っている間に Shadow の転送が待たないこと。
+    `max_shadow_record_bytes` を超える記録が送られないこと
   - **実時間の CPU の取り合いを含む試験**: 実際の子プロセスを `SCHED_IDLE` で起動し、子に**全コアを使い切る重い計算**
     （論理 CPU の数だけの計算ループ）を走らせた状態と、子を起動しない状態とで、同じ frame の列（数百周期）を
-    実時間で流す。各周期の「`next_due` から基準の `MpcProposal` を送るまでの時間」の分布を比べ、
+    実時間で流す（fand 側の受信を遅らせる条件も含める）。各周期の「`next_due` から基準の `MpcProposal` を送るまでの時間」の分布を比べ、
     p50 / p99 / 最大の差が許容幅（`config/` の試験用の設定に置く。ルール 9）に収まること。
     実時間に依存するので通常の CI の `-m "not hardware"` からは分け（専用の marker）、リリースゲートと B1 の着手前に
     **本番のホスト**で走らせる。B1 の前提に「本番のホストでこの試験に合格」を加える
   - 同じ frame の列に対し、`stage: off` と `stage: shadow_mpc` で、各 tick の `requested_demand` /
     `effective_demand` が一致すること
   - B1 で、ヒント有りの記録が `MpcProposal` の slot へ入らず、`hint_shadow` の記録にだけ現れること
-  - `SCHED_IDLE` に下げられない環境では子を起動しないこと（`shadow_unavailable`）
+  - `SCHED_IDLE` に下げられない（下げたことを確かめられない）環境では、子が artifact の読み込みも solve も始めずに
+    終了し、親がその run の間は作り直さず `shadow_unavailable` になること
 - **fand が再検査する。** 0066 §2.1 (d) の 2 条件（系統ごとに `demand_hint >= demand_base - eps`、
   かつ両 plan の予測のすべての offset で CPU / GPU が `hint <= base + eps_c`）と認証領域の判定を、
   worker の判定とは別に fand の中で決定論的に行い、両方が通ったときだけヒント有りの plan を
@@ -238,7 +266,8 @@ Stage B の骨格は既に FINAL の記録で決まっている。本記録は�
 - **保持**: `config/retention.yaml` に `hint_shadow_days` を足す（ルール 9）。既定の値は `control_trace_days` と同じに
   する（突き合わせる相手の trace より長く残しても join できないため）
 - **突き合わせ（join の契約）**: `hint_shadow_records` の1行は、`control_traces` の主キー
-  `(ts_ms, tick_id) = (source_ts_ms, source_tick_id)` の行と、その trace の `run_id` が記録の `run_id` と等しいときだけ
+  `(ts_ms, tick_id) = (source_ts_ms, source_tick_id)` の行と、その trace の最上位の `run_id`（§2.9 で必須にする欄。
+  `mode_command.run_id` ではない）が記録の `run_id` と等しいときだけ
   対応する。対応する trace の行が無い（保存に失敗した・保持で消えた）記録は集計で「対応なし」として数え、捨てない。
   基準の plan が実際に使われたかは、元 snapshot が同じ基準の `MpcProposal` を Gate が評価した tick（0053 の台帳の側）
   から引く。**`ts_ms` だけ・`tick_id` だけでは突き合わせない**（再起動で `tick_id` が戻り、壁時計は飛ぶため）
@@ -298,7 +327,10 @@ Stage B の骨格は既に FINAL の記録で決まっている。本記録は�
 | Learned MPC worker の停止・timeout・モデル読込の失敗・Gate の退避 | 既存のとおり Fallback で運転。Fallback はヒントを読まないので、ヒントの効き目は自動的に 0 | `hint_prior_skipped: mpc_unavailable` |
 | 二重解法で予算が尽きた・ヒント有りが解けない | 基準の plan を使う | `budget_exhausted`（0066） |
 | Shadow solver が前の solve の途中 | 新しい依頼を捨て、基準の plan を使う | `shadow_busy` |
-| Shadow solver の子プロセスが死んだ・応答しない・`SCHED_IDLE` に下げられない | 子を作り直す（下げられなければ起動しない）。基準の周期と plan はそのまま | `shadow_unavailable` |
+| Shadow solver の子プロセスが死んだ・応答しない | 子を設定の間隔で作り直す。基準の周期と plan はそのまま | `shadow_unavailable` |
+| 子が `SCHED_IDLE` に下げられない・確かめられない | 子は何もせず終了し、その run の間は作り直さない（B1 は使えない。`nice` で代えない） | `shadow_unavailable` |
+| Shadow の記録を fand へ送れない（lock が取れない・送信待ちが空でない・`EAGAIN`・期限切れ） | その記録を捨てる。基準の送信は待たない | `shadow_dropped_backpressure` |
+| Shadow の記録が `max_shadow_record_bytes` を超える | 切り詰めずに捨てる | `shadow_record_too_large` |
 | ヒント有りの記録の検証（新しさ・`run_id`・artifact・対の基準）に落ちた | その記録だけを捨て、基準の plan を使う（基準は自分の検証が失敗したときだけ拒む） | `hint_record_rejected` |
 | 認証領域の外・単調性の再検査が不合格 | 基準の plan を使う | `out_of_certified_domain` / `monotonicity_violated`（0066） |
 | ハッシュの不一致・記録が無い | 実効の段階を B0（記録だけ）に留める（0066 §2.1 (c)） | `certification_mismatch` |
@@ -324,6 +356,27 @@ Stage B の骨格は既に FINAL の記録で決まっている。本記録は�
 
 `ControlTick` の schema version を1つ上げ、古い version の trace にこの塊を持たせない（0064 §2.9 の規律）。
 `note`・生の `source`・`peer_uid` は載せない（0064 §2.9 のまま）。
+
+**fand の起動ごとの `run_id` をすべての trace に必ず載せる。** §2.5a の突き合わせは trace の `run_id` を使うが、
+いまの `ControlTick` で `run_id` を持つのは `mode_command`（`ModeCommandRecord.run_id`。v12）だけで、これは任意であり、
+管理ソケットを開かない構成（`--no-admin`）では `None` になる。そこで:
+
+- 上と同じ版上げで、`ControlTick` の最上位に **`run_id`（必須。`RUN_ID_PATTERN` の形）** を足す。値は `control_daemon.py` が
+  起動ごとに1つ作る `run_id`（`new_run_id()`。管理ソケットの監査と Learned の経路の封筒が既に共有しているもの。0077 §2.3）。
+  **ヒントの段階・管理ソケットの有無・Learned の経路の有無に関わらず、その版以降に fand が書くすべての tick に載せる**
+  （`stage: off` でも載せる。`--no-admin` でも載せる）
+- 同じ tick に `mode_command.run_id` があるときは、最上位の `run_id` と等しいことを `ControlTick` の検証で確かめる
+  （食い違う trace は作らない）
+- 古い版の trace には `run_id` を持たせない（足さない・推測で埋めない）。古い版の trace と対応する `hint_shadow` の記録は
+  存在しない（B1 は新しい版の後にしか動かない）ので、突き合わせに穴は生じない。古い版の trace の `mode_command.run_id` を
+  最上位の `run_id` として読み替えない
+- **0071 との関係**: 0071 §2.3 は本文（`body`）を保存した JSON のまま返し、外枠（`seq` / `ts_ms` / `tick_id` /
+  `schema_version` / `age_ms`）は `/api/v1` に属して `ControlTick` の版で変わらない、と決めている。`run_id` は本文の中の
+  欄なので、`/api/v1` の形は変わらない。画面の変換（`airflow-trace.js`）は新しい版を知るまで「未対応の版」と出す
+  （0071 §2.3 の規律のまま）ので、版の追加と同じ PR で変換と fixture を更新する。`run_id` は起動ごとの乱数の識別子で、
+  個体識別子を含まない（`learned_channel/messages.py` の形。v12 の `mode_command` で既に本文に出ている）ので、
+  0071 の LLM との境界（`/api/v1/tools` に載せない）とルール 10 に触れない
+- Supervisor の shadow 集計（0074）の鍵 `(ts_ms, tick_id)` は変えない。`run_id` は §2.5a の突き合わせの検算に加わるだけ
 
 ---
 
@@ -364,6 +417,9 @@ Stage B の骨格は既に FINAL の記録で決まっている。本記録は�
 | **ハッシュ不一致のとき B1 に下げて二重解法を測り続ける** | 0066 §2.1 (c) は不一致・記録無しで Stage B を無効（記録のみ）にすると定めている。未認証の組み合わせで MPC worker の挙動を変える段階を動かさない。B0 に留める |
 | **ヒント有りの solve を周期のループの中で、基準の送信の後に同期に回す** | `PeriodicWorker.run()` は終わった時刻から次の周期を数えるので、ヒント有りが遅れた分だけ次の基準の solve がずれ、提案が失効して Fallback になりうる。別プロセスの Shadow solver に切り離し、次の周期で打ち切る（§2.5） |
 | **Shadow solver を同じプロセスの別スレッドにし、重なりは B1 で測ってから決める** | GIL と CPU の取り合いで打ち切りの合図が効くまで基準の solve が待たされうる。分離を B1 の前に構造で保証するため、最初から `SCHED_IDLE` の子プロセスにする（§2.5） |
+| **Shadow の記録も基準と同じ `_send()`（共有 lock・期限なしのブロッキング送信）で送る** | fand の受信が詰まると、Shadow の記録の送信が lock を持ったまま止まり、基準の `MpcProposal` と heartbeat の送信を待たせる。Shadow の記録はノンブロッキング・期限つきで、詰まったら捨てる（§2.5） |
+| **`SCHED_IDLE` に下げられないとき `nice` で代える** | `nice` は CPU が混んでいるときも子に時間を配るので、§2.5 の「基準が子を待たない」の前提が成り立たない。扱いを1つにし、B1 を使わない |
+| **突き合わせに `mode_command.run_id` を使う** | 任意の欄で、`--no-admin` では `None` になる。最上位の必須の `run_id` を足す（§2.9） |
 | **遅れて届くヒント有りの記録を 0053 の Shadow の台帳に書く** | 0053 の台帳は不変の `ControlTick` に埋め込まれ、その tick に Gate が評価した候補を記録する。後から届き Gate が評価しない記録は入らない。0053 を変えず、別の追記専用の `hint_shadow` の記録にする（§2.5a） |
 | **ヒント有りの記録の検証が落ちたら基準の提案も捨てる** | 任意の機能の失敗で基準の MPC を失い、Fallback に落ちる。基準は自分の検証でだけ拒む（§2.5） |
 | **B1 で二重解法の両方の結果を1つの提案にまとめて送る** | ヒント有りの solve の分だけ基準の解の到着が遅れ、B1 が `requested_demand` の時刻に影響する。基準を先に公開し、ヒント有りは別の Shadow 用の記録にする（§2.5） |
