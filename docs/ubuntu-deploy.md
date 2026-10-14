@@ -249,6 +249,7 @@ sudo ls -l /run/coldaisle-power/ && sudo cat /run/coldaisle-power/cpu-package.js
   2. 写しを置き、`cpu_power` だけを `enabled: true`、`confirmation` を `status: confirmed` と `basis`（確認した日と承認）にする
 
      ```bash
+     sudo install -d -o root -g coldaisle -m 0750 /etc/coldaisle   # 2 節の秘匿情報を省いた導入先では、まだ無い
      sudo install -o root -g coldaisle -m 0640 /opt/coldaisle/config/internal-telemetry.yaml /etc/coldaisle/internal-telemetry.yaml
      sudoedit /etc/coldaisle/internal-telemetry.yaml
      ```
