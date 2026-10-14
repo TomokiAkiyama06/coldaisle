@@ -6,18 +6,22 @@
 秘匿情報はテストにも書かない（#41）。
 """
 
+import io
 import json
+import logging
 from pathlib import Path
 
 import httpx
 import pytest
 
+from coldaisle import logs
 from coldaisle.clock import SimulatedClock
 from coldaisle.notify import Notification, NotifyConfig, Router, StdoutNotifier
 from coldaisle.notify.notifiers import (
     LINE_TO_ENV,
     LINE_TOKEN_ENV,
     SLACK_WEBHOOK_ENV,
+    DeliveryError,
     LineNotifier,
     SlackNotifier,
 )
@@ -465,3 +469,57 @@ def test_explanation_is_sent_once_per_firing(config):
     sender.notify(notification())
     assert sender.notify(notification(kind="explanation", body="x")) is True
     assert sender.notify(notification(kind="explanation", body="x")) is False
+
+
+# ---------------------------------------------------------------- 秘匿情報をログに出さない（#305）
+
+SECRET_WEBHOOK = (
+    "https://hooks.slack.com/services/TFAKE/BFAKE/secret-token-for-test"  # pragma: allowlist secret
+)
+
+
+@pytest.mark.parametrize(
+    "respond",
+    [
+        lambda request: httpx.Response(404),
+        lambda request: (_ for _ in ()).throw(httpx.ConnectError("boom", request=request)),
+    ],
+    ids=["http-status", "transport"],
+)
+def test_slack_failure_never_carries_the_webhook_url(respond):
+    """httpx の例外の文には URL が入る。送信の失敗は URL を含まない例外に置き換える。"""
+    client = httpx.Client(transport=httpx.MockTransport(respond))
+    with pytest.raises(DeliveryError) as raised:
+        SlackNotifier(SECRET_WEBHOOK, client=client).send(notification())
+    assert "secret-token-for-test" not in str(raised.value)
+    assert raised.value.__suppress_context__
+    assert raised.value.__cause__ is None
+
+
+def test_failed_delivery_log_does_not_leak_the_webhook_url(config):
+    """`Router` は失敗を exc_info で残す。整形した行に URL が出ないこと。"""
+    stream = io.StringIO()
+    logs.configure("INFO", stream)
+    client = httpx.Client(transport=httpx.MockTransport(lambda request: httpx.Response(403)))
+    sender = router(
+        config,
+        SimulatedClock(NOON_MS),
+        slack=SlackNotifier(SECRET_WEBHOOK, client=client),
+        stdout=Recorder("stdout"),
+    )
+    sender.notify(notification())
+    text = stream.getvalue()
+    assert "通知の送信に失敗した" in text
+    assert "slack: HTTP 403" in text
+    assert "secret-token-for-test" not in text
+
+
+def test_successful_delivery_does_not_log_the_webhook_url(config):
+    """httpx は info で URL を出す。`logs.configure` は httpx / httpcore を warning にする。"""
+    stream = io.StringIO()
+    logs.configure("INFO", stream)
+    client = httpx.Client(transport=httpx.MockTransport(lambda request: httpx.Response(200)))
+    SlackNotifier(SECRET_WEBHOOK, client=client).send(notification())
+    assert logging.getLogger("httpx").getEffectiveLevel() == logging.WARNING
+    assert logging.getLogger("httpcore").getEffectiveLevel() == logging.WARNING
+    assert "secret-token-for-test" not in stream.getvalue()
