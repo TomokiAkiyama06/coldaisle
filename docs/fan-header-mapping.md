@@ -250,3 +250,31 @@ fand の trace で測った値（2026-10-14 07:46〜07:50。試験の側から�
 
 - `startup_settle_ms` 5000 では Front が全開に届く前に Demand が下がり始める。0126 で 15000 にする
 - 08:06 の takeover（BIOS の約 680 RPM から）でも、Front は 5.6 s で 1498 RPM（全開の 83%）だった
+
+### T5: watchdog（2026-10-14 09:47〜11:52）
+
+本番の設定（drop-in なし・`startup_settle_ms` 15000）で fand を auto で動かした。systemd の `WatchdogTimestampMonotonic`（最後の
+`WATCHDOG=1` を受けた時刻）が変わった直後に `SIGSTOP` し、Max（3 zone の `pwmN_enable=0`）を 20 ms ごとに読んで時間を測った。
+時刻はどちらも CLOCK_MONOTONIC。Max を確かめたら負荷を止め、30 s 見てから `systemctl stop` で BIOS へ戻した。
+GPU 600 W で落ち着いた状態は作れないので、(ii) と (iii) の温めは 450 W に置き換えた（[0127](decisions/0127-t5-gpu-steady-450w.md)）。
+
+| 条件 | 位相 | `SIGSTOP` から Max | 止める直前の `effective`（F / R / T） | 開始 → 最高（Max の後 30 s まで）CPU / GPU / 12V-2x6 °C | 判定 |
+|---|---|---|---|---|---|
+| (ii) アイドル | 2.3 ms | 5294 ms | 0.43 / 0.43 / 0.43 | 39 → 51 / 29 → 29 / 27 → 27 | 合格 |
+| (i) GPU 600 W | 1.8 ms | 5163 ms | 0.42 / 0.42 / 0.42 | 40 → 60 / 29 → 39 / 26 → 28 | 合格 |
+| (i) CPU 全スレッド | 0.8 ms | 5182 ms | 0.40 / 0.40 / 0.40 | 40 → 72 / 29 → 29 / 27 → 27 | 合格 |
+| (ii) GPU 300 W | 2.8 ms | 5143 ms | 0.65 / 0.65 / 0.65 | 65 → 68 / 63 → 63 / 41 → 41 | 合格 |
+| (ii) GPU 450 W | 2.6 ms | 5143 ms | 0.85 / 0.85 / 0.85 | 65 → 65 / 75 → 75 / 46 → 46 | 合格 |
+| (iii) 450 W で 10 分 → GPU 600 W | 1.9 ms | 5144 ms | 0.48 / 0.48 / 0.48 | 45 → 64 / 49 → 68 / 43 → 43 | 合格 |
+| (ii) CPU 全スレッド | 8.0 ms | 5220 ms | 0.89 / 0.89 / 1.0 | 76 → 76 / 29 → 29 / 26 → 26 | 合格 |
+| (iii) CPU 10 分 → CPU 全スレッド | 2.6 ms | 5221 ms | 0.47 / 0.47 / 0.47 | 43 → 74 / 29 → 29 / 26 → 26 | 合格 |
+
+- 合格の条件（0121 §2.7）: `SIGSTOP` から Max まで約 11 s 以内、開始 + 上昇が上限より 5 °C 以上低い（CPU・GPU 85 °C 未満、
+  T_SENSOR の 12V-2x6 75 °C 未満）。最も高かったのは (iii) CPU の 74 °C
+- Max までは 5143〜5294 ms で、どれも watchdog の 5 s の直後だった。systemd は止まったプロセスにも `SIGABRT` を届け
+  （`Killing process … with signal SIGABRT`）、`TimeoutAbortSec` の SIGKILL を待たずに ExecStopPost の引き継ぎ
+  （`safety_handoff_completed`）が Max を書いた。最悪の約 11 s（0119 §2.12）にはならなかった
+- (i) / (iii) の直前の `effective` は、アイドルで記録した値（0.43）か、それ + 0.05 以内だった
+- (ii) アイドルの CPU の 51 °C は、負荷の無い条件での一瞬の値（止めてから 8.9 s、Max の 3.6 s 後。約 10 s で 40 °C に戻った）。`RestartSec` 2 s で fand が自動で起動し直した時刻と重なるので、その起動（Python の起動と import）によるものと見ている
+- `ii-gpu600`（10:47）は、fand が 0.96 まで上げても、負荷の開始から約 80 s で GPU コアが中止の見張り（80 °C）に届いて止めた
+- 1 回目の書き出しが 2 回目で上書きされたので、DB から書き出し直した（`t5-0947-*`）。`/var/crash` の fand の記録は増えていない
