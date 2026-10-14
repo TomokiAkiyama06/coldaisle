@@ -142,8 +142,23 @@ Stage B の骨格は既に FINAL の記録で決まっている。本記録は�
 - `supervisor_hint` を入れるのは、§2.6 の段階が **B1 以上**で、ヒントが `active`・対応表に鍵があり・
   ヒント有りの context が基準と違う tick だけ。それ以外は `None`
 - **MPC worker は 0066 §2.1 (d) のとおり二重解法を行う。** 先に基準を解き、残りの `mpc.budget_ms` と
-  `mpc.optimizer.max_evaluations` でヒント有りを解く。予算は増やさない。worker の提案には
-  基準の plan に加えて、ヒント有りの plan（解けたとき）と、解かなかった・使えない理由（閉じた語彙）を載せる
+  `mpc.optimizer.max_evaluations` でヒント有りを解く。予算は増やさない
+- **基準の解を先に公開する。** worker は基準の solve が終わった時点で、その結果を**いまと同じ `MpcProposal`**
+  として経路へ送る（ヒント有りの solve を待たない）。ヒント有りの plan（解けたとき）と、解かなかった・
+  使えない理由（閉じた語彙）は、その後に**別のメッセージ**（同じ `run_id` と元 snapshot に束縛した
+  Shadow 用の記録）として送る。したがって fand が基準の解を受け取る時刻は、ヒントを扱わない worker と
+  変わらない。ヒント有りの solve が遅れても・失敗しても、基準の `MpcProposal` の経路には何も起きない
+- **B1 は `requested_demand` の値にも時刻にも影響しない。** B1 では fand はヒント有りの記録を Shadow の台帳へ
+  渡すだけで、受け渡し口（`MpcProposal` の slot）にも Gate にも入れない。基準の `MpcProposal` が受け渡し口に
+  届く時刻・内容・その後の Gate / Guard / Safety の結果は、`stage: off` の場合と同じである
+- 試験で固定する（Mock の worker と simulated backend。ルール 7）:
+  - 同じ frame の列に対し、`stage: off` と `stage: shadow_mpc` で、fand が受け取る基準の `MpcProposal` の
+    内容と受信の単調時刻、各 tick の `requested_demand` / `effective_demand` が一致すること
+  - ヒント有りの solve を人工的に遅らせた・例外にした・予算を使い切らせた場合も、基準の `MpcProposal` の
+    送信時刻（worker 側の単調時計）と fand の受信時刻が、ヒントを扱わない場合と変わらないこと
+  - worker の中で、基準の `MpcProposal` の送信がヒント有りの solve の開始より先に起きること
+    （呼び出し順の記録で確かめる）
+  - B1 で、ヒント有りの記録が `MpcProposal` の slot へ入らず、Shadow の台帳にだけ現れること
 - **fand が再検査する。** 0066 §2.1 (d) の 2 条件（系統ごとに `demand_hint >= demand_base - eps`、
   かつ両 plan の予測のすべての offset で CPU / GPU が `hint <= base + eps_c`）と認証領域の判定を、
   worker の判定とは別に fand の中で決定論的に行い、両方が通ったときだけヒント有りの plan を
@@ -162,7 +177,7 @@ Stage B の骨格は既に FINAL の記録で決まっている。本記録は�
 |---|---|---|---|
 | `off` | ヒントを読まない（Stage A のまま） | なし | — |
 | **B0 `observe`** | ヒントを読み、状態（`active` / `expired` / …）を進め、終端状態を永続化し、「効かせていたら選んだ context」を trace に残す（`influence: would_override`）。frame には載せない | **なし** | 0064 前提 1（#82）・前提 4（所有者の承認）・0066 §2.2 の実装 |
-| **B1 `shadow_mpc`** | B0 に加え、frame の `supervisor_hint` を埋め、worker に二重解法をさせる。ヒント有りの plan は **Shadow の台帳（0053 / #90）へ「適用しなかった提案」として残すだけ**で、Gate へは基準の plan だけを渡す | **なし** | B0 の前提 ＋ 0064 前提 2（RulePolicy の本番値） |
+| **B1 `shadow_mpc`** | B0 に加え、frame の `supervisor_hint` を埋め、worker に二重解法をさせる。基準の解は先に `MpcProposal` として届き（§2.5）、ヒント有りの plan は後から **Shadow の台帳（0053 / #90）へ「適用しなかった提案」として残すだけ**で、Gate へは基準の plan だけを渡す | **なし**（値も時刻も。§2.5） | B0 の前提 ＋ 0064 前提 2（RulePolicy の本番値）＋ 0066 §2.1 (b) / (c) の照合済みハッシュ |
 | **B2 `active`** | §2.5 の再検査を通ったヒント有りの plan を、基準の plan の代わりに Gate へ渡す | Learned MPC の authority の範囲で**ありうる** | 0064 前提 1〜4 と 0066 §2.1 (b) / (c) のすべて（#288 の着手条件 1〜6） |
 
 - **B0 / B1 は 0064 の Stage B の前提を緩めるものではない。** どちらも `requested_demand` を1ビットも
@@ -173,8 +188,9 @@ Stage B の骨格は既に FINAL の記録で決まっている。本記録は�
   Fallback であり、ヒントは実 Fan に効かない。`coldaisle-control rollback-authority`（0072 §2.6）や
   自動降格（0057）で authority が下がれば、ヒントの効き目も同じ tick で下がる。
   **ヒント専用の昇格の入口・journal は作らない**（制御権の段階は authority の1本に集める）
-- B2 を設定で有効にしていても、ハッシュの不一致・記録の欠落（0066 §2.1 (c)）では、実効の段階を
-  **B1 に下げて**起動する（B0 ではなく B1 にするのは、不一致の間も二重解法の成功率と差分を測り続けるため）。
+- B1 / B2 を設定で有効にしていても、認証のハッシュが無い・合わない（0066 §2.1 (c)）ときは、実効の段階を
+  **B0（記録だけ）に留めて**起動する。0066 §2.1 (c) の「一致しない、または記録が無い場合は Stage B を無効のまま
+  （ヒントは記録のみ）」と同じ安全側に揃え、未認証の組み合わせではヒント有りの solve を走らせない。
   ハッシュ不一致で起動を拒否しない（0066 §2.1 (c) のまま）
 - B0 に入る前に、Stage A の記録（`events` × decision trace の `ts_ms` による突き合わせ）を一度オフラインで
   集計し、所有者が「続ける価値がある」と判断すること。ここでは数値の閾値は置かない（0064 §2.10 の
@@ -203,7 +219,7 @@ Stage B の骨格は既に FINAL の記録で決まっている。本記録は�
 | Learned MPC worker の停止・timeout・モデル読込の失敗・Gate の退避 | 既存のとおり Fallback で運転。Fallback はヒントを読まないので、ヒントの効き目は自動的に 0 | `hint_prior_skipped: mpc_unavailable` |
 | 二重解法で予算が尽きた・ヒント有りが解けない | 基準の plan を使う | `budget_exhausted`（0066） |
 | 認証領域の外・単調性の再検査が不合格 | 基準の plan を使う | `out_of_certified_domain` / `monotonicity_violated`（0066） |
-| ハッシュの不一致・記録が無い | 実効の段階を B1 に下げる | `certification_mismatch` |
+| ハッシュの不一致・記録が無い | 実効の段階を B0（記録だけ）に留める（0066 §2.1 (c)） | `certification_mismatch` |
 | ヒントの状態を読めない（`events`・終端状態の表など） | ヒントを使わず記録のみ | `hint_state_unreadable`（0066） |
 | Supervisor の評価の失敗 | Supervisor 出力が無いので MPC も基準も無い（既存のとおり） | 既存の `supervisor_unavailable` |
 | authority が `shadow` | ヒント有りの plan は Gate の先へ届かない | `authority_shadow` |
@@ -235,7 +251,7 @@ Stage B の骨格は既に FINAL の記録で決まっている。本記録は�
 
 - ヒントが実 Fan へ届く道が「RulePolicy の band → MPC → Gate → authority → Guard → Safety」の1本だけで、
   その強さは authority の1本で上下する。ヒント専用の制御権が生まれない
-- B0 / B1 で、`requested_demand` を変えずに「Regime が追いつかなかった tick」と「二重解法の成功率・差分」を
+- B0 / B1 で、`requested_demand` を（値も時刻も）変えずに「Regime が追いつかなかった tick」と「二重解法の成功率・差分」を
   測れる。0064 前提 3 と 0066 §5 #4 を**効かせる前に**答えられる
 - 二重解法の最終判定を fand が持つので、ML 側のプロセスの誤りでヒント有りの plan が通ることがない
 - ML がどこで止まっても、ヒントの効き目は自動的に 0 になる（Fallback がヒントを読まないため）
@@ -245,7 +261,8 @@ Stage B の骨格は既に FINAL の記録で決まっている。本記録は�
 | トレードオフ | 緩和策 |
 |---|---|
 | frame・worker の提案・trace の3つの schema が変わる | いずれも版を上げ、古い版にヒントの塊を持たせない。B0 は frame を変えないので、frame の変更は B1 の実装 Issue に閉じる |
-| 二重解法で MPC worker の計算が増える | 予算は増やさない（0066 §2.1 (d)）。基準を先に解くので基準の結果は遅れない。成功率は B1 で測り、低ければ B2 を使わない（人が決める） |
+| 二重解法で MPC worker の計算が増える | 予算は増やさない（0066 §2.1 (d)）。基準を先に解いて先に公開するので、基準の結果の到着は遅れない（§2.5 の試験で固定）。成功率は B1 で測り、低ければ B2 を使わない（人が決める） |
+| B1 にも認証のハッシュが要るので、二重解法の成功率を測れるのは認証の後になる | 0066 §2.1 (b) の認証ランナー自体が実際の Optimizer と予算で二重解法を回すので、その結果で一次の見積もりは得られる。安全側（0066 §2.1 (c)）を優先する |
 | B0 で制御デーモンが DB を読むスレッドを持つ | 読み出しは tick の外。失敗はヒント無しに倒すだけで、制御は止めない |
 | `IDLE` の鍵を許すと、ジョブを起動しない嘘のヒントで保持時間ぶん騒音が増える | 冷却を弱めないので温度は上がらない（0066）。保持時間で上が抑えられ、矛盾は trace に数えられる。既定の設定には置かない |
 | RL はヒントを使えないまま | RL の active が閉じている間は効果が無い。宣言の形は RL の active を開く記録で決める |
@@ -262,7 +279,8 @@ Stage B の骨格は既に FINAL の記録で決まっている。本記録は�
 | **ヒントを Fallback の曲線・Reactive Guard の floor に効かせる（案 E）** | 退避先が外部の自己申告に依存する。Guard / Safety へはルール 2・3 と 0064 §2.8 で禁止済み |
 | **MPC worker の二重解法の判定をそのまま信じる** | 最終判定を ML 側のプロセスに置くことになる。比較は安価なので fand で再検査する |
 | **ヒント専用の Authority / 昇格の入口を作る** | 制御権の段階が2本になり、片方だけ下げ忘れる状態が生まれる。B2 の実効は Learned MPC の authority で上下させれば足りる |
-| **ハッシュ不一致のとき B0 に下げる** | 不一致の間に二重解法の成功率と差分を測る機会を失う。B1 も `requested_demand` を変えないので、B1 に下げて足りる |
+| **ハッシュ不一致のとき B1 に下げて二重解法を測り続ける** | 0066 §2.1 (c) は不一致・記録無しで Stage B を無効（記録のみ）にすると定めている。未認証の組み合わせで MPC worker の挙動を変える段階を動かさない。B0 に留める |
+| **B1 で二重解法の両方の結果を1つの提案にまとめて送る** | ヒント有りの solve の分だけ基準の解の到着が遅れ、B1 が `requested_demand` の時刻に影響する。基準を先に公開し、ヒント有りは別の Shadow 用の記録にする（§2.5） |
 | **ヒントで `regime_confidence` を上げる・`UNKNOWN` を別の Regime の context に写す** | 未知の状態を自己申告で既知に見せる（ルール 4）。0041 の鮮度判定と 0054 の帰属も壊れる |
 | **ヒントの残り時間（`expected_duration_s`）に応じて band を補間する** | 申告を時間軸の真値として扱う（AGENTS.md「負荷があと何時間続くかを断定しない」）。期限の算出にだけ使う（0064 §2.3） |
 | **tick の中で `events` を読む** | DB のロックで tick の期限を越えうる。受け渡し口の形（`operating_mode.py`）で tick の外に出す |
@@ -284,6 +302,6 @@ Stage B の骨格は既に FINAL の記録で決まっている。本記録は�
 
 1. 0066 §2.2 の migration・終端状態の表・run の記録（B0 の前提）
 2. B0: 受け渡し口と読み手のスレッド・`SupervisorInput.workload_hint`・状態の遷移・trace の塊
-3. B1: frame の `supervisor_hint`・worker の二重解法・fand の再検査・Shadow の台帳への記録
-4. 0066 §2.1 (b) の認証ランナーとハッシュ（未決 3 の後）
+3. 0066 §2.1 (b) の認証ランナーとハッシュ（未決 3 の後。B1 の前提）
+4. B1: frame の `supervisor_hint`・worker の二重解法（基準を先に公開・ヒント有りは別の Shadow 用の記録）・fand の再検査・Shadow の台帳への記録
 5. B2: Gate へ渡す候補の切り替え（前提 1〜6 がすべて揃ってから）
