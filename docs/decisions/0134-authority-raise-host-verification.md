@@ -1,4 +1,4 @@
-# 決定記録 0134: 導入先で `coldaisle-authority raise` を使えるようにする前に足す点（実行するコード・入口の書き分け・権限の確かめ方・段階 C の時期）
+# 決定記録 0134: 導入先で `coldaisle-authority raise` を使えるようにする前に足す点（隔離モードで起動するコード・入口の書き分け・権限の確かめ方・段階 C の時期）
 
 - **種別**: Decision Record
 - **Status**: Proposed
@@ -52,7 +52,11 @@
    `--registry-limits`（既定は作業ディレクトリの相対 path `config`）の `model-registry.yaml` も読む。
    また `docs/authority-rollout.md` の例は開発の形の `uv run coldaisle-authority raise` で、本番でどのコードを
    どの uid で実行するかが書かれていない。**CLI の検証（承認の形・uid の束縛・証拠の hash）は承認者自身の
-   process で走る**ので、承認者が書けるコードで実行すると、検証そのものが承認者の手に移る
+   process で走る**ので、承認者が書けるコードで実行すると、検証そのものが承認者の手に移る。
+   **console script（`.venv/bin/coldaisle-authority`）を絶対 path で実行しても足りない。** console script は
+   `PYTHONPATH` などの環境変数を読むので、承認者の環境の `PYTHONPATH` が書き換えられる場所を指していると、
+   そこにある `coldaisle` が root の所有のコードより先に読まれる（開発の環境で、`PYTHONPATH` の先に置いた偽の
+   `coldaisle` が console script から読まれ、`python -I -m coldaisle.authority_cli` では読まれないことを確かめた）
 2. **「昇格の入口が1つ」が何によって保たれているかの書き分け。** AGENTS.md は `coldaisle-authority raise` を
    「人が自分の uid で実行する唯一の昇格の入口」とする。これは (a) コードの構造（`raise_stage()` を呼ぶのは
    `authority_cli.py` だけ。管理ソケット・fand・API・AI・eventd・Learned worker に上げる経路が無い。
@@ -100,10 +104,32 @@
 これを狭めない（§5 の 3）。承認する人が、上げる対象の artifact を自分で見られるのは承認の役割の範囲で、artifact は
 秘匿情報ではなく、狭めると Registry が作るファイルごとに ACL を付け分ける必要が出るためである。
 
-### 2.2 本番の `raise` は root の所有のコードを絶対 path で実行し、`--registry-limits` も絶対 path で渡す
+### 2.2 本番の `raise` は root の所有の interpreter を隔離モード（`-I`）で起動し、`--registry-limits` も絶対 path で渡す
 
-- 本番では `/opt/coldaisle/.venv/bin/coldaisle-authority raise`（仮の path）を、承認者の uid のまま実行する。
-  **`uv run` を使わない**（`.venv` と lock を書こうとする。`/opt/coldaisle` は root の所有なので失敗するが、
+- 本番では、root の所有の venv の interpreter を `-I` で起動して入口のモジュールを実行する。承認者の uid のまま
+  実行する（path は仮の値）
+
+  ```bash
+  /opt/coldaisle/.venv/bin/python -I -m coldaisle.authority_cli raise \
+      --authority-root /var/lib/coldaisle-authority \
+      --approval <承認.json> --report <報告.json> \
+      --config-dir /etc/coldaisle/control-config \
+      --registry-root /var/lib/coldaisle-registry \
+      --registry-limits /opt/coldaisle/config
+  ```
+
+  - `-I` は `PYTHON*` の環境変数（`PYTHONPATH` など）を無視し、作業ディレクトリと user site を `sys.path` に
+    入れない。venv の site-packages（root の所有）は `-I` でも読まれる。`src/coldaisle/authority_cli.py` には
+    `if __name__ == "__main__": raise SystemExit(main())` があるので、`-m` でそのまま入口が動く（console script と
+    同じ `main()`。引数も終了コードも同じ）
+  - **console script `.venv/bin/coldaisle-authority` を本番の手順に書かない**（§1.2 の 1。`-I` が付かない）
+  - 打ち間違いを減らすためにラッパーを置くなら、root の所有・承認者が書けない場所に置き、中身は
+    `#!/bin/sh` と `exec /opt/coldaisle/.venv/bin/python -I -m coldaisle.authority_cli "$@"` の2行だけにする
+    （ラッパーを置くかは §5 の 2。置かなければ上の1行を手順に書く）
+  - `-I` が防ぐのは Python の起動時の探索だけで、`LD_PRELOAD` など動的リンカの環境変数は防がない。
+    承認者本人の意図した書き換えは §2.3 の (c) の限界のままで、ここで守るのは、手順に従った承認者の環境に
+    たまたま残った `PYTHONPATH` や、作業ディレクトリの checkout が検証を黙って置き換えないことである
+- **`uv run` を使わない**（`.venv` と lock を書こうとする。`/opt/coldaisle` は root の所有なので失敗するが、
   失敗の理由が権限の設計と紛らわしい）。**承認者のホームにある checkout など、承認者が書けるコードで本番の
   authority のディレクトリを指さない**
 - `--registry-limits /opt/coldaisle/config` を明示する（既定の相対 path `config` は作業ディレクトリで意味が変わる）。
@@ -145,7 +171,8 @@
 
 | # | 資格 | 期待 |
 |---|---|---|
-| 1 | 承認者（`coldaisle-authority` だけ） | `/opt/coldaisle` の `.venv/bin`・`config`・`src` に書けない。`config/model-registry.yaml` を読める |
+| 1 | 承認者（`coldaisle-authority` だけ） | `/opt/coldaisle` の `.venv/bin`・`config`・`src` と、venv の使う interpreter（とラッパーを置くならラッパー）に書けない。`config/model-registry.yaml` を読める |
+| 1b | 承認者（同上） | **`PYTHONPATH` を承認者の書ける場所（中に偽の `coldaisle/__init__.py` を置く。読まれたら目印を出して止まるだけの1行）に向けても、§2.2 の起動の形では root の所有のコードが読まれる**。`/opt/coldaisle/.venv/bin/python -I -c 'import coldaisle; print(coldaisle.__file__)'` が `/opt/coldaisle` の下を指し、`-I -m coldaisle.authority_cli --help` が使い方を出す（目印が出ない）こと。確かめた後に偽の package を消す |
 | 2 | 管理ソケットの人（`coldaisle-admin` だけ） | authority のディレクトリに書けない・`authority.json` に書けない。制御設定の4ファイル・`registry.json`・`.registry.lock` を読めない（`flock -n` も失敗）。`/etc/coldaisle` を一覧できない |
 | 3 | `coldaisle`（API / 取り込みの unit と同じ資格） | 2 と同じ（authority・制御設定・Registry のどれにも触れない） |
 | 4 | 制御設定の4ファイルを置き直した後（導入先の手順で `install` し直したとき） | 0104 §2.9 の 1 の `getfacl` に加えて、承認者の資格で4ファイルを `cat` できること（default ACL が効いたことを、表示ではなく読み取りで確かめる） |
@@ -168,8 +195,9 @@
 本 PR は本記録と索引の行だけで、コード・`docs/ubuntu-deploy.md`・`docs/authority-rollout.md`・`deploy/` には
 触れない。FINAL の後の文書の PR（#217）で次を直す。
 
-- `docs/authority-rollout.md`: 本番の例を `/opt/coldaisle/.venv/bin/coldaisle-authority`・`--registry-limits` の
-  絶対 path にする（開発の例は `uv run` のまま）。`uv run` を本番で使わない理由を1行
+- `docs/authority-rollout.md`: 本番の例を `/opt/coldaisle/.venv/bin/python -I -m coldaisle.authority_cli`（§2.2）・
+  `--registry-limits` の絶対 path にする（開発の例は `uv run` のまま）。`uv run` と console script を本番で使わない
+  理由を1行ずつ
 - `docs/ubuntu-deploy.md` 6.7: 手順 6 に §2.2、手順 9 に §2.4 の決まりと項目、§2.5 の C1 / C2 の分け方
 - 6.7 の手順 9 の 4 の `test -r` / `test -w` を、§2.4 の実際の操作に置き換える
 
@@ -210,7 +238,11 @@ Issue で同じ決まりに揃える（§5 の 4）。
    確認の健全さに関わる手順の判断で、記録に無いまま手順書だけを変えると理由が残らない
 5. **`--registry-limits` を必須にする・path をコードで固定する**: 上限は権限を広げないので、コードの変更に見合う
    得が無い。固定の path はルール 9 に反し、開発と試験で別の上限を使えなくなる。手順で絶対 path を渡す
-6. **確認を `test` のまま、外部コマンドではなく shell の組み込みに揃える**: 組み込みでも補助グループ・ACL の扱いは
+6. **本番でも console script（`.venv/bin/coldaisle-authority`）を絶対 path で実行する**: 短く書けるが、
+   console script は `PYTHONPATH` を読み、書き換えられる場所の `coldaisle` が先に読まれうる（§1.2 の 1）。
+   console script の shebang に `-I` を足すには、`uv sync` が作るファイルを導入先で書き換えることになり、
+   更新のたびに戻る
+7. **確認を `test` のまま、外部コマンドではなく shell の組み込みに揃える**: 組み込みでも補助グループ・ACL の扱いは
    shell ごとに違いうる。実際に開く操作なら、カーネルの判定そのものを見られる
 
 ## 5. 判断点・未決事項
@@ -218,7 +250,7 @@ Issue で同じ決まりに揃える（§5 の 4）。
 | # | 判断点 | 推奨案 | 代替案 |
 |---|---|---|---|
 | 1 | 本記録を作るか | **作る**（§1.2 の4点だけを足し、0104 の形は変えない） | 作らず 6.7 の手順 9 をそのまま行う（§4 の 4） |
-| 2 | 本番の `raise` で実行するコード | **root の所有の `/opt/coldaisle/.venv/bin/coldaisle-authority` を絶対 path で。`uv run` を使わない。`--registry-limits` も絶対 path**（§2.2） | 手順で決めない（いまの `uv run` の例のまま） |
+| 2 | 本番の `raise` で実行するコード | **root の所有の `/opt/coldaisle/.venv/bin/python -I -m coldaisle.authority_cli` を手順に直接書く。ラッパーは置かない（root の所有のファイルが1つ増えるだけで、守る性質は同じ）。`uv run` と console script を使わない。`--registry-limits` も絶対 path**（§2.2。C1 で §2.4 の 1b を確かめる） | root の所有のラッパー（`exec ... -I -m coldaisle.authority_cli "$@"` の2行）を置き、手順はラッパーを呼ぶ / 手順で決めない（いまの `uv run` の例のまま） |
 | 3 | 承認者が artifact の本体を読めること（`raise` には要らない） | **狭めない**（§2.1。承認の役割の範囲・秘匿情報ではない） | `registry.json` だけに狭める（Registry が作るファイルごとに ACL を付け分ける） |
 | 4 | 6.4 / 6.8 の `test` の確認 | **別の Issue で同じ決まりに揃える**（1 Issue = 1 PR） | #217 の文書の PR に含める |
 | 5 | 段階 C の分け方と #217 を閉じる時期 | **C1 / C2 に分け、#217 は C2（Production ができた後の `approval_rejected`）まで閉じない**（§2.5） | C1 で #217 を閉じ、C2 を `requires:server` の別 Issue にする |
