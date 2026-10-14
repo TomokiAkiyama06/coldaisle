@@ -179,9 +179,15 @@ Stage B の骨格は既に FINAL の記録で決まっている。本記録は�
       （`ChannelClosed` にしない。経路の切断として扱うのは基準・heartbeat の送信の失敗だけ）
     - **送る前に、経路の送信待ちが空であることを確かめる**（`SIOCOUTQ` で、fand がまだ読んでいないバイトが 0）。
       空でなければ送らない。これで Shadow の記録が経路のバッファに積み上がり、次の基準の `MpcProposal` の
-      `send` を待たせることが無い（Shadow の記録が経路に残るのは高々 1 件）。経路の送信バッファは
-      `max_message_bytes + max_shadow_record_bytes` 以上であることを起動時に確かめ、満たさなければ B1 を使わない
-      （`shadow_unavailable`）
+      `send` を待たせることが無い（Shadow の記録が経路に残るのは高々 1 件）
+    - **送信バッファは Shadow の分だけ足し、基準と heartbeat の空きを減らさない。** 送信バッファには基準の提案だけで
+      なく heartbeat も入り、どのメッセージにもパケットごとの余分（カーネルの管理領域）がかかる。そこで B1 では、
+      worker のソケットの送信バッファ（`SO_SNDBUF`）を、ヒントを扱わないときの値に
+      `max_shadow_record_bytes + packet_overhead_bytes`（どちらも `config/learned-channel.yaml`。余分の値は実測で
+      決める）を**足した**値にする。Shadow の記録が経路に 1 件残っていても、基準の提案と heartbeat が使える空きは
+      ヒントを扱わないときと同じになる。足した値を設定できない（`getsockopt` で確かめた値が足りない）ときは B1 を
+      使わない（`shadow_unavailable`）。§2.5 の「fand 側の受信が詰まった場合」の試験は、heartbeat が溜まる長さの
+      詰まりを含めて、基準の送信がヒントを扱わない worker と同じ時点で詰まり始める（それより早くない）ことを確かめる
     - **期限**: 親が持てる未転送の記録は 1 件だけ（新しいものが来たら古いものを捨てる）。転送できないまま、その記録の
       元になった frame の次の基準の周期の開始（`next_due`）を過ぎたら捨てる。いずれも
       `hint_prior_skipped: shadow_dropped_backpressure` として数える（数は trace のヒントの塊に載せる）
@@ -439,6 +445,7 @@ Stage B の骨格は既に FINAL の記録で決まっている。本記録は�
 | 4 | RL artifact の「ヒントを使う」宣言の形（0064 §5 #6） | RL の active slot を開く記録 |
 | 5 | B0 の受け渡し口で「最後に読めた時刻が古い」とみなす上限 | B0 の実装 Issue（設定値） |
 | 6 | frame・worker の提案・trace の schema の具体の版番号と欄の型 | 各段階の実装 Issue |
+| 7 | 実装の細部（送信の lock・バッファの見積もり・試験の許容幅など）は、実装の PR とその試験で確定する。決定記録の段階のレビューはここで閉じ、実装の PR のレビューで詰める（2026-10-14 所有者の判断） | 各段階の実装 PR |
 
 ### 実装 Issue の切り方（参考。着手は前提が揃ってから）
 
