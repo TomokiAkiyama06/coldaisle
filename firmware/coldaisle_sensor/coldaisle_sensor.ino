@@ -31,7 +31,7 @@
 // 設定
 // ======================================================
 
-static const char FW_VERSION[] = "1.0.0";
+static const char FW_VERSION[] = "1.1.0";
 static const char DEVICE_ID[] = "xiao-esp32s3";
 
 // 送信周期。ホストはこの値を `interval_ms` として受け取り、期待サンプル数に使う
@@ -44,6 +44,9 @@ static const uint8_t DS_RESOLUTION_BITS = 11;
 
 // 変換待ち。11bit の 375ms にマージンを足した値
 static const uint32_t DS_CONVERSION_WAIT_MS = 400;
+
+// hello を出し直す間隔（決定記録 0129）。**読み手がいつ付いても、この時間のうちに構成が届く**
+static const uint32_t HELLO_INTERVAL_MS = 60000;
 
 // ウォッチドッグ。1周期 2.5 秒なので、数周期ぶんの余裕を取る
 static const uint32_t WDT_TIMEOUT_MS = 15000;
@@ -143,8 +146,8 @@ uint8_t am2320_backoff_left = 0;
 uint32_t seq = 0;
 uint64_t next_due_ms = 0;
 
-// USB CDC が繋がっているか。**繋がった瞬間にもう一度 hello を出す**ためだけに持つ
-bool host_connected = false;
+// 次に hello を出す時刻（決定記録 0129）
+uint64_t next_hello_ms = 0;
 
 // 1行ぶんの組み立て先。**途中まで書いた行を出さない**ために一度に書き出す
 static char line[768];
@@ -339,16 +342,18 @@ void setup() {
   }
   esp_task_wdt_add(NULL);
 
-  // **電源投入時に1回**（決定記録 0003 §2.2）。
+  // **起動時に1回、その後は HELLO_INTERVAL_MS ごと**（決定記録 0129）。
   //
-  // ただし、これだけでは足りない。デバイスのほうが先に起動していると、
+  // 起動時の1回だけでは足りない。ホストがポートを開くのは起動より数秒遅く、
   // **誰も読んでいない間に hello が流れて消える。** ホストはサンプルだけを
   // 受け取り、ROM の一覧も `interval_ms` も知らないまま動き続ける（FR-403 が
-  // 比べる相手を持てない）。`loop()` で接続を見て、繋がった瞬間に出し直す
+  // 比べる相手を持てない）。Hardware CDC の `(bool)Serial` はホストがポートを
+  // 開いたことを表さないので、繋がった瞬間を待つ方法は使えない（#43）
   send_hello();
-  host_connected = (bool)Serial;
 
-  next_due_ms = (uint64_t)(esp_timer_get_time() / 1000) + INTERVAL_MS;
+  uint64_t start_ms = (uint64_t)(esp_timer_get_time() / 1000);
+  next_due_ms = start_ms + INTERVAL_MS;
+  next_hello_ms = start_ms + HELLO_INTERVAL_MS;
 }
 
 // ======================================================
@@ -357,17 +362,6 @@ void setup() {
 
 void loop() {
   esp_task_wdt_reset();
-
-  // **繋がった瞬間に hello を出し直す。**
-  //
-  // 周期的に出すのではなく、立ち上がりだけで出す。周期的に出すと
-  // 「電源投入時に1回だけ」（#11 の受入基準）が崩れ、ホストの記録が
-  // 何度も書き換わる。読み手が付いたときにだけ、その読み手のために出す
-  bool connected = (bool)Serial;
-  if (connected && !host_connected) {
-    send_hello();
-  }
-  host_connected = connected;
 
   // `millis()` ではなく 64bit のタイマを使う。`millis()` は約49.7日で巻き戻り、
   // ホストはそれを**再起動として扱う**（FR-106）。稼働し続けているのに
@@ -384,6 +378,14 @@ void loop() {
   next_due_ms += INTERVAL_MS;
   if (next_due_ms < now_ms) {
     next_due_ms = now_ms + INTERVAL_MS;
+  }
+
+  // **サンプルの行の間で出す。** 行は1行ずつ組んで書き出すので混ざらない。
+  // 中身は起動時と同じ（センサーは起動時にしか数えない）。同じ中身の hello を
+  // ホストは記録し直さない（決定記録 0129 §2.2）
+  if (now_ms >= next_hello_ms) {
+    send_hello();
+    next_hello_ms = now_ms + HELLO_INTERVAL_MS;
   }
 
   // **5本同時に変換を開始する**（spec-review C-01）

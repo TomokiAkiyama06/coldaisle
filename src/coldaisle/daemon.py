@@ -101,6 +101,9 @@ class Stats:
     samples: int = 0
     readings: int = 0
     hellos: int = 0
+    """処理した起動バナーの数。直前と同じ中身のものは数えない（決定記録 0129 §2.2）。"""
+    hellos_repeated: int = 0
+    """直前と同じ中身で、記録し直さなかった起動バナーの数（0129 §2.2。60 s ごとに届く）。"""
     discarded: int = 0
     """正規化・保存に失敗して捨てたサンプル数。**0 でない日は原因を追う。**"""
     dropped_samples: int = 0
@@ -130,6 +133,7 @@ class Stats:
             "samples": self.samples,
             "readings": self.readings,
             "hellos": self.hellos,
+            "hellos_repeated": self.hellos_repeated,
             "discarded": self.discarded,
             "dropped_samples": self.dropped_samples,
             "restarts": self.restarts,
@@ -179,6 +183,10 @@ class Daemon:
         self._stop = False
         self._source_exhausted = False
         self._device_id: str | None = None
+        self._last_hello: RawHello | None = None
+        """直前に処理した起動バナー。同じ中身なら記録し直さない（0129 §2.2）。"""
+        self._last_err: frozenset[str] = frozenset()
+        """直前のサンプルの `err`。変わったときだけログに残す（0129 §2.3）。"""
         self._reported_drops = 0
         self.stats = Stats()
 
@@ -547,6 +555,12 @@ class Daemon:
             )
 
     def _on_hello(self, hello: RawHello, received_ms: int) -> None:
+        if hello == self._last_hello:
+            # **同じ中身なら何もしない**（決定記録 0129 §2.2）。デバイスは 60 s ごとに
+            # 出し直すので、毎回書くと記録とログが1日に千回以上書き換わる。
+            # 中身が同じなら、記録も ROM の照合も同じ結果になる
+            self.stats.hellos_repeated += 1
+            return
         # **受け取った瞬間の時刻を使う。** 待ち行列に積まれている間に時計は進む
         at_ms = received_ms
         self._device_id = hello.dev
@@ -606,8 +620,34 @@ class Daemon:
             )
         if self._engine is not None:
             self._record(self._engine.on_hello(observed, recorded, at_ms=at_ms))
+        # **処理し終えてから覚える。** 途中で例外になったら、次の同じ hello で処理し直す
+        self._last_hello = hello
+
+    def _log_err_change(self, raw: RawSample) -> None:
+        """`err` の集合が直前のサンプルと変わったときだけ1行残す（決定記録 0129 §2.3）。
+
+        欠測の原因（`-127` の抜線・`85` の電源投入値・`absent` の未接続）は DB に残らない。
+        シリアルを開けるのは取り込みだけなので（AGENTS.md ルール 6）、ここで残さないと
+        後から追えない。
+        """
+        err = frozenset(raw.err)
+        if err == self._last_err:
+            return
+        LOGGER.warning(
+            "サンプルの err が変わった",
+            extra={
+                logs.FIELDS_KEY: {
+                    "seq": raw.seq,
+                    "err": sorted(err),
+                    "added": sorted(err - self._last_err),
+                    "cleared": sorted(self._last_err - err),
+                }
+            },
+        )
+        self._last_err = err
 
     def _on_sample(self, raw: RawSample, received_ms: int) -> None:
+        self._log_err_change(raw)
         if self._calibration_floor_ms is not None and received_ms < self._calibration_floor_ms:
             # 運転中に壁時計が戻った。保存すると新しい較正の値が記録より前の時刻に入り、
             # 古い較正の値に見える。取り込みは止めず、時計が追いつけば保存を再開する（0099 §2.2）
