@@ -65,6 +65,17 @@ Fan が全開へ上がる途中の `ctl max` の直後にも同じ跳ねが出�
 ### 2.1 `startup_settle_ms` = 15000
 
 測った最長（Front 12841 ms）に、tach の更新の閾値（1500 ms）を足すと 14341 ms になる。これより長い 15000 にする。
+
+0125 は T6 の合格の条件に fand の 1 tick（1000 ms）も足した。同じように足すと 15341 ms で 15000 を超えるが、値は変えない
+（2026-10-14 の所有者の判断）。理由は次のとおり。
+
+- 上の時間は、fand 自身の tick の trace で回転数が全開の ±5% に入った時刻である。fand が読む位相（tick）の遅れはすでに含まれ、
+  実際に入った時刻はこれより最大で更新の閾値の分だけ早い。足した 1500 ms は、ほかの読み手との位相で fand から見えるのが遅れる分である
+- `startup_settle_ms` は tach を判定しない時間で、過ぎた後に Demand が `ramp_down`（0.05/s）で下がり始めるだけである。
+  Front の全開の確認が 1 tick 遅れても、その間の Demand は 1.0 から 0.05 しか下がらない。0125 の stall の判定のように、
+  遅れて見えることが誤った `tach_stall`（`EMERGENCY`）につながる値ではない
+- T1 の 24 h の soak の起動の記録で、Demand が下がり始めるまでに 3 zone が全開の ±5% に入っていることと、起動の直後に
+  誤った `tach_stall` が出ないことを確かめる（2.3）。足りなければ値を変える案を所有者に出す
 status を `confirmed`・basis を本記録と `docs/fan-header-mapping.md` の T4 の結果にするのは、0121 §2.10 のとおり、
 すべての試験がそろってから所有者の承認を得て行う。それまでは `provisional` のまま 15000 にする。
 
@@ -86,7 +97,7 @@ status を `confirmed`・basis を本記録と `docs/fan-header-mapping.md` の 
 
 2.1 と 2.2 により、T4 は合格とする。`ramp_down_per_s` 0.05 と `startup_settle_ms` 15000 は、0121 §2.10 の時点で `confirmed` にする。
 ただし `startup_settle_ms` は 15000 にした設定で、T1 の起動の記録から Demand が下がり始めるまでに 3 zone が全開の ±5% に
-入っていることを確かめる。
+入っていることと、起動の直後に誤った `tach_stall` が出ないことを確かめる。
 
 ## 3. Consequences
 

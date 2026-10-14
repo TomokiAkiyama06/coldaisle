@@ -1,4 +1,4 @@
-# 決定記録 0127: T5 の GPU の定常と温めは 450 W で行い、T5 を合格とする
+# 決定記録 0127: T5 の GPU の定常と温めは 450 W で行い、`SIGABRT` で終わる経路を合格とし、約 11 s の経路を残りとする
 
 - **種別**: Decision Record
 - **Status**: Proposed（2026-10-14 にリポジトリ所有者が置き換えの方針を承認。記録の承認待ち）
@@ -53,22 +53,38 @@ GPU 600 W（上限を既定に戻した状態）を始める。再開の負荷�
 - `SIGSTOP` から Max（3 zone の `pwmN_enable=0`）までは 5143〜5294 ms で、約 11 s 以内
 - 開始の温度 + 上昇の最高は CPU 76 °C・GPU 75 °C・12V-2x6 46 °C で、上限より 5 °C 以上低い
 
-よって T5 は合格とし、`watchdog_timeout_ms` 5000 を 0121 §2.10 の時点で `confirmed` にする。
+よって、0121 §2.7 の表の2つの条件は、8 条件のすべてで満たした。
 
-Max までが約 5 s だったのは、systemd が止まったプロセスにも `SIGABRT` を届け、`TimeoutAbortSec` の SIGKILL を待たずに
-ExecStopPost の引き継ぎが走ったためである。0119 §2.12 の最悪約 11 s は、この経路が遅れたときの上限として残す。
+Max までが約 5 s だったのは、systemd が止まったプロセスにも `SIGABRT` を届け（systemd は watchdog の signal の後に
+`SIGCONT` も送るので、`SIGSTOP` で止めたプロセスも `SIGABRT` で終わる）、`TimeoutAbortSec` の SIGKILL を待たずに
+ExecStopPost の引き継ぎが走ったためである。
+
+### 2.5 約 11 s の経路は未完了で、`watchdog_timeout_ms` はまだ `confirmed` にしない
+
+0119 §2.13 が `watchdog_timeout_ms` に求めるのは、hang から Max までの**実際の最悪時間（約 11 s）**の間の温度の上昇が
+上限までの余裕に収まることである。`SIGABRT` で fand が終わらない hang（D 状態など）では、`TimeoutAbortSec` の 5 s を待ってから
+SIGKILL・引き継ぎになり、Demand は止めた時の低い値のまま約 11 s 続く。
+
+2.4 の試行は、すべて約 5.2 s で `SIGABRT` で終わり、Max を確かめた直後に負荷を止めている。そのため、低い Demand のまま
+負荷がさらに約 6 s 続く場合の温度の上がりは測れていない。2.4 の結果から 11 s の上がりを保守的に見積もる根拠も無い
+（(i) / (iii) の CPU 全スレッドでは、約 5 s の負荷で `cpu.package` が +31〜32 °C 上がった。負荷が続いた場合のその後の 6 s の上がり方は測っていない）。
+
+したがって、T5 は **`SIGABRT` で終わる経路（約 5 s）について合格**とし、**約 11 s の経路は未完了（残り）**とする。
+`watchdog_timeout_ms` 5000 は、残りの試験の結果を記録するまで `provisional` のままにする。残りの試験の方法は §5 の 2 で
+所有者が決める。
 
 ## 3. Consequences
 
 ### 良くなること
 
-- 中止の基準を緩めずに T5 を終えられる
+- 中止の基準を緩めずに、T5 のうち `SIGABRT` で終わる経路を終えられる
 - GPU 600 W の上がりは、(i) のアイドルからと (iii) の温まった状態からの2つで測れている
 
 ### 悪くなること・その緩和
 
 - 「GPU 600 W の定常で fand が止まる」場合を測っていない。この状態は fand が動いていても中止の基準を超えるので、
   筐体の Fan の制御で守れる範囲の外にある。GPU 自身の温度の保護（driver の slowdown）が働く
+- 約 11 s の経路が残るので、`watchdog_timeout_ms` の確定と承認点 3 の前に、試験をもう1つ行う必要がある（§5 の 2）
 - 450 W の定常の Demand（0.85）は 600 W の定常より低いので、(ii) のうち Demand が高い側の開始の状態は CPU 全スレッド
   （Top 1.0）で押さえる
 
@@ -83,3 +99,14 @@ ExecStopPost の引き継ぎが走ったためである。0119 §2.12 の最悪�
 ## 5. 未決事項
 
 1. T7（GPU 600 W での BIOS との比較）も、GPU 80 °C の見張りに当たる見込みである。T7 の前に扱いを決める。
+2. **T5 の残り: 約 11 s の経路**（§2.5）。`watchdog_timeout_ms` を `confirmed` にする前に、所有者が次のどれかを選ぶ。
+   - (a) 試験専用の設定で再現する: `safety.yaml` の `watchdog_timeout_ms` と unit の `WatchdogSec` を、試験の間だけ
+     どちらも 11 s（`WatchdogSec` 5 s + `TimeoutAbortSec` 5 s + 実行部 1 s 未満を丸めた値）にし、2.4 と同じ手順で `SIGSTOP` して、
+     低い Demand のまま約 11 s 続く間と Max の後 30 s の温度を測る。CPU の上がりが最も大きかった (i) CPU 全スレッドと
+     (iii) CPU、GPU の (iii) を少なくとも行う。0080 §2.6 の不変条件（`hardware_write_fail_exit_ms` ≤ `watchdog_timeout_ms`）は
+     満たす。試験専用の設定なので、0121 §2.8 の T6 と同じく所有者の承認を要する
+   - (b) 最悪時間そのものを短くする（unit の `TimeoutAbortSec` を短くする、または 0080 §4 の S1 の `WatchdogSignal=SIGKILL`）。
+     0080 §5 の 1・3、0121 §5 の 3 の決定に当たるので、別の決定記録にする
+   - (c) 試験をせず、約 11 s の上がりを別の根拠で保守的に見積もる（方法と根拠を示して承認を得る。上のとおり 2.4 の結果だけでは足りない）
+
+   どれも、結果を `docs/fan-header-mapping.md` の T5 に足してから、0121 §2.10 の時点で `confirmed` にする。

@@ -283,6 +283,10 @@ GPU 600 W で落ち着いた状態は作れないので、(ii) と (iii) の温�
 - Max までは 5143〜5294 ms で、どれも watchdog の 5 s の直後だった。systemd は止まったプロセスにも `SIGABRT` を届け
   （`Killing process … with signal SIGABRT`）、`TimeoutAbortSec` の SIGKILL を待たずに ExecStopPost の引き継ぎ
   （`safety_handoff_completed`）が Max を書いた。最悪の約 11 s（0119 §2.12）にはならなかった
+- **残り（未完了）: 約 11 s の経路。** `SIGABRT` で fand が終わらない hang では `TimeoutAbortSec` の 5 s も待つので、
+  低い Demand のまま約 11 s 続く。上の試行はすべて約 5.2 s で終わり、Max を確かめた直後に負荷を止めたので、その後の約 6 s の
+  上がりを測っていない。0119 §2.13 は `watchdog_timeout_ms` に約 11 s の間の余裕を求めるので、上の表は `SIGABRT` で終わる経路の
+  合格で、`watchdog_timeout_ms` はまだ `confirmed` にしない。試験の方法は所有者が決める（[0127](decisions/0127-t5-gpu-steady-450w.md) §2.5・§5 の 2）
 - (i) / (iii) の直前の `effective` は、アイドルで記録した値（0.43）か、それ + 0.05 以内だった
 - (ii) アイドルの CPU の 51 °C は、負荷の無い条件での一瞬の値（止めてから 8.9 s、Max の 3.6 s 後。約 10 s で 40 °C に戻った）。`RestartSec` 2 s で fand が自動で起動し直した時刻と重なるので、その起動（Python の起動と import）によるものと見ている
 - `ii-gpu600`（10:47）は、fand が 0.96 まで上げても、負荷の開始から約 80 s で GPU コアが中止の見張り（80 °C）に届いて止めた
