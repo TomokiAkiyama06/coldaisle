@@ -1,13 +1,18 @@
 # 決定記録 0133: Workload Hint Stage B — ヒントを RulePolicy の context 選択の prior として使う経路・段階・失効
 
 - **種別**: Decision Record
-- **Status**: Proposed
+- **Status**: FINAL（2026-10-14、リポジトリ所有者の承認）
 - **Date**: 2026-10-14
-- **Supersedes**: [0064](0064-workload-hint-entry-and-supervisor-prior.md) §2.10 の Stage A の「**制御デーモンは読まない**」
-  の記述のみ（限定的な置き換え。§2.6 の段階 B0 / B1 で制御デーモンがヒントを**読んで記録する**が、
-  `requested_demand` は1ビットも変えない。0064 §2.10 の Stage B の前提 4 項目と 0066 §2.1 (b) / (c) の 2 項目は、
-  ヒントで `requested_demand` が変わりうる段階 B2 の前提として**すべて有効のまま**）。
-  承認された場合、0064 側へ `Superseded by` を追記する（`docs/decisions/README.md`「追記のみ」）
+- **Supersedes**（いずれも限定的な置き換え。旧記録は FINAL のため本文を書き換えず、`Superseded by` の追記だけを行った）:
+  - [0064](0064-workload-hint-entry-and-supervisor-prior.md) §2.10 の Stage A の「**制御デーモンは読まない**」の記述
+    （§2.6 の段階 B0 / B1 で制御デーモンがヒントを**読んで記録する**が、`requested_demand` は1ビットも変えない。
+    0064 §2.10 の Stage B の前提 4 項目と 0066 §2.1 (b) / (c) の 2 項目は、ヒントで `requested_demand` が変わりうる
+    段階 B2 の前提として**すべて有効のまま**）と、§2.9 の trace の欄 `influence` の値域（`none` / `context_override` に
+    `would_override` を足す。§2.9。他の欄は有効）
+  - [0066](0066-workload-hint-stage-b-conditions.md) §2.1 (d) の二重解法の**実行の形**のうち、ヒント有りの solve を
+    基準と同じ流れの中で続けて解く部分（基準の解を先に `MpcProposal` として公開し、ヒント有りの solve は worker の
+    `SCHED_IDLE` の子プロセスで解き、打ち切り時刻に次の基準の周期の開始 `next_due` を加える。§2.5。予算
+    `mpc.budget_ms` / `mpc.optimizer.max_evaluations` を増やさない・共有する・基準を先に解く・2 条件の比較は有効）
 - **関連**: [0028](0028-fan-control-contracts.md) §2.2 / §2.3 / §2.5 /
   [0030](0030-control-decision-trace-storage.md) / [0036](0036-transient-cpu-gpu-regime.md) /
   [0041](0041-supervisor-proposal-freshness.md) / [0045](0045-local-socket-write-entry.md) /
@@ -114,7 +119,7 @@ Stage B の骨格は既に FINAL の記録で決まっている。本記録は�
 - `IDLE` / `COOLDOWN` を鍵に置くことは許す（ジョブの立ち上がりで負荷が Telemetry に現れる前に
   band を下げる＝先行冷却が、ヒントのいちばんの使い道であるため）。ただし 0064 §2.7 の矛盾の保持時間
   `contradiction_hold_ms` を過ぎれば `contradicted` になり効かなくなるので、`IDLE` への効き目は
-  保持時間で上が抑えられる。**既定の設定には `IDLE` / `COOLDOWN` の鍵を置かない**（所有者の判断事項 2）
+  保持時間で上が抑えられる。**既定の設定には `IDLE` / `COOLDOWN` の鍵を置かない**（2026-10-14 所有者が承認）
 - 選ばれた context は、いまと同じく `supervisor.output_bounds` の検証を通る
 
 ### 2.4 期限・失効・Telemetry との食い違い
@@ -441,11 +446,25 @@ Stage B の骨格は既に FINAL の記録で決まっている。本記録は�
 |---|---|---|
 | 1 | B2 へ進む Stage A / B0 の証拠の閾値と観測期間（0064 §5 #1） | B0 の実測を見てから、B2 の実装 Issue で記録する |
 | 2 | `context_overrides` の具体値・`contradiction_hold_ms`・TTL の本番値（0064 §5 #3） | `config/fan-policy.yaml`。設定であり記録には書かない |
-| 3 | 単調性ゲートのハッシュの置き場所と、Thermal Model の昇格との結び付け（0066 §5 #3 / #5）。推奨は Model Registry の lifecycle（0062）に、Thermal Model の production と組で置くこと | B2 の実装 Issue の前に別の決定記録 |
+| 3 | 単調性ゲートのハッシュの置き場所と、Thermal Model の昇格との結び付け（0066 §5 #3 / #5）。方向は Model Registry の lifecycle（0062）に、Thermal Model の production と組で置く（2026-10-14 所有者が承認）。詳細は未決 | B2 の実装 Issue の前に別の決定記録 |
 | 4 | RL artifact の「ヒントを使う」宣言の形（0064 §5 #6） | RL の active slot を開く記録 |
 | 5 | B0 の受け渡し口で「最後に読めた時刻が古い」とみなす上限 | B0 の実装 Issue（設定値） |
 | 6 | frame・worker の提案・trace の schema の具体の版番号と欄の型 | 各段階の実装 Issue |
 | 7 | 実装の細部（送信の lock・バッファの見積もり・試験の許容幅など）は、実装の PR とその試験で確定する。決定記録の段階のレビューはここで閉じ、実装の PR のレビューで詰める（2026-10-14 所有者の判断） | 各段階の実装 PR |
+
+### 承認で決着した点（2026-10-14、リポジトリ所有者）
+
+PR #296 で所有者に判断を求めた次の点は、いずれも推奨どおり承認された。
+
+1. B0 / B1 は Stage B の前提 1〜6 がすべて揃う前に始めてよい。B0 は 0064 前提 1・4 と 0066 §2.2 の実装の後、
+   B1 はさらに RulePolicy の本番値・照合済みの認証ハッシュ・本番のホストでの実時間の試験（§2.5）の合格の後。
+   これに伴い 0064 §2.10 の「制御デーモンは読まない」を置き換える（Supersedes 欄）
+2. `IDLE` / `COOLDOWN` を `context_overrides` の鍵に許す。ただし既定の設定には置かない（§2.3）
+3. 二重解法の最終判定は worker に任せず、fand で再検査する（§2.5）
+4. 単調性ゲートのハッシュの置き場所は Model Registry の lifecycle に寄せる方向とし、詳細は別の決定記録で決める（§5 の 3）
+
+B1 で新しく要る仕組み（`SCHED_IDLE` の子プロセスの Shadow solver・ノンブロッキングで期限つきの Shadow の記録の転送と
+送信バッファの上乗せ・`hint_shadow_records`・`ControlTick` の最上位の必須の `run_id`）も、本記録のとおり承認された。
 
 ### 実装 Issue の切り方（参考。着手は前提が揃ってから）
 
