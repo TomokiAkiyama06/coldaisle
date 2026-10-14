@@ -4,7 +4,6 @@
 - **Status**: FINAL（2026-09-10、PR #28 のマージ。**実機確認は別**。§5-1）
 - **Date**: 2026-09-10
 - **Supersedes**: なし
-- **Superseded by**: [0129](0129-periodic-hello.md)（§2.8「`hello` は読み手が繋がった瞬間にも出し直す」と §4 の「`hello` を周期的に出し直す」の行のみ＝`hello` は起動時と 60 s ごとに出し、取り込みは同じ中身を記録し直さない。ほかは有効）
 - **関連**: [`0003-device-json-schema.md`](0003-device-json-schema.md) /
   `docs/spec-review.md` C-01 / C-02 / C-04 / W-01 / W-03 /
   `docs/requirements.md` FR-105 / FR-106 / FR-403 / #11 / #4 / #12

@@ -72,7 +72,7 @@ docs/decisions/NNNN-<slug>.md      例: 0002-metric-naming.md
 |---|---|---|
 | [0001](0001-initial-project-decisions.md) | プロジェクト初期の決定（D-01〜D-19、V-01） | FINAL |
 | [0002](0002-metric-naming.md) | メトリクス命名規約とDBスキーマ（ロング形式） | FINAL |
-| [0003](0003-device-json-schema.md) | デバイス出力 JSON スキーマ v1 | FINAL（§2.2 の `hello` の「電源投入時に1回」は [0129](0129-periodic-hello.md) で置き換え） |
+| [0003](0003-device-json-schema.md) | デバイス出力 JSON スキーマ v1 | FINAL |
 | [0004](0004-storage-read-contract.md) | ストレージ層の読み出し契約 | FINAL |
 | [0005](0005-model-selection.md) | ローカルモデルは Qwen3.8-27B 単体構成 | FINAL |
 | [0006](0006-gpu-mode-and-mixed-state.md) | GPU Mode を2段階にし `mixed` を異常として扱う | FINAL |
@@ -91,7 +91,7 @@ docs/decisions/NNNN-<slug>.md      例: 0002-metric-naming.md
 | [0019](0019-claude-escalation.md) | Claude へのエスカレーション | FINAL |
 | [0020](0020-decision-memory.md) | 運用メモリへの記録 | FINAL |
 | [0021](0021-public-repo-hygiene.md) | public リポジトリの衛生 | FINAL |
-| [0022](0022-firmware-v1.md) | 本番ファームウェア v1 | FINAL（§2.8 の繋がった瞬間の `hello` の出し直しは [0129](0129-periodic-hello.md) で置き換え） |
+| [0022](0022-firmware-v1.md) | 本番ファームウェア v1 | FINAL |
 | [0023](0023-serial-source.md) | シリアル取り込み | FINAL |
 | [0024](0024-calibration.md) | 較正の手順と記録 | FINAL |
 | [0025](0025-probe-identity.md) | プローブの同定 | FINAL |
