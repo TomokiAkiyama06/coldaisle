@@ -72,7 +72,7 @@ docs/decisions/NNNN-<slug>.md      例: 0002-metric-naming.md
 |---|---|---|
 | [0001](0001-initial-project-decisions.md) | プロジェクト初期の決定（D-01〜D-19、V-01） | FINAL |
 | [0002](0002-metric-naming.md) | メトリクス命名規約とDBスキーマ（ロング形式） | FINAL |
-| [0003](0003-device-json-schema.md) | デバイス出力 JSON スキーマ v1 | FINAL |
+| [0003](0003-device-json-schema.md) | デバイス出力 JSON スキーマ v1 | FINAL（§2.2 の `hello` の「電源投入時に1回」は [0129](0129-periodic-hello.md) で置き換え） |
 | [0004](0004-storage-read-contract.md) | ストレージ層の読み出し契約 | FINAL |
 | [0005](0005-model-selection.md) | ローカルモデルは Qwen3.8-27B 単体構成 | FINAL |
 | [0006](0006-gpu-mode-and-mixed-state.md) | GPU Mode を2段階にし `mixed` を異常として扱う | FINAL |
@@ -91,7 +91,7 @@ docs/decisions/NNNN-<slug>.md      例: 0002-metric-naming.md
 | [0019](0019-claude-escalation.md) | Claude へのエスカレーション | FINAL |
 | [0020](0020-decision-memory.md) | 運用メモリへの記録 | FINAL |
 | [0021](0021-public-repo-hygiene.md) | public リポジトリの衛生 | FINAL |
-| [0022](0022-firmware-v1.md) | 本番ファームウェア v1 | FINAL |
+| [0022](0022-firmware-v1.md) | 本番ファームウェア v1 | FINAL（§2.8 の繋がった瞬間の `hello` の出し直しは [0129](0129-periodic-hello.md) で置き換え） |
 | [0023](0023-serial-source.md) | シリアル取り込み | FINAL |
 | [0024](0024-calibration.md) | 較正の手順と記録 | FINAL |
 | [0025](0025-probe-identity.md) | プローブの同定 | FINAL |
@@ -196,3 +196,4 @@ docs/decisions/NNNN-<slug>.md      例: 0002-metric-naming.md
 | [0125](0125-stall-rise-criterion-tach-update.md) | T6 の立ち上がりを、試験の側から基板を読まずに fand の trace で測り（nct6775 は読んだときに更新するので、読む頻度が測る値を変える）、「5 回の最長 + driver の更新の閾値 1500 ms + fand の 1 tick 1000 ms < `stall_window_ms`」で判定する。`stall_window_ms` は 5000 のまま（延ばすと本物の stall の検出が遅れる）。Rear は stall の回転数を下回らないので、90% までの時間は記録だけにする | FINAL |
 | [0126](0126-startup-settle-front-spinup.md) | 起動の落ち着き `startup_settle_ms` を 5000 から 15000 にする（T4 の測り直しで Front が 0.35 から全開の ±5% に入るまで最長 12841 ms。tach の更新の閾値 1500 ms を足して 14341 ms < 15000。起動の後の Max を延ばすだけで安全側）。T4 の温度の判定では、`cpu.package` だけ、試験の操作（`coldaisle-control`）の直後 15 s を除く（同じ試行の `ctl max` の直後にも同じ跳ねが出ているときに限る）。T4 は合格 | FINAL |
 | [0128](0128-gpu-fan-curve-service.md) | GPU の Fan を、fand の外の root の小さな専用サービス `coldaisle-gpu-fan`（標準ライブラリだけ・ctypes で NVML・device がちょうど1つのときだけ）が、GPU コアの温度の曲線（45 °C 30 % / 55 °C 50 % / 65 °C 80 % / 70 °C 以上 100 %。`provisional`）で書く。上げはすぐ、下げは 2 °C のヒステリシスと 1 %/s。止めた・落ちた・hang（`WatchdogSec=5s`）・NVML のエラーでは GPU 自身の既定の制御に戻す。fand・ML・LLM は触れない（AIO ポンプと同じ扱い）。GPU 600 W で既定の制御（47 %）では約 80 s で 80 °C、100 % 固定では 74 °C で落ち着いたため | FINAL |
+| [0129](0129-periodic-hello.md) | `hello` を起動時と 60 s ごとに出す（Hardware CDC の `(bool)Serial` は読み手を表さず、繋がった瞬間の出し直しが働かなかった。#43）。取り込みは同じ中身の `hello` を記録し直さず、ログも出さない。サンプルの `err` の集合が変わったときだけ warning で残す。0022 §2.8 と 0003 §2.2 の「電源投入時に1回」を置き換え | FINAL |
