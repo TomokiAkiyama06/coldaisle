@@ -1,7 +1,7 @@
 # 決定記録 0128: GPU の Fan を、温度の曲線で書く root の小さな専用サービス（`coldaisle-gpu-fan`）で制御する
 
 - **種別**: Decision Record
-- **Status**: Proposed（2026-10-14 にリポジトリ所有者が承認。未決 1 を閉じ、レビューの後に FINAL）
+- **Status**: Proposed（2026-10-14 にリポジトリ所有者が承認。レビューの後に FINAL）
 - **Date**: 2026-10-14
 - **Supersedes**: なし
 - **関連**: [`0028`](0028-fan-control-contracts.md) /
@@ -102,9 +102,12 @@ hang の検出に `WatchdogSec=5s` を使う（`sd_notify` は `socket` で `NOT
 
 ### 2.5 unit `deploy/systemd/coldaisle-gpu-fan.service`
 
-- `User=root`。capability は**まず持たせずに**確かめ、NVML の書き込みが拒まれたら `CAP_SYS_ADMIN` だけを足す
-  （実装の前に、導入先で `systemd-run` で確かめて本記録の未決 1 を閉じる）
-- device: `DevicePolicy=closed`・`DeviceAllow=/dev/nvidiactl rw`・`DeviceAllow=/dev/nvidia0 rw`（足りない device は未決 1 と一緒に確かめる）
+- `User=root`・`CapabilityBoundingSet=CAP_SYS_ADMIN`・`AmbientCapabilities=` なし。NVML の Fan の書き込みと自動への戻しは、
+  uid 0 でも `CAP_SYS_ADMIN` が無いと `NVML_ERROR_NO_PERMISSION` で拒まれる（2026-10-14 に導入先の `systemd-run` で確かめた。
+  capability なしでは読み取りだけ通り、`CAP_SYS_ADMIN` だけで書き込みと戻しが通った）。`CAP_SYS_ADMIN` は広い権限なので、
+  下の sandbox と device の制限で、使える先を NVIDIA の device だけに絞る
+- device: `DevicePolicy=closed`・`DeviceAllow=/dev/nvidiactl rw`・`DeviceAllow=/dev/nvidia0 rw`。この2つだけで、読み取り・書き込み・
+  戻しのすべてが通った（`/dev/nvidia-uvm`・`/dev/nvidia-caps/*` は要らない）
 - sandbox は 0122 に合わせる: `NoNewPrivileges=yes`・`ProtectSystem=strict`・`ProtectHome=yes`・`PrivateTmp=yes`・
   `PrivateNetwork=yes`・`RestrictAddressFamilies=AF_UNIX`・`ProtectKernelModules=yes`・`ProtectControlGroups=yes`・
   `LockPersonality=yes`・`RestrictRealtime=yes`・`SystemCallArchitectures=native`・`ProtectClock=yes`・`ProtectHostname=yes`
@@ -137,7 +140,8 @@ SIGTERM と `--restore-default` で自動に戻す・device が 0 個・2 個の
 
 ### 悪くなること・その緩和
 
-- root で動き、Fan に書くプロセスが1つ増える。標準ライブラリだけ・ネットワークなし・書ける device は NVIDIA の2つだけに絞る
+- root で動き、Fan に書くプロセスが1つ増え、`CAP_SYS_ADMIN` を持つ。標準ライブラリだけ・ネットワークなし・使える device は NVIDIA の2つだけ・
+  ファイルシステムは読み取りだけに絞る
 - 負荷のときの GPU の Fan の音が大きくなる（600 W の定常では 100 %）
 - fand の外に Fan の制御ができる。役割は GPU の Fan だけに限り、fand・ML・LLM からは触れない。曲線の変更は決定記録と承認を要する
 - 落ちたときは自動に戻るので、その間の 600 W の定常は 80 °C を超えうる。GPU 自身の保護と fand の Fallback に委ね、
@@ -157,7 +161,7 @@ SIGTERM と `--restore-default` で自動に戻す・device が 0 個・2 個の
 
 | # | 内容 | 時期 |
 |---|---|---|
-| 1 | NVML の書き込みに `CAP_SYS_ADMIN` が要るか、ほかに要る device があるか | 実装の前に導入先の `systemd-run` で確かめる |
+| 1 | ~~NVML の書き込みに `CAP_SYS_ADMIN` が要るか、ほかに要る device があるか~~ | 2026-10-14 に確かめて閉じた（§2.5。`CAP_SYS_ADMIN` が要る・device は2つで足りる） |
 | 2 | 曲線の値を `confirmed` にする | 2.7 の確認の後 |
 | 3 | GPU のメモリの温度（`gpu.0.mem`）も曲線の入力にするか | 運転データの後、別の記録 |
 | 4 | 0127（T5 の GPU を 450 W に置き換え）の扱い | 2.7 の 4 の後。600 W で行えたら 0127 は取り下げる |
