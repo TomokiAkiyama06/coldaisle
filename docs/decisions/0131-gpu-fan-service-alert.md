@@ -108,6 +108,21 @@ GPU の Fan は既定の制御にも曲線にも従っていない。
   `llm_excluded_rules: ["GPU_FAN_NOT_MANUAL", "GPU_FAN_BELOW_CURVE"]`）として置く（AGENTS.md ルール 9。0017 §2.3 の
   「メトリクス名で分岐しない」と同じ方針）。一覧の形の検査は読み込み時に行い、不正なら LLM の所見を作らない（安全側）
 - AI ツールの窓口（0015 / 0018 の読み取り専用ツール）も、同じ一覧のメトリクスとアラートを返さない
+- **アラートの自動の説明（0016 / #38）も要求しない。** `explain_alerts: true`（今の既定）では、通知を送った発火の遷移が
+  `Daemon._record()` → `_request_explanation()` → 説明の待ち行列 → `Explainer.explain()` → `Explainer._ask()` と進み、
+  rule_id・閾値・`detail`・直近の統計が LLM に渡る。除外の一覧に入った rule_id の発火は、`_request_explanation()` を呼ばず
+  **通知だけを送る**（素のアラート。#38 のデグレードと同じ見え方）。一覧は日次レポートと同じものを読む（2 か所に持たない）
+- LLM へ届く経路を洗った結果（2026-10-14、`src/coldaisle` で `coldaisle.ai` を import する箇所と `Provider` の呼び出しを grep）と、
+  それぞれの閉じ方:
+
+  | 経路 | LLM に渡るもの | 閉じ方 |
+  |---|---|---|
+  | `daemon.py` の自動の説明（`Explainer`） | 発火したアラート1件の rule_id・閾値・detail、`get_stats` の統計、`get_latest` の品質が ok でないメトリクスの名前 | 一覧の rule_id は説明を要求しない（上）。ほかのアラートの説明の `get_latest`（`_quality_evidence()`）・`get_stats` も `ToolRegistry` を通るので、ツールの除外で `gpu.*.fan_policy` の名前と値が出ない |
+  | `report.py` の所見（`ai.summary.summarise`） | `facts_markdown()` | 一覧のメトリクスとアラートの行を除く（上） |
+  | `server.py` の AI ツールの窓口（`ToolRegistry`。API の `/tools` も同じ実体） | ツールの応答 | 一覧のメトリクスとアラートを返さない（上） |
+  | `escalate.py` の案件資料（人が Claude へ持ち込む） | critical のアラートの rule_id と関係するメトリクス | 今の 2 つは warning なので載らない。重大度を後で変えても載らないよう、一覧の rule_id とメトリクスは案件資料から除く |
+
+  `memory.py`・`calibrate.py` などほかの合成の起点は `coldaisle.ai` を import せず、LLM を呼ばない。新しく LLM を呼ぶ経路を足すときは、同じ一覧を当てる
 - LLM の所見は「GPU の Fan について何も知らない」前提で書かれる。GPU の Fan の異常は、通知（Router。LLM を通らない）と
   レポートの本文の表で人に届く
 
@@ -122,6 +137,8 @@ GPU の Fan は既定の制御にも曲線にも従っていない。
 - 実機なしのテスト（AGENTS.md ルール 7）: 偽の NVML で `fan_policy` の 0 / 1 / missing（関数が無い・NOT_SUPPORTED）、
   SimulatedClock と DB に入れた `gpu.0.*` で 2 つのルールの pending → firing → resolved・stale（`config/quality.yaml` の閾値）と missing で評価しないこと・
   LLM の入力（`facts_markdown()`）と AI ツールの応答に除外の一覧のメトリクスとアラートが入らず、人が読む本文には出ること・
+  除外の一覧の rule_id の発火で、通知は送られ `Explainer`（説明の待ち行列）が呼ばれないこと（一覧に無い rule_id では今までどおり呼ばれること）・
+  ほかのアラートの説明の Evidence に `gpu.*.fan_policy` の名前が出ないこと・案件資料に一覧の rule_id とメトリクスが載らないこと・
   一括再生で評価時刻が DB の時刻に従うこと、日次レポートの「続いているアラート」の節
 - Mock の Telemetry に `fan_policy` を足し、シナリオで「サービスが止まった」（0 が続く）を作れるようにする
 - 導入先（実装の後・所有者の承認の後）: `coldaisle` ユーザーで `fan_policy` が読めること。
