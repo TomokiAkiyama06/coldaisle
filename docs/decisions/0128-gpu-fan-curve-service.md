@@ -4,6 +4,7 @@
 - **Status**: FINAL（2026-10-14、リポジトリ所有者の承認）
 - **Date**: 2026-10-14
 - **Supersedes**: なし
+- **Superseded by**: §2.3 の曲線の値は [`0130`](0130-gpu-fan-quieter-curve.md)（形・検査・ヒステリシス・下げる速さは変えない）
 - **関連**: [`0028`](0028-fan-control-contracts.md) /
   [`0080`](0080-fand-systemd-unit.md) §2.5 /
   [`0119`](0119-safety-values-first-host.md) §2.12 /

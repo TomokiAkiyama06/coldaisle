@@ -70,6 +70,7 @@ def test_every_scenario_is_defined_in_yaml(scenarios):
         "sensor_reset_85",
         "reset",
         "dropout",
+        "notify_check",
     }
 
 
