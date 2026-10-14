@@ -265,7 +265,7 @@ fand の trace で測った値（2026-10-14 07:46〜07:50。試験の側から�
 本番の設定（drop-in なし・`startup_settle_ms` 15000）で fand を auto で動かした。systemd の `WatchdogTimestampMonotonic`（最後の
 `WATCHDOG=1` を受けた時刻）が変わった直後に `SIGSTOP` し、Max（3 zone の `pwmN_enable=0`）を 20 ms ごとに読んで時間を測った。
 時刻はどちらも CLOCK_MONOTONIC。Max を確かめたら負荷を止め、30 s 見てから `systemctl stop` で BIOS へ戻した。
-GPU 600 W で落ち着いた状態は作れないので、(ii) と (iii) の温めは 450 W に置き換えた（[0127](decisions/0127-t5-gpu-steady-450w.md)）。
+GPU 600 W で落ち着いた状態は作れないので、(ii) と (iii) の温めは 450 W に置き換えた（0127（承認を保留中。PR #291））。
 
 | 条件 | 位相 | `SIGSTOP` から Max | 止める直前の `effective`（F / R / T） | 開始 → 最高（Max の後 30 s まで）CPU / GPU / 12V-2x6 °C | 判定 |
 |---|---|---|---|---|---|
@@ -286,7 +286,7 @@ GPU 600 W で落ち着いた状態は作れないので、(ii) と (iii) の温�
 - **残り（未完了）: 約 11 s の経路。** `SIGABRT` で fand が終わらない hang では `TimeoutAbortSec` の 5 s も待つので、
   低い Demand のまま約 11 s 続く。上の試行はすべて約 5.2 s で終わり、Max を確かめた直後に負荷を止めたので、その後の約 6 s の
   上がりを測っていない。0119 §2.13 は `watchdog_timeout_ms` に約 11 s の間の余裕を求めるので、上の表は `SIGABRT` で終わる経路の
-  合格で、`watchdog_timeout_ms` はまだ `confirmed` にしない。試験の方法は所有者が決める（[0127](decisions/0127-t5-gpu-steady-450w.md) §2.5・§5 の 2）
+  合格で、`watchdog_timeout_ms` はまだ `confirmed` にしない。試験の方法は所有者が決める（0127（承認を保留中。PR #291） §2.5・§5 の 2）
 - (i) / (iii) の直前の `effective` は、アイドルで記録した値（0.43）か、それ + 0.05 以内だった
 - (ii) アイドルの CPU の 51 °C は、負荷の無い条件での一瞬の値（止めてから 8.9 s、Max の 3.6 s 後。約 10 s で 40 °C に戻った）。`RestartSec` 2 s で fand が自動で起動し直した時刻と重なるので、その起動（Python の起動と import）によるものと見ている
 - `ii-gpu600`（10:47）は、fand が 0.96 まで上げても、負荷の開始から約 80 s で GPU コアが中止の見張り（80 °C）に届いて止めた

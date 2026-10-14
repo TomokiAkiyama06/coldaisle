@@ -1,7 +1,7 @@
 # 決定記録 0125: T6 の立ち上がりを fand の trace で測り、tach の更新の閾値と fand の 1 tick を足して判定し、`stall_window_ms` は 5000 のままにする
 
 - **種別**: Decision Record
-- **Status**: Proposed（所有者の承認待ち）
+- **Status**: FINAL（2026-10-14、リポジトリ所有者の承認）
 - **Date**: 2026-10-14
 - **Supersedes**: [`0121`](0121-hardware-test-procedure.md) の一部（§2.8 T6 の表の「止まった状態から `stall_min_rpm` まで」と
   「Rear の manual 0.0 の間の最低の回転数と、0.35 の 90% までの時間」の合格の条件）
