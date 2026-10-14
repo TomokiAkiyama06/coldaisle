@@ -124,6 +124,10 @@ GPU の Fan は既定の制御にも曲線にも従っていない。
 
 0128 §2.1 と AGENTS.md の固定前提（fand・Learned・LLM は GPU の Fan を読まない）を、安全側に読んでそのまま守る。
 
+**原則: LLM へ渡すものは、除外の一覧を当てた後の集合だけから作る（件数・時刻・欠けの注記・省略の状態など、派生した値を含む）。**
+除く前の集合から作った派生の値を渡すと、その差から除いたメトリクスやアラートの存在が分かるため。人が見る決定論的な出力は、
+除く前の集合から作る。以下の項は、この原則を各経路に当てたものである。
+
 - 日次レポートの LLM の所見の入力（`facts_markdown()` の経路。0017 §2.2）からは、`gpu.*.fan_policy` と
   `GPU_FAN_NOT_MANUAL` / `GPU_FAN_BELOW_CURVE` の 2 つのアラート（その日の件数の行と、続いているアラートの節の行）を除く。
   これらは**人が読む本文**（LLM を通さない、コードが作る表）にだけ載せる
@@ -131,12 +135,16 @@ GPU の Fan は既定の制御にも曲線にも従っていない。
   ルールごとの件数の表・`ALERT_SCAN_LIMIT` を超えた省略の注記）は、除外の一覧の rule_id を除いた後で数え直す。
   除く前の件数を LLM に渡すと、件数の差から除いたアラートの存在が分かるため。省略の注記も、除いた後の件数で判定する。
   **人が読む本文の件数・表・注記は、除く前の値のまま**（GPU の Fan のアラートも数える）
+- `facts_markdown()` の**「集計の欠け」の注記**（収録が 1440 分に満たないメトリクスがあるか。`report.py` の `_facts()`）も、
+  除外の一覧のメトリクスを除いた後のメトリクスから判定する。`gpu.*.fan_policy` だけが欠けている日は、LLM 向けには注記を出さない。
+  人が読む本文の注記は除く前のメトリクスから作る
 - 除く対象は、コードでメトリクス名・rule_id を分岐せず、`config/report.yaml` に一覧（例: `llm_excluded_metrics: ["gpu.*.fan_policy"]`・
   `llm_excluded_rules: ["GPU_FAN_NOT_MANUAL", "GPU_FAN_BELOW_CURVE"]`）として置く（AGENTS.md ルール 9。0017 §2.3 の
   「メトリクス名で分岐しない」と同じ方針）。一覧の形の検査は読み込み時に行い、不正なら LLM の所見を作らない（安全側）
 - AI ツールの窓口（0015 / 0018 の読み取り専用ツール。`get_latest`・`query_series`・`get_stats`・`list_alerts`・`describe_system`）も、
   同じ一覧のメトリクスとアラートを返さない。`describe_system` のメトリクスの一覧と閾値（`thresholds`）からも、一覧のメトリクスと
-  rule_id の行を除く
+  rule_id の行を除く。`get_latest` の上位の `ts_ms`（最新の時刻）・`derived` も、除外を当てた後の読み値の集合から作る
+  （除外したメトリクスが最も新しいとき、除く前の集合の `ts_ms` を返すとその存在が分かるため）
 - **Server Health の AI 要約にも渡さない。** `build_server_health()`（`api/server_health.py`）は、発火中のアラートの重大度の数
   （`alert_severity_counts`）から `signal` を決め、`signal` のテンプレートを `AiHealthSummarizer.summarize()`（`ai/health.py`）が
   `Provider.chat()` に渡す。GPU の Fan の warning は `signal` を変えるので、テンプレートを通して LLM に届く。
@@ -185,6 +193,8 @@ GPU の Fan は既定の制御にも曲線にも従っていない。
   回復の時刻から `fire_after_s` 続いて初めて発火すること・firing のまま stale になっても解除されず、回復後に手動が `clear_s`
   続いて初めて解除されること（空白の前の手動の時間を数えない）・`gpu_fan_below_curve` で `gpu.0.core` か `gpu.0.fan_speed`
   の片方だけが stale でも同じに扱うこと・既存のしきい値のルール（例: `intake_high`）の振る舞いが変わらないこと・
+  LLM 向けの「集計の欠け」の注記が除外を当てた後のメトリクスから作られること（`gpu.0.fan_policy` だけが欠けた日に LLM 向けには出ず、
+  本文には出ること）・`get_latest` で除外したメトリクスが最も新しいとき、上位の `ts_ms` が除外を当てた後の最新の時刻になること・
   `describe_system` の応答に一覧のメトリクスと rule_id の閾値が出ないこと・
   日次レポートで、一覧の rule_id の発火がある日に `facts_markdown()` の件数・前日の件数・表・省略の注記が除いた後の値になり、
   人が読む本文は除く前の値のままであること（`ALERT_SCAN_LIMIT` の境界を含む）・
@@ -235,3 +245,4 @@ GPU の Fan は既定の制御にも曲線にも従っていない。
 | 2 | `coldaisle-telemetry` の停止を通知するルール（GPU・CPU の値が一定時間来ない） | 別の Issue |
 | 3 | `fire_after_s`・`fan_below`・`core_threshold`・`clear_s`・`core_clear`・`fan_clear` の値の確定 | 導入先で 2.6 の確認の後 |
 | 4 | 既存のしきい値・範囲のルール（`intake_high` など）も、欠けた値で pending を取り消すか（今は `since_ms` を保ち、空白をまたいで発火しうる。§2.3） | 別の Issue（通知の振る舞いが変わるので所有者の判断） |
+| 5 | LLM の経路の細部（各経路の派生の値・除外の当て方）は、実装の PR とその試験で確定する。決定記録の段階のレビューはここで閉じる | 2026-10-14 所有者の判断。実装の PR |
