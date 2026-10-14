@@ -10,8 +10,9 @@ GPU の Fan は fand の Control Pipeline（Front / Rear / Top）の外に置く
 止めたとき・NVML のエラーのときは GPU 自身の既定の制御へ戻す。落ちたとき・hang の
 ときは unit の ``ExecStopPost=`` が ``--restore-default`` で戻す（0128 §2.4）。
 
-曲線・周期・起動時の待ち・ヒステリシス・下げる速さは引数で受け取り、コードに既定値を
-持たない（AGENTS.md ルール9。値は unit が 0128 のとおりに渡す）。
+曲線・周期・起動時の待ち・ヒステリシス・下げる速さ・GPU の型番の名前は引数で受け取り、
+コードに既定値を持たない（AGENTS.md ルール9。値は unit が 0128 のとおりに渡す）。
+曲線はその型番で確かめたものなので、NVML の名前が ``--gpu-name`` と違えば書かない（0128 §2.2）。
 """
 
 from __future__ import annotations
@@ -39,8 +40,8 @@ systemd に再起動させる。device が 0 個なのは driver の読み込み
 途中のことがある。再起動して待ち直せば、GPU が現れたときに人の操作なしで曲線へ戻る（0128 §2.2）。
 """
 EXIT_CONFIG = 2
-"""引数が不正・起動時の待ちを過ぎても device が 2 個以上・曲線が Fan の範囲の外・
-NVML の library が無い。
+"""引数が不正・起動時の待ちを過ぎても device が 2 個以上・GPU の型番が ``--gpu-name`` と違う・
+曲線が Fan の範囲の外・NVML の library が無い。
 
 unit の ``RestartPreventExitStatus=2`` と対になる。人が直すまで結果が変わらない。
 """
@@ -49,6 +50,8 @@ DEVICE_RETRY_INTERVAL_S = 1.0
 MAX_PERCENT = 100
 """曲線の最後の点の回転（0128 §2.3）。600 W の定常で GPU の Fan を全開にするため。"""
 NVML_LIBRARY = "libnvidia-ml.so.1"
+NVML_DEVICE_NAME_BUFFER_SIZE = 96
+"""``NVML_DEVICE_NAME_V2_BUFFER_SIZE``。``nvmlDeviceGetName`` に渡す領域の大きさ（API の定数）。"""
 NVML_SUCCESS = 0
 NVML_TEMPERATURE_GPU = 0
 FAN_POLICY_MANUAL = 1
@@ -69,6 +72,10 @@ class NvmlError(Exception):
         self.code = code
 
 
+class GpuModelMismatchError(ValueError):
+    """NVML の device の名前が ``--gpu-name`` と違う（曲線を確かめていない型番。0128 §2.2）。"""
+
+
 class Nvml(Protocol):
     """このサービスが使う NVML の範囲。
 
@@ -83,6 +90,9 @@ class Nvml(Protocol):
 
     def device_count(self) -> int:
         """device の数。"""
+
+    def device_name(self) -> str:
+        """device 0 の型番の名前（例: ``NVIDIA RTX PRO 6000 Blackwell Workstation Edition``）。"""
 
     def fan_count(self) -> int:
         """device 0 の Fan の数。"""
@@ -145,6 +155,14 @@ class CtypesNvml:
                 "nvmlDeviceGetHandleByIndex_v2", ctypes.c_uint(0), ctypes.byref(self._handle)
             )
         return count
+
+    def device_name(self) -> str:
+        """device 0 の型番の名前。"""
+        buffer = ctypes.create_string_buffer(NVML_DEVICE_NAME_BUFFER_SIZE)
+        self._call(
+            "nvmlDeviceGetName", self._handle, buffer, ctypes.c_uint(NVML_DEVICE_NAME_BUFFER_SIZE)
+        )
+        return buffer.value.decode("utf-8", "replace")
 
     def fan_count(self) -> int:
         """device 0 の Fan の数。"""
@@ -247,8 +265,11 @@ class Settings:
     startup_wait_ms: int
     hysteresis_c: float
     down_rate_percent_per_s: float
+    gpu_name: str
 
     def __post_init__(self) -> None:
+        if not self.gpu_name.strip():
+            raise ValueError("gpu_name を空にしない")
         if self.interval_ms <= 0:
             raise ValueError("interval_ms は正にする")
         if self.startup_wait_ms < 0:
@@ -311,7 +332,11 @@ class Notifier:
 
 
 class FanCurveService:
-    """1 周期ぶんの読み取りと書き込み。NVML と時計は差し替えられる（試験用）。"""
+    """1 周期ぶんの読み取りと書き込み。NVML と時計は差し替えられる（試験用）。
+
+    作るときに読むだけで、まだ書かない。GPU の型番が ``settings.gpu_name`` と違えば
+    ``GpuModelMismatchError`` を上げる（0128 §2.2。知らない型番に書かない）。
+    """
 
     def __init__(
         self,
@@ -320,6 +345,11 @@ class FanCurveService:
         *,
         monotonic: Callable[[], float] = time.monotonic,
     ) -> None:
+        name = nvml.device_name()
+        if name != settings.gpu_name:
+            raise GpuModelMismatchError(
+                f"GPU の型番 {name!r} が --gpu-name {settings.gpu_name!r} と違う"
+            )
         self._nvml = nvml
         self._level = FanLevel(settings)
         self._monotonic = monotonic
@@ -384,15 +414,14 @@ def wait_for_single_device(
     nvml: Nvml,
     startup_wait_ms: int,
     stop: threading.Event,
-    notifier: Notifier,
     *,
     monotonic: Callable[[], float] = time.monotonic,
 ) -> int | None:
     """NVML を初期化し、device がちょうど1つになるまで探し直す（0128 §2.2）。
 
     最後に見た device の数を返す（見つかれば 1。NVML が初期化できないままなら 0）。
-    待ちの間に ``stop`` が立てば ``None``。待つ間も watchdog へ通知する
-    （Type=notify の watchdog は起動から数える）。
+    待ちの間に ``stop`` が立てば ``None``。まだ何も書いていないので ``READY=1`` の前で、
+    systemd の watchdog は効かない（上限は unit の ``TimeoutStartSec=``。0128 §2.4）。
     """
     deadline = monotonic() + startup_wait_ms / 1_000
     initialized = False
@@ -407,7 +436,6 @@ def wait_for_single_device(
                 return count
         except NvmlError as error:
             _LOGGER.warning(_json_event({"event": "gpu_fan_waiting", "detail": str(error)}))
-        notifier.send("WATCHDOG=1")
         remaining = deadline - monotonic()
         if remaining <= 0:
             _LOGGER.error(_json_event({"event": "gpu_fan_device_not_unique", "count": count}))
@@ -424,13 +452,17 @@ def run(
 ) -> int:
     """``stop`` が立つまで周期ごとに ``step`` を呼ぶ。戻り値は終了コード。
 
+    ``READY=1`` は最初の ``step`` の**前**に送る。systemd の watchdog は起動の完了の後にだけ
+    効くので、最初の周期で 1 つ目の Fan に書いた後に NVML が止まっても、``TimeoutStartSec=``
+    ではなく watchdog の上限で止めて ``ExecStopPost=`` に戻させるため（0128 §2.4）。
+
     どの終わり方でも、終わる前に既定の制御へ戻す
     （戻せなくても unit の ``ExecStopPost=`` がもう一度試みる）。
     """
     interval_s = interval_ms / 1_000
     deadline = time.monotonic()
     code = 0
-    ready = False
+    notifier.send("READY=1")
     while not stop.is_set():
         try:
             service.step()
@@ -438,9 +470,6 @@ def run(
             _LOGGER.error(_json_event({"event": "gpu_fan_failed", "detail": str(error)}))
             code = EXIT_FAILED
             break
-        if not ready:
-            notifier.send("READY=1")
-            ready = True
         notifier.send("WATCHDOG=1")
         deadline += interval_s
         now = time.monotonic()
@@ -486,6 +515,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--startup-wait-ms", type=int)
     parser.add_argument("--hysteresis-c", type=float)
     parser.add_argument("--down-rate-percent-per-s", type=float)
+    parser.add_argument("--gpu-name")
     return parser
 
 
@@ -509,6 +539,7 @@ def main(
         "startup_wait_ms",
         "hysteresis_c",
         "down_rate_percent_per_s",
+        "gpu_name",
     )
     missing = [name for name in required if getattr(args, name) is None]
     try:
@@ -520,6 +551,7 @@ def main(
             startup_wait_ms=args.startup_wait_ms,
             hysteresis_c=args.hysteresis_c,
             down_rate_percent_per_s=args.down_rate_percent_per_s,
+            gpu_name=args.gpu_name,
         )
     except ValueError as error:
         _LOGGER.error(_json_event({"event": "gpu_fan_invalid_arguments", "detail": str(error)}))
@@ -539,7 +571,7 @@ def main(
         # driver が入っていない導入先。待っても変わらない
         _LOGGER.error(_json_event({"event": "gpu_fan_library_missing", "detail": str(error)}))
         return EXIT_CONFIG
-    count = wait_for_single_device(nvml, settings.startup_wait_ms, stop, notifier)
+    count = wait_for_single_device(nvml, settings.startup_wait_ms, stop)
     if count is None:
         _LOGGER.info(_json_event({"event": "gpu_fan_stopped", "exit_code": 0}))
         return 0
@@ -549,6 +581,10 @@ def main(
         return EXIT_CONFIG
     try:
         service = FanCurveService(nvml, settings)
+    except GpuModelMismatchError as error:
+        # GPU を交換した・別の機械に入れた。曲線を確かめ直すまで書かない（0128 §2.2）
+        _LOGGER.error(_json_event({"event": "gpu_fan_model_mismatch", "detail": str(error)}))
+        return EXIT_CONFIG
     except ValueError as error:
         _LOGGER.error(_json_event({"event": "gpu_fan_invalid_arguments", "detail": str(error)}))
         return EXIT_CONFIG
@@ -560,6 +596,7 @@ def main(
             {
                 "event": "gpu_fan_started",
                 "curve": [list(point) for point in settings.curve.points],
+                "gpu_name": settings.gpu_name,
                 "interval_ms": settings.interval_ms,
             }
         )

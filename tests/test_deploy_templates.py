@@ -15,6 +15,7 @@
 """
 
 import re
+import shlex
 import tomllib
 from pathlib import Path
 
@@ -906,15 +907,26 @@ def test_gpu_fan_is_sandboxed_and_writes_no_files():
         "ProtectClock": "yes",
         "ProtectHostname": "yes",
         "LimitCORE": "0",
+        # CAP_SYS_ADMIN で保護を外さない（0128 §2.5）
+        "ProtectKernelTunables": "yes",
+        "ProtectKernelLogs": "yes",
+        "RestrictNamespaces": "yes",
+        "RestrictSUIDSGID": "yes",
+        "SystemCallErrorNumber": "EPERM",
     }.items():
         assert service.get(key) == [value], key
+    denied = words(gpu_fan(), "Service", "SystemCallFilter")
+    # 拒む一覧（先頭の ~）。mount で ProtectSystem= などを外さない
+    assert denied[0] == "~@mount"
+    for group in ("@swap", "@reboot", "@module", "@raw-io", "@debug"):
+        assert group in denied[1:], group
     for key in ("ReadWritePaths", "StateDirectory", "RuntimeDirectory"):
         assert key not in service, key
 
 
 def test_gpu_fan_runs_the_source_file_with_the_curve_of_0128():
     """venv と `coldaisle` パッケージに依存しない。値は 0128 のとおりに unit が渡す。"""
-    command = one(gpu_fan(), "Service", "ExecStart").split()
+    command = shlex.split(one(gpu_fan(), "Service", "ExecStart"))
     assert command[0] == "/usr/bin/python3"
     assert command[1:3] == ["-I", "-S"]
     source = command[3]
@@ -927,21 +939,29 @@ def test_gpu_fan_runs_the_source_file_with_the_curve_of_0128():
         "--startup-wait-ms": "60000",
         "--hysteresis-c": "2",
         "--down-rate-percent-per-s": "1",
+        # 曲線を確かめた型番。個体の識別子ではない（0128 §2.2・AGENTS.md ルール 10）
+        "--gpu-name": "NVIDIA RTX PRO 6000 Blackwell Workstation Edition",
     }
 
 
 def test_gpu_fan_restores_default_control_however_it_stops():
     """stop・落ちた・SIGKILL・watchdog のどれでも ExecStopPost= が既定の制御へ戻す（0128 §2.4）。"""
     unit = gpu_fan()
-    start = one(unit, "Service", "ExecStart").split()
-    stop_post = one(unit, "Service", "ExecStopPost").split()
+    start = shlex.split(one(unit, "Service", "ExecStart"))
+    stop_post = shlex.split(one(unit, "Service", "ExecStopPost"))
     assert stop_post == [*start[:4], "--restore-default"]
     assert one(unit, "Service", "Type") == "notify"
     assert one(unit, "Service", "NotifyAccess") == "main"
     assert one(unit, "Service", "WatchdogSec") == "5s"
-    # hang（kill -STOP）から既定の制御へ戻すまでの上限。既定の 90 s を待たない（0128 §2.4）
+    # hang（kill -STOP）から ExecStopPost= の終わりまでの上限。既定の 90 s を待たない。
+    # watchdog 5 s + abort 2 s + 戻しの処理の打ち切り 3 s = 10 s 以内（0128 §2.4）
     assert one(unit, "Service", "TimeoutAbortSec") == "2s"
-    assert one(unit, "Service", "TimeoutStopSec") == "5s"
+    assert one(unit, "Service", "TimeoutStopSec") == "3s"
+    bound = sum(
+        int(one(unit, "Service", key).removesuffix("s"))
+        for key in ("WatchdogSec", "TimeoutAbortSec", "TimeoutStopSec")
+    )
+    assert bound <= 10
     # 起動時に device を待つ 60 s より長く待つ
     assert one(unit, "Service", "TimeoutStartSec") == "90s"
 

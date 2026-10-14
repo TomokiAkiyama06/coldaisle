@@ -253,6 +253,9 @@ GPU の Fan は fand（Front / Rear / Top）の外で、root の小さなサー�
 （45 °C 30 % / 55 °C 50 % / 65 °C 80 % / 70 °C 以上 100 %。`provisional`）で書きます。標準ライブラリだけのソースを
 システムの `/usr/bin/python3 -I -S` で動かし、NVML は `ctypes` で呼びます。NVML の Fan の書き込みには `CAP_SYS_ADMIN` が
 要るので、unit はそれだけを持ち、使える device を `/dev/nvidiactl` と `/dev/nvidia0` に絞ります。
+`CAP_SYS_ADMIN` で保護を外せないよう、mount の系統の system call・カーネルの設定の書き込み・namespace の作成も拒みます。
+曲線は `--gpu-name` の型番（`NVIDIA RTX PRO 6000 Blackwell Workstation Edition`）で確かめたもので、NVML の名前が違えば
+何も書かずに終了コード 2 で止まります（`gpu_fan_model_mismatch`。GPU を交換したときは曲線を確かめ直し、決定記録と unit を直す）。
 
 **Fan に書くので、所有者の承認の後に有効にします。**
 
@@ -267,7 +270,7 @@ nvidia-smi --query-gpu=temperature.gpu,fan.speed --format=csv
 
 - 止めたとき（`systemctl stop`）・落ちたとき・hang（`WatchdogSec=5s`）・NVML のエラーのときは、GPU 自身の既定の制御へ戻します。
   落ちたときは unit の `ExecStopPost=`（`--restore-default`）が戻します。hang（`kill -STOP` など）では、watchdog の 5 s と
-  `TimeoutAbortSec=2s` の後に戻します
+  `TimeoutAbortSec=2s` の後に戻します。戻しの処理も `TimeoutStopSec=3s` で打ち切るので、hang から 10 s 以内に終わります
 - 起動時は NVML の device がちょうど1つになるまで 1 s ごとに探し直し、60 s を過ぎたら何も書かずに終わります
   （`journalctl -u coldaisle-gpu-fan` に `gpu_fan_device_not_unique`）。device が 0 個なら終了コード 1 で、2 s 後に起動し直して
   また待ちます（driver の読み込みが遅いとき）。2 個以上なら終了コード 2 で止まり、再起動しません

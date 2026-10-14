@@ -22,6 +22,7 @@ from coldaisle.gpu_fan_curve import (
     Curve,
     FanCurveService,
     FanLevel,
+    GpuModelMismatchError,
     Notifier,
     NvmlError,
     Settings,
@@ -33,6 +34,9 @@ from coldaisle.gpu_fan_curve import (
 
 CURVE = "45:30,55:50,65:80,70:100"
 """0128 §2.3 の曲線（unit が渡す値と同じ）。"""
+
+GPU_NAME = "NVIDIA RTX PRO 6000 Blackwell Workstation Edition"
+"""曲線を確かめた型番（unit が --gpu-name に渡す値と同じ。個体の識別子ではない）。"""
 
 FAN_POLICY_DEFAULT = 0
 
@@ -51,6 +55,8 @@ class FakeNvml:
         self.restores: list[int] = []
         self.fail: set[str] = set()
         self.init_calls = 0
+        self.name = GPU_NAME
+        self.calls: list[str] = []
 
     def _maybe_fail(self, name: str) -> None:
         if name in self.fail:
@@ -66,6 +72,9 @@ class FakeNvml:
     def device_count(self) -> int:
         self._maybe_fail("device_count")
         return self.devices
+
+    def device_name(self) -> str:
+        return self.name
 
     def fan_count(self) -> int:
         return self.fans
@@ -85,6 +94,7 @@ class FakeNvml:
 
     def set_fan_speed(self, fan: int, percent: int) -> None:
         self._maybe_fail("set")
+        self.calls.append(f"set {fan} {percent}")
         self.writes.append((fan, percent))
         self.targets[fan] = percent
         self.policies[fan] = FAN_POLICY_MANUAL
@@ -120,6 +130,7 @@ def settings(**overrides: object) -> Settings:
         "startup_wait_ms": 0,
         "hysteresis_c": 2.0,
         "down_rate_percent_per_s": 1.0,
+        "gpu_name": GPU_NAME,
     }
     values.update(overrides)
     return Settings(**values)  # type: ignore[arg-type]
@@ -257,8 +268,54 @@ def test_run_restores_default_control_and_fails_on_an_nvml_error() -> None:
     service = FanCurveService(nvml, settings(), monotonic=FakeClock())
     assert run(service, 1000, threading.Event(), notifier) == EXIT_FAILED
     assert nvml.restores == [0, 1]
-    # 1 度も書けていないので READY も WATCHDOG も送らない
-    assert notifier.messages == []
+    # READY=1 は最初の周期の前に送る。周期を終えていないので WATCHDOG は送らない
+    assert notifier.messages == ["READY=1"]
+
+
+def test_ready_is_sent_before_the_first_fan_write() -> None:
+    """watchdog は READY=1 の後にだけ効く。
+
+    最初の書き込みの途中の hang も watchdog で止める（0128 §2.4）。
+    """
+    nvml = FakeNvml(temperature=70)
+    stop = threading.Event()
+
+    class OrderingNotifier(RecordingNotifier):
+        def send(self, message: str) -> None:
+            nvml.calls.append(message)
+            super().send(message)
+
+    service = FanCurveService(nvml, settings(), monotonic=FakeClock())
+    original_step = service.step
+
+    def step_then_stop() -> int:
+        result = original_step()
+        stop.set()
+        return result
+
+    service.step = step_then_stop  # type: ignore[method-assign]
+    assert run(service, 1000, stop, OrderingNotifier()) == 0
+    assert nvml.calls == ["READY=1", "set 0 100", "set 1 100", "WATCHDOG=1"]
+
+
+def test_the_service_refuses_a_gpu_model_other_than_the_validated_one() -> None:
+    nvml = FakeNvml(temperature=70)
+    nvml.name = "NVIDIA Some Other GPU"
+    with pytest.raises(GpuModelMismatchError):
+        FanCurveService(nvml, settings(), monotonic=FakeClock())
+    assert nvml.writes == []
+
+
+def test_main_stops_without_writing_when_the_gpu_model_differs() -> None:
+    """GPU を交換した・別の機械に入れた: 書かずに 2（unit は再起動しない。0128 §2.2）。"""
+    nvml = FakeNvml(temperature=70)
+    nvml.name = f"{GPU_NAME} (other)"
+    argv = ["--curve", CURVE, "--interval-ms", "1000", "--startup-wait-ms", "0",
+            "--hysteresis-c", "2", "--down-rate-percent-per-s", "1",
+            "--gpu-name", GPU_NAME]  # fmt: skip
+    assert main(argv, nvml_factory=lambda: nvml) == EXIT_CONFIG
+    assert nvml.writes == []
+    assert nvml.restores == []
 
 
 def test_restoring_tries_every_fan_even_if_one_fails() -> None:
@@ -288,7 +345,6 @@ def test_waiting_succeeds_once_exactly_one_device_appears() -> None:
     nvml = FakeNvml(devices=0)
     clock = FakeClock()
     stop = threading.Event()
-    notifier = RecordingNotifier()
     original = stop.wait
 
     def advance(timeout: float | None = None) -> bool:
@@ -297,15 +353,14 @@ def test_waiting_succeeds_once_exactly_one_device_appears() -> None:
         return original(0)
 
     stop.wait = advance  # type: ignore[method-assign]
-    assert wait_for_single_device(nvml, 5000, stop, notifier, monotonic=clock) == 1
-    assert notifier.messages == ["WATCHDOG=1"]
+    assert wait_for_single_device(nvml, 5000, stop, monotonic=clock) == 1
 
 
 @pytest.mark.parametrize("devices", [0, 2])
 def test_waiting_gives_up_without_writing_when_the_device_is_not_unique(devices: int) -> None:
     nvml = FakeNvml(devices=devices)
     stop = threading.Event()
-    assert wait_for_single_device(nvml, 0, stop, RecordingNotifier()) == devices
+    assert wait_for_single_device(nvml, 0, stop) == devices
     assert nvml.writes == []
 
 
@@ -329,6 +384,8 @@ def test_main_does_not_write_when_the_device_is_not_unique(devices: int, expecte
             "2",
             "--down-rate-percent-per-s",
             "1",
+            "--gpu-name",
+            GPU_NAME,
         ],
         nvml_factory=lambda: nvml,
     )
@@ -341,11 +398,19 @@ def test_main_does_not_write_when_the_device_is_not_unique(devices: int, expecte
     [
         [],  # 引数が無い（既定値を持たない）
         ["--curve", "45:30,70:90", "--interval-ms", "1000", "--startup-wait-ms", "0",
-         "--hysteresis-c", "2", "--down-rate-percent-per-s", "1"],  # 最後が 100 % でない
+         "--hysteresis-c", "2", "--down-rate-percent-per-s", "1",
+         "--gpu-name", GPU_NAME],  # 最後が 100 % でない
         ["--curve", CURVE, "--interval-ms", "0", "--startup-wait-ms", "0",
-         "--hysteresis-c", "2", "--down-rate-percent-per-s", "1"],  # 周期が正でない
+         "--hysteresis-c", "2", "--down-rate-percent-per-s", "1",
+         "--gpu-name", GPU_NAME],  # 周期が正でない
         ["--curve", CURVE, "--interval-ms", "1000", "--startup-wait-ms", "0",
-         "--hysteresis-c", "2", "--down-rate-percent-per-s", "0"],  # 下げる速さが正でない
+         "--hysteresis-c", "2", "--down-rate-percent-per-s", "0",
+         "--gpu-name", GPU_NAME],  # 下げる速さが正でない
+        ["--curve", CURVE, "--interval-ms", "1000", "--startup-wait-ms", "0",
+         "--hysteresis-c", "2", "--down-rate-percent-per-s", "1"],  # 型番が無い
+        ["--curve", CURVE, "--interval-ms", "1000", "--startup-wait-ms", "0",
+         "--hysteresis-c", "2", "--down-rate-percent-per-s", "1",
+         "--gpu-name", " "],  # 型番が空
     ],
 )  # fmt: skip
 def test_main_rejects_invalid_arguments_without_touching_nvml(argv: list[str]) -> None:
@@ -360,7 +425,8 @@ def test_main_reports_a_missing_library_as_a_configuration_error() -> None:
         raise OSError("libnvidia-ml.so.1: cannot open shared object file")
 
     argv = ["--curve", CURVE, "--interval-ms", "1000", "--startup-wait-ms", "0",
-            "--hysteresis-c", "2", "--down-rate-percent-per-s", "1"]  # fmt: skip
+            "--hysteresis-c", "2", "--down-rate-percent-per-s", "1",
+            "--gpu-name", GPU_NAME]  # fmt: skip
     assert main(argv, nvml_factory=factory) == EXIT_CONFIG
 
 

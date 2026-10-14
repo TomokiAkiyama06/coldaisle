@@ -14,31 +14,34 @@ After=systemd-modules-load.service
 StartLimitIntervalSec=0
 
 [Service]
-# 最初の書き込みの後に READY=1、周期ごとに WATCHDOG=1 を送る。hang は watchdog で止め、
-# ExecStopPost= が既定の制御へ戻す（0128 §2.4）
+# 最初の書き込みの前に READY=1、周期ごとに WATCHDOG=1 を送る。watchdog は READY=1 の後にだけ効くので、
+# 最初の周期の書き込みの途中の hang も watchdog で止め、ExecStopPost= が既定の制御へ戻す（0128 §2.4）
 Type=notify
 NotifyAccess=main
 WatchdogSec=5s
 # kill -STOP で止まったままだと SIGABRT では終わらず、systemd は TimeoutAbortSec= を待ってから SIGKILL し、
 # その後で ExecStopPost= を走らせる。既定の 90 s では低い回転の 600 W で 80 °C に届く（約 80 s）ので、
-# hang から既定の制御へ戻すまでを watchdog 5 s + abort 2 s + ExecStopPost= に抑える（0128 §2.4）
+# hang から ExecStopPost= の終わり（または打ち切り）までを watchdog 5 s + abort 2 s + 3 s = 10 s 以内に抑える（0128 §2.4）
 TimeoutAbortSec=2s
-# stop の SIGTERM の後と ExecStopPost= の上限。どちらも 1 s 未満で終わる（導入先で 35〜170 ms）
-TimeoutStopSec=5s
-# 起動時に device を最大 60 s 待つ（その間も WATCHDOG=1 を送る）。それより長くする
+# stop の SIGTERM の後と ExecStopPost= の上限。どちらも 1 s 未満で終わる（導入先で 35〜170 ms）。
+# 戻しの処理が止まっても 3 s で打ち切り、Restart= で起動し直す（0128 §2.4 の 10 s の上限）
+TimeoutStopSec=3s
+# 起動時に device を最大 60 s 待つ（まだ何も書かず、READY=1 の前なので watchdog は効かない）。それより長くする
 TimeoutStartSec=90s
 User=root
 WorkingDirectory=/
 # 標準ライブラリだけのソースを、システムの python3 で venv に依存せず動かす（0128 §2.2）。
 # 値は 0128 のとおり（曲線は provisional）: 45 °C 30 % / 55 °C 50 % / 65 °C 80 % / 70 °C 以上 100 %、
-# 周期 1000 ms、device を待つのは起動時の 60000 ms まで、下げるときのヒステリシス 2 °C・1 %/s
-ExecStart=/usr/bin/python3 -I -S /opt/coldaisle/src/coldaisle/gpu_fan_curve.py --curve 45:30,55:50,65:80,70:100 --interval-ms 1000 --startup-wait-ms 60000 --hysteresis-c 2 --down-rate-percent-per-s 1
+# 周期 1000 ms、device を待つのは起動時の 60000 ms まで、下げるときのヒステリシス 2 °C・1 %/s。
+# 曲線は --gpu-name の型番で確かめたもの。NVML の名前が違えば書かずに 2 で止まる（0128 §2.2）。
+# 型番の名前は同じ型番に共通の値で、個体の識別子ではない（シリアル・UUID・bus id は書かない）
+ExecStart=/usr/bin/python3 -I -S /opt/coldaisle/src/coldaisle/gpu_fan_curve.py --curve 45:30,55:50,65:80,70:100 --interval-ms 1000 --startup-wait-ms 60000 --hysteresis-c 2 --down-rate-percent-per-s 1 --gpu-name "NVIDIA RTX PRO 6000 Blackwell Workstation Edition"
 # どの止まり方（stop・落ちた・SIGKILL・watchdog）でも走り、GPU 自身の既定の制御へ戻す
 ExecStopPost=/usr/bin/python3 -I -S /opt/coldaisle/src/coldaisle/gpu_fan_curve.py --restore-default
 
 Restart=always
 RestartSec=2
-# 2: 引数が不正・device が 2 個以上・曲線が Fan の範囲の外・NVML の library が無い。
+# 2: 引数が不正・device が 2 個以上・型番が --gpu-name と違う・曲線が Fan の範囲の外・NVML の library が無い。
 # 人が直すまで結果が変わらない。運転中の NVML のエラーと、60 s 待っても device が 0 個のとき
 # （driver の読み込みが遅い）は 1 で終わり、ここで再起動して待ち直す（0128 §2.2）
 RestartPreventExitStatus=2
@@ -69,6 +72,15 @@ RestrictRealtime=yes
 SystemCallArchitectures=native
 ProtectClock=yes
 ProtectHostname=yes
+# CAP_SYS_ADMIN を持つので、mount で上の保護を外したり、/proc/sys・/sys のカーネルの設定を書いたり
+# できないようにする（ProtectSystem=strict は /dev・/proc・/sys を含まない。0128 §2.5）。
+# NVML の device の操作は ioctl で、下の拒む系統に入らない（導入先で確かめる。0128 §2.7 の 1）
+ProtectKernelTunables=yes
+ProtectKernelLogs=yes
+RestrictNamespaces=yes
+RestrictSUIDSGID=yes
+SystemCallFilter=~@mount @swap @reboot @module @raw-io @debug @cpu-emulation @obsolete
+SystemCallErrorNumber=EPERM
 
 [Install]
 WantedBy=multi-user.target
