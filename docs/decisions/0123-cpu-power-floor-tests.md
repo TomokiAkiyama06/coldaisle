@@ -1,7 +1,7 @@
 # 決定記録 0123: CPU Power の cooling floor と `telemetry.cpu_power_ms` を確定する試験を 0121 に足す
 
 - **種別**: Decision Record
-- **Status**: Proposed（所有者の承認待ち）
+- **Status**: FINAL（2026-10-14、リポジトリ所有者の承認）
 - **Date**: 2026-10-14
 - **Supersedes**: [`0121`](0121-hardware-test-procedure.md) の一部（§2.3 の `*_telemetry_stale` の行のうち「`cpu_power_ms` は入力が無いので
   確定しない」と、§3「悪くなること」の同じ趣旨の項。0122 §5 の 1）
