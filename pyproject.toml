@@ -72,6 +72,9 @@ coldaisle-safety-handoff = "coldaisle.safety_handoff:main"
 # CPU Package の電力を RAPL から 1 s の平均・1 W の丸めで渡す root のサービス。unit は
 # /usr/bin/python3 -I -S でソースを直接動かす。標準ライブラリだけ（#278 / 決定記録 0122）
 coldaisle-cpu-power = "coldaisle.cpu_power_publisher:main"
+# GPU の Fan を GPU コアの温度の曲線で書く root のサービス（fand の外。NVML を ctypes で呼ぶ）。unit は
+# /usr/bin/python3 -I -S でソースを直接動かす。標準ライブラリだけ（#285 / 決定記録 0128）
+coldaisle-gpu-fan = "coldaisle.gpu_fan_curve:main"
 # NVML / hwmon を既存 readings timeline へ収集する読み取り専用 daemon（#65）
 coldaisle-telemetry = "coldaisle.telemetry_daemon:main"
 # 3系統 Fan 制御デーモン。**hwmon へ書き込むのはこのプロセスの Backend だけ**（#74 / 0028 §2.2）
