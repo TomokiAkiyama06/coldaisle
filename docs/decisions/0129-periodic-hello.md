@@ -1,11 +1,10 @@
 # 決定記録 0129: `hello` を起動時と 60 s ごとに出し、取り込みは同じ内容の `hello` を記録し直さない
 
 - **種別**: Decision Record
-- **Status**: Proposed（2026-10-14 にリポジトリ所有者が承認。レビューの後に FINAL）
+- **Status**: FINAL（2026-10-14、リポジトリ所有者の承認）
 - **Date**: 2026-10-14
 - **Supersedes**: [`0022`](0022-firmware-v1.md) §2.8（`hello` を読み手が繋がった瞬間に出し直す）と §4 の却下した代替案のうち
   「`hello` を周期的に出し直す」の行 / [`0003`](0003-device-json-schema.md) §2.2 の表の `hello` の行のうち「電源投入時に1回」
-  （旧記録側の `Superseded by` と README の 0003 / 0022 の行は、この記録を FINAL にする commit で足す。Proposed の間は足さない。§5 #2）
 - **関連**: [`0002`](0002-metric-naming.md) §2.10 /
   [`0012`](0012-rule-engine.md)（`PROBE_CHANGED`） /
   [`0025`](0025-probe-identity.md) /
@@ -118,4 +117,4 @@
 | # | 内容 | 時期 |
 |---|---|---|
 | 1 | 60 s を変えるか（短くすると差し替えに早く気づけ、帯域が増える） | 運転の後、必要なら別の記録 |
-| 2 | 0022 / 0003 のヘッダへの `Superseded by` の追記と、README の 0003 / 0022 の行の Status 欄。Proposed の間に足すと、まだ効いていない決定で FINAL の記録を置き換えたことになる（0080・0100 と同じく FINAL にするときに足す） | この記録を FINAL にする commit |
+| 2 | ~~0022 / 0003 のヘッダへの `Superseded by` の追記と、README の 0003 / 0022 の行~~ | FINAL にした commit で足して閉じた |
