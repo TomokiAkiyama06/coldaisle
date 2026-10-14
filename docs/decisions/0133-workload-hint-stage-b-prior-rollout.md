@@ -147,41 +147,53 @@ Stage B の骨格は既に FINAL の記録で決まっている。本記録は�
   として経路へ送る（ヒント有りの solve を待たない）。ヒント有りの plan（解けたとき）と、解かなかった・
   使えない理由（閉じた語彙）は、その後に**別のメッセージ**（Shadow 用の記録。同じ `run_id`・元 snapshot・
   対になる基準の `MpcProposal` を指す識別に束縛する）として送る
-- **ヒント有りの solve は基準の周期から切り離す。** いまの `PeriodicWorker.run()`（`learned_worker/cli.py`）は
-  1つのスレッドで `step()` を同期に呼び、終わった時刻から次の周期を数える。ここにヒント有りの solve を
-  そのまま足すと、それが遅れた分だけ次の基準の solve がずれ、基準の提案が失効して Fallback になりうる。そこで:
-  - 周期のループ（いまのスレッド）が持つのは**基準の solve と送信だけ**とする。`next_due` は基準の solve と送信の
-    終わりだけから数え、ヒント有りの solve の進み具合を見ない
-  - ヒント有りの solve は worker の中の**専用のスレッド 1 本**（Shadow solver）で行う。周期のループは基準の送信の後に、
-    (frame・基準の plan・打ち切り時刻) を**1 枠の受け渡し口**に置くだけで、待たない。Shadow solver が前の solve の
-    途中なら新しい依頼は捨てる（`hint_prior_skipped: shadow_busy`。待ち行列を作らない）
-  - 打ち切り時刻は `min(基準の solve の開始 + mpc.budget_ms, 次の基準の周期の開始 next_due)` とする。
-    0066 §2.1 (d) の「予算を共有する」はこの上限として残し、さらに**次の基準の周期が来たら必ず打ち切る**。
-    Optimizer はモデルの評価の境目ごとに打ち切りの旗と時刻を見る（評価回数の打ち切り `max_evaluations` と同じ場所）。
-    周期のループは `next_due` に達したら旗を立てるだけで、Shadow solver の終了を待たない。打ち切った solve は
-    `hint_prior_skipped: budget_exhausted` として記録を送る（または送らない。実装 Issue で決める）
-  - Python のスレッドは GIL を共有するので、打ち切りが効くまでの**1 回のモデル評価**の間だけ、基準の solve と
-    CPU を取り合いうる。この重なりの上限は「評価 1 回の時間」で、周期の長さに比べて小さいことを B1 の実測で確かめる。
-    小さくなければ、Shadow solver を別プロセスに分ける（registry の束縛を2つ持つ費用がかかるので、測ってから決める）
-  - 送信は周期のループ・heartbeat のスレッド・Shadow solver の3か所からになる。経路の送信は1メッセージ単位で
-    直列化されていること（`SOCK_SEQPACKET` の1回の送信が1メッセージ。heartbeat がすでに別スレッドから送っている）を
-    試験で確かめる
-- **B1 は `requested_demand` の値にも時刻にも影響しない。** B1 では fand はヒント有りの記録を Shadow の台帳へ
-  渡すだけで、受け渡し口（`MpcProposal` の slot）にも Gate にも入れない。基準の `MpcProposal` が受け渡し口に
-  届く時刻・内容・その後の Gate / Guard / Safety の結果は、`stage: off` の場合と同じである
-- 試験で固定する（Mock の worker と simulated backend・注入した単調時計。ルール 7）:
-  - **複数周期の frame の列**（少なくとも数周期ぶん）を流し、ヒント有りの solve を人工的に遅らせた
-    （周期より長くかかる・次の周期をまたぐ）・例外にした・予算を使い切らせた各場合について、**各周期の基準の
-    `MpcProposal` の送信時刻（worker 側の単調時計）と内容が、ヒントを扱わない worker（`supervisor_hint` が常に
-    `None`）と一致する**こと。周期ごとのずれが積み重ならないことを見るため、1周期だけでなく列の全体で比べる
-  - 遅らせたヒント有りの solve が、次の周期の `next_due` で打ち切られ、Shadow solver に依頼が溜まらない
-    （`shadow_busy` で捨てられる）こと
-  - 同じ frame の列に対し、`stage: off` と `stage: shadow_mpc` で、fand が受け取る基準の `MpcProposal` の
-    内容と受信の単調時刻、各 tick の `requested_demand` / `effective_demand` が一致すること
-  - worker の中で、基準の `MpcProposal` の送信がヒント有りの solve の開始より先に起きること
-    （呼び出し順の記録で確かめる）
-  - B1 で、ヒント有りの記録が `MpcProposal` の slot へ入らず、Shadow の台帳にだけ現れること
-  - 実時間の重なり（GIL）は CI では上限を断定せず、B1 の実測で評価 1 回の時間と基準の送信時刻のゆらぎを記録する
+- **ヒント有りの solve は基準の周期から切り離し、最初から別プロセスで解く。** いまの `PeriodicWorker.run()`
+  （`learned_worker/cli.py`）は1つのスレッドで `step()` を同期に呼び、終わった時刻から次の周期を数える。ここに
+  ヒント有りの solve をそのまま足すと、それが遅れた分だけ次の基準の solve がずれ、基準の提案が失効して Fallback に
+  なりうる。同じプロセスの別スレッドにしても、GIL と CPU の取り合いで打ち切りの合図が効くまで基準の solve が
+  待たされうる。**B1 の前に分離を構造で保証する**ため、次のようにする（「B1 で測ってから決める」はしない）:
+  - **基準のプロセス**（いまの MPC worker。`coldaisle-learnd --role mpc`）の周期のループが持つのは、基準の solve と
+    送信、frame の受信、Shadow solver との受け渡しだけとする。`next_due` は基準の solve と送信の終わりだけから数え、
+    ヒント有りの solve の進み具合を見ない
+  - **Shadow solver は基準のプロセスが起動する子プロセス 1 つ**とする（別の uid でなくてよい。同じ unit・同じ cgroup
+    に入るので、unit の停止で一緒に止まる。親が死んだら子も終わる（`PR_SET_PDEATHSIG`））。子は起動の直後に
+    自分の**スケジューリングを `SCHED_IDLE` に下げる**（特権なしで下げられる。下げられなければ `nice` を設定の最大値へ
+    上げ、それも失敗したら子を起動せず `shadow_unavailable` とする）。基準のプロセスの優先度は変えない。
+    これで、CPU が空いていないとき子は基準のプロセスより後に回され、基準が子を待つことは無い
+  - 子は fand のソケットを持たない（役割ごとの接続は1つのまま。0077）。子は親が束縛した artifact の識別
+    （`expected_artifacts` と digest）を受け取り、自分で読んで digest が一致したときだけ解く。一致しなければ
+    `hint_record_rejected` 相当の理由だけを返す
+  - 親から子へは**1 枠**の依頼（frame・基準の plan・打ち切り時刻）をノンブロッキングで渡す。子が前の solve の途中なら
+    依頼を捨てる（`hint_prior_skipped: shadow_busy`。待ち行列を作らない）。子から親への結果も非同期の pipe で返し、
+    親は**基準の solve の外**（frame を待つ間の受信の多重化の中）でだけ読み、fand へ別のメッセージとして転送する。
+    転送は I/O だけで、モデルの評価をしない
+  - 打ち切り時刻は `min(基準の solve の開始 + mpc.budget_ms, 次の基準の周期の開始 next_due)` を
+    `CLOCK_MONOTONIC` の絶対時刻で渡す（同じホストの別プロセスで同じ時計）。子は評価の境目ごとにこれを見て
+    自分で打ち切る。親は子を待たない。0066 §2.1 (d) の「予算を共有する」はこの上限として残る
+  - 子が死んだ・応答しない・pipe が壊れたときは、親はその子を終わらせ、設定の間隔をあけて作り直す。その間は
+    `shadow_unavailable` で、基準の周期には何も起きない。子の失敗で worker（親）を終了しない
+  - **残る影響と主張の範囲**: OS のスケジューラは基準を優先するが、共有のキャッシュ・メモリ帯域・SMT の兄弟の
+    コアでの干渉は残る。したがって主張は「基準の送信時刻は、Shadow solver が CPU を使い切っていても、Shadow
+    solver が無いときと**分布として区別できない**（下の試験の許容幅の中）」であり、ビット単位の一致ではない
+- **B1 は `requested_demand` の値にも時刻にも影響しない。** B1 では fand はヒント有りの記録を §2.5a の
+  `hint_shadow` の記録へ書くだけで、受け渡し口（`MpcProposal` の slot）にも Gate にも入れない。基準の
+  `MpcProposal` が受け渡し口に届く内容・その後の Gate / Guard / Safety の結果は `stage: off` の場合と同じで、
+  届く時刻は上の範囲で変わらない
+- 試験で固定する:
+  - **決定論の試験（CI。Mock の worker・simulated backend・注入した単調時計。ルール 7）**: 複数周期の frame の列を
+    流し、Shadow solver を偽物にして遅らせる（周期をまたぐ）・例外にする・死なせる・応答させない各場合で、
+    各周期の基準の `MpcProposal` の内容と送信時刻（注入した時計）が、ヒントを扱わない worker と一致すること。
+    依頼が溜まらない（`shadow_busy`）こと。子の死で親が終了しないこと。基準の送信が子への依頼より先に起きること
+  - **実時間の CPU の取り合いを含む試験**: 実際の子プロセスを `SCHED_IDLE` で起動し、子に**全コアを使い切る重い計算**
+    （論理 CPU の数だけの計算ループ）を走らせた状態と、子を起動しない状態とで、同じ frame の列（数百周期）を
+    実時間で流す。各周期の「`next_due` から基準の `MpcProposal` を送るまでの時間」の分布を比べ、
+    p50 / p99 / 最大の差が許容幅（`config/` の試験用の設定に置く。ルール 9）に収まること。
+    実時間に依存するので通常の CI の `-m "not hardware"` からは分け（専用の marker）、リリースゲートと B1 の着手前に
+    **本番のホスト**で走らせる。B1 の前提に「本番のホストでこの試験に合格」を加える
+  - 同じ frame の列に対し、`stage: off` と `stage: shadow_mpc` で、各 tick の `requested_demand` /
+    `effective_demand` が一致すること
+  - B1 で、ヒント有りの記録が `MpcProposal` の slot へ入らず、`hint_shadow` の記録にだけ現れること
+  - `SCHED_IDLE` に下げられない環境では子を起動しないこと（`shadow_unavailable`）
 - **fand が再検査する。** 0066 §2.1 (d) の 2 条件（系統ごとに `demand_hint >= demand_base - eps`、
   かつ両 plan の予測のすべての offset で CPU / GPU が `hint <= base + eps_c`）と認証領域の判定を、
   worker の判定とは別に fand の中で決定論的に行い、両方が通ったときだけヒント有りの plan を
@@ -197,6 +209,43 @@ Stage B の骨格は既に FINAL の記録で決まっている。本記録は�
   - 基準の `MpcProposal` が拒まれた・入れ替わった場合、それと対のヒント有りの記録も使わない（対になる基準が無い
     ヒント有りの plan だけを Gate へ渡さない）。逆向き（ヒントの失敗で基準を捨てる）は作らない
 
+### 2.5a ヒント有りの記録の保存先（`hint_shadow`。0053 の台帳とは別）
+
+0053 の Shadow の台帳は、**不変の `ControlTick` に埋め込まれ、その tick に Gate が評価した候補**を記録する。
+ヒント有りの記録は基準の `MpcProposal` より後に（次の tick 以降に）届き、Gate も評価しないので、その台帳には
+書けない。**0053 は変えず**、別の追記専用の記録を定める。
+
+- **保存先**: fand の store（`control_traces` と同じ SQLite）の新しい表 `hint_shadow_records`。書くのは fand だけで、
+  0066 §2.2 の「制御デーモンが自分の表にだけ書く別の接続」を使う。`events` には書かない。書き込みは tick の外の
+  書き手（trace の書き込みと同じ経路）で行い、失敗しても制御は続ける（0060 §2.6 と同じ。失敗の回数は trace の
+  ヒントの塊に数える）
+- **形**（列の型と migration は実装 Issue で定める。ここでは契約だけ）:
+
+  | 列 | 内容 |
+  |---|---|
+  | `seq` | 追記順の番号（再利用・巻き戻りなし）。主キー |
+  | `run_id` | fand の起動ごとの `run_id`（経路の封筒が運ぶもの。0077） |
+  | `source_tick_id` / `source_ts_ms` | ヒント有りの solve の元になった frame の snapshot の `tick_id` と `ts_ms` |
+  | `source_monotonic_ms` | 同じ snapshot の `monotonic_ms`（鮮度の判定と突き合わせの検算に使う） |
+  | `received_monotonic_ms` / `received_ts_ms` | fand が受け取った時刻（単調時計と壁時計） |
+  | `schema_version` | この記録の形の版 |
+  | `status` | 閉じた語彙: `recorded`（plan あり）/ `skipped`（worker が解かなかった・打ち切った。理由つき）/ `rejected`（fand の検証に落ちた。§2.5 の `hint_record_rejected`） |
+  | `reason` | `status` が `recorded` 以外のときの閉じた語彙（`budget_exhausted` / `shadow_busy` / `out_of_certified_domain` / `monotonicity_violated` / `stale` / `run_id_mismatch` / `artifact_mismatch` / `base_mismatch` など） |
+  | `record_json` | `recorded` のときだけ: 基準とヒント有りの両 plan の `requested_demand`、両 plan の予測（`PlanPrediction.targets` の全 offset）、fand の再検査の結果、ヒント有りの context（band）、artifact の識別・`config` の digest・認証のハッシュ。`note`・生の `source`・`peer_uid` は載せない（0064 §2.9） |
+
+- **追記専用**: UPDATE はトリガで拒む。DELETE は保持期間の適用（`coldaisle-rollup`）だけが行う（`control_traces` と
+  同じ扱い。0030）
+- **保持**: `config/retention.yaml` に `hint_shadow_days` を足す（ルール 9）。既定の値は `control_trace_days` と同じに
+  する（突き合わせる相手の trace より長く残しても join できないため）
+- **突き合わせ（join の契約）**: `hint_shadow_records` の1行は、`control_traces` の主キー
+  `(ts_ms, tick_id) = (source_ts_ms, source_tick_id)` の行と、その trace の `run_id` が記録の `run_id` と等しいときだけ
+  対応する。対応する trace の行が無い（保存に失敗した・保持で消えた）記録は集計で「対応なし」として数え、捨てない。
+  基準の plan が実際に使われたかは、元 snapshot が同じ基準の `MpcProposal` を Gate が評価した tick（0053 の台帳の側）
+  から引く。**`ts_ms` だけ・`tick_id` だけでは突き合わせない**（再起動で `tick_id` が戻り、壁時計は飛ぶため）
+- **公開しない**: 読み取り API・AI ツールには出さない（新しい endpoint を足さない。0009 §3 / ルール 8）。
+  Thermal Dataset（0031 / 0109）にも入れない。B1 の集計（ヒント有りが選ばれていたらの差分・二重解法の成功率）は
+  DB を読むだけの CLI で行い、その形は B1 の実装 Issue で定める
+
 ### 2.6 段階（shadow から始める）
 
 段階は `config/fan-policy.yaml` の `supervisor.workload_hint.stage` で持つ。値は
@@ -207,7 +256,7 @@ Stage B の骨格は既に FINAL の記録で決まっている。本記録は�
 |---|---|---|---|
 | `off` | ヒントを読まない（Stage A のまま） | なし | — |
 | **B0 `observe`** | ヒントを読み、状態（`active` / `expired` / …）を進め、終端状態を永続化し、「効かせていたら選んだ context」を trace に残す（`influence: would_override`）。frame には載せない | **なし** | 0064 前提 1（#82）・前提 4（所有者の承認）・0066 §2.2 の実装 |
-| **B1 `shadow_mpc`** | B0 に加え、frame の `supervisor_hint` を埋め、worker に二重解法をさせる。基準の解は先に `MpcProposal` として届き（§2.5）、ヒント有りの plan は後から **Shadow の台帳（0053 / #90）へ「適用しなかった提案」として残すだけ**で、Gate へは基準の plan だけを渡す | **なし**（値も時刻も。§2.5） | B0 の前提 ＋ 0064 前提 2（RulePolicy の本番値）＋ 0066 §2.1 (b) / (c) の照合済みハッシュ |
+| **B1 `shadow_mpc`** | B0 に加え、frame の `supervisor_hint` を埋め、worker に二重解法をさせる。基準の解は先に `MpcProposal` として届き（§2.5）、ヒント有りの plan は別プロセスの Shadow solver が解き、後から **`hint_shadow` の記録（§2.5a）へ残すだけ**で、Gate へは基準の plan だけを渡す | **なし**（値。時刻は §2.5 の範囲で変わらない） | B0 の前提 ＋ 0064 前提 2（RulePolicy の本番値）＋ 0066 §2.1 (b) / (c) の照合済みハッシュ ＋ §2.5 の実時間の試験に本番のホストで合格 |
 | **B2 `active`** | §2.5 の再検査を通ったヒント有りの plan を、基準の plan の代わりに Gate へ渡す | Learned MPC の authority の範囲で**ありうる** | 0064 前提 1〜4 と 0066 §2.1 (b) / (c) のすべて（#288 の着手条件 1〜6） |
 
 - **B0 / B1 は 0064 の Stage B の前提を緩めるものではない。** どちらも `requested_demand` を1ビットも
@@ -249,6 +298,7 @@ Stage B の骨格は既に FINAL の記録で決まっている。本記録は�
 | Learned MPC worker の停止・timeout・モデル読込の失敗・Gate の退避 | 既存のとおり Fallback で運転。Fallback はヒントを読まないので、ヒントの効き目は自動的に 0 | `hint_prior_skipped: mpc_unavailable` |
 | 二重解法で予算が尽きた・ヒント有りが解けない | 基準の plan を使う | `budget_exhausted`（0066） |
 | Shadow solver が前の solve の途中 | 新しい依頼を捨て、基準の plan を使う | `shadow_busy` |
+| Shadow solver の子プロセスが死んだ・応答しない・`SCHED_IDLE` に下げられない | 子を作り直す（下げられなければ起動しない）。基準の周期と plan はそのまま | `shadow_unavailable` |
 | ヒント有りの記録の検証（新しさ・`run_id`・artifact・対の基準）に落ちた | その記録だけを捨て、基準の plan を使う（基準は自分の検証が失敗したときだけ拒む） | `hint_record_rejected` |
 | 認証領域の外・単調性の再検査が不合格 | 基準の plan を使う | `out_of_certified_domain` / `monotonicity_violated`（0066） |
 | ハッシュの不一致・記録が無い | 実効の段階を B0（記録だけ）に留める（0066 §2.1 (c)） | `certification_mismatch` |
@@ -293,7 +343,7 @@ Stage B の骨格は既に FINAL の記録で決まっている。本記録は�
 | トレードオフ | 緩和策 |
 |---|---|
 | frame・worker の提案・trace の3つの schema が変わる | いずれも版を上げ、古い版にヒントの塊を持たせない。B0 は frame を変えないので、frame の変更は B1 の実装 Issue に閉じる |
-| 二重解法で MPC worker の計算が増える | 予算は増やさない（0066 §2.1 (d)）。基準を先に解いて先に公開し、ヒント有りは周期のループの外の Shadow solver で解いて次の周期で打ち切るので、基準の周期はずれない（§2.5 の複数周期の試験で固定）。GIL による重なりは評価 1 回分を上限とし、B1 で実測する。成功率は B1 で測り、低ければ B2 を使わない（人が決める） |
+| 二重解法で MPC worker の計算が増える | 予算は増やさない（0066 §2.1 (d)）。基準を先に解いて先に公開し、ヒント有りは `SCHED_IDLE` の子プロセスで解いて次の周期で打ち切るので、基準の周期はずれない（§2.5 の決定論の試験と、全コアを使い切る実時間の試験で固定）。キャッシュ・メモリ帯域の干渉は残るので、主張は分布の許容幅の中に留める。成功率は B1 で測り、低ければ B2 を使わない（人が決める） |
 | B1 にも認証のハッシュが要るので、二重解法の成功率を測れるのは認証の後になる | 0066 §2.1 (b) の認証ランナー自体が実際の Optimizer と予算で二重解法を回すので、その結果で一次の見積もりは得られる。安全側（0066 §2.1 (c)）を優先する |
 | B0 で制御デーモンが DB を読むスレッドを持つ | 読み出しは tick の外。失敗はヒント無しに倒すだけで、制御は止めない |
 | `IDLE` の鍵を許すと、ジョブを起動しない嘘のヒントで保持時間ぶん騒音が増える | 冷却を弱めないので温度は上がらない（0066）。保持時間で上が抑えられ、矛盾は trace に数えられる。既定の設定には置かない |
@@ -312,7 +362,9 @@ Stage B の骨格は既に FINAL の記録で決まっている。本記録は�
 | **MPC worker の二重解法の判定をそのまま信じる** | 最終判定を ML 側のプロセスに置くことになる。比較は安価なので fand で再検査する |
 | **ヒント専用の Authority / 昇格の入口を作る** | 制御権の段階が2本になり、片方だけ下げ忘れる状態が生まれる。B2 の実効は Learned MPC の authority で上下させれば足りる |
 | **ハッシュ不一致のとき B1 に下げて二重解法を測り続ける** | 0066 §2.1 (c) は不一致・記録無しで Stage B を無効（記録のみ）にすると定めている。未認証の組み合わせで MPC worker の挙動を変える段階を動かさない。B0 に留める |
-| **ヒント有りの solve を周期のループの中で、基準の送信の後に同期に回す** | `PeriodicWorker.run()` は終わった時刻から次の周期を数えるので、ヒント有りが遅れた分だけ次の基準の solve がずれ、提案が失効して Fallback になりうる。Shadow solver に切り離し、次の周期で打ち切る（§2.5） |
+| **ヒント有りの solve を周期のループの中で、基準の送信の後に同期に回す** | `PeriodicWorker.run()` は終わった時刻から次の周期を数えるので、ヒント有りが遅れた分だけ次の基準の solve がずれ、提案が失効して Fallback になりうる。別プロセスの Shadow solver に切り離し、次の周期で打ち切る（§2.5） |
+| **Shadow solver を同じプロセスの別スレッドにし、重なりは B1 で測ってから決める** | GIL と CPU の取り合いで打ち切りの合図が効くまで基準の solve が待たされうる。分離を B1 の前に構造で保証するため、最初から `SCHED_IDLE` の子プロセスにする（§2.5） |
+| **遅れて届くヒント有りの記録を 0053 の Shadow の台帳に書く** | 0053 の台帳は不変の `ControlTick` に埋め込まれ、その tick に Gate が評価した候補を記録する。後から届き Gate が評価しない記録は入らない。0053 を変えず、別の追記専用の `hint_shadow` の記録にする（§2.5a） |
 | **ヒント有りの記録の検証が落ちたら基準の提案も捨てる** | 任意の機能の失敗で基準の MPC を失い、Fallback に落ちる。基準は自分の検証でだけ拒む（§2.5） |
 | **B1 で二重解法の両方の結果を1つの提案にまとめて送る** | ヒント有りの solve の分だけ基準の解の到着が遅れ、B1 が `requested_demand` の時刻に影響する。基準を先に公開し、ヒント有りは別の Shadow 用の記録にする（§2.5） |
 | **ヒントで `regime_confidence` を上げる・`UNKNOWN` を別の Regime の context に写す** | 未知の状態を自己申告で既知に見せる（ルール 4）。0041 の鮮度判定と 0054 の帰属も壊れる |
@@ -337,5 +389,5 @@ Stage B の骨格は既に FINAL の記録で決まっている。本記録は�
 1. 0066 §2.2 の migration・終端状態の表・run の記録（B0 の前提）
 2. B0: 受け渡し口と読み手のスレッド・`SupervisorInput.workload_hint`・状態の遷移・trace の塊
 3. 0066 §2.1 (b) の認証ランナーとハッシュ（未決 3 の後。B1 の前提）
-4. B1: frame の `supervisor_hint`・worker の二重解法（基準を先に公開・ヒント有りは別の Shadow 用の記録）・fand の再検査・Shadow の台帳への記録
+4. B1: frame の `supervisor_hint`・`SCHED_IDLE` の子プロセスの Shadow solver（基準を先に公開・ヒント有りは別のメッセージ）・fand の再検査・`hint_shadow_records` の表と保持・実時間の試験
 5. B2: Gate へ渡す候補の切り替え（前提 1〜6 がすべて揃ってから）
