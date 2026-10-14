@@ -107,3 +107,7 @@ def configure(
     root = logging.getLogger()
     root.handlers = [handler]
     root.setLevel(level.upper())
+    # httpx / httpcore は info で要求の URL をそのまま出す。Slack の Webhook は URL そのものが
+    # 秘匿情報なので（決定記録 0013 §2.1）、ルートを INFO にしても journal に残さない（#305）
+    for name in ("httpx", "httpcore"):
+        logging.getLogger(name).setLevel(logging.WARNING)

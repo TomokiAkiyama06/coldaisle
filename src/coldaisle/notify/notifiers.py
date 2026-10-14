@@ -32,6 +32,28 @@ LINE_PUSH_URL = "https://api.line.me/v2/bot/message/push"
 TIMEOUT_S = 10.0
 
 
+class DeliveryError(Exception):
+    """宛先への送信の失敗。**宛先の URL・トークンを含まない。**
+
+    httpx の例外の文には URL が入る（`HTTPStatusError` は ``for url '…'``）。Slack の Webhook は
+    URL そのものが秘匿情報なので（決定記録 0013 §2.1）、呼び出し側が ``exc_info`` で記録しても
+    漏れないよう、宛先の名前・例外の型・HTTP の状態コードだけにして元の例外の連鎖を切る（#305）。
+    """
+
+
+def _post(target: str, client: httpx.Client | None, url: str, **kwargs: object) -> None:
+    try:
+        if client is not None:
+            client.post(url, **kwargs).raise_for_status()  # type: ignore[arg-type]
+            return
+        with httpx.Client(timeout=TIMEOUT_S) as owned:
+            owned.post(url, **kwargs).raise_for_status()  # type: ignore[arg-type]
+    except httpx.HTTPStatusError as error:
+        raise DeliveryError(f"{target}: HTTP {error.response.status_code}") from None
+    except httpx.HTTPError as error:
+        raise DeliveryError(f"{target}: {type(error).__name__}") from None
+
+
 class Notifier(Protocol):
     """1つの宛先。`send` は例外を投げてよい（呼び出し側が記録して続ける）。"""
 
@@ -81,11 +103,7 @@ class SlackNotifier:
 
     def send(self, notification: Notification) -> None:
         payload = {"text": notification.as_text()}
-        if self._client is not None:
-            self._client.post(self._webhook_url, json=payload).raise_for_status()
-            return
-        with httpx.Client(timeout=TIMEOUT_S) as client:
-            client.post(self._webhook_url, json=payload).raise_for_status()
+        _post(self.name, self._client, self._webhook_url, json=payload)
 
 
 class LineNotifier:
@@ -110,11 +128,7 @@ class LineNotifier:
             "messages": [{"type": "text", "text": notification.as_text()[:4_900]}],
         }
         headers = {"Authorization": f"Bearer {self._token}"}
-        if self._client is not None:
-            self._client.post(LINE_PUSH_URL, json=payload, headers=headers).raise_for_status()
-            return
-        with httpx.Client(timeout=TIMEOUT_S) as client:
-            client.post(LINE_PUSH_URL, json=payload, headers=headers).raise_for_status()
+        _post(self.name, self._client, LINE_PUSH_URL, json=payload, headers=headers)
 
 
 def from_env() -> dict[str, Notifier]:
