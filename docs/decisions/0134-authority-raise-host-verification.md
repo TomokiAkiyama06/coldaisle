@@ -190,25 +190,33 @@ py=/opt/coldaisle/.venv/bin/python
 # 隔離した interpreter が使う場所: sys.path の各項と、venv と interpreter の prefix
 "$py" -I -c 'import sys; print("\n".join(p for p in [*sys.path, sys.prefix, sys.base_prefix] if p))' \
   | sort -u > roots.txt
+: > unresolved.txt
 # symlink の実体を、増えなくなるまで roots に足す。項そのものと、項の下で出会うすべての symlink
-# （ディレクトリを指すものもファイルを指すものも）を readlink -f で解決する。find は symlink を
-# たどらない（-P）ので循環しても止まり、roots は増えるだけの有限の集合なので繰り返しも止まる
+# （ディレクトリを指すものもファイルを指すものも）を1つずつ readlink -f で解決する。
+# 解決できない symlink（切れたもの・途中のディレクトリが無いものを含む）は飛ばさず unresolved.txt に残す。
+# find は symlink をたどらない（-P）ので循環しても止まり、roots は増えるだけの有限の集合なので繰り返しも止まる
 while :; do
   while IFS= read -r p; do
-    [ -e "$p" ] || continue        # 無い項（python312.zip・切れた symlink の先など）は飛ばす。存在の判定だけ
-    readlink -f -- "$p"
-    find "$p" -type l -exec readlink -f -- {} + 2>/dev/null
-  done < roots.txt | cat - roots.txt | sort -u > roots.next
+    [ -e "$p" ] || [ -L "$p" ] || continue   # symlink でもなく存在もしない項は、下の祖先の検査で見る
+    find "$p" -type l -print                  # 項そのものが symlink なら、項も出る
+  done < roots.txt | while IFS= read -r l; do
+    if t=$(readlink -f -- "$l") && [ -e "$t" ]; then
+      printf '%s\n' "$t"
+    else
+      printf '%s\n' "$l" >> unresolved.txt
+    fi
+  done | cat - roots.txt | sort -u > roots.next
   if cmp -s roots.txt roots.next; then rm -f roots.next; break; fi
   mv roots.next roots.txt
 done
-# 調べるディレクトリ: 各項（実体を含む）の下のすべてと、各項の祖先（/ の手前まで）
+sort -u unresolved.txt | while IFS= read -r l; do echo "解決できない symlink: $l"; done
+# 調べるディレクトリ: 各項（実体を含む）の下のすべてと、各項の祖先（/ の手前まで）。
+# 祖先は項が存在しなくても見る（無い項を後から作れるかは、親に書けるかで決まる）
 while IFS= read -r p; do
-  [ -e "$p" ] || continue
-  [ -d "$p" ] && find "$p" -type d -print
+  [ -d "$p" ] && [ ! -L "$p" ] && find "$p" -type d -print
   d=$p; while [ "$d" != / ]; do d=$(dirname -- "$d"); [ "$d" = / ] || printf '%s\n' "$d"; done
 done < roots.txt | sort -u > dirs.txt
-# ディレクトリ: 作れたら「書ける」（作ったものは消す）
+# ディレクトリ: 作れたら「書ける」（作ったものは消す）。無いディレクトリは作れないので出ない（祖先で見る）
 while IFS= read -r d; do
   if touch -- "$d/.probe-0134" 2>/dev/null; then rm -f -- "$d/.probe-0134"; echo "書ける: $d"; fi
 done < dirs.txt
@@ -220,14 +228,19 @@ while IFS= read -r p; do
 done < roots.txt
 ```
 
-- 1行でも「書ける」が出たら、本番の `raise` は使わない。`roots.txt` に `/opt/coldaisle` と interpreter の置き場所
-  （`docs/ubuntu-deploy.md` 2）以外の場所が出たときも同じ（承認者の書ける場所が import に使われうる。
-  symlink の実体がそこにあるときを含む）
+- 「書ける」か「解決できない symlink」が1行でも出たら、C1 は失敗で、本番の `raise` は使わない。
+  `roots.txt` に `/opt/coldaisle` と interpreter の置き場所（`docs/ubuntu-deploy.md` 2）以外の場所が出たときも同じ
+  （承認者の書ける場所が import に使われうる。symlink の実体がそこにあるときを含む）
+- **解決できない symlink は、理由を問わず失敗にする（安全側）。** 切れた symlink や途中のディレクトリが無い
+  symlink の先は、いまは検査できず、後で承認者がその場所を作れれば書き換え可能なコードが読まれうる。
+  直すときは symlink を消すか、先を root の所有で作ってから C1 をやり直す
 - symlink そのものは書き換えられない（symlink の mode は使われない）。置き換えられるかは、symlink のある
   ディレクトリに書けるかで決まり、それは上のディレクトリの検査で見ている。実体とその祖先は、実体を
   `roots.txt` に足したことで同じ検査に掛かる（venv の `bin/python` は interpreter の実体への symlink で、
   その実体と親もここで見る）
-- `roots.txt` と `dirs.txt` は承認者の作業ディレクトリに置き、結果を #217 に残すときは path を仮の名前に置き換える
+- `sys.path` の項が symlink でもなく存在もしない（`python312.zip` など）ときは、その項の祖先のディレクトリに
+  書けないことで、承認者が後から作れないことを見る
+- `roots.txt`・`dirs.txt`・`unresolved.txt` は承認者の作業ディレクトリに置き、結果を #217 に残すときは path を仮の名前に置き換える
 
 結果は 0104 §2.9 の 6 のとおり #217 に残し、実機のユーザー名・ホスト名・path は仮の名前に置き換える。
 
