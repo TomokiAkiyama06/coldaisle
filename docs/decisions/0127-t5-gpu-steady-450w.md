@@ -1,9 +1,11 @@
 # 決定記録 0127: T5 の GPU の定常と温めは 450 W で行い、`SIGABRT` で終わる経路を合格とし、約 11 s の経路を残りとする
 
 - **種別**: Decision Record
-- **Status**: Proposed（2026-10-14 にリポジトリ所有者が置き換えの方針を承認。記録の承認待ち）
+- **Status**: Rejected（2026-10-15、リポジトリ所有者の判断。GPU の Fan の専用サービス（[`0128`](0128-gpu-fan-curve-service.md)）と
+  [`0130`](0130-gpu-fan-quieter-curve.md) の曲線の下で、T5 の (ii) / (iii) を 0121 のとおり GPU 600 W のまま行い合格したため、450 W への置き換えは要らなくなった。
+  §2.5 の「約 11 s の経路は未完了」は 0119 §2.13 の要件として `docs/fan-header-mapping.md` の T5 に残す）
 - **Date**: 2026-10-14
-- **Supersedes**: [`0121`](0121-hardware-test-procedure.md) §2.7 T5 のうち、(ii) 定常の「GPU 600 W」の段階と、
+- **Supersedes**: なし（Rejected。以下は提案した時点の置き換えの範囲）[`0121`](0121-hardware-test-procedure.md) §2.7 T5 のうち、(ii) 定常の「GPU 600 W」の段階と、
   (iii) 熱がこもった状態からの再開の「GPU 600 W を 10 分」の温め
 - **関連**: [`0119`](0119-safety-values-first-host.md) §2.12 /
   [`0121`](0121-hardware-test-procedure.md) §2.1（中止の基準）/ §2.7 / §2.9 /
