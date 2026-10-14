@@ -593,11 +593,12 @@ def test_firing_and_resolution_reach_the_notifier(tmp_path):
 
 @pytest.mark.slow
 def test_notify_check_scenario_reaches_each_target_once(tmp_path):
-    """#51: `notify_check` で LINE（critical）と Slack（warning）の両方へ、
-    発火と解除が1回ずつ届く。
+    """#51: `notify_check` で critical（`RAPID_RISE`）と warning（`INTAKE_HIGH`）の
+    発火と解除が1回ずつ、どちらも Slack へ届く（決定記録 0135）。
 
-    所有者が実物の Webhook / トークンで到達を確かめる手順（docs/notifications.md）の
-    入力なので、**このシナリオで両方の経路が鳴ること**と**連投しないこと**を固定する。
+    所有者が実物の Webhook で到達を確かめる手順（docs/notifications.md）の
+    入力なので、**このシナリオで両方の重大度が鳴ること**と**連投しないこと**を固定する。
+    LINE は routing に無いので、作られていても届かない。
     外部サービスへは出ない。宛先を差し替えて確かめる。
     """
     from coldaisle.daemon import Config, build
@@ -646,11 +647,10 @@ def test_notify_check_scenario_reaches_each_target_once(tmp_path):
             if item.state in ("firing", "resolved")
         ]
 
-    assert transitions("line") == [
+    assert transitions("line") == [], "LINE は使わない（決定記録 0135）"
+    assert transitions("slack") == [
         ("RAPID_RISE", "critical", "firing"),
         ("RAPID_RISE", "critical", "resolved"),
-    ]
-    assert transitions("slack") == [
         ("INTAKE_HIGH", "warning", "firing"),
         ("INTAKE_HIGH", "warning", "resolved"),
     ]

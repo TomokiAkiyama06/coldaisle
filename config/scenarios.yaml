@@ -113,7 +113,7 @@ scenarios:
     duration_s: 720
     effects:
       # Slack / LINE へ実際に届くかを確かめるための入力（#51 / 決定記録 0013 §2.7）。
-      # 既定の宛先では critical が LINE、warning が Slack へ行く（決定記録 0001 D-03）。
+      # 既定の宛先では critical も warning も Slack へ行く（決定記録 0135）。
       # **閾値は暫定値**（config/rules.yaml）なので、ここで鳴ることは
       # 「この値が危険」という意味ではない。手順は docs/notifications.md
       #

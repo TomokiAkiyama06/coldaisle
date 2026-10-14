@@ -71,25 +71,31 @@ def router(config, clock, **targets) -> Router:
 
 
 def test_severity_routing(config, tmp_path):
-    """critical は LINE、warning は Slack（決定記録 0001 D-03）。"""
-    assert config.routing[AlertSeverity.CRITICAL] == ["line", "stdout"]
+    """critical も warning も Slack（決定記録 0135。0001 D-03 を置き換え）。
+
+    LINE は使わない。区別は本文の重大度で行う。
+    """
+    assert config.routing[AlertSeverity.CRITICAL] == ["slack", "stdout"]
     assert config.routing[AlertSeverity.WARNING] == ["slack", "stdout"]
 
 
 def test_notification_goes_only_to_its_targets(config):
+    """`routing` に無い宛先へは送らない。LINE は作られていても使わない（決定記録 0135）。"""
     slack, line = Recorder("slack"), Recorder("line")
     sender = router(config, SimulatedClock(NOON_MS), slack=slack, line=line)
     sender.notify(notification(severity="warning"))
-
-    assert len(slack.sent) == 1
-    assert line.sent == [], "warning は LINE へ送らない"
-
-
-def test_critical_reaches_line(config):
-    line = Recorder("line")
-    sender = router(config, SimulatedClock(NIGHT_MS), line=line)
     sender.notify(notification(severity="critical", rule_id="SENSOR_FAULT"))
-    assert len(line.sent) == 1
+
+    assert len(slack.sent) == 2
+    assert line.sent == [], "routing に無い LINE へは送らない"
+
+
+def test_critical_reaches_slack(config):
+    """critical は夜間でも Slack に届く（決定記録 0135 §2.3）。"""
+    slack = Recorder("slack")
+    sender = router(config, SimulatedClock(NIGHT_MS), slack=slack)
+    sender.notify(notification(severity="critical", rule_id="SENSOR_FAULT"))
+    assert [item.severity for item in slack.sent] == [AlertSeverity.CRITICAL]
 
 
 def test_missing_target_is_announced_not_silently_dropped(config, caplog):
@@ -176,9 +182,10 @@ def test_night_suppresses_warning_until_thresholds_are_measured(config):
 
 
 def test_night_never_suppresses_critical(config):
-    line = Recorder("line")
-    sender = router(config, SimulatedClock(NIGHT_MS), line=line)
+    slack = Recorder("slack")
+    sender = router(config, SimulatedClock(NIGHT_MS), slack=slack)
     assert sender.notify(notification(severity="critical")) is True
+    assert len(slack.sent) == 1
 
 
 def test_daytime_warning_is_sent(config):
@@ -319,15 +326,27 @@ def test_resolution_is_not_sent_when_the_firing_was_suppressed(config):
     assert slack.sent == []
 
 
-def test_critical_resolution_reaches_line(config):
-    """**解除の重大度が落ちない。** critical の解除が Slack へ流れてはいけない。"""
-    line, slack = Recorder("line"), Recorder("slack")
-    sender = router(config, SimulatedClock(NOON_MS), line=line, slack=slack)
-    sender.notify(notification(severity="critical", rule_id="SENSOR_FAULT"))
-    sender.notify(notification(severity="critical", rule_id="SENSOR_FAULT", state="resolved"))
+def test_critical_resolution_keeps_its_severity(config):
+    """**解除の重大度が落ちない。** critical の解除が warning として扱われてはいけない。
 
-    assert [item.state for item in line.sent] == ["firing", "resolved"]
-    assert slack.sent == []
+    critical と warning は同じ Slack へ届く（決定記録 0135）ため、宛先では見分けられない。
+    夜間に critical の発火と解除が critical のまま届き、同じ夜間の warning は届かないことで、
+    重大度ごとの方針（0001 D-04 / 0013 §2.5）が解除にも保たれていることを確かめる。
+    """
+    slack = Recorder("slack")
+    sender = router(config, SimulatedClock(NIGHT_MS), slack=slack)
+    assert sender.notify(notification(severity="critical", rule_id="SENSOR_FAULT")) is True
+    assert sender.notify(notification(severity="warning")) is False
+    assert (
+        sender.notify(notification(severity="critical", rule_id="SENSOR_FAULT", state="resolved"))
+        is True
+    )
+    assert sender.notify(notification(severity="warning", state="resolved")) is False
+
+    assert [(item.rule_id, item.severity, item.state) for item in slack.sent] == [
+        ("SENSOR_FAULT", AlertSeverity.CRITICAL, "firing"),
+        ("SENSOR_FAULT", AlertSeverity.CRITICAL, "resolved"),
+    ]
 
 
 def test_invalid_timezone_fails_at_load(tmp_path):
