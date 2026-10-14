@@ -4,6 +4,7 @@
 - **Status**: FINAL（2026-08-24、PR #6 のマージ）
 - **Date**: 2026-08-24
 - **Supersedes**: なし
+- **Superseded by**: [0129](0129-periodic-hello.md)（§2.2 の表の `hello` の「電源投入時に1回」のみ＝起動時と 60 s ごと。`hello` の中身と扱いは有効）
 - **関連**: `docs/requirements.md` §5.2 / §5.3 / FR-103 / FR-105 / FR-106 /
   `docs/spec-review.md` W-04 / C-01 / C-02 / C-04 /
   [`0002-metric-naming.md`](0002-metric-naming.md)
