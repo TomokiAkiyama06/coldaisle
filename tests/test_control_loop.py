@@ -1311,22 +1311,31 @@ def test_invariant_13_cpu_power_goes_stale_after_its_own_limit_without_a_fault(c
     実機では収集を止めると CPU の温度も同じ tick で古くなり、Top が `zone_fault_max` になって
     この reason が trace に出ない。境界はここで確かめる。
     """
-    harness = Harness(catalog)
+    # 0123 が確定する値（5000 ms）を明示する。既定の試験用の設定（1000 ms）から読み戻すと、
+    # 値が変わってもこのテストは通ってしまい、5000 ms の根拠にならない。
+    limit_ms = 5_000
+    safety_document = valid_documents()["safety.yaml"]
+    safety_document["telemetry"]["cpu_power_ms"] = {"value": limit_ms, "status": "provisional"}
+    harness = Harness(catalog, config=control_config(safety=safety_document))
+    assert harness.config.safety.telemetry.cpu_power_ms.value == limit_ms
     harness.settle()
     # Top の requested を floor より下げ、safety floor の reason が毎 tick 残るようにする
     harness.mode.command = manual(1.0, 1.0, 0.0)
-    harness.telemetry.frozen_metric_ts_ms["power.cpu.package"] = harness.clock.now_ms()
+    frozen_ts_ms = harness.clock.now_ms()
+    harness.telemetry.frozen_metric_ts_ms["power.cpu.package"] = frozen_ts_ms
 
-    limit_ms = harness.config.safety.telemetry.cpu_power_ms.value
     tick_ms = harness.config.safety.tick_ms.value
     for _ in range(limit_ms // tick_ms):
         top = harness.tick().tick.zones.top.demand
         floor_reasons = [r for r in top.reasons if r.code == "cpu_cooling_floor"]
         assert floor_reasons
         assert all("cpu_power_unavailable" not in reason.detail for reason in floor_reasons)
+    # 古さがちょうど 5000 ms の tick までは外さない（境界を含む）
+    assert harness.clock.now_ms() - frozen_ts_ms == limit_ms
 
     result = harness.tick()
 
+    assert harness.clock.now_ms() - frozen_ts_ms > limit_ms
     top = result.tick.zones.top.demand
     assert any("cpu_power_unavailable" in reason.detail for reason in top.reasons)
     assert top.forced_max is False

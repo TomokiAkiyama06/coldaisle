@@ -66,7 +66,7 @@ GPU 600 W だけの負荷でも 1 回行う。
 
 | 確かめるもの | 確定する値 | 合格の条件 |
 |---|---|---|
-| `tests/test_control_loop.py` の `test_invariant_13_cpu_power_goes_stale_after_its_own_limit_without_a_fault`（CPU Power の時刻だけを止め、Top の requested を floor より下げて floor の reason を毎 tick 残す） | `telemetry.cpu_power_ms` 5000 | `cpu_power_ms` 以内の tick では `cpu_power_unavailable` が出ず、超えた最初の tick で出る。fault は上がらず、Top は `forced_max` にならず、safety state は `NORMAL` のまま。値の確定は、このテストが CI で通ることと、(b) で fand が古さの判定の結果に追従することの2つで行う |
+| `tests/test_control_loop.py` の `test_invariant_13_cpu_power_goes_stale_after_its_own_limit_without_a_fault`（テストの設定で `cpu_power_ms` を 5000 に明示し、CPU Power の時刻だけを止め、Top の requested を floor より下げて floor の reason を毎 tick 残す。既定の試験用の設定の値を読み戻すと、値が変わっても通ってしまうため） | `telemetry.cpu_power_ms` 5000 | 古さが 5000 ms 以下の tick（ちょうど 5000 ms を含む）では `cpu_power_unavailable` が出ず、超えた最初の tick で出る。fault は上がらず、Top は `forced_max` にならず、safety state は `NORMAL` のまま。値の確定は、このテストが CI で通ることと、(b) で fand が古さの判定の結果に追従することの2つで行う |
 
 **(b) 収集の側の判定**: fand を manual 0.35（3 zone とも）で動かしている間に、`coldaisle-cpu-power` を `systemctl kill -s SIGSTOP` で 30 s 一時停止し、
 `SIGCONT` で戻す（`systemctl stop` は unit の `RuntimeDirectory` を消し、ファイルが無いと adapter は `stale_after_ms` を待たずに
