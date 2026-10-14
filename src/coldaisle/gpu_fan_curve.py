@@ -33,9 +33,14 @@ from types import FrameType
 from typing import Any, Protocol
 
 EXIT_FAILED = 1
-"""運転中に NVML が読めない・書けない。既定の制御へ戻してから終わり、systemd に再起動させる。"""
+"""運転中に NVML が読めない・書けない、または起動時の待ちを過ぎても device が 0 個。
+
+systemd に再起動させる。device が 0 個なのは driver の読み込みが遅い・読み込み直しの
+途中のことがある。再起動して待ち直せば、GPU が現れたときに人の操作なしで曲線へ戻る（0128 §2.2）。
+"""
 EXIT_CONFIG = 2
-"""引数が不正・起動時の待ちを過ぎても device がちょうど1つでない・曲線が Fan の範囲の外。
+"""引数が不正・起動時の待ちを過ぎても device が 2 個以上・曲線が Fan の範囲の外・
+NVML の library が無い。
 
 unit の ``RestartPreventExitStatus=2`` と対になる。人が直すまで結果が変わらない。
 """
@@ -382,11 +387,12 @@ def wait_for_single_device(
     notifier: Notifier,
     *,
     monotonic: Callable[[], float] = time.monotonic,
-) -> bool | None:
+) -> int | None:
     """NVML を初期化し、device がちょうど1つになるまで探し直す（0128 §2.2）。
 
-    見つかれば ``True``、``startup_wait_ms`` を過ぎたら ``False``、待ちの間に ``stop`` が
-    立てば ``None``。待つ間も watchdog へ通知する（Type=notify の watchdog は起動から数える）。
+    最後に見た device の数を返す（見つかれば 1。NVML が初期化できないままなら 0）。
+    待ちの間に ``stop`` が立てば ``None``。待つ間も watchdog へ通知する
+    （Type=notify の watchdog は起動から数える）。
     """
     deadline = monotonic() + startup_wait_ms / 1_000
     initialized = False
@@ -398,14 +404,14 @@ def wait_for_single_device(
                 initialized = True
             count = nvml.device_count()
             if count == 1:
-                return True
+                return count
         except NvmlError as error:
             _LOGGER.warning(_json_event({"event": "gpu_fan_waiting", "detail": str(error)}))
         notifier.send("WATCHDOG=1")
         remaining = deadline - monotonic()
         if remaining <= 0:
             _LOGGER.error(_json_event({"event": "gpu_fan_device_not_unique", "count": count}))
-            return False
+            return count
         if stop.wait(min(DEVICE_RETRY_INTERVAL_S, remaining)):
             return None
 
@@ -533,11 +539,13 @@ def main(
         # driver が入っていない導入先。待っても変わらない
         _LOGGER.error(_json_event({"event": "gpu_fan_library_missing", "detail": str(error)}))
         return EXIT_CONFIG
-    found = wait_for_single_device(nvml, settings.startup_wait_ms, stop, notifier)
-    if found is None:
+    count = wait_for_single_device(nvml, settings.startup_wait_ms, stop, notifier)
+    if count is None:
         _LOGGER.info(_json_event({"event": "gpu_fan_stopped", "exit_code": 0}))
         return 0
-    if not found:
+    if count == 0:
+        return EXIT_FAILED
+    if count != 1:
         return EXIT_CONFIG
     try:
         service = FanCurveService(nvml, settings)

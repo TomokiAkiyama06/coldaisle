@@ -266,9 +266,11 @@ nvidia-smi --query-gpu=temperature.gpu,fan.speed --format=csv
 ```
 
 - 止めたとき（`systemctl stop`）・落ちたとき・hang（`WatchdogSec=5s`）・NVML のエラーのときは、GPU 自身の既定の制御へ戻します。
-  落ちたときは unit の `ExecStopPost=`（`--restore-default`）が戻します
-- 起動時は NVML の device がちょうど1つになるまで 1 s ごとに探し直し、60 s を過ぎたら何も書かずに終了コード 2 で止まり、
-  再起動しません（`journalctl -u coldaisle-gpu-fan` に `gpu_fan_device_not_unique`）
+  落ちたときは unit の `ExecStopPost=`（`--restore-default`）が戻します。hang（`kill -STOP` など）では、watchdog の 5 s と
+  `TimeoutAbortSec=2s` の後に戻します
+- 起動時は NVML の device がちょうど1つになるまで 1 s ごとに探し直し、60 s を過ぎたら何も書かずに終わります
+  （`journalctl -u coldaisle-gpu-fan` に `gpu_fan_device_not_unique`）。device が 0 個なら終了コード 1 で、2 s 後に起動し直して
+  また待ちます（driver の読み込みが遅いとき）。2 個以上なら終了コード 2 で止まり、再起動しません
 - 回転は `coldaisle-telemetry` が `gpu.0.fan_speed` として集めます。fand・telemetry とは依存しません
 - 曲線を変えるときは、決定記録と所有者の承認を経て unit の `--curve` を変えます
 

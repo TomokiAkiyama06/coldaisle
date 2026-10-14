@@ -297,7 +297,7 @@ def test_waiting_succeeds_once_exactly_one_device_appears() -> None:
         return original(0)
 
     stop.wait = advance  # type: ignore[method-assign]
-    assert wait_for_single_device(nvml, 5000, stop, notifier, monotonic=clock) is True
+    assert wait_for_single_device(nvml, 5000, stop, notifier, monotonic=clock) == 1
     assert notifier.messages == ["WATCHDOG=1"]
 
 
@@ -305,12 +305,18 @@ def test_waiting_succeeds_once_exactly_one_device_appears() -> None:
 def test_waiting_gives_up_without_writing_when_the_device_is_not_unique(devices: int) -> None:
     nvml = FakeNvml(devices=devices)
     stop = threading.Event()
-    assert wait_for_single_device(nvml, 0, stop, RecordingNotifier()) is False
+    assert wait_for_single_device(nvml, 0, stop, RecordingNotifier()) == devices
     assert nvml.writes == []
 
 
-def test_main_does_not_write_when_the_device_is_not_unique() -> None:
-    nvml = FakeNvml(devices=2)
+@pytest.mark.parametrize(
+    ("devices", "expected"),
+    # 0 個は driver の読み込みが遅いことがあるので再起動させる。
+    # 2 個以上は人が直すまで変わらない（0128 §2.2）
+    [(0, EXIT_FAILED), (2, EXIT_CONFIG)],
+)
+def test_main_does_not_write_when_the_device_is_not_unique(devices: int, expected: int) -> None:
+    nvml = FakeNvml(devices=devices)
     code = main(
         [
             "--curve",
@@ -326,7 +332,7 @@ def test_main_does_not_write_when_the_device_is_not_unique() -> None:
         ],
         nvml_factory=lambda: nvml,
     )
-    assert code == EXIT_CONFIG
+    assert code == expected
     assert nvml.writes == []
 
 

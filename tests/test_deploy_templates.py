@@ -939,6 +939,9 @@ def test_gpu_fan_restores_default_control_however_it_stops():
     assert one(unit, "Service", "Type") == "notify"
     assert one(unit, "Service", "NotifyAccess") == "main"
     assert one(unit, "Service", "WatchdogSec") == "5s"
+    # hang（kill -STOP）から既定の制御へ戻すまでの上限。既定の 90 s を待たない（0128 §2.4）
+    assert one(unit, "Service", "TimeoutAbortSec") == "2s"
+    assert one(unit, "Service", "TimeoutStopSec") == "5s"
     # 起動時に device を待つ 60 s より長く待つ
     assert one(unit, "Service", "TimeoutStartSec") == "90s"
 

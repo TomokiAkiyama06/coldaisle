@@ -10,7 +10,7 @@ Description=coldaisle GPU fan curve (NVML)
 Documentation=file:///opt/coldaisle/docs/ubuntu-deploy.md
 # NVIDIA の driver を module で読み込む導入先で、先に起動しない（0128 §2.5）。fand・telemetry とは依存させない
 After=systemd-modules-load.service
-# 再起動を諦めない。device がちょうど1つでない導入先は終了コード 2 で止まる（下の RestartPreventExitStatus=）
+# 再起動を諦めない。device が 2 個以上の導入先は終了コード 2 で止まる（下の RestartPreventExitStatus=）
 StartLimitIntervalSec=0
 
 [Service]
@@ -19,6 +19,12 @@ StartLimitIntervalSec=0
 Type=notify
 NotifyAccess=main
 WatchdogSec=5s
+# kill -STOP で止まったままだと SIGABRT では終わらず、systemd は TimeoutAbortSec= を待ってから SIGKILL し、
+# その後で ExecStopPost= を走らせる。既定の 90 s では低い回転の 600 W で 80 °C に届く（約 80 s）ので、
+# hang から既定の制御へ戻すまでを watchdog 5 s + abort 2 s + ExecStopPost= に抑える（0128 §2.4）
+TimeoutAbortSec=2s
+# stop の SIGTERM の後と ExecStopPost= の上限。どちらも 1 s 未満で終わる（導入先で 35〜170 ms）
+TimeoutStopSec=5s
 # 起動時に device を最大 60 s 待つ（その間も WATCHDOG=1 を送る）。それより長くする
 TimeoutStartSec=90s
 User=root
@@ -32,8 +38,9 @@ ExecStopPost=/usr/bin/python3 -I -S /opt/coldaisle/src/coldaisle/gpu_fan_curve.p
 
 Restart=always
 RestartSec=2
-# 2: 引数が不正・device がちょうど1つでない・曲線が Fan の範囲の外・NVML の library が無い。
-# 人が直すまで結果が変わらない。運転中の NVML のエラーは 1 で終わり、ここで再起動する
+# 2: 引数が不正・device が 2 個以上・曲線が Fan の範囲の外・NVML の library が無い。
+# 人が直すまで結果が変わらない。運転中の NVML のエラーと、60 s 待っても device が 0 個のとき
+# （driver の読み込みが遅い）は 1 で終わり、ここで再起動して待ち直す（0128 §2.2）
 RestartPreventExitStatus=2
 
 StandardOutput=journal
