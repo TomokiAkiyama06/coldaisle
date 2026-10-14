@@ -924,8 +924,8 @@ def test_gpu_fan_is_sandboxed_and_writes_no_files():
         assert key not in service, key
 
 
-def test_gpu_fan_runs_the_source_file_with_the_curve_of_0128():
-    """venv と `coldaisle` パッケージに依存しない。値は 0128 のとおりに unit が渡す。"""
+def test_gpu_fan_runs_the_source_file_with_the_curve_of_0130():
+    """venv と `coldaisle` に依存しない。曲線は 0130、ほかは 0128 のとおりに unit が渡す。"""
     command = shlex.split(one(gpu_fan(), "Service", "ExecStart"))
     assert command[0] == "/usr/bin/python3"
     assert command[1:3] == ["-I", "-S"]
@@ -934,7 +934,7 @@ def test_gpu_fan_runs_the_source_file_with_the_curve_of_0128():
     assert (ROOT / source.removeprefix("/opt/coldaisle/")).is_file()
     arguments = dict(zip(command[4::2], command[5::2], strict=True))
     assert arguments == {
-        "--curve": "45:30,55:50,65:80,70:100",
+        "--curve": "45:30,60:40,70:50,76:60,80:75,83:100",
         "--interval-ms": "1000",
         "--startup-wait-ms": "60000",
         "--hysteresis-c": "2",

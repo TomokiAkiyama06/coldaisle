@@ -31,11 +31,12 @@ TimeoutStartSec=90s
 User=root
 WorkingDirectory=/
 # 標準ライブラリだけのソースを、システムの python3 で venv に依存せず動かす（0128 §2.2）。
-# 値は 0128 のとおり（曲線は provisional）: 45 °C 30 % / 55 °C 50 % / 65 °C 80 % / 70 °C 以上 100 %、
+# 曲線は 0130 のとおり（provisional）: 45 °C 30 % / 60 °C 40 % / 70 °C 50 % / 76 °C 60 % / 80 °C 75 % / 83 °C 以上 100 %。
+# ほかの値は 0128 のとおり:
 # 周期 1000 ms、device を待つのは起動時の 60000 ms まで、下げるときのヒステリシス 2 °C・1 %/s。
 # 曲線は --gpu-name の型番で確かめたもの。NVML の名前が違えば書かずに 2 で止まる（0128 §2.2）。
 # 型番の名前は同じ型番に共通の値で、個体の識別子ではない（シリアル・UUID・bus id は書かない）
-ExecStart=/usr/bin/python3 -I -S /opt/coldaisle/src/coldaisle/gpu_fan_curve.py --curve 45:30,55:50,65:80,70:100 --interval-ms 1000 --startup-wait-ms 60000 --hysteresis-c 2 --down-rate-percent-per-s 1 --gpu-name "NVIDIA RTX PRO 6000 Blackwell Workstation Edition"
+ExecStart=/usr/bin/python3 -I -S /opt/coldaisle/src/coldaisle/gpu_fan_curve.py --curve 45:30,60:40,70:50,76:60,80:75,83:100 --interval-ms 1000 --startup-wait-ms 60000 --hysteresis-c 2 --down-rate-percent-per-s 1 --gpu-name "NVIDIA RTX PRO 6000 Blackwell Workstation Edition"
 # どの止まり方（stop・落ちた・SIGKILL・watchdog）でも走り、GPU 自身の既定の制御へ戻す
 ExecStopPost=/usr/bin/python3 -I -S /opt/coldaisle/src/coldaisle/gpu_fan_curve.py --restore-default
 
