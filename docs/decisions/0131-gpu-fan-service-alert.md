@@ -104,22 +104,41 @@ GPU の Fan は既定の制御にも曲線にも従っていない。
 - 日次レポートの LLM の所見の入力（`facts_markdown()` の経路。0017 §2.2）からは、`gpu.*.fan_policy` と
   `GPU_FAN_NOT_MANUAL` / `GPU_FAN_BELOW_CURVE` の 2 つのアラート（その日の件数の行と、続いているアラートの節の行）を除く。
   これらは**人が読む本文**（LLM を通さない、コードが作る表）にだけ載せる
+- `facts_markdown()` の中の**アラートの集計**（発火の件数 `alert_total`・前日の件数 `prev_alert_total`・
+  ルールごとの件数の表・`ALERT_SCAN_LIMIT` を超えた省略の注記）は、除外の一覧の rule_id を除いた後で数え直す。
+  除く前の件数を LLM に渡すと、件数の差から除いたアラートの存在が分かるため。省略の注記も、除いた後の件数で判定する。
+  **人が読む本文の件数・表・注記は、除く前の値のまま**（GPU の Fan のアラートも数える）
 - 除く対象は、コードでメトリクス名・rule_id を分岐せず、`config/report.yaml` に一覧（例: `llm_excluded_metrics: ["gpu.*.fan_policy"]`・
   `llm_excluded_rules: ["GPU_FAN_NOT_MANUAL", "GPU_FAN_BELOW_CURVE"]`）として置く（AGENTS.md ルール 9。0017 §2.3 の
   「メトリクス名で分岐しない」と同じ方針）。一覧の形の検査は読み込み時に行い、不正なら LLM の所見を作らない（安全側）
-- AI ツールの窓口（0015 / 0018 の読み取り専用ツール）も、同じ一覧のメトリクスとアラートを返さない
+- AI ツールの窓口（0015 / 0018 の読み取り専用ツール。`get_latest`・`query_series`・`get_stats`・`list_alerts`・`describe_system`）も、
+  同じ一覧のメトリクスとアラートを返さない。`describe_system` のメトリクスの一覧と閾値（`thresholds`）からも、一覧のメトリクスと
+  rule_id の行を除く
+- **Server Health の AI 要約にも渡さない。** `build_server_health()`（`api/server_health.py`）は、発火中のアラートの重大度の数
+  （`alert_severity_counts`）から `signal` を決め、`signal` のテンプレートを `AiHealthSummarizer.summarize()`（`ai/health.py`）が
+  `Provider.chat()` に渡す。GPU の Fan の warning は `signal` を変えるので、テンプレートを通して LLM に届く。
+  - **人が見る決定論的な応答**（`signal`・`active_alerts`・テンプレートの文）は、除外の一覧を当てない（GPU の Fan のアラートも数え、見せる）
+  - **AI 向けの入力**は、除外の一覧の rule_id を除いた重大度の数で `signal` を決め直し（AI 用の signal）、そのテンプレートだけを渡す
+  - AI 用の signal と応答の `signal` が違うとき（＝除いたアラートが signal を変えているとき）は、**要約を求めず**決定論的なテンプレートを返す
+    （`summary_source: "template"`）。AI 用の signal で作った要約を出すと、応答の `signal` と要約の文が食い違って人を誤らせるため。
+    要約を求めないこと自体は LLM に何も渡さない
 - **アラートの自動の説明（0016 / #38）も要求しない。** `explain_alerts: true`（今の既定）では、通知を送った発火の遷移が
   `Daemon._record()` → `_request_explanation()` → 説明の待ち行列 → `Explainer.explain()` → `Explainer._ask()` と進み、
   rule_id・閾値・`detail`・直近の統計が LLM に渡る。除外の一覧に入った rule_id の発火は、`_request_explanation()` を呼ばず
   **通知だけを送る**（素のアラート。#38 のデグレードと同じ見え方）。一覧は日次レポートと同じものを読む（2 か所に持たない）
-- LLM へ届く経路を洗った結果（2026-10-14、`src/coldaisle` で `coldaisle.ai` を import する箇所と `Provider` の呼び出しを grep）と、
-  それぞれの閉じ方:
+- LLM へ届く経路を洗った結果と、それぞれの閉じ方。2026-10-14 に `src/coldaisle` で `Provider.chat()` の呼び出し元
+  （`ai/summary.py`・`ai/explain.py`・`ai/health.py`・`ai/provider.py` の `probe()`）と、それを組み立てる箇所
+  （`coldaisle.ai` を import する `report.py`・`daemon.py`・`server.py`）、`ToolRegistry` を作る箇所（`daemon.py`・`server.py`）を grep し、
+  呼び出し元までたどって確かめた。これで全部である:
 
   | 経路 | LLM に渡るもの | 閉じ方 |
   |---|---|---|
   | `daemon.py` の自動の説明（`Explainer`） | 発火したアラート1件の rule_id・閾値・detail、`get_stats` の統計、`get_latest` の品質が ok でないメトリクスの名前 | 一覧の rule_id は説明を要求しない（上）。ほかのアラートの説明の `get_latest`（`_quality_evidence()`）・`get_stats` も `ToolRegistry` を通るので、ツールの除外で `gpu.*.fan_policy` の名前と値が出ない |
   | `report.py` の所見（`ai.summary.summarise`） | `facts_markdown()` | 一覧のメトリクスとアラートの行を除く（上） |
-  | `server.py` の AI ツールの窓口（`ToolRegistry`。API の `/tools` も同じ実体） | ツールの応答 | 一覧のメトリクスとアラートを返さない（上） |
+  | `report.py` の所見（`ai.summary.summarise`）のアラートの集計 | `facts_markdown()` の件数・前日の件数・省略の注記 | 一覧の rule_id を除いた後で数え直す（上）。本文は除く前のまま |
+  | `server.py` の AI ツールの窓口（`ToolRegistry`。API の `/tools` も同じ実体。外の LLM の agent が呼ぶ） | ツールの応答（`describe_system` のメトリクスの一覧と閾値を含む） | 一覧のメトリクスとアラートを返さない（上） |
+  | `server.py` → `build_server_health()` → `BackgroundHealthSummarizer` → `AiHealthSummarizer.summarize()` | 発火中のアラートの重大度の数で決まる `signal` のテンプレート | AI 用の signal は一覧の rule_id を除いて決め、応答の `signal` と違えば要約を求めない（上）。応答は除く前のまま |
+  | `ai/provider.py` の `probe()`（疎通の確認） | 固定の `"ping"` だけ | 該当なし（データを渡さない） |
   | `escalate.py` の案件資料（人が Claude へ持ち込む） | critical のアラートの rule_id と関係するメトリクス | 今の 2 つは warning なので載らない。重大度を後で変えても載らないよう、一覧の rule_id とメトリクスは案件資料から除く |
 
   `memory.py`・`calibrate.py` などほかの合成の起点は `coldaisle.ai` を import せず、LLM を呼ばない。新しく LLM を呼ぶ経路を足すときは、同じ一覧を当てる
@@ -139,6 +158,12 @@ GPU の Fan は既定の制御にも曲線にも従っていない。
   LLM の入力（`facts_markdown()`）と AI ツールの応答に除外の一覧のメトリクスとアラートが入らず、人が読む本文には出ること・
   除外の一覧の rule_id の発火で、通知は送られ `Explainer`（説明の待ち行列）が呼ばれないこと（一覧に無い rule_id では今までどおり呼ばれること）・
   ほかのアラートの説明の Evidence に `gpu.*.fan_policy` の名前が出ないこと・案件資料に一覧の rule_id とメトリクスが載らないこと・
+  `describe_system` の応答に一覧のメトリクスと rule_id の閾値が出ないこと・
+  日次レポートで、一覧の rule_id の発火がある日に `facts_markdown()` の件数・前日の件数・表・省略の注記が除いた後の値になり、
+  人が読む本文は除く前の値のままであること（`ALERT_SCAN_LIMIT` の境界を含む）・
+  Server Health で、一覧の rule_id の warning だけが発火しているとき、応答の `signal` と `active_alerts` はそれを含み、
+  summarizer は呼ばれず `summary_source` が `template` になること。一覧に無い warning も発火しているとき（AI 用の signal が同じ）は、
+  summarizer に渡るテンプレートが除いた後の signal のものであること・
   一括再生で評価時刻が DB の時刻に従うこと、日次レポートの「続いているアラート」の節
 - Mock の Telemetry に `fan_policy` を足し、シナリオで「サービスが止まった」（0 が続く）を作れるようにする
 - 導入先（実装の後・所有者の承認の後）: `coldaisle` ユーザーで `fan_policy` が読めること。
