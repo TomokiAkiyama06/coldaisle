@@ -188,10 +188,23 @@
 ```bash
 py=/opt/coldaisle/.venv/bin/python
 # 隔離した interpreter が使う場所: sys.path の各項と、venv と interpreter の prefix
-"$py" -I -c 'import sys; print("\n".join(p for p in [*sys.path, sys.prefix, sys.base_prefix] if p))' > roots.txt
-# 調べるディレクトリ: 各項の下のすべてと、各項の祖先（/ の手前まで）
+"$py" -I -c 'import sys; print("\n".join(p for p in [*sys.path, sys.prefix, sys.base_prefix] if p))' \
+  | sort -u > roots.txt
+# symlink の実体を、増えなくなるまで roots に足す。項そのものと、項の下で出会うすべての symlink
+# （ディレクトリを指すものもファイルを指すものも）を readlink -f で解決する。find は symlink を
+# たどらない（-P）ので循環しても止まり、roots は増えるだけの有限の集合なので繰り返しも止まる
+while :; do
+  while IFS= read -r p; do
+    [ -e "$p" ] || continue        # 無い項（python312.zip・切れた symlink の先など）は飛ばす。存在の判定だけ
+    readlink -f -- "$p"
+    find "$p" -type l -exec readlink -f -- {} + 2>/dev/null
+  done < roots.txt | cat - roots.txt | sort -u > roots.next
+  if cmp -s roots.txt roots.next; then rm -f roots.next; break; fi
+  mv roots.next roots.txt
+done
+# 調べるディレクトリ: 各項（実体を含む）の下のすべてと、各項の祖先（/ の手前まで）
 while IFS= read -r p; do
-  [ -e "$p" ] || continue          # 無い項（python312.zip など）は飛ばす。存在の判定だけで権限には使わない
+  [ -e "$p" ] || continue
   [ -d "$p" ] && find "$p" -type d -print
   d=$p; while [ "$d" != / ]; do d=$(dirname -- "$d"); [ "$d" = / ] || printf '%s\n' "$d"; done
 done < roots.txt | sort -u > dirs.txt
@@ -199,7 +212,8 @@ done < roots.txt | sort -u > dirs.txt
 while IFS= read -r d; do
   if touch -- "$d/.probe-0134" 2>/dev/null; then rm -f -- "$d/.probe-0134"; echo "書ける: $d"; fi
 done < dirs.txt
-# ファイル（.pth・.py・pyvenv.cfg・interpreter の実体を含む）: 追記で開けたら「書ける」（中身は変わらない）
+# ファイル（.pth・.py・pyvenv.cfg・interpreter の実体を含む）: 追記で開けたら「書ける」（中身は変わらない）。
+# symlink のファイルは -type f に出ないが、その実体は上で roots に入っており、ここで実体として調べる
 while IFS= read -r p; do
   [ -e "$p" ] || continue
   find "$p" -type f -exec sh -c 'for f; do if (: >> "$f") 2>/dev/null; then echo "書ける: $f"; fi; done' _ {} +
@@ -207,9 +221,12 @@ done < roots.txt
 ```
 
 - 1行でも「書ける」が出たら、本番の `raise` は使わない。`roots.txt` に `/opt/coldaisle` と interpreter の置き場所
-  （`docs/ubuntu-deploy.md` 2）以外の場所が出たときも同じ（承認者の書ける場所が import に使われうる）
-- symlink は `find` がたどらないので、項そのものが symlink のときは実体の側も `roots.txt` に足して見る
-  （venv の `bin/python` は interpreter の実体への symlink で、実体は `sys.base_prefix` の下にある）
+  （`docs/ubuntu-deploy.md` 2）以外の場所が出たときも同じ（承認者の書ける場所が import に使われうる。
+  symlink の実体がそこにあるときを含む）
+- symlink そのものは書き換えられない（symlink の mode は使われない）。置き換えられるかは、symlink のある
+  ディレクトリに書けるかで決まり、それは上のディレクトリの検査で見ている。実体とその祖先は、実体を
+  `roots.txt` に足したことで同じ検査に掛かる（venv の `bin/python` は interpreter の実体への symlink で、
+  その実体と親もここで見る）
 - `roots.txt` と `dirs.txt` は承認者の作業ディレクトリに置き、結果を #217 に残すときは path を仮の名前に置き換える
 
 結果は 0104 §2.9 の 6 のとおり #217 に残し、実機のユーザー名・ホスト名・path は仮の名前に置き換える。
