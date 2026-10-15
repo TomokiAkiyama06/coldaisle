@@ -10,10 +10,10 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from coldaisle.store.models import METRIC_PATTERN, AlertSeverity
 
@@ -26,11 +26,31 @@ def rule_metrics(rule: BaseModel) -> tuple[str, ...]:
     return tuple(value for key in METRIC_KEYS if isinstance(value := getattr(rule, key, None), str))
 
 
+ValueKind = Literal["metric", "per_minute", "seconds", "samples", "none"]
+"""遷移の `value` が何を表すか（決定記録 0142 §2.4）。通知の `値:` の単位を決める。
+
+ルールごとに値の意味が違う（`SENSOR_FAULT` は秒数、`RAPID_RISE` は 1 分あたりの変化）。
+メトリクスの単位を機械的に付けると、秒数に `°C` が付く。
+"""
+
+
 class _Rule(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     enabled: bool
     severity: AlertSeverity
+    label: str
+    """人が読む名前（決定記録 0142 §2.3）。**必須。** 通知と日次レポートに出る。
+
+    省略を許すと、書き漏らしが英語の ID の通知として静かに通る。
+    """
+
+    @field_validator("label")
+    @classmethod
+    def _label_is_not_blank(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("label が空")
+        return value
 
 
 class ThresholdRule(_Rule):
@@ -138,6 +158,18 @@ class RuleSet(BaseModel):
     gpu_fan_not_manual: FlagOffRule
     gpu_fan_below_curve: HotAndSlowRule
 
+    def labels(self) -> dict[str, str]:
+        """`RULE_ID`（ルールの名前の大文字）→ 人が読む名前（決定記録 0142 §2.3）。"""
+        return {name.upper(): rule.label for name, rule in self}
+
+    def metrics_by_rule(self) -> dict[str, tuple[str, ...]]:
+        """`RULE_ID` → 定義が参照するメトリクス（決定記録 0142 §2.2a。通知の `現在値:` を絞る）。"""
+        return {name.upper(): rule_metrics(rule) for name, rule in self}
+
+    def value_kinds(self) -> dict[str, ValueKind]:
+        """`RULE_ID` → 遷移の `value` の意味（決定記録 0142 §2.4）。**ルールの型で決める。**"""
+        return {name.upper(): _value_kind(rule) for name, rule in self}
+
     @classmethod
     def from_yaml(cls, path: Path) -> RuleSet:
         loaded: Any = yaml.safe_load(path.read_text(encoding="utf-8"))
@@ -177,3 +209,16 @@ class RuleSet(BaseModel):
                 raise ValueError(f"{name}: low < low_clear <= high_clear < high とする（{rule}）")
             if isinstance(spec, ConsecutiveRule) and spec.clear_consecutive > spec.consecutive:
                 raise ValueError(f"{name}: clear_consecutive は consecutive 以下にする（{rule}）")
+
+
+def _value_kind(rule: BaseModel) -> ValueKind:
+    """ルールの型から値の意味を決める。ルールの名前（ID）で分岐しない。"""
+    if isinstance(rule, SlopeRule):
+        return "per_minute"
+    if isinstance(rule, SilenceRule):
+        return "seconds"
+    if isinstance(rule, ConsecutiveRule):
+        return "samples"
+    if isinstance(rule, EventRule):
+        return "none"
+    return "metric"

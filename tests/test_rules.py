@@ -588,6 +588,13 @@ def test_firing_and_resolution_reach_the_notifier(tmp_path):
     assert fired, "発火が通知されていない"
     assert fired[0].rule_id == "RECIRCULATION"
     assert "air.room" in fired[0].context, "本文に現在値が載る"
+    # 現在値は派生値・その材料・室温だけ（決定記録 0142 §2.2a）
+    readings = next(line for line in fired[0].as_text().splitlines() if line.startswith("現在値:"))
+    assert [part.split("=")[0] for part in readings.removeprefix("現在値: ").split(", ")] == [
+        "吸気上昇（再循環の指標）",
+        "前面吸気",
+        "室温",
+    ]
     assert fired[0].dashboard_url
 
 
@@ -655,13 +662,24 @@ def test_notify_check_scenario_reaches_each_target_once(tmp_path):
         ("INTAKE_HIGH", "warning", "resolved"),
     ]
     # 同じチャンネルに来るため、本文の先頭の行で重大度を見分ける（決定記録 0135 §2.2）。
-    # docs/notifications.md §2 の表と同じ文字列
-    assert [item.title for item in received["slack"] if item.kind == "alert"] == [
-        "🔴 [critical] RAPID_RISE [air.gpu_intake] — firing",
-        "✅ [critical 解除] RAPID_RISE [air.gpu_intake] — resolved",
-        "🟠 [warning] INTAKE_HIGH [air.gpu_intake] — firing",
-        "✅ [warning 解除] INTAKE_HIGH [air.gpu_intake] — resolved",
+    # 語は日本語で、最後の行に ID を残す（決定記録 0142）。docs/notifications.md §2 の表と同じ文字列
+    alerts = [item for item in received["slack"] if item.kind == "alert"]
+    assert [item.title for item in alerts] == [
+        "🔴 [重大] 温度の急上昇（GPU吸気）— 発生",
+        "✅ [重大 解除] 温度の急上昇（GPU吸気）— 解除",
+        "🟠 [警告] GPU吸気が高い（GPU吸気）— 発生",
+        "✅ [警告 解除] GPU吸気が高い（GPU吸気）— 解除",
     ]
+    assert [item.as_text().splitlines()[-1] for item in alerts] == [
+        "RAPID_RISE / air.gpu_intake",
+        "RAPID_RISE / air.gpu_intake",
+        "INTAKE_HIGH / air.gpu_intake",
+        "INTAKE_HIGH / air.gpu_intake",
+    ]
+    firing = alerts[0].as_text().splitlines()
+    assert firing[1].startswith("値: ") and firing[1].endswith(" °C/分")
+    assert firing[3].startswith("現在値: GPU吸気=") and firing[3].endswith(" °C")
+    assert firing[3].count("=") == 2, "関係する値（GPU吸気）と室温だけ（決定記録 0142 §2.2a）"
     # 手順書（docs/notifications.md §3）が終了時のログで見る数
     assert daemon.stats.notifications == 4
 

@@ -115,7 +115,7 @@ def _rule_facts(rules: RuleSet) -> list[Fact]:
     """ルールの閾値。**種類ごとに書き分けない**（項目が増えても落ちない）。"""
     facts: list[Fact] = []
     for name, rule in sorted(rules):
-        dumped = rule.model_dump()
+        dumped = rule.model_dump(exclude={"label"})  # 名前は閾値ではない（決定記録 0142 §2.7）
         if not dumped.pop("enabled"):
             value = "無効"
         else:

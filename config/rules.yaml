@@ -12,6 +12,7 @@
 # ############################################################################
 #
 # 共通の項目
+#   label         : 人が読む名前。通知と日次レポートに出る。**必須**（決定記録 0142 §2.3）
 #   enabled       : false にすると評価しない
 #   severity      : info | warning | critical
 #   fire_after_s  : 条件が続いたら発火するまでの秒数（0 なら即時）
@@ -26,6 +27,7 @@
 rules:
   # FR-401: 30秒以上サンプルが来ない。取り込み・ケーブル・デバイスのどれかが死んでいる
   sensor_fault:
+    label: センサーの応答が途絶えた
     enabled: true
     severity: critical
     silence_s: 30.0
@@ -34,6 +36,7 @@ rules:
 
   # FR-402: 特定メトリクスが連続で null / suspect。センサー1本の故障
   sensor_missing:
+    label: センサーの値が欠けている
     enabled: true
     severity: warning
     consecutive: 5
@@ -41,11 +44,13 @@ rules:
 
   # FR-403: 起動バナーの ROM が前回と違う。プローブの差し替え・入れ替わり
   probe_changed:
+    label: プローブが入れ替わった
     enabled: true
     severity: info
 
   # FR-404: 排気の再循環。自分の排気を吸っている
   recirculation:
+    label: 排気の再循環
     enabled: true
     severity: warning
     metric: d.intake_rise
@@ -55,6 +60,7 @@ rules:
 
   # FR-405: GPU 吸気温が高い
   intake_high:
+    label: GPU吸気が高い
     enabled: true
     severity: warning
     metric: air.gpu_intake
@@ -64,6 +70,7 @@ rules:
 
   # FR-406: 風量低下。GPU が空気に与える熱が増えている
   airflow_degraded:
+    label: 風量の低下
     enabled: true
     severity: warning
     metric: d.gpu_delta
@@ -73,6 +80,7 @@ rules:
 
   # FR-407: 急上昇。何かが急に起きている（critical）
   rapid_rise:
+    label: 温度の急上昇
     enabled: true
     severity: critical
     metric: air.gpu_intake
@@ -83,6 +91,7 @@ rules:
 
   # FR-408: 室温が高い。エアコンや外気の問題
   room_high:
+    label: 室温が高い
     enabled: true
     severity: warning
     metric: air.room
@@ -92,6 +101,7 @@ rules:
 
   # FR-409: 湿度の逸脱。低湿は静電気、高湿は結露。どちらも高額GPUの実害要因
   humidity_out_of_range:
+    label: 湿度が範囲の外
     enabled: true
     severity: warning
     metric: air.room_humidity
@@ -112,6 +122,7 @@ rules:
   # GPU の Fan の制御方式が手動でない（＝サービスが握っていない）状態が続く。
   # 30 s は再起動（RestartSec=2 と起動の待ち）を拾わず、600 W で 80 °C に届く約 80 s より短い
   gpu_fan_not_manual:
+    label: GPU Fanを曲線のサービスが握っていない
     enabled: true
     severity: warning
     metric: gpu.0.fan_policy
@@ -122,6 +133,7 @@ rules:
   # 0130 の曲線は 80 °C で 75 %。600 W の定常（78〜79 °C・68〜72 %）は発火の温度に届かず、
   # GPU 自身の既定の制御（80 °C で約 47 %）や手動の低い回転のまま残った状態を捉える
   gpu_fan_below_curve:
+    label: GPU Fanが曲線より遅い
     enabled: true
     severity: warning
     core_metric: gpu.0.core

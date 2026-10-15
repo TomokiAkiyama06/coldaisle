@@ -1,6 +1,7 @@
 # 通知の到達確認（Slack）
 
-通知の規約は決定記録 [0013](decisions/0013-notifications.md)、宛先は [0135](decisions/0135-critical-notifications-to-slack.md) にあります。
+通知の規約は決定記録 [0013](decisions/0013-notifications.md)、宛先は [0135](decisions/0135-critical-notifications-to-slack.md)、
+本文の日本語の形は [0142](decisions/0142-japanese-notification-text.md) にあります。
 この文書は、**実物の Webhook / トークンで本当に届くか**を確かめる手順です（#51 / 0013 §2.7・§5 未決2）。
 テストは宛先を差し替えて行っているため、外部サービスへの到達はここでしか確かめられません。
 
@@ -15,8 +16,8 @@
 - `COLDAISLE_SLACK_WEBHOOK`: 監視専用チャンネルの Incoming Webhook の URL
 
 critical と warning は**同じ Webhook・同じチャンネル**に届きます（決定記録 0135）。
-見分けるのは本文の先頭の行の記号と `[重大度]` です（発火は critical が 🔴、warning が 🟠、
-解除は ✅ に `[critical 解除]` / `[warning 解除]`。決定記録 0135 §2.2）。
+見分けるのは本文の先頭の行の記号と `[重大度]` です（発火は critical が 🔴 `[重大]`、warning が 🟠 `[警告]`、
+解除は ✅ に `[重大 解除]` / `[警告 解除]`。決定記録 0135 §2.2 / 0142 §2.1）。
 夜間（22時〜7時）は critical だけが届き、warning は届きません（`night.warning_enabled: false`）。
 
 ### LINE を使う場合
@@ -74,10 +75,29 @@ COLDAISLE_DASHBOARD_URL=https://dashboard.example.invalid/
 
 | 順 | 重大度 | 届くもの | 本文の先頭の行 |
 |---|---|---|---|
-| 1 | critical | `RAPID_RISE` の発火 | `🔴 [critical] RAPID_RISE [air.gpu_intake] — firing` |
-| 2 | critical | `RAPID_RISE` の解除 | `✅ [critical 解除] RAPID_RISE [air.gpu_intake] — resolved` |
-| 3 | warning | `INTAKE_HIGH` の発火 | `🟠 [warning] INTAKE_HIGH [air.gpu_intake] — firing` |
-| 4 | warning | `INTAKE_HIGH` の解除 | `✅ [warning 解除] INTAKE_HIGH [air.gpu_intake] — resolved` |
+| 1 | critical | `RAPID_RISE` の発火 | `🔴 [重大] 温度の急上昇（GPU吸気）— 発生` |
+| 2 | critical | `RAPID_RISE` の解除 | `✅ [重大 解除] 温度の急上昇（GPU吸気）— 解除` |
+| 3 | warning | `INTAKE_HIGH` の発火 | `🟠 [警告] GPU吸気が高い（GPU吸気）— 発生` |
+| 4 | warning | `INTAKE_HIGH` の解除 | `✅ [警告 解除] GPU吸気が高い（GPU吸気）— 解除` |
+
+本文の最後の行は ID です（`RAPID_RISE / air.gpu_intake`。ログ・DB・`config/rules.yaml` と突き合わせるため）。
+1 通目の全体は次の形になります（数値は走らせるたびに少し違います）。
+
+```text
+🔴 [重大] 温度の急上昇（GPU吸気）— 発生
+値: 5.16 °C/分
+5.16 ℃/分で上昇している
+現在値: GPU吸気=37.15 °C, 室温=26.09 °C
+http://127.0.0.1:8000/
+RAPID_RISE / air.gpu_intake
+```
+
+ルールの名前は `config/rules.yaml` の各ルールの `label`（必須）、メトリクスの名前と単位は
+`config/metrics.yaml` の `label` と `unit` から引きます（決定記録 0142 §2.3）。名前を直すときは設定だけを変え、
+`coldaisle-daemon` を再起動します。
+
+`現在値:` はそのアラートに関係する値だけです（アラートのメトリクス・ルールが参照するメトリクス・
+派生値ならその材料。最後に `config/notify.yaml` の `context_always`（室温）を付ける。決定記録 0142 §2.2a）。
 
 正常でも、各アラートには発火と解除の **2通** が届きます。
 **同じ遷移（例: `RAPID_RISE` の発火）が2通以上届いたら**、連投の抑制が効いていません（#51 の受入基準）。

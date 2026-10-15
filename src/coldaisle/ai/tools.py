@@ -424,7 +424,8 @@ class ToolRegistry:
         抜けたまま説明させると、モデルは無い情報を埋めようとする。
         """
         return {
-            name.upper(): rule.model_dump(mode="json")
+            # 名前（label）は閾値ではないので渡さない（決定記録 0142 §2.7）
+            name.upper(): rule.model_dump(mode="json", exclude={"label"})
             for name, rule in self.rules
             # 除外の rule_id と、除外のメトリクスを指すルールの行を出さない（0131 §2.4a）
             if not self.exclusions.excludes_rule(name.upper())
