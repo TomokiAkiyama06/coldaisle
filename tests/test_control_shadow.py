@@ -86,6 +86,7 @@ from test_control_schema import (
     REGISTRY_PROVENANCE,
     SAFETY_PROVENANCE,
     TELEMETRY_HEALTH_RECORD,
+    TRACE_RUN_ID,
 )
 from test_fallback_controller import (
     assessment_for,
@@ -257,6 +258,7 @@ def tick_with(
         air_balance_coordination=COORDINATION_RECORD,
         tach_unconfirmed_zones=(),
         telemetry_health=TELEMETRY_HEALTH_RECORD,
+        run_id=TRACE_RUN_ID,
     )
 
 
@@ -558,6 +560,7 @@ def test_invariant_1_g_a_shadow_record_is_refused_in_modes_people_drive() -> Non
             air_balance_coordination=COORDINATION_RECORD,
             tach_unconfirmed_zones=(),
             telemetry_health=TELEMETRY_HEALTH_RECORD,
+            run_id=TRACE_RUN_ID,
         )
     # 記録器自身も、その mode では何も作らない。
     assert (
@@ -1437,6 +1440,7 @@ def solved_shadow_tick(*, applied: float, ts_ms: int = SCORED_ACTION_TS_MS) -> C
         air_balance_coordination=COORDINATION_RECORD,
         tach_unconfirmed_zones=(),
         telemetry_health=TELEMETRY_HEALTH_RECORD,
+        run_id=TRACE_RUN_ID,
     )
 
 
@@ -1462,6 +1466,7 @@ def follow_up_tick(*, tick_id: int, ts_ms: int, applied: float) -> ControlTick:
         air_balance_coordination=COORDINATION_RECORD,
         tach_unconfirmed_zones=(),
         telemetry_health=TELEMETRY_HEALTH_RECORD,
+        run_id=TRACE_RUN_ID,
     )
 
 
@@ -1914,6 +1919,7 @@ def test_the_counterfactual_artifact_comes_from_the_gate_not_the_assessment() ->
         air_balance_coordination=COORDINATION_RECORD,
         tach_unconfirmed_zones=(),
         telemetry_health=TELEMETRY_HEALTH_RECORD,
+        run_id=TRACE_RUN_ID,
     )
     assert tick.model_gate is not None
     assert tick.model_gate.artifact_sha256 == item.artifact_sha256

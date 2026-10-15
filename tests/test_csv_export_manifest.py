@@ -432,7 +432,9 @@ def test_retention_does_not_delete_the_rows(store, out_dir, rules):
     fill(store)
     export(store, out_dir)
     before = rows(store)
-    retention = RetentionRules(raw_days=1, control_trace_days=1, csv_dir=str(out_dir))
+    retention = RetentionRules(
+        raw_days=1, control_trace_days=1, hint_shadow_days=1, csv_dir=str(out_dir)
+    )
     result = run(store, retention, now_ms=NOON_JST_MS + 400 * 86_400_000)
     assert result.deleted_rows > 0, "生データは消えている"
     assert rows(store) == before

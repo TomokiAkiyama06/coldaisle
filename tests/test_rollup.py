@@ -308,7 +308,8 @@ def test_config_file_covers_every_field(rules_30d):
 def test_unknown_key_is_rejected(tmp_path):
     path = tmp_path / "retention.yaml"
     path.write_text(
-        "raw_days: 30\ncontrol_trace_days: 30\ncsv_dir: x\nraw_day: 14\n", encoding="utf-8"
+        "raw_days: 30\ncontrol_trace_days: 30\nhint_shadow_days: 30\ncsv_dir: x\nraw_day: 14\n",
+        encoding="utf-8",
     )
     with pytest.raises(ValueError, match="raw_day"):
         RetentionRules.from_yaml(path)
@@ -343,7 +344,7 @@ def test_cli_runs_and_writes_csv(tmp_path, rules):
 
     retention = tmp_path / "retention.yaml"
     retention.write_text(
-        f"raw_days: 30\ncontrol_trace_days: 30\ncsv_dir: {tmp_path / 'csv'}\n"
+        f"raw_days: 30\ncontrol_trace_days: 30\nhint_shadow_days: 30\ncsv_dir: {tmp_path / 'csv'}\n"
         "csv_timezone: Asia/Tokyo\ncsv_export_lock_timeout_s: 5\n",
         encoding="utf-8",
     )
@@ -372,7 +373,8 @@ def export_cli(tmp_path, rules, extra_yaml: str, *argv: str) -> tuple[int, Path,
         write(store, "air.room", 1_787_616_000_000, 26.0)  # 2026-08-25 09:00 JST
     retention = tmp_path / "retention.yaml"
     retention.write_text(
-        f"raw_days: 30\ncontrol_trace_days: 30\ncsv_dir: {tmp_path / 'csv'}\n" + extra_yaml,
+        f"raw_days: 30\ncontrol_trace_days: 30\nhint_shadow_days: 30\ncsv_dir: {tmp_path / 'csv'}\n"
+        + extra_yaml,
         encoding="utf-8",
     )
     code = main(
@@ -457,7 +459,9 @@ def test_the_configured_timezone_is_used_without_the_flag(tmp_path, rules):
 def test_retention_without_export_settings_still_loads(tmp_path):
     """export の2つのキーが無くても、ロールアップと保持期間の設定は読める。"""
     path = tmp_path / "retention.yaml"
-    path.write_text("raw_days: 30\ncontrol_trace_days: 30\ncsv_dir: x\n", encoding="utf-8")
+    path.write_text(
+        "raw_days: 30\ncontrol_trace_days: 30\nhint_shadow_days: 30\ncsv_dir: x\n", encoding="utf-8"
+    )
     loaded = RetentionRules.from_yaml(path)
     assert loaded.csv_timezone is None
     assert loaded.csv_export_lock_timeout_s is None
@@ -652,7 +656,9 @@ def test_cli_creates_the_database_directory(tmp_path):
     """`var/` は追跡されていない。既定のコマンドが素の checkout で動くこと。"""
     retention = tmp_path / "retention.yaml"
     retention.write_text(
-        f"raw_days: 30\ncontrol_trace_days: 30\ncsv_dir: {tmp_path / 'csv'}\n", encoding="utf-8"
+        "raw_days: 30\ncontrol_trace_days: 30\nhint_shadow_days: 30\n"
+        f"csv_dir: {tmp_path / 'csv'}\n",
+        encoding="utf-8",
     )
     database = tmp_path / "var" / "coldaisle.db"
     assert not database.parent.exists()

@@ -111,6 +111,10 @@ def test_migration_creates_exactly_the_decided_objects():
         ("trigger", "csv_exports_no_update"),
         ("trigger", "csv_exports_no_delete"),
         ("trigger", "dataset_source_run_export_binding_pair"),
+        # 0014: Workload Hint Stage B の B1 のヒント有りの記録（決定記録 0133 §2.5a）
+        ("table", "hint_shadow_records"),
+        ("index", "ix_hint_shadow_records_source"),
+        ("trigger", "hint_shadow_records_no_update"),
     }
 
 

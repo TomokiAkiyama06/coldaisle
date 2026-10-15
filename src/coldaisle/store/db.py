@@ -34,6 +34,8 @@ from coldaisle.store.models import (
     ControlTraceRecord,
     DeviceRecord,
     EventRecord,
+    HintShadowMatch,
+    HintShadowRecord,
     LatestReading,
     Quality,
     RollupPoint,
@@ -579,6 +581,93 @@ class SqliteStore:
         if row_id is None:
             raise RuntimeError("監査の行の採番に失敗した")
         return record.model_copy(update={"id": int(row_id)})
+
+    def record_hint_shadow(self, record: HintShadowRecord) -> HintShadowRecord:
+        """ヒント有りの solve の記録を1行追記する（#288 / 決定記録 0133 §2.5a）。
+
+        **追記のみ。** 更新は DB のトリガが拒否する。削除は保持期間の適用
+        （:meth:`delete_hint_shadow_before`）だけ。書くのは ``coldaisle-fand`` の tick の外の書き手
+        だけ（B1 で配線する）。``seq`` は保存時に AUTOINCREMENT で決まり、再利用しない。
+        """
+        if record.seq is not None:
+            raise ValueError("採番前の記録を渡す（seq は保存時に決まる）")
+        with self.transaction():
+            cursor = self._conn.execute(
+                "INSERT INTO hint_shadow_records (run_id, source_tick_id, source_ts_ms,"
+                " source_monotonic_ms, received_monotonic_ms, received_ts_ms, schema_version,"
+                " status, reason, record_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    record.run_id,
+                    record.source_tick_id,
+                    record.source_ts_ms,
+                    record.source_monotonic_ms,
+                    record.received_monotonic_ms,
+                    record.received_ts_ms,
+                    record.schema_version,
+                    record.status.value,
+                    None if record.reason is None else record.reason.value,
+                    record.record_json,
+                ),
+            )
+        row_id = cursor.lastrowid
+        if row_id is None:
+            raise RuntimeError("hint_shadow_records の採番に失敗した")
+        return record.model_copy(update={"seq": int(row_id)})
+
+    def delete_hint_shadow_before(self, cutoff_ms: int) -> int:
+        """保持期間を過ぎたヒント有りの記録を削除して行数を返す（決定記録 0133 §2.5a）。
+
+        消すのは ``source_ts_ms < cutoff_ms`` の行。基準を元の tick の時刻にするのは、突き合わせる
+        相手の trace（``control_traces.ts_ms``）と同じ時刻で古くなるようにするため。
+        """
+        if cutoff_ms < 0:
+            raise ValueError("hint_shadow_records の削除基準時刻が不正")
+        with self.transaction():
+            cursor = self._conn.execute(
+                "DELETE FROM hint_shadow_records WHERE source_ts_ms < ?", (cutoff_ms,)
+            )
+        return int(cursor.rowcount)
+
+    def hint_shadow_matches(self, start_ms: int, end_ms: int) -> tuple[HintShadowMatch, ...]:
+        """``source_ts_ms`` が ``[start_ms, end_ms)`` の記録を、trace との対応の有無とともに返す。
+
+        突き合わせの契約（決定記録 0133 §2.5a）: ``control_traces`` の主キー
+        ``(ts_ms, tick_id) = (source_ts_ms, source_tick_id)`` の行があり、その trace の**最上位の**
+        ``run_id`` が記録の ``run_id`` と等しいときだけ対応する。``mode_command.run_id`` は見ない。
+        対応の無い記録も捨てずに返す（集計で「対応なし」として数える）。並びは ``seq``（追記順）。
+        """
+        if start_ms < 0 or end_ms < start_ms:
+            raise ValueError("期間が不正")
+        rows = self._conn.execute(
+            "SELECT h.seq, h.run_id, h.source_tick_id, h.source_ts_ms, h.source_monotonic_ms,"
+            " h.received_monotonic_ms, h.received_ts_ms, h.schema_version, h.status, h.reason,"
+            " h.record_json,"
+            " EXISTS (SELECT 1 FROM control_traces AS c"
+            "         WHERE c.ts_ms = h.source_ts_ms AND c.tick_id = h.source_tick_id"
+            "           AND json_extract(c.trace_json, '$.run_id') = h.run_id) AS trace_matched"
+            " FROM hint_shadow_records AS h"
+            " WHERE h.source_ts_ms >= ? AND h.source_ts_ms < ? ORDER BY h.seq",
+            (start_ms, end_ms),
+        ).fetchall()
+        return tuple(
+            HintShadowMatch(
+                record=HintShadowRecord(
+                    seq=row["seq"],
+                    run_id=row["run_id"],
+                    source_tick_id=row["source_tick_id"],
+                    source_ts_ms=row["source_ts_ms"],
+                    source_monotonic_ms=row["source_monotonic_ms"],
+                    received_monotonic_ms=row["received_monotonic_ms"],
+                    received_ts_ms=row["received_ts_ms"],
+                    schema_version=row["schema_version"],
+                    status=row["status"],
+                    reason=row["reason"],
+                    record_json=row["record_json"],
+                ),
+                trace_matched=bool(row["trace_matched"]),
+            )
+            for row in rows
+        )
 
     def append_calibration_activation(self, row: CalibrationActivation) -> None:
         """較正の変更の記録を1行追記する（#233 / 決定記録 0099 §2.2 / §2.5）。

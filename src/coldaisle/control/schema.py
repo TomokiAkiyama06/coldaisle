@@ -26,7 +26,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from coldaisle.measurement import validate_metric
 
-SCHEMA_VERSION: Literal[15] = 15
+SCHEMA_VERSION: Literal[16] = 16
 """`ControlTick` の形の版。**フィールドの名前や意味を変えたら上げる。**
 
 #82 が保存したデータを読み違えないため。
@@ -81,6 +81,11 @@ SCHEMA_VERSION: Literal[15] = 15
   （`telemetry_health`。健全度・それを `DEGRADED` にした入力・Guard の `threshold_profile`）。
   **v15 には必須**で、保存済みの v1〜v14 は欄なしのまま読める
   （「記録が無い」であって「`NORMAL` だった」ではない）
+- v16（#288 / 決定記録 0133 §2.9）: fand の起動ごとの `run_id`（最上位。`RUN_ID_PATTERN`）。
+  ヒントの段階・管理ソケットの有無・Learned の経路の有無に関わらず**v16 には必須**で、
+  同じ tick の `mode_command.run_id` があれば等しい。保存済みの v1〜v15 は欄なしのまま読める
+  （古い版の `mode_command.run_id` を最上位の `run_id` として読み替えない）。
+  `hint_shadow_records`（0133 §2.5a）との突き合わせの検算に使う
 """
 
 Demand = Annotated[float, Field(ge=0.0, le=1.0, allow_inf_nan=False)]
@@ -2225,7 +2230,7 @@ class TelemetryHealthRecord(_Frozen):
 class ControlTick(_Frozen):
     """1 tick の判断の記録（decision trace。0028 §2.3）。#82 が保存し、#90 / #91 が読む。"""
 
-    schema_version: Literal[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15] = SCHEMA_VERSION
+    schema_version: Literal[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16] = SCHEMA_VERSION
     tick_id: int = Field(ge=0)
     ts_ms: int = Field(ge=0)
     """記録の時刻（壁時計。0028 §2.6）。"""
@@ -2298,6 +2303,15 @@ class ControlTick(_Frozen):
 
     保存済みの v1〜v14 では None（「記録が無い」であって「NORMAL だった」ではない）。
     """
+    run_id: str | None = Field(
+        default=None, pattern=RUN_ID_PATTERN, exclude_if=lambda value: value is None
+    )
+    """fand の起動ごとの識別子（v16。#288 / 決定記録 0133 §2.9）。保存済みの v1〜v15 では None。
+
+    ``hint_shadow_records`` の行は ``(ts_ms, tick_id)`` とこの値がそろったときだけ、この tick と
+    対応する（0133 §2.5a）。``tick_id`` は再起動で戻り、壁時計は飛ぶため、主キーだけでは
+    別の run の tick と取り違えうる。
+    """
     faults: tuple[Fault, ...] = ()
     """いま有効な故障。
 
@@ -2352,6 +2366,7 @@ class ControlTick(_Frozen):
         self._check_authority()
         self._check_air_balance_coordination()
         self._check_telemetry_health()
+        self._check_run_id()
         self._check_model_gate()
         self._check_registry_binds_model()
         self._check_shadow()
@@ -2584,6 +2599,24 @@ class ControlTick(_Frozen):
         ):
             # Guard が判断を返さないのは例外の tick だけ。理由の無い欠けを作らない。
             raise ValueError("guard_threshold_profile が無い tick には guard_exception がある")
+
+    def _check_run_id(self) -> None:
+        """v16 の ``run_id`` が必須で ``mode_command.run_id`` と等しいか（0133 §2.9）。"""
+        if self.run_id is None:
+            if self.schema_version >= 16:
+                # 版が中身を表さない記録を作らない（0060 §2.4）。`--no-admin` でも載せる
+                raise ValueError("v16 の ControlTick には run_id が要る")
+            return
+        if self.schema_version < 16:
+            raise ValueError("run_id を記録する ControlTick は schema version 16 にする")
+        mode_command = self.mode_command
+        if (
+            mode_command is not None
+            and mode_command.run_id is not None
+            and mode_command.run_id != self.run_id
+        ):
+            # 食い違う trace を作らない。どちらの run の tick か言えなくなる
+            raise ValueError("mode_command.run_id は最上位の run_id と等しくする")
 
     def _check_tach_unconfirmed(self, record: AirBalanceCoordinationRecord) -> None:
         zones = self.tach_unconfirmed_zones

@@ -30,6 +30,7 @@ requested にする（決定記録 0085）。
 from __future__ import annotations
 
 import logging
+import re
 from collections import deque
 from dataclasses import dataclass
 from typing import Protocol, Self, cast
@@ -92,6 +93,7 @@ from coldaisle.control.schema import (
     AIR_BALANCE_ZONE_REASONS,
     BASELINE_STAGE,
     CONTROL_TICK_RUNTIME_SCHEMA_VERSION,
+    RUN_ID_PATTERN,
     SCHEMA_VERSION,
     AirBalanceCoordinationFailure,
     AirBalanceCoordinationMode,
@@ -636,6 +638,7 @@ class ControlLoop:
         clock: Clock,
         monotonic: MonotonicClock,
         registry: RegistryProvenance,
+        run_id: str,
         mode_source: OperatingModeSource | None = None,
         admin_mode: AdminModeTracker | None = None,
         supervisor: SupervisorCoordinator | None = None,
@@ -679,6 +682,13 @@ class ControlLoop:
             raise ValueError("RL Supervisor worker を配線するなら Supervisor も配線する")
         if learned_health is not None and learned_source is None:
             raise ValueError("Learned の経路の状態は提案の口と一緒に配線する（決定記録 0077 §2.2）")
+        if re.fullmatch(RUN_ID_PATTERN, run_id) is None:
+            # 既定値を置かない。渡し忘れや別の形の値で、どの run の tick か言えない trace を
+            # 作らない（決定記録 0133 §2.9）
+            raise ValueError("run_id は fand の起動ごとの 32 桁の16進（new_run_id()）")
+        if admin_mode is not None and admin_mode.run_id != run_id:
+            # 管理ソケットの監査・Learned の経路の封筒・trace は同じ run_id を使う（0077 §2.3）
+            raise ValueError("管理ソケットの受け渡し口と loop の run_id を揃える")
         if mode_source is not None and admin_mode is not None:
             # モードの出どころを1つにする。2つあると、どちらが人の最新の意図か決まらない
             raise ValueError("mode_source と admin_mode は同時に配線しない")
@@ -721,6 +731,8 @@ class ControlLoop:
         # 同じ記録になるのを防ぐため（読んでいない構成は `RegistryProvenance.unbound()` を
         # 明示する）。
         self._registry = registry
+        # **起動ごとの run_id を毎 tick 載せる**（v16。決定記録 0133 §2.9）。
+        self._run_id = run_id
         # **frame の `expected_artifacts` は trace の `registry` と同じ値から作る**（決定記録 0077
         # §2.6）。別々に渡すと、worker が読む artifact と trace が名乗る版が食い違いうる。
         self._expected_artifacts = LearnedExpectedArtifacts.from_provenance(registry)
@@ -944,6 +956,9 @@ class ControlLoop:
             # **健全度と Guard が実際に選んだ閾値の組を毎 tick 残す**（v15。#308 / 決定記録 0137）。
             # どちらもこの tick の snapshot と Guard の判断から写すだけで、制御へは戻らない。
             telemetry_health=self._telemetry_health_record(snapshot, guard_decision),
+            # **fand の起動ごとの run_id を毎 tick 残す**（v16。#288 / 決定記録 0133 §2.9）。
+            # 段階・管理ソケット・Learned の経路の有無に関わらず載せる。
+            run_id=self._run_id,
         )
         recorded, trace_failed = self._record(tick)
         # **journal の書き残しと変化の検知は heartbeat と trace の保存の後**（0072 §2.6 /
