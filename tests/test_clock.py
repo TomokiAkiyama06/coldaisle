@@ -6,11 +6,19 @@
 """
 
 import ast
+import time
 from pathlib import Path
 
 import pytest
 
-from coldaisle.clock import Clock, SimulatedClock, WallClock
+from coldaisle.clock import (
+    SIMULATED_BOOT_ID,
+    BootClock,
+    BootClockUnavailableError,
+    Clock,
+    SimulatedClock,
+    WallClock,
+)
 
 SRC = Path(__file__).resolve().parents[1] / "src" / "coldaisle"
 
@@ -146,3 +154,63 @@ def test_the_detector_catches_every_spelling(snippet):
 )
 def test_the_detector_allows_elapsed_time_and_conversion(snippet):
     assert not wall_clock_calls(ast.parse(snippet))
+
+
+# ---------------------------------------------------------------- BootClock（#318 / 0066 §2.2）
+
+LETTERED_BOOT_ID = "28ffabcd-0000-4000-8000-00000000beef"
+"""英字を含む仮の boot id（大文字にすると形が変わる）。"""
+
+
+@pytest.mark.parametrize("implementation", [WallClock(), SimulatedClock(0)])
+def test_implementations_satisfy_the_boot_clock_protocol(implementation):
+    assert isinstance(implementation, BootClock)
+
+
+def test_simulated_boottime_follows_scenario_time_from_the_start():
+    """Mock / Replay で再現できる。シナリオの開始を boot の起点にし、巻き戻らない。"""
+    clock = SimulatedClock(5_000)
+    assert clock.boottime_ns() == 0
+    clock.advance_to_ms(7_500)
+    assert clock.boottime_ns() == 2_500 * 1_000_000
+    assert clock.boot_id() == SIMULATED_BOOT_ID
+
+
+def test_simulated_boot_id_is_injectable_and_validated():
+    assert SimulatedClock(0, boot_id=LETTERED_BOOT_ID).boot_id() == LETTERED_BOOT_ID
+    with pytest.raises(ValueError, match="UUID"):
+        SimulatedClock(0, boot_id="NOT-A-UUID")
+    with pytest.raises(ValueError, match="UUID"):
+        SimulatedClock(0, boot_id=LETTERED_BOOT_ID.upper())
+
+
+def test_wall_clock_reads_and_caches_the_boot_id(tmp_path):
+    path = tmp_path / "boot_id"
+    path.write_text(SIMULATED_BOOT_ID + "\n", encoding="ascii")
+    clock = WallClock(boot_id_path=path)
+    assert clock.boot_id() == SIMULATED_BOOT_ID
+    path.unlink()
+    assert clock.boot_id() == SIMULATED_BOOT_ID, "boot id はプロセスの生存中に変わらない"
+
+
+@pytest.mark.parametrize("content", [None, "", "garbage\n", LETTERED_BOOT_ID.upper() + "\n"])
+def test_wall_clock_boot_id_failures_are_reported(tmp_path, content):
+    path = tmp_path / "boot_id"
+    if content is not None:
+        path.write_text(content, encoding="ascii")
+    with pytest.raises(BootClockUnavailableError):
+        WallClock(boot_id_path=path).boot_id()
+
+
+@pytest.mark.skipif(not hasattr(time, "CLOCK_BOOTTIME"), reason="CLOCK_BOOTTIME が無い")
+def test_wall_clock_boottime_is_non_negative_and_non_decreasing():
+    clock = WallClock()
+    first = clock.boottime_ns()
+    assert first >= 0
+    assert clock.boottime_ns() >= first
+
+
+def test_wall_clock_without_clock_boottime_is_reported(monkeypatch):
+    monkeypatch.delattr(time, "CLOCK_BOOTTIME", raising=False)
+    with pytest.raises(BootClockUnavailableError):
+        WallClock().boottime_ns()
