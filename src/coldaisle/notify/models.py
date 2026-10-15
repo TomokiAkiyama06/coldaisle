@@ -1,21 +1,58 @@
 """通知の設定と本文（#20）。
 
 **秘匿情報は設定ファイルに置かない。** Webhook URL とトークンは環境変数から読む
-（リポジトリは public。#41 / 決定 Q-06）。
+（リポジトリは public。#41 / 決定 Q-06）。導入先のダッシュボードのアドレスも同じで、
+`COLDAISLE_DASHBOARD_URL` で `dashboard_url` を上書きできる（#307）。
 """
 
 from __future__ import annotations
 
+import os
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo
 
 import yaml
 from pydantic import BaseModel, ConfigDict, Field
 
 from coldaisle.store.models import AlertSeverity
+
+DASHBOARD_URL_ENV = "COLDAISLE_DASHBOARD_URL"
+"""通知の本文のダッシュボードのリンクを上書きする環境変数（#307）。
+
+`config/notify.yaml` の既定はサーバー自身から見たアドレスで、Slack を別の端末で開くと
+届かない。導入先の実際のアドレスは public なリポジトリに書けない（AGENTS.md ルール 10）ため、
+導入先の環境変数（`/etc/coldaisle/coldaisle.env`）に置く。**空文字は未設定と同じに扱う**
+（`.env.example` を写したままの空の行で既定を潰さない）。
+"""
+
+_DASHBOARD_URL_SCHEMES = frozenset({"http", "https"})
+
+
+def _check_dashboard_url(value: str, *, source: str) -> str:
+    """http / https の絶対 URL でホストがあることを確かめる。**起動時に落とす。**
+
+    遅らせると、壊れたリンクが最初の通知で初めて分かる（それも Slack を開いた人にだけ）。
+    例外の文に値そのものは入れない。導入先のアドレスや URL に埋めた資格情報が
+    ログに残らないようにする（#305 と同じ考え方）。
+    """
+    if not value or any(ch.isspace() for ch in value):
+        raise ValueError(f"{source}: ダッシュボードの URL が空か、空白を含む")
+    try:
+        parts = urlsplit(value)
+        _ = parts.port  # 数字でないポートはここで ValueError になる
+    except ValueError:
+        # 元の例外の文には値が入りうるので連鎖を切る
+        raise ValueError(f"{source}: ダッシュボードの URL を解釈できない") from None
+    if parts.scheme.lower() not in _DASHBOARD_URL_SCHEMES:
+        raise ValueError(f"{source}: ダッシュボードの URL は http か https の絶対 URL にする")
+    if not parts.hostname:
+        raise ValueError(f"{source}: ダッシュボードの URL にホストが無い")
+    return value
 
 
 class NightPolicy(BaseModel):
@@ -64,10 +101,22 @@ class NotifyConfig(BaseModel):
     dashboard_url: str
 
     @classmethod
-    def from_yaml(cls, path: Path) -> NotifyConfig:
+    def from_yaml(cls, path: Path, *, environ: Mapping[str, str] | None = None) -> NotifyConfig:
+        """設定を読み、`COLDAISLE_DASHBOARD_URL` があれば `dashboard_url` を置き換える。
+
+        `environ` は試験用。省くと `os.environ` を読む。
+        """
         loaded: Any = yaml.safe_load(path.read_text(encoding="utf-8"))
         if not isinstance(loaded, dict):
             raise ValueError(f"通知の設定が辞書ではない: {path}")
+        override = (os.environ if environ is None else environ).get(DASHBOARD_URL_ENV, "")
+        if override:
+            loaded = {
+                **loaded,
+                "dashboard_url": _check_dashboard_url(override, source=DASHBOARD_URL_ENV),
+            }
+        elif isinstance(loaded.get("dashboard_url"), str):
+            _check_dashboard_url(loaded["dashboard_url"], source=f"{path} の dashboard_url")
         config = cls.model_validate(loaded)
         try:
             _ = config.night.zone  # 綴り違いは起動時に落とす
