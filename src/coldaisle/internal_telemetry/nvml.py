@@ -29,6 +29,14 @@ pynvml の定数名は版で変わってきた（``ClocksThrottle`` → ``Clocks
 """
 
 
+FAN_POLICY_MANUAL = 1
+"""``nvmlDeviceGetFanControlPolicy_v2`` の手動（``NVML_FAN_POLICY_MANUAL``）。決定記録 0131 §2.2
+
+``coldaisle-gpu-fan``（0128）が Fan を握っている間はすべての Fan がこれになる。
+ABI の値に固定する（pynvml の定数名に依存しない。``THROTTLE_REASON_BITS`` と同じ理由）。
+"""
+
+
 class ClockEventReasons(NamedTuple):
     """現在の clock event reason と、この GPU が報告しうる reason のビット集合。"""
 
@@ -66,6 +74,8 @@ class NvmlApi(Protocol):
     def clock_event_reasons(self, handle: object) -> ClockEventReasons | None: ...
 
     def fan_speed_pct(self, handle: object) -> float | None: ...
+
+    def fan_policy_manual(self, handle: object) -> float | None: ...
 
 
 class PynvmlApi:
@@ -182,6 +192,24 @@ class PynvmlApi:
         # 冷却ファンを持たない GPU では NotSupported が返り、呼び出し側で欠測にする
         return float(self._load().nvmlDeviceGetFanSpeed(handle))
 
+    def fan_policy_manual(self, handle: object) -> float | None:
+        """すべての Fan の制御方式が手動なら 1、1 つでも手動でなければ 0（決定記録 0131 §2.2）。
+
+        **読むだけで書かない。** 関数が無い binding / driver は ``None``（欠測）。
+        ``NVML_ERROR_NOT_SUPPORTED`` などの例外は呼び出し側の ``_read`` が欠測に畳む。
+        Fan の数が 0 なら判定できないので欠測にする（「手動」とも「手動でない」とも言えない）。
+        """
+        module = self._load()
+        count = getattr(module, "nvmlDeviceGetNumFans", None)
+        policy = getattr(module, "nvmlDeviceGetFanControlPolicy_v2", None)
+        if not callable(count) or not callable(policy):
+            return None
+        fans = int(count(handle))
+        if fans <= 0:
+            return None
+        manual = all(int(policy(handle, fan)) == FAN_POLICY_MANUAL for fan in range(fans))
+        return 1.0 if manual else 0.0
+
 
 def _first_callable(module: ModuleType, *names: str) -> Callable[[object], Any] | None:
     for name in names:
@@ -201,6 +229,7 @@ def _gpu_metrics(index: int) -> tuple[str, ...]:
         f"power.gpu.{index}",
         f"gpu.{index}.tlimit_margin",
         f"gpu.{index}.fan_speed",
+        f"gpu.{index}.fan_policy",
         *(f"gpu.{index}.throttle.{reason}" for reason in THROTTLE_REASON_BITS),
     )
 
@@ -272,6 +301,7 @@ class NvmlAdapter:
             power = self._read(self._api.power_w, handle)
             margin = self._read(self._api.tlimit_margin_c, handle)
             fan = self._read(self._api.fan_speed_pct, handle)
+            fan_policy = self._read(self._api.fan_policy_manual, handle)
             throttle = _throttle_flags(self._api, handle)
             readings.extend(
                 (
@@ -283,6 +313,7 @@ class NvmlAdapter:
                     _reading(f"power.gpu.{index}", power),
                     _reading(f"gpu.{index}.tlimit_margin", margin),
                     _reading(f"gpu.{index}.fan_speed", fan),
+                    _reading(f"gpu.{index}.fan_policy", fan_policy),
                     *(
                         _reading(f"gpu.{index}.throttle.{reason}", flag)
                         for reason, flag in throttle.items()
@@ -302,6 +333,7 @@ class NvmlAdapter:
                     power,
                     margin,
                     fan,
+                    fan_policy,
                     *throttle.values(),
                 )
             )

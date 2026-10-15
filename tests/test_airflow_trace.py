@@ -2,7 +2,7 @@
 
 `airflow-trace.js` の変換を node で実際に動かして確かめる（決定記録 0044。CI では node が必須）。
 
-1. **版の解釈は1か所**（`airflow-trace.js`）。v1〜v14 の fixture を読める
+1. **版の解釈は1か所**（`airflow-trace.js`）。v1〜v15 の fixture を読める
    （schema.py に無い版は「未対応の版」）
 2. **3つの状態を混ぜない**: その版に欄が無い／欄はあるが値が無い／画面が知らない版
 3. Safety override・Fallback・OOD を通常状態と区別して出す
@@ -38,7 +38,7 @@ AIRFLOW_UI_PATH = CONFIG_DIR / "airflow-ui.yaml"
 NOW_MS = 1_787_616_020_000
 
 NOT_IN_VERSION = "この版の記録には無い"
-FIXTURE_VERSIONS = range(1, 15)
+FIXTURE_VERSIONS = range(1, 16)
 
 
 def _node() -> str:
@@ -113,7 +113,7 @@ def _steps(result: Any, zone: str) -> dict[str, dict[str, Any]]:
 
 @pytest.mark.parametrize("version", FIXTURE_VERSIONS)
 def test_every_stored_version_is_read(version):
-    """保存済みの v1〜v14 の fixture を、同じ `page.control` の形にできる。"""
+    """保存済みの v1〜v15 の fixture を、同じ `page.control` の形にできる。"""
     result = _convert(_body(version))
     assert result["status"] == "ok"
     assert result["schema_version"] == version
@@ -182,11 +182,11 @@ def test_workload_regime_absent_in_v1_only():
     assert _chip(_convert(_body(2)), "負荷の傾向")["v"] != NOT_IN_VERSION
 
 
-@pytest.mark.parametrize("version", [15, 999])
+@pytest.mark.parametrize("version", [16, 999])
 def test_an_unknown_version_is_not_shown(version):
     """画面が知らない版は「未対応の版」。**制御由来の項目を出さない。**
 
-    v15 は schema.py にまだ無い。中身は先にマージされた PR で決まるので、推測で読まない。
+    v16 は schema.py にまだ無い。中身は先にマージされた PR で決まるので、推測で読まない。
     """
     body = _body(10)
     body["schema_version"] = version
@@ -816,3 +816,48 @@ def test_v13_an_unpersisted_demotion_is_shown_as_bad():
     chip = _chip(_convert(_v13(body)), "制御権の出どころ")
     assert chip["tone"] == "bad"
     assert "再起動で戻る" in chip["v"]
+
+
+# ------------------------------------------------------------ v15: 入力の健全度（0137 §2.2）
+
+HEALTH = "入力の健全度"
+
+
+def test_v14_has_no_telemetry_health():
+    """v14 以前を「そろっている」と言わない（0071 §2.3 の「この版の記録には無い」）。"""
+    chip = _chip(_convert(_body(14)), HEALTH)
+    assert chip == {"k": HEALTH, "v": NOT_IN_VERSION, "tone": "absent"}
+
+
+def test_v15_degraded_inputs_and_the_conservative_guard_are_shown():
+    chip = _chip(_convert(_body(15)), HEALTH)
+    assert chip == {
+        "k": HEALTH,
+        "v": "欠けている入力 1 ・ 急変への対応は保守側の閾値",
+        "tone": "warn",
+    }
+
+
+def test_v15_complete_inputs_are_shown_as_ok():
+    body = _body(15)
+    body["telemetry_health"].update(
+        {"health": "normal", "degraded_inputs": [], "guard_threshold_profile": "normal"}
+    )
+    assert _chip(_convert(body), HEALTH) == {"k": HEALTH, "v": "そろっている", "tone": "ok"}
+
+
+def test_v15_a_guard_without_a_decision_is_not_shown_as_normal():
+    body = _body(15)
+    body["telemetry_health"]["guard_threshold_profile"] = None
+    chip = _chip(_convert(body), HEALTH)
+    assert chip["tone"] == "bad"
+    assert "例外" in chip["v"]
+
+
+def test_v15_a_mismatched_record_is_not_shown_as_normal():
+    """健全度と閾値の組が食い違う記録は schema が拒否する。画面も「正常」と言わない。"""
+    body = _body(15)
+    body["telemetry_health"].update({"health": "normal", "guard_threshold_profile": "conservative"})
+    chip = _chip(_convert(body), HEALTH)
+    assert chip["tone"] == "warn"
+    assert chip["v"] == "記録の値を解釈できない"

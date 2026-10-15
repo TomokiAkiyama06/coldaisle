@@ -49,6 +49,7 @@ from test_control_schema import (
     MODE_COMMAND_RECORD,
     REGISTRY_PROVENANCE,
     SAFETY_PROVENANCE,
+    TELEMETRY_HEALTH_RECORD,
 )
 
 BASE_TS_MS = 1_800_000_000_000
@@ -632,6 +633,7 @@ def control_tick(decision: SupervisorDecision, current: SupervisorInput) -> Cont
         authority=AUTHORITY_RECORD,
         air_balance_coordination=COORDINATION_RECORD,
         tach_unconfirmed_zones=(),
+        telemetry_health=TELEMETRY_HEALTH_RECORD,
     )
 
 
@@ -677,6 +679,7 @@ def test_decision_can_be_embedded_in_v3_control_trace_with_shadow_output() -> No
         authority=AUTHORITY_RECORD,
         air_balance_coordination=COORDINATION_RECORD,
         tach_unconfirmed_zones=(),
+        telemetry_health=TELEMETRY_HEALTH_RECORD,
     )
 
     # v3 で Supervisor decision を追加した。以後の版（v4: #78 の fault code）でもそのまま載る。

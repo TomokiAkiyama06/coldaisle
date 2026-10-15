@@ -49,6 +49,7 @@ from coldaisle.ingest import (
 )
 from coldaisle.ingest.protocol import RawHello, RawMessage, RawSample, Source
 from coldaisle.ingest.serial_source import DEFAULT_BAUD
+from coldaisle.llm_exclusions import LlmExclusions, LlmExclusionsError
 from coldaisle.metrics import MetricCatalog
 from coldaisle.notify import Notification, NotifyConfig, Router, notifiers_from_env
 from coldaisle.rules import Engine, RuleSet, Transition, probe_mismatch
@@ -87,6 +88,7 @@ DEFAULT_RULES = Path("config/rules.yaml")
 DEFAULT_NOTIFY = Path("config/notify.yaml")
 DEFAULT_AI = Path("config/ai.yaml")
 DEFAULT_METRICS = Path("config/metrics.yaml")
+DEFAULT_REPORT_CONFIG = Path("config/report.yaml")
 DEFAULT_REPLAY_TIMEZONE = "Asia/Tokyo"
 """manifest の無い CSV を再生するときの既定の timezone（従来の `--timezone` の既定。0010 §2.7）。
 
@@ -162,6 +164,7 @@ class Daemon:
         engine: Engine | None = None,
         notifier: Router | None = None,
         explainer_factory: Callable[[], Explainer] | None = None,
+        llm_exclusions: LlmExclusions | None = None,
         tick_s: float = 1.0,
         calibration_gate: IngestCalibrationGate | None = None,
     ) -> None:
@@ -172,7 +175,10 @@ class Daemon:
         self._dataset_run_alias = dataset_run_alias
         self._engine = engine
         self._notifier = notifier
-        self._explainer_factory = explainer_factory
+        # **一覧が無ければ説明を求めない**（決定記録 0131 §2.4a。どの発火を LLM へ渡して
+        # よいか分からないため）。素のアラートは今までどおり届く
+        self._explainer_factory = explainer_factory if llm_exclusions is not None else None
+        self._llm_exclusions = llm_exclusions
         self._explain_queue: queue.Queue[int | None] = queue.Queue(maxsize=32)
         self._explain_thread: threading.Thread | None = None
         self._tick_s = tick_s
@@ -537,8 +543,21 @@ class Daemon:
             if not sent:
                 continue
             self.stats.notifications += 1
-            if transition.state == "firing":
+            if transition.state == "firing" and self._may_explain(transition):
                 self._request_explanation(transition)
+
+    def _may_explain(self, transition: Transition) -> bool:
+        """LLM に説明を求めてよい発火か（決定記録 0131 §2.4a）。
+
+        除外の一覧の rule_id（とそのメトリクスを指すアラート）は**通知だけを送る**。
+        説明を求めると、rule_id・閾値・detail・直近の統計が LLM に渡る。
+        """
+        exclusions = self._llm_exclusions
+        if exclusions is None or self._engine is None:
+            return False
+        return not exclusions.excludes_alert(
+            transition.rule_id, transition.metric, self._engine.catalog
+        )
 
     def _handle(self, received_ms: int, message: RawMessage) -> None:
         try:
@@ -756,6 +775,11 @@ class Config:
     notify: Path = DEFAULT_NOTIFY
     ai: Path = DEFAULT_AI
     metrics: Path = DEFAULT_METRICS
+    report_config: Path = DEFAULT_REPORT_CONFIG
+    """LLM へ渡さない一覧（`llm_excluded_*`）を読む設定。
+
+    日次レポートと同じ1か所（決定記録 0131 §2.4a）。
+    """
     tick_s: float = 1.0
     """サンプルが来ないときに時刻ベースのルールを評価する間隔。"""
 
@@ -771,6 +795,7 @@ def build(config: Config) -> Daemon:
     source = _build_source(config)
     rules = QualityRules.from_yaml(config.quality_rules)
     calibration, calibration_sha256 = _calibration_for(config)
+    exclusions = _llm_exclusions(config.report_config)
     config.db.parent.mkdir(parents=True, exist_ok=True)
     clock: Clock = source.clock
     store = SqliteStore(config.db, rules=rules, clock=clock)
@@ -801,7 +826,8 @@ def build(config: Config) -> Daemon:
             store=store,
             clock=clock,
         ),
-        explainer_factory=_explainer_factory(config, rules, clock),
+        explainer_factory=_explainer_factory(config, rules, clock, exclusions),
+        llm_exclusions=exclusions,
         notifier=Router(
             config=NotifyConfig.from_yaml(config.notify),
             notifiers=notifiers_from_env(),
@@ -812,8 +838,20 @@ def build(config: Config) -> Daemon:
     )
 
 
+def _llm_exclusions(path: Path) -> LlmExclusions | None:
+    """LLM へ渡さない一覧。**読めなければアラートの説明を求めない**（決定記録 0131 §2.4a）。"""
+    try:
+        return LlmExclusions.from_yaml(path)
+    except LlmExclusionsError as error:
+        LOGGER.error(
+            "LLM へ渡さない一覧が不正なので、アラートの説明を求めない（素のアラートだけを送る）",
+            extra={logs.FIELDS_KEY: {"config": str(path), "reason": str(error)}},
+        )
+        return None
+
+
 def _explainer_factory(
-    config: Config, quality_rules: QualityRules, clock: Clock
+    config: Config, quality_rules: QualityRules, clock: Clock, exclusions: LlmExclusions | None
 ) -> Callable[[], Explainer] | None:
     """説明器を作る関数を返す。**呼ばれるのは説明スレッドの中。**
 
@@ -821,7 +859,7 @@ def _explainer_factory(
     接続を開くのは使う側のスレッドに任せる。
     """
     settings = AiSettings.from_yaml(config.ai)
-    if not settings.explain_alerts:
+    if not settings.explain_alerts or exclusions is None:
         return None
     catalog = MetricCatalog.from_yaml(config.metrics)
     rule_set = RuleSet.from_yaml(config.rules)
@@ -830,7 +868,10 @@ def _explainer_factory(
         store = SqliteStore(config.db, rules=quality_rules, clock=clock)
         return Explainer(
             provider=provider_from_env(settings),
-            tools=ToolRegistry(store=store, catalog=catalog, rules=rule_set, clock=clock),
+            # 説明の Evidence（get_latest / get_stats）もツールを通る。除外を当てる（0131 §2.4a）
+            tools=ToolRegistry(
+                store=store, catalog=catalog, rules=rule_set, clock=clock, exclusions=exclusions
+            ),
         )
 
     return build
@@ -916,6 +957,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--ai", type=Path, default=DEFAULT_AI)
     parser.add_argument("--metrics", type=Path, default=DEFAULT_METRICS)
     parser.add_argument(
+        "--report-config",
+        type=Path,
+        default=DEFAULT_REPORT_CONFIG,
+        help="LLM へ渡さない一覧（llm_excluded_*）を読む設定（決定記録 0131）",
+    )
+    parser.add_argument(
         "--csv", type=Path, default=None, help="replay の入力（ファイル/ディレクトリ）"
     )
     parser.add_argument(
@@ -954,6 +1001,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             notify=args.notify,
             ai=args.ai,
             metrics=args.metrics,
+            report_config=args.report_config,
             csv=args.csv,
             dataset_run_alias=args.dataset_run_alias,
             bulk=args.bulk,

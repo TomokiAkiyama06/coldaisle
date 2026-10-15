@@ -124,6 +124,7 @@ from coldaisle.control.schema import (
     ShadowRecord,
     SupervisorDecision,
     SupervisorOutput,
+    TelemetryHealthRecord,
     Zone,
     ZoneRecord,
     ZoneRequest,
@@ -940,6 +941,9 @@ class ControlLoop:
             tach_unconfirmed_zones=tuple(
                 sorted(safety_decision.tach_unconfirmed_zones, key=lambda zone: zone.value)
             ),
+            # **健全度と Guard が実際に選んだ閾値の組を毎 tick 残す**（v15。#308 / 決定記録 0137）。
+            # どちらもこの tick の snapshot と Guard の判断から写すだけで、制御へは戻らない。
+            telemetry_health=self._telemetry_health_record(snapshot, guard_decision),
         )
         recorded, trace_failed = self._record(tick)
         # **journal の書き残しと変化の検知は heartbeat と trace の保存の後**（0072 §2.6 /
@@ -1233,6 +1237,22 @@ class ControlLoop:
             return decision.zones
         empty = GuardZoneOutput()
         return PerZone[GuardZoneOutput](front=empty, rear=empty, top=empty)
+
+    @staticmethod
+    def _telemetry_health_record(
+        snapshot: ControlStateSnapshot, guard: ReactiveGuardDecision | None
+    ) -> TelemetryHealthRecord:
+        """この tick の健全度と Guard の閾値の組（決定記録 0137 §2.1）。
+
+        Guard が例外で判断を返さなかった tick だけ閾値の組を None にする（その tick の faults に
+        ``guard_exception`` が載る）。snapshot は組み立てに失敗した tick でも作り直してあるので、
+        健全度はいつも書ける。
+        """
+        return TelemetryHealthRecord(
+            health=snapshot.telemetry_health,
+            degraded_inputs=snapshot.degraded_inputs,
+            guard_threshold_profile=None if guard is None else guard.threshold_profile,
+        )
 
     @staticmethod
     def _log_guard_events(decision: ReactiveGuardDecision | None) -> None:

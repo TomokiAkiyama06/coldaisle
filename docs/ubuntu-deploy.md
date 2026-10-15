@@ -303,6 +303,13 @@ nvidia-smi --query-gpu=temperature.gpu,fan.speed --format=csv
   （`journalctl -u coldaisle-gpu-fan` に `gpu_fan_device_not_unique`）。device が 0 個なら終了コード 1 で、2 s 後に起動し直して
   また待ちます（driver の読み込みが遅いとき）。2 個以上なら終了コード 2 で止まり、再起動しません
 - 回転は `coldaisle-telemetry` が `gpu.0.fan_speed` として集めます。fand・telemetry とは依存しません
+- サービスが Fan を握っていないことは、`coldaisle-telemetry` が集める制御方式（`gpu.0.fan_policy`。手動なら 1）と
+  回転から、取り込みのルールエンジンが warning で知らせます（`GPU_FAN_NOT_MANUAL` / `GPU_FAN_BELOW_CURVE`。
+  決定記録 0131 / 0140。閾値は `config/rules.yaml`。`GPU_FAN_BELOW_CURVE` は 80 °C 以上で 70 % 未満）。日次レポートの「日の終わりに続いているアラート」にも毎日出ます。
+  監視系は systemd も journal も読まないので、理由は `systemctl status coldaisle-gpu-fan` と
+  `journalctl -u coldaisle-gpu-fan`（`gpu_fan_model_mismatch` など）で確かめます。
+  導入したら、`coldaisle` ユーザーで `gpu.0.fan_policy` が `ok` で記録されること（missing なら判定されない）と、
+  `systemctl stop coldaisle-gpu-fan` の数十秒後に warning が届き `start` で解除されることを確かめます（0131 §2.6。所有者の承認の後）
 - 曲線を変えるときは、決定記録と所有者の承認を経て unit の `--curve` を変えます
 
 ## 5. Mac からのデータ移行
@@ -540,21 +547,29 @@ hwmon には `/dev` のノードが無いので、udev の `GROUP=` / `MODE=` �
    done
    ```
 
-4. 確かめます。所有者・グループ・mode を一覧し、**unit と同じ主グループ・補助グループで**書き込み権を
+4. 確かめます。所有者・グループ・mode を一覧し、**unit と同じ主グループ・補助グループで**実際に書けることを
    見ます。fand が `coldaisle` グループを得るのは unit の `SupplementaryGroups=` からなので、
-   `sudo -u coldaisle-fan test -w` では確かめられません（アカウントのグループ一覧で動くため、
-   実際の fand は書けるのに確かめだけが落ちます）。一時的な unit で同じグループを渡します
+   `sudo -u coldaisle-fan` では確かめられません（アカウントのグループ一覧で動くため、
+   実際の fand は書けるのに確かめだけが落ちます）。一時的な unit で同じグループを渡します。
+   判定は `test -w` ではなく実際に開く操作で行います（決定記録 0134 §2.4。`test` の答えは実装で変わり、
+   補助グループで書けるファイルを外部コマンドの `test -w` が「書けない」と報告した例があります）。
+   ファイルは `: >>`（追記で開くだけで中身は変わりません）、ディレクトリは目印のファイルを作って消すことで見ます
 
    ```bash
-   for f in /var/lib/coldaisle /var/lib/coldaisle/coldaisle.db \
-            /var/lib/coldaisle/coldaisle.db-wal /var/lib/coldaisle/coldaisle.db-shm \
-            /var/lib/coldaisle/coldaisle.db-journal; do
+   d=/var/lib/coldaisle
+   sudo stat -c '%A %U:%G %n' "$d"
+   sudo systemd-run --pipe --wait --quiet \
+        -p User=coldaisle-fan -p Group=coldaisle-fan \
+        -p "SupplementaryGroups=coldaisle coldaisle-admin coldaisle-authority" \
+        sh -c 'touch -- "$1/.probe-fand" && rm -- "$1/.probe-fand"' _ "$d" || echo "書けない: $d"
+   for f in "$d"/coldaisle.db "$d"/coldaisle.db-wal "$d"/coldaisle.db-shm "$d"/coldaisle.db-journal; do
+     # 無いファイルを : >> で開くと作ってしまうので、在るものだけを見る（unit は手順 1 で止めてある）
      sudo test -e "$f" || continue
      sudo stat -c '%A %U:%G %n' "$f"
      sudo systemd-run --pipe --wait --quiet \
           -p User=coldaisle-fan -p Group=coldaisle-fan \
           -p "SupplementaryGroups=coldaisle coldaisle-admin coldaisle-authority" \
-          test -w "$f" || echo "書けない: $f"
+          sh -c ': >> "$1"' _ "$f" || echo "書けない: $f"
    done
    ```
 
@@ -671,13 +686,20 @@ CLI の書いた journal を読むと、走行中なら `SHADOW` へ下がり、
    `-rw-rw----`（`0660`）・グループ `coldaisle-authority` であること。6.4 の手順 4 と同じく、
    unit と同じグループを渡した一時的な unit で fand から書けることも確かめます
 
+   （判定は 6.4 の手順 4 と同じく、`test -w` ではなく実際に開く操作で行います。決定記録 0134 §2.4）
+
    ```bash
-   for f in "$new" "$new"/authority.json "$new"/.authority.lock; do
+   sudo systemd-run --pipe --wait --quiet \
+        -p User=coldaisle-fan -p Group=coldaisle-fan \
+        -p "SupplementaryGroups=coldaisle coldaisle-admin coldaisle-authority" \
+        sh -c 'touch -- "$1/.probe-fand" && rm -- "$1/.probe-fand"' _ "$new" || echo "書けない: $new"
+   for f in "$new"/authority.json "$new"/.authority.lock; do
+     # 無いファイルを : >> で開くと作ってしまうので、在るものだけを見る（fand は手順 1 で止めてある）
      sudo test -e "$f" || continue
      sudo systemd-run --pipe --wait --quiet \
           -p User=coldaisle-fan -p Group=coldaisle-fan \
           -p "SupplementaryGroups=coldaisle coldaisle-admin coldaisle-authority" \
-          test -w "$f" || echo "書けない: $f"
+          sh -c ': >> "$1"' _ "$f" || echo "書けない: $f"
    done
    ```
 
@@ -874,14 +896,16 @@ CLI の書いた journal を読むと、走行中なら `SHADOW` へ下がり、
       グループ `coldaisle-registry`・ACL 付きであることを `getfacl` で見る。書き手が authority のディレクトリへ
       書けないこと（`touch /var/lib/coldaisle-authority/x` が失敗する）
    4. **fand と同じグループで**（6.4 の手順 4 と同じ `systemd-run`）: 制御設定と `registry.json` を読めて、
-      どちらにも書けないこと
+      どちらにも書けないこと。判定は `test -r` / `test -w` ではなく、`cat` で読めることと、`: >>`
+      （追記で開くだけで中身は変わらない）が**失敗する**ことで見ます（決定記録 0134 §2.4）
 
       ```bash
       for f in /etc/coldaisle/control-config/safety.yaml /var/lib/coldaisle-registry/registry.json; do
         sudo systemd-run --pipe --wait --quiet \
              -p User=coldaisle-fan -p Group=coldaisle-fan \
              -p "SupplementaryGroups=coldaisle coldaisle-admin coldaisle-authority" \
-             sh -c "test -r '$f' && ! test -w '$f'" || echo "期待と違う: $f"
+             sh -c 'cat -- "$1" > /dev/null && ! (: >> "$1") 2> /dev/null' _ "$f" \
+             || echo "期待と違う: $f"
       done
       ```
 
@@ -1011,20 +1035,25 @@ CLI の書いた journal を読むと、走行中なら `SHADOW` へ下がり、
 
    `group:coldaisle-learn-mpc` と `group:coldaisle-learn-rl` の行が手順 4 のとおりで、**`.registry.lock` に
    `group:coldaisle-learn-*` の行が無いこと**。unit と同じ資格で、読めて書けないことを確かめます
-   （6.4 の手順 4 と同じ `systemd-run`）
+   （6.4 の手順 4 と同じ `systemd-run`）。判定は `test -r` / `test -w` ではなく実際に開く操作で行います
+   （決定記録 0134 §2.4）。読めることは `cat`、書けないことは `: >>`（追記で開くだけで中身は変わらない）が
+   **失敗する**こと、読めないことは `cat` が**失敗する**ことで見ます。ファイルが無くても `cat` は失敗するので、
+   「読めない」の対象は先に在ることを確かめます
 
    ```bash
    for u in coldaisle-learn-mpc coldaisle-learn-rl; do
      for f in /etc/coldaisle/control-config/safety.yaml /etc/coldaisle/learned-channel.yaml \
               /var/lib/coldaisle-registry/registry.json; do
        sudo systemd-run --pipe --wait --quiet -p "User=$u" -p "Group=$u" \
-            sh -c "test -r '$f' && ! test -w '$f'" || echo "期待と違う: $u $f"
+            sh -c 'cat -- "$1" > /dev/null && ! (: >> "$1") 2> /dev/null' _ "$f" \
+            || echo "期待と違う: $u $f"
      done
      # 読めないこと（どれも権限の error になる）
      for f in /etc/coldaisle/coldaisle.env /etc/coldaisle/control-admin.yaml /var/lib/coldaisle/coldaisle.db \
               /var/lib/coldaisle-authority/authority.json /var/lib/coldaisle-registry/.registry.lock; do
+       sudo test -e "$f" || { echo "無い（確かめられない）: $f"; continue; }
        sudo systemd-run --pipe --wait --quiet -p "User=$u" -p "Group=$u" \
-            sh -c "! test -r '$f'" || echo "期待と違う: $u $f"
+            sh -c '! cat -- "$1" > /dev/null 2>&1' _ "$f" || echo "期待と違う: $u $f"
      done
    done
    ```

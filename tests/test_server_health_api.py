@@ -29,6 +29,7 @@ from coldaisle.internal_telemetry import (
     NvmlAdapter,
     NvmlConfig,
 )
+from coldaisle.llm_exclusions import LlmExclusions
 from coldaisle.metrics import MetricCatalog
 from coldaisle.store import AlertSeverity, Quality, Reading, Sample, SqliteStore
 from conftest import CONFIG_DIR, QUALITY_RULES_PATH
@@ -161,6 +162,7 @@ def _app(
     hwmon_metrics=("cpu.package",),
     nvml_metrics=NVML_METRICS,
     cpu_power_metrics=(),
+    llm_exclusions=None,
 ):
     return create_app(
         Config(
@@ -175,6 +177,7 @@ def _app(
         health_hwmon_metrics=hwmon_metrics,
         health_nvml_metrics=nvml_metrics,
         health_cpu_power_metrics=cpu_power_metrics,
+        llm_exclusions=llm_exclusions or LlmExclusions.from_yaml(CONFIG_DIR / "report.yaml"),
     )
 
 
@@ -812,6 +815,10 @@ class UnsupportedTemperaturesNvml:
     def fan_speed_pct(self, handle: object) -> float | None:
         return 30.0
 
+    # 制御方式の読み取りは導入先で未確認（決定記録 0131 §2.6）。ここでは手動として返す
+    def fan_policy_manual(self, handle: object) -> float | None:
+        return 1.0
+
 
 def _store_collector_cycle(path: Path, rules, api) -> None:
     """telemetry daemon と同じ経路（collector → insert_sample → source state）で保存する。"""
@@ -921,7 +928,7 @@ def test_server_health_settings_reject_tolerating_a_required_metric(tmp_path):
 def test_repository_server_health_settings_load():
     catalog = MetricCatalog.from_yaml(CONFIG_DIR / "metrics.yaml")
     settings = ServerHealthSettings.from_yaml(CONFIG_DIR / "server-health.yaml", catalog=catalog)
-    assert settings.missing_tolerated == {"gpu.0.hotspot", "gpu.0.mem"}
+    assert settings.missing_tolerated == {"gpu.0.hotspot", "gpu.0.mem", "gpu.0.fan_policy"}
 
 
 def test_stale_row_of_a_removed_input_does_not_degrade_the_signal(tmp_path, rules):

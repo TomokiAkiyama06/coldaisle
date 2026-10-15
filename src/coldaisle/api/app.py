@@ -84,6 +84,7 @@ from coldaisle.internal_telemetry import (
     NvmlAdapter,
     ProcStatAdapter,
 )
+from coldaisle.llm_exclusions import LlmExclusions
 from coldaisle.metrics import MetricCatalog, compute_derived
 from coldaisle.store import (
     Aggregation,
@@ -270,7 +271,14 @@ def create_app(
     health_hwmon_metrics: tuple[str, ...] | None = None,
     health_nvml_metrics: tuple[str, ...] | None = None,
     health_cpu_power_metrics: tuple[str, ...] | None = None,
+    llm_exclusions: LlmExclusions | None = None,
 ) -> FastAPI:
+    """API を作る。
+
+    ``llm_exclusions`` は Server Health の AI 要約へ渡す集合から除く一覧（決定記録 0131
+    §2.4a）。無ければ要約を求めない。AI ツールの窓口（``tools``）は合成の起点が
+    一覧を当てた実体を渡す。
+    """
     settings = config or Config.from_env()
     catalog = MetricCatalog.from_yaml(settings.metrics)
     health_settings = ServerHealthSettings.from_yaml(settings.server_health, catalog=catalog)
@@ -352,6 +360,7 @@ def create_app(
             hwmon_metrics=health_hwmon_metrics,
             nvml_metrics=health_nvml_metrics,
             cpu_power_metrics=health_cpu_power_metrics,
+            llm_exclusions=llm_exclusions,
         )
 
     @app.get("/api/v1/latest", response_model=LatestResponse, response_model_by_alias=True)

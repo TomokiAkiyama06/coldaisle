@@ -17,6 +17,7 @@ import pytest
 from coldaisle import logs
 from coldaisle.clock import SimulatedClock
 from coldaisle.notify import Notification, NotifyConfig, Router, StdoutNotifier
+from coldaisle.notify.models import DASHBOARD_URL_ENV
 from coldaisle.notify.notifiers import (
     LINE_TO_ENV,
     LINE_TOKEN_ENV,
@@ -413,6 +414,76 @@ def test_invalid_timezone_fails_at_load(tmp_path):
     path.write_text(text, encoding="utf-8")
     with pytest.raises(ValueError, match="タイムゾーン"):
         NotifyConfig.from_yaml(path)
+
+
+# ---------------------------------------------------------------- ダッシュボードの場所（#307）
+
+EXAMPLE_DASHBOARD = "https://dashboard.example.invalid/"
+
+
+def test_dashboard_url_env_overrides_yaml():
+    """導入先のアドレスは環境変数で与える。public なリポジトリの config に書けない（ルール 10）。"""
+    config = NotifyConfig.from_yaml(NOTIFY_PATH, environ={DASHBOARD_URL_ENV: EXAMPLE_DASHBOARD})
+    assert config.dashboard_url == EXAMPLE_DASHBOARD
+    assert notification(dashboard_url=config.dashboard_url).as_text().endswith(EXAMPLE_DASHBOARD)
+
+
+def test_dashboard_url_without_env_keeps_yaml():
+    assert NotifyConfig.from_yaml(NOTIFY_PATH, environ={}).dashboard_url == "http://127.0.0.1:8000/"
+
+
+def test_dashboard_url_empty_env_is_unset():
+    """`.env.example` を写したままの空の行で既定を潰さない。"""
+    config = NotifyConfig.from_yaml(NOTIFY_PATH, environ={DASHBOARD_URL_ENV: ""})
+    assert config.dashboard_url == "http://127.0.0.1:8000/"
+
+
+def test_dashboard_url_reads_process_environment(monkeypatch):
+    """`environ` を省くとプロセスの環境変数を読む（daemon / report / escalate の起動時）。"""
+    monkeypatch.setenv(DASHBOARD_URL_ENV, "http://192.0.2.10:8000/")
+    assert NotifyConfig.from_yaml(NOTIFY_PATH).dashboard_url == "http://192.0.2.10:8000/"
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "dashboard.example.invalid",  # scheme が無い
+        "/airflow.html",  # 相対
+        "ftp://dashboard.example.invalid/",
+        "javascript:alert(1)",
+        "http://",  # ホストが無い
+        "https:///path",
+        "http://dashboard.example.invalid:port/",  # ポートが数字でない
+        " https://dashboard.example.invalid/",
+        "https://dashboard.example.invalid/ x",
+        " ",
+    ],
+)
+def test_dashboard_url_env_rejects_malformed(value):
+    """壊れたリンクを最初の通知で知ることにしない。起動時に落とす。"""
+    with pytest.raises(ValueError, match=DASHBOARD_URL_ENV) as raised:
+        NotifyConfig.from_yaml(NOTIFY_PATH, environ={DASHBOARD_URL_ENV: value})
+    if value.strip():
+        # 導入先のアドレスをログに残さない
+        assert value.strip() not in str(raised.value)
+        assert raised.value.__cause__ is None
+
+
+def test_dashboard_url_in_yaml_is_checked(tmp_path):
+    text = (
+        Path(NOTIFY_PATH)
+        .read_text(encoding="utf-8")
+        .replace('dashboard_url: "http://127.0.0.1:8000/"', 'dashboard_url: "127.0.0.1:8000"')
+    )
+    path = tmp_path / "notify.yaml"
+    path.write_text(text, encoding="utf-8")
+    with pytest.raises(ValueError, match="dashboard_url"):
+        NotifyConfig.from_yaml(path, environ={})
+    # 環境変数で上書きするなら config の値は使わないので問わない
+    assert (
+        NotifyConfig.from_yaml(path, environ={DASHBOARD_URL_ENV: EXAMPLE_DASHBOARD}).dashboard_url
+        == EXAMPLE_DASHBOARD
+    )
 
 
 # ---------------------------------------------------------------- 説明の後追い（#38）

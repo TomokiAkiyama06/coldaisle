@@ -207,7 +207,7 @@ def round_trip(tick: ControlTick) -> ControlTick:
 def test_off_records_off_and_copies_the_unconfirmed_tach(catalog: MetricCatalog) -> None:
     harness = Harness(catalog, config=coordination_config("off"))
     first = harness.tick().tick
-    assert first.schema_version == 14
+    assert first.schema_version == 15
     assert record_of(first) == AirBalanceCoordinationRecord.off()
     # 引き継ぎ直後の STARTUP は tach の応答をまだ見ていない（timer が動いている）。
     assert first.tach_unconfirmed_zones == (Zone.FRONT, Zone.REAR, Zone.TOP)

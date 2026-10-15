@@ -64,6 +64,7 @@ from test_control_config import valid_documents, write_documents
 from test_control_schema import (
     REGISTRY_PROVENANCE,
     SAFETY_PROVENANCE,
+    TELEMETRY_HEALTH_RECORD,
     fallback_state,
     passthrough,
     zones,
@@ -266,6 +267,7 @@ class Fixture:
             authority=AuthorityRecord(entry="static", config_ceiling=AuthorityStage.FULL),
             air_balance_coordination=AirBalanceCoordinationRecord.off(),
             tach_unconfirmed_zones=(),
+            telemetry_health=TELEMETRY_HEALTH_RECORD,
         )
 
 

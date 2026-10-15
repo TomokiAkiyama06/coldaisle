@@ -42,6 +42,31 @@ LINE は今は使っていません。`LineNotifier` のコードは残してあ
 
 `missing` が空にならない限り、その重大度は stdout（構造化ログ）にしか出ていません。
 
+### ダッシュボードのリンク
+
+通知の本文の最後の行はダッシュボードのリンクです。既定は `config/notify.yaml` の
+`dashboard_url`（`http://127.0.0.1:8000/`）で、**サーバー自身から見たアドレス**なので、
+Slack を Mac・スマホで開いて押しても開けません（#307）。
+
+- `COLDAISLE_DASHBOARD_URL`: 別の端末から開けるダッシュボードのアドレス。設定すると
+  `dashboard_url` を置き換えます。アラートの通知・日次レポート（`coldaisle-report`）・
+  故障疑いの案件（`coldaisle-escalate`）の通知が同じ値を使います
+
+導入先の実際のアドレスはリポジトリに書けない（public。AGENTS.md ルール 10）ため、
+導入先では `/etc/coldaisle/coldaisle.env` に置きます。例（仮の値）:
+
+```bash
+COLDAISLE_DASHBOARD_URL=https://dashboard.example.invalid/
+```
+
+- **空文字は未設定と同じ**に扱い、`config/notify.yaml` の値を使います（`.env.example` を
+  写したままの空の行で既定を潰さないため）
+- 値は起動時に検査します。`http` か `https` の絶対 URL で、ホストを含むこと。
+  scheme が無い・相対・ホストが無い・ポートが数字でない・空白を含む値は、起動時に
+  `COLDAISLE_DASHBOARD_URL: ...` で始まる `ValueError` で落ちます（壊れたリンクを最初の通知で
+  知ることにしないため）。エラーの文に値そのものは入れません
+- 環境変数が無いときは `config/notify.yaml` の `dashboard_url` を同じ規則で検査します
+
 ## 2. 試しに鳴らす（MockSource）
 
 `notify_check` シナリオは、critical（`RAPID_RISE`）と warning（`INTAKE_HIGH`）を
@@ -137,6 +162,8 @@ sudo bash -c 'set -a; . /etc/coldaisle/coldaisle.env; set +a; cd /opt/coldaisle 
 `/etc/coldaisle/coldaisle.env` を書き換えたら、`coldaisle-daemon` を再起動するまで反映されません
 （環境変数は起動時にだけ読みます）。再起動の後、`journalctl -u coldaisle-daemon` で
 起動時の `missing` の警告が消えたことを確かめます。
+`COLDAISLE_DASHBOARD_URL` も同じで、再起動するまで通知のリンクは変わりません
+（日次レポートは次に `coldaisle-report.service` が走ったときから）。
 
 ## 5. まだ決まっていないこと
 

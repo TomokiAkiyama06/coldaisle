@@ -16,6 +16,7 @@ import pytest
 from coldaisle.ai import ToolRegistry, as_data
 from coldaisle.ai.tools import DEFINITIONS, MAX_SERIES_POINTS
 from coldaisle.clock import SimulatedClock
+from coldaisle.llm_exclusions import LlmExclusions
 from coldaisle.metrics import MetricCatalog
 from coldaisle.rules import RuleSet
 from coldaisle.store import DeviceRecord, Quality, Reading, Sample, SensorRecord, SqliteStore
@@ -41,6 +42,7 @@ def tools(store) -> ToolRegistry:
         catalog=MetricCatalog.from_yaml(CONFIG_DIR / "metrics.yaml"),
         rules=RuleSet.from_yaml(CONFIG_DIR / "rules.yaml"),
         clock=store.clock,
+        exclusions=LlmExclusions.from_yaml(CONFIG_DIR / "report.yaml"),
     )
 
 
