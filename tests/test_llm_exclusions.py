@@ -27,7 +27,7 @@ from coldaisle.llm_exclusions import LlmExclusions, LlmExclusionsError
 from coldaisle.metrics import MetricCatalog
 from coldaisle.notify import Notification
 from coldaisle.report import MINUTES_PER_DAY, ReportConfig, build, run
-from coldaisle.rules import RuleSet, Transition
+from coldaisle.rules import Engine, RuleSet, Transition
 from coldaisle.store import (
     AlertRecord,
     AlertSeverity,
@@ -445,10 +445,17 @@ class _Notifier:
 def _daemon(tmp_path, rules, exclusions: LlmExclusions | None) -> tuple[Daemon, _Notifier, list]:
     clock = SimulatedClock(NOW_MS)
     notifier = _Notifier()
+    store = SqliteStore(tmp_path / "daemon.db", rules=rules, clock=clock)
     daemon = Daemon(
         source=None,  # type: ignore[arg-type]
-        store=SqliteStore(tmp_path / "daemon.db", rules=rules, clock=clock),
+        store=store,
         normalizer=Normalizer(rules=rules, calibration=Calibration(), clock=clock),
+        engine=Engine(
+            rules=RuleSet.from_yaml(CONFIG_DIR / "rules.yaml"),
+            catalog=MetricCatalog.from_yaml(CONFIG_DIR / "metrics.yaml"),
+            store=store,
+            clock=clock,
+        ),
         notifier=notifier,  # type: ignore[arg-type]
         explainer_factory=lambda: None,  # type: ignore[arg-type,return-value]
         llm_exclusions=exclusions,
@@ -586,3 +593,50 @@ def test_health_summary_is_not_requested_without_a_list(tmp_path, rules, monkeyp
     app = server.create_server()
     paths = {getattr(route, "path", "") for route in app.routes}
     assert "/api/v1/tools" not in paths
+
+
+# ---------------------------------------- 派生値を指すアラート（PR #315 の指摘）
+
+ROOM_ONLY = LlmExclusions(metric_patterns=("air.room",), rule_ids=frozenset())
+"""派生値 `d.intake_rise`（air.front_intake - air.room）の材料を除く一覧。"""
+
+
+def test_alert_on_a_derived_value_of_an_excluded_input_is_dropped_from_facts(store, catalog):
+    put_alert(store, "RECIRCULATION", fired_ms=DAY_START_MS + 60_000, metric="d.intake_rise")
+    put_alert(store, "INTAKE_HIGH", fired_ms=DAY_START_MS + 120_000, metric="air.gpu_intake")
+    report = daily(store, catalog, exclusions=ROOM_ONLY)
+    facts = report.facts_markdown()
+    assert "RECIRCULATION" not in facts
+    assert "発火 1 件" in facts
+    assert "RECIRCULATION" in report.as_markdown(), "本文は除く前のまま"
+
+
+def test_alert_on_a_derived_value_of_an_excluded_input_is_not_explained(tmp_path, rules):
+    daemon, notifier, asked = _daemon(tmp_path, rules, ROOM_ONLY)
+    try:
+        daemon._record(
+            [_firing("RECIRCULATION", "d.intake_rise"), _firing("INTAKE_HIGH", "air.gpu_intake")]
+        )
+        assert len(notifier.sent) == 2
+        assert asked == ["INTAKE_HIGH"]
+    finally:
+        daemon.store.close()
+
+
+def test_alert_on_a_derived_value_of_an_excluded_input_does_not_drive_the_ai_signal(
+    tmp_path, rules
+):
+    path = tmp_path / "health.db"
+    _populate(path, rules)
+    # d.gpu_internal_delta = gpu.0.hotspot - gpu.0.core。hotspot は監視必須ではないので、
+    # 情報源の状態は決め直せる（AI 用の signal はアラートの除外だけで変わる）
+    _fire(path, rules, "AIRFLOW_DEGRADED", "d.gpu_internal_delta")
+    summarizer = FakeSummarizer()
+    hotspot_only = LlmExclusions(metric_patterns=("gpu.0.hotspot",), rule_ids=frozenset())
+    with TestClient(
+        _app(path, SimulatedClock(HEALTH_NOW_MS), summarizer, llm_exclusions=hotspot_only)
+    ) as client:
+        body = client.get("/api/v1/server-health").json()
+    assert body["signal"] == "yellow"
+    assert body["summary_source"] == "template"
+    assert summarizer.facts == [], "AI 用の signal（green）と食い違うので要約を求めない"

@@ -260,7 +260,7 @@ def _ai_signal(
         return None
     if any(exclusions.excludes_metric(metric) for metric in source_metrics):
         return None
-    excluded = exclusions.excluded_metrics((*catalog.metrics, *readings))
+    excluded = exclusions.excluded_metrics((*catalog.metrics, *readings), catalog)
     firing = store.alert_severity_counts(
         state="firing", exclude_rule_ids=exclusions.rule_ids, exclude_metrics=excluded
     )

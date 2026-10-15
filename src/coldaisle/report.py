@@ -320,7 +320,7 @@ def build(
     human = _view(store, day, tz, lines, window, max_alerts=max_alerts)
     if exclusions is None:
         return human
-    excluded = exclusions.excluded_metrics((*names, *catalog.derived))
+    excluded = exclusions.excluded_metrics(names, catalog)
     llm = _view(
         store,
         day,

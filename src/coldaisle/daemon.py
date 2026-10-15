@@ -553,9 +553,11 @@ class Daemon:
         説明を求めると、rule_id・閾値・detail・直近の統計が LLM に渡る。
         """
         exclusions = self._llm_exclusions
-        if exclusions is None:
+        if exclusions is None or self._engine is None:
             return False
-        return not exclusions.excludes_alert(transition.rule_id, transition.metric)
+        return not exclusions.excludes_alert(
+            transition.rule_id, transition.metric, self._engine.catalog
+        )
 
     def _handle(self, received_ms: int, message: RawMessage) -> None:
         try:

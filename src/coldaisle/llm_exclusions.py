@@ -94,13 +94,23 @@ class LlmExclusions:
     def excludes_rule(self, rule_id: str) -> bool:
         return rule_id in self.rule_ids
 
-    def excludes_alert(self, rule_id: str, metric: str | None) -> bool:
-        """アラートを LLM へ渡さないか。**指しているメトリクスが除外でも除く**（名前が漏れる）。"""
-        return self.excludes_rule(rule_id) or (metric is not None and self.excludes_metric(metric))
+    def excludes_alert(self, rule_id: str, metric: str | None, catalog: MetricCatalog) -> bool:
+        """アラートを LLM へ渡さないか。**指しているメトリクスが除外でも除く**（名前が漏れる）。
 
-    def excluded_metrics(self, candidates: Iterable[str]) -> frozenset[str]:
-        """候補のうち除くものの集合。SQL の `NOT IN` に渡す具体的な名前を作るのに使う。"""
-        return frozenset(name for name in candidates if self.excludes_metric(name))
+        派生値を指すアラートは、材料が除外でも除く（`excludes_metric_or_inputs`）。
+        """
+        return self.excludes_rule(rule_id) or (
+            metric is not None and self.excludes_metric_or_inputs(metric, catalog)
+        )
+
+    def excluded_metrics(self, candidates: Iterable[str], catalog: MetricCatalog) -> frozenset[str]:
+        """候補（と `catalog` の派生値）のうち除くものの集合。SQL の `NOT IN` に渡す名前を作る。
+
+        **派生値は材料が除外でも含める。** 含めないと、除外したメトリクスから作った派生値を
+        指すアラートが LLM へ渡り、件数や signal から存在が分かる。
+        """
+        names = {*candidates, *catalog.derived}
+        return frozenset(name for name in names if self.excludes_metric_or_inputs(name, catalog))
 
 
 def _string_list(loaded: dict[Any, Any], key: str) -> list[str]:
