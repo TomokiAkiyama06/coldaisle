@@ -1014,7 +1014,8 @@ Registry と制御設定への書き込み、root。artifact の本体は `raise
       確認を行うのが C2 です。
       どちらの場合も承認の期限内であることと、承認の `to_stage` が `fan-policy.yaml` の上限以下であることが要ります
       （それより前の検査で拒まれるため）
-   6. **隔離した interpreter が import に使う場所のすべてに、承認者が書けないこと**（0134 §2.4 の 1。C1）。
+   6. **隔離した interpreter が import に使う場所のすべてに、承認者が書けないこと**（0134 §2.4 の 1。走査の範囲と外の場所の扱いは決定記録 [`0141`](decisions/0141-c1-import-scan-scope.md)。C1）。
+      **0141 は Proposed です。FINAL になるまで、この 6 で C1 を通したとはしません**（0134 の文面のままでは、システムの Python の導入で通らないため）。
       `coldaisle-authority` だけのアカウントで行います。`-I` は site の処理を止めず、site-packages の `.pth`
       （`import` で始まる行は実行される。editable の導入の `.pth` は `src` を `sys.path` に足す）は `-I` でも
       効くので、`.venv/bin`・`config`・`src` だけを見るのでは足りません。**隔離した interpreter 自身が報告する
@@ -1097,7 +1098,7 @@ Registry と制御設定への書き込み、root。artifact の本体は `raise
         `/opt/coldaisle-python`）以外の場所も出ることがあります（Ubuntu のシステムの Python では、標準ライブラリの
         `sitecustomize.py` が `/etc/python3.12/` の下への symlink です）。そうした場所も `roots.txt` の項なので、
         下のすべてと祖先が上の「書ける」の検査に掛かっています。**出たこと自体では失敗にしません**が、どの場所が
-        出たかを結果に残し、その場所が root の所有であることを `stat -c '%A %U:%G %n'` でも見ます
+        出たかを結果に残し、その場所が root の所有であることを `stat -c '%A %U:%G %n'` でも見ます（0141 §2.2）
         （承認者の書ける場所なら、上の検査で「書ける」が出て失敗になります）
       - **解決できない symlink は、理由を問わず失敗にします（安全側）。** 切れた symlink や途中のディレクトリが
         無い symlink の先は、いまは検査できず、後で承認者がその場所を作れれば書き換え可能なコードが読まれえます。

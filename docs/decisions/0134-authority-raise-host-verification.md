@@ -5,6 +5,7 @@
 - **Date**: 2026-10-14
 - **Supersedes**: なし（[0104](0104-authority-raise-least-privilege.md) / [0105](0105-registry-shared-root-settled-points.md) の
   権限の形・グループ・mode・setgid は**変えない**。0104 §2.9 の確認の手順に足すだけ）
+- **Superseded by**: §2.4 の「1 の確かめ方」のうち走査の範囲（`sys.base_prefix` の下をすべて辿る）と「`roots.txt` に `/opt/coldaisle` と interpreter の置き場所以外が出たら C1 は失敗」は [`0141`](0141-c1-import-scan-scope.md)（Proposed。FINAL になるまでは本記録のまま）
 - **関連**: [0104](0104-authority-raise-least-privilege.md) §2.1〜§2.10 /
   [0105](0105-registry-shared-root-settled-points.md) /
   [0086](0086-authority-approver-uid.md) §2.1〜§2.4・§3・§5 の 1 /
