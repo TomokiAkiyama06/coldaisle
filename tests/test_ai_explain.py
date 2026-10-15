@@ -519,11 +519,36 @@ def test_assessment_with_the_opposite_sign_is_discarded(loaded_store, assessment
 
 
 def test_signed_numbers_in_the_facts_are_matched_with_their_sign():
-    facts = "傾き -0.500 /分 / 平均 450.00"
-    assert Explainer._invented_numbers("傾きは -0.5 です。", facts) == []
-    assert Explainer._invented_numbers("傾きは 0.5 です。", facts) == ["0.5"]
-    assert Explainer._invented_numbers("傾きは +0.5 です。", facts) == ["+0.5"]
-    assert Explainer._invented_numbers("電力は +450 です。", facts) == []
+    values = frozenset({-0.5, 450.0})
+    assert Explainer._invented_numbers("傾きは -0.5 です。", values) == []
+    assert Explainer._invented_numbers("傾きは 0.5 です。", values) == ["0.5"]
+    assert Explainer._invented_numbers("傾きは +0.5 です。", values) == ["+0.5"]
+    assert Explainer._invented_numbers("電力は +450 です。", values) == []
+
+
+@pytest.mark.parametrize(
+    "assessment",
+    [
+        "発火前 15 分で GPU使用率は 92 まで上がりました。",  # 窓の長さ（ラベル）
+        "直近 24 時間の平均より高い状態です。",  # 直近24h のラベル
+        "L3 の推測として GPU使用率が 92 です。",  # [L3] のラベル
+    ],
+)
+def test_numbers_only_in_labels_are_not_allowed(loaded_store, assessment):
+    """**ラベル・窓の長さにしか無い数字は測った値ではない。** 見立てに書けば捨てる。"""
+    answer = json.dumps(
+        {"unverified": ["x"], "checks": ["y"], "assessment": assessment}, ensure_ascii=False
+    )
+    assert _explainer(loaded_store, answer)[0].explain(alert()) is None
+
+
+def test_allowed_values_come_from_the_evidence_values(loaded_store):
+    """許す数値は証拠の値そのもの（集計値・閾値・件数）。"""
+    evidence = _explainer(loaded_store)[0].build_evidence(alert())
+    values = {value for item in evidence for value in item.values}
+    assert {92.0, 450.0, 6.2, 5.0, 480.0} <= values
+    assert 15.0 not in values
+    assert 24.0 not in values
 
 
 def test_material_window_ends_at_the_firing_time(tmp_path, rules):

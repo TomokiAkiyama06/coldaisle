@@ -108,6 +108,11 @@ class Evidence:
 
     level: str
     text: str
+    values: tuple[float, ...] = ()
+    """この行が示す**値そのもの**（表示した桁に丸めた集計値・現在値・閾値・件数）。
+
+    見立ての数値はここからだけ許す（0143 §2.11）。ラベル・メトリクス名・窓の長さの数字は含めない。
+    """
 
     def as_line(self) -> str:
         return f"✓ [{self.level}] {self.text}"
@@ -194,11 +199,14 @@ class Explainer:
                 Evidence(
                     "L2",
                     f"{target} = {alert.trigger_value:.2f}（閾値 {alert.threshold:.2f}）",
+                    (round(alert.trigger_value, 2), round(alert.threshold, 2)),
                 )
             )
         if alert.fired_ms is not None:
             held_s = (alert.fired_ms - alert.started_ms) / 1000
-            lines.append(Evidence("L2", f"条件が {held_s:.0f} 秒継続して発火"))
+            lines.append(
+                Evidence("L2", f"条件が {held_s:.0f} 秒継続して発火", (float(round(held_s)),))
+            )
         if alert.detail:
             lines.append(Evidence("L2", f"詳細: {as_data(alert.detail)}"))
         return lines
@@ -214,7 +222,13 @@ class Explainer:
         )
         if bad:
             return [Evidence("L1", f"品質が ok でないメトリクス: {', '.join(bad)}")]
-        return [Evidence("L1", f"全 {len(metrics)} メトリクスの品質が ok（センサー異常ではない）")]
+        return [
+            Evidence(
+                "L1",
+                f"全 {len(metrics)} メトリクスの品質が ok（センサー異常ではない）",
+                (float(len(metrics)),),
+            )
+        ]
 
     def _history_evidence(self, alert: AlertRecord) -> list[Evidence]:
         """直近24時間との比較（L1）。**平常時との差**を数字で置く。"""
@@ -228,12 +242,20 @@ class Explainer:
                 "L1",
                 f"{alert.metric} 直近24h: 平均 {stats['mean']:.2f} / 最大 {stats['max']:.2f}"
                 f" / p95 {stats['p95']:.2f}（{stats['sample_count']} 件）",
+                (
+                    round(stats["mean"], 2),
+                    round(stats["max"], 2),
+                    round(stats["p95"], 2),
+                    float(stats["sample_count"]),
+                ),
             )
         ]
         if stats.get("slope_per_min") is not None:
-            lines.append(Evidence("L1", f"直近24hの傾き {stats['slope_per_min']:.3f} /分"))
+            slope = stats["slope_per_min"]
+            lines.append(Evidence("L1", f"直近24hの傾き {slope:.3f} /分", (round(slope, 3),)))
         if stats.get("missing_ratio"):
-            lines.append(Evidence("L1", f"直近24hの欠測率 {stats['missing_ratio']:.1%}"))
+            ratio = stats["missing_ratio"]
+            lines.append(Evidence("L1", f"直近24hの欠測率 {ratio:.1%}", (round(ratio * 100, 1),)))
         return lines
 
     def _context_evidence(self, alert: AlertRecord) -> list[Evidence]:
@@ -266,13 +288,19 @@ class Explainer:
                 f"{metric} {span}: 平均 {stats['mean']:.2f} / 最大 {stats['max']:.2f}"
                 f"（{unit}、{stats['sample_count']} 件）"
             )
+            values = [
+                round(stats["mean"], 2),
+                round(stats["max"], 2),
+                float(stats["sample_count"]),
+            ]
             if stats.get("slope_per_min") is not None:
                 text += f" / 傾き {stats['slope_per_min']:.3f} /分"
+                values.append(round(stats["slope_per_min"], 3))
             meta = self.tools.catalog.metrics.get(metric)
             if meta is not None:
                 # 表示名を添える。「目標値」など値の意味は catalog が持つ（名前で分岐しない）
                 text += f"（{meta.label}）"
-            lines.append(Evidence("L1", text))
+            lines.append(Evidence("L1", text, tuple(values)))
         return lines
 
     # ------------------------------------------------------------------ L3
@@ -295,9 +323,13 @@ class Explainer:
         )
         if not result.available:
             return None
-        return self._parse(result.text, user)
+        # 見立てに許す数値は、証拠の**値そのもの**だけ（ラベル・名前・窓の長さの数字を許さない）
+        allowed = frozenset(value for item in verified for value in item.values)
+        return self._parse(result.text, allowed)
 
-    def _parse(self, text: str, facts: str = "") -> tuple[list[str], list[str], str] | None:
+    def _parse(
+        self, text: str, allowed: frozenset[float] = frozenset()
+    ) -> tuple[list[str], list[str], str] | None:
         """モデルの出力を読む。**約束を破っていたら丸ごと捨てる。**
 
         確度を書いてきた出力を「その行だけ消して使う」ことはしない。
@@ -319,7 +351,7 @@ class Explainer:
         assessment = self._clean_assessment(parsed.get("assessment"))
         if not unverified and not checks and not assessment:
             return None
-        if assessment and self._invented_numbers(assessment, facts):
+        if assessment and self._invented_numbers(assessment, allowed):
             # **事実に無い数値は、モデルが作った数値である**（日次レポートの所見と同じ）
             LOGGER.warning(
                 "AI の見立てに事実へ無い数値があったので捨てた",
@@ -349,12 +381,12 @@ class Explainer:
         return _WHITESPACE.sub(" ", value).strip()[:MAX_ASSESSMENT_CHARS]
 
     @staticmethod
-    def _invented_numbers(text: str, facts: str) -> list[str]:
-        """事実に現れない数値。`45.2` と `45.20` は同じ値とみなす（書式の差で捨てない）。
+    def _invented_numbers(text: str, allowed: frozenset[float]) -> list[str]:
+        """証拠の値に無い数値。`45.2` と `45.20` は同じ値とみなす（書式の差で捨てない）。
 
         **符号は含めて比べる**（`-0.5` と `0.5` は違う値）。`+0.5` は `0.5` と同じ。
+        許すのは `Evidence.values`（値そのもの）だけで、ラベルや窓の長さの数字は許さない。
         """
-        allowed = {_signed(token) for token in _NUMBER.findall(facts)}
         return [token for token in _NUMBER.findall(text) if _signed(token) not in allowed]
 
     @staticmethod
