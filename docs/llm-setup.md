@@ -131,6 +131,7 @@ Server Health の任意要約を Claude API で作れます。**既定では使�
 | `COLDAISLE_LLM_PROVIDER` | `anthropic`（未設定・空・`openai_compatible` なら今のまま） |
 | `ANTHROPIC_API_KEY` | Claude API の鍵。`/etc/coldaisle/coldaisle.env` にだけ書く |
 | `ANTHROPIC_MODEL` | モデル ID。**推奨は `claude-haiku-5-5`**。所見の質が足りなければ `claude-sonnet-5-5` |
+| `ANTHROPIC_WORKSPACE_ID` | 任意。ワークスペースに属さない鍵で、API が `anthropic-workspace-id` ヘッダを求めて 400 を返すときだけ書く（`anthropic-workspace-id` ヘッダで送る）。空白を含むと Claude API を使わない。空なら送らない |
 
 - **送るのは今のローカル LLM に渡すのと同じ集計値だけです**（日次レポートの表・アラートの Evidence の行・
   Server Health の固定の文）。生の時系列・decision trace・ツールの結果・案件資料（`coldaisle-escalate`）は送りません
@@ -160,7 +161,12 @@ Server Health の任意要約を Claude API で作れます。**既定では使�
    sudoedit /etc/coldaisle/coldaisle.env
    # COLDAISLE_LLM_PROVIDER=anthropic
    # ANTHROPIC_MODEL=claude-haiku-5-5
+   # ANTHROPIC_WORKSPACE_ID=<Console のワークスペースの ID>   # 鍵がワークスペースに属さないときだけ
    ```
+
+   鍵がワークスペースに属さないと、API は「`anthropic-workspace-id` ヘッダが要る」と 400 を返します
+   （journal の `reason` は `HTTP 400: invalid_request_error`）。そのときは鍵を作り直すか、
+   `ANTHROPIC_WORKSPACE_ID` に Console のワークスペースの ID を書きます（値はログに出ません）
 
 4. 環境変数は起動時に読むので、常駐する 2 つを再起動する（`coldaisle-report` は次のタイマーの起動から効く）
 
@@ -184,5 +190,5 @@ Server Health の任意要約を Claude API で作れます。**既定では使�
 1. vLLM を動かし、上の「動作確認」を通す
 2. `/etc/coldaisle/coldaisle.env` から `COLDAISLE_LLM_PROVIDER` を消し（または `openai_compatible`）、
    `OPENAI_BASE_URL` / `MODEL_NAME` を書く
-3. `ANTHROPIC_API_KEY` を消し、Console で鍵を無効にする
+3. `ANTHROPIC_API_KEY`（と `ANTHROPIC_WORKSPACE_ID`）を消し、Console で鍵を無効にする
 4. `sudo systemctl restart coldaisle-daemon coldaisle-api`

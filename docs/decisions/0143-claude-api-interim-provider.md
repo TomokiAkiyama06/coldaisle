@@ -97,6 +97,11 @@ Provider は呼び出し側が組み立てた `ChatMessage` の列をそのま�
   失敗の理由は「HTTP の状態コード」「応答の `error.type`」「例外の型の名前」だけにし、
   httpx の例外の文（URL やヘッダを含みうる）も応答の本文の `message` も載せない（#305 の `DeliveryError` と同じ考え方）
 - `ChatResult.reason` は API の応答（`available: false` のとき UI に出る）にも載るため、ここも同じ規則で作る
+- **任意の環境変数 `ANTHROPIC_WORKSPACE_ID`。** ワークスペースに属さない鍵では API が `anthropic-workspace-id`
+  ヘッダを求め、無ければ 400 を返す（導入先の疎通で確認。所有者は鍵を作り直さず ID を足すと判断した）。
+  値があればそのヘッダで送る。空文字は未設定と同じ（送らない）。値の形は起動時（Provider を作るとき）に検査し、
+  空白を含めば Claude API を使わない（`UnavailableProvider`。監視は止めない）。秘匿の値ではないが、
+  **鍵と同じくログ・`reason`・例外の文・repr に値を出さない**（扱いを揃え、どれを出してよいかを迷わせない）
 
 ### 2.5 費用と回数の上限（`config/ai.yaml` の `anthropic:`）
 
@@ -152,7 +157,7 @@ Provider に依らず同じものを通る。
 1. 導入先で vLLM を動かし、`docs/llm-setup.md` のスモークテストを通す
 2. `/etc/coldaisle/coldaisle.env` で `COLDAISLE_LLM_PROVIDER` を消すか `openai_compatible` にし、
    `OPENAI_BASE_URL` / `MODEL_NAME` を書く
-3. `ANTHROPIC_API_KEY` を消し、Anthropic の Console で鍵を無効にする（使わない鍵を置いたままにしない）
+3. `ANTHROPIC_API_KEY`（と `ANTHROPIC_WORKSPACE_ID`）を消し、Anthropic の Console で鍵を無効にする（使わない鍵を置いたままにしない）
 4. `coldaisle-daemon` と `coldaisle-api` を再起動する（`coldaisle-report` は次の起動から効く）
 5. 本記録の Status を `Superseded` にする記録を書くか、§5 の 2 に従って `AnthropicProvider` を残すかを決める
 

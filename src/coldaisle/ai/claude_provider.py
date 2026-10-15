@@ -43,6 +43,11 @@ from coldaisle.ai.provider import (
 LOGGER = logging.getLogger("coldaisle.ai.claude")
 
 API_KEY_ENV = "ANTHROPIC_API_KEY"  # pragma: allowlist secret - 変数名であって値ではない
+WORKSPACE_ENV = "ANTHROPIC_WORKSPACE_ID"
+"""任意。ワークスペースに属さない鍵で要る `anthropic-workspace-id` ヘッダの値（0143 §2.4）。
+
+秘匿ではないが鍵と同じく**ログ・理由・repr に出さない**（扱いを揃える）。空文字は未設定と同じ。
+"""
 MODEL_ENV = "ANTHROPIC_MODEL"
 """モデル ID。**コードに既定を持たない**（0143 §2.2）。
 
@@ -122,6 +127,8 @@ class AnthropicProvider:
     api_key: str = field(repr=False)
     """**repr に出さない。** dataclass の既定の repr はログや例外に紛れうる。"""
     budget: DailyCallBudget
+    workspace_id: str | None = field(default=None, repr=False)
+    """あれば `anthropic-workspace-id` ヘッダで送る。repr に出さない。"""
     client: httpx.Client | None = None
     sleep: Callable[[float], None] = time.sleep
 
@@ -135,12 +142,20 @@ class AnthropicProvider:
         """
         api_key = (os.environ.get(API_KEY_ENV) or "").strip()
         model = (os.environ.get(MODEL_ENV) or "").strip()
+        workspace_id = os.environ.get(WORKSPACE_ENV) or None
         limits = settings.anthropic
         missing = [
             name for name, value in ((API_KEY_ENV, api_key), (MODEL_ENV, model)) if not value
         ]
         if limits is None:
             missing.append("config/ai.yaml の anthropic:")
+        if workspace_id is not None and any(c.isspace() for c in workspace_id):
+            # 値は書かない（変数名だけ）。形が不正なら送らずに使わない
+            LOGGER.warning(
+                "ANTHROPIC_WORKSPACE_ID の形が不正なので AI を使わない（監視は継続する）",
+                extra={logs.FIELDS_KEY: {"env": WORKSPACE_ENV}},
+            )
+            return UnavailableProvider(reason=f"{WORKSPACE_ENV} の形が不正（空白を含む）")
         if missing or limits is None:
             reason = f"Claude API が設定されていない（{' / '.join(missing)}）"
             LOGGER.warning(
@@ -154,6 +169,7 @@ class AnthropicProvider:
             limits=limits,
             api_key=api_key,
             budget=DailyCallBudget(limits.daily_call_limit),
+            workspace_id=workspace_id,
         )
 
     def chat(
@@ -200,6 +216,8 @@ class AnthropicProvider:
             "anthropic-version": API_VERSION,
             "content-type": "application/json",
         }
+        if self.workspace_id:
+            headers["anthropic-workspace-id"] = self.workspace_id
         last_reason = ""
         for attempt in range(1, self.settings.max_attempts + 1):
             if not self.budget.try_acquire():

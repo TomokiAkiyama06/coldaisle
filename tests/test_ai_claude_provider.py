@@ -30,6 +30,7 @@ from coldaisle.ai.claude_provider import (
     API_KEY_ENV,
     MESSAGES_URL,
     MODEL_ENV,
+    WORKSPACE_ENV,
     AnthropicProvider,
     DailyCallBudget,
 )
@@ -308,7 +309,14 @@ def test_max_tokens_is_capped_by_the_limit(settings):
 
 @pytest.fixture
 def clean_env(monkeypatch):
-    for name in (PROVIDER_ENV, API_KEY_ENV, MODEL_ENV, BASE_URL_ENV, OPENAI_MODEL_ENV):
+    for name in (
+        PROVIDER_ENV,
+        API_KEY_ENV,
+        MODEL_ENV,
+        WORKSPACE_ENV,
+        BASE_URL_ENV,
+        OPENAI_MODEL_ENV,
+    ):
         monkeypatch.delenv(name, raising=False)
     return monkeypatch
 
@@ -375,7 +383,7 @@ def test_config_has_limits_but_no_model_or_key():
 
 def test_env_example_and_docs_name_the_variables():
     example = (ROOT / ".env.example").read_text(encoding="utf-8")
-    for name in (PROVIDER_ENV, API_KEY_ENV, MODEL_ENV):
+    for name in (PROVIDER_ENV, API_KEY_ENV, MODEL_ENV, WORKSPACE_ENV):
         assert f"{name}=" in example
     setup = (ROOT / "docs" / "llm-setup.md").read_text(encoding="utf-8")
     assert PROVIDER_ENV in setup
@@ -387,3 +395,55 @@ def test_escalation_does_not_import_a_provider():
     source = (ROOT / "src" / "coldaisle" / "escalate.py").read_text(encoding="utf-8")
     assert "coldaisle.ai" not in source
     assert "claude_provider" not in source
+
+
+# ---------------------------------------------------------------- ワークスペース（0143 §2.4）
+
+WORKSPACE = "wrkspc_0000test"
+
+
+def _headers_from_env(clean_env, settings) -> httpx.Headers:
+    clean_env.setenv(PROVIDER_ENV, "anthropic")
+    clean_env.setenv(API_KEY_ENV, FAKE_KEY)
+    clean_env.setenv(MODEL_ENV, MODEL)
+    chosen = provider_from_env(settings)
+    assert isinstance(chosen, AnthropicProvider)
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(200, json=reply("はい"))
+
+    chosen.client = httpx.Client(transport=httpx.MockTransport(handler))
+    assert ask(chosen).available is True
+    assert WORKSPACE not in repr(chosen)
+    return seen[0].headers
+
+
+def test_workspace_header_is_sent_when_set(clean_env, settings):
+    """ワークスペースに属さない鍵では `anthropic-workspace-id` が要る。"""
+    clean_env.setenv(WORKSPACE_ENV, WORKSPACE)
+    assert _headers_from_env(clean_env, settings)["anthropic-workspace-id"] == WORKSPACE
+
+
+@pytest.mark.parametrize("value", [None, ""])
+def test_workspace_header_is_absent_when_unset_or_empty(clean_env, settings, value):
+    """空文字は未設定と同じ。"""
+    if value is not None:
+        clean_env.setenv(WORKSPACE_ENV, value)
+    assert "anthropic-workspace-id" not in _headers_from_env(clean_env, settings)
+
+
+@pytest.mark.parametrize("value", [" wrkspc_x", "wrkspc x", "wrkspc_x\n", "\t"])
+def test_malformed_workspace_is_unavailable_without_echo(clean_env, settings, caplog, value):
+    """形が不正なら使わない。**値を理由・ログに出さない。**"""
+    clean_env.setenv(PROVIDER_ENV, "anthropic")
+    clean_env.setenv(API_KEY_ENV, FAKE_KEY)
+    clean_env.setenv(MODEL_ENV, MODEL)
+    clean_env.setenv(WORKSPACE_ENV, value)
+    caplog.set_level(logging.DEBUG)
+    chosen = provider_from_env(settings)
+    assert isinstance(chosen, UnavailableProvider)
+    assert WORKSPACE_ENV in chosen.reason
+    assert "wrkspc" not in chosen.reason
+    assert "wrkspc" not in caplog.text
