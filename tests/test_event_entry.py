@@ -37,7 +37,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from coldaisle.api.app import Config, create_app
-from coldaisle.clock import SimulatedClock
+from coldaisle.clock import SIMULATED_BOOT_ID, BootClockUnavailableError, SimulatedClock
 from coldaisle.event_entry import client as event_client
 from coldaisle.event_entry import server as event_server
 from coldaisle.event_entry.config import EventEntrySettings
@@ -107,7 +107,7 @@ class RunningServer:
                 clock = SimulatedClock(TEST_EPOCH_MS)
                 with SqliteStore(db, rules=rules, clock=clock) as store:
                     self.server = EventEntryServer(
-                        settings=settings, store=store, clock=clock, **kwargs
+                        settings=settings, store=store, clock=clock, boot_clock=clock, **kwargs
                     )
                     self.server.bind()
                     self._ready.set()
@@ -1474,3 +1474,43 @@ def test_only_the_entry_config_mentions_workload_hints():
         if path.is_file() and HINT_NAME.search(path.read_text(encoding="utf-8", errors="ignore"))
     )
     assert mentioned == ["event-entry.yaml"]
+
+
+# ---------------------------------------------------------------- boot id と CLOCK_BOOTTIME（0066）
+
+
+@needs_peercred
+def test_every_written_row_carries_the_boot_id_and_boottime(running, db, rules):
+    """移行後に eventd が書く行は、boot id と CLOCK_BOOTTIME の両方を必ず持つ（0066 §2.2）。"""
+    assert running.send(encode_workload_hint("start", workload="training"))["ok"] is True
+    assert running.send(encode_gpu_mode("ai"))["ok"] is True
+    events = stored_events(db, rules)
+    assert len(events) == 2
+    for event in events:
+        assert event.boot_id == SIMULATED_BOOT_ID
+        # SimulatedClock はシナリオの開始を boot の起点にする。進めていないので 0
+        assert event.boottime_ns == 0
+
+
+class _UnavailableBootClock:
+    def boot_id(self) -> str:
+        raise BootClockUnavailableError("boot id を読めない")
+
+    def boottime_ns(self) -> int:
+        raise BootClockUnavailableError("CLOCK_BOOTTIME を読めない")
+
+
+@needs_peercred
+def test_eventd_refuses_to_start_without_a_boot_clock(db, rules):
+    """入れられない行を書き始める前に止める（片方だけ・両方 NULL の行を新しく作らない）。"""
+    clock = SimulatedClock(TEST_EPOCH_MS)
+    with (
+        SqliteStore(db, rules=rules, clock=clock) as store,
+        pytest.raises(EntryStartupError, match="CLOCK_BOOTTIME"),
+    ):
+        EventEntryServer(
+            settings=EventEntrySettings.from_yaml(CONFIG_PATH),
+            store=store,
+            clock=clock,
+            boot_clock=_UnavailableBootClock(),
+        )

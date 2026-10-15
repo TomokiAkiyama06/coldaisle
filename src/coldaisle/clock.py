@@ -15,8 +15,30 @@
 
 from __future__ import annotations
 
+import re
 import time
+from pathlib import Path
 from typing import Protocol, runtime_checkable
+
+BOOT_ID_PATH = Path("/proc/sys/kernel/random/boot_id")
+"""起動ごとの識別子（Linux）。決定記録 0066 §2.2 の boot id の出どころ。"""
+
+BOOT_ID_PATTERN = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
+"""boot id の形（UUID の小文字 36 文字。0066 §2.2）。"""
+
+SIMULATED_BOOT_ID = "00000000-0000-4000-8000-000000000000"
+"""`SimulatedClock` の既定の boot id。実機の値ではないと一目で分かる仮の値（ルール 10）。"""
+
+
+class BootClockUnavailableError(RuntimeError):
+    """boot id または `CLOCK_BOOTTIME` を読めない（Linux 以外・`/proc` が無いなど）。"""
+
+
+def validate_boot_id(value: str) -> str:
+    """boot id の形を確かめて返す。形が違えば `ValueError`。"""
+    if not BOOT_ID_PATTERN.match(value):
+        raise ValueError("boot id は UUID の小文字 36 文字にする")
+    return value
 
 
 @runtime_checkable
@@ -28,13 +50,64 @@ class Clock(Protocol):
         ...
 
 
+@runtime_checkable
+class BootClock(Protocol):
+    """boot id と `CLOCK_BOOTTIME`（決定記録 0066 §2.2）。
+
+    **経過を過小に見積もらない時計。** `CLOCK_MONOTONIC` は suspend 中に進まず、
+    壁時計は時刻合わせで戻る。Workload Hint の期限と起動時の取り込みの経過は、
+    同じ boot（boot id が一致）の中でだけ `CLOCK_BOOTTIME` の差で数える。
+
+    制御ループの他の判定（tick の deadline・stale・hold・stall）は `MonotonicClock` のまま
+    （0028 の契約）。この時計を混ぜない。
+    """
+
+    def boot_id(self) -> str:
+        """いまの boot の識別子（UUID の小文字 36 文字）。"""
+        ...
+
+    def boottime_ns(self) -> int:
+        """`CLOCK_BOOTTIME` のナノ秒（0 以上。起点はその boot の起動）。"""
+        ...
+
+
 class WallClock:
-    """実時計。`serial` ソースと本番運用で使う。"""
+    """実時計。`serial` ソースと本番運用で使う。
+
+    `BootClock` も実時計で満たす（boot id は `/proc`、経過は `CLOCK_BOOTTIME`）。
+    Linux 以外では `BootClockUnavailableError` を出す。
+    """
+
+    def __init__(self, *, boot_id_path: Path = BOOT_ID_PATH) -> None:
+        self._boot_id_path = boot_id_path
+        # boot id はプロセスの生存中に変わらない。1回読めたら持つ
+        self._boot_id: str | None = None
 
     def now_ms(self) -> int:
         # time_ns から作る。time() の float は 2026 年の Unix 秒で
         # ミリ秒未満の桁が落ちる可能性があり、丸めの向きが環境で変わる
         return time.time_ns() // 1_000_000
+
+    def boot_id(self) -> str:
+        if self._boot_id is None:
+            try:
+                text = self._boot_id_path.read_text(encoding="ascii").strip()
+            except (OSError, UnicodeDecodeError) as exc:
+                raise BootClockUnavailableError("boot id を読めない") from exc
+            try:
+                self._boot_id = validate_boot_id(text)
+            except ValueError as exc:
+                raise BootClockUnavailableError("boot id の形が不正") from exc
+        return self._boot_id
+
+    def boottime_ns(self) -> int:
+        clock_id = getattr(time, "CLOCK_BOOTTIME", None)
+        if clock_id is None:
+            raise BootClockUnavailableError("CLOCK_BOOTTIME の無いプラットフォーム")
+        try:
+            return time.clock_gettime_ns(clock_id)
+        except OSError as exc:
+            raise BootClockUnavailableError("CLOCK_BOOTTIME を読めない") from exc
 
 
 class SimulatedClock:
@@ -50,13 +123,26 @@ class SimulatedClock:
     どちらを採るかは #8 で決める（#42 の Issue に選択肢を書いた）。
     """
 
-    def __init__(self, start_ms: int) -> None:
+    def __init__(self, start_ms: int, *, boot_id: str = SIMULATED_BOOT_ID) -> None:
         if start_ms < 0:
             raise ValueError(f"開始時刻が負: {start_ms}")
+        self._start_ms = start_ms
         self._now_ms = start_ms
+        self._boot_id = validate_boot_id(boot_id)
 
     def now_ms(self) -> int:
         return self._now_ms
+
+    def boot_id(self) -> str:
+        """構築時に与えた boot id（既定は仮の値）。"""
+        return self._boot_id
+
+    def boottime_ns(self) -> int:
+        """シナリオ時間での経過（開始時刻を boot の起点とみなす）。
+
+        `advance_to_ms` が巻き戻さないので、この値も減らない（0066 §2.2）。
+        """
+        return (self._now_ms - self._start_ms) * 1_000_000
 
     def advance_to_ms(self, value: int) -> None:
         """指定時刻まで進める。**巻き戻さない。**

@@ -111,6 +111,21 @@ def test_migration_creates_exactly_the_decided_objects():
         ("trigger", "csv_exports_no_update"),
         ("trigger", "csv_exports_no_delete"),
         ("trigger", "dataset_source_run_export_binding_pair"),
+        ("table", "workload_hint_runs"),
+        ("table", "workload_hint_run_ends"),
+        ("table", "workload_hint_backfill_boundaries"),
+        ("table", "workload_hint_terminal_states"),
+        ("trigger", "workload_hint_run_ends_refs"),
+        ("trigger", "workload_hint_backfill_boundaries_refs"),
+        ("trigger", "workload_hint_terminal_states_refs"),
+        ("trigger", "workload_hint_runs_no_update"),
+        ("trigger", "workload_hint_runs_no_delete"),
+        ("trigger", "workload_hint_run_ends_no_update"),
+        ("trigger", "workload_hint_run_ends_no_delete"),
+        ("trigger", "workload_hint_backfill_boundaries_no_update"),
+        ("trigger", "workload_hint_backfill_boundaries_no_delete"),
+        ("trigger", "workload_hint_terminal_states_no_update"),
+        ("trigger", "workload_hint_terminal_states_no_delete"),
     }
 
 
