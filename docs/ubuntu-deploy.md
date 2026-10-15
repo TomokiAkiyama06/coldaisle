@@ -424,6 +424,9 @@ sudo install -d -o coldaisle-fan -g coldaisle-authority -m 2770 /var/lib/coldais
   `sudo -u coldaisle-fan` も使いません）。記録される承認者は実行した人の `uid.<数値>` です
   （0086 §2.1）。root と fand のユーザー（= `/var/lib/coldaisle-authority` の所有者）の昇格は拒まれます
   （0086 §2.3。rollback は誰でも通ります）
+- 本番の `raise` は、root の所有の venv の interpreter を隔離モードで起動する形
+  （`/opt/coldaisle/.venv/bin/python -I -m coldaisle.authority_cli raise ...`）で実行します。`uv run` と
+  console script（`.venv/bin/coldaisle-authority`）は本番の `raise` に使いません（6.7 の手順 6。決定記録 0134 §2.2）
 - `/var/lib/coldaisle-authority` は **setgid（`2770`）が要ります。** 人が書いたファイルのグループが
   `coldaisle-authority` になり、fand が読み書きできるためです。CLI は書く前にディレクトリが
   「ディレクトリ・other に権限が無い・setgid 付き」であることを確かめ、違えば書かずに止まります。
@@ -720,12 +723,16 @@ CLI の書いた journal を読むと、走行中なら `SHADOW` へ下がり、
 ### 6.7 承認者の最小権限（制御設定の読み取りと Model Registry。決定記録 0104 / 0105）
 
 決定の理由は決定記録 [`0104`](decisions/0104-authority-raise-least-privilege.md)（§2.1〜§2.6・§2.9）と
-[`0105`](decisions/0105-registry-shared-root-settled-points.md) を見てください。ここに書く名前（グループ
+[`0105`](decisions/0105-registry-shared-root-settled-points.md)、導入先で使う前に足した点（実行するコード・
+入口の書き分け・権限の確かめ方・段階 C の時期）は [`0134`](decisions/0134-authority-raise-host-verification.md)
+を見てください。ここに書く名前（グループ
 `coldaisle-registry` / `coldaisle-authority`・`/var/lib/coldaisle-registry`）は**すべて仮の値**です。
 **実機のユーザー名・ホスト名・path はコミットしません**（AGENTS.md ルール10）。
 
-> **本番での `coldaisle-authority raise` は、この節の手順 9（実機での確認。0104 の段階 C）が導入先で通り、
-> 結果を #217 に残すまで使えません。** 手順 1〜8 で権限を置いても、確認が済むまでは `raise` しません。
+> **本番での `coldaisle-authority raise` は、この節の手順 9（実機での確認。0104 の段階 C）の C1 と C2 が
+> 導入先で通り、結果を #217 に残すまで使えません**（0134 §2.5）。手順 1〜8 で権限を置いても、確認が済むまでは
+> `raise` しません。**C1（権限の形）だけが通った状態で「使える」とはしません。** C2 は Registry に thermal_model の
+> Production artifact が初めてできた後に行います（それまでは上げる対象が無いので `raise` 自体が要りません）。
 > `rollback` はこの節に関係なく使えます。この節の手順でも fand を `enable` も `start` もしません。
 
 **誰が何をできるか**（0104 §2.1）
@@ -735,7 +742,34 @@ CLI の書いた journal を読むと、走行中なら `SHADOW` へ下がり、
 | fand（`coldaisle-fan`） | 読む（6.2 のまま） | `--registry-root` を渡したときだけ読む（unit の補助グループ `coldaisle-authority` 経由の ACL） | 使わない | 読み書き（6.1） |
 | 承認者（`coldaisle-authority` の人） | **読む**（ACL） | **読む**（ACL） | **flock だけ**（`r`） | 読み書き（6.1） |
 | Registry の書き手（`coldaisle-registry` の人） | 触らない | 読み書き（グループ） | 読み書き（グループ） | 触らない |
+| 管理ソケットの人（`coldaisle-admin` だけの人） | 触らない | 触らない | 触らない | 触らない |
 | `coldaisle`（API / 取り込み）・AI 層 | 触らない | 触らない | 触らない | 触らない |
+
+**承認者の uid が `raise` のために要るもの**（0134 §2.1。上の表に加えて）
+
+| もの | 承認者の uid に要る権限 | 与え方 |
+|---|---|---|
+| 実行するコード（`/opt/coldaisle` の `.venv` と、それが使う Python） | `r-x` だけ。**書けない** | root の所有（2 節のまま） |
+| `/opt/coldaisle/config/model-registry.yaml`（`--registry-limits` が読む） | `r` だけ。**書けない** | root の所有（2 節のまま） |
+| 承認ファイル・評価報告 | `r` | 承認者自身のファイル |
+
+要らないもの（与えない）: DB、管理ソケット（`coldaisle-admin`）、`coldaisle-fan` グループ（hwmon を書ける）、
+Registry と制御設定への書き込み、root。artifact の本体は `raise` には要りませんが、手順 3 の default ACL で
+承認者も読めます。承認する人が対象の artifact を見られるのは承認の役割の範囲なので、狭めません（0134 §2.1）。
+
+**「昇格の入口が1つ」を保つもの**（0134 §2.3）
+
+| 層 | 何が保つか | 誰に効くか | 確かめ方 |
+|---|---|---|---|
+| (a) コード | `raise_stage()` を呼ぶのは `authority_cli.py` だけ。管理ソケット・fand・API・AI・eventd・Learned worker は上げられない | すべての process | `tests/test_authority_cli.py` ほかの走査 |
+| (b) 権限 | authority のディレクトリに書けるのは、`coldaisle-authority` の人・fand（unit の補助グループだけ）・root だけ | `coldaisle-admin` だけの人、`coldaisle-registry` だけの人、`coldaisle`（API / 取り込み）、AI 層、Learned worker | 手順 9（C1） |
+| (c) 承認者本人 | 強制しません。fand 側の照合（0089 / 0090）と構造化ログの監査の記録（0086 §2.8）が残ります | `coldaisle-authority` の人 | 改ざん検知は未決（0086 §5 の 1） |
+
+- `coldaisle-admin` と `coldaisle-authority` は分けたままにします。管理ソケットは運転モードと降格だけを受ける入口で、
+  `coldaisle-admin` に入っても `raise` に要る読み取りは1つも付きません。1人の導入先では同じ人が両方に入って
+  かまいません
+- `raise` の後に効いていることを確かめる `coldaisle-control status` は `coldaisle-admin` の人が行います。
+  確かめるためだけに、承認者の CLI に管理ソケットや DB を読ませません
 
 - 承認者も Registry の書き手も**自分の uid のまま**実行します（`sudo` も `sudo -u` も使いません。0086 §2.1）
 - 同じ人が `coldaisle-registry` と `coldaisle-authority` の両方に入ることは認めます（0104 §5 の 3）。
@@ -824,7 +858,35 @@ CLI の書いた journal を読むと、走行中なら `SHADOW` へ下がり、
    .venv/bin/coldaisle-registry status --root /var/lib/coldaisle-registry
    ```
 
-6. **承認者の使い方と照合**（0104 §2.6）。`coldaisle-authority raise` の `--config-dir` と `--registry-root` には、
+6. **承認者の使い方と照合**（0104 §2.6・0134 §2.2）。本番の `raise` は、**root の所有の venv の interpreter を
+   隔離モード（`-I`）で起動して**入口のモジュールを実行します。承認者の uid のまま実行し（`sudo` を使わない）、
+   `--registry-limits` も絶対 path で渡します
+
+   ```bash
+   /opt/coldaisle/.venv/bin/python -I -m coldaisle.authority_cli raise \
+       --authority-root /var/lib/coldaisle-authority \
+       --approval <承認.json> --report <報告.json> \
+       --config-dir /etc/coldaisle/control-config \
+       --registry-root /var/lib/coldaisle-registry \
+       --registry-limits /opt/coldaisle/config
+   ```
+
+   - `-I` は `PYTHONPATH` などの `PYTHON*` の環境変数を無視し、作業ディレクトリと user site を import の探索に
+     入れません。CLI の検証（承認の形・uid の束縛・証拠の hash）は承認者自身の process で走るので、承認者の
+     環境にたまたま残った `PYTHONPATH` や、作業ディレクトリの checkout が検証を黙って置き換えないようにします。
+     `-m coldaisle.authority_cli` は console script と同じ `main()` を呼びます（引数も終了コードも同じ）
+   - **console script（`.venv/bin/coldaisle-authority`）を本番の `raise` に使いません。** 絶対 path で実行しても
+     `PYTHONPATH` を読むので、承認者の書ける場所の `coldaisle` が root の所有のコードより先に読まれえます
+   - **`uv run` を使いません。** `.venv` と lock を書こうとし、root の所有の `/opt/coldaisle` では権限の error で
+     止まるので、権限の設計の誤りと紛らわしくなります。**承認者のホームの checkout など、承認者が書けるコードで
+     本番の authority のディレクトリを指しません**
+   - `--registry-limits` の既定（相対 path の `config`）は作業ディレクトリで意味が変わるので、絶対 path を渡します
+     （上限は読み込みの大きさを抑えるだけで、上げる向きの判断には使われません）
+   - `-I` は site-packages の `.pth` の実行も、`LD_PRELOAD` など動的リンカの環境変数も止めません。承認者が
+     import に使われる場所に書けないことを手順 9 の 6（C1）で確かめます。承認者本人が意図して別のコードを
+     走らせることはこの形でも防げません（上の表の (c)）
+
+   `--config-dir` と `--registry-root` には、
    **fand の unit の `ExecStart=` と同じ path** を渡します（`--config-dir /etc/coldaisle/control-config`。
    `--registry-root` は fand に Registry を渡す unit（0077 の段階 6）の値と同じ `/var/lib/coldaisle-registry`）。
    CLI は path が fand と同じかを確かめません。取り違えた・fand の起動後に差し替えた設定や artifact で上げても、
@@ -863,16 +925,47 @@ CLI の書いた journal を読むと、走行中なら `SHADOW` へ下がり、
    Registry の root は `drwxrws---+`・`root:coldaisle-registry`、lock は `-rw-rw----+`・`root:coldaisle-registry`
    であること
 
-9. **実機での確認**（0104 §2.9。段階 C。**人が行います**）。どれか1つでも期待と違えば `raise` は使いません
+9. **実機での確認**（0104 §2.9・0134 §2.4 / §2.5。段階 C。**人が行います**）。どれか1つでも期待と違えば `raise` は使いません
+
+   段階 C は2つに分けます（0134 §2.5）。
+
+   | 段階 | 内容 | 時期 |
+   |---|---|---|
+   | C1 | 手順 1〜8 の配置と、下の 1〜4・6〜10（権限の形） | 手順 1〜8 の後ならいつでも。fand を `start` しません。0121 の試験と並行してかまいません |
+   | C2 | 下の 5（承認者の uid の `raise` が `expected_revision` の不一致の `approval_rejected` まで届く） | Registry に thermal_model の Production artifact が初めてできた後。それまでは 5 を `evidence_rejected`（Production が無い）までの確認に留めます |
+
+   **判定は実際に開く操作で行います**（0134 §2.4）。`test -r` / `test -w` / `test -x` の結果は判定に使いません。
+   `test` の答えは実装（外部コマンドか shell の組み込みか、補助グループと ACL をどう扱うか）で変わり、
+   「書けない」の確認が誤って通ると、広すぎる権限を見逃すためです。
+
+   - 読める: `cat -- <ファイル> > /dev/null` が成功する。ディレクトリを一覧できる: `ls -- <ディレクトリ>` が成功する
+   - ファイルに書けない: `sh -c ': >> "$1"' _ <ファイル>` が**失敗する**（追記で開くだけで、開けても中身は
+     変わりません）。無いファイルには行いません（ディレクトリに書ければ作ってしまうため。作れるかはディレクトリの
+     確認で見ます）
+   - ディレクトリに書けない: `touch -- <ディレクトリ>/.probe-0134` が**失敗する**。成功したら作ったファイルを消し、
+     「期待と違う」として扱います
+   - unit と同じ資格で見るときは、unit と同じ `User=`・`Group=`・`SupplementaryGroups=` を渡した `systemd-run` の
+     中で、上の操作を `sh -c` で行います（6.4 の手順 4 と同じ）
 
    **役割ごとの確認は、その役割のグループだけを持つアカウントで行います。** 同じ人が `coldaisle-authority` と
    `coldaisle-registry` を兼ねる（上の表の下の注記で認めている）アカウントでは、2 の「書けない」と 3 の
-   「authority のディレクトリへ書けない」は成り立ちません（もう一方のグループの権限で書けるため）。兼任の
-   アカウントしか無い導入先では、確認のためだけの一時アカウントを役割ごとに作り（`useradd --system
-   --no-create-home --shell /usr/sbin/nologin`。それぞれ片方のグループにだけ入れる）、`sudo -u <一時アカウント>`
-   で 2 と 3 を実行し、確認の後に `userdel` で消します。この `sudo -u` は権限の形を確かめるためだけで、
-   本物の `raise` や Registry への書き込みには使いません（承認者は自分の uid で実行する。0086 §2.1）。
-   3 の書き込み（`register`）は、一時アカウントではなく実際の書き手の uid で行います
+   「authority のディレクトリへ書けない」は成り立ちません（もう一方のグループの権限で書けるため）。
+   `coldaisle-admin` を兼ねるアカウントでも、8 は確かめられません。兼任のアカウントしか無い導入先では、
+   確認のためだけの一時アカウントを役割ごとに作り（`useradd --system --no-create-home --shell /usr/sbin/nologin`。
+   それぞれ1つのグループにだけ入れる。2・6・7・10 は `coldaisle-authority` だけ、8 は `coldaisle-admin` だけ）、
+   `sudo -u <一時アカウント>` で実行し、確認の後に `userdel` で消します。この `sudo -u` は権限の形を確かめるため
+   だけで、本物の `raise` や Registry への書き込みには使いません（承認者は自分の uid で実行する。0086 §2.1）。
+   3 の書き込み（`register`）は、一時アカウントではなく実際の書き手の uid で行います。
+   6〜8・10 のスクリプトを一時アカウントで実行するときは、その一時アカウントが書ける作業ディレクトリを作り、
+   スクリプトを置いてから実行します（`<スクリプト>` は下の各項目で保存したファイル）
+
+   ```bash
+   w=$(sudo -u <一時アカウント> mktemp -d)
+   sudo install -o <一時アカウント> -m 0644 <スクリプト> "$w/"
+   sudo -u <一時アカウント> sh -c 'cd -- "$1" && bash "./$2"' _ "$w" <スクリプトのファイル名>
+   # 結果を写した後に消す
+   sudo rm -rf -- "$w"
+   ```
 
    1. 手順 8 の `getfacl` の形が期待どおりであること
    2. **承認者の uid で**（ログインし直し、`id -nG` に `coldaisle-authority` が出てから。`sudo` を使わない）
@@ -881,13 +974,15 @@ CLI の書いた journal を読むと、走行中なら `SHADOW` へ下がり、
         `registry.json` の確認は手順 3 の書き込みの後に行う）
       - flock を取れる: `flock -n /var/lib/coldaisle-registry/.registry.lock true; echo $?` が `0`
       - **読めない・書けない**（すべて権限の error になること）: `cat /etc/coldaisle/coldaisle.env`、
-        `cat /etc/coldaisle/control-admin.yaml`、`ls /etc/coldaisle`、`touch /etc/coldaisle/control-config/x`、
-        `touch /var/lib/coldaisle-registry/x`、`sh -c ': >> /var/lib/coldaisle-registry/registry.json'`、
-        `sh -c ': >> /var/lib/coldaisle-registry/.registry.lock'`
+        `cat /etc/coldaisle/control-admin.yaml`、`ls /etc/coldaisle`、`touch /etc/coldaisle/control-config/.probe-0134`、
+        `touch /var/lib/coldaisle-registry/.probe-0134`、`sh -c ': >> /var/lib/coldaisle-registry/registry.json'`、
+        `sh -c ': >> /var/lib/coldaisle-registry/.registry.lock'`（`touch` が通ってしまったら、作った
+        `.probe-0134` を消して「期待と違う」とする）
    3. **Registry の書き手の uid で**: `coldaisle-registry status --root /var/lib/coldaisle-registry` が通り、
       書く操作（開発用の artifact の `register` など）の後も 2 の「読める」が通ること。作られたファイルが `0640`・
       グループ `coldaisle-registry`・ACL 付きであることを `getfacl` で見る。書き手が authority のディレクトリへ
-      書けないこと（`touch /var/lib/coldaisle-authority/x` が失敗する）
+      書けないこと（`touch /var/lib/coldaisle-authority/.probe-0134` が失敗する。通ってしまったら消して
+      「期待と違う」とする）
    4. **fand と同じグループで**（6.4 の手順 4 と同じ `systemd-run`）: 制御設定と `registry.json` を読めて、
       どちらにも書けないこと。判定は `test -r` / `test -w` ではなく、`cat` で読めることと、`: >>`
       （追記で開くだけで中身は変わらない）が**失敗する**ことで見ます（決定記録 0134 §2.4）
@@ -902,26 +997,173 @@ CLI の書いた journal を読むと、走行中なら `SHADOW` へ下がり、
       done
       ```
 
-   5. **`raise` が読み取りと lock を通ること**（本物の昇格はしない。0104 §5 の 7）。承認者の uid で、
-      **期限内で形の正しい、`expected_revision` だけが journal と合わない承認**を渡します。`raise` はこれを
-      Registry の lock と authority の lock を取った**後**に拒みます（期限切れの承認は Registry を読む前に拒まれるので
-      確認に使えません）。期待する結果は終了コード 4・`code` が `approval_rejected`（revision の不一致）で、
-      journal は変わりません。終了コード 1 の `io_or_config_error`（制御設定を読めない）や `registry_error`
-      （Registry を読めない。0105 §2.4）なら権限が足りていません。
+   5. **`raise` が読み取りと lock を通ること**（本物の昇格はしない。0104 §5 の 7。**C2**）。承認者の uid で、
+      手順 6 の形（`/opt/coldaisle/.venv/bin/python -I -m coldaisle.authority_cli raise ...`。`--registry-limits` も
+      絶対 path）で実行し、**期限内で形の正しい、`expected_revision` だけが journal と合わない承認**を渡します。
+      `raise` はこれを Registry の lock と authority の lock を取った**後**に拒みます（期限切れの承認は Registry を
+      読む前に拒まれるので確認に使えません）。期待する結果は終了コード 4・`code` が `approval_rejected`
+      （revision の不一致）で、journal は変わりません。終了コード 1 の `io_or_config_error`（制御設定や
+      `model-registry.yaml` を読めない）や `registry_error`（Registry を読めない。0105 §2.4）なら権限が足りていません。
 
       **前提: Registry に thermal_model の Production artifact があること。** `raise` は Registry の lock を
       取って Production を読んだ直後、authority の lock と `expected_revision` を見る**前**に、Production が無ければ
       拒みます。Production がまだ無い導入先（3 で candidate を登録しただけ、など）では、期待する結果は
       終了コード 4・`code` が `evidence_rejected` で、構造化ログの `error` が「Production の artifact が無い」
-      ことです。これでも制御設定の読み取りと Registry の読み取り・lock は確かめられますが、authority の lock までは
-      届かないので、Production を置いた後に `approval_rejected` の確認をもう一度行ってから `raise` を使います。
+      ことです。これは C1 の間に行ってかまいません（制御設定の読み取りと Registry の読み取り・lock は確かめられる）が、
+      authority の lock までは届かないので **C2 ではありません**。Production ができた後に `approval_rejected` の
+      確認を行うのが C2 です。
       どちらの場合も承認の期限内であることと、承認の `to_stage` が `fan-policy.yaml` の上限以下であることが要ります
       （それより前の検査で拒まれるため）
-   6. 結果（どの確認が通ったか・`getfacl` の形）を #217 に残します。**実機のユーザー名・ホスト名・path は
-      書きません**（仮の名前に置き換える）
+   6. **隔離した interpreter が import に使う場所のすべてに、承認者が書けないこと**（0134 §2.4 の 1。C1）。
+      `coldaisle-authority` だけのアカウントで行います。`-I` は site の処理を止めず、site-packages の `.pth`
+      （`import` で始まる行は実行される。editable の導入の `.pth` は `src` を `sys.path` に足す）は `-I` でも
+      効くので、`.venv/bin`・`config`・`src` だけを見るのでは足りません。**隔離した interpreter 自身が報告する
+      場所**（`sys.path` の各項と `sys.prefix`・`sys.base_prefix`、その下のすべて・symlink の実体・祖先）を、
+      実際に開いて確かめます。次をファイル（例: `c1-import-paths.sh`）に保存し、承認者が書ける空の作業
+      ディレクトリで `bash c1-import-paths.sh` として実行します（一時アカウントなら上の前置きの形）
 
-   9 がすべて通り、#217 に結果を残したら、この節の冒頭と 6.1 の「本番での `raise` は使えません」の注記を
-   外す PR を作ります（所有者の承認の後）。
+      ```bash
+      py=/opt/coldaisle/.venv/bin/python
+      # 隔離した interpreter が使う場所: sys.path の各項と、venv と interpreter の prefix
+      "$py" -I -c 'import sys; print("\n".join(p for p in [*sys.path, sys.prefix, sys.base_prefix] if p))' \
+        | sort -u > roots.txt
+      : > unresolved.txt
+      # symlink の実体を、増えなくなるまで roots に足す。項そのものと、項の下で出会うすべての symlink
+      # （ディレクトリを指すものもファイルを指すものも）を1つずつ readlink -f で解決する。
+      # 解決できない symlink（切れたもの・途中のディレクトリが無いものを含む）は飛ばさず unresolved.txt に残す。
+      # find は symlink をたどらない（-P）ので循環しても止まり、roots は増えるだけの有限の集合なので繰り返しも止まる
+      while :; do
+        while IFS= read -r p; do
+          # path の途中の要素（/opt/coldaisle 自体など）が symlink なら、その1段先を項として足す。
+          # 足した項の祖先も下の検査に掛かり、項はまたここで要素ごとに解決される（-s -m は文字の上だけで整える）
+          q=$p
+          while [ "$q" != / ]; do
+            if [ -L "$q" ]; then
+              t=$(readlink -- "$q")
+              case $t in /*) ;; *) t=$(dirname -- "$q")/$t ;; esac
+              realpath -s -m -- "$t" >&3
+              printf '%s\n' "$q"                    # 解決できるかは下で確かめる
+            fi
+            q=$(dirname -- "$q")
+          done
+          [ -e "$p" ] || [ -L "$p" ] || continue   # symlink でもなく存在もしない項は、下の祖先の検査で見る
+          find "$p" -type l -print                  # 項そのものが symlink なら、項も出る
+        done < roots.txt 3>hops.txt | while IFS= read -r l; do
+          if t=$(readlink -f -- "$l") && [ -e "$t" ]; then
+            printf '%s\n' "$t"
+          else
+            printf '%s\n' "$l" >> unresolved.txt
+          fi
+        done | cat - hops.txt roots.txt | sort -u > roots.next
+        if cmp -s roots.txt roots.next; then rm -f roots.next; break; fi
+        mv roots.next roots.txt
+      done
+      sort -u unresolved.txt | while IFS= read -r l; do echo "解決できない symlink: $l"; done
+      # 調べるディレクトリ: 各項（実体を含む）の下のすべてと、各項の祖先（/ の手前まで）。
+      # 祖先は項が存在しなくても見る（無い項を後から作れるかは、親に書けるかで決まる）
+      while IFS= read -r p; do
+        [ -d "$p" ] && [ ! -L "$p" ] && find "$p" -type d -print
+        d=$p; while [ "$d" != / ]; do d=$(dirname -- "$d"); [ "$d" = / ] || printf '%s\n' "$d"; done
+      done < roots.txt | sort -u > dirs.txt
+      # ディレクトリ: 作れたら「書ける」（作ったものは消す）。無いディレクトリは作れないので出ない（祖先で見る）
+      while IFS= read -r d; do
+        if touch -- "$d/.probe-0134" 2>/dev/null; then rm -f -- "$d/.probe-0134"; echo "書ける: $d"; fi
+      done < dirs.txt
+      # ファイル（.pth・.py・pyvenv.cfg・interpreter の実体を含む）: 追記で開けたら「書ける」（中身は変わらない）。
+      # symlink のファイルは -type f に出ないが、その実体は上で roots に入っており、ここで実体として調べる
+      while IFS= read -r p; do
+        [ -e "$p" ] || continue
+        find "$p" -type f -exec sh -c 'for f; do if (: >> "$f") 2>/dev/null; then echo "書ける: $f"; fi; done' _ {} +
+      done < roots.txt
+      # --registry-limits の置き場所（sys.path には入らない）: ディレクトリに書けず、model-registry.yaml を読めて書けない
+      c=/opt/coldaisle/config
+      if touch -- "$c/.probe-0134" 2>/dev/null; then rm -f -- "$c/.probe-0134"; echo "書ける: $c"; fi
+      cat -- "$c/model-registry.yaml" > /dev/null || echo "読めない: $c/model-registry.yaml"
+      if (: >> "$c/model-registry.yaml") 2>/dev/null; then echo "書ける: $c/model-registry.yaml"; fi
+      ```
+
+      - 「書ける」「読めない」「解決できない symlink」が1行でも出たら C1 は失敗で、本番の `raise` は使いません。
+        `roots.txt` に `/opt/coldaisle` と interpreter の置き場所（2 節。システムの Python か
+        `/opt/coldaisle-python`）以外の場所が出たときも同じです（承認者の書ける場所が import に使われうる。
+        symlink の実体がそこにあるときを含む）
+      - **解決できない symlink は、理由を問わず失敗にします（安全側）。** 切れた symlink や途中のディレクトリが
+        無い symlink の先は、いまは検査できず、後で承認者がその場所を作れれば書き換え可能なコードが読まれえます。
+        直すときは symlink を消すか、先を root の所有で作ってから 6 をやり直します
+      - symlink そのものの mode は使われません。置き換えられるかは symlink のあるディレクトリに書けるかで決まり、
+        それは上のディレクトリの検査で見ています。venv の `bin/python` は interpreter の実体への symlink で、
+        その実体と親も実体を `roots.txt` に足したことで同じ検査に掛かります
+      - `sys.path` の項が存在しない（`python312.zip` など）ときは、その項の祖先のディレクトリに書けないことで、
+        承認者が後から作れないことを見ます
+      - `roots.txt`・`dirs.txt`・`unresolved.txt`・`hops.txt` は作業ディレクトリに残ります。結果を #217 に
+        残すときは path を仮の名前に置き換えます
+   7. **承認者の書ける場所に偽の `coldaisle` を置いても、手順 6 の起動の形では root の所有のコードが読まれること**
+      （0134 §2.4 の 1b。C1）。`coldaisle-authority` だけのアカウントで、`PYTHONPATH` と作業ディレクトリの
+      両方を、読まれたら目印を出して止まるだけの偽の package に向けます。次をファイル（例: `c1-fake-package.sh`）
+      に保存して `bash` で実行します
+
+      ```bash
+      fake=$(mktemp -d)
+      mkdir -- "$fake/coldaisle"
+      printf '%s\n' 'raise SystemExit("MARK-0134: 偽の coldaisle が読まれた")' > "$fake/coldaisle/__init__.py"
+      ( cd -- "$fake" && PYTHONPATH="$fake" /opt/coldaisle/.venv/bin/python -I \
+          -c 'import coldaisle; print(coldaisle.__file__)' )
+      ( cd -- "$fake" && PYTHONPATH="$fake" /opt/coldaisle/.venv/bin/python -I \
+          -m coldaisle.authority_cli --help > /dev/null ) && echo "使い方が出た"
+      rm -rf -- "$fake"
+      ```
+
+      1つ目が `/opt/coldaisle` の下の path を出し、2つ目が `使い方が出た` を出すこと。`MARK-0134` が出たら失敗です。
+      確かめた後に偽の package を消します（上の最後の行）
+   8. **管理ソケットの人（`coldaisle-admin` だけ）が authority・制御設定・Registry のどれにも触れないこと**
+      （0134 §2.4 の 2。C1）。次をファイル（例: `c1-denied.sh`。9 でも使う）に保存し、`coldaisle-admin` だけの
+      アカウントで `bash` で実行します（`authority.json` は fand か `raise` / `rollback` が作るまで無いので、
+      無ければディレクトリの確認だけになります）
+
+      ```bash
+      ng() { echo "期待と違う: $*"; }
+      for d in /var/lib/coldaisle-authority /etc/coldaisle/control-config /var/lib/coldaisle-registry; do
+        if touch -- "$d/.probe-0134" 2> /dev/null; then rm -f -- "$d/.probe-0134"; ng "書ける: $d"; fi
+      done
+      f=/var/lib/coldaisle-authority/authority.json
+      if [ -e "$f" ] && (: >> "$f") 2> /dev/null; then ng "書ける: $f"; fi
+      for f in /etc/coldaisle/control-config/fan-hardware.yaml /etc/coldaisle/control-config/safety.yaml \
+               /etc/coldaisle/control-config/fan-policy.yaml /etc/coldaisle/control-config/air-balance.yaml \
+               /var/lib/coldaisle-registry/registry.json /var/lib/coldaisle-registry/.registry.lock; do
+        if cat -- "$f" > /dev/null 2>&1; then ng "読める: $f"; fi
+      done
+      if flock -n /var/lib/coldaisle-registry/.registry.lock true 2> /dev/null; then ng "flock を取れる"; fi
+      ```
+
+      加えて、同じアカウントで `/etc/coldaisle` を一覧できないこと（`ls -- /etc/coldaisle` が権限の error になる）。
+      何も出ず、`ls` が失敗すれば通っています
+   9. **`coldaisle`（API / 取り込み）の資格が authority・制御設定・Registry のどれにも触れないこと**（0134 §2.4 の 3。
+      C1）。unit と同じ資格（取り込みの unit の `User=coldaisle`・`Group=coldaisle`・`SupplementaryGroups=dialout`）の
+      `systemd-run` で、8 の `c1-denied.sh` を実行します。`/etc/coldaisle` の一覧の確認は行いません
+      （2 節で `root:coldaisle`・`0750` にしてあり、`coldaisle` は `coldaisle.env` を読むために一覧できる）
+
+      ```bash
+      sudo systemd-run --pipe --wait --quiet \
+           -p User=coldaisle -p Group=coldaisle -p SupplementaryGroups=dialout \
+           bash < c1-denied.sh
+      ```
+
+      何も出なければ通っています（`systemd-run` の作業ディレクトリは `/` なので、スクリプトは標準入力で渡します。
+      スクリプトの中に標準入力を読むコマンドはありません）
+   10. **制御設定の4ファイルを置き直した後**（導入先の手順で `install` し直したとき。0134 §2.4 の 4）: 手順 8 の
+       `getfacl` に加えて、`coldaisle-authority` だけのアカウントで4ファイルを `cat` できること（default ACL が
+       効いたことを、表示ではなく読み取りで確かめる）
+
+       ```bash
+       for f in fan-hardware.yaml safety.yaml fan-policy.yaml air-balance.yaml; do
+         cat -- "/etc/coldaisle/control-config/$f" > /dev/null || echo "読めない: $f"
+       done
+       ```
+
+   11. 結果（どの確認が通ったか・`getfacl` の形）を、C1 と C2 のそれぞれの後に #217 に残します。
+       **実機のユーザー名・ホスト名・path は書きません**（仮の名前に置き換える）
+
+   C1 と C2 がすべて通り、#217 に結果を残したら、この節の冒頭と 6.1 の「本番での `raise` は使えません」の注記を
+   外す PR を作ります（所有者の承認の後）。**C1 だけが通った状態では外しません**（0134 §2.5）。
 
 ### 6.8 Learned worker の unit（決定記録 0077 段階 6・0115）
 
