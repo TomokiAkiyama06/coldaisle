@@ -19,8 +19,8 @@ from __future__ import annotations
 
 import argparse
 import logging
-from collections.abc import Sequence
-from dataclasses import dataclass, replace
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass, field, replace
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -36,9 +36,10 @@ from coldaisle.ai.provider import AiSettings, Provider
 from coldaisle.clock import Clock, WallClock
 from coldaisle.llm_exclusions import METRICS_KEY, RULES_KEY, LlmExclusions, LlmExclusionsError
 from coldaisle.metrics import MetricCatalog
-from coldaisle.notify.models import Notification, NotifyConfig
+from coldaisle.notify.models import SEVERITY_LABELS, Notification, NotifyConfig
 from coldaisle.notify.notifiers import Notifier
 from coldaisle.notify.notifiers import from_env as notifiers_from_env
+from coldaisle.rules.models import RuleSet
 from coldaisle.store.csv_export import day_bounds_ms
 from coldaisle.store.db import Aggregation, SqliteStore
 from coldaisle.store.models import AlertRecord, AlertSeverity, RollupPoint
@@ -149,6 +150,11 @@ class DailyReport:
     2 日目以降に出ない。ルール名で分岐せず、全ルールに効く（0017 §2.3）。
     """
     ongoing_truncated: bool = False
+    rule_labels: Mapping[str, str] = field(default_factory=dict)
+    """`RULE_ID` → 人が読む名前（`config/rules.yaml` の `label`。決定記録 0142 §2.6）。
+
+    名前が無いルールは ID だけを出す。
+    """
     summary: str | None = None
     """AI の所見。**未検証**であり、無くてもレポートは成立する。"""
     llm_view: DailyReport | None = None
@@ -210,7 +216,10 @@ class DailyReport:
             lines += ["", f"**{ALERT_SCAN_LIMIT} 件を超えたため打ち切った。**"]
         if self.alerts:
             lines += ["", "| ルール | 重大度 | 件数 |", "|---|---|---|"]
-            lines += [f"| {a.rule_id} | {a.severity.value} | {a.count} |" for a in self.alerts]
+            lines += [
+                f"| {self._rule(a.rule_id)} | {SEVERITY_LABELS[a.severity]} | {a.count} |"
+                for a in self.alerts
+            ]
         lines += [""]
         if self.ongoing:
             zone = ZoneInfo(self.timezone)
@@ -221,7 +230,8 @@ class DailyReport:
                 "|---|---|---|",
             ]
             lines += [
-                f"| {o.rule_id} | {o.severity.value} | {_local_time(o.fired_ms, zone)} |"
+                f"| {self._rule(o.rule_id)} | {SEVERITY_LABELS[o.severity]} "
+                f"| {_local_time(o.fired_ms, zone)} |"
                 for o in self.ongoing
             ]
             if self.ongoing_truncated:
@@ -238,6 +248,11 @@ class DailyReport:
                 "",
             ]
         return lines
+
+    def _rule(self, rule_id: str) -> str:
+        """`<名前>（<RULE_ID>）`。測定値の表の `<表示名>（<メトリクス>）` と揃える（0142 §2.6）。"""
+        label = self.rule_labels.get(rule_id)
+        return f"{label}（{rule_id}）" if label else rule_id
 
 
 _NO_DATA_NOTE = (
@@ -301,6 +316,7 @@ def build(
     catalog: MetricCatalog,
     max_alerts: int,
     exclusions: LlmExclusions | None,
+    rule_labels: Mapping[str, str] | None = None,
 ) -> DailyReport:
     """1日ぶんを集計する。**ここに推論は入らない。**
 
@@ -317,7 +333,8 @@ def build(
         for metric in names
     )
     window = _Window(start_ms, end_ms, prev_start_ms, prev_end_ms)
-    human = _view(store, day, tz, lines, window, max_alerts=max_alerts)
+    labels = dict(rule_labels or {})
+    human = replace(_view(store, day, tz, lines, window, max_alerts=max_alerts), rule_labels=labels)
     if exclusions is None:
         return human
     excluded = exclusions.excluded_metrics(names, catalog)
@@ -331,7 +348,7 @@ def build(
         exclude_rule_ids=exclusions.rule_ids,
         exclude_metrics=excluded,
     )
-    return replace(human, llm_view=llm)
+    return replace(human, llm_view=replace(llm, rule_labels=labels))
 
 
 @dataclass(frozen=True)
@@ -568,6 +585,7 @@ def run(
     day: date,
     summariser: Provider | None = None,
     exclusions: LlmExclusions | None = None,
+    rule_labels: Mapping[str, str] | None = None,
 ) -> DailyReport:
     """集計して所見を付ける。**送信とファイル書き込みは呼び出し側。**
 
@@ -580,6 +598,7 @@ def run(
         catalog=catalog,
         max_alerts=config.max_alerts,
         exclusions=exclusions,
+        rule_labels=rule_labels,
     )
     if summariser is None or report.llm_view is None:
         return report
@@ -596,6 +615,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--db", type=Path, default=Path("var/coldaisle.db"))
     parser.add_argument("--config", type=Path, default=Path("config/report.yaml"))
     parser.add_argument("--metrics", type=Path, default=Path("config/metrics.yaml"))
+    parser.add_argument(
+        "--rules",
+        type=Path,
+        default=Path("config/rules.yaml"),
+        help="アラートの表のルールの名前（label）を読む（決定記録 0142 §2.6）",
+    )
     parser.add_argument("--notify", type=Path, default=Path("config/notify.yaml"))
     parser.add_argument("--ai", type=Path, default=Path("config/ai.yaml"))
     parser.add_argument("--quality-rules", type=Path, default=Path("config/quality.yaml"))
@@ -608,6 +633,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     logs.configure(args.log_level)
     config = ReportConfig.from_yaml(args.config)
     catalog = MetricCatalog.from_yaml(args.metrics)
+    rule_labels = RuleSet.from_yaml(args.rules).labels()
     notify_config = NotifyConfig.from_yaml(args.notify)
     clock = WallClock()
     day = args.date or _yesterday(clock, config.zone)
@@ -622,6 +648,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             day=day,
             summariser=_summariser(args.ai, config) if exclusions is not None else None,
             exclusions=exclusions,
+            rule_labels=rule_labels,
         )
     finally:
         store.close()

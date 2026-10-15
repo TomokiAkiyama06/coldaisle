@@ -24,6 +24,7 @@ from coldaisle.clock import Clock
 from coldaisle.store import migrations
 from coldaisle.store.calibration_history import SELECT_ROWS as SELECT_CALIBRATION_ACTIVATIONS
 from coldaisle.store.calibration_history import CalibrationActivation, verify_activation_rows
+from coldaisle.store.hint_state import WorkloadHintStateTables
 from coldaisle.store.models import (
     AlertRecord,
     AlertSeverity,
@@ -48,6 +49,22 @@ from coldaisle.store.quality import QualityRules
 
 P95 = 0.95
 """FR-303 が要求する分位点。"""
+
+_EVENT_COLUMNS = "id, ts_ms, kind, payload, peer_uid, boot_id, boottime_ns"
+"""読み出す ``events`` の列（0045 §2.5 / 0066 §2.2）。"""
+
+
+def _event_record(row: sqlite3.Row) -> EventRecord:
+    return EventRecord(
+        id=row["id"],
+        ts_ms=row["ts_ms"],
+        kind=row["kind"],
+        payload_json=row["payload"],
+        peer_uid=row["peer_uid"],
+        boot_id=row["boot_id"],
+        boottime_ns=row["boottime_ns"],
+    )
+
 
 _SEQUENCED_TRACE_COLUMNS = "seq, ts_ms, tick_id, schema_version, trace_json"
 """読み取り API が読む `control_traces` の列（決定記録 0071 §2.2a）。"""
@@ -531,8 +548,16 @@ class SqliteStore:
             raise ValueError("採番前の event を渡す（id は保存時に決まる）")
         with self.transaction():
             cursor = self._conn.execute(
-                "INSERT INTO events (ts_ms, kind, payload, peer_uid) VALUES (?, ?, ?, ?)",
-                (event.ts_ms, event.kind, event.payload_json, event.peer_uid),
+                "INSERT INTO events (ts_ms, kind, payload, peer_uid, boot_id, boottime_ns) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (
+                    event.ts_ms,
+                    event.kind,
+                    event.payload_json,
+                    event.peer_uid,
+                    event.boot_id,
+                    event.boottime_ns,
+                ),
             )
             if state is not None:
                 key, value = state
@@ -782,17 +807,11 @@ class SqliteStore:
     def event(self, event_id: int) -> EventRecord | None:
         """ID で1件の事象を引く（#106 / 決定記録 0071 §2.7）。無ければ ``None``。"""
         row = self._conn.execute(
-            "SELECT id, ts_ms, kind, payload, peer_uid FROM events WHERE id = ?", (event_id,)
+            f"SELECT {_EVENT_COLUMNS} FROM events WHERE id = ?", (event_id,)
         ).fetchone()
         if row is None:
             return None
-        return EventRecord(
-            id=row["id"],
-            ts_ms=row["ts_ms"],
-            kind=row["kind"],
-            payload_json=row["payload"],
-            peer_uid=row["peer_uid"],
-        )
+        return _event_record(row)
 
     def events(
         self,
@@ -817,22 +836,53 @@ class SqliteStore:
             where += f" AND kind IN ({', '.join('?' for _ in kinds)})"
             params.extend(kinds)
         rows = self._conn.execute(
-            "SELECT id, ts_ms, kind, payload, peer_uid FROM ("
-            f"SELECT id, ts_ms, kind, payload, peer_uid FROM events WHERE {where} "
+            f"SELECT {_EVENT_COLUMNS} FROM ("
+            f"SELECT {_EVENT_COLUMNS} FROM events WHERE {where} "
             "ORDER BY ts_ms DESC, id DESC LIMIT ?"
             ") ORDER BY ts_ms, id",
             (*params, limit),
         ).fetchall()
-        return tuple(
-            EventRecord(
-                id=row["id"],
-                ts_ms=row["ts_ms"],
-                kind=row["kind"],
-                payload_json=row["payload"],
-                peer_uid=row["peer_uid"],
-            )
-            for row in rows
-        )
+        return tuple(_event_record(row) for row in rows)
+
+    def events_after_id(
+        self,
+        after_id: int,
+        *,
+        kinds: Sequence[str] | None = None,
+        limit: int = 1_000,
+    ) -> tuple[EventRecord, ...]:
+        """``id`` が ``after_id`` より大きい事象を **``id`` の昇順**（追記の順）に返す。
+
+        決定記録 0066 §2.2。
+
+        Workload Hint の起動時の復元と稼働中の増分取り込みは、行の順序にも読み進めた位置にも
+        壁時計（``ts_ms``）を使わない。時計が戻った後に追記された終了・置き換えの行は、``ts_ms`` が
+        開始の行より小さくても追記順に並ぶ。``limit`` を超えるときは**古い側（小さい id）を残す**
+        （読み進めた位置を最後の id に置けば、続きを取りこぼさない）。
+        """
+        if after_id < 0:
+            raise ValueError("after_id は 0 以上にする")
+        if limit <= 0:
+            raise ValueError("limit は正にする")
+        where = "id > ?"
+        params: list[object] = [after_id]
+        if kinds is not None:
+            if not kinds:
+                return ()
+            where += f" AND kind IN ({', '.join('?' for _ in kinds)})"
+            params.extend(kinds)
+        rows = self._conn.execute(
+            f"SELECT {_EVENT_COLUMNS} FROM events WHERE {where} ORDER BY id LIMIT ?",
+            (*params, limit),
+        ).fetchall()
+        return tuple(_event_record(row) for row in rows)
+
+    def workload_hint_state(self) -> WorkloadHintStateTables:
+        """この接続で Workload Hint の終端状態・run の記録・境界を扱う（決定記録 0066 §2.2）。
+
+        `coldaisle-fand` は ``events`` を読む接続とは**別の** `SqliteStore` からこれを作る。
+        """
+        return WorkloadHintStateTables(self._conn)
 
     def control_admin_audit(self, run_id: str | None = None) -> tuple[ControlAdminAuditRecord, ...]:
         """管理ソケットの監査の行を書いた順に返す。``run_id`` で1回の起動に絞れる。"""

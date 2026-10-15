@@ -7,12 +7,13 @@
 通知はその外側にある。
 """
 
-from coldaisle.notify.models import Notification, NotifyConfig
+from coldaisle.notify.models import DisplayNames, Notification, NotifyConfig
 from coldaisle.notify.notifiers import LineNotifier, Notifier, SlackNotifier, StdoutNotifier
 from coldaisle.notify.notifiers import from_env as notifiers_from_env
 from coldaisle.notify.router import Router
 
 __all__ = [
+    "DisplayNames",
     "LineNotifier",
     "Notification",
     "Notifier",

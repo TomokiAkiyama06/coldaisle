@@ -16,7 +16,8 @@ import pytest
 
 from coldaisle import logs
 from coldaisle.clock import SimulatedClock
-from coldaisle.notify import Notification, NotifyConfig, Router, StdoutNotifier
+from coldaisle.metrics import MetricCatalog
+from coldaisle.notify import DisplayNames, Notification, NotifyConfig, Router, StdoutNotifier
 from coldaisle.notify.models import DASHBOARD_URL_ENV
 from coldaisle.notify.notifiers import (
     LINE_TO_ENV,
@@ -27,10 +28,19 @@ from coldaisle.notify.notifiers import (
     SlackNotifier,
 )
 from coldaisle.notify.notifiers import from_env as notifiers_from_env
+from coldaisle.rules import RuleSet
 from coldaisle.store import AlertSeverity
 from conftest import CONFIG_DIR
 
 NOTIFY_PATH = CONFIG_DIR / "notify.yaml"
+RULES_PATH = CONFIG_DIR / "rules.yaml"
+_RULES = RuleSet.from_yaml(RULES_PATH)
+NAMES = DisplayNames.build(
+    rules=_RULES,
+    catalog=MetricCatalog.from_yaml(CONFIG_DIR / "metrics.yaml"),
+    context_always=NotifyConfig.from_yaml(NOTIFY_PATH, environ={}).context_always,
+)
+"""本番の設定から作った名前（決定記録 0142）。"""
 NOON_MS = 1_787_626_800_000  # 2026-08-25T12:00:00+09:00（昼）
 NIGHT_MS = 1_787_670_000_000  # 2026-08-26T00:00:00+09:00（夜）
 
@@ -64,6 +74,7 @@ def notification(state: str = "firing", severity: str = "warning", **kwargs) -> 
         "detail": None,
         "dashboard_url": "http://127.0.0.1:8000/",
         "context": {"air.room": 26.0, "air.front_intake": 33.2},
+        "names": NAMES,
     }
     return Notification(**{**defaults, **kwargs})
 
@@ -217,13 +228,13 @@ def test_night_window_wraps_midnight(at_ms, expected, config):
 # ---------------------------------------------------------------- 本文と失敗
 
 
-def test_body_carries_context_and_dashboard_link():
-    """本文だけで何が起きているか判断できるようにする（Issue の指定）。"""
+def test_body_carries_context_and_hint():
+    """本文だけで何が起きているか・何を確かめるかが分かる（Issue の指定 / 決定記録 0142）。"""
     text = notification().as_text()
-    assert "RECIRCULATION" in text
-    assert "7.20" in text
-    assert "air.room=26.00" in text
-    assert "http://127.0.0.1:8000/" in text
+    assert "排気が吸気側へ回り込んでいます" in text
+    assert "吸気上昇（再循環の指標） 7.2 °C（閾値 5.0 °C を超過）" in text
+    assert "室温 26.0 °C" in text
+    assert "確認してください" in text
 
 
 def test_resolution_is_visually_distinct():
@@ -233,16 +244,23 @@ def test_resolution_is_visually_distinct():
 
 
 SEVERITY_TITLES = [
-    ("critical", "firing", "🔴 [critical] RAPID_RISE [d.intake_rise] — firing"),
-    ("critical", "resolved", "✅ [critical 解除] RAPID_RISE [d.intake_rise] — resolved"),
-    ("warning", "firing", "🟠 [warning] RAPID_RISE [d.intake_rise] — firing"),
-    ("warning", "resolved", "✅ [warning 解除] RAPID_RISE [d.intake_rise] — resolved"),
+    ("critical", "firing", "🔴 [重大] GPU の吸気温度が急上昇しています"),
+    ("critical", "resolved", "✅ [重大 解除] GPU の吸気温度の急上昇が収まりました"),
+    ("warning", "firing", "🟠 [警告] GPU の吸気温度が急上昇しています"),
+    ("warning", "resolved", "✅ [警告 解除] GPU の吸気温度の急上昇が収まりました"),
+    ("info", "firing", "🔵 [情報] GPU の吸気温度が急上昇しています"),
 ]
+
+
+def rapid_rise(state: str, severity: str) -> Notification:
+    return notification(
+        state=state, severity=severity, rule_id="RAPID_RISE", metric="air.gpu_intake"
+    )
 
 
 @pytest.mark.parametrize(("severity", "state", "expected"), SEVERITY_TITLES)
 def test_body_starts_with_the_severity_on_slack(severity, state, expected):
-    """**本文の先頭の行に重大度が出る。**
+    """**本文の先頭の行に重大度が出る。** 文は日本語（決定記録 0142 §2.1）。
 
     critical と warning は同じ Slack のチャンネルへ届く（決定記録 0135 §2.2）ため、
     宛先では見分けられない。実際に POST される本文で確かめる。
@@ -254,26 +272,286 @@ def test_body_starts_with_the_severity_on_slack(severity, state, expected):
         return httpx.Response(200)
 
     client = httpx.Client(transport=httpx.MockTransport(handler))
-    item = notification(state=state, severity=severity, rule_id="RAPID_RISE")
-    SlackNotifier("https://example.invalid/hook", client=client).send(item)
-    assert posted[0]["text"].splitlines()[0] == expected
+    SlackNotifier("https://example.invalid/hook", client=client).send(rapid_rise(state, severity))
+    lines = posted[0]["text"].splitlines()
+    assert lines[0] == expected
+    assert lines[-1] == "RAPID_RISE / air.gpu_intake", "最後の行に ID を残す（0142 §2.2）"
 
 
 @pytest.mark.parametrize(("severity", "state", "expected"), SEVERITY_TITLES)
 def test_body_starts_with_the_severity_on_stdout(severity, state, expected, caplog):
-    """stdout（構造化ログ）の本文にも同じ先頭の行が出る。"""
-    item = notification(state=state, severity=severity, rule_id="RAPID_RISE")
+    """stdout（構造化ログ）の本文にも同じ先頭の行が出る。ログの欄は ID のまま（0142 §2.7）。"""
     with caplog.at_level("WARNING"):
-        StdoutNotifier().send(item)
+        StdoutNotifier().send(rapid_rise(state, severity))
     fields = [getattr(record, "fields", None) for record in caplog.records]
-    texts = [entry["text"] for entry in fields if entry]
-    assert texts[0].splitlines()[0] == expected
+    entries = [entry for entry in fields if entry]
+    assert entries[0]["text"].splitlines()[0] == expected
+    assert entries[0]["rule"] == "RAPID_RISE"
+
+
+def test_firing_body_in_japanese():
+    """発火の本文の全体（所有者が了承した形。決定記録 0142 §2.2）。
+
+    値と detail を重ねず、1 行に「対象の値（変化量）・関係する値・室温」。数は小数 1 桁。
+    ループバックのダッシュボードの URL は出さない。
+    """
+    item = notification(
+        severity="critical",
+        rule_id="RAPID_RISE",
+        metric="air.gpu_intake",
+        value=5.16,
+        detail="5.16 ℃/分で上昇している",
+        context={"air.gpu_intake": 37.15, "air.room": 26.09, "air.room_humidity": 48.0},
+    )
+    assert item.as_text().splitlines() == [
+        "🔴 [重大] GPU の吸気温度が急上昇しています",
+        "GPU吸気 37.1 °C（1 分で +5.2 °C）・室温 26.1 °C",
+        "GPU の前が塞がれていないか、排気が回り込んでいないかを確認してください。",
+        "RAPID_RISE / air.gpu_intake",
+    ]
+
+
+def test_resolved_body_in_japanese():
+    """解除は文と現在値の 1 行だけ（確かめることは載せない）。"""
+    item = notification(
+        severity="critical",
+        state="resolved",
+        rule_id="RAPID_RISE",
+        metric="air.gpu_intake",
+        value=None,
+        context={"air.gpu_intake": 38.0, "air.room": 24.1},
+    )
+    assert item.as_text().splitlines() == [
+        "✅ [重大 解除] GPU の吸気温度の急上昇が収まりました",
+        "GPU吸気 38.0 °C・室温 24.1 °C",
+        "RAPID_RISE / air.gpu_intake",
+    ]
+
+
+def test_dashboard_link_is_shown_only_when_reachable():
+    """`COLDAISLE_DASHBOARD_URL` を設定したとき（ループバックでない）だけ URL を載せる。"""
+    loopback = notification(dashboard_url="http://127.0.0.1:8000/").as_text()
+    localhost = notification(dashboard_url="http://localhost:8000/").as_text()
+    reachable = notification(dashboard_url="https://dashboard.example.invalid/").as_text()
+    assert "127.0.0.1" not in loopback
+    assert "localhost" not in localhost
+    assert reachable.splitlines()[-2] == "https://dashboard.example.invalid/"
+
+
+def test_alert_without_metric_has_id_only():
+    """`SENSOR_FAULT` はメトリクスを持たない。値は秒数で、°C を付けない（0142 §2.4）。"""
+    item = notification(
+        severity="critical",
+        rule_id="SENSOR_FAULT",
+        metric=None,
+        value=31.0,
+        detail="31 秒サンプルが届いていない",
+        context={"air.room": 24.1, "air.gpu_intake": 30.0},
+    )
+    lines = item.as_text().splitlines()
+    assert lines[:2] == [
+        "🔴 [重大] センサー基板からのデータが途絶えています",
+        "31 秒データが届いていない・室温 24.1 °C",
+    ]
+    assert lines[-1] == "SENSOR_FAULT"
+
+
+@pytest.mark.parametrize(
+    ("rule_id", "metric", "value", "context", "expected"),
+    [
+        (
+            "SENSOR_MISSING",
+            "air.top_exhaust",
+            5.0,
+            {"air.top_exhaust": None, "air.room": 24.1},
+            "トップ排気の値が 5 回続けて欠けた・室温 24.1 °C",
+        ),
+        (
+            "ROOM_HIGH",
+            "air.room",
+            30.52,
+            {"air.room": 30.52},
+            "室温 30.5 °C（閾値 30.0 °C を超過）",
+        ),
+        (
+            # 決定記録 0144: 設定の threshold は期待値を超えた分なので数を書かない
+            "AIRFLOW_DEGRADED",
+            "d.gpu_delta",
+            47.0,
+            {
+                "air.gpu_exhaust": 68.0,
+                "air.gpu_intake": 21.0,
+                "power.gpu.0": 600.0,
+                "air.room": 24.1,
+            },
+            "GPUが与えた熱 47.0 °C（GPU の電力に応じた正常の上限を超過）・GPU排気 68.0 °C"
+            "・GPU吸気 21.0 °C・GPU消費電力 600.0 W・室温 24.1 °C",
+        ),
+        (
+            "HUMIDITY_OUT_OF_RANGE",
+            "air.room_humidity",
+            71.0,
+            {"air.room_humidity": 71.0, "air.room": 24.1},
+            "室内湿度 71.0 %RH（上限 70.0 %RH を超過）・室温 24.1 °C",
+        ),
+        (
+            "HUMIDITY_OUT_OF_RANGE",
+            "air.room_humidity",
+            18.0,
+            {"air.room_humidity": 18.0, "air.room": 24.1},
+            "室内湿度 18.0 %RH（下限 20.0 %RH を下回る）・室温 24.1 °C",
+        ),
+        (
+            "GPU_FAN_BELOW_CURVE",
+            "gpu.0.fan_speed",
+            47.0,
+            {"gpu.0.core": 81.0, "air.room": 24.1},
+            "GPU Fan速度（NVMLの目標値） 47.0 %（70.0 % 未満）・GPUコア温度 81.0 °C・室温 24.1 °C",
+        ),
+        ("GPU_FAN_NOT_MANUAL", "gpu.0.fan_policy", 0.0, {"air.room": 24.1}, "室温 24.1 °C"),
+        (
+            "PROBE_CHANGED",
+            None,
+            None,
+            {"air.room": 24.1},
+            "較正が対応していないプローブ: gpu_intake・室温 24.1 °C",
+        ),
+    ],
+)
+def test_reading_line_follows_the_rule_kind(rule_id, metric, value, context, expected):
+    """値の行の書き方はルールの種類で決める（決定記録 0142 §2.4）。`flag` の値は出さない。"""
+    item = notification(
+        rule_id=rule_id,
+        metric=metric,
+        value=value,
+        detail="較正が対応していないプローブ: gpu_intake",
+        context=context,
+    )
+    assert item.as_text().splitlines()[1] == expected
+
+
+@pytest.mark.parametrize(
+    ("rule_id", "metric", "expected"),
+    [
+        ("RAPID_RISE", "air.gpu_intake", "🟠 [警告] GPU の吸気温度が急上昇しています"),
+        ("INTAKE_HIGH", "air.gpu_intake", "🟠 [警告] GPU の吸気温度が高くなっています"),
+        ("SENSOR_MISSING", "air.top_exhaust", "🟠 [警告] センサーの値が欠けています（トップ排気）"),
+        ("SENSOR_MISSING", "gpu.1.core", "🟠 [警告] センサーの値が欠けています（gpu.1.core）"),
+    ],
+)
+def test_metric_is_appended_only_when_the_rule_does_not_fix_it(rule_id, metric, expected):
+    """名前を重ねない。ルールの定義がメトリクスを決めていないときだけ括弧を付ける（0142 §2.1）。
+
+    `config/metrics.yaml` に無いメトリクスは ID のまま。
+    """
+    assert notification(rule_id=rule_id, metric=metric).title == expected
+
+
+def test_without_names_ids_are_shown():
+    """名前を渡さなければ ID のまま出る（名前の辞書を持たない呼び出し）。"""
+    item = notification(names=DisplayNames(), rule_id="RAPID_RISE", metric="air.gpu_intake")
+    assert item.title == "🟠 [警告] RAPID_RISE（air.gpu_intake） 発生"
 
 
 def test_explanation_title_carries_the_severity():
-    """発火に続く説明も同じチャンネルへ届くため、重大度を載せる。"""
+    """発火に続く説明も同じチャンネルへ届くため、重大度を載せる。最後の行に ID。"""
     item = notification(severity="critical", kind="explanation", body="説明")
-    assert item.title == "🔎 [critical] RECIRCULATION の説明"
+    assert item.title == "🔎 [重大] 説明: 排気が吸気側へ回り込んでいます"
+    assert item.as_text().splitlines()[-1] == "RECIRCULATION / d.intake_rise"
+
+
+TEXT_KEYS = ("label", "title", "resolved_title", "hint")
+
+
+def test_every_rule_has_texts():
+    """`config/rules.yaml` のすべてのルールに名前・2 つの文・確かめることがある（0142 §2.3）。"""
+    rules = RuleSet.from_yaml(RULES_PATH)
+    assert set(NAMES.rules) == {name.upper() for name in type(rules).model_fields}
+    for text in NAMES.rules.values():
+        for key in TEXT_KEYS:
+            value = getattr(text, key)
+            assert value.strip() and not value.isascii(), (key, value)
+
+
+@pytest.mark.parametrize("key", TEXT_KEYS)
+@pytest.mark.parametrize("blank", [False, True])
+def test_rule_without_a_text_is_rejected(tmp_path, key, blank):
+    """名前・文・確かめることが無い・空のルールは読み込みで落とす。"""
+    lines = RULES_PATH.read_text(encoding="utf-8").splitlines(keepends=True)
+    start = lines.index("  rapid_rise:\n")
+    index = next(i for i in range(start, len(lines)) if lines[i].startswith(f"    {key}: "))
+    lines[index] = f"    {key}: '   '\n" if blank else ""
+    path = tmp_path / "rules.yaml"
+    path.write_text("".join(lines), encoding="utf-8")
+    with pytest.raises(ValueError, match="rapid_rise"):
+        RuleSet.from_yaml(path)
+
+
+AIR = {
+    "air.room": 24.1,
+    "air.room_humidity": 55.0,
+    "air.front_intake": 27.0,
+    "air.gpu_intake": 30.0,
+    "air.gpu_exhaust": 52.0,
+    "air.top_exhaust": 33.0,
+    "air.rear_exhaust": 35.0,
+    "d.intake_rise": 2.9,
+    "d.gpu_delta": 22.0,
+}
+"""デーモンが渡す現在値の形（空気のセンサー 7 本と派生値）。"""
+
+
+@pytest.mark.parametrize(
+    ("rule_id", "metric", "expected"),
+    [
+        (
+            "AIRFLOW_DEGRADED",
+            "d.gpu_delta",
+            "GPUが与えた熱 22.0 °C・GPU排気 52.0 °C・GPU吸気 30.0 °C・室温 24.1 °C",
+        ),
+        (
+            "RECIRCULATION",
+            "d.intake_rise",
+            "吸気上昇（再循環の指標） 2.9 °C・前面吸気 27.0 °C・室温 24.1 °C",
+        ),
+        ("INTAKE_HIGH", "air.gpu_intake", "GPU吸気 30.0 °C・室温 24.1 °C"),
+        ("ROOM_HIGH", "air.room", "室温 24.1 °C"),
+        ("HUMIDITY_OUT_OF_RANGE", "air.room_humidity", "室内湿度 55.0 %RH・室温 24.1 °C"),
+        ("SENSOR_MISSING", "air.top_exhaust", "トップ排気 33.0 °C・室温 24.1 °C"),
+        ("SENSOR_FAULT", None, "室温 24.1 °C"),
+    ],
+)
+def test_context_lists_only_related_readings(rule_id, metric, expected):
+    """値の行はアラートのメトリクス・派生値の材料・室温だけ（決定記録 0142 §2.2a）。
+
+    材料は `config/metrics.yaml` の派生値の定義から引く。室温は最後に 1 回だけ。
+    解除の本文で確かめる（発火の対象の値の注記が付かない形）。
+    """
+    item = notification(
+        state="resolved", rule_id=rule_id, metric=metric, value=None, context=dict(AIR)
+    )
+    assert item.as_text().splitlines()[1] == expected
+
+
+def test_context_always_must_be_a_known_metric():
+    """常に付けるメトリクスの綴り違いは起動時に落とす。"""
+    with pytest.raises(ValueError, match="context_always"):
+        DisplayNames.build(
+            rules=_RULES,
+            catalog=MetricCatalog.from_yaml(CONFIG_DIR / "metrics.yaml"),
+            context_always=("air.rooom",),
+        )
+
+
+def test_notify_config_requires_context_always(tmp_path):
+    """`config/notify.yaml` の `context_always` は必須（書き漏らしで室温が黙って消えない）。"""
+    text = NOTIFY_PATH.read_text(encoding="utf-8")
+    broken = text.replace("context_always: [air.room]\n", "")
+    assert broken != text
+    path = tmp_path / "notify.yaml"
+    path.write_text(broken, encoding="utf-8")
+    with pytest.raises(ValueError, match="context_always"):
+        NotifyConfig.from_yaml(path, environ={})
 
 
 def test_a_failing_target_does_not_stop_the_others(config, caplog):
@@ -425,7 +703,8 @@ def test_dashboard_url_env_overrides_yaml():
     """導入先のアドレスは環境変数で与える。public なリポジトリの config に書けない（ルール 10）。"""
     config = NotifyConfig.from_yaml(NOTIFY_PATH, environ={DASHBOARD_URL_ENV: EXAMPLE_DASHBOARD})
     assert config.dashboard_url == EXAMPLE_DASHBOARD
-    assert notification(dashboard_url=config.dashboard_url).as_text().endswith(EXAMPLE_DASHBOARD)
+    lines = notification(dashboard_url=config.dashboard_url).as_text().splitlines()
+    assert lines[-2] == EXAMPLE_DASHBOARD, "URL の後は ID の行（決定記録 0142 §2.2）"
 
 
 def test_dashboard_url_without_env_keeps_yaml():

@@ -33,7 +33,7 @@ from pathlib import Path
 from types import FrameType
 
 from coldaisle import logs
-from coldaisle.clock import Clock, WallClock
+from coldaisle.clock import BootClock, BootClockUnavailableError, Clock, WallClock
 from coldaisle.event_entry.config import DEFAULT_CONFIG, EventEntrySettings
 from coldaisle.event_entry.messages import MessageError, parse_message
 from coldaisle.local_socket import (
@@ -90,15 +90,26 @@ class EventEntryServer:
         settings: EventEntrySettings,
         store: SqliteStore,
         clock: Clock,
+        boot_clock: BootClock,
         server_uid: int | None = None,
     ) -> None:
         if not peer_credentials_supported():
             raise EntryStartupError(
                 "SO_PEERCRED が無いプラットフォームでは起動しない（接続相手を確かめられない）"
             )
+        # 書く行には boot id と CLOCK_BOOTTIME を必ず入れる（決定記録 0066 §2.2）。
+        # 読めない環境では、入れられない行を書き始める前に起動を止める
+        try:
+            boot_clock.boot_id()
+            boot_clock.boottime_ns()
+        except BootClockUnavailableError as exc:
+            raise EntryStartupError(
+                "boot id / CLOCK_BOOTTIME を読めないため起動しない（決定記録 0066 §2.2）"
+            ) from exc
         self._settings = settings
         self._store = store
         self._clock = clock
+        self._boot_clock = boot_clock
         group_gid = resolve_group(settings.socket.group)
         self._authorizer = Authorizer(
             server_uid=os.geteuid() if server_uid is None else server_uid,
@@ -223,14 +234,22 @@ class EventEntryServer:
             self.rejected += 1
             return
 
-        now_ms = self._clock.now_ms()
         try:
+            # 行の CLOCK_BOOTTIME は壁時計より**先に**採る（0066 §2.2）。2つの採取の間に
+            # suspend をはさむと、行の boottime が古い側に寄り、読み手から見た経過は
+            # 多めになる（期限は短くなる側）。逆の順では suspend の時間が経過から落ち、
+            # 失効したヒントを有効のまま扱いうる
+            boot_id = self._boot_clock.boot_id()
+            boottime_ns = self._boot_clock.boottime_ns()
+            now_ms = self._clock.now_ms()
             stored = self._store.record_event(
                 EventRecord(
                     ts_ms=now_ms,
                     kind=message.kind,
                     payload_json=message.payload_json(),
                     peer_uid=uid,
+                    boot_id=boot_id,
+                    boottime_ns=boottime_ns,
                 ),
                 state=message.system_state(),
             )
@@ -305,7 +324,7 @@ def main(
     *,
     install_signals: Callable[[EventEntryServer], None] | None = None,
 ) -> int:
-    """`coldaisle-eventd` の入口。時計は常に実時計（0045 §2.5）。"""
+    """`coldaisle-eventd` の入口。時計は常に実時計（0045 §2.5。boot id と `CLOCK_BOOTTIME` も）。"""
     args = build_parser().parse_args(argv)
     logs.configure(args.log_level)
     settings = EventEntrySettings.from_yaml(args.config)
@@ -314,7 +333,7 @@ def main(
     with SqliteStore(
         args.db, rules=QualityRules.from_yaml(args.quality_rules), clock=clock
     ) as store:
-        server = EventEntryServer(settings=settings, store=store, clock=clock)
+        server = EventEntryServer(settings=settings, store=store, clock=clock, boot_clock=clock)
         (install_signals or _install_signal_handlers)(server)
         server.bind()
         try:

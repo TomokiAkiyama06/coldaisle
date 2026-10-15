@@ -354,6 +354,63 @@ def test_sensor_missing_on_exhaust_still_cancels_pending(engine, store):
     assert alert.state == "firing"
 
 
+# ---------------------------------------------------------------- 起動時の復元（0144 §2.8）
+
+
+def test_restart_cancels_a_pending_left_by_the_old_fixed_threshold(store, rule_set):
+    """旧い `d.gpu_delta > 20` で始まった pending を持ち越さない。
+
+    600 W・差 39（超過 5。新しい発火の閾値 6 を超えていない）が続いても、旧い時計で発火しない。
+    """
+    store.open_alert(
+        rule_id=RULE_ID,
+        severity="warning",
+        metric="d.gpu_delta",
+        started_ms=at(-900),
+        threshold=20.0,
+        trigger_value=26.0,
+    )
+    engine = make_engine(store, rule_set)
+    assert rows(store) == [], "復元で取り消す"
+    run(engine, store, 0, 600, power=600.0, delta=39.0)
+    assert rows(store) == []
+
+
+def test_restart_keeps_a_firing_alert(store, rule_set):
+    """発火中の行は保ち、新しい判定の解除（超過 < clear）で解く。"""
+    alert_id = store.open_alert(
+        rule_id=RULE_ID,
+        severity="warning",
+        metric="d.gpu_delta",
+        started_ms=at(-900),
+        threshold=20.0,
+        trigger_value=26.0,
+    )
+    store.fire_alert(alert_id, fired_ms=at(-600), trigger_value=26.0)
+    engine = make_engine(store, rule_set)
+    run(engine, store, 0, 10, power=600.0, delta=39.0)  # 超過 5 >= 4
+    assert rows(store)[0].state == "firing"
+    run(engine, store, 10, 20, power=600.0, delta=32.0)
+    assert rows(store)[0].state == "resolved"
+
+
+def test_restart_restarts_counting_for_a_real_excess(store, rule_set):
+    """新しい判定でも成立している pending は、起動の後の最初の成立から数え直す。"""
+    store.open_alert(
+        rule_id=RULE_ID,
+        severity="warning",
+        metric="d.gpu_delta",
+        started_ms=at(-900),
+        threshold=40.0,
+        trigger_value=47.0,
+    )
+    engine = make_engine(store, rule_set)
+    run(engine, store, 0, 400, power=600.0, delta=47.0)
+    [alert] = rows(store)
+    assert alert.started_ms == at(0)
+    assert alert.fired_ms == at(300)
+
+
 # ---------------------------------------------------------------- 設定の検査
 
 

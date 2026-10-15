@@ -37,7 +37,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from coldaisle.api.app import Config, create_app
-from coldaisle.clock import SimulatedClock
+from coldaisle.clock import SIMULATED_BOOT_ID, BootClockUnavailableError, SimulatedClock
 from coldaisle.event_entry import client as event_client
 from coldaisle.event_entry import server as event_server
 from coldaisle.event_entry.config import EventEntrySettings
@@ -95,7 +95,12 @@ class RunningServer:
     """別スレッドで入口を動かす。SQLite の接続はそのスレッドで開く（0004 §2.8）。"""
 
     def __init__(
-        self, settings: EventEntrySettings, db: Path, rules: QualityRules, **kwargs: int
+        self,
+        settings: EventEntrySettings,
+        db: Path,
+        rules: QualityRules,
+        clock: SimulatedClock | None = None,
+        **kwargs: int,
     ) -> None:
         self.settings = settings
         self._ready = threading.Event()
@@ -104,10 +109,14 @@ class RunningServer:
 
         def run() -> None:
             try:
-                clock = SimulatedClock(TEST_EPOCH_MS)
-                with SqliteStore(db, rules=rules, clock=clock) as store:
+                server_clock = SimulatedClock(TEST_EPOCH_MS) if clock is None else clock
+                with SqliteStore(db, rules=rules, clock=server_clock) as store:
                     self.server = EventEntryServer(
-                        settings=settings, store=store, clock=clock, **kwargs
+                        settings=settings,
+                        store=store,
+                        clock=server_clock,
+                        boot_clock=server_clock,
+                        **kwargs,
                     )
                     self.server.bind()
                     self._ready.set()
@@ -1474,3 +1483,90 @@ def test_only_the_entry_config_mentions_workload_hints():
         if path.is_file() and HINT_NAME.search(path.read_text(encoding="utf-8", errors="ignore"))
     )
     assert mentioned == ["event-entry.yaml"]
+
+
+# ---------------------------------------------------------------- boot id と CLOCK_BOOTTIME（0066）
+
+
+@needs_peercred
+def test_every_written_row_carries_the_boot_id_and_boottime(running, db, rules):
+    """移行後に eventd が書く行は、boot id と CLOCK_BOOTTIME の両方を必ず持つ（0066 §2.2）。"""
+    assert running.send(encode_workload_hint("start", workload="training"))["ok"] is True
+    assert running.send(encode_gpu_mode("ai"))["ok"] is True
+    events = stored_events(db, rules)
+    assert len(events) == 2
+    for event in events:
+        assert event.boot_id == SIMULATED_BOOT_ID
+        # SimulatedClock はシナリオの開始を boot の起点にする。進めていないので 0
+        assert event.boottime_ns == 0
+
+
+class _UnavailableBootClock:
+    def boot_id(self) -> str:
+        raise BootClockUnavailableError("boot id を読めない")
+
+    def boottime_ns(self) -> int:
+        raise BootClockUnavailableError("CLOCK_BOOTTIME を読めない")
+
+
+@needs_peercred
+def test_eventd_refuses_to_start_without_a_boot_clock(db, rules):
+    """入れられない行を書き始める前に止める（片方だけ・両方 NULL の行を新しく作らない）。"""
+    clock = SimulatedClock(TEST_EPOCH_MS)
+    with (
+        SqliteStore(db, rules=rules, clock=clock) as store,
+        pytest.raises(EntryStartupError, match="CLOCK_BOOTTIME"),
+    ):
+        EventEntryServer(
+            settings=EventEntrySettings.from_yaml(CONFIG_PATH),
+            store=store,
+            clock=clock,
+            boot_clock=_UnavailableBootClock(),
+        )
+
+
+class _AdvancingClock(SimulatedClock):
+    """読むたびにシナリオ時間を進める時計。2つの採取の間に suspend をはさんだ状況を作る。"""
+
+    STEP_MS = 1_000
+
+    def __init__(self, start_ms: int) -> None:
+        super().__init__(start_ms)
+        self.armed = False
+
+    def _step(self) -> None:
+        if self.armed:
+            self.advance_to_ms(SimulatedClock.now_ms(self) + self.STEP_MS)
+
+    def now_ms(self) -> int:
+        value = super().now_ms()
+        self._step()
+        return value
+
+    def boottime_ns(self) -> int:
+        value = super().boottime_ns()
+        self._step()
+        return value
+
+
+@needs_peercred
+def test_the_row_boottime_is_taken_before_the_wall_clock(short_dir, db, rules):
+    """行の CLOCK_BOOTTIME は壁時計より先に採る（suspend が経過から落ちない側。0066 §2.2）。
+
+    採取のたびに時計を進めると、先に採った値のほうが古い。行の boottime（開始からの経過）が
+    壁時計の経過より大きければ、壁時計を先に採っている（suspend の時間を経過から落とす順）。
+    """
+    clock = _AdvancingClock(TEST_EPOCH_MS)
+    entry = RunningServer(settings_for(short_dir / "run" / "events.sock"), db, rules, clock=clock)
+    try:
+        clock.armed = True
+        assert entry.send(encode_workload_hint("start", workload="training"))["ok"] is True
+    finally:
+        clock.armed = False
+        entry.stop()
+    with SqliteStore(db, rules=rules, clock=SimulatedClock(TEST_EPOCH_MS)) as store:
+        (event,) = store.events_after_id(0)
+    assert event.boottime_ns is not None
+    row_boottime_ms = event.boottime_ns // 1_000_000
+    row_wall_elapsed_ms = event.ts_ms - TEST_EPOCH_MS
+    assert row_boottime_ms < row_wall_elapsed_ms, "CLOCK_BOOTTIME を壁時計より先に採る"

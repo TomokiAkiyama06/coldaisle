@@ -166,10 +166,11 @@ class Engine:
             state.firing = alert.state.value == "firing"
             state.severity = alert.severity.value
             self._advance(alert.started_ms)
-            if not state.firing and alert.rule_id in self._latest_rule_ids():
+            if not state.firing and alert.rule_id in self._restart_reset_rule_ids():
                 # DB の最新値を読むルールの発火待ちは、止まっていた間を連続とみなさない
                 # （決定記録 0131 §2.3。欠けた入力で発火待ちを取り消すのと同じ扱い）。
-                # 残すと、再起動の直後に 1 回成立しただけで継続時間を満たしたことになる
+                # 残すと、再起動の直後に 1 回成立しただけで継続時間を満たしたことになる。
+                # 電力で判定するルールは、旧い判定で始まった pending を持ち越さない（0144 §2.8）
                 self._cancel_pending(alert.rule_id, alert.metric)
         self._cancel_hydrated_gaps()
 
@@ -562,12 +563,18 @@ class Engine:
             return self._continue(rule_id, rule.metric, slope, rule.fire_after_s)
         return self._end(rule_id, rule.metric) if state.since_ms is not None else []
 
-    def _latest_rule_ids(self) -> frozenset[str]:
-        """DB の最新値を読むルールの rule_id（決定記録 0131 §2.3）。"""
+    def _restart_reset_rule_ids(self) -> frozenset[str]:
+        """復元のときに発火待ちを取り消して数え直すルールの rule_id。
+
+        - DB の最新値を読むルール（決定記録 0131 §2.3）
+        - 電力から求めた期待値で判定するルール（決定記録 0144 §2.8）。判定の形を変えた前の版が残した
+          pending（旧い固定の閾値で始まったもの）を、新しい閾値を一度も超えないまま古い時計で
+          発火させないため。毎回の起動で同じに扱う（版を見分ける印を行に持たない）
+        """
         return frozenset(
             name.upper()
             for name, rule in self.rules
-            if isinstance(rule, FlagOffRule | HotAndSlowRule)
+            if isinstance(rule, FlagOffRule | HotAndSlowRule | PowerReferencedRule)
         )
 
     def _evaluate_latest(self) -> list[Transition]:

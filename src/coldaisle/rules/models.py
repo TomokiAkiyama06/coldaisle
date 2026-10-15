@@ -11,10 +11,10 @@ from __future__ import annotations
 
 from itertools import pairwise
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from coldaisle.store.models import METRIC_PATTERN, AlertSeverity
 
@@ -27,11 +27,42 @@ def rule_metrics(rule: BaseModel) -> tuple[str, ...]:
     return tuple(value for key in METRIC_KEYS if isinstance(value := getattr(rule, key, None), str))
 
 
+TEXT_KEYS = ("label", "title", "resolved_title", "hint")
+"""人が読む文の項目（決定記録 0142）。閾値ではないので、AI ツールと運用メモリの事実には出さない。"""
+
+ValueKind = Literal[
+    "threshold", "excess", "range", "slope", "below", "flag", "seconds", "samples", "event"
+]
+"""遷移の `value` が何を表すか（決定記録 0142 §2.4）。通知の値の行の書き方を決める。
+
+ルールごとに値の意味が違う（`SENSOR_FAULT` は秒数、`RAPID_RISE` は 1 分あたりの変化）。
+メトリクスの単位を機械的に付けると、秒数に `°C` が付く。
+"""
+
+
 class _Rule(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     enabled: bool
     severity: AlertSeverity
+    label: str
+    """短い名前（決定記録 0142 §2.3）。日次レポートの表に出る。"""
+    title: str
+    """発火の通知の見出しの文（例「GPU の吸気温度が急上昇しています」）。"""
+    resolved_title: str
+    """解除の通知の見出しの文（例「GPU の吸気温度の急上昇が収まりました」）。"""
+    hint: str
+    """発火の通知に載せる「確かめること」の一文。
+
+    4 つとも**必須**。省略を許すと、書き漏らしが ID だけの通知・手掛かりの無い通知として静かに通る。
+    """
+
+    @field_validator("label", "title", "resolved_title", "hint")
+    @classmethod
+    def _text_is_not_blank(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("空の文")
+        return value
 
 
 class ThresholdRule(_Rule):
@@ -182,6 +213,14 @@ class RuleSet(BaseModel):
     gpu_fan_not_manual: FlagOffRule
     gpu_fan_below_curve: HotAndSlowRule
 
+    def labels(self) -> dict[str, str]:
+        """`RULE_ID`（ルールの名前の大文字）→ 人が読む名前（決定記録 0142 §2.3）。"""
+        return {name.upper(): rule.label for name, rule in self}
+
+    def value_kinds(self) -> dict[str, ValueKind]:
+        """`RULE_ID` → 遷移の `value` の意味（決定記録 0142 §2.4）。**ルールの型で決める。**"""
+        return {name.upper(): _value_kind(rule) for name, rule in self}
+
     @classmethod
     def from_yaml(cls, path: Path) -> RuleSet:
         loaded: Any = yaml.safe_load(path.read_text(encoding="utf-8"))
@@ -239,3 +278,23 @@ def _validate_power_referenced(name: str, rule: PowerReferencedRule) -> None:
             raise ValueError(f"{name}: expected の power_w は増える順に並べる")
         if high.value < low.value:
             raise ValueError(f"{name}: expected の value は電力について減らないようにする")
+
+
+def _value_kind(rule: BaseModel) -> ValueKind:
+    """ルールの型から値の意味を決める。ルールの名前（ID）で分岐しない。"""
+    kinds: tuple[tuple[type[BaseModel], ValueKind], ...] = (
+        (ThresholdRule, "threshold"),
+        # 0144: `threshold` は期待値を超えた分で、値（d.gpu_delta）と同じ尺度ではない
+        (PowerReferencedRule, "excess"),
+        (RangeRule, "range"),
+        (SlopeRule, "slope"),
+        (HotAndSlowRule, "below"),
+        (FlagOffRule, "flag"),
+        (SilenceRule, "seconds"),
+        (ConsecutiveRule, "samples"),
+        (EventRule, "event"),
+    )
+    for model, kind in kinds:
+        if isinstance(rule, model):
+            return kind
+    raise TypeError(f"値の意味が決まっていないルールの型: {type(rule).__name__}")
