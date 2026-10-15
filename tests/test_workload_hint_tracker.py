@@ -487,3 +487,41 @@ def test_older_versions_cannot_carry_the_block():
     raw["workload_hint"] = {"schema_version": 1, "stage": "off", "influence": "none"}
     with pytest.raises(ValidationError, match="schema version 16"):
         ControlTick.model_validate_json(json.dumps(raw))
+
+
+@pytest.mark.parametrize("failure", ["stale", "unreadable", "dead"])
+def test_unreadable_ticks_do_not_reset_the_contradiction_hold(failure):
+    """読めない tick は使わないだけで、同じ event の矛盾の保持は続く（PR #332 の Codex P2）。"""
+    r = rig()
+    observation = active(r)
+    r.publish(observation)
+    r.step(regime=WorkloadRegime.IDLE)
+    for _ in range(3):
+        r.advance(HOLD_MS // 4)
+        if failure == "stale":
+            r.monotonic.advance_ms(STALE_MS + 1)
+        elif failure == "unreadable":
+            r.publish(None, state=HintFeedState.UNREADABLE)
+        else:
+            r.mailbox.alive = False
+        tick = r.step(regime=WorkloadRegime.IDLE)
+        assert tick.lost is HintPriorSkipped.HINT_STATE_UNREADABLE
+        r.mailbox.alive = True
+        r.publish(observation)
+        assert r.step(regime=WorkloadRegime.IDLE).status is WorkloadHintStatus.ACTIVE
+    r.advance(HOLD_MS // 4)
+    r.publish(observation)
+    assert r.step(regime=WorkloadRegime.IDLE).status is WorkloadHintStatus.CONTRADICTED
+
+
+def test_a_break_in_the_regime_while_unreadable_still_restarts_the_hold():
+    r = rig()
+    observation = active(r)
+    r.publish(observation)
+    r.step(regime=WorkloadRegime.IDLE)
+    r.advance(HOLD_MS - 1)
+    r.publish(None, state=HintFeedState.UNREADABLE)
+    r.step(regime=WorkloadRegime.SUSTAINED_GPU)
+    r.advance(1)
+    r.publish(observation)
+    assert r.step(regime=WorkloadRegime.IDLE).status is WorkloadHintStatus.ACTIVE

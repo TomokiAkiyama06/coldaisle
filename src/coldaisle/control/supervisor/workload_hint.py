@@ -257,7 +257,7 @@ class WorkloadHintTracker:
                 "workload hint の状態を進められなかった; ヒントを使わない",
                 extra={logs.FIELDS_KEY: {"tick_id": tick_id, "reason": "hint_state_unreadable"}},
             )
-            self._reset_contradiction()
+            self._keep_contradiction_while_unreadable(regime)
             return self._lost(HintPriorSkipped.HINT_STATE_UNREADABLE)
 
     def record(
@@ -309,7 +309,7 @@ class WorkloadHintTracker:
         assert mailbox is not None
         feed = self._feed(mailbox)
         if feed is None:
-            self._reset_contradiction()
+            self._keep_contradiction_while_unreadable(regime)
             return self._lost(HintPriorSkipped.HINT_STATE_UNREADABLE)
         if feed.state is HintFeedState.RUN_START_NOT_DURABLE:
             self._reset_contradiction()
@@ -397,6 +397,17 @@ class WorkloadHintTracker:
         ):
             return None
         return feed
+
+    def _keep_contradiction_while_unreadable(self, regime: WorkloadRegime | None) -> None:
+        """読めない tick はヒントを使わないだけで、同じ event の矛盾の保持は消さない。
+
+        読み手の健全性はテレメトリの観測と関係が無い。消すと、読み手の短い失敗が繰り返すだけで
+        ``contradicted`` に届かず、B0 の証拠の矛盾を少なく数える（PR #332 の Codex P2）。
+        Regime が食い違わなくなった tick は、読めるときと同じく数え直す。終端にするのは、
+        次に読めて同じ event が active と分かった tick（保持の起点はそのまま）。
+        """
+        if regime not in CONTRADICTING_REGIMES:
+            self._reset_contradiction()
 
     def _contradicted(
         self, event_id: int, regime: WorkloadRegime | None, boot: BootReading
