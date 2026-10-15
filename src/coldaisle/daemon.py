@@ -872,6 +872,7 @@ def _explainer_factory(
         store = SqliteStore(config.db, rules=quality_rules, clock=clock)
         return Explainer(
             provider=provider,
+            context=settings.explain_context,
             # 説明の Evidence（get_latest / get_stats）もツールを通る。除外を当てる（0131 §2.4a）
             tools=ToolRegistry(
                 store=store, catalog=catalog, rules=rule_set, clock=clock, exclusions=exclusions

@@ -77,6 +77,21 @@ class AnthropicLimits(BaseModel):
     """
 
 
+class ExplainContext(BaseModel):
+    """`config/ai.yaml` の `explain_context:`。アラートの説明に足す負荷と温度の集計（0143 §2.11）。
+
+    **集計（平均・最大・傾き）だけを渡す。** 生の時系列は渡さない（ルール 8）。
+    LLM へ渡さない一覧（0131 §2.4a / 0138）に当たるメトリクスは、ここに書いても材料にならない。
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    window: str = Field(pattern=r"^[1-9][0-9]*[smh]$")
+    """発火の直前から遡る窓（例 `15m`）。説明は発火の直後に作るので「直近」で発火の前後を見る。"""
+    metrics: tuple[str, ...] = Field(min_length=1, max_length=16)
+    """集計して渡すメトリクス。プロンプトの長さを抑えるため 16 個まで。"""
+
+
 class AiSettings(BaseModel):
     """`config/ai.yaml`。接続先とモデル名は含まない（環境変数から）。"""
 
@@ -94,6 +109,8 @@ class AiSettings(BaseModel):
     send_thinking_flag: bool
     explain_alerts: bool = True
     """発火したアラートに Evidence 形式の説明を後追いで付けるか（#38）。"""
+    explain_context: ExplainContext | None = None
+    """アラートの説明に足す負荷と温度の集計（0143 §2.11）。無ければ足さない（今のまま）。"""
     anthropic: AnthropicLimits | None = None
     """Claude API を使うときの上限（決定記録 0143 §2.5）。無ければ Claude API を使わない。"""
 

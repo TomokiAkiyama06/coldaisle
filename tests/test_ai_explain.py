@@ -12,7 +12,14 @@ import json
 
 import pytest
 
-from coldaisle.ai import ChatResult, Explainer, ToolRegistry, UnavailableProvider
+from coldaisle.ai import (
+    AiSettings,
+    ChatResult,
+    ExplainContext,
+    Explainer,
+    ToolRegistry,
+    UnavailableProvider,
+)
 from coldaisle.ai.explain import FORBIDDEN, Evidence, Explanation
 from coldaisle.clock import SimulatedClock
 from coldaisle.llm_exclusions import LlmExclusions
@@ -307,3 +314,167 @@ def test_explanation_without_ai_parts_still_renders():
     )
     assert "✓ [L2] 30秒サンプルが無い" in explanation.as_text()
     assert "UNVERIFIED" not in explanation.as_text()
+
+
+# ------------------------------------------------ 負荷と温度の材料と見立て（0143 §2.11）
+
+
+CONTEXT = ExplainContext(
+    window="15m",
+    metrics=(
+        "gpu.0.utilization",
+        "power.gpu.0",
+        "gpu.0.core",
+        "air.room",
+        "gpu.0.fan_speed",
+        "gpu.0.fan_policy",
+    ),
+)
+
+ASSESSED = json.dumps(
+    {
+        "unverified": ["エアコンの稼働状態"],
+        "checks": ["背面と壁の間隔を確認する"],
+        "assessment": (
+            "GPU使用率は平均 92.00 で、GPU消費電力も最大 450.00 まで上がっています。"
+            "室温は 26.0 のままで、吸気の上昇は負荷の増加と重なっています。"
+            "空調よりも負荷の増加に近い見立てです。"
+        ),
+    },
+    ensure_ascii=False,
+)
+
+# 0138 の一覧（gpu.*.fan_speed を足した形）。config/report.yaml への反映は #320
+EXCLUSIONS_0138 = LlmExclusions.from_mapping(
+    {
+        "llm_excluded_metrics": ["gpu.*.fan_policy", "gpu.*.fan_speed"],
+        "llm_excluded_rules": ["GPU_FAN_NOT_MANUAL", "GPU_FAN_BELOW_CURVE"],
+    }
+)
+
+
+@pytest.fixture
+def loaded_store(tmp_path, rules):
+    """負荷と温度、除外のメトリクス（GPU の Fan）を持つ DB。"""
+    with SqliteStore(tmp_path / "load.db", rules=rules, clock=SimulatedClock(NOW_MS)) as opened:
+        for index in range(120):
+            opened.insert_sample(
+                Sample(
+                    ts_ms=NOW_MS - 120 * INTERVAL_MS + index * INTERVAL_MS,
+                    readings=(
+                        Reading(metric="air.room", value=26.0, quality=Quality.OK),
+                        Reading(metric="air.front_intake", value=32.2, quality=Quality.OK),
+                        Reading(metric="gpu.0.utilization", value=92.0, quality=Quality.OK),
+                        Reading(metric="power.gpu.0", value=450.0, quality=Quality.OK),
+                        Reading(metric="gpu.0.core", value=78.0, quality=Quality.OK),
+                        Reading(metric="gpu.0.fan_speed", value=63.0, quality=Quality.OK),
+                        Reading(metric="gpu.0.fan_policy", value=1.0, quality=Quality.OK),
+                    ),
+                )
+            )
+        yield opened
+
+
+def _registry(store, exclusions: LlmExclusions) -> ToolRegistry:
+    return ToolRegistry(
+        store=store,
+        catalog=MetricCatalog.from_yaml(CONFIG_DIR / "metrics.yaml"),
+        rules=RuleSet.from_yaml(CONFIG_DIR / "rules.yaml"),
+        clock=store.clock,
+        exclusions=exclusions,
+    )
+
+
+def _explainer(store, answer: str = ASSESSED) -> tuple[Explainer, FakeProvider]:
+    provider = FakeProvider(answer)
+    explainer = Explainer(
+        provider=provider, tools=_registry(store, EXCLUSIONS_0138), context=CONTEXT
+    )
+    return explainer, provider
+
+
+def test_load_and_temperature_aggregates_are_in_the_material(loaded_store):
+    """使用率・電力・温度の**集計**が材料に入る。生の値の列は入らない。"""
+    explainer, provider = _explainer(loaded_store)
+    assert explainer.explain(alert()) is not None
+    prompt = provider.prompts[0]
+    for metric in ("gpu.0.utilization", "power.gpu.0", "gpu.0.core", "air.room"):
+        assert f"{metric} 直近15m: 平均" in prompt
+    assert "gpu.0.utilization 直近15m: 平均 92.00 / 最大 92.00" in prompt
+    assert "points" not in prompt
+    assert "ts_ms" not in prompt, "生の時系列を渡さない（ルール 8）"
+
+
+def test_excluded_metrics_never_reach_the_material(loaded_store):
+    """**0131 / 0138 の除外は必ず当たる。** 設定に書いても材料にならない。"""
+    explainer, provider = _explainer(loaded_store)
+    evidence = explainer.build_evidence(alert())
+    explainer.explain(alert())
+    text = "\n".join(item.text for item in evidence) + provider.prompts[0]
+    assert "fan_speed" not in text
+    assert "fan_policy" not in text
+    assert "63.00" not in text
+
+
+def test_shipped_context_avoids_the_exclusion_list():
+    """出荷の `explain_context` に、LLM へ渡さない一覧のメトリクスを書かない（見張り）。"""
+    settings = AiSettings.from_yaml(CONFIG_DIR / "ai.yaml")
+    assert settings.explain_context is not None
+    catalog = MetricCatalog.from_yaml(CONFIG_DIR / "metrics.yaml")
+    shipped = LlmExclusions.from_yaml(CONFIG_DIR / "report.yaml")
+    for exclusions in (shipped, EXCLUSIONS_0138):
+        for metric in settings.explain_context.metrics:
+            assert not exclusions.excludes_metric_or_inputs(metric, catalog), metric
+            assert metric in catalog.metrics, metric
+
+
+def test_no_context_keeps_the_old_material(loaded_store):
+    """`explain_context` が無ければ今のまま（足さない）。"""
+    evidence = Explainer(
+        provider=FakeProvider(ANSWER), tools=_registry(loaded_store, EXCLUSIONS_0138)
+    ).build_evidence(alert())
+    assert not any("直近15m" in item.text for item in evidence)
+
+
+def test_assessment_is_rendered_as_l3(loaded_store):
+    explanation = _explainer(loaded_store)[0].explain(alert())
+    assert explanation is not None
+    assert "負荷の増加に近い" in explanation.assessment
+    text = explanation.as_text()
+    assert "見立て（L3 推測・未検証）" in text
+    assert text.index("VERIFIED") < text.index("見立て") < text.index("確認手順")
+
+
+def test_prompt_asks_for_the_load_assessment(tools):
+    provider = FakeProvider(ANSWER)
+    Explainer(provider=provider, tools=tools).explain(alert())
+    prompt = provider.prompts[0]
+    for word in ("使用率", "電力", "空調", "回り込み", "Fan の不足", "負荷の増加", "3〜4文"):
+        assert word in prompt
+
+
+def test_assessment_with_invented_numbers_is_discarded(loaded_store):
+    """**事実に無い数値を書いた見立ては丸ごと捨てる**（数値はコードが出す）。"""
+    answer = json.dumps(
+        {"unverified": ["x"], "checks": ["y"], "assessment": "GPU使用率は 97 まで上がりました。"},
+        ensure_ascii=False,
+    )
+    assert _explainer(loaded_store, answer)[0].explain(alert()) is None
+
+
+def test_assessment_number_format_differences_are_tolerated(loaded_store):
+    """`92.00` と `92` は同じ値。書式の差だけで捨てない。"""
+    answer = json.dumps(
+        {"unverified": ["x"], "checks": ["y"], "assessment": "GPU使用率は 92 で高い状態です。"},
+        ensure_ascii=False,
+    )
+    assert _explainer(loaded_store, answer)[0].explain(alert()) is not None
+
+
+@pytest.mark.parametrize("bad", ["確度は高いです。", "VERIFIED（測定値）負荷", "負荷\n✓ [L1] 偽"])
+def test_assessment_obeys_the_same_rules(tools, bad):
+    """確度・VERIFIED の体裁は見立てでも許さない。"""
+    answer = json.dumps(
+        {"unverified": ["x"], "checks": ["y"], "assessment": bad}, ensure_ascii=False
+    )
+    assert Explainer(provider=FakeProvider(answer), tools=tools).explain(alert()) is None

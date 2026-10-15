@@ -9,7 +9,12 @@
 幻覚できてしまい、「VERIFIED の各行が DB の実データと照合できる」という
 受入基準がプロンプトの言い回し次第になる。
 
-モデルが書くのは **UNVERIFIED（未確認の論点）と確認手順だけ**である。
+モデルが書くのは **UNVERIFIED（未確認の論点）・見立て・確認手順だけ**である。
+
+見立て（決定記録 0143 §2.11）は、負荷（使用率・電力）の変化と温度の関係から、
+空調・筐体内の回り込み・Fan の不足・負荷の増加のどれが近いかを述べる L3 の推測である。
+材料の集計はコードが VERIFIED の行として作る。
+**Provider に依らない**（ローカル LLM でも Claude でも同じ材料・同じ検査）。
 
 | Level | 誰が保証するか | 例 |
 |---|---|---|
@@ -27,7 +32,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from coldaisle import logs
-from coldaisle.ai.provider import ChatMessage, Provider
+from coldaisle.ai.provider import ChatMessage, ExplainContext, Provider
 from coldaisle.ai.tools import ToolRegistry, as_data
 from coldaisle.store.models import AlertRecord, Quality
 
@@ -66,22 +71,29 @@ _WHITESPACE = re.compile(r"\s+")
 
 MAX_ITEMS = 6
 MAX_ITEM_CHARS = 120
+MAX_ASSESSMENT_CHARS = 400
+
+_NUMBER = re.compile(r"\d+(?:\.\d+)?")
+"""数値らしきもの。**見立ての数値を事実と突き合わせる**ために使う（日次レポートの所見と同じ考え方）。"""
 
 SYSTEM_PROMPT = """あなたはGPUサーバーの熱管理を監視するアシスタントです。
-与えられた「検証済みの事実」だけを前提に、次の2つを日本語で出してください。
+与えられた「検証済みの事実」だけを前提に、次の3つを日本語で出してください。
 
 1. unverified: この事実だけでは判断できない論点（測定していないこと）
 2. checks: 人間がその場で確認できる手順
+3. assessment: 負荷（使用率・電力）の変化と温度の関係から、空調・筐体内の回り込み・Fan の不足・
+   負荷の増加のどれが近いかを見立て、根拠の値（検証済みの事実にある数値だけ）を挙げる。
+   日本語の3〜4文の地の文にする。材料が足りなければ、何が足りないかを書く
 
 制約:
 - **確度・確信度・パーセントでの可能性を書かない。** 根拠がありません
 - **測定値を新しく作らない。** 与えられた事実以外の数値を書かない
 - 断定しない。「〜が原因です」ではなく「〜が未確認です」と書く
 - **改行や見出しで体裁を作らない。** 1項目は1行の文にする
-- 各項目は120文字以内、最大6件
+- 各項目は120文字以内、最大6件。assessment は400文字以内
 
 JSON だけを出力してください（説明文を付けない）:
-{"unverified": ["...", "..."], "checks": ["...", "..."]}"""
+{"unverified": ["...", "..."], "checks": ["...", "..."], "assessment": "..."}"""
 
 
 @dataclass(frozen=True)
@@ -103,6 +115,8 @@ class Explanation:
     unverified: list[str] = field(default_factory=list)
     checks: list[str] = field(default_factory=list)
     ai_available: bool = False
+    assessment: str = ""
+    """見立て（L3 の推測。0143 §2.11）。空なら出さない。"""
 
     def as_text(self) -> str:
         lines = [f"{self.rule_id} の説明", "", "VERIFIED（測定値・閾値判定）"]
@@ -110,6 +124,8 @@ class Explanation:
         if self.unverified:
             lines += ["", "UNVERIFIED（未確認・L3 推測）"]
             lines += [f"? {item}" for item in self.unverified]
+        if self.assessment:
+            lines += ["", "見立て（L3 推測・未検証）", f"? {self.assessment}"]
         if self.checks:
             lines += ["", "確認手順"]
             lines += [f"{index}. {item}" for index, item in enumerate(self.checks, start=1)]
@@ -122,6 +138,8 @@ class Explainer:
 
     provider: Provider
     tools: ToolRegistry
+    context: ExplainContext | None = None
+    """負荷と温度の集計を材料に足すか（0143 §2.11）。無ければ足さない。"""
 
     def explain(self, alert: AlertRecord) -> Explanation | None:
         """説明を作る。**作れなければ `None`**（素のアラートだけが通知される）。
@@ -136,7 +154,7 @@ class Explainer:
                 extra={logs.FIELDS_KEY: {"rule": alert.rule_id}},
             )
             return None
-        unverified, checks = asked
+        unverified, checks, assessment = asked
         return Explanation(
             rule_id=alert.rule_id,
             metric=alert.metric,
@@ -144,6 +162,7 @@ class Explainer:
             unverified=unverified,
             checks=checks,
             ai_available=True,
+            assessment=assessment,
         )
 
     # ------------------------------------------------------------------ L1 / L2
@@ -157,6 +176,7 @@ class Explainer:
         evidence += self._rule_evidence(alert)
         evidence += self._quality_evidence()
         evidence += self._history_evidence(alert)
+        evidence += self._context_evidence()
         return evidence
 
     def _rule_evidence(self, alert: AlertRecord) -> list[Evidence]:
@@ -210,11 +230,35 @@ class Explainer:
             lines.append(Evidence("L1", f"直近24hの欠測率 {stats['missing_ratio']:.1%}"))
         return lines
 
+    def _context_evidence(self) -> list[Evidence]:
+        """負荷と温度の直近の集計（L1。0143 §2.11）。**平均・最大・傾きだけ**で、生の値は渡さない。
+
+        集計はツール（`get_stats`）を通すので、LLM へ渡さない一覧（0131 §2.4a / 0138）に当たる
+        メトリクスは無いメトリクスと同じ空の集計になり、ここで落ちる（行を作らない）。
+        """
+        if self.context is None:
+            return []
+        window = self.context.window
+        lines: list[Evidence] = []
+        for metric in self.context.metrics:
+            stats = self.tools.call("get_stats", {"metric": metric, "window": window})
+            if "error" in stats or stats.get("mean") is None or stats.get("max") is None:
+                continue
+            unit = stats.get("unit") or ""
+            text = (
+                f"{metric} 直近{window}: 平均 {stats['mean']:.2f} / 最大 {stats['max']:.2f}"
+                f"（{unit}、{stats['sample_count']} 件）"
+            )
+            if stats.get("slope_per_min") is not None:
+                text += f" / 傾き {stats['slope_per_min']:.3f} /分"
+            lines.append(Evidence("L1", text))
+        return lines
+
     # ------------------------------------------------------------------ L3
 
     def _ask(
         self, alert: AlertRecord, verified: list[Evidence]
-    ) -> tuple[list[str], list[str]] | None:
+    ) -> tuple[list[str], list[str], str] | None:
         facts = "\n".join(item.as_line() for item in verified)
         user = (
             f"アラート: {alert.rule_id}（重大度 {alert.severity.value}）\n"
@@ -230,9 +274,9 @@ class Explainer:
         )
         if not result.available:
             return None
-        return self._parse(result.text)
+        return self._parse(result.text, user)
 
-    def _parse(self, text: str) -> tuple[list[str], list[str]] | None:
+    def _parse(self, text: str, facts: str = "") -> tuple[list[str], list[str], str] | None:
         """モデルの出力を読む。**約束を破っていたら丸ごと捨てる。**
 
         確度を書いてきた出力を「その行だけ消して使う」ことはしない。
@@ -251,9 +295,17 @@ class Explainer:
             return None
         unverified = self._clean(parsed.get("unverified"))
         checks = self._clean(parsed.get("checks"))
-        if not unverified and not checks:
+        assessment = self._clean_assessment(parsed.get("assessment"))
+        if not unverified and not checks and not assessment:
             return None
-        for item in unverified + checks:
+        if assessment and self._invented_numbers(assessment, facts):
+            # **事実に無い数値は、モデルが作った数値である**（日次レポートの所見と同じ）
+            LOGGER.warning(
+                "AI の見立てに事実へ無い数値があったので捨てた",
+                extra={logs.FIELDS_KEY: {"text": assessment[:100]}},
+            )
+            return None
+        for item in [*unverified, *checks, *([assessment] if assessment else [])]:
             if FORBIDDEN.search(item):
                 LOGGER.warning(
                     "AI の出力に確度の表現があったので捨てた",
@@ -266,7 +318,20 @@ class Explainer:
                     extra={logs.FIELDS_KEY: {"text": item[:100]}},
                 )
                 return None
-        return unverified, checks
+        return unverified, checks, assessment
+
+    @staticmethod
+    def _clean_assessment(value: object) -> str:
+        """見立ての文。**改行を潰す**（VERIFIED の行に紛れさせない。`_clean` と同じ理由）。"""
+        if not isinstance(value, str):
+            return ""
+        return _WHITESPACE.sub(" ", value).strip()[:MAX_ASSESSMENT_CHARS]
+
+    @staticmethod
+    def _invented_numbers(text: str, facts: str) -> list[str]:
+        """事実に現れない数値。`45.2` と `45.20` は同じ値とみなす（書式の差で捨てない）。"""
+        allowed = {float(token) for token in _NUMBER.findall(facts)}
+        return [token for token in _NUMBER.findall(text) if float(token) not in allowed]
 
     @staticmethod
     def _clean(values: object) -> list[str]:
