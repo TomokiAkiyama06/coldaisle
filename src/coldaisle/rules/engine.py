@@ -480,7 +480,14 @@ class Engine:
                 rule.fire_after_s,
                 detail=detail,
             )
-        return self._continue(rule_id, rule.metric, value, rule.fire_after_s, detail=detail)
+        return self._continue(
+            rule_id,
+            rule.metric,
+            value,
+            rule.fire_after_s,
+            detail=detail,
+            threshold=expected + rule.threshold,
+        )
 
     def _reference_power(self, rule: PowerReferencedRule) -> float | None:
         """参照電力: 直近 `power_window_s` の ok の値の最大（決定記録 0144 §2.3）。
@@ -780,22 +787,32 @@ class Engine:
         fire_after_s: float,
         *,
         detail: str | None = None,
+        threshold: float | None = None,
     ) -> list[Transition]:
+        """発火待ちを続ける。`threshold` は発火の時点で当てる閾値（省けば開いたときの値のまま）。"""
         state = self._state(rule_id, metric)
         if state.firing or state.since_ms is None:
             return []
         if (self._now_ms - state.since_ms) / 1000 < fire_after_s:
             return []
-        return self._fire(rule_id, metric, value, detail)
+        return self._fire(rule_id, metric, value, detail, threshold=threshold)
 
     def _fire(
-        self, rule_id: str, metric: str | None, value: float | None, detail: str | None
+        self,
+        rule_id: str,
+        metric: str | None,
+        value: float | None,
+        detail: str | None,
+        *,
+        threshold: float | None = None,
     ) -> list[Transition]:
         state = self._state(rule_id, metric)
         if state.alert_id is None:
             return []
         now = self._now_ms
-        self.store.fire_alert(state.alert_id, fired_ms=now, trigger_value=value, detail=detail)
+        self.store.fire_alert(
+            state.alert_id, fired_ms=now, trigger_value=value, detail=detail, threshold=threshold
+        )
         state.firing = True
         LOGGER.warning(
             "アラートが発火した",

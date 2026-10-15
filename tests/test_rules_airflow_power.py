@@ -200,6 +200,31 @@ def test_threshold_follows_power(engine, store):
     assert alert.threshold == pytest.approx(32.5)
 
 
+def test_fired_alert_records_the_threshold_applied_at_firing(engine, store):
+    """発火待ちの間に電力が上がったら、行の閾値は発火の時点で当てた値（0144 §2.6）。
+
+    300 W で 41 °C（限度 32.5）から待ちに入り、600 W に上がっても 41 °C は限度 40.0 を超えて続く。
+    記録は開いたときの 32.5 ではなく 40.0 にする（説明が誤った限度を書かないため）。
+    """
+    run(engine, store, 0, 100, power=300.0, delta=41.0)
+    assert rows(store)[0].threshold == pytest.approx(32.5)
+    run(engine, store, 100, 400, power=600.0, delta=41.0)
+    [alert] = rows(store)
+    assert alert.state == "firing"
+    assert alert.started_ms == at(0)
+    assert alert.threshold == pytest.approx(40.0)
+    assert alert.detail is not None
+    assert "600 W" in alert.detail
+
+    # 解除はその周期の参照電力で判定し、発火の時点の閾値の記録は変えない
+    run(engine, store, 400, 1100, power=300.0, delta=39.0)  # 窓の間は 600 W の期待値で超過 5 > 4
+    assert rows(store)[0].state == "firing"
+    run(engine, store, 1100, 1110, power=300.0, delta=30.0)  # 300 W の期待値 26.5 で超過 3.5 < 4
+    [alert] = rows(store)
+    assert alert.state == "resolved"
+    assert alert.threshold == pytest.approx(40.0)
+
+
 # ---------------------------------------------------------------- 電力の変化の直後
 
 
