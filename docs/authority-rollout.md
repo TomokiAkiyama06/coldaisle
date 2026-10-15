@@ -93,17 +93,51 @@ journal がまだ SHADOW の初日に SHADOW 互換の artifact が拒まれ、�
 昇格は**人が自分の uid で実行する CLI** だけが行う。`coldaisle-fand`・管理ソケット・API・AI・
 eventd には昇格の経路が無い（0072 §2.1。`tests/test_authority_cli.py` が走査する）。
 
+「昇格の入口が1つ」は次の3つの層で保たれる（決定記録 0134 §2.3）。
+
+| 層 | 何が保つか | 誰に効くか |
+|---|---|---|
+| (a) コード | `raise_stage()` を呼ぶのは `authority_cli.py` だけ。管理ソケット・fand・API・AI・eventd・Learned worker は上げられない（`tests/test_authority_cli.py` ほかが走査） | すべての process |
+| (b) 権限 | authority のディレクトリに書けるのは、`coldaisle-authority` の人・fand（unit の補助グループだけ）・root だけ（`docs/ubuntu-deploy.md` 6.7 の手順 9 で確かめる） | `coldaisle-admin` だけの人、`coldaisle-registry` だけの人、`coldaisle`（API / 取り込み）、AI 層、Learned worker |
+| (c) 承認者本人 | 強制しない。0089 / 0090 の fand 側の照合と構造化ログの監査の記録（0086 §2.8）が残る。改ざん検知は 0086 §5 の 1 で未決 | `coldaisle-authority` の人 |
+
+開発（リポジトリの checkout）では `uv run` で実行する。
+
 ```bash
 uv run coldaisle-authority raise \
-    --authority-root /var/lib/coldaisle-authority \
+    --authority-root var/authority \
     --approval var/stage-approval.json \
     --report var/evaluation.json \
     --config-dir var/control-config \
     --registry-root var/model-registry
 ```
 
-（path は仮の値。導入先の値に置き換える。`--registry-limits` は `model-registry.yaml` の
-ディレクトリで、既定は `config`）
+（`--registry-limits` は `model-registry.yaml` のディレクトリで、既定は作業ディレクトリの相対 path `config`）
+
+**本番（`docs/ubuntu-deploy.md` の導入先）では、root の所有の venv の interpreter を隔離モード（`-I`）で起動し、
+`--registry-limits` も絶対 path で渡す**（決定記録 0134 §2.2。path は仮の値。導入先の値に置き換える）。
+承認者の uid のまま実行する（`sudo` を使わない）。
+
+```bash
+/opt/coldaisle/.venv/bin/python -I -m coldaisle.authority_cli raise \
+    --authority-root /var/lib/coldaisle-authority \
+    --approval <承認.json> --report <報告.json> \
+    --config-dir /etc/coldaisle/control-config \
+    --registry-root /var/lib/coldaisle-registry \
+    --registry-limits /opt/coldaisle/config
+```
+
+- **`uv run` を本番で使わない**: `.venv` と lock を書こうとし、root の所有の `/opt/coldaisle` では権限の error で
+  止まるので、権限の設計の誤りと紛らわしい
+- **console script（`.venv/bin/coldaisle-authority`）を本番で使わない**: 絶対 path で実行しても `PYTHONPATH` を読み、
+  承認者の書ける場所の `coldaisle` が root の所有のコードより先に読まれうる（CLI の検証は承認者の process で走る）
+- `-m coldaisle.authority_cli` は console script と同じ `main()` を呼ぶ（引数も終了コードも同じ）。`-I` は
+  `PYTHON*` の環境変数と作業ディレクトリ・user site からの探索を止めるが、site-packages の `.pth` と動的リンカの
+  環境変数は止めない。承認者が import に使われる場所に書けないことを `docs/ubuntu-deploy.md` 6.7 の手順 9 の 6・7
+  （段階 C1）で確かめる
+- 承認者のホームの checkout など、承認者が書けるコードで本番の authority のディレクトリを指さない
+- `--registry-limits` の既定（相対 path）は作業ディレクトリで意味が変わる。上限は読み込みの大きさを抑えるだけで、
+  上げる向きの判断には使われないので、CLI は path を固定しない（ルール 9）
 
 **本番では `--config-dir` と `--registry-root` に fand の unit と同じ path を渡す**（決定記録 0104 §2.6 / §2.7）。
 `--config-dir` は fand の unit の `ExecStart=` の `--config-dir`（`docs/ubuntu-deploy.md` の例では
@@ -140,7 +174,8 @@ coldaisle-control status   # authority_journal_revision が N になるまで、
 導入先の権限と確認の手順は `docs/ubuntu-deploy.md` 6.7。
 
 **本番（`docs/ubuntu-deploy.md` の導入先）での `raise` は、`docs/ubuntu-deploy.md` 6.7 の手順 9（実機での確認。
-決定記録 0104 の段階 C）が導入先で通り、結果を #217 に残すまで使えない（`rollback` は使える）。** 承認者に
+決定記録 0104 の段階 C）の C1（権限の形）と C2（Production ができた後の `approval_rejected` までの確認）が導入先で
+通り、結果を #217 に残すまで使えない（`rollback` は使える。C1 だけでは使えるとしない。0134 §2.5）。** 承認者に
 制御設定の読み取り（POSIX ACL）と Model Registry の読み取り・lock の flock を与える手順は 6.7（0104 / 0105）。
 6.7 の外で権限を個別に足して回避しない。
 `rollback` は authority のディレクトリ（`authority.json` と lock）だけを使い、制御設定も Registry も

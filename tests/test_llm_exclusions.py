@@ -9,6 +9,7 @@ Server Health の AI 要約・案件資料。
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
@@ -41,6 +42,7 @@ from conftest import CONFIG_DIR
 from test_ai_explain import ANSWER
 from test_ai_explain import FakeProvider as ExplainProvider
 from test_server_health_api import NOW_MS as HEALTH_NOW_MS
+from test_server_health_api import NVML_METRICS as HEALTH_NVML_METRICS
 from test_server_health_api import FakeSummarizer, _app, _populate
 
 REPORT_YAML = CONFIG_DIR / "report.yaml"
@@ -119,9 +121,6 @@ def daily(store, catalog, exclusions: LlmExclusions | None = EXCLUSIONS):
 def test_shipped_list_names_the_gpu_fan_policy_and_rules():
     assert EXCLUSIONS.excludes_metric(POLICY)
     assert EXCLUSIONS.excludes_metric("gpu.1.fan_policy")
-    assert not EXCLUSIONS.excludes_metric("gpu.0.fan_speed"), (
-        "0043 の fan speed は #301 で別に決める"
-    )
     assert EXCLUSIONS.rule_ids == frozenset(GPU_RULES)
 
 
@@ -641,3 +640,162 @@ def test_alert_on_a_derived_value_of_an_excluded_input_does_not_drive_the_ai_sig
     assert body["signal"] == "yellow"
     assert body["summary_source"] == "template"
     assert summarizer.facts == [], "AI 用の signal（green）と食い違うので要約を求めない"
+
+
+# ---------------------------------------- 既存の `gpu.*.fan_speed`（決定記録 0138）
+
+SPEED = "gpu.0.fan_speed"
+GPU_FAN_METRIC = re.compile(r"^gpu\.[0-9]+\.fan")
+
+
+def test_shipped_list_also_names_the_gpu_fan_speed():
+    """0138 §2.1: 0043 の NVML の目標値も、0128 §2.1 の「LLM は GPU の Fan を読まない」に入る。"""
+    assert EXCLUSIONS.excludes_metric(SPEED)
+    assert EXCLUSIONS.excludes_metric("gpu.1.fan_speed")
+    assert "gpu.*.fan_speed" in EXCLUSIONS.metric_patterns, "名前を1つずつ書く（0138 §4）"
+    # GPU の Fan 以外の GPU の値は今までどおり渡す（0138 §5 の 3）
+    for kept in ("gpu.0.core", "power.gpu.0", "gpu.0.tlimit_margin", "gpu.0.throttle.hw_thermal"):
+        assert not EXCLUSIONS.excludes_metric(kept)
+
+
+def test_every_gpu_fan_metric_in_the_catalog_is_excluded(catalog):
+    """0138 §2.5 の見張り: GPU の Fan のメトリクスを後で足したときの除き忘れを CI で止める。"""
+    gpu_fan = sorted(name for name in catalog.metrics if GPU_FAN_METRIC.match(name))
+    assert SPEED in gpu_fan and POLICY in gpu_fan, "見張りの対象が空になっていないこと"
+    missed = [name for name in gpu_fan if not EXCLUSIONS.excludes_metric(name)]
+    assert missed == [], f"config/report.yaml の llm_excluded_metrics に足す: {missed}"
+
+
+def test_every_derived_value_of_a_gpu_fan_metric_is_excluded(catalog):
+    """派生値の材料に GPU の Fan があれば、その派生値も LLM へ渡さない（0131 §2.4a の原則）。"""
+    for name, derived in catalog.derived.items():
+        if GPU_FAN_METRIC.match(derived.minuend) or GPU_FAN_METRIC.match(derived.subtrahend):
+            assert EXCLUSIONS.excludes_metric_or_inputs(name, catalog), name
+
+
+def test_facts_for_the_llm_drop_the_fan_speed_row_but_the_body_keeps_it(store, catalog):
+    for minute in range(MINUTES_PER_DAY):
+        bucket(store, "air.room", minute, 26.0)
+        bucket(store, "gpu.0.core", minute, 60.0)
+        bucket(store, SPEED, minute, 45.0)
+    report = daily(store, catalog)
+    assert SPEED in report.as_markdown(), "人が読む本文には残す（0138 §2.1）"
+    facts = report.facts_markdown()
+    assert "fan_speed" not in facts
+    assert "gpu.0.core" in facts, "GPU の温度は今までどおり渡す"
+
+
+def test_incomplete_note_for_the_llm_ignores_a_short_fan_speed(store, catalog):
+    """`gpu.0.fan_speed` だけが 1440 分に満たない日は、LLM 向けに「集計の欠け」を出さない。"""
+    for minute in range(MINUTES_PER_DAY):
+        bucket(store, "air.room", minute, 26.0)
+    bucket(store, SPEED, 0, 45.0)  # 1 分しか無い
+    report = daily(store, catalog)
+    assert "## 集計の欠け" in report.as_markdown()
+    assert "## 集計の欠け" not in report.facts_markdown()
+
+
+def test_get_latest_drops_the_fan_speed_and_takes_ts_from_what_is_left(store, tools):
+    reading(store, NOW_MS - 5_000, "air.room", 26.0)
+    reading(store, NOW_MS - 1_000, SPEED, 45.0)  # 除外のメトリクスがいちばん新しい
+    result = tools.call("get_latest")
+    assert SPEED not in result["metrics"]
+    assert "fan_speed" not in str(result)
+    assert result["ts_ms"] == NOW_MS - 5_000
+
+
+def test_describe_system_drops_the_fan_speed(tools):
+    described = tools.call("describe_system")
+    assert SPEED not in described["metrics"]
+    assert "fan_speed" not in str(described)
+    assert "gpu.0.core" in described["metrics"]
+
+
+def test_series_and_stats_for_the_fan_speed_answer_as_if_it_did_not_exist(store, tools):
+    for index in range(10):
+        reading(store, NOW_MS - 600_000 + index * 2_500, SPEED, 45.0)
+    unknown = "gpu.0.no_such_metric"
+    for tool, args in (("query_series", {"window": "1h"}), ("get_stats", {"window": "1h"})):
+        excluded = tools.call(tool, {"metric": SPEED, **args})
+        absent = tools.call(tool, {"metric": unknown, **args})
+        assert {**excluded, "metric": unknown} == absent, "値も件数も返らない"
+        assert "45" not in str(excluded)
+
+
+def test_explanation_evidence_does_not_name_the_fan_speed(store, tools):
+    reading(store, NOW_MS - 1_000, "air.room", 26.0)
+    reading(store, NOW_MS - 1_000, "air.front_intake", None)  # 一覧に無い・品質が ok でない
+    reading(store, NOW_MS - 1_000, SPEED, None)  # 一覧にある・品質が ok でない
+    alert = AlertRecord(
+        id=1,
+        rule_id="RECIRCULATION",
+        severity=AlertSeverity.WARNING,
+        state=AlertState.FIRING,
+        metric="d.intake_rise",
+        started_ms=NOW_MS - 300_000,
+        fired_ms=NOW_MS,
+        trigger_value=6.0,
+        threshold=5.0,
+    )
+    provider = ExplainProvider(ANSWER)
+    explanation = Explainer(provider=provider, tools=tools).explain(alert)
+    assert explanation is not None
+    assert "fan_speed" not in explanation.as_text()
+    assert all("fan_speed" not in prompt for prompt in provider.prompts)
+    assert "air.front_intake" in explanation.as_text(), "ほかのメトリクスは今までどおり出る"
+
+
+def _degrade(path: Path, rules, metrics: tuple[str, ...], quality: Quality) -> None:
+    with SqliteStore(path, rules=rules, clock=SimulatedClock(HEALTH_NOW_MS)) as opened:
+        opened.insert_sample(
+            Sample(
+                ts_ms=HEALTH_NOW_MS + 1,
+                readings=tuple(
+                    Reading(metric=metric, value=1.0, quality=quality) for metric in metrics
+                ),
+            )
+        )
+
+
+def _health(path: Path, summarizer: FakeSummarizer) -> dict[str, object]:
+    # gpu.0.fan_policy は NVML の入力（0131）。監視対象に入れて品質の経路を通す
+    app = _app(
+        path,
+        SimulatedClock(HEALTH_NOW_MS + 1),
+        summarizer,
+        nvml_metrics=(*HEALTH_NVML_METRICS, POLICY),
+    )
+    with TestClient(app) as client:
+        body: dict[str, object] = client.get("/api/v1/server-health").json()
+    return body
+
+
+@pytest.mark.parametrize("metric", [SPEED, POLICY])
+@pytest.mark.parametrize("quality", [Quality.SUSPECT, Quality.STALE])
+def test_health_summary_is_not_requested_when_only_an_excluded_metric_degrades(
+    tmp_path, rules, metric, quality
+):
+    """0138 §2.3: 一覧のメトリクスの品質だけが signal を下げるなら、要約を求めない。"""
+    path = tmp_path / "health.db"
+    _populate(path, rules)
+    _degrade(path, rules, (metric,), quality)
+    summarizer = FakeSummarizer()
+    body = _health(path, summarizer)
+    # 人が見る応答は除く前のまま（今のとおり下がる）
+    assert body["signal"] == "yellow"
+    assert summarizer.facts == []
+    assert body["summary_source"] == "template"
+    assert body["summary"] == YELLOW_TEMPLATE
+
+
+@pytest.mark.parametrize("metric", [SPEED, POLICY])
+def test_health_summary_is_requested_when_a_kept_metric_also_degrades(tmp_path, rules, metric):
+    """一覧に無い監視対象も下がれば AI 用の signal は応答と同じで、今までどおり要約を求める。"""
+    path = tmp_path / "health.db"
+    _populate(path, rules)
+    _degrade(path, rules, (metric, "gpu.0.core"), Quality.SUSPECT)
+    summarizer = FakeSummarizer()
+    body = _health(path, summarizer)
+    assert body["signal"] == "yellow"
+    assert summarizer.facts == [YELLOW_TEMPLATE], "名前と値は渡らない（テンプレートだけ）"
+    assert body["summary_source"] == "ai"
