@@ -1,7 +1,7 @@
 # 決定記録 0137: tick ごとの telemetry の健全度と Guard の閾値の組を decision trace に載せる（ControlTick v15）
 
 - **種別**: Decision Record
-- **Status**: Proposed
+- **Status**: FINAL（2026-10-15、リポジトリ所有者の承認）
 - **Date**: 2026-10-15
 - **Supersedes**: なし（0071 §2.3 の版の解釈の規則はそのまま使い、v15 の欄を足すだけ）
 - **関連**: [0028](0028-fan-control-contracts.md) §2.3 / [0029](0029-telemetry-loss-classes.md) §2.1 /
