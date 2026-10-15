@@ -1018,15 +1018,22 @@ Registry と制御設定への書き込み、root。artifact の本体は `raise
       `coldaisle-authority` だけのアカウントで行います。`-I` は site の処理を止めず、site-packages の `.pth`
       （`import` で始まる行は実行される。editable の導入の `.pth` は `src` を `sys.path` に足す）は `-I` でも
       効くので、`.venv/bin`・`config`・`src` だけを見るのでは足りません。**隔離した interpreter 自身が報告する
-      場所**（`sys.path` の各項と `sys.prefix`・`sys.base_prefix`、その下のすべて・symlink の実体・祖先）を、
-      実際に開いて確かめます。次をファイル（例: `c1-import-paths.sh`）に保存し、承認者が書ける空の作業
+      場所**（`sys.path` の各項と venv（`sys.prefix`）と interpreter の実行ファイルの下のすべて・symlink の実体・
+      祖先、`sys.base_prefix` そのものと祖先）を、実際に開いて確かめます。
+      `sys.base_prefix` は下のすべてを辿りません。システムの Python（2 節の `/usr/bin/python3.12`）では
+      `/usr` になり、import に使わない `/usr` の下の symlink（`/etc` を指す標準のものなど）まで辿ってしまうためです。
+      `sys.base_prefix` の下で import に使う場所（標準ライブラリ・`lib-dynload`）は `sys.path` の項として、
+      interpreter の実体は実行ファイルの symlink の実体として、それぞれ下のすべてを見ます。次をファイル（例: `c1-import-paths.sh`）に保存し、承認者が書ける空の作業
       ディレクトリで `bash c1-import-paths.sh` として実行します（一時アカウントなら上の前置きの形）
 
       ```bash
       py=/opt/coldaisle/.venv/bin/python
-      # 隔離した interpreter が使う場所: sys.path の各項と、venv と interpreter の prefix
-      "$py" -I -c 'import sys; print("\n".join(p for p in [*sys.path, sys.prefix, sys.base_prefix] if p))' \
+      # 隔離した interpreter が使う場所: sys.path の各項と、venv（sys.prefix）と、実行ファイル
+      # （venv の bin/python。symlink の実体の interpreter は下で roots に足される）
+      "$py" -I -c 'import sys; print("\n".join(p for p in [*sys.path, sys.prefix, sys.executable] if p))' \
         | sort -u > roots.txt
+      # interpreter の prefix は、そのものと祖先だけを見る（下のすべては辿らない。/usr になりうるため）
+      "$py" -I -c 'import sys; print(sys.base_prefix)' > base.txt
       : > unresolved.txt
       # symlink の実体を、増えなくなるまで roots に足す。項そのものと、項の下で出会うすべての symlink
       # （ディレクトリを指すものもファイルを指すものも）を1つずつ readlink -f で解決する。
@@ -1065,6 +1072,9 @@ Registry と制御設定への書き込み、root。artifact の本体は `raise
         [ -d "$p" ] && [ ! -L "$p" ] && find "$p" -type d -print
         d=$p; while [ "$d" != / ]; do d=$(dirname -- "$d"); [ "$d" = / ] || printf '%s\n' "$d"; done
       done < roots.txt | sort -u > dirs.txt
+      while IFS= read -r d; do
+        while [ "$d" != / ]; do printf '%s\n' "$d"; d=$(dirname -- "$d"); done
+      done < base.txt | sort -u - dirs.txt -o dirs.txt
       # ディレクトリ: 作れたら「書ける」（作ったものは消す）。無いディレクトリは作れないので出ない（祖先で見る）
       while IFS= read -r d; do
         if touch -- "$d/.probe-0134" 2>/dev/null; then rm -f -- "$d/.probe-0134"; echo "書ける: $d"; fi
@@ -1082,10 +1092,13 @@ Registry と制御設定への書き込み、root。artifact の本体は `raise
       if (: >> "$c/model-registry.yaml") 2>/dev/null; then echo "書ける: $c/model-registry.yaml"; fi
       ```
 
-      - 「書ける」「読めない」「解決できない symlink」が1行でも出たら C1 は失敗で、本番の `raise` は使いません。
-        `roots.txt` に `/opt/coldaisle` と interpreter の置き場所（2 節。システムの Python か
-        `/opt/coldaisle-python`）以外の場所が出たときも同じです（承認者の書ける場所が import に使われうる。
-        symlink の実体がそこにあるときを含む）
+      - 「書ける」「読めない」「解決できない symlink」が1行でも出たら C1 は失敗で、本番の `raise` は使いません
+      - `roots.txt` には `/opt/coldaisle` と interpreter の置き場所（2 節。システムの Python か
+        `/opt/coldaisle-python`）以外の場所も出ることがあります（Ubuntu のシステムの Python では、標準ライブラリの
+        `sitecustomize.py` が `/etc/python3.12/` の下への symlink です）。そうした場所も `roots.txt` の項なので、
+        下のすべてと祖先が上の「書ける」の検査に掛かっています。**出たこと自体では失敗にしません**が、どの場所が
+        出たかを結果に残し、その場所が root の所有であることを `stat -c '%A %U:%G %n'` でも見ます
+        （承認者の書ける場所なら、上の検査で「書ける」が出て失敗になります）
       - **解決できない symlink は、理由を問わず失敗にします（安全側）。** 切れた symlink や途中のディレクトリが
         無い symlink の先は、いまは検査できず、後で承認者がその場所を作れれば書き換え可能なコードが読まれえます。
         直すときは symlink を消すか、先を root の所有で作ってから 6 をやり直します

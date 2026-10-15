@@ -517,7 +517,9 @@ def test_the_deploy_guide_checks_every_role_named_in_0134():
         "| C1 |",
         "| C2 |",
         "C1 だけが通った状態では外しません",
-        "sys.prefix, sys.base_prefix",
+        "sys.prefix, sys.executable",
+        "print(sys.base_prefix)' > base.txt",
+        "出たこと自体では失敗にしません",
         "解決できない symlink",
         "MARK-0134",
         "管理ソケットの人（`coldaisle-admin` だけ）が authority・制御設定・Registry の"
