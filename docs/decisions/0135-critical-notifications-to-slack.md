@@ -3,6 +3,7 @@
 - **種別**: Decision Record
 - **Status**: FINAL（2026-10-15、リポジトリ所有者の承認）
 - **Date**: 2026-10-15
+- **Superseded by**: [0142](0142-japanese-notification-text.md)（§2.2 の先頭の行の形だけ。提案中）
 - **Supersedes**: [0001](0001-initial-project-decisions.md) D-03（通知は重大度で分岐。critical / warning で別経路）
 - **関連**: [0001](0001-initial-project-decisions.md) D-04 /
   [0013](0013-notifications.md) §2.3.1 / §2.5 / §2.6 / §2.7 /
