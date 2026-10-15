@@ -43,7 +43,7 @@ explain_alerts: true
 # ここに書いても材料にならない（gpu.*.fan_speed / gpu.*.fan_policy などは書かない）。
 # Provider に依らない（ローカル LLM でも Claude でも同じ材料）
 explain_context:
-  # 説明は発火の直後に作るので、直近の窓で発火の前後を見る
+  # 窓は発火の時刻で終わる（説明が遅れても発火の前の状態を見る）
   window: 15m
   metrics:
     - gpu.0.utilization

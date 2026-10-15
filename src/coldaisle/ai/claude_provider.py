@@ -149,13 +149,21 @@ class AnthropicProvider:
         ]
         if limits is None:
             missing.append("config/ai.yaml の anthropic:")
-        if workspace_id is not None and any(c.isspace() for c in workspace_id):
-            # 値は書かない（変数名だけ）。形が不正なら送らずに使わない
+        malformed = [
+            name
+            for name, value in ((API_KEY_ENV, api_key), (WORKSPACE_ENV, workspace_id))
+            if value and not _header_safe(value)
+        ]
+        if malformed:
+            # 値は書かない（変数名だけ）。ヘッダに載せられない形なら送らずに使わない。
+            # 貼り付けたスマートクォートなどは送信時に UnicodeEncodeError になるため、起動時に止める
             LOGGER.warning(
-                "ANTHROPIC_WORKSPACE_ID の形が不正なので AI を使わない（監視は継続する）",
-                extra={logs.FIELDS_KEY: {"env": WORKSPACE_ENV}},
+                "Claude API の鍵かワークスペース ID の形が不正。AI を使わない（監視は継続）",
+                extra={logs.FIELDS_KEY: {"env": malformed}},
             )
-            return UnavailableProvider(reason=f"{WORKSPACE_ENV} の形が不正（空白を含む）")
+            return UnavailableProvider(
+                reason=f"{' / '.join(malformed)} の形が不正（ASCII の印字できる文字・空白なし）"
+            )
         if missing or limits is None:
             reason = f"Claude API が設定されていない（{' / '.join(missing)}）"
             LOGGER.warning(
@@ -241,6 +249,10 @@ class AnthropicProvider:
             except httpx.HTTPError as error:
                 # **例外の文を載せない。** httpx の文には URL や要求の情報が入りうる（#305）
                 last_reason = type(error).__name__
+            except UnicodeError as error:
+                # ヘッダを符号化できない（起動時の検査をすり抜けた値）。粘っても直らない。
+                # 例外の文には値の一部が入るので型の名前だけ（0143 §2.4）
+                return self._unavailable(f"ヘッダを符号化できない（{type(error).__name__}）")
             except ValueError as error:
                 last_reason = f"応答を JSON として読めない（{type(error).__name__}）"
             if attempt < self.settings.max_attempts:
@@ -287,6 +299,11 @@ class AnthropicProvider:
             extra={logs.FIELDS_KEY: {"model": self.model, "reason": reason}},
         )
         return ChatResult(available=False, reason=reason, model=self.model)
+
+
+def _header_safe(value: str) -> bool:
+    """HTTP のヘッダにそのまま載せられるか（ASCII の印字できる文字だけ・空白なし）。"""
+    return value.isascii() and value.isprintable() and not any(c.isspace() for c in value)
 
 
 def _http_reason(response: httpx.Response) -> str:

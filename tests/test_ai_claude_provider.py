@@ -476,3 +476,50 @@ def test_effort_may_be_omitted_from_the_config():
     from coldaisle.ai import AnthropicLimits
 
     assert AnthropicLimits(max_tokens=10, daily_call_limit=1).effort is None
+
+
+# ---------------------------------------------------------------- ヘッダに載せられない値
+
+
+SMART_KEY = "“sk-ant-test-0000-fake”"  # pragma: allowlist secret - 貼り付けたスマートクォート
+
+
+@pytest.mark.parametrize(
+    ("env", "value"),
+    [
+        (API_KEY_ENV, SMART_KEY),
+        (API_KEY_ENV, "sk-ant-teést"),  # pragma: allowlist secret - テストのダミー値
+        (WORKSPACE_ENV, "“wrkspc_0000test”"),
+        (WORKSPACE_ENV, "wrkspc_\u0007x"),
+    ],
+)
+def test_non_ascii_header_values_are_refused_at_startup(clean_env, settings, caplog, env, value):
+    """**非 ASCII の鍵・ID は起動時に止める**（送信時の符号化の失敗でレポートを止めない）。"""
+    clean_env.setenv(PROVIDER_ENV, "anthropic")
+    clean_env.setenv(API_KEY_ENV, FAKE_KEY)
+    clean_env.setenv(MODEL_ENV, MODEL)
+    clean_env.setenv(env, value)
+    caplog.set_level(logging.DEBUG)
+    chosen = provider_from_env(settings)
+    assert isinstance(chosen, UnavailableProvider)
+    assert env in chosen.reason
+    for text in (chosen.reason, caplog.text):
+        assert "sk-ant" not in text
+        assert "wrkspc" not in text
+
+
+def test_encoding_failure_at_send_time_is_a_result(settings):
+    """検査をすり抜けた値でも、送信時の符号化の失敗は「利用不可」の結果にする（例外にしない）。"""
+    calls: list[int] = []
+
+    def handler(_: httpx.Request) -> httpx.Response:
+        calls.append(1)
+        return httpx.Response(200, json=reply("x"))
+
+    p = provider(settings, handler)
+    p.api_key = SMART_KEY
+    result = ask(p)
+    assert result.available is False
+    assert "符号化" in result.reason
+    assert "sk-ant" not in result.reason
+    assert calls == []

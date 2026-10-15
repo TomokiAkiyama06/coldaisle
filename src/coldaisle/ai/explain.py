@@ -73,8 +73,11 @@ MAX_ITEMS = 6
 MAX_ITEM_CHARS = 120
 MAX_ASSESSMENT_CHARS = 400
 
-_NUMBER = re.compile(r"\d+(?:\.\d+)?")
-"""数値らしきもの。**見立ての数値を事実と突き合わせる**ために使う（日次レポートの所見と同じ考え方）。"""
+_NUMBER = re.compile(r"[-+\u2212]?\d+(?:\.\d+)?")
+"""数値らしきもの（**符号を含む**）。見立ての数値を事実と突き合わせるために使う。
+
+符号を落とすと `-450` を `450` と同じと見てしまう。`−`（U+2212）も負の符号として読む。
+"""
 
 SYSTEM_PROMPT = """あなたはGPUサーバーの熱管理を監視するアシスタントです。
 与えられた「検証済みの事実」だけを前提に、次の3つを日本語で出してください。
@@ -176,7 +179,7 @@ class Explainer:
         evidence += self._rule_evidence(alert)
         evidence += self._quality_evidence()
         evidence += self._history_evidence(alert)
-        evidence += self._context_evidence()
+        evidence += self._context_evidence(alert)
         return evidence
 
     def _rule_evidence(self, alert: AlertRecord) -> list[Evidence]:
@@ -230,7 +233,7 @@ class Explainer:
             lines.append(Evidence("L1", f"直近24hの欠測率 {stats['missing_ratio']:.1%}"))
         return lines
 
-    def _context_evidence(self) -> list[Evidence]:
+    def _context_evidence(self, alert: AlertRecord) -> list[Evidence]:
         """負荷と温度の直近の集計（L1。0143 §2.11）。**平均・最大・傾きだけ**で、生の値は渡さない。
 
         集計はツール（`get_stats`）を通すので、LLM へ渡さない一覧（0131 §2.4a / 0138）に当たる
@@ -239,14 +242,25 @@ class Explainer:
         if self.context is None:
             return []
         window = self.context.window
+        # 窓の終わりを発火の時刻に固定する。説明が待ち行列で遅れても、発火の前の状態を見る
+        end_ms = alert.fired_ms
+        span = f"直近{window}" if end_ms is None else f"発火前{window}"
         lines: list[Evidence] = []
         for metric in self.context.metrics:
-            stats = self.tools.call("get_stats", {"metric": metric, "window": window})
+            try:
+                stats = self.tools.stats(metric, window, end_ms=end_ms)
+            except Exception as error:
+                # `tools.call` と同じく 1 つの失敗で説明を止めない（その行を作らないだけ）
+                LOGGER.warning(
+                    "説明の材料の集計に失敗した（その行は付けない）",
+                    extra={logs.FIELDS_KEY: {"metric": metric, "error": type(error).__name__}},
+                )
+                continue
             if "error" in stats or stats.get("mean") is None or stats.get("max") is None:
                 continue
             unit = stats.get("unit") or ""
             text = (
-                f"{metric} 直近{window}: 平均 {stats['mean']:.2f} / 最大 {stats['max']:.2f}"
+                f"{metric} {span}: 平均 {stats['mean']:.2f} / 最大 {stats['max']:.2f}"
                 f"（{unit}、{stats['sample_count']} 件）"
             )
             if stats.get("slope_per_min") is not None:
@@ -329,9 +343,12 @@ class Explainer:
 
     @staticmethod
     def _invented_numbers(text: str, facts: str) -> list[str]:
-        """事実に現れない数値。`45.2` と `45.20` は同じ値とみなす（書式の差で捨てない）。"""
-        allowed = {float(token) for token in _NUMBER.findall(facts)}
-        return [token for token in _NUMBER.findall(text) if float(token) not in allowed]
+        """事実に現れない数値。`45.2` と `45.20` は同じ値とみなす（書式の差で捨てない）。
+
+        **符号は含めて比べる**（`-0.5` と `0.5` は違う値）。`+0.5` は `0.5` と同じ。
+        """
+        allowed = {_signed(token) for token in _NUMBER.findall(facts)}
+        return [token for token in _NUMBER.findall(text) if _signed(token) not in allowed]
 
     @staticmethod
     def _clean(values: object) -> list[str]:
@@ -347,3 +364,8 @@ class Explainer:
             if text:
                 cleaned.append(text[:MAX_ITEM_CHARS])
         return cleaned
+
+
+def _signed(token: str) -> float:
+    """符号つきの数値の文字列を値にする（`−` は負の符号）。"""
+    return float(token.replace("\u2212", "-"))

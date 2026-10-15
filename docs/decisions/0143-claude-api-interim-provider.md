@@ -101,7 +101,7 @@ Provider は呼び出し側が組み立てた `ChatMessage` の列をそのま�
 - **任意の環境変数 `ANTHROPIC_WORKSPACE_ID`。** ワークスペースに属さない鍵では API が `anthropic-workspace-id`
   ヘッダを求め、無ければ 400 を返す（導入先の疎通で確認。所有者は鍵を作り直さず ID を足すと判断した）。
   値があればそのヘッダで送る。空文字は未設定と同じ（送らない）。値の形は起動時（Provider を作るとき）に検査し、
-  空白を含めば Claude API を使わない（`UnavailableProvider`。監視は止めない）。秘匿の値ではないが、
+  空白を含めば Claude API を使わない。鍵と ID はどちらも ASCII の印字できる文字だけを許し（貼り付けたスマートクォートなどはヘッダに載らず送信時に符号化の例外になるため）、外れれば同じく使わない。送信時の符号化の失敗も「利用不可」の結果にする（`UnavailableProvider`。監視は止めない）。秘匿の値ではないが、
   **鍵と同じくログ・`reason`・例外の文・repr に値を出さない**（扱いを揃え、どれを出してよいかを迷わせない）
 
 ### 2.5 費用と回数の上限（`config/ai.yaml` の `anthropic:`）
@@ -181,7 +181,7 @@ Provider に依らず同じものを通る。
 材料と出力の欄を 1 つずつ足す。0016 は FINAL なので書き換えず、ここに置く。
 
 - **材料（VERIFIED の L1 の行を足す）:** `config/ai.yaml` の `explain_context` に書いたメトリクスごとに、
-  直近の窓（`window`。出荷は `15m`。説明は発火の直後に作るので発火の前後を見る）の
+  **発火の時刻（`fired_ms`）で終わる窓**（`window`。出荷は `15m`。説明が待ち行列で遅れても発火の前の状態を見る）の
   **平均・最大・傾き（/分）と件数だけ**を、コードが `get_stats` で組み立てて 1 行にする。生の時系列は渡さない（ルール 8）。
   出荷の一覧は `gpu.0.utilization`・`power.gpu.0`・`gpu.0.core`・`cpu.utilization`・`power.cpu.package`・
   `cpu.package`・室温（`air.room`）と吸排気（`air.front_intake`・`air.gpu_intake`・`air.gpu_exhaust`・

@@ -315,17 +315,25 @@ class ToolRegistry:
 
     def _tool_get_stats(self, arguments: dict[str, Any]) -> dict[str, Any]:
         args = StatsArgs.model_validate(arguments)
-        validate_metric(args.metric)
-        start_ms, end_ms = self._range(None, None, args.window)
+        return self.stats(args.metric, args.window)
+
+    def stats(self, metric: str, window: str, *, end_ms: int | None = None) -> dict[str, Any]:
+        """`get_stats` と同じ集計。**窓の終わりを指定できる**（説明が発火の時刻に固定する）。
+
+        LLM に渡すツールの定義（`get_stats`）は変えない。終わりの時刻を選ぶのはコードだけ
+        （決定記録 0143 §2.11）。除外（0131 §2.4a）は `get_stats` と同じく当てる。
+        """
+        validate_metric(metric)
+        start_ms, end_ms = self._range(None, end_ms, window)
         stats = (
-            _empty_stats(args.metric, start_ms, end_ms)  # 無いメトリクスと同じ（0131 §2.4a）
-            if self._excluded(args.metric)
-            else self.store.stats(args.metric, start_ms, end_ms)
+            _empty_stats(metric, start_ms, end_ms)  # 無いメトリクスと同じ（0131 §2.4a）
+            if self._excluded(metric)
+            else self.store.stats(metric, start_ms, end_ms)
         )
         return {
-            "metric": args.metric,
-            "unit": self._unit(args.metric),
-            "window": args.window,
+            "metric": metric,
+            "unit": self._unit(metric),
+            "window": window,
             "from_ms": stats.start_ms,
             "to_ms": stats.end_ms,
             "sample_count": stats.ok_value_count,

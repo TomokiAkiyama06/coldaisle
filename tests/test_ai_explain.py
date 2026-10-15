@@ -394,8 +394,8 @@ def test_load_and_temperature_aggregates_are_in_the_material(loaded_store):
     assert explainer.explain(alert()) is not None
     prompt = provider.prompts[0]
     for metric in ("gpu.0.utilization", "power.gpu.0", "gpu.0.core", "air.room"):
-        assert f"{metric} 直近15m: 平均" in prompt
-    assert "gpu.0.utilization 直近15m: 平均 92.00 / 最大 92.00" in prompt
+        assert f"{metric} 発火前15m: 平均" in prompt
+    assert "gpu.0.utilization 発火前15m: 平均 92.00 / 最大 92.00" in prompt
     assert "points" not in prompt
     assert "ts_ms" not in prompt, "生の時系列を渡さない（ルール 8）"
 
@@ -430,7 +430,7 @@ def test_no_context_keeps_the_old_material(loaded_store):
     evidence = Explainer(
         provider=FakeProvider(ANSWER), tools=_registry(loaded_store, SHIPPED_EXCLUSIONS)
     ).build_evidence(alert())
-    assert not any("直近15m" in item.text for item in evidence)
+    assert not any("15m:" in item.text for item in evidence)
 
 
 def test_assessment_is_rendered_as_l3(loaded_store):
@@ -475,3 +475,59 @@ def test_assessment_obeys_the_same_rules(tools, bad):
         {"unverified": ["x"], "checks": ["y"], "assessment": bad}, ensure_ascii=False
     )
     assert Explainer(provider=FakeProvider(answer), tools=tools).explain(alert()) is None
+
+
+@pytest.mark.parametrize(
+    "assessment",
+    [
+        "GPU消費電力は -450 まで下がりました。",
+        "GPU消費電力は −450 まで下がりました。",
+        "GPU使用率は -92 です。",
+    ],
+)
+def test_assessment_with_the_opposite_sign_is_discarded(loaded_store, assessment):
+    """**符号を含めて比べる。** 事実が 450 のとき `-450` は作った数値である。"""
+    answer = json.dumps(
+        {"unverified": ["x"], "checks": ["y"], "assessment": assessment}, ensure_ascii=False
+    )
+    assert _explainer(loaded_store, answer)[0].explain(alert()) is None
+
+
+def test_signed_numbers_in_the_facts_are_matched_with_their_sign():
+    facts = "傾き -0.500 /分 / 平均 450.00"
+    assert Explainer._invented_numbers("傾きは -0.5 です。", facts) == []
+    assert Explainer._invented_numbers("傾きは 0.5 です。", facts) == ["0.5"]
+    assert Explainer._invented_numbers("傾きは +0.5 です。", facts) == ["+0.5"]
+    assert Explainer._invented_numbers("電力は +450 です。", facts) == []
+
+
+def test_material_window_ends_at_the_firing_time(tmp_path, rules):
+    """**説明が待ち行列で遅れても、発火の前の窓を使う。** 今の時刻を基準にしない。"""
+    fired_ms = NOW_MS - 30 * 60_000
+    with SqliteStore(tmp_path / "late.db", rules=rules, clock=SimulatedClock(NOW_MS)) as store:
+        for index in range(120):
+            ts = fired_ms - 120 * INTERVAL_MS + index * INTERVAL_MS
+            store.insert_sample(
+                Sample(
+                    ts_ms=ts,
+                    readings=(Reading(metric="gpu.0.utilization", value=95.0, quality=Quality.OK),),
+                )
+            )
+        for index in range(120):
+            # 発火の後（説明を作る今まで）は負荷が下がっている
+            ts = NOW_MS - 120 * INTERVAL_MS + index * INTERVAL_MS
+            store.insert_sample(
+                Sample(
+                    ts_ms=ts,
+                    readings=(Reading(metric="gpu.0.utilization", value=10.0, quality=Quality.OK),),
+                )
+            )
+        explainer = Explainer(
+            provider=FakeProvider(ASSESSED),
+            tools=_registry(store, SHIPPED_EXCLUSIONS),
+            context=ExplainContext(window="15m", metrics=("gpu.0.utilization",)),
+        )
+        evidence = explainer.build_evidence(alert(fired_ms=fired_ms, started_ms=fired_ms - 60_000))
+    line = next(item.text for item in evidence if item.text.startswith("gpu.0.utilization"))
+    assert "平均 95.00 / 最大 95.00" in line, line
+    assert "10.00" not in line

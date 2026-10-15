@@ -87,7 +87,7 @@ class ExplainContext(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     window: str = Field(pattern=r"^[1-9][0-9]*[smh]$")
-    """発火の直前から遡る窓（例 `15m`）。説明は発火の直後に作るので「直近」で発火の前後を見る。"""
+    """発火の時刻から遡る窓（例 `15m`）。説明が遅れても発火の前の状態を見る。"""
     metrics: tuple[str, ...] = Field(min_length=1, max_length=16)
     """集計して渡すメトリクス。プロンプトの長さを抑えるため 16 個まで。"""
 
