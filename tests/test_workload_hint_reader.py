@@ -465,10 +465,37 @@ def test_thread_starts_restores_and_ends_the_run_cleanly(rig):
     event_id = rig.hint()
     mailbox = HintMailbox()
     reader = rig.reader(RUN_A, mailbox)
-    assert reader.start(wait_s=5.0)
+    reader.start()
+    assert reader.wait_ready(5.0)
     assert mailbox.reader_alive()
     observation = current(mailbox)
     assert observation is not None and observation.event_id == event_id
     reader.stop()
     assert not mailbox.reader_alive()
     assert rig.run_end(RUN_A) == "clean"
+
+
+def test_unknown_version_inside_the_boundary_is_not_backfilled(rig):
+    """版を知らない行も境界で拒む（書かない・出さない。Codex P2）。"""
+    old = rig.hint(payload='{"hint_v":9,"phase":"start","type":"workload_hint","v":1}')
+    mailbox = HintMailbox()
+    reader = rig.reader(RUN_A, mailbox)
+    reader.begin()  # 初回の run なので境界ができる
+    reader.poll()
+    assert current(mailbox) is None
+    assert rig.terminal(old) is None
+    reader.end()
+
+
+def test_unknown_version_after_a_clean_run_is_shown_as_unsupported(rig):
+    clean_previous_run(rig)
+    unknown = rig.hint(payload='{"hint_v":9,"phase":"start","type":"workload_hint","v":1}')
+    mailbox = HintMailbox()
+    reader = rig.reader(RUN_A, mailbox)
+    reader.begin()
+    reader.poll()
+    observation = current(mailbox)
+    assert observation is not None
+    assert observation.status is WorkloadHintStatus.UNSUPPORTED_VERSION
+    assert rig.terminal(unknown) == "unsupported_version"
+    reader.end()

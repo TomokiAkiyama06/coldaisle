@@ -160,14 +160,22 @@ class WorkloadHintReader:
 
     # ------------------------------------------------------------ 合成の起点が使う面
 
-    def start(self, *, wait_s: float) -> bool:
-        """スレッドを起こし、run の開始と起動時の取り込みを最大 ``wait_s`` 待つ。
+    def start(self) -> None:
+        """スレッドを起こす。**待たない。**
 
-        待ちきれなくても起動は続ける（その間の tick は ``hint_state_unreadable``）。
-        取り込みを終えたら True。
+        run の開始と起動時の取り込みはスレッドの中で行う。fand の起動の経路（`READY=1` と
+        最初の heartbeat の間）でヒントのために待つと、DB の busy timeout や大きな ``events`` の
+        復元で systemd の watchdog を越えうる。ヒントは任意の機能なので、取り込みが終わるまでの
+        tick は受け渡し口が空で ``hint_state_unreadable`` になるだけにする（0133 §2.8）。
         """
         self._thread.start()
-        return self._initialized.wait(timeout=wait_s)
+
+    def wait_ready(self, timeout_s: float) -> bool:
+        """最初の取り込み（または run を始められなかったこと）が終わるまで最大 ``timeout_s`` 待つ。
+
+        試験と診断のためだけ。fand の起動の経路では呼ばない。
+        """
+        return self._initialized.wait(timeout=timeout_s)
 
     def stop(self, *, drain: bool = True) -> None:
         """止めて、run の終了記録を書かせる。
@@ -318,6 +326,18 @@ class WorkloadHintReader:
     ) -> HintObservation | None:
         assert self._run is not None and self._state is not None
         parsed = parse_hint_row(row)
+        # **版を見る前に境界と終端済みで拒む。** 確かめられない run の前の行・既に終端の行は、
+        # 版を知らない行でも取り込まない（書き直さず、trace にも出さない。0066 §2.2）
+        if parsed.event_id <= self._run.boundary_event_id:
+            self._log_rejected(
+                parsed.event_id, BackfillRejection.UNCLEAN_PREVIOUS_RUN, at_startup=True
+            )
+            return None
+        if not parsed.supported and self._state.terminal_state(parsed.event_id) is not None:
+            self._log_rejected(
+                parsed.event_id, BackfillRejection.ALREADY_TERMINATED, at_startup=True
+            )
+            return None
         if not parsed.supported:
             self._write_terminal(parsed.event_id, WorkloadHintStatus.UNSUPPORTED_VERSION)
             return HintObservation(

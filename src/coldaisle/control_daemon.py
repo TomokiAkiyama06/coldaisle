@@ -1391,12 +1391,9 @@ def _open_workload_hint(
         run_id=run_id,
         mailbox=mailbox,
     )
-    assert hint.reader_stale_after_ms is not None
-    if not reader.start(wait_s=hint.reader_stale_after_ms / 1_000):
-        LOGGER.warning(
-            "workload hint の起動時の取り込みを待ちきれなかった（終わるまでヒントを使わない）",
-            extra={logs.FIELDS_KEY: {"reason": "hint_state_unreadable"}},
-        )
+    # **待たない**（Codex P1）。取り込みが終わるまでの tick は `hint_state_unreadable` になり、
+    # 起動・heartbeat・Fan の制御はヒントの読み手を待たない
+    reader.start()
     tracker = WorkloadHintTracker(hint, mailbox=mailbox, boot_clock=wall, monotonic=monotonic)
     return tracker, reader
 

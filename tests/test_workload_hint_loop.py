@@ -295,6 +295,7 @@ def test_fand_wires_the_reader_and_ends_the_run_cleanly(tmp_path):
     )
     try:
         assert daemon.workload_hint_reader is not None
+        assert daemon.workload_hint_reader.wait_ready(5.0)
         tick = daemon.loop.tick().tick
         assert tick.workload_hint == WorkloadHintRecord(stage=WorkloadHintStage.OBSERVE)
         run_id = tick.run_id
@@ -335,4 +336,64 @@ def test_fand_with_stage_off_starts_no_reader(tmp_path):
         assert daemon.workload_hint_reader is None
         assert daemon.loop.tick().tick.workload_hint == WorkloadHintRecord.off()
     finally:
+        daemon.close()
+
+
+def test_a_slow_reader_does_not_delay_startup_or_the_first_tick(tmp_path, monkeypatch):
+    """読み手が run の開始で止まっていても、fand の組み立てと最初の tick は待たない（Codex P1）。
+
+    最初の tick は ``hint_state_unreadable`` の記録になり、読み手が進めば次から読める。
+    """
+    import json
+    import threading
+    import time
+
+    from coldaisle.control.loop import NullWatchdog
+    from coldaisle.control.schema import HintPriorSkipped
+    from coldaisle.control_daemon import Config, build
+    from coldaisle.workload_hint_reader import WorkloadHintReader
+    from test_control_config import write_documents
+    from test_simulated_fan_backend import hardware_config
+
+    release = threading.Event()
+    original_begin = WorkloadHintReader.begin
+
+    def slow_begin(self: WorkloadHintReader) -> None:
+        release.wait(timeout=30)
+        original_begin(self)
+
+    monkeypatch.setattr(WorkloadHintReader, "begin", slow_begin)
+    config_dir = tmp_path / "control"
+    config_dir.mkdir()
+    documents = valid_documents()
+    documents["fan-hardware.yaml"] = json.loads(hardware_config().model_dump_json())
+    documents["fan-policy.yaml"] = hint_policy()
+    write_documents(config_dir, documents)
+    started = time.monotonic()
+    daemon = build(
+        Config(
+            config_dir=config_dir,
+            db=tmp_path / "control.db",
+            metrics=METRICS_PATH,
+            admin_config=tmp_path / "missing.yaml",
+        ),
+        watchdog=NullWatchdog(),
+    )
+    try:
+        tick = daemon.loop.tick().tick
+        elapsed = time.monotonic() - started
+        # reader_stale_after_ms（5 s）も busy timeout（5 s）も待っていない
+        assert elapsed < 3.0
+        assert tick.workload_hint == WorkloadHintRecord(
+            stage=WorkloadHintStage.OBSERVE, skipped=HintPriorSkipped.HINT_STATE_UNREADABLE
+        )
+        release.set()
+        reader = daemon.workload_hint_reader
+        assert reader is not None
+        assert reader.wait_ready(5.0)
+        assert daemon.loop.tick().tick.workload_hint == WorkloadHintRecord(
+            stage=WorkloadHintStage.OBSERVE
+        )
+    finally:
+        release.set()
         daemon.close()
