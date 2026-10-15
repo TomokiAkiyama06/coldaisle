@@ -675,8 +675,12 @@ def test_migration_is_append_only_and_idempotent(tmp_path, rules):
                 "SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name"
             )
         ]
+        # 後の migration が列を足しても（0014 の events.boot_id など）、既存の列の値は変わらない
         before = {
-            table: conn.execute(f"SELECT * FROM {table}").fetchall()
+            table: (
+                [column[1] for column in conn.execute(f"PRAGMA table_info({table})")],
+                conn.execute(f"SELECT * FROM {table}").fetchall(),
+            )
             for table in tables
             if table != "schema_version"
         }
@@ -685,8 +689,11 @@ def test_migration_is_append_only_and_idempotent(tmp_path, rules):
         conn.close()
 
     with SqliteStore(path, rules=rules, clock=SimulatedClock(5_000)) as store:
-        for table, content in before.items():
-            after = [tuple(row) for row in store.connection.execute(f"SELECT * FROM {table}")]
+        for table, (columns, content) in before.items():
+            selected = ", ".join(columns)
+            after = [
+                tuple(row) for row in store.connection.execute(f"SELECT {selected} FROM {table}")
+            ]
             assert after == [tuple(row) for row in content], table
         assert rows(store) == [], "過去の export の行を埋めない（0100 §2.7）"
         versions = [

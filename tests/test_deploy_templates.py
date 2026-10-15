@@ -476,7 +476,73 @@ def test_the_deploy_guide_checks_permissions_by_opening_not_by_test():
     assert 'sh -c \'cat -- "$1" > /dev/null && ! (: >> "$1") 2> /dev/null\' _ "$f"' in guide
     assert 'sh -c \'! cat -- "$1" > /dev/null 2>&1\' _ "$f"' in guide
     assert 'sh -c \': >> "$1"\' _ "$f" || echo "書けない: $f"' in guide
-    assert 'sh -c \'touch -- "$1/.probe-fand" && rm -- "$1/.probe-fand"\'' in guide
+    assert 'sh -c \'t=$(mktemp -p "$1" .probe-XXXXXXXX) && rm -- "$t"\'' in guide
+    # 目印は推測できない名前で排他的に作る。固定の名前の touch は、先に置かれた同じ名前のファイルで
+    # 「書けない」と誤って判定される（決定記録 0141 §2.5）
+    for block in blocks:
+        assert not re.search(r"touch\b[^\n]*\.probe-", block), block
+
+
+PRODUCTION_RAISE = "/opt/coldaisle/.venv/bin/python -I -m coldaisle.authority_cli raise"
+"""本番の `raise` の起動の形（決定記録 0134 §2.2。path は**仮の値**）。"""
+
+
+@pytest.mark.parametrize("doc", ["ubuntu-deploy.md", "authority-rollout.md"])
+def test_production_raise_runs_the_root_owned_interpreter_in_isolated_mode(doc):
+    """本番の `raise` は root の所有の interpreter を `-I` で起動し、上限も絶対 path で渡す。
+
+    決定記録 0134 §2.2。console script（`.venv/bin/coldaisle-authority`）は `PYTHONPATH` を読み、
+    `uv run` は `.venv` を書こうとする。どちらも本番の手順のコードブロックに書かない
+    （開発の `uv run` は `authority-rollout.md` に残す）。
+    """
+    text = (ROOT / "docs" / doc).read_text(encoding="utf-8")
+    blocks = re.findall(r"```bash\n(.*?)```", text, flags=re.DOTALL)
+    production = [b for b in blocks if "/var/lib/coldaisle-authority" in b and " raise" in b]
+    assert production, doc
+    for block in production:
+        flat = " ".join(block.replace("\\\n", " ").split())
+        assert PRODUCTION_RAISE in flat, block
+        assert "--registry-limits /opt/coldaisle/config" in flat, block
+    for block in blocks:
+        assert ".venv/bin/coldaisle-authority" not in block, block
+        if "/var/lib/coldaisle-authority" in block:
+            assert "uv run coldaisle-authority raise" not in block, block
+
+
+def test_the_deploy_guide_checks_every_role_named_in_0134():
+    """段階 C に 0134 §2.4 の項目と §2.5 の C1 / C2 の分け方がある。
+
+    管理ソケットだけの人・`coldaisle` の資格・偽の package・import に使う場所の検査が抜けると、
+    「入口が1つ」の (b) の層を確かめないまま `raise` を使えると書き換えうる。
+    """
+    guide = (ROOT / "docs" / "ubuntu-deploy.md").read_text(encoding="utf-8")
+    section = guide[guide.index("### 6.7") : guide.index("### 6.8")]
+    for needle in (
+        "| C1 |",
+        "| C2 |",
+        "C1 だけが通った状態では外しません",
+        "sys.prefix, sys.executable",
+        "print(sys.base_prefix)' > base.txt",
+        "出たこと自体では失敗にしません",
+        "decisions/0141-c1-import-scan-scope.md",
+        "FINAL になるまで、この 6 で C1 を通したとはしません",
+        "解決できない symlink",
+        "MARK-0134",
+        "管理ソケットの人（`coldaisle-admin` だけ）が authority・制御設定・Registry の"
+        "どれにも触れない",
+        "-p User=coldaisle -p Group=coldaisle -p SupplementaryGroups=dialout",
+        "flock -n /var/lib/coldaisle-registry/.registry.lock true 2> /dev/null; then ng",
+        'cat -- "/etc/coldaisle/control-config/$f" > /dev/null || echo "読めない: $f"',
+    ):
+        assert needle in section, needle
+    # 手順のコードブロックで目印のファイルを作ったら、同じ行で消す
+    # （権限が広すぎるときにファイルを残さない）
+    code = "".join(re.findall(r"```bash\n(.*?)```", section, flags=re.DOTALL))
+    probes = [line for line in code.splitlines() if "mktemp -p " in line and ".probe-" in line]
+    assert probes
+    for line in probes:
+        assert ".probe-XXXXXXXX" in line, line
+        assert 'rm -f -- "$t"' in line, line
 
 
 def test_fand_states_every_timeout():

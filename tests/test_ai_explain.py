@@ -344,13 +344,8 @@ ASSESSED = json.dumps(
     ensure_ascii=False,
 )
 
-# 0138 の一覧（gpu.*.fan_speed を足した形）。config/report.yaml への反映は #320
-EXCLUSIONS_0138 = LlmExclusions.from_mapping(
-    {
-        "llm_excluded_metrics": ["gpu.*.fan_policy", "gpu.*.fan_speed"],
-        "llm_excluded_rules": ["GPU_FAN_NOT_MANUAL", "GPU_FAN_BELOW_CURVE"],
-    }
-)
+# 出荷の一覧そのもの（config/report.yaml。0131 §2.4a / 0138）
+SHIPPED_EXCLUSIONS = LlmExclusions.from_yaml(CONFIG_DIR / "report.yaml")
 
 
 @pytest.fixture
@@ -388,7 +383,7 @@ def _registry(store, exclusions: LlmExclusions) -> ToolRegistry:
 def _explainer(store, answer: str = ASSESSED) -> tuple[Explainer, FakeProvider]:
     provider = FakeProvider(answer)
     explainer = Explainer(
-        provider=provider, tools=_registry(store, EXCLUSIONS_0138), context=CONTEXT
+        provider=provider, tools=_registry(store, SHIPPED_EXCLUSIONS), context=CONTEXT
     )
     return explainer, provider
 
@@ -421,17 +416,19 @@ def test_shipped_context_avoids_the_exclusion_list():
     settings = AiSettings.from_yaml(CONFIG_DIR / "ai.yaml")
     assert settings.explain_context is not None
     catalog = MetricCatalog.from_yaml(CONFIG_DIR / "metrics.yaml")
-    shipped = LlmExclusions.from_yaml(CONFIG_DIR / "report.yaml")
-    for exclusions in (shipped, EXCLUSIONS_0138):
-        for metric in settings.explain_context.metrics:
-            assert not exclusions.excludes_metric_or_inputs(metric, catalog), metric
-            assert metric in catalog.metrics, metric
+    # 前提: 出荷の一覧が GPU の Fan を除いている（この PR では除外を当てたまま。0146 は別）
+    assert SHIPPED_EXCLUSIONS.excludes_metric("gpu.0.fan_speed")
+    assert SHIPPED_EXCLUSIONS.excludes_metric("gpu.0.fan_policy")
+    for metric in settings.explain_context.metrics:
+        assert not SHIPPED_EXCLUSIONS.excludes_metric_or_inputs(metric, catalog), metric
+        assert metric in catalog.metrics, metric
+        assert "fan" not in metric, "explain_context に Fan を足さない（0146 の FINAL の後に別で）"
 
 
 def test_no_context_keeps_the_old_material(loaded_store):
     """`explain_context` が無ければ今のまま（足さない）。"""
     evidence = Explainer(
-        provider=FakeProvider(ANSWER), tools=_registry(loaded_store, EXCLUSIONS_0138)
+        provider=FakeProvider(ANSWER), tools=_registry(loaded_store, SHIPPED_EXCLUSIONS)
     ).build_evidence(alert())
     assert not any("直近15m" in item.text for item in evidence)
 

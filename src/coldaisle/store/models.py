@@ -20,6 +20,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 # 層をまたいで使う名前の規約と品質はレイヤ横断の module に置く（#261 / 決定記録 0113 §2.3）。
 # 既存の `from coldaisle.store.models import Quality` などを壊さないため、
 # 同じオブジェクトを再 export する。
+from coldaisle.clock import validate_boot_id
 from coldaisle.measurement import DERIVED_PREFIX as DERIVED_PREFIX
 from coldaisle.measurement import METRIC_PATTERN as METRIC_PATTERN
 from coldaisle.measurement import Quality as Quality
@@ -301,6 +302,9 @@ class EventRecord(BaseModel):
     書き込みの入口（`coldaisle.event_entry`）が検証済みの内容だけを渡す。
     ここでは保存の形（kind の書式・JSON object）だけを縛り、どの kind を受理するかは
     入口の許可リストに任せる。種類を足すたびに保存層を直さないため。
+
+    ``boot_id`` / ``boottime_ns`` は書いた時点の boot id と `CLOCK_BOOTTIME`（決定記録 0066 §2.2）。
+    2つは組で、片方だけの記録を作らない。移行前の行は両方 ``None`` のまま読む（埋めない）。
     """
 
     model_config = ConfigDict(frozen=True)
@@ -310,6 +314,19 @@ class EventRecord(BaseModel):
     kind: str
     payload_json: str
     peer_uid: int | None = None
+    boot_id: str | None = None
+    boottime_ns: int | None = Field(default=None, ge=0)
+
+    @field_validator("boot_id")
+    @classmethod
+    def _boot_id_has_the_uuid_shape(cls, value: str | None) -> str | None:
+        return None if value is None else validate_boot_id(value)
+
+    @model_validator(mode="after")
+    def _boot_clock_goes_together(self) -> EventRecord:
+        if (self.boot_id is None) != (self.boottime_ns is None):
+            raise ValueError("boot_id と boottime_ns は組で持つ（片方だけにしない）")
+        return self
 
     @field_validator("kind")
     @classmethod
