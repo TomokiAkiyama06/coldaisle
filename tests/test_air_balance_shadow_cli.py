@@ -61,6 +61,7 @@ from test_control_config import valid_documents, write_documents
 from test_control_schema import (
     REGISTRY_PROVENANCE,
     SAFETY_PROVENANCE,
+    TELEMETRY_HEALTH_RECORD,
     fallback_state,
     forced,
     passthrough,
@@ -191,6 +192,7 @@ class Fixture:
             authority=AuthorityRecord(entry="static", config_ceiling=AuthorityStage.FULL),
             air_balance_coordination=record,
             tach_unconfirmed_zones=(),
+            telemetry_health=TELEMETRY_HEALTH_RECORD,
             faults=faults,
         )
 
@@ -522,6 +524,7 @@ def test_a_trace_without_coordination_rejects_the_run(setup: Fixture) -> None:
     body["schema_version"] = 13
     del body["air_balance_coordination"]
     del body["tach_unconfirmed_zones"]
+    del body["telemetry_health"]
     row = ControlTraceRecord(
         ts_ms=tick.ts_ms, tick_id=tick.tick_id, schema_version=13, trace_json=json.dumps(body)
     )

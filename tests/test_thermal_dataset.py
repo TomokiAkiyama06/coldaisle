@@ -1274,6 +1274,13 @@ def _tick_for_schema_version(version: int, *, ts_ms: int, tick_id: int) -> Contr
         # （#81 / 決定記録 0078 §2.7）
         raw["air_balance_coordination"] = {"schema_version": 1, "mode": "off", "status": "off"}
         raw["tach_unconfirmed_zones"] = []
+    if version >= 15:
+        # v15も同じく、健全度と Guard の閾値の組を省いた記録を作れない（#308 / 決定記録 0137）
+        raw["telemetry_health"] = {
+            "schema_version": 1,
+            "health": "normal",
+            "guard_threshold_profile": "normal",
+        }
     return ControlTick.model_validate_json(json.dumps(raw))
 
 

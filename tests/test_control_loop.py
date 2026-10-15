@@ -37,6 +37,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
+import sqlite3
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -63,7 +65,7 @@ from coldaisle.control.loop import (
     build_input_contract,
 )
 from coldaisle.control.model_registry import ArtifactKind, ModelRegistry
-from coldaisle.control.reactive.guard import ReactiveGuard
+from coldaisle.control.reactive.guard import ReactiveGuard, ReactiveGuardDecision
 from coldaisle.control.safety.critical import (
     CriticalSafety,
     DemandComposer,
@@ -75,17 +77,23 @@ from coldaisle.control.schema import (
     ControllerKind,
     ControlTick,
     FaultCode,
+    GuardThresholdProfile,
     OperatingMode,
     PerZone,
     Reason,
     RegistryProvenance,
     SafetyState,
+    TelemetryHealth,
     Zone,
     ZoneRequest,
     registry_reason_sha256,
 )
 from coldaisle.control.shadow.record import ShadowRecorder
-from coldaisle.control.state import ControlStateEstimator
+from coldaisle.control.state import (
+    ControlStateEstimator,
+    ControlStateSnapshot,
+    TelemetryImportance,
+)
 from coldaisle.control.supervisor.policy import SupervisorCoordinator
 from coldaisle.control.supervisor.regime import WorkloadRegimeEstimator
 from coldaisle.control_daemon import (
@@ -115,6 +123,7 @@ from coldaisle.control_daemon import (
     run_config_invalid_max,
 )
 from coldaisle.metrics import MetricCatalog
+from coldaisle.store import SqliteStore
 from coldaisle.store.models import Quality
 from conftest import TEST_EPOCH_MS
 from test_control_config import valid_documents, write_documents
@@ -1133,7 +1142,7 @@ def test_invariant_12_every_tick_records_that_no_registry_was_read(catalog) -> N
     for result in results:
         assert result.tick.registry == RegistryProvenance.unbound()
     recorded = json.loads(harness.trace.rows[-1])
-    assert recorded["schema_version"] == SCHEMA_VERSION == 14
+    assert recorded["schema_version"] == SCHEMA_VERSION == 15
     assert recorded["registry"] == {"schema_version": 1, "revision": None, "production": {}}
 
 
@@ -1341,6 +1350,179 @@ def test_invariant_13_cpu_power_goes_stale_after_its_own_limit_without_a_fault(c
     assert top.forced_max is False
     assert result.tick.faults == ()
     assert result.tick.state.safety_state is SafetyState.NORMAL
+
+
+class RecordingGuard:
+    """本物の Reactive Guard に渡った snapshot と、Guard が返した判断を覚える（値は変えない）。"""
+
+    def __init__(self, inner: ReactiveGuard) -> None:
+        self.inner = inner
+        self.snapshots: list[ControlStateSnapshot] = []
+        self.decisions: list[ReactiveGuardDecision] = []
+
+    def evaluate(self, snapshot: ControlStateSnapshot) -> ReactiveGuardDecision:
+        decision = self.inner.evaluate(snapshot)
+        self.snapshots.append(snapshot)
+        self.decisions.append(decision)
+        return decision
+
+
+def _health(tick: ControlTick) -> tuple[TelemetryHealth, tuple[str, ...], Any]:
+    record = tick.telemetry_health
+    assert record is not None
+    return record.health, record.degraded_inputs, record.guard_threshold_profile
+
+
+def test_cpu_power_staleness_alone_degrades_health_and_makes_the_guard_conservative(
+    catalog, tmp_path, rules, clock
+) -> None:
+    """**CPU Power の古さから健全度と Guard の閾値までを、本番の経路で1本につなぐ。**
+
+    決定記録 0136 §2.3 / 0137 §2.4（0123 §2.2 (b) の T9 (b) の 2 行目と、3 行目のうち健全度）。
+    入力は本番と同じく `build_input_contract()` の契約・ControlLoop の古さの追跡・
+    `ControlStateEstimator` を通り、本物の `ReactiveGuard` へ渡る。`power.cpu.package` の
+    `source_ts_ms` だけを止め、ほかの入力は毎 tick 新しい時刻で渡す。
+    既存の `test_one_air_probe_loss_is_degraded_but_not_the_critical_group`（空気のセンサー）と
+    `test_degraded_snapshot_uses_the_configured_conservative_threshold_set`（Guard 単体）は
+    規則を別々に確かめるだけなので、このテストの代わりにしない。
+    """
+    limit_ms = 5_000
+    safety_document = valid_documents()["safety.yaml"]
+    safety_document["telemetry"]["cpu_power_ms"] = {"value": limit_ms, "status": "provisional"}
+    config = control_config(safety=safety_document)
+    guard = RecordingGuard(ReactiveGuard(config.policy.reactive_guard, catalog))
+    harness = Harness(catalog, config=config, guard=guard)
+    # 本番の契約で CPU Power は DEGRADED の入力（0029 §2.1 / 0123 §1）
+    specs = {spec.metric: spec for spec in harness.contract.signals}
+    assert specs["power.cpu.package"].importance is TelemetryImportance.DEGRADED
+    assert specs["power.cpu.package"].stale_after_ms == limit_ms
+    harness.settle()
+    tick_ms = harness.config.safety.tick_ms.value
+    ticks: list[ControlTick] = []
+
+    def step() -> ControlTick:
+        recorded = harness.tick().tick
+        ticks.append(recorded)
+        # trace の欄は、Guard に渡った snapshot と Guard が返した判断をそのまま写している
+        assert guard.decisions[-1].tick_id == recorded.tick_id
+        assert _health(recorded) == (
+            guard.snapshots[-1].telemetry_health,
+            guard.snapshots[-1].degraded_inputs,
+            guard.decisions[-1].threshold_profile,
+        )
+        return recorded
+
+    # ほかの入力がそろっている間は NORMAL・normal
+    assert _health(step()) == (TelemetryHealth.NORMAL, (), GuardThresholdProfile.NORMAL)
+
+    frozen_ts_ms = harness.clock.now_ms()
+    harness.telemetry.frozen_metric_ts_ms["power.cpu.package"] = frozen_ts_ms
+    for _ in range(limit_ms // tick_ms):
+        assert _health(step()) == (TelemetryHealth.NORMAL, (), GuardThresholdProfile.NORMAL)
+    # 古さがちょうど stale_after の tick までは健全（境界を含む。0123 §2.2 (a) と同じ数え方）
+    assert harness.clock.now_ms() - frozen_ts_ms == limit_ms
+
+    stale = step()
+    assert harness.clock.now_ms() - frozen_ts_ms > limit_ms
+    assert _health(stale) == (
+        TelemetryHealth.DEGRADED,
+        ("power.cpu.package",),
+        GuardThresholdProfile.CONSERVATIVE,
+    )
+    # 健全度だけが下がる。fault は上がらず、Critical Safety の状態は NORMAL のまま
+    assert stale.faults == ()
+    assert stale.state.safety_state is SafetyState.NORMAL
+    # 古いままなら DEGRADED・conservative が続く
+    assert _health(step())[2] is GuardThresholdProfile.CONSERVATIVE
+
+    # 新しい sample を渡した最初の tick で NORMAL・normal に戻る
+    del harness.telemetry.frozen_metric_ts_ms["power.cpu.package"]
+    recovered = step()
+    assert _health(recovered) == (TelemetryHealth.NORMAL, (), GuardThresholdProfile.NORMAL)
+    assert recovered.faults == ()
+
+    # 0137 §2.3 の SQL（決定記録の文面そのもの）で、同じ trace から割合を数えられる
+    with SqliteStore(tmp_path / "traces.db", rules=rules, clock=clock) as store:
+        for recorded in ticks:
+            assert store.record_control_trace(
+                ts_ms=recorded.ts_ms,
+                tick_id=recorded.tick_id,
+                schema_version=recorded.schema_version,
+                trace_json=recorded.model_dump_json(),
+            )
+    connection = sqlite3.connect(tmp_path / "traces.db")
+    try:
+        connection.row_factory = sqlite3.Row
+        row = connection.execute(
+            _decision_0137_sql(),
+            {"start_ms": ticks[0].ts_ms, "end_ms": ticks[-1].ts_ms + 1},
+        ).fetchone()
+    finally:
+        connection.close()
+    degraded = sum(1 for item in ticks if _health(item)[0] is TelemetryHealth.DEGRADED)
+    assert degraded == 2
+    assert dict(row) == {
+        "ticks": len(ticks),
+        "normal_ticks": len(ticks) - degraded,
+        "conservative_ticks": degraded,
+        "guard_unknown_ticks": 0,
+    }
+
+
+def _decision_0137_sql() -> str:
+    """決定記録 0137 §2.3 の SQL。**文面をそのまま走らせ、記録と実装のずれを CI で落とす。**"""
+    text = (
+        Path(__file__).resolve().parents[1]
+        / "docs"
+        / "decisions"
+        / "0137-trace-telemetry-health.md"
+    ).read_text(encoding="utf-8")
+    blocks = re.findall(r"```sql\n(.*?)```", text, flags=re.DOTALL)
+    assert len(blocks) == 1
+    return blocks[0].strip()
+
+
+class RaisingGuard:
+    def evaluate(self, snapshot: ControlStateSnapshot) -> ReactiveGuardDecision:
+        raise RuntimeError("guard の不具合")
+
+
+def test_a_tick_without_a_guard_decision_records_no_threshold_profile(catalog) -> None:
+    """Guard が例外の tick だけ閾値の組を None にし、`guard_exception` を同じ行に残す。
+
+    決定記録 0137 §2.1。`guard_exception` は EMERGENCY なので settle しない。
+    """
+    harness = Harness(catalog, guard=RaisingGuard())
+
+    recorded = harness.tick().tick
+
+    record = recorded.telemetry_health
+    assert record is not None
+    assert record.guard_threshold_profile is None
+    assert record.health is TelemetryHealth.NORMAL
+    assert FaultCode.GUARD_EXCEPTION in {fault.code for fault in recorded.faults}
+
+
+def test_an_unreadable_telemetry_tick_is_degraded_and_conservative(catalog) -> None:
+    """snapshot を作れない tick も Guard を通る。健全度は書ける。
+
+    決定記録 0137 §2.1 の「Guard を通らない tick」は Guard の例外の tick だけ。
+    """
+    harness = Harness(catalog)
+    harness.settle()
+    harness.telemetry.error = RuntimeError("ストアが読めない")
+
+    recorded = harness.tick().tick
+
+    health, inputs, profile = _health(recorded)
+    assert health is TelemetryHealth.DEGRADED
+    assert profile is GuardThresholdProfile.CONSERVATIVE
+    expected = sorted(
+        spec.metric
+        for spec in harness.contract.signals
+        if spec.enabled and spec.importance is not TelemetryImportance.ADVISORY
+    )
+    assert list(inputs) == expected
 
 
 def test_invariant_13_a_telemetry_failure_does_not_stop_the_loop(catalog) -> None:

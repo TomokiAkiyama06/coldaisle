@@ -58,6 +58,9 @@ from coldaisle.control.schema import (
     MODEL_GATE_ASSESSMENT_COMPONENTS,
     REGISTRY_ARTIFACT_KINDS,
     AirBalanceCoordinationRecord,
+    GuardThresholdProfile,
+    TelemetryHealth,
+    TelemetryHealthRecord,
     registry_reason_sha256,
 )
 
@@ -580,6 +583,11 @@ MODE_COMMAND_RECORD = ModeCommandRecord.without_entry()
 COORDINATION_RECORD = AirBalanceCoordinationRecord.off()
 """v14 の `ControlTick` に必須の Air Balance の協調の記録（`mode: off`。決定記録 0078 §2.7）。"""
 
+TELEMETRY_HEALTH_RECORD = TelemetryHealthRecord(
+    health=TelemetryHealth.NORMAL, guard_threshold_profile=GuardThresholdProfile.NORMAL
+)
+"""v15 の `ControlTick` に必須の健全度と Guard の閾値の組（入力がそろった tick。決定記録 0137）。"""
+
 AUTHORITY_RECORD = AuthorityRecord(entry="static", config_ceiling=AuthorityStage.FULL)
 """v13 の `ControlTick` に必須の制御権の出どころ（journal を持たない構成。決定記録 0072 §2.6）。
 
@@ -658,6 +666,7 @@ def tick(demand: EffectiveZoneDemand, faults=(), **state_overrides) -> ControlTi
         authority=AUTHORITY_RECORD,
         air_balance_coordination=COORDINATION_RECORD,
         tach_unconfirmed_zones=(),
+        telemetry_health=TELEMETRY_HEALTH_RECORD,
     )
 
 
@@ -773,6 +782,7 @@ def test_a_front_or_rear_stall_can_stay_degraded():
         authority=AUTHORITY_RECORD,
         air_balance_coordination=COORDINATION_RECORD,
         tach_unconfirmed_zones=(),
+        telemetry_health=TELEMETRY_HEALTH_RECORD,
     )
     assert recorded.state.safety_state is SafetyState.DEGRADED
 
@@ -807,6 +817,7 @@ def test_stale_cpu_temperature_drives_top_to_max():
         authority=AUTHORITY_RECORD,
         air_balance_coordination=COORDINATION_RECORD,
         tach_unconfirmed_zones=(),
+        telemetry_health=TELEMETRY_HEALTH_RECORD,
     )
     assert recorded.zones.top.demand.forced_max
 
@@ -823,7 +834,7 @@ def test_the_stored_v1_record_still_loads_unchanged():
     stored = FIXTURE.read_text(encoding="utf-8")
     tick = ControlTick.model_validate_json(stored)
     assert tick.schema_version == 1
-    assert SCHEMA_VERSION == 14
+    assert SCHEMA_VERSION == 15
     assert json.loads(tick.model_dump_json()) == json.loads(stored)
 
 
@@ -897,6 +908,7 @@ def test_current_trace_stores_workload_regime_and_confidence_together():
         authority=AUTHORITY_RECORD,
         air_balance_coordination=COORDINATION_RECORD,
         tach_unconfirmed_zones=(),
+        telemetry_health=TELEMETRY_HEALTH_RECORD,
     )
 
     payload = json.loads(recorded.model_dump_json())
@@ -934,6 +946,7 @@ def test_v2_trace_keeps_simultaneous_transient_load_distinct():
         authority=AUTHORITY_RECORD,
         air_balance_coordination=COORDINATION_RECORD,
         tach_unconfirmed_zones=(),
+        telemetry_health=TELEMETRY_HEALTH_RECORD,
     )
 
     payload = json.loads(recorded.model_dump_json())
@@ -956,6 +969,7 @@ def test_fallback_trace_remains_valid_when_regime_is_not_available():
         authority=AUTHORITY_RECORD,
         air_balance_coordination=COORDINATION_RECORD,
         tach_unconfirmed_zones=(),
+        telemetry_health=TELEMETRY_HEALTH_RECORD,
     )
 
     assert recorded.schema_version == SCHEMA_VERSION
@@ -1006,6 +1020,7 @@ def test_v3_supervisor_policy_requires_a_matching_decision():
             authority=AUTHORITY_RECORD,
             air_balance_coordination=COORDINATION_RECORD,
             tach_unconfirmed_zones=(),
+            telemetry_health=TELEMETRY_HEALTH_RECORD,
         )
 
 
@@ -1120,6 +1135,7 @@ def test_the_v9_trace_keeps_disabled_inputs_and_the_provisional_flag():
         authority=AUTHORITY_RECORD,
         air_balance_coordination=COORDINATION_RECORD,
         tach_unconfirmed_zones=(),
+        telemetry_health=TELEMETRY_HEALTH_RECORD,
     )
     payload = json.loads(recorded.model_dump_json())
     assert payload["schema_version"] == SCHEMA_VERSION
@@ -1195,6 +1211,7 @@ def registry_tick(registry: RegistryProvenance, **overrides: object) -> ControlT
         "authority": AUTHORITY_RECORD,
         "air_balance_coordination": COORDINATION_RECORD,
         "tach_unconfirmed_zones": (),
+        "telemetry_health": TELEMETRY_HEALTH_RECORD,
     }
     return ControlTick(**(values | overrides))
 
@@ -1204,7 +1221,7 @@ def test_a_v10_tick_round_trips_the_registry_pointer_it_used():
     recorded = registry_tick(bound_registry())
 
     payload = json.loads(recorded.model_dump_json())
-    assert payload["schema_version"] == SCHEMA_VERSION == 14
+    assert payload["schema_version"] == SCHEMA_VERSION == 15
     assert payload["registry"]["revision"] == 3
     thermal = payload["registry"]["production"]["thermal_model"]
     assert thermal["artifact_sha256"] == REGISTRY_SHA
@@ -1556,10 +1573,13 @@ def learned_tick(**overrides) -> ControlTick:
         "authority": AUTHORITY_RECORD,
         "air_balance_coordination": COORDINATION_RECORD,
         "tach_unconfirmed_zones": (),
+        "telemetry_health": TELEMETRY_HEALTH_RECORD,
     }
     version = overrides.get("schema_version", SCHEMA_VERSION)
     assert isinstance(version, int)
     values["runtime"] = runtime_for(version)
+    if version < 15:
+        values.pop("telemetry_health")
     if version < 14:
         values.pop("air_balance_coordination")
         values.pop("tach_unconfirmed_zones")
@@ -1769,6 +1789,7 @@ def test_a_tick_cannot_claim_two_different_artifacts():
             authority=AUTHORITY_RECORD,
             air_balance_coordination=COORDINATION_RECORD,
             tach_unconfirmed_zones=(),
+            telemetry_health=TELEMETRY_HEALTH_RECORD,
             state=fallback_state(
                 authority_stage=AuthorityStage.LIMITED,
                 fallback_reason=Reason(code="low_confidence"),
@@ -1857,3 +1878,121 @@ def test_a_model_gate_without_a_schema_version_is_refused():
 
     with pytest.raises(ValidationError, match="schema_version"):
         ControlTick.model_validate_json(json.dumps(document))
+
+
+# ---------------------------------------------------------------- v15: 健全度（決定記録 0137）
+
+
+def test_a_v15_tick_round_trips_the_telemetry_health():
+    record = TelemetryHealthRecord(
+        health=TelemetryHealth.DEGRADED,
+        degraded_inputs=("air.front_intake", "power.cpu.package"),
+        guard_threshold_profile=GuardThresholdProfile.CONSERVATIVE,
+    )
+    recorded = registry_tick(REGISTRY_PROVENANCE, telemetry_health=record)
+
+    payload = json.loads(recorded.model_dump_json())
+    assert payload["schema_version"] == SCHEMA_VERSION == 15
+    assert payload["telemetry_health"] == {
+        "schema_version": 1,
+        "health": "degraded",
+        "degraded_inputs": ["air.front_intake", "power.cpu.package"],
+        "guard_threshold_profile": "conservative",
+    }
+    assert ControlTick.model_validate_json(recorded.model_dump_json()) == recorded
+
+
+def test_a_v15_tick_cannot_omit_the_telemetry_health():
+    """**「記録が無い」を新しい trace で作らない**（0060 §2.4 と同じ規律）。"""
+    with pytest.raises(ValidationError, match="telemetry_health が要る"):
+        registry_tick(REGISTRY_PROVENANCE, telemetry_health=None)
+
+
+def test_a_v14_tick_reads_without_the_telemetry_health_but_cannot_carry_it():
+    """保存済みの v14 は欄なしで読める。v14 を名乗って v15 の欄を持てない。"""
+    stored = json.loads((FIXTURE.parent / "control_tick_v14.json").read_text(encoding="utf-8"))
+    tick = ControlTick.model_validate_json(json.dumps(stored))
+    assert tick.schema_version == 14
+    assert tick.telemetry_health is None
+    assert json.loads(tick.model_dump_json()) == stored
+
+    with pytest.raises(ValidationError, match="schema version 15"):
+        registry_tick(REGISTRY_PROVENANCE, schema_version=14)
+
+
+@pytest.mark.parametrize(
+    ("health", "inputs", "profile", "message"),
+    [
+        # 原因の無い DEGRADED・欠けた入力のある NORMAL
+        (TelemetryHealth.DEGRADED, (), GuardThresholdProfile.CONSERVATIVE, "degraded_inputs"),
+        (
+            TelemetryHealth.NORMAL,
+            ("power.cpu.package",),
+            GuardThresholdProfile.NORMAL,
+            "degraded_inputs",
+        ),
+        # 健全度と Guard の閾値の組の食い違い（T9 (b) のつながりが切れた記録）
+        (TelemetryHealth.NORMAL, (), GuardThresholdProfile.CONSERVATIVE, "conservative"),
+        (
+            TelemetryHealth.DEGRADED,
+            ("power.cpu.package",),
+            GuardThresholdProfile.NORMAL,
+            "conservative",
+        ),
+        # 並びと重複
+        (
+            TelemetryHealth.DEGRADED,
+            ("power.cpu.package", "air.front_intake"),
+            GuardThresholdProfile.CONSERVATIVE,
+            "昇順",
+        ),
+        (
+            TelemetryHealth.DEGRADED,
+            ("power.cpu.package", "power.cpu.package"),
+            GuardThresholdProfile.CONSERVATIVE,
+            "昇順",
+        ),
+    ],
+)
+def test_the_telemetry_health_record_refuses_an_inconsistent_tick(health, inputs, profile, message):
+    with pytest.raises(ValidationError, match=message):
+        TelemetryHealthRecord(
+            health=health, degraded_inputs=inputs, guard_threshold_profile=profile
+        )
+
+
+def test_a_missing_guard_profile_needs_the_guard_exception():
+    """Guard が判断を返さないのは例外の tick だけ。理由の無い欠けを作らない（0137 §2.1）。"""
+    without_guard = TelemetryHealthRecord(
+        health=TelemetryHealth.NORMAL, guard_threshold_profile=None
+    )
+    with pytest.raises(ValidationError, match="guard_exception"):
+        registry_tick(REGISTRY_PROVENANCE, telemetry_health=without_guard)
+
+    recorded = ControlTick(
+        tick_id=1,
+        ts_ms=NOW_MS,
+        state=fallback_state(safety_state=SafetyState.EMERGENCY),
+        zones=zones(forced()),
+        faults=(Fault(code=FaultCode.GUARD_EXCEPTION, detail="RuntimeError"),),
+        runtime=CONTROL_TICK_RUNTIME,
+        safety_provenance=SAFETY_PROVENANCE,
+        registry=REGISTRY_PROVENANCE,
+        air_balance=AIR_BALANCE_RECORD,
+        mode_command=MODE_COMMAND_RECORD,
+        authority=AUTHORITY_RECORD,
+        air_balance_coordination=COORDINATION_RECORD,
+        tach_unconfirmed_zones=(),
+        telemetry_health=without_guard,
+    )
+    assert recorded.telemetry_health is not None
+    assert recorded.telemetry_health.guard_threshold_profile is None
+
+
+def test_the_trace_and_the_controller_share_one_health_type():
+    """trace と State Estimator・Guard が別の enum を持たない（0137 §2.1）。"""
+    from coldaisle.control import state
+    from coldaisle.control.reactive import guard
+
+    assert state.TelemetryHealth is TelemetryHealth
+    assert guard.GuardThresholdProfile is GuardThresholdProfile
