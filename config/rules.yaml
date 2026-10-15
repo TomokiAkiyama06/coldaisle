@@ -18,6 +18,10 @@
 #   threshold     : 発火の閾値
 #   clear         : 解除の閾値。**発火と別に持つ**（ヒステリシス。要件 §6.4）
 #                   閾値ちょうどを往復するデータでフラッピングしないため
+#
+# しきい値・範囲のルール（recirculation / intake_high / airflow_degraded / room_high /
+# humidity_out_of_range）は、SENSOR_MISSING / SENSOR_FAULT が発火したら、その入力に依る
+# 発火待ちを数え直す（決定記録 0139。境界は sensor_missing.consecutive と sensor_fault.silence_s）
 
 rules:
   # FR-401: 30秒以上サンプルが来ない。取り込み・ケーブル・デバイスのどれかが死んでいる

@@ -1097,6 +1097,22 @@ class SqliteStore:
         ).fetchone()
         return None if row is None else AlertRecord.model_validate(dict(row))
 
+    def active_alerts(self) -> tuple[AlertRecord, ...]:
+        """未解決（`pending` / `firing`）のアラートを**件数の上限なしに**すべて返す。
+
+        ルールエンジンの起動時の復元に使う（決定記録 0139 §2.3.2）。解決済みを含む
+        新しい N 件で読むと、古い発火中の故障アラートや pending が窓の外に落ちる。
+        有効な行の数はルールとメトリクスの組の数で抑えられるので、上限を持たない。
+        順は `alerts()` と同じ（新しい順）。
+        """
+        rows = self._conn.execute(
+            "SELECT id, rule_id, severity, state, metric, started_ms, fired_ms, resolved_ms, "
+            "trigger_value, threshold, detail FROM alerts "
+            "WHERE state IN ('pending', 'firing') "
+            "ORDER BY started_ms DESC, id DESC"
+        ).fetchall()
+        return tuple(AlertRecord.model_validate(dict(row)) for row in rows)
+
     def open_alert(
         self,
         *,
