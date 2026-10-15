@@ -66,7 +66,7 @@ _ERROR_TYPE = re.compile(r"^[a-z_]{1,64}$")
 **本文の `message` は載せない**（何が入るか分からない）。
 """
 
-_UNUSABLE_STOPS = frozenset({"refusal", "max_tokens"})
+_UNUSABLE_STOPS = frozenset({"refusal", "max_tokens", "model_context_window_exceeded"})
 """採用しない `stop_reason`。切れた所見・JSON を使わない（0143 §2.6）。"""
 
 _RETRYABLE_4XX = frozenset({408, 429})
@@ -196,10 +196,12 @@ class AnthropicProvider:
             "messages": turns,
             # temperature / thinking は送らない
             # （Haiku 5.5 / Sonnet 5.5 は既定以外の sampling を拒む。0143 §2.5）
-            "output_config": {"effort": self.limits.effort},
         }
         if system:
             payload["system"] = system
+        if self.limits.effort is not None:
+            # 設定したときだけ送る。対応するモデルかをコードで判定しない（0143 §2.5）
+            payload["output_config"] = {"effort": self.limits.effort}
         use_thinking = self.settings.thinking if thinking is None else thinking
         timeout = self.settings.thinking_timeout_s if use_thinking else self.settings.timeout_s
         return self._post(payload, timeout)

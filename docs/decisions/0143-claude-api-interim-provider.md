@@ -28,7 +28,7 @@ Provider は `UnavailableProvider` になり、次の 3 つが動いていない
 |---|---|---|
 | 日次レポートの所見（FR-506 / 0017） | `report.py` → `ai.summary.summarise` | 表だけが届く |
 | アラートの自動の説明（FR-505 / FR-508 / 0016） | `daemon.py` の説明スレッド → `ai.explain.Explainer` | 素のアラートだけが届く |
-| Server Health の任意要約（0040） | `server.py` → `ai.health.AiHealthSummarizer` | 固定のテンプレートだけ |
+| Server Health の任意要約（0040） | `server.py` → `ai.health.AiHealthSummarizer`（**`coldaisle.server:app` で起動したときだけ**。導入先の `coldaisle-api.service` は `coldaisle.api:app` で起動しており、この経路は作られない。§5 の 5） | 固定のテンプレートだけ |
 
 所有者は 2026-10-15 に、ローカル LLM が入るまでの代わりとして Claude API の鍵を使ってよいと判断し、
 導入先の `/etc/coldaisle/coldaisle.env` に鍵を登録した（#324）。
@@ -76,7 +76,7 @@ Provider は呼び出し側が組み立てた `ChatMessage` の列をそのま�
 |---|---|
 | 日次レポートの所見 | `facts_markdown()` の文（日ごとの集計の表と件数。0017 §2.2。0131 §2.4a / 0138 の除外を当てた後） |
 | アラートの説明 | アラートの rule_id・重大度・対象と、コードが組み立てた Evidence の行（閾値判定・品質・直近 24 時間の統計。0016）。Evidence を集めるツールにも除外を当てる（0131 §2.4a） |
-| Server Health の任意要約 | 固定のテンプレートの文 1 つ（0040） |
+| Server Health の任意要約（`coldaisle.server:app` のときだけ） | 固定のテンプレートの文 1 つ（0040） |
 
 - 生の時系列は送らない（ルール 8 / FR-504）。今の経路がそもそも渡していない
 - 0131 §2.4a / 0138 の除外（`config/report.yaml` の `llm_excluded_metrics` / `llm_excluded_rules`）はそのまま当たる。
@@ -109,18 +109,18 @@ Provider は呼び出し側が組み立てた `ChatMessage` の列をそのま�
 |---|---|---|
 | `max_tokens` | `1024` | 1 回の応答の上限。今の `max_tokens` と同じ値。超える値は送らない |
 | `daily_call_limit` | `200` | **1 プロセス・1 日（導入先のローカル時刻の日付）あたりの HTTP 要求の回数**。再試行も 1 回と数える |
-| `effort` | `low` | `output_config.effort`。短い分類・要約なので考える量を抑える |
+| `effort` | 無し（`null`） | `output_config.effort`。**無い・`null` なら送らない**（モデルの既定のまま）。対応するモデルかどうかをコードで判定しないので、対応を確かめたモデルでだけ `low` などを設定する |
 
 - 上限に達したら**呼ばずに**「利用不可」を返す。呼び出し側は今と同じくテンプレート（表だけ・素のアラート・固定の文）を出す
 - 上限に達したことは、その日に 1 回だけ warning のログに出す（毎回出すと本物の障害が埋もれる）
-- 数えるのはプロセスの中のメモリ（daemon・report・API のそれぞれ）。再起動で 0 に戻る。
+- 数えるのはプロセスの中のメモリ（daemon・report・`coldaisle.server:app` で起動した API のそれぞれ）。再起動で 0 に戻る。
   上限は費用の暴走を止めるための粗い蓋であり、課金の正本は Anthropic の Console の使用量と、
   所有者が Console で設定する月の上限（spend limit）である（§5 の 1）
 - 費用の見積もり（`claude-haiku-5-5`、1 回あたり入力 3,000 token・出力 1,024 token の最悪の場合）:
   約 $0.0008 / 回。3 プロセスが毎日上限まで呼んでも 600 回 × $0.0008 ≒ **$0.5 / 日**。
-  実際は日次レポート 1 回 + アラートの件数 + Health の文の変化の回数で、桁が 1〜2 小さい
+  実際は日次レポート 1 回 + アラートの件数（+ `coldaisle.server:app` のときの Health の文の変化の回数）で、桁が 1〜2 小さい
 - `temperature` は送らない（Haiku 5.5 / Sonnet 5.5 は既定以外の値を 400 で拒む）。
-  `thinking` も送らない（モデルの既定の adaptive のまま。深さは `effort` で抑える）
+  `thinking` も送らない（モデルの既定のまま。深さを抑えたいときは `effort` を設定する）
 
 ### 2.6 不達・上限超過・鍵が無いときも監視と通知は動き続ける（FR-507）
 
@@ -130,7 +130,7 @@ Provider は呼び出し側が組み立てた `ChatMessage` の列をそのま�
   すべて `ChatResult(available=False, reason=...)` で返す
 - `ANTHROPIC_API_KEY` か `ANTHROPIC_MODEL` が無ければ `UnavailableProvider`（作って毎回失敗させない）
 - 再試行は今の `max_attempts` / `retry_backoff_s` に従い、**429・5xx・接続の失敗だけ**。他の 4xx は再試行しない
-- `stop_reason` が `refusal` か `max_tokens`（途中で切れた）なら「利用不可」として捨てる
+- `stop_reason` が `refusal`・`max_tokens`（途中で切れた）・`model_context_window_exceeded`（文脈の長さで切れた）なら「利用不可」として捨てる
   （切れた所見や JSON を採用しない）
 - 説明は付かないだけで、アラートは今と同じ時刻に今と同じ宛先へ届く（説明は後追い。0016）
 
@@ -164,7 +164,7 @@ Provider に依らず同じものを通る。
 ### 2.10 実装: httpx で Messages API を直接呼ぶ（SDK を足さない）
 
 - 使う API の面は `POST /v1/messages` の 1 つだけで、送るのは `model` / `max_tokens` / `system` / `messages` /
-  `output_config.effort`、読むのは `content` の `text` の塊と `stop_reason` だけである
+  （設定したときだけ）`output_config.effort`、読むのは `content` の `text` の塊と `stop_reason` だけである
 - 公式の Python SDK（`anthropic`）を足すと、1.x は `httpx2` を含む別の依存の木を連れてくる。
   本プロジェクトは既に `httpx` を使い、OpenAI 互換の Provider も SDK を使わず httpx で直接呼んでいる。
   SDK の自前の再試行（既定 2 回）と待ち時間（既定 10 分）は 0014 §2.5 の「粘らない」と別に止める必要もある
@@ -217,3 +217,5 @@ Provider に依らず同じものを通る。
 | 2 | ローカル LLM が入った後、`AnthropicProvider` をコードに残すか消すか | ローカル LLM の導入（#58）の後 |
 | 3 | `daily_call_limit` / `max_tokens` / `effort` の値の見直し | 有効にして 1〜2 週間の使用量を Console で見た後 |
 | 4 | 導入先の `coldaisle.env` の鍵の変数名が `ANTHROPIC_API_KEY` と一致するか | 導入先で有効にするとき（#324 の PR の手順） |
+| 5 | 導入先の API（`coldaisle-api.service`）を `coldaisle.api:app` から `coldaisle.server:app` へ切り替えるか（切り替えると Server Health の任意要約と AI ツールの窓口が開く。unit の変更は本記録の範囲外） | 別の Issue |
+| 6 | モデル ID（推奨の `claude-haiku-5-5`）が鍵で使えるか | 導入先で有効にするとき（`docs/llm-setup.md` の疎通確認） |

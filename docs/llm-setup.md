@@ -122,21 +122,23 @@ print('利用可' if result.available else f'利用不可: {result.reason}')
 
 ## Claude API（ローカル LLM が入るまでの代わり。決定記録 0143）
 
-導入先にローカル LLM（vLLM。#58）が入るまでの間だけ、日次レポートの所見・アラートの説明・
-Server Health の任意要約を Claude API で作れます。**既定では使いません。**
+導入先にローカル LLM（vLLM。#58）が入るまでの間だけ、日次レポートの所見とアラートの説明を
+Claude API で作れます。**既定では使いません。**
+Server Health の任意要約は、API を `coldaisle.server:app` で起動したときだけ作られます。
+導入先の `coldaisle-api.service` は `coldaisle.api:app` で起動しているので、今の導入では作られません（0143 §5 の 5）。
 `COLDAISLE_LLM_PROVIDER=anthropic` と明示したときだけ外へ送ります（鍵を置いただけでは送らない）。
 
 | 環境変数 | 値 |
 |---|---|
 | `COLDAISLE_LLM_PROVIDER` | `anthropic`（未設定・空・`openai_compatible` なら今のまま） |
 | `ANTHROPIC_API_KEY` | Claude API の鍵。`/etc/coldaisle/coldaisle.env` にだけ書く |
-| `ANTHROPIC_MODEL` | モデル ID。**推奨は `claude-haiku-5-5`**。所見の質が足りなければ `claude-sonnet-5-5` |
+| `ANTHROPIC_MODEL` | モデル ID。**推奨は `claude-haiku-5-5`**。所見の質が足りなければ `claude-sonnet-5-5`。**モデル ID は Anthropic のモデルの一覧（Console / Models API）で確かめる**（世代が替わると ID も替わる） |
 | `ANTHROPIC_WORKSPACE_ID` | 任意。ワークスペースに属さない鍵で、API が `anthropic-workspace-id` ヘッダを求めて 400 を返すときだけ書く（`anthropic-workspace-id` ヘッダで送る）。空白を含むと Claude API を使わない。空なら送らない |
 
 - **送るのは今のローカル LLM に渡すのと同じ集計値だけです**（日次レポートの表・アラートの Evidence の行・
-  Server Health の固定の文）。生の時系列・decision trace・ツールの結果・案件資料（`coldaisle-escalate`）は送りません
+  `coldaisle.server:app` のときの Server Health の固定の文）。生の時系列・decision trace・ツールの結果・案件資料（`coldaisle-escalate`）は送りません
 - `config/report.yaml` の除外（`llm_excluded_metrics` / `llm_excluded_rules`。0131 §2.4a / 0138）はそのまま当たります
-- 1 回の長さ・1 日の回数・`effort` の上限は `config/ai.yaml` の `anthropic:` です。上限に達したら呼ばずに、
+- 1 回の長さ・1 日の回数の上限と `effort`（既定は送らない）は `config/ai.yaml` の `anthropic:` です。上限に達したら呼ばずに、
   所見・説明の無い今の形で届きます（監視と通知は止まりません。FR-507）
 - 鍵はログ・応答の `reason`・通知に出ません（失敗の理由は HTTP の状態コードと `error.type` だけ）
 
@@ -167,6 +169,25 @@ Server Health の任意要約を Claude API で作れます。**既定では使�
    鍵がワークスペースに属さないと、API は「`anthropic-workspace-id` ヘッダが要る」と 400 を返します
    （journal の `reason` は `HTTP 400: invalid_request_error`）。そのときは鍵を作り直すか、
    `ANTHROPIC_WORKSPACE_ID` に Console のワークスペースの ID を書きます（値はログに出ません）
+
+   **モデル ID は Anthropic のモデルの一覧（Console / Models API）で確かめてから書きます。**
+
+   再起動の前に、鍵・ワークスペース・モデル ID で 1 回だけ疎通を確かめる（1 回ぶんの上限を使う。所有者の手元の
+   確かめのスクリプトがあればそれでもよい）
+
+   ```bash
+   sudo systemd-run --wait --pipe --uid=coldaisle --gid=coldaisle \
+     -p WorkingDirectory=/opt/coldaisle -p EnvironmentFile=/etc/coldaisle/coldaisle.env \
+     /opt/coldaisle/.venv/bin/python -c "
+   from pathlib import Path
+   from coldaisle.ai import AiSettings, provider_from_env
+   r = provider_from_env(AiSettings.from_yaml(Path('config/ai.yaml'))).probe()
+   print('利用可' if r.available else f'利用不可: {r.reason}')
+   "
+   ```
+
+   `利用可` なら良い。`HTTP 404: not_found_error` はモデル ID の誤り、`HTTP 401: authentication_error` は鍵の誤り、
+   `HTTP 400: invalid_request_error` はワークスペースの ID の不足か誤りを疑う（値はログに出ない）
 
 4. 環境変数は起動時に読むので、常駐する 2 つを再起動する（`coldaisle-report` は次のタイマーの起動から効く）
 

@@ -111,7 +111,9 @@ def test_request_shape(settings):
     assert body["system"] == "日本語で答える"
     assert body["messages"] == [{"role": "user", "content": "所見を書いて"}]
     assert body["max_tokens"] <= settings.anthropic.max_tokens
-    assert body["output_config"] == {"effort": settings.anthropic.effort}
+    # 既定の設定では effort を送らない（対応するモデルかをコードで判定しない。0143 §2.5）
+    assert settings.anthropic.effort is None
+    assert "output_config" not in body
     # 既定以外の sampling を拒むモデルがある（0143 §2.5）
     assert "temperature" not in body
     assert "thinking" not in body
@@ -141,7 +143,7 @@ def test_tools_are_never_sent(settings):
     assert calls == []
 
 
-@pytest.mark.parametrize("stop", ["refusal", "max_tokens"])
+@pytest.mark.parametrize("stop", ["refusal", "max_tokens", "model_context_window_exceeded"])
 def test_unusable_stop_reason_is_unavailable(settings, stop):
     """拒否・途中で切れた応答は採用しない（切れた所見や JSON を使わない）。"""
     result = ask(provider(settings, lambda _: httpx.Response(200, json=reply("途中", stop=stop))))
@@ -447,3 +449,30 @@ def test_malformed_workspace_is_unavailable_without_echo(clean_env, settings, ca
     assert WORKSPACE_ENV in chosen.reason
     assert "wrkspc" not in chosen.reason
     assert "wrkspc" not in caplog.text
+
+
+# ---------------------------------------------------------------- effort（0143 §2.5）
+
+
+@pytest.mark.parametrize("effort", [None, "low", "high"])
+def test_effort_is_sent_only_when_configured(settings, effort):
+    seen: list[dict] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(json.loads(request.content))
+        return httpx.Response(200, json=reply("x"))
+
+    configured = settings.model_copy(
+        update={"anthropic": settings.anthropic.model_copy(update={"effort": effort})}
+    )
+    ask(provider(configured, handler))
+    if effort is None:
+        assert "output_config" not in seen[0]
+    else:
+        assert seen[0]["output_config"] == {"effort": effort}
+
+
+def test_effort_may_be_omitted_from_the_config():
+    from coldaisle.ai import AnthropicLimits
+
+    assert AnthropicLimits(max_tokens=10, daily_call_limit=1).effort is None

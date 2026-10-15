@@ -70,8 +70,11 @@ class AnthropicLimits(BaseModel):
     """1 回の応答の上限。`AiSettings.max_tokens` と小さいほうを送る。"""
     daily_call_limit: int = Field(ge=1)
     """1 プロセス・1 日（ローカル時刻の日付）あたりの HTTP 要求の回数。再試行も 1 回と数える。"""
-    effort: Literal["low", "medium", "high"]
-    """`output_config.effort`。短い分類・要約なので推奨は `low`。"""
+    effort: Literal["low", "medium", "high"] | None = None
+    """`output_config.effort`。**無い・null なら送らない**（モデルの既定のまま）。
+
+    対応するモデルかどうかをコードで判定しない（0143 §2.5）。対応を確かめたモデルでだけ設定する。
+    """
 
 
 class AiSettings(BaseModel):
