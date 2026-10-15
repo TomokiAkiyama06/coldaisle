@@ -460,6 +460,25 @@ def test_the_deploy_guide_creates_the_authority_directory_the_unit_uses():
     assert f'"SupplementaryGroups={supplementary}"' in guide
 
 
+def test_the_deploy_guide_checks_permissions_by_opening_not_by_test():
+    """権限は `test -r` / `-w` / `-x` で判定せず、実際に開いて確かめる（0134 §2.4 / #300）。
+
+    `test` の答えは実装（外部コマンドか組み込みか・補助グループと ACL の扱い）で変わり、
+    「書けない」の確認が誤って通ると広すぎる権限を見逃す。手順のコードブロックに戻さない。
+    存在の確認（`test -e` / `test -d`）は権限の判定ではないので対象にしない。
+    """
+    guide = (ROOT / "docs" / "ubuntu-deploy.md").read_text(encoding="utf-8")
+    blocks = re.findall(r"```bash\n(.*?)```", guide, flags=re.DOTALL)
+    assert blocks
+    for block in blocks:
+        assert not re.search(r"\btest\s+-[rwx]\b", block), block
+    # 置き換えた形（読める・ファイルに書けない／書ける・ディレクトリに書ける）
+    assert 'sh -c \'cat -- "$1" > /dev/null && ! (: >> "$1") 2> /dev/null\' _ "$f"' in guide
+    assert 'sh -c \'! cat -- "$1" > /dev/null 2>&1\' _ "$f"' in guide
+    assert 'sh -c \': >> "$1"\' _ "$f" || echo "書けない: $f"' in guide
+    assert 'sh -c \'touch -- "$1/.probe-fand" && rm -- "$1/.probe-fand"\'' in guide
+
+
 def test_fand_states_every_timeout():
     """既定（90 秒）のままだと、止まらない fand を待つあいだ PWM が最後の値に残る（0080 §2.2）。"""
     service = fand()["Service"]
