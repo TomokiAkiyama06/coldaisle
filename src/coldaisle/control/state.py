@@ -14,6 +14,7 @@ from typing import Annotated, Self
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from coldaisle.control.schema import Demand, PerZone
+from coldaisle.control.schema import TelemetryHealth as TelemetryHealth
 from coldaisle.measurement import Quality, validate_metric
 from coldaisle.metrics import MetricCatalog, compute_derived
 
@@ -36,13 +37,6 @@ class TelemetryImportance(StrEnum):
     CRITICAL = "critical"
     DEGRADED = "degraded"
     ADVISORY = "advisory"
-
-
-class TelemetryHealth(StrEnum):
-    """入力の健康度。Critical Safety の ``SafetyState`` とは別の軸。"""
-
-    NORMAL = "normal"
-    DEGRADED = "degraded"
 
 
 class SignalSpec(_Frozen):
@@ -220,6 +214,15 @@ class ControlStateSnapshot(_Frozen):
         """派生値を key にした読み取り用のコピーを返す。"""
         return {signal.metric: signal.value for signal in self.derived}
 
+    @property
+    def degraded_inputs(self) -> tuple[str, ...]:
+        """健全度を ``DEGRADED`` にする入力の metric（昇順）。決定記録 0137 §2.1。
+
+        ``telemetry_health`` と同じ規則（有効で advisory でなく、値として使えない）で数える。
+        snapshot の形は変えず、trace へ写すときに数え直す。
+        """
+        return tuple(sorted(signal.metric for signal in self.signals if _degrades_health(signal)))
+
 
 class ControlStateEstimator:
     """収集済み input frame から状態を組み立てる純粋な State Estimator。"""
@@ -321,12 +324,7 @@ class ControlStateEstimator:
 
     @staticmethod
     def _telemetry_health(signals: tuple[SnapshotSignal, ...]) -> TelemetryHealth:
-        if any(
-            signal.enabled
-            and signal.importance is not TelemetryImportance.ADVISORY
-            and not signal.available
-            for signal in signals
-        ):
+        if any(_degrades_health(signal) for signal in signals):
             return TelemetryHealth.DEGRADED
         return TelemetryHealth.NORMAL
 
@@ -361,3 +359,15 @@ class ControlStateEstimator:
                 )
             )
         return tuple(trends)
+
+
+def _degrades_health(signal: SnapshotSignal) -> bool:
+    """この signal が telemetry の健全度を ``DEGRADED`` にするか（0029 §2.1）。
+
+    健全度の判定と trace の ``degraded_inputs``（決定記録 0137）が同じ規則を使うため1か所に置く。
+    """
+    return (
+        signal.enabled
+        and signal.importance is not TelemetryImportance.ADVISORY
+        and not signal.available
+    )

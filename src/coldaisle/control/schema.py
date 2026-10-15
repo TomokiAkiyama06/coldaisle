@@ -24,7 +24,9 @@ from typing import Annotated, Literal, Protocol, Self, runtime_checkable
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-SCHEMA_VERSION: Literal[14] = 14
+from coldaisle.measurement import validate_metric
+
+SCHEMA_VERSION: Literal[15] = 15
 """`ControlTick` の形の版。**フィールドの名前や意味を変えたら上げる。**
 
 #82 が保存したデータを読み違えないため。
@@ -75,6 +77,10 @@ SCHEMA_VERSION: Literal[14] = 14
   Gate を迂回した tick の `fallback_reason` に `air_balance_coordination_failed` を許す。
   **v14 には両方が必須**で、保存済みの v1〜v13 は欄なしのまま読める
   （「記録が無い」であって「協調していなかった」ではない）
+- v15（#308 / 決定記録 0137）: その tick の telemetry の健全度と Reactive Guard の閾値の組
+  （`telemetry_health`。健全度・それを `DEGRADED` にした入力・Guard の `threshold_profile`）。
+  **v15 には必須**で、保存済みの v1〜v14 は欄なしのまま読める
+  （「記録が無い」であって「`NORMAL` だった」ではない）
 """
 
 Demand = Annotated[float, Field(ge=0.0, le=1.0, allow_inf_nan=False)]
@@ -2159,10 +2165,67 @@ class AuthorityRecord(_Frozen):
         return lowest_stage(*stages)
 
 
+class TelemetryHealth(StrEnum):
+    """入力の健全度。Critical Safety の ``SafetyState`` とは別の軸（決定記録 0029 §2.1）。
+
+    State Estimator（`coldaisle.control.state`）が決め、Reactive Guard が読み、
+    decision trace（v15）が写す。**3者が同じ型を使う**（決定記録 0137 §2.1）。
+    """
+
+    NORMAL = "normal"
+    DEGRADED = "degraded"
+
+
+class GuardThresholdProfile(StrEnum):
+    """Reactive Guard が snapshot の入力品質に応じて選んだ閾値組（#80 / 決定記録 0137 §2.1）。"""
+
+    NORMAL = "normal"
+    CONSERVATIVE = "conservative"
+
+
+TELEMETRY_HEALTH_RECORD_SCHEMA_VERSION: Literal[1] = 1
+"""`TelemetryHealthRecord` の形の版。"""
+
+
+class TelemetryHealthRecord(_Frozen):
+    """その tick の telemetry の健全度と Guard の閾値の組（`ControlTick` v15。決定記録 0137）。
+
+    - ``health``: その tick の snapshot の ``telemetry_health`` の写し
+    - ``degraded_inputs``: 健全度を ``DEGRADED`` にした入力（有効で advisory でなく、値として
+      使えない signal の metric）。昇順・重複なし
+    - ``guard_threshold_profile``: その tick の ``ReactiveGuardDecision.threshold_profile``。
+      **Guard が例外で判断を返さなかった tick だけ** None（同じ tick の faults に
+      ``guard_exception`` がある。`ControlTick` が検証する）
+    """
+
+    schema_version: Literal[1] = TELEMETRY_HEALTH_RECORD_SCHEMA_VERSION
+    health: TelemetryHealth
+    degraded_inputs: tuple[str, ...] = ()
+    guard_threshold_profile: GuardThresholdProfile | None
+
+    @model_validator(mode="after")
+    def _health_matches_inputs_and_profile(self) -> Self:
+        for metric in self.degraded_inputs:
+            validate_metric(metric)
+        if list(self.degraded_inputs) != sorted(set(self.degraded_inputs)):
+            raise ValueError("degraded_inputs は metric 名の昇順・重複なしで記録する")
+        degraded = self.health is TelemetryHealth.DEGRADED
+        if degraded != bool(self.degraded_inputs):
+            # 原因の無い DEGRADED も、欠けた入力のある NORMAL も作らない（決定記録 0137 §2.1）
+            raise ValueError("health が degraded なのは degraded_inputs がある tick だけ")
+        profile = self.guard_threshold_profile
+        if profile is not None and (profile is GuardThresholdProfile.CONSERVATIVE) != degraded:
+            # Guard の規則そのもの。食い違いは健全度と閾値がつながっていないことを意味する
+            raise ValueError(
+                "guard_threshold_profile が conservative なのは health が degraded の tick だけ"
+            )
+        return self
+
+
 class ControlTick(_Frozen):
     """1 tick の判断の記録（decision trace。0028 §2.3）。#82 が保存し、#90 / #91 が読む。"""
 
-    schema_version: Literal[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14] = SCHEMA_VERSION
+    schema_version: Literal[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15] = SCHEMA_VERSION
     tick_id: int = Field(ge=0)
     ts_ms: int = Field(ge=0)
     """記録の時刻（壁時計。0028 §2.6）。"""
@@ -2228,6 +2291,13 @@ class ControlTick(_Frozen):
     どの zone の未確認の tach が協調の ``skipped``（``tach_unconfirmed``）の原因かを
     trace だけで読む。
     """
+    telemetry_health: TelemetryHealthRecord | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
+    """その tick の telemetry の健全度と Guard の閾値の組（v15。#308 / 決定記録 0137）。
+
+    保存済みの v1〜v14 では None（「記録が無い」であって「NORMAL だった」ではない）。
+    """
     faults: tuple[Fault, ...] = ()
     """いま有効な故障。
 
@@ -2281,6 +2351,7 @@ class ControlTick(_Frozen):
         self._check_mode_command()
         self._check_authority()
         self._check_air_balance_coordination()
+        self._check_telemetry_health()
         self._check_model_gate()
         self._check_registry_binds_model()
         self._check_shadow()
@@ -2497,6 +2568,22 @@ class ControlTick(_Frozen):
         else:
             self._check_requested_covers_output(record)
             self._check_coordination_reasons(record)
+
+    def _check_telemetry_health(self) -> None:
+        """v15 の ``telemetry_health`` が版と同じ tick の faults に合うか（決定記録 0137 §2.1）。"""
+        record = self.telemetry_health
+        if record is None:
+            if self.schema_version >= 15:
+                # 版が中身を表さない記録を作らない（0060 §2.4）。
+                raise ValueError("v15 の ControlTick には telemetry_health が要る")
+            return
+        if self.schema_version < 15:
+            raise ValueError("telemetry_health を記録する ControlTick は schema version 15 にする")
+        if record.guard_threshold_profile is None and not any(
+            fault.code is FaultCode.GUARD_EXCEPTION for fault in self.faults
+        ):
+            # Guard が判断を返さないのは例外の tick だけ。理由の無い欠けを作らない。
+            raise ValueError("guard_threshold_profile が無い tick には guard_exception がある")
 
     def _check_tach_unconfirmed(self, record: AirBalanceCoordinationRecord) -> None:
         zones = self.tach_unconfirmed_zones

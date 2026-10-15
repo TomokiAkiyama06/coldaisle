@@ -21,13 +21,14 @@
 (function (root) {
   // 版ごとに**初めて現れた**欄（control/schema.py の SCHEMA_VERSION の説明）。
   // **schema.py にある版だけを知っている版にする。** 版の番号は先にマージされた PR で決まる
-  // （0064 §2.9 / 0071 §2.5）ため、推測で先取りしない。v15 以降は「未対応の版」。
+  // （0064 §2.9 / 0071 §2.5）ため、推測で先取りしない。v16 以降は「未対応の版」。
   // v11（#81 / 決定記録 0073 §2.5）: `air_balance` と `zones.*.applied_demand`。
   // v12（#74 / 決定記録 0072 §2.7）: `mode_command`（モードの出どころ・lease 切れ・受付の停止）。
   // v13（#92 / 決定記録 0072 §2.6）: `authority`（制御権の出どころ・journal を読めない・降格の指令）。
   // v14（#81 / 決定記録 0078 §2.7）: `air_balance_coordination`（Baseline への Air Balance の協調）と
   //   `tach_unconfirmed_zones`。協調の状態を画面に出すかは 0078 §5 のとおり #106 の後続で決める
   //   ので、ここでは版を読めるようにするだけで表示しない。
+  // v15（#308 / 決定記録 0137）: `telemetry_health`（入力の健全度・欠けた入力・Guard の閾値の組）。
   const SINCE = {
     workload_regime: 2,
     supervisor: 3,
@@ -42,8 +43,9 @@
     authority: 13,
     air_balance_coordination: 14,
     tach_unconfirmed_zones: 14,
+    telemetry_health: 15,
   };
-  const KNOWN_VERSIONS = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14];
+  const KNOWN_VERSIONS = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
 
   const NOT_IN_VERSION = "この版の記録には無い";
   const ZONE_KEYS = ["front", "rear", "top"];
@@ -342,6 +344,25 @@
     return { k: key, v: "権限の記録（journal）" };
   }
 
+  // 入力の健全度（v15。決定記録 0137 §2.2）。**v14 以前を「そろっている」と言わない。**
+  // 健全度は Critical Safety の安全状態とは別の軸（1本の欠けでは安全状態は正常のまま）。
+  function telemetryHealthChip(version, body) {
+    const key = "入力の健全度";
+    if (!has(version, "telemetry_health")) return { k: key, v: NOT_IN_VERSION, tone: "absent" };
+    const record = body.telemetry_health;
+    if (!isObject(record)) return { k: key, v: UNKNOWN_VALUE, tone: "warn" };
+    const profile = record.guard_threshold_profile;
+    if (profile === null) {
+      return { k: key, v: "急変への対応の判断なし（例外）", tone: "bad" };
+    }
+    if (record.health === "normal" && profile === "normal") return { k: key, v: "そろっている", tone: "ok" };
+    if (record.health === "degraded" && profile === "conservative") {
+      const count = Array.isArray(record.degraded_inputs) ? record.degraded_inputs.length : 0;
+      return { k: key, v: `欠けている入力 ${count} ・ 急変への対応は保守側の閾値`, tone: "warn" };
+    }
+    return { k: key, v: UNKNOWN_VALUE, tone: "warn" };
+  }
+
   function number(value) {
     return typeof value === "number" && Number.isFinite(value) ? value : null;
   }
@@ -567,6 +588,7 @@
       safetyProvenanceChip(version, body),
       modeSourceChip(version, body),
       authoritySourceChip(version, body),
+      telemetryHealthChip(version, body),
     ];
     return {
       ...base,

@@ -90,6 +90,7 @@ from test_control_schema import (
     MODE_COMMAND_RECORD,
     REGISTRY_PROVENANCE,
     SAFETY_PROVENANCE,
+    TELEMETRY_HEALTH_RECORD,
 )
 from test_fallback_controller import (
     TEST_ARTIFACT_SHA256,
@@ -867,6 +868,7 @@ def test_v5_trace_requires_consistent_model_gate_for_learned_ticks() -> None:
     payload.pop("authority", None)
     payload.pop("air_balance_coordination", None)
     payload.pop("tach_unconfirmed_zones", None)
+    payload.pop("telemetry_health", None)
     with pytest.raises(ValidationError, match="schema version 5"):
         ControlTick.model_validate_json(json.dumps(payload))
 
@@ -945,6 +947,7 @@ def _trace_tick(selection) -> ControlTick:
         authority=AUTHORITY_RECORD,
         air_balance_coordination=COORDINATION_RECORD,
         tach_unconfirmed_zones=(),
+        telemetry_health=TELEMETRY_HEALTH_RECORD,
     )
 
 

@@ -14,6 +14,7 @@ from typing import Annotated, Literal
 from pydantic import BaseModel, ConfigDict, Field
 
 from coldaisle.control.config import GuardThresholdBand, ReactiveGuardConfig
+from coldaisle.control.schema import GuardThresholdProfile as GuardThresholdProfile
 from coldaisle.control.schema import GuardZoneOutput, PerZone, Reason, Zone
 from coldaisle.control.state import ControlStateSnapshot, TelemetryHealth
 from coldaisle.metrics import MetricCatalog
@@ -23,13 +24,6 @@ FiniteFloat = Annotated[float, Field(allow_inf_nan=False)]
 
 class _Frozen(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid", strict=True)
-
-
-class GuardThresholdProfile(StrEnum):
-    """snapshot の入力品質に応じて選んだ閾値組。"""
-
-    NORMAL = "normal"
-    CONSERVATIVE = "conservative"
 
 
 class GuardEvidenceSource(StrEnum):
