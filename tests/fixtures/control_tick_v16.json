@@ -258,5 +258,10 @@
     ],
     "guard_threshold_profile": "conservative"
   },
-  "run_id": "0123456789abcdef0123456789abcdef"
+  "run_id": "0123456789abcdef0123456789abcdef",
+  "workload_hint": {
+    "schema_version": 1,
+    "stage": "off",
+    "influence": "none"
+  }
 }

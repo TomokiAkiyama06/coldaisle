@@ -445,6 +445,7 @@ class Harness:
         air_balance_coordinator: Any = None,
         rl_supervisor_source: Any = None,
         expected_rl_identity: Any = None,
+        workload_hint_factory: Any = None,
     ) -> None:
         self.config = config if config is not None else control_config()
         self.clock = SimulatedClock(TEST_EPOCH_MS)
@@ -524,6 +525,12 @@ class Harness:
             authority=authority or RecordingAuthority(self.authority, self.order),
             watchdog=self.watchdog,
             air_balance_coordinator=air_balance_coordinator,
+            # Workload Hint の受け渡し口（#319）。factory は試験の時計を受け取って tracker を返す
+            workload_hint=(
+                None
+                if workload_hint_factory is None
+                else workload_hint_factory(self.clock, self.monotonic)
+            ),
         )
 
     def tick(self, *, advance_ms: int | None = None) -> Any:

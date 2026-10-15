@@ -57,6 +57,7 @@ from coldaisle.control.schema import (
     SupervisorDecision,
     SupervisorPolicyEvaluation,
     SupervisorPolicyKind,
+    WorkloadHintRecord,
     WorkloadRegime,
     Zone,
     ZoneRecord,
@@ -259,6 +260,7 @@ def tick_with(
         tach_unconfirmed_zones=(),
         telemetry_health=TELEMETRY_HEALTH_RECORD,
         run_id=TRACE_RUN_ID,
+        workload_hint=WorkloadHintRecord.off(),
     )
 
 
@@ -561,6 +563,7 @@ def test_invariant_1_g_a_shadow_record_is_refused_in_modes_people_drive() -> Non
             tach_unconfirmed_zones=(),
             telemetry_health=TELEMETRY_HEALTH_RECORD,
             run_id=TRACE_RUN_ID,
+            workload_hint=WorkloadHintRecord.off(),
         )
     # 記録器自身も、その mode では何も作らない。
     assert (
@@ -1441,6 +1444,7 @@ def solved_shadow_tick(*, applied: float, ts_ms: int = SCORED_ACTION_TS_MS) -> C
         tach_unconfirmed_zones=(),
         telemetry_health=TELEMETRY_HEALTH_RECORD,
         run_id=TRACE_RUN_ID,
+        workload_hint=WorkloadHintRecord.off(),
     )
 
 
@@ -1467,6 +1471,7 @@ def follow_up_tick(*, tick_id: int, ts_ms: int, applied: float) -> ControlTick:
         tach_unconfirmed_zones=(),
         telemetry_health=TELEMETRY_HEALTH_RECORD,
         run_id=TRACE_RUN_ID,
+        workload_hint=WorkloadHintRecord.off(),
     )
 
 
@@ -1920,6 +1925,7 @@ def test_the_counterfactual_artifact_comes_from_the_gate_not_the_assessment() ->
         tach_unconfirmed_zones=(),
         telemetry_health=TELEMETRY_HEALTH_RECORD,
         run_id=TRACE_RUN_ID,
+        workload_hint=WorkloadHintRecord.off(),
     )
     assert tick.model_gate is not None
     assert tick.model_gate.artifact_sha256 == item.artifact_sha256

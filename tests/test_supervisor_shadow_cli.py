@@ -40,6 +40,7 @@ from coldaisle.control.schema import (
     SupervisorPolicyEvaluation,
     SupervisorPolicyIdentity,
     SupervisorPolicyKind,
+    WorkloadHintRecord,
     WorkloadRegime,
 )
 from coldaisle.control.supervisor import (
@@ -270,6 +271,7 @@ class Fixture:
             tach_unconfirmed_zones=(),
             telemetry_health=TELEMETRY_HEALTH_RECORD,
             run_id=TRACE_RUN_ID,
+            workload_hint=WorkloadHintRecord.off(),
         )
 
 

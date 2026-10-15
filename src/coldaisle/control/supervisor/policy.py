@@ -6,14 +6,18 @@ to ``SupervisorCoordinator``; it never waits for or directly invokes RL inferenc
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from enum import StrEnum
 from typing import Protocol, Self
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from coldaisle.clock import Clock
-from coldaisle.control.config import RulePolicyConfig, SupervisorConfig
+from coldaisle.control.config import (
+    RulePolicyConfig,
+    SupervisorConfig,
+    SupervisorPolicyContext,
+)
 from coldaisle.control.schema import (
     ControlTick,
     Reason,
@@ -22,9 +26,12 @@ from coldaisle.control.schema import (
     SupervisorPolicyEvaluation,
     SupervisorPolicyIdentity,
     SupervisorPolicyKind,
+    WorkloadHintKind,
+    WorkloadRegime,
 )
 from coldaisle.control.state import ControlStateSnapshot
 from coldaisle.control.supervisor.regime import WorkloadRegimeEstimate
+from coldaisle.control.supervisor.workload_hint import WorkloadHint
 
 
 class _Frozen(BaseModel):
@@ -38,6 +45,14 @@ class SupervisorInput(_Frozen):
     recent_history: tuple[ControlStateSnapshot, ...] = ()
     workload: WorkloadRegimeEstimate
     recent_performance: tuple[ControlTick, ...] = ()
+    workload_hint: WorkloadHint | None = None
+    """その tick で ``active`` な Workload Hint（#319 / 決定記録 0064 §2.5 / 0133 §2.2）。
+
+    **Regime の推定には入れない**（``workload`` は Telemetry だけから決まる）。読むのは
+    RulePolicy の context の選択だけで、B0 では「効かせていたら変わったか」を判定するだけで
+    出力は変えない。
+    **RLPolicy には渡さない**（`ShadowRLPolicy` が伏せる。0133 §2.2）。
+    """
 
     @model_validator(mode="after")
     def _all_context_is_causal_and_matches_the_current_tick(self) -> Self:
@@ -171,9 +186,36 @@ class RulePolicy:
 
     kind = SupervisorPolicyKind.RULE
 
-    def __init__(self, config: RulePolicyConfig, clock: Clock) -> None:
+    def __init__(
+        self,
+        config: RulePolicyConfig,
+        clock: Clock,
+        *,
+        hint_overrides: Mapping[tuple[WorkloadRegime, WorkloadHintKind], WorkloadRegime]
+        | None = None,
+    ) -> None:
+        """``hint_overrides`` は ``supervisor.workload_hint.context_overrides``（0064 §2.8）。
+
+        無ければヒントは何もしない（「効かない」側）。値の冷却を弱めない検査は設定の読み込みで済んでいる
+        （0066 §2.1 (a)）。
+        """
         self._config = config
         self._clock = clock
+        self._hint_overrides = dict(hint_overrides or {})
+
+    def hinted_context(self, policy_input: SupervisorInput) -> SupervisorPolicyContext | None:
+        """ヒントで選ぶことになる context。ヒントが無い・対応表に鍵が無ければ None（0064 §2.8）。
+
+        **選ぶだけで出力は変えない**（B0。0133 §2.6）。鍵は Telemetry 由来の Regime と
+        ``workload``。
+        """
+        hint = policy_input.workload_hint
+        if hint is None:
+            return None
+        target = self._hint_overrides.get((policy_input.workload.regime, hint.workload))
+        if target is None:
+            return None
+        return self._config.contexts.get(target)
 
     @property
     def version(self) -> str:
@@ -212,8 +254,12 @@ class ShadowRLPolicy:
         return self._policy.version
 
     def propose(self, policy_input: SupervisorInput) -> SupervisorOutput:
-        """比較用出力を返す。選択は Coordinator の shadow slot だけが行う。"""
-        output = self._policy.propose(policy_input)
+        """比較用出力を返す。選択は Coordinator の shadow slot だけが行う。
+
+        **Workload Hint は伏せて渡す**（決定記録 0133 §2.2 / 0064 §2.10）。RL artifact の
+        「ヒントを使う」宣言の形は未決で、宣言の無い artifact には渡さない。
+        """
+        output = self._policy.propose(policy_input.model_copy(update={"workload_hint": None}))
         if output.policy is not SupervisorPolicyKind.RL:
             raise ValueError("ShadowRLPolicy は RLPolicy output だけを受け付ける")
         return output
@@ -238,7 +284,29 @@ class SupervisorCoordinator:
         """
         self._expected_rl_identity = expected_rl_identity
         self._config = config
-        self._rule = rule_policy or RulePolicy(config.rule_policy, clock)
+        self._rule = rule_policy or RulePolicy(
+            config.rule_policy, clock, hint_overrides=config.workload_hint.overrides
+        )
+
+    def would_override(self, policy_input: SupervisorInput, decision: SupervisorDecision) -> bool:
+        """ヒントを効かせていたら、選ばれた RulePolicy の context が変わったか（0133 §2.6 / §2.9）。
+
+        **出力は変えない**（B0）。読むのは RulePolicy だけで、選ばれた出力が RLPolicy の tick は
+        常に False（0133 §2.2）。比べるのは strategy / weights / target_band の組。
+        """
+        selected = decision.selected_output
+        if selected is None or selected.policy is not SupervisorPolicyKind.RULE:
+            return False
+        if not isinstance(self._rule, RulePolicy):
+            return False
+        context = self._rule.hinted_context(policy_input)
+        if context is None:
+            return False
+        return (context.strategy, context.weights, context.target_band) != (
+            selected.strategy,
+            selected.weights,
+            selected.target_band,
+        )
 
     def evaluate(
         self,

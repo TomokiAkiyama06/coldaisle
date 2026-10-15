@@ -61,6 +61,7 @@ from coldaisle.control.schema import (
     GuardThresholdProfile,
     TelemetryHealth,
     TelemetryHealthRecord,
+    WorkloadHintRecord,
     registry_reason_sha256,
 )
 
@@ -671,6 +672,7 @@ def tick(demand: EffectiveZoneDemand, faults=(), **state_overrides) -> ControlTi
         tach_unconfirmed_zones=(),
         telemetry_health=TELEMETRY_HEALTH_RECORD,
         run_id=TRACE_RUN_ID,
+        workload_hint=WorkloadHintRecord.off(),
     )
 
 
@@ -788,6 +790,7 @@ def test_a_front_or_rear_stall_can_stay_degraded():
         tach_unconfirmed_zones=(),
         telemetry_health=TELEMETRY_HEALTH_RECORD,
         run_id=TRACE_RUN_ID,
+        workload_hint=WorkloadHintRecord.off(),
     )
     assert recorded.state.safety_state is SafetyState.DEGRADED
 
@@ -824,6 +827,7 @@ def test_stale_cpu_temperature_drives_top_to_max():
         tach_unconfirmed_zones=(),
         telemetry_health=TELEMETRY_HEALTH_RECORD,
         run_id=TRACE_RUN_ID,
+        workload_hint=WorkloadHintRecord.off(),
     )
     assert recorded.zones.top.demand.forced_max
 
@@ -916,6 +920,7 @@ def test_current_trace_stores_workload_regime_and_confidence_together():
         tach_unconfirmed_zones=(),
         telemetry_health=TELEMETRY_HEALTH_RECORD,
         run_id=TRACE_RUN_ID,
+        workload_hint=WorkloadHintRecord.off(),
     )
 
     payload = json.loads(recorded.model_dump_json())
@@ -955,6 +960,7 @@ def test_v2_trace_keeps_simultaneous_transient_load_distinct():
         tach_unconfirmed_zones=(),
         telemetry_health=TELEMETRY_HEALTH_RECORD,
         run_id=TRACE_RUN_ID,
+        workload_hint=WorkloadHintRecord.off(),
     )
 
     payload = json.loads(recorded.model_dump_json())
@@ -979,6 +985,7 @@ def test_fallback_trace_remains_valid_when_regime_is_not_available():
         tach_unconfirmed_zones=(),
         telemetry_health=TELEMETRY_HEALTH_RECORD,
         run_id=TRACE_RUN_ID,
+        workload_hint=WorkloadHintRecord.off(),
     )
 
     assert recorded.schema_version == SCHEMA_VERSION
@@ -1031,6 +1038,7 @@ def test_v3_supervisor_policy_requires_a_matching_decision():
             tach_unconfirmed_zones=(),
             telemetry_health=TELEMETRY_HEALTH_RECORD,
             run_id=TRACE_RUN_ID,
+            workload_hint=WorkloadHintRecord.off(),
         )
 
 
@@ -1147,6 +1155,7 @@ def test_the_v9_trace_keeps_disabled_inputs_and_the_provisional_flag():
         tach_unconfirmed_zones=(),
         telemetry_health=TELEMETRY_HEALTH_RECORD,
         run_id=TRACE_RUN_ID,
+        workload_hint=WorkloadHintRecord.off(),
     )
     payload = json.loads(recorded.model_dump_json())
     assert payload["schema_version"] == SCHEMA_VERSION
@@ -1224,6 +1233,7 @@ def registry_tick(registry: RegistryProvenance, **overrides: object) -> ControlT
         "tach_unconfirmed_zones": (),
         "telemetry_health": TELEMETRY_HEALTH_RECORD,
         "run_id": TRACE_RUN_ID,
+        "workload_hint": WorkloadHintRecord.off(),
     }
     return ControlTick(**(values | overrides))
 
@@ -1588,12 +1598,14 @@ def learned_tick(**overrides) -> ControlTick:
         "telemetry_health": TELEMETRY_HEALTH_RECORD,
         # v16 を名乗る記録は fand の起動ごとの run_id を省けない（#288 / 決定記録 0133 §2.9）。
         "run_id": TRACE_RUN_ID,
+        "workload_hint": WorkloadHintRecord.off(),
     }
     version = overrides.get("schema_version", SCHEMA_VERSION)
     assert isinstance(version, int)
     values["runtime"] = runtime_for(version)
     if version < 16:
         values.pop("run_id")
+        values.pop("workload_hint")
     if version < 15:
         values.pop("telemetry_health")
     if version < 14:
@@ -1807,6 +1819,7 @@ def test_a_tick_cannot_claim_two_different_artifacts():
             tach_unconfirmed_zones=(),
             telemetry_health=TELEMETRY_HEALTH_RECORD,
             run_id=TRACE_RUN_ID,
+            workload_hint=WorkloadHintRecord.off(),
             state=fallback_state(
                 authority_stage=AuthorityStage.LIMITED,
                 fallback_reason=Reason(code="low_confidence"),
@@ -2002,6 +2015,7 @@ def test_a_missing_guard_profile_needs_the_guard_exception():
         tach_unconfirmed_zones=(),
         telemetry_health=without_guard,
         run_id=TRACE_RUN_ID,
+        workload_hint=WorkloadHintRecord.off(),
     )
     assert recorded.telemetry_health is not None
     assert recorded.telemetry_health.guard_threshold_profile is None

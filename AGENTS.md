@@ -271,6 +271,7 @@ src/coldaisle/
   control_admin/ # 合成の起点: coldaisle-fand の管理ソケット（運転モードと Authority の降格。昇格は受けない）。AI 層・API・eventd・control から import しない。#74 / #92 / 決定記録 0072
   learned_worker/ # 合成の起点: Learned MPC / RL Supervisor worker（`coldaisle-learnd --role mpc|supervisor`）。frame の列から MPC の提案・Supervisor の出力（Demand を含まない）を返す。Telemetry・SQLite・較正ファイル・hwmon・AI 層を import しない。#86 / #89 / 決定記録 0077 / 0101 / 0107
   learned_channel/ # 合成の起点: Learned worker と coldaisle-fand の経路（役割ごとのソケット・受付スレッド・frame の送り出し・registry の production の監視）。control・AI 層・API・control_admin から import しない。#86 / #104 / 決定記録 0077
+  workload_hint_reader/ # 合成の起点: Workload Hint の読み手のスレッド（`events` を読み取り専用で読み、終端状態・run の記録を自分の表にだけ書く）。control・AI 層・API から import しない。#319 / 決定記録 0133 §2.8
   declared_changes.py # 合成の起点が共有: 宣言された変更（DeclaredChange）の YAML の形と検証（drift / dataset v2）。0109
   local_socket.py # レイヤ横断: Unix ソケット入口に共通の門（SO_PEERCRED・権限・起動時の検査）。0045 / 0072 §2.5
   authority_cli.py # 合成の起点: `coldaisle-authority raise` / `rollback`。`raise_stage()` を呼ぶ唯一の場所。**どこからも import しない**。#92 / 決定記録 0086
@@ -290,7 +291,7 @@ src/coldaisle/
     air_balance.py       # Air Balance Model と air-balance.yaml（v2）の形。Safety ではない。#81
     air_balance_trace.py # applied demand から Air Balance を trace へ記録するだけ（制御へ効かない）。#81 / 決定記録 0073
     air_balance_coordination.py # Baseline（Fallback）の requested への Air Balance の協調（上げるだけ・max_raise・保持。Gate の前・合成の前）。#81 / 決定記録 0078 / 0085
-    supervisor/ # RulePolicy / RLPolicy / Workload Regime
+    supervisor/ # RulePolicy / RLPolicy / Workload Regime / Workload Hint の状態の遷移（B0。DB を開かない。#319）
     model/      # Learned Thermal Model、Confidence / OOD
     mpc/        # Optimizer / horizon制御
     reactive/   # 急変に対する決定論的Guard

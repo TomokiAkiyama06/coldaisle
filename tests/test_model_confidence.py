@@ -79,6 +79,7 @@ from coldaisle.control.schema import (
     PerZone,
     Reason,
     SafetyState,
+    WorkloadHintRecord,
     ZoneRecord,
 )
 from coldaisle.store.models import Quality
@@ -871,6 +872,7 @@ def test_v5_trace_requires_consistent_model_gate_for_learned_ticks() -> None:
     payload.pop("tach_unconfirmed_zones", None)
     payload.pop("telemetry_health", None)
     payload.pop("run_id", None)
+    payload.pop("workload_hint", None)
     with pytest.raises(ValidationError, match="schema version 5"):
         ControlTick.model_validate_json(json.dumps(payload))
 
@@ -951,6 +953,7 @@ def _trace_tick(selection) -> ControlTick:
         tach_unconfirmed_zones=(),
         telemetry_health=TELEMETRY_HEALTH_RECORD,
         run_id=TRACE_RUN_ID,
+        workload_hint=WorkloadHintRecord.off(),
     )
 
 

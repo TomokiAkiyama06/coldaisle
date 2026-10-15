@@ -116,6 +116,7 @@ from coldaisle.control.schema import (
     Fault,
     FaultCode,
     GuardZoneOutput,
+    HintPriorSkipped,
     ModeCommandRecord,
     OperatingMode,
     PerZone,
@@ -127,6 +128,9 @@ from coldaisle.control.schema import (
     SupervisorDecision,
     SupervisorOutput,
     TelemetryHealthRecord,
+    WorkloadHintRecord,
+    WorkloadHintStage,
+    WorkloadRegime,
     Zone,
     ZoneRecord,
     ZoneRequest,
@@ -155,6 +159,11 @@ from coldaisle.control.supervisor.regime import (
     WorkloadRegimeEstimate,
     WorkloadRegimeEstimator,
     WorkloadRegimeState,
+)
+from coldaisle.control.supervisor.workload_hint import (
+    HintTick,
+    WorkloadHintTracker,
+    effective_stage,
 )
 from coldaisle.measurement import Quality, validate_metric
 from coldaisle.metrics import MetricCatalog
@@ -654,6 +663,7 @@ class ControlLoop:
         authority: AuthorityObserver | None = None,
         watchdog: Watchdog | None = None,
         air_balance_coordinator: AirBalanceCoordinator | None = None,
+        workload_hint: WorkloadHintTracker | None = None,
     ) -> None:
         """``air_balance_coordinator`` は試験で偽の model を差し込むときだけ渡す。
 
@@ -689,6 +699,19 @@ class ControlLoop:
         if admin_mode is not None and admin_mode.run_id != run_id:
             # 管理ソケットの監査・Learned の経路の封筒・trace は同じ run_id を使う（0077 §2.3）
             raise ValueError("管理ソケットの受け渡し口と loop の run_id を揃える")
+        hint_stage = effective_stage(config.policy.supervisor.workload_hint.stage)
+        if workload_hint is None and hint_stage is not WorkloadHintStage.OFF:
+            # 設定が読むと言うのに読み手を配線し忘れた構成を、`stage: off` の trace にしない
+            # （決定記録 0133 §2.9 は実効の段階を残す）
+            raise ValueError("supervisor.workload_hint.stage が off 以外なら読み手を配線する")
+        if workload_hint is not None and workload_hint.stage is not hint_stage:
+            raise ValueError("Workload Hint の読み手と設定の段階を揃える")
+        if (
+            workload_hint is not None
+            and hint_stage is not WorkloadHintStage.OFF
+            and (supervisor is None)
+        ):
+            raise ValueError("Workload Hint を読むなら Supervisor も配線する（0133 §2.2）")
         if mode_source is not None and admin_mode is not None:
             # モードの出どころを1つにする。2つあると、どちらが人の最新の意図か決まらない
             raise ValueError("mode_source と admin_mode は同時に配線しない")
@@ -710,6 +733,8 @@ class ControlLoop:
         self._admin_mode = admin_mode
         self._supervisor = supervisor
         self._regime = regime
+        # **Workload Hint の受け渡し口**（決定記録 0133 §2.8）。None は `stage: off`。
+        self._workload_hint = workload_hint
         self._learned_source = learned_source
         self._rl_supervisor_source = rl_supervisor_source
         self._learned_sink = learned_sink
@@ -807,7 +832,7 @@ class ControlLoop:
                 monotonic_ms=snapshot.monotonic_ms,
             )
         )
-        supervisor_decision, regime_estimate = self._run_supervisor(
+        supervisor_decision, regime_estimate, hint_record = self._run_supervisor(
             snapshot, now_mono_ms=snapshot.monotonic_ms
         )
         supervisor_output = (
@@ -959,6 +984,9 @@ class ControlLoop:
             # **fand の起動ごとの run_id を毎 tick 残す**（v16。#288 / 決定記録 0133 §2.9）。
             # 段階・管理ソケット・Learned の経路の有無に関わらず載せる。
             run_id=self._run_id,
+            # **Workload Hint の塊も同じ版で毎 tick 残す**（v16。#319 / 決定記録 0133 §2.9）。
+            # B0 は記録するだけで、requested には1ビットも効かない。
+            workload_hint=hint_record,
         )
         recorded, trace_failed = self._record(tick)
         # **journal の書き残しと変化の検知は heartbeat と trace の保存の後**（0072 §2.6 /
@@ -1123,9 +1151,14 @@ class ControlLoop:
 
     def _run_supervisor(
         self, snapshot: ControlStateSnapshot, *, now_mono_ms: int
-    ) -> tuple[SupervisorDecision | None, WorkloadRegimeEstimate | None]:
+    ) -> tuple[SupervisorDecision | None, WorkloadRegimeEstimate | None, WorkloadHintRecord]:
+        """Regime・Supervisor の判断と、その tick の Workload Hint の記録（0133 §2.9）。
+
+        **ヒントは Regime の推定の後に進める**（矛盾は Telemetry 由来の Regime だけで判定する。
+        0064 §2.7）。Regime の推定にはヒントを入れない（0064 §2.5）。
+        """
         if self._supervisor is None or self._regime is None:
-            return None, None
+            return None, None, self._hint_record(self._hint_step(snapshot, None), None, None)
         try:
             self._regime_state, estimate = self._regime.step(self._regime_state, snapshot)
         except Exception:
@@ -1133,11 +1166,15 @@ class ControlLoop:
                 "workload regime estimation failed",
                 extra={logs.FIELDS_KEY: {"tick_id": snapshot.tick_id}},
             )
-            return None, None
+            return None, None, self._hint_record(self._hint_step(snapshot, None), None, None)
+        hint_tick = self._hint_step(snapshot, estimate.regime)
         candidate, rl_error = self._rl_candidate(now_mono_ms)
+        policy_input = SupervisorInput(
+            snapshot=snapshot, workload=estimate, workload_hint=hint_tick.hint
+        )
         try:
             decision = self._supervisor.evaluate(
-                SupervisorInput(snapshot=snapshot, workload=estimate),
+                policy_input,
                 now_monotonic_ms=now_mono_ms,
                 rl_candidate=candidate,
                 rl_error=rl_error,
@@ -1148,8 +1185,49 @@ class ControlLoop:
                 "supervisor evaluation failed",
                 extra={logs.FIELDS_KEY: {"tick_id": snapshot.tick_id}},
             )
-            return None, estimate
-        return decision, estimate
+            return None, estimate, self._hint_record(hint_tick, None, None)
+        return decision, estimate, self._hint_record(hint_tick, policy_input, decision)
+
+    def _hint_step(self, snapshot: ControlStateSnapshot, regime: WorkloadRegime | None) -> HintTick:
+        if self._workload_hint is None:
+            return HintTick(stage=WorkloadHintStage.OFF)
+        # 例外を外へ出さない（tracker の契約）。受け渡し口を覗くだけで DB を開かない
+        return self._workload_hint.step(
+            tick_id=snapshot.tick_id, ts_ms=snapshot.ts_ms, regime=regime
+        )
+
+    def _hint_record(
+        self,
+        hint_tick: HintTick,
+        policy_input: SupervisorInput | None,
+        decision: SupervisorDecision | None,
+    ) -> WorkloadHintRecord:
+        """trace の塊。**組み立てに失敗しても tick を止めない**（ヒントは任意。0133 §2.8）。"""
+        tracker = self._workload_hint
+        if tracker is None:
+            return WorkloadHintRecord.off()
+        try:
+            would = (
+                policy_input is not None
+                and decision is not None
+                and self._supervisor is not None
+                and self._supervisor.would_override(policy_input, decision)
+            )
+            return tracker.record(
+                hint_tick,
+                supervisor_available=decision is not None and decision.selected_output is not None,
+                would_override=would,
+            )
+        except Exception:
+            LOGGER.exception(
+                "workload hint の記録を組み立てられなかった; ヒントを使わない記録にする",
+                extra={logs.FIELDS_KEY: {"stage": tracker.stage.value}},
+            )
+            if tracker.stage is WorkloadHintStage.OFF:
+                return WorkloadHintRecord.off()
+            return WorkloadHintRecord(
+                stage=tracker.stage, skipped=HintPriorSkipped.HINT_STATE_UNREADABLE
+            )
 
     def _rl_candidate(
         self, now_mono_ms: int

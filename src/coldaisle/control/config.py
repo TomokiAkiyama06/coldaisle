@@ -29,12 +29,14 @@ from coldaisle.control.schema import (
     SupervisorObjectiveWeights,
     SupervisorPolicyKind,
     SupervisorTargetBand,
+    WorkloadHintKind,
+    WorkloadHintStage,
     WorkloadRegime,
     Zone,
 )
 from coldaisle.measurement import validate_metric
 
-CONTROL_CONFIG_VERSION: Literal[15] = 15
+CONTROL_CONFIG_VERSION: Literal[16] = 16
 """4ファイルを束ねた Control Config の版。
 
 - v11（#81 / 決定記録 0073 §2.1）: ``air-balance.yaml``（v2）を4つ目のファイルにした。
@@ -49,9 +51,13 @@ CONTROL_CONFIG_VERSION: Literal[15] = 15
 - v15（#74 / 決定記録 0118 §2.1）: ``fan-hardware.yaml`` を v2 にした。``label`` は必須のまま
   ``null``（Fan の label を持たない driver の宣言）を許し、``tach_attribute`` の番号を
   ``pwm_attribute`` と同じに限る
+- v16（#319 / 決定記録 0133 §2.6 / 0064 §2.6〜§2.8 / 0066 §2.1 (a)）: ``fan-policy.yaml`` を
+  v12 にした（``supervisor.workload_hint``。段階・期限・矛盾の保持時間・起動時の取り込みの上限・
+  読み手の周期と鮮度の上限・既知の source・``context_overrides``）。``context_overrides`` の
+  上書き先が基準より冷却を弱めうる設定と、鍵の Regime が ``unknown`` の設定を拒否する
 """
 FAN_HARDWARE_CONFIG_VERSION: Literal[2] = 2
-FAN_POLICY_CONFIG_VERSION: Literal[11] = 11
+FAN_POLICY_CONFIG_VERSION: Literal[12] = 12
 SAFETY_CONFIG_VERSION: Literal[4] = 4
 CONFIG_FILENAMES = {
     "fan_hardware": "fan-hardware.yaml",
@@ -928,6 +934,147 @@ class RulePolicyConfig(_ConfigModel):
     contexts: WorkloadPolicyContexts
 
 
+def _yaml_workload_hint_stage(value: object) -> object:
+    """YAML の ``stage`` を列挙値に正規化する。
+
+    YAML 1.1 は引用符の無い ``off`` を偽として読む（``yaml.safe_load``）。``stage: off`` と
+    書いた設定を拒否しないよう、**偽だけ**を ``off`` と読む。真（``on`` / ``yes``）はどの段階か
+    決められないので拒否する（ヒントを読む向きの値を推測しない）。
+    """
+    if value is False:
+        return WorkloadHintStage.OFF
+    return WorkloadHintStage(value) if isinstance(value, str) else value
+
+
+def _yaml_workload_regime(value: object) -> object:
+    return WorkloadRegime(value) if isinstance(value, str) else value
+
+
+def _yaml_workload_hint_kind(value: object) -> object:
+    return WorkloadHintKind(value) if isinstance(value, str) else value
+
+
+class WorkloadHintContextOverride(_ConfigModel):
+    """ヒントが変えられる context の選択の1行（決定記録 0064 §2.8 / 0066 §2.1 (a)）。
+
+    鍵は (Telemetry 由来の Regime, ``workload``)。値 ``context`` は**同じ
+    ``rule_policy.contexts`` の中の別の context**（Regime の名前で指す）。表に無い組み合わせでは
+    ヒントは何もしない。
+    """
+
+    regime: Annotated[WorkloadRegime, BeforeValidator(_yaml_workload_regime)]
+    workload: Annotated[WorkloadHintKind, BeforeValidator(_yaml_workload_hint_kind)]
+    context: Annotated[WorkloadRegime, BeforeValidator(_yaml_workload_regime)]
+
+
+_HINT_SOURCE_PATTERN = re.compile(r"[a-z0-9][a-z0-9._-]{0,63}")
+
+
+class WorkloadHintConfig(_ConfigModel):
+    """Workload Hint Stage B の段階と、読み手・状態の遷移の値（決定記録 0133 §2.6 / 0064 §2.6）。
+
+    ``stage`` は**上限**で、実効の段階はさらに下がりうる（B1 / B2 の認証のハッシュが無いあいだは
+    B0 に留まる。0133 §2.6）。``stage: off`` では他の欄を省ける（読まない値を書かせない）。
+    ``off`` 以外では全ての欄が必須（既定値をコードに置かない。ルール 9）。
+    """
+
+    stage: Annotated[WorkloadHintStage, BeforeValidator(_yaml_workload_hint_stage)]
+    grace_ms: NonNegativeMilliseconds | None = None
+    """申告した期間に足す猶予（0064 §2.6 の ``declared_ms``）。"""
+    default_ttl_ms: PositiveMilliseconds | None = None
+    """``expected_duration_s`` の無いヒントの期限。"""
+    max_age_ms: PositiveMilliseconds | None = None
+    """期限の上限。申告で伸ばせない（0064 §2.6）。"""
+    contradiction_hold_ms: PositiveMilliseconds | None = None
+    """ヒントと食い違う Regime（``IDLE`` / ``COOLDOWN``）が続いたら ``contradicted`` にする時間。"""
+    startup_backfill_ms: NonNegativeMilliseconds | None = None
+    """起動時に取り込む経過の上限（0066 §2.2。``CLOCK_BOOTTIME`` と壁時計の両方で数える）。"""
+    reader_poll_ms: PositiveMilliseconds | None = None
+    """読み手のスレッドが ``events`` を読む周期（tick の外。0133 §2.8）。"""
+    reader_stale_after_ms: PositiveMilliseconds | None = None
+    """最後に読めた時刻がこれより古ければ ``hint_state_unreadable`` に倒す（0133 §5 #5）。"""
+    known_sources: Annotated[tuple[str, ...], BeforeValidator(_yaml_sequence_to_tuple)] | None = (
+        None
+    )
+    """trace の ``source_label`` にそのまま出す ``source``。他は ``other``（0064 §2.9）。"""
+    context_overrides: (
+        Annotated[tuple[WorkloadHintContextOverride, ...], BeforeValidator(_yaml_sequence_to_tuple)]
+        | None
+    ) = None
+
+    @model_validator(mode="after")
+    def _values_are_complete_and_bounded(self) -> Self:
+        values = {
+            "grace_ms": self.grace_ms,
+            "default_ttl_ms": self.default_ttl_ms,
+            "max_age_ms": self.max_age_ms,
+            "contradiction_hold_ms": self.contradiction_hold_ms,
+            "startup_backfill_ms": self.startup_backfill_ms,
+            "reader_poll_ms": self.reader_poll_ms,
+            "reader_stale_after_ms": self.reader_stale_after_ms,
+            "known_sources": self.known_sources,
+            "context_overrides": self.context_overrides,
+        }
+        if self.stage is not WorkloadHintStage.OFF:
+            missing = sorted(name for name, value in values.items() if value is None)
+            if missing:
+                raise ValueError(
+                    f"supervisor.workload_hint.stage が off 以外なら次も設定する: {missing}"
+                )
+        if (
+            self.reader_poll_ms is not None
+            and self.reader_stale_after_ms is not None
+            and self.reader_stale_after_ms <= self.reader_poll_ms
+        ):
+            # 周期より短い鮮度の上限は、健全な読み手でも常に「古い」になる
+            raise ValueError("workload_hint.reader_stale_after_ms は reader_poll_ms より長くする")
+        for source in self.known_sources or ():
+            if not _HINT_SOURCE_PATTERN.fullmatch(source) or source == "other":
+                raise ValueError(f"workload_hint.known_sources の形が不正: {source!r}")
+        if self.known_sources is not None and len(set(self.known_sources)) != len(
+            self.known_sources
+        ):
+            raise ValueError("workload_hint.known_sources は重複させない")
+        keys = [(item.regime, item.workload) for item in self.context_overrides or ()]
+        if len(set(keys)) != len(keys):
+            raise ValueError(
+                "workload_hint.context_overrides の鍵 (regime, workload) は重複させない"
+            )
+        if any(regime is WorkloadRegime.UNKNOWN for regime, _ in keys):
+            # 未知の状態をヒントで既知の扱いにしない（0133 §2.3 / ルール 4）
+            raise ValueError("workload_hint.context_overrides の鍵に regime: unknown を置かない")
+        return self
+
+    @property
+    def overrides(self) -> dict[tuple[WorkloadRegime, WorkloadHintKind], WorkloadRegime]:
+        """(Regime, workload) → 上書き先の context（Regime の名前）。"""
+        return {(item.regime, item.workload): item.context for item in self.context_overrides or ()}
+
+
+def validate_hint_override_does_not_weaken_cooling(
+    base: SupervisorPolicyContext, target: SupervisorPolicyContext
+) -> None:
+    """上書き先 context が基準より冷却を弱めうるなら ``ValueError``（決定記録 0066 §2.1 (a)）。
+
+    許すのは ``target_band`` の CPU / GPU の ``upper_c`` / ``lower_c`` を**下げる（等しい）
+    ことだけ**で、``strategy`` と全ての weight は基準と等しくする。weight の相対比や
+    ``lower_c`` の引き上げで、パラメータの比較を通りながら冷却を弱める経路を入口から塞ぐ
+    （0066 §1-1）。
+    """
+    if target.strategy != base.strategy:
+        raise ValueError("ヒントの上書き先 context の strategy は基準と等しくする")
+    if target.weights != base.weights:
+        raise ValueError("ヒントの上書き先 context の weights は基準と等しくする")
+    for name in ("cpu_temperature", "gpu_temperature"):
+        target_band = getattr(target.target_band, name)
+        base_band = getattr(base.target_band, name)
+        if target_band.upper_c > base_band.upper_c or target_band.lower_c > base_band.lower_c:
+            raise ValueError(
+                f"ヒントの上書き先 context の target_band.{name} は基準より上げない"
+                "（upper_c / lower_c とも基準以下）"
+            )
+
+
 class SupervisorConfig(_ConfigModel):
     """Supervisor timing・selection・出力範囲を一括で検証する。"""
 
@@ -942,6 +1089,25 @@ class SupervisorConfig(_ConfigModel):
     )
     output_bounds: SupervisorOutputBounds
     rule_policy: RulePolicyConfig
+    workload_hint: WorkloadHintConfig
+    """``fan-policy.yaml`` v12（#319 / 決定記録 0133 §2.6）。**必須。** v11 以前を補完しない。"""
+
+    @model_validator(mode="after")
+    def _hint_overrides_do_not_weaken_cooling(self) -> Self:
+        # **全ての (Regime, workload) の組へ検査する**（0066 §2.1 (a)）。違反する設定では
+        # 制御デーモンを起動しない（0066 §2.1 (c)。ヒントの入口だけを止める半端な状態にしない）
+        contexts = self.rule_policy.contexts
+        for (regime, workload), target in self.workload_hint.overrides.items():
+            try:
+                validate_hint_override_does_not_weaken_cooling(
+                    contexts.get(regime), contexts.get(target)
+                )
+            except ValueError as error:
+                raise ValueError(
+                    f"workload_hint.context_overrides ({regime.value}, {workload.value}) -> "
+                    f"{target.value}: {error}"
+                ) from error
+        return self
 
     @model_validator(mode="after")
     def _selection_and_contexts_are_consistent(self) -> Self:
@@ -1085,7 +1251,7 @@ class AirBalanceCoordinationConfig(_ConfigModel):
 
 
 class FanPolicyConfig(_ConfigModel):
-    schema_version: Literal[11]
+    schema_version: Literal[12]
     fallback_curve: Annotated[
         tuple[FallbackPoint, ...], BeforeValidator(_yaml_sequence_to_tuple), Field(min_length=2)
     ]
