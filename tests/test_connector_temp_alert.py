@@ -12,15 +12,19 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import pytest
 import yaml
 
+from coldaisle.channels import METRIC_TO_CHANNEL
 from coldaisle.clock import SimulatedClock
 from coldaisle.daemon import Daemon
 from coldaisle.ingest import Calibration, Normalizer
 from coldaisle.ingest.protocol import RawMessage, RawSample
+from coldaisle.ingest.replay import ReplaySource
 from coldaisle.internal_telemetry import (
     HwmonAdapter,
     HwmonConfig,
@@ -31,6 +35,7 @@ from coldaisle.llm_exclusions import LlmExclusions
 from coldaisle.metrics import MetricCatalog
 from coldaisle.rules import Engine, RuleSet
 from coldaisle.store import Quality, QualityRules, Reading, Sample, SqliteStore
+from coldaisle.store.csv_export import export_day
 from conftest import CONFIG_DIR, QUALITY_RULES_PATH
 from test_gpu_fan_service_alert import RecordingNotifier
 
@@ -368,25 +373,58 @@ def test_disabled_rules_are_not_evaluated(store, rule_set):
     assert run(engine, store, 0, 120, 90.0) == []
 
 
-# ---------------------------------------------------------------- 一括再生（0012 §2.2）
+# ---------------------------------------------------------------- 一括再生（0145 §2.1）
 
 
-def test_bulk_replay_reads_the_value_at_the_evaluation_time(engine, store):
-    """時計は止まったまま、評価時刻はサンプルの時刻に従う。先の時刻の行を読まない。"""
-    for step in range(0, 6):
-        write(store, step * STEP_S, 76.0, Quality.OK)
-    write(store, 1000, 40.0, Quality.OK)
-    transitions = []
-    for step in range(0, 6):
-        transitions += engine.on_sample(
-            Sample(
-                ts_ms=at(step * STEP_S),
-                readings=(Reading(metric="air.room", value=26.0, quality=Quality.OK),),
+def test_bulk_replay_of_an_export_carries_no_connector_reading(tmp_path, rules, rule_set):
+    """日次 CSV の一括再生では、この値が無いので評価されない（発火待ちも始まらない）。
+
+    日次 CSV はチャンネルの対応（`channels.py`）があるメトリクスだけを書き、
+    `board.connector_12v2x6` には対応が無い。内部の telemetry の再生は範囲外（0145 §2.1）。
+    """
+    assert CONNECTOR not in METRIC_TO_CHANNEL
+    jst = ZoneInfo("Asia/Tokyo")
+    with SqliteStore(tmp_path / "live.db", rules=rules, clock=SimulatedClock(NOW_MS)) as live:
+        for step in range(0, 48):  # 2 分。コネクタは重大の閾値を超えている
+            live.insert_sample(
+                Sample(
+                    ts_ms=at(step * STEP_S),
+                    readings=(
+                        Reading(metric="air.room", value=26.0, quality=Quality.OK),
+                        Reading(metric=CONNECTOR, value=90.0, quality=Quality.OK),
+                    ),
+                )
             )
+        csv_path = export_day(
+            live,
+            datetime.fromtimestamp(NOW_MS / 1000, jst).date(),
+            tz=jst,
+            out_dir=tmp_path / "logs",
+            lock_timeout_s=5.0,
         )
-    assert store.clock.now_ms() == NOW_MS, "時計は進めていない"
-    assert states(transitions, CRITICAL) == ["pending", "firing"]
-    assert rows(store, CRITICAL)[0].fired_ms == at(10)
+    assert "connector" not in csv_path.read_text(encoding="utf-8").splitlines()[0]
+
+    replay = ReplaySource(csv_path, tz=jst, bulk=True)
+    store = SqliteStore(tmp_path / "replay.db", rules=rules, clock=replay.clock)
+    daemon = Daemon(
+        source=replay,
+        store=store,
+        normalizer=Normalizer(rules=rules, calibration=Calibration(), clock=replay.clock),
+        engine=Engine(
+            rules=rule_set,
+            catalog=MetricCatalog.from_yaml(METRICS_PATH),
+            store=store,
+            clock=replay.clock,
+        ),
+        source_name="replay",
+    )
+    try:
+        stats = daemon.run()
+        assert stats.samples == 48, "基板の値は再生される"
+        assert CONNECTOR not in store.metrics(), "コネクタの読み値は再生の DB に入らない"
+        assert rows(store, HIGH) == [] and rows(store, CRITICAL) == []
+    finally:
+        store.close()
 
 
 # ---------------------------------------------------------------- 偽の sysfs から通知まで

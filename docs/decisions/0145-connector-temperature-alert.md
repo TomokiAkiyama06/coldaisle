@@ -44,7 +44,10 @@
 - 項目は `ThresholdRule` と同じ（`enabled`・`severity`・`metric`・`threshold`・`clear`・`fire_after_s`）。読み込み時に
   `clear < threshold` を確かめる（`ThresholdRule` と同じ）
 - 値は 0131 §2.3 のとおり、サンプルとティックの評価のたびに `SqliteStore.latest(at_ms=評価時刻)` で読む。
-  圧縮再生・一括再生でも実運用と同じ判定になる。基板のサンプルが止まっていても `on_tick()` で評価される
+  基板のサンプルが止まっていても `on_tick()` で評価される
+- **日次 CSV の再生（`--source replay --csv … --bulk` など）では評価されない。** 日次 CSV はチャンネルの対応（`channels.py`）が
+  あるメトリクスだけを書き（`store/csv_export.py`）、`board.connector_12v2x6` には対応が無いので、再生の DB にこの値が入らない。
+  値が無いので発火待ちも始まらない。内部の telemetry を再生できるようにするのは本記録の範囲外（§5 の 7）
 - **比較は「以上」**: 成立は `値 >= threshold`、成立中は `値 >= clear` の間続き、`値 < clear` で解除する。
   所有者の選択（「65 °C 以上」）と 0110 §2.2 の Critical Safety の判定（`値 >= 上限`）に合わせる。
   既存の `ThresholdRule` の `値 > threshold` は変えない
@@ -101,6 +104,7 @@ DB へ直接書く（`coldaisle-telemetry` の行を模す）か、偽の hwmon 
 - 欠け: stale・missing・suspect（負の値）で発火待ちを取り消し、回復から数え直す。発火中は欠けで解除しない
 - 再起動: 発火待ちは取り消し、発火中は保つ
 - 基板の `SENSOR_FAULT` が発火しても、コネクタのルールは評価され続ける
+- 日次 CSV の書き出しと一括再生では、コネクタの値が再生の DB に入らず、2 つのルールの行が作られない
 - 収集（偽の hwmon）→ DB → 取り込みのルールエンジン → 通知（critical）
 
 ---
@@ -163,3 +167,5 @@ DB へ直接書く（`coldaisle-telemetry` の行を模す）か、偽の hwmon 
 5. **案件資料（`coldaisle-escalate`）の「24 時間の p95 が閾値の内側か」の行。** 今は `ThresholdRule` / `RangeRule` だけで、
    本記録のルールは含まない。要るなら別に足す
 6. **`label`。** 0142（PR #328）の後に 2.4 の案で足す
+7. **内部の telemetry の再生。** 日次 CSV に `board.connector_12v2x6` が無いので、過去の記録でこのルールを検証できない。
+   要るなら CSV の列か別の再生の経路を別に決める
