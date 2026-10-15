@@ -19,11 +19,11 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
-from typing import Any
+from typing import Any, Self
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from coldaisle import logs
 from coldaisle.channels import METRIC_TO_CHANNEL
@@ -52,7 +52,8 @@ class RetentionRules(BaseModel):
     """ヒント有りの solve の記録（``hint_shadow_records``）の保持日数（決定記録 0133 §2.5a）。
 
     突き合わせる相手の trace より長く残しても join できないので、設定の値は
-    ``control_trace_days`` と同じにする（既定値はコードに置かない。ルール 9）。
+    ``control_trace_days`` と同じにする（違えば読み込みで拒否する。既定値はコードに置かない。
+    ルール 9）。
     """
 
     csv_dir: str
@@ -71,6 +72,19 @@ class RetentionRules(BaseModel):
 
     無ければ ``--export-day`` を拒否する（``csv_timezone`` と同じ扱い）。
     """
+
+    @model_validator(mode="after")
+    def _hint_shadow_lives_as_long_as_the_trace(self) -> Self:
+        # 別々に消すと、片方だけ変えた設定で B1 の証拠が trace より先に消える・trace が消えた後に
+        # 突き合わせられない記録が残る（0133 §2.5a の join の契約。PR #332 の Codex P2）。
+        # 起動時に分かる誤りにする
+        if self.hint_shadow_days != self.control_trace_days:
+            raise ValueError(
+                "hint_shadow_days は control_trace_days と同じ値にする（決定記録 0133 §2.5a）: "
+                f"hint_shadow_days={self.hint_shadow_days}; "
+                f"control_trace_days={self.control_trace_days}"
+            )
+        return self
 
     @classmethod
     def from_yaml(cls, path: Path) -> RetentionRules:

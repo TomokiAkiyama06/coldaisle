@@ -933,3 +933,16 @@ def test_outage_before_disabling_is_filled_when_the_disable_is_detected(store):
         "WHERE metric = 'gpu.0.core'"
     ).fetchone()
     assert tuple(state) == (0, 6 * MINUTE_MS + 5_000)
+
+
+@pytest.mark.parametrize(("trace_days", "shadow_days"), [(30, 31), (30, 7)])
+def test_hint_shadow_retention_must_equal_the_trace_retention(tmp_path, trace_days, shadow_days):
+    """片方だけ変えた設定は読み込みで拒む（0133 §2.5a の join の契約。PR #332 の Codex P2）。"""
+    path = tmp_path / "retention.yaml"
+    path.write_text(
+        f"raw_days: 30\ncontrol_trace_days: {trace_days}\nhint_shadow_days: {shadow_days}\n"
+        "csv_dir: x\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="hint_shadow_days は control_trace_days と同じ"):
+        RetentionRules.from_yaml(path)
