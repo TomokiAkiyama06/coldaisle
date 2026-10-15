@@ -1,7 +1,7 @@
 # 決定記録 0146: LLM が GPU の Fan の値を読むことを許す（読むだけ。書き込み・実行の手段は与えない）
 
 - **種別**: Decision Record
-- **Status**: Proposed
+- **Status**: FINAL（2026-10-16、リポジトリ所有者の承認）
 - **Date**: 2026-10-15
 - **Supersedes**:
   - [`0128`](0128-gpu-fan-curve-service.md) §2.1 の「fand・Learned MPC・Supervisor・LLM は、GPU の Fan を読まないし書かない」のうち、

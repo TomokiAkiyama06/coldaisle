@@ -3,6 +3,7 @@
 - **種別**: Decision Record
 - **Status**: FINAL（2026-08-25、PR #19 のマージ）
 - **Date**: 2026-08-25
+- **Superseded by**: [0142](0142-japanese-notification-text.md)（§2.6 の「ダッシュボードの URL を載せる」のうち、ループバックのアドレスなら載せない点だけ。提案中）
 - **Supersedes**: なし
 - **関連**: [`0001-initial-project-decisions.md`](0001-initial-project-decisions.md) D-03 / D-04 /
   [`0012-rule-engine.md`](0012-rule-engine.md) §2.6 /
