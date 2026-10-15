@@ -38,7 +38,7 @@ from coldaisle.alert_graph import (
 )
 from coldaisle.clock import SimulatedClock
 from coldaisle.metrics import MetricCatalog
-from coldaisle.notify import Notification, NotifyConfig, Router
+from coldaisle.notify import DisplayNames, Notification, NotifyConfig, Router
 from coldaisle.notify.notifiers import SLACK_WEBHOOK_ENV, DeliveryError, SlackNotifier
 from coldaisle.notify.notifiers import from_env as notifiers_from_env
 from coldaisle.notify.png_chart import (
@@ -66,6 +66,13 @@ UPLOAD_URL = "https://files.example.invalid/upload/signed-secret-part"
 NOON_MS = 1_787_626_800_000  # 2026-08-25T12:00:00+09:00（昼）
 NIGHT_MS = 1_787_670_000_000  # 2026-08-26T00:00:00+09:00（夜）
 MINUTE_MS = 60_000
+NOTIFY_CONFIG = NotifyConfig.from_yaml(CONFIG_DIR / "notify.yaml")
+NAMES = DisplayNames.build(
+    rules=RuleSet.from_yaml(CONFIG_DIR / "rules.yaml"),
+    catalog=MetricCatalog.from_yaml(CONFIG_DIR / "metrics.yaml"),
+    context_always=NOTIFY_CONFIG.context_always,
+)
+"""本文の「現在値:」と同じ選び方（0142 §2.2a）。デーモンと同じ組み立て。"""
 
 
 @pytest.fixture(scope="module")
@@ -80,7 +87,7 @@ def rule_set() -> RuleSet:
 
 @pytest.fixture(scope="module")
 def graph_config(catalog) -> GraphConfig:
-    config = load_graph_config(CONFIG_DIR / "notify-graph.yaml", catalog)
+    config = load_graph_config(CONFIG_DIR / "notify-graph.yaml")
     assert config is not None, "リポジトリの設定は有効"
     return config
 
@@ -254,13 +261,15 @@ def test_render_refuses_nothing_to_draw():
 
 
 def test_plan_for_a_derived_metric_adds_its_inputs_and_room(rule_set, catalog):
-    """派生値は材料も、最後に室温（`always_metrics`）。閾値は派生値の面に（0147 §2.3）。"""
+    """派生値は材料も、最後に室温（通知の `context_always`。0142 §2.2a と同じ選び方）。
+
+    閾値は派生値の面に（0147 §2.3）。
+    """
     plan = plan_graph(
         "AIRFLOW_DEGRADED",
         "d.gpu_delta",
         rules=rule_set,
-        catalog=catalog,
-        always_metrics=("air.room",),
+        names=NAMES,
     )
     assert plan.metrics == ("d.gpu_delta", "air.gpu_exhaust", "air.gpu_intake", "air.room")
     assert [t.value for t in plan.thresholds["d.gpu_delta"]] == [
@@ -273,8 +282,7 @@ def test_plan_for_hot_and_slow_puts_each_threshold_on_its_metric(rule_set, catal
         "GPU_FAN_BELOW_CURVE",
         "gpu.0.core",
         rules=rule_set,
-        catalog=catalog,
-        always_metrics=("air.room",),
+        names=NAMES,
     )
     rule = rule_set.gpu_fan_below_curve
     assert plan.metrics == ("gpu.0.core", "gpu.0.fan_speed", "air.room")
@@ -299,9 +307,7 @@ def test_plan_for_hot_and_slow_puts_each_threshold_on_its_metric(rule_set, catal
 )
 def test_plan_by_rule_kind(rule_set, catalog, rule_id, metric, expected_metrics, expected_lines):
     """変化率・連続欠け・知らないルールには閾値の線を引かない（値の軸の閾値ではない）。"""
-    plan = plan_graph(
-        rule_id, metric, rules=rule_set, catalog=catalog, always_metrics=("air.room",)
-    )
+    plan = plan_graph(rule_id, metric, rules=rule_set, names=NAMES)
     assert plan.metrics == expected_metrics
     assert {m: len(lines) for m, lines in plan.thresholds.items()} == expected_lines
 
@@ -339,6 +345,7 @@ def test_render_alert_graph_reads_the_last_window(store, rule_set, catalog, grap
         store,
         rules=rule_set,
         catalog=catalog,
+        names=NAMES,
         config=graph_config,
     )
     assert graph is not None
@@ -359,6 +366,7 @@ def test_render_alert_graph_without_values_is_none(store, rule_set, catalog, gra
         store,
         rules=rule_set,
         catalog=catalog,
+        names=NAMES,
         config=graph_config,
     )
     assert graph is None
@@ -369,18 +377,18 @@ def test_broken_graph_config_disables_graphs_only(tmp_path, catalog, caplog):
     broken = tmp_path / "notify-graph.yaml"
     broken.write_text("enabled: true\nwindow_s: -1\n", encoding="utf-8")
     with caplog.at_level(logging.ERROR, logger="coldaisle.notify"):
-        assert load_graph_config(broken, catalog) is None
-        assert load_graph_config(tmp_path / "missing.yaml", catalog) is None
+        assert load_graph_config(broken) is None
+        assert load_graph_config(tmp_path / "missing.yaml") is None
     assert len(caplog.records) == 2
 
-    unknown = tmp_path / "unknown.yaml"
-    unknown.write_text(
-        (CONFIG_DIR / "notify-graph.yaml")
-        .read_text(encoding="utf-8")
-        .replace("[air.room]", "[air.not_defined]"),
+    # 室温は通知の context_always から取る。グラフの設定に持たせると拒む（2 か所に持たない）
+    duplicated = tmp_path / "duplicated.yaml"
+    duplicated.write_text(
+        (CONFIG_DIR / "notify-graph.yaml").read_text(encoding="utf-8")
+        + "always_metrics: [air.room]\n",
         encoding="utf-8",
     )
-    assert load_graph_config(unknown, catalog) is None
+    assert load_graph_config(duplicated) is None
 
     disabled = tmp_path / "disabled.yaml"
     disabled.write_text(
@@ -389,7 +397,7 @@ def test_broken_graph_config_disables_graphs_only(tmp_path, catalog, caplog):
         .replace("enabled: true", "enabled: false"),
         encoding="utf-8",
     )
-    assert load_graph_config(disabled, catalog) is None
+    assert load_graph_config(disabled) is None
 
 
 # ---------------------------------------------------------------- Slack の API（偽物）
@@ -578,6 +586,7 @@ def worker(store, rule_set, catalog, graph_config, uploader, clock) -> AlertGrap
         open_reader=lambda: store,
         rules=rule_set,
         catalog=catalog,
+        names=NAMES,
         config=graph_config,
         clock=clock,
         repeat_after_s=1800.0,
@@ -632,6 +641,53 @@ def test_upload_failure_is_logged_and_dropped(store, rule_set, catalog, graph_co
     assert "グラフを添えられなかった" in caplog.text
 
 
+class FlakyUploader(FakeUploader):
+    """1 回目だけ失敗する。"""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.attempts = 0
+
+    def upload_to_thread(self, **kwargs: object) -> None:
+        self.attempts += 1
+        if self.attempts == 1:
+            raise DeliveryError("slack: upload: HTTP 500")
+        self.uploads.append(kwargs)
+
+
+def test_failed_graph_does_not_suppress_the_next_firing(store, rule_set, catalog, graph_config):
+    """抑えるのは**実際に上げた**グラフだけ（0147 §2.4。Codex レビュー P2）。
+
+    上げに失敗したら予約を外し、`repeat_after_s` の間の次の発火には添える。上げられた後は抑える。
+    """
+    fill(store)
+    clock = SimulatedClock(NOON_MS)
+    uploader = FlakyUploader()
+    graphs = worker(store, rule_set, catalog, graph_config, uploader, clock)
+    assert graphs.offer(firing(), CHANNEL, "1.0") is True
+    assert graphs.failed == 1
+    clock.advance_to_ms(NOON_MS + MINUTE_MS)
+    assert graphs.offer(firing(), CHANNEL, "2.0") is True, "失敗の後の発火には添える"
+    assert [u["thread_ts"] for u in uploader.uploads] == ["2.0"]
+    clock.advance_to_ms(NOON_MS + 2 * MINUTE_MS)
+    assert graphs.offer(firing(), CHANNEL, "3.0") is False, "上げた後は repeat_after_s まで抑える"
+
+
+def test_graph_without_values_does_not_suppress_the_next_firing(
+    store, rule_set, catalog, graph_config
+):
+    """描く値が無くて添えなかったときも予約を外す。"""
+    clock = SimulatedClock(NOON_MS)
+    uploader = FakeUploader()
+    graphs = worker(store, rule_set, catalog, graph_config, uploader, clock)
+    assert graphs.offer(firing(), CHANNEL, "1.0") is True
+    assert uploader.uploads == []
+    fill(store, end_ms=NOON_MS + MINUTE_MS)
+    clock.advance_to_ms(NOON_MS + MINUTE_MS)
+    assert graphs.offer(firing(), CHANNEL, "2.0") is True
+    assert [u["thread_ts"] for u in uploader.uploads] == ["2.0"]
+
+
 def test_failed_upload_log_has_neither_token_nor_upload_url(store, rule_set, catalog, graph_config):
     """整形したログ（exc_info 込み）にトークンも署名入りの上げ先も出ない（0147 §2.6）。"""
     fill(store)
@@ -662,6 +718,7 @@ def test_reader_failure_is_logged_and_dropped(rule_set, catalog, graph_config):
         open_reader=cannot_open,
         rules=rule_set,
         catalog=catalog,
+        names=NAMES,
         config=graph_config,
         clock=SimulatedClock(NOON_MS),
         repeat_after_s=1800.0,
@@ -684,6 +741,7 @@ def test_offer_never_waits_for_the_upload(tmp_path, rules, rule_set, catalog, gr
         open_reader=lambda: SqliteStore(db, rules=rules, clock=clock),
         rules=rule_set,
         catalog=catalog,
+        names=NAMES,
         config=graph_config,
         clock=clock,
         repeat_after_s=1800.0,
@@ -716,6 +774,7 @@ def test_router_sends_text_first_then_graph_in_the_same_thread(
         open_reader=lambda: store,
         rules=rule_set,
         catalog=catalog,
+        names=NAMES,
         config=graph_config,
         clock=clock,
         repeat_after_s=1800.0,
@@ -767,20 +826,24 @@ def test_daemon_builds_graphs_only_with_the_bot(tmp_path, rules, rule_set, catal
     config = Config(db=tmp_path / "x.db", notify_graph=CONFIG_DIR / "notify-graph.yaml")
     clock = SimulatedClock(NOON_MS)
     webhook_only = {"stdout": StdoutNotifier(), "slack": SlackNotifier("https://x.invalid/")}
-    assert _alert_graph(config, webhook_only, rules, clock, rule_set, catalog, 1800.0) is None
+    assert (
+        _alert_graph(config, webhook_only, rules, clock, rule_set, catalog, NOTIFY_CONFIG) is None
+    )
 
     bot = SlackBotNotifier(api(FakeSlack()), CHANNEL)
-    built = _alert_graph(config, {"slack": bot}, rules, clock, rule_set, catalog, 1800.0)
+    built = _alert_graph(config, {"slack": bot}, rules, clock, rule_set, catalog, NOTIFY_CONFIG)
     assert isinstance(built, AlertGraphWorker)
 
     broken = Config(db=tmp_path / "x.db", notify_graph=tmp_path / "missing.yaml")
-    assert _alert_graph(broken, {"slack": bot}, rules, clock, rule_set, catalog, 1800.0) is None
+    assert (
+        _alert_graph(broken, {"slack": bot}, rules, clock, rule_set, catalog, NOTIFY_CONFIG) is None
+    )
 
 
 def test_repo_graph_config_matches_the_decision(graph_config):
     """0147 §2.3 / §2.7 の既定。"""
     assert graph_config.window_s == 3600
-    assert graph_config.always_metrics == ("air.room",)
+    assert "air.room" in NOTIFY_CONFIG.context_always, "室温は通知の context_always から"
 
 
 def test_example_env_lists_the_bot_variables():

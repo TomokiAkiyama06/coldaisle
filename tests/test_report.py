@@ -30,6 +30,7 @@ from coldaisle.report import (
     send,
     write,
 )
+from coldaisle.rules import RuleSet
 from coldaisle.store import AlertSeverity, SqliteStore
 from conftest import CONFIG_DIR
 
@@ -260,6 +261,31 @@ def test_only_fired_alerts_are_counted(store, catalog):
     assert report.alerts == (
         type(report.alerts[0])(rule_id="RECIRCULATION", severity=AlertSeverity.WARNING, count=2),
     )
+
+
+def test_alert_table_shows_rule_names_and_japanese_severity(store, catalog):
+    """表のルールは `<名前>（<RULE_ID>）`、重大度は日本語（決定記録 0142 §2.6）。
+
+    LLM へ渡す版も同じ形で作る。名前の無いルールは ID のまま。
+    """
+    alert(store, "RECIRCULATION", minute=10)
+    alert(store, "RAPID_RISE", minute=20, severity="critical")
+    alert(store, "UNLISTED_RULE", minute=30)
+    labels = RuleSet.from_yaml(CONFIG_DIR / "rules.yaml").labels()
+    report = build(
+        store,
+        day=DAY,
+        tz=TZ,
+        catalog=catalog,
+        max_alerts=20,
+        exclusions=EXCLUSIONS,
+        rule_labels=labels,
+    )
+    for text in (report.as_markdown(), report.facts_markdown()):
+        assert "| 排気の再循環（RECIRCULATION） | 警告 | 1 |" in text
+        assert "| 温度の急上昇（RAPID_RISE） | 重大 | 1 |" in text
+        assert "| UNLISTED_RULE | 警告 | 1 |" in text
+    assert report.as_markdown().startswith("# 日次レポート 2026-08-24"), "見出しは変えない"
 
 
 def test_alerts_are_compared_with_the_previous_day(store, catalog):

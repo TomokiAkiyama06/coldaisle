@@ -28,14 +28,13 @@ from coldaisle import logs
 from coldaisle.clock import Clock
 from coldaisle.measurement import Quality
 from coldaisle.metrics import MetricCatalog
-from coldaisle.notify.models import Notification
+from coldaisle.notify.models import DisplayNames, Notification
 from coldaisle.notify.png_chart import MAX_SERIES_PER_PANEL, Panel, Series, Threshold, render_png
 from coldaisle.rules.models import (
     HotAndSlowRule,
     RangeRule,
     RuleSet,
     ThresholdRule,
-    rule_metrics,
 )
 from coldaisle.store.models import AlertSeverity, SeriesPoint
 
@@ -60,8 +59,6 @@ class GraphConfig(BaseModel):
 
     enabled: bool
     window_s: float = Field(gt=0, le=86_400)
-    always_metrics: tuple[str, ...]
-    """どのアラートにも足すメトリクス（既定 `air.room`）。名前をコードに書かない（ルール 9）。"""
     gap_s: float = Field(gt=0)
     """これより離れた 2 点は結ばない。"""
     width: int = Field(ge=400, le=4000)
@@ -69,18 +66,16 @@ class GraphConfig(BaseModel):
     max_points: int = Field(ge=10, le=100_000)
 
 
-def load_graph_config(path: Path, catalog: MetricCatalog) -> GraphConfig | None:
+def load_graph_config(path: Path) -> GraphConfig | None:
     """設定を読む。**読めない・不正ならグラフだけを無効にする**（0147 §2.7）。
 
     監視と文章の通知はグラフより大事なので、起動は止めない。error を 1 度残す。
+    どのアラートにも足すメトリクス（室温）はここに持たず、通知の `context_always` を使う。
     """
     try:
         loaded: Any = yaml.safe_load(path.read_text(encoding="utf-8"))
         config = GraphConfig.model_validate(loaded)
-        unknown = [m for m in config.always_metrics if catalog.unit_for(m) is None]
-        if unknown:
-            raise ValueError(f"config/metrics.yaml に無いメトリクス: {unknown}")
-    except (OSError, yaml.YAMLError, ValidationError, ValueError) as error:
+    except (OSError, yaml.YAMLError, ValidationError) as error:
         LOGGER.error(
             "グラフの設定が読めないので、通知にグラフを添えない（文章の通知は届く）",
             extra={logs.FIELDS_KEY: {"config": str(path), "reason": str(error)}},
@@ -133,37 +128,20 @@ class GraphPlan:
     thresholds: dict[str, tuple[Threshold, ...]]
 
 
-def plan_graph(
-    rule_id: str,
-    metric: str,
-    *,
-    rules: RuleSet,
-    catalog: MetricCatalog,
-    always_metrics: Sequence[str],
-) -> GraphPlan:
+def plan_graph(rule_id: str, metric: str, *, rules: RuleSet, names: DisplayNames) -> GraphPlan:
     """描くメトリクスと閾値の線を決める（0147 §2.3）。
 
-    順: アラートのメトリクス → ルールの残りのメトリクス → それらの派生値の材料 →
-    `always_metrics`。重複は先に出たほうだけを残す。
+    描くメトリクスは通知の「現在値:」と**同じ選び方**（決定記録 0142 §2.2a の
+    `DisplayNames.context_metrics`。アラートのメトリクス → ルールの残りのメトリクス →
+    派生値の材料 → `config/notify.yaml` の `context_always`）。選び方を 2 か所に持たない。
+    ルールの文が無い ID（知らないルール）は、メトリクス・その材料・`context_always` だけ。
     """
-    rule = _rule_for(rule_id, rules)
-    primary = [metric, *(rule_metrics(rule) if rule is not None else ())]
-    ordered: list[str] = []
-    for name in primary:
-        _add(ordered, name)
-    for name in list(ordered):
-        derived = catalog.derived.get(name)
-        if derived is not None:
-            _add(ordered, derived.minuend)
-            _add(ordered, derived.subtrahend)
-    for name in always_metrics:
-        _add(ordered, name)
-    return GraphPlan(metrics=tuple(ordered), thresholds=_thresholds(rule))
-
-
-def _add(ordered: list[str], name: str) -> None:
-    if name not in ordered:
-        ordered.append(name)
+    selected = names.context_metrics(rule_id, metric)
+    if selected is None:
+        selected = list(
+            dict.fromkeys([metric, *names.materials.get(metric, ()), *names.context_always])
+        )
+    return GraphPlan(metrics=tuple(selected), thresholds=_thresholds(_rule_for(rule_id, rules)))
 
 
 def _rule_for(rule_id: str, rules: RuleSet) -> BaseModel | None:
@@ -243,16 +221,11 @@ def render_alert_graph(
     *,
     rules: RuleSet,
     catalog: MetricCatalog,
+    names: DisplayNames,
     config: GraphConfig,
 ) -> RenderedGraph | None:
     """1 枚を描く。描く値が 1 点も無ければ `None`。"""
-    plan = plan_graph(
-        request.rule_id,
-        request.metric,
-        rules=rules,
-        catalog=catalog,
-        always_metrics=config.always_metrics,
-    )
+    plan = plan_graph(request.rule_id, request.metric, rules=rules, names=names)
     window_ms = round(config.window_s * 1000)
     start_ms = request.end_ms - window_ms
     # `series()` の範囲は [start, end)。送った時刻の点まで入れる
@@ -290,9 +263,9 @@ def render_alert_graph(
             )
         )
         for color, (metric, _) in zip(_COLOR_NAMES, drawn, strict=False):
-            legend.append(f"{_label(metric, catalog)}（{metric}）={color}")
+            legend.append(f"{names.metric(metric)}（{metric}）={color}")
         threshold_texts.extend(
-            f"{_label(metric, catalog)} の閾値 {t.value:g}"
+            f"{names.metric(metric)} の閾値 {t.value:g}"
             for metric, _ in drawn
             for t in plan.thresholds.get(metric, ())
         )
@@ -324,14 +297,6 @@ def _names(panel: Panel) -> tuple[str, ...]:
     return tuple(series.name for series in panel.series)
 
 
-def _label(metric: str, catalog: MetricCatalog) -> str:
-    if metric in catalog.metrics:
-        return catalog.metrics[metric].label
-    if metric in catalog.derived:
-        return catalog.derived[metric].label
-    return metric
-
-
 class AlertGraphWorker:
     """グラフの依頼を受けて、別のスレッドで描いて上げる（0147 §2.2）。
 
@@ -346,6 +311,7 @@ class AlertGraphWorker:
         open_reader: Callable[[], SeriesReader],
         rules: RuleSet,
         catalog: MetricCatalog,
+        names: DisplayNames,
         config: GraphConfig,
         clock: Clock,
         repeat_after_s: float,
@@ -354,10 +320,17 @@ class AlertGraphWorker:
         self._open_reader = open_reader
         self._rules = rules
         self._catalog = catalog
+        self._names = names
         self._config = config
         self._clock = clock
         self._repeat_after_ms = round(repeat_after_s * 1000)
-        self._last_offered_ms: dict[tuple[str, str], int] = {}
+        self._last_graph_ms: dict[tuple[str, str], int] = {}
+        """`(ルール, メトリクス)` → 上げた（または上げている途中の）グラフの時刻。
+
+        **抑えるのは実際に上げたグラフだけ**（0147 §2.4）。依頼を積んだ時点で予約し、
+        描けない・上げられない・停止で捨てたときは予約を外す（`_release`）。外さないと、
+        失敗した 1 枚のせいで `repeat_after_s` の間の次の発火にもグラフが付かない。
+        """
         self._lock = threading.Lock()
         self._queue: queue.Queue[GraphRequest | None] = queue.Queue(QUEUE_SIZE)
         self._thread: threading.Thread | None = None
@@ -380,7 +353,7 @@ class AlertGraphWorker:
         key = (notification.rule_id, notification.metric)
         now_ms = self._clock.now_ms()
         with self._lock:
-            last = self._last_offered_ms.get(key)
+            last = self._last_graph_ms.get(key)
             if last is not None and now_ms - last < self._repeat_after_ms:
                 return False
             request = GraphRequest(
@@ -399,7 +372,7 @@ class AlertGraphWorker:
                     extra={logs.FIELDS_KEY: {"dropped": self.dropped}},
                 )
                 return False
-            self._last_offered_ms[key] = now_ms
+            self._last_graph_ms[key] = now_ms  # 予約。上げられなければ `_release` で外す
         if self._thread is None:
             self.drain()  # スレッドを起こしていない場合はその場で描く（テスト用）
         return True
@@ -420,9 +393,11 @@ class AlertGraphWorker:
         # 積まれている依頼は捨ててから止める（停止を遅らせない）
         while True:
             try:
-                self._queue.get_nowait()
+                discarded = self._queue.get_nowait()
             except queue.Empty:
                 break
+            if discarded is not None:
+                self._release(discarded)
         with contextlib.suppress(queue.Full):  # 直前に空にしているので普通は起きない
             self._queue.put(None, timeout=timeout_s)
         thread.join(timeout=timeout_s)
@@ -461,10 +436,12 @@ class AlertGraphWorker:
                 self._reader,
                 rules=self._rules,
                 catalog=self._catalog,
+                names=self._names,
                 config=self._config,
             )
             if graph is None:
                 LOGGER.info("描く値が無いのでグラフを添えない", extra={logs.FIELDS_KEY: fields})
+                self._release(request)
                 return
             self._uploader.upload_to_thread(
                 channel=request.channel,
@@ -477,6 +454,7 @@ class AlertGraphWorker:
         except Exception:
             # 例外の文はトークン・上げ先の URL を含まない（DeliveryError。0147 §2.6）
             self.failed += 1
+            self._release(request)
             LOGGER.warning(
                 "グラフを添えられなかった（本文は届いている）",
                 exc_info=True,
@@ -484,6 +462,13 @@ class AlertGraphWorker:
             )
             return
         self.uploaded += 1
+
+    def _release(self, request: GraphRequest) -> None:
+        """上げられなかった依頼の予約を外す。**その依頼の予約のときだけ**（後の予約を消さない）。"""
+        key = (request.rule_id, request.metric)
+        with self._lock:
+            if self._last_graph_ms.get(key) == request.end_ms:
+                del self._last_graph_ms[key]
 
     def _close_reader(self) -> None:
         if self._reader is not None:

@@ -51,8 +51,8 @@ from coldaisle.ingest import (
 from coldaisle.ingest.protocol import RawHello, RawMessage, RawSample, Source
 from coldaisle.ingest.serial_source import DEFAULT_BAUD
 from coldaisle.llm_exclusions import LlmExclusions, LlmExclusionsError
-from coldaisle.metrics import MetricCatalog
-from coldaisle.notify import Notification, NotifyConfig, Router, notifiers_from_env
+from coldaisle.metrics import MetricCatalog, compute_derived
+from coldaisle.notify import DisplayNames, Notification, NotifyConfig, Router, notifiers_from_env
 from coldaisle.notify.notifiers import Notifier
 from coldaisle.notify.slack_bot import SlackBotNotifier
 from coldaisle.rules import Engine, RuleSet, Transition, probe_mismatch
@@ -180,6 +180,17 @@ class Daemon:
         self._dataset_run_alias = dataset_run_alias
         self._engine = engine
         self._notifier = notifier
+        # 通知の本文の名前と「現在値:」の選び方（決定記録 0142）。ルールとメトリクスの設定は
+        # エンジンが、常に付けるメトリクスは通知の設定が持っている
+        self._names = (
+            DisplayNames()
+            if engine is None or notifier is None
+            else DisplayNames.build(
+                rules=engine.rules,
+                catalog=engine.catalog,
+                context_always=notifier.config.context_always,
+            )
+        )
         # **一覧が無ければ説明を求めない**（決定記録 0131 §2.4a。どの発火を LLM へ渡して
         # よいか分からないため）。素のアラートは今までどおり届く
         self._explainer_factory = explainer_factory if llm_exclusions is not None else None
@@ -515,6 +526,7 @@ class Daemon:
                 dashboard_url=self._notifier.config.dashboard_url,
                 kind="explanation",
                 body=explanation.as_text(),
+                names=self._names,
             )
         )
         self.stats.explanations += 1
@@ -550,6 +562,7 @@ class Daemon:
                     detail=transition.detail,
                     dashboard_url=self._notifier.config.dashboard_url,
                     context=dict(self._latest_values),
+                    names=self._names,
                 )
             )
             if not sent:
@@ -736,12 +749,14 @@ class Daemon:
             )
         if normalized.out_of_order:
             LOGGER.warning("seq が進んでいない", extra={logs.FIELDS_KEY: {"seq": raw.seq}})
-        # 通知の本文に載せる現在値。**何が起きているかを本文だけで判断できるように**
-        self._latest_values = {
-            reading.metric: reading.value
-            for reading in normalized.sample.readings
-            if reading.metric.startswith("air.")
-        }
+        # 通知の本文に載せる現在値。**何が起きているかを本文だけで判断できるように**。
+        # どれを載せるかは通知ごとに選ぶ（決定記録 0142 §2.2a）。派生値もここで計算しておく
+        readings = [r for r in normalized.sample.readings if r.metric.startswith("air.")]
+        self._latest_values = {reading.metric: reading.value for reading in readings}
+        if self._engine is not None:
+            self._latest_values.update(
+                compute_derived({r.metric: r for r in readings}, self._engine.catalog)
+            )
         if self._engine is not None:
             self._record(self._engine.on_sample(normalized.sample))
         if normalized.unknown_channels:
@@ -829,9 +844,7 @@ def build(config: Config) -> Daemon:
     catalog = MetricCatalog.from_yaml(config.metrics)
     notify_config = NotifyConfig.from_yaml(config.notify)
     notifiers = notifiers_from_env()
-    alert_graph = _alert_graph(
-        config, notifiers, rules, clock, rule_set, catalog, notify_config.repeat_after_s
-    )
+    alert_graph = _alert_graph(config, notifiers, rules, clock, rule_set, catalog, notify_config)
     return Daemon(
         source=source,
         store=store,
@@ -858,17 +871,18 @@ def _alert_graph(
     clock: Clock,
     rule_set: RuleSet,
     catalog: MetricCatalog,
-    repeat_after_s: float,
+    notify_config: NotifyConfig,
 ) -> AlertGraphWorker | None:
     """Slack の Bot があり、グラフの設定が有効なときだけグラフを添える（決定記録 0147）。
 
     Webhook だけのときは作らない（スレッドの `ts` が無い）。DB の接続はグラフのスレッドが
-    自分で開く（決定記録 0004 §2.8）。
+    自分で開く（決定記録 0004 §2.8）。描くメトリクスは本文の「現在値:」と同じ選び方
+    （決定記録 0142 §2.2a の `DisplayNames`。`context_always` を含む）。
     """
     slack = notifiers.get("slack")
     if not isinstance(slack, SlackBotNotifier):
         return None
-    graph_config = load_graph_config(config.notify_graph, catalog)
+    graph_config = load_graph_config(config.notify_graph)
     if graph_config is None:
         return None
     worker = AlertGraphWorker(
@@ -876,9 +890,12 @@ def _alert_graph(
         open_reader=lambda: SqliteStore(config.db, rules=quality_rules, clock=clock),
         rules=rule_set,
         catalog=catalog,
+        names=DisplayNames.build(
+            rules=rule_set, catalog=catalog, context_always=notify_config.context_always
+        ),
         config=graph_config,
         clock=clock,
-        repeat_after_s=repeat_after_s,
+        repeat_after_s=notify_config.repeat_after_s,
     )
     slack.attach(worker.offer)
     return worker

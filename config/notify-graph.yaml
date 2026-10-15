@@ -12,8 +12,8 @@ enabled: true
 # 本文を送った時刻から遡って描く長さ（秒）
 window_s: 3600
 
-# どのアラートにも足すメトリクス。config/metrics.yaml にある名前だけ（無ければグラフを無効にする）
-always_metrics: [air.room]
+# 描くメトリクスは本文の「現在値:」と同じ選び方（決定記録 0142 §2.2a）。
+# どのアラートにも足す室温は config/notify.yaml の context_always（ここには持たない）
 
 # これより離れた 2 点は線で結ばない（欠けを欠けとして見せる。秒）
 gap_s: 30

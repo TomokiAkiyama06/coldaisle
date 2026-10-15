@@ -6,7 +6,7 @@
 - **Supersedes**: なし
 - **関連**: [0013](0013-notifications.md) §2.1 / §2.3 / §2.4 / §2.5 /
   [0135](0135-critical-notifications-to-slack.md) /
-  [0142](0142-japanese-notification-text.md)（提案中。PR #328）§2.2a /
+  [0142](0142-japanese-notification-text.md) §2.2a /
   [0002](0002-metric-naming.md) §2.2 / [0004](0004-storage-read-contract.md) §2.8 /
   #305 / #306 / `config/notify.yaml`、`config/notify-graph.yaml`、`docs/notifications.md` /
   `src/coldaisle/notify/`、`src/coldaisle/alert_graph.py`
@@ -75,11 +75,15 @@
 
 - 期間: 発火の通知を送った時刻から遡って `window_s`（既定 3600 s = 60 分）。
   `readings` の生の値（`series()`。品質 `ok` の点だけ）
-- 描くメトリクス（重複は先に出たほうだけ。0142 案 §2.2a と同じ選び方）:
+- 描くメトリクスは**本文の「現在値:」と同じもの**。0142 §2.2a の選び方（`DisplayNames.context_metrics`）を
+  そのまま使い、選び方を 2 か所に持たない（重複は先に出たほうだけ）:
   1. アラートのメトリクス（`Notification.metric`）
   2. ルールの定義が参照する残りのメトリクス（`metric` / `core_metric` / `fan_metric`）
   3. 1・2 が派生値なら材料（`config/metrics.yaml` の `minuend`・`subtrahend`）
-  4. `config/notify-graph.yaml` の `always_metrics`（既定 `[air.room]`。ルール 9 のため設定に置く）
+  4. `config/notify.yaml` の `context_always`（既定 `[air.room]`。0142 §2.2a）
+
+  ルールの文を持たない ID（`config/rules.yaml` に無いルール）は、1・その材料・4 だけ。
+  本文の「現在値:」と違い、取り込みのサンプルに無い値（`GPU_FAN_*` の GPU の値など）も DB から読んで描く
 - **派生値は保存しないので**（0002 §2.2）、材料の 2 本を同じ `ts_ms` で突き合わせて引き算する
   （両方 `ok` の時刻だけ。`compute_derived` と同じ規則）
 - **単位ごとに別の面（パネル）にする。** 1 つの面に 2 つの縦軸を持たない。
@@ -109,7 +113,7 @@
 | info | 添えない | Slack へ送らない（`routing`） |
 | メトリクスを持たないアラート（`SENSOR_FAULT`・`PROBE_CHANGED`） | 添えない | 何を描くか決まらない。無音のときは描く値も無い |
 | `repeat_after_s` / 夜間の方針で**本文を送らなかった** | 添えない | 送っていない通知に続けない（`Router` が送ったものだけに続く） |
-| 同じ `(ルール, メトリクス)` に `repeat_after_s` 以内にグラフを上げた | 添えない | 発火と解除を往復するアラートで画像が連投されるのを抑える |
+| 同じ `(ルール, メトリクス)` に `repeat_after_s` 以内にグラフを**実際に上げた**（または上げている途中） | 添えない | 発火と解除を往復するアラートで画像が連投されるのを抑える。描けなかった・上げられなかった・停止で捨てたグラフは数えない（次の発火には添える） |
 | 夜間に届いた critical | 添える | スレッドへの返信はチャンネルの通知にならない（Bot が始めたスレッドを人はフォローしていない） |
 | Webhook で送った・Webhook へ送り直した | 添えない | スレッドの `ts` が無い（2.1） |
 
@@ -141,7 +145,6 @@ PNG は `zlib` と `struct` で書き、線は整数の座標で引く。文字�
 ```yaml
 enabled: true
 window_s: 3600
-always_metrics: [air.room]
 gap_s: 30
 width: 960
 panel_height: 300
@@ -150,8 +153,9 @@ max_points: 4000
 
 - **読めない・形が不正なら、起動時に error を 1 度記録してグラフだけを無効にする。**
   文章の通知・取り込みは止めない（監視 > 通知 > グラフの順に大事）
-- `config/notify.yaml` の `NotifyConfig`（`extra="forbid"`）には足さない。並行する 0142 案（PR #328）が
-  同じクラスと同じファイルを変えており、衝突を避けるため。0142 が入った後の扱いは §5
+- `config/notify.yaml` の `NotifyConfig`（`extra="forbid"`）には足さない。壊れたグラフの設定で通知ごと
+  起動しなくなるのを避けるため。どのアラートにも足すメトリクス（室温）だけは、本文と揃えるため
+  `config/notify.yaml` の `context_always`（0142）を使い、このファイルには持たない
 
 ---
 
@@ -185,7 +189,7 @@ max_points: 4000
 | 解除にもグラフを添える | 解除のたびに画像が届き連投になる。発火の時点のグラフで足りる（2.4） |
 | 1 つの面に 2 つの縦軸（°C と %） | 軸の取り違えを招く。単位ごとに面を分ける（2.3） |
 | matplotlib / Pillow を足す | 2.5 |
-| グラフの設定を `config/notify.yaml` に足す | 0142 案と衝突する・壊れたグラフの設定で通知ごと起動しなくなる（2.7） |
+| グラフの設定を `config/notify.yaml` に足す | 壊れたグラフの設定で通知ごと起動しなくなる（2.7） |
 
 ---
 
@@ -197,6 +201,6 @@ max_points: 4000
 | 2 | **夜間の critical にも添える**（2.4。スレッドの返信は鳴らないという前提。実際の Slack で鳴るなら夜間は添えない） | 所有者の到達確認 |
 | 3 | **同じ `(ルール, メトリクス)` のグラフは `repeat_after_s` に 1 回まで**（2.4。仕様に無い抑え） | 本記録のレビュー |
 | 4 | `SENSOR_FAULT`（メトリクスなし）に何を描くか（今は添えない） | 運用で要るとなったとき |
-| 5 | 0142 が FINAL になったら、描くメトリクスの選び方（2.3 の 1〜4）と `always_metrics` を 0142 の `context_always` と 1 か所にまとめる | 0142 の後の Issue |
+| 5 | （閉じた）描くメトリクスの選び方と室温を 0142 の `DisplayNames.context_metrics`・`context_always` にまとめた（2.3）。グラフ専用の `always_metrics` は持たない | — |
 | 6 | グラフの設定が壊れているときに起動を止めず error の記録だけにする（2.7。リポジトリの他の設定は起動時に落とす） | 本記録のレビュー |
 | 7 | 実際の Slack への到達（`files:write` の scope・チャンネルへの招待・スレッドに画像が出ること） | 所有者が `docs/notifications.md` の手順で確認 |

@@ -263,7 +263,7 @@ def test_ongoing_alerts_section_lists_alerts_still_firing_at_the_end_of_the_day(
     assert report.alert_total == 0, "その日に発火した件数には出ない"
     assert "## 日の終わりに続いているアラート" in human
     section = human.split("## 日の終わりに続いているアラート")[1]
-    assert "| GPU_FAN_NOT_MANUAL | warning | 2026-08-22 01:00 |" in section
+    assert "| GPU_FAN_NOT_MANUAL | 警告 | 2026-08-22 01:00 |" in section
     # 翌日に解除されたものも、その日の終わりには続いていた（作り直しても同じ）
     assert "ROOM_HIGH" in section
     assert "INTAKE_HIGH" not in section, "その日のうちに解除された"
@@ -431,6 +431,7 @@ class _Notifier:
     @dataclass
     class _Config:
         dashboard_url: str = ""
+        context_always: tuple[str, ...] = ("air.room",)
 
     def __init__(self) -> None:
         self.config = self._Config()

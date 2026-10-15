@@ -1,6 +1,7 @@
 # 通知の到達確認（Slack）
 
-通知の規約は決定記録 [0013](decisions/0013-notifications.md)、宛先は [0135](decisions/0135-critical-notifications-to-slack.md) にあります。
+通知の規約は決定記録 [0013](decisions/0013-notifications.md)、宛先は [0135](decisions/0135-critical-notifications-to-slack.md)、
+本文の日本語の形は [0142](decisions/0142-japanese-notification-text.md) にあります。
 この文書は、**実物の Webhook / トークンで本当に届くか**を確かめる手順です（#51 / 0013 §2.7・§5 未決2）。
 テストは宛先を差し替えて行っているため、外部サービスへの到達はここでしか確かめられません。
 
@@ -15,8 +16,8 @@
 - `COLDAISLE_SLACK_WEBHOOK`: 監視専用チャンネルの Incoming Webhook の URL
 
 critical と warning は**同じ Webhook・同じチャンネル**に届きます（決定記録 0135）。
-見分けるのは本文の先頭の行の記号と `[重大度]` です（発火は critical が 🔴、warning が 🟠、
-解除は ✅ に `[critical 解除]` / `[warning 解除]`。決定記録 0135 §2.2）。
+見分けるのは本文の先頭の行の記号と `[重大度]` です（発火は critical が 🔴 `[重大]`、warning が 🟠 `[警告]`、
+解除は ✅ に `[重大 解除]` / `[警告 解除]`。決定記録 0135 §2.2 / 0142 §2.1）。
 夜間（22時〜7時）は critical だけが届き、warning は届きません（`night.warning_enabled: false`）。
 
 ### LINE を使う場合
@@ -44,9 +45,10 @@ LINE は今は使っていません。`LineNotifier` のコードは残してあ
 
 ### ダッシュボードのリンク
 
-通知の本文の最後の行はダッシュボードのリンクです。既定は `config/notify.yaml` の
+通知の本文の ID の行の前にダッシュボードのリンクを載せます。既定は `config/notify.yaml` の
 `dashboard_url`（`http://127.0.0.1:8000/`）で、**サーバー自身から見たアドレス**なので、
-Slack を Mac・スマホで開いて押しても開けません（#307）。
+Slack を Mac・スマホで開いて押しても開けません（#307）。**ループバックのアドレス（`127.*`・`localhost`）の
+ままなら、リンクは本文に載りません**（決定記録 0142 §2.2）。
 
 - `COLDAISLE_DASHBOARD_URL`: 別の端末から開けるダッシュボードのアドレス。設定すると
   `dashboard_url` を置き換えます。アラートの通知・日次レポート（`coldaisle-report`）・
@@ -137,10 +139,30 @@ sudo bash -c 'read -rp "チャンネル ID (C...): " c; printf "COLDAISLE_SLACK_
 
 | 順 | 重大度 | 届くもの | 本文の先頭の行 |
 |---|---|---|---|
-| 1 | critical | `RAPID_RISE` の発火 | `🔴 [critical] RAPID_RISE [air.gpu_intake] — firing` |
-| 2 | critical | `RAPID_RISE` の解除 | `✅ [critical 解除] RAPID_RISE [air.gpu_intake] — resolved` |
-| 3 | warning | `INTAKE_HIGH` の発火 | `🟠 [warning] INTAKE_HIGH [air.gpu_intake] — firing` |
-| 4 | warning | `INTAKE_HIGH` の解除 | `✅ [warning 解除] INTAKE_HIGH [air.gpu_intake] — resolved` |
+| 1 | critical | `RAPID_RISE` の発火 | `🔴 [重大] GPU の吸気温度が急上昇しています` |
+| 2 | critical | `RAPID_RISE` の解除 | `✅ [重大 解除] GPU の吸気温度の急上昇が収まりました` |
+| 3 | warning | `INTAKE_HIGH` の発火 | `🟠 [警告] GPU の吸気温度が高くなっています` |
+| 4 | warning | `INTAKE_HIGH` の解除 | `✅ [警告 解除] GPU の吸気温度が下がりました` |
+
+1 通目の全体は次の形になります（数値は走らせるたびに少し違います。`COLDAISLE_DASHBOARD_URL` を
+設定していれば、ID の行の前にリンクが入ります）。
+
+```text
+🔴 [重大] GPU の吸気温度が急上昇しています
+GPU吸気 37.1 °C（1 分で +5.2 °C）・室温 26.1 °C
+GPU の前が塞がれていないか、排気が回り込んでいないかを確認してください。
+RAPID_RISE / air.gpu_intake
+```
+
+- 2 行目は値の行です。発火では対象の値とその意味（変化量・閾値の超過）を先頭に、関係する値
+  （アラートのメトリクス・ルールが参照するメトリクス・派生値ならその材料）、最後に `config/notify.yaml` の
+  `context_always`（室温）を並べます（決定記録 0142 §2.2a / §2.4）
+- 3 行目は確かめることです（発火のときだけ）
+- 最後の行は ID です（ログ・DB・`config/rules.yaml` と突き合わせるため）
+
+見出しの文と確かめることは `config/rules.yaml` の各ルールの `title` / `resolved_title` / `hint`（必須）、
+メトリクスの名前と単位は `config/metrics.yaml` の `label` と `unit` から引きます（決定記録 0142 §2.3）。
+文を直すときは設定だけを変え、`coldaisle-daemon` を再起動します。
 
 正常でも、各アラートには発火と解除の **2通** が届きます。
 **同じ遷移（例: `RAPID_RISE` の発火）が2通以上届いたら**、連投の抑制が効いていません（#51 の受入基準）。
