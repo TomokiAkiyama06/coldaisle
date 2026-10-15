@@ -9,6 +9,7 @@
 
 from __future__ import annotations
 
+from itertools import pairwise
 from pathlib import Path
 from typing import Any
 
@@ -17,7 +18,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from coldaisle.store.models import METRIC_PATTERN, AlertSeverity
 
-METRIC_KEYS = ("metric", "core_metric", "fan_metric")
+METRIC_KEYS = ("metric", "core_metric", "fan_metric", "power_metric")
 """ルールがメトリクス名を持つ項目。名前の検査と、LLM への除外の判定（0131 §2.4a）で使う。"""
 
 
@@ -41,6 +42,49 @@ class ThresholdRule(_Rule):
     clear: float
     """解除の閾値。**発火より内側**に置く。同じ値にするとフラッピングする。"""
     fire_after_s: float = Field(ge=0)
+
+
+class ExpectedPoint(BaseModel):
+    """期待値の表の1点。GPU 電力（W）と、その電力での正常な値の上限（決定記録 0144 §2.2）。"""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    power_w: float = Field(ge=0)
+    value: float
+
+
+class PowerReferencedRule(_Rule):
+    """値が「電力から求めた正常の上限（期待値）」を超えた分で判定する（FR-406 / 決定記録 0144）。
+
+    超過 = 値 − 期待値(参照電力)。超過が `threshold` を超えた状態が `fire_after_s` 続けば発火し、
+    `clear` を下回れば解除する。参照電力は `power_metric` の直近 `power_window_s` の最大で、
+    電力の値は取り込みのサンプルではなく DB から評価時刻で読む（0144 §2.1 / §2.3）。
+    """
+
+    metric: str
+    power_metric: str
+    power_window_s: float = Field(gt=0)
+    """参照電力を取る窓。**下げた直後の余熱で鳴らさない**ため、窓の中の最大を使う（0144 §2.3）。"""
+    expected: tuple[ExpectedPoint, ...] = Field(min_length=2)
+    """`power_w` が増える順。`value` は減らない（読み込み時に検査する）。間は線形、外は端の値。"""
+    threshold: float
+    """発火: 期待値を超えた分がこれを超える。"""
+    clear: float
+    """解除: 期待値を超えた分がこれを下回る。**`threshold` より小さくする。**"""
+    fire_after_s: float = Field(ge=0)
+
+    def expected_at(self, power_w: float | None) -> float:
+        """参照電力での期待値。**電力が分からなければ表の最大**（0144 §2.4）。"""
+        points = self.expected
+        if power_w is None:
+            return points[-1].value
+        if power_w <= points[0].power_w:
+            return points[0].value
+        for low, high in pairwise(points):
+            if power_w <= high.power_w:
+                ratio = (power_w - low.power_w) / (high.power_w - low.power_w)
+                return low.value + ratio * (high.value - low.value)
+        return points[-1].value
 
 
 class RangeRule(_Rule):
@@ -131,7 +175,7 @@ class RuleSet(BaseModel):
     probe_changed: EventRule
     recirculation: ThresholdRule
     intake_high: ThresholdRule
-    airflow_degraded: ThresholdRule
+    airflow_degraded: PowerReferencedRule
     rapid_rise: SlopeRule
     room_high: ThresholdRule
     humidity_out_of_range: RangeRule
@@ -169,6 +213,8 @@ class RuleSet(BaseModel):
                 )
             if isinstance(spec, ThresholdRule) and spec.clear >= spec.threshold:
                 raise ValueError(f"{name}: clear は threshold より小さくする（{rule}）")
+            if isinstance(spec, PowerReferencedRule):
+                _validate_power_referenced(name, spec)
             if isinstance(spec, SlopeRule) and spec.clear >= spec.threshold:
                 raise ValueError(f"{name}: clear は threshold より小さくする（{rule}）")
             if isinstance(spec, RangeRule) and not (
@@ -177,3 +223,19 @@ class RuleSet(BaseModel):
                 raise ValueError(f"{name}: low < low_clear <= high_clear < high とする（{rule}）")
             if isinstance(spec, ConsecutiveRule) and spec.clear_consecutive > spec.consecutive:
                 raise ValueError(f"{name}: clear_consecutive は consecutive 以下にする（{rule}）")
+
+
+def _validate_power_referenced(name: str, rule: PowerReferencedRule) -> None:
+    """期待値の表と閾値の向き（決定記録 0144 §2.6）。
+
+    **表は電力について減らない。** 減る表は「電力が上がると正常の上限が下がる」ことになり、
+    電力が分からないときに使う「表の最大」が最後の点でなくなる。
+    """
+    if rule.clear >= rule.threshold:
+        raise ValueError(f"{name}: clear は threshold より小さくする")
+    points = rule.expected
+    for low, high in pairwise(points):
+        if high.power_w <= low.power_w:
+            raise ValueError(f"{name}: expected の power_w は増える順に並べる")
+        if high.value < low.value:
+            raise ValueError(f"{name}: expected の value は電力について減らないようにする")

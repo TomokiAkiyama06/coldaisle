@@ -24,6 +24,7 @@ from coldaisle.metrics import MetricCatalog, compute_derived
 from coldaisle.rules.models import (
     FlagOffRule,
     HotAndSlowRule,
+    PowerReferencedRule,
     RangeRule,
     RuleSet,
     SlopeRule,
@@ -228,9 +229,18 @@ class Engine:
         self._last_sample_ms = sample.ts_ms
         transitions += self._evaluate_silence()
         transitions += self._evaluate_missing(readings)
-        for name in ("recirculation", "intake_high", "airflow_degraded", "room_high"):
+        for name in ("recirculation", "intake_high"):
             rule = getattr(self.rules, name)
             transitions += self._evaluate_threshold(name, rule, values.get(rule.metric), readings)
+        transitions += self._evaluate_power_referenced(
+            "airflow_degraded",
+            self.rules.airflow_degraded,
+            values.get(self.rules.airflow_degraded.metric),
+            readings,
+        )
+        transitions += self._evaluate_threshold(
+            "room_high", self.rules.room_high, values.get(self.rules.room_high.metric), readings
+        )
         transitions += self._evaluate_range(
             "humidity_out_of_range",
             self.rules.humidity_out_of_range,
@@ -424,6 +434,69 @@ class Engine:
                 )
             return self._continue(rule_id, rule.metric, value, rule.fire_after_s)
         return self._end(rule_id, rule.metric) if state.since_ms is not None else []
+
+    def _evaluate_power_referenced(
+        self,
+        name: str,
+        rule: PowerReferencedRule,
+        value: float | None,
+        readings: Mapping[str, Reading],
+    ) -> list[Transition]:
+        """電力から求めた期待値を超えた分で判定する（FR-406 / 決定記録 0144）。
+
+        値が無い周期は今のしきい値のルールと同じ（0012 §2.8・0139 の取り消し）。
+        電力が分からない周期は**表の最大を期待値にして評価を続ける**（0144 §2.4。黙らない）。
+        行の `threshold` はその時の発火の値（期待値 + 超過の閾値）、`trigger_value` は値そのもの
+        （0144 §2.6）。
+        """
+        if not rule.enabled:
+            return []
+        rule_id = name.upper()
+        if value is None:
+            self._reset_on_missing(rule_id, rule.metric, readings)
+            return []
+        power = self._reference_power(rule)
+        expected = rule.expected_at(power)
+        excess = value - expected
+        state = self._state(rule_id, rule.metric)
+        limit = rule.clear if state.since_ms is not None else rule.threshold
+        if excess <= limit:
+            return self._end(rule_id, rule.metric) if state.since_ms is not None else []
+        if power is None:
+            basis = f"{rule.power_metric} が無い・stale のため表の最大の期待値 {expected:.1f}"
+        else:
+            basis = (
+                f"{rule.power_metric} {power:.0f} W"
+                f"（直近 {rule.power_window_s:.0f} 秒の最大）の期待値 {expected:.1f}"
+            )
+        detail = f"{rule.metric} = {value:.1f}。{basis} を {excess:.1f} 超えている"
+        if state.since_ms is None:
+            return self._begin(
+                rule_id,
+                rule.metric,
+                rule.severity.value,
+                expected + rule.threshold,
+                value,
+                rule.fire_after_s,
+                detail=detail,
+            )
+        return self._continue(rule_id, rule.metric, value, rule.fire_after_s, detail=detail)
+
+    def _reference_power(self, rule: PowerReferencedRule) -> float | None:
+        """参照電力: 直近 `power_window_s` の ok の値の最大（決定記録 0144 §2.3）。
+
+        **最新値が無い・ok でない（stale を含む）なら `None`**（0144 §2.4）。
+        窓の中の古い ok の値で、止まった収集の後の電力を推測しない。
+        stale の閾値は `SqliteStore.latest()` が `config/quality.yaml` で決める
+        （閾値を 2 か所に持たない。0131 §2.3）。
+        """
+        now = self._now_ms
+        current = _current(self.store.latest(at_ms=now), rule.power_metric)
+        if current is None:
+            return None
+        window_ms = int(rule.power_window_s * 1000)
+        peak = self.store.stats(rule.power_metric, now - window_ms, now + 1).max_value
+        return current if peak is None else max(current, peak)
 
     def _evaluate_range(
         self,

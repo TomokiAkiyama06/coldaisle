@@ -62,13 +62,25 @@ rules:
     clear: 38.0
     fire_after_s: 120.0
 
-  # FR-406: 風量低下。GPU が空気に与える熱が増えている
+  # FR-406: 風量低下。GPU が空気に与える熱が、同じ電力のときの正常より大きい（決定記録 0144。provisional）。
+  # d.gpu_delta から「GPU 電力から求めた正常の上限（expected）」を引いた超過で判定する。
+  # 参照電力は power.gpu.0 の直近 power_window_s の最大（下げた直後の余熱で鳴らさない）。
+  # power.gpu.0 が無い・stale（config/quality.yaml）なら expected の最大で評価を続ける。
+  # expected は T4・T5・T7 の定常の最大（0 W 5.0 / 300 W 26.3 / 450 W 33.8 / 600 W 32.6）から置いた。
+  # 電力について減らない表にする（読み込みで検査する）。間は線形、外は端の値
   airflow_degraded:
     enabled: true
     severity: warning
     metric: d.gpu_delta
-    threshold: 20.0
-    clear: 18.0
+    power_metric: power.gpu.0
+    power_window_s: 600.0
+    expected:
+      - {power_w: 0.0, value: 5.0}
+      - {power_w: 300.0, value: 26.5}
+      - {power_w: 450.0, value: 34.0}
+      - {power_w: 600.0, value: 34.0}
+    threshold: 6.0 # 期待値を超えた分（℃）。600 W では d.gpu_delta 40.0 超で発火
+    clear: 4.0
     fire_after_s: 300.0
 
   # FR-407: 急上昇。何かが急に起きている（critical）
