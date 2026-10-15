@@ -258,6 +258,7 @@ src/coldaisle/
   measurement.py # レイヤ横断: メトリクス名の規約と Quality（store は再 export。worker に SQLite 層を載せない）。#261
   daemon.py   # 合成の起点: Source→Normalizer→Store→Rules を束ねる。#8 / #18
   ingest/     # L0: Source実装（serial / mock / replay）、正規化
+  alert_graph.py # 合成の起点の部品: Slack の発火の通知に直近 60 分のグラフを後から添える（専用のスレッド・自分の DB の接続・LLM を使わない）。#334 / 決定記録 0147
   report.py   # 合成の起点: 日次レポート（Store→AI→通知）。#25
   soak.py     # 合成の起点: 連続運転テストの集計（Store を読むだけ）。#47
   server.py   # 合成の起点: 読み取りAPI + AIツールの窓口。#23

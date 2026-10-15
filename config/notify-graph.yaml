@@ -1,0 +1,26 @@
+# Slack の発火の通知に添えるグラフ（#334 / 決定記録 0147）
+#
+# 使うのは COLDAISLE_SLACK_BOT_TOKEN と COLDAISLE_SLACK_CHANNEL が**両方**あるときだけ
+# （Webhook ではファイルを添付できない）。作り方は docs/notifications.md。
+# 添えるのは critical / warning の**発火**だけ（解除・説明・日次レポートには添えない）。
+#
+# **このファイルが読めない・形が不正なら、グラフだけを無効にする**（起動は止めない。
+# 文章の通知は今どおり届く。起動時に error が 1 度残る。0147 §2.7）
+
+enabled: true
+
+# 本文を送った時刻から遡って描く長さ（秒）
+window_s: 3600
+
+# どのアラートにも足すメトリクス。config/metrics.yaml にある名前だけ（無ければグラフを無効にする）
+always_metrics: [air.room]
+
+# これより離れた 2 点は線で結ばない（欠けを欠けとして見せる。秒）
+gap_s: 30
+
+# 画像の幅と、1 つの面（単位ごとに 1 つ）の高さ（px）
+width: 960
+panel_height: 300
+
+# 1 系列あたりの点の上限。超えたら同じ間隔で間引く（直近は必ず残す）
+max_points: 4000
