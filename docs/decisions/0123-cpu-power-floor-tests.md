@@ -5,6 +5,7 @@
 - **Date**: 2026-10-14
 - **Supersedes**: [`0121`](0121-hardware-test-procedure.md) の一部（§2.3 の `*_telemetry_stale` の行のうち「`cpu_power_ms` は入力が無いので
   確定しない」と、§3「悪くなること」の同じ趣旨の項。0122 §5 の 1）
+- **Superseded by**: §2.1 の中間の負荷の行（10 tick に届かなければ合格にしない）と、§2.2 (b) の健全度と Guard の閾値の行と、戻した後の健全度の確かめ方（CI のテストで満たす）は [`0136`](0136-t7-t8-t9-acceptance-exceptions.md)
 - **関連**: [`0119`](0119-safety-values-first-host.md) §2.4 / §2.8 / §2.13 /
   [`0121`](0121-hardware-test-procedure.md) /
   [`0122`](0122-cpu-power-publisher.md)
