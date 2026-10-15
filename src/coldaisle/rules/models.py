@@ -26,8 +26,11 @@ def rule_metrics(rule: BaseModel) -> tuple[str, ...]:
     return tuple(value for key in METRIC_KEYS if isinstance(value := getattr(rule, key, None), str))
 
 
-ValueKind = Literal["metric", "per_minute", "seconds", "samples", "none"]
-"""遷移の `value` が何を表すか（決定記録 0142 §2.4）。通知の `値:` の単位を決める。
+TEXT_KEYS = ("label", "title", "resolved_title", "hint")
+"""人が読む文の項目（決定記録 0142）。閾値ではないので、AI ツールと運用メモリの事実には出さない。"""
+
+ValueKind = Literal["threshold", "range", "slope", "below", "flag", "seconds", "samples", "event"]
+"""遷移の `value` が何を表すか（決定記録 0142 §2.4）。通知の値の行の書き方を決める。
 
 ルールごとに値の意味が違う（`SENSOR_FAULT` は秒数、`RAPID_RISE` は 1 分あたりの変化）。
 メトリクスの単位を機械的に付けると、秒数に `°C` が付く。
@@ -40,16 +43,22 @@ class _Rule(BaseModel):
     enabled: bool
     severity: AlertSeverity
     label: str
-    """人が読む名前（決定記録 0142 §2.3）。**必須。** 通知と日次レポートに出る。
+    """短い名前（決定記録 0142 §2.3）。日次レポートの表に出る。"""
+    title: str
+    """発火の通知の見出しの文（例「GPU の吸気温度が急上昇しています」）。"""
+    resolved_title: str
+    """解除の通知の見出しの文（例「GPU の吸気温度の急上昇が収まりました」）。"""
+    hint: str
+    """発火の通知に載せる「確かめること」の一文。
 
-    省略を許すと、書き漏らしが英語の ID の通知として静かに通る。
+    4 つとも**必須**。省略を許すと、書き漏らしが ID だけの通知・手掛かりの無い通知として静かに通る。
     """
 
-    @field_validator("label")
+    @field_validator("label", "title", "resolved_title", "hint")
     @classmethod
-    def _label_is_not_blank(cls, value: str) -> str:
+    def _text_is_not_blank(cls, value: str) -> str:
         if not value.strip():
-            raise ValueError("label が空")
+            raise ValueError("空の文")
         return value
 
 
@@ -162,10 +171,6 @@ class RuleSet(BaseModel):
         """`RULE_ID`（ルールの名前の大文字）→ 人が読む名前（決定記録 0142 §2.3）。"""
         return {name.upper(): rule.label for name, rule in self}
 
-    def metrics_by_rule(self) -> dict[str, tuple[str, ...]]:
-        """`RULE_ID` → 定義が参照するメトリクス（決定記録 0142 §2.2a。通知の `現在値:` を絞る）。"""
-        return {name.upper(): rule_metrics(rule) for name, rule in self}
-
     def value_kinds(self) -> dict[str, ValueKind]:
         """`RULE_ID` → 遷移の `value` の意味（決定記録 0142 §2.4）。**ルールの型で決める。**"""
         return {name.upper(): _value_kind(rule) for name, rule in self}
@@ -213,12 +218,17 @@ class RuleSet(BaseModel):
 
 def _value_kind(rule: BaseModel) -> ValueKind:
     """ルールの型から値の意味を決める。ルールの名前（ID）で分岐しない。"""
-    if isinstance(rule, SlopeRule):
-        return "per_minute"
-    if isinstance(rule, SilenceRule):
-        return "seconds"
-    if isinstance(rule, ConsecutiveRule):
-        return "samples"
-    if isinstance(rule, EventRule):
-        return "none"
-    return "metric"
+    kinds: tuple[tuple[type[BaseModel], ValueKind], ...] = (
+        (ThresholdRule, "threshold"),
+        (RangeRule, "range"),
+        (SlopeRule, "slope"),
+        (HotAndSlowRule, "below"),
+        (FlagOffRule, "flag"),
+        (SilenceRule, "seconds"),
+        (ConsecutiveRule, "samples"),
+        (EventRule, "event"),
+    )
+    for model, kind in kinds:
+        if isinstance(rule, model):
+            return kind
+    raise TypeError(f"値の意味が決まっていないルールの型: {type(rule).__name__}")

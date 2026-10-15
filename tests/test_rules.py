@@ -7,6 +7,8 @@
 鳴りっぱなしのアラートは、鳴らないアラートと同じくらい役に立たない。
 """
 
+import re
+
 import pytest
 
 from coldaisle.clock import SimulatedClock
@@ -588,13 +590,14 @@ def test_firing_and_resolution_reach_the_notifier(tmp_path):
     assert fired, "発火が通知されていない"
     assert fired[0].rule_id == "RECIRCULATION"
     assert "air.room" in fired[0].context, "本文に現在値が載る"
-    # 現在値は派生値・その材料・室温だけ（決定記録 0142 §2.2a）
-    readings = next(line for line in fired[0].as_text().splitlines() if line.startswith("現在値:"))
-    assert [part.split("=")[0] for part in readings.removeprefix("現在値: ").split(", ")] == [
+    # 値の行は対象の値（閾値の超過）・派生値の材料・室温だけ（決定記録 0142 §2.2 / §2.2a）
+    readings = fired[0].as_text().splitlines()[1].split("・")
+    assert [part.split(" ")[0] for part in readings] == [
         "吸気上昇（再循環の指標）",
         "前面吸気",
         "室温",
     ]
+    assert "（閾値 5.0 °C を超過）" in readings[0]
     assert fired[0].dashboard_url
 
 
@@ -665,10 +668,10 @@ def test_notify_check_scenario_reaches_each_target_once(tmp_path):
     # 語は日本語で、最後の行に ID を残す（決定記録 0142）。docs/notifications.md §2 の表と同じ文字列
     alerts = [item for item in received["slack"] if item.kind == "alert"]
     assert [item.title for item in alerts] == [
-        "🔴 [重大] 温度の急上昇（GPU吸気）— 発生",
-        "✅ [重大 解除] 温度の急上昇（GPU吸気）— 解除",
-        "🟠 [警告] GPU吸気が高い（GPU吸気）— 発生",
-        "✅ [警告 解除] GPU吸気が高い（GPU吸気）— 解除",
+        "🔴 [重大] GPU の吸気温度が急上昇しています",
+        "✅ [重大 解除] GPU の吸気温度の急上昇が収まりました",
+        "🟠 [警告] GPU の吸気温度が高くなっています",
+        "✅ [警告 解除] GPU の吸気温度が下がりました",
     ]
     assert [item.as_text().splitlines()[-1] for item in alerts] == [
         "RAPID_RISE / air.gpu_intake",
@@ -676,10 +679,17 @@ def test_notify_check_scenario_reaches_each_target_once(tmp_path):
         "INTAKE_HIGH / air.gpu_intake",
         "INTAKE_HIGH / air.gpu_intake",
     ]
+    # 所有者が了承した形（決定記録 0142 §2.2）。数は走らせるたびに少し違うので形で見る。
+    # 既定のダッシュボードはループバックなので URL は出ない
     firing = alerts[0].as_text().splitlines()
-    assert firing[1].startswith("値: ") and firing[1].endswith(" °C/分")
-    assert firing[3].startswith("現在値: GPU吸気=") and firing[3].endswith(" °C")
-    assert firing[3].count("=") == 2, "関係する値（GPU吸気）と室温だけ（決定記録 0142 §2.2a）"
+    assert len(firing) == 4
+    assert re.fullmatch(r"GPU吸気 \d+\.\d °C（1 分で \+\d+\.\d °C）・室温 \d+\.\d °C", firing[1])
+    assert firing[2] == "GPU の前が塞がれていないか、排気が回り込んでいないかを確認してください。"
+    resolved = alerts[1].as_text().splitlines()
+    assert len(resolved) == 3
+    assert re.fullmatch(r"GPU吸気 \d+\.\d °C・室温 \d+\.\d °C", resolved[1])
+    warning = alerts[2].as_text().splitlines()
+    assert re.fullmatch(r"GPU吸気 \d+\.\d °C（閾値 40\.0 °C を超過）・室温 \d+\.\d °C", warning[1])
     # 手順書（docs/notifications.md §3）が終了時のログで見る数
     assert daemon.stats.notifications == 4
 

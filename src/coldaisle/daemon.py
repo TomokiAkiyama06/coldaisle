@@ -181,9 +181,7 @@ class Daemon:
             DisplayNames()
             if engine is None or notifier is None
             else DisplayNames.build(
-                rule_labels=engine.rules.labels(),
-                value_kinds=engine.rules.value_kinds(),
-                rule_metrics=engine.rules.metrics_by_rule(),
+                rules=engine.rules,
                 catalog=engine.catalog,
                 context_always=notifier.config.context_always,
             )

@@ -26,7 +26,7 @@ from coldaisle import logs
 from coldaisle.clock import Clock
 from coldaisle.llm_exclusions import LlmExclusions
 from coldaisle.metrics import MetricCatalog, compute_derived
-from coldaisle.rules.models import RuleSet, rule_metrics
+from coldaisle.rules.models import TEXT_KEYS, RuleSet, rule_metrics
 from coldaisle.store import Aggregation, SqliteStore
 from coldaisle.store.db import MINUTE_MS
 from coldaisle.store.models import Stats, validate_metric
@@ -424,8 +424,8 @@ class ToolRegistry:
         抜けたまま説明させると、モデルは無い情報を埋めようとする。
         """
         return {
-            # 名前（label）は閾値ではないので渡さない（決定記録 0142 §2.7）
-            name.upper(): rule.model_dump(mode="json", exclude={"label"})
+            # 名前・文・hint は閾値ではないので渡さない（決定記録 0142 §2.7）
+            name.upper(): rule.model_dump(mode="json", exclude=set(TEXT_KEYS))
             for name, rule in self.rules
             # 除外の rule_id と、除外のメトリクスを指すルールの行を出さない（0131 §2.4a）
             if not self.exclusions.excludes_rule(name.upper())
