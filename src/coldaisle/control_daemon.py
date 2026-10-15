@@ -1104,6 +1104,7 @@ def build(
             learned=learned,
             learned_calibration=learned_calibration,
             metric_catalog_sha256=metric_catalog_sha256,
+            run_id=run_id,
         )
     except BaseException:
         if isinstance(learned, LearnedChannelEntry):
@@ -1348,6 +1349,7 @@ def _build_loop(
     learned: LearnedChannelEntry | DisabledLearnedChannel | None,
     learned_calibration: AvailableCalibration | UnavailableCalibration,
     metric_catalog_sha256: str,
+    run_id: str,
 ) -> ControlLoop:
     safety = CriticalSafety(
         control.safety,
@@ -1383,6 +1385,9 @@ def _build_loop(
         # 移っても書き換えない（役割を閉じるだけ）。frame の `expected_artifacts` も loop が
         # ここから作る
         registry=registry_binding.provenance,
+        # **管理ソケットの監査・Learned の経路の封筒と同じ run_id を毎 tick の trace に載せる**
+        # （v16。決定記録 0133 §2.9）。`--no-admin` でも載せる
+        run_id=run_id,
         # **モードの出どころは1つ。** 管理ソケットを開けたら受け渡し口、開けなければ常に AUTO
         # （0072 §2.2。開かなかった入口は死んだとは扱わない）
         mode_source=None if admin is not None else StaticOperatingMode(),

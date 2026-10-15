@@ -127,6 +127,7 @@ from coldaisle.store import SqliteStore
 from coldaisle.store.models import Quality
 from conftest import TEST_EPOCH_MS
 from test_control_config import valid_documents, write_documents
+from test_control_schema import TRACE_RUN_ID
 from test_model_registry import (
     COMPATIBILITY as REGISTRY_COMPATIBILITY,
 )
@@ -488,6 +489,8 @@ class Harness:
             clock=self.clock,
             monotonic=self.monotonic,
             registry=registry if registry is not None else RegistryProvenance.unbound(),
+            # 管理ソケットの受け渡し口と同じ run_id を渡す（決定記録 0133 §2.9 / 0077 §2.3）
+            run_id=TRACE_RUN_ID if admin_mode is None else admin_mode.run_id,
             mode_source=self.mode if admin_mode is None else None,
             admin_mode=admin_mode,
             supervisor=(
@@ -1142,8 +1145,47 @@ def test_invariant_12_every_tick_records_that_no_registry_was_read(catalog) -> N
     for result in results:
         assert result.tick.registry == RegistryProvenance.unbound()
     recorded = json.loads(harness.trace.rows[-1])
-    assert recorded["schema_version"] == SCHEMA_VERSION == 15
+    assert recorded["schema_version"] == SCHEMA_VERSION == 16
     assert recorded["registry"] == {"schema_version": 1, "revision": None, "production": {}}
+
+
+def test_every_tick_records_the_run_id_without_an_admin_entry(catalog) -> None:
+    """管理ソケットを開かない構成（`--no-admin`）でも、毎 tick 起動ごとの run_id を載せる（v16）。
+
+    ``hint_shadow_records`` との突き合わせは最上位の run_id を使う（決定記録 0133 §2.5a / §2.9）。
+    ``mode_command.run_id`` は入口の無い構成で None なので、そちらに頼らない。
+    """
+    harness = Harness(catalog)
+
+    results = [harness.tick(), harness.settle()]
+
+    for result in results:
+        assert result.tick.run_id == TRACE_RUN_ID
+        assert result.tick.mode_command.run_id is None
+    for row in harness.trace.rows:
+        assert json.loads(row)["run_id"] == TRACE_RUN_ID
+
+
+@pytest.mark.parametrize("run_id", ["", "0123", "0123456789ABCDEF" * 2])
+def test_a_loop_refuses_a_run_id_of_another_shape(catalog, run_id: str) -> None:
+    """既定値を置かず、形の違う値を起動時に拒む。tick の途中で trace を作れない状態にしない。"""
+    loop = Harness(catalog).loop
+    with pytest.raises(ValueError, match="run_id"):
+        ControlLoop(
+            config=loop._config,
+            estimator=loop._estimator,
+            fallback=loop._fallback,
+            gate=loop._gate,
+            guard=loop._guard,
+            safety=loop._safety,
+            composer=loop._composer,
+            backend=loop._backend,
+            telemetry=loop._telemetry,
+            clock=loop._clock,
+            monotonic=loop._monotonic,
+            registry=loop._registry,
+            run_id=run_id,
+        )
 
 
 def test_invariant_12_every_tick_records_the_production_pointer_it_used(

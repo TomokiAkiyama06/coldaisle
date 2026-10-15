@@ -9,6 +9,10 @@ raw_days: 30
 # Control decision trace の保持日数。1秒周期でも保存容量を無制限に増やさない。
 # 値の根拠と変更手順は Decision Record 0030 を参照する。
 control_trace_days: 30
+# Workload Hint Stage B の B1 で、ヒント有りの solve の記録（hint_shadow_records）の保持日数。
+# 突き合わせる相手の decision trace より長く残しても join できないため、control_trace_days と
+# 同じ値にする（決定記録 0133 §2.5a）。control_trace_days を変えるときは一緒に変える
+hint_shadow_days: 30
 
 # 日次CSV（FR-205）の出力先。`~` は展開する
 csv_dir: "~/server_sensor_logs"

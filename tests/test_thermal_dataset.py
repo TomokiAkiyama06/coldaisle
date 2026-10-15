@@ -1281,6 +1281,9 @@ def _tick_for_schema_version(version: int, *, ts_ms: int, tick_id: int) -> Contr
             "health": "normal",
             "guard_threshold_profile": "normal",
         }
+    if version >= 16:
+        # v16 も同じく、fand の起動ごとの run_id を省いた記録を作れない（#288 / 決定記録 0133 §2.9）
+        raw["run_id"] = "0123456789abcdef" * 2
     return ControlTick.model_validate_json(json.dumps(raw))
 
 

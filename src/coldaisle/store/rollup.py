@@ -48,6 +48,13 @@ class RetentionRules(BaseModel):
     control_trace_days: int = Field(gt=0)
     """Control decision trace の保持日数。保存容量を無制限に増やさない。"""
 
+    hint_shadow_days: int = Field(gt=0)
+    """ヒント有りの solve の記録（``hint_shadow_records``）の保持日数（決定記録 0133 §2.5a）。
+
+    突き合わせる相手の trace より長く残しても join できないので、設定の値は
+    ``control_trace_days`` と同じにする（既定値はコードに置かない。ルール 9）。
+    """
+
     csv_dir: str
     """日次CSV（FR-205）の出力先。`~` を含んでよい。"""
 
@@ -80,6 +87,10 @@ class RetentionRules(BaseModel):
     def control_trace_retention_ms(self) -> int:
         return self.control_trace_days * DAY_MS
 
+    @property
+    def hint_shadow_retention_ms(self) -> int:
+        return self.hint_shadow_days * DAY_MS
+
 
 @dataclass(frozen=True)
 class Result:
@@ -94,6 +105,8 @@ class Result:
     control_trace_cutoff_ms: int | None = None
     future_control_traces: int = 0
     """実行時刻より未来の ``ts_ms`` を持つ trace の件数。時計の異常の手がかり（0071 §2.2a）。"""
+    deleted_hint_shadow: int = 0
+    hint_shadow_cutoff_ms: int | None = None
 
 
 def rollup_minutes(
@@ -455,6 +468,10 @@ def run(
     # 同じトランザクションで進める（決定記録 0071 §2.2a）
     deleted_traces = store.delete_control_traces_before(trace_cutoff)
     future_traces = store.count_control_traces_after(now_ms)
+    # ヒント有りの記録は元の tick の時刻（`source_ts_ms`）で消す。突き合わせる trace と
+    # 同じ時刻で古くなる（決定記録 0133 §2.5a）
+    hint_shadow_cutoff = max(0, now_ms - rules.hint_shadow_retention_ms)
+    deleted_hint_shadow = store.delete_hint_shadow_before(hint_shadow_cutoff)
     return Result(
         minute_buckets=minutes,
         hour_buckets=hours,
@@ -463,6 +480,8 @@ def run(
         deleted_control_traces=deleted_traces,
         control_trace_cutoff_ms=trace_cutoff,
         future_control_traces=future_traces,
+        deleted_hint_shadow=deleted_hint_shadow,
+        hint_shadow_cutoff_ms=hint_shadow_cutoff,
     )
 
 
@@ -531,6 +550,9 @@ def main(
                     "control_trace_cutoff_ms": result.control_trace_cutoff_ms,
                     "control_trace_days": rules.control_trace_days,
                     "future_control_traces": result.future_control_traces,
+                    "deleted_hint_shadow": result.deleted_hint_shadow,
+                    "hint_shadow_cutoff_ms": result.hint_shadow_cutoff_ms,
+                    "hint_shadow_days": rules.hint_shadow_days,
                 }
             },
         )

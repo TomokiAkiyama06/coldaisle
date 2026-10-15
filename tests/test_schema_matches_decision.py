@@ -126,6 +126,10 @@ def test_migration_creates_exactly_the_decided_objects():
         ("trigger", "workload_hint_backfill_boundaries_no_delete"),
         ("trigger", "workload_hint_terminal_states_no_update"),
         ("trigger", "workload_hint_terminal_states_no_delete"),
+        # 0016: Workload Hint Stage B の B1 のヒント有りの記録（決定記録 0133 §2.5a）
+        ("table", "hint_shadow_records"),
+        ("index", "ix_hint_shadow_records_source"),
+        ("trigger", "hint_shadow_records_no_update"),
     }
 
 

@@ -62,6 +62,7 @@ from test_control_schema import (
     REGISTRY_PROVENANCE,
     SAFETY_PROVENANCE,
     TELEMETRY_HEALTH_RECORD,
+    TRACE_RUN_ID,
     fallback_state,
     forced,
     passthrough,
@@ -193,6 +194,7 @@ class Fixture:
             air_balance_coordination=record,
             tach_unconfirmed_zones=(),
             telemetry_health=TELEMETRY_HEALTH_RECORD,
+            run_id=TRACE_RUN_ID,
             faults=faults,
         )
 
@@ -525,6 +527,7 @@ def test_a_trace_without_coordination_rejects_the_run(setup: Fixture) -> None:
     del body["air_balance_coordination"]
     del body["tach_unconfirmed_zones"]
     del body["telemetry_health"]
+    del body["run_id"]
     row = ControlTraceRecord(
         ts_ms=tick.ts_ms, tick_id=tick.tick_id, schema_version=13, trace_json=json.dumps(body)
     )
