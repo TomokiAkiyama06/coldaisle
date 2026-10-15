@@ -182,8 +182,14 @@ A では同じことが **1 サンプルの欠け**で起き、`SENSOR_MISSING` 
 - `_hydrate()` が DB から読み戻した `SENSOR_MISSING` / `SENSOR_FAULT` の発火中の状態は、2.3.1・2.3.3 の「発火中」としてそのまま使う
 - **復元の時の取り消し（移行を含む）**: `_hydrate()` の終わりに、読み戻した 5 つのルールの pending（未発火）のうち、
   次のどちらかに当たるものを取り消す（行を消し `since_ms` を戻す。遷移は配らない）
-  - その入力のメトリクス（派生値なら `minuend` / `subtrahend`）の `SENSOR_MISSING` が発火中で読み戻された
-  - `SENSOR_FAULT` が発火中で読み戻された
+  - その入力のメトリクス（派生値なら `minuend` / `subtrahend`）の `SENSOR_MISSING` が発火中で読み戻され、**いまの設定で `sensor_missing.enabled: true`**
+  - `SENSOR_FAULT` が発火中で読み戻され、**いまの設定で `sensor_fault.enabled: true`**
+
+  故障ルールを無効にした後に発火中の行が DB に残っている場合（今の `_hydrate()` は `enabled` を見ずに復元する）は、その行を理由に取り消さない
+  （2.3.1・2.3.3 の「故障ルールが無効なら取り消さない」と揃える）。無効にしたルールの残った行そのものの扱いは今のまま変えない
+- **復元で読むアラート**: 今の `_hydrate()` は `store.alerts(limit=1_000)` で解決済みを含む新しい 1000 件だけを読むので、
+  古い発火中の故障アラートや pending が窓の外に落ちうる。復元は**件数の上限なしに、有効な（`pending` / `firing` の）アラートだけを読む**
+  問い合わせで行う（`SqliteStore` に足す。`state IN ('pending', 'firing')` の条件で、解決済みの行の数に影響されない）
   発火中の故障アラートは既に人に届いているので、黙った遅れにならない。発火の時刻の前後は比べない（故障アラートが先に発火していて、
   その解除を待つ間に pending が始まった場合も取り消す。安全側に、観測の切れ目をまたいだ継続を数えない）。
   **本記録の振る舞いを初めて入れる更新**では、更新の前のエンジンが取り消さずに残した「発火中の故障アラート」と「同じ空白をまたいで pending のままの
@@ -221,7 +227,8 @@ A では同じことが **1 サンプルの欠け**で起き、`SENSOR_MISSING` 
 | `_evaluate_silence()` | 評価の基準の時刻を引数で受けられるようにする（`on_tick()` は今の時刻、`on_sample()` は直前のサンプルの時刻との差）。`SENSOR_FAULT` が発火した評価で 5 つのルールの pending を取り消す |
 | `_evaluate_threshold()` / `_evaluate_range()` | `value is None` の分岐で 2.3.1 の条件を見て、満たせば pending を取り消す（firing なら何もしない） |
 | `RuleState` | 変えない（独立の欠けの数を持たない） |
-| `_hydrate()` | 読み戻しの終わりに、発火中の `SENSOR_MISSING`（入力のメトリクス）/ `SENSOR_FAULT` に依る pending を取り消す（2.3.2。移行を含む） |
+| `_hydrate()` | 有効なアラートだけを上限なしに読む問い合わせに替え、読み戻しの終わりに、発火中でいま有効な `SENSOR_MISSING`（入力のメトリクス）/ `SENSOR_FAULT` に依る pending を取り消す（2.3.2。移行を含む） |
+| `src/coldaisle/store/db.py`（`SqliteStore`） | 有効な（`pending` / `firing`）アラートだけを件数の上限なしに返す読み出しを足す |
 | `begin()` | 変えない（2.3.2） |
 | `src/coldaisle/rules/models.py`（ルールの設定の型） | 変えない（新しい項目を足さない） |
 | `config/rules.yaml` | 値は変えない。冒頭の説明に「`SENSOR_MISSING` / `SENSOR_FAULT` が発火したら、その入力に依る発火待ちを数え直す」を 1 行足す |
@@ -247,6 +254,10 @@ A では同じことが **1 サンプルの欠け**で起き、`SENSOR_MISSING` 
   `started_ms` を持つ pending の `ROOM_HIGH`（および `RECIRCULATION`）を置いて起動し、最初のサンプルが ok で閾値を超えていても発火せず、
   そのサンプルの時刻から数え直すこと。発火中の `SENSOR_FAULT` と pending の 5 つのルールでも同じこと。入力に関係しない
   `SENSOR_MISSING`（例: `air.top_exhaust`）だけが発火中なら、`INTAKE_HIGH` の pending を引き継ぐこと。発火中（firing）のしきい値のアラートは取り消さないこと
+- **無効化した後の残った行**: `sensor_missing.enabled: false`（または `sensor_fault.enabled: false`）にした設定で、以前の発火中の
+  `SENSOR_MISSING`（`SENSOR_FAULT`）の行と依存する pending が DB に残ったまま起動したとき、pending を取り消さず引き継ぐこと
+- **復元の窓**: 発火中の `SENSOR_MISSING` と依存する pending より新しい解決済みのアラートが 1000 件を超える DB で起動しても、
+  両方が復元され、復元の時の取り消しが働くこと（発火中の故障アラートの無い pending は引き継がれること）
 - **無音（実時間）**: 20 s の無音では pending を保つこと。30 s の無音で `on_tick()` が `SENSOR_FAULT` を発火させた評価で取り消され、
   再開の後に数え直すこと。`SENSOR_FAULT` の解除の時刻が今と同じこと
 - **無音（一括再生）**: `on_tick()` を呼ばずにサンプルを流し、サンプルの時刻に 30 s 以上の空白があるとき、空白の後の最初のサンプルの時刻で
