@@ -347,6 +347,11 @@ ASSESSED = json.dumps(
 # 出荷の一覧そのもの（config/report.yaml。0131 §2.4a / 0138）
 SHIPPED_EXCLUSIONS = LlmExclusions.from_yaml(CONFIG_DIR / "report.yaml")
 
+# 除外の仕組みを確かめるための一覧（出荷の一覧は 0146 で空。仕組みは残る。0131 §2.4a）
+FAN_EXCLUSIONS = LlmExclusions.from_mapping(
+    {"llm_excluded_metrics": ["gpu.*.fan_policy", "gpu.*.fan_speed"], "llm_excluded_rules": []}
+)
+
 
 @pytest.fixture
 def loaded_store(tmp_path, rules):
@@ -401,8 +406,11 @@ def test_load_and_temperature_aggregates_are_in_the_material(loaded_store):
 
 
 def test_excluded_metrics_never_reach_the_material(loaded_store):
-    """**0131 / 0138 の除外は必ず当たる。** 設定に書いても材料にならない。"""
-    explainer, provider = _explainer(loaded_store)
+    """**除外の一覧に当たるメトリクスは、設定に書いても材料にならない**（0131 §2.4a の仕組み）。"""
+    provider = FakeProvider(ASSESSED)
+    explainer = Explainer(
+        provider=provider, tools=_registry(loaded_store, FAN_EXCLUSIONS), context=CONTEXT
+    )
     evidence = explainer.build_evidence(alert())
     explainer.explain(alert())
     text = "\n".join(item.text for item in evidence) + provider.prompts[0]
@@ -412,17 +420,34 @@ def test_excluded_metrics_never_reach_the_material(loaded_store):
 
 
 def test_shipped_context_avoids_the_exclusion_list():
-    """出荷の `explain_context` に、LLM へ渡さない一覧のメトリクスを書かない（見張り）。"""
+    """出荷の `explain_context` に、LLM へ渡さない一覧のメトリクスを書かない（見張り）。
+
+    0146 で GPU の Fan の目標値（`gpu.0.fan_speed`）を読めるようになったので材料に含める。
+    """
     settings = AiSettings.from_yaml(CONFIG_DIR / "ai.yaml")
     assert settings.explain_context is not None
     catalog = MetricCatalog.from_yaml(CONFIG_DIR / "metrics.yaml")
-    # 前提: 出荷の一覧が GPU の Fan を除いている（この PR では除外を当てたまま。0146 は別）
-    assert SHIPPED_EXCLUSIONS.excludes_metric("gpu.0.fan_speed")
-    assert SHIPPED_EXCLUSIONS.excludes_metric("gpu.0.fan_policy")
+    assert "gpu.0.fan_speed" in settings.explain_context.metrics
     for metric in settings.explain_context.metrics:
         assert not SHIPPED_EXCLUSIONS.excludes_metric_or_inputs(metric, catalog), metric
         assert metric in catalog.metrics, metric
-        assert "fan" not in metric, "explain_context に Fan を足さない（0146 の FINAL の後に別で）"
+
+
+def test_fan_speed_reaches_the_material_with_the_shipped_list(loaded_store):
+    """0146: 出荷の一覧のもとでは GPU の Fan の目標値も材料に入る。"""
+    explainer, provider = _explainer(loaded_store)
+    assert explainer.explain(alert()) is not None
+    assert "gpu.0.fan_speed 発火前15m: 平均 63.00" in provider.prompts[0]
+    assert "目標値" in provider.prompts[0]
+
+
+def test_prompt_says_fan_speed_is_a_target(tools):
+    provider = FakeProvider(ANSWER)
+    Explainer(provider=provider, tools=tools).explain(alert())
+    assert "目標値" in provider.prompts[0]
+    assert "GPU の Fan 速度は実回転ではなく" in provider.prompts[0]
+    # 除外の一覧に当たるときにメトリクス名をプロンプトに出さない（0131 §2.4a の仕組みを崩さない）
+    assert "fan_speed" not in provider.prompts[0]
 
 
 def test_no_context_keeps_the_old_material(loaded_store):

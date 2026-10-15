@@ -137,15 +137,15 @@ Server Health の任意要約は、API を `coldaisle.server:app` で起動し�
 
 - **送るのは今のローカル LLM に渡すのと同じ集計値だけです**（日次レポートの表・アラートの Evidence の行・
   `coldaisle.server:app` のときの Server Health の固定の文）。生の時系列・decision trace・ツールの結果・案件資料（`coldaisle-escalate`）は送りません
-- `config/report.yaml` の除外（`llm_excluded_metrics` / `llm_excluded_rules`。0131 §2.4a / 0138）はそのまま当たります
+- `config/report.yaml` の除外（`llm_excluded_metrics` / `llm_excluded_rules`。0131 §2.4a）はそのまま当たります。
+  0146 で一覧は空になり、GPU の Fan の値（目標値の %）もローカル LLM と同じく送ります
 - 1 回の長さ・1 日の回数の上限と `effort`（既定は送らない）は `config/ai.yaml` の `anthropic:` です。上限に達したら呼ばずに、
   所見・説明の無い今の形で届きます（監視と通知は止まりません。FR-507）
 - 鍵はログ・応答の `reason`・通知に出ません（失敗の理由は HTTP の状態コードと `error.type` だけ）
 
 ### 導入先で有効にする
 
-**前提: 決定記録 0143 が承認され、0138 の実装（#320）と本機能が `/opt/coldaisle` に入っていること。**
-0138 の前は `gpu.*.fan_speed` が LLM の入力に残っており、それが外へ出ます。
+**前提: 決定記録 0143 が承認され、本機能が `/opt/coldaisle` に入っていること。**
 
 1. Anthropic の Console で、この鍵の月の上限（spend limit）を設定する（費用の正本。`config/ai.yaml` の上限は粗い蓋）
 2. 鍵の変数名が `ANTHROPIC_API_KEY` であることを、**値を表示せずに**確かめる

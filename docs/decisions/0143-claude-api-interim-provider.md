@@ -13,7 +13,7 @@
   [`0015`](0015-llm-tools.md) / [`0016`](0016-evidence-alerts.md) / [`0017`](0017-daily-report.md) /
   [`0018`](0018-tool-exposure.md) / [`0019`](0019-claude-escalation.md) /
   [`0013`](0013-notifications.md) §2.1 / [`0131`](0131-gpu-fan-service-alert.md) §2.4a /
-  [`0138`](0138-gpu-fan-speed-llm-exclusion.md) / [`0040`](0040-server-health-api.md) /
+  [`0138`](0138-gpu-fan-speed-llm-exclusion.md) / [`0146`](0146-llm-reads-gpu-fan.md) / [`0040`](0040-server-health-api.md) /
   `docs/requirements.md` FR-501 / FR-504 / FR-505 / FR-506 / FR-507 / FR-508 /
   AGENTS.md ルール 1 / 8 / 9 / 10 / #58 / #305 / #306
 - **対象 Issue**: #324
@@ -80,15 +80,17 @@ Provider は呼び出し側が組み立てた `ChatMessage` の列をそのま�
 | Server Health の任意要約（`coldaisle.server:app` のときだけ） | 固定のテンプレートの文 1 つ（0040） |
 
 - 生の時系列は送らない（ルール 8 / FR-504）。今の経路がそもそも渡していない
-- 0131 §2.4a / 0138 の除外（`config/report.yaml` の `llm_excluded_metrics` / `llm_excluded_rules`）はそのまま当たる。
+- 0131 §2.4a の除外の仕組み（`config/report.yaml` の `llm_excluded_metrics` / `llm_excluded_rules`）はそのまま当たる。
+  0146 で一覧は空になり、GPU の Fan の値（`gpu.*.fan_speed` / `gpu.*.fan_policy` と `GPU_FAN_*` のアラート）も
+  ローカル LLM と同じく渡る（Claude だけ別に絞らない。送る内容を Provider で変えない §2.3 の原則どおり）。
   除外の一覧が読めなければ、今と同じく LLM を呼ばない
 - **decision trace（`/api/v1/control/*`）は送らない**（0071。今も LLM へ渡す経路が無い）
 - **ツールは送らない。** `AnthropicProvider.chat()` は `tools` が渡されたら呼ばずに「利用不可」を返す。
   今の 3 経路はどれもツールを渡していない。ツールの結果を外へ流す経路を、この記録の範囲で開かない
   （AI ツールの窓口 `/api/v1/tools`（0018）は Workspace が呼ぶ GET であり、本記録とは関係しない）
 - **0019 の案件資料は送らない。** `coldaisle-escalate` は Provider を使わない（0019 §2.1 のまま）
-- **前提: 0138 の実装（#320）が `main` に入るまで、導入先で `anthropic` を選ばない。**
-  入る前は既存の `gpu.*.fan_speed` が LLM の入力に残っており（0138 §1）、外へ出ることになるため
+- 前提だった 0138 の実装（#320）は `main` に入り、その後 0146 が GPU の Fan の値を LLM へ渡すと決めた（FINAL）。
+  GPU の Fan の値が外へ出ることは 0146 の判断に含まれる
 
 ### 2.4 鍵: 環境変数 `ANTHROPIC_API_KEY` だけ。ログ・例外の文・通知に出さない
 
@@ -183,12 +185,15 @@ Provider に依らず同じものを通る。
 - **材料（VERIFIED の L1 の行を足す）:** `config/ai.yaml` の `explain_context` に書いたメトリクスごとに、
   **発火の時刻（`fired_ms`）で終わる窓**（`window`。出荷は `15m`。説明が待ち行列で遅れても発火の前の状態を見る）の
   **平均・最大・傾き（/分）と件数だけ**を、コードが `get_stats` で組み立てて 1 行にする。生の時系列は渡さない（ルール 8）。
-  出荷の一覧は `gpu.0.utilization`・`power.gpu.0`・`gpu.0.core`・`cpu.utilization`・`power.cpu.package`・
+  出荷の一覧は `gpu.0.utilization`・`power.gpu.0`・`gpu.0.core`・`gpu.0.fan_speed`（0146。実回転ではなく
+  NVML の目標値の %。各行の末尾に `config/metrics.yaml` の表示名を添え、プロンプトに「表示名に目標値とあるものは
+  実測ではない（GPU の Fan 速度は実回転ではなく目標値の %）」と 1 行添える。プロンプトにはメトリクス名を書かず、
+  除外の一覧に当たるときに名前が出ない仕組み（0131 §2.4a）を崩さない）・`cpu.utilization`・`power.cpu.package`・
   `cpu.package`・室温（`air.room`）と吸排気（`air.front_intake`・`air.gpu_intake`・`air.gpu_exhaust`・
   `air.top_exhaust`・`air.rear_exhaust`）。16 個まで。`explain_context` が無ければ今のまま足さない
-- **除外は必ず当たる:** 集計は除外を当てたツールを通すので、0131 §2.4a / 0138 の一覧に当たるメトリクス
-  （`gpu.*.fan_speed`・`gpu.*.fan_policy` など）は設定に書いても行にならない。出荷の一覧が除外に当たらないことは
-  CI のテストで見張る（0138 の一覧を足した形でも確かめる）
+- **除外は必ず当たる:** 集計は除外を当てたツールを通すので、0131 §2.4a の一覧に当たるメトリクスは
+  設定に書いても行にならない（仕組みはテストで確かめる。出荷の一覧は 0146 で空）。出荷の `explain_context` が
+  出荷の一覧に当たらないことは CI のテストで見張る
 - **出力（見立て）:** モデルに `assessment` を足して書かせる。指示は「負荷（使用率・電力）の変化と温度の関係から、
   空調・筐体内の回り込み・Fan の不足・負荷の増加のどれが近いかを見立て、根拠の値を挙げる。日本語の 3〜4 文」。
   通知では「見立て（L3 推測・未検証）」の節に `? ` を付けて出す（UNVERIFIED の後・確認手順の前）
@@ -205,7 +210,7 @@ Provider に依らず同じものを通る。
 
 - ローカル LLM が無くても、日次レポートの所見とアラートの説明が付く
 - 既定は今のまま。`COLDAISLE_LLM_PROVIDER` を消すだけで外への送信が止まる
-- 送る内容は今と同じ集計値で、除外（0131 / 0138）・出力の検査（0016 / 0017）も同じものを通る
+- 送る内容は今と同じ集計値で、除外（0131 の仕組み。一覧は 0146）・出力の検査（0016 / 0017）も同じものを通る
 
 ### 悪くなること・その緩和
 

@@ -1,10 +1,14 @@
-"""LLM へ GPU の Fan の事実を渡さない（決定記録 0131 §2.4a / §2.6）。
+"""LLM へ渡さない一覧の仕組み（決定記録 0131 §2.4a / 0138 §2.3。0146 §2.2 が引き継ぐ）。
 
 **LLM へ渡すものは、除外の一覧を当てた後の集合だけから作る**（件数・時刻・欠けの注記など
 派生した値を含む）。人が見る決定論的な出力は、除く前の集合から作る。
 
 経路は 0131 §2.4a の表のとおり: 日次レポートの所見・AI ツールの窓口・アラートの自動の説明・
 Server Health の AI 要約・案件資料。
+
+**出荷の一覧（`config/report.yaml`）は空**で、GPU の Fan の値とアラートは LLM が読むだけ
+許される（決定記録 0146）。仕組みのテストは、テストの中で作った一覧（`EXCLUSIONS`。
+GPU の Fan の名前を使う）で確かめる。出荷の一覧の確かめは末尾の節。
 """
 
 from __future__ import annotations
@@ -46,7 +50,8 @@ from test_server_health_api import NVML_METRICS as HEALTH_NVML_METRICS
 from test_server_health_api import FakeSummarizer, _app, _populate
 
 REPORT_YAML = CONFIG_DIR / "report.yaml"
-EXCLUSIONS = LlmExclusions.from_yaml(REPORT_YAML)
+SHIPPED = LlmExclusions.from_yaml(REPORT_YAML)
+"""出荷の一覧。空（決定記録 0146 §2.2）。"""
 TZ = ZoneInfo("Asia/Tokyo")
 DAY = date(2026, 8, 24)
 DAY_START_MS = 1_787_497_200_000
@@ -55,6 +60,11 @@ MINUTE_MS = 60_000
 NOW_MS = DAY_START_MS + DAY_MS + 3_600_000  # 翌日の 01:00
 POLICY = "gpu.0.fan_policy"
 GPU_RULES = ("GPU_FAN_NOT_MANUAL", "GPU_FAN_BELOW_CURVE")
+SPEED = "gpu.0.fan_speed"
+EXCLUSIONS = LlmExclusions(
+    metric_patterns=("gpu.*.fan_policy", "gpu.*.fan_speed"), rule_ids=frozenset(GPU_RULES)
+)
+"""仕組みを確かめるためのテストの一覧（0131 / 0138 のころの出荷の一覧と同じ中身）。"""
 
 
 @pytest.fixture
@@ -118,10 +128,18 @@ def daily(store, catalog, exclusions: LlmExclusions | None = EXCLUSIONS):
 # ---------------------------------------------------------------- 一覧の形
 
 
-def test_shipped_list_names_the_gpu_fan_policy_and_rules():
-    assert EXCLUSIONS.excludes_metric(POLICY)
-    assert EXCLUSIONS.excludes_metric("gpu.1.fan_policy")
-    assert EXCLUSIONS.rule_ids == frozenset(GPU_RULES)
+def test_shipped_list_is_empty_but_both_keys_are_written():
+    """0146 §2.2: 空の一覧は「除くものが無い」の明示。キーの省略は今までどおり不正。"""
+    assert SHIPPED.metric_patterns == ()
+    assert SHIPPED.rule_ids == frozenset()
+
+
+def test_an_empty_list_is_accepted(tmp_path):
+    path = tmp_path / "report.yaml"
+    path.write_text("llm_excluded_metrics: []\nllm_excluded_rules: []\n", encoding="utf-8")
+    loaded = LlmExclusions.from_yaml(path)
+    assert not loaded.excludes_metric(POLICY)
+    assert not loaded.excludes_rule("GPU_FAN_NOT_MANUAL")
 
 
 def test_shipped_report_config_still_loads_with_the_list():
@@ -263,7 +281,7 @@ def test_ongoing_alerts_section_lists_alerts_still_firing_at_the_end_of_the_day(
     assert report.alert_total == 0, "その日に発火した件数には出ない"
     assert "## 日の終わりに続いているアラート" in human
     section = human.split("## 日の終わりに続いているアラート")[1]
-    assert "| GPU_FAN_NOT_MANUAL | warning | 2026-08-22 01:00 |" in section
+    assert "| GPU_FAN_NOT_MANUAL | 警告 | 2026-08-22 01:00 |" in section
     # 翌日に解除されたものも、その日の終わりには続いていた（作り直しても同じ）
     assert "ROOM_HIGH" in section
     assert "INTAKE_HIGH" not in section, "その日のうちに解除された"
@@ -431,6 +449,7 @@ class _Notifier:
     @dataclass
     class _Config:
         dashboard_url: str = ""
+        context_always: tuple[str, ...] = ("air.room",)
 
     def __init__(self) -> None:
         self.config = self._Config()
@@ -556,7 +575,9 @@ def test_health_summary_is_not_requested_when_only_an_excluded_alert_changes_the
     _populate(path, rules)
     _fire(path, rules, "GPU_FAN_NOT_MANUAL", POLICY)
     summarizer = FakeSummarizer()
-    with TestClient(_app(path, SimulatedClock(HEALTH_NOW_MS), summarizer)) as client:
+    with TestClient(
+        _app(path, SimulatedClock(HEALTH_NOW_MS), summarizer, llm_exclusions=EXCLUSIONS)
+    ) as client:
         body = client.get("/api/v1/server-health").json()
     # 人が見る応答は除く前のまま
     assert body["signal"] == "yellow"
@@ -573,7 +594,9 @@ def test_health_summary_uses_the_signal_after_exclusion_when_it_agrees(tmp_path,
     _fire(path, rules, "GPU_FAN_NOT_MANUAL", POLICY)
     _fire(path, rules, "RECIRCULATION", "d.intake_rise")
     summarizer = FakeSummarizer()
-    with TestClient(_app(path, SimulatedClock(HEALTH_NOW_MS), summarizer)) as client:
+    with TestClient(
+        _app(path, SimulatedClock(HEALTH_NOW_MS), summarizer, llm_exclusions=EXCLUSIONS)
+    ) as client:
         body = client.get("/api/v1/server-health").json()
     assert body["signal"] == "yellow"
     assert {a["rule_id"] for a in body["active_alerts"]} == {"GPU_FAN_NOT_MANUAL", "RECIRCULATION"}
@@ -641,35 +664,11 @@ def test_alert_on_a_derived_value_of_an_excluded_input_does_not_drive_the_ai_sig
     assert summarizer.facts == [], "AI 用の signal（green）と食い違うので要約を求めない"
 
 
-# ---------------------------------------- 既存の `gpu.*.fan_speed`（決定記録 0138）
+# ------------------------- 一覧に当たったメトリクスの経路（決定記録 0138 §2.3 の仕組み）
+#
+# `gpu.*.fan_speed` を一覧に入れたテストの一覧で、品質の経路まで除けることを確かめる。
 
-SPEED = "gpu.0.fan_speed"
 GPU_FAN_METRIC = re.compile(r"^gpu\.[0-9]+\.fan")
-
-
-def test_shipped_list_also_names_the_gpu_fan_speed():
-    """0138 §2.1: 0043 の NVML の目標値も、0128 §2.1 の「LLM は GPU の Fan を読まない」に入る。"""
-    assert EXCLUSIONS.excludes_metric(SPEED)
-    assert EXCLUSIONS.excludes_metric("gpu.1.fan_speed")
-    assert "gpu.*.fan_speed" in EXCLUSIONS.metric_patterns, "名前を1つずつ書く（0138 §4）"
-    # GPU の Fan 以外の GPU の値は今までどおり渡す（0138 §5 の 3）
-    for kept in ("gpu.0.core", "power.gpu.0", "gpu.0.tlimit_margin", "gpu.0.throttle.hw_thermal"):
-        assert not EXCLUSIONS.excludes_metric(kept)
-
-
-def test_every_gpu_fan_metric_in_the_catalog_is_excluded(catalog):
-    """0138 §2.5 の見張り: GPU の Fan のメトリクスを後で足したときの除き忘れを CI で止める。"""
-    gpu_fan = sorted(name for name in catalog.metrics if GPU_FAN_METRIC.match(name))
-    assert SPEED in gpu_fan and POLICY in gpu_fan, "見張りの対象が空になっていないこと"
-    missed = [name for name in gpu_fan if not EXCLUSIONS.excludes_metric(name)]
-    assert missed == [], f"config/report.yaml の llm_excluded_metrics に足す: {missed}"
-
-
-def test_every_derived_value_of_a_gpu_fan_metric_is_excluded(catalog):
-    """派生値の材料に GPU の Fan があれば、その派生値も LLM へ渡さない（0131 §2.4a の原則）。"""
-    for name, derived in catalog.derived.items():
-        if GPU_FAN_METRIC.match(derived.minuend) or GPU_FAN_METRIC.match(derived.subtrahend):
-            assert EXCLUSIONS.excludes_metric_or_inputs(name, catalog), name
 
 
 def test_facts_for_the_llm_drop_the_fan_speed_row_but_the_body_keeps_it(store, catalog):
@@ -678,7 +677,7 @@ def test_facts_for_the_llm_drop_the_fan_speed_row_but_the_body_keeps_it(store, c
         bucket(store, "gpu.0.core", minute, 60.0)
         bucket(store, SPEED, minute, 45.0)
     report = daily(store, catalog)
-    assert SPEED in report.as_markdown(), "人が読む本文には残す（0138 §2.1）"
+    assert SPEED in report.as_markdown(), "人が読む本文には残す"
     facts = report.facts_markdown()
     assert "fan_speed" not in facts
     assert "gpu.0.core" in facts, "GPU の温度は今までどおり渡す"
@@ -756,13 +755,16 @@ def _degrade(path: Path, rules, metrics: tuple[str, ...], quality: Quality) -> N
         )
 
 
-def _health(path: Path, summarizer: FakeSummarizer) -> dict[str, object]:
+def _health(
+    path: Path, summarizer: FakeSummarizer, exclusions: LlmExclusions = EXCLUSIONS
+) -> dict[str, object]:
     # gpu.0.fan_policy は NVML の入力（0131）。監視対象に入れて品質の経路を通す
     app = _app(
         path,
         SimulatedClock(HEALTH_NOW_MS + 1),
         summarizer,
         nvml_metrics=(*HEALTH_NVML_METRICS, POLICY),
+        llm_exclusions=exclusions,
     )
     with TestClient(app) as client:
         body: dict[str, object] = client.get("/api/v1/server-health").json()
@@ -774,7 +776,7 @@ def _health(path: Path, summarizer: FakeSummarizer) -> dict[str, object]:
 def test_health_summary_is_not_requested_when_only_an_excluded_metric_degrades(
     tmp_path, rules, metric, quality
 ):
-    """0138 §2.3: 一覧のメトリクスの品質だけが signal を下げるなら、要約を求めない。"""
+    """0138 §2.3（0146 §2.2 が引き継ぐ）: 一覧のメトリクスの品質だけで下がるなら要約を求めない。"""
     path = tmp_path / "health.db"
     _populate(path, rules)
     _degrade(path, rules, (metric,), quality)
@@ -797,4 +799,107 @@ def test_health_summary_is_requested_when_a_kept_metric_also_degrades(tmp_path, 
     body = _health(path, summarizer)
     assert body["signal"] == "yellow"
     assert summarizer.facts == [YELLOW_TEMPLATE], "名前と値は渡らない（テンプレートだけ）"
+    assert body["summary_source"] == "ai"
+
+
+# ------------------------- 出荷の一覧では GPU の Fan を LLM が読む（決定記録 0146）
+
+
+def test_shipped_list_matches_no_gpu_fan_metric(catalog):
+    """0146 §2.3: #320 の見張りの逆向き。GPU の Fan を一覧へ黙って書き戻させない。"""
+    gpu_fan = sorted(name for name in catalog.metrics if GPU_FAN_METRIC.match(name))
+    assert SPEED in gpu_fan and POLICY in gpu_fan, "見張りの対象が空になっていないこと"
+    caught = [name for name in gpu_fan if SHIPPED.excludes_metric(name)]
+    assert caught == [], f"決定記録 0146: GPU の Fan は LLM が読む。一覧から外す: {caught}"
+    for rule_id in GPU_RULES:
+        assert not SHIPPED.excludes_rule(rule_id), rule_id
+
+
+def test_shipped_list_matches_no_derived_value_of_a_gpu_fan_metric(catalog):
+    for name, derived in catalog.derived.items():
+        if GPU_FAN_METRIC.match(derived.minuend) or GPU_FAN_METRIC.match(derived.subtrahend):
+            assert not SHIPPED.excludes_metric_or_inputs(name, catalog), name
+
+
+def test_facts_for_the_llm_carry_the_gpu_fan_with_the_shipped_list(store, catalog):
+    for minute in range(MINUTES_PER_DAY):
+        bucket(store, "air.room", minute, 26.0)
+        bucket(store, SPEED, minute, 47.0)
+        bucket(store, POLICY, minute, 0.0)
+    put_alert(store, "GPU_FAN_NOT_MANUAL", fired_ms=DAY_START_MS + 7_200_000, metric=POLICY)
+    report = daily(store, catalog, exclusions=SHIPPED)
+    facts = report.facts_markdown()
+    for expected in (SPEED, POLICY, "GPU_FAN_NOT_MANUAL", "発火 1 件（前日 0 件）"):
+        assert expected in facts, expected
+
+
+@pytest.fixture
+def shipped_tools(store, catalog) -> ToolRegistry:
+    return ToolRegistry(
+        store=store,
+        catalog=catalog,
+        rules=RuleSet.from_yaml(CONFIG_DIR / "rules.yaml"),
+        clock=store.clock,
+        exclusions=SHIPPED,
+    )
+
+
+def test_ai_tools_return_the_gpu_fan_with_the_shipped_list(store, shipped_tools):
+    reading(store, NOW_MS - 5_000, "air.room", 26.0)
+    reading(store, NOW_MS - 1_000, SPEED, 47.0)
+    reading(store, NOW_MS - 1_000, POLICY, 0.0)
+    put_alert(store, "GPU_FAN_NOT_MANUAL", fired_ms=NOW_MS - 50_000, metric=POLICY)
+    latest = shipped_tools.call("get_latest")
+    assert latest["metrics"][SPEED]["value"] == 47.0
+    assert POLICY in latest["metrics"]
+    assert latest["ts_ms"] == NOW_MS - 1_000
+    stats = shipped_tools.call("get_stats", {"metric": SPEED, "window": "1h"})
+    assert "47" in str(stats)
+    alerts = shipped_tools.call("list_alerts", {"limit": 5})["alerts"]
+    assert [a["rule_id"] for a in alerts] == ["GPU_FAN_NOT_MANUAL"]
+    described = shipped_tools.call("describe_system")
+    assert SPEED in described["metrics"] and POLICY in described["metrics"]
+    assert set(GPU_RULES) <= set(described["thresholds"])
+
+
+def test_gpu_fan_alerts_are_explained_with_the_shipped_list(tmp_path, rules):
+    daemon, notifier, asked = _daemon(tmp_path, rules, SHIPPED)
+    try:
+        daemon._record(
+            [
+                _firing("GPU_FAN_NOT_MANUAL", POLICY),
+                _firing("GPU_FAN_BELOW_CURVE", SPEED),
+            ]
+        )
+        assert len(notifier.sent) == 2
+        assert asked == list(GPU_RULES), "0146: ほかのアラートと同じに説明を求める"
+    finally:
+        daemon.store.close()
+
+
+def test_health_summary_is_requested_for_a_gpu_fan_alert_with_the_shipped_list(tmp_path, rules):
+    path = tmp_path / "health.db"
+    _populate(path, rules)
+    _fire(path, rules, "GPU_FAN_NOT_MANUAL", POLICY)
+    summarizer = FakeSummarizer()
+    with TestClient(
+        _app(path, SimulatedClock(HEALTH_NOW_MS), summarizer, llm_exclusions=SHIPPED)
+    ) as client:
+        body = client.get("/api/v1/server-health").json()
+    assert body["signal"] == "yellow"
+    assert summarizer.facts == [YELLOW_TEMPLATE]
+    assert body["summary_source"] == "ai"
+
+
+@pytest.mark.parametrize("metric", [SPEED, POLICY])
+def test_health_summary_is_requested_when_a_gpu_fan_metric_degrades_with_the_shipped_list(
+    tmp_path, rules, metric
+):
+    path = tmp_path / "health.db"
+    _populate(path, rules)
+    _degrade(path, rules, (metric,), Quality.STALE)
+    summarizer = FakeSummarizer()
+    body = _health(path, summarizer, SHIPPED)
+    assert body["signal"] == "yellow"
+    assert summarizer.facts == [YELLOW_TEMPLATE]
     assert body["summary_source"] == "ai"

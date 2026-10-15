@@ -88,6 +88,9 @@ SYSTEM_PROMPT = """あなたはGPUサーバーの熱管理を監視するアシ�
    負荷の増加のどれが近いかを見立て、根拠の値（検証済みの事実にある数値だけ）を挙げる。
    日本語の3〜4文の地の文にする。材料が足りなければ、何が足りないかを書く
 
+注意: 行の末尾の表示名に「目標値」とあるメトリクスは実測ではなく目標値です
+（GPU の Fan 速度は実回転ではなく、NVML が返す目標値の % です）。
+
 制約:
 - **確度・確信度・パーセントでの可能性を書かない。** 根拠がありません
 - **測定値を新しく作らない。** 与えられた事実以外の数値を書かない
@@ -265,6 +268,10 @@ class Explainer:
             )
             if stats.get("slope_per_min") is not None:
                 text += f" / 傾き {stats['slope_per_min']:.3f} /分"
+            meta = self.tools.catalog.metrics.get(metric)
+            if meta is not None:
+                # 表示名を添える。「目標値」など値の意味は catalog が持つ（名前で分岐しない）
+                text += f"（{meta.label}）"
             lines.append(Evidence("L1", text))
         return lines
 

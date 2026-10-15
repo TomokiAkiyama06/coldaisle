@@ -39,8 +39,8 @@ explain_alerts: true
 
 # アラートの説明に足す、負荷と温度の直近の集計（決定記録 0143 §2.11）。
 # **平均・最大・傾きだけを渡す。生の時系列は渡さない**（ルール 8）。
-# LLM へ渡さない一覧（config/report.yaml の llm_excluded_*。0131 §2.4a / 0138）に当たるメトリクスは、
-# ここに書いても材料にならない（gpu.*.fan_speed / gpu.*.fan_policy などは書かない）。
+# LLM へ渡さない一覧（config/report.yaml の llm_excluded_*。0131 §2.4a）に当たるメトリクスは、
+# ここに書いても材料にならない（0146 で一覧は空。GPU の Fan の値も読める）。
 # Provider に依らない（ローカル LLM でも Claude でも同じ材料）
 explain_context:
   # 窓は発火の時刻で終わる（説明が遅れても発火の前の状態を見る）
@@ -49,6 +49,7 @@ explain_context:
     - gpu.0.utilization
     - power.gpu.0
     - gpu.0.core
+    - gpu.0.fan_speed    # NVML の目標値の %（実回転ではない）。0146 で LLM が読める
     - cpu.utilization
     - power.cpu.package
     - cpu.package
