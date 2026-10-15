@@ -407,7 +407,8 @@ class Notification:
         """発火の対象の値と、その意味（変化量・閾値）。ルールの種類で決める（0142 §2.4）。"""
         text = self.names.rules[self.rule_id]
         value, metric = self.value, self.metric
-        if text.kind == "event":
+        if text.kind in ("event", "control"):
+            # fand の状態（決定記録 0148 §2.5）も、原因の 1 行を detail がそのまま持つ
             return self.detail
         if value is None:
             return None

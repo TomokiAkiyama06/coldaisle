@@ -21,7 +21,10 @@ from dataclasses import dataclass, field
 from coldaisle import logs
 from coldaisle.clock import Clock
 from coldaisle.metrics import MetricCatalog, compute_derived
+from coldaisle.rules.fand_trace import FandStatus, describe_faults, read_fand_status
 from coldaisle.rules.models import (
+    ControlSilenceRule,
+    ControlStateRule,
     FlagOffRule,
     HotAndSlowRule,
     RangeRule,
@@ -129,6 +132,12 @@ class Engine:
     catalog: MetricCatalog
     store: SqliteStore
     clock: Clock
+    read_control_traces: bool = True
+    """fand の decision trace を読むルール（決定記録 0148）を評価するか。
+
+    **実時間の取り込みでだけ True にする**（`daemon.build()`）。再生・時間圧縮では評価時刻が
+    CSV・シナリオの時刻で、別プロセスが壁時計で書いた trace と比べられない（0148 §2.1）。
+    """
     _states: dict[tuple[str, str | None], RuleState] = field(default_factory=dict)
     _last_sample_ms: int | None = field(default=None)
     _now_ms: int = field(default=0)
@@ -239,6 +248,7 @@ class Engine:
         )
         transitions += self._evaluate_slope("rapid_rise", self.rules.rapid_rise)
         transitions += self._evaluate_latest()
+        transitions += self._evaluate_control()
         return transitions
 
     def on_tick(self) -> list[Transition]:
@@ -251,7 +261,7 @@ class Engine:
         止まっていても、GPU の値は別プロセスが書き続けている。
         """
         self._advance(self.clock.now_ms())
-        return self._evaluate_silence() + self._evaluate_latest()
+        return self._evaluate_silence() + self._evaluate_latest() + self._evaluate_control()
 
     def on_hello(
         self,
@@ -483,7 +493,9 @@ class Engine:
         return frozenset(
             name.upper()
             for name, rule in self.rules
-            if isinstance(rule, FlagOffRule | HotAndSlowRule)
+            if isinstance(
+                rule, FlagOffRule | HotAndSlowRule | ControlStateRule | ControlSilenceRule
+            )
         )
 
     def _evaluate_latest(self) -> list[Transition]:
@@ -580,6 +592,127 @@ class Engine:
                 detail=detail,
             )
         return self._continue(rule_id, rule.fan_metric, fan, rule.fire_after_s, detail=detail)
+
+    def _evaluate_control(self) -> list[Transition]:
+        """fand の最後の decision trace を読んで評価するルール（決定記録 0148）。
+
+        **最後に記録した 1 行**（`latest_control_trace()`。0071 §2.2）の `safety_state` と
+        `faults` だけを見る。fand は `fault_clear_hold_ms` の間状態を保つので、評価の間隔
+        （約 1 s）で見落とさない（0148 §3）。
+        trace が 1 行も無い DB（fand を導入していない機械）では何もしない（0148 §2.8）。
+        """
+        emergency = self.rules.fand_emergency
+        degraded = self.rules.fand_degraded
+        silent = self.rules.fand_trace_silent
+        if not self.read_control_traces or not (
+            emergency.enabled or degraded.enabled or silent.enabled
+        ):
+            return []
+        trace = self.store.latest_control_trace()
+        if trace is None:
+            self._reset_on_gap("FAND_EMERGENCY", None)
+            self._reset_on_gap("FAND_DEGRADED", None)
+            return []
+        status = read_fand_status(trace)
+        age_s = (self._now_ms - trace.ts_ms) / 1000
+        # 時計が戻って trace が評価時刻より先にあるときは新しいとみなす（年齢は負。0148 §2.2）
+        fresh = status is not None and age_s < silent.silence_s
+        transitions: list[Transition] = []
+        if silent.enabled:
+            if status is None:
+                detail = (
+                    f"最新の decision trace を読めない（schema_version {trace.schema_version}"
+                    f"・tick {trace.tick_id}）"
+                )
+            else:
+                detail = f"最後の decision trace から {age_s:.0f} 秒（tick {trace.tick_id}）"
+            transitions += self._evaluate_trace_silence(silent, fresh, age_s, detail)
+        current = status if fresh else None
+        transitions += self._evaluate_control_state(
+            "fand_emergency", emergency, current, target="emergency", worse=frozenset()
+        )
+        transitions += self._evaluate_control_state(
+            "fand_degraded", degraded, current, target="degraded", worse=frozenset({"emergency"})
+        )
+        return transitions
+
+    def _evaluate_trace_silence(
+        self, rule: ControlSilenceRule, fresh: bool, age_s: float, detail: str
+    ) -> list[Transition]:
+        rule_id = "FAND_TRACE_SILENT"
+        state = self._state(rule_id, None)
+        if not fresh:
+            state.resumed_ms = None
+            if state.since_ms is None:
+                return self._begin(
+                    rule_id,
+                    None,
+                    rule.severity.value,
+                    rule.silence_s,
+                    age_s,
+                    rule.fire_after_s,
+                    detail=detail,
+                )
+            return self._continue(rule_id, None, age_s, rule.fire_after_s, detail=detail)
+        if state.since_ms is None:
+            return []
+        if not state.firing:
+            return self._end(rule_id, None)
+        # 1 行届いただけで復旧とみなさない。再起動を繰り返している間も一瞬は書く
+        if state.resumed_ms is None:
+            state.resumed_ms = self._now_ms
+        if (self._now_ms - state.resumed_ms) / 1000 < rule.clear_s:
+            return []
+        return self._end(rule_id, None)
+
+    def _evaluate_control_state(
+        self,
+        name: str,
+        rule: ControlStateRule,
+        status: FandStatus | None,
+        *,
+        target: str,
+        worse: frozenset[str],
+    ) -> list[Transition]:
+        """`safety_state` が `target` の間を成立とみなす（0148 §2.2）。
+
+        `worse`（DEGRADED に対する EMERGENCY）の間は始めも発火も解除もしない。悪化で
+        「解けました」を出さず、2 通を同時に出さないため。trace が古い・読めない（`status` が
+        `None`）周期は評価しない（発火待ちは取り消し、発火中は保つ。0148 §2.3）。
+        """
+        if not rule.enabled:
+            return []
+        rule_id = name.upper()
+        if status is None:
+            self._reset_on_gap(rule_id, None)
+            return []
+        state = self._state(rule_id, None)
+        if status.safety_state == target:
+            state.resumed_ms = None
+            detail = describe_faults(status.faults, rule.fault_labels)
+            if state.since_ms is None:
+                return self._begin(
+                    rule_id,
+                    None,
+                    rule.severity.value,
+                    None,
+                    None,
+                    rule.fire_after_s,
+                    detail=detail,
+                )
+            return self._continue(rule_id, None, None, rule.fire_after_s, detail=detail)
+        if status.safety_state in worse:
+            state.resumed_ms = None
+            return []
+        if state.since_ms is None:
+            return []
+        if not state.firing:
+            return self._end(rule_id, None)  # 発火待ちの揺らぎは消す（0012 §2.4）
+        if state.resumed_ms is None:
+            state.resumed_ms = self._now_ms
+        if (self._now_ms - state.resumed_ms) / 1000 < rule.clear_s:
+            return []
+        return self._end(rule_id, None)
 
     def _reset_on_gap(self, rule_id: str, metric: str | None) -> None:
         """欠けた・stale の入力を受けた（決定記録 0131 §2.3）。**連続の時間を数え直す。**

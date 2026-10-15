@@ -390,6 +390,12 @@ nvidia-smi --query-gpu=temperature.gpu,fan.speed --format=csv
 > **この節の手順で `systemctl enable` も `systemctl start` もしません。** 有効化は 0080 §2.10 の
 > 段階 5 と、0028 §2.9 の承認点 3 の後です。テンプレートを置いただけでは Fan 制御は有効になりません。
 
+> **fand の状態の通知（決定記録 [`0148`](decisions/0148-fand-state-alert.md)）。** 取り込み（`coldaisle-daemon`）が
+> fand の decision trace の最後の 1 行を読み、`EMERGENCY`（重大・即時）・`DEGRADED` の 120 s の継続（警告）・
+> trace の 60 s の途絶（警告）を Slack へ送ります（値は `config/rules.yaml`）。DB に trace が 1 行も無いうちは鳴りません。
+> 一度 fand を動かした機械で fand を意図して止めておくときは、途絶の警告が 1 回届きます。止めている間は
+> `config/rules.yaml` の `fand_trace_silent.enabled` を false にして `coldaisle-daemon` を再起動すると鳴りません。
+
 ### 6.1 ユーザーとグループ
 
 ```bash

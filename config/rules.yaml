@@ -180,3 +180,66 @@ rules:
     core_clear: 77.0 # core がこれ未満になったら解除する
     fan_clear: 73.0 # fan がこれ以上になったら解除する
     fire_after_s: 30.0
+
+  # 決定記録 0148: fand（Fan 制御。Critical Safety）の状態を、fand が DB へ書く decision trace の
+  # **最後の 1 行**から読んで知らせる。監視系は読むだけで、fand・制御の経路には触らない。
+  # 見るのは `state.safety_state` と `faults` の code / zone だけ（版は読み分けない）。
+  # 実時間の取り込みでだけ評価する（replay・--speed では読まない）。
+  # DB に trace が 1 行も無い（fand を導入していない）機械では評価しない。
+  # trace が古い（fand_trace_silent.silence_s 以上前）・読めない間は、EMERGENCY / DEGRADED の
+  # 発火待ちを取り消し、発火中は解除しない（0131 §2.3 と同じ扱い。0148 §2.3）。
+  # 値はすべて provisional（0148 §5 の 1）
+
+  # 全 Fan を最大で回す緊急の状態。即時に知らせる（夜間も届く）
+  fand_emergency:
+    label: Fan制御が緊急状態
+    title: Fan 制御が緊急状態です（すべての Fan を最大で回しています）
+    resolved_title: Fan 制御が緊急状態を抜けました
+    hint: GPU・CPU・コネクタの温度と Fan の回転を確かめてください。理由は /api/v1/control/latest の faults と journalctl -u coldaisle-fand にあります。
+    enabled: true
+    severity: critical
+    fire_after_s: 0.0
+    clear_s: 10.0 # emergency でない新しい trace がこの秒数だけ続いたら解除する
+    # fault code → 本文に出す名前（0148 §2.5）。無い code は code のまま出す
+    fault_labels: &fand_fault_labels
+      cpu_telemetry_stale: CPU の温度が読めない
+      gpu_telemetry_stale: GPU の温度が読めない
+      t_sensor_stale: コネクタの温度が読めない
+      air_telemetry_stale: 空気の温度（センサー基板）が読めない
+      absolute_temperature_limit: 絶対温度の上限に達した
+      tach_stall: Fan の回転が止まった
+      write_failure: Fan への書き込みに失敗した
+      readback_mismatch: Fan の設定の読み戻しが合わない
+      enable_reverted: Fan の制御方式が外から戻された
+      fallback_exception: Baseline の制御器の例外
+      guard_exception: Reactive Guard の例外
+      tick_overrun: 制御の周期に間に合わない
+      config_invalid: 制御の設定が不正
+
+  # 一部の Fan を上げて運転を続けている状態（zone の fault・Telemetry の欠け）。
+  # 1 tick の fault でも fault_clear_hold_ms（導入先 30 s）は残るので、それより長く続いたら知らせる。
+  # emergency の間は始めも解除もしない（悪化で「解けました」を出さない）
+  fand_degraded:
+    label: Fan制御が縮退運転
+    title: Fan 制御が縮退運転を続けています（一部の Fan を上げています）
+    resolved_title: Fan 制御が通常の運転に戻りました
+    hint: 原因の Fan とセンサーを確かめてください。理由は /api/v1/control/latest の faults と journalctl -u coldaisle-fand にあります。
+    enabled: true
+    severity: warning
+    fire_after_s: 120.0
+    clear_s: 10.0 # degraded でも emergency でもない新しい trace がこの秒数だけ続いたら解除する
+    fault_labels: *fand_fault_labels
+
+  # fand の trace が来ない（fand が止まっている・DB へ書けていない）か、最新の trace を読めない。
+  # 監視系は意図した停止と落ちたことを見分けない。止めておくときは enabled を false にして
+  # coldaisle-daemon を再起動する（0148 §2.8）
+  fand_trace_silent:
+    label: Fan制御の記録が途絶えた
+    title: Fan 制御（fand）の記録が途絶えています
+    resolved_title: Fan 制御（fand）の記録が戻りました
+    hint: systemctl status coldaisle-fand と journalctl -u coldaisle-fand で動いているかを確かめてください。意図して止めているなら config/rules.yaml の fand_trace_silent.enabled を false にします。
+    enabled: true
+    severity: warning
+    silence_s: 60.0 # 最後の trace からこの秒数で途絶とみなす。EMERGENCY / DEGRADED の trace の新しさの上限でもある
+    fire_after_s: 0.0
+    clear_s: 30.0 # 読める新しい trace がこの秒数だけ続いたら解除する
