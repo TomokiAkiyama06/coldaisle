@@ -157,6 +157,28 @@ sudo bash -c 'set -a; . /etc/coldaisle/coldaisle.env; set +a; cd /opt/coldaisle 
 - （LINE を使う場合）LINE が `401`: トークンの誤り・失効
 - （LINE を使う場合）LINE が `400`: `COLDAISLE_LINE_TO` の誤り、または送信先が公式アカウントを友だち追加していない
 
+### 発火が遅れるとき（センサーの欠け・無音）
+
+しきい値・範囲の 5 つのルール（`recirculation`・`intake_high`・`airflow_degraded`・`room_high`・
+`humidity_out_of_range`）は、発火待ちの間に入力の欠け・サンプルの無音で次のアラートが**発火すると**、
+発火待ちを取り消し、回復の後に条件が成立した時刻から数え直します（決定記録 0139）。
+
+| 先に届くアラート | 条件（`config/rules.yaml`） | 数え直すルール |
+|---|---|---|
+| `SENSOR_MISSING`（warning） | 入力のメトリクスが `sensor_missing.consecutive`（5）サンプル連続で ok でない | その入力に依るルール（派生値は 2 つの入力のどちらでも） |
+| `SENSOR_FAULT`（critical） | サンプルが `sensor_fault.silence_s`（30 s）届かない（一括再生ではサンプルの時刻の空白） | 5 つすべて |
+
+- **発火が遅れるときは、必ずその原因のアラートが先に届いています。** 1〜4 サンプルの短い欠けでは
+  数え直さず、今までどおりの時刻に鳴ります
+- 遅れは最大で `fire_after_s` + 欠けの長さです（例: AM2320 が 5 回失敗して約 30 s 休むと、
+  `room_high` は約 20.7 分。決定記録 0139 §2.2 (3)）
+- 欠けが `fire_after_s` より短い間隔で繰り返すと、そのルールは発火しないまま続きます。そのときは
+  `SENSOR_MISSING` が欠けのたびに届くので、センサーの欠けを先に直します
+- 発火中のアラートは欠けで解除しません。回復の後に解除の閾値で解除します
+- `sensor_missing` / `sensor_fault` を無効にしている・欄が省かれた・デーモンの再起動の空白では
+  数え直しません（黙って遅らせないため。空白をまたいで発火しうる。決定記録 0139 §5）
+- 一括再生（`--bulk`）でも、CSV の 30 s 以上の空白は空白の後の最初のサンプルの時刻で `SENSOR_FAULT` になります
+
 ## 4. 導入先へ反映する
 
 `/etc/coldaisle/coldaisle.env` を書き換えたら、`coldaisle-daemon` を再起動するまで反映されません
