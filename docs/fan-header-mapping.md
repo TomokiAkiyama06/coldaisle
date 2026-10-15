@@ -330,7 +330,7 @@ GPU の Fan のサービスの下で 600 W のまま合格した（下の「GPU 
 | `air.gpu_exhaust` | −0.38 | +0.21 | −0.32 | −0.36 |
 | `air.top_exhaust` | +0.00 | +0.03 | −2.32 | −2.30 |
 | `air.rear_exhaust` | −0.49 | +0.62 | −1.12 | −0.61 |
-| 判定 | 合格 | | 合格（下の注を参照） | |
+| 判定 | 合格 | | 合格（決定記録 0136 §2.1。下の注を参照） | |
 
 - **CPU 全スレッド**（`t7cpu-1546-*`）: 吸気は 20.0〜20.9 °C。CPU の最高は 4 回とも 72〜73 °C で、電力は 200 W に張りついた。
   GPU はアイドル（25〜26 °C）で、throttle の flag はこのときの書き出しに含めていない。14:20 の 1 回目（`t7cpu-1420-*`）は、BIOS の 1 回目（吸気 24.4 °C）の後に止めたので判定に使わない
@@ -339,7 +339,7 @@ GPU の Fan のサービスの下で 600 W のまま合格した（下の「GPU 
   `hw_slowdown`）はどの試行でも立たず、「fand でだけ立つ」ことはなかった
 - **GPU 600 W は手順から外れた。** 試行 3（fand）の負荷の間に部屋が暖まり、吸気が 20.4 → 23.1 °C に上がった。試行 4（BIOS）は、
   アイドルの記録（19.6 °C）より 3.5 °C 高い吸気で始まった。0121 §2.9 は、負荷の前の吸気の差が ±1 °C を超えたらやり直すと決めている。
-  所有者は、やり直さずにこの結果で合格とした（2026-10-15）。判断の材料は次の 2 つ
+  所有者は、やり直さずにこの結果で合格とし（2026-10-15）、[0136](decisions/0136-t7-t8-t9-acceptance-exceptions.md) §2.1 に残した。例外はこの 1 回だけ。判断の材料は次の 2 つ
   - 吸気がそろっている試行 1（BIOS）とだけ比べても、fand は全項目で 0.8〜2.6 °C 低かった
   - 3 °C の余裕はどの項目にも残っていた
 - 0121 §2.9 のとおり、この比較は値の確定ではなく、`enable` の判断の材料とする
@@ -367,7 +367,7 @@ GPU の Fan のサービスの下で 600 W のまま合格した（下の「GPU 
   収まる tick は 177 あった。ただ、CPU が 74〜75 °C に上がり、温度の曲線（0.80〜0.84）が power の曲線（0.70〜0.76）を上回った。
   181 tick すべてで温度の曲線が Top の floor を決め、power の曲線が決めた tick は 0 だった。この機械では、130〜170 W を保つと
   温度の曲線が先に floor を決めるので、power の曲線の途中が実機で効く場面がない。0123 §2.1 のとおり合格にせず、所有者が判断した
-- **所有者の判断（2026-10-15）**: `cpu_power_cooling_floor` は両端の 2 点（100 W → 0.35・200 W → 1.0）を全スレッドの 3 回で確定する。
+- **所有者の判断（2026-10-15、[0136](decisions/0136-t7-t8-t9-acceptance-exceptions.md) §2.2）**: `cpu_power_cooling_floor` は両端の 2 点（100 W → 0.35・200 W → 1.0）を全スレッドの 3 回で確定する。
   途中の傾きは実機では確かめていない。途中の値が線形の補間になることは、CI のテスト
   `test_cpu_power_jump_raises_the_top_floor_even_when_the_cpu_is_cool`（157.5 W で曲線の中間の値）で担保する
 - 中間の負荷は、`stress-ng --cpu-load` の割合を最大 8 段で合わせてから 3 分保持した。0123 §2.1 は、スレッド数を試行の前に決め、
@@ -384,17 +384,17 @@ fand を manual 0.35（3 zone とも）で動かし、`coldaisle-cpu-power` を 
 |---|---|---|---|
 | 最後の書き込みから、Top の reason に `cpu_power_unavailable` が出る tick まで | 7311 ms | 5000〜8500 ms（5000 ms + 収集の周期 2500 ms + 1 tick） | 合格 |
 | その間の fault・Top・safety state | fault は無し。Top は `bound_by` が `safety_floor` の 0.35 のまま。`normal` | fault が上がらず、Top が 0.35 のまま | 合格 |
-| その間の telemetry の健全度と Guard の閾値 | 記録に無い（下の注を参照） | `DEGRADED`・`conservative` | 合格（所有者の判断） |
+| その間の telemetry の健全度と Guard の閾値 | 記録に無い（下の注を参照） | `DEGRADED`・`conservative` | 未完了（0136 §2.3 の CI のテストで満たす。#308） |
 | 戻した後 | `SIGCONT` から 1.8 s（最後の書き込みから 32.3 s）の tick で `cpu_power_unavailable` が消えた | 新しい sample で power の項が戻り、健全度が `NORMAL` に戻る | 合格 |
 
 - 一時停止の間に Reactive Guard は発火しなかった。Top の `bound_by` はずっと `safety_floor` で、判定できない試行にはならなかった
 - **健全度と Guard の閾値は、記録から直接は確かめられなかった。** 理由は次の 2 つ
   - `telemetry_health` は decision trace にも `control tick` のログにも出ない
   - `threshold_profile` は Guard の発火と解除のログにしか出ない
-- 所有者は、次の 3 つを根拠に合格とした（2026-10-15）
-  - `cpu_power_unavailable` が出たことは、CPU Power の入力が使えないと判定されたことを示す
-  - コードの規則では、DEGRADED の重要度の入力が使えなければ健全度は `DEGRADED`、`DEGRADED` なら Guard は `conservative` になる。
-    規則は `test_one_air_probe_loss_is_degraded_but_not_the_critical_group` と `test_degraded_snapshot_uses_the_configured_conservative_threshold_set` で確かめている
-  - 戻した後の T8 の全スレッドで、Guard の発火 4 回はすべて `threshold_profile` が `normal` だった。健全度が `NORMAL` に戻っていたことを示す
-- 健全度と閾値を trace に載せ、CPU Power だけが古くなったときのテストを足すことは #308 で行う。0123 §2.3 の、T1 で健全度が `NORMAL` だった時間の割合も、それまで数えられない
+- 所有者は 2026-10-15 に、この行を実機の観測の代わりに CI のテストで満たすことにした（[0136](decisions/0136-t7-t8-t9-acceptance-exceptions.md) §2.3）。
+  テストは、`power.cpu.package` の時刻だけを古くした frame を、本番と同じ signal の組み立てから Reactive Guard まで通し、
+  健全度が `DEGRADED`・閾値が `conservative` になり、新しい sample で戻ることを確かめる。**テストが入るまでこの行は未完了。**
+  実機で `cpu_power_unavailable` が出て、fault が上がらなかったことは、テストの前提（収集の側が CPU Power を使えないと判定した）を裏付ける
+- 戻した後の T8 の全スレッドで、Guard の発火 4 回はすべて `threshold_profile` が `normal` だった。これは復帰の行の材料にだけ使い、一時停止の間の状態の材料にはしない
+- そのテストと、健全度と閾値を trace に載せることは #308 で行う。0123 §2.3 の、T1 で健全度が `NORMAL` だった時間の割合も、それまで数えられない
 - T9 (a)（fand の計時の `telemetry.cpu_power_ms`）は、0123 §2.2 のとおり実機では行わず、CI のテストで確かめる
