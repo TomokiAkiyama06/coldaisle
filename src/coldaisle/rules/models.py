@@ -17,6 +17,14 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from coldaisle.store.models import METRIC_PATTERN, AlertSeverity
 
+METRIC_KEYS = ("metric", "core_metric", "fan_metric")
+"""ルールがメトリクス名を持つ項目。名前の検査と、LLM への除外の判定（0131 §2.4a）で使う。"""
+
+
+def rule_metrics(rule: BaseModel) -> tuple[str, ...]:
+    """ルールが参照するメトリクス名。"""
+    return tuple(value for key in METRIC_KEYS if isinstance(value := getattr(rule, key, None), str))
+
 
 class _Rule(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
@@ -76,6 +84,40 @@ class EventRule(_Rule):
     """点の出来事。継続時間を持たない（FR-403）。"""
 
 
+class FlagOffRule(_Rule):
+    """0/1 の flag が 1 でない状態が続いたら発火する（決定記録 0131 §2.1）。
+
+    値は取り込みのサンプルではなく、**DB の最新値**（別プロセスの収集が書いたもの）を
+    評価のたびに読む（0131 §2.3）。最新値が無い・ok でない（stale を含む）周期は
+    評価しない。発火待ちは取り消し、発火中は解除の待ちだけを数え直す。
+    """
+
+    metric: str
+    fire_after_s: float = Field(ge=0)
+    clear_s: float = Field(ge=0)
+    """flag が 1 の状態がこの秒数だけ続いたら解除する。**1 回の 1 で解除しない。**"""
+
+
+class HotAndSlowRule(_Rule):
+    """温度が高いのに回転が低い状態が続いたら発火する（決定記録 0131 §2.1）。
+
+    `FlagOffRule` と同じく DB の最新値を読み、2 つの値のどちらかが無い・ok でない
+    周期は評価しない（0131 §2.3）。
+    """
+
+    core_metric: str
+    fan_metric: str
+    core_threshold: float
+    """`core_metric` がこれ以上で、"""
+    fan_below: float
+    """`fan_metric` がこれ未満なら成立。"""
+    core_clear: float
+    """解除: `core_metric` がこれ未満になる。**`core_threshold` より小さくする。**"""
+    fan_clear: float
+    """解除: `fan_metric` がこれ以上になる。**`fan_below` より大きくする。**"""
+    fire_after_s: float = Field(ge=0)
+
+
 class RuleSet(BaseModel):
     """`config/rules.yaml` 全体。**すべてのルールを明示する。**
 
@@ -93,6 +135,8 @@ class RuleSet(BaseModel):
     rapid_rise: SlopeRule
     room_high: ThresholdRule
     humidity_out_of_range: RangeRule
+    gpu_fan_not_manual: FlagOffRule
+    gpu_fan_below_curve: HotAndSlowRule
 
     @classmethod
     def from_yaml(cls, path: Path) -> RuleSet:
@@ -111,10 +155,18 @@ class RuleSet(BaseModel):
         """
         for name, rule in self.model_dump().items():
             spec = getattr(self, name)
-            if "metric" in rule and not METRIC_PATTERN.match(rule["metric"]):
-                # 保存可否ではなく**文法**で見る。ルールは派生値（`d.` 始まり）を
-                # 参照してよい。名前が実在するかはエンジンがカタログと突き合わせる
-                raise ValueError(f"{name}: メトリクス名が命名規約に合わない（{rule['metric']!r}）")
+            for key in METRIC_KEYS:
+                if key in rule and not METRIC_PATTERN.match(rule[key]):
+                    # 保存可否ではなく**文法**で見る。ルールは派生値（`d.` 始まり）を
+                    # 参照してよい。名前が実在するかはエンジンがカタログと突き合わせる
+                    raise ValueError(f"{name}: メトリクス名が命名規約に合わない（{rule[key]!r}）")
+            if isinstance(spec, HotAndSlowRule) and not (
+                spec.core_clear < spec.core_threshold and spec.fan_below < spec.fan_clear
+            ):
+                raise ValueError(
+                    f"{name}: core_clear < core_threshold かつ "
+                    f"fan_below < fan_clear とする（{rule}）"
+                )
             if isinstance(spec, ThresholdRule) and spec.clear >= spec.threshold:
                 raise ValueError(f"{name}: clear は threshold より小さくする（{rule}）")
             if isinstance(spec, SlopeRule) and spec.clear >= spec.threshold:

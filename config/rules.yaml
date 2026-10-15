@@ -96,3 +96,34 @@ rules:
     high: 70.0
     high_clear: 67.0
     fire_after_s: 600.0
+
+  # 決定記録 0131 §2.1: GPU の Fan の曲線（coldaisle-gpu-fan。0128）が効いていない。
+  # 値は coldaisle-telemetry が DB へ書いた NVML の最新値を、評価のたびに読む（0131 §2.3）。
+  # 最新値が無い・ok でない（stale。閾値は config/quality.yaml の stale_after_ms）周期は
+  # 評価しない（発火待ちは取り消し、発火中は解除の待ちだけを数え直す）。
+  # 通知を受けたら `systemctl status coldaisle-gpu-fan` と `journalctl -u coldaisle-gpu-fan`
+  # （gpu_fan_model_mismatch などの event）で理由を切り分ける。
+  # この 2 つは LLM へ渡さない（config/report.yaml の llm_excluded_rules。0131 §2.4a）
+
+  # GPU の Fan の制御方式が手動でない（＝サービスが握っていない）状態が続く。
+  # 30 s は再起動（RestartSec=2 と起動の待ち）を拾わず、600 W で 80 °C に届く約 80 s より短い
+  gpu_fan_not_manual:
+    enabled: true
+    severity: warning
+    metric: gpu.0.fan_policy
+    fire_after_s: 30.0
+    clear_s: 10.0 # 手動がこの秒数だけ続いたら解除する
+
+  # GPU コアが高いのに Fan が曲線（70 °C 以上で 100 %）より低い状態が続く。
+  # fan_below を 100 ではなく 90 にするのは、NVML の目標値の読み取りと周期のずれで
+  # 1 周期だけ低く見えるのを拾わないため
+  gpu_fan_below_curve:
+    enabled: true
+    severity: warning
+    core_metric: gpu.0.core
+    fan_metric: gpu.0.fan_speed
+    core_threshold: 70.0
+    fan_below: 90.0
+    core_clear: 67.0 # core がこれ未満になったら解除する
+    fan_clear: 95.0 # fan がこれ以上になったら解除する
+    fire_after_s: 30.0

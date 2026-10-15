@@ -34,6 +34,7 @@ from coldaisle.ai import provider as ai_provider
 from coldaisle.ai import summary as ai_summary
 from coldaisle.ai.provider import AiSettings, Provider
 from coldaisle.clock import Clock, WallClock
+from coldaisle.llm_exclusions import METRICS_KEY, RULES_KEY, LlmExclusions, LlmExclusionsError
 from coldaisle.metrics import MetricCatalog
 from coldaisle.notify.models import Notification, NotifyConfig
 from coldaisle.notify.notifiers import Notifier
@@ -80,6 +81,9 @@ class ReportConfig(BaseModel):
         loaded: Any = yaml.safe_load(path.read_text(encoding="utf-8"))
         if not isinstance(loaded, dict):
             raise ValueError(f"レポートの設定が辞書ではない: {path}")
+        # LLM へ渡さない一覧は `LlmExclusions.from_yaml()` が別に読む（決定記録 0131 §2.4a）。
+        # 一覧の不正でレポート全体を止めない（不正なら所見だけを作らない）
+        loaded = {k: v for k, v in loaded.items() if k not in (METRICS_KEY, RULES_KEY)}
         config = cls.model_validate(loaded)
         try:
             _ = config.zone  # 綴り違いは起動時に落とす（NotifyConfig と同じ）
@@ -121,6 +125,15 @@ class AlertLine:
 
 
 @dataclass(frozen=True)
+class OngoingLine:
+    """日の終わりに発火したまま続いていたアラート1件（決定記録 0131 §2.4）。"""
+
+    rule_id: str
+    severity: AlertSeverity
+    fired_ms: int
+
+
+@dataclass(frozen=True)
 class DailyReport:
     day: date
     timezone: str
@@ -129,8 +142,21 @@ class DailyReport:
     alert_total: int
     prev_alert_total: int
     alerts_truncated: bool = False
+    ongoing: tuple[OngoingLine, ...] = ()
+    """日の終わりに発火したまま続いていたアラート（決定記録 0131 §2.4）。
+
+    件数（その日に発火したもの）だけでは、人が直すまで続く状態（型番の不一致など）が
+    2 日目以降に出ない。ルール名で分岐せず、全ルールに効く（0017 §2.3）。
+    """
+    ongoing_truncated: bool = False
     summary: str | None = None
     """AI の所見。**未検証**であり、無くてもレポートは成立する。"""
+    llm_view: DailyReport | None = None
+    """LLM へ渡す版（決定記録 0131 §2.4a）。除外の一覧を当てた後の集合だけから作り直したもの。
+
+    件数・表・省略の注記・欠けの注記も、除いた後の値で作る。除く前の値を渡すと、
+    その差から除いたものの存在が分かる。**`None` なら所見を作らない**（一覧が読めない）。
+    """
 
     @property
     def has_data(self) -> bool:
@@ -152,8 +178,14 @@ class DailyReport:
         return "\n".join(lines).rstrip() + "\n"
 
     def facts_markdown(self) -> str:
-        """所見を除いた部分。**モデルに渡すのはこれだけ**（#25 / FR-504）。"""
-        return "\n".join(self._facts()).rstrip() + "\n"
+        """所見を除いた部分。**モデルに渡すのはこれだけ**（#25 / FR-504）。
+
+        **除外の一覧を当てた版（`llm_view`）から作る**（決定記録 0131 §2.4a）。
+        当てていないレポートからは作らない（人が読む本文をそのまま渡さない）。
+        """
+        if self.llm_view is None:
+            raise ValueError("LLM へ渡す除外の一覧を当てていない（決定記録 0131 §2.4a）")
+        return "\n".join(self.llm_view._facts()).rstrip() + "\n"
 
     def _facts(self) -> list[str]:
         lines: list[str] = []
@@ -180,6 +212,21 @@ class DailyReport:
             lines += ["", "| ルール | 重大度 | 件数 |", "|---|---|---|"]
             lines += [f"| {a.rule_id} | {a.severity.value} | {a.count} |" for a in self.alerts]
         lines += [""]
+        if self.ongoing:
+            zone = ZoneInfo(self.timezone)
+            lines += [
+                "## 日の終わりに続いているアラート",
+                "",
+                "| ルール | 重大度 | 発火 |",
+                "|---|---|---|",
+            ]
+            lines += [
+                f"| {o.rule_id} | {o.severity.value} | {_local_time(o.fired_ms, zone)} |"
+                for o in self.ongoing
+            ]
+            if self.ongoing_truncated:
+                lines += ["", f"**{ALERT_SCAN_LIMIT} 件を超えたため打ち切った。**"]
+            lines += [""]
         incomplete = [line for line in self.metrics if 0 < line.minutes < MINUTES_PER_DAY]
         if incomplete:
             # **「収録」が 1440 に満たない理由は2つある。** どちらかを断定しない
@@ -221,6 +268,10 @@ def _num(value: float | None) -> str:
     return "—" if value is None else f"{value:.2f}"
 
 
+def _local_time(at_ms: int, zone: ZoneInfo) -> str:
+    return datetime.fromtimestamp(at_ms / 1000, tz=zone).strftime("%Y-%m-%d %H:%M")
+
+
 def _count(value: float | None) -> str:
     return "—" if value is None else f"{round(value)}"
 
@@ -249,42 +300,117 @@ def build(
     tz: ZoneInfo,
     catalog: MetricCatalog,
     max_alerts: int,
+    exclusions: LlmExclusions | None,
 ) -> DailyReport:
-    """1日ぶんを集計する。**ここに推論は入らない。**"""
+    """1日ぶんを集計する。**ここに推論は入らない。**
+
+    人が読む本文は除く前の集合から作る。`exclusions` があれば、LLM へ渡す版
+    （`llm_view`）を除いた後の集合から**作り直す**（決定記録 0131 §2.4a）。除く前の
+    件数から引き算しない。上限（`ALERT_SCAN_LIMIT`）で打ち切る前に除かないと、
+    件数と省略の注記が除く前の集合に引きずられる。
+    """
     start_ms, end_ms = day_bounds_ms(day, tz)
     prev_start_ms, prev_end_ms = day_bounds_ms(day - timedelta(days=1), tz)
-    lines = [
+    names = _metric_order(store, catalog)
+    lines = tuple(
         _metric_line(store, metric, catalog, (start_ms, end_ms), (prev_start_ms, prev_end_ms))
-        for metric in _metric_order(store, catalog)
-    ]
-    fired = _fired(store, start_ms, end_ms)
+        for metric in names
+    )
+    window = _Window(start_ms, end_ms, prev_start_ms, prev_end_ms)
+    human = _view(store, day, tz, lines, window, max_alerts=max_alerts)
+    if exclusions is None:
+        return human
+    excluded = exclusions.excluded_metrics((*names, *catalog.derived))
+    llm = _view(
+        store,
+        day,
+        tz,
+        tuple(line for line in lines if line.metric not in excluded),
+        window,
+        max_alerts=max_alerts,
+        exclude_rule_ids=exclusions.rule_ids,
+        exclude_metrics=excluded,
+    )
+    return replace(human, llm_view=llm)
+
+
+@dataclass(frozen=True)
+class _Window:
+    start_ms: int
+    end_ms: int
+    prev_start_ms: int
+    prev_end_ms: int
+
+
+def _view(
+    store: SqliteStore,
+    day: date,
+    tz: ZoneInfo,
+    lines: tuple[MetricLine, ...],
+    window: _Window,
+    *,
+    max_alerts: int,
+    exclude_rule_ids: frozenset[str] = frozenset(),
+    exclude_metrics: frozenset[str] = frozenset(),
+) -> DailyReport:
+    """与えたメトリクスの行と、除外を当てたアラートの集合から1つの版を作る。"""
+    fired = _fired(store, window.start_ms, window.end_ms, exclude_rule_ids, exclude_metrics)
     counted: dict[tuple[str, AlertSeverity], int] = {}
     for record in fired:
         key = (record.rule_id, record.severity)
         counted[key] = counted.get(key, 0) + 1
     ranked = sorted(counted.items(), key=lambda item: (-item[1], item[0][0]))[:max_alerts]
+    previous = _fired(
+        store, window.prev_start_ms, window.prev_end_ms, exclude_rule_ids, exclude_metrics
+    )
+    ongoing = store.alerts_firing_at(
+        window.end_ms,
+        limit=ALERT_SCAN_LIMIT,
+        exclude_rule_ids=exclude_rule_ids,
+        exclude_metrics=exclude_metrics,
+    )
     return DailyReport(
         day=day,
         timezone=str(tz),
-        metrics=tuple(lines),
+        metrics=lines,
         alerts=tuple(
             AlertLine(rule_id=rule, severity=severity, count=count)
             for (rule, severity), count in ranked
         ),
         alert_total=len(fired),
-        prev_alert_total=len(_fired(store, prev_start_ms, prev_end_ms)),
+        prev_alert_total=len(previous),
         alerts_truncated=len(fired) >= ALERT_SCAN_LIMIT,
+        ongoing=tuple(
+            OngoingLine(rule_id=record.rule_id, severity=record.severity, fired_ms=record.fired_ms)
+            for record in ongoing
+            if record.fired_ms is not None
+        ),
+        ongoing_truncated=len(ongoing) >= ALERT_SCAN_LIMIT,
     )
 
 
-def _fired(store: SqliteStore, start_ms: int, end_ms: int) -> list[AlertRecord]:
+def _fired(
+    store: SqliteStore,
+    start_ms: int,
+    end_ms: int,
+    exclude_rule_ids: frozenset[str],
+    exclude_metrics: frozenset[str],
+) -> list[AlertRecord]:
     """**その日に発火したもの**を数える。
 
     pending のまま消えたものは誰にも届いていない。日の境界は `fired_ms` に当てる
     （`SqliteStore.fired_alerts`）。条件の成立時刻に当てると、23:55 に成立して
     00:03 に発火したアラートが前日の件数に入ってしまう。
     """
-    return list(store.fired_alerts(start_ms=start_ms, end_ms=end_ms, limit=ALERT_SCAN_LIMIT))
+    return list(
+        store.fired_alerts(
+            start_ms=start_ms,
+            end_ms=end_ms,
+            limit=ALERT_SCAN_LIMIT,
+            exclude_rule_ids=exclude_rule_ids,
+            exclude_metrics=exclude_metrics,
+        )
+    )
 
 
 def _metric_order(store: SqliteStore, catalog: MetricCatalog) -> list[str]:
@@ -441,10 +567,21 @@ def run(
     *,
     day: date,
     summariser: Provider | None = None,
+    exclusions: LlmExclusions | None = None,
 ) -> DailyReport:
-    """集計して所見を付ける。**送信とファイル書き込みは呼び出し側。**"""
-    report = build(store, day=day, tz=config.zone, catalog=catalog, max_alerts=config.max_alerts)
-    if summariser is None:
+    """集計して所見を付ける。**送信とファイル書き込みは呼び出し側。**
+
+    `exclusions` が無ければ所見を作らない（決定記録 0131 §2.4a。一覧が読めないときの安全側）。
+    """
+    report = build(
+        store,
+        day=day,
+        tz=config.zone,
+        catalog=catalog,
+        max_alerts=config.max_alerts,
+        exclusions=exclusions,
+    )
+    if summariser is None or report.llm_view is None:
         return report
     return report.with_summary(ai_summary.summarise(summariser, report.facts_markdown()))
 
@@ -475,9 +612,17 @@ def main(argv: Sequence[str] | None = None) -> int:
     clock = WallClock()
     day = args.date or _yesterday(clock, config.zone)
 
+    exclusions = _exclusions(args.config)
     store = SqliteStore(args.db, rules=QualityRules.from_yaml(args.quality_rules), clock=clock)
     try:
-        report = run(store, config, catalog, day=day, summariser=_summariser(args.ai, config))
+        report = run(
+            store,
+            config,
+            catalog,
+            day=day,
+            summariser=_summariser(args.ai, config) if exclusions is not None else None,
+            exclusions=exclusions,
+        )
     finally:
         store.close()
 
@@ -509,6 +654,18 @@ def main(argv: Sequence[str] | None = None) -> int:
         },
     )
     return 0
+
+
+def _exclusions(path: Path) -> LlmExclusions | None:
+    """LLM へ渡さない一覧。**読めなければ所見を作らない**（決定記録 0131 §2.4a）。"""
+    try:
+        return LlmExclusions.from_yaml(path)
+    except LlmExclusionsError as error:
+        LOGGER.error(
+            "LLM へ渡さない一覧が不正なので所見を作らない",
+            extra={logs.FIELDS_KEY: {"config": str(path), "reason": str(error)}},
+        )
+        return None
 
 
 def _summariser(ai_path: Path, config: ReportConfig) -> Provider | None:

@@ -29,6 +29,7 @@ from coldaisle.escalate import (
     main,
     write_packet,
 )
+from coldaisle.llm_exclusions import LlmExclusions
 from coldaisle.metrics import MetricCatalog
 from coldaisle.rules import RuleSet
 from coldaisle.store import Quality, Reading, Sample, SqliteStore
@@ -36,6 +37,7 @@ from conftest import CONFIG_DIR
 
 SRC = Path(__file__).resolve().parents[1] / "src" / "coldaisle"
 CONFIG_PATH = CONFIG_DIR / "escalation.yaml"
+EXCLUSIONS = LlmExclusions.from_yaml(CONFIG_DIR / "report.yaml")
 TZ = ZoneInfo("Asia/Tokyo")
 DAY = date(2026, 8, 24)
 DAY_START_MS = 1_787_497_200_000
@@ -122,8 +124,8 @@ def test_no_model_is_involved():
 
 def test_the_same_input_gives_the_same_findings(store, rules, catalog):
     with_step_change(store, before=12.0, after=22.0)
-    first = evaluate(store, rules, catalog, day=DAY)
-    second = evaluate(store, rules, catalog, day=DAY)
+    first = evaluate(store, rules, catalog, day=DAY, exclusions=EXCLUSIONS)
+    second = evaluate(store, rules, catalog, day=DAY, exclusions=EXCLUSIONS)
     assert first == second
     assert [finding.trigger for finding in first] == ["step_change"]
 
@@ -134,7 +136,7 @@ def test_the_same_input_gives_the_same_findings(store, rules, catalog):
 def test_a_sustained_step_is_escalated(store, rules, catalog):
     """急に変わって、**そのまま戻らない**ものを拾う。"""
     with_step_change(store, before=12.0, after=22.0)
-    findings = evaluate(store, rules, catalog, day=DAY)
+    findings = evaluate(store, rules, catalog, day=DAY, exclusions=EXCLUSIONS)
     assert len(findings) == 1
     assert "d.gpu_internal_delta" in findings[0].problem
     assert findings[0].started == DAY - timedelta(days=2)
@@ -146,12 +148,12 @@ def test_a_one_day_spike_is_not_escalated(store, rules, catalog):
         gap = 22.0 if offset == -1 else 12.0
         day_of(store, "gpu.0.core", day_offset=offset, mean=70.0)
         day_of(store, "gpu.0.hotspot", day_offset=offset, mean=70.0 + gap)
-    assert evaluate(store, rules, catalog, day=DAY) == []
+    assert evaluate(store, rules, catalog, day=DAY, exclusions=EXCLUSIONS) == []
 
 
 def test_a_small_change_is_not_escalated(store, rules, catalog):
     with_step_change(store, before=12.0, after=14.0)
-    assert evaluate(store, rules, catalog, day=DAY) == []
+    assert evaluate(store, rules, catalog, day=DAY, exclusions=EXCLUSIONS) == []
 
 
 def test_a_drifting_level_is_not_a_step(store, rules, catalog):
@@ -160,7 +162,7 @@ def test_a_drifting_level_is_not_a_step(store, rules, catalog):
         gap = {0: 40.0, -1: 30.0, -2: 22.0}.get(offset, 12.0)
         day_of(store, "gpu.0.core", day_offset=offset, mean=70.0)
         day_of(store, "gpu.0.hotspot", day_offset=offset, mean=70.0 + gap)
-    assert evaluate(store, rules, catalog, day=DAY) == []
+    assert evaluate(store, rules, catalog, day=DAY, exclusions=EXCLUSIONS) == []
 
 
 def test_a_gap_inside_the_tail_breaks_the_continuity(store, rules, catalog):
@@ -176,14 +178,14 @@ def test_a_gap_inside_the_tail_breaks_the_continuity(store, rules, catalog):
         gap = 22.0 if offset >= -3 else 12.0
         day_of(store, "gpu.0.core", day_offset=offset, mean=70.0)
         day_of(store, "gpu.0.hotspot", day_offset=offset, mean=70.0 + gap)
-    assert evaluate(store, rules, catalog, day=DAY) == []
+    assert evaluate(store, rules, catalog, day=DAY, exclusions=EXCLUSIONS) == []
 
 
 def test_missing_days_do_not_produce_a_step(store, rules, catalog):
     """**データが無い日を「変わっていない」とみなさない。**"""
     day_of(store, "gpu.0.core", day_offset=0, mean=70.0)
     day_of(store, "gpu.0.hotspot", day_offset=0, mean=92.0)
-    assert evaluate(store, rules, catalog, day=DAY) == []
+    assert evaluate(store, rules, catalog, day=DAY, exclusions=EXCLUSIONS) == []
 
 
 # ---------------------------------------------------------------- 逸脱と再発
@@ -204,7 +206,7 @@ def test_sustained_deviation_fires_when_enabled(store, rules, catalog):
     )
     for index in range(24):
         hour(store, "air.room", day_offset=0, hour_index=index, mean=31.0)
-    findings = evaluate(store, enabled, catalog, day=DAY)
+    findings = evaluate(store, enabled, catalog, day=DAY, exclusions=EXCLUSIONS)
     assert [finding.trigger for finding in findings] == ["sustained_deviation"]
 
 
@@ -221,13 +223,13 @@ def test_a_gap_in_the_hours_is_not_treated_as_normal(store, rules, catalog):
         if index == 20:
             continue  # 1時間だけ欠測
         hour(store, "air.room", day_offset=0, hour_index=index, mean=31.0)
-    assert evaluate(store, enabled, catalog, day=DAY) == []
+    assert evaluate(store, enabled, catalog, day=DAY, exclusions=EXCLUSIONS) == []
 
 
 def test_repeated_criticals_are_escalated(store, rules, catalog):
     for offset in (-4, -2, 0):
         critical(store, "SENSOR_FAULT", day_offset=offset)
-    findings = evaluate(store, rules, catalog, day=DAY)
+    findings = evaluate(store, rules, catalog, day=DAY, exclusions=EXCLUSIONS)
     assert [finding.rule_id for finding in findings] == ["SENSOR_FAULT"]
 
 
@@ -235,7 +237,7 @@ def test_two_criticals_are_not_enough(store, rules, catalog):
     """**1回や2回では引き上げない。** 対処済みかもしれない。"""
     for offset in (-2, 0):
         critical(store, "SENSOR_FAULT", day_offset=offset)
-    assert evaluate(store, rules, catalog, day=DAY) == []
+    assert evaluate(store, rules, catalog, day=DAY, exclusions=EXCLUSIONS) == []
 
 
 def test_every_qualifying_rule_is_reported(store, rules, catalog):
@@ -247,7 +249,7 @@ def test_every_qualifying_rule_is_reported(store, rules, catalog):
     for offset in (-4, -2, 0):
         critical(store, "SENSOR_FAULT", day_offset=offset)
         critical(store, "HUMIDITY_OUT_OF_RANGE", day_offset=offset)
-    findings = evaluate(store, rules, catalog, day=DAY)
+    findings = evaluate(store, rules, catalog, day=DAY, exclusions=EXCLUSIONS)
     assert sorted(finding.rule_id for finding in findings) == [
         "HUMIDITY_OUT_OF_RANGE",
         "SENSOR_FAULT",
@@ -262,8 +264,10 @@ def test_a_continuing_pattern_keeps_the_same_case_name(store, rules, catalog):
     """
     for offset in range(-10, 1, 2):  # 2日おきに発火し続けている
         critical(store, "SENSOR_FAULT", day_offset=offset)
-    today = evaluate(store, rules, catalog, day=DAY)[0]
-    yesterday = evaluate(store, rules, catalog, day=DAY - timedelta(days=1))[0]
+    today = evaluate(store, rules, catalog, day=DAY, exclusions=EXCLUSIONS)[0]
+    yesterday = evaluate(store, rules, catalog, day=DAY - timedelta(days=1), exclusions=EXCLUSIONS)[
+        0
+    ]
     assert today.slug == yesterday.slug
     assert today.started == DAY - timedelta(days=10)
 
@@ -272,13 +276,15 @@ def test_a_new_outbreak_after_a_quiet_spell_is_a_new_case(store, rules, catalog)
     """**間隔が窓を超えたら別の案件。** 半年前の同じルールと1つにまとめない。"""
     for offset in (-60, -4, -2, 0):
         critical(store, "SENSOR_FAULT", day_offset=offset)
-    assert evaluate(store, rules, catalog, day=DAY)[0].started == DAY - timedelta(days=4)
+    assert evaluate(store, rules, catalog, day=DAY, exclusions=EXCLUSIONS)[
+        0
+    ].started == DAY - timedelta(days=4)
 
 
 def test_criticals_outside_the_window_are_not_counted(store, rules, catalog):
     for offset in (-30, -20, 0):
         critical(store, "SENSOR_FAULT", day_offset=offset)
-    assert evaluate(store, rules, catalog, day=DAY) == []
+    assert evaluate(store, rules, catalog, day=DAY, exclusions=EXCLUSIONS) == []
 
 
 # ---------------------------------------------------------------- 案件資料（受入基準）
@@ -287,8 +293,8 @@ def test_criticals_outside_the_window_are_not_counted(store, rules, catalog):
 def test_the_packet_has_the_five_sections(store, rules, catalog):
     """構想メモ §10 の形。**問題 / 測定値 / 経過 / 試行済み / 争点。**"""
     with_step_change(store, before=12.0, after=22.0)
-    finding = evaluate(store, rules, catalog, day=DAY)[0]
-    text = build_packet(store, finding, rules, catalog, day=DAY)
+    finding = evaluate(store, rules, catalog, day=DAY, exclusions=EXCLUSIONS)[0]
+    text = build_packet(store, finding, rules, catalog, day=DAY, exclusions=EXCLUSIONS)
     for section in ("## 問題", "## 測定値", "## 経過", "## 試行済み", "## 争点"):
         assert section in text
 
@@ -308,8 +314,8 @@ def test_a_critical_packet_also_has_five_sections(store, rules, catalog):
             )
         ]
     )
-    finding = evaluate(store, rules, catalog, day=DAY)[0]
-    text = build_packet(store, finding, rules, catalog, day=DAY)
+    finding = evaluate(store, rules, catalog, day=DAY, exclusions=EXCLUSIONS)[0]
+    text = build_packet(store, finding, rules, catalog, day=DAY, exclusions=EXCLUSIONS)
     for section in ("## 問題", "## 測定値", "## 経過", "## 試行済み", "## 争点"):
         assert section in text
     assert "SENSOR_FAULT の発火回数" in text
@@ -320,8 +326,10 @@ def test_the_occurrence_course_shows_quiet_days_as_zero(store, rules, catalog):
     """**間の静かな日も並べる。** 3行だけ見せると、頻度が分からない。"""
     for offset in (-4, -2, 0):
         critical(store, "SENSOR_FAULT", day_offset=offset)
-    finding = evaluate(store, rules, catalog, day=DAY)[0]
-    course = build_packet(store, finding, rules, catalog, day=DAY).split("## 経過")[1]
+    finding = evaluate(store, rules, catalog, day=DAY, exclusions=EXCLUSIONS)[0]
+    course = build_packet(store, finding, rules, catalog, day=DAY, exclusions=EXCLUSIONS).split(
+        "## 経過"
+    )[1]
     assert f"| {(DAY - timedelta(days=3)).isoformat()} | 0 |" in course
     assert f"| {(DAY - timedelta(days=4)).isoformat()} | 1 |" in course
 
@@ -331,7 +339,7 @@ def test_the_packet_says_it_was_not_sent(store, rules, catalog):
     finding = Finding(
         trigger="step_change", problem="x", question="y", started=DAY, metric="air.room"
     )
-    text = build_packet(store, finding, rules, catalog, day=DAY)
+    text = build_packet(store, finding, rules, catalog, day=DAY, exclusions=EXCLUSIONS)
     assert PREAMBLE in text
     assert "送信は行っていません" in text
 
@@ -348,8 +356,8 @@ def test_the_packet_contains_no_raw_series(store, rules, catalog):
             for step in range(100)
         ]
     )
-    finding = evaluate(store, rules, catalog, day=DAY)[0]
-    text = build_packet(store, finding, rules, catalog, day=DAY)
+    finding = evaluate(store, rules, catalog, day=DAY, exclusions=EXCLUSIONS)[0]
+    text = build_packet(store, finding, rules, catalog, day=DAY, exclusions=EXCLUSIONS)
     assert str(DAY_START_MS) not in text  # ミリ秒の時刻が出ない
     assert text.count("\n|") <= rules.course_days + 10  # 行数が日数の桁で収まる
 
@@ -357,8 +365,8 @@ def test_the_packet_contains_no_raw_series(store, rules, catalog):
 def test_the_packet_is_capped(store, rules, catalog):
     small = rules.model_copy(update={"max_chars": 500})
     with_step_change(store, before=12.0, after=22.0)
-    finding = evaluate(store, small, catalog, day=DAY)[0]
-    text = build_packet(store, finding, small, catalog, day=DAY)
+    finding = evaluate(store, small, catalog, day=DAY, exclusions=EXCLUSIONS)[0]
+    text = build_packet(store, finding, small, catalog, day=DAY, exclusions=EXCLUSIONS)
     assert len(text) <= 540
     assert "上限で切りました" in text  # **黙って切らない**
 
@@ -366,14 +374,16 @@ def test_the_packet_is_capped(store, rules, catalog):
 def test_a_derived_metric_states_how_it_was_computed(store, rules, catalog):
     """**1日平均どうしの差**であることを書く（生の差の平均とは一致しない）。"""
     with_step_change(store, before=12.0, after=22.0)
-    finding = evaluate(store, rules, catalog, day=DAY)[0]
-    assert DERIVED_BASIS in build_packet(store, finding, rules, catalog, day=DAY)
+    finding = evaluate(store, rules, catalog, day=DAY, exclusions=EXCLUSIONS)[0]
+    assert DERIVED_BASIS in build_packet(
+        store, finding, rules, catalog, day=DAY, exclusions=EXCLUSIONS
+    )
 
 
 def test_the_measurements_use_the_ingredients_of_a_derived_metric(store, rules, catalog):
     with_step_change(store, before=12.0, after=22.0)
-    finding = evaluate(store, rules, catalog, day=DAY)[0]
-    text = build_packet(store, finding, rules, catalog, day=DAY)
+    finding = evaluate(store, rules, catalog, day=DAY, exclusions=EXCLUSIONS)[0]
+    text = build_packet(store, finding, rules, catalog, day=DAY, exclusions=EXCLUSIONS)
     assert "gpu.0.hotspot" in text and "gpu.0.core" in text
 
 
@@ -396,8 +406,10 @@ def test_the_checks_compare_against_the_configured_thresholds(store, rules, cata
             )
         ]
     )
-    finding = evaluate(store, rules, catalog, day=DAY)[0]
-    text = build_packet(store, finding, rules, catalog, day=DAY, rule_set=rule_set)
+    finding = evaluate(store, rules, catalog, day=DAY, exclusions=EXCLUSIONS)[0]
+    text = build_packet(
+        store, finding, rules, catalog, day=DAY, exclusions=EXCLUSIONS, rule_set=rule_set
+    )
     threshold = rule_set.intake_high.threshold
     assert (
         f"air.gpu_intake（24時間 p95 29.1）: 正常範囲（intake_high の閾値 {threshold:.1f} 未満）"
@@ -423,8 +435,10 @@ def test_a_value_outside_the_threshold_is_marked(store, rules, catalog):
             )
         ]
     )
-    finding = evaluate(store, rules, catalog, day=DAY)[0]
-    text = build_packet(store, finding, rules, catalog, day=DAY, rule_set=rule_set)
+    finding = evaluate(store, rules, catalog, day=DAY, exclusions=EXCLUSIONS)[0]
+    text = build_packet(
+        store, finding, rules, catalog, day=DAY, exclusions=EXCLUSIONS, rule_set=rule_set
+    )
     assert "**外れている**" in text
 
 
@@ -435,8 +449,8 @@ def test_untested_things_are_not_claimed_as_checked(store, rules, catalog):
     いま測っていない。書けば、読む側は確認済みだと思う。
     """
     with_step_change(store, before=12.0, after=22.0)
-    finding = evaluate(store, rules, catalog, day=DAY)[0]
-    text = build_packet(store, finding, rules, catalog, day=DAY)
+    finding = evaluate(store, rules, catalog, day=DAY, exclusions=EXCLUSIONS)[0]
+    text = build_packet(store, finding, rules, catalog, day=DAY, exclusions=EXCLUSIONS)
     checked = text.split("## 試行済み")[1].split("## 争点")[0]
     for untested in ("ファン回転数", "負荷パターン"):
         assert untested not in checked
@@ -484,7 +498,7 @@ def test_the_same_case_is_not_written_twice(tmp_path):
 
 
 def test_nothing_is_written_when_there_is_nothing_to_escalate(store, rules, catalog, tmp_path):
-    assert evaluate(store, rules, catalog, day=DAY) == []
+    assert evaluate(store, rules, catalog, day=DAY, exclusions=EXCLUSIONS) == []
 
 
 def test_the_checks_ignore_readings_after_the_cutoff(store, rules, catalog):
@@ -506,8 +520,10 @@ def test_the_checks_ignore_readings_after_the_cutoff(store, rules, catalog):
             ),
         ]
     )
-    finding = evaluate(store, rules, catalog, day=DAY)[0]
-    checked = build_packet(store, finding, rules, catalog, day=DAY).split("## 試行済み")[1]
+    finding = evaluate(store, rules, catalog, day=DAY, exclusions=EXCLUSIONS)[0]
+    checked = build_packet(store, finding, rules, catalog, day=DAY, exclusions=EXCLUSIONS).split(
+        "## 試行済み"
+    )[1]
     assert "air.room=missing" not in checked
     assert "すべて ok" in checked
 

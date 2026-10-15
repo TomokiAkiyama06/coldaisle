@@ -13,7 +13,7 @@ import os
 import re
 import sqlite3
 import time
-from collections.abc import Iterable, Iterator, Sequence
+from collections.abc import Collection, Iterable, Iterator, Sequence
 from contextlib import contextmanager
 from enum import StrEnum
 from pathlib import Path
@@ -1172,13 +1172,17 @@ class SqliteStore:
         start_ms: int | None = None,
         end_ms: int | None = None,
         limit: int = 100,
+        exclude_rule_ids: Collection[str] = (),
+        exclude_metrics: Collection[str] = (),
     ) -> tuple[AlertRecord, ...]:
         """アラート一覧（FR-304）。書き込むのはルールエンジン（#18）。
 
         新しい順に返す。監視の一覧で先に見たいのは直近だからである。
+
+        ``exclude_*`` は LLM へ渡す一覧（決定記録 0131 §2.4a）。**件数の上限より先に除く。**
+        取ってから除くと、除いたぶんだけ件数が減り、その差から存在が分かる。
         """
-        clauses: list[str] = []
-        params: list[object] = []
+        clauses, params = _alert_exclusion(exclude_rule_ids, exclude_metrics)
         if state is not None:
             clauses.append("state = ?")
             params.append(state)
@@ -1197,20 +1201,37 @@ class SqliteStore:
         ).fetchall()
         return tuple(AlertRecord.model_validate(dict(row)) for row in rows)
 
-    def alert_severity_counts(self, *, state: str) -> dict[AlertSeverity, int]:
+    def alert_severity_counts(
+        self,
+        *,
+        state: str,
+        exclude_rule_ids: Collection[str] = (),
+        exclude_metrics: Collection[str] = (),
+    ) -> dict[AlertSeverity, int]:
         """``state`` のアラートを severity ごとに数える（件数上限なし）。
 
         一覧（``alerts()``）は新しい順に件数で打ち切るため、古い critical を
         見落とす。重大度の判定は一覧ではなくこちらで行う（#66）。
+        ``exclude_*`` は ``alerts()`` と同じ（決定記録 0131 §2.4a）。
         """
+        clauses, params = _alert_exclusion(exclude_rule_ids, exclude_metrics)
+        clauses.insert(0, "state = ?")
+        params.insert(0, state)
         rows = self._conn.execute(
-            "SELECT severity, COUNT(*) AS n FROM alerts WHERE state = ? GROUP BY severity",
-            (state,),
+            f"SELECT severity, COUNT(*) AS n FROM alerts WHERE {' AND '.join(clauses)} "
+            "GROUP BY severity",
+            params,
         ).fetchall()
         return {AlertSeverity(row["severity"]): int(row["n"]) for row in rows}
 
     def fired_alerts(
-        self, *, start_ms: int, end_ms: int, limit: int = 100
+        self,
+        *,
+        start_ms: int,
+        end_ms: int,
+        limit: int = 100,
+        exclude_rule_ids: Collection[str] = (),
+        exclude_metrics: Collection[str] = (),
     ) -> tuple[AlertRecord, ...]:
         """`fired_ms` が `[start_ms, end_ms)` に入るアラート（#25）。
 
@@ -1220,13 +1241,43 @@ class SqliteStore:
 
         `alerts()` と分けたのは、一覧（FR-304）が見たいのは「いつ始まったか」で、
         並びも母数も別物だからである。引数で切り替えると呼び分けを間違える。
+
+        ``exclude_*`` は ``alerts()`` と同じ（件数の上限より先に除く。決定記録 0131 §2.4a）。
         """
+        clauses, params = _alert_exclusion(exclude_rule_ids, exclude_metrics)
+        where = "".join(f"AND {clause} " for clause in clauses)
         rows = self._conn.execute(
             "SELECT id, rule_id, severity, state, metric, started_ms, fired_ms, resolved_ms, "
             "trigger_value, threshold, detail FROM alerts "
-            "WHERE fired_ms IS NOT NULL AND fired_ms >= ? AND fired_ms < ? "
+            f"WHERE fired_ms IS NOT NULL AND fired_ms >= ? AND fired_ms < ? {where}"
             "ORDER BY fired_ms DESC, id DESC LIMIT ?",
-            (start_ms, end_ms, limit),
+            (start_ms, end_ms, *params, limit),
+        ).fetchall()
+        return tuple(AlertRecord.model_validate(dict(row)) for row in rows)
+
+    def alerts_firing_at(
+        self,
+        at_ms: int,
+        *,
+        limit: int = 100,
+        exclude_rule_ids: Collection[str] = (),
+        exclude_metrics: Collection[str] = (),
+    ) -> tuple[AlertRecord, ...]:
+        """``at_ms`` の時点で発火したまま続いていたアラート（決定記録 0131 §2.4）。
+
+        ``fired_ms < at_ms`` で、まだ解除されていないか ``at_ms`` 以降に解除されたもの。
+        **今の ``state`` では見ない。** 過去の日を作り直したとき、その後に解除された
+        アラートもその日の終わりには続いていた。古い順に返す（いつから続いているか）。
+        """
+        clauses, params = _alert_exclusion(exclude_rule_ids, exclude_metrics)
+        where = "".join(f"AND {clause} " for clause in clauses)
+        rows = self._conn.execute(
+            "SELECT id, rule_id, severity, state, metric, started_ms, fired_ms, resolved_ms, "
+            "trigger_value, threshold, detail FROM alerts "
+            "WHERE fired_ms IS NOT NULL AND fired_ms < ? "
+            f"AND (resolved_ms IS NULL OR resolved_ms >= ?) {where}"
+            "ORDER BY fired_ms ASC, id ASC LIMIT ?",
+            (at_ms, at_ms, *params, limit),
         ).fetchall()
         return tuple(AlertRecord.model_validate(dict(row)) for row in rows)
 
@@ -1508,3 +1559,18 @@ def _sequenced_trace(row: sqlite3.Row) -> SequencedControlTrace:
         schema_version=row["schema_version"],
         trace_json=row["trace_json"],
     )
+
+
+def _alert_exclusion(
+    rule_ids: Collection[str], metrics: Collection[str]
+) -> tuple[list[str], list[object]]:
+    """アラートの検索から除く条件（決定記録 0131 §2.4a）。値はすべて束縛変数で渡す。"""
+    clauses: list[str] = []
+    params: list[object] = []
+    if rule_ids:
+        clauses.append(f"rule_id NOT IN ({', '.join('?' for _ in rule_ids)})")
+        params.extend(sorted(rule_ids))
+    if metrics:
+        clauses.append(f"(metric IS NULL OR metric NOT IN ({', '.join('?' for _ in metrics)}))")
+        params.extend(sorted(metrics))
+    return clauses, params
