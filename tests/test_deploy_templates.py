@@ -476,7 +476,11 @@ def test_the_deploy_guide_checks_permissions_by_opening_not_by_test():
     assert 'sh -c \'cat -- "$1" > /dev/null && ! (: >> "$1") 2> /dev/null\' _ "$f"' in guide
     assert 'sh -c \'! cat -- "$1" > /dev/null 2>&1\' _ "$f"' in guide
     assert 'sh -c \': >> "$1"\' _ "$f" || echo "書けない: $f"' in guide
-    assert 'sh -c \'touch -- "$1/.probe-fand" && rm -- "$1/.probe-fand"\'' in guide
+    assert 'sh -c \'t=$(mktemp -p "$1" .probe-XXXXXXXX) && rm -- "$t"\'' in guide
+    # 目印は推測できない名前で排他的に作る。固定の名前の touch は、先に置かれた同じ名前のファイルで
+    # 「書けない」と誤って判定される（決定記録 0141 §2.5）
+    for block in blocks:
+        assert not re.search(r"touch\b[^\n]*\.probe-", block), block
 
 
 PRODUCTION_RAISE = "/opt/coldaisle/.venv/bin/python -I -m coldaisle.authority_cli raise"
@@ -534,10 +538,11 @@ def test_the_deploy_guide_checks_every_role_named_in_0134():
     # 手順のコードブロックで目印のファイルを作ったら、同じ行で消す
     # （権限が広すぎるときにファイルを残さない）
     code = "".join(re.findall(r"```bash\n(.*?)```", section, flags=re.DOTALL))
-    probes = [line for line in code.splitlines() if "touch -- " in line]
+    probes = [line for line in code.splitlines() if "mktemp -p " in line and ".probe-" in line]
     assert probes
     for line in probes:
-        assert "rm -f -- " in line, line
+        assert ".probe-XXXXXXXX" in line, line
+        assert 'rm -f -- "$t"' in line, line
 
 
 def test_fand_states_every_timeout():

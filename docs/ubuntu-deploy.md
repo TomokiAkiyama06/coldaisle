@@ -549,7 +549,8 @@ hwmon には `/dev` のノードが無いので、udev の `GROUP=` / `MODE=` �
    実際の fand は書けるのに確かめだけが落ちます）。一時的な unit で同じグループを渡します。
    判定は `test -w` ではなく実際に開く操作で行います（決定記録 0134 §2.4。`test` の答えは実装で変わり、
    補助グループで書けるファイルを外部コマンドの `test -w` が「書けない」と報告した例があります）。
-   ファイルは `: >>`（追記で開くだけで中身は変わりません）、ディレクトリは目印のファイルを作って消すことで見ます
+   ファイルは `: >>`（追記で開くだけで中身は変わりません）、ディレクトリは推測できない名前の目印を
+   `mktemp` で排他的に作って消すことで見ます（決定記録 0141 §2.5）
 
    ```bash
    d=/var/lib/coldaisle
@@ -557,7 +558,7 @@ hwmon には `/dev` のノードが無いので、udev の `GROUP=` / `MODE=` �
    sudo systemd-run --pipe --wait --quiet \
         -p User=coldaisle-fan -p Group=coldaisle-fan \
         -p "SupplementaryGroups=coldaisle coldaisle-admin coldaisle-authority" \
-        sh -c 'touch -- "$1/.probe-fand" && rm -- "$1/.probe-fand"' _ "$d" || echo "書けない: $d"
+        sh -c 't=$(mktemp -p "$1" .probe-XXXXXXXX) && rm -- "$t"' _ "$d" || echo "書けない: $d"
    for f in "$d"/coldaisle.db "$d"/coldaisle.db-wal "$d"/coldaisle.db-shm "$d"/coldaisle.db-journal; do
      # 無いファイルを : >> で開くと作ってしまうので、在るものだけを見る（unit は手順 1 で止めてある）
      sudo test -e "$f" || continue
@@ -688,7 +689,7 @@ CLI の書いた journal を読むと、走行中なら `SHADOW` へ下がり、
    sudo systemd-run --pipe --wait --quiet \
         -p User=coldaisle-fan -p Group=coldaisle-fan \
         -p "SupplementaryGroups=coldaisle coldaisle-admin coldaisle-authority" \
-        sh -c 'touch -- "$1/.probe-fand" && rm -- "$1/.probe-fand"' _ "$new" || echo "書けない: $new"
+        sh -c 't=$(mktemp -p "$1" .probe-XXXXXXXX) && rm -- "$t"' _ "$new" || echo "書けない: $new"
    for f in "$new"/authority.json "$new"/.authority.lock; do
      # 無いファイルを : >> で開くと作ってしまうので、在るものだけを見る（fand は手順 1 で止めてある）
      sudo test -e "$f" || continue
@@ -942,8 +943,11 @@ Registry と制御設定への書き込み、root。artifact の本体は `raise
    - ファイルに書けない: `sh -c ': >> "$1"' _ <ファイル>` が**失敗する**（追記で開くだけで、開けても中身は
      変わりません）。無いファイルには行いません（ディレクトリに書ければ作ってしまうため。作れるかはディレクトリの
      確認で見ます）
-   - ディレクトリに書けない: `touch -- <ディレクトリ>/.probe-0134` が**失敗する**。成功したら作ったファイルを消し、
-     「期待と違う」として扱います
+   - ディレクトリに書けない: `mktemp -p <ディレクトリ> .probe-XXXXXXXX` が**失敗する**。成功したら作ったファイルを
+     すぐ消し、「期待と違う」として扱います。目印は**推測できない名前で排他的に**作ります（`mktemp` は乱数の名前を
+     `O_EXCL` で作る）。固定の名前（`.probe-0134` など）を `touch` で作る形は使いません。書けるディレクトリに、
+     別の利用者が書けない同じ名前のファイルを先に置いておくと、`touch` が失敗して「書けない」と誤って判定される
+     ためです（決定記録 [`0141`](decisions/0141-c1-import-scan-scope.md) §2.5）
    - unit と同じ資格で見るときは、unit と同じ `User=`・`Group=`・`SupplementaryGroups=` を渡した `systemd-run` の
      中で、上の操作を `sh -c` で行います（6.4 の手順 4 と同じ）
 
@@ -974,15 +978,15 @@ Registry と制御設定への書き込み、root。artifact の本体は `raise
         `registry.json` の確認は手順 3 の書き込みの後に行う）
       - flock を取れる: `flock -n /var/lib/coldaisle-registry/.registry.lock true; echo $?` が `0`
       - **読めない・書けない**（すべて権限の error になること）: `cat /etc/coldaisle/coldaisle.env`、
-        `cat /etc/coldaisle/control-admin.yaml`、`ls /etc/coldaisle`、`touch /etc/coldaisle/control-config/.probe-0134`、
-        `touch /var/lib/coldaisle-registry/.probe-0134`、`sh -c ': >> /var/lib/coldaisle-registry/registry.json'`、
-        `sh -c ': >> /var/lib/coldaisle-registry/.registry.lock'`（`touch` が通ってしまったら、作った
-        `.probe-0134` を消して「期待と違う」とする）
+        `cat /etc/coldaisle/control-admin.yaml`、`ls /etc/coldaisle`、`mktemp -p /etc/coldaisle/control-config .probe-XXXXXXXX`、
+        `mktemp -p /var/lib/coldaisle-registry .probe-XXXXXXXX`、`sh -c ': >> /var/lib/coldaisle-registry/registry.json'`、
+        `sh -c ': >> /var/lib/coldaisle-registry/.registry.lock'`（`mktemp` が通ってしまったら、出力された
+        目印を消して「期待と違う」とする）
    3. **Registry の書き手の uid で**: `coldaisle-registry status --root /var/lib/coldaisle-registry` が通り、
       書く操作（開発用の artifact の `register` など）の後も 2 の「読める」が通ること。作られたファイルが `0640`・
       グループ `coldaisle-registry`・ACL 付きであることを `getfacl` で見る。書き手が authority のディレクトリへ
-      書けないこと（`touch /var/lib/coldaisle-authority/.probe-0134` が失敗する。通ってしまったら消して
-      「期待と違う」とする）
+      書けないこと（`mktemp -p /var/lib/coldaisle-authority .probe-XXXXXXXX` が失敗する。通ってしまったら
+      出力された目印を消して「期待と違う」とする）
    4. **fand と同じグループで**（6.4 の手順 4 と同じ `systemd-run`）: 制御設定と `registry.json` を読めて、
       どちらにも書けないこと。判定は `test -r` / `test -w` ではなく、`cat` で読めることと、`: >>`
       （追記で開くだけで中身は変わらない）が**失敗する**ことで見ます（決定記録 0134 §2.4）
@@ -1076,9 +1080,10 @@ Registry と制御設定への書き込み、root。artifact の本体は `raise
       while IFS= read -r d; do
         while [ "$d" != / ]; do printf '%s\n' "$d"; d=$(dirname -- "$d"); done
       done < base.txt | sort -u - dirs.txt -o dirs.txt
-      # ディレクトリ: 作れたら「書ける」（作ったものは消す）。無いディレクトリは作れないので出ない（祖先で見る）
+      # ディレクトリ: 推測できない名前の目印を排他的に作れたら「書ける」（作ったものはすぐ消す）。
+      # 無いディレクトリは作れないので出ない（祖先で見る）
       while IFS= read -r d; do
-        if touch -- "$d/.probe-0134" 2>/dev/null; then rm -f -- "$d/.probe-0134"; echo "書ける: $d"; fi
+        if t=$(mktemp -p "$d" .probe-XXXXXXXX 2>/dev/null); then rm -f -- "$t"; echo "書ける: $d"; fi
       done < dirs.txt
       # ファイル（.pth・.py・pyvenv.cfg・interpreter の実体を含む）: 追記で開けたら「書ける」（中身は変わらない）。
       # symlink のファイルは -type f に出ないが、その実体は上で roots に入っており、ここで実体として調べる
@@ -1088,7 +1093,7 @@ Registry と制御設定への書き込み、root。artifact の本体は `raise
       done < roots.txt
       # --registry-limits の置き場所（sys.path には入らない）: ディレクトリに書けず、model-registry.yaml を読めて書けない
       c=/opt/coldaisle/config
-      if touch -- "$c/.probe-0134" 2>/dev/null; then rm -f -- "$c/.probe-0134"; echo "書ける: $c"; fi
+      if t=$(mktemp -p "$c" .probe-XXXXXXXX 2>/dev/null); then rm -f -- "$t"; echo "書ける: $c"; fi
       cat -- "$c/model-registry.yaml" > /dev/null || echo "読めない: $c/model-registry.yaml"
       if (: >> "$c/model-registry.yaml") 2>/dev/null; then echo "書ける: $c/model-registry.yaml"; fi
       ```
@@ -1136,7 +1141,7 @@ Registry と制御設定への書き込み、root。artifact の本体は `raise
       ```bash
       ng() { echo "期待と違う: $*"; }
       for d in /var/lib/coldaisle-authority /etc/coldaisle/control-config /var/lib/coldaisle-registry; do
-        if touch -- "$d/.probe-0134" 2> /dev/null; then rm -f -- "$d/.probe-0134"; ng "書ける: $d"; fi
+        if t=$(mktemp -p "$d" .probe-XXXXXXXX 2> /dev/null); then rm -f -- "$t"; ng "書ける: $d"; fi
       done
       f=/var/lib/coldaisle-authority/authority.json
       if [ -e "$f" ] && (: >> "$f") 2> /dev/null; then ng "書ける: $f"; fi
