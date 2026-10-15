@@ -60,6 +60,7 @@ uv run coldaisle-control max --reason "負荷試験の前に全開"  # MAX（期
 uv run coldaisle-control rollback-authority --reason "挙動を見直す"  # Authority を Baseline へ（lower-authority --to-stage も。**上げる操作は無い**。#92）
 uv run coldaisle-authority raise --authority-root <dir> --approval <承認.json> --report <報告.json> --config-dir var/control-config --registry-root var/model-registry  # Authority を1段上げる。**人が自分の uid で実行する唯一の昇格の入口**。承認者は実行した uid（`--approver` は無い。#92 / 決定記録 0086）
 #   --registry-root は開発でも共有の root の形にする（`chmod 2770` 済み・`.registry.lock` がある）。CLI は Registry を作らず、lock は O_RDONLY で flock だけ（決定記録 0104 §2.4 / 0105）
+#   本番は root の所有の `/opt/coldaisle/.venv/bin/python -I -m coldaisle.authority_cli raise ... --registry-limits /opt/coldaisle/config`（`uv run` と console script を使わない。docs/ubuntu-deploy.md 6.7 / 決定記録 0134 §2.2）
 uv run coldaisle-authority rollback --authority-root <dir> --reason "fand 停止中に戻す"  # fand が止まっているときの rollback（uid で拒まない）
 COLDAISLE_DB=var/coldaisle.db uv run uvicorn coldaisle.api:app --host 127.0.0.1 --port 8000
 COLDAISLE_DB=var/coldaisle.db uv run uvicorn coldaisle.server:app --port 8000  # + AI ツールの窓口

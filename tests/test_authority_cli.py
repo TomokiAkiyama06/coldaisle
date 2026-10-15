@@ -24,7 +24,9 @@ import logging
 import os
 import shutil
 import stat
+import subprocess
 import sys
+import tomllib
 from pathlib import Path
 from typing import Any
 
@@ -372,6 +374,80 @@ def test_nothing_imports_the_cli() -> None:
     )
     assert importers == []
     assert authority_cli.__name__ == "coldaisle.authority_cli"
+
+
+# ======================================== 6b. 本番の起動の形（決定記録 0134 §2.2 / §2.4 の 1b）
+
+_FAKE_MARK = "MARK-0134"
+
+
+def _fake_package(tmp_path: Path) -> Path:
+    """読まれたら目印を出して止まるだけの偽の `coldaisle` を置く（承認者の書ける場所の役）。"""
+    fake = tmp_path / "fake"
+    (fake / "coldaisle").mkdir(parents=True)
+    (fake / "coldaisle" / "__init__.py").write_text(
+        f'raise SystemExit("{_FAKE_MARK}")\n', encoding="utf-8"
+    )
+    return fake
+
+
+def _run(args: list[str], *, cwd: Path, pythonpath: Path) -> subprocess.CompletedProcess[str]:
+    env = {**os.environ, "PYTHONPATH": str(pythonpath)}
+    return subprocess.run(
+        [sys.executable, *args],
+        cwd=cwd,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+
+
+def test_the_isolated_entry_ignores_pythonpath_and_the_working_directory(tmp_path: Path) -> None:
+    """**`python -I -m coldaisle.authority_cli` は承認者の書ける場所の `coldaisle` を読まない。**
+
+    `PYTHONPATH` と作業ディレクトリの両方を偽の package に向けても、検証を行うコードは
+    導入された `coldaisle` のまま（0134 §2.2）。`__main__` の入口が消えると `-m` が何もせず
+    終わるので、使い方が出ることも見る。
+    """
+    fake = _fake_package(tmp_path)
+    where = _run(
+        ["-I", "-c", "import coldaisle; print(coldaisle.__file__)"], cwd=fake, pythonpath=fake
+    )
+    assert where.returncode == 0, where.stderr
+    assert _FAKE_MARK not in where.stdout + where.stderr
+    import coldaisle
+
+    assert Path(where.stdout.strip()).resolve() == Path(coldaisle.__file__).resolve()
+
+    usage = _run(["-I", "-m", "coldaisle.authority_cli", "--help"], cwd=fake, pythonpath=fake)
+    assert usage.returncode == 0, usage.stderr
+    assert _FAKE_MARK not in usage.stdout + usage.stderr
+    assert "raise" in usage.stdout and "rollback" in usage.stdout
+
+
+def test_without_isolation_the_fake_package_would_win(tmp_path: Path) -> None:
+    """対照: `-I` が無ければ `PYTHONPATH` の偽の package が先に読まれる。
+
+    console script（`.venv/bin/coldaisle-authority`）を本番で使わない理由
+    （0134 §1.2 の 1 / §4 の 6）。
+    この対照が崩れると、上の試験は偽の package が効かないまま通っている。
+    """
+    fake = _fake_package(tmp_path)
+    loaded = _run(["-c", "import coldaisle"], cwd=tmp_path, pythonpath=fake)
+    assert loaded.returncode != 0
+    assert _FAKE_MARK in loaded.stderr
+
+
+def test_the_module_entry_is_the_console_script_entry() -> None:
+    """`-m coldaisle.authority_cli` と console script は同じ `main()` を呼ぶ（0134 §2.2）。"""
+    pyproject = Path(__file__).resolve().parents[1] / "pyproject.toml"
+    data = tomllib.loads(pyproject.read_text(encoding="utf-8"))
+    assert data["project"]["scripts"]["coldaisle-authority"] == "coldaisle.authority_cli:main"
+    source = Path(authority_cli.__file__).read_text(encoding="utf-8")
+    assert 'if __name__ == "__main__":' in source
+    assert "raise SystemExit(main())" in source
 
 
 # ================================================================ 7. 境界の失敗（codex）
