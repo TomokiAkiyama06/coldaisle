@@ -1,7 +1,7 @@
 # 決定記録 0138: 既存の `gpu.<index>.fan_speed` も LLM へ渡すものから除く（0131 §2.4a の除外の一覧に足す）
 
 - **種別**: Decision Record
-- **Status**: Proposed
+- **Status**: FINAL（2026-10-15、リポジトリ所有者の承認）
 - **Date**: 2026-10-15
 - **Supersedes**: なし（0131 §2.4a の一覧に項目を足す。0131 の原則と経路の閉じ方は変えない）
 - **関連**: [`0131`](0131-gpu-fan-service-alert.md) §2.4a / §5 の 1 /
