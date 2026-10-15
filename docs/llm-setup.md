@@ -117,3 +117,72 @@ print('利用可' if result.available else f'利用不可: {result.reason}')
 
 **LLM が止まっていても、取り込み・保存・API・ダッシュボード・ルールエンジンは
 そのまま動きます**（FR-507）。この確認は AI 機能を使うときだけ必要です。
+
+---
+
+## Claude API（ローカル LLM が入るまでの代わり。決定記録 0143）
+
+導入先にローカル LLM（vLLM。#58）が入るまでの間だけ、日次レポートの所見・アラートの説明・
+Server Health の任意要約を Claude API で作れます。**既定では使いません。**
+`COLDAISLE_LLM_PROVIDER=anthropic` と明示したときだけ外へ送ります（鍵を置いただけでは送らない）。
+
+| 環境変数 | 値 |
+|---|---|
+| `COLDAISLE_LLM_PROVIDER` | `anthropic`（未設定・空・`openai_compatible` なら今のまま） |
+| `ANTHROPIC_API_KEY` | Claude API の鍵。`/etc/coldaisle/coldaisle.env` にだけ書く |
+| `ANTHROPIC_MODEL` | モデル ID。**推奨は `claude-haiku-5-5`**。所見の質が足りなければ `claude-sonnet-5-5` |
+
+- **送るのは今のローカル LLM に渡すのと同じ集計値だけです**（日次レポートの表・アラートの Evidence の行・
+  Server Health の固定の文）。生の時系列・decision trace・ツールの結果・案件資料（`coldaisle-escalate`）は送りません
+- `config/report.yaml` の除外（`llm_excluded_metrics` / `llm_excluded_rules`。0131 §2.4a / 0138）はそのまま当たります
+- 1 回の長さ・1 日の回数・`effort` の上限は `config/ai.yaml` の `anthropic:` です。上限に達したら呼ばずに、
+  所見・説明の無い今の形で届きます（監視と通知は止まりません。FR-507）
+- 鍵はログ・応答の `reason`・通知に出ません（失敗の理由は HTTP の状態コードと `error.type` だけ）
+
+### 導入先で有効にする
+
+**前提: 決定記録 0143 が承認され、0138 の実装（#320）と本機能が `/opt/coldaisle` に入っていること。**
+0138 の前は `gpu.*.fan_speed` が LLM の入力に残っており、それが外へ出ます。
+
+1. Anthropic の Console で、この鍵の月の上限（spend limit）を設定する（費用の正本。`config/ai.yaml` の上限は粗い蓋）
+2. 鍵の変数名が `ANTHROPIC_API_KEY` であることを、**値を表示せずに**確かめる
+
+   ```bash
+   sudo grep -c '^ANTHROPIC_API_KEY=.' /etc/coldaisle/coldaisle.env   # 1 なら良い。0 なら名前が違う
+   sudo grep -o '^[A-Z_]*=' /etc/coldaisle/coldaisle.env              # 変数名だけを一覧する
+   ```
+
+   別の名前で登録していたら、`sudoedit` で `ANTHROPIC_API_KEY=` に直す
+
+3. 残りの 2 つを足す
+
+   ```bash
+   sudoedit /etc/coldaisle/coldaisle.env
+   # COLDAISLE_LLM_PROVIDER=anthropic
+   # ANTHROPIC_MODEL=claude-haiku-5-5
+   ```
+
+4. 環境変数は起動時に読むので、常駐する 2 つを再起動する（`coldaisle-report` は次のタイマーの起動から効く）
+
+   ```bash
+   sudo systemctl restart coldaisle-daemon coldaisle-api
+   ```
+
+5. 確かめる。前日のレポートを**送らずに**作り、所見が付くかを見る（1 回ぶんの上限を使う）
+
+   ```bash
+   sudo systemd-run --wait --pipe --uid=coldaisle --gid=coldaisle \
+     -p WorkingDirectory=/opt/coldaisle -p EnvironmentFile=/etc/coldaisle/coldaisle.env \
+     /opt/coldaisle/.venv/bin/coldaisle-report --db /var/lib/coldaisle/coldaisle.db --no-send --print
+   journalctl -u coldaisle-daemon -u coldaisle-api --since -10min | grep -i 'claude'
+   ```
+
+   「所見」の節が出れば有効です。出なければ journal の `reason`（`HTTP 401: authentication_error` など）を見ます
+
+### ローカル LLM が入ったら戻す（0143 §2.9）
+
+1. vLLM を動かし、上の「動作確認」を通す
+2. `/etc/coldaisle/coldaisle.env` から `COLDAISLE_LLM_PROVIDER` を消し（または `openai_compatible`）、
+   `OPENAI_BASE_URL` / `MODEL_NAME` を書く
+3. `ANTHROPIC_API_KEY` を消し、Console で鍵を無効にする
+4. `sudo systemctl restart coldaisle-daemon coldaisle-api`

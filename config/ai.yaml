@@ -36,3 +36,21 @@ send_thinking_flag: true
 # アラートに Evidence 形式の説明を後追いで付けるか（#38 / FR-508）。
 # **生成は通知経路をブロックしません。** 失敗したら素のアラートだけが届きます
 explain_alerts: true
+
+# --------------------------------------------------------------------------
+# Claude API を使うときの上限（決定記録 0143 §2.5 / #324）
+#
+# **ローカル LLM が導入先に入るまでの間だけの代わり。** 使うのは環境変数で
+# `COLDAISLE_LLM_PROVIDER=anthropic` と明示したときだけ（既定は上の OpenAI 互換のまま）。
+# 鍵（ANTHROPIC_API_KEY）とモデル ID（ANTHROPIC_MODEL）は環境変数から読み、ここには書かない。
+#
+# 上限に達したら**呼ばずに**「利用不可」を返す。所見・説明が付かないだけで、監視と通知は動く（FR-507）。
+anthropic:
+  # 1 回の応答の上限。上の max_tokens と小さいほうを送る
+  max_tokens: 1024
+  # 1 プロセス・1 日（ローカル時刻の日付）あたりの HTTP 要求の回数。再試行も 1 回と数える。
+  # daemon（アラートの説明）・report（日次レポート）・API（Server Health の要約）がそれぞれ数える。
+  # プロセスの中で数えるので再起動で 0 に戻る。**課金の正本は Anthropic の Console の spend limit**
+  daily_call_limit: 200
+  # output_config.effort。短い分類・要約なので考える量を抑える（low / medium / high）
+  effort: low

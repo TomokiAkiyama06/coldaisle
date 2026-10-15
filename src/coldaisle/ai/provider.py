@@ -1,7 +1,10 @@
-"""OpenAI 互換 API の Provider（L3）。#21
+"""OpenAI 互換 API の Provider（L3）と Provider の選び方。#21 / #324
 
 Ollama と vLLM はどちらも `/v1/chat/completions` を話す。**接続先とモデル名を
 環境変数で差し替えるだけ**でバックエンドが切り替わる（FR-501 / 要件 §7.2）。
+
+ローカル LLM が導入先に入るまでの間だけ、`COLDAISLE_LLM_PROVIDER=anthropic` で
+Claude API（`coldaisle.ai.claude_provider`）を選べる（決定記録 0143）。**既定は今のまま。**
 
 **LLM が不達でも監視は止まらない**（FR-507）。この層は接続の失敗を
 例外として上へ投げず、「利用不可」という結果として返す。
@@ -16,7 +19,7 @@ import re
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Literal, Protocol
 
 import httpx
 import yaml
@@ -29,6 +32,16 @@ LOGGER = logging.getLogger("coldaisle.ai")
 BASE_URL_ENV = "OPENAI_BASE_URL"
 MODEL_ENV = "MODEL_NAME"
 API_KEY_ENV = "OPENAI_API_KEY"  # pragma: allowlist secret - 変数名であって値ではない
+
+PROVIDER_ENV = "COLDAISLE_LLM_PROVIDER"
+"""どの Provider を使うか（決定記録 0143 §2.2）。**未設定なら今のまま（OpenAI 互換）。**
+
+`config/ai.yaml` に置かないのは、導入先の `config/` が clone のまま root の所有であり、
+接続先を環境変数だけで切り替える 0014 §2.1 と揃えるため。
+"""
+
+OPENAI_COMPATIBLE = "openai_compatible"
+ANTHROPIC = "anthropic"
 
 THINK_BLOCK = re.compile(r"<think>(.*?)</think>", re.DOTALL)
 """閉じた思考の出力。**利用者へ見せる本文からは外す。**
@@ -43,6 +56,22 @@ OPEN_THINK = "<think>"
 `max_tokens` に達すると `</think>` が出ないまま切れる。**長い診断のときだけ
 内部の推論が本文に混じる**ことになるので、閉じタグが無くても切り離す。
 """
+
+
+class AnthropicLimits(BaseModel):
+    """`config/ai.yaml` の `anthropic:`。**費用と回数の上限**（決定記録 0143 §2.5）。
+
+    接続先・モデル ID・鍵は含まない（環境変数から）。
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    max_tokens: int = Field(gt=0)
+    """1 回の応答の上限。`AiSettings.max_tokens` と小さいほうを送る。"""
+    daily_call_limit: int = Field(ge=1)
+    """1 プロセス・1 日（ローカル時刻の日付）あたりの HTTP 要求の回数。再試行も 1 回と数える。"""
+    effort: Literal["low", "medium", "high"]
+    """`output_config.effort`。短い分類・要約なので推奨は `low`。"""
 
 
 class AiSettings(BaseModel):
@@ -62,6 +91,8 @@ class AiSettings(BaseModel):
     send_thinking_flag: bool
     explain_alerts: bool = True
     """発火したアラートに Evidence 形式の説明を後追いで付けるか（#38）。"""
+    anthropic: AnthropicLimits | None = None
+    """Claude API を使うときの上限（決定記録 0143 §2.5）。無ければ Claude API を使わない。"""
 
     @classmethod
     def from_yaml(cls, path: Path) -> AiSettings:
@@ -228,10 +259,12 @@ class OpenAiCompatibleProvider:
         return ChatResult(available=False, reason=reason, model=self.model)
 
 
+@dataclass(frozen=True)
 class UnavailableProvider:
     """設定されていないときの代わり。**常に「利用不可」を返す。**
 
     `None` を配って呼び出し側に分岐を書かせると、書き忘れが落ちる経路になる。
+    `reason` には設定の値を入れない（変数名だけ。鍵を出さない。決定記録 0143 §2.4）。
     """
 
     reason: str = "LLM が設定されていない（OPENAI_BASE_URL / MODEL_NAME）"
@@ -266,6 +299,22 @@ def split_thinking(content: str) -> tuple[str, str]:
 
 
 def from_env(settings: AiSettings) -> Provider:
-    """使える Provider を返す。**必ず何かを返す**（`None` を返さない）。"""
-    provider = OpenAiCompatibleProvider.from_env(settings)
-    return provider if provider is not None else UnavailableProvider()
+    """使える Provider を返す。**必ず何かを返す**（`None` を返さない）。
+
+    `COLDAISLE_LLM_PROVIDER` で選ぶ（決定記録 0143 §2.2）。未設定・空なら今のまま OpenAI 互換。
+    知らない値でも例外にしない（**LLM の設定の誤りで監視を止めない**。FR-507）。
+    """
+    choice = (os.environ.get(PROVIDER_ENV) or OPENAI_COMPATIBLE).strip()
+    if choice == OPENAI_COMPATIBLE:
+        provider = OpenAiCompatibleProvider.from_env(settings)
+        return provider if provider is not None else UnavailableProvider()
+    if choice == ANTHROPIC:
+        # 関数の中で import する: claude_provider がこのモジュールの型を使うため（循環を避ける）
+        from coldaisle.ai.claude_provider import AnthropicProvider
+
+        return AnthropicProvider.from_env(settings)
+    LOGGER.error(
+        "LLM の Provider の指定が不正なので AI を使わない（監視は継続する）",
+        extra={logs.FIELDS_KEY: {"env": PROVIDER_ENV, "value": choice[:40]}},
+    )
+    return UnavailableProvider(reason=f"{PROVIDER_ENV} の値が不正")
