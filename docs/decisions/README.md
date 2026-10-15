@@ -74,7 +74,7 @@ docs/decisions/NNNN-<slug>.md      例: 0002-metric-naming.md
 | [0002](0002-metric-naming.md) | メトリクス命名規約とDBスキーマ（ロング形式） | FINAL |
 | [0003](0003-device-json-schema.md) | デバイス出力 JSON スキーマ v1 | FINAL（§2.2 の `hello` の「電源投入時に1回」は [0129](0129-periodic-hello.md) で置き換え） |
 | [0004](0004-storage-read-contract.md) | ストレージ層の読み出し契約 | FINAL |
-| [0005](0005-model-selection.md) | ローカルモデルは Qwen3.8-27B 単体構成 | FINAL |
+| [0005](0005-model-selection.md) | ローカルモデルは Qwen3.8-27B 単体構成 | FINAL（ローカル LLM が入るまでの間だけ Claude API を使う点は [0143](0143-claude-api-interim-provider.md) で補う。Proposed） |
 | [0006](0006-gpu-mode-and-mixed-state.md) | GPU Mode を2段階にし `mixed` を異常として扱う | FINAL |
 | [0007](0007-ingest-pipeline.md) | 取り込みパイプラインの規約 | FINAL |
 | [0008](0008-rollup-and-retention.md) | ロールアップ・保持期間・日次CSVの規約 | FINAL |
@@ -83,7 +83,7 @@ docs/decisions/NNNN-<slug>.md      例: 0002-metric-naming.md
 | [0011](0011-dashboard.md) | 開発用ダッシュボードの方針 | FINAL |
 | [0012](0012-rule-engine.md) | ルールエンジンの規約 | FINAL |
 | [0013](0013-notifications.md) | 通知の規約 | FINAL |
-| [0014](0014-llm-provider.md) | LLM Provider の規約 | FINAL |
+| [0014](0014-llm-provider.md) | LLM Provider の規約 | FINAL（§2.1 の Provider の選び方は [0143](0143-claude-api-interim-provider.md) で足す。Proposed） |
 | [0015](0015-llm-tools.md) | 読み取り専用ツールの規約 | FINAL |
 | [0016](0016-evidence-alerts.md) | アラート説明の Evidence 形式 | FINAL |
 | [0017](0017-daily-report.md) | 日次レポートの規約 | FINAL |
@@ -208,3 +208,4 @@ docs/decisions/NNNN-<slug>.md      例: 0002-metric-naming.md
 | [0138](0138-gpu-fan-speed-llm-exclusion.md) | 既存の `gpu.*.fan_speed`（0043。NVML の目標値）も 0131 §2.4a の `llm_excluded_metrics` に足し、LLM へ渡すものすべて（日次レポートの所見・AI ツール・アラートの説明・案件資料）から除く。人が読む本文・API・ダッシュボードには残し、0043 の Advisory の区分と収集は変えない。Server Health の AI 用の signal は一覧のメトリクスの品質も除いて決め直す（`fan_policy` にも効く）。一覧の漏れを CI で見張る | FINAL |
 | [0139](0139-rule-pending-reset-on-missing.md) | 既存のしきい値・範囲のルール（`recirculation`・`intake_high`・`airflow_degraded`・`room_high`・`humidity_out_of_range`）で、入力の欠けで `SENSOR_MISSING` が発火中のとき、または無音が `SENSOR_FAULT` の条件を満たす評価（既に発火中でも）でだけ発火待ち（pending）を取り消して数え直す（独立の数え方を持たない・いま無効の故障ルールの行は根拠にしない・故障アラートの無効化・欄の省略・再起動の空白では取り消さない・復元のときに発火中でいま有効な故障アラートに依る pending を取り消す（移行を含む。復元は有効なアラートだけを上限なしに読む）・発火中は保つ・一括再生では直前のサンプルとの差で無音を測り `SENSOR_FAULT` を出す・新しい閾値を足さない）。発火が遅れるときは必ず `SENSOR_MISSING` / `SENSOR_FAULT` が出る。最悪の例は AM2320 の 42.5 s の欠けで `room_high` が 600 s → 約 1242 s | FINAL |
 | [0140](0140-gpu-fan-below-curve-thresholds.md) | `GPU_FAN_BELOW_CURVE` の閾値を 0130 の曲線に合わせる（発火は `gpu.0.core` 80 °C 以上かつ `gpu.0.fan_speed` 70 % 未満が 30 s、解除は 77 °C 未満または 73 % 以上。`provisional`）。0130 の曲線では 80 °C で 75 %・600 W の定常は 78〜79 °C・68〜72 % で、0131 の 70 °C / 90 % では高い負荷のたびに誤って発火するため。既定の制御（80 °C で約 47 %）は捉える。80 °C までは気づかないが、止まったことは `GPU_FAN_NOT_MANUAL` が先に捉える。0131 §2.1 の該当の値を置き換え | FINAL |
+| [0143](0143-claude-api-interim-provider.md) | ローカル LLM（#58）が導入先に入るまでの間だけ Claude API を LLM の Provider として使う（環境変数 `COLDAISLE_LLM_PROVIDER=anthropic` の明示の opt-in で既定は今のまま・鍵は `ANTHROPIC_API_KEY`・モデル ID は `ANTHROPIC_MODEL` で推奨は `claude-haiku-5-5`・送るのは今の Provider と同じ集計値だけで 0131 / 0138 の除外も当てツールと trace は送らない・鍵をログ・例外の文・通知に出さない・`config/ai.yaml` の `anthropic:` に `max_tokens` 1024 / 1 プロセス 1 日 200 回 / `effort: low` の上限・不達や上限超過でも監視は動く・0019 の案件資料は送らない・httpx で直接呼び SDK を足さない・0138 の実装（#320）が入るまで有効にしない） | Proposed |
