@@ -12,6 +12,7 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 from dataclasses import dataclass, field
+from itertools import pairwise
 from pathlib import Path
 
 import pytest
@@ -132,13 +133,14 @@ def test_shipped_rules_have_the_approved_provisional_values(rule_set):
     below = rule_set.gpu_fan_below_curve
     assert (below.enabled, below.severity.value) == (True, "warning")
     assert (below.core_metric, below.fan_metric) == (CORE, FAN)
-    assert (below.core_threshold, below.fan_below, below.fire_after_s) == (70, 90, 30)
-    assert (below.core_clear, below.fan_clear) == (67, 95)
+    # 決定記録 0140（0130 の曲線に合わせた値。provisional）
+    assert (below.core_threshold, below.fan_below, below.fire_after_s) == (80, 70, 30)
+    assert (below.core_clear, below.fan_clear) == (77, 73)
 
 
 @pytest.mark.parametrize(
     ("key", "value"),
-    [("core_clear", 70.0), ("core_clear", 71.0), ("fan_clear", 90.0), ("fan_clear", 85.0)],
+    [("core_clear", 80.0), ("core_clear", 81.0), ("fan_clear", 70.0), ("fan_clear", 65.0)],
 )
 def test_clear_must_be_inside_the_fire_condition(tmp_path, key, value):
     """解除が発火の外側にあると、発火した瞬間に解除条件も満たす。"""
@@ -313,7 +315,17 @@ def test_disabled_rule_is_not_evaluated(store, rule_set):
 
 # ---------------------------------------------------------------- GPU_FAN_BELOW_CURVE
 
-HOT_SLOW = {POLICY: 1.0, CORE: 75.0, FAN: 30.0}
+HOT_SLOW = {POLICY: 1.0, CORE: 82.0, FAN: 30.0}
+
+CURVE_0130 = ((45, 30), (60, 40), (70, 50), (76, 60), (80, 75), (83, 100))
+"""決定記録 0130 の曲線（°C, %）。点の間は直線で結ぶ。"""
+
+
+def curve(core: float) -> float:
+    for (t0, f0), (t1, f1) in pairwise(CURVE_0130):
+        if t0 <= core <= t1:
+            return f0 + (f1 - f0) * (core - t0) / (t1 - t0)
+    return 100.0 if core > CURVE_0130[-1][0] else CURVE_0130[0][1]
 
 
 def test_below_curve_fires_when_hot_and_slow_for_thirty_seconds(engine, store):
@@ -322,7 +334,7 @@ def test_below_curve_fires_when_hot_and_slow_for_thirty_seconds(engine, store):
     assert states(transitions, BELOW_CURVE) == ["pending", "firing"]
     assert states(transitions, NOT_MANUAL) == [], "制御方式は手動のまま"
     [row] = rows(store, BELOW_CURVE)
-    assert (row.metric, row.threshold, row.trigger_value) == (FAN, 90.0, 30.0)
+    assert (row.metric, row.threshold, row.trigger_value) == (FAN, 70.0, 30.0)
     assert row.fired_ms == at(30)
     firing = next(t for t in transitions if t.state == "firing")
     assert "systemctl status coldaisle-gpu-fan" in (firing.detail or "")
@@ -330,24 +342,24 @@ def test_below_curve_fires_when_hot_and_slow_for_thirty_seconds(engine, store):
 
 @pytest.mark.parametrize(
     ("core", "fan"),
-    [(69.9, 30.0), (70.0, 90.0), (90.0, 100.0)],
+    [(79.9, 30.0), (80.0, 70.0), (90.0, 100.0)],
 )
 def test_below_curve_does_not_fire_outside_the_condition(engine, store, core, fan):
-    """70 °C 以上で 90 % 未満のときだけ。曲線どおりの 100 % は正しい。"""
+    """80 °C 以上で 70 % 未満のときだけ（決定記録 0140）。"""
     assert run(engine, store, 0, 60, {POLICY: 1.0, CORE: core, FAN: fan}) == []
 
 
 def test_below_curve_uses_hysteresis_to_clear(engine, store):
     run(engine, store, 0, 32.5, HOT_SLOW)
-    # 67 ≤ core < 70・fan < 95 は解除しない（発火の閾値の内側）
-    assert run(engine, store, 32.5, 60, {POLICY: 1.0, CORE: 68.0, FAN: 92.0}) == []
-    transitions = run(engine, store, 60, 62.5, {POLICY: 1.0, CORE: 68.0, FAN: 95.0})
+    # 77 ≤ core < 80・70 ≤ fan < 73 は解除しない（発火の閾値の内側）
+    assert run(engine, store, 32.5, 60, {POLICY: 1.0, CORE: 78.0, FAN: 72.0}) == []
+    transitions = run(engine, store, 60, 62.5, {POLICY: 1.0, CORE: 78.0, FAN: 73.0})
     assert states(transitions, BELOW_CURVE) == ["resolved"]
 
 
 def test_below_curve_clears_when_the_core_cools(engine, store):
     run(engine, store, 0, 32.5, HOT_SLOW)
-    transitions = run(engine, store, 32.5, 35, {POLICY: 1.0, CORE: 66.9, FAN: 30.0})
+    transitions = run(engine, store, 32.5, 35, {POLICY: 1.0, CORE: 76.9, FAN: 30.0})
     assert states(transitions, BELOW_CURVE) == ["resolved"]
 
 
@@ -524,3 +536,28 @@ def test_stopped_service_reaches_the_notifier_without_asking_the_llm(tmp_path, r
         assert latest[POLICY].value == 0.0
     finally:
         store.close()
+
+
+# ------------------------------------------------ 0130 の曲線との整合（決定記録 0140）
+
+
+@pytest.mark.parametrize("core", [70, 72, 74, 76, 77, 78, 79, 80, 81])
+def test_normal_rotation_on_the_0130_curve_does_not_fire(engine, store, core):
+    """0130 の曲線どおりに回っていれば、70〜81 °C のどこでも発火しない（高い負荷で誤発火しない）。
+
+    0131 の値（70 °C / 90 %）ではここで発火していた。
+    """
+    fan = float(int(curve(core)))  # NVML は整数の %。切り捨てて低い側で確かめる
+    assert run(engine, store, 0, 120, {POLICY: 1.0, CORE: float(core), FAN: fan}) == []
+
+
+@pytest.mark.parametrize(("core", "fan"), [(78.0, 68.0), (79.0, 72.0), (79.0, 68.0)])
+def test_measured_600w_steady_state_does_not_fire(engine, store, core, fan):
+    """600 W の定常は 78〜79 °C・68〜72 %（docs/fan-header-mapping.md の T5・T7）。"""
+    assert run(engine, store, 0, 120, {POLICY: 1.0, CORE: core, FAN: fan}) == []
+
+
+def test_gpu_default_control_at_80c_fires(engine, store):
+    """GPU 自身の既定の制御は 80 °C で約 47 %（0128 §1 の測定）。30 s で捉える。"""
+    transitions = run(engine, store, 0, 32.5, {POLICY: 0.0, CORE: 80.0, FAN: 47.0})
+    assert states(transitions, BELOW_CURVE) == ["pending", "firing"]

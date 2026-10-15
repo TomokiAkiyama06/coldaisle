@@ -305,7 +305,7 @@ nvidia-smi --query-gpu=temperature.gpu,fan.speed --format=csv
 - 回転は `coldaisle-telemetry` が `gpu.0.fan_speed` として集めます。fand・telemetry とは依存しません
 - サービスが Fan を握っていないことは、`coldaisle-telemetry` が集める制御方式（`gpu.0.fan_policy`。手動なら 1）と
   回転から、取り込みのルールエンジンが warning で知らせます（`GPU_FAN_NOT_MANUAL` / `GPU_FAN_BELOW_CURVE`。
-  決定記録 0131。閾値は `config/rules.yaml`）。日次レポートの「日の終わりに続いているアラート」にも毎日出ます。
+  決定記録 0131 / 0140。閾値は `config/rules.yaml`。`GPU_FAN_BELOW_CURVE` は 80 °C 以上で 70 % 未満）。日次レポートの「日の終わりに続いているアラート」にも毎日出ます。
   監視系は systemd も journal も読まないので、理由は `systemctl status coldaisle-gpu-fan` と
   `journalctl -u coldaisle-gpu-fan`（`gpu_fan_model_mismatch` など）で確かめます。
   導入したら、`coldaisle` ユーザーで `gpu.0.fan_policy` が `ok` で記録されること（missing なら判定されない）と、
