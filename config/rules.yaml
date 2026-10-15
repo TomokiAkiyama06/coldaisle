@@ -191,6 +191,10 @@ rules:
 
   # 警告。夜間は届かない（config/notify.yaml の night.warning_enabled。0135 §2.3）
   connector_temp_high:
+    label: 12V-2x6コネクタが熱い
+    title: 12V-2x6 コネクタの温度が高くなっています
+    resolved_title: 12V-2x6 コネクタの温度が下がりました
+    hint: GPU の負荷を下げ、電源ケーブルの差し込みを確認してください。
     enabled: true
     severity: warning
     metric: board.connector_12v2x6
@@ -201,6 +205,10 @@ rules:
   # 重大。80 °C（safety.yaml の telemetry.t_sensor.absolute_ceiling_c）の手前。
   # 10 s は 2.5 s 周期の 4〜5 回の読み値（1 回の読み違いで鳴らさない。0145 §2.2）
   connector_temp_critical:
+    label: 12V-2x6コネクタが危険な温度
+    title: 12V-2x6 コネクタが危険な温度です
+    resolved_title: 12V-2x6 コネクタの温度が危険な範囲から下がりました
+    hint: すぐに GPU の負荷を止め、電源ケーブルとコネクタを確認してください。
     enabled: true
     severity: critical
     metric: board.connector_12v2x6

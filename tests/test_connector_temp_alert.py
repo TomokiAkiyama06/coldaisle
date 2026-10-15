@@ -496,6 +496,13 @@ def test_hot_connector_reaches_the_notifier_as_critical(tmp_path, rules, rule_se
         daemon.run()
         sent = [(n.rule_id, n.state, n.severity.value) for n in notifier.sent]
         assert sent == [(CRITICAL, "firing", "critical")]
+        # 0142 の通知の形: 見出しの文・値（「以上」）・確かめること・最後の行に ID
+        assert notifier.sent[0].as_text().splitlines() == [
+            "🔴 [重大] 12V-2x6 コネクタが危険な温度です",
+            "12V-2x6コネクタ外装温度 76.0 °C（閾値 75.0 °C 以上）・室温 26.0 °C",
+            "すぐに GPU の負荷を止め、電源ケーブルとコネクタを確認してください。",
+            f"{CRITICAL} / {CONNECTOR}",
+        ]
         [row] = rows(store, CRITICAL)
         assert (row.started_ms, row.fired_ms) == (at(8 * STEP_S), at(8 * STEP_S + 10))
         assert store.latest(at_ms=at(0))[CONNECTOR].quality is Quality.SUSPECT

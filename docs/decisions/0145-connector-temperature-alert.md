@@ -9,7 +9,7 @@
   [`0131`](0131-gpu-fan-service-alert.md) §2.3（DB の最新値を読むルール） /
   [`0139`](0139-rule-pending-reset-on-missing.md)（欠けたときの発火待ちの取り消し） /
   [`0135`](0135-critical-notifications-to-slack.md)（critical も Slack・夜間は critical だけ） /
-  [`0013`](0013-notifications.md) / 進行中の 0142 案（PR #328。ルールの `label`） /
+  [`0013`](0013-notifications.md) / [`0142`](0142-japanese-notification-text.md)（通知の文。ルールの `label`・`title`・`resolved_title`・`hint`） /
   `docs/fan-header-mapping.md` の T5・T7 /
   `config/rules.yaml`、`config/internal-telemetry.yaml`、`config/quality.yaml`、`src/coldaisle/rules/`
 - **対象 Issue**: #329
@@ -91,8 +91,10 @@
   （`night.warning_enabled: false`。0135 §2.3）。夜間に人へ届くのは 75 °C の重大だけ
 - LLM の説明（#38）は既存のルールと同じく求める（除外の一覧 `llm_excluded_rules` に足さない。GPU の Fan と違い、
   LLM に渡さない理由が無い。渡すのは集計だけ（AGENTS.md ルール 8））
-- 0142（PR #328）の `label`（必須）は、0142 が入った後に足す（本記録の PR の時点の `main` のスキーマは未知の項目を拒むため）。
-  案: `connector_temp_high` は「12V-2x6コネクタが熱い」、`connector_temp_critical` は「12V-2x6コネクタが危険な温度」
+- 通知の文は 0142 の形に従う（`config/rules.yaml` の 4 つの必須の項目）。重大の見出しは「12V-2x6 コネクタが危険な温度です」、
+  確かめることは警告が「GPU の負荷を下げ、電源ケーブルの差し込みを確認してください。」、重大が「すぐに GPU の負荷を止め、
+  電源ケーブルとコネクタを確認してください。」。値の行は比較に合わせて「（閾値 75.0 °C 以上）」と書く（値の意味の種類
+  `at_or_above` を足す。0142 §2.4 の「超過」は `>` のルールの言い方のため）
 
 ### 2.5 テスト（実機なし。AGENTS.md ルール 7）
 
@@ -166,6 +168,6 @@ DB へ直接書く（`coldaisle-telemetry` の行を模す）か、偽の hwmon 
 4. **値の確定。** 65 / 75 °C・60 / 10 s・3 °C の幅は provisional。#50 の較正（T_SENSOR の誤差）と、運転の記録（日次レポートの最高値）で見直す
 5. **案件資料（`coldaisle-escalate`）の「24 時間の p95 が閾値の内側か」の行。** 今は `ThresholdRule` / `RangeRule` だけで、
    本記録のルールは含まない。要るなら別に足す
-6. **`label`。** 0142（PR #328）の後に 2.4 の案で足す
+6. **通知の文の言い回し。** 2.4 の文は provisional（0142 の後に足した）。運用で見直す
 7. **内部の telemetry の再生。** 日次 CSV に `board.connector_12v2x6` が無いので、過去の記録でこのルールを検証できない。
    要るなら CSV の列か別の再生の経路を別に決める

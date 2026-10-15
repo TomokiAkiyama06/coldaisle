@@ -29,7 +29,9 @@ def rule_metrics(rule: BaseModel) -> tuple[str, ...]:
 TEXT_KEYS = ("label", "title", "resolved_title", "hint")
 """人が読む文の項目（決定記録 0142）。閾値ではないので、AI ツールと運用メモリの事実には出さない。"""
 
-ValueKind = Literal["threshold", "range", "slope", "below", "flag", "seconds", "samples", "event"]
+ValueKind = Literal[
+    "threshold", "at_or_above", "range", "slope", "below", "flag", "seconds", "samples", "event"
+]
 """遷移の `value` が何を表すか（決定記録 0142 §2.4）。通知の値の行の書き方を決める。
 
 ルールごとに値の意味が違う（`SENSOR_FAULT` は秒数、`RAPID_RISE` は 1 分あたりの変化）。
@@ -242,6 +244,7 @@ def _value_kind(rule: BaseModel) -> ValueKind:
     """ルールの型から値の意味を決める。ルールの名前（ID）で分岐しない。"""
     kinds: tuple[tuple[type[BaseModel], ValueKind], ...] = (
         (ThresholdRule, "threshold"),
+        (LatestThresholdRule, "at_or_above"),  # 比較は「以上」（決定記録 0145 §2.1）
         (RangeRule, "range"),
         (SlopeRule, "slope"),
         (HotAndSlowRule, "below"),
