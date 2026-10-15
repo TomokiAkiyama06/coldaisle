@@ -29,12 +29,13 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from coldaisle import logs
 from coldaisle.clock import Clock, WallClock
+from coldaisle.llm_exclusions import LlmExclusions, LlmExclusionsError
 from coldaisle.metrics import MetricCatalog
 from coldaisle.notify.models import Notification, NotifyConfig
 from coldaisle.notify.notifiers import Notifier
 from coldaisle.notify.notifiers import from_env as notifiers_from_env
 from coldaisle.report import send
-from coldaisle.rules.models import RangeRule, RuleSet, ThresholdRule
+from coldaisle.rules.models import RangeRule, RuleSet, ThresholdRule, rule_metrics
 from coldaisle.store.csv_export import day_bounds_ms
 from coldaisle.store.db import Aggregation, SqliteStore
 from coldaisle.store.models import AlertRecord, AlertSeverity, RollupPoint
@@ -148,16 +149,27 @@ def evaluate(
     catalog: MetricCatalog,
     *,
     day: date,
+    exclusions: LlmExclusions,
 ) -> list[Finding]:
-    """`day` の終わりまでを見て候補を返す。**判定は決定論的**（受入基準）。"""
+    """`day` の終わりまでを見て候補を返す。**判定は決定論的**（受入基準）。
+
+    案件資料は人が Claude へ持ち込む。**除外の一覧のメトリクスとアラートは載せない**
+    （決定記録 0131 §2.4a）。引き金が除外のメトリクスを見ていれば、その引き金は使わない。
+    """
     _, end_ms = day_bounds_ms(day, rules.zone)
     single = [
         _step_change(store, rules, catalog, day=day),
         _sustained_deviation(store, rules, catalog, end_ms=end_ms),
     ]
-    return [finding for finding in single if finding is not None] + _repeated_critical(
-        store, rules, end_ms=end_ms
-    )
+    return [
+        finding
+        for finding in single
+        if finding is not None
+        and (
+            finding.metric is None
+            or not exclusions.excludes_metric_or_inputs(finding.metric, catalog)
+        )
+    ] + _repeated_critical(store, rules, end_ms=end_ms, exclusions=exclusions, catalog=catalog)
 
 
 def _step_change(
@@ -250,7 +262,14 @@ LOOKBACK_FACTOR = 4
 """再発の起点を探すとき、窓の何倍まで遡るか。**案件の名前を安定させる**ため。"""
 
 
-def _repeated_critical(store: SqliteStore, rules: EscalationRules, *, end_ms: int) -> list[Finding]:
+def _repeated_critical(
+    store: SqliteStore,
+    rules: EscalationRules,
+    *,
+    end_ms: int,
+    exclusions: LlmExclusions,
+    catalog: MetricCatalog,
+) -> list[Finding]:
     """**同じ critical が繰り返し出る**なら、対処が効いていない。
 
     条件を満たすルールは**すべて**返す。1件目で打ち切ると、残りは翌日以降も
@@ -264,7 +283,11 @@ def _repeated_critical(store: SqliteStore, rules: EscalationRules, *, end_ms: in
     fired = [
         record
         for record in store.fired_alerts(
-            start_ms=end_ms - window_ms * LOOKBACK_FACTOR, end_ms=end_ms, limit=1000
+            start_ms=end_ms - window_ms * LOOKBACK_FACTOR,
+            end_ms=end_ms,
+            limit=1000,
+            exclude_rule_ids=exclusions.rule_ids,
+            exclude_metrics=_excluded_names(store, catalog, exclusions),
         )
         if record.severity is AlertSeverity.CRITICAL and record.fired_ms is not None
     ]
@@ -407,9 +430,13 @@ def build_packet(
     catalog: MetricCatalog,
     *,
     day: date,
+    exclusions: LlmExclusions,
     rule_set: RuleSet | None = None,
 ) -> str:
-    """圧縮した案件資料（構想メモ §10）。**生の時系列は入らない。**"""
+    """圧縮した案件資料（構想メモ §10）。**生の時系列は入らない。**
+
+    除外の一覧のメトリクス・アラートは載せない（決定記録 0131 §2.4a）。
+    """
     _, end_ms = day_bounds_ms(day, rules.zone)
     lines = [
         f"# エスカレーション案件 {day.isoformat()}",
@@ -421,9 +448,11 @@ def build_packet(
         finding.problem,
         "",
     ]
-    lines += _measurements(store, finding, catalog, end_ms=end_ms)
+    lines += _measurements(store, finding, catalog, end_ms=end_ms, exclusions=exclusions)
     lines += _course(store, finding, rules, catalog, day=day)
-    lines += _checked(store, end_ms=end_ms, rule_set=rule_set)
+    lines += _checked(
+        store, end_ms=end_ms, rule_set=rule_set, exclusions=exclusions, catalog=catalog
+    )
     lines += ["## 争点", "", finding.question, ""]
     text = "\n".join(lines).rstrip() + "\n"
     if len(text) > rules.max_chars:
@@ -433,10 +462,19 @@ def build_packet(
 
 
 def _measurements(
-    store: SqliteStore, finding: Finding, catalog: MetricCatalog, *, end_ms: int
+    store: SqliteStore,
+    finding: Finding,
+    catalog: MetricCatalog,
+    *,
+    end_ms: int,
+    exclusions: LlmExclusions,
 ) -> list[str]:
     """直近24時間の統計。**関係するメトリクスだけ**を載せる。"""
-    metrics = _related(finding, catalog)
+    metrics = [
+        metric
+        for metric in _related(finding, catalog)
+        if not exclusions.excludes_metric_or_inputs(metric, catalog)
+    ]
     if not metrics:
         return []
     lines = [
@@ -513,13 +551,24 @@ def _occurrence_course(finding: Finding, rules: EscalationRules, *, day: date) -
     return [*lines, ""]
 
 
-def _checked(store: SqliteStore, *, end_ms: int, rule_set: RuleSet | None = None) -> list[str]:
+def _checked(
+    store: SqliteStore,
+    *,
+    end_ms: int,
+    exclusions: LlmExclusions,
+    catalog: MetricCatalog,
+    rule_set: RuleSet | None = None,
+) -> list[str]:
     """**自動で確認したこと**。人が「それは見た」と言えるようにする。
 
     ここに書くのは**測って分かること**だけ。「負荷パターンに変化なし」のような、
     測っていないことは書かない（それは争点であって、確認済みではない）。
     """
-    latest = store.latest(at_ms=end_ms)
+    latest = {
+        metric: reading
+        for metric, reading in store.latest(at_ms=end_ms).items()
+        if not exclusions.excludes_metric_or_inputs(metric, catalog)
+    }
     bad = sorted(
         f"{metric}={reading.quality.value}"
         for metric, reading in latest.items()
@@ -541,7 +590,9 @@ def _checked(store: SqliteStore, *, end_ms: int, rule_set: RuleSet | None = None
         lines.append(f"- {metric}（24時間の合計）: {round(total)}")
     if not counts:
         lines.append("- 取りこぼしの記録なし（24時間）")
-    lines += _within_thresholds(store, latest, end_ms=end_ms, rule_set=rule_set)
+    lines += _within_thresholds(
+        store, latest, end_ms=end_ms, rule_set=rule_set, exclusions=exclusions
+    )
     return [*lines, ""]
 
 
@@ -551,6 +602,7 @@ def _within_thresholds(
     *,
     end_ms: int,
     rule_set: RuleSet | None,
+    exclusions: LlmExclusions,
 ) -> list[str]:
     """閾値を持つルールについて、**24時間の p95 が中に収まっているか**を書く。
 
@@ -562,6 +614,10 @@ def _within_thresholds(
     lines: list[str] = []
     for name, rule in sorted(rule_set):
         if not isinstance(rule, ThresholdRule | RangeRule) or not rule.enabled:
+            continue
+        if exclusions.excludes_rule(name.upper()) or any(
+            exclusions.excludes_metric(metric) for metric in rule_metrics(rule)
+        ):
             continue
         # 派生値は保存されないので統計を引けない（決定記録 0002 §2.2）。
         # **無い値を推測してまで1行増やさない**
@@ -579,6 +635,17 @@ def _within_thresholds(
         mark = "正常範囲" if inside else "**外れている**"
         lines.append(f"- {rule.metric}（24時間 p95 {p95:.1f}）: {mark}（{name} の{bound}）")
     return lines
+
+
+def _excluded_names(
+    store: SqliteStore, catalog: MetricCatalog, exclusions: LlmExclusions
+) -> frozenset[str]:
+    """アラートの検索から除く具体的なメトリクス名（DB と `config/metrics.yaml` から）。"""
+    return frozenset(
+        name
+        for name in (*catalog.metrics, *catalog.derived, *store.metrics())
+        if exclusions.excludes_metric_or_inputs(name, catalog)
+    )
 
 
 def _num(value: float | None) -> str:
@@ -644,6 +711,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--notify", type=Path, default=Path("config/notify.yaml"))
     parser.add_argument("--quality-rules", type=Path, default=Path("config/quality.yaml"))
     parser.add_argument("--rules", type=Path, default=Path("config/rules.yaml"))
+    parser.add_argument(
+        "--report-config",
+        type=Path,
+        default=Path("config/report.yaml"),
+        help="LLM へ渡さない一覧（llm_excluded_*）を読む設定（決定記録 0131）",
+    )
     parser.add_argument("--date", type=date.fromisoformat, help="YYYY-MM-DD。既定は前日")
     parser.add_argument("--force", action="store_true", help="同じ案件でも作り直す")
     parser.add_argument("--print", action="store_true", help="全文を標準出力へ")
@@ -656,18 +729,35 @@ def main(argv: Sequence[str] | None = None) -> int:
     catalog = MetricCatalog.from_yaml(args.metrics)
     notify_config = NotifyConfig.from_yaml(args.notify)
     rule_set = RuleSet.from_yaml(args.rules)
+    try:
+        exclusions = LlmExclusions.from_yaml(args.report_config)
+    except LlmExclusionsError as error:
+        # 案件資料は Claude へ持ち込むもの。何を除けばよいか分からないまま作らない
+        LOGGER.error(
+            "LLM へ渡さない一覧が不正なので案件資料を作らない",
+            extra={logs.FIELDS_KEY: {"config": str(args.report_config), "reason": str(error)}},
+        )
+        return 1
     clock: Clock = WallClock()
     day = args.date or _yesterday(clock, rules.zone)
 
     store = SqliteStore(args.db, rules=QualityRules.from_yaml(args.quality_rules), clock=clock)
     try:
-        findings = evaluate(store, rules, catalog, day=day)
+        findings = evaluate(store, rules, catalog, day=day, exclusions=exclusions)
         written = [
             (finding, path)
             for finding in findings
             for path in [
                 write_packet(
-                    build_packet(store, finding, rules, catalog, day=day, rule_set=rule_set),
+                    build_packet(
+                        store,
+                        finding,
+                        rules,
+                        catalog,
+                        day=day,
+                        exclusions=exclusions,
+                        rule_set=rule_set,
+                    ),
                     finding,
                     rules.output_dir,
                     force=args.force,

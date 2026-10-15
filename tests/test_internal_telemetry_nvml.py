@@ -14,6 +14,7 @@ from coldaisle.internal_telemetry import (
     NvmlConfig,
     SourceStatus,
 )
+from coldaisle.internal_telemetry.nvml import FAN_POLICY_MANUAL, PynvmlApi
 from coldaisle.store import Quality
 
 
@@ -32,6 +33,7 @@ class FakeNvml:
     )
     fail_reasons: bool = False
     fan: float | None = 30.0
+    fan_policy: float | None = 1.0
 
     def initialize(self) -> None:
         self.initialized += 1
@@ -82,6 +84,9 @@ class FakeNvml:
 
     def fan_speed_pct(self, handle: object) -> float | None:
         return self.fan
+
+    def fan_policy_manual(self, handle: object) -> float | None:
+        return self.fan_policy
 
 
 def config(*indices: int, enabled: bool = True) -> NvmlConfig:
@@ -303,3 +308,96 @@ def test_throttle_bits_match_the_nvml_abi():
     assert {reason: getattr(pynvml, name) for reason, name in names.items()} == dict(
         THROTTLE_REASON_BITS
     )
+
+
+# ---------------------------------------------------------------- fan_policy（決定記録 0131 §2.2）
+
+
+@pytest.mark.parametrize(("policy", "expected"), [(1.0, 1.0), (0.0, 0.0)])
+def test_fan_policy_is_recorded_as_a_flag(policy, expected):
+    result = NvmlAdapter(config(0), FakeNvml(fan_policy=policy)).poll()
+    readings = {reading.metric: reading for reading in result.readings}
+
+    assert readings["gpu.0.fan_policy"].value == expected
+    assert readings["gpu.0.fan_policy"].quality is Quality.OK
+    assert "gpu.0.fan_policy" in NvmlAdapter(config(0), FakeNvml()).expected_metrics
+
+
+def test_unreadable_fan_policy_is_missing_and_advisory():
+    """関数が無い driver・NOT_SUPPORTED は missing。制御の入力ではないので状態を下げない。"""
+    result = NvmlAdapter(config(0), FakeNvml(fan_policy=None)).poll()
+    readings = {reading.metric: reading for reading in result.readings}
+
+    assert readings["gpu.0.fan_policy"].value is None
+    assert readings["gpu.0.fan_policy"].quality is Quality.MISSING
+    assert result.status is SourceStatus.OK
+
+
+class _NotSupportedError(Exception):
+    """pynvml の ``NVMLError_NotSupported`` の代わり。"""
+
+
+class _FakePynvml:
+    """``pynvml`` モジュールの代わり。Fan ごとの制御方式を返す（書く関数は持たない）。"""
+
+    def __init__(self, policies: list[int] | None, *, raise_on: int | None = None) -> None:
+        self._policies = policies
+        self._raise_on = raise_on
+        if policies is None:
+            return
+        self.nvmlDeviceGetNumFans = lambda handle: len(self._policies or [])
+        self.nvmlDeviceGetFanControlPolicy_v2 = self._policy
+
+    def _policy(self, handle: object, fan: int) -> int:
+        if fan == self._raise_on:
+            raise _NotSupportedError("NVML_ERROR_NOT_SUPPORTED")
+        assert self._policies is not None
+        return self._policies[fan]
+
+
+def _pynvml_api(module: object) -> PynvmlApi:
+    api = PynvmlApi()
+    api._module = module  # type: ignore[assignment]
+    return api
+
+
+@pytest.mark.parametrize(
+    ("policies", "expected"),
+    [
+        ([FAN_POLICY_MANUAL, FAN_POLICY_MANUAL], 1.0),
+        # 1 つでも手動でなければ「握っていない」（サービスはすべての Fan に同じ値を書く）
+        ([FAN_POLICY_MANUAL, 0], 0.0),
+        ([0, 0], 0.0),
+        ([], None),  # Fan が無い GPU は判定できない
+        (None, None),  # 関数が無い binding / driver
+    ],
+)
+def test_pynvml_fan_policy_reads_every_fan(policies, expected):
+    assert _pynvml_api(_FakePynvml(policies)).fan_policy_manual(handle=0) == expected
+
+
+def test_pynvml_not_supported_becomes_missing_through_the_adapter():
+    """NOT_SUPPORTED の例外は adapter の ``_read`` が欠測に畳む（0043 の T.Limit と同じ扱い）。"""
+    api = _pynvml_api(_FakePynvml([FAN_POLICY_MANUAL, FAN_POLICY_MANUAL], raise_on=1))
+    with pytest.raises(_NotSupportedError):
+        api.fan_policy_manual(handle=0)
+    assert NvmlAdapter._read(api.fan_policy_manual, 0) is None
+
+
+def test_fan_policy_manual_matches_the_nvml_abi():
+    """pynvml の定数と一致すること。binding が無い環境では飛ばす。"""
+    pynvml = pytest.importorskip("pynvml")
+    if not hasattr(pynvml, "NVML_FAN_POLICY_MANUAL"):
+        pytest.skip("この binding は定数を持たない")
+    assert pynvml.NVML_FAN_POLICY_MANUAL == FAN_POLICY_MANUAL
+
+
+def test_nvml_adapter_never_writes_the_fan():
+    """読むのは制御方式だけで、書かない（0131 §2.2 / 0128 §2.1）。"""
+    from pathlib import Path
+
+    source = (
+        Path(__file__).resolve().parents[1] / "src" / "coldaisle" / "internal_telemetry" / "nvml.py"
+    ).read_text(encoding="utf-8")
+    assert "nvmlDeviceSetFan" not in source
+    assert "SetDefaultFan" not in source

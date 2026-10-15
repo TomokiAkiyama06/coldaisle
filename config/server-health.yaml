@@ -55,6 +55,9 @@ active_alerts_limit: 100
 # GPU / driver によっては公開されない metric。collector は毎回 quality=missing で
 # 保存するため、missing だけは signal を下げない（suspect / stale は下げる）。
 # RTX PRO 6000 は NVML で hotspot / memory 温度を返さないことを実機で確認済み。
+# gpu.0.fan_policy は driver が制御方式の読み取りを公開しないとき missing になる
+# （決定記録 0131 §2.2。導入先で読めるかは未確認）。missing の間はルールも評価しない。
 missing_tolerated:
   - gpu.0.hotspot
   - gpu.0.mem
+  - gpu.0.fan_policy

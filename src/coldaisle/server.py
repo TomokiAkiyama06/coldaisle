@@ -16,11 +16,14 @@ COLDAISLE_DB=var/coldaisle.db uv run uvicorn coldaisle.server:app --host 127.0.0
 
 from __future__ import annotations
 
+import logging
 import os
+from collections.abc import Callable
 from pathlib import Path
 
 from fastapi import FastAPI
 
+from coldaisle import logs
 from coldaisle.ai import (
     AiHealthSummarizer,
     AiSettings,
@@ -30,17 +33,29 @@ from coldaisle.ai import (
 from coldaisle.ai.tools import ToolRegistry
 from coldaisle.api.app import Config, Tools, create_app
 from coldaisle.clock import Clock, WallClock
+from coldaisle.llm_exclusions import LlmExclusions, LlmExclusionsError
 from coldaisle.metrics import MetricCatalog
 from coldaisle.rules import RuleSet
 from coldaisle.store import SqliteStore
 
 DEFAULT_RULES = Path("config/rules.yaml")
 DEFAULT_AI_CONFIG = Path("config/ai.yaml")
+DEFAULT_REPORT_CONFIG = Path("config/report.yaml")
+"""LLM へ渡さない一覧（`llm_excluded_*`）の置き場所。日次レポートと同じ1か所（0131 §2.4a）。"""
+
+LOGGER = logging.getLogger("coldaisle.server")
 
 
 def create_server(config: Config | None = None, *, clock: Clock | None = None) -> FastAPI:
-    """API にツールの窓口を足したアプリを作る。"""
+    """API にツールの窓口を足したアプリを作る。
+
+    **LLM へ渡さない一覧が読めなければ、ツールの窓口も AI 要約も開かない**
+    （決定記録 0131 §2.4a。どれを LLM へ渡してよいか分からないため）。読み取り API は動く。
+    """
     settings = config or Config.from_env()
+    exclusions = _llm_exclusions(
+        Path(os.environ.get("COLDAISLE_REPORT_CONFIG", str(DEFAULT_REPORT_CONFIG)))
+    )
     catalog = MetricCatalog.from_yaml(settings.metrics)
     rules = RuleSet.from_yaml(Path(os.environ.get("COLDAISLE_RULES", str(DEFAULT_RULES))))
     ai_settings = AiSettings.from_yaml(
@@ -49,23 +64,43 @@ def create_server(config: Config | None = None, *, clock: Clock | None = None) -
     ai_provider = provider_from_env(ai_settings)
     health_summarizer = (
         None
-        if ai_provider is None
+        if ai_provider is None or exclusions is None
         else BackgroundHealthSummarizer(
             AiHealthSummarizer(ai_provider), retry_s=ai_settings.health_summary_retry_s
         )
     )
     ticking = clock or WallClock()
 
-    def tools(store: SqliteStore) -> Tools:
-        # **接続はスレッドごと**（決定記録 0004 §2.8）。渡された接続をそのまま使う
-        return ToolRegistry(store=store, catalog=catalog, rules=rules, clock=ticking)
-
     return create_app(
         settings,
         clock=ticking,
-        tools=tools,
+        tools=None if exclusions is None else _tools_factory(catalog, rules, ticking, exclusions),
         health_summarizer=health_summarizer,
+        llm_exclusions=exclusions,
     )
+
+
+def _tools_factory(
+    catalog: MetricCatalog, rules: RuleSet, clock: Clock, exclusions: LlmExclusions
+) -> Callable[[SqliteStore], Tools]:
+    def tools(store: SqliteStore) -> Tools:
+        # **接続はスレッドごと**（決定記録 0004 §2.8）。渡された接続をそのまま使う
+        return ToolRegistry(
+            store=store, catalog=catalog, rules=rules, clock=clock, exclusions=exclusions
+        )
+
+    return tools
+
+
+def _llm_exclusions(path: Path) -> LlmExclusions | None:
+    try:
+        return LlmExclusions.from_yaml(path)
+    except LlmExclusionsError as error:
+        LOGGER.error(
+            "LLM へ渡さない一覧が不正なので、AI ツールの窓口と AI 要約を開かない",
+            extra={logs.FIELDS_KEY: {"config": str(path), "reason": str(error)}},
+        )
+        return None
 
 
 app = create_server()

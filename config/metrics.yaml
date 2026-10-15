@@ -23,6 +23,9 @@ metrics:
   # 決定記録 0043（FINAL）。NVML の T.Limit margin・fan speed・clock event reason
   gpu.0.tlimit_margin: {unit: "C",   label: "GPU T.Limit までの余裕"}
   gpu.0.fan_speed:     {unit: "%",   label: "GPU Fan速度（NVMLの目標値）"}
+  # 決定記録 0131 §2.2。すべての Fan の制御方式が手動なら 1、1 つでも手動でなければ 0。
+  # ロールアップの平均は「手動だった割合」になる。LLM へ渡さない（config/report.yaml）
+  gpu.0.fan_policy:    {unit: "flag", label: "GPU Fan制御方式（手動=1）"}
   # 0/1。ロールアップの平均は「その区間で reason が立っていた割合」になる
   gpu.0.throttle.hw_slowdown:    {unit: "flag", label: "GPU HW Slowdown"}
   gpu.0.throttle.hw_thermal:     {unit: "flag", label: "GPU HW Thermal Slowdown"}

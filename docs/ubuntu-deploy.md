@@ -303,6 +303,13 @@ nvidia-smi --query-gpu=temperature.gpu,fan.speed --format=csv
   （`journalctl -u coldaisle-gpu-fan` に `gpu_fan_device_not_unique`）。device が 0 個なら終了コード 1 で、2 s 後に起動し直して
   また待ちます（driver の読み込みが遅いとき）。2 個以上なら終了コード 2 で止まり、再起動しません
 - 回転は `coldaisle-telemetry` が `gpu.0.fan_speed` として集めます。fand・telemetry とは依存しません
+- サービスが Fan を握っていないことは、`coldaisle-telemetry` が集める制御方式（`gpu.0.fan_policy`。手動なら 1）と
+  回転から、取り込みのルールエンジンが warning で知らせます（`GPU_FAN_NOT_MANUAL` / `GPU_FAN_BELOW_CURVE`。
+  決定記録 0131 / 0140。閾値は `config/rules.yaml`。`GPU_FAN_BELOW_CURVE` は 80 °C 以上で 70 % 未満）。日次レポートの「日の終わりに続いているアラート」にも毎日出ます。
+  監視系は systemd も journal も読まないので、理由は `systemctl status coldaisle-gpu-fan` と
+  `journalctl -u coldaisle-gpu-fan`（`gpu_fan_model_mismatch` など）で確かめます。
+  導入したら、`coldaisle` ユーザーで `gpu.0.fan_policy` が `ok` で記録されること（missing なら判定されない）と、
+  `systemctl stop coldaisle-gpu-fan` の数十秒後に warning が届き `start` で解除されることを確かめます（0131 §2.6。所有者の承認の後）
 - 曲線を変えるときは、決定記録と所有者の承認を経て unit の `--curve` を変えます
 
 ## 5. Mac からのデータ移行
