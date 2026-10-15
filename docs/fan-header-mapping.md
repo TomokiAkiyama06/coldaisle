@@ -385,7 +385,7 @@ fand を manual 0.35（3 zone とも）で動かし、`coldaisle-cpu-power` を 
 | 最後の書き込みから、Top の reason に `cpu_power_unavailable` が出る tick まで | 7311 ms | 5000〜8500 ms（5000 ms + 収集の周期 2500 ms + 1 tick） | 合格 |
 | その間の fault・Top・safety state | fault は無し。Top は `bound_by` が `safety_floor` の 0.35 のまま。`normal` | fault が上がらず、Top が 0.35 のまま | 合格 |
 | その間の telemetry の健全度と Guard の閾値 | 記録に無い（下の注を参照） | `DEGRADED`・`conservative` | 未完了（0136 §2.3 の CI のテストで満たす。#308） |
-| 戻した後 | `SIGCONT` から 1.8 s（最後の書き込みから 32.3 s）の tick で `cpu_power_unavailable` が消えた | 新しい sample で power の項が戻り、健全度が `NORMAL` に戻る | 合格 |
+| 戻した後 | `SIGCONT` から 1.8 s（最後の書き込みから 32.3 s）の tick で `cpu_power_unavailable` が消えた | 新しい sample で power の項が戻り、健全度が `NORMAL` に戻る | power の項は合格。健全度が `NORMAL` に戻ることは未完了（0136 §2.3 の CI のテストで満たす。#308） |
 
 - 一時停止の間に Reactive Guard は発火しなかった。Top の `bound_by` はずっと `safety_floor` で、判定できない試行にはならなかった
 - **健全度と Guard の閾値は、記録から直接は確かめられなかった。** 理由は次の 2 つ
@@ -395,6 +395,6 @@ fand を manual 0.35（3 zone とも）で動かし、`coldaisle-cpu-power` を 
   テストは、`power.cpu.package` の時刻だけを古くした frame を、本番と同じ signal の組み立てから Reactive Guard まで通し、
   健全度が `DEGRADED`・閾値が `conservative` になり、新しい sample で戻ることを確かめる。**テストが入るまでこの行は未完了。**
   実機で `cpu_power_unavailable` が出て、fault が上がらなかったことは、テストの前提（収集の側が CPU Power を使えないと判定した）を裏付ける
-- 戻した後の T8 の全スレッドで、Guard の発火 4 回はすべて `threshold_profile` が `normal` だった。これは復帰の行の材料にだけ使い、一時停止の間の状態の材料にはしない
+- 戻した後の T8 の全スレッドで、Guard の発火 4 回はすべて `threshold_profile` が `normal` だった。ただしこれは約 1 分後の値で、新しい sample を観測した tick の健全度を示さないので、合否の材料にしない
 - そのテストと、健全度と閾値を trace に載せることは #308 で行う。0123 §2.3 の、T1 で健全度が `NORMAL` だった時間の割合も、それまで数えられない
 - T9 (a)（fand の計時の `telemetry.cpu_power_ms`）は、0123 §2.2 のとおり実機では行わず、CI のテストで確かめる

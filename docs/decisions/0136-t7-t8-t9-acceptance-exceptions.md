@@ -6,7 +6,7 @@
 - **Supersedes**: [`0121`](0121-hardware-test-procedure.md) §2.9 の「負荷の前の吸気の温度の差が ±1 °C を超えたらやり直す」
   （2026-10-15 の T7 の GPU 600 W の試行 4 にだけ）/
   [`0123`](0123-cpu-power-floor-tests.md) §2.1 の中間の負荷の行（「そうした tick が 10 に届かないときは、確定せず記録して所有者が判断する（合格にしない）」）/
-  [`0123`](0123-cpu-power-floor-tests.md) §2.2 (b) の「その間の telemetry の健全度と Guard の閾値」の行の確かめ方
+  [`0123`](0123-cpu-power-floor-tests.md) §2.2 (b) の「その間の telemetry の健全度と Guard の閾値」の行と、「戻した後」の行のうち健全度の部分の確かめ方
 - **関連**: [`0119`](0119-safety-values-first-host.md) §2.3 / §2.13 /
   `docs/fan-header-mapping.md`「0121 の試験の結果」T7・T8・T9 (b) /
   #308
@@ -60,8 +60,8 @@
 
 ### 2.3 T9 (b) の健全度と Guard の閾値は、CI のテストで確かめる
 
-0123 §2.2 (b) の 2 行目（その間の telemetry の健全度と Guard の閾値）は、実機の観測の代わりに、次のテストが CI で通ったことで満たす。
-**テストが入るまで、この行は未完了とする。** 実機で見えた次の 2 点は、このテストの前提（収集の側が CPU Power を使えないと判定したこと）を裏付ける。
+0123 §2.2 (b) の 2 行目（その間の telemetry の健全度と Guard の閾値）と、3 行目（戻した後）のうち健全度が `NORMAL` に戻る部分は、実機の観測の代わりに、次のテストが CI で通ったことで満たす。3 行目のうち power の項が戻る部分は、実機で `SIGCONT` から 1.8 s の tick で `cpu_power_unavailable` が消えたことで満たしている。
+**テストが入るまで、これらは未完了とする。** 実機で見えた次の 2 点は、このテストの前提（収集の側が CPU Power を使えないと判定したこと）を裏付ける。
 
 - 実機で `cpu_power_unavailable` が出たこと（最後の書き込みから 7311 ms）
 - fault が上がらず、Top が 0.35 のままだったこと
@@ -77,8 +77,7 @@
 - 既存の `test_one_air_probe_loss_is_degraded_but_not_the_critical_group`（空気のセンサー）と
   `test_degraded_snapshot_uses_the_configured_conservative_threshold_set`（Guard 単体）は、規則を別々に確かめるだけなので、この代わりにしない
 
-戻した後の T8 の全スレッドで Guard の発火 4 回がすべて `normal` の閾値だったことは、復帰（0123 §2.2 (b) の 3 行目）の材料にだけ使う。
-一時停止の間の状態の材料にはしない。
+戻した後の T8 の全スレッドで Guard の発火 4 回がすべて `normal` の閾値だったことは、約 1 分後の値で、新しい sample を観測した tick の健全度を示さないので、合否の材料にしない。
 
 #308 で健全度と閾値を trace に載せたら、T1 の間に実機でも確かめる（0123 §2.3）。
 
