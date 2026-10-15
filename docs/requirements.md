@@ -371,6 +371,9 @@ coldaisle が NVML / lm-sensors も収集し、`GET /api/v1/server-health` を�
 | FR-408 | `ROOM_HIGH` | `air.room > 30°C` が10分継続 | warning |
 | FR-409 | `HUMIDITY_OUT_OF_RANGE` | `air.room_humidity` が 20%未満 or 70%超 が10分継続 | warning |
 
+> **FR-406 の条件について（提案中）**: 決定記録 0144（Proposed）が、GPU の電力から求めた正常な
+> `d.gpu_delta` の上限を超えた分で判定する形への置き換えを提案している。表の改訂は 0144 が FINAL になったときに行う。
+
 > **FR-403 の定義について（2026-08-25 改訂）**: 「変わった瞬間」ではなく
 > **「不一致が続いている状態」**で判定します。意味するのは「較正のオフセットが、
 > いま間違ったプローブに対応している」という、人が直すまで続く状態だからです。
