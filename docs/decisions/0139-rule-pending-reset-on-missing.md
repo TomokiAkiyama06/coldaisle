@@ -152,6 +152,8 @@ A では同じことが **1 サンプルの欠け**で起き、`SENSOR_MISSING` 
 
 **原則: pending の取り消しは、取り消しの原因になった欠けを知らせるアラート（`SENSOR_MISSING` / `SENSOR_FAULT`）が
 エンジンの状態として発火しているときに限る。** 取り消しのために独立の数え方を持たない。
+**いまの設定で無効（`enabled: false`）の故障ルールの発火中の行・状態は、どの経路（サンプルごと・無音・復元）でも取り消しの根拠に使わない。**
+無効にした後に DB に残った行を `_hydrate()` が復元しても、それでは取り消さない（通知の経路としてもう働いていないため）。
 アラートが出ない欠け（故障アラートの無効化・欄の省略・再起動の空白）では取り消さず、今までどおり pending を保つ。
 黙って発火が遅れる経路を作らないためである（その場合に残る空白をまたいだ発火は §5 で扱う）。
 
@@ -161,7 +163,8 @@ A では同じことが **1 サンプルの欠け**で起き、`SENSOR_MISSING` 
   しきい値・範囲のルールは、同じサンプルの `_evaluate_missing()` の後の `SENSOR_MISSING` の状態を読む
 - ルールの値が `None` のサンプルで、次の 2 つを満たす入力のメトリクスが 1 つでもあれば、pending を取り消す
   - そのサンプルでそのメトリクスが ok でない（読み値の品質が ok でない）
-  - そのメトリクスの `SENSOR_MISSING` が**発火中**（`RuleState` の `firing`。0012 の状態機械の状態そのもの）
+  - そのメトリクスの `SENSOR_MISSING` が**発火中**（`RuleState` の `firing`。0012 の状態機械の状態そのもの）で、
+    **いまの設定で `sensor_missing.enabled: true`**（無効にした後に復元した行は根拠にしない）
 - 入力のメトリクスは、ルールの `metric` が派生値なら `config/metrics.yaml` の `minuend` / `subtrahend` の 2 つ、そうでなければ `metric` 自身
 - 取り消しは、pending の行を消し `since_ms` を戻す（0012 §2.4 の「継続時間に届かなかった揺らぎは消す」と同じ。遷移は配らない）。
   0131 §2.3 の実装で作る共通の部品（`RuleState` を pending から戻す関数）を使う
@@ -202,13 +205,19 @@ A では同じことが **1 サンプルの欠け**で起き、`SENSOR_MISSING` 
 #### 2.3.3 無音（`SENSOR_FAULT` に結びつける。一括再生を含む）
 
 - `sensor_fault.enabled: true` のときだけ当てる。無効なら取り消さない
-- `on_tick()` で無音（今の時刻 − 最後のサンプルの時刻）が `silence_s` に届き `SENSOR_FAULT` が発火した評価で、5 つのルールの pending をすべて取り消す
+- **無音の条件（今の時刻、または新しいサンプルの時刻 − 直前のサンプルの時刻 ≥ `silence_s`）を満たす評価では、`SENSOR_FAULT` が
+  新しく発火したか既に発火中かによらず、5 つのルールの pending をすべて取り消す。** サンプルが `clear_s` より短く戻る間に pending が始まり、
+  `SENSOR_FAULT` が発火中のまま再び空白が来た場合（「戻ってすぐまた空白」）も、2 回目の空白で取り消す。発火中の `SENSOR_FAULT` は人に届いて
+  おり、黙った遅れにならない
+- `on_tick()` で無音が `silence_s` に届いた評価（`SENSOR_FAULT` が発火した評価と、発火中で無音が続く評価）で取り消す。無音の間は
+  サンプルが来ないので pending は新しく始まらず、繰り返しの取り消しは何もしない
 - **一括再生（`--bulk`）と処理の滞り**: 一括再生では受け箱が空にならず `on_tick()` が呼ばれない。また今の `on_sample()` は
   `_last_sample_ms` を新しいサンプルの時刻に**先に**更新してから `_evaluate_silence()` を呼ぶので、CSV の空白は無音として見えない。
   そこで `on_sample()` は、`_last_sample_ms` を更新する**前に**、新しいサンプルの時刻と直前のサンプルの時刻の差で無音を評価する
   - 差が `silence_s` 以上で `SENSOR_FAULT` が発火していなければ、そのサンプルの時刻（0012 §2.2 の評価時刻）で `SENSOR_FAULT` を開いて発火させ、
     同じ評価で 5 つのルールの pending を取り消す。`detail` は今と同じ形（「N 秒サンプルが届いていない」）
-  - そのサンプルは届いているので、`resumed_ms` をそのサンプルの時刻にし、`clear_s` 届き続けたら今までどおり解除する
+  - 差が `silence_s` 以上で `SENSOR_FAULT` が既に発火中なら、発火中のまま、同じ評価で 5 つのルールの pending を取り消す
+  - どちらでも、そのサンプルは届いているので、`resumed_ms` をそのサンプルの時刻にし直し（前の再開からの数えは捨てる）、`clear_s` 届き続けたら今までどおり解除する
   - 実時間の運転では、`on_tick()` が先に `SENSOR_FAULT` を発火させているので、上の分岐は何もしない（発火中のまま再開の扱いへ進む）
 - これにより、一括再生でも CSV の空白が `SENSOR_FAULT` として記録される。今は一括再生では空白で `SENSOR_FAULT` が出ないので、
   `sensor_fault` の振る舞いの変更である（2.5 で確かめる）
@@ -224,7 +233,7 @@ A では同じことが **1 サンプルの欠け**で起き、`SENSOR_MISSING` 
 | 場所 | 変えること |
 |---|---|
 | `src/coldaisle/rules/engine.py` の `on_sample()` | `_last_sample_ms` を更新する前に、直前のサンプルの時刻との差で無音を評価する（2.3.3） |
-| `_evaluate_silence()` | 評価の基準の時刻を引数で受けられるようにする（`on_tick()` は今の時刻、`on_sample()` は直前のサンプルの時刻との差）。`SENSOR_FAULT` が発火した評価で 5 つのルールの pending を取り消す |
+| `_evaluate_silence()` | 評価の基準の時刻を引数で受けられるようにする（`on_tick()` は今の時刻、`on_sample()` は直前のサンプルの時刻との差）。無音の条件を満たす評価で（`SENSOR_FAULT` が新しく発火したか既に発火中かによらず。`sensor_fault.enabled: true` のとき）5 つのルールの pending を取り消す |
 | `_evaluate_threshold()` / `_evaluate_range()` | `value is None` の分岐で 2.3.1 の条件を見て、満たせば pending を取り消す（firing なら何もしない） |
 | `RuleState` | 変えない（独立の欠けの数を持たない） |
 | `_hydrate()` | 有効なアラートだけを上限なしに読む問い合わせに替え、読み戻しの終わりに、発火中でいま有効な `SENSOR_MISSING`（入力のメトリクス）/ `SENSOR_FAULT` に依る pending を取り消す（2.3.2。移行を含む） |
@@ -254,6 +263,11 @@ A では同じことが **1 サンプルの欠け**で起き、`SENSOR_MISSING` 
   `started_ms` を持つ pending の `ROOM_HIGH`（および `RECIRCULATION`）を置いて起動し、最初のサンプルが ok で閾値を超えていても発火せず、
   そのサンプルの時刻から数え直すこと。発火中の `SENSOR_FAULT` と pending の 5 つのルールでも同じこと。入力に関係しない
   `SENSOR_MISSING`（例: `air.top_exhaust`）だけが発火中なら、`INTAKE_HIGH` の pending を引き継ぐこと。発火中（firing）のしきい値のアラートは取り消さないこと
+- **無効化した後の残った行（サンプルごとの経路）**: `sensor_missing.enabled: false` にした設定で、以前の発火中の `SENSOR_MISSING`（`air.gpu_intake`）の行が
+  残ったまま起動し、`INTAKE_HIGH` が pending になった後に `air.gpu_intake` が 1 サンプル欠けても取り消さないこと
+- **戻ってすぐまた空白**: 30 s の無音で `SENSOR_FAULT` が発火 → サンプルが `clear_s`（10 s）より短く戻る間に `INTAKE_HIGH` が pending になる →
+  再び 30 s の無音、のとき、`SENSOR_FAULT` は発火中のまま、2 回目の空白で pending が取り消され、空白の前の `started_ms` で発火しないこと。
+  実時間（`on_tick()`）と一括再生（サンプルの時刻の差）の両方で確かめる。`SENSOR_FAULT` の解除は 2 回目の再開から `clear_s` の後になること
 - **無効化した後の残った行**: `sensor_missing.enabled: false`（または `sensor_fault.enabled: false`）にした設定で、以前の発火中の
   `SENSOR_MISSING`（`SENSOR_FAULT`）の行と依存する pending が DB に残ったまま起動したとき、pending を取り消さず引き継ぐこと
 - **復元の窓**: 発火中の `SENSOR_MISSING` と依存する pending より新しい解決済みのアラートが 1000 件を超える DB で起動しても、
