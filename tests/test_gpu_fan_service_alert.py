@@ -456,6 +456,7 @@ class RecordingNotifier:
     @dataclass
     class _Config:
         dashboard_url: str = "http://127.0.0.1:8000/"
+        context_always: tuple[str, ...] = ("air.room",)
 
     def __init__(self) -> None:
         self.config = self._Config()
