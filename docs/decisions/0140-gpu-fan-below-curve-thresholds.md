@@ -1,7 +1,7 @@
 # 決定記録 0140: `GPU_FAN_BELOW_CURVE` の閾値を 0130 の曲線に合わせ、80 °C 以上で 70 % 未満にする
 
 - **種別**: Decision Record
-- **Status**: Proposed
+- **Status**: FINAL（2026-10-15、リポジトリ所有者の承認）
 - **Date**: 2026-10-15
 - **Supersedes**: [`0131`](0131-gpu-fan-service-alert.md) §2.1 の `gpu_fan_below_curve` の閾値
   （`core_threshold` 70 °C・`fan_below` 90 %・`core_clear` 67 °C・`fan_clear` 95 %）と、その根拠の説明
