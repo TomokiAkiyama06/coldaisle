@@ -31,6 +31,7 @@ from coldaisle.api.models import (
 )
 from coldaisle.api.server_health import ServerHealthSettings, build_server_health
 from coldaisle.clock import SimulatedClock
+from coldaisle.llm_exclusions import LlmExclusions
 from coldaisle.metrics import MetricCatalog
 from coldaisle.store import Quality, Reading, Sample, SqliteStore
 from coldaisle.store.models import EventRecord, LatestReading
@@ -908,6 +909,7 @@ def test_the_advisory_is_identical_whether_the_ai_answers_or_fails(tmp_path, rul
             ),
             clock=SimulatedClock(NOW_MS),
             health_summarizer=summarizer,
+            llm_exclusions=LlmExclusions.from_yaml(CONFIG_DIR / "report.yaml"),
             health_hwmon_metrics=(),
             health_nvml_metrics=(),
         )

@@ -22,14 +22,31 @@ from coldaisle import logs
 from coldaisle.clock import Clock
 from coldaisle.metrics import MetricCatalog, compute_derived
 from coldaisle.rules.models import (
+    FlagOffRule,
+    HotAndSlowRule,
     RangeRule,
     RuleSet,
     SlopeRule,
     ThresholdRule,
+    rule_metrics,
 )
-from coldaisle.store import Quality, Reading, Sample, SqliteStore
+from coldaisle.store import LatestReading, Quality, Reading, Sample, SqliteStore
 
 LOGGER = logging.getLogger("coldaisle.rules")
+
+
+GAP_RESET_RULES: tuple[str, ...] = (
+    "recirculation",
+    "intake_high",
+    "airflow_degraded",
+    "room_high",
+    "humidity_out_of_range",
+)
+"""欠けの検知（`SENSOR_MISSING` / `SENSOR_FAULT`）で発火待ちを数え直すルール（決定記録 0139 §2.3）。
+
+`rapid_rise`・`sensor_*`・`probe_changed` と、DB の最新値を読む GPU の Fan の 2 つのルール
+（0131 §2.3。1 回の欠けで取り消す）は含めない。
+"""
 
 
 @dataclass
@@ -126,12 +143,10 @@ class Engine:
     def __post_init__(self) -> None:
         known = set(self.catalog.metrics) | set(self.catalog.derived)
         for name, rule in self.rules:
-            metric = getattr(rule, "metric", None)
-            if metric is None:
-                continue
-            if metric not in known:
-                # 綴り違いは「一度も成立しないルール」として静かに通る。読み込み時に落とす
-                raise ValueError(f"{name}: 未知のメトリクス {metric!r}（config/metrics.yaml）")
+            for metric in rule_metrics(rule):
+                if metric not in known:
+                    # 綴り違いは「一度も成立しないルール」として静かに通る。読み込み時に落とす
+                    raise ValueError(f"{name}: 未知のメトリクス {metric!r}（config/metrics.yaml）")
         self._hydrate()
 
     def _hydrate(self) -> None:
@@ -141,15 +156,42 @@ class Engine:
         条件が解けていても `firing` のまま永久に残り、逆にまだ異常なら
         同じ事象の行がもう1つ増える。
         """
-        for alert in self.store.alerts(limit=1_000):
-            if alert.state.value not in ("pending", "firing"):
-                continue
+        # **件数の上限なしに、有効な行だけを読む**（決定記録 0139 §2.3.2）。解決済みを含む
+        # 新しい N 件で読むと、古い発火中の故障アラートや pending が窓の外に落ちる
+        for alert in self.store.active_alerts():
             state = self._state(alert.rule_id, alert.metric)
             state.since_ms = alert.started_ms
             state.alert_id = alert.id
             state.firing = alert.state.value == "firing"
             state.severity = alert.severity.value
             self._advance(alert.started_ms)
+            if not state.firing and alert.rule_id in self._latest_rule_ids():
+                # DB の最新値を読むルールの発火待ちは、止まっていた間を連続とみなさない
+                # （決定記録 0131 §2.3。欠けた入力で発火待ちを取り消すのと同じ扱い）。
+                # 残すと、再起動の直後に 1 回成立しただけで継続時間を満たしたことになる
+                self._cancel_pending(alert.rule_id, alert.metric)
+        self._cancel_hydrated_gaps()
+
+    def _cancel_hydrated_gaps(self) -> None:
+        """読み戻した発火待ちのうち、発火中の故障アラートに依るものを取り消す（0139 §2.3.2）。
+
+        更新の前のエンジンが取り消さずに残した状態（移行）も、ここで同じに閉じる。
+        発火中の故障アラートは既に人に届いているので、黙った遅れにならない。
+        **いまの設定で無効の故障ルールの行は根拠にしない**（通知の経路として働いていない）。
+        発火の時刻の前後は比べない（観測の切れ目をまたいだ継続を数えない）。
+        停止の空白だけでは取り消さない（空白を知らせる信号が無く、黙った遅れになる。0139 §5 の 4）。
+        """
+        fault_firing = self._fault_firing()
+        for name in GAP_RESET_RULES:
+            rule = getattr(self.rules, name)
+            rule_id = name.upper()
+            state = self._states.get((rule_id, rule.metric))
+            if state is None or state.since_ms is None or state.firing:
+                continue
+            if fault_firing or any(
+                self._missing_firing(metric) for metric in self._input_metrics(rule.metric)
+            ):
+                self._cancel_pending(rule_id, rule.metric)
 
     def begin(self, at_ms: int) -> None:
         """監視を始めた時刻を基準にする。
@@ -169,8 +211,8 @@ class Engine:
 
         **サンプルの受信時刻で評価する。** 時計は処理より先に進んでいることがある。
         """
+        previous_ms = self._last_sample_ms
         self._advance(sample.ts_ms)
-        self._last_sample_ms = sample.ts_ms
         readings = {reading.metric: reading for reading in sample.readings}
         values: dict[str, float | None] = {
             metric: (reading.value if reading.quality is Quality.OK else None)
@@ -179,17 +221,24 @@ class Engine:
         values.update(compute_derived(readings, self.catalog))
 
         transitions: list[Transition] = []
+        # **`_last_sample_ms` を更新する前に**、直前のサンプルとの空白を無音として評価する
+        # （決定記録 0139 §2.3.3）。一括再生では `on_tick()` が呼ばれず、
+        # 更新した後では空白が見えない
+        transitions += self._evaluate_sample_gap(previous_ms, sample.ts_ms)
+        self._last_sample_ms = sample.ts_ms
         transitions += self._evaluate_silence()
         transitions += self._evaluate_missing(readings)
         for name in ("recirculation", "intake_high", "airflow_degraded", "room_high"):
             rule = getattr(self.rules, name)
-            transitions += self._evaluate_threshold(name, rule, values.get(rule.metric))
+            transitions += self._evaluate_threshold(name, rule, values.get(rule.metric), readings)
         transitions += self._evaluate_range(
             "humidity_out_of_range",
             self.rules.humidity_out_of_range,
             values.get(self.rules.humidity_out_of_range.metric),
+            readings,
         )
         transitions += self._evaluate_slope("rapid_rise", self.rules.rapid_rise)
+        transitions += self._evaluate_latest()
         return transitions
 
     def on_tick(self) -> list[Transition]:
@@ -197,9 +246,12 @@ class Engine:
 
         **無音の検出（FR-401）はこれが無いと動かない。** サンプルが来た時だけ
         評価すると、止まったことに気づけるのは再開した後になる。
+
+        DB の最新値を読むルール（決定記録 0131 §2.3）もここで評価する。基板のサンプルが
+        止まっていても、GPU の値は別プロセスが書き続けている。
         """
         self._advance(self.clock.now_ms())
-        return self._evaluate_silence()
+        return self._evaluate_silence() + self._evaluate_latest()
 
     def on_hello(
         self,
@@ -251,11 +303,52 @@ class Engine:
         state = self._state("SENSOR_FAULT", None)
         silence_s = (now - self._last_sample_ms) / 1000
 
-        if state.since_ms is None:
-            if silence_s < rule.silence_s:
-                return []
+        if silence_s >= rule.silence_s:
             state.resumed_ms = None
-            return self._begin(
+            return self._fault_silence(silence_s)
+        if state.since_ms is None:
+            return []
+        # 届き始めた。**すぐには解除しない。** 1件届いただけで復旧とみなすと、
+        # 断続的な接続で発火と解除を繰り返す
+        if state.resumed_ms is None:
+            state.resumed_ms = now
+        if (now - state.resumed_ms) / 1000 < rule.clear_s:
+            return []
+        return self._end("SENSOR_FAULT", None)
+
+    def _evaluate_sample_gap(self, previous_ms: int | None, sample_ms: int) -> list[Transition]:
+        """新しいサンプルと直前のサンプルの時刻の差を無音として評価する（決定記録 0139 §2.3.3）。
+
+        一括再生・処理の滞りでは `on_tick()` が無音を見ないので、CSV の空白を
+        ここで `SENSOR_FAULT` にする。差が `silence_s` 以上なら、発火していなければ
+        このサンプルの時刻で開いて発火させ、5 つのルールの発火待ちを取り消す。
+        そのサンプルは届いているので、再開の時刻をこのサンプルの時刻にし直す
+        （前の再開からの数えは捨てる）。実時間の運転では `on_tick()` が先に発火させて
+        いるので、発火中のまま再開の扱いへ進むだけになる。
+        """
+        rule = self.rules.sensor_fault
+        if not rule.enabled or previous_ms is None:
+            return []
+        gap_s = (sample_ms - previous_ms) / 1000
+        if gap_s < rule.silence_s:
+            return []
+        transitions = self._fault_silence(gap_s)
+        state = self._state("SENSOR_FAULT", None)
+        if state.since_ms is not None:
+            state.resumed_ms = self._now_ms
+        return transitions
+
+    def _fault_silence(self, silence_s: float) -> list[Transition]:
+        """無音の条件（`silence_s` 以上）を満たした評価。**`sensor_fault` が有効なときだけ呼ぶ。**
+
+        `SENSOR_FAULT` を開く・続ける。発火中なら（新しく発火したか既に発火中かによらず）、
+        5 つのルールの発火待ちを取り消す（決定記録 0139 §2.3.3）。「戻ってすぐまた空白」も
+        2 回目の空白で取り消す。発火中の `SENSOR_FAULT` は人に届いているので、黙った遅れにならない。
+        """
+        rule = self.rules.sensor_fault
+        state = self._state("SENSOR_FAULT", None)
+        if state.since_ms is None:
+            transitions = self._begin(
                 "SENSOR_FAULT",
                 None,
                 rule.severity.value,
@@ -264,17 +357,12 @@ class Engine:
                 rule.fire_after_s,
                 detail=f"{silence_s:.0f} 秒サンプルが届いていない",
             )
-
-        if silence_s >= rule.silence_s:
-            state.resumed_ms = None
-            return self._continue("SENSOR_FAULT", None, silence_s, rule.fire_after_s)
-        # 届き始めた。**すぐには解除しない。** 1件届いただけで復旧とみなすと、
-        # 断続的な接続で発火と解除を繰り返す
-        if state.resumed_ms is None:
-            state.resumed_ms = now
-        if (now - state.resumed_ms) / 1000 < rule.clear_s:
-            return []
-        return self._end("SENSOR_FAULT", None)
+        else:
+            transitions = self._continue("SENSOR_FAULT", None, silence_s, rule.fire_after_s)
+        if state.firing:
+            for name in GAP_RESET_RULES:
+                self._cancel_pending(name.upper(), getattr(self.rules, name).metric)
+        return transitions
 
     def _evaluate_missing(self, readings: Mapping[str, Reading]) -> list[Transition]:
         rule = self.rules.sensor_missing
@@ -309,11 +397,18 @@ class Engine:
         return transitions
 
     def _evaluate_threshold(
-        self, name: str, rule: ThresholdRule, value: float | None
+        self,
+        name: str,
+        rule: ThresholdRule,
+        value: float | None,
+        readings: Mapping[str, Reading],
     ) -> list[Transition]:
-        if not rule.enabled or value is None:
+        if not rule.enabled:
             return []
         rule_id = name.upper()
+        if value is None:
+            self._reset_on_missing(rule_id, rule.metric, readings)
+            return []
         state = self._state(rule_id, rule.metric)
         # ヒステリシス: 成立中は解除の閾値まで下がるのを待つ
         limit = rule.clear if state.since_ms is not None else rule.threshold
@@ -330,10 +425,19 @@ class Engine:
             return self._continue(rule_id, rule.metric, value, rule.fire_after_s)
         return self._end(rule_id, rule.metric) if state.since_ms is not None else []
 
-    def _evaluate_range(self, name: str, rule: RangeRule, value: float | None) -> list[Transition]:
-        if not rule.enabled or value is None:
+    def _evaluate_range(
+        self,
+        name: str,
+        rule: RangeRule,
+        value: float | None,
+        readings: Mapping[str, Reading],
+    ) -> list[Transition]:
+        if not rule.enabled:
             return []
         rule_id = name.upper()
+        if value is None:
+            self._reset_on_missing(rule_id, rule.metric, readings)
+            return []
         state = self._state(rule_id, rule.metric)
         if state.since_ms is None:
             outside = value < rule.low or value > rule.high
@@ -373,6 +477,176 @@ class Engine:
                 )
             return self._continue(rule_id, rule.metric, slope, rule.fire_after_s)
         return self._end(rule_id, rule.metric) if state.since_ms is not None else []
+
+    def _latest_rule_ids(self) -> frozenset[str]:
+        """DB の最新値を読むルールの rule_id（決定記録 0131 §2.3）。"""
+        return frozenset(
+            name.upper()
+            for name, rule in self.rules
+            if isinstance(rule, FlagOffRule | HotAndSlowRule)
+        )
+
+    def _evaluate_latest(self) -> list[Transition]:
+        """DB の最新値を評価時刻で読んで評価するルール（決定記録 0131 §2.3）。
+
+        **`at_ms` は評価時刻**（0012 §2.2）。圧縮再生・一括再生でも実運用と同じ判定になる。
+        stale は `SqliteStore.latest()` が `config/quality.yaml` の閾値で落とした品質を
+        そのまま使う（閾値を 2 か所に持たない）。
+        """
+        not_manual = self.rules.gpu_fan_not_manual
+        below_curve = self.rules.gpu_fan_below_curve
+        if not not_manual.enabled and not below_curve.enabled:
+            return []
+        latest = self.store.latest(at_ms=self._now_ms)
+        transitions: list[Transition] = []
+        transitions += self._evaluate_flag_off("gpu_fan_not_manual", not_manual, latest)
+        transitions += self._evaluate_hot_and_slow("gpu_fan_below_curve", below_curve, latest)
+        return transitions
+
+    def _evaluate_flag_off(
+        self, name: str, rule: FlagOffRule, latest: Mapping[str, LatestReading]
+    ) -> list[Transition]:
+        if not rule.enabled:
+            return []
+        rule_id = name.upper()
+        value = _current(latest, rule.metric)
+        if value is None:
+            self._reset_on_gap(rule_id, rule.metric)
+            return []
+        state = self._state(rule_id, rule.metric)
+        if value != 1.0:
+            # 手動でない。解除の待ちは途切れた
+            state.resumed_ms = None
+            detail = (
+                f"{rule.metric} = {value:g}（1 でない）。"
+                "GPU の Fan を曲線のサービスが握っていない。"
+                f"{_GPU_FAN_SERVICE_HINT}"
+            )
+            if state.since_ms is None:
+                return self._begin(
+                    rule_id,
+                    rule.metric,
+                    rule.severity.value,
+                    None,
+                    value,
+                    rule.fire_after_s,
+                    detail=detail,
+                )
+            return self._continue(rule_id, rule.metric, value, rule.fire_after_s, detail=detail)
+        if state.since_ms is None:
+            return []
+        if not state.firing:
+            return self._end(rule_id, rule.metric)  # 発火待ちの揺らぎは消す（0012 §2.4）
+        # **1 回の 1 で解除しない。** 再起動を繰り返している間も一瞬は手動になる
+        if state.resumed_ms is None:
+            state.resumed_ms = self._now_ms
+        if (self._now_ms - state.resumed_ms) / 1000 < rule.clear_s:
+            return []
+        return self._end(rule_id, rule.metric)
+
+    def _evaluate_hot_and_slow(
+        self, name: str, rule: HotAndSlowRule, latest: Mapping[str, LatestReading]
+    ) -> list[Transition]:
+        if not rule.enabled:
+            return []
+        rule_id = name.upper()
+        core = _current(latest, rule.core_metric)
+        fan = _current(latest, rule.fan_metric)
+        if core is None or fan is None:
+            # 片方だけが欠けても欠けとみなす（0131 §2.3）
+            self._reset_on_gap(rule_id, rule.fan_metric)
+            return []
+        state = self._state(rule_id, rule.fan_metric)
+        if state.since_ms is None:
+            holds = core >= rule.core_threshold and fan < rule.fan_below
+        else:
+            # ヒステリシス: 成立中は解除の閾値を越えるまで成立し続ける
+            holds = not (core < rule.core_clear or fan >= rule.fan_clear)
+        if not holds:
+            return self._end(rule_id, rule.fan_metric) if state.since_ms is not None else []
+        detail = (
+            f"{rule.core_metric} = {core:.1f} で {rule.fan_metric} = {fan:.0f}"
+            f"（{rule.fan_below:g} 未満）。GPU の Fan が曲線どおりに回っていない。"
+            f"{_GPU_FAN_SERVICE_HINT}"
+        )
+        if state.since_ms is None:
+            return self._begin(
+                rule_id,
+                rule.fan_metric,
+                rule.severity.value,
+                rule.fan_below,
+                fan,
+                rule.fire_after_s,
+                detail=detail,
+            )
+        return self._continue(rule_id, rule.fan_metric, fan, rule.fire_after_s, detail=detail)
+
+    def _reset_on_gap(self, rule_id: str, metric: str | None) -> None:
+        """欠けた・stale の入力を受けた（決定記録 0131 §2.3）。**連続の時間を数え直す。**
+
+        - 発火待ちは取り消す（行を消す。遷移は配らない）。回復後に成立したら、その時刻から数え直す
+        - 発火中は**解除しない**。解除の待ちの起点だけを戻し、回復後にもう一度待つ
+
+        **DB の最新値を読むルールだけが呼ぶ。** しきい値・範囲のルールは、欠けを知らせる
+        `SENSOR_MISSING` / `SENSOR_FAULT` が発火したときだけ取り消す（`_reset_on_missing()`。
+        決定記録 0139。境界が違うのは 0139 §3 のとおり）。
+        """
+        state = self._state(rule_id, metric)
+        if state.since_ms is None:
+            return
+        if state.firing:
+            state.resumed_ms = None
+            return
+        self._cancel_pending(rule_id, metric)
+
+    def _reset_on_missing(self, rule_id: str, metric: str, readings: Mapping[str, Reading]) -> None:
+        """値が無いサンプル。欠けを知らせる `SENSOR_MISSING` が発火中なら発火待ちを取り消す。
+
+        決定記録 0139 §2.3.1。入力のメトリクスのうち、**このサンプルで ok でなく**、
+        その `SENSOR_MISSING` が発火中（いまの設定で有効）のものが 1 つでもあれば取り消す。
+        独立の欠けの数を持たないので、取り消しの条件と故障アラートの条件が食い違わない。
+        1〜4 サンプルの欠け・欄の省略・`sensor_missing` の無効化では取り消さない
+        （黙って発火を遅らせない）。発火中のルールは何もしない（回復後に解除の閾値で解く）。
+        """
+        for name in self._input_metrics(metric):
+            reading = readings.get(name)
+            if reading is None or reading.quality is Quality.OK:
+                continue
+            if self._missing_firing(name):
+                self._cancel_pending(rule_id, metric)
+                return
+
+    def _input_metrics(self, metric: str) -> tuple[str, ...]:
+        """ルールの入力のメトリクス。派生値なら `minuend` / `subtrahend` の 2 つ。"""
+        derived = self.catalog.derived.get(metric)
+        if derived is None:
+            return (metric,)
+        return (derived.minuend, derived.subtrahend)
+
+    def _missing_firing(self, metric: str) -> bool:
+        """`metric` の `SENSOR_MISSING` が発火中で、いまの設定で有効か（0139 §2.3）。"""
+        if not self.rules.sensor_missing.enabled:
+            return False
+        state = self._states.get(("SENSOR_MISSING", metric))
+        return state is not None and state.firing
+
+    def _fault_firing(self) -> bool:
+        """`SENSOR_FAULT` が発火中で、いまの設定で有効か（0139 §2.3）。"""
+        if not self.rules.sensor_fault.enabled:
+            return False
+        state = self._states.get(("SENSOR_FAULT", None))
+        return state is not None and state.firing
+
+    def _cancel_pending(self, rule_id: str, metric: str | None) -> None:
+        """発火待ちを取り消す。継続時間に届かなかった揺らぎと同じく行を消す（0012 §2.4）。"""
+        state = self._state(rule_id, metric)
+        if state.firing:
+            return
+        if state.alert_id is not None:
+            self.store.delete_alert(state.alert_id)
+        state.since_ms = None
+        state.alert_id = None
+        state.resumed_ms = None
 
     # ------------------------------------------------------------------ 状態機械
 
@@ -426,14 +700,20 @@ class Engine:
         return transitions
 
     def _continue(
-        self, rule_id: str, metric: str | None, value: float | None, fire_after_s: float
+        self,
+        rule_id: str,
+        metric: str | None,
+        value: float | None,
+        fire_after_s: float,
+        *,
+        detail: str | None = None,
     ) -> list[Transition]:
         state = self._state(rule_id, metric)
         if state.firing or state.since_ms is None:
             return []
         if (self._now_ms - state.since_ms) / 1000 < fire_after_s:
             return []
-        return self._fire(rule_id, metric, value, None)
+        return self._fire(rule_id, metric, value, detail)
 
     def _fire(
         self, rule_id: str, metric: str | None, value: float | None, detail: str | None
@@ -472,3 +752,18 @@ class Engine:
         if not was_firing:
             return []
         return [Transition(rule_id, metric, "resolved", None, None, severity)]
+
+
+_GPU_FAN_SERVICE_HINT = (
+    "理由は `systemctl status coldaisle-gpu-fan` と `journalctl -u coldaisle-gpu-fan`"
+    "（gpu_fan_model_mismatch などの event）で確かめる"
+)
+"""通知の文に載せる切り分けの案内（決定記録 0131 §2.1）。監視系は systemd も journal も読まない。"""
+
+
+def _current(latest: Mapping[str, LatestReading], metric: str) -> float | None:
+    """評価に使える最新値。**無い・ok でない（stale を含む）なら `None`**（0131 §2.3）。"""
+    reading = latest.get(metric)
+    if reading is None or reading.quality is not Quality.OK or reading.value is None:
+        return None
+    return reading.value

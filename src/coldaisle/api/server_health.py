@@ -29,6 +29,7 @@ from coldaisle.api.models import (
 )
 from coldaisle.channels import EVENT_METRICS
 from coldaisle.internal_telemetry import SOURCE_STATE_PREFIX
+from coldaisle.llm_exclusions import LlmExclusions
 from coldaisle.metrics import MetricCatalog
 from coldaisle.store import AlertSeverity, Quality, SqliteStore
 from coldaisle.store.models import LatestReading
@@ -130,8 +131,15 @@ def build_server_health(
     hwmon_metrics: tuple[str, ...],
     nvml_metrics: tuple[str, ...],
     cpu_power_metrics: tuple[str, ...] = (),
+    llm_exclusions: LlmExclusions | None = None,
 ) -> ServerHealthResponse:
-    """DB の同じ current view から REST / WS 共通 payload を作る。"""
+    """DB の同じ current view から REST / WS 共通 payload を作る。
+
+    **応答（signal・active_alerts・テンプレート）は除外の一覧を当てない。** AI 要約へ渡す
+    テンプレートだけは、除外の一覧の rule_id とメトリクスを除いた集合で signal を決め直し
+    （AI 用の signal）、それが応答の signal と違えば要約を求めない（決定記録 0131 §2.4a）。
+    ``llm_exclusions`` が無ければ要約を求めない（どれを LLM へ渡してよいか分からない）。
+    """
     # payload 全体を DB の1時点から作る。文ごとに読むと、間に resolve や新しい
     # サンプルが入ったとき一覧・件数・値・source 状態が食い違う。AI 要約は
     # スナップショットの外で行い、読み取りトランザクションを長く保持しない
@@ -155,6 +163,16 @@ def build_server_health(
             (*hwmon_metrics, *nvml_metrics, *cpu_power_metrics)
         )
         signal = _signal(sources, readings, firing, settings.missing_tolerated, sorted(monitored))
+        ai_signal = _ai_signal(
+            store,
+            catalog,
+            llm_exclusions,
+            sources=sources,
+            readings=readings,
+            settings=settings,
+            monitored=monitored,
+            source_metrics=(*settings.required_metrics(), *hwmon_metrics),
+        )
         # advisory も同じスナップショットから作る。過去のフルロード実績は別の
         # 読み出しになるため、現在値と食い違う時点を混ぜない（決定記録 0042 §2.6）
         advisory = advisor.evaluate(
@@ -175,9 +193,11 @@ def build_server_health(
     )
 
     summary = None
-    if summarizer is not None:
+    # AI 用の signal が応答と違う（＝除いたアラート・メトリクスが signal を変えている）ときは
+    # 要約を求めない。求めると、応答の signal と要約の文が食い違って人を誤らせる
+    if summarizer is not None and ai_signal is signal:
         try:
-            summary = summarizer.summarize(_TEMPLATES[signal])
+            summary = summarizer.summarize(_TEMPLATES[ai_signal])
         except Exception:
             # AI は任意の文面生成だけを担う。失敗を signal や API availability へ伝播させない。
             LOGGER.warning("Server Health のAI要約に失敗した", exc_info=True)
@@ -217,6 +237,39 @@ def build_server_health(
             ai_layer=ai_source,
         ),
         compute_mode_advisory=advisory,
+    )
+
+
+def _ai_signal(
+    store: SqliteStore,
+    catalog: MetricCatalog,
+    exclusions: LlmExclusions | None,
+    *,
+    sources: HealthSources,
+    readings: Mapping[str, LatestReading],
+    settings: ServerHealthSettings,
+    monitored: frozenset[str],
+    source_metrics: tuple[str, ...],
+) -> ServerSignal | None:
+    """除外の一覧を当てた後の集合で決めた signal。``None`` なら要約を求めない。
+
+    情報源の状態（sources）は監視必須の metric から決まる。そこに除外の metric があると
+    除いた後の集合だけで決め直せないので、要約を求めない（安全側）。
+    """
+    if exclusions is None:
+        return None
+    if any(exclusions.excludes_metric(metric) for metric in source_metrics):
+        return None
+    excluded = exclusions.excluded_metrics((*catalog.metrics, *readings), catalog)
+    firing = store.alert_severity_counts(
+        state="firing", exclude_rule_ids=exclusions.rule_ids, exclude_metrics=excluded
+    )
+    return _signal(
+        sources,
+        readings,
+        firing,
+        settings.missing_tolerated,
+        sorted(metric for metric in monitored if metric not in excluded),
     )
 
 

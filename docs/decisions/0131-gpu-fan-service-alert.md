@@ -4,6 +4,7 @@
 - **Status**: FINAL（2026-10-14、リポジトリ所有者の承認）
 - **Date**: 2026-10-14
 - **Supersedes**: なし
+- **Superseded by**: [`0140`](0140-gpu-fan-below-curve-thresholds.md)（§2.1 の `gpu_fan_below_curve` の閾値とその根拠の説明だけ。Proposed）
 - **関連**: [`0128`](0128-gpu-fan-curve-service.md) §2.2 / §2.4 /
   [`0012`](0012-rule-engine.md) §2.1 / §2.2 /
   [`0013`](0013-notifications.md) /

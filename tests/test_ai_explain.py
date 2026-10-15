@@ -15,6 +15,7 @@ import pytest
 from coldaisle.ai import ChatResult, Explainer, ToolRegistry, UnavailableProvider
 from coldaisle.ai.explain import FORBIDDEN, Evidence, Explanation
 from coldaisle.clock import SimulatedClock
+from coldaisle.llm_exclusions import LlmExclusions
 from coldaisle.metrics import MetricCatalog
 from coldaisle.rules import RuleSet
 from coldaisle.store import (
@@ -80,6 +81,7 @@ def tools(store) -> ToolRegistry:
         catalog=MetricCatalog.from_yaml(CONFIG_DIR / "metrics.yaml"),
         rules=RuleSet.from_yaml(CONFIG_DIR / "rules.yaml"),
         clock=store.clock,
+        exclusions=LlmExclusions.from_yaml(CONFIG_DIR / "report.yaml"),
     )
 
 
@@ -145,6 +147,7 @@ def test_quality_problems_are_reported(tmp_path, rules):
             catalog=MetricCatalog.from_yaml(CONFIG_DIR / "metrics.yaml"),
             rules=RuleSet.from_yaml(CONFIG_DIR / "rules.yaml"),
             clock=store.clock,
+            exclusions=LlmExclusions.from_yaml(CONFIG_DIR / "report.yaml"),
         )
         evidence = Explainer(provider=FakeProvider(ANSWER), tools=registry).build_evidence(alert())
     assert any("air.rear_exhaust" in item.text for item in evidence)

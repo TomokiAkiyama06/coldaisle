@@ -1,7 +1,7 @@
 # 決定記録 0141: 段階 C1 の import の場所の検査は Python が実際に読む場所に限り、外へ解決した先は書けない検査で受け入れる
 
 - **種別**: Decision Record
-- **Status**: Proposed
+- **Status**: FINAL（2026-10-15、リポジトリ所有者の承認）
 - **Date**: 2026-10-15
 - **Supersedes**: [`0134`](0134-authority-raise-host-verification.md) §2.4 の「1 の確かめ方」のうち、次の2点だけ。
   (1) 走査の範囲（`sys.base_prefix` の下をすべて辿る）。

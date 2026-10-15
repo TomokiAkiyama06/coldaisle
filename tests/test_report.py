@@ -16,6 +16,7 @@ import pytest
 from coldaisle.ai.provider import ChatResult, UnavailableProvider
 from coldaisle.ai.summary import summarise
 from coldaisle.clock import SimulatedClock
+from coldaisle.llm_exclusions import LlmExclusions
 from coldaisle.metrics import MetricCatalog
 from coldaisle.notify.models import Notification
 from coldaisle.report import (
@@ -34,6 +35,7 @@ from conftest import CONFIG_DIR
 
 DAY = date(2026, 8, 24)
 TZ = ZoneInfo("Asia/Tokyo")
+EXCLUSIONS = LlmExclusions.from_yaml(CONFIG_DIR / "report.yaml")
 DAY_START_MS = 1_787_497_200_000
 """2026-08-24T00:00:00+09:00。"""
 
@@ -144,7 +146,7 @@ def alert(
 
 
 def report_for(store, catalog, day: date = DAY) -> DailyReport:
-    return build(store, day=day, tz=TZ, catalog=catalog, max_alerts=20)
+    return build(store, day=day, tz=TZ, catalog=catalog, max_alerts=20, exclusions=EXCLUSIONS)
 
 
 def line_for(report: DailyReport, metric: str):
@@ -386,7 +388,14 @@ def test_model_receives_the_table_not_the_raw_series(store, catalog):
     """生の時系列をプロンプトに入れない（FR-504）。"""
     bucket(store, "air.room", 0, mean=26.0, ok=24)
     provider = FakeProvider("大きな変化はありません。")
-    run(store, _config_with(summarise=True), catalog, day=DAY, summariser=provider)
+    run(
+        store,
+        _config_with(summarise=True),
+        catalog,
+        day=DAY,
+        summariser=provider,
+        exclusions=EXCLUSIONS,
+    )
     assert "## 測定値" in provider.prompts[0]
     assert "## 所見" not in provider.prompts[0]
 

@@ -24,11 +24,12 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from coldaisle import logs
 from coldaisle.clock import Clock
+from coldaisle.llm_exclusions import LlmExclusions
 from coldaisle.metrics import MetricCatalog, compute_derived
-from coldaisle.rules.models import RuleSet
+from coldaisle.rules.models import RuleSet, rule_metrics
 from coldaisle.store import Aggregation, SqliteStore
 from coldaisle.store.db import MINUTE_MS
-from coldaisle.store.models import validate_metric
+from coldaisle.store.models import Stats, validate_metric
 
 LOGGER = logging.getLogger("coldaisle.ai.tools")
 
@@ -198,12 +199,18 @@ DEFINITIONS: list[dict[str, Any]] = _advisory(
 
 @dataclass
 class ToolRegistry:
-    """ツールの実行時。**存在しないツールを呼ばれても落ちない。**"""
+    """ツールの実行時。**存在しないツールを呼ばれても落ちない。**
+
+    **`exclusions` のメトリクスとアラートは返さない**（決定記録 0131 §2.4a）。名前を
+    指定されても「無いメトリクス」と同じ応答にする。上位の時刻・派生値・閾値も、
+    除いた後の集合から作る（除く前の集合から作ると、その差から存在が分かる）。
+    """
 
     store: SqliteStore
     catalog: MetricCatalog
     rules: RuleSet
     clock: Clock
+    exclusions: LlmExclusions
 
     @property
     def guidance(self) -> str:
@@ -247,7 +254,11 @@ class ToolRegistry:
 
     def _tool_get_latest(self, arguments: dict[str, Any]) -> dict[str, Any]:
         EmptyArgs.model_validate(arguments)
-        readings = self.store.latest()
+        readings = {
+            metric: reading
+            for metric, reading in self.store.latest().items()
+            if not self._excluded(metric)
+        }
         return {
             "ts_ms": max((r.ts_ms for r in readings.values()), default=None),
             "metrics": {
@@ -259,7 +270,11 @@ class ToolRegistry:
                 }
                 for metric, reading in sorted(readings.items())
             },
-            "derived": compute_derived(readings, self.catalog),
+            "derived": {
+                name: value
+                for name, value in compute_derived(readings, self.catalog).items()
+                if not self._excluded(name)
+            },
         }
 
     def _tool_query_series(self, arguments: dict[str, Any]) -> dict[str, Any]:
@@ -273,10 +288,14 @@ class ToolRegistry:
         validate_metric(args.metric)
         start_ms, end_ms = self._range(args.from_ms, args.to_ms, args.window)
         agg = self._choose_agg(args.agg, end_ms - start_ms)
-        buckets = self.store.aggregate(args.metric, start_ms, end_ms, agg, limit=MAX_SERIES_POINTS)
+        buckets = (
+            ()  # 無いメトリクスと同じ応答にする（決定記録 0131 §2.4a）
+            if self._excluded(args.metric)
+            else self.store.aggregate(args.metric, start_ms, end_ms, agg, limit=MAX_SERIES_POINTS)
+        )
         return {
             "metric": args.metric,
-            "unit": self.catalog.unit_for(args.metric),
+            "unit": self._unit(args.metric),
             "agg": agg.value,
             "from_ms": start_ms,
             "to_ms": end_ms,
@@ -298,10 +317,14 @@ class ToolRegistry:
         args = StatsArgs.model_validate(arguments)
         validate_metric(args.metric)
         start_ms, end_ms = self._range(None, None, args.window)
-        stats = self.store.stats(args.metric, start_ms, end_ms)
+        stats = (
+            _empty_stats(args.metric, start_ms, end_ms)  # 無いメトリクスと同じ（0131 §2.4a）
+            if self._excluded(args.metric)
+            else self.store.stats(args.metric, start_ms, end_ms)
+        )
         return {
             "metric": args.metric,
-            "unit": self.catalog.unit_for(args.metric),
+            "unit": self._unit(args.metric),
             "window": args.window,
             "from_ms": stats.start_ms,
             "to_ms": stats.end_ms,
@@ -317,7 +340,12 @@ class ToolRegistry:
     def _tool_list_alerts(self, arguments: dict[str, Any]) -> dict[str, Any]:
         args = AlertsArgs.model_validate(arguments)
         alerts = self.store.alerts(
-            state=args.state, start_ms=args.from_ms, end_ms=args.to_ms, limit=args.limit
+            state=args.state,
+            start_ms=args.from_ms,
+            end_ms=args.to_ms,
+            limit=args.limit,
+            exclude_rule_ids=self.exclusions.rule_ids,
+            exclude_metrics=self._excluded_names(),
         )
         return {
             "alerts": [
@@ -368,6 +396,7 @@ class ToolRegistry:
             "metrics": {
                 name: {"unit": meta.unit, "label": meta.label}
                 for name, meta in sorted(self.catalog.metrics.items())
+                if not self._excluded(name)
             },
             "derived": {
                 name: {
@@ -376,6 +405,7 @@ class ToolRegistry:
                     "formula": f"{meta.minuend} - {meta.subtrahend}",
                 }
                 for name, meta in sorted(self.catalog.derived.items())
+                if not self._excluded(name)
             },
             "thresholds": self._thresholds(),
             "note": (
@@ -393,7 +423,29 @@ class ToolRegistry:
         ように「そのルールの発火条件そのもの」が抜ける。
         抜けたまま説明させると、モデルは無い情報を埋めようとする。
         """
-        return {name.upper(): rule.model_dump(mode="json") for name, rule in self.rules}
+        return {
+            name.upper(): rule.model_dump(mode="json")
+            for name, rule in self.rules
+            # 除外の rule_id と、除外のメトリクスを指すルールの行を出さない（0131 §2.4a）
+            if not self.exclusions.excludes_rule(name.upper())
+            and not any(self._excluded(metric) for metric in rule_metrics(rule))
+        }
+
+    def _unit(self, metric: str) -> str | None:
+        """単位。**除外のメトリクスは無いメトリクスと同じ `None`**（単位から存在が分かる）。"""
+        return None if self._excluded(metric) else self.catalog.unit_for(metric)
+
+    def _excluded(self, metric: str) -> bool:
+        """LLM へ渡さないメトリクスか。派生値は材料が除外でも除く（決定記録 0131 §2.4a）。"""
+        return self.exclusions.excludes_metric_or_inputs(metric, self.catalog)
+
+    def _excluded_names(self) -> frozenset[str]:
+        """アラートの検索から除く具体的なメトリクス名（DB と `config/metrics.yaml` から）。"""
+        return frozenset(
+            name
+            for name in (*self.catalog.metrics, *self.catalog.derived, *self.store.metrics())
+            if self._excluded(name)
+        )
 
     def _range(self, from_ms: int | None, to_ms: int | None, window: str | None) -> tuple[int, int]:
         """期間を決める。**片側だけの指定を黙って捨てない。**
@@ -453,3 +505,20 @@ class ToolRegistry:
         if not isinstance(parsed, dict):
             raise ValueError(f"引数が辞書ではない: {parsed!r}")
         return parsed
+
+
+def _empty_stats(metric: str, start_ms: int, end_ms: int) -> Stats:
+    """窓に1行も無いときの統計（`SqliteStore.stats()` と同じ形）。"""
+    return Stats(
+        metric=metric,
+        start_ms=start_ms,
+        end_ms=end_ms,
+        row_count=0,
+        ok_value_count=0,
+        min_value=None,
+        max_value=None,
+        mean_value=None,
+        p95_value=None,
+        slope_per_min=None,
+        missing_ratio=None,
+    )

@@ -18,6 +18,10 @@
 #   threshold     : 発火の閾値
 #   clear         : 解除の閾値。**発火と別に持つ**（ヒステリシス。要件 §6.4）
 #                   閾値ちょうどを往復するデータでフラッピングしないため
+#
+# しきい値・範囲のルール（recirculation / intake_high / airflow_degraded / room_high /
+# humidity_out_of_range）は、SENSOR_MISSING / SENSOR_FAULT が発火したら、その入力に依る
+# 発火待ちを数え直す（決定記録 0139。境界は sensor_missing.consecutive と sensor_fault.silence_s）
 
 rules:
   # FR-401: 30秒以上サンプルが来ない。取り込み・ケーブル・デバイスのどれかが死んでいる
@@ -96,3 +100,34 @@ rules:
     high: 70.0
     high_clear: 67.0
     fire_after_s: 600.0
+
+  # 決定記録 0131 §2.1: GPU の Fan の曲線（coldaisle-gpu-fan。0128）が効いていない。
+  # 値は coldaisle-telemetry が DB へ書いた NVML の最新値を、評価のたびに読む（0131 §2.3）。
+  # 最新値が無い・ok でない（stale。閾値は config/quality.yaml の stale_after_ms）周期は
+  # 評価しない（発火待ちは取り消し、発火中は解除の待ちだけを数え直す）。
+  # 通知を受けたら `systemctl status coldaisle-gpu-fan` と `journalctl -u coldaisle-gpu-fan`
+  # （gpu_fan_model_mismatch などの event）で理由を切り分ける。
+  # この 2 つは LLM へ渡さない（config/report.yaml の llm_excluded_rules。0131 §2.4a）
+
+  # GPU の Fan の制御方式が手動でない（＝サービスが握っていない）状態が続く。
+  # 30 s は再起動（RestartSec=2 と起動の待ち）を拾わず、600 W で 80 °C に届く約 80 s より短い
+  gpu_fan_not_manual:
+    enabled: true
+    severity: warning
+    metric: gpu.0.fan_policy
+    fire_after_s: 30.0
+    clear_s: 10.0 # 手動がこの秒数だけ続いたら解除する
+
+  # GPU コアが高いのに Fan が曲線より低い状態が続く（決定記録 0140。provisional）。
+  # 0130 の曲線は 80 °C で 75 %。600 W の定常（78〜79 °C・68〜72 %）は発火の温度に届かず、
+  # GPU 自身の既定の制御（80 °C で約 47 %）や手動の低い回転のまま残った状態を捉える
+  gpu_fan_below_curve:
+    enabled: true
+    severity: warning
+    core_metric: gpu.0.core
+    fan_metric: gpu.0.fan_speed
+    core_threshold: 80.0
+    fan_below: 70.0
+    core_clear: 77.0 # core がこれ未満になったら解除する
+    fan_clear: 73.0 # fan がこれ以上になったら解除する
+    fire_after_s: 30.0
