@@ -78,7 +78,11 @@ class HintStateWriteError(HintStateError):
 
 @dataclass(frozen=True)
 class BootStamp:
-    """書いた時点の boot id と `CLOCK_BOOTTIME`（ナノ秒）。"""
+    """書いた時点の boot id と `CLOCK_BOOTTIME`（ナノ秒）。
+
+    run の記録・終端状態の boot と時刻は**記録のためだけ**に持ち、経過や期限の計算には使わない
+    （順序は `run_seq`、終端の判定は `event_id` で決める）。そのため壁時計との採取の順序に依らない。
+    """
 
     boot_id: str
     boottime_ns: int

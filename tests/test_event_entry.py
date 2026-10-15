@@ -95,7 +95,12 @@ class RunningServer:
     """別スレッドで入口を動かす。SQLite の接続はそのスレッドで開く（0004 §2.8）。"""
 
     def __init__(
-        self, settings: EventEntrySettings, db: Path, rules: QualityRules, **kwargs: int
+        self,
+        settings: EventEntrySettings,
+        db: Path,
+        rules: QualityRules,
+        clock: SimulatedClock | None = None,
+        **kwargs: int,
     ) -> None:
         self.settings = settings
         self._ready = threading.Event()
@@ -104,10 +109,14 @@ class RunningServer:
 
         def run() -> None:
             try:
-                clock = SimulatedClock(TEST_EPOCH_MS)
-                with SqliteStore(db, rules=rules, clock=clock) as store:
+                server_clock = SimulatedClock(TEST_EPOCH_MS) if clock is None else clock
+                with SqliteStore(db, rules=rules, clock=server_clock) as store:
                     self.server = EventEntryServer(
-                        settings=settings, store=store, clock=clock, boot_clock=clock, **kwargs
+                        settings=settings,
+                        store=store,
+                        clock=server_clock,
+                        boot_clock=server_clock,
+                        **kwargs,
                     )
                     self.server.bind()
                     self._ready.set()
@@ -1514,3 +1523,50 @@ def test_eventd_refuses_to_start_without_a_boot_clock(db, rules):
             clock=clock,
             boot_clock=_UnavailableBootClock(),
         )
+
+
+class _AdvancingClock(SimulatedClock):
+    """読むたびにシナリオ時間を進める時計。2つの採取の間に suspend をはさんだ状況を作る。"""
+
+    STEP_MS = 1_000
+
+    def __init__(self, start_ms: int) -> None:
+        super().__init__(start_ms)
+        self.armed = False
+
+    def _step(self) -> None:
+        if self.armed:
+            self.advance_to_ms(SimulatedClock.now_ms(self) + self.STEP_MS)
+
+    def now_ms(self) -> int:
+        value = super().now_ms()
+        self._step()
+        return value
+
+    def boottime_ns(self) -> int:
+        value = super().boottime_ns()
+        self._step()
+        return value
+
+
+@needs_peercred
+def test_the_row_boottime_is_taken_before_the_wall_clock(short_dir, db, rules):
+    """行の CLOCK_BOOTTIME は壁時計より先に採る（suspend が経過から落ちない側。0066 §2.2）。
+
+    採取のたびに時計を進めると、先に採った値のほうが古い。行の boottime（開始からの経過）が
+    壁時計の経過より大きければ、壁時計を先に採っている（suspend の時間を経過から落とす順）。
+    """
+    clock = _AdvancingClock(TEST_EPOCH_MS)
+    entry = RunningServer(settings_for(short_dir / "run" / "events.sock"), db, rules, clock=clock)
+    try:
+        clock.armed = True
+        assert entry.send(encode_workload_hint("start", workload="training"))["ok"] is True
+    finally:
+        clock.armed = False
+        entry.stop()
+    with SqliteStore(db, rules=rules, clock=SimulatedClock(TEST_EPOCH_MS)) as store:
+        (event,) = store.events_after_id(0)
+    assert event.boottime_ns is not None
+    row_boottime_ms = event.boottime_ns // 1_000_000
+    row_wall_elapsed_ms = event.ts_ms - TEST_EPOCH_MS
+    assert row_boottime_ms < row_wall_elapsed_ms, "CLOCK_BOOTTIME を壁時計より先に採る"

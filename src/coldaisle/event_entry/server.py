@@ -234,11 +234,14 @@ class EventEntryServer:
             self.rejected += 1
             return
 
-        now_ms = self._clock.now_ms()
         try:
-            # 受理した時点の boot と経過を、壁時計と同じ瞬間に採る（0066 §2.2）
+            # 行の CLOCK_BOOTTIME は壁時計より**先に**採る（0066 §2.2）。2つの採取の間に
+            # suspend をはさむと、行の boottime が古い側に寄り、読み手から見た経過は
+            # 多めになる（期限は短くなる側）。逆の順では suspend の時間が経過から落ち、
+            # 失効したヒントを有効のまま扱いうる
             boot_id = self._boot_clock.boot_id()
             boottime_ns = self._boot_clock.boottime_ns()
+            now_ms = self._clock.now_ms()
             stored = self._store.record_event(
                 EventRecord(
                     ts_ms=now_ms,

@@ -34,7 +34,13 @@ class BackfillRejection(StrEnum):
 
 @dataclass(frozen=True)
 class BootReading:
-    """いまの boot id と `CLOCK_BOOTTIME`（ナノ秒）。"""
+    """いまの boot id と `CLOCK_BOOTTIME`（ナノ秒）。
+
+    **採る順序を固定する。** 行（`events`）の側は `CLOCK_BOOTTIME` を壁時計より先に採る
+    （`coldaisle-eventd`）。読み手の「いま」の側はその逆で、壁時計（``startup_wall_ms``）を
+    先に、`CLOCK_BOOTTIME` を**後に**採る。どちらも2つの採取の間に suspend をはさんだとき、
+    `CLOCK_BOOTTIME` の差（経過）が多めになる側（期限が短くなる側）に倒すため。
+    """
 
     boot_id: str
     boottime_ns: int
