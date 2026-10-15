@@ -34,8 +34,12 @@ summarise: true
 #
 # メトリクスは名前のパターン（`*` は何にでも一致）、ルールは rule_id で書きます。
 # **どちらのキーも省略できません。** 形が不正なら、LLM へ渡す経路を開きません（安全側）。
+#
+# GPU の Fan のメトリクス（`gpu.<index>.fan…`）は、すべてここに名前を1つずつ書きます
+# （決定記録 0128 §2.1・0138）。書き忘れは tests/test_llm_exclusions.py が CI で止めます。
 llm_excluded_metrics:
   - "gpu.*.fan_policy"
+  - "gpu.*.fan_speed"  # 0043 の NVML の目標値。決定記録 0138
 llm_excluded_rules:
   - GPU_FAN_NOT_MANUAL
   - GPU_FAN_BELOW_CURVE
