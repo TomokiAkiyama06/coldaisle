@@ -131,3 +131,30 @@ rules:
     core_clear: 77.0 # core がこれ未満になったら解除する
     fan_clear: 73.0 # fan がこれ以上になったら解除する
     fire_after_s: 30.0
+
+  # 決定記録 0145: 12V-2x6 コネクタの外装温度（T_SENSOR。0110）を 2 段で知らせる（値は provisional）。
+  # 0110 の Critical Safety（80 °C で EMERGENCY・全 zone Max）より前に、人が負荷を止められるように。
+  # 値は coldaisle-telemetry が DB へ書いた hwmon の最新値を、評価のたびに読む（基板のサンプルに含まれない）。
+  # 比較は「以上」（成立は値 >= threshold、解除は値 < clear）。最新値が無い・ok でない
+  # （stale は config/quality.yaml の stale_after_ms・0 °C 未満の断線は suspect）周期は評価しない
+  # （発火待ちは取り消し、発火中は保つ。0131 §2.3 と同じ。0139 は当てない）。
+  # 実測は GPU 600 W の定常で 48〜51 °C（docs/fan-header-mapping.md の T5・T7）
+
+  # 警告。夜間は届かない（config/notify.yaml の night.warning_enabled。0135 §2.3）
+  connector_temp_high:
+    enabled: true
+    severity: warning
+    metric: board.connector_12v2x6
+    threshold: 65.0
+    clear: 62.0
+    fire_after_s: 60.0
+
+  # 重大。80 °C（safety.yaml の telemetry.t_sensor.absolute_ceiling_c）の手前。
+  # 10 s は 2.5 s 周期の 4〜5 回の読み値（1 回の読み違いで鳴らさない。0145 §2.2）
+  connector_temp_critical:
+    enabled: true
+    severity: critical
+    metric: board.connector_12v2x6
+    threshold: 75.0
+    clear: 72.0
+    fire_after_s: 10.0
