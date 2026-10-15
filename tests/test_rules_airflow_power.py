@@ -192,6 +192,30 @@ def test_hysteresis_between_clear_and_threshold(engine, store):
     assert alert.state == "firing"
 
 
+def test_excess_exactly_at_threshold_does_not_start(engine, store):
+    """成立は「超過 > threshold」（0144 §2.1）。差 40.0（超過ちょうど 6.0）で待たない。"""
+    run(engine, store, 0, 600, power=600.0, delta=40.0)
+    assert rows(store) == []
+
+
+def test_excess_exactly_at_clear_keeps_firing(engine, store):
+    """解除は「超過 < clear」（0144 §2.1）。差 38.0（超過ちょうど 4.0）では発火を保つ。"""
+    run(engine, store, 0, 400, power=600.0, delta=47.0)
+    run(engine, store, 400, 600, power=600.0, delta=38.0)
+    assert rows(store)[0].state == "firing"
+    run(engine, store, 600, 610, power=600.0, delta=37.9)
+    assert rows(store)[0].state == "resolved"
+
+
+def test_excess_exactly_at_clear_keeps_pending(engine, store):
+    """発火待ちの間も、超過ちょうど clear では取り消さず、継続時間で発火する。"""
+    run(engine, store, 0, 100, power=600.0, delta=47.0)
+    run(engine, store, 100, 400, power=600.0, delta=38.0)
+    [alert] = rows(store)
+    assert alert.state == "firing"
+    assert alert.started_ms == at(0)
+
+
 def test_threshold_follows_power(engine, store):
     """300 W では 32.5 °C 超で鳴る（450 W・600 W なら正常の 33 °C でも）。"""
     run(engine, store, 0, 400, power=300.0, delta=33.0)

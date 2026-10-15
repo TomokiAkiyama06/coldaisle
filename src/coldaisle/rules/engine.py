@@ -459,9 +459,13 @@ class Engine:
         expected = rule.expected_at(power)
         excess = value - expected
         state = self._state(rule_id, rule.metric)
-        limit = rule.clear if state.since_ms is not None else rule.threshold
-        if excess <= limit:
-            return self._end(rule_id, rule.metric) if state.since_ms is not None else []
+        # 0144 §2.1: 成立は「超過 > threshold」、成立中の解除は「超過 < clear」。
+        # 等しいときは成立を保つ
+        if state.since_ms is None:
+            if excess <= rule.threshold:
+                return []
+        elif excess < rule.clear:
+            return self._end(rule_id, rule.metric)
         if power is None:
             basis = f"{rule.power_metric} が無い・stale のため表の最大の期待値 {expected:.1f}"
         else:
