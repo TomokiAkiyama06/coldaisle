@@ -209,7 +209,7 @@ process が強制終了したとき（`SIGKILL`・電源断）は片づけられ
 | 登録の後・`load_version` と L1〜L12 の検査の失敗 | 1 | `--out` と、Registry の **candidate**（production は動かない） | ログに artifact の key と `--out` の path を出す。人が原因を確かめ、`coldaisle-registry retire` で candidate を退ける。CLI は `retire` しない |
 
 構造化ログには失敗した段（`before_publish` / `cleanup_failed` / `out_replaced` / `publish_durability` / `register` / `register_durability` /
-`out_replaced_after_register` / `untrusted_path` / `out_modified` / `out_modified_after_register` / `post_register_check`）を必ず出し、どの行に当たるかを人が取り違えないようにする。
+`out_replaced_after_register` / `untrusted_path` / `out_modified` / `out_modified_after_register` / `post_register_check`）を必ず出し、どの行に当たるかを人が取り違えないようにする。登録の後は1回の実行で複数の段に当たりうる（例: `register_durability` と `out_modified_after_register`）ので、当たった段をすべて出す。
 
 ### 2.5 出力と、既定では Registry を書かないこと
 
@@ -375,7 +375,9 @@ JSON として読めて、書かれた3つのファイルの大きさと SHA-256
     見えているのに通常の失敗と報告し、再実行は「既にある」で拒まれる。そこでこの subcommand は `RegistryDurabilityError` を
     自分で受け、下の「`--apply` の Registry 側の書き込み」の例外の型（`RegistryCommitNotDurableError`）で分ける。確定していれば
     段 `register_durability`・終了コード 1 で ref を出し、「登録は見えている・再登録しない・`coldaisle-registry status` で確かめる」と
-    ログに書く。読み直した snapshot から確定を推し量らない（下記）
+    ログに書く。読み直した snapshot から確定を推し量らない（下記）。**この分岐でも、成功のときと同じ登録の後の2つの検査
+    （path の照合と中身の再検証）を必ず行う**。登録は確定しているので、その間の名前の付け替えや書き換えは `out_replaced_after_register` /
+    `out_modified_after_register` として出す。複数に当たれば、当たった段をすべてログに出す（`register_durability` だけで終えない）
     確定していなければ段 `register` の失敗として今の報告のとおり
   - 判定は `register_candidate` が投げる例外の型そのもので、`train.py` と `registry.py` の両方が同じ型で受ける（両方が既に
     `control/model_registry.py` を import する。§2.1）。読み取りの method は足さない
@@ -458,7 +460,9 @@ process が強制終了したときに残るのは、印の無い（または無
 でだけ、`RegistryDurabilityError` の派生 `RegistryCommitNotDurableError`（仮の名前。登録した `ArtifactRef` を持つ）を `raise ... from exc`
 で投げる。artifact ファイルの段の `RegistryDurabilityError` は今の型のまま。派生なので、`RegistryDurabilityError` や
 `ModelRegistryError` で受けている既存の呼び出しは変わらない。CLI は `RegistryCommitNotDurableError` なら「確定したが永続が
-確かでない」として登録の後の検査（`load_version` は lifecycle の状態に依らず読める）へ進み、それ以外の `RegistryDurabilityError` は
+確かでない」として、成功のときと同じ登録の後の検査（path の照合・中身の再検証・`load_version` と L1〜L12。`load_version` は
+lifecycle の状態に依らず読める）をすべて行ってから、当たった段（`register_durability` と、あれば `out_replaced_after_register` /
+`out_modified_after_register` / `post_register_check`）をすべてログに出して終了コード 1 にし、それ以外の `RegistryDurabilityError` は
 登録の失敗として扱う（§2.4 の表）。
 - **読み直した snapshot から確定を推し量らない理由。** 例外の時点で Registry の lock は放されているので、読み直す前に他の権限の
   ある CLI が状態を進めたり（`validate` / `retire`）、確定の前に失敗したこの呼び出しの後で、別の呼び出しが同じ ref・同じ
@@ -646,7 +650,9 @@ best-effort で `OSError` / `UnsafeRegistryPathError` を握る（`src/coldaisle
 - 確定の後の `RegistryDurabilityError`（`coldaisle-train --apply` と `coldaisle-registry register --training-output` の両方）:
   `registry.json` の置き換えの後に例外を起こし、CLI が受ける前に同じ ref を `retire`（と `validate`）で進めた場合でも、段
   `register_durability`・終了コード 1 に分類され（`coldaisle-train` は登録の後の L1〜L12 の検査も行う）、再登録を促さないこと。
-  `coldaisle-registry register --training-output` が通常の「操作は行われなかった」と報告しないこと
+  `coldaisle-registry register --training-output` が通常の「操作は行われなかった」と報告しないこと。`RegistryCommitNotDurableError` に
+  加えて登録の途中で `--out` の名前を付け替える・ファイルをその場で書き換えると、どちらの CLI も `register_durability` と
+  `out_replaced_after_register` / `out_modified_after_register` を両方ログに出すこと
 - 公開の後の失敗: 登録の失敗では終了コード 1・段 `register`・`--out` が残り、登録が確定しないこと。登録の後の検査の失敗では
   終了コード 1・段 `post_register_check`・`--out` が残り、candidate が1つ足されたまま（上の (1)〜(4)）で、CLI が `retire` しない
   （`RETIRED` の event が足されない）こと
