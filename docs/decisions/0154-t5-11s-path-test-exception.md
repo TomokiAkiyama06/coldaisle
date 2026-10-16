@@ -120,8 +120,13 @@ SIGABRT で終わらないが SIGKILL では終わる hang（**kill できる ha
    - `systemctl show -p WatchdogUSec --value coldaisle-fand` が `11s`
    - `systemctl show -p ExecStart --value coldaisle-fand` の `argv[]` がちょうど1つで、`--config-dir /etc/coldaisle/control-config-test-t5-11s` を含む
    - `systemctl show -p DropInPaths --value coldaisle-fand` が `t5-11s.conf` だけ
-   - `TimeoutAbortSec`・`TimeoutStopSec`・`RestartSec`・`WatchdogSignal`・`ExecStopPost` の `systemctl show` の値が、置く前に
-     控えた値と同じ
+   - `systemctl show` の `TimeoutAbortUSec`・`TimeoutStopUSec`・`TimeoutStartUSec`・`RestartUSec`・`WatchdogSignal`・`ExecStopPost` の
+     値が、置く前に控えた値と同じ（`systemctl show` の名前は D-Bus の property の名前で、時間は `…USec` で終わる。unit の
+     `TimeoutAbortSec=` などの名前で問い合わせない）
+   - **`TimeoutAbortUSec` が 5 s 以下**（置く前と後の両方で確かめる）。この試験は SIGABRT で終わる経路を通り、`TimeoutAbortSec` の
+     待ちそのものは通らない。本番の最悪（§1.1 の 5000 + 5000 + 約 50 ms）と §2.2 の時間の下限 10100 ms は `TimeoutAbortSec` 5 s を
+     前提にしているので、導入先の unit が 5 s より長ければ、試験の固まる時間が本番の最悪より短くなり、§2.8 の確定に使えない。
+     5 s を超えていたら試験を始めず、所有者が扱いを決める（§2.8 の前提の「`TimeoutAbortSec` が 5 s 以下」）
 
    もし効かないまま fand を起動しても、`WatchdogSec` 5 s と `watchdog_timeout_ms` 11000 の食い違いは「短い向き」なので
    起動はする（0080 §2.3 の warning）が、固まる時間が約 5 s になり §2.2 の時間の下限で無効になる。上の確認はこれを試験の前に防ぐ
@@ -365,7 +370,7 @@ sudo bash <作業用のディレクトリ>/deploy/t5-11s.sh ii-idle i-cpu iii-cp
 スクリプトの中身はリポジトリに置かない（実機の識別子を含むため。AGENTS.md ルール 10）。
 
 0. **最初に**、終了時の後片付け（§2.3 の 3・4）を `trap` で登録する（§2.3 の 3。1 の負荷・2 の設定と drop-in と fand の起動より前）
-1. 前提の確認: fand が止まっていて `disabled`、本番の unit に drop-in が無い、`coldaisle-gpu-fan` が 0130 の曲線で
+1. 前提の確認: fand が止まっていて `disabled`、本番の unit に drop-in が無い、`systemctl show -p TimeoutAbortUSec --value coldaisle-fand` が 5 s 以下（§2.3 の 2）、`coldaisle-gpu-fan` が 0130 の曲線で
    動いている、ほかの CPU 負荷（Docker のコンテナなど）が無い、CPU 電力が 40 W 未満。あわせて、§2.5a の各センサーを
    50 ms ごとに 60 s 読み（アイドルで 30 s、CPU 全スレッドで 30 s。fand は BIOS のまま）、§2.5a の求め方で、文書の上限から
    置いた `U` が上がっている区間の変化の間隔と矛盾しないことを確かめ（アイドルの区間の値が変わらないことは使わない。文書の版と
