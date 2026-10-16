@@ -70,8 +70,14 @@ fand が hang したときに Max になるまでの順序は、0080 §2.5 の�
 | P5 | **引き継ぎの Max**（3 zone の `pwmN_enable` を全速に、manual なら `pwmN` を最大に。読み戻しで確かめる） | T5 は 3 zone の `pwmN_enable=0` を 20 ms ごとに読んで Max を確かめた（この driver は manual の 255 を `0` と読み返す。0118 §2.6）。Top の確認で `pwm2=89` から全速。T2 で3 zone `applied` | `tests/test_safety_handoff.py` の `test_handoff_writes_only_full_speed_enable_and_max_pwm`・`test_manual_readback_must_show_max_pwm` ほか | なし |
 | P6 | **Max になるまでの時間** | 約 5 s の経路: 5143〜5324 ms（T5、実測）。約 11 s の経路: P1 の 5 s + P3 の 5 s + P4・P5 の 44〜51 ms ≒ 約 10.05 s（**計算。実測ではなく、上限でもない**。systemd の処理の遅れと、負荷の下の SIGKILL から回収・`ExecStopPost` の完了までの時間を含まない。§2.4 の X5）。D 状態: 上限なし | — | 合計の時間の実測 |
 
-部品ごとに見ると、約 11 s の経路で実機で通っていないのは **P3 の 5 s の待ちと、その間（低い Demand のまま）の温度**だけである。
-P3 の後の SIGKILL から Max までは P4・P5 と同じ部品で、`kill -KILL` で実測してある。
+部品ごとに見ると、約 11 s の経路で実機で通っていないのは次の 2 つである:
+
+- **P3 の 5 s の待ちと、その間（低い Demand のまま）の温度**
+- **SIGKILL の後に、プロセスが回収され cgroup が止まり `ExecStopPost` が Max を書き終えるまでの時間**（P4・P5 の時間）。部品そのもの
+  （回収・停止・実行部・Max の書き込み）は `kill -KILL`・SIGABRT・T2 の経路で通っているが、その時間はアイドルの `kill -KILL` の 2 回
+  （44・51 ms）しか測っておらず、負荷の下の値も上限も無い（§2.4 の X5）
+
+P4・P5 は「部品が動くこと」は実測とテストで担保しているが、「時間の上限」は担保していない。
 
 ### 2.3 約 11 s の経路が起こる条件（解析）
 
