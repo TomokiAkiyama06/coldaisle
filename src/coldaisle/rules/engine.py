@@ -775,7 +775,11 @@ class Engine:
                 return []
             return self._fire(rule_id, None, None, detail)
         if status.safety_state in worse:
+            # 発火中は保つ（悪化で「解けました」を出さない）。発火待ちは取り消し、悪い側の状態が
+            # 終わってから数え直す（0148 §2.2）。残すと、その間の時間まで数えて戻った直後に発火する
             state.resumed_ms = None
+            if not state.firing:
+                self._cancel_pending(rule_id, None)
             return []
         if state.since_ms is None:
             return []

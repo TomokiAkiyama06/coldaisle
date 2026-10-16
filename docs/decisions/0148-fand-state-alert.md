@@ -61,7 +61,7 @@ fand は tick ごとに `control_traces` へ 1 行を書く（0071）。`SqliteS
 - **DEGRADED は 120 s 続いたら**: 1 tick だけの fault でも `fault_clear_hold_ms` の 30 s は `DEGRADED` が残る
   （T2 の「一時的」の試験で確認）。それを拾わず、Telemetry の収集の再起動（数秒 + 30 s）も拾わない長さ
 - **DEGRADED の判定は EMERGENCY の間は止める**: `emergency` の trace の間、`fand_degraded` は始めも発火も解除もしない
-  （発火中なら保ち、解除の待ちを数え直す）。悪化（DEGRADED → EMERGENCY）で「DEGRADED が解けました」を出さず、
+  （発火中なら保ち、解除の待ちを数え直す。発火待ちは取り消す）。悪化（DEGRADED → EMERGENCY）で「DEGRADED が解けました」を出さず、
   EMERGENCY と DEGRADED の 2 通を同時に出さないため。EMERGENCY が解けて DEGRADED が残れば、そこから数え始める
 - `startup` は通知しない（起動の takeover で全 Max の正常な段階）。`normal` と同じく「異常でない」として扱う
 - **trace の新しさ**: 最新の trace の `ts_ms` が評価時刻より `fand_trace_silent.silence_s`（60 s）以上前なら、

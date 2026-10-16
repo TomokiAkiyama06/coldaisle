@@ -293,6 +293,22 @@ def test_degraded_worsening_to_emergency_is_not_resolved(engine, store):
     assert states(transitions, EMERGENCY) == ["resolved"]
 
 
+def test_pending_degraded_restarts_after_emergency(engine, store):
+    """DEGRADED 100 s → EMERGENCY 30 s → DEGRADED。戻ってから 120 s で発火。"""
+    fand = Fand(store)
+    run(engine, fand, 0, 100, body("degraded", [GPU_STALE]))
+    transitions = run(engine, fand, 100, 130, body("emergency", [OVER_TEMP]))
+    assert states(transitions, DEGRADED) == []
+    assert [a for a in store.alerts(limit=10) if a.rule_id == DEGRADED] == []
+    transitions = run(engine, fand, 130, 249, body("degraded", [GPU_STALE]))
+    assert states(transitions, DEGRADED) == ["pending"]
+    transitions = run(engine, fand, 249, 252, body("degraded", [GPU_STALE]))
+    assert states(transitions, DEGRADED) == ["firing"]
+    [alert] = [a for a in store.alerts(limit=10) if a.rule_id == DEGRADED]
+    assert alert.started_ms == at(130)
+    assert alert.fired_ms == at(250)
+
+
 def test_startup_is_not_an_alert(engine, store):
     """起動の takeover（全 Max）は正常な段階（0148 §2.2）。"""
     fand = Fand(store)
