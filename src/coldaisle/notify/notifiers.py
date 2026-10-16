@@ -137,9 +137,18 @@ def from_env() -> dict[str, Notifier]:
     **設定されていない宛先は作らない。** 作って毎回失敗させると、
     ログが失敗で埋まって本物の障害が見えなくなる。
     足りないことは起動時に1度だけ警告する（`Router`）。
+
+    Slack は Bot トークンとチャンネル（`COLDAISLE_SLACK_BOT_TOKEN` / `COLDAISLE_SLACK_CHANNEL`）が
+    両方あれば Bot で送り、Webhook があればそれを Bot の失敗時の送り直しに使う
+    （決定記録 0147 §2.1）。
     """
+    # slack_bot はこのモジュールの DeliveryError を使うので、循環を避けて関数の中で読む
+    from coldaisle.notify.slack_bot import SlackBotNotifier
+
     available: dict[str, Notifier] = {"stdout": StdoutNotifier()}
-    slack = SlackNotifier.from_env()
+    webhook = SlackNotifier.from_env()
+    bot = SlackBotNotifier.from_env(fallback=webhook)
+    slack: Notifier | None = bot if bot is not None else webhook
     if slack is not None:
         available["slack"] = slack
     line = LineNotifier.from_env()

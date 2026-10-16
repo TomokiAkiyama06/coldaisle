@@ -403,7 +403,7 @@ CLI で書いた rollback も、動いている fand は次の tick で journal 
   （`authority_artifact_ceiling`。0089）・config の上限（`authority_config_binding_ceiling`。0090。
   `authority_config_ceiling` は `fan-policy.yaml` の上限で別物）。**model version も照らした artifact や
   設定の hash も含めない**
-- `ControlTick` v13 以降（いまは v15）の `authority`（`AuthorityRecord`）: その tick の Gate が stage を読んだ時点の
+- `ControlTick` v13 以降（いまは v16）の `authority`（`AuthorityRecord`）: その tick の Gate が stage を読んだ時点の
   journal の stage と revision・設定の上限・書き残せずに持っている上限・`journal_unreadable`・
   その tick の先頭で入れた管理ソケットの降格の `command_id`・直近の永続化の失敗。
   実効 stage（`state.authority_stage`）はこれらの最小を超えない（schema が拒む）。

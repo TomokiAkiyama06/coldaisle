@@ -69,6 +69,69 @@ COLDAISLE_DASHBOARD_URL=https://dashboard.example.invalid/
   知ることにしないため）。エラーの文に値そのものは入れません
 - 環境変数が無いときは `config/notify.yaml` の `dashboard_url` を同じ規則で検査します
 
+## 1a. 発火の通知にグラフを添える（Slack の Bot トークン）
+
+重大（critical）・警告（warning）の**発生**の通知に、対象の値と関係する値（派生値ならその材料・室温）の
+**直近 60 分のグラフ**を、同じ投稿のスレッドへ添えます（決定記録 [0147](decisions/0147-slack-alert-graph.md)）。
+Incoming Webhook ではファイルを添付できないため、Slack アプリの **Bot トークン**が要ります。
+
+| 環境変数 | 値 |
+|---|---|
+| `COLDAISLE_SLACK_BOT_TOKEN` | Bot User OAuth Token（`xoxb-` で始まる） |
+| `COLDAISLE_SLACK_CHANNEL` | 送り先のチャンネルの **ID**（`C` で始まる。`#名前` ではない） |
+
+- **両方**あると、本文も Bot（`chat.postMessage`）で送り、その投稿のスレッドへグラフを上げます。
+  片方だけなら Bot を使わず、起動時に `Slack の Bot は トークンとチャンネルの両方が要る…` の警告が出ます
+- 無ければ今までどおり Webhook で本文だけを送ります
+- `COLDAISLE_SLACK_WEBHOOK` も残しておくと、Bot の送信が失敗したとき（トークンの失効・Bot がチャンネルから
+  外れたなど）にその通知を Webhook で送り直します（グラフは付きません）
+- 解除・発火の説明・日次レポートにはグラフを添えません。同じアラートのグラフは `repeat_after_s`（30 分）に 1 回まで
+- グラフの設定は `config/notify-graph.yaml`。壊れていても文章の通知は止まらず、グラフだけが付かなくなります
+  （起動時に `グラフの設定が読めないので…` の error が出ます）
+
+### Bot トークンの作り方（所有者が行う）
+
+1. ブラウザで <https://api.slack.com/apps> を開き、**Create New App** → **From scratch**。
+   App Name（例 `coldaisle`）と、通知を受けるワークスペースを選んで **Create App**
+   （既に Incoming Webhook 用のアプリがあれば、それを開いて 2. から進めてもかまいません）
+2. 左の **OAuth & Permissions** を開き、**Scopes** の **Bot Token Scopes** で **Add an OAuth Scope** から
+   次の 2 つだけを足す（**ほかの scope は足さない**）
+   - `chat:write`（本文を投稿する）
+   - `files:write`（グラフをスレッドへ上げる）
+3. 同じ画面の上の **Install to Workspace**（既に入っていれば **Reinstall to Workspace**）→ **許可する**
+4. 表示された **Bot User OAuth Token**（`xoxb-…`）を控える。**チャットや Issue に貼らない**
+5. Slack で通知のチャンネルを開き、メッセージ欄で `/invite @coldaisle`（1. の App Name）を送って Bot を招く。
+   招かないと `not_in_channel` で失敗します
+6. チャンネル名をクリック → 詳細の一番下にある **チャンネル ID**（`C` で始まる）を控える
+
+### 導入先へ置く
+
+値はリポジトリにも、コマンドの引数（シェルの履歴・`ps` に残る）にも書きません。
+**別のターミナル**で次を実行し、聞かれたら貼り付けて Enter を押します（画面に表示されません）。
+
+```bash
+sudo bash -c 'read -rsp "Bot User OAuth Token: " t; echo; printf "COLDAISLE_SLACK_BOT_TOKEN=%s\n" "$t" >> /etc/coldaisle/coldaisle.env'
+sudo bash -c 'read -rp "チャンネル ID (C...): " c; printf "COLDAISLE_SLACK_CHANNEL=%s\n" "$c" >> /etc/coldaisle/coldaisle.env'
+```
+
+- 既に同じ名前の行（`.env.example` から写した空の `COLDAISLE_SLACK_BOT_TOKEN=` など）があれば、
+  `sudoedit /etc/coldaisle/coldaisle.env` で**空の行を消して**から追記します（同じ名前が 2 行あると後の行が効きます）
+- 権限は変わりません（`0640`・`root:coldaisle`。[`ubuntu-deploy.md`](ubuntu-deploy.md) §2）。
+  `sudo stat -c '%a %U:%G' /etc/coldaisle/coldaisle.env` で確かめます
+- 反映には `coldaisle-daemon` の再起動が要ります（§4）。起動のログに Bot の警告が出ていないことを確かめます
+
+開発機で試すときは `.env`（git 管理外）に同じ 2 行を書き、§2 の `notify_check` を流します。
+`RAPID_RISE` と `INTAKE_HIGH` の発火の投稿のスレッドに、グラフが 1 枚ずつ付けば届いています
+（mock の DB には直近の値しか無いので、グラフは短い線になります）。
+
+| ログ | 意味 |
+|---|---|
+| `グラフを添えられなかった` の `slack: files.completeUploadExternal: not_in_channel` | Bot をチャンネルに招いていない（5.） |
+| `… missing_scope` | `files:write` / `chat:write` が足りない（2.）。足したら **Reinstall** が要る |
+| `… invalid_auth` / `not_authed` | トークンの写し間違い・失効 |
+| `Slack の Bot で送れなかったので Webhook で送り直す` | Bot の本文の送信が失敗し、Webhook で届けた（理由は `reason`） |
+| `描く値が無いのでグラフを添えない` | 直近 60 分に値が無い（センサーの欠けなど）。本文は届いている |
+
 ## 2. 試しに鳴らす（MockSource）
 
 `notify_check` シナリオは、critical（`RAPID_RISE`）と warning（`INTAKE_HIGH`）を

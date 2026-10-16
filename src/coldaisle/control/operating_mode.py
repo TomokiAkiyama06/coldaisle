@@ -258,6 +258,11 @@ class AdminModeTracker:
         self._death_drain_failures = 0
 
     @property
+    def run_id(self) -> str:
+        """この受け渡し口が監査の記録に載せる起動ごとの識別子（決定記録 0072 §2.7）。"""
+        return self._run_id
+
+    @property
     def receiver_dead(self) -> bool:
         """受付スレッドの死を見て `MAX` に固定したか（再起動まで戻らない）。"""
         return self._dead

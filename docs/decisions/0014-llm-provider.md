@@ -3,6 +3,7 @@
 - **種別**: Decision Record
 - **Status**: FINAL（2026-08-25、PR #20 のマージ）
 - **Date**: 2026-08-25
+- **Superseded by**: [`0143`](0143-claude-api-interim-provider.md)（§2.1 の Provider の選び方に限る。`COLDAISLE_LLM_PROVIDER` を足す。他の規約は変わらない。0143 は Proposed）
 - **Supersedes**: なし
 - **関連**: [`0005-model-selection.md`](0005-model-selection.md) /
   [`0013-notifications.md`](0013-notifications.md) §2.1 /

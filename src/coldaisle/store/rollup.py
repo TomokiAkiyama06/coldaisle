@@ -19,11 +19,11 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
-from typing import Any
+from typing import Any, Self
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from coldaisle import logs
 from coldaisle.channels import METRIC_TO_CHANNEL
@@ -48,6 +48,14 @@ class RetentionRules(BaseModel):
     control_trace_days: int = Field(gt=0)
     """Control decision trace の保持日数。保存容量を無制限に増やさない。"""
 
+    hint_shadow_days: int = Field(gt=0)
+    """ヒント有りの solve の記録（``hint_shadow_records``）の保持日数（決定記録 0133 §2.5a）。
+
+    突き合わせる相手の trace より長く残しても join できないので、設定の値は
+    ``control_trace_days`` と同じにする（違えば読み込みで拒否する。既定値はコードに置かない。
+    ルール 9）。
+    """
+
     csv_dir: str
     """日次CSV（FR-205）の出力先。`~` を含んでよい。"""
 
@@ -65,6 +73,19 @@ class RetentionRules(BaseModel):
     無ければ ``--export-day`` を拒否する（``csv_timezone`` と同じ扱い）。
     """
 
+    @model_validator(mode="after")
+    def _hint_shadow_lives_as_long_as_the_trace(self) -> Self:
+        # 別々に消すと、片方だけ変えた設定で B1 の証拠が trace より先に消える・trace が消えた後に
+        # 突き合わせられない記録が残る（0133 §2.5a の join の契約。PR #332 の Codex P2）。
+        # 起動時に分かる誤りにする
+        if self.hint_shadow_days != self.control_trace_days:
+            raise ValueError(
+                "hint_shadow_days は control_trace_days と同じ値にする（決定記録 0133 §2.5a）: "
+                f"hint_shadow_days={self.hint_shadow_days}; "
+                f"control_trace_days={self.control_trace_days}"
+            )
+        return self
+
     @classmethod
     def from_yaml(cls, path: Path) -> RetentionRules:
         loaded: Any = yaml.safe_load(path.read_text(encoding="utf-8"))
@@ -80,6 +101,10 @@ class RetentionRules(BaseModel):
     def control_trace_retention_ms(self) -> int:
         return self.control_trace_days * DAY_MS
 
+    @property
+    def hint_shadow_retention_ms(self) -> int:
+        return self.hint_shadow_days * DAY_MS
+
 
 @dataclass(frozen=True)
 class Result:
@@ -94,6 +119,8 @@ class Result:
     control_trace_cutoff_ms: int | None = None
     future_control_traces: int = 0
     """実行時刻より未来の ``ts_ms`` を持つ trace の件数。時計の異常の手がかり（0071 §2.2a）。"""
+    deleted_hint_shadow: int = 0
+    hint_shadow_cutoff_ms: int | None = None
 
 
 def rollup_minutes(
@@ -455,6 +482,10 @@ def run(
     # 同じトランザクションで進める（決定記録 0071 §2.2a）
     deleted_traces = store.delete_control_traces_before(trace_cutoff)
     future_traces = store.count_control_traces_after(now_ms)
+    # ヒント有りの記録は元の tick の時刻（`source_ts_ms`）で消す。突き合わせる trace と
+    # 同じ時刻で古くなる（決定記録 0133 §2.5a）
+    hint_shadow_cutoff = max(0, now_ms - rules.hint_shadow_retention_ms)
+    deleted_hint_shadow = store.delete_hint_shadow_before(hint_shadow_cutoff)
     return Result(
         minute_buckets=minutes,
         hour_buckets=hours,
@@ -463,6 +494,8 @@ def run(
         deleted_control_traces=deleted_traces,
         control_trace_cutoff_ms=trace_cutoff,
         future_control_traces=future_traces,
+        deleted_hint_shadow=deleted_hint_shadow,
+        hint_shadow_cutoff_ms=hint_shadow_cutoff,
     )
 
 
@@ -531,6 +564,9 @@ def main(
                     "control_trace_cutoff_ms": result.control_trace_cutoff_ms,
                     "control_trace_days": rules.control_trace_days,
                     "future_control_traces": result.future_control_traces,
+                    "deleted_hint_shadow": result.deleted_hint_shadow,
+                    "hint_shadow_cutoff_ms": result.hint_shadow_cutoff_ms,
+                    "hint_shadow_days": rules.hint_shadow_days,
                 }
             },
         )
