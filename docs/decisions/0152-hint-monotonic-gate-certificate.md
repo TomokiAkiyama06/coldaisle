@@ -11,6 +11,8 @@
   [0064](0064-workload-hint-entry-and-supervisor-prior.md) §2.2 / §2.10 /
   [0066](0066-workload-hint-stage-b-conditions.md) §2.1 (b)〜(d) /
   [0071](0071-control-trace-read-api.md) §2.5 /
+  [0079](0079-model-artifact-formats.md) §2.4（L9） / [0096](0096-calibration-binding-digest.md) /
+  [0101](0101-calibration-via-learned-frame.md) /
   [0077](0077-learned-proposal-handoff.md) §2.6 / [0090](0090-authority-bound-to-loaded-config.md) /
   [0098](0098-registry-binding-settled-points.md) §2.1 / §2.4 / §2.6 /
   [0104](0104-authority-raise-least-privilege.md) §2.1 / §2.3 / [0105](0105-registry-shared-root-settled-points.md) /
@@ -52,8 +54,19 @@ B0 は PR #332（#319）でマージ済みで、いまの実装は「照合す�
   それを呼ぶだけにする。入口は読み取り専用の CLI（仮の名前 `coldaisle-hint-certify`）とする
 - **入力**: Control Config の4ファイル（`--config-dir`）・`config/safety.yaml` の `workload_hint.max_eps` /
   `max_eps_c`・Model Registry（`--registry-root`。thermal_model ほか MPC が束縛する production を**読むだけ**）・
-  ロックファイル（§2.4）。Thermal Model artifact は Registry の production を使い、パスで別のファイルを渡す入口を作らない
-  （「Stage B で使う Thermal Model artifact」以外で証明書を作れないようにする）
+  ロックファイル（§2.4）・**実行時に効く較正**（下）。Thermal Model artifact は Registry の production を使い、パスで
+  別のファイルを渡す入口を作らない（「Stage B で使う Thermal Model artifact」以外で証明書を作れないようにする）
+- **較正も入力にする。** thermal_model の artifact の特徴量が較正に縛られている（`calibration_binding` を持つ。
+  0096）場合、実行時の読み込みは L9（0079 §2.4。較正の digest が runtime の較正と一致しなければ拒否）を行い、
+  worker はその較正を fand の frame から受け取る（0101）。ランナーには frame も fand の入力も届かないので、
+  そのままでは較正つきの artifact をすべて不合格にするか、L9 を迂回して実行時と別の経路を認証することになる。そこで:
+  - ランナーは、fand が起動時に読むのと**同じ較正ファイル**を `--calibration` で受け取り、fand と**同じ読み取りの関数**
+    （いまは `control_daemon.py` の `read_runtime_calibration`。実装で横断の場所へ移し、両方がそれを呼ぶ）で
+    `RuntimeCalibration`（`available` / `unavailable`）にする。既定の path を置かない（0101 §2.1 / 0096 §5 #8 と同じ）
+  - その `RuntimeCalibration` を、worker と同じ loader の L1〜L12（**L9 を含む**）に渡して束縛を作る。L9 を飛ばす・
+    較正を 0 で埋める・別の較正を当てる経路をランナーに作らない（0096 §2.6 / 0101 §2.3）。L9 に外れれば束縛を
+    作れないので不合格（証明書を出さない）
+  - 使った較正の digest を証明書の部品 `calibration`（§2.3）に入れ、fand・worker の照合の対象にする（§2.4 / §2.6）
 - **出力**: 合格したときだけ、証明書の JSON（§2.3）を `--out` のパスへ書く。不合格なら証明書を書かず、
   不合格の点の数と最初の点の軸（値は載せない）を構造化ログに出して終了コードを 0 以外にする。
   **Registry にも設定にも書かない**（`coldaisle-calibrate` の既定と同じく、書くのは人の次の操作）
@@ -117,6 +130,17 @@ B0 は PR #332（#319）でマージ済みで、いまの実装は「照合す�
 | `hint_gate` | 格子の定義・`eps` / `eps_c`、および `safety.yaml` の `max_eps` / `max_eps_c` | fand |
 | `optimizer` | Optimizer の設定（探索格子・`mpc.budget_ms`・`mpc.optimizer.max_evaluations` など `solve` の結果に効くもの）と目的関数の設定 | worker |
 | `conditions` | `LearnedMpcController.conditions()` の全体（列挙を別に持たない。0066 §2.1 (c)） | worker |
+| `calibration` | ランナーが使った `RuntimeCalibration` の digest。`available` なら較正を当てる全 metric の実効の offset（`calibration_offsets.effective_metric_offsets`）の `offsets_sha256`、`unavailable` ならその閉じた code（0101 §2.2 の2値）を区別できる形で符号化したものの SHA-256。2状態を同じ digest にしない（空の `offsets_c` の `available` と `unavailable` を混ぜない。0096 §2.6） | fand（起動時に読んだ較正）と worker（frame の `calibration`） |
+
+- `calibration` の部品は artifact の `metric_binding` に依らない**較正の全体**の digest とする。L9 の digest
+  （0096 §2.4。artifact が使う metric に関わる値だけ）は artifact を読まないと1つに決まらず、fand は artifact を
+  読まない（0077 §2.6 / 0101 §4）ため。全体で束ねるので、artifact が使わないチャネルの較正を変えても再認証が要る
+  （安全側。L9 より厳しい向きにしか働かない）。実効の offset の写像は `Normalizer` と L9 が共有する
+  `calibration_offsets.py` の関数をそのまま使い、規則を3か所目に書かない（0096 §5 #3）
+- **較正が変わったら証明書は合わなくなり、B0 に留まる。** 較正の変更は fand の再起動で効く（0101 §2.5 /
+  `docs/calibration.md` の再起動の順番）ので、再起動した fand の照合で `calibration_mismatch` になり、新しい較正で
+  ランナーを走らせて証明書を昇格し直すまで B0 のまま。`--calibration` を省いて起動した fand（`unavailable`。0101 §2.6 (b)）も、
+  `available` で作った証明書とは合わない
 
 - **部品の digest を作る関数は1つだけ**にし、ランナー・fand・worker が同じ関数を呼ぶ（置き場所は横断の module。
   `calibration_offsets.py` と同じ扱い）。`tests/` 側で digest を計算・上書きしない（0066 §2.1 (c)）
@@ -135,7 +159,8 @@ fand は起動時に1回だけ、tick を始める前に照合する（合成の
   3. 証明書の `schema_version` を知っている・`result` が `passed`・`grid_points > 0`（`certificate_invalid`）
   4. 証明書の `thermal_model` が、同じ snapshot の thermal_model の production と一致する（`thermal_model_mismatch`）
   5. `eps` / `eps_c` と `max_eps` / `max_eps_c` が 0066 §2.1 (b) の制約を満たす（`eps_bounds_invalid`）
-  6. fand 側の部品（`source_tree` / `lockfile` / `environment` / `hint_policy` / `hint_gate`）を自分で計算し、
+  6. fand 側の部品（`source_tree` / `lockfile` / `environment` / `hint_policy` / `hint_gate` / `calibration`。`calibration` は
+     起動時に `--calibration` から読んだ `RuntimeCalibration`、つまり frame で worker へ運ぶのと同じ値から計算する）を自分で計算し、
      それぞれ一致する（`<部品>_mismatch`）
   7. 証明書の `certificate_sha256` を、証明書の欄から計算し直して一致する（`certificate_hash_mismatch`）
 - ロックファイルは起動時の引数（仮の名前 `--hint-lockfile`。root の所有のパス）で渡す。渡されない・読めないときは
@@ -159,7 +184,9 @@ fand は起動時に1回だけ、tick を始める前に照合する（合成の
 
 - B1 の frame の版上げ（0133 §2.5 の `supervisor_hint` を足すもの）と**同じ版上げ**で、frame に欄
   `hint_certification` を足す: `certificate_sha256` と、worker 側の部品の期待値
-  （`source_tree` / `lockfile` / `environment` / `optimizer` / `conditions` の digest）。
+  （`source_tree` / `lockfile` / `environment` / `optimizer` / `conditions` / `calibration` の digest）。
+  worker の `calibration` は、束縛に使った frame の `calibration`（0101 §2.2。L9 に渡したのと同じ値）から同じ関数で
+  計算する。較正ファイルを読まない（0101 §2.1）
   `supervisor_hint` を入れる tick だけに入れ、それ以外は `None`（`supervisor_hint` と片方だけの frame は作らない）
 - **Shadow solver の子プロセス**は、artifact の digest の照合（0133 §2.5）に加えて、自分の部品を同じ関数で計算し、
   frame の期待値とすべて一致するときだけ解く。一致しなければ解かずに `skipped`・理由 `certification_mismatch` の
@@ -184,6 +211,11 @@ fand は起動時に1回だけ、tick を始める前に照合する（合成の
 
 ### 2.8 試験の方針（すべて実機不要。ルール 7）
 
+- **較正**: 較正つきの Mock の thermal artifact で、ランナーが `--calibration` の較正を L9 に通して合格する・
+  別の較正では L9 で束縛を作れず不合格・`--calibration` を省けば較正つきの artifact は不合格（較正の無い artifact は
+  通る）。証明書を作った後に較正の offset を1つ変えた fand が `calibration_mismatch` で B0・`unavailable` の fand が
+  `available` の証明書で B0・空の `offsets_c` の `available` と `unavailable` の digest が違う。worker が frame の
+  較正から計算した digest が fand のものと一致する（往復）
 - **digest の関数**: 同じ入力で同じ値・パスと内容の境界をずらした2つのツリーが違う値になる・
   `__pycache__` / `*.pyc` を含めない・部品ごとに1か所変えると、その部品とそれだけが変わる
 - **fand の照合**（`tmp_path` の Registry・Mock の artifact）: §2.4 の各理由ごとに1つずつ壊した入力で、
@@ -240,6 +272,8 @@ fand は起動時に1回だけ、tick を始める前に照合する（合成の
 | 証明書の照合を fand だけで行う | worker は自分の `--config-dir` を読むので、`conditions()`・Optimizer の設定が認証と違っても見逃す |
 | 証明書の照合を worker だけで行い、fand は worker の結果を信じる | 最終の判定を ML 側のプロセスに置かない（0133 §2.5）。fand が持つ部品は fand が自分で計算する |
 | 稼働中に新しい証明書が昇格したら再照合して B1 へ上げる | 稼働中に段階を上げる経路ができる。制御権に関わる段階は下げるだけにし、上げるのは再起動の時だけにする（0077 §2.6 の production の監視と同じ規律） |
+| ランナーが較正を 0 で埋める・L9 を飛ばして束縛を作る | 実行時（worker が frame の較正を L9 に通す。0101）と別の経路を認証することになる。較正つきの artifact では、認証した予測と実行時の予測が別物になりうる |
+| 証明書の `calibration` に L9 の digest（artifact の使う metric だけ）を入れる | fand は artifact を読まないので照合できない（0101 §4）。較正の全体で束ねる |
 | ハッシュ1つだけを持ち、部品ごとの digest を持たない | 合わないとき何を変えたのかが分からず、再認証の要否の判断を人が推測することになる |
 
 ---
