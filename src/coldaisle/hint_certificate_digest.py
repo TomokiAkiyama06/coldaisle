@@ -145,11 +145,19 @@ def lockfile_sha256(path: Path) -> str:
 
 @dataclass(frozen=True, slots=True)
 class InstalledDistribution:
-    """入った配布物の1件。``record`` は ``RECORD`` の bytes（無ければ ``None``）。"""
+    """入った配布物の1件。``record`` は ``RECORD`` の bytes（無ければ ``None``）。
+
+    ``precedence`` は**同じ名前の配布物の中での import の優先の順**（0 が最も先の ``sys.path``
+    の項目にあるもの）。同じ名前が2つ見えているとき、どちらが import されるかは ``sys.path`` の
+    順で決まるので、順を入れ替えると実行時のコードが変わる。並べ替えで順を捨てると、入れ替えても
+    同じ指紋になるため、順そのものを指紋に入れる。同じ ``sys.path`` の項目に同じ名前が2つあれば
+    同じ値になる（その間の順は ``sys.path`` で決まらない）。
+    """
 
     name: str
     version: str
     record: bytes | None
+    precedence: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -172,18 +180,28 @@ def current_environment() -> RuntimeEnvironment:
     """いま動いている処理系と、その ``sys.path`` から見える配布物を集める。"""
     version = sys.implementation.version
     distributions: list[InstalledDistribution] = []
-    for distribution in importlib.metadata.distributions():
-        name = distribution.metadata["Name"]
-        if not name:
-            raise ValueError("名前の無い配布物がある")
-        record = distribution.read_text("RECORD")
-        distributions.append(
-            InstalledDistribution(
-                name=str(name),
-                version=distribution.version,
-                record=None if record is None else record.encode("utf-8"),
+    # sys.path の項目を前から1つずつ見て、同じ名前が先に見えた項目の数を precedence にする。
+    # 項目の path そのものは入れない（同じホストでも起動の仕方で sys.path[0] が変わるため）。
+    seen_entries: dict[str, int] = {}
+    for entry in sys.path:
+        names_here: set[str] = set()
+        for distribution in importlib.metadata.distributions(path=[entry]):
+            name = distribution.metadata["Name"]
+            if not name:
+                raise ValueError("名前の無い配布物がある")
+            canonical = _canonical_distribution_name(str(name))
+            record = distribution.read_text("RECORD")
+            distributions.append(
+                InstalledDistribution(
+                    name=str(name),
+                    version=distribution.version,
+                    record=None if record is None else record.encode("utf-8"),
+                    precedence=seen_entries.get(canonical, 0),
+                )
             )
-        )
+            names_here.add(canonical)
+        for canonical in names_here:
+            seen_entries[canonical] = seen_entries.get(canonical, 0) + 1
     return RuntimeEnvironment(
         implementation=sys.implementation.name,
         implementation_version=(
@@ -195,13 +213,19 @@ def current_environment() -> RuntimeEnvironment:
     )
 
 
-def _distribution_parts(distribution: InstalledDistribution) -> tuple[bytes, bytes, bytes, bytes]:
+def _distribution_parts(
+    distribution: InstalledDistribution,
+) -> tuple[bytes, bytes, bytes, bytes, bytes]:
+    if distribution.precedence < 0:
+        raise ValueError("precedence は 0 以上")
     if distribution.record is None:
         record_tag, record_digest = _RECORD_ABSENT, b""
     else:
         record_tag, record_digest = _RECORD_PRESENT, _sha256_hex(distribution.record).encode()
     return (
         _canonical_distribution_name(distribution.name).encode("utf-8"),
+        # 10 進の固定幅にして、並べ替えの順を precedence の大小と一致させる。
+        f"{distribution.precedence:010d}".encode("ascii"),
         distribution.version.encode("utf-8"),
         record_tag,
         record_digest,
@@ -211,8 +235,9 @@ def _distribution_parts(distribution: InstalledDistribution) -> tuple[bytes, byt
 def environment_bytes(environment: RuntimeEnvironment) -> bytes:
     """``environment`` の digest の元になる列。配布物は列挙の順に依らず並べる。
 
-    各配布物は「正規化した名前・版・``RECORD`` の有無・``RECORD`` の SHA-256」。同じ名前が
-    2つ見えていれば2件とも入れる（どちらが import されるかを推測しない）。
+    各配布物は「正規化した名前・import の優先の順（``precedence``）・版・``RECORD`` の有無・
+    ``RECORD`` の SHA-256」。同じ名前が2つ見えていれば2件とも、優先の順と一緒に入れる。
+    名前の違う配布物どうしの列挙の順は指紋に効かない。
     """
     entries = sorted(_distribution_parts(item) for item in environment.distributions)
     parts: list[bytes] = [

@@ -243,6 +243,55 @@ def test_an_empty_record_is_not_a_missing_record() -> None:
     assert digest.environment_sha256(empty) != digest.environment_sha256(missing)
 
 
+def test_swapping_the_import_precedence_of_a_shadowed_distribution_changes_the_digest() -> None:
+    """同じ名前の2つの配布物の優先の順を入れ替えると、実行時のコードが変わりうる（#349 の P1）。"""
+    first = digest.InstalledDistribution(name="numpy", version="2.0.0", record=b"a", precedence=0)
+    second = digest.InstalledDistribution(name="numpy", version="1.26.0", record=b"b", precedence=1)
+    swapped = (
+        digest.InstalledDistribution(name="numpy", version="2.0.0", record=b"a", precedence=1),
+        digest.InstalledDistribution(name="numpy", version="1.26.0", record=b"b", precedence=0),
+    )
+    assert digest.environment_sha256(
+        environment(distributions=(first, second))
+    ) != digest.environment_sha256(environment(distributions=swapped))
+    # 列挙の順だけを変えても同じ。
+    assert digest.environment_sha256(
+        environment(distributions=(first, second))
+    ) == digest.environment_sha256(environment(distributions=(second, first)))
+
+
+def _fake_distribution(root: Path, name: str, version: str) -> None:
+    info = root / f"{name}-{version}.dist-info"
+    info.mkdir(parents=True)
+    (info / "METADATA").write_text(
+        f"Metadata-Version: 2.1\nName: {name}\nVersion: {version}\n", encoding="utf-8"
+    )
+    (info / "RECORD").write_text(f"{name}/__init__.py,,\n", encoding="utf-8")
+
+
+def test_the_current_environment_follows_the_sys_path_order(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    early = tmp_path / "early"
+    late = tmp_path / "late"
+    _fake_distribution(early, "shadowed-pkg", "2.0.0")
+    _fake_distribution(late, "shadowed-pkg", "1.0.0")
+
+    def precedences() -> dict[str, int]:
+        return {
+            item.version: item.precedence
+            for item in digest.current_environment().distributions
+            if item.name == "shadowed-pkg"
+        }
+
+    monkeypatch.setattr("sys.path", [str(early), str(late)])
+    forward = digest.environment_sha256()
+    assert precedences() == {"2.0.0": 0, "1.0.0": 1}
+    monkeypatch.setattr("sys.path", [str(late), str(early)])
+    assert precedences() == {"1.0.0": 0, "2.0.0": 1}
+    assert digest.environment_sha256() != forward
+
+
 def test_the_current_environment_is_fingerprinted() -> None:
     current = digest.current_environment()
     assert current.distributions
