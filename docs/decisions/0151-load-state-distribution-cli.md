@@ -78,6 +78,8 @@ Workload Regime（`control/supervisor/regime.py`）を主軸にしない理由�
   判定に使う trace と `fan.*`）は **`--start - lookback_ms` から読む**。`lookback_ms` は
   `settle_ms + power_window_ms + max(trace_max_age_ms, fan_max_age_ms)` で、設定から計算し別の値として持たない。
   さかのぼった区間の評価時刻は状態と落ち着きの計時を決めるためだけに使い、**分布にも件数にも入れない**
+- ただし §2.6a の `fand` の判定に使う「連続した trace の区間の不一致の割合」は、`lookback_ms` で切らず、
+  **区間の本当の始まりまでさかのぼって読む**（§2.6a）。`lookback_ms` はそれ以外の行にだけ当てる
 - さかのぼった区間に行が無い・欠けている（保持期間の外・取り込みが止まっていた）・`max_gap_ms` を超える間隔がある
   ときは、状態が始めから続いていたとは言えない。その場合は**区間の中の最初の評価可能な時刻から落ち着きの計時を
   始め**、そこから `settle_ms` は `transition` とする（保守的に、定常へ入れない側に倒す）。こうなったことは出力の
@@ -161,16 +163,49 @@ DB に残る記録で、これを直接に言える欄は無い（2026-10-16 の
 
 | 区分 | 条件（**すべて**を満たすときだけ） |
 |---|---|
-| `fand` | `[t - trace_max_age_ms, t]` に trace があり `operating_mode` が `auto`。3 つの zone すべてで、`[t - fan_max_age_ms, t]` に ok の `fan.<zone>.pwm` があり、trace の `pwm_raw / 255 × 100` との差が `pwm_match_tolerance_pct` 以内。さらに、その trace を含む**連続した trace の区間**（間隔が `trace_max_age_ms` を超えたら切る。`run_id` は v16 からなので使わない）全体で、突き合わせられた時刻のうち一致しなかった割合が `pwm_mismatch_max_ratio` 以下 |
+| `fand` | `[t - trace_max_age_ms, t]` に trace があり `operating_mode` が `auto`。3 つの zone すべてで、`[t - fan_max_age_ms, t]` に ok の `fan.<zone>.pwm` があり、trace の `pwm_raw / 255 × 100` との差が `pwm_match_tolerance_pct` 以内。さらに、その trace を含む**連続した trace の区間**（間隔が `trace_max_age_ms` を超えたら切る。`run_id` は v16 からなので使わない）の**始まりから終わりまで全体**（`--start` / `--end` の外も含む）で、突き合わせられた時刻のうち一致しなかった割合が `pwm_mismatch_max_ratio` 以下。区間の始まりを確かめられないとき（下の「区間の全体を読む」）は `undetermined` |
 | `fand_override` | `fand` の条件のうち `operating_mode` だけが `auto` でない（`manual` / `max` / `calibration`。試験の操作） |
-| `bios` | `[t - trace_max_age_ms, t]` に trace が無い。3 つの zone すべてで ok の `fan.<zone>.rpm` が `fan_max_age_ms` 以内にあり、**少なくとも 1 つの zone が `full_speed_rpm_min.<zone>` 未満**（引き継ぎの Max は全 zone が全速なので、どれかが全速でなければ引き継ぎではない） |
-| `undetermined` | 上のどれにも当たらない。例: trace はあるが物理の PWM と合わない（simulated の backend など）・`fan.*` が欠けている・trace が無く全 zone が全速（引き継ぎの Max か、BIOS が高負荷で全速かを区別できない） |
+| `bios` | `[t - trace_max_age_ms, t]` に trace が無い。3 つの zone すべてで ok の `fan.<zone>.rpm` が `fan_max_age_ms` 以内にあり、**すべての zone が `full_speed_rpm_min.<zone>` 未満**。さらに、`t` より前に fand が動いていなかったか、直前の fand の停止の後が BIOS だったと確かめられる（下の「`bios` の前提」） |
+| `undetermined` | 上のどれにも当たらない。例: trace はあるが物理の PWM と合わない（simulated の backend など）・区間の始まりを確かめられない・`fan.*` が欠けている・trace が無く 1 つでも全速の zone がある（引き継ぎの Max が一部の zone だけ成功した状態か、BIOS が高負荷で全速にしたかを区別できない）・trace が途絶えた後で、その停止が正常だったと確かめられない |
+
+**区間の全体を読む**（`fand` の判定）:
+
+- 不一致の割合は、`--start` を含む連続した trace の区間について、`--start` から trace を古い向きへ、間隔が
+  `trace_max_age_ms` を超える所（区間の本当の始まり）までさかのぼって読み、その区間の全体で数える。`--end` の側も
+  同じく区間の終わりまで読む。こうして判定が `--start` / `--end` の置き方に依らないようにする
+- 決まった長さの窓（例: 直近 30 分の割合）にしないのは、simulated の運転で前半が外れ、窓に入る後半だけがたまたま
+  合う、という場合を窓では捨てられないため。区間の全体なら、その運転全体の性質で判定できる
+- 読むのは trace の `ts_ms`・`state.operating_mode`・`zones.*.hardware.pwm_raw` だけ（SQL の `json_extract` で取り出し、
+  trace の全体を検証の型に通さない）と、同じ範囲の `fan.*.pwm` の ok の行。保持期間（`control_trace_days` /
+  `raw_days` 30 日）が上限なので、1 区間で最大約 260 万 tick。手動で時々走らせる CLI として許容する
+- **区間の始まりを確かめられないとき**は、その区間のすべての時刻を `undetermined` にする。確かめられないとは、
+  区間の最も古い trace が DB に残る最も古い trace で、`control_trace_prune` の `pruned_through_seq` が 0 でない
+  （それより古い trace を保持期間で消した。0007 / 0010 の表）か、区間の始まりが生データ（`fan.*.pwm`）の保持期間の
+  外にあるとき。消えた前半の一致を推測しない
+
+**`bios` の前提**（引き継ぎの Max と BIOS を取り違えない）:
+
+- 異常終了の後の引き継ぎは zone ごとに成否が分かれる（`safety_handoff.py` の `HandoffZoneResult` の `status`）。
+  成功した zone は全速のまま、失敗した zone は fand が最後に書いた PWM のまま残りうる。そこで「1 つでも全速未満」では
+  なく **すべての zone が全速未満**を求める。ただしそれだけでは、すべての zone の引き継ぎが失敗した状態を除けない
+- 正常停止かどうかを DB で確かめられる記録は**無い**（2026-10-16 の main で確かめた）。fand は正常停止で引き継ぎの
+  記録を消すだけで DB に書かない。引き継ぎの結果（`safety_handoff_completed` と zone ごとの `status`）は journal の
+  ログにだけ出る。`control_admin_audit` は管理ソケットの指令だけで、`systemctl stop` を記録しない
+- そのため `bios` は次のどちらかのときだけにする:
+  1. `t` より前に trace が 1 行も無く、`control_trace_prune` の `pruned_through_seq` が 0（fand がこの DB に一度も
+     書いていない。導入先の 2026-10-13 より前の履歴）
+  2. `t` が `--periods` の **`bios_confirmed`** の区間の中にある。人が journal（`safety_handoff_completed` が無い、
+     または `record_found: false`）や `systemctl` の記録で、直前の fand の停止が正常だったこと・再起動したことを
+     確かめて書く。区間ごとに根拠の文（`basis`）を必須にし、出力の来歴にそのまま写す
+- 上のどちらでもない trace の途絶の後は、物理の回転数が BIOS らしく見えても `undetermined`
+- 引き継ぎの結果と fand の正常停止を DB に残すこと（例: 取り込みが読める追記の表）は、§5 #7 の trace の backend の欄と
+  同じく別の記録の候補とする。それが入れば、`bios_confirmed` を人が書かずに済む
 
 - 区間の単位で `pwm_mismatch_max_ratio` を見るのは、simulated の backend でも BIOS の PWM がたまたま指令と
   近い時刻があり、時刻ごとの一致だけでは `fand` に入ってしまうため
 - `bios` の判定に PWM ではなく回転数を使うのは、`pwmN_enable=0`（全速）のときに `pwmN` を読んで何が返るかを
   導入先で確かめていないため（§5 #7）。回転数は物理の結果なので、enable の値に依らない
-- 高負荷で BIOS が全 zone を全速にした時刻は `undetermined` に入り、`bios` の高負荷の分布から抜ける。件数は出すので、
+- 高負荷で BIOS が 1 つでも zone を全速にした時刻は `undetermined` に入り、`bios` の高負荷の分布から抜ける。件数は出すので、
   多ければ人が気づける。誤って引き継ぎの Max を BIOS に混ぜるより、抜けるほうを選ぶ
 - trace に backend が載るようになったら（§5 #7）、その欄を優先する別の記録で置き換える
 
@@ -221,6 +256,8 @@ DB に残る記録で、これを直接に言える欄は無い（2026-10-16 の
 | `pwm_match_tolerance_pct` | trace の `pwm_raw` と物理の `fan.*.pwm` の差の許容 | 2.0（約 5 / 255） |
 | `pwm_mismatch_max_ratio` | 連続した trace の区間で一致しなかった割合の上限 | 0.05 |
 | `full_speed_rpm_min.front` / `.rear` / `.top` | これ以上を全速とみなす回転数 | §5 #8 |
+
+`--periods` の YAML は、名前つきの区間・除外する区間に加えて、`bios_confirmed` の区間（`start` / `end` / 必須の `basis`）を持てる（§2.6a）。
 | `quantiles` | 出す分位点 | 0.01 / 0.05 / 0.25 / 0.5 / 0.75 / 0.95 / 0.99 |
 | `min_samples` | 分位点を出す件数の下限 | 120（約 5 分） |
 | `metrics` | 集計する metric の一覧 | §2.5 |
@@ -237,8 +274,13 @@ DB に残る記録で、これを直接に言える欄は無い（2026-10-16 の
 - 分位点: 手で計算した type 7 の値と一致する。`min_samples` 未満で `null` と理由
 - `cooling`（§2.6a）: trace があり物理の PWM が合えば `fand`。trace はあるが PWM が合わない（simulated の
   backend を模した合成データ）・区間の不一致の割合が上限を超える・`fan.*` が欠けると `undetermined`。trace が無く
-  1 つの zone でも全速未満なら `bios`、全 zone が全速なら `undetermined`。`manual` の tick が `fand_override` で
+  すべての zone が全速未満で、それより前に trace が無く prune も無いか `bios_confirmed` の中なら `bios`。
+  一部の zone だけ全速（引き継ぎの一部の成功を模した合成データ）・trace の途絶の後で `bios_confirmed` が無い・
+  prune の記録がある DB では `undetermined`。`manual` の tick が `fand_override` で
   既定では除かれ、`undetermined` は件数だけに出る
+- 区間の全体（§2.6a）: `--start` より前から続く trace の区間で、前半の PWM が外れ `--start` 以後だけが合う合成データを
+  `undetermined` にする（`--start` を区間の途中のどこに置いても判定が変わらない）。区間の始まりが最も古い trace で
+  `pruned_through_seq` が 0 でない DB では、その区間を `undetermined` にする。`--end` の後に外れが続く場合も同じ
 - 区間の始めの境目（§2.3）: `--start` の `settle_ms` 前に負荷が変わったデータで、`--start` 直後の評価時刻が
   `transition` になる（さかのぼった区間の時刻は件数に入らない）。`--start` より前に行が無いデータでは、区間の
   最初から `settle_ms` が `transition` になり、`start_lookback_incomplete: true` が出る。`--start` の
@@ -254,7 +296,8 @@ DB に残る記録で、これを直接に言える欄は無い（2026-10-16 の
 （書いている最中の DB をファイルの複写で写さない）。期間は T1 の開始から 24 h を `--start` / `--end` で渡す。
 T1 は hwmon の backend で fand が制御しているので、§2.6a の突き合わせが合えば `cooling: fand` に入る。合わない時刻が
 多ければ `undetermined` が増えるので、その件数を先に確かめる。BIOS の期間との比較は、同じ DB の
-T1 より前の期間を別に走らせて並べる。
+T1 より前の期間を別に走らせて並べる。fand の試験（0121 の T0〜T9）より前の期間は §2.6a の 1 で `bios` に入り、
+試験の間と後の fand が止まっていた期間は、所有者が journal を確かめて `bios_confirmed` を書いたときだけ `bios` に入る。
 
 ## 3. Consequences
 
@@ -275,7 +318,7 @@ T1 より前の期間を別に走らせて並べる。
 | 帯の初期値が根拠の薄い `provisional` | 電力そのものの分布も出すので、1 回走らせてから帯を見直せる（§5 #2） |
 | 生データだけを読むので、保持期間（30 日）より古い期間は集計できない | `d.*` は保存しないので、ロールアップからは正しい分布が出ない。必要な期間は保持期間のうちに走らせ、出力を残す |
 | 24 h × 2.5 s で metric あたり約 3.5 万件をメモリに持つ | 期間の上限 `max_period_days` で抑える。30 日でも metric あたり約 100 万件の float で、1 回の手動の集計として許容できる |
-| 高負荷で BIOS が全 zone を全速にした時刻が `undetermined` になり、`bios` の高負荷の分布が薄くなる | 件数を出すので気づける。引き継ぎの Max を BIOS に混ぜるより安全側。trace に backend と引き継ぎが載れば解消する（§5 #7） |
+| 高負荷で BIOS がどれかの zone を全速にした時刻と、fand を一度動かした後で `bios_confirmed` を書いていない期間が `undetermined` になり、`bios` の分布が薄くなる | 件数を出すので気づける。引き継ぎの Max を BIOS に混ぜるより安全側。trace に backend と引き継ぎが載れば解消する（§5 #7） |
 | エアコンの ON / OFF を自動で区別できない | DB に記録が無いものを推測しない。人が `--periods` で区間を渡す |
 
 ## 4. 却下した代替案
@@ -303,5 +346,5 @@ T1 より前の期間を別に走らせて並べる。
 | 4 | `config/rules.yaml` の現在の閾値を並べ、超えた割合を出すか | **(a) 出さない（推奨。人が表と `rules.yaml` を並べて読む。CLI をルールの形の変化から切り離す）**／(b) `d.*` を対象にする `threshold` 型のルールだけ、閾値と超過の割合を参考に出す | 本記録の承認 |
 | 5 | `fand_override`（`manual` / `max` / `calibration` の tick）の既定の扱い | **(a) 既定で除き件数だけ出す・`--include-override` で含める（推奨。試験の操作は普段の運転ではない）**／(b) 既定で含め別のグループにする | 本記録の承認 |
 | 6 | 実装の担当（AGENTS.md「実装の担当」） | **(a) ローカル LLM（推奨。仕様が本記録で明確・`soak.py` の読み取り専用の型を模倣でき・実機不要のテストで確かめられる）**／(b) Claude | 本記録の承認の後、Issue で |
-| 7 | `pwmN_enable=0`（引き継ぎの全速）のときに nct6799 の `pwmN` を読むと何が返るか・trace に backend の欄を足すか | **(a) 本記録では回転数で `bios` を判定し（§2.6a）、`pwmN` の読みの確認と trace の backend の欄（`ControlTick` の版上げ）は別の Issue と記録に分ける（推奨。CLI のために制御の trace の形を変えない）**／(b) 先に `ControlTick` へ `backend` と起動時の引き継ぎの検出を足し、それを `cooling` の主の根拠にする | 本記録の承認。(b) は別の記録 |
+| 7 | `pwmN_enable=0`（引き継ぎの全速）のときに nct6799 の `pwmN` を読むと何が返るか・trace に backend の欄を足すか・引き継ぎの結果と fand の正常停止を DB に残すか | **(a) 本記録では回転数と `bios_confirmed` で `bios` を判定し（§2.6a）、`pwmN` の読みの確認・trace の backend の欄（`ControlTick` の版上げ）・引き継ぎと正常停止の記録は別の Issue と記録に分ける（推奨。CLI のために制御の trace と引き継ぎ実行部の形を変えない）**／(b) 先に `ControlTick` へ `backend` を、DB へ引き継ぎの zone ごとの結果と正常停止を足し、それを `cooling` の主の根拠にする | 本記録の承認。(b) は別の記録 |
 | 8 | `full_speed_rpm_min` の値 | **(a) T2・T5・T6 の記録の全速の回転数（Front / Rear / Top）の最小から 5 % 引いた値を所有者が確かめて置く（推奨）**／(b) `docs/fan-header-mapping.md` の定格から決める | 本記録の承認（値は設定） |
