@@ -1,7 +1,7 @@
 # 決定記録 0157: 認証ランナー・`coldaisle-fand`・`coldaisle-learnd` の起動の形をそろえ、`sys.path` の全項目を実行環境の指紋に入れる
 
 - **種別**: Decision Record
-- **Status**: Proposed
+- **Status**: FINAL（2026-10-16、リポジトリ所有者の承認）
 - **Date**: 2026-10-16
 - **Supersedes**: なし（[0066](0066-workload-hint-stage-b-conditions.md) §2.1 (c) の「実行環境の指紋」と
   [0152](0152-hint-monotonic-gate-certificate.md) §2.3 の部品 `environment` の定義を**補う**。置き換えではない。
