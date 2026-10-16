@@ -65,9 +65,9 @@ AGENTS.md の「仕様に無い判断をした場合、実装より先に決定�
   |---|---|
   | `coldaisle.training_entry` | §2.4 の 2: `verify_training_dataset_v2`・`TrainingDatasetRefused` |
   | `coldaisle.calibration_log` | §2.4 の 3: `verify_training_calibration` |
-  | `coldaisle.declared_changes` | §2.3 / §2.7: `read_declared_changes`（同じ bytes の `file_sha256` を返す）・`DeclaredChangesError` |
-  | `coldaisle.control.drift.model` | §2.3: `read_declared_changes` が返す `DeclaredChange` の型（`training_entry` が受け取る型。`control/drift` の中でこれだけ） |
-  | `coldaisle.metrics` | §2.3 / §2.4 の 5・7 / §2.7: `MetricCatalog.from_yaml_with_sha256` |
+  | `coldaisle.declared_changes` | §2.3 / §2.7: `parse_declared_changes`（実装の PR で足す bytes の API。同じ bytes の `file_sha256` を返す）・`DeclaredChangesError` |
+  | `coldaisle.control.drift.model` | §2.3: `parse_declared_changes` が返す `DeclaredChange` の型（`training_entry` が受け取る型。`control/drift` の中でこれだけ） |
+  | `coldaisle.metrics` | §2.3 / §2.4 の 5・7 / §2.7: `MetricCatalog.from_yaml_bytes_with_sha256`（実装の PR で足す bytes の API） |
   | `coldaisle.store`（読むだけの API） | §2.3 / §2.7: `QualityRules`（`model_validate`）。DB は `training_entry` が読み取り専用で開く |
   | `coldaisle.ingest.calibration` | §2.3 / §2.7: `Calibration.from_json_bytes`（`ingest` の中でこれだけ。取り込みの Source は使わない） |
   | `coldaisle.control.model.*` | §2.4 の 1・4〜7 / §2.7: `counterfactual_training`（`verify_training_dataset_artifact_v2`・`train_counterfactual_ridge`・`CounterfactualTrainingSpec`）・`counterfactual_confidence`（`seal_counterfactual_artifact`）・`counterfactual`（`CounterfactualThermalModelArtifact.model_validate_json`・`canonical_counterfactual_artifact_bytes`・`counterfactual_registry_metadata`・`counterfactual_registry_metadata_json_bytes`・`check_artifact_contents`・`RegistryCounterfactualThermalModel.from_verified_artifact`）・`calibration_digest`（`RuntimeCalibration`。読んだ `Calibration` から作る）・`confidence`（`ConfidenceProfileSpec`・`SupportAxis`）・`dataset`（`split_temporally_v2`）・`training`（`split_sha256`） |
@@ -148,8 +148,11 @@ AGENTS.md の「仕様に無い判断をした場合、実装より先に決定�
    `--calibration` の写像が期間に効いていた行と一致しなければ拒否する（0099 §2.6 / 0096 §5 #4）。さらに
    `--declared-changes` の `calibration_changed` が期間の後にあっても拒否する（0109 の和集合と同じ向き）
 4. `split_temporally_v2`（`--training-spec` の境界）
-5. `train_counterfactual_ridge`（`train` だけ）→ `fit_confidence_profile_v2`（範囲は `train`、residual の基準は
-   `validation`）→ `seal_counterfactual_artifact`
+5. `train_counterfactual_ridge`（`train` だけ）→ `seal_counterfactual_artifact`（範囲は `train`、residual の基準は
+   `validation`）。**`fit_confidence_profile_v2` を `train.py` から直接呼ばない。** `seal_counterfactual_artifact` が内部で
+   1回だけ呼び（`src/coldaisle/control/model/counterfactual_confidence.py`）、`assemble_counterfactual_artifact` で封じるので、
+   先に明示して呼ぶと全 train example の support の集計と validation の residual の推論を2回行う。報告の Profile の SHA-256 は、
+   封じた artifact の `confidence_profile`（manifest の `confidence_profile_sha256`）から取り、Profile を作り直さない
 6. `canonical_counterfactual_artifact_bytes` と `counterfactual_registry_metadata`
 7. **読み込み側の検査を作った bytes に通す。** 作った bytes を読み直し、loader と同じ内容の検査
    （`check_artifact_contents` を `--calibration` の値と `--metrics-config` つきで。L9 の較正の digest を含む）を通してから
@@ -438,12 +441,31 @@ coldaisle-authority raise          → authority を1段   （承認者の uid�
   |---|---|
   | `--training-spec` | `train.py` が bytes を読み、`yaml.safe_load` → schema の pydantic の型で検証。hash も同じ bytes |
   | `--quality-config` | `QualityRules.from_yaml(path)` は path から読み digest を返さないので**使わない**。`train.py` が bytes を読み、`yaml.safe_load` → mapping であることを確かめ → `QualityRules.model_validate`（`from_yaml` の本体と同じ処理で、既存の API で足りる）。hash も同じ bytes |
-  | `--metrics-config` | `MetricCatalog.from_yaml_with_sha256`（既に1回だけ読み、同じ bytes の SHA-256 を返す。0107 §2.6） |
-  | `--declared-changes` | `read_declared_changes`（既に1回だけ読み、同じ bytes の `file_sha256` を返す） |
+  | `--metrics-config` | `train.py` が上限つきで bytes を読み、`MetricCatalog.from_yaml_bytes_with_sha256(data, origin=...)`（実装の PR で足す。下記）。hash も同じ bytes |
+  | `--declared-changes` | `train.py` が上限つきで bytes を読み、`parse_declared_changes(data, origin=...)`（実装の PR で足す。下記）。`file_sha256` も同じ bytes |
   | `--calibration` | `train.py` が bytes を読み、`Calibration.from_json_bytes(data, origin=...)`。hash も同じ bytes（報告の digest。較正の照合は 0099 §2.6 の `offsets_sha256`） |
   | `--registry-limits` | `train.py` が `model-registry.yaml` の bytes を読み、`yaml.safe_load` → `ModelRegistryLimits.model_validate`（`from_file` の本体と同じ）。1回読んだ limits を登録と `load_version` の両方に使う（§2.5） |
 
-  上限で切って読む（0062 §2.1 の流儀）。`training_entry` に渡す `QualityRules` も、この1回の読みから作ったものを渡す
+  `training_entry` に渡す `QualityRules` も、この1回の読みから作ったものを渡す
+
+- **上の6つの入力はすべて上限で切って読む**（0062 §2.1 の流儀: 上限＋1 byte だけを読み、超えていれば parse の前に拒否する。
+  読んでから大きさを判断しない）。読むのは `train.py` の1つの関数で、`O_RDONLY | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK` で開き、
+  `fstat` で regular file であることを確かめてから読む（`declared_changes._read_regular_file` と同じ開き方）。上限を超えた・
+  regular file でない・UTF-8 でない・YAML / JSON として読めない・parser の再帰が尽きた（`RecursionError`。0062 §2.1）は、
+  どれも学習の前に構造化ログと終了コード 1 で拒否し、`--out` を作らない。上限の値は §5 の 12
+- **既存の `MetricCatalog.from_yaml_with_sha256`（`src/coldaisle/metrics.py`）と `read_declared_changes`
+  （`src/coldaisle/declared_changes.py`）は path からファイル全体を上限なしで読む**（前者は `Path.read_bytes()`、後者は EOF までの
+  `os.read` のループ）。そのまま呼ぶと上の約束を満たせないので、`train.py` からは呼ばない。実装の PR で、同じ検証を bytes から
+  行う API を足す:
+  - `MetricCatalog.from_yaml_bytes_with_sha256(payload: bytes, *, origin: str) -> tuple[MetricCatalog, str]`
+    （`from_yaml_with_sha256` の本体のうち、読んだ後の decode・`safe_load`・辞書の確認・`model_validate`・`_validate_names`・
+    SHA-256 をここへ移す）
+  - `parse_declared_changes(payload: bytes, *, origin: str) -> DeclaredChangesInput`（`read_declared_changes` の本体のうち、
+    読んだ後の decode・重複した鍵を拒む loader・mapping の確認・`model_validate`・`file_sha256` をここへ移す）
+
+  既存の2つの関数は、いまの読み方で bytes を得てから新しい関数を呼ぶ薄い包みにする。**fand（`control_daemon` の
+  `from_yaml_with_sha256`）と `coldaisle-dataset`（`read_declared_changes`）の挙動・例外・digest は変えない**（上限を足すかは
+  本記録では決めない。足すならそれぞれの入口の記録で決める）。手順を写して2つにしない
 - `code_commit` は `--code-commit` で明示して渡す。CLI は `git` を呼ばない（`subprocess` を使わない）。`--apply` のときは
   必須にする（§5 の 8）
 
@@ -533,7 +555,11 @@ best-effort で `OSError` / `UnsafeRegistryPathError` を握る（`src/coldaisle
   `metadata.json` は完成）の `--out` のファイルを渡すと終了コード 1 で Registry が変わらないこと。公開の後の `--out` でも拒むこと。
   `training-report.json` の無い別のディレクトリのファイルは従来どおり登録できること。手順 3 で `training-report.json` が最初に
   書かれること
-- 設定の1回読み: `--quality-config` / `--training-spec` / `--calibration` / `--registry-limits` を、読んだ直後に差し替えても
+- 設定の上限: 6つの設定の入力のそれぞれについて、上限＋1 byte のファイルを渡すと学習の前に終了コード 1 で拒否され、`--out` が
+  作られず、読んだ byte 数が上限＋1 を超えないこと（`os.read` を包んで数える）。symlink・FIFO を渡しても拒否されること。
+  `MetricCatalog.from_yaml_bytes_with_sha256` と `parse_declared_changes` が、既存の `from_yaml_with_sha256` /
+  `read_declared_changes` と同じ入力で同じ結果・同じ digest・同じ例外の型を返すこと（既存の試験はそのまま通ること）
+- 設定の1回読み: `--quality-config` / `--training-spec` / `--calibration` / `--metrics-config` / `--declared-changes` / `--registry-limits` を、読んだ直後に差し替えても
   （`open` を包んで2回目の読みで別の bytes を返す）、学習・登録に使った設定と報告の digest が1回目の bytes のものであり、
   path から2回読まないこと
 - `coldaisle-registry register --training-output`: 有効な印の `--out` から candidate を登録できること。印が無い・書きかけ・
@@ -597,3 +623,4 @@ best-effort で `OSError` / `UnsafeRegistryPathError` を握る（`src/coldaisle
 | 9 | （申し送り）`write_dataset` にも、確認と `os.rename` の間に作られた空のディレクトリを置き換える同じ窓がある | **本記録では扱わない。** 直すなら 0031 §3（macOS / Ubuntu 共通の `os.rename`）を置き換える別の決定記録で扱う | — |
 | 10 | `--out` の公開の手段（NFR-07「macOS / Ubuntu 双方で動作。OS依存はシリアルデバイス検出のみに閉じる」との関係） | **(A) OS に依らない手順**（§2.5 の本文）。`os.mkdir` で `--out` を排他的に確保し、中に書いてから完成の印を一時名で書いて fsync し、`os.link` で `COMPLETE.json` として公開する（既にあれば失敗）。利点: POSIX 共通の操作だけで NFR-07 を変えない・ctypes も OS の分岐も要らず CI（Ubuntu）で全経路を実物で試験できる・`mkdir` の排他で置き換えの窓が無い（前回の指摘を満たす）・0031 §3 の「共通の POSIX の操作だけ」と一貫する。欠点: 強制終了の後に `COMPLETE.json` の無い `--out` が残り、人が消すまで再実行できない・読む側が印を確かめる必要がある（新しい `coldaisle-registry register --training-output` は Registry を開く前に `COMPLETE.json` を確かめる。印を見ないのは既存の `--metadata` / `--payload` の経路だけで、その経路も `register_candidate` の checksum で書きかけを拒む） | (B) NFR-07 を変えて OS ごとの置き換えない rename を使う（Linux `renameat2(RENAME_NOREPLACE)`・macOS `renameatx_np(RENAME_EXCL)`・使えなければ失敗。ctypes の小さな関数1つ）。NFR-07 の「OS依存はシリアルデバイス検出のみに閉じる」を「…シリアルデバイス検出と、決定記録 0150 の出力の公開（置き換えない rename）に閉じる」へ変え、同じ PR で `docs/requirements.md` を直す。利点: `--out` は「無い」か「完成」のどちらかで、強制終了の後に残るのは隠れた一時ディレクトリだけ・読む側に印の確認が要らない。欠点: 要件を変える・macOS の分岐は Ubuntu の CI では差し替えでしか試験できない・ファイルシステムが対応しないと使えない・0031 §3 の writer（共通の `os.rename`）と手段が分かれる |
 | 11 | （申し送り）Registry の登録の失敗で、参照されない artifact のファイルが残りうる（`_remove_artifact_if_unreferenced` が best-effort）。`coldaisle-registry` に片付けの入口は無い | **本記録では扱わない**（Registry の書き方と片付けは 0062 / 0104 の範囲）。必要なら Registry の片付けの入口を別の記録で決める | — |
+| 12 | 設定の入力（§2.7 の6つ）を読む上限の値と置き場所 | **`train.py` の構造上の定数 `MAX_TRAINING_CONFIG_BYTES = 1 MiB`**（6つに共通）。運用の閾値ではなくメモリを守る構造上の上限で、既存の `MAX_ARTIFACT_BYTES`（`control/model/thermal.py`）・`_MAX_JOURNAL_BYTES`（`control/authority.py`）・`MAX_DECLARED_CHANGES` と同じ扱い。いまの設定は数 KB で、宣言の YAML も `MAX_DECLARED_CHANGES` = 64 件に収まる。利点: `--apply` の無い実行でも追加の設定が要らず、上限を決めるファイル自身の読みに上限が要るという循環が無い | (a) `--registry-limits` を常に必須にし、その `max_snapshot_bytes` を使う（0062 §2.1 と同じ値）。欠点: `--out` だけの実行にも Registry の設定が要り、`model-registry.yaml` 自身は別の上限で読む必要が残る。(b) `--training-spec` に置く。欠点: spec 自身の読みに上限が要る |
