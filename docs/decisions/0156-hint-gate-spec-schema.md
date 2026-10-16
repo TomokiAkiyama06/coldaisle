@@ -1,7 +1,7 @@
 # 決定記録 0156: Workload Hint の単調性ゲートの仕様（格子・`eps`・上限）の設定の形
 
 - **種別**: Decision Record
-- **Status**: Proposed
+- **Status**: FINAL（2026-10-16、リポジトリ所有者の承認）
 - **Date**: 2026-10-16
 - **Supersedes**: なし（[0066](0066-workload-hint-stage-b-conditions.md) §2.1 (b) / (d) と
   [0152](0152-hint-monotonic-gate-certificate.md) §2.3 / §2.4 を置き換えず、設定の**形**を補う。
