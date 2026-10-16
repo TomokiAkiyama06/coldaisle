@@ -204,7 +204,7 @@ DB に残る記録で、これを直接に言える欄は無い（2026-10-16 の
 
 | 区分 | 条件（**すべて**を満たすときだけ） |
 |---|---|
-| `fand` | `t` 以前で最も新しい、`fan_max_age_ms` 以内の Fan のサンプル（3 つの zone の ok の `fan.<zone>.pwm`）について、下の「Fan のサンプルと trace の突き合わせ（as-of）」で**一致**し、一致した tick がすべて `operating_mode` `auto`。さらに、その as-of の trace を含む**連続した trace の区間**（間隔が `trace_max_age_ms` を超えたら切る。`run_id` は v16 からなので使わない）の**始まりから終わりまで全体**（`--start` / `--end` の外も含む）で、突き合わせた Fan のサンプルのうち一致しなかった割合が `pwm_mismatch_max_ratio` 以下。区間の始まりか終わりを確かめられないとき（下の「区間の全体を読む」）は `undetermined` |
+| `fand` | `t` 以前で最も新しい、`fan_max_age_ms` 以内の Fan のサンプル（3 つの zone の ok の `fan.<zone>.pwm`）について、下の「Fan のサンプルと trace の突き合わせ（as-of）」で**一致**し、一致した tick がすべて `operating_mode` `auto`。さらに、その as-of の trace を含む**連続した trace の区間**（間隔が `trace_max_age_ms` を超えたら切る。`run_id` は v16 からなので使わない）の**始まりから終わりまで全体**（`--start` / `--end` の外も含む）で、突き合わせた Fan のサンプルが十分にあり（下の「Fan のサンプルの覆い」）、そのうち一致しなかった割合が `pwm_mismatch_max_ratio` 以下。区間の始まりか終わりを確かめられないとき（下の「区間の全体を読む」）は `undetermined` |
 | `fand_override` | `fand` の条件のうち、一致した tick がすべて `auto` でない（`manual` / `max` / `calibration`。試験の操作）。一致した tick のモードが食い違えば `undetermined` |
 | `bios` | `t` が `--periods` の **`bios_confirmed`** の区間の中にあり、`t` の as-of の trace が無く（§2.6 の規則）、壁時計の重なりに触れない（下の「`bios` の前提」）。**trace が無いことだけでは `bios` にしない** |
 | `undetermined` | 上のどれにも当たらない。例: trace はあるが物理の PWM と合わない（simulated の backend など）・区間の始まりか終わりを確かめられない・`fan.*` が欠けている・trace が無く `bios_confirmed` の区間の外（trace の無い DB を含む）・壁時計の重なりに触れる |
@@ -335,6 +335,23 @@ DB に残る記録で、これを直接に言える欄は無い（2026-10-16 の
 
 - 区間の単位で `pwm_mismatch_max_ratio` を見るのは、simulated の backend でも BIOS の PWM がたまたま指令と
   近い時刻があり、時刻ごとの一致だけでは `fand` に入ってしまうため
+
+**Fan のサンプルの覆い**（分母が小さいと割合の検査が素通りになるのを防ぐ）:
+
+- 区間の大半で `fan.*.pwm` が欠けていると（telemetry の収集の停止・生データの保持期間の外）、不一致の割合の分母は
+  残った少しのサンプルだけになり、simulated の区間でもたまたま 3 zone が合ったサンプルが 1 つあれば不一致 0 % に
+  なる。そこで区間ごとに、**突き合わせられた Fan のサンプル**（3 zone の `fan.*.pwm` が同じ `ts_ms` で揃い、as-of の
+  trace がその区間にあるもの。一致・不一致・flag が false で一致にしないものを含む。分母と同じ）について、次の
+  両方を求める:
+  - 数が `fan_min_samples_per_segment` 以上
+  - 覆いの割合 `数 ÷ (区間の長さ ÷ fan_expected_interval_ms)` が `fan_min_coverage_ratio` 以上（区間の長さは
+    `seq` の順の最初と最後の trace の `ts_ms` の差。時計が戻って負や 0 になる区間は、覆いを計れないので満たさない
+    とする）
+- 満たさない区間は、すべての時刻を `undetermined`（理由 `fan_coverage_low`）にし、件数だけを出す
+- 文書の全体を点検し、割合で判定する検査はほかに 2 つあることを確かめた。どちらも分母を「届いた数」ではなく
+  決まった長さから作るか、最小の数を持つ: 電力の窓の `power_min_ok_ratio`（分母は `power_window_ms ÷ 期待周期` の
+  決まった数。§2.2）と分位点の `min_samples`（§2.5。`transition` の分布にも同じく当てる）。生データの覆い（§2.7）は
+  割合ではなくバケットごとの行数の突き合わせなので当たらない
 - trace に backend が載るようになったら（§5 #7）、その欄を優先する別の記録で置き換える
 
 ### 2.6b `--periods` の YAML の約束
@@ -416,6 +433,9 @@ DB に残る記録で、これを直接に言える欄は無い（2026-10-16 の
 | `fan_max_age_ms` | `fan.*.pwm` を評価時刻に使う古さの上限 | 5000（2 周期） |
 | `pwm_match_tolerance_pct` | trace の `pwm_raw` と物理の `fan.*.pwm` の差の許容 | 2.0（約 5 / 255） |
 | `pwm_mismatch_max_ratio` | 連続した trace の区間で一致しなかった Fan のサンプルの割合の上限 | 0.05 |
+| `fan_expected_interval_ms` | Fan のサンプル（`coldaisle-telemetry` の収集）の期待周期 | 2500（`config/internal-telemetry.yaml` の `interval_ms` と同じ） |
+| `fan_min_samples_per_segment` | trace の区間ごとに求める、突き合わせられた Fan のサンプルの最小の数 | 120（約 5 分） |
+| `fan_min_coverage_ratio` | trace の区間ごとの Fan のサンプルの覆いの割合の下限 | 0.8 |
 | `pwm_apply_delay_ms` | 指令が物理の PWM に反映されるまで許す遅れ（候補の trace の窓） | 3500（telemetry の 1 周期 2500 ms + fand の 1 tick 1000 ms） |
 
 `--periods` の YAML の形と約束は §2.6b。
@@ -452,6 +472,10 @@ DB に残る記録で、これを直接に言える欄は無い（2026-10-16 の
 - 書き込みの確かめ（§2.6a）: PWM が合っていても、候補の trace に `write_ok` か `readback_ok` が false の zone がある
   （`ENABLE_REVERTED` で `readback_ok = false` を含む）・`hardware` の無いサンプルは `undetermined`。区間の中で
   そうしたサンプルが `pwm_mismatch_max_ratio` を超えると、合っているサンプルも含めて区間ごと `undetermined`
+- Fan のサンプルの覆い（§2.6a）: simulated の区間で `fan.*.pwm` の大半が欠け、残った 1 つのサンプルがたまたま 3 zone で
+  合う合成データで、不一致 0 % でも `fan_coverage_low` で `undetermined` になる。数が `fan_min_samples_per_segment` 未満・
+  覆いの割合が `fan_min_coverage_ratio` 未満のどちらでも同じ。両方を満たすと割合の検査へ進む。時計が戻って区間の
+  長さが 0 以下になる区間は覆いを満たさない
 - `seq` の境目（§2.6a）: 新しい DB（`legacy_through_seq = 0`）で最初の tick が `legacy_until_ms` から
   `trace_max_age_ms` 以内に書かれても、`seq = 1` から続く区間は確かめられて `fand` になりうる。`seq ≤ legacy_through_seq`
   の行から始まる区間・`s0 - 1` の行が無い区間は `undetermined`
