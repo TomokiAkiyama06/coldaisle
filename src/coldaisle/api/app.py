@@ -14,6 +14,7 @@ import os
 import re
 import sqlite3
 import threading
+import weakref
 from collections.abc import AsyncIterator, Callable, Mapping
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
@@ -198,13 +199,42 @@ class Config:
         )
 
 
+class _ThreadStore:
+    """1スレッドの接続を持ち、スレッドの終了でその接続を閉じる（#346）。
+
+    `threading.local` の値は、スレッドが終わるときにそのスレッドの上で破棄される。
+    `sqlite3` の接続は作ったスレッドからしか閉じられないため、ここで閉じるのが
+    同じスレッドから閉じられる最後の機会になる。解放に任せないのは、
+    `sqlite3.Connection` が文の cache と循環参照を作り、参照の数が 0 になっても
+    循環 GC が回るまで fd を持ち続けるため。
+    """
+
+    __slots__ = ("__weakref__", "store")
+
+    def __init__(self, store: SqliteStore) -> None:
+        self.store = store
+
+    def __del__(self) -> None:
+        # 停止処理（close_all）が先に閉じていても、二重の close は害が無い。
+        # 想定と違うスレッドで破棄されたときは閉じられないが、例外を
+        # __del__ から投げても誰も受け取れないため、ここでは黙って諦める
+        with suppress(sqlite3.ProgrammingError):
+            self.store.close()
+
+
 class StoreProvider:
-    """スレッドごとに接続を1本持つ。
+    """スレッドごとに接続を1本持ち、スレッドが終わったら閉じる。
 
     `SqliteStore` はインスタンスをスレッド間で共有しない約束（決定記録 0004 §2.8）。
     FastAPI の同期エンドポイントはスレッドプールで動くため、
     スレッドローカルに持つのが素直。リクエストごとに開くとマイグレーションの
     確認が毎回走る。
+
+    **開いた接続を強参照で覚えない**（#346）。anyio のワーカースレッドは一定時間
+    使われないと終わり、次の要求は新しいスレッドで新しい接続を開く。強参照で
+    覚えると、終わったスレッドの接続が閉じられないまま残り、DB と WAL の fd が
+    上限まで積み上がる。終わったスレッドの接続は `_ThreadStore` が閉じ、
+    停止処理のための一覧（`close_all`）は弱参照でだけ持つ。
     """
 
     def __init__(self, config: Config, clock: Clock) -> None:
@@ -212,29 +242,34 @@ class StoreProvider:
         self._clock = clock
         self._rules = QualityRules.from_yaml(config.quality_rules)
         self._local = threading.local()
-        self._opened: list[SqliteStore] = []
+        self._opened: weakref.WeakSet[_ThreadStore] = weakref.WeakSet()
         self._lock = threading.Lock()
 
     def get(self) -> SqliteStore:
-        store: SqliteStore | None = getattr(self._local, "store", None)
-        if store is None:
-            store = SqliteStore(self._config.db, rules=self._rules, clock=self._clock)
-            self._local.store = store
+        holder: _ThreadStore | None = getattr(self._local, "holder", None)
+        if holder is None:
+            holder = _ThreadStore(
+                SqliteStore(self._config.db, rules=self._rules, clock=self._clock)
+            )
+            self._local.holder = holder
             with self._lock:
-                self._opened.append(store)
-        return store
+                self._opened.add(holder)
+        return holder.store
 
     def close_all(self) -> None:
-        """開いた接続を閉じる。**別スレッドが持つものは閉じられない。**
+        """まだ生きている接続を閉じる。**別スレッドが持つものは閉じられない。**
 
         `sqlite3` の接続は作ったスレッドからしか閉じられず、停止処理は
-        別のスレッドで走る。ワーカースレッドが持つ接続はプロセス終了時に
-        解放される。WAL はコミット済みなので、閉じ損ねてもデータは失われない。
+        別のスレッドで走る。生きているワーカースレッドが持つ接続はスレッドの
+        終了かプロセスの終了で閉じる。終わったスレッドの接続はすでに閉じて
+        いて、ここには残らない。WAL はコミット済みなので、閉じ損ねても
+        データは失われない。
         """
         with self._lock:
-            for store in self._opened:
+            # 反復の途中で別スレッドが終わると WeakSet が縮むため、先に写しを取る
+            for holder in list(self._opened):
                 with suppress(sqlite3.ProgrammingError):
-                    store.close()
+                    holder.store.close()
             self._opened.clear()
 
 
