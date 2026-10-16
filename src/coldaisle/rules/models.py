@@ -28,8 +28,11 @@ def rule_metrics(rule: BaseModel) -> tuple[str, ...]:
     return tuple(value for key in METRIC_KEYS if isinstance(value := getattr(rule, key, None), str))
 
 
-TEXT_KEYS = ("label", "title", "resolved_title", "hint")
-"""人が読む文の項目（決定記録 0142）。閾値ではないので、AI ツールと運用メモリの事実には出さない。"""
+TEXT_KEYS = ("label", "title", "resolved_title", "hint", "fault_labels")
+"""人が読む文の項目（決定記録 0142 / 0148）。
+
+閾値ではないので、AI ツールと運用メモリの事実には出さない。
+"""
 
 ValueKind = Literal[
     "threshold",
@@ -42,6 +45,7 @@ ValueKind = Literal[
     "seconds",
     "samples",
     "event",
+    "control",
 ]
 """遷移の `value` が何を表すか（決定記録 0142 §2.4）。通知の値の行の書き方を決める。
 
@@ -236,6 +240,42 @@ class LatestThresholdRule(_Rule):
     fire_after_s: float = Field(ge=0)
 
 
+class ControlStateRule(_Rule):
+    """fand の最新の decision trace の `safety_state` が続いたら発火する（決定記録 0148 §2.2）。
+
+    どの状態を見るかはルールの名前で決まる（`fand_emergency` / `fand_degraded`）。
+    trace が古い・読めない周期は評価しない（0131 §2.3 と同じ。0148 §2.3）。
+    """
+
+    fire_after_s: float = Field(ge=0)
+    clear_s: float = Field(ge=0)
+    """その状態でない新しい trace がこの秒数だけ続いたら解除する。**1 回で解除しない。**"""
+    fault_labels: dict[str, str]
+    """fault code → 本文に出す日本語の名前（0148 §2.5）。無い code は code のまま出す。"""
+
+    @field_validator("fault_labels")
+    @classmethod
+    def _labels_are_not_blank(cls, value: dict[str, str]) -> dict[str, str]:
+        for code, label in value.items():
+            if not label.strip():
+                raise ValueError(f"fault_labels の {code} が空の文")
+        return value
+
+
+class ControlSilenceRule(_Rule):
+    """fand の decision trace が届かない・読めない状態が続いたら発火する（決定記録 0148 §2.2）。
+
+    `silence_s` は trace の新しさの閾値でもある
+    （`ControlStateRule` が「いまの状態」として使う上限）。
+    DB に trace が 1 行も無いときは評価しない（0148 §2.8）。
+    """
+
+    silence_s: float = Field(gt=0)
+    fire_after_s: float = Field(ge=0)
+    clear_s: float = Field(ge=0)
+    """読める新しい trace がこの秒数だけ続いたら解除する。"""
+
+
 class RuleSet(BaseModel):
     """`config/rules.yaml` 全体。**すべてのルールを明示する。**
 
@@ -257,6 +297,9 @@ class RuleSet(BaseModel):
     gpu_fan_below_curve: HotAndSlowRule
     connector_temp_high: LatestThresholdRule
     connector_temp_critical: LatestThresholdRule
+    fand_emergency: ControlStateRule
+    fand_degraded: ControlStateRule
+    fand_trace_silent: ControlSilenceRule
 
     def labels(self) -> dict[str, str]:
         """`RULE_ID`（ルールの名前の大文字）→ 人が読む名前（決定記録 0142 §2.3）。"""
@@ -341,6 +384,8 @@ def _value_kind(rule: BaseModel) -> ValueKind:
         (SilenceRule, "seconds"),
         (ConsecutiveRule, "samples"),
         (EventRule, "event"),
+        (ControlStateRule, "control"),
+        (ControlSilenceRule, "control"),
     )
     for model, kind in kinds:
         if isinstance(rule, model):

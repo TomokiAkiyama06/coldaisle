@@ -347,8 +347,8 @@ def test_config_marks_thresholds_as_provisional():
 
 def test_every_required_rule_is_defined(rule_set):
     """FR-401〜409 の9つと、GPU の Fan の曲線の2つ（決定記録 0131）と、
-    12V-2x6 コネクタの温度の2つ（決定記録 0145）。"""
-    assert len(RuleSet.model_fields) == 13
+    12V-2x6 コネクタの温度の2つ（決定記録 0145）と、fand の状態の3つ（0148）。"""
+    assert len(RuleSet.model_fields) == 16
 
 
 @pytest.mark.parametrize(

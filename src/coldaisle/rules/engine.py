@@ -19,9 +19,12 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
 
 from coldaisle import logs
-from coldaisle.clock import Clock
+from coldaisle.clock import Clock, MonotonicClock, SystemMonotonicClock
 from coldaisle.metrics import MetricCatalog, compute_derived
+from coldaisle.rules.fand_trace import FandStatus, describe_faults, read_fand_status
 from coldaisle.rules.models import (
+    ControlSilenceRule,
+    ControlStateRule,
     ExpectedReference,
     FlagOffRule,
     HotAndSlowRule,
@@ -64,7 +67,13 @@ class RuleState:
     streak: int = 0
     """連続回数（FR-402 用）。"""
     resumed_ms: int | None = None
-    """無音から復帰した時刻（FR-401 用）。"""
+    """無音から復帰した時刻（FR-401 用）。
+
+    fand の trace を読むルール（決定記録 0148）では、解除の条件を満たした最初の行を**読んだ
+    ときの単調時計**（`Engine.monotonic`）を入れる。trace の `ts_ms` は壁時計で前後に跳ぶため。
+    """
+    trace_since_mono_ms: int | None = None
+    """fand の trace を読むルールで、条件が成立した最初の行を読んだときの単調時計（0148）。"""
     severity: str = "warning"
     """このアラートの重大度。**解除したあとに DB から引けない**ので持っておく。
 
@@ -135,6 +144,22 @@ class Engine:
     catalog: MetricCatalog
     store: SqliteStore
     clock: Clock
+    read_control_traces: bool = True
+    """fand の decision trace を読むルール（決定記録 0148）を評価するか。
+
+    **実時間の取り込みでだけ True にする**（`daemon.build()`）。再生・時間圧縮では評価時刻が
+    CSV・シナリオの時刻で、別プロセスが壁時計で書いた trace と比べられない（0148 §2.1）。
+    """
+    monotonic: MonotonicClock = field(default_factory=SystemMonotonicClock)
+    """fand の trace を読むルールの発火と解除の待ちを測る単調時計（決定記録 0148 §2.2）。
+
+    trace の `ts_ms` は fand が壁時計で付けるので、NTP の補正で前へ跳ぶと 2 行で待ちが満ち、
+    後ろへ跳ぶと壁時計が追いつくまで待ちが止まる。試験では手で進める時計に差し替える。
+    """
+    _trace_seq: int | None = field(default=None)
+    """最後に読んだ trace の `seq`（記録の順の番号。再利用しない。0071 §2.2a）。"""
+    _trace_seen_mono_ms: int = field(default=0)
+    """`_trace_seq` の行を**初めて読んだ**ときの単調時計。同じ行を読み直しても変えない。"""
     _states: dict[tuple[str, str | None], RuleState] = field(default_factory=dict)
     _last_sample_ms: int | None = field(default=None)
     _now_ms: int = field(default=0)
@@ -255,6 +280,7 @@ class Engine:
         )
         transitions += self._evaluate_slope("rapid_rise", self.rules.rapid_rise)
         transitions += self._evaluate_latest()
+        transitions += self._evaluate_control()
         return transitions
 
     def on_tick(self) -> list[Transition]:
@@ -267,7 +293,7 @@ class Engine:
         止まっていても、GPU の値は別プロセスが書き続けている。
         """
         self._advance(self.clock.now_ms())
-        return self._evaluate_silence() + self._evaluate_latest()
+        return self._evaluate_silence() + self._evaluate_latest() + self._evaluate_control()
 
     def on_hello(
         self,
@@ -599,7 +625,13 @@ class Engine:
             name.upper()
             for name, rule in self.rules
             if isinstance(
-                rule, FlagOffRule | HotAndSlowRule | LatestThresholdRule | PowerReferencedRule
+                rule,
+                FlagOffRule
+                | HotAndSlowRule
+                | LatestThresholdRule
+                | PowerReferencedRule
+                | ControlStateRule
+                | ControlSilenceRule,
             )
         )
 
@@ -736,6 +768,173 @@ class Engine:
                 rule.fire_after_s,
             )
         return self._continue(rule_id, rule.metric, value, rule.fire_after_s)
+
+    def _evaluate_control(self) -> list[Transition]:
+        """fand の最後の decision trace を読んで評価するルール（決定記録 0148）。
+
+        **最後に記録した 1 行**（`latest_control_trace()`。0071 §2.2）の `safety_state` と
+        `faults` だけを見る。fand は `fault_clear_hold_ms` の間状態を保つので、評価の間隔
+        （約 1 s）で見落とさない（0148 §3）。
+        trace が 1 行も無い DB（fand を導入していない機械）では何もしない（0148 §2.8）。
+
+        **発火の待ちと解除の待ちは、新しい行を初めて読んだときの単調時計で測る。**
+        評価は約 1 s ごとに同じ行を何度も読む。評価の時刻で測ると、fand が 1 行書いて
+        止まったときに、その 1 行だけで待ちが満ちて発火中のアラートを解いてしまう。
+        trace の `ts_ms` で測ると、壁時計が前へ跳んだとき隣り合う 2 行で満ち、
+        後ろへ跳んだとき止まる。新しい行かどうかは `seq`（記録の順の番号）が変わったかで決め、
+        壁時計の大小に頼らない。途絶の 60 s だけは
+        `ts_ms` と評価時刻の差で測る（0148 §2.2）。
+        """
+        emergency = self.rules.fand_emergency
+        degraded = self.rules.fand_degraded
+        silent = self.rules.fand_trace_silent
+        if not self.read_control_traces or not (
+            emergency.enabled or degraded.enabled or silent.enabled
+        ):
+            return []
+        trace = self.store.latest_control_trace()
+        if trace is None:
+            self._reset_on_gap("FAND_EMERGENCY", None)
+            self._reset_on_gap("FAND_DEGRADED", None)
+            return []
+        if trace.seq != self._trace_seq:
+            self._trace_seq = trace.seq
+            self._trace_seen_mono_ms = self.monotonic.monotonic_ms()
+        seen_ms = self._trace_seen_mono_ms
+        status = read_fand_status(trace)
+        # 古さは**いまの壁時計**と比べる。巻き戻さない評価時刻（`_now_ms`）と比べると、
+        # ホストの時計が silence_s より大きく戻ったとき、両方のプロセスが直った時刻で
+        # 書いた新しい行まで古く見え、途絶を誤って鳴らし、時計が追いつくまで EMERGENCY を
+        # 解けない。fand も同じ壁時計で書く（0148 §2.2）。時計が戻って trace が先にある
+        # ときは新しいとみなす（年齢は負）
+        age_s = (self.clock.now_ms() - trace.ts_ms) / 1000
+        fresh = status is not None and age_s < silent.silence_s
+        transitions: list[Transition] = []
+        if silent.enabled:
+            if status is None:
+                detail = (
+                    f"最新の decision trace を読めない（schema_version {trace.schema_version}"
+                    f"・tick {trace.tick_id}）"
+                )
+            else:
+                detail = f"最後の decision trace から {age_s:.0f} 秒（tick {trace.tick_id}）"
+            transitions += self._evaluate_trace_silence(silent, fresh, age_s, seen_ms, detail)
+        current = status if fresh else None
+        transitions += self._evaluate_control_state(
+            "fand_emergency",
+            emergency,
+            current,
+            seen_ms,
+            target="emergency",
+            worse=frozenset(),
+        )
+        transitions += self._evaluate_control_state(
+            "fand_degraded",
+            degraded,
+            current,
+            seen_ms,
+            target="degraded",
+            worse=frozenset({"emergency"}),
+        )
+        return transitions
+
+    def _evaluate_trace_silence(
+        self, rule: ControlSilenceRule, fresh: bool, age_s: float, seen_ms: int, detail: str
+    ) -> list[Transition]:
+        rule_id = "FAND_TRACE_SILENT"
+        state = self._state(rule_id, None)
+        if not fresh:
+            state.resumed_ms = None
+            if state.since_ms is None:
+                return self._begin(
+                    rule_id,
+                    None,
+                    rule.severity.value,
+                    rule.silence_s,
+                    age_s,
+                    rule.fire_after_s,
+                    detail=detail,
+                )
+            return self._continue(rule_id, None, age_s, rule.fire_after_s, detail=detail)
+        if state.since_ms is None:
+            return []
+        if not state.firing:
+            return self._end(rule_id, None)
+        # 1 行届いただけで復旧とみなさない。読める新しい行が clear_s の幅（単調時計）で
+        # 届き続けたら解く（同じ行を読み続けても進まない）
+        return self._trace_clear(rule_id, state, seen_ms, rule.clear_s)
+
+    def _evaluate_control_state(
+        self,
+        name: str,
+        rule: ControlStateRule,
+        status: FandStatus | None,
+        seen_ms: int,
+        *,
+        target: str,
+        worse: frozenset[str],
+    ) -> list[Transition]:
+        """`safety_state` が `target` の間を成立とみなす（0148 §2.2）。
+
+        `worse`（DEGRADED に対する EMERGENCY）の間は始めも発火も解除もしない。悪化で
+        「解けました」を出さず、2 通を同時に出さないため。trace が古い・読めない（`status` が
+        `None`）周期は評価しない（発火待ちは取り消し、発火中は保つ。0148 §2.3）。
+        発火と解除の待ちは行を初めて読んだときの単調時計（`seen_ms`）で測る（`_evaluate_control`）。
+        """
+        if not rule.enabled:
+            return []
+        rule_id = name.upper()
+        if status is None:
+            self._reset_on_gap(rule_id, None)
+            return []
+        state = self._state(rule_id, None)
+        if status.safety_state == target:
+            state.resumed_ms = None
+            detail = describe_faults(status.faults, rule.fault_labels)
+            if state.since_ms is None:
+                state.trace_since_mono_ms = seen_ms
+                # 発火は下で単調時計で判定する。ここでは即時の発火だけを任せる
+                return self._begin(
+                    rule_id,
+                    None,
+                    rule.severity.value,
+                    None,
+                    None,
+                    rule.fire_after_s,
+                    detail=detail,
+                )
+            if state.firing:
+                return []
+            if state.trace_since_mono_ms is None:
+                state.trace_since_mono_ms = seen_ms
+            if (seen_ms - state.trace_since_mono_ms) / 1000 < rule.fire_after_s:
+                return []
+            return self._fire(rule_id, None, None, detail)
+        if status.safety_state in worse:
+            # 発火中は保つ（悪化で「解けました」を出さない）。発火待ちは取り消し、悪い側の状態が
+            # 終わってから数え直す（0148 §2.2）。残すと、その間の時間まで数えて戻った直後に発火する
+            state.resumed_ms = None
+            if not state.firing:
+                self._cancel_pending(rule_id, None)
+            return []
+        if state.since_ms is None:
+            return []
+        if not state.firing:
+            return self._end(rule_id, None)  # 発火待ちの揺らぎは消す（0012 §2.4）
+        return self._trace_clear(rule_id, state, seen_ms, rule.clear_s)
+
+    def _trace_clear(
+        self, rule_id: str, state: RuleState, seen_ms: int, clear_s: float
+    ) -> list[Transition]:
+        """解除の待ちを、行を初めて読んだときの単調時計で測る（0148）。
+
+        **同じ行の繰り返しでは進まない**（`seen_ms` は新しい行が来たときだけ変わる）。
+        """
+        if state.resumed_ms is None:
+            state.resumed_ms = seen_ms
+        if (seen_ms - state.resumed_ms) / 1000 < clear_s:
+            return []
+        return self._end(rule_id, None)
 
     def _reset_on_gap(self, rule_id: str, metric: str | None) -> None:
         """欠けた・stale の入力を受けた（決定記録 0131 §2.3）。**連続の時間を数え直す。**
