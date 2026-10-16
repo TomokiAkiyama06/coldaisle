@@ -99,7 +99,7 @@ AGENTS.md の「仕様に無い判断をした場合、実装より先に決定�
 
 任意の引数は `--code-commit <hex>` だけ（§2.7）。
 
-### 2.4 検査と学習の順。どれか1つでも外れれば何も書かない
+### 2.4 検査と学習の順。公開の前に1つでも外れれば何も書かない
 
 1. `verify_training_dataset_artifact_v2`: 公開物の bytes と directory 名の alias に束縛する
 2. `verify_training_dataset_v2`: 元の入力の fingerprint・export の束縛・本番の DB の行と trace を照合し、一時の専用 DB で
@@ -120,7 +120,21 @@ AGENTS.md の「仕様に無い判断をした場合、実装より先に決定�
 
 `test` は学習にも Profile にも使わない。件数と期間を報告に載せるだけ（§5 の 5）。
 
-失敗は構造化ログに理由を出して**終了コード 1**。`--out` には何も現れない（§2.5 の「公開の手順」。ファイルごとの rename はしない）。
+失敗は構造化ログに理由を出して**終了コード 1**。「何も残さない」の約束は **`--out` の公開（§2.5 の手順 6）の前の失敗**に
+限る。本節の 1〜7（7 は `check_artifact_contents` まで）の失敗と、公開の手順の 1〜6 の失敗では、`--out` は作られない
+（ファイルごとの rename はしない）。
+
+公開の後の失敗（`--apply` のときだけ起きる）は、`--out` を消さずに残す。消すと、Registry に登録済みかもしれない bytes の
+唯一の手元の写しを失うためである。
+
+| 失敗した段 | 終了コード | 残るもの | 回復 |
+|---|---|---|---|
+| 公開の前（検査・学習・公開の手順 1〜6） | 1 | 何も残らない（強制終了なら親の `.coldaisle-train-stage-*` だけ） | 原因を直して同じ引数で再実行 |
+| 公開の後・Registry の登録の失敗（lock・revision・同じ版が登録済み・権限・limits） | 1 | `--out`（3ファイル）。Registry は変わらない（登録の確定点の前） | `--out` の `artifact.json` と `metadata.json` を `coldaisle-registry register` へ渡す。同じ版が登録済みなら `--model-version` を上げて別の `--out` で作り直す |
+| 登録の後・`load_version` と L1〜L12 の検査の失敗 | 1 | `--out` と、Registry の **candidate**（production は動かない） | ログに artifact の key と `--out` の path を出す。人が原因を確かめ、`coldaisle-registry retire` で candidate を退ける。CLI は `retire` しない |
+
+構造化ログには失敗した段（`before_publish` / `register` / `post_register_check`）を必ず出し、どの行に当たるかを
+人が取り違えないようにする。
 
 ### 2.5 出力と、既定では Registry を書かないこと
 
@@ -136,7 +150,7 @@ AGENTS.md の「仕様に無い判断をした場合、実装より先に決定�
 
 ファイルごとに一時ファイルから rename すると、1つ目の rename の後に process が強制終了したとき一部だけが `--out` に残り、
 再実行も「既にある」で拒まれる。そこで既存の Dataset の writer（`src/coldaisle/dataset.py` の `write_dataset`）と同じ手順で、
-**ディレクトリ全体を1回の `os.rename` で公開する。**
+**ディレクトリ全体を1回の rename で公開する**（ただし置き換えない rename。手順 6）。
 
 1. `--out` の親を `O_DIRECTORY | O_NOFOLLOW` で開き、親の中の writer 用の lock ファイルを `flock(LOCK_EX)` する
    （実行した uid の所有の通常ファイル・group / other が書けない・link 数 1 を確かめる。`_lock_output_root` と同じ）。
@@ -146,15 +160,22 @@ AGENTS.md の「仕様に無い判断をした場合、実装より先に決定�
    （推測できない名前。衝突したら作り直す）
 4. 3つのファイルを一時ディレクトリへ `O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW` で書き、**それぞれ fsync** する
 5. **一時ディレクトリを fsync** し、開いた fd と path の `(st_dev, st_ino)` が同じことを確かめる（差し替えの検知）
-6. `--out` がまだ無いことをもう一度確かめ、`os.rename(一時ディレクトリ, --out)` で公開する
+6. **置き換えない rename** で公開する: Linux の `renameat2(親の fd, 一時ディレクトリ, 親の fd, --out, RENAME_NOREPLACE)`
+   を ctypes で libc から呼ぶ。`--out` が既にあれば `EEXIST` で失敗し、拒否する。POSIX の `os.rename` は、確認と rename の
+   間に（lock に協調しない同じ uid の process が）作った**空のディレクトリを黙って置き換える**ので使わない。
+   writer の lock は協調する書き手どうしにしか効かず、この窓を閉じない。`renameat2` が libc に無い・`ENOSYS`・`EINVAL`
+   （ファイルシステムが対応しない）のときは**失敗にする**（`os.rename` へ落とさない）。リポジトリには同じ用途の既存の
+   実装が無いので、共有の部品として1か所に置く（下記）
 7. **親を fsync** する（rename したディレクトリの項を永続にする）
 8. 失敗したとき（公開の前）は、自分で作った一時ディレクトリの**既知の3つの名前だけ**を unlink して rmdir する。
-   後始末の失敗は元の例外を隠さない（`suppress(OSError)`）。`--out` には何も現れない
+   後始末の失敗は元の例外を隠さない（`suppress(OSError)`）。`--out` には何も現れない。手順 2 の確認は早く拒否するための
+   もので、拒否の正しさは手順 6 の `RENAME_NOREPLACE` が持つ
 
 process が強制終了したときに残りうるのは親の中の `.coldaisle-train-stage-*` だけで、`--out` は「無い」か「3つがそろって
 ある」のどちらかになる。残った一時ディレクトリは名前が一意なので再実行を妨げない。自動では消さない（Dataset の writer と
 同じ。人が確かめて消す）。手順は Dataset の writer と共有する（実装の PR で `dataset.py` の非公開の関数を、ファイル名の
-組を引数に取る共有の部品へ移す。手順を写して2つにしない）。
+組を引数に取る共有の部品へ移す。手順を写して2つにしない）。いまの `write_dataset` も `os.rename` を使っており同じ窓を
+持つ。共有の部品へ移すときに Dataset の writer も `RENAME_NOREPLACE` にするかは §5 の 9。
 
 #### `--apply` の Registry 側の書き込み
 
@@ -171,8 +192,14 @@ process が強制終了したときに残りうるのは親の中の `.coldaisle
 
 - **既定では Registry を書かない。** `--out` へ書いて終わる（`coldaisle-calibrate` / `coldaisle-memory` の「既定では
   書かない」と同じ流儀）
-- `--apply --registry-root <dir> --actor <名前> --reason <文>` を付けたときだけ、`artifact.json` と `metadata.json` と
+- `--apply --registry-root <dir> --registry-limits <dir> --actor <名前> --reason <文>` を付けたときだけ、`artifact.json` と `metadata.json` と
   **同じ bytes** を `ModelRegistry.register_candidate` へ渡す（§5 の 1 / 2）
+- **`--registry-limits <dir>` は `--apply` のとき必須**（`model-registry.yaml` のあるディレクトリ。既定値を置かない）。
+  `ModelRegistry` は `ModelRegistryLimits` を要し、その値は `config/model-registry.yaml` にだけあってコードに既定値が無い。
+  `load_model_registry_limits` で1回読み、**登録（`register_candidate`）と登録の後の `load_version`（§2.4 の 7）の両方に
+  同じ limits を使う**。`coldaisle-registry --limits` と `coldaisle-authority raise --registry-limits` は既定値に相対 path の
+  `config` を持つが、作業ディレクトリに依って別のファイルを読む余地があるので、ここでは置かない（0134 §2.2 が本番の
+  `raise` に絶対 path を求めたのと同じ理由）。読めない・不正なら、公開の前に拒否する（Registry を開く前に limits を読む）
 - 呼ぶのは **`register_candidate` だけ**。`mark_validated` / `promote` / `rollback` / `retire` は呼ばない。
   production pointer は動かない（0056 §2.6 の「candidate として登録」）
 - 権限は 0104 §2.1 の「Registry の書き手」と同じ。`coldaisle-registry` グループの人が**自分の uid のまま**実行する。
@@ -225,8 +252,11 @@ coldaisle-authority raise          → authority を1段   （承認者の uid�
 - `--apply` で candidate になり、production pointer と revision 以外の記録が変わらない。同じ版の2回目は終了コード 1
 - 拒否: 公開物の改ざん・`--replay-path` の取り違え・期間の後の較正の記録・`--calibration` の取り違え・`--out` が既にある・
   `support_axes` に `fan.<zone>` が欠ける。どれも `--out` が作られず、親に一時ディレクトリも残らない
-- 公開の手順: 一時ディレクトリへ書いた後・rename の前に例外を起こしても `--out` が無いこと、rename の直前に `--out` を作られたら
-  拒否すること（Dataset の writer の試験と同じ形）
+- 公開の手順: 一時ディレクトリへ書いた後・rename の前に例外を起こしても `--out` が無いこと。手順 2 の後・rename の前に
+  **空の `--out` ディレクトリを lock を取らずに作る**と、`EEXIST` で拒否され、その空のディレクトリが置き換えられずに残ること。
+  `renameat2` が使えない（ctypes の関数を差し替えて `ENOSYS` を返す）ときに失敗し、`os.rename` へ落ちないこと
+- 公開の後の失敗: 登録の失敗・登録の後の検査の失敗で終了コード 1、`--out` が残り、ログに段が出ること（§2.4 の表）
+- `--apply` で `--registry-limits` が無いと引数の段で拒否され、何も書かないこと
 - import の走査: `train` を import する module が無いこと、`train` が §2.1 の禁止の module を import しないこと
 - 作った artifact が `check_artifact_contents` を通り、`--apply` の後に `from_verified_artifact`（L1〜L12）を通ること（§2.4 の 7）
 
@@ -278,3 +308,4 @@ coldaisle-authority raise          → authority を1段   （承認者の uid�
 | 6 | RL Supervisor の学習を同じ CLI に入れるか | **入れない**。thermal の candidate が production（`shadow`）になってから別の記録で決める（§2.2） | (a) `coldaisle-train --role supervisor` を今から用意する（0058 §3 のとおり `promotable=False` しか出ず、使い道が無い） |
 | 7 | Q-25（本番でオンライン学習を行うか） | **本記録では行わない**（人が手で実行するだけ。timer を作らない）。Q-25 は #93 / #104 で開いたまま | (a) drift の推奨（0056）を受けて自動で学習・candidate 登録する timer を作る（昇格は人なので制御には届かないが、candidate が増え続ける） |
 | 8 | `--code-commit` | **`--apply` のときだけ必須**、`--out` だけなら任意 | (a) 常に任意（Registry の `code_commit` は `null` を許す）。(b) 常に必須 |
+| 9 | Dataset の writer（`write_dataset`）も `RENAME_NOREPLACE` にするか | **する**（共有の部品へ移す実装の PR で。拒否を強めるだけで、通っていた正しい実行は変わらない） | (a) 学習の CLI だけにし、Dataset の writer は別の Issue で直す |
