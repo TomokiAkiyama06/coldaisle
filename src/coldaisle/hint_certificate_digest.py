@@ -49,8 +49,6 @@ _ENVIRONMENT_TAG = b"coldaisle-hint-environment-v1"
 _CALIBRATION_TAG = b"coldaisle-hint-calibration-v1"
 _CALIBRATION_AVAILABLE = b"available"
 _CALIBRATION_UNAVAILABLE = b"unavailable"
-_RECORD_PRESENT = b"record"
-_RECORD_ABSENT = b"no-record"
 _DISTRIBUTION_NAME_SEPARATORS = re.compile(r"[-_.]+")
 
 
@@ -153,7 +151,7 @@ def lockfile_sha256(path: Path) -> str:
 
 @dataclass(frozen=True, slots=True)
 class InstalledDistribution:
-    """入った配布物の1件。``record`` は ``RECORD`` の bytes（無ければ ``None``）。
+    """入った配布物の1件。``record`` は ``RECORD`` の bytes（RECORD の無い配布物は指紋を作らない）。
 
     ``path_rank`` は、この配布物の見つかった ``sys.path`` の項目の**順位**（配布物を持つ項目だけを
     前から 0, 1, … と数えた値）。Python は ``sys.path`` の前の項目から import するので、同じ
@@ -164,7 +162,7 @@ class InstalledDistribution:
 
     name: str
     version: str
-    record: bytes | None
+    record: bytes
     path_rank: int = 0
 
 
@@ -198,13 +196,16 @@ def current_environment() -> RuntimeEnvironment:
             if not name:
                 raise ValueError("名前の無い配布物がある")
             record = distribution.read_text("RECORD")
-            if record is not None:
-                _claim_record_files(owners, owner, record)
+            if record is None:
+                # RECORD の無い配布物は、入ったファイルを変えても指紋が変わらない。指紋を作らない
+                # （fand は照合の失敗として B0 に倒す。PR #349 の P1）。
+                raise ValueError(f"RECORD の無い配布物がある: {name}")
+            _claim_record_files(owners, owner, record)
             distributions.append(
                 InstalledDistribution(
                     name=str(name),
                     version=distribution.version,
-                    record=None if record is None else record.encode("utf-8"),
+                    record=record.encode("utf-8"),
                     path_rank=rank,
                 )
             )
@@ -245,29 +246,29 @@ def _claim_record_files(owners: dict[str, int], owner: int, record: str) -> None
 
 def _distribution_parts(
     distribution: InstalledDistribution,
-) -> tuple[bytes, bytes, bytes, bytes, bytes]:
+) -> tuple[bytes, bytes, bytes, bytes]:
     if distribution.path_rank < 0:
         raise ValueError("path_rank は 0 以上")
-    if distribution.record is None:
-        record_tag, record_digest = _RECORD_ABSENT, b""
-    else:
-        record_tag, record_digest = _RECORD_PRESENT, _sha256_hex(distribution.record).encode()
     return (
         # 10 進の固定幅にして、並べ替えの順を path_rank の大小と一致させる。
         f"{distribution.path_rank:010d}".encode("ascii"),
         _canonical_distribution_name(distribution.name).encode("utf-8"),
         distribution.version.encode("utf-8"),
-        record_tag,
-        record_digest,
+        _sha256_hex(distribution.record).encode("ascii"),
     )
 
 
 def environment_bytes(environment: RuntimeEnvironment) -> bytes:
     """``environment`` の digest の元になる列。配布物は ``sys.path`` の順位で並べる。
 
-    各配布物は「``sys.path`` の項目の順位（``path_rank``）・正規化した名前・版・``RECORD`` の有無・
-    ``RECORD`` の SHA-256」。項目の順位の順、同じ項目の中では名前の順に並べる（同じ項目の中の
+    各配布物は「``sys.path`` の項目の順位（``path_rank``）・正規化した名前・版・``RECORD`` の
+    SHA-256」。項目の順位の順、同じ項目の中では名前の順に並べる（同じ項目の中の
     列挙の順はファイルシステムに依るので効かせない）。同じ名前が2つ見えていれば2件とも入れる。
+
+    **入ったファイルそのものは読まない。** 束ねるのは 0066 §2.1 (c) / 0152 §2.3 の定義どおり
+    ``RECORD`` の bytes（各ファイルの hash の一覧）までで、入ったファイルを読み直して ``RECORD`` と
+    照合はしない。``RECORD`` を変えずにファイルだけを書き換えた改変は、この指紋では検出しない
+    （インストール先は root の所有。docs/ubuntu-deploy.md）。
     """
     entries = sorted(_distribution_parts(item) for item in environment.distributions)
     parts: list[bytes] = [

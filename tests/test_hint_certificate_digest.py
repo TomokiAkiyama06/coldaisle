@@ -224,17 +224,6 @@ def test_a_distribution_name_is_normalised_before_ordering() -> None:
         pytest.param(
             {
                 "distributions": (
-                    digest.InstalledDistribution(name="numpy", version="2.0.0", record=None),
-                    digest.InstalledDistribution(
-                        name="pydantic", version="2.9.0", record=b"p,y,2\n"
-                    ),
-                )
-            },
-            id="record-missing",
-        ),
-        pytest.param(
-            {
-                "distributions": (
                     digest.InstalledDistribution(
                         name="numpy", version="2.0.0", record=b"numpy/a.so,x,1\n"
                     ),
@@ -250,14 +239,17 @@ def test_each_part_of_the_environment_changes_the_digest(overrides: dict[str, ob
     )
 
 
-def test_an_empty_record_is_not_a_missing_record() -> None:
-    empty = environment(
-        distributions=(digest.InstalledDistribution(name="a", version="1", record=b""),)
-    )
-    missing = environment(
-        distributions=(digest.InstalledDistribution(name="a", version="1", record=None),)
-    )
-    assert digest.environment_sha256(empty) != digest.environment_sha256(missing)
+def test_a_distribution_without_a_record_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """RECORD の無い配布物はファイルを変えても指紋が変わらないので、指紋を作らない（#349）。"""
+    site = tmp_path / "site"
+    info = site / "bare-1.0.dist-info"
+    info.mkdir(parents=True)
+    (info / "METADATA").write_text("Metadata-Version: 2.1\nName: bare\nVersion: 1.0\n")
+    monkeypatch.setattr("sys.path", [str(site)])
+    with pytest.raises(ValueError, match="RECORD の無い"):
+        digest.current_environment()
 
 
 def test_swapping_the_sys_path_rank_changes_the_digest() -> None:
