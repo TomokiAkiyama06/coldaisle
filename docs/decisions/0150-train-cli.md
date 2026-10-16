@@ -56,30 +56,47 @@ AGENTS.md の「仕様に無い判断をした場合、実装より先に決定�
 - 合成の起点 `src/coldaisle/train.py`、console script `coldaisle-train`（`pyproject.toml`）
 - **どこからも import しない**（`authority_cli.py` と同じ扱い）。とくに `control_daemon`・`learned_worker`・
   `learned_channel`・`control/`・`api/`・`ai/`・`server`・`event_entry`・`control_admin` から import しない
-- `train.py` が import してよいのは次の一覧だけ（関数・型・メソッドの単位。§2 の手順で使うものを全部並べる）。
-  `control/hardware`・`control/safety`・`control/reactive`・`control/loop`・`serial`・`subprocess`・`ai` を import しない
-  （試験で走査する。§2.9）
+- **import の約束は、モジュール単位の許可の一覧と禁止の一覧の2つ**とする（関数・メソッドの単位では並べない。漏れが続くため）。
+  対象は `train.py` と `training_output.py` が**直接** import するもの（AST で走査する。§2.9）
 
-  | module | 使うもの | 使う所 |
-  |---|---|---|
-  | `training_entry` | `verify_training_dataset_v2`・`TrainingDatasetRefused` | §2.4 の 2 |
-  | `calibration_log` | `verify_training_calibration` | §2.4 の 3 |
-  | `declared_changes` | `read_declared_changes`（`DeclaredChangesInput` の `changes` と `file_sha256`）・`DeclaredChangesError` | §2.3 の `--declared-changes`・§2.7 |
-  | `metrics` | `MetricCatalog.from_yaml_with_sha256` | §2.3 の `--metrics-config`・§2.4 の 5 / 7・§2.7 |
-  | `store` | `QualityRules`（`model_validate` だけ。§2.7） | §2.3 の `--quality-config` |
-  | `ingest.calibration` | `Calibration.from_json_bytes` | §2.3 の `--calibration`・§2.4 の 3 / 5 / 7 |
-  | `control.model.counterfactual_training` | `verify_training_dataset_artifact_v2`・`train_counterfactual_ridge`・`CounterfactualTrainingSpec` | §2.4 の 1 / 5 |
-  | `control.model.counterfactual_confidence` | `seal_counterfactual_artifact` | §2.4 の 5 |
-  | `control.model.counterfactual` | `canonical_counterfactual_artifact_bytes`・`counterfactual_registry_metadata`・`counterfactual_registry_metadata_json_bytes`・`check_artifact_contents`・`RegistryCounterfactualThermalModel.from_verified_artifact` | §2.4 の 6 / 7 |
-  | `control.model.confidence` | `ConfidenceProfileSpec`（`SupportAxis` を含む） | §2.3 の `--training-spec` |
-  | `control.model.dataset` | `split_temporally_v2` | §2.4 の 4 |
-  | `control.model.training` | `split_sha256` | §2.7 |
-  | `control.model_registry` | `ModelRegistry`（`register_candidate`・`load_version`）・`ModelRegistryLimits`・`load_model_registry_limits`・`ArtifactMetadata`・`ModelRegistryError` とその派生（`RegistryDurabilityError` など） | §2.5 |
-  | `training_output` | 公開の手順・path の照合・印を確かめる関数（§2.5） | §2.5 |
-  | `dataset` | `_open_output_root` を公開にした関数だけ（§2.5 の手順 1） | §2.5 |
-  | `logs` | 構造化ログ | 全体 |
+  **許可の一覧**（`coldaisle` の中。§2 の手順と実在のコードを突き合わせて決めた）
 
-  実装の PR で、この一覧に無いものが要るとわかったら、PR の説明に足すものと理由を書き、試験の走査の許可の一覧と一緒に足す
+  | module | 根拠（§2 の手順 → 実在のコード） |
+  |---|---|
+  | `coldaisle.training_entry` | §2.4 の 2: `verify_training_dataset_v2`・`TrainingDatasetRefused` |
+  | `coldaisle.calibration_log` | §2.4 の 3: `verify_training_calibration` |
+  | `coldaisle.declared_changes` | §2.3 / §2.7: `read_declared_changes`（同じ bytes の `file_sha256` を返す）・`DeclaredChangesError` |
+  | `coldaisle.control.drift.model` | §2.3: `read_declared_changes` が返す `DeclaredChange` の型（`training_entry` が受け取る型。`control/drift` の中でこれだけ） |
+  | `coldaisle.metrics` | §2.3 / §2.4 の 5・7 / §2.7: `MetricCatalog.from_yaml_with_sha256` |
+  | `coldaisle.store`（読むだけの API） | §2.3 / §2.7: `QualityRules`（`model_validate`）。DB は `training_entry` が読み取り専用で開く |
+  | `coldaisle.ingest.calibration` | §2.3 / §2.7: `Calibration.from_json_bytes`（`ingest` の中でこれだけ。取り込みの Source は使わない） |
+  | `coldaisle.control.model.*` | §2.4 の 1・4〜7 / §2.7: `counterfactual_training`（`verify_training_dataset_artifact_v2`・`train_counterfactual_ridge`・`CounterfactualTrainingSpec`）・`counterfactual_confidence`（`seal_counterfactual_artifact`）・`counterfactual`（`CounterfactualThermalModelArtifact.model_validate_json`・`canonical_counterfactual_artifact_bytes`・`counterfactual_registry_metadata`・`counterfactual_registry_metadata_json_bytes`・`check_artifact_contents`・`RegistryCounterfactualThermalModel.from_verified_artifact`）・`calibration_digest`（`RuntimeCalibration`。読んだ `Calibration` から作る）・`confidence`（`ConfidenceProfileSpec`・`SupportAxis`）・`dataset`（`split_temporally_v2`）・`training`（`split_sha256`） |
+  | `coldaisle.control.schema` | §2.2: `AuthorityStage`（`authority_compatibility` を `(shadow,)` に固定する型。値の型だけ） |
+  | `coldaisle.control.model_registry` | §2.5: `ModelRegistry`（`register_candidate`・`load_version`）・`ModelRegistryLimits`・`ArtifactMetadata`・`ModelRegistryError` とその派生 |
+  | `coldaisle.training_output` | §2.5: 公開の手順・path の照合・印を確かめる関数 |
+  | `coldaisle.dataset` | §2.5 の手順 1: `_open_output_root` を公開にした関数 |
+  | `coldaisle.logs` | 構造化ログ |
+
+  `training_output.py` が import してよい `coldaisle` の module は無い（§2.5）。`coldaisle` の外は標準ライブラリ（下の禁止を除く）・
+  `pydantic`・`yaml` だけ。
+
+  **禁止の一覧**（直接 import したら試験が落ちる）: `coldaisle.control.loop`・`coldaisle.control.operating_mode`・
+  `coldaisle.control.authority`・`coldaisle.control.hardware`・`coldaisle.control.safety`・`coldaisle.control.reactive`・
+  `coldaisle.control.fallback`・`coldaisle.control.mpc`・`coldaisle.control.supervisor`・`coldaisle.control.rl`・
+  `coldaisle.control_daemon`・`coldaisle.learned_worker`・`coldaisle.learned_channel`・`coldaisle.control_admin`・
+  `coldaisle.authority_cli`・`coldaisle.event_entry`・`coldaisle.registry`（別の合成の起点）・`coldaisle.ai`・`coldaisle.api`・
+  `coldaisle.server`・`coldaisle.notify`・`serial`・`subprocess`・`ctypes`・`socket`。`coldaisle.control`（パッケージそのもの）も
+  禁止し、`coldaisle.control.<module>` の形で許可の一覧のものだけを import する（`coldaisle/control/__init__.py` は `loop`・
+  `hardware` などを再 export しているため）
+
+  **推移的な import は約束しない。** 実在のコードでは、許可した module を import するだけで禁止の module が読み込まれる:
+  `coldaisle.control.<module>` を読むと親の `coldaisle/control/__init__.py` が `loop`・`hardware`・`safety`・`mpc` などを
+  import し、`training_entry` は `daemon` を通じて `ai`・`notify` を import する（`training_entry` 自身が再生のために
+  `Daemon` を使う。0112 §2.3）。これは既存の構成で、本記録では変えない。約束は「`train.py` から禁止の module の機能を
+  **呼ぶ経路を書かない**」ことで、それを直接の import の走査で確かめる。LLM に依らないこと・Fan へ書かないことは、
+  `train.py` が `ai` / `notify` / `hardware` を呼ばないこと（直接の import が無ければ名前で呼べない）と、`training_entry` の
+  再生が通知・説明を渡さないこと（`verify_training_dataset_v2` の `Daemon(...)` は `source`・`store`・`normalizer`・`source_name`・
+  `dataset_run_alias` だけで作り、Notifier も Explainer も渡さない）で保つ
 - **LLM に依らない。** AI 層のツールにも読み取り API にも出さない（AGENTS.md ルール1。0062 §2.1 と同じ）
 - 0062 の `coldaisle-registry` には `register --training-output` を1つ足す（§2.5。既存の操作と引数は変えない）
 - **人が手で実行する。** systemd の timer やデーモンからは起動しない（本番のオンライン学習はしない。Q-25 は開いたまま
@@ -507,8 +524,11 @@ best-effort で `OSError` / `UnsafeRegistryPathError` を握る（`src/coldaisle
   （`RETIRED` の event が足されない）こと
 - `--apply` で `--registry-limits` が無い・不正だと、学習を始める前に終了コード 1 で拒否され、`--out` が作られず Registry が
   変わらないこと
-- import の走査: `train` を import する module が無いこと、`train` が §2.1 の禁止の module を import しないこと。
-  `training_output` を import するのが `train` と `registry` だけで、`training_output` が coldaisle の他の module を import しないこと
+- import の走査（AST で直接の import を読む）: `train` を import する module が無いこと。`train` の直接の import が §2.1 の
+  **許可の一覧**（`coldaisle.control.model.*` は前方一致）と標準ライブラリ・`pydantic`・`yaml` に収まり、**禁止の一覧**に1つも
+  当たらないこと（`import coldaisle.control` / `from coldaisle.control import ...` も禁止に当たること）。`training_output` を
+  import するのが `train` と `registry` だけで、`training_output` の直接の import に `coldaisle` の module が無いこと。推移的な
+  import は検査しない（§2.1）
 - `coldaisle-registry register --metadata/--payload` の拒否: 手順 3 の後・手順 5 の前（`COMPLETE.json` が無い・`artifact.json` と
   `metadata.json` は完成）の `--out` のファイルを渡すと終了コード 1 で Registry が変わらないこと。公開の後の `--out` でも拒むこと。
   `training-report.json` の無い別のディレクトリのファイルは従来どおり登録できること。手順 3 で `training-report.json` が最初に
