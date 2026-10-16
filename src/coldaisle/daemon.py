@@ -563,6 +563,7 @@ class Daemon:
                     dashboard_url=self._notifier.config.dashboard_url,
                     context=dict(self._latest_values),
                     names=self._names,
+                    reference=transition.reference,
                 )
             )
             if not sent:
@@ -854,7 +855,15 @@ def build(config: Config) -> Daemon:
         # ルールエンジンは**取り込みと同じプロセス・同じ時計**で動かす。
         # 継続時間の判定が実時間に依存すると、圧縮再生で検証できない
         # （決定記録 0007 §2.11 / §5 未決3）
-        engine=Engine(rules=rule_set, catalog=catalog, store=store, clock=clock),
+        engine=Engine(
+            rules=rule_set,
+            catalog=catalog,
+            store=store,
+            clock=clock,
+            # fand の decision trace は壁時計で書かれる。実時間の取り込みでだけ読む
+            # （決定記録 0148 §2.1）
+            read_control_traces=config.source != "replay" and config.speed == 1.0,
+        ),
         explainer_factory=_explainer_factory(config, rules, clock, exclusions),
         llm_exclusions=exclusions,
         notifier=Router(config=notify_config, notifiers=notifiers, clock=clock),
