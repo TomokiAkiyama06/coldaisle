@@ -72,8 +72,8 @@
   `learned_worker/cli.py` と認証ランナーは実装の PR で足す）。console script と同じ `main()`・引数・終了コード
 - argparse の `prog` は module のファイル名にならないよう明示する（`coldaisle-fand` / `coldaisle-learnd` / `coldaisle-hint-certify`）
 - console script（`.venv/bin/coldaisle-fand` など）は消さない（開発と手の試験で使う）。**本番の unit と手順には書かない**
-- 認証ランナーは、自分が `sys.flags.isolated` で、`__main__` が `-m` で起動された（`__main__.__spec__` がある）ことを確かめ、
-  そうでなければ何もせずに終了する（0152 §2.1 の `SCHED_IDLE` の確かめと同じ扱い）。人が console script で
+- 認証ランナーは、自分の `launch_form` が §2.3 の `isolated_module`（入口の module と `sys.orig_argv` の形を含む）で
+  あることを確かめ、そうでなければ何もせずに終了する（0152 §2.1 の `SCHED_IDLE` の確かめと同じ扱い）。人が console script で
   走らせても、本番と合わない証明書を作らない
 
 ### 2.2 部品 `environment` に「起動の形」と「`sys.path` の全項目」を足す
@@ -98,8 +98,18 @@
 
 ### 2.3 起動の形が違うプロセスは、指紋の不一致で B0 に倒れる
 
-- fand・worker は、起動時に自分の起動の形を閉じた語彙 `launch_form` で判定する: `isolated_module`（`sys.flags.isolated`
-  が真・`sys.flags.safe_path` が真・`__main__.__spec__` がある）か `other`
+- fand・worker は、起動時に自分の起動の形を閉じた語彙 `launch_form` で判定する: `isolated_module` か `other`。
+  `isolated_module` は次の**すべて**を満たすときだけ（どれか1つでも外れれば `other`）
+  1. `sys.flags.isolated` と `sys.flags.safe_path` が真
+  2. `__main__.__spec__` があり、その `name` が**そのプロセスの入口の module**（fand は `coldaisle.control_daemon`、
+     worker は `coldaisle.learned_worker.cli`、認証ランナーは段 2 で決める module）と一致する。入口の module 名は
+     各プロセスのコードが定数で持ち、設定から読まない（入口の識別であって閾値ではない）
+  3. `sys.orig_argv` が `[<sys.executable>, "-I", "-m", <入口の module>, ...]` の形で、`-m` の前に `-I` 以外の
+     interpreter の引数が無い。`-m` で別の module（計測用のラッパーなど）を起動し、その中から入口を呼ぶ形を
+     `isolated_module` と数えないため（`__main__.__spec__` があるだけでは、何かの module が `-m` で起動されたことしか言えない）
+- worker の Shadow solver の子（`multiprocessing` の spawn）は `-I -c` の spawn の形で起動されるので、上の 2・3 を当てない。
+  子は親の worker が `isolated_module` と判定したときだけ作られ（`other` の worker は子を作らずに `certification_mismatch`
+  を返す）、子自身は 1 と、§2.2 の `interpreter_flags` を含む指紋を計算して frame の期待値と比べる（0152 §2.6）
 - `other` のとき、指紋は計算しない。fand は 0152 §2.4 の手順 5 の部品 `environment` を不一致として扱い、
   `certification: environment_mismatch` で B0 に留まる（起動は止めない。0152 §2.4）。worker は Shadow solver の子が
   `certification_mismatch` を返す（0152 §2.6）。**`launch_form` で新しい失敗の理由は作らない**（既存の語彙に倒す）
@@ -184,6 +194,7 @@ fand は disabled のまま 0121 の試験中なので、`enable` の前に切�
 | site-packages は `RECORD` だけで束ね、中身を読まない（配布物の無い項目だけ中身を読む） | 読む量は減るが、`RECORD` に載らない `.pth`（site の処理で実行される）と、`RECORD` を変えない書き換えが残る（§5 の 2） |
 | console script のまま、`sys.path[0]` だけを指紋から除く | `PYTHONPATH` と user site の項目が残る。どの項目を除くかの規則がプロセスの起動の仕方に依る |
 | console script の shebang に `-I` を付ける | console script は `uv sync` が作り直す生成物で、手で直しても戻る。生成の設定に依る形を本番の前提にしない |
+| `launch_form` を `sys.flags.isolated` と `__main__.__spec__` の有無だけで判定する | `-I -m` で起動した別の module（計測用のラッパーなど）から入口を呼ぶ形も通る。同じ環境の中にあるコードなので指紋も合い、認証した起動の形と違う実行時が B1 に進みうる（PR #351 の Codex P2） |
 | `launch_form: other` に新しい失敗の理由を作る | 0152 §2.4 の閉じた語彙で足りる（`environment_mismatch`）。理由の細目はログの `launch_form` で分かる |
 
 ---
