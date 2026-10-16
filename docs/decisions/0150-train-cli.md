@@ -265,8 +265,8 @@ process が強制終了したとき（`SIGKILL`・電源断）は片づけられ
    `O_DIRECTORY | O_NOFOLLOW` で開き、path の照合（下記）が通ること・中が空であることを確かめる（差し替えの検知）。
    以後は fd（`dir_fd`）だけで書く
 3. 3つのファイルを `--out` の中へ `O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW` で書き、**それぞれ fsync** する。**順は
-   `training-report.json` を最初**にする（`artifact.json` があるときは必ず `training-report.json` もある。下の「`--metadata` /
-   `--payload` の経路」の判定に使う）
+   `training-report.json` を最初**にする（`artifact.json` があるときは必ず `training-report.json` もある。人が未完成の `--out` を
+   見たときの手がかり。`--metadata` / `--payload` の経路の拒否はこれに依らず中身で行う。下記）
 4. **完成の印を一時名で書く。** 3つのファイルの名前・大きさ・SHA-256 を、`--out` の中の一時名
    `.COMPLETE.json.tmp-<32 hex>` へ `O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW` で書き、fsync する。読む側はこの名前を見ない
 5. **link の直前に、path の照合（下記）で `--out` の path がまだ手順 2 で開いたディレクトリを指していることを確かめる。**
@@ -366,29 +366,30 @@ JSON として読めて、書かれた3つのファイルの大きさと SHA-256
     import しない（§2.1）ので、両方が既に import する `control/model_registry.py` に置く
   - 既存の `register --metadata/--payload`・`validate`・`promote` などの報告は本記録では変えない（同じ関数で分けられるが、
     それぞれの入口の記録で決める）
-- **`--metadata` / `--payload` の経路は、学習の出力のファイルを拒む。** 手順 3〜5 の間、`artifact.json` と `metadata.json` は
-  `COMPLETE.json` がまだ無いのに完成して checksum も合っていることがある。同じ uid が並行してこの経路で登録すると、公開の点より
-  前に candidate ができ、その後に印の作成が失敗すると `--out` は片づけられるのに Registry は変わったままになる。これは「脅威の
-  前提」の**同じ uid の誤った操作**に当たるので、安価な検査で止める: `register --metadata/--payload` は、`--payload` か
-  `--metadata` のファイルと同じディレクトリに `training-report.json` があれば（学習の出力のディレクトリ。手順 3 で最初に書く）、
-  `COMPLETE.json` の有無に依らず拒む。**判定は、実際に開いたファイルの項があるディレクトリで行う。** いまの `read_bounded`
-  （`src/coldaisle/registry.py`）は `path.open("rb")` で最後の要素の symlink もたどるので、学習の出力の外に置いた symlink を渡すと、
-  path の字面の隣を見る判定は symlink のあるディレクトリしか見ず、読むのは学習の出力の中の完成したファイルになる。そこで実装の
-  PR で、この2つの入力の読み方を次に変える（§5 の 14）: (1) 親のディレクトリを `O_RDONLY | O_DIRECTORY` で1回開く（親までの
-  symlink は今どおりたどる）→ (2) 最後の要素を `os.open(名前, O_RDONLY | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK, dir_fd=親)` で開き
-  （symlink なら `ELOOP` で拒否）、`fstat` で regular file であることを確かめ、その fd から上限＋1 byte だけを読む →
-  (3) 隣の `training-report.json` の有無を、同じ親の fd に対する `os.stat(..., dir_fd=親, follow_symlinks=False)` で確かめる。
-  開いた項と判定するディレクトリが同じ fd に束縛されるので、symlink で判定を外せない。hard link やコピーで別のディレクトリへ
-  置いたものは判定が効かないが、同じ uid の意図した操作として下の「欠点」と同じく前提の外とする。上の条件に当たれば
-  `COMPLETE.json` の有無に依らず拒み、`--training-output` を使うよう促して終了コード 1 で Registry を開かない。学習の出力は
-  `--training-output` の経路（印を確かめる）からだけ登録できる。RL policy など学習の CLI の外の artifact の登録は、最後の要素に symlink を渡さない限り変わらない（§5 の 14）。
-  - **推奨とした理由**: もう1つの案「書いている途中のファイルを一時名（`.artifact.json.partial` など）で置き、公開と同時か
-    直前に最終の名前へ移す」は、最終の名前へ移すのを印の link の前にすると窓が残り（移した後・link の前に同じ経路で登録
-    できる）、link の後にすると「印はあるがファイルが無い」公開の後の失敗の状態が増える。拒む案は公開の手順と状態を変えず、
-    登録できる経路を「印を確かめる経路」1つに絞れる
-  - 欠点: 学習の出力のファイルを別の場所へ写してから `--metadata` / `--payload` で渡すと、この判定は効かない。同じ uid の
-    意図した操作なので前提の外とする。写したものでも `register_candidate` は payload の SHA-256 を metadata と照合するので、
-    書きかけのファイルが黙って candidate になることは無い
+- **`--metadata` / `--payload` の経路は、学習の出力を拒む。判定はファイルの置き場所ではなく、読んだ bytes の中身で行う。**
+  手順 3〜5 の間、`artifact.json` と `metadata.json` は `COMPLETE.json` がまだ無いのに完成して checksum も合っていることがある。
+  同じ uid が並行してこの経路で登録すると、公開の点より前に candidate ができ、その後に公開の前の失敗で `--out` は片づけられるのに
+  Registry は変わったままになる。これは「脅威の前提」の**同じ uid の誤った操作**に当たるので、安価な検査で止める:
+  `register --metadata/--payload` は、読んだ metadata の bytes を `ArtifactMetadata` として検証した後、**`kind` が `thermal_model` で
+  `capability` が `counterfactual_action` なら**、Registry を開く前に終了コード 1 で拒み、`--training-output` を使うよう促す。
+  最初の版でこの組の artifact を作るのは `coldaisle-train` だけ（§2.2）なので、学習の出力は `--training-output` の経路（印を確かめる）
+  からだけ登録できる。RL policy・観測の再生の thermal model（v1）など、それ以外の artifact の登録は変わらない（§5 の 14）。
+  - **ファイルシステムの状態で判定しない理由。** 前の版の案（`--payload` / `--metadata` と同じディレクトリに `training-report.json`
+    があれば拒む）は、検査と登録の間に競合が残る: 経路が完成した `metadata.json` / `artifact.json` を読んで buffer に持った後、
+    書き手が公開の前の失敗の後始末で `training-report.json` を先に消すと、検査は「無い」と見て登録を続ける。後始末の順を変えても、
+    読む前・読んだ後の2回の検査にしても、書き手の手順 3 から後始末までが検査の間に収まれば同じことが起きる。symlink や hard link、
+    別の場所への写しでも外れる。中身の判定は読んだ bytes だけを見るので、ファイルシステムの競合・link・写しのどれにも依らない。
+    そのため前の版で足した「最後の要素を `O_NOFOLLOW` で開き、親の fd で `training-report.json` を確かめる」読み方の変更は要らず、
+    `read_bounded` の挙動（symlink をたどる）は変えない
+  - **推奨とした理由**（一時名の案と比べて）: もう1つの案「書いている途中のファイルを一時名（`.artifact.json.partial` など）で
+    置き、公開と同時か直前に最終の名前へ移す」は、最終の名前へ移すのを印の link の前にすると窓が残り（移した後・link の前に同じ
+    経路で登録できる）、link の後にすると「印はあるがファイルが無い」公開の後の失敗の状態が増える。中身で拒む案は公開の手順と
+    状態を変えず、登録できる経路を「印を確かめる経路」1つに絞れる
+  - 欠点: 反実仮想 thermal model を `coldaisle-train` の外で作って `--metadata` / `--payload` で登録する手段が無くなる
+    （`docs/model-registry.md` の反実仮想 artifact v2 の「登録」の段は `register --metadata` で登録すると書いているので、実装の PR で
+    `--training-output` へ書き換える）。将来ほかの作り手を足すなら、その記録でこの判定を見直す。学習の出力を改変して `kind` /
+    `capability` を変えたものは判定を外れるが、`register_candidate` は payload の SHA-256 を metadata と照合し、読み込み側の L5 が
+    artifact が決める metadata の全欄を照合する（0079 §2.3）ので、反実仮想 artifact として読まれることは無い
 - **確かめる関数の置き場所は、レイヤ横断の小さなモジュール `src/coldaisle/training_output.py`**（仮の名前）とする。
   印の形（`COMPLETE.json` の pydantic の型）・書く側の公開の手順（§2.5 の手順 2〜7）・path の照合の関数・読む側の確かめる関数
   （`O_DIRECTORY | O_NOFOLLOW` で開き、`dir_fd` で各ファイルを上限つきで読み、大きさと SHA-256 を照合して bytes を返す）を
@@ -628,12 +629,11 @@ best-effort で `OSError` / `UnsafeRegistryPathError` を握る（`src/coldaisle
   当たらないこと（`import coldaisle.control` / `from coldaisle.control import ...` も禁止に当たること）。`training_output` を
   import するのが `train` と `registry` だけで、`training_output` の直接の import に `coldaisle` の module が無いこと。推移的な
   import は検査しない（§2.1）
-- `coldaisle-registry register --metadata/--payload` の拒否: 手順 3 の後・手順 5 の前（`COMPLETE.json` が無い・`artifact.json` と
-  `metadata.json` は完成）の `--out` のファイルを渡すと終了コード 1 で Registry が変わらないこと。公開の後の `--out` でも拒むこと。
-  `training-report.json` の無い別のディレクトリのファイルは従来どおり登録できること。手順 3 で `training-report.json` が最初に
-  書かれること。学習の出力の外に置いた、学習の出力の中の `artifact.json` / `metadata.json` への **symlink** を `--payload` /
-  `--metadata` に渡すと（`COMPLETE.json` の前でも後でも）終了コード 1 で Registry が変わらないこと。symlink のディレクトリを
-  親に持つ path（`<symlink のディレクトリ>/artifact.json`）でも、開いた親の fd で `training-report.json` を見つけて拒むこと
+- `coldaisle-registry register --metadata/--payload` の拒否: `kind` = `thermal_model`・`capability` = `counterfactual_action` の
+  metadata は、手順 3 の後・手順 5 の前（`COMPLETE.json` が無い）の `--out` のファイルでも、公開の後の `--out` でも、別の場所への
+  写し・symlink・hard link でも終了コード 1 で Registry を開かず変わらないこと。読みの後に `training-report.json` などを消しても
+  結果が変わらないこと（判定がファイルシステムの状態を見ないこと）。RL policy と観測の再生の thermal model（v1）は従来どおり登録
+  できること。`--metadata` / `--payload` の読み方（`read_bounded`）が変わらないこと
 - Dataset の読み込み（§2.4 の 1）: `load_training_dataset_artifact_v2` が `coldaisle-dataset` の公開物から、
   `verify_training_dataset_artifact_v2` と同じ束縛（`artifact_id`・`manifest_sha256`・`examples_sha256`）を返すこと。
   `examples.jsonl` が上限＋1 byte・manifest の `examples_sha256` と違う・canonical でない行（空白や鍵の順を変えた同じ値）・
@@ -713,4 +713,4 @@ best-effort で `OSError` / `UnsafeRegistryPathError` を握る（`src/coldaisle
 | 11 | （申し送り）Registry の登録の失敗で、参照されない artifact のファイルが残りうる（`_remove_artifact_if_unreferenced` が best-effort）。`coldaisle-registry` に片付けの入口は無い | **本記録では扱わない**（Registry の書き方と片付けは 0062 / 0104 の範囲）。必要なら Registry の片付けの入口を別の記録で決める | — |
 | 12 | 設定の入力（§2.7 の6つ）を読む上限の値と置き場所。**決定済み（所有者、2026-10-16）: 推奨のとおり** | **`train.py` の構造上の定数 `MAX_TRAINING_CONFIG_BYTES = 1 MiB`**（6つに共通）。運用の閾値ではなくメモリを守る構造上の上限で、既存の `MAX_ARTIFACT_BYTES`（`control/model/thermal.py`）・`_MAX_JOURNAL_BYTES`（`control/authority.py`）・`MAX_DECLARED_CHANGES` と同じ扱い。いまの設定は数 KB で、宣言の YAML も `MAX_DECLARED_CHANGES` = 64 件に収まる。利点: `--apply` の無い実行でも追加の設定が要らず、上限を決めるファイル自身の読みに上限が要るという循環が無い | (a) `--registry-limits` を常に必須にし、その `max_snapshot_bytes` を使う（0062 §2.1 と同じ値）。欠点: `--out` だけの実行にも Registry の設定が要り、`model-registry.yaml` 自身は別の上限で読む必要が残る。(b) `--training-spec` に置く。欠点: spec 自身の読みに上限が要る |
 | 13 | macOS の `/tmp`・`/var` など、OS が置く symlink を含む `--out`。**決定済み（所有者、2026-10-16）: 推奨のとおり** | **受け入れない**（§2.5 の「path の照合」）。symlink を含まない実の path（`/private/tmp/...`）を人が渡し、CLI は拒否のログでそれを示す。利点: 解く処理が無く、照合の窓が増えない・Dataset の writer（`_open_output_root`）と挙動が揃う・OS ごとの分岐が無い（NFR-07） | (a) root の所有の `/` の中の root の所有の symlink（`/tmp`・`/var`・`/etc`）だけを、`fstat` と `readlink` で確かめて一度だけ解き、先を fd で開いて照合を続ける。欠点: 別名の一覧（macOS の分岐）を持つ・Ubuntu の CI では模してしか試験できない |
-| 14 | 既存の `coldaisle-registry register --metadata/--payload` が最後の要素の symlink をたどって読む挙動 | **拒否する**（§2.5。親の fd を1回開き、最後の要素を `O_NOFOLLOW` で開く。学習の出力の判定を開いた項のディレクトリに束縛する）。既存の入口を狭める変更で、RL policy などの登録で `--payload` に symlink を渡していた運用は、実のファイルを渡す形に変わる | (a) symlink を許したまま、開いた fd の `(st_dev, st_ino)` と、隣の `artifact.json` / `metadata.json` の `fstat` を比べる。欠点: 実の親を fd から得る手段が OS ごとに違い（Linux の `/proc/self/fd`・macOS の `F_GETPATH`）、NFR-07 に反する |
+| 14 | 既存の `coldaisle-registry register --metadata/--payload` で、学習の出力（書きかけを含む）を登録させない方法 | **読んだ metadata の中身で拒む**（`kind` = `thermal_model` かつ `capability` = `counterfactual_action` なら拒否し `--training-output` を促す。§2.5）。ファイルシステムの競合・symlink・link・写しに依らない。`read_bounded` の読み方は変えない。欠点: 反実仮想 thermal model をこの経路で登録できなくなる（いまの作り手は `coldaisle-train` だけ）・`docs/model-registry.md` の登録の段を書き換える | (a) 同じディレクトリの `training-report.json` で判定し、最後の要素を `O_NOFOLLOW` で開いて親の fd に束縛する（前の版の案）。欠点: 読んだ後に書き手の後始末が `training-report.json` を消すと検査を外れる競合が残る・hard link と写しで外れる。(b) 書き手の後始末と legacy の読みを lock で直列にする。欠点: 新しい lock の file と順序の約束が要り、強制終了の後の lock の扱いも決める必要がある |
