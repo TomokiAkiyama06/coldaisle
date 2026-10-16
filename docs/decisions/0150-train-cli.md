@@ -145,7 +145,7 @@ process が強制終了したとき（`SIGKILL`・電源断）は片づけられ
 | 公開の後・**`--out` の名前の差し替え**（手順 6 の後の照合、または `--apply` の登録の直前の照合） | 1 | 書き手の完成した出力（どこかの名前の下）と、`--out` の名前の先の別のもの。**登録しない**（Registry は変わらない） | ログに段 `out_replaced` と2つの `(st_dev, st_ino)` を出す。成功を報告しない。人が確かめ、完成した出力を `coldaisle-registry register --training-output` で確かめてから使うか、消して作り直す |
 | 公開の前の強制終了（`SIGKILL`・電源断） | — | **`COMPLETE.json` の無い `--out`**（中のファイルは途中まで。印の一時名が残ることもある）。link の後・`--out` の fsync の前の電源断でも、link が永続でなければこの状態に戻りうる | 再実行は `--out` があるので拒否され、そのとき `--out` に有効な完成の印が無いことをログに出す。人が確かめて `--out` を消し、同じ引数で再実行する。CLI は自動では消さない（自分が作ったものか確かめられないため） |
 | 公開の後・一時名の unlink と `--out` と親の fsync の失敗（公開の手順 6。`--apply` の有無に依らない） | 1 | `--out`（3ファイルと有効な `COMPLETE.json`。中身はすべて fsync 済みで、永続でないのはディレクトリの項だけ。unlink の失敗なら印の一時名も残るが、確かめる関数は見ない）。`--apply` なら Registry へは進まない | ログに段 `publish_durability` と `--out` の path を出す。中身は完成しているので、そのまま使ってよい（`--apply` なら `coldaisle-registry register --training-output <--out>` で登録する）。電源断の後に `--out` が無い・印が無効なら、消して同じ引数で再実行する（その前に並行の `register` で同じ版の candidate が登録されていれば、Registry 側の bytes は Registry が fsync している。`coldaisle-registry status` で確かめ、あれば作り直さない） |
-| 公開の後・Registry の登録の失敗（lock・revision・同じ版が登録済み・権限・limits、および artifact ファイルの段の `RegistryDurabilityError`） | 1 | `--out`（3ファイルと完成の印）。Registry は変わらない（登録の確定点の前） | `coldaisle-registry register --training-output <--out>` で登録する。同じ版が登録済みなら `--model-version` を上げて別の `--out` で作り直す |
+| 公開の後・Registry の登録の失敗（lock・revision・同じ版が登録済み・権限・limits、および artifact ファイルの段の `RegistryDurabilityError`） | 1 | `--out`（3ファイルと完成の印）。`registry.json` と参照される artifact は変わらない（登録の確定点の前）。artifact を置いた後の失敗では、**参照されない artifact のファイル**（`artifacts/thermal_model/<model_id>/<version>/`）が残りうる（`register_candidate` の片付けは best-effort） | `coldaisle-registry register --training-output <--out>` で登録する（同じ版の再登録は残った artifact を同じ path へ `os.replace` で上書きするので妨げられない）。登録しないまま残った参照されない artifact は、`coldaisle-registry` に片付けの入口が無いので、人が `coldaisle-registry status` で参照されていないことを確かめてから消す。同じ版が登録済みなら `--model-version` を上げて別の `--out` で作り直す |
 | 登録は確定したが永続が確かでない（`registry.json` の置き換えの後の `RegistryDurabilityError`。下記） | 1 | `--out` と、Registry の **candidate**（見えている。production は動かない） | CLI はそのまま**登録の後の検査（`load_version` と L1〜L12）へ進む**。検査が通ってもログに段 `register_durability` を出して終了コード 1。人は `coldaisle-registry status` で candidate があることを確かめる。電源断の後に無くなっていたら、`coldaisle-registry register --training-output <--out>` で登録する。**もう一度 `coldaisle-train --apply` で登録し直さない**（見えている間は「既にある」になる） |
 | 登録の後・**`--out` の名前の差し替え**（登録の直後の path の照合。登録の直前の照合の後に祖先などの名前が付け替えられた） | 1 | Registry の **candidate**（登録済み。production は動かない。中身は検査済みの bytes で正しい）と、書き手の完成した出力（どこかの名前の下）。`--out` の path は別のものを指す | ログに段 `out_replaced_after_register`・登録した artifact の key（`model_id` と version）・理由（照合で得た2つの `(st_dev, st_ino)`、path が無い・symlink を含む、の別）を出す。成功を報告しない。人が `coldaisle-registry status` で candidate を確かめ、付け替えの経緯を調べて、使わないなら既存の入口 `coldaisle-registry retire` で外す。CLI は自分で `retire` しない。登録の後の L1〜L12 の検査はこの場合も行い、結果をログに出す |
 | 公開の後・**`--out` の中身の書き換え**（手順 6 の後・登録の前または成功の報告の前の再検証で、`COMPLETE.json` か3つのファイルが印やメモリ上の bytes と違う） | 1 | 書き換えられた `--out`。**登録しない**（Registry は変わらない） | ログに段 `out_modified` と、違ったファイルの名前・期待した SHA-256・実際の SHA-256 を出す。成功を報告しない。人が誰が書いたかを確かめ、`--out` を消して別の `--out` で作り直す |
@@ -224,15 +224,20 @@ process が強制終了したとき（`SIGKILL`・電源断）は片づけられ
    後始末の失敗（`unlink` / `rmdir` の `errno` と、`--out` に残った名前の一覧）を構造化ログに出し、段 `cleanup_failed` で
    終了コード 1 にする（§2.4 の表）。`suppress(OSError)` で黙って捨てない（AGENTS.md「例外を握りつぶさない」）
 
-**path の照合（`training_output.py` の関数。仮に `path_names_directory(path, fd)`）。** `--out` の**絶対 path を根から1要素ずつ
-解き直す**: `/` から各要素を `os.lstat`（symlink に従わない）で調べ、途中の要素が symlink なら不一致とし、ディレクトリなら次へ
-進む。最後の要素の `(st_dev, st_ino)` が、固定した fd の `fstat` と一致するときだけ一致とする（path が無い・symlink を含む・
-別のものを指す、はすべて不一致）。親の fd や祖先の fd を使わないので、開いた後に祖先や親の名前が付け替えられても、いまの path が
-指すものと比べられる。
+**path の照合（`training_output.py` の関数。仮に `path_names_directory(path, fd)`）。** `--out` の**絶対 path を根から1要素ずつ、
+ディレクトリの fd でたどり直す**: `os.open("/", O_RDONLY | O_DIRECTORY | O_NOFOLLOW)` から始め、各要素（最後の `--out` も）を
+`os.open(名前, O_RDONLY | O_DIRECTORY | O_NOFOLLOW, dir_fd=ひとつ前の fd)` で開いては前の fd を閉じる。最後に開いた fd の
+`fstat` の `(st_dev, st_ino)` が、手順 2 で固定した fd の `fstat` と一致するときだけ一致とする。途中か最後の要素が symlink なら
+`ELOOP`、ディレクトリでなければ `ENOTDIR`、無ければ `ENOENT` で開けず、すべて不一致とする。path の文字列を毎回根から解かせる
+`os.lstat` の連続は使わない: ある祖先を確かめた後にそれが symlink へ差し替えられると、後の要素の `lstat` がその symlink を
+たどってしまい、差し替えを見逃す（例: `/tmp/a` を確かめた後に `/tmp/a` を `a-old` への symlink に替えると、`/tmp/a/out` の
+`lstat` は `a-old/out` を見て一致と報告する）。fd でたどれば、各段で開いたものそのものから次を開くので、その時点の path の
+各要素が symlink でないディレクトリであることと、最後がいまの path の指すものであることを1回のたどりで確かめられる。
+いずれも POSIX で共通の操作で、NFR-07 を変えない。手順 1 で開いた親や祖先の fd は使い回さない（開いた後の付け替えを見るため）。
 
 - **選んだ方式と理由。** 「祖先をすべて、所有者と権限で確かめる」案もあるが採らない。`/tmp` のような sticky で world が書ける
   祖先の下の普通の置き場所まで拒むことになり、どこまでの祖先を信じるか（root の所有なら可、など）の規則も別に要る。path を
-  根から解き直して inode を比べるほうが単純で、置き場所を狭めずに「要求した path がいま書き手の出力を指しているか」を
+  根から fd でたどり直して inode を比べるほうが単純で、置き場所を狭めずに「要求した path がいま書き手の出力を指しているか」を
   直接確かめられる。**ただし照合は時点の確認で、照合と次の操作（link・登録）の間の窓は閉じない。** とくに登録の直前の照合の
   後・`register_candidate` の前に祖先の名前を付け替えられると、登録を防げない。そこで本記録は「差し替えの後の登録を防ぐ」とは
   約束せず、**登録の後にもう一度 path を照合し、外れていれば必ず失敗として報告する**ことを約束する（段
@@ -371,7 +376,12 @@ coldaisle-authority raise          → authority を1段   （承認者の uid�
 `tmp_path` と、既存の `tests/test_training_entry.py` の合成の dataset の作り方を使う。`@pytest.mark.hardware` は付けない。
 
 **Registry の状態の検査は、変わったものと変わらなかったものの両方を言う。** 下の「Registry が変わらない」は、`registry.json` の
-bytes が前と同じで、`artifacts/` の下にファイルが増えていないことをいう。「candidate が1つ足される」は、`register_candidate` の
+bytes が前と同じで、`artifacts/` の下にファイルが増えていないことをいう（`register_candidate` を呼ぶ前に止まる場合）。
+「登録が確定しない」は、`register_candidate` を呼んで確定点（`registry.json` の置き換え）の前に失敗した場合で、`registry.json`
+の bytes と、**参照される** artifact のファイルが前と同じであることをいう。このとき**参照されない artifact のファイルが残ることは
+ありうる**: artifact を置いた後に失敗すると `register_candidate` は `_remove_artifact_if_unreferenced` で消そうとするが、これは
+best-effort で `OSError` / `UnsafeRegistryPathError` を握る（`src/coldaisle/control/model_registry.py`）。既存の Registry の性質で、
+本記録では変えない（§5 の 11）。「candidate が1つ足される」は、`register_candidate` の
 約束（`src/coldaisle/control/model_registry.py` の `register_candidate` と `_append_event`）どおり、前の snapshot と比べて
 (1) `revision` がちょうど 1 増え、(2) `artifacts` に新しい key が1つだけ足されて状態が `candidate`・metadata が `metadata.json`
 と同じで、(3) `audit` の末尾に `REGISTERED` の event が1つだけ足され（`revision`・`artifact`・`actor`・`reason` が一致）、
@@ -394,8 +404,10 @@ bytes が前と同じで、`artifacts/` の下にファイルが増えていな�
   使わないこと（差し替えて呼ばれないことを確かめる）
 - 親の検査（`_open_output_root` の使い回し）: `--out` の親が group / world に書ける・他の uid の所有・path に symlink がある・
   `..` を含む・無いとき、学習の前に終了コード 1 で拒否し、`--out` が作られないこと
-- path の照合: `--out` の名前だけでなく、**親や祖先の名前を付け替えて**同じ path に別のディレクトリを置いたとき・path の途中を
-  symlink に差し替えたときも不一致になること（親の fd を使った照合では見逃す形を試す）。`/tmp` の下（sticky・world が書ける
+- path の照合: `--out` の名前だけでなく、**親や祖先の名前を付け替えて**同じ path に別のディレクトリを置いたとき・path の途中の
+  要素を、元のディレクトリ（付け替えた先）への **symlink** に差し替えたとき（例: `/tmp/a` を `a-old` に名前を変え `/tmp/a -> a-old`
+  を置く。`lstat` の連続や親の fd を使った照合では一致と見逃す形）・最後の `--out` を symlink にしたときも、`ELOOP` / `ENOTDIR` /
+  `ENOENT` で不一致になること。`os.lstat` を使わず `O_NOFOLLOW` の `os.open` でたどっていること（差し替えて確かめる）。`/tmp` の下（sticky・world が書ける
   祖先）の `--out` を拒まないこと。`coldaisle-registry register --training-output` でも、印を確かめた後・登録の前に親の名前を
   付け替えると終了コード 1 で Registry が変わらないこと。`register_candidate` の呼び出しを包んで**登録の直後**に親の名前を
   付け替えると、candidate が1つ足され（上の (1)〜(4)）、その bytes が印を確かめた bytes と同じで、段
@@ -417,8 +429,9 @@ bytes が前と同じで、`artifacts/` の下にファイルが増えていな�
   `publish_durability`・`--out` が3ファイルと有効な印つきで残ること。`--apply` なら Registry が変わらないこと（登録へ進まない）
 - 登録の `RegistryDurabilityError` の2つの意味: snapshot の置き換えの後で起こしたとき（ディレクトリの fsync を失敗させる）は
   candidate が1つ足されていて（上の (1)〜(4)）、登録の後の検査へ進み、段 `register_durability` で終了コード 1。artifact ファイルの
-  段で起こしたときは Registry が変わらず（参照されない artifact も残らない）、段 `register` で終了コード 1
-- 公開の後の失敗: 登録の失敗では終了コード 1・段 `register`・`--out` が残り Registry が変わらないこと。登録の後の検査の失敗では
+  段で起こしたときは登録が確定せず（`registry.json` と参照される artifact は同じ。片付けが成功すれば参照されない artifact も
+  残らず、片付けも失敗させると参照されない artifact が残りうることを、どちらも確かめる）、段 `register` で終了コード 1
+- 公開の後の失敗: 登録の失敗では終了コード 1・段 `register`・`--out` が残り、登録が確定しないこと。登録の後の検査の失敗では
   終了コード 1・段 `post_register_check`・`--out` が残り、candidate が1つ足されたまま（上の (1)〜(4)）で、CLI が `retire` しない
   （`RETIRED` の event が足されない）こと
 - `--apply` で `--registry-limits` が無い・不正だと、学習を始める前に終了コード 1 で拒否され、`--out` が作られず Registry が
@@ -485,3 +498,4 @@ bytes が前と同じで、`artifacts/` の下にファイルが増えていな�
 | 8 | `--code-commit` | **`--apply` のときだけ必須**、`--out` だけなら任意 | (a) 常に任意（Registry の `code_commit` は `null` を許す）。(b) 常に必須 |
 | 9 | （申し送り）`write_dataset` にも、確認と `os.rename` の間に作られた空のディレクトリを置き換える同じ窓がある | **本記録では扱わない。** 直すなら 0031 §3（macOS / Ubuntu 共通の `os.rename`）を置き換える別の決定記録で扱う | — |
 | 10 | `--out` の公開の手段（NFR-07「macOS / Ubuntu 双方で動作。OS依存はシリアルデバイス検出のみに閉じる」との関係） | **(A) OS に依らない手順**（§2.5 の本文）。`os.mkdir` で `--out` を排他的に確保し、中に書いてから完成の印を一時名で書いて fsync し、`os.link` で `COMPLETE.json` として公開する（既にあれば失敗）。利点: POSIX 共通の操作だけで NFR-07 を変えない・ctypes も OS の分岐も要らず CI（Ubuntu）で全経路を実物で試験できる・`mkdir` の排他で置き換えの窓が無い（前回の指摘を満たす）・0031 §3 の「共通の POSIX の操作だけ」と一貫する。欠点: 強制終了の後に `COMPLETE.json` の無い `--out` が残り、人が消すまで再実行できない・読む側が印を確かめる必要がある（新しい `coldaisle-registry register --training-output` は Registry を開く前に `COMPLETE.json` を確かめる。印を見ないのは既存の `--metadata` / `--payload` の経路だけで、その経路も `register_candidate` の checksum で書きかけを拒む） | (B) NFR-07 を変えて OS ごとの置き換えない rename を使う（Linux `renameat2(RENAME_NOREPLACE)`・macOS `renameatx_np(RENAME_EXCL)`・使えなければ失敗。ctypes の小さな関数1つ）。NFR-07 の「OS依存はシリアルデバイス検出のみに閉じる」を「…シリアルデバイス検出と、決定記録 0150 の出力の公開（置き換えない rename）に閉じる」へ変え、同じ PR で `docs/requirements.md` を直す。利点: `--out` は「無い」か「完成」のどちらかで、強制終了の後に残るのは隠れた一時ディレクトリだけ・読む側に印の確認が要らない。欠点: 要件を変える・macOS の分岐は Ubuntu の CI では差し替えでしか試験できない・ファイルシステムが対応しないと使えない・0031 §3 の writer（共通の `os.rename`）と手段が分かれる |
+| 11 | （申し送り）Registry の登録の失敗で、参照されない artifact のファイルが残りうる（`_remove_artifact_if_unreferenced` が best-effort）。`coldaisle-registry` に片付けの入口は無い | **本記録では扱わない**（Registry の書き方と片付けは 0062 / 0104 の範囲）。必要なら Registry の片付けの入口を別の記録で決める | — |
