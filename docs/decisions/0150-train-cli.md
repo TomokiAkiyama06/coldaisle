@@ -140,13 +140,15 @@ process が強制終了したとき（`SIGKILL`・電源断）は片づけられ
 |---|---|---|---|
 | 公開の前（検査・学習・公開の手順 1〜5 の例外。`os.link` の失敗を含む）で、後始末が成功 | 1 | 何も残らない（作った `--out` を片づけた） | 原因を直して同じ引数で再実行 |
 | 公開の前の失敗で、**後始末が失敗**（例: 手順 5 の `EEXIST`。他の process が `--out` に `COMPLETE.json` を置いたため、既知の名前だけを消した後の `rmdir` が `ENOTEMPTY`） | 1 | **未完成の `--out`**（書き手の既知の名前は消せた分だけ消え、知らない名前が残る）。書き手は公開していない | ログに段 `cleanup_failed`・元の失敗の理由・後始末の例外（`errno`）・`--out` に残った名前の一覧を出す（元の例外は原因として残し、後始末の例外は隠さない）。人は、残った `COMPLETE.json` などが誰のものかを確かめ、`coldaisle-registry status` でそれを使った candidate が登録されていないことを見てから `--out` を消し、同じ引数で再実行する。CLI は知らない名前を消さない |
+| 公開の前・**`--out` の名前の差し替え**（手順 5 の link の前の照合で、名前が無いか別のものを指す） | 1 | 書き手のディレクトリ（中の既知の名前は fd で消した。名前の付け替えで別の場所にあれば空のまま残る）と、`--out` の名前の先にある別のもの（書き手は触らない） | ログに段 `out_replaced`・手順 2 で開いた `(st_dev, st_ino)`・いま名前が指す `(st_dev, st_ino)`（あれば）を出す。親は §2.5 の手順 1 の検査で書き手の uid だけが書けるので、起きたなら同じ uid か root の操作である。人が親の中を確かめ、書き手のディレクトリ（空）を消し、`--out` の名前の先を調べてから再実行する |
+| 公開の後・**`--out` の名前の差し替え**（手順 6 の後の照合、または `--apply` の登録の直前の照合） | 1 | 書き手の完成した出力（どこかの名前の下）と、`--out` の名前の先の別のもの。**登録しない**（Registry は変わらない） | ログに段 `out_replaced` と2つの `(st_dev, st_ino)` を出す。成功を報告しない。人が確かめ、完成した出力を `coldaisle-registry register --training-output` で確かめてから使うか、消して作り直す |
 | 公開の前の強制終了（`SIGKILL`・電源断） | — | **`COMPLETE.json` の無い `--out`**（中のファイルは途中まで。印の一時名が残ることもある）。link の後・`--out` の fsync の前の電源断でも、link が永続でなければこの状態に戻りうる | 再実行は `--out` があるので拒否され、そのとき `--out` に有効な完成の印が無いことをログに出す。人が確かめて `--out` を消し、同じ引数で再実行する。CLI は自動では消さない（自分が作ったものか確かめられないため） |
 | 公開の後・一時名の unlink と `--out` と親の fsync の失敗（公開の手順 6。`--apply` の有無に依らない） | 1 | `--out`（3ファイルと有効な `COMPLETE.json`。中身はすべて fsync 済みで、永続でないのはディレクトリの項だけ。unlink の失敗なら印の一時名も残るが、確かめる関数は見ない）。`--apply` なら Registry へは進まない | ログに段 `publish_durability` と `--out` の path を出す。中身は完成しているので、そのまま使ってよい（`--apply` なら `coldaisle-registry register --training-output <--out>` で登録する）。電源断の後に `--out` が無い・印が無効なら、消して同じ引数で再実行する（その前に並行の `register` で同じ版の candidate が登録されていれば、Registry 側の bytes は Registry が fsync している。`coldaisle-registry status` で確かめ、あれば作り直さない） |
 | 公開の後・Registry の登録の失敗（lock・revision・同じ版が登録済み・権限・limits、および artifact ファイルの段の `RegistryDurabilityError`） | 1 | `--out`（3ファイルと完成の印）。Registry は変わらない（登録の確定点の前） | `coldaisle-registry register --training-output <--out>` で登録する。同じ版が登録済みなら `--model-version` を上げて別の `--out` で作り直す |
 | 登録は確定したが永続が確かでない（`registry.json` の置き換えの後の `RegistryDurabilityError`。下記） | 1 | `--out` と、Registry の **candidate**（見えている。production は動かない） | CLI はそのまま**登録の後の検査（`load_version` と L1〜L12）へ進む**。検査が通ってもログに段 `register_durability` を出して終了コード 1。人は `coldaisle-registry status` で candidate があることを確かめる。電源断の後に無くなっていたら、`coldaisle-registry register --training-output <--out>` で登録する。**もう一度 `coldaisle-train --apply` で登録し直さない**（見えている間は「既にある」になる） |
 | 登録の後・`load_version` と L1〜L12 の検査の失敗 | 1 | `--out` と、Registry の **candidate**（production は動かない） | ログに artifact の key と `--out` の path を出す。人が原因を確かめ、`coldaisle-registry retire` で candidate を退ける。CLI は `retire` しない |
 
-構造化ログには失敗した段（`before_publish` / `cleanup_failed` / `publish_durability` / `register` / `register_durability` /
+構造化ログには失敗した段（`before_publish` / `cleanup_failed` / `out_replaced` / `publish_durability` / `register` / `register_durability` /
 `post_register_check`）を必ず出し、どの行に当たるかを人が取り違えないようにする。
 
 ### 2.5 出力と、既定では Registry を書かないこと
@@ -164,7 +166,12 @@ process が強制終了したとき（`SIGKILL`・電源断）は片づけられ
 **推奨案（§5 の 10 の (A)）で書く。** 使うのは macOS / Ubuntu で共通の POSIX の操作だけで、OS ごとの関数を呼ばない
 （NFR-07 を変えない）。
 
-1. `--out` の親を `O_DIRECTORY | O_NOFOLLOW` で開く
+1. **`--out` の親を、Dataset の writer と同じ検査で開く。** 既存の `dataset._open_output_root`（`src/coldaisle/dataset.py`）を
+   使い回す: path の各要素を `/` から symlink に追従せず（`O_DIRECTORY | O_NOFOLLOW`）`dir_fd` でたどって開き（無い要素は `0700` で作る。Dataset の writer と同じ）、`..` を拒み、
+   開いた親が**実行した uid の所有で、group / world が書けない**ことを確かめる（外れれば `PermissionError` で拒否）。0700 は
+   ディレクトリの中身を守るが名前は守らないので、親に書ける別のユーザーが作ったばかりの `--out` の名前を付け替えて差し替える
+   ことを、この検査で親に書ける者を書き手（と root）に限って防ぐ。実装の PR ではこの非公開の関数を公開の関数にして
+   `train.py` から呼ぶ（挙動は変えない。0031 §3 は置き換えない。手順を写して2つにしない）
 2. **`os.mkdir(--out の名前, 0o700, dir_fd=親)` で `--out` を排他的に確保する。** 既にあれば `EEXIST` で拒否する。`mkdir` は
    POSIX で原子的で、既にあるもの（他の process が作った空のディレクトリを含む）を**置き換えない**。「既にある出力は必ず拒む」
    の正しさはこの1手が持ち、確認と公開の間の窓（rename による置き換え）がそもそも無い。作った直後に `--out` を
@@ -173,14 +180,19 @@ process が強制終了したとき（`SIGKILL`・電源断）は片づけられ
 3. 3つのファイルを `--out` の中へ `O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW` で書き、**それぞれ fsync** する
 4. **完成の印を一時名で書く。** 3つのファイルの名前・大きさ・SHA-256 を、`--out` の中の一時名
    `.COMPLETE.json.tmp-<32 hex>` へ `O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW` で書き、fsync する。読む側はこの名前を見ない
-5. **`os.link(一時名, "COMPLETE.json", src_dir_fd=--out, dst_dir_fd=--out, follow_symlinks=False)` で印を公開する。**
+5. **link の直前に、`--out` の名前がまだ開いたディレクトリを指していることを確かめる**: `os.stat(--out の名前, dir_fd=親,
+   follow_symlinks=False)` の `(st_dev, st_ino)` が、手順 2 で開いた fd の `fstat` と同じであること。違えば（名前が無い・別の
+   ものを指す）失敗にし、段 `out_replaced` で終了コード 1（§2.4 の表）。そのうえで
+   **`os.link(一時名, "COMPLETE.json", src_dir_fd=--out, dst_dir_fd=--out, follow_symlinks=False)` で印を公開する。**
    `link` は既にある名前を置き換えず `EEXIST` で失敗する（POSIX 共通。NFR-07 を変えない）。**この link が公開の確定点**で、
    `COMPLETE.json` は中身が fsync 済みの状態でだけ名前として現れる。`O_CREAT` で直接作ると、中身を書いて fsync するまでの間に
    名前が見えて、並行する `register --training-output` が確かめて登録したのに書き手が後で片づける、という食い違いが起きる
 6. 一時名を unlink し、`--out` を fsync し、親を fsync する（`COMPLETE.json` の項と `--out` の項を永続にする）。ここでの失敗は
-   公開の**後**の失敗（§2.4 の表）で、片づけない
+   公開の**後**の失敗（§2.4 の表）で、片づけない。fsync の後にもう一度、手順 5 と同じ `(st_dev, st_ino)` の照合をする。違えば
+   段 `out_replaced` で終了コード 1 にし、成功を報告しない
 7. 手順 2〜5 で例外が起きたとき（link の失敗を含む）は、自分で作った `--out` の中の**既知の名前だけ**（3つのファイル・
-   印の一時名）を unlink し、`--out` を rmdir する（手順 2 で確かめた `(st_dev, st_ino)` と同じときだけ）。知らない名前
+   印の一時名）を開いた fd（`dir_fd`）で unlink し、`--out` を rmdir する（rmdir は名前で行うので、その直前に名前が手順 2 で
+   確かめた `(st_dev, st_ino)` と同じときだけ。違えば rmdir せず段 `out_replaced`）。知らない名前
    （他の process が置いた `COMPLETE.json` など）は消さない。後始末の例外は**握りつぶさない**: 元の例外を原因として保ったまま、
    後始末の失敗（`unlink` / `rmdir` の `errno` と、`--out` に残った名前の一覧）を構造化ログに出し、段 `cleanup_failed` で
    終了コード 1 にする（§2.4 の表）。`suppress(OSError)` で黙って捨てない（AGENTS.md「例外を握りつぶさない」）
@@ -190,7 +202,9 @@ JSON として読めて、書かれた3つのファイルの大きさと SHA-256
 書きかけで見えることは手順の上では無いが、読む側は書き手を信用せず毎回この照合をする（ファイルの書きかけや後からの
 差し替えもこれで拒める）。確かめる関数は印に書かれた3つのファイルと `COMPLETE.json` だけを読み、他の名前は見ない。
 
-- `--apply` の登録は手順 6 が成功した後に、メモリ上の同じ bytes で行う（印を読み直さない）
+- `--apply` の登録は手順 6 が成功した後に、メモリ上の同じ bytes で行う（印を読み直さない）。**登録の直前にも**、`--out` の名前が
+  手順 2 で開いたディレクトリ（同じ `(st_dev, st_ino)`）を指していることを確かめ、違えば登録せずに段 `out_replaced` で
+  終了コード 1。要求した `--out` が別のものを指しているのに candidate を登録することを防ぐ
 - 手動の登録と回復は **`coldaisle-registry register --training-output <--out>`** で行う（`--metadata` / `--payload` と
   排他）。`register` は下記の確かめる関数で印を確かめ、**確かめたときに読んだ bytes そのもの**（`artifact.json` と
   `metadata.json`）を `register_candidate` へ渡す（確かめた後に読み直さない。差し替えの窓を作らない）。印が無い・無効なら
@@ -323,6 +337,11 @@ bytes が前と同じで、`artifacts/` の下にファイルが増えていな�
   `--out` と他の process の `COMPLETE.json` が残ること（黙って成功扱いにしないこと）。`unlink` を失敗させたときも同じ段になること。学習を始める前に**空の `--out` を作っておく**と
   手順 2 の `EEXIST` で拒否され、その空のディレクトリが置き換えられずに残ること。`os.rename` / `os.replace` を `--out` の公開に
   使わないこと（差し替えて呼ばれないことを確かめる）
+- 親の検査（`_open_output_root` の使い回し）: `--out` の親が group / world に書ける・他の uid の所有・path に symlink がある・
+  `..` を含むとき、学習の前に終了コード 1 で拒否し、`--out` が作られないこと
+- 名前の差し替え: 手順 2 の後・手順 5 の link の前に `--out` の名前を付け替えて別のディレクトリを置くと、link をせず段
+  `out_replaced`・終了コード 1 で、置かれた別のディレクトリに何も書かず消さないこと。手順 6 の後・登録の前に同じことをすると、
+  段 `out_replaced`・終了コード 1 で Registry が変わらず、成功を報告しないこと
 - 完成の印: 印が無い・書きかけ（JSON が途中）・大きさや SHA-256 がずれた `--out` を、確かめる関数が未完成として拒むこと。
   印の一時名だけがある `--out` も未完成として拒むこと。強制終了の模擬（手順 3 または 4 の後で止めて片づけを走らせない）の後の
   再実行が、`--out` があることと印が無効なことを出して拒むこと
