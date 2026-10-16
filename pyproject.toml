@@ -41,6 +41,8 @@ coldaisle-rollup = "coldaisle.rollup_job:main"
 coldaisle-report = "coldaisle.report:main"
 # 連続運転テスト（soak）の集計。**既存の DB を読むだけ**（#47）
 coldaisle-soak-report = "coldaisle.soak:main"
+# 負荷の状態ごとの d.* の分布。**DB を読むだけで、合否も閾値の提案も出さない**（#50 / 決定記録 0151）
+coldaisle-load-distribution = "coldaisle.load_distribution:main"
 # 故障疑いの案件資料。**送信はしない**（#39）
 coldaisle-escalate = "coldaisle.escalate:main"
 # 運用メモリの更新案。**既定では書かない**（#40）
