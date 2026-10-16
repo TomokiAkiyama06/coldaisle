@@ -76,7 +76,7 @@ Workload Regime（`control/supervisor/regime.py`）を主軸にしない理由�
 - **区間の始め（`--start`）の境目**: `--start` の直前に負荷が変わっていても、区間の中だけを読むと前の状態が
   見えず、最初の評価時刻を定常として数えてしまう。これを避けるため、状態の判定に使う行（電力・§2.6 の `cooling` の
   判定に使う trace と `fan.*`）は **`--start - lookback_ms` から読む**。`lookback_ms` は
-  `settle_ms + power_window_ms + max(trace_max_age_ms, fan_max_age_ms)` で、設定から計算し別の値として持たない。
+  `settle_ms + power_window_ms + fan_max_age_ms + max(trace_max_age_ms, pwm_apply_delay_ms)` で、設定から計算し別の値として持たない。
   さかのぼった区間の評価時刻は状態と落ち着きの計時を決めるためだけに使い、**分布にも件数にも入れない**
 - ただし §2.6a の `fand` の判定に使う「連続した trace の区間の不一致の割合」は、`lookback_ms` で切らず、
   **区間の本当の始まりまでさかのぼって読む**（§2.6a）。`lookback_ms` はそれ以外の行にだけ当てる
@@ -163,10 +163,29 @@ DB に残る記録で、これを直接に言える欄は無い（2026-10-16 の
 
 | 区分 | 条件（**すべて**を満たすときだけ） |
 |---|---|
-| `fand` | `[t - trace_max_age_ms, t]` に trace があり `operating_mode` が `auto`。その trace の 3 つの zone すべてで `hardware` があり **`write_ok` と `readback_ok` がともに true**（下の「書き込みを確かめられた tick だけを一致とする」）。3 つの zone すべてで、`[t - fan_max_age_ms, t]` に ok の `fan.<zone>.pwm` があり、trace の `pwm_raw / 255 × 100` との差が `pwm_match_tolerance_pct` 以内。さらに、その trace を含む**連続した trace の区間**（間隔が `trace_max_age_ms` を超えたら切る。`run_id` は v16 からなので使わない）の**始まりから終わりまで全体**（`--start` / `--end` の外も含む）で、突き合わせられた時刻のうち一致しなかった割合が `pwm_mismatch_max_ratio` 以下。区間の始まりを確かめられないとき（下の「区間の全体を読む」）は `undetermined` |
+| `fand` | `t` 以前で最も新しい、`fan_max_age_ms` 以内の Fan のサンプル（3 つの zone の ok の `fan.<zone>.pwm`）について、下の「Fan のサンプルと trace の突き合わせ（as-of）」の結果が**一致**で、その as-of の trace の `operating_mode` が `auto`。さらに、その trace を含む**連続した trace の区間**（間隔が `trace_max_age_ms` を超えたら切る。`run_id` は v16 からなので使わない）の**始まりから終わりまで全体**（`--start` / `--end` の外も含む）で、突き合わせた Fan のサンプルのうち一致しなかった割合が `pwm_mismatch_max_ratio` 以下。区間の始まりか終わりを確かめられないとき（下の「区間の全体を読む」）は `undetermined` |
 | `fand_override` | `fand` の条件のうち `operating_mode` だけが `auto` でない（`manual` / `max` / `calibration`。試験の操作） |
 | `bios` | `[t - trace_max_age_ms, t]` に trace が無い。3 つの zone すべてで ok の `fan.<zone>.rpm` が `fan_max_age_ms` 以内にあり、**すべての zone が `full_speed_rpm_min.<zone>` 未満**。さらに、`t` より前に fand が動いていなかったか、直前の fand の停止の後が BIOS だったと確かめられる（下の「`bios` の前提」） |
-| `undetermined` | 上のどれにも当たらない。例: trace はあるが物理の PWM と合わない（simulated の backend など）・区間の始まりを確かめられない・`fan.*` が欠けている・trace が無く 1 つでも全速の zone がある（引き継ぎの Max が一部の zone だけ成功した状態か、BIOS が高負荷で全速にしたかを区別できない）・trace が途絶えた後で、その停止が正常だったと確かめられない |
+| `undetermined` | 上のどれにも当たらない。例: trace はあるが物理の PWM と合わない（simulated の backend など）・区間の始まりか終わりを確かめられない・`fan.*` が欠けている・trace が無く 1 つでも全速の zone がある（引き継ぎの Max が一部の zone だけ成功した状態か、BIOS が高負荷で全速にしたかを区別できない）・trace が途絶えた後で、その停止が正常だったと確かめられない |
+
+**Fan のサンプルと trace の突き合わせ（as-of）**（`fand` の判定）:
+
+- 突き合わせの単位は trace の tick ではなく **Fan のサンプル**（`coldaisle-telemetry` の 1 回の収集。2500 ms ごと）。
+  trace は 1000 ms ごとなので、1 つのサンプルの前に trace が複数ある。どれと比べるかを次のとおり決める
+- サンプルの時刻 `t_f` に対する **as-of の trace** は、`ts_ms ≤ t_f` の trace のうち `seq` が最も大きいもの
+  （同じ `ts_ms` なら大きい `seq`。時計が戻っても書いた順の最新を選ぶ）。`t_f - ts_ms` が `trace_max_age_ms` を
+  超えるなら as-of の trace は無い（`fand` にならない）
+- 指令が物理の PWM に反映されるまでには遅れがある（fand の書き込みと telemetry の読み取りが別の周期で、ランプの最中は
+  tick ごとに指令が変わる）。そこで **候補の trace** を、as-of の trace と同じ区間で、`seq` が as-of の trace 以下で、
+  `ts_ms` が `[t_f - pwm_apply_delay_ms, t_f]` に入るもの（as-of の trace は必ず含める）とする
+- サンプルは、3 つの zone それぞれで、物理の `fan.<zone>.pwm` と候補のどれかの `pwm_raw / 255 × 100` の差が
+  `pwm_match_tolerance_pct` 以内なら**一致**。ただし候補の trace のどれか 1 つでも、3 つの zone のどれかに `hardware` が
+  無いか `write_ok` / `readback_ok` が false なら、そのサンプルは一致にしない（下の「書き込みを確かめられた tick
+  だけを一致とする」）
+- 3 つの zone の `fan.*.pwm` は同じ収集で同じ `ts_ms` を持つ。zone ごとに時刻が違う行は、zone ごとに同じ規則で突き合わせ、
+  1 つでも一致しない zone があればそのサンプルは一致にしない
+- 評価時刻 `t` の `cooling` は、`t` 以前で最も新しい `fan_max_age_ms` 以内のサンプルの結果を使う（サンプルが無ければ
+  `undetermined`）
 
 **書き込みを確かめられた tick だけを一致とする**（`fand` の判定）:
 
@@ -174,11 +193,11 @@ DB に残る記録で、これを直接に言える欄は無い（2026-10-16 の
   要求の PWM でこの欄を埋め、`ENABLE_REVERTED` のときはレジスタの値が入って `readback_ok = false` になる
   （`control/hardware/hwmon.py`）。前の duty が残っていた・BIOS の duty がたまたま同じだった、という tick を
   `pwm_raw` の一致だけで `fand` にしない
-- そこで tick ごとの一致は、**3 つの zone すべてで `hardware` があり `write_ok` と `readback_ok` がともに true** で、
-  かつ PWM の差が許容の内のときだけとする。flag のどれかが false・`hardware` が無い zone がある tick の評価時刻は
-  `undetermined`
-- 区間の不一致の割合では、そうした tick を**不一致として分子に数える**（分母は、区間の中で `fan.*.pwm` と
-  突き合わせられた tick のすべて）。書き込みの失敗が多い運転を、確かめられた一致の多さで `fand` に入れないため。
+- そこで一致に使えるのは、**3 つの zone すべてで `hardware` があり `write_ok` と `readback_ok` がともに true** の
+  trace だけとする。flag のどれかが false・`hardware` が無い zone がある trace が候補に入ったサンプルは、PWM が
+  合っていても一致にせず、それを使う評価時刻は `undetermined`
+- 区間の不一致の割合では、そうしたサンプルを**不一致として分子に数える**（分母は、as-of の trace がその区間に
+  属する Fan のサンプルのすべて）。書き込みの失敗が多い運転を、確かめられた一致の多さで `fand` に入れないため。
   書き込みの失敗が続く区間は、区間ごと `undetermined` に倒れる
 
 **区間の全体を読む**（`fand` の判定）:
@@ -188,20 +207,21 @@ DB に残る記録で、これを直接に言える欄は無い（2026-10-16 の
   戻ると書いた順を表さない（0071 §2.2a の「並びは `seq`、`ts_ms` は絞り込みだけ」と同じ理由）。そこで、連続した
   trace の区間は「`seq` の昇順で隣り合う 2 行の `ts_ms` の差が `trace_max_age_ms` を超えたら切る」と定義する。
   差が負（時計が戻った）なら切らない（区間を短く切ると、外れた前半を落とせてしまうため、繋ぐ側に倒す）。
-  `ts_ms` は、この途切れの比較と、評価時刻 `t` に対する trace の古さ（`[t - trace_max_age_ms, t]`）にだけ使う
-- 評価時刻 `t` の窓に、別々の区間（`seq` でたどって別の区間）に属する trace が入ったとき（時計が戻った前後）は、
-  どの区間の判定にも寄せず `undetermined` にする
-- 不一致の割合は、`t` の trace を含む区間について、`seq` を小さい向きへ区間の本当の始まりまで、大きい向きへ
+  `ts_ms` は、この途切れの比較と、Fan のサンプルに対する trace の古さ（as-of の選択と `pwm_apply_delay_ms`）にだけ使う
+- サンプルの候補の窓に、別々の区間（`seq` でたどって別の区間）に属する trace が入ったとき（時計が戻った前後）は、
+  どの区間の判定にも寄せず、そのサンプルを `undetermined` にする
+- 不一致の割合は、as-of の trace を含む区間について、`seq` を小さい向きへ区間の本当の始まりまで、大きい向きへ
   終わりまでたどって読み、その区間の全体で数える。こうして判定が `--start` / `--end` の置き方に依らないようにする
 - 決まった長さの窓（例: 直近 30 分の割合）にしないのは、simulated の運転で前半が外れ、窓に入る後半だけがたまたま
   合う、という場合を窓では捨てられないため。区間の全体なら、その運転全体の性質で判定できる
 - 読むのは trace の `seq`・`ts_ms`・`state.operating_mode`・3 つの zone の `zones.<zone>.hardware.pwm_raw` /
   `write_ok` / `readback_ok`（`hardware` が無いことも含む）だけ（SQL の `json_extract` で取り出し、trace の全体を
-  検証の型に通さない）と、同じ範囲の `fan.*.pwm` の ok の行。区間の割合の数え方は、上の tick ごとの規則と
-  **同じ判定の関数**を使う（flag が false・`hardware` が無い tick は、PWM がたまたま合っていても不一致に数える）。
+  検証の型に通さない）と、同じ範囲の `fan.*.pwm` の ok の行。区間の割合の数え方は、上のサンプルごとの規則と
+  **同じ判定の関数**を使う（flag が false・`hardware` が無い trace が候補に入ったサンプルは、PWM がたまたま合っていても
+  不一致に数える）。
   2 つの経路で判定を書き分けない。保持期間（`control_trace_days` / `raw_days` 30 日）が上限なので、1 区間で最大
   約 260 万 tick。手動で時々走らせる CLI として許容する
-- **区間の始まりを確かめられるか**は、時刻ではなく `seq` の境目で決める。根拠は `control_trace_prune` の列:
+- **区間の始まりと終わりを確かめられるか**は、時刻ではなく `seq` の境目で決める。根拠は `control_trace_prune` の列:
   - `legacy_through_seq`（0010）: 0007 が移行の前の行に `(ts_ms, tick_id)` の順で振った `seq` の上限。移行の前の
     行が無ければ 0。0010 の注釈のとおり、`legacy_until_ms` は空の DB でも作った時刻（`:now_ms`）で書かれるので、
     時刻では移行の前の行と今の行を見分けられない。`seq ≤ legacy_through_seq` の行だけが移行の前の行で、その前に
@@ -216,11 +236,21 @@ DB に残る記録で、これを直接に言える欄は無い（2026-10-16 の
   しれないので、残った行だけで割合を数えない。欠番は削除のほかにも起こりうる: 書き手の `INSERT OR IGNORE` は
   重複で捨てた挿入の番号を使わないと注釈している（`store/db.py` の `record_control_trace` の「`seq` は欠番を持ちうる」）。
   理由を見分けずに同じく保守的に扱い、出力に穴のあった区間の数と欠番の数（`seq_gaps`）を出して、人が気づけるようにする
-- 区間の最も小さい `seq` を `s0` とする。区間の始まりを**確かめられる**のは次のどちらかのとき:
-  1. `s0 - 1` の行が残っていて、`s0` の行との `ts_ms` の差が `trace_max_age_ms` を超える（残っている行で途切れを見た）
-  2. `s0 = 1` で、`legacy_through_seq = 0`（移行の前の行は無かった）
-- それ以外（`s0 - 1` の行が無い。理由が削除でも欠番でも見分けない。`s0 ≤ legacy_through_seq` なら移行の前の行）は、区間の前半が消えたかもしれないので、その区間のすべての時刻を `undetermined` にする。区間の
-  始まりが生データ（`fan.*.pwm`）の保持期間の外にあるときも同じ。消えた前半の一致を推測しない
+- 区間の最も小さい `seq` を `s0`、最も大きい `seq` を `s1` とする。始まりと終わりは**同じ形の検査**で確かめる
+  （隣の `seq` の行が残っているか、DB の端であることを示せるか）:
+  - 始まりを**確かめられる**のは次のどちらかのとき:
+    1. `s0 - 1` の行が残っている（区間の定義から、その行とは `trace_max_age_ms` を超えて途切れている。別の区間に属してよい）
+    2. `s0 = 1` で、`legacy_through_seq = 0`（移行の前の行は無かった。`seq` は 1 から振る）
+  - 終わりを**確かめられる**のは次のどちらかのとき:
+    1. `s1 + 1` の行が残っている（同じく別の区間に属してよい）
+    2. `s1` が DB に残る最も大きい `seq` で、`pruned_through_seq < s1`（`s1` より後の行を消したことが無い。書き手は
+       `MAX(MAX(seq), pruned_through_seq) + 1` で振るので、後の行が書かれて消えていれば `pruned_through_seq > s1` になる）
+- どちらかを確かめられない区間（`s0 - 1` か `s1 + 1` の行が無い。理由が削除でも欠番でも見分けない。`s0 ≤ legacy_through_seq`
+  なら移行の前の行）は、区間の前後が消えたかもしれないので、その区間のすべての時刻を `undetermined` にする。例:
+  `(seq, ts_ms) = (1, 5000)` と `(3, 8000)` が残り `(2, 1000)` を消した DB では、全部の履歴なら時計が戻った `seq 2` は
+  `seq 1` と同じ区間だが、残った行では `seq 1` だけの区間に見える。始まりは `s0 = 1` で通るが、終わりは `seq 2` が
+  無いので通らず `undetermined`（`seq 3` の区間も始まりで通らない）。区間の始まりか終わりが生データ（`fan.*.pwm`）の
+  保持期間の外にあるときも同じ。消えた部分の一致を推測しない
 - `legacy_until_ms` に近い時刻に書かれたというだけでは、今の行を拒まない（新しい DB では 0010 が
   `legacy_through_seq = 0` を記録し、最初の tick は `seq = 1` から始まるので 2 で確かめられる。ただし区間の中の
   `seq` の連続は別に求める）
@@ -304,7 +334,8 @@ DB に残る記録で、これを直接に言える欄は無い（2026-10-16 の
 | `trace_max_age_ms` | trace があるとみなす古さの上限・連続した trace の区間を切る間隔 | 2000（tick 1000 ms の 2 倍） |
 | `fan_max_age_ms` | `fan.*.pwm` / `fan.*.rpm` を評価時刻に使う古さの上限 | 5000（2 周期） |
 | `pwm_match_tolerance_pct` | trace の `pwm_raw` と物理の `fan.*.pwm` の差の許容 | 2.0（約 5 / 255） |
-| `pwm_mismatch_max_ratio` | 連続した trace の区間で一致しなかった割合の上限 | 0.05 |
+| `pwm_mismatch_max_ratio` | 連続した trace の区間で一致しなかった Fan のサンプルの割合の上限 | 0.05 |
+| `pwm_apply_delay_ms` | 指令が物理の PWM に反映されるまで許す遅れ（候補の trace の窓） | 3500（telemetry の 1 周期 2500 ms + fand の 1 tick 1000 ms） |
 | `full_speed_rpm_min.front` / `.rear` / `.top` | これ以上を全速とみなす回転数 | §5 #8 |
 
 `--periods` の YAML は、名前つきの区間・除外する区間に加えて、`bios_confirmed` の区間（`start` / `end` / 必須の `basis`）を持てる（§2.6a）。
@@ -328,9 +359,9 @@ DB に残る記録で、これを直接に言える欄は無い（2026-10-16 の
   一部の zone だけ全速（引き継ぎの一部の成功を模した合成データ）・trace の途絶の後で `bios_confirmed` が無い・
   prune の記録がある DB では `undetermined`。`manual` の tick が `fand_override` で
   既定では除かれ、`undetermined` は件数だけに出る
-- 書き込みの確かめ（§2.6a）: PWM が合っていても `write_ok` か `readback_ok` が false の zone がある tick
-  （`ENABLE_REVERTED` で `readback_ok = false` を含む）・`hardware` の無い tick は `undetermined`。区間の中で
-  そうした tick が `pwm_mismatch_max_ratio` を超えると、合っている tick も含めて区間ごと `undetermined`
+- 書き込みの確かめ（§2.6a）: PWM が合っていても、候補の trace に `write_ok` か `readback_ok` が false の zone がある
+  （`ENABLE_REVERTED` で `readback_ok = false` を含む）・`hardware` の無いサンプルは `undetermined`。区間の中で
+  そうしたサンプルが `pwm_mismatch_max_ratio` を超えると、合っているサンプルも含めて区間ごと `undetermined`
 - `seq` の境目（§2.6a）: 新しい DB（`legacy_through_seq = 0`）で最初の tick が `legacy_until_ms` から
   `trace_max_age_ms` 以内に書かれても、`seq = 1` から続く区間は確かめられて `fand` になりうる。`seq ≤ legacy_through_seq`
   の行から始まる区間・`s0 - 1` の行が無い区間は `undetermined`
@@ -341,8 +372,16 @@ DB に残る記録で、これを直接に言える欄は無い（2026-10-16 の
 - `bios` の 1（§2.6a）: trace が 1 行でもある DB（`t` より後の trace だけでも）・`pruned_through_seq` が 0 でない DB・
   `legacy_through_seq` が 0 でない DB では、trace の無い時刻で全 zone が全速未満でも `bios_confirmed` が無ければ
   `undetermined`。保持期間で消した範囲と残る最初の trace の間の時刻も同じ
-- 区間の割合の数え方（§2.6a）: flag が false の tick で PWM がたまたま観測と合う合成データで、その tick が区間の
-  割合の不一致に数えられ、tick ごとの判定と区間の判定が同じ関数の結果になる
+- as-of の突き合わせ（§2.6a）: ランプの最中に、Fan のサンプルの時刻の直前の trace は新しい指令・物理の PWM は
+  1〜3 tick 前の指令という合成データで、`pwm_apply_delay_ms` の窓の候補と一致して `fand` になる（最新の trace だけと
+  比べて外れにしない）。遅れが `pwm_apply_delay_ms` を超えるデータは一致にしない。trace の `ts_ms` が Fan のサンプルより
+  後（telemetry の時刻とずれた）の trace は as-of に選ばれない。同じ `ts_ms` の trace が 2 つあるときは大きい `seq` を選ぶ。
+  候補の中に flag が false の trace があるサンプルは、PWM が合っていても一致にならない
+- 区間の終わり（§2.6a）: `(1, 5000)` と `(3, 8000)` が残り `(2, 1000)` を消した合成データで、`seq 1` の区間が終わりの
+  検査で、`seq 3` の区間が始まりの検査で `undetermined` になる。最新の行で終わる区間は、`pruned_through_seq` が
+  それより小さいときだけ通る
+- 区間の割合の数え方（§2.6a）: flag が false の trace が候補に入り PWM がたまたま観測と合うサンプルの合成データで、
+  そのサンプルが区間の割合の不一致に数えられ、サンプルごとの判定と区間の判定が同じ関数の結果になる
 - 区間の全体（§2.6a）: `--start` より前から続く trace の区間で、前半の PWM が外れ `--start` 以後だけが合う合成データを
   `undetermined` にする（`--start` を区間の途中のどこに置いても判定が変わらない）。区間の最初の行の前の `seq` の行が
   無い DB では、その区間を `undetermined` にする。`--end` の後に外れが続く場合も同じ
