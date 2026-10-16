@@ -355,8 +355,17 @@ JSON として読めて、書かれた3つのファイルの大きさと SHA-256
   前に candidate ができ、その後に印の作成が失敗すると `--out` は片づけられるのに Registry は変わったままになる。これは「脅威の
   前提」の**同じ uid の誤った操作**に当たるので、安価な検査で止める: `register --metadata/--payload` は、`--payload` か
   `--metadata` のファイルと同じディレクトリに `training-report.json` があれば（学習の出力のディレクトリ。手順 3 で最初に書く）、
+  `COMPLETE.json` の有無に依らず拒む。**判定は、実際に開いたファイルの項があるディレクトリで行う。** いまの `read_bounded`
+  （`src/coldaisle/registry.py`）は `path.open("rb")` で最後の要素の symlink もたどるので、学習の出力の外に置いた symlink を渡すと、
+  path の字面の隣を見る判定は symlink のあるディレクトリしか見ず、読むのは学習の出力の中の完成したファイルになる。そこで実装の
+  PR で、この2つの入力の読み方を次に変える（§5 の 14）: (1) 親のディレクトリを `O_RDONLY | O_DIRECTORY` で1回開く（親までの
+  symlink は今どおりたどる）→ (2) 最後の要素を `os.open(名前, O_RDONLY | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK, dir_fd=親)` で開き
+  （symlink なら `ELOOP` で拒否）、`fstat` で regular file であることを確かめ、その fd から上限＋1 byte だけを読む →
+  (3) 隣の `training-report.json` の有無を、同じ親の fd に対する `os.stat(..., dir_fd=親, follow_symlinks=False)` で確かめる。
+  開いた項と判定するディレクトリが同じ fd に束縛されるので、symlink で判定を外せない。hard link やコピーで別のディレクトリへ
+  置いたものは判定が効かないが、同じ uid の意図した操作として下の「欠点」と同じく前提の外とする。上の条件に当たれば
   `COMPLETE.json` の有無に依らず拒み、`--training-output` を使うよう促して終了コード 1 で Registry を開かない。学習の出力は
-  `--training-output` の経路（印を確かめる）からだけ登録できる。RL policy など学習の CLI の外の artifact の登録は変わらない。
+  `--training-output` の経路（印を確かめる）からだけ登録できる。RL policy など学習の CLI の外の artifact の登録は、最後の要素に symlink を渡さない限り変わらない（§5 の 14）。
   - **推奨とした理由**: もう1つの案「書いている途中のファイルを一時名（`.artifact.json.partial` など）で置き、公開と同時か
     直前に最終の名前へ移す」は、最終の名前へ移すのを印の link の前にすると窓が残り（移した後・link の前に同じ経路で登録
     できる）、link の後にすると「印はあるがファイルが無い」公開の後の失敗の状態が増える。拒む案は公開の手順と状態を変えず、
@@ -428,7 +437,10 @@ process が強制終了したときに残るのは、印の無い（または無
   **同じ bytes** を `ModelRegistry.register_candidate` へ渡す（§5 の 1 / 2）
 - **`--registry-limits <dir>` は `--apply` のとき必須**（`model-registry.yaml` のあるディレクトリ。既定値を置かない）。
   `ModelRegistry` は `ModelRegistryLimits` を要し、その値は `config/model-registry.yaml` にだけあってコードに既定値が無い。
-  `load_model_registry_limits` で1回読み、**登録（`register_candidate`）と登録の後の `load_version`（§2.4 の 7）の両方に
+  §2.7 の上限つきの1回の読み（`MAX_TRAINING_CONFIG_BYTES`）で `model-registry.yaml` の bytes を得て、その buffer から
+  `yaml.safe_load` → `ModelRegistryLimits.model_validate` で作る。**`load_model_registry_limits` と `ModelRegistryLimits.from_file` は
+  使わない**（どちらも path から上限なしで読み、§2.7 の読みと別の2回目の読みになって、差し替えた bytes を見うるため）。この1つの
+  limits を、**登録（`register_candidate`）と登録の後の `load_version`（§2.4 の 7）の両方に
   同じ limits を使う**。`coldaisle-registry --limits` と `coldaisle-authority raise --registry-limits` は既定値に相対 path の
   `config` を持つが、作業ディレクトリに依って別のファイルを読む余地があるので、ここでは置かない（0134 §2.2 が本番の
   `raise` に絶対 path を求めたのと同じ理由）。読めない・不正なら、公開の前に拒否する（Registry を開く前に limits を読む）
@@ -593,7 +605,9 @@ best-effort で `OSError` / `UnsafeRegistryPathError` を握る（`src/coldaisle
 - `coldaisle-registry register --metadata/--payload` の拒否: 手順 3 の後・手順 5 の前（`COMPLETE.json` が無い・`artifact.json` と
   `metadata.json` は完成）の `--out` のファイルを渡すと終了コード 1 で Registry が変わらないこと。公開の後の `--out` でも拒むこと。
   `training-report.json` の無い別のディレクトリのファイルは従来どおり登録できること。手順 3 で `training-report.json` が最初に
-  書かれること
+  書かれること。学習の出力の外に置いた、学習の出力の中の `artifact.json` / `metadata.json` への **symlink** を `--payload` /
+  `--metadata` に渡すと（`COMPLETE.json` の前でも後でも）終了コード 1 で Registry が変わらないこと。symlink のディレクトリを
+  親に持つ path（`<symlink のディレクトリ>/artifact.json`）でも、開いた親の fd で `training-report.json` を見つけて拒むこと
 - Dataset の読み込み（§2.4 の 1）: `load_training_dataset_artifact_v2` が `coldaisle-dataset` の公開物から、
   `verify_training_dataset_artifact_v2` と同じ束縛（`artifact_id`・`manifest_sha256`・`examples_sha256`）を返すこと。
   `examples.jsonl` が上限＋1 byte・manifest の `examples_sha256` と違う・canonical でない行（空白や鍵の順を変えた同じ値）・
@@ -673,3 +687,4 @@ best-effort で `OSError` / `UnsafeRegistryPathError` を握る（`src/coldaisle
 | 11 | （申し送り）Registry の登録の失敗で、参照されない artifact のファイルが残りうる（`_remove_artifact_if_unreferenced` が best-effort）。`coldaisle-registry` に片付けの入口は無い | **本記録では扱わない**（Registry の書き方と片付けは 0062 / 0104 の範囲）。必要なら Registry の片付けの入口を別の記録で決める | — |
 | 12 | 設定の入力（§2.7 の6つ）を読む上限の値と置き場所。**決定済み（所有者、2026-10-16）: 推奨のとおり** | **`train.py` の構造上の定数 `MAX_TRAINING_CONFIG_BYTES = 1 MiB`**（6つに共通）。運用の閾値ではなくメモリを守る構造上の上限で、既存の `MAX_ARTIFACT_BYTES`（`control/model/thermal.py`）・`_MAX_JOURNAL_BYTES`（`control/authority.py`）・`MAX_DECLARED_CHANGES` と同じ扱い。いまの設定は数 KB で、宣言の YAML も `MAX_DECLARED_CHANGES` = 64 件に収まる。利点: `--apply` の無い実行でも追加の設定が要らず、上限を決めるファイル自身の読みに上限が要るという循環が無い | (a) `--registry-limits` を常に必須にし、その `max_snapshot_bytes` を使う（0062 §2.1 と同じ値）。欠点: `--out` だけの実行にも Registry の設定が要り、`model-registry.yaml` 自身は別の上限で読む必要が残る。(b) `--training-spec` に置く。欠点: spec 自身の読みに上限が要る |
 | 13 | macOS の `/tmp`・`/var` など、OS が置く symlink を含む `--out`。**決定済み（所有者、2026-10-16）: 推奨のとおり** | **受け入れない**（§2.5 の「path の照合」）。symlink を含まない実の path（`/private/tmp/...`）を人が渡し、CLI は拒否のログでそれを示す。利点: 解く処理が無く、照合の窓が増えない・Dataset の writer（`_open_output_root`）と挙動が揃う・OS ごとの分岐が無い（NFR-07） | (a) root の所有の `/` の中の root の所有の symlink（`/tmp`・`/var`・`/etc`）だけを、`fstat` と `readlink` で確かめて一度だけ解き、先を fd で開いて照合を続ける。欠点: 別名の一覧（macOS の分岐）を持つ・Ubuntu の CI では模してしか試験できない |
+| 14 | 既存の `coldaisle-registry register --metadata/--payload` が最後の要素の symlink をたどって読む挙動 | **拒否する**（§2.5。親の fd を1回開き、最後の要素を `O_NOFOLLOW` で開く。学習の出力の判定を開いた項のディレクトリに束縛する）。既存の入口を狭める変更で、RL policy などの登録で `--payload` に symlink を渡していた運用は、実のファイルを渡す形に変わる | (a) symlink を許したまま、開いた fd の `(st_dev, st_ino)` と、隣の `artifact.json` / `metadata.json` の `fstat` を比べる。欠点: 実の親を fd から得る手段が OS ごとに違い（Linux の `/proc/self/fd`・macOS の `F_GETPATH`）、NFR-07 に反する |
