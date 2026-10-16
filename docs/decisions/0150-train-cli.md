@@ -123,10 +123,13 @@ AGENTS.md の「仕様に無い判断をした場合、実装より先に決定�
 `test` は学習にも Profile にも使わない。件数と期間を報告に載せるだけ（§5 の 5）。
 
 失敗は構造化ログに理由を出して**終了コード 1**。「何も残さない」の約束は **`--out` の公開（§2.5 の手順 5 の
-`os.link` による `COMPLETE.json` の公開。これが公開の確定点）の前に process の中で起きた失敗**に限る。本節の 1〜7
+`os.link` による `COMPLETE.json` の公開。これが公開の確定点）の前に process の中で起きた失敗で、かつ手順 7 の後始末が
+成功したとき**に限る。本節の 1〜7
 （7 は `check_artifact_contents` まで）の失敗では `--out` を作らず、公開の手順の 2〜5 の失敗（`os.link` そのものの失敗を含む）
-では、自分で作った `--out` を手順 7 のとおり片づける。`COMPLETE.json` は link の前には名前として存在しないので、片づける前に
-他の process（`coldaisle-registry register --training-output`）がそれを確かめて登録することは起きない。
+では、自分で作った `--out` を手順 7 のとおり片づける。書き手自身の `COMPLETE.json` は link の前には名前として存在しないので、
+片づける前に他の process（`coldaisle-registry register --training-output`）が書き手の印を確かめて登録することは起きない。
+後始末が失敗したとき（他の process が `--out` の中に置いた名前が残って `rmdir` が `ENOTEMPTY` になる、など）は握りつぶさず、
+「後始末の失敗」として表の行に分ける。
 
 process が強制終了したとき（`SIGKILL`・電源断）は片づけられないので、**`COMPLETE.json` の無い `--out`** が残りうる（§2.5）。
 公開の後の失敗は、`--out` を消さずに残す。消すと、Registry に登録済みかもしれない bytes の唯一の手元の写しを失うためである。
@@ -135,14 +138,15 @@ process が強制終了したとき（`SIGKILL`・電源断）は片づけられ
 
 | 失敗した段 | 終了コード | 残るもの | 回復 |
 |---|---|---|---|
-| 公開の前（検査・学習・公開の手順 1〜5 の例外。`os.link` の失敗を含む） | 1 | 何も残らない（作った `--out` を片づける） | 原因を直して同じ引数で再実行 |
+| 公開の前（検査・学習・公開の手順 1〜5 の例外。`os.link` の失敗を含む）で、後始末が成功 | 1 | 何も残らない（作った `--out` を片づけた） | 原因を直して同じ引数で再実行 |
+| 公開の前の失敗で、**後始末が失敗**（例: 手順 5 の `EEXIST`。他の process が `--out` に `COMPLETE.json` を置いたため、既知の名前だけを消した後の `rmdir` が `ENOTEMPTY`） | 1 | **未完成の `--out`**（書き手の既知の名前は消せた分だけ消え、知らない名前が残る）。書き手は公開していない | ログに段 `cleanup_failed`・元の失敗の理由・後始末の例外（`errno`）・`--out` に残った名前の一覧を出す（元の例外は原因として残し、後始末の例外は隠さない）。人は、残った `COMPLETE.json` などが誰のものかを確かめ、`coldaisle-registry status` でそれを使った candidate が登録されていないことを見てから `--out` を消し、同じ引数で再実行する。CLI は知らない名前を消さない |
 | 公開の前の強制終了（`SIGKILL`・電源断） | — | **`COMPLETE.json` の無い `--out`**（中のファイルは途中まで。印の一時名が残ることもある）。link の後・`--out` の fsync の前の電源断でも、link が永続でなければこの状態に戻りうる | 再実行は `--out` があるので拒否され、そのとき `--out` に有効な完成の印が無いことをログに出す。人が確かめて `--out` を消し、同じ引数で再実行する。CLI は自動では消さない（自分が作ったものか確かめられないため） |
 | 公開の後・一時名の unlink と `--out` と親の fsync の失敗（公開の手順 6。`--apply` の有無に依らない） | 1 | `--out`（3ファイルと有効な `COMPLETE.json`。中身はすべて fsync 済みで、永続でないのはディレクトリの項だけ。unlink の失敗なら印の一時名も残るが、確かめる関数は見ない）。`--apply` なら Registry へは進まない | ログに段 `publish_durability` と `--out` の path を出す。中身は完成しているので、そのまま使ってよい（`--apply` なら `coldaisle-registry register --training-output <--out>` で登録する）。電源断の後に `--out` が無い・印が無効なら、消して同じ引数で再実行する（その前に並行の `register` で同じ版の candidate が登録されていれば、Registry 側の bytes は Registry が fsync している。`coldaisle-registry status` で確かめ、あれば作り直さない） |
 | 公開の後・Registry の登録の失敗（lock・revision・同じ版が登録済み・権限・limits、および artifact ファイルの段の `RegistryDurabilityError`） | 1 | `--out`（3ファイルと完成の印）。Registry は変わらない（登録の確定点の前） | `coldaisle-registry register --training-output <--out>` で登録する。同じ版が登録済みなら `--model-version` を上げて別の `--out` で作り直す |
 | 登録は確定したが永続が確かでない（`registry.json` の置き換えの後の `RegistryDurabilityError`。下記） | 1 | `--out` と、Registry の **candidate**（見えている。production は動かない） | CLI はそのまま**登録の後の検査（`load_version` と L1〜L12）へ進む**。検査が通ってもログに段 `register_durability` を出して終了コード 1。人は `coldaisle-registry status` で candidate があることを確かめる。電源断の後に無くなっていたら、`coldaisle-registry register --training-output <--out>` で登録する。**もう一度 `coldaisle-train --apply` で登録し直さない**（見えている間は「既にある」になる） |
 | 登録の後・`load_version` と L1〜L12 の検査の失敗 | 1 | `--out` と、Registry の **candidate**（production は動かない） | ログに artifact の key と `--out` の path を出す。人が原因を確かめ、`coldaisle-registry retire` で candidate を退ける。CLI は `retire` しない |
 
-構造化ログには失敗した段（`before_publish` / `publish_durability` / `register` / `register_durability` /
+構造化ログには失敗した段（`before_publish` / `cleanup_failed` / `publish_durability` / `register` / `register_durability` /
 `post_register_check`）を必ず出し、どの行に当たるかを人が取り違えないようにする。
 
 ### 2.5 出力と、既定では Registry を書かないこと
@@ -176,8 +180,10 @@ process が強制終了したとき（`SIGKILL`・電源断）は片づけられ
 6. 一時名を unlink し、`--out` を fsync し、親を fsync する（`COMPLETE.json` の項と `--out` の項を永続にする）。ここでの失敗は
    公開の**後**の失敗（§2.4 の表）で、片づけない
 7. 手順 2〜5 で例外が起きたとき（link の失敗を含む）は、自分で作った `--out` の中の**既知の名前だけ**（3つのファイル・
-   印の一時名）を unlink し、`--out` を rmdir する（手順 2 で確かめた `(st_dev, st_ino)` と同じときだけ）。`COMPLETE.json` は
-   この時点で存在しない。後始末の失敗は元の例外を隠さない（`suppress(OSError)`）
+   印の一時名）を unlink し、`--out` を rmdir する（手順 2 で確かめた `(st_dev, st_ino)` と同じときだけ）。知らない名前
+   （他の process が置いた `COMPLETE.json` など）は消さない。後始末の例外は**握りつぶさない**: 元の例外を原因として保ったまま、
+   後始末の失敗（`unlink` / `rmdir` の `errno` と、`--out` に残った名前の一覧）を構造化ログに出し、段 `cleanup_failed` で
+   終了コード 1 にする（§2.4 の表）。`suppress(OSError)` で黙って捨てない（AGENTS.md「例外を握りつぶさない」）
 
 **読む側は、有効な `COMPLETE.json` の無い `--out` を未完成として拒む。** 有効とは、`COMPLETE.json`（一時名ではない）が
 JSON として読めて、書かれた3つのファイルの大きさと SHA-256 が実物と一致することである。link で公開するので `COMPLETE.json` が
@@ -300,9 +306,11 @@ coldaisle-authority raise          → authority を1段   （承認者の uid�
 - `--apply` で candidate になり、production pointer と revision 以外の記録が変わらない。同じ版の2回目は終了コード 1
 - 拒否: 公開物の改ざん・`--replay-path` の取り違え・期間の後の較正の記録・`--calibration` の取り違え・`--out` が既にある・
   `support_axes` に `fan.<zone>` が欠ける。どれも `--out` が作られない
-- 公開の手順: 手順 3〜5 の途中で例外を起こす（`os.link` を `EEXIST` などで失敗させるのを含む）と `--out` が片づけられて
+- 公開の手順: 手順 3〜5 の途中で例外を起こす（`os.link` を `EEXIST` 以外で失敗させるのを含む）と、後始末が成功して `--out` が
   無いこと。手順 4 の印の一時名を書いて fsync するまでの間に `COMPLETE.json` が名前として存在しないこと（確かめる関数を
-  その時点で呼ぶと「印が無い」で拒むこと）。手順 5 の前に `COMPLETE.json` を置いておくと link が `EEXIST` で失敗し、置き換えないこと。学習を始める前に**空の `--out` を作っておく**と
+  その時点で呼ぶと「印が無い」で拒むこと）。手順 5 の前に他の process の役で `COMPLETE.json` を置いておくと、link が `EEXIST` で失敗して置き換えず、書き手の既知の名前
+  だけが消え、`rmdir` が `ENOTEMPTY` になり、段 `cleanup_failed`・終了コード 1・残った名前の一覧（`COMPLETE.json`）がログに出て、
+  `--out` と他の process の `COMPLETE.json` が残ること（黙って成功扱いにしないこと）。`unlink` を失敗させたときも同じ段になること。学習を始める前に**空の `--out` を作っておく**と
   手順 2 の `EEXIST` で拒否され、その空のディレクトリが置き換えられずに残ること。`os.rename` / `os.replace` を `--out` の公開に
   使わないこと（差し替えて呼ばれないことを確かめる）
 - 完成の印: 印が無い・書きかけ（JSON が途中）・大きさや SHA-256 がずれた `--out` を、確かめる関数が未完成として拒むこと。
