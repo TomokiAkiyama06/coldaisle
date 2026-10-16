@@ -366,13 +366,14 @@ coldaisle が NVML / lm-sensors も収集し、`GET /api/v1/server-health` を�
 | FR-403 | `PROBE_CHANGED` | hello の `rom` が**記録された構成と一致しない状態が続いている**（★2026-08-25 改訂） | info |
 | FR-404 | `RECIRCULATION` | `d.intake_rise > 5.0°C` が5分継続 | warning |
 | FR-405 | `INTAKE_HIGH` | `air.gpu_intake > 40°C` が2分継続 | warning |
-| FR-406 | `AIRFLOW_DEGRADED` | `d.gpu_delta > 20°C` が5分継続 | warning |
+| FR-406 | `AIRFLOW_DEGRADED` | `d.gpu_delta` が、`power.gpu.0`（直近 600 s の最大）から求めた正常な上限（期待値）を 6°C 超えて5分継続（4°C 未満で解除。値は provisional。決定記録 0144） | warning |
 | FR-407 | `RAPID_RISE` | `air.gpu_intake` の上昇率が 5°C/分 超 | critical |
 | FR-408 | `ROOM_HIGH` | `air.room > 30°C` が10分継続 | warning |
 | FR-409 | `HUMIDITY_OUT_OF_RANGE` | `air.room_humidity` が 20%未満 or 70%超 が10分継続 | warning |
 
-> **FR-406 の条件について（提案中）**: 決定記録 0144（Proposed）が、GPU の電力から求めた正常な
-> `d.gpu_delta` の上限を超えた分で判定する形への置き換えを提案している。表の改訂は 0144 が FINAL になったときに行う。
+> **FR-406 の条件について（2026-10-16 改訂）**: 旧い条件「`d.gpu_delta > 20°C` が5分継続」は、
+> GPU の高負荷の定常（600 W で 30〜32°C）でも鳴るため、決定記録 0144 の形に置き換えた。期待値は電力の点の表
+> （0 W 5.0 / 300 W 26.5 / 450 W 34.0 / 600 W 34.0°C）の線形の補いで、`power.gpu.0` が無い・stale のときは表の最大で評価する。
 
 > **FR-403 の定義について（2026-08-25 改訂）**: 「変わった瞬間」ではなく
 > **「不一致が続いている状態」**で判定します。意味するのは「較正のオフセットが、
