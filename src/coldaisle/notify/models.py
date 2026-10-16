@@ -429,6 +429,8 @@ class Notification:
         note = ""
         if text.kind == "threshold" and text.threshold is not None:
             note = f"（閾値 {_num(text.threshold, unit)} を超過）"
+        elif text.kind == "at_or_above" and text.threshold is not None:
+            note = f"（閾値 {_num(text.threshold, unit)} 以上）"
         elif text.kind == "range" and text.low is not None and value < text.low:
             note = f"（下限 {_num(text.low, unit)} を下回る）"
         elif text.kind == "range" and text.high is not None and value > text.high:
