@@ -553,6 +553,77 @@ def test_the_same_row_does_not_advance_the_degraded_wait(engine, store):
     assert states(evaluate(engine, 1), DEGRADED) == ["firing"]
 
 
+class SettableClock:
+    """前後どちらへも動かせる壁時計（ホストの時計が戻る場面の再現用）。"""
+
+    def __init__(self, now_ms: int) -> None:
+        self.value = now_ms
+
+    def now_ms(self) -> int:
+        return self.value
+
+
+def test_a_wall_clock_set_back_beyond_silence_s_keeps_new_traces_fresh(store, rule_set):
+    """ホストの時計が silence_s より大きく戻っても、戻った後に書いた行を古いとみなさない。
+
+    途絶を鳴らさず、発火中の EMERGENCY は単調時計で clear_s たてば解く（追いつきを待たない）。
+    """
+    wall = SettableClock(at(0))
+    mono = ManualMonotonicClock()
+    engine = Engine(
+        rules=rule_set,
+        catalog=MetricCatalog.from_yaml(METRICS_PATH),
+        store=store,
+        clock=wall,
+        monotonic=mono,
+    )
+    fand = Fand(store)
+    transitions = []
+    for seconds in range(5):
+        wall.value = at(1000 + seconds)
+        fand.write(wall.value, body("emergency", [OVER_TEMP]))
+        mono.advance_ms(1000)
+        transitions += engine.on_tick()
+    assert states(transitions, EMERGENCY) == ["pending", "firing"]
+    transitions = []
+    for seconds in range(10):
+        wall.value = at(800 + seconds)  # 200 s 戻った。fand も同じ時計で書く
+        fand.write(wall.value, body("normal"))
+        mono.advance_ms(1000)
+        transitions += engine.on_tick()
+    assert states(transitions, SILENT) == []
+    assert states(transitions, EMERGENCY) == []
+    wall.value = at(810)
+    fand.write(wall.value, body("normal"))
+    mono.advance_ms(1000)
+    transitions = engine.on_tick()
+    assert states(transitions, EMERGENCY) == ["resolved"]
+    assert states(transitions, SILENT) == []
+    assert [a for a in store.alerts(limit=10) if a.rule_id == SILENT] == []
+
+
+def test_a_wall_clock_set_back_keeps_a_pending_degraded(store, rule_set):
+    """時計が大きく戻っても DEGRADED の発火待ちを取り消さず、単調時計で 120 s たてば発火する。"""
+    wall = SettableClock(at(1000))
+    mono = ManualMonotonicClock()
+    engine = Engine(
+        rules=rule_set,
+        catalog=MetricCatalog.from_yaml(METRICS_PATH),
+        store=store,
+        clock=wall,
+        monotonic=mono,
+    )
+    fand = Fand(store)
+    transitions = []
+    for k in range(121):
+        wall.value = at(1000 + k) if k < 60 else at(700 + k)  # 60 s 目に 300 s 戻る
+        fand.write(wall.value, body("degraded", [GPU_STALE]))
+        transitions += engine.on_tick()
+        mono.advance_ms(1000)
+    assert states(transitions, DEGRADED) == ["pending", "firing"]
+    assert states(transitions, SILENT) == []
+
+
 def test_a_trace_from_the_future_counts_as_fresh(engine, store):
     """時計が戻って trace の時刻が評価時刻より先にある（年齢が負）。新しいとみなす。"""
     fand = Fand(store)

@@ -688,8 +688,12 @@ class Engine:
             self._trace_seen_mono_ms = self.monotonic.monotonic_ms()
         seen_ms = self._trace_seen_mono_ms
         status = read_fand_status(trace)
-        age_s = (self._now_ms - trace.ts_ms) / 1000
-        # 時計が戻って trace が評価時刻より先にあるときは新しいとみなす（年齢は負。0148 §2.2）
+        # 古さは**いまの壁時計**と比べる。巻き戻さない評価時刻（`_now_ms`）と比べると、
+        # ホストの時計が silence_s より大きく戻ったとき、両方のプロセスが直った時刻で
+        # 書いた新しい行まで古く見え、途絶を誤って鳴らし、時計が追いつくまで EMERGENCY を
+        # 解けない。fand も同じ壁時計で書く（0148 §2.2）。時計が戻って trace が先にある
+        # ときは新しいとみなす（年齢は負）
+        age_s = (self.clock.now_ms() - trace.ts_ms) / 1000
         fresh = status is not None and age_s < silent.silence_s
         transitions: list[Transition] = []
         if silent.enabled:
