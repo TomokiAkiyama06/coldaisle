@@ -200,6 +200,20 @@ Top の分を差し引くとき、Top の掃引（Rear を R に固定）の値�
 L_cpu から `q_top(R | d_r)` を測って使う（§5 の 6。推奨。Rear の段の窓が 3 から 5 に増える）。Top の掃引の `q_top(R)` との差は
 「zone の間の結合の大きさ」として報告し、Air Balance Model の「各 zone の風量は自分の Demand だけで決まる」という近似の誤差として #81 へ渡す。
 
+**結合の上限（1 次元の曲線で表せるか）**: 本番の Air Balance Model は各 zone を自分の Demand だけで評価する。結合が大きいと、Rear が R から
+離れたときの `q_rear + q_top` と協調が間違う。そこで次の 2 つの結合の比を求め、どちらかが `max_coupling_ratio` を超えたら `calibrated` に
+しない（§2.6 の 4 の 5）。そのときは 1 次元の曲線では表せないので、相互作用を入れたモデルを別の決定記録で扱う。
+
+```text
+# (i) Rear を変えたときの Top: Rear の 6 段の q_top(R | d_r)（各段は有効な 3 回の平均）
+coupling_top_by_rear = (max_d_r q_top(R | d_r) - min_d_r q_top(R | d_r)) / mean_d_r q_top(R | d_r)
+# (ii) 零位法の 5 つの組の状態で測った q_rear / q_top と、1 次元の曲線のその Demand の値との差
+coupling_null = max_組 max( |q_rear(組) - q_rear_curve(d_r)| / q_rear_curve(d_r),  |q_top(組) - q_top_curve(d_t)| / q_top_curve(d_t) )
+```
+
+(ii) は Top を変えたときの Rear（組（R, 0.80））と、Front を `d_f*` にしたときの両方（Top / Rear の掃引は Front を R に固定）を含む。
+比べる値の不確かさが比そのものより大きい（判定できない）ときも `calibrated` にしない（§2.6 の 4 の 5）。
+
 - **Top（`q_top`）**: 負荷で増えた CPU Package の熱は AIO の冷却水を経てほぼすべて Top のラジエーターの空気へ移ると近似する。
 
   ```text
@@ -228,9 +242,22 @@ L_cpu から `q_top(R | d_r)` を測って使う（§5 の 6。推奨。Rear の
 そこへ入る**すべての温度と電力の項**から伝えて見積もり、条件を満たさない点は出さない（捨てた理由 `low_signal`）。3 回が同じ値に
 量子化されて範囲の検査を素通りすることや、Top の引き算で電力の増分がほとんど打ち消された雑音だけの分子が通ることを防ぐ。
 
+**窓の平均の不確かさ（相関を見込む）と窓の中の傾き**: 2 分の窓の中の温度と電力はゆっくり変わるので、続いたサンプルは相関する。
+`s² / n` は独立なサンプルを仮定し、独立の証拠が増えないのに不確かさを √n 近く小さくしうるので使わない。代わりに**ブロックに分けた推定**を使う。
+
+- 各窓を時刻で `window_blocks` 個（k）の同じ長さのブロックに分け、ブロックごとに ok の行の平均を取る（ブロックの中の行が §2.2 の覆いを
+  満たさない窓は既に捨てている）
+- 窓の平均の不確かさは、ブロックの平均のばらつきと、窓を k 個の独立のサンプルとしか見なさない値の大きい方にする（保守的）:
+  `u_mean(x̄) = max( sd(ブロックの平均) / sqrt(k),  sd(窓の行) / sqrt(k) )`
+- 窓の中の線形の傾き `b` を最小二乗で求める。`|b| × 窓の長さ` が `max_window_trend`（温度と電力で別の値）を超える窓は、落ち着いていない
+  として捨てる（`window_trend`）。超えない窓でも、傾きが窓の平均を代表の時刻の値として使う誤りを `u_trend(x̄) = |b| × 窓の長さ / sqrt(12)`
+  として足す
+
 ```text
-# 内挿した差 Δx（x は温度の差 T_z - T_front_intake、または電力）の不確かさ
-u_noise(Δx) = sqrt(s_L^2 / n_L + s_B^2 / n_B)       # 窓の中の標準偏差と sample の数（前後の負荷なしの窓は大きい方）
+# 窓 1 つの平均 x̄ の不確かさ（相関と傾きを見込む）
+u_win(x̄) = sqrt(u_mean(x̄)^2 + u_trend(x̄)^2)
+# 内挿した差 Δx（x は温度の差 T_z - T_front_intake、または電力）。w = (t_L - t_1) / (t_2 - t_1)
+u_noise(Δx) = sqrt(u_win(x̄_L)^2 + (1 - w)^2 * u_win(x̄_1)^2 + w^2 * u_win(x̄_2)^2)
 u_drift(Δx) = drift_residual_fraction * |x_2 - x_1| # 直線の内挿で取り切れない曲がりの分
 u_res(ΔT)   = 0.125 / sqrt(12) * sqrt(4)            # DS18B20 の分解能。2 本のプローブ × L と基準の 2 窓。平均しても量子化は減らないとみなす
 u_res(ΔP)   = 1 / sqrt(12) * sqrt(2)                # 電力の 1 W の丸め。L と基準の 2 窓
@@ -303,9 +330,10 @@ airflow_index(d) = q_z(d) / q_z(1.0)
 目安にする（Front を上げても排気の温度差が下がらなくなるのは、吸気が足りている側）。
 
 **設定の値**: `drift_residual_fraction`・`min_signal_to_uncertainty`・`min_delta_t_c`・`min_delta_power_w`・`max_gpu_fan_delta_pct`・
-`max_aux_fan_delta_rpm`・`null_resolution`・`max_null_halfwidth`・`front_coverage_tolerance` は解析の道具の設定
+`max_aux_fan_delta_rpm`・`null_resolution`・`max_null_halfwidth`・`front_coverage_tolerance`・`window_blocks`・`max_window_trend`（温度・電力）・
+`max_coupling_ratio` は解析の道具の設定
 （`config/airflow-characterization.yaml`。Control Config ではない）に `status: provisional` と `basis` 付きで置き、コードに既定値を置かない（ルール 9）。
-提案の初期値は 0.25・10・1.0 °C・20 W・2 %・50 RPM・0.02・0.05・0.05 で、承認の記録で見直す。
+提案の初期値は 0.25・10・1.0 °C・20 W・2 %・50 RPM・0.02・0.05・0.05・4・（0.2 °C・5 W）・10 % で、承認の記録で見直す。
 
 **繰り返しとまとめ方**:
 
@@ -390,11 +418,16 @@ airflow_index(d) = q_z(d) / q_z(1.0)
      観測の最大に約 5% を足す 0120 の規則のまま。ファイルの `approval` は `confirmed` のままで、`basis` を承認の記録に変える
    - `air-balance.yaml`: `zones.<zone>.points` を §2.4 の点にする。`source.status` はファイルに 1 つなので、**次の条件がすべてそろうまで
      `uncalibrated` のまま**にする。本記録で `calibrated` の条件を書くのはこの一覧だけで、ほかの節はここを指す
-     1. Top と Rear の 6 段のすべてで、有効な 3 回の EFU が同条件の検査・信号 ÷ 不確かさの条件（§2.4。Rear は同じ段の L_cpu を含む）と
-        承認の目安（下の 5）を満たす
+     ここで「有効な回」は、§2.2 の窓の覆い・floor の決まり、§2.4 の時刻の内挿・基準のずれ・同条件の検査・窓の傾き・信号 ÷ 不確かさ、
+     零位法の `null_unresolved` / `null_shifted`、§2.6 の 2 の DB の写しの束縛、§2.7 の較正の束縛のすべてを通った回をいう
+     1. Top と Rear の 6 段のすべてで有効な 3 回があり（Rear は同じ段の L_cpu も有効）、承認の目安（下の 5）を満たす
      2. Front の零位法の 5 つの組のすべてで有効な 3 回があり、点の範囲が `d_f*` の不確かさを含めて 0.35〜1.00 を覆う（§2.4 の零位法の 9）
-     3. §2.4a の 1（出口ごとのプローブの補正）と 2（独立の `q_top / q_rear` の比較）の**両方**を済ませ、その結果を承認の記録で所有者が受け入れる
-     4. `balance`・`thermal_limits`・`thermal_inputs` の値が #81 の決定記録で承認されている（下の項）
+     3. GPU の Fan のそろえ方（§5 の 3）が決まって承認され、(a) を選んだときは EFU を出すすべての測定（Top と Rear の掃引・零位法・§2.4a）が
+        同じ固定の duty で行われている（曲線のまま測った下見の Top の EFU は使わない。§2.2）
+     4. §2.4a の 1（出口ごとのプローブの補正）と 2（同じ状態の点での独立の `q_top / q_rear` の比較）の**両方**を済ませ、一致の目安と結果を
+        承認の記録で所有者が受け入れる
+     5. zone の間の結合の比 `coupling_top_by_rear` と `coupling_null` がどちらも `max_coupling_ratio` 以下で、判定できる（§2.4 の結合の上限）
+     6. `balance`・`thermal_limits`・`thermal_inputs` の値が #81 の決定記録で承認されている（下の項）
 
      2 つの zone だけで `calibrated` にしない（比が作れない）。条件を満たす前の値は provisional で、§2.1 の範囲でだけ使う。
      値を書いても `uncalibrated` の間は Air Balance は無効で、Demand は変わらない（0073 §2.3）
@@ -414,7 +447,7 @@ airflow_index(d) = q_z(d) / q_z(1.0)
 - 較正の digest（区間の開始の時点で有効な `calibration_activations` の行の `offsets_sha256`。0096 / 0099）
 - 解析に使う DB の写しの SHA-256・作った時刻（§2.6 の 2）
 - 負荷の定義（GPU の電力の上限・CPU の worker の数）と予備の試行の結果
-- 段ごとの指示の値（3 zone）・lease・開始と終了の時刻（ms）・捨てた理由（`floor_bound` / `unsettled` / `aborted` / `safety_fault` / `room_drift` / `baseline_drift` / `condition_mismatch` / `low_signal` / `null_unresolved` / `null_shifted` / `calibration_changed` / `telemetry_coverage` / `trace_coverage`）と、各窓の代表の時刻
+- 段ごとの指示の値（3 zone）・lease・開始と終了の時刻（ms）・捨てた理由（`floor_bound` / `unsettled` / `aborted` / `safety_fault` / `room_drift` / `baseline_drift` / `condition_mismatch` / `low_signal` / `window_trend` / `null_unresolved` / `null_shifted` / `calibration_changed` / `telemetry_coverage` / `trace_coverage`）と、各窓の代表の時刻
 - 零位法では、観測した Front の値ごとの向き（`+` / `−` / `?`）と二分法の順序
 
 **較正との結びつけ**: 保存された温度にはプローブごとの offset（`config/calibration.json`）が掛かっている。EFU は 2 つのプローブの差を
@@ -460,6 +493,9 @@ manifest に残すことだけを決める。
 - 分母が正で信号 ÷ 不確かさの条件を満たさない点を出さないこと（3 回とも同じ値に量子化された合成の例を含む）。L の時刻が前後の負荷なしの窓の
   真ん中にない合成の例で、時刻の内挿がずれを取り除くこと
 - GPU の Fan・VRM の Fan・ポンプ・他の zone の `effective` が B と L で違う合成の例を、同条件の検査で捨てること
+- 窓の平均の不確かさ: 強く相関した（ゆっくり漂う滑らかな）合成の窓で、ブロックに分けた推定が `s² / n` より大きい不確かさを出し、
+  信号の条件を素通りさせないこと。傾きが `max_window_trend` を超える窓を `window_trend` で捨てること
+- 結合の上限: Rear を変えると Top の風量が `max_coupling_ratio` を超えて変わる合成の筐体で、`calibrated` を提案しないこと
 - 窓の覆い: 収集が途切れて数個の同じ読み値だけが残った窓・`stale` / `suspect` の行を含む窓・trace の `seq` に欠番がある窓・tick の間隔が
   開いた窓・`run_id` が途中で変わる窓・欠けた tick の間に floor が掛かっていた例を、値を計算する前に捨て、3 回のまとめに入れないこと
 - Rear を変えると Top の風量も変わる（結合のある）合成の筐体で、同じ段の L_cpu の `q_top(R | d_r)` を使った `q_rear` が真の値を取り戻し、
@@ -468,7 +504,7 @@ manifest に残すことだけを決める。
   範囲の判定が `u(d_f*)` を含めて行われ、ぎりぎり届かない例で「覆わない」になること
 - Top の引き算で電力の増分がほとんど打ち消され、`q_top` の 3 回がそろっている合成の例で、温度と電力の不確かさを伝えた `u(N)` によって
   雑音だけの正の分子を出さないこと
-- 段・組の有効な回が 3 未満なら値を出さないこと（1 回の観測を範囲 0 として通さない）。§2.6 の 4 の条件の 1〜3 のどれかが欠けた出力では、
+- 段・組の有効な回が 3 未満なら値を出さないこと（1 回の観測を範囲 0 として通さない）。§2.6 の 4 の条件の 1〜5 のどれかが欠けた出力では、
   EFU に provisional の印が付き、`calibrated` を提案しないこと（§2.4a の 1 だけ・2 だけの例を含む）
 - 解析の道具が DB へ書かない・設定へ書かない・control と AI 層から import されないこと（既存の import の検査に足す）
 - 報告の Markdown に個体識別子が出ないこと（`tests/test_repo_hygiene.py` の流儀）
