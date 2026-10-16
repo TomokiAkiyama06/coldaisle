@@ -5,7 +5,8 @@
 - **Date**: 2026-10-16
 - **Supersedes**: なし（既存の決定が「学習の CLI の PR で行う」と先送りした配線を、どの形で行うかを決める。
   [0102](0102-calibration-change-log-settled-points.md) §2.3・[0112](0112-training-replay-path-required.md) §2.1 / §2.2 の 3・
-  [0099](0099-calibration-change-log.md) §2.6・[0096](0096-calibration-binding-digest.md) §5 #4 の決定は置き換えない）
+  [0099](0099-calibration-change-log.md) §2.6・[0096](0096-calibration-binding-digest.md) §5 #4 の決定は置き換えない。
+  [0031](0031-thermal-dataset-contract.md) §3 の Dataset の writer の公開（共通の `os.rename`）も置き換えない。§5 の 9）
 - **関連**: [0031](0031-thermal-dataset-contract.md) §2.5 / [0048](0048-thermal-model-artifact-and-inference.md) /
   [0050](0050-model-confidence-ood-and-authority.md) / [0052](0052-learned-mpc-optimizer-and-hard-constraints.md) §2.1 /
   [0054](0054-offline-evaluation-attribution-and-gates.md) / [0056](0056-model-drift-detection-and-retraining-triggers.md) §2.5 / §2.6 /
@@ -124,16 +125,19 @@ AGENTS.md の「仕様に無い判断をした場合、実装より先に決定�
 限る。本節の 1〜7（7 は `check_artifact_contents` まで）の失敗と、公開の手順の 1〜6 の失敗では、`--out` は作られない
 （ファイルごとの rename はしない）。
 
-公開の後の失敗（`--apply` のときだけ起きる）は、`--out` を消さずに残す。消すと、Registry に登録済みかもしれない bytes の
-唯一の手元の写しを失うためである。
+公開の後の失敗は、`--out` を消さずに残す。消すと、Registry に登録済みかもしれない bytes の唯一の手元の写しを失うためである。
+公開の後の失敗は `--apply` の無い実行でも起きる（公開の手順 7 の親の fsync）。
 
 | 失敗した段 | 終了コード | 残るもの | 回復 |
 |---|---|---|---|
 | 公開の前（検査・学習・公開の手順 1〜6） | 1 | 何も残らない（強制終了なら親の `.coldaisle-train-stage-*` だけ） | 原因を直して同じ引数で再実行 |
-| 公開の後・Registry の登録の失敗（lock・revision・同じ版が登録済み・権限・limits） | 1 | `--out`（3ファイル）。Registry は変わらない（登録の確定点の前） | `--out` の `artifact.json` と `metadata.json` を `coldaisle-registry register` へ渡す。同じ版が登録済みなら `--model-version` を上げて別の `--out` で作り直す |
+| 公開の後・親の fsync の失敗（公開の手順 7。`--apply` の有無に依らない） | 1 | `--out`（3ファイルがそろって見えている。各ファイルと一時ディレクトリは fsync 済みで、永続でないのは親の中の `--out` の項だけ）。`--apply` なら Registry へは進まない | ログに段 `publish_durability` と `--out` の path を出す。中身は完成しているので、そのまま使ってよい（`--apply` なら `--out` の2ファイルを `coldaisle-registry register` へ渡す）。電源断の後に `--out` が消えていたら、同じ引数で再実行する |
+| 公開の後・Registry の登録の失敗（lock・revision・同じ版が登録済み・権限・limits、および artifact ファイルの段の `RegistryDurabilityError`） | 1 | `--out`（3ファイル）。Registry は変わらない（登録の確定点の前） | `--out` の `artifact.json` と `metadata.json` を `coldaisle-registry register` へ渡す。同じ版が登録済みなら `--model-version` を上げて別の `--out` で作り直す |
+| 登録は確定したが永続が確かでない（`registry.json` の置き換えの後の `RegistryDurabilityError`。下記） | 1 | `--out` と、Registry の **candidate**（見えている。production は動かない） | CLI はそのまま**登録の後の検査（`load_version` と L1〜L12）へ進む**。検査が通ってもログに段 `register_durability` を出して終了コード 1。人は `coldaisle-registry status` で candidate があることを確かめる。電源断の後に無くなっていたら、`--out` の2ファイルで `coldaisle-registry register` する。**もう一度 `coldaisle-train --apply` で登録し直さない**（見えている間は「既にある」になる） |
 | 登録の後・`load_version` と L1〜L12 の検査の失敗 | 1 | `--out` と、Registry の **candidate**（production は動かない） | ログに artifact の key と `--out` の path を出す。人が原因を確かめ、`coldaisle-registry retire` で candidate を退ける。CLI は `retire` しない |
 
-構造化ログには失敗した段（`before_publish` / `register` / `post_register_check`）を必ず出し、どの行に当たるかを
+構造化ログには失敗した段（`before_publish` / `publish_durability` / `register` / `register_durability` /
+`post_register_check`）を必ず出し、どの行に当たるかを
 人が取り違えないようにする。
 
 ### 2.5 出力と、既定では Registry を書かないこと
@@ -160,30 +164,51 @@ AGENTS.md の「仕様に無い判断をした場合、実装より先に決定�
    （推測できない名前。衝突したら作り直す）
 4. 3つのファイルを一時ディレクトリへ `O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW` で書き、**それぞれ fsync** する
 5. **一時ディレクトリを fsync** し、開いた fd と path の `(st_dev, st_ino)` が同じことを確かめる（差し替えの検知）
-6. **置き換えない rename** で公開する: Linux の `renameat2(親の fd, 一時ディレクトリ, 親の fd, --out, RENAME_NOREPLACE)`
-   を ctypes で libc から呼ぶ。`--out` が既にあれば `EEXIST` で失敗し、拒否する。POSIX の `os.rename` は、確認と rename の
-   間に（lock に協調しない同じ uid の process が）作った**空のディレクトリを黙って置き換える**ので使わない。
-   writer の lock は協調する書き手どうしにしか効かず、この窓を閉じない。`renameat2` が libc に無い・`ENOSYS`・`EINVAL`
-   （ファイルシステムが対応しない）のときは**失敗にする**（`os.rename` へ落とさない）。リポジトリには同じ用途の既存の
-   実装が無いので、共有の部品として1か所に置く（下記）
+6. **置き換えない rename** で公開する。POSIX の `os.rename` は、確認と rename の間に（lock に協調しない同じ uid の
+   process が）作った**空のディレクトリを黙って置き換える**ので使わない。writer の lock は協調する書き手どうしにしか
+   効かず、この窓を閉じない。OS ごとの手段は次のとおりで、ctypes で libc から呼ぶ小さな関数1つ
+   （仮に `rename_noreplace(親の fd, 一時ディレクトリの名前, 親の fd, --out の名前)`）に閉じる
+
+   | OS（`sys.platform`） | 手段 | 既にあるとき |
+   |---|---|---|
+   | Linux（`linux`） | `renameat2(..., RENAME_NOREPLACE)`（flag の値 1。glibc 2.28 以降が export する） | `EEXIST` |
+   | macOS（`darwin`） | `renameatx_np(..., RENAME_EXCL)`（flag の値 4。`renamex_np` の dir fd を取る形。macOS 10.12 以降） | `EEXIST` |
+   | それ以外 | 無し | — |
+
+   `EEXIST` は「`--out` が既にある」として拒否する。**どちらも使えないとき**（libc に関数が無い・それ以外の OS・
+   `ENOSYS`・`EINVAL` / `ENOTSUP`（ファイルシステムが対応しない））は**失敗にする**（`os.rename` へ落とさない）。
+   リポジトリには同じ用途の既存の実装が無い
 7. **親を fsync** する（rename したディレクトリの項を永続にする）
 8. 失敗したとき（公開の前）は、自分で作った一時ディレクトリの**既知の3つの名前だけ**を unlink して rmdir する。
    後始末の失敗は元の例外を隠さない（`suppress(OSError)`）。`--out` には何も現れない。手順 2 の確認は早く拒否するための
-   もので、拒否の正しさは手順 6 の `RENAME_NOREPLACE` が持つ
+   もので、拒否の正しさは手順 6 の置き換えない rename が持つ。手順 7 の失敗は公開の**後**の失敗で、`--out` を残す（§2.4 の表）
 
 process が強制終了したときに残りうるのは親の中の `.coldaisle-train-stage-*` だけで、`--out` は「無い」か「3つがそろって
 ある」のどちらかになる。残った一時ディレクトリは名前が一意なので再実行を妨げない。自動では消さない（Dataset の writer と
-同じ。人が確かめて消す）。手順は Dataset の writer と共有する（実装の PR で `dataset.py` の非公開の関数を、ファイル名の
-組を引数に取る共有の部品へ移す。手順を写して2つにしない）。いまの `write_dataset` も `os.rename` を使っており同じ窓を
-持つ。共有の部品へ移すときに Dataset の writer も `RENAME_NOREPLACE` にするかは §5 の 9。
+同じ。人が確かめて消す）。lock・一時ディレクトリ・ファイルの書き込みと後始末は Dataset の writer の手順に合わせる。
+**`write_dataset` の挙動（0031 §3 の macOS / Ubuntu 共通の `os.rename`）は本記録では変えない**（§5 の 9 の申し送り）。
 
 #### `--apply` の Registry 側の書き込み
 
 `ModelRegistry.register_candidate` は、artifact を `artifacts/<kind>/<model_id>/<version>/` へ一時ファイルと
-`os.replace` で書いてから、`registry.json` を同じく原子的に置き換える。**`registry.json` の置き換えが登録の確定点**で、
+`os.replace` で書いてから、`registry.json` を同じく原子的に置き換える（`src/coldaisle/control/model_registry.py` の
+`register_candidate` → `_write_artifact` → `_atomic_write`）。**`registry.json` の置き換えが登録の確定点**で、
 その前に強制終了しても残るのは参照されない artifact だけである（snapshot が無い bytes を指す状態は起きない）。
-同じ版の再登録は同じ path へ `os.replace` で上書きするので、残った artifact が再実行を妨げない。したがって Registry 側に
-同じ問題は無く、本記録では変えない。
+同じ版の再登録は同じ path へ `os.replace` で上書きするので、残った artifact が再実行を妨げない。
+
+ただし例外は2つの意味に分かれる。`_atomic_write` は `os.replace` の**後**にディレクトリの fsync が失敗すると
+`RegistryDurabilityError`（「置き換えは済んで見えているが、crash をまたぐ永続が確かでない。呼び出し側は取り消さない」）を出す。
+`register_candidate` は、
+
+- artifact ファイルの段（snapshot の置き換えの前）の例外では、参照されない artifact を消して例外を出す。**Registry は変わらない**
+- snapshot の置き換えを試みた後の `RegistryDurabilityError` だけは、artifact を消さずにそのまま出す。**candidate は登録済みで
+  見えている**（`snapshot_attempted and isinstance(exc, RegistryDurabilityError)` の分岐）
+
+例外の型だけでは2つを区別できない（どちらも `RegistryDurabilityError` になりうる）。そこで CLI は `RegistryDurabilityError`
+を受けたら、同じ limits で Registry を読み直し（`load_version`）、**その ref が candidate として、`metadata.json` と同じ
+`sha256` で見えているか**で分ける。見えていれば「確定したが永続が確かでない」として登録の後の検査へ進み、見えていなければ
+登録の失敗として扱う（§2.4 の表）。それ以外の `ModelRegistryError` は登録の失敗である。Registry 側の書き方は本記録では
+変えない。
 
 順序は **`--out` の公開 → Registry の登録**とする。2つの間で止まったときは `--out` だけがあり、`coldaisle-train` の
 再実行は `--out` が既にあるので拒否される。このときは `--out` の `artifact.json` と `metadata.json` を
@@ -252,9 +277,18 @@ coldaisle-authority raise          → authority を1段   （承認者の uid�
 - `--apply` で candidate になり、production pointer と revision 以外の記録が変わらない。同じ版の2回目は終了コード 1
 - 拒否: 公開物の改ざん・`--replay-path` の取り違え・期間の後の較正の記録・`--calibration` の取り違え・`--out` が既にある・
   `support_axes` に `fan.<zone>` が欠ける。どれも `--out` が作られず、親に一時ディレクトリも残らない
+- 置き換えない rename の分岐（`rename_noreplace`）: `sys.platform` と libc の関数の解決を差し替えて、Linux では
+  `renameat2` を flag 1 で、macOS では `renameatx_np` を flag 4 で呼ぶこと。`EEXIST` を「既にある」に写すこと。関数が無い・
+  それ以外の OS・`ENOSYS` / `EINVAL` / `ENOTSUP` で失敗し、`os.rename` を呼ばないこと（`os.rename` を差し替えて呼ばれないことを
+  確かめる）。CI（Ubuntu）では実物の `renameat2` で、空の `--out` を置き換えないことも確かめる
 - 公開の手順: 一時ディレクトリへ書いた後・rename の前に例外を起こしても `--out` が無いこと。手順 2 の後・rename の前に
   **空の `--out` ディレクトリを lock を取らずに作る**と、`EEXIST` で拒否され、その空のディレクトリが置き換えられずに残ること。
-  `renameat2` が使えない（ctypes の関数を差し替えて `ENOSYS` を返す）ときに失敗し、`os.rename` へ落ちないこと
+  置き換えない rename が使えないときに失敗し、`os.rename` へ落ちないこと
+- 公開の後の親の fsync の失敗（`os.fsync` を親の fd でだけ失敗させる）: `--apply` 無しでも終了コード 1・段 `publish_durability`・
+  `--out` が3ファイルそろって残ること。`--apply` なら Registry へ進まないこと
+- 登録の `RegistryDurabilityError` の2つの意味: snapshot の置き換えの後で起こしたとき（ディレクトリの fsync を失敗させる）は
+  candidate が見えていて、登録の後の検査へ進み、段 `register_durability` で終了コード 1。artifact ファイルの段で起こしたときは
+  Registry が変わらず、段 `register` で終了コード 1
 - 公開の後の失敗: 登録の失敗・登録の後の検査の失敗で終了コード 1、`--out` が残り、ログに段が出ること（§2.4 の表）
 - `--apply` で `--registry-limits` が無いと引数の段で拒否され、何も書かないこと
 - import の走査: `train` を import する module が無いこと、`train` が §2.1 の禁止の module を import しないこと
@@ -282,6 +316,9 @@ coldaisle-authority raise          → authority を1段   （承認者の uid�
 - 引数が多い（必須が 11）。→ 既定値を置かないのは既存の規律（0079 §2.3 / 0099 §2.6）。手順は `docs/thermal-model.md` に
   例を1つ書く
 - 学習のたびに元の CSV から作り直すので遅い（0112 の費用）。→ 人が手で走らせる頻度の操作なので受け入れる
+- 置き換えない rename は OS ごとに違う libc の関数で、NFR-07 の「OS 依存はシリアルデバイス検出のみに閉じる」に1か所
+  増える。→ 小さな関数1つに閉じ、両 OS の分岐と使えないときの失敗を試験する（§2.9）。`os.rename` へ落とすと拒否の約束が
+  成り立たないので、移植性より拒否の正しさを取る
 - `--apply` があることで、学習した人がそのまま Registry を書ける。→ 書けるのは candidate だけで、production へは
   validate・人の承認ファイル・authority の承認の3段を通る。権限も既存の書き手と同じで増えない
 
@@ -308,4 +345,4 @@ coldaisle-authority raise          → authority を1段   （承認者の uid�
 | 6 | RL Supervisor の学習を同じ CLI に入れるか | **入れない**。thermal の candidate が production（`shadow`）になってから別の記録で決める（§2.2） | (a) `coldaisle-train --role supervisor` を今から用意する（0058 §3 のとおり `promotable=False` しか出ず、使い道が無い） |
 | 7 | Q-25（本番でオンライン学習を行うか） | **本記録では行わない**（人が手で実行するだけ。timer を作らない）。Q-25 は #93 / #104 で開いたまま | (a) drift の推奨（0056）を受けて自動で学習・candidate 登録する timer を作る（昇格は人なので制御には届かないが、candidate が増え続ける） |
 | 8 | `--code-commit` | **`--apply` のときだけ必須**、`--out` だけなら任意 | (a) 常に任意（Registry の `code_commit` は `null` を許す）。(b) 常に必須 |
-| 9 | Dataset の writer（`write_dataset`）も `RENAME_NOREPLACE` にするか | **する**（共有の部品へ移す実装の PR で。拒否を強めるだけで、通っていた正しい実行は変わらない） | (a) 学習の CLI だけにし、Dataset の writer は別の Issue で直す |
+| 9 | （申し送り）`write_dataset` にも、確認と `os.rename` の間に作られた空のディレクトリを置き換える同じ窓がある | **本記録では扱わない。** 直すなら 0031 §3（macOS / Ubuntu 共通の `os.rename`）を置き換える別の決定記録で扱う | — |
