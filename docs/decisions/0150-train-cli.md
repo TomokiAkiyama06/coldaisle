@@ -148,10 +148,12 @@ process が強制終了したとき（`SIGKILL`・電源断）は片づけられ
 | 公開の後・Registry の登録の失敗（lock・revision・同じ版が登録済み・権限・limits、および artifact ファイルの段の `RegistryDurabilityError`） | 1 | `--out`（3ファイルと完成の印）。Registry は変わらない（登録の確定点の前） | `coldaisle-registry register --training-output <--out>` で登録する。同じ版が登録済みなら `--model-version` を上げて別の `--out` で作り直す |
 | 登録は確定したが永続が確かでない（`registry.json` の置き換えの後の `RegistryDurabilityError`。下記） | 1 | `--out` と、Registry の **candidate**（見えている。production は動かない） | CLI はそのまま**登録の後の検査（`load_version` と L1〜L12）へ進む**。検査が通ってもログに段 `register_durability` を出して終了コード 1。人は `coldaisle-registry status` で candidate があることを確かめる。電源断の後に無くなっていたら、`coldaisle-registry register --training-output <--out>` で登録する。**もう一度 `coldaisle-train --apply` で登録し直さない**（見えている間は「既にある」になる） |
 | 登録の後・**`--out` の名前の差し替え**（登録の直後の path の照合。登録の直前の照合の後に祖先などの名前が付け替えられた） | 1 | Registry の **candidate**（登録済み。production は動かない。中身は検査済みの bytes で正しい）と、書き手の完成した出力（どこかの名前の下）。`--out` の path は別のものを指す | ログに段 `out_replaced_after_register`・登録した artifact の key（`model_id` と version）・理由（照合で得た2つの `(st_dev, st_ino)`、path が無い・symlink を含む、の別）を出す。成功を報告しない。人が `coldaisle-registry status` で candidate を確かめ、付け替えの経緯を調べて、使わないなら既存の入口 `coldaisle-registry retire` で外す。CLI は自分で `retire` しない。登録の後の L1〜L12 の検査はこの場合も行い、結果をログに出す |
+| 公開の後・**`--out` の中身の書き換え**（手順 6 の後・登録の前または成功の報告の前の再検証で、`COMPLETE.json` か3つのファイルが印やメモリ上の bytes と違う） | 1 | 書き換えられた `--out`。**登録しない**（Registry は変わらない） | ログに段 `out_modified` と、違ったファイルの名前・期待した SHA-256・実際の SHA-256 を出す。成功を報告しない。人が誰が書いたかを確かめ、`--out` を消して別の `--out` で作り直す |
+| 登録の後・**`--out` の中身の書き換え**（登録の後・成功の報告の前の再検証で、登録した bytes と違う） | 1 | Registry の **candidate**（登録済み。中身は登録の直前に検証した bytes で正しい）と、書き換えられた `--out` | ログに段 `out_modified_after_register`・登録した artifact の key（`model_id` と version）・違ったファイルと2つの SHA-256 を出す。成功を報告しない。人が `coldaisle-registry status` で candidate を確かめ、使わないなら既存の入口 `coldaisle-registry retire` で外す。CLI は自分で `retire` しない |
 | 登録の後・`load_version` と L1〜L12 の検査の失敗 | 1 | `--out` と、Registry の **candidate**（production は動かない） | ログに artifact の key と `--out` の path を出す。人が原因を確かめ、`coldaisle-registry retire` で candidate を退ける。CLI は `retire` しない |
 
 構造化ログには失敗した段（`before_publish` / `cleanup_failed` / `out_replaced` / `publish_durability` / `register` / `register_durability` /
-`out_replaced_after_register` / `post_register_check`）を必ず出し、どの行に当たるかを人が取り違えないようにする。
+`out_replaced_after_register` / `out_modified` / `out_modified_after_register` / `post_register_check`）を必ず出し、どの行に当たるかを人が取り違えないようにする。
 
 ### 2.5 出力と、既定では Registry を書かないこと
 
@@ -163,20 +165,41 @@ process が強制終了したとき（`SIGKILL`・電源断）は片づけられ
 | `metadata.json` | `ArtifactMetadata` の strict JSON（`coldaisle-registry register --metadata` へそのまま渡せる形） |
 | `training-report.json` | §2.7 の digest の一覧・split ごとの件数と期間・artifact の SHA-256・Profile の SHA-256・除いた example の件数 |
 
+#### 脅威の前提
+
+`--out` の公開と登録の手順が守る相手は次の2つだけである。
+
+- **(a) 途中の失敗・電源断・強制終了。** どこで止まっても、`--out` は「無い」「未完成と分かる（有効な `COMPLETE.json` が無い）」
+  「完成している」のどれかで、Registry は 0062 / 0104 の確定点の前か後のどちらかにある。残ったものと回復は §2.4 の表に書く
+- **(b) 別のユーザー（`--out` の親や祖先に書ける者）による名前の差し替え。** 親の所有者と権限の検査（手順 1）と、path の照合
+  （根から解き直して inode を比べる）で見つけ、失敗として報告する（防げない窓は報告する。下記）
+
+**同じ uid の悪意あるプロセスは前提の外とする。** 同じ uid は Registry の書き手の権限・設定・`train.py` の実行環境（venv・
+作業ディレクトリ）そのものを書き換えられるので、ここで何を検査しても迂回できる。下の「中身の再検証」（`out_modified` /
+`out_modified_after_register`）は、同じ uid の**誤った操作**（別の端末で同じ `--out` へ誤って書いた、など）を見つける安価な
+検査と位置づけ、悪意への防御とは主張しない。
+
 #### 公開の手順（`--out` を最初に排他的に作り、最後に完成の印を付ける。OS に依らない）
 
 **推奨案（§5 の 10 の (A)）で書く。** 使うのは macOS / Ubuntu で共通の POSIX の操作だけで、OS ごとの関数を呼ばない
 （NFR-07 を変えない）。
 
 1. **`--out` の親を、Dataset の writer と同じ検査で開く。** 既存の `dataset._open_output_root`（`src/coldaisle/dataset.py`）を
-   使い回す: path の各要素を `/` から symlink に追従せず（`O_DIRECTORY | O_NOFOLLOW`）`dir_fd` でたどって開き（無い要素は `0700` で作る。Dataset の writer と同じ）、`..` を拒み、
+   使い回す: path の各要素を `/` から symlink に追従せず（`O_DIRECTORY | O_NOFOLLOW`）`dir_fd` でたどって開き、`..` を拒み、
    開いた親が**実行した uid の所有で、group / world が書けない**ことを確かめる（外れれば `PermissionError` で拒否）。0700 は
    ディレクトリの中身を守るが名前は守らないので、親に書ける別のユーザーが作ったばかりの `--out` の名前を付け替えて差し替える
    ことを、この検査で親に書ける者を書き手（と root）に限って防ぐ。実装の PR ではこの非公開の関数を公開の関数にして
    `train.py` から呼ぶ（挙動は変えない。0031 §3 は置き換えない。手順を写して2つにしない）。**この関数が確かめるのは最後に
    開いた親だけで、祖先は確かめない。** 祖先に group / world が書ける場所（`/tmp` の下など）があると、開いた後に親の名前を
    付け替えられ、親の fd に対する照合は古い親を見続ける。そこで公開と登録の前の照合は、親の fd ではなく
-   **`--out` の絶対 path を根から解き直して**行う（下の「path の照合」）
+   **`--out` の絶対 path を根から解き直して**行う（下の「path の照合」）。
+   **`--out` の親（と祖先）は既にあることを求め、無ければ失敗にする**（作らない）。いまの `_open_output_root` は無い要素を
+   `0700` で作り、作らない形で呼ぶ引数は無い。作った祖先の項はさらにその親の中にあり、手順 6 が fsync するのは `--out` と直接の
+   親だけなので、成功を報告した後の電源断で祖先ごと出力が消えうる。そこで公開の関数にするときに keyword 引数
+   `create: bool`（既定は今の挙動の `True`。Dataset の writer の挙動は変えない）を足し、`train.py` は `create=False` で呼ぶ。
+   `False` では無い要素で `FileNotFoundError` を出し、終了コード 1（学習の前に拒否。`--out` は作られない）。`train.py` 側で
+   先に `os.lstat` で確かめるだけの形は、確かめた後・開く前に消されると作り直してしまうので採らない。この変更も 0031 §3 の
+   公開の手順は変えない
 2. **`os.mkdir(--out の名前, 0o700, dir_fd=親)` で `--out` を排他的に確保する。** 既にあれば `EEXIST` で拒否する。`mkdir` は
    POSIX で原子的で、既にあるもの（他の process が作った空のディレクトリを含む）を**置き換えない**。「既にある出力は必ず拒む」
    の正しさはこの1手が持ち、確認と公開の間の窓（rename による置き換え）がそもそも無い。作った直後に `--out` を
@@ -213,8 +236,8 @@ process が強制終了したとき（`SIGKILL`・電源断）は片づけられ
   直接確かめられる。**ただし照合は時点の確認で、照合と次の操作（link・登録）の間の窓は閉じない。** とくに登録の直前の照合の
   後・`register_candidate` の前に祖先の名前を付け替えられると、登録を防げない。そこで本記録は「差し替えの後の登録を防ぐ」とは
   約束せず、**登録の後にもう一度 path を照合し、外れていれば必ず失敗として報告する**ことを約束する（段
-  `out_replaced_after_register`。§2.4 の表）。このとき登録された candidate の**中身は正しい**: 書き手が登録するのは検査済みの
-  メモリ上の bytes、`register --training-output` が登録するのは印を確かめたときに開いた fd から読んだ bytes で、どちらも path を
+  `out_replaced_after_register`。§2.4 の表）。このとき登録された candidate の**中身は正しい**: 書き手も `register --training-output` も、登録するのは
+  開いた fd を確かめる関数に通して返った bytes（書き手ではメモリ上の bytes と一致を確かめたもの）で、どちらも path を
   読み直さない。問題は `--out` の名前が別のものを指していることだけである
 - この関数は `training_output.py` に置き、`train.py`（手順 5・手順 6 の後・`--apply` の登録の直前・手順 7 の rmdir の前）と
   `coldaisle-registry register --training-output`（`--out` を開いて印を確かめた後、`register_candidate` を呼ぶ直前と直後）の
@@ -226,7 +249,13 @@ JSON として読めて、書かれた3つのファイルの大きさと SHA-256
 書きかけで見えることは手順の上では無いが、読む側は書き手を信用せず毎回この照合をする（ファイルの書きかけや後からの
 差し替えもこれで拒める）。確かめる関数は印に書かれた3つのファイルと `COMPLETE.json` だけを読み、他の名前は見ない。
 
-- `--apply` の登録は手順 6 が成功した後に、メモリ上の同じ bytes で行う（印を読み直さない）。**登録の直前にも**、`--out` の名前が
+- **中身の再検証（同じ uid の誤った操作を見つける安価な検査。上の「脅威の前提」）。** 手順 6 の後、`--apply` の登録の直前に、
+  開いた `--out` の fd を `training_output.py` の確かめる関数に通し（`COMPLETE.json` と3つのファイルの大きさ・SHA-256）、
+  **その関数が返した bytes を登録する**（メモリ上の bytes は使わない）。返した bytes がメモリ上の bytes と違えば、登録せずに段
+  `out_modified` で終了コード 1。`--apply` の無い実行でも、成功を報告する直前に同じ検証をし、外れれば `out_modified` で
+  終了コード 1。`--apply` では登録の後・成功を報告する直前にもう一度検証し、登録した bytes と違えば段
+  `out_modified_after_register` で終了コード 1（candidate は登録済み）
+- `--apply` の登録は手順 6 が成功した後に行う。**登録の直前にも**、`--out` の名前が
   手順 2 で開いたディレクトリを指していることを path の照合で確かめ、違えば登録せずに段 `out_replaced` で
   終了コード 1（直前の照合で見つかった差し替えでは登録しない）。**登録の後にも**同じ照合をし、違えば段
   `out_replaced_after_register` で終了コード 1（直前の照合の後の差し替えは登録を防げないので、登録の後に必ず報告する）。
@@ -364,7 +393,7 @@ bytes が前と同じで、`artifacts/` の下にファイルが増えていな�
   手順 2 の `EEXIST` で拒否され、その空のディレクトリが置き換えられずに残ること。`os.rename` / `os.replace` を `--out` の公開に
   使わないこと（差し替えて呼ばれないことを確かめる）
 - 親の検査（`_open_output_root` の使い回し）: `--out` の親が group / world に書ける・他の uid の所有・path に symlink がある・
-  `..` を含むとき、学習の前に終了コード 1 で拒否し、`--out` が作られないこと
+  `..` を含む・無いとき、学習の前に終了コード 1 で拒否し、`--out` が作られないこと
 - path の照合: `--out` の名前だけでなく、**親や祖先の名前を付け替えて**同じ path に別のディレクトリを置いたとき・path の途中を
   symlink に差し替えたときも不一致になること（親の fd を使った照合では見逃す形を試す）。`/tmp` の下（sticky・world が書ける
   祖先）の `--out` を拒まないこと。`coldaisle-registry register --training-output` でも、印を確かめた後・登録の前に親の名前を
@@ -372,6 +401,12 @@ bytes が前と同じで、`artifacts/` の下にファイルが増えていな�
   付け替えると、candidate が1つ足され（上の (1)〜(4)）、その bytes が印を確かめた bytes と同じで、段
   `out_replaced_after_register`・終了コード 1・ログに登録した version が出て、`RETIRED` の event が足されないこと（`train --apply`
   でも同じ）
+- 中身の再検証: 手順 6 の後・登録の前に `--out` の `artifact.json` を書き換えると、段 `out_modified`・終了コード 1 で Registry が
+  変わらないこと。登録で渡る bytes が確かめる関数の返した bytes であること（関数を包んで確かめる）。`register_candidate` の
+  直後に書き換えると、candidate が1つ足され（上の (1)〜(4)）、段 `out_modified_after_register`・終了コード 1・ログに version が
+  出て、`RETIRED` の event が足されないこと。`--apply` 無しでも、成功の報告の前に書き換えると `out_modified` で終了コード 1
+- 親が無い: `--out` の親（または祖先）が無いと、学習の前に終了コード 1 で拒否し、何も作らないこと（親を作らない）。公開の
+  関数の `create` の既定（`True`）で Dataset の writer の既存の試験がそのまま通ること
 - 名前の差し替え: 手順 2 の後・手順 5 の link の前に `--out` の名前を付け替えて別のディレクトリを置くと、link をせず段
   `out_replaced`・終了コード 1 で、置かれた別のディレクトリに何も書かず消さないこと。手順 6 の後・登録の前に同じことをすると、
   段 `out_replaced`・終了コード 1 で Registry が変わらず、成功を報告しないこと
