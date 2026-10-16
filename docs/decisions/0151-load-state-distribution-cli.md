@@ -206,15 +206,24 @@ DB に残る記録で、これを直接に言える欄は無い（2026-10-16 の
     行が無ければ 0。0010 の注釈のとおり、`legacy_until_ms` は空の DB でも作った時刻（`:now_ms`）で書かれるので、
     時刻では移行の前の行と今の行を見分けられない。`seq ≤ legacy_through_seq` の行だけが移行の前の行で、その前に
     移行の前の削除で消えた行があったかは分からない
-  - `pruned_through_seq`（0007）: 保持期間の削除（`ts_ms < cutoff` の行）で消した行の `seq` の上限。消していなければ 0
+  - `pruned_through_seq`（0007）: 保持期間の削除（`ts_ms < cutoff` の行）で消した行の `seq` の**上限**。消していなければ 0。
+    削除は `delete_control_traces_before()` が `ts_ms` で行うので、時計が戻ると `seq` の先頭からの連続にならず、
+    途中の `seq` だけが消え、それより小さい `seq` の行が残ることがある（`tests/test_control_trace_api.py` の seq 1 と 3 を
+    残して 2 を消す例）。そこで本記録は `pruned_through_seq` を「消したことがあるか（0 か）」と「この値以下の
+    `seq` は消えたかもしれない」の判断にだけ使い、「この値以下がすべて消えた・この値より上はすべて残る」とは読まない
+- **区間の中で `seq` が連続していることを求める。** 区間の最も小さい `seq` から最も大きい `seq` までに欠番（穴）が
+  1 つでもあれば、その区間のすべての時刻を `undetermined` にする。欠けた tick に不一致や書き込みの失敗があったかも
+  しれないので、残った行だけで割合を数えない。欠番は削除のほかにも起こりうる: 書き手の `INSERT OR IGNORE` は
+  重複で捨てた挿入の番号を使わないと注釈している（`store/db.py` の `record_control_trace` の「`seq` は欠番を持ちうる」）。
+  理由を見分けずに同じく保守的に扱い、出力に穴のあった区間の数と欠番の数（`seq_gaps`）を出して、人が気づけるようにする
 - 区間の最も小さい `seq` を `s0` とする。区間の始まりを**確かめられる**のは次のどちらかのとき:
   1. `s0 - 1` の行が残っていて、`s0` の行との `ts_ms` の差が `trace_max_age_ms` を超える（残っている行で途切れを見た）
   2. `s0 = 1` で、`legacy_through_seq = 0`（移行の前の行は無かった）
-- それ以外（`s0 - 1` の行が無い。`s0 - 1 ≤ pruned_through_seq` なら削除で消えた、`s0 ≤ legacy_through_seq` なら
-  移行の前の行）は、区間の前半が消えたかもしれないので、その区間のすべての時刻を `undetermined` にする。区間の
+- それ以外（`s0 - 1` の行が無い。理由が削除でも欠番でも見分けない。`s0 ≤ legacy_through_seq` なら移行の前の行）は、区間の前半が消えたかもしれないので、その区間のすべての時刻を `undetermined` にする。区間の
   始まりが生データ（`fan.*.pwm`）の保持期間の外にあるときも同じ。消えた前半の一致を推測しない
 - `legacy_until_ms` に近い時刻に書かれたというだけでは、今の行を拒まない（新しい DB では 0010 が
-  `legacy_through_seq = 0` を記録し、最初の tick は `seq = 1` から始まるので 2 で確かめられる）
+  `legacy_through_seq = 0` を記録し、最初の tick は `seq = 1` から始まるので 2 で確かめられる。ただし区間の中の
+  `seq` の連続は別に求める）
 
 **`bios` の前提**（引き継ぎの Max と BIOS を取り違えない）:
 
@@ -324,7 +333,9 @@ DB に残る記録で、これを直接に言える欄は無い（2026-10-16 の
   そうした tick が `pwm_mismatch_max_ratio` を超えると、合っている tick も含めて区間ごと `undetermined`
 - `seq` の境目（§2.6a）: 新しい DB（`legacy_through_seq = 0`）で最初の tick が `legacy_until_ms` から
   `trace_max_age_ms` 以内に書かれても、`seq = 1` から続く区間は確かめられて `fand` になりうる。`seq ≤ legacy_through_seq`
-  の行から始まる区間・`s0 - 1 ≤ pruned_through_seq` で前の行が消えた区間は `undetermined`
+  の行から始まる区間・`s0 - 1` の行が無い区間は `undetermined`
+- `seq` の穴（§2.6a）: `ts_ms` で消して seq 1 と 3 を残し 2 を消した合成データ（`tests/test_control_trace_api.py` と同じ形）で、
+  `s0 = 1` でも区間が `undetermined` になる。重複で捨てた挿入による欠番も同じで、`seq_gaps` に数が出る
 - 時計の戻り（§2.6a）: `seq` の順で `ts_ms` が戻る合成データで、区間が `seq` の順でたどられ（時刻の順に並べ替えない）、
   戻った所で区間が切れない。評価時刻の窓に 2 つの区間の trace が入ると `undetermined`
 - `bios` の 1（§2.6a）: trace が 1 行でもある DB（`t` より後の trace だけでも）・`pruned_through_seq` が 0 でない DB・
@@ -333,8 +344,8 @@ DB に残る記録で、これを直接に言える欄は無い（2026-10-16 の
 - 区間の割合の数え方（§2.6a）: flag が false の tick で PWM がたまたま観測と合う合成データで、その tick が区間の
   割合の不一致に数えられ、tick ごとの判定と区間の判定が同じ関数の結果になる
 - 区間の全体（§2.6a）: `--start` より前から続く trace の区間で、前半の PWM が外れ `--start` 以後だけが合う合成データを
-  `undetermined` にする（`--start` を区間の途中のどこに置いても判定が変わらない）。区間の最初の行の前の `seq` が
-  削除で消えた DB では、その区間を `undetermined` にする。`--end` の後に外れが続く場合も同じ
+  `undetermined` にする（`--start` を区間の途中のどこに置いても判定が変わらない）。区間の最初の行の前の `seq` の行が
+  無い DB では、その区間を `undetermined` にする。`--end` の後に外れが続く場合も同じ
 - 区間の始めの境目（§2.3）: `--start` の `settle_ms` 前に負荷が変わったデータで、`--start` 直後の評価時刻が
   `transition` になる（さかのぼった区間の時刻は件数に入らない）。`--start` より前に行が無いデータでは、区間の
   最初から `settle_ms` が `transition` になり、`start_lookback_incomplete: true` が出る。`--start` の
