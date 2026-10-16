@@ -3,7 +3,9 @@
 - **種別**: Decision Record
 - **Status**: Proposed
 - **Date**: 2026-10-16
-- **Supersedes**: なし（既存の決定が「学習の CLI の PR で行う」と先送りした配線を、どの形で行うかを決める。
+- **Supersedes**: [0062](0062-model-registry-operations.md) の §2.1 の `register` のうち、`--metadata` / `--payload` で
+  `kind` = `thermal_model` かつ `capability` = `counterfactual_action` の artifact を登録できる点のみ（§2.5 / §5 の 14。0062 の他の点は
+  変えない）。それ以外は置き換えない（既存の決定が「学習の CLI の PR で行う」と先送りした配線を、どの形で行うかを決める。
   [0102](0102-calibration-change-log-settled-points.md) §2.3・[0112](0112-training-replay-path-required.md) §2.1 / §2.2 の 3・
   [0099](0099-calibration-change-log.md) §2.6・[0096](0096-calibration-binding-digest.md) §5 #4 の決定は置き換えない。
   [0031](0031-thermal-dataset-contract.md) §3 の Dataset の writer の公開（共通の `os.rename`）も置き換えない。§5 の 9）
