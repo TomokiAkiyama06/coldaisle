@@ -165,7 +165,7 @@ RPM の比と正規化した EFU の差（取り付けた状態で風量が回�
 - 応答の時間: 上りの段の、`effective` が変わった tick から trace の回転数が新しい段の値の ±5% に入って留まった tick まで（0126 と同じ測り方。
   tach の更新 1500 ms を足して記録）。下りは `ramp_down` の律速なので記録だけにする
 - **上りと下りから 1 つの表へ**: `pwm_to_rpm` は方向を持たない 1 つの表なので、段ごとの候補の値は、3 回の上りと下りの**すべての観測**（中ほどの
-  段は 6 個。折り返しの 1.00 と両端の段は観測の数が少ない）の中央値とする。ばらつき（§2.6 の 5）も同じすべての観測の範囲 ÷ 平均で見るので、
+  段は 6 個。折り返しの 1.00 と両端の段は観測の数が少ない）の中央値とする。ばらつき（§2.6 の 5）も同じすべての観測の**範囲 ÷ 中央値**で見るので（分母は候補の値と同じ中央値にそろえる）、
   ヒステリシスが `approval.max_rpm_spread` を超える段は目安を満たさず値を出さない（方向ごとの表は `FanProfile` が持てないので作らない）
 - 出すもの: zone ごとの RPM(d)（上りと下りのすべての観測の中央値・範囲。`pwm_to_rpm` の候補）、観測の最大 RPM、上りと下りの差（ヒステリシス。
   方向ごとの 3 回の中央値の差）。`airflow_index` は出さない（§2.1）
@@ -579,7 +579,7 @@ airflow_index(d) = q_z(d) / q_z(1.0)
 
 | 検査（節） | 量 | `u` の求め方 | 比べ方 |
 |---|---|---|---|
-| 落ち着き（§2.5） | 直近 `settle.span_s` のブロックの平均の最大 − 最小 | 分解能 `u_res` × √2 | 上側 ≤ `settle.max_range_air_c` / `settle.max_range_chip_c` |
+| 落ち着き（§2.5） | 直近 `settle.span_s` のブロックの平均の最大 − 最小 | その metric の分解能（`resolution.air_c`・`resolution.cpu_package_c`・`resolution.gpu_core_c`・`resolution.board_connector_c`）の `u_res` × √2。設定が欠ければ解析は何も出さずに失敗する（§2.6b） | 上側 ≤ `settle.max_range_air_c` / `settle.max_range_chip_c` |
 | 窓の傾き（§2.4） | `|b| × 窓の長さ` | ブロックの平均から求めた傾きの標準誤差 × 窓の長さ | 上側 ≤ `max_window_trend` |
 | 基準のずれ（§2.4） | 前後の負荷なしの窓の差 `|x_2 − x_1|` | `sqrt(u_win(x̄_1)^2 + u_win(x̄_2)^2)` | 上側 ≤ `max_baseline_shift_c` |
 | 同条件: GPU の Fan（§2.4・零位法の 0） | 窓の中央値の差 | 目標値の 1 % の丸め（1/√12 × √2） | 上側 ≤ `max_gpu_fan_delta_pct` |
@@ -587,8 +587,8 @@ airflow_index(d) = q_z(d) / q_z(1.0)
 | 部屋（§2.5・零位法の 0） | セッションの中の `air.room` のブロックの平均の最大 − 最小 | `u_res` × √2 | 上側 ≤ `max_room_drift_c` |
 | 温度上昇・電力の増分の最小（§2.4） | `ΔT_z` / `ΔP` | §2.4 の `u(ΔT_z)` / `u(ΔP)` | 下側 ≥ `min_delta_t_c` / `min_delta_power_w` |
 | 信号 ÷ 不確かさ（§2.4） | `値 / u(値)` | — | ≥ `min_signal_to_uncertainty`（それ自体が不確かさの検査） |
-| 回転数のばらつき（§2.6 の 5） | 3 回の上りと下りのすべての観測（n 個）の範囲 ÷ 平均 | 各観測の `u`（窓の中央値の `u_win` と tach の更新の量子化）から、範囲は √2 × 最大の `u`、平均は 最大の `u` / √n | `(範囲 + k × u(範囲)) / (平均 − k × u(平均))` ≤ `approval.max_rpm_spread` |
-| EFU のばらつき（§2.6 の 5） | 3 回の範囲 ÷ 平均 | 各回の §2.4 の `u(q)` から同じく | 同じ形で ≤ `approval.max_efu_spread` |
+| 回転数のばらつき（§2.6 の 5・§2.3） | 3 回の上りと下りのすべての観測（n 個）の範囲 ÷ **中央値**（候補の値と同じ。§2.3・§2.6 の 5 と同じ分母） | 各観測の `u`（窓の中央値の `u_win` と tach の更新の量子化）から、範囲は √2 × 最大の `u`、中央値は 1.25 × 最大の `u` / √n（中央値の標本の効率） | `(範囲 + k × u(範囲)) / (中央値 − k × u(中央値))` ≤ `approval.max_rpm_spread` |
+| EFU のばらつき（§2.6 の 5） | 3 回の範囲 ÷ **平均**（段の値と同じ平均。§2.4） | 範囲は √2 × 各回の §2.4 の `u(q)` の最大、平均は下の「回の平均の不確かさ」の `u_ind(平均)`（共通の項は範囲と平均の比で打ち消し合うので足さない） | `(範囲 + k × u(範囲)) / (平均 − k × u(平均))` ≤ `approval.max_efu_spread` |
 | GPU の Fan の duty の影響（§2.4） | `effect_top` / `effect_rear` / `effect_null` | 両方の duty の段の平均の `u(平均)`（下の「回の平均の不確かさ」）から伝える | 上側 ≤ `max_gpu_fan_duty_effect` |
 | 結合の比（§2.4） | `coupling_top_by_rear` / `coupling_null` | 各段の平均の `u(平均)`（下の「回の平均の不確かさ」）から伝える | 上側 < `max_coupling_ratio` |
 | 零位法の区間の風量の誤差（零位法の 8） | `u_bracket(q_front) / q_front` | —（それ自体が不確かさ。`bound_coverage_factor` を掛けて比べる） | `k × u_bracket / q_front` ≤ `null.max_bracket_flow_error` |
@@ -635,6 +635,7 @@ u(平均)        = sqrt( u_ind(平均)^2 + u_shared^2 )      # u_shared は回�
 | 同条件 | `max_gpu_fan_delta_pct` / `max_aux_fan_delta_rpm` | 2 / 50 | §2.4 |
 | 信号 | `min_signal_to_uncertainty` / `min_delta_t_c` / `min_delta_power_w` | 10 / 1.0 / 20 | §2.4 |
 | 分解能 | `resolution.air_c` / `resolution.power_w` / `resolution.gpu_fan_pct` | 0.125 / 1 / 1 | §2.4・§2.6a |
+| 分解能（落ち着きの判定のチップの温度） | `resolution.cpu_package_c` / `resolution.gpu_core_c` / `resolution.board_connector_c` | 未決（hwmon の `cpu.package` と T_SENSOR の `board.connector_12v2x6` は driver で刻みが違うので、実機の値の刻みを確かめて決める）/ 1（NVML の温度は整数の °C）/ 未決（同上） | §2.5・§2.6a |
 | CPU の負荷の余裕 | `cpu_floor_margin_demand` | 0.05 | §2.2 |
 | 負荷の定義（manifest と NVML の電力の上限・worker の数と照らす） | `load.gpu_power_limit_w` / `load.gpu_power_limit_max_w` | 300 / 450 | §2.2・§5 の 5 |
 | 零位法 | `null.combos` / `null.settle_s` / `null.observe_s` / `null_resolution` / `max_null_halfwidth` / `front_coverage_tolerance` / `null.repetitions` / `null.min_distinct_days` / `null.max_bracket_flow_error` | （0.35, 0.35）・（0.60, 0.60）・（0.80, 0.60）・（0.60, 0.80）・（1.00, 1.00） / 30 / 30 / 0.02 / 0.05 / 0.05 / 3 / 2 / 5 % | §2.4 |
