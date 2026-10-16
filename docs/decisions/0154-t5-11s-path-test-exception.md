@@ -1,0 +1,215 @@
+# 決定記録 0154: T5 の約 11 s の経路を、試験専用の `WatchdogSec` / `watchdog_timeout_ms` 11 s で再現する
+
+- **種別**: Decision Record
+- **Status**: Proposed
+- **Date**: 2026-10-16
+- **Supersedes**: [`0121`](0121-hardware-test-procedure.md) §2.1 の「試験専用の設定は §2.8 の stall の試験だけで使う」に、
+  本記録の T5 の約 11 s の経路の試験（§2.3）を例外として1つ足す。0121 §2.1 のほかの決まり（制御の経路を迂回しない・
+  所有者が現地・記録・中止の基準・負荷）と、§2.7 の測り方・温度の合格の条件は**変えない**
+- **関連**: [`0119`](0119-safety-values-first-host.md) §2.12 / §2.13 /
+  [`0121`](0121-hardware-test-procedure.md) §2.1 / §2.7 / §2.8 / §2.10 / §5 の 3 /
+  [`0127`](0127-t5-gpu-steady-450w.md) §2.4 / §2.5 / §5 の 2（Rejected。§5 の 2 の (a) を所有者が選んだ）/
+  [`0080`](0080-fand-systemd-unit.md) §2.3 / §2.4 / §2.5 / §5 の 1・3 /
+  [`0128`](0128-gpu-fan-curve-service.md) / [`0130`](0130-gpu-fan-quieter-curve.md) §2.2 /
+  [`0028`](0028-fan-control-contracts.md) §2.9（承認点 2・3）/
+  `docs/fan-header-mapping.md`「0121 の試験の結果」T5 / `docs/ubuntu-deploy.md` 6.5 /
+  `deploy/systemd/coldaisle-fand.service` / `src/coldaisle/safety_handoff.py`
+- **対象 Issue**: #74
+
+---
+
+## 1. Context
+
+### 1.1 約 11 s の経路とは何か
+
+fand が hang したときに Max になるまでの順序は、0080 §2.5 のとおり
+「watchdog の時間切れ → `WatchdogSignal`（SIGABRT）→ `TimeoutAbortSec` で SIGKILL → cgroup の停止 →
+`ExecStopPost`（`safety_handoff.py` が root で3 zone に Max を書く）」である。最悪時間は
+**`WatchdogSec` 5 s + `TimeoutAbortSec` 5 s + 引き継ぎ実行部の時間（1 s 未満）≒ 約 11 s**（0080 §2.3・0119 §2.12）。
+この間、Fan は止まる直前に書いた低い Demand のまま回る。
+
+2026-10-14 の T5（`docs/fan-header-mapping.md`）では、`SIGSTOP` したプロセスにも systemd が watchdog の signal の後に
+`SIGCONT` を送るため、fand は SIGABRT（faulthandler）で終わり、`TimeoutAbortSec` を待たずに引き継ぎが走った。
+Max までは 12 試行すべてで 5143〜5324 ms（**約 5.2 s の経路**）で合格した。
+
+SIGABRT で終わらない hang（signal を処理できない詰まり方）では `TimeoutAbortSec` の 5 s も待ち、その後の SIGKILL から
+Max までは実測 44〜51 ms（予備確認の `kill -KILL`）である。つまり実際の最悪は
+**5000 + 5000 + 約 50 ms ≒ 10.05 s**（systemd の処理の遅れを除く）で、これが「約 11 s の経路」である。
+5.2 s の試行は Max を確かめた直後に負荷を止めたので、その後の約 5 s の上がりは測っていない（0127 §2.5）。
+0119 §2.13 は `watchdog_timeout_ms` を `confirmed` にする条件として、この最悪時間の間の温度の上昇が上限までの余裕に
+収まることを求める。
+
+### 1.2 本番の設定では再現できない
+
+- SIGABRT で終わらない hang を外から作る手段が無い。`SIGSTOP` は systemd の `SIGCONT` で解け、SIGABRT で終わる
+- `WatchdogSignal` を無視される signal に変えると、`SIGCONT` で fand が動き出し、Demand を書き続ける。
+  「低い Demand のまま固まる」状態にならない
+- `TimeoutAbortSec` の経路そのもの（SIGKILL → 引き継ぎ）は予備確認で 44〜51 ms と測ってある。足りないのは
+  **固まった時間が約 10 s 続くときの温度**だけである
+
+### 1.3 これまでの判断
+
+- 所有者は 0127 §5 の 2 で (a)「試験専用の設定で再現する」を選んだ（`safety.yaml` の `watchdog_timeout_ms` と unit の
+  `WatchdogSec` を試験の間だけどちらも 11 s にし、(i) CPU 全スレッド・(iii) CPU・(iii) GPU を少なくとも行う）
+- 0121 §2.1 は試験専用の設定を §2.8 の T6 にしか認めないので、実施の前にこの記録で例外と中身を決める
+  （`docs/fan-header-mapping.md` の T5「残り」）
+- 2026-10-16、所有者は「`enable` の前にこの試験を行う」を選んだ。あわせて、unit のタイムアウト
+  （`TimeoutAbortSec`・`TimeoutStopSec`・`TimeoutStartSec`・`RestartSec`）は `provisional` のまま進む、アイドルの
+  Guard の発火（T1 で 431 回）はこのまま `enable` してよく静音化は別の Issue、`/opt` は d3c5404 のまま `enable` する、
+  と決めた。これらは本記録の範囲外である
+
+## 2. Decision
+
+### 2.1 試験の目的
+
+`WatchdogSec` 5 s・`TimeoutAbortSec` 5 s の本番の deadman で起こりうる最悪の時間（約 10.05 s）以上、Fan を止める直前の
+低い Demand に固めたまま負荷をかけ続け、その間と Max の後 30 s の温度の上昇が、0121 §2.7 の余裕に収まることを確かめる。
+**本番の値（`watchdog_timeout_ms` 5000・`WatchdogSec` 5s・`TimeoutAbortSec` 5s）は変えない。** 11 s は固まる時間を
+作るための試験の中だけの値で、本番へは持ち込まない。
+
+### 2.2 合格の条件
+
+| 測るもの | 合格の条件 | 根拠 |
+|---|---|---|
+| `SIGSTOP` から Max（3 zone の `pwmN_enable=0`、20 ms ごとに読む。CLOCK_MONOTONIC）まで | **10100 ms 以上・12000 ms 以下** | 下限: 本番の最悪 5000 + 5000 + SIGKILL から Max の実測の最長 51 ms を 100 ms に切り上げた値。これより短い試行は本番の最悪を覆わないので判定に使わない。上限: 11000 + SIGABRT から Max の実測の最長（T5 の 324 ms、apport が core を受けた予備確認の 0.86 s）に余裕を足した値。超えたら SIGABRT の経路が想定どおりでない |
+| 止めている間と Max の後 30 s の温度 | 0121 §2.7 のまま: 開始 + 上昇が上限（`absolute_temp_ceiling_c` 90 °C、T_SENSOR 80 °C）より 5 °C 以上低い（`cpu.package`・`gpu.0.core` は 85 °C 未満、`board.connector_12v2x6` は 75 °C 未満） | 0119 §2.13・0121 §2.7。本記録で緩めない |
+| 止める直前の `effective` | (i) は記録したアイドルの値のまま、(iii) はアイドルの値 + 0.05 以内（0121 §2.7。外れた試行は使わない） | 「低い Demand のまま固まる」最悪の条件にするため |
+| 位相（`SIGSTOP` の時刻 − systemd が最後の `WATCHDOG=1` を受けた時刻） | 100 ms 以内の試行を各条件で少なくとも 1 つ（0121 §2.7） | 固まる時間を最も長くするため |
+
+試験の値で固まる時間は約 11.1〜11.9 s になり、本番の最悪（約 10.05 s）より約 1 s 長い。温度の面で保守的な側である。
+
+参考として、Max から3 zone の `fanN_input` が全開の 90% に届くまでの時間も記録する（判定には使わない）。
+
+### 2.3 試験専用の設定（例外の中身）
+
+本番の設定を書き換えず、0121 §2.1 の T6 と同じく**別の場所の設定と unit の drop-in**で差し替える。
+
+1. **設定**: `/etc/coldaisle/control-config-test-t5-11s/` に、本番の `/etc/coldaisle/control-config/` の4ファイルを
+   所有者・権限ごと写し、`safety.yaml` の `watchdog_timeout_ms.value` だけを `5000` → `11000` にする（`status` は
+   `provisional` のまま。`basis` は足さない）。ほかの値はすべて本番と同じ。**`hardware_write_fail_exit_ms` は 5000 のまま**
+   （0080 §2.6 の `hardware_write_fail_exit_ms <= watchdog_timeout_ms` を満たし、T2 で測った書き込みの失敗の経路は変えない）。
+   置いた後に `diff -r` で、違いがこの1行だけであることを確かめる
+2. **drop-in**: `/etc/systemd/system/coldaisle-fand.service.d/t5-11s.conf` に次の2つだけを書く
+   - `ExecStart=` の空行と、本番の `ExecStart`（置いてある unit の値をそのまま。導入先で足した引数も含む）の
+     `--config-dir` だけを上の場所に替えた行
+   - `WatchdogSec=11s`
+
+   `TimeoutAbortSec`・`TimeoutStopSec`・`TimeoutStartSec`・`RestartSec`・`WatchdogSignal`・`ExecStopPost`・
+   `KillMode`・hardening は**変えない**。0080 §2.3 の `WATCHDOG_USEC <= watchdog_timeout_ms` は 11000 どうしで等しく、
+   食い違えば fand は終了コード 4 で制御を取らない（安全側）
+3. **期間**: 置くのは試験のスクリプトの実行の間だけ。スクリプトの先頭で置いて `systemctl daemon-reload`、終了時
+   （正常・中止・失敗のどれでも。`trap`）に drop-in と設定のディレクトリを消して `daemon-reload` する
+4. **元に戻ったことの確認**（スクリプトの最後と、所有者が目で）:
+   - `systemctl show -p WatchdogUSec --value coldaisle-fand` が `5s`
+   - `systemctl show -p ExecStart --value coldaisle-fand` に `--config-dir /etc/coldaisle/control-config ` がある
+   - `/etc/systemd/system/coldaisle-fand.service.d/` に `t5-11s.conf` が無く、`/etc/coldaisle/control-config-test-t5-11s/` も無い
+   - `systemctl is-enabled coldaisle-fand` が試験の前と同じ（`disabled`）。**drop-in がある間に `enable` しない**
+   - 3 zone の `pwmN_enable` が `5`（`systemctl stop` で BIOS へ返した）
+
+一時的な unit（`systemd-run` など）は使わない。本番の unit と違う形で動かすと、`ExecStopPost`・`KillMode`・権限が
+本番と同じであることを別に確かめる必要が出るためである。
+
+### 2.4 試験の条件と回数
+
+`coldaisle-gpu-fan` を 0130 の曲線で動かした状態で、0121 §2.7 のとおり行う（負荷は GPU 600 W と CPU 全スレッドを別々に）。
+
+| 順 | 条件 | 回数 | 目的 |
+|---|---|---|---|
+| 1 | (ii) アイドル | 有効な試行 1 回 | 同じ日のアイドルの `effective` を記録する（(i)・(iii) の基準）。アイドルの 11 s の上がりも記録する |
+| 2 | (i) CPU 全スレッド | 有効な試行 1 回 | 5.2 s の経路で CPU の上がりが最も大きかった（40 → 72 °C） |
+| 3 | (iii) CPU 10 分 → CPU 全スレッド | 有効な試行 1 回 | 冷却水が温かい状態からの CPU（43 → 74 °C） |
+| 4 | (iii) GPU 600 W 10 分 → GPU 600 W | 有効な試行 1 回 | 温まった状態からの GPU |
+
+(i) GPU 600 W を足すかは §5 の 1。(ii) の負荷の定常は、止める前に Fallback と floor が Demand を上げているので
+本記録では行わない（5.2 s の経路の結果で開始の温度の高い側を押さえている）。
+
+有効な試行は、§2.2 の位相・`effective`・時間の下限を満たし、中止の基準で止めなかったもの。満たさない試行は記録して
+やり直す。1 条件のやり直しは 2 回まで、それでも得られなければ止めて所有者が扱いを決める。
+
+### 2.5 安全の扱い
+
+- **制御の経路を迂回しない**（0121 §2.1）。Demand は fand の auto で決まり、Guard と Critical Safety を通る。
+  Max を書くのは引き継ぎ実行部（Critical Safety の一部）だけで、人も試験のスクリプトも PWM を書かない。LLM は関わらない
+- **中止の基準**は 0121 §2.1（`gpu.0.core` は 0130 §2.2 の 85 °C）と同じ: `cpu.package` 88 °C・`gpu.0.core` 85 °C・
+  `board.connector_12v2x6` 70 °C。スクリプトの見張りは T5 と同じく `cpu.package` 85・`board.connector_12v2x6` 67 °C
+  （3 °C 手前）・`gpu.0.core` 85 °C で動く
+- **止めている間に見張りに届いたら**、負荷を止め、すぐに fand の main PID へ `SIGKILL` を送る（管理ソケットは止まった
+  fand に届かない）。SIGKILL の後は本番の `TimeoutAbortSec` の経路と同じく `ExecStopPost` が Max を書く（実測 44〜51 ms）。
+  その試行は合格にしない
+- **`SIGSTOP` から 12000 ms で Max が見えなければ**、同じく `SIGKILL` を送る。試行は無効とし、原因（journal の
+  `Watchdog timeout` と `safety_handoff_completed`）を確かめるまで次の条件へ進まない。固まる時間は最長でも約 12 s に限る
+- それでも Max にならなければ 0121 §2.1 のとおり `systemctl stop coldaisle-fand`、それも効かなければ
+  `pwmN_enable` に `5` を書く
+- 所有者が現地にいて、開始と終了を行う（0121 §2.1）
+
+### 2.6 手順の骨子
+
+所有者の作業用のディレクトリ（リポジトリの外）に、T5 のスクリプトを元にした試験のスクリプトを用意し、内容を事前に
+示してから所有者が実行する（`! sudo bash <作業用のディレクトリ>/deploy/t5-11s.sh ii-idle i-cpu iii-cpu iii-gpu600`）。
+スクリプトの中身はリポジトリに置かない（実機の識別子を含むため。AGENTS.md ルール 10）。
+
+1. 前提の確認: fand が止まっていて `disabled`、本番の unit に drop-in が無い、`coldaisle-gpu-fan` が 0130 の曲線で
+   動いている、ほかの CPU 負荷（Docker のコンテナなど）が無い、CPU 電力が 40 W 未満
+2. §2.3 の 1・2 を置き、`daemon-reload`。`WatchdogUSec` が `11s`、`ExecStart` の `--config-dir` が試験の場所であることを確かめる。
+   `trap` で終了時の後片付け（§2.3 の 3・4）を登録する
+3. 条件ごとに: `systemctl start`（`enable` しない）→ STARTUP の 20 s → 条件の準備（落ち着きの判定・(iii) の 10 分と
+   アイドル + 0.05 への戻り）→ `WatchdogTimestampMonotonic` が変わった直後に `SIGSTOP` → (i)・(iii) はその直後に負荷を始める
+   → 20 ms ごとに `pwmN_enable` を読み Max を待つ（§2.5 の 12000 ms と見張り）→ Max の後に負荷を止め 30 s 見る →
+   `systemctl stop` で BIOS へ返す → 60 s 置く
+4. 後片付け: 負荷を止め、GPU の電力の上限を既定に戻し、fand を `stop`、§2.3 の 3・4 を行って結果を表示する。
+   DB・journal（`__MONOTONIC_TIMESTAMP` つき）を書き出す
+
+### 2.7 記録の置き場所
+
+- 生の記録（DB の書き出し・journal・印の時刻）は、これまでの T5 と同じく所有者の作業用のディレクトリに
+  `t5-11s-<HHMM>-*` の名前で残す（リポジトリには置かない）
+- 結果は `docs/fan-header-mapping.md` の「0121 の試験の結果」T5 に「約 11 s の経路（0154）」の表として足す
+  （条件・位相・`SIGSTOP` から Max・止める直前の `effective`・開始 → 最高の温度・判定）。実機の識別子は書かない
+
+### 2.8 合格した後の確定
+
+- 4 条件すべてで §2.2 を満たしたら、0121 §2.10 のとおり、`watchdog_timeout_ms` 5000 の `status` を `confirmed`・`basis` を
+  0121 §2.7・本記録・`docs/fan-header-mapping.md` の T5 にする変更を、所有者の承認（0028 §2.9 の**承認点 2**）を得て
+  `/etc/coldaisle/control-config/safety.yaml` に当てる。確定するのは 5000 で、試験の 11000 ではない
+- この確定は「`TimeoutAbortSec` が 5 s 以下」を前提にする。unit のタイムアウトは `provisional` のまま進む（§1.3）が、
+  後で `TimeoutAbortSec` を 5 s より長くするなら、本記録の試験をやり直す
+- 0121 のほかの試験の値の確定とそろってから**承認点 3** を完了とし、`enable` は所有者が判断する（0121 §2.10）
+- 満たさない条件があれば、値も設定も本記録では変えない。§5 の 3 のとおり別の決定記録で案を出す。それまで `enable` しない
+
+## 3. Consequences
+
+### 良くなること
+
+- 0119 §2.13 が `watchdog_timeout_ms` に求める「最悪時間の間の温度」を、本番の最悪より約 1 s 長い時間で実測できる
+- 本番の値・unit・`safety.yaml` を書き換えずに済む。違いは `diff -r` で1行・drop-in で2つの指令だけ
+- 引き継ぎ（Max を書く経路）・`KillMode`・権限は本番のまま試すので、5.2 s の経路の結果と同じ部品で比べられる
+
+### 悪くなること・その緩和
+
+- 試験の間は deadman が 11 s に延び、hang から Max までが本番より遅い。緩和: 所有者が現地・`enable` しない・スクリプトの
+  実行の間だけ・止めている間の見張りと 12000 ms での SIGKILL・`trap` での後片付けと確認
+- SIGKILL で終わる本番の最悪の経路の「時間」は、この試験では通らない（SIGABRT で終わる）。緩和: SIGKILL から Max は
+  予備確認の 44〜51 ms で足りており、本記録で要るのは固まる時間の長さだけである。時間の下限 10100 ms で本番の最悪を覆う
+- drop-in を消し忘れると deadman が 11 s のまま残る。緩和: `trap`・§2.3 の 4 の確認・`enable` の前に
+  `systemctl cat coldaisle-fand` で drop-in が無いことを所有者が確かめる
+
+## 4. 却下した代替案
+
+| 案 | 却下の理由 |
+|---|---|
+| `WatchdogSignal` を無視される signal にして `TimeoutAbortSec` の経路を本物で通す | systemd の `SIGCONT` で fand が動き出し、Demand を書き続ける。「低い Demand のまま固まる」状態にならない |
+| `SIGCONT` の後にもう一度 `SIGSTOP` する | 動き出した瞬間に fand が書くかどうかが競合で決まり、固めた Demand が保証できない |
+| `WatchdogSec` / `watchdog_timeout_ms` を 10 s にする | 固まる時間が約 10.1〜10.9 s で、本番の最悪（約 10.05 s）との余裕が小さい。0127 §5 の 2 (a) の 11 s のままにする |
+| 一時的な unit（`systemd-run`）で動かす | `ExecStopPost`・`KillMode`・権限・hardening が本番と同じであることを別に確かめる必要がある（§2.3） |
+| 本番の `/etc/coldaisle/control-config/safety.yaml` と unit を一時的に書き換える | 戻し忘れが本番の値に残る。0121 §2.1 の T6 と同じく別の場所と drop-in にする |
+| 5.2 s の結果から 10 s の上がりを見積もる（0127 §5 の 2 (c)） | 5 s の負荷で `cpu.package` が +31〜32 °C 上がり、その後の上がり方の根拠が無い（0127 §2.5）。所有者は (a) を選んだ |
+| 最悪時間そのものを短くする（`TimeoutAbortSec` を短く、または `WatchdogSignal=SIGKILL`。0127 §5 の 2 (b)） | 0080 §5 の 1・3 の決定に当たり、所有者はタイムアウトを `provisional` のまま進むと決めた（§1.3）。試験が不合格なら §5 の 3 で改めて出す |
+
+## 5. 未決事項
+
+| # | 内容 | 選択肢（推奨を先に） | 時期 |
+|---|---|---|---|
+| 1 | (i) GPU 600 W（アイドルから先に止めて GPU 600 W を始める）も行うか | **(推奨) 行う**: 1 回で 10〜30 分（落ち着きの判定を含む）。5.2 s の経路では GPU 29 → 39 °C と余裕が大きく危険は小さいが、0121 §2.7 の (i) の2つがそろう / 行わない: 所有者の指定の3条件だけにする（GPU の上がりは (iii) で押さえる） | 承認の時 |
+| 2 | 同じ日のアイドルの `effective` を、試験の設定の (ii) アイドルで取るか | **(推奨) 取る**（§2.4 の 1。11 s のアイドルは危険が小さく、(i)・(iii) の基準を同じ日の値にできる）/ T1 の記録のアイドルの値を使う（T1 の後に Guard の発火の扱いを変えていないが、日と室温が違う） | 承認の時 |
+| 3 | どれかの条件が §2.2 の温度を満たさなかったときの次の案 | **(推奨) 別の決定記録で、最悪時間を短くする案（`TimeoutAbortSec` を短く、または `WatchdogSignal=SIGKILL`。0080 §5 の 1・3）を先に出し、それでも足りなければ floor を強める案を出す。それまで `enable` しない** / 余裕の基準（5 °C）を見直す案を出す（安全の基準を緩めるので推奨しない） | 結果の後 |
+| 4 | 時間の下限 10100 ms・上限 12000 ms でよいか | **(推奨) このまま**（§2.2 の根拠）/ 下限を 11000 ms（0127 の丸めた値）にする: 下限が試験の設定そのものになり、位相と systemd の遅れで有効な試行が得にくい | 承認の時 |

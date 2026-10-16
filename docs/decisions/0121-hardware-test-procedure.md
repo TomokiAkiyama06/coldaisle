@@ -8,6 +8,7 @@
 - **Superseded by**: §2.5 T3 と §2.8 T6 の時間の条件の境界の読み方（trace の壁時計の ±50 ms）と、T3 の落ち着きの判定は [`0124`](0124-trace-wall-clock-tolerance.md)。§2.8 T6 の立ち上がりの測り方と合格の条件（fand の trace で測り tach の更新の閾値と fand の 1 tick を足す・Rear の 90% の時間は記録だけ）は [`0125`](0125-stall-rise-criterion-tach-update.md)。§2.6 T4 の温度の判定で `cpu.package` の操作の直後 15 s を除くことは [`0126`](0126-startup-settle-front-spinup.md)
 - **Superseded by**: §2.1 の中止の基準のうち `gpu.0.core` 83 °C（→ 85 °C）は [`0130`](0130-gpu-fan-quieter-curve.md)
 - **Superseded by**: §2.9 の吸気の差が ±1 °C を超えたらやり直す決まりを、2026-10-15 の T7 の GPU 600 W の試行 4 にだけ当てないことは [`0136`](0136-t7-t8-t9-acceptance-exceptions.md)
+- **Superseded by**: §2.1 の「試験専用の設定は §2.8 の stall の試験だけで使う」に、T5 の約 11 s の経路の試験を例外として足すことは [`0154`](0154-t5-11s-path-test-exception.md)（Proposed。FINAL になるまでは本記録のまま）
 - **関連**: [`0028`](0028-fan-control-contracts.md) §2.6〜§2.9 /
   [`0080`](0080-fand-systemd-unit.md) §2.3 / §2.6 / §2.10 /
   [`0118`](0118-hwmon-backend-label-less-headers.md) /
