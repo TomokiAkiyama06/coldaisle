@@ -147,17 +147,17 @@ def lockfile_sha256(path: Path) -> str:
 class InstalledDistribution:
     """入った配布物の1件。``record`` は ``RECORD`` の bytes（無ければ ``None``）。
 
-    ``precedence`` は**同じ名前の配布物の中での import の優先の順**（0 が最も先の ``sys.path``
-    の項目にあるもの）。同じ名前が2つ見えているとき、どちらが import されるかは ``sys.path`` の
-    順で決まるので、順を入れ替えると実行時のコードが変わる。並べ替えで順を捨てると、入れ替えても
-    同じ指紋になるため、順そのものを指紋に入れる。同じ ``sys.path`` の項目に同じ名前が2つあれば
-    同じ値になる（その間の順は ``sys.path`` で決まらない）。
+    ``path_rank`` は、この配布物の見つかった ``sys.path`` の項目の**順位**（配布物を持つ項目だけを
+    前から 0, 1, … と数えた値）。Python は ``sys.path`` の前の項目から import するので、同じ
+    import 名を持つ配布物（同じ名前の2つ・名前の違う2つのどちらも）の項目の順を入れ替えると、
+    実行時のコードが変わる。順位を指紋に入れ、項目の順の入れ替えを必ず検出する（PR #349 の P1）。
+    項目の path そのものは入れない（同じホストでも起動の仕方で ``sys.path[0]`` が変わるため）。
     """
 
     name: str
     version: str
     record: bytes | None
-    precedence: int = 0
+    path_rank: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -180,28 +180,26 @@ def current_environment() -> RuntimeEnvironment:
     """いま動いている処理系と、その ``sys.path`` から見える配布物を集める。"""
     version = sys.implementation.version
     distributions: list[InstalledDistribution] = []
-    # sys.path の項目を前から1つずつ見て、同じ名前が先に見えた項目の数を precedence にする。
-    # 項目の path そのものは入れない（同じホストでも起動の仕方で sys.path[0] が変わるため）。
-    seen_entries: dict[str, int] = {}
+    # sys.path の項目を前から1つずつ見て、配布物を持つ項目に順位を振る（import の優先の順）。
+    rank = 0
     for entry in sys.path:
-        names_here: set[str] = set()
+        found = False
         for distribution in importlib.metadata.distributions(path=[entry]):
             name = distribution.metadata["Name"]
             if not name:
                 raise ValueError("名前の無い配布物がある")
-            canonical = _canonical_distribution_name(str(name))
             record = distribution.read_text("RECORD")
             distributions.append(
                 InstalledDistribution(
                     name=str(name),
                     version=distribution.version,
                     record=None if record is None else record.encode("utf-8"),
-                    precedence=seen_entries.get(canonical, 0),
+                    path_rank=rank,
                 )
             )
-            names_here.add(canonical)
-        for canonical in names_here:
-            seen_entries[canonical] = seen_entries.get(canonical, 0) + 1
+            found = True
+        if found:
+            rank += 1
     return RuntimeEnvironment(
         implementation=sys.implementation.name,
         implementation_version=(
@@ -216,16 +214,16 @@ def current_environment() -> RuntimeEnvironment:
 def _distribution_parts(
     distribution: InstalledDistribution,
 ) -> tuple[bytes, bytes, bytes, bytes, bytes]:
-    if distribution.precedence < 0:
-        raise ValueError("precedence は 0 以上")
+    if distribution.path_rank < 0:
+        raise ValueError("path_rank は 0 以上")
     if distribution.record is None:
         record_tag, record_digest = _RECORD_ABSENT, b""
     else:
         record_tag, record_digest = _RECORD_PRESENT, _sha256_hex(distribution.record).encode()
     return (
+        # 10 進の固定幅にして、並べ替えの順を path_rank の大小と一致させる。
+        f"{distribution.path_rank:010d}".encode("ascii"),
         _canonical_distribution_name(distribution.name).encode("utf-8"),
-        # 10 進の固定幅にして、並べ替えの順を precedence の大小と一致させる。
-        f"{distribution.precedence:010d}".encode("ascii"),
         distribution.version.encode("utf-8"),
         record_tag,
         record_digest,
@@ -233,11 +231,11 @@ def _distribution_parts(
 
 
 def environment_bytes(environment: RuntimeEnvironment) -> bytes:
-    """``environment`` の digest の元になる列。配布物は列挙の順に依らず並べる。
+    """``environment`` の digest の元になる列。配布物は ``sys.path`` の順位で並べる。
 
-    各配布物は「正規化した名前・import の優先の順（``precedence``）・版・``RECORD`` の有無・
-    ``RECORD`` の SHA-256」。同じ名前が2つ見えていれば2件とも、優先の順と一緒に入れる。
-    名前の違う配布物どうしの列挙の順は指紋に効かない。
+    各配布物は「``sys.path`` の項目の順位（``path_rank``）・正規化した名前・版・``RECORD`` の有無・
+    ``RECORD`` の SHA-256」。項目の順位の順、同じ項目の中では名前の順に並べる（同じ項目の中の
+    列挙の順はファイルシステムに依るので効かせない）。同じ名前が2つ見えていれば2件とも入れる。
     """
     entries = sorted(_distribution_parts(item) for item in environment.distributions)
     parts: list[bytes] = [

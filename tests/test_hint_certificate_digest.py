@@ -243,52 +243,68 @@ def test_an_empty_record_is_not_a_missing_record() -> None:
     assert digest.environment_sha256(empty) != digest.environment_sha256(missing)
 
 
-def test_swapping_the_import_precedence_of_a_shadowed_distribution_changes_the_digest() -> None:
-    """同じ名前の2つの配布物の優先の順を入れ替えると、実行時のコードが変わりうる（#349 の P1）。"""
-    first = digest.InstalledDistribution(name="numpy", version="2.0.0", record=b"a", precedence=0)
-    second = digest.InstalledDistribution(name="numpy", version="1.26.0", record=b"b", precedence=1)
-    swapped = (
-        digest.InstalledDistribution(name="numpy", version="2.0.0", record=b"a", precedence=1),
-        digest.InstalledDistribution(name="numpy", version="1.26.0", record=b"b", precedence=0),
-    )
-    assert digest.environment_sha256(
-        environment(distributions=(first, second))
-    ) != digest.environment_sha256(environment(distributions=swapped))
-    # 列挙の順だけを変えても同じ。
-    assert digest.environment_sha256(
-        environment(distributions=(first, second))
-    ) == digest.environment_sha256(environment(distributions=(second, first)))
+def test_swapping_the_sys_path_rank_changes_the_digest() -> None:
+    """配布物を持つ項目の順を入れ替えると、実行時のコードが変わりうる（#349 の P1）。
+
+    同じ名前の2つでも、同じ import 名を持つ名前の違う2つでも同じ。
+    """
+    for later_name in ("numpy", "numpy-fork"):
+        early = digest.InstalledDistribution(
+            name="numpy", version="2.0.0", record=b"a", path_rank=0
+        )
+        late = digest.InstalledDistribution(
+            name=later_name, version="1.0.0", record=b"b", path_rank=1
+        )
+        swapped = (
+            digest.InstalledDistribution(name="numpy", version="2.0.0", record=b"a", path_rank=1),
+            digest.InstalledDistribution(
+                name=later_name, version="1.0.0", record=b"b", path_rank=0
+            ),
+        )
+        assert digest.environment_sha256(
+            environment(distributions=(early, late))
+        ) != digest.environment_sha256(environment(distributions=swapped))
+        # 列挙の順だけを変えても同じ。
+        assert digest.environment_sha256(
+            environment(distributions=(early, late))
+        ) == digest.environment_sha256(environment(distributions=(late, early)))
 
 
 def _fake_distribution(root: Path, name: str, version: str) -> None:
-    info = root / f"{name}-{version}.dist-info"
+    info = root / f"{name.replace('-', '_')}-{version}.dist-info"
     info.mkdir(parents=True)
     (info / "METADATA").write_text(
         f"Metadata-Version: 2.1\nName: {name}\nVersion: {version}\n", encoding="utf-8"
     )
-    (info / "RECORD").write_text(f"{name}/__init__.py,,\n", encoding="utf-8")
+    (info / "RECORD").write_text("shared_pkg/__init__.py,,\n", encoding="utf-8")
 
 
+@pytest.mark.parametrize("late_name", ["shared-pkg", "shared-pkg-fork"])
 def test_the_current_environment_follows_the_sys_path_order(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, late_name: str
 ) -> None:
     early = tmp_path / "early"
     late = tmp_path / "late"
-    _fake_distribution(early, "shadowed-pkg", "2.0.0")
-    _fake_distribution(late, "shadowed-pkg", "1.0.0")
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    _fake_distribution(early, "shared-pkg", "2.0.0")
+    _fake_distribution(late, late_name, "1.0.0")
 
-    def precedences() -> dict[str, int]:
+    def ranks() -> dict[str, int]:
         return {
-            item.version: item.precedence
+            item.version: item.path_rank
             for item in digest.current_environment().distributions
-            if item.name == "shadowed-pkg"
+            if item.name.startswith("shared-pkg")
         }
 
-    monkeypatch.setattr("sys.path", [str(early), str(late)])
+    # 配布物を持たない項目は順位を取らない。
+    monkeypatch.setattr("sys.path", [str(empty), str(early), str(late)])
     forward = digest.environment_sha256()
-    assert precedences() == {"2.0.0": 0, "1.0.0": 1}
+    assert ranks() == {"2.0.0": 0, "1.0.0": 1}
+    monkeypatch.setattr("sys.path", [str(early), str(empty), str(late)])
+    assert digest.environment_sha256() == forward
     monkeypatch.setattr("sys.path", [str(late), str(early)])
-    assert precedences() == {"1.0.0": 0, "2.0.0": 1}
+    assert ranks() == {"1.0.0": 0, "2.0.0": 1}
     assert digest.environment_sha256() != forward
 
 
