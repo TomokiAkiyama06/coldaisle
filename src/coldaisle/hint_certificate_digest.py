@@ -231,14 +231,15 @@ def _claim_record_files(owners: dict[str, int], owner: int, record: str) -> None
 
     重なったファイルは後から入れた配布物のものが残り、どちらが実行されるかが入れた順で決まる。
     ``RECORD`` の組は入れた順に依らないので、指紋では区別できない。区別できない環境は指紋を
-    作らない（fand は照合の失敗として B0 に倒す。PR #349 の P1）。``__pycache__`` / ``*.pyc`` は
-    実行時に作り直されるので比べない（0152 §2.3 のソースツリーと同じ除外）。
+    作らない（fand は照合の失敗として B0 に倒す。PR #349 の P1）。比べないのは ``__pycache__`` の
+    下（ソースから作り直される cache）だけ。それ以外の ``*.pyc`` はソースの無い module として
+    import されうるので、重なれば拒む。
     """
     for row in csv.reader(io.StringIO(record)):
         if not row or not row[0]:
             continue
         path = os.path.normpath(row[0])
-        if path.endswith(_EXCLUDED_SUFFIX) or _EXCLUDED_DIRECTORY in Path(path).parts:
+        if _EXCLUDED_DIRECTORY in Path(path).parts:
             continue
         if owners.setdefault(path, owner) != owner:
             raise ValueError(f"同じ sys.path の項目で2つの配布物が同じファイルを入れている: {path}")

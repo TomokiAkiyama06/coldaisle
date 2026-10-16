@@ -341,11 +341,28 @@ def test_bytecode_listed_by_two_distributions_is_not_an_overlap(
             f"Metadata-Version: 2.1\nName: {name}\nVersion: 1.0\n", encoding="utf-8"
         )
         (info / "RECORD").write_text(
-            f"{name}/__init__.py,,\nns/__pycache__/x.cpython-312.pyc,,\nns/x.pyc,,\n",
+            f"{name}/__init__.py,,\nns/__pycache__/x.cpython-312.pyc,,\n",
             encoding="utf-8",
         )
     monkeypatch.setattr("sys.path", [str(site)])
     assert len(digest.current_environment().distributions) == 2
+
+
+def test_a_sourceless_module_listed_by_two_distributions_is_an_overlap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`__pycache__` の外の `.pyc` は import されうるので、重なれば拒む（#349 の P1）。"""
+    site = tmp_path / "site"
+    for name in ("first", "second"):
+        info = site / f"{name}-1.0.dist-info"
+        info.mkdir(parents=True)
+        (info / "METADATA").write_text(
+            f"Metadata-Version: 2.1\nName: {name}\nVersion: 1.0\n", encoding="utf-8"
+        )
+        (info / "RECORD").write_text(f"{name}/__init__.py,,\nns/mod.pyc,,\n", encoding="utf-8")
+    monkeypatch.setattr("sys.path", [str(site)])
+    with pytest.raises(ValueError, match="同じファイル"):
+        digest.current_environment()
 
 
 def test_the_current_environment_is_fingerprinted() -> None:
