@@ -981,7 +981,9 @@ class Aggregator:
         start_ms: int,
         end_ms: int,
         include_override: bool,
+        force_lookback_incomplete: bool = False,
     ) -> None:
+        self._force_lookback_incomplete = force_lookback_incomplete
         self._config = config
         self._periods = periods
         self._cooling = cooling
@@ -1027,7 +1029,8 @@ class Aggregator:
         config = self._config
         result = MetricResult(metric, unit)
         times = [ts for ts, _ in evaluations]
-        incomplete = self._lookback_incomplete(times)
+        # 生データが消えた期間の直後は、さかのぼりの行が残っていても始めから続いたとは言えない
+        incomplete = self._force_lookback_incomplete or self._lookback_incomplete(times)
         result.start_lookback_incomplete = incomplete
         prev_t: int | None = None
         prev_phys: tuple[str, str] | None = None
@@ -1046,8 +1049,14 @@ class Aggregator:
             open_kind = None
             open_key = None
 
+        bad_times = [ts for ts, _ in non_ok]
         for at_ms, value in evaluations:
             in_window = at_ms >= self._start_ms
+            if prev_t is not None and bisect_right(bad_times, prev_t) < bisect_left(
+                bad_times, at_ms
+            ):
+                # 品質で除いた行を挟んだ。受け入れた観測が途切れたので segment を切る（§2.3）
+                close()
             force = False
             if in_window and not crossed:
                 crossed = True
@@ -1227,6 +1236,13 @@ def build(
             f"（最初のバケット {_iso(first, config)}・最後のバケット {_iso(last, config)}・"
             f"metric {sorted(pruned)}）。期間を狭めるか --allow-partial を明示する"
         )
+    # --allow-partial: 集計そのものを実際に覆った期間（消えた最後のバケットの次から）に絞る。
+    # 来歴だけを狭めると、消えかけのバケットに残った行が分布に混ざる（0155 §2.5）
+    covered_start = start_ms
+    if pruned:
+        covered_start = min(
+            end_ms, max(start_ms, max(buckets[-1] for buckets in pruned.values()) + MINUTE_MS)
+        )
 
     # 較正の変更（0099）。全行を検証し、期間の中の行を一覧にする
     try:
@@ -1258,14 +1274,15 @@ def build(
         inputs.periods,
         cooling,
         labeler,
-        start_ms=start_ms,
+        start_ms=covered_start,
         end_ms=end_ms,
         include_override=include_override,
+        force_lookback_incomplete=bool(pruned),
     )
     results: list[MetricResult] = []
     for metric in config.metrics:
         evaluations, non_ok = _metric_rows(
-            database, catalog, metric, config, read_from, end_ms, start_ms
+            database, catalog, metric, config, read_from, end_ms, covered_start
         )
         unit = catalog.unit_for(metric)
         assert unit is not None
@@ -1274,11 +1291,6 @@ def build(
     segment_reasons: dict[str, int] = defaultdict(int)
     for segment in cooling.relevant_segments:
         segment_reasons[segment.status or "accepted"] += 1
-    covered_start = start_ms
-    if pruned:
-        covered_start = min(
-            end_ms, max(start_ms, max(buckets[-1] for buckets in pruned.values()) + MINUTE_MS)
-        )
     provenance: dict[str, Any] = {
         "period": {
             "start_ms": start_ms,

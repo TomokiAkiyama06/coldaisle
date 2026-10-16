@@ -422,6 +422,10 @@ def test_buckets_deleted_by_retention_fail_by_default(fx: Fixture) -> None:
     assert provenance["incomplete"] is True
     assert provenance["covered_period"]["start_ms"] == T0 + 2 * MIN
     assert provenance["deleted_buckets"]["air.room"]["count"] == 1
+    # 集計そのものも覆った期間から。消えかけのバケットに残った行を分布に入れない（Codex P1）
+    assert provenance["start_lookback_incomplete"] is True
+    assert transitions(report)[IDLE]["stats"]["n"] == 60 * S // 2500
+    assert groups(report)[IDLE]["stats"]["n"] == (18 * MIN - 60 * S) // 2500
 
 
 def test_buckets_after_the_rollup_are_accepted(fx: Fixture) -> None:
@@ -507,6 +511,15 @@ def test_calibration_changes_in_the_period_are_listed(fx: Fixture, rules: Qualit
     assert provenance["calibration_changed"] is True
     assert [change["ts_ms"] for change in provenance["calibration_changes"]] == [T0 + 5 * MIN]
     assert provenance["calibration_changes"][0]["offsets_sha256"] == second.offsets_sha256
+
+
+def test_a_non_ok_row_between_accepted_rows_splits_the_segment(fx: Fixture) -> None:
+    """品質で除いた行を挟めば、間隔が max_gap_ms 未満でも別の segment（Codex P2）。"""
+    steady_bios(fx, T0 - 10 * MIN, T0 + 10 * MIN)
+    fx.reading("air.room", T0 + 5 * MIN, -127.0, "suspect")
+    report = fx.build(T0, T0 + 10 * MIN, periods=bios_everywhere())
+    assert groups(report)[IDLE]["segments"]["count"] == 2
+    assert transitions(report) == {}  # 品質の欠けは状態の変化ではない
 
 
 # ---------------------------------------------------------------- 統計
