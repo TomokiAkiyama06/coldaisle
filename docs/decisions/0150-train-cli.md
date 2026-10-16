@@ -121,28 +121,29 @@ AGENTS.md の「仕様に無い判断をした場合、実装より先に決定�
 
 `test` は学習にも Profile にも使わない。件数と期間を報告に載せるだけ（§5 の 5）。
 
-失敗は構造化ログに理由を出して**終了コード 1**。「何も残さない」の約束は **`--out` の公開（§2.5 の手順 6）の前の失敗**に
-限る。本節の 1〜7（7 は `check_artifact_contents` まで）の失敗と、公開の手順の 1〜6 の失敗では、`--out` は作られない
-（ファイルごとの rename はしない）。
+失敗は構造化ログに理由を出して**終了コード 1**。「何も残さない」の約束は **`--out` の公開（§2.5 の手順 4 の完成の印の
+fsync）の前に process の中で起きた失敗**に限る。本節の 1〜7（7 は `check_artifact_contents` まで）の失敗では `--out` を作らず、
+公開の手順の 2〜4 の失敗では、自分で作った `--out` を手順 6 のとおり片づける。
 
+process が強制終了したとき（`SIGKILL`・電源断）は片づけられないので、**完成の印の無い `--out`** が残りうる（§2.5）。
 公開の後の失敗は、`--out` を消さずに残す。消すと、Registry に登録済みかもしれない bytes の唯一の手元の写しを失うためである。
-公開の後の失敗は `--apply` の無い実行でも起きる（公開の手順 7 の親の fsync）。
+公開の後の失敗は `--apply` の無い実行でも起きる（公開の手順 5 の fsync）。
 
 | 失敗した段 | 終了コード | 残るもの | 回復 |
 |---|---|---|---|
-| 公開の前（検査・学習・公開の手順 1〜6） | 1 | 何も残らない（強制終了なら親の `.coldaisle-train-stage-*` だけ） | 原因を直して同じ引数で再実行 |
-| 公開の後・親の fsync の失敗（公開の手順 7。`--apply` の有無に依らない） | 1 | `--out`（3ファイルがそろって見えている。各ファイルと一時ディレクトリは fsync 済みで、永続でないのは親の中の `--out` の項だけ）。`--apply` なら Registry へは進まない | ログに段 `publish_durability` と `--out` の path を出す。中身は完成しているので、そのまま使ってよい（`--apply` なら `--out` の2ファイルを `coldaisle-registry register` へ渡す）。電源断の後に `--out` が消えていたら、同じ引数で再実行する |
-| 公開の後・Registry の登録の失敗（lock・revision・同じ版が登録済み・権限・limits、および artifact ファイルの段の `RegistryDurabilityError`） | 1 | `--out`（3ファイル）。Registry は変わらない（登録の確定点の前） | `--out` の `artifact.json` と `metadata.json` を `coldaisle-registry register` へ渡す。同じ版が登録済みなら `--model-version` を上げて別の `--out` で作り直す |
+| 公開の前（検査・学習・公開の手順 1〜4 の例外） | 1 | 何も残らない（作った `--out` を片づける） | 原因を直して同じ引数で再実行 |
+| 公開の前の強制終了（`SIGKILL`・電源断） | — | **完成の印の無い `--out`**（中のファイルは途中まで） | 再実行は `--out` があるので拒否され、そのとき `--out` に有効な完成の印が無いことをログに出す。人が確かめて `--out` を消し、同じ引数で再実行する。CLI は自動では消さない（自分が作ったものか確かめられないため） |
+| 公開の後・`--out` と親の fsync の失敗（公開の手順 5。`--apply` の有無に依らない） | 1 | `--out`（3ファイルと有効な完成の印。それぞれ fsync 済みで、永続でないのはディレクトリの項だけ）。`--apply` なら Registry へは進まない | ログに段 `publish_durability` と `--out` の path を出す。中身は完成しているので、そのまま使ってよい（`--apply` なら `--out` の2ファイルを `coldaisle-registry register` へ渡す）。電源断の後に `--out` が無い・印が無効なら、消して同じ引数で再実行する |
+| 公開の後・Registry の登録の失敗（lock・revision・同じ版が登録済み・権限・limits、および artifact ファイルの段の `RegistryDurabilityError`） | 1 | `--out`（3ファイルと完成の印）。Registry は変わらない（登録の確定点の前） | `--out` の `artifact.json` と `metadata.json` を `coldaisle-registry register` へ渡す。同じ版が登録済みなら `--model-version` を上げて別の `--out` で作り直す |
 | 登録は確定したが永続が確かでない（`registry.json` の置き換えの後の `RegistryDurabilityError`。下記） | 1 | `--out` と、Registry の **candidate**（見えている。production は動かない） | CLI はそのまま**登録の後の検査（`load_version` と L1〜L12）へ進む**。検査が通ってもログに段 `register_durability` を出して終了コード 1。人は `coldaisle-registry status` で candidate があることを確かめる。電源断の後に無くなっていたら、`--out` の2ファイルで `coldaisle-registry register` する。**もう一度 `coldaisle-train --apply` で登録し直さない**（見えている間は「既にある」になる） |
 | 登録の後・`load_version` と L1〜L12 の検査の失敗 | 1 | `--out` と、Registry の **candidate**（production は動かない） | ログに artifact の key と `--out` の path を出す。人が原因を確かめ、`coldaisle-registry retire` で candidate を退ける。CLI は `retire` しない |
 
 構造化ログには失敗した段（`before_publish` / `publish_durability` / `register` / `register_durability` /
-`post_register_check`）を必ず出し、どの行に当たるかを
-人が取り違えないようにする。
+`post_register_check`）を必ず出し、どの行に当たるかを人が取り違えないようにする。
 
 ### 2.5 出力と、既定では Registry を書かないこと
 
-`--out` のディレクトリに次の3つを置く。`--out` が**既にあれば拒否する**（上書きしない）。
+`--out` のディレクトリに次の3つと完成の印を置く。`--out` が**既にあれば拒否する**（上書きしない）。
 
 | ファイル | 中身 |
 |---|---|
@@ -150,43 +151,37 @@ AGENTS.md の「仕様に無い判断をした場合、実装より先に決定�
 | `metadata.json` | `ArtifactMetadata` の strict JSON（`coldaisle-registry register --metadata` へそのまま渡せる形） |
 | `training-report.json` | §2.7 の digest の一覧・split ごとの件数と期間・artifact の SHA-256・Profile の SHA-256・除いた example の件数 |
 
-#### 公開の手順（3つを1回の rename で出す）
+#### 公開の手順（`--out` を最初に排他的に作り、最後に完成の印を付ける。OS に依らない）
 
-ファイルごとに一時ファイルから rename すると、1つ目の rename の後に process が強制終了したとき一部だけが `--out` に残り、
-再実行も「既にある」で拒まれる。そこで既存の Dataset の writer（`src/coldaisle/dataset.py` の `write_dataset`）と同じ手順で、
-**ディレクトリ全体を1回の rename で公開する**（ただし置き換えない rename。手順 6）。
+**推奨案（§5 の 10 の (A)）で書く。** 使うのは macOS / Ubuntu で共通の POSIX の操作だけで、OS ごとの関数を呼ばない
+（NFR-07 を変えない）。
 
-1. `--out` の親を `O_DIRECTORY | O_NOFOLLOW` で開き、親の中の writer 用の lock ファイルを `flock(LOCK_EX)` する
-   （実行した uid の所有の通常ファイル・group / other が書けない・link 数 1 を確かめる。`_lock_output_root` と同じ）。
-   `--out` の不存在の確認と rename を、同じ親へ書く他の writer と直列にする
-2. `--out` が無いことを確かめる（あれば拒否）
-3. **同じ親の中**（同じファイルシステム）に `0700` の一時ディレクトリ `.coldaisle-train-stage-<32 hex>` を作る
-   （推測できない名前。衝突したら作り直す）
-4. 3つのファイルを一時ディレクトリへ `O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW` で書き、**それぞれ fsync** する
-5. **一時ディレクトリを fsync** し、開いた fd と path の `(st_dev, st_ino)` が同じことを確かめる（差し替えの検知）
-6. **置き換えない rename** で公開する。POSIX の `os.rename` は、確認と rename の間に（lock に協調しない同じ uid の
-   process が）作った**空のディレクトリを黙って置き換える**ので使わない。writer の lock は協調する書き手どうしにしか
-   効かず、この窓を閉じない。OS ごとの手段は次のとおりで、ctypes で libc から呼ぶ小さな関数1つ
-   （仮に `rename_noreplace(親の fd, 一時ディレクトリの名前, 親の fd, --out の名前)`）に閉じる
+1. `--out` の親を `O_DIRECTORY | O_NOFOLLOW` で開く
+2. **`os.mkdir(--out の名前, 0o700, dir_fd=親)` で `--out` を排他的に確保する。** 既にあれば `EEXIST` で拒否する。`mkdir` は
+   POSIX で原子的で、既にあるもの（他の process が作った空のディレクトリを含む）を**置き換えない**。「既にある出力は必ず拒む」
+   の正しさはこの1手が持ち、確認と公開の間の窓（rename による置き換え）がそもそも無い。作った直後に `--out` を
+   `O_DIRECTORY | O_NOFOLLOW` で開き、path と fd の `(st_dev, st_ino)` が同じこと・中が空であることを確かめる（差し替えの検知）。
+   以後は fd（`dir_fd`）だけで書く
+3. 3つのファイルを `--out` の中へ `O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW` で書き、**それぞれ fsync** する
+4. **完成の印** `COMPLETE.json` を `O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW` で作り、3つのファイルの名前・大きさ・SHA-256 を
+   書いて fsync する。**この fsync が公開の確定点**である
+5. `--out` を fsync し、親を fsync する（中の項と `--out` の項を永続にする）。失敗は公開の**後**の失敗（§2.4 の表）
+6. 手順 2〜4 で例外が起きたときは、自分で作った `--out` の中の**既知の4つの名前だけ**を unlink し、`--out` を rmdir する
+   （手順 2 で確かめた `(st_dev, st_ino)` と同じときだけ）。後始末の失敗は元の例外を隠さない（`suppress(OSError)`）
 
-   | OS（`sys.platform`） | 手段 | 既にあるとき |
-   |---|---|---|
-   | Linux（`linux`） | `renameat2(..., RENAME_NOREPLACE)`（flag の値 1。glibc 2.28 以降が export する） | `EEXIST` |
-   | macOS（`darwin`） | `renameatx_np(..., RENAME_EXCL)`（flag の値 4。`renamex_np` の dir fd を取る形。macOS 10.12 以降） | `EEXIST` |
-   | それ以外 | 無し | — |
+**読む側は、有効な完成の印の無い `--out` を未完成として拒む。** 有効とは、印が JSON として読めて、書かれた3つのファイルの
+大きさと SHA-256 が実物と一致することである（印そのものの書きかけも、ファイルの書きかけもこれで拒める）。
 
-   `EEXIST` は「`--out` が既にある」として拒否する。**どちらも使えないとき**（libc に関数が無い・それ以外の OS・
-   `ENOSYS`・`EINVAL` / `ENOTSUP`（ファイルシステムが対応しない））は**失敗にする**（`os.rename` へ落とさない）。
-   リポジトリには同じ用途の既存の実装が無い
-7. **親を fsync** する（rename したディレクトリの項を永続にする）
-8. 失敗したとき（公開の前）は、自分で作った一時ディレクトリの**既知の3つの名前だけ**を unlink して rmdir する。
-   後始末の失敗は元の例外を隠さない（`suppress(OSError)`）。`--out` には何も現れない。手順 2 の確認は早く拒否するための
-   もので、拒否の正しさは手順 6 の置き換えない rename が持つ。手順 7 の失敗は公開の**後**の失敗で、`--out` を残す（§2.4 の表）
+- `--apply` の登録は手順 5 の後に、メモリ上の同じ bytes で行う（印を読み直さない）
+- 人が `--out` を `coldaisle-registry register` へ渡すときは、先に印を確かめる（手順書に書く）。印を確かめずに渡しても、
+  `register` は payload の SHA-256 を metadata と照合し、metadata は strict JSON として読むので、書きかけのファイルが黙って
+  candidate になることは無い（`ModelRegistry.register_candidate` の checksum の検査）
+- 印を確かめる関数は `train.py` に置き、§5 の 1 の (a) の経路や後続の道具が使えるようにする
 
-process が強制終了したときに残りうるのは親の中の `.coldaisle-train-stage-*` だけで、`--out` は「無い」か「3つがそろって
-ある」のどちらかになる。残った一時ディレクトリは名前が一意なので再実行を妨げない。自動では消さない（Dataset の writer と
-同じ。人が確かめて消す）。lock・一時ディレクトリ・ファイルの書き込みと後始末は Dataset の writer の手順に合わせる。
-**`write_dataset` の挙動（0031 §3 の macOS / Ubuntu 共通の `os.rename`）は本記録では変えない**（§5 の 9 の申し送り）。
+process が強制終了したときに残るのは、印の無い（または無効な）`--out` だけである。再実行は手順 2 で拒否されるので、人が
+確かめて消す（§2.4 の表）。Dataset の writer（0031 §3）は「親の中の一時ディレクトリ → 共通の `os.rename`」で、強制終了の後に
+残るのが隠れた一時ディレクトリである点が違うが、どちらも **macOS / Ubuntu 共通の POSIX の操作だけ**を使う点で一致する。
+**`write_dataset` の挙動（0031 §3）は本記録では変えない**（§5 の 9 の申し送り）。
 
 #### `--apply` の Registry 側の書き込み
 
@@ -276,16 +271,14 @@ coldaisle-authority raise          → authority を1段   （承認者の uid�
 - `--apply` 無しでは Registry のディレクトリを作らず、ファイルが1つも増えない
 - `--apply` で candidate になり、production pointer と revision 以外の記録が変わらない。同じ版の2回目は終了コード 1
 - 拒否: 公開物の改ざん・`--replay-path` の取り違え・期間の後の較正の記録・`--calibration` の取り違え・`--out` が既にある・
-  `support_axes` に `fan.<zone>` が欠ける。どれも `--out` が作られず、親に一時ディレクトリも残らない
-- 置き換えない rename の分岐（`rename_noreplace`）: `sys.platform` と libc の関数の解決を差し替えて、Linux では
-  `renameat2` を flag 1 で、macOS では `renameatx_np` を flag 4 で呼ぶこと。`EEXIST` を「既にある」に写すこと。関数が無い・
-  それ以外の OS・`ENOSYS` / `EINVAL` / `ENOTSUP` で失敗し、`os.rename` を呼ばないこと（`os.rename` を差し替えて呼ばれないことを
-  確かめる）。CI（Ubuntu）では実物の `renameat2` で、空の `--out` を置き換えないことも確かめる
-- 公開の手順: 一時ディレクトリへ書いた後・rename の前に例外を起こしても `--out` が無いこと。手順 2 の後・rename の前に
-  **空の `--out` ディレクトリを lock を取らずに作る**と、`EEXIST` で拒否され、その空のディレクトリが置き換えられずに残ること。
-  置き換えない rename が使えないときに失敗し、`os.rename` へ落ちないこと
-- 公開の後の親の fsync の失敗（`os.fsync` を親の fd でだけ失敗させる）: `--apply` 無しでも終了コード 1・段 `publish_durability`・
-  `--out` が3ファイルそろって残ること。`--apply` なら Registry へ進まないこと
+  `support_axes` に `fan.<zone>` が欠ける。どれも `--out` が作られない
+- 公開の手順: 手順 3・4 の途中で例外を起こすと `--out` が片づけられて無いこと。学習を始める前に**空の `--out` を作っておく**と
+  手順 2 の `EEXIST` で拒否され、その空のディレクトリが置き換えられずに残ること。`os.rename` / `os.replace` を `--out` の公開に
+  使わないこと（差し替えて呼ばれないことを確かめる）
+- 完成の印: 印が無い・書きかけ（JSON が途中）・大きさや SHA-256 がずれた `--out` を、確かめる関数が未完成として拒むこと。
+  強制終了の模擬（手順 3 の後で止めて片づけを走らせない）の後の再実行が、`--out` があることと印が無効なことを出して拒むこと
+- 公開の後の fsync の失敗（`os.fsync` を `--out` または親の fd でだけ失敗させる）: `--apply` 無しでも終了コード 1・段
+  `publish_durability`・`--out` が3ファイルと有効な印つきで残ること。`--apply` なら Registry へ進まないこと
 - 登録の `RegistryDurabilityError` の2つの意味: snapshot の置き換えの後で起こしたとき（ディレクトリの fsync を失敗させる）は
   candidate が見えていて、登録の後の検査へ進み、段 `register_durability` で終了コード 1。artifact ファイルの段で起こしたときは
   Registry が変わらず、段 `register` で終了コード 1
@@ -316,9 +309,9 @@ coldaisle-authority raise          → authority を1段   （承認者の uid�
 - 引数が多い（必須が 11）。→ 既定値を置かないのは既存の規律（0079 §2.3 / 0099 §2.6）。手順は `docs/thermal-model.md` に
   例を1つ書く
 - 学習のたびに元の CSV から作り直すので遅い（0112 の費用）。→ 人が手で走らせる頻度の操作なので受け入れる
-- 置き換えない rename は OS ごとに違う libc の関数で、NFR-07 の「OS 依存はシリアルデバイス検出のみに閉じる」に1か所
-  増える。→ 小さな関数1つに閉じ、両 OS の分岐と使えないときの失敗を試験する（§2.9）。`os.rename` へ落とすと拒否の約束が
-  成り立たないので、移植性より拒否の正しさを取る
+- 強制終了の後に、印の無い `--out` がその名前のまま残り、人が消すまで同じ `--out` で再実行できない（Dataset の writer なら
+  隠れた一時ディレクトリが残るだけ）。→ 再実行の拒否のログに「印が無効」を出し、回復を §2.4 の表に書く。代わりに OS ごとの
+  関数を使わずに済み、NFR-07 を変えない（§5 の 10）
 - `--apply` があることで、学習した人がそのまま Registry を書ける。→ 書けるのは candidate だけで、production へは
   validate・人の承認ファイル・authority の承認の3段を通る。権限も既存の書き手と同じで増えない
 
@@ -346,3 +339,4 @@ coldaisle-authority raise          → authority を1段   （承認者の uid�
 | 7 | Q-25（本番でオンライン学習を行うか） | **本記録では行わない**（人が手で実行するだけ。timer を作らない）。Q-25 は #93 / #104 で開いたまま | (a) drift の推奨（0056）を受けて自動で学習・candidate 登録する timer を作る（昇格は人なので制御には届かないが、candidate が増え続ける） |
 | 8 | `--code-commit` | **`--apply` のときだけ必須**、`--out` だけなら任意 | (a) 常に任意（Registry の `code_commit` は `null` を許す）。(b) 常に必須 |
 | 9 | （申し送り）`write_dataset` にも、確認と `os.rename` の間に作られた空のディレクトリを置き換える同じ窓がある | **本記録では扱わない。** 直すなら 0031 §3（macOS / Ubuntu 共通の `os.rename`）を置き換える別の決定記録で扱う | — |
+| 10 | `--out` の公開の手段（NFR-07「macOS / Ubuntu 双方で動作。OS依存はシリアルデバイス検出のみに閉じる」との関係） | **(A) OS に依らない手順**（§2.5 の本文）。`os.mkdir` で `--out` を排他的に確保し、中に書いてから完成の印を `O_EXCL` で付ける。利点: POSIX 共通の操作だけで NFR-07 を変えない・ctypes も OS の分岐も要らず CI（Ubuntu）で全経路を実物で試験できる・`mkdir` の排他で置き換えの窓が無い（前回の指摘を満たす）・0031 §3 の「共通の POSIX の操作だけ」と一貫する。欠点: 強制終了の後に印の無い `--out` が残り、人が消すまで再実行できない・読む側が印を確かめる必要がある（`coldaisle-registry register` は印を見ないが checksum で書きかけを拒む） | (B) NFR-07 を変えて OS ごとの置き換えない rename を使う（Linux `renameat2(RENAME_NOREPLACE)`・macOS `renameatx_np(RENAME_EXCL)`・使えなければ失敗。ctypes の小さな関数1つ）。NFR-07 の「OS依存はシリアルデバイス検出のみに閉じる」を「…シリアルデバイス検出と、決定記録 0150 の出力の公開（置き換えない rename）に閉じる」へ変え、同じ PR で `docs/requirements.md` を直す。利点: `--out` は「無い」か「完成」のどちらかで、強制終了の後に残るのは隠れた一時ディレクトリだけ・読む側に印の確認が要らない。欠点: 要件を変える・macOS の分岐は Ubuntu の CI では差し替えでしか試験できない・ファイルシステムが対応しないと使えない・0031 §3 の writer（共通の `os.rename`）と手段が分かれる |
