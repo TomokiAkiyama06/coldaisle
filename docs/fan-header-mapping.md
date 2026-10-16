@@ -411,16 +411,17 @@ reading と trace、fand の journal、`coldaisle-soak-report` の集計）。
 | 測るもの（0121 §2.3） | 結果 | 合格の条件 | 判定 |
 |---|---|---|---|
 | `duration_ms` の分布 | 最大 11 ms・p99.9 6 ms・p99 5 ms（86400 tick） | 最大が 125 ms 未満 | 合格 |
-| `deadline_exceeded` の数と連続の最長 | 0 回（連続の最長 0） | 連続の最長が 1 以下 | 合格 |
+| `deadline_exceeded` の数と連続の最長 | 0 回（連続の最長 0）。停止時の集計の `overruns` も 0 | 連続の最長が 1 以下 | 合格 |
 | tick の間隔（`control tick` のログの journal の単調時計の差） | 最大 1023.96 ms・p99.9 1019.6 ms・p99 1012.0 ms・最小 977.0 ms | 最大が 1500 ms 未満・p99.9 が 1100 ms 未満 | 合格 |
-| `stats.skipped_slots` | 0 と判断（下の注を参照） | 0 | 合格（推論） |
+| `stats.skipped_slots` | 0（停止時の集計。下の注を参照） | 0 | 合格 |
 | systemd の watchdog による再起動 | 0 回（journal に `Watchdog timeout` は無い） | 0 回 | 合格 |
 | `*_telemetry_stale`（`cpu_ms` / `gpu_ms` / `air_ms`）と `cpu_power_unavailable`（0123 §2.3） | 0 回 | 0 回 | 合格 |
 | `write_failure` / `readback_mismatch` / `enable_reverted` | 0 回 | 0 回 | 合格 |
 | `tach_stall` | 0 回（起動の直後を含む。T4 の注の確認） | 0 回 | 合格 |
 
-- **`skipped_slots` は直接は数えていない。** `control tick` のログに `stats.skipped_slots` の欄が無いため。86400 s の間に
-  86400 tick（`tick_id` 0〜86399）が記録され、tick の間隔の最大が 1024 ms なので、飛ばした周期は無いと判断した
+- **`skipped_slots` などは、fand が正常停止のときにログに出す集計（`ControlStats`）の値。** journal の「control daemon を終了する」の行で、
+  `ticks` 86400・`overruns` 0・`skipped_slots` 0・`recorded` 86400・`trace_dropped` 0・`emergency_max` false。
+  `control tick` のログには `skipped_slots` の欄が無いので、この行を根拠にした。DB の trace も 86400 tick（`tick_id` 0〜86399）で、`recorded` と一致する
 - fault は 0 回。`safety_state` は起動の直後の 17 tick が `startup`（`startup_max` で 3 zone とも Max）、残りの 86383 tick は `normal`。
   `mode` はずっと `auto`
 - trace の reasons の内訳（zone ごとの件数の合計）: `ramp_down_limit` 7232・`reactive_guard_hold` 4826・`reactive_guard_triggered` 520・
@@ -434,7 +435,7 @@ reading と trace、fand の journal、`coldaisle-soak-report` の集計）。
 
 | 測るもの | 結果 |
 |---|---|
-| telemetry の健全度（0137 §2.3 の SQL。`(ticks, normal, conservative, guard_unknown)`） | (86400, 86400, 0, 0)。`NORMAL` の割合 100%。期間 86401 s ÷ `tick_ms` に対して記録の欠けは無い |
+| telemetry の健全度（0137 §2.3 の SQL。`(ticks, normal, conservative, guard_unknown)`） | (86400, 86400, 0, 0)。`NORMAL` の割合 100%。期間 86401 s ÷ `tick_ms` に対して記録の欠けは無い（停止時の集計の `recorded` 86400・`trace_dropped` 0） |
 | Reactive Guard の発火（`reactive guard started` のログ） | 431 回（同じ数だけ `released`）。閾値の組はどの tick も `normal` |
 | power の floor が Top を決めた時間（0123 §2.1 の最後の行） | 7 tick（約 0.008%）。2026-10-16 の 12:00・13:12・14:05 に 2〜3 tick ずつ |
 
