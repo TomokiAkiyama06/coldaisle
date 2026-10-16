@@ -141,7 +141,11 @@ RPM の比と正規化した EFU の差（取り付けた状態で風量が回�
     `run_id` を持つ版の trace でだけ行う）、(2) その `run_id` の中で `tick_id` が窓の始まりから終わりまで 1 ずつ連続している（fand は tick ごとに
     `tick_id` を 1 ずつ振るので、欠けた tick が無いことをこれで確かめる）、(3) 隣り合う 2 行の `ts_ms` の差と、窓の始まりから最初の tick・最後の
     tick から窓の終わりまでの差が `trace_max_gap_ms` 以下、(4) tick の数が `min_trace_ticks` 以上、(5) すべての tick で `operating_mode` が
-    `manual` で、その段の指令（`command_id`）のまま・Critical Safety が `NORMAL`・3 zone の `effective` が manual の値と同じ（§2.2 の floor の決まり）。
+    `manual` で、その段の指令（`command_id`）のまま・Critical Safety が `NORMAL`・3 zone の `effective` が manual の値と同じ（§2.2 の floor の決まり）、
+    (6) すべての tick の 3 zone で、ハードウェアへ適用した値を確かめる: `hardware.write_ok` と `hardware.readback_ok` が true で、`applied_demand`
+    （v11 の欄。書き込みと読み戻しを確かめた zone にだけ残る。`ZoneRecord`）が null でなく manual の値と同じ。`effective` だけでは足りない:
+    書き込みや読み戻しに失敗した tick も `effective` は指令の値のままで、backend の fault は次の tick へ持ち越されるので、窓の最後の tick の
+    失敗は窓の中の trace に fault として現れないことがある。`applied_demand` を持たない古い版の trace は使わない。
     (1)〜(4) は「floor が掛かっていないこと」を、欠けた tick の無い trace で確かめるためにある。
     0151（FINAL）は `run_id` の無い古い trace も読むので、`seq` の欠番がある区間を保守的に `undetermined` にする。本記録は `run_id` と
     `tick_id` で欠けた tick を直接確かめられる新しい trace だけを使うので、`seq` の欠番を問わない。目的と入力が違うので矛盾しない
@@ -160,7 +164,11 @@ RPM の比と正規化した EFU の差（取り付けた状態で風量が回�
 - 回数: zone ごとに 3 回。うち少なくとも 1 回は別の日にする
 - 応答の時間: 上りの段の、`effective` が変わった tick から trace の回転数が新しい段の値の ±5% に入って留まった tick まで（0126 と同じ測り方。
   tach の更新 1500 ms を足して記録）。下りは `ramp_down` の律速なので記録だけにする
-- 出すもの: zone ごとの RPM(d)（3 回の中央値・範囲。`pwm_to_rpm` の候補）、観測の最大 RPM、上りと下りの差。`airflow_index` は出さない（§2.1）
+- **上りと下りから 1 つの表へ**: `pwm_to_rpm` は方向を持たない 1 つの表なので、段ごとの候補の値は、3 回の上りと下りの**すべての観測**（中ほどの
+  段は 6 個。折り返しの 1.00 と両端の段は観測の数が少ない）の中央値とする。ばらつき（§2.6 の 5）も同じすべての観測の範囲 ÷ 平均で見るので、
+  ヒステリシスが `approval.max_rpm_spread` を超える段は目安を満たさず値を出さない（方向ごとの表は `FanProfile` が持てないので作らない）
+- 出すもの: zone ごとの RPM(d)（上りと下りのすべての観測の中央値・範囲。`pwm_to_rpm` の候補）、観測の最大 RPM、上りと下りの差（ヒステリシス。
+  方向ごとの 3 回の中央値の差）。`airflow_index` は出さない（§2.1）
 
 ### 2.4 熱収支による実効風量（EFU）
 
@@ -414,6 +422,15 @@ airflow_index(d) = q_z(d) / q_z(1.0)
 
 1. **出口ごとのプローブのずれ**: Top と Rear の出口で、固定のプローブの温度と出口の面の平均（できれば流速で重みづけした平均）の温度の
    関係を求め、出口ごとの補正の係数にする。補正の後の値で `q_top` / `q_rear` を計算し直す。
+   **係数の推定と不確かさ**: 係数は温度上昇の比 `c_z = ΔT_z_plane / ΔT_z_probe`（出口の面の平均の温度上昇 ÷ 固定のプローブの温度上昇。
+   どちらも §2.4 と同じ B / L の差で、`air.front_intake` を基準にする）とし、独立な面の測定（落ち着きからやり直したもの）の回ごとの `c_z` の
+   平均を値にする。`u(c_z)` は、各回の `c_z` に面の点の温度の `u(ΔT)`・流速の重みの不確かさ（§5 の 2 の計測器の精度）・面の点の数が有限な
+   ことの寄与（点の間の残差から見積もる）を伝えた値と、回の間のばらつき（標準偏差 ÷ √回数）の大きい方にする。補正の後の EFU は
+   `q_z,corr = q_z / c_z`（Rear は式の中の `ΔT_rear` と、L_gpu の `ΔT_top` をそれぞれの係数で補正）で、`u(q_z,corr)` の相対の二乗に
+   `(u(c_z) / c_z)^2` を足す。係数は同じ zone のすべての段に共通の系統の誤差なので、zone の中の比（`airflow_index`）と同じ zone の回の間の
+   ばらつき・`coupling_top_by_rear` では打ち消し合うとして足さず、zone をまたぐ比（§2.4a の 2 の `q_top / q_rear`・`q_front` の和・`coupling_null`）と
+   EFU の値そのものには足す。`u(c_z)` が求められない回は使わない（§2.6a）。
+   面の測定の回数と点の格子は、§5 の 2 の計測器を決める承認の記録で決める（それまで設定に置かない）
    **Top は熱源ごとに求める。** `air.top_exhaust` は GPU の排気とラジエーターの排気が混ざる 1 点なので、プローブと出口の平均の関係は
    どちらの熱が入るかで変わりうる（GPU の熱がプローブの近く・遠くに偏る）。そこで Top の補正の係数を、CPU の負荷（L_cpu。ラジエーターの熱）と
    GPU の負荷（L_gpu）の**両方**で同じ方法で求める。`q_top(R | d_r)` と Top の掃引の `q_top` は L_cpu の係数で、Rear の式の
@@ -520,7 +537,7 @@ airflow_index(d) = q_z(d) / q_z(1.0)
    - `calibrated` にするには、曲線に加えて `balance`（目標の比と帯）・`thermal_limits`・`thermal_inputs` の値が要る。これらは本記録では
      決めず、#81 で応答の行列を材料に別の決定記録で決める。`calibrated` にすると Air Balance の推定が trace に載り、Learned MPC を
      配備したときは balance の項が効く（0073 §2.3）。協調の `mode` は `fan-policy.yaml` で別に `off` のまま（0078）
-5. 承認の目安（承認の決定記録で所有者が最終に決める。比べ方は §2.6a の上側の境界）: 回転数は段ごとの 3 回（§2.3）の範囲が中央値の 3% 以内、EFU は段ごとの
+5. 承認の目安（承認の決定記録で所有者が最終に決める。比べ方は §2.6a の上側の境界）: 回転数は段ごとの 3 回の上りと下りのすべての観測（§2.3）の範囲が中央値の 3% 以内、EFU は段ごとの
    有効な 3 回の独立な掃引（§2.4）の範囲が平均の 15% 以内。有効な回が 3 未満の段は目安を当てずに値を出さない。
    外れた段は値を出さず、理由を報告に残す。EFU はこの目安を満たしても、上の 4 の条件がそろうまで provisional
 
@@ -540,7 +557,7 @@ airflow_index(d) = q_z(d) / q_z(1.0)
 | 部屋（§2.5・零位法の 0） | セッションの中の `air.room` のブロックの平均の最大 − 最小 | `u_res` × √2 | 上側 ≤ `max_room_drift_c` |
 | 温度上昇・電力の増分の最小（§2.4） | `ΔT_z` / `ΔP` | §2.4 の `u(ΔT_z)` / `u(ΔP)` | 下側 ≥ `min_delta_t_c` / `min_delta_power_w` |
 | 信号 ÷ 不確かさ（§2.4） | `値 / u(値)` | — | ≥ `min_signal_to_uncertainty`（それ自体が不確かさの検査） |
-| 回転数のばらつき（§2.6 の 5） | 3 回の範囲 ÷ 平均 | 各回の `u`（窓の中央値の `u_win` と tach の更新の量子化）から、範囲は √2 × 最大の `u`、平均は 最大の `u` / √3 | `(範囲 + k × u(範囲)) / (平均 − k × u(平均))` ≤ `approval.max_rpm_spread` |
+| 回転数のばらつき（§2.6 の 5） | 3 回の上りと下りのすべての観測（n 個）の範囲 ÷ 平均 | 各観測の `u`（窓の中央値の `u_win` と tach の更新の量子化）から、範囲は √2 × 最大の `u`、平均は 最大の `u` / √n | `(範囲 + k × u(範囲)) / (平均 − k × u(平均))` ≤ `approval.max_rpm_spread` |
 | EFU のばらつき（§2.6 の 5） | 3 回の範囲 ÷ 平均 | 各回の §2.4 の `u(q)` から同じく | 同じ形で ≤ `approval.max_efu_spread` |
 | GPU の Fan の duty の影響（§2.4） | `effect_top` / `effect_rear` / `effect_null` | 両方の duty の段の平均の `u(平均)` から伝える | 上側 ≤ `max_gpu_fan_duty_effect` |
 | 結合の比（§2.4） | `coupling_top_by_rear` / `coupling_null` | 各段の平均の `u(平均) = max(伝えた u / √3, 3 回の範囲 / 2)` から伝える | 上側 < `max_coupling_ratio` |
@@ -549,7 +566,7 @@ airflow_index(d) = q_z(d) / q_z(1.0)
 | Front の範囲の覆い（零位法の 9） | 端の点の `d_f*` | `u(d_f*)`（零位法の 8） | 最低の点の上側 ≤ 0.35 + 許容・最高の点の下側 ≥ 1.00 − 許容 |
 | 零位法の半幅（零位法の 5） | 区間の半幅 | —（指示した Demand の差で、測った値ではない） | ≤ `max_null_halfwidth` |
 | 零点の確認（零位法の 6 の負荷の間・7 のアイドル） | 両端の向き | —（定性的） | `d_lo` が `−`・`d_hi` が `+`。`?` は不合格 |
-| §2.4a の一致（§2.4a） | 熱と独立の方法の比の差 | 熱の比の `u` だけ（独立の比の誤差は上限の側に含めてあるので足さない。§2.4a） | 上側 ≤ `approval.max_independent_ratio_gap`（計測器の精度から導き、§2.4a の測定の前に承認。後から広げるのは新しい決定記録だけ） |
+| §2.4a の一致（§2.4a） | 熱と独立の方法の比の差 | 熱の比（補正の後）の `u` だけ。補正の係数の `u(c_z)` は熱の比の `u` に含める（§2.4a の 1）。独立の比の誤差は上限の側に含めてあるので足さない（§2.4a） | 上側 ≤ `approval.max_independent_ratio_gap`（計測器の精度から導き、§2.4a の測定の前に承認。後から広げるのは新しい決定記録だけ） |
 | 応答の行列の熱の入力（§2.5） | 動かした段と基準の段の電力の差（CPU・GPU） | 各窓の `u_win` と `u_res(ΔP)` | 上側 ≤ `response_matrix.max_power_delta_w` |
 | まとめに入る回の Control Config（§2.7） | 4 ファイルの SHA-256 | —（照合） | すべての回で同じ |
 | 窓の覆い・`tick_id` の連続・hash・較正の digest（§2.2・§2.6・§2.7） | 数・時刻の差・一致 | —（数えた値と照合で、不確かさを持たない） | そのまま |
@@ -590,6 +607,7 @@ airflow_index(d) = q_z(d) / q_z(1.0)
 見て負荷を止める判断に使う。解析の検査ではないので、解析の設定に写さない（写すと 2 か所で食い違いうる）。CPU の floor の点（60 / 80 °C・100 / 200 W）は `safety.yaml` の値で、解析は manifest の Control Config の hash を通して同じものを読み、写さない。GPU の Fan の固定の duty の値は、
 §5 の 3 の承認の記録と `coldaisle-gpu-fan` の側に置き、解析は manifest に残った値と `gpu.0.fan_speed` を照らすだけにする。
 §2.4a の一致の上限 `approval.max_independent_ratio_gap` は、§5 の 2 の計測器を決める承認の記録で、§2.4a の測定の前に値を決めて足す（§2.4a の表の案）。
+§2.4a の 1 の面の測定の回数と点の格子（`probe_correction.*`）も同じ承認の記録で決めて足す。
 零位法の漏れの経路の一覧と、駆動される経路の割合の上限 `null.max_driven_leak_ratio`（案 2〜5 %。計測器の精度を見て決める）は、零位法の測定の前に
 承認の記録で決めて足す（§5 の 7。一覧は数値ではないので manifest に版を残し、解析は manifest の一覧の版が承認の記録の版と同じことを照らす）。
 
@@ -670,6 +688,8 @@ manifest に残すことだけを決める。
   一覧の版が承認の版と違う例、観測する経路の一部の向きが記録に無い例で、Front の `calibrated` を提案しないこと
 - 零位法の区間の誤差: 傾きの大きい Front の曲線で、半幅は `max_null_halfwidth` 以内でも `u_bracket` の割合が `null.max_bracket_flow_error` を
   超える合成の例で `calibrated` を提案せず、`u_total(q_front)` が `coupling_null` などの比べ方に入ること
+- 補正の係数の不確かさ: 面の点が少なく `u(c_z)` の大きい合成の例で、補正の後の `q_top / q_rear` の `u` が大きくなり §2.4a の一致を通らないこと。
+  `airflow_index` には `u(c_z)` を足さないこと。trace の最後の tick で `write_ok` / `readback_ok` が偽（`applied_demand` が null）の窓を `trace_coverage` で捨てること
 - Top の熱源ごとの補正: GPU の熱がプローブの近くに偏る合成の筐体で、L_cpu の係数だけで補正した `q_rear` が偏り、L_gpu の係数を使うと真の値を
   取り戻すこと。L_gpu の係数が無い出力で Rear に provisional の印が付くこと
 - Top の引き算で電力の増分がほとんど打ち消され、`q_top` の 3 回がそろっている合成の例で、温度と電力の不確かさを伝えた `u(N)` によって
