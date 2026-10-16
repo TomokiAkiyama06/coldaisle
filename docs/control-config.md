@@ -223,7 +223,7 @@ supervisor:
   `supervisor_unavailable` / `rule_policy_not_active` だけ。`rule_policy_not_active` は設定の `active_policy` が
   `rule_policy` でない構成の tick で、RL の提案が無く RulePolicy へ fallback した tick も含む（ヒントを効かせうるのは
   active slot の RulePolicy だけ。0133 §2.2）。`would_override` は判定しない。0133 §2.8 の表に無い値で、
-  PR #332 のレビューで足した
+  PR #332 のレビューで足し、決定記録 0149 で語彙に加える
 
 **移行手順**: v11 を v12 として補完しない（読み込み時に拒否する）。
 
