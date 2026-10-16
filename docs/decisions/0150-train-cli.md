@@ -56,10 +56,30 @@ AGENTS.md の「仕様に無い判断をした場合、実装より先に決定�
 - 合成の起点 `src/coldaisle/train.py`、console script `coldaisle-train`（`pyproject.toml`）
 - **どこからも import しない**（`authority_cli.py` と同じ扱い）。とくに `control_daemon`・`learned_worker`・
   `learned_channel`・`control/`・`api/`・`ai/`・`server`・`event_entry`・`control_admin` から import しない
-- `train.py` が import してよいのは、上の表の関数・型、`store`（読み取り）・`ingest`（`training_entry` 経由の再生）・
-  `control/model_registry`・`training_output`（§2.5）・`dataset`（`_open_output_root` を公開にした関数だけ。§2.5 の手順 1）・
-  `logs` だけ。`control/hardware`・`control/safety`・`control/reactive`・`control/loop`・
-  `serial`・`subprocess`・`ai` を import しない（試験で走査する。§2.9）
+- `train.py` が import してよいのは次の一覧だけ（関数・型・メソッドの単位。§2 の手順で使うものを全部並べる）。
+  `control/hardware`・`control/safety`・`control/reactive`・`control/loop`・`serial`・`subprocess`・`ai` を import しない
+  （試験で走査する。§2.9）
+
+  | module | 使うもの | 使う所 |
+  |---|---|---|
+  | `training_entry` | `verify_training_dataset_v2`・`TrainingDatasetRefused` | §2.4 の 2 |
+  | `calibration_log` | `verify_training_calibration` | §2.4 の 3 |
+  | `declared_changes` | `read_declared_changes`（`DeclaredChangesInput` の `changes` と `file_sha256`）・`DeclaredChangesError` | §2.3 の `--declared-changes`・§2.7 |
+  | `metrics` | `MetricCatalog.from_yaml_with_sha256` | §2.3 の `--metrics-config`・§2.4 の 5 / 7・§2.7 |
+  | `store` | `QualityRules`（`model_validate` だけ。§2.7） | §2.3 の `--quality-config` |
+  | `ingest.calibration` | `Calibration.from_json_bytes` | §2.3 の `--calibration`・§2.4 の 3 / 5 / 7 |
+  | `control.model.counterfactual_training` | `verify_training_dataset_artifact_v2`・`train_counterfactual_ridge`・`CounterfactualTrainingSpec` | §2.4 の 1 / 5 |
+  | `control.model.counterfactual_confidence` | `seal_counterfactual_artifact` | §2.4 の 5 |
+  | `control.model.counterfactual` | `canonical_counterfactual_artifact_bytes`・`counterfactual_registry_metadata`・`counterfactual_registry_metadata_json_bytes`・`check_artifact_contents`・`RegistryCounterfactualThermalModel.from_verified_artifact` | §2.4 の 6 / 7 |
+  | `control.model.confidence` | `ConfidenceProfileSpec`（`SupportAxis` を含む） | §2.3 の `--training-spec` |
+  | `control.model.dataset` | `split_temporally_v2` | §2.4 の 4 |
+  | `control.model.training` | `split_sha256` | §2.7 |
+  | `control.model_registry` | `ModelRegistry`（`register_candidate`・`load_version`）・`ModelRegistryLimits`・`load_model_registry_limits`・`ArtifactMetadata`・`ModelRegistryError` とその派生（`RegistryDurabilityError` など） | §2.5 |
+  | `training_output` | 公開の手順・path の照合・印を確かめる関数（§2.5） | §2.5 |
+  | `dataset` | `_open_output_root` を公開にした関数だけ（§2.5 の手順 1） | §2.5 |
+  | `logs` | 構造化ログ | 全体 |
+
+  実装の PR で、この一覧に無いものが要るとわかったら、PR の説明に足すものと理由を書き、試験の走査の許可の一覧と一緒に足す
 - **LLM に依らない。** AI 層のツールにも読み取り API にも出さない（AGENTS.md ルール1。0062 §2.1 と同じ）
 - 0062 の `coldaisle-registry` には `register --training-output` を1つ足す（§2.5。既存の操作と引数は変えない）
 - **人が手で実行する。** systemd の timer やデーモンからは起動しない（本番のオンライン学習はしない。Q-25 は開いたまま
@@ -211,7 +231,9 @@ process が強制終了したとき（`SIGKILL`・電源断）は片づけられ
    の正しさはこの1手が持ち、確認と公開の間の窓（rename による置き換え）がそもそも無い。作った直後に `--out` を
    `O_DIRECTORY | O_NOFOLLOW` で開き、path の照合（下記）が通ること・中が空であることを確かめる（差し替えの検知）。
    以後は fd（`dir_fd`）だけで書く
-3. 3つのファイルを `--out` の中へ `O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW` で書き、**それぞれ fsync** する
+3. 3つのファイルを `--out` の中へ `O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW` で書き、**それぞれ fsync** する。**順は
+   `training-report.json` を最初**にする（`artifact.json` があるときは必ず `training-report.json` もある。下の「`--metadata` /
+   `--payload` の経路」の判定に使う）
 4. **完成の印を一時名で書く。** 3つのファイルの名前・大きさ・SHA-256 を、`--out` の中の一時名
    `.COMPLETE.json.tmp-<32 hex>` へ `O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW` で書き、fsync する。読む側はこの名前を見ない
 5. **link の直前に、path の照合（下記）で `--out` の path がまだ手順 2 で開いたディレクトリを指していることを確かめる。**
@@ -284,9 +306,21 @@ JSON として読めて、書かれた3つのファイルの大きさと SHA-256
 - 手動の登録と回復は **`coldaisle-registry register --training-output <--out>`** で行う（`--metadata` / `--payload` と
   排他）。`register` は下記の確かめる関数で印を確かめ、**確かめたときに読んだ bytes そのもの**（`artifact.json` と
   `metadata.json`）を `register_candidate` へ渡す（確かめた後に読み直さない。差し替えの窓を作らない）。印が無い・無効なら
-  終了コード 1 で Registry を開かない。既存の `--metadata` / `--payload` の経路（RL policy など学習の CLI の外の artifact）は
-  変えない。印を確かめずに `--metadata` / `--payload` で渡しても、`register_candidate` は payload の SHA-256 を metadata と
-  照合し、metadata は strict JSON として読むので、書きかけのファイルが黙って candidate になることは無い
+  終了コード 1 で Registry を開かない
+- **`--metadata` / `--payload` の経路は、学習の出力のファイルを拒む。** 手順 3〜5 の間、`artifact.json` と `metadata.json` は
+  `COMPLETE.json` がまだ無いのに完成して checksum も合っていることがある。同じ uid が並行してこの経路で登録すると、公開の点より
+  前に candidate ができ、その後に印の作成が失敗すると `--out` は片づけられるのに Registry は変わったままになる。これは「脅威の
+  前提」の**同じ uid の誤った操作**に当たるので、安価な検査で止める: `register --metadata/--payload` は、`--payload` か
+  `--metadata` のファイルと同じディレクトリに `training-report.json` があれば（学習の出力のディレクトリ。手順 3 で最初に書く）、
+  `COMPLETE.json` の有無に依らず拒み、`--training-output` を使うよう促して終了コード 1 で Registry を開かない。学習の出力は
+  `--training-output` の経路（印を確かめる）からだけ登録できる。RL policy など学習の CLI の外の artifact の登録は変わらない。
+  - **推奨とした理由**: もう1つの案「書いている途中のファイルを一時名（`.artifact.json.partial` など）で置き、公開と同時か
+    直前に最終の名前へ移す」は、最終の名前へ移すのを印の link の前にすると窓が残り（移した後・link の前に同じ経路で登録
+    できる）、link の後にすると「印はあるがファイルが無い」公開の後の失敗の状態が増える。拒む案は公開の手順と状態を変えず、
+    登録できる経路を「印を確かめる経路」1つに絞れる
+  - 欠点: 学習の出力のファイルを別の場所へ写してから `--metadata` / `--payload` で渡すと、この判定は効かない。同じ uid の
+    意図した操作なので前提の外とする。写したものでも `register_candidate` は payload の SHA-256 を metadata と照合するので、
+    書きかけのファイルが黙って candidate になることは無い
 - **確かめる関数の置き場所は、レイヤ横断の小さなモジュール `src/coldaisle/training_output.py`**（仮の名前）とする。
   印の形（`COMPLETE.json` の pydantic の型）・書く側の公開の手順（§2.5 の手順 2〜7）・path の照合の関数・読む側の確かめる関数
   （`O_DIRECTORY | O_NOFOLLOW` で開き、`dir_fd` で各ファイルを上限つきで読み、大きさと SHA-256 を照合して bytes を返す）を
@@ -376,8 +410,23 @@ coldaisle-authority raise          → authority を1段   （承認者の uid�
 - **壁時計を読まない。** `created_at` は引数（§5 の 4）。報告にも生成時刻の欄を置かない（0054 §2.7 と同じ）
 - `training-report.json` に次の digest を載せる: dataset の alias・manifest と examples の SHA-256・split の SHA-256
   （`split_sha256`）・`--training-spec` の bytes の SHA-256・較正の `offsets_sha256` と照合した記録の行・
-  `--declared-changes` / `--quality-config` / `--metrics-config` の bytes の SHA-256・再生の入力の `source_sha256` と
+  `--declared-changes` / `--quality-config` / `--metrics-config` / `--calibration` の bytes の SHA-256（どれも parse した bytes と同じ
+  buffer から。下記）・再生の入力の `source_sha256` と
   `export_binding_sha256`。artifact の manifest が既に持つもの（`training_data`・`calibration_binding`）は重ねて計算しない
+- **設定ファイルはすべて1回だけ読み、その bytes から parse し、同じ buffer から hash する。** 読んだ後・digest を取る前に
+  差し替えられて、artifact と `training-report.json` が違う設定を指すことを防ぐ。path から2回読む API（parse 用と hash 用）を
+  使わない。既存の入口で足りるかは次のとおり
+
+  | 入力 | 読み方 |
+  |---|---|
+  | `--training-spec` | `train.py` が bytes を読み、`yaml.safe_load` → schema の pydantic の型で検証。hash も同じ bytes |
+  | `--quality-config` | `QualityRules.from_yaml(path)` は path から読み digest を返さないので**使わない**。`train.py` が bytes を読み、`yaml.safe_load` → mapping であることを確かめ → `QualityRules.model_validate`（`from_yaml` の本体と同じ処理で、既存の API で足りる）。hash も同じ bytes |
+  | `--metrics-config` | `MetricCatalog.from_yaml_with_sha256`（既に1回だけ読み、同じ bytes の SHA-256 を返す。0107 §2.6） |
+  | `--declared-changes` | `read_declared_changes`（既に1回だけ読み、同じ bytes の `file_sha256` を返す） |
+  | `--calibration` | `train.py` が bytes を読み、`Calibration.from_json_bytes(data, origin=...)`。hash も同じ bytes（報告の digest。較正の照合は 0099 §2.6 の `offsets_sha256`） |
+  | `--registry-limits` | `train.py` が `model-registry.yaml` の bytes を読み、`yaml.safe_load` → `ModelRegistryLimits.model_validate`（`from_file` の本体と同じ）。1回読んだ limits を登録と `load_version` の両方に使う（§2.5） |
+
+  上限で切って読む（0062 §2.1 の流儀）。`training_entry` に渡す `QualityRules` も、この1回の読みから作ったものを渡す
 - `code_commit` は `--code-commit` で明示して渡す。CLI は `git` を呼ばない（`subprocess` を使わない）。`--apply` のときは
   必須にする（§5 の 8）
 
@@ -460,6 +509,13 @@ best-effort で `OSError` / `UnsafeRegistryPathError` を握る（`src/coldaisle
   変わらないこと
 - import の走査: `train` を import する module が無いこと、`train` が §2.1 の禁止の module を import しないこと。
   `training_output` を import するのが `train` と `registry` だけで、`training_output` が coldaisle の他の module を import しないこと
+- `coldaisle-registry register --metadata/--payload` の拒否: 手順 3 の後・手順 5 の前（`COMPLETE.json` が無い・`artifact.json` と
+  `metadata.json` は完成）の `--out` のファイルを渡すと終了コード 1 で Registry が変わらないこと。公開の後の `--out` でも拒むこと。
+  `training-report.json` の無い別のディレクトリのファイルは従来どおり登録できること。手順 3 で `training-report.json` が最初に
+  書かれること
+- 設定の1回読み: `--quality-config` / `--training-spec` / `--calibration` / `--registry-limits` を、読んだ直後に差し替えても
+  （`open` を包んで2回目の読みで別の bytes を返す）、学習・登録に使った設定と報告の digest が1回目の bytes のものであり、
+  path から2回読まないこと
 - `coldaisle-registry register --training-output`: 有効な印の `--out` から candidate を登録できること。印が無い・書きかけ・
   SHA-256 がずれた `--out` では終了コード 1 で Registry が変わらないこと。`--metadata` / `--payload` と同時に渡すと拒否し、
   Registry が変わらないこと。成功したときは candidate が1つ足され（上の (1)〜(4)）、`--out` の中身が変わらないこと。確かめた後に
