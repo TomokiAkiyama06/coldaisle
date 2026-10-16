@@ -54,7 +54,7 @@ SIGABRT で終わらないが SIGKILL では終わる hang（**kill できる ha
 - SIGABRT で終わらない hang を外から作る手段が無い。`SIGSTOP` は systemd の `SIGCONT` で解け、SIGABRT で終わる
 - `WatchdogSignal` を無視される signal に変えると、`SIGCONT` で fand が動き出し、Demand を書き続ける。
   「低い Demand のまま固まる」状態にならない
-- `TimeoutAbortSec` の経路そのもの（SIGKILL → 引き継ぎ）は予備確認で 44〜51 ms と測ってある。足りないのは
+- `TimeoutAbortSec` の経路そのもの（SIGKILL → 引き継ぎ）は予備確認で 44〜51 ms と測ってある（**kill できる fand に限る**。D 状態では §1.1a）。足りないのは
   **固まった時間が約 10 s 続くときの温度**だけである
 
 ### 1.3 これまでの判断
@@ -82,7 +82,7 @@ SIGABRT で終わらないが SIGKILL では終わる hang（**kill できる ha
 
 | 測るもの | 合格の条件 | 根拠 |
 |---|---|---|
-| `SIGSTOP` から Max（3 zone の `pwmN_enable=0`、20 ms ごとに読む。CLOCK_MONOTONIC）まで | **10100 ms 以上・12000 ms 以下** | 下限: 本番の最悪 5000 + 5000 + SIGKILL から Max の実測の最長 51 ms を 100 ms に切り上げた値。これより短い試行は本番の最悪を覆わないので判定に使わない。上限: 11000 + SIGABRT から Max の実測の最長（T5 の 324 ms、apport が core を受けた予備確認の 0.86 s）に余裕を足した値。超えたら SIGABRT の経路が想定どおりでない |
+| `SIGSTOP` から Max（3 zone の `pwmN_enable=0`、20 ms ごとに読む。CLOCK_MONOTONIC）まで | **10100 ms 以上・12000 ms 以下** | 下限: kill できる hang（§1.1a）の本番の最悪 5000 + 5000 + SIGKILL から Max の実測の最長 51 ms を 100 ms に切り上げた値。これより短い試行は本番の最悪を覆わないので判定に使わない。上限: 11000 + SIGABRT から Max の実測の最長（T5 の 324 ms、apport が core を受けた予備確認の 0.86 s）に余裕を足した値。超えたら SIGABRT の経路が想定どおりでない |
 | 止めている間と Max の後 30 s の温度 | 0121 §2.7 のまま: 開始 + 上昇が上限（`absolute_temp_ceiling_c` 90 °C、T_SENSOR 80 °C）より 5 °C 以上低い（`cpu.package`・`gpu.0.core` は 85 °C 未満、`board.connector_12v2x6` は 75 °C 未満）。**判定は §2.5a の速い読み取りの最大値に、読み取りの間の見落としの分（§2.5a の式の `r × L`）を足した値で行う**。DB の 2500 ms ごとの値は参考にだけ使う | 0119 §2.13・0121 §2.7。本記録で緩めない。2500 ms ごとの値では、CPU が約 5 s で 31〜32 °C 上がる間の最大を見落とし、誤って合格にしうる |
 | 止める直前の `effective` | (i) は記録したアイドルの値のまま、(iii) はアイドルの値 + 0.05 以内（0121 §2.7。外れた試行は使わない） | 「低い Demand のまま固まる」最悪の条件にするため |
 | 位相（`SIGSTOP` の時刻 − systemd が最後の `WATCHDOG=1` を受けた時刻） | 100 ms 以内の試行を各条件で少なくとも 1 つ（0121 §2.7） | 固まる時間を最も長くするため |
@@ -115,7 +115,7 @@ SIGABRT で終わらないが SIGKILL では終わる hang（**kill できる ha
    1. **負荷を止める**: CPU / GPU の負荷のプロセスを止めて終わるのを待ち、GPU の電力の上限を既定に戻す
    2. **fand を止める**: fand が `SIGSTOP` で止まっている（`/proc/<main PID>/stat` の状態が `T`）なら、**先に `SIGKILL` を送る**
       （`SIGCONT` で動かさない。動き出した fand は止める前の古い状態で数 tick 書きうるので、止まったまま殺して
-      `ExecStopPost` に Max を書かせる。実測 44〜51 ms）。そのあと `systemctl stop coldaisle-fand`（`Restart=always` の再起動を
+      `ExecStopPost` に Max を書かせる。実測 44〜51 ms は**kill できる fand に限る**。D 状態なら下の「3 を確かめられないとき」へ）。そのあと `systemctl stop coldaisle-fand`（`Restart=always` の再起動を
       止める。再起動していれば正常停止で BIOS へ返す）。`systemctl stop` が `TimeoutStopSec`（10 s）+ 5 s で終わらなければ
       `systemctl kill -s SIGKILL coldaisle-fand` を送ってから、もう一度 `systemctl stop` する
    3. **止まったことを確かめる**: `systemctl is-active coldaisle-fand` が `inactive`（`failed` なら `reset-failed` の後に
@@ -124,12 +124,29 @@ SIGABRT で終わらないが SIGKILL では終わる hang（**kill できる ha
    4. 3 が確かめられたときだけ、**drop-in と試験の設定のディレクトリを消して `daemon-reload`** する
    5. **本番の設定に戻ったことを確かめる**（下の 4）
 
-   3 を確かめられないとき（`active` / `deactivating` のまま、`pwmN_enable` に `1` が残る、読めない）は、**drop-in と試験の設定を
+   スクリプトの中の `pwmN_enable` などの sysfs の読み取りは、D 状態の driver で戻らないことがあるので、すべて時間の上限
+   （`timeout 2`）をつけ、戻らなければ「読めない」として扱う。
+
+   3 を確かめられないとき（`active` / `deactivating` のまま、`pwmN_enable` に `1` が残る、読めない、fand のプロセスの状態が
+   `D` のまま。SIGKILL が効かない D 状態を含む）は、**drop-in と試験の設定を
    消さずに残し**、端末に大きく警告を出して（「fand が 11 s の試験の設定のまま動いている可能性。drop-in を残した」）、
    0 以外で終わる。所有者はその場で次を行う: `systemctl status coldaisle-fand` と `ps` で fand のプロセスが残っていないか、
    3 zone の `pwmN_enable` と `pwmN` を見る → 残っていれば `systemctl kill -s SIGKILL coldaisle-fand` と `systemctl stop` →
    それでも `pwmN_enable` が `1` なら 0121 §2.1 のとおり `5` を書く → `inactive` を確かめてから、手で drop-in と設定を消して
    `daemon-reload` し、下の 4 を確かめる
+
+   **SIGKILL が効かない（fand の状態が `D` のまま終わらない、`pwmN_enable` の読み書きも戻らない）とき**は、`ExecStopPost` の Max も、
+   人の `pwmN_enable=5` の書き込みも同じ driver で止まりうる（§1.1a）。Fan は最後の値のままと見なし、熱を減らす側で対処する。
+   所有者が取れる手は、順に:
+   1. CPU / GPU の負荷のプロセスが残っていないかを確かめて止める（`pgrep` / `pkill`。`nvidia-smi` で GPU の使用率と電力を見る）。
+      GPU の負荷が止まらなければ、そのプロセスを `kill -KILL` し、GPU の電力の上限を最小にする（`nvidia-smi -pl`）。
+      GPU の Fan は `coldaisle-gpu-fan`（別のプロセス・NVML。0128）が動かし続ける
+   2. ほかの負荷（Docker のコンテナ・ビルドなど）も止め、マシンをアイドルに保つ。CPU は自身の温度の上限でクロックを下げる
+   3. 温度を、試験のスクリプトの速い読み取り（読めれば）か `nvidia-smi` と BIOS の表示で見続ける。D 状態の調べのために
+      `cat /proc/<main PID>/stack` と `dmesg` の `hung_task` を記録に残す（§5 の 9）
+   4. 温度が下がらない、または読めないときの**最後の手段は電源を切る**。D 状態のプロセスがあると `systemctl poweroff` も
+      止まりうるので、電源ボタンの長押しか電源ユニットのスイッチで切る。次の起動では fand は `disabled` なので起動せず、
+      BIOS の制御で始まる。drop-in と試験の設定は残っているので、起動後に上の手順で消して下の 4 を確かめる
 
    `pwmN_enable` が `0`（Max）で終わったときは、試験の設定を消した後に、本番の設定で fand を `systemctl start` →
    STARTUP の後に `systemctl stop` で BIOS へ返す（0080 §2.8 の正常停止）か、Max のまま置くかを所有者が決める（どちらも安全側）
@@ -169,12 +186,13 @@ SIGABRT で終わらないが SIGKILL では終わる hang（**kill できる ha
   §2.5a の速い読み取りで行い、閾値は §2.5a の式で基準より下げる。**`SIGSTOP` の間は fand 自身の Critical Safety も
   止まっている**ので、この見張りと systemd の deadman だけが頼りになる
 - **止めている間に見張りに届いたら**、負荷を止め、すぐに fand の main PID へ `SIGKILL` を送る（管理ソケットは止まった
-  fand に届かない）。SIGKILL の後は本番の `TimeoutAbortSec` の経路と同じく `ExecStopPost` が Max を書く（実測 44〜51 ms）。
+  fand に届かない）。SIGKILL の後は本番の `TimeoutAbortSec` の経路と同じく `ExecStopPost` が Max を書く（実測 44〜51 ms。
+  **kill できる fand に限る**。1 s で Max が見えなければ §2.3 の 3 の「SIGKILL が効かないとき」へ進む）。
   その試行は合格にしない
 - **`SIGSTOP` から 12000 ms で Max が見えなければ**、同じく `SIGKILL` を送る。試行は無効とし、原因（journal の
   `Watchdog timeout` と `safety_handoff_completed`）を確かめるまで次の条件へ進まない。固まる時間は最長でも約 12 s に限る
 - それでも Max にならなければ 0121 §2.1 のとおり `systemctl stop coldaisle-fand`、それも効かなければ
-  `pwmN_enable` に `5` を書く
+  `pwmN_enable` に `5` を書く。fand が SIGKILL で終わらない（D 状態）ときは、§2.3 の 3 の「SIGKILL が効かないとき」の手順を行う
 - 所有者が現地にいて、開始と終了を行う（0121 §2.1）
 
 ### 2.5a 試験の見張りと判定に使う速い温度の読み取り
@@ -189,7 +207,8 @@ SIGABRT で終わらないが SIGKILL では終わる hang（**kill できる ha
 | `board.connector_12v2x6` | telemetry と同じ hwmon の属性（T_Sensor） | 判定と見張り |
 
 **見落としの分の式**: 読み取りから反応までの遅れ `L` = センサー自身の更新の間隔 `U` + 読み取りの間隔 0.25 s + 反応
-（負荷を止めて SIGKILL を送り、`ExecStopPost` が Max を書くまで。実測 44〜51 ms を 0.1 s に丸める）。最大の上昇の速さを `r` とすると、
+（負荷を止めて SIGKILL を送り、`ExecStopPost` が Max を書くまで。実測 44〜51 ms を 0.1 s に丸める。**kill できる fand に限る**。D 状態では反応に上限が無く、
+負荷を止めることだけが効く）。最大の上昇の速さを `r` とすると、
 読み取りの間に見落としうる上がりは `r × L` である。
 
 - **中止の閾値** = 中止の基準 − `r × L` − 余裕 1 °C（切り捨て）
@@ -278,9 +297,10 @@ CPU の条件が中止や判定の上限に届いたら、その条件は負荷�
 ### 悪くなること・その緩和
 
 - 試験の間は deadman が 11 s に延び、hang から Max までが本番より遅い。緩和: 所有者が現地・`enable` しない・スクリプトの
-  実行の間だけ・止めている間の見張りと 12000 ms での SIGKILL・`trap` での後片付けと確認
+  実行の間だけ・止めている間の見張りと 12000 ms での SIGKILL（kill できる fand に限る）・`trap` での後片付けと確認。
+  試験の中で fand が D 状態になれば SIGKILL も効かず、§2.3 の 3 の手順（負荷を止める・最後の手段で電源を切る）に頼る
 - SIGKILL で終わる本番の最悪の経路の「時間」は、この試験では通らない（SIGABRT で終わる）。緩和: SIGKILL から Max は
-  予備確認の 44〜51 ms で足りており、本記録で要るのは固まる時間の長さだけである。時間の下限 10100 ms で本番の最悪を覆う
+  予備確認の 44〜51 ms で足りており（kill できる fand に限る。D 状態では上限が無い。§1.1a）、本記録で要るのは固まる時間の長さだけである。時間の下限 10100 ms で本番の最悪を覆う
 - **D 状態の hang は守れないまま残る**（§1.1a）。試験に合格しても、hwmon の driver の中で書き込みが戻らなければ、Fan は最後の
   低い Demand のまま上限の無い時間残りうる。緩和は本記録の中には無く、§5 の 8・9 で所有者が受け入れか手当てを決める
 - drop-in を消し忘れると deadman が 11 s のまま残る。緩和: `trap`・§2.3 の 4 の確認・`enable` の前に
