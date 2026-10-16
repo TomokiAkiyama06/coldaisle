@@ -574,3 +574,67 @@ def test_devices_is_empty_before_the_first_hello(tmp_path, rules, clock):
     )
     with TestClient(app) as opened:
         assert opened.get("/api/v1/devices").json() == {"devices": []}
+
+
+def _open_fd_count() -> int | None:
+    """このプロセスが開いている fd の数。`/proc` が無い環境では数えない。"""
+    fd_dir = Path("/proc/self/fd")
+    return len(list(fd_dir.iterdir())) if fd_dir.is_dir() else None
+
+
+def test_store_provider_releases_connections_of_finished_threads(db, clock):
+    """終わったスレッドの接続は閉じられ、接続と fd が積み上がらない（#346）。
+
+    anyio のワーカースレッドは使われないと終わり、次の要求は新しいスレッドで
+    新しい接続を開く。provider が強参照を持つと、本番では約 20 時間で fd の
+    上限に達した。
+    """
+    import threading
+    import weakref
+
+    from coldaisle.api.app import StoreProvider
+
+    provider = StoreProvider(
+        Config(db=db, quality_rules=QUALITY_RULES_PATH, metrics=METRICS_PATH), clock
+    )
+    refs: list[weakref.ref[SqliteStore]] = []
+
+    def work() -> None:
+        store = provider.get()
+        assert provider.get() is store  # 同じスレッドでは同じ接続を使い回す
+        store.latest()
+        refs.append(weakref.ref(store))
+
+    def run_threads(count: int) -> None:
+        for _ in range(count):
+            thread = threading.Thread(target=work)
+            thread.start()
+            thread.join()
+
+    run_threads(5)  # import や遅延初期化で開く fd を先に済ませる
+    before = _open_fd_count()
+    run_threads(200)
+
+    # gc.collect() に頼らない。スレッドの終了だけで解放されること
+    assert all(ref() is None for ref in refs)
+    if before is not None:
+        after = _open_fd_count()
+        assert after is not None
+        assert after <= before + 2
+
+    provider.close_all()  # 終わったスレッドの分が残っていなくても落ちない
+
+
+def test_store_provider_close_all_closes_connections_of_live_threads(db, clock):
+    """停止処理で閉じられる接続（同じスレッドのもの）は従来どおり閉じる。"""
+    import sqlite3
+
+    from coldaisle.api.app import StoreProvider
+
+    provider = StoreProvider(
+        Config(db=db, quality_rules=QUALITY_RULES_PATH, metrics=METRICS_PATH), clock
+    )
+    store = provider.get()
+    provider.close_all()
+    with pytest.raises(sqlite3.ProgrammingError):
+        store.connection.execute("SELECT 1")
