@@ -125,6 +125,25 @@ RPM の比と正規化した EFU の差（取り付けた状態で風量が回�
 - 測定の期間中は較正を変えない（`coldaisle-calibrate --apply` をしない。§2.7）
 - 試験の側から `fanN_input` を高い頻度で読まない（読む頻度が更新を変える。0125）。回転数は fand の trace と `coldaisle-telemetry` の値を使う
 - **LLM は関わらない。** 手順の実行・解析・承認のどこにも LLM を使わない。解析の結果を LLM のプロンプトへ入れない（ルール 1 / 8）
+- **窓の覆いの検査**: 値を取るすべての窓（§2.3 の 60 s の窓・§2.4 の負荷なし / 負荷ありの 2 分の窓・零位法の観測の 30 s の窓・§2.5 の 2 分の窓）
+  について、次の 2 つを検査し、満たさない窓は**値を計算する前に**捨てる（捨てた理由 `telemetry_coverage` / `trace_coverage`）。捨てた窓を
+  含む段・回は、§2.4 の不確かさ・3 回のまとめ・§2.6 の 5 の承認の目安に入れない。残った数個の読み値から `s²/n` を出して
+  `low_signal` を通ること、trace の欠けで一時的な floor が隠れることを防ぐ
+  - **metric ごとの覆い**（その窓で使う metric のすべて。温度・電力・`gpu.0.fan_speed`・`fan.vrm.rpm`・`fan.aio_pump.rpm`・`air.room` など）:
+    窓の中の行が**すべて** `quality = ok`（`stale` / `suspect` / 欠けの行が 1 つでもあれば捨てる。0029 の分類を値として使わない）・ok の行の数が
+    `min_ok_samples` 以上・隣り合う ok の行の時刻の差と、窓の始まりから最初の行・最後の行から窓の終わりまでの差が `max_sample_gap_ms` 以下。
+    値は各 metric の自分の行の時刻で使い、補間・リサンプルしない（0151（PR #343。提案中）§2 と同じ）。閾値は収集の周期が違うので
+    source ごと（基板の `air.*`・`coldaisle-telemetry` の NVML / hwmon・`coldaisle-cpu-power`）に持つ
+  - **trace の覆い**（fand の decision trace）: 0151 の「連続した trace の区間」と同じ形で読む。窓に入る trace を `seq` の昇順でたどり、
+    (1) `seq` に欠番が無い（理由を見分けず、穴があれば捨てる）、(2) 隣り合う 2 行の `ts_ms` の差と、窓の始まりから最初の tick・最後の tick から
+    窓の終わりまでの差が `trace_max_gap_ms` 以下（`ts_ms` は途切れの比較にだけ使い、並びは `seq`）、(3) tick の数が `min_trace_ticks` 以上、
+    (4) すべての tick が同じ `run_id`（fand の再起動をまたがない。測定は `run_id` を持つ版の trace でだけ行うので、0151 と違い使える）、
+    (5) すべての tick で `operating_mode` が `manual` で、その段の指令（`command_id`）のまま・Critical Safety が `NORMAL`・3 zone の `effective` が
+    manual の値と同じ（§2.2 の floor の決まり）。(1)〜(4) は「floor が掛かっていないこと」を、欠けた tick の無い trace で確かめるためにある
+  - 閾値 `min_ok_samples`・`max_sample_gap_ms`（source ごと）・`trace_max_gap_ms`・`min_trace_ticks` は §2.4 の「設定の値」と同じ
+    `config/airflow-characterization.yaml` に `status: provisional` で置く。提案の初期値は、基板の 2.5 s の周期で 2 分の窓に対し `min_ok_samples` 44
+    （48 の約 9 割）・`max_sample_gap_ms` 6000（2 周期と少し）、trace は `trace_max_gap_ms` 1500（0121 T1 の tick の間隔の上限）・`min_trace_ticks` は
+    窓の長さ ÷ 1000 ms の 95 %。窓の長さが違う窓（60 s・30 s）には同じ割合で当てる
 
 ### 2.3 回転数の掃引（`pwm_to_rpm` と Fan profile）
 
@@ -378,7 +397,7 @@ airflow_index(d) = q_z(d) / q_z(1.0)
 - 較正の digest（区間の開始の時点で有効な `calibration_activations` の行の `offsets_sha256`。0096 / 0099）
 - 解析に使う DB の写しの SHA-256・作った時刻（§2.6 の 2）
 - 負荷の定義（GPU の電力の上限・CPU の worker の数）と予備の試行の結果
-- 段ごとの指示の値（3 zone）・lease・開始と終了の時刻（ms）・捨てた理由（`floor_bound` / `unsettled` / `aborted` / `safety_fault` / `room_drift` / `baseline_drift` / `condition_mismatch` / `low_signal` / `null_unresolved` / `calibration_changed`）と、各窓の代表の時刻
+- 段ごとの指示の値（3 zone）・lease・開始と終了の時刻（ms）・捨てた理由（`floor_bound` / `unsettled` / `aborted` / `safety_fault` / `room_drift` / `baseline_drift` / `condition_mismatch` / `low_signal` / `null_unresolved` / `calibration_changed` / `telemetry_coverage` / `trace_coverage`）と、各窓の代表の時刻
 - 零位法では、観測した Front の値ごとの向き（`+` / `−` / `?`）と二分法の順序
 
 **較正との結びつけ**: 保存された温度にはプローブごとの offset（`config/calibration.json`）が掛かっている。EFU は 2 つのプローブの差を
@@ -424,6 +443,8 @@ manifest に残すことだけを決める。
 - 分母が正で信号 ÷ 不確かさの条件を満たさない点を出さないこと（3 回とも同じ値に量子化された合成の例を含む）。L の時刻が前後の負荷なしの窓の
   真ん中にない合成の例で、時刻の内挿がずれを取り除くこと
 - GPU の Fan・VRM の Fan・ポンプ・他の zone の `effective` が B と L で違う合成の例を、同条件の検査で捨てること
+- 窓の覆い: 収集が途切れて数個の同じ読み値だけが残った窓・`stale` / `suspect` の行を含む窓・trace の `seq` に欠番がある窓・tick の間隔が
+  開いた窓・`run_id` が途中で変わる窓・欠けた tick の間に floor が掛かっていた例を、値を計算する前に捨て、3 回のまとめに入れないこと
 - Rear を変えると Top の風量も変わる（結合のある）合成の筐体で、同じ段の L_cpu の `q_top(R | d_r)` を使った `q_rear` が真の値を取り戻し、
   Top の掃引の `q_top(R)` を流用した場合との差が結合の大きさとして報告されること
 - 零位法: 同じ向きの観測の列から、二分法の区間・`d_f*`・`u(d_f*)` が一意に決まること（`?` を端にしない・区間が無い組は点を出さない）。
