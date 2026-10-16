@@ -192,14 +192,14 @@ def current_environment() -> RuntimeEnvironment:
     rank = 0
     for entry in sys.path:
         found = False
-        owners: dict[str, str] = {}
-        for distribution in importlib.metadata.distributions(path=[entry]):
+        owners: dict[str, int] = {}
+        for owner, distribution in enumerate(importlib.metadata.distributions(path=[entry])):
             name = distribution.metadata["Name"]
             if not name:
                 raise ValueError("名前の無い配布物がある")
             record = distribution.read_text("RECORD")
             if record is not None:
-                _claim_record_files(owners, str(name), record)
+                _claim_record_files(owners, owner, record)
             distributions.append(
                 InstalledDistribution(
                     name=str(name),
@@ -222,8 +222,11 @@ def current_environment() -> RuntimeEnvironment:
     )
 
 
-def _claim_record_files(owners: dict[str, str], name: str, record: str) -> None:
+def _claim_record_files(owners: dict[str, int], owner: int, record: str) -> None:
     """同じ ``sys.path`` の項目で、2つの配布物が同じファイルを入れていれば ``ValueError``。
+
+    ``owner`` はその項目の中での配布物の通し番号で、名前では見分けない（同じ名前の古い
+    ``dist-info`` が残った2つの版も別の配布物として数える）。
 
     重なったファイルは後から入れた配布物のものが残り、どちらが実行されるかが入れた順で決まる。
     ``RECORD`` の組は入れた順に依らないので、指紋では区別できない。区別できない環境は指紋を
@@ -236,11 +239,8 @@ def _claim_record_files(owners: dict[str, str], name: str, record: str) -> None:
         path = os.path.normpath(row[0])
         if path.endswith(_EXCLUDED_SUFFIX) or _EXCLUDED_DIRECTORY in Path(path).parts:
             continue
-        previous = owners.setdefault(path, name)
-        if previous != name:
-            raise ValueError(
-                f"同じ sys.path の項目で2つの配布物が同じファイルを入れている: {previous} / {name}"
-            )
+        if owners.setdefault(path, owner) != owner:
+            raise ValueError(f"同じ sys.path の項目で2つの配布物が同じファイルを入れている: {path}")
 
 
 def _distribution_parts(

@@ -325,13 +325,14 @@ def test_the_current_environment_follows_the_sys_path_order(
     assert digest.environment_sha256() != forward
 
 
+@pytest.mark.parametrize("other_name", ["shared-pkg-fork", "shared-pkg"])
 def test_two_distributions_installing_the_same_file_in_one_entry_are_refused(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, other_name: str
 ) -> None:
     """同じ項目で同じファイルを入れた2つは、入れた順で実行のコードが決まる（#349 の P1）。"""
     site = tmp_path / "site"
     _fake_distribution(site, "shared-pkg", "2.0.0")
-    _fake_distribution(site, "shared-pkg-fork", "1.0.0")
+    _fake_distribution(site, other_name, "1.0.0")
     monkeypatch.setattr("sys.path", [str(site)])
     with pytest.raises(ValueError, match="同じファイル"):
         digest.current_environment()
