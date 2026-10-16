@@ -26,7 +26,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from coldaisle.measurement import validate_metric
 
-SCHEMA_VERSION: Literal[15] = 15
+SCHEMA_VERSION: Literal[16] = 16
 """`ControlTick` の形の版。**フィールドの名前や意味を変えたら上げる。**
 
 #82 が保存したデータを読み違えないため。
@@ -81,6 +81,13 @@ SCHEMA_VERSION: Literal[15] = 15
   （`telemetry_health`。健全度・それを `DEGRADED` にした入力・Guard の `threshold_profile`）。
   **v15 には必須**で、保存済みの v1〜v14 は欄なしのまま読める
   （「記録が無い」であって「`NORMAL` だった」ではない）
+- v16（#288 / 決定記録 0133 §2.9）: fand の起動ごとの `run_id`（最上位。`RUN_ID_PATTERN`）。
+  ヒントの段階・管理ソケットの有無・Learned の経路の有無に関わらず**v16 には必須**で、
+  同じ tick の `mode_command.run_id` があれば等しい。保存済みの v1〜v15 は欄なしのまま読める
+  （古い版の `mode_command.run_id` を最上位の `run_id` として読み替えない）。
+  `hint_shadow_records`（0133 §2.5a）との突き合わせの検算に使う。
+  同じ版上げで Workload Hint の塊（`workload_hint`。#319 / 0133 §2.9 の B0。実効の段階・
+  ヒントの状態・`influence`・`skipped`）も**v16 に必須**にした。`stage: off` でも載せる
 """
 
 Demand = Annotated[float, Field(ge=0.0, le=1.0, allow_inf_nan=False)]
@@ -2222,10 +2229,200 @@ class TelemetryHealthRecord(_Frozen):
         return self
 
 
+class WorkloadHintStage(StrEnum):
+    """Workload Hint Stage B の段階（決定記録 0133 §2.6）。
+
+    設定（``supervisor.workload_hint.stage``）は**上限**で、trace には実効の段階を残す。
+    """
+
+    OFF = "off"
+    """ヒントを読まない（Stage A のまま）。"""
+    OBSERVE = "observe"
+    """B0: 読み、状態を進め、「効かせていたら選んだ context」を記録するだけ。Demand は変えない。"""
+    SHADOW_MPC = "shadow_mpc"
+    """B1: B0 に加え、Shadow solver の二重解法を記録する。**未実装**（実効は B0 に留まる）。"""
+    ACTIVE = "active"
+    """B2: 再検査を通ったヒント有りの plan を Gate へ渡す。**未実装**（実効は B0 に留まる）。"""
+
+
+_WORKLOAD_HINT_STAGE_ORDER = (
+    WorkloadHintStage.OFF,
+    WorkloadHintStage.OBSERVE,
+    WorkloadHintStage.SHADOW_MPC,
+    WorkloadHintStage.ACTIVE,
+)
+
+
+def workload_hint_stage_rank(stage: WorkloadHintStage) -> int:
+    """段階の順位（``off`` が 0）。実効の段階は設定の上限を超えない。"""
+    return _WORKLOAD_HINT_STAGE_ORDER.index(stage)
+
+
+class WorkloadHintKind(StrEnum):
+    """Workload Hint の ``workload`` の閉じた語彙（決定記録 0064 §2.3）。
+
+    書き込み入口（`coldaisle.event_entry.messages.HintWorkload`）と同じ値を持つ（試験で固定する）。
+    control は入口を import しないので、trace と Supervisor の側の型をここに置く。
+    """
+
+    TRAINING = "training"
+    BENCHMARK = "benchmark"
+    INFERENCE_SERVICE = "inference_service"
+
+
+class WorkloadHintStatus(StrEnum):
+    """ヒントの状態（決定記録 0064 §2.9 / 0133 §2.4）。``active`` 以外は終端で、一方向。"""
+
+    ACTIVE = "active"
+    EXPIRED = "expired"
+    CONTRADICTED = "contradicted"
+    SUPERSEDED = "superseded"
+    ENDED = "ended"
+    UNSUPPORTED_VERSION = "unsupported_version"
+
+
+class WorkloadHintInfluence(StrEnum):
+    """その tick でヒントが判断を変えたか（決定記録 0064 §2.9 / 0133 §2.9）。"""
+
+    NONE = "none"
+    CONTEXT_OVERRIDE = "context_override"
+    """B2 で実際に選択が変わった。**B0 では出ない。**"""
+    WOULD_OVERRIDE = "would_override"
+    """B0 / B1 で、効かせていれば選択が変わった（実際には変えていない）。"""
+
+
+class HintPriorSkipped(StrEnum):
+    """ヒントを使わなかった・使えなかった理由（決定記録 0133 §2.8 / 0066 §2.1 (d) / §2.2）。
+
+    閉じた語彙。B1 / B2 の値も先に置く（版を上げずに B1 の記録を足せるように）が、
+    **B0 の実装が出すのは** ``hint_state_unreadable`` / ``run_start_not_durable`` /
+    ``certification_mismatch`` / ``supervisor_unavailable`` / ``rule_policy_not_active`` だけ。
+    """
+
+    MPC_UNAVAILABLE = "mpc_unavailable"
+    BUDGET_EXHAUSTED = "budget_exhausted"
+    SHADOW_BUSY = "shadow_busy"
+    SHADOW_UNAVAILABLE = "shadow_unavailable"
+    SHADOW_DROPPED_BACKPRESSURE = "shadow_dropped_backpressure"
+    SHADOW_RECORD_TOO_LARGE = "shadow_record_too_large"
+    HINT_RECORD_REJECTED = "hint_record_rejected"
+    OUT_OF_CERTIFIED_DOMAIN = "out_of_certified_domain"
+    MONOTONICITY_VIOLATED = "monotonicity_violated"
+    CERTIFICATION_MISMATCH = "certification_mismatch"
+    HINT_STATE_UNREADABLE = "hint_state_unreadable"
+    RUN_START_NOT_DURABLE = "run_start_not_durable"
+    SUPERVISOR_UNAVAILABLE = "supervisor_unavailable"
+    AUTHORITY_SHADOW = "authority_shadow"
+    RULE_POLICY_NOT_ACTIVE = "rule_policy_not_active"
+    """設定の active slot が RulePolicy でない（0133 §2.2。RL が active で Rule へ fallback した
+    tick も含む）。ヒントを効かせうる経路が無いので判定しない。0133 §2.8 の表に無い値で、
+    PR #332 のレビューで足した。"""
+
+
+HINT_SOURCE_LABEL_OTHER = "other"
+"""許可リストに無い（または書き手が付けなかった）``source`` の trace 上の値（0064 §2.9）。"""
+
+WORKLOAD_HINT_RECORD_SCHEMA_VERSION: Literal[1] = 1
+"""`WorkloadHintRecord` の形の版。"""
+
+_HINT_STATE_LOST = frozenset(
+    {HintPriorSkipped.HINT_STATE_UNREADABLE, HintPriorSkipped.RUN_START_NOT_DURABLE}
+)
+
+
+class WorkloadHintRecord(_Frozen):
+    """その tick の Workload Hint の記録（`ControlTick` v16。決定記録 0064 §2.9 / 0133 §2.9）。
+
+    **閉じた語彙だけを持つ。** ``note``・生の ``source``・``peer_uid``・書き手の任意の識別子は
+    載せない（0064 §2.9）。全文は ``event_id`` から ``events`` の行を引けば残っている。
+
+    - ``stage``: その tick の**実効**の段階（設定の上限ではない）
+    - ``event_id`` / ``workload`` / ``status`` / ``source_label``: この run で読み手が追っている
+      最新のヒント（無ければ None）。終端になったヒントは、次のヒントが来るまで終端の状態のまま残る
+    - ``age_ms``: ``status`` が ``active`` の tick だけ。同じ boot の ``CLOCK_BOOTTIME`` と行の
+      ``boottime_ns`` の差（0066 §2.2）
+    - ``influence``: ヒントで判断が変わったか（B0 は ``would_override`` まで）
+    - ``skipped``: ヒントを使えなかった理由（0133 §2.8）。使った tick と効かない tick は None
+    """
+
+    schema_version: Literal[1] = WORKLOAD_HINT_RECORD_SCHEMA_VERSION
+    stage: WorkloadHintStage
+    event_id: int | None = Field(default=None, ge=1)
+    workload: WorkloadHintKind | None = None
+    status: WorkloadHintStatus | None = None
+    source_label: str | None = Field(
+        default=None, pattern=r"^[a-z0-9][a-z0-9._-]{0,63}$", max_length=64
+    )
+    age_ms: int | None = Field(default=None, ge=0)
+    influence: WorkloadHintInfluence = WorkloadHintInfluence.NONE
+    skipped: HintPriorSkipped | None = None
+
+    @classmethod
+    def off(cls) -> WorkloadHintRecord:
+        """``stage: off`` の tick（ヒントを読まない）。"""
+        return cls(stage=WorkloadHintStage.OFF)
+
+    @model_validator(mode="after")
+    def _fields_match_the_stage_and_status(self) -> Self:
+        if self.stage is WorkloadHintStage.OFF:
+            if (
+                any(
+                    value is not None
+                    for value in (
+                        self.event_id,
+                        self.workload,
+                        self.status,
+                        self.source_label,
+                        self.age_ms,
+                        self.skipped,
+                    )
+                )
+                or self.influence is not WorkloadHintInfluence.NONE
+            ):
+                # 読まない段階で、読んだかのような記録を作らない
+                raise ValueError("stage: off の記録はヒントの欄を持たない")
+            return self
+        has_event = self.event_id is not None
+        if has_event != (self.status is not None):
+            raise ValueError("event_id と status は組で持つ")
+        if self.status is WorkloadHintStatus.UNSUPPORTED_VERSION:
+            if self.workload is not None or self.source_label is not None:
+                # 知らない版の行を推測で解釈しない（0064 §2.3）
+                raise ValueError("unsupported_version のヒントの workload / source は読まない")
+        elif has_event != (self.workload is not None) or has_event != (
+            self.source_label is not None
+        ):
+            raise ValueError("ヒントの workload と source_label は event_id と組で持つ")
+        active = self.status is WorkloadHintStatus.ACTIVE
+        if active != (self.age_ms is not None):
+            raise ValueError("age_ms を持つのは status が active の tick だけ")
+        if self.influence is not WorkloadHintInfluence.NONE and not active:
+            raise ValueError("ヒントが判断を変えうるのは status が active の tick だけ")
+        if self.influence is WorkloadHintInfluence.CONTEXT_OVERRIDE and (
+            self.stage is not WorkloadHintStage.ACTIVE
+        ):
+            raise ValueError("context_override は stage: active の tick だけ")
+        if self.influence is WorkloadHintInfluence.WOULD_OVERRIDE and self.stage not in {
+            WorkloadHintStage.OBSERVE,
+            WorkloadHintStage.SHADOW_MPC,
+        }:
+            raise ValueError("would_override は stage: observe / shadow_mpc の tick だけ")
+        if self.skipped in _HINT_STATE_LOST:
+            if has_event or self.influence is not WorkloadHintInfluence.NONE:
+                # 状態を読めない tick に、古い状態のヒントを残さない（0066 §2.2）
+                raise ValueError("ヒントの状態を読めない tick はヒントの欄を持たない")
+        elif self.skipped is not None and not active:
+            # 「使わなかった」は使えるヒントがあった tick だけの理由（0133 §2.4）
+            raise ValueError("skipped を持てるのは active のヒントがある tick だけ")
+        if self.skipped is not None and self.influence is WorkloadHintInfluence.CONTEXT_OVERRIDE:
+            raise ValueError("使わなかった tick に context_override を残さない")
+        return self
+
+
 class ControlTick(_Frozen):
     """1 tick の判断の記録（decision trace。0028 §2.3）。#82 が保存し、#90 / #91 が読む。"""
 
-    schema_version: Literal[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15] = SCHEMA_VERSION
+    schema_version: Literal[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16] = SCHEMA_VERSION
     tick_id: int = Field(ge=0)
     ts_ms: int = Field(ge=0)
     """記録の時刻（壁時計。0028 §2.6）。"""
@@ -2298,6 +2495,23 @@ class ControlTick(_Frozen):
 
     保存済みの v1〜v14 では None（「記録が無い」であって「NORMAL だった」ではない）。
     """
+    run_id: str | None = Field(
+        default=None, pattern=RUN_ID_PATTERN, exclude_if=lambda value: value is None
+    )
+    """fand の起動ごとの識別子（v16。#288 / 決定記録 0133 §2.9）。保存済みの v1〜v15 では None。
+
+    ``hint_shadow_records`` の行は ``(ts_ms, tick_id)`` とこの値がそろったときだけ、この tick と
+    対応する（0133 §2.5a）。``tick_id`` は再起動で戻り、壁時計は飛ぶため、主キーだけでは
+    別の run の tick と取り違えうる。
+    """
+    workload_hint: WorkloadHintRecord | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
+    """その tick の Workload Hint の記録（v16。#319 / 決定記録 0133 §2.9）。
+
+    保存済みの v1〜v15 では None（「記録が無い」であって「ヒントが無かった」ではない）。
+    ``stage: off`` の構成の v16 も ``None`` ではなく ``WorkloadHintRecord.off()`` を持つ。
+    """
     faults: tuple[Fault, ...] = ()
     """いま有効な故障。
 
@@ -2352,6 +2566,8 @@ class ControlTick(_Frozen):
         self._check_authority()
         self._check_air_balance_coordination()
         self._check_telemetry_health()
+        self._check_run_id()
+        self._check_workload_hint()
         self._check_model_gate()
         self._check_registry_binds_model()
         self._check_shadow()
@@ -2584,6 +2800,36 @@ class ControlTick(_Frozen):
         ):
             # Guard が判断を返さないのは例外の tick だけ。理由の無い欠けを作らない。
             raise ValueError("guard_threshold_profile が無い tick には guard_exception がある")
+
+    def _check_run_id(self) -> None:
+        """v16 の ``run_id`` が必須で ``mode_command.run_id`` と等しいか（0133 §2.9）。"""
+        if self.run_id is None:
+            if self.schema_version >= 16:
+                # 版が中身を表さない記録を作らない（0060 §2.4）。`--no-admin` でも載せる
+                raise ValueError("v16 の ControlTick には run_id が要る")
+            return
+        if self.schema_version < 16:
+            raise ValueError("run_id を記録する ControlTick は schema version 16 にする")
+        mode_command = self.mode_command
+        if (
+            mode_command is not None
+            and mode_command.run_id is not None
+            and mode_command.run_id != self.run_id
+        ):
+            # 食い違う trace を作らない。どちらの run の tick か言えなくなる
+            raise ValueError("mode_command.run_id は最上位の run_id と等しくする")
+
+    def _check_workload_hint(self) -> None:
+        """v16 の ``workload_hint`` が必須で、古い版に無いか（0064 §2.9 / 0133 §2.9）。"""
+        if self.workload_hint is None:
+            if self.schema_version >= 16:
+                # 版が中身を表さない記録を作らない（0060 §2.4）。stage: off でも載せる
+                raise ValueError("v16 の ControlTick には workload_hint が要る")
+            return
+        if self.schema_version < 16:
+            # 「昔の tick はヒントが無かった」と「昔の形にはヒントという概念が無かった」を
+            # 取り違えない（0064 §2.9）
+            raise ValueError("workload_hint を記録する ControlTick は schema version 16 にする")
 
     def _check_tach_unconfirmed(self, record: AirBalanceCoordinationRecord) -> None:
         zones = self.tach_unconfirmed_zones

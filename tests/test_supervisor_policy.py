@@ -28,7 +28,7 @@ from coldaisle.control import (
     ZoneRecord,
 )
 from coldaisle.control.config import SupervisorConfig
-from coldaisle.control.schema import SupervisorPolicyIdentity
+from coldaisle.control.schema import SupervisorPolicyIdentity, WorkloadHintRecord
 from coldaisle.control.state import ControlStateSnapshot, TelemetryHealth
 from coldaisle.control.supervisor import (
     ReceivedSupervisorOutput,
@@ -50,6 +50,7 @@ from test_control_schema import (
     REGISTRY_PROVENANCE,
     SAFETY_PROVENANCE,
     TELEMETRY_HEALTH_RECORD,
+    TRACE_RUN_ID,
 )
 
 BASE_TS_MS = 1_800_000_000_000
@@ -126,6 +127,8 @@ def supervisor_document(
                 "unknown": conservative,
             },
         },
+        # fan-policy.yaml v12（#319 / 決定記録 0133 §2.6）。既定の試験は Stage A のまま
+        "workload_hint": {"stage": "off"},
     }
 
 
@@ -634,6 +637,8 @@ def control_tick(decision: SupervisorDecision, current: SupervisorInput) -> Cont
         air_balance_coordination=COORDINATION_RECORD,
         tach_unconfirmed_zones=(),
         telemetry_health=TELEMETRY_HEALTH_RECORD,
+        run_id=TRACE_RUN_ID,
+        workload_hint=WorkloadHintRecord.off(),
     )
 
 
@@ -680,6 +685,8 @@ def test_decision_can_be_embedded_in_v3_control_trace_with_shadow_output() -> No
         air_balance_coordination=COORDINATION_RECORD,
         tach_unconfirmed_zones=(),
         telemetry_health=TELEMETRY_HEALTH_RECORD,
+        run_id=TRACE_RUN_ID,
+        workload_hint=WorkloadHintRecord.off(),
     )
 
     # v3 で Supervisor decision を追加した。以後の版（v4: #78 の fault code）でもそのまま載る。

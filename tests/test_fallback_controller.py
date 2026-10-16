@@ -119,6 +119,8 @@ def supervisor_config() -> dict[str, object]:
                 )
             },
         },
+        # fan-policy.yaml v12（#319 / 決定記録 0133 §2.6）
+        "workload_hint": {"stage": "off"},
     }
 
 
@@ -166,7 +168,7 @@ def policy(
     mpc: dict[str, object] | None = None,
 ) -> FanPolicyConfig:
     document: dict[str, object] = {
-        "schema_version": 11,
+        "schema_version": 12,
         "fallback_curve": [
             {"temperature_c": 20.0, "demand": 0.2},
             {"temperature_c": 80.0, "demand": 0.8},

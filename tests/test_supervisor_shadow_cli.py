@@ -40,6 +40,7 @@ from coldaisle.control.schema import (
     SupervisorPolicyEvaluation,
     SupervisorPolicyIdentity,
     SupervisorPolicyKind,
+    WorkloadHintRecord,
     WorkloadRegime,
 )
 from coldaisle.control.supervisor import (
@@ -65,6 +66,7 @@ from test_control_schema import (
     REGISTRY_PROVENANCE,
     SAFETY_PROVENANCE,
     TELEMETRY_HEALTH_RECORD,
+    TRACE_RUN_ID,
     fallback_state,
     passthrough,
     zones,
@@ -268,6 +270,8 @@ class Fixture:
             air_balance_coordination=AirBalanceCoordinationRecord.off(),
             tach_unconfirmed_zones=(),
             telemetry_health=TELEMETRY_HEALTH_RECORD,
+            run_id=TRACE_RUN_ID,
+            workload_hint=WorkloadHintRecord.off(),
         )
 
 

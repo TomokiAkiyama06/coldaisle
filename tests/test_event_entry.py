@@ -1452,15 +1452,38 @@ def test_cli_duration_units(text, seconds):
 HINT_NAME = re.compile(r"workload[_-]?hint", re.IGNORECASE)
 
 
-def test_control_does_not_read_workload_hints_in_stage_a():
-    """Stage A では制御は1ビットも変わらない（0064 §2.10）。名前すら出てこない。"""
+HINT_AWARE_CONTROL_FILES = {
+    "control_daemon.py",
+    "control/config.py",
+    "control/loop.py",
+    "control/schema.py",
+    "control/supervisor/hint_clock.py",
+    "control/supervisor/policy.py",
+    "control/supervisor/workload_hint.py",
+}
+"""ヒントの名前が出てよい制御側のファイル（決定記録 0133 §2.6 の B0 / §2.7）。
+
+0064 §2.10 の Stage A の「制御デーモンは読まない」は 0133 が置き換えた。B0 では制御デーモンが
+ヒントを読んで記録するが、名前が出るのは設定・trace の形・loop の配線・Supervisor の入力と
+状態の遷移だけで、Safety / Guard / Fallback / hardware には出てこない。
+"""
+
+
+def test_control_mentions_workload_hints_only_where_b0_reads_them():
+    """ヒントの名前が出る制御側のファイルを固定する（増えたら 0133 §2.7 と照らして見直す）。"""
     sources = [SRC / "control_daemon.py", *sorted((SRC / "control").rglob("*.py"))]
-    offenders = [
+    mentioned = {
         str(path.relative_to(SRC))
         for path in sources
         if HINT_NAME.search(path.read_text(encoding="utf-8"))
-    ]
-    assert offenders == []
+    }
+    assert mentioned <= HINT_AWARE_CONTROL_FILES
+    assert not any(
+        name.startswith(
+            ("control/safety", "control/reactive", "control/fallback", "control/hardware")
+        )
+        for name in mentioned
+    )
 
 
 def test_control_does_not_open_the_event_store():

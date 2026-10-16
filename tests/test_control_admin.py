@@ -639,7 +639,9 @@ def test_a_command_takes_effect_at_the_start_of_the_next_tick(catalog):
         assert record.demand.requested == pytest.approx(0.9)
     assert mailbox.outcomes == [ModeOutcome(ModeOutcomeKind.APPLIED, 1, tick.tick_id)]
     assert mailbox.status is not None and mailbox.status.command_id == 1
-    assert tick.schema_version == 15
+    assert tick.schema_version == 16
+    # 最上位の run_id と管理ソケットの記録の run_id は同じ値（決定記録 0133 §2.9）
+    assert tick.run_id == tick.mode_command.run_id == RUN_ID
     assert ControlTick.model_validate_json(tick.model_dump_json()) == tick
 
 
@@ -790,7 +792,32 @@ def test_one_mode_source_only(catalog):
             clock=loop._clock,
             monotonic=loop._monotonic,
             registry=loop._registry,
+            run_id=RUN_ID,
             mode_source=StaticOperatingMode(),
+            admin_mode=AdminModeTracker(FakeMailbox(), run_id=RUN_ID),
+        )
+
+
+def test_the_loop_and_the_admin_entry_share_one_run_id(catalog):
+    """管理ソケットの監査と trace は同じ run_id を使う（決定記録 0077 §2.3 / 0133 §2.9）。"""
+    from coldaisle.control.loop import ControlLoop
+
+    loop = Harness(catalog, admin_mode=AdminModeTracker(FakeMailbox(), run_id=RUN_ID)).loop
+    with pytest.raises(ValueError, match="run_id を揃える"):
+        ControlLoop(
+            config=loop._config,
+            estimator=loop._estimator,
+            fallback=loop._fallback,
+            gate=loop._gate,
+            guard=loop._guard,
+            safety=loop._safety,
+            composer=loop._composer,
+            backend=loop._backend,
+            telemetry=loop._telemetry,
+            clock=loop._clock,
+            monotonic=loop._monotonic,
+            registry=loop._registry,
+            run_id="1" * 32,
             admin_mode=AdminModeTracker(FakeMailbox(), run_id=RUN_ID),
         )
 

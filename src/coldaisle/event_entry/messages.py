@@ -4,7 +4,8 @@
 `workload_hint`（#107 / 決定記録 0064）の2つ。どちらも「記録と文脈」であって
 「指令」ではない（0064 §2.2）。
 
-`workload_hint` は Stage A（0064 §2.10）で**記録するだけ**で、制御はこれを読まない。
+`workload_hint` は入口では**記録するだけ**。制御デーモンは段階 B0（決定記録 0133 §2.6）で
+`events` から読んで状態を記録するが、`requested_demand` は変えない。
 形だけで決まる検証はモデルが持ち、設定で決まる上限（受理する `hint_v`・
 `expected_duration_s` の上限）は `parse_message` が `WorkloadHintLimits` で確かめる。
 

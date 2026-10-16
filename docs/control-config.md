@@ -176,6 +176,63 @@ Model を Production へ昇格させても authority は動かない（#104 と 
 v8からv9へは `authority_rollout` を追加してから `schema_version: 9` へ上げる。
 v1〜v8は自動補完せず起動前に拒否する。
 
+## Control Config v16 と `fan-policy.yaml` v12（#319 / 決定記録 0133 §2.6 / 0064 §2.6〜§2.8 / 0066 §2.1 (a)）
+
+束ねた版 `CONTROL_CONFIG_VERSION` を 15 → 16 に上げ、`fan-policy.yaml` を schema version 11 → 12 にした
+（ほかのファイルの版は変えない。`fan-hardware.yaml` 2、`safety.yaml` 4、`air-balance.yaml` 2）。
+v12 は Workload Hint Stage B の段階と値（`supervisor.workload_hint`）を**必須**にする。
+
+```yaml
+supervisor:
+  # ...（v11 と同じ）
+  workload_hint:
+    stage: off            # off / observe（B0）/ shadow_mpc（B1）/ active（B2）。設定は上限
+```
+
+`stage: off` は Stage A のまま（ヒントを読まない）で、他の欄は省ける。`off` 以外では次の全てが必須
+（既定値をコードに置かない。ルール 9）。
+
+```yaml
+  workload_hint:
+    stage: observe
+    grace_ms: <申告した期間に足す猶予>
+    default_ttl_ms: <expected_duration_s の無いヒントの期限>
+    max_age_ms: <期限の上限。申告で伸ばせない>
+    contradiction_hold_ms: <計算負荷のヒントで Regime が IDLE / COOLDOWN のまま続いたら contradicted にする時間>
+    startup_backfill_ms: <起動時に取り込む経過の上限（CLOCK_BOOTTIME と壁時計の両方）>
+    reader_poll_ms: <読み手のスレッドが events を読む周期>
+    reader_stale_after_ms: <最後に読めた時刻がこれより古ければヒントを使わない。reader_poll_ms より長く>
+    known_sources: []     # trace の source_label にそのまま出す source。他は other
+    context_overrides: [] # 既定は空（ヒントは何もしない）。IDLE / COOLDOWN の鍵は既定に置かない（0133 §2.3）
+    # - {regime: transient_gpu, workload: training, context: sustained_gpu}
+```
+
+- `stage: observe`（B0）は、ヒントを読み・状態（`active` / `expired` / `contradicted` / `superseded` / `ended` /
+  `unsupported_version`）を進め・終端状態を永続化し、「効かせていたら選んだ context」を trace に残す
+  （`influence: would_override`）。**`requested_demand` は1ビットも変えない**
+- `shadow_mpc` / `active` は**まだ実装していない**。設定しても、認証のハッシュ（0066 §2.1 (c)）を照合する仕組みが
+  無いので実効は B0 に留まり、trace の `skipped` に `certification_mismatch` が出る（0133 §2.6）
+- `context_overrides` の値は**同じ `rule_policy.contexts` の中の別の context**（Regime の名前で指す）。
+  上書き先は基準（鍵の Regime の context）に対し、`strategy` と全ての weight が等しく、CPU / GPU の
+  `target_band` の `upper_c` / `lower_c` が**基準以下**でなければならない（0066 §2.1 (a)）。違反と、鍵の Regime が
+  `unknown` の設定は Control Config の不正（`config_invalid` の全 zone Max）になる。`stage: off` でも検査する
+- YAML の引用符の無い `off` は偽として読まれるが、`stage` では `off` と読む（`on` / `yes` は拒否する）
+- trace は `ControlTick` v16 の `workload_hint`（形は `control/schema.py` の `WorkloadHintRecord`）。
+  `stage: off` でも毎 tick 載る
+- B0 の trace の `skipped` に出るのは `hint_state_unreadable` / `run_start_not_durable` / `certification_mismatch` /
+  `supervisor_unavailable` / `rule_policy_not_active` だけ。`rule_policy_not_active` は設定の `active_policy` が
+  `rule_policy` でない構成の tick で、RL の提案が無く RulePolicy へ fallback した tick も含む（ヒントを効かせうるのは
+  active slot の RulePolicy だけ。0133 §2.2）。`would_override` は判定しない。0133 §2.8 の表に無い値で、
+  PR #332 のレビューで足した
+
+**移行手順**: v11 を v12 として補完しない（読み込み時に拒否する）。
+
+1. 運用の `fan-policy.yaml` の `supervisor` に `workload_hint: {stage: off}` を足す（B0 を始めるまではこれだけ）
+2. 最後に `schema_version: 12` へ上げる。塊を欠く v12 と v11 のままのファイルはどちらも拒否され、
+   `config_invalid` の全 zone Max で止まる
+3. 新しいコードへ更新して再起動する。B0 を始めるときは、0133 §2.6 の前提（Stage A の記録の集計と所有者の判断）を
+   満たしてから `stage: observe` と上の値を入れて再起動する
+
 ## Control Config v15 と `fan-hardware.yaml` v2（#74 / 決定記録 0118 §2.1）
 
 束ねた版 `CONTROL_CONFIG_VERSION` を 14 → 15 に上げ、`fan-hardware.yaml` を schema version 1 → 2 にした

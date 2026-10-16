@@ -122,11 +122,12 @@ from coldaisle.control.safety.write_fail_exit import (
     HardwareWriteFailureExit,
     HardwareWriteFailureExitError,
 )
-from coldaisle.control.schema import PerZone, Zone
+from coldaisle.control.schema import PerZone, WorkloadHintStage, Zone
 from coldaisle.control.shadow.record import ShadowRecorder
 from coldaisle.control.state import ControlInputContract, ControlStateEstimator
 from coldaisle.control.supervisor.policy import SupervisorCoordinator
 from coldaisle.control.supervisor.regime import WorkloadRegimeEstimator
+from coldaisle.control.supervisor.workload_hint import WorkloadHintTracker, effective_stage
 from coldaisle.control_admin import ControlAdminEntry, open_control_admin
 from coldaisle.control_admin.runtime import new_run_id
 from coldaisle.ingest.calibration import Calibration
@@ -139,6 +140,7 @@ from coldaisle.learned_channel.mailbox import LearnedMailbox
 from coldaisle.learned_channel.registry_watch import RegistryWatch, read_startup_registry
 from coldaisle.metrics import MetricCatalog
 from coldaisle.store import QualityRules, SqliteStore
+from coldaisle.workload_hint_reader import HintMailbox, WorkloadHintReader, open_events_reader
 
 LOGGER = logging.getLogger("coldaisle.control")
 
@@ -760,6 +762,8 @@ class ControlDaemon:
     """書き込みの失敗が続いたら終える判定（決定記録 0080 §2.6）。None は試験の足場だけ。"""
     hardware: FanHardwareBackend | None = None
     """組み立てた Hardware Backend。正常停止で制御を返すために持つ（決定記録 0080 §2.8）。"""
+    workload_hint_reader: WorkloadHintReader | None = None
+    """Workload Hint の読み手のスレッド（0133 §2.8）。`close()` で止め、run の終了を書かせる。"""
     runtime_calibration: RuntimeCalibration | None = None
     """起動時に1回だけ読んだ runtime の較正（決定記録 0079 §2.4 / 0096 §5 #8）。
 
@@ -807,6 +811,10 @@ class ControlDaemon:
         if self.admin is not None:
             leftover = self.admin.stop(drain=drain)
             self.admin = None
+        if self.workload_hint_reader is not None:
+            # 例外で抜けた経路では待たない（run の終了記録が無ければ、次の起動で境界ができる）
+            self.workload_hint_reader.stop(drain=drain)
+            self.workload_hint_reader = None
         if self.authority is not None:
             _settle_authority_on_stop(
                 self.authority, leftover, drain=drain, persist_without_wait=persist_without_wait
@@ -1010,7 +1018,8 @@ def build(
         raise ActuationNotApprovedError(
             "fan-hardware.yaml の approval が confirmed ではないため制御を取らない"
         )
-    clock: Clock = WallClock()
+    wall = WallClock()
+    clock: Clock = wall
     monotonic: MonotonicClock = SystemMonotonicClock()
     try:
         # frame v3 の `metric_catalog_sha256` は**読んだのと同じ bytes** の hash（0107 §2.6）
@@ -1076,6 +1085,10 @@ def build(
     learned = _open_learned(
         config, control, monotonic=monotonic, run_id=run_id, registry_watch=registry.watch
     )
+    # **Workload Hint の読み手は loop の外のスレッド**（0133 §2.8）。読めなくても起動は続ける
+    hint_tracker, hint_reader = _open_workload_hint(
+        config, control, rules=rules, wall=wall, monotonic=monotonic, run_id=run_id
+    )
     built_backends: list[FanHardwareBackend] = []
 
     def capturing_factory(
@@ -1104,8 +1117,12 @@ def build(
             learned=learned,
             learned_calibration=learned_calibration,
             metric_catalog_sha256=metric_catalog_sha256,
+            run_id=run_id,
+            workload_hint=hint_tracker,
         )
     except BaseException:
+        if hint_reader is not None:
+            hint_reader.stop()
         if isinstance(learned, LearnedChannelEntry):
             learned.stop()
         if admin is not None:
@@ -1119,6 +1136,7 @@ def build(
         admin=admin,
         learned=learned if isinstance(learned, LearnedChannelEntry) else None,
         authority=authority,
+        workload_hint_reader=hint_reader,
         hardware=built_backends[0] if built_backends else None,
         # **書けないまま制御を持ち続けない**（決定記録 0080 §2.6）。時間は safety.yaml が持つ
         write_fail_exit=HardwareWriteFailureExit(control.safety.hardware_write_fail_exit_ms.value),
@@ -1329,6 +1347,57 @@ def _open_learned(
     return entry if entry is not None else DisabledLearnedChannel()
 
 
+def _open_workload_hint(
+    config: Config,
+    control: ControlConfig,
+    *,
+    rules: QualityRules,
+    wall: WallClock,
+    monotonic: MonotonicClock,
+    run_id: str,
+) -> tuple[WorkloadHintTracker | None, WorkloadHintReader | None]:
+    """Workload Hint の読み手を起こし、loop が使う tracker を返す（決定記録 0133 §2.6 / §2.8）。
+
+    ``stage: off`` なら何もしない（Stage A のまま。ヒントを読まない）。B1 / B2 を設定していても、
+    認証のハッシュを照合する仕組みがまだ無いので実効は B0 に留める（0133 §2.6）。
+    **読めなくても起動は止めない**（ヒントは任意の機能。0133 §2.8）。
+    """
+    hint = control.policy.supervisor.workload_hint
+    stage = effective_stage(hint.stage)
+    if stage is WorkloadHintStage.OFF:
+        return None, None
+    if stage is not hint.stage:
+        LOGGER.warning(
+            "workload hint の段階を B0（記録だけ）に留める",
+            extra={
+                logs.FIELDS_KEY: {
+                    "configured_stage": hint.stage.value,
+                    "effective_stage": stage.value,
+                    "reason": "certification_mismatch",
+                }
+            },
+        )
+    db = config.db
+    mailbox = HintMailbox()
+    reader = WorkloadHintReader(
+        hint,
+        # **events は読み取り専用の接続で読み**、自分の表へは別の接続で書く（0066 §2.2）。
+        # どちらも読み手のスレッドの中で開く
+        open_events=lambda: open_events_reader(db, rules=rules, clock=wall),
+        open_state=lambda: SqliteStore(db, rules=rules, clock=wall),
+        boot_clock=wall,
+        clock=wall,
+        monotonic=monotonic,
+        run_id=run_id,
+        mailbox=mailbox,
+    )
+    # **待たない**（Codex P1）。取り込みが終わるまでの tick は `hint_state_unreadable` になり、
+    # 起動・heartbeat・Fan の制御はヒントの読み手を待たない
+    reader.start()
+    tracker = WorkloadHintTracker(hint, mailbox=mailbox, boot_clock=wall, monotonic=monotonic)
+    return tracker, reader
+
+
 def _build_loop(
     config: Config,
     control: ControlConfig,
@@ -1348,6 +1417,8 @@ def _build_loop(
     learned: LearnedChannelEntry | DisabledLearnedChannel | None,
     learned_calibration: AvailableCalibration | UnavailableCalibration,
     metric_catalog_sha256: str,
+    run_id: str,
+    workload_hint: WorkloadHintTracker | None,
 ) -> ControlLoop:
     safety = CriticalSafety(
         control.safety,
@@ -1383,6 +1454,9 @@ def _build_loop(
         # 移っても書き換えない（役割を閉じるだけ）。frame の `expected_artifacts` も loop が
         # ここから作る
         registry=registry_binding.provenance,
+        # **管理ソケットの監査・Learned の経路の封筒と同じ run_id を毎 tick の trace に載せる**
+        # （v16。決定記録 0133 §2.9）。`--no-admin` でも載せる
+        run_id=run_id,
         # **モードの出どころは1つ。** 管理ソケットを開けたら受け渡し口、開けなければ常に AUTO
         # （0072 §2.2。開かなかった入口は死んだとは扱わない）
         mode_source=None if admin is not None else StaticOperatingMode(),
@@ -1410,6 +1484,9 @@ def _build_loop(
         trace=ControlTraceLogger(store) if config.record_trace else None,
         authority=authority,
         watchdog=deadman,
+        # **Workload Hint の受け渡し口**（B0。決定記録 0133 §2.6）。`stage: off` なら None。
+        # 記録するだけで requested には効かない
+        workload_hint=workload_hint,
     )
     _log_configuration(control, safety)
     return loop
