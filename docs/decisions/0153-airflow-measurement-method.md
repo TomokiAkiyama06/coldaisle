@@ -313,11 +313,19 @@ airflow_index(d) = q_z(d) / q_z(1.0)
 5. `d_f*` = 最後の区間の中点、`u(d_f*)` = 最後の区間の半幅。半幅が `max_null_halfwidth` を超える回は使わない（`null_unresolved`）
 6. その状態（Front を `d_f*`、Rear と Top を組の値、GPU の Fan は手順 0 の状態）のまま、Rear の段と同じ 5 つの窓（B → L_cpu → B_mid → L_gpu → B'）で
    `q_top` と `q_rear` を**その状態で**測り（上の結合のため、6 段の掃引の値を流用しない）、`q_front(d_f*) = q_rear + q_top`、
-   `u(q_front) = sqrt(u(q_rear)^2 + u(q_top)^2)` とする。同条件の検査と信号の条件は上と同じ
+   `u(q_front) = sqrt(u(q_rear)^2 + u(q_top)^2)` とする。同条件の検査と信号の条件は上と同じ。
+   **負荷の間の零点の確認**: CPU / GPU の熱で筐体の中の空気が温まると浮力で圧力の零点がずれ、負荷の窓の間は等式が成り立たなくなりうる。
+   そこで L_cpu と L_gpu のそれぞれで、窓の 2 分の平均を取り終えた後、**負荷を止めずに** Front を `d_lo` にして手順 2 と同じ待ちと観測、
+   続けて `d_hi` で同じ観測をし、Front を `d_f*` に戻してから負荷を止める（L の窓の値はその前に取り終えているので、Front を動かしても
+   変わらない。次の負荷なしの窓は `d_f*` で落ち着きを待ち直す）。`d_lo` が `−`、`d_hi` が `+` でなければ（`?` を含む）、負荷の間に
+   零点が最後の区間の外へずれたとして、その回を捨てる（`null_shifted_under_load`）。Front を動かしている間も floor の決まりと
+   中止の基準は同じ
+   **観測の安全**: 向きの観測（§5 の 1 の糸・紙片）は、筐体を開けず、筐体の外の隙間・メッシュの面に外から当てて目で見るだけにする。
+   手・道具を筐体の中へ入れない（回転中の Fan・12V-2x6 のコネクタに近づかない）。負荷の間の排気は温かいが、外から見るだけなので
+   触れない。外から見られる観測点が無い組は、負荷の間の確認ができないので、その組の点を出さない
 7. **零点の確かめ直し**: 手順 6 の B' の後、負荷を止めたまま（手順 2〜5 と同じアイドルの条件）、最後の区間の両端 `d_lo` と `d_hi` で
-   手順 2 と同じ観測をし直す。`d_lo` が `−`、`d_hi` が `+` のままでなければ、手順 6 の間に零点がずれたとして、その回を捨てる
-   （`null_shifted`）。負荷の窓の間の筐体の中の温度上昇による浮力は、零点を少しずらしうる。この確かめ直しはアイドルに戻った後の
-   ずれだけを捉えるので、負荷の間のずれは近似として報告に残し、§2.4a で見る
+   手順 2 と同じ観測をし直す。`d_lo` が `−`、`d_hi` が `+` のままでなければ（`?` を含む）、手順 6 の間に零点がずれたとして、その回を捨てる
+   （`null_shifted`）。負荷の間のずれは手順 6 の「負荷の間の零点の確認」で捉える
 8. 曲線: 組ごとの点（3 回の平均の `d_f*` と `q_front`）を線形につなぐ（RPM の比の形は使わない）。点の demand の不確かさは
    `u(d_f*)` の 3 回の最大と 3 回の範囲の半分の大きい方、EFU の不確かさは `u(q_front)` の最大と 3 回の範囲の半分の大きい方で、報告に残す
 9. 範囲の判定: 最も低い点の `d_f* + bound_coverage_factor × u(d_f*)` が `0.35 + front_coverage_tolerance` 以下、かつ最も高い点の `d_f* − bound_coverage_factor × u(d_f*)` が
@@ -330,13 +338,7 @@ airflow_index(d) = q_z(d) / q_z(1.0)
 §2.5 の応答の行列の Front の段（F+ / F−）の熱の応答（`d.case_delta`・`air.gpu_intake`・`d.gpu_preheat`）を、零位法の結果と矛盾しないかの
 目安にする（Front を上げても排気の温度差が下がらなくなるのは、吸気が足りている側）。
 
-この節と §2.2・§2.5 の閾値との比較は、すべて §2.6a の形（上側・下側の境界）で行う。
-
-**設定の値**: `bound_coverage_factor`・`drift_residual_fraction`・`min_signal_to_uncertainty`・`min_delta_t_c`・`min_delta_power_w`・`max_gpu_fan_delta_pct`・
-`max_aux_fan_delta_rpm`・`null_resolution`・`max_null_halfwidth`・`front_coverage_tolerance`・`window_blocks`・`max_window_trend`（温度・電力）・
-`max_coupling_ratio` は解析の道具の設定
-（`config/airflow-characterization.yaml`。Control Config ではない）に `status: provisional` と `basis` 付きで置き、コードに既定値を置かない（ルール 9）。
-提案の初期値は 2・0.25・10・1.0 °C・20 W・2 %・50 RPM・0.02・0.05・0.05・4・（0.2 °C・5 W）・10 % で、承認の記録で見直す。
+この節と §2.2・§2.5 の閾値との比較は、すべて §2.6a の形（上側・下側の境界）で行う。解析が使う値は §2.6b の設定に置く。
 
 **繰り返しとまとめ方**:
 
@@ -422,8 +424,8 @@ airflow_index(d) = q_z(d) / q_z(1.0)
      観測の最大に約 5% を足す 0120 の規則のまま。ファイルの `approval` は `confirmed` のままで、`basis` を承認の記録に変える
    - `air-balance.yaml`: `zones.<zone>.points` を §2.4 の点にする。`source.status` はファイルに 1 つなので、**次の条件がすべてそろうまで
      `uncalibrated` のまま**にする。本記録で `calibrated` の条件を書くのはこの一覧だけで、ほかの節はここを指す
-     ここで「有効な回」は、§2.2 の窓の覆い・floor の決まり、§2.4 の時刻の内挿・基準のずれ・同条件の検査・窓の傾き・信号 ÷ 不確かさ、
-     零位法の `null_unresolved` / `null_shifted`、§2.6 の 2 の DB の写しの束縛、§2.7 の較正の束縛のすべてを通った回をいう
+     すべての回が同じ Control Config（4 ファイルの SHA-256 が同じ。§2.7）で測られていること。ここで「有効な回」は、§2.2 の窓の覆い・floor の決まり、§2.4 の時刻の内挿・基準のずれ・同条件の検査・窓の傾き・信号 ÷ 不確かさ、
+     零位法の `null_unresolved` / `null_shifted` / `null_shifted_under_load`、§2.6 の 2 の DB の写しの束縛、§2.7 の較正の束縛のすべてを通った回をいう
      1. Top と Rear の 6 段のすべてで有効な 3 回があり（Rear は同じ段の L_cpu も有効）、承認の目安（下の 5）を満たす
      2. Front の零位法の 5 つの組のすべてで有効な 3 回があり、点の範囲が `d_f*` の不確かさを含めて 0.35〜1.00 を覆う（§2.4 の零位法の 9）
      3. GPU の Fan のそろえ方（§5 の 3）が決まって承認され、(a) を選んだときは EFU を出すすべての測定（Top と Rear の掃引・零位法・§2.4a）が
@@ -450,33 +452,72 @@ airflow_index(d) = q_z(d) / q_z(1.0)
 
 | 検査（節） | 量 | `u` の求め方 | 比べ方 |
 |---|---|---|---|
-| 落ち着き（§2.5） | 直近 3 分のブロックの平均の最大 − 最小 | 分解能 `u_res` × √2 | 上側 ≤ 0.5 °C（空気）/ 1 °C（チップ） |
+| 落ち着き（§2.5） | 直近 `settle.span_s` のブロックの平均の最大 − 最小 | 分解能 `u_res` × √2 | 上側 ≤ `settle.max_range_air_c` / `settle.max_range_chip_c` |
 | 窓の傾き（§2.4） | `|b| × 窓の長さ` | ブロックの平均から求めた傾きの標準誤差 × 窓の長さ | 上側 ≤ `max_window_trend` |
-| 基準のずれ（§2.4） | 前後の負荷なしの窓の差 `|x_2 − x_1|` | `sqrt(u_win(x̄_1)^2 + u_win(x̄_2)^2)` | 上側 ≤ 0.3 °C |
+| 基準のずれ（§2.4） | 前後の負荷なしの窓の差 `|x_2 − x_1|` | `sqrt(u_win(x̄_1)^2 + u_win(x̄_2)^2)` | 上側 ≤ `max_baseline_shift_c` |
 | 同条件: GPU の Fan（§2.4・零位法の 0） | 窓の中央値の差 | 目標値の 1 % の丸め（1/√12 × √2） | 上側 ≤ `max_gpu_fan_delta_pct` |
 | 同条件: VRM の Fan・ポンプ（§2.4・§2.5・零位法の 0） | 窓の中央値の差 | 各窓の `u_win` の二乗和の平方根 | 上側 ≤ `max_aux_fan_delta_rpm` |
-| 部屋（§2.5・零位法の 0） | セッションの中の `air.room` のブロックの平均の最大 − 最小 | `u_res` × √2 | 上側 ≤ 1 °C |
+| 部屋（§2.5・零位法の 0） | セッションの中の `air.room` のブロックの平均の最大 − 最小 | `u_res` × √2 | 上側 ≤ `max_room_drift_c` |
 | 温度上昇・電力の増分の最小（§2.4） | `ΔT_z` / `ΔP` | §2.4 の `u(ΔT_z)` / `u(ΔP)` | 下側 ≥ `min_delta_t_c` / `min_delta_power_w` |
 | 信号 ÷ 不確かさ（§2.4） | `値 / u(値)` | — | ≥ `min_signal_to_uncertainty`（それ自体が不確かさの検査） |
-| 回転数のばらつき（§2.6 の 5） | 3 回の範囲 ÷ 平均 | 各回の `u`（窓の中央値の `u_win` と tach の更新の量子化）から、範囲は √2 × 最大の `u`、平均は 最大の `u` / √3 | `(範囲 + k × u(範囲)) / (平均 − k × u(平均))` ≤ 3 % |
-| EFU のばらつき（§2.6 の 5） | 3 回の範囲 ÷ 平均 | 各回の §2.4 の `u(q)` から同じく | 同じ形で ≤ 15 % |
+| 回転数のばらつき（§2.6 の 5） | 3 回の範囲 ÷ 平均 | 各回の `u`（窓の中央値の `u_win` と tach の更新の量子化）から、範囲は √2 × 最大の `u`、平均は 最大の `u` / √3 | `(範囲 + k × u(範囲)) / (平均 − k × u(平均))` ≤ `approval.max_rpm_spread` |
+| EFU のばらつき（§2.6 の 5） | 3 回の範囲 ÷ 平均 | 各回の §2.4 の `u(q)` から同じく | 同じ形で ≤ `approval.max_efu_spread` |
 | 結合の比（§2.4） | `coupling_top_by_rear` / `coupling_null` | 各段の平均の `u(平均) = max(伝えた u / √3, 3 回の範囲 / 2)` から伝える | 上側 < `max_coupling_ratio` |
 | Front の範囲の覆い（零位法の 9） | 端の点の `d_f*` | `u(d_f*)`（零位法の 8） | 最低の点の上側 ≤ 0.35 + 許容・最高の点の下側 ≥ 1.00 − 許容 |
 | 零位法の半幅（零位法の 5） | 区間の半幅 | —（指示した Demand の差で、測った値ではない） | ≤ `max_null_halfwidth` |
-| 零点の確かめ直し（零位法の 7） | 両端の向き | —（定性的） | `d_lo` が `−`・`d_hi` が `+`。`?` は不合格 |
-| §2.4a の一致（§2.4a） | 熱と独立の方法の比の差 | 両方の比の `u` の二乗和の平方根 | 上側 ≤ 承認の記録で所有者が決める値 |
+| 零点の確認（零位法の 6 の負荷の間・7 のアイドル） | 両端の向き | —（定性的） | `d_lo` が `−`・`d_hi` が `+`。`?` は不合格 |
+| §2.4a の一致（§2.4a） | 熱と独立の方法の比の差 | 両方の比の `u` の二乗和の平方根 | 上側 ≤ `approval.max_independent_ratio_gap`（承認の記録で所有者が決めて §2.6b に足す） |
+| まとめに入る回の Control Config（§2.7） | 4 ファイルの SHA-256 | —（照合） | すべての回で同じ |
 | 窓の覆い・seq の連続・hash・較正の digest（§2.2・§2.6・§2.7） | 数・時刻の差・一致 | —（数えた値と照合で、不確かさを持たない） | そのまま |
+
+### 2.6b 解析の設定（`config/airflow-characterization.yaml`）
+
+解析が検査と計算に使う**すべての数値**（閾値だけでなく、解析が manifest と照らして検査する手順の値も）を、解析の道具の設定
+`config/airflow-characterization.yaml`（Control Config ではない）に置く。各値は `status: provisional` と `basis` を持ち、コードに既定値を
+置かない（AGENTS.md ルール 9）。本文の数値は提案の初期値で、承認の記録で見直す。設定が欠けた・不正なら、解析は何も出さずに失敗する。
+
+| 区分 | 鍵 | 提案の初期値 | 使う節 |
+|---|---|---|---|
+| 境界の係数 | `bound_coverage_factor` | 2 | §2.6a |
+| 回転数の掃引 | `rpm_sweep.levels` / `rpm_sweep.other_zones_demand` / `rpm_sweep.settle_s` / `rpm_sweep.record_s` / `rpm_sweep.repetitions` / `rpm_sweep.min_distinct_days` | 0.35・0.40・0.45・0.50・0.60・0.70・0.80・0.90・1.00 / 0.60 / 30 / 60 / 3 / 2 | §2.3 |
+| 応答の時間 | `rpm_sweep.response_band` / `tach_update_ms` | ±5 % / 1500 | §2.3 |
+| アイドルの条件 | `idle.cpu_package_c` / `idle.gpu_core_c` / `idle.gpu_power_w` | 50 / 45 / 50 | §2.3 |
+| EFU の掃引 | `efu.levels` / `efu.reference_demand` / `efu.repetitions` / `efu.min_distinct_days` | 0.35・0.50・0.60・0.70・0.80・1.00 / 0.60 / 3 / 2 | §2.4 |
+| 窓 | `window.length_s` / `window.max_settle_s` / `window_blocks` | 120 / 1200 / 4 | §2.4・§2.5 |
+| 落ち着き | `settle.span_s` / `settle.max_range_air_c` / `settle.max_range_chip_c` | 180 / 0.5 / 1.0 | §2.5 |
+| 窓の傾き | `max_window_trend.temperature_c` / `max_window_trend.power_w` | 0.2 / 5 | §2.4 |
+| 基準のずれ | `max_baseline_shift_c` / `drift_residual_fraction` | 0.3 / 0.25 | §2.4 |
+| 部屋 | `max_room_drift_c` | 1.0 | §2.5 |
+| 同条件 | `max_gpu_fan_delta_pct` / `max_aux_fan_delta_rpm` | 2 / 50 | §2.4 |
+| 信号 | `min_signal_to_uncertainty` / `min_delta_t_c` / `min_delta_power_w` | 10 / 1.0 / 20 | §2.4 |
+| 分解能 | `resolution.air_c` / `resolution.power_w` / `resolution.gpu_fan_pct` | 0.125 / 1 / 1 | §2.4・§2.6a |
+| CPU の負荷の余裕 | `cpu_floor_margin_demand` | 0.05 | §2.2 |
+| 負荷の定義（manifest と NVML の電力の上限・worker の数と照らす） | `load.gpu_power_limit_w` / `load.gpu_power_limit_max_w` | 300 / 450 | §2.2・§5 の 5 |
+| 零位法 | `null.combos` / `null.settle_s` / `null.observe_s` / `null_resolution` / `max_null_halfwidth` / `front_coverage_tolerance` / `null.repetitions` | （0.35, 0.35）・（0.60, 0.60）・（0.80, 0.60）・（0.60, 0.80）・（1.00, 1.00） / 30 / 30 / 0.02 / 0.05 / 0.05 / 3 | §2.4 |
+| 応答の行列 | `response_matrix.reference_demand` / `response_matrix.plus_demand` / `response_matrix.minus_demand` / `response_matrix.repetitions` | 0.60 / 0.90 / 0.35 / 2 | §2.5 |
+| 結合 | `max_coupling_ratio` | 10 % | §2.4 |
+| 承認の目安 | `approval.max_rpm_spread` / `approval.max_efu_spread` | 3 % / 15 % | §2.6 の 5 |
+| 窓の覆い | `coverage.<source>.min_ok_samples` / `coverage.<source>.max_sample_gap_ms` / `coverage.trace_max_gap_ms` / `coverage.min_trace_ticks_ratio` | 44（2 分の窓）/ 6000 / 1500 / 0.95 | §2.2 |
+
+設定に置かないもの: 中止の基準（`cpu.package` 88 °C・`gpu.0.core` 85 °C・`board.connector_12v2x6` 70 °C）は 0121 / 0130 の値で、所有者が測定中に
+見て負荷を止める判断に使う。解析の検査ではないので、解析の設定に写さない（写すと 2 か所で食い違いうる）。CPU の floor の点（60 / 80 °C・100 / 200 W）は `safety.yaml` の値で、解析は manifest の Control Config の hash を通して同じものを読み、写さない。GPU の Fan の固定の duty の値は、
+§5 の 3 の承認の記録と `coldaisle-gpu-fan` の側に置き、解析は manifest に残った値と `gpu.0.fan_speed` を照らすだけにする。
+§2.6a の表の §2.4a の一致の目安は、所有者が承認の記録で決めた後に `approval.max_independent_ratio_gap` として足す。
 
 ### 2.7 run の manifest
 
 測定のセッションごとに 1 ファイル（YAML）。形は解析の道具の PR で固定する。最低限、次を持つ。
 
 - `schema_version`・`run_id`（#83 の `source_run_id` にそのまま使える形）・`kind`（`rpm_sweep` / `thermal_efu` / `response_matrix` / `null_balance`）
-- 使った Control Config の 4 ファイルの SHA-256（trace の `runtime.config` と突き合わせ、違えば解析が拒否する）
+- 使った Control Config の 4 ファイルの SHA-256（trace の `runtime.config` と突き合わせ、違えば解析が拒否する）。さらに、**1 つのまとめ
+  （段の 3 回の平均・zone の曲線・3 zone をそろえた `calibrated` の候補・結合の比・§2.4a の比較）に入るすべての回で、4 ファイルの SHA-256 が
+  同じ**であることを求める。違う回は別の測定として扱い、まとめない（報告では hash の組ごとに分けて示す。捨てた理由 `config_mismatch`）。
+  特に `fan-hardware.yaml` が変わると、同じ Demand でも PWM / RPM が変わる。測定の期間中は 4 ファイルを変えない（§2.3 の結果で
+  `fan-hardware.yaml` を更新するなら、EFU の測定の前に済ませる。provisional の値を導入先の `air-balance.yaml` へ書くのも期間の後にする）
 - 較正の digest（区間の開始の時点で有効な `calibration_activations` の行の `offsets_sha256`。0096 / 0099）
 - 解析に使う DB の写しの SHA-256・作った時刻（§2.6 の 2）
 - 負荷の定義（GPU の電力の上限・CPU の worker の数）と予備の試行の結果
-- 段ごとの指示の値（3 zone）・lease・開始と終了の時刻（ms）・捨てた理由（`floor_bound` / `unsettled` / `aborted` / `safety_fault` / `room_drift` / `baseline_drift` / `condition_mismatch` / `low_signal` / `window_trend` / `null_unresolved` / `null_shifted` / `calibration_changed` / `telemetry_coverage` / `trace_coverage`）と、各窓の代表の時刻
+- 段ごとの指示の値（3 zone）・lease・開始と終了の時刻（ms）・捨てた理由（`floor_bound` / `unsettled` / `aborted` / `safety_fault` / `room_drift` / `baseline_drift` / `condition_mismatch` / `low_signal` / `window_trend` / `null_unresolved` / `null_shifted` / `null_shifted_under_load` / `config_mismatch` / `calibration_changed` / `telemetry_coverage` / `trace_coverage`）と、各窓の代表の時刻
 - 零位法では、観測した Front の値ごとの向き（`+` / `−` / `?`）と二分法の順序
 
 **較正との結びつけ**: 保存された温度にはプローブごとの offset（`config/calibration.json`）が掛かっている。EFU は 2 つのプローブの差を
