@@ -1285,13 +1285,18 @@ class SqliteStore:
         fired_ms: int,
         trigger_value: float | None,
         detail: str | None = None,
+        threshold: float | None = None,
     ) -> None:
-        """継続時間の条件を満たしたので発火させる。"""
+        """継続時間の条件を満たしたので発火させる。
+
+        `threshold` を渡したら、発火の時点で当てた閾値に書き換える（決定記録 0144 §2.6。
+        電力で閾値が変わるルールは、発火待ちの間に限度が変わる）。省けば開いたときの値のまま。
+        """
         with self.transaction():
             self._conn.execute(
                 "UPDATE alerts SET state = 'firing', fired_ms = ?, trigger_value = ?, "
-                "detail = COALESCE(?, detail) WHERE id = ?",
-                (fired_ms, trigger_value, detail, alert_id),
+                "detail = COALESCE(?, detail), threshold = COALESCE(?, threshold) WHERE id = ?",
+                (fired_ms, trigger_value, detail, threshold, alert_id),
             )
 
     def resolve_alert(self, alert_id: int, *, resolved_ms: int) -> None:

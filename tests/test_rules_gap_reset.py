@@ -445,7 +445,7 @@ ALL_OVER = {
     "air.front_intake": 33.0,
     "air.room": 31.0,  # room_high 超え・d.intake_rise = 2.0 なので recirculation は別に用意する
     "air.gpu_intake": 42.0,
-    "air.gpu_exhaust": 65.0,  # d.gpu_delta = 23
+    "air.gpu_exhaust": 90.0,  # d.gpu_delta = 48（電力を書かないので期待値は表の最大 34。0144 §2.4）
     "air.room_humidity": 15.0,
 }
 

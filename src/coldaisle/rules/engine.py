@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 from coldaisle import logs
 from coldaisle.clock import Clock, MonotonicClock, SystemMonotonicClock
@@ -25,9 +25,11 @@ from coldaisle.rules.fand_trace import FandStatus, describe_faults, read_fand_st
 from coldaisle.rules.models import (
     ControlSilenceRule,
     ControlStateRule,
+    ExpectedReference,
     FlagOffRule,
     HotAndSlowRule,
     LatestThresholdRule,
+    PowerReferencedRule,
     RangeRule,
     RuleSet,
     SlopeRule,
@@ -94,6 +96,8 @@ class Transition:
     value: float | None
     detail: str | None = None
     severity: str = "warning"
+    reference: ExpectedReference | None = None
+    """電力で判定するルールが比べた期待値（決定記録 0144）。それ以外のルールは `None`。"""
 
 
 _ABSENT = object()
@@ -192,10 +196,11 @@ class Engine:
             state.firing = alert.state.value == "firing"
             state.severity = alert.severity.value
             self._advance(alert.started_ms)
-            if not state.firing and alert.rule_id in self._latest_rule_ids():
+            if not state.firing and alert.rule_id in self._restart_reset_rule_ids():
                 # DB の最新値を読むルールの発火待ちは、止まっていた間を連続とみなさない
                 # （決定記録 0131 §2.3。欠けた入力で発火待ちを取り消すのと同じ扱い）。
-                # 残すと、再起動の直後に 1 回成立しただけで継続時間を満たしたことになる
+                # 残すと、再起動の直後に 1 回成立しただけで継続時間を満たしたことになる。
+                # 電力で判定するルールは、旧い判定で始まった pending を持ち越さない（0144 §2.8）
                 self._cancel_pending(alert.rule_id, alert.metric)
         self._cancel_hydrated_gaps()
 
@@ -255,9 +260,18 @@ class Engine:
         self._last_sample_ms = sample.ts_ms
         transitions += self._evaluate_silence()
         transitions += self._evaluate_missing(readings)
-        for name in ("recirculation", "intake_high", "airflow_degraded", "room_high"):
+        for name in ("recirculation", "intake_high"):
             rule = getattr(self.rules, name)
             transitions += self._evaluate_threshold(name, rule, values.get(rule.metric), readings)
+        transitions += self._evaluate_power_referenced(
+            "airflow_degraded",
+            self.rules.airflow_degraded,
+            values.get(self.rules.airflow_degraded.metric),
+            readings,
+        )
+        transitions += self._evaluate_threshold(
+            "room_high", self.rules.room_high, values.get(self.rules.room_high.metric), readings
+        )
         transitions += self._evaluate_range(
             "humidity_out_of_range",
             self.rules.humidity_out_of_range,
@@ -453,6 +467,99 @@ class Engine:
             return self._continue(rule_id, rule.metric, value, rule.fire_after_s)
         return self._end(rule_id, rule.metric) if state.since_ms is not None else []
 
+    def _evaluate_power_referenced(
+        self,
+        name: str,
+        rule: PowerReferencedRule,
+        value: float | None,
+        readings: Mapping[str, Reading],
+    ) -> list[Transition]:
+        """電力から求めた期待値を超えた分で判定する（FR-406 / 決定記録 0144）。
+
+        値が無い周期は今のしきい値のルールと同じ（0012 §2.8・0139 の取り消し）。
+        電力が分からない周期は**表の最大を期待値にして評価を続ける**（0144 §2.4。黙らない）。
+        行の `threshold` はその時の発火の値（期待値 + 超過の閾値）、`trigger_value` は値そのもの
+        （0144 §2.6）。
+        """
+        if not rule.enabled:
+            return []
+        rule_id = name.upper()
+        if value is None:
+            self._reset_on_missing(rule_id, rule.metric, readings)
+            return []
+        power = self._reference_power(rule)
+        expected = rule.expected_at(power)
+        excess = value - expected
+        state = self._state(rule_id, rule.metric)
+        # 0144 §2.1: 成立は「超過 > threshold」、成立中の解除は「超過 < clear」。
+        # 等しいときは成立を保つ
+        if state.since_ms is None:
+            if excess <= rule.threshold:
+                return []
+        elif excess < rule.clear:
+            return self._end(rule_id, rule.metric)
+        if power is None:
+            basis = f"{rule.power_metric} が無い・stale のため表の最大の期待値 {expected:.1f}"
+        else:
+            basis = (
+                f"{rule.power_metric} {power:.0f} W"
+                f"（直近 {rule.power_window_s:.0f} 秒の最大）の期待値 {expected:.1f}"
+            )
+        detail = f"{rule.metric} = {value:.1f}。{basis} を {excess:.1f} 超えている"
+        reference = ExpectedReference(power_w=power, expected=expected, excess=excess)
+        return [
+            replace(transition, reference=reference)
+            for transition in self._hold_power_referenced(
+                rule_id, rule, value, expected, detail, started=state.since_ms is not None
+            )
+        ]
+
+    def _hold_power_referenced(
+        self,
+        rule_id: str,
+        rule: PowerReferencedRule,
+        value: float,
+        expected: float,
+        detail: str,
+        *,
+        started: bool,
+    ) -> list[Transition]:
+        """成立している周期。待ちを開くか続ける（閾値は発火の時点の値。0144 §2.6）。"""
+        if not started:
+            return self._begin(
+                rule_id,
+                rule.metric,
+                rule.severity.value,
+                expected + rule.threshold,
+                value,
+                rule.fire_after_s,
+                detail=detail,
+            )
+        return self._continue(
+            rule_id,
+            rule.metric,
+            value,
+            rule.fire_after_s,
+            detail=detail,
+            threshold=expected + rule.threshold,
+        )
+
+    def _reference_power(self, rule: PowerReferencedRule) -> float | None:
+        """参照電力: 直近 `power_window_s` の ok の値の最大（決定記録 0144 §2.3）。
+
+        **最新値が無い・ok でない（stale を含む）なら `None`**（0144 §2.4）。
+        窓の中の古い ok の値で、止まった収集の後の電力を推測しない。
+        stale の閾値は `SqliteStore.latest()` が `config/quality.yaml` で決める
+        （閾値を 2 か所に持たない。0131 §2.3）。
+        """
+        now = self._now_ms
+        current = _current(self.store.latest(at_ms=now), rule.power_metric)
+        if current is None:
+            return None
+        window_ms = int(rule.power_window_s * 1000)
+        peak = self.store.stats(rule.power_metric, now - window_ms, now + 1).max_value
+        return current if peak is None else max(current, peak)
+
     def _evaluate_range(
         self,
         name: str,
@@ -506,8 +613,14 @@ class Engine:
             return self._continue(rule_id, rule.metric, slope, rule.fire_after_s)
         return self._end(rule_id, rule.metric) if state.since_ms is not None else []
 
-    def _latest_rule_ids(self) -> frozenset[str]:
-        """DB の最新値を読むルールの rule_id（決定記録 0131 §2.3）。"""
+    def _restart_reset_rule_ids(self) -> frozenset[str]:
+        """復元のときに発火待ちを取り消して数え直すルールの rule_id。
+
+        - DB の最新値を読むルール（決定記録 0131 §2.3）
+        - 電力から求めた期待値で判定するルール（決定記録 0144 §2.8）。判定の形を変えた前の版が残した
+          pending（旧い固定の閾値で始まったもの）を、新しい閾値を一度も超えないまま古い時計で
+          発火させないため。毎回の起動で同じに扱う（版を見分ける印を行に持たない）
+        """
         return frozenset(
             name.upper()
             for name, rule in self.rules
@@ -516,6 +629,7 @@ class Engine:
                 FlagOffRule
                 | HotAndSlowRule
                 | LatestThresholdRule
+                | PowerReferencedRule
                 | ControlStateRule
                 | ControlSilenceRule,
             )
@@ -948,22 +1062,32 @@ class Engine:
         fire_after_s: float,
         *,
         detail: str | None = None,
+        threshold: float | None = None,
     ) -> list[Transition]:
+        """発火待ちを続ける。`threshold` は発火の時点で当てる閾値（省けば開いたときの値のまま）。"""
         state = self._state(rule_id, metric)
         if state.firing or state.since_ms is None:
             return []
         if (self._now_ms - state.since_ms) / 1000 < fire_after_s:
             return []
-        return self._fire(rule_id, metric, value, detail)
+        return self._fire(rule_id, metric, value, detail, threshold=threshold)
 
     def _fire(
-        self, rule_id: str, metric: str | None, value: float | None, detail: str | None
+        self,
+        rule_id: str,
+        metric: str | None,
+        value: float | None,
+        detail: str | None,
+        *,
+        threshold: float | None = None,
     ) -> list[Transition]:
         state = self._state(rule_id, metric)
         if state.alert_id is None:
             return []
         now = self._now_ms
-        self.store.fire_alert(state.alert_id, fired_ms=now, trigger_value=value, detail=detail)
+        self.store.fire_alert(
+            state.alert_id, fired_ms=now, trigger_value=value, detail=detail, threshold=threshold
+        )
         state.firing = True
         LOGGER.warning(
             "アラートが発火した",
