@@ -263,9 +263,10 @@ def test_render_refuses_nothing_to_draw():
 
 
 def test_plan_for_a_derived_metric_adds_its_inputs_and_room(rule_set, catalog):
-    """派生値は材料も、最後に室温（通知の `context_always`。0142 §2.2a と同じ選び方）。
+    """派生値の材料とルールの残りのメトリクス、最後に室温（通知の「現在値:」と同じ。0142 §2.2a）。
 
-    閾値は派生値の面に（0147 §2.3）。
+    `AIRFLOW_DEGRADED` の閾値は期待値を超えた分（決定記録 0144）で `d.gpu_delta` の軸に無いので、
+    線を引かない（0147 §2.3 の「値の軸に引ける閾値だけ」）。
     """
     plan = plan_graph(
         "AIRFLOW_DEGRADED",
@@ -273,10 +274,20 @@ def test_plan_for_a_derived_metric_adds_its_inputs_and_room(rule_set, catalog):
         rules=rule_set,
         names=NAMES,
     )
-    assert plan.metrics == ("d.gpu_delta", "air.gpu_exhaust", "air.gpu_intake", "air.room")
-    assert [t.value for t in plan.thresholds["d.gpu_delta"]] == [
-        rule_set.airflow_degraded.threshold
-    ]
+    assert plan.metrics == (
+        "d.gpu_delta",
+        "air.gpu_exhaust",
+        "air.gpu_intake",
+        "power.gpu.0",
+        "air.room",
+    )
+    assert plan.thresholds == {}
+
+
+def test_plan_for_a_threshold_rule_puts_the_line_on_its_metric(rule_set, catalog):
+    """閾値は値の面に（0147 §2.3）。"""
+    plan = plan_graph("INTAKE_HIGH", "air.gpu_intake", rules=rule_set, names=NAMES)
+    assert [t.value for t in plan.thresholds["air.gpu_intake"]] == [rule_set.intake_high.threshold]
 
 
 def test_plan_for_hot_and_slow_puts_each_threshold_on_its_metric(rule_set, catalog):
@@ -382,11 +393,11 @@ def test_render_alert_graph_reads_the_last_window(store, rule_set, catalog, grap
     assert graph is not None
     width, height, body = pixels(graph.png)
     assert width == graph_config.width
-    assert height == graph_config.panel_height, "4 本とも °C なので 1 面"
-    assert has_color(body, THRESHOLD)
+    assert height == graph_config.panel_height, "電力の値が無いので °C の 1 面だけ"
+    assert not has_color(body, THRESHOLD), "超過の閾値は d.gpu_delta の軸に無い（決定記録 0144）"
     assert graph.comment.startswith("直近60分: GPUが与えた熱（d.gpu_delta）=青")
     assert "室温（air.room）=黄" in graph.comment
-    assert "閾値 20 = 赤の破線" in graph.comment
+    assert "赤の破線" not in graph.comment
     assert graph.filename == f"airflow_degraded_{NOON_MS}.png"
 
 

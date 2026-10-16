@@ -162,9 +162,14 @@ def test_simple_threshold_rules(name, metric, over, under, engine, store, rule_s
 
 
 def test_airflow_degraded_uses_a_derived_value(engine, store):
-    """FR-406。`d.gpu_delta`（排気 − 吸気）が20℃を5分。派生値で判定する。"""
+    """FR-406。`d.gpu_delta`（排気 − 吸気）の派生値で判定する。
+
+    電力の判定は tests/test_rules_airflow_power.py（決定記録 0144）。
+    ここでは GPU 電力を書かないので、期待値は表の最大（34.0）で、
+    差 47.0 は超過 13.0 > 6.0 として 5 分で発火する。
+    """
     for step in range(0, 400, 10):
-        feed(engine, step, **{"air.gpu_exhaust": 50.0, "air.gpu_intake": 28.0})  # 差 22.0
+        feed(engine, step, **{"air.gpu_exhaust": 75.0, "air.gpu_intake": 28.0})  # 差 47.0
     assert alerts(store, "AIRFLOW_DEGRADED")[0].state == "firing"
 
 
@@ -342,8 +347,8 @@ def test_config_marks_thresholds_as_provisional():
 
 def test_every_required_rule_is_defined(rule_set):
     """FR-401〜409 の9つと、GPU の Fan の曲線の2つ（決定記録 0131）と、
-    12V-2x6 コネクタの温度の2つ（決定記録 0145）。"""
-    assert len(RuleSet.model_fields) == 13
+    12V-2x6 コネクタの温度の2つ（決定記録 0145）と、fand の状態の3つ（0148）。"""
+    assert len(RuleSet.model_fields) == 16
 
 
 @pytest.mark.parametrize(

@@ -398,3 +398,71 @@ fand を manual 0.35（3 zone とも）で動かし、`coldaisle-cpu-power` を 
 - 戻した後の T8 の全スレッドで、Guard の発火 4 回はすべて `threshold_profile` が `normal` だった。ただしこれは約 1 分後の値で、新しい sample を観測した tick の健全度を示さないので、合否の材料にしない
 - そのテストと、健全度と閾値を trace に載せることは #308 で行う。0123 §2.3 の、T1 で健全度が `NORMAL` だった時間の割合も、それまで数えられない
 - T9 (a)（fand の計時の `telemetry.cpu_power_ms`）は、0123 §2.2 のとおり実機では行わず、CI のテストで確かめる
+
+### T1: 24 時間の連続運転（2026-10-15 16:36:04〜2026-10-16 16:36:05）
+
+**判定: 合格（2026-10-16、所有者が確認）。** 下の表の判定は、0121 §2.3 の合格の条件に当てた集計の結果。
+
+0121 §2.3 のとおり、正式の unit（`--backend hwmon`）を `systemctl start` で動かし（`enable` しない）、所有者の普段の使い方のまま
+24 時間 fand に制御させて、`systemctl stop` で終えた。`/opt` の版は `d3c5404`、decision trace は v15（0137）。fand の再起動は 0 回で、
+止めた後の `pwmN_enable` は 3 zone とも 5（BIOS の制御）に戻った。記録は `t1-10151636-*`（`~/coldaisle-host-work/`。DB から書き出した
+reading と trace、fand の journal、`coldaisle-soak-report` の集計）。
+
+| 測るもの（0121 §2.3） | 結果 | 合格の条件 | 判定 |
+|---|---|---|---|
+| `duration_ms` の分布 | 最大 11 ms・p99.9 6 ms・p99 5 ms（86400 tick） | 最大が 125 ms 未満 | 合格 |
+| `deadline_exceeded` の数と連続の最長 | 0 回（連続の最長 0）。停止時の集計の `overruns` も 0 | 連続の最長が 1 以下 | 合格 |
+| tick の間隔（`control tick` のログの journal の単調時計の差） | 最大 1023.96 ms・p99.9 1019.6 ms・p99 1012.0 ms・最小 977.0 ms | 最大が 1500 ms 未満・p99.9 が 1100 ms 未満 | 合格 |
+| `stats.skipped_slots` | 0（停止時の集計。下の注を参照） | 0 | 合格 |
+| systemd の watchdog による再起動 | 0 回（journal に `Watchdog timeout` は無い） | 0 回 | 合格 |
+| `*_telemetry_stale`（`cpu_ms` / `gpu_ms` / `air_ms`）と `cpu_power_unavailable`（0123 §2.3） | 0 回 | 0 回 | 合格 |
+| `write_failure` / `readback_mismatch` / `enable_reverted` | 0 回 | 0 回 | 合格 |
+| `tach_stall` | 0 回（起動の直後を含む。T4 の注の確認） | 0 回 | 合格 |
+
+- **`skipped_slots` などは、fand が正常停止のときにログに出す集計（`ControlStats`）の値。** journal の「control daemon を終了する」の行で、
+  `ticks` 86400・`overruns` 0・`skipped_slots` 0・`recorded` 86400・`trace_dropped` 0・`emergency_max` false。
+  `control tick` のログには `skipped_slots` の欄が無いので、この行を根拠にした。DB の trace も 86400 tick（`tick_id` 0〜86399）で、`recorded` と一致する
+- fault は 0 回。`safety_state` は起動の直後の 17 tick が `startup`（`startup_max` で 3 zone とも Max）、残りの 86383 tick は `normal`。
+  `mode` はずっと `auto`
+- trace の reasons の内訳（zone ごとの件数の合計）: `ramp_down_limit` 7232・`reactive_guard_hold` 4826・`reactive_guard_triggered` 520・
+  `cpu_cooling_floor` 150（Top だけ）・`startup_max` 51
+- `bound_by`（tick の数）: `requested` が Front / Rear 82669・Top 81263、`guard_floor` が Front / Rear 1319・Top 2577、`ramp_down` が
+  Front / Rear 2395・Top 2394、Top の `safety_floor` 149、`forced_max` が各 17。`effective` は 3 zone とも 0.40〜1.00、平均は約 0.585
+- Learned は配備していないので、起動時に経路を開かずに運転する error が 1 件出た（T0 と同じ）。fand の journal の error はこれだけ
+- systemd の記録では、fand の CPU 時間は 24 時間で 4 分 46 s、メモリの最大は 288.7 MB
+
+**0123 §2.3・0137 §2.3 の記録（合否にしない）**
+
+| 測るもの | 結果 |
+|---|---|
+| telemetry の健全度（0137 §2.3 の SQL。`(ticks, normal, conservative, guard_unknown)`） | (86400, 86400, 0, 0)。`NORMAL` の割合 100%。期間 86401 s ÷ `tick_ms` に対して記録の欠けは無い（停止時の集計の `recorded` 86400・`trace_dropped` 0） |
+| Reactive Guard の発火（`reactive guard started` のログ） | 431 回（同じ数だけ `released`）。閾値の組はどの tick も `normal` |
+| power の floor が Top を決めた時間（0123 §2.1 の最後の行） | 7 tick（約 0.008%）。2026-10-16 の 12:00・13:12・14:05 に 2〜3 tick ずつ |
+
+- power の floor が Top を決めた tick は、T8 と同じ判定（Top の `safety_floor` が、前後 2.5 s の `cpu.package` の最大値から計算した温度の曲線の値より
+  0.05 以上高い）で数えた。そのときの `safety_floor` は 0.83〜0.86、CPU は 71〜73 °C、前後 2.5 s の `power.cpu.package` の最大は 174〜179 W。
+  24 時間の `power.cpu.package` の最高は 179 W で、100 W を超えた sample は 34561 のうち 53。そのときの CPU の使われ方（どの作業か）は記録に無い。
+  音とのつり合いは所有者が判断する
+
+**温度**（中止の基準: CPU 88・GPU 85・12V-2x6 70 °C。どれにも届かなかった）
+
+| メトリクス | 最低〜最高（°C） |
+|---|---|
+| `cpu.package` | 33〜81 |
+| `gpu.0.core` | 24〜79 |
+| `board.connector_12v2x6` | 21〜47 |
+| `air.front_intake` | 16.4〜26.1 |
+| `air.gpu_exhaust` | 21.3〜54.9 |
+
+**取り込みの soak（`coldaisle-soak-report`、#47）**: 欠測率は全 `air.*` チャネルで 0.000%、デバイスの再起動 0、`sys.dropped_samples`・
+`sys.queue_drops`・`suspect` は 0。DB で判定できる項目は合格。シリアルの再接続回数と取り込みのデーモンの RSS は DB に記録経路が無く、
+確かめていない（総合の判定は「判定不能」）。
+
+- **中止の基準の見張り（`coldaisle-t1-watch`）は途中で一度止まった。** 2026-10-16 10:33 に起動し直した。止まっていた間は、
+  中止の基準の監視が無かった。fand 自体はその間も動き続け（再起動 0・tick の欠け無し）、上の温度の最高は 24 時間の DB の記録から
+  数えたもので、見張りの止まっていた間も含めて中止の基準に届いていない
+
+### 残り
+
+- T5 の約 11 s の経路（watchdog の最悪の時間）。上の T5 の節のとおり、試験専用の設定の例外を決める決定記録と所有者の承認が先
+- T1 は合格（2026-10-16、所有者が確認）。値の `status` を `confirmed` にするのは、所有者の承認を得てまとめて行う
