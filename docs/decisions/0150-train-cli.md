@@ -74,7 +74,7 @@ AGENTS.md の「仕様に無い判断をした場合、実装より先に決定�
   | `coldaisle.ingest.calibration` | §2.3 / §2.7: `Calibration.from_json_bytes`（`ingest` の中でこれだけ。取り込みの Source は使わない） |
   | `coldaisle.control.model.*` | §2.4 の 1・4〜7 / §2.7: `counterfactual_training`（`load_training_dataset_artifact_v2`（実装の PR で足す。§2.4 の 1）・`train_counterfactual_ridge`・`CounterfactualTrainingSpec`）・`counterfactual_confidence`（`seal_counterfactual_artifact`）・`counterfactual`（`CounterfactualThermalModelArtifact.model_validate_json`・`canonical_counterfactual_artifact_bytes`・`counterfactual_registry_metadata`・`counterfactual_registry_metadata_json_bytes`・`check_artifact_contents`・`RegistryCounterfactualThermalModel.from_verified_artifact`）・`calibration_digest`（`RuntimeCalibration`。読んだ `Calibration` から作る）・`confidence`（`ConfidenceProfileSpec`・`SupportAxis`）・`dataset`（`split_temporally_v2`）・`training`（`split_sha256`） |
   | `coldaisle.control.schema` | §2.2: `AuthorityStage`（`authority_compatibility` を `(shadow,)` に固定する型。値の型だけ） |
-  | `coldaisle.control.model_registry` | §2.5: `ModelRegistry`（`register_candidate`・`load_version`・実装の PR で足す読み取りだけの `committed_registration`）・`ModelRegistryLimits`・`ArtifactMetadata`・`ModelRegistryError` とその派生 |
+  | `coldaisle.control.model_registry` | §2.5: `ModelRegistry`（`register_candidate`・`load_version`・実装の PR で足す例外の型 `RegistryCommitNotDurableError`）・`ModelRegistryLimits`・`ArtifactMetadata`・`ModelRegistryError` とその派生 |
   | `coldaisle.training_output` | §2.5: 公開の手順・path の照合・印を確かめる関数 |
   | `coldaisle.dataset` | §2.5 の手順 1: `_open_output_root` を公開にした関数 |
   | `coldaisle.logs` | 構造化ログ |
@@ -202,7 +202,7 @@ process が強制終了したとき（`SIGKILL`・電源断）は片づけられ
 | 公開の前の強制終了（`SIGKILL`・電源断） | — | **`COMPLETE.json` の無い `--out`**（中のファイルは途中まで。印の一時名が残ることもある）。link の後・`--out` の fsync の前の電源断でも、link が永続でなければこの状態に戻りうる | 再実行は `--out` があるので拒否され、そのとき `--out` に有効な完成の印が無いことをログに出す。人が確かめて `--out` を消し、同じ引数で再実行する。CLI は自動では消さない（自分が作ったものか確かめられないため） |
 | 公開の後・一時名の unlink と `--out` と親の fsync の失敗（公開の手順 6。`--apply` の有無に依らない） | 1 | `--out`（3ファイルと有効な `COMPLETE.json`。中身はすべて fsync 済みで、永続でないのはディレクトリの項だけ。unlink の失敗なら印の一時名も残るが、確かめる関数は見ない）。`--apply` なら Registry へは進まない | ログに段 `publish_durability` と `--out` の path を出す。中身は完成しているので、そのまま使ってよい（`--apply` なら `coldaisle-registry register --training-output <--out>` で登録する）。電源断の後に `--out` が無い・印が無効なら、消して同じ引数で再実行する（その前に並行の `register` で同じ版の candidate が登録されていれば、Registry 側の bytes は Registry が fsync している。`coldaisle-registry status` で確かめ、あれば作り直さない） |
 | 公開の後・Registry の登録の失敗（lock・revision・同じ版が登録済み・権限・limits、および artifact ファイルの段の `RegistryDurabilityError`） | 1 | `--out`（3ファイルと完成の印）。`registry.json` と参照される artifact は変わらない（登録の確定点の前）。artifact を置いた後の失敗では、**参照されない artifact のファイル**（`artifacts/thermal_model/<model_id>/<version>/`）が残りうる（`register_candidate` の片付けは best-effort） | `coldaisle-registry register --training-output <--out>` で登録する（同じ版の再登録は残った artifact を同じ path へ `os.replace` で上書きするので妨げられない）。登録しないまま残った参照されない artifact は、`coldaisle-registry` に片付けの入口が無いので、人が `coldaisle-registry status` で参照されていないことを確かめてから消す。同じ版が登録済みなら `--model-version` を上げて別の `--out` で作り直す |
-| 登録は確定したが永続が確かでない（`registry.json` の置き換えの後の `RegistryDurabilityError`。下記） | 1 | `--out` と、Registry の **candidate**（見えている。production は動かない。読み直す前に他の CLI が `validate` / `retire` で状態を進めていることもある） | CLI はそのまま**登録の後の検査（`load_version` と L1〜L12）へ進む**（読んだ状態もログに出す）。検査が通ってもログに段 `register_durability` を出して終了コード 1。人は `coldaisle-registry status` で candidate があることを確かめる。電源断の後に無くなっていたら、`coldaisle-registry register --training-output <--out>` で登録する。**もう一度 `coldaisle-train --apply` で登録し直さない**（見えている間は「既にある」になる） |
+| 登録は確定したが永続が確かでない（`registry.json` の置き換えの後の `RegistryDurabilityError`。`register_candidate` が派生の `RegistryCommitNotDurableError` で知らせる。下記） | 1 | `--out` と、Registry の **candidate**（見えている。production は動かない。読み直す前に他の CLI が `validate` / `retire` で状態を進めていることもある） | CLI はそのまま**登録の後の検査（`load_version` と L1〜L12）へ進む**。検査が通ってもログに段 `register_durability` を出して終了コード 1。人は `coldaisle-registry status` で candidate があることを確かめる。電源断の後に無くなっていたら、`coldaisle-registry register --training-output <--out>` で登録する。**もう一度 `coldaisle-train --apply` で登録し直さない**（見えている間は「既にある」になる） |
 | 登録の後・**`--out` の名前の差し替え**（登録の直後の path の照合。登録の直前の照合の後に祖先などの名前が付け替えられた） | 1 | Registry の **candidate**（登録済み。production は動かない。中身は検査済みの bytes で正しい）と、書き手の完成した出力（どこかの名前の下）。`--out` の path は別のものを指す | ログに段 `out_replaced_after_register`・登録した artifact の key（`model_id` と version）・理由（照合で得た2つの `(st_dev, st_ino)`、path が無い・symlink を含む、の別）を出す。成功を報告しない。人が `coldaisle-registry status` で candidate を確かめ、付け替えの経緯を調べて、使わないなら既存の入口 `coldaisle-registry retire` で外す。CLI は自分で `retire` しない。登録の後の L1〜L12 の検査はこの場合も行い、結果をログに出す |
 | 公開の後・**`--out` の中身の書き換え**（手順 6 の後・登録の前または成功の報告の前の再検証で、`COMPLETE.json` か3つのファイルが印やメモリ上の bytes と違う） | 1 | 書き換えられた `--out`。**登録しない**（Registry は変わらない） | ログに段 `out_modified` と、違ったファイルの名前・期待した SHA-256・実際の SHA-256 を出す。成功を報告しない。人が誰が書いたかを確かめ、`--out` を消して別の `--out` で作り直す |
 | 登録の後・**`--out` の中身の書き換え**（登録の後・成功の報告の前の再検証で、登録した bytes と違う） | 1 | Registry の **candidate**（登録済み。中身は登録の直前に検証した bytes で正しい）と、書き換えられた `--out` | ログに段 `out_modified_after_register`・登録した artifact の key（`model_id` と version）・違ったファイルと2つの SHA-256 を出す。成功を報告しない。人が `coldaisle-registry status` で candidate を確かめ、使わないなら既存の入口 `coldaisle-registry retire` で外す。CLI は自分で `retire` しない |
@@ -373,14 +373,12 @@ JSON として読めて、書かれた3つのファイルの大きさと SHA-256
     いまの `coldaisle-registry` の `main` は `ModelRegistryError` をまとめて「操作は行われなかった」と記録する
     （`src/coldaisle/registry.py` の `main`）ので、そのままでは `registry.json` の置き換えの後の fsync の失敗でも、candidate が
     見えているのに通常の失敗と報告し、再実行は「既にある」で拒まれる。そこでこの subcommand は `RegistryDurabilityError` を
-    自分で受け、snapshot を1回読み直して、同じ判定（その ref の記録が同じ `sha256` で `artifacts` にあり、その ref の
-    `REGISTERED` の event があるか。lifecycle の状態は条件にしない）で分ける。確定していれば段 `register_durability`・終了コード 1
-    で、読んだ状態と ref を出し、「登録は見えている・再登録しない・`coldaisle-registry status` で確かめる」とログに書く。
+    自分で受け、下の「`--apply` の Registry 側の書き込み」の例外の型（`RegistryCommitNotDurableError`）で分ける。確定していれば
+    段 `register_durability`・終了コード 1 で ref を出し、「登録は見えている・再登録しない・`coldaisle-registry status` で確かめる」と
+    ログに書く。読み直した snapshot から確定を推し量らない（下記）
     確定していなければ段 `register` の失敗として今の報告のとおり
-  - 判定は1つの関数にし、`train.py` と `registry.py` の両方が呼ぶ。置き場所は `control/model_registry.py` の読み取りだけの
-    method（仮に `ModelRegistry.committed_registration(ref, sha256) -> ArtifactStatus | None`。`inspect()` の snapshot を1回読む。
-    Registry の書き方は変えない）。`training_output.py` は coldaisle を import しないので置かず、`train.py` は `registry.py` を
-    import しない（§2.1）ので、両方が既に import する `control/model_registry.py` に置く
+  - 判定は `register_candidate` が投げる例外の型そのもので、`train.py` と `registry.py` の両方が同じ型で受ける（両方が既に
+    `control/model_registry.py` を import する。§2.1）。読み取りの method は足さない
   - 既存の `register --metadata/--payload`・`validate`・`promote` などの報告は本記録では変えない（同じ関数で分けられるが、
     それぞれの入口の記録で決める）
 - **`--metadata` / `--payload` の経路は、学習の出力を拒む。判定はファイルの置き場所ではなく、読んだ bytes の中身で行う。**
@@ -454,16 +452,21 @@ process が強制終了したときに残るのは、印の無い（または無
 - snapshot の置き換えを試みた後の `RegistryDurabilityError` だけは、artifact を消さずにそのまま出す。**candidate は登録済みで
   見えている**（`snapshot_attempted and isinstance(exc, RegistryDurabilityError)` の分岐）
 
-例外の型だけでは2つを区別できない（どちらも `RegistryDurabilityError` になりうる）。そこで CLI は `RegistryDurabilityError`
-を受けたら、同じ limits で Registry の snapshot を**1回だけ**読み直し（上の `committed_registration` が `ModelRegistry.inspect()` を呼ぶ。1回の読みで lifecycle の
-状態と audit を含む snapshot を得る）、**その ref の記録が `metadata.json` と同じ `sha256` で `artifacts` にあり、`audit` にその ref の
-`REGISTERED` の event があるか**で分ける。**lifecycle の状態は条件にしない。** `RegistryDurabilityError` の時点で Registry の lock は
-放されているので、読み直す前に他の権限のある CLI が `validate` / `retire` で状態を進めうる。状態が `candidate` のままであることを
-求めると、確定した登録を確定の前の失敗と取り違え、登録の後の検査を飛ばし、「既にある」で拒まれる再登録を促してしまう。
-あれば「確定したが永続が確かでない」として、読んだ状態（`candidate` / `validated` / `retired` など）をログに出して登録の後の検査
-（`load_version` は状態に依らず読める）へ進み、無ければ登録の失敗として扱う（§2.4 の表）。同じ ref が別の `sha256` で
-あるときは、同じ版を別の bytes で他者が登録したので、登録の失敗（同じ版が登録済み）とする。それ以外の `ModelRegistryError` は登録の失敗である。Registry 側の書き方は本記録では
-変えない。
+いまは例外の型だけでは2つを区別できない（どちらも `RegistryDurabilityError` になりうる）。そこで**実装の PR で
+`register_candidate` に、確定したかどうかを例外の型で持ち出させる**: `snapshot_attempted and isinstance(exc, RegistryDurabilityError)`
+の分岐（いまも artifact を消さない分岐。`_atomic_write` は `os.replace` の後の fsync の失敗でだけ `RegistryDurabilityError` を出す）
+でだけ、`RegistryDurabilityError` の派生 `RegistryCommitNotDurableError`（仮の名前。登録した `ArtifactRef` を持つ）を `raise ... from exc`
+で投げる。artifact ファイルの段の `RegistryDurabilityError` は今の型のまま。派生なので、`RegistryDurabilityError` や
+`ModelRegistryError` で受けている既存の呼び出しは変わらない。CLI は `RegistryCommitNotDurableError` なら「確定したが永続が
+確かでない」として登録の後の検査（`load_version` は lifecycle の状態に依らず読める）へ進み、それ以外の `RegistryDurabilityError` は
+登録の失敗として扱う（§2.4 の表）。
+- **読み直した snapshot から確定を推し量らない理由。** 例外の時点で Registry の lock は放されているので、読み直す前に他の権限の
+  ある CLI が状態を進めたり（`validate` / `retire`）、確定の前に失敗したこの呼び出しの後で、別の呼び出しが同じ ref・同じ
+  `sha256` を登録したりしうる。snapshot の記録と `REGISTERED` の event の有無で分けると、前者では状態の条件で確定を取り違え、
+  後者では他の呼び出しの登録をこの呼び出しの確定と取り違える。確定したかどうかを知っているのは lock の中の
+  `register_candidate` だけなので、その結果を例外の型で持ち出す
+それ以外の `ModelRegistryError` は登録の失敗である。Registry 側の書き方（書く順・確定点・片付け）は本記録では
+変えない（変えるのは確定の後の例外の型だけ）。
 
 順序は **`--out` の公開 → Registry の登録**とする。2つの間で止まったときは `--out` だけがあり、`coldaisle-train` の
 再実行は `--out` が既にあるので拒否される。このときは `coldaisle-registry register --training-output <--out>` で、印を
@@ -637,11 +640,13 @@ best-effort で `OSError` / `UnsafeRegistryPathError` を握る（`src/coldaisle
 - `register --training-output` の登録の後の再検証: `register_candidate` を包んで、登録の途中で `--out` の `artifact.json` を
   その場で書き換えると（inode は変えない）、段 `out_modified_after_register`・終了コード 1 で成功を報告せず、candidate の bytes は
   確かめた bytes であること
+- `register_candidate` の例外の型: `registry.json` の置き換えの後の fsync の失敗では `RegistryCommitNotDurableError`（登録した ref を
+  持つ）、artifact ファイルの段の fsync の失敗では `RegistryDurabilityError`（派生ではない）になること。後者で lock が放された後に、
+  別の呼び出しが同じ ref・同じ `sha256` を登録しても、元の呼び出しは段 `register` に分類されること
 - 確定の後の `RegistryDurabilityError`（`coldaisle-train --apply` と `coldaisle-registry register --training-output` の両方）:
-  `registry.json` の置き換えの後に例外を起こし、読み直しの前に同じ ref を `retire`
-  （と `validate`）で進めた場合でも、段 `register_durability`・終了コード 1 に分類され（`coldaisle-train` は登録の後の L1〜L12 の検査も行う）、読んだ状態をログに出し、
-  再登録を促さないこと。`coldaisle-registry register --training-output` が通常の「操作は行われなかった」と報告しないこと。
-  同じ版が別の `sha256` で登録済みのときは段 `register` になること
+  `registry.json` の置き換えの後に例外を起こし、CLI が受ける前に同じ ref を `retire`（と `validate`）で進めた場合でも、段
+  `register_durability`・終了コード 1 に分類され（`coldaisle-train` は登録の後の L1〜L12 の検査も行う）、再登録を促さないこと。
+  `coldaisle-registry register --training-output` が通常の「操作は行われなかった」と報告しないこと
 - 公開の後の失敗: 登録の失敗では終了コード 1・段 `register`・`--out` が残り、登録が確定しないこと。登録の後の検査の失敗では
   終了コード 1・段 `post_register_check`・`--out` が残り、candidate が1つ足されたまま（上の (1)〜(4)）で、CLI が `retire` しない
   （`RETIRED` の event が足されない）こと
