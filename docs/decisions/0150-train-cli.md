@@ -70,7 +70,7 @@ AGENTS.md の「仕様に無い判断をした場合、実装より先に決定�
   | `coldaisle.metrics` | §2.3 / §2.4 の 5・7 / §2.7: `MetricCatalog.from_yaml_bytes_with_sha256`（実装の PR で足す bytes の API） |
   | `coldaisle.store`（読むだけの API） | §2.3 / §2.7: `QualityRules`（`model_validate`）。DB は `training_entry` が読み取り専用で開く |
   | `coldaisle.ingest.calibration` | §2.3 / §2.7: `Calibration.from_json_bytes`（`ingest` の中でこれだけ。取り込みの Source は使わない） |
-  | `coldaisle.control.model.*` | §2.4 の 1・4〜7 / §2.7: `counterfactual_training`（`verify_training_dataset_artifact_v2`・`train_counterfactual_ridge`・`CounterfactualTrainingSpec`）・`counterfactual_confidence`（`seal_counterfactual_artifact`）・`counterfactual`（`CounterfactualThermalModelArtifact.model_validate_json`・`canonical_counterfactual_artifact_bytes`・`counterfactual_registry_metadata`・`counterfactual_registry_metadata_json_bytes`・`check_artifact_contents`・`RegistryCounterfactualThermalModel.from_verified_artifact`）・`calibration_digest`（`RuntimeCalibration`。読んだ `Calibration` から作る）・`confidence`（`ConfidenceProfileSpec`・`SupportAxis`）・`dataset`（`split_temporally_v2`）・`training`（`split_sha256`） |
+  | `coldaisle.control.model.*` | §2.4 の 1・4〜7 / §2.7: `counterfactual_training`（`load_training_dataset_artifact_v2`（実装の PR で足す。§2.4 の 1）・`train_counterfactual_ridge`・`CounterfactualTrainingSpec`）・`counterfactual_confidence`（`seal_counterfactual_artifact`）・`counterfactual`（`CounterfactualThermalModelArtifact.model_validate_json`・`canonical_counterfactual_artifact_bytes`・`counterfactual_registry_metadata`・`counterfactual_registry_metadata_json_bytes`・`check_artifact_contents`・`RegistryCounterfactualThermalModel.from_verified_artifact`）・`calibration_digest`（`RuntimeCalibration`。読んだ `Calibration` から作る）・`confidence`（`ConfidenceProfileSpec`・`SupportAxis`）・`dataset`（`split_temporally_v2`）・`training`（`split_sha256`） |
   | `coldaisle.control.schema` | §2.2: `AuthorityStage`（`authority_compatibility` を `(shadow,)` に固定する型。値の型だけ） |
   | `coldaisle.control.model_registry` | §2.5: `ModelRegistry`（`register_candidate`・`load_version`）・`ModelRegistryLimits`・`ArtifactMetadata`・`ModelRegistryError` とその派生 |
   | `coldaisle.training_output` | §2.5: 公開の手順・path の照合・印を確かめる関数 |
@@ -141,7 +141,20 @@ AGENTS.md の「仕様に無い判断をした場合、実装より先に決定�
 
 ### 2.4 検査と学習の順。公開の前に1つでも外れれば何も書かない
 
-1. `verify_training_dataset_artifact_v2`: 公開物の bytes と directory 名の alias に束縛する
+1. **`--dataset` の読み込みと公開物への束縛を、1回の読みで行う。** 既存の `verify_training_dataset_artifact_v2` は構築済みの
+   `ThermalDatasetV2` を第1引数に取り、`examples.jsonl` は hash するだけで読まない。ディレクトリから `ThermalDatasetV2` を作る
+   読み手は本番のコードに無い。そこで実装の PR で `control/model/counterfactual_training.py` に
+   `load_training_dataset_artifact_v2(dataset_dir: Path) -> VerifiedTrainingDatasetArtifactV2` を足す:
+   - directory 名が公開用の alias（`dataset-<32 hex>`）であることを確かめ、既存の `_open_directory_without_symlinks` で開く
+   - `manifest.json` と `examples.jsonl` を、開いた `dir_fd` から既存の `_read_regular_file_at` で**それぞれ1回だけ**、既存の上限
+     （`MAX_DATASET_MANIFEST_BYTES` / `MAX_DATASET_EXAMPLES_BYTES`。`control/model/training.py`）で読む。上限を超えれば parse の前に拒否する
+   - manifest が canonical な公開 bytes であること、**読んだ examples の bytes の SHA-256** が `manifest.examples_sha256` と一致する
+     ことを、parse の前に確かめる（hash と parse を同じ buffer から行う）
+   - examples の各行を `DatasetExampleV2.model_validate_json` で読み、`ThermalDatasetV2(manifest=..., examples=...)` を作る（型の
+     検査はそのまま効く）。`examples_jsonl_bytes(dataset.examples)` が読んだ bytes と完全に一致することを求める（canonical でない行を拒む）
+   - 束縛の token は `verify_training_dataset_artifact_v2` と同じものを使い、`manifest_sha256`・`examples_sha256` も読んだ bytes から取る
+
+   既存の `verify_training_dataset_artifact_v2` は変えない（試験と既存の呼び出しのため）。`train.py` はそれを呼ばず、新しい関数だけを呼ぶ
 2. `verify_training_dataset_v2`: 元の入力の fingerprint・export の束縛・本番の DB の行と trace を照合し、一時の専用 DB で
    作り直した bytes が一致することを求める（0112 §2.3 / 0116）
 3. `verify_training_calibration`: 期間の終わり（全 example の `label_end_ms` の最大）より後に較正の記録があれば拒否し、
@@ -289,6 +302,16 @@ process が強制終了したとき（`SIGKILL`・電源断）は片づけられ
 `lstat` は `a-old/out` を見て一致と報告する）。fd でたどれば、各段で開いたものそのものから次を開くので、その時点の path の
 各要素が symlink でないディレクトリであることと、最後がいまの path の指すものであることを1回のたどりで確かめられる。
 いずれも POSIX で共通の操作で、NFR-07 を変えない。手順 1 で開いた親や祖先の fd は使い回さない。
+- **`--out` には symlink を含まない実の path を渡す。CLI は symlink を解かない。** macOS では `/tmp`・`/var`・`/etc` が
+  `/private/...` への symlink なので、`--out /tmp/<自分のディレクトリ>/...` は根の次の要素で `ELOOP` になる。そこで:
+  - `os.path.realpath` などで先に解いてから照合する形は採らない（解いた後・開く前に途中の要素を差し替えられる窓が戻る）。
+    OS ごとの別名の一覧を持って解く形も、本記録では採らない（§5 の 13）
+  - `ELOOP` で開けなかったときは、どの要素が symlink かを `os.readlink(名前, dir_fd=ひとつ前の fd)` で読んでログに出し（読むだけで
+    たどらない）、段 `untrusted_path`・終了コード 1 で拒否する。ログには「symlink を含まない実の path（macOS なら `/private/tmp/...`）を
+    渡す」ことを書く。開始の時点なら学習の前で、`--out` は作られない
+  - この約束は `--out` の親の検査（手順 1 の `_open_output_root`）と `coldaisle-registry register --training-output` の照合も同じ
+  - Ubuntu の `/tmp` は実のディレクトリなので、`/tmp/<自分のディレクトリ>` はそのまま受け入れる。macOS では `/private/tmp/<自分のディレクトリ>`
+    （`/private` は root の所有で `0755`、`/private/tmp` は `1777`・root の所有）が同じ規則 (a)(b) で受け入れられる
 - **開始の時点**（手順 1 で親を開いた直後・手順 2 の前）に `--out` の親までを `open_trusted_path` で検査し、満たさなければ
   学習の前に段 `untrusted_path` で拒む（`--out` は作られない）。以後の照合（手順 2 の直後・link の前・手順 6 の後・登録の前後・
   rmdir の前）は同じたどりで `--out` までを確かめ、信頼の検査も毎回行う（権限が途中で緩められたら `untrusted_path` で失敗）
@@ -452,7 +475,9 @@ coldaisle-authority raise          → authority を1段   （承認者の uid�
   読んでから大きさを判断しない）。読むのは `train.py` の1つの関数で、`O_RDONLY | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK` で開き、
   `fstat` で regular file であることを確かめてから読む（`declared_changes._read_regular_file` と同じ開き方）。上限を超えた・
   regular file でない・UTF-8 でない・YAML / JSON として読めない・parser の再帰が尽きた（`RecursionError`。0062 §2.1）は、
-  どれも学習の前に構造化ログと終了コード 1 で拒否し、`--out` を作らない。上限の値は §5 の 12
+  どれも学習の前に構造化ログと終了コード 1 で拒否し、`--out` を作らない。**上限は `train.py` の構造上の定数
+  `MAX_TRAINING_CONFIG_BYTES = 1 MiB`（1,048,576 bytes）で、6つの入力に共通**（運用の閾値ではなくメモリを守る構造上の上限。
+  既存の `MAX_ARTIFACT_BYTES`・`_MAX_JOURNAL_BYTES`・`MAX_DECLARED_CHANGES` と同じ扱い。§5 の 12 で決定済み）
 - **既存の `MetricCatalog.from_yaml_with_sha256`（`src/coldaisle/metrics.py`）と `read_declared_changes`
   （`src/coldaisle/declared_changes.py`）は path からファイル全体を上限なしで読む**（前者は `Path.read_bytes()`、後者は EOF までの
   `os.read` のループ）。そのまま呼ぶと上の約束を満たせないので、`train.py` からは呼ばない。実装の PR で、同じ検証を bytes から
@@ -512,12 +537,15 @@ best-effort で `OSError` / `UnsafeRegistryPathError` を握る（`src/coldaisle
   で拒否し、`--out` が作られないこと。試す形は、group に書ける祖先（実行した uid の所有・`0775`）・sticky でない world に書ける
   祖先（`0777`）・sticky な祖先（`1777`）の中の**他の uid の所有**のディレクトリ（`tmp_path` では他の uid を作れないので、
   `fstat` を包んで所有者を差し替えて試す）・他の uid の所有で group / other に書けない祖先は (a) を満たさないこと。逆に、
-  `/tmp`（`1777`・root の所有）の中の実行した uid の所有のディレクトリの下と、root の所有の `0755` の祖先は受け入れること。
+  システムの一時ディレクトリの実の path（Linux の `/tmp`、macOS の `/private/tmp`。どちらも `1777`・root の所有）の中の実行した
+  uid の所有のディレクトリの下と、root の所有の `0755` の祖先は受け入れること。祖先に symlink を含む path（macOS の `/tmp` の形を
+  `tmp_path` の中の symlink で模す）は、symlink の先が信頼できる場所でも段 `untrusted_path`・終了コード 1 で拒否され、ログに
+  symlink の要素と実の path を渡す指示が出て、`--out` が作られないこと
   開始の後に祖先の mode を `0777` に緩めると、次の照合で `untrusted_path` になること
 - path の照合: `--out` の名前だけでなく、**親や祖先の名前を付け替えて**同じ path に別のディレクトリを置いたとき・path の途中の
   要素を、元のディレクトリ（付け替えた先）への **symlink** に差し替えたとき（例: `/tmp/a` を `a-old` に名前を変え `/tmp/a -> a-old`
   を置く。`lstat` の連続や親の fd を使った照合では一致と見逃す形）・最後の `--out` を symlink にしたときも、`ELOOP` / `ENOTDIR` /
-  `ENOENT` で不一致になること。`os.lstat` を使わず `O_NOFOLLOW` の `os.open` でたどっていること（差し替えて確かめる）。`/tmp` の下（sticky・world が書ける
+  `ENOENT` で不一致になること。`os.lstat` を使わず `O_NOFOLLOW` の `os.open` でたどっていること（差し替えて確かめる）。一時ディレクトリの実の path の下（sticky・world が書ける
   祖先）の `--out` を拒まないこと。`coldaisle-registry register --training-output` でも、印を確かめた後・登録の前に親の名前を
   付け替えると終了コード 1 で Registry が変わらないこと。`register_candidate` の呼び出しを包んで**登録の直後**に親の名前を
   付け替えると、candidate が1つ足され（上の (1)〜(4)）、その bytes が印を確かめた bytes と同じで、段
@@ -555,6 +583,11 @@ best-effort で `OSError` / `UnsafeRegistryPathError` を握る（`src/coldaisle
   `metadata.json` は完成）の `--out` のファイルを渡すと終了コード 1 で Registry が変わらないこと。公開の後の `--out` でも拒むこと。
   `training-report.json` の無い別のディレクトリのファイルは従来どおり登録できること。手順 3 で `training-report.json` が最初に
   書かれること
+- Dataset の読み込み（§2.4 の 1）: `load_training_dataset_artifact_v2` が `coldaisle-dataset` の公開物から、
+  `verify_training_dataset_artifact_v2` と同じ束縛（`artifact_id`・`manifest_sha256`・`examples_sha256`）を返すこと。
+  `examples.jsonl` が上限＋1 byte・manifest の `examples_sha256` と違う・canonical でない行（空白や鍵の順を変えた同じ値）・
+  型に外れる行・directory 名が alias でない・directory か各ファイルが symlink のときは、学習の前に終了コード 1 で拒否され `--out` が
+  作られないこと。各ファイルを1回だけ開くこと（読みの後に差し替えても、使った bytes が1回目のものであること）
 - 設定の上限: 6つの設定の入力のそれぞれについて、上限＋1 byte のファイルを渡すと学習の前に終了コード 1 で拒否され、`--out` が
   作られず、読んだ byte 数が上限＋1 を超えないこと（`os.read` を包んで数える）。symlink・FIFO を渡しても拒否されること。
   `MetricCatalog.from_yaml_bytes_with_sha256` と `parse_declared_changes` が、既存の `from_yaml_with_sha256` /
@@ -623,4 +656,5 @@ best-effort で `OSError` / `UnsafeRegistryPathError` を握る（`src/coldaisle
 | 9 | （申し送り）`write_dataset` にも、確認と `os.rename` の間に作られた空のディレクトリを置き換える同じ窓がある | **本記録では扱わない。** 直すなら 0031 §3（macOS / Ubuntu 共通の `os.rename`）を置き換える別の決定記録で扱う | — |
 | 10 | `--out` の公開の手段（NFR-07「macOS / Ubuntu 双方で動作。OS依存はシリアルデバイス検出のみに閉じる」との関係） | **(A) OS に依らない手順**（§2.5 の本文）。`os.mkdir` で `--out` を排他的に確保し、中に書いてから完成の印を一時名で書いて fsync し、`os.link` で `COMPLETE.json` として公開する（既にあれば失敗）。利点: POSIX 共通の操作だけで NFR-07 を変えない・ctypes も OS の分岐も要らず CI（Ubuntu）で全経路を実物で試験できる・`mkdir` の排他で置き換えの窓が無い（前回の指摘を満たす）・0031 §3 の「共通の POSIX の操作だけ」と一貫する。欠点: 強制終了の後に `COMPLETE.json` の無い `--out` が残り、人が消すまで再実行できない・読む側が印を確かめる必要がある（新しい `coldaisle-registry register --training-output` は Registry を開く前に `COMPLETE.json` を確かめる。印を見ないのは既存の `--metadata` / `--payload` の経路だけで、その経路も `register_candidate` の checksum で書きかけを拒む） | (B) NFR-07 を変えて OS ごとの置き換えない rename を使う（Linux `renameat2(RENAME_NOREPLACE)`・macOS `renameatx_np(RENAME_EXCL)`・使えなければ失敗。ctypes の小さな関数1つ）。NFR-07 の「OS依存はシリアルデバイス検出のみに閉じる」を「…シリアルデバイス検出と、決定記録 0150 の出力の公開（置き換えない rename）に閉じる」へ変え、同じ PR で `docs/requirements.md` を直す。利点: `--out` は「無い」か「完成」のどちらかで、強制終了の後に残るのは隠れた一時ディレクトリだけ・読む側に印の確認が要らない。欠点: 要件を変える・macOS の分岐は Ubuntu の CI では差し替えでしか試験できない・ファイルシステムが対応しないと使えない・0031 §3 の writer（共通の `os.rename`）と手段が分かれる |
 | 11 | （申し送り）Registry の登録の失敗で、参照されない artifact のファイルが残りうる（`_remove_artifact_if_unreferenced` が best-effort）。`coldaisle-registry` に片付けの入口は無い | **本記録では扱わない**（Registry の書き方と片付けは 0062 / 0104 の範囲）。必要なら Registry の片付けの入口を別の記録で決める | — |
-| 12 | 設定の入力（§2.7 の6つ）を読む上限の値と置き場所 | **`train.py` の構造上の定数 `MAX_TRAINING_CONFIG_BYTES = 1 MiB`**（6つに共通）。運用の閾値ではなくメモリを守る構造上の上限で、既存の `MAX_ARTIFACT_BYTES`（`control/model/thermal.py`）・`_MAX_JOURNAL_BYTES`（`control/authority.py`）・`MAX_DECLARED_CHANGES` と同じ扱い。いまの設定は数 KB で、宣言の YAML も `MAX_DECLARED_CHANGES` = 64 件に収まる。利点: `--apply` の無い実行でも追加の設定が要らず、上限を決めるファイル自身の読みに上限が要るという循環が無い | (a) `--registry-limits` を常に必須にし、その `max_snapshot_bytes` を使う（0062 §2.1 と同じ値）。欠点: `--out` だけの実行にも Registry の設定が要り、`model-registry.yaml` 自身は別の上限で読む必要が残る。(b) `--training-spec` に置く。欠点: spec 自身の読みに上限が要る |
+| 12 | 設定の入力（§2.7 の6つ）を読む上限の値と置き場所。**決定済み（所有者、2026-10-16）: 推奨のとおり** | **`train.py` の構造上の定数 `MAX_TRAINING_CONFIG_BYTES = 1 MiB`**（6つに共通）。運用の閾値ではなくメモリを守る構造上の上限で、既存の `MAX_ARTIFACT_BYTES`（`control/model/thermal.py`）・`_MAX_JOURNAL_BYTES`（`control/authority.py`）・`MAX_DECLARED_CHANGES` と同じ扱い。いまの設定は数 KB で、宣言の YAML も `MAX_DECLARED_CHANGES` = 64 件に収まる。利点: `--apply` の無い実行でも追加の設定が要らず、上限を決めるファイル自身の読みに上限が要るという循環が無い | (a) `--registry-limits` を常に必須にし、その `max_snapshot_bytes` を使う（0062 §2.1 と同じ値）。欠点: `--out` だけの実行にも Registry の設定が要り、`model-registry.yaml` 自身は別の上限で読む必要が残る。(b) `--training-spec` に置く。欠点: spec 自身の読みに上限が要る |
+| 13 | macOS の `/tmp`・`/var` など、OS が置く symlink を含む `--out` | **受け入れない**（§2.5 の「path の照合」）。symlink を含まない実の path（`/private/tmp/...`）を人が渡し、CLI は拒否のログでそれを示す。利点: 解く処理が無く、照合の窓が増えない・Dataset の writer（`_open_output_root`）と挙動が揃う・OS ごとの分岐が無い（NFR-07） | (a) root の所有の `/` の中の root の所有の symlink（`/tmp`・`/var`・`/etc`）だけを、`fstat` と `readlink` で確かめて一度だけ解き、先を fd で開いて照合を続ける。欠点: 別名の一覧（macOS の分岐）を持つ・Ubuntu の CI では模してしか試験できない |
