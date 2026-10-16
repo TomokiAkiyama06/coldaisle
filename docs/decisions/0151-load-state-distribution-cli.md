@@ -183,25 +183,38 @@ DB に残る記録で、これを直接に言える欄は無い（2026-10-16 の
 
 **区間の全体を読む**（`fand` の判定）:
 
-- 不一致の割合は、`--start` を含む連続した trace の区間について、`--start` から trace を古い向きへ、間隔が
-  `trace_max_age_ms` を超える所（区間の本当の始まり）までさかのぼって読み、その区間の全体で数える。`--end` の側も
-  同じく区間の終わりまで読む。こうして判定が `--start` / `--end` の置き方に依らないようにする
+- **区間は `seq` の順でたどる。** trace の書かれた順は `seq`（0007 で足した `NOT NULL UNIQUE` の列。書き手は
+  `MAX(MAX(seq), pruned_through_seq) + 1` を挿入と同じ文で振る。`store/db.py`）で、`ts_ms` は壁時計なので時計が
+  戻ると書いた順を表さない（0071 §2.2a の「並びは `seq`、`ts_ms` は絞り込みだけ」と同じ理由）。そこで、連続した
+  trace の区間は「`seq` の昇順で隣り合う 2 行の `ts_ms` の差が `trace_max_age_ms` を超えたら切る」と定義する。
+  差が負（時計が戻った）なら切らない（区間を短く切ると、外れた前半を落とせてしまうため、繋ぐ側に倒す）。
+  `ts_ms` は、この途切れの比較と、評価時刻 `t` に対する trace の古さ（`[t - trace_max_age_ms, t]`）にだけ使う
+- 評価時刻 `t` の窓に、別々の区間（`seq` でたどって別の区間）に属する trace が入ったとき（時計が戻った前後）は、
+  どの区間の判定にも寄せず `undetermined` にする
+- 不一致の割合は、`t` の trace を含む区間について、`seq` を小さい向きへ区間の本当の始まりまで、大きい向きへ
+  終わりまでたどって読み、その区間の全体で数える。こうして判定が `--start` / `--end` の置き方に依らないようにする
 - 決まった長さの窓（例: 直近 30 分の割合）にしないのは、simulated の運転で前半が外れ、窓に入る後半だけがたまたま
   合う、という場合を窓では捨てられないため。区間の全体なら、その運転全体の性質で判定できる
-- 読むのは trace の `ts_ms`・`state.operating_mode`・3 つの zone の `zones.<zone>.hardware.pwm_raw` /
+- 読むのは trace の `seq`・`ts_ms`・`state.operating_mode`・3 つの zone の `zones.<zone>.hardware.pwm_raw` /
   `write_ok` / `readback_ok`（`hardware` が無いことも含む）だけ（SQL の `json_extract` で取り出し、trace の全体を
   検証の型に通さない）と、同じ範囲の `fan.*.pwm` の ok の行。区間の割合の数え方は、上の tick ごとの規則と
   **同じ判定の関数**を使う（flag が false・`hardware` が無い tick は、PWM がたまたま合っていても不一致に数える）。
-  2 つの経路で判定を書き分けない保持期間（`control_trace_days` /
-  `raw_days` 30 日）が上限なので、1 区間で最大約 260 万 tick。手動で時々走らせる CLI として許容する
-- **trace が欠けていないと言える時刻の下限** `trace_complete_from_ms` を、`control_trace_prune`（0007 / 0010）の
-  `legacy_until_ms` と `pruned_before_ms`（`NULL` なら 0）の大きいほうとする。`legacy_until_ms` は 0007 の移行の前の
-  期間全体を「移行前の削除で欠けているかもしれない」と記録したもので、その範囲では `pruned_through_seq` が 0 の
-  ままでも trace が消えていないとは言えない。`pruned_before_ms` は保持期間の削除で消したことがある範囲
-- **区間の始まりを確かめられないとき**は、その区間のすべての時刻を `undetermined` にする。確かめられないとは、
-  区間の最も古い trace の時刻から `trace_max_age_ms` を引いた時刻が `trace_complete_from_ms` 以下のとき（その前に
-  同じ区間の trace が消えていたかもしれない）か、区間の始まりが生データ（`fan.*.pwm`）の保持期間の外にあるとき。
-  消えた前半の一致を推測しない
+  2 つの経路で判定を書き分けない。保持期間（`control_trace_days` / `raw_days` 30 日）が上限なので、1 区間で最大
+  約 260 万 tick。手動で時々走らせる CLI として許容する
+- **区間の始まりを確かめられるか**は、時刻ではなく `seq` の境目で決める。根拠は `control_trace_prune` の列:
+  - `legacy_through_seq`（0010）: 0007 が移行の前の行に `(ts_ms, tick_id)` の順で振った `seq` の上限。移行の前の
+    行が無ければ 0。0010 の注釈のとおり、`legacy_until_ms` は空の DB でも作った時刻（`:now_ms`）で書かれるので、
+    時刻では移行の前の行と今の行を見分けられない。`seq ≤ legacy_through_seq` の行だけが移行の前の行で、その前に
+    移行の前の削除で消えた行があったかは分からない
+  - `pruned_through_seq`（0007）: 保持期間の削除（`ts_ms < cutoff` の行）で消した行の `seq` の上限。消していなければ 0
+- 区間の最も小さい `seq` を `s0` とする。区間の始まりを**確かめられる**のは次のどちらかのとき:
+  1. `s0 - 1` の行が残っていて、`s0` の行との `ts_ms` の差が `trace_max_age_ms` を超える（残っている行で途切れを見た）
+  2. `s0 = 1` で、`legacy_through_seq = 0`（移行の前の行は無かった）
+- それ以外（`s0 - 1` の行が無い。`s0 - 1 ≤ pruned_through_seq` なら削除で消えた、`s0 ≤ legacy_through_seq` なら
+  移行の前の行）は、区間の前半が消えたかもしれないので、その区間のすべての時刻を `undetermined` にする。区間の
+  始まりが生データ（`fan.*.pwm`）の保持期間の外にあるときも同じ。消えた前半の一致を推測しない
+- `legacy_until_ms` に近い時刻に書かれたというだけでは、今の行を拒まない（新しい DB では 0010 が
+  `legacy_through_seq = 0` を記録し、最初の tick は `seq = 1` から始まるので 2 で確かめられる）
 
 **`bios` の前提**（引き継ぎの Max と BIOS を取り違えない）:
 
@@ -212,10 +225,11 @@ DB に残る記録で、これを直接に言える欄は無い（2026-10-16 の
   記録を消すだけで DB に書かない。引き継ぎの結果（`safety_handoff_completed` と zone ごとの `status`）は journal の
   ログにだけ出る。`control_admin_audit` は管理ソケットの指令だけで、`systemctl stop` を記録しない
 - そのため `bios` は次のどちらかのときだけにする:
-  1. fand がこの DB に**一度も書いていない**と示せる DB で、`t` が `legacy_until_ms` より後。示せるとは、
-     `control_traces` に**全期間で 1 行も無く**、`control_trace_prune` の `pruned_through_seq` が 0 で、
-     `pruned_before_ms` が `NULL` のときだけ。`legacy_until_ms` は 0007 で必ず書かれ（`NOT NULL`）、その前に trace が
-     無かったことを DB からは示せないので、`legacy_until_ms` 以前の `t` には使わない。
+  1. fand がこの DB に**一度も書いていない**と `seq` の境目で示せる DB。示せるとは、`control_traces` に**全期間で
+     1 行も無く**、`control_trace_prune` の `pruned_through_seq` が 0（消した行が無い）で、`legacy_through_seq` が 0
+     （0010 の時点で移行の前の行が無かった）のときだけ。さらに `t` が `legacy_until_ms` より後であること
+     （0007 より前の削除は記録が無いので、0007 を当てた時刻より前の期間には使わない。新しい DB では
+     `legacy_until_ms` は DB を作った時刻で、それより前の readings は無い）。
      **trace の無い区間は、fand が動かなかった証拠にしない。** 保持期間の削除で古い trace が消えると、消した範囲と
      残る最初の trace の間には trace が無いが、その前の運転が異常終了し 3 つの zone の引き継ぎがすべて失敗していれば、
      全速未満の回転数のまま fand の後の状態が続きうる。trace が 1 行でもある DB・削除の記録がある DB では 1 を使わず、
@@ -308,17 +322,19 @@ DB に残る記録で、これを直接に言える欄は無い（2026-10-16 の
 - 書き込みの確かめ（§2.6a）: PWM が合っていても `write_ok` か `readback_ok` が false の zone がある tick
   （`ENABLE_REVERTED` で `readback_ok = false` を含む）・`hardware` の無い tick は `undetermined`。区間の中で
   そうした tick が `pwm_mismatch_max_ratio` を超えると、合っている tick も含めて区間ごと `undetermined`
-- legacy の境目（§2.6a）: `legacy_until_ms` 以前の時刻は、trace が無く `pruned_through_seq` が 0 でも `bios` に
-  ならず（`bios_confirmed` の中なら `bios`）、区間の始まりが `legacy_until_ms` 以前の trace の区間は `undetermined`。
-  `pruned_before_ms` についても同じ
+- `seq` の境目（§2.6a）: 新しい DB（`legacy_through_seq = 0`）で最初の tick が `legacy_until_ms` から
+  `trace_max_age_ms` 以内に書かれても、`seq = 1` から続く区間は確かめられて `fand` になりうる。`seq ≤ legacy_through_seq`
+  の行から始まる区間・`s0 - 1 ≤ pruned_through_seq` で前の行が消えた区間は `undetermined`
+- 時計の戻り（§2.6a）: `seq` の順で `ts_ms` が戻る合成データで、区間が `seq` の順でたどられ（時刻の順に並べ替えない）、
+  戻った所で区間が切れない。評価時刻の窓に 2 つの区間の trace が入ると `undetermined`
 - `bios` の 1（§2.6a）: trace が 1 行でもある DB（`t` より後の trace だけでも）・`pruned_through_seq` が 0 でない DB・
-  `pruned_before_ms` がある DB では、trace の無い時刻で全 zone が全速未満でも `bios_confirmed` が無ければ
+  `legacy_through_seq` が 0 でない DB では、trace の無い時刻で全 zone が全速未満でも `bios_confirmed` が無ければ
   `undetermined`。保持期間で消した範囲と残る最初の trace の間の時刻も同じ
 - 区間の割合の数え方（§2.6a）: flag が false の tick で PWM がたまたま観測と合う合成データで、その tick が区間の
   割合の不一致に数えられ、tick ごとの判定と区間の判定が同じ関数の結果になる
 - 区間の全体（§2.6a）: `--start` より前から続く trace の区間で、前半の PWM が外れ `--start` 以後だけが合う合成データを
-  `undetermined` にする（`--start` を区間の途中のどこに置いても判定が変わらない）。区間の始まりが最も古い trace で
-  `pruned_through_seq` が 0 でない DB では、その区間を `undetermined` にする。`--end` の後に外れが続く場合も同じ
+  `undetermined` にする（`--start` を区間の途中のどこに置いても判定が変わらない）。区間の最初の行の前の `seq` が
+  削除で消えた DB では、その区間を `undetermined` にする。`--end` の後に外れが続く場合も同じ
 - 区間の始めの境目（§2.3）: `--start` の `settle_ms` 前に負荷が変わったデータで、`--start` 直後の評価時刻が
   `transition` になる（さかのぼった区間の時刻は件数に入らない）。`--start` より前に行が無いデータでは、区間の
   最初から `settle_ms` が `transition` になり、`start_lookback_incomplete: true` が出る。`--start` の
