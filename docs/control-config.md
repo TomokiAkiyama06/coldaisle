@@ -219,6 +219,11 @@ supervisor:
 - YAML の引用符の無い `off` は偽として読まれるが、`stage` では `off` と読む（`on` / `yes` は拒否する）
 - trace は `ControlTick` v16 の `workload_hint`（形は `control/schema.py` の `WorkloadHintRecord`）。
   `stage: off` でも毎 tick 載る
+- B0 の trace の `skipped` に出るのは `hint_state_unreadable` / `run_start_not_durable` / `certification_mismatch` /
+  `supervisor_unavailable` / `rule_policy_not_active` だけ。`rule_policy_not_active` は設定の `active_policy` が
+  `rule_policy` でない構成の tick で、RL の提案が無く RulePolicy へ fallback した tick も含む（ヒントを効かせうるのは
+  active slot の RulePolicy だけ。0133 §2.2）。`would_override` は判定しない。0133 §2.8 の表に無い値で、
+  PR #332 のレビューで足した
 
 **移行手順**: v11 を v12 として補完しない（読み込み時に拒否する）。
 
