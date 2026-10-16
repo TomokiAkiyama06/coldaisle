@@ -227,8 +227,22 @@ Rear の計算に使う `q_top(R)` を Top の各回で補間なしに直接得�
 
 1. **生の記録**は今までどおり DB（telemetry と `control_traces`）にある。測定の区間と段は run の manifest（§2.7）に書き、
    `var/airflow-characterization/` に置く（`var/` は git の管理外）
-2. **解析**は読み取りだけの道具（実装は別の PR）が manifest と DB（`immutable=1`）を読み、zone ごとの RPM・`airflow_index`・EFU の点・
-   応答の行列・再現性を JSON と Markdown の 1 ファイルに書く。設定を書かない。control・AI 層・API から import しない
+2. **解析の入力は本番の DB そのものではなく、checkpoint された 1 ファイルの写し**にする。取り込み・`coldaisle-telemetry`・fand が書いている
+   最中の DB を `immutable=1` で開くと、checkpoint されていない WAL の内容を黙って無視し、直前の測定を含まない古い断面を読みうる
+   （`EvidenceDatabase` は空でない `-wal` / `-journal` があれば拒む。`src/coldaisle/evaluate.py`）。書き手は止めない
+   - 写しは、既存の手順（`docs/ubuntu-deploy.md` の移行の手順 2）と同じ SQLite のオンラインバックアップ `sqlite3 <本番の DB> ".backup <写し>"`
+     で作り、`PRAGMA integrity_check;` が `ok` であることを確かめる。`.backup` は書き手と読み手が動いたままでも整合した 1 ファイルを作り、
+     `-wal` / `-shm` を伴わない
+   - **権限**: 本番の DB のディレクトリは `2770`・グループ `coldaisle` で、運用者の uid からは読めない（0080 §2.1）。写しは所有者の許可を得て
+     root で作り（`sudo`。0121 の試験の書き出しと同じ流儀）、運用者の作業ディレクトリ（`var/airflow-characterization/`）へ置いて運用者の
+     所有・`0600` にする。運用者を `coldaisle` グループに入れて読ませる方法は取らない（書き込みの権限まで渡すため）
+   - 写しは、回（セッション）の終了の時刻より後に作る。解析は、写しの中の telemetry と `control_traces` の最後の時刻が manifest の
+     終了の時刻以上であること（区間を覆うこと）を確かめ、覆わなければ拒否する
+   - manifest は写しに結びつける: 写しの SHA-256・作った時刻（ms）・元の DB に対する相対の名前（絶対パスは書かない）を manifest に追記する。
+     解析は写しの SHA-256 を計算し直して照合し、違えば拒否する。写しを作り直したら manifest も更新する
+   - 解析は読み取りだけの道具（実装は別の PR）が manifest と写し（`EvidenceDatabase` と同じ `immutable=1` と添えファイルの検査）を読み、
+     zone ごとの RPM・`airflow_index`・EFU の点・応答の行列・再現性を JSON と Markdown の 1 ファイルに書く。設定・DB を書かない。
+     control・AI 層・API から import しない
 3. **報告**は #75 の成果物 `docs/airflow-characterization-YYYY-MM-DD.md` に値を残す（個体識別子・ホスト名・絶対パスを書かない。ルール 10）
 4. **承認**は値ごとに新しい決定記録で所有者が行う（0120 と同じ流儀）。承認の前に設定を変えない
    - `fan-hardware.yaml`（導入先の `/etc/coldaisle/control-config/`。リポジトリに置かない）: 各 zone の `profile.pwm_to_rpm` と
@@ -251,6 +265,7 @@ Rear の計算に使う `q_top(R)` を Top の各回で補間なしに直接得�
 - `schema_version`・`run_id`（#83 の `source_run_id` にそのまま使える形）・`kind`（`rpm_sweep` / `thermal_efu` / `response_matrix` / `null_balance`）
 - 使った Control Config の 4 ファイルの SHA-256（trace の `runtime.config` と突き合わせ、違えば解析が拒否する）
 - 較正の digest（区間の開始の時点で有効な `calibration_activations` の行の `offsets_sha256`。0096 / 0099）
+- 解析に使う DB の写しの SHA-256・作った時刻（§2.6 の 2）
 - 負荷の定義（GPU の電力の上限・CPU の worker の数）と予備の試行の結果
 - 段ごとの指示の値（3 zone）・lease・開始と終了の時刻（ms）・捨てた理由（`floor_bound` / `unsettled` / `aborted` / `safety_fault` / `room_drift` / `baseline_drift` / `calibration_changed`）
 
@@ -289,7 +304,7 @@ manifest に残すことだけを決める。
 - **合成の筐体**: 3 zone の真の EFU の曲線を与えた単純な熱の模型（熱源・漏れ・1 点のセンサーの偏りを含む）から、§2.3〜§2.5 の手順どおりの
   時系列を作り、解析が曲線を許容の範囲で取り戻すこと。漏れの量を変えて `q_rear` の偏りの向きが仕様どおりであること
 - floor に縛られた段（trace の `effective` ≠ manual の値）・未収束・`air.room` のずれ・B と B' のずれ・Control Config の hash の不一致・
-  区間の中の較正の有効化と digest の不一致を、
+  区間の中の較正の有効化と digest の不一致・DB の写しの SHA-256 の不一致・空でない `-wal` の添えファイル・写しが区間を覆わないことを、
   manifest と trace の fixture で正しく外す・拒否すること
 - 出した点が `FanProfile`（単調・`maximum_rpm`・点の数）と `ZoneFlowCurve`（端点・単調）の検証をそのまま通り、`calibrated` に
   書き換えた写しで `ConfiguredAirBalanceModel` が作れること（テストの中だけ）
