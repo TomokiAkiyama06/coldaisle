@@ -39,6 +39,7 @@ import yaml
 from pydantic import ValidationError
 
 from coldaisle.clock import SystemMonotonicClock
+from coldaisle.control.config import FanHardwareConfig
 from coldaisle.control.fallback.gate import ControllerGate, LearnedControlStatus
 from coldaisle.control.hardware.simulated import SimulatedFaultPlan
 from coldaisle.control.learned_handoff import (
@@ -66,7 +67,7 @@ from coldaisle.local_socket import SocketStartupError, prepare_path
 from coldaisle.metrics import MetricCatalog
 from conftest import CONFIG_DIR
 from test_control_config import valid_documents, write_documents
-from test_control_loop import METRICS_PATH, Harness, control_config
+from test_control_loop import METRICS_PATH, Harness, control_config, manual
 from test_fallback_controller import assessment_for, learned_proposal
 from test_simulated_fan_backend import hardware_config
 
@@ -912,6 +913,86 @@ def test_an_unconfirmed_zone_is_missing_not_filled(catalog) -> None:
     assert result.tick.zones.top.demand.effective is not None
     assert frame.applied.top is None
     assert frame.applied.front == result.hardware.front.applied_demand is not None
+
+
+def test_a_readback_mismatch_zone_is_missing_not_filled(catalog) -> None:
+    """0092 §2.2: 書けても読み戻しが合わない zone は欠測。他の zone は渡す。"""
+    sink = RecordingSink()
+    harness = Harness(
+        catalog,
+        learned_source=StaticSource(),
+        learned_health=sink,
+        learned_sink=sink,
+        fault_plan=SimulatedFaultPlan(readback_mismatch=frozenset({Zone.TOP})),
+    )
+    result = harness.tick()
+    frame = sink.frames[-1]
+    assert result.hardware is not None
+    assert result.hardware.top.readback.write_ok and not result.hardware.top.readback.readback_ok
+    assert result.tick.zones.top.demand.effective is not None
+    assert frame.applied.top is None
+    for zone in (Zone.FRONT, Zone.REAR):
+        assert frame.applied.get(zone) == result.hardware.get(zone).applied_demand is not None
+
+
+def test_applied_carries_the_minimum_stable_raise_not_the_effective_demand(catalog) -> None:
+    """0092 §1: effective が `minimum_stable_demand` を下回る tick は、引き上げた値が効いた値。
+
+    backend を差し替えず、本物の simulated backend の写像（`map_demand`）を通す。Safety の
+    最低 demand（試験用設定で 0.4）より高い `minimum_stable_demand` を持つ profile にし、
+    MANUAL で下げて effective を最低安定の値の下へ落とす。
+    """
+    base = control_config()
+    document = base.fan_hardware.model_dump(mode="json")
+    for zone_document in document["zones"].values():
+        zone_document["profile"]["minimum_stable_demand"] = 0.5
+    config = base.model_copy(update={"fan_hardware": FanHardwareConfig.model_validate(document)})
+    sink = RecordingSink()
+    harness = Harness(
+        catalog,
+        config=config,
+        learned_source=StaticSource(),
+        learned_health=sink,
+        learned_sink=sink,
+    )
+    harness.settle()
+    harness.mode.command = manual(0.1, 0.1, 0.1)
+    raised = None
+    for _ in range(10):
+        result = harness.tick()
+        if result.tick.zones.front.demand.effective < 0.5:
+            raised = result
+            break
+    assert raised is not None, "effective が minimum_stable_demand の下へ落ちなかった"
+    frame = sink.frames[-1]
+    assert raised.hardware.front.applied_demand == 0.5
+    assert frame.applied.front == 0.5
+    assert frame.applied.front != raised.tick.zones.front.demand.effective
+    for zone in Zone:
+        assert frame.applied.get(zone) == raised.hardware.get(zone).applied_demand
+
+
+def test_the_startup_tick_carries_the_startup_mapping(catalog) -> None:
+    """0092 §1: 未起動の zone の最初の書き込みは `startup_demand` の写像を掛けた値。
+
+    本物の simulated backend を通す。takeover の間 backend は全 zone forced Max しか受けない
+    （0028 §2.7）ため、起動時の effective は 1.0 で、写像の結果はその値に一致する。ここでは
+    frame の値が effective ではなく、未起動の写像（`max(stable, startup_demand)`）を経た
+    backend の結果から来ることを確かめる。
+    """
+    sink = RecordingSink()
+    harness = Harness(
+        catalog, learned_source=StaticSource(), learned_health=sink, learned_sink=sink
+    )
+    result = harness.tick()
+    assert result.tick.state.safety_state is SafetyState.STARTUP
+    frame = sink.frames[-1]
+    for zone in Zone:
+        profile = harness.config.fan_hardware.zones.get(zone).profile
+        effective = result.tick.zones.get(zone).demand.effective
+        expected = max(profile.stable_demand(effective), profile.startup_demand)
+        assert result.hardware.get(zone).applied_demand == expected
+        assert frame.applied.get(zone) == expected
 
 
 def test_a_tick_without_hardware_results_sends_every_zone_as_missing(catalog) -> None:

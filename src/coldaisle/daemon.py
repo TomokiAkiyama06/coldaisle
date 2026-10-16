@@ -927,10 +927,15 @@ def _explainer_factory(
     catalog = MetricCatalog.from_yaml(config.metrics)
     rule_set = RuleSet.from_yaml(config.rules)
 
+    # Provider は1つだけ作り、説明器を作り直しても共有する
+    # （1 日の呼び出しの上限を数え直さない。0143 §2.5）
+    provider = provider_from_env(settings)
+
     def build() -> Explainer:
         store = SqliteStore(config.db, rules=quality_rules, clock=clock)
         return Explainer(
-            provider=provider_from_env(settings),
+            provider=provider,
+            context=settings.explain_context,
             # 説明の Evidence（get_latest / get_stats）もツールを通る。除外を当てる（0131 §2.4a）
             tools=ToolRegistry(
                 store=store, catalog=catalog, rules=rule_set, clock=clock, exclusions=exclusions
