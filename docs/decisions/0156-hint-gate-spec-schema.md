@@ -236,19 +236,21 @@ supervisor:
 
 ---
 
-## 5. 未決事項（所有者の判断を求める点。推奨を先頭に）
+## 5. 判断点（決定済み。推奨を先頭に）
 
-| # | 判断点 | 選択肢（推奨を先頭） |
-|---|---|---|
-| 1 | 数値の軸の書き方（§2.3） | **(a 推奨) 昇順の `points` の列。範囲は先頭と末尾** / (b) `{min, max, step}`（端と丸めの規則が要る） |
-| 2 | baseline の代表集合（§2.5） | **(a 推奨) 設定に `{front, rear, top}` の組の列で書く。領域は外接箱** / (b) 格子の状態ごとに Fallback の曲線から導く（実行時に近いが、ゲートの仕様が Fallback の設定に依り、ランナーが snapshot を合成する） |
-| 3 | `monotonicity_gate` / `safety.yaml` の `workload_hint` の不正の扱い（§2.6） | **(a 推奨) 形の誤り（未知の鍵・型・欄の欠落）は Control Config の不正、値の制約（有限・非負・大小・点の数）は `hint_gate_invalid` / `eps_bounds_invalid` で B0** / (b) どちらも B0（他の欄と扱いが割れる）/ (c) どちらも Control Config の不正（0066 §2.1 (b) の「無効のまま起動」と合わない） |
-| 4 | `provisional` の `eps` / 上限で Stage B に進めるか（§2.6） | **(a 推奨) 仕様は `provisional` でも導く。B1 は進める。B2 で `confirmed` を要るかは B2 の記録で決める** / (b) B1 から `confirmed` を要る（実測の前に B1 の測定を始められない） |
-| 5 | window feature の形（§2.4） | **(a 推奨) 平らな window（全 frame 同じ値）。温度は基準の `upper_c` からの差、他は絶対値。artifact の使う metric はすべて軸を持つ** / (b) 値に加えて傾きの軸も持つ（点の数が増える）/ (c) 記録済みの代表 window（設定から導けない） |
-| 6 | 点の数の上限 | **(a 推奨) 設定に置かない。ランナーが点の数をログに出す** / (b) `monotonicity_gate.max_grid_points` を置き、超えたら `hint_gate_invalid`（大きすぎる格子の打ち間違いを止める） |
-| 7 | `max_eps_c` の天井の置き場所（§2.6） | **(a 推奨) `safety.yaml` の `max_eps_c_ceiling` の値（`ConfigValue`）。コードは有限・非負と大小だけを見る** / (b) コードのスキーマの定数（0066 の「コードに定数を置かない」と合わない） |
-| 8 | 証明書の metadata の2欄（§2.8） | **(a 推奨) ここで `hint-gate-spec-v1` / `hint-certificate-v1` に固定する** / (b) 段 3（fand の照合）で `ModelCompatibility` と一緒に決める |
-| 9 | `safety_floors` に `zone_min_demand` を含めることを強制するか（§2.5） | **(a 推奨) 強制しない（推奨として文書に書く。含めなければ領域の外で B0 と同じ）** / (b) 強制する（ゲートの仕様の関数が `safety.yaml` の `zone_min_demand` を読むことになり、0152 §2.3 の入力が増える） |
+**所有者の決定（2026-10-16）**: 1〜9 のすべてを推奨の案（いずれも (a)）で決めた。§2 の本文はその決定を書いたものである。
+
+| # | 判断点 | 選択肢（推奨を先頭） | 決定 |
+|---|---|---|---|
+| 1 | 数値の軸の書き方（§2.3） | **(a 推奨) 昇順の `points` の列。範囲は先頭と末尾** / (b) `{min, max, step}`（端と丸めの規則が要る） | 決定済み（所有者、2026-10-16）: (a) |
+| 2 | baseline の代表集合（§2.5） | **(a 推奨) 設定に `{front, rear, top}` の組の列で書く。領域は外接箱** / (b) 格子の状態ごとに Fallback の曲線から導く（実行時に近いが、ゲートの仕様が Fallback の設定に依り、ランナーが snapshot を合成する） | 決定済み（所有者、2026-10-16）: (a) |
+| 3 | `monotonicity_gate` / `safety.yaml` の `workload_hint` の不正の扱い（§2.6） | **(a 推奨) 形の誤り（未知の鍵・型・欄の欠落）は Control Config の不正、値の制約（有限・非負・大小・点の数）は `hint_gate_invalid` / `eps_bounds_invalid` で B0** / (b) どちらも B0（他の欄と扱いが割れる）/ (c) どちらも Control Config の不正（0066 §2.1 (b) の「無効のまま起動」と合わない） | 決定済み（所有者、2026-10-16）: (a) |
+| 4 | `provisional` の `eps` / 上限で Stage B に進めるか（§2.6） | **(a 推奨) 仕様は `provisional` でも導く。B1 は進める。B2 で `confirmed` を要るかは B2 の記録で決める** / (b) B1 から `confirmed` を要る（実測の前に B1 の測定を始められない） | 決定済み（所有者、2026-10-16）: (a) |
+| 5 | window feature の形（§2.4） | **(a 推奨) 平らな window（全 frame 同じ値）。温度は基準の `upper_c` からの差、他は絶対値。artifact の使う metric はすべて軸を持つ** / (b) 値に加えて傾きの軸も持つ（点の数が増える）/ (c) 記録済みの代表 window（設定から導けない） | 決定済み（所有者、2026-10-16）: (a) |
+| 6 | 点の数の上限 | **(a 推奨) 設定に置かない。ランナーが点の数をログに出す** / (b) `monotonicity_gate.max_grid_points` を置き、超えたら `hint_gate_invalid`（大きすぎる格子の打ち間違いを止める） | 決定済み（所有者、2026-10-16）: (a) |
+| 7 | `max_eps_c` の天井の置き場所（§2.6） | **(a 推奨) `safety.yaml` の `max_eps_c_ceiling` の値（`ConfigValue`）。コードは有限・非負と大小だけを見る** / (b) コードのスキーマの定数（0066 の「コードに定数を置かない」と合わない） | 決定済み（所有者、2026-10-16）: (a) |
+| 8 | 証明書の metadata の2欄（§2.8） | **(a 推奨) ここで `hint-gate-spec-v1` / `hint-certificate-v1` に固定する** / (b) 段 3（fand の照合）で `ModelCompatibility` と一緒に決める | 決定済み（所有者、2026-10-16）: (a) |
+| 9 | `safety_floors` に `zone_min_demand` を含めることを強制するか（§2.5） | **(a 推奨) 強制しない（推奨として文書に書く。含めなければ領域の外で B0 と同じ）** / (b) 強制する（ゲートの仕様の関数が `safety.yaml` の `zone_min_demand` を読むことになり、0152 §2.3 の入力が増える） | 決定済み（所有者、2026-10-16）: (a) |
 
 値そのもの（各 `points`・`eps` / `eps_c`・`max_eps` / `max_eps_c` / 天井）は 0066 §5 の 1 のとおり Stage A の実測で
 決める。この記録では決めない。
