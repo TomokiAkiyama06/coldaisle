@@ -301,11 +301,21 @@ coldaisle-authority raise          → authority を1段   （承認者の uid�
 
 `tmp_path` と、既存の `tests/test_training_entry.py` の合成の dataset の作り方を使う。`@pytest.mark.hardware` は付けない。
 
-- 2回走らせて `artifact.json` の bytes が一致する（golden ではなく自己一致。係数の値は固定しない）
-- `--apply` 無しでは Registry のディレクトリを作らず、ファイルが1つも増えない
-- `--apply` で candidate になり、production pointer と revision 以外の記録が変わらない。同じ版の2回目は終了コード 1
+**Registry の状態の検査は、変わったものと変わらなかったものの両方を言う。** 下の「Registry が変わらない」は、`registry.json` の
+bytes が前と同じで、`artifacts/` の下にファイルが増えていないことをいう。「candidate が1つ足される」は、`register_candidate` の
+約束（`src/coldaisle/control/model_registry.py` の `register_candidate` と `_append_event`）どおり、前の snapshot と比べて
+(1) `revision` がちょうど 1 増え、(2) `artifacts` に新しい key が1つだけ足されて状態が `candidate`・metadata が `metadata.json`
+と同じで、(3) `audit` の末尾に `REGISTERED` の event が1つだけ足され（`revision`・`artifact`・`actor`・`reason` が一致）、
+(4) **`production` の pointer と、それまでの `artifacts` の各記録と `audit` の各 event はすべて前と同じ**であることをいう
+（足されたもの以外が1つでも変われば失敗にする）。
+
+- 2回走らせて `artifact.json` と `metadata.json` の bytes が一致する（golden ではなく自己一致。係数の値は固定しない）。
+  `metadata.json` の `sha256` が `artifact.json` の SHA-256 と一致すること。`--created-at` だけを変えると bytes が変わること
+  （壁時計を読んでいない・引数が効いていることの確認）
+- `--apply` 無しでは、既にある Registry が変わらず、無い `--registry-root` を作らないこと
+- `--apply` で candidate が1つ足されること（上の (1)〜(4)）。同じ版の2回目は終了コード 1 で、Registry が変わらないこと
 - 拒否: 公開物の改ざん・`--replay-path` の取り違え・期間の後の較正の記録・`--calibration` の取り違え・`--out` が既にある・
-  `support_axes` に `fan.<zone>` が欠ける。どれも `--out` が作られない
+  `support_axes` に `fan.<zone>` が欠ける。どれも終了コード 1 で `--out` が作られず、`--apply` を付けていても Registry が変わらないこと
 - 公開の手順: 手順 3〜5 の途中で例外を起こす（`os.link` を `EEXIST` 以外で失敗させるのを含む）と、後始末が成功して `--out` が
   無いこと。手順 4 の印の一時名を書いて fsync するまでの間に `COMPLETE.json` が名前として存在しないこと（確かめる関数を
   その時点で呼ぶと「印が無い」で拒むこと）。手順 5 の前に他の process の役で `COMPLETE.json` を置いておくと、link が `EEXIST` で失敗して置き換えず、書き手の既知の名前
@@ -317,18 +327,23 @@ coldaisle-authority raise          → authority を1段   （承認者の uid�
   印の一時名だけがある `--out` も未完成として拒むこと。強制終了の模擬（手順 3 または 4 の後で止めて片づけを走らせない）の後の
   再実行が、`--out` があることと印が無効なことを出して拒むこと
 - 公開の後の失敗（手順 6 の一時名の unlink、または `os.fsync` を `--out` か親の fd でだけ失敗させる）: `--apply` 無しでも終了コード 1・段
-  `publish_durability`・`--out` が3ファイルと有効な印つきで残ること。`--apply` なら Registry へ進まないこと
+  `publish_durability`・`--out` が3ファイルと有効な印つきで残ること。`--apply` なら Registry が変わらないこと（登録へ進まない）
 - 登録の `RegistryDurabilityError` の2つの意味: snapshot の置き換えの後で起こしたとき（ディレクトリの fsync を失敗させる）は
-  candidate が見えていて、登録の後の検査へ進み、段 `register_durability` で終了コード 1。artifact ファイルの段で起こしたときは
-  Registry が変わらず、段 `register` で終了コード 1
-- 公開の後の失敗: 登録の失敗・登録の後の検査の失敗で終了コード 1、`--out` が残り、ログに段が出ること（§2.4 の表）
-- `--apply` で `--registry-limits` が無いと引数の段で拒否され、何も書かないこと
+  candidate が1つ足されていて（上の (1)〜(4)）、登録の後の検査へ進み、段 `register_durability` で終了コード 1。artifact ファイルの
+  段で起こしたときは Registry が変わらず（参照されない artifact も残らない）、段 `register` で終了コード 1
+- 公開の後の失敗: 登録の失敗では終了コード 1・段 `register`・`--out` が残り Registry が変わらないこと。登録の後の検査の失敗では
+  終了コード 1・段 `post_register_check`・`--out` が残り、candidate が1つ足されたまま（上の (1)〜(4)）で、CLI が `retire` しない
+  （`RETIRED` の event が足されない）こと
+- `--apply` で `--registry-limits` が無い・不正だと、学習を始める前に終了コード 1 で拒否され、`--out` が作られず Registry が
+  変わらないこと
 - import の走査: `train` を import する module が無いこと、`train` が §2.1 の禁止の module を import しないこと。
   `training_output` を import するのが `train` と `registry` だけで、`training_output` が coldaisle の他の module を import しないこと
 - `coldaisle-registry register --training-output`: 有効な印の `--out` から candidate を登録できること。印が無い・書きかけ・
-  SHA-256 がずれた `--out` では終了コード 1 で Registry が変わらないこと。`--metadata` / `--payload` と同時に渡すと拒否すること。
-  確かめた後に `artifact.json` を差し替えても、登録されるのは確かめた bytes であること
-- 作った artifact が `check_artifact_contents` を通り、`--apply` の後に `from_verified_artifact`（L1〜L12）を通ること（§2.4 の 7）
+  SHA-256 がずれた `--out` では終了コード 1 で Registry が変わらないこと。`--metadata` / `--payload` と同時に渡すと拒否し、
+  Registry が変わらないこと。成功したときは candidate が1つ足され（上の (1)〜(4)）、`--out` の中身が変わらないこと。確かめた後に
+  `artifact.json` を差し替えても、登録された artifact の bytes が確かめた bytes であること（差し替えた bytes ではないこと）
+- 作った artifact が `check_artifact_contents` を通り、`--apply` の後に `from_verified_artifact`（L1〜L12）を通ること（§2.4 の 7）。
+  逆向きも確かめる: `check_artifact_contents` が通らない artifact（たとえば別の較正の値を渡す）では `--out` が作られないこと
 
 ### 2.10 実装の段階
 
