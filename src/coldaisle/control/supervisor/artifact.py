@@ -37,7 +37,6 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 from coldaisle.control.config import FanPolicyConfig, SafetyConfig, SupervisorOutputBounds
 from coldaisle.control.model.thermal import canonical_json_bytes, canonical_sha256
 from coldaisle.control.model_registry import (
-    MODEL_REGISTRY_SCHEMA_VERSION,
     ArtifactCapability,
     ArtifactKind,
     ArtifactRef,
@@ -320,7 +319,13 @@ class SupervisorPolicyArtifact(_Frozen):
 class SupervisorPolicyRegistryMetadata(_Frozen):
     """#104 `ArtifactMetadata` へ1対1で写せる値。**artifact bytes から導く。**"""
 
-    schema_version: Literal[3] = MODEL_REGISTRY_SCHEMA_VERSION
+    schema_version: Literal[3] = 3
+    """#104 `ArtifactMetadata` の版。**v3 のまま書き、v3 だけを照合する。**
+
+    registry の v4（#288 / 決定記録 0152 §2.2）は `hint_certificate` の kind と能力を足しただけで、
+    supervisor_policy の欄は何も変わっていない。v4 へ上げると、登録済みの v3 の policy が
+    `registry_metadata_mismatches` の `schema_version` で束縛できなくなるため上げない。
+    """
     kind: Literal["supervisor_policy"] = "supervisor_policy"
     artifact_format: Literal["json"] = "json"
     capability: Literal[ArtifactCapability.SUPERVISOR_STRATEGY] = (

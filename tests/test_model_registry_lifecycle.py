@@ -228,7 +228,7 @@ def test_feature_schema_mismatch_names_the_kind_that_must_fall_back(tmp_path: Pa
     assert report.trace_metadata()["model_registry_health"] == {
         "health": "unusable",
         "registry_revision": report.revision,
-        "supported_schema_version": 3,
+        "supported_schema_version": 4,
         "productions": [
             {
                 "artifact_kind": "thermal_model",
@@ -408,7 +408,7 @@ def test_an_existing_v2_registry_keeps_its_production_artifact_and_upgrades_on_w
 
     register_and_validate(registry, "2.0.0")
     upgraded = json.loads(snapshot_path.read_text(encoding="utf-8"))
-    assert upgraded["schema_version"] == 3
+    assert upgraded["schema_version"] == 4
     after = make_registry(root).load_production(ArtifactKind.THERMAL_MODEL, COMPATIBILITY)
     assert after.status is ArtifactLoadStatus.LOADED
     assert after.artifact is not None and loaded.artifact is not None
@@ -416,12 +416,12 @@ def test_an_existing_v2_registry_keeps_its_production_artifact_and_upgrades_on_w
 
 
 def test_an_unknown_registry_schema_version_still_fails_closed(tmp_path: Path) -> None:
-    """読める版は 2 と 3 だけ。それ以外を補って読まない。"""
+    """読める版は 2・3・4 だけ。それ以外を補って読まない。"""
     root = tmp_path / "registry"
     production_registry(root)
     snapshot_path = root / "registry.json"
     stored = json.loads(snapshot_path.read_text(encoding="utf-8"))
-    stored["schema_version"] = 4
+    stored["schema_version"] = 5
     write_json(snapshot_path, stored)
     assert (
         make_registry(root).load_production(ArtifactKind.THERMAL_MODEL, COMPATIBILITY).status
@@ -520,7 +520,7 @@ def test_cli_status_is_read_only_and_does_not_create_the_registry(
     missing = tmp_path / "absent"
     assert cli.main(["status", *base_args(missing)]) == cli.EXIT_OK
     assert stdout_json(capsys) == {
-        "schema_version": 3,
+        "schema_version": 4,
         "revision": 0,
         "production": {},
         "artifacts": [],
