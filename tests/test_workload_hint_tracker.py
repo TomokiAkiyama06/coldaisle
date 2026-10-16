@@ -525,3 +525,15 @@ def test_a_break_in_the_regime_while_unreadable_still_restarts_the_hold():
     r.advance(1)
     r.publish(observation)
     assert r.step(regime=WorkloadRegime.IDLE).status is WorkloadHintStatus.ACTIVE
+
+
+def test_rl_active_configuration_records_rule_policy_not_active():
+    """active slot が RulePolicy でなければ would_override を残さない（0133 §2.2）。"""
+    r = rig()
+    r.publish(active(r))
+    tick = r.step()
+    record = r.tracker.record(
+        tick, supervisor_available=True, would_override=True, rule_policy_active=False
+    )
+    assert record.influence is WorkloadHintInfluence.NONE
+    assert record.skipped is HintPriorSkipped.RULE_POLICY_NOT_ACTIVE

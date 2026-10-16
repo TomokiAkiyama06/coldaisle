@@ -261,9 +261,19 @@ class WorkloadHintTracker:
             return self._lost(HintPriorSkipped.HINT_STATE_UNREADABLE)
 
     def record(
-        self, tick: HintTick, *, supervisor_available: bool, would_override: bool
+        self,
+        tick: HintTick,
+        *,
+        supervisor_available: bool,
+        would_override: bool,
+        rule_policy_active: bool = True,
     ) -> WorkloadHintRecord:
-        """trace の塊（0133 §2.9）。``would_override`` は RulePolicy が判定した値。"""
+        """trace の塊（0133 §2.9）。``would_override`` は RulePolicy が判定した値。
+
+        ``rule_policy_active`` は設定の active slot が RulePolicy か。そうでなければヒントを
+        効かせうる経路が無い（RL の fallback の Rule は対象外。0133 §2.2）ので
+        ``rule_policy_not_active`` とし、``would_override`` を残さない。
+        """
         if tick.stage is WorkloadHintStage.OFF:
             return WorkloadHintRecord.off()
         if tick.lost is not None:
@@ -276,6 +286,8 @@ class WorkloadHintTracker:
         if tick.hint is not None:
             if not supervisor_available:
                 skipped = HintPriorSkipped.SUPERVISOR_UNAVAILABLE
+            elif not rule_policy_active:
+                skipped = HintPriorSkipped.RULE_POLICY_NOT_ACTIVE
             else:
                 if would_override:
                     influence = WorkloadHintInfluence.WOULD_OVERRIDE

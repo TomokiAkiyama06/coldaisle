@@ -98,8 +98,10 @@ def training_hint(clock: SimulatedClock) -> HintObservation:
     )
 
 
-def harness(catalog, *, with_hint: bool, alive: bool = True) -> tuple[Harness, list[FakeMailbox]]:
-    config = control_config(policy=hint_policy())
+def harness(
+    catalog, *, with_hint: bool, alive: bool = True, policy: dict[str, Any] | None = None
+) -> tuple[Harness, list[FakeMailbox]]:
+    config = control_config(policy=policy or hint_policy())
     mailboxes: list[FakeMailbox] = []
 
     def factory(clock: SimulatedClock, monotonic: ManualMonotonicClock) -> WorkloadHintTracker:
@@ -397,3 +399,31 @@ def test_a_slow_reader_does_not_delay_startup_or_the_first_tick(tmp_path, monkey
     finally:
         release.set()
         daemon.close()
+
+
+def test_rule_fallback_under_an_rl_active_config_does_not_record_would_override(catalog):
+    """active が RLPolicy の構成で Rule へ fallback した tick は対象外（0133 §2.2。PR #332）。"""
+    from coldaisle.control.schema import HintPriorSkipped, SupervisorPolicyKind
+
+    policy = hint_policy()
+    policy["supervisor"]["active_policy"] = "rl_policy"  # type: ignore[index]
+    policy["supervisor"]["shadow_policy"] = None  # type: ignore[index]
+    h, _ = harness(catalog, with_hint=True, policy=policy)
+    ticks = [result.tick for result in h.run(12)]
+    keyed = [
+        tick
+        for tick in ticks
+        if tick.state.workload_regime is not None
+        and tick.state.workload_regime.value in KEYED_REGIMES
+    ]
+    assert keyed
+    for tick in keyed:
+        assert tick.supervisor is not None
+        selected = tick.supervisor.selected_output
+        # RL の提案は無いので Rule の fallback が選ばれている（試験の前提）
+        assert selected is not None and selected.policy is SupervisorPolicyKind.RULE
+        record = tick.workload_hint
+        assert record is not None
+        assert record.status is WorkloadHintStatus.ACTIVE
+        assert record.influence is WorkloadHintInfluence.NONE
+        assert record.skipped is HintPriorSkipped.RULE_POLICY_NOT_ACTIVE

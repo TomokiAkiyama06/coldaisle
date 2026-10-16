@@ -288,12 +288,21 @@ class SupervisorCoordinator:
             config.rule_policy, clock, hint_overrides=config.workload_hint.overrides
         )
 
+    @property
+    def rule_policy_active(self) -> bool:
+        """設定の active slot が RulePolicy か（ヒントを読めるのはこの構成だけ。0133 §2.2）。"""
+        return self._config.active_policy is SupervisorPolicyKind.RULE
+
     def would_override(self, policy_input: SupervisorInput, decision: SupervisorDecision) -> bool:
         """ヒントを効かせていたら、選ばれた RulePolicy の context が変わったか（0133 §2.6 / §2.9）。
 
-        **出力は変えない**（B0）。読むのは RulePolicy だけで、選ばれた出力が RLPolicy の tick は
-        常に False（0133 §2.2）。比べるのは strategy / weights / target_band の組。
+        **出力は変えない**（B0）。読むのは**設定の active slot の** RulePolicy だけ（0133 §2.2）。
+        active が RLPolicy の構成では、RL の提案が無く Rule へ fallback した tick も False
+        （fallback はヒントを効かせうる経路ではない）。比べるのは strategy / weights /
+        target_band の組。
         """
+        if not self.rule_policy_active:
+            return False
         selected = decision.selected_output
         if selected is None or selected.policy is not SupervisorPolicyKind.RULE:
             return False

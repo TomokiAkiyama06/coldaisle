@@ -2296,7 +2296,7 @@ class HintPriorSkipped(StrEnum):
 
     閉じた語彙。B1 / B2 の値も先に置く（版を上げずに B1 の記録を足せるように）が、
     **B0 の実装が出すのは** ``hint_state_unreadable`` / ``run_start_not_durable`` /
-    ``certification_mismatch`` / ``supervisor_unavailable`` だけ。
+    ``certification_mismatch`` / ``supervisor_unavailable`` / ``rule_policy_not_active`` だけ。
     """
 
     MPC_UNAVAILABLE = "mpc_unavailable"
@@ -2313,6 +2313,10 @@ class HintPriorSkipped(StrEnum):
     RUN_START_NOT_DURABLE = "run_start_not_durable"
     SUPERVISOR_UNAVAILABLE = "supervisor_unavailable"
     AUTHORITY_SHADOW = "authority_shadow"
+    RULE_POLICY_NOT_ACTIVE = "rule_policy_not_active"
+    """設定の active slot が RulePolicy でない（0133 §2.2。RL が active で Rule へ fallback した
+    tick も含む）。ヒントを効かせうる経路が無いので判定しない。0133 §2.8 の表に無い値で、
+    PR #332 のレビューで足した。"""
 
 
 HINT_SOURCE_LABEL_OTHER = "other"

@@ -1217,6 +1217,9 @@ class ControlLoop:
                 hint_tick,
                 supervisor_available=decision is not None and decision.selected_output is not None,
                 would_override=would,
+                rule_policy_active=(
+                    self._supervisor is not None and self._supervisor.rule_policy_active
+                ),
             )
         except Exception:
             LOGGER.exception(
