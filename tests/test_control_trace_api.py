@@ -241,7 +241,9 @@ def test_migration_of_an_empty_table_uses_the_wall_clock(
 
 
 def test_rollup_prunes_with_the_boundary_and_counts_future_rows(store: SqliteStore) -> None:
-    rules = RetentionRules(raw_days=30, control_trace_days=30, csv_dir="unused")
+    rules = RetentionRules(
+        raw_days=30, control_trace_days=30, hint_shadow_days=30, csv_dir="unused"
+    )
     now_ms = 40 * DAY_MS
     record(store, 1 * DAY_MS, 1)
     record(store, 39 * DAY_MS, 2)

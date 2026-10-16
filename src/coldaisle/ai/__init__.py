@@ -11,8 +11,10 @@ from coldaisle.ai.explain import Evidence, Explainer, Explanation
 from coldaisle.ai.health import AiHealthSummarizer, BackgroundHealthSummarizer
 from coldaisle.ai.provider import (
     AiSettings,
+    AnthropicLimits,
     ChatMessage,
     ChatResult,
+    ExplainContext,
     OpenAiCompatibleProvider,
     Provider,
     UnavailableProvider,
@@ -24,10 +26,12 @@ __all__ = [
     "DEFINITIONS",
     "AiHealthSummarizer",
     "AiSettings",
+    "AnthropicLimits",
     "BackgroundHealthSummarizer",
     "ChatMessage",
     "ChatResult",
     "Evidence",
+    "ExplainContext",
     "Explainer",
     "Explanation",
     "OpenAiCompatibleProvider",

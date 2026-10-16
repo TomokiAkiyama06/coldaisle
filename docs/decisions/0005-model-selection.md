@@ -3,6 +3,7 @@
 - **種別**: Decision Record
 - **Status**: FINAL（2026-08-24 承認）
 - **Date**: 2026-08-24
+- **Superseded by**: [`0143`](0143-claude-api-interim-provider.md)（ローカル LLM が導入先に入るまでの間だけ Claude API を使う点に限る。モデルの選定は変わらない。0143 は Proposed）
 - **Supersedes**: [`0001-initial-project-decisions.md`](0001-initial-project-decisions.md) D-13
 - **関連**: `docs/requirements.md` §7.1 / §7.2 / Q-08 / FR-501 / FR-504 / #21 / #27 / #31
 - **対象 Issue**: #31

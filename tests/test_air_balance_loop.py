@@ -85,7 +85,7 @@ def test_an_uncalibrated_file_disables_air_balance_on_every_tick(catalog: Metric
 
     for result in results:
         tick = result.tick
-        assert tick.schema_version == 15
+        assert tick.schema_version == 16
         record = tick.air_balance
         assert record is not None
         assert record.status == "disabled"
@@ -110,7 +110,7 @@ def test_the_runtime_digest_names_all_four_files_with_their_versions(
     assert runtime is not None and runtime.schema_version == 2
     digest = runtime.config
     sources = harness.config.sources
-    assert digest.control_config_version == CONTROL_CONFIG_VERSION == 15
+    assert digest.control_config_version == CONTROL_CONFIG_VERSION == 16
     assert (digest.fan_hardware_sha256, digest.fan_hardware_schema_version) == (
         sources.fan_hardware.sha256,
         sources.fan_hardware.schema_version,

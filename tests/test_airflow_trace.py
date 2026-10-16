@@ -2,7 +2,7 @@
 
 `airflow-trace.js` の変換を node で実際に動かして確かめる（決定記録 0044。CI では node が必須）。
 
-1. **版の解釈は1か所**（`airflow-trace.js`）。v1〜v15 の fixture を読める
+1. **版の解釈は1か所**（`airflow-trace.js`）。v1〜v16 の fixture を読める
    （schema.py に無い版は「未対応の版」）
 2. **3つの状態を混ぜない**: その版に欄が無い／欄はあるが値が無い／画面が知らない版
 3. Safety override・Fallback・OOD を通常状態と区別して出す
@@ -38,7 +38,7 @@ AIRFLOW_UI_PATH = CONFIG_DIR / "airflow-ui.yaml"
 NOW_MS = 1_787_616_020_000
 
 NOT_IN_VERSION = "この版の記録には無い"
-FIXTURE_VERSIONS = range(1, 16)
+FIXTURE_VERSIONS = range(1, 17)
 
 
 def _node() -> str:
@@ -113,7 +113,7 @@ def _steps(result: Any, zone: str) -> dict[str, dict[str, Any]]:
 
 @pytest.mark.parametrize("version", FIXTURE_VERSIONS)
 def test_every_stored_version_is_read(version):
-    """保存済みの v1〜v15 の fixture を、同じ `page.control` の形にできる。"""
+    """保存済みの v1〜v16 の fixture を、同じ `page.control` の形にできる。"""
     result = _convert(_body(version))
     assert result["status"] == "ok"
     assert result["schema_version"] == version
@@ -182,11 +182,11 @@ def test_workload_regime_absent_in_v1_only():
     assert _chip(_convert(_body(2)), "負荷の傾向")["v"] != NOT_IN_VERSION
 
 
-@pytest.mark.parametrize("version", [16, 999])
+@pytest.mark.parametrize("version", [17, 999])
 def test_an_unknown_version_is_not_shown(version):
     """画面が知らない版は「未対応の版」。**制御由来の項目を出さない。**
 
-    v16 は schema.py にまだ無い。中身は先にマージされた PR で決まるので、推測で読まない。
+    v17 は schema.py にまだ無い。中身は先にマージされた PR で決まるので、推測で読まない。
     """
     body = _body(10)
     body["schema_version"] = version
@@ -861,3 +861,16 @@ def test_v15_a_mismatched_record_is_not_shown_as_normal():
     chip = _chip(_convert(body), HEALTH)
     assert chip["tone"] == "warn"
     assert chip["v"] == "記録の値を解釈できない"
+
+
+# ------------------------------------------------------------ v16: 起動ごとの run_id（0133 §2.9）
+
+
+def test_v16_reads_like_v15_and_does_not_show_the_run_id():
+    """v16 は版を読めるようにするだけ。run_id は突き合わせの検算用で、画面には出さない。"""
+    v15 = _convert(_body(15))
+    v16 = _convert(_body(16))
+    assert v16["status"] == "ok"
+    assert v16["control"]["chips"] == v15["control"]["chips"]
+    run_id = _body(16)["run_id"]
+    assert run_id not in json.dumps(v16, ensure_ascii=False)

@@ -31,6 +31,7 @@ from zoneinfo import ZoneInfo
 
 from coldaisle import logs
 from coldaisle.ai import AiSettings, Explainer, ToolRegistry, provider_from_env
+from coldaisle.alert_graph import AlertGraphWorker, load_graph_config
 from coldaisle.calibration_log import (
     CalibrationActivationRefused,
     IngestCalibrationGate,
@@ -52,6 +53,8 @@ from coldaisle.ingest.serial_source import DEFAULT_BAUD
 from coldaisle.llm_exclusions import LlmExclusions, LlmExclusionsError
 from coldaisle.metrics import MetricCatalog, compute_derived
 from coldaisle.notify import DisplayNames, Notification, NotifyConfig, Router, notifiers_from_env
+from coldaisle.notify.notifiers import Notifier
+from coldaisle.notify.slack_bot import SlackBotNotifier
 from coldaisle.rules import Engine, RuleSet, Transition, probe_mismatch
 from coldaisle.store import (
     AlertSeverity,
@@ -86,6 +89,7 @@ DEFAULT_CALIBRATION = Path("config/calibration.json")
 DEFAULT_CALIBRATION_POLICY = Path("config/calibration.yaml")
 DEFAULT_RULES = Path("config/rules.yaml")
 DEFAULT_NOTIFY = Path("config/notify.yaml")
+DEFAULT_NOTIFY_GRAPH = Path("config/notify-graph.yaml")
 DEFAULT_AI = Path("config/ai.yaml")
 DEFAULT_METRICS = Path("config/metrics.yaml")
 DEFAULT_REPORT_CONFIG = Path("config/report.yaml")
@@ -167,6 +171,7 @@ class Daemon:
         llm_exclusions: LlmExclusions | None = None,
         tick_s: float = 1.0,
         calibration_gate: IngestCalibrationGate | None = None,
+        alert_graph: AlertGraphWorker | None = None,
     ) -> None:
         self._source = source
         self._store = store
@@ -194,6 +199,8 @@ class Daemon:
         self._explain_thread: threading.Thread | None = None
         self._tick_s = tick_s
         self._calibration_gate = calibration_gate
+        self._alert_graph = alert_graph
+        """Slack の発火の通知に添えるグラフ（決定記録 0147）。取り込みのスレッドは触れない。"""
         self._calibration_floor_ms: int | None = None
         """較正の記録の最後の行の時刻。これより前の sample は保存しない（0099 §2.2）。"""
         self._latest_values: dict[str, float | None] = {}
@@ -299,6 +306,8 @@ class Daemon:
             # **いつから見ているか**を基準にする。起動時からデバイスが無い場合、
             # これが無いと `SENSOR_FAULT` が永久に鳴らない
             self._engine.begin(self._normalizer.clock.now_ms())
+        if self._alert_graph is not None:
+            self._alert_graph.start()
         if self._notifier is not None:
             self._notifier.start()
         if self._explainer_factory is not None and self._explain_thread is None:
@@ -342,6 +351,9 @@ class Daemon:
         if self._notifier is not None:
             # **送り切ってから止める。** 最後の critical を落とさない
             self._notifier.stop()
+        if self._alert_graph is not None:
+            # グラフは送り切らない。描きかけを短く待って捨てる（決定記録 0147 §2.2）
+            self._alert_graph.stop()
         LOGGER.info("取り込みを終了する", extra={logs.FIELDS_KEY: self.stats.as_fields()})
         return self.stats
 
@@ -789,6 +801,8 @@ class Config:
     """
     rules: Path = DEFAULT_RULES
     notify: Path = DEFAULT_NOTIFY
+    notify_graph: Path = DEFAULT_NOTIFY_GRAPH
+    """Slack の通知に添えるグラフの設定（決定記録 0147 §2.7）。壊れていてもグラフだけを止める。"""
     ai: Path = DEFAULT_AI
     metrics: Path = DEFAULT_METRICS
     report_config: Path = DEFAULT_REPORT_CONFIG
@@ -827,6 +841,11 @@ def build(config: Config) -> Daemon:
             calibration_file_sha256=calibration_sha256,
         )
     )
+    rule_set = RuleSet.from_yaml(config.rules)
+    catalog = MetricCatalog.from_yaml(config.metrics)
+    notify_config = NotifyConfig.from_yaml(config.notify)
+    notifiers = notifiers_from_env()
+    alert_graph = _alert_graph(config, notifiers, rules, clock, rule_set, catalog, notify_config)
     return Daemon(
         source=source,
         store=store,
@@ -836,22 +855,51 @@ def build(config: Config) -> Daemon:
         # ルールエンジンは**取り込みと同じプロセス・同じ時計**で動かす。
         # 継続時間の判定が実時間に依存すると、圧縮再生で検証できない
         # （決定記録 0007 §2.11 / §5 未決3）
-        engine=Engine(
-            rules=RuleSet.from_yaml(config.rules),
-            catalog=MetricCatalog.from_yaml(config.metrics),
-            store=store,
-            clock=clock,
-        ),
+        engine=Engine(rules=rule_set, catalog=catalog, store=store, clock=clock),
         explainer_factory=_explainer_factory(config, rules, clock, exclusions),
         llm_exclusions=exclusions,
-        notifier=Router(
-            config=NotifyConfig.from_yaml(config.notify),
-            notifiers=notifiers_from_env(),
-            clock=clock,
-        ),
+        notifier=Router(config=notify_config, notifiers=notifiers, clock=clock),
         tick_s=config.tick_s,
         calibration_gate=calibration_gate,
+        alert_graph=alert_graph,
     )
+
+
+def _alert_graph(
+    config: Config,
+    notifiers: dict[str, Notifier],
+    quality_rules: QualityRules,
+    clock: Clock,
+    rule_set: RuleSet,
+    catalog: MetricCatalog,
+    notify_config: NotifyConfig,
+) -> AlertGraphWorker | None:
+    """Slack の Bot があり、グラフの設定が有効なときだけグラフを添える（決定記録 0147）。
+
+    Webhook だけのときは作らない（スレッドの `ts` が無い）。DB の接続はグラフのスレッドが
+    自分で開く（決定記録 0004 §2.8）。描くメトリクスは本文の「現在値:」と同じ選び方
+    （決定記録 0142 §2.2a の `DisplayNames`。`context_always` を含む）。
+    """
+    slack = notifiers.get("slack")
+    if not isinstance(slack, SlackBotNotifier):
+        return None
+    graph_config = load_graph_config(config.notify_graph)
+    if graph_config is None:
+        return None
+    worker = AlertGraphWorker(
+        uploader=slack.api,
+        open_reader=lambda: SqliteStore(config.db, rules=quality_rules, clock=clock),
+        rules=rule_set,
+        catalog=catalog,
+        names=DisplayNames.build(
+            rules=rule_set, catalog=catalog, context_always=notify_config.context_always
+        ),
+        config=graph_config,
+        clock=clock,
+        repeat_after_s=notify_config.repeat_after_s,
+    )
+    slack.attach(worker.offer)
+    return worker
 
 
 def _llm_exclusions(path: Path) -> LlmExclusions | None:
@@ -880,10 +928,15 @@ def _explainer_factory(
     catalog = MetricCatalog.from_yaml(config.metrics)
     rule_set = RuleSet.from_yaml(config.rules)
 
+    # Provider は1つだけ作り、説明器を作り直しても共有する
+    # （1 日の呼び出しの上限を数え直さない。0143 §2.5）
+    provider = provider_from_env(settings)
+
     def build() -> Explainer:
         store = SqliteStore(config.db, rules=quality_rules, clock=clock)
         return Explainer(
-            provider=provider_from_env(settings),
+            provider=provider,
+            context=settings.explain_context,
             # 説明の Evidence（get_latest / get_stats）もツールを通る。除外を当てる（0131 §2.4a）
             tools=ToolRegistry(
                 store=store, catalog=catalog, rules=rule_set, clock=clock, exclusions=exclusions
@@ -970,6 +1023,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--calibration-policy", type=Path, default=DEFAULT_CALIBRATION_POLICY)
     parser.add_argument("--rules", type=Path, default=DEFAULT_RULES)
     parser.add_argument("--notify", type=Path, default=DEFAULT_NOTIFY)
+    parser.add_argument(
+        "--notify-graph",
+        type=Path,
+        default=DEFAULT_NOTIFY_GRAPH,
+        help="Slack の通知に添えるグラフの設定（決定記録 0147。壊れていてもグラフだけを止める）",
+    )
     parser.add_argument("--ai", type=Path, default=DEFAULT_AI)
     parser.add_argument("--metrics", type=Path, default=DEFAULT_METRICS)
     parser.add_argument(
@@ -1015,6 +1074,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             calibration_policy=args.calibration_policy,
             rules=args.rules,
             notify=args.notify,
+            notify_graph=args.notify_graph,
             ai=args.ai,
             metrics=args.metrics,
             report_config=args.report_config,

@@ -25,6 +25,7 @@ from coldaisle.rules.models import (
     ExpectedReference,
     FlagOffRule,
     HotAndSlowRule,
+    LatestThresholdRule,
     PowerReferencedRule,
     RangeRule,
     RuleSet,
@@ -46,8 +47,9 @@ GAP_RESET_RULES: tuple[str, ...] = (
 )
 """欠けの検知（`SENSOR_MISSING` / `SENSOR_FAULT`）で発火待ちを数え直すルール（決定記録 0139 §2.3）。
 
-`rapid_rise`・`sensor_*`・`probe_changed` と、DB の最新値を読む GPU の Fan の 2 つのルール
-（0131 §2.3。1 回の欠けで取り消す）は含めない。
+`rapid_rise`・`sensor_*`・`probe_changed` と、DB の最新値を読むルール
+（GPU の Fan の 2 つと 12V-2x6 コネクタの 2 つ。0131 §2.3 / 0145 §2.3。
+1 回の欠けで取り消す）は含めない。
 """
 
 
@@ -596,7 +598,9 @@ class Engine:
         return frozenset(
             name.upper()
             for name, rule in self.rules
-            if isinstance(rule, FlagOffRule | HotAndSlowRule | PowerReferencedRule)
+            if isinstance(
+                rule, FlagOffRule | HotAndSlowRule | LatestThresholdRule | PowerReferencedRule
+            )
         )
 
     def _evaluate_latest(self) -> list[Transition]:
@@ -608,12 +612,20 @@ class Engine:
         """
         not_manual = self.rules.gpu_fan_not_manual
         below_curve = self.rules.gpu_fan_below_curve
-        if not not_manual.enabled and not below_curve.enabled:
+        connector = (
+            ("connector_temp_high", self.rules.connector_temp_high),
+            ("connector_temp_critical", self.rules.connector_temp_critical),
+        )
+        if not (
+            not_manual.enabled or below_curve.enabled or any(rule.enabled for _, rule in connector)
+        ):
             return []
         latest = self.store.latest(at_ms=self._now_ms)
         transitions: list[Transition] = []
         transitions += self._evaluate_flag_off("gpu_fan_not_manual", not_manual, latest)
         transitions += self._evaluate_hot_and_slow("gpu_fan_below_curve", below_curve, latest)
+        for name, rule in connector:
+            transitions += self._evaluate_latest_threshold(name, rule, latest)
         return transitions
 
     def _evaluate_flag_off(
@@ -693,6 +705,37 @@ class Engine:
                 detail=detail,
             )
         return self._continue(rule_id, rule.fan_metric, fan, rule.fire_after_s, detail=detail)
+
+    def _evaluate_latest_threshold(
+        self, name: str, rule: LatestThresholdRule, latest: Mapping[str, LatestReading]
+    ) -> list[Transition]:
+        """DB の最新値のしきい値（決定記録 0145 §2.1）。成立は `>= threshold`、解除は `< clear`。
+
+        欠け・stale・suspect（0 °C 未満の断線など）は高温と取り違えない。発火待ちは取り消し、
+        発火中は保つ（0131 §2.3。0145 §2.3）。
+        """
+        if not rule.enabled:
+            return []
+        rule_id = name.upper()
+        value = _current(latest, rule.metric)
+        if value is None:
+            self._reset_on_gap(rule_id, rule.metric)
+            return []
+        state = self._state(rule_id, rule.metric)
+        # ヒステリシス: 成立中は解除の閾値を下回るまで成立し続ける
+        limit = rule.clear if state.since_ms is not None else rule.threshold
+        if value < limit:
+            return self._end(rule_id, rule.metric) if state.since_ms is not None else []
+        if state.since_ms is None:
+            return self._begin(
+                rule_id,
+                rule.metric,
+                rule.severity.value,
+                rule.threshold,
+                value,
+                rule.fire_after_s,
+            )
+        return self._continue(rule_id, rule.metric, value, rule.fire_after_s)
 
     def _reset_on_gap(self, rule_id: str, metric: str | None) -> None:
         """欠けた・stale の入力を受けた（決定記録 0131 §2.3）。**連続の時間を数え直す。**

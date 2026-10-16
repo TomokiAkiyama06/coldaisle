@@ -159,6 +159,8 @@ def supervisor_config() -> dict[str, object]:
                 "unknown": conservative,
             },
         },
+        # fan-policy.yaml v12（#319 / 決定記録 0133 §2.6）。既定の試験は Stage A のまま
+        "workload_hint": {"stage": "off"},
     }
 
 
@@ -253,7 +255,7 @@ def valid_documents() -> dict[str, dict[str, object]]:
             "hardware_write_fail_exit_ms": provisional(5000),
         },
         "fan-policy.yaml": {
-            "schema_version": 11,
+            "schema_version": 12,
             "fallback_curve": [
                 {"temperature_c": 25.0, "demand": 0.3},
                 {"temperature_c": 80.0, "demand": 1.0},
@@ -392,13 +394,13 @@ def load_config(tmp_path: Path) -> ControlConfig:
 def test_complete_config_has_traceable_sources_and_is_not_actuation_ready(tmp_path: Path) -> None:
     config = load_config(tmp_path)
 
-    assert CONTROL_CONFIG_VERSION == 15
+    assert CONTROL_CONFIG_VERSION == 16
     assert config.actuation_permitted is False
-    assert config.trace_metadata()["control_config_version"] == 15
+    assert config.trace_metadata()["control_config_version"] == 16
     metadata = config.trace_metadata()["control_config"]
     assert metadata["fan_hardware"]["name"] == "fan-hardware.yaml"
     assert metadata["safety"]["schema_version"] == 4
-    assert metadata["policy"]["schema_version"] == 11
+    assert metadata["policy"]["schema_version"] == 12
     assert metadata["air_balance"]["name"] == "air-balance.yaml"
     assert metadata["air_balance"]["schema_version"] == 2
     assert len(metadata["safety"]["sha256"]) == 64
@@ -1068,9 +1070,9 @@ def test_v4_to_v5_migration_requires_explicit_supervisor_policy_values(tmp_path:
         ControlConfig.from_directory(tmp_path)
 
     documents["fan-policy.yaml"]["supervisor"] = supervisor
-    documents["fan-policy.yaml"]["schema_version"] = 11
+    documents["fan-policy.yaml"]["schema_version"] = 12
     write_documents(tmp_path, documents)
-    assert ControlConfig.from_directory(tmp_path).policy.schema_version == 11
+    assert ControlConfig.from_directory(tmp_path).policy.schema_version == 12
 
     del documents["fan-policy.yaml"]["supervisor"]["active_policy"]
     write_documents(tmp_path, documents)

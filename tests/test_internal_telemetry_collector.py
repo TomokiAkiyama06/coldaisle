@@ -347,7 +347,9 @@ def test_rollup_entry_point_registers_internal_metrics(tmp_path: Path, rules):
             )
     retention = tmp_path / "retention.yaml"
     retention.write_text(
-        f"raw_days: 30\ncontrol_trace_days: 30\ncsv_dir: {tmp_path / 'csv'}\n", encoding="utf-8"
+        "raw_days: 30\ncontrol_trace_days: 30\nhint_shadow_days: 30\n"
+        f"csv_dir: {tmp_path / 'csv'}\n",
+        encoding="utf-8",
     )
     telemetry = tmp_path / "internal-telemetry.yaml"
     telemetry.write_text(

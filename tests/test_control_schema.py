@@ -61,6 +61,7 @@ from coldaisle.control.schema import (
     GuardThresholdProfile,
     TelemetryHealth,
     TelemetryHealthRecord,
+    WorkloadHintRecord,
     registry_reason_sha256,
 )
 
@@ -588,6 +589,9 @@ TELEMETRY_HEALTH_RECORD = TelemetryHealthRecord(
 )
 """v15 の `ControlTick` に必須の健全度と Guard の閾値の組（入力がそろった tick。決定記録 0137）。"""
 
+TRACE_RUN_ID = "0123456789abcdef" * 2
+"""v16 の `ControlTick` に必須の起動ごとの `run_id`（決定記録 0133 §2.9）。明らかな仮の値。"""
+
 AUTHORITY_RECORD = AuthorityRecord(entry="static", config_ceiling=AuthorityStage.FULL)
 """v13 の `ControlTick` に必須の制御権の出どころ（journal を持たない構成。決定記録 0072 §2.6）。
 
@@ -667,6 +671,8 @@ def tick(demand: EffectiveZoneDemand, faults=(), **state_overrides) -> ControlTi
         air_balance_coordination=COORDINATION_RECORD,
         tach_unconfirmed_zones=(),
         telemetry_health=TELEMETRY_HEALTH_RECORD,
+        run_id=TRACE_RUN_ID,
+        workload_hint=WorkloadHintRecord.off(),
     )
 
 
@@ -783,6 +789,8 @@ def test_a_front_or_rear_stall_can_stay_degraded():
         air_balance_coordination=COORDINATION_RECORD,
         tach_unconfirmed_zones=(),
         telemetry_health=TELEMETRY_HEALTH_RECORD,
+        run_id=TRACE_RUN_ID,
+        workload_hint=WorkloadHintRecord.off(),
     )
     assert recorded.state.safety_state is SafetyState.DEGRADED
 
@@ -818,6 +826,8 @@ def test_stale_cpu_temperature_drives_top_to_max():
         air_balance_coordination=COORDINATION_RECORD,
         tach_unconfirmed_zones=(),
         telemetry_health=TELEMETRY_HEALTH_RECORD,
+        run_id=TRACE_RUN_ID,
+        workload_hint=WorkloadHintRecord.off(),
     )
     assert recorded.zones.top.demand.forced_max
 
@@ -834,7 +844,7 @@ def test_the_stored_v1_record_still_loads_unchanged():
     stored = FIXTURE.read_text(encoding="utf-8")
     tick = ControlTick.model_validate_json(stored)
     assert tick.schema_version == 1
-    assert SCHEMA_VERSION == 15
+    assert SCHEMA_VERSION == 16
     assert json.loads(tick.model_dump_json()) == json.loads(stored)
 
 
@@ -909,6 +919,8 @@ def test_current_trace_stores_workload_regime_and_confidence_together():
         air_balance_coordination=COORDINATION_RECORD,
         tach_unconfirmed_zones=(),
         telemetry_health=TELEMETRY_HEALTH_RECORD,
+        run_id=TRACE_RUN_ID,
+        workload_hint=WorkloadHintRecord.off(),
     )
 
     payload = json.loads(recorded.model_dump_json())
@@ -947,6 +959,8 @@ def test_v2_trace_keeps_simultaneous_transient_load_distinct():
         air_balance_coordination=COORDINATION_RECORD,
         tach_unconfirmed_zones=(),
         telemetry_health=TELEMETRY_HEALTH_RECORD,
+        run_id=TRACE_RUN_ID,
+        workload_hint=WorkloadHintRecord.off(),
     )
 
     payload = json.loads(recorded.model_dump_json())
@@ -970,6 +984,8 @@ def test_fallback_trace_remains_valid_when_regime_is_not_available():
         air_balance_coordination=COORDINATION_RECORD,
         tach_unconfirmed_zones=(),
         telemetry_health=TELEMETRY_HEALTH_RECORD,
+        run_id=TRACE_RUN_ID,
+        workload_hint=WorkloadHintRecord.off(),
     )
 
     assert recorded.schema_version == SCHEMA_VERSION
@@ -1021,6 +1037,8 @@ def test_v3_supervisor_policy_requires_a_matching_decision():
             air_balance_coordination=COORDINATION_RECORD,
             tach_unconfirmed_zones=(),
             telemetry_health=TELEMETRY_HEALTH_RECORD,
+            run_id=TRACE_RUN_ID,
+            workload_hint=WorkloadHintRecord.off(),
         )
 
 
@@ -1136,6 +1154,8 @@ def test_the_v9_trace_keeps_disabled_inputs_and_the_provisional_flag():
         air_balance_coordination=COORDINATION_RECORD,
         tach_unconfirmed_zones=(),
         telemetry_health=TELEMETRY_HEALTH_RECORD,
+        run_id=TRACE_RUN_ID,
+        workload_hint=WorkloadHintRecord.off(),
     )
     payload = json.loads(recorded.model_dump_json())
     assert payload["schema_version"] == SCHEMA_VERSION
@@ -1212,6 +1232,8 @@ def registry_tick(registry: RegistryProvenance, **overrides: object) -> ControlT
         "air_balance_coordination": COORDINATION_RECORD,
         "tach_unconfirmed_zones": (),
         "telemetry_health": TELEMETRY_HEALTH_RECORD,
+        "run_id": TRACE_RUN_ID,
+        "workload_hint": WorkloadHintRecord.off(),
     }
     return ControlTick(**(values | overrides))
 
@@ -1221,7 +1243,7 @@ def test_a_v10_tick_round_trips_the_registry_pointer_it_used():
     recorded = registry_tick(bound_registry())
 
     payload = json.loads(recorded.model_dump_json())
-    assert payload["schema_version"] == SCHEMA_VERSION == 15
+    assert payload["schema_version"] == SCHEMA_VERSION == 16
     assert payload["registry"]["revision"] == 3
     thermal = payload["registry"]["production"]["thermal_model"]
     assert thermal["artifact_sha256"] == REGISTRY_SHA
@@ -1574,10 +1596,16 @@ def learned_tick(**overrides) -> ControlTick:
         "air_balance_coordination": COORDINATION_RECORD,
         "tach_unconfirmed_zones": (),
         "telemetry_health": TELEMETRY_HEALTH_RECORD,
+        # v16 を名乗る記録は fand の起動ごとの run_id を省けない（#288 / 決定記録 0133 §2.9）。
+        "run_id": TRACE_RUN_ID,
+        "workload_hint": WorkloadHintRecord.off(),
     }
     version = overrides.get("schema_version", SCHEMA_VERSION)
     assert isinstance(version, int)
     values["runtime"] = runtime_for(version)
+    if version < 16:
+        values.pop("run_id")
+        values.pop("workload_hint")
     if version < 15:
         values.pop("telemetry_health")
     if version < 14:
@@ -1790,6 +1818,8 @@ def test_a_tick_cannot_claim_two_different_artifacts():
             air_balance_coordination=COORDINATION_RECORD,
             tach_unconfirmed_zones=(),
             telemetry_health=TELEMETRY_HEALTH_RECORD,
+            run_id=TRACE_RUN_ID,
+            workload_hint=WorkloadHintRecord.off(),
             state=fallback_state(
                 authority_stage=AuthorityStage.LIMITED,
                 fallback_reason=Reason(code="low_confidence"),
@@ -1892,7 +1922,7 @@ def test_a_v15_tick_round_trips_the_telemetry_health():
     recorded = registry_tick(REGISTRY_PROVENANCE, telemetry_health=record)
 
     payload = json.loads(recorded.model_dump_json())
-    assert payload["schema_version"] == SCHEMA_VERSION == 15
+    assert payload["schema_version"] == SCHEMA_VERSION == 16
     assert payload["telemetry_health"] == {
         "schema_version": 1,
         "health": "degraded",
@@ -1984,6 +2014,8 @@ def test_a_missing_guard_profile_needs_the_guard_exception():
         air_balance_coordination=COORDINATION_RECORD,
         tach_unconfirmed_zones=(),
         telemetry_health=without_guard,
+        run_id=TRACE_RUN_ID,
+        workload_hint=WorkloadHintRecord.off(),
     )
     assert recorded.telemetry_health is not None
     assert recorded.telemetry_health.guard_threshold_profile is None
@@ -1996,3 +2028,53 @@ def test_the_trace_and_the_controller_share_one_health_type():
 
     assert state.TelemetryHealth is TelemetryHealth
     assert guard.GuardThresholdProfile is GuardThresholdProfile
+
+
+# ------------------------------------------------------------ v16: 起動ごとの run_id（0133 §2.9）
+
+
+def test_a_v16_tick_round_trips_the_run_id():
+    recorded = registry_tick(REGISTRY_PROVENANCE)
+
+    payload = json.loads(recorded.model_dump_json())
+    assert payload["schema_version"] == SCHEMA_VERSION == 16
+    assert payload["run_id"] == TRACE_RUN_ID
+    assert ControlTick.model_validate_json(recorded.model_dump_json()) == recorded
+
+
+def test_a_v16_tick_cannot_omit_the_run_id():
+    """入口の無い構成（`--no-admin`）でも省けない。突き合わせの鍵を欠いた trace を作らない。"""
+    assert MODE_COMMAND_RECORD.run_id is None
+    with pytest.raises(ValidationError, match="run_id が要る"):
+        registry_tick(REGISTRY_PROVENANCE, run_id=None)
+
+
+def test_a_v15_tick_reads_without_the_run_id_but_cannot_carry_it():
+    """保存済みの v15 は欄なしで読める。古い版の mode_command.run_id を最上位へ読み替えない。"""
+    stored = json.loads((FIXTURE.parent / "control_tick_v15.json").read_text(encoding="utf-8"))
+    tick = ControlTick.model_validate_json(json.dumps(stored))
+    assert tick.schema_version == 15
+    assert tick.mode_command is not None and tick.mode_command.run_id is not None
+    assert tick.run_id is None
+    assert "run_id" not in json.loads(tick.model_dump_json())
+
+    with pytest.raises(ValidationError, match="schema version 16"):
+        registry_tick(REGISTRY_PROVENANCE, schema_version=15)
+
+
+def test_the_run_id_must_match_the_mode_command():
+    """同じ tick の管理ソケットの記録と食い違う run_id を作らない（0133 §2.9）。"""
+    other = "1" * 32
+    admin = ModeCommandRecord(entry="control_admin", run_id=TRACE_RUN_ID)
+    assert registry_tick(REGISTRY_PROVENANCE, mode_command=admin).run_id == TRACE_RUN_ID
+    with pytest.raises(ValidationError, match="最上位の run_id と等しく"):
+        registry_tick(
+            REGISTRY_PROVENANCE,
+            mode_command=ModeCommandRecord(entry="control_admin", run_id=other),
+        )
+
+
+@pytest.mark.parametrize("run_id", ["", "0123", "0123456789ABCDEF" * 2, "g" * 32, "0" * 33])
+def test_a_run_id_of_another_shape_is_refused(run_id: str):
+    with pytest.raises(ValidationError):
+        registry_tick(REGISTRY_PROVENANCE, run_id=run_id)

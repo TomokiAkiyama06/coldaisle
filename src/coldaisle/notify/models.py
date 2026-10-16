@@ -434,6 +434,8 @@ class Notification:
         elif text.kind == "excess":
             # 設定の threshold は期待値を超えた分（決定記録 0144）。期待値はエンジンが比べた値を書く
             note = _excess_note(self.reference, unit)
+        elif text.kind == "at_or_above" and text.threshold is not None:
+            note = f"（閾値 {_num(text.threshold, unit)} 以上）"
         elif text.kind == "range" and text.low is not None and value < text.low:
             note = f"（下限 {_num(text.low, unit)} を下回る）"
         elif text.kind == "range" and text.high is not None and value > text.high:

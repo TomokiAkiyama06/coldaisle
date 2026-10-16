@@ -36,3 +36,46 @@ send_thinking_flag: true
 # アラートに Evidence 形式の説明を後追いで付けるか（#38 / FR-508）。
 # **生成は通知経路をブロックしません。** 失敗したら素のアラートだけが届きます
 explain_alerts: true
+
+# アラートの説明に足す、負荷と温度の直近の集計（決定記録 0143 §2.11）。
+# **平均・最大・傾きだけを渡す。生の時系列は渡さない**（ルール 8）。
+# LLM へ渡さない一覧（config/report.yaml の llm_excluded_*。0131 §2.4a）に当たるメトリクスは、
+# ここに書いても材料にならない（0146 で一覧は空。GPU の Fan の値も読める）。
+# Provider に依らない（ローカル LLM でも Claude でも同じ材料）
+explain_context:
+  # 窓は発火の時刻で終わる（説明が遅れても発火の前の状態を見る）
+  window: 15m
+  metrics:
+    - gpu.0.utilization
+    - power.gpu.0
+    - gpu.0.core
+    - gpu.0.fan_speed    # NVML の目標値の %（実回転ではない）。0146 で LLM が読める
+    - cpu.utilization
+    - power.cpu.package
+    - cpu.package
+    - air.room
+    - air.front_intake
+    - air.gpu_intake
+    - air.gpu_exhaust
+    - air.top_exhaust
+    - air.rear_exhaust
+
+# --------------------------------------------------------------------------
+# Claude API を使うときの上限（決定記録 0143 §2.5 / #324）
+#
+# **ローカル LLM が導入先に入るまでの間だけの代わり。** 使うのは環境変数で
+# `COLDAISLE_LLM_PROVIDER=anthropic` と明示したときだけ（既定は上の OpenAI 互換のまま）。
+# 鍵（ANTHROPIC_API_KEY）とモデル ID（ANTHROPIC_MODEL）は環境変数から読み、ここには書かない。
+#
+# 上限に達したら**呼ばずに**「利用不可」を返す。所見・説明が付かないだけで、監視と通知は動く（FR-507）。
+anthropic:
+  # 1 回の応答の上限。上の max_tokens と小さいほうを送る
+  max_tokens: 1024
+  # 1 プロセス・1 日（ローカル時刻の日付）あたりの HTTP 要求の回数。再試行も 1 回と数える。
+  # daemon（アラートの説明）・report（日次レポート）・API（`coldaisle.server:app` で起動したときの
+  # Server Health の要約）がそれぞれ数える。
+  # プロセスの中で数えるので再起動で 0 に戻る。**課金の正本は Anthropic の Console の spend limit**
+  daily_call_limit: 200
+  # output_config.effort（low / medium / high）。**null なら送らない**（モデルの既定のまま）。
+  # 対応するモデルかをコードで判定しないので、対応を確かめたモデルでだけ設定する（0143 §2.5）
+  effort: null

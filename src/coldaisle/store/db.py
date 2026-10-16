@@ -35,6 +35,8 @@ from coldaisle.store.models import (
     ControlTraceRecord,
     DeviceRecord,
     EventRecord,
+    HintShadowMatch,
+    HintShadowRecord,
     LatestReading,
     Quality,
     RollupPoint,
@@ -604,6 +606,93 @@ class SqliteStore:
         if row_id is None:
             raise RuntimeError("監査の行の採番に失敗した")
         return record.model_copy(update={"id": int(row_id)})
+
+    def record_hint_shadow(self, record: HintShadowRecord) -> HintShadowRecord:
+        """ヒント有りの solve の記録を1行追記する（#288 / 決定記録 0133 §2.5a）。
+
+        **追記のみ。** 更新は DB のトリガが拒否する。削除は保持期間の適用
+        （:meth:`delete_hint_shadow_before`）だけ。書くのは ``coldaisle-fand`` の tick の外の書き手
+        だけ（B1 で配線する）。``seq`` は保存時に AUTOINCREMENT で決まり、再利用しない。
+        """
+        if record.seq is not None:
+            raise ValueError("採番前の記録を渡す（seq は保存時に決まる）")
+        with self.transaction():
+            cursor = self._conn.execute(
+                "INSERT INTO hint_shadow_records (run_id, source_tick_id, source_ts_ms,"
+                " source_monotonic_ms, received_monotonic_ms, received_ts_ms, schema_version,"
+                " status, reason, record_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    record.run_id,
+                    record.source_tick_id,
+                    record.source_ts_ms,
+                    record.source_monotonic_ms,
+                    record.received_monotonic_ms,
+                    record.received_ts_ms,
+                    record.schema_version,
+                    record.status.value,
+                    None if record.reason is None else record.reason.value,
+                    record.record_json,
+                ),
+            )
+        row_id = cursor.lastrowid
+        if row_id is None:
+            raise RuntimeError("hint_shadow_records の採番に失敗した")
+        return record.model_copy(update={"seq": int(row_id)})
+
+    def delete_hint_shadow_before(self, cutoff_ms: int) -> int:
+        """保持期間を過ぎたヒント有りの記録を削除して行数を返す（決定記録 0133 §2.5a）。
+
+        消すのは ``source_ts_ms < cutoff_ms`` の行。基準を元の tick の時刻にするのは、突き合わせる
+        相手の trace（``control_traces.ts_ms``）と同じ時刻で古くなるようにするため。
+        """
+        if cutoff_ms < 0:
+            raise ValueError("hint_shadow_records の削除基準時刻が不正")
+        with self.transaction():
+            cursor = self._conn.execute(
+                "DELETE FROM hint_shadow_records WHERE source_ts_ms < ?", (cutoff_ms,)
+            )
+        return int(cursor.rowcount)
+
+    def hint_shadow_matches(self, start_ms: int, end_ms: int) -> tuple[HintShadowMatch, ...]:
+        """``source_ts_ms`` が ``[start_ms, end_ms)`` の記録を、trace との対応の有無とともに返す。
+
+        突き合わせの契約（決定記録 0133 §2.5a）: ``control_traces`` の主キー
+        ``(ts_ms, tick_id) = (source_ts_ms, source_tick_id)`` の行があり、その trace の**最上位の**
+        ``run_id`` が記録の ``run_id`` と等しいときだけ対応する。``mode_command.run_id`` は見ない。
+        対応の無い記録も捨てずに返す（集計で「対応なし」として数える）。並びは ``seq``（追記順）。
+        """
+        if start_ms < 0 or end_ms < start_ms:
+            raise ValueError("期間が不正")
+        rows = self._conn.execute(
+            "SELECT h.seq, h.run_id, h.source_tick_id, h.source_ts_ms, h.source_monotonic_ms,"
+            " h.received_monotonic_ms, h.received_ts_ms, h.schema_version, h.status, h.reason,"
+            " h.record_json,"
+            " EXISTS (SELECT 1 FROM control_traces AS c"
+            "         WHERE c.ts_ms = h.source_ts_ms AND c.tick_id = h.source_tick_id"
+            "           AND json_extract(c.trace_json, '$.run_id') = h.run_id) AS trace_matched"
+            " FROM hint_shadow_records AS h"
+            " WHERE h.source_ts_ms >= ? AND h.source_ts_ms < ? ORDER BY h.seq",
+            (start_ms, end_ms),
+        ).fetchall()
+        return tuple(
+            HintShadowMatch(
+                record=HintShadowRecord(
+                    seq=row["seq"],
+                    run_id=row["run_id"],
+                    source_tick_id=row["source_tick_id"],
+                    source_ts_ms=row["source_ts_ms"],
+                    source_monotonic_ms=row["source_monotonic_ms"],
+                    received_monotonic_ms=row["received_monotonic_ms"],
+                    received_ts_ms=row["received_ts_ms"],
+                    schema_version=row["schema_version"],
+                    status=row["status"],
+                    reason=row["reason"],
+                    record_json=row["record_json"],
+                ),
+                trace_matched=bool(row["trace_matched"]),
+            )
+            for row in rows
+        )
 
     def append_calibration_activation(self, row: CalibrationActivation) -> None:
         """較正の変更の記録を1行追記する（#233 / 決定記録 0099 §2.2 / §2.5）。
@@ -1384,6 +1473,51 @@ class SqliteStore:
             )
             for row in rows
         )
+
+    def ok_series_buckets(
+        self,
+        metric: str,
+        start_ms: int,
+        end_ms: int,
+        bucket_ms: int,
+        *,
+        subtrahend: str | None = None,
+    ) -> tuple[tuple[int, int, float], ...]:
+        """`[start_ms, end_ms)` を `bucket_ms` ごとに区切り、`quality='ok'` の値の平均を返す。
+
+        通知のグラフ用（決定記録 0147 §2.3）。**窓全体を均等に間引く。** 行数で打ち切ると
+        窓の片側だけが残り、軸が示す期間と中身が食い違う。
+
+        返すのは `(区間の番号, 区間の中で最も新しい行の時刻, 平均)`。区間の番号は空白（値の無い
+        区間）の判定に使う（番号が飛んだら間に値が無い）。
+
+        `subtrahend` を渡すと、同じ時刻に両方 `ok` の行だけで `metric - subtrahend` を平均する
+        （派生値は保存しないため。決定記録 0002 §2.2）。区間に行が無ければ点を返さない。
+        """
+        validate_metric(metric)
+        self._check_range(start_ms, end_ms)
+        if bucket_ms <= 0:
+            raise ValueError("bucket_ms は正にする")
+        ok = Quality.OK.value
+        if subtrahend is None:
+            rows = self._conn.execute(
+                "SELECT (ts_ms - ?) / ? AS bucket, MAX(ts_ms) AS ts, AVG(value) AS value "
+                "FROM readings WHERE metric = ? AND ts_ms >= ? AND ts_ms < ? "
+                "AND quality = ? AND value IS NOT NULL GROUP BY bucket ORDER BY bucket",
+                (start_ms, bucket_ms, metric, start_ms, end_ms, ok),
+            ).fetchall()
+        else:
+            validate_metric(subtrahend)
+            rows = self._conn.execute(
+                "SELECT (a.ts_ms - ?) / ? AS bucket, MAX(a.ts_ms) AS ts, "
+                "AVG(a.value - b.value) AS value "
+                "FROM readings AS a JOIN readings AS b "
+                "ON b.metric = ? AND b.ts_ms = a.ts_ms AND b.quality = ? AND b.value IS NOT NULL "
+                "WHERE a.metric = ? AND a.ts_ms >= ? AND a.ts_ms < ? "
+                "AND a.quality = ? AND a.value IS NOT NULL GROUP BY bucket ORDER BY bucket",
+                (start_ms, bucket_ms, subtrahend, ok, metric, start_ms, end_ms, ok),
+            ).fetchall()
+        return tuple((int(row["bucket"]), int(row["ts"]), float(row["value"])) for row in rows)
 
     def rollup(
         self, metric: str, start_ms: int, end_ms: int, agg: Aggregation
