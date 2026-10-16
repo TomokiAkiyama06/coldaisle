@@ -350,6 +350,17 @@ class ArtifactMetadata(_Frozen):
             raise ValueError(
                 "hint_certificate の source_runs は証明書の certificate_sha256 の1つだけ"
             )
+        # 決定記録 0156 §2.8: ゲートの仕様の版と証明書の本体の版。
+        if self.feature_schema_version != HINT_CERTIFICATE_FEATURE_SCHEMA_VERSION:
+            raise ValueError(
+                "hint_certificate の feature_schema_version は "
+                f"{HINT_CERTIFICATE_FEATURE_SCHEMA_VERSION}"
+            )
+        if self.target_schema_version != HINT_CERTIFICATE_TARGET_SCHEMA_VERSION:
+            raise ValueError(
+                "hint_certificate の target_schema_version は "
+                f"{HINT_CERTIFICATE_TARGET_SCHEMA_VERSION}"
+            )
         return self
 
     @property
@@ -360,6 +371,10 @@ class ArtifactMetadata(_Frozen):
 
 HINT_CERTIFICATE_MIN_SCHEMA_VERSION = 4
 """kind `hint_certificate` と能力 `hint_monotonicity_certificate` を記録できる最初の版。"""
+HINT_CERTIFICATE_FEATURE_SCHEMA_VERSION = "hint-gate-spec-v1"
+"""kind `hint_certificate` の metadata の `feature_schema_version`（決定記録 0156 §2.8）。"""
+HINT_CERTIFICATE_TARGET_SCHEMA_VERSION = "hint-certificate-v1"
+"""kind `hint_certificate` の metadata の `target_schema_version`（決定記録 0156 §2.8）。"""
 HINT_CERTIFICATE_MODEL_FAMILY = "hint-monotonicity-certificate"
 """kind `hint_certificate` の metadata の `model_family`（決定記録 0152 §5 の 2 (a)）。"""
 

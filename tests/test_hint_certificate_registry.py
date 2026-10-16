@@ -48,10 +48,10 @@ THERMAL_COMPATIBILITY = ModelCompatibility(
     target_schema_version="thermal-targets-v1",
     authority_stage=AuthorityStage.SHADOW,
 )
-# 証明書の feature / target の版の値は 0152 が決めていない（後の段で決める）。ここでは仮の値。
+# 証明書の feature / target の版の値は決定記録 0156 §2.8 が固定する。
 CERTIFICATE_COMPATIBILITY = ModelCompatibility(
-    feature_schema_version="hint-certificate-test",
-    target_schema_version="hint-certificate-test",
+    feature_schema_version="hint-gate-spec-v1",
+    target_schema_version="hint-certificate-v1",
     authority_stage=AuthorityStage.SHADOW,
 )
 
@@ -94,8 +94,8 @@ def certificate_fields(version: str = "1.0.0") -> dict[str, object]:
         "created_at": "2026-10-16T10:00:00+09:00",
         "training_dataset_version": THERMAL_KEY,
         "source_runs": (CERTIFICATE_SHA256,),
-        "feature_schema_version": "hint-certificate-test",
-        "target_schema_version": "hint-certificate-test",
+        "feature_schema_version": "hint-gate-spec-v1",
+        "target_schema_version": "hint-certificate-v1",
         "code_commit": None,
         "sha256": sha256(certificate_payload(version)).hexdigest(),
         "model_family": HINT_CERTIFICATE_MODEL_FAMILY,
@@ -199,6 +199,16 @@ def test_a_certificate_metadata_fixes_the_meaning_of_the_existing_fields() -> No
         ),
         pytest.param({"source_runs": ("run-001",)}, "source_runs", id="not-a-digest"),
         pytest.param({"source_runs": ("AB" * 32,)}, "source_runs", id="upper-hex"),
+        pytest.param(
+            {"feature_schema_version": "thermal-features-v1"},
+            "feature_schema_version",
+            id="feature-schema",
+        ),
+        pytest.param(
+            {"target_schema_version": "hint-certificate-v0"},
+            "target_schema_version",
+            id="target-schema",
+        ),
     ],
 )
 def test_a_certificate_metadata_outside_the_fixed_meaning_is_rejected(

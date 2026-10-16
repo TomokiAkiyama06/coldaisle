@@ -112,6 +112,23 @@ def test_a_symlink_in_the_tree_is_refused(tmp_path: Path, target_is_directory: b
         digest.source_tree_sha256(root)
 
 
+def test_an_unreadable_directory_in_the_tree_is_an_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """読めないディレクトリを黙って飛ばさない（#349 の P1）。"""
+    root = tree(tmp_path / "a", {"__init__.py": b"", "sub/m.py": b"x = 1\n"})
+    real_scandir = os.scandir
+
+    def scandir(path):  # type: ignore[no-untyped-def]
+        if Path(path) == root / "sub":
+            raise PermissionError("listing denied")
+        return real_scandir(path)
+
+    monkeypatch.setattr(os, "scandir", scandir)
+    with pytest.raises(PermissionError):
+        digest.source_tree_sha256(root)
+
+
 def test_the_imported_package_is_the_one_under_test() -> None:
     import coldaisle
 
@@ -306,6 +323,36 @@ def test_the_current_environment_follows_the_sys_path_order(
     monkeypatch.setattr("sys.path", [str(late), str(early)])
     assert ranks() == {"1.0.0": 0, "2.0.0": 1}
     assert digest.environment_sha256() != forward
+
+
+def test_two_distributions_installing_the_same_file_in_one_entry_are_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """同じ項目で同じファイルを入れた2つは、入れた順で実行のコードが決まる（#349 の P1）。"""
+    site = tmp_path / "site"
+    _fake_distribution(site, "shared-pkg", "2.0.0")
+    _fake_distribution(site, "shared-pkg-fork", "1.0.0")
+    monkeypatch.setattr("sys.path", [str(site)])
+    with pytest.raises(ValueError, match="同じファイル"):
+        digest.current_environment()
+
+
+def test_bytecode_listed_by_two_distributions_is_not_an_overlap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    site = tmp_path / "site"
+    for name in ("first", "second"):
+        info = site / f"{name}-1.0.dist-info"
+        info.mkdir(parents=True)
+        (info / "METADATA").write_text(
+            f"Metadata-Version: 2.1\nName: {name}\nVersion: 1.0\n", encoding="utf-8"
+        )
+        (info / "RECORD").write_text(
+            f"{name}/__init__.py,,\nns/__pycache__/x.cpython-312.pyc,,\nns/x.pyc,,\n",
+            encoding="utf-8",
+        )
+    monkeypatch.setattr("sys.path", [str(site)])
+    assert len(digest.current_environment().distributions) == 2
 
 
 def test_the_current_environment_is_fingerprinted() -> None:

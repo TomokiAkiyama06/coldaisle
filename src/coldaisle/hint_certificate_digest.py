@@ -24,8 +24,10 @@ Learned MPC worker が同じ関数を呼ぶ（0152 §2.3。``calibration_offsets
 
 from __future__ import annotations
 
+import csv
 import hashlib
 import importlib.metadata
+import io
 import os
 import platform
 import re
@@ -84,9 +86,15 @@ def imported_package_dir() -> Path:
     return Path(init).resolve().parent
 
 
+def _raise(error: OSError) -> None:
+    # os.walk は既定で読めないディレクトリを黙って飛ばす。飛ばすとそこのコードが束ねる範囲から
+    # 漏れるので、例外のまま返す（fand は照合の失敗として B0 に倒す）。
+    raise error
+
+
 def _source_files(package_dir: Path) -> list[tuple[bytes, Path]]:
     files: list[tuple[bytes, Path]] = []
-    for current, directories, names in os.walk(package_dir, followlinks=False):
+    for current, directories, names in os.walk(package_dir, onerror=_raise, followlinks=False):
         here = Path(current)
         kept: list[str] = []
         for directory in directories:
@@ -184,11 +192,14 @@ def current_environment() -> RuntimeEnvironment:
     rank = 0
     for entry in sys.path:
         found = False
+        owners: dict[str, str] = {}
         for distribution in importlib.metadata.distributions(path=[entry]):
             name = distribution.metadata["Name"]
             if not name:
                 raise ValueError("名前の無い配布物がある")
             record = distribution.read_text("RECORD")
+            if record is not None:
+                _claim_record_files(owners, str(name), record)
             distributions.append(
                 InstalledDistribution(
                     name=str(name),
@@ -209,6 +220,27 @@ def current_environment() -> RuntimeEnvironment:
         machine=platform.machine(),
         distributions=tuple(distributions),
     )
+
+
+def _claim_record_files(owners: dict[str, str], name: str, record: str) -> None:
+    """同じ ``sys.path`` の項目で、2つの配布物が同じファイルを入れていれば ``ValueError``。
+
+    重なったファイルは後から入れた配布物のものが残り、どちらが実行されるかが入れた順で決まる。
+    ``RECORD`` の組は入れた順に依らないので、指紋では区別できない。区別できない環境は指紋を
+    作らない（fand は照合の失敗として B0 に倒す。PR #349 の P1）。``__pycache__`` / ``*.pyc`` は
+    実行時に作り直されるので比べない（0152 §2.3 のソースツリーと同じ除外）。
+    """
+    for row in csv.reader(io.StringIO(record)):
+        if not row or not row[0]:
+            continue
+        path = os.path.normpath(row[0])
+        if path.endswith(_EXCLUDED_SUFFIX) or _EXCLUDED_DIRECTORY in Path(path).parts:
+            continue
+        previous = owners.setdefault(path, name)
+        if previous != name:
+            raise ValueError(
+                f"同じ sys.path の項目で2つの配布物が同じファイルを入れている: {previous} / {name}"
+            )
 
 
 def _distribution_parts(

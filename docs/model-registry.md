@@ -323,7 +323,8 @@ MemoryErrorで落とさないためである。壊れたYAML・JSONやファイ�
   （`register` → `validate` → 承認ファイル付きの `promote`、`rollback` / `retire`）を通す。kind と capability は
   組でだけ使い（片方だけの metadata は拒否）、既存の欄の意味を固定する（0152 §5 の 2 (a)）:
   `training_dataset_version` は認証した thermal_model の key（`thermal_model/<model_id>/<version>`）、
-  `source_runs` は証明書の `certificate_sha256` の1つだけ、`model_family` は `hint-monotonicity-certificate`。
+  `source_runs` は証明書の `certificate_sha256` の1つだけ、`model_family` は `hint-monotonicity-certificate`、
+  `feature_schema_version` は `hint-gate-spec-v1`、`target_schema_version` は `hint-certificate-v1`（決定記録 0156 §2.8）。
   Registry は証明書の中身を読まない（中身の照合は fand と worker が後の段で行う）。閉じた列挙に値を
   足したので **Registry schema version を 3 から 4 へ上げた**。v2 / v3 の snapshot はそのまま読み、次の書き込みで
   v4 にする。v4 より前の版を名乗る snapshot・metadata は `hint_certificate` を持てない。v3 までの読み手は
