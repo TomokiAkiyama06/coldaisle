@@ -48,7 +48,7 @@
 |---|---|---|
 | `observed: ObservedThermalInput` | window（時刻ごとの metric の値と mask）と、直前の effective demand（`action`） | window feature の軸（§2.4）と直前 Demand の軸（§2.3） |
 | `anchor` | `observed` から内部モデルが作る予測 | 格子の点ごとに内部モデルで作る（軸ではない） |
-| `constraints: HardConstraintSet` | 設定の `zone_bounds`・`zone_min_demand`・**この tick の safety floor**・直前の effective・上げ幅 / 下げ幅 | 設定の部分は `optimizer` の部品と Control Config で束ねる（0152 §2.3）。tick ごとに変わるのは safety floor と直前の effective で、前者を代表集合（§2.5）、後者を直前 Demand の軸にする |
+| `constraints: HardConstraintSet` | 設定の `zone_bounds`・`zone_min_demand`・**この tick の safety floor**・直前の effective・上げ幅 / 下げ幅 | 設定の部分（`safety.yaml` の `zone_min_demand`・`ramp_down_per_s` を含む）は部品 `optimizer` で束ねる（§2.5）。tick ごとに変わるのは safety floor と直前の effective で、前者を代表集合（§2.5）、後者を直前 Demand の軸にする |
 | `weights` / `target_band` | Supervisor の context（基準とヒント有り） | `context_overrides` の鍵から導く（§2.2） |
 | `baseline: PerZone[Demand]` | Fallback の Baseline の requested | 代表集合（§2.5） |
 
@@ -138,10 +138,19 @@ supervisor:
 ### 2.5 hard constraints と baseline は「3系統の値の組の列」で代表集合を書く
 
 - **hard constraints**: `HardConstraintSet` のうち tick ごとに変わるのは safety floor と直前の effective で、
-  後者は §2.3 の軸。前者を `safety_floors` に、`{front, rear, top}` の Demand の組の列で書く。設定由来の
-  `zone_bounds`・`zone_min_demand`・上げ幅 / 下げ幅は `optimizer` の部品と Control Config で束ねる（0152 §2.3）ので、
-  ここには書かない。ランナーは各点で `HardConstraintSet.build` を**実行時と同じ関数**で呼ぶ。実行不能（`InfeasiblePlanError`）
-  になる点は、実行時も Fallback になる点なので**試験の対象から外して数え**、その数を証明書には載せずログに出す
+  後者は §2.3 の軸。前者を `safety_floors` に、`{front, rear, top}` の Demand の組の列で書く。ランナーは各点で
+  `HardConstraintSet.build` を**実行時と同じ関数**で呼ぶ
+- **`HardConstraintSet.build` の設定の入力はすべて部品 `optimizer` に束ねる。** 0152 §2.3 の `optimizer`（「`solve` の結果に
+  効くもの」）は、`mpc.optimizer` の `zone_bounds`・`step_ms`・`max_step_up`・`max_step_down` に加えて、
+  **`safety.yaml` の `zone_min_demand` と `ramp_down_per_s`** を含むと読む。この2つは `build` の floor と下げ幅を決めるが、
+  `conditions()` にも `hint_gate` にも入らないので、ここで名指さないと、認証の後に Safety の値を変えても古い証明書が
+  合ってしまう。worker は自分の `--config-dir` の値でこの部品を計算する（0152 §2.6）。ここに挙げたものはゲートの
+  仕様の関数の入力ではない（§5 の 9 の「ゲートの仕様の関数は `zone_min_demand` を読まない」は変えない）
+- **格子の点はすべて実行可能でなければならない。** どれか1点でも `build` が `InfeasiblePlanError` になれば、ランナーは
+  不合格にして証明書を出さない（点を黙って除かない）。`grid_points` は「試して比べた点の数」（0152 §2.3）であり、
+  除いた点を数えたまま証明書に載せると、試していない点を試したと記録することになるため。実行不能になる組
+  （ceiling を超える floor など）は、人が設定の代表集合から外す。ランナーは不合格のとき、実行不能になった点の数と
+  最初の点の軸（値は載せない）をログに出す（0152 §2.1 の不合格のログと同じ規律）
 - **baseline**: `baselines` に `{front, rear, top}` の Demand の組の列で書く（0066 の「baseline の代表集合」の文言どおり）
 - 認証領域: 系統ごとに、列の値の最小〜最大の範囲（組の列の外接箱）。その tick の safety floor / Baseline の
   requested が系統のどれか1つでも範囲の外なら `out_of_certified_domain`
@@ -210,6 +219,7 @@ supervisor:
 
 | トレードオフ | 緩和策 |
 |---|---|
+| 格子の点が1つでも実行不能なら不合格になる | 実行不能な組は実行時も Fallback になる組で、試す意味が無い。人が代表集合から外す。ログに数と最初の点の軸が出る |
 | 直積で点の数が大きくなる（例: 鍵 2 × 直前 Demand 3³ × 温度 4 × 4 × 他の軸 × 代表集合） | ランナーは `SCHED_IDLE`・制御の外。点の数をログに出し、人が刻みを選ぶ。上限の設定は置かない（§5 の 6） |
 | 平らな window は時間方向の変化を試さない | 0066 §2.1 (d) の二重解法が領域の中の tick を毎回確かめる。範囲の判定は外を弾くためだけ |
 | 代表集合の外接箱は、試した組より広い領域を「中」とみなす | 同じく二重解法が受け持つ。範囲の判定で領域の中を認証済みとは扱わない（0066 §2.1 (d)） |
@@ -232,6 +242,8 @@ supervisor:
 | safety floor を系統ごとの軸にして直積で試す | 点の数が3乗で増える。floor の組み合わせは Guard / Safety の状態で決まり、組の列のほうが実際の状態を表しやすい |
 | 天井をコードの定数（スキーマの `le=`）にする | 0066 §2.1 (b) の「コードに定数を置かない」と合わない（ルール 9） |
 | `eps` の値の制約違反を Control Config の不正（全 zone Max）にする | 0066 §2.1 (b) は「Stage B を無効のまま起動」。ヒントは安全の入力ではないので、Fan を全開にする理由にしない |
+| 実行不能な格子の点を除いて数え、ログにだけ残す | 証明書の `grid_points` が試していない点を含み、永続の証拠が実態とずれる。全点が除かれても合格しうる |
+| `HardConstraintSet` の Safety の入力を束ねない（`optimizer` を `mpc.optimizer` だけと読む） | 認証の後に `zone_min_demand` / `ramp_down_per_s` を変えても証明書が合い、認証していない探索の範囲で B1 / B2 が動く |
 | `feature_schema_version` / `target_schema_version` を段 3 に回す | 形が決まったいま決められる。段 3 まで空けると、それまでに登録した証明書の値がばらつく |
 
 ---
