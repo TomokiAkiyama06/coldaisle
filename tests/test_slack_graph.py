@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import io
+import itertools
 import json
 import logging
 import struct
@@ -333,9 +334,38 @@ def test_derived_points_are_computed_from_ok_inputs_only(store, catalog):
         ]
     )
     points = read_points(
-        store, "d.gpu_delta", catalog, start_ms=NOON_MS - MINUTE_MS, end_ms=NOON_MS, limit=100
+        store, "d.gpu_delta", catalog, start_ms=NOON_MS - MINUTE_MS, end_ms=NOON_MS, max_points=100
     )
     assert points == ((NOON_MS - 20_000, 20.0),)
+
+
+@pytest.mark.parametrize("metric", ["air.gpu_exhaust", "d.gpu_delta"])
+def test_long_window_is_thinned_evenly_from_start_to_end(store, catalog, metric):
+    """1 日・1 s ごとでも、窓の先頭から末尾まで点がある（行数で古い側を捨てない。Codex P2）。"""
+    day_ms = 86_400_000
+    start_ms = NOON_MS - day_ms
+    store.insert_samples(
+        [
+            Sample(
+                ts_ms=start_ms + i * 1000,
+                readings=(
+                    Reading(metric="air.gpu_exhaust", value=40.0 + (i % 10), quality=Quality.OK),
+                    Reading(metric="air.gpu_intake", value=30.0, quality=Quality.OK),
+                ),
+            )
+            for i in range(day_ms // 1000)
+        ]
+    )
+    points = read_points(
+        store, metric, catalog, start_ms=start_ms, end_ms=NOON_MS + 1, max_points=1000
+    )
+    assert 900 <= len(points) <= 1000
+    assert points[0][0] < start_ms + day_ms // 500, "窓の先頭の近くに点がある"
+    assert points[-1][0] == NOON_MS - 1000, "直近の行を含む"
+    gaps = [b[0] - a[0] for a, b in itertools.pairwise(points)]
+    assert max(gaps) <= 2 * day_ms // 1000, "途中が抜けていない"
+    offset = 30.0 if metric == "d.gpu_delta" else 0.0
+    assert all(abs(value + offset - 44.5) < 1.0 for _, value in points), "区間の平均"
 
 
 def test_render_alert_graph_reads_the_last_window(store, rule_set, catalog, graph_config):

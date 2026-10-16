@@ -1380,6 +1380,48 @@ class SqliteStore:
             for row in rows
         )
 
+    def ok_series_buckets(
+        self,
+        metric: str,
+        start_ms: int,
+        end_ms: int,
+        bucket_ms: int,
+        *,
+        subtrahend: str | None = None,
+    ) -> tuple[tuple[int, float], ...]:
+        """`[start_ms, end_ms)` を `bucket_ms` ごとに区切り、`quality='ok'` の値の平均を返す。
+
+        通知のグラフ用（決定記録 0147 §2.3）。**窓全体を均等に間引く。** 行数で打ち切ると
+        窓の片側だけが残り、軸が示す期間と中身が食い違う。時刻は区間の中で最も新しい行の時刻。
+
+        `subtrahend` を渡すと、同じ時刻に両方 `ok` の行だけで `metric - subtrahend` を平均する
+        （派生値は保存しないため。決定記録 0002 §2.2）。区間に行が無ければ点を返さない。
+        """
+        validate_metric(metric)
+        self._check_range(start_ms, end_ms)
+        if bucket_ms <= 0:
+            raise ValueError("bucket_ms は正にする")
+        ok = Quality.OK.value
+        if subtrahend is None:
+            rows = self._conn.execute(
+                "SELECT (ts_ms - ?) / ? AS bucket, MAX(ts_ms) AS ts, AVG(value) AS value "
+                "FROM readings WHERE metric = ? AND ts_ms >= ? AND ts_ms < ? "
+                "AND quality = ? AND value IS NOT NULL GROUP BY bucket ORDER BY bucket",
+                (start_ms, bucket_ms, metric, start_ms, end_ms, ok),
+            ).fetchall()
+        else:
+            validate_metric(subtrahend)
+            rows = self._conn.execute(
+                "SELECT (a.ts_ms - ?) / ? AS bucket, MAX(a.ts_ms) AS ts, "
+                "AVG(a.value - b.value) AS value "
+                "FROM readings AS a JOIN readings AS b "
+                "ON b.metric = ? AND b.ts_ms = a.ts_ms AND b.quality = ? AND b.value IS NOT NULL "
+                "WHERE a.metric = ? AND a.ts_ms >= ? AND a.ts_ms < ? "
+                "AND a.quality = ? AND a.value IS NOT NULL GROUP BY bucket ORDER BY bucket",
+                (start_ms, bucket_ms, subtrahend, ok, metric, start_ms, end_ms, ok),
+            ).fetchall()
+        return tuple((int(row["ts"]), float(row["value"])) for row in rows)
+
     def rollup(
         self, metric: str, start_ms: int, end_ms: int, agg: Aggregation
     ) -> tuple[RollupPoint, ...]:

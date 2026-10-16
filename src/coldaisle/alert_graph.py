@@ -14,9 +14,10 @@ from __future__ import annotations
 
 import contextlib
 import logging
+import math
 import queue
 import threading
-from collections.abc import Callable, Sequence
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
@@ -26,7 +27,6 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from coldaisle import logs
 from coldaisle.clock import Clock
-from coldaisle.measurement import Quality
 from coldaisle.metrics import MetricCatalog
 from coldaisle.notify.models import DisplayNames, Notification
 from coldaisle.notify.png_chart import MAX_SERIES_PER_PANEL, Panel, Series, Threshold, render_png
@@ -36,7 +36,7 @@ from coldaisle.rules.models import (
     RuleSet,
     ThresholdRule,
 )
-from coldaisle.store.models import AlertSeverity, SeriesPoint
+from coldaisle.store.models import AlertSeverity
 
 LOGGER = logging.getLogger("coldaisle.notify")
 
@@ -87,9 +87,15 @@ def load_graph_config(path: Path) -> GraphConfig | None:
 class SeriesReader(Protocol):
     """グラフに要る読み出しだけ（`SqliteStore` が満たす）。"""
 
-    def series(
-        self, metric: str, start_ms: int, end_ms: int, *, limit: int | None = None
-    ) -> tuple[SeriesPoint, ...]: ...
+    def ok_series_buckets(
+        self,
+        metric: str,
+        start_ms: int,
+        end_ms: int,
+        bucket_ms: int,
+        *,
+        subtrahend: str | None = None,
+    ) -> tuple[tuple[int, float], ...]: ...
 
     def close(self) -> None: ...
 
@@ -179,30 +185,24 @@ def read_points(
     *,
     start_ms: int,
     end_ms: int,
-    limit: int,
+    max_points: int,
 ) -> tuple[tuple[int, float], ...]:
-    """品質 `ok` の点だけ。
+    """品質 `ok` の点だけを、**窓全体で均等に** `max_points` 区間までに間引いて読む。
 
+    区間ごとの平均を SQL で出す（`ok_series_buckets`）。行数で打ち切らない（窓の片側だけが
+    残ると、軸が示す期間と中身が食い違う）。区間の幅は窓 ÷ `max_points` で、既定の 60 分・
+    4000 点なら 900 ms（2.5 s の取り込みでは 1 区間に 1 行なので生の値のまま）。
     派生値は保存しないので（0002 §2.2）、材料を同じ時刻で突き合わせて引く。
     """
+    bucket_ms = max(1, math.ceil((end_ms - start_ms) / max_points))
     derived = catalog.derived.get(metric)
     if derived is None:
-        return _ok_points(reader.series(metric, start_ms, end_ms, limit=limit))
-    minuend = dict(_ok_points(reader.series(derived.minuend, start_ms, end_ms, limit=limit)))
-    subtrahend = dict(_ok_points(reader.series(derived.subtrahend, start_ms, end_ms, limit=limit)))
-    return tuple(
-        (ts_ms, round(value - subtrahend[ts_ms], 3))
-        for ts_ms, value in sorted(minuend.items())
-        if ts_ms in subtrahend
-    )
-
-
-def _ok_points(points: Sequence[SeriesPoint]) -> tuple[tuple[int, float], ...]:
-    return tuple(
-        (point.ts_ms, float(point.value))
-        for point in points
-        if point.quality is Quality.OK and point.value is not None
-    )
+        points = reader.ok_series_buckets(metric, start_ms, end_ms, bucket_ms)
+    else:
+        points = reader.ok_series_buckets(
+            derived.minuend, start_ms, end_ms, bucket_ms, subtrahend=derived.subtrahend
+        )
+    return tuple((ts_ms, round(value, 3)) for ts_ms, value in points)
 
 
 @dataclass(frozen=True)
@@ -228,7 +228,7 @@ def render_alert_graph(
     plan = plan_graph(request.rule_id, request.metric, rules=rules, names=names)
     window_ms = round(config.window_s * 1000)
     start_ms = request.end_ms - window_ms
-    # `series()` の範囲は [start, end)。送った時刻の点まで入れる
+    # 読み出しの範囲は [start, end)。送った時刻の点まで入れる
     end_exclusive = request.end_ms + 1
     by_unit: dict[str, list[tuple[str, tuple[tuple[int, float], ...]]]] = {}
     for metric in plan.metrics:
@@ -238,7 +238,7 @@ def render_alert_graph(
             catalog,
             start_ms=start_ms,
             end_ms=end_exclusive,
-            limit=config.max_points * 4,
+            max_points=config.max_points,
         )
         unit = catalog.unit_for(metric) or ""
         group = by_unit.setdefault(unit, [])
