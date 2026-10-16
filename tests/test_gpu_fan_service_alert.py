@@ -502,8 +502,14 @@ class BoardWithTelemetry:
                 yield RawSample(seq=index, up=index, channels={"room_temp": 26.0})
 
 
-def test_stopped_service_reaches_the_notifier_without_asking_the_llm(tmp_path, rules, rule_set):
-    """偽の NVML →（収集）→ DB →（取り込みのルールエンジン）→ 通知。説明は求めない（§2.4a）。"""
+def test_stopped_service_reaches_the_notifier_and_asks_for_an_explanation(
+    tmp_path, rules, rule_set
+):
+    """偽の NVML →（収集）→ DB →（取り込みのルールエンジン）→ 通知と説明。
+
+    LLM は GPU の Fan を読むだけ許される（決定記録 0146。0131 §2.4a を置き換え）。
+    出荷の一覧のまま、ほかのアラートと同じに説明を求める。
+    """
     db = tmp_path / "e2e.db"
     clock = SimulatedClock(NOW_MS)
     store = SqliteStore(db, rules=rules, clock=clock)
@@ -529,7 +535,7 @@ def test_stopped_service_reaches_the_notifier_without_asking_the_llm(tmp_path, r
         fired = [n for n in notifier.sent if n.rule_id == NOT_MANUAL]
         assert [(n.state, n.severity.value) for n in fired] == [("firing", "warning")]
         assert "systemctl status coldaisle-gpu-fan" in (fired[0].detail or "")
-        assert asked == [], "除外の一覧の rule_id は LLM に説明を求めない"
+        assert asked == [NOT_MANUAL], "0146: GPU の Fan のアラートも説明を求める（読むだけ）"
         # 停止は 4 回目の読み取りの後（7.5 s）。そこから 30 s で発火
         assert rows(store, NOT_MANUAL)[0].started_ms == at(4 * STEP_S)
         assert rows(store, NOT_MANUAL)[0].fired_ms == at(4 * STEP_S + 30)

@@ -1,7 +1,7 @@
 # 決定記録 0145: 12V-2x6 コネクタの温度を 2 段で通知する（警告 65 °C・重大 75 °C）
 
 - **種別**: Decision Record
-- **Status**: Proposed
+- **Status**: FINAL（2026-10-16、リポジトリ所有者の承認）
 - **Date**: 2026-10-15
 - **Supersedes**: なし（0110 の Critical Safety の 80 °C と、0012 / 0131 §2.3 / 0139 の状態機械は変えない）
 - **関連**: [`0110`](0110-t-sensor-ceiling-and-enablement.md)（T_SENSOR・80 °C・0 °C 未満は suspect） /
