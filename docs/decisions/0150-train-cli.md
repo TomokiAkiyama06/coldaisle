@@ -225,7 +225,7 @@ process が強制終了したとき（`SIGKILL`・電源断）は片づけられ
 
 - **(a) 途中の失敗・電源断・強制終了。** どこで止まっても、`--out` は「無い」「未完成と分かる（有効な `COMPLETE.json` が無い）」
   「完成している」のどれかで、Registry は 0062 / 0104 の確定点の前か後のどちらかにある。残ったものと回復は §2.4 の表に書く
-- **(b) 別のユーザー（`--out` の親や祖先に書ける者）による名前の差し替え。** 開始の時点で、根から `--out` の親までの各
+- **(b) 別のユーザー（`--out` の親や祖先に書ける者。mode の bit と POSIX ACL のどちらで書けるかを問わない）による名前の差し替え。** 開始の時点で、根から `--out` の親までの各
   ディレクトリが「信頼できる祖先」（下の「path の照合」の (a) か (b)）であることを確かめ、満たさなければ拒む。満たすとき、
   別のユーザーは途中のどの要素の名前も変えられない: ある要素の名前を変えるにはその親ディレクトリへの書き込みが要るが、
   (a) の親は root か実行した uid だけが書け、(b) の sticky な親（`/tmp` など）では、中の項目の名前を変えられるのはその項目か
@@ -295,6 +295,14 @@ process が強制終了したとき（`SIGKILL`・電源断）は片づけられ
   消せるので、D の所有者が別のユーザーなら最後の照合の後に `--out` を差し替えられる（D の所有者を確かめないと (b) は成り立たない）。
   どちらも満たさなければ失敗（段 `untrusted_path`、終了コード 1）。`--out` そのものは手順 2 で書き手が `0700` で作るので
   (a) を満たす
+  (c) **POSIX ACL を持たないこと**（(a)(b) のどちらにも加える）。mode の bit だけでは、名前つきの ACL の項目で別の uid に書き込みを
+  渡したディレクトリを見逃す（本リポジトリは 0104 §2.2 で ACL を実際に使う）。ACL の実効の権限を解く処理は持たず、ACL が
+  あること自体を拒む: fd に対する `os.listxattr` に `system.posix_acl_access` か `system.posix_acl_default` があれば失敗（段
+  `untrusted_path`。ログに祖先の path と見つけた属性の名前）。default ACL も拒むのは、親に default ACL があると手順 2 で作る
+  `--out` がそれを受け継ぎ、`0700` でも別の uid が中に書けるためである。`--out` も手順 2 の直後に同じ検査をする。
+  `os.listxattr` が無い環境（macOS の Python の標準ライブラリには無い）では ACL を確かめられないので、ログに
+  「ACL を検査していない」と出したうえで (a)(b) だけで判定し、**その環境では脅威の前提の (b) は ACL の無い置き場所を前提にする**
+  （§5 の 15）。OS の名前では分岐せず、関数の有無で分ける
 - たどり方: `os.open("/", O_RDONLY | O_DIRECTORY | O_NOFOLLOW)` から始め、各要素（最後の `--out` も）を
 `os.open(名前, O_RDONLY | O_DIRECTORY | O_NOFOLLOW, dir_fd=ひとつ前の fd)` で開いては前の fd を閉じる。最後に開いた fd の
 `fstat` の `(st_dev, st_ino)` が、手順 2 で固定した fd の `fstat` と一致するときだけ一致とする。途中か最後の要素が symlink なら
@@ -330,6 +338,11 @@ process が強制終了したとき（`SIGKILL`・電源断）は片づけられ
 - この関数は `training_output.py` に置き、`train.py`（手順 5・手順 6 の後・`--apply` の登録の直前・手順 7 の rmdir の前）と
   `coldaisle-registry register --training-output`（`--out` を開いて印を確かめた後、`register_candidate` を呼ぶ直前と直後）の
   両方が同じ関数を使う。直前で違えば終了コード 1 で Registry を開かない。直後で違えば段 `out_replaced_after_register`
+  （終了コード 1）。**`register --training-output` も、登録の後・成功の報告の前に、確かめる関数をもう一度同じ `--out` の fd に
+  通し、返った bytes と印が登録した bytes と同じことを確かめる**（`coldaisle-train` の「中身の再検証」と同じ）。違えば・印が
+  無効になっていれば段 `out_modified_after_register`・終了コード 1 で、登録した artifact の key・違ったファイルと2つの SHA-256 を
+  出し、成功を報告しない（candidate は登録済みで、中身は登録の直前に確かめた bytes で正しい。§2.4 の表の行と同じ回復）。path と
+  directory の inode が同じままでも、同じ uid がファイルをその場で書き換えうるため
   （終了コード 1）
 
 **読む側は、有効な `COMPLETE.json` の無い `--out` を未完成として拒む。** 有効とは、`COMPLETE.json`（一時名ではない）が
@@ -614,6 +627,12 @@ best-effort で `OSError` / `UnsafeRegistryPathError` を握る（`src/coldaisle
   candidate が1つ足されていて（上の (1)〜(4)）、登録の後の検査へ進み、段 `register_durability` で終了コード 1。artifact ファイルの
   段で起こしたときは登録が確定せず（`registry.json` と参照される artifact は同じ。片付けが成功すれば参照されない artifact も
   残らず、片付けも失敗させると参照されない artifact が残りうることを、どちらも確かめる）、段 `register` で終了コード 1
+- ACL（`os.listxattr` がある環境だけ。無ければ skip）: 祖先か親に `system.posix_acl_access` / `system.posix_acl_default` がある
+  とき（`os.listxattr` を包んで返す属性を差し替えて試す）、mode が (a) を満たしても学習の前に段 `untrusted_path`・終了コード 1 で
+  拒否され、`--out` が作られないこと。`os.listxattr` が無いときは「ACL を検査していない」のログが出て (a)(b) だけで判定すること
+- `register --training-output` の登録の後の再検証: `register_candidate` を包んで、登録の途中で `--out` の `artifact.json` を
+  その場で書き換えると（inode は変えない）、段 `out_modified_after_register`・終了コード 1 で成功を報告せず、candidate の bytes は
+  確かめた bytes であること
 - 確定の後の `RegistryDurabilityError`（`coldaisle-train --apply` と `coldaisle-registry register --training-output` の両方）:
   `registry.json` の置き換えの後に例外を起こし、読み直しの前に同じ ref を `retire`
   （と `validate`）で進めた場合でも、段 `register_durability`・終了コード 1 に分類され（`coldaisle-train` は登録の後の L1〜L12 の検査も行う）、読んだ状態をログに出し、
@@ -714,3 +733,4 @@ best-effort で `OSError` / `UnsafeRegistryPathError` を握る（`src/coldaisle
 | 12 | 設定の入力（§2.7 の6つ）を読む上限の値と置き場所。**決定済み（所有者、2026-10-16）: 推奨のとおり** | **`train.py` の構造上の定数 `MAX_TRAINING_CONFIG_BYTES = 1 MiB`**（6つに共通）。運用の閾値ではなくメモリを守る構造上の上限で、既存の `MAX_ARTIFACT_BYTES`（`control/model/thermal.py`）・`_MAX_JOURNAL_BYTES`（`control/authority.py`）・`MAX_DECLARED_CHANGES` と同じ扱い。いまの設定は数 KB で、宣言の YAML も `MAX_DECLARED_CHANGES` = 64 件に収まる。利点: `--apply` の無い実行でも追加の設定が要らず、上限を決めるファイル自身の読みに上限が要るという循環が無い | (a) `--registry-limits` を常に必須にし、その `max_snapshot_bytes` を使う（0062 §2.1 と同じ値）。欠点: `--out` だけの実行にも Registry の設定が要り、`model-registry.yaml` 自身は別の上限で読む必要が残る。(b) `--training-spec` に置く。欠点: spec 自身の読みに上限が要る |
 | 13 | macOS の `/tmp`・`/var` など、OS が置く symlink を含む `--out`。**決定済み（所有者、2026-10-16）: 推奨のとおり** | **受け入れない**（§2.5 の「path の照合」）。symlink を含まない実の path（`/private/tmp/...`）を人が渡し、CLI は拒否のログでそれを示す。利点: 解く処理が無く、照合の窓が増えない・Dataset の writer（`_open_output_root`）と挙動が揃う・OS ごとの分岐が無い（NFR-07） | (a) root の所有の `/` の中の root の所有の symlink（`/tmp`・`/var`・`/etc`）だけを、`fstat` と `readlink` で確かめて一度だけ解き、先を fd で開いて照合を続ける。欠点: 別名の一覧（macOS の分岐）を持つ・Ubuntu の CI では模してしか試験できない |
 | 14 | 既存の `coldaisle-registry register --metadata/--payload` で、学習の出力（書きかけを含む）を登録させない方法 | **読んだ metadata の中身で拒む**（`kind` = `thermal_model` かつ `capability` = `counterfactual_action` なら拒否し `--training-output` を促す。§2.5）。ファイルシステムの競合・symlink・link・写しに依らない。`read_bounded` の読み方は変えない。欠点: 反実仮想 thermal model をこの経路で登録できなくなる（いまの作り手は `coldaisle-train` だけ）・`docs/model-registry.md` の登録の段を書き換える | (a) 同じディレクトリの `training-report.json` で判定し、最後の要素を `O_NOFOLLOW` で開いて親の fd に束縛する（前の版の案）。欠点: 読んだ後に書き手の後始末が `training-report.json` を消すと検査を外れる競合が残る・hard link と写しで外れる。(b) 書き手の後始末と legacy の読みを lock で直列にする。欠点: 新しい lock の file と順序の約束が要り、強制終了の後の lock の扱いも決める必要がある |
+| 15 | 祖先の POSIX ACL を確かめられない環境（`os.listxattr` が無い。macOS の Python の標準ライブラリ） | **ACL を検査せず (a)(b) だけで判定し、ログに「ACL を検査していない」と出す。その環境の脅威の前提 (b) は ACL の無い置き場所を前提にする**（§2.5）。Linux（CI と本番）では ACL を拒む。OS の名前で分岐せず関数の有無で分ける。利点: macOS でも使え、ctypes を足さない（NFR-07） | (a) `os.listxattr` が無ければ `untrusted_path` で拒む（macOS では使えなくなる）。(b) macOS の `acl_get_fd` を ctypes で呼ぶ（OS ごとの関数・CI で試験できない） |
