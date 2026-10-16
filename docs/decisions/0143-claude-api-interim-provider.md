@@ -1,7 +1,7 @@
 # 決定記録 0143: ローカル LLM が入るまでの間だけ Claude API を LLM の Provider として使う
 
 - **種別**: Decision Record
-- **Status**: Proposed
+- **Status**: FINAL（2026-10-16、リポジトリ所有者の承認）
 - **Date**: 2026-10-15
 - **Supersedes**: [`0005-model-selection.md`](0005-model-selection.md) の「ローカルモデルだけを使う」前提の一部
   （ローカル LLM が導入先に入るまでの間に限る。§2.1）と、
