@@ -16,12 +16,13 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 from coldaisle import logs
 from coldaisle.clock import Clock
 from coldaisle.metrics import MetricCatalog, compute_derived
 from coldaisle.rules.models import (
+    ExpectedReference,
     FlagOffRule,
     HotAndSlowRule,
     PowerReferencedRule,
@@ -84,6 +85,8 @@ class Transition:
     value: float | None
     detail: str | None = None
     severity: str = "warning"
+    reference: ExpectedReference | None = None
+    """電力で判定するルールが比べた期待値（決定記録 0144）。それ以外のルールは `None`。"""
 
 
 _ABSENT = object()
@@ -475,7 +478,26 @@ class Engine:
                 f"（直近 {rule.power_window_s:.0f} 秒の最大）の期待値 {expected:.1f}"
             )
         detail = f"{rule.metric} = {value:.1f}。{basis} を {excess:.1f} 超えている"
-        if state.since_ms is None:
+        reference = ExpectedReference(power_w=power, expected=expected, excess=excess)
+        return [
+            replace(transition, reference=reference)
+            for transition in self._hold_power_referenced(
+                rule_id, rule, value, expected, detail, started=state.since_ms is not None
+            )
+        ]
+
+    def _hold_power_referenced(
+        self,
+        rule_id: str,
+        rule: PowerReferencedRule,
+        value: float,
+        expected: float,
+        detail: str,
+        *,
+        started: bool,
+    ) -> list[Transition]:
+        """成立している周期。待ちを開くか続ける（閾値は発火の時点の値。0144 §2.6）。"""
+        if not started:
             return self._begin(
                 rule_id,
                 rule.metric,

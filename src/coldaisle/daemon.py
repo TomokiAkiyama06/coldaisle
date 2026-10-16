@@ -551,6 +551,7 @@ class Daemon:
                     dashboard_url=self._notifier.config.dashboard_url,
                     context=dict(self._latest_values),
                     names=self._names,
+                    reference=transition.reference,
                 )
             )
             if not sent:

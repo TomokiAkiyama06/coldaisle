@@ -20,7 +20,7 @@ import yaml
 from pydantic import BaseModel, ConfigDict, Field
 
 from coldaisle.metrics import MetricCatalog
-from coldaisle.rules.models import RuleSet, rule_metrics
+from coldaisle.rules.models import ExpectedReference, RuleSet, rule_metrics
 from coldaisle.store.models import AlertSeverity
 
 DASHBOARD_URL_ENV = "COLDAISLE_DASHBOARD_URL"
@@ -318,6 +318,8 @@ class Notification:
     """本文をそのまま渡す場合に使う（説明の全文）。"""
     names: DisplayNames = field(default_factory=DisplayNames)
     """ID → 人が読む文と名前（決定記録 0142）。空なら ID のまま出す。"""
+    reference: ExpectedReference | None = None
+    """電力で判定するルールが比べた期待値（決定記録 0144）。遷移からそのまま渡す。"""
 
     @property
     def title(self) -> str:
@@ -430,9 +432,8 @@ class Notification:
         if text.kind == "threshold" and text.threshold is not None:
             note = f"（閾値 {_num(text.threshold, unit)} を超過）"
         elif text.kind == "excess":
-            # 設定の threshold は期待値を超えた分（決定記録 0144）。
-            # 期待値は電力で変わるので数を書かない
-            note = "（GPU の電力に応じた正常の上限を超過）"
+            # 設定の threshold は期待値を超えた分（決定記録 0144）。期待値はエンジンが比べた値を書く
+            note = _excess_note(self.reference, unit)
         elif text.kind == "range" and text.low is not None and value < text.low:
             note = f"（下限 {_num(text.low, unit)} を下回る）"
         elif text.kind == "range" and text.high is not None and value > text.high:
@@ -440,3 +441,14 @@ class Notification:
         elif text.kind == "below" and text.below is not None:
             note = f"（{_num(text.below, unit)} 未満）"
         return f"{name} {_num(value, unit)}{note}"
+
+
+def _excess_note(reference: ExpectedReference | None, unit: str) -> str:
+    """電力で判定するルールの括弧（決定記録 0144 §2.6）。参照電力・期待値・超過を書く。"""
+    if reference is None:
+        return "（GPU の電力に応じた正常の上限を超過）"
+    expected = _num(reference.expected, unit)
+    excess = _num(reference.excess, unit)
+    if reference.power_w is None:
+        return f"（GPU の電力が分からないため最大の期待 {expected} を {excess} 超過）"
+    return f"（GPU {reference.power_w:.0f} W の期待 {expected} を {excess} 超過）"

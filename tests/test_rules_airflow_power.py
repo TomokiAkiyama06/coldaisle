@@ -463,3 +463,73 @@ def test_unknown_power_metric_is_rejected(tmp_path, store):
     rules = RuleSet.from_yaml(_write_rules(tmp_path, power_metric="power.gpu.9"))
     with pytest.raises(ValueError, match=r"power\.gpu\.9"):
         make_engine(store, rules)
+
+
+# ---------------------------------------------------------------- 通知（本番の daemon の経路）
+
+
+def _daemon_notifications(tmp_path: Path, *, power: float | None) -> list:
+    """本番の `Daemon` の組み立てと `_record` で通知を作る。context を手で入れない。
+
+    `power.gpu.0` は `coldaisle-telemetry` と同じく DB へ直接書く（基板のサンプルに載らない）。
+    基板のサンプルは daemon と同じく DB へ書いてからエンジンで評価する。
+    """
+    from coldaisle.daemon import Config, build
+    from coldaisle.notify import Notification, NotifyConfig, Router
+    from conftest import CALIBRATION_PATH, QUALITY_RULES_PATH, SCENARIOS_PATH
+
+    received: list[Notification] = []
+
+    class Recorder:
+        def send(self, notification: Notification) -> None:
+            received.append(notification)
+
+    daemon = build(
+        Config(
+            source="mock",
+            scenario="recirculation",
+            speed=60.0,
+            db=tmp_path / "notify.db",
+            scenarios=SCENARIOS_PATH,
+            quality_rules=QUALITY_RULES_PATH,
+            calibration=CALIBRATION_PATH,
+            rules=RULES_PATH,
+            metrics=METRICS_PATH,
+            notify=CONFIG_DIR / "notify.yaml",
+            tick_s=0.05,
+        )
+    )
+    daemon._notifier = Router(
+        config=NotifyConfig.from_yaml(CONFIG_DIR / "notify.yaml"),
+        notifiers={"slack": Recorder(), "stdout": Recorder()},
+        clock=SimulatedClock(1_787_626_800_000),  # 昼（夜間の抑制に掛けない）
+    )
+    try:
+        seconds = 0.0
+        while seconds < 400:
+            if power is not None:
+                daemon.store.insert_sample(_sample(seconds, {POWER: power}))
+            exhaust = INTAKE_C + 41.2
+            board = _sample(seconds, {"air.gpu_intake": INTAKE_C, "air.gpu_exhaust": exhaust})
+            daemon.store.insert_sample(board)
+            daemon._record(daemon._engine.on_sample(board))
+            seconds += STEP_S
+    finally:
+        daemon.store.close()
+    return [item for item in received if item.rule_id == RULE_ID and item.state == "firing"]
+
+
+def test_daemon_notification_shows_power_expected_and_excess(tmp_path):
+    """0144 §2.6: 値の行に参照電力・期待値・超過を書く（daemon の context に電力は無い）。"""
+    fired = _daemon_notifications(tmp_path, power=600.0)
+    assert fired
+    assert POWER not in fired[0].context, "電力は基板の値に載らない（遷移から渡す）"
+    line = fired[0].as_text().splitlines()[1]
+    assert line.startswith("GPUが与えた熱 41.2 °C（GPU 600 W の期待 34.0 °C を 7.2 °C 超過）")
+
+
+def test_daemon_notification_says_power_was_unknown(tmp_path):
+    fired = _daemon_notifications(tmp_path, power=None)
+    assert fired
+    line = fired[0].as_text().splitlines()[1]
+    assert "（GPU の電力が分からないため最大の期待 34.0 °C を 7.2 °C 超過）" in line

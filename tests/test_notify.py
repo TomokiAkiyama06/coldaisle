@@ -374,18 +374,14 @@ def test_alert_without_metric_has_id_only():
             "室温 30.5 °C（閾値 30.0 °C を超過）",
         ),
         (
-            # 決定記録 0144: 設定の threshold は期待値を超えた分なので数を書かない
+            # 決定記録 0144: 遷移に比べた期待値が無いとき（参照電力と期待値の文は
+            # tests/test_rules_airflow_power.py の daemon の経路で確かめる）
             "AIRFLOW_DEGRADED",
             "d.gpu_delta",
             47.0,
-            {
-                "air.gpu_exhaust": 68.0,
-                "air.gpu_intake": 21.0,
-                "power.gpu.0": 600.0,
-                "air.room": 24.1,
-            },
+            {"air.gpu_exhaust": 68.0, "air.gpu_intake": 21.0, "air.room": 24.1},
             "GPUが与えた熱 47.0 °C（GPU の電力に応じた正常の上限を超過）・GPU排気 68.0 °C"
-            "・GPU吸気 21.0 °C・GPU消費電力 600.0 W・室温 24.1 °C",
+            "・GPU吸気 21.0 °C・室温 24.1 °C",
         ),
         (
             "HUMIDITY_OUT_OF_RANGE",

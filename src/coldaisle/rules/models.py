@@ -9,6 +9,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from itertools import pairwise
 from pathlib import Path
 from typing import Any, Literal
@@ -82,6 +83,21 @@ class ExpectedPoint(BaseModel):
 
     power_w: float = Field(ge=0)
     value: float
+
+
+@dataclass(frozen=True)
+class ExpectedReference:
+    """電力で判定するルールが比べた相手（決定記録 0144 §2.6）。通知の値の行に出す。
+
+    基板のサンプルに `power.gpu.0` は載らないので、通知の側では電力も期待値も分からない。
+    判定に使った値をエンジンから遷移に載せて渡す
+    （アラートの行には `detail` と `threshold` で残る）。
+    """
+
+    power_w: float | None
+    """参照電力（直近の窓の最大）。**分からなければ `None`**（期待値は表の最大）。"""
+    expected: float
+    excess: float
 
 
 class PowerReferencedRule(_Rule):
