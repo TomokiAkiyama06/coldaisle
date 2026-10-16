@@ -188,8 +188,11 @@ DB に残る記録で、これを直接に言える欄は無い（2026-10-16 の
   同じく区間の終わりまで読む。こうして判定が `--start` / `--end` の置き方に依らないようにする
 - 決まった長さの窓（例: 直近 30 分の割合）にしないのは、simulated の運転で前半が外れ、窓に入る後半だけがたまたま
   合う、という場合を窓では捨てられないため。区間の全体なら、その運転全体の性質で判定できる
-- 読むのは trace の `ts_ms`・`state.operating_mode`・`zones.*.hardware.pwm_raw` だけ（SQL の `json_extract` で取り出し、
-  trace の全体を検証の型に通さない）と、同じ範囲の `fan.*.pwm` の ok の行。保持期間（`control_trace_days` /
+- 読むのは trace の `ts_ms`・`state.operating_mode`・3 つの zone の `zones.<zone>.hardware.pwm_raw` /
+  `write_ok` / `readback_ok`（`hardware` が無いことも含む）だけ（SQL の `json_extract` で取り出し、trace の全体を
+  検証の型に通さない）と、同じ範囲の `fan.*.pwm` の ok の行。区間の割合の数え方は、上の tick ごとの規則と
+  **同じ判定の関数**を使う（flag が false・`hardware` が無い tick は、PWM がたまたま合っていても不一致に数える）。
+  2 つの経路で判定を書き分けない保持期間（`control_trace_days` /
   `raw_days` 30 日）が上限なので、1 区間で最大約 260 万 tick。手動で時々走らせる CLI として許容する
 - **trace が欠けていないと言える時刻の下限** `trace_complete_from_ms` を、`control_trace_prune`（0007 / 0010）の
   `legacy_until_ms` と `pruned_before_ms`（`NULL` なら 0）の大きいほうとする。`legacy_until_ms` は 0007 の移行の前の
@@ -209,11 +212,15 @@ DB に残る記録で、これを直接に言える欄は無い（2026-10-16 の
   記録を消すだけで DB に書かない。引き継ぎの結果（`safety_handoff_completed` と zone ごとの `status`）は journal の
   ログにだけ出る。`control_admin_audit` は管理ソケットの指令だけで、`systemctl stop` を記録しない
 - そのため `bios` は次のどちらかのときだけにする:
-  1. `t` が `trace_complete_from_ms` より後で、`(trace_complete_from_ms, t)` に trace が 1 行も無く、DB の最も古い
-     trace も `t` より後（fand がこの DB に一度も書いていない。導入先では 2026-10-13 より前の履歴）。
-     `t` が `trace_complete_from_ms` 以下なら、`pruned_through_seq` が 0 でも、移行の前や保持期間の削除で trace が
-     消えた可能性を除けないので 1 は使わず、`bios_confirmed` が無ければ `undetermined`。fand がほかの DB へ
-     書いていた期間は判定できない（fand は取り込みと同じ DB に書く前提。0080）
+  1. fand がこの DB に**一度も書いていない**と示せる DB で、`t` が `legacy_until_ms` より後。示せるとは、
+     `control_traces` に**全期間で 1 行も無く**、`control_trace_prune` の `pruned_through_seq` が 0 で、
+     `pruned_before_ms` が `NULL` のときだけ。`legacy_until_ms` は 0007 で必ず書かれ（`NOT NULL`）、その前に trace が
+     無かったことを DB からは示せないので、`legacy_until_ms` 以前の `t` には使わない。
+     **trace の無い区間は、fand が動かなかった証拠にしない。** 保持期間の削除で古い trace が消えると、消した範囲と
+     残る最初の trace の間には trace が無いが、その前の運転が異常終了し 3 つの zone の引き継ぎがすべて失敗していれば、
+     全速未満の回転数のまま fand の後の状態が続きうる。trace が 1 行でもある DB・削除の記録がある DB では 1 を使わず、
+     `bios_confirmed` が無ければ `undetermined`。fand がほかの DB へ書いていた期間は判定できない（fand は取り込みと
+     同じ DB に書く前提。0080）
   2. `t` が `--periods` の **`bios_confirmed`** の区間の中にある。人が journal（`safety_handoff_completed` が無い、
      または `record_found: false`）や `systemctl` の記録で、直前の fand の停止が正常だったこと・再起動したことを
      確かめて書く。区間ごとに根拠の文（`basis`）を必須にし、出力の来歴にそのまま写す
@@ -301,9 +308,14 @@ DB に残る記録で、これを直接に言える欄は無い（2026-10-16 の
 - 書き込みの確かめ（§2.6a）: PWM が合っていても `write_ok` か `readback_ok` が false の zone がある tick
   （`ENABLE_REVERTED` で `readback_ok = false` を含む）・`hardware` の無い tick は `undetermined`。区間の中で
   そうした tick が `pwm_mismatch_max_ratio` を超えると、合っている tick も含めて区間ごと `undetermined`
-- legacy の境目（§2.6a）: `legacy_until_ms` より前の時刻は、trace が無く `pruned_through_seq` が 0 でも `bios` に
+- legacy の境目（§2.6a）: `legacy_until_ms` 以前の時刻は、trace が無く `pruned_through_seq` が 0 でも `bios` に
   ならず（`bios_confirmed` の中なら `bios`）、区間の始まりが `legacy_until_ms` 以前の trace の区間は `undetermined`。
   `pruned_before_ms` についても同じ
+- `bios` の 1（§2.6a）: trace が 1 行でもある DB（`t` より後の trace だけでも）・`pruned_through_seq` が 0 でない DB・
+  `pruned_before_ms` がある DB では、trace の無い時刻で全 zone が全速未満でも `bios_confirmed` が無ければ
+  `undetermined`。保持期間で消した範囲と残る最初の trace の間の時刻も同じ
+- 区間の割合の数え方（§2.6a）: flag が false の tick で PWM がたまたま観測と合う合成データで、その tick が区間の
+  割合の不一致に数えられ、tick ごとの判定と区間の判定が同じ関数の結果になる
 - 区間の全体（§2.6a）: `--start` より前から続く trace の区間で、前半の PWM が外れ `--start` 以後だけが合う合成データを
   `undetermined` にする（`--start` を区間の途中のどこに置いても判定が変わらない）。区間の始まりが最も古い trace で
   `pruned_through_seq` が 0 でない DB では、その区間を `undetermined` にする。`--end` の後に外れが続く場合も同じ
@@ -322,8 +334,9 @@ DB に残る記録で、これを直接に言える欄は無い（2026-10-16 の
 （書いている最中の DB をファイルの複写で写さない）。期間は T1 の開始から 24 h を `--start` / `--end` で渡す。
 T1 は hwmon の backend で fand が制御しているので、§2.6a の突き合わせが合えば `cooling: fand` に入る。合わない時刻が
 多ければ `undetermined` が増えるので、その件数を先に確かめる。BIOS の期間との比較は、同じ DB の
-T1 より前の期間を別に走らせて並べる。fand の試験（0121 の T0〜T9）より前の期間は §2.6a の 1 で `bios` に入り、
-試験の間と後の fand が止まっていた期間は、所有者が journal を確かめて `bios_confirmed` を書いたときだけ `bios` に入る。
+T1 より前の期間を別に走らせて並べる。導入先の DB には試験（0121 の T0〜T9）の trace が
+あるので §2.6a の 1 は使えず、BIOS の期間（試験の前も、試験の間と後で fand が止まっていた期間も）は、所有者が journal を
+確かめて `bios_confirmed` を書いたときだけ `bios` に入る。
 
 ## 3. Consequences
 
