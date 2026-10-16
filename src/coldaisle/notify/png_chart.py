@@ -57,6 +57,16 @@ class Series:
 
     name: str
     points: tuple[tuple[int, float], ...]
+    joined: tuple[bool, ...] | None = None
+    """`joined[i]` が真なら点 i を点 i-1 と結ぶ。`None` なら時刻の差（`gap_ms`）で決める。
+
+    区間で間引いた系列は代表時刻の差が区間の幅になるので、空白を時刻の差では判定できない。
+    読む側が「隣の区間に値があったか」で決めて渡す（決定記録 0147 §2.3）。
+    """
+
+    def __post_init__(self) -> None:
+        if self.joined is not None and len(self.joined) != len(self.points):
+            raise ValueError("joined は points と同じ長さにする")
 
 
 @dataclass(frozen=True)
@@ -173,9 +183,23 @@ def _draw_panel(
 
     for color, line in zip(SERIES_COLORS, series, strict=False):
         points = _thin(line.points, max_points)
+        # 間引いたら区間の連続性は使えない（点が飛ぶ）。時刻の差で判定し直す
+        joined = line.joined if len(points) == len(line.points) else None
+
+        def is_joined(
+            index: int,
+            points: tuple[tuple[int, float], ...] = points,
+            joined: tuple[bool, ...] | None = joined,
+        ) -> bool:
+            if index <= 0 or index >= len(points):
+                return False
+            if joined is not None:
+                return joined[index]
+            return points[index][0] - points[index - 1][0] <= gap_ms
+
         for index, (ts_ms, value) in enumerate(points):
-            joined_before = index > 0 and ts_ms - points[index - 1][0] <= gap_ms
-            joined_after = index + 1 < len(points) and points[index + 1][0] - ts_ms <= gap_ms
+            joined_before = is_joined(index)
+            joined_after = is_joined(index + 1)
             if joined_before:
                 before_ts, before_value = points[index - 1]
                 canvas.thick_line(

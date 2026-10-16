@@ -75,7 +75,7 @@ def load_graph_config(path: Path) -> GraphConfig | None:
     try:
         loaded: Any = yaml.safe_load(path.read_text(encoding="utf-8"))
         config = GraphConfig.model_validate(loaded)
-    except (OSError, yaml.YAMLError, ValidationError) as error:
+    except (OSError, UnicodeDecodeError, yaml.YAMLError, ValidationError) as error:
         LOGGER.error(
             "グラフの設定が読めないので、通知にグラフを添えない（文章の通知は届く）",
             extra={logs.FIELDS_KEY: {"config": str(path), "reason": str(error)}},
@@ -95,7 +95,7 @@ class SeriesReader(Protocol):
         bucket_ms: int,
         *,
         subtrahend: str | None = None,
-    ) -> tuple[tuple[int, float], ...]: ...
+    ) -> tuple[tuple[int, int, float], ...]: ...
 
     def close(self) -> None: ...
 
@@ -187,22 +187,58 @@ def read_points(
     end_ms: int,
     max_points: int,
 ) -> tuple[tuple[int, float], ...]:
+    """`read_series` の点だけ（時刻と値）。"""
+    return read_series(
+        reader,
+        metric,
+        catalog,
+        start_ms=start_ms,
+        end_ms=end_ms,
+        max_points=max_points,
+        gap_ms=0,
+    ).points
+
+
+def read_series(
+    reader: SeriesReader,
+    metric: str,
+    catalog: MetricCatalog,
+    *,
+    start_ms: int,
+    end_ms: int,
+    max_points: int,
+    gap_ms: int,
+) -> Series:
     """品質 `ok` の点だけを、**窓全体で均等に** `max_points` 区間までに間引いて読む。
 
     区間ごとの平均を SQL で出す（`ok_series_buckets`）。行数で打ち切らない（窓の片側だけが
     残ると、軸が示す期間と中身が食い違う）。区間の幅は窓 ÷ `max_points` で、既定の 60 分・
     4000 点なら 900 ms（2.5 s の取り込みでは 1 区間に 1 行なので生の値のまま）。
     派生値は保存しないので（0002 §2.2）、材料を同じ時刻で突き合わせて引く。
+
+    **隣の点と結ぶか**（`Series.joined`）は、時刻の差が `gap_ms` 以下か、または区間の幅が
+    `gap_ms` より広いときに限り隣の区間（番号の差が 1）にも値があるか、で決める（0147 §2.3）。
+    区間が広いと代表時刻の差が区間の幅ほどになり、時刻の差だけでは連続した取り込みも空白に見える。
     """
     bucket_ms = max(1, math.ceil((end_ms - start_ms) / max_points))
     derived = catalog.derived.get(metric)
     if derived is None:
-        points = reader.ok_series_buckets(metric, start_ms, end_ms, bucket_ms)
+        rows = reader.ok_series_buckets(metric, start_ms, end_ms, bucket_ms)
     else:
-        points = reader.ok_series_buckets(
+        rows = reader.ok_series_buckets(
             derived.minuend, start_ms, end_ms, bucket_ms, subtrahend=derived.subtrahend
         )
-    return tuple((ts_ms, round(value, 3)) for ts_ms, value in points)
+    coarse = bucket_ms > gap_ms
+    joined = tuple(
+        index > 0
+        and (row[1] - rows[index - 1][1] <= gap_ms or (coarse and row[0] - rows[index - 1][0] == 1))
+        for index, row in enumerate(rows)
+    )
+    return Series(
+        name=metric,
+        points=tuple((ts_ms, round(value, 3)) for _, ts_ms, value in rows),
+        joined=joined,
+    )
 
 
 @dataclass(frozen=True)
@@ -230,35 +266,37 @@ def render_alert_graph(
     start_ms = request.end_ms - window_ms
     # 読み出しの範囲は [start, end)。送った時刻の点まで入れる
     end_exclusive = request.end_ms + 1
-    by_unit: dict[str, list[tuple[str, tuple[tuple[int, float], ...]]]] = {}
+    gap_ms = round(config.gap_s * 1000)
+    by_unit: dict[str, list[tuple[str, Series]]] = {}
     for metric in plan.metrics:
-        points = read_points(
+        series = read_series(
             reader,
             metric,
             catalog,
             start_ms=start_ms,
             end_ms=end_exclusive,
             max_points=config.max_points,
+            gap_ms=gap_ms,
         )
         unit = catalog.unit_for(metric) or ""
         group = by_unit.setdefault(unit, [])
         if len(group) < MAX_SERIES_PER_PANEL:
-            group.append((metric, points))
-    if not any(points for group in by_unit.values() for _, points in group):
+            group.append((metric, series))
+    if not any(series.points for group in by_unit.values() for _, series in group):
         return None
 
     panels: list[Panel] = []
     legend: list[str] = []
     threshold_texts: list[str] = []
     for unit, group in by_unit.items():
-        drawn = [(metric, points) for metric, points in group if points]
+        drawn = [(metric, series) for metric, series in group if series.points]
         if not drawn:
             continue
         thresholds = tuple(t for metric, _ in drawn for t in plan.thresholds.get(metric, ()))
         panels.append(
             Panel(
                 unit=unit,
-                series=tuple(Series(metric, points) for metric, points in drawn),
+                series=tuple(series for _, series in drawn),
                 thresholds=thresholds,
             )
         )

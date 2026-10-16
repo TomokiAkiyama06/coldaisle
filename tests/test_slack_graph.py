@@ -35,6 +35,7 @@ from coldaisle.alert_graph import (
     load_graph_config,
     plan_graph,
     read_points,
+    read_series,
     render_alert_graph,
 )
 from coldaisle.clock import SimulatedClock
@@ -880,3 +881,112 @@ def test_example_env_lists_the_bot_variables():
     text = Path(CONFIG_DIR.parent / ".env.example").read_text(encoding="utf-8")
     assert f"{SLACK_BOT_TOKEN_ENV}=\n" in text
     assert f"{SLACK_CHANNEL_ENV}=\n" in text
+
+
+# ------------------------------------------------ 再レビューの指摘（0147 §2.3 / §2.7）
+
+
+def test_graph_config_with_broken_utf8_disables_graphs_only(tmp_path, caplog):
+    """不正な UTF-8 も「読めない設定」としてグラフだけを止める（起動は止めない）。"""
+    broken = tmp_path / "notify-graph.yaml"
+    broken.write_bytes(b"enabled: true\nwindow_s: \xff\xfe\n")
+    with caplog.at_level(logging.ERROR, logger="coldaisle.notify"):
+        assert load_graph_config(broken) is None
+    assert "グラフの設定が読めない" in caplog.text
+
+
+def day_of_seconds(store: SqliteStore, *, hole: tuple[int, int] | None = None) -> int:
+    """1 日ぶん 1 s ごとの排気。`hole`（秒の範囲）だけ値が無い。窓の始まりを返す。"""
+    start_ms = NOON_MS - 86_400_000
+    store.insert_samples(
+        [
+            Sample(
+                ts_ms=start_ms + i * 1000,
+                readings=(Reading(metric="air.gpu_exhaust", value=40.0, quality=Quality.OK),),
+            )
+            for i in range(86_400)
+            if hole is None or not (hole[0] <= i < hole[1])
+        ]
+    )
+    return start_ms
+
+
+def test_coarse_buckets_are_joined_by_bucket_continuity(store, catalog):
+    """区間（約 86 s）が gap_s（30 s）より広くても、連続した取り込みは線で結ぶ（Codex P2）。"""
+    start_ms = day_of_seconds(store)
+    series = read_series(
+        store,
+        "air.gpu_exhaust",
+        catalog,
+        start_ms=start_ms,
+        end_ms=NOON_MS + 1,
+        max_points=1000,
+        gap_ms=30_000,
+    )
+    assert series.joined is not None
+    assert series.joined[0] is False
+    assert all(series.joined[1:]), "隣の区間に値があれば結ぶ"
+
+
+def test_coarse_buckets_still_break_at_a_real_hole(store, catalog):
+    """値の無い区間を挟んだら結ばない（欠けを欠けとして見せる）。"""
+    start_ms = day_of_seconds(store, hole=(40_000, 41_000))  # 約 17 分の欠け
+    series = read_series(
+        store,
+        "air.gpu_exhaust",
+        catalog,
+        start_ms=start_ms,
+        end_ms=NOON_MS + 1,
+        max_points=1000,
+        gap_ms=30_000,
+    )
+    assert series.joined is not None
+    assert series.joined[1:].count(False) == 1
+
+
+def test_fine_buckets_break_by_time_gap(store, catalog):
+    """区間が gap_s より狭い（既定の 60 分）ときは、今までどおり時刻の差で切る。"""
+    store.insert_samples(
+        [
+            Sample(
+                ts_ms=NOON_MS - offset_s * 1000,
+                readings=(Reading(metric="air.room", value=25.0, quality=Quality.OK),),
+            )
+            for offset_s in (300, 290, 280, 200, 190)
+        ]
+    )
+    series = read_series(
+        store,
+        "air.room",
+        catalog,
+        start_ms=NOON_MS - 3_600_000,
+        end_ms=NOON_MS + 1,
+        max_points=4000,
+        gap_ms=30_000,
+    )
+    assert series.joined == (False, True, True, False, True)
+
+
+def test_png_uses_joined_flags_instead_of_time_gap():
+    """`joined` を渡した系列は、時刻の差が gap_ms より大きくても線で結ぶ。"""
+    start_ms = NOON_MS - 86_400_000
+    points = ((start_ms + 43_000_000, 30.0), (start_ms + 43_086_400, 30.0))
+    kwargs = {
+        "start_ms": start_ms,
+        "end_ms": NOON_MS,
+        "width": 960,
+        "panel_height": 300,
+        "gap_ms": 30_000,
+        "max_points": 4000,
+    }
+    joined = render_png([Panel("C", (Series("air.room", points, joined=(False, True)),))], **kwargs)
+    separate = render_png([Panel("C", (Series("air.room", points),))], **kwargs)
+
+    def count(png: bytes) -> int:
+        body = pixels(png)[2]
+        target = bytes(SERIES_COLORS[0])
+        return sum(1 for i in range(0, len(body), 3) if body[i : i + 3] == target)
+
+    assert count(joined) != count(separate), "結ぶと点ではなく線になる"
+    with pytest.raises(ValueError):
+        Series("air.room", points, joined=(True,))

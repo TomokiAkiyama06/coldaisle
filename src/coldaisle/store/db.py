@@ -1388,11 +1388,14 @@ class SqliteStore:
         bucket_ms: int,
         *,
         subtrahend: str | None = None,
-    ) -> tuple[tuple[int, float], ...]:
+    ) -> tuple[tuple[int, int, float], ...]:
         """`[start_ms, end_ms)` を `bucket_ms` ごとに区切り、`quality='ok'` の値の平均を返す。
 
         通知のグラフ用（決定記録 0147 §2.3）。**窓全体を均等に間引く。** 行数で打ち切ると
-        窓の片側だけが残り、軸が示す期間と中身が食い違う。時刻は区間の中で最も新しい行の時刻。
+        窓の片側だけが残り、軸が示す期間と中身が食い違う。
+
+        返すのは `(区間の番号, 区間の中で最も新しい行の時刻, 平均)`。区間の番号は空白（値の無い
+        区間）の判定に使う（番号が飛んだら間に値が無い）。
 
         `subtrahend` を渡すと、同じ時刻に両方 `ok` の行だけで `metric - subtrahend` を平均する
         （派生値は保存しないため。決定記録 0002 §2.2）。区間に行が無ければ点を返さない。
@@ -1420,7 +1423,7 @@ class SqliteStore:
                 "AND a.quality = ? AND a.value IS NOT NULL GROUP BY bucket ORDER BY bucket",
                 (start_ms, bucket_ms, subtrahend, ok, metric, start_ms, end_ms, ok),
             ).fetchall()
-        return tuple((int(row["ts"]), float(row["value"])) for row in rows)
+        return tuple((int(row["bucket"]), int(row["ts"]), float(row["value"])) for row in rows)
 
     def rollup(
         self, metric: str, start_ms: int, end_ms: int, agg: Aggregation
