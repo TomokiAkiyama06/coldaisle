@@ -122,6 +122,16 @@ Workload Regime（`control/supervisor/regime.py`）を主軸にしない理由�
 
 ### 2.6 切り口（グループの鍵）
 
+**時刻に trace を結びつける規則（as-of）**。本記録で、ある時刻 `x`（評価時刻 `t` か Fan のサンプルの時刻 `t_f`）に
+trace を結びつける箇所は、すべてこの 1 つの規則を使う（実装も 1 つの関数にする）。
+
+- `x` の **as-of の trace** は、`ts_ms ≤ x` の trace のうち **`seq` が最も大きい**もの。`ts_ms` が同じ trace が複数
+  あっても `seq` で 1 つに決まる（`seq` は `UNIQUE`）。`ts_ms > x` の trace（未来の tick・時計が戻った後に書かれ
+  `ts_ms` が `x` より大きい行）は選ばない
+- `x - ts_ms` が `trace_max_age_ms` を超えるなら、`x` の as-of の trace は**無い**（fand が止まった後に最後の tick を
+  引きずらない）
+- 使う場所: §2.6a の Fan のサンプルの as-of・`bios` の「trace が無い」・下の 4 の `trace-regime`
+
 分布は次の鍵の組ごとに出す。
 
 1. **`cooling`**（常に付ける）: 物理の Fan を誰が動かしていたか。値は `fand` / `bios` / `fand_override` /
@@ -132,8 +142,12 @@ Workload Regime（`control/supervisor/regime.py`）を主軸にしない理由�
 3. **`period`**（任意）: `--periods <yaml>` に名前つきの区間（例: `ac_on` / `ac_off`、試験の区間）と除外する区間を
    書くと、区間の名前を鍵に足す。区間の外の評価時刻は使わない。エアコンの ON / OFF は DB に記録が無いので、
    人が区間で渡す（推測しない）
-4. **`--group-by trace-regime`**（任意）: 状態の代わりに trace の `state.workload_regime` を鍵にする。trace は
-   既存の `ControlTick` の検証を通ったものだけを使い、通らない行・Regime の無い tick は件数だけ数える。
+4. **`--group-by trace-regime`**（任意）: 状態の代わりに、評価時刻 `t` の **as-of の trace**（上の規則。古さの上限は
+   `trace_max_age_ms` を共有し、別の値を持たない）の `state.workload_regime` を鍵にする。as-of の trace が無い
+   （fand が止まっている・最後の tick が古すぎる）評価時刻の鍵は `unknown_no_trace`、as-of の trace が既存の
+   `ControlTick` の検証を通らない・`workload_regime` を持たない評価時刻の鍵は `unknown_unreadable` とし、どちらも
+   分布に入れず件数だけ数える（Regime の語彙の `unknown` と混ぜない）。regime が変わる前後でも、`t` より後の tick の
+   regime は使わない。
    出力には「Regime の設定は `provisional`（0119 §2.14）」を必ず書く
 
 ### 2.6a `cooling` の判定: trace の有無ではなく、物理の Fan の観測と突き合わせる
@@ -163,27 +177,32 @@ DB に残る記録で、これを直接に言える欄は無い（2026-10-16 の
 
 | 区分 | 条件（**すべて**を満たすときだけ） |
 |---|---|
-| `fand` | `t` 以前で最も新しい、`fan_max_age_ms` 以内の Fan のサンプル（3 つの zone の ok の `fan.<zone>.pwm`）について、下の「Fan のサンプルと trace の突き合わせ（as-of）」の結果が**一致**で、その as-of の trace の `operating_mode` が `auto`。さらに、その trace を含む**連続した trace の区間**（間隔が `trace_max_age_ms` を超えたら切る。`run_id` は v16 からなので使わない）の**始まりから終わりまで全体**（`--start` / `--end` の外も含む）で、突き合わせた Fan のサンプルのうち一致しなかった割合が `pwm_mismatch_max_ratio` 以下。区間の始まりか終わりを確かめられないとき（下の「区間の全体を読む」）は `undetermined` |
-| `fand_override` | `fand` の条件のうち `operating_mode` だけが `auto` でない（`manual` / `max` / `calibration`。試験の操作） |
-| `bios` | `[t - trace_max_age_ms, t]` に trace が無い。3 つの zone すべてで ok の `fan.<zone>.rpm` が `fan_max_age_ms` 以内にあり、**すべての zone が `full_speed_rpm_min.<zone>` 未満**。さらに、`t` より前に fand が動いていなかったか、直前の fand の停止の後が BIOS だったと確かめられる（下の「`bios` の前提」） |
+| `fand` | `t` 以前で最も新しい、`fan_max_age_ms` 以内の Fan のサンプル（3 つの zone の ok の `fan.<zone>.pwm`）について、下の「Fan のサンプルと trace の突き合わせ（as-of）」で**一致**し、一致した tick がすべて `operating_mode` `auto`。さらに、その as-of の trace を含む**連続した trace の区間**（間隔が `trace_max_age_ms` を超えたら切る。`run_id` は v16 からなので使わない）の**始まりから終わりまで全体**（`--start` / `--end` の外も含む）で、突き合わせた Fan のサンプルのうち一致しなかった割合が `pwm_mismatch_max_ratio` 以下。区間の始まりか終わりを確かめられないとき（下の「区間の全体を読む」）は `undetermined` |
+| `fand_override` | `fand` の条件のうち、一致した tick がすべて `auto` でない（`manual` / `max` / `calibration`。試験の操作）。一致した tick のモードが食い違えば `undetermined` |
+| `bios` | `t` の as-of の trace が無い（§2.6 の規則）。3 つの zone すべてで ok の `fan.<zone>.rpm` が `fan_max_age_ms` 以内にあり、**すべての zone が `full_speed_rpm_min.<zone>` 未満**。さらに、`t` より前に fand が動いていなかったか、直前の fand の停止の後が BIOS だったと確かめられる（下の「`bios` の前提」） |
 | `undetermined` | 上のどれにも当たらない。例: trace はあるが物理の PWM と合わない（simulated の backend など）・区間の始まりか終わりを確かめられない・`fan.*` が欠けている・trace が無く 1 つでも全速の zone がある（引き継ぎの Max が一部の zone だけ成功した状態か、BIOS が高負荷で全速にしたかを区別できない）・trace が途絶えた後で、その停止が正常だったと確かめられない |
 
 **Fan のサンプルと trace の突き合わせ（as-of）**（`fand` の判定）:
 
 - 突き合わせの単位は trace の tick ではなく **Fan のサンプル**（`coldaisle-telemetry` の 1 回の収集。2500 ms ごと）。
   trace は 1000 ms ごとなので、1 つのサンプルの前に trace が複数ある。どれと比べるかを次のとおり決める
-- サンプルの時刻 `t_f` に対する **as-of の trace** は、`ts_ms ≤ t_f` の trace のうち `seq` が最も大きいもの
-  （同じ `ts_ms` なら大きい `seq`。時計が戻っても書いた順の最新を選ぶ）。`t_f - ts_ms` が `trace_max_age_ms` を
-  超えるなら as-of の trace は無い（`fand` にならない）
+- サンプルの時刻 `t_f` に対する **as-of の trace** は §2.6 の as-of の規則で選ぶ（as-of の trace が無ければ
+  `fand` にも `fand_override` にもならない）
 - 指令が物理の PWM に反映されるまでには遅れがある（fand の書き込みと telemetry の読み取りが別の周期で、ランプの最中は
   tick ごとに指令が変わる）。そこで **候補の trace** を、as-of の trace と同じ区間で、`seq` が as-of の trace 以下で、
   `ts_ms` が `[t_f - pwm_apply_delay_ms, t_f]` に入るもの（as-of の trace は必ず含める）とする
-- サンプルは、3 つの zone それぞれで、物理の `fan.<zone>.pwm` と候補のどれかの `pwm_raw / 255 × 100` の差が
-  `pwm_match_tolerance_pct` 以内なら**一致**。ただし候補の trace のどれか 1 つでも、3 つの zone のどれかに `hardware` が
-  無いか `write_ok` / `readback_ok` が false なら、そのサンプルは一致にしない（下の「書き込みを確かめられた tick
-  だけを一致とする」）
-- 3 つの zone の `fan.*.pwm` は同じ収集で同じ `ts_ms` を持つ。zone ごとに時刻が違う行は、zone ごとに同じ規則で突き合わせ、
-  1 つでも一致しない zone があればそのサンプルは一致にしない
+- **1 つの候補の tick が 3 つの zone のすべてと一致すること**を求める。候補の tick `c` が一致するとは、3 つの
+  zone のすべてで物理の `fan.<zone>.pwm` と `c` の `pwm_raw / 255 × 100` の差が `pwm_match_tolerance_pct` 以内の
+  とき。zone ごとに別々の tick と一致する（Front は ある tick、Rear は別の tick）ことは、どの tick も指令していない
+  物理のベクトルなので一致にしない
+- ただし候補の trace のどれか 1 つでも、3 つの zone のどれかに `hardware` が無いか `write_ok` / `readback_ok` が
+  false なら、そのサンプルは一致にしない（下の「書き込みを確かめられた tick だけを一致とする」）
+- **分類は、一致した tick の `operating_mode` で決める**（as-of の trace のモードではない）。一致した tick がすべて
+  `auto` なら `fand`、すべて `auto` 以外（`manual` / `max` / `calibration`）なら `fand_override`。一致した tick どうしで
+  モードが食い違う（例: 遅れたサンプルが古い `manual` の tick と、新しい `auto` の tick の両方と一致する）なら、
+  そのサンプルは `undetermined`。どの tick とも一致しなければ不一致
+- 3 つの zone の `fan.*.pwm` は同じ収集で同じ `ts_ms` を持つ。3 つが同じ `ts_ms` で揃わないサンプルは、1 つの
+  ベクトルとして比べられないので `undetermined`（区間の割合では不一致に数える）
 - 評価時刻 `t` の `cooling` は、`t` 以前で最も新しい `fan_max_age_ms` 以内のサンプルの結果を使う（サンプルが無ければ
   `undetermined`）
 
@@ -331,7 +350,7 @@ DB に残る記録で、これを直接に言える欄は無い（2026-10-16 の
 | `settle_ms` | 移り変わり直後とみなす長さ | 300000（§5 #3） |
 | `max_gap_ms` | これを超える間隔で落ち着きの計時をやり直す | 10000（`stale_after_ms` と同じ） |
 | `pair_max_age_ms` | `d.*` の減数を対にする古さの上限 | 5000（2 周期） |
-| `trace_max_age_ms` | trace があるとみなす古さの上限・連続した trace の区間を切る間隔 | 2000（tick 1000 ms の 2 倍） |
+| `trace_max_age_ms` | as-of の trace の古さの上限（§2.6 の規則。`cooling`・`trace-regime` で共有）・連続した trace の区間を切る間隔 | 2000（tick 1000 ms の 2 倍） |
 | `fan_max_age_ms` | `fan.*.pwm` / `fan.*.rpm` を評価時刻に使う古さの上限 | 5000（2 周期） |
 | `pwm_match_tolerance_pct` | trace の `pwm_raw` と物理の `fan.*.pwm` の差の許容 | 2.0（約 5 / 255） |
 | `pwm_mismatch_max_ratio` | 連続した trace の区間で一致しなかった Fan のサンプルの割合の上限 | 0.05 |
@@ -376,7 +395,13 @@ DB に残る記録で、これを直接に言える欄は無い（2026-10-16 の
   1〜3 tick 前の指令という合成データで、`pwm_apply_delay_ms` の窓の候補と一致して `fand` になる（最新の trace だけと
   比べて外れにしない）。遅れが `pwm_apply_delay_ms` を超えるデータは一致にしない。trace の `ts_ms` が Fan のサンプルより
   後（telemetry の時刻とずれた）の trace は as-of に選ばれない。同じ `ts_ms` の trace が 2 つあるときは大きい `seq` を選ぶ。
-  候補の中に flag が false の trace があるサンプルは、PWM が合っていても一致にならない
+  候補の中に flag が false の trace があるサンプルは、PWM が合っていても一致にならない。Front は tick A、Rear は tick B
+  とだけ合う（どの 1 つの tick とも 3 zone が揃わない）サンプルは一致にならない。遅れたサンプルが古い `manual` の tick
+  とだけ合うなら、as-of の trace が `auto` でも `fand_override`、`manual` と `auto` の両方の tick と合うなら `undetermined`。
+  3 zone の `fan.*.pwm` の `ts_ms` が揃わないサンプルは `undetermined`
+- `trace-regime`（§2.6 の 4）: regime が変わる tick の前後の評価時刻で、`t` より後の tick の regime を使わない。同じ
+  `ts_ms` の 2 つの trace では大きい `seq` の regime を使う。fand が止まり最後の tick が `trace_max_age_ms` より古い
+  評価時刻は `unknown_no_trace`、検証を通らない trace は `unknown_unreadable` で、どちらも件数だけに出る
 - 区間の終わり（§2.6a）: `(1, 5000)` と `(3, 8000)` が残り `(2, 1000)` を消した合成データで、`seq 1` の区間が終わりの
   検査で、`seq 3` の区間が始まりの検査で `undetermined` になる。最新の行で終わる区間は、`pruned_through_seq` が
   それより小さいときだけ通る
