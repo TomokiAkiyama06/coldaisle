@@ -1128,6 +1128,20 @@ def test_the_output_never_overwrites_an_input(fx: Fixture) -> None:
     assert fx.db.read_bytes() == before
 
 
+@pytest.mark.parametrize("kind", ["hardlink", "wal"])
+def test_the_output_never_touches_a_hard_link_or_a_sidecar(fx: Fixture, kind: str) -> None:
+    """ハードリンクと SQLite の添え file も入力として守る（Codex P2）。"""
+    if kind == "hardlink":
+        out = fx.tmp_path / "link.json"
+        out.hardlink_to(fx.db)
+    else:
+        out = fx.db.with_name(fx.db.name + "-wal")
+    before = fx.db.read_bytes()
+    argv = ["--db", str(fx.db), "--start", iso(T0), "--end", iso(T0 + MIN), "--out", str(out)]
+    assert ld.main(argv) == 2
+    assert fx.db.read_bytes() == before
+
+
 # ---------------------------------------------------------------- import の向き
 
 

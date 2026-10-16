@@ -1579,8 +1579,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         LOGGER.error("DB が見つからない")
         return 2
     if args.out is not None:
-        protected = [args.db, args.config, args.metrics, *([args.periods] if args.periods else [])]
-        if any(args.out.resolve() == path.resolve() for path in protected):
+        protected = [
+            args.db,
+            *(args.db.with_name(args.db.name + suffix) for suffix in _SQLITE_SIDECARS),
+            args.config,
+            args.metrics,
+            *([args.periods] if args.periods else []),
+        ]
+        if any(_same_file(args.out, path) for path in protected):
             LOGGER.error("--out が入力のファイルを指している")
             return 2
     zone = inputs.config.zone
@@ -1623,6 +1629,21 @@ def main(argv: Sequence[str] | None = None) -> int:
         extra={logs.FIELDS_KEY: {"start_ms": start_ms, "end_ms": end_ms, "format": args.format}},
     )
     return 0
+
+
+_SQLITE_SIDECARS: Final = ("-wal", "-shm", "-journal")
+"""DB の添え file。書き込むと読み取り専用の証拠の DB を壊す。"""
+
+
+def _same_file(out: Path, protected: Path) -> bool:
+    """同じパスか、同じ実体（ハードリンク・シンボリックリンク）か。"""
+    if out.resolve() == protected.resolve():
+        return True
+    try:
+        return out.exists() and protected.exists() and out.samefile(protected)
+    except OSError:
+        # 確かめられないときは書かない側に倒す
+        return True
 
 
 def _emit(text: str, out: Path | None) -> None:
