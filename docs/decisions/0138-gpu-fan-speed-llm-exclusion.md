@@ -4,6 +4,7 @@
 - **Status**: FINAL（2026-10-15、リポジトリ所有者の承認）
 - **Date**: 2026-10-15
 - **Supersedes**: なし（0131 §2.4a の一覧に項目を足す。0131 の原則と経路の閉じ方は変えない）
+- **Superseded by**: [`0146`](0146-llm-reads-gpu-fan.md)（全体。§2.3 の品質の経路の仕組みは 0146 §2.2 が引き継ぐ。Proposed）
 - **関連**: [`0131`](0131-gpu-fan-service-alert.md) §2.4a / §5 の 1 /
   [`0128`](0128-gpu-fan-curve-service.md) §2.1 /
   [`0043`](0043-cpu-die-and-gpu-throttle-metrics.md) §2.1 / §2.4 /

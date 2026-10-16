@@ -139,7 +139,7 @@ PWM
 - Front / Rear / Top は3系統独立制御。ただし推定実効風量とAir Balanceを共有して協調する。
 - AIO Pump は通常制御対象外。BIOS / safety設定で高い安全側の固定運用を基本とする。
 - GPU の Fan も fand の制御対象外。root の専用サービス `coldaisle-gpu-fan` が GPU コアの温度の決定論的な曲線で書き、
-  止まったら GPU 自身の既定の制御へ戻す。fand・Learned・LLM から読まない・書かない（決定記録 0128）。
+  止まったら GPU 自身の既定の制御へ戻す。fand・Learned から読まない・書かない。LLM は読むだけ（決定記録 0128 / 0146）。
 - 初期学習中でもアーキテクチャは完成形を使うが、制御権は段階的に解放する。
   Shadow → authority制限 → full authority の順とし、低Confidence時はFallbackへ退避する。
 - Supervisorは「負荷があと何時間続くか」を断定しない。観測履歴から `IDLE / TRANSIENT_* / SUSTAINED_* / COOLDOWN / UNKNOWN`

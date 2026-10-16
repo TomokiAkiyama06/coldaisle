@@ -108,6 +108,9 @@ sudo install -m 0640 -g coldaisle /opt/coldaisle/.env.example /etc/coldaisle/col
 sudoedit /etc/coldaisle/coldaisle.env
 ```
 
+ローカル LLM が入るまでの間、Claude API を LLM の代わりに使う場合（決定記録 0143）は、
+`docs/llm-setup.md` の「Claude API」の節の手順で同じファイルに書きます。
+
 ## 3. udev（固定デバイス名）
 
 1. センサー基板を挿し、`/dev/ttyACM*` のどれになったかを確かめる
