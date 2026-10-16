@@ -1718,7 +1718,7 @@ def test_trace_provenance_of_an_empty_registry_lists_every_kind_without_producti
     provenance = registry.inspect().trace_provenance()
 
     assert provenance.revision == 0
-    assert set(provenance.production) == {kind.value for kind in ArtifactKind}
+    assert set(provenance.production) == REGISTRY_ARTIFACT_KINDS
     for pointer in provenance.production.values():
         assert pointer.artifact_sha256 is None
         assert pointer.established_by is None
@@ -1773,7 +1773,11 @@ def test_trace_provenance_pointer_change_events_match_the_registry_vocabulary() 
 
 
 def test_trace_provenance_artifact_kinds_match_the_registry_vocabulary() -> None:
-    """schema が値で持つ kind の集合と `ArtifactKind` を揃える。**食い違いをここで止める。**"""
-    assert {kind.value for kind in ArtifactKind} == REGISTRY_ARTIFACT_KINDS
+    """schema が値で持つ kind の集合と `ArtifactKind` を揃える。**食い違いをここで止める。**
+
+    provenance に載せないのは `hint_certificate` だけ（決定記録 0152 §2.7a）。もう1つ足すときは、
+    この等式の変更と決定記録を要る（黙って provenance から漏れる kind を作らない）。
+    """
+    assert {kind.value for kind in ArtifactKind} == REGISTRY_ARTIFACT_KINDS | {"hint_certificate"}
     provenance = RegistrySnapshot(revision=0).trace_provenance()
     assert set(provenance.production) == REGISTRY_ARTIFACT_KINDS

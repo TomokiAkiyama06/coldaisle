@@ -260,8 +260,9 @@ MemoryErrorで落とさないためである。壊れたYAML・JSONやファイ�
 - decision trace への載せ方（決定記録 0071 §2.5 / §5 #7、0075）: registry event用の表は足さない。
   `ControlTick` v10 の `registry` に、**tickが使っていた** registry の `revision` と、kindごとの
   production の `artifact_sha256` と、そのpointerを成立させた最後のpromotion / rollbackの
-  `tick_trace_metadata()` を**毎tick**載せる（`RegistrySnapshot.trace_provenance()` が作る。全kindの欄を
-  揃え、productionが無いkindは `None`）。`tick_trace_metadata()` は `trace_metadata()` と同じ欄だが、
+  `tick_trace_metadata()` を**毎tick**載せる（`RegistrySnapshot.trace_provenance()` が作る。制御が
+  artifact として束縛する kind（`REGISTRY_ARTIFACT_KINDS` の4つ）の欄を揃え、productionが無いkindは
+  `None`。`hint_certificate` は載せない。決定記録 0152 §2.7a）。`tick_trace_metadata()` は `trace_metadata()` と同じ欄だが、
   **自由記述の `reason`（最大1000字）だけは全文を載せず、UTF-8 の SHA-256 を `reason_sha256` に置く**
   （決定記録 0075。毎tickの保存量を抑えるため）。理由の全文は `coldaisle-registry audit` で引き、
   `registry_reason_sha256()` で digest を計算して照合する。制御loopは起動時に渡された値を写すだけで、registryも
@@ -317,6 +318,18 @@ MemoryErrorで落とさないためである。壊れたYAML・JSONやファイ�
   必須項目として登録時に申告し、attestationがそれを載せる。#86 はこの申告だけを見て内部モデルの
   可否を決め、推論器の自称では判断しない。capabilityの追加にともない Registry schema version を
   2 へ上げた（既定値を補うと、能力を申告していないartifactが「反実仮想もできる」側へ倒れる）。
+- #288 Workload Hint の単調性ゲートの証明書（決定記録 0152 §2.2）: kind `hint_certificate`・capability
+  `hint_monotonicity_certificate`・形式 `json` の artifact として、thermal_model と同じ lifecycle
+  （`register` → `validate` → 承認ファイル付きの `promote`、`rollback` / `retire`）を通す。kind と capability は
+  組でだけ使い（片方だけの metadata は拒否）、既存の欄の意味を固定する（0152 §5 の 2 (a)）:
+  `training_dataset_version` は認証した thermal_model の key（`thermal_model/<model_id>/<version>`）、
+  `source_runs` は証明書の `certificate_sha256` の1つだけ、`model_family` は `hint-monotonicity-certificate`。
+  Registry は証明書の中身を読まない（中身の照合は fand と worker が後の段で行う）。閉じた列挙に値を
+  足したので **Registry schema version を 3 から 4 へ上げた**。v2 / v3 の snapshot はそのまま読み、次の書き込みで
+  v4 にする。v4 より前の版を名乗る snapshot・metadata は `hint_certificate` を持てない。v3 までの読み手は
+  v4 の snapshot を `INVALID_REGISTRY` として拒む（fail closed）。thermal model の registry metadata は v3 のまま
+  書き、v4 も読む。supervisor policy の registry metadata は v3 のまま（登録済みの policy を版だけで束縛
+  できなくしないため）
 - #90 / #91: `load_version()` でcandidate / validated / retiredを含む明示versionを固定できる。
   `load_production()` と混ぜず、評価対象のversionを暗黙に変えない。
 - #92 Authority Rollout: `ModelCompatibility.authority_stage` で互換性だけを検査する。モデルの
