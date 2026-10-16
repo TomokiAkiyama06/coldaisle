@@ -16,7 +16,7 @@ from typing import Any
 
 import pytest
 
-from coldaisle.clock import SimulatedClock
+from coldaisle.clock import ManualMonotonicClock, SimulatedClock
 from coldaisle.control.schema import ControlTick, FaultCode
 from coldaisle.daemon import Daemon, build
 from coldaisle.ingest import Calibration, Normalizer
@@ -64,6 +64,7 @@ def engine(store, rule_set) -> Engine:
         catalog=MetricCatalog.from_yaml(METRICS_PATH),
         store=store,
         clock=store.clock,
+        monotonic=ManualMonotonicClock(),
     )
 
 
@@ -93,6 +94,15 @@ class Fand:
         )
 
 
+def step(engine: Engine, wall_ms: int) -> None:
+    """評価時刻（壁時計）を `wall_ms` へ進め、単調時計も同じ幅だけ進める（跳びの無い場合）。"""
+    clock = engine.store.clock
+    delta = max(0, wall_ms - clock.now_ms())
+    clock.advance_to_ms(wall_ms)  # type: ignore[attr-defined]
+    assert isinstance(engine.monotonic, ManualMonotonicClock)
+    engine.monotonic.advance_ms(delta)
+
+
 def run(
     engine: Engine,
     fand: Fand,
@@ -111,7 +121,7 @@ def run(
     while seconds < stop:
         if trace is not None:
             fand.write(at(seconds, base), trace)
-        engine.store.clock.advance_to_ms(at(seconds, base))  # type: ignore[attr-defined]
+        step(engine, at(seconds, base))
         transitions += engine.on_tick()
         seconds += 1.0
     return transitions
@@ -404,16 +414,16 @@ def test_one_normal_trace_then_stop_does_not_resolve_emergency(engine, store):
     assert [a.state.value for a in store.alerts(limit=10) if a.rule_id == EMERGENCY] == ["firing"]
 
 
-def test_advancing_traces_resolve_after_clear_s_of_trace_time(engine, store):
-    """新しい行が clear_s の幅で届き続けたら解く（trace の時刻で測る）。"""
+def test_advancing_traces_resolve_after_clear_s(engine, store):
+    """新しい行が clear_s の幅で届き続けたら解く（新しい行を読んだときの単調時計で測る）。"""
     fand = Fand(store)
     run(engine, fand, 0, 5, body("emergency", [OVER_TEMP]))
-    # 評価は 1 s ごとだが、trace は 5 s ごとにしか来ない。解除は trace の時刻で 10 s の幅
+    # 評価は 1 s ごとだが、trace は 5 s ごとにしか来ない。解除は新しい行の間の 10 s の幅
     transitions = []
     for seconds in range(5, 40):
         if seconds % 5 == 0:
             fand.write(at(seconds), body("normal"))
-        store.clock.advance_to_ms(at(seconds))  # type: ignore[attr-defined]
+        step(engine, at(seconds))
         transitions += engine.on_tick()
     resolved = [t for t in transitions if t.rule_id == EMERGENCY and t.state == "resolved"]
     assert len(resolved) == 1
@@ -421,7 +431,7 @@ def test_advancing_traces_resolve_after_clear_s_of_trace_time(engine, store):
     assert alert.resolved_ms == at(15)
 
 
-def test_degraded_fire_after_s_is_measured_in_trace_time(engine, store):
+def test_degraded_fire_after_s_needs_new_rows(engine, store):
     """DEGRADED の 1 行を書いて止まっても、同じ行の繰り返しで 120 s の待ちは満ちない。"""
     fand = Fand(store)
     run(engine, fand, 0, 70, body("degraded", [GPU_STALE]))
@@ -431,6 +441,101 @@ def test_degraded_fire_after_s_is_measured_in_trace_time(engine, store):
     assert pending.fired_ms is None
     run(engine, fand, 129, 140, None)
     assert [a for a in store.alerts(limit=10) if a.rule_id == DEGRADED] == [], "古くなって取り消す"
+
+
+# ------------------------------------------------- 壁時計の跳び（0148 §2.2。待ちは単調時計で測る）
+
+
+def evaluate(engine: Engine, mono_step_s: float) -> list:
+    """壁時計（評価時刻）は動かさず、単調時計だけ進めて 1 回評価する。"""
+    assert isinstance(engine.monotonic, ManualMonotonicClock)
+    engine.monotonic.advance_ms(int(mono_step_s * 1000))
+    return engine.on_tick()
+
+
+def test_a_forward_jump_of_the_wall_clock_does_not_resolve_with_two_rows(engine, store):
+    """発火中の EMERGENCY。正常の行の次で trace の時刻が 10 s 前へ跳んでも、2 行では解かない。"""
+    fand = Fand(store)
+    run(engine, fand, 0, 5, body("emergency", [OVER_TEMP]))
+    fand.write(at(5), body("normal"))
+    transitions = evaluate(engine, 1)
+    fand.write(at(16), body("normal"))  # NTP の補正で前へ跳んだ
+    store.clock.advance_to_ms(at(16))  # type: ignore[attr-defined]  # 単調時計は進めない
+    transitions += evaluate(engine, 1)
+    assert states(transitions, EMERGENCY) == []
+    # 以降も 1 s ごとに行が届けば、単調時計で clear_s（10 s）たってから解く
+    for seconds in range(17, 25):
+        fand.write(at(seconds), body("normal"))
+        transitions += evaluate(engine, 1)
+    assert states(transitions, EMERGENCY) == []
+    fand.write(at(25), body("normal"))
+    assert states(evaluate(engine, 1), EMERGENCY) == ["resolved"]
+
+
+def test_a_backward_jump_of_the_wall_clock_still_resolves_after_clear_s(engine, store):
+    """trace の時刻が後ろへ跳んでも、単調時計で clear_s たてば解く（追いつきを待たない）。"""
+    fand = Fand(store)
+    run(engine, fand, 0, 10, body("emergency", [OVER_TEMP]))
+    transitions = []
+    for k in range(10):
+        # 1 行目のあとで 5 s 後ろへ跳ぶ（trace の時刻は 9, 4, 5, 6, ...）
+        fand.write(at(9 if k == 0 else 3 + k), body("normal"))
+        transitions += evaluate(engine, 1)
+    assert states(transitions, EMERGENCY) == []
+    fand.write(at(13), body("normal"))
+    assert states(evaluate(engine, 1), EMERGENCY) == ["resolved"]
+
+
+def test_the_same_row_does_not_advance_the_wait_on_the_monotonic_clock(engine, store):
+    """新しい行が来ない限り、単調時計がいくら進んでも解除の待ちは進まない（同じ行の繰り返し）。"""
+    fand = Fand(store)
+    run(engine, fand, 0, 5, body("emergency", [OVER_TEMP]))
+    fand.write(at(5), body("normal"))
+    transitions = []
+    for _ in range(30):
+        transitions += evaluate(engine, 1)  # 壁時計は止めたまま（途絶にしない）
+    assert states(transitions, EMERGENCY) == []
+    assert [a.state.value for a in store.alerts(limit=10) if a.rule_id == EMERGENCY] == ["firing"]
+    # 次の新しい行で、最初の正常の行から単調時計で 30 s たっているので解く
+    fand.write(at(6), body("normal"))
+    assert states(evaluate(engine, 1), EMERGENCY) == ["resolved"]
+
+
+def test_a_forward_jump_does_not_fire_degraded_with_two_rows(engine, store):
+    """DEGRADED の行の次の行で trace の時刻が 200 s 前へ跳んでも、120 s の待ちは満ちない。"""
+    fand = Fand(store)
+    run(engine, fand, 0, 2, body("degraded", [GPU_STALE]))
+    fand.write(at(202), body("degraded", [GPU_STALE]))
+    store.clock.advance_to_ms(at(202))  # type: ignore[attr-defined]  # 単調時計は進めない
+    transitions = evaluate(engine, 1)
+    assert states(transitions, DEGRADED) == []
+    [pending] = [a for a in store.alerts(limit=10) if a.rule_id == DEGRADED]
+    assert pending.fired_ms is None
+
+
+def test_a_backward_jump_still_fires_degraded_after_fire_after_s(engine, store):
+    """trace の時刻が後ろへ跳んでも、単調時計で fire_after_s（120 s）たてば発火する。"""
+    fand = Fand(store)
+    run(engine, fand, 0, 31, body("degraded", [GPU_STALE]))
+    transitions = []
+    for k in range(89):
+        fand.write(at(1 + k * 0.1), body("degraded", [GPU_STALE]))  # 30 s 後ろへ跳んだ
+        transitions += evaluate(engine, 1)
+    assert states(transitions, DEGRADED) == []
+    fand.write(at(10), body("degraded", [GPU_STALE]))
+    assert states(evaluate(engine, 1), DEGRADED) == ["firing"]
+
+
+def test_the_same_row_does_not_advance_the_degraded_wait(engine, store):
+    """DEGRADED の 1 行を読み続けても、単調時計で 120 s を過ぎて発火しない。"""
+    fand = Fand(store)
+    run(engine, fand, 0, 2, body("degraded", [GPU_STALE]))
+    transitions = []
+    for _ in range(200):
+        transitions += evaluate(engine, 1)  # 壁時計は止めたまま（途絶にしない）
+    assert states(transitions, DEGRADED) == []
+    fand.write(at(2), body("degraded", [GPU_STALE]))
+    assert states(evaluate(engine, 1), DEGRADED) == ["firing"]
 
 
 def test_a_trace_from_the_future_counts_as_fresh(engine, store):
@@ -446,11 +551,14 @@ def test_a_trace_from_the_future_counts_as_fresh(engine, store):
 def test_a_restart_keeps_the_firing_alert_without_notifying_again(store, rule_set):
     """取り込みを再起動しても、発火中のアラートを復元して出し直さない（0148 §2.8）。"""
     catalog = MetricCatalog.from_yaml(METRICS_PATH)
-    first = Engine(rules=rule_set, catalog=catalog, store=store, clock=store.clock)
+    mono = ManualMonotonicClock()
+    first = Engine(rules=rule_set, catalog=catalog, store=store, clock=store.clock, monotonic=mono)
     fand = Fand(store)
     run(first, fand, 0, 5, body("normal"))
     assert states(run(first, fand, 5, 70, None), SILENT) == ["pending", "firing"]
-    restarted = Engine(rules=rule_set, catalog=catalog, store=store, clock=store.clock)
+    restarted = Engine(
+        rules=rule_set, catalog=catalog, store=store, clock=store.clock, monotonic=mono
+    )
     transitions = run(restarted, fand, 70, 100, None)
     assert transitions == []
     transitions = run(restarted, fand, 100, 140, body("normal"))
@@ -465,7 +573,11 @@ def test_disabled_silence_rule_is_quiet_while_fand_is_stopped(store, rule_set):
         }
     )
     engine = Engine(
-        rules=quiet, catalog=MetricCatalog.from_yaml(METRICS_PATH), store=store, clock=store.clock
+        rules=quiet,
+        catalog=MetricCatalog.from_yaml(METRICS_PATH),
+        store=store,
+        clock=store.clock,
+        monotonic=ManualMonotonicClock(),
     )
     fand = Fand(store)
     run(engine, fand, 0, 5, body("normal"))
@@ -479,6 +591,7 @@ def test_traces_are_not_read_unless_live(store, rule_set):
         catalog=MetricCatalog.from_yaml(METRICS_PATH),
         store=store,
         clock=store.clock,
+        monotonic=ManualMonotonicClock(),
         read_control_traces=False,
     )
     fand = Fand(store)
@@ -532,6 +645,7 @@ def daemon_for(tmp_path, rule_set, start_ms: int) -> tuple[Daemon, SqliteStore, 
             catalog=MetricCatalog.from_yaml(METRICS_PATH),
             store=store,
             clock=clock,
+            monotonic=ManualMonotonicClock(),
         ),
         notifier=Router(
             config=NotifyConfig.from_yaml(NOTIFY_PATH, environ={}),
@@ -547,7 +661,8 @@ def drive(daemon: Daemon, store: SqliteStore, fand: Fand, start: float, stop: fl
     while seconds < stop:
         if trace is not None:
             fand.write(at(seconds, base), trace)
-        store.clock.advance_to_ms(at(seconds, base))  # type: ignore[attr-defined]
+        assert daemon._engine is not None
+        step(daemon._engine, at(seconds, base))
         daemon._tick()
         seconds += 1.0
 
