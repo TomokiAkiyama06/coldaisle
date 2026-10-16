@@ -141,7 +141,7 @@ RPM の比と正規化した EFU の差（取り付けた状態で風量が回�
     約束のとおり `seq` は欠番を持ちうるので、その連続は求めない）、(1) すべての tick が同じ `run_id`（fand の再起動をまたがない。測定は
     `run_id` を持つ版の trace でだけ行う）、(2) その `run_id` の中で `tick_id` が窓の始まりから終わりまで 1 ずつ連続している（fand は tick ごとに
     `tick_id` を 1 ずつ振るので、欠けた tick が無いことをこれで確かめる）、(3) 隣り合う 2 行の `ts_ms` の差と、窓の始まりから最初の tick・最後の
-    tick から窓の終わりまでの差が `trace_max_gap_ms` 以下、(4) tick の数が `min_trace_ticks` 以上、(5) すべての tick で `operating_mode` が
+    tick から窓の終わりまでの差が `trace_max_gap_ratio × tick_period_ms` 以下、(4) tick の数が `min_trace_ticks` 以上、(5) すべての tick で `operating_mode` が
     `manual` で、その段の指令（`command_id`）のまま・Critical Safety が `NORMAL`・3 zone の `effective` が manual の値と同じ（§2.2 の floor の決まり）、
     (6) すべての tick の 3 zone で、ハードウェアへ適用した値を確かめる: `hardware.write_ok` と `hardware.readback_ok` が true で、`applied_demand`
     （v11 の欄。書き込みと読み戻しを確かめた zone にだけ残る。`ZoneRecord`）が null でなく manual の値と同じ。`effective` だけでは足りない:
@@ -152,10 +152,12 @@ RPM の比と正規化した EFU の差（取り付けた状態で風量が回�
     `tick_id` で欠けた tick を直接確かめられる新しい trace だけを使うので、`seq` の欠番を問わない。目的と入力が違うので矛盾しない
   - 閾値は §2.6b の `config/airflow-characterization.yaml` に `status: provisional` で置く。数の下限は**割合**で持ち、検査する区間（値を取る窓・
     落ち着きの区間）の長さごとに `min_ok_samples = ceil(min_ok_ratio × 区間の長さ ÷ その source の収集の周期)`、
-    `min_trace_ticks = ceil(min_trace_ticks_ratio × 区間の長さ ÷ 1000 ms)` で求める（区間の長さごとの数を設定に置かない）。提案の初期値は、
+    `min_trace_ticks = ceil(min_trace_ticks_ratio × 区間の長さ ÷ tick_period_ms)` で求める（区間の長さごとの数を設定に置かない）。`tick_period_ms` は
+    trace の `runtime.tick_period_ms`（fand の `safety.tick_ms`）をそのまま使い、区間のすべての tick で同じ値であることを確かめる（違えば
+    `trace_coverage`）。1000 ms と決め打ちしない。提案の初期値は、
     `coverage.<source>.min_ok_ratio` 0.9（基板の 2.5 s の周期で 2 分の窓は 44、`settle.span_s` 180 s は 65、60 s は 22、30 s は 11）・
-    `coverage.<source>.period_ms`（基板 2500。ほかの source はその収集の周期）・`max_sample_gap_ms` 6000（2 周期と少し）、trace は `trace_max_gap_ms`
-    1500（0121 T1 の tick の間隔の上限）・`min_trace_ticks_ratio` 0.95
+    `coverage.<source>.period_ms`（基板 2500。ほかの source はその収集の周期）・`max_sample_gap_ms` 6000（2 周期と少し）、trace は `trace_max_gap_ratio`
+    1.5（tick の周期 1000 ms のとき 1500 ms。0121 T1 の tick の間隔の上限）・`min_trace_ticks_ratio` 0.95
 
 ### 2.3 回転数の掃引（`pwm_to_rpm` と Fan profile）
 
@@ -205,8 +207,8 @@ x_base(t_L) = x_1 + (x_2 - x_1) * (t_L - t_1) / (t_2 - t_1)
 | 条件 | 検査 |
 |---|---|
 | 3 zone の Demand | 3 zone のすべてで、trace の `effective` が manual の値と同じ（§2.2 の floor の決まり。対象でない zone も含む） |
-| GPU の Fan | `gpu.0.fan_speed` の窓の中央値の差が `max_gpu_fan_delta_pct` 以内（§5 の 3。GPU の Fan は GPU コアの温度で動くので、GPU の負荷の L ではそのままでは満たせない） |
-| VRM の Fan・AIO ポンプ | `fan.vrm.rpm`・`fan.aio_pump.rpm` の窓の中央値の差が `max_aux_fan_delta_rpm` 以内（どちらも fand の制御の外。VRM の Fan は BIOS が動かしうる） |
+| GPU の Fan | `gpu.0.fan_speed` の窓の中央値の差と、**各窓の中の生の値の幅**（最大 − 最小）がどちらも `max_gpu_fan_delta_pct` 以内（中央値が同じでも窓の中で揺れれば流れが違う。§5 の 3。GPU の Fan は GPU コアの温度で動くので、GPU の負荷の L ではそのままでは満たせない） |
+| VRM の Fan・AIO ポンプ | `fan.vrm.rpm`・`fan.aio_pump.rpm` の窓の中央値の差と、各窓の中の生の値の幅がどちらも `max_aux_fan_delta_rpm` 以内（どちらも fand の制御の外。VRM の Fan は BIOS が動かしうる） |
 | 部屋 | 上の「基準のずれ」と、§2.5 の `air.room` の 1 °C の決まり |
 
 **zone の間の結合**: Rear の Demand を変えると筐体の内の圧力が変わり、同じ Top の Demand でも Top の出口の風量が変わる。Rear の式で
@@ -355,9 +357,9 @@ airflow_index(d) = q_z(d) / q_z(1.0)
    流れで決まるので、どれかが変われば `q_front(d_f*) = q_rear + q_top` の等式が成り立たなくなる
    - **GPU の Fan**: §5 の 3 で (a) を選んだときは、手順 1 の前に GPU の Fan を EFU の窓と同じ固定の duty にし、手順 7 の終わりまで変えない
      （向きの探索・二分法・5 つの熱の窓・確かめ直しのすべてで同じ duty。曲線の値が固定の値を超えた窓は同条件の検査で捨てる）。
-     ほかを選んだときは、手順 1〜7 のすべての窓で `gpu.0.fan_speed` が手順 2 の最初の窓の値から `max_gpu_fan_delta_pct` 以内であることを求める
+     ほかを選んだときは、手順 1〜7 のすべての窓の**すべての ok の行**で `gpu.0.fan_speed` が手順 2 の最初の窓の中央値から `max_gpu_fan_delta_pct` 以内であることを求める
    - **Rear と Top の Demand**: 手順 1 の組の値のまま、手順 7 まで変えない（trace の `effective` が manual の値と同じ。§2.2 の floor の決まり）
-   - **VRM の Fan・AIO ポンプ**: 手順 1〜7 のすべての窓で、`fan.vrm.rpm`・`fan.aio_pump.rpm` が手順 2 の最初の窓の値から
+   - **VRM の Fan・AIO ポンプ**: 手順 1〜7 のすべての窓のすべての ok の行で、`fan.vrm.rpm`・`fan.aio_pump.rpm` が手順 2 の最初の窓の中央値から
      `max_aux_fan_delta_rpm` 以内（負荷の窓で VRM の Fan が上がれば、その回を捨てる）
    - **部屋**: 1 つの回の中で `air.room` が 1 °C を超えて動かない（§2.5）
    - manifest に、GPU の Fan の状態（固定の duty の値か曲線か）と各窓の値を残す。得た `q_front` の曲線は「その GPU の Fan の状態での値」で、
@@ -516,7 +518,7 @@ airflow_index(d) = q_z(d) / q_z(1.0)
 - 見る指標: `air.gpu_intake`・`d.case_delta`・`gpu.0.core` / `hotspot`・`cpu.package`・`air.gpu_exhaust` / `rear_exhaust` / `top_exhaust`
   （それぞれ `air.front_intake` との差）。`air.room` / `air.room_humidity`・`board.connector_12v2x6`・`gpu.0.fan_speed`・`fan.vrm.rpm`・`fan.aio_pump.rpm`・電力も残す
 - 比べる 2 つの段（基準の段と動かした段）で、動かした zone 以外の条件をそろえる: 動かしていない zone の `effective` が manual の値と同じ
-  （floor の決まり）・負荷（電力の上限と worker の数）が同じ・`fan.aio_pump.rpm` の差が `max_aux_fan_delta_rpm` 以内。GPU の Fan と VRM の Fan は
+  （floor の決まり）・負荷（電力の上限と worker の数）が同じ・`fan.aio_pump.rpm` の窓の中央値の差と各窓の中の生の値の幅が `max_aux_fan_delta_rpm` 以内。GPU の Fan と VRM の Fan は
   温度に応じて動くのが運転のままの応答の一部なので、そろえずに記録する（応答の行列は「運転のままの系で、その zone を動かすと何が起きるか」を測る）
 - **熱の入力をそろえる**: Fan を変えると CPU / GPU の温度が変わり、boost・throttle・リークで、同じ電力の上限・同じ worker の数でも実際の電力が
   変わりうる。動かした段と、その前後の基準の段（時刻で内挿した値）の `power.cpu.package` と `power.gpu.0` の窓の平均の差が、上側の境界で
@@ -525,7 +527,7 @@ airflow_index(d) = q_z(d) / q_z(1.0)
   電力の差（と throttle の flag）を報告に残す（Fan を下げて throttle に入ること自体は意味のある結果なので、黙って消さない）
 - 回数: 負荷ごとに 2 回（別の日）
 - **落ち着き**: 0121 T4 の測り直しと同じ基準。直近 3 分（`settle.span_s`。区間の全体が §2.2 の覆いの検査を満たすこと。欠け・`stale` / `suspect` の行の
-  ある区間では落ち着いたと判定しない）の幅が、空気の温度 0.5 °C 以内・`cpu.package`（3 点の中央値）/ `gpu.0.core` /
+  ある区間では落ち着いたと判定しない）の**生の ok の行の**幅（最大 − 最小。ブロックの平均で均さない。`cpu.package` は 3 点の中央値の列の幅）が、空気の温度 0.5 °C 以内・`cpu.package`（3 点の中央値）/ `gpu.0.core` /
   `board.connector_12v2x6` 1 °C 以内になったら落ち着いたとし、最後の 2 分の平均を値にする。20 分で落ち着かなければ「未収束」として
   解析から外す
 - 1 つのセッションの中で `air.room` が 1 °C を超えて動いたら、そのセッションをやり直す（0121 §2.9 の吸気の決まりと同じ趣旨）
@@ -594,11 +596,11 @@ airflow_index(d) = q_z(d) / q_z(1.0)
 
 | 検査（節） | 量 | `u` の求め方 | 比べ方 |
 |---|---|---|---|
-| 落ち着き（§2.5） | 直近 `settle.span_s` のブロックの平均の最大 − 最小 | その metric の分解能（`resolution.air_c`・`resolution.cpu_package_c`・`resolution.gpu_core_c`・`resolution.board_connector_c`）の `u_res` × √2。設定が欠ければ解析は何も出さずに失敗する（§2.6b） | 上側 ≤ `settle.max_range_air_c` / `settle.max_range_chip_c` |
+| 落ち着き（§2.5） | 直近 `settle.span_s` の生の ok の行の最大 − 最小（ブロックの平均で均さない。ブロックの中で揺れても幅に出る） | その metric の分解能（`resolution.air_c`・`resolution.cpu_package_c`・`resolution.gpu_core_c`・`resolution.board_connector_c`）の `u_res` × √2。設定が欠ければ解析は何も出さずに失敗する（§2.6b） | 上側 ≤ `settle.max_range_air_c` / `settle.max_range_chip_c` |
 | 窓の傾き（§2.4） | `|b| × 窓の長さ` | ブロックの平均から求めた傾きの標準誤差 × 窓の長さ | 上側 ≤ `max_window_trend` |
 | 基準のずれ（§2.4） | 前後の負荷なしの窓の差 `|x_2 − x_1|` | `sqrt(u_win(x̄_1)^2 + u_win(x̄_2)^2)` | 上側 ≤ `max_baseline_shift_c` |
-| 同条件: GPU の Fan（§2.4・零位法の 0） | 窓の中央値の差 | 目標値の 1 % の丸め（1/√12 × √2） | 上側 ≤ `max_gpu_fan_delta_pct` |
-| 同条件: VRM の Fan・ポンプ（§2.4・§2.5・零位法の 0） | 窓の中央値の差 | 各窓の `u_win` の二乗和の平方根 | 上側 ≤ `max_aux_fan_delta_rpm` |
+| 同条件: GPU の Fan（§2.4・零位法の 0） | 窓の中央値の差・各窓の中の生の値の幅 | 目標値の 1 % の丸め（1/√12 × √2） | 上側 ≤ `max_gpu_fan_delta_pct` |
+| 同条件: VRM の Fan・ポンプ（§2.4・§2.5・零位法の 0） | 窓の中央値の差・各窓の中の生の値の幅 | 各窓の `u_win` の二乗和の平方根 | 上側 ≤ `max_aux_fan_delta_rpm` |
 | 部屋（§2.5・零位法の 0） | セッションの中の `air.room` のブロックの平均の最大 − 最小 | `u_res` × √2 | 上側 ≤ `max_room_drift_c` |
 | 温度上昇・電力の増分の最小（§2.4） | `ΔT_z` / `ΔP` | §2.4 の `u(ΔT_z)` / `u(ΔP)` | 下側 ≥ `min_delta_t_c` / `min_delta_power_w` |
 | 信号 ÷ 不確かさ（§2.4） | `値 / u(値)` | — | ≥ `min_signal_to_uncertainty`（それ自体が不確かさの検査） |
@@ -669,7 +671,7 @@ u_shared,i     = その回の値の式（§2.4・§2.4a の 1）へ、共通の�
 | GPU の Fan の duty（主でない duty の部分の測定） | `gpu_fan_duty.repetitions` / `gpu_fan_duty.min_distinct_days` / `gpu_fan_duty.rear_excluded_pct` | 3 / 2 / 30（Rear を測らない duty）。段と組は `efu.levels` と `null.combos` のすべてを使い、別の鍵で減らさない（§5 の 8） | §2.4 |
 | 応答の行列の熱の入力 | `response_matrix.max_power_delta_w` | 5 | §2.5 |
 | 承認の目安 | `approval.max_rpm_spread` / `approval.max_efu_spread` | 3 % / 15 % | §2.6 の 5 |
-| 窓の覆い | `coverage.<source>.min_ok_ratio` / `coverage.<source>.period_ms` / `coverage.<source>.max_sample_gap_ms` / `coverage.trace_max_gap_ms` / `coverage.min_trace_ticks_ratio` | 0.9 / 2500（基板）/ 6000 / 1500 / 0.95（数の下限はすべての区間の長さから割合で求める。§2.2） | §2.2 |
+| 窓の覆い | `coverage.<source>.min_ok_ratio` / `coverage.<source>.period_ms` / `coverage.<source>.max_sample_gap_ms` / `coverage.trace_max_gap_ratio` / `coverage.min_trace_ticks_ratio` | 0.9 / 2500（基板）/ 6000 / 1.5（× trace の `tick_period_ms`）/ 0.95（数の下限はすべての区間の長さから割合で求める。§2.2） | §2.2 |
 
 設定に置かないもの: 中止の基準（`cpu.package` 88 °C・`gpu.0.core` 85 °C・`board.connector_12v2x6` 70 °C）は 0121 / 0130 の値で、所有者が測定中に
 見て負荷を止める判断に使う。解析の検査ではないので、解析の設定に写さない（写すと 2 か所で食い違いうる）。CPU の floor の点（60 / 80 °C・100 / 200 W）は `safety.yaml` の値で、解析は manifest の Control Config の hash を通して同じものを読み、写さない。GPU の Fan の固定の duty の値は、
@@ -762,6 +764,7 @@ manifest に残すことだけを決める。
   duty の影響が低い段だけで大きい合成の筐体で `calibrated` を提案しないこと。
 - duty の零位法: `d_f*` は同じでも `q_rear + q_top` が duty で変わる合成の筐体で、`effect_null` が上限を超えて `calibrated` を提案しないこと。
   30 % の確かめ方が無い出力で Rear と Front の `calibrated` を提案しないこと
+- 窓の中の揺れ: GPU の Fan・VRM の Fan・ポンプが中央値は同じで窓の中で揺れる合成の例を同条件の検査で捨てること。温度がブロックの中で周期的に揺れ、ブロックの平均はそろう例を落ち着いたと判定しないこと。`tick_period_ms` が 1000 ms 以外の trace で tick の数の下限と間隔の上限がその周期から求まること
 - 負荷の重さ: 負荷で風量が変わる合成の筐体で、重ねた段の差が上限を超えると重い負荷の段を `load_dependence` で捨てること。負荷の影響が低い段だけにある合成の筐体で、1 つの段の重なりの結果を
   ほかの段へ移さないこと。共通の成分が複数ある Rear の例で `u_shared` がすべての成分を合わせた値になること（最大の 1 つだけにしない）。落ち着きの区間の最初に欠けがあり最後の 2 分はそろう例で、落ち着いたと判定しないこと
 - 回の平均: 3 回がそろって範囲が 0 の合成の例で、補正の係数と分解能の共通の項が `u(平均)` に √3 で割られずに残り、結合の比・duty の影響の上側の境界が上限をまたぐ例で通さないことtrace の最後の tick で `write_ok` / `readback_ok` が偽（`applied_demand` が null）の窓を `trace_coverage` で捨てること
