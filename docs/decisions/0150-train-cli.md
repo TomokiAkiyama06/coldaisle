@@ -88,7 +88,7 @@ AGENTS.md の「仕様に無い判断をした場合、実装より先に決定�
 | `--training-spec <path>` | 学習の選択の YAML（下記） | AGENTS.md ルール9 |
 | `--model-id` / `--model-version` | artifact の identity。同じ版の再登録は Registry が拒否する | 0062 |
 | `--created-at <RFC 3339>` | artifact の `created_at`（壁時計を読まない。§2.7） | 0079 §2.3 |
-| `--out <dir>` | 出力先（§2.4） | — |
+| `--out <dir>` | 出力先のディレクトリ。**まだ無いこと**（§2.5 の公開の手順で作る） | — |
 
 `--training-spec` の YAML（schema v1）は次を持つ。どれも**本番の既定値を置かない**（0048 §2.3 / 0079 §2.3 と同じ）。
 リポジトリには仮の値の例（`config/training.example.yaml`）だけを置く（§5 の 3）。
@@ -120,17 +120,54 @@ AGENTS.md の「仕様に無い判断をした場合、実装より先に決定�
 
 `test` は学習にも Profile にも使わない。件数と期間を報告に載せるだけ（§5 の 5）。
 
-失敗は構造化ログに理由を出して**終了コード 1**。出力の途中のファイルを残さない（一時ファイルへ書いて最後に rename）。
+失敗は構造化ログに理由を出して**終了コード 1**。`--out` には何も現れない（§2.5 の「公開の手順」。ファイルごとの rename はしない）。
 
 ### 2.5 出力と、既定では Registry を書かないこと
 
-`--out` に次の3つを書く。**既にあれば拒否する**（上書きしない。`O_EXCL`）。
+`--out` のディレクトリに次の3つを置く。`--out` が**既にあれば拒否する**（上書きしない）。
 
 | ファイル | 中身 |
 |---|---|
 | `artifact.json` | 登録する canonical bytes（§2.4 の 6） |
 | `metadata.json` | `ArtifactMetadata` の strict JSON（`coldaisle-registry register --metadata` へそのまま渡せる形） |
 | `training-report.json` | §2.7 の digest の一覧・split ごとの件数と期間・artifact の SHA-256・Profile の SHA-256・除いた example の件数 |
+
+#### 公開の手順（3つを1回の rename で出す）
+
+ファイルごとに一時ファイルから rename すると、1つ目の rename の後に process が強制終了したとき一部だけが `--out` に残り、
+再実行も「既にある」で拒まれる。そこで既存の Dataset の writer（`src/coldaisle/dataset.py` の `write_dataset`）と同じ手順で、
+**ディレクトリ全体を1回の `os.rename` で公開する。**
+
+1. `--out` の親を `O_DIRECTORY | O_NOFOLLOW` で開き、親の中の writer 用の lock ファイルを `flock(LOCK_EX)` する
+   （実行した uid の所有の通常ファイル・group / other が書けない・link 数 1 を確かめる。`_lock_output_root` と同じ）。
+   `--out` の不存在の確認と rename を、同じ親へ書く他の writer と直列にする
+2. `--out` が無いことを確かめる（あれば拒否）
+3. **同じ親の中**（同じファイルシステム）に `0700` の一時ディレクトリ `.coldaisle-train-stage-<32 hex>` を作る
+   （推測できない名前。衝突したら作り直す）
+4. 3つのファイルを一時ディレクトリへ `O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW` で書き、**それぞれ fsync** する
+5. **一時ディレクトリを fsync** し、開いた fd と path の `(st_dev, st_ino)` が同じことを確かめる（差し替えの検知）
+6. `--out` がまだ無いことをもう一度確かめ、`os.rename(一時ディレクトリ, --out)` で公開する
+7. **親を fsync** する（rename したディレクトリの項を永続にする）
+8. 失敗したとき（公開の前）は、自分で作った一時ディレクトリの**既知の3つの名前だけ**を unlink して rmdir する。
+   後始末の失敗は元の例外を隠さない（`suppress(OSError)`）。`--out` には何も現れない
+
+process が強制終了したときに残りうるのは親の中の `.coldaisle-train-stage-*` だけで、`--out` は「無い」か「3つがそろって
+ある」のどちらかになる。残った一時ディレクトリは名前が一意なので再実行を妨げない。自動では消さない（Dataset の writer と
+同じ。人が確かめて消す）。手順は Dataset の writer と共有する（実装の PR で `dataset.py` の非公開の関数を、ファイル名の
+組を引数に取る共有の部品へ移す。手順を写して2つにしない）。
+
+#### `--apply` の Registry 側の書き込み
+
+`ModelRegistry.register_candidate` は、artifact を `artifacts/<kind>/<model_id>/<version>/` へ一時ファイルと
+`os.replace` で書いてから、`registry.json` を同じく原子的に置き換える。**`registry.json` の置き換えが登録の確定点**で、
+その前に強制終了しても残るのは参照されない artifact だけである（snapshot が無い bytes を指す状態は起きない）。
+同じ版の再登録は同じ path へ `os.replace` で上書きするので、残った artifact が再実行を妨げない。したがって Registry 側に
+同じ問題は無く、本記録では変えない。
+
+順序は **`--out` の公開 → Registry の登録**とする。2つの間で止まったときは `--out` だけがあり、`coldaisle-train` の
+再実行は `--out` が既にあるので拒否される。このときは `--out` の `artifact.json` と `metadata.json` を
+`coldaisle-registry register` へ渡せば同じ bytes が登録される（§5 の 1 の推奨の理由と同じ）。登録の失敗は構造化ログに
+`--out` の path を出し、この手順を促す。
 
 - **既定では Registry を書かない。** `--out` へ書いて終わる（`coldaisle-calibrate` / `coldaisle-memory` の「既定では
   書かない」と同じ流儀）
@@ -187,7 +224,9 @@ coldaisle-authority raise          → authority を1段   （承認者の uid�
 - `--apply` 無しでは Registry のディレクトリを作らず、ファイルが1つも増えない
 - `--apply` で candidate になり、production pointer と revision 以外の記録が変わらない。同じ版の2回目は終了コード 1
 - 拒否: 公開物の改ざん・`--replay-path` の取り違え・期間の後の較正の記録・`--calibration` の取り違え・`--out` が既にある・
-  `support_axes` に `fan.<zone>` が欠ける。どれも `--out` に何も残らない
+  `support_axes` に `fan.<zone>` が欠ける。どれも `--out` が作られず、親に一時ディレクトリも残らない
+- 公開の手順: 一時ディレクトリへ書いた後・rename の前に例外を起こしても `--out` が無いこと、rename の直前に `--out` を作られたら
+  拒否すること（Dataset の writer の試験と同じ形）
 - import の走査: `train` を import する module が無いこと、`train` が §2.1 の禁止の module を import しないこと
 - 作った artifact が `check_artifact_contents` を通り、`--apply` の後に `from_verified_artifact`（L1〜L12）を通ること（§2.4 の 7）
 
