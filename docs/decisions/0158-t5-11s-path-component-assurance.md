@@ -5,7 +5,10 @@
 - **Date**: 2026-10-16
 - **Supersedes**: [`0121`](0121-hardware-test-procedure.md) §2.7 T5 のうち、約 11 s の経路（SIGABRT で終わらず `TimeoutAbortSec` を
   待つ経路）を実機で測ることを、本記録の部品ごとの根拠・テスト・解析で補う。0121 §2.7 の測り方・合格の条件・約 5 s の経路の
-  合格は**変えない**。0121 は書き換えない
+  合格は**変えない**。0121 は書き換えない。
+  あわせて [`0119`](0119-safety-values-first-host.md) §2.13 の表の `watchdog_timeout_ms` の行（「実際の最悪時間（約 11 s）の間の温度の上昇が…余裕に収まる」を
+  実機の試験で裏付けるまで `provisional`）のうち、約 11 s の経路の温度を実機で測ることを、本記録の §2.6 の条件（所有者の受け入れ・テスト）で置き換える。
+  0119 §2.13 のほかの行と、約 5 s の経路を実機で裏付けることは変えない
 - **関連**: [`0154`](0154-t5-11s-path-test-exception.md)（Rejected。実機で再現する案）/
   [`0127`](0127-t5-gpu-steady-450w.md) §2.5 / §5 の 2（Rejected。(c)「試験をせず別の根拠で見積もる」に当たる）/
   [`0119`](0119-safety-values-first-host.md) §2.12 / §2.13 /
@@ -65,7 +68,7 @@ fand が hang したときに Max になるまでの順序は、0080 §2.5 の�
 | P3 | **`TimeoutAbortSec` の SIGKILL**（5 s） | 実機で通したことは無い（外から作る手段が無い。0154 §1.2）。期限で SIGKILL を送ることは systemd の文書の振る舞い（`systemd.service(5)` の `TimeoutAbortSec=`）。SIGKILL の後は P4 と同じ経路で、`kill -KILL` で 44 ms（simulated）・51 ms（hwmon、3 zone に Max） | `tests/test_deploy_templates.py` の `test_fand_states_every_timeout`（明示してあることだけ。値の上限は見ない。§2.5 の T1） | **この部品の時間（5 s の待ち）と、その間の温度** |
 | P4 | **cgroup の停止と引き継ぎ**（`KillMode=control-group`・`ExecStopPost=+/usr/bin/python3 -I -S …/safety_handoff.py`。root・venv に依存しない・記録があれば Max、無ければ何もしない） | T2: 書き込みの失敗の 2 回の終了コード 7 で、引き継ぎの実行部が3 zone に Max を書いた（`applied`）。T5 の 12 試行で `safety_handoff_completed`。段階 5: 再起動の連続で毎回 `ExecStopPost` が走った。`kill -KILL` の後にも走った（P3） | `tests/test_safety_handoff.py`（記録の検査・3 zone・一部の zone の失敗で他を止めない・読み戻し・標準ライブラリだけ・`-I -S` で環境に左右されない、など）、`tests/test_deploy_templates.py`（`KillMode`・`ExecStopPost` の形と権限） | なし（SIGABRT でも SIGKILL でも同じ実行部） |
 | P5 | **引き継ぎの Max**（3 zone の `pwmN_enable` を全速に、manual なら `pwmN` を最大に。読み戻しで確かめる） | T5 は 3 zone の `pwmN_enable=0` を 20 ms ごとに読んで Max を確かめた（この driver は manual の 255 を `0` と読み返す。0118 §2.6）。Top の確認で `pwm2=89` から全速。T2 で3 zone `applied` | `tests/test_safety_handoff.py` の `test_handoff_writes_only_full_speed_enable_and_max_pwm`・`test_manual_readback_must_show_max_pwm` ほか | なし |
-| P6 | **Max になるまでの時間** | 約 5 s の経路: 5143〜5324 ms（T5、実測）。約 11 s の経路: P1 の 5 s + P3 の 5 s + P4・P5 の 44〜51 ms ≒ 約 10.05 s（**計算。実測ではない**）。D 状態: 上限なし | — | 合計の時間の実測 |
+| P6 | **Max になるまでの時間** | 約 5 s の経路: 5143〜5324 ms（T5、実測）。約 11 s の経路: P1 の 5 s + P3 の 5 s + P4・P5 の 44〜51 ms ≒ 約 10.05 s（**計算。実測ではなく、上限でもない**。systemd の処理の遅れと、負荷の下の SIGKILL から回収・`ExecStopPost` の完了までの時間を含まない。§2.4 の X5）。D 状態: 上限なし | — | 合計の時間の実測 |
 
 部品ごとに見ると、約 11 s の経路で実機で通っていないのは **P3 の 5 s の待ちと、その間（低い Demand のまま）の温度**だけである。
 P3 の後の SIGKILL から Max までは P4・P5 と同じ部品で、`kill -KILL` で実測してある。
@@ -103,10 +106,11 @@ D 状態（中断できない I/O）は SIGKILL でも終わらないので約 1
 |---|---|---|
 | X1 | 約 11 s の経路の間の温度を実測していない。0121 §2.7 の「開始 + 上昇が上限より 5 °C 以上低い」を、この経路では測定で示せない | 起こる条件が狭い（§2.3。ユーザー空間の固まりは約 5 s の経路になる）。約 5 s の経路の最高は上限の内側で、増える約 5 s はチップの温度より冷却水と筐体の温度に効く（0119 §2.12）。チップは自身のクロックの制限で守られ、GPU の Fan は別のプロセスで動く。見積もり（0154 §2.5b）は上限 85 °C の内側 |
 | X2 | `TimeoutAbortSec` の期限で systemd が SIGKILL を送ることを、この機械で通していない | systemd の文書の振る舞いで、SIGKILL の後の経路（P4・P5）は `kill -KILL` で実測してある。`TimeoutAbortSec` の値が変わらないことは §2.5 の T1 のテストで守る |
-| X3 | §2.3 の仮説の終わり方（journal のパイプの詰まりなど）が実際に起こるか・起こったときの時間を確かめていない | 記録に残っていない。起こっても kill できる限り `TimeoutAbortSec` の 5 s で上限がある |
+| X3 | §2.3 の仮説の終わり方（journal のパイプの詰まりなど）が実際に起こるか・起こったときの時間を確かめていない | 記録に残っていない（起こったときの時間は X5） |
+| X5 | **時間切れから Max までの全体に上限が無い**。`TimeoutAbortSec` 5 s が決めるのは systemd が SIGKILL を**送る**時刻だけで、プロセスが回収され cgroup が止まり `ExecStopPost` が Max を書き終えるまでの時間は決めない（`systemd.service(5)`: `ExecStopPost` はサービスが止まった後に走る）。SIGKILL から Max の 44〜51 ms はアイドルの 2 回の実測で、負荷の下の値でも上限でもない。§1.1 の約 10.05 s も systemd の処理の遅れを除いた計算である | 上限を与えるには新しい値（全体の時間の上限と、それを超えたときの手当て）が要るので、本記録では決めない。受け入れるなら「約 10.05 s は上限ではなく、kill できる hang の典型の見積もり」と `basis` に書く（§2.6）。受け入れないなら §5 の 1 の別の案へ |
 | X4 | D 状態の hang（上限なし） | **本記録では受け入れない**。0154 §5 の 8・9 の論点を §5 の 2 に引き継ぐ |
 
-X1〜X3 を受け入れるかは所有者が決める（§5 の 1）。受け入れないなら §2.6 のとおり `confirmed` にしない。
+X1〜X3 と X5 を受け入れるかは所有者が決める（§5 の 1）。受け入れないなら §2.6 のとおり `confirmed` にしない。
 
 ### 2.5 テストで担保する範囲
 
@@ -132,7 +136,7 @@ systemd を使った経路全体のテスト（コンテナや VM の systemd �
 - T5 の結果は「**SIGABRT で終わる約 5 s の経路は実機で合格**（`docs/fan-header-mapping.md` の T5）、**約 11 s の経路は実機では試さず、
   本記録の部品ごとの根拠・テスト・解析で担保する**」とする
 - `watchdog_timeout_ms` 5000 は、次がそろったときだけ、0121 §2.10 のとおり承認点 2 で `confirmed` にできる:
-  1. 所有者が §2.4 の X1〜X3 を受け入れる（§5 の 1）
+  1. 所有者が §2.4 の X1〜X3 と X5 を受け入れる（§5 の 1）
   2. §2.5 の T1〜T3 が入る（§5 の 3）
   3. `basis` に「0121 §2.7（約 5 s の経路の実測）・本記録（約 11 s の経路は部品と解析。kill できる hang に限る）・`docs/fan-header-mapping.md` の T5」と書き、
      D 状態の hang（X4）が範囲の外であることを明記する
@@ -169,7 +173,7 @@ systemd を使った経路全体のテスト（コンテナや VM の systemd �
 
 | # | 内容 | 選択肢（推奨を先に） | 時期 |
 |---|---|---|---|
-| 1 | §2.4 の X1〜X3（約 11 s の経路の温度を実測していない・`TimeoutAbortSec` の SIGKILL をこの機械で通していない・§2.3 の仮説の終わり方を確かめていない）を受け入れるか | **(推奨) 受け入れる**: §2.5 の T1〜T3 が入ってから、`basis` に条件つき（kill できる hang に限る・約 11 s の経路は部品と解析）と書いて承認点 2 で `confirmed` にする / 受け入れず、最悪時間を短くする案（`TimeoutAbortSec` を短く、または `WatchdogSignal=SIGKILL`。0080 §5 の 1・3）を別の決定記録で出す。値はその記録で決める / どちらもせず `provisional` のまま `enable` しない | 承認点 2 の前 |
+| 1 | §2.4 の X1〜X3 と X5（約 11 s の経路の温度を実測していない・`TimeoutAbortSec` の SIGKILL をこの機械で通していない・§2.3 の仮説の終わり方を確かめていない・時間切れから Max までの全体に上限が無い）を受け入れるか | **(推奨) 受け入れる**: §2.5 の T1〜T3 が入ってから、`basis` に条件つき（kill できる hang に限る・約 11 s の経路は部品と解析）と書いて承認点 2 で `confirmed` にする / 受け入れず、最悪時間を短くする案（`TimeoutAbortSec` を短く、または `WatchdogSignal=SIGKILL`。0080 §5 の 1・3）を別の決定記録で出す。値はその記録で決める / どちらもせず `provisional` のまま `enable` しない | 承認点 2 の前 |
 | 2 | **D 状態の hang（X4）の残るリスク**（0154 §5 の 8・9 から引き継ぐ） | **(推奨) 調べてから決める**: 予備確認から T1 までの journal と `dmesg` で `hung_task`（`blocked for more than`）・fand の `duration_ms` の外れ値・`write_failure` / `readback_mismatch` を数え、T1 の 24 h の tick の最大の時間を示す。そのうえで、兆しが無ければ、BIOS / EC・CPU・GPU の自身の保護に頼る範囲を所有者が承認して受け入れる / 受け入れず、手当て（fand の trace の途絶の通知など。PR #337 の案）を決めるまで `enable` しない | 承認点 3 の前 |
 | 3 | §2.5 の T1〜T3 のテストを足す実装の PR | **(推奨) 本記録の FINAL の後、承認点 2 の前に、別の Issue・ブランチで足す**（制御の挙動は変えない。テストの追加と、T2・T3 が落ちたときだけ実装を直す）/ 足さずに承認点 2 へ進む（解析の前提が守られない。推奨しない） | 承認点 2 の前 |
 | 4 | systemd を使った経路全体のテスト（VM・コンテナの systemd で `SIGSTOP` と SIGKILL の経路を通し、`ExecStopPost` が走ることと時間を測る。simulated backend） | **(推奨) 行わない**: 段階 5 と T5 の実機の結果があり、systemd の振る舞いはこの機械の実測のほうが根拠として強い / 行う: `hardware` 印のテストとして足す（CI では走らない） | 3 と同時 |
