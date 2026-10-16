@@ -56,7 +56,9 @@ def read_fand_status(trace: SequencedControlTrace) -> FandStatus | None:
     safety_state = state.get("safety_state")
     if not isinstance(safety_state, str) or safety_state not in SAFETY_STATES:
         return None
-    raw_faults = body.get("faults", [])
+    # `faults` の欠けを空とみなさない。壊れた・形の変わった trace の `normal` で、発火中の
+    # EMERGENCY を解いたり、途絶を健全と見たりしないため（v1 から常に書かれている欄）
+    raw_faults = body.get("faults")
     if not isinstance(raw_faults, list):
         return None
     faults: list[FandFault] = []

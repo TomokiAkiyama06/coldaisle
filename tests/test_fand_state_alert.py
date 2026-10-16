@@ -169,6 +169,8 @@ def test_a_newer_version_with_extra_fields_is_still_read():
     "broken",
     [
         {"faults": []},
+        {"state": {"safety_state": "normal"}},
+        {"state": {"safety_state": "normal"}, "faults": None},
         {"state": {"safety_state": "panic"}, "faults": []},
         {"state": {"safety_state": "normal"}, "faults": {}},
         {"state": {"safety_state": "degraded"}, "faults": [{"zone": "top"}]},
@@ -351,6 +353,18 @@ def test_a_stale_trace_keeps_a_firing_emergency_and_drops_a_pending_degraded(eng
     transitions = run(engine, other, 650, 900, None)
     assert [a for a in store.alerts(limit=10) if a.rule_id == DEGRADED] == [], "発火待ちは取り消す"
     assert states(transitions, DEGRADED) == []
+
+
+def test_a_trace_without_faults_does_not_resolve_a_firing_emergency(engine, store):
+    """`faults` の無い trace は読めない。`normal` でも EMERGENCY を解かず、途絶とする。"""
+    fand = Fand(store)
+    run(engine, fand, 0, 5, body("emergency", [OVER_TEMP]))
+    broken = body("normal")
+    del broken["faults"]
+    transitions = run(engine, fand, 5, 60, broken)
+    assert states(transitions, EMERGENCY) == []
+    assert states(transitions, SILENT) == ["pending", "firing"]
+    assert [a.state.value for a in store.alerts(limit=10) if a.rule_id == EMERGENCY] == ["firing"]
 
 
 def test_a_trace_from_the_future_counts_as_fresh(engine, store):
