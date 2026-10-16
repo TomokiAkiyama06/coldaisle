@@ -299,6 +299,14 @@ class IntervalSet:
     def intervals(self) -> tuple[Interval, ...]:
         return self._intervals
 
+    def crossed(self, after_ms: int, before_ms: int) -> bool:
+        """開区間 `(after_ms, before_ms)` のどこかが区間に入るか（評価時刻の間に挟まった区間）。"""
+        index = bisect_left(self._starts, before_ms) - 1
+        if index < 0:
+            return False
+        item = self._intervals[index]
+        return max(item.start_ms, after_ms + 1) < min(item.end_ms, before_ms)
+
     def find(self, at_ms: int) -> Interval | None:
         index = bisect_right(self._starts, at_ms) - 1
         if index < 0:
@@ -1064,6 +1072,12 @@ class Aggregator:
             gap = prev_t is not None and at_ms - prev_t > config.max_gap_ms
             if gap:
                 close()
+            if prev_t is not None and self._periods.exclude.crossed(prev_t, at_ms):
+                # 2 つの評価時刻の間に除く区間が丸ごと挟まった。その間の状態は分からないので、
+                # 区間の中の時刻と同じく計時をやり直し segment を切る（0155 §2.2）
+                prev_phys = None
+                timer = None
+                close()
             item = self.classify(at_ms)
             prev_t = at_ms
             if item.excluded:
@@ -1411,6 +1425,14 @@ def as_markdown(report: dict[str, Any]) -> str:
         "# 負荷の状態ごとの分布",
         "",
         f"- 期間: {period['start']} 〜 {period['end']}",
+        *(
+            [
+                f"- **実際に集計した期間（生データの欠けのため）**: "
+                f"{provenance['covered_period']['start']} 〜 {provenance['covered_period']['end']}"
+            ]
+            if provenance["incomplete"]
+            else []
+        ),
         f"- 切り口: {provenance['group_by']}"
         + ("（fand_override を含む）" if provenance["include_override"] else ""),
         f"- 設定の SHA-256: `{provenance['config_sha256']}`",
@@ -1431,20 +1453,28 @@ def as_markdown(report: dict[str, Any]) -> str:
         lines.append("")
     for metric in report["metrics"]:
         lines += [f"## {metric['metric']}（{metric['unit']}）", ""]
-        lines += ["| cooling | 状態 | period | n | p50 | p95 | p99 | max | segment |",
-                  "|---|---|---|---|---|---|---|---|---|"]  # fmt: skip
-        for group in metric["groups"]:
-            stats = group["stats"]
-            quantiles = stats["quantiles"]
-            lines.append(
-                f"| {group['cooling']} | {group['label']} | {group['period']} | {stats['n']} "
-                f"| {_num(quantiles.get('p50'))} | {_num(quantiles.get('p95'))} "
-                f"| {_num(quantiles.get('p99'))} | {_num(stats['max'])} "
-                f"| {group['segments']['count']} |"
-            )
-        if not metric["groups"]:
-            lines.append("| — | — | — | 0 | — | — | — | — | 0 |")
-        lines.append("")
+        lines += _group_table(metric["groups"])
+        if metric["transitions"]:
+            # 移り変わり直後は主の分布に入れないが捨てない（0151 §2.3）。行き先の状態ごとに出す
+            lines += [f"### {metric['metric']} の transition（行き先の状態ごと）", ""]
+            lines += _group_table(metric["transitions"])
+        if metric["quality"]:
+            lines += [
+                f"### {metric['metric']} の品質で除いた件数",
+                "",
+                "| cooling | 状態 | period | missing | suspect | stale | null | unpaired |",
+                "|---|---|---|---|---|---|---|---|",
+            ]
+            lines += [
+                f"| {item['cooling']} | {item['label']} | {item['period']} "
+                + " ".join(
+                    f"| {item.get(name, 0)}"
+                    for name in ("missing", "suspect", "stale", "null", "unpaired")
+                )
+                + " |"
+                for item in metric["quality"]
+            ]
+            lines.append("")
     lines += ["## 除いた件数", "", "| metric | 理由 | 件数 |", "|---|---|---|"]
     for metric, counts in provenance["excluded"].items():
         for reason, count in counts.items():
@@ -1454,6 +1484,25 @@ def as_markdown(report: dict[str, Any]) -> str:
             else:
                 lines.append(f"| {metric} | {reason} | {count} |")
     return "\n".join(lines).rstrip() + "\n"
+
+
+def _group_table(groups: Sequence[dict[str, Any]]) -> list[str]:
+    lines = [
+        "| cooling | 状態 | period | n | p50 | p95 | p99 | max | segment |",
+        "|---|---|---|---|---|---|---|---|---|",
+    ]
+    for group in groups:
+        stats = group["stats"]
+        quantiles = stats["quantiles"]
+        lines.append(
+            f"| {group['cooling']} | {group['label']} | {group['period']} | {stats['n']} "
+            f"| {_num(quantiles.get('p50'))} | {_num(quantiles.get('p95'))} "
+            f"| {_num(quantiles.get('p99'))} | {_num(stats['max'])} "
+            f"| {group['segments']['count']} |"
+        )
+    if not groups:
+        lines.append("| — | — | — | 0 | — | — | — | — | 0 |")
+    return [*lines, ""]
 
 
 def _num(value: float | None) -> str:

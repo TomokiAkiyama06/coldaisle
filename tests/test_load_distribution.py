@@ -408,6 +408,20 @@ def test_exclude_wins_over_bios_confirmed_and_named_periods_coexist(fx: Fixture)
     assert report["provenance"]["periods_sha256"] is not None
 
 
+def test_an_exclude_interval_between_two_samples_restarts_settle(fx: Fixture) -> None:
+    """評価時刻の間に丸ごと挟まった除く区間でも計時をやり直す（0155 §2.2 / Codex P1）。"""
+    steady_bios(fx, T0 - 10 * MIN, T0 + 20 * MIN)
+    hole = T0 + 5 * MIN + 1000  # 2.5 s ごとの評価時刻の間の 1 s
+    periods = {
+        "exclude": [{"start": iso(hole), "end": iso(hole + 1000), "reason": "時計"}],
+        **bios_everywhere(),
+    }
+    report = fx.build(T0, T0 + 20 * MIN, periods=periods)
+    assert "excluded_by_periods" not in excluded(report)
+    assert transitions(report)[IDLE]["stats"]["n"] == 60 * S // 2500
+    assert groups(report)[IDLE]["segments"]["count"] == 2
+
+
 # ---------------------------------------------------------------- 生データの覆い
 
 
@@ -1074,6 +1088,20 @@ def test_the_cli_output_has_provenance_and_no_db_path(fx: Fixture) -> None:
     lines = markdown.read_text(encoding="utf-8").splitlines()
     assert "| cooling | 状態 | period | n | p50 | p95 | p99 | max | segment |" in lines
     assert "## 除いた件数" in lines
+
+
+def test_markdown_shows_transitions_quality_and_the_covered_period(fx: Fixture) -> None:
+    """Codex P2 の 3 件: transition の表・品質の件数・--allow-partial の実際の期間。"""
+    steady_bios(fx, T0 - 10 * MIN, T0 + 20 * MIN)
+    fx.reading("air.room", T0 + 10 * MIN + 1, -127.0, "suspect")
+    fx.rollup("air.room", T0 + MIN, 30)
+    report = fx.build(T0, T0 + 20 * MIN, periods=bios_everywhere(), allow_partial=True)
+    text = ld.as_markdown(report)
+    assert "### air.room の transition（行き先の状態ごと）" in text
+    assert "### air.room の品質で除いた件数" in text
+    assert "| bios | cpu:idle/gpu:idle | all | 0 | 1 | 0 | 0 | 0 |" in text
+    covered = report["provenance"]["covered_period"]["start"]
+    assert f"**実際に集計した期間（生データの欠けのため）**: {covered}" in text
 
 
 def test_the_output_never_overwrites_an_input(fx: Fixture) -> None:
