@@ -97,14 +97,37 @@ Max までは実測 44〜51 ms（予備確認の `kill -KILL`）である。つ�
    `TimeoutAbortSec`・`TimeoutStopSec`・`TimeoutStartSec`・`RestartSec`・`WatchdogSignal`・`ExecStopPost`・
    `KillMode`・hardening は**変えない**。0080 §2.3 の `WATCHDOG_USEC <= watchdog_timeout_ms` は 11000 どうしで等しく、
    食い違えば fand は終了コード 4 で制御を取らない（安全側）
-3. **期間**: 置くのは試験のスクリプトの実行の間だけ。スクリプトの先頭で置いて `systemctl daemon-reload`、終了時
-   （正常・中止・失敗のどれでも。`trap`）に drop-in と設定のディレクトリを消して `daemon-reload` する
+3. **期間**: 置くのは試験のスクリプトの実行の間だけ。スクリプトの先頭で置いて `systemctl daemon-reload` する。
+   終了時（正常・中止・エラー・Ctrl-C のどれでも。`trap` を `EXIT`・`INT`・`TERM`・`HUP` に置き、後片付けの間は
+   `INT` を無視して二重に走らせない）の後片付けは、**次の順序を必ず守る**。設定を先に消すと、すでに動いている fand が
+   読み込み済みの 11 s の deadman のまま Fan を持ち続け、しかも reload 後の unit の定義は本番に戻ったように見えるためである
+   1. **負荷を止める**: CPU / GPU の負荷のプロセスを止めて終わるのを待ち、GPU の電力の上限を既定に戻す
+   2. **fand を止める**: fand が `SIGSTOP` で止まっている（`/proc/<main PID>/stat` の状態が `T`）なら、**先に `SIGKILL` を送る**
+      （`SIGCONT` で動かさない。動き出した fand は止める前の古い状態で数 tick 書きうるので、止まったまま殺して
+      `ExecStopPost` に Max を書かせる。実測 44〜51 ms）。そのあと `systemctl stop coldaisle-fand`（`Restart=always` の再起動を
+      止める。再起動していれば正常停止で BIOS へ返す）。`systemctl stop` が `TimeoutStopSec`（10 s）+ 5 s で終わらなければ
+      `systemctl kill -s SIGKILL coldaisle-fand` を送ってから、もう一度 `systemctl stop` する
+   3. **止まったことを確かめる**: `systemctl is-active coldaisle-fand` が `inactive`（`failed` なら `reset-failed` の後に
+      `inactive`）、main PID が 0、3 zone の `pwmN_enable` がすべて `5`（正常停止で BIOS へ返した）か、すべて `0`
+      （`SIGKILL` の後の `ExecStopPost` の Max。引き継ぎ記録が残る）であること
+   4. 3 が確かめられたときだけ、**drop-in と試験の設定のディレクトリを消して `daemon-reload`** する
+   5. **本番の設定に戻ったことを確かめる**（下の 4）
+
+   3 を確かめられないとき（`active` / `deactivating` のまま、`pwmN_enable` に `1` が残る、読めない）は、**drop-in と試験の設定を
+   消さずに残し**、端末に大きく警告を出して（「fand が 11 s の試験の設定のまま動いている可能性。drop-in を残した」）、
+   0 以外で終わる。所有者はその場で次を行う: `systemctl status coldaisle-fand` と `ps` で fand のプロセスが残っていないか、
+   3 zone の `pwmN_enable` と `pwmN` を見る → 残っていれば `systemctl kill -s SIGKILL coldaisle-fand` と `systemctl stop` →
+   それでも `pwmN_enable` が `1` なら 0121 §2.1 のとおり `5` を書く → `inactive` を確かめてから、手で drop-in と設定を消して
+   `daemon-reload` し、下の 4 を確かめる
+
+   `pwmN_enable` が `0`（Max）で終わったときは、試験の設定を消した後に、本番の設定で fand を `systemctl start` →
+   STARTUP の後に `systemctl stop` で BIOS へ返す（0080 §2.8 の正常停止）か、Max のまま置くかを所有者が決める（どちらも安全側）
 4. **元に戻ったことの確認**（スクリプトの最後と、所有者が目で）:
    - `systemctl show -p WatchdogUSec --value coldaisle-fand` が `5s`
    - `systemctl show -p ExecStart --value coldaisle-fand` に `--config-dir /etc/coldaisle/control-config ` がある
    - `/etc/systemd/system/coldaisle-fand.service.d/` に `t5-11s.conf` が無く、`/etc/coldaisle/control-config-test-t5-11s/` も無い
    - `systemctl is-enabled coldaisle-fand` が試験の前と同じ（`disabled`）。**drop-in がある間に `enable` しない**
-   - 3 zone の `pwmN_enable` が `5`（`systemctl stop` で BIOS へ返した）
+   - 3 zone の `pwmN_enable` が `5`（`systemctl stop` で BIOS へ返した）か `0`（上の 3 の Max）で、`1` が無い
 
 一時的な unit（`systemd-run` など）は使わない。本番の unit と違う形で動かすと、`ExecStopPost`・`KillMode`・権限が
 本番と同じであることを別に確かめる必要が出るためである。
@@ -210,7 +233,7 @@ CPU の条件が中止や判定の上限に届いたら、その条件は負荷�
    アイドル + 0.05 への戻り）→ `WatchdogTimestampMonotonic` が変わった直後に `SIGSTOP` → (i)・(iii) はその直後に負荷を始める
    → 20 ms ごとに `pwmN_enable` を読み Max を待つ（§2.5 の 12000 ms と、§2.5a の 250 ms ごとの見張り）→ Max の後に負荷を止め 30 s 見る →
    `systemctl stop` で BIOS へ返す → 60 s 置く
-4. 後片付け: 負荷を止め、GPU の電力の上限を既定に戻し、fand を `stop`、§2.3 の 3・4 を行って結果を表示する。
+4. 後片付け: §2.3 の 3 の順序（負荷 → fand の停止 → 停止の確認 → 設定を消す → 本番の確認）で行い、結果を表示する。
    DB・journal（`__MONOTONIC_TIMESTAMP` つき）を書き出す
 
 ### 2.7 記録の置き場所
