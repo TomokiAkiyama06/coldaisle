@@ -114,9 +114,9 @@ B0 は PR #332（#319）でマージ済みで、いまの実装は「照合す�
 | `result` | `passed` だけ（不合格では証明書を作らないので、それ以外の値を持たない。読むときも `passed` 以外を拒む） |
 | `thermal_model` | 認証した thermal_model の `ArtifactRef` と `artifact_sha256` |
 | `components` | 0066 §2.1 (c) が束ねるものの、**部品ごとの SHA-256**（下の表）。どれが変わったかを照合で名指すため |
-| `certified_domain` | 格子の各軸の範囲（0066 §2.1 (d) の認証領域）と刻み |
-| `eps` / `eps_c` | 試験で使った許容誤差 |
-| `grid_points` | 試した点の数（0 なら不正） |
+| `certified_domain` | 格子の各軸の範囲（0066 §2.1 (d) の認証領域）と刻み。**ゲートの仕様（下）から導いた値そのもの** |
+| `eps` / `eps_c` | 試験で使った許容誤差。同じくゲートの仕様から導いた値 |
+| `grid_points` | 試した点の数。同じくゲートの仕様から導いた値（0 になる仕様は設定の誤り） |
 | `certificate_sha256` | `components`・`certified_domain`・`eps` / `eps_c`・`thermal_model` を、長さ付きの正準な符号化（0066 §2.1 (c) のソースツリーと同じ規律）で連結した列の SHA-256。**これが 0066 / 0133 の言う「認証のハッシュ」** |
 
 `components` の部品と、照合する側:
@@ -127,7 +127,7 @@ B0 は PR #332（#319）でマージ済みで、いまの実装は「照合す�
 | `lockfile` | ロックファイルの SHA-256 | fand と worker |
 | `environment` | 処理系の実装と版・`sysconfig` のプラットフォーム・`platform.machine()`・入った配布物の名前・版・`RECORD` のハッシュから作る指紋 | fand と worker |
 | `hint_policy` | 基準の context の全体と `context_overrides`（`fan-policy.yaml` の `supervisor` の該当部分を正準化したもの） | fand |
-| `hint_gate` | 格子の定義・`eps` / `eps_c`、および `safety.yaml` の `max_eps` / `max_eps_c` | fand |
+| `hint_gate` | **ゲートの仕様**（下）の正準な符号化の SHA-256 | fand と worker |
 | `optimizer` | Optimizer の設定（探索格子・`mpc.budget_ms`・`mpc.optimizer.max_evaluations` など `solve` の結果に効くもの）と目的関数の設定 | worker |
 | `conditions` | `LearnedMpcController.conditions()` の全体（列挙を別に持たない。0066 §2.1 (c)） | worker |
 | `calibration` | ランナーが使った `RuntimeCalibration` の digest。`available` なら較正を当てる全 metric の実効の offset（`calibration_offsets.effective_metric_offsets`）の `offsets_sha256`、`unavailable` ならその閉じた code（0101 §2.2 の2値）を区別できる形で符号化したものの SHA-256。2状態を同じ digest にしない（空の `offsets_c` の `available` と `unavailable` を混ぜない。0096 §2.6） | fand（起動時に読んだ較正）と worker（frame の `calibration`） |
@@ -142,6 +142,14 @@ B0 は PR #332（#319）でマージ済みで、いまの実装は「照合す�
   ランナーを走らせて証明書を昇格し直すまで B0 のまま。`--calibration` を省いて起動した fand（`unavailable`。0101 §2.6 (b)）も、
   `available` で作った証明書とは合わない
 
+- **ゲートの仕様は設定から1つの純粋な関数で導く。** 入力は `fan-policy.yaml` の格子の定義（各軸の範囲・刻み）・
+  `eps` / `eps_c` と `safety.yaml` の `max_eps` / `max_eps_c` だけで、出力は「認証領域（各軸の範囲と刻み）・
+  `eps` / `eps_c`・格子の点の数」を正準化した1つの値（ゲートの仕様）とする。ランナーはこの関数の出力で格子を回し、
+  証明書の `certified_domain` / `eps` / `eps_c` / `grid_points` には**その出力をそのまま**書く。`hint_gate` はその出力の
+  digest である。fand・worker も同じ関数を自分の設定に当てて導く（§2.4 / §2.6）
+- **証明書の欄は照合の対象であって、値の出どころにしない。** 実行時の認証領域の判定（0066 §2.1 (d)）と `eps` / `eps_c`
+  の比較（0133 §2.5 の fand の再検査を含む）に使うのは、fand・worker が自分の設定から導いたゲートの仕様であり、
+  証明書の `certified_domain` / `eps` を読んで使わない
 - **部品の digest を作る関数は1つだけ**にし、ランナー・fand・worker が同じ関数を呼ぶ（置き場所は横断の module。
   `calibration_offsets.py` と同じ扱い）。`tests/` 側で digest を計算・上書きしない（0066 §2.1 (c)）
 - 証明書の大きさは Registry の `max_artifact_bytes` で抑え、読む側も上限＋1 byte だけを読む（0062 §2.1 の規律）
@@ -156,13 +164,21 @@ fand は起動時に1回だけ、tick を始める前に照合する（合成の
 - 照合の順（最初に落ちたところで止め、その理由を残す）:
   1. `--registry-root` が渡され、snapshot を読めた（`registry_unbound`）
   2. hint_certificate の production があり、checksum・形式が合う（`certificate_missing` / `certificate_unreadable`）
-  3. 証明書の `schema_version` を知っている・`result` が `passed`・`grid_points > 0`（`certificate_invalid`）
-  4. 証明書の `thermal_model` が、同じ snapshot の thermal_model の production と一致する（`thermal_model_mismatch`）
-  5. `eps` / `eps_c` と `max_eps` / `max_eps_c` が 0066 §2.1 (b) の制約を満たす（`eps_bounds_invalid`）
-  6. fand 側の部品（`source_tree` / `lockfile` / `environment` / `hint_policy` / `hint_gate` / `calibration`。`calibration` は
-     起動時に `--calibration` から読んだ `RuntimeCalibration`、つまり frame で worker へ運ぶのと同じ値から計算する）を自分で計算し、
-     それぞれ一致する（`<部品>_mismatch`）
-  7. 証明書の `certificate_sha256` を、証明書の欄から計算し直して一致する（`certificate_hash_mismatch`）
+  3. 証明書の `schema_version` を知っている・`result` が `passed`（`certificate_invalid`）
+  4. 自分の設定から§2.3 の関数でゲートの仕様を導けて、導いた `eps` / `eps_c` と `max_eps` / `max_eps_c` が
+     0066 §2.1 (b) の制約を満たし、格子の点の数が 0 でない（`eps_bounds_invalid` / `hint_gate_invalid`）。
+     **証明書の `eps` ではなく、導いた値で検査する**
+  5. **期待する証明書の本体を fand が自分で組み立てる。** `thermal_model` は同じ snapshot の production、
+     `certified_domain` / `eps` / `eps_c` / `grid_points` は 4 で導いたゲートの仕様、fand 側の部品（`source_tree` /
+     `lockfile` / `environment` / `hint_policy` / `hint_gate` / `calibration`。`calibration` は起動時に `--calibration` から
+     読んだ `RuntimeCalibration`、つまり frame で worker へ運ぶのと同じ値から計算する）は自分で計算した digest、
+     worker 側の部品（`optimizer` / `conditions`）だけは証明書の値を置く（§2.6 で worker が照合する）
+  6. 証明書の本体（`certificate_sha256` を除く全欄）が、5 の期待する本体と**正準な符号化で丸ごと一致**し、かつ
+     証明書の `certificate_sha256` が**期待する本体から計算した** SHA-256 と一致する。欄ごとに別々に通すことはしない
+     （ある欄の digest だけ、あるいは証明書自身の欄から計算し直したハッシュだけが合う、という通り方を作らない）。
+     ログの理由には最初に食い違った欄を名指す（`thermal_model_mismatch` / `<部品>_mismatch` /
+     `certified_domain_mismatch` / `eps_mismatch` / `grid_points_mismatch` / `certificate_hash_mismatch`）が、
+     合否は丸ごとの一致だけで決める
 - ロックファイルは起動時の引数（仮の名前 `--hint-lockfile`。root の所有のパス）で渡す。渡されない・読めないときは
   `lockfile_mismatch` で B0（§5 の 4）
 - 照合の結果は構造化ログ（JSON Lines）に1行、閉じた語彙で残す（`configured_stage` / `effective_stage` /
@@ -184,7 +200,9 @@ fand は起動時に1回だけ、tick を始める前に照合する（合成の
 
 - B1 の frame の版上げ（0133 §2.5 の `supervisor_hint` を足すもの）と**同じ版上げ**で、frame に欄
   `hint_certification` を足す: `certificate_sha256` と、worker 側の部品の期待値
-  （`source_tree` / `lockfile` / `environment` / `optimizer` / `conditions` / `calibration` の digest）。
+  （`source_tree` / `lockfile` / `environment` / `hint_gate` / `optimizer` / `conditions` / `calibration` の digest）。
+  `hint_gate` は worker も自分の設定から§2.3 の同じ関数でゲートの仕様を導いて計算し、Shadow solver の認証領域の判定と
+  2 条件の比較（0066 §2.1 (d)）には導いたその仕様を使う（frame の値・証明書の値を使わない）。
   worker の `calibration` は、束縛に使った frame の `calibration`（0101 §2.2。L9 に渡したのと同じ値）から同じ関数で
   計算する。較正ファイルを読まない（0101 §2.1）
   `supervisor_hint` を入れる tick だけに入れ、それ以外は `None`（`supervisor_hint` と片方だけの frame は作らない）
@@ -211,6 +229,10 @@ fand は起動時に1回だけ、tick を始める前に照合する（合成の
 
 ### 2.8 試験の方針（すべて実機不要。ルール 7）
 
+- **ゲートの仕様の一致**: 次の偽の証明書をどれも fand が B0 にすること — 他の欄はそのままで `certified_domain` だけ
+  広げた・`eps` だけ大きくした・`grid_points` だけ変えた（いずれも `certificate_sha256` を偽の欄から計算し直したものと、
+  元のままのものの両方）・`hint_gate` の digest は今の設定に合わせ `certified_domain` は別の格子にした。
+  fand と worker の認証領域の判定が、証明書の `certified_domain` を書き換えても変わらない（設定から導いた値だけを使う）
 - **較正**: 較正つきの Mock の thermal artifact で、ランナーが `--calibration` の較正を L9 に通して合格する・
   別の較正では L9 で束縛を作れず不合格・`--calibration` を省けば較正つきの artifact は不合格（較正の無い artifact は
   通る）。証明書を作った後に較正の offset を1つ変えた fand が `calibration_mismatch` で B0・`unavailable` の fand が
@@ -274,6 +296,8 @@ fand は起動時に1回だけ、tick を始める前に照合する（合成の
 | 稼働中に新しい証明書が昇格したら再照合して B1 へ上げる | 稼働中に段階を上げる経路ができる。制御権に関わる段階は下げるだけにし、上げるのは再起動の時だけにする（0077 §2.6 の production の監視と同じ規律） |
 | ランナーが較正を 0 で埋める・L9 を飛ばして束縛を作る | 実行時（worker が frame の較正を L9 に通す。0101）と別の経路を認証することになる。較正つきの artifact では、認証した予測と実行時の予測が別物になりうる |
 | 証明書の `calibration` に L9 の digest（artifact の使う metric だけ）を入れる | fand は artifact を読まないので照合できない（0101 §4）。較正の全体で束ねる |
+| 証明書の `certified_domain` / `eps` を欄ごとに検査する（`hint_gate` の digest を比べ、`certificate_sha256` を証明書の欄から計算し直す） | 食い違って作られた・登録前に書き換えられた証明書で、内部では辻褄の合う偽の領域を受け入れうる。Registry の CLI は中身を読まないので止まらない。期待する本体を fand が自分の設定から導き、丸ごとの一致だけを合格にする |
+| 実行時の認証領域の判定に証明書の `certified_domain` を使う | 証明書が値の出どころになり、書き換えで試していない状態が「認証済み」になる。設定から導いた値を使い、証明書は照合にだけ使う |
 | ハッシュ1つだけを持ち、部品ごとの digest を持たない | 合わないとき何を変えたのかが分からず、再認証の要否の判断を人が推測することになる |
 
 ---
