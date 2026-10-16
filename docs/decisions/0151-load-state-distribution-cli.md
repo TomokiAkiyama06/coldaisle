@@ -73,6 +73,15 @@ Workload Regime（`control/supervisor/regime.py`）を主軸にしない理由�
   やり直す（欠けの前後を同じ定常として繋がない）
 - 定常の連続した区間（segment）ごとに数え、状態ごとに **segment の数と最長の長さ**を出す。1 回の長い負荷だけで
   決まった p99 を、複数回の負荷の p99 と見分けるため
+- **区間の始め（`--start`）の境目**: `--start` の直前に負荷が変わっていても、区間の中だけを読むと前の状態が
+  見えず、最初の評価時刻を定常として数えてしまう。これを避けるため、状態の判定に使う行（電力・§2.6 の `cooling` の
+  判定に使う trace と `fan.*`）は **`--start - lookback_ms` から読む**。`lookback_ms` は
+  `settle_ms + power_window_ms + max(trace_max_age_ms, fan_max_age_ms)` で、設定から計算し別の値として持たない。
+  さかのぼった区間の評価時刻は状態と落ち着きの計時を決めるためだけに使い、**分布にも件数にも入れない**
+- さかのぼった区間に行が無い・欠けている（保持期間の外・取り込みが止まっていた）・`max_gap_ms` を超える間隔がある
+  ときは、状態が始めから続いていたとは言えない。その場合は**区間の中の最初の評価可能な時刻から落ち着きの計時を
+  始め**、そこから `settle_ms` は `transition` とする（保守的に、定常へ入れない側に倒す）。こうなったことは出力の
+  来歴に `start_lookback_incomplete: true` として残す
 
 ### 2.4 評価の時刻と `d.*` の組み立て
 
@@ -113,10 +122,10 @@ Workload Regime（`control/supervisor/regime.py`）を主軸にしない理由�
 
 分布は次の鍵の組ごとに出す。
 
-1. **`cooling`**（常に付ける）: 評価時刻 `t` の `[t - trace_max_age_ms, t]` に `control_traces` の行があれば `fand`、
-   無ければ `no_fand`（BIOS の制御）。trace の `state.operating_mode` が `auto` でない tick（`manual` / `max` /
-   `calibration`。試験の操作）は `fand_override` とし、**既定では分布から除いて件数だけ数える**
-   （`--include-override` で含める）。Fan の制御が違う期間を混ぜると、同じ負荷でも温度差の分布がずれるため
+1. **`cooling`**（常に付ける）: 物理の Fan を誰が動かしていたか。値は `fand` / `bios` / `fand_override` /
+   `undetermined` の 4 つで、判定は §2.6a。`fand_override` と `undetermined` は**既定では分布から除いて件数だけ
+   数える**（`--include-override` で `fand_override` を含める。`undetermined` を含める選択肢は持たない）。
+   Fan の制御が違う期間を混ぜると、同じ負荷でも温度差の分布がずれるため
 2. **状態**（§2.2 の電力の帯）
 3. **`period`**（任意）: `--periods <yaml>` に名前つきの区間（例: `ac_on` / `ac_off`、試験の区間）と除外する区間を
    書くと、区間の名前を鍵に足す。区間の外の評価時刻は使わない。エアコンの ON / OFF は DB に記録が無いので、
@@ -124,6 +133,46 @@ Workload Regime（`control/supervisor/regime.py`）を主軸にしない理由�
 4. **`--group-by trace-regime`**（任意）: 状態の代わりに trace の `state.workload_regime` を鍵にする。trace は
    既存の `ControlTick` の検証を通ったものだけを使い、通らない行・Regime の無い tick は件数だけ数える。
    出力には「Regime の設定は `provisional`（0119 §2.14）」を必ず書く
+
+### 2.6a `cooling` の判定: trace の有無ではなく、物理の Fan の観測と突き合わせる
+
+**trace があることは「fand が物理の Fan を動かしていた」ことを意味しない。** fand は既定で `--backend simulated`
+（`control_daemon.py` の `backend_factory_for`。0118 §2.5）で動き、そのまま既定の DB に向ければ物理の Fan は BIOS の
+ままなのに trace が残る。逆に、trace が無い期間も BIOS とは限らない。fand が異常終了すると、引き継ぎ実行部
+（`safety_handoff.py`）が `pwmN_enable=0` / `pwmN=255` の Max を書き、次に fand が起動するまでそのまま残る。
+
+DB に残る記録で、これを直接に言える欄は無い（2026-10-16 の main で確かめた）:
+
+- `ControlTick`（v1〜v16）に backend の欄は無い。欄は `state` / `zones` / `runtime` / `safety_provenance` /
+  `registry` / `air_balance` / `mode_command` / `authority` / `telemetry_health` / `run_id` / `workload_hint` /
+  `faults` などで、`runtime.config` は 4 ファイルの hash と版だけである（`ControlConfigDigest`）
+- 引き継ぎの記録は `/run/coldaisle/fan-handoff.json`（`safety_handoff.HANDOFF_RECORD_PATH`）で、tmpfs にあり DB に
+  入らない。正常停止で fand が消す（`control/hardware/hwmon.py`）ので、後から読んでも残っていない
+- `control_admin_audit`（0072 §2.7）は管理ソケットの指令の監査で、backend も引き継ぎも記録しない
+
+そこで、fand と別のプロセスが物理の hwmon から読んで DB に残す値と突き合わせる。使う欄は次のとおり。
+
+- trace の `zones.<zone>.hardware.pwm_raw`（`HardwareReadback`。backend が読み戻した値）と `state.operating_mode`
+- `coldaisle-telemetry` が nct6799 の `pwmN` / `fanN_input` から読む `fan.{front,rear,top}.pwm`（`pwmN / 255 × 100` %。
+  `internal_telemetry/hwmon.py`）と `fan.{front,rear,top}.rpm`（`config/internal-telemetry.yaml`。対応は
+  `docs/fan-header-mapping.md`）
+
+判定（評価時刻 `t` ごと）:
+
+| 区分 | 条件（**すべて**を満たすときだけ） |
+|---|---|
+| `fand` | `[t - trace_max_age_ms, t]` に trace があり `operating_mode` が `auto`。3 つの zone すべてで、`[t - fan_max_age_ms, t]` に ok の `fan.<zone>.pwm` があり、trace の `pwm_raw / 255 × 100` との差が `pwm_match_tolerance_pct` 以内。さらに、その trace を含む**連続した trace の区間**（間隔が `trace_max_age_ms` を超えたら切る。`run_id` は v16 からなので使わない）全体で、突き合わせられた時刻のうち一致しなかった割合が `pwm_mismatch_max_ratio` 以下 |
+| `fand_override` | `fand` の条件のうち `operating_mode` だけが `auto` でない（`manual` / `max` / `calibration`。試験の操作） |
+| `bios` | `[t - trace_max_age_ms, t]` に trace が無い。3 つの zone すべてで ok の `fan.<zone>.rpm` が `fan_max_age_ms` 以内にあり、**少なくとも 1 つの zone が `full_speed_rpm_min.<zone>` 未満**（引き継ぎの Max は全 zone が全速なので、どれかが全速でなければ引き継ぎではない） |
+| `undetermined` | 上のどれにも当たらない。例: trace はあるが物理の PWM と合わない（simulated の backend など）・`fan.*` が欠けている・trace が無く全 zone が全速（引き継ぎの Max か、BIOS が高負荷で全速かを区別できない） |
+
+- 区間の単位で `pwm_mismatch_max_ratio` を見るのは、simulated の backend でも BIOS の PWM がたまたま指令と
+  近い時刻があり、時刻ごとの一致だけでは `fand` に入ってしまうため
+- `bios` の判定に PWM ではなく回転数を使うのは、`pwmN_enable=0`（全速）のときに `pwmN` を読んで何が返るかを
+  導入先で確かめていないため（§5 #7）。回転数は物理の結果なので、enable の値に依らない
+- 高負荷で BIOS が全 zone を全速にした時刻は `undetermined` に入り、`bios` の高負荷の分布から抜ける。件数は出すので、
+  多ければ人が気づける。誤って引き継ぎの Max を BIOS に混ぜるより、抜けるほうを選ぶ
+- trace に backend が載るようになったら（§5 #7）、その欄を優先する別の記録で置き換える
 
 ### 2.7 品質と較正
 
@@ -167,7 +216,11 @@ Workload Regime（`control/supervisor/regime.py`）を主軸にしない理由�
 | `settle_ms` | 移り変わり直後とみなす長さ | 300000（§5 #3） |
 | `max_gap_ms` | これを超える間隔で落ち着きの計時をやり直す | 10000（`stale_after_ms` と同じ） |
 | `pair_max_age_ms` | `d.*` の減数を対にする古さの上限 | 5000（2 周期） |
-| `trace_max_age_ms` | `cooling: fand` とみなす trace の古さの上限 | 2000（tick 1000 ms の 2 倍） |
+| `trace_max_age_ms` | trace があるとみなす古さの上限・連続した trace の区間を切る間隔 | 2000（tick 1000 ms の 2 倍） |
+| `fan_max_age_ms` | `fan.*.pwm` / `fan.*.rpm` を評価時刻に使う古さの上限 | 5000（2 周期） |
+| `pwm_match_tolerance_pct` | trace の `pwm_raw` と物理の `fan.*.pwm` の差の許容 | 2.0（約 5 / 255） |
+| `pwm_mismatch_max_ratio` | 連続した trace の区間で一致しなかった割合の上限 | 0.05 |
+| `full_speed_rpm_min.front` / `.rear` / `.top` | これ以上を全速とみなす回転数 | §5 #8 |
 | `quantiles` | 出す分位点 | 0.01 / 0.05 / 0.25 / 0.5 / 0.75 / 0.95 / 0.99 |
 | `min_samples` | 分位点を出す件数の下限 | 120（約 5 分） |
 | `metrics` | 集計する metric の一覧 | §2.5 |
@@ -182,8 +235,15 @@ Workload Regime（`control/supervisor/regime.py`）を主軸にしない理由�
 - `d.*` の対: 同じ時刻の対・`pair_max_age_ms` 以内の対・超えた `unpaired`・減数が `suspect` の行を使わない
 - 品質: `missing` / `suspect` / `stale` / `NULL` が分布に入らず件数に出る
 - 分位点: 手で計算した type 7 の値と一致する。`min_samples` 未満で `null` と理由
-- 切り口: trace の有無で `fand` / `no_fand`、`manual` の tick が `fand_override` で既定では除かれる。
-  `--periods` の区間の外を使わない。`--group-by trace-regime` で検証を通らない trace を件数だけ数える
+- `cooling`（§2.6a）: trace があり物理の PWM が合えば `fand`。trace はあるが PWM が合わない（simulated の
+  backend を模した合成データ）・区間の不一致の割合が上限を超える・`fan.*` が欠けると `undetermined`。trace が無く
+  1 つの zone でも全速未満なら `bios`、全 zone が全速なら `undetermined`。`manual` の tick が `fand_override` で
+  既定では除かれ、`undetermined` は件数だけに出る
+- 区間の始めの境目（§2.3）: `--start` の `settle_ms` 前に負荷が変わったデータで、`--start` 直後の評価時刻が
+  `transition` になる（さかのぼった区間の時刻は件数に入らない）。`--start` より前に行が無いデータでは、区間の
+  最初から `settle_ms` が `transition` になり、`start_lookback_incomplete: true` が出る。`--start` の
+  `settle_ms` より前から状態が変わっていないデータでは、`--start` 直後から定常に入る
+- 切り口: `--periods` の区間の外を使わない。`--group-by trace-regime` で検証を通らない trace を件数だけ数える
 - 設定: 未知の metric・`W` でない電力の metric・帯の下限が昇順でない・鍵の欠けを拒否する
 - 出力: JSON の版と来歴の欄、DB のパスが出ないこと、Markdown の表の形
 - import の向き: `ai/` / `api/` / `server.py` がこのモジュールを import しない
@@ -192,7 +252,8 @@ Workload Regime（`control/supervisor/regime.py`）を主軸にしない理由�
 
 導入先の DB は作業者の uid から読めないので、root で SQLite の `.backup` で写しを作り、その写しに対して走らせる
 （書いている最中の DB をファイルの複写で写さない）。期間は T1 の開始から 24 h を `--start` / `--end` で渡す。
-T1 は全体が fand の制御なので `cooling: fand` のグループだけになる。BIOS の期間との比較は、同じ DB の
+T1 は hwmon の backend で fand が制御しているので、§2.6a の突き合わせが合えば `cooling: fand` に入る。合わない時刻が
+多ければ `undetermined` が増えるので、その件数を先に確かめる。BIOS の期間との比較は、同じ DB の
 T1 より前の期間を別に走らせて並べる。
 
 ## 3. Consequences
@@ -214,6 +275,7 @@ T1 より前の期間を別に走らせて並べる。
 | 帯の初期値が根拠の薄い `provisional` | 電力そのものの分布も出すので、1 回走らせてから帯を見直せる（§5 #2） |
 | 生データだけを読むので、保持期間（30 日）より古い期間は集計できない | `d.*` は保存しないので、ロールアップからは正しい分布が出ない。必要な期間は保持期間のうちに走らせ、出力を残す |
 | 24 h × 2.5 s で metric あたり約 3.5 万件をメモリに持つ | 期間の上限 `max_period_days` で抑える。30 日でも metric あたり約 100 万件の float で、1 回の手動の集計として許容できる |
+| 高負荷で BIOS が全 zone を全速にした時刻が `undetermined` になり、`bios` の高負荷の分布が薄くなる | 件数を出すので気づける。引き継ぎの Max を BIOS に混ぜるより安全側。trace に backend と引き継ぎが載れば解消する（§5 #7） |
 | エアコンの ON / OFF を自動で区別できない | DB に記録が無いものを推測しない。人が `--periods` で区間を渡す |
 
 ## 4. 却下した代替案
@@ -225,6 +287,7 @@ T1 より前の期間を別に走らせて並べる。
 | ロールアップ（`readings_1m`）から計算する | `d.*` が無く、被減数と減数の分平均の差は同じ時刻の差の分布と一致しない。`suspect` などの品質の内訳も残らない |
 | API のエンドポイントにする | 生データを広い期間で読むので重く、AI ツールの経路に近づく。手動で時々走らせる用途に常駐の口は要らない |
 | `coldaisle-soak-report` に足す | soak は受入基準の判定（0070）で、期間も目的も違う。判定の CLI に分布を混ぜると、判定の再現性の範囲が広がる |
+| trace の有無だけで fand と BIOS を分ける | simulated の backend の fand でも trace は残り、異常終了の後の引き継ぎの Max の期間には trace が無い。どちらも物理の Fan の状態と食い違う（§2.6a） |
 | GPU Mode の申告（`events` / `sys.gpu_mode`）で負荷を分ける | 申告は観測ではない（0045 §2.6・0063 の I-3）。申告と実際の負荷がずれた期間を誤った状態に入れる |
 | p99 + マージンを CLI が計算して閾値の候補を出す | 閾値は安全・通知に関わる人の判断（AGENTS.md「迷ったら」）。マージンの決め方も未決で、数字が出ると候補が既定値のように扱われる |
 
@@ -240,3 +303,5 @@ T1 より前の期間を別に走らせて並べる。
 | 4 | `config/rules.yaml` の現在の閾値を並べ、超えた割合を出すか | **(a) 出さない（推奨。人が表と `rules.yaml` を並べて読む。CLI をルールの形の変化から切り離す）**／(b) `d.*` を対象にする `threshold` 型のルールだけ、閾値と超過の割合を参考に出す | 本記録の承認 |
 | 5 | `fand_override`（`manual` / `max` / `calibration` の tick）の既定の扱い | **(a) 既定で除き件数だけ出す・`--include-override` で含める（推奨。試験の操作は普段の運転ではない）**／(b) 既定で含め別のグループにする | 本記録の承認 |
 | 6 | 実装の担当（AGENTS.md「実装の担当」） | **(a) ローカル LLM（推奨。仕様が本記録で明確・`soak.py` の読み取り専用の型を模倣でき・実機不要のテストで確かめられる）**／(b) Claude | 本記録の承認の後、Issue で |
+| 7 | `pwmN_enable=0`（引き継ぎの全速）のときに nct6799 の `pwmN` を読むと何が返るか・trace に backend の欄を足すか | **(a) 本記録では回転数で `bios` を判定し（§2.6a）、`pwmN` の読みの確認と trace の backend の欄（`ControlTick` の版上げ）は別の Issue と記録に分ける（推奨。CLI のために制御の trace の形を変えない）**／(b) 先に `ControlTick` へ `backend` と起動時の引き継ぎの検出を足し、それを `cooling` の主の根拠にする | 本記録の承認。(b) は別の記録 |
+| 8 | `full_speed_rpm_min` の値 | **(a) T2・T5・T6 の記録の全速の回転数（Front / Rear / Top）の最小から 5 % 引いた値を所有者が確かめて置く（推奨）**／(b) `docs/fan-header-mapping.md` の定格から決める | 本記録の承認（値は設定） |
