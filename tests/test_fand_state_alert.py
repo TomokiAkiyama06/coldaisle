@@ -367,6 +367,56 @@ def test_a_trace_without_faults_does_not_resolve_a_firing_emergency(engine, stor
     assert [a.state.value for a in store.alerts(limit=10) if a.rule_id == EMERGENCY] == ["firing"]
 
 
+def test_one_trace_then_stop_does_not_resolve_silence(engine, store):
+    """fand が 1 行だけ書いて止まる。同じ行を読み続けても途絶の解除は進まない（0148）。"""
+    fand = Fand(store)
+    run(engine, fand, 0, 5, body("normal"))
+    assert states(run(engine, fand, 5, 70, None), SILENT) == ["pending", "firing"]
+    fand.write(at(70), body("normal"))
+    transitions = run(engine, fand, 70, 130, None)
+    assert SILENT not in [t.rule_id for t in transitions if t.state == "resolved"]
+    assert [a.state.value for a in store.alerts(limit=10) if a.rule_id == SILENT] == ["firing"]
+
+
+def test_one_normal_trace_then_stop_does_not_resolve_emergency(engine, store):
+    """非 EMERGENCY の 1 行だけで、発火中の EMERGENCY を解かない（同じ行の繰り返し）。"""
+    fand = Fand(store)
+    run(engine, fand, 0, 5, body("emergency", [OVER_TEMP]))
+    fand.write(at(5), body("normal"))
+    transitions = run(engine, fand, 5, 120, None)
+    assert states(transitions, EMERGENCY) == []
+    assert [a.state.value for a in store.alerts(limit=10) if a.rule_id == EMERGENCY] == ["firing"]
+
+
+def test_advancing_traces_resolve_after_clear_s_of_trace_time(engine, store):
+    """新しい行が clear_s の幅で届き続けたら解く（trace の時刻で測る）。"""
+    fand = Fand(store)
+    run(engine, fand, 0, 5, body("emergency", [OVER_TEMP]))
+    # 評価は 1 s ごとだが、trace は 5 s ごとにしか来ない。解除は trace の時刻で 10 s の幅
+    transitions = []
+    for seconds in range(5, 40):
+        if seconds % 5 == 0:
+            fand.write(at(seconds), body("normal"))
+        store.clock.advance_to_ms(at(seconds))  # type: ignore[attr-defined]
+        transitions += engine.on_tick()
+    resolved = [t for t in transitions if t.rule_id == EMERGENCY and t.state == "resolved"]
+    assert len(resolved) == 1
+    [alert] = [a for a in store.alerts(limit=10) if a.rule_id == EMERGENCY]
+    assert alert.resolved_ms == at(15)
+
+
+def test_degraded_fire_after_s_is_measured_in_trace_time(engine, store):
+    """DEGRADED の 1 行を書いて止まっても、同じ行の繰り返しで 120 s の待ちは満ちない。"""
+    fand = Fand(store)
+    run(engine, fand, 0, 70, body("degraded", [GPU_STALE]))
+    transitions = run(engine, fand, 70, 129, None)
+    assert states(transitions, DEGRADED) == [], "壁時計で 120 s を過ぎても発火しない"
+    [pending] = [a for a in store.alerts(limit=10) if a.rule_id == DEGRADED]
+    assert pending.fired_ms is None
+    run(engine, fand, 129, 140, None)
+    assert [a for a in store.alerts(limit=10) if a.rule_id == DEGRADED] == [], "古くなって取り消す"
+
+
 def test_a_trace_from_the_future_counts_as_fresh(engine, store):
     """時計が戻って trace の時刻が評価時刻より先にある（年齢が負）。新しいとみなす。"""
     fand = Fand(store)

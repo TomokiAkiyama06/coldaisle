@@ -33,7 +33,16 @@ TEXT_KEYS = ("label", "title", "resolved_title", "hint", "fault_labels")
 """
 
 ValueKind = Literal[
-    "threshold", "range", "slope", "below", "flag", "seconds", "samples", "event", "control"
+    "threshold",
+    "at_or_above",
+    "range",
+    "slope",
+    "below",
+    "flag",
+    "seconds",
+    "samples",
+    "event",
+    "control",
 ]
 """遷移の `value` が何を表すか（決定記録 0142 §2.4）。通知の値の行の書き方を決める。
 
@@ -152,6 +161,24 @@ class HotAndSlowRule(_Rule):
     fire_after_s: float = Field(ge=0)
 
 
+class LatestThresholdRule(_Rule):
+    """DB の最新値が閾値**以上**の状態が続いたら発火する（決定記録 0145 §2.1）。
+
+    取り込みのサンプルに含まれない値（internal telemetry など。別プロセスが DB へ書く）に使う。
+    `FlagOffRule` と同じく評価のたびに最新値を読み、無い・ok でない（stale・suspect を含む）
+    周期は評価しない。発火待ちは取り消し、発火中は保つ（0131 §2.3）。
+
+    比較は `ThresholdRule`（`>`）と違い **`>=`**（Critical Safety の上限の判定と同じ。0110 §2.2）。
+    """
+
+    metric: str
+    threshold: float
+    """`metric` がこれ以上で成立する。"""
+    clear: float
+    """`metric` がこれ未満になったら解除する。**`threshold` より小さくする。**"""
+    fire_after_s: float = Field(ge=0)
+
+
 class ControlStateRule(_Rule):
     """fand の最新の decision trace の `safety_state` が続いたら発火する（決定記録 0148 §2.2）。
 
@@ -207,6 +234,8 @@ class RuleSet(BaseModel):
     humidity_out_of_range: RangeRule
     gpu_fan_not_manual: FlagOffRule
     gpu_fan_below_curve: HotAndSlowRule
+    connector_temp_high: LatestThresholdRule
+    connector_temp_critical: LatestThresholdRule
     fand_emergency: ControlStateRule
     fand_degraded: ControlStateRule
     fand_trace_silent: ControlSilenceRule
@@ -250,6 +279,8 @@ class RuleSet(BaseModel):
                 )
             if isinstance(spec, ThresholdRule) and spec.clear >= spec.threshold:
                 raise ValueError(f"{name}: clear は threshold より小さくする（{rule}）")
+            if isinstance(spec, LatestThresholdRule) and spec.clear >= spec.threshold:
+                raise ValueError(f"{name}: clear は threshold より小さくする（{rule}）")
             if isinstance(spec, SlopeRule) and spec.clear >= spec.threshold:
                 raise ValueError(f"{name}: clear は threshold より小さくする（{rule}）")
             if isinstance(spec, RangeRule) and not (
@@ -264,6 +295,7 @@ def _value_kind(rule: BaseModel) -> ValueKind:
     """ルールの型から値の意味を決める。ルールの名前（ID）で分岐しない。"""
     kinds: tuple[tuple[type[BaseModel], ValueKind], ...] = (
         (ThresholdRule, "threshold"),
+        (LatestThresholdRule, "at_or_above"),  # 比較は「以上」（決定記録 0145 §2.1）
         (RangeRule, "range"),
         (SlopeRule, "slope"),
         (HotAndSlowRule, "below"),

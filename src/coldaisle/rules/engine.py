@@ -27,6 +27,7 @@ from coldaisle.rules.models import (
     ControlStateRule,
     FlagOffRule,
     HotAndSlowRule,
+    LatestThresholdRule,
     RangeRule,
     RuleSet,
     SlopeRule,
@@ -47,8 +48,9 @@ GAP_RESET_RULES: tuple[str, ...] = (
 )
 """欠けの検知（`SENSOR_MISSING` / `SENSOR_FAULT`）で発火待ちを数え直すルール（決定記録 0139 §2.3）。
 
-`rapid_rise`・`sensor_*`・`probe_changed` と、DB の最新値を読む GPU の Fan の 2 つのルール
-（0131 §2.3。1 回の欠けで取り消す）は含めない。
+`rapid_rise`・`sensor_*`・`probe_changed` と、DB の最新値を読むルール
+（GPU の Fan の 2 つと 12V-2x6 コネクタの 2 つ。0131 §2.3 / 0145 §2.3。
+1 回の欠けで取り消す）は含めない。
 """
 
 
@@ -63,7 +65,13 @@ class RuleState:
     streak: int = 0
     """連続回数（FR-402 用）。"""
     resumed_ms: int | None = None
-    """無音から復帰した時刻（FR-401 用）。"""
+    """無音から復帰した時刻（FR-401 用）。
+
+    fand の trace を読むルール（決定記録 0148）では**trace の時刻**（`ts_ms`）を入れる。
+    同じ行を繰り返し読んでも解除の待ちが進まないようにするため。
+    """
+    trace_since_ms: int | None = None
+    """fand の trace を読むルールで、条件が成立した最初の trace の時刻（0148）。"""
     severity: str = "warning"
     """このアラートの重大度。**解除したあとに DB から引けない**ので持っておく。
 
@@ -494,7 +502,12 @@ class Engine:
             name.upper()
             for name, rule in self.rules
             if isinstance(
-                rule, FlagOffRule | HotAndSlowRule | ControlStateRule | ControlSilenceRule
+                rule,
+                FlagOffRule
+                | HotAndSlowRule
+                | LatestThresholdRule
+                | ControlStateRule
+                | ControlSilenceRule,
             )
         )
 
@@ -507,12 +520,20 @@ class Engine:
         """
         not_manual = self.rules.gpu_fan_not_manual
         below_curve = self.rules.gpu_fan_below_curve
-        if not not_manual.enabled and not below_curve.enabled:
+        connector = (
+            ("connector_temp_high", self.rules.connector_temp_high),
+            ("connector_temp_critical", self.rules.connector_temp_critical),
+        )
+        if not (
+            not_manual.enabled or below_curve.enabled or any(rule.enabled for _, rule in connector)
+        ):
             return []
         latest = self.store.latest(at_ms=self._now_ms)
         transitions: list[Transition] = []
         transitions += self._evaluate_flag_off("gpu_fan_not_manual", not_manual, latest)
         transitions += self._evaluate_hot_and_slow("gpu_fan_below_curve", below_curve, latest)
+        for name, rule in connector:
+            transitions += self._evaluate_latest_threshold(name, rule, latest)
         return transitions
 
     def _evaluate_flag_off(
@@ -593,6 +614,37 @@ class Engine:
             )
         return self._continue(rule_id, rule.fan_metric, fan, rule.fire_after_s, detail=detail)
 
+    def _evaluate_latest_threshold(
+        self, name: str, rule: LatestThresholdRule, latest: Mapping[str, LatestReading]
+    ) -> list[Transition]:
+        """DB の最新値のしきい値（決定記録 0145 §2.1）。成立は `>= threshold`、解除は `< clear`。
+
+        欠け・stale・suspect（0 °C 未満の断線など）は高温と取り違えない。発火待ちは取り消し、
+        発火中は保つ（0131 §2.3。0145 §2.3）。
+        """
+        if not rule.enabled:
+            return []
+        rule_id = name.upper()
+        value = _current(latest, rule.metric)
+        if value is None:
+            self._reset_on_gap(rule_id, rule.metric)
+            return []
+        state = self._state(rule_id, rule.metric)
+        # ヒステリシス: 成立中は解除の閾値を下回るまで成立し続ける
+        limit = rule.clear if state.since_ms is not None else rule.threshold
+        if value < limit:
+            return self._end(rule_id, rule.metric) if state.since_ms is not None else []
+        if state.since_ms is None:
+            return self._begin(
+                rule_id,
+                rule.metric,
+                rule.severity.value,
+                rule.threshold,
+                value,
+                rule.fire_after_s,
+            )
+        return self._continue(rule_id, rule.metric, value, rule.fire_after_s)
+
     def _evaluate_control(self) -> list[Transition]:
         """fand の最後の decision trace を読んで評価するルール（決定記録 0148）。
 
@@ -600,6 +652,10 @@ class Engine:
         `faults` だけを見る。fand は `fault_clear_hold_ms` の間状態を保つので、評価の間隔
         （約 1 s）で見落とさない（0148 §3）。
         trace が 1 行も無い DB（fand を導入していない機械）では何もしない（0148 §2.8）。
+
+        **発火の待ちと解除の待ちは trace の時刻で測る。** 評価は約 1 s ごとに同じ行を何度も読む。
+        壁時計で測ると、fand が 1 行書いて止まったときに、その 1 行だけで待ちが満ちて
+        発火中のアラートを解いてしまう。新しい行が来ない限り待ちは進まない。
         """
         emergency = self.rules.fand_emergency
         degraded = self.rules.fand_degraded
@@ -626,18 +682,28 @@ class Engine:
                 )
             else:
                 detail = f"最後の decision trace から {age_s:.0f} 秒（tick {trace.tick_id}）"
-            transitions += self._evaluate_trace_silence(silent, fresh, age_s, detail)
+            transitions += self._evaluate_trace_silence(silent, fresh, age_s, trace.ts_ms, detail)
         current = status if fresh else None
         transitions += self._evaluate_control_state(
-            "fand_emergency", emergency, current, target="emergency", worse=frozenset()
+            "fand_emergency",
+            emergency,
+            current,
+            trace.ts_ms,
+            target="emergency",
+            worse=frozenset(),
         )
         transitions += self._evaluate_control_state(
-            "fand_degraded", degraded, current, target="degraded", worse=frozenset({"emergency"})
+            "fand_degraded",
+            degraded,
+            current,
+            trace.ts_ms,
+            target="degraded",
+            worse=frozenset({"emergency"}),
         )
         return transitions
 
     def _evaluate_trace_silence(
-        self, rule: ControlSilenceRule, fresh: bool, age_s: float, detail: str
+        self, rule: ControlSilenceRule, fresh: bool, age_s: float, trace_ms: int, detail: str
     ) -> list[Transition]:
         rule_id = "FAND_TRACE_SILENT"
         state = self._state(rule_id, None)
@@ -658,18 +724,16 @@ class Engine:
             return []
         if not state.firing:
             return self._end(rule_id, None)
-        # 1 行届いただけで復旧とみなさない。再起動を繰り返している間も一瞬は書く
-        if state.resumed_ms is None:
-            state.resumed_ms = self._now_ms
-        if (self._now_ms - state.resumed_ms) / 1000 < rule.clear_s:
-            return []
-        return self._end(rule_id, None)
+        # 1 行届いただけで復旧とみなさない。読める trace が clear_s の**trace の時刻**の幅で
+        # 届き続けたら解く（同じ行を読み続けても進まない）
+        return self._trace_clear(rule_id, state, trace_ms, rule.clear_s)
 
     def _evaluate_control_state(
         self,
         name: str,
         rule: ControlStateRule,
         status: FandStatus | None,
+        trace_ms: int,
         *,
         target: str,
         worse: frozenset[str],
@@ -679,6 +743,7 @@ class Engine:
         `worse`（DEGRADED に対する EMERGENCY）の間は始めも発火も解除もしない。悪化で
         「解けました」を出さず、2 通を同時に出さないため。trace が古い・読めない（`status` が
         `None`）周期は評価しない（発火待ちは取り消し、発火中は保つ。0148 §2.3）。
+        発火と解除の待ちは trace の時刻で測る（`_evaluate_control`）。
         """
         if not rule.enabled:
             return []
@@ -691,6 +756,8 @@ class Engine:
             state.resumed_ms = None
             detail = describe_faults(status.faults, rule.fault_labels)
             if state.since_ms is None:
+                state.trace_since_ms = trace_ms
+                # 発火は下で trace の時刻で判定する。ここでは即時の発火だけを任せる
                 return self._begin(
                     rule_id,
                     None,
@@ -700,7 +767,13 @@ class Engine:
                     rule.fire_after_s,
                     detail=detail,
                 )
-            return self._continue(rule_id, None, None, rule.fire_after_s, detail=detail)
+            if state.firing:
+                return []
+            if state.trace_since_ms is None:
+                state.trace_since_ms = trace_ms
+            if (trace_ms - state.trace_since_ms) / 1000 < rule.fire_after_s:
+                return []
+            return self._fire(rule_id, None, None, detail)
         if status.safety_state in worse:
             state.resumed_ms = None
             return []
@@ -708,9 +781,15 @@ class Engine:
             return []
         if not state.firing:
             return self._end(rule_id, None)  # 発火待ちの揺らぎは消す（0012 §2.4）
+        return self._trace_clear(rule_id, state, trace_ms, rule.clear_s)
+
+    def _trace_clear(
+        self, rule_id: str, state: RuleState, trace_ms: int, clear_s: float
+    ) -> list[Transition]:
+        """解除の待ちを trace の時刻で測る（0148）。**同じ行の繰り返しでは進まない。**"""
         if state.resumed_ms is None:
-            state.resumed_ms = self._now_ms
-        if (self._now_ms - state.resumed_ms) / 1000 < rule.clear_s:
+            state.resumed_ms = trace_ms
+        if (trace_ms - state.resumed_ms) / 1000 < clear_s:
             return []
         return self._end(rule_id, None)
 
