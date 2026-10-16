@@ -163,10 +163,23 @@ DB に残る記録で、これを直接に言える欄は無い（2026-10-16 の
 
 | 区分 | 条件（**すべて**を満たすときだけ） |
 |---|---|
-| `fand` | `[t - trace_max_age_ms, t]` に trace があり `operating_mode` が `auto`。3 つの zone すべてで、`[t - fan_max_age_ms, t]` に ok の `fan.<zone>.pwm` があり、trace の `pwm_raw / 255 × 100` との差が `pwm_match_tolerance_pct` 以内。さらに、その trace を含む**連続した trace の区間**（間隔が `trace_max_age_ms` を超えたら切る。`run_id` は v16 からなので使わない）の**始まりから終わりまで全体**（`--start` / `--end` の外も含む）で、突き合わせられた時刻のうち一致しなかった割合が `pwm_mismatch_max_ratio` 以下。区間の始まりを確かめられないとき（下の「区間の全体を読む」）は `undetermined` |
+| `fand` | `[t - trace_max_age_ms, t]` に trace があり `operating_mode` が `auto`。その trace の 3 つの zone すべてで `hardware` があり **`write_ok` と `readback_ok` がともに true**（下の「書き込みを確かめられた tick だけを一致とする」）。3 つの zone すべてで、`[t - fan_max_age_ms, t]` に ok の `fan.<zone>.pwm` があり、trace の `pwm_raw / 255 × 100` との差が `pwm_match_tolerance_pct` 以内。さらに、その trace を含む**連続した trace の区間**（間隔が `trace_max_age_ms` を超えたら切る。`run_id` は v16 からなので使わない）の**始まりから終わりまで全体**（`--start` / `--end` の外も含む）で、突き合わせられた時刻のうち一致しなかった割合が `pwm_mismatch_max_ratio` 以下。区間の始まりを確かめられないとき（下の「区間の全体を読む」）は `undetermined` |
 | `fand_override` | `fand` の条件のうち `operating_mode` だけが `auto` でない（`manual` / `max` / `calibration`。試験の操作） |
 | `bios` | `[t - trace_max_age_ms, t]` に trace が無い。3 つの zone すべてで ok の `fan.<zone>.rpm` が `fan_max_age_ms` 以内にあり、**すべての zone が `full_speed_rpm_min.<zone>` 未満**。さらに、`t` より前に fand が動いていなかったか、直前の fand の停止の後が BIOS だったと確かめられる（下の「`bios` の前提」） |
 | `undetermined` | 上のどれにも当たらない。例: trace はあるが物理の PWM と合わない（simulated の backend など）・区間の始まりを確かめられない・`fan.*` が欠けている・trace が無く 1 つでも全速の zone がある（引き継ぎの Max が一部の zone だけ成功した状態か、BIOS が高負荷で全速にしたかを区別できない）・trace が途絶えた後で、その停止が正常だったと確かめられない |
+
+**書き込みを確かめられた tick だけを一致とする**（`fand` の判定）:
+
+- `hardware.pwm_raw` は、書き込みやその確かめに失敗した tick にも残る。hwmon の backend の `_failed()` は写像した
+  要求の PWM でこの欄を埋め、`ENABLE_REVERTED` のときはレジスタの値が入って `readback_ok = false` になる
+  （`control/hardware/hwmon.py`）。前の duty が残っていた・BIOS の duty がたまたま同じだった、という tick を
+  `pwm_raw` の一致だけで `fand` にしない
+- そこで tick ごとの一致は、**3 つの zone すべてで `hardware` があり `write_ok` と `readback_ok` がともに true** で、
+  かつ PWM の差が許容の内のときだけとする。flag のどれかが false・`hardware` が無い zone がある tick の評価時刻は
+  `undetermined`
+- 区間の不一致の割合では、そうした tick を**不一致として分子に数える**（分母は、区間の中で `fan.*.pwm` と
+  突き合わせられた tick のすべて）。書き込みの失敗が多い運転を、確かめられた一致の多さで `fand` に入れないため。
+  書き込みの失敗が続く区間は、区間ごと `undetermined` に倒れる
 
 **区間の全体を読む**（`fand` の判定）:
 
@@ -178,10 +191,14 @@ DB に残る記録で、これを直接に言える欄は無い（2026-10-16 の
 - 読むのは trace の `ts_ms`・`state.operating_mode`・`zones.*.hardware.pwm_raw` だけ（SQL の `json_extract` で取り出し、
   trace の全体を検証の型に通さない）と、同じ範囲の `fan.*.pwm` の ok の行。保持期間（`control_trace_days` /
   `raw_days` 30 日）が上限なので、1 区間で最大約 260 万 tick。手動で時々走らせる CLI として許容する
+- **trace が欠けていないと言える時刻の下限** `trace_complete_from_ms` を、`control_trace_prune`（0007 / 0010）の
+  `legacy_until_ms` と `pruned_before_ms`（`NULL` なら 0）の大きいほうとする。`legacy_until_ms` は 0007 の移行の前の
+  期間全体を「移行前の削除で欠けているかもしれない」と記録したもので、その範囲では `pruned_through_seq` が 0 の
+  ままでも trace が消えていないとは言えない。`pruned_before_ms` は保持期間の削除で消したことがある範囲
 - **区間の始まりを確かめられないとき**は、その区間のすべての時刻を `undetermined` にする。確かめられないとは、
-  区間の最も古い trace が DB に残る最も古い trace で、`control_trace_prune` の `pruned_through_seq` が 0 でない
-  （それより古い trace を保持期間で消した。0007 / 0010 の表）か、区間の始まりが生データ（`fan.*.pwm`）の保持期間の
-  外にあるとき。消えた前半の一致を推測しない
+  区間の最も古い trace の時刻から `trace_max_age_ms` を引いた時刻が `trace_complete_from_ms` 以下のとき（その前に
+  同じ区間の trace が消えていたかもしれない）か、区間の始まりが生データ（`fan.*.pwm`）の保持期間の外にあるとき。
+  消えた前半の一致を推測しない
 
 **`bios` の前提**（引き継ぎの Max と BIOS を取り違えない）:
 
@@ -192,8 +209,11 @@ DB に残る記録で、これを直接に言える欄は無い（2026-10-16 の
   記録を消すだけで DB に書かない。引き継ぎの結果（`safety_handoff_completed` と zone ごとの `status`）は journal の
   ログにだけ出る。`control_admin_audit` は管理ソケットの指令だけで、`systemctl stop` を記録しない
 - そのため `bios` は次のどちらかのときだけにする:
-  1. `t` より前に trace が 1 行も無く、`control_trace_prune` の `pruned_through_seq` が 0（fand がこの DB に一度も
-     書いていない。導入先の 2026-10-13 より前の履歴）
+  1. `t` が `trace_complete_from_ms` より後で、`(trace_complete_from_ms, t)` に trace が 1 行も無く、DB の最も古い
+     trace も `t` より後（fand がこの DB に一度も書いていない。導入先では 2026-10-13 より前の履歴）。
+     `t` が `trace_complete_from_ms` 以下なら、`pruned_through_seq` が 0 でも、移行の前や保持期間の削除で trace が
+     消えた可能性を除けないので 1 は使わず、`bios_confirmed` が無ければ `undetermined`。fand がほかの DB へ
+     書いていた期間は判定できない（fand は取り込みと同じ DB に書く前提。0080）
   2. `t` が `--periods` の **`bios_confirmed`** の区間の中にある。人が journal（`safety_handoff_completed` が無い、
      または `record_found: false`）や `systemctl` の記録で、直前の fand の停止が正常だったこと・再起動したことを
      確かめて書く。区間ごとに根拠の文（`basis`）を必須にし、出力の来歴にそのまま写す
@@ -278,6 +298,12 @@ DB に残る記録で、これを直接に言える欄は無い（2026-10-16 の
   一部の zone だけ全速（引き継ぎの一部の成功を模した合成データ）・trace の途絶の後で `bios_confirmed` が無い・
   prune の記録がある DB では `undetermined`。`manual` の tick が `fand_override` で
   既定では除かれ、`undetermined` は件数だけに出る
+- 書き込みの確かめ（§2.6a）: PWM が合っていても `write_ok` か `readback_ok` が false の zone がある tick
+  （`ENABLE_REVERTED` で `readback_ok = false` を含む）・`hardware` の無い tick は `undetermined`。区間の中で
+  そうした tick が `pwm_mismatch_max_ratio` を超えると、合っている tick も含めて区間ごと `undetermined`
+- legacy の境目（§2.6a）: `legacy_until_ms` より前の時刻は、trace が無く `pruned_through_seq` が 0 でも `bios` に
+  ならず（`bios_confirmed` の中なら `bios`）、区間の始まりが `legacy_until_ms` 以前の trace の区間は `undetermined`。
+  `pruned_before_ms` についても同じ
 - 区間の全体（§2.6a）: `--start` より前から続く trace の区間で、前半の PWM が外れ `--start` 以後だけが合う合成データを
   `undetermined` にする（`--start` を区間の途中のどこに置いても判定が変わらない）。区間の始まりが最も古い trace で
   `pruned_through_seq` が 0 でない DB では、その区間を `undetermined` にする。`--end` の後に外れが続く場合も同じ
