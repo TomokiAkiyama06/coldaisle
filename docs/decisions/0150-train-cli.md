@@ -305,7 +305,7 @@ process が強制終了したとき（`SIGKILL`・電源断）は片づけられ
 - **`--out` には symlink を含まない実の path を渡す。CLI は symlink を解かない。** macOS では `/tmp`・`/var`・`/etc` が
   `/private/...` への symlink なので、`--out /tmp/<自分のディレクトリ>/...` は根の次の要素で `ELOOP` になる。そこで:
   - `os.path.realpath` などで先に解いてから照合する形は採らない（解いた後・開く前に途中の要素を差し替えられる窓が戻る）。
-    OS ごとの別名の一覧を持って解く形も、本記録では採らない（§5 の 13）
+    OS ごとの別名の一覧を持って解く形も採らない（§5 の 13 で決定済み）
   - `ELOOP` で開けなかったときは、どの要素が symlink かを `os.readlink(名前, dir_fd=ひとつ前の fd)` で読んでログに出し（読むだけで
     たどらない）、段 `untrusted_path`・終了コード 1 で拒否する。ログには「symlink を含まない実の path（macOS なら `/private/tmp/...`）を
     渡す」ことを書く。開始の時点なら学習の前で、`--out` は作られない
@@ -368,7 +368,18 @@ JSON として読めて、書かれた3つのファイルの大きさと SHA-256
   印の形（`COMPLETE.json` の pydantic の型）・書く側の公開の手順（§2.5 の手順 2〜7）・path の照合の関数・読む側の確かめる関数
   （`O_DIRECTORY | O_NOFOLLOW` で開き、`dir_fd` で各ファイルを上限つきで読み、大きさと SHA-256 を照合して bytes を返す）を
   1か所に持つ。import するのは `train.py` と `registry.py`（どちらも合成の起点）だけで、標準ライブラリと pydantic の外の
-  coldaisle の module を import しない。根拠:
+  coldaisle の module を import しない。
+  - **読む側の上限は呼び出し側が int で渡し、parse の前に当てる。** `training_output.py` は coldaisle を import しないので
+    `ModelRegistryLimits` を受け取らず、`max_artifact_bytes: int` と `max_other_bytes: int` を必須の keyword 引数に取る（既定値なし）。
+    当て方は 0062 §2.1 と同じで、`artifact.json` は `max_artifact_bytes`、`COMPLETE.json`・`metadata.json`・`training-report.json` は
+    `max_other_bytes` を上限とする。順は (1) `COMPLETE.json` を上限＋1 byte だけ読み、超えれば parse の前に拒否 → (2) 印に書かれた
+    各ファイルの大きさが、そのファイルの上限を超えていれば開く前に拒否 → (3) 各ファイルを `O_NOFOLLOW` で開き、`fstat` の大きさが印と
+    同じことを確かめ、印の大きさ＋1 byte だけ読む（多く読めれば拒否）→ (4) SHA-256 を照合して bytes を返す
+  - 渡す値: `coldaisle-registry register --training-output` は既存の `--limits` から読んだ `ModelRegistryLimits` の
+    `max_artifact_bytes` / `max_snapshot_bytes`（`register --metadata/--payload` の `read_bounded` と同じ値。Registry を開く前に当てる）。
+    `train.py` は `--apply` のとき `--registry-limits` の同じ2つ、`--apply` の無い実行の再検証（`out_modified`）では自分がメモリに
+    持つ bytes の長さ（印と各ファイル。期待する大きさそのもの）を渡す
+  根拠:
   - 既存の前例が同じ形である。`csv_export_manifest.py`（export と再生が共有する manifest の形。0100）と
     `declared_changes.py`（`coldaisle-drift` と `coldaisle-dataset` が共有する YAML の形。0109）は、複数の合成の起点が共有する
     ファイルの形を、どの合成の起点にも属さないレイヤ横断の module に置いている
@@ -595,6 +606,10 @@ best-effort で `OSError` / `UnsafeRegistryPathError` を握る（`src/coldaisle
 - 設定の1回読み: `--quality-config` / `--training-spec` / `--calibration` / `--metrics-config` / `--declared-changes` / `--registry-limits` を、読んだ直後に差し替えても
   （`open` を包んで2回目の読みで別の bytes を返す）、学習・登録に使った設定と報告の digest が1回目の bytes のものであり、
   path から2回読まないこと
+- `coldaisle-registry register --training-output` の上限: `COMPLETE.json`・`metadata.json`・`training-report.json` が
+  `max_snapshot_bytes`＋1 byte、`artifact.json` が `max_artifact_bytes`＋1 byte のとき（印の大きさもそれに合わせたもの・印は小さいが
+  実物が大きいもの）、どれも終了コード 1 で Registry が変わらず、読んだ byte 数が上限＋1 を超えないこと（`os.read` を包んで数える）。
+  印に書かれた大きさが上限を超えるときは、そのファイルを開かないこと
 - `coldaisle-registry register --training-output`: 有効な印の `--out` から candidate を登録できること。印が無い・書きかけ・
   SHA-256 がずれた `--out` では終了コード 1 で Registry が変わらないこと。`--metadata` / `--payload` と同時に渡すと拒否し、
   Registry が変わらないこと。成功したときは candidate が1つ足され（上の (1)〜(4)）、`--out` の中身が変わらないこと。確かめた後に
@@ -657,4 +672,4 @@ best-effort で `OSError` / `UnsafeRegistryPathError` を握る（`src/coldaisle
 | 10 | `--out` の公開の手段（NFR-07「macOS / Ubuntu 双方で動作。OS依存はシリアルデバイス検出のみに閉じる」との関係） | **(A) OS に依らない手順**（§2.5 の本文）。`os.mkdir` で `--out` を排他的に確保し、中に書いてから完成の印を一時名で書いて fsync し、`os.link` で `COMPLETE.json` として公開する（既にあれば失敗）。利点: POSIX 共通の操作だけで NFR-07 を変えない・ctypes も OS の分岐も要らず CI（Ubuntu）で全経路を実物で試験できる・`mkdir` の排他で置き換えの窓が無い（前回の指摘を満たす）・0031 §3 の「共通の POSIX の操作だけ」と一貫する。欠点: 強制終了の後に `COMPLETE.json` の無い `--out` が残り、人が消すまで再実行できない・読む側が印を確かめる必要がある（新しい `coldaisle-registry register --training-output` は Registry を開く前に `COMPLETE.json` を確かめる。印を見ないのは既存の `--metadata` / `--payload` の経路だけで、その経路も `register_candidate` の checksum で書きかけを拒む） | (B) NFR-07 を変えて OS ごとの置き換えない rename を使う（Linux `renameat2(RENAME_NOREPLACE)`・macOS `renameatx_np(RENAME_EXCL)`・使えなければ失敗。ctypes の小さな関数1つ）。NFR-07 の「OS依存はシリアルデバイス検出のみに閉じる」を「…シリアルデバイス検出と、決定記録 0150 の出力の公開（置き換えない rename）に閉じる」へ変え、同じ PR で `docs/requirements.md` を直す。利点: `--out` は「無い」か「完成」のどちらかで、強制終了の後に残るのは隠れた一時ディレクトリだけ・読む側に印の確認が要らない。欠点: 要件を変える・macOS の分岐は Ubuntu の CI では差し替えでしか試験できない・ファイルシステムが対応しないと使えない・0031 §3 の writer（共通の `os.rename`）と手段が分かれる |
 | 11 | （申し送り）Registry の登録の失敗で、参照されない artifact のファイルが残りうる（`_remove_artifact_if_unreferenced` が best-effort）。`coldaisle-registry` に片付けの入口は無い | **本記録では扱わない**（Registry の書き方と片付けは 0062 / 0104 の範囲）。必要なら Registry の片付けの入口を別の記録で決める | — |
 | 12 | 設定の入力（§2.7 の6つ）を読む上限の値と置き場所。**決定済み（所有者、2026-10-16）: 推奨のとおり** | **`train.py` の構造上の定数 `MAX_TRAINING_CONFIG_BYTES = 1 MiB`**（6つに共通）。運用の閾値ではなくメモリを守る構造上の上限で、既存の `MAX_ARTIFACT_BYTES`（`control/model/thermal.py`）・`_MAX_JOURNAL_BYTES`（`control/authority.py`）・`MAX_DECLARED_CHANGES` と同じ扱い。いまの設定は数 KB で、宣言の YAML も `MAX_DECLARED_CHANGES` = 64 件に収まる。利点: `--apply` の無い実行でも追加の設定が要らず、上限を決めるファイル自身の読みに上限が要るという循環が無い | (a) `--registry-limits` を常に必須にし、その `max_snapshot_bytes` を使う（0062 §2.1 と同じ値）。欠点: `--out` だけの実行にも Registry の設定が要り、`model-registry.yaml` 自身は別の上限で読む必要が残る。(b) `--training-spec` に置く。欠点: spec 自身の読みに上限が要る |
-| 13 | macOS の `/tmp`・`/var` など、OS が置く symlink を含む `--out` | **受け入れない**（§2.5 の「path の照合」）。symlink を含まない実の path（`/private/tmp/...`）を人が渡し、CLI は拒否のログでそれを示す。利点: 解く処理が無く、照合の窓が増えない・Dataset の writer（`_open_output_root`）と挙動が揃う・OS ごとの分岐が無い（NFR-07） | (a) root の所有の `/` の中の root の所有の symlink（`/tmp`・`/var`・`/etc`）だけを、`fstat` と `readlink` で確かめて一度だけ解き、先を fd で開いて照合を続ける。欠点: 別名の一覧（macOS の分岐）を持つ・Ubuntu の CI では模してしか試験できない |
+| 13 | macOS の `/tmp`・`/var` など、OS が置く symlink を含む `--out`。**決定済み（所有者、2026-10-16）: 推奨のとおり** | **受け入れない**（§2.5 の「path の照合」）。symlink を含まない実の path（`/private/tmp/...`）を人が渡し、CLI は拒否のログでそれを示す。利点: 解く処理が無く、照合の窓が増えない・Dataset の writer（`_open_output_root`）と挙動が揃う・OS ごとの分岐が無い（NFR-07） | (a) root の所有の `/` の中の root の所有の symlink（`/tmp`・`/var`・`/etc`）だけを、`fstat` と `readlink` で確かめて一度だけ解き、先を fd で開いて照合を続ける。欠点: 別名の一覧（macOS の分岐）を持つ・Ubuntu の CI では模してしか試験できない |
