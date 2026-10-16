@@ -267,12 +267,16 @@ rules:
   # fand の trace が来ない（fand が止まっている・DB へ書けていない）か、最新の trace を読めない。
   # 監視系は意図した停止と落ちたことを見分けない。止めておくときは enabled を false にして
   # coldaisle-daemon を再起動する（0148 §2.8）
+  # 出荷では無効（0148 §5 の 2、所有者の決定）。fand を常駐させる前は trace が途絶えるのが
+  # 正常で、鳴らすと誤報になるため。fand を enable するときに true にして coldaisle-daemon を
+  # 再起動する（docs/ubuntu-deploy.md 6 節）。無効でも silence_s は EMERGENCY / DEGRADED の
+  # trace の新しさの上限として使う
   fand_trace_silent:
     label: Fan制御の記録が途絶えた
     title: Fan 制御（fand）の記録が途絶えています
     resolved_title: Fan 制御（fand）の記録が戻りました
     hint: systemctl status coldaisle-fand と journalctl -u coldaisle-fand で動いているかを確かめてください。意図して止めているなら config/rules.yaml の fand_trace_silent.enabled を false にします。
-    enabled: true
+    enabled: false
     severity: warning
     silence_s: 60.0 # 最後の trace からこの秒数で途絶とみなす。EMERGENCY / DEGRADED の trace の新しさの上限でもある
     fire_after_s: 0.0

@@ -44,11 +44,26 @@ BASE = json.loads((FIXTURES / "control_tick_v15.json").read_text(encoding="utf-8
 
 @pytest.fixture
 def rule_set() -> RuleSet:
-    """本番の rules.yaml。基板の無音（SENSOR_FAULT）だけは切る（ここでは基板を流さない）。"""
+    """本番の rules.yaml。基板の無音（SENSOR_FAULT）だけは切る（ここでは基板を流さない）。
+
+    `fand_trace_silent` は出荷では無効（0148 §5 の 2）。fand を enable したあとの形
+    （有効）で型と評価を確かめるため、ここでは有効にする。
+    """
     shipped = RuleSet.from_yaml(RULES_PATH)
     return shipped.model_copy(
-        update={"sensor_fault": shipped.sensor_fault.model_copy(update={"enabled": False})}
+        update={
+            "sensor_fault": shipped.sensor_fault.model_copy(update={"enabled": False}),
+            "fand_trace_silent": shipped.fand_trace_silent.model_copy(update={"enabled": True}),
+        }
     )
+
+
+def test_shipped_rules_enable_emergency_and_degraded_but_not_trace_silence():
+    """出荷では EMERGENCY / DEGRADED だけが有効。途絶は fand の enable まで無効（0148 §5 の 2）。"""
+    shipped = RuleSet.from_yaml(RULES_PATH)
+    assert shipped.fand_emergency.enabled
+    assert shipped.fand_degraded.enabled
+    assert not shipped.fand_trace_silent.enabled
 
 
 @pytest.fixture

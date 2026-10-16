@@ -396,8 +396,11 @@ nvidia-smi --query-gpu=temperature.gpu,fan.speed --format=csv
 > **fand の状態の通知（決定記録 [`0148`](decisions/0148-fand-state-alert.md)）。** 取り込み（`coldaisle-daemon`）が
 > fand の decision trace の最後の 1 行を読み、`EMERGENCY`（重大・即時）・`DEGRADED` の 120 s の継続（警告）・
 > trace の 60 s の途絶（警告）を Slack へ送ります（値は `config/rules.yaml`）。DB に trace が 1 行も無いうちは鳴りません。
-> 一度 fand を動かした機械で fand を意図して止めておくときは、途絶の警告が 1 回届きます。止めている間は
-> `config/rules.yaml` の `fand_trace_silent.enabled` を false にして `coldaisle-daemon` を再起動すると鳴りません。
+> **途絶の警告（`fand_trace_silent`）は出荷では無効です**（0148 §5 の 2）。fand を常駐させる前は trace が途絶えるのが
+> 正常だからです。EMERGENCY と DEGRADED は最初から有効です。fand を `enable` するときに、6.5 の最後の手順で有効にします。
+> enable の後に fand を意図して止めておくときは、途絶の警告が 1 回届きます。止めている間は
+> `config/rules.yaml` の `fand_trace_silent.enabled` を false に戻して `coldaisle-daemon` を再起動すると鳴りません
+> （fand を動かし直すときに true にして再起動します）。
 
 ### 6.1 ユーザーとグループ
 
@@ -645,6 +648,19 @@ sudo /usr/bin/python3 -I -S /opt/coldaisle/src/coldaisle/safety_handoff.py; echo
   （決定記録 0115 §3）。
   時間切れ（`TimeoutStartSec` / `TimeoutStopSec` / `TimeoutAbortSec`）・`WatchdogSec`・`RestartSec` は
   暫定値で、実機の測定と所有者の承認で決めます（0080 §5 の 1）
+- **fand を `enable` するときは、途絶の警告も有効にします**（決定記録 0148 §5 の 2）。
+  出荷の `config/rules.yaml` では `fand_trace_silent.enabled` が false です。`config/` は root の所有なので
+  `sudo` で書き換え、取り込みを再起動して読ませます（ルールは起動時に1回だけ読みます）:
+
+  ```bash
+  sudoedit /opt/coldaisle/config/rules.yaml   # fand_trace_silent: の enabled: false を true にする
+  sudo systemctl restart coldaisle-daemon.service
+  ```
+
+  取り込みの再起動の間（数秒）は基板の取り込みと通知が止まります。発火中のアラートは再起動の後に復元され、
+  出し直しません。導入先のコードを更新した後は、出荷の値（false）に戻っていないかを確かめます。
+  fand を意図して止めておく間に戻すときは、上の段落（6 節の冒頭の 0148 の注記）のとおり false にして
+  同じく再起動します
 
 ### 6.6 authority.json を専用のディレクトリへ移す（以前のテンプレートで fand を動かした導入先）
 

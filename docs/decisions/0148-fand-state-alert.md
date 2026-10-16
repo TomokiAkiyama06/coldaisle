@@ -1,7 +1,7 @@
 # 決定記録 0148: fand の EMERGENCY / DEGRADED と trace の途絶を、監視系が DB の decision trace を読んで Slack へ知らせる
 
 - **種別**: Decision Record
-- **Status**: Proposed
+- **Status**: FINAL（2026-10-16、リポジトリ所有者の承認）
 - **Date**: 2026-10-16
 - **Supersedes**: なし（0012 のルールエンジンにルールの型を 2 つ足す。0013 / 0135 / 0142 の通知の経路・形は変えない）
 - **関連**: [`0028`](0028-fan-control-contracts.md) §2.5 (d) / §2.7 /
@@ -55,6 +55,8 @@ fand は tick ごとに `control_traces` へ 1 行を書く（0071）。`SqliteS
 | `fand_trace_silent`（`FAND_TRACE_SILENT`） | warning | 最後の trace から 60 s 以上新しい行が無い、または最新の trace を読めない | 0 s（60 s の無音そのものが待ち） | 読める新しい trace が 30 s 続く |
 
 値はすべて `config/rules.yaml` に置き（ルール 9）、**provisional**。
+`fand_emergency` / `fand_degraded` は出荷で有効、`fand_trace_silent` は**出荷で無効**で、fand を enable するときに
+有効にする（2.8・§5 の 2）。無効の間も `silence_s` は下の「trace の新しさ」の閾値として使う。
 
 - **EMERGENCY は即時**: 全 Fan が Max で、原因は温度の上限・Top の stall など人が見るべきもの。fand 自身が
   `fault_clear_hold_ms`（導入先 30 s。0119）で状態を保つので、1 tick の揺れでは出入りしない
@@ -133,7 +135,10 @@ FAND_EMERGENCY
 
 - 監視系は「意図した停止」と「落ちた」を見分けない（systemd・journal を読まない。0131 と同じ）
 - **DB に trace が 1 行も無いときは評価しない**（fand を導入していない機械で鳴らさない）
-- trace がある機械で fand を意図して止めるときは、`FAND_TRACE_SILENT` が 1 回だけ warning で届く（遷移だけを送るので
+- **`fand_trace_silent` は出荷で無効**（§5 の 2 の所有者の決定）。fand を常駐させる前（T1 などの試験で一時的に動かして
+  止めた機械）は trace が途絶えるのが正常で、鳴らすと誤報になるため。fand を enable するときに
+  `fand_trace_silent.enabled` を true にして取り込み（`coldaisle-daemon`）を再起動する（`docs/ubuntu-deploy.md` 6 節）
+- 有効にした後で fand を意図して止めるときは、`FAND_TRACE_SILENT` が 1 回だけ warning で届く（遷移だけを送るので
   繰り返さない。取り込みを再起動しても発火中のアラートを復元するので出し直さない）。止めている間も鳴らしたくなければ、
   `config/rules.yaml` の `fand_trace_silent.enabled` を false にして取り込みを再起動する（`hint` に書く）
 - EMERGENCY / DEGRADED が発火中のまま fand を止めると、そのアラートは次に fand が動いて状態が戻るまで発火中のまま残る（2.3）
@@ -145,7 +150,7 @@ FAND_EMERGENCY
 ### 良くなること
 
 - fand の EMERGENCY が夜間も Slack に届く。原因の fault code が日本語の名前と一緒に本文に出る
-- fand が止まった・trace を書けないことに気づける（いまは画面を開くまで分からない）
+- fand が止まった・trace を書けないことに気づける（いまは画面を開くまで分からない。fand の enable で途絶の警告を有効にした後）
 - fand・制御の経路は変わらない。監視系は既存の読み出し（0071）だけを使う
 
 ### 悪くなること・その緩和
@@ -155,7 +160,7 @@ FAND_EMERGENCY
 | 最新の 1 行だけを見るので、評価の間（約 1 s）にだけ現れた状態は見ない | fand は `fault_clear_hold_ms`（30 s）の間状態を保つ。`fault_clear_hold_ms` を評価の間隔より短くする設定は想定しない（§5 の 3） |
 | 基板の無音（`SENSOR_FAULT`）は fand でも `air_telemetry_stale` の DEGRADED になり、2 通届く | 原因の行（`air_telemetry_stale`）で同じ事象と分かる。まとめるかは §5 の 4 |
 | 取り込みデーモンが止まると、この通知も止まる | 取り込みの停止は fand の DEGRADED（`air_telemetry_stale`）になるが、それを知らせる側が止まっている。外からの死活監視は範囲外（§5 の 5） |
-| fand を意図して止めると warning が 1 回届く | 2.8。導入前の機械では鳴らない |
+| fand を意図して止めると warning が 1 回届く | 2.8。出荷では無効で、enable の前の機械では鳴らない |
 
 ---
 
@@ -174,16 +179,20 @@ FAND_EMERGENCY
 
 ---
 
-## 5. 未決事項・仕様に無かった判断
+## 5. 未決事項・仕様に無かった判断（2026-10-16 に所有者が決定）
 
-1. **値（provisional）**: EMERGENCY 即時・DEGRADED 120 s・無音 60 s・解除 10 / 10 / 30 s は Claude の案。所有者の承認が要る
-2. **`fand_trace_silent` を出荷で有効にした**（2.8）。fand を常駐させるまでは、T1 の後に 1 回 warning が届く。
-   常駐の前は false で出す案もある（所有者が選ぶ）
-3. **最新の 1 行だけを見る**（3）。`fault_clear_hold_ms` が取り込みの評価の間隔（約 1 s）より短いと、短い EMERGENCY を見落としうる
-4. **基板の無音と fand の DEGRADED（`air_telemetry_stale`）の 2 通をまとめない**（3）
-5. **取り込みデーモン自身の停止**は知らせられない（範囲外。別の Issue）
+1. **値（provisional）**: EMERGENCY 即時・DEGRADED 120 s・無音 60 s・解除 10 / 10 / 30 s は Claude の案。
+   **決定: 案のとおり承認。provisional のまま**（実運用の結果で見直す）
+2. **`fand_trace_silent` を出荷で有効にするか**（2.8）。有効なら、fand を常駐させるまでは T1 の後に 1 回 warning が届く。
+   **決定: fand を enable するまで無効で出す**（`config/rules.yaml` で `enabled: false`）。EMERGENCY と DEGRADED は
+   最初から有効。fand の enable の手順（`docs/ubuntu-deploy.md` 6.5）で true にして取り込みを再起動する
+3. **最新の 1 行だけを見る**（3）。`fault_clear_hold_ms` が取り込みの評価の間隔（約 1 s）より短いと、短い EMERGENCY を見落としうる。
+   **決定: 案のとおり**
+4. **基板の無音と fand の DEGRADED（`air_telemetry_stale`）の 2 通をまとめない**（3）。**決定: 案のとおり**
+5. **取り込みデーモン自身の停止**は知らせられない（範囲外。別の Issue）。**決定: 案のとおり**
 6. **Front / Rear の tach stall は DEGRADED（warning）なので夜間は届かない**。0028 §2.7 の「通知する」を夜間も含むと読むなら、
-   tach stall を含む DEGRADED を critical にする別の判断が要る
-7. **fault の日本語の名前**（`fault_labels`）は Claude の案。所有者が `config/rules.yaml` で直してよい
-8. **`startup` を通知しない**（2.2）。`startup` のまま進まない状態を知らせるかは別に決める
-9. **自動の説明（LLM）を求める**（2.6）。閉じた語彙の 1 行だけが渡る。求めないなら `llm_excluded_rules` に足す（0146 の一覧の変更になる）
+   tach stall を含む DEGRADED を critical にする別の判断が要る。**決定: warning のまま**（夜間は届かない）
+7. **fault の日本語の名前**（`fault_labels`）は Claude の案。所有者が `config/rules.yaml` で直してよい。**決定: 案のとおり**
+8. **`startup` を通知しない**（2.2）。`startup` のまま進まない状態を知らせるかは別に決める。**決定: 案のとおり**
+9. **自動の説明（LLM）を求める**（2.6）。閉じた語彙の 1 行だけが渡る。求めないなら `llm_excluded_rules` に足す（0146 の一覧の変更になる）。
+   **決定: 案のとおり**（`llm_excluded_rules` に足さない）
