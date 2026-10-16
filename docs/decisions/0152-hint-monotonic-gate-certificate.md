@@ -219,13 +219,39 @@ fand は起動時に1回だけ、tick を始める前に照合する（合成の
 
 ### 2.7 trace への記録
 
-- B1 の `ControlTick` の版上げ（frame と同じ実装 PR）で、ヒントの塊に `certificate_sha256`（その run で照合を通った
-  証明書。通っていなければ `null`）を足す。毎 tick 同じ値で、どの証明書の下で B1 / B2 が動いたかを後から引くため。
-  理由の細目は載せない（起動時のログに1回残す）
+- B1 の `ControlTick` の版上げ（frame と同じ実装 PR）で、ヒントの塊に欄 `certificate` を足す。値は、fand が起動時に
+  照合に使った hint_certificate の production の識別（`model_id` / `version` / `artifact_sha256` と、その pointer を成立させた
+  registry の変更の revision）と `certificate_sha256`。production が無い・照合が通らなかったときは `null`。
+  ヒントの塊がある tick では**欄を必ず置く**（値が無ければ `null`。0062 §2.5 の「欄を揃える」）。毎 tick 同じ値で、
+  どの証明書の下で B1 / B2 が動いたかを後から引くため。理由の細目は載せない（起動時のログに1回残す）
 - `hint_shadow_records` の `record_json` は 0133 §2.5a のとおり認証のハッシュを載せる。値はこの `certificate_sha256`
-- Registry の provenance（trace の `registry`。0071 §2.5）に hint_certificate の production の識別が載る
-  （`RegistrySnapshot.trace_provenance()` の kind の列挙に従う）
+- **trace の `registry`（`RegistryProvenance` v1。0071 §2.5）には hint_certificate を載せない**（§2.7a）
 - 証明書の中身・照合の結果を読み取り API と AI ツールに出さない（ルール 8・0133 §2.5a）
+
+### 2.7a `RegistryProvenance` との関係（kind を足しても過去の trace を壊さない）
+
+いまの `RegistryProvenance`（`control/schema.py`。`schema_version: Literal[1]`）は、registry を読んだ tick の
+`production` の鍵が1つのグローバルな集合 `REGISTRY_ARTIFACT_KINDS`（4 kind）と**等しい**ことを検証で求め、
+`RegistrySnapshot.trace_provenance()`（`control/model_registry.py`）は `ArtifactKind` の**全値**を回して鍵を作る。
+`tests/test_model_registry.py` は `ArtifactKind` の値の集合が `REGISTRY_ARTIFACT_KINDS` と等しいことを確かめている。
+`ControlTick` v10 以降は `registry` を必須にしている。したがって `hint_certificate` を `ArtifactKind` に足すだけだと、
+集合を広げれば保存済みの v10〜v16 の trace（4 つの鍵）が読み直しの検証で落ち、広げなければ新しく作る provenance
+（5 つの鍵）が落ちる。`ControlTick` の版を上げても、入れ子の v1 のオブジェクトの検証は変わらないので解決しない。
+次の2案を比べた。
+
+| 案 | 形 | 版で分けるところ | 評価 |
+|---|---|---|---|
+| **P（推奨）provenance に載せず、ヒントの塊で運ぶ** | `RegistryProvenance` v1 と `REGISTRY_ARTIFACT_KINDS` は**変えない**。意味を「制御が artifact として束縛する kind の production」と読む。`trace_provenance()` は `ArtifactKind` の全値ではなく `REGISTRY_ARTIFACT_KINDS` に入る kind だけを回す（列挙を明示する）。hint_certificate の識別は §2.7 の `certificate` の欄で運ぶ | `ControlTick` の版上げは B1 の版上げ（ヒントの塊の `certificate`）だけ。`RegistryProvenance` の版・保存済みの trace・`registry_binding` / `LearnedExpectedArtifacts.from_provenance` は変えない。`airflow-trace.js` は `KNOWN_VERSIONS` に B1 の版を足すだけ（`registry` の中身も `workload_hint` も表示していない） | 過去の trace・Gate の期待値・frame の固定（0098 §2.4）の出どころに触れない。証明書はヒントだけが使うので、ヒントの塊にあるのが読む側にも自然。代わりに provenance は registry の全 kind を表さなくなる（0062 §2.5 / 0071 §2.5 の「全 kind」を「束縛する kind」に読み替える。registry の全件は従来どおり `coldaisle-registry audit` が正本） |
+| Q. provenance v2 を足す | `RegistryProvenance.schema_version` を `Literal[1, 2]` にし、鍵の集合を版ごとに持つ（v1 = いまの 4 kind を**固定の定数** `REGISTRY_ARTIFACT_KINDS_V1` に、v2 = 5 kind）。検証は `set(production) == KINDS[schema_version]` | `ControlTick` の版上げで、新しい版の tick は provenance v2 を必須、v10〜旧版は v1 を必須にする（`ControlTick._check` で版ごとに読み分け）。`trace_provenance()` は v2 を作る。`registry_binding` / `from_provenance` は v1 / v2 の両方を受ける。`tests/test_model_registry.py` の等式は v2 の集合と比べる。`airflow-trace.js` は `KNOWN_VERSIONS` を足す（provenance の中身を表示し始めるときは、その版を解釈に足す） | 「全 kind」の原則は保つ。ただし provenance を作る・読む全員（loop・binding・frame の固定・試験の fixture）に版の分岐が入り、Learned の経路の出どころ（0077 §2.6）に、制御が束縛しない kind のための変更が及ぶ |
+
+**P を採る**（§5 の 8）。あわせて次を守る。
+
+- `REGISTRY_ARTIFACT_KINDS` を**固定の値**として残し、`ArtifactKind` から導かない。`tests/test_model_registry.py` の
+  等式は「`ArtifactKind` の値 = `REGISTRY_ARTIFACT_KINDS` ∪ {`hint_certificate`}」に変え、provenance に載せない kind を
+  もう1つ足すときは、この等式の変更と決定記録を要るようにする（黙って provenance から漏れる kind を作らない）
+- 保存済みの v10〜v16 の trace は、`RegistryProvenance` も `ControlTick` もその版のまま読める（再検証で落ちない）ことを
+  試験で固定する（保存済みの本文の fixture を読み直す）
+- registry の lifecycle の正本は 0062 §2.5 のとおり `registry.json` の audit で、証明書の昇格・rollback もそこに残る
 
 ### 2.8 試験の方針（すべて実機不要。ルール 7）
 
@@ -253,6 +279,9 @@ fand は起動時に1回だけ、tick を始める前に照合する（合成の
   fand と照合が通らない。`SCHED_IDLE` に下げられない環境では何もせずに終了する
 - **境界**: AI 層・API・eventd・control_admin がランナーと証明書の module を import しない（0064 §2.2 の import 走査に
   加える）。`coldaisle.control.safety` / `reactive` / `fallback` / `hardware` も import しない（0133 §2.7）
+- **trace と provenance**: `hint_certificate` を足した後も、保存済みの v10〜v16 の trace の本文が検証を通る・
+  `trace_provenance()` の鍵が `REGISTRY_ARTIFACT_KINDS`（4 kind）のまま・ヒントの塊の `certificate` が、照合を通った
+  run では証明書の識別、通らない run では `null` で、欄そのものは必ずある
 - **Registry**: 新しい kind の `promote` が承認ファイル無しでは通らない。古い版の snapshot を新しい読み手が読める・
   新しい版の snapshot を古い読み手が `INVALID_REGISTRY` として拒む
 
@@ -313,6 +342,7 @@ fand は起動時に1回だけ、tick を始める前に照合する（合成の
 | 5 | ランナーの優先度 | **(a 推奨) `SCHED_IDLE` 必須。下げられなければ実行しない**（§2.1）/ (b) `nice` で足りるとする / (c) 制約しない（本番のホストで fand・worker と CPU を取り合う） |
 | 6 | 稼働中に証明書・thermal_model の production が変わったとき | **(a 推奨) B0 に下げ、再起動まで上げない**（§2.4）/ (b) 再照合して合えばその場で B1 へ上げる |
 | 7 | worker の照合の不一致の扱い | **(a 推奨) B1 ではその記録を `certification_mismatch` で捨てるだけ。B2 でどこまで信じるかは B2 の記録で決める**（§2.6）/ (b) 1件でも不一致なら fand がその run の残りを B0 に下げる |
+| 8 | trace での証明書の運び方（§2.7a） | **(P 推奨) `RegistryProvenance` v1 と `REGISTRY_ARTIFACT_KINDS` を変えず、ヒントの塊の `certificate` で運ぶ** / (Q) `RegistryProvenance` v2（鍵の集合を版ごとに持つ）を足し、`ControlTick` の版で v1 / v2 を読み分ける |
 
 ### 実装 Issue の切り方（参考）
 
