@@ -57,9 +57,10 @@ AGENTS.md の「仕様に無い判断をした場合、実装より先に決定�
 - **どこからも import しない**（`authority_cli.py` と同じ扱い）。とくに `control_daemon`・`learned_worker`・
   `learned_channel`・`control/`・`api/`・`ai/`・`server`・`event_entry`・`control_admin` から import しない
 - `train.py` が import してよいのは、上の表の関数・型、`store`（読み取り）・`ingest`（`training_entry` 経由の再生）・
-  `control/model_registry`・`logs` だけ。`control/hardware`・`control/safety`・`control/reactive`・`control/loop`・
+  `control/model_registry`・`training_output`（§2.5）・`logs` だけ。`control/hardware`・`control/safety`・`control/reactive`・`control/loop`・
   `serial`・`subprocess`・`ai` を import しない（試験で走査する。§2.9）
 - **LLM に依らない。** AI 層のツールにも読み取り API にも出さない（AGENTS.md ルール1。0062 §2.1 と同じ）
+- 0062 の `coldaisle-registry` には `register --training-output` を1つ足す（§2.5。既存の操作と引数は変えない）
 - **人が手で実行する。** systemd の timer やデーモンからは起動しない（本番のオンライン学習はしない。Q-25 は開いたまま
   §5 の 7）
 
@@ -133,9 +134,9 @@ process が強制終了したとき（`SIGKILL`・電源断）は片づけられ
 |---|---|---|---|
 | 公開の前（検査・学習・公開の手順 1〜4 の例外） | 1 | 何も残らない（作った `--out` を片づける） | 原因を直して同じ引数で再実行 |
 | 公開の前の強制終了（`SIGKILL`・電源断） | — | **完成の印の無い `--out`**（中のファイルは途中まで） | 再実行は `--out` があるので拒否され、そのとき `--out` に有効な完成の印が無いことをログに出す。人が確かめて `--out` を消し、同じ引数で再実行する。CLI は自動では消さない（自分が作ったものか確かめられないため） |
-| 公開の後・`--out` と親の fsync の失敗（公開の手順 5。`--apply` の有無に依らない） | 1 | `--out`（3ファイルと有効な完成の印。それぞれ fsync 済みで、永続でないのはディレクトリの項だけ）。`--apply` なら Registry へは進まない | ログに段 `publish_durability` と `--out` の path を出す。中身は完成しているので、そのまま使ってよい（`--apply` なら `--out` の2ファイルを `coldaisle-registry register` へ渡す）。電源断の後に `--out` が無い・印が無効なら、消して同じ引数で再実行する |
-| 公開の後・Registry の登録の失敗（lock・revision・同じ版が登録済み・権限・limits、および artifact ファイルの段の `RegistryDurabilityError`） | 1 | `--out`（3ファイルと完成の印）。Registry は変わらない（登録の確定点の前） | `--out` の `artifact.json` と `metadata.json` を `coldaisle-registry register` へ渡す。同じ版が登録済みなら `--model-version` を上げて別の `--out` で作り直す |
-| 登録は確定したが永続が確かでない（`registry.json` の置き換えの後の `RegistryDurabilityError`。下記） | 1 | `--out` と、Registry の **candidate**（見えている。production は動かない） | CLI はそのまま**登録の後の検査（`load_version` と L1〜L12）へ進む**。検査が通ってもログに段 `register_durability` を出して終了コード 1。人は `coldaisle-registry status` で candidate があることを確かめる。電源断の後に無くなっていたら、`--out` の2ファイルで `coldaisle-registry register` する。**もう一度 `coldaisle-train --apply` で登録し直さない**（見えている間は「既にある」になる） |
+| 公開の後・`--out` と親の fsync の失敗（公開の手順 5。`--apply` の有無に依らない） | 1 | `--out`（3ファイルと有効な完成の印。それぞれ fsync 済みで、永続でないのはディレクトリの項だけ）。`--apply` なら Registry へは進まない | ログに段 `publish_durability` と `--out` の path を出す。中身は完成しているので、そのまま使ってよい（`--apply` なら `coldaisle-registry register --training-output <--out>` で登録する）。電源断の後に `--out` が無い・印が無効なら、消して同じ引数で再実行する |
+| 公開の後・Registry の登録の失敗（lock・revision・同じ版が登録済み・権限・limits、および artifact ファイルの段の `RegistryDurabilityError`） | 1 | `--out`（3ファイルと完成の印）。Registry は変わらない（登録の確定点の前） | `coldaisle-registry register --training-output <--out>` で登録する。同じ版が登録済みなら `--model-version` を上げて別の `--out` で作り直す |
+| 登録は確定したが永続が確かでない（`registry.json` の置き換えの後の `RegistryDurabilityError`。下記） | 1 | `--out` と、Registry の **candidate**（見えている。production は動かない） | CLI はそのまま**登録の後の検査（`load_version` と L1〜L12）へ進む**。検査が通ってもログに段 `register_durability` を出して終了コード 1。人は `coldaisle-registry status` で candidate があることを確かめる。電源断の後に無くなっていたら、`coldaisle-registry register --training-output <--out>` で登録する。**もう一度 `coldaisle-train --apply` で登録し直さない**（見えている間は「既にある」になる） |
 | 登録の後・`load_version` と L1〜L12 の検査の失敗 | 1 | `--out` と、Registry の **candidate**（production は動かない） | ログに artifact の key と `--out` の path を出す。人が原因を確かめ、`coldaisle-registry retire` で candidate を退ける。CLI は `retire` しない |
 
 構造化ログには失敗した段（`before_publish` / `publish_durability` / `register` / `register_durability` /
@@ -173,10 +174,26 @@ process が強制終了したとき（`SIGKILL`・電源断）は片づけられ
 大きさと SHA-256 が実物と一致することである（印そのものの書きかけも、ファイルの書きかけもこれで拒める）。
 
 - `--apply` の登録は手順 5 の後に、メモリ上の同じ bytes で行う（印を読み直さない）
-- 人が `--out` を `coldaisle-registry register` へ渡すときは、先に印を確かめる（手順書に書く）。印を確かめずに渡しても、
-  `register` は payload の SHA-256 を metadata と照合し、metadata は strict JSON として読むので、書きかけのファイルが黙って
-  candidate になることは無い（`ModelRegistry.register_candidate` の checksum の検査）
-- 印を確かめる関数は `train.py` に置き、§5 の 1 の (a) の経路や後続の道具が使えるようにする
+- 手動の登録と回復は **`coldaisle-registry register --training-output <--out>`** で行う（`--metadata` / `--payload` と
+  排他）。`register` は下記の確かめる関数で印を確かめ、**確かめたときに読んだ bytes そのもの**（`artifact.json` と
+  `metadata.json`）を `register_candidate` へ渡す（確かめた後に読み直さない。差し替えの窓を作らない）。印が無い・無効なら
+  終了コード 1 で Registry を開かない。既存の `--metadata` / `--payload` の経路（RL policy など学習の CLI の外の artifact）は
+  変えない。印を確かめずに `--metadata` / `--payload` で渡しても、`register_candidate` は payload の SHA-256 を metadata と
+  照合し、metadata は strict JSON として読むので、書きかけのファイルが黙って candidate になることは無い
+- **確かめる関数の置き場所は、レイヤ横断の小さなモジュール `src/coldaisle/training_output.py`**（仮の名前）とする。
+  印の形（`COMPLETE.json` の pydantic の型）・書く側の公開の手順（§2.5 の手順 2〜6）・読む側の確かめる関数
+  （`O_DIRECTORY | O_NOFOLLOW` で開き、`dir_fd` で各ファイルを上限つきで読み、大きさと SHA-256 を照合して bytes を返す）を
+  1か所に持つ。import するのは `train.py` と `registry.py`（どちらも合成の起点）だけで、標準ライブラリと pydantic の外の
+  coldaisle の module を import しない。根拠:
+  - 既存の前例が同じ形である。`csv_export_manifest.py`（export と再生が共有する manifest の形。0100）と
+    `declared_changes.py`（`coldaisle-drift` と `coldaisle-dataset` が共有する YAML の形。0109）は、複数の合成の起点が共有する
+    ファイルの形を、どの合成の起点にも属さないレイヤ横断の module に置いている
+  - `train.py` に置くと、§2.1 の「どこからも import しない」と両立しない（`registry.py` が import できない）
+  - `control/model_registry.py` に置くと、制御の process の import の木に入る。`control_daemon` は
+    `control/registry_binding.py` を通じて、`learned_worker` と `learned_channel/registry_watch.py` は直接、`model_registry` を
+    import している。学習の出力のファイルの形は fand も worker も読まないので、その木に足さない
+  - 試験で、`control_daemon`・`control/`・`learned_worker`・`learned_channel`・`api/`・`ai/` が `training_output` を import
+    しないことを走査する（§2.9）
 
 process が強制終了したときに残るのは、印の無い（または無効な）`--out` だけである。再実行は手順 2 で拒否されるので、人が
 確かめて消す（§2.4 の表）。Dataset の writer（0031 §3）は「親の中の一時ディレクトリ → 共通の `os.rename`」で、強制終了の後に
@@ -206,8 +223,8 @@ process が強制終了したときに残るのは、印の無い（または無
 変えない。
 
 順序は **`--out` の公開 → Registry の登録**とする。2つの間で止まったときは `--out` だけがあり、`coldaisle-train` の
-再実行は `--out` が既にあるので拒否される。このときは `--out` の `artifact.json` と `metadata.json` を
-`coldaisle-registry register` へ渡せば同じ bytes が登録される（§5 の 1 の推奨の理由と同じ）。登録の失敗は構造化ログに
+再実行は `--out` が既にあるので拒否される。このときは `coldaisle-registry register --training-output <--out>` で、印を
+確かめた同じ bytes が登録される（§5 の 1 の推奨の理由と同じ）。登録の失敗は構造化ログに
 `--out` の path を出し、この手順を促す。
 
 - **既定では Registry を書かない。** `--out` へ書いて終わる（`coldaisle-calibrate` / `coldaisle-memory` の「既定では
@@ -284,7 +301,11 @@ coldaisle-authority raise          → authority を1段   （承認者の uid�
   Registry が変わらず、段 `register` で終了コード 1
 - 公開の後の失敗: 登録の失敗・登録の後の検査の失敗で終了コード 1、`--out` が残り、ログに段が出ること（§2.4 の表）
 - `--apply` で `--registry-limits` が無いと引数の段で拒否され、何も書かないこと
-- import の走査: `train` を import する module が無いこと、`train` が §2.1 の禁止の module を import しないこと
+- import の走査: `train` を import する module が無いこと、`train` が §2.1 の禁止の module を import しないこと。
+  `training_output` を import するのが `train` と `registry` だけで、`training_output` が coldaisle の他の module を import しないこと
+- `coldaisle-registry register --training-output`: 有効な印の `--out` から candidate を登録できること。印が無い・書きかけ・
+  SHA-256 がずれた `--out` では終了コード 1 で Registry が変わらないこと。`--metadata` / `--payload` と同時に渡すと拒否すること。
+  確かめた後に `artifact.json` を差し替えても、登録されるのは確かめた bytes であること
 - 作った artifact が `check_artifact_contents` を通り、`--apply` の後に `from_verified_artifact`（L1〜L12）を通ること（§2.4 の 7）
 
 ### 2.10 実装の段階
@@ -292,7 +313,7 @@ coldaisle-authority raise          → authority を1段   （承認者の uid�
 | 段 | 内容 |
 |---|---|
 | 0 | 本記録（Proposed） |
-| 1 | `src/coldaisle/train.py`・console script・`config/training.example.yaml`・§2.9 の試験。`training_entry` と `docs/thermal-dataset.md` の「学習の CLI はまだ無い」を直す。AGENTS.md のコマンド一覧と `docs/thermal-model.md` に1行足す |
+| 1 | `src/coldaisle/train.py`・`src/coldaisle/training_output.py`・`coldaisle-registry register --training-output`・console script・`config/training.example.yaml`・§2.9 の試験。`training_entry` と `docs/thermal-dataset.md` の「学習の CLI はまだ無い」を直す。AGENTS.md のコマンド一覧と `docs/thermal-model.md` に1行足す |
 | 2 | （別の記録）thermal model の offline evaluation の形と `offline_evaluation_ref`（§5 の 5） |
 | 3 | （別の記録）RL Supervisor の学習の入口（§5 の 6） |
 
