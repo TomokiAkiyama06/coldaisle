@@ -1040,6 +1040,23 @@ def test_bands_must_ascend_and_keys_must_be_complete() -> None:
         ld.LoadDistributionConfig.from_bytes(yaml.safe_dump(document).encode())
     with pytest.raises(ValueError):
         make_config(unknown_key=1)
+    with pytest.raises(ValueError):
+        make_config(settle_ms="300000")  # 引用符つきの数字を受けない（Codex P2）
+    with pytest.raises(ValueError):
+        make_config(power_min_ok_ratio=True)
+
+
+def test_periods_reject_unquoted_timestamps() -> None:
+    text = "periods:\n  - {name: x, start: 2026-08-25T09:00:00, end: 2026-08-25T10:00:00}\n"
+    with pytest.raises(ValueError, match="引用符"):
+        ld.Periods.from_bytes(text.encode(), make_config().zone)
+
+
+@pytest.mark.parametrize("end_offset", [0, -MIN, 31 * 24 * 60 * MIN])
+def test_a_bad_period_is_an_input_error(fx: Fixture, end_offset: int) -> None:
+    """逆転・空・max_period_days 超えは集計の拒否（1）ではなく入力の誤り（2）（Codex P2）。"""
+    argv = ["--db", str(fx.db), "--start", iso(T0), "--end", iso(T0 + end_offset)]
+    assert ld.main(argv) == 2
 
 
 def test_the_shipped_config_matches_the_record() -> None:

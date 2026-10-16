@@ -220,9 +220,21 @@ class LoadDistributionConfig(_Frozen):
         loaded: Any = yaml.safe_load(payload.decode("utf-8"))
         if not isinstance(loaded, dict):
             raise ValueError("load-distribution の設定が辞書ではない")
-        # YAML の数（整数で書いた下限など）を float の欄へ受けるため strict を緩める。
-        # 文字列の数字や真偽値は pydantic の lax でも int / float の欄に入らない
-        return cls.model_validate(loaded, strict=False)
+        return cls.model_validate_json(_as_json_text(loaded), strict=True)
+
+
+def _as_json_text(loaded: dict[str, Any]) -> str:
+    """YAML を JSON の値にしてから strict で検証する。
+
+    JSON の strict は列を tuple に、整数を float の欄に受け、引用符つきの数字・真偽値の数・
+    YAML の datetime は受けない（0151 §2.10「型の違いは拒否する」）。
+    """
+    try:
+        return json.dumps(loaded, ensure_ascii=False, allow_nan=False)
+    except (TypeError, ValueError) as error:
+        raise ValueError(
+            f"YAML に JSON で表せない値がある（時刻は引用符で囲む）: {error}"
+        ) from error
 
 
 def fan_pwm_metric(zone: Zone) -> str:
@@ -342,8 +354,7 @@ class Periods:
             loaded = {}
         if not isinstance(loaded, dict):
             raise ValueError("--periods の YAML が辞書ではない")
-        # 列（list）を tuple の欄へ受けるため strict を緩める。時刻の欄は lax でも文字列だけ
-        document = PeriodsFile.model_validate(loaded, strict=False)
+        document = PeriodsFile.model_validate_json(_as_json_text(loaded), strict=True)
 
         def interval(item: _PeriodBase, text: str) -> Interval:
             return Interval(parse_time(item.start, zone), parse_time(item.end, zone), text)
@@ -1578,6 +1589,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         end_ms = parse_time(args.end, zone)
     except ValueError as error:
         LOGGER.error("時刻を読めない", extra={logs.FIELDS_KEY: {"error": str(error)}})
+        return 2
+    if end_ms <= start_ms or end_ms - start_ms > inputs.config.max_period_days * 86_400_000:
+        # 期間の指定の誤りは入力の誤り（2）。集計の拒否（1）と見分ける（0155 §2.14）
+        LOGGER.error(
+            "期間が空か逆転しているか、max_period_days を超える",
+            extra={logs.FIELDS_KEY: {"max_period_days": inputs.config.max_period_days}},
+        )
         return 2
     try:
         database = LoadDistributionDatabase(args.db)
