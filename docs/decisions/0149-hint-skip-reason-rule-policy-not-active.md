@@ -1,7 +1,7 @@
 # 決定記録 0149: Workload Hint の `skipped` の語彙に `rule_policy_not_active` を足す
 
 - **種別**: Decision Record
-- **Status**: Proposed
+- **Status**: FINAL（2026-10-16、リポジトリ所有者の承認）
 - **Date**: 2026-10-16
 - **Supersedes**: なし（[0133](0133-workload-hint-stage-b-prior-rollout.md) §2.8 の表に1行を足して補う。
   0133 の本文は書き換えず、置き換える決定も無い）
