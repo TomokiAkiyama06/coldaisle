@@ -57,7 +57,8 @@ AGENTS.md の「仕様に無い判断をした場合、実装より先に決定�
 - **どこからも import しない**（`authority_cli.py` と同じ扱い）。とくに `control_daemon`・`learned_worker`・
   `learned_channel`・`control/`・`api/`・`ai/`・`server`・`event_entry`・`control_admin` から import しない
 - `train.py` が import してよいのは、上の表の関数・型、`store`（読み取り）・`ingest`（`training_entry` 経由の再生）・
-  `control/model_registry`・`training_output`（§2.5）・`logs` だけ。`control/hardware`・`control/safety`・`control/reactive`・`control/loop`・
+  `control/model_registry`・`training_output`（§2.5）・`dataset`（`_open_output_root` を公開にした関数だけ。§2.5 の手順 1）・
+  `logs` だけ。`control/hardware`・`control/safety`・`control/reactive`・`control/loop`・
   `serial`・`subprocess`・`ai` を import しない（試験で走査する。§2.9）
 - **LLM に依らない。** AI 層のツールにも読み取り API にも出さない（AGENTS.md ルール1。0062 §2.1 と同じ）
 - 0062 の `coldaisle-registry` には `register --training-output` を1つ足す（§2.5。既存の操作と引数は変えない）
@@ -171,31 +172,49 @@ process が強制終了したとき（`SIGKILL`・電源断）は片づけられ
    開いた親が**実行した uid の所有で、group / world が書けない**ことを確かめる（外れれば `PermissionError` で拒否）。0700 は
    ディレクトリの中身を守るが名前は守らないので、親に書ける別のユーザーが作ったばかりの `--out` の名前を付け替えて差し替える
    ことを、この検査で親に書ける者を書き手（と root）に限って防ぐ。実装の PR ではこの非公開の関数を公開の関数にして
-   `train.py` から呼ぶ（挙動は変えない。0031 §3 は置き換えない。手順を写して2つにしない）
+   `train.py` から呼ぶ（挙動は変えない。0031 §3 は置き換えない。手順を写して2つにしない）。**この関数が確かめるのは最後に
+   開いた親だけで、祖先は確かめない。** 祖先に group / world が書ける場所（`/tmp` の下など）があると、開いた後に親の名前を
+   付け替えられ、親の fd に対する照合は古い親を見続ける。そこで公開と登録の前の照合は、親の fd ではなく
+   **`--out` の絶対 path を根から解き直して**行う（下の「path の照合」）
 2. **`os.mkdir(--out の名前, 0o700, dir_fd=親)` で `--out` を排他的に確保する。** 既にあれば `EEXIST` で拒否する。`mkdir` は
    POSIX で原子的で、既にあるもの（他の process が作った空のディレクトリを含む）を**置き換えない**。「既にある出力は必ず拒む」
    の正しさはこの1手が持ち、確認と公開の間の窓（rename による置き換え）がそもそも無い。作った直後に `--out` を
-   `O_DIRECTORY | O_NOFOLLOW` で開き、path と fd の `(st_dev, st_ino)` が同じこと・中が空であることを確かめる（差し替えの検知）。
+   `O_DIRECTORY | O_NOFOLLOW` で開き、path の照合（下記）が通ること・中が空であることを確かめる（差し替えの検知）。
    以後は fd（`dir_fd`）だけで書く
 3. 3つのファイルを `--out` の中へ `O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW` で書き、**それぞれ fsync** する
 4. **完成の印を一時名で書く。** 3つのファイルの名前・大きさ・SHA-256 を、`--out` の中の一時名
    `.COMPLETE.json.tmp-<32 hex>` へ `O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW` で書き、fsync する。読む側はこの名前を見ない
-5. **link の直前に、`--out` の名前がまだ開いたディレクトリを指していることを確かめる**: `os.stat(--out の名前, dir_fd=親,
-   follow_symlinks=False)` の `(st_dev, st_ino)` が、手順 2 で開いた fd の `fstat` と同じであること。違えば（名前が無い・別の
-   ものを指す）失敗にし、段 `out_replaced` で終了コード 1（§2.4 の表）。そのうえで
+5. **link の直前に、path の照合（下記）で `--out` の path がまだ手順 2 で開いたディレクトリを指していることを確かめる。**
+   違えば（path が無い・途中に symlink がある・別のものを指す）失敗にし、段 `out_replaced` で終了コード 1（§2.4 の表）。そのうえで
    **`os.link(一時名, "COMPLETE.json", src_dir_fd=--out, dst_dir_fd=--out, follow_symlinks=False)` で印を公開する。**
    `link` は既にある名前を置き換えず `EEXIST` で失敗する（POSIX 共通。NFR-07 を変えない）。**この link が公開の確定点**で、
    `COMPLETE.json` は中身が fsync 済みの状態でだけ名前として現れる。`O_CREAT` で直接作ると、中身を書いて fsync するまでの間に
    名前が見えて、並行する `register --training-output` が確かめて登録したのに書き手が後で片づける、という食い違いが起きる
 6. 一時名を unlink し、`--out` を fsync し、親を fsync する（`COMPLETE.json` の項と `--out` の項を永続にする）。ここでの失敗は
-   公開の**後**の失敗（§2.4 の表）で、片づけない。fsync の後にもう一度、手順 5 と同じ `(st_dev, st_ino)` の照合をする。違えば
+   公開の**後**の失敗（§2.4 の表）で、片づけない。fsync の後にもう一度、手順 5 と同じ path の照合をする。違えば
    段 `out_replaced` で終了コード 1 にし、成功を報告しない
 7. 手順 2〜5 で例外が起きたとき（link の失敗を含む）は、自分で作った `--out` の中の**既知の名前だけ**（3つのファイル・
    印の一時名）を開いた fd（`dir_fd`）で unlink し、`--out` を rmdir する（rmdir は名前で行うので、その直前に名前が手順 2 で
-   確かめた `(st_dev, st_ino)` と同じときだけ。違えば rmdir せず段 `out_replaced`）。知らない名前
+   確かめた `(st_dev, st_ino)` と同じとき、つまり path の照合が通るときだけ。違えば rmdir せず段 `out_replaced`）。知らない名前
    （他の process が置いた `COMPLETE.json` など）は消さない。後始末の例外は**握りつぶさない**: 元の例外を原因として保ったまま、
    後始末の失敗（`unlink` / `rmdir` の `errno` と、`--out` に残った名前の一覧）を構造化ログに出し、段 `cleanup_failed` で
    終了コード 1 にする（§2.4 の表）。`suppress(OSError)` で黙って捨てない（AGENTS.md「例外を握りつぶさない」）
+
+**path の照合（`training_output.py` の関数。仮に `path_names_directory(path, fd)`）。** `--out` の**絶対 path を根から1要素ずつ
+解き直す**: `/` から各要素を `os.lstat`（symlink に従わない）で調べ、途中の要素が symlink なら不一致とし、ディレクトリなら次へ
+進む。最後の要素の `(st_dev, st_ino)` が、固定した fd の `fstat` と一致するときだけ一致とする（path が無い・symlink を含む・
+別のものを指す、はすべて不一致）。親の fd や祖先の fd を使わないので、開いた後に祖先や親の名前が付け替えられても、いまの path が
+指すものと比べられる。
+
+- **選んだ方式と理由。** 「祖先をすべて、所有者と権限で確かめる」案もあるが採らない。`/tmp` のような sticky で world が書ける
+  祖先の下の普通の置き場所まで拒むことになり、どこまでの祖先を信じるか（root の所有なら可、など）の規則も別に要る。path を
+  根から解き直して inode を比べるほうが単純で、置き場所を狭めずに「要求した path がいま書き手の出力を指しているか」を
+  直接確かめられる。照合と次の操作（link・登録）の間の窓は残るが、その窓で付け替えられても、書き手が書くのは fd の先だけで、
+  手順 6 の後と登録の直前の照合のどちらかが外れを見つける（どちらも外れなければ、登録した bytes は path の先の印が確かめた
+  bytes と同じ）
+- この関数は `training_output.py` に置き、`train.py`（手順 5・手順 6 の後・`--apply` の登録の直前・手順 7 の rmdir の前）と
+  `coldaisle-registry register --training-output`（`--out` を開いて印を確かめた後、`register_candidate` を呼ぶ直前）の両方が
+  同じ関数を使う。違えば `register` も終了コード 1 で Registry を開かない
 
 **読む側は、有効な `COMPLETE.json` の無い `--out` を未完成として拒む。** 有効とは、`COMPLETE.json`（一時名ではない）が
 JSON として読めて、書かれた3つのファイルの大きさと SHA-256 が実物と一致することである。link で公開するので `COMPLETE.json` が
@@ -203,7 +222,7 @@ JSON として読めて、書かれた3つのファイルの大きさと SHA-256
 差し替えもこれで拒める）。確かめる関数は印に書かれた3つのファイルと `COMPLETE.json` だけを読み、他の名前は見ない。
 
 - `--apply` の登録は手順 6 が成功した後に、メモリ上の同じ bytes で行う（印を読み直さない）。**登録の直前にも**、`--out` の名前が
-  手順 2 で開いたディレクトリ（同じ `(st_dev, st_ino)`）を指していることを確かめ、違えば登録せずに段 `out_replaced` で
+  手順 2 で開いたディレクトリを指していることを path の照合で確かめ、違えば登録せずに段 `out_replaced` で
   終了コード 1。要求した `--out` が別のものを指しているのに candidate を登録することを防ぐ
 - 手動の登録と回復は **`coldaisle-registry register --training-output <--out>`** で行う（`--metadata` / `--payload` と
   排他）。`register` は下記の確かめる関数で印を確かめ、**確かめたときに読んだ bytes そのもの**（`artifact.json` と
@@ -212,7 +231,7 @@ JSON として読めて、書かれた3つのファイルの大きさと SHA-256
   変えない。印を確かめずに `--metadata` / `--payload` で渡しても、`register_candidate` は payload の SHA-256 を metadata と
   照合し、metadata は strict JSON として読むので、書きかけのファイルが黙って candidate になることは無い
 - **確かめる関数の置き場所は、レイヤ横断の小さなモジュール `src/coldaisle/training_output.py`**（仮の名前）とする。
-  印の形（`COMPLETE.json` の pydantic の型）・書く側の公開の手順（§2.5 の手順 2〜7）・読む側の確かめる関数
+  印の形（`COMPLETE.json` の pydantic の型）・書く側の公開の手順（§2.5 の手順 2〜7）・path の照合の関数・読む側の確かめる関数
   （`O_DIRECTORY | O_NOFOLLOW` で開き、`dir_fd` で各ファイルを上限つきで読み、大きさと SHA-256 を照合して bytes を返す）を
   1か所に持つ。import するのは `train.py` と `registry.py`（どちらも合成の起点）だけで、標準ライブラリと pydantic の外の
   coldaisle の module を import しない。根拠:
@@ -339,6 +358,10 @@ bytes が前と同じで、`artifacts/` の下にファイルが増えていな�
   使わないこと（差し替えて呼ばれないことを確かめる）
 - 親の検査（`_open_output_root` の使い回し）: `--out` の親が group / world に書ける・他の uid の所有・path に symlink がある・
   `..` を含むとき、学習の前に終了コード 1 で拒否し、`--out` が作られないこと
+- path の照合: `--out` の名前だけでなく、**親や祖先の名前を付け替えて**同じ path に別のディレクトリを置いたとき・path の途中を
+  symlink に差し替えたときも不一致になること（親の fd を使った照合では見逃す形を試す）。`/tmp` の下（sticky・world が書ける
+  祖先）の `--out` を拒まないこと。`coldaisle-registry register --training-output` でも、印を確かめた後・登録の前に親の名前を
+  付け替えると終了コード 1 で Registry が変わらないこと
 - 名前の差し替え: 手順 2 の後・手順 5 の link の前に `--out` の名前を付け替えて別のディレクトリを置くと、link をせず段
   `out_replaced`・終了コード 1 で、置かれた別のディレクトリに何も書かず消さないこと。手順 6 の後・登録の前に同じことをすると、
   段 `out_replaced`・終了コード 1 で Registry が変わらず、成功を報告しないこと
