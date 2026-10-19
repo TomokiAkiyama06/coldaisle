@@ -274,6 +274,29 @@ def _check_ancestor(fd: int, child: os.stat_result | None, shown: str) -> None:
         )
 
 
+def _check_output_directory(fd: int, shown: str) -> None:
+    directory = os.fstat(fd)
+    if directory.st_uid not in (0, os.geteuid()) or directory.st_mode & (
+        stat.S_IWGRP | stat.S_IWOTH
+    ):
+        raise UntrustedPathError(
+            f"--out が実行した uid（か root）の所有でない、または他人が書ける: {shown}",
+            path=shown,
+            detail={
+                "reason": "output_directory_not_private",
+                "owner_uid": directory.st_uid,
+                "mode": oct(stat.S_IMODE(directory.st_mode)),
+            },
+        )
+    acl = _acl_names(fd)
+    if acl:
+        raise UntrustedPathError(
+            f"--out が POSIX ACL を持つ: {shown}",
+            path=shown,
+            detail={"reason": "posix_acl", "xattrs": list(acl)},
+        )
+
+
 def _symlink_error(name: str, parent_fd: int, shown: str) -> UntrustedPathError:
     try:
         target: str | None = os.readlink(name, dir_fd=parent_fd)
@@ -321,7 +344,11 @@ def _walk(path: Path, *, through_last: bool, symlink_is_untrusted: bool) -> int:
             os.close(current)
             current = child
             shown = child_path
-        if not through_last:
+        if through_last:
+            # --out そのもの: 規則 (a) と ACL（sticky の規則 (b) は使わない。中のファイルを
+            # 他の uid が差し替えられないこと。PR #359 の Codex P2）
+            _check_output_directory(current, str(shown))
+        else:
             # 親そのもの（次の要素はまだ無い。規則 (b) の次の要素の検査は以後の照合で行う）
             _check_ancestor(current, None, str(shown))
         return current

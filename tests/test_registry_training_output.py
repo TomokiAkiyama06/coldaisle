@@ -478,3 +478,22 @@ def test_an_os_error_in_the_path_check_after_register_is_reported(
     [error] = registry_errors(capsys)
     assert error["stages"] == ["out_replaced_after_register"]
     assert error["artifact"] == "thermal_model/rack-thermal/0.1.0"
+
+
+@pytest.mark.parametrize("damage", ["group_writable", "acl"])
+def test_an_output_directory_others_can_write_is_refused(
+    world: World, out: Path, monkeypatch: pytest.MonkeyPatch, damage: str
+) -> None:
+    """--out そのものも信頼の検査に通す（PR #359 の Codex P2）。"""
+    if damage == "group_writable":
+        out.chmod(0o770)
+    else:
+        key = (out.stat().st_dev, out.stat().st_ino)
+
+        def listxattr(fd: int) -> list[str]:
+            result = os.fstat(fd)
+            return ["system.posix_acl_access"] if (result.st_dev, result.st_ino) == key else []
+
+        monkeypatch.setattr(os, "listxattr", listxattr, raising=False)
+    assert register(world, "--training-output", str(out)) == 1
+    assert not world.registry.exists()
