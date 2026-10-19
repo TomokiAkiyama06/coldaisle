@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import ast
 import os
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -168,8 +170,26 @@ def environment(**overrides: object) -> digest.RuntimeEnvironment:
             digest.InstalledDistribution(name="numpy", version="2.0.0", record=b"numpy/a.so,x,1\n"),
             digest.InstalledDistribution(name="pydantic", version="2.9.0", record=b"p,y,2\n"),
         ),
+        "interpreter_flags": (("flags.isolated", "1"), ("flags.safe_path", "True")),
+        "executable": "/opt/example/.venv/bin/python",
+        "executable_sha256": "a" * SHA256_HEX,
+        "sys_path": (SYS_PATH_STDLIB, SYS_PATH_SITE),
     }
     return digest.RuntimeEnvironment(**(values | overrides))  # type: ignore[arg-type]
+
+
+SYS_PATH_STDLIB = digest.SysPathEntry(
+    0, "/opt/example/lib", "/opt/example/lib", digest.SysPathKind.DIRECTORY, "b" * SHA256_HEX
+)
+SYS_PATH_SITE = digest.SysPathEntry(
+    1, "/opt/example/site", "/opt/example/site", digest.SysPathKind.DIRECTORY, "c" * SHA256_HEX
+)
+
+
+def _with_position(entry: digest.SysPathEntry, position: int) -> digest.SysPathEntry:
+    return digest.SysPathEntry(
+        position, entry.path, entry.real_path, entry.kind, entry.content_sha256
+    )
 
 
 def test_the_environment_digest_does_not_depend_on_the_listing_order() -> None:
@@ -230,6 +250,94 @@ def test_a_distribution_name_is_normalised_before_ordering() -> None:
                 )
             },
             id="distribution-removed",
+        ),
+        pytest.param({"interpreter_flags": (("flags.isolated", "0"),)}, id="flags"),
+        pytest.param(
+            {
+                "interpreter_flags": (
+                    ("flags.isolated", "1"),
+                    ("flags.safe_path", "True"),
+                    ("xoptions.dev", "True"),
+                )
+            },
+            id="xoptions",
+        ),
+        pytest.param({"executable": "/opt/other/.venv/bin/python"}, id="executable-path"),
+        pytest.param({"executable_sha256": "d" * SHA256_HEX}, id="executable-content"),
+        pytest.param(
+            {"sys_path": (_with_position(SYS_PATH_SITE, 0), _with_position(SYS_PATH_STDLIB, 1))},
+            id="sys-path-order",
+        ),
+        pytest.param({"sys_path": (SYS_PATH_STDLIB,)}, id="sys-path-removed"),
+        pytest.param(
+            {
+                "sys_path": (
+                    SYS_PATH_STDLIB,
+                    SYS_PATH_SITE,
+                    digest.SysPathEntry(2, "/opt/src", "/opt/src", digest.SysPathKind.MISSING, ""),
+                )
+            },
+            id="sys-path-missing-entry-added",
+        ),
+        pytest.param(
+            {
+                "sys_path": (
+                    SYS_PATH_STDLIB,
+                    digest.SysPathEntry(
+                        1,
+                        "/opt/example/link",
+                        "/opt/example/site",
+                        SYS_PATH_SITE.kind,
+                        "c" * SHA256_HEX,
+                    ),
+                )
+            },
+            id="sys-path-path",
+        ),
+        pytest.param(
+            {
+                "sys_path": (
+                    SYS_PATH_STDLIB,
+                    digest.SysPathEntry(
+                        1,
+                        "/opt/example/site",
+                        "/opt/elsewhere",
+                        SYS_PATH_SITE.kind,
+                        "c" * SHA256_HEX,
+                    ),
+                )
+            },
+            id="sys-path-realpath",
+        ),
+        pytest.param(
+            {
+                "sys_path": (
+                    SYS_PATH_STDLIB,
+                    digest.SysPathEntry(
+                        1,
+                        "/opt/example/site",
+                        "/opt/example/site",
+                        digest.SysPathKind.FILE,
+                        "c" * SHA256_HEX,
+                    ),
+                )
+            },
+            id="sys-path-kind",
+        ),
+        pytest.param(
+            {
+                "sys_path": (
+                    SYS_PATH_STDLIB,
+                    digest.SysPathEntry(
+                        1,
+                        "/opt/example/site",
+                        "/opt/example/site",
+                        SYS_PATH_SITE.kind,
+                        "e" * SHA256_HEX,
+                    ),
+                )
+            },
+            id="sys-path-content",
         ),
     ],
 )
@@ -306,12 +414,13 @@ def test_the_current_environment_follows_the_sys_path_order(
             if item.name.startswith("shared-pkg")
         }
 
-    # 配布物を持たない項目は順位を取らない。
+    # 配布物を持たない項目は順位を取らない。ただし項目の位置は sys_path が束ねる（0157 §2.2）。
     monkeypatch.setattr("sys.path", [str(empty), str(early), str(late)])
     forward = digest.environment_sha256()
     assert ranks() == {"2.0.0": 0, "1.0.0": 1}
     monkeypatch.setattr("sys.path", [str(early), str(empty), str(late)])
-    assert digest.environment_sha256() == forward
+    assert ranks() == {"2.0.0": 0, "1.0.0": 1}
+    assert digest.environment_sha256() != forward
     monkeypatch.setattr("sys.path", [str(late), str(early)])
     assert ranks() == {"1.0.0": 0, "2.0.0": 1}
     assert digest.environment_sha256() != forward
@@ -365,10 +474,311 @@ def test_a_sourceless_module_listed_by_two_distributions_is_an_overlap(
         digest.current_environment()
 
 
-def test_the_current_environment_is_fingerprinted() -> None:
-    current = digest.current_environment()
-    assert current.distributions
-    assert digest.environment_sha256() == digest.environment_sha256(current)
+def test_the_current_environment_is_fingerprinted(tmp_path: Path) -> None:
+    site = tmp_path / "site"
+    _fake_distribution(site, "shared-pkg", "1.0.0")
+    current = digest.current_environment([str(site), str(tmp_path / "absent")])
+    assert [item.name for item in current.distributions] == ["shared-pkg"]
+    assert [item.kind for item in current.sys_path] == [
+        digest.SysPathKind.DIRECTORY,
+        digest.SysPathKind.MISSING,
+    ]
+    assert ("flags.isolated", repr(sys.flags.isolated)) in current.interpreter_flags
+    assert current.executable == sys.executable
+    assert len(current.executable_sha256) == SHA256_HEX
+    assert len(digest.environment_sha256(current)) == SHA256_HEX
+
+
+def test_the_executable_digest_is_of_the_real_interpreter(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """interpreter の差し替えを見分ける（0157 §2.2）。symlink の先の bytes を束ねる。"""
+    real = tmp_path / "python3.12"
+    real.write_bytes(b"interpreter-1")
+    link = tmp_path / "python"
+    os.symlink(real, link)
+    monkeypatch.setattr("sys.executable", str(link))
+    first = digest.current_environment([])
+    assert first.executable == str(link)
+    real.write_bytes(b"interpreter-2")
+    second = digest.current_environment([])
+    assert first.executable_sha256 != second.executable_sha256
+    assert digest.environment_sha256(first) != digest.environment_sha256(second)
+
+
+def test_moving_an_entry_without_distributions_changes_the_digest(tmp_path: Path) -> None:
+    """配布物を持たない項目（ソースのチェックアウトなど）を site-packages の前後に動かすと、
+    import されるコードが変わりうる（PR #349 の残りの P1 / 0157 §1.1）。"""
+    checkout = tree(tmp_path / "checkout", {"shared_pkg/__init__.py": b"x = 'checkout'\n"})
+    site = tmp_path / "site"
+    _fake_distribution(site, "shared-pkg", "1.0.0")
+    write(site, "shared_pkg/__init__.py", b"x = 'site'\n")
+    before = digest.current_environment([str(checkout), str(site)])
+    after = digest.current_environment([str(site), str(checkout)])
+    assert [item.path_rank for item in before.distributions] == [0]
+    assert [item.path_rank for item in after.distributions] == [0]
+    assert digest.environment_sha256(before) != digest.environment_sha256(after)
+
+
+def test_a_file_outside_the_record_changes_the_digest(tmp_path: Path) -> None:
+    """``RECORD`` に載らない ``.pth`` と、``RECORD`` を変えない書き換えも入る（0157 §5 の 2）。"""
+    site = tmp_path / "site"
+    _fake_distribution(site, "shared-pkg", "1.0.0")
+    write(site, "shared_pkg/__init__.py", b"x = 1\n")
+    base = digest.environment_sha256(digest.current_environment([str(site)]))
+    write(site, "_extra.pth", b"import os\n")
+    with_pth = digest.environment_sha256(digest.current_environment([str(site)]))
+    assert with_pth != base
+    (site / "_extra.pth").unlink()
+    assert digest.environment_sha256(digest.current_environment([str(site)])) == base
+    write(site, "shared_pkg/__init__.py", b"x = 2\n")
+    assert digest.environment_sha256(digest.current_environment([str(site)])) != base
+
+
+# ---------------------------------------------------------------- sys.path の項目
+
+
+def entry_digest(path: Path) -> str:
+    return digest.sys_path_entry(0, str(path)).content_sha256
+
+
+def test_a_directory_entry_is_the_digest_of_its_tree(tmp_path: Path) -> None:
+    first = tree(tmp_path / "a", {"m.py": b"x = 1\n", "pkg/n.py": b"y = 2\n"})
+    second = tree(tmp_path / "b", {"pkg/n.py": b"y = 2\n", "m.py": b"x = 1\n"})
+    item = digest.sys_path_entry(3, str(first))
+    assert item.position == 3
+    assert item.kind is digest.SysPathKind.DIRECTORY
+    assert item.path == str(first)
+    assert item.real_path == str(first)
+    assert len(item.content_sha256) == SHA256_HEX
+    assert entry_digest(first) == entry_digest(second)
+    write(second, "pkg/n.py", b"y = 3\n")
+    assert entry_digest(first) != entry_digest(second)
+
+
+def test_the_tree_skips_pycache_but_keeps_a_sourceless_module(tmp_path: Path) -> None:
+    root = tree(tmp_path / "a", {"m.py": b"x = 1\n"})
+    base = entry_digest(root)
+    write(root, "__pycache__/m.cpython-312.pyc", b"cache")
+    assert entry_digest(root) == base
+    write(root, "sourceless.pyc", b"code")
+    assert entry_digest(root) != base
+
+
+def test_a_file_entry_and_a_missing_entry(tmp_path: Path) -> None:
+    archive = tmp_path / "python312.zip"
+    archive.write_bytes(b"zip-1")
+    item = digest.sys_path_entry(0, str(archive))
+    assert item.kind is digest.SysPathKind.FILE
+    archive.write_bytes(b"zip-2")
+    assert digest.sys_path_entry(0, str(archive)).content_sha256 != item.content_sha256
+    missing = digest.sys_path_entry(1, str(tmp_path / "absent.zip"))
+    assert missing.kind is digest.SysPathKind.MISSING
+    assert missing.content_sha256 == ""
+
+
+def test_a_relative_entry_is_made_absolute(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.chdir(tmp_path)
+    assert digest.sys_path_entry(0, "").path == str(tmp_path)
+
+
+def test_an_entry_that_is_a_symlink_binds_both_paths(tmp_path: Path) -> None:
+    real = tree(tmp_path / "real", {"m.py": b"x = 1\n"})
+    link = tmp_path / "link"
+    os.symlink(real, link, target_is_directory=True)
+    item = digest.sys_path_entry(0, str(link))
+    assert item.path == str(link)
+    assert item.real_path == str(real)
+    assert item.content_sha256 == entry_digest(real)
+
+
+def test_a_symlink_to_a_file_binds_the_link_and_the_target(tmp_path: Path) -> None:
+    """配布の symlink（Ubuntu の標準ライブラリなど）を拒まず、決まった形で符号化する。0157 §2.2。"""
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "real.py").write_bytes(b"x = 1\n")
+    (outside / "other.py").write_bytes(b"x = 1\n")
+    root = tree(tmp_path / "a", {"m.py": b""})
+    os.symlink(outside / "real.py", root / "linked.py")
+    base = entry_digest(root)
+    (outside / "real.py").write_bytes(b"x = 2\n")
+    changed_target = entry_digest(root)
+    assert changed_target != base
+    (outside / "real.py").write_bytes(b"x = 1\n")
+    assert entry_digest(root) == base
+    # 先の中身が同じでも、リンクの文字列が違えば別の値。
+    (root / "linked.py").unlink()
+    os.symlink(outside / "other.py", root / "linked.py")
+    assert entry_digest(root) != base
+    # 同じ中身の通常のファイルとも区別する。
+    (root / "linked.py").unlink()
+    (root / "linked.py").write_bytes(b"x = 1\n")
+    assert entry_digest(root) != base
+
+
+def test_a_broken_symlink_is_encoded_not_refused(tmp_path: Path) -> None:
+    root = tree(tmp_path / "a", {"m.py": b""})
+    base = entry_digest(root)
+    os.symlink(tmp_path / "nowhere", root / "dangling.py")
+    broken = entry_digest(root)
+    assert broken != base
+    (root / "dangling.py").unlink()
+    os.symlink(tmp_path / "elsewhere", root / "dangling.py")
+    assert entry_digest(root) != broken
+
+
+def test_a_symlink_to_a_directory_binds_its_tree(tmp_path: Path) -> None:
+    outside = tree(tmp_path / "outside", {"n.py": b"y = 1\n", "inner.py": b""})
+    root = tree(tmp_path / "a", {"m.py": b""})
+    os.symlink(outside, root / "linked", target_is_directory=True)
+    base = entry_digest(root)
+    write(outside, "n.py", b"y = 2\n")
+    assert entry_digest(root) != base
+    # 辿った先の木の中の symlink のファイルは符号化する。
+    os.symlink(outside / "n.py", outside / "alias.py")
+    assert len(entry_digest(root)) == SHA256_HEX
+
+
+def test_a_directory_symlink_inside_a_followed_tree_is_refused(tmp_path: Path) -> None:
+    """循環と辿る深さの規則を作らない（fail closed。0157 §2.2）。"""
+    deeper = tree(tmp_path / "deeper", {"z.py": b""})
+    outside = tree(tmp_path / "outside", {"n.py": b""})
+    os.symlink(deeper, outside / "nested", target_is_directory=True)
+    root = tree(tmp_path / "a", {"m.py": b""})
+    os.symlink(outside, root / "linked", target_is_directory=True)
+    with pytest.raises(ValueError, match="symlink"):
+        entry_digest(root)
+
+
+def test_a_self_referencing_symlink_is_an_error(tmp_path: Path) -> None:
+    root = tree(tmp_path / "a", {"m.py": b""})
+    os.symlink(root / "loop", root / "loop")
+    with pytest.raises(OSError):
+        entry_digest(root)
+
+
+def test_a_special_file_in_an_entry_is_refused(tmp_path: Path) -> None:
+    root = tree(tmp_path / "a", {"m.py": b""})
+    os.mkfifo(root / "pipe")
+    with pytest.raises(ValueError, match="通常のファイル"):
+        entry_digest(root)
+
+
+def test_an_unreadable_directory_in_an_entry_is_an_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tree(tmp_path / "a", {"m.py": b"", "sub/n.py": b""})
+    real_scandir = os.scandir
+
+    def scandir(path):  # type: ignore[no-untyped-def]
+        if Path(path) == root / "sub":
+            raise PermissionError("listing denied")
+        return real_scandir(path)
+
+    monkeypatch.setattr(os, "scandir", scandir)
+    with pytest.raises(PermissionError):
+        entry_digest(root)
+
+
+def test_the_sys_path_positions_must_be_contiguous() -> None:
+    with pytest.raises(ValueError, match="位置"):
+        digest.environment_sha256(environment(sys_path=(_with_position(SYS_PATH_SITE, 1),)))
+    with pytest.raises(ValueError, match="中身の digest"):
+        digest.environment_sha256(
+            environment(
+                sys_path=(digest.SysPathEntry(0, "/x", "/x", digest.SysPathKind.MISSING, "a" * 64),)
+            )
+        )
+
+
+# ---------------------------------------------------------------- launch_form
+
+ENTRY = "coldaisle.control_daemon"
+EXECUTABLE = "/opt/example/.venv/bin/python"
+
+
+def form(**overrides: object) -> digest.LaunchForm:
+    values: dict[str, object] = {
+        "isolated": True,
+        "safe_path": True,
+        "main_spec_name": ENTRY,
+        "orig_argv": (EXECUTABLE, "-I", "-m", ENTRY, "--backend", "hwmon"),
+        "executable": EXECUTABLE,
+    }
+    return digest.launch_form(ENTRY, **(values | overrides))  # type: ignore[arg-type]
+
+
+def test_the_isolated_module_form() -> None:
+    assert form() is digest.LaunchForm.ISOLATED_MODULE
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        pytest.param({"isolated": False}, id="not-isolated"),
+        pytest.param({"safe_path": False}, id="not-safe-path"),
+        pytest.param({"main_spec_name": None}, id="console-script"),
+        pytest.param({"main_spec_name": "coldaisle.learned_worker.cli"}, id="other-entry"),
+        pytest.param({"orig_argv": (EXECUTABLE, "-I", "-X", "dev", "-m", ENTRY)}, id="extra-flag"),
+        pytest.param({"orig_argv": (EXECUTABLE, "-Im", ENTRY)}, id="combined-flags"),
+        pytest.param(
+            {"orig_argv": (EXECUTABLE, "-I", "-m", "profiler", ENTRY)}, id="wrapper-module"
+        ),
+        pytest.param({"orig_argv": ("python", "-I", "-m", ENTRY)}, id="other-argv0"),
+        pytest.param({"executable": ""}, id="no-executable"),
+    ],
+)
+def test_any_other_form_is_other(overrides: dict[str, object]) -> None:
+    assert form(**overrides) is digest.LaunchForm.OTHER
+
+
+def test_an_empty_entry_module_is_an_error() -> None:
+    with pytest.raises(ValueError):
+        digest.launch_form(
+            "",
+            isolated=True,
+            safe_path=True,
+            main_spec_name="",
+            orig_argv=(EXECUTABLE, "-I", "-m", ""),
+            executable=EXECUTABLE,
+        )
+
+
+def _launch_forms(*interpreter_args: str) -> list[str]:
+    # 入口の module を ``-m`` で起動する実プロセスで判定する（0157 §2.4 の1つの試験）。
+    # ``-I`` では tests/ が sys.path に入らないので、標準ライブラリの timeit を入口に見立て、
+    # その setup から判定を呼ぶ（timeit 自身が ``__main__`` の spec を持つ）。
+    setup = (
+        "from coldaisle.hint_certificate_digest import current_launch_form as f; "
+        "print(f('timeit').value, f('coldaisle.control_daemon').value)"
+    )
+    completed = subprocess.run(
+        [
+            sys.executable,
+            *interpreter_args,
+            "-m",
+            "timeit",
+            "-n",
+            "1",
+            "-r",
+            "1",
+            "-s",
+            setup,
+            "pass",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return completed.stdout.splitlines()[0].split()
+
+
+def test_the_launch_form_of_a_real_isolated_module_process() -> None:
+    assert _launch_forms("-I") == ["isolated_module", "other"]
+
+
+def test_a_process_without_isolation_is_other() -> None:
+    assert _launch_forms() == ["other", "other"]
 
 
 # ---------------------------------------------------------------- calibration

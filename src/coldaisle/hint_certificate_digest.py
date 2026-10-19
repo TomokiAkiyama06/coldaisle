@@ -9,9 +9,14 @@ Learned MPC worker が同じ関数を呼ぶ（0152 §2.3。``calibration_offsets
 
 - ``source_tree``: 実際に import された ``coldaisle`` パッケージのディレクトリ
 - ``lockfile``: ロックファイルの bytes
-- ``environment``: 処理系・プラットフォーム・入った配布物の指紋
+- ``environment``: 処理系・プラットフォーム・入った配布物・interpreter のフラグと実体・
+  ``sys.path`` の全項目（位置・path・中身）の指紋（0157 §2.2）
 - ``calibration``: ``RuntimeCalibration`` の2状態（``available`` の実効の offset /
   ``unavailable`` の閉じた code）
+
+起動の形の判定 :func:`launch_form`（``isolated_module`` / ``other``。0157 §2.3）もここに置く。
+``other`` のプロセスは ``environment`` を計算せず、照合を ``environment_mismatch`` に倒す
+（呼び出し側の fand・worker・認証ランナーは後の段で足す）。
 
 ``hint_policy`` / ``hint_gate`` / ``optimizer`` / ``conditions`` と ``certificate_sha256`` は、
 ゲートの仕様（格子の定義と ``eps`` の設定）と合わせて後の段で足す。
@@ -34,8 +39,9 @@ import re
 import stat
 import sys
 import sysconfig
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
+from enum import StrEnum
 from pathlib import Path
 
 from coldaisle.calibration_offsets import effective_metric_offsets, offsets_sha256
@@ -45,7 +51,14 @@ _LENGTH_BYTES = 8
 _EXCLUDED_DIRECTORY = "__pycache__"
 _EXCLUDED_SUFFIX = ".pyc"
 _SOURCE_TREE_TAG = b"coldaisle-hint-source-tree-v1"
-_ENVIRONMENT_TAG = b"coldaisle-hint-environment-v1"
+_ENVIRONMENT_TAG = b"coldaisle-hint-environment-v2"
+"""v2 で 0157 §2.2 の ``interpreter_flags`` / ``executable`` / ``sys_path`` を足した。"""
+_SYS_PATH_TREE_TAG = b"coldaisle-hint-sys-path-tree-v1"
+_TREE_FILE = b"file"
+_TREE_LINK = b"link"
+_LINK_TO_FILE = b"to-file"
+_LINK_TO_DIRECTORY = b"to-directory"
+_LINK_BROKEN = b"broken"
 _CALIBRATION_TAG = b"coldaisle-hint-calibration-v1"
 _CALIBRATION_AVAILABLE = b"available"
 _CALIBRATION_UNAVAILABLE = b"unavailable"
@@ -149,6 +162,21 @@ def lockfile_sha256(path: Path) -> str:
 # ---------------------------------------------------------------- environment
 
 
+class LaunchForm(StrEnum):
+    """起動の形の閉じた語彙（0157 §2.3）。``other`` のプロセスは指紋を計算しない。"""
+
+    ISOLATED_MODULE = "isolated_module"
+    OTHER = "other"
+
+
+class SysPathKind(StrEnum):
+    """``sys.path`` の項目の種類（0157 §2.2）。"""
+
+    DIRECTORY = "directory"
+    FILE = "file"
+    MISSING = "missing"
+
+
 @dataclass(frozen=True, slots=True)
 class InstalledDistribution:
     """入った配布物の1件。``record`` は ``RECORD`` の bytes（RECORD の無い配布物は指紋を作らない）。
@@ -157,7 +185,8 @@ class InstalledDistribution:
     前から 0, 1, … と数えた値）。Python は ``sys.path`` の前の項目から import するので、同じ
     import 名を持つ配布物（同じ名前の2つ・名前の違う2つのどちらも）の項目の順を入れ替えると、
     実行時のコードが変わる。順位を指紋に入れ、項目の順の入れ替えを必ず検出する（PR #349 の P1）。
-    項目の path そのものは入れない（同じホストでも起動の仕方で ``sys.path[0]`` が変わるため）。
+    配布物の名前・版・``RECORD`` は、照合の理由で何が変わったかを名指すために残す（0157 §2.2）。
+    項目の位置・path・中身は :class:`SysPathEntry` が別に束ねる。
     """
 
     name: str
@@ -167,14 +196,40 @@ class InstalledDistribution:
 
 
 @dataclass(frozen=True, slots=True)
+class SysPathEntry:
+    """``sys.path`` の1項目（0157 §2.2）。
+
+    ``path`` は項目の絶対 path、``real_path`` はその ``realpath``（項目そのものが symlink のときに
+    両方を束ねる）。中身は ``real_path`` の先で読む。``content_sha256`` はディレクトリなら木の
+    digest、ファイルなら bytes の SHA-256、無い項目なら空。path は指紋の**入力**にだけ使い、
+    証明書・trace・ログには digest しか出さない（ルール 10）。
+    """
+
+    position: int
+    path: str
+    real_path: str
+    kind: SysPathKind
+    content_sha256: str
+
+
+@dataclass(frozen=True, slots=True)
 class RuntimeEnvironment:
-    """``environment`` の指紋の入力（0066 §2.1 (c) / 0152 §2.3）。"""
+    """``environment`` の指紋の入力（0066 §2.1 (c) / 0152 §2.3 / 0157 §2.2）。
+
+    ``interpreter_flags`` は ``sys.flags`` の全欄（``flags.<名前>``）と ``sys._xoptions``
+    （``xoptions.<名前>``）の組。``executable`` は ``sys.executable`` の path、
+    ``executable_sha256`` はその実体（``realpath``）の bytes の SHA-256。
+    """
 
     implementation: str
     implementation_version: str
     platform: str
     machine: str
     distributions: tuple[InstalledDistribution, ...]
+    interpreter_flags: tuple[tuple[str, str], ...]
+    executable: str
+    executable_sha256: str
+    sys_path: tuple[SysPathEntry, ...]
 
 
 def _canonical_distribution_name(name: str) -> str:
@@ -182,13 +237,164 @@ def _canonical_distribution_name(name: str) -> str:
     return _DISTRIBUTION_NAME_SEPARATORS.sub("-", name).lower()
 
 
-def current_environment() -> RuntimeEnvironment:
-    """いま動いている処理系と、その ``sys.path`` から見える配布物を集める。"""
+def launch_form(
+    entry_module: str,
+    *,
+    isolated: bool,
+    safe_path: bool,
+    main_spec_name: str | None,
+    orig_argv: Sequence[str],
+    executable: str,
+) -> LaunchForm:
+    """起動の形を判定する（0157 §2.3）。次の**すべて**を満たすときだけ ``isolated_module``。
+
+    1. ``isolated`` と ``safe_path`` が真（``-I``）
+    2. ``__main__.__spec__.name`` が ``entry_module``（そのプロセスの入口の module）と一致する
+    3. ``orig_argv`` が ``[executable, "-I", "-m", entry_module, ...]`` の形で、``-m`` の前に
+       ``-I`` 以外の interpreter の引数が無い（``-m`` で起動した別の module から入口を呼ぶ形を
+       数えない）
+
+    どれか1つでも外れれば ``other``。``entry_module`` は呼び出し側のコードが定数で持つ（設定から
+    読まない）。
+    """
+    if not entry_module:
+        raise ValueError("入口の module を空にしない")
+    if not (isolated and safe_path):
+        return LaunchForm.OTHER
+    if main_spec_name != entry_module:
+        return LaunchForm.OTHER
+    if not executable or list(orig_argv[:4]) != [executable, "-I", "-m", entry_module]:
+        return LaunchForm.OTHER
+    return LaunchForm.ISOLATED_MODULE
+
+
+def current_launch_form(entry_module: str) -> LaunchForm:
+    """いま動いているプロセスの起動の形（:func:`launch_form` に実際の値を渡す）。"""
+    main = sys.modules.get("__main__")
+    spec = getattr(main, "__spec__", None)
+    name = getattr(spec, "name", None)
+    return launch_form(
+        entry_module,
+        isolated=bool(sys.flags.isolated),
+        safe_path=bool(sys.flags.safe_path),
+        main_spec_name=name if isinstance(name, str) else None,
+        orig_argv=tuple(sys.orig_argv),
+        executable=sys.executable,
+    )
+
+
+def _interpreter_flags() -> tuple[tuple[str, str], ...]:
+    # sys.flags の全欄を名前つきで（__match_args__ は名前のある欄の全部）。
+    # 値は repr で型ごと束ねる。
+    items = [
+        (f"flags.{name}", repr(getattr(sys.flags, name))) for name in type(sys.flags).__match_args__
+    ]
+    items.extend((f"xoptions.{key}", repr(value)) for key, value in sys._xoptions.items())
+    return tuple(sorted(items))
+
+
+def _file_sha256(path: str) -> str:
+    with open(path, "rb") as handle:
+        return hashlib.file_digest(handle, "sha256").hexdigest()
+
+
+def _tree_records(
+    root: str, relative: str, records: list[tuple[bytes, list[bytes]]], follow_directory_links: bool
+) -> None:
+    # os.scandir は読めないディレクトリで例外を投げる。そのまま返す（束ねる範囲から漏らさない）。
+    with os.scandir(os.path.join(root, relative) if relative else root) as listing:
+        children = list(listing)
+    for child in children:
+        name = child.name
+        rel = f"{relative}/{name}" if relative else name
+        rel_bytes = os.fsencode(rel)
+        mode = os.lstat(child.path).st_mode
+        if stat.S_ISDIR(mode):
+            if name == _EXCLUDED_DIRECTORY:
+                continue
+            _tree_records(root, rel, records, follow_directory_links)
+        elif stat.S_ISREG(mode):
+            records.append((rel_bytes, [_TREE_FILE, rel_bytes, _file_sha256(child.path).encode()]))
+        elif stat.S_ISLNK(mode):
+            records.append((rel_bytes, _link_parts(child.path, rel_bytes, follow_directory_links)))
+        else:
+            raise ValueError(f"sys.path の項目に通常のファイルでないものがある: {rel}")
+
+
+def _link_parts(path: str, rel_bytes: bytes, follow_directory_links: bool) -> list[bytes]:
+    """木の中の symlink を「印・相対パス・リンクの文字列・先の状態」で符号化する（0157 §2.2）。"""
+    parts = [_TREE_LINK, rel_bytes, os.fsencode(os.readlink(path))]
+    try:
+        target = os.stat(path)
+    except (FileNotFoundError, NotADirectoryError):
+        # 壊れたリンクは import されない。中身は無いが、リンクの文字列は束ねる。
+        return [*parts, _LINK_BROKEN]
+    if stat.S_ISREG(target.st_mode):
+        # 先が項目の外でも中身を束ねる（import されうるのは先の中身）。
+        return [*parts, _LINK_TO_FILE, _file_sha256(path).encode()]
+    if stat.S_ISDIR(target.st_mode):
+        if not follow_directory_links:
+            # 辿った先の木の中の symlink のディレクトリは辿らない。循環と深さの規則を作らない。
+            raise ValueError("辿った symlink の先にさらに symlink のディレクトリがある")
+        return [
+            *parts,
+            _LINK_TO_DIRECTORY,
+            _tree_sha256(path, follow_directory_links=False).encode(),
+        ]
+    raise ValueError("symlink の先が通常のファイルでもディレクトリでもない")
+
+
+def _tree_sha256(root: str, *, follow_directory_links: bool) -> str:
+    """``sys.path`` の項目のディレクトリの木の digest（0157 §2.2）。
+
+    ``source_tree`` と同じ規律（相対パスの bytes の昇順・長さ付き・``__pycache__`` のディレクトリを
+    除く）で、ファイルは中身の SHA-256 を束ねる（site-packages を丸ごと連結して持たない）。
+    ``__pycache__`` の外の ``*.pyc`` は、ソースの無い module として import されうるので除かない。
+    """
+    records: list[tuple[bytes, list[bytes]]] = []
+    _tree_records(root, "", records, follow_directory_links)
+    records.sort(key=lambda item: item[0])
+    parts: list[bytes] = [_SYS_PATH_TREE_TAG, str(len(records)).encode("ascii")]
+    for _, encoded in records:
+        parts.append(length_prefixed(encoded))
+    return _sha256_hex(length_prefixed(parts))
+
+
+def sys_path_entry(position: int, entry: str) -> SysPathEntry:
+    """``sys.path`` の1項目を、位置・絶対 path・``realpath``・種類・中身の digest にする。
+
+    0157 §2.2。
+
+    読めないディレクトリ・通常のファイルでもディレクトリでもない項目は例外（fand は照合の失敗
+    として B0 に倒す）。
+    """
+    path = os.path.abspath(entry)
+    real_path = os.path.realpath(path)
+    try:
+        mode = os.stat(real_path).st_mode
+    except (FileNotFoundError, NotADirectoryError):
+        return SysPathEntry(position, path, real_path, SysPathKind.MISSING, "")
+    if stat.S_ISDIR(mode):
+        content = _tree_sha256(real_path, follow_directory_links=True)
+        return SysPathEntry(position, path, real_path, SysPathKind.DIRECTORY, content)
+    if stat.S_ISREG(mode):
+        return SysPathEntry(position, path, real_path, SysPathKind.FILE, _file_sha256(real_path))
+    raise ValueError(f"sys.path の項目が通常のファイルでもディレクトリでもない: 位置 {position}")
+
+
+def current_environment(sys_path: Sequence[str] | None = None) -> RuntimeEnvironment:
+    """いま動いている処理系と、その ``sys.path`` から見える配布物・項目の中身を集める。
+
+    ``sys_path`` を省けば ``sys.path`` を使う（試験は偽の列を渡す。0157 §2.4）。
+    呼び出し側は、:func:`current_launch_form` が ``other`` のプロセスでは呼ばない（0157 §2.3）。
+    標準ライブラリと site-packages の全ファイルを読むので、起動時に1回だけ呼ぶ。
+    """
+    entries = list(sys.path if sys_path is None else sys_path)
     version = sys.implementation.version
     distributions: list[InstalledDistribution] = []
     # sys.path の項目を前から1つずつ見て、配布物を持つ項目に順位を振る（import の優先の順）。
     rank = 0
-    for entry in sys.path:
+    for entry in entries:
         found = False
         owners: dict[str, int] = {}
         for owner, distribution in enumerate(importlib.metadata.distributions(path=[entry])):
@@ -212,6 +418,9 @@ def current_environment() -> RuntimeEnvironment:
             found = True
         if found:
             rank += 1
+    executable = sys.executable
+    if not executable:
+        raise ValueError("sys.executable を決められない")
     return RuntimeEnvironment(
         implementation=sys.implementation.name,
         implementation_version=(
@@ -220,6 +429,10 @@ def current_environment() -> RuntimeEnvironment:
         platform=sysconfig.get_platform(),
         machine=platform.machine(),
         distributions=tuple(distributions),
+        interpreter_flags=_interpreter_flags(),
+        executable=executable,
+        executable_sha256=_file_sha256(os.path.realpath(executable)),
+        sys_path=tuple(sys_path_entry(position, entry) for position, entry in enumerate(entries)),
     )
 
 
@@ -259,19 +472,40 @@ def _distribution_parts(
     )
 
 
+def _sys_path_parts(entry: SysPathEntry) -> list[bytes]:
+    if entry.position < 0:
+        raise ValueError("sys.path の位置は 0 以上")
+    if (entry.kind is SysPathKind.MISSING) != (not entry.content_sha256):
+        raise ValueError("無い項目だけが中身の digest を持たない")
+    return [
+        f"{entry.position:010d}".encode("ascii"),
+        os.fsencode(entry.path),
+        os.fsencode(entry.real_path),
+        entry.kind.value.encode("ascii"),
+        entry.content_sha256.encode("ascii"),
+    ]
+
+
 def environment_bytes(environment: RuntimeEnvironment) -> bytes:
-    """``environment`` の digest の元になる列。配布物は ``sys.path`` の順位で並べる。
+    """``environment`` の digest の元になる列（0152 §2.3 / 0157 §2.2）。
 
-    各配布物は「``sys.path`` の項目の順位（``path_rank``）・正規化した名前・版・``RECORD`` の
-    SHA-256」。項目の順位の順、同じ項目の中では名前の順に並べる（同じ項目の中の
-    列挙の順はファイルシステムに依るので効かせない）。同じ名前が2つ見えていれば2件とも入れる。
-
-    **入ったファイルそのものは読まない。** 束ねるのは 0066 §2.1 (c) / 0152 §2.3 の定義どおり
-    ``RECORD`` の bytes（各ファイルの hash の一覧）までで、入ったファイルを読み直して ``RECORD`` と
-    照合はしない。``RECORD`` を変えずにファイルだけを書き換えた改変は、この指紋では検出しない
-    （インストール先は root の所有。docs/ubuntu-deploy.md）。
+    1. 処理系の実装と版・プラットフォーム・``platform.machine()``
+    2. 配布物: 「``sys.path`` の項目の順位（``path_rank``）・正規化した名前・版・``RECORD`` の
+       SHA-256」を、項目の順位の順、同じ項目の中では名前の順に（列挙の順はファイルシステムに
+       依るので効かせない）。同じ名前が2つ見えていれば2件とも入れる
+    3. ``interpreter_flags``（鍵の昇順）
+    4. ``executable`` の path と実体の SHA-256
+    5. ``sys.path`` の**全項目を位置の順に**: 位置・絶対 path・``realpath``・種類・中身の digest。
+       site-packages も中身を読むので、``RECORD`` に載らないファイル（``.pth`` など）と
+       ``RECORD`` を変えずに書き換えたファイルも入る
     """
     entries = sorted(_distribution_parts(item) for item in environment.distributions)
+    flags = sorted(environment.interpreter_flags)
+    path_entries = sorted(environment.sys_path, key=lambda item: item.position)
+    if [item.position for item in path_entries] != list(range(len(path_entries))):
+        raise ValueError("sys.path の位置は 0 から欠けずに並ぶ")
+    if not environment.executable or not environment.executable_sha256:
+        raise ValueError("executable とその digest を空にしない")
     parts: list[bytes] = [
         _ENVIRONMENT_TAG,
         environment.implementation.encode("utf-8"),
@@ -282,6 +516,13 @@ def environment_bytes(environment: RuntimeEnvironment) -> bytes:
     ]
     for entry in entries:
         parts.extend(entry)
+    parts.append(str(len(flags)).encode("ascii"))
+    for key, value in flags:
+        parts.extend((key.encode("utf-8"), value.encode("utf-8")))
+    parts.extend((os.fsencode(environment.executable), environment.executable_sha256.encode()))
+    parts.append(str(len(path_entries)).encode("ascii"))
+    for path_entry in path_entries:
+        parts.append(length_prefixed(_sys_path_parts(path_entry)))
     return length_prefixed(parts)
 
 
