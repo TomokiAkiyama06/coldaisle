@@ -1455,6 +1455,7 @@ HINT_NAME = re.compile(r"workload[_-]?hint", re.IGNORECASE)
 HINT_AWARE_CONTROL_FILES = {
     "control_daemon.py",
     "control/config.py",
+    "control/hint_gate.py",
     "control/loop.py",
     "control/schema.py",
     "control/supervisor/hint_clock.py",
@@ -1466,6 +1467,8 @@ HINT_AWARE_CONTROL_FILES = {
 0064 §2.10 の Stage A の「制御デーモンは読まない」は 0133 が置き換えた。B0 では制御デーモンが
 ヒントを読んで記録するが、名前が出るのは設定・trace の形・loop の配線・Supervisor の入力と
 状態の遷移だけで、Safety / Guard / Fallback / hardware には出てこない。
+``control/hint_gate.py`` は単調性ゲートの仕様と部品の digest（0152 §2.3 / 0156）で、
+制御の値を作らない。
 """
 
 
