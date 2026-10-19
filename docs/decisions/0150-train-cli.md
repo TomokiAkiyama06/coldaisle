@@ -420,11 +420,12 @@ JSON として読めて、書かれた3つのファイルの大きさと SHA-256
   - **読む側の上限は呼び出し側が int で渡し、parse の前に当てる。** `training_output.py` は coldaisle を import しないので
     `ModelRegistryLimits` を受け取らず、`max_artifact_bytes: int` と `max_other_bytes: int` を必須の keyword 引数に取る（既定値なし）。
     当て方は 0062 §2.1 と同じで、`artifact.json` は `max_artifact_bytes`、`COMPLETE.json`・`metadata.json`・`training-report.json` は
-    `max_other_bytes` を上限とする。順は (1) `COMPLETE.json` を上限＋1 byte だけ読み、超えれば parse の前に拒否 → (2) **印に書かれた
+    `max_other_bytes` を上限とする。順は (1) `COMPLETE.json` を `O_RDONLY | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK` で `dir_fd` から1回だけ開き、`fstat` で regular file
+    であること（`S_ISREG`）を確かめてから、その fd で上限＋1 byte だけ読み、超えれば parse の前に拒否 → (2) **印に書かれた
     名前の集合が、ちょうど `artifact.json`・`metadata.json`・`training-report.json` の3つで、それぞれ1回だけ**であることを、どれかを
     開く前に確かめる（固定の basename との完全一致で比べる。絶対 path・`/` を含む名前・`..`・重複・欠け・余分な名前はすべて拒否。
     開くのは印の文字列ではなくこの固定の名前）→ (3) 印に書かれた各ファイルの大きさが、そのファイルの上限を超えていれば開く前に拒否 →
-    (4) `COMPLETE.json` と各ファイルを `O_RDONLY | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK` で `dir_fd` から開き、`fstat` で
+    (4) 各ファイルを同じ開き方で `dir_fd` から開き、`fstat` で
     **regular file であること**（`S_ISREG`。FIFO・デバイス・ディレクトリは拒否）と大きさが印と同じことを確かめ、印の大きさ＋1 byte
     だけ読む（多く読めれば拒否）→ (5) SHA-256 を照合して bytes を返す。`O_NONBLOCK` は FIFO を開くときに塞がないため、`S_ISREG` は
     読む前に特殊なファイルを除くためで、設定の入力（§2.7）と Dataset の読み（`_read_regular_file_at`）と同じ開き方である
