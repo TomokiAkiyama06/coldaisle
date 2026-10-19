@@ -735,6 +735,7 @@ def test_power_rise_and_fall_are_both_power_mismatch(bench: Bench) -> None:
     assert "air.gpu_intake" in pair(report, 0, "T+")["responses"]
     markdown = ac.as_markdown(report)
     assert "throttle" in markdown and "| F+ | discarded | power_mismatch（pair） |" in markdown
+    assert "段ごとの記録" in markdown and "ポンプ rpm" in markdown and "| 2000 |" in markdown
 
 
 def test_stale_outlier_in_the_settle_span_is_telemetry_coverage(bench: Bench) -> None:
@@ -867,8 +868,24 @@ def test_matrix_manifest_must_bracket_moved_steps(bench: Bench) -> None:
         ),
         "m1",
     )
-    with pytest.raises(ValueError, match="R"):
+    with pytest.raises(ValueError, match="並び"):
         ac.load_manifest(path)
+
+
+def test_matrix_manifest_rejects_a_repeated_moved_step(bench: Bench) -> None:
+    steps = matrix_steps(T0)
+    steps[3].update(label="F+", commanded=steps[1]["commanded"])  # F- の代わりにもう一度 F+
+    db = bench.snapshot()
+    document = manifest_doc(
+        "response_matrix",
+        "m1",
+        steps,
+        db,
+        calibration_offsets_sha256=OFFSETS_SHA,
+        load={"kind": "gpu", "gpu_power_limit_w": 300.0, "cpu_workers": None, "pilot": "x"},
+    )
+    with pytest.raises(ValueError, match="並び"):
+        ac.load_manifest(bench.manifest(document, "m1"))
 
 
 # ---------------------------------------------------------------------- DB の写し・設定

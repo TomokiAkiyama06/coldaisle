@@ -499,6 +499,25 @@ REQUIRED_METRICS: Final = tuple(
 LABELS: Final = ("R", "F+", "F-", "Rr+", "Rr-", "T+", "T-", "All+")
 """応答の行列の段（§2.5）。`R` は基準の段。"""
 
+MATRIX_SEQUENCE: Final = (
+    "R",
+    "F+",
+    "R",
+    "F-",
+    "R",
+    "Rr+",
+    "R",
+    "Rr-",
+    "R",
+    "T+",
+    "R",
+    "T-",
+    "R",
+    "All+",
+    "R",
+)
+"""§2.5 の段の並び（基準の段を間に挟む）。manifest はこの並びだけを受ける。"""
+
 _LABEL_ZONE: Final = {"F": "front", "Rr": "rear", "T": "top"}
 
 
@@ -638,12 +657,13 @@ class MatrixManifest(_Manifest):
     @model_validator(mode="after")
     def _bracketed(self) -> Self:
         _steps_in_order(self.steps)
-        labels = [step.label for step in self.steps]
-        if labels[0] != "R" or labels[-1] != "R":
-            raise ValueError("応答の行列は基準の段（R）で始めて R で終える")
-        for earlier, later in pairwise(labels):
-            if (earlier == "R") == (later == "R"):
-                raise ValueError("動かした段は基準の段（R）で挟む（§2.5）")
+        labels = tuple(step.label for step in self.steps)
+        if labels != MATRIX_SEQUENCE:
+            # 同じ段を 2 度置いた回を 2 回分として数えない。中止した段も並びに残し discarded で示す
+            raise ValueError(
+                "応答の行列の段は §2.5 の並び（" + ", ".join(MATRIX_SEQUENCE) + "）にする。"
+                "動かした段は基準の段（R）で挟む"
+            )
         return self
 
 
@@ -2111,6 +2131,36 @@ def _matrix_markdown(matrix: dict[str, Any]) -> list[str]:
                     ]
                 )
             )
+        lines += [
+            "",
+            f"#### {run['run_id']} の段ごとの記録（値の窓の平均・中央値）",
+            "",
+            *_header(
+                "段",
+                "状態",
+                "理由",
+                "窓",
+                *(_SHORT[metric] for metric in _STEP_COLUMNS),
+                "RPM front / rear / top",
+            ),
+        ]
+        for step in run["steps"]:
+            values = {**step["means"], **step["recorded"]}
+            rpm = step["hardware_rpm_median"]
+            lines.append(
+                _row(
+                    [
+                        step["label"],
+                        step["status"],
+                        step["reason"] or "—",
+                        "—"
+                        if step["window_start"] is None
+                        else f"{step['window_start']} 〜 {step['window_end']}",
+                        *(_num(values.get(metric)) for metric in _STEP_COLUMNS),
+                        " / ".join(_num(rpm.get(zone)) for zone in ZONES) if rpm else "—",
+                    ]
+                )
+            )
     lines += [
         "",
         "### まとめ（負荷ごと）",
@@ -2133,6 +2183,29 @@ def _matrix_markdown(matrix: dict[str, Any]) -> list[str]:
                 )
             )
     return lines
+
+
+_STEP_COLUMNS: Final = (
+    "air.room",
+    "air.room_humidity",
+    "board.connector_12v2x6",
+    "power.cpu.package",
+    "power.gpu.0",
+    PUMP,
+    "fan.vrm.rpm",
+    "gpu.0.fan_speed",
+)
+_SHORT: Final = {
+    "air.room": "室温",
+    "air.room_humidity": "湿度",
+    "board.connector_12v2x6": "12V-2x6",
+    "power.cpu.package": "P CPU",
+    "power.gpu.0": "P GPU",
+    PUMP: "ポンプ rpm",
+    "fan.vrm.rpm": "VRM rpm",
+    "gpu.0.fan_speed": "GPU Fan %",
+}
+"""Markdown の段ごとの表の列（§2.5 の「残す」もの）。"""
 
 
 def _throttle(flags: dict[str, bool | None]) -> str:
