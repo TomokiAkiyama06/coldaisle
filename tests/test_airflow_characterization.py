@@ -732,6 +732,23 @@ def test_power_rise_and_fall_are_both_power_mismatch(bench: Bench) -> None:
         assert item["throttle"]["gpu.0.throttle.sw_power_cap"] is False
         assert item["responses"] == {}
     assert pair(report, 0, "T+")["status"] == "ok"
+    assert "air.gpu_intake" in pair(report, 0, "T+")["responses"]
+    markdown = ac.as_markdown(report)
+    assert "throttle" in markdown and "| F+ | discarded | power_mismatch（pair） |" in markdown
+
+
+def test_stale_outlier_in_the_settle_span_is_telemetry_coverage(bench: Bench) -> None:
+    path = matrix_run(bench, "m1", T0)
+    steps = yaml.safe_load(path.read_text(encoding="utf-8"))["steps"]
+    rr_minus = next(step for step in steps if step["label"] == "Rr-")
+    # 落ち着きの区間に必ず入るよう、段の中に 5 s ごとの stale の外れ値を入れる
+    for ts in range(rr_minus["start_ms"], rr_minus["end_ms"], 5000):
+        bench.reading("air.gpu_exhaust", ts, 90.0, quality="stale")
+    document = yaml.safe_load(path.read_text(encoding="utf-8"))
+    document["db_copy"]["sha256"] = sha(bench.snapshot("m1.db"))
+    path.write_text(yaml.safe_dump(document), encoding="utf-8")
+    item = pair(build([path]), 0, "Rr-")
+    assert item["reason"] == "telemetry_coverage" and item["reason_from"] == "moved"
 
 
 def test_pump_mismatch_is_condition_mismatch(bench: Bench) -> None:

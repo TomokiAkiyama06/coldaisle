@@ -408,6 +408,7 @@ class Indicator:
 
 
 INDICATORS: Final = (
+    Indicator("air.gpu_intake", "air.gpu_intake", None, "air_c", "temperature"),
     Indicator("d.gpu_preheat", "air.gpu_intake", "air.front_intake", "air_c", "temperature"),
     Indicator("d.case_delta", "air.rear_exhaust", "air.front_intake", "air_c", "temperature"),
     Indicator(
@@ -428,7 +429,8 @@ INDICATORS: Final = (
     Indicator("gpu.0.hotspot", "gpu.0.hotspot", None, "gpu_hotspot_c", "temperature"),
     Indicator("cpu.package", "cpu.package", None, "cpu_package_c", "temperature"),
 )
-"""§2.5 の見る指標。`air.gpu_intake` との差は `d.gpu_preheat`、`air.rear_exhaust` との差は
+"""§2.5 の見る指標。`air.gpu_intake` はそのままの値と `air.front_intake` との差（`d.gpu_preheat`）の
+両方を持つ。`air.rear_exhaust` との差は
 `d.case_delta`（`config/metrics.yaml` の定義と同じ引き算）。"""
 
 POWER_INDICATORS: Final = (
@@ -1505,6 +1507,15 @@ def analyse_matrix_step(
         lo = at - span
         rows = {metric: context.series[metric].between(lo, at) for metric in SETTLE_AIR}
         chip_rows = {metric: context.series[metric].between(lo, at) for metric, _ in chips}
+        # 落ち着きの区間の全体の覆い（§2.3）を**幅を計算する前に**確かめる。満たさなければ
+        # 次の時刻を見る（stale / suspect の外れ値を「未収束」と読み違えない）
+        settle_rows = {**rows, **chip_rows}
+        if not all(
+            telemetry_covered(settle_rows[metric], lo, at, config.source_of(metric))
+            for metric in settle_rows
+        ):
+            coverage_failure = Reason.TELEMETRY_COVERAGE
+            continue
         if not all(
             _settle_range_ok(
                 rows[metric], config.settle.max_range_air_c.value, u_air, k, median3=False
@@ -1520,14 +1531,6 @@ def analyse_matrix_step(
             )
             for metric, u in chips
         ):
-            continue
-        # 落ち着きの区間の全体の覆い（§2.3）。満たさなければ次の時刻を見る
-        settle_rows = {**rows, **chip_rows}
-        if not all(
-            telemetry_covered(settle_rows[metric], lo, at, config.source_of(metric))
-            for metric in settle_rows
-        ):
-            coverage_failure = Reason.TELEMETRY_COVERAGE
             continue
         settle_trace = check_trace(context.ticks, lo, at, step, context.hashes, config)
         if settle_trace.reason is not None:
@@ -2064,7 +2067,15 @@ def _matrix_markdown(matrix: dict[str, Any]) -> list[str]:
             "",
             f"### {title}: {run['status']}{reason}",
             "",
-            *_header("段", "状態", "理由", "ΔP CPU", "ΔP GPU", *(item.name for item in INDICATORS)),
+            *_header(
+                "段",
+                "状態",
+                "理由",
+                "ΔP CPU",
+                "ΔP GPU",
+                "throttle",
+                *(item.name for item in INDICATORS),
+            ),
         ]
         for pair in run["pairs"]:
             power = pair["power_delta"]
@@ -2079,6 +2090,7 @@ def _matrix_markdown(matrix: dict[str, Any]) -> list[str]:
                         why,
                         _cell(power.get("power.cpu.package")),
                         _cell(power.get("power.gpu.0")),
+                        _throttle(pair["throttle"]),
                         *(_cell(pair["responses"].get(item.name)) for item in INDICATORS),
                     ]
                 )
@@ -2105,6 +2117,14 @@ def _matrix_markdown(matrix: dict[str, Any]) -> list[str]:
                 )
             )
     return lines
+
+
+def _throttle(flags: dict[str, bool | None]) -> str:
+    """立っていた throttle の flag（§2.5。捨てた組でも残す）。記録が無ければ —。"""
+    if all(value is None for value in flags.values()):
+        return "—"
+    raised = [name.removeprefix("gpu.0.throttle.") for name, value in flags.items() if value]
+    return ", ".join(raised) or "なし"
 
 
 def _cell(entry: dict[str, Any] | None) -> str:
