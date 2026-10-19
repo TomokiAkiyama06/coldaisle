@@ -1246,3 +1246,18 @@ def test_trend_of_a_retained_temperature_is_window_trend(bench: Bench) -> None:
 
     report = build([matrix_run(bench, "m1", T0, effects={"air.room": ramp})])
     assert pair(report, 0, "Rr-")["reason"] == "window_trend"
+
+
+def test_copy_created_before_the_run_end_is_refused(bench: Bench) -> None:
+    paths = sweep_runs(bench)
+    document = yaml.safe_load(paths[0].read_text(encoding="utf-8"))
+    document["db_copy"]["created_at_ms"] = document["steps"][-1]["end_ms"] - 1
+    paths[0].write_text(yaml.safe_dump(document), encoding="utf-8")
+    with pytest.raises(ac.AnalysisError, match="created_at_ms"):
+        build(paths)
+
+
+def test_markdown_shows_maxima_and_downward_timing(bench: Bench) -> None:
+    text = ac.as_markdown(build(sweep_runs(bench, days=(0, 0, 0))))
+    assert "最大 RPM" in text and "応答 ms（下り）" in text
+    assert "| 2000 | 1500, 1500, 1500 | — |" in text

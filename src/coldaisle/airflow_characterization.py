@@ -1964,6 +1964,11 @@ def _open_contexts(
             database, digest = databases[key]
             if digest != manifest.db_copy.sha256:
                 raise AnalysisError(f"{manifest.run_id}: DB の写しの SHA-256 が manifest と違う")
+            if manifest.db_copy.created_at_ms < run.end_ms:
+                raise AnalysisError(
+                    f"{manifest.run_id}: db_copy.created_at_ms が run の終わりより前"
+                    "（写しは回の終了より後に作る。§2.7 の 2）"
+                )
             for table in _TABLES:
                 last = database.last_ts(table)
                 if last is None or last < run.end_ms:
@@ -2133,7 +2138,9 @@ def _sweep_markdown(sweep: dict[str, Any]) -> list[str]:
                 "範囲",
                 "範囲÷中央値の上側",
                 "上り−下り",
+                "最大 RPM",
                 "応答 ms（上り）",
+                "応答 ms（下り）",
             ),
         ]
         for row in item["levels"]:
@@ -2149,7 +2156,9 @@ def _sweep_markdown(sweep: dict[str, Any]) -> list[str]:
                         _num(row["rpm_range"]),
                         _num(row["spread_upper"]),
                         _num(row["hysteresis_up_minus_down"]),
+                        _num(row["rpm_max"]),
                         ", ".join(str(value) for value in row["response_ms_up"]) or "—",
+                        ", ".join(str(value) for value in row["response_ms_down"]) or "—",
                     ]
                 )
             )
