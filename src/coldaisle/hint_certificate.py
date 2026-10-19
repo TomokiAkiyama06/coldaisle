@@ -400,7 +400,9 @@ def parse_hint_certificate(data: bytes, *, max_bytes: int) -> HintCertificate:
             object_pairs_hook=_reject_duplicate_keys,
             parse_constant=_reject_constant,
         )
-    except (UnicodeDecodeError, ValueError) as error:
+    except (UnicodeDecodeError, ValueError, RecursionError) as error:
+        # 深く入れ子にした JSON は小さくても RecursionError になる。Registry は中身を読まずに
+        # 登録するので、ここで読めないものとして閉じた理由に倒す（PR #357 の Codex P2）。
         raise HintCertificateError("certificate_unreadable", "証明書を JSON として読めない") from (
             error
         )

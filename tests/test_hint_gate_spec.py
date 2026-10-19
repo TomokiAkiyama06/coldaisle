@@ -601,6 +601,10 @@ def test_unreadable_certificates(tmp_path: Path) -> None:
     duplicated = data[:-1] + b', "result": "passed"}'
     assert _reason(duplicated) == "certificate_unreadable"
     assert _reason(data.replace(b'"eps": 0.01', b'"eps": NaN')) == "certificate_unreadable"
+    nested = b"[" * 100_000 + b"]" * 100_000
+    assert _reason(nested, max_bytes=len(nested)) == "certificate_unreadable"
+    deep_field = data[:-1] + b', "extra": ' + b"[" * 100_000 + b"]" * 100_000 + b"}"
+    assert _reason(deep_field, max_bytes=len(deep_field)) == "certificate_unreadable"
 
 
 @pytest.mark.parametrize(
