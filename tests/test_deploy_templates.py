@@ -625,6 +625,83 @@ def test_fand_states_every_timeout():
         assert service[key][0] not in {"", "infinity"}
 
 
+TIME_SPAN_UNITS_S = {
+    "us": 1e-6,
+    "usec": 1e-6,
+    "ms": 1e-3,
+    "msec": 1e-3,
+    "s": 1.0,
+    "sec": 1.0,
+    "second": 1.0,
+    "seconds": 1.0,
+    "m": 60.0,
+    "min": 60.0,
+    "minute": 60.0,
+    "minutes": 60.0,
+    "h": 3600.0,
+    "hr": 3600.0,
+    "hour": 3600.0,
+    "hours": 3600.0,
+}
+TIME_SPAN_PART = re.compile(r"(\d+(?:\.\d+)?)\s*([a-z]*)")
+
+
+def time_span_s(value: str) -> float:
+    """systemd の時間（`systemd.time(7)`。`5s`・`500ms`・`1min 30s`・単位なしは秒）を秒にする。
+
+    読めない形（`infinity` を含む）は落とす。上限の検査を、読み違えで黙って通さないため。
+    """
+    text = value.strip()
+    assert text, "空の時間"
+    position = 0
+    total = 0.0
+    for match in TIME_SPAN_PART.finditer(text):
+        assert text[position : match.start()].strip() == "", f"読めない時間: {value!r}"
+        unit = match.group(2) or "s"
+        assert unit in TIME_SPAN_UNITS_S, f"知らない単位: {value!r}"
+        total += float(match.group(1)) * TIME_SPAN_UNITS_S[unit]
+        position = match.end()
+    assert position > 0 and text[position:].strip() == "", f"読めない時間: {value!r}"
+    return total
+
+
+def test_time_span_parser_reads_the_systemd_forms():
+    assert time_span_s("5s") == 5.0
+    assert time_span_s("5") == 5.0
+    assert time_span_s("500ms") == 0.5
+    assert time_span_s("1min 30s") == 90.0
+    for broken in ("infinity", "", "5 parsecs", "s5"):
+        with pytest.raises(AssertionError):
+            time_span_s(broken)
+
+
+ANALYSED_WATCHDOG_S = 5.0
+"""決定記録 0158 §2.2 の P6 の解析の前提の `WatchdogSec`（新しい安全の値ではない）。"""
+ANALYSED_TIMEOUT_ABORT_S = 5.0
+"""同じく `TimeoutAbortSec`。SIGABRT で終わらないときに SIGKILL を送るまでの待ち。"""
+
+
+def test_fand_watchdog_and_abort_timeout_stay_within_the_0158_analysis():
+    """`WatchdogSec` + `TimeoutAbortSec` が 0158 の解析の前提（5 s + 5 s、合計 10 s）を超えない。
+
+    決定記録 0158 §2.5 の T1。
+
+    約 11 s の経路（SIGABRT で終わらず SIGKILL で終わる）の見積もりは、この 2 つの値の和に
+    引き継ぎの時間を足したもの（0158 §2.2 の P6）。値を延ばすなら、このテストを直す前に
+    0158 の解析をやり直す。`WatchdogSec=0` は watchdog を切り、`TimeoutAbortSec=0` は待ちを
+    無期限にする（`systemd.service(5)`）ので、上限の検査とは別に拒む。
+    """
+    unit = fand()
+    service = unit["Service"]
+    watchdog_s = time_span_s(one(unit, "Service", "WatchdogSec"))
+    assert len(service.get("TimeoutAbortSec", [])) == 1, "TimeoutAbortSec を明示する"
+    abort_s = time_span_s(service["TimeoutAbortSec"][0])
+
+    assert 0 < watchdog_s <= ANALYSED_WATCHDOG_S
+    assert 0 < abort_s <= ANALYSED_TIMEOUT_ABORT_S
+    assert watchdog_s + abort_s <= ANALYSED_WATCHDOG_S + ANALYSED_TIMEOUT_ABORT_S
+
+
 def test_fand_logs_to_journald():
     unit = fand()
     assert one(unit, "Service", "StandardOutput") == "journal"
