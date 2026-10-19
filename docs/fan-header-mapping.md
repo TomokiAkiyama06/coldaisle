@@ -284,7 +284,10 @@ GPU の Fan のサービスの下で 600 W のまま合格した（下の「GPU 
 - Max までは 5143〜5294 ms で、どれも watchdog の 5 s の直後だった。systemd は止まったプロセスにも `SIGABRT` を届け
   （`Killing process … with signal SIGABRT`）、`TimeoutAbortSec` の SIGKILL を待たずに ExecStopPost の引き継ぎ
   （`safety_handoff_completed`）が Max を書いた。最悪の約 11 s（0119 §2.12）にはならなかった
-- **残り（未完了）: 約 11 s の経路。** `SIGABRT` で fand が終わらない hang では `TimeoutAbortSec` の 5 s も待つので、
+- **約 11 s の経路は実機では試さない。** 0154 は取り下げ、[0158](decisions/0158-t5-11s-path-component-assurance.md)（FINAL、2026-10-19）で、
+  実測済みの部品・テスト・解析で担保し、残るリスク（X1〜X3 と X5）を所有者が受け入れた。`watchdog_timeout_ms` を `confirmed` にするのは
+  0158 §2.5 の T1〜T3 のテストが入り、承認点 2 を得てから（0158 §2.6）。D 状態の hang は 0158 §5 の 2 のとおり調べてから決める。
+  以下はそれまでの経緯: `SIGABRT` で fand が終わらない hang では `TimeoutAbortSec` の 5 s も待つので、
   低い Demand のまま約 11 s 続く。上の試行はすべて約 5.2 s で終わり、Max を確かめた直後に負荷を止めたので、その後の約 6 s の
   上がりを測っていない。0119 §2.13 は `watchdog_timeout_ms` に約 11 s の間の余裕を求めるので、上の表は `SIGABRT` で終わる経路の
   合格で、`watchdog_timeout_ms` はまだ `confirmed` にしない。所有者は「試験専用の設定で再現する」方向を選んだ（`safety.yaml` の `watchdog_timeout_ms` と unit の `WatchdogSec` を試験の間だけ
@@ -312,7 +315,7 @@ GPU の Fan のサービスの下で 600 W のまま合格した（下の「GPU 
 - 0130 の曲線の (ii) は 0130 §2.4 の 2 を兼ねる: GPU 600 W を 15 分以上かけ、GPU コアは 78 °C・GPU の Fan は 68 % で落ち着いた
   （筐体の Fan は GPU の温度で 0.91）。23:44 の 1 回目（`t5-2344-*`）は 30 分 78 °C で横ばいだったが、試験の側の落ち着きの判定
   （空気の排気の 3 分の幅 0.5 °C）が Fan の強いときの排気の揺れで通らず止まった。判定を「最初の 1 分と最後の 1 分の平均の差」に直して行った
-- `SIGSTOP` から Max は、どれも上と同じく `SIGABRT` で終わる約 5.2 s の経路。約 11 s の経路は上のとおり残り
+- `SIGSTOP` から Max は、どれも上と同じく `SIGABRT` で終わる約 5.2 s の経路。約 11 s の経路は上のとおり 0158 で担保する
 
 ### T7: 高温での BIOS との比較（CPU 2026-10-14 15:50〜16:39、GPU 2026-10-15 09:10〜10:28）
 
@@ -464,5 +467,7 @@ reading と trace、fand の journal、`coldaisle-soak-report` の集計）。
 
 ### 残り
 
-- T5 の約 11 s の経路（watchdog の最悪の時間）。上の T5 の節のとおり、試験専用の設定の例外を決める決定記録と所有者の承認が先
+- T5 の約 11 s の経路（watchdog の最悪の時間）は実機では試さず、[0158](decisions/0158-t5-11s-path-component-assurance.md) で担保する。
+  残りは 0158 §2.5 の T1〜T3 のテスト（別の Issue）と、D 状態の hang の調べ（0158 §5 の 2: 予備確認から T1 までの journal と `dmesg` の
+  `hung_task`・`duration_ms` の外れ値・`write_failure` / `readback_mismatch`、T1 の 24 h の tick の最大の時間）
 - T1 は合格（2026-10-16、所有者が確認）。値の `status` を `confirmed` にするのは、所有者の承認を得てまとめて行う
