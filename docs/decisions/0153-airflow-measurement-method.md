@@ -219,7 +219,7 @@ zone の間の結合までを 1 つの記録で決め、`air-balance.yaml` を `
 | 窓の傾き | `max_window_trend.temperature_c` / `max_window_trend.power_w` | 0.2 / 5 |
 | 部屋 | `max_room_drift_c` | 1.0 |
 | ポンプ | `max_aux_fan_delta_rpm` | 50 |
-| 分解能 | `resolution.air_c` / `resolution.power_w` / `resolution.gpu_core_c` / `resolution.cpu_package_c` / `resolution.board_connector_c` | 0.125 / 1 / 1 / 実機の値の刻みを確かめて解析の道具の PR で決める / 同左（§5 の 1 で決定） |
+| 分解能 | `resolution.air_c` / `resolution.power_w` / `resolution.gpu_core_c` / `resolution.gpu_hotspot_c` / `resolution.cpu_package_c` / `resolution.board_connector_c` / `resolution.fan_rpm` | 0.125 / 1 / 1 / 1（NVML の温度は整数の °C） / 実機の値の刻みを確かめて解析の道具の PR で決める / 同左 / 同左（tach の読み値の刻み。§5 の 1 で決定） |
 | 負荷 | `load.gpu_power_limit_w` | 300 |
 | 応答の行列 | `response_matrix.reference_demand` / `plus_demand` / `minus_demand` / `repetitions` / `min_distinct_days` / `max_power_delta_w` | 0.60 / 0.90 / 0.35 / 2 / 2 / 5 |
 | 承認の目安 | `approval.max_rpm_spread` | 3 % |
