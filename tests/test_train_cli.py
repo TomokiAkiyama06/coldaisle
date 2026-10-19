@@ -1042,3 +1042,29 @@ def test_a_failing_post_register_check_keeps_the_candidate(
     after = snapshot(world)
     assert_one_candidate_added(before, after, world.outputs / "run")
     assert all(event.event.value != "retired" for event in after.audit)
+
+
+def test_an_os_error_in_the_path_check_after_register_is_reported(
+    world: World, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """登録の後に祖先へ入れなくなっても段と key を出して終わる（PR #359 の Codex P2）。"""
+    real_register, real_open = ModelRegistry.register_candidate, os.open
+    broken: list[bool] = []
+
+    def failing_open(path: Any, *args: Any, **kwargs: Any) -> int:
+        if broken and str(path) == "outputs":
+            raise OSError(errno.EIO, "I/O error")
+        return real_open(path, *args, **kwargs)
+
+    def then_break(self: ModelRegistry, *args: Any, **kwargs: Any) -> Any:
+        ref = real_register(self, *args, **kwargs)
+        broken.append(True)
+        return ref
+
+    monkeypatch.setattr(os, "open", failing_open)
+    monkeypatch.setattr(ModelRegistry, "register_candidate", then_break)
+    capsys.readouterr()
+    assert train.main(world.apply_argv()) == 1
+    [error] = train_errors(capsys)
+    assert error["stages"] == ["out_replaced_after_register"]
+    assert error["artifact"] == "thermal_model/rack-thermal/0.1.0"

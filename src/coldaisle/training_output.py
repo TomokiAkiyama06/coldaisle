@@ -372,16 +372,18 @@ def path_names_directory(path: Path, expected: Identity) -> PathCheck:
     except UntrustedPathError:
         raise
     except OSError as error:
+        # どの OSError も不一致として返す（照合できないものを一致とは言わない。呼び出し側は
+        # 登録しない・rmdir しない・登録の後なら段として報告する）
         reason = {
             errno.ELOOP: "symlink",
             errno.ENOTDIR: "not_a_directory_or_symlink",
             errno.ENOENT: "missing",
-        }.get(error.errno or 0)
-        if reason is None:
-            raise
+        }.get(error.errno or 0, f"os_error: {error}")
         return PathCheck(matches=False, actual=None, reason=reason)
     try:
         actual = _identity(fd)
+    except OSError as error:
+        return PathCheck(matches=False, actual=None, reason=f"os_error: {error}")
     finally:
         os.close(fd)
     if actual != expected:
@@ -596,7 +598,10 @@ def _open_regular_at(directory_fd: int, name: str) -> tuple[int, int]:
     except OSError as error:
         raise TrainingOutputIncomplete(f"{name} を開けない: {error}") from error
     try:
-        result = os.fstat(fd)
+        try:
+            result = os.fstat(fd)
+        except OSError as error:
+            raise TrainingOutputIncomplete(f"{name} を確かめられない: {error}") from error
         if not stat.S_ISREG(result.st_mode):
             raise TrainingOutputIncomplete(f"{name} が regular file ではない")
         return fd, result.st_size
@@ -636,6 +641,8 @@ def read_training_output(
     fd, _size = _open_regular_at(directory_fd, COMPLETE_FILENAME)
     try:
         marker_bytes = _read_limited(fd, max_other_bytes)
+    except OSError as error:
+        raise TrainingOutputIncomplete(f"{COMPLETE_FILENAME} を読めない: {error}") from error
     finally:
         os.close(fd)
     if len(marker_bytes) > max_other_bytes:
@@ -670,6 +677,8 @@ def read_training_output(
             if size != entry.size:
                 raise TrainingOutputIncomplete(f"{filename} の大きさが印と違う")
             payload = _read_limited(fd, entry.size)
+        except OSError as error:
+            raise TrainingOutputIncomplete(f"{filename} を読めない: {error}") from error
         finally:
             os.close(fd)
         if len(payload) != entry.size:
