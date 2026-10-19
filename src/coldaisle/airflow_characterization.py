@@ -1102,6 +1102,17 @@ def check_trace(
     return TraceCheck(None, inside)
 
 
+def faulted_during(ticks: Sequence[Tick], step: _Step) -> bool:
+    """段の区間の**全体**で Critical Safety が NORMAL でない・fault がある tick があったか（§2.2）。
+
+    値の窓の外で DEGRADED / EMERGENCY になって戻った段も、段ごと捨てる。
+    """
+    return any(
+        step.start_ms <= tick.ts_ms <= step.end_ms and (tick.safety != "normal" or tick.faults)
+        for tick in ticks
+    )
+
+
 def reached_tick(ticks: Sequence[Tick], step: _Step) -> tuple[Tick | None, Reason]:
     """3 zone の `effective` が指示の値に届いた最初の tick（§2.4 の「届いた tick」）。"""
     seen_command = False
@@ -1201,6 +1212,9 @@ def analyse_sweep_step(
     )
     if step.discarded is not None:
         observation.reason = Reason(step.discarded.reason)
+        return observation
+    if faulted_during(context.ticks, step):
+        observation.reason = Reason.SAFETY_FAULT
         return observation
     reach, missing = reached_tick(context.ticks, step)
     if reach is None:
@@ -1506,6 +1520,9 @@ def analyse_matrix_step(
     if step.discarded is not None:
         window.reason = Reason(step.discarded.reason)
         return window
+    if faulted_during(context.ticks, step):
+        window.reason = Reason.SAFETY_FAULT
+        return window
     reach, missing = reached_tick(context.ticks, step)
     if reach is None:
         window.reason = missing
@@ -1607,10 +1624,10 @@ def _value_window(
             statistics.fmean(value for _, value in _points(rows)) if covered else None
         )
     for metric in THROTTLE_METRICS:
-        flags = [
-            row.value for row in context.series[metric].between(start, end) if row.quality == "ok"
-        ]
-        window.throttle[metric] = None if not flags else any(bool(flag) for flag in flags)
+        # 覆いの欠けた窓では「立っていない」と言えない（欠けた間に立ったかもしれない）→ None
+        rows = context.series[metric].between(start, end)
+        covered = telemetry_covered(rows, start, end, config.coverage.telemetry)
+        window.throttle[metric] = any(bool(row.value) for row in rows) if covered else None
     for zone in ZONES:
         rpms = [float(rpm) for tick in checked.ticks if (rpm := tick.zones[zone].rpm) is not None]
         window.zone_rpm[zone] = statistics.median(rpms) if rpms else None
@@ -1868,6 +1885,11 @@ def _open_contexts(
                         f"{manifest.run_id}: DB の写しが無い: {manifest.db_copy.file}"
                     )
                 digest = file_sha256(run.db_path)
+                # **開く前に** bytes の digest を照合する。照合できない写しを SQLite に渡さない
+                if digest != manifest.db_copy.sha256:
+                    raise AnalysisError(
+                        f"{manifest.run_id}: DB の写しの SHA-256 が manifest と違う"
+                    )
                 try:
                     databases[key] = (CopyDatabase(run.db_path), digest)
                 except EvidenceDatabaseError as error:
@@ -2209,11 +2231,15 @@ _SHORT: Final = {
 
 
 def _throttle(flags: dict[str, bool | None]) -> str:
-    """立っていた throttle の flag（§2.5。捨てた組でも残す）。記録が無ければ —。"""
-    if all(value is None for value in flags.values()):
+    """立っていた throttle の flag（§2.5。捨てた組でも残す）。覆いの欠けた flag は「不明」。"""
+    if not flags:
         return "—"
     raised = [name.removeprefix("gpu.0.throttle.") for name, value in flags.items() if value]
-    return ", ".join(raised) or "なし"
+    unknown = [
+        name.removeprefix("gpu.0.throttle.") for name, value in flags.items() if value is None
+    ]
+    parts = [*raised, f"不明: {', '.join(unknown)}"] if unknown else raised
+    return ", ".join(parts) or "なし"
 
 
 def _cell(entry: dict[str, Any] | None) -> str:

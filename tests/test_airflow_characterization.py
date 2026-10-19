@@ -1037,3 +1037,75 @@ def test_module_has_no_write_paths() -> None:
     for word in ("INSERT", "UPDATE ", "DELETE", "CREATE ", "DROP ", "commit(", "safe_dump"):
         assert word not in text
     assert text.count("write_text(") == 1
+
+
+def test_safety_fault_outside_the_window_discards_the_step(bench: Bench) -> None:
+    def tick_fn(step: dict[str, Any], ts: int) -> dict[str, Any]:
+        # 0.50 の段の始めの 5 s だけ DEGRADED（値の窓は 30 s 後から）
+        if step["level"] == 0.5 and step["direction"] == "up" and ts - step["start_ms"] < 5 * S:
+            return {"safety": "degraded"}
+        return {}
+
+    steps = sweep_steps("front", 1, T0, command_id=1)
+    bench.drive(steps, zone_fn=steady_rpm, tick_fn=tick_fn)
+    idle_readings(bench, T0, steps[-1]["end_ms"] + 10 * S)
+    db = bench.snapshot()
+    report = build([bench.manifest(manifest_doc("rpm_sweep", "r1", steps, db), "r1")])
+    by_level = {
+        (step["level"], step["direction"]): step["reason"] for step in report["rpm_sweep"]["steps"]
+    }
+    assert by_level[(0.5, "up")] == "safety_fault"
+    assert by_level[(0.6, "up")] is None
+
+
+def test_matrix_fault_before_settling_discards_the_step(bench: Bench) -> None:
+    def tick_fn(step: dict[str, Any], ts: int) -> dict[str, Any]:
+        if step["label"] == "Rr-" and ts - step["start_ms"] < 3 * S:
+            return {"faults": [{"code": "telemetry_loss"}]}
+        return {}
+
+    steps = matrix_steps(T0)
+    bench.calibration(T0 - 3600 * S)
+    bench.drive(steps, tick_fn=tick_fn)
+    matrix_readings(bench, steps)
+    db = bench.snapshot("m1.db")
+    document = manifest_doc(
+        "response_matrix",
+        "m1",
+        steps,
+        db,
+        calibration_offsets_sha256=OFFSETS_SHA,
+        load={"kind": "gpu", "gpu_power_limit_w": 300.0, "cpu_workers": None, "pilot": "x"},
+    )
+    item = pair(build([bench.manifest(document, "m1")]), 0, "Rr-")
+    assert item["reason"] == "safety_fault" and item["reason_from"] == "moved"
+
+
+def test_partially_covered_throttle_flag_is_unknown(bench: Bench) -> None:
+    path = matrix_run(bench, "m1", T0)
+    steps = yaml.safe_load(path.read_text(encoding="utf-8"))["steps"]
+    f_plus = next(step for step in steps if step["label"] == "F+")
+    for ts in range(f_plus["start_ms"], f_plus["end_ms"], 2500):
+        if (ts // 2500) % 3 == 0:
+            bench.reading("gpu.0.throttle.sw_power_cap", ts, None, quality="stale")
+    document = yaml.safe_load(path.read_text(encoding="utf-8"))
+    document["db_copy"]["sha256"] = sha(bench.snapshot("m1.db"))
+    path.write_text(yaml.safe_dump(document), encoding="utf-8")
+    report = build([path])
+    assert pair(report, 0, "F+")["throttle"]["gpu.0.throttle.sw_power_cap"] is None
+    assert pair(report, 0, "T+")["throttle"]["gpu.0.throttle.sw_power_cap"] is False
+    assert "不明: " in ac.as_markdown(report)
+
+
+def test_digest_is_checked_before_opening(bench: Bench, monkeypatch: pytest.MonkeyPatch) -> None:
+    paths = sweep_runs(bench)
+    document = yaml.safe_load(paths[0].read_text(encoding="utf-8"))
+    document["db_copy"]["sha256"] = "0" * 64
+    paths[0].write_text(yaml.safe_dump(document), encoding="utf-8")
+
+    def refuse(path: Path) -> None:
+        raise AssertionError("照合の前に DB を開いた")
+
+    monkeypatch.setattr(ac, "CopyDatabase", refuse)
+    with pytest.raises(ac.AnalysisError, match="SHA-256"):
+        build(paths[:1])
