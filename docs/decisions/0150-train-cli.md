@@ -219,7 +219,7 @@ process が強制終了したとき（`SIGKILL`・電源断）は片づけられ
 | ファイル | 中身 |
 |---|---|
 | `artifact.json` | 登録する canonical bytes（§2.4 の 6） |
-| `metadata.json` | `ArtifactMetadata` の strict JSON（`coldaisle-registry register --metadata` へそのまま渡せる形） |
+| `metadata.json` | `ArtifactMetadata` の strict JSON（`ArtifactMetadata` として検証できる形）。**`coldaisle-registry register --metadata` には渡せない**（`kind` = `thermal_model`・`capability` = `counterfactual_action` をその経路は拒む。下の「`--metadata` / `--payload` の経路の拒否」）。手動の登録は `coldaisle-registry register --training-output <--out>` で行う |
 | `training-report.json` | §2.7 の digest の一覧・split ごとの件数と期間・artifact の SHA-256・Profile の SHA-256・除いた example の件数 |
 
 #### 脅威の前提
