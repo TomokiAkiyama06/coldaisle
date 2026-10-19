@@ -150,7 +150,7 @@ class TableStatus(StrEnum):
     NOT_MONOTONIC = "not_monotonic"
     """段の中央値が demand に対して下がり、`FanProfile` の検証を通らない。"""
     TOO_MANY_REPETITIONS = "too_many_repetitions"
-    """応答の行列で、有効な回が `response_matrix.repetitions` より多い（§2.6 の 2 回の式）。"""
+    """回が `repetitions` より多い（掃引は §2.4 の 3 回、応答の行列は §2.6 の 2 回の式）。"""
     LOAD_MISMATCH = "load_mismatch"
     """まとめる回の負荷の設定（電力の上限・worker の数）が違う（§2.5）。"""
 
@@ -1115,6 +1115,23 @@ def faulted_during(ticks: Sequence[Tick], step: _Step) -> bool:
     )
 
 
+def step_interval_reason(context: RunContext, step: _Step) -> Reason | None:
+    """段の区間の全体（`[start_ms, end_ms)`）の検査。窓の外の ramp・落ち着きの間も含める。
+
+    - Critical Safety が NORMAL でない・fault がある → `safety_fault`（§2.2）
+    - Control Config の hash が manifest と違う → `config_mismatch`（§2.9）
+    """
+    if faulted_during(context.ticks, step):
+        return Reason.SAFETY_FAULT
+    expected = context.hashes.as_tuple()
+    if any(
+        step.start_ms <= tick.ts_ms < step.end_ms and tick.config != expected
+        for tick in context.ticks
+    ):
+        return Reason.CONFIG_MISMATCH
+    return None
+
+
 def reached_tick(ticks: Sequence[Tick], step: _Step) -> tuple[Tick | None, Reason]:
     """3 zone の `effective` が指示の値に届いた最初の tick（§2.4 の「届いた tick」）。"""
     seen_command = False
@@ -1215,8 +1232,9 @@ def analyse_sweep_step(
     if step.discarded is not None:
         observation.reason = Reason(step.discarded.reason)
         return observation
-    if faulted_during(context.ticks, step):
-        observation.reason = Reason.SAFETY_FAULT
+    step_reason = step_interval_reason(context, step)
+    if step_reason is not None:
+        observation.reason = step_reason
         return observation
     reach, missing = reached_tick(context.ticks, step)
     if reach is None:
@@ -1360,6 +1378,9 @@ def aggregate_sweep(
                 max_observed = observed if max_observed is None else max(max_observed, observed)
         if len(reps) < sweep.repetitions.value:
             zone_reasons.append(TableStatus.INSUFFICIENT_REPETITIONS.value)
+        elif len(reps) > sweep.repetitions.value:
+            # 0153 §2.4 は zone ごとに 3 回。多い回を黙って中央値へ混ぜない
+            zone_reasons.append(TableStatus.TOO_MANY_REPETITIONS.value)
         if any(not row["emitted"] for row in level_rows):
             zone_reasons.append(TableStatus.LEVEL_MISSING.value)
         candidate: dict[str, Any] | None = None
@@ -1419,6 +1440,8 @@ def _level_row(
         valid_days.add(rep.day)
     if reason is None and len(reps) < sweep.repetitions.value:
         reason = TableStatus.INSUFFICIENT_REPETITIONS.value
+    if reason is None and len(reps) > sweep.repetitions.value:
+        reason = TableStatus.TOO_MANY_REPETITIONS.value
     if reason is None and len(valid_days) < sweep.min_distinct_days.value:
         reason = TableStatus.INSUFFICIENT_DAYS.value
     values = [item.rpm_median for item in valid_obs if item.rpm_median is not None]
@@ -1522,8 +1545,9 @@ def analyse_matrix_step(
     if step.discarded is not None:
         window.reason = Reason(step.discarded.reason)
         return window
-    if faulted_during(context.ticks, step):
-        window.reason = Reason.SAFETY_FAULT
+    step_reason = step_interval_reason(context, step)
+    if step_reason is not None:
+        window.reason = step_reason
         return window
     reach, missing = reached_tick(context.ticks, step)
     if reach is None:
@@ -1540,6 +1564,7 @@ def analyse_matrix_step(
     ]
     coverage_failure: Reason | None = None
     range_evaluated = False
+    value_failure: Reason | None = None
     for tick in context.ticks:
         at = tick.ts_ms
         if at < reach.ts_ms + span or at > deadline:
@@ -1578,9 +1603,26 @@ def analyse_matrix_step(
             # 覆いを満たした区間が幅で外れた。前後の覆いの失敗より「未収束」を理由にする
             range_evaluated = True
             continue
-        return _value_window(context, window, step, at - length, at, config)
-    window.reason = Reason.UNSETTLED if range_evaluated else (coverage_failure or Reason.UNSETTLED)
+        attempt = MatrixWindow(label=step.label, index=index, start_ms=step.start_ms)
+        attempt = _value_window(context, attempt, step, at - length, at, config)
+        if attempt.reason in _RETRY_VALUE_WINDOW:
+            # 値の窓だけの覆いの欠け・傾きなら、締め切りまで後の時刻の窓を探す（§2.5）
+            value_failure = attempt.reason
+            continue
+        return attempt
+    if value_failure is not None:
+        window.reason = value_failure
+    else:
+        window.reason = (
+            Reason.UNSETTLED if range_evaluated else (coverage_failure or Reason.UNSETTLED)
+        )
     return window
+
+
+_RETRY_VALUE_WINDOW: Final = frozenset(
+    {Reason.TELEMETRY_COVERAGE, Reason.TRACE_COVERAGE, Reason.WINDOW_TREND}
+)
+"""値の窓で捨てても、後の時刻の窓を探し続ける理由。floor・Safety・Config は段ごと捨てる。"""
 
 
 def _value_window(

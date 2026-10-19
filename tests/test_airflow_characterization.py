@@ -1147,3 +1147,45 @@ def test_surplus_matrix_repetitions_are_not_averaged(bench: Bench) -> None:
     entries = build(paths)["response_matrix"]["aggregate"][0]["entries"]
     assert {entry["reason"] for entry in entries} == {"too_many_repetitions"}
     assert all(entry["mean"] is None for entry in entries)
+
+
+def test_config_change_before_the_window_discards_the_step(bench: Bench) -> None:
+    other = {**HASHES, "policy": "7" * 64}
+
+    def tick_fn(step: dict[str, Any], ts: int) -> dict[str, Any]:
+        if step["level"] == 0.6 and step["direction"] == "up" and ts - step["start_ms"] < 10 * S:
+            return {"hashes": other}
+        return {}
+
+    steps = sweep_steps("front", 1, T0, command_id=1)
+    bench.drive(steps, zone_fn=steady_rpm, tick_fn=tick_fn)
+    idle_readings(bench, T0, steps[-1]["end_ms"] + 10 * S)
+    db = bench.snapshot()
+    report = build([bench.manifest(manifest_doc("rpm_sweep", "r1", steps, db), "r1")])
+    by_level = {
+        (step["level"], step["direction"]): step["reason"] for step in report["rpm_sweep"]["steps"]
+    }
+    assert by_level[(0.6, "up")] == "config_mismatch"
+    assert by_level[(0.7, "up")] is None
+
+
+def test_surplus_sweep_repetitions_emit_no_table(bench: Bench) -> None:
+    report = build(sweep_runs(bench, days=(0, 0, 1, 1)))
+    front = report["rpm_sweep"]["zones"]["front"]
+    assert front["candidate"] is None and "too_many_repetitions" in front["reasons"]
+
+
+def test_value_window_failure_keeps_searching_later_windows(bench: Bench) -> None:
+    path = matrix_run(bench, "m1", T0)
+    steps = yaml.safe_load(path.read_text(encoding="utf-8"))["steps"]
+    rr_plus = next(step for step in steps if step["label"] == "Rr+")
+    # 最初の値の窓（61〜181 s）の始めにだけ hotspot の stale を 1 行（落ち着きには使わない）
+    bench.reading("gpu.0.hotspot", rr_plus["start_ms"] + 62_500, 70.0, quality="stale")
+    document = yaml.safe_load(path.read_text(encoding="utf-8"))
+    document["db_copy"]["sha256"] = sha(bench.snapshot("m1.db"))
+    path.write_text(yaml.safe_dump(document), encoding="utf-8")
+    report = build([path])
+    item = pair(report, 0, "Rr+")
+    assert item["status"] == "ok", item
+    step = next(s for s in report["response_matrix"]["runs"][0]["steps"] if s["label"] == "Rr+")
+    assert step["window_start"] > ac._iso(rr_plus["start_ms"] + 62_500, make_config().zone)
