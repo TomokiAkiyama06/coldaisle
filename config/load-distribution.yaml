@@ -1,0 +1,101 @@
+# 負荷の状態ごとの差温度（`d.*`）の分布（coldaisle-load-distribution。#50 / 決定記録 0151）
+#
+# **DB を読むだけで、合否も閾値の提案も出さない**（0151 §2.1）。p99 + マージンの計算と
+# `config/rules.yaml` の値の決定は人がする。
+# コードに既定値は無いので、ここを消すと集計は動かない（AGENTS.md ルール9。0151 §2.10）。
+# 鍵の欠け・未知の鍵・型の違いは起動時に拒否する。
+#
+# **値はすべて `provisional`**（0151 §2.10 の初期値）。変えるときは設定の差分と、出力の来歴に
+# 残る設定の SHA-256 で追える。
+#
+#   uv run coldaisle-load-distribution --db <DB の写し> --start 2026-10-15T16:36 \
+#     --end 2026-10-16T16:36 --out var/load-distribution/t1.json
+#
+# 出力は `docs/` に置かない（室温の推移は生活パターン。決定記録 0017 §2.4）。
+
+version: 1
+
+# `--start` / `--end` にタイムゾーンが無いときの解釈と、表示に使うローカル時刻
+timezone: "Asia/Tokyo"
+
+# 1回で集計できる期間の上限（日）。生データの保持期間（config/retention.yaml の raw_days）と同じ
+max_period_days: 30
+
+# 電力の窓の中の ok の件数の基準にする期待周期（ms）
+expected_interval_ms: 2500
+
+# 負荷の状態の軸（0151 §2.2）。帯は下限（W）の昇順で、`[下限, 次の帯の下限)`。最初の帯の下限は 0。
+# 帯の値は 0151 §5 #2 の決定（GPU は T1 の 24 h の分布から選んだ境目）
+axes:
+  cpu:
+    metric: power.cpu.package
+    bands:
+      - {name: idle, lower_w: 0}
+      - {name: light, lower_w: 50}
+      - {name: full, lower_w: 120}
+  gpu:
+    metric: power.gpu.0
+    bands:
+      - {name: idle, lower_w: 0}
+      - {name: light, lower_w: 30}
+      - {name: high, lower_w: 200}
+      - {name: full, lower_w: 350}
+
+# 評価時刻 t の電力は `(t - power_window_ms, t]` の ok の行の平均（ms）
+power_window_ms: 30000
+# 窓の中の ok の行が `power_window_ms / expected_interval_ms × power_min_ok_ratio` に満たない軸は unknown
+power_min_ok_ratio: 0.5
+
+# 状態が変わった時刻からこの長さ（ms）は transition（主の分布に入れない。0151 §5 #3）
+settle_ms: 300000
+# 評価時刻の間隔がこれ（ms）を超えたら落ち着きの計時をやり直す（stale_after_ms と同じ）
+max_gap_ms: 10000
+# `d.*` の減数を対にする古さの上限（ms。2 周期）
+pair_max_age_ms: 5000
+# as-of の trace の古さの上限・連続した trace の区間を切る間隔（ms。tick 1000 ms の 2 倍）
+trace_max_age_ms: 2000
+# `fan.*.pwm` を評価時刻に使う古さの上限（ms。2 周期）
+fan_max_age_ms: 5000
+# trace の `pwm_raw` と物理の `fan.*.pwm` の差の許容（%。約 5 / 255）
+pwm_match_tolerance_pct: 2.0
+# 連続した trace の区間で一致しなかった Fan のサンプルの割合の上限
+pwm_mismatch_max_ratio: 0.05
+# Fan のサンプル（coldaisle-telemetry の収集）の期待周期（ms。config/internal-telemetry.yaml の interval_ms と同じ）
+fan_expected_interval_ms: 2500
+# trace の区間ごとに求める、突き合わせられた Fan のサンプルの最小の数（約 5 分）
+fan_min_samples_per_segment: 120
+# trace の区間ごとの Fan のサンプルの覆いの割合の下限
+fan_min_coverage_ratio: 0.8
+# 指令が物理の PWM に反映されるまで許す遅れ（ms。telemetry の 1 周期 2500 ms + fand の 1 tick 1000 ms）
+pwm_apply_delay_ms: 3500
+
+# 出す分位点（Hyndman–Fan の type 7。重複なし昇順）
+quantiles: [0.01, 0.05, 0.25, 0.5, 0.75, 0.95, 0.99]
+# 分位点・標準偏差を出す件数の下限（約 5 分）
+min_samples: 120
+
+# 集計する metric（0151 §2.5）。config/metrics.yaml に無い名前は起動時に拒否する
+metrics:
+  - d.intake_rise
+  - d.gpu_preheat
+  - d.gpu_delta
+  - d.top_rise
+  - d.rear_rise
+  - d.gpu_internal_delta
+  - d.case_delta
+  - d.connector_rise
+  - air.room
+  - air.front_intake
+  - air.gpu_intake
+  - air.gpu_exhaust
+  - air.rear_exhaust
+  - air.top_exhaust
+  - gpu.0.core
+  - cpu.package
+  - board.connector_12v2x6
+  - air.room_humidity
+  - power.gpu.0
+  - power.cpu.package
+  - fan.front.pwm
+  - fan.rear.pwm
+  - fan.top.pwm
