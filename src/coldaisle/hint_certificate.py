@@ -57,6 +57,8 @@ Sha256 = Annotated[str, Field(pattern=_SHA256_PATTERN)]
 FiniteFloat = Annotated[float, Field(allow_inf_nan=False)]
 NonNegativeFinite = Annotated[float, Field(ge=0.0, allow_inf_nan=False)]
 UnitDemand = Annotated[float, Field(ge=0.0, le=1.0, allow_inf_nan=False)]
+DemandTolerance = Annotated[float, Field(ge=0.0, lt=1.0, allow_inf_nan=False)]
+"""``eps``（0156 §2.6 の ``eps < 1.0``）。導出が拒む値を型でも持てなくする（PR #357）。"""
 
 
 class _Frozen(BaseModel):
@@ -202,7 +204,7 @@ class HintGateSpec(_Frozen):
     """
 
     spec_version: Literal["hint-gate-spec-v1"]
-    eps: NonNegativeFinite
+    eps: DemandTolerance
     eps_c: NonNegativeFinite
     certified_domain: HintGateDomain
     grid_points: int = Field(gt=0)
@@ -261,7 +263,7 @@ class HintCertificateBody(_Frozen):
     thermal_model: CertifiedThermalModel
     components: HintCertificateComponents
     certified_domain: HintGateDomain
-    eps: NonNegativeFinite
+    eps: DemandTolerance
     eps_c: NonNegativeFinite
     grid_points: int = Field(gt=0)
 

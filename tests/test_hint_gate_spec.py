@@ -382,6 +382,13 @@ def test_the_error_message_does_not_carry_the_values(tmp_path: Path) -> None:
     assert "7.654321" not in str(caught.value)
 
 
+def test_the_spec_rejects_a_demand_tolerance_of_one(tmp_path: Path) -> None:
+    raw = json.loads(derive(load(tmp_path, documents())).canonical_bytes())
+    raw["eps"] = 1.0
+    with pytest.raises(ValidationError, match="eps"):
+        cert.HintGateSpec.model_validate_json(json.dumps(raw))
+
+
 def test_the_spec_rejects_a_grid_points_that_does_not_follow_the_domain(tmp_path: Path) -> None:
     spec = derive(load(tmp_path, documents()))
     raw = json.loads(spec.canonical_bytes())
@@ -622,6 +629,7 @@ def test_unreadable_certificates(tmp_path: Path) -> None:
         lambda raw: raw["certified_domain"]["hint_keys"].reverse(),
         lambda raw: raw["certified_domain"]["previous_demand"].update(minimum=0.0),
         lambda raw: raw.update(eps=-0.1),
+        lambda raw: raw.update(eps=1.0),
     ],
 )
 def test_invalid_certificates(tmp_path: Path, mutate: Any) -> None:
