@@ -166,6 +166,26 @@ v1 artifact は変えず、v1 を v2 として読み替えない。
 - **anchor 推論**（`predict`）: 計画 action の列は `hold_effective`（いま掛かっている effective demand を
   全 step で保つ）。`predict_trajectory` は action schema の格子と完全に一致する列だけを予測する
 
+- **学習の CLI**（`coldaisle-train`。決定記録 [0150](decisions/0150-train-cli.md)）: Dataset v2 の公開物の1回の読み →
+  元の入力と本番の DB との照合と作り直し → 較正の記録との照合 → split → 学習と同梱 Profile → 読み込み側の検査、を
+  1回の実行で行い、`--out` に `artifact.json`・`metadata.json`・`training-report.json` と完成の印 `COMPLETE.json` を
+  置く。**既定では Registry を書かない**。`--apply` のときだけ candidate を登録する（production は動かない）。
+  `authority_compatibility` は `(shadow,)` 固定。学習の選択は `--training-spec` の YAML（例は
+  `config/training.example.yaml`。仮の値）。例:
+
+  ```bash
+  uv run coldaisle-train --dataset var/datasets/dataset-<32 hex> --replay-path ~/server_sensor_logs \
+      --calibration-history-db var/coldaisle.db --declared-changes var/declared-changes.yaml \
+      --quality-config config/quality.yaml --calibration config/calibration.json \
+      --metrics-config config/metrics.yaml --training-spec var/training.yaml \
+      --model-id rack-thermal --model-version 0.1.0 --created-at 2026-10-20T09:00:00+09:00 \
+      --out var/training/rack-thermal-0.1.0
+  ```
+
+  `--out` の親（と祖先）は既にあり、実行した uid（か root）の所有で他人が書けないこと。symlink を含まない実の path を
+  渡す（macOS は `/private/tmp/...`。macOS では祖先に ACL が無いことを運用の前提とする。0150 §5 の 15）。失敗した段
+  （`stage`）と回復は 0150 §2.4 の表。手動の登録は `coldaisle-registry register --training-output <--out>`
+
 MPC への束縛（`MpcModelBinding`・`PlanPrediction`・§2.5 の探索範囲の写し）は段 4（#86。次の次の節）、
 runtime contract の例と `docs/model-registry.md` は段 5（#104）で v2 に合わせた。
 

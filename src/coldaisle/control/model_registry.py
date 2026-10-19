@@ -1247,6 +1247,19 @@ class RegistryDurabilityError(ModelRegistryError):
     """
 
 
+class RegistryCommitNotDurableError(RegistryDurabilityError):
+    """``register_candidate`` の登録は確定した（``registry.json`` を置き換えた）が永続が確かでない。
+
+    決定記録 0150 §2.5。lock の中で確定を知っている ``register_candidate`` だけが投げる。
+    呼び出し側は snapshot を読み直して確定を推し量らず、この型で「candidate は見えている・
+    再登録しない」と分ける。artifact ファイルの段の ``RegistryDurabilityError`` はこの型にしない。
+    """
+
+    def __init__(self, message: str, *, ref: ArtifactRef) -> None:
+        super().__init__(message)
+        self.ref = ref
+
+
 class RegistryCapacityError(ModelRegistryError):
     """The next registry snapshot would exceed the configured snapshot bound."""
 
@@ -1410,7 +1423,12 @@ class ModelRegistry:
                 # is committed and the artifact is referenced: never delete it.
                 if not (snapshot_attempted and isinstance(exc, RegistryDurabilityError)):
                     self._remove_artifact_if_unreferenced(root_fd, ref)
-                raise
+                    raise
+                # 確定したことを例外の型で持ち出す（決定記録 0150 §2.5）。読み直した snapshot から
+                # 推し量ると、lock を放した後の他の操作と取り違える
+                raise RegistryCommitNotDurableError(
+                    f"candidate は登録済みだが永続が確かでない: {ref.key}", ref=ref
+                ) from exc
             return ref
 
     def mark_validated(

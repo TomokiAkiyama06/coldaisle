@@ -196,8 +196,9 @@ v1 との違い（規則の正本は [0087](decisions/0087-dataset-v2-action-gri
      （manifest と `examples.jsonl`）が渡された dataset と完全に一致することを求める
   **学習には元の日次 CSV と manifest が要る**。`control_trace_sha256` は `seq` を含むので、学習に使う dataset の専用 DB の
   ControlTick も、本番の trace を `seq` ごと写したものにする（`coldaisle-dataset` の v2 が写す。決定記録
-  [0116](decisions/0116-dataset-cli-copies-production-traces.md)）。学習の CLI はまだ無く、関数の入口まで。較正ファイルとの照合（`verify_training_calibration`）は
-  返した記録で続けて行う
+  [0116](decisions/0116-dataset-cli-copies-production-traces.md)）。学習の CLI `coldaisle-train`（決定記録
+  [0150](decisions/0150-train-cli.md)）がこの検査と、返した記録での較正ファイルとの照合（`verify_training_calibration`）を
+  必須の引数で続けて行う
 - `control_trace_sha256` は run の全 ControlTick を `seq` 付きで hash する（v2 は anchor 以外の tick も使うため）
 
 ### v2 の CLI（決定記録 0109）

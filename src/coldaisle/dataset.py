@@ -911,8 +911,14 @@ def _action_zone(tick: ControlTick, zone: Zone) -> ActionZone:
     )
 
 
-def _open_output_root(output_root: Path) -> int:
-    """pathの各要素をsymlink非追従で開き、必要なdirectoryだけ作る。"""
+def open_output_root(output_root: Path, *, create: bool = True) -> int:
+    """pathの各要素をsymlink非追従で開き、必要なdirectoryだけ作る。
+
+    開いた最後の directory が実行 user の所有で group / world が書けないことを確かめ、その fd を
+    返す（祖先は確かめない）。``create`` が偽なら無い要素を作らず ``FileNotFoundError``
+    （``coldaisle-train`` の ``--out`` の親。決定記録 0150 §2.5 の手順 1）。Dataset の writer は
+    既定の真のまま使う（0031 §3 の挙動を変えない）。
+    """
     if ".." in output_root.parts:
         raise ValueError("output rootに '..' は使えない")
     absolute = output_root if output_root.is_absolute() else Path.cwd() / output_root
@@ -921,8 +927,9 @@ def _open_output_root(output_root: Path) -> int:
         for component in absolute.parts[1:]:
             if component in ("", "."):
                 continue
-            with suppress(FileExistsError):
-                os.mkdir(component, mode=0o700, dir_fd=directory_fd)
+            if create:
+                with suppress(FileExistsError):
+                    os.mkdir(component, mode=0o700, dir_fd=directory_fd)
             next_fd = os.open(component, _DIRECTORY_FLAGS, dir_fd=directory_fd)
             os.close(directory_fd)
             directory_fd = next_fd
@@ -1011,7 +1018,7 @@ def write_dataset(
         raise ValueError("manifestのexamples_sha256が書き出すbytesと一致しない")
     manifest_payload = (dataset.manifest.model_dump_json(indent=2) + "\n").encode()
 
-    root_fd = _open_output_root(output_root)
+    root_fd = open_output_root(output_root)
     lock_fd: int | None = None
     staging_fd: int | None = None
     staging_name: str | None = None

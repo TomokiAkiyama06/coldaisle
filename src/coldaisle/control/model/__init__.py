@@ -55,6 +55,7 @@ from coldaisle.control.model.counterfactual_training import (
     CounterfactualTrainingSpec,
     VerifiedTrainingDatasetArtifactV2,
     assemble_counterfactual_artifact,
+    load_training_dataset_artifact_v2,
     train_counterfactual_ridge,
     verify_training_dataset_artifact_v2,
 )
@@ -200,6 +201,7 @@ __all__ = [
     "fit_confidence_profile_v2",
     "hold_effective",
     "inference_id",
+    "load_training_dataset_artifact_v2",
     "registry_metadata",
     "registry_metadata_json_bytes",
     "replay_cases",
