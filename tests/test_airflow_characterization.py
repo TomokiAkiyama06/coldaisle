@@ -1189,3 +1189,20 @@ def test_value_window_failure_keeps_searching_later_windows(bench: Bench) -> Non
     assert item["status"] == "ok", item
     step = next(s for s in report["response_matrix"]["runs"][0]["steps"] if s["label"] == "Rr+")
     assert step["window_start"] > ac._iso(rr_plus["start_ms"] + 62_500, make_config().zone)
+
+
+def test_null_rpm_during_the_ramp_restarts_the_response_time(bench: Bench) -> None:
+    def gap(step: dict[str, Any], zone: str, ts: int) -> dict[str, Any]:
+        item = steady_rpm(step, zone, ts)
+        offset = ts - step["start_ms"]
+        if zone == "front" and step["level"] == 0.4 and 2 * S <= offset < 10 * S:
+            item["rpm"] = None
+        return item
+
+    steps = sweep_steps("front", 1, T0, command_id=1, levels=(0.35, 0.40), down=())
+    bench.drive(steps, zone_fn=gap)
+    idle_readings(bench, T0, steps[-1]["end_ms"] + 10 * S)
+    db = bench.snapshot()
+    report = build([bench.manifest(manifest_doc("rpm_sweep", "r1", steps, db), "r1")])
+    # 帯に入るのは null の後（10 s）。tach の更新 1500 ms を足す
+    assert report["rpm_sweep"]["steps"][1]["response_ms"] == 10 * S + 1500

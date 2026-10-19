@@ -1290,7 +1290,7 @@ def analyse_sweep_step(
     observation.rpm_median = median
     observation.u = math.sqrt(stat.u_win**2 + quantization**2)
     observation.rpm_max = int(max(values))
-    observation.response_ms = _response_time(context.ticks, step, median, end, config)
+    observation.response_ms = _response_time(context.ticks, step, median, start, end, config)
     return observation
 
 
@@ -1298,6 +1298,7 @@ def _response_time(
     ticks: Sequence[Tick],
     step: SweepStep,
     target: float,
+    window_start_ms: int,
     window_end_ms: int,
     config: AirflowCharacterizationConfig,
 ) -> int | None:
@@ -1325,6 +1326,10 @@ def _response_time(
     for index in range(len(in_step) - 1, change - 1, -1):
         rpm = in_step[index].zones[step.zone].rpm
         if rpm is None:
+            # 記録の窓の中の null は回転数の覆い（§2.3）で検査済み。窓の前の null は
+            # 「帯に留まった」と言えないので、そこで区切る（応答の時間を短く見積もらない）
+            if in_step[index].ts_ms < window_start_ms:
+                break
             continue
         if abs(rpm - target) > band:
             break
