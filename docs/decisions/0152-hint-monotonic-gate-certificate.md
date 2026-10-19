@@ -3,6 +3,7 @@
 - **種別**: Decision Record
 - **Status**: FINAL（2026-10-16、リポジトリ所有者の承認）
 - **Date**: 2026-10-16
+- **Superseded by**: §2.3 の部品の表の `conditions` の行の「`conditions()` の全体（列挙を別に持たない）」の部分は [0160](0160-hint-conditions-digest-scope.md)（Registry の revision・`production_active`・`artifact_status`・`authority_stage` の閉じた一覧を除いて束ねる。照合する側・他の部品は変えない。Proposed）
 - **Supersedes**: なし（[0066](0066-workload-hint-stage-b-conditions.md) §2.1 (b) / (c) と
   [0133](0133-workload-hint-stage-b-prior-rollout.md) §2.5 / §2.5a / §2.6 / §2.9 を置き換えず、具体の形を補う。
   0066 §5 の未決 #3（ハッシュの置き場所）と #5（Thermal Model の昇格との結び付け）、0133 §5 の未決 #3 に答える）
