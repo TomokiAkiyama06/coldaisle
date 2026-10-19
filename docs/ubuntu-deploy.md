@@ -1404,27 +1404,30 @@ unit の `ExecStart=` は、以前のテンプレートでは console script（`
 > （合わなければ B0 に倒れるだけで、冷却の制御は変わりません）。
 
 1. `/opt/coldaisle` を更新し、root で venv を同期します（2 節と同じ形。`uv sync --no-dev`）
-2. 3つの unit を置き直して読み込ませます。導入先で書き換えた行（`WatchdogSec=`・`--t-sensor-metric` など。6.2 / 6.5）は
-   置き直した後に同じく書き換えます（`sudo cp` の前に `diff` で差分を見ておきます）
+2. **置いてある unit だけ**を置き直して読み込ませます。worker の unit をまだ置いていない導入先（6.8 の前）では
+   fand の unit だけが対象です（ここで worker の unit を新しく置きません。6.8 の手順で置きます）。
+   下の `units` は、`/etc/systemd/system/` に置いてある unit の名前だけを集めます。3〜5 も同じ shell で続けます。
+   導入先で書き換えた行（`WatchdogSec=`・`--t-sensor-metric` など。6.2 / 6.5）は、置き直した後に同じく書き換えます
+   （`sudo cp` の前に `diff` で差分を見ておきます）
 
    ```bash
+   units=()
    for u in coldaisle-fand coldaisle-learnd-mpc coldaisle-learnd-supervisor; do
-     diff -u "/etc/systemd/system/$u.service" "/opt/coldaisle/deploy/systemd/$u.service"
+     [ -e "/etc/systemd/system/$u.service" ] && units+=("$u")
    done
-   sudo cp /opt/coldaisle/deploy/systemd/coldaisle-fand.service \
-           /opt/coldaisle/deploy/systemd/coldaisle-learnd-mpc.service \
-           /opt/coldaisle/deploy/systemd/coldaisle-learnd-supervisor.service /etc/systemd/system/
+   echo "${units[@]}"   # 置き直す unit
+   for u in "${units[@]}"; do
+     diff -u "/etc/systemd/system/$u.service" "/opt/coldaisle/deploy/systemd/$u.service"
+     sudo cp "/opt/coldaisle/deploy/systemd/$u.service" /etc/systemd/system/
+   done
    sudoedit /etc/systemd/system/coldaisle-fand.service   # 導入先で書き換えていた行を戻す（6.2 / 6.5）
    sudo systemctl daemon-reload
    ```
 
-   worker の unit をまだ置いていない導入先（6.8 の前）は、fand の unit だけを置き直します
 3. `systemd-analyze verify` で確かめます。`... is not executable` が出ないこと（`/opt/coldaisle/.venv/bin/python` が実在すること）
 
    ```bash
-   sudo systemd-analyze verify /etc/systemd/system/coldaisle-fand.service \
-        /etc/systemd/system/coldaisle-learnd-mpc.service \
-        /etc/systemd/system/coldaisle-learnd-supervisor.service
+   for u in "${units[@]}"; do sudo systemd-analyze verify "/etc/systemd/system/$u.service"; done
    ```
 
 4. `ExecStart=` が `-I -m` の形になったことを確かめます。`argv[]=` が
@@ -1432,14 +1435,17 @@ unit の `ExecStart=` は、以前のテンプレートでは console script（`
    始まること
 
    ```bash
-   systemctl show -p ExecStart coldaisle-fand coldaisle-learnd-mpc coldaisle-learnd-supervisor
+   systemctl show -p ExecStart "${units[@]}"
    ```
 
-5. worker を動かしているなら再起動し、動いているプロセスの引数に `-I` と `-m` があることを確かめます
+5. 動いている worker があれば再起動し、動いているプロセスの引数に `-I` と `-m` があることを確かめます
+   （止まっている worker は起動しません）
 
    ```bash
-   sudo systemctl restart coldaisle-learnd-mpc coldaisle-learnd-supervisor
-   for u in coldaisle-learnd-mpc coldaisle-learnd-supervisor; do
+   for u in "${units[@]}"; do
+     [ "$u" = coldaisle-fand ] && continue
+     systemctl is-active --quiet "$u" || continue
+     sudo systemctl restart "$u"
      pid=$(systemctl show -p MainPID --value "$u")
      sudo tr '\0' ' ' < "/proc/$pid/cmdline"; echo
    done
