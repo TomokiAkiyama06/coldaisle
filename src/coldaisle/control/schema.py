@@ -1188,10 +1188,14 @@ class SafetyProvenance(_Frozen):
 REGISTRY_ARTIFACT_KINDS: frozenset[str] = frozenset(
     {"thermal_model", "confidence_model", "supervisor_policy", "feature_transform"}
 )
-"""registry が production pointer を持つ artifact kind（`RegistryProvenance.production` の鍵）。
+"""制御が artifact として束縛する kind（`RegistryProvenance.production` の鍵）。**固定の値。**
 
-`coldaisle.control.model_registry.ArtifactKind` の値。schema は registry を import しないので
-値で持ち、食い違いは tests/test_model_registry.py で止める。
+`coldaisle.control.model_registry.ArtifactKind` の値のうち、`hint_certificate` を除いたもの。
+`ArtifactKind` から導かない: kind を足すたびにこの集合が広がると、保存済みの v10 以降の trace
+（4 つの鍵）が読み直しの検証で落ちる（決定記録 0152 §2.7a の案 P）。schema は registry を
+import しないので値で持ち、「`ArtifactKind` の値 = この集合 ∪ {`hint_certificate`}」を
+tests/test_model_registry.py で止める。provenance に載せない kind をもう1つ足すときは、その等式の
+変更と決定記録を要る。
 """
 
 REGISTRY_POINTER_CHANGE_EVENTS: frozenset[str] = frozenset({"promoted", "rolled_back"})

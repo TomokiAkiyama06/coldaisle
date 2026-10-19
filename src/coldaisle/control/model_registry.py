@@ -36,6 +36,7 @@ from pydantic import (
 
 from coldaisle.clock import Clock, WallClock
 from coldaisle.control.schema import (
+    REGISTRY_ARTIFACT_KINDS,
     AuthorityStage,
     RegistryPointerChange,
     RegistryProductionPointer,
@@ -43,15 +44,20 @@ from coldaisle.control.schema import (
     registry_reason_sha256,
 )
 
-MODEL_REGISTRY_SCHEMA_VERSION: Literal[3] = 3
+MODEL_REGISTRY_SCHEMA_VERSION: Literal[4] = 4
 """**書き出す** registry schema version。"""
-MODEL_REGISTRY_READABLE_SCHEMA_VERSIONS: tuple[int, ...] = (2, 3)
-"""**読める** registry schema version。v2 は v3 の部分集合である。
+MODEL_REGISTRY_READABLE_SCHEMA_VERSIONS: tuple[int, ...] = (2, 3, 4)
+"""**読める** registry schema version。v2 は v3 の、v3 は v4 の部分集合である。
 
 v3 の差は `ArtifactCapability` に値が1つ増えただけで、v2 の snapshot は新しい列挙でそのまま
 復号できる。読めないことにすると、既存の production artifact がすべて使えなくなり
 Fallback へ落ちる（#89 レビュー）。**v2 は読み、次の書き込みで v3 へ上げる**
 （`_append_event` は既定の版で snapshot を作り直す）。
+
+v4 の差は `ArtifactKind.HINT_CERTIFICATE` と `ArtifactCapability.HINT_MONOTONICITY_CERTIFICATE`
+を足したことだけ（#288 / 決定記録 0152 §2.2）。v2 / v3 の snapshot はそのまま読み、次の書き込みで
+v4 へ上げる。**v4 より前の版の snapshot・metadata は新しい値を持てない**（古い版を名乗ったまま
+新しい値を入れた snapshot を作らない）。
 """
 MODEL_REGISTRY_CONFIG_FILENAME = "model-registry.yaml"
 
@@ -106,6 +112,22 @@ class ArtifactKind(StrEnum):
     CONFIDENCE_MODEL = "confidence_model"
     SUPERVISOR_POLICY = "supervisor_policy"
     FEATURE_TRANSFORM = "feature_transform"
+    HINT_CERTIFICATE = "hint_certificate"
+    """Workload Hint の単調性ゲートの証明書（#288 / 決定記録 0152 §2.2）。
+
+    thermal_model と同じ lifecycle を通るが、**制御が artifact として束縛する kind ではない**。
+    frame の `expected_artifacts` にも trace の `RegistryProvenance` にも載せない（0152 §2.2 /
+    §2.7a）。`register` で申告できる能力は `hint_monotonicity_certificate` だけ。
+    """
+
+
+_PROVENANCE_KINDS: tuple[ArtifactKind, ...] = tuple(
+    kind for kind in ArtifactKind if kind.value in REGISTRY_ARTIFACT_KINDS
+)
+"""trace の `RegistryProvenance` に載せる kind（決定記録 0152 §2.7a）。
+
+`REGISTRY_ARTIFACT_KINDS`（固定の値）に入る kind だけ。`ArtifactKind` の全値からは導かない。
+"""
 
 
 class ArtifactCapability(StrEnum):
@@ -127,6 +149,14 @@ class ArtifactCapability(StrEnum):
     この能力を申告した artifact が MPC の内部モデルや学習 dynamics として束縛される経路は
     無い。逆に #89 の束縛はこの能力だけを受け付けるので、thermal artifact を
     `supervisor_policy` として取り違えて渡す配線ミスも型で止まる（決定記録 0061 §2.1）。
+    """
+    HINT_MONOTONICITY_CERTIFICATE = "hint_monotonicity_certificate"
+    """Workload Hint の単調性ゲートに合格した証明書（#288 / 決定記録 0152 §2.2）。
+
+    **予測も戦略も持たない。** `COUNTERFACTUAL_CAPABILITIES` にも `supervisor_strategy` の束縛にも
+    入らないので、この能力の artifact が MPC の内部モデル・RL の policy として束縛される経路は
+    無い（0061 §2.1 の `supervisor_strategy` と同じ、型で取り違えを止める形）。kind
+    `hint_certificate` とだけ組になる（`ArtifactMetadata` が両向きに検査する）。
     """
 
 
@@ -205,12 +235,22 @@ HyperparameterValue = str | int | float | bool | None
 _HYPERPARAMETER_TYPES = (str, int, float, bool, type(None))
 
 
+_REF_MODEL_ID_MAX_LENGTH = 120
+_REF_VERSION_MAX_LENGTH = 80
+_TRAINING_DATASET_VERSION_MAX_LENGTH = 200
+_THERMAL_MODEL_KEY_MAX_LENGTH = (
+    len(ArtifactKind.THERMAL_MODEL.value) + 2 + _REF_MODEL_ID_MAX_LENGTH + _REF_VERSION_MAX_LENGTH
+)
+"""`thermal_model/<model_id>/<version>` の最長。証明書の `training_dataset_version` はこの key を
+持つので、欄の上限をこれに合わせる（ほかの kind は従来の 200 のまま。PR #349 の Codex P2）。"""
+
+
 class ArtifactRef(_Frozen):
     """Stable identity of one artifact version."""
 
     kind: ArtifactKind
-    model_id: str = Field(pattern=_IDENTIFIER_PATTERN, max_length=120)
-    version: str = Field(pattern=_SEMVER_PATTERN, max_length=80)
+    model_id: str = Field(pattern=_IDENTIFIER_PATTERN, max_length=_REF_MODEL_ID_MAX_LENGTH)
+    version: str = Field(pattern=_SEMVER_PATTERN, max_length=_REF_VERSION_MAX_LENGTH)
 
     @property
     def key(self) -> str:
@@ -221,7 +261,7 @@ class ArtifactRef(_Frozen):
 class ArtifactMetadata(_Frozen):
     """Training, compatibility, evaluation, and integrity metadata."""
 
-    schema_version: Literal[2, 3] = MODEL_REGISTRY_SCHEMA_VERSION
+    schema_version: Literal[2, 3, 4] = MODEL_REGISTRY_SCHEMA_VERSION
     kind: ArtifactKind
     artifact_format: ArtifactFormat
     capability: ArtifactCapability
@@ -234,11 +274,19 @@ class ArtifactMetadata(_Frozen):
     ので、値が1つ増えた snapshot は古い読み手が復号できない。復号できないと
     `INVALID_REGISTRY` になり registry 全体が読めなくなるため、**加算だからと版を据え置か
     ない。** 版を上げることで「この snapshot は新しい読み手が要る」を明示する。
+
+    v4 で `hint_monotonicity_certificate` を足した（#288 / 決定記録 0152 §2.2）。kind
+    `hint_certificate` と組でだけ使い、欄の意味を kind ごとに固定する（0152 §5 の 2 (a)。
+    `_hint_certificate_fields_are_fixed`）。
     """
     model_id: str = Field(pattern=_IDENTIFIER_PATTERN, max_length=120)
     version: str = Field(pattern=_SEMVER_PATTERN, max_length=80)
     created_at: str = Field(min_length=1, max_length=64)
-    training_dataset_version: str = Field(min_length=1, max_length=200)
+    training_dataset_version: str = Field(
+        min_length=1,
+        max_length=max(_TRAINING_DATASET_VERSION_MAX_LENGTH, _THERMAL_MODEL_KEY_MAX_LENGTH),
+    )
+    """hint_certificate 以外の kind は 200 文字まで（`_hint_certificate_fields_are_fixed`）。"""
     # Every sequence / mapping reachable from RegistrySnapshot stops at its first bad
     # member (FailFast or a fail-fast validator); see RegistrySnapshot.audit.
     source_runs: Annotated[tuple[str, ...], FailFast()] = Field(min_length=1)
@@ -289,10 +337,80 @@ class ArtifactMetadata(_Frozen):
                 raise ValueError("hyperparameter に非有限値を入れない")
         return self
 
+    @model_validator(mode="after")
+    def _hint_certificate_fields_are_fixed(self) -> Self:
+        # kind と能力は両向きに組にする。片方だけの artifact を作ると、証明書を thermal_model
+        # として、あるいは thermal artifact を証明書として取り違える余地が残る（0152 §2.2）。
+        is_certificate_kind = self.kind is ArtifactKind.HINT_CERTIFICATE
+        claims_certificate = self.capability is ArtifactCapability.HINT_MONOTONICITY_CERTIFICATE
+        if is_certificate_kind != claims_certificate:
+            raise ValueError(
+                "kind hint_certificate と能力 hint_monotonicity_certificate は組でだけ使う"
+            )
+        if not is_certificate_kind:
+            if len(self.training_dataset_version) > _TRAINING_DATASET_VERSION_MAX_LENGTH:
+                raise ValueError(
+                    f"training_dataset_version は {_TRAINING_DATASET_VERSION_MAX_LENGTH} 文字まで"
+                )
+            return self
+        if self.schema_version < HINT_CERTIFICATE_MIN_SCHEMA_VERSION:
+            raise ValueError("hint_certificate は registry schema v4 より前の版で記録しない")
+        if self.artifact_format is not ArtifactFormat.JSON:
+            raise ValueError("hint_certificate の形式は json だけ")
+        # 0152 §5 の 2 (a): 既存の欄を kind ごとに意味を固定して使う。
+        if self.model_family != HINT_CERTIFICATE_MODEL_FAMILY:
+            raise ValueError(f"hint_certificate の model_family は {HINT_CERTIFICATE_MODEL_FAMILY}")
+        if certified_thermal_model_ref(self.training_dataset_version) is None:
+            raise ValueError(
+                "hint_certificate の training_dataset_version は認証した thermal_model の key"
+            )
+        if len(self.source_runs) != 1 or re.fullmatch(_SHA256_PATTERN, self.source_runs[0]) is None:
+            raise ValueError(
+                "hint_certificate の source_runs は証明書の certificate_sha256 の1つだけ"
+            )
+        # 決定記録 0156 §2.8: ゲートの仕様の版と証明書の本体の版。
+        if self.feature_schema_version != HINT_CERTIFICATE_FEATURE_SCHEMA_VERSION:
+            raise ValueError(
+                "hint_certificate の feature_schema_version は "
+                f"{HINT_CERTIFICATE_FEATURE_SCHEMA_VERSION}"
+            )
+        if self.target_schema_version != HINT_CERTIFICATE_TARGET_SCHEMA_VERSION:
+            raise ValueError(
+                "hint_certificate の target_schema_version は "
+                f"{HINT_CERTIFICATE_TARGET_SCHEMA_VERSION}"
+            )
+        return self
+
     @property
     def ref(self) -> ArtifactRef:
         """Return the stable reference represented by this metadata."""
         return ArtifactRef(kind=self.kind, model_id=self.model_id, version=self.version)
+
+
+HINT_CERTIFICATE_MIN_SCHEMA_VERSION = 4
+"""kind `hint_certificate` と能力 `hint_monotonicity_certificate` を記録できる最初の版。"""
+HINT_CERTIFICATE_FEATURE_SCHEMA_VERSION = "hint-gate-spec-v1"
+"""kind `hint_certificate` の metadata の `feature_schema_version`（決定記録 0156 §2.8）。"""
+HINT_CERTIFICATE_TARGET_SCHEMA_VERSION = "hint-certificate-v1"
+"""kind `hint_certificate` の metadata の `target_schema_version`（決定記録 0156 §2.8）。"""
+HINT_CERTIFICATE_MODEL_FAMILY = "hint-monotonicity-certificate"
+"""kind `hint_certificate` の metadata の `model_family`（決定記録 0152 §5 の 2 (a)）。"""
+
+
+def certified_thermal_model_ref(value: str) -> ArtifactRef | None:
+    """証明書の metadata の `training_dataset_version`（認証した thermal_model の key）を読む。
+
+    `thermal_model/<model_id>/<version>` の形でなければ `None`。証明書の中身との照合は
+    読み手（fand / worker）が行う（Registry は artifact を deserialize しない。0062 §2.3）。
+    """
+    parts = value.split("/")
+    if len(parts) != 3 or parts[0] != ArtifactKind.THERMAL_MODEL.value:
+        return None
+    try:
+        ref = ArtifactRef(kind=ArtifactKind.THERMAL_MODEL, model_id=parts[1], version=parts[2])
+    except ValidationError:
+        return None
+    return ref if ref.key == value else None
 
 
 class ModelCompatibility(_Frozen):
@@ -459,7 +577,7 @@ def _validate_member[ModelT: BaseModel](model: type[ModelT], value: object) -> M
 class RegistrySnapshot(_Frozen):
     """Atomically replaced complete registry state."""
 
-    schema_version: Literal[2, 3] = MODEL_REGISTRY_SCHEMA_VERSION
+    schema_version: Literal[2, 3, 4] = MODEL_REGISTRY_SCHEMA_VERSION
     revision: int = Field(ge=0)
     artifacts: dict[str, ArtifactRecord] = Field(default_factory=dict)
     production: dict[ArtifactKind, ProductionSlot] = Field(default_factory=dict)
@@ -484,9 +602,14 @@ class RegistrySnapshot(_Frozen):
     def trace_provenance(self) -> RegistryProvenance:
         """decision trace の各 tick へ載せる、この snapshot の版（決定記録 0071 §2.5）。
 
-        `revision` と、**全 kind** の production pointer（無ければ `None`）、その pointer を
-        成立させた最後の promotion / rollback の `tick_trace_metadata()`（`reason` は digest。
-        決定記録 0075）を返す。path を含まない。
+        `revision` と、**制御が artifact として束縛する kind**（`REGISTRY_ARTIFACT_KINDS`）の
+        production pointer（無ければ `None`）、その pointer を成立させた最後の promotion /
+        rollback の `tick_trace_metadata()`（`reason` は digest。決定記録 0075）を返す。path を
+        含まない。
+
+        `ArtifactKind` の全値は回さない。`hint_certificate` は provenance に載せず、ヒントの塊で
+        運ぶ（決定記録 0152 §2.7a の案 P）。載せると保存済みの v10 以降の trace（4 つの鍵）と
+        新しい provenance のどちらかが `RegistryProvenance` v1 の検証で落ちるため。
 
         **snapshot から読むだけで、registry にも過去の trace にも触れない。** 制御デーモンは
         起動時に持った snapshot からこれを1度作り、毎 tick 同じ値を載せる。
@@ -495,7 +618,7 @@ class RegistrySnapshot(_Frozen):
         for event in self.pointer_changes:
             established[event.artifact.kind] = event
         production: dict[str, RegistryProductionPointer] = {}
-        for kind in ArtifactKind:
+        for kind in _PROVENANCE_KINDS:
             slot = self.production.get(kind)
             if slot is None:
                 production[kind.value] = RegistryProductionPointer(
@@ -540,6 +663,15 @@ class RegistrySnapshot(_Frozen):
 
     @model_validator(mode="after")
     def _pointers_and_lifecycle_agree(self) -> Self:
+        if self.schema_version < HINT_CERTIFICATE_MIN_SCHEMA_VERSION and (
+            ArtifactKind.HINT_CERTIFICATE in self.production
+            or any(
+                record.metadata.kind is ArtifactKind.HINT_CERTIFICATE
+                for record in self.artifacts.values()
+            )
+        ):
+            # 古い版を名乗ったまま新しい kind を持つ snapshot を受け入れない（0152 §2.2）。
+            raise ValueError("registry schema v4 より前の snapshot は hint_certificate を持てない")
         for key, record in self.artifacts.items():
             if key != record.ref.key:
                 raise ValueError("artifact key と metadata が一致しない")
@@ -955,12 +1087,14 @@ class RegistryHealthReport(_Frozen):
     """
 
     health: RegistryHealth
-    supported_schema_version: Literal[3] = MODEL_REGISTRY_SCHEMA_VERSION
-    """**この実装が受理する** registry schema version。読んだ snapshot の申告ではない。
+    supported_schema_version: Literal[4] = MODEL_REGISTRY_SCHEMA_VERSION
+    """**この実装が書き出す** registry schema version。読んだ snapshot の申告ではない。
 
-    `MODEL_REGISTRY_SCHEMA_VERSION` と lockstep にする。v3 で `ArtifactCapability` に
-    `supervisor_strategy` が入った（#89 / 決定記録 0061 §2.1）ので、v2 の snapshot は
-    この実装では復号できず `INVALID_REGISTRY` になる（fail closed）。
+    `MODEL_REGISTRY_SCHEMA_VERSION` と lockstep にする。v4 で `ArtifactKind` に
+    `hint_certificate`、`ArtifactCapability` に `hint_monotonicity_certificate` が入った
+    （#288 / 決定記録 0152 §2.2）ので、v4 の snapshot は v3 までの実装では復号できず
+    `INVALID_REGISTRY` になる（fail closed）。この実装は v2 / v3 の snapshot も読む
+    （`MODEL_REGISTRY_READABLE_SCHEMA_VERSIONS`）。
     """
     revision: int = Field(ge=0)
     productions: tuple[ProductionHealth, ...] = ()

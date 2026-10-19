@@ -72,6 +72,7 @@ from coldaisle.control.safety.critical import (
     create_control_runtime_binding,
 )
 from coldaisle.control.schema import (
+    REGISTRY_ARTIFACT_KINDS,
     SCHEMA_VERSION,
     BoundBy,
     ControllerKind,
@@ -1228,7 +1229,8 @@ def test_invariant_12_every_tick_records_the_production_pointer_it_used(
         # 自由記述の `reason` は全文を載せず digest だけ（決定記録 0075）。
         assert thermal.established_by.reason_sha256 == registry_reason_sha256(promotion.reason)
         # production の無い kind も欄を揃えて残す（0062 §2.5）。
-        assert set(provenance.production) == {kind.value for kind in ArtifactKind}
+        # hint_certificate は載せない（0152 §2.7a）。
+        assert set(provenance.production) == REGISTRY_ARTIFACT_KINDS
         assert provenance.production[ArtifactKind.SUPERVISOR_POLICY.value].established_by is None
     stored = [json.loads(row) for row in harness.trace.rows]
     assert {row["registry"]["revision"] for row in stored} == {3}

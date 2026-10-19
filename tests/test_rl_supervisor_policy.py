@@ -260,6 +260,8 @@ def register_policy(
     artifact_bytes = payload or _policy_artifact_bytes(policy_artifact)
     derived = _derive_policy_registry_metadata(policy_artifact, artifact_bytes)
     metadata = ArtifactMetadata(
+        # 学習側が書く metadata の版（v3）をそのまま写す（実運用は derived の JSON を登録する）。
+        schema_version=derived.schema_version,
         kind=kind,
         artifact_format=ArtifactFormat.JSON,
         capability=capability,
