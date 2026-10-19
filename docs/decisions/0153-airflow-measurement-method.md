@@ -1,7 +1,7 @@
 # 決定記録 0153: 3 系統 Fan の回転数の掃引と応答の行列（風量の測定の第 1 段・測定中の安全・結果の置き場所）
 
 - **種別**: Decision Record
-- **Status**: Proposed
+- **Status**: FINAL（2026-10-19、リポジトリ所有者の承認。§5 の 1 点は推奨の案）
 - **Date**: 2026-10-16（2026-10-19 に範囲を絞って書き直し。§1）
 - **Supersedes**: なし
 - **関連**: [`0026`](0026-three-zone-fan-control.md) /
@@ -217,7 +217,7 @@ zone の間の結合までを 1 つの記録で決め、`air-balance.yaml` を `
 | 窓の傾き | `max_window_trend.temperature_c` / `max_window_trend.power_w` | 0.2 / 5 |
 | 部屋 | `max_room_drift_c` | 1.0 |
 | ポンプ | `max_aux_fan_delta_rpm` | 50 |
-| 分解能 | `resolution.air_c` / `resolution.power_w` / `resolution.gpu_core_c` / `resolution.cpu_package_c` / `resolution.board_connector_c` | 0.125 / 1 / 1 / 未決 / 未決（実機の値の刻みを確かめて決める。§5 の 1） |
+| 分解能 | `resolution.air_c` / `resolution.power_w` / `resolution.gpu_core_c` / `resolution.cpu_package_c` / `resolution.board_connector_c` | 0.125 / 1 / 1 / 実機の値の刻みを確かめて解析の道具の PR で決める / 同左（§5 の 1 で決定） |
 | 負荷 | `load.gpu_power_limit_w` | 300 |
 | 応答の行列 | `response_matrix.reference_demand` / `plus_demand` / `minus_demand` / `repetitions` / `min_distinct_days` / `max_power_delta_w` | 0.60 / 0.90 / 0.35 / 2 / 2 / 5 |
 | 承認の目安 | `approval.max_rpm_spread` | 3 % |
@@ -343,13 +343,13 @@ PR #341 の Codex のレビューの指摘のうち、本記録の範囲の外�
 | 3 zone を同時にランダムに動かして回帰で一度に求める | 落ち着くまで 10 分以上かかる系では段の数が足りず、floor の介入の判定も難しい |
 | GPU 600 W を固定の負荷にする | 低い Demand の段で Guard の floor と中止の基準に近づき、段の多くが捨てられる |
 
-## 5. 未決事項
+## 5. 判断点（決定済み。推奨を先頭に）
 
-所有者の判断が要る点。いずれも測定の前に決める。
+**所有者の決定（2026-10-19）**: 1 を推奨の案で決めた。§2 の本文はその決定を書いたものである。
 
-| # | 論点 | 選択肢 | 推奨 |
+| # | 論点 | 選択肢（推奨を先に） | 決定 |
 |---|---|---|---|
-| 1 | §2.8 の初期値（承認の目安の回転数 3 %・応答の行列の電力の差 5 W・落ち着きの幅・窓の覆いの割合など）と、未決の分解能（`cpu.package`・`board.connector_12v2x6`） | (a) この値で進め、分解能は実機の値の刻みを確かめて解析の道具の PR で決め、結果を承認する記録で見直す (b) 先に予備の測定で決める | **(a)** |
+| 1 | §2.8 の初期値（承認の目安の回転数 3 %・応答の行列の電力の差 5 W・落ち着きの幅・窓の覆いの割合など）と、未決の分解能（`cpu.package`・`board.connector_12v2x6`） | **(推奨) (a)** この値で進め、分解能は実機の値の刻みを確かめて解析の道具の PR で決め、結果を承認する記録で見直す / (b) 先に予備の測定で決める | 決定済み（所有者、2026-10-19）: (a) |
 
 範囲を絞ったことで、最初の案の §5 の 1（圧力差の向き）・2（独立の確認）・3（GPU の Fan のそろえ方）・5（小さな温度上昇）・6（結合）・
 8・9（duty の影響）は §2.12 の後続の記録へ移した。最初の案の §5 の 4 の EFU の部分も後続へ移し、回転数の部分を上の 1 に含めた。
