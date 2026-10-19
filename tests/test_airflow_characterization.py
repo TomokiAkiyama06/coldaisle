@@ -787,6 +787,33 @@ def test_room_drift_discards_the_session(bench: Bench) -> None:
     assert run["pairs"] == []
 
 
+def test_room_excursion_outside_the_value_windows_discards_the_session(bench: Bench) -> None:
+    # 値の窓（各段の 60〜180 s）の外、落ち着きの途中だけで 2 °C 動いて戻る
+    def room(label: str | None, ts: int) -> float:
+        return 2.0 if label == "Rr+" and (ts - T0) % MATRIX_STEP_MS < 40 * S else 0.0
+
+    run = build([matrix_run(bench, "m1", T0, effects={"air.room": room})])["response_matrix"][
+        "runs"
+    ][0]
+    assert run["reason"] == "room_drift"
+
+
+def test_an_early_coverage_gap_does_not_hide_unsettled(bench: Bench) -> None:
+    def wobble(label: str | None, ts: int) -> float:
+        return (1.5 if (ts // 2500) % 2 else -1.5) if label == "T+" else 0.0
+
+    path = matrix_run(bench, "m1", T0, effects={"gpu.0.core": wobble})
+    steps = yaml.safe_load(path.read_text(encoding="utf-8"))["steps"]
+    t_plus = next(step for step in steps if step["label"] == "T+")
+    # 段の始めの 1 行だけ stale（最初の候補の区間は覆いを欠く）
+    bench.reading("air.room", t_plus["start_ms"] + 2500, 24.0, quality="stale")
+    document = yaml.safe_load(path.read_text(encoding="utf-8"))
+    document["db_copy"]["sha256"] = sha(bench.snapshot("m1.db"))
+    path.write_text(yaml.safe_dump(document), encoding="utf-8")
+    item = pair(build([path]), 0, "T+")
+    assert item["reason"] == "unsettled"
+
+
 def test_matrix_floor_bound_baseline_discards_both_neighbours(bench: Bench) -> None:
     def floored(step: dict[str, Any], zone: str, ts: int) -> dict[str, Any]:
         effective = step["commanded"][zone]

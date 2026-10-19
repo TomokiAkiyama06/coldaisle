@@ -1500,6 +1500,7 @@ def analyse_matrix_step(
         for metric, key in SETTLE_CHIP
     ]
     coverage_failure: Reason | None = None
+    range_evaluated = False
     for tick in context.ticks:
         at = tick.ts_ms
         if at < reach.ts_ms + span or at > deadline:
@@ -1516,6 +1517,10 @@ def analyse_matrix_step(
         ):
             coverage_failure = Reason.TELEMETRY_COVERAGE
             continue
+        settle_trace = check_trace(context.ticks, lo, at, step, context.hashes, config)
+        if settle_trace.reason is not None:
+            coverage_failure = settle_trace.reason
+            continue
         if not all(
             _settle_range_ok(
                 rows[metric], config.settle.max_range_air_c.value, u_air, k, median3=False
@@ -1531,13 +1536,11 @@ def analyse_matrix_step(
             )
             for metric, u in chips
         ):
-            continue
-        settle_trace = check_trace(context.ticks, lo, at, step, context.hashes, config)
-        if settle_trace.reason is not None:
-            coverage_failure = coverage_failure or settle_trace.reason
+            # 覆いを満たした区間が幅で外れた。前後の覆いの失敗より「未収束」を理由にする
+            range_evaluated = True
             continue
         return _value_window(context, window, step, at - length, at, config)
-    window.reason = coverage_failure or Reason.UNSETTLED
+    window.reason = Reason.UNSETTLED if range_evaluated else (coverage_failure or Reason.UNSETTLED)
     return window
 
 
@@ -1667,11 +1670,24 @@ def _pair(
     return result
 
 
-def _room_drift(windows: Sequence[MatrixWindow], config: AirflowCharacterizationConfig) -> bool:
-    """セッションの中の `air.room` のブロックの平均の最大 − 最小の上側の境界（§2.6）。"""
-    blocks = [
-        value for window in windows if ROOM in window.stats for value in window.stats[ROOM].blocks
-    ]
+def _room_drift(context: RunContext, config: AirflowCharacterizationConfig) -> bool:
+    """セッションの中の `air.room` のブロックの平均の最大 − 最小の上側の境界（§2.6）。
+
+    値の窓だけでなく**セッションの全体**（最初の段の始まりから最後の段の終わり）を、値の窓の
+    ブロックと同じ長さ（`window.length_s / window_blocks`）に区切って見る。落ち着きの途中や
+    捨てた段の間のずれも、セッションをやり直す理由にする（§2.5）。ok の行の無いブロックは飛ばす。
+    """
+    run = context.run
+    width = config.window.length_s.value * 1000 // config.window_blocks.value
+    blocks: list[float] = []
+    for start in range(run.start_ms, run.end_ms, width):
+        values = [
+            row.value
+            for row in context.series[ROOM].between(start, min(start + width, run.end_ms))
+            if row.quality == "ok" and row.value is not None
+        ]
+        if values:
+            blocks.append(statistics.fmean(values))
     if not blocks:
         return False
     u = config.resolution_of("air_c") / _SQRT12 * math.sqrt(2.0)
@@ -1705,7 +1721,7 @@ def analyse_matrix_run(
         analyse_matrix_step(context, index, step, config)
         for index, step in enumerate(manifest.steps)
     ]
-    if run_reason is None and _room_drift(windows, config):
+    if run_reason is None and _room_drift(context, config):
         run_reason = Reason.ROOM_DRIFT
     pairs: list[dict[str, Any]] = []
     if run_reason is None:
