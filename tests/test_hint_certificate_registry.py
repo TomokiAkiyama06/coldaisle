@@ -22,6 +22,7 @@ from coldaisle.control import (
     ArtifactKind,
     ArtifactLoadStatus,
     ArtifactMetadata,
+    ArtifactRef,
     AuthorityStage,
     HumanApproval,
     ModelCompatibility,
@@ -216,6 +217,28 @@ def test_a_certificate_metadata_outside_the_fixed_meaning_is_rejected(
 ) -> None:
     with pytest.raises(ValidationError, match=message):
         certificate_metadata(**overrides)
+
+
+def test_a_certificate_can_reference_the_longest_thermal_model_key() -> None:
+    """`model_id` 120 文字・版 80 文字の thermal_model の key も持てる（PR #349 の Codex P2）。"""
+    longest = ArtifactRef(
+        kind=ArtifactKind.THERMAL_MODEL,
+        model_id="r" * 120,
+        version="1.0.0-" + "a" * 74,
+    )
+    assert len(longest.key) > 200
+    metadata = certificate_metadata(training_dataset_version=longest.key)
+    assert certified_thermal_model_ref(metadata.training_dataset_version) == longest
+
+
+def test_other_kinds_keep_the_dataset_version_limit() -> None:
+    fields = thermal_metadata("1.0.0").model_dump(mode="python") | {
+        "training_dataset_version": "d" * 201
+    }
+    with pytest.raises(ValidationError, match="200 文字まで"):
+        ArtifactMetadata(**fields)
+    fields["training_dataset_version"] = "d" * 200
+    assert ArtifactMetadata(**fields).training_dataset_version == "d" * 200
 
 
 def test_the_certificate_capability_is_not_accepted_on_another_kind() -> None:

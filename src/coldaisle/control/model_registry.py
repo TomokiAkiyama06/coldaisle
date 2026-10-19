@@ -235,12 +235,22 @@ HyperparameterValue = str | int | float | bool | None
 _HYPERPARAMETER_TYPES = (str, int, float, bool, type(None))
 
 
+_REF_MODEL_ID_MAX_LENGTH = 120
+_REF_VERSION_MAX_LENGTH = 80
+_TRAINING_DATASET_VERSION_MAX_LENGTH = 200
+_THERMAL_MODEL_KEY_MAX_LENGTH = (
+    len(ArtifactKind.THERMAL_MODEL.value) + 2 + _REF_MODEL_ID_MAX_LENGTH + _REF_VERSION_MAX_LENGTH
+)
+"""`thermal_model/<model_id>/<version>` の最長。証明書の `training_dataset_version` はこの key を
+持つので、欄の上限をこれに合わせる（ほかの kind は従来の 200 のまま。PR #349 の Codex P2）。"""
+
+
 class ArtifactRef(_Frozen):
     """Stable identity of one artifact version."""
 
     kind: ArtifactKind
-    model_id: str = Field(pattern=_IDENTIFIER_PATTERN, max_length=120)
-    version: str = Field(pattern=_SEMVER_PATTERN, max_length=80)
+    model_id: str = Field(pattern=_IDENTIFIER_PATTERN, max_length=_REF_MODEL_ID_MAX_LENGTH)
+    version: str = Field(pattern=_SEMVER_PATTERN, max_length=_REF_VERSION_MAX_LENGTH)
 
     @property
     def key(self) -> str:
@@ -272,7 +282,11 @@ class ArtifactMetadata(_Frozen):
     model_id: str = Field(pattern=_IDENTIFIER_PATTERN, max_length=120)
     version: str = Field(pattern=_SEMVER_PATTERN, max_length=80)
     created_at: str = Field(min_length=1, max_length=64)
-    training_dataset_version: str = Field(min_length=1, max_length=200)
+    training_dataset_version: str = Field(
+        min_length=1,
+        max_length=max(_TRAINING_DATASET_VERSION_MAX_LENGTH, _THERMAL_MODEL_KEY_MAX_LENGTH),
+    )
+    """hint_certificate 以外の kind は 200 文字まで（`_hint_certificate_fields_are_fixed`）。"""
     # Every sequence / mapping reachable from RegistrySnapshot stops at its first bad
     # member (FailFast or a fail-fast validator); see RegistrySnapshot.audit.
     source_runs: Annotated[tuple[str, ...], FailFast()] = Field(min_length=1)
@@ -334,6 +348,10 @@ class ArtifactMetadata(_Frozen):
                 "kind hint_certificate と能力 hint_monotonicity_certificate は組でだけ使う"
             )
         if not is_certificate_kind:
+            if len(self.training_dataset_version) > _TRAINING_DATASET_VERSION_MAX_LENGTH:
+                raise ValueError(
+                    f"training_dataset_version は {_TRAINING_DATASET_VERSION_MAX_LENGTH} 文字まで"
+                )
             return self
         if self.schema_version < HINT_CERTIFICATE_MIN_SCHEMA_VERSION:
             raise ValueError("hint_certificate は registry schema v4 より前の版で記録しない")
