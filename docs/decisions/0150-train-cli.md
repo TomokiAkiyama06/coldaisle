@@ -420,9 +420,14 @@ JSON として読めて、書かれた3つのファイルの大きさと SHA-256
   - **読む側の上限は呼び出し側が int で渡し、parse の前に当てる。** `training_output.py` は coldaisle を import しないので
     `ModelRegistryLimits` を受け取らず、`max_artifact_bytes: int` と `max_other_bytes: int` を必須の keyword 引数に取る（既定値なし）。
     当て方は 0062 §2.1 と同じで、`artifact.json` は `max_artifact_bytes`、`COMPLETE.json`・`metadata.json`・`training-report.json` は
-    `max_other_bytes` を上限とする。順は (1) `COMPLETE.json` を上限＋1 byte だけ読み、超えれば parse の前に拒否 → (2) 印に書かれた
-    各ファイルの大きさが、そのファイルの上限を超えていれば開く前に拒否 → (3) 各ファイルを `O_NOFOLLOW` で開き、`fstat` の大きさが印と
-    同じことを確かめ、印の大きさ＋1 byte だけ読む（多く読めれば拒否）→ (4) SHA-256 を照合して bytes を返す
+    `max_other_bytes` を上限とする。順は (1) `COMPLETE.json` を上限＋1 byte だけ読み、超えれば parse の前に拒否 → (2) **印に書かれた
+    名前の集合が、ちょうど `artifact.json`・`metadata.json`・`training-report.json` の3つで、それぞれ1回だけ**であることを、どれかを
+    開く前に確かめる（固定の basename との完全一致で比べる。絶対 path・`/` を含む名前・`..`・重複・欠け・余分な名前はすべて拒否。
+    開くのは印の文字列ではなくこの固定の名前）→ (3) 印に書かれた各ファイルの大きさが、そのファイルの上限を超えていれば開く前に拒否 →
+    (4) `COMPLETE.json` と各ファイルを `O_RDONLY | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK` で `dir_fd` から開き、`fstat` で
+    **regular file であること**（`S_ISREG`。FIFO・デバイス・ディレクトリは拒否）と大きさが印と同じことを確かめ、印の大きさ＋1 byte
+    だけ読む（多く読めれば拒否）→ (5) SHA-256 を照合して bytes を返す。`O_NONBLOCK` は FIFO を開くときに塞がないため、`S_ISREG` は
+    読む前に特殊なファイルを除くためで、設定の入力（§2.7）と Dataset の読み（`_read_regular_file_at`）と同じ開き方である
   - 渡す値: `coldaisle-registry register --training-output` は既存の `--limits` から読んだ `ModelRegistryLimits` の
     `max_artifact_bytes` / `max_snapshot_bytes`（`register --metadata/--payload` の `read_bounded` と同じ値。Registry を開く前に当てる）。
     `train.py` は `--apply` のとき `--registry-limits` の同じ2つ、`--apply` の無い実行の再検証（`out_modified`）では自分がメモリに
@@ -689,7 +694,10 @@ best-effort で `OSError` / `UnsafeRegistryPathError` を握る（`src/coldaisle
 - `coldaisle-registry register --training-output` の上限: `COMPLETE.json`・`metadata.json`・`training-report.json` が
   `max_snapshot_bytes`＋1 byte、`artifact.json` が `max_artifact_bytes`＋1 byte のとき（印の大きさもそれに合わせたもの・印は小さいが
   実物が大きいもの）、どれも終了コード 1 で Registry が変わらず、読んだ byte 数が上限＋1 を超えないこと（`os.read` を包んで数える）。
-  印に書かれた大きさが上限を超えるときは、そのファイルを開かないこと
+  印に書かれた大きさが上限を超えるときは、そのファイルを開かないこと。印の名前が絶対 path（`/etc/passwd` など）・`..` を含む・
+  `/` を含む・同じ名前の重複・3つのどれかの欠け・余分な名前のとき、どのファイルも開かずに終了コード 1 で Registry が変わらないこと
+  （`os.open` を包んで呼ばれないことを確かめる）。`COMPLETE.json` か3つのどれかを、印の大きさに合わせた FIFO・ディレクトリに
+  差し替えると、塞がらずに（試験の時間の上限の中で）終了コード 1 で拒否されること
 - `coldaisle-registry register --training-output`: 有効な印の `--out` から candidate を登録できること。印が無い・書きかけ・
   SHA-256 がずれた `--out` では終了コード 1 で Registry が変わらないこと。`--metadata` / `--payload` と同時に渡すと拒否し、
   Registry が変わらないこと。成功したときは candidate が1つ足され（上の (1)〜(4)）、`--out` の中身が変わらないこと。確かめた後に
