@@ -12,10 +12,14 @@
 7. Learned worker の unit と `tmpfiles.d`、fand の Learned・較正の引数（決定記録 0115。0077 段階 6）
 8. CPU Package の電力を root で渡す `coldaisle-cpu-power`（決定記録 0122 §2.2）
 9. GPU の Fan を温度の曲線で書く `coldaisle-gpu-fan`（決定記録 0128 §2.5）
+10. fand と Learned worker の起動の形（root の所有の venv の interpreter を `-I -m`。
+    決定記録 0157 §2.1 / §2.5）
 """
 
 import re
 import shlex
+import subprocess
+import sys
 import tomllib
 from pathlib import Path
 
@@ -58,6 +62,18 @@ GPU_FAN = "coldaisle-gpu-fan"
 
 DB_UNITS = (*SERVICES, *JOBS)
 """`StateDirectory=coldaisle` を持ち、`/var/lib/coldaisle` の mode を決める unit（0080 §2.1）。"""
+
+VENV_PYTHON = "/opt/coldaisle/.venv/bin/python"
+"""本番の fand・worker を起動する root の所有の venv の interpreter（0157 §2.1。**仮の値**）。"""
+
+ENTRY_MODULES = {
+    FAND: "coldaisle.control_daemon",
+    "coldaisle-learnd": "coldaisle.learned_worker.cli",
+}
+"""console script の名前 → `-I -m` で起動する入口の module（決定記録 0157 §2.1）。
+
+argparse の `prog` は console script の名前のまま（`-m` でも module のファイル名にしない）。
+"""
 
 SENSORS_RULES = UDEV / "99-coldaisle-sensors.rules"
 HWMON_RULES = UDEV / "99-coldaisle-hwmon.rules"
@@ -102,6 +118,18 @@ def scripts() -> set[str]:
 
 def unit_files() -> list[Path]:
     return sorted(SYSTEMD.glob("*.service")) + sorted(SYSTEMD.glob("*.timer"))
+
+
+def isolated_module_args(exec_start: str, script: str) -> list[str]:
+    """`ExecStart=` が `<venv の python> -I -m <入口の module> ...` の形かを確かめ、引数を返す。
+
+    `-m` の前に `-I` 以外の interpreter の引数を置かない（0157 §2.3 の 3。`launch_form` が
+    `isolated_module` と判定する形と同じ）。
+    """
+    words = exec_start.split()
+    assert words[:4] == [VENV_PYTHON, "-I", "-m", ENTRY_MODULES[script]], exec_start
+    assert script in scripts()  # console script は開発と手の試験のために残す（0157 §2.1）
+    return words[4:]
 
 
 def test_the_expected_units_exist():
@@ -177,13 +205,57 @@ def test_services_do_not_run_as_root(name):
     assert one(unit, "Service", "Group") == "coldaisle"
 
 
-@pytest.mark.parametrize("name", ("coldaisle-daemon", "coldaisle-telemetry", *JOBS, FAND))
+@pytest.mark.parametrize("name", ("coldaisle-daemon", "coldaisle-telemetry", *JOBS))
 def test_exec_start_points_at_a_real_entry_point(name):
     """**入口の名前を変えたら、テンプレートも落ちる。**"""
     unit = parse_unit(SYSTEMD / f"{name}.service")
     binary = one(unit, "Service", "ExecStart").split()[0]
     assert binary == f"/opt/coldaisle/.venv/bin/{name}"
     assert name in scripts()
+
+
+def test_fand_exec_start_runs_the_venv_interpreter_in_isolated_module_mode():
+    """fand は console script ではなく `-I -m coldaisle.control_daemon` で起動する。
+
+    決定記録 0157 §2.1 / §2.5。
+    """
+    isolated_module_args(one(fand(), "Service", "ExecStart"), FAND)
+
+
+@pytest.mark.parametrize("script", ENTRY_MODULES)
+def test_the_entry_modules_run_under_isolated_mode_with_the_console_script_prog(script):
+    """`python -I -m <入口>` で `main()` が走り、`prog` が console script の名前になる。
+
+    決定記録 0157 §2.1。
+
+    `-I` では作業ディレクトリが `sys.path` に入らないので、導入された `coldaisle` を
+    import できることも同時に確かめる（0157 §2.4 の CI の範囲。`launch_form` の判定は
+    test_hint_certificate_digest が見る）。
+    """
+    completed = subprocess.run(
+        [sys.executable, "-I", "-m", ENTRY_MODULES[script], "--help"],
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stdout.startswith(f"usage: {script} "), completed.stdout
+
+
+def test_the_deploy_guide_never_runs_fand_or_the_worker_through_the_console_script():
+    """本番の手順のコードブロックに console script の fand・worker を書かない（0157 §2.5）。
+
+    切り替えの手順（6.9）は unit と同じ `-I -m` の形を名指す。
+    """
+    guide = (ROOT / "docs" / "ubuntu-deploy.md").read_text(encoding="utf-8")
+    for block in re.findall(r"```bash\n(.*?)```", guide, flags=re.DOTALL):
+        for script in ENTRY_MODULES:
+            assert f".venv/bin/{script}" not in block, block
+    section = guide[guide.index("### 6.9") :]
+    for module in ENTRY_MODULES.values():
+        assert f"{VENV_PYTHON} -I -m {module}" in section
+    assert "ActiveEnterTimestampMonotonic" in section  # READY=1 までの時間の測り方（0157 §5 の 4）
 
 
 def test_the_report_waits_for_the_rollup():
@@ -612,10 +684,12 @@ def option(exec_start: list[str], name: str) -> str:
 
 @pytest.mark.parametrize("role", WORKERS)
 def test_worker_exec_start_points_at_the_learnd_entry_point(role):
-    exec_start = one(worker(role), "Service", "ExecStart").split()
-    assert exec_start[0] == "/opt/coldaisle/.venv/bin/coldaisle-learnd"
-    assert "coldaisle-learnd" in scripts()
+    """worker も fand と同じ `-I -m` の形（決定記録 0157 §2.1 / §2.5）。"""
+    exec_start = isolated_module_args(one(worker(role), "Service", "ExecStart"), "coldaisle-learnd")
     assert option(exec_start, "--role") == role
+    from coldaisle.learned_worker.cli import build_parser
+
+    assert build_parser().parse_args(exec_start).role == role
 
 
 def test_the_two_worker_units_differ_only_in_role_identity():
@@ -847,7 +921,9 @@ def test_fand_drives_the_hwmon_backend_explicitly():
 
     # 既定は simulated のまま（開発機で引数を付け忘れて実機の Fan に書かない）
     assert build_parser().parse_args([]).backend == "simulated"
-    assert build_parser().parse_args(exec_start[1:]).backend == "hwmon"
+    assert build_parser().parse_args(isolated_module_args(" ".join(exec_start), FAND)).backend == (
+        "hwmon"
+    )
 
 
 # ---------------------------------------------------------------- CPU Package の電力（0122）
