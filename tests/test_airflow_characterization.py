@@ -1109,3 +1109,41 @@ def test_digest_is_checked_before_opening(bench: Bench, monkeypatch: pytest.Monk
     monkeypatch.setattr(ac, "CopyDatabase", refuse)
     with pytest.raises(ac.AnalysisError, match="SHA-256"):
         build(paths[:1])
+
+
+def test_fault_on_the_next_step_first_tick_is_not_blamed_on_this_step(bench: Bench) -> None:
+    def tick_fn(step: dict[str, Any], ts: int) -> dict[str, Any]:
+        if step["level"] == 0.45 and step["direction"] == "up" and ts == step["start_ms"]:
+            return {"safety": "degraded"}
+        return {}
+
+    steps = sweep_steps("front", 1, T0, command_id=1)
+    bench.drive(steps, zone_fn=steady_rpm, tick_fn=tick_fn)
+    idle_readings(bench, T0, steps[-1]["end_ms"] + 10 * S)
+    db = bench.snapshot()
+    report = build([bench.manifest(manifest_doc("rpm_sweep", "r1", steps, db), "r1")])
+    by_level = {
+        (step["level"], step["direction"]): step["reason"] for step in report["rpm_sweep"]["steps"]
+    }
+    assert by_level[(0.4, "up")] is None
+    assert by_level[(0.45, "up")] == "safety_fault"
+
+
+def test_uncovered_record_only_metric_discards_the_window(bench: Bench) -> None:
+    path = matrix_run(bench, "m1", T0)
+    steps = yaml.safe_load(path.read_text(encoding="utf-8"))["steps"]
+    t_plus = next(step for step in steps if step["label"] == "T+")
+    for ts in range(t_plus["start_ms"], t_plus["end_ms"], 2500):
+        bench.reading("fan.vrm.rpm", ts, 1500.0, quality="suspect")
+    document = yaml.safe_load(path.read_text(encoding="utf-8"))
+    document["db_copy"]["sha256"] = sha(bench.snapshot("m1.db"))
+    path.write_text(yaml.safe_dump(document), encoding="utf-8")
+    item = pair(build([path]), 0, "T+")
+    assert item["reason"] == "telemetry_coverage" and item["reason_from"] == "moved"
+
+
+def test_surplus_matrix_repetitions_are_not_averaged(bench: Bench) -> None:
+    paths = [matrix_run(bench, f"m{day}", T0 + day * DAY) for day in range(3)]
+    entries = build(paths)["response_matrix"]["aggregate"][0]["entries"]
+    assert {entry["reason"] for entry in entries} == {"too_many_repetitions"}
+    assert all(entry["mean"] is None for entry in entries)

@@ -149,6 +149,8 @@ class TableStatus(StrEnum):
     """9 段のどれかが値を出せない（§2.4。zone の表を出さない）。"""
     NOT_MONOTONIC = "not_monotonic"
     """段の中央値が demand に対して下がり、`FanProfile` の検証を通らない。"""
+    TOO_MANY_REPETITIONS = "too_many_repetitions"
+    """応答の行列で、有効な回が `response_matrix.repetitions` より多い（§2.6 の 2 回の式）。"""
     LOAD_MISMATCH = "load_mismatch"
     """まとめる回の負荷の設定（電力の上限・worker の数）が違う（§2.5）。"""
 
@@ -481,7 +483,7 @@ MATRIX_VALUE_METRICS: Final = tuple(
 """応答の行列の値の窓で覆いを求める metric（§2.3「その窓で使う metric のすべて」）。"""
 
 RECORD_ONLY: Final = ("air.room_humidity", "gpu.0.fan_speed", "fan.vrm.rpm")
-"""残すだけの metric（§2.5）。検査にも値にも使わないので覆いを求めず、覆わなければ null。"""
+"""残すだけの metric（§2.5）。検査には使わないが、値の窓では覆いを求める（欠ければ窓を捨てる）。"""
 
 THROTTLE_METRICS: Final = (
     "gpu.0.throttle.hw_slowdown",
@@ -1108,7 +1110,7 @@ def faulted_during(ticks: Sequence[Tick], step: _Step) -> bool:
     値の窓の外で DEGRADED / EMERGENCY になって戻った段も、段ごと捨てる。
     """
     return any(
-        step.start_ms <= tick.ts_ms <= step.end_ms and (tick.safety != "normal" or tick.faults)
+        step.start_ms <= tick.ts_ms < step.end_ms and (tick.safety != "normal" or tick.faults)
         for tick in ticks
     )
 
@@ -1618,11 +1620,12 @@ def _value_window(
             window.reason = Reason.WINDOW_TREND
             return window
     for metric in RECORD_ONLY:
+        # 残すものも値の窓で使う metric に数える。覆わなければ運転の状態の記録を欠いた窓として捨てる
         rows = context.series[metric].between(start, end)
-        covered = telemetry_covered(rows, start, end, config.source_of(metric))
-        window.recorded[metric] = (
-            statistics.fmean(value for _, value in _points(rows)) if covered else None
-        )
+        if not telemetry_covered(rows, start, end, config.source_of(metric)):
+            window.reason = Reason.TELEMETRY_COVERAGE
+            return window
+        window.recorded[metric] = statistics.fmean(value for _, value in _points(rows))
     for metric in THROTTLE_METRICS:
         # 覆いの欠けた窓では「立っていない」と言えない（欠けた間に立ったかもしれない）→ None
         rows = context.series[metric].between(start, end)
@@ -1820,6 +1823,9 @@ def aggregate_matrix(
                     status = reasons[0]
                 elif len(found) < matrix.repetitions.value:
                     status = TableStatus.INSUFFICIENT_REPETITIONS.value
+                elif len(found) > matrix.repetitions.value:
+                    # §2.6 の平均の u は 2 回の式。黙って一般化しない
+                    status = TableStatus.TOO_MANY_REPETITIONS.value
                 elif len({day for _, day, _ in found}) < matrix.min_distinct_days.value:
                     status = TableStatus.INSUFFICIENT_DAYS.value
                 mean = u_mean = spread = None
