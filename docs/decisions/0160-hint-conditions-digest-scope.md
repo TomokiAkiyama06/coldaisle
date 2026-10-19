@@ -1,7 +1,7 @@
 # 決定記録 0160: 証明書の部品 `conditions` の digest に入れる値を、解の結果に効くものに限る
 
 - **種別**: Decision Record
-- **Status**: Proposed
+- **Status**: FINAL（2026-10-19、リポジトリ所有者の承認）
 - **Date**: 2026-10-20
 - **Supersedes**（いずれも限定的な置き換え。旧記録は FINAL のため本文を書き換えず、`Superseded by` の追記だけを行う）:
   - [0066](0066-workload-hint-stage-b-conditions.md) §2.1 (c) の「探索のコストに入る他のモデルと条件」の項のうち、
@@ -37,7 +37,7 @@
 digest と決めている。ところが `conditions()` の値には、**解の結果に効かないのに、証明書を作った後に必ず変わる値**が入っている。
 
 | `conditions()` の位置 | 中身 | 変わる時 |
-|---|---|---|
+|---|---|---|---|
 | `binding.registry_revision` | `ArtifactAttestation.trace_metadata()` の欄。artifact を読んだ時点の Registry の snapshot の `revision`（`model_registry.py` の `_load_record`） | Registry への**どの書き込みでも**1つ進む |
 | `authority_stage` | `MpcModelBinding.authority_stage`。worker が束縛を作ったときの実効の stage（frame の `authority_stage`。0077 §2.3） | Authority の昇格・降格・rollback（0057）のたび |
 
@@ -64,7 +64,7 @@ digest と決めている。ところが `conditions()` の値には、**解の�
 部品 `conditions` の digest の入力は、**`LearnedMpcController.conditions()` の全体から、次の閉じた一覧の位置だけを除いた値**とする。
 
 | 除く位置 | 結果に効かない根拠 | 除かないと起きること |
-|---|---|---|
+|---|---|---|---|
 | `binding.registry_revision` | `LearnedMpcOptimizer.solve` も `MpcModelBinding.predict` / `predict_plan` も読まない。Registry の lifecycle の通し番号で、artifact の bytes（`binding.artifact_sha256`）とは独立に進む | 証明書の昇格・別の kind の操作で必ず不一致（§1） |
 | `binding.production_active` | 予測・探索のどちらも読まない。しかも `MpcModelBinding.from_verified_artifact` は `production_active` が偽の artifact を拒む（`counterfactual.py`）ので、束縛ができた時点で値は常に真。情報を落とさない | 実害は無いが、Registry の状態を表す値を結果の条件と混ぜる |
 | `binding.artifact_status` | 同上。束縛ができた時点で常に `production`（`ArtifactAttestation` は production pointer でないものを production として発行しない。`model_registry.py`） | 同上 |
@@ -112,10 +112,30 @@ digest と決めている。ところが `conditions()` の値には、**解の�
     値は変えない（ルール 2・3）
 - B0 に倒れても `requested_demand` は変わらない（0152 §2.5）
 
-### 2.4 段 2（認証ランナー）の実装に残る判断
+### 2.4 段 2（認証ランナー）の実装の決まり
 
-§5 の 1〜6 は、0152・0156・0157 に書かれておらず、段 2 の実装に要る判断である。この記録の承認で一緒に決める。
-決まった案は段 2 の PR がそのまま実装する。
+0152・0156・0157 に書かれておらず、段 2 の実装に要る判断を次のとおり決める（§5 の 1〜6。所有者が 2026-10-19 に
+すべて推奨の案で決めた）。段 2 の PR はこのとおり実装する。どれも、合わなければ B0 に倒れる向きである。
+
+1. **束縛の authority stage**: ランナーは thermal_model を `shadow` に固定して束縛する（最も低い制御権。§2.1 で digest から
+   外れるので、効くのは Registry の互換性の検査だけ。実行時の stage での互換性は worker が束縛のときに確かめる）
+2. **solve が `ok` にならない点**: 格子の点で、ヒント有り・無しのどちらかの solve が `ok` にならなければ（timeout・
+   `plan_out_of_learned_range`・`cost_unusable` など）不合格にし、証明書を出さない。点を黙って除かない（0156 §2.5 と同じ）。
+   ログには解けなかった点の数・最初の点の軸（値は載せない）・理由の code を出す
+3. **予算**: 2 回の solve に、それぞれ `mpc.budget_ms` と `mpc.optimizer.max_evaluations` を丸ごと渡し、実時計で測る。
+   optimizer は打ち切ると解を返さないので、実行時に予算を分け合って解けた解はランナーの解と同じになる。
+   `SCHED_IDLE` の下で timeout すれば 2 のとおり不合格
+4. **温度の metric**: 目的関数の温度の metric（`mpc.optimizer.cost_metrics.cpu_temperature` / `gpu_temperature`）が artifact の
+   window の feature に無ければ、不合格にし証明書を出さない
+5. **平らな window の原点**: `action_ts_ms` を artifact の `window_ms` にし、格子の時刻を 0 から `sample_period_ms` 刻みで
+   作る。各 cell の `source_ts_ms` はその格子の時刻（stale にしない）。値は設定に置かない（閾値ではなく時刻の並びの起点）
+6. **solve の入口**: `LearnedMpcController` に公開の入口を1つ足す（観測 window・safety floor・context の `weights` /
+   `target_band`・baseline を受け取り、anchor 推論とその照合・`HardConstraintSet.build`・`solve` を `propose()` と同じ関数で行い、
+   `OptimizerOutcome` を返す。`propose()` の振る舞いは変えない。段 4 の worker の二重解法とも共有する）。予算は引数で受け取る:
+   使ってよい評価の回数の上限と、打ち切りの絶対時刻（単調時計）を受け取り、どちらも設定の値から求めた値**以下にしか**できない
+   （入口で超える値を拒む。予算を増やす経路を作らない。0066 §2.1 (d) / 0133 §2.5）。ランナーは 3 のとおり設定の値を丸ごと渡し、
+   段 4 の Shadow solver は基準の solve の残りの回数と共通の打ち切り時刻を渡す。`LearnedMpcOptimizer.solve` もこの2つを
+   受け取れるようにし、渡さないときは今の振る舞い（設定の値・呼んだ時刻から数える）のまま
 
 ---
 
@@ -151,16 +171,16 @@ digest と決めている。ところが `conditions()` の値には、**解の�
 
 ---
 
-## 5. 判断点（所有者の判断を求める点。推奨を先頭に）
+## 5. 判断点（決定済み。推奨を先頭に）
 
-§2.1〜§2.3（除く値と形）は所有者が 2026-10-19 に選んだ方向（(a)）を具体にしたもので、この記録の承認で確定する。
-次の 1〜6 は段 2（認証ランナー）の実装に要る、記録に無い判断である。どの案も、合わなければ B0 に倒れる向きにしてある。
+**所有者の決定（2026-10-19）**: §2.1〜§2.3（除く値と形）は所有者が選んだ方向（(a)）を具体にしたもので、1〜6 はすべて
+推奨の案（いずれも (a)）で決めた。§2.4 の本文はその決定を書いたものである。
 
-| # | 判断点 | 選択肢（推奨を先頭） |
-|---|---|---|
-| 1 | ランナーが thermal_model を束縛する authority stage（§2.1 で digest からは外れるので、効くのは Registry の互換性の検査 `authority_compatibility` だけ） | **(a 推奨) `shadow` に固定する**（最も低い制御権。実行時の stage での互換性は worker が束縛のときに確かめる。ランナーは制御権を持たない）/ (b) 必須の引数 `--authority-stage` で人が選ぶ（選び間違いは証明書の合否に効かず、互換性の検査だけが変わる）/ (c) Authority の journal を読む（ランナーが journal の場所と読み方を持つことになる） |
-| 2 | 格子の点で solve が `ok` にならないとき（timeout・`plan_out_of_learned_range`・`cost_unusable` など。0156 §2.5 は `HardConstraintSet.build` の実行不能だけを決めている） | **(a 推奨) 不合格にして証明書を出さない。** ヒント有り・無しのどちらでも同じ。点を黙って除かない（0156 §2.5 と同じ理由。`grid_points` は試して比べた点の数）。ログには解けなかった点の数と最初の点の軸（値は載せない）と理由の code を出す / (b) 両方が解けなかった点は「実行時も基準を使う点」として数えずに続ける（試していない点を試したと記録する） |
-| 3 | 二重解法の予算の分け方 | **(a 推奨) 2回の solve に、それぞれ `mpc.budget_ms` と `mpc.optimizer.max_evaluations` を丸ごと渡す。** optimizer は打ち切ると解を返さない（部分解を出さない。`optimizer.py`）ので、実行時に予算を分け合って解けた解は、ランナーの解と同じになる。時計は実時計（`SCHED_IDLE` の下で timeout すれば 2 のとおり不合格）/ (b) 実行時と同じく分け合う（基準が使った残りをヒント有りに渡す。実行時なら基準を使うだけの点で不合格になる）/ (c) 進まない時計を渡し、評価の回数だけで打ち切る（ホストの負荷に依らず決まるが、実行時と違う時計の経路を認証する） |
-| 4 | 目的関数の温度の metric（`mpc.optimizer.cost_metrics.cpu_temperature` / `gpu_temperature`）が、artifact の window の feature に無いとき（0156 §2.4 は書いていない） | **(a 推奨) 不合格にして証明書を出さない**（温度の軸が window に効かず、格子が 0066 の4区分を試したことにならない）/ (b) その温度の軸を window に当てずに続ける（軸の `points` の数だけ同じ点を重ねて数える） |
-| 5 | 平らな window（0156 §2.4）の時刻の原点 | **(a 推奨) `action_ts_ms` を artifact の `window_ms` にし、格子の時刻を 0 から `sample_period_ms` 刻みで作る。各 cell の `source_ts_ms` はその格子の時刻**（stale にしない）。値は設定に置かない（閾値ではなく、時刻の並びの起点）/ (b) 起点を設定に置く（設定が1つ増え、`hint_gate` に入れるかの判断が要る）/ (c) 実行時の壁時計（証明書の結果が走らせた時刻に依りうる） |
-| 6 | ランナーが solve を呼ぶ入口（`LearnedMpcController` の optimizer は外から呼べない） | **(a 推奨) `LearnedMpcController` に公開の入口を1つ足す**（観測 window・safety floor・context の `weights` / `target_band`・baseline を受け取り、anchor 推論とその照合・`HardConstraintSet.build`・`solve` を `propose()` と同じ関数で行い、`OptimizerOutcome` を返す。`propose()` の振る舞いは変えない。段 4 の worker の二重解法とも共有する。**予算は引数で受け取る**: 使ってよい評価の回数の上限と、打ち切りの絶対時刻（単調時計）を受け取り、どちらも設定の `mpc.optimizer.max_evaluations` / `mpc.budget_ms` から求めた値**以下にしか**できない（入口で超える値を拒む。予算を増やす経路を作らない。0066 §2.1 (d) / 0133 §2.5）。ランナーは 3 (a) のとおり各 solve に設定の値を丸ごと渡し、段 4 の Shadow solver は基準の solve の残りの回数と共通の打ち切り時刻を渡す。`LearnedMpcOptimizer.solve` もこの2つを受け取れるようにし、渡さないときは今の振る舞い（設定の値・呼んだ時刻から数える）のまま）/ (b) ランナーが `LearnedMpcOptimizer` と `MpcCostModel` を自分で組み立てる（controller の「目的関数を外から受け取らない」に反し、組み立てが2か所になる）/ (c) `propose()` を呼ぶ（snapshot・`SupervisorOutput`・Fallback の提案を合成する必要があり、Confidence の判定が解の取り出しに混ざる） |
+| # | 判断点 | 選択肢（推奨を先頭） | 決定 |
+|---|---|---|---|
+| 1 | ランナーが thermal_model を束縛する authority stage（§2.1 で digest からは外れるので、効くのは Registry の互換性の検査 `authority_compatibility` だけ） | **(a 推奨) `shadow` に固定する**（最も低い制御権。実行時の stage での互換性は worker が束縛のときに確かめる。ランナーは制御権を持たない）/ (b) 必須の引数 `--authority-stage` で人が選ぶ（選び間違いは証明書の合否に効かず、互換性の検査だけが変わる）/ (c) Authority の journal を読む（ランナーが journal の場所と読み方を持つことになる） | 決定済み（所有者、2026-10-19）: (a) |
+| 2 | 格子の点で solve が `ok` にならないとき（timeout・`plan_out_of_learned_range`・`cost_unusable` など。0156 §2.5 は `HardConstraintSet.build` の実行不能だけを決めている） | **(a 推奨) 不合格にして証明書を出さない。** ヒント有り・無しのどちらでも同じ。点を黙って除かない（0156 §2.5 と同じ理由。`grid_points` は試して比べた点の数）。ログには解けなかった点の数と最初の点の軸（値は載せない）と理由の code を出す / (b) 両方が解けなかった点は「実行時も基準を使う点」として数えずに続ける（試していない点を試したと記録する） | 決定済み（所有者、2026-10-19）: (a) |
+| 3 | 二重解法の予算の分け方 | **(a 推奨) 2回の solve に、それぞれ `mpc.budget_ms` と `mpc.optimizer.max_evaluations` を丸ごと渡す。** optimizer は打ち切ると解を返さない（部分解を出さない。`optimizer.py`）ので、実行時に予算を分け合って解けた解は、ランナーの解と同じになる。時計は実時計（`SCHED_IDLE` の下で timeout すれば 2 のとおり不合格）/ (b) 実行時と同じく分け合う（基準が使った残りをヒント有りに渡す。実行時なら基準を使うだけの点で不合格になる）/ (c) 進まない時計を渡し、評価の回数だけで打ち切る（ホストの負荷に依らず決まるが、実行時と違う時計の経路を認証する） | 決定済み（所有者、2026-10-19）: (a) |
+| 4 | 目的関数の温度の metric（`mpc.optimizer.cost_metrics.cpu_temperature` / `gpu_temperature`）が、artifact の window の feature に無いとき（0156 §2.4 は書いていない） | **(a 推奨) 不合格にして証明書を出さない**（温度の軸が window に効かず、格子が 0066 の4区分を試したことにならない）/ (b) その温度の軸を window に当てずに続ける（軸の `points` の数だけ同じ点を重ねて数える） | 決定済み（所有者、2026-10-19）: (a) |
+| 5 | 平らな window（0156 §2.4）の時刻の原点 | **(a 推奨) `action_ts_ms` を artifact の `window_ms` にし、格子の時刻を 0 から `sample_period_ms` 刻みで作る。各 cell の `source_ts_ms` はその格子の時刻**（stale にしない）。値は設定に置かない（閾値ではなく、時刻の並びの起点）/ (b) 起点を設定に置く（設定が1つ増え、`hint_gate` に入れるかの判断が要る）/ (c) 実行時の壁時計（証明書の結果が走らせた時刻に依りうる） | 決定済み（所有者、2026-10-19）: (a) |
+| 6 | ランナーが solve を呼ぶ入口（`LearnedMpcController` の optimizer は外から呼べない） | **(a 推奨) `LearnedMpcController` に公開の入口を1つ足す**（観測 window・safety floor・context の `weights` / `target_band`・baseline を受け取り、anchor 推論とその照合・`HardConstraintSet.build`・`solve` を `propose()` と同じ関数で行い、`OptimizerOutcome` を返す。`propose()` の振る舞いは変えない。段 4 の worker の二重解法とも共有する。**予算は引数で受け取る**: 使ってよい評価の回数の上限と、打ち切りの絶対時刻（単調時計）を受け取り、どちらも設定の `mpc.optimizer.max_evaluations` / `mpc.budget_ms` から求めた値**以下にしか**できない（入口で超える値を拒む。予算を増やす経路を作らない。0066 §2.1 (d) / 0133 §2.5）。ランナーは 3 (a) のとおり各 solve に設定の値を丸ごと渡し、段 4 の Shadow solver は基準の solve の残りの回数と共通の打ち切り時刻を渡す。`LearnedMpcOptimizer.solve` もこの2つを受け取れるようにし、渡さないときは今の振る舞い（設定の値・呼んだ時刻から数える）のまま）/ (b) ランナーが `LearnedMpcOptimizer` と `MpcCostModel` を自分で組み立てる（controller の「目的関数を外から受け取らない」に反し、組み立てが2か所になる）/ (c) `propose()` を呼ぶ（snapshot・`SupervisorOutput`・Fallback の提案を合成する必要があり、Confidence の判定が解の取り出しに混ざる） | 決定済み（所有者、2026-10-19）: (a) |

@@ -4,7 +4,7 @@
 - **Status**: FINAL（2026-09-24、リポジトリ所有者が承認）
 - **Date**: 2026-09-21
 - **Superseded by**: [0133](0133-workload-hint-stage-b-prior-rollout.md)（§2.1 (d) の二重解法の実行の形のうち、ヒント有りの solve を基準と同じ流れで続けて解く部分のみ。基準の解を先に公開し、ヒント有りは worker の `SCHED_IDLE` の子プロセスで解き、打ち切り時刻に `next_due` を加える。予算を増やさない・共有する・基準を先に解く・2 条件の比較と、他の節は有効）
-  / [0160](0160-hint-conditions-digest-scope.md)（§2.1 (c) の「探索のコストに入る他のモデルと条件」のうち、`conditions()` の「全体」「列挙を別に持たない」の部分のみ。証明書の digest からは Registry の revision・`production_active`・`artifact_status`・`authority_stage` の閉じた一覧を除き、他は全体を束ねる。Proposed）
+  / [0160](0160-hint-conditions-digest-scope.md)（§2.1 (c) の「探索のコストに入る他のモデルと条件」のうち、`conditions()` の「全体」「列挙を別に持たない」の部分のみ。証明書の digest からは Registry の revision・`production_active`・`artifact_status`・`authority_stage` の閉じた一覧を除き、他は全体を束ねる）
 - **Supersedes**（いずれも限定的な置き換え。旧記録は FINAL のため本文を書き換えず、`Superseded by` の追記だけを行う）:
   - [0064](0064-workload-hint-entry-and-supervisor-prior.md) §2.8 の「単調性（片方向）」の検証方法、§2.6 の
     「起動時の取り込み」の条件と §2.6 の「`events.ts_ms` を行の順序に使う」こと（起動時の復元と稼働中の増分取り込みの両方）、
