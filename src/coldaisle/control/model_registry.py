@@ -43,6 +43,7 @@ from coldaisle.control.schema import (
     RegistryProvenance,
     registry_reason_sha256,
 )
+from coldaisle.hint_certificate import HINT_CERTIFICATE_SCHEMA_VERSION, HINT_GATE_SPEC_VERSION
 
 MODEL_REGISTRY_SCHEMA_VERSION: Literal[4] = 4
 """**書き出す** registry schema version。"""
@@ -389,10 +390,16 @@ class ArtifactMetadata(_Frozen):
 
 HINT_CERTIFICATE_MIN_SCHEMA_VERSION = 4
 """kind `hint_certificate` と能力 `hint_monotonicity_certificate` を記録できる最初の版。"""
-HINT_CERTIFICATE_FEATURE_SCHEMA_VERSION = "hint-gate-spec-v1"
-"""kind `hint_certificate` の metadata の `feature_schema_version`（決定記録 0156 §2.8）。"""
-HINT_CERTIFICATE_TARGET_SCHEMA_VERSION = "hint-certificate-v1"
-"""kind `hint_certificate` の metadata の `target_schema_version`（決定記録 0156 §2.8）。"""
+HINT_CERTIFICATE_FEATURE_SCHEMA_VERSION = HINT_GATE_SPEC_VERSION
+"""kind `hint_certificate` の metadata の `feature_schema_version`（決定記録 0156 §2.8）。
+
+ゲートの仕様の版の印そのもの（`coldaisle.hint_certificate`。値を2か所に書かない）。
+"""
+HINT_CERTIFICATE_TARGET_SCHEMA_VERSION = HINT_CERTIFICATE_SCHEMA_VERSION
+"""kind `hint_certificate` の metadata の `target_schema_version`（決定記録 0156 §2.8）。
+
+証明書の本体の `schema_version` そのもの（`coldaisle.hint_certificate`）。
+"""
 HINT_CERTIFICATE_MODEL_FAMILY = "hint-monotonicity-certificate"
 """kind `hint_certificate` の metadata の `model_family`（決定記録 0152 §5 の 2 (a)）。"""
 
