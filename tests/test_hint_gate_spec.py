@@ -561,6 +561,24 @@ def test_the_domain_and_eps_change_the_certificate_hash(tmp_path: Path) -> None:
     assert cert.certificate_sha256(moved) != issued.certificate_sha256
 
 
+def test_the_thermal_model_ref_follows_the_registry_grammar() -> None:
+    """Registry の ArtifactRef に成りえない参照を拒む（PR #357 の Codex P2）。"""
+    from coldaisle.control import model_registry as registry
+
+    assert cert.ARTIFACT_MODEL_ID_PATTERN == registry._IDENTIFIER_PATTERN
+    assert cert.ARTIFACT_VERSION_PATTERN == registry._SEMVER_PATTERN
+    assert cert.ARTIFACT_MODEL_ID_MAX_LENGTH == registry._REF_MODEL_ID_MAX_LENGTH
+    assert cert.ARTIFACT_VERSION_MAX_LENGTH == registry._REF_VERSION_MAX_LENGTH
+    for update in (
+        {"version": "latest"},
+        {"version": "1." + "0" * 80 + ".0"},
+        {"model_id": "Thermal"},
+        {"model_id": "t" * 121},
+    ):
+        with pytest.raises(ValidationError):
+            cert.CertifiedThermalModel(**{**THERMAL.model_dump(), **update})
+
+
 def _raw(tmp_path: Path) -> dict[str, Any]:
     _, issued = a_certificate(tmp_path)
     loaded: dict[str, Any] = json.loads(issued.to_json_bytes())
@@ -596,6 +614,7 @@ def test_unreadable_certificates(tmp_path: Path) -> None:
         lambda raw: raw["components"].pop("calibration"),
         lambda raw: raw["components"].update(source_tree="F" * 64),
         lambda raw: raw["thermal_model"].update(kind="supervisor_policy"),
+        lambda raw: raw["thermal_model"].update(version="latest"),
         lambda raw: raw["certified_domain"]["hint_keys"].reverse(),
         lambda raw: raw["certified_domain"]["previous_demand"].update(minimum=0.0),
         lambda raw: raw.update(eps=-0.1),

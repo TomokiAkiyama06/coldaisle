@@ -43,6 +43,15 @@ _CERTIFICATE_HASH_TAG = b"coldaisle-hint-certificate-v1"
 _SHA256_PATTERN = r"^[0-9a-f]{64}$"
 _ENUM_VALUE_PATTERN = r"^[a-z][a-z0-9_]{0,63}$"
 _ZONES = ("front", "rear", "top")
+# Registry の ArtifactRef と同じ文法（control/model_registry.py。ここは control を import しないので
+# 値を写し、試験で一致を固定する）。production に成りえない参照の証明書を作らせない。
+ARTIFACT_MODEL_ID_PATTERN = r"^[a-z][a-z0-9_.-]*$"
+ARTIFACT_VERSION_PATTERN = (
+    r"^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)"
+    r"(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$"
+)
+ARTIFACT_MODEL_ID_MAX_LENGTH = 120
+ARTIFACT_VERSION_MAX_LENGTH = 80
 
 Sha256 = Annotated[str, Field(pattern=_SHA256_PATTERN)]
 FiniteFloat = Annotated[float, Field(allow_inf_nan=False)]
@@ -220,8 +229,10 @@ class CertifiedThermalModel(_Frozen):
     """認証した thermal_model の ``ArtifactRef`` と ``artifact_sha256``（0152 §2.3）。"""
 
     kind: Literal["thermal_model"]
-    model_id: str = Field(min_length=1, max_length=200)
-    version: str = Field(min_length=1, max_length=200)
+    model_id: str = Field(
+        pattern=ARTIFACT_MODEL_ID_PATTERN, max_length=ARTIFACT_MODEL_ID_MAX_LENGTH
+    )
+    version: str = Field(pattern=ARTIFACT_VERSION_PATTERN, max_length=ARTIFACT_VERSION_MAX_LENGTH)
     artifact_sha256: Sha256
 
 
