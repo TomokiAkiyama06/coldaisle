@@ -43,6 +43,9 @@ coldaisle-report = "coldaisle.report:main"
 coldaisle-soak-report = "coldaisle.soak:main"
 # 負荷の状態ごとの d.* の分布。**DB を読むだけで、合否も閾値の提案も出さない**（#50 / 決定記録 0151）
 coldaisle-load-distribution = "coldaisle.load_distribution:main"
+# 回転数の掃引と応答の行列の解析。**DB の写しと manifest を読むだけで、設定・DB を書かない**
+# （#75 / 決定記録 0153 §2.7 の 2）
+coldaisle-airflow-characterization = "coldaisle.airflow_characterization:main"
 # 故障疑いの案件資料。**送信はしない**（#39）
 coldaisle-escalate = "coldaisle.escalate:main"
 # 運用メモリの更新案。**既定では書かない**（#40）
