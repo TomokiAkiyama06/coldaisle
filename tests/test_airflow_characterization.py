@@ -1206,3 +1206,43 @@ def test_null_rpm_during_the_ramp_restarts_the_response_time(bench: Bench) -> No
     report = build([bench.manifest(manifest_doc("rpm_sweep", "r1", steps, db), "r1")])
     # 帯に入るのは null の後（10 s）。tach の更新 1500 ms を足す
     assert report["rpm_sweep"]["steps"][1]["response_ms"] == 10 * S + 1500
+
+
+def test_null_rpm_inside_the_window_also_breaks_the_response_time(bench: Bench) -> None:
+    def gap(step: dict[str, Any], zone: str, ts: int) -> dict[str, Any]:
+        item = steady_rpm(step, zone, ts)
+        if zone == "front" and step["level"] == 0.4 and ts - step["start_ms"] == 50 * S:
+            item["rpm"] = None
+        return item
+
+    steps = sweep_steps("front", 1, T0, command_id=1, levels=(0.35, 0.40), down=())
+    bench.drive(steps, zone_fn=gap)
+    idle_readings(bench, T0, steps[-1]["end_ms"] + 10 * S)
+    db = bench.snapshot()
+    report = build([bench.manifest(manifest_doc("rpm_sweep", "r1", steps, db), "r1")])
+    step = report["rpm_sweep"]["steps"][1]
+    assert step["reason"] is None
+    assert step["response_ms"] == 51 * S + 1500
+
+
+def test_trending_idle_window_is_window_trend(bench: Bench) -> None:
+    steps = sweep_steps("front", 1, T0, command_id=1, levels=(0.35, 0.40), down=())
+    bench.drive(steps, zone_fn=steady_rpm)
+    start, end = T0 - 300 * S, steps[-1]["end_ms"] + 10 * S
+    bench.series(
+        "cpu.package", start, end, lambda ts: 40.0 + 0.5 * ((ts - T0) % SWEEP_STEP_MS) / 60_000
+    )
+    bench.series("gpu.0.core", start, end, 35.0)
+    bench.series("power.gpu.0", start, end, 20.0)
+    db = bench.snapshot()
+    report = build([bench.manifest(manifest_doc("rpm_sweep", "r1", steps, db), "r1")])
+    assert {step["reason"] for step in report["rpm_sweep"]["steps"]} == {"window_trend"}
+
+
+def test_trend_of_a_retained_temperature_is_window_trend(bench: Bench) -> None:
+    # 指標に入らない air.room を 0.3 °C / 120 s で上げる（セッションのずれ 1 °C の内側）
+    def ramp(label: str | None, ts: int) -> float:
+        return 0.3 * ((ts - T0) % MATRIX_STEP_MS) / 120_000 if label == "Rr-" else 0.0
+
+    report = build([matrix_run(bench, "m1", T0, effects={"air.room": ramp})])
+    assert pair(report, 0, "Rr-")["reason"] == "window_trend"

@@ -1284,6 +1284,14 @@ def analyse_sweep_step(
         if not idle.mean + config.k * idle.u_win < limit.value:
             observation.reason = Reason.CONDITION_MISMATCH
             return observation
+        trend_limit = (
+            config.max_window_trend.power_w.value
+            if metric.startswith("power.")
+            else config.max_window_trend.temperature_c.value
+        )
+        if idle.trend > trend_limit:
+            observation.reason = Reason.WINDOW_TREND
+            return observation
     values = [value for _, value in rpm_points]
     median = statistics.median(values)
     quantization = config.resolution_of("fan_rpm") / _SQRT12
@@ -1326,11 +1334,9 @@ def _response_time(
     for index in range(len(in_step) - 1, change - 1, -1):
         rpm = in_step[index].zones[step.zone].rpm
         if rpm is None:
-            # 記録の窓の中の null は回転数の覆い（§2.3）で検査済み。窓の前の null は
-            # 「帯に留まった」と言えないので、そこで区切る（応答の時間を短く見積もらない）
-            if in_step[index].ts_ms < window_start_ms:
-                break
-            continue
+            # null の間は「帯に留まった」と言えないので、窓の中でも前でもそこで区切る
+            # （応答の時間を短く見積もらない）。最後の tick が null なら応答の時間は求めない
+            break
         if abs(rpm - target) > band:
             break
         settled = index
@@ -1664,6 +1670,14 @@ def _value_window(
             else config.max_window_trend.power_w.value
         )
         if window.indicator(item).trend > limit:
+            window.reason = Reason.WINDOW_TREND
+            return window
+    # 指標に入らない温度（air.room・board.connector_12v2x6 など）も値の窓の統計として
+    # 保持するので、同じ傾きの上限を当てる（§2.6）。電力は上の POWER_INDICATORS で見た
+    for metric, stat in window.stats.items():
+        if metric == PUMP or metric.startswith("power."):
+            continue
+        if stat.trend > config.max_window_trend.temperature_c.value:
             window.reason = Reason.WINDOW_TREND
             return window
     for metric in RECORD_ONLY:
