@@ -619,9 +619,16 @@ sudo /usr/bin/python3 -I -S /opt/coldaisle/src/coldaisle/safety_handoff.py; echo
 
 - `systemd-analyze verify` は CI に無いので（`tests/test_deploy_templates.py` は静的な試験だけ）、
   **導入先で人が走らせます。** 何も出なければ通っています。特に
-  `... is not executable` が出ないこと（`ExecStart=` の `/opt/coldaisle/.venv/bin/coldaisle-fand` と
+  `... is not executable` が出ないこと（`ExecStart=` の `/opt/coldaisle/.venv/bin/python` と
   `ExecStopPost=` の `/usr/bin/python3` が実在すること）を確かめます。出たまま起動すると fand は
   `READY=1` に届かず、deadman も tach の監視も動きません
+- unit の `ExecStart=` は root の所有の venv の interpreter を **`-I -m`** で起動します
+  （`/opt/coldaisle/.venv/bin/python -I -m coldaisle.control_daemon ...`。決定記録 [`0157`](decisions/0157-hint-runtime-launch-form.md) §2.1。
+  6.7 の `raise` と同じ形）。console script（`.venv/bin/coldaisle-fand`）は `PYTHONPATH` などの環境変数を読み、
+  `sys.path` の先頭に script のディレクトリが入るので、**本番の unit と手順では使いません**（開発と手の試験のために残します）。
+  `-I -m` で起動した fand は、プロセス名が `python` になります（journal の識別は `SyslogIdentifier=` のまま）。
+  手で起動して試すときも unit と同じ形にします（`uv run coldaisle-fand` は開発用です）。
+  以前のテンプレート（console script の `ExecStart=`）を置いた導入先は 6.9 で切り替えます
 - 引き継ぎ実行部（`ExecStopPost=`）は venv を使わず、システムの `/usr/bin/python3` で
   `/opt/coldaisle/src/coldaisle/safety_handoff.py` を引数なしで実行します。`/opt/coldaisle` は
   root の所有のままにします（fand のユーザーが書き換えられないように）
@@ -1354,6 +1361,9 @@ Registry と制御設定への書き込み、root。artifact の本体は `raise
         /etc/systemd/system/coldaisle-learnd-supervisor.service
    ```
 
+   - `ExecStart=` は fand と同じく root の所有の venv の interpreter を `-I -m` で起動します
+     （`/opt/coldaisle/.venv/bin/python -I -m coldaisle.learned_worker.cli --role mpc|supervisor ...`。決定記録 0157 §2.1）。
+     console script（`.venv/bin/coldaisle-learnd`）は本番では使いません
    - `--config-dir`・`--registry-root`・`--learned-channel-config` と `WorkingDirectory=` は fand の unit と同じ値です。
      fand の側を変えたら worker の側も変えます（違うと frame の照合が外れ続け、提案が使われません）
    - `RestartSec=` と資源の上限（`MemoryMax=` など）は暫定値です（0115 §2.6）
@@ -1380,3 +1390,75 @@ Registry と制御設定への書き込み、root。artifact の本体は `raise
    - `coldaisle-learn-rl` が `/run/coldaisle/learned-mpc` を、`coldaisle-learn-mpc` が `/run/coldaisle/learned-rl` を
      たどれないこと
    - 結果を #57 に残します。**実機のユーザー名・ホスト名・path は書きません**
+
+### 6.9 起動の形を `-I -m` へ切り替える（以前のテンプレートを置いた導入先。決定記録 0157 §2.6）
+
+決定の理由は決定記録 [`0157`](decisions/0157-hint-runtime-launch-form.md) を見てください。fand・Learned worker の
+unit の `ExecStart=` は、以前のテンプレートでは console script（`/opt/coldaisle/.venv/bin/coldaisle-fand` /
+`coldaisle-learnd`）でした。いまのテンプレートは root の所有の venv の interpreter を `-I -m` で起動します（6.5 / 6.8）。
+以前のテンプレートを `/etc/systemd/system/` に置いた導入先は、次の順で切り替えます。**fand を `enable` する前に行います**
+（fand は 0121 の試験中で disabled のまま）。path・unit 名は**仮の値**です。
+
+> **Workload Hint の Stage B の証明書（決定記録 0152）は、この切り替えの後に本番のホストで作ります。**
+> 起動の形と `sys.path` が証明書の実行環境の指紋に入るので、切り替えの前に作った証明書は合いません
+> （合わなければ B0 に倒れるだけで、冷却の制御は変わりません）。
+
+1. `/opt/coldaisle` を更新し、root で venv を同期します（2 節と同じ形。`uv sync --no-dev`）
+2. 3つの unit を置き直して読み込ませます。導入先で書き換えた行（`WatchdogSec=`・`--t-sensor-metric` など。6.2 / 6.5）は
+   置き直した後に同じく書き換えます（`sudo cp` の前に `diff` で差分を見ておきます）
+
+   ```bash
+   for u in coldaisle-fand coldaisle-learnd-mpc coldaisle-learnd-supervisor; do
+     diff -u "/etc/systemd/system/$u.service" "/opt/coldaisle/deploy/systemd/$u.service"
+   done
+   sudo cp /opt/coldaisle/deploy/systemd/coldaisle-fand.service \
+           /opt/coldaisle/deploy/systemd/coldaisle-learnd-mpc.service \
+           /opt/coldaisle/deploy/systemd/coldaisle-learnd-supervisor.service /etc/systemd/system/
+   sudoedit /etc/systemd/system/coldaisle-fand.service   # 導入先で書き換えていた行を戻す（6.2 / 6.5）
+   sudo systemctl daemon-reload
+   ```
+
+   worker の unit をまだ置いていない導入先（6.8 の前）は、fand の unit だけを置き直します
+3. `systemd-analyze verify` で確かめます。`... is not executable` が出ないこと（`/opt/coldaisle/.venv/bin/python` が実在すること）
+
+   ```bash
+   sudo systemd-analyze verify /etc/systemd/system/coldaisle-fand.service \
+        /etc/systemd/system/coldaisle-learnd-mpc.service \
+        /etc/systemd/system/coldaisle-learnd-supervisor.service
+   ```
+
+4. `ExecStart=` が `-I -m` の形になったことを確かめます。`argv[]=` が
+   `/opt/coldaisle/.venv/bin/python -I -m coldaisle.control_daemon ...`（worker は `/opt/coldaisle/.venv/bin/python -I -m coldaisle.learned_worker.cli --role ...`）で
+   始まること
+
+   ```bash
+   systemctl show -p ExecStart coldaisle-fand coldaisle-learnd-mpc coldaisle-learnd-supervisor
+   ```
+
+5. worker を動かしているなら再起動し、動いているプロセスの引数に `-I` と `-m` があることを確かめます
+
+   ```bash
+   sudo systemctl restart coldaisle-learnd-mpc coldaisle-learnd-supervisor
+   for u in coldaisle-learnd-mpc coldaisle-learnd-supervisor; do
+     pid=$(systemctl show -p MainPID --value "$u")
+     sudo tr '\0' ' ' < "/proc/$pid/cmdline"; echo
+   done
+   ```
+
+6. fand は 0121 の手順のまま（disabled）です。0121 の試験で fand を手で起動するときも、unit と同じ
+   `/opt/coldaisle/.venv/bin/python -I -m coldaisle.control_daemon ...` の形で起動します
+   （`.venv/bin/coldaisle-fand` は使いません）
+7. **fand の起動から `READY=1` までの時間を測ります**（決定記録 0157 §5 の 4）。0157 §2.2 の実行環境の指紋は
+   起動時に1回、`READY=1` の前に標準ライブラリと site-packages の中身を読みます。その時間が `TimeoutStartSec=` の
+   猶予に収まることを確かめます。fand を unit で起動する試験（0080 §2.10 の段階 5）のときに、次の2つの時刻の差を読みます
+   （`Type=notify` なので、`ActiveEnter` は `READY=1` を受けた時刻です）
+
+   ```bash
+   systemctl show -p ExecMainStartTimestampMonotonic -p ActiveEnterTimestampMonotonic coldaisle-fand
+   # 差（マイクロ秒）が起動から READY=1 までの時間。TimeoutStartSec=（unit の値）と比べる
+   ```
+
+   - 指紋の計算は、Workload Hint の Stage B の照合を入れる版から加わります。その版へ上げた後に測り直します
+   - 起動を何回か繰り返し（再起動の直後の冷えた状態を含めて）、最も長いものを `TimeoutStartSec=` と比べます。
+     収まらなければ fand を `enable` せず、別の決定記録で扱います（0157 §5 の 4）
+   - 結果（測った回数と最も長い時間）を #288 に残します。**実機のホスト名・path は書きません**

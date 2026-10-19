@@ -34,7 +34,9 @@ WorkingDirectory=/opt/coldaisle
 # **同じ値**にする。--metrics / --registry-limits は渡さず、作業ディレクトリ基準の既定（fand と同じファイル）を使う。
 # frame の config と metric_catalog_sha256 の照合が取り違えで外れ続けないようにするため（0107 §2.6・0115 §2.4）。
 # 較正ファイルは読まない（frame で受け取る。0101 §2.1）
-ExecStart=/opt/coldaisle/.venv/bin/coldaisle-learnd --role supervisor --config-dir /etc/coldaisle/control-config --registry-root /var/lib/coldaisle-registry --learned-channel-config /etc/coldaisle/learned-channel.yaml
+# 起動の形は coldaisle-fand と同じく root の所有の venv の interpreter を -I -m で（決定記録 0157 §2.1）。
+# console script（.venv/bin/coldaisle-learnd）は本番では使わない
+ExecStart=/opt/coldaisle/.venv/bin/python -I -m coldaisle.learned_worker.cli --role supervisor --config-dir /etc/coldaisle/control-config --registry-root /var/lib/coldaisle-registry --learned-channel-config /etc/coldaisle/learned-channel.yaml
 
 # fand の再起動・停止で接続が切れると終了コード 3 で終わる（0113 §2.1）。それが通常の経路なので戻す。
 # 2（引数の誤り。未知の --role を含む。0114 §2.1 の8）は人が直すまで変わらないので戻さない。**3 と 5 は入れない**（5 は一時的な失敗も含む。0115 §2.5）

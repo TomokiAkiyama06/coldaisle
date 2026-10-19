@@ -294,3 +294,8 @@ def _connect(role: LearnedRole, settings: LearnedChannelSettings) -> WorkerChann
         max_message_bytes=settings.limits.max_message_bytes.value,
         role=role,
     )
+
+
+# 本番の unit は `python -I -m coldaisle.learned_worker.cli` で起動する（決定記録 0157 §2.1）
+if __name__ == "__main__":  # pragma: no cover
+    raise SystemExit(main())
