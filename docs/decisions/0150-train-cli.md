@@ -1,7 +1,7 @@
 # 決定記録 0150: 学習の CLI `coldaisle-train`（Thermal Dataset v2 から反実仮想 Thermal Model artifact v2 を作り、Model Registry へ candidate として登録する入口）
 
 - **種別**: Decision Record
-- **Status**: Proposed
+- **Status**: FINAL（2026-10-19、リポジトリ所有者の承認。§5 の 13 点（1〜11・14・15）はすべて推奨の案。12・13 は 2026-10-16 に決定済み）
 - **Date**: 2026-10-16
 - **Supersedes**: [0062](0062-model-registry-operations.md) の §2.1 の `register` のうち、`--metadata` / `--payload` で
   `kind` = `thermal_model` かつ `capability` = `counterfactual_action` の artifact を登録できる点のみ（§2.5 / §5 の 14。0062 の他の点は
@@ -243,7 +243,7 @@ process が強制終了したとき（`SIGKILL`・電源断）は片づけられ
 
 #### 公開の手順（`--out` を最初に排他的に作り、最後に完成の印を付ける。OS に依らない）
 
-**推奨案（§5 の 10 の (A)）で書く。** 使うのは macOS / Ubuntu で共通の POSIX の操作だけで、OS ごとの関数を呼ばない
+**§5 の 10 で決めた (A) で書く。** 使うのは macOS / Ubuntu で共通の POSIX の操作だけで、OS ごとの関数を呼ばない
 （NFR-07 を変えない）。
 
 1. **`--out` の親を、Dataset の writer と同じ検査で開く。** 既存の `dataset._open_output_root`（`src/coldaisle/dataset.py`）を
@@ -403,7 +403,7 @@ JSON として読めて、書かれた3つのファイルの大きさと SHA-256
     別の場所への写しでも外れる。中身の判定は読んだ bytes だけを見るので、ファイルシステムの競合・link・写しのどれにも依らない。
     そのため前の版で足した「最後の要素を `O_NOFOLLOW` で開き、親の fd で `training-report.json` を確かめる」読み方の変更は要らず、
     `read_bounded` の挙動（symlink をたどる）は変えない
-  - **推奨とした理由**（一時名の案と比べて）: もう1つの案「書いている途中のファイルを一時名（`.artifact.json.partial` など）で
+  - **この案を選んだ理由**（一時名の案と比べて）: もう1つの案「書いている途中のファイルを一時名（`.artifact.json.partial` など）で
     置き、公開と同時か直前に最終の名前へ移す」は、最終の名前へ移すのを印の link の前にすると窓が残り（移した後・link の前に同じ
     経路で登録できる）、link の後にすると「印はあるがファイルが無い」公開の後の失敗の状態が増える。中身で拒む案は公開の手順と
     状態を変えず、登録できる経路を「印を確かめる経路」1つに絞れる
@@ -479,7 +479,7 @@ lifecycle の状態に依らず読める）をすべて行ってから、当た�
 
 順序は **`--out` の公開 → Registry の登録**とする。2つの間で止まったときは `--out` だけがあり、`coldaisle-train` の
 再実行は `--out` が既にあるので拒否される。このときは `coldaisle-registry register --training-output <--out>` で、印を
-確かめた同じ bytes が登録される（§5 の 1 の推奨の理由と同じ）。登録の失敗は構造化ログに
+確かめた同じ bytes が登録される（§5 の 1 で選んだ理由と同じ）。登録の失敗は構造化ログに
 `--out` の path を出し、この手順を促す。
 
 - **既定では Registry を書かない。** `--out` へ書いて終わる（`coldaisle-calibrate` / `coldaisle-memory` の「既定では
@@ -701,7 +701,7 @@ best-effort で `OSError` / `UnsafeRegistryPathError` を握る（`src/coldaisle
 
 | 段 | 内容 |
 |---|---|
-| 0 | 本記録（Proposed） |
+| 0 | 本記録（FINAL） |
 | 1 | `src/coldaisle/train.py`・`src/coldaisle/training_output.py`・`coldaisle-registry register --training-output`・console script・`config/training.example.yaml`・§2.9 の試験。`training_entry` と `docs/thermal-dataset.md` の「学習の CLI はまだ無い」を直す。AGENTS.md のコマンド一覧と `docs/thermal-model.md` に1行足す |
 | 2 | （別の記録）thermal model の offline evaluation の形と `offline_evaluation_ref`（§5 の 5） |
 | 3 | （別の記録）RL Supervisor の学習の入口（§5 の 6） |
@@ -736,9 +736,11 @@ best-effort で `OSError` / `UnsafeRegistryPathError` を握る（`src/coldaisle
 | 学習の選択を CLI の引数だけで渡す | 報告に spec の digest を1つで残せない。support 軸の列のような構造を引数で渡すと取り違えやすい |
 | 壁時計で `created_at` を埋める | 同じ入力から bytes が変わり、作り直して比べる確認ができない |
 
-## 5. 未決事項（人の判断が要る点。推奨を先頭に）
+## 5. 判断点（決定済み。推奨を先頭に）
 
-| # | 論点 | 推奨 | 代替 |
+**所有者の決定（2026-10-19）**: 1〜11・14・15 のすべてを推奨の案で決めた（12・13 は 2026-10-16 に推奨の案で決定済み）。§2 の本文はその決定を書いたものである。
+
+| # | 論点 | 決定（推奨の案） | 代替（採らない） |
 |---|---|---|---|
 | 1 | Registry への書き込みを `coldaisle-train` に持たせるか | **`--apply` のときだけ `register_candidate` を呼ぶ**（§2.5）。`--out` の同じ bytes なので、後から `coldaisle-registry register` で登録しても同じ結果になる | (a) 持たせない。`--out` に書くだけで、登録は常に `coldaisle-registry register` を人が別に打つ（境界は最も単純だが、取り違えた metadata を登録する余地が残る） |
 | 2 | `--apply` の actor の決め方 | **`--actor` / `--reason` を必須の引数にする**（`coldaisle-registry register` と同じ。0062） | (a) 実行した uid の名前から導く（0086 の承認者と同じ形。0086 §5 の未決 2「Registry の承認者も uid に結びつけるか」と一緒に決めるべきで、ここだけ先に変えない） |
