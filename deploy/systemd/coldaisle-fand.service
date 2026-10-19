@@ -42,6 +42,10 @@ UMask=0007
 WorkingDirectory=/opt/coldaisle
 
 # 実行ファイルは導入先の venv の絶対パスで書く（素の名前は systemd の探索パスに無い）。
+# root の所有の venv の interpreter を -I -m で起動する（決定記録 0157 §2.1。0134 §2.2 の raise と同じ形）。
+# console script（.venv/bin/coldaisle-fand）は PYTHONPATH などを読み、sys.path[0] に script のディレクトリが入るので
+# 本番では使わない。-I でも WorkingDirectory= は残す（作業ディレクトリ基準の既定のファイルが使う。0157 §2.5）。
+# プロセス名は python になるが、journal の識別は SyslogIdentifier= のまま
 # 制御の4ファイルと管理ソケットの設定は root 所有の場所に置き、fand 自身が safety.yaml を緩められないようにする。
 # --authority-root は承認者のグループと共有する専用のディレクトリ（決定記録 0086 §2.2。下の ReadWritePaths=）
 # Learned と較正の3つは常に渡す（決定記録 0115 §2.3）。**どれも失敗は安全側**で、読めなければ Learned を
@@ -55,7 +59,7 @@ WorkingDirectory=/opt/coldaisle
 # --t-sensor-metric は入れない。導入先の safety.yaml で telemetry.t_sensor を有効にしたときだけ、
 # 置いた unit の ExecStart= の末尾に「--t-sensor-metric board.connector_12v2x6」を足す（決定記録 0110 §2.8。
 # safety.yaml と食い違うと起動時に拒否される）
-ExecStart=/opt/coldaisle/.venv/bin/coldaisle-fand --backend hwmon --require-watchdog --config-dir /etc/coldaisle/control-config --admin-config /etc/coldaisle/control-admin.yaml --db /var/lib/coldaisle/coldaisle.db --authority-root /var/lib/coldaisle-authority --calibration /opt/coldaisle/config/calibration.json --registry-root /var/lib/coldaisle-registry --learned-channel-config /etc/coldaisle/learned-channel.yaml
+ExecStart=/opt/coldaisle/.venv/bin/python -I -m coldaisle.control_daemon --backend hwmon --require-watchdog --config-dir /etc/coldaisle/control-config --admin-config /etc/coldaisle/control-admin.yaml --db /var/lib/coldaisle/coldaisle.db --authority-root /var/lib/coldaisle-authority --calibration /opt/coldaisle/config/calibration.json --registry-root /var/lib/coldaisle-registry --learned-channel-config /etc/coldaisle/learned-channel.yaml
 
 # 異常終了・watchdog・SIGKILL の後に root・sandbox なしで Max を書く引き継ぎ実行部（0028 §2.7 / 0080 §2.5）。
 # venv と coldaisle パッケージに依存しないよう、システムの python3 でソースを直接、引数なしで実行する。

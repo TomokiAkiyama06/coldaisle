@@ -513,8 +513,12 @@ class ThermalModelArtifact(_Frozen):
 class ThermalRegistryMetadata(_Frozen):
     """Values that map one-to-one to #104 ``ArtifactMetadata``."""
 
-    schema_version: Literal[2, 3] = 3
-    """#104 ``ArtifactMetadata`` の版。**書き出しは v3、v2 で登録済みの記録も読む。**
+    schema_version: Literal[2, 3, 4] = 3
+    """#104 ``ArtifactMetadata`` の版。**書き出しは v3、v2 / v4 で登録された記録も読む。**
+
+    v4（#288 / 決定記録 0152 §2.2）は `hint_certificate` の kind と能力を足しただけで、thermal
+    model 側の欄は変わっていない。既定の版（v4）の ``ArtifactMetadata`` で登録された thermal
+    artifact を版の違いだけで読めなくしないため、v4 も受け付ける。
 
     v3 は `ArtifactCapability` に `supervisor_strategy` が増えただけで（#89）、thermal model
     側の欄は何も変わっていない。v2 で登録済みの production artifact を版の違いだけで

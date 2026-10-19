@@ -5,6 +5,7 @@
 - **Date**: 2026-10-11
 - **Supersedes**: なし（0028 §5 未決 1 のうち `safety.yaml` の値を閉じる。Policy の値は範囲外）
 - **Superseded by**: §2.9 の `startup_settle_ms` の値（5000 → 15000）は [`0126`](0126-startup-settle-front-spinup.md)
+- **Superseded by**: §2.13 の `watchdog_timeout_ms` の行のうち、約 11 s の経路の温度を実機で測ることを、部品ごとの根拠・テスト・解析と所有者の受け入れで置き換えることは [`0158`](0158-t5-11s-path-component-assurance.md)
 - **関連**: [`0028`](0028-fan-control-contracts.md) §2.6〜§2.9 /
   [`0029`](0029-telemetry-loss-classes.md) /
   [`0080`](0080-fand-systemd-unit.md) §2.6 /
