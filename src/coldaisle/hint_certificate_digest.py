@@ -20,7 +20,8 @@ Learned MPC worker が同じ関数を呼ぶ（0152 §2.3。``calibration_offsets
 
 設定から値を選ぶ部品（``hint_policy`` / ``optimizer``）とゲートの仕様の導出は、設定の型を読むので
 ``coldaisle.control.hint_gate`` に置き、正準な符号化と digest はここの :func:`json_component_sha256`
-を呼ぶ（0152 §2.3 / 0156 §2.7）。``conditions``（``LearnedMpcController.conditions()`` の全体）は
+を呼ぶ（0152 §2.3 / 0156 §2.7）。``conditions``（``LearnedMpcController.conditions()`` から
+0160 の閉じた一覧を除いたもの）は
 :func:`conditions_sha256`、証明書の型と ``certificate_sha256`` は ``coldaisle.hint_certificate``。
 
 **例外を握りつぶさない。** 読めない・symlink を含む・非有限の offset は ``ValueError`` /
@@ -66,7 +67,20 @@ _CALIBRATION_TAG = b"coldaisle-hint-calibration-v1"
 _CALIBRATION_AVAILABLE = b"available"
 _CALIBRATION_UNAVAILABLE = b"unavailable"
 _DISTRIBUTION_NAME_SEPARATORS = re.compile(r"[-_.]+")
-_CONDITIONS_TAG = b"coldaisle-hint-conditions-v1"
+_CONDITIONS_TAG = b"coldaisle-hint-conditions-v2"
+"""v2: 決定記録 0160 §2.2（:data:`CONDITIONS_EXCLUDED_POSITIONS` を除いて束ねる）。"""
+
+CONDITIONS_EXCLUDED_POSITIONS: tuple[tuple[str, ...], ...] = (
+    ("binding", "registry_revision"),
+    ("binding", "production_active"),
+    ("binding", "artifact_status"),
+    ("authority_stage",),
+)
+"""部品 ``conditions`` の digest から除く位置の**閉じた一覧**（決定記録 0160 §2.1）。
+
+どれも予測・探索が読まない値で、証明書を昇格する・Authority を動かすたびに変わる。
+一覧に無い位置はすべて束ねる。増やすには決定記録を要る（黙って除かれる値を作らない）。
+"""
 
 
 def length_prefixed(parts: Iterable[bytes]) -> bytes:
@@ -595,8 +609,34 @@ def json_component_sha256(tag: bytes, value: object) -> str:
 
 
 def conditions_sha256(conditions: Mapping[str, object]) -> str:
-    """``conditions`` の部品: ``LearnedMpcController.conditions()`` の**全体**の digest。
+    """``conditions`` の部品: ``LearnedMpcController.conditions()`` から閉じた一覧を除いた digest。
 
-    0152 §2.3 / 0066 §2.1 (c)。鍵を列挙し直さない（``conditions()`` に鍵が増えればそのまま束ねる）。
+    0152 §2.3 / 0066 §2.1 (c) / 0160 §2.1・§2.2。除くのは :data:`CONDITIONS_EXCLUDED_POSITIONS`
+    だけで、それ以外の鍵は列挙し直さずに束ねる（``conditions()`` に鍵が増えればそのまま入る）。
+    呼び出し側（認証ランナー・worker）は ``conditions()`` の値をそのまま渡し、自分で鍵を除かない。
+
+    **除く位置が無ければ ``ValueError``**（fail closed。0160 §2.2）。親が mapping でない・鍵が無い
+    入力では digest を作らない。入力の mapping は書き換えない（写しから除く）。
     """
-    return json_component_sha256(_CONDITIONS_TAG, dict(conditions))
+    copied = _copied_mapping(conditions)
+    for position in CONDITIONS_EXCLUDED_POSITIONS:
+        parent: dict[str, object] = copied
+        for key in position[:-1]:
+            child = parent.get(key)
+            if not isinstance(child, dict):
+                raise ValueError(
+                    f"conditions の除く位置の親が mapping でない: {'.'.join(position)}"
+                )
+            parent = child
+        if position[-1] not in parent:
+            raise ValueError(f"conditions に除く位置が無い: {'.'.join(position)}")
+        del parent[position[-1]]
+    return json_component_sha256(_CONDITIONS_TAG, copied)
+
+
+def _copied_mapping(value: Mapping[str, object]) -> dict[str, object]:
+    """入れ子の mapping を写す（除く操作で呼び出し側の値を書き換えない）。"""
+    return {
+        key: _copied_mapping(item) if isinstance(item, Mapping) else item
+        for key, item in value.items()
+    }

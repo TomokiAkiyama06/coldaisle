@@ -334,6 +334,8 @@ MemoryErrorで落とさないためである。壊れたYAML・JSONやファイ�
   `training_dataset_version` は認証した thermal_model の key（`thermal_model/<model_id>/<version>`）、
   `source_runs` は証明書の `certificate_sha256` の1つだけ、`model_family` は `hint-monotonicity-certificate`、
   `feature_schema_version` は `hint-gate-spec-v1`、`target_schema_version` は `hint-certificate-v1`（決定記録 0156 §2.8）。
+  証明書の JSON は認証ランナー `coldaisle-hint-certify`（決定記録 0152 §2.1。`docs/ubuntu-deploy.md` 6.10）が
+  `--out` に書き、ランナーは Registry に書かない。登録の metadata は上の意味で人が書く。
   Registry は証明書の中身を読まない（中身の照合は fand と worker が後の段で行う）。閉じた列挙に値を
   足したので **Registry schema version を 3 から 4 へ上げた**。v2 / v3 の snapshot はそのまま読み、次の書き込みで
   v4 にする。v4 より前の版を名乗る snapshot・metadata は `hint_certificate` を持てない。v3 までの読み手は

@@ -1468,3 +1468,44 @@ unit の `ExecStart=` は、以前のテンプレートでは console script（`
    - 起動を何回か繰り返し（再起動の直後の冷えた状態を含めて）、最も長いものを `TimeoutStartSec=` と比べます。
      収まらなければ fand を `enable` せず、別の決定記録で扱います（0157 §5 の 4）
    - 結果（測った回数と最も長い時間）を #288 に残します。**実機のホスト名・path は書きません**
+
+### 6.10 Workload Hint の単調性ゲートの証明書を作る（認証ランナー。決定記録 0152 §2.1 / 0157 / 0160）
+
+決定の理由は決定記録 [`0152`](decisions/0152-hint-monotonic-gate-certificate.md) §2.1・
+[`0157`](decisions/0157-hint-runtime-launch-form.md) §2.1・[`0160`](decisions/0160-hint-conditions-digest-scope.md) §2.4 を
+見てください。Workload Hint を B1 `shadow_mpc` 以上で使うには、本番のホストで認証ランナーを走らせ、合格したときに
+出る証明書を Model Registry に kind `hint_certificate` として登録・昇格します。**ランナーは `--out` の1ファイルしか書きません**
+（Registry にも設定にも書かない）。証明書が無い・合わないあいだ、fand は B0（記録だけ）に留まり、冷却の制御は変わりません。
+
+- **6.9 の切り替えの後に**走らせます（起動の形と `sys.path` が実行環境の指紋に入る）
+- Thermal Model の昇格・rollback、`/opt/coldaisle` の更新（`uv sync`）、Control Config・較正の変更のあとは作り直します
+  （作り直さなければ照合が合わず B0 に倒れるだけ）
+- ランナーは起動の直後に自分を `SCHED_IDLE` に下げ、下げられなければ何もせずに終わります（終了コード 3）。
+  `-I -m` の形でない起動（console script の `coldaisle-hint-certify` を含む）も何もせずに終わります（終了コード 3）
+- 格子の点の数を最初にログに出します。点が多いと時間が掛かります（`SCHED_IDLE` なので fand・worker の邪魔はしない）
+
+path・ユーザーは**仮の値**です。`--config-dir`・`--registry-root`・`--calibration` は **fand の unit の `ExecStart=` と同じ path**、
+`--hint-lockfile` は root の所有の `/opt/coldaisle/uv.lock` を渡します。制御設定と Registry を読むので、6.7 の承認者
+（制御設定の読み取りと Registry の読み取りを持つ人）が自分の uid で走らせます。
+
+```bash
+/opt/coldaisle/.venv/bin/python -I -m coldaisle.hint_certify \
+  --config-dir /etc/coldaisle/control-config \
+  --metrics /opt/coldaisle/config/metrics.yaml \
+  --registry-root /var/lib/coldaisle-registry \
+  --registry-limits /opt/coldaisle/config \
+  --calibration /opt/coldaisle/config/calibration.json \
+  --hint-lockfile /opt/coldaisle/uv.lock \
+  --out "$HOME/hint-certificate.json"
+echo $?   # 0 = 合格（証明書を書いた）/ 1 = 不合格 / 3 = 起動の形・SCHED_IDLE / 4 = 入力を読めない / 5 = --out を書けない
+```
+
+- 不合格（1）のときは証明書を書きません。ログの `reason` が理由です（`grid_point_unsolved`: 格子の点で解けなかった・
+  `monotonicity_violated`: ヒント有りの解が基準より冷却を弱めた・`window_metrics_mismatch` / `temperature_metric_not_in_window`:
+  格子の軸と artifact の window の metric が合わない・`thermal_model_unbindable`: 較正の不一致などで束縛できない ほか）。
+  `first_point` は最初の点の軸の**位置**（値は載せない）
+- `--out` が既にあれば上書きしません（終了コード 5）
+- 合格したら、証明書を `coldaisle-registry register` → `validate` → 承認ファイル付きの `promote` で登録します
+  （metadata の欄の意味は `docs/model-registry.md` の #288 の項）。承認者は、昇格の前に 0133 §2.6 の B1 の他の前提
+  （RulePolicy の本番値・本番のホストでの実時間の試験の合格）が揃っていることを確かめ、承認ファイルの `reason` に書きます
+  （0152 §5 の 3）
