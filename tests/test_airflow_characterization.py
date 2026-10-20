@@ -837,6 +837,26 @@ def test_calibration_activation_inside_the_run_is_calibration_changed(bench: Ben
     assert run["status"] == "discarded" and run["reason"] == "calibration_changed"
 
 
+@pytest.mark.parametrize(("offset_ms", "discarded"), [(-1, True), (0, False)])
+def test_calibration_activation_at_the_run_end_is_outside_the_run(
+    bench: Bench, offset_ms: int, discarded: bool
+) -> None:
+    """区間は `[start, end)`。`end_ms` ちょうどの有効化は次のセッションのもの（#360）。"""
+    path = matrix_run(bench, "m1", T0)
+    document = yaml.safe_load(path.read_text(encoding="utf-8"))
+    end_ms = document["steps"][-1]["end_ms"]
+    bench.calibration(end_ms + offset_ms, {"air.room": 0.2})
+    db = bench.snapshot("m1.db")
+    document["db_copy"]["sha256"] = sha(db)
+    path.write_text(yaml.safe_dump(document), encoding="utf-8")
+    run = build([path])["response_matrix"]["runs"][0]
+    if discarded:
+        assert run["status"] == "discarded" and run["reason"] == "calibration_changed"
+    else:
+        assert run["status"] == "ok" and run["reason"] is None
+        assert run["calibration_offsets_sha256"] == OFFSETS_SHA
+
+
 def test_calibration_digest_mismatch_and_missing_row(bench: Bench) -> None:
     path = matrix_run(bench, "m1", T0, calibration=False)
     assert build([path])["response_matrix"]["runs"][0]["reason"] == "calibration_changed"
