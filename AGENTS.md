@@ -63,6 +63,8 @@ uv run coldaisle-control rollback-authority --reason "挙動を見直す"  # Aut
 uv run coldaisle-authority raise --authority-root <dir> --approval <承認.json> --report <報告.json> --config-dir var/control-config --registry-root var/model-registry  # Authority を1段上げる。**人が自分の uid で実行する唯一の昇格の入口**。承認者は実行した uid（`--approver` は無い。#92 / 決定記録 0086）
 #   --registry-root は開発でも共有の root の形にする（`chmod 2770` 済み・`.registry.lock` がある）。CLI は Registry を作らず、lock は O_RDONLY で flock だけ（決定記録 0104 §2.4 / 0105）
 #   本番は root の所有の `/opt/coldaisle/.venv/bin/python -I -m coldaisle.authority_cli raise ... --registry-limits /opt/coldaisle/config`（`uv run` と console script を使わない。docs/ubuntu-deploy.md 6.7 / 決定記録 0134 §2.2）
+uv run python -I -m coldaisle.hint_certify --config-dir var/control-config --registry-root var/model-registry --hint-lockfile uv.lock --calibration config/calibration.json --out var/hint-certificate.json  # Workload Hint の単調性ゲートの認証ランナー（合格したときだけ --out に証明書を書く。**Registry・設定に書かない**。登録は人が coldaisle-registry で。-I -m でない・SCHED_IDLE に下げられないなら何もしない。#288 / 決定記録 0152 §2.1 / 0157 / 0160 §2.4）
+#   本番は `/opt/coldaisle/.venv/bin/python -I -m coldaisle.hint_certify ...`（console script の coldaisle-hint-certify は -I -m でないので何もしない。docs/ubuntu-deploy.md 6.10）
 uv run coldaisle-authority rollback --authority-root <dir> --reason "fand 停止中に戻す"  # fand が止まっているときの rollback（uid で拒まない）
 COLDAISLE_DB=var/coldaisle.db uv run uvicorn coldaisle.api:app --host 127.0.0.1 --port 8000
 COLDAISLE_DB=var/coldaisle.db uv run uvicorn coldaisle.server:app --port 8000  # + AI ツールの窓口
@@ -281,6 +283,9 @@ src/coldaisle/
   declared_changes.py # 合成の起点が共有: 宣言された変更（DeclaredChange）の YAML の形と検証（drift / dataset v2）。0109
   local_socket.py # レイヤ横断: Unix ソケット入口に共通の門（SO_PEERCRED・権限・起動時の検査）。0045 / 0072 §2.5
   authority_cli.py # 合成の起点: `coldaisle-authority raise` / `rollback`。`raise_stage()` を呼ぶ唯一の場所。**どこからも import しない**。#92 / 決定記録 0086
+  hint_certify.py # 合成の起点: Workload Hint の単調性ゲートの認証ランナー `coldaisle-hint-certify`（格子・二重解法・全 offset の比較・証明書の生成）。**書くのは --out だけ**（Registry・設定に書かない）。**どこからも import しない**。#288 / 決定記録 0152 §2.1 / 0160 §2.4
+  hint_certificate.py / hint_certificate_digest.py # レイヤ横断: 証明書とゲートの仕様の型・部品の digest（ランナー・fand・worker が同じ関数を呼ぶ。control を import しない）。0152 §2.3 / 0156 / 0157 / 0160
+  startup_calibration.py # 合成の起点の部品: 起動時に1回だけ読む較正（fand と認証ランナーが同じ関数で読む）。0152 §2.1 / 0101
   rollup_job.py # 合成の起点: `coldaisle-rollup` の入口（周期メトリクスを Store へ渡す）。#65
   cpu_power_publisher.py # root の `coldaisle-cpu-power`: RAPL の CPU Package 電力を 1 s 平均・1 W で `/run` へ書く。**標準ライブラリだけ・coldaisle を import しない**（`python3 -I -S`）。#278 / 決定記録 0122
   gpu_fan_curve.py # root の `coldaisle-gpu-fan`: GPU の Fan を GPU コアの温度の曲線で書く（NVML を ctypes で。fand の外）。止まったら既定の制御へ戻す。**標準ライブラリだけ・coldaisle を import しない**（`python3 -I -S`）。#285 / 決定記録 0128

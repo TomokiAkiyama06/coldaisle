@@ -25,7 +25,6 @@ from dataclasses import dataclass
 from typing import Protocol
 
 from coldaisle import logs
-from coldaisle.control.air_balance import ConfiguredAirBalanceModel
 from coldaisle.control.config import ControlConfig
 from coldaisle.control.fallback.gate import LearnedFailure
 from coldaisle.control.learned_handoff import (
@@ -46,7 +45,11 @@ from coldaisle.control.model_registry import (
     ModelRegistry,
     VerifiedArtifact,
 )
-from coldaisle.control.mpc.controller import LearnedMpcRuntime, MpcProposal
+from coldaisle.control.mpc.controller import (
+    LearnedMpcRuntime,
+    MpcCostDependencies,
+    MpcProposal,
+)
 from coldaisle.control.schema import AuthorityStage, Reason, stage_rank
 from coldaisle.learned_worker.registry import ProductionCheck
 from coldaisle.learned_worker.window import FrameHistory, build_observed_input
@@ -291,7 +294,9 @@ class MpcWorkerCore:
             return None
         assert self._calibration is not None
         control = self._inputs.control
-        enabled = control.air_balance_enabled
+        # 任意依存は fand と同じ規則で同じ Control Config から作る（0107 §2.6）。
+        # acoustic は #94 まで渡さない。認証ランナーも同じ関数で作る（0152 §2.1）
+        dependencies = MpcCostDependencies.from_control(control)
         runtime = LearnedMpcRuntime.load(
             loaded,
             control.policy,
@@ -302,15 +307,9 @@ class MpcWorkerCore:
             expected_model_version=pinned.version,
             monotonic_ms=self._monotonic_ms,
             authority=self._authority,
-            # 任意依存は fand と同じ規則で同じ Control Config から作る（0107 §2.6）。
-            # acoustic は #94 まで渡さない
-            air_balance=(
-                ConfiguredAirBalanceModel(control.air_balance, control.sources.air_balance.sha256)
-                if enabled
-                else None
-            ),
-            balance_band=control.air_balance.balance if enabled else None,
-            fan_hardware=control.fan_hardware if enabled else None,
+            air_balance=dependencies.air_balance,
+            balance_band=dependencies.balance_band,
+            fan_hardware=dependencies.fan_hardware,
         )
         if runtime.controller is None:
             assert runtime.failure_reason is not None

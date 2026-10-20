@@ -456,13 +456,106 @@ def test_optimizer_does_not_follow_unrelated_safety_values(tmp_path: Path) -> No
     assert _optimizer(tmp_path, docs) == base
 
 
-def test_conditions_binds_the_whole_mapping() -> None:
-    base = conditions_sha256({"binding": {"a": 1}, "acoustic": None})
-    assert conditions_sha256({"acoustic": None, "binding": {"a": 1}}) == base
-    assert conditions_sha256({"binding": {"a": 2}, "acoustic": None}) != base
-    assert conditions_sha256({"binding": {"a": 1}, "acoustic": None, "new": 0}) != base
+def conditions_value(**overrides: object) -> dict[str, Any]:
+    """``LearnedMpcController.conditions()`` と同じ形の値（試験用）。"""
+    value: dict[str, Any] = {
+        "binding": {
+            "artifact_kind": "thermal_model",
+            "artifact_capability": "counterfactual_action",
+            "model_id": "rack-thermal",
+            "model_version": "0.1.0",
+            "artifact_sha256": "a" * 64,
+            "artifact_status": "production",
+            "production_active": True,
+            "registry_revision": 3,
+        },
+        "authority_stage": "shadow",
+        "confidence_profile_sha256": "b" * 64,
+        "model_confidence": {"x": 1},
+        "acoustic": None,
+        "air_balance": None,
+        "balance_band": None,
+        "balance_minimum_stable_demand": None,
+    }
+    value.update(overrides)
+    return value
+
+
+def test_conditions_excludes_exactly_the_closed_list_of_0160() -> None:
+    from coldaisle.hint_certificate_digest import CONDITIONS_EXCLUDED_POSITIONS
+
+    assert CONDITIONS_EXCLUDED_POSITIONS == (
+        ("binding", "registry_revision"),
+        ("binding", "production_active"),
+        ("binding", "artifact_status"),
+        ("authority_stage",),
+    )
+
+
+@pytest.mark.parametrize(
+    ("path", "value"),
+    [
+        (("binding", "registry_revision"), 99),
+        (("binding", "production_active"), False),
+        (("binding", "artifact_status"), "retired"),
+        (("authority_stage",), "full"),
+    ],
+)
+def test_conditions_ignores_only_the_excluded_positions(
+    path: tuple[str, ...], value: object
+) -> None:
+    base = conditions_sha256(conditions_value())
+    changed = conditions_value()
+    target: dict[str, Any] = changed
+    for key in path[:-1]:
+        target = target[key]
+    target[path[-1]] = value
+    assert conditions_sha256(changed) == base
+
+
+def test_conditions_binds_every_other_position() -> None:
+    base = conditions_sha256(conditions_value())
+    assert conditions_sha256(dict(reversed(list(conditions_value().items())))) == base
+    for key in conditions_value():
+        if key in ("binding", "authority_stage"):
+            continue
+        assert conditions_sha256(conditions_value(**{key: {"changed": key}})) != base, key
+    for key in ("artifact_kind", "artifact_capability", "model_id", "model_version"):
+        changed = conditions_value()
+        changed["binding"][key] = "other"
+        assert conditions_sha256(changed) != base, key
+    changed = conditions_value()
+    changed["binding"]["artifact_sha256"] = "c" * 64
+    assert conditions_sha256(changed) != base
+    # 鍵が増えたらそのまま束ねる（列挙し直さない）
+    assert conditions_sha256(conditions_value(new=0)) != base
     with pytest.raises(ValueError):
-        conditions_sha256({"x": float("nan")})
+        conditions_sha256(conditions_value(acoustic=float("nan")))
+
+
+@pytest.mark.parametrize(
+    "broken",
+    [
+        lambda value: value.pop("authority_stage"),
+        lambda value: value["binding"].pop("registry_revision"),
+        lambda value: value["binding"].pop("production_active"),
+        lambda value: value["binding"].pop("artifact_status"),
+        lambda value: value.update(binding="not-a-mapping"),
+        lambda value: value.pop("binding"),
+    ],
+)
+def test_conditions_without_an_excluded_position_fails_closed(broken: Any) -> None:
+    value = conditions_value()
+    broken(value)
+    with pytest.raises(ValueError):
+        conditions_sha256(value)
+
+
+def test_conditions_does_not_rewrite_its_input() -> None:
+    value = conditions_value()
+    before = copy.deepcopy(value)
+    conditions_sha256(value)
+    assert value == before
 
 
 def test_component_digests_are_distinct_for_the_same_json() -> None:

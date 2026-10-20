@@ -175,19 +175,41 @@ class LearnedMpcOptimizer:
         target_band: SupervisorTargetBand,
         baseline: PerZone[Demand],
         budget_started_mono_ms: int | None = None,
+        max_evaluations: int | None = None,
+        deadline_mono_ms: int | None = None,
     ) -> OptimizerOutcome:
         """この tick の requested を探す。**解けなければ解を返さない。**
 
         ``budget_started_mono_ms`` を渡すと、その時刻から ``budget_ms`` を数える。
         呼び出し側は anchor 推論と Confidence 判定に使った時間も予算に含められる。
+
+        ``max_evaluations`` / ``deadline_mono_ms`` は予算を**狭める**ためだけの引数（決定記録 0160
+        §2.4 の 6）。評価の回数の上限は ``1`` 以上・設定の ``mpc.optimizer.max_evaluations`` 以下、
+        打ち切りの絶対時刻（単調時計）は「予算の起点 + ``budget_ms``」以下でなければ ``ValueError``
+        （予算を増やす経路を作らない。0066 §2.1 (d)）。渡さないときは今の振る舞い（設定の値・
+        起点から ``budget_ms``）のまま。
         """
         started_ms = (
             self._monotonic_ms() if budget_started_mono_ms is None else budget_started_mono_ms
         )
+        configured_evaluations = self._config.max_evaluations.value
+        if max_evaluations is None:
+            evaluation_limit = configured_evaluations
+        elif 1 <= max_evaluations <= configured_evaluations:
+            evaluation_limit = max_evaluations
+        else:
+            raise ValueError("max_evaluations は 1 以上・mpc.optimizer.max_evaluations 以下にする")
+        configured_deadline = started_ms + self._budget_ms
+        if deadline_mono_ms is None:
+            deadline = configured_deadline
+        elif deadline_mono_ms <= configured_deadline:
+            deadline = deadline_mono_ms
+        else:
+            raise ValueError("deadline_mono_ms は予算の起点 + mpc.budget_ms 以下にする")
         evaluations = 0
         # 入口で見る。anchor 推論と Confidence 判定だけで予算を使い切った tick に、
         # さらに1回まるごとモデルを回させない（予測は高価になりうる）。
-        if self._out_of_budget(started_ms):
+        if self._out_of_budget(deadline):
             return self._timed_out(started_ms, evaluations)
         try:
             # 格子の算出も制約の交わりを読むので、実行不能はここで捕まえる。
@@ -205,7 +227,7 @@ class LearnedMpcOptimizer:
                     started_ms,
                     0,
                 )
-            if self._out_of_budget(started_ms):
+            if self._out_of_budget(deadline):
                 # 制約の組み立てと support の照合で越えた場合も、**モデルを呼ぶ直前に**止める
                 # （0052 §2.5）。
                 return self._timed_out(started_ms, evaluations)
@@ -227,10 +249,9 @@ class LearnedMpcOptimizer:
         best_cost = baseline_cost
         best_prediction = baseline_prediction
         # Baseline の評価だけで予算を使い切ることもある。**評価のあとにも必ず見る。**
-        if self._out_of_budget(started_ms):
+        if self._out_of_budget(deadline):
             return self._timed_out(started_ms, evaluations)
 
-        max_evaluations = self._config.max_evaluations.value
         for _sweep in range(self._config.sweeps.value):
             improved = False
             for zone in _ZONE_ORDER:
@@ -245,7 +266,7 @@ class LearnedMpcOptimizer:
                         # 学習した action 列の外の候補は**評価しない**（外挿の予測で選ばない）。
                         # 件数は trace に出さない（0079 §6 の質問 6）。
                         continue
-                    if evaluations >= max_evaluations or self._out_of_budget(started_ms):
+                    if evaluations >= evaluation_limit or self._out_of_budget(deadline):
                         return self._timed_out(started_ms, evaluations)
                     try:
                         cost, prediction = self._evaluate(
@@ -285,13 +306,13 @@ class LearnedMpcOptimizer:
                         incumbent = candidate
                         improved = True
                     # 最後の候補で予算を越えたまま OK を返さない。
-                    if self._out_of_budget(started_ms):
+                    if self._out_of_budget(deadline):
                         return self._timed_out(started_ms, evaluations)
             if not improved:
                 break
 
         # 評価しなかった候補だけが続いた場合も、予算を越えたまま OK を返さない。
-        if self._out_of_budget(started_ms):
+        if self._out_of_budget(deadline):
             return self._timed_out(started_ms, evaluations)
         plan = self._plan(incumbent)
         solution = MpcSolution(
@@ -405,8 +426,9 @@ class LearnedMpcOptimizer:
             top=constraints.clamp(Zone.TOP, demands.top),
         )
 
-    def _out_of_budget(self, started_ms: int) -> bool:
-        return self._elapsed_ms(started_ms) >= self._budget_ms
+    def _out_of_budget(self, deadline_mono_ms: int) -> bool:
+        # 起点から budget_ms を数えるのと同じ（打ち切りの時刻は「起点 + budget_ms」以下）。
+        return self._monotonic_ms() >= deadline_mono_ms
 
     def _elapsed_ms(self, started_ms: int) -> int:
         # 単調時計なので戻らないが、注入された時計が壊れていても負の経過にしない。

@@ -71,6 +71,10 @@ coldaisle-registry = "coldaisle.registry:main"
 # 承認者は実行した uid（引数で受け取らない）。fand / control / API / AI から呼ばない
 # （#92 / 決定記録 0072 §2.1 / 0086）
 coldaisle-authority = "coldaisle.authority_cli:main"
+# Workload Hint の単調性ゲートの認証ランナー。**合格したときだけ --out に証明書を書く**。Registry にも
+# 設定にも書かない（登録は人が coldaisle-registry で行う）。本番は `python -I -m coldaisle.hint_certify`
+# で起動し、この console script は開発用（-I -m でなければ何もせずに終わる。#288 / 決定記録 0152 / 0157）
+coldaisle-hint-certify = "coldaisle.hint_certify:main"
 # fan daemon 停止後にだけ systemd ExecStopPost から起動する。
 # 制御モデル・Safety Config・外部パッケージに依存せず Max しか書かない。
 coldaisle-safety-handoff = "coldaisle.safety_handoff:main"

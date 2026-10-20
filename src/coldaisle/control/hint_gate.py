@@ -7,6 +7,8 @@
   だけを入力にした**1つの純粋な関数**。認証ランナー・``coldaisle-fand``・Learned MPC worker が
   自分の設定に当てる（0152 §2.3）。出力の digest（``HintGateSpec.sha256``）が部品 ``hint_gate``
 - :func:`hint_policy_sha256`: 部品 ``hint_policy``（基準の context の全体と ``context_overrides``）
+- :func:`calibration_sha256`: 部品 ``calibration``（frame v3 の ``calibration`` の2状態。fand・
+  認証ランナーは起動時に読んだ較正、worker は束縛に使った frame の較正から同じ関数で作る）
 - :func:`optimizer_sha256`: 部品 ``optimizer``（``mpc.optimizer``・``mpc.budget_ms`` と、
   ``HardConstraintSet.build`` が読む ``safety.yaml`` の ``zone_min_demand`` / ``ramp_down_per_s``。
   0156 §2.5）
@@ -31,6 +33,7 @@ from coldaisle.control.config import (
     SupervisorConfig,
     WorkloadHintConfig,
 )
+from coldaisle.control.learned_handoff import AvailableCalibration, UnavailableCalibration
 from coldaisle.hint_certificate import (
     HintGateAxis,
     HintGateDemandAxis,
@@ -41,7 +44,11 @@ from coldaisle.hint_certificate import (
     HintGateZoneDemands,
     HintGateZoneRanges,
 )
-from coldaisle.hint_certificate_digest import json_component_sha256
+from coldaisle.hint_certificate_digest import (
+    calibration_available_sha256,
+    calibration_unavailable_sha256,
+    json_component_sha256,
+)
 from coldaisle.measurement import validate_metric
 
 _HINT_POLICY_TAG = b"coldaisle-hint-policy-v1"
@@ -249,3 +256,16 @@ def optimizer_sha256(policy: FanPolicyConfig, safety: SafetyConfig) -> str:
             "safety_ramp_down_per_s": safety.ramp_down_per_s.model_dump(mode="json"),
         },
     )
+
+
+def calibration_sha256(calibration: AvailableCalibration | UnavailableCalibration) -> str:
+    """部品 ``calibration``: frame v3 の ``calibration``（0101 §2.2）の2状態から（0152 §2.3）。
+
+    ``available`` は較正の全体の実効の offset、``unavailable`` は閉じた code で符号化する
+    （空の ``offsets_c`` の ``available`` と ``unavailable`` を同じ digest にしない。0096 §2.6）。
+    fand・認証ランナーは ``read_startup_calibration`` が返した frame の側の値、worker は束縛に
+    使った frame の ``calibration`` を渡す（どれも同じ1つの読み取りから作られる値）。
+    """
+    if isinstance(calibration, AvailableCalibration):
+        return calibration_available_sha256(calibration.offsets_c)
+    return calibration_unavailable_sha256(calibration.reason.value)

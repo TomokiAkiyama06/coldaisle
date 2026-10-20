@@ -16,17 +16,27 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Callable
+from dataclasses import dataclass
 from typing import Self
 
 from pydantic import BaseModel, ConfigDict, model_validator
 
 from coldaisle import logs
 from coldaisle.control.acoustic import AcousticCostModel
-from coldaisle.control.air_balance import AirBalanceModel, BalanceBand
-from coldaisle.control.config import FanHardwareConfig, FanPolicyConfig, SafetyConfig
+from coldaisle.control.air_balance import AirBalanceModel, BalanceBand, ConfiguredAirBalanceModel
+from coldaisle.control.config import (
+    ControlConfig,
+    FanHardwareConfig,
+    FanPolicyConfig,
+    SafetyConfig,
+)
 from coldaisle.control.fallback.gate import LearnedControlStatus, LearnedFailure, SnapshotStatus
 from coldaisle.control.model.calibration_digest import RuntimeCalibration
-from coldaisle.control.model.confidence import ConfidenceAssessment, ResidualEvidence
+from coldaisle.control.model.confidence import (
+    ConfidenceAssessment,
+    ResidualEvidence,
+    inference_id,
+)
 from coldaisle.control.model.counterfactual_confidence import CounterfactualConfidenceAssessor
 from coldaisle.control.model.thermal import (
     ObservedThermalInput,
@@ -36,7 +46,7 @@ from coldaisle.control.model.thermal import (
 from coldaisle.control.model_registry import VerifiedArtifact
 from coldaisle.control.mpc.cost import MpcCostModel, MpcCostUnusableError, PlanCost
 from coldaisle.control.mpc.counterfactual import MpcModelBinding, MpcModelUnusableError
-from coldaisle.control.mpc.optimizer import LearnedMpcOptimizer, MpcSolution
+from coldaisle.control.mpc.optimizer import LearnedMpcOptimizer, MpcSolution, OptimizerOutcome
 from coldaisle.control.mpc.plan import HardConstraintSet
 from coldaisle.control.schema import (
     AuthorityStage,
@@ -47,7 +57,9 @@ from coldaisle.control.schema import (
     OptimizerStatus,
     PerZone,
     Reason,
+    SupervisorObjectiveWeights,
     SupervisorOutput,
+    SupervisorTargetBand,
     Zone,
     ZoneRequest,
     stage_rank,
@@ -398,22 +410,13 @@ class LearnedMpcController:
         # 制御権は運転中に動く（#92）。生成時の照合だけだと、昇格のあとに作り直されなかった
         # worker が、束縛の覆っていない stage で提案を出し続ける。tick ごとに見る。
         self._check_binding_covers_authority(self._binding, self._authority.current_stage())
-        anchor = self._binding.predict(observed)
-        self._check_anchor(anchor, observed)
+        anchor = self._anchor(observed)
         assessment = self._assessor.assess(observed, anchor, residual)
-        constraints = HardConstraintSet.build(
-            optimizer=self._policy.mpc.optimizer,
-            safety=self._safety,
-            safety_floor=safety_floor,
-            # **変化幅の起点は観測 window の action から取る。** 呼び出し側から別に受け取ると、
-            # anchor が見ている action と違う値で rate limit と変化コストを計算できてしまう。
-            current=_applied_demands(observed),
-        )
-        outcome = self._optimizer.solve(
+        outcome = self._solve_from_anchor(
             observed=observed,
             anchor=anchor,
             anchor_inference_id=assessment.inference_id,
-            constraints=constraints,
+            safety_floor=safety_floor,
             weights=supervisor.weights,
             target_band=supervisor.target_band,
             baseline=_demands(baseline),
@@ -447,6 +450,95 @@ class LearnedMpcController:
             solution=outcome.solution,
             # **照合した stage を結果に結び付ける。** Gate が選ぶ瞬間まで運ぶ（#92）。
             binding_authority_stage=self._binding.authority_stage,
+        )
+
+    def solve(
+        self,
+        *,
+        observed: ObservedThermalInput,
+        safety_floor: PerZone[Demand],
+        weights: SupervisorObjectiveWeights,
+        target_band: SupervisorTargetBand,
+        baseline: PerZone[Demand],
+        max_evaluations: int,
+        deadline_mono_ms: int,
+    ) -> OptimizerOutcome:
+        """観測 window と context から ``propose()`` と**同じ関数**で解く（0160 §2.4 の 6）。
+
+        anchor 推論とその照合・``HardConstraintSet.build``・``solve`` を行い、``OptimizerOutcome``
+        を返す。Confidence の判定・提案の組み立ては行わない（認証ランナーと、段 4 の Shadow
+        solver の二重解法が使う）。``propose()`` の振る舞いは変えない。
+
+        予算は引数で受け取る: 評価の回数の上限 ``max_evaluations`` と、打ち切りの絶対時刻
+        ``deadline_mono_ms``（この controller の単調時計）。どちらも設定の
+        ``mpc.optimizer.max_evaluations`` / 呼んだ時刻 + ``mpc.budget_ms`` **以下にしか**できない
+        （超える値は ``ValueError``。予算を増やす経路を作らない。0066 §2.1 (d) / 0133 §2.5）。
+
+        **例外は翻訳しない**（``propose()`` と違い、worker の境界ではない）。anchor 推論・照合・
+        制約の組み立ての失敗はそのまま返り、呼び出し側が「解けなかった」として扱う。
+        """
+        started_ms = self._monotonic_ms()
+        configured_evaluations = self._policy.mpc.optimizer.max_evaluations.value
+        if not 1 <= max_evaluations <= configured_evaluations:
+            raise ValueError("max_evaluations は 1 以上・mpc.optimizer.max_evaluations 以下にする")
+        if deadline_mono_ms > started_ms + self._policy.mpc.budget_ms:
+            raise ValueError("deadline_mono_ms は呼んだ時刻 + mpc.budget_ms 以下にする")
+        self._check_binding_covers_authority(self._binding, self._authority.current_stage())
+        anchor = self._anchor(observed)
+        return self._solve_from_anchor(
+            observed=observed,
+            anchor=anchor,
+            # assessment と同じ識別子（同じ関数）。予測の照合はこの値と比べる
+            anchor_inference_id=inference_id(observed, anchor),
+            safety_floor=safety_floor,
+            weights=weights,
+            target_band=target_band,
+            baseline=baseline,
+            budget_started_mono_ms=started_ms,
+            max_evaluations=max_evaluations,
+            deadline_mono_ms=deadline_mono_ms,
+        )
+
+    def _anchor(self, observed: ObservedThermalInput) -> ThermalPrediction:
+        """anchor 推論と、その推論が束縛した artifact とこの入力に属することの照合。"""
+        anchor = self._binding.predict(observed)
+        self._check_anchor(anchor, observed)
+        return anchor
+
+    def _solve_from_anchor(
+        self,
+        *,
+        observed: ObservedThermalInput,
+        anchor: ThermalPrediction,
+        anchor_inference_id: str,
+        safety_floor: PerZone[Demand],
+        weights: SupervisorObjectiveWeights,
+        target_band: SupervisorTargetBand,
+        baseline: PerZone[Demand],
+        budget_started_mono_ms: int,
+        max_evaluations: int | None = None,
+        deadline_mono_ms: int | None = None,
+    ) -> OptimizerOutcome:
+        """制約を組み立てて解く（``propose()`` と ``solve()`` が共有する1つの経路）。"""
+        constraints = HardConstraintSet.build(
+            optimizer=self._policy.mpc.optimizer,
+            safety=self._safety,
+            safety_floor=safety_floor,
+            # **変化幅の起点は観測 window の action から取る。** 呼び出し側から別に受け取ると、
+            # anchor が見ている action と違う値で rate limit と変化コストを計算できてしまう。
+            current=_applied_demands(observed),
+        )
+        return self._optimizer.solve(
+            observed=observed,
+            anchor=anchor,
+            anchor_inference_id=anchor_inference_id,
+            constraints=constraints,
+            weights=weights,
+            target_band=target_band,
+            baseline=baseline,
+            budget_started_mono_ms=budget_started_mono_ms,
+            max_evaluations=max_evaluations,
+            deadline_mono_ms=deadline_mono_ms,
         )
 
     def _check_anchor(self, anchor: ThermalPrediction, observed: ObservedThermalInput) -> None:
@@ -485,6 +577,33 @@ class LearnedMpcController:
         return MpcProposal(
             failure=failure,
             failure_reason=Reason(code=_reason_code(code), detail=detail[:500]),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class MpcCostDependencies:
+    """目的関数の任意依存（Air Balance・``BalanceBand``・profile の写像）。決定記録 0107 §2.6。
+
+    Learned MPC worker と認証ランナー（0152 §2.1）が**同じ規則で同じ Control Config から**作る。
+    作り方が2か所に分かれると、同じ設定から別の ``conditions()`` ができる（照合が合わず B0）。
+    acoustic は #94 まで渡さない。
+    """
+
+    air_balance: AirBalanceModel | None
+    balance_band: BalanceBand | None
+    fan_hardware: FanHardwareConfig | None
+
+    @classmethod
+    def from_control(cls, control: ControlConfig) -> MpcCostDependencies:
+        """``air_balance`` が有効なときだけ Air Balance の3つを作る（fand と同じ規則）。"""
+        if not control.air_balance_enabled:
+            return cls(air_balance=None, balance_band=None, fan_hardware=None)
+        return cls(
+            air_balance=ConfiguredAirBalanceModel(
+                control.air_balance, control.sources.air_balance.sha256
+            ),
+            balance_band=control.air_balance.balance,
+            fan_hardware=control.fan_hardware,
         )
 
 
