@@ -1,0 +1,124 @@
+# 回転数の掃引と応答の行列の解析の設定（coldaisle-airflow-characterization。#75 / 決定記録 0153 §2.8）
+#
+# **解析の道具の設定で、Control Config ではない。** fand・Learned worker はこのファイルを読まない。
+# 解析は DB の写しと run の manifest を読むだけで、DB・設定・Control Config を書かない（0153 §2.7 の 2）。
+#
+# コードに既定値は無い（AGENTS.md ルール9。0153 §2.8）。鍵の欠け・未知の鍵・型の違いは起動時に拒否し、
+# 解析は何も出さずに失敗する。数値はすべて `{value, status, basis}` の形で持つ。
+#
+# - `status: provisional` … 0153 §2.8 の提案の初期値。結果を承認する決定記録で見直す（0153 §5 の 1 (a)）
+# - `status: undetermined`（`value: null`）… **値を決めていない**。実機で値の刻みを確かめてから決める。
+#   その値を使う解析（`resolution.fan_rpm` は回転数の掃引、`resolution.cpu_package_c` と
+#   `resolution.board_connector_c` は応答の行列）は、未定のままでは何も出さずに失敗する（0153 §2.6）
+#
+# 設定に置かないもの（0153 §2.8）: 中止の基準（0121 / 0130 の値。所有者が測定中に見る）、
+# CPU の floor の点（safety.yaml の値。manifest の Control Config の hash で同じものを読む）。
+#
+#   uv run coldaisle-airflow-characterization --run var/airflow-characterization/<run>.yaml \
+#     [--run ...] --format markdown --out var/airflow-characterization/report.md
+#
+# 出力は `var/` に置く。値を残す報告（docs/airflow-characterization-YYYY-MM-DD.md）は人が書く（0153 §2.7 の 3）。
+
+version: 1
+
+# 「別の日」（min_distinct_days）を数えるときの日付の区切り。manifest の時刻は Unix ms
+timezone: "Asia/Tokyo"
+
+# 上限の検査は `値 + bound_coverage_factor × u(値)` が上限以下のときだけ通す（§2.6）
+bound_coverage_factor: {value: 2.0, status: provisional, basis: "決定記録 0153 §2.8 の提案の初期値"}
+
+# §2.4 回転数の掃引
+rpm_sweep:
+  levels:
+    value: [0.35, 0.40, 0.45, 0.50, 0.60, 0.70, 0.80, 0.90, 1.00]
+    status: provisional
+    basis: "決定記録 0153 §2.4 / §2.8。0.35 未満は測らない（§2.10）。最後の段が折り返し（1 方向だけ）"
+  other_zones_demand: {value: 0.60, status: provisional, basis: "決定記録 0153 §2.4"}
+  settle_s: {value: 30, status: provisional, basis: "決定記録 0153 §2.4（effective が届いた tick から）"}
+  record_s: {value: 60, status: provisional, basis: "決定記録 0153 §2.4"}
+  repetitions: {value: 3, status: provisional, basis: "決定記録 0153 §2.4（zone ごと）"}
+  min_distinct_days: {value: 2, status: provisional, basis: "決定記録 0153 §2.4（少なくとも 1 回は別の日）"}
+  min_rpm_ratio: {value: 0.9, status: provisional, basis: "決定記録 0153 §2.3 / §2.8"}
+  max_rpm_gap_ms: {value: 3000, status: provisional, basis: "決定記録 0153 §2.8（tach の更新 1500 ms の 2 回分）"}
+  response_band: {value: 0.05, status: provisional, basis: "決定記録 0153 §2.4（±5 %。0126 と同じ測り方）"}
+  tach_update_ms: {value: 1500, status: provisional, basis: "決定記録 0125 / 0153 §2.4"}
+  maximum_rpm_margin: {value: 0.05, status: provisional, basis: "決定記録 0120 / 0153 §2.7 の 4"}
+  maximum_rpm_round_up: {value: 100, status: provisional, basis: "決定記録 0153 §2.7 の 4"}
+
+# §2.4 アイドルの条件（窓の平均 + k × u が値未満）
+idle:
+  cpu_package_c: {value: 50.0, status: provisional, basis: "決定記録 0153 §2.4"}
+  gpu_core_c: {value: 45.0, status: provisional, basis: "決定記録 0153 §2.4"}
+  gpu_power_w: {value: 50.0, status: provisional, basis: "決定記録 0153 §2.4"}
+
+# §2.5 値を取る窓（最後の 2 分）と、落ち着くまでの上限（20 分。指示の時刻から）
+window:
+  length_s: {value: 120, status: provisional, basis: "決定記録 0153 §2.5"}
+  max_settle_s: {value: 1200, status: provisional, basis: "決定記録 0153 §2.5"}
+window_blocks: {value: 4, status: provisional, basis: "決定記録 0153 §2.6（ブロックの数で割らない）"}
+
+# §2.5 落ち着き（直近 span_s の生の ok の行の幅）
+settle:
+  span_s: {value: 180, status: provisional, basis: "決定記録 0153 §2.5"}
+  max_range_air_c: {value: 0.5, status: provisional, basis: "決定記録 0153 §2.5"}
+  max_range_chip_c: {value: 1.0, status: provisional, basis: "決定記録 0153 §2.5（cpu.package / gpu.0.core / board.connector_12v2x6）"}
+
+# §2.6 窓の中の最小二乗の傾き × 窓の長さの上限
+max_window_trend:
+  temperature_c: {value: 0.2, status: provisional, basis: "決定記録 0153 §2.8"}
+  power_w: {value: 5.0, status: provisional, basis: "決定記録 0153 §2.8"}
+
+max_room_drift_c: {value: 1.0, status: provisional, basis: "決定記録 0153 §2.5（0121 §2.9 と同じ趣旨）"}
+max_aux_fan_delta_rpm: {value: 50.0, status: provisional, basis: "決定記録 0153 §2.5（fan.aio_pump.rpm）"}
+
+# §2.6 分解能（u_res = 分解能 / √12）
+resolution:
+  air_c: {value: 0.125, status: provisional, basis: "決定記録 0153 §2.8（DS18B20 の 11 bit）"}
+  power_w: {value: 1.0, status: provisional, basis: "決定記録 0153 §2.8（RAPL と NVML の 1 W の丸め）"}
+  gpu_core_c: {value: 1.0, status: provisional, basis: "決定記録 0153 §2.8（NVML の温度は整数の °C）"}
+  gpu_hotspot_c: {value: 1.0, status: provisional, basis: "決定記録 0153 §2.8（NVML の温度は整数の °C）"}
+  # 以下の 3 つは未定。実機の値の刻みを確かめて決める（0153 §2.8 / §5 の 1 (a)）
+  cpu_package_c: {value: null, status: undetermined, basis: "実機の値の刻みが未確認（決定記録 0153 §2.8）"}
+  board_connector_c: {value: null, status: undetermined, basis: "実機の値の刻みが未確認（決定記録 0153 §2.8）"}
+  fan_rpm: {value: null, status: undetermined, basis: "tach の読み値の刻みが未確認（決定記録 0153 §2.8 / §5 の 1）"}
+
+# §2.2 負荷（応答の行列だけ）。manifest の GPU の電力の上限と突き合わせる
+load:
+  gpu_power_limit_w: {value: 300.0, status: provisional, basis: "決定記録 0153 §2.2"}
+
+# §2.5 応答の行列
+response_matrix:
+  reference_demand: {value: 0.60, status: provisional, basis: "決定記録 0153 §2.5（R）"}
+  plus_demand: {value: 0.90, status: provisional, basis: "決定記録 0153 §2.5（+ と All+）"}
+  minus_demand: {value: 0.35, status: provisional, basis: "決定記録 0153 §2.5（−）"}
+  repetitions: {value: 2, status: provisional, basis: "決定記録 0153 §2.5（負荷ごと）"}
+  min_distinct_days: {value: 2, status: provisional, basis: "決定記録 0153 §2.5（別の日）"}
+  max_power_delta_w: {value: 5.0, status: provisional, basis: "決定記録 0153 §2.5 / §2.8"}
+
+approval:
+  max_rpm_spread: {value: 0.03, status: provisional, basis: "決定記録 0153 §2.7 の 5（承認の記録で所有者が最終に決める）"}
+
+# §2.3 窓の覆い。metric はそれを書く source ごとに閾値を持つ
+coverage:
+  board:
+    # ESP32-S3 の基板（DS18B20・2.5 s 周期）
+    metrics: [air.front_intake, air.gpu_intake, air.gpu_exhaust, air.top_exhaust, air.rear_exhaust,
+              air.room, air.room_humidity]
+    min_ok_ratio: {value: 0.9, status: provisional, basis: "決定記録 0153 §2.8"}
+    period_ms: {value: 2500, status: provisional, basis: "決定記録 0153 §2.8（基板）"}
+    max_sample_gap_ms: {value: 6000, status: provisional, basis: "決定記録 0153 §2.8"}
+  telemetry:
+    # coldaisle-telemetry（NVML / hwmon）
+    metrics: [cpu.package, gpu.0.core, gpu.0.hotspot, power.gpu.0, board.connector_12v2x6,
+              gpu.0.fan_speed, fan.vrm.rpm, fan.aio_pump.rpm]
+    min_ok_ratio: {value: 0.9, status: provisional, basis: "決定記録 0153 §2.8"}
+    period_ms: {value: 2500, status: provisional, basis: "config/internal-telemetry.yaml の interval_ms（0153 §2.8 は基板の値だけを示す）"}
+    max_sample_gap_ms: {value: 6000, status: provisional, basis: "決定記録 0153 §2.8"}
+  cpu_power:
+    # coldaisle-cpu-power（RAPL。coldaisle-telemetry が interval_ms ごとに読む。0122）
+    metrics: [power.cpu.package]
+    min_ok_ratio: {value: 0.9, status: provisional, basis: "決定記録 0153 §2.8"}
+    period_ms: {value: 2500, status: provisional, basis: "config/internal-telemetry.yaml の interval_ms（0153 §2.8 は基板の値だけを示す）"}
+    max_sample_gap_ms: {value: 6000, status: provisional, basis: "決定記録 0153 §2.8"}
+  trace_max_gap_ratio: {value: 1.5, status: provisional, basis: "決定記録 0153 §2.3 / §2.8"}
+  min_trace_ticks_ratio: {value: 0.95, status: provisional, basis: "決定記録 0153 §2.3 / §2.8"}

@@ -30,6 +30,7 @@ uv run coldaisle-report             # 前日の日次レポート（ロールア
 uv run coldaisle-report --date 2026-08-24 --no-send --print  # 任意の日を作り直す
 uv run coldaisle-soak-report --start 2026-08-24T09:00  # 連続運転テストの集計（**DB を読むだけ**）
 uv run coldaisle-load-distribution --db <DB の写し> --start 2026-10-15T16:36 --end 2026-10-16T16:36 --out var/load-distribution/t1.json  # 負荷の状態ごとの d.* の分布（**DB を読むだけ・合否も閾値の提案も出さない**。`--periods` で区間と bios_confirmed。決定記録 0151）
+uv run coldaisle-airflow-characterization --run var/airflow-characterization/<run>.yaml [--run ...] --format markdown --out var/airflow-characterization/report.md  # 回転数の掃引と応答の行列の解析（**DB の写しと manifest を読むだけ・設定へ写さない**。分解能の未定の値があると失敗する。決定記録 0153）
 uv run coldaisle-escalate           # 故障疑いの案件資料（**送信はしない**）
 uv run coldaisle-memory             # 運用メモリの更新案（**既定では書かない**）
 uv run coldaisle-memory --apply --commit  # 確認してから書く
@@ -266,6 +267,7 @@ src/coldaisle/
   report.py   # 合成の起点: 日次レポート（Store→AI→通知）。#25
   soak.py     # 合成の起点: 連続運転テストの集計（Store を読むだけ）。#47
   load_distribution.py # 合成の起点: 負荷の状態（電力の帯）ごとの d.* の分布（DB を mode=ro で読むだけ・合否なし。AI 層・API から import しない）。#50 / 決定記録 0151
+  airflow_characterization.py # 合成の起点: 回転数の掃引と応答の行列の解析（checkpoint 済みの DB の写しを immutable で読むだけ・設定へ書かない。control・AI 層・API から import しない）。#75 / 決定記録 0153
   server.py   # 合成の起点: 読み取りAPI + AIツールの窓口。#23
   escalate.py # 合成の起点: 故障疑いの案件資料（AI非依存・送信しない）。#39
   memory.py   # 合成の起点: 運用メモリの記録（確認を経由する）。#40
@@ -320,7 +322,7 @@ src/coldaisle/
   web/        # L4: 静的アセット。airflow-trace.js が decision trace の版の解釈を1か所で持つ（0071 §2.3）
 firmware/     # ESP32-S3 Arduino スケッチ。**コンパイルは人の手**（#11 / 決定記録 0022 §2.9）
 deploy/       # Ubuntu 常駐化のテンプレート（systemd / udev）。**仮の値だけ**。手順は docs/ubuntu-deploy.md（#57）
-config/       # rules.yaml, calibration.json, coldaisle.toml, evaluation.yaml, drift.yaml, air-balance-shadow.yaml, rl-training.yaml, soak.yaml, load-distribution.yaml, control-admin.yaml / control-admin.dev.yaml, learned-channel.yaml, training.example.yaml（`coldaisle-train` の仮の値の例）（Control Config の4ファイル fan-hardware / safety / fan-policy / air-balance は実運用のものを置かない。docs/control-config.md）
+config/       # rules.yaml, calibration.json, coldaisle.toml, evaluation.yaml, drift.yaml, air-balance-shadow.yaml, rl-training.yaml, soak.yaml, load-distribution.yaml, airflow-characterization.yaml, control-admin.yaml / control-admin.dev.yaml, learned-channel.yaml, training.example.yaml（`coldaisle-train` の仮の値の例）（Control Config の4ファイル fan-hardware / safety / fan-policy / air-balance は実運用のものを置かない。docs/control-config.md）
 memory/       # 運用メモリ（いまの閾値・較正値）。`coldaisle-memory` が更新案を出す
 docs/         # 要件定義、仕様レビュー、ADR
 tests/
