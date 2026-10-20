@@ -136,6 +136,7 @@ from coldaisle.control.schema import (
     ZoneRequest,
     lowest_stage,
     stage_rank,
+    workload_hint_stage_rank,
 )
 from coldaisle.control.shadow.record import ShadowRecorder
 from coldaisle.control.state import (
@@ -699,12 +700,18 @@ class ControlLoop:
         if admin_mode is not None and admin_mode.run_id != run_id:
             # 管理ソケットの監査・Learned の経路の封筒・trace は同じ run_id を使う（0077 §2.3）
             raise ValueError("管理ソケットの受け渡し口と loop の run_id を揃える")
-        hint_stage = effective_stage(config.policy.supervisor.workload_hint.stage)
+        # 照合が通ったときの上限（実際の実効は tracker が持つ。照合が通らなければ B0）
+        hint_stage = effective_stage(config.policy.supervisor.workload_hint.stage, certified=True)
         if workload_hint is None and hint_stage is not WorkloadHintStage.OFF:
             # 設定が読むと言うのに読み手を配線し忘れた構成を、`stage: off` の trace にしない
             # （決定記録 0133 §2.9 は実効の段階を残す）
             raise ValueError("supervisor.workload_hint.stage が off 以外なら読み手を配線する")
-        if workload_hint is not None and workload_hint.stage is not hint_stage:
+        if workload_hint is not None and (
+            workload_hint.configured_stage is not config.policy.supervisor.workload_hint.stage
+            or workload_hint_stage_rank(workload_hint.stage) > workload_hint_stage_rank(hint_stage)
+        ):
+            # 実効の段階は起動時の照合（0152 §2.4）で B0 に下がりうるので、設定の段階と、
+            # 実装の上限を超えないことだけを揃える
             raise ValueError("Workload Hint の読み手と設定の段階を揃える")
         if (
             workload_hint is not None

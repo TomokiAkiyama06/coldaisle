@@ -56,6 +56,7 @@ uv run coldaisle-learnd --role mpc --config-dir var/control-config --registry-ro
 uv run coldaisle-learnd --role supervisor --config-dir var/control-config --registry-root var/model-registry --learned-channel-config config/learned-channel.yaml  # RL Supervisor worker。frame の snapshot と Workload Regime から戦略・重みだけを返す（Demand は出さない。shadow 用の束縛だけで active は閉じたまま。#89 / 決定記録 0077 段階 4）
 uv run coldaisle-fand --authority-root var/authority  # Authority Stage の journal（authority.json）の場所。起動時に読めなければ制御を取らない（#92 / 決定記録 0057 / 0072 §2.6）
 uv run coldaisle-fand --calibration config/calibration.json  # 較正を起動時に1回だけ読む（反実仮想 artifact の L9。読めなくても起動は止めない。決定記録 0079 §2.4 / 0096）
+uv run coldaisle-fand --registry-root var/model-registry --hint-lockfile uv.lock  # Workload Hint の B1 / B2 を設定したときだけ、起動時に1回証明書を照合（合わなければ B0。console script は launch_form が other なので environment_mismatch。#288 / 決定記録 0152 §2.4 / 0157 §2.3）
 uv run coldaisle-fand --learned-channel-config config/learned-channel.yaml  # Learned worker との経路を開く（役割ごとの SOCK_SEQPACKET。省くと開かない。不正なら Learned だけ無効で運転。#86 / 決定記録 0077）
 uv run coldaisle-fand --registry-root var/model-registry  # 起動時に1回だけ Model Registry を読み Gate・trace・frame・authority を束縛（省くと読まない。読めなければ Learned だけ無効。production が動いた役割は再起動まで閉じる。#104 / 決定記録 0077 §2.6 / 0098）
 uv run coldaisle-control status     # coldaisle-fand の運転モードを読む（管理ソケット。#74 / 決定記録 0072。**人が使う**）

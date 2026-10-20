@@ -25,6 +25,7 @@ import しない（0133 §2.7。試験で固定する）。
 from __future__ import annotations
 
 import logging
+import threading
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import Protocol
@@ -59,9 +60,34 @@ LOGGER = logging.getLogger("coldaisle.control")
 IMPLEMENTED_STAGE = WorkloadHintStage.OBSERVE
 """この実装が動かせる最も高い段階（B0）。
 
-B1 / B2 を設定しても、認証のハッシュ（0066 §2.1 (c)）を照合する仕組みがまだ無いので、
-実効の段階は B0 に留まる（0133 §2.6「ハッシュが無い・合わないときは B0 に留めて起動する」）。
+fand の起動時の証明書の照合（決定記録 0152 §2.4。``coldaisle.hint_certification``）はあるが、
+B1 の Shadow solver（0152 段 4）はまだ無いので、照合が通っても実効の段階は B0 に留まる
+（0152 §2.4「実効の段階 = min(設定の stage, 実装が動かせる最も高い段階, 照合の結果)」）。
 """
+
+
+class HintCertificationLatch:
+    """稼働中に hint_certificate / thermal_model の production が変わったことの印（0152 §2.4）。
+
+    **下げるだけで、上げる経路を持たない**（0152 §5 の 6 (a)）。受付スレッド（registry の監視）が
+    :meth:`revoke` し、loop のスレッドの :class:`WorkloadHintTracker` がその tick から実効の段階を
+    B0 に下げ、再起動まで上げない。元に戻す操作は無い。
+    """
+
+    __slots__ = ("_revoked",)
+
+    def __init__(self) -> None:
+        self._revoked = threading.Event()
+
+    def revoke(self) -> None:
+        """production が変わった・確かめられなかった（何度呼んでも同じ）。"""
+        self._revoked.set()
+
+    @property
+    def revoked(self) -> bool:
+        """一度でも :meth:`revoke` されたか。"""
+        return self._revoked.is_set()
+
 
 CONTRADICTING_REGIMES = frozenset({WorkloadRegime.IDLE, WorkloadRegime.COOLDOWN})
 """計算負荷のヒントと食い違う Regime（0064 §2.7。v1 のヒントは3種類とも計算負荷）。"""
@@ -210,6 +236,7 @@ class WorkloadHintTracker:
         "_effective",
         "_mailbox",
         "_monotonic",
+        "_revocation",
         "_terminal",
     )
 
@@ -220,11 +247,19 @@ class WorkloadHintTracker:
         mailbox: WorkloadHintMailbox | None,
         boot_clock: BootClock,
         monotonic: MonotonicClock,
+        certified: bool = False,
+        revocation: HintCertificationLatch | None = None,
     ) -> None:
-        """``mailbox`` が None なのは ``stage: off`` の構成だけ（読み手を作らない）。"""
+        """``mailbox`` が None なのは ``stage: off`` の構成だけ（読み手を作らない）。
+
+        ``certified`` は fand の起動時の照合の結果（0152 §2.4）。省けば照合していない扱いで、
+        B1 / B2 の設定は B0 に留まる。``revocation`` は稼働中の production の変化の印で、
+        立てばその tick から B0 に下げる（再起動まで上げない）。
+        """
         self._config = config
         self._configured = config.stage
-        self._effective = effective_stage(config.stage)
+        self._effective = effective_stage(config.stage, certified=certified)
+        self._revocation = revocation
         if (self._effective is WorkloadHintStage.OFF) != (mailbox is None):
             raise ValueError("読み手の受け渡し口は stage が off 以外のときだけ配線する")
         self._mailbox = mailbox
@@ -249,6 +284,7 @@ class WorkloadHintTracker:
         """この tick のヒントの状態を進める。``regime`` は Telemetry 由来（無ければ None）。"""
         if self._effective is WorkloadHintStage.OFF:
             return HintTick(stage=WorkloadHintStage.OFF)
+        self._apply_revocation(tick_id)
         try:
             return self._step(tick_id=tick_id, ts_ms=ts_ms, regime=regime)
         except Exception:
@@ -308,6 +344,31 @@ class WorkloadHintTracker:
         )
 
     # ------------------------------------------------------------------ 内部
+
+    def _apply_revocation(self, tick_id: int) -> None:
+        """production が変わっていたら、この tick から B0 に下げる（0152 §2.4。下げるだけ）。"""
+        revocation = self._revocation
+        if revocation is None or not revocation.revoked:
+            return
+        if workload_hint_stage_rank(self._effective) <= workload_hint_stage_rank(
+            WorkloadHintStage.OBSERVE
+        ):
+            return
+        previous = self._effective
+        self._effective = WorkloadHintStage.OBSERVE
+        LOGGER.warning(
+            "稼働中に証明書か thermal_model の production が変わったため、"
+            "workload hint の段階を再起動まで B0 に下げる",
+            extra={
+                logs.FIELDS_KEY: {
+                    "tick_id": tick_id,
+                    "configured_stage": self._configured.value,
+                    "previous_stage": previous.value,
+                    "effective_stage": self._effective.value,
+                    "reason": "registry_production_changed",
+                }
+            },
+        )
 
     def _lost(self, reason: HintPriorSkipped) -> HintTick:
         return HintTick(stage=self._effective, lost=reason)
@@ -482,10 +543,19 @@ class WorkloadHintTracker:
         return HintTick(stage=self._effective, observation=observation, status=status)
 
 
-def effective_stage(configured: WorkloadHintStage) -> WorkloadHintStage:
-    """設定の上限から、この実装で動かせる実効の段階（0133 §2.6）。"""
-    if workload_hint_stage_rank(configured) > workload_hint_stage_rank(IMPLEMENTED_STAGE):
-        return IMPLEMENTED_STAGE
+def effective_stage(configured: WorkloadHintStage, *, certified: bool = False) -> WorkloadHintStage:
+    """実効の段階 = min(設定の stage, 実装が動かせる最も高い段階, 照合の結果)（0152 §2.4）。
+
+    ``certified`` が偽（照合していない・通らなかった）なら B0 より上にしない（0133 §2.6）。
+    設定より上がることは無い。
+    """
+    ceiling = IMPLEMENTED_STAGE
+    if not certified and workload_hint_stage_rank(ceiling) > workload_hint_stage_rank(
+        WorkloadHintStage.OBSERVE
+    ):
+        ceiling = WorkloadHintStage.OBSERVE
+    if workload_hint_stage_rank(configured) > workload_hint_stage_rank(ceiling):
+        return ceiling
     return configured
 
 
