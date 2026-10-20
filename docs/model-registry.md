@@ -160,6 +160,9 @@ uv run coldaisle-registry verify   --root var/model-registry --contract config/m
 uv run coldaisle-registry register --root var/model-registry \
     --metadata var/candidate.json --payload var/candidate.model.json \
     --actor trainer --reason "training completed"
+uv run coldaisle-registry register --root var/model-registry \
+    --training-output var/training/rack-thermal-0.1.0 \
+    --actor trainer --reason "training completed"
 uv run coldaisle-registry validate --root var/model-registry \
     --artifact thermal_model/rack-thermal/1.2.0 \
     --offline-evaluation-ref evaluation/offline/1.2.0 \
@@ -287,9 +290,15 @@ MemoryErrorで落とさないためである。壊れたYAML・JSONやファイ�
   登録しない。model と Profile は1つの bytes なので、promotion / rollback で必ず組のまま動き、0037 の
   rollback target の選び方がそのまま「正しい組」を選ぶ。Profile を作り直すと model の版が上がる（0079 §2.1）。
   - **登録**: 登録する bytes は `canonical_counterfactual_artifact_bytes(artifact)` そのもの（同じ artifact が
-    2通りの bytes を持たない）。`register --metadata` の JSON は
+    2通りの bytes を持たない）。metadata の JSON は
     `counterfactual_registry_metadata_json_bytes(counterfactual_registry_metadata(artifact, bytes))` で
-    manifest から導く。読み込み時の L5 が、artifact が決める metadata の全欄を照合する（0079 §2.3）
+    manifest から導く。読み込み時の L5 が、artifact が決める metadata の全欄を照合する（0079 §2.3）。
+    作り手は `coldaisle-train` だけで、登録は `coldaisle-train --apply` か
+    `register --training-output <--out>`（完成の印 `COMPLETE.json` を確かめ、確かめたときに読んだ bytes を渡す）で行う。
+    `register --metadata/--payload` は `thermal_model` かつ `counterfactual_action` の metadata を拒む
+    （書きかけの学習の出力を登録させない。判定は読んだ bytes の中身。決定記録 0150 §2.5 / §5 の 14）。
+    `registry.json` の置き換えの後に fsync が失敗したときは `RegistryCommitNotDurableError`（登録した ref を持つ）で
+    「登録は見えている・再登録しない」と分ける
   - **読み込み**: `RegistryCounterfactualThermalModel.from_verified_artifact(verified, metric_catalog=,
     calibration=)` だけが封をした型（model と同梱 Profile v2）を作る。0079 §2.4 の L1〜L10 と 0084 の
     L11 / L12 を検査し（順は 0097 §2.4）、1つでも外れたら `CounterfactualArtifactRejectedError`（`check` に

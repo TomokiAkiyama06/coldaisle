@@ -1,0 +1,27 @@
+# `coldaisle-train --training-spec` の例（#84 / 決定記録 0150 §2.3）
+#
+# **仮の値の例です。実運用の値ではありません。** そのまま使わず、学習する dataset ごとに
+# 値を決めて別のファイル（例: var/training.yaml）に書いてください。コードに既定値はありません
+# （AGENTS.md「絶対に守るルール」9 / 決定記録 0048 §2.3 / 0079 §2.3）。
+schema_version: 1
+
+# split の境界（epoch ミリ秒。決定記録 0031 §2.5）。dataset の期間に合わせて決める。
+# 境界をまたぐ example は purged になり、学習にも Profile にも使わない
+validation_start_ms: 1000000000000
+test_start_ms: 1000000600000
+
+# ridge の正則化の強さ（> 0）
+ridge_lambda: 1.0
+
+# 同梱 Confidence Profile v2 の support 軸（決定記録 0079 §2.5）。
+# 全 zone の fan.<zone>（effective demand）の軸が要る。feature metric の軸を足してもよい
+support_axes:
+  - source: fan.front
+    edges: [0.5]
+  - source: fan.rear
+    edges: [0.5]
+  - source: fan.top
+    edges: [0.5]
+
+# validation の residual RMS の下限（target の単位。> 0）
+residual_scale_floor: 0.01

@@ -71,10 +71,21 @@ class MetricCatalog(BaseModel):
         `metric_catalog_sha256` で照合するために使う。読み直して hash を取ると、間で書き換わった
         別の bytes の hash になりうるので、1回だけ読む。
         """
-        payload = path.read_bytes()
+        return cls.from_yaml_bytes_with_sha256(path.read_bytes(), origin=str(path))
+
+    @classmethod
+    def from_yaml_bytes_with_sha256(
+        cls, payload: bytes, *, origin: str
+    ) -> tuple[MetricCatalog, str]:
+        """読んだ bytes から catalog を作り、**同じ bytes** の SHA-256 と返す。
+
+        決定記録 0150 §2.7。
+        ``coldaisle-train`` は設定を上限で切って1回だけ読み、その buffer から parse と hash を
+        行う。``origin`` は誤りの文言に使う出どころ（path など）。
+        """
         loaded: Any = yaml.safe_load(payload.decode("utf-8"))
         if not isinstance(loaded, dict):
-            raise ValueError(f"メトリクス定義が辞書ではない: {path}")
+            raise ValueError(f"メトリクス定義が辞書ではない: {origin}")
         catalog = cls.model_validate(loaded)
         catalog._validate_names()
         return catalog, sha256(payload).hexdigest()

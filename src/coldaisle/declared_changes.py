@@ -147,24 +147,32 @@ def read_declared_changes(path: Path) -> DeclaredChangesInput:
     strict に外れる値（bool / 浮動小数 / 文字列の時刻）・重複した鍵・上限超えは、すべて
     :class:`DeclaredChangesError`。
     """
-    payload = _read_regular_file(path)
+    return parse_declared_changes(_read_regular_file(path), origin=path.name)
+
+
+def parse_declared_changes(payload: bytes, *, origin: str) -> DeclaredChangesInput:
+    """読んだ bytes を検証して返す（0109 §2.3 / 決定記録 0150 §2.7）。
+
+    :func:`read_declared_changes` の読んだ後の本体。``coldaisle-train`` は上限で切って1回だけ
+    読んだ bytes を渡し、``file_sha256`` も同じ bytes から取る。``origin`` は誤りの文言に使う名前。
+    """
     try:
         text = payload.decode("utf-8")
     except UnicodeDecodeError as error:
-        raise DeclaredChangesError(f"宣言のファイルが UTF-8 ではない: {path.name}") from error
+        raise DeclaredChangesError(f"宣言のファイルが UTF-8 ではない: {origin}") from error
     try:
         loaded: object = yaml.load(text, Loader=_UniqueKeySafeLoader)
     except yaml.YAMLError as error:
-        raise DeclaredChangesError(f"宣言のファイルを YAML として読めない: {path.name}") from error
+        raise DeclaredChangesError(f"宣言のファイルを YAML として読めない: {origin}") from error
     if not isinstance(loaded, dict):
         raise DeclaredChangesError(
-            f"宣言のファイルの最上位が mapping ではない: {path.name}"
+            f"宣言のファイルの最上位が mapping ではない: {origin}"
             "（宣言が無いときも schema_version: 1 と changes: [] を書く）"
         )
     try:
         parsed = DeclaredChangesFile.model_validate(loaded)
     except ValidationError as error:
-        raise DeclaredChangesError(f"宣言のファイルが検証に外れる: {path.name}: {error}") from error
+        raise DeclaredChangesError(f"宣言のファイルが検証に外れる: {origin}: {error}") from error
     return DeclaredChangesInput(
         changes=parsed.changes, file_sha256=hashlib.sha256(payload).hexdigest()
     )
@@ -175,5 +183,6 @@ __all__ = [
     "DeclaredChangesFile",
     "DeclaredChangesInput",
     "normalize_declared_changes",
+    "parse_declared_changes",
     "read_declared_changes",
 ]

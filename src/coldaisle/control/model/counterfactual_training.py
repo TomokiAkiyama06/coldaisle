@@ -61,6 +61,7 @@ from coldaisle.control.model.dataset import (
     DatasetSpecV2,
     DatasetSplitV2,
     ThermalDatasetV2,
+    examples_jsonl_bytes,
 )
 from coldaisle.control.model.thermal import (
     DatasetArtifactId,
@@ -189,6 +190,58 @@ def verify_training_dataset_artifact_v2(
         raise ValueError("公開した Dataset manifest が学習対象の dataset と一致しない")
     if examples_sha256 != manifest.examples_sha256:
         raise ValueError("公開した Dataset examples の checksum が manifest と一致しない")
+    return VerifiedTrainingDatasetArtifactV2(
+        artifact_id=artifact_id,
+        dataset=dataset,
+        manifest_sha256=hashlib.sha256(manifest_bytes).hexdigest(),
+        examples_sha256=examples_sha256,
+        _token=_DATASET_V2_BINDING_TOKEN,
+    )
+
+
+def load_training_dataset_artifact_v2(dataset_dir: Path) -> VerifiedTrainingDatasetArtifactV2:
+    """公開済みの Dataset v2 の directory を**1回の読み**で読み、公開物へ束縛する。
+
+    決定記録 0150 §2.4 の 1。
+    ``manifest.json`` と ``examples.jsonl`` を、symlink をたどらず開いた directory の fd から
+    それぞれ1回だけ上限つきで読み、hash と parse を同じ buffer から行う。
+
+    - directory 名が公開用 alias（``dataset-<32 hex>``）であること
+    - manifest が canonical な公開 bytes であること・読んだ examples の bytes の SHA-256 が
+      ``manifest.examples_sha256`` と一致すること（どちらも parse の前）
+    - 各行を ``DatasetExampleV2`` として読み、``ThermalDatasetV2`` を作り（型の検査が効く）、
+      ``examples_jsonl_bytes`` が読んだ bytes と完全に一致すること（canonical でない行を拒む）
+
+    束縛の token は :func:`verify_training_dataset_artifact_v2` と同じものを使う。
+    """
+    artifact_id = dataset_dir.name
+    if _DATASET_ARTIFACT_ALIAS.fullmatch(artifact_id) is None:
+        raise ValueError("Dataset artifact の directory 名は公開用 alias にする")
+    directory_fd = _open_directory_without_symlinks(dataset_dir)
+    try:
+        manifest_bytes = _read_regular_file_at(
+            directory_fd, _DATASET_MANIFEST_FILENAME, max_bytes=MAX_DATASET_MANIFEST_BYTES
+        )
+        examples_bytes = _read_regular_file_at(
+            directory_fd, _DATASET_EXAMPLES_FILENAME, max_bytes=MAX_DATASET_EXAMPLES_BYTES
+        )
+    finally:
+        os.close(directory_fd)
+    manifest = DatasetManifestV2.model_validate_json(manifest_bytes)
+    if manifest_bytes != (manifest.model_dump_json(indent=2) + "\n").encode("utf-8"):
+        raise ValueError("Dataset manifest は canonical な公開 bytes に限る")
+    examples_sha256 = hashlib.sha256(examples_bytes).hexdigest()
+    if examples_sha256 != manifest.examples_sha256:
+        raise ValueError("公開した Dataset examples の checksum が manifest と一致しない")
+    if examples_bytes and not examples_bytes.endswith(b"\n"):
+        raise ValueError("Dataset examples の最後の行が改行で終わらない")
+    lines = examples_bytes.split(b"\n")[:-1] if examples_bytes else []
+    dataset = ThermalDatasetV2(
+        manifest=manifest,
+        examples=tuple(DatasetExampleV2.model_validate_json(line) for line in lines),
+    )
+    if examples_jsonl_bytes(dataset.examples) != examples_bytes:
+        raise ValueError("Dataset examples は canonical な公開 bytes に限る")
     return VerifiedTrainingDatasetArtifactV2(
         artifact_id=artifact_id,
         dataset=dataset,

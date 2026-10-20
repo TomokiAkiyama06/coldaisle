@@ -36,6 +36,7 @@ uv run coldaisle-memory --apply --commit  # 確認してから書く
 uv run coldaisle-calibrate          # 較正オフセットの算出（**既定では書かない**）
 uv run coldaisle-calibrate --apply  # 確認してから書く。手順は docs/calibration.md
 uv run coldaisle-dataset --dataset-version 2 --declared-changes var/declared-changes.yaml --calibration-history-db var/coldaisle.db ...  # Thermal Dataset v2（版は必須。手順は docs/thermal-dataset.md。決定記録 0109）
+uv run coldaisle-train --dataset var/datasets/dataset-<32 hex> --replay-path ... --training-spec var/training.yaml --out var/training/<名前> ...  # 反実仮想 Thermal Model の学習（**既定では Registry を書かない**。`--apply` で candidate だけ。人が手で実行し timer にしない。例は docs/thermal-model.md。#84 / 決定記録 0150）
 uv run coldaisle-evaluate --runs var/evaluation-runs.yaml --out var/evaluation.json  # Controller構成の比較（読み取りのみ）
 uv run coldaisle-drift --evidence var/drift-evidence.yaml --profile var/confidence-profile.json  # Model driftの検知（読み取りのみ・書き込みはしない。`--format markdown` で trend を人が読む表に）
 uv run coldaisle-supervisor-shadow --evidence var/supervisor-shadow-runs.yaml --registry-root var/model-registry --out var/supervisor-shadow.json  # Supervisor の Shadow 集計（DB と Registry を読むだけ。昇格は CLI の外）
@@ -267,6 +268,8 @@ src/coldaisle/
   escalate.py # 合成の起点: 故障疑いの案件資料（AI非依存・送信しない）。#39
   memory.py   # 合成の起点: 運用メモリの記録（確認を経由する）。#40
   calibrate.py# 合成の起点: 較正オフセットの算出（確認を経由する）。#13
+  train.py    # 合成の起点: 学習の CLI `coldaisle-train`（Dataset v2 → 反実仮想 Thermal Model artifact v2。`--apply` のときだけ candidate を登録）。**どこからも import しない**。#84 / 決定記録 0150
+  training_output.py # レイヤ横断: 学習の出力（`--out`）の形・公開の手順・path の照合・確かめる関数（train と registry が共有。coldaisle を import しない）。決定記録 0150 §2.5
   evaluate.py # 合成の起点: Controller構成の比較レポート（読み取りのみ）。#91
   supervisor_shadow.py # 合成の起点: 保存済み trace から Supervisor の Shadow 集計（読み取りのみ。制御へ届かない）。#89
   air_balance_shadow.py # 合成の起点: 保存済み trace から Air Balance の協調の shadow 集計（読み取りのみ・合否なし。制御へ届かない）。#81 / 決定記録 0093
@@ -312,7 +315,7 @@ src/coldaisle/
   web/        # L4: 静的アセット。airflow-trace.js が decision trace の版の解釈を1か所で持つ（0071 §2.3）
 firmware/     # ESP32-S3 Arduino スケッチ。**コンパイルは人の手**（#11 / 決定記録 0022 §2.9）
 deploy/       # Ubuntu 常駐化のテンプレート（systemd / udev）。**仮の値だけ**。手順は docs/ubuntu-deploy.md（#57）
-config/       # rules.yaml, calibration.json, coldaisle.toml, evaluation.yaml, drift.yaml, air-balance-shadow.yaml, rl-training.yaml, soak.yaml, load-distribution.yaml, control-admin.yaml / control-admin.dev.yaml, learned-channel.yaml（Control Config の4ファイル fan-hardware / safety / fan-policy / air-balance は実運用のものを置かない。docs/control-config.md）
+config/       # rules.yaml, calibration.json, coldaisle.toml, evaluation.yaml, drift.yaml, air-balance-shadow.yaml, rl-training.yaml, soak.yaml, load-distribution.yaml, control-admin.yaml / control-admin.dev.yaml, learned-channel.yaml, training.example.yaml（`coldaisle-train` の仮の値の例）（Control Config の4ファイル fan-hardware / safety / fan-policy / air-balance は実運用のものを置かない。docs/control-config.md）
 memory/       # 運用メモリ（いまの閾値・較正値）。`coldaisle-memory` が更新案を出す
 docs/         # 要件定義、仕様レビュー、ADR
 tests/
