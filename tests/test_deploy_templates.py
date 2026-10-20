@@ -380,6 +380,16 @@ def test_fand_refuses_to_run_without_the_deadman_and_uses_the_shared_db():
         assert not exec_start[exec_start.index(option) + 1].startswith("/var/lib/")
 
 
+def test_fand_passes_the_root_owned_lockfile_for_the_hint_certificate():
+    """B1 / B2 の照合の部品 ``lockfile``（決定記録 0152 §2.4 / §5 の 4 (a)）。
+
+    認証ランナーと同じ root の所有の ``uv.lock``（docs/ubuntu-deploy.md）。渡さなければ
+    ``lockfile_mismatch`` で B0 のまま B1 に進めない。
+    """
+    exec_start = one(fand(), "Service", "ExecStart").split()
+    assert exec_start[exec_start.index("--hint-lockfile") + 1] == "/opt/coldaisle/uv.lock"
+
+
 def test_fand_stops_every_process_before_the_handoff():
     """`ExecStopPost` の前に cgroup の全プロセスを止め、書き手を1つにする（0028 §2.7）。"""
     assert one(fand(), "Service", "KillMode") == "control-group"
