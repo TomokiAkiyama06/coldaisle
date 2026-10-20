@@ -1816,11 +1816,15 @@ def _room_drift(context: RunContext, config: AirflowCharacterizationConfig) -> b
 
 
 def _calibration_reason(context: RunContext) -> tuple[Reason | None, str | None]:
-    """§2.9 の較正との結びつけ。区間の中の有効化・区間の開始で有効な行の無さ・digest の違い。"""
+    """§2.9 の較正との結びつけ。区間の中の有効化・区間の開始で有効な行の無さ・digest の違い。
+
+    区間は段・窓と同じく終わりを含まない（`[start_ms, end_ms)`）。`end_ms` ちょうどの有効化は
+    次のセッションに帰属させ、この回を捨てない（#360）。
+    """
     run = context.run
     manifest = run.manifest
     rows = context.calibration
-    if any(run.start_ms <= row.ts_ms <= run.end_ms for row in rows):
+    if any(run.start_ms <= row.ts_ms < run.end_ms for row in rows):
         return Reason.CALIBRATION_CHANGED, None
     effective = [row for row in rows if row.ts_ms < run.start_ms]
     if not effective:
