@@ -18,8 +18,10 @@ Learned MPC worker が同じ関数を呼ぶ（0152 §2.3。``calibration_offsets
 ``other`` のプロセスは ``environment`` を計算せず、照合を ``environment_mismatch`` に倒す
 （呼び出し側の fand・worker・認証ランナーは後の段で足す）。
 
-``hint_policy`` / ``hint_gate`` / ``optimizer`` / ``conditions`` と ``certificate_sha256`` は、
-ゲートの仕様（格子の定義と ``eps`` の設定）と合わせて後の段で足す。
+設定から値を選ぶ部品（``hint_policy`` / ``optimizer``）とゲートの仕様の導出は、設定の型を読むので
+``coldaisle.control.hint_gate`` に置き、正準な符号化と digest はここの :func:`json_component_sha256`
+を呼ぶ（0152 §2.3 / 0156 §2.7）。``conditions``（``LearnedMpcController.conditions()`` の全体）は
+:func:`conditions_sha256`、証明書の型と ``certificate_sha256`` は ``coldaisle.hint_certificate``。
 
 **例外を握りつぶさない。** 読めない・symlink を含む・非有限の offset は ``ValueError`` /
 ``OSError`` のまま呼び出し側へ返す。fand はそれを照合の失敗（B0）として扱う（0152 §2.4。
@@ -33,6 +35,7 @@ import csv
 import hashlib
 import importlib.metadata
 import io
+import json
 import os
 import platform
 import re
@@ -63,6 +66,7 @@ _CALIBRATION_TAG = b"coldaisle-hint-calibration-v1"
 _CALIBRATION_AVAILABLE = b"available"
 _CALIBRATION_UNAVAILABLE = b"unavailable"
 _DISTRIBUTION_NAME_SEPARATORS = re.compile(r"[-_.]+")
+_CONDITIONS_TAG = b"coldaisle-hint-conditions-v1"
 
 
 def length_prefixed(parts: Iterable[bytes]) -> bytes:
@@ -559,3 +563,40 @@ def calibration_unavailable_sha256(code: str) -> str:
     return _sha256_hex(
         length_prefixed((_CALIBRATION_TAG, _CALIBRATION_UNAVAILABLE, code.encode("utf-8")))
     )
+
+
+# ---------------------------------------------------------------- 設定・条件の正準な JSON
+
+
+def canonical_json_bytes(value: object) -> bytes:
+    """部品の digest の入力にする canonical JSON（0156 §2.7）。
+
+    ``calibration_offsets.canonical_offsets_bytes`` と同じ規約（``sort_keys``・``allow_nan=False``・
+    区切りの空白なし・UTF-8）。非有限の数・JSON にできない値は例外のまま返す（黙って文字列に
+    しない）。
+    """
+    return json.dumps(
+        value,
+        ensure_ascii=False,
+        allow_nan=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+
+
+def json_component_sha256(tag: bytes, value: object) -> str:
+    """版のタグと canonical JSON を長さ付きで連結した列の SHA-256（部品の digest の共通の形）。
+
+    タグは部品ごとに別の値にする（同じ JSON の値が別の部品の digest と一致しないように）。
+    """
+    if not tag:
+        raise ValueError("部品のタグを空にしない")
+    return _sha256_hex(length_prefixed((tag, canonical_json_bytes(value))))
+
+
+def conditions_sha256(conditions: Mapping[str, object]) -> str:
+    """``conditions`` の部品: ``LearnedMpcController.conditions()`` の**全体**の digest。
+
+    0152 §2.3 / 0066 §2.1 (c)。鍵を列挙し直さない（``conditions()`` に鍵が増えればそのまま束ねる）。
+    """
+    return json_component_sha256(_CONDITIONS_TAG, dict(conditions))

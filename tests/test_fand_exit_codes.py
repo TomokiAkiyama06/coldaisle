@@ -5,7 +5,8 @@
 2. 通知の I/O の失敗（socket の作成・`READY=1` の送信）は終了コード 6 で、4 ではない（§2.4）
 3. takeover 後に書き込みと読み戻しが `hardware_write_fail_exit_ms` 続けて失敗したら終了コード 7
    （途中で1回成功すれば数え直す。§2.6）
-4. 起動時に `faulthandler` を有効にする（§2.5）
+4. 起動時に `faulthandler` を有効にする（§2.5）。起動の後も SIGABRT に Python の処理関数を置かず、
+   SIGABRT を塞がない（決定記録 0158 §2.5 の T2・T3）
 5. 制御を取る前に DB へ書けるかを確かめ、書けなければ `db_not_writable` で終了コード 5。
    `SQLITE_BUSY` は権限の失敗と取り違えない（§2.1）
 
@@ -17,8 +18,13 @@ from __future__ import annotations
 import errno
 import json
 import os
+import resource
+import signal
 import socket
 import sqlite3
+import subprocess
+import sys
+import time
 from collections.abc import Callable, Iterator
 from pathlib import Path
 from types import SimpleNamespace
@@ -499,6 +505,137 @@ def test_a_faulthandler_failure_does_not_stop_startup(
         control_daemon._enable_faulthandler()
 
     assert any("faulthandler" in record.getMessage() for record in caplog.records)
+
+
+SIGABRT_BIT = 1 << (signal.SIGABRT - 1)
+"""`/proc/<pid>/task/<tid>/status` の `SigBlk`（16 進のマスク）での SIGABRT の位置。"""
+
+linux_proc = pytest.mark.skipif(
+    not Path("/proc/self/task").is_dir(),
+    reason="スレッドごとのシグナルマスクを /proc で読む（Linux）",
+)
+
+
+def _sigabrt_blocked_threads(pid: int | str) -> list[str]:
+    """SIGABRT を塞いでいるスレッドの tid を返す（`SigBlk` を読む）。"""
+    blocked: list[str] = []
+    for task in sorted(Path(f"/proc/{pid}/task").iterdir()):
+        try:
+            status = (task / "status").read_text(encoding="ascii")
+        except (FileNotFoundError, ProcessLookupError):
+            continue  # 読む間に終わったスレッド
+        mask = next(line for line in status.splitlines() if line.startswith("SigBlk:"))
+        if int(mask.split()[1], 16) & SIGABRT_BIT:
+            blocked.append(task.name)
+    return blocked
+
+
+def test_main_leaves_sigabrt_at_the_default_disposition_after_startup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """起動の後も SIGABRT は既定（`SIG_DFL`）のまま（決定記録 0158 §2.5 の T2）。
+
+    Python の処理関数は main thread がバイトコードに戻るまで動かないので、置くとユーザー空間の
+    固まりが SIGABRT で終わらず、約 5 s の経路が約 11 s の経路（SIGKILL）に変わりうる（0158 §2.3）。
+    `faulthandler` は C の処理関数で、`signal.getsignal` には現れない。
+    """
+    _confirmed_documents(tmp_path)
+    seen: list[object] = []
+    original_run = ControlDaemon.run
+
+    def observing_run(self: ControlDaemon, max_ticks: int | None = None) -> Any:
+        # tick を回している間（SIGTERM・SIGINT の処理関数を置いた後）の状態を見る
+        seen.append(signal.getsignal(signal.SIGABRT))
+        stats = original_run(self, max_ticks=max_ticks)
+        seen.append(signal.getsignal(signal.SIGABRT))
+        return stats
+
+    monkeypatch.setattr(ControlDaemon, "run", observing_run)
+    assert signal.getsignal(signal.SIGABRT) is signal.SIG_DFL, "試験の前提（pytest が置いていない）"
+
+    assert main(_argv(tmp_path)) == 0
+    assert seen == [signal.SIG_DFL, signal.SIG_DFL]
+    assert signal.getsignal(signal.SIGABRT) is signal.SIG_DFL
+
+
+@linux_proc
+def test_main_does_not_block_sigabrt_on_any_thread_after_startup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`faulthandler` を有効にした後に、SIGABRT をどのスレッドでも塞がない（0158 §2.5 の T3）。
+
+    塞がれた SIGABRT は届かず、SIGKILL の経路（約 11 s）になる。main thread は
+    `pthread_sigmask` で、tick の間に生きている全スレッドは `/proc/self/task` で見る。
+    """
+    _confirmed_documents(tmp_path)
+    main_masks: list[set[signal.Signals]] = []
+    blocked: list[list[str]] = []
+    original_run = ControlDaemon.run
+
+    def observing_run(self: ControlDaemon, max_ticks: int | None = None) -> Any:
+        main_masks.append(signal.pthread_sigmask(signal.SIG_BLOCK, []))
+        blocked.append(_sigabrt_blocked_threads("self"))
+        return original_run(self, max_ticks=max_ticks)
+
+    monkeypatch.setattr(ControlDaemon, "run", observing_run)
+    assert _sigabrt_blocked_threads("self") == [], "試験の前提（pytest が塞いでいない）"
+
+    assert main(_argv(tmp_path)) == 0
+    assert len(main_masks) == 1
+    assert signal.SIGABRT not in main_masks[0]
+    assert blocked == [[]]
+
+
+@linux_proc
+def test_a_running_fand_process_ends_by_sigabrt_with_a_traceback(tmp_path: Path) -> None:
+    """動いている fand の process は SIGABRT で traceback を残して既定の動作で終わる。
+
+    決定記録 0158 §2.5 の T2・T3 を、別の process の実際の終わり方で確かめる。
+
+    systemd の `WatchdogSignal=SIGABRT` の代わりに試験から送る（systemd の経路全体は試さない。
+    0158 §5 の 4）。別の process で確かめるのは、pytest が `faulthandler` を先に有効にしているため、
+    同じ process では fand 自身が有効にした状態を作れないから。simulated backend で実機は要らない。
+    """
+    _confirmed_documents(tmp_path)
+    argv = _argv(tmp_path)[:-2]  # --max-ticks を外し、止めるまで回す
+    log = tmp_path / "fand.stderr"
+    env = {
+        key: value
+        for key, value in os.environ.items()
+        if key not in {NOTIFY_SOCKET_ENV, WATCHDOG_USEC_ENV, WATCHDOG_PID_ENV}
+    }
+
+    def no_core() -> None:
+        # unit の LimitCORE=0 と同じ（core の書き出しで終わりを遅らせない）
+        resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+
+    with log.open("wb") as stderr:
+        process = subprocess.Popen(
+            [sys.executable, "-m", "coldaisle.control_daemon", *argv],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=stderr,
+            env=env,
+            preexec_fn=no_core,
+        )
+        try:
+            deadline = time.monotonic() + 60
+            while '"msg": "control tick"' not in log.read_text(encoding="utf-8", errors="replace"):
+                assert process.poll() is None, log.read_text(encoding="utf-8", errors="replace")
+                assert time.monotonic() < deadline, "fand が tick を始めない"
+                time.sleep(0.05)
+
+            assert _sigabrt_blocked_threads(process.pid) == []
+            process.send_signal(signal.SIGABRT)
+            returncode = process.wait(timeout=10)
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.wait()
+
+    output = log.read_text(encoding="utf-8", errors="replace")
+    assert returncode == -signal.SIGABRT, output
+    assert "Fatal Python error: Aborted" in output  # faulthandler が書いてから終わった
 
 
 # ------------------------------------------------ 5. 起動時の DB の書き込み確認（§2.1）

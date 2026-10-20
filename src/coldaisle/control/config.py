@@ -36,7 +36,7 @@ from coldaisle.control.schema import (
 )
 from coldaisle.measurement import validate_metric
 
-CONTROL_CONFIG_VERSION: Literal[16] = 16
+CONTROL_CONFIG_VERSION: Literal[17] = 17
 """4ファイルを束ねた Control Config の版。
 
 - v11（#81 / 決定記録 0073 §2.1）: ``air-balance.yaml``（v2）を4つ目のファイルにした。
@@ -55,10 +55,15 @@ CONTROL_CONFIG_VERSION: Literal[16] = 16
   v12 にした（``supervisor.workload_hint``。段階・期限・矛盾の保持時間・起動時の取り込みの上限・
   読み手の周期と鮮度の上限・既知の source・``context_overrides``）。``context_overrides`` の
   上書き先が基準より冷却を弱めうる設定と、鍵の Regime が ``unknown`` の設定を拒否する
+- v17（#288 / 決定記録 0156 §2.1）: ``fan-policy.yaml`` を v13（``supervisor.workload_hint`` の
+  ``monotonicity_gate``）、``safety.yaml`` を v5（``workload_hint`` の ``max_eps`` ほか）にした。
+  どちらの塊も省ける。**形**の誤りだけを Control Config の不正にし、値の制約（有限・非負・大小・
+  点の数）はゲートの仕様の関数（``control/hint_gate.py``）が検査して B0 に倒す
+  （0156 §2.6 / §5 の 3）
 """
 FAN_HARDWARE_CONFIG_VERSION: Literal[2] = 2
-FAN_POLICY_CONFIG_VERSION: Literal[12] = 12
-SAFETY_CONFIG_VERSION: Literal[4] = 4
+FAN_POLICY_CONFIG_VERSION: Literal[13] = 13
+SAFETY_CONFIG_VERSION: Literal[5] = 5
 CONFIG_FILENAMES = {
     "fan_hardware": "fan-hardware.yaml",
     "safety": "safety.yaml",
@@ -316,14 +321,32 @@ class TelemetryDelays(_ConfigModel):
         return self
 
 
+class SafetyWorkloadHintConfig(_ConfigModel):
+    """Workload Hint の単調性ゲートの ``eps`` の上限（``safety.yaml`` v5。決定記録 0156 §2.6）。
+
+    人がレビューする安全側の設定に置き、Policy 側の値で上限を動かせないようにする（0066 §2.1 (b)）。
+    **ここでは形だけを検査する。** 有限・非負・大小の制約はゲートの仕様の関数が検査し、外れれば
+    ``eps_bounds_invalid`` で B0 に留める（全 zone Max にも起動拒否にもしない。0156 §2.6）。
+    そのため値の型は非有限も通す ``float`` にしている。Critical Safety はこの塊を読まない。
+    """
+
+    max_eps: ConfigValue[float]
+    max_eps_c: ConfigValue[float]
+    max_eps_c_ceiling: ConfigValue[float]
+    """``max_eps_c`` の天井（0066 §2.1 (b) の「有限の天井」。コードに定数を置かない）。"""
+
+
 class SafetyConfig(_ConfigModel):
     """Critical Safety だけが所有する設定。全数値に status/basis を残す。"""
 
-    schema_version: Literal[4]
+    schema_version: Literal[5]
     """v4（決定記録 0080 §2.6）で ``hardware_write_fail_exit_ms`` を必須にした。
 
     **v3 を v4 として補完しない。** 補うと、所有者が見ていない時間で「書けないまま制御を
     持ち続ける」上限が決まる（0028 §2.8 / ``docs/control-config.md`` の移行の規則）。
+
+    v5（#288 / 決定記録 0156 §2.1）で省ける塊 ``workload_hint`` を足した。v4 を v5 として読まない
+    （いままでの版上げと同じ手順）。
     """
     absolute_temp_ceiling_c: SafetyFloat
     """T_SENSOR **以外**の温度の絶対上限（決定記録 0110 §2.2）。
@@ -360,6 +383,12 @@ class SafetyConfig(_ConfigModel):
     tick_deadline_ms: SafetyMilliseconds
     overrun_consecutive_limit: ConfigValue[Annotated[int, Field(gt=0)]]
     watchdog_timeout_ms: SafetyMilliseconds
+    workload_hint: SafetyWorkloadHintConfig | None = None
+    """Workload Hint の単調性ゲートの上限（v5。決定記録 0156 §2.1 / §2.6）。省ける。
+
+    ``supervisor.workload_hint.stage`` が ``shadow_mpc`` / ``active`` で塊が無ければ、ゲートの仕様を
+    導けず ``eps_bounds_invalid`` で B0 に留まる。
+    """
     hardware_write_fail_exit_ms: SafetyMilliseconds
     """takeover の後、ある zone の書き込みと読み戻しが一度も成功しないまま続いたら
     fand を終了コード 7 で終える時間（決定記録 0080 §2.6）。
@@ -969,6 +998,78 @@ class WorkloadHintContextOverride(_ConfigModel):
 
 _HINT_SOURCE_PATTERN = re.compile(r"[a-z0-9][a-z0-9._-]{0,63}")
 
+HintGatePoints = Annotated[tuple[float, ...], BeforeValidator(_yaml_sequence_to_tuple)]
+"""ゲートの格子の1つの軸の点の列（0156 §2.3）。
+
+**形だけ**（数の列）を検査する。1つ以上・狭義の昇順・有限・Demand の軸の ``[0, 1]`` は値の制約で、
+ゲートの仕様の関数が ``hint_gate_invalid`` にする（0156 §2.6 / §5 の 3）。
+"""
+
+
+class HintGateAxisConfig(_ConfigModel):
+    """数値の軸（0156 §2.3）。範囲は ``points`` の先頭と末尾で、刻みは ``points`` そのもの。"""
+
+    points: HintGatePoints
+
+
+class HintGateTemperatureConfig(_ConfigModel):
+    """CPU / GPU の温度の軸（0156 §2.4）。
+
+    値は基準の context の ``target_band.*.upper_c`` からの差 ℃。
+    """
+
+    cpu: HintGateAxisConfig
+    gpu: HintGateAxisConfig
+
+
+class HintGateWindowFeatureConfig(_ConfigModel):
+    """温度以外の window feature の軸（metric 名と絶対値の ``points``。0156 §2.4）。
+
+    metric 名の形・重複は値の制約としてゲートの仕様の関数が検査する。
+    """
+
+    metric: str
+    points: HintGatePoints
+
+
+class HintGateZoneDemandsConfig(_ConfigModel):
+    """3系統の Demand の組（hard constraints / baseline の代表集合の1つ。0156 §2.5）。"""
+
+    front: float
+    rear: float
+    top: float
+
+
+class HintMonotonicityGateConfig(_ConfigModel):
+    """Workload Hint の単調性ゲートの格子と ``eps``（``fan-policy.yaml`` v13。決定記録 0156）。
+
+    (Regime, workload) の軸は ``context_overrides`` の鍵から導くので、ここには書かない
+    （0156 §2.2）。
+    全ての鍵が必須で、既定値をコードに置かない（ルール 9）。値の制約はゲートの仕様の関数
+    （``control/hint_gate.py``）が検査する。この塊は ``requested_demand`` の手前（Learned MPC の
+    Shadow solver と将来の B2 の context の選択）にしか効かず、Reactive Guard / Critical Safety の
+    値・経路を変えない（0156 §2.1）。
+    """
+
+    eps: ConfigValue[float]
+    """Demand の許容誤差（0066 §2.1 (b)）。"""
+    eps_c: ConfigValue[float]
+    """予測温度の許容誤差 ℃（0066 §2.1 (b)）。"""
+    previous_demand: HintGateAxisConfig
+    """直前の effective demand。3系統それぞれに同じ ``points`` を当て、直積を試す（0156 §2.3）。"""
+    temperature: HintGateTemperatureConfig
+    window_features: Annotated[
+        tuple[HintGateWindowFeatureConfig, ...], BeforeValidator(_yaml_sequence_to_tuple)
+    ]
+    safety_floors: Annotated[
+        tuple[HintGateZoneDemandsConfig, ...], BeforeValidator(_yaml_sequence_to_tuple)
+    ]
+    """hard constraints の代表集合（tick ごとに変わる safety floor の組の列。0156 §2.5）。"""
+    baselines: Annotated[
+        tuple[HintGateZoneDemandsConfig, ...], BeforeValidator(_yaml_sequence_to_tuple)
+    ]
+    """baseline の代表集合（0156 §2.5）。"""
+
 
 class WorkloadHintConfig(_ConfigModel):
     """Workload Hint Stage B の段階と、読み手・状態の遷移の値（決定記録 0133 §2.6 / 0064 §2.6）。
@@ -1001,6 +1102,12 @@ class WorkloadHintConfig(_ConfigModel):
         Annotated[tuple[WorkloadHintContextOverride, ...], BeforeValidator(_yaml_sequence_to_tuple)]
         | None
     ) = None
+    monotonicity_gate: HintMonotonicityGateConfig | None = None
+    """単調性ゲートの格子と ``eps``（v13。決定記録 0156 §2.1）。省ける。
+
+    ``stage`` が ``off`` / ``observe`` では読まない。``shadow_mpc`` / ``active`` で無ければゲートの
+    仕様を導けず ``hint_gate_invalid`` で B0 に留まる（起動は止めない）。
+    """
 
     @model_validator(mode="after")
     def _values_are_complete_and_bounded(self) -> Self:
@@ -1090,7 +1197,10 @@ class SupervisorConfig(_ConfigModel):
     output_bounds: SupervisorOutputBounds
     rule_policy: RulePolicyConfig
     workload_hint: WorkloadHintConfig
-    """``fan-policy.yaml`` v12（#319 / 決定記録 0133 §2.6）。**必須。** v11 以前を補完しない。"""
+    """``fan-policy.yaml`` v12（#319 / 決定記録 0133 §2.6）。**必須。** v11 以前を補完しない。
+
+    v13（#288 / 決定記録 0156）で省ける ``monotonicity_gate`` を足した。
+    """
 
     @model_validator(mode="after")
     def _hint_overrides_do_not_weaken_cooling(self) -> Self:
@@ -1251,7 +1361,9 @@ class AirBalanceCoordinationConfig(_ConfigModel):
 
 
 class FanPolicyConfig(_ConfigModel):
-    schema_version: Literal[12]
+    schema_version: Literal[13]
+    """v13（#288 / 決定記録 0156 §2.1）で ``supervisor.workload_hint.monotonicity_gate``
+    を足した。"""
     fallback_curve: Annotated[
         tuple[FallbackPoint, ...], BeforeValidator(_yaml_sequence_to_tuple), Field(min_length=2)
     ]
@@ -1527,6 +1639,9 @@ class ControlConfig(_ConfigModel):
         append("safety.yaml", "overrun_consecutive_limit", safety.overrun_consecutive_limit)
         append("safety.yaml", "watchdog_timeout_ms", safety.watchdog_timeout_ms)
         append("safety.yaml", "hardware_write_fail_exit_ms", safety.hardware_write_fail_exit_ms)
+        if safety.workload_hint is not None:
+            for name in ("max_eps", "max_eps_c", "max_eps_c_ceiling"):
+                append("safety.yaml", f"workload_hint.{name}", getattr(safety.workload_hint, name))
         for zone in Zone:
             append(
                 "safety.yaml",
@@ -1639,6 +1754,14 @@ class ControlConfig(_ConfigModel):
                 f"mpc.optimizer.cost_scales.{name}",
                 getattr(optimizer.cost_scales, name),
             )
+        gate = self.policy.supervisor.workload_hint.monotonicity_gate
+        if gate is not None:
+            for name in ("eps", "eps_c"):
+                append(
+                    "fan-policy.yaml",
+                    f"supervisor.workload_hint.monotonicity_gate.{name}",
+                    getattr(gate, name),
+                )
         rollout = self.policy.authority_rollout
         for name in (
             "approval_max_age_ms",

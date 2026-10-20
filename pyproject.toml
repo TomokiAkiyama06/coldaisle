@@ -54,6 +54,9 @@ coldaisle-memory = "coldaisle.memory:main"
 coldaisle-calibrate = "coldaisle.calibrate:main"
 # Thermal Datasetのwindow/horizonはCLIで必須指定し、実測前の候補を既定値にしない（#83）
 coldaisle-dataset = "coldaisle.dataset:main"
+# 反実仮想 Thermal Model artifact v2 の学習。**既定では Registry を書かない**。`--apply` のときだけ
+# candidate を登録する（production は動かさない）。人が手で実行し、timer から呼ばない（#84 / 決定記録 0150）
+coldaisle-train = "coldaisle.train:main"
 # Controller 構成の比較レポート。**読み取りだけで、制御へ届かない**（#91 / 決定記録 0054）
 coldaisle-evaluate = "coldaisle.evaluate:main"
 # Thermal Model の drift 検知と再学習の推奨。**書き込みはしない**（#93 / 決定記録 0056）

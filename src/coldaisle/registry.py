@@ -11,6 +11,9 @@ uv run coldaisle-registry audit    --root var/model-registry --pointer-changes
 uv run coldaisle-registry register --root var/model-registry \\
     --metadata var/candidate.json --payload var/candidate.model.json \\
     --actor trainer --reason "training completed"
+uv run coldaisle-registry register --root var/model-registry \\
+    --training-output var/training/rack-thermal-0.1.0 \\
+    --actor trainer --reason "training completed"
 uv run coldaisle-registry validate --root var/model-registry \\
     --artifact thermal_model/rack-thermal/1.2.0 \\
     --offline-evaluation-ref evaluation/offline/1.2.0 \\
@@ -38,6 +41,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
@@ -46,8 +50,9 @@ from typing import Literal
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
-from coldaisle import logs
+from coldaisle import logs, training_output
 from coldaisle.control.model_registry import (
+    ArtifactCapability,
     ArtifactKind,
     ArtifactMetadata,
     ArtifactRef,
@@ -57,6 +62,7 @@ from coldaisle.control.model_registry import (
     ModelRegistry,
     ModelRegistryError,
     ModelRegistryLimits,
+    RegistryCommitNotDurableError,
     RegistryHealth,
     RegistryHealthReport,
     load_model_registry_limits,
@@ -308,12 +314,33 @@ def _log_health(report: RegistryHealthReport) -> None:
     )
 
 
+def _is_counterfactual_thermal(metadata: ArtifactMetadata) -> bool:
+    return (
+        metadata.kind is ArtifactKind.THERMAL_MODEL
+        and metadata.capability is ArtifactCapability.COUNTERFACTUAL_ACTION
+    )
+
+
 def run_register(args: argparse.Namespace) -> int:
     """candidate を登録する。**production にはしない。**"""
+    if args.training_output is not None:
+        if args.metadata is not None or args.payload is not None:
+            raise ValueError("--training-output は --metadata / --payload と同時に渡さない")
+        return run_register_training_output(args)
+    if args.metadata is None or args.payload is None:
+        raise ValueError("--metadata と --payload を両方渡す（または --training-output）")
     limits = _limits(args)
     metadata = ArtifactMetadata.model_validate_json(
         read_bounded(args.metadata, limits.max_snapshot_bytes)
     )
+    if _is_counterfactual_thermal(metadata):
+        # 学習の出力（書きかけを含む）は印を確かめる経路からだけ登録する。判定はファイルの
+        # 置き場所ではなく読んだ bytes の中身で行う（決定記録 0150 §2.5 / §5 の 14）
+        raise ValueError(
+            "反実仮想 thermal model（thermal_model / counterfactual_action）は"
+            " --metadata / --payload で登録しない。coldaisle-train の出力を"
+            " --training-output で登録する（決定記録 0150）"
+        )
     # artifact 本体は**読む前に**上限で切る。registry 側の検査は bytes を作ったあとに走る。
     payload = read_bounded(args.payload, limits.max_artifact_bytes)
     ref = _registry(args, limits).register_candidate(
@@ -325,6 +352,100 @@ def run_register(args: argparse.Namespace) -> int:
     _log_change("candidate を登録した", artifact=ref, actor=args.actor, reason=args.reason)
     emit({"artifact": ref.key, "status": "candidate"})
     return EXIT_OK
+
+
+def run_register_training_output(args: argparse.Namespace) -> int:
+    """``coldaisle-train`` の ``--out`` を、完成の印を確かめて candidate として登録する。
+
+    決定記録 0150 §2.5。
+
+    確かめたときに読んだ bytes そのものを ``register_candidate`` へ渡す（読み直さない）。印が無い・
+    無効なら Registry を開かない。登録の後に path の照合と中身の再検証をもう一度行い、外れたら
+    成功を報告しない（candidate は登録済み。CLI は retire しない）。
+    """
+    limits = _limits(args)
+    out: Path = args.training_output
+    out_fd = training_output.open_trusted_path(out)
+    try:
+        identity = (os.fstat(out_fd).st_dev, os.fstat(out_fd).st_ino)
+        verified = training_output.read_training_output(
+            out_fd,
+            max_artifact_bytes=limits.max_artifact_bytes,
+            max_other_bytes=limits.max_snapshot_bytes,
+        )
+        metadata = ArtifactMetadata.model_validate_json(verified.metadata)
+        if not _is_counterfactual_thermal(metadata):
+            # 学習の出力の作り手は coldaisle-train だけで、作るのは反実仮想 thermal model だけ
+            # （決定記録 0150 §2.2）。それ以外をこの経路で登録させない
+            raise ValueError(
+                "--training-output で登録できるのは thermal_model / counterfactual_action だけ"
+            )
+        training_output.require_path_names_directory(out, identity, when="登録の直前")
+        stages: list[str] = []
+        fields: dict[str, object] = {"training_output": str(out)}
+        try:
+            ref = _registry(args, limits).register_candidate(
+                metadata, verified.artifact, actor=args.actor, reason=args.reason
+            )
+        except RegistryCommitNotDurableError as exc:
+            # 確定はしている。読み直した snapshot から推し量らない（0150 §2.5）
+            ref = exc.ref
+            stages.append("register_durability")
+            fields["register_durability"] = (
+                f"{exc}（登録は見えている。再登録しない。coldaisle-registry status で確かめる）"
+            )
+        fields["artifact"] = ref.key
+        stages.extend(_training_output_after_register(out, out_fd, identity, verified, fields))
+    finally:
+        os.close(out_fd)
+    if stages:
+        LOGGER.error(
+            "candidate の登録の後の検査で問題がある（成功を報告しない。CLI は retire しない）",
+            extra={logs.FIELDS_KEY: {"stage": stages[0], "stages": stages, **fields}},
+        )
+        return EXIT_FAILED
+    _log_change("candidate を登録した", artifact=ref, actor=args.actor, reason=args.reason)
+    emit({"artifact": ref.key, "status": "candidate"})
+    return EXIT_OK
+
+
+def _training_output_after_register(
+    out: Path,
+    out_fd: int,
+    identity: tuple[int, int],
+    verified: training_output.VerifiedTrainingOutput,
+    fields: dict[str, object],
+) -> list[str]:
+    stages: list[str] = []
+    try:
+        check = training_output.path_names_directory(out, identity)
+    except training_output.UntrustedPathError as exc:
+        stages.append("out_replaced_after_register")
+        fields["out_replaced_after_register"] = {"untrusted": True, **exc.fields()}
+    else:
+        if not check.matches:
+            stages.append("out_replaced_after_register")
+            fields["out_replaced_after_register"] = {
+                "expected_identity": list(identity),
+                "actual_identity": None if check.actual is None else list(check.actual),
+                "mismatch_reason": check.reason,
+            }
+    expected = verified.file_bytes()
+    try:
+        again = training_output.read_training_output(
+            out_fd,
+            max_artifact_bytes=len(verified.artifact),
+            max_other_bytes=max(len(verified.marker), *(len(item) for item in expected.values())),
+        )
+    except training_output.TrainingOutputIncomplete as exc:
+        stages.append("out_modified_after_register")
+        fields["out_modified_after_register"] = {"problem": str(exc)}
+    else:
+        differences = training_output.output_differences(again, expected, verified.marker)
+        if differences:
+            stages.append("out_modified_after_register")
+            fields["out_modified_after_register"] = {"differences": differences}
+    return stages
 
 
 def run_validate(args: argparse.Namespace) -> int:
@@ -500,8 +621,14 @@ def build_parser() -> argparse.ArgumentParser:
 
     register = subparsers.add_parser("register", help="candidate を登録する")
     _add_common(register)
-    register.add_argument("--metadata", type=Path, required=True, help="ArtifactMetadata の JSON")
-    register.add_argument("--payload", type=Path, required=True, help="artifact 本体")
+    register.add_argument("--metadata", type=Path, default=None, help="ArtifactMetadata の JSON")
+    register.add_argument("--payload", type=Path, default=None, help="artifact 本体")
+    register.add_argument(
+        "--training-output",
+        type=Path,
+        default=None,
+        help="coldaisle-train の --out（完成の印を確かめる。--metadata / --payload と排他）",
+    )
     _add_actor(register)
     register.set_defaults(handler=run_register)
 
@@ -556,11 +683,20 @@ def main(argv: list[str] | None = None) -> int:
         ValueError,
         OSError,
         yaml.YAMLError,
+        training_output.TrainingOutputError,
     ) as exc:
         # 握りつぶさない。操作は行われなかったことを、理由とともに残す。
+        stage = exc.stage if isinstance(exc, training_output.TrainingOutputError) else None
+        details = exc.fields() if isinstance(exc, training_output.TrainingOutputError) else {}
         LOGGER.error(
             "Model Registry の操作に失敗した",
-            extra={logs.FIELDS_KEY: {"command": args.command, "error": str(exc)}},
+            extra={
+                logs.FIELDS_KEY: {
+                    "command": args.command,
+                    "error": str(exc),
+                    **({"stage": stage, **details} if stage is not None else {}),
+                }
+            },
         )
         return EXIT_FAILED
     return exit_code

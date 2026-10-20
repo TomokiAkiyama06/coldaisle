@@ -93,7 +93,7 @@ def safety_config(
     curve_floor = 0.5 if uniform_zone_min is None else uniform_zone_min
     return SafetyConfig.model_validate(
         {
-            "schema_version": 4,
+            "schema_version": 5,
             "absolute_temp_ceiling_c": value(85.0),
             "zone_min_demand": {zone: value(demand) for zone, demand in zone_min.items()},
             "cpu_cooling_floor": [

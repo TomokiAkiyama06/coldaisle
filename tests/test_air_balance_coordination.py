@@ -186,7 +186,7 @@ def test_fan_policy_v12_still_requires_the_coordination_block(
     tmp_path: Path,
 ) -> None:
     """v10 から塊を必須にした（v11 / v12 でも同じ）。v9 を補完しない（0078 §2.4）。"""
-    assert FAN_POLICY_CONFIG_VERSION == 12
+    assert FAN_POLICY_CONFIG_VERSION == 13
     documents = valid_documents()
     del documents["fan-policy.yaml"]["air_balance_coordination"]
     write_documents(tmp_path, documents)

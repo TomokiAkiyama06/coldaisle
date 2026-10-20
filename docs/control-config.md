@@ -176,6 +176,64 @@ Model を Production へ昇格させても authority は動かない（#104 と 
 v8からv9へは `authority_rollout` を追加してから `schema_version: 9` へ上げる。
 v1〜v8は自動補完せず起動前に拒否する。
 
+## Control Config v17・`fan-policy.yaml` v13・`safety.yaml` v5（#288 / 決定記録 0156 / 0152 §2.3）
+
+束ねた版 `CONTROL_CONFIG_VERSION` を 16 → 17 に上げ、`fan-policy.yaml` を schema version 12 → 13、
+`safety.yaml` を 4 → 5 にした（`fan-hardware.yaml` 2・`air-balance.yaml` 2 は変えない）。足したのは
+Workload Hint の単調性ゲート（0066 §2.1 (b)）の格子と `eps`、その上限の**形**で、値は 0066 §5 の 1 のとおり
+Stage A の実測で決める。**どちらの塊も省ける。** 既存の値（0119 が確定した `safety.yaml` の値を含む）は変えない。
+
+```yaml
+# fan-policy.yaml v13
+supervisor:
+  workload_hint:
+    # ...（v12 と同じ）
+    monotonicity_gate:
+      eps: {value: <Demand の許容誤差>, status: provisional}
+      eps_c: {value: <予測温度の許容誤差 ℃>, status: provisional}
+      previous_demand: {points: [<d1>, <d2>, <d3>]}    # 3系統それぞれに当て、直積を試す
+      temperature:                                     # 基準の context の target_band.*.upper_c からの差 ℃
+        cpu: {points: [<band の下>, <band の中>, <upper_c の付近>, <超過>]}
+        gpu: {points: [...]}
+      window_features:                                 # 温度以外の window feature（metric 名と絶対値）
+        - {metric: <metric 名>, points: [...]}
+      safety_floors:                                   # hard constraints の代表集合（書いた順を保つ）
+        - {front: <d>, rear: <d>, top: <d>}
+      baselines:                                       # baseline の代表集合
+        - {front: <d>, rear: <d>, top: <d>}
+```
+
+```yaml
+# safety.yaml v5
+workload_hint:
+  max_eps: {value: <Demand>, status: provisional}
+  max_eps_c: {value: <℃>, status: provisional}
+  max_eps_c_ceiling: {value: <℃>, status: provisional}   # max_eps_c の天井（0066 §2.1 (b)）
+```
+
+- 格子の (Regime, workload) は `context_overrides` の鍵そのもの（別に書かない。0156 §2.2）
+- 数値の軸は昇順の `points` の列で書く。認証領域のその軸の範囲は先頭〜末尾（0156 §2.3）
+- `safety_floors` には、Guard / Safety の floor が掛かっていないときの値（`zone_min_demand`）を含めることを推奨する。
+  含めなければ、その状態の tick が認証領域の外になり B0 と同じ振る舞いになるだけ（0156 §2.5 / §5 の 9）
+- **形**の誤り（未知の鍵・型の違い・`ConfigValue` の欄の欠落）は Control Config の不正（`config_invalid` の全 zone Max）。
+  **値**の制約（有限・非負・`max_eps < 1`・`max_eps_c <= max_eps_c_ceiling`・`eps <= max_eps`・`eps_c <= max_eps_c`・
+  `points` が1つ以上で狭義の昇順・Demand の軸が `[0, 1]`・代表集合の重複・点の数が 0）は読み込みでは検査せず、
+  ゲートの仕様の関数（`control/hint_gate.py` の `derive_hint_gate_spec`）が `eps_bounds_invalid` / `hint_gate_invalid` に
+  する。B1 / B2 を設定していても B0 に留まるだけで、起動は止めない（0156 §2.6 / §5 の 3）
+- ゲートの仕様の digest（証明書の部品 `hint_gate`）には `status` / `basis` と上限（`max_eps` ほか）を入れない。
+  根拠の書き直しや上限の変更だけでは再認証は要らない（0156 §2.7）。`eps` / 格子の値が変われば再認証が要る
+- 証明書の部品 `optimizer` は `mpc.optimizer` の全体・`mpc.budget_ms` に加えて `safety.yaml` の `zone_min_demand` /
+  `ramp_down_per_s` を束ねる（0156 §2.5）。これらを変えると、認証し直すまで B1 / B2 は B0 に留まる
+- この段では fand・Learned worker はまだ照合しない（0152 の段 3・段 4）。`shadow_mpc` / `active` の実効はいままでどおり B0
+- どの欄も `requested_demand` の手前（Learned MPC の Shadow solver と将来の B2 の context の選択）にしか効かず、
+  Reactive Guard と Critical Safety の値・経路は変えない。Critical Safety は `safety.yaml` の `workload_hint` を読まない
+
+**移行手順**: v12 / v4 を v13 / v5 として読まない（読み込み時に拒否する）。
+
+1. 運用の `fan-policy.yaml` を `schema_version: 13`、`safety.yaml` を `schema_version: 5` へ上げる（塊は省いてよい）。
+   片方だけ上げたファイルは拒否され、`config_invalid` の全 zone Max で止まる
+2. 新しいコードへ更新して再起動する。単調性ゲートの値は、Stage A の実測（0066 §5 の 1）と所有者の判断の後で入れる
+
 ## Control Config v16 と `fan-policy.yaml` v12（#319 / 決定記録 0133 §2.6 / 0064 §2.6〜§2.8 / 0066 §2.1 (a)）
 
 束ねた版 `CONTROL_CONFIG_VERSION` を 15 → 16 に上げ、`fan-policy.yaml` を schema version 11 → 12 にした

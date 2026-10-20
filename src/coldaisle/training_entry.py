@@ -14,7 +14,7 @@
    同じ spec と宣言で builder を走らせ、作り直した公開物の bytes（manifest と
    ``examples.jsonl``）が dataset と完全に一致することを求める（0112 §2.3）
 
-学習の CLI はまだ無い。CLI への配線は学習の CLI の PR で行う（0102 §2.3 と同じ扱い）。
+学習の CLI ``coldaisle-train``（``coldaisle.train``。決定記録 0150）が必須の引数でこの検査を呼ぶ。
 較正ファイルとの照合（:func:`~coldaisle.calibration_log.verify_training_calibration`）は、
 返した記録で呼び出し側が続けて行う。
 """

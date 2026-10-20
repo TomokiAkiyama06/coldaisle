@@ -66,8 +66,8 @@ def load(tmp_path: Path, documents: dict[str, Any]) -> ControlConfig:
 
 
 def test_versions_were_raised():
-    assert FAN_POLICY_CONFIG_VERSION == 12
-    assert CONTROL_CONFIG_VERSION == 16
+    assert FAN_POLICY_CONFIG_VERSION == 13
+    assert CONTROL_CONFIG_VERSION == 17
 
 
 def test_block_is_required(tmp_path):
