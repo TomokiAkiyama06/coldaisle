@@ -1330,6 +1330,26 @@ def _response_time(
     )
     if change is None:
         return None
+    # 変わった tick から窓の終わりまで trace が途切れていないこと（§2.3 の (1)〜(3) と (5) の
+    # mode・command_id）。欠けをまたいで「帯に留まった」とは言えないので、外れたら求めない
+    span = in_step[change:]
+    periods = {tick.period_ms for tick in span}
+    if (
+        len(periods) != 1
+        or None in periods
+        or len({tick.run_id for tick in span}) != 1
+        or span[0].run_id is None
+        or any(tick.mode != "manual" or tick.command_id != step.command_id for tick in span)
+    ):
+        return None
+    period = periods.pop()
+    assert period is not None
+    max_gap = config.coverage.trace_max_gap_ratio.value * period
+    if any(
+        later.tick_id != earlier.tick_id + 1 or not 0 <= later.ts_ms - earlier.ts_ms <= max_gap
+        for earlier, later in pairwise(span)
+    ):
+        return None
     settled: int | None = None
     for index in range(len(in_step) - 1, change - 1, -1):
         rpm = in_step[index].zones[step.zone].rpm
@@ -1868,6 +1888,9 @@ def aggregate_matrix(
         }
         if len(settings) > 1:
             reasons.append(TableStatus.LOAD_MISMATCH.value)
+        if len(members) > matrix.repetitions.value:
+            # 回の超過は組で絞る前の成功した回の数で見る。段ごとに別の 2 回を選んだまとめを作らない
+            reasons.append(TableStatus.TOO_MANY_REPETITIONS.value)
         entries: list[dict[str, Any]] = []
         for label in LABELS[1:]:
             for item in INDICATORS:

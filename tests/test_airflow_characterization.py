@@ -1261,3 +1261,33 @@ def test_markdown_shows_maxima_and_downward_timing(bench: Bench) -> None:
     text = ac.as_markdown(build(sweep_runs(bench, days=(0, 0, 0))))
     assert "最大 RPM" in text and "応答 ms（下り）" in text
     assert "| 2000 | 1500, 1500, 1500 | — |" in text
+
+
+def test_trace_gap_during_the_ramp_leaves_the_response_time_unknown(bench: Bench) -> None:
+    steps = sweep_steps("front", 1, T0, command_id=1, levels=(0.35, 0.40), down=())
+    bench.drive(steps, zone_fn=steady_rpm)
+    # 0.40 の段の 5〜15 s の tick を消す（記録の窓は 30 s 後からなので覆いは満たす）
+    start = steps[1]["start_ms"]
+    bench.conn.execute(
+        "DELETE FROM control_traces WHERE ts_ms >= ? AND ts_ms < ?", (start + 5 * S, start + 15 * S)
+    )
+    idle_readings(bench, T0, steps[-1]["end_ms"] + 10 * S)
+    db = bench.snapshot()
+    report = build([bench.manifest(manifest_doc("rpm_sweep", "r1", steps, db), "r1")])
+    step = report["rpm_sweep"]["steps"][1]
+    assert step["reason"] is None and step["response_ms"] is None
+    assert report["rpm_sweep"]["steps"][0]["response_ms"] == 1500
+
+
+def test_surplus_runs_are_counted_before_pair_filtering(bench: Bench) -> None:
+    def power(label: str | None, ts: int) -> float:
+        return 10.0 if label == "F+" and ts >= T0 + 2 * DAY else 0.0
+
+    paths = [
+        matrix_run(bench, f"m{day}", T0 + day * DAY, effects={"power.gpu.0": power})
+        for day in range(3)
+    ]
+    entries = build(paths)["response_matrix"]["aggregate"][0]["entries"]
+    f_plus = [entry for entry in entries if entry["label"] == "F+"]
+    assert {entry["reason"] for entry in f_plus} == {"too_many_repetitions"}
+    assert all(entry["mean"] is None for entry in entries)
