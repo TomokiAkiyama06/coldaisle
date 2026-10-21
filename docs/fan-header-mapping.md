@@ -285,8 +285,9 @@ GPU の Fan のサービスの下で 600 W のまま合格した（下の「GPU 
   （`Killing process … with signal SIGABRT`）、`TimeoutAbortSec` の SIGKILL を待たずに ExecStopPost の引き継ぎ
   （`safety_handoff_completed`）が Max を書いた。最悪の約 11 s（0119 §2.12）にはならなかった
 - **約 11 s の経路は実機では試さない。** 0154 は取り下げ、[0158](decisions/0158-t5-11s-path-component-assurance.md)（FINAL、2026-10-19）で、
-  実測済みの部品・テスト・解析で担保し、残るリスク（X1〜X3 と X5）を所有者が受け入れた。`watchdog_timeout_ms` を `confirmed` にするのは
-  0158 §2.5 の T1〜T3 のテストが入り、承認点 2 を得てから（0158 §2.6）。D 状態の hang は 0158 §5 の 2 のとおり調べてから決める。
+  実測済みの部品・テスト・解析で担保し、残るリスク（X1〜X3 と X5）を所有者が受け入れた。0158 §2.5 の T1〜T3 のテストは PR #355 で入った。
+  `watchdog_timeout_ms` を `confirmed` にするのは承認点 2 を得てから（0158 §2.6。案は決定記録 [0161](decisions/0161-fand-enable-prerequisites.md) §2.2）。
+  D 状態の hang は 0158 §5 の 2 のとおり調べてから決める（調べた結果と案は 0161 §2.1）。
   以下はそれまでの経緯: `SIGABRT` で fand が終わらない hang では `TimeoutAbortSec` の 5 s も待つので、
   低い Demand のまま約 11 s 続く。上の試行はすべて約 5.2 s で終わり、Max を確かめた直後に負荷を止めたので、その後の約 6 s の
   上がりを測っていない。0119 §2.13 は `watchdog_timeout_ms` に約 11 s の間の余裕を求めるので、上の表は `SIGABRT` で終わる経路の
@@ -387,8 +388,8 @@ fand を manual 0.35（3 zone とも）で動かし、`coldaisle-cpu-power` を 
 |---|---|---|---|
 | 最後の書き込みから、Top の reason に `cpu_power_unavailable` が出る tick まで | 7311 ms | 5000〜8500 ms（5000 ms + 収集の周期 2500 ms + 1 tick） | 合格 |
 | その間の fault・Top・safety state | fault は無し。Top は `bound_by` が `safety_floor` の 0.35 のまま。`normal` | fault が上がらず、Top が 0.35 のまま | 合格 |
-| その間の telemetry の健全度と Guard の閾値 | 記録に無い（下の注を参照） | `DEGRADED`・`conservative` | 未完了（0136 §2.3 の CI のテストで満たす。#308） |
-| 戻した後 | `SIGCONT` から 1.8 s（最後の書き込みから 32.3 s）の tick で `cpu_power_unavailable` が消えた | 新しい sample で power の項が戻り、健全度が `NORMAL` に戻る | power の項は合格。健全度が `NORMAL` に戻ることは未完了（0136 §2.3 の CI のテストで満たす。#308） |
+| その間の telemetry の健全度と Guard の閾値 | 記録に無い（下の注を参照） | `DEGRADED`・`conservative` | 合格（0136 §2.3 の CI のテストで満たした。#308 / PR #314。下の注を参照） |
+| 戻した後 | `SIGCONT` から 1.8 s（最後の書き込みから 32.3 s）の tick で `cpu_power_unavailable` が消えた | 新しい sample で power の項が戻り、健全度が `NORMAL` に戻る | power の項は合格。健全度が `NORMAL` に戻ることも合格（0136 §2.3 の CI のテストで満たした。#308 / PR #314） |
 
 - 一時停止の間に Reactive Guard は発火しなかった。Top の `bound_by` はずっと `safety_floor` で、判定できない試行にはならなかった
 - **健全度と Guard の閾値は、記録から直接は確かめられなかった。** 理由は次の 2 つ
@@ -396,10 +397,12 @@ fand を manual 0.35（3 zone とも）で動かし、`coldaisle-cpu-power` を 
   - `threshold_profile` は Guard の発火と解除のログにしか出ない
 - 所有者は 2026-10-15 に、この行を実機の観測の代わりに CI のテストで満たすことにした（[0136](decisions/0136-t7-t8-t9-acceptance-exceptions.md) §2.3）。
   テストは、`power.cpu.package` の時刻だけを古くした frame を、本番と同じ signal の組み立てから Reactive Guard まで通し、
-  健全度が `DEGRADED`・閾値が `conservative` になり、新しい sample で戻ることを確かめる。**テストが入るまでこの行は未完了。**
+  健全度が `DEGRADED`・閾値が `conservative` になり、新しい sample で戻ることを確かめる。テストは #308（PR #314）で入った:
+  `tests/test_control_loop.py` の `test_cpu_power_staleness_alone_degrades_health_and_makes_the_guard_conservative`。
   実機で `cpu_power_unavailable` が出て、fault が上がらなかったことは、テストの前提（収集の側が CPU Power を使えないと判定した）を裏付ける
 - 戻した後の T8 の全スレッドで、Guard の発火 4 回はすべて `threshold_profile` が `normal` だった。ただしこれは約 1 分後の値で、新しい sample を観測した tick の健全度を示さないので、合否の材料にしない
-- そのテストと、健全度と閾値を trace に載せることは #308 で行う。0123 §2.3 の、T1 で健全度が `NORMAL` だった時間の割合も、それまで数えられない
+- 健全度と閾値は #308（PR #314、`ControlTick` v15・決定記録 0137）で trace に載った。0123 §2.3 の、T1 で健全度が `NORMAL` だった時間の割合は
+  下の T1 の節にある（86400 tick すべて `NORMAL`）
 - T9 (a)（fand の計時の `telemetry.cpu_power_ms`）は、0123 §2.2 のとおり実機では行わず、CI のテストで確かめる
 
 ### T1: 24 時間の連続運転（2026-10-15 16:36:04〜2026-10-16 16:36:05）
@@ -431,6 +434,9 @@ reading と trace、fand の journal、`coldaisle-soak-report` の集計）。
   `cpu_cooling_floor` 150（Top だけ）・`startup_max` 51
 - `bound_by`（tick の数）: `requested` が Front / Rear 82669・Top 81263、`guard_floor` が Front / Rear 1319・Top 2577、`ramp_down` が
   Front / Rear 2395・Top 2394、Top の `safety_floor` 149、`forced_max` が各 17。`effective` は 3 zone とも 0.40〜1.00、平均は約 0.585
+- **起動の落ち着き（0126 §2.3）**: 起動（BIOS の制御の回転数から）の `startup` の 17 tick のうち、tick 16 の回転数（Front 1776・Rear 1528・
+  Top 2288 RPM）を全開とすると、±5% に入ったのは Rear・Top が tick 4、Front が tick 10（10000 ms）で、Demand が `ramp_down` で下がり始めた
+  tick 17（17001 ms）までどれも外れなかった（試験の記録の trace から 2026-10-21 に数えた。決定記録 0161 §2.2）
 - Learned は配備していないので、起動時に経路を開かずに運転する error が 1 件出た（T0 と同じ）。fand の journal の error はこれだけ
 - systemd の記録では、fand の CPU 時間は 24 時間で 4 分 46 s、メモリの最大は 288.7 MB
 
@@ -467,7 +473,10 @@ reading と trace、fand の journal、`coldaisle-soak-report` の集計）。
 
 ### 残り
 
-- T5 の約 11 s の経路（watchdog の最悪の時間）は実機では試さず、[0158](decisions/0158-t5-11s-path-component-assurance.md) で担保する。
-  残りは 0158 §2.5 の T1〜T3 のテスト（別の Issue）と、D 状態の hang の調べ（0158 §5 の 2: 予備確認から T1 までの journal と `dmesg` の
-  `hung_task`・`duration_ms` の外れ値・`write_failure` / `readback_mismatch`、T1 の 24 h の tick の最大の時間）
-- T1 は合格（2026-10-16、所有者が確認）。値の `status` を `confirmed` にするのは、所有者の承認を得てまとめて行う
+- 0121 の実機の試験はすべて終わった。T5 の約 11 s の経路は実機では試さず [0158](decisions/0158-t5-11s-path-component-assurance.md) で担保し、
+  0158 §2.5 の T1〜T3 のテストは PR #355（890949e）で入った。T9 (b) の健全度と Guard の閾値のテストは #308（PR #314）で入った
+- `enable` までに残る判断（D 状態の hang の受け入れ・承認点 2 で値の `status` を `confirmed` にすること・unit の時間の値・
+  HEAD へ更新した後の確認のやり直し・順序）は、決定記録 [0161](decisions/0161-fand-enable-prerequisites.md) で所有者に提案している。
+  D 状態の hang の調べ（0158 §5 の 2）の結果も 0161 §2.1 にある（2026-10-13 以降の `journalctl -k` の hung_task 0 件・T1 の `duration_ms` 最大 11 ms・
+  書き込みの失敗 0。予備確認から T1 の前までの trace は未確認）
+- T1 は合格（2026-10-16、所有者が確認）。値の `status` を `confirmed` にするのは、所有者の承認を得てまとめて行う（案は 0161 §2.2）
