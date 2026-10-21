@@ -1,12 +1,11 @@
 # 決定記録 0162: Workload Hint の B1（Shadow solver）の前に決める点 — fand の認証領域の再検査・集計の CLI・PR の切り方
 
 - **種別**: Decision Record
-- **Status**: Proposed
+- **Status**: FINAL（2026-10-21、リポジトリ所有者の承認。§5 の 1〜8 はすべて推奨の案）
 - **Date**: 2026-10-21
-- **Supersedes**: なし（推奨の案はどれも、[0133](0133-workload-hint-stage-b-prior-rollout.md) §2.5 / §2.5a / §2.8 / §2.9・
+- **Supersedes**: なし（採った案はどれも、[0133](0133-workload-hint-stage-b-prior-rollout.md) §2.5 / §2.5a / §2.8 / §2.9・
   [0152](0152-hint-monotonic-gate-certificate.md) §2.3 / §2.6 / §2.7・[0156](0156-hint-gate-spec-schema.md) §2.4 を置き換えず、
-  具体の形を補う。§5 の 1 で (b)・(d) を、§5 の 2 で (b) を選ぶ場合だけ置き換えが要る。そのときは承認の PR で
-  Supersedes を書き、旧記録へ `Superseded by` を追記する）
+  具体の形を補う。§5 の 1 の (b)・(d) や 2 の (b) なら置き換えが要ったが、どれも採っていない）
 - **関連**: [0041](0041-supervisor-proposal-freshness.md) / [0053](0053-control-shadow-mode-and-counterfactual-logging.md) /
   [0066](0066-workload-hint-stage-b-conditions.md) §2.1 (b)〜(d) /
   [0074](0074-supervisor-shadow-wiring-and-episode-evaluation.md) /
@@ -93,7 +92,7 @@ fand の受信と検証と記録・`ControlTick` の版上げ・learnd の `--hi
 
 ---
 
-## 2. Decision（推奨の案。§5 で所有者が選ぶ）
+## 2. Decision（2026-10-21 所有者が §5 の推奨の案で承認）
 
 ### 2.1 安全上の不変条件（どの案でも変えない）
 
@@ -119,7 +118,7 @@ fand の受信と検証と記録・`ControlTick` の版上げ・learnd の `--hi
 |---|---|---|
 | (a) worker が判定の入力を記録に載せる | worker が window の各格子時刻に当てた frame の `tick_id` と値を `record_json` に載せ、fand が自分の設定から導いた仕様で判定する | fand は値が自分の送った frame と一致するかまでは確かめられるが、**window の長さと格子は worker の申告**のまま（fand は artifact を読まない）。短い window を申告されれば、その分だけ判定が弱くなる。記録も horizon・offset に加えて window の分だけ大きくなる（`max_shadow_record_bytes`） |
 | (b) fand は自分の軸だけを判定する | 鍵（Regime, workload）・直前 Demand・safety floor・Baseline・最新の snapshot だけを fand が判定し、window の全 frame の判定は worker（子プロセス）に任せる | 単純。ただし 0133 §2.5 の「最終の判定を ML 側に置かない」から、window の判定だけが外れる。0133 §2.5 / 0152 §2.3 の一部を置き換えることになる |
-| **(c 推奨) fand が window を覆う区間を自分の frame で判定する** | fand は自分が MPC worker へ送り出した frame の軸の値を、設定の長さ `domain_lookback_ms` だけ環状に持つ。記録の元の tick から遡って `domain_lookback_ms` の区間（とその直前の 1 frame）の**すべての frame** が領域の中にあることを確かめる。worker は artifact の `window_ms` が frame で受け取った `domain_lookback_ms` 以下であることを確かめ、超えれば解かない | fand の判定は artifact にも worker の申告にも依らない。区間は window を含む（下の「覆う」の説明）ので、fand の判定は worker の判定より**厳しい側にしか**ずれない。最終の判定は fand と worker の両方が通ったときだけ、のまま |
+| **(c 推奨) fand が window を覆う区間を自分の frame で判定する** | fand は自分が MPC worker へ送り出した frame の軸の値を、設定の長さ `domain_lookback_ms` だけ環状に持つ。`supervisor_hint` を埋めた frame を送り出す時点で、その tick から遡って `domain_lookback_ms` の区間（とその直前の 1 frame）の**すべての frame** が領域の中にあることを確かめる。worker は artifact の `window_ms` が frame で受け取った `domain_lookback_ms` 以下であることを確かめ、超えれば解かない | fand の判定は artifact にも worker の申告にも依らない。区間は window を含む（下の「覆う」の説明）ので、fand の判定は worker の判定より**厳しい側にしか**ずれない。最終の判定は fand と worker の両方が通ったときだけ、のまま |
 | (d) fand が artifact の window の仕様だけを読む | 起動時に artifact の feature schema を読み、worker と同じ規則で window を組み立てる | 0077 §2.6（fand は artifact を読まない・deserialize しない）を置き換える。worker に届かなかった frame（`offer` で捨てた frame）を fand は区別できず、同じ window にはならない |
 
 **(c) を採る。** 詳細:
@@ -130,8 +129,22 @@ fand の受信と検証と記録・`ControlTick` の版上げ・learnd の `--hi
   context の `target_band`、`safety_floor`、`baseline` の requested、`applied`。frame そのものや他の signal は持たない。
   列に入れるのは送り出しの側（`learned_channel` の受付スレッドが枠から取り出して送った frame）で、**tick の中では
   何も待たない**（0077 §2.2。`offer` の形を変えない）
-- **区間**: 記録の元の tick（`source_tick_id` / `source_ts_ms`。列の中の値と一致しなければ `hint_record_rejected`）を
-  `N` とし、`snapshot.ts_ms` が `[source_ts_ms - domain_lookback_ms, source_ts_ms]` に入る frame と、その区間より前で
+- **判定は frame を送り出す時点で行い、結果を記録が届くまで保持する**（PR #365 の Codex P1 の 1）。Shadow の記録は
+  非同期に、元の frame より後の frame を何件も送った後に届きうる。届いた時点で区間を組み立て直すと、区間の古い frame が
+  列から押し出されていて、正しい記録まで拒むことになる。そこで:
+  - `supervisor_hint` を埋めた frame `N` を送り出すとき、区間（下）の frame はすべて送り出し済みなので、その場で下の
+    1〜5 を判定し、結果（合否と最初の外れの項目）を `N` の (`tick_id` / `snapshot.ts_ms` / `monotonic_ms`) を鍵にして
+    **保留の表**に置く。列は区間の長さ（`domain_lookback_ms` と、その直前の 1 frame）だけ持てばよい
+  - 保留の表の結果は、送り出しから `pending_domain_result_ms` の間だけ持ち、件数は `max_pending_domain_results` で
+    抑える（どちらも `config/learned-channel.yaml`。ルール 9）。上限を超えたら古いものから捨てる
+  - 記録が届いたとき、元の tick の結果が保留の表に無い（期限切れ・上限で捨てた・送り出していない）なら、**範囲の外として
+    扱う**: 記録は `recorded` のまま残し、fand の領域の判定を不合格、最初の外れの項目を `source_interval_unavailable`
+    とする（2 条件の再検査も行って残すが、領域の判定が不合格なので「両方が通った」にはならない）。値を推測で埋めない
+  - 結果を使った鍵は保留の表から消す（同じ元の tick の記録を2回通さない。2件目は `hint_record_rejected`）
+  - `pending_domain_result_ms` は、worker の Shadow の記録の期限（0133 §2.5 の「元の frame の次の基準の周期の開始
+    `next_due` を過ぎたら捨てる」）より長く置く。短すぎても正しい記録が範囲の外になるだけで、危険側には倒れない
+- **区間**: 送り出す frame（のちに届く記録の元の tick。記録の `source_tick_id` / `source_ts_ms` / `source_monotonic_ms` が
+  保留の表の鍵と一致しなければ、上のとおり範囲の外）を `N` とし、`snapshot.ts_ms` が `[source_ts_ms - domain_lookback_ms, source_ts_ms]` に入る frame と、その区間より前で
   最新の frame 1 つ（0107 §2.1 の as-of で window の先頭の格子時刻に当たりうる frame）を区間の frame とする
 - **覆う**: worker の window の格子時刻は `[action_ts_ms - window_ms, action_ts_ms]`（`action_ts_ms` は `N` の
   `snapshot.ts_ms`）で、各格子時刻の値は `snapshot.ts_ms <= t` で最新の frame から来る（0107 §2.1）。`window_ms <=
@@ -153,7 +166,7 @@ fand の受信と検証と記録・`ControlTick` の版上げ・learnd の `--hi
 - **`domain_lookback_ms` の置き場所**: `config/learned-channel.yaml`（ルール 9）。fand が読み、frame の
   `hint_certification`（0152 §2.6）に載せて worker へ渡す。worker は自分の設定ではなく frame の値で比べる
   （fand と worker で値が割れて、fand の区間が window より短くなることを作らない）
-- **証明書には束ねない**（§5 の 2）。`domain_lookback_ms` は解の結果に効かず、fand の判定を厳しくする向きにしか
+- **証明書には束ねない**（§5 の 2）。`domain_lookback_ms`（と保留の表の `pending_domain_result_ms` / `max_pending_domain_results`）は解の結果に効かず、fand の判定を厳しくする向きにしか
   働かない（短すぎれば worker が解かない。長ければ fand の外が増えるだけ）。0152 §2.3 のゲートの仕様の入力と、0156 §2.7 の
   正準な形・版の印 `hint-gate-spec-v1` は変えない
 - **2 条件の再検査**は 0133 §2.5 のまま、記録の両 plan の `requested_demand` と予測の全 offset を、fand が自分の設定から
@@ -167,7 +180,9 @@ fand の受信と検証と記録・`ControlTick` の版上げ・learnd の `--hi
 - **試験**（実機不要。ルール 7）: 区間の中の 1 frame だけ温度を範囲の外にすると fand が外にする（worker が window に
   使わない古い frame でも外になる＝厳しい側）・区間に `tick_id` の飛びがあると外・`window_ms > domain_lookback_ms` の
   artifact で子が `certification_mismatch`・証明書の `certified_domain` を書き換えても fand の判定が変わらない（0152 §2.8）・
-  fand の判定が worker の記録の中の判定結果に依らない
+  fand の判定が worker の記録の中の判定結果に依らない・元の frame の後に区間の長さを超えて frame を送った後に届いた
+  記録でも、保留の表の結果で正しく判定される・保留の期限を過ぎて届いた記録が `source_interval_unavailable` で範囲の外に
+  なる・同じ元の tick の2件目の記録が `hint_record_rejected`
 
 ### 2.3 論点 1 に付随: 記録の後に分かる理由と、worker が捨てた数の運び先
 
@@ -177,9 +192,19 @@ fand の受信と検証と記録・`ControlTick` の版上げ・learnd の `--hi
   `hint_record_rejected` / `certification_mismatch`（子の照合））は、`hint_shadow_records` の `status` / `reason` にだけ残す。
   trace は不変のまま書き直さない（0030 / 0133 §2.5a）。0133 §2.8 の表の語彙はそのまま使い、置き場所を分けるだけである
 - **worker が送らずに捨てた数**（`shadow_dropped_backpressure` / `shadow_record_too_large` と、子が作れない
-  `shadow_unavailable` の回数）は、worker が run の中の**累積の数**として持ち、送れた Shadow の記録のメッセージに毎回
+  `shadow_unavailable` の回数）は、worker が**自分のプロセスの中の累積の数**として持ち、送れた Shadow の記録のメッセージに毎回
   載せる。fand は最後に受け取った値を、以後の tick の trace のヒントの塊の新しい欄 `shadow_counters`（受け取っていなければ
-  `null`）に写す。数は増える向きにしか進まない（減った値を受け取ったら `hint_record_rejected`）
+  `null`）に写す
+- **数の epoch**（PR #365 の Codex P1 の 2）: fand の `run_id` が同じまま、worker のプロセスが再起動して接続し直すことが
+  ある（0077 §2.7 / 0115 §2.5）。新しいプロセスの数は 0 から始まる。そこで:
+  - worker はプロセスの起動ごとに1つ **`worker_instance_id`**（`run_id` と同じ形の乱数の識別子。個体識別子を含まない。
+    ルール 10）を作り、すべての Shadow の記録のメッセージに数と組で載せる。子の作り直しでは変えない（数は親が持つ）。
+    同じプロセスが接続し直したときも同じ値のまま
+  - 数は `(run_id, worker_instance_id)` を1つの epoch として、その中でだけ増える向きに進む。fand は epoch ごとに最後の値を持ち、
+    **同じ epoch の中で**どれかの数が減った記録だけを `hint_record_rejected` で捨てる。新しい `worker_instance_id` の記録は
+    新しい epoch として受け、前の epoch の値と比べない（再起動した worker の正しい記録を拒み続けない）
+  - trace の `shadow_counters` は `{worker_instance_id, 各数}` の形にし、その tick に fand が最後に受け取った epoch の値を写す。
+    前の epoch の最後の値はその epoch の最後の tick までの trace に残る
   - heartbeat には載せない（基準の経路のメッセージの形を変えない。0133 §2.5）
   - 限界: 最後の記録の後に捨てた分は fand に届かない。集計はこれを「下限」として示す（§2.4）
 - **語彙の追加**: `HintShadowReason` に `certification_mismatch`（0152 §2.6）を足す。`shadow_unavailable` は記録を作らず、
@@ -202,8 +227,16 @@ fand の受信と検証と記録・`ControlTick` の版上げ・learnd の `--hi
   母集団を 1 つにまとめない（0133 §2.2 の帰属の規律と同じ）
 - **出力**（同じ入力から同じ bytes。生成時刻を持たない）:
   - **段の数**: 候補になった tick（`stage: shadow_mpc` かつ `influence: would_override`）→ 届いた記録（`status` と
-    `reason` ごと）→ `recorded` → fand の領域の判定に通った → 2 条件に通った。worker が捨てた数（§2.3 の累積の数の最大）は
+    `reason` ごと）→ `recorded` → fand の領域の判定に通った → 2 条件に通った。worker が捨てた数（下）は
     「少なくともこれだけ」として別に示す。対応する trace が無い記録は「対応なし」として数え、捨てない（0133 §2.5a）
+  - **worker が捨てた数は区間ごとの差で数える**（PR #365 の Codex P1 の 3）。累積の数の最大をそのまま使うと、区間の前に
+    捨てた分まで区間に入る。manifest の区間ごと・§2.3 の epoch（`(run_id, worker_instance_id)`）ごとに:
+    - 基準値 = その epoch の、区間の開始より前で最後の tick の `shadow_counters` の値。区間の中の値 = 区間の終わりより前で
+      最後の tick の値。区間の数 = 区間の中の値 − 基準値
+    - 区間の開始より前にその epoch の値が無い（epoch の最初の値が区間の中にある）ときは基準値を 0 とし、その epoch の数に
+      「最初の記録より前の分（区間の前に捨てた分）を含みうる」の印を付ける
+    - 区間の数の合計は epoch の和。epoch を跨いで差を取らない（新しい epoch は 0 から始まる）
+    - 印の付いた epoch がある区間では、成功率の分母が多めでありうる（率は低めに出る）ことを出力に書く
   - **二重解法の成功率**: 「2 条件まで通った記録の数」を「届いた記録の数 + worker が捨てた数」で割った値を、分子と
     分母と一緒に出す。分母の定義を出力に書く。割合だけを出さない
   - **「ヒント有りが選ばれていたら」の差分**: `recorded` の記録について、系統ごとの `requested_demand` の差
@@ -227,7 +260,7 @@ fand の受信と検証と記録・`ControlTick` の版上げ・learnd の `--hi
 |---|---|---|
 | **PR-A frame と制御側の配線** | `LearnedFrame` v4（`supervisor_hint`・`hint_certification`（0152 §2.6 の期待値と `domain_lookback_ms`））。fand は実効の段階が B1 以上の tick だけ埋め、0133 §2.5 の関係（同じ tick・同じ regime・同じ policy の版・`target_band` だけが違う）を検査し、満たさなければ両方 `None`。RL worker への frame は常に `None`（0133 §2.2）。§2.2 の判定の関数。worker は v4 を受け、ヒントの欄を読まない | fand は埋めない（B0 のまま）。frame の版だけが上がる。fand と worker は同じ venv で入れ替わる（0157）ので、v3 / v4 の混在を扱わない |
 | **PR-B worker の Shadow solver の子プロセス** | 0133 §2.5 の子（`SCHED_IDLE` の確かめ・`PR_SET_PDEATHSIG`・1 枠の依頼・打ち切り時刻・作り直しの間隔）、子の照合（0152 §2.6・0157 §2.3 の `launch_form`）、残りの予算での二重解法（0160 §5 の 6 の入口）、§2.2 の worker の判定、ノンブロッキングで期限つきの転送（`SIOCOUTQ`・`MSG_DONTWAIT`・`SO_SNDBUF` の上乗せ・`max_shadow_record_bytes`）、§2.3 の累積の数、新しい受信の本文 `hint_shadow`。**learnd の `--hint-lockfile`**（0152 §5 の 4）と `deploy/systemd/coldaisle-learnd-mpc.service`・`docs/ubuntu-deploy.md` 6.8。決定論の試験と、実時間の試験（専用の marker。0133 §2.5） | 本文の型を `InboundBody` に足すと、いまの `server.py` は知らない型の本文でも末尾で生存の知らせ（`last_valid_mono_ms`）を数え直してしまう。そこで同じ PR で、fand の受信に `hint_shadow` を `unsupported_body` として捨て、生存に数えない分岐を足す（接続は切らない。§2.3）。frame に `supervisor_hint` が来ないので子は依頼を受けない |
-| **PR-C fand の受信・検証・記録と `ControlTick` の版上げ** | `hint_shadow` の受信と検証（新しさ・`run_id`・artifact・対の基準・証明書と `conditions` の digest。0133 §2.5 / 0152 §2.6）、§2.2 の環状の列と再検査、`hint_shadow_records` への書き込み（tick の外の書き手）と `record_json` の形、`HintShadowReason` の `certification_mismatch`、`ControlTick` v17（ヒントの塊に `certificate`（0152 §2.7）と `shadow_counters`（§2.3）。`WorkloadHintRecord` の版を上げる）、`airflow-trace.js` の `KNOWN_VERSIONS` と fixture（0133 §2.9）。**最後に `IMPLEMENTED_STAGE = SHADOW_MPC`** | 設定の `stage` の既定は `off` のまま。B1 が動くのは、所有者が設定を `shadow_mpc` にし、証明書を昇格し、0133 §2.6 の前提（RulePolicy の本番値・本番のホストでの実時間の試験の合格）を揃えたときだけ |
+| **PR-C fand の受信・検証・記録と `ControlTick` の版上げ** | `hint_shadow` の受信と検証（新しさ・`run_id`・artifact・対の基準・証明書と `conditions` の digest。0133 §2.5 / 0152 §2.6）、§2.2 の環状の列・送り出しの時点の判定と保留の表・再検査、§2.3 の epoch ごとの数の検査、`hint_shadow_records` への書き込み（tick の外の書き手）と `record_json` の形、`HintShadowReason` の `certification_mismatch`、`ControlTick` v17（ヒントの塊に `certificate`（0152 §2.7）と `shadow_counters`（§2.3）。`WorkloadHintRecord` の版を上げる）、`airflow-trace.js` の `KNOWN_VERSIONS` と fixture（0133 §2.9）。**最後に `IMPLEMENTED_STAGE = SHADOW_MPC`** | 設定の `stage` の既定は `off` のまま。B1 が動くのは、所有者が設定を `shadow_mpc` にし、証明書を昇格し、0133 §2.6 の前提（RulePolicy の本番値・本番のホストでの実時間の試験の合格）を揃えたときだけ |
 | **PR-D 集計の CLI** | §2.4 の `coldaisle-hint-shadow` | 読むだけ。制御に届かない |
 
 - `IMPLEMENTED_STAGE` を PR-C で上げるのは、fand の受信・検証・記録が無いまま B1 の frame を出すと、worker が解いた
@@ -267,7 +300,7 @@ fand の受信と検証と記録・`ControlTick` の版上げ・learnd の `--hi
 | トレードオフ | 緩和策 |
 |---|---|
 | fand の判定は window より長い区間を見るので、worker が使わない古い frame の外れでも記録を落とす | 厳しい側にしかずれない（B1 では記録が減るだけ）。`domain_lookback_ms` を artifact の `window_ms` に近づければ差は小さい。落ちた数は CLI の段の数に出る |
-| fand に区間の長さ分の環状の列が要る | 持つのは軸の値だけ。長さは設定で、送り出しの側で持ち、tick は待たない |
+| fand に区間の長さ分の環状の列と、記録を待つ保留の表が要る | 持つのは軸の値と判定の結果だけ。長さ・期限・件数は設定で抑え、送り出しの側で持ち、tick は待たない。保留が切れた記録は範囲の外になるだけ |
 | 2 条件の再検査は worker の予測に依る | B1 は適用しないので記録が汚れるだけ。B2 で扱う（§2.6） |
 | 最後の記録の後に worker が捨てた数は fand に届かない | CLI は数を「下限」として示す。heartbeat の形は変えない（基準の経路を変えない） |
 | 段 4 が 4 つの PR になる | 途中の main はどれも B0 のまま。PR ごとの差分が小さくなり、レビューで安全の不変条件（§2.1）を確かめやすい |
@@ -293,7 +326,12 @@ fand の受信と検証と記録・`ControlTick` の版上げ・learnd の `--hi
 
 ---
 
-## 5. 未決事項（所有者の判断を求める点。推奨を先頭に）
+## 5. 判断点（決定済み。推奨を先頭に）
+
+**所有者の決定（2026-10-21）**: 1〜8 のすべてを推奨の案で承認した。§2 の本文はその決定を書いたものである。
+PR #365 の Codex のレビュー（P1 3 件）で、承認の趣旨を変えずに次を足した（判定を厳しくする向きと、数え方の誤りの修正）:
+§2.2 の判定を送り出しの時点で行い記録が届くまで保持する（届く前に消えたら範囲の外）・§2.3 の数の epoch
+（`worker_instance_id`）・§2.4 の区間ごとの差での数え方
 
 | # | 判断点 | 選択肢（推奨を先頭） |
 |---|---|---|
@@ -306,5 +344,4 @@ fand の受信と検証と記録・`ControlTick` の版上げ・learnd の `--hi
 | 7 | 段 4 の PR の切り方と `IMPLEMENTED_STAGE` を上げる PR（§2.5） | **(a 推奨) PR-A frame → PR-B worker の子 → PR-C fand の受信・記録・`ControlTick` v17、PR-C の最後で上げる。PR-D に CLI** / (b) PR-B と PR-C をまとめる（差分が大きい）/ (c) 上げるのを、本番のホストでの実時間の試験の合格の後の別の PR にする |
 | 8 | learnd の `--hint-lockfile` を渡す unit（§2.5） | **(a 推奨) MPC の unit だけ（PR-B で `coldaisle-learnd-mpc.service` と `docs/ubuntu-deploy.md` 6.8 を変える）** / (b) 2 つの unit の両方（Supervisor の worker は使わない） |
 
-承認の後、§5 の選択で旧記録の置き換えが要る場合（1 の (b) / (d)、2 の (b)）は、承認の PR でこの記録の Supersedes と
-旧記録の `Superseded by` を書く。推奨の案だけなら置き換えは無い。
+推奨の案だけが採られたので、旧記録の置き換えは無い（Supersedes: なし）。
