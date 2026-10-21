@@ -3,7 +3,7 @@
 - **種別**: Decision Record
 - **Status**: FINAL（2026-10-22、リポジトリ所有者の判断）
 - **Date**: 2026-10-22
-- **Supersedes**: なし（[`0024`](0024-calibration.md) の §5 の 1「実機での較正」を行わないことだけを決める。0024 の仕組みは変えない）
+- **Supersedes**: [`0024`](0024-calibration.md) の §5 の 1「実機での較正」と §5 の 4「ベースライン測定より較正が先」のみ（0024 の仕組みと他の節は有効）
 - **関連**: [`0024`](0024-calibration.md) / [`0096`](0096-calibration-binding-digest.md) /
   [`0099`](0099-calibration-change-log.md) / [`0153`](0153-airflow-measurement-method.md) §2.9 / §2.10 /
   `docs/spec-review.md` W-02 / `docs/requirements.md` FR-107 / `docs/calibration.md`
@@ -50,6 +50,9 @@ DB の `calibration_activations` は 2026-10-11 の 1 行（全チャネル 0.0�
 - **0096 / 0099（較正の digest と変更の記録）**: offset 0.0 の digest のまま変わらない。Dataset v2・学習・
   Workload Hint の証明書の較正の部品も同じ digest を束ねる。
 - **#47**（24 時間連続運転）の #45 への依存は外れる。
+- **0024 §5 の 4**（ベースライン測定 #50 より較正が先）: 較正を行わないので、#50 は較正を待たない。#50 の閾値は §2.2 の誤差を前提に決める。
+- **運用の文書**: `docs/calibration.md` の冒頭と §4（`--apply`）、`config/rules.yaml` の `probe_changed` の hint に本記録を示し、
+  未較正の警告や `PROBE_CHANGED` に応じて `--apply` を実行しないようにする。`docs/requirements.md` の R-02 の対策と M2 の内容も本記録に合わせる。
 
 ### 2.4 見直す条件
 
