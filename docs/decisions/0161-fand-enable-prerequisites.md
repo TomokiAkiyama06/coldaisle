@@ -1,10 +1,10 @@
 # 決定記録 0161: fand を本番で `enable` する前に残っている判断（D 状態の hang・承認点 2 の値・unit の時間・HEAD での確認のやり直し・順序）
 
 - **種別**: Decision Record
-- **Status**: Proposed
+- **Status**: FINAL（2026-10-21、リポジトリ所有者の承認。§5 の 1〜8 はすべて推奨の案）
 - **Date**: 2026-10-21
 - **Supersedes**: なし（[`0158`](0158-t5-11s-path-component-assurance.md) §5 の 2・[`0080`](0080-fand-systemd-unit.md) §5 の 1 / 2・
-  [`0028`](0028-fan-control-contracts.md) §2.9 の承認点 2・[`0157`](0157-hint-runtime-launch-form.md) §5 の 4 の測定に答える案を出す。
+  [`0028`](0028-fan-control-contracts.md) §2.9 の承認点 2・[`0157`](0157-hint-runtime-launch-form.md) §5 の 4 の測定に答える。
   どの記録の決定も置き換えない。新しい安全の値は決めない）
 - **関連**: [`0119`](0119-safety-values-first-host.md) §2.6〜§2.13 /
   [`0121`](0121-hardware-test-procedure.md) §2.1 / §2.3〜§2.10 / §5 /
@@ -64,33 +64,60 @@
 
 Critical Safety・Reactive Guard・Fallback・hardware backend・引き継ぎ実行部（`safety_handoff.py`）は、T1 の後に変わっていない。
 
-## 2. Decision（提案）
+## 2. Decision
 
-各節に推奨の案を書く。代替案は §4、所有者が選ぶものは §5 に番号つきで並べる。
+所有者は 2026-10-21 に §5 の 1〜8 をすべて推奨の案で決めた。各節はその決定を書いたもので、代替案は §4 と §5 に残す。
 
 ### 2.1 D 状態の hang（0158 §5 の 2 の X4）
 
-**調べた結果**（2026-10-21）:
+**調べた結果**（2026-10-21。予備確認〜T1 の前は 2026-10-22）:
 
 | 調べたもの | 範囲 | 結果 |
 |---|---|---|
 | `journalctl -k` の `blocked for more than` / `hung_task` | 2026-10-13 以降（boot -1 の 10-13 以降と、boot 0 = 10-14 02:18 以降） | 0 件 |
 | T1 の fand の `duration_ms` | 2026-10-15 16:36〜10-16 16:36（86400 tick） | 最大 11 ms・p99.9 6 ms。`deadline_exceeded` 0 |
 | T1 の `write_failure` / `readback_mismatch` / `enable_reverted` | 同上 | 0 回 |
-| 予備確認（10-13）〜T1 の前の decision trace | 2026-10-13〜10-15 | **未確認**（DB が root でしか読めない） |
+| T1 の systemd の watchdog による終了と fand の再起動 | 同上 | 0 回（journal に `Watchdog timeout` は無い。fand の再起動 0 回） |
+| T1 の trace の欠け（tick の飛び） | 同上 | 無い（`tick_id` 0〜86399 が続き、停止時の集計の `ticks` 86400・`recorded` 86400・`trace_dropped` 0・`skipped_slots` 0。tick の間隔の最大 1023.96 ms） |
+| 予備確認（10-13）〜T1 の前の decision trace と fand の unit の journal（H1〜H4） | 2026-10-13 21:00〜10-15 16:36 | 試験の注入で説明できないものは 0（下の「予備確認〜T1 の前の結果」） |
 
 参考に、T8 の CPU の全スレッドの負荷を含む区間（2026-10-14 13:51〜、1684 tick）の journal でも `deadline_exceeded` は 0、
 `duration_ms` の最大は 7 ms だった（試験の記録の journal から数えた）。
 
-**推奨**: D 状態の hang の残るリスクを受け入れる。ただし `enable` の前に、所有者が予備確認〜T1 の前の trace を読み取りだけで数える
-（§2.5 の手順 2）。数えるのは、`faults` に `write_failure` / `readback_mismatch` が出た tick（**T2 の注入の区間 2026-10-14 02:26〜02:28 と
-T6 の試験の設定の区間は除く。ほかの試験の操作の区間は結果の節と照らす**）と、journal の `control tick` の `duration_ms` の外れ値（125 ms 以上。0121 §2.3 の合格の条件の値で、新しい値ではない）。
-どちらかが見つかったら受け入れを保留し、所有者に示し直す。
+**決定**: D 状態の hang の残るリスクを受け入れる。ただし `enable` の前に、所有者が予備確認〜T1 の前の記録を読み取りだけで数える
+（§2.5 の手順 2）。tick が完了しない止まり方（5 s を超えて I/O が戻らず watchdog で終わる。カーネルの hung task の検出の時間より短い）は
+`duration_ms` にも `faults` にも `hung_task` にも残らないので、次の 4 つをすべて数える。
+
+| # | 数えるもの | 見る場所 |
+|---|---|---|
+| H1 | `faults` に `write_failure` / `readback_mismatch` が出た tick | DB の写しの decision trace |
+| H2 | `control tick` の `duration_ms` の外れ値（125 ms 以上。0121 §2.3 の合格の条件の値で、新しい値ではない） | fand の journal |
+| H3 | systemd の watchdog による終了（`Watchdog timeout`・`Killing process … with signal SIGABRT`）と、fand の異常終了・再起動（`Main process exited` の `status=` がシグナルか 0 以外・`Scheduled restart job`） | fand の unit の journal（`journalctl -u coldaisle-fand`） |
+| H4 | trace の欠け: 1 回の起動の中で `tick_id` が飛ぶ、または続く 2 つの trace の `ts_ms` の差が 1500 ms 以上（0121 §2.3 の tick の間隔の条件の値） | DB の写しの decision trace |
+
+**試験の操作の区間は除く**（その区間の記録は結果の節と照らす）: 段階 5 の一部と承認点 3 の確認項目（2026-10-13。`kill -STOP` / `kill -KILL` / 再起動の連続）、
+T2 の注入（2026-10-14 02:26〜02:28。終了コード 7 と再起動）、T5（2026-10-14 09:47〜11:52 と 19:59〜10-15 01:00。`SIGSTOP` による watchdog の終了）、
+T0（2026-10-14 01:56 と 03:09。`0640` の DB の写しによる終了コード 5）、T3 の注入（2026-10-14 02:38〜02:46）、
+T6 の試験の設定の区間（2026-10-14 02:56〜03:03・07:46〜07:50・15:02〜15:12）。どの試験の操作にも当たらないものが 1 つでも見つかったら
+受け入れを保留し、所有者に示し直す。
+
+**予備確認〜T1 の前の結果**（2026-10-22。本番の DB の写しを読み取りだけ（`mode=ro`）で開き、journal は所有者の uid で読んだ）。
+これで上の確認は済んだ。
+
+| # | 範囲 | 結果 |
+|---|---|---|
+| H1 | `control_traces` の `ts` < 2026-10-15 16:36。58 run（10-13 21:40〜10-15 10:07） | `write_ok` / `readback_ok` が false の zone は T2 の注入の 2 run（10-14 02:26:20〜02:28:18）の中だけ（6 + 7 tick、fault は `enable_reverted`）。ほかの `faults` は T3（`*_telemetry_stale`、02:38〜02:46）と T6（`tach_stall`、03:01〜03:03）の注入の区間だけ |
+| H2 | 同上 | `duration_ms` の最大 15 ms（10-14 07:46 の run。ほかは 11 ms 以下）。`deadline_exceeded` 0 |
+| H3 | `coldaisle-fand.service` の journal、2026-10-13 21:00〜10-15 16:36 | `Watchdog timeout` → SIGABRT は 13 回で、すべて試験の `SIGSTOP` と時刻が合う: 10-13 21:18（0080 段階 5）・21:45（承認点 3 の予備確認）、10-14 09:53 / 10:00 / 10:07 / 10:45 / 11:14 / 11:27 / 11:39 / 11:52（T5）、20:30 / 20:42（T5 の GPU 600 W のやり直し）、10-15 00:45 / 00:58（T5、0130 の曲線）。SIGKILL（`status=9`）2 回は 10-13 21:18 / 21:46 の `kill -KILL` の確認。終了コード 7 の 2 回は T2（02:26:45 / 02:28:18）。終了コード 5 は 10-14 01:56 に 3 回と 03:09 に 3 回で、どれも `db_not_writable`（T0 と、その後片付けの間の権限の状態） |
+| H4 | H1 と同じ trace | 1 つの run の中で 1.5 s を超える tick の飛びは 0 |
+| — | `journalctl -k` の `hung_task` / `blocked for more than`（10-13 以降、boot -1 と 0） | 0 件（上の表と同じ） |
+
+試験の注入で説明できない watchdog の終了・異常終了・trace の欠け・D 状態の兆しは 0 だった。
 
 受け入れる理由:
 
 - この機械では、約 8 日の運転と試験（故障の注入を含む）の間に、カーネルが hung task を一度も報告していない
-- fand の tick は最大 11 ms で、hwmon の読み書きが driver の中で長く止まった兆しが無い
+- fand の tick は T1 で最大 11 ms、予備確認〜T1 の前で最大 15 ms で、試験の注入で説明できない watchdog の終了・trace の欠けも無い。hwmon の読み書きが driver の中で長く止まった兆しが無い
 - D 状態で fand が止まると trace が途絶える。0148 の `fand_trace_silent` が 60 s で warning を出す（§2.5 で `enable` と同時に有効にする）。
   **ただしこれは知らせるだけで Max にはしない。夜間（22〜7 時）は warning が届かない**（0148 §2.7）
 - チップの保護（CPU 95 °C・GPU の T.Limit のクロックの制限）と、fand と別のプロセスで動く GPU の Fan（0128）は、fand の hang の影響を受けない（0119 §2.12・0158 §2.3）
@@ -117,27 +144,37 @@ T6 の試験の設定の区間は除く。ほかの試験の操作の区間は�
 | `write_fail_emergency_after` | 3 | T2: Front の注入で 3 回目の評価で `EMERGENCY`、一時的な失敗は 1 tick で戻り `EMERGENCY` にならない。T1: 書き込みの失敗 0 回 | `0119 §2.7 / 0121 §2.4 T2・§2.3 T1 / 0161 §2.2` |
 | `hardware_write_fail_exit_ms` | 5000 | T2: Front・Top とも `failing_ms` 5001 で終了コード 7、引き継ぎが 3 zone に Max（`applied`）、再起動の takeover は成功し終了コード 7 を繰り返さない | `0119 §2.10・§2.12 / 0080 §2.6 / 0121 §2.4 T2 / 0161 §2.2` |
 | `ramp_down_per_s` | 0.05 | T4: 下降率の最大 0.0500 / 0.0501 /s、アイドル・GPU 300 W とも温度の上がりは 3 °C 未満 | `0119 §2.9 / 0121 §2.6 T4 / 0126 §2.3 / 0161 §2.2` |
-| `startup_settle_ms` | 15000 | T4: 全開の ±5% まで Front 最長 12841 ms（+ 1500 = 14341 ms < 15000）。T1: 起動の直後を含め `tach_stall` 0 回。T1 の起動（BIOS の制御の回転数から）で、3 zone とも遅くとも 10000 ms（tick 10）までに全開の ±5% に入り、Demand が下がり始めた tick 17（17001 ms）までそこに留まった（下の注） | `0126 §2.1・§2.3 / 0121 §2.6 T4・§2.3 T1 / 0161 §2.2` |
+| `startup_settle_ms` | 15000 | T4: 全開の ±5% まで Front 最長 12841 ms（+ 1500 = 14341 ms < 15000）。T1: 起動の直後を含め `tach_stall` 0 回。T1 の起動（BIOS の制御の回転数から）で、3 zone とも遅くとも 12001 ms（tick 12）までに全開の ±5% に入り、Demand が下がり始めた tick 17（17001 ms）までそこに留まった。全開は T4 で独立に測った値（下の注） | `0126 §2.1・§2.3 / 0121 §2.6 T4・§2.3 T1 / 0161 §2.2` |
 | `fault_clear_hold_ms` | 30000 | T3: 解消まで 30001 / 31000 / 30001 ms で途中に出入りしない、温度と tach は 30 s より短く落ち着く。T2 の一時的な失敗: 30 s の保持の後 `normal` | `0119 §2.9 / 0121 §2.5 T3・§2.4 T2 / 0124 / 0161 §2.2` |
 | `cpu_power_cooling_floor` | 100 W → 0.35、200 W → 1.0 | T8: 全スレッドの 3 回で 2.1〜3.8 s で効き、範囲の外の tick 0、195 W 以上を含む。途中の補間は CI の `test_cpu_power_jump_raises_the_top_floor_even_when_the_cpu_is_cool` | `0119 §2.4 / 0123 §2.1 / 0136 §2.2（両端の 2 点。途中は CI のテスト）/ 0161 §2.2` |
 
 注（`startup_settle_ms`）: 0126 §2.3 は T1 の起動の記録で「Demand が下がり始めるまでに 3 zone が全開の ±5% に入っていること」を確かめるとしたが、
-`docs/fan-header-mapping.md` の T1 には `tach_stall` 0 回だけが書かれていた。T1 の試験の記録（DB から書き出した trace）の最初の 25 tick を
-読み、tick 16（`startup` の最後）の回転数（Front 1776・Rear 1528・Top 2288 RPM）を全開とすると、±5% に入ったのは Rear・Top が tick 4、
-Front が tick 10 で、どれも tick 17 で `ramp_down` が始まるまで外れなかった。本記録の PR で `docs/fan-header-mapping.md` の T1 にも足す。
+`docs/fan-header-mapping.md` の T1 には `tach_stall` 0 回だけが書かれていた。そこで T1 の試験の記録（DB から書き出した trace）の最初の 25 tick を読んだ。
+全開の回転数は、同じ起動の値を使うと届いていない値を基準にしうるので、**T4 の起動の落ち着きの 3 回（2026-10-14、`ctl max` を 30 s 保った後の
+回転数。試験の記録の目印）で独立に測った値**を使う: Front 1795 / 1792 / 1790・Rear 1578 / 1548 / 1546・Top 2368 / 2364 / 2343 RPM。
+判定は、T4 のどの回を全開としても ±5% に入っていること（下端は 3 回の最も高い全開の 95%、上端は最も低い全開の 105%）とした。
+
+| zone | T4 の全開（3 回） | 判定の範囲 | T1 で入った tick | tick 17 まで |
+|---|---|---|---|---|
+| Front | 1790〜1795 | 1705.3〜1879.5 | tick 12（12001 ms、1741 RPM） | 外れない（1741〜1776） |
+| Rear | 1546〜1578 | 1499.1〜1623.3 | tick 6（6001 ms、1523 RPM） | 外れない（1523〜1582） |
+| Top | 2343〜2368 | 2249.6〜2460.2 | tick 4（4001 ms、2250 RPM） | 外れない（2250〜2347） |
+
+3 zone とも tick 12（12001 ms）までに入り、Demand が `ramp_down` で下がり始めた tick 17（17001 ms）までそこに留まった。
+本記録の PR で `docs/fan-header-mapping.md` の T1 にも足す。
 
 **tick 系の 3 つ（`tick_ms` / `tick_deadline_ms` / `overrun_consecutive_limit`）の確定は、Learned を配備しない運用に限る**
 （0121 §2.1・§5 の 1）。worker の unit（`coldaisle-learnd-*`）を起動するときは 0121 §2.3 の soak をやり直す。`basis` にそう書く。
 
 **`confirmed` にする作業は所有者が `sudo` で行う。** 導入先の `/etc/coldaisle/control-config/safety.yaml` はリポジトリに置かず、
-本記録の作業では読めない。§2.5 の手順 4 で、Control Config の移行と同じ編集で行う（推奨。§5 の 7）。書き換えた後、fand の起動ログの
+本記録の作業では読めない。§2.5 の手順 4 で、Control Config の移行と同じ編集で行う（§5 の 7）。書き換えた後、fand の起動ログの
 `safety_config_is_provisional` が false になることを確かめる（true なら `provisional` の項目が残っている）。
 
 ### 2.3 unit の時間の値と `Nice=` などの扱い（0080 §5 の 1 / 2）
 
 **時間の値**（`deploy/systemd/coldaisle-fand.service` の今の値。変えない）:
 
-| 項目 | 今の値 | 推奨 | 根拠 |
+| 項目 | 今の値 | 決定 | 根拠 |
 |---|---:|---|---|
 | `WatchdogSec` | 5s | 確定 | `watchdog_timeout_ms` と同じ（0080 §2.3・0119 §2.10）。§2.2 の `watchdog_timeout_ms` と一緒に確定する |
 | `TimeoutAbortSec` | 5s | 確定 | 0158 の解析の前提（`WatchdogSec` + `TimeoutAbortSec` ≤ 10 s）。PR #355 の `tests/test_deploy_templates.py` がこの合計を超えないことを守る。短くする案（0127 §5 の 2 の (b)）は所有者が 0158 §5 の 1 で選ばなかった |
@@ -145,10 +182,10 @@ Front が tick 10 で、どれも tick 17 で `ramp_down` が始まるまで外�
 | `RestartSec` | 2 | 確定 | 異常終了の後は `ExecStopPost` が Max を書いてから待つので、待つ間は Max（0080 §2.4）。段階 5・T2 で再起動と takeover が通り、終了コード 7 の繰り返しにならなかった |
 | `TimeoutStartSec` | 30s | **§2.4 の `READY=1` の測定の後に確定** | `READY=1` は takeover の前に送る（`control_daemon.py`）ので、時間切れでも制御は取っておらず BIOS の制御のまま（再起動を繰り返す）。T1 の起動（`d3c5404`）は `Starting` から `Started`（`READY=1`）まで約 0.51 s。HEAD の形（`-I -m`）では測っていない |
 
-`TimeoutStartSec` の合格の目安は、§2.4 で測った最長が `TimeoutStartSec` の**半分（15 s）未満**とする（推奨。§5 の 3）。
+`TimeoutStartSec` の合格の目安は、§2.4 で測った最長が `TimeoutStartSec` の**半分（15 s）未満**とする（§5 の 3）。
 これは unit の猶予の余裕の目安で、安全の値ではない。満たさなければ `enable` せず、0157 §5 の 4 のとおり別の記録で扱う。
 
-**`Nice=` / `CPUWeight=` / `OOMScoreAdjust=`**: **置かない**（推奨）。
+**`Nice=` / `CPUWeight=` / `OOMScoreAdjust=`**: **置かない**（§5 の 4）。
 
 - CPU の負荷: T1（普段の使い方）で `deadline_exceeded` 0・`duration_ms` 最大 11 ms、T8 の CPU の全スレッドの負荷を含む区間でも
   `deadline_exceeded` 0・最大 7 ms（期限 250 ms）。overrun を抑える手当てが要る兆しが無い
@@ -160,9 +197,22 @@ Front が tick 10 で、どれも tick 17 で `ramp_down` が始まるまで外�
 ### 2.4 HEAD へ更新した後にやり直す確認
 
 §1.3 のとおり、T1 の後に変わったのは起動の形・Workload Hint・loop の trace の欄・DB・設定の版で、Critical Safety・Guard・Fallback・
-hardware backend・引き継ぎ実行部は変わっていない。そこで、変わった部分を通る経路だけを短く確かめる（推奨。§5 の 6）。
+hardware backend・引き継ぎ実行部は変わっていない。そこで、変わった部分を通る経路だけを短く確かめる（§5 の 6）。
 
-**前提**: `fan-policy.yaml` の `supervisor.workload_hint.stage` は **`off`** にする（推奨。§5 の 5）。`off` なら Workload Hint の読み手の
+**対象の版を `5ff6f96` に固定する。** 短くしてよい根拠は `d3c5404..5ff6f96` の差分の確認（§1.3）だけで、それより後の版は確かめていない。
+導入先へ入れるのは `5ff6f96` とする。それより後の commit を入れるなら、入れる前に `5ff6f96..<commit>` の `src/`・`deploy/`・`uv.lock` の差分を見て、
+次のどれかに差分があれば、R1〜R3 で足りるかの判断をやり直す（所有者が判断し、足りなければ新しい決定記録で範囲を決める）。判断の前に
+その commit を入れない。
+
+- `src/coldaisle/control/`・`src/coldaisle/control_daemon.py`・`src/coldaisle/safety_handoff.py`（Critical Safety・Guard・Fallback・hardware backend・引き継ぎ）
+- fand が起動時と tick の中で使うもの: `src/coldaisle/store/`（migration を含む）・`src/coldaisle/workload_hint_reader/`・`src/coldaisle/learned_channel/`・
+  `src/coldaisle/control_admin/`・`src/coldaisle/local_socket.py`・`src/coldaisle/hint_certification.py` ほか `control_daemon.py` が import する module
+- `deploy/systemd/coldaisle-fand.service`・`deploy/udev/`・`uv.lock`
+- `ControlTick` の版（R3 は v16 を期待する）と Control Config の版（§2.5 の手順 4 は v17 を前提にする）
+
+これらに差分が無いと確かめた commit なら、R1〜R3 をそのまま使ってよい。
+
+**前提**: `fan-policy.yaml` の `supervisor.workload_hint.stage` は **`off`** にする（§5 の 5）。`off` なら Workload Hint の読み手の
 スレッドも証明書の照合も動かず（`_open_workload_hint`）、T1 から増えるのは loop の trace の欄だけになる。worker の unit は起動しない。
 
 | # | 確認 | 手順 | 合格の条件 | 根拠 | 所要 |
@@ -174,7 +224,7 @@ hardware backend・引き継ぎ実行部は変わっていない。そこで、�
 合計で約 3.5 時間（設定の移行を除く）。どれかが条件を満たさなければ `enable` せず、結果を所有者に示す。結果は `docs/fan-header-mapping.md` の
 「0121 の試験の結果」の後に「HEAD での確認」として残す（`/opt` の版・trace の版を書く。実機のホスト名・path は書かない）。
 
-この表は今回の更新（`d3c5404` → HEAD）だけのもので、`enable` の後の `/opt` の更新で何をやり直すかの一般の規定ではない（§5 の 8）。
+この表は今回の更新（`d3c5404` → `5ff6f96`）だけのもので、`enable` の後の `/opt` の更新で何をやり直すかの一般の規定ではない（§5 の 8）。
 
 ### 2.5 `enable` までの順序（所有者の手順）
 
@@ -182,9 +232,10 @@ hardware backend・引き継ぎ実行部は変わっていない。そこで、�
 
 | # | 手順 | 参照 |
 |---|---|---|
-| 1 | 本記録を承認する（§5 の選択を含む。PR のマージで FINAL） | — |
-| 2 | （§5 の 1 で推奨を選んだとき）予備確認〜T1 の前の trace と journal を、DB の写しで読み取りだけで数える（§2.1）。見つかれば止めて示し直す | §2.1 |
-| 3 | DB に書くものをすべて止め、`/opt/coldaisle` をその時点の main へ更新し、root で venv を同期し、`coldaisle-rollup` で migration（0014〜0016）を当てる。`/etc/coldaisle/internal-telemetry.yaml` の写しの差分も見る | `docs/ubuntu-deploy.md` 2 / 4「コードを更新するとき」/ 4.1 |
+| 1 | 本記録の承認（2026-10-21。§5 の 1〜8 はすべて推奨の案） | — |
+| 2 | 予備確認〜T1 の前の記録（H1〜H4）を、DB の写しと journal で読み取りだけで数える（§2.1）。試験の操作に当たらないものが見つかれば止めて示し直す。**2026-10-22 に済んだ（0 件）** | §2.1 |
+| 3 | DB に書くものをすべて止め（`coldaisle-rollup.timer` / `coldaisle-report.timer` と `coldaisle-daemon` / `coldaisle-api` / `coldaisle-telemetry`。常駐させていれば `coldaisle-eventd` も。fand は止まっている）、`/opt/coldaisle` を **`5ff6f96`** へ更新し（後の commit なら §2.4 の差分の確認を先に行う）、root で venv を同期し、`coldaisle-rollup` を 1 回だけ手で走らせて migration（0014〜0016）を当てる。`/etc/coldaisle/internal-telemetry.yaml` の写しの差分も見る | `docs/ubuntu-deploy.md` 2 / 4「コードを更新するとき」/ 4.1 / §2.4 |
+| 3a | **止めた書き手とタイマーを起動し直す**（`coldaisle-daemon` / `coldaisle-api` / `coldaisle-telemetry`、止めていれば `coldaisle-eventd`、続けて `coldaisle-rollup.timer` / `coldaisle-report.timer`）。R1〜R3 の前に、`air.*` と内部の telemetry の新しい sample が DB に届いていることを確かめる（届かないまま fand を動かすと stale で Max・`fault_demand` になり、R3 の stale 0 回を満たせない） | `docs/ubuntu-deploy.md` 4「コードを更新するとき」の手順 3 |
 | 4 | Control Config を移行する: `fan-policy.yaml` を v13 にして `supervisor.workload_hint: {stage: off}` を足し、`safety.yaml` を v5 にする（両方そろえる）。**同じ編集で** §2.2 の 15 項目の `status` を `confirmed`・`basis` を §2.2 の文言にする | `docs/control-config.md` の v16 / v17 の移行手順 / 6.2 / §2.2 |
 | 5 | fand の unit を `-I -m` の形へ置き直し、導入先で書き換えていた行（`WatchdogSec=`・`--t-sensor-metric`）を戻し、`systemd-analyze verify` と `ExecStart=` を確かめる。引き継ぎ実行部の `exit=0` も見る | 6.9 の手順 1〜4 / 6.5 |
 | 6 | §2.4 の R1〜R3 を行い、結果を残す。fand の起動ログの `safety_config_is_provisional` が false であることを見る | §2.4 / 6.9 の手順 7 |
@@ -197,7 +248,7 @@ hardware backend・引き継ぎ実行部は変わっていない。そこで、�
 
 ### 良くなること
 
-- `enable` の前に残る判断が 1 か所にそろい、所有者が §5 を選べば手順どおりに進められる
+- `enable` の前に残る判断が 1 か所にそろい、§2.5 の手順どおりに進められる
 - 承認点 2 の値ごとに根拠の試験と `basis` が対応づき、後で値を見直すときの比較の基準になる
 - T1 の版と HEAD の差のうち、変わった経路だけを短く確かめるので、24 h の soak をやり直さずに済む
 
@@ -220,15 +271,17 @@ hardware backend・引き継ぎ実行部は変わっていない。そこで、�
 | unit の `TimeoutAbortSec` を短くする | 0158 §5 の 1 で所有者が選ばなかった。新しい安全の値を決めることになる |
 | 承認点 2 の status を今の `safety.yaml` v4 のまま先に書き換える | 書き換えは手順 4 の移行でもう一度 `safety.yaml` を開くので、2 回に分けると食い違いの機会が増える。§5 の 7 の選択肢には残す |
 
-## 5. 未決事項（所有者が選ぶ。推奨を先頭に）
+## 5. 判断点（決定済み。推奨を先頭に）
 
-| # | 内容 | 選択肢（推奨を先に） | 時期 |
-|---|---|---|---|
-| 1 | D 状態の hang（0158 §5 の 2）を受け入れるか | **(推奨) 受け入れる。`enable` の前に予備確認〜T1 の前の trace と journal を所有者が数え（§2.1・§2.5 の 2）、何も無ければそのまま** / 受け入れる。予備確認〜T1 の前は数えない（journal の hung_task 0 件と T1 で足りるとする）/ 受け入れず、手当てを決めるまで `enable` しない | 承認点 3 の前 |
-| 2 | §2.2 の表の 15 項目を `confirmed` にするか | **(推奨) 表のとおり、値を変えずに `confirmed`。tick 系の 3 つは Learned を配備しない運用に限ると `basis` に書く** / 一部を `provisional` のまま残す（どれを残すかを示す。0121 §2.10 の「すべてそろってから承認点 3」に当たらなくなる） | 承認点 3 の前 |
-| 3 | unit の時間の値 | **(推奨) `WatchdogSec` 5s・`TimeoutAbortSec` 5s・`TimeoutStopSec` 10s・`RestartSec` 2 を確定。`TimeoutStartSec` 30s は R2 の最長が 15 s 未満なら確定** / `TimeoutStartSec` も R2 の最長が 30 s 未満なら確定（余裕の目安を置かない）/ どれも暫定のまま `enable` する | `enable` の前（R2 の後） |
-| 4 | `Nice=` / `CPUWeight=` / `OOMScoreAdjust=`（0080 §5 の 2） | **(推奨) 置かない。Learned の配備か、overrun・OOM の終了が出たときに見直す** / `OOMScoreAdjust=` だけ負の値で置く（値は別に決める）/ 3 つとも置く（値は別に決める） | `enable` の前 |
-| 5 | `enable` のときの Workload Hint の `stage` | **(推奨) `off`。B0 を始めるときに R3 を読み手のスレッドを含めてやり直す** / `observe`（B0）で `enable` し、R3 を `observe` で行う（0133 §2.6 の前提も要る） | 手順 4 |
-| 6 | HEAD での確認のやり直しの範囲 | **(推奨) §2.4 の R1〜R3（約 3.5 時間）** / T1（24 h）をやり直す / R1 と R2 だけ（soak を省く） | 手順 6 |
-| 7 | 承認点 2 の status を書き換える時期 | **(推奨) 手順 4 の Control Config の移行と同じ編集** / 先に今の `safety.yaml` v4 で書き換えてから移行する | 手順 4 |
-| 8 | `enable` の後に `/opt` を更新するとき、何をやり直すかの一般の規定 | **(推奨) 本記録では決めない。最初の更新の前に別の記録で決める（変わった部分で R1〜R3 のどれをやり直すかの決まり）** / 本記録の §2.4 を常にやり直す（毎回 3.5 時間） | `enable` の後の最初の更新の前 |
+**所有者の決定（2026-10-21）**: 1〜8 のすべてを推奨の案で決めた。§2 の本文はその決定を書いたものである。
+
+| # | 内容 | 選択肢（推奨を先に） | 時期 | 決定 |
+|---|---|---|---|---|
+| 1 | D 状態の hang（0158 §5 の 2）を受け入れるか | **(推奨) 受け入れる。`enable` の前に予備確認〜T1 の前の trace と journal を所有者が数え（§2.1・§2.5 の 2）、何も無ければそのまま** / 受け入れる。予備確認〜T1 の前は数えない（journal の hung_task 0 件と T1 で足りるとする）/ 受け入れず、手当てを決めるまで `enable` しない | 承認点 3 の前 | 決定済み（所有者、2026-10-21）: 推奨の案。確認は 2026-10-22 に済んだ（§2.1。試験の注入で説明できないものは 0） |
+| 2 | §2.2 の表の 15 項目を `confirmed` にするか | **(推奨) 表のとおり、値を変えずに `confirmed`。tick 系の 3 つは Learned を配備しない運用に限ると `basis` に書く** / 一部を `provisional` のまま残す（どれを残すかを示す。0121 §2.10 の「すべてそろってから承認点 3」に当たらなくなる） | 承認点 3 の前 | 決定済み（所有者、2026-10-21）: 推奨の案 |
+| 3 | unit の時間の値 | **(推奨) `WatchdogSec` 5s・`TimeoutAbortSec` 5s・`TimeoutStopSec` 10s・`RestartSec` 2 を確定。`TimeoutStartSec` 30s は R2 の最長が 15 s 未満なら確定** / `TimeoutStartSec` も R2 の最長が 30 s 未満なら確定（余裕の目安を置かない）/ どれも暫定のまま `enable` する | `enable` の前（R2 の後） | 決定済み（所有者、2026-10-21）: 推奨の案 |
+| 4 | `Nice=` / `CPUWeight=` / `OOMScoreAdjust=`（0080 §5 の 2） | **(推奨) 置かない。Learned の配備か、overrun・OOM の終了が出たときに見直す** / `OOMScoreAdjust=` だけ負の値で置く（値は別に決める）/ 3 つとも置く（値は別に決める） | `enable` の前 | 決定済み（所有者、2026-10-21）: 推奨の案 |
+| 5 | `enable` のときの Workload Hint の `stage` | **(推奨) `off`。B0 を始めるときに R3 を読み手のスレッドを含めてやり直す** / `observe`（B0）で `enable` し、R3 を `observe` で行う（0133 §2.6 の前提も要る） | 手順 4 | 決定済み（所有者、2026-10-21）: 推奨の案 |
+| 6 | HEAD での確認のやり直しの範囲 | **(推奨) §2.4 の R1〜R3（約 3.5 時間）** / T1（24 h）をやり直す / R1 と R2 だけ（soak を省く） | 手順 6 | 決定済み（所有者、2026-10-21）: 推奨の案 |
+| 7 | 承認点 2 の status を書き換える時期 | **(推奨) 手順 4 の Control Config の移行と同じ編集** / 先に今の `safety.yaml` v4 で書き換えてから移行する | 手順 4 | 決定済み（所有者、2026-10-21）: 推奨の案 |
+| 8 | `enable` の後に `/opt` を更新するとき、何をやり直すかの一般の規定 | **(推奨) 本記録では決めない。最初の更新の前に別の記録で決める（変わった部分で R1〜R3 のどれをやり直すかの決まり）** / 本記録の §2.4 を常にやり直す（毎回 3.5 時間） | `enable` の後の最初の更新の前 | 決定済み（所有者、2026-10-21）: 推奨の案 |

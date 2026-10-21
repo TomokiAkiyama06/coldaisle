@@ -286,8 +286,8 @@ GPU の Fan のサービスの下で 600 W のまま合格した（下の「GPU 
   （`safety_handoff_completed`）が Max を書いた。最悪の約 11 s（0119 §2.12）にはならなかった
 - **約 11 s の経路は実機では試さない。** 0154 は取り下げ、[0158](decisions/0158-t5-11s-path-component-assurance.md)（FINAL、2026-10-19）で、
   実測済みの部品・テスト・解析で担保し、残るリスク（X1〜X3 と X5）を所有者が受け入れた。0158 §2.5 の T1〜T3 のテストは PR #355 で入った。
-  `watchdog_timeout_ms` を `confirmed` にするのは承認点 2 を得てから（0158 §2.6。案は決定記録 [0161](decisions/0161-fand-enable-prerequisites.md) §2.2）。
-  D 状態の hang は 0158 §5 の 2 のとおり調べてから決める（調べた結果と案は 0161 §2.1）。
+  `watchdog_timeout_ms` を `confirmed` にするのは承認点 2 を得てから（0158 §2.6。項目と `basis` は決定記録 [0161](decisions/0161-fand-enable-prerequisites.md) §2.2）。
+  D 状態の hang は 0158 §5 の 2 のとおり調べてから決める（調べた結果と決定は 0161 §2.1）。
   以下はそれまでの経緯: `SIGABRT` で fand が終わらない hang では `TimeoutAbortSec` の 5 s も待つので、
   低い Demand のまま約 11 s 続く。上の試行はすべて約 5.2 s で終わり、Max を確かめた直後に負荷を止めたので、その後の約 6 s の
   上がりを測っていない。0119 §2.13 は `watchdog_timeout_ms` に約 11 s の間の余裕を求めるので、上の表は `SIGABRT` で終わる経路の
@@ -434,8 +434,9 @@ reading と trace、fand の journal、`coldaisle-soak-report` の集計）。
   `cpu_cooling_floor` 150（Top だけ）・`startup_max` 51
 - `bound_by`（tick の数）: `requested` が Front / Rear 82669・Top 81263、`guard_floor` が Front / Rear 1319・Top 2577、`ramp_down` が
   Front / Rear 2395・Top 2394、Top の `safety_floor` 149、`forced_max` が各 17。`effective` は 3 zone とも 0.40〜1.00、平均は約 0.585
-- **起動の落ち着き（0126 §2.3）**: 起動（BIOS の制御の回転数から）の `startup` の 17 tick のうち、tick 16 の回転数（Front 1776・Rear 1528・
-  Top 2288 RPM）を全開とすると、±5% に入ったのは Rear・Top が tick 4、Front が tick 10（10000 ms）で、Demand が `ramp_down` で下がり始めた
+- **起動の落ち着き（0126 §2.3）**: 全開の回転数を T4 の起動の落ち着きの 3 回で独立に測った値（`ctl max` を 30 s 保った後。Front 1790〜1795・
+  Rear 1546〜1578・Top 2343〜2368 RPM）とし、どの回を全開としても ±5% に入る範囲で判定した。起動（BIOS の制御の回転数から）の `startup` の
+  17 tick で、範囲に入ったのは Top が tick 4・Rear が tick 6・Front が tick 12（12001 ms）で、Demand が `ramp_down` で下がり始めた
   tick 17（17001 ms）までどれも外れなかった（試験の記録の trace から 2026-10-21 に数えた。決定記録 0161 §2.2）
 - Learned は配備していないので、起動時に経路を開かずに運転する error が 1 件出た（T0 と同じ）。fand の journal の error はこれだけ
 - systemd の記録では、fand の CPU 時間は 24 時間で 4 分 46 s、メモリの最大は 288.7 MB
@@ -476,7 +477,7 @@ reading と trace、fand の journal、`coldaisle-soak-report` の集計）。
 - 0121 の実機の試験はすべて終わった。T5 の約 11 s の経路は実機では試さず [0158](decisions/0158-t5-11s-path-component-assurance.md) で担保し、
   0158 §2.5 の T1〜T3 のテストは PR #355（890949e）で入った。T9 (b) の健全度と Guard の閾値のテストは #308（PR #314）で入った
 - `enable` までに残る判断（D 状態の hang の受け入れ・承認点 2 で値の `status` を `confirmed` にすること・unit の時間の値・
-  HEAD へ更新した後の確認のやり直し・順序）は、決定記録 [0161](decisions/0161-fand-enable-prerequisites.md) で所有者に提案している。
+  HEAD へ更新した後の確認のやり直し・順序）は、決定記録 [0161](decisions/0161-fand-enable-prerequisites.md) で決めた（2026-10-21、所有者の承認）。
   D 状態の hang の調べ（0158 §5 の 2）の結果も 0161 §2.1 にある（2026-10-13 以降の `journalctl -k` の hung_task 0 件・T1 の `duration_ms` 最大 11 ms・
-  書き込みの失敗 0。予備確認から T1 の前までの trace は未確認）
-- T1 は合格（2026-10-16、所有者が確認）。値の `status` を `confirmed` にするのは、所有者の承認を得てまとめて行う（案は 0161 §2.2）
+  書き込みの失敗 0。予備確認から T1 の前までの trace と journal も 2026-10-22 に確かめ、試験の注入で説明できないものは 0）
+- T1 は合格（2026-10-16、所有者が確認）。値の `status` を `confirmed` にするのは、所有者の承認を得てまとめて行う（項目と `basis` は 0161 §2.2）
