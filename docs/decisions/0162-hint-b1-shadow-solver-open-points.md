@@ -125,7 +125,7 @@ fand の受信と検証と記録・`ControlTick` の版上げ・learnd の `--hi
 
 - **持つもの**: fand は、MPC worker へ**実際に送り出した** frame ごとに、判定に要る値だけを環状の列に持つ:
   `tick_id`・`snapshot.ts_ms`・`monotonic_ms`、`mpc.optimizer.cost_metrics` の CPU / GPU 温度と、ゲートの仕様の
-  `window_features` の metric の値と quality、その frame の (Regime, ヒントの workload) の鍵、基準とヒント有りの
+  `window_features` の metric の値と quality と `source_ts_ms`、その frame の (Regime, ヒントの workload) の鍵、基準とヒント有りの
   context の `target_band`、`safety_floor`、`baseline` の requested、`applied`。frame そのものや他の signal は持たない。
   列に入れるのは送り出しの側（`learned_channel` の受付スレッドが枠から取り出して送った frame）で、**tick の中では
   何も待たない**（0077 §2.2。`offer` の形を変えない）
@@ -157,16 +157,29 @@ fand の受信と検証と記録・`ControlTick` の版上げ・learnd の `--hi
   3. `N` の `safety_floor` と `baseline` の 3 系統が `safety_floor_range` / `baseline_range` の範囲（0156 §2.5）
   4. 区間のすべての frame で、CPU / GPU 温度が「`N` の基準の context の `upper_c` + 軸の範囲」の中（0156 §2.4 の
      「その tick の Regime の基準の `upper_c` からの差」。`N` の基準で全 frame を測る）、`window_features` の各 metric が
-     軸の範囲の中、どの軸の metric も値があり quality が `stale` / `suspect` でない
+     軸の範囲の中、どの軸の metric も値があり quality が `stale` / `suspect` でなく、**古さでも stale でない**
+     （下の「古さの検査」）
   5. **区間に欠けが無い**: 区間の frame の `tick_id` が連続している（送り出せなかった tick があれば外）
   どれかが外なら `out_of_certified_domain`。fand の判定は、記録の中の worker の判定結果を読まない
+- **古さの検査**（PR #365 の Codex P2。worker は artifact の `stale_after_ms` で「格子時刻 − `source_ts_ms`」が閾値以上の
+  cell を stale にする（0107 §2.1・`learned_worker/window.py`）が、fand は artifact を読まない）: fand は設定の
+  `domain_stale_after_ms`（`config/learned-channel.yaml`）で古さを判定し、frame の `hint_certification` で worker へ渡す。
+  worker は束縛した artifact の `stale_after_ms` が `domain_stale_after_ms` **以上**であることを確かめ、満たさなければ
+  解かずに `certification_mismatch` を返す（fand の閾値が artifact より緩くならないようにする）
+  - 区間の各 frame の各軸の metric について、古さ = 「その frame の**次の** frame の `snapshot.ts_ms`（`N` 自身は自分の
+    `snapshot.ts_ms`）− その signal の `source_ts_ms`」とし、`domain_stale_after_ms` 以上なら外。worker の格子時刻は、当てた
+    frame の時刻から次の frame の時刻の手前までにあり、`N` の格子時刻は `N` の時刻なので、fand の古さは worker の古さ以上になり、
+    閾値も artifact 以下なので、**fand は worker より厳しい側にしかずれない**
+  - `source_ts_ms` が無い signal は値が無いのと同じく外にする
+  - `domain_stale_after_ms` も解の結果に効かず、判定を厳しくする向きにしか働かないので、証明書には束ねない（下）
 - **worker の側**: Shadow solver の子は、束縛した artifact の `window_ms` が frame の `domain_lookback_ms` 以下であることを
-  起動時（束縛のとき）に確かめ、超えれば解かずに `certification_mismatch` を返す。worker 自身の判定は 0156 §2.4 の定義
+  起動時（束縛のとき）に確かめ、超えれば解かずに `certification_mismatch` を返す（`stale_after_ms` と
+  `domain_stale_after_ms` の比較も同じ時点。上の「古さの検査」）。worker 自身の判定は 0156 §2.4 の定義
   （実際の window の全 frame・artifact の `stale_after_ms`）のまま、同じ関数に実際の window を渡して行う
 - **`domain_lookback_ms` の置き場所**: `config/learned-channel.yaml`（ルール 9）。fand が読み、frame の
   `hint_certification`（0152 §2.6）に載せて worker へ渡す。worker は自分の設定ではなく frame の値で比べる
   （fand と worker で値が割れて、fand の区間が window より短くなることを作らない）
-- **証明書には束ねない**（§5 の 2）。`domain_lookback_ms`（と保留の表の `pending_domain_result_ms` / `max_pending_domain_results`）は解の結果に効かず、fand の判定を厳しくする向きにしか
+- **証明書には束ねない**（§5 の 2）。`domain_lookback_ms`・`domain_stale_after_ms`（と保留の表の `pending_domain_result_ms` / `max_pending_domain_results`）は解の結果に効かず、fand の判定を厳しくする向きにしか
   働かない（短すぎれば worker が解かない。長ければ fand の外が増えるだけ）。0152 §2.3 のゲートの仕様の入力と、0156 §2.7 の
   正準な形・版の印 `hint-gate-spec-v1` は変えない
 - **2 条件の再検査**は 0133 §2.5 のまま、記録の両 plan の `requested_demand` と予測の全 offset を、fand が自分の設定から
@@ -182,7 +195,7 @@ fand の受信と検証と記録・`ControlTick` の版上げ・learnd の `--hi
   artifact で子が `certification_mismatch`・証明書の `certified_domain` を書き換えても fand の判定が変わらない（0152 §2.8）・
   fand の判定が worker の記録の中の判定結果に依らない・元の frame の後に区間の長さを超えて frame を送った後に届いた
   記録でも、保留の表の結果で正しく判定される・保留の期限を過ぎて届いた記録が `source_interval_unavailable` で範囲の外に
-  なる・同じ元の tick の2件目の記録が `hint_record_rejected`
+  なる・同じ元の tick の2件目の記録が `hint_record_rejected`・quality が `ok` でも `source_ts_ms` が `domain_stale_after_ms` より古い signal を fand が外にする・artifact の `stale_after_ms` が `domain_stale_after_ms` より短いと子が `certification_mismatch`
 
 ### 2.3 論点 1 に付随: 記録の後に分かる理由と、worker が捨てた数の運び先
 
@@ -369,7 +382,7 @@ fand の受信と検証と記録・`ControlTick` の版上げ・learnd の `--hi
 **所有者の決定（2026-10-21）**: 1〜8 のすべてを推奨の案で承認した。§2 の本文はその決定を書いたものである。
 PR #365 の Codex のレビュー（P1 3 件）で、承認の趣旨を変えずに次を足した（判定を厳しくする向きと、数え方の誤りの修正）:
 §2.2 の判定を送り出しの時点で行い記録が届くまで保持する（届く前に消えたら範囲の外）・§2.3 の数の epoch
-（`worker_instance_id`）・§2.4 の区間ごとの差での数え方。2 回目のレビュー（P1 2 件）で、§2.4 の捨てた数と成功率を `run_id` × epoch の層に限り、数を観測の時刻で区間に振り分けてずれうる幅を出すことを足した。3 回目のレビュー（P1 1 件）で、`hint_shadow_records` のすべての行に `worker_instance_id` を残すこと（PR-C の migration）を足した。4 回目のレビュー（P1 1 件）で、行に累積の数も残し、成功率のすべての項を `received_ts_ms` の軸に揃えることを足した。5 回目のレビュー（P1 1 件・P2 1 件）で、worker の終了で失われた試みを epoch の切れ目として数え成功率を常に上限と名指すこと、数の減った行（`counters_decreased`）を端点から除き受け入れた行の最大を使うことを足した
+（`worker_instance_id`）・§2.4 の区間ごとの差での数え方。2 回目のレビュー（P1 2 件）で、§2.4 の捨てた数と成功率を `run_id` × epoch の層に限り、数を観測の時刻で区間に振り分けてずれうる幅を出すことを足した。3 回目のレビュー（P1 1 件）で、`hint_shadow_records` のすべての行に `worker_instance_id` を残すこと（PR-C の migration）を足した。4 回目のレビュー（P1 1 件）で、行に累積の数も残し、成功率のすべての項を `received_ts_ms` の軸に揃えることを足した。5 回目のレビュー（P1 1 件・P2 1 件）で、worker の終了で失われた試みを epoch の切れ目として数え成功率を常に上限と名指すこと、数の減った行（`counters_decreased`）を端点から除き受け入れた行の最大を使うことを足した。6 回目のレビュー（P2 1 件）で、fand が `source_ts_ms` も持ち `domain_stale_after_ms` で古さを厳しい側に判定すること（worker は artifact の `stale_after_ms` がそれ以上であることを確かめる）を足した
 
 | # | 判断点 | 選択肢（推奨を先頭） |
 |---|---|---|
