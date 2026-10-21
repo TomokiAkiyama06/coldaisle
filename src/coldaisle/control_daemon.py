@@ -121,14 +121,19 @@ from coldaisle.control.safety.write_fail_exit import (
     HardwareWriteFailureExit,
     HardwareWriteFailureExitError,
 )
-from coldaisle.control.schema import PerZone, WorkloadHintStage, Zone
+from coldaisle.control.schema import PerZone, WorkloadHintStage, Zone, workload_hint_stage_rank
 from coldaisle.control.shadow.record import ShadowRecorder
 from coldaisle.control.state import ControlInputContract, ControlStateEstimator
 from coldaisle.control.supervisor.policy import SupervisorCoordinator
 from coldaisle.control.supervisor.regime import WorkloadRegimeEstimator
-from coldaisle.control.supervisor.workload_hint import WorkloadHintTracker, effective_stage
+from coldaisle.control.supervisor.workload_hint import (
+    HintCertificationLatch,
+    WorkloadHintTracker,
+    effective_stage,
+)
 from coldaisle.control_admin import ControlAdminEntry, open_control_admin
 from coldaisle.control_admin.runtime import new_run_id
+from coldaisle.hint_certification import HintCertificateSource, verify_hint_certificate
 from coldaisle.learned_channel import (
     DisabledLearnedChannel,
     LearnedChannelEntry,
@@ -636,6 +641,12 @@ class Config:
     None は「読まなかった」として `RuntimeCalibration.unavailable` になり、較正の掛かる
     metric を使う artifact は L9 で拒まれる（0096 §5 #8）。起動は止めない。
     """
+    hint_lockfile: Path | None = None
+    """Workload Hint の証明書の部品 ``lockfile`` のロックファイル（決定記録 0152 §2.4 / §5 の 4）。
+
+    root の所有の ``uv.lock`` を渡す。None・読めないときは ``lockfile_mismatch`` で B0（起動は
+    止めない）。B1 / B2 を設定していなければ読まない。
+    """
 
 
 @dataclass(slots=True)
@@ -1045,7 +1056,17 @@ def build(
     # **registry は起動時に1回だけ読み、1つの snapshot から provenance・Gate の期待値・
     # `expected_rl_identity`・frame の `expected_artifacts` を作る**（決定記録 0077 §2.6）。
     # 読めなければ Learned を無効にして起動を続ける（例外を出さない）。
-    registry = read_startup_registry(config.registry_root, limits_dir=config.registry_limits)
+    # Workload Hint の B1 / B2 を設定したときだけ、同じ snapshot から証明書も読む（0152 §2.2）。
+    # 設定が B0 以下なら照合しても実効は上がらない（min を取る。0152 §2.4）ので読まない
+    hint_latch = (
+        HintCertificationLatch()
+        if workload_hint_stage_rank(control.policy.supervisor.workload_hint.stage)
+        > workload_hint_stage_rank(WorkloadHintStage.OBSERVE)
+        else None
+    )
+    registry = read_startup_registry(
+        config.registry_root, limits_dir=config.registry_limits, hint_latch=hint_latch
+    )
     # **Gate と authority runtime が照らす artifact は1つの変数から渡す**（決定記録 0089 §2.1）。
     # 束縛する `thermal_model` が無ければ None で、authority は journal が上がっていても Baseline
     # より上を有効にしない（0089 §2.2）。
@@ -1087,7 +1108,15 @@ def build(
     )
     # **Workload Hint の読み手は loop の外のスレッド**（0133 §2.8）。読めなくても起動は続ける
     hint_tracker, hint_reader = _open_workload_hint(
-        config, control, rules=rules, wall=wall, monotonic=monotonic, run_id=run_id
+        config,
+        control,
+        rules=rules,
+        wall=wall,
+        monotonic=monotonic,
+        run_id=run_id,
+        certificate=registry.hint_certificate,
+        hint_latch=hint_latch,
+        calibration=learned_calibration,
     )
     built_backends: list[FanHardwareBackend] = []
 
@@ -1293,28 +1322,46 @@ def _open_workload_hint(
     wall: WallClock,
     monotonic: MonotonicClock,
     run_id: str,
+    certificate: HintCertificateSource | None,
+    hint_latch: HintCertificationLatch | None,
+    calibration: AvailableCalibration | UnavailableCalibration,
 ) -> tuple[WorkloadHintTracker | None, WorkloadHintReader | None]:
     """Workload Hint の読み手を起こし、loop が使う tracker を返す（決定記録 0133 §2.6 / §2.8）。
 
-    ``stage: off`` なら何もしない（Stage A のまま。ヒントを読まない）。B1 / B2 を設定していても、
-    認証のハッシュを照合する仕組みがまだ無いので実効は B0 に留める（0133 §2.6）。
-    **読めなくても起動は止めない**（ヒントは任意の機能。0133 §2.8）。
+    ``stage: off`` なら何もしない（Stage A のまま。ヒントを読まない）。B1 / B2 を設定したときは、
+    tick を始める前に証明書を1回だけ照合し（0152 §2.4。``coldaisle.hint_certification``）、
+    実効の段階 = min(設定, 実装の上限, 照合の結果) とする。照合の結果を1行のログに残す。
+    **照合が通らなくても・読めなくても起動は止めない**（ヒントは任意の機能。0133 §2.8）。
     """
     hint = control.policy.supervisor.workload_hint
-    stage = effective_stage(hint.stage)
-    if stage is WorkloadHintStage.OFF:
-        return None, None
-    if stage is not hint.stage:
-        LOGGER.warning(
-            "workload hint の段階を B0（記録だけ）に留める",
+    certified = False
+    if hint_latch is not None:
+        result = verify_hint_certificate(
+            source=certificate,
+            supervisor=control.policy.supervisor,
+            limits=control.safety.workload_hint,
+            lockfile=config.hint_lockfile,
+            calibration=calibration,
+        )
+        certified = result.certified
+        stage = effective_stage(hint.stage, certified=certified)
+        # 0152 §2.4 / 0157 §2.3: 閉じた語彙の1行。path・ホスト名は載せない
+        LOGGER.log(
+            logging.INFO if stage is hint.stage else logging.WARNING,
+            "workload hint の証明書を照合した",
             extra={
                 logs.FIELDS_KEY: {
                     "configured_stage": hint.stage.value,
                     "effective_stage": stage.value,
-                    "reason": "certification_mismatch",
+                    "certification": result.certification.value,
+                    "certificate_sha256": result.certificate_sha256,
+                    "launch_form": result.launch_form.value,
                 }
             },
         )
+    stage = effective_stage(hint.stage, certified=certified)
+    if stage is WorkloadHintStage.OFF:
+        return None, None
     db = config.db
     mailbox = HintMailbox()
     reader = WorkloadHintReader(
@@ -1332,7 +1379,14 @@ def _open_workload_hint(
     # **待たない**（Codex P1）。取り込みが終わるまでの tick は `hint_state_unreadable` になり、
     # 起動・heartbeat・Fan の制御はヒントの読み手を待たない
     reader.start()
-    tracker = WorkloadHintTracker(hint, mailbox=mailbox, boot_clock=wall, monotonic=monotonic)
+    tracker = WorkloadHintTracker(
+        hint,
+        mailbox=mailbox,
+        boot_clock=wall,
+        monotonic=monotonic,
+        certified=certified,
+        revocation=hint_latch,
+    )
     return tracker, reader
 
 
@@ -1593,6 +1647,15 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--hint-lockfile",
+        type=Path,
+        default=None,
+        help=(
+            "Workload Hint の証明書の照合に使うロックファイル（root の所有の uv.lock。"
+            "決定記録 0152 §2.4）。B1 / B2 を設定したときだけ読む。省く・読めないときは B0"
+        ),
+    )
+    parser.add_argument(
         "--backend",
         choices=BACKEND_CHOICES,
         default="simulated",
@@ -1639,6 +1702,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         registry_root=args.registry_root,
         registry_limits=args.registry_limits,
         calibration=args.calibration,
+        hint_lockfile=args.hint_lockfile,
     )
     monotonic: MonotonicClock = SystemMonotonicClock()
     backend_factory = backend_factory_for(args.backend)

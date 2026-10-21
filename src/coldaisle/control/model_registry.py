@@ -1677,6 +1677,41 @@ class ModelRegistry:
                 "registry snapshot を検証できない",
             )
 
+    def inspect_with_production(
+        self,
+        kind: ArtifactKind,
+        compatibility: ModelCompatibility,
+    ) -> tuple[RegistrySnapshot, ArtifactLoadResult]:
+        """1つの snapshot を読み、**その同じ snapshot** の ``kind`` の production を検証して読む。
+
+        決定記録 0152 §2.2（fand は同じ1つの snapshot から thermal_model と hint_certificate の
+        production を読む）。``inspect()`` と ``load_production()`` を別々に呼ぶと、その間の
+        promotion で別の snapshot の値を組み合わせうる。
+
+        snapshot を検証できなければ ``inspect()`` と同じく ``RegistryCorruptError``。artifact の
+        読み込みの失敗は ``ArtifactLoadResult`` の status で返す（例外にしない）。
+        """
+        try:
+            with self._open_root(create=False) as root_fd:
+                if root_fd is None:
+                    empty = RegistrySnapshot(revision=0)
+                    return empty, self._load_failure(
+                        ArtifactLoadStatus.NO_PRODUCTION,
+                        empty.revision,
+                        "production artifact が登録されていない",
+                    )
+                snapshot = self._read_snapshot(root_fd)
+                slot = snapshot.production.get(kind)
+                if slot is None:
+                    return snapshot, self._load_failure(
+                        ArtifactLoadStatus.NO_PRODUCTION,
+                        snapshot.revision,
+                        "production artifact が登録されていない",
+                    )
+                return snapshot, self._load_record(root_fd, snapshot, slot.active, compatibility)
+        except UnsafeRegistryPathError as exc:
+            raise RegistryCorruptError("registry root を安全に読み取れない") from exc
+
     def load_version(
         self,
         ref: ArtifactRef,
