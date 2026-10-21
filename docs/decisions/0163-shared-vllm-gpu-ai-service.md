@@ -1,11 +1,11 @@
 # 決定記録 0163: GPU AI Service は Personal AI Workspace の vLLM を共用し、Docker Compose の3層分離は行わない
 
 - **種別**: Decision Record
-- **Status**: Proposed
+- **Status**: FINAL（2026-10-21、リポジトリ所有者の承認。§5 の 1〜10 はすべて推奨の案）
 - **Date**: 2026-10-21
 - **Supersedes**: なし（下の記録を置き換えず、所有者の 2026-10-21 の決定を具体にして補う）
   - [0143](0143-claude-api-interim-provider.md) は置き換えない。§2.5 で 0143 §2.9 の戻す手順の値を決め、
-    0143 §5 の 2 に推奨の案を出す。0143 の Status をどうするかは戻した後に決める（0143 §2.9 の 5）
+    0143 §5 の 2 に答える（コードを残す。§5 の 1）。0143 は FINAL のまま（0143 §2.9 の 5）
   - [0002](0002-metric-naming.md) §2.6 / [0006](0006-gpu-mode-and-mixed-state.md) §2.2 の `sys.gpu_state` の5値と意味は変えない。
     §2.6 は 0002 §2.6 が `config/gpu_state.yaml` に置くとした「プロセスの識別規則」の形を決める
 - **関連**: [0001](0001-initial-project-decisions.md) D-06 / D-14 / [0005](0005-model-selection.md) /
@@ -148,10 +148,21 @@
 | 確かめること | 期待 |
 |---|---|
 | `GET /v1/models` | `main` があり、`root` が Qwen3.8-27B-FP8 を指す |
-| `Provider.probe()`（`coldaisle` の uid で。0143 の手順と同じ形） | `利用可` |
+| `Provider.probe()`（`coldaisle` の uid で。**Provider を明示し、導入先の env を読ませない**。下の「試すときの Provider の指定」） | `利用可`、かつ `ChatResult.model` が `main`（Claude のモデル ID なら Claude を試している） |
 | `enable_thinking=false` を送った要求 | 400 にならず、`content` に `<think>` が無い。400 なら `send_thinking_flag: false` にする（0014 §2.3） |
-| `coldaisle-report --no-send --print` | 「所見」の節が付く |
+| `coldaisle-report --no-send --print`（probe と同じ形で Provider を明示する） | 「所見」の節が付き、journal に Claude の行が出ない |
 | （参考）`tools` を付けた要求 1 回 | `tool_calls[].function.arguments` が JSON の文字列で返る |
+
+**試すときの Provider の指定**（PR #364 の指摘）
+
+- `provider_from_env()` は**最初に `COLDAISLE_LLM_PROVIDER` を読み**、`anthropic` なら `OPENAI_BASE_URL` / `MODEL_NAME` を見ずに
+  `AnthropicProvider` を返す（`src/coldaisle/ai/provider.py`）。0143 を有効にしたままの導入先の `/etc/coldaisle/coldaisle.env` には
+  `COLDAISLE_LLM_PROVIDER=anthropic` があるので、その env を読ませたまま `OPENAI_BASE_URL` / `MODEL_NAME` だけを足すと、**PAW ではなく Claude を試して `利用可` になる**
+- しかも systemd では `EnvironmentFile=` の値が `Environment=`（`systemd-run --setenv` / `-E`）を上書きする。env を読ませたまま `--setenv=COLDAISLE_LLM_PROVIDER=openai_compatible` を足しても効かない
+- そこで切り替えの前の試験（probe・レポート・NFR-04 の測定）は、**`-p EnvironmentFile=/etc/coldaisle/coldaisle.env` を付けず**、
+  使う値をすべて `--setenv` で渡す: `COLDAISLE_LLM_PROVIDER=openai_compatible`・`OPENAI_BASE_URL=http://127.0.0.1:18080/v1`・`MODEL_NAME=main`
+  （`ANTHROPIC_*` は渡さない）。結果の `model` が `main` であることも出して確かめる
+- 切り替えの後（§2.5 の手順 2〜4 の後）の確かめは env を読ませてよい。そのときも `model` が `main` であることを見る
 
 ### 2.3 起動・停止の所有者は PAW。coldaisle は起動しない・待たない
 
@@ -186,20 +197,22 @@ NFR-04 は「vLLM 環境で LLM の初回トークン 2 秒以内」。coldaisle
 
 0143 §2.9 の手順を、§2.1 の値で行う。**本記録の承認と §2.2 のスモークテストの後**に、所有者が導入先で行う。
 
-1. PAW の vLLM が動いているときに §2.2 のスモークテストを通す（`/etc/coldaisle/coldaisle.env` を変える前に、`OPENAI_BASE_URL` / `MODEL_NAME` を
-   一時的に渡した `systemd-run` で `probe()` を確かめる。0143 の手順と同じ形）
-2. `/etc/coldaisle/coldaisle.env` から `COLDAISLE_LLM_PROVIDER` を消し、`OPENAI_BASE_URL=http://127.0.0.1:18080/v1` と `MODEL_NAME=main` を書く
+1. PAW の vLLM が動いているときに §2.2 のスモークテストを通す。`/etc/coldaisle/coldaisle.env` を変える前なので、**env を読ませず
+   Provider を `--setenv=COLDAISLE_LLM_PROVIDER=openai_compatible` で明示する**（§2.2「試すときの Provider の指定」）。
+   `利用可` と `model` が `main` の両方が出るまで手順 2 へ進まない（Claude を試して通ったまま鍵を消さない）
+2. `/etc/coldaisle/coldaisle.env` の `COLDAISLE_LLM_PROVIDER=anthropic` を `COLDAISLE_LLM_PROVIDER=openai_compatible` に書き換え
+   （消してもよいが、明示のほうが読み違えない）、`OPENAI_BASE_URL=http://127.0.0.1:18080/v1` と `MODEL_NAME=main` を書く
 3. `ANTHROPIC_API_KEY`（と `ANTHROPIC_WORKSPACE_ID`・`ANTHROPIC_MODEL`）を消し、Anthropic の Console で鍵を無効にする
 4. `coldaisle-daemon` と `coldaisle-api` を再起動する（`coldaisle-report` は次のタイマーの起動から効く）
-5. 前日のレポートを `--no-send --print` で作り、所見が付くことと、journal に Claude の行が出ないことを確かめる
+5. env を読ませた形で `probe()` の `model` が `main` であることと、前日のレポートを `--no-send --print` で作り所見が付くこと・journal に Claude の行が出ないことを確かめる
 
-**`AnthropicProvider`（0143 §5 の 2）**: 推奨は**コードを残す**（§5 の 1）。
+**`AnthropicProvider`（0143 §5 の 2）**: **コードを残す**（§5 の 1）。
 
 - 外へ送るのは `COLDAISLE_LLM_PROVIDER=anthropic` と鍵の両方を置いたときだけで（0143 §2.2）、手順 2・3 で両方が導入先から消える
 - PAW の vLLM は Compute Mode のたびに止まり、PAW の変更で窓口が変わりうる。長く使えない期間が出たとき、所有者が明示の opt-in で
   再び選べる余地を残す
 - **vLLM が止まっているときに Claude API へ自動で切り替える経路は作らない**（§4）。止まっていればテンプレートへ縮退する（§2.3）
-- 残すなら 0143 の Status は FINAL のまま（期間は導入先の設定で終わる）。消すなら、消す PR で 0143 を `Superseded` にする記録を書く
+- 0143 の Status は FINAL のまま（期間は導入先の設定で終わる。0143 §2.9 の 5 の答え）
 
 ### 2.6 `sys.gpu_state` の識別規則（#63）: NVML の PID を cgroup の systemd unit で照合する
 
@@ -285,7 +298,7 @@ ai_units:            # 推論サーバの systemd unit 名（完全一致）。�
 | 1 | `docs/requirements.md` §7.2 の vLLM の起動例（`hermes` / 8001 / 0.4 / 32768）を「PAW の vLLM を共用する。coldaisle は起動しない」に改め、§2.1 の値と §2.2 の前提を書く。`docs/llm-setup.md` の本番の節とスモークテスト（§2.2 の表）・NFR-04 の測り方（§2.4）・戻す手順（§2.5）。`config/ai.yaml` の注釈の例 | `docs:` |
 | 2 | `sys.gpu_state` の収集（§2.6）と `config/gpu_state.yaml`。cgroup の読み取りは偽の `/proc` で試験する（ルール 7） | `feat:`（#63） |
 | 3 | 導入先の切り替え（§2.5 の 1〜5） | 所有者が導入先で |
-| 4 | §5 の 1 で消すと決めたときだけ: `AnthropicProvider` の削除と 0143 を置き換える記録 | `refactor:` |
+| 4 | （行わない）`AnthropicProvider` の削除。§5 の 1 で残すと決めた | — |
 
 ---
 
@@ -323,17 +336,19 @@ ai_units:            # 推論サーバの systemd unit 名（完全一致）。�
 
 ---
 
-## 5. 未決事項（所有者が選ぶ。推奨を先頭）
+## 5. 判断点（決定済み。推奨を先頭に）
+
+**所有者の決定（2026-10-21）**: 1〜10 はすべて推奨の案（いずれも (a)）で決めた。§2 の本文はその案を書いたものである。
 
 | # | 判断点 | 選択肢（推奨を先頭） | 決定 |
 |---|---|---|---|
-| 1 | `AnthropicProvider` を残すか（0143 §5 の 2） | **(a 推奨) コードを残し、導入先の `COLDAISLE_LLM_PROVIDER` と鍵は消す**。自動の切り替えはしない（§2.5）。0143 は FINAL のまま / (b) コードと試験を消し、0143 を `Superseded` にする記録を書く（外へ送る経路がコードからも消える。再び要るときは作り直す） | 未決 |
-| 2 | Server Health の `ai_layer` の決め方 | **(a 推奨) 要約の成否のまま**（0040 §2.7。§2.7）/ (b) 窓口の疎通（`/v1/models`）で決める / (c) `sys.gpu_state` から決める | 未決 |
-| 3 | `sys.gpu_state` の識別規則 | **(a 推奨) NVML の PID → `/proc/<pid>/cgroup` の最も内側の `.service` を `ai_units` の一覧と照合**（§2.6）/ (b) プロセス名で照合する / (c) PAW の GPU Mode の事象から決める | 未決 |
-| 4 | `config/gpu_state.yaml`（`ai_units`）の置き場所 | **(a 推奨) リポジトリの `config/gpu_state.yaml` に unit 名を書く**（0002 §2.6 のとおり。変更がレビューを通る。unit 名は個体識別子ではない）/ (b) リポジトリには形と例だけを置き、導入先の `/etc/coldaisle/` の写しを環境変数で指す（`COLDAISLE_SERVER_HEALTH` と同じ形。PAW の unit 名をリポジトリに出さない） | 未決 |
-| 5 | cgroup が読めない PID があるとき | **(a 推奨) 全体を `unknown`**（判定不能。最も保守的な閾値。§2.6）/ (b) その PID を `compute` に数える（推論サーバと示せないものは計算とみなす） | 未決 |
-| 6 | NFR-04 の合格の基準 | **(a 推奨) warm・PAW の要求が無いときに 20 回すべて 2 s 以内**。重なったときは参考（§2.4）/ (b) 20 回の 95 パーセンタイル（2 番目に遅い値）が 2 s 以内 / (c) 重なったときも含めて判定する | 未決 |
-| 7 | 文書と実装をどの PR で直すか | **(a 推奨) この PR は決定記録だけ。FINAL の後に §2.9 の順で別の PR** / (b) この PR で `docs/requirements.md` §7.2 と `docs/llm-setup.md` も直す | 未決 |
-| 8 | `main` の実体の確かめ方 | **(a 推奨) 導入時と PAW の変更時のスモークテストで `/v1/models` の `root` を確かめて記録するだけ**（実行時には確かめない）/ (b) 日次レポートに実体（`root`）を載せる（毎日 `/v1/models` を 1 回呼ぶ） | 未決 |
-| 9 | AI 由来の CUDA process の数をメトリクスにするか | **(a 推奨) 足さない**。#63 の受入基準は `sys.gpu_state` の `idle` / `compute` で確かめる / (b) `sys.cuda_processes.ai` などを `readings` に足す（`metrics.yaml` と命名の検討が要る） | 未決 |
-| 10 | PAW の Scheduler に GPU Mode の事象（`coldaisle-event gpu-mode`。0045）を送ってもらうか | **(a 推奨) 本記録では求めない**（PAW 側の判断。送られれば 0045 のとおり記録し、`sys.gpu_state` の観測と並べてタイムラインに出る）/ (b) PAW の Scheduler の start / stop のたびに送ることを求める | 未決 |
+| 1 | `AnthropicProvider` を残すか（0143 §5 の 2） | **(a 推奨) コードを残し、導入先の `COLDAISLE_LLM_PROVIDER` と鍵は消す**。自動の切り替えはしない（§2.5）。0143 は FINAL のまま / (b) コードと試験を消し、0143 を `Superseded` にする記録を書く（外へ送る経路がコードからも消える。再び要るときは作り直す） | 決定済み（所有者、2026-10-21）: (a) |
+| 2 | Server Health の `ai_layer` の決め方 | **(a 推奨) 要約の成否のまま**（0040 §2.7。§2.7）/ (b) 窓口の疎通（`/v1/models`）で決める / (c) `sys.gpu_state` から決める | 決定済み（所有者、2026-10-21）: (a) |
+| 3 | `sys.gpu_state` の識別規則 | **(a 推奨) NVML の PID → `/proc/<pid>/cgroup` の最も内側の `.service` を `ai_units` の一覧と照合**（§2.6）/ (b) プロセス名で照合する / (c) PAW の GPU Mode の事象から決める | 決定済み（所有者、2026-10-21）: (a) |
+| 4 | `config/gpu_state.yaml`（`ai_units`）の置き場所 | **(a 推奨) リポジトリの `config/gpu_state.yaml` に unit 名を書く**（0002 §2.6 のとおり。変更がレビューを通る。unit 名は個体識別子ではない）/ (b) リポジトリには形と例だけを置き、導入先の `/etc/coldaisle/` の写しを環境変数で指す（`COLDAISLE_SERVER_HEALTH` と同じ形。PAW の unit 名をリポジトリに出さない） | 決定済み（所有者、2026-10-21）: (a) |
+| 5 | cgroup が読めない PID があるとき | **(a 推奨) 全体を `unknown`**（判定不能。最も保守的な閾値。§2.6）/ (b) その PID を `compute` に数える（推論サーバと示せないものは計算とみなす） | 決定済み（所有者、2026-10-21）: (a) |
+| 6 | NFR-04 の合格の基準 | **(a 推奨) warm・PAW の要求が無いときに 20 回すべて 2 s 以内**。重なったときは参考（§2.4）/ (b) 20 回の 95 パーセンタイル（2 番目に遅い値）が 2 s 以内 / (c) 重なったときも含めて判定する | 決定済み（所有者、2026-10-21）: (a) |
+| 7 | 文書と実装をどの PR で直すか | **(a 推奨) この PR は決定記録だけ。FINAL の後に §2.9 の順で別の PR** / (b) この PR で `docs/requirements.md` §7.2 と `docs/llm-setup.md` も直す | 決定済み（所有者、2026-10-21）: (a) |
+| 8 | `main` の実体の確かめ方 | **(a 推奨) 導入時と PAW の変更時のスモークテストで `/v1/models` の `root` を確かめて記録するだけ**（実行時には確かめない）/ (b) 日次レポートに実体（`root`）を載せる（毎日 `/v1/models` を 1 回呼ぶ） | 決定済み（所有者、2026-10-21）: (a) |
+| 9 | AI 由来の CUDA process の数をメトリクスにするか | **(a 推奨) 足さない**。#63 の受入基準は `sys.gpu_state` の `idle` / `compute` で確かめる / (b) `sys.cuda_processes.ai` などを `readings` に足す（`metrics.yaml` と命名の検討が要る） | 決定済み（所有者、2026-10-21）: (a) |
+| 10 | PAW の Scheduler に GPU Mode の事象（`coldaisle-event gpu-mode`。0045）を送ってもらうか | **(a 推奨) 本記録では求めない**（PAW 側の判断。送られれば 0045 のとおり記録し、`sys.gpu_state` の観測と並べてタイムラインに出る）/ (b) PAW の Scheduler の start / stop のたびに送ることを求める | 決定済み（所有者、2026-10-21）: (a) |
