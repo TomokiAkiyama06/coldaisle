@@ -205,6 +205,12 @@ fand の受信と検証と記録・`ControlTick` の版上げ・learnd の `--hi
     新しい epoch として受け、前の epoch の値と比べない（再起動した worker の正しい記録を拒み続けない）
   - trace の `shadow_counters` は `{worker_instance_id, 各数}` の形にし、その tick に fand が最後に受け取った epoch の値を写す。
     前の epoch の最後の値はその epoch の最後の tick までの trace に残る
+  - **`hint_shadow_records` のすべての行に `worker_instance_id` を残す**（PR #365 の Codex P1 の 6）。`recorded` 以外の行は
+    `record_json` を持たず、元の tick の trace はその記録より前の数しか持たないので、行そのものに epoch が無いと、
+    `skipped` / `rejected` の行を集計の epoch に振り分けられない。PR-C の migration で列 `worker_instance_id`
+    （`run_id` と同じ形。必須）を足し、`HintShadowRecord` にも必須の欄として足す。fand は封筒の検証を通ったメッセージの
+    `worker_instance_id` をそのまま書く（封筒の検証に落ちたメッセージは今までどおり行を作らない）。B1 の行は PR-C より前には
+    作られない（書き手が無い）ので、既存の行を推測で埋める必要は無い
   - heartbeat には載せない（基準の経路のメッセージの形を変えない。0133 §2.5）
   - 限界: 最後の記録の後に捨てた分は fand に届かない。集計はこれを「下限」として示す（§2.4）
 - **語彙の追加**: `HintShadowReason` に `certification_mismatch`（0152 §2.6）を足す。`shadow_unavailable` は記録を作らず、
@@ -220,7 +226,7 @@ fand の受信と検証と記録・`ControlTick` の版上げ・learnd の `--hi
   `--format json|markdown`・`--out`。DB は他の shadow の CLI と同じく `coldaisle-evaluate` の `EvidenceDatabase`
   （`immutable=1`）で開き、書かない（migration も走らせない）。書くのは `--out` の 1 ファイルだけ。既定値で期間を
   決めない
-- **読むもの**: `hint_shadow_records` と、0133 §2.5a の join の契約（`(ts_ms, tick_id) = (source_ts_ms, source_tick_id)`
+- **読むもの**: `hint_shadow_records`（行の `worker_instance_id` で epoch に振り分ける。§2.3）と、0133 §2.5a の join の契約（`(ts_ms, tick_id) = (source_ts_ms, source_tick_id)`
   かつ最上位の `run_id` が等しい）で対応する `control_traces` の行の、ヒントの塊（`stage` / `influence` / `skipped` /
   `certificate` / `shadow_counters`）と 0053 の台帳（基準の plan が Gate に評価されたか）
 - **層**: `run_id` × 証明書（`certificate_sha256`）× (Regime, workload) の鍵ごとに数える。証明書・run・鍵の違う
@@ -271,7 +277,7 @@ fand の受信と検証と記録・`ControlTick` の版上げ・learnd の `--hi
 |---|---|---|
 | **PR-A frame と制御側の配線** | `LearnedFrame` v4（`supervisor_hint`・`hint_certification`（0152 §2.6 の期待値と `domain_lookback_ms`））。fand は実効の段階が B1 以上の tick だけ埋め、0133 §2.5 の関係（同じ tick・同じ regime・同じ policy の版・`target_band` だけが違う）を検査し、満たさなければ両方 `None`。RL worker への frame は常に `None`（0133 §2.2）。§2.2 の判定の関数。worker は v4 を受け、ヒントの欄を読まない | fand は埋めない（B0 のまま）。frame の版だけが上がる。fand と worker は同じ venv で入れ替わる（0157）ので、v3 / v4 の混在を扱わない |
 | **PR-B worker の Shadow solver の子プロセス** | 0133 §2.5 の子（`SCHED_IDLE` の確かめ・`PR_SET_PDEATHSIG`・1 枠の依頼・打ち切り時刻・作り直しの間隔）、子の照合（0152 §2.6・0157 §2.3 の `launch_form`）、残りの予算での二重解法（0160 §5 の 6 の入口）、§2.2 の worker の判定、ノンブロッキングで期限つきの転送（`SIOCOUTQ`・`MSG_DONTWAIT`・`SO_SNDBUF` の上乗せ・`max_shadow_record_bytes`）、§2.3 の累積の数、新しい受信の本文 `hint_shadow`。**learnd の `--hint-lockfile`**（0152 §5 の 4）と `deploy/systemd/coldaisle-learnd-mpc.service`・`docs/ubuntu-deploy.md` 6.8。決定論の試験と、実時間の試験（専用の marker。0133 §2.5） | 本文の型を `InboundBody` に足すと、いまの `server.py` は知らない型の本文でも末尾で生存の知らせ（`last_valid_mono_ms`）を数え直してしまう。そこで同じ PR で、fand の受信に `hint_shadow` を `unsupported_body` として捨て、生存に数えない分岐を足す（接続は切らない。§2.3）。frame に `supervisor_hint` が来ないので子は依頼を受けない |
-| **PR-C fand の受信・検証・記録と `ControlTick` の版上げ** | `hint_shadow` の受信と検証（新しさ・`run_id`・artifact・対の基準・証明書と `conditions` の digest。0133 §2.5 / 0152 §2.6）、§2.2 の環状の列・送り出しの時点の判定と保留の表・再検査、§2.3 の epoch ごとの数の検査、`hint_shadow_records` への書き込み（tick の外の書き手）と `record_json` の形、`HintShadowReason` の `certification_mismatch`、`ControlTick` v17（ヒントの塊に `certificate`（0152 §2.7）と `shadow_counters`（§2.3）。`WorkloadHintRecord` の版を上げる）、`airflow-trace.js` の `KNOWN_VERSIONS` と fixture（0133 §2.9）。**最後に `IMPLEMENTED_STAGE = SHADOW_MPC`** | 設定の `stage` の既定は `off` のまま。B1 が動くのは、所有者が設定を `shadow_mpc` にし、証明書を昇格し、0133 §2.6 の前提（RulePolicy の本番値・本番のホストでの実時間の試験の合格）を揃えたときだけ |
+| **PR-C fand の受信・検証・記録と `ControlTick` の版上げ** | `hint_shadow` の受信と検証（新しさ・`run_id`・artifact・対の基準・証明書と `conditions` の digest。0133 §2.5 / 0152 §2.6）、§2.2 の環状の列・送り出しの時点の判定と保留の表・再検査、§2.3 の epoch ごとの数の検査と `hint_shadow_records` の列 `worker_instance_id`（migration）、`hint_shadow_records` への書き込み（tick の外の書き手）と `record_json` の形、`HintShadowReason` の `certification_mismatch`、`ControlTick` v17（ヒントの塊に `certificate`（0152 §2.7）と `shadow_counters`（§2.3）。`WorkloadHintRecord` の版を上げる）、`airflow-trace.js` の `KNOWN_VERSIONS` と fixture（0133 §2.9）。**最後に `IMPLEMENTED_STAGE = SHADOW_MPC`** | 設定の `stage` の既定は `off` のまま。B1 が動くのは、所有者が設定を `shadow_mpc` にし、証明書を昇格し、0133 §2.6 の前提（RulePolicy の本番値・本番のホストでの実時間の試験の合格）を揃えたときだけ |
 | **PR-D 集計の CLI** | §2.4 の `coldaisle-hint-shadow` | 読むだけ。制御に届かない |
 
 - `IMPLEMENTED_STAGE` を PR-C で上げるのは、fand の受信・検証・記録が無いまま B1 の frame を出すと、worker が解いた
@@ -342,7 +348,7 @@ fand の受信と検証と記録・`ControlTick` の版上げ・learnd の `--hi
 **所有者の決定（2026-10-21）**: 1〜8 のすべてを推奨の案で承認した。§2 の本文はその決定を書いたものである。
 PR #365 の Codex のレビュー（P1 3 件）で、承認の趣旨を変えずに次を足した（判定を厳しくする向きと、数え方の誤りの修正）:
 §2.2 の判定を送り出しの時点で行い記録が届くまで保持する（届く前に消えたら範囲の外）・§2.3 の数の epoch
-（`worker_instance_id`）・§2.4 の区間ごとの差での数え方。2 回目のレビュー（P1 2 件）で、§2.4 の捨てた数と成功率を `run_id` × epoch の層に限り、数を観測の時刻で区間に振り分けてずれうる幅を出すことを足した
+（`worker_instance_id`）・§2.4 の区間ごとの差での数え方。2 回目のレビュー（P1 2 件）で、§2.4 の捨てた数と成功率を `run_id` × epoch の層に限り、数を観測の時刻で区間に振り分けてずれうる幅を出すことを足した。3 回目のレビュー（P1 1 件）で、`hint_shadow_records` のすべての行に `worker_instance_id` を残すこと（PR-C の migration）を足した
 
 | # | 判断点 | 選択肢（推奨を先頭） |
 |---|---|---|
