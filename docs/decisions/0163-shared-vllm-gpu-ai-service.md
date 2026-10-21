@@ -152,6 +152,7 @@
 | `enable_thinking=false` を送った要求 | 400 にならず、`content` に `<think>` が無い。400 なら `send_thinking_flag: false` にする（0014 §2.3） |
 | `coldaisle-report --no-send --print`（probe と同じ形で Provider を明示する） | 「所見」の節が付き、journal に Claude の行が出ない |
 | （参考）`tools` を付けた要求 1 回 | `tool_calls[].function.arguments` が JSON の文字列で返る |
+| PAW の vLLM が動いているときの `sys.gpu_state`（§2.6 の実装の後） | `ai`（他の CUDA process があれば `mixed`）。`compute` なら `ai_units` が古い（§2.6 の陽性の対照） |
 
 **試すときの Provider の指定**（PR #364 の指摘）
 
@@ -251,7 +252,14 @@ ai_units:            # 推論サーバの systemd unit 名（完全一致）。�
 - 一覧に入れるのは unit 名だけで、PID・uid・ホスト名・パスは書かない（ルール 10）。置き場所は §5 の 4
 - 形が不正（鍵が無い・空でない文字列の一覧でない・`.service` で終わらない）なら `coldaisle-telemetry` は `sys.gpu_state` を `unknown` にして収集を続ける
   （温度の収集を止めない。#63 の「Compute Mode 中も温度欠測なし」）
-- #63 の「AI 由来 CUDA process = 0 を確認可能」は `sys.gpu_state` が `idle` か `compute` であることで確かめる。数のメトリクスは足さない（§5 の 9）
+- #63 の「AI 由来 CUDA process = 0 を確認可能」の確かめ方（PR #364 の指摘）
+  - **`idle` だけが、NVML に CUDA process が1つも無いことの証拠になる。** `compute` は「`ai_units` に入る unit の process が無い」ことしか言わない。
+    推論サーバの unit が一覧から漏れていれば（PAW の unit の改名・新しい推論サーバ）、その process も `compute` に数えられ、0006 では `compute` は
+    通常の値なので警告も出ない。つまり `compute` が「AI 由来 0」を意味するのは、**`ai_units` が推論サーバの unit をすべて含むという前提の下だけ**である
+  - その前提は実行時には確かめられない（数のメトリクスは足さない。§5 の 9）。そこで導入時と PAW の変更時（unit 名・推論サーバの追加）のスモークテスト
+    （§2.2 の表）で**陽性の対照**を取る: PAW の vLLM（と Ollama）を動かしているときに `sys.gpu_state` が `ai`（他の CUDA process があれば `mixed`）になり、
+    `compute` にならないことを確かめる。`compute` になったら `ai_units` を直すまで、`compute` を「AI 由来 0」の証拠に使わない
+  - #63 の受入の試験は、PAW の Scheduler が vLLM を止めた後に `idle` になること（他の CUDA の負荷が無いとき）と、上の陽性の対照の 2 つで行う
 - `sys.gpu_state` は観測の記録だけで、fand・Learned・Critical Safety の入力にしない（0045 の GPU Mode と同じ扱い）。閾値の切り替え（#18）は別に決める
 - GPU Mode（PAW が申告する指令値）からは決めない。指令と実態はずれる（0002 §2.6「用語の区別」）
 - `/proc` を読むことは読み取りだけで、LLM の層に権限を足さない。LLM が `sys.gpu_state` を見るのは既存の読み取り専用のツールを通るときだけで、ツールは足さない（ルール 1）
@@ -310,7 +318,7 @@ ai_units:            # 推論サーバの systemd unit 名（完全一致）。�
 | 停止・起動の判断が PAW の1か所になり、二重の調整が要らない | 窓口（ポート・`main`）が PAW の都合で変わりうる | 変わっても「利用不可」になるだけ。PAW の変更時に §2.2 のスモークテスト |
 | Claude API の鍵と外への経路が導入先から消える（0143 §2.9） | `main` の実体が変わっても coldaisle は気づかない | スモークテストで `/v1/models` の `root` を記録（§5 の 8） |
 | Compose を作らず、今の systemd の導入・権限・deadman の設計をそのまま使える | #64 の Issue の構想（3 層）は実現しない | Core と GPU AI の分離は unit の独立と `sys.gpu_state` で満たす（§2.8） |
-| `sys.gpu_state` が子プロセスやプロセス名の違いに左右されない | PAW や Ollama の unit 名が変わると `compute` と誤る | 一覧を設定に置く（§2.6）。誤ると `mixed` / `compute` が見え、0006 §2.4 の警告で気づける |
+| `sys.gpu_state` が子プロセスやプロセス名の違いに左右されない | PAW や Ollama の unit 名が変わると、その process を `compute` と誤り、`compute` は通常の値なので警告も出ない（実行時には気づけない） | 一覧を設定に置く（§2.6）。導入時と PAW の変更時に陽性の対照（vLLM を動かして `ai` になる）を取り、取れていない間は `compute` を「AI 由来 0」の証拠に使わない（§2.6） |
 | | 共用の窓口なので、PAW の長い要求と重なると coldaisle の要求が遅れ `timeout_s` で利用不可になりうる | 監視は待たない（0014 §2.5）。NFR-04 は重ならないときで測り、重なったときは参考（§2.4） |
 | | 日次レポートの時刻に vLLM が止まっていると、その日の所見が欠ける | 再試行や待ちは足さない（0014 §2.5）。表は届く |
 
