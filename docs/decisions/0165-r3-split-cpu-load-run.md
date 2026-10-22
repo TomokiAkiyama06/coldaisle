@@ -1,7 +1,7 @@
 # 決定記録 0165: 0161 の R3 を、2 時間の本回と CPU の負荷を補う回の組で満たしたとする（2026-10-22 の一回だけ）
 
 - **種別**: Decision Record
-- **Status**: Proposed
+- **Status**: FINAL（2026-10-22、リポジトリ所有者の承認）
 - **Date**: 2026-10-22
 - **Supersedes**: なし（[`0161`](0161-fand-enable-prerequisites.md) §2.4 の R3 の手順を、2026-10-22 の一回に限って補う。0161 の決定は置き換えない。新しい安全の値は決めない）
 - **関連**: [`0161`](0161-fand-enable-prerequisites.md) §2.4 / §2.5 / [`0121`](0121-hardware-test-procedure.md) §2.1 / §2.3 /
