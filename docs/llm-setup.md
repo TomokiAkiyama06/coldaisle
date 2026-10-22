@@ -66,41 +66,132 @@ MODEL_NAME=qwen3:8b
 
 ---
 
-## Ubuntu + RTX PRO 6000（本番）
+## Ubuntu + RTX PRO 6000（本番）: PAW の vLLM を共用する
 
-vLLM を使います。**常駐させません。** Compute Mode ではプロセスごと停止して
-VRAM を全解放します（決定 D-14 / 要件 §7.2）。
+coldaisle 専用の vLLM は**立てない**。同じ機械で Personal AI Workspace（PAW）が動かしている vLLM を、
+OpenAI 互換の窓口として読むだけにする（決定記録 [0163](decisions/0163-shared-vllm-gpu-ai-service.md)）。
+**coldaisle は vLLM を起動も停止もしない。** 起動・停止は PAW の Compute Resource Scheduler が持つ。
+
+PAW の vLLM の値（0163 §1.2。**PAW が決める値**で、coldaisle の設定ではない）:
+
+| 項目 | 値 |
+|---|---|
+| モデル | Qwen3.8-27B-FP8（決定記録 0005 の「27B FP8 単体」） |
+| `--served-model-name` | `main` |
+| 待ち受け | `127.0.0.1:18080`（ループバックだけ） |
+| `--gpu-memory-utilization` | `0.51` |
+| `--max-model-len` | `131072` |
+| 思考 | `--reasoning-parser qwen3` |
+| ツール | `--enable-auto-tool-choice --tool-call-parser qwen3_coder` |
+
+導入先の `/etc/coldaisle/coldaisle.env`（git の外）に書くのは次だけ（0163 §2.1）。`config/ai.yaml` には書かない。
 
 ```bash
-vllm serve Qwen/Qwen3.8-27B \
-  --enable-auto-tool-choice \
-  --tool-call-parser hermes \
-  --max-model-len 32768 \
-  --gpu-memory-utilization 0.4 \
-  --port 8001
+# /etc/coldaisle/coldaisle.env
+COLDAISLE_LLM_PROVIDER=openai_compatible   # 書かなくてもよい（既定の経路）
+OPENAI_BASE_URL=http://127.0.0.1:18080/v1
+MODEL_NAME=main                            # PAW の別名。モデルの実体の名前は書かない
+# OPENAI_API_KEY は書かない（PAW の vLLM は --api-key を付けていない。PAW が鍵を付けたら、そのときに書く）
 ```
+
+- `MODEL_NAME` を `main` にするのは、PAW がモデルを差し替えても coldaisle の設定を変えずに済むようにするためである
+- ポートと `main` は PAW が決める窓口である。PAW が変えると coldaisle は「利用不可」になるだけで、監視は止まらない（FR-507）。
+  変えたことに気づく仕組みは置かず、導入時と PAW の変更時に下の「スモークテスト」で確かめる
+- 送るのは今と同じ集計値だけである（ルール 8 / FR-504）。生の時系列・decision trace・ツールの結果は送らない
+
+### 起動しない・待たない（0163 §2.3）
+
+- coldaisle は `systemctl` も D-Bus も呼ばない。coldaisle の unit は PAW の unit への `Wants=` / `Requires=` / `After=` を持たない
+- 止まっていれば接続は拒否され、`max_attempts`（2）と `retry_backoff_s`（0.5 s）の後に「利用不可」として返る（0014 §2.5）。
+  起きるまで待つ・起こしに行く・後で作り直すことはしない
+- 止まっている間は、日次レポートは表だけ、アラートは素の文だけ、Server Health はテンプレート（`ai_layer: stopped`）になる。
+  日次レポートのタイマーの時刻に vLLM が止まっていれば、その日の所見は付かない
+- Compute Mode で VRAM を空けるのは PAW の Scheduler の責任である。coldaisle はそれを `sys.gpu_state`（0163 §2.6）で観測するだけである
+
+### tool-call parser と reasoning の前提（0163 §2.2）
+
+**今の実装のまま受けられる。コードは変えない。**
+
+- coldaisle 自身の呼び出し（日次レポートの所見・アラートの説明・Server Health の要約・`probe()`）は `tools` を送らない。
+  parser が効くのは要求に `tools` があるときだけなので、`qwen3_coder` か `hermes` かは結果に効かない
+- vLLM の parser は `tool_calls[].function.arguments` を JSON の文字列で返し、`ToolRegistry.call` はそれを受ける。
+  ただし coldaisle は tool loop を持たない。ツールを使う会話は Workspace のチャットが持つ（FR-502）
+- reasoning parser は思考を `message.content` から別の欄（vLLM の版により `reasoning_content` または `reasoning`）へ移す。
+  Provider は `content` だけを読むので、本文に思考は混ざらない。`<think>` の切り離し（0014 §2.4）は安全網として残す
+- 思考の指示は今のまま `send_thinking_flag: true`（`chat_template_kwargs.enable_thinking=false` を送る。0014 §2.3）
+
+### スモークテスト（導入時と PAW の変更時。0163 §2.2）
+
+PAW の vLLM が動いているときに行う。
+
+| 確かめること | 期待 |
+|---|---|
+| `GET /v1/models` | `main` があり、`root` が Qwen3.8-27B-FP8 を指す。`root` を導入の記録に残す |
+| `Provider.probe()`（`coldaisle` の uid で。Provider を明示し、導入先の env を読ませない） | `利用可`、かつ `model` が `main`（Claude のモデル ID なら Claude を試している） |
+| `enable_thinking=false` を送った要求 | 400 にならず、`content` に `<think>` が無い。400 なら `send_thinking_flag: false` にする（0014 §2.3） |
+| `coldaisle-report --no-send --print`（probe と同じ形で Provider を明示する） | 「所見」の節が付き、journal に Claude の行が出ない |
+| （参考）`tools` を付けた要求 1 回 | `tool_calls[].function.arguments` が JSON の文字列で返る |
+| PAW の vLLM が動いているときの `sys.gpu_state`（0163 §2.6 の実装の後） | `ai`（他の CUDA process があれば `mixed`）。`compute` なら `config/gpu_state.yaml` の `ai_units` が古い |
+
+**試すときの Provider の指定（重要）**
+
+- `provider_from_env()` は最初に `COLDAISLE_LLM_PROVIDER` を読み、`anthropic` なら `OPENAI_BASE_URL` / `MODEL_NAME` を見ずに Claude を使う。
+  0143 を有効にしたままの `/etc/coldaisle/coldaisle.env` を読ませたまま `OPENAI_BASE_URL` / `MODEL_NAME` だけを足すと、**PAW ではなく Claude を試して `利用可` になる**
+- systemd では `EnvironmentFile=` の値が `--setenv` を上書きする。env を読ませたまま `--setenv=COLDAISLE_LLM_PROVIDER=openai_compatible` を足しても効かない
+- そこで切り替えの前の試験（probe・レポート・NFR-04 の測定）は、**`-p EnvironmentFile=/etc/coldaisle/coldaisle.env` を付けず**、
+  使う値をすべて `--setenv` で渡す。`ANTHROPIC_*` は渡さない。結果の `model` が `main` であることも出して確かめる
+- 切り替えの後（下の「Claude API から戻す」の手順 2〜4 の後）の確かめは env を読ませてよい。そのときも `model` が `main` であることを見る
 
 ```bash
-# .env
-OPENAI_BASE_URL=http://127.0.0.1:8001/v1
-MODEL_NAME=Qwen/Qwen3.8-27B
+# 1. 窓口のモデル（root を記録する）
+curl -s http://127.0.0.1:18080/v1/models | python3 -m json.tool
+
+# 2. probe（env を読ませず、Provider を明示する）
+sudo systemd-run --wait --pipe --uid=coldaisle --gid=coldaisle \
+  -p WorkingDirectory=/opt/coldaisle \
+  --setenv=COLDAISLE_LLM_PROVIDER=openai_compatible \
+  --setenv=OPENAI_BASE_URL=http://127.0.0.1:18080/v1 \
+  --setenv=MODEL_NAME=main \
+  /opt/coldaisle/.venv/bin/python -c "
+from pathlib import Path
+from coldaisle.ai import AiSettings, provider_from_env
+r = provider_from_env(AiSettings.from_yaml(Path('config/ai.yaml'))).probe()
+print(('利用可' if r.available else f'利用不可: {r.reason}'), 'model=' + r.model)
+"
+
+# 3. enable_thinking=false の要求（content に <think> が無いこと。400 にならないこと）
+curl -s http://127.0.0.1:18080/v1/chat/completions -H 'Content-Type: application/json' -d '{
+  "model": "main", "stream": false, "max_tokens": 64,
+  "messages": [{"role": "user", "content": "ping"}],
+  "chat_template_kwargs": {"enable_thinking": false}
+}' | python3 -m json.tool
+
+# 4. 日次レポート（送らない。probe と同じ形で Provider を明示する）
+sudo systemd-run --wait --pipe --uid=coldaisle --gid=coldaisle \
+  -p WorkingDirectory=/opt/coldaisle \
+  --setenv=COLDAISLE_LLM_PROVIDER=openai_compatible \
+  --setenv=OPENAI_BASE_URL=http://127.0.0.1:18080/v1 \
+  --setenv=MODEL_NAME=main \
+  /opt/coldaisle/.venv/bin/coldaisle-report --db /var/lib/coldaisle/coldaisle.db --no-send --print
+journalctl -u coldaisle-daemon -u coldaisle-api --since -10min | grep -i 'claude'   # 何も出なければ良い（上の --pipe の出力にも出ないこと）
 ```
 
-### `--gpu-memory-utilization 0.4` の理由
+### NFR-04（初回トークン 2 s）の測り方（0163 §2.4）
 
-96GB のうち **4割（約38GB）** を上限にしています。27B を FP8 で載せると
-重みが 30〜33GB で、残りが KV プールになります（決定記録 0005）。
+Provider は `stream: false` なので、測定は Provider を通さず、同じ窓口へ同じ形の要求をストリーミングで送る一回限りの手順で行う。
+**測定をコードと CI に足さない。**
 
-**これは「常駐してよい」という意味ではありません。** 研究・学習・Kaggle が
-GPU の主目的であり（#27）、Compute Mode では上限を切るのではなく
-**プロセスを完全停止して VRAM を全解放**します。
-停止の判定は「Docker を止めた」ではなく **NVML で CUDA プロセス数が 0 になったこと**で行います。
+| 項目 | 決め |
+|---|---|
+| 状態 | **warm**（PAW の vLLM が起動済みでモデルを読み終えている）。起動にかかる時間は coldaisle が待たないので範囲の外 |
+| 要求 | coldaisle の最も長い実際のプロンプト（`explain_context` を足したアラートの説明）と同じ長さ・`enable_thinking=false`・`max_tokens` 1024・`stream: true` |
+| 計る区間 | 要求を送ってから、最初の `content` の差分が届くまで |
+| 回数 | 20 回。間をあけて送る（prefix cache で 2 回目以降だけ速くならないよう、プロンプトの先頭の時刻の行を毎回変える） |
+| 合格 | PAW の他の要求が無いときに **20 回すべて 2 s 以内** |
+| 参考 | PAW の要求と重なったときの値も記録する。合否には使わない（共用の窓口で、相手の負荷は coldaisle が決められない） |
 
-### 導入時に確かめること（決定記録 0005 §2.2）
-
-- vLLM が Blackwell (sm_120) でこのモデルを動かせること
-- HuggingFace のリポジトリ ID（`Qwen/Qwen3.8-27B` を想定）
-- ツールコールパーサの推奨値（vLLM / モデルのバージョンで変わる）
+- 結果は文書の PR か導入の記録に残す
+- 2 s を超えたら、所有者が PAW 側の設定（`--max-num-seqs` など）を含めて扱いを決める
 
 ---
 
@@ -117,12 +208,13 @@ print('利用可' if result.available else f'利用不可: {result.reason}')
 
 **LLM が止まっていても、取り込み・保存・API・ダッシュボード・ルールエンジンは
 そのまま動きます**（FR-507）。この確認は AI 機能を使うときだけ必要です。
+導入先（本番）では、これではなく上の「スモークテスト」を使う（Provider を明示し、`model` も確かめる）。
 
 ---
 
 ## Claude API（ローカル LLM が入るまでの代わり。決定記録 0143）
 
-導入先にローカル LLM（vLLM。#58）が入るまでの間だけ、日次レポートの所見とアラートの説明を
+導入先がローカル LLM（PAW の vLLM の共用。#58 / 決定記録 0163）へ切り替わるまでの間だけ、日次レポートの所見とアラートの説明を
 Claude API で作れます。**既定では使いません。**
 Server Health の任意要約は、API を `coldaisle.server:app` で起動したときだけ作られます。
 導入先の `coldaisle-api.service` は `coldaisle.api:app` で起動しているので、今の導入では作られません（0143 §5 の 5）。
@@ -206,10 +298,19 @@ Server Health の任意要約は、API を `coldaisle.server:app` で起動し�
 
    「所見」の節が出れば有効です。出なければ journal の `reason`（`HTTP 401: authentication_error` など）を見ます
 
-### ローカル LLM が入ったら戻す（0143 §2.9）
+### Claude API から戻す（0143 §2.9 / 0163 §2.5）
 
-1. vLLM を動かし、上の「動作確認」を通す
-2. `/etc/coldaisle/coldaisle.env` から `COLDAISLE_LLM_PROVIDER` を消し（または `openai_compatible`）、
-   `OPENAI_BASE_URL` / `MODEL_NAME` を書く
-3. `ANTHROPIC_API_KEY`（と `ANTHROPIC_WORKSPACE_ID`）を消し、Console で鍵を無効にする
-4. `sudo systemctl restart coldaisle-daemon coldaisle-api`
+0143 §2.9 の手順を、上の「本番」の値で行う。**所有者が導入先で行う。**
+
+1. PAW の vLLM が動いているときに、上の「スモークテスト」を通す。`/etc/coldaisle/coldaisle.env` を変える前なので、
+   **env を読ませず、Provider を `--setenv=COLDAISLE_LLM_PROVIDER=openai_compatible` で明示する**（「試すときの Provider の指定」）。
+   `利用可` と `model` が `main` の両方が出るまで手順 2 へ進まない（Claude を試して通ったまま鍵を消さない）
+2. `/etc/coldaisle/coldaisle.env` の `COLDAISLE_LLM_PROVIDER=anthropic` を `COLDAISLE_LLM_PROVIDER=openai_compatible` に書き換え
+   （消してもよいが、明示のほうが読み違えない）、`OPENAI_BASE_URL=http://127.0.0.1:18080/v1` と `MODEL_NAME=main` を書く
+3. `ANTHROPIC_API_KEY`（と `ANTHROPIC_WORKSPACE_ID`・`ANTHROPIC_MODEL`）を消し、Anthropic の Console で鍵を無効にする
+4. `sudo systemctl restart coldaisle-daemon coldaisle-api`（`coldaisle-report` は次のタイマーの起動から効く）
+5. env を読ませた形（`-p EnvironmentFile=/etc/coldaisle/coldaisle.env`）で `probe()` の `model` が `main` であることと、
+   前日のレポートを `--no-send --print` で作り所見が付くこと・journal に Claude の行が出ないことを確かめる
+
+**`AnthropicProvider` のコードは残す**（0163 §2.5）。外へ送るのは `COLDAISLE_LLM_PROVIDER=anthropic` と鍵の両方を置いたときだけで、
+手順 2・3 で両方が導入先から消える。**vLLM が止まっているときに Claude API へ自動で切り替える経路は無い。** 止まっていればテンプレートへ縮退する。
