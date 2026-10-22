@@ -323,7 +323,7 @@ src/coldaisle/
   web/        # L4: 静的アセット。airflow-trace.js が decision trace の版の解釈を1か所で持つ（0071 §2.3）
 firmware/     # ESP32-S3 Arduino スケッチ。**コンパイルは人の手**（#11 / 決定記録 0022 §2.9）
 deploy/       # Ubuntu 常駐化のテンプレート（systemd / udev）。**仮の値だけ**。手順は docs/ubuntu-deploy.md（#57）
-config/       # rules.yaml, calibration.json, coldaisle.toml, evaluation.yaml, drift.yaml, air-balance-shadow.yaml, rl-training.yaml, soak.yaml, load-distribution.yaml, airflow-characterization.yaml, control-admin.yaml / control-admin.dev.yaml, learned-channel.yaml, training.example.yaml（`coldaisle-train` の仮の値の例）（Control Config の4ファイル fan-hardware / safety / fan-policy / air-balance は実運用のものを置かない。docs/control-config.md）
+config/       # rules.yaml, calibration.json, coldaisle.toml, evaluation.yaml, drift.yaml, air-balance-shadow.yaml, rl-training.yaml, soak.yaml, load-distribution.yaml, airflow-characterization.yaml, control-admin.yaml / control-admin.dev.yaml, learned-channel.yaml, gpu_state.yaml（`sys.gpu_state` の `ai_units`。決定記録 0163 §2.6）, training.example.yaml（`coldaisle-train` の仮の値の例）（Control Config の4ファイル fan-hardware / safety / fan-policy / air-balance は実運用のものを置かない。docs/control-config.md）
 memory/       # 運用メモリ（いまの閾値・較正値）。`coldaisle-memory` が更新案を出す
 docs/         # 要件定義、仕様レビュー、ADR
 tests/

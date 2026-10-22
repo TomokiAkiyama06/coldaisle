@@ -9,6 +9,7 @@ from types import ModuleType
 from typing import Any, NamedTuple, Protocol, cast
 
 from coldaisle.internal_telemetry.config import NvmlConfig
+from coldaisle.internal_telemetry.gpu_state import GPU_STATE_KEY, GpuState, GpuStateClassifier
 from coldaisle.internal_telemetry.models import AdapterResult, SourceStatus
 from coldaisle.store import Quality, Reading
 
@@ -235,13 +236,25 @@ def _gpu_metrics(index: int) -> tuple[str, ...]:
 
 
 class NvmlAdapter:
-    """単一 GPU を1回の NVML session から読み取る。"""
+    """単一 GPU を1回の NVML session から読み取る。
+
+    ``gpu_state`` を渡すと、compute process の PID から ``sys.gpu_state`` を決めて
+    ``AdapterResult.states`` に載せる（決定記録 0163 §2.6）。NVML が使えない・process の
+    一覧が欠けた周期は ``unknown``。渡さなければ状態を出さない（読み取りの値だけ）。
+    """
 
     name = "nvml"
 
-    def __init__(self, config: NvmlConfig, api: NvmlApi | None = None) -> None:
+    def __init__(
+        self,
+        config: NvmlConfig,
+        api: NvmlApi | None = None,
+        *,
+        gpu_state: GpuStateClassifier | None = None,
+    ) -> None:
         self._config = config
         self._api = api or PynvmlApi()
+        self._gpu_state = gpu_state
         self._initialized = False
         self._expected_metrics = (
             *(metric for index in config.gpu_indices for metric in _gpu_metrics(index)),
@@ -253,9 +266,24 @@ class NvmlAdapter:
         return self._expected_metrics if self._config.enabled else ()
 
     def poll(self) -> AdapterResult:
-        """GPUごとの失敗を分離して読み、取得不能値を missing にする。"""
+        """GPUごとの失敗を分離して読み、取得不能値を missing にする。
+
+        予期しない例外も collector と同じく source の ``unavailable`` に畳むが、ここで畳むのは
+        ``sys.gpu_state`` を ``unknown`` にするため。collector で畳むと状態が書かれず、
+        直前の値（たとえば ``idle``）が残り続ける。
+        """
+        try:
+            return self._poll()
+        except Exception as error:
+            return self._unavailable(error)
+
+    def _poll(self) -> AdapterResult:
         if not self._config.enabled:
-            return AdapterResult(source=self.name, status=SourceStatus.DISABLED)
+            return AdapterResult(
+                source=self.name,
+                status=SourceStatus.DISABLED,
+                states=self._unknown_state("nvml_disabled"),
+            )
         try:
             if not self._initialized:
                 self._api.initialize()
@@ -269,6 +297,7 @@ class NvmlAdapter:
                 status=SourceStatus.UNAVAILABLE,
                 readings=tuple(_missing(metric) for metric in self.expected_metrics),
                 detail=f"unexpected_device_count:{count}",
+                states=self._unknown_state(f"unexpected_device_count:{count}"),
             )
 
         readings: list[Reading] = []
@@ -357,7 +386,32 @@ class NvmlAdapter:
             status = SourceStatus.DEGRADED
         else:
             status = SourceStatus.OK
-        return AdapterResult(source=self.name, status=status, readings=tuple(readings))
+        if process_info_complete:
+            states = self._classified_state(process_ids)
+        else:
+            # 一部の GPU の一覧しか無いと、見えていない GPU の process を数え落とし
+            # idle / ai と誤る。温度の status とは独立に unknown にする
+            states = self._unknown_state("compute_process_list_incomplete")
+        return AdapterResult(
+            source=self.name, status=status, readings=tuple(readings), states=states
+        )
+
+    def _classified_state(self, process_ids: set[int]) -> tuple[tuple[str, str], ...]:
+        if self._gpu_state is None:
+            return ()
+        try:
+            state = self._gpu_state.classify(process_ids)
+        except Exception as error:
+            # 判定の失敗で温度まで欠測にしない（#63「Compute Mode 中も温度欠測なし」）。
+            # 握りつぶさず unknown とその理由をログに残す
+            return self._unknown_state(f"classification_failed:{type(error).__name__}")
+        return ((GPU_STATE_KEY, state.value),)
+
+    def _unknown_state(self, reason: str) -> tuple[tuple[str, str], ...]:
+        if self._gpu_state is None:
+            return ()
+        self._gpu_state.unknown(reason)
+        return ((GPU_STATE_KEY, GpuState.UNKNOWN.value),)
 
     @staticmethod
     def _read(reader: Callable[[object], float | None], handle: object) -> float | None:
@@ -375,6 +429,7 @@ class NvmlAdapter:
             status=SourceStatus.UNAVAILABLE,
             readings=tuple(_missing(metric) for metric in self.expected_metrics),
             detail=type(error).__name__,
+            states=self._unknown_state(f"nvml_unavailable:{type(error).__name__}"),
         )
 
     def close(self) -> None:
