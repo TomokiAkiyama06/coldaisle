@@ -540,6 +540,7 @@ R3 の CPU の負荷は本回でかからず、所有者の判断で別の回で
 | `skipped_slots`（停止時の集計） | 0（`ticks` 7205・`overruns` 0・`recorded` 7205・`trace_dropped` 0・`emergency_max` false） | 0 | 合格 |
 | systemd の watchdog による終了・再起動・異常終了 | 0 回 | 0 回 | 合格 |
 | `*_telemetry_stale` / `write_failure`・`readback_mismatch`・`enable_reverted` / `tach_stall` | 0 回（fault は 0） | 0 回 | 合格 |
+| `cpu_power_unavailable`（0123 §2.3。Top の reason の detail で、fault にはならない） | 0 tick。DB の `power.cpu.package` の sample は 2882 件で、間隔の最大 2502 ms（古さの上限 5000 ms に届く間隔は 0） | 収集が止まった時間を除き 0 回 | 合格 |
 | trace の `schema_version` と欠け | すべて 16（7205 tick）・`tick_id` の飛び 0・ts の差 1500 ms 以上 0 | 16・欠け 0 | 合格 |
 
 - 健全度は 7205 tick すべて `normal`。`safety_state` は `startup` 17 tick・`normal` 7188 tick、`mode` はずっと `auto`
@@ -565,6 +566,7 @@ R3 の CPU の負荷は本回でかからず、所有者の判断で別の回で
 | `skipped_slots` | 0（`ticks` 1504・`overruns` 0・`recorded` 1504・`trace_dropped` 0） | 合格 |
 | watchdog による終了・再起動・異常終了 | 0 回 | 合格 |
 | stale / 書き込みの失敗 / `tach_stall` | 0 回 | 合格 |
+| `cpu_power_unavailable`（0123 §2.3） | 0 tick。`power.cpu.package` の sample は 602 件で、間隔の最大 2502 ms（5000 ms に届く間隔は 0） | 合格 |
 | trace の `schema_version` と欠け | すべて 16（1504 tick）・欠け 0 | 合格 |
 
 - 判定のスクリプト（`r3-verdict-0161.py`）の「期間がおよそ 2 時間」と「GPU の負荷 10 分」の行は 2 時間の本回のための行で、この回では
