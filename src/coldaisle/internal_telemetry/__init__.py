@@ -1,6 +1,6 @@
 """Internal Telemetry（NVML / hwmon / /proc/stat / CPU Package 電力）の読み取り専用実装。
 
-#65 / #278
+#65 / #278。``sys.gpu_state`` の識別（NVML の PID と ``/proc/<pid>/cgroup``）は #63
 """
 
 from coldaisle.internal_telemetry.collector import CollectionCycle, InternalTelemetryCollector
@@ -17,6 +17,13 @@ from coldaisle.internal_telemetry.config import (
     ProcStatConfig,
 )
 from coldaisle.internal_telemetry.cpu_power import CPU_POWER_SCHEMA_VERSION, CpuPowerAdapter
+from coldaisle.internal_telemetry.gpu_state import (
+    GPU_STATE_KEY,
+    GpuState,
+    GpuStateClassifier,
+    GpuStateConfig,
+    ProcCgroupReader,
+)
 from coldaisle.internal_telemetry.hwmon import HwmonAdapter
 from coldaisle.internal_telemetry.models import (
     SOURCE_STATE_PREFIX,
@@ -44,6 +51,7 @@ __all__ = [
     "CONNECTOR_TEMPERATURE_METRIC",
     "CPU_POWER_SCHEMA_VERSION",
     "CPU_UTILIZATION_METRIC",
+    "GPU_STATE_KEY",
     "SOURCE_STATE_PREFIX",
     "TELEMETRY_KIND_KEY",
     "THROTTLE_REASON_BITS",
@@ -55,6 +63,9 @@ __all__ = [
     "CpuPowerAdapter",
     "CpuPowerConfig",
     "CpuTimes",
+    "GpuState",
+    "GpuStateClassifier",
+    "GpuStateConfig",
     "HwmonAdapter",
     "HwmonConfig",
     "HwmonMeasurement",
@@ -64,6 +75,7 @@ __all__ = [
     "NvmlAdapter",
     "NvmlApi",
     "NvmlConfig",
+    "ProcCgroupReader",
     "ProcStatAdapter",
     "ProcStatConfig",
     "PynvmlApi",

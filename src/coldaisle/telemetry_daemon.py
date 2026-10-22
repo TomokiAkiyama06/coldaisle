@@ -15,12 +15,16 @@ from dataclasses import dataclass
 from pathlib import Path
 from types import FrameType
 
+import yaml
+
 from coldaisle import logs
 from coldaisle.clock import Clock, WallClock
 from coldaisle.internal_telemetry import (
     SOURCE_STATE_PREFIX,
     TELEMETRY_KIND_KEY,
     CpuPowerAdapter,
+    GpuStateClassifier,
+    GpuStateConfig,
     HwmonAdapter,
     InternalTelemetryCollector,
     InternalTelemetryConfig,
@@ -39,6 +43,7 @@ DEFAULT_DB = Path("var/coldaisle.db")
 DEFAULT_CONFIG = Path("config/internal-telemetry.yaml")
 DEFAULT_QUALITY_RULES = Path("config/quality.yaml")
 DEFAULT_METRICS = Path("config/metrics.yaml")
+DEFAULT_GPU_STATE = Path("config/gpu_state.yaml")
 
 
 @dataclass(frozen=True, slots=True)
@@ -49,6 +54,7 @@ class Config:
     telemetry: Path = DEFAULT_CONFIG
     quality_rules: Path = DEFAULT_QUALITY_RULES
     metrics: Path = DEFAULT_METRICS
+    gpu_state: Path = DEFAULT_GPU_STATE
 
 
 @dataclass(slots=True)
@@ -184,6 +190,9 @@ class InternalTelemetryDaemon:
                         source.status.value,
                         at_ms=cycle.sample.ts_ms,
                     )
+                    # sys.gpu_state など。値が変わったときだけ行が増える（0002 §2.6）
+                    for key, value in source.states:
+                        self._store.set_system_state(key, value, at_ms=cycle.sample.ts_ms)
                     if source.status in (SourceStatus.DEGRADED, SourceStatus.UNAVAILABLE):
                         LOGGER.warning(
                             "Internal Telemetry source の取得が不完全",
@@ -272,7 +281,7 @@ def build(
     # 名乗った種類（mock）と実際に読む先が食い違う
     used_adapters = (
         (
-            NvmlAdapter(telemetry.nvml),
+            NvmlAdapter(telemetry.nvml, gpu_state=load_gpu_state_classifier(config.gpu_state)),
             HwmonAdapter(telemetry.hwmon),
             ProcStatAdapter(telemetry.proc_stat),
             # stale の判定を collector と同じ時計で行う（決定記録 0122 §2.3）
@@ -298,6 +307,30 @@ def build(
         source_kind=source_kind,
         sleep=sleep,
     )
+
+
+def load_gpu_state_classifier(path: Path) -> GpuStateClassifier:
+    """``config/gpu_state.yaml`` を読む。読めない・形が不正なら常に ``unknown`` を出す判定器にする。
+
+    **起動を止めない**（決定記録 0163 §2.6）。``sys.gpu_state`` は観測の記録だけで、
+    設定の誤りで温度・電力の収集まで止めると #63 の「Compute Mode 中も温度欠測なし」を破る。
+    誤りは起動時のログと、``sys.gpu_state = unknown`` が続くことで分かる。
+    """
+    try:
+        config = GpuStateConfig.from_yaml(path)
+    except (OSError, ValueError, yaml.YAMLError) as error:
+        LOGGER.error(
+            "gpu_state の設定を読めない。sys.gpu_state は unknown になる",
+            extra={logs.FIELDS_KEY: {"path": str(path), "error": type(error).__name__}},
+        )
+        return GpuStateClassifier(
+            None, config_error=f"gpu_state_config_invalid:{type(error).__name__}"
+        )
+    LOGGER.info(
+        "gpu_state configuration",
+        extra={logs.FIELDS_KEY: {"ai_units": list(config.ai_units)}},
+    )
+    return GpuStateClassifier(config)
 
 
 def _log_configuration(config: InternalTelemetryConfig) -> None:
@@ -358,6 +391,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
     parser.add_argument("--quality-rules", type=Path, default=DEFAULT_QUALITY_RULES)
     parser.add_argument("--metrics", type=Path, default=DEFAULT_METRICS)
+    parser.add_argument(
+        "--gpu-state-config",
+        type=Path,
+        default=DEFAULT_GPU_STATE,
+        help="sys.gpu_state の識別規則（ai_units）。読めなければ sys.gpu_state は unknown",
+    )
     parser.add_argument("--once", action="store_true", help="1回収集して終了する")
     parser.add_argument("--log-level", default="INFO")
     return parser
@@ -373,6 +412,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             telemetry=args.config,
             quality_rules=args.quality_rules,
             metrics=args.metrics,
+            gpu_state=args.gpu_state_config,
         )
     )
 
