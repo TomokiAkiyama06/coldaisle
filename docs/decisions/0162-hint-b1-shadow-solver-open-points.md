@@ -296,8 +296,9 @@ fand の受信と検証と記録・`ControlTick` の版上げ・learnd の `--hi
     `source_ts_ms` で行を消すので、保持の境界の直前の tick を元にし区間の中で受け取った記録が消えうる。PR-D の CLI は、
     区間ごとに、証拠の DB に残る最も古い行の `source_ts_ms` と保持の境界（`control_trace_prune` などの記録から分かる範囲）を確かめ、
     区間の開始が「残る最も古い `source_ts_ms` + `pending_domain_result_ms`」より前なら、その区間の率を出さず `retention_truncated`
-    として拒否する（届いた記録は元の tick から `pending_domain_result_ms` の内に受け取られたものだけが受け入れられるので、
-    この余裕があれば区間の中で受け取った行は消えていない）。保持の削除を `received_ts_ms` に揃える変更は PR-C で行ってもよいが、
+    として拒否する。あわせて、証拠の DB の行の中に `received_ts_ms − source_ts_ms` が `pending_domain_result_ms` を超える行が
+    1 つでもあれば（遅れて届き拒否された行を含む）、この余裕では足りないので、その最大の遅れを余裕に使う（遅れの上限を記録の
+    外から仮定しない）。保持の削除を `received_ts_ms` に揃える変更は PR-C で行ってもよいが、
     その場合も CLI の検査は残す
   - **「ヒント有りが選ばれていたら」の差分**: `recorded` の記録について、系統ごとの `requested_demand` の差
     （ヒント有り − 基準）の分布（件数・最小・中央値・p95・最大。`control.evaluation.stats` の要約）と、予測の CPU / GPU
