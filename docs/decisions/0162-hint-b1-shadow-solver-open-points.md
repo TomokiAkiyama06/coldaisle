@@ -292,6 +292,13 @@ fand の受信と検証と記録・`ControlTick` の版上げ・learnd の `--hi
     `Store.hint_shadow_matches()` の区間の選び方は、この率には使わない）。元の tick の時刻の軸の数（段の数の
     「候補になった tick」・差分の分布・trace との対応）は別の表にし、率の項と混ぜない。分母の定義（観測の時刻で数えること・
     上のずれうる幅・印）を出力に書く。割合だけを出さない
+  - **保持期間との整合**（PR #365 の Codex P2）: `hint_shadow_records` の保持期間の削除（`SqliteStore.delete_hint_shadow_before()`）は
+    `source_ts_ms` で行を消すので、保持の境界の直前の tick を元にし区間の中で受け取った記録が消えうる。PR-D の CLI は、
+    区間ごとに、証拠の DB に残る最も古い行の `source_ts_ms` と保持の境界（`control_trace_prune` などの記録から分かる範囲）を確かめ、
+    区間の開始が「残る最も古い `source_ts_ms` + `pending_domain_result_ms`」より前なら、その区間の率を出さず `retention_truncated`
+    として拒否する（届いた記録は元の tick から `pending_domain_result_ms` の内に受け取られたものだけが受け入れられるので、
+    この余裕があれば区間の中で受け取った行は消えていない）。保持の削除を `received_ts_ms` に揃える変更は PR-C で行ってもよいが、
+    その場合も CLI の検査は残す
   - **「ヒント有りが選ばれていたら」の差分**: `recorded` の記録について、系統ごとの `requested_demand` の差
     （ヒント有り − 基準）の分布（件数・最小・中央値・p95・最大。`control.evaluation.stats` の要約）と、予測の CPU / GPU
     温度の差（全 offset での最大と、最終 offset）の分布。fand の再検査に通った記録と落ちた記録を分けて出す。
