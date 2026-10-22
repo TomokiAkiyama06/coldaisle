@@ -534,9 +534,9 @@ R3 の CPU の負荷は本回でかからず、所有者の判断で別の回で
 
 | 測るもの（0121 §2.3） | 結果 | 合格の条件 | 判定 |
 |---|---|---|---|
-| `duration_ms` | 最大 8 ms・p99.9 6 ms（7188 tick、`startup` を除く） | 最大が 125 ms 未満 | 合格 |
+| `duration_ms` | 全 7205 tick で最大 8 ms（`startup` の 17 tick は最大 5 ms）。`startup` を除く 7188 tick の p99.9 は 6 ms | 最大が 125 ms 未満 | 合格 |
 | `deadline_exceeded` | 0 回（連続の最長 0） | 連続の最長が 1 以下 | 合格 |
-| tick の間隔（journal の単調時計） | 最大 1020.2 ms・p99.9 1019.5 ms | 最大が 1500 ms 未満・p99.9 が 1100 ms 未満 | 合格 |
+| tick の間隔（journal の単調時計） | 全 7205 tick で最大 1020.2 ms・p99.9 1019.5 ms（`startup` を含めても除いても同じ） | 最大が 1500 ms 未満・p99.9 が 1100 ms 未満 | 合格 |
 | `skipped_slots`（停止時の集計） | 0（`ticks` 7205・`overruns` 0・`recorded` 7205・`trace_dropped` 0・`emergency_max` false） | 0 | 合格 |
 | systemd の watchdog による終了・再起動・異常終了 | 0 回 | 0 回 | 合格 |
 | `*_telemetry_stale` / `write_failure`・`readback_mismatch`・`enable_reverted` / `tach_stall` | 0 回（fault は 0） | 0 回 | 合格 |
@@ -560,9 +560,9 @@ R3 の CPU の負荷は本回でかからず、所有者の判断で別の回で
 
 | 測るもの（0121 §2.3） | 結果 | 判定 |
 |---|---|---|
-| `duration_ms` | 最大 18 ms・p99.9 12 ms（1487 tick） | 合格 |
+| `duration_ms` | 全 1504 tick で最大 18 ms（`startup` の 17 tick は最大 5 ms）。`startup` を除く 1487 tick の p99.9 は 12 ms | 合格 |
 | `deadline_exceeded` | 0 回 | 合格 |
-| tick の間隔 | 最大 1028.8 ms・p99.9 1023.0 ms | 合格 |
+| tick の間隔 | 全 1504 tick で最大 1028.8 ms・p99.9 1022.9 ms（`startup` を除くと p99.9 1023.0 ms） | 合格 |
 | `skipped_slots` | 0（`ticks` 1504・`overruns` 0・`recorded` 1504・`trace_dropped` 0） | 合格 |
 | watchdog による終了・再起動・異常終了 | 0 回 | 合格 |
 | stale / 書き込みの失敗 / `tach_stall` | 0 回 | 合格 |
