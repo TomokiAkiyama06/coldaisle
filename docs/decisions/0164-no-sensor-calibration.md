@@ -54,7 +54,7 @@ DB の `calibration_activations` は 2026-10-11 の 1 行（全チャネル 0.0�
   Workload Hint の証明書の較正の部品も同じ digest を束ねる。
 - **#47**（24 時間連続運転）の #45 への依存は外れる。
 - **0024 §5 の 4**（ベースライン測定 #50 より較正が先）: 較正を行わないので、#50 は較正を待たない。#50 の閾値は §2.2 の誤差を前提に決める。
-- **運用の文書**: `docs/calibration.md` の冒頭と §4（`--apply`）、`config/rules.yaml` の `probe_changed` の hint、ダッシュボードのセンサー構成の注記（`src/coldaisle/web/index.html`）に本記録を示し、
+- **運用の文書**: `docs/calibration.md` の冒頭と §4（`--apply`）、`config/rules.yaml` の `probe_changed` の hint、`config/calibration.json` の `note`、ダッシュボードのセンサー構成の注記（`src/coldaisle/web/index.html`）に本記録を示し、
   未較正の警告や `PROBE_CHANGED` に応じて `--apply` を実行しないようにする。`docs/requirements.md` の R-02 の対策と M2 の内容も本記録に合わせる。
 
 ### 2.4 見直す条件
