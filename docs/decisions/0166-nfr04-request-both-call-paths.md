@@ -51,6 +51,8 @@ PR #370 の Codex の指摘で、この前提が成り立たないことが分�
 - (a) は `coldaisle-report --db <写し> --date <日> --no-send --print` を、Provider を明示して（0163 §2.2「試すときの Provider の指定」）`OPENAI_BASE_URL` を記録用の窓口に向けて走らせる。
   `--no-send` でもレポートは作業ディレクトリの `var/reports/` に書かれるので、`/opt/coldaisle` ではなく作業用のフォルダで走らせる
 - (b) は `Explainer` を本番の説明スレッドと同じ部品（`AiSettings.explain_context`・`ToolRegistry` と `LlmExclusions`）で組み、写しの発火済みのアラートについて `explain()` を呼ぶ一回限りのスクリプトで作る
+  - 説明の材料は「いま」の DB を読む（`get_latest` は最新の行、直近 24 h の集計は時計の今で終わる）。そのままでは発火した時点の要求と中身も長さも違う。
+    そこで**アラートごとに**写しをもう一つ作り、`ts_ms` を持つ表（`alerts` を除く）から発火の時刻より後の行を消し、時計（`SimulatedClock`）を発火の時刻に合わせて作る（PR #370 の Codex の指摘）
 - DB の写しは root で SQLite の backup を取り、操作者の uid に渡す（導入先の DB は操作者から読めない）
 
 ## 3. Consequences

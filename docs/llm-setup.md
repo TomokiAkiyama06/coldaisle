@@ -239,14 +239,15 @@ class H(http.server.BaseHTTPRequestHandler):
 http.server.HTTPServer(("127.0.0.1", 18099), H).serve_forever()
 ```
 
-`explain.py`（本番の説明スレッドと同じ部品で説明の要求を作る）:
+`explain.py`（本番の説明スレッドと同じ部品で説明の要求を作る。アラートごとに、写しから発火の時刻より後の行を消し、時計を発火の時刻に合わせて、発火した時点の要求を再現する）:
 
 ```python
-# 直近 7 日に発火したアラート（無ければ最後の 1 件）の説明の要求を、本番の説明スレッドと同じ部品で作る
-import sqlite3, sys, time
+# 直近 7 日に発火したアラート（無ければ最後の 1 件）の説明の要求を、本番の説明スレッドと同じ部品で作る。
+# 発火した時点の要求を再現するため、アラートごとに写しから発火の時刻より後の行を消し、時計を発火の時刻に合わせる
+import shutil, sqlite3, sys, time
 from pathlib import Path
 from coldaisle.ai import AiSettings, Explainer, ToolRegistry, provider_from_env
-from coldaisle.clock import WallClock
+from coldaisle.clock import SimulatedClock
 from coldaisle.llm_exclusions import LlmExclusions
 from coldaisle.metrics import MetricCatalog
 from coldaisle.rules import RuleSet
@@ -254,20 +255,30 @@ from coldaisle.store import QualityRules, SqliteStore
 db = Path(sys.argv[1])
 since = int(time.time() * 1000) - 7 * 86_400_000
 with sqlite3.connect(f"file:{db}?mode=ro", uri=True) as con:
-    ids = [r[0] for r in con.execute("SELECT id FROM alerts WHERE fired_ms >= ? ORDER BY id", (since,))]
-    ids = ids or [r[0] for r in con.execute("SELECT id FROM alerts WHERE fired_ms IS NOT NULL ORDER BY fired_ms DESC LIMIT 1")]
+    rows = con.execute("SELECT id, fired_ms FROM alerts WHERE fired_ms >= ? ORDER BY id", (since,)).fetchall()
+    rows = rows or con.execute(
+        "SELECT id, fired_ms FROM alerts WHERE fired_ms IS NOT NULL ORDER BY fired_ms DESC LIMIT 1").fetchall()
 settings = AiSettings.from_yaml(Path("config/ai.yaml"))
-clock = WallClock()
-store = SqliteStore(db, rules=QualityRules.from_yaml(Path("config/quality.yaml")), clock=clock)
-tools = ToolRegistry(store=store, catalog=MetricCatalog.from_yaml(Path("config/metrics.yaml")),
-                     rules=RuleSet.from_yaml(Path("config/rules.yaml")), clock=clock,
-                     exclusions=LlmExclusions.from_yaml(Path("config/report.yaml")))
-explainer = Explainer(provider=provider_from_env(settings), tools=tools, context=settings.explain_context)
-for alert_id in ids:
+provider = provider_from_env(settings)
+for alert_id, fired_ms in rows:
+    as_of = db.with_name(f"as-of-{alert_id}.db")
+    shutil.copyfile(db, as_of)
+    with sqlite3.connect(as_of) as con:
+        tables = [r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type = 'table'")]
+        for table in tables:
+            columns = {r[1] for r in con.execute(f'PRAGMA table_info("{table}")')}
+            if "ts_ms" in columns and table != "alerts":
+                con.execute(f'DELETE FROM "{table}" WHERE ts_ms > ?', (fired_ms,))
+    clock = SimulatedClock(fired_ms)
+    store = SqliteStore(as_of, rules=QualityRules.from_yaml(Path("config/quality.yaml")), clock=clock)
+    tools = ToolRegistry(store=store, catalog=MetricCatalog.from_yaml(Path("config/metrics.yaml")),
+                         rules=RuleSet.from_yaml(Path("config/rules.yaml")), clock=clock,
+                         exclusions=LlmExclusions.from_yaml(Path("config/report.yaml")))
     alert = store.alert(alert_id)
     if alert is not None:
-        explainer.explain(alert)
-print(f"説明の要求を {len(ids)} 件作った")
+        Explainer(provider=provider, tools=tools, context=settings.explain_context).explain(alert)
+    as_of.unlink()
+print(f"説明の要求を {len(rows)} 件作った")
 ```
 
 **測る**（PAW の vLLM が warm で、PAW の他の要求が無いときに。経路ごとに 20 回）:
