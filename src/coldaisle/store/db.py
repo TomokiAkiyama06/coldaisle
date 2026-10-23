@@ -1716,6 +1716,29 @@ class SqliteStore:
             missing_ratio=None if row_count == 0 else 1.0 - ok_count / row_count,
         )
 
+    def extreme_times(
+        self, metric: str, start_ms: int, end_ms: int
+    ) -> tuple[int | None, int | None]:
+        """窓 `[start_ms, end_ms)` で最大値・最小値をとった時刻 `(max_ts_ms, min_ts_ms)`。
+
+        `stats()` と同じく `quality='ok'` かつ値を持つ行だけを見る。同じ値が何度もあれば
+        最初の時刻を返す。行が無ければ `(None, None)`。返すのは時刻 2 つだけで、点の列ではない
+        （AI のツール `get_stats` が使う。決定記録 0168 §2.3）。
+        """
+        validate_metric(metric)
+        self._check_range(start_ms, end_ms)
+        found: list[int | None] = []
+        for order in ("DESC", "ASC"):
+            row = self._conn.execute(
+                "SELECT ts_ms FROM readings "
+                "WHERE metric = ? AND ts_ms >= ? AND ts_ms < ? "
+                "  AND quality = 'ok' AND value IS NOT NULL "
+                f"ORDER BY value {order}, ts_ms ASC LIMIT 1",
+                (metric, start_ms, end_ms),
+            ).fetchone()
+            found.append(None if row is None else int(row["ts_ms"]))
+        return found[0], found[1]
+
     # ------------------------------------------------------------------ 内部
 
     def _percentile(

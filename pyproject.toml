@@ -100,6 +100,9 @@ coldaisle-control = "coldaisle.control_admin.client:main"
 coldaisle-eventd = "coldaisle.event_entry.server:main"
 # 上の入口へ1件送るクライアント（例: coldaisle-event gpu-mode compute）
 coldaisle-event = "coldaisle.event_entry.client:main"
+# Slack のメンションに読み取り専用のツールで答える常駐のプロセス。**DB は読むだけで、書き込み・実行の
+# ツールを持たない**。許可リストのチャンネルかつユーザーにだけ答える（#374 / 決定記録 0168）
+coldaisle-slackbot = "coldaisle.slackbot.cli:main"
 
 [build-system]
 requires = ["hatchling"]

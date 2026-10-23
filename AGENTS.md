@@ -46,6 +46,7 @@ uv run coldaisle-eventd             # 書き込み専用の Unix ソケット入
 uv run coldaisle-event gpu-mode compute  # GPU Mode の切り替えを記録する（#67）
 uv run coldaisle-event workload-hint training --expected-duration 4h  # Workload Hint を記録する（記録のみ。#107 / 決定記録 0064）
 uv run coldaisle-telemetry --once   # NVML / hwmon を1回収集（#65）
+uv run coldaisle-slackbot --db var/coldaisle.db  # Slack のメンションに読み取り専用のツール（4 つ）で答える（Socket Mode。許可リストの両方に当たるときだけ。**書き込み・実行の経路は無い**。#374 / 決定記録 0168。導入は docs/ubuntu-deploy.md 4.3）
 # GPU の Fan の曲線（coldaisle-gpu-fan）は root の unit でだけ動かす。手順は docs/ubuntu-deploy.md 4.2（#285 / 決定記録 0128）
 uv run coldaisle-fand --max-ticks 5 # 3系統Fan制御デーモン（simulated backend。#74 / 決定記録 0028）
 uv run coldaisle-fand --config-dir var/control-config  # 4ファイル（air-balance.yaml を含む）を置いた設定で起動。無ければ全 zone Max（決定記録 0073）
@@ -270,6 +271,7 @@ src/coldaisle/
   load_distribution.py # 合成の起点: 負荷の状態（電力の帯）ごとの d.* の分布（DB を mode=ro で読むだけ・合否なし。AI 層・API から import しない）。#50 / 決定記録 0151
   airflow_characterization.py # 合成の起点: 回転数の掃引と応答の行列の解析（checkpoint 済みの DB の写しを immutable で読むだけ・設定へ書かない。control・AI 層・API から import しない）。#75 / 決定記録 0153
   server.py   # 合成の起点: 読み取りAPI + AIツールの窓口。#23
+  slackbot/   # 合成の起点: Slack のメンションへの返答 `coldaisle-slackbot`（Socket Mode・許可リスト・読み取り専用のツール 4 つの tool loop）。control・ingest を import しない。#374 / 決定記録 0168
   escalate.py # 合成の起点: 故障疑いの案件資料（AI非依存・送信しない）。#39
   memory.py   # 合成の起点: 運用メモリの記録（確認を経由する）。#40
   calibrate.py# 合成の起点: 較正オフセットの算出（確認を経由する）。#13

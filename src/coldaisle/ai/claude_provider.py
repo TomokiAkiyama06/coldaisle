@@ -6,7 +6,9 @@
 守ること（0143 §2）:
 
 - **送る内容を広げない。** 呼び出し側が組み立てた `ChatMessage` の列（集計値だけ）をそのまま送る。
-  **ツールは送らない**（`tools` が渡されたら呼ばずに「利用不可」）
+  **ツールは送らない**（`tools` が渡されたら呼ばずに「利用不可」）。例外は Slack のメンションへの
+  返答（決定記録 0168 §2.5）だけで、`allow_tools=True` で作ったときに限り Messages API の
+  `tool_use` / `tool_result` を話す
 - **鍵をログ・`reason`・例外の文に出さない。** 失敗の理由は状態コード・`error.type`・
   例外の型の名前だけ（#305）
 - **費用と回数の上限。** 1 日の要求の回数を超えたら呼ばずに「利用不可」を返す
@@ -18,6 +20,7 @@ SDK の自前の再試行と待ち時間を別に止める必要もあるため�
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import re
@@ -37,6 +40,7 @@ from coldaisle.ai.provider import (
     ChatMessage,
     ChatResult,
     Provider,
+    ToolChoice,
     UnavailableProvider,
 )
 
@@ -71,6 +75,9 @@ _UNUSABLE_STOPS = frozenset({"refusal", "max_tokens", "model_context_window_exce
 
 _RETRYABLE_4XX = frozenset({408, 429})
 """4xx のうち再試行するもの。他の 4xx は要求が悪いので粘らない（0014 §2.5）。"""
+
+_TOOL_USE_ID = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
+"""`tool_use` の `id` として受ける形。合わない応答は採用しない（何が入るか分からない）。"""
 
 
 class DailyCallBudget:
@@ -131,9 +138,16 @@ class AnthropicProvider:
     """あれば `anthropic-workspace-id` ヘッダで送る。repr に出さない。"""
     client: httpx.Client | None = None
     sleep: Callable[[float], None] = time.sleep
+    allow_tools: bool = False
+    """ツールの定義と結果を送ってよいか（決定記録 0168 §2.5）。
+
+    **真にするのは `coldaisle-slackbot` だけ。**
+
+    偽（既定）なら、`tools` を渡されても呼ばずに「利用不可」を返す（0143 §2.3 のまま）。
+    """
 
     @classmethod
-    def from_env(cls, settings: AiSettings) -> Provider:
+    def from_env(cls, settings: AiSettings, *, allow_tools: bool = False) -> Provider:
         """環境変数から組み立てる。**足りなければ `UnavailableProvider`**。
 
         作って毎回失敗させない（0014 §2.2）。
@@ -178,6 +192,7 @@ class AnthropicProvider:
             api_key=api_key,
             budget=DailyCallBudget(limits.daily_call_limit),
             workspace_id=workspace_id,
+            allow_tools=allow_tools,
         )
 
     def chat(
@@ -186,16 +201,17 @@ class AnthropicProvider:
         *,
         thinking: bool | None = None,
         tools: list[dict[str, Any]] | None = None,
+        tool_choice: ToolChoice | None = None,
     ) -> ChatResult:
-        if tools:
+        if tools and not self.allow_tools:
             # ツールの結果を外へ流す経路をこの Provider では開かない（0143 §2.3）
             return self._unavailable("外部の Provider にはツールを渡さない（決定記録 0143 §2.3）")
         system = "\n\n".join(m.content for m in messages if m.role == "system")
-        turns = [
-            {"role": m.role, "content": m.content}
-            for m in messages
-            if m.role in ("user", "assistant")
-        ]
+        try:
+            turns = _turns(messages) if tools else _plain_turns(messages)
+            anthropic_tools = [_anthropic_tool(definition) for definition in tools or ()]
+        except ValueError as error:
+            return self._unavailable(f"ツールの発話を Messages API の形にできない（{error}）")
         if not turns:
             return self._unavailable("送る発話が無い")
         payload: dict[str, Any] = {
@@ -207,6 +223,10 @@ class AnthropicProvider:
         }
         if system:
             payload["system"] = system
+        if anthropic_tools:
+            payload["tools"] = anthropic_tools
+            if tool_choice is not None:
+                payload["tool_choice"] = {"type": tool_choice}
         if self.limits.effort is not None:
             # 設定したときだけ送る。対応するモデルかをコードで判定しない（0143 §2.5）
             payload["output_config"] = {"effort": self.limits.effort}
@@ -284,13 +304,23 @@ class AnthropicProvider:
             and block.get("type") == "text"
             and isinstance(block.get("text"), str)
         ]
-        if not texts:
+        tool_calls: list[dict[str, Any]] = []
+        if self.allow_tools:
+            # ツールを送れない作り（既定）では tool_use を読まない（0143 §2.3 のまま）
+            uses = [b for b in content if isinstance(b, dict) and b.get("type") == "tool_use"]
+            for block in uses:
+                call = _tool_call(block)
+                if call is None:
+                    return self._unavailable("応答の tool_use の形が違う")
+                tool_calls.append(call)
+        if not texts and not tool_calls:
             return self._unavailable("応答に text が無い")
         model = body.get("model")
         return ChatResult(
             available=True,
             text="".join(texts).strip(),
             model=model if isinstance(model, str) else self.model,
+            tool_calls=tool_calls,
         )
 
     def _unavailable(self, reason: str) -> ChatResult:
@@ -299,6 +329,94 @@ class AnthropicProvider:
             extra={logs.FIELDS_KEY: {"model": self.model, "reason": reason}},
         )
         return ChatResult(available=False, reason=reason, model=self.model)
+
+
+def _plain_turns(messages: list[ChatMessage]) -> list[dict[str, Any]]:
+    """ツールを送らないときの発話（**今までと同じ形**。user と assistant の文だけ）。"""
+    return [
+        {"role": m.role, "content": m.content} for m in messages if m.role in ("user", "assistant")
+    ]
+
+
+def _turns(messages: list[ChatMessage]) -> list[dict[str, Any]]:
+    """tool loop の発話を Messages API の形にする（決定記録 0168 §2.5）。
+
+    - assistant の `tool_calls` は `tool_use` の塊にする
+    - 続く role `tool` の発話（ツールの結果）は、1 つの user の発話の `tool_result` の塊にまとめる
+      （Messages API は user と assistant が交互であることを求める）
+    """
+    turns: list[dict[str, Any]] = []
+    for message in messages:
+        if message.role == "system":
+            continue
+        if message.role == "tool":
+            if message.tool_call_id is None:
+                raise ValueError("tool の発話に tool_call_id が無い")
+            block = {
+                "type": "tool_result",
+                "tool_use_id": message.tool_call_id,
+                "content": message.content,
+            }
+            last = turns[-1] if turns else None
+            if last is not None and last["role"] == "user" and isinstance(last["content"], list):
+                last["content"].append(block)
+            else:
+                turns.append({"role": "user", "content": [block]})
+            continue
+        if message.role == "assistant" and message.tool_calls:
+            blocks: list[dict[str, Any]] = []
+            if message.content:
+                blocks.append({"type": "text", "text": message.content})
+            blocks.extend(_tool_use(call) for call in message.tool_calls)
+            turns.append({"role": "assistant", "content": blocks})
+            continue
+        if message.role in ("user", "assistant"):
+            turns.append({"role": message.role, "content": message.content})
+    return turns
+
+
+def _tool_use(call: dict[str, Any]) -> dict[str, Any]:
+    """OpenAI の形の呼び出し → `tool_use` の塊。"""
+    function = call.get("function")
+    call_id = call.get("id")
+    if not isinstance(function, dict) or not isinstance(call_id, str):
+        raise ValueError("tool_calls の形が違う")
+    name = function.get("name")
+    arguments = function.get("arguments")
+    if not isinstance(name, str):
+        raise ValueError("tool_calls に name が無い")
+    parsed: Any = json.loads(arguments) if isinstance(arguments, str) and arguments else {}
+    if not isinstance(parsed, dict):
+        raise ValueError("tool_calls の arguments が辞書でない")
+    return {"type": "tool_use", "id": call_id, "name": name, "input": parsed}
+
+
+def _anthropic_tool(definition: dict[str, Any]) -> dict[str, Any]:
+    """OpenAI の function calling の定義 → Messages API の `tools` の 1 つ。"""
+    function = definition.get("function")
+    if not isinstance(function, dict) or not isinstance(function.get("name"), str):
+        raise ValueError("ツールの定義の形が違う")
+    return {
+        "name": function["name"],
+        "description": str(function.get("description", "")),
+        "input_schema": function.get("parameters") or {"type": "object", "properties": {}},
+    }
+
+
+def _tool_call(block: dict[str, Any]) -> dict[str, Any] | None:
+    """`tool_use` の塊 → OpenAI の形の呼び出し（`ChatResult.tool_calls` の形を揃える）。"""
+    call_id = block.get("id")
+    name = block.get("name")
+    arguments = block.get("input")
+    if not isinstance(call_id, str) or not _TOOL_USE_ID.match(call_id):
+        return None
+    if not isinstance(name, str) or not isinstance(arguments, dict):
+        return None
+    return {
+        "id": call_id,
+        "type": "function",
+        "function": {"name": name, "arguments": json.dumps(arguments, ensure_ascii=False)},
+    }
 
 
 def _header_safe(value: str) -> bool:

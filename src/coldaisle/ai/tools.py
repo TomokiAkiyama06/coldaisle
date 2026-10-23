@@ -17,6 +17,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Any
 
@@ -72,6 +73,9 @@ class SeriesArgs(_Args):
 class StatsArgs(_Args):
     metric: str
     window: str = "1h"
+    # 期間の指定は list_alerts と同じ形（from / to の Unix ミリ秒。決定記録 0168 §2.3）
+    from_ms: int | None = Field(default=None, alias="from")
+    to_ms: int | None = Field(default=None, alias="to")
 
 
 class AlertsArgs(_Args):
@@ -154,13 +158,18 @@ DEFINITIONS: list[dict[str, Any]] = _advisory(
             "function": {
                 "name": "get_stats",
                 "description": (
-                    "期間の min/max/mean/p95/傾き/欠測率を返す。数値の集計はこれを使う。"
+                    "期間の min/max/mean/p95/傾き/欠測率と、最大値・最小値をとった時刻"
+                    "（max_ts_ms / min_ts_ms）を返す。数値の集計はこれを使う。"
+                    "期間は window（例: 24h）か from/to（Unix ミリ秒）で指定する。"
+                    "from だけなら現在まで、to だけなら window ぶん遡る。"
                 ),
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "metric": {"type": "string"},
                         "window": {"type": "string", "description": "例: 1h / 24h / 7d"},
+                        "from": {"type": "integer"},
+                        "to": {"type": "integer"},
                     },
                     "required": ["metric"],
                     "additionalProperties": False,
@@ -315,30 +324,57 @@ class ToolRegistry:
 
     def _tool_get_stats(self, arguments: dict[str, Any]) -> dict[str, Any]:
         args = StatsArgs.model_validate(arguments)
-        return self.stats(args.metric, args.window)
+        return self.stats(args.metric, args.window, start_ms=args.from_ms, end_ms=args.to_ms)
 
-    def stats(self, metric: str, window: str, *, end_ms: int | None = None) -> dict[str, Any]:
+    def stats(
+        self,
+        metric: str,
+        window: str,
+        *,
+        end_ms: int | None = None,
+        start_ms: int | None = None,
+    ) -> dict[str, Any]:
         """`get_stats` と同じ集計。**窓の終わりを指定できる**（説明が発火の時刻に固定する）。
 
-        LLM に渡すツールの定義（`get_stats`）は変えない。終わりの時刻を選ぶのはコードだけ
-        （決定記録 0143 §2.11）。除外（0131 §2.4a）は `get_stats` と同じく当てる。
+        終わりの時刻だけを選ぶ呼び出し（アラートの説明。決定記録 0143 §2.11）の振る舞いは
+        今のまま。`start_ms` は `get_stats` の `from`（決定記録 0168 §2.3）で、期間の解き方は
+        `query_series` と同じ（`_range`）。除外（0131 §2.4a）は `get_stats` と同じく当てる。
+
+        最大値・最小値をとった時刻（`max_ts_ms` / `min_ts_ms`）も返す。**点の列は返さない**
+        （ルール 8）。同じ値が何度もあれば最初の時刻。
         """
         validate_metric(metric)
-        start_ms, end_ms = self._range(None, end_ms, window)
-        stats = (
-            _empty_stats(metric, start_ms, end_ms)  # 無いメトリクスと同じ（0131 §2.4a）
-            if self._excluded(metric)
-            else self.store.stats(metric, start_ms, end_ms)
+        explicit_start = start_ms is not None
+        start_ms, end_ms = self._range(start_ms, end_ms, window)
+        excluded = self._excluded(metric)
+        # 集計と最大・最小の時刻を同じスナップショットで読む。間に取り込みの書き込みが入っても、
+        # 古い最大値と新しい行の時刻を組にしない。呼び出し側が既に読み取りの中ならそれに乗る
+        snapshot = (
+            nullcontext() if self.store.connection.in_transaction else self.store.read_snapshot()
         )
+        with snapshot:
+            stats = (
+                _empty_stats(metric, start_ms, end_ms)  # 無いメトリクスと同じ（0131 §2.4a）
+                if excluded
+                else self.store.stats(metric, start_ms, end_ms)
+            )
+            max_ts_ms, min_ts_ms = (
+                (None, None)
+                if excluded or stats.ok_value_count == 0
+                else self.store.extreme_times(metric, start_ms, end_ms)
+            )
         return {
             "metric": metric,
             "unit": self._unit(metric),
-            "window": window,
+            # from を指定したときは window を使っていない（期間は from_ms / to_ms のとおり）
+            "window": None if explicit_start else window,
             "from_ms": stats.start_ms,
             "to_ms": stats.end_ms,
             "sample_count": stats.ok_value_count,
             "min": stats.min_value,
             "max": stats.max_value,
+            "max_ts_ms": max_ts_ms,
+            "min_ts_ms": min_ts_ms,
             "mean": stats.mean_value,
             "p95": stats.p95_value,
             "slope_per_min": stats.slope_per_min,

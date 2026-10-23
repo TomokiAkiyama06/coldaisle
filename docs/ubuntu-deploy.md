@@ -197,27 +197,28 @@ DB の migration は、更新後に**最初にストアを開いたプロセス*
 
 1. **DB に書くものをすべて止める。** 取り込み（`coldaisle-daemon`）・API・タイマーに加え、
    制御デーモン（`coldaisle-fand`）・`coldaisle-telemetry`・`coldaisle-eventd` を常駐させていれば
-   それも止めます
+   それも止めます。DB を読むだけの `coldaisle-slackbot`（4.3）も、開くときに migration を当てうるので止めます
 2. コードを更新し、`coldaisle-rollup` を1回だけ手で走らせて migration を当てる
 3. 書き手とタイマーを起動し直す
 
 ```bash
 sudo systemctl stop coldaisle-rollup.timer coldaisle-report.timer
-sudo systemctl stop coldaisle-daemon coldaisle-api coldaisle-telemetry   # 常駐させている他の書き手も
+sudo systemctl stop coldaisle-daemon coldaisle-api coldaisle-telemetry coldaisle-slackbot   # 常駐させている他の書き手も
 # ここでコードを更新する（git pull と venv の同期）
 # unit が増えた版へ上げるときは、ここで置いて有効にする（下の注記。例は 0117 の telemetry）
 sudo cp /opt/coldaisle/deploy/systemd/coldaisle-telemetry.service /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable coldaisle-telemetry.service
 sudo systemctl start coldaisle-rollup.service        # migration を当てる（終わるまで待つ）
-sudo systemctl start coldaisle-daemon coldaisle-api coldaisle-telemetry
+sudo systemctl start coldaisle-daemon coldaisle-api coldaisle-telemetry coldaisle-slackbot
 sudo systemctl start coldaisle-rollup.timer coldaisle-report.timer
 ```
 
 - **unit が増えた版へ上げるときは、`git pull` だけでは足りません。** `/etc/systemd/system/` へ
   置いて `daemon-reload` と `enable` をしないと、`start` が `Unit ... not found` で失敗し、
   次の起動でも動きません。`coldaisle-telemetry.service`（決定記録 0117）より前の版から上げるときは、
-  最初の `stop` からこの unit を外してください（まだ置かれていないので止めるものがありません）
+  最初の `stop` からこの unit を外してください（まだ置かれていないので止めるものがありません）。
+  `coldaisle-slackbot.service`（4.3。決定記録 0168）を置いていない導入先では、`stop` と `start` の両方から外します
 - **表を作り直す migration は、その間ほかの書き込みを止めます。** たとえば 0007（#106）は
   decision trace の表（保持期間いっぱい、最大30日分の JSON）を作り直し、1つの書き込み
   トランザクションで行います。その間は取り込みも制御の trace も書けません。書き手を止めて
@@ -315,6 +316,86 @@ nvidia-smi --query-gpu=temperature.gpu,fan.speed --format=csv
   `systemctl stop coldaisle-gpu-fan` の数十秒後に warning が届き `start` で解除されることを確かめます（0131 §2.6。所有者の承認の後）
 - 曲線を変えるときは、決定記録と所有者の承認を経て unit の `--curve` を変えます
 
+### 4.3 Slack のメンションへの返答（coldaisle-slackbot。決定記録 0168）
+
+Slack でボットにメンションすると（例: `@coldaisle いまの GPU の温度は？`）、読み取り専用のツール
+（`get_latest` / `get_stats` / `list_alerts` / `describe_system`）で集計した値から LLM が答え、メンションのスレッドへ返します。
+
+- **Socket Mode**（こちらから WebSocket で Slack へつなぐ）で受けるので、外から入る口は開けません（API の 127.0.0.1 の待ち受けも変えない）
+- 答えるのは、許可リストのチャンネル**かつ**許可リストのユーザーのメンションだけです。どちらかが空なら誰にも答えません
+  （起動時に `Slack の許可リストが空なので…` の警告が 1 度出ます）。リストの外・ボット・編集・DM には返事もしません
+- 書き込み・実行のツールはありません。Fan・設定・アラートの状態は変わりません（AGENTS.md ルール 1・2）
+- 回数の上限は `config/ai.yaml` の `slack_qa:`（1 日 100 回の LLM の呼び出し・1 ユーザー 1 分 3 質問・tool loop は 4 往復まで）。
+  上限・LLM が使えないときは「いま AI が使えません。ダッシュボードで確かめてください。」の固定の文だけを返します
+- ツールの結果に無い数値が答えに出ると、末尾に「※ ツールの結果に無い数値を含みます（未検証）」が付きます。ダッシュボードが正です
+- 時刻と「昨日」の日の境界は `config/report.yaml` の `timezone`（日次レポートと同じ）で解きます。OS の時刻帯は使いません。
+  読めなければ固定の文だけを返します
+- 1 つの質問のツールの呼び出しは 1 応答 8 個・合計 16 個まで、`describe_system` のデバイスの欄（ID・ファームウェア・GPIO・ROM の末尾）は
+  外へ出しません。Slack から長く何も届かないとき（`idle_reconnect_s`）や切断を求められたときは、新しい URL でつなぎ直します
+- 質問・答えの本文と ID はログに出ません（長さ・ツールの名前・往復の数・所要時間だけ）
+- 止めても監視・通知・制御は今のまま動きます（取り込み・API・fand・telemetry と依存しない）
+
+**前提:** LLM が使えること（`docs/llm-setup.md`。Claude API なら `COLDAISLE_LLM_PROVIDER=anthropic` ほか）と、
+[`notifications.md`](notifications.md) 1a の Bot トークン（`COLDAISLE_SLACK_BOT_TOKEN`）があること。
+
+#### Slack のアプリの側（所有者が行う）
+
+<https://api.slack.com/apps> で、1a で作ったアプリ（Bot トークンのアプリ）を開きます。
+
+1. **Socket Mode** を開き、**Enable Socket Mode** を有効にする。App-Level Token の作成を求められたら、
+   名前（例 `coldaisle-socket`）を付け、scope に `connections:write` だけを足して **Generate**。
+   表示された **App-Level Token**（`xapp-…`）を控える（**チャットや Issue に貼らない**。あとで **Basic Information** の
+   **App-Level Tokens** からも見られる）
+2. **OAuth & Permissions** の **Bot Token Scopes** に `app_mentions:read` を足す（`chat:write` は 1a で足してある。ほかは足さない）
+3. **Event Subscriptions** を開き、**Enable Events** を有効にする（Socket Mode なので Request URL は要らない）。
+   **Subscribe to bot events** で **Add Bot User Event** から `app_mention` だけを足し、**Save Changes**
+4. 画面の上に出る **reinstall your app**（または **OAuth & Permissions** の **Reinstall to Workspace**）→ **許可する**。
+   **Bot トークン（`xoxb-`）は変わらないことが多いですが、変わったら `COLDAISLE_SLACK_BOT_TOKEN` も置き直します**
+5. 答えさせたいチャンネルに Bot を招く（`/invite @coldaisle`）。チャンネルの **ID**（`C` で始まる）と、
+   答えてよい人の **メンバー ID**（プロフィールの **︙** → **メンバー ID をコピー**。`U` で始まる）を控える
+
+#### 導入先へ置く
+
+値はリポジトリにも、コマンドの引数（シェルの履歴・`ps` に残る）にも書きません。
+**別のターミナル**で次を実行し、聞かれたら貼り付けて Enter を押します（トークンは画面に表示されません）。
+
+```bash
+sudo bash -c 'read -rsp "App-Level Token (xapp-...): " t; echo; printf "COLDAISLE_SLACK_APP_TOKEN=%s\n" "$t" >> /etc/coldaisle/coldaisle.env'
+# 複数あればカンマ区切り（例: C0000000001,C0000000002）
+sudo bash -c 'read -rp "答えるチャンネルの ID (C...): " c; printf "COLDAISLE_SLACK_QA_CHANNELS=%s\n" "$c" >> /etc/coldaisle/coldaisle.env'
+sudo bash -c 'read -rp "答えてよいメンバーの ID (U...): " u; printf "COLDAISLE_SLACK_QA_USERS=%s\n" "$u" >> /etc/coldaisle/coldaisle.env'
+sudo grep -o '^COLDAISLE_SLACK_[A-Z_]*=' /etc/coldaisle/coldaisle.env   # 変数名だけを一覧する（同じ名前が 2 行無いこと）
+```
+
+- 形の合わない ID が 1 つでもあると、その一覧は空として扱い、誰にも答えません（journal に `形の合わない値がある` の error）
+- 2 つのトークンを取り違えると起動しません（App は `xapp-`、Bot は `xoxb-` で始まる）
+
+#### unit を置いて起動する
+
+```bash
+sudo cp /opt/coldaisle/deploy/systemd/coldaisle-slackbot.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now coldaisle-slackbot.service
+journalctl -u coldaisle-slackbot -n 20 --no-pager   # 「Slack の Socket Mode につないだ」が出れば良い
+```
+
+許可したチャンネルで、許可したユーザーから `@coldaisle いまの GPU の温度は？` と送り、スレッドに答えが付くことを確かめます
+（1 回ぶんの上限を使う）。journal には `Slack のメンションに返した` の行に `tools`・`round_trips`・`elapsed_ms` が出ます。
+
+| ログ | 意味 |
+|---|---|
+| `Slack のトークンが足りないので起動しない` / `形が違うので起動しない` | env の 2 つのトークン。終了コード 2 で、起動し直さない（直したら `systemctl restart`） |
+| `config/ai.yaml に slack_qa: が無いので起動しない` | 設定の塊が無い。終了コード 2 |
+| `config/ai.yaml を読めないので起動しない` | ファイルが無い・YAML が壊れている・値が不正（`error` は例外の型の名前だけ）。終了コード 2 |
+| `Slack の auth.test に失敗した` | Bot トークンの誤り・失効か、ネットワーク。5 s ごとに起動し直す |
+| `Socket Mode の URL を得られなかった` の `invalid_auth` / `not_allowed_token_type` | App-Level Token の誤りか、Socket Mode が無効（1.） |
+| `LLM へ渡さない一覧が不正なので、メンションに答えない` | `config/report.yaml` が読めない。固定の文だけを返す（0131 §2.4a） |
+| `Slack へ答えを返せなかった` の `not_in_channel` / `missing_scope` | Bot をチャンネルに招いていない（5.）・scope の不足（2.。足したら Reinstall） |
+| 何も起きない | 許可リストに当たっていない・Event Subscriptions の `app_mention` が無い（3.）・Reinstall をしていない（4.） |
+
+止めるときは `sudo systemctl disable --now coldaisle-slackbot.service`。トークンを無効にするときは、Slack のアプリの
+**Basic Information** で App-Level Token を **Revoke** し、env から `COLDAISLE_SLACK_APP_TOKEN` の行を消します。
+
 ## 5. Mac からのデータ移行
 
 1. **Mac 側で DB に書くプロセスをすべて止める。** 取り込み（`coldaisle-daemon`）だけでなく、
@@ -350,12 +431,12 @@ nvidia-smi --query-gpu=temperature.gpu,fan.speed --format=csv
    ```bash
    sudo systemctl stop coldaisle-rollup.timer coldaisle-report.timer
    sudo systemctl stop coldaisle-rollup.service coldaisle-report.service \
-        coldaisle-daemon coldaisle-api coldaisle-telemetry
+        coldaisle-daemon coldaisle-api coldaisle-telemetry coldaisle-slackbot
    rsync -av <mac>:/tmp/coldaisle-migrate.db /tmp/coldaisle.db
    sudo rm -f /var/lib/coldaisle/coldaisle.db-wal /var/lib/coldaisle/coldaisle.db-shm
    # 0660: coldaisle-fand も補助グループで書く（決定記録 0080 §2.1。0640 では fand が書けない）
    sudo install -o coldaisle -g coldaisle -m 0660 /tmp/coldaisle.db /var/lib/coldaisle/coldaisle.db
-   sudo systemctl start coldaisle-daemon coldaisle-api coldaisle-telemetry
+   sudo systemctl start coldaisle-daemon coldaisle-api coldaisle-telemetry coldaisle-slackbot
    sudo systemctl start coldaisle-rollup.timer coldaisle-report.timer
    ```
 
@@ -539,7 +620,7 @@ hwmon には `/dev` のノードが無いので、udev の `GROUP=` / `MODE=` �
    ```bash
    sudo systemctl stop coldaisle-rollup.timer coldaisle-report.timer
    sudo systemctl stop coldaisle-rollup.service coldaisle-report.service \
-        coldaisle-daemon coldaisle-api coldaisle-telemetry
+        coldaisle-daemon coldaisle-api coldaisle-telemetry coldaisle-slackbot
    ```
 
 2. 新しい unit（`StateDirectoryMode=2770`・`UMask=0007`）を置きます（4 節の `cp`）
@@ -596,7 +677,7 @@ hwmon には `/dev` のノードが無いので、udev の `GROUP=` / `MODE=` �
    グループ `coldaisle`・`0660` であること）をもう一度 `stat` で見ます
 
    ```bash
-   sudo systemctl start coldaisle-daemon coldaisle-api coldaisle-telemetry
+   sudo systemctl start coldaisle-daemon coldaisle-api coldaisle-telemetry coldaisle-slackbot
    sudo systemctl start coldaisle-rollup.timer coldaisle-report.timer
    sudo sh -c "stat -c '%A %U:%G %n' /var/lib/coldaisle/coldaisle.db*"
    ```
