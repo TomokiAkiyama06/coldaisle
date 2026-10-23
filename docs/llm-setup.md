@@ -206,8 +206,10 @@ export COLDAISLE_LLM_PROVIDER=openai_compatible OPENAI_BASE_URL=http://127.0.0.1
 
 # (a) 日次レポート: 直近 7 日の各日の要求を拾う
 python3 -I record.py req-report & rec=$!
+# 日付はレポートの時刻帯（config/report.yaml の timezone）で数える。OS の時刻帯で数えると日がずれうる
+tz="$(sed -n 's/^timezone: *"\{0,1\}\([^"]*\)"\{0,1\}$/\1/p' config/report.yaml)"
 for i in 1 2 3 4 5 6 7; do
-  /opt/coldaisle/.venv/bin/coldaisle-report --db copy.db --date "$(date -d "-$i day" +%F)" --no-send --print >/dev/null
+  /opt/coldaisle/.venv/bin/coldaisle-report --db copy.db --date "$(TZ="$tz" date -d "-$i day" +%F)" --no-send --print >/dev/null
 done
 kill "$rec"
 
