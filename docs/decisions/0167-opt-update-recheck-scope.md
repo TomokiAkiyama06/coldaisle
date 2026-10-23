@@ -53,12 +53,19 @@ checkout し、その中で `uv sync --no-dev` してできた venv で実行す
 コードだけが見える）。
 
 ```bash
-git clone --quiet <リポジトリ> /tmp/coldaisle-target && git -C /tmp/coldaisle-target checkout --quiet <target>
-(cd /tmp/coldaisle-target && uv sync --no-dev --quiet)
-/tmp/coldaisle-target/.venv/bin/python -I -c "import sys, coldaisle.control_daemon; print('\n'.join(sorted(m.__file__ for n, m in sys.modules.items() if n.startswith('coldaisle') and getattr(m, '__file__', None))))"
+# 毎回新しい一時ディレクトリに作り、どの段で失敗しても止める（前の回の checkout を調べない）
+bash -euo pipefail -c '
+  dir="$(mktemp -d)"
+  git clone --quiet "$1" "$dir"
+  git -C "$dir" checkout --quiet "$2"
+  (cd "$dir" && uv sync --no-dev --quiet)
+  "$dir/.venv/bin/python" -I -c "import sys, coldaisle.control_daemon; print(\"\\n\".join(sorted(m.__file__ for n, m in sys.modules.items() if n.startswith(\"coldaisle\") and getattr(m, \"__file__\", None))))" > "$dir.closure"
+  if grep -v "^$dir/src/" "$dir.closure"; then echo "checkout の外の coldaisle を読んだ" >&2; exit 1; fi
+  echo "閉包: $dir.closure"
+' _ <リポジトリ> <target>
 ```
 
-出た path がすべて `/tmp/coldaisle-target/src/` の下であることを確かめる（別の場所の `coldaisle` を読んでいない）。
+出た path がすべてその一時ディレクトリの `src/` の下であることを、上の `grep` で確かめる（別の場所の `coldaisle` を読んでいない）。
 
 関数の中で import する module（`control/supervisor/artifact.py` などの遅延の import）はここに出ないことがあるが、`src/coldaisle/control/` は
 丸ごと F 以上に当てるので、閉包の取りこぼしは `control/` の外の module に限られる。閉包に出なくても fand から使う module を見つけたら、
