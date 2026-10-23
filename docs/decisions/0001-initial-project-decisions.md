@@ -4,7 +4,7 @@
 **Status**: FINAL
 **Date**: 2026-08-23
 **Supersedes**: `docs/requirements.md` §12 の暫定案
-**Superseded by**: D-03 → [`0135-critical-notifications-to-slack.md`](0135-critical-notifications-to-slack.md)（critical も Slack へ。critical / warning は同じ経路で、本文の重大度で区別する）
+**Superseded by**: D-03 → [`0135-critical-notifications-to-slack.md`](0135-critical-notifications-to-slack.md)（critical も Slack へ。critical / warning は同じ経路で、本文の重大度で区別する） / D-06 の一部 → [`0168-slack-mention-qa.md`](0168-slack-mention-qa.md)（Slack のメンションへの返答に限って coldaisle が会話の受け口を持つ。Web のチャット UI は作らないまま）
 
 > 構想メモ §22 の Decision Memory 形式に従い、追記のみで管理します。
 > 変更が必要になった場合は本ファイルを書き換えず、新しい決定記録を作り
