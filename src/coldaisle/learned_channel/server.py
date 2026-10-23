@@ -538,6 +538,10 @@ class LearnedChannelServer:
             self._send_frame(conn, frame)
 
     def _send_frame(self, conn: _Connection, frame: LearnedFrame) -> None:
+        if conn.role is not LearnedRole.MPC:
+            # **RL Supervisor worker へはヒントの欄を伏せて送る**（0133 §2.2 / 0152 §2.6）。
+            # ヒントを読むのは MPC worker の Shadow solver だけで、RL artifact は宣言を持たない
+            frame = frame.without_hint()
         data = encode_outbound(
             OutboundEnvelope(run_id=self._run_id, role=conn.role, body=FrameBody(frame=frame))
         )

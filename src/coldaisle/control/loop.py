@@ -33,7 +33,7 @@ import logging
 import re
 from collections import deque
 from dataclasses import dataclass
-from typing import Protocol, Self, cast
+from typing import Any, Protocol, Self, cast
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -63,8 +63,10 @@ from coldaisle.control.learned_handoff import (
     LearnedExpectedArtifacts,
     LearnedFrame,
     LearnedFrameSink,
+    LearnedHintCertification,
     LearnedRole,
     UnavailableCalibration,
+    supervisor_hint_relation_holds,
 )
 from coldaisle.control.logging import ControlTraceLogger
 from coldaisle.control.mpc.controller import MpcProposal
@@ -659,6 +661,7 @@ class ControlLoop:
         learned_health: LearnedChannelHealth | None = None,
         learned_calibration: AvailableCalibration | UnavailableCalibration | None = None,
         metric_catalog_sha256: str | None = None,
+        learned_hint_certification: LearnedHintCertification | None = None,
         shadow: ShadowRecorder | None = None,
         trace: ControlTraceLogger | None = None,
         authority: AuthorityObserver | None = None,
@@ -680,6 +683,11 @@ class ControlLoop:
         ``learned_calibration`` / ``metric_catalog_sha256`` は frame v3 の欄（決定記録 0101 §2.2 /
         0107 §2.6）。fand が起動時に読んだ値で、``learned_sink`` を渡すなら**両方とも必須**
         （既定値で「読めなかった」や別の catalog を名乗らせない）。
+
+        ``learned_hint_certification`` は frame v4 の ``hint_certification``（決定記録 0152 §2.6 /
+        0162 §2.2）。fand が起動時に証明書の照合を通し、``config/learned-channel.yaml`` に領域の
+        判定の値があるときだけ渡す。**実効の段階が B1 以上の tick でだけ** ``supervisor_hint`` と
+        組で frame に入れる（0133 §2.5）。渡さなければ frame のヒントの欄は常に None。
         """
         if learned_sink is not None and (
             learned_calibration is None or metric_catalog_sha256 is None
@@ -687,6 +695,8 @@ class ControlLoop:
             raise ValueError(
                 "frame を送るなら起動時の較正と Metric Catalog の SHA-256 も渡す（0101 / 0107）"
             )
+        if learned_hint_certification is not None and learned_sink is None:
+            raise ValueError("hint_certification は frame を送る構成でだけ渡す（0152 §2.6）")
         if (supervisor is None) != (regime is None):
             raise ValueError("Supervisor と Workload Regime 推定は一緒に配線する")
         if rl_supervisor_source is not None and supervisor is None:
@@ -747,6 +757,8 @@ class ControlLoop:
         self._learned_sink = learned_sink
         self._learned_calibration = learned_calibration
         self._metric_catalog_sha256 = metric_catalog_sha256
+        # **毎 run 同じ値**（起動時の照合の結果。0152 §2.6）。None ならヒントの欄を埋めない
+        self._learned_hint_certification = learned_hint_certification
         self._learned_health = learned_health
         # **受付スレッドの死は再起動まで覚える**（決定記録 0077 §2.2）。以後は提案を1件も読まない。
         self._learned_channel_dead = False
@@ -839,7 +851,7 @@ class ControlLoop:
                 monotonic_ms=snapshot.monotonic_ms,
             )
         )
-        supervisor_decision, regime_estimate, hint_record = self._run_supervisor(
+        supervisor_decision, regime_estimate, hint_record, supervisor_hint = self._run_supervisor(
             snapshot, now_mono_ms=snapshot.monotonic_ms
         )
         supervisor_output = (
@@ -1006,6 +1018,7 @@ class ControlLoop:
             snapshot=snapshot,
             workload=regime_estimate,
             supervisor=supervisor_output,
+            supervisor_hint=supervisor_hint,
             baseline=baseline,
             safety=safety_decision,
             hardware=hardware,
@@ -1158,14 +1171,27 @@ class ControlLoop:
 
     def _run_supervisor(
         self, snapshot: ControlStateSnapshot, *, now_mono_ms: int
-    ) -> tuple[SupervisorDecision | None, WorkloadRegimeEstimate | None, WorkloadHintRecord]:
+    ) -> tuple[
+        SupervisorDecision | None,
+        WorkloadRegimeEstimate | None,
+        WorkloadHintRecord,
+        SupervisorOutput | None,
+    ]:
         """Regime・Supervisor の判断と、その tick の Workload Hint の記録（0133 §2.9）。
 
         **ヒントは Regime の推定の後に進める**（矛盾は Telemetry 由来の Regime だけで判定する。
         0064 §2.7）。Regime の推定にはヒントを入れない（0064 §2.5）。
+
+        4つ目の値は frame v4 の ``supervisor_hint`` の候補（B1 以上の tick だけ。0133 §2.5）。
+        **選ばれた出力は変えない**（B1 は shadow だけ。0162 §2.1）。
         """
         if self._supervisor is None or self._regime is None:
-            return None, None, self._hint_record(self._hint_step(snapshot, None), None, None)
+            return (
+                None,
+                None,
+                self._hint_record(self._hint_step(snapshot, None), None, None),
+                None,
+            )
         try:
             self._regime_state, estimate = self._regime.step(self._regime_state, snapshot)
         except Exception:
@@ -1173,7 +1199,12 @@ class ControlLoop:
                 "workload regime estimation failed",
                 extra={logs.FIELDS_KEY: {"tick_id": snapshot.tick_id}},
             )
-            return None, None, self._hint_record(self._hint_step(snapshot, None), None, None)
+            return (
+                None,
+                None,
+                self._hint_record(self._hint_step(snapshot, None), None, None),
+                None,
+            )
         hint_tick = self._hint_step(snapshot, estimate.regime)
         candidate, rl_error = self._rl_candidate(now_mono_ms)
         policy_input = SupervisorInput(
@@ -1192,8 +1223,42 @@ class ControlLoop:
                 "supervisor evaluation failed",
                 extra={logs.FIELDS_KEY: {"tick_id": snapshot.tick_id}},
             )
-            return None, estimate, self._hint_record(hint_tick, None, None)
-        return decision, estimate, self._hint_record(hint_tick, policy_input, decision)
+            return None, estimate, self._hint_record(hint_tick, None, None), None
+        return (
+            decision,
+            estimate,
+            self._hint_record(hint_tick, policy_input, decision),
+            self._supervisor_hint(hint_tick, policy_input, decision),
+        )
+
+    def _supervisor_hint(
+        self, hint_tick: HintTick, policy_input: SupervisorInput, decision: SupervisorDecision
+    ) -> SupervisorOutput | None:
+        """frame v4 の ``supervisor_hint`` の候補（決定記録 0133 §2.5 / 0162 §2.5 の PR-A）。
+
+        入れるのは、**この tick の実効の段階が B1（``shadow_mpc``）以上**で、``hint_certification``
+        を持ち（起動時の照合が通った）、ヒントが ``active``・対応表に鍵があり・ヒント有りの
+        context が基準と違う tick だけ。それ以外は None。**組み立てに失敗しても tick を止めない**
+        （ヒントは任意。0133 §2.8）。ここで作るのは worker へ渡す値だけで、``requested_demand`` には
+        届かない（0162 §2.1）。
+        """
+        if (
+            self._supervisor is None
+            or self._learned_sink is None
+            or self._learned_hint_certification is None
+            or hint_tick.hint is None
+            or workload_hint_stage_rank(hint_tick.stage)
+            < workload_hint_stage_rank(WorkloadHintStage.SHADOW_MPC)
+        ):
+            return None
+        try:
+            return self._supervisor.hinted_output(policy_input, decision)
+        except Exception:
+            LOGGER.exception(
+                "ヒント有りの Supervisor 出力を組み立てられなかった; frame のヒントの欄を空にする",
+                extra={logs.FIELDS_KEY: {"tick_id": policy_input.snapshot.tick_id}},
+            )
+            return None
 
     def _hint_step(self, snapshot: ControlStateSnapshot, regime: WorkloadRegime | None) -> HintTick:
         if self._workload_hint is None:
@@ -1746,6 +1811,7 @@ class ControlLoop:
         snapshot: ControlStateSnapshot,
         workload: WorkloadRegimeEstimate | None,
         supervisor: SupervisorOutput | None,
+        supervisor_hint: SupervisorOutput | None,
         baseline: ControllerProposal | None,
         safety: CriticalSafetyDecision,
         hardware: PerZone[FanHardwareResult] | None,
@@ -1755,35 +1821,80 @@ class ControlLoop:
 
         失敗しても制御には何も返さない（frame が届かないのは worker の window の欠けであり、
         Confidence / OOD と Gate が Fallback へ倒す）。
+
+        ``supervisor_hint`` は基準の ``supervisor`` との関係（同じ tick・regime・policy の版で
+        ``target_band`` だけが違う。0133 §2.5）を確かめ、成り立てば ``hint_certification`` と組で
+        入れる。成り立たない・組み立てに失敗したときは**両方 None の frame を送る**（ヒントの失敗で
+        基準の frame を失わない。失敗の影響は片方向。0162 §2.1）。
         """
         if self._learned_sink is None:
             return
         assert self._learned_calibration is not None and self._metric_catalog_sha256 is not None
         try:
-            frame = LearnedFrame(
-                snapshot=snapshot,
-                workload=workload,
-                supervisor=supervisor,
-                baseline=baseline,
-                safety_floor=PerZone[Demand](
+            fields: dict[str, Any] = {
+                "snapshot": snapshot,
+                "workload": workload,
+                "supervisor": supervisor,
+                "baseline": baseline,
+                "safety_floor": PerZone[Demand](
                     front=safety.zones.front.floor,
                     rear=safety.zones.rear.floor,
                     top=safety.zones.top.floor,
                 ),
-                applied=_applied_demands(hardware),
-                authority_stage=authority_stage,
-                expected_artifacts=self._expected_artifacts,
-                config=self._config_digest,
+                "applied": _applied_demands(hardware),
+                "authority_stage": authority_stage,
+                "expected_artifacts": self._expected_artifacts,
+                "config": self._config_digest,
                 # **毎 tick 同じ値**（fand は較正も catalog も起動時にしか読まない。0101 §2.2）
-                calibration=self._learned_calibration,
-                metric_catalog_sha256=self._metric_catalog_sha256,
-            )
+                "calibration": self._learned_calibration,
+                "metric_catalog_sha256": self._metric_catalog_sha256,
+            }
+            frame = self._frame_with_hint(fields, snapshot, supervisor, supervisor_hint)
+            if frame is None:
+                frame = LearnedFrame(**fields, supervisor_hint=None, hint_certification=None)
             self._learned_sink.offer(frame)
         except Exception:
             LOGGER.exception(
                 "learned worker への frame を置けなかった",
                 extra={logs.FIELDS_KEY: {"tick_id": snapshot.tick_id}},
             )
+
+    def _frame_with_hint(
+        self,
+        fields: dict[str, Any],
+        snapshot: ControlStateSnapshot,
+        supervisor: SupervisorOutput | None,
+        supervisor_hint: SupervisorOutput | None,
+    ) -> LearnedFrame | None:
+        """ヒントの欄を入れた frame。入れない・入れられないなら None。
+
+        None なら呼び出し側が両方 None の frame を作る。関係の検査（0133 §2.5）に落ちたら入れない。
+        """
+        certification = self._learned_hint_certification
+        if supervisor_hint is None or certification is None:
+            return None
+        if not supervisor_hint_relation_holds(snapshot, supervisor, supervisor_hint):
+            LOGGER.warning(
+                "ヒント有りの Supervisor 出力が基準と同じ tick・regime・policy の版でない; "
+                "frame のヒントの欄を空にする",
+                extra={
+                    logs.FIELDS_KEY: {
+                        "tick_id": snapshot.tick_id,
+                        "reason": "supervisor_hint_relation_mismatch",
+                    }
+                },
+            )
+            return None
+        try:
+            return LearnedFrame(
+                **fields, supervisor_hint=supervisor_hint, hint_certification=certification
+            )
+        except Exception:
+            LOGGER.exception(
+                "ヒントの欄を入れた frame を作れなかった; ヒントの欄を空にして送る",
+                extra={logs.FIELDS_KEY: {"tick_id": snapshot.tick_id}},
+            )
+            return None
 
     def _learned_source_mono_ms(self, result: MpcProposal) -> int | None:
         """提案の元 snapshot の単調時刻（**この loop の時計**。決定記録 0077 §2.4 の4）。

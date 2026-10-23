@@ -93,6 +93,8 @@ from coldaisle.control.hardware import (
 )
 from coldaisle.control.learned_handoff import (
     AvailableCalibration,
+    LearnedHintCertification,
+    LearnedHintComponents,
     UnavailableCalibration,
 )
 from coldaisle.control.logging import ControlTraceLogger
@@ -133,7 +135,11 @@ from coldaisle.control.supervisor.workload_hint import (
 )
 from coldaisle.control_admin import ControlAdminEntry, open_control_admin
 from coldaisle.control_admin.runtime import new_run_id
-from coldaisle.hint_certification import HintCertificateSource, verify_hint_certificate
+from coldaisle.hint_certification import (
+    HintCertificateSource,
+    HintCertificationResult,
+    verify_hint_certificate,
+)
 from coldaisle.learned_channel import (
     DisabledLearnedChannel,
     LearnedChannelEntry,
@@ -1107,7 +1113,7 @@ def build(
         config, control, monotonic=monotonic, run_id=run_id, registry_watch=registry.watch
     )
     # **Workload Hint の読み手は loop の外のスレッド**（0133 §2.8）。読めなくても起動は続ける
-    hint_tracker, hint_reader = _open_workload_hint(
+    hint_tracker, hint_reader, hint_certification = _open_workload_hint(
         config,
         control,
         rules=rules,
@@ -1148,6 +1154,7 @@ def build(
             metric_catalog_sha256=metric_catalog_sha256,
             run_id=run_id,
             workload_hint=hint_tracker,
+            learned_hint_certification=_learned_hint_certification(learned, hint_certification),
         )
     except BaseException:
         if hint_reader is not None:
@@ -1325,8 +1332,10 @@ def _open_workload_hint(
     certificate: HintCertificateSource | None,
     hint_latch: HintCertificationLatch | None,
     calibration: AvailableCalibration | UnavailableCalibration,
-) -> tuple[WorkloadHintTracker | None, WorkloadHintReader | None]:
+) -> tuple[WorkloadHintTracker | None, WorkloadHintReader | None, HintCertificationResult | None]:
     """Workload Hint の読み手を起こし、loop が使う tracker を返す（決定記録 0133 §2.6 / §2.8）。
+
+    3つ目の値は起動時の証明書の照合の結果（B1 / B2 を設定したときだけ。それ以外は None）。
 
     ``stage: off`` なら何もしない（Stage A のまま。ヒントを読まない）。B1 / B2 を設定したときは、
     tick を始める前に証明書を1回だけ照合し（0152 §2.4。``coldaisle.hint_certification``）、
@@ -1335,6 +1344,7 @@ def _open_workload_hint(
     """
     hint = control.policy.supervisor.workload_hint
     certified = False
+    result: HintCertificationResult | None = None
     if hint_latch is not None:
         result = verify_hint_certificate(
             source=certificate,
@@ -1361,7 +1371,7 @@ def _open_workload_hint(
         )
     stage = effective_stage(hint.stage, certified=certified)
     if stage is WorkloadHintStage.OFF:
-        return None, None
+        return None, None, result
     db = config.db
     mailbox = HintMailbox()
     reader = WorkloadHintReader(
@@ -1387,7 +1397,37 @@ def _open_workload_hint(
         certified=certified,
         revocation=hint_latch,
     )
-    return tracker, reader
+    return tracker, reader, result
+
+
+def _learned_hint_certification(
+    learned: LearnedChannelEntry | DisabledLearnedChannel | None,
+    certification: HintCertificationResult | None,
+) -> LearnedHintCertification | None:
+    """frame v4 の ``hint_certification``（決定記録 0152 §2.6 / 0162 §2.2）。作れなければ None。
+
+    作るのは、Learned の経路を開けて ``config/learned-channel.yaml`` に ``hint_domain`` の塊が
+    あり、起動時の証明書の照合が通ったときだけ。それ以外は None で、loop は frame に
+    ヒントの欄を入れない（B1 の依頼が worker へ届かないだけで、基準の経路は変わらない）。
+    実効の段階が B0 の間は、渡しても loop が埋めない（0133 §2.5）。
+    """
+    if not isinstance(learned, LearnedChannelEntry):
+        return None
+    domain = learned.settings.hint_domain
+    if (
+        domain is None
+        or certification is None
+        or not certification.certified
+        or certification.certificate_sha256 is None
+        or certification.components is None
+    ):
+        return None
+    return LearnedHintCertification(
+        certificate_sha256=certification.certificate_sha256,
+        components=LearnedHintComponents.from_certificate(certification.components),
+        domain_lookback_ms=domain.domain_lookback_ms.value,
+        domain_stale_after_ms=domain.domain_stale_after_ms.value,
+    )
 
 
 def _build_loop(
@@ -1411,6 +1451,7 @@ def _build_loop(
     metric_catalog_sha256: str,
     run_id: str,
     workload_hint: WorkloadHintTracker | None,
+    learned_hint_certification: LearnedHintCertification | None,
 ) -> ControlLoop:
     safety = CriticalSafety(
         control.safety,
@@ -1472,6 +1513,9 @@ def _build_loop(
         # frame v3 の欄（決定記録 0101 §2.2 / 0107 §2.6）。起動時に読んだ値を毎 tick 同じに載せる
         learned_calibration=learned_calibration,
         metric_catalog_sha256=metric_catalog_sha256,
+        # frame v4 の `hint_certification`（0152 §2.6 / 0162 §2.2）。B1 以上の tick だけ
+        # `supervisor_hint` と組で入る。照合が通らない・経路の設定に値が無ければ None
+        learned_hint_certification=learned_hint_certification,
         shadow=ShadowRecorder(control.policy.shadow),
         trace=ControlTraceLogger(store) if config.record_trace else None,
         authority=authority,

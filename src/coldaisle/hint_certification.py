@@ -180,6 +180,9 @@ class HintCertificationResult:
     certification: HintCertification
     launch_form: LaunchForm
     certificate_sha256: str | None = None
+    components: HintCertificateComponents | None = None
+    """照合が通ったときだけ、その証明書の部品（frame v4 の ``hint_certification`` の worker 側の
+    期待値の出どころ。0152 §2.6）。通らなければ None。"""
 
     @property
     def certified(self) -> bool:
@@ -251,6 +254,7 @@ def verify_hint_certificate(
         certification=HintCertification.CERTIFIED,
         launch_form=form,
         certificate_sha256=certificate.certificate_sha256,
+        components=certificate.components,
     )
 
 
