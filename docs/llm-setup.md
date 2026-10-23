@@ -179,7 +179,7 @@ sudo systemd-run --wait --pipe --uid=coldaisle --gid=coldaisle \
 journalctl -u coldaisle-daemon -u coldaisle-api --since -10min | grep -i 'claude'   # 何も出なければ良い（上の --pipe の出力にも出ないこと）
 ```
 
-### NFR-04（初回トークン 2 s）の測り方（0163 §2.4）
+### NFR-04（初回トークン 2 s）の測り方（0163 §2.4 / 0166）
 
 Provider は `stream: false` なので、測定は Provider を通さず、同じ窓口へ同じ形の要求をストリーミングで送る一回限りの手順で行う。
 **測定をコードと CI に足さない。**
@@ -187,11 +187,119 @@ Provider は `stream: false` なので、測定は Provider を通さず、同�
 | 項目 | 決め |
 |---|---|
 | 状態 | **warm**（PAW の vLLM が起動済みでモデルを読み終えている）。起動にかかる時間は coldaisle が待たないので範囲の外 |
-| 要求 | coldaisle の最も長い実際のプロンプト（`explain_context` を足したアラートの説明）と同じ長さ・`enable_thinking=false`・`max_tokens` 1024・`stream: true` |
+| 要求 | **2 つの経路のそれぞれで実際に作られた要求の本文**（0166）。(a) 日次レポートの所見は直近 7 日で最も長い日、(b) アラートの説明は直近 7 日に発火したもので最も長いもの（無ければ最後の 1 件）。保存した本文の `stream` を `true`・`max_tokens` を 1024 にして送る（`enable_thinking=false` は保存したまま） |
 | 計る区間 | 要求を送ってから、最初の `content` の差分が届くまで |
-| 回数 | 20 回。間をあけて送る（prefix cache で 2 回目以降だけ速くならないよう、プロンプトの先頭の時刻の行を毎回変える） |
-| 合格 | PAW の他の要求が無いときに **20 回すべて 2 s 以内** |
+| 回数 | 経路ごとに 20 回。間をあけて送る（prefix cache で 2 回目以降だけ速くならないよう、プロンプトの先頭の時刻の行を毎回変える） |
+| 合格 | **経路ごとに**、PAW の他の要求が無いときに **20 回すべて 2 s 以内**（(a) と (b) の両方） |
 | 参考 | PAW の要求と重なったときの値も記録する。合否には使わない（共用の窓口で、相手の負荷は coldaisle が決められない） |
+
+**要求の本文を拾う**（0166 §2.2。手で同じ長さの文を作らない）。`/opt/coldaisle` ではなく作業用のフォルダで行う
+（`--no-send` でもレポートは作業ディレクトリの `var/reports/` に書かれる）。拾った本文には DB の値が入るので、リポジトリに入れない。
+
+```bash
+mkdir -p ~/nfr04 && cd ~/nfr04 && ln -sfn /opt/coldaisle/config config
+# DB の写し（導入先の DB は操作者から読めないので root で backup を取って渡す）
+sudo /opt/coldaisle/.venv/bin/python -I -c "import sqlite3,sys; sqlite3.connect('file:/var/lib/coldaisle/coldaisle.db?mode=ro', uri=True).backup(sqlite3.connect(sys.argv[1]))" "$PWD/copy.db"
+sudo chown "$(id -u):$(id -g)" copy.db
+# 下の 3 つのスクリプトを ~/nfr04 に置く（record.py / explain.py / measure.py）
+export COLDAISLE_LLM_PROVIDER=openai_compatible OPENAI_BASE_URL=http://127.0.0.1:18099/v1 MODEL_NAME=main
+
+# (a) 日次レポート: 直近 7 日の各日の要求を拾う
+python3 -I record.py req-report & rec=$!
+for i in 1 2 3 4 5 6 7; do
+  /opt/coldaisle/.venv/bin/coldaisle-report --db copy.db --date "$(date -d "-$i day" +%F)" --no-send --print >/dev/null
+done
+kill "$rec"
+
+# (b) アラートの説明: 直近 7 日に発火したもの（無ければ最後の 1 件）の要求を拾う
+python3 -I record.py req-explain & rec=$!
+/opt/coldaisle/.venv/bin/python -I explain.py copy.db
+kill "$rec"
+
+ls -S req-report/*.json | head -1    # (a) で使う本文（最も長いもの）
+ls -S req-explain/*.json | head -1   # (b) で使う本文
+```
+
+`record.py`（ループバックだけで待ち受け、要求の本文を保存して空の応答を返す。空なので所見と説明は捨てられる）:
+
+```python
+# 受けた chat/completions の要求の本文をそのまま保存し、空の応答を返す（ループバックだけ・測定の準備の一回だけ）
+import http.server, json, sys, pathlib
+out = pathlib.Path(sys.argv[1]); out.mkdir(exist_ok=True)
+class H(http.server.BaseHTTPRequestHandler):
+    def do_POST(self):
+        body = self.rfile.read(int(self.headers["Content-Length"]))
+        n = len(list(out.glob("*.json")))
+        (out / f"{n:03d}.json").write_bytes(body)
+        reply = json.dumps({"id": "r", "object": "chat.completion", "model": "main",
+                            "choices": [{"index": 0, "finish_reason": "stop",
+                                         "message": {"role": "assistant", "content": ""}}]}).encode()
+        self.send_response(200); self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(reply))); self.end_headers(); self.wfile.write(reply)
+http.server.HTTPServer(("127.0.0.1", 18099), H).serve_forever()
+```
+
+`explain.py`（本番の説明スレッドと同じ部品で説明の要求を作る）:
+
+```python
+# 直近 7 日に発火したアラート（無ければ最後の 1 件）の説明の要求を、本番の説明スレッドと同じ部品で作る
+import sqlite3, sys, time
+from pathlib import Path
+from coldaisle.ai import AiSettings, Explainer, ToolRegistry, provider_from_env
+from coldaisle.clock import WallClock
+from coldaisle.llm_exclusions import LlmExclusions
+from coldaisle.metrics import MetricCatalog
+from coldaisle.rules import RuleSet
+from coldaisle.store import QualityRules, SqliteStore
+db = Path(sys.argv[1])
+since = int(time.time() * 1000) - 7 * 86_400_000
+with sqlite3.connect(f"file:{db}?mode=ro", uri=True) as con:
+    ids = [r[0] for r in con.execute("SELECT id FROM alerts WHERE fired_ms >= ? ORDER BY id", (since,))]
+    ids = ids or [r[0] for r in con.execute("SELECT id FROM alerts WHERE fired_ms IS NOT NULL ORDER BY fired_ms DESC LIMIT 1")]
+settings = AiSettings.from_yaml(Path("config/ai.yaml"))
+clock = WallClock()
+store = SqliteStore(db, rules=QualityRules.from_yaml(Path("config/quality.yaml")), clock=clock)
+tools = ToolRegistry(store=store, catalog=MetricCatalog.from_yaml(Path("config/metrics.yaml")),
+                     rules=RuleSet.from_yaml(Path("config/rules.yaml")), clock=clock,
+                     exclusions=LlmExclusions.from_yaml(Path("config/report.yaml")))
+explainer = Explainer(provider=provider_from_env(settings), tools=tools, context=settings.explain_context)
+for alert_id in ids:
+    alert = store.alert(alert_id)
+    if alert is not None:
+        explainer.explain(alert)
+print(f"説明の要求を {len(ids)} 件作った")
+```
+
+**測る**（PAW の vLLM が warm で、PAW の他の要求が無いときに。経路ごとに 20 回）:
+
+```bash
+python3 -I measure.py "$(ls -S req-report/*.json | head -1)"
+python3 -I measure.py "$(ls -S req-explain/*.json | head -1)"
+```
+
+`measure.py`:
+
+```python
+# 保存した要求を stream で 20 回送り、最初の content の差分までの秒数を出す
+import json, sys, time, urllib.request
+body = json.load(open(sys.argv[1], encoding="utf-8"))
+url = sys.argv[2] if len(sys.argv) > 2 else "http://127.0.0.1:18080/v1/chat/completions"
+body.update(stream=True, max_tokens=1024)
+system = body["messages"][0]
+base = system["content"]
+for n in range(1, 21):
+    system["content"] = f"測定 {time.time_ns()}\n{base}"  # 先頭を毎回変える（prefix cache を避ける）
+    req = urllib.request.Request(url, json.dumps(body).encode(), {"Content-Type": "application/json"})
+    start = time.monotonic(); first = None
+    with urllib.request.urlopen(req, timeout=60) as resp:
+        for line in resp:
+            if first is None and line.startswith(b"data: {"):
+                choices = json.loads(line[6:]).get("choices") or [{}]
+                if (choices[0].get("delta") or {}).get("content"):
+                    first = time.monotonic() - start
+    print(f"{n:2d} {'到達せず' if first is None else f'{first:.3f} s'}", flush=True)
+    time.sleep(5)
+```
 
 - 結果は文書の PR か導入の記録に残す
 - 2 s を超えたら、所有者が PAW 側の設定（`--max-num-seqs` など）を含めて扱いを決める
