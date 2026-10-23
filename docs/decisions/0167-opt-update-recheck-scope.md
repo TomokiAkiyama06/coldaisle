@@ -1,0 +1,134 @@
+# 決定記録 0167: fand を `enable` した後に `/opt/coldaisle` を更新するとき、差分の区分でやり直す確認を決める
+
+- **種別**: Decision Record
+- **Status**: Proposed
+- **Date**: 2026-10-23
+- **Supersedes**: なし（[`0161`](0161-fand-enable-prerequisites.md) §5 の 8 が「最初の更新の前に別の記録で決める」とした一般の規定を決める。
+  0161 §2.4 の R1〜R3 の中身と合格の条件は変えずに使う）
+- **関連**: [`0121`](0121-hardware-test-procedure.md) §2.3 / §2.10 / [`0128`](0128-gpu-fan-curve-service.md) §2.7 /
+  [`0148`](0148-fand-state-alert.md) / [`0161`](0161-fand-enable-prerequisites.md) §1.3 / §2.4 / §2.5 / §5 の 8 /
+  [`0165`](0165-r3-split-cpu-load-run.md) / `docs/ubuntu-deploy.md` 4「コードを更新するとき」/ 6.5 / 6.9 /
+  `docs/fan-header-mapping.md`「HEAD での確認」
+- **対象 Issue**: #74
+
+---
+
+## 1. Context
+
+fand は 2026-10-23 に `/opt/coldaisle` = `5ff6f96` で `enable` した（0161 §2.5 の手順 8）。0161 §2.4 は、`d3c5404` → `5ff6f96` の更新に限って
+R1〜R3（約 3.5 時間）をやり直すと決め、`enable` の後の更新で何をやり直すかは「最初の更新の前に別の記録で決める」とした（0161 §5 の 8）。
+
+main はすでに `5ff6f96` より進んでいる（#369 の `sys.gpu_state`、`src/coldaisle/internal_telemetry/`・`telemetry_daemon.py`・`config/gpu_state.yaml`）。
+更新のたびに R1〜R3 をやり直すと毎回 3.5 時間かかり、所有者が現地にいる必要がある（R1）。一方で、何もやり直さずに入れると、
+fand の経路の回帰に気づけない。
+
+0161 §2.4 は、R1〜R3 で足りるかの判断をやり直す path の一覧を、すでに持っている。本記録はそれを一般の規定に広げ、
+差分の区分ごとにやり直す確認を決める。
+
+## 2. Decision
+
+### 2.1 区分
+
+更新の前に、導入済みの commit（`<deployed>`）と入れる commit（`<target>`）の差分を
+`git diff --name-only <deployed> <target> -- src deploy config uv.lock firmware` で取り、各 path を次の区分に当てる。
+**差分の全体の区分は、当たった区分のうち最も上のもの**とする。
+
+| 区分 | 当たる path・変化 | やり直す確認 |
+|---|---|---|
+| **S**（安全の経路） | `src/coldaisle/control/safety/`・`control/reactive/`・`control/fallback/`・`control/hardware/`・`src/coldaisle/safety_handoff.py`・`deploy/systemd/coldaisle-fand.service`・`deploy/udev/`・`safety.yaml` の版か値の変化を求める版・`src/coldaisle/gpu_fan_curve.py` と `deploy/systemd/coldaisle-gpu-fan.service` | **本記録の規定の外。** 更新の前に、やり直す 0121 の試験（T のどれか）と 0128 §2.7 の確認を新しい決定記録で決め、所有者が承認する。それまで入れない |
+| **F**（fand のほかのコード） | S に当たらない `src/coldaisle/control/`・`src/coldaisle/control_daemon.py`・fand の import の閉包（§2.2）の module（2026-10-23 の main では `store/`（migration を含む）・`ingest/`・`control_admin/`・`learned_channel/`・`workload_hint_reader/`・`event_entry/`・`channels.py`・`metrics.py`・`measurement.py`・`calibration_offsets.py`・`startup_calibration.py`・`hint_certificat*.py`・`local_socket.py`・`logs.py`・`clock.py`・`csv_export_manifest.py` ほか）・`uv.lock`・`config/calibration.json`・`ControlTick` の版・Control Config の版 | 0161 §2.4 の **R1〜R3** を、そのままの手順と合格の条件で行う（`stage: off`。R3 の CPU と GPU の負荷の回は 0165 §2.3 の直したスクリプトで）。合格するまで `enable` の状態に戻さない（§2.3） |
+| **I**（fand の入力を作るもの。閉包の外） | `src/coldaisle/daemon.py`・`src/coldaisle/telemetry_daemon.py`・`src/coldaisle/internal_telemetry/`・`src/coldaisle/cpu_power_publisher.py`・それらの unit（`coldaisle-daemon` / `coldaisle-telemetry` / `coldaisle-cpu-power`）・`config/internal-telemetry.yaml`・`config/gpu_state.yaml`・`config/quality.yaml`・`config/metrics.yaml`・`firmware/`。取り込みと共有する module（`ingest/`・`metrics.py` など）は fand の閉包に入るので F | **I1**（§2.4） |
+| **O**（その他） | 上のどれにも当たらないもの（`api/`・`web/`・`ai/`・`notify/`・`rules/`・`report.py` ほか、`docs/`・`tests/`、ほかの `config/`） | 共通の確認（§2.3）だけ |
+
+- 区分の当てはめは、更新を準備する側（エージェントでもよい）が行い、差分の path と区分の一覧を所有者に示す。**所有者が確かめてから更新する**
+- 一覧に無い新しい path（新しい module・新しい unit）は、fand の import の閉包に入るなら F、fand の入力を作るなら I とする。
+  どちらか判断できなければ上の区分に寄せる
+- 当てはめの結果とやり直した確認の結果は、#74 にコメントで残す（`/opt` の前後の commit と区分。実機のホスト名・path は書かない）
+
+### 2.2 fand の import の閉包
+
+F の「fand の import の閉包」は、`<target>` で次の一行が出す path とする。
+
+```bash
+/opt/coldaisle/.venv/bin/python -I -c "import sys, coldaisle.control_daemon; print('\n'.join(sorted(m.__file__ for n, m in sys.modules.items() if n.startswith('coldaisle') and getattr(m, '__file__', None))))"
+```
+
+関数の中で import する module（`control/supervisor/artifact.py` などの遅延の import）はここに出ないことがあるが、`src/coldaisle/control/` は
+丸ごと F 以上に当てるので、閉包の取りこぼしは `control/` の外の module に限られる。閉包に出なくても fand から使う module を見つけたら、
+次の更新から F に足す（本記録の §2.1 の表は path の例であり、閉包と合わせて読む）。
+
+### 2.3 すべての区分で行う手順と共通の確認
+
+更新の手順は `docs/ubuntu-deploy.md` 4「コードを更新するとき」のとおりで、**最初に fand を止める**（DB の書き手なので。`systemctl stop` で
+3 zone は BIOS の制御へ戻る）。止めている間は BIOS の制御で、0148 の通知を出す `coldaisle-daemon` も止まっている。
+
+共通の確認（どの区分でも行う）:
+
+| # | 確認 | 合格 |
+|---|---|---|
+| C1 | 書き手を起動し直した後、`coldaisle-fand` を `start` する（`enable` は残ったまま） | `active`・`NRestarts` 0、起動ログの `safety_config_is_provisional` が false、trace が届き、`schema_version` が期待の版 |
+| C2 | `/opt/coldaisle/config/rules.yaml` の `fand_trace_silent.enabled` | 出荷の `false` に戻っていたら `true` に直して `coldaisle-daemon` を再起動する（0161 §2.5 の手順 10） |
+| C3 | `/etc/coldaisle/internal-telemetry.yaml` の写しと repo の yaml の差分 | 差分があれば所有者が扱いを決める（今の運用のまま） |
+| C4 | 更新の後 10 分の trace | `safety_state` が `normal` に戻り（起動の直後の `startup` を除く）、`faults` が空 |
+
+F では、R1〜R3 の間は 0161 §2.4 の手順どおり `systemctl start` / `stop` で動かし、R3 に合格するまで C1 で常駐の状態に戻さない
+（R3 の 2 時間の soak をそのまま常駐の運転とつなげてよい）。合格しなければ `/opt` を `<deployed>` へ戻し、C1 からやり直す。
+
+### 2.4 I1: fand の入力を作るものが変わったときの確認
+
+| 確認 | 範囲 | 合格 |
+|---|---|---|
+| fand の trace の `faults` と理由 | 更新の後 30 分（アイドルでよい） | `cpu_telemetry_stale`・`gpu_telemetry_stale`・`air_telemetry_stale`・`t_sensor_stale` の `faults` と、Top の理由の detail の `cpu_power_unavailable` が 0 tick |
+| 入力の新しさ | 同じ 30 分 | `/api/v1/health` の `stale` が false、`data_age_seconds` が 5 s 未満。`coldaisle-telemetry` と `coldaisle-daemon` の `NRestarts` 0 |
+| 変わった metric | 差分が足した・変えた metric | DB に新しい sample が届いている（例: #369 の `sys.gpu_state`） |
+
+I1 で合格しなければ `/opt` を `<deployed>` へ戻す。fand は入力が古くなれば `*_telemetry_stale` で Max・fault にする（安全側。0060 §2.2）ので、
+I1 の間に不合格になっても冷却は失わない。
+
+### 2.5 最初の適用（`5ff6f96` → `4e80252`）
+
+2026-10-23 の main（`4e80252`）を §2.1 に当てた結果（`git diff --name-only 5ff6f96 4e80252 -- src deploy config uv.lock firmware`）:
+
+| path | 区分 |
+|---|---|
+| `config/gpu_state.yaml`（新しい） | I（`coldaisle-telemetry` が読む。fand は読まない） |
+| `src/coldaisle/internal_telemetry/__init__.py`・`gpu_state.py`（新しい）・`models.py`・`nvml.py` | I |
+| `src/coldaisle/telemetry_daemon.py` | I |
+
+`coldaisle.control_daemon` の import の閉包（§2.2。開発の checkout の `4e80252` で実行）には `coldaisle.internal_telemetry`・`coldaisle.telemetry_daemon`・`coldaisle.daemon`・`coldaisle.cpu_power_publisher` が無いことを確かめた。
+`deploy/`・`uv.lock`・`store/` に差分は無い。したがって区分は **I** で、共通の確認と I1 を行う。本記録の承認の後、所有者の判断で更新する。
+
+## 3. Consequences
+
+### 良くなること
+
+- 更新のたびに 3.5 時間の確認をせずに済む。fand に関係しない更新（文書・通知・AI など）は、共通の確認だけで入れられる
+- 安全の経路が変わる更新は、規定の外として必ず新しい記録と承認を通る。毎回同じ R1〜R3 で済ませて、変わった安全の振る舞いを試さないまま入れることが無い
+- 区分の当てはめを path で機械的に行えるので、エージェントが準備して所有者が確かめる形にできる
+
+### 悪くなること・その緩和
+
+| 悪くなること | 緩和 |
+|---|---|
+| 区分の表に無い経路で fand に効く変更（遅延の import・共有の設定）を O と見誤りうる | `control/` は丸ごと F 以上。判断できなければ上の区分に寄せる。0148 の通知・C4 で常駐の後も見る。見つけたら表に足す |
+| 更新の間（fand を止めてから C1 まで）は BIOS の制御になる | 今までの更新と同じ。BIOS の曲線とチップの保護は効いている。0161 §2.4 の R1〜R3 の間も同じ |
+| I では負荷の下の tick の時間を見ない | fand のコードは変わっていない。入力の欠けは stale で Max になる（安全側） |
+| F で R3 の 2 時間の間は所有者の負担が残る | R1 だけ現地が要る。R3 は常駐の運転とつなげられる |
+
+## 4. 却下した代替案
+
+| 案 | 却下の理由 |
+|---|---|
+| 毎回 R1〜R3 をやり直す（0161 §5 の 8 の 2 つ目の案） | fand に関係しない更新でも 3.5 時間かかり、更新が溜まる。溜まると 1 回の差分が大きくなり、かえって切り分けにくい |
+| 区分 S も R1〜R3 で済ませる | R1〜R3 は T1 の後に安全の経路が変わっていないことを前提にした短い確認で（0161 §2.4）、安全の振る舞いそのものを試さない |
+| 区分を path ではなく PR ごとの申告（ラベル）で決める | 申告の漏れを防げない。path は差分から機械的に取れる |
+| 更新の間も fand を動かしたまま入れる | fand は DB の書き手で、migration の手順（`docs/ubuntu-deploy.md` 4）と合わない。止めても BIOS の制御で冷える |
+
+## 5. 判断点（推奨を先頭に）
+
+| # | 内容 | 選択肢（推奨を先に） | 時期 |
+|---|---|---|---|
+| 1 | 区分の数と境界 | **(推奨) S / F / I / O の 4 つ（§2.1）** / F と I を 1 つにまとめ、どちらも R1〜R3 / S と F を 1 つにまとめ、どちらも R1〜R3 | 承認のとき |
+| 2 | I1 の観察の長さ | **(推奨) 30 分（アイドルでよい）** / 2 時間（R3 と同じ） / 共通の確認の 10 分だけ | 承認のとき |
+| 3 | 当てはめの結果を残す場所 | **(推奨) #74 のコメント** / `docs/fan-header-mapping.md` に節を足す / 残さない | 承認のとき |
+| 4 | `5ff6f96` → `4e80252` の更新（§2.5） | **(推奨) 本記録の承認の後、区分 I として共通の確認と I1 で入れる** / B1 などの次の F の変更と一緒に入れる | 承認の後 |
