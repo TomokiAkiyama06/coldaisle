@@ -1,7 +1,7 @@
 # 決定記録 0168: Slack でボットにメンションすると、読み取り専用のツールで集計した値から LLM が答える
 
 - **種別**: Decision Record
-- **Status**: Proposed
+- **Status**: FINAL（2026-10-23、リポジトリ所有者の承認。§5 の 1〜7 はすべて推奨の案）
 - **Date**: 2026-10-23
 - **Supersedes**: [`0001`](0001-initial-project-decisions.md) D-06（「AI チャット UI は実装しない」）のうち、**Slack のメンションへの返答に限って**
   coldaisle が会話の受け口を持つことを認める部分のみ（Web の チャット UI は作らないまま。ツールを使う会話の正は Workspace のまま）/
@@ -25,7 +25,7 @@
 - 0143 §2.3 は、Claude API へツールの定義と結果を送らないとした（`AnthropicProvider.chat()` は `tools` があれば呼ばない）
 - coldaisle は tool loop を持たない（0163 §2.2）。いまの Slack ボット（0147）は送るだけで、メンションを受け取らない
 
-## 2. Decision（案。§5 の推奨で書く）
+## 2. Decision（2026-10-23 所有者が §5 の推奨の案で承認）
 
 ### 2.1 受け取り方: Slack の Socket Mode で、新しい常駐の unit `coldaisle-slackbot`
 
@@ -112,7 +112,9 @@
 | `query_series` も渡す | 点の列は生の時系列に近い（ルール 8）。必要になれば別の記録で |
 | Slack の SDK（`slack_sdk`）を足す | 使うのは `apps.connections.open` と WebSocket の受信と `chat.postMessage` だけで、依存を増やすほどではない |
 
-## 5. 判断点（推奨を先頭に）
+## 5. 判断点（決定済み。推奨を先頭に）
+
+**所有者の決定（2026-10-23）**: 1〜7 のすべてを推奨の案で決めた。所有者の用途は、メンションで使用率と異常（アラート）を確かめること。
 
 | # | 内容 | 選択肢（推奨を先に） |
 |---|---|---|

@@ -3,6 +3,7 @@
 - **種別**: Decision Record
 - **Status**: FINAL（2026-10-16、リポジトリ所有者の承認）
 - **Date**: 2026-10-15
+- **Superseded by**: [0168](0168-slack-mention-qa.md)（§2.3 の「ツールは送らない」のうち、Slack のメンションへの返答の経路に限ってツールの定義と結果を送る部分のみ。他の 3 経路はツールを送らないまま）
 - **Supersedes**: [`0005-model-selection.md`](0005-model-selection.md) の「ローカルモデルだけを使う」前提の一部
   （ローカル LLM が導入先に入るまでの間に限る。§2.1）と、
   [`0014-llm-provider.md`](0014-llm-provider.md) §2.1 の「接続先は OpenAI 互換だけ」の部分（Provider の選び方を足す。§2.2）。
