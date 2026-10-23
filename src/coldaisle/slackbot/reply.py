@@ -35,13 +35,14 @@ _SPECIAL = re.compile(r"<(?:[!@#]|[a-zA-Z][a-zA-Z0-9+.-]*:)[^<>]*>|<[^<>|]*\|[^<
 """
 
 _BARE_URL = re.compile(
-    r"(?:(?<![A-Za-z0-9+.-])[a-zA-Z][a-zA-Z0-9+.-]*://|(?<![A-Za-z0-9.-])www\.)[A-Za-z0-9\-._~:/?#\[\]@!$&'()*+,;=%]+"
+    r"(?:(?<![A-Za-z0-9+.-])[a-zA-Z][a-zA-Z0-9+.-]*://|(?<![A-Za-z0-9.-])www\.)[^\s<>()（）「」『』【】、。，．！？・]+"
 )
 """山括弧で囲まない素の URL（`https://…` `www.…`）。
 
-Slack は押せるリンクにするので消す（PR #376 の指摘）。URL に使える ASCII の文字だけを URL とみなし、
-続く日本語の文や句読点は残す。前に日本語が空白なしで付いても見つける
-（`\b` は日本語も単語の文字と見るので使わない）。
+Slack は押せるリンクにするので消す（PR #376 の指摘）。空白・括弧・日本語の句読点までを
+URL とみなし（日本語のドメインも消す）、続く文は残す。前に日本語が空白なしで付いても
+見つける（`\b` は日本語も単語の文字と見るので使わない）。投稿では Slack の URL の
+自動リンクも止める（`parse: none`）。
 """
 
 LINK_OMITTED = "（リンクは省きました）"
@@ -76,6 +77,9 @@ def sanitize(text: str) -> str:
 def compose(text: str, *, verified: bool, max_chars: int) -> str:
     """返す 1 投稿を作る。**印は切らずに残す**（本文のほうを短くする）。"""
     body = sanitize(text)
+    if not body:
+        # 記法とリンクを消したら何も残らなかった。空の投稿は Slack が拒むので固定の文にする
+        return fixed(NO_ANSWER_TEXT, max_chars=max_chars)
     mark = "" if verified else f"\n{UNVERIFIED_MARK}"
     limit = max_chars - len(mark)
     if len(body) > limit:

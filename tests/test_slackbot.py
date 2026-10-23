@@ -551,6 +551,19 @@ def test_a_bare_url_right_after_japanese_is_removed(raw):
     assert text.startswith("詳細は") and text.endswith("。温度は71°Cです")
 
 
+def test_an_internationalized_bare_url_is_removed():
+    text = sanitize("詳細はhttps://例え.テスト。温度は71°Cです")
+    assert "例え" not in text and "テスト" not in text
+    assert text.endswith("。温度は71°Cです")
+
+
+def test_an_answer_that_is_only_removable_syntax_becomes_the_no_answer_text():
+    assert (
+        compose("<https://phish.example.invalid>", verified=True, max_chars=3000) == NO_ANSWER_TEXT
+    )
+    assert compose("<@U0000OWNER>", verified=False, max_chars=3000) == NO_ANSWER_TEXT
+
+
 def test_prose_after_a_bare_url_is_kept():
     text = sanitize("https://phish.example.invalid。温度は71°Cです")
     assert "phish" not in text
@@ -701,6 +714,7 @@ def test_slack_api_posts_into_the_thread_without_unfurling():
         "thread_ts": "1.1",
         "unfurl_links": False,
         "unfurl_media": False,
+        "parse": "none",  # 本文の URL を Slack に自動でリンクにさせない（PR #376 の指摘）
     }
     # 今までの呼び方は今までと同じ要求
     api.post_message(CHANNEL, "本文")

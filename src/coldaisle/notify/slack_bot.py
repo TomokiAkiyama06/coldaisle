@@ -66,8 +66,9 @@ class SlackApi:
     ) -> str:
         """`chat.postMessage`。投稿の `ts` を返す。
 
-        `thread_ts` があればそのスレッドへ返す。`unfurl=False` はリンクの展開を止める
-        （メンションへの返答。決定記録 0168 §2.4）。どちらも省けば今までと同じ要求になる。
+        `thread_ts` があればそのスレッドへ返す。`unfurl=False` はリンクの展開と、
+        本文の URL・名前の自動リンク（`parse: none`）を止める（メンションへの返答。
+        決定記録 0168 §2.4）。どちらも省けば今までと同じ要求になる。
         """
         payload: dict[str, Any] = {"channel": channel, "text": text}
         if thread_ts is not None:
@@ -75,6 +76,7 @@ class SlackApi:
         if not unfurl:
             payload["unfurl_links"] = False
             payload["unfurl_media"] = False
+            payload["parse"] = "none"
         body = self._call("chat.postMessage", json_body=payload)
         ts = body.get("ts")
         if not isinstance(ts, str) or not ts:
