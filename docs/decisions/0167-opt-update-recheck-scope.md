@@ -35,8 +35,8 @@ fand の経路の回帰に気づけない。
 
 | 区分 | 当たる path・変化 | やり直す確認 |
 |---|---|---|
-| **S**（安全の経路） | `src/coldaisle/control/safety/`・`control/reactive/`・`control/fallback/`・`control/hardware/`・`src/coldaisle/safety_handoff.py`・`src/coldaisle/control/config.py`（`SafetyConfig` を定義して読み、Critical Safety がそのまま使う。読み方・検証・単位・既定値の変化は値の変化と同じ）・較正の値と当てる経路（`config/calibration.json`・`src/coldaisle/calibration_offsets.py`・`src/coldaisle/ingest/calibration.py`・`src/coldaisle/ingest/normalize.py`・**`src/coldaisle/daemon.py`**（較正を読み `Normalizer` へ渡す配線。`_calibration_for` と `build` の組み立て。I1 は較正した値を基準と照らさないので、この配線の変化は I では見つけられない。daemon.py の差分は丸ごと S に当てる）。取り込みが保存の前に offset を当て、Critical Safety はその値を絶対温度の上限とそのまま比べるので、誤った offset は過熱を隠しうる）・`deploy/systemd/coldaisle-fand.service`・`deploy/udev/`・`safety.yaml` の版か値の変化を求める版・`src/coldaisle/gpu_fan_curve.py` と `deploy/systemd/coldaisle-gpu-fan.service` | **本記録の規定の外。** 更新の前に、やり直す 0121 の試験（T のどれか）と 0128 §2.7 の確認を新しい決定記録で決め、所有者が承認する。それまで入れない |
-| **F**（fand のほかのコード） | S に当たらない `src/coldaisle/control/`・`src/coldaisle/control_daemon.py`・fand の import の閉包（§2.2）の module（2026-10-23 の main では `store/`（migration を含む）・`ingest/`（S に当たる較正の部分を除く）・`control_admin/`・`learned_channel/`・`workload_hint_reader/`・`event_entry/`・`channels.py`・`metrics.py`・`measurement.py`・`startup_calibration.py`・`hint_certificat*.py`・`local_socket.py`・`logs.py`・`clock.py`・`csv_export_manifest.py` ほか）・`uv.lock`・`pyproject.toml`（依存・build・同梱物・Python の版）・`ControlTick` の版・Control Config の版 | 0161 §2.4 の **R1〜R3** を、そのままの手順と合格の条件で行う。ただし R3 の trace の `schema_version` は 16 の固定ではなく、`<target>` の `src/coldaisle/control/schema.py` の `SCHEMA_VERSION` と一致することとする（`stage: off`。R3 の CPU と GPU の負荷の回は 0165 §2.3 の直したスクリプトで）。合格するまで `enable` の状態に戻さない（§2.3） |
+| **S**（安全の経路） | `src/coldaisle/control/safety/`・Critical Safety を組み立てて呼び、結果を出力の前に当てる配線（`src/coldaisle/control/loop.py`・`src/coldaisle/control_daemon.py`。R1〜R3 は過熱や安全の fault を注入しないので、配線の欠け・順序の誤りを見つけられない）・`control/reactive/`・`control/fallback/`・`control/hardware/`・`src/coldaisle/safety_handoff.py`・`src/coldaisle/control/config.py`（`SafetyConfig` を定義して読み、Critical Safety がそのまま使う。読み方・検証・単位・既定値の変化は値の変化と同じ）・較正の値と当てる経路（`config/calibration.json`・`src/coldaisle/calibration_offsets.py`・`src/coldaisle/ingest/calibration.py`・`src/coldaisle/ingest/normalize.py`・**`src/coldaisle/daemon.py`**（較正を読み `Normalizer` へ渡す配線。`_calibration_for` と `build` の組み立て。I1 は較正した値を基準と照らさないので、この配線の変化は I では見つけられない。daemon.py の差分は丸ごと S に当てる）。取り込みが保存の前に offset を当て、Critical Safety はその値を絶対温度の上限とそのまま比べるので、誤った offset は過熱を隠しうる）・`deploy/systemd/coldaisle-fand.service`・`deploy/udev/`・`safety.yaml` の版か値の変化を求める版・`src/coldaisle/gpu_fan_curve.py` と `deploy/systemd/coldaisle-gpu-fan.service` | **本記録の規定の外。** 更新の前に、やり直す 0121 の試験（T のどれか）と 0128 §2.7 の確認を新しい決定記録で決め、所有者が承認する。それまで入れない |
+| **F**（fand のほかのコード） | S に当たらない `src/coldaisle/control/`・fand の import の閉包（§2.2）の module（2026-10-23 の main では `store/`（migration を含む）・`ingest/`（S に当たる較正の部分を除く）・`control_admin/`・`learned_channel/`・`workload_hint_reader/`・`event_entry/`・`channels.py`・`metrics.py`・`measurement.py`・`startup_calibration.py`・`hint_certificat*.py`・`local_socket.py`・`logs.py`・`clock.py`・`csv_export_manifest.py` ほか）・`uv.lock`・`pyproject.toml`（依存・build・同梱物・Python の版）・`ControlTick` の版・Control Config の版 | 0161 §2.4 の **R1〜R3** を、そのままの手順と合格の条件で行う。ただし R3 の trace の `schema_version` は 16 の固定ではなく、`<target>` の `src/coldaisle/control/schema.py` の `SCHEMA_VERSION` と一致することとする（`stage: off`。R3 の CPU と GPU の負荷の回は 0165 §2.3 の直したスクリプトで）。合格するまで `enable` の状態に戻さない（§2.3） |
 | **I**（fand の入力を作るもの。閉包の外） | `src/coldaisle/telemetry_daemon.py`・`src/coldaisle/internal_telemetry/`・`src/coldaisle/cpu_power_publisher.py`・それらの unit（`coldaisle-daemon` / `coldaisle-telemetry` / `coldaisle-cpu-power`）・`config/internal-telemetry.yaml`・`config/gpu_state.yaml`・`config/quality.yaml`・`config/metrics.yaml`・`firmware/`。取り込みと共有する module（`ingest/`・`metrics.py` など）は fand の閉包に入るので F | **I1**（§2.4）。`firmware/` の本番のスケッチが変わったときは、I1 の前に所有者がコンパイルと書き込みを行い（0022 §2.9。`firmware/README.md` の確認の一覧）、起動バナーの版が `<target>` の版であることを確かめる |
 | **O**（その他） | 上のどれにも当たらないもの（`api/`・`web/`・`ai/`・`notify/`・`rules/`・`report.py` ほか、`docs/`・`tests/`、ほかの `config/`） | 共通の確認（§2.3）だけ |
 
@@ -90,6 +90,9 @@ F では、R1〜R3 の間は 0161 §2.4 の手順どおり `systemctl start` / `
 | fand の trace の `faults` と理由 | 更新の後 30 分（アイドルでよい） | `cpu_telemetry_stale`・`gpu_telemetry_stale`・`air_telemetry_stale`・`t_sensor_stale` の `faults` と、Top の理由の detail の `cpu_power_unavailable` が 0 tick |
 | 入力の新しさ | 同じ 30 分 | `/api/v1/health` の `stale` が false、`data_age_seconds` が 5 s 未満。`coldaisle-telemetry`・`coldaisle-daemon`・`coldaisle-cpu-power` が `active` で `NRestarts` 0（`coldaisle-cpu-power` は `RestartSec=2` で戻るので、5 s の古さの上限に届かない再起動は trace に出ない） |
 | 変わった metric | 差分が足した・変えた metric | DB に新しい sample が届いている（例: #369 の `sys.gpu_state`） |
+| **基準との照合**（値を作る部分が変わったとき。`internal_telemetry/`・`telemetry_daemon.py`・`cpu_power_publisher.py`・`firmware/`） | 同じ 30 分に、アイドルで 10 組以上 | Critical Safety が読む metric（導入先の `safety.yaml` の絶対温度の上限と CPU cooling floor が読むもの。この機械では CPU 温度・GPU コア温度・CPU Package 電力）の DB の値を、coldaisle を通さない読み取りと比べる。GPU は `nvidia-smi --query-gpu=temperature.gpu,power.draw`、CPU 温度は hwmon の `tempN_input` を直接（÷1000）、CPU 電力は root で RAPL の `energy_uj` の 1 s の差。時刻の差 2 s 以内の組で、温度は ±1 °C 以内・電力は ±5 % か ±3 W の大きいほう以内。空気の温度（`firmware/`）は基板の値と別の温度計の差が今までの差から 1 °C を超えて動かないこと。1 組でも外れれば不合格 |
+
+基準との照合は、値がそのまま届いていても変換の誤り（単位・桁・チャネルの取り違え）で低く出る退行を見つけるためのもので、所有者の判断で足した（2026-10-23。PR #372 の Codex の指摘）。
 
 I1 で合格しなければ `/opt` を `<deployed>` へ戻す（migration を当てたなら DB も §2.3 の backup で戻す）。fand は入力が古くなれば `*_telemetry_stale` で Max・fault にする（安全側。0060 §2.2）ので、
 I1 の間に不合格になっても冷却は失わない。
@@ -105,7 +108,9 @@ I1 の間に不合格になっても冷却は失わない。
 | `src/coldaisle/telemetry_daemon.py` | I |
 
 `coldaisle.control_daemon` の import の閉包（§2.2。開発の checkout の `4e80252` で実行）には `coldaisle.internal_telemetry`・`coldaisle.telemetry_daemon`・`coldaisle.daemon`・`coldaisle.cpu_power_publisher` が無いことを確かめた。
-`deploy/`・`uv.lock`・`pyproject.toml`・`store/`・`firmware/` に差分は無い。したがって区分は **I** で、共通の確認と I1 を行う。本記録の承認の後、所有者の判断で更新する。
+`deploy/`・`uv.lock`・`pyproject.toml`・`store/`・`firmware/` に差分は無い。したがって区分は **I** で、共通の確認と I1 を行う。`nvml.py` が変わったので、I1 の基準との照合（GPU の温度と電力）も行う。本記録の承認の後、所有者の判断で更新する。
+
+その後の main（`d4f3087`。#373 の PR-A）は `control/loop.py`・`control_daemon.py` を変えたので、そこまで入れると区分は **S** になる（§2.1）。その更新の前に、やり直す試験を新しい決定記録で決める。
 
 ## 3. Consequences
 
