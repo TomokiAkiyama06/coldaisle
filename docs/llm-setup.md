@@ -88,9 +88,12 @@ PAW の vLLM の値（0163 §1.2。**PAW が決める値**で、coldaisle の設
 
 ```bash
 # /etc/coldaisle/coldaisle.env
-COLDAISLE_LLM_PROVIDER=openai_compatible   # 書かなくてもよい（既定の経路）
+# systemd の EnvironmentFile= は行末のコメントを取り除かない。説明は値の行に書かず、前の行に置く
+# 書かなくてもよい（既定の経路）
+COLDAISLE_LLM_PROVIDER=openai_compatible
 OPENAI_BASE_URL=http://127.0.0.1:18080/v1
-MODEL_NAME=main                            # PAW の別名。モデルの実体の名前は書かない
+# PAW の別名。モデルの実体の名前は書かない
+MODEL_NAME=main
 # OPENAI_API_KEY は書かない（PAW の vLLM は --api-key を付けていない。PAW が鍵を付けたら、そのときに書く）
 ```
 
