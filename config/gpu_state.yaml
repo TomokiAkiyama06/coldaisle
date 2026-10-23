@@ -1,0 +1,22 @@
+# sys.gpu_state の識別規則（決定記録 0002 §2.6 / 0163 §2.6。#63）
+#
+# coldaisle-telemetry が NVML の compute process の PID ごとに /proc/<pid>/cgroup（cgroup v2 の 0:: の行）を読み、
+# path のうち .service で終わる最も内側の要素を unit 名として下の一覧と照合する。プロセス名では照合しない。
+#
+#   CUDA process が無い                     → idle（AI 由来の CUDA process が 0 の唯一の直接の証拠）
+#   すべての process の unit が一覧にある   → ai
+#   どの process の unit も一覧に無い       → compute（端末の session-N.scope・コンテナの docker-<id>.scope を含む）
+#   両方がある                              → mixed（切り替えの失敗。0006 §2.2）
+#   NVML が使えない・cgroup が読めない PID がある・このファイルの形が不正 → unknown（収集は止めない）
+#
+# **compute は「AI 由来 0」の証拠ではない。** 推論サーバの unit がここから漏れていれば（改名・新しい推論サーバ）、
+# その process も compute に数えられ、警告も出ない。導入時と推論サーバの変更時に陽性の対照
+# （推論サーバを動かして ai / mixed になる）を取り、取れていない間は compute を「AI 由来 0」に使わない（0163 §2.6）。
+#
+# 書くのは unit 名（完全一致・.service で終わる）だけ。PID・uid・ホスト名・パスは書かない（AGENTS.md ルール 10）。
+# user@<uid>.service（user のサービスマネージャ）は受けない。
+ai_units:
+  # Personal AI Workspace（PAW）の vLLM（OpenAI 互換の窓口。決定記録 0163 §2.1）。起動・停止は PAW の Scheduler が持つ
+  - paw-llm-main.service
+  # Ollama（同じ機械で GPU を使いうる。0163 §1.2）
+  - ollama.service
