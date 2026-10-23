@@ -8,6 +8,7 @@
     0143 §5 の 2 に答える（コードを残す。§5 の 1）。0143 は FINAL のまま（0143 §2.9 の 5）
   - [0002](0002-metric-naming.md) §2.6 / [0006](0006-gpu-mode-and-mixed-state.md) §2.2 の `sys.gpu_state` の5値と意味は変えない。
     §2.6 は 0002 §2.6 が `config/gpu_state.yaml` に置くとした「プロセスの識別規則」の形を決める
+- **Superseded by**: [0166](0166-nfr04-request-both-call-paths.md)（§2.4 の表の「要求」の行のみ＝日次レポートの所見とアラートの説明の両方の実際の要求を経路ごとに測る。§2.4 のほかの行と他の節は有効）
 - **関連**: [0001](0001-initial-project-decisions.md) D-06 / D-14 / [0005](0005-model-selection.md) /
   [0014](0014-llm-provider.md) §2.1 / §2.3 / §2.4 / §2.5 / [0019](0019-claude-escalation.md) /
   [0028](0028-fan-control-contracts.md) §5 の 7 / [0040](0040-server-health-api.md) §2.4 / §2.7 /

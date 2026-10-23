@@ -446,7 +446,7 @@ Provider 抽象（Issue #21）があるため、差し替えは設定変更で�
 | フェーズ | ホスト | ランタイム | 形式 |
 |---|---|---|---|
 | 現在（サーバー未着） | Mac | **Ollama** または LM Studio / MLX | Q4_K_M 量子化（27B で約17GB） |
-| 本番 | Ubuntu + RTX PRO 6000 | **vLLM** | BF16 または FP8 |
+| 本番 | Ubuntu + RTX PRO 6000 | **vLLM**（PAW の vLLM を共用。決定記録 0163） | FP8 |
 
 > Mac 側は搭載メモリ次第です。27B の Q4_K_M が乗らない場合は、
 > **開発中の代替として小型モデルを使ってかまいません。** Provider 抽象（FR-501）が
@@ -455,21 +455,46 @@ Provider 抽象（Issue #21）があるため、差し替えは設定変更で�
 Ollama も vLLM も OpenAI互換の `/v1/chat/completions` を提供するため、
 アプリ側は `OPENAI_BASE_URL` と `MODEL_NAME` の2つを環境変数で切り替えるだけで済みます。
 
-**vLLM起動例（本番）**
+**本番の vLLM: Personal AI Workspace（PAW）の vLLM を共用する。coldaisle は起動しない**（決定記録 [0163](decisions/0163-shared-vllm-gpu-ai-service.md)）
 
-```bash
-vllm serve Qwen/Qwen3.8-27B \
-  --enable-auto-tool-choice \
-  --tool-call-parser hermes \
-  --max-model-len 32768 \
-  --gpu-memory-utilization 0.4 \
-  --port 8001
-```
+coldaisle 専用の vLLM は立てない。同じ機械で PAW（本書の「Workspace」）が動かしている vLLM を、
+OpenAI 互換の窓口として読むだけにする。起動・停止は PAW の Compute Resource Scheduler が持つ（0163 §2.3）。
 
-`--gpu-memory-utilization 0.4` で上限を切ります（重み 30〜33GB に KV プールを足した値）。
-ただし **v0.2 での重要な変更点** として、これは「常駐させてよい」という意味ではありません。
+| 項目 | PAW の vLLM の値（0163 §1.2） |
+|---|---|
+| モデル | Qwen3.8-27B-FP8（7.1 の「27B FP8 単体」と同じ選定） |
+| `--served-model-name` | `main` |
+| 待ち受け | `127.0.0.1:18080`（ループバックだけ） |
+| `--gpu-memory-utilization` | `0.51` |
+| `--max-model-len` | `131072` |
+| 思考 | `--reasoning-parser qwen3` |
+| ツール | `--enable-auto-tool-choice --tool-call-parser qwen3_coder` |
 
-**vLLM は停止可能な GPU AI Service として構成します（D-06）。**
+これらは **PAW が決める値**であり、coldaisle の設定ではない。coldaisle が導入先の `/etc/coldaisle/coldaisle.env` に書くのは次だけ（0163 §2.1）。
+`config/ai.yaml` には書かない。
+
+| 環境変数 | 値 |
+|---|---|
+| `COLDAISLE_LLM_PROVIDER` | 書かない（または `openai_compatible`） |
+| `OPENAI_BASE_URL` | `http://127.0.0.1:18080/v1` |
+| `MODEL_NAME` | `main`（モデルの実体の名前ではなく PAW の別名。PAW がモデルを差し替えても coldaisle の設定を変えずに済む） |
+| `OPENAI_API_KEY` | 書かない（PAW の vLLM は `--api-key` を付けていない。PAW が鍵を付けたら、そのときに書く） |
+
+- PAW がポートや `main` を変えると、coldaisle は「利用不可」になるだけで監視は止まらない（FR-507）。
+  変えたことに気づく仕組みは置かず、導入時と PAW の変更時のスモークテスト（`docs/llm-setup.md`）で確かめる
+- 共用によって PAW の vLLM へ渡すものは増えない。送るのは今と同じ集計値だけである（ルール 8 / FR-504）
+
+**tool-call parser と reasoning の前提**（0163 §2.2。**今の実装のまま受けられる**）
+
+- coldaisle 自身の LLM の呼び出し（日次レポートの所見・アラートの説明・Server Health の要約・疎通確認）は `tools` を送らない。
+  parser が効くのは要求に `tools` があるときだけなので、coldaisle の経路では parser の種類が結果に効かない。以前の `hermes` の前提は不要である
+- 将来 `tools` を送っても、vLLM の parser は OpenAI の形（JSON の文字列の `tool_calls[].function.arguments`）に直して返し、形は合う。
+  ただし coldaisle は tool loop を持たない。ツールを使う会話は Workspace のチャットが持つ（FR-502 / D-06）
+- reasoning parser は思考を `message.content` から別の欄へ移す。Provider は `content` だけを読むので、本文に思考は混ざらない。
+  `<think>` の切り離し（決定記録 0014 §2.4）は、parser を外した窓口へ向けたときの安全網として残す
+- 思考の指示は今のまま `chat_template_kwargs.enable_thinking=false` を送る（`send_thinking_flag: true`。0014 §2.3）
+
+**vLLM は停止可能な GPU AI Service である（D-06）。** 止めるのは PAW で、coldaisle ではない。
 Kaggle・研究でGPUを使う際は `--gpu-memory-utilization` による制限ではなく、
 **プロセスを完全停止してVRAMを全解放**します。構想メモ §40 の
 「復帰速度より、VRAMを確実に空けることを優先」に従います。
@@ -479,15 +504,14 @@ Kaggle・研究でGPUを使う際は `--gpu-memory-utilization` による制限�
 | GPU Mode | Core Service（取り込み・アラート・API・UI） | GPU AI Service（LLM説明・チャット） |
 |---|---|---|
 | AI | 稼働 | 稼働 |
-| **Compute（Kaggle）** | **稼働** | **完全停止** |
+| **Compute（Kaggle）** | **稼働** | **完全停止**（PAW の Scheduler が止める） |
 
-停止判定は「Dockerを止めた」ではなく **NVMLでCUDAプロセス数が0になったこと**で行います
-（構想メモ §39）。
-
-> ツールコールパーサはvLLM/モデルのバージョンで推奨値が変わります
-> （Qwen3系は `hermes`、Coder系は `qwen3_xml` など）。
-> 導入時に `vllm serve --help` と当該バージョンのドキュメントで確認し、
-> スモークテスト（後述のIssue）を必ず通してください。
+- coldaisle は PAW の vLLM を**起動も停止もしない・待たない**。PAW の unit への依存（`Wants=` / `Requires=` / `After=`）も持たない。
+  止まっていれば `max_attempts` の後に「利用不可」として返し、日次レポートは表だけ、アラートは素の文だけ、
+  Server Health はテンプレートになる（0163 §2.3 / 0014 §2.5）
+- Compute Mode で VRAM を空けるのは PAW の Scheduler の責任である。coldaisle はそれを `sys.gpu_state` で**観測するだけ**である
+  （識別規則は 0163 §2.6）。停止の確かめは「Dockerを止めた」ではなく NVML の CUDA process で行い（構想メモ §39）、
+  NVML に CUDA process が1つも無いことの証拠になるのは `sys.gpu_state` の `idle` だけである
 
 ### 7.3 ツール定義（v1）
 
@@ -551,7 +575,7 @@ Kaggle・研究でGPUを使う際は `--gpu-memory-utilization` による制限�
 |---|---|---|
 | **M0 基盤** | リポジトリ・CI・規約・スキーマ確定 | なし |
 | **M1 データ基盤** | Mock/Replayソース・ストレージ・API | **なし** ← 今すぐ着手可 |
-| **M2 実機接続** | 本番ファーム・SerialSource・較正・長時間試験 | ESP32のみ（**手元にあるので着手可**） |
+| **M2 実機接続** | 本番ファーム・SerialSource・較正の仕組み（実機での較正は行わない。決定記録 0164）・長時間試験 | ESP32のみ（**手元にあるので着手可**） |
 | **M3 UI** | ダッシュボード刷新（API経由化） | なし |
 | **M4 アラート** | ルールエンジン・通知 | なし |
 | **M5 AI** | Provider抽象・ツール・チャット・レポート | なし（Mac + Ollama） |
@@ -569,7 +593,7 @@ Kaggle・研究でGPUを使う際は `--gpu-memory-utilization` による制限�
 | ID | リスク | 影響 | 対策 |
 |---|---|---|---|
 | R-01 | DS18B20の12bit変換が750ms × 5本で送信周期2.5秒に間に合わない | 周期崩壊 | 非同期変換で5本同時開始 + 分解能を11bitへ（詳細は spec-review.md） |
-| R-02 | センサー個体差（±0.5°C）でΔT判定が誤動作 | 誤警報 | 較正手順を設け `calibration.json` でオフセット補正 |
+| R-02 | センサー個体差（±0.5°C）でΔT判定が誤動作 | 誤警報 | 較正の仕組み（`calibration.json`）は用意したが、実機での較正は行わず ±1.0°C の系統誤差を受け入れる。温度差の閾値はこの誤差を前提に決め、見直しの条件を置く（決定記録 0164） |
 | R-03 | AM2320のコネクタ誤挿入による発熱（**再発の恐れあり**） | 部品破損・発火 | キー付きコネクタ必須化。手順書に「通電中の抜き差し禁止」を明記 |
 | R-04 | 閾値を実測なしで決めるとアラートが機能しない | 形骸化 | ベースライン測定Issueを必須の前提タスクにする |
 | R-05 | LLMが誤った診断を出し、それを信じて誤操作する | 運用事故 | 出力に必ず根拠データを併記。制御権限を与えない（D-03） |

@@ -1,9 +1,9 @@
 # ローカルLLM の設定（FR-501 / #21）
 #
 # **接続先とモデル名は環境変数から読みます**（`.env`）。ここには書きません。
-#   OPENAI_BASE_URL   例: http://127.0.0.1:11434/v1（Ollama） / http://127.0.0.1:8001/v1（vLLM）
-#   MODEL_NAME        例: qwen3.8:27b
-#   OPENAI_API_KEY    ローカルでは不要。vLLM に鍵を設定した場合のみ
+#   OPENAI_BASE_URL   例: http://127.0.0.1:11434/v1（Ollama） / http://127.0.0.1:18080/v1（本番。PAW の vLLM を共用。決定記録 0163 §2.1）
+#   MODEL_NAME        例: qwen3.8:27b（Ollama） / main（本番。PAW の --served-model-name）
+#   OPENAI_API_KEY    ローカルでは不要。本番も書かない（PAW の vLLM が鍵を付けたときだけ）
 #
 # 環境変数を変えるだけでバックエンドが切り替わること（受入基準）を保つため、
 # このファイルに接続先を書かないでください。
