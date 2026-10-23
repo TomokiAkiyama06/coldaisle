@@ -538,6 +538,12 @@ def test_bare_urls_are_removed(raw):
     assert "リンクは省きました" in text
 
 
+def test_prose_after_a_bare_url_is_kept():
+    text = sanitize("https://phish.example.invalid。温度は71°Cです")
+    assert "phish" not in text
+    assert text.endswith("。温度は71°Cです")
+
+
 def test_numbers_and_units_are_not_taken_for_urls():
     assert sanitize("GPU は 71.0 °C、電力は 300 W です") == "GPU は 71.0 °C、電力は 300 W です"
 
