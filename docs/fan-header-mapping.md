@@ -481,3 +481,97 @@ reading と trace、fand の journal、`coldaisle-soak-report` の集計）。
   D 状態の hang の調べ（0158 §5 の 2）の結果も 0161 §2.1 にある（2026-10-13 以降の `journalctl -k` の hung_task 0 件・T1 の `duration_ms` 最大 11 ms・
   書き込みの失敗 0。予備確認から T1 の前までの trace と journal も 2026-10-22 に確かめ、試験の注入で説明できないものは 0）
 - T1 は合格（2026-10-16、所有者が確認）。値の `status` を `confirmed` にするのは、所有者の承認を得てまとめて行う（項目と `basis` は 0161 §2.2）
+
+## HEAD での確認（決定記録 0161 §2.4。2026-10-22）
+
+**判定: R1〜R3 は 0161 §2.4 の合格の条件をすべて満たした。ただし R3 は、2 時間の本回と CPU の負荷を補う回の組で満たした（0161 §2.4 の手順からの逸脱。決定記録 [0165](decisions/0165-r3-split-cpu-load-run.md) で扱う）。所有者はこの結果で承認点 3（0121 §2.10）を完了と判断した（2026-10-22）。0165 は同日に所有者が承認した。`enable`（0161 §2.5 の手順 8〜10）は本記録のマージの後に行う。**
+R3 の CPU の負荷は本回でかからず、所有者の判断で別の回で補った（下の「R3 の補い」）。
+
+`/opt` の版は `5ff6f96`、decision trace は v16、Control Config は v17（`fan-policy.yaml` v13・`safety.yaml` v5、
+`supervisor.workload_hint.stage: off`）。0161 §2.5 の手順 3〜5（`/opt` の更新と migration 0014〜0016・Control Config の移行と
+§2.2 の 15 項目の `confirmed`・unit の `-I -m` の形への置き直し）は同じ日に済ませた。unit の差は 0157 のコメント 6 行と `ExecStart=` の
+1 行だけで、`systemd-analyze verify` は何も出さず、引き継ぎ実行部は `exit=0`。どの回も `systemctl start` だけで動かし（`enable` しない）、
+終わると `pwmN_enable` は 3 zone とも 5（BIOS の制御）に戻り、fand は `disabled` のまま。記録は `r1-10221203-*`・`r2-ready-0161.txt`・
+`r3-10221231-*`・`r3b-10221502-*`（`~/coldaisle-host-work/`）。
+
+起動のたびの起動ログは `control_config_version=17`・`safety_config_is_provisional=False`・`safety_disabled_inputs=[]` で、
+`safety.yaml` の暫定値は 0 件（`provisional_values` 59 件はすべて `safety.yaml` の外）。最初の trace は `schema_version=16`・
+`mode=auto`・`safety=normal`・`workload_hint.stage=off`・`safety_provenance.config_is_provisional=False`。動いているプロセスの引数は
+どの回も `-I -m coldaisle.control_daemon`。
+
+### R1: 0080 段階 5 の短い確認（2026-10-22 12:03〜12:05、アイドル・所有者が現地）
+
+| 確かめたこと | 結果 | 合格の条件 | 判定 |
+|---|---|---|---|
+| heartbeat の直後に `kill -STOP` → Max | 5768 ms（位相 0.9 ms）。引き継ぎは 3 zone とも `applied`、`RestartSec` の後に再起動して takeover | 約 5 s（T5 のアイドル 5294 ms 程度）・0121 §2.7 の約 11 s 以内 | 合格 |
+| `kill -KILL` → Max | 59 ms（`pwm_enable=0,0,0`）。引き継ぎは 3 zone とも `applied`、再起動して takeover | 引き継ぎが 3 zone に Max・再起動で takeover | 合格 |
+| `systemctl stop`（2 回） | `pwm_enable` 5,5,5・`/run/coldaisle` は残る（`drwx--x--x coldaisle-fan:coldaisle-fan`）・正常停止のログあり | 3 zone とも BIOS の値・`/run/coldaisle` が残る | 合格 |
+| 引数 | 4 回の起動すべてで `-I -m` | `-I` と `-m` がある | 合格 |
+
+- **`kill -STOP` の後の終了は `status=11/SEGV` だった**（それまでの journal の 13 回はすべて `6/ABRT`）。watchdog の SIGABRT を受けた後、faulthandler
+  （0080 §2.5）が traceback を書き出す途中で落ちた。メインのスレッドが止められた位置（pydantic の処理の途中）によるもので、起動の形とは関係が無い。
+  プロセスは終わり、引き継ぎ実行部が Max を書き、時間も基準の内なので、安全への影響は無い（書き出しの途中で固まっても `TimeoutAbortSec` で
+  SIGKILL になる）。失ったのはメインのスレッドの traceback の一部だけ
+- Learned は配備していないので、起動時に経路を開かずに運転する error が各回 1 件出た（T0・T1 と同じ）
+
+### R2: `READY=1` までの時間（0157 §5 の 4）
+
+`ExecMainStartTimestampMonotonic` と `ActiveEnterTimestampMonotonic` の差。
+
+| 回 | OS の起動から | `READY=1` まで |
+|---|---|---|
+| R1 の起動・watchdog の後の再起動・2 回目の起動・SIGKILL の後の再起動 | 約 8.4 日 | 323・318・315・322 ms |
+| OS の再起動の直後（cold） | 230 s | 331 ms |
+| R3 の起動・R3 の補いの起動 | 1215 s・10256 s | 317・307 ms |
+
+7 回（OS の再起動の直後を 1 回含む）で最長 331 ms。`TimeoutStartSec` 30 s の半分の 15 s 未満で、0161 §2.3 の条件を満たす。
+`stage: off` では指紋を計算しないので、B1 を設定する版で測り直す（6.9 の手順 7 の注）。
+
+### R3: 短い soak（2026-10-22 12:31:22〜14:31:27）
+
+所有者の普段の使い方に加えて、開始から 60 分に GPU 600 W を 10 分かけた（`gpu_burn.py`、603 s・中央値 600 W）。CPU の全スレッド 10 分は
+20 分にかける予定だったが、かからなかった（下の注）。
+
+| 測るもの（0121 §2.3） | 結果 | 合格の条件 | 判定 |
+|---|---|---|---|
+| `duration_ms` | 全 7205 tick で最大 8 ms（`startup` の 17 tick は最大 5 ms）。`startup` を除く 7188 tick の p99.9 は 6 ms | 最大が 125 ms 未満 | 合格 |
+| `deadline_exceeded` | 0 回（連続の最長 0） | 連続の最長が 1 以下 | 合格 |
+| tick の間隔（journal の単調時計） | 全 7205 tick で最大 1020.2 ms・p99.9 1019.5 ms（`startup` を含めても除いても同じ） | 最大が 1500 ms 未満・p99.9 が 1100 ms 未満 | 合格 |
+| `skipped_slots`（停止時の集計） | 0（`ticks` 7205・`overruns` 0・`recorded` 7205・`trace_dropped` 0・`emergency_max` false） | 0 | 合格 |
+| systemd の watchdog による終了・再起動・異常終了 | 0 回 | 0 回 | 合格 |
+| `*_telemetry_stale` / `write_failure`・`readback_mismatch`・`enable_reverted` / `tach_stall` | 0 回（fault は 0） | 0 回 | 合格 |
+| `cpu_power_unavailable`（0123 §2.3。Top の reason の detail で、fault にはならない） | 0 tick。DB の `power.cpu.package` の sample は 2882 件で、間隔の最大 2502 ms（古さの上限 5000 ms に届く間隔は 0） | 収集が止まった時間を除き 0 回 | 合格 |
+| trace の `schema_version` と欠け | すべて 16（7205 tick）・`tick_id` の飛び 0・ts の差 1500 ms 以上 0 | 16・欠け 0 | 合格 |
+
+- 健全度は 7205 tick すべて `normal`。`safety_state` は `startup` 17 tick・`normal` 7188 tick、`mode` はずっと `auto`
+- Reactive Guard の発火 22 回（Top の `cpu_temperature_rise` 20・Front / Rear の `gpu_power_rise,gpu_temperature_rise` 各 1）。
+  Top の `bound_by` は `requested` 6318・`guard_floor` 622・`ramp_down` 248・`forced_max` 17。power の floor が Top を決めた tick は 0
+- 温度（°C）: `cpu.package` 38〜77・`gpu.0.core` 28〜79・`board.connector_12v2x6` 25〜50・`air.front_intake` 22.9〜24.8・
+  `air.gpu_exhaust` 25.1〜55.3。中止の基準（CPU 88・GPU 85・12V-2x6 70）には届かなかった
+- **CPU の負荷が 5 s で終わった。** 負荷は root の一時 unit（見張り）から所有者の uid で stress-ng を起動する作りで、その unit の作業ディレクトリが
+  `/` だった。stress-ng は temp-path（既定は作業ディレクトリ）に書けないと始めずに終わる（`temp-path '.' must be readable and writeable`）。
+  T7・T8 は所有者の端末から起動していたので起きなかった。試験のスクリプトの不具合で、fand とは関係が無い
+
+### R3 の補い: CPU の全スレッド 10 分（2026-10-22 15:02:03〜15:27:07）
+
+所有者の判断（2026-10-22）で、R3 を 2 時間やり直さず、別の回で CPU の負荷だけを補った（決定記録 0165）。正式の unit で 25 分（普段 5 分・CPU の全スレッド
+10 分・普段 10 分）。stress-ng に `--temp-path /tmp` を付け、始める前に同じ形で起動できることを確かめた。負荷は 603 s、
+`power.cpu.package` の中央値 200 W・最大 200 W、32 本の worker が最後まで動いた。
+
+| 測るもの（0121 §2.3） | 結果 | 判定 |
+|---|---|---|
+| `duration_ms` | 全 1504 tick で最大 18 ms（`startup` の 17 tick は最大 5 ms）。`startup` を除く 1487 tick の p99.9 は 12 ms | 合格 |
+| `deadline_exceeded` | 0 回 | 合格 |
+| tick の間隔 | 全 1504 tick で最大 1028.8 ms・p99.9 1022.9 ms（`startup` を除くと p99.9 1023.0 ms） | 合格 |
+| `skipped_slots` | 0（`ticks` 1504・`overruns` 0・`recorded` 1504・`trace_dropped` 0） | 合格 |
+| watchdog による終了・再起動・異常終了 | 0 回 | 合格 |
+| stale / 書き込みの失敗 / `tach_stall` | 0 回 | 合格 |
+| `cpu_power_unavailable`（0123 §2.3） | 0 tick。`power.cpu.package` の sample は 602 件で、間隔の最大 2502 ms（5000 ms に届く間隔は 0） | 合格 |
+| trace の `schema_version` と欠け | すべて 16（1504 tick）・欠け 0 | 合格 |
+
+- 判定のスクリプト（`r3-verdict-0161.py`）の「期間がおよそ 2 時間」と「GPU の負荷 10 分」の行は 2 時間の本回のための行で、この回では
+  想定どおり不合格・NG になる。2 時間の期間と GPU の負荷は本回で満たしている
+- 健全度は 1504 tick すべて `normal`。Guard の発火 1 回（Top の `cpu_temperature_rise`）。Top の `bound_by` は `requested` 859・
+  `safety_floor` 600（reason `cpu_cooling_floor`）。power の floor が Top を決めた tick は 458（CPU 電力の中央値 200 W）
+- 温度（°C）: `cpu.package` 39〜84・`gpu.0.core` 29〜30・`board.connector_12v2x6` 26〜27・`air.front_intake` 24.1〜25.3。
+  CPU の最高 84 °C は中止の基準 88 °C の 4 °C 下（T1 の 24 時間の最高は 81 °C）
