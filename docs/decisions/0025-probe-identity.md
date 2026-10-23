@@ -4,6 +4,7 @@
 - **Status**: FINAL（2026-09-10、PR #31 のマージ）
 - **Date**: 2026-09-10
 - **Supersedes**: なし
+- **Superseded by**: [0164](0164-no-sensor-calibration.md)（§2.1 のうち `PROBE_CHANGED` を「人が較正をやり直して記録側を更新する」ことで解く手順のみ＝較正をやり直す前に 0164 §2.4 の 3 の新しい記録で決める。状態の定義と記録を上書きしない扱いは有効）
 - **関連**: [`0012-rule-engine.md`](0012-rule-engine.md) §2.6 /
   [`0022-firmware-v1.md`](0022-firmware-v1.md) §2.9 /
   [`0024-calibration.md`](0024-calibration.md) /

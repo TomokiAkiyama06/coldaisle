@@ -57,7 +57,7 @@ rules:
     label: プローブが入れ替わった
     title: 温度プローブの入れ替わりを検出しました
     resolved_title: 温度プローブの対応が較正と一致しました
-    hint: プローブを差し替えたなら較正をやり直してください（docs/calibration.md）。
+    hint: プローブを差し替えたなら、較正を行うかを先に決めてください（較正は行わない方針。決定記録 0164 §2.4・docs/calibration.md の冒頭）。
     enabled: true
     severity: info
 
