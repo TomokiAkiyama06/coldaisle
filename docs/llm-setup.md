@@ -137,6 +137,9 @@ Server Health の任意要約は、API を `coldaisle.server:app` で起動し�
 
 - **送るのは今のローカル LLM に渡すのと同じ集計値だけです**（日次レポートの表・アラートの Evidence の行・
   `coldaisle.server:app` のときの Server Health の固定の文）。生の時系列・decision trace・ツールの結果・案件資料（`coldaisle-escalate`）は送りません
+- 例外は Slack のメンションへの返答（`coldaisle-slackbot`。決定記録 0168）だけで、読み取り専用のツールのうち
+  `get_latest` / `get_stats` / `list_alerts` / `describe_system` の定義と結果（集計値）を送ります（`query_series`・trace は送りません）。
+  回数の上限は `config/ai.yaml` の `slack_qa:` で、日次レポート・アラートの説明の上限とは別です。導入は [`ubuntu-deploy.md`](ubuntu-deploy.md) 4.3
 - `config/report.yaml` の除外（`llm_excluded_metrics` / `llm_excluded_rules`。0131 §2.4a）はそのまま当たります。
   0146 で一覧は空になり、GPU の Fan の値（目標値の %）もローカル LLM と同じく送ります
 - 1 回の長さ・1 日の回数の上限と `effort`（既定は送らない）は `config/ai.yaml` の `anthropic:` です。上限に達したら呼ばずに、

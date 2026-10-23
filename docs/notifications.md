@@ -98,6 +98,9 @@ Incoming Webhook ではファイルを添付できないため、Slack アプリ
    次の 2 つだけを足す（**ほかの scope は足さない**）
    - `chat:write`（本文を投稿する）
    - `files:write`（グラフをスレッドへ上げる）
+
+   メンションへの返答（`coldaisle-slackbot`。決定記録 0168）を使うときだけ、`app_mentions:read` も足します。
+   手順は [`ubuntu-deploy.md`](ubuntu-deploy.md) 4.3
 3. 同じ画面の上の **Install to Workspace**（既に入っていれば **Reinstall to Workspace**）→ **許可する**
 4. 表示された **Bot User OAuth Token**（`xoxb-…`）を控える。**チャットや Issue に貼らない**
 5. Slack で通知のチャンネルを開き、メッセージ欄で `/invite @coldaisle`（1. の App Name）を送って Bot を招く。

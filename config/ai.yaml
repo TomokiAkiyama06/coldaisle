@@ -79,3 +79,40 @@ anthropic:
   # output_config.effort（low / medium / high）。**null なら送らない**（モデルの既定のまま）。
   # 対応するモデルかをコードで判定しないので、対応を確かめたモデルでだけ設定する（0143 §2.5）
   effort: null
+
+# --------------------------------------------------------------------------
+# Slack のメンションへの返答（coldaisle-slackbot。決定記録 0168 / #374）
+#
+# **この経路だけの上限**で、日次レポート・アラートの説明の上限（上の anthropic:）を食わない（0168 §2.5）。
+# この塊が無ければ coldaisle-slackbot は起動しない。答えるのは許可リスト（COLDAISLE_SLACK_QA_CHANNELS /
+# COLDAISLE_SLACK_QA_USERS。環境変数）の両方に当たるメンションだけ（0168 §2.2）。
+# LLM に渡すツールは get_latest / get_stats / list_alerts / describe_system の 4 つだけ（0168 §2.3。ここでは変えない）。
+slack_qa:
+  # 1 プロセス・1 日（ローカル時刻の日付）あたりの LLM の呼び出しの回数。tool loop の 1 往復を 1 回と数える。
+  # 上限に達したら呼ばずに「いま AI が使えません」の固定の文を返す
+  daily_call_limit: 100
+  # 1 つの質問で、ツールの呼び出しを返す応答を受ける回数の上限。超えたらツール無しで答えさせる（0168 §5 の 3）
+  max_round_trips: 4
+  # 1 回の応答で実行するツールの数の上限。超えた分は実行せずにエラーの結果を返す
+  max_tool_calls_per_round: 8
+  # 1 つの質問で実行するツールの呼び出しの合計の上限（0168 §2.3）。超えた分は実行せずにエラーの結果を返す
+  max_tool_calls_per_question: 16
+  # 1 ユーザーが user_window_s 秒の間に聞ける質問の数。超えたら「少し待ってください」と返す（0168 §2.5）
+  user_questions_per_window: 3
+  user_window_s: 60.0
+  # LLM へ送る質問文の長さの上限（超えた分は送らない）
+  max_question_chars: 1000
+  # 1 つのツールの結果（JSON）を LLM へ送る長さの上限
+  max_tool_result_chars: 16000
+  # 1 投稿の長さの上限（0168 §2.4。3000 まで）
+  max_reply_chars: 3000
+  # 答えを作る待ち行列の長さ。溢れたメンションには答えない（受信と ack は止めない）
+  queue_size: 8
+  # Socket Mode が切れたときに、つなぎ直すまで待つ時間。失敗が続くと倍にし、上限で止める
+  reconnect_initial_s: 2.0
+  reconnect_max_s: 300.0
+  # この秒数 Slack から何も受けなければ（hello・event・disconnect のどれも）、apps.connections.open から
+  # 新しい URL を取り直してつなぎ直す（0168 §2.1。Slack は接続を数時間ごとに入れ替え、警告が届かないこともある）。
+  # **provisional。** WebSocket の ping / pong（websockets の keepalive、約 20 s ごと）は数えないので、
+  # 静かなワークスペースではこの間隔でつなぎ直す。ping の間隔より十分長くとる
+  idle_reconnect_s: 900.0

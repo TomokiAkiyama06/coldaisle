@@ -14,6 +14,8 @@
 9. GPU の Fan を温度の曲線で書く `coldaisle-gpu-fan`（決定記録 0128 §2.5）
 10. fand と Learned worker の起動の形（root の所有の venv の interpreter を `-I -m`。
     決定記録 0157 §2.1 / §2.5）
+11. Slack のメンションに答える `coldaisle-slackbot`（決定記録 0168 §2.1）。
+    設定の誤りでは起動し直さない
 """
 
 import re
@@ -33,7 +35,7 @@ SYSTEMD = ROOT / "deploy" / "systemd"
 UDEV = ROOT / "deploy" / "udev"
 TMPFILES = ROOT / "deploy" / "tmpfiles.d" / "coldaisle-learned.conf"
 
-SERVICES = ("coldaisle-daemon", "coldaisle-api", "coldaisle-telemetry")
+SERVICES = ("coldaisle-daemon", "coldaisle-api", "coldaisle-telemetry", "coldaisle-slackbot")
 """常駐するもの。**落ちたら戻す**（NFR-01）。"""
 
 JOBS = ("coldaisle-rollup", "coldaisle-report")
@@ -205,7 +207,9 @@ def test_services_do_not_run_as_root(name):
     assert one(unit, "Service", "Group") == "coldaisle"
 
 
-@pytest.mark.parametrize("name", ("coldaisle-daemon", "coldaisle-telemetry", *JOBS))
+@pytest.mark.parametrize(
+    "name", ("coldaisle-daemon", "coldaisle-telemetry", "coldaisle-slackbot", *JOBS)
+)
 def test_exec_start_points_at_a_real_entry_point(name):
     """**入口の名前を変えたら、テンプレートも落ちる。**"""
     unit = parse_unit(SYSTEMD / f"{name}.service")
@@ -1236,3 +1240,15 @@ def test_no_other_unit_depends_on_gpu_fan():
 def test_the_deploy_guide_places_gpu_fan_and_enables_it_after_approval():
     guide = (ROOT / "docs" / "ubuntu-deploy.md").read_text(encoding="utf-8")
     assert f"sudo systemctl enable --now {GPU_FAN}.service" in guide
+
+
+def test_the_slackbot_stops_restarting_on_a_configuration_error():
+    """設定の誤り（終了コード 2）は起動し直しても直らない。
+
+    トークンは env ファイルからだけ（0168 §2.1）。
+    """
+    unit = parse_unit(SYSTEMD / "coldaisle-slackbot.service")
+    assert one(unit, "Service", "RestartPreventExitStatus") == "2"
+    assert one(unit, "Service", "EnvironmentFile") == "-/etc/coldaisle/coldaisle.env"
+    assert "TOKEN" not in " ".join(unit["Service"].get("Environment", []))
+    assert one(unit, "Service", "ProtectSystem") == "strict"

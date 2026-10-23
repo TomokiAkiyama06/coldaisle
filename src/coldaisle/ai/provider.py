@@ -92,6 +92,48 @@ class ExplainContext(BaseModel):
     """集計して渡すメトリクス。プロンプトの長さを抑えるため 16 個まで。"""
 
 
+class SlackQaSettings(BaseModel):
+    """`config/ai.yaml` の `slack_qa:`。Slack のメンションへの返答の上限（決定記録 0168）。
+
+    **この経路だけの上限**で、日次レポート・アラートの説明の上限（`anthropic:`）を食わない
+    （0168 §2.5）。無ければ `coldaisle-slackbot` は起動しない。
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    daily_call_limit: int = Field(ge=1)
+    """1 プロセス・1 日（ローカル時刻の日付）あたりの LLM の呼び出しの回数。
+
+    tool loop の 1 往復を 1 回と数える。
+    """
+    max_round_trips: int = Field(ge=1)
+    """1 つの質問で、ツールの呼び出しを返す応答を受ける回数の上限。
+
+    超えたらツールを呼ばせずに答えさせる。
+    """
+    max_tool_calls_per_round: int = Field(ge=1)
+    max_tool_calls_per_question: int = Field(ge=1)
+    """1 つの質問で実行するツールの呼び出しの合計の上限（0168 §2.3）。超えた分は実行しない。"""
+    """1 回の応答で実行するツールの数の上限。超えた分は実行せずにエラーの結果を返す。"""
+    user_questions_per_window: int = Field(ge=1)
+    """1 ユーザーが `user_window_s` の間に聞ける質問の数。超えたら「少し待ってください」と返す。"""
+    user_window_s: float = Field(gt=0)
+    max_question_chars: int = Field(gt=0)
+    """LLM へ送る質問文の長さの上限（超えた分は送らない）。"""
+    max_tool_result_chars: int = Field(gt=0)
+    """1 つのツールの結果（JSON）を LLM へ送る長さの上限。"""
+    max_reply_chars: int = Field(gt=0, le=3000)
+    """1 投稿の長さの上限（0168 §2.4。3000 文字まで）。"""
+    queue_size: int = Field(ge=1)
+    """答えを作る待ち行列の長さ。溢れたメンションには答えない（受信を止めない）。"""
+    reconnect_initial_s: float = Field(gt=0)
+    """Socket Mode が切れたときに、つなぎ直すまで待つ最初の時間。失敗が続くと倍にする。"""
+    reconnect_max_s: float = Field(gt=0)
+    """つなぎ直すまで待つ時間の上限。"""
+    idle_reconnect_s: float = Field(gt=0)
+    """この間 Slack から何も受けなければ、新しい URL を取り直してつなぎ直す（0168 §2.1）。"""
+
+
 class AiSettings(BaseModel):
     """`config/ai.yaml`。接続先とモデル名は含まない（環境変数から）。"""
 
@@ -113,6 +155,11 @@ class AiSettings(BaseModel):
     """アラートの説明に足す負荷と温度の集計（0143 §2.11）。無ければ足さない（今のまま）。"""
     anthropic: AnthropicLimits | None = None
     """Claude API を使うときの上限（決定記録 0143 §2.5）。無ければ Claude API を使わない。"""
+    slack_qa: SlackQaSettings | None = None
+    """Slack のメンションへの返答の上限（決定記録 0168）。
+
+    無ければ `coldaisle-slackbot` は起動しない。
+    """
 
     @classmethod
     def from_yaml(cls, path: Path) -> AiSettings:
@@ -124,8 +171,18 @@ class AiSettings(BaseModel):
 
 @dataclass(frozen=True)
 class ChatMessage:
+    """1 つの発話。
+
+    `tool_calls` と `tool_call_id` は tool loop（決定記録 0168 §2.3）でだけ使う。
+    `tool_calls` は assistant の発話が呼んだツール（OpenAI の形 `{"id", "type": "function",
+    "function": {"name", "arguments"}}`）、`tool_call_id` は role `tool` の発話（ツールの結果）が
+    どの呼び出しへの答えかを示す。どちらも無い発話の送り方は今までと同じ。
+    """
+
     role: str
     content: str
+    tool_calls: tuple[dict[str, Any], ...] = ()
+    tool_call_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -146,6 +203,10 @@ class ChatResult:
     """モデルが呼びたがったツール（#22 が使う）。"""
 
 
+ToolChoice = Literal["auto", "none"]
+"""ツールを呼ばせるか。`None` なら送らない（相手の既定のまま）。"""
+
+
 class Provider(Protocol):
     """LLM への窓口。実装は差し替えられる（試験では偽物を使う）。"""
 
@@ -155,7 +216,10 @@ class Provider(Protocol):
         *,
         thinking: bool | None = None,
         tools: list[dict[str, Any]] | None = None,
-    ) -> ChatResult: ...
+        tool_choice: ToolChoice | None = None,
+    ) -> ChatResult:
+        """`tool_choice="none"` はツールの定義を送ったまま呼ばせない（tool loop の打ち切り）。"""
+        ...
 
     def probe(self) -> ChatResult:
         """疎通確認。**失敗しても例外にしない。**"""
@@ -197,17 +261,20 @@ class OpenAiCompatibleProvider:
         *,
         thinking: bool | None = None,
         tools: list[dict[str, Any]] | None = None,
+        tool_choice: ToolChoice | None = None,
     ) -> ChatResult:
         use_thinking = self.settings.thinking if thinking is None else thinking
         payload: dict[str, Any] = {
             "model": self.model,
-            "messages": [{"role": m.role, "content": m.content} for m in messages],
+            "messages": [_openai_message(m) for m in messages],
             "temperature": self.settings.temperature,
             "max_tokens": self.settings.max_tokens,
             "stream": False,
         }
         if tools:
             payload["tools"] = tools
+            if tool_choice is not None:
+                payload["tool_choice"] = tool_choice
         if self.settings.send_thinking_flag:
             # Qwen3 系 + vLLM の作法。対応しないバックエンドでは外すこと
             payload["chat_template_kwargs"] = {"enable_thinking": use_thinking}
@@ -295,11 +362,22 @@ class UnavailableProvider:
         *,
         thinking: bool | None = None,
         tools: list[dict[str, Any]] | None = None,
+        tool_choice: ToolChoice | None = None,
     ) -> ChatResult:
         return ChatResult(available=False, reason=self.reason)
 
     def probe(self) -> ChatResult:
         return ChatResult(available=False, reason=self.reason)
+
+
+def _openai_message(message: ChatMessage) -> dict[str, Any]:
+    """OpenAI 互換の形の発話。**ツールの欄が無い発話は今までと同じ形**（role と content だけ）。"""
+    wire: dict[str, Any] = {"role": message.role, "content": message.content}
+    if message.tool_calls:
+        wire["tool_calls"] = list(message.tool_calls)
+    if message.tool_call_id is not None:
+        wire["tool_call_id"] = message.tool_call_id
+    return wire
 
 
 def split_thinking(content: str) -> tuple[str, str]:
@@ -318,11 +396,15 @@ def split_thinking(content: str) -> tuple[str, str]:
     return text.strip(), "\n".join(part for part in thinking if part).strip()
 
 
-def from_env(settings: AiSettings) -> Provider:
+def from_env(settings: AiSettings, *, allow_tools: bool = False) -> Provider:
     """使える Provider を返す。**必ず何かを返す**（`None` を返さない）。
 
     `COLDAISLE_LLM_PROVIDER` で選ぶ（決定記録 0143 §2.2）。未設定・空なら今のまま OpenAI 互換。
     知らない値でも例外にしない（**LLM の設定の誤りで監視を止めない**。FR-507）。
+
+    `allow_tools` は Claude API へツールの定義と結果を送ってよいか（決定記録 0168 §2.5）。
+    **真にするのは Slack のメンションへの返答（`coldaisle-slackbot`）だけ。** 日次レポート・
+    アラートの説明・Server Health は既定の偽のまま（0143 §2.3）。OpenAI 互換の Provider は今のまま。
     """
     choice = (os.environ.get(PROVIDER_ENV) or OPENAI_COMPATIBLE).strip()
     if choice == OPENAI_COMPATIBLE:
@@ -332,7 +414,7 @@ def from_env(settings: AiSettings) -> Provider:
         # 関数の中で import する: claude_provider がこのモジュールの型を使うため（循環を避ける）
         from coldaisle.ai.claude_provider import AnthropicProvider
 
-        return AnthropicProvider.from_env(settings)
+        return AnthropicProvider.from_env(settings, allow_tools=allow_tools)
     LOGGER.error(
         "LLM の Provider の指定が不正なので AI を使わない（監視は継続する）",
         extra={logs.FIELDS_KEY: {"env": PROVIDER_ENV, "value": choice[:40]}},

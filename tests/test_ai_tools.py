@@ -399,3 +399,86 @@ def test_stats_still_takes_no_series(tools, store):
     fill(store, hours=1)
     result = tools.call("get_stats", {"metric": "air.gpu_intake", "window": "1h"})
     assert "points" not in result
+
+
+# ------------------------------------------- get_stats の期間と最大・最小の時刻（0168 §2.3）
+
+
+def test_get_stats_tells_when_the_maximum_and_minimum_were_reached(tools, store):
+    """「昨日いちばん熱かったのはいつ？」に、時刻 2 つで答える（点の列は返さない）。"""
+    fill(store, hours=24)  # 20.0 から 40.0 へ単調に上がる
+    result = tools.call("get_stats", {"metric": "air.gpu_intake", "window": "24h"})
+    samples = int(24 * HOUR_MS / INTERVAL_MS)
+    assert result["min_ts_ms"] == NOW_MS - 24 * HOUR_MS
+    assert result["max_ts_ms"] == NOW_MS - 24 * HOUR_MS + (samples - 1) * INTERVAL_MS
+    assert "points" not in result
+
+
+def test_get_stats_takes_the_first_time_of_a_repeated_extreme(tools, store):
+    store.insert_samples(
+        Sample(
+            ts_ms=NOW_MS - 30_000 + index * 10_000,
+            readings=(Reading(metric="air.room", value=value, quality=Quality.OK),),
+        )
+        for index, value in enumerate([25.0, 30.0, 30.0])
+    )
+    result = tools.call("get_stats", {"metric": "air.room", "window": "1h"})
+    assert result["max_ts_ms"] == NOW_MS - 20_000
+    assert result["min_ts_ms"] == NOW_MS - 30_000
+
+
+def test_get_stats_accepts_a_period_like_list_alerts(tools, store):
+    fill(store, hours=24)
+    start = NOW_MS - 24 * HOUR_MS
+    end = NOW_MS - 12 * HOUR_MS
+    result = tools.call("get_stats", {"metric": "air.gpu_intake", "from": start, "to": end})
+    assert (result["from_ms"], result["to_ms"]) == (start, end)
+    assert result["window"] is None  # window は使っていない
+    assert result["max"] < 31.0  # 前半だけ（後半ほど高い）
+    assert start <= result["max_ts_ms"] < end
+    assert result["min_ts_ms"] == start
+    # from だけなら現在まで
+    tail = tools.call("get_stats", {"metric": "air.gpu_intake", "from": end})
+    assert tail["to_ms"] == NOW_MS
+    # 逆転・未来は誤り（黙って別の区間を返さない）
+    reversed_period = {"metric": "air.gpu_intake", "from": end, "to": start}
+    assert "error" in tools.call("get_stats", reversed_period)
+    assert "error" in tools.call("get_stats", {"metric": "air.gpu_intake", "from": NOW_MS + 1})
+
+
+def test_get_stats_without_a_period_is_unchanged(tools, store):
+    """期間を省けば今の window のまま。終わりだけを選ぶ `stats(..., end_ms=...)` も今のまま。"""
+    fill(store, hours=2)
+    result = tools.call("get_stats", {"metric": "air.gpu_intake", "window": "1h"})
+    assert (result["from_ms"], result["to_ms"], result["window"]) == (
+        NOW_MS - HOUR_MS,
+        NOW_MS,
+        "1h",
+    )
+    fixed = tools.stats("air.gpu_intake", "15m", end_ms=NOW_MS - HOUR_MS)
+    assert (fixed["from_ms"], fixed["to_ms"], fixed["window"]) == (
+        NOW_MS - HOUR_MS - 15 * 60_000,
+        NOW_MS - HOUR_MS,
+        "15m",
+    )
+
+
+def test_get_stats_extremes_are_empty_without_values(tools):
+    result = tools.call("get_stats", {"metric": "air.room", "window": "1h"})
+    assert result["max_ts_ms"] is None
+    assert result["min_ts_ms"] is None
+
+
+def test_get_stats_hides_the_extreme_times_of_an_excluded_metric(store):
+    fill(store, hours=1)
+    excluding = ToolRegistry(
+        store=store,
+        catalog=MetricCatalog.from_yaml(CONFIG_DIR / "metrics.yaml"),
+        rules=RuleSet.from_yaml(CONFIG_DIR / "rules.yaml"),
+        clock=store.clock,
+        exclusions=LlmExclusions(metric_patterns=("air.gpu_*",), rule_ids=frozenset()),
+    )
+    result = excluding.call("get_stats", {"metric": "air.gpu_intake", "window": "1h"})
+    assert result["max_ts_ms"] is None
+    assert result["min_ts_ms"] is None
+    assert result["max"] is None

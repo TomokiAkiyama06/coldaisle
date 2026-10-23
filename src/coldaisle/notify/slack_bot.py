@@ -44,13 +44,16 @@ OnPosted = Callable[[Notification, str, str], object]
 
 
 class SlackApi:
-    """Slack の Web API の必要な分だけ。**トークンは repr に出さない。**"""
+    """Slack の Web API の必要な分だけ。**トークンは repr に出さない。**
+
+    Bot トークン（`xoxb-`）でも App トークン（`xapp-`。Socket Mode の接続だけ）でも同じ形で使う。
+    """
 
     def __init__(
         self, token: str, *, client: httpx.Client | None = None, timeout_s: float = TIMEOUT_S
     ) -> None:
         if not token:
-            raise ValueError("Slack の Bot トークンが空")
+            raise ValueError("Slack のトークンが空")
         self.__token = token
         self._client = client
         self._timeout_s = timeout_s
@@ -58,13 +61,44 @@ class SlackApi:
     def __repr__(self) -> str:
         return "SlackApi(token=<hidden>)"
 
-    def post_message(self, channel: str, text: str) -> str:
-        """`chat.postMessage`。投稿の `ts` を返す。"""
-        body = self._call("chat.postMessage", json_body={"channel": channel, "text": text})
+    def post_message(
+        self, channel: str, text: str, *, thread_ts: str | None = None, unfurl: bool = True
+    ) -> str:
+        """`chat.postMessage`。投稿の `ts` を返す。
+
+        `thread_ts` があればそのスレッドへ返す。`unfurl=False` はリンクの展開を止める
+        （メンションへの返答。決定記録 0168 §2.4）。どちらも省けば今までと同じ要求になる。
+        """
+        payload: dict[str, Any] = {"channel": channel, "text": text}
+        if thread_ts is not None:
+            payload["thread_ts"] = thread_ts
+        if not unfurl:
+            payload["unfurl_links"] = False
+            payload["unfurl_media"] = False
+        body = self._call("chat.postMessage", json_body=payload)
         ts = body.get("ts")
         if not isinstance(ts, str) or not ts:
             raise DeliveryError("slack: chat.postMessage: ts が無い")
         return ts
+
+    def bot_user_id(self) -> str:
+        """`auth.test` でこのトークンのボット自身のユーザー ID を得る（決定記録 0168 §2.2）。"""
+        body = self._call("auth.test")
+        user_id = body.get("user_id")
+        if not isinstance(user_id, str) or not user_id:
+            raise DeliveryError("slack: auth.test: user_id が無い")
+        return user_id
+
+    def open_socket_url(self) -> str:
+        """`apps.connections.open`（App トークン）で Socket Mode の WebSocket の URL を得る。
+
+        **URL には接続のための券が入るので、ログ・例外・repr に出さない**（決定記録 0168 §2.1）。
+        """
+        body = self._call("apps.connections.open")
+        url = body.get("url")
+        if not isinstance(url, str) or not url.startswith("wss://"):
+            raise DeliveryError("slack: apps.connections.open: url が無い")
+        return url
 
     def upload_to_thread(
         self,

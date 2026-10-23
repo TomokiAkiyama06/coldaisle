@@ -1,0 +1,47 @@
+# Slack のメンションに読み取り専用のツールで答える常駐のプロセス（#374 / 決定記録 0168）のテンプレート。
+#
+# **テンプレートである。** `User=` / `Group=` は仮の値。導入の手順は docs/ubuntu-deploy.md 4.3。
+# トークン（COLDAISLE_SLACK_APP_TOKEN / COLDAISLE_SLACK_BOT_TOKEN）と許可リスト
+# （COLDAISLE_SLACK_QA_CHANNELS / COLDAISLE_SLACK_QA_USERS）は env ファイルにだけ置く。
+#
+# Socket Mode でこちらから Slack へつなぐ。待ち受けは開かない（決定記録 0001 D-10 を変えない）。
+# DB は読むだけ。取り込み・API・fand・telemetry に依存せず、止めても監視・通知・制御は今のまま動く。
+
+[Unit]
+Description=coldaisle Slack mention Q&A bot
+Documentation=file:///opt/coldaisle/docs/ubuntu-deploy.md
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=coldaisle
+Group=coldaisle
+WorkingDirectory=/opt/coldaisle
+StateDirectory=coldaisle
+# 2770（setgid）: /var/lib/coldaisle を使う unit すべてで揃える（決定記録 0080 §2.1）
+StateDirectoryMode=2770
+# SQLite の -wal / -shm を DB と同じグループで扱えるようにする（0080 §2.1）
+UMask=0007
+EnvironmentFile=-/etc/coldaisle/coldaisle.env
+ExecStart=/opt/coldaisle/.venv/bin/coldaisle-slackbot --db /var/lib/coldaisle/coldaisle.db
+
+Restart=always
+RestartSec=5
+# 終了コード 2 は設定の誤り（トークンが無い・形が違う・config/ai.yaml に slack_qa: が無い）。
+# 起動し直しても直らないので止まったままにする（journal に理由が出る）
+RestartPreventExitStatus=2
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=coldaisle-slackbot
+
+NoNewPrivileges=yes
+PrivateTmp=yes
+# 書けるのは StateDirectory（/var/lib/coldaisle）だけ
+ProtectSystem=strict
+ProtectHome=yes
+
+[Install]
+WantedBy=multi-user.target
