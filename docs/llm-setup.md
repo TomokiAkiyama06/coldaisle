@@ -227,17 +227,37 @@ ls -S req-explain/*.json | head -1   # (b) で使う本文
 ```python
 # 受けた chat/completions の要求の本文をそのまま保存し、空の応答を返す（ループバックだけ・測定の準備の一回だけ）
 import http.server, json, sys, pathlib
-out = pathlib.Path(sys.argv[1]); out.mkdir(exist_ok=True)
+
+out = pathlib.Path(sys.argv[1])
+out.mkdir(exist_ok=True)
+
+
 class H(http.server.BaseHTTPRequestHandler):
     def do_POST(self):
         body = self.rfile.read(int(self.headers["Content-Length"]))
         n = len(list(out.glob("*.json")))
         (out / f"{n:03d}.json").write_bytes(body)
-        reply = json.dumps({"id": "r", "object": "chat.completion", "model": "main",
-                            "choices": [{"index": 0, "finish_reason": "stop",
-                                         "message": {"role": "assistant", "content": ""}}]}).encode()
-        self.send_response(200); self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(reply))); self.end_headers(); self.wfile.write(reply)
+        reply = json.dumps(
+            {
+                "id": "r",
+                "object": "chat.completion",
+                "model": "main",
+                "choices": [
+                    {
+                        "index": 0,
+                        "finish_reason": "stop",
+                        "message": {"role": "assistant", "content": ""},
+                    }
+                ],
+            }
+        ).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(reply)))
+        self.end_headers()
+        self.wfile.write(reply)
+
+
 http.server.HTTPServer(("127.0.0.1", 18099), H).serve_forever()
 ```
 
@@ -254,12 +274,19 @@ from coldaisle.llm_exclusions import LlmExclusions
 from coldaisle.metrics import MetricCatalog
 from coldaisle.rules import RuleSet
 from coldaisle.store import QualityRules, SqliteStore
+
 db = Path(sys.argv[1])
 since = int(time.time() * 1000) - 7 * 86_400_000
 with sqlite3.connect(f"file:{db}?mode=ro", uri=True) as con:
-    rows = con.execute("SELECT id, fired_ms FROM alerts WHERE fired_ms >= ? ORDER BY id", (since,)).fetchall()
-    rows = rows or con.execute(
-        "SELECT id, fired_ms FROM alerts WHERE fired_ms IS NOT NULL ORDER BY fired_ms DESC LIMIT 1").fetchall()
+    rows = con.execute(
+        "SELECT id, fired_ms FROM alerts WHERE fired_ms >= ? ORDER BY id", (since,)
+    ).fetchall()
+    rows = (
+        rows
+        or con.execute(
+            "SELECT id, fired_ms FROM alerts WHERE fired_ms IS NOT NULL ORDER BY fired_ms DESC LIMIT 1"
+        ).fetchall()
+    )
 settings = AiSettings.from_yaml(Path("config/ai.yaml"))
 provider = provider_from_env(settings)
 for alert_id, fired_ms in rows:
@@ -275,13 +302,21 @@ for alert_id, fired_ms in rows:
                 except sqlite3.DatabaseError:
                     if table == "readings" or table.startswith("readings_"):
                         # 説明の材料の表を戻せないなら、発火した時点の要求にならない。黙って進めない
-                        raise SystemExit(f"{table} の行を消せない（封をした DB の写しなど）。別の写しで行う")
+                        raise SystemExit(
+                            f"{table} の行を消せない（封をした DB の写しなど）。別の写しで行う"
+                        )
                     # 追記専用の表（events など。削除をトリガで拒む）は説明の材料に使わないので残す
     clock = SimulatedClock(fired_ms)
-    store = SqliteStore(as_of, rules=QualityRules.from_yaml(Path("config/quality.yaml")), clock=clock)
-    tools = ToolRegistry(store=store, catalog=MetricCatalog.from_yaml(Path("config/metrics.yaml")),
-                         rules=RuleSet.from_yaml(Path("config/rules.yaml")), clock=clock,
-                         exclusions=LlmExclusions.from_yaml(Path("config/report.yaml")))
+    store = SqliteStore(
+        as_of, rules=QualityRules.from_yaml(Path("config/quality.yaml")), clock=clock
+    )
+    tools = ToolRegistry(
+        store=store,
+        catalog=MetricCatalog.from_yaml(Path("config/metrics.yaml")),
+        rules=RuleSet.from_yaml(Path("config/rules.yaml")),
+        clock=clock,
+        exclusions=LlmExclusions.from_yaml(Path("config/report.yaml")),
+    )
     alert = store.alert(alert_id)
     if alert is not None:
         Explainer(provider=provider, tools=tools, context=settings.explain_context).explain(alert)
@@ -301,15 +336,21 @@ python3 -I measure.py "$(ls -S req-explain/*.json | head -1)"
 ```python
 # 保存した要求を stream で 20 回送り、最初の content の差分までの秒数を出す
 import json, sys, time, urllib.request
+
 body = json.load(open(sys.argv[1], encoding="utf-8"))
 url = sys.argv[2] if len(sys.argv) > 2 else "http://127.0.0.1:18080/v1/chat/completions"
 body.update(stream=True, max_tokens=1024)
 system = body["messages"][0]
 base = system["content"]
 for n in range(1, 21):
-    system["content"] = f"測定 {time.time_ns()}\n{base}"  # 先頭を毎回変える（prefix cache を避ける）
-    req = urllib.request.Request(url, json.dumps(body).encode(), {"Content-Type": "application/json"})
-    start = time.monotonic(); first = None
+    system["content"] = (
+        f"測定 {time.time_ns()}\n{base}"  # 先頭を毎回変える（prefix cache を避ける）
+    )
+    req = urllib.request.Request(
+        url, json.dumps(body).encode(), {"Content-Type": "application/json"}
+    )
+    start = time.monotonic()
+    first = None
     with urllib.request.urlopen(req, timeout=60) as resp:
         for line in resp:
             if first is None and line.startswith(b"data: {"):
