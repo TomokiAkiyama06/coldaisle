@@ -101,9 +101,15 @@ class HintDomainSettings(_Strict):
     """
 
     domain_lookback_ms: ProvisionalMs
-    """fand が判定する区間の長さ。artifact の ``window_ms`` 以下でなければ worker は解かない。"""
+    """fand が判定する区間の長さ。
+
+    artifact の ``window_ms`` がこれ**以下**でなければ worker は解かない。
+    """
     domain_stale_after_ms: ProvisionalMs
-    """fand の古さの閾値。artifact の ``stale_after_ms`` 以上でなければ worker は解かない。"""
+    """fand の古さの閾値。
+
+    artifact の ``stale_after_ms`` がこれ**以上**でなければ worker は解かない。
+    """
 
 
 class LearnedChannelSettings(_Strict):

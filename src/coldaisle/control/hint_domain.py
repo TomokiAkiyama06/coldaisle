@@ -284,8 +284,9 @@ def judge_certified_domain(
       ``stale_after_ms``
 
     古さ = 「その frame の**次の** frame の時刻（``N`` は自分の時刻）− ``source_ts_ms``」で、
-    ``stale_after_ms`` 以上なら外（0162 §2.2「古さの検査」）。例外を投げない（入力の列が時刻順で
-    なければ外にする）。
+    ``stale_after_ms`` 以上なら外（0162 §2.2「古さの検査」）。列の形では例外を投げない（入力の列が
+    時刻順でなければ外にする）。``lookback_ms`` / ``stale_after_ms`` の値が不正なときだけ
+    ``ValueError``。
     """
     if lookback_ms < 0 or stale_after_ms <= 0:
         raise ValueError("lookback_ms は 0 以上、stale_after_ms は正にする")
