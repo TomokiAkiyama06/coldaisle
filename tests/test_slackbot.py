@@ -538,6 +538,19 @@ def test_bare_urls_are_removed(raw):
     assert "リンクは省きました" in text
 
 
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "詳細はhttps://phish.example.invalid。温度は71°Cです",
+        "詳細はwww.phish.example.invalid。温度は71°Cです",
+    ],
+)
+def test_a_bare_url_right_after_japanese_is_removed(raw):
+    text = sanitize(raw)
+    assert "phish" not in text
+    assert text.startswith("詳細は") and text.endswith("。温度は71°Cです")
+
+
 def test_prose_after_a_bare_url_is_kept():
     text = sanitize("https://phish.example.invalid。温度は71°Cです")
     assert "phish" not in text
