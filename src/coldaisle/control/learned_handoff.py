@@ -9,6 +9,8 @@
 - `LearnedFrameSink`: frame を送り出し用の1枠へ置く口。**待たない**
 - `LearnedChannelHealth`: 経路の状態を **lock を取らずに**読む口。`poll()` の形を変えずに
   「なぜ提案が無いのか」を loop へ渡す（0077 §2.5 の「trace の detail の運び方」）
+- `LearnedHintCertification`: frame v4 の `hint_certification`（0152 §2.6 / 0162 §2.2）。
+  `supervisor_hint` と**両方そろうか両方 None**（片方だけの frame を型で作れない）
 
 worker からの経路で運べるのは `MpcProposal`（と段階 4 の Supervisor 出力）の型だけで、Demand の
 上書き・モード・authority を表す型を持たない（0077 §2.4 の 6、AGENTS.md ルール2）。
@@ -17,9 +19,9 @@ worker からの経路で運べるのは `MpcProposal`（と段階 4 の Supervi
 from __future__ import annotations
 
 from enum import StrEnum
-from typing import Annotated, Literal, Protocol
+from typing import Annotated, Literal, Protocol, Self
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from coldaisle.control.model.calibration_digest import RuntimeCalibration
 from coldaisle.control.schema import (
@@ -30,11 +32,13 @@ from coldaisle.control.schema import (
     PerZone,
     RegistryProvenance,
     SupervisorOutput,
+    SupervisorPolicyKind,
 )
 from coldaisle.control.state import ControlStateSnapshot
 from coldaisle.control.supervisor.regime import WorkloadRegimeEstimate
+from coldaisle.hint_certificate import HintCertificateComponents, Sha256
 
-LEARNED_FRAME_SCHEMA_VERSION: Literal[3] = 3
+LEARNED_FRAME_SCHEMA_VERSION: Literal[4] = 4
 """`LearnedFrame` の版。
 
 - v1（#86 / 0077 段階 1）: `expected_artifacts` は持たない
@@ -43,6 +47,10 @@ LEARNED_FRAME_SCHEMA_VERSION: Literal[3] = 3
 - v3（#86 / 0077 段階 3）: `calibration`（fand が起動時に読んだ較正。決定記録 0101 §2.2）と
   `metric_catalog_sha256`（fand が読んだ Metric Catalog の SHA-256。決定記録 0107 §2.6）を足した。
   **v2 以前は受け取らない**（0101 §2.3。どの欄も信用できない frame から較正だけを拾わない）
+- v4（#288 / 決定記録 0133 §2.5・0152 §2.6・0162 §2.5 の PR-A）: `supervisor_hint`（ヒント有りの
+  context による Supervisor 出力）と `hint_certification`（証明書の識別・worker 側の部品の期待値・
+  fand の領域の判定の長さと古さの閾値）を足した。**両方そろうか両方 None。** fand と worker は
+  同じ venv で入れ替わる（0157）ので、v3 / v4 の混在は扱わない（v3 以前は受け取らない）
 """
 
 THERMAL_MODEL_KIND = "thermal_model"
@@ -181,6 +189,100 @@ def calibration_to_runtime(
     return RuntimeCalibration.unavailable(calibration.reason.value)
 
 
+class LearnedHintComponents(_FrozenStrict):
+    """worker 側で照合する部品の期待値（0152 §2.6 の7つ。``hint_policy`` は fand だけが照合する）。
+
+    fand が起動時に照合を通した証明書の ``components`` から写す（:meth:`from_certificate`）。
+    照合が通った証明書の部品は fand が自分で計算した値と一致しているので、写すのは同じ値である。
+    """
+
+    source_tree: Sha256
+    lockfile: Sha256
+    environment: Sha256
+    hint_gate: Sha256
+    optimizer: Sha256
+    conditions: Sha256
+    calibration: Sha256
+
+    @classmethod
+    def from_certificate(cls, components: HintCertificateComponents) -> Self:
+        """証明書の部品から worker 側の7つを写す。"""
+        return cls(
+            source_tree=components.source_tree,
+            lockfile=components.lockfile,
+            environment=components.environment,
+            hint_gate=components.hint_gate,
+            optimizer=components.optimizer,
+            conditions=components.conditions,
+            calibration=components.calibration,
+        )
+
+
+class LearnedHintCertification(_FrozenStrict):
+    """frame v4 の ``hint_certification``（決定記録 0152 §2.6 / 0162 §2.2）。**毎 run 同じ値。**
+
+    - ``certificate_sha256``: fand が起動時に照合を通した証明書の認証のハッシュ
+    - ``components``: worker 側の部品の期待値（Shadow solver の子が自分の部品と比べる）
+    - ``domain_lookback_ms`` / ``domain_stale_after_ms``: fand の認証領域の判定の区間の長さと
+      古さの閾値（``config/learned-channel.yaml``。証明書には束ねない。0162 §2.2）。worker は
+      artifact の ``window_ms`` が前者**以下**・``stale_after_ms`` が後者**以上**であることを
+      確かめる
+
+    path・個体識別子を持たない（AGENTS.md ルール10）。
+    """
+
+    certificate_sha256: Sha256
+    components: LearnedHintComponents
+    domain_lookback_ms: int = Field(ge=1)
+    domain_stale_after_ms: int = Field(ge=1)
+
+
+def _band_is_not_weaker(base: SupervisorOutput, hint: SupervisorOutput) -> bool:
+    """ヒント有りの band が基準より冷却を弱めない（CPU / GPU の上限・下限とも基準以下）。
+
+    設定の読み込み（0066 §2.1 (a)）が上書き先 context に課す条件と同じ向き。ここで重ねて確かめる。
+    """
+    for name in ("cpu_temperature", "gpu_temperature"):
+        hinted = getattr(hint.target_band, name)
+        based = getattr(base.target_band, name)
+        if hinted.upper_c > based.upper_c or hinted.lower_c > based.lower_c:
+            return False
+    return True
+
+
+def supervisor_hint_relation_holds(
+    snapshot: ControlStateSnapshot,
+    base: SupervisorOutput | None,
+    hint: SupervisorOutput,
+) -> bool:
+    """``supervisor_hint`` と基準の ``supervisor`` の関係（決定記録 0133 §2.5）が成り立つか。
+
+    **同じ tick**（基準・ヒント有りとも frame の ``snapshot`` の ``tick_id`` / ``ts_ms`` /
+    schema の版）・**同じ regime**・**同じ policy の版**で、``target_band`` **だけが違う**こと。
+    加えて、どちらも RulePolicy の出力であること（ヒントを効かせるのは RulePolicy だけ。0133 §2.2）
+    と、ヒント有りの band が基準より冷却を弱めないこと（0066 §2.1 (a) の向き）を確かめる。
+    fand は frame を作る前にこれを確かめ、成り立たなければ両方 None にする。frame の検証も同じ
+    関数を呼ぶ。
+    """
+    if base is None:
+        return False
+    if base.policy is not SupervisorPolicyKind.RULE or hint.policy is not SupervisorPolicyKind.RULE:
+        return False
+    if (base.tick_id, base.ts_ms, base.snapshot_schema_version) != (
+        snapshot.tick_id,
+        snapshot.ts_ms,
+        snapshot.schema_version,
+    ):
+        return False
+    if hint.target_band == base.target_band:
+        return False
+    rest_base = {name: value for name, value in base if name != "target_band"}
+    rest_hint = {name: value for name, value in hint if name != "target_band"}
+    if rest_base != rest_hint:
+        return False
+    return _band_is_not_weaker(base, hint)
+
+
 class LearnedFrame(BaseModel):
     """1 tick の worker の入力（0077 §2.3、`applied` は 0092）。
 
@@ -191,7 +293,7 @@ class LearnedFrame(BaseModel):
 
     model_config = ConfigDict(frozen=True, extra="forbid", strict=True)
 
-    schema_version: Literal[3] = LEARNED_FRAME_SCHEMA_VERSION
+    schema_version: Literal[4] = LEARNED_FRAME_SCHEMA_VERSION
     snapshot: ControlStateSnapshot
     """その tick の `ControlStateSnapshot`（層をまたいで同じ object。0060 §2.5）。"""
     workload: WorkloadRegimeEstimate | None
@@ -230,6 +332,39 @@ class LearnedFrame(BaseModel):
     worker は自分が読んだ catalog の SHA-256 と違えば束縛を作らない（`metric_catalog_mismatch`）。
     path は載せない（AGENTS.md ルール10）。
     """
+    supervisor_hint: SupervisorOutput | None
+    """その tick のヒント有りの context による Supervisor 出力（v4。決定記録 0133 §2.5）。
+
+    fand が入れるのは実効の段階が B1（``shadow_mpc``）以上で、ヒントが ``active``・
+    対応表に鍵があり・ヒント有りの context が基準と違う tick だけ。
+    **RL Supervisor worker への frame では常に None**（0133 §2.2。:meth:`without_hint`）。
+    既定値を持たない。
+    """
+    hint_certification: LearnedHintCertification | None
+    """証明書の識別と worker 側の部品の期待値（v4。決定記録 0152 §2.6 / 0162 §2.2）。
+
+    ``supervisor_hint`` と**両方そろうか両方 None**。既定値を持たない。
+    """
+
+    @model_validator(mode="after")
+    def _hint_fields_come_together_and_relate(self) -> Self:
+        if (self.supervisor_hint is None) != (self.hint_certification is None):
+            # 片方だけの frame を作らない（0152 §2.6）
+            raise ValueError("supervisor_hint と hint_certification は両方入れるか両方 None にする")
+        if self.supervisor_hint is not None and not supervisor_hint_relation_holds(
+            self.snapshot, self.supervisor, self.supervisor_hint
+        ):
+            raise ValueError(
+                "supervisor_hint は基準の supervisor と同じ tick・regime・policy の版で、"
+                "target_band だけが違う出力にする（0133 §2.5）"
+            )
+        return self
+
+    def without_hint(self) -> LearnedFrame:
+        """ヒントの欄を伏せた frame（RL Supervisor worker へ送る形。0133 §2.2）。"""
+        if self.supervisor_hint is None and self.hint_certification is None:
+            return self
+        return self.model_copy(update={"supervisor_hint": None, "hint_certification": None})
 
 
 class LearnedFrameSink(Protocol):

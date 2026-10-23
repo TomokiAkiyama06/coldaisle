@@ -61,6 +61,11 @@ class AdapterResult(BaseModel):
     status: SourceStatus
     readings: tuple[Reading, ...] = ()
     detail: str | None = None
+    states: tuple[tuple[str, str], ...] = ()
+    """``system_state`` に書くカテゴリ値（key, value）。daemon が変化したときだけ書く（0002 §2.6）。
+
+    ``sys.gpu_state`` のように数値の ``Reading`` にできない観測を運ぶ（決定記録 0163 §2.6）。
+    """
 
 
 class TelemetryAdapter(Protocol):
