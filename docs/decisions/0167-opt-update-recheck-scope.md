@@ -47,11 +47,18 @@ fand の経路の回帰に気づけない。
 
 ### 2.2 fand の import の閉包
 
-F の「fand の import の閉包」は、`<target>` で次の一行が出す path とする。
+F の「fand の import の閉包」は、**`<target>` のコードを入れた環境**で次の一行が出す path とする。導入先の `/opt/coldaisle/.venv` は
+更新の前は `<deployed>` のコードなので使わない（`<target>` で足した module が閉包に出ず、O に見誤る）。`/opt` とは別の場所に `<target>` を
+checkout し、その中で `uv sync --no-dev` してできた venv で実行する（`-I` は作業ディレクトリを読まないので、venv に入った `<target>` の
+コードだけが見える）。
 
 ```bash
-/opt/coldaisle/.venv/bin/python -I -c "import sys, coldaisle.control_daemon; print('\n'.join(sorted(m.__file__ for n, m in sys.modules.items() if n.startswith('coldaisle') and getattr(m, '__file__', None))))"
+git clone --quiet <リポジトリ> /tmp/coldaisle-target && git -C /tmp/coldaisle-target checkout --quiet <target>
+(cd /tmp/coldaisle-target && uv sync --no-dev --quiet)
+/tmp/coldaisle-target/.venv/bin/python -I -c "import sys, coldaisle.control_daemon; print('\n'.join(sorted(m.__file__ for n, m in sys.modules.items() if n.startswith('coldaisle') and getattr(m, '__file__', None))))"
 ```
+
+出た path がすべて `/tmp/coldaisle-target/src/` の下であることを確かめる（別の場所の `coldaisle` を読んでいない）。
 
 関数の中で import する module（`control/supervisor/artifact.py` などの遅延の import）はここに出ないことがあるが、`src/coldaisle/control/` は
 丸ごと F 以上に当てるので、閉包の取りこぼしは `control/` の外の module に限られる。閉包に出なくても fand から使う module を見つけたら、
