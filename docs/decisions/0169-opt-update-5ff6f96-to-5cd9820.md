@@ -68,11 +68,13 @@ R3 の最初の 30 分と重ねてよい（どちらもアイドルの区間で�
 1. 本記録の承認
 2. 0167 §2.3 の手順で書き手と fand を止め、`/opt/coldaisle` を `5cd9820` へ更新し、root で venv を同期する（migration は無いが、`coldaisle-rollup` を
    1 回走らせる手順はそのまま行う）。`coldaisle-slackbot.service` を `/etc/systemd/system/` に置いて `daemon-reload` する（この時点では起動しない）
-3. 共通の確認 C1〜C4（0167 §2.3。C2 の `fand_trace_silent.enabled` は出荷の `false` に戻るので `true` に直す）
+3. 共通の確認のうち C2（`fand_trace_silent.enabled` は出荷の `false` に戻るので `true` に直す）と C3。**確認の間は fand を `disabled` にしておく**
+   （T3・R1〜R3 は `systemctl start` / `stop` で動かし、R2 の再起動で fand が勝手に起動しないようにする。0167 §2.3 の「R3 に合格するまで常駐の状態に戻さない」）。
+   止まっている間は BIOS の制御
 4. §2.1 (b) の T3 の短い回
 5. R1・R2（R1 は所有者が現地。0161 §2.4）
-6. R3（2 時間）と、その最初の 30 分に I1
-7. すべて合格したら `coldaisle-slackbot` を `enable --now` し、許可したチャンネルでメンションして答えが返ることを確かめる（0168 / `docs/ubuntu-deploy.md` 4.3）
+6. R3（2 時間）と、その最初の 30 分に I1。基準との照合は、R3 が CPU の負荷を始める 20 分より前のアイドルで 2 分ごとに 10 組とる
+7. すべて合格したら fand を `enable --now` して C1・C4（0167 §2.3）を確かめ、続けて `coldaisle-slackbot` を `enable --now` し、許可したチャンネルでメンションして答えが返ることを確かめる（0168 / `docs/ubuntu-deploy.md` 4.3）
 8. 結果を #74 にコメントで残す（0167 §5 の 3）。#374 は 7 を確かめてから閉じる
 
 どれかが条件を満たさなければ、`/opt` を `5ff6f96` へ戻して C1 からやり直す（migration が無いので DB は戻さなくてよい）。
