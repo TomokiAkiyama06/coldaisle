@@ -431,12 +431,12 @@ journalctl -u coldaisle-slackbot -n 20 --no-pager   # 「Slack の Socket Mode �
    ```bash
    sudo systemctl stop coldaisle-rollup.timer coldaisle-report.timer
    sudo systemctl stop coldaisle-rollup.service coldaisle-report.service \
-        coldaisle-daemon coldaisle-api coldaisle-telemetry
+        coldaisle-daemon coldaisle-api coldaisle-telemetry coldaisle-slackbot
    rsync -av <mac>:/tmp/coldaisle-migrate.db /tmp/coldaisle.db
    sudo rm -f /var/lib/coldaisle/coldaisle.db-wal /var/lib/coldaisle/coldaisle.db-shm
    # 0660: coldaisle-fand も補助グループで書く（決定記録 0080 §2.1。0640 では fand が書けない）
    sudo install -o coldaisle -g coldaisle -m 0660 /tmp/coldaisle.db /var/lib/coldaisle/coldaisle.db
-   sudo systemctl start coldaisle-daemon coldaisle-api coldaisle-telemetry
+   sudo systemctl start coldaisle-daemon coldaisle-api coldaisle-telemetry coldaisle-slackbot
    sudo systemctl start coldaisle-rollup.timer coldaisle-report.timer
    ```
 
@@ -620,7 +620,7 @@ hwmon には `/dev` のノードが無いので、udev の `GROUP=` / `MODE=` �
    ```bash
    sudo systemctl stop coldaisle-rollup.timer coldaisle-report.timer
    sudo systemctl stop coldaisle-rollup.service coldaisle-report.service \
-        coldaisle-daemon coldaisle-api coldaisle-telemetry
+        coldaisle-daemon coldaisle-api coldaisle-telemetry coldaisle-slackbot
    ```
 
 2. 新しい unit（`StateDirectoryMode=2770`・`UMask=0007`）を置きます（4 節の `cp`）
@@ -677,7 +677,7 @@ hwmon には `/dev` のノードが無いので、udev の `GROUP=` / `MODE=` �
    グループ `coldaisle`・`0660` であること）をもう一度 `stat` で見ます
 
    ```bash
-   sudo systemctl start coldaisle-daemon coldaisle-api coldaisle-telemetry
+   sudo systemctl start coldaisle-daemon coldaisle-api coldaisle-telemetry coldaisle-slackbot
    sudo systemctl start coldaisle-rollup.timer coldaisle-report.timer
    sudo sh -c "stat -c '%A %U:%G %n' /var/lib/coldaisle/coldaisle.db*"
    ```

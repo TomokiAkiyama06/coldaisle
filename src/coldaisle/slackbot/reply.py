@@ -34,6 +34,14 @@ _SPECIAL = re.compile(r"<(?:[!@#]|[a-zA-Z][a-zA-Z0-9+.-]*:)[^<>]*>|<[^<>|]*\|[^<
 残った `<` `>` は下のエスケープで記法として読まれなくなる。
 """
 
+_BARE_URL = re.compile(r"(?:\b[a-zA-Z][a-zA-Z0-9+.-]*://|\bwww\.)\S+")
+"""山括弧で囲まない素の URL（`https://…` `www.…`）。
+
+Slack は押せるリンクにするので消す（PR #376 の指摘）。
+"""
+
+LINK_OMITTED = "（リンクは省きました）"
+
 _BROADCAST = re.compile(r"@(channel|here|everyone)\b", re.IGNORECASE)
 """地の文の `@here` など。
 
@@ -56,6 +64,7 @@ def sanitize(text: str) -> str:
     """LLM の文から記法を取り除き、Slack の規則でエスケープする。"""
     cleaned = _CONTROL.sub("", text)
     cleaned = _SPECIAL.sub("", cleaned)
+    cleaned = _BARE_URL.sub(LINK_OMITTED, cleaned)
     cleaned = _BROADCAST.sub(lambda m: f"＠{m.group(1)}", cleaned)
     return cleaned.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").strip()
 

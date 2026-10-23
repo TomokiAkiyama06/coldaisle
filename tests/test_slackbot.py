@@ -522,6 +522,26 @@ def test_notification_syntax_and_links_are_removed(raw, gone):
     assert "<" not in text and ">" not in text
 
 
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "詳しくは https://phish.example.invalid/login を開いて",
+        "http://phish.example.invalid を開いて",
+        "www.phish.example.invalid を開いて",
+        "ftp://phish.example.invalid/x を開いて",
+    ],
+)
+def test_bare_urls_are_removed(raw):
+    """山括弧で囲まない素の URL も消す（Slack は押せるリンクにする。PR #376 の指摘）。"""
+    text = sanitize(raw)
+    assert "phish" not in text
+    assert "リンクは省きました" in text
+
+
+def test_numbers_and_units_are_not_taken_for_urls():
+    assert sanitize("GPU は 71.0 °C、電力は 300 W です") == "GPU は 71.0 °C、電力は 300 W です"
+
+
 def test_plain_broadcast_words_and_brackets_are_defused():
     text = sanitize("@here 温度 < 50 かつ > 30 & 安定")
     assert "@here" not in text
