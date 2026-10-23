@@ -4,6 +4,7 @@
 - **Status**: FINAL（2026-08-25 承認）
 - **Date**: 2026-08-25
 - **Supersedes**: [`0004-storage-read-contract.md`](0004-storage-read-contract.md) §2.7（同一 `(metric, ts_ms)` の扱い。拒否 → 無視へ）
+- **Superseded by**: [0164](0164-no-sensor-calibration.md)（§2.6 のうち `PROBE_CHANGED` を「人が較正をやり直して記録側を更新する」ことで解く手順のみ＝較正をやり直す前に 0164 §2.4 の 3 の新しい記録で決める。状態の定義と記録を上書きしない扱いは有効）
 - **関連**: [`0002-metric-naming.md`](0002-metric-naming.md) §2.2 / §2.9 /
   [`0007-ingest-pipeline.md`](0007-ingest-pipeline.md) §2.11 / §5 未決3 /
   [`0009-read-api.md`](0009-read-api.md) §2.1 /
