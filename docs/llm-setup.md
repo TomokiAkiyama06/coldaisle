@@ -270,7 +270,13 @@ for alert_id, fired_ms in rows:
         for table in tables:
             columns = {r[1] for r in con.execute(f'PRAGMA table_info("{table}")')}
             if "ts_ms" in columns and table != "alerts":
-                con.execute(f'DELETE FROM "{table}" WHERE ts_ms > ?', (fired_ms,))
+                try:
+                    con.execute(f'DELETE FROM "{table}" WHERE ts_ms > ?', (fired_ms,))
+                except sqlite3.DatabaseError:
+                    if table == "readings" or table.startswith("readings_"):
+                        # 説明の材料の表を戻せないなら、発火した時点の要求にならない。黙って進めない
+                        raise SystemExit(f"{table} の行を消せない（封をした DB の写しなど）。別の写しで行う")
+                    # 追記専用の表（events など。削除をトリガで拒む）は説明の材料に使わないので残す
     clock = SimulatedClock(fired_ms)
     store = SqliteStore(as_of, rules=QualityRules.from_yaml(Path("config/quality.yaml")), clock=clock)
     tools = ToolRegistry(store=store, catalog=MetricCatalog.from_yaml(Path("config/metrics.yaml")),
