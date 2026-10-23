@@ -4,6 +4,7 @@
 - **Status**: FINAL（2026-10-22、リポジトリ所有者の判断）
 - **Date**: 2026-10-22
 - **Supersedes**: [`0024`](0024-calibration.md) の §5 の 1「実機での較正」と §5 の 4「ベースライン測定より較正が先」のみ（0024 の仕組みと他の節は有効）
+  / [`0012`](0012-rule-engine.md) §2.6 と [`0025`](0025-probe-identity.md) §2.1 のうち、`PROBE_CHANGED` を「人が較正をやり直して記録側を更新する」ことで解く手順の部分のみ（較正をやり直す前に §2.4 の 3 の新しい記録で決める。`PROBE_CHANGED` を続く状態とする定義と、不一致の間は記録側を上書きしない扱いは有効）
 - **関連**: [`0024`](0024-calibration.md) / [`0096`](0096-calibration-binding-digest.md) /
   [`0099`](0099-calibration-change-log.md) / [`0153`](0153-airflow-measurement-method.md) §2.9 /
   `docs/spec-review.md` W-02 / `docs/requirements.md` FR-107 / `docs/calibration.md`

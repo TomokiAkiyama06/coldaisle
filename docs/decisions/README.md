@@ -81,7 +81,7 @@ docs/decisions/NNNN-<slug>.md      例: 0002-metric-naming.md
 | [0009](0009-read-api.md) | 読み取り API の契約 | FINAL |
 | [0010](0010-csv-replay.md) | CSV 再生の規約 | FINAL |
 | [0011](0011-dashboard.md) | 開発用ダッシュボードの方針 | FINAL |
-| [0012](0012-rule-engine.md) | ルールエンジンの規約 | FINAL |
+| [0012](0012-rule-engine.md) | ルールエンジンの規約 | FINAL（§2.6 の `PROBE_CHANGED` を較正のやり直しで解く手順は [0164](0164-no-sensor-calibration.md) で置き換え） |
 | [0013](0013-notifications.md) | 通知の規約 | FINAL（§2.6 の URL の一部は [0142](0142-japanese-notification-text.md) で置き換えを提案中） |
 | [0014](0014-llm-provider.md) | LLM Provider の規約 | FINAL（§2.1 の Provider の選び方は [0143](0143-claude-api-interim-provider.md) で足す。Proposed） |
 | [0015](0015-llm-tools.md) | 読み取り専用ツールの規約 | FINAL |
@@ -94,7 +94,7 @@ docs/decisions/NNNN-<slug>.md      例: 0002-metric-naming.md
 | [0022](0022-firmware-v1.md) | 本番ファームウェア v1 | FINAL（§2.8 の繋がった瞬間の `hello` の出し直しは [0129](0129-periodic-hello.md) で置き換え） |
 | [0023](0023-serial-source.md) | シリアル取り込み | FINAL |
 | [0024](0024-calibration.md) | 較正の手順と記録 | FINAL |
-| [0025](0025-probe-identity.md) | プローブの同定 | FINAL |
+| [0025](0025-probe-identity.md) | プローブの同定 | FINAL（§2.1 の `PROBE_CHANGED` を較正のやり直しで解く手順は [0164](0164-no-sensor-calibration.md) で置き換え） |
 | [0026](0026-three-zone-fan-control.md) | Front / Rear / Top を独立Fan zoneとして制御する | FINAL |
 | [0027](0027-fan-control-architecture.md) | Fan 制御アーキテクチャ（Supervisor + Learned MPC + Reactive Guard + Critical Safety） | FINAL |
 | [0028](0028-fan-control-contracts.md) | Fan 制御の層間契約（入出力・優先順位・状態遷移・周期・故障時の扱い・設定・承認点） | FINAL（§2.7 の正常停止の見分け方は [0080](0080-fand-systemd-unit.md) で置き換え） |
