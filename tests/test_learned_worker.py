@@ -67,6 +67,7 @@ from coldaisle.learned_worker.window import (
 )
 from coldaisle.metrics import MetricCatalog
 from coldaisle.store.models import Quality
+from hint_frame_world import HINT_CERTIFICATION, lowered_band
 from test_control_loop import METRIC_CATALOG_SHA256, METRICS_PATH, catalog, control_config
 from test_fallback_controller import fallback_proposal
 from test_learned_mpc import (
@@ -172,11 +173,22 @@ def frame(
     config: ControlConfig = CONTROL,
     catalog_sha256: str = CATALOG_SHA256,
     omit: tuple[str, ...] = (),
+    with_hint: bool = False,
 ) -> LearnedFrame:
+    current = snapshot(tick_id, omit=omit)
+    base = supervisor_output() if with_supervisor else None
+    hint = None
+    if with_hint:
+        # 基準を同じ tick に揃え、band だけを下げたヒント有りの出力（0133 §2.5 の関係）
+        assert base is not None
+        base = base.model_copy(update={"tick_id": tick_id, "ts_ms": current.ts_ms})
+        hint = base.model_copy(update={"target_band": lowered_band(base)})
     return LearnedFrame(
-        snapshot=snapshot(tick_id, omit=omit),
+        snapshot=current,
         workload=None,
-        supervisor=supervisor_output() if with_supervisor else None,
+        supervisor=base,
+        supervisor_hint=hint,
+        hint_certification=HINT_CERTIFICATION if with_hint else None,
         baseline=fallback_proposal(0.4),
         safety_floor=PerZone[Demand](front=0.2, rear=0.2, top=0.2),
         applied=PerZone[Demand | None](front=applied, rear=applied, top=applied),
@@ -228,7 +240,7 @@ def test_frame_v3_round_trips_the_calibration_and_the_catalog_hash(trained: MpcA
 
     assert isinstance(parsed.body, FrameBody)
     assert parsed.body.frame == item
-    assert parsed.body.frame.schema_version == LEARNED_FRAME_SCHEMA_VERSION == 3
+    assert parsed.body.frame.schema_version == LEARNED_FRAME_SCHEMA_VERSION == 4
     assert parsed.body.frame.calibration == available()
     assert parsed.body.frame.metric_catalog_sha256 == CATALOG_SHA256
 
@@ -241,6 +253,9 @@ def _frame_json(item: LearnedFrame) -> dict[str, Any]:
     "mutate",
     [
         pytest.param(lambda doc: doc.update(schema_version=2), id="v2"),
+        pytest.param(lambda doc: doc.update(schema_version=3), id="v3"),
+        pytest.param(lambda doc: doc.pop("supervisor_hint"), id="no-supervisor-hint"),
+        pytest.param(lambda doc: doc.pop("hint_certification"), id="no-hint-certification"),
         pytest.param(lambda doc: doc.pop("calibration"), id="no-calibration"),
         pytest.param(lambda doc: doc.pop("metric_catalog_sha256"), id="no-catalog-hash"),
         pytest.param(lambda doc: doc.update(calibration={"status": "available"}), id="no-offsets"),
@@ -263,6 +278,80 @@ def test_old_or_broken_frames_are_refused_as_a_whole(trained: MpcArtifact, mutat
     mutate(document)
     with pytest.raises(ValidationError):
         LearnedFrame.model_validate_json(json.dumps(document))
+
+
+# ====================================================== frame v4（0133 §2.5 / 0152 §2.6 / 0162）
+
+
+def test_frame_v4_round_trips_the_hint_fields(trained: MpcArtifact) -> None:
+    item = frame(10, pins=pinned_of(trained), with_hint=True)
+    data = encode_outbound(
+        OutboundEnvelope(run_id=RUN_ID, role=LearnedRole.MPC, body=FrameBody(frame=item))
+    )
+    parsed = OutboundEnvelope.model_validate_json(data)
+    assert isinstance(parsed.body, FrameBody)
+    assert parsed.body.frame == item
+    assert parsed.body.frame.hint_certification == HINT_CERTIFICATION
+    assert parsed.body.frame.supervisor_hint is not None
+
+
+@pytest.mark.parametrize("missing", ["supervisor_hint", "hint_certification"])
+def test_a_frame_with_only_one_of_the_hint_fields_is_refused(
+    trained: MpcArtifact, missing: str
+) -> None:
+    """片方だけの frame は作れず、受け取れもしない（0152 §2.6）。"""
+    document = _frame_json(frame(10, pins=pinned_of(trained), with_hint=True))
+    document[missing] = None
+    with pytest.raises(ValidationError, match="両方"):
+        LearnedFrame.model_validate_json(json.dumps(document))
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        pytest.param({"tick_id": 9}, id="other-tick"),
+        pytest.param({"regime": "sustained_cpu"}, id="other-regime"),
+        pytest.param({"version": "rule-2"}, id="other-version"),
+        pytest.param({"strategy": "quiet"}, id="other-strategy"),
+        pytest.param({"policy": "rl"}, id="rl-policy"),
+    ],
+)
+def test_a_hint_that_differs_beyond_the_band_is_refused(
+    trained: MpcArtifact, change: dict[str, Any]
+) -> None:
+    """同じ tick・regime・policy の版で target_band だけが違う、の外は frame の検証に落ちる。"""
+    document = _frame_json(frame(10, pins=pinned_of(trained), with_hint=True))
+    document["supervisor_hint"].update(change)
+    with pytest.raises(ValidationError):
+        LearnedFrame.model_validate_json(json.dumps(document))
+
+
+def test_a_hint_with_the_same_band_or_a_weaker_band_is_refused(trained: MpcArtifact) -> None:
+    item = frame(10, pins=pinned_of(trained), with_hint=True)
+    base = item.supervisor
+    assert base is not None
+    same = _frame_json(item)
+    same["supervisor_hint"]["target_band"] = json.loads(base.target_band.model_dump_json())
+    weaker = _frame_json(item)
+    weaker["supervisor_hint"]["target_band"]["gpu_temperature"]["upper_c"] = (
+        base.target_band.gpu_temperature.upper_c + 1.0
+    )
+    for document in (same, weaker):
+        with pytest.raises(ValidationError):
+            LearnedFrame.model_validate_json(json.dumps(document))
+
+
+def test_the_worker_ignores_the_hint_fields(trained: MpcArtifact) -> None:
+    """worker は v4 を受け、ヒントの欄を読まない（0162 §2.5 の PR-A）。同じ提案になる。"""
+    pins = pinned_of(trained)
+    hinted = ticks(10, 2, pins=pins, with_hint=True)
+    plain = [item.without_hint() for item in hinted]
+    assert all(item.supervisor_hint is None for item in plain)
+    with_hint = feed(core_for(trained), *hinted)
+    without = feed(core_for(trained), *plain)
+    assert with_hint is not None and with_hint.failure is None, with_hint
+    assert without is not None
+    assert with_hint.model_dump() == without.model_dump()
 
 
 @pytest.mark.parametrize("code", list(CalibrationUnavailableCode))

@@ -66,6 +66,7 @@ from coldaisle.learned_channel.messages import parse_inbound
 from coldaisle.local_socket import SocketStartupError, prepare_path
 from coldaisle.metrics import MetricCatalog
 from conftest import CONFIG_DIR
+from hint_frame_world import with_hint
 from test_control_config import valid_documents, write_documents
 from test_control_loop import METRICS_PATH, Harness, control_config, manual
 from test_fallback_controller import assessment_for, learned_proposal
@@ -771,6 +772,46 @@ def test_a_frame_reaches_every_connected_worker(channel, sample_frame) -> None:
     finally:
         mpc.close()
         rl.close()
+
+
+def test_the_rl_worker_never_receives_the_hint_fields(channel, sample_frame) -> None:
+    """frame v4 のヒントの欄は MPC worker にだけ届き、RL worker には常に None（0133 §2.2）。"""
+    hinted = with_hint(sample_frame)
+    assert hinted.supervisor_hint is not None
+    running = channel()
+    mpc, _ = connect(running, LearnedRole.MPC, MPC_UID)
+    rl, _ = connect(running, LearnedRole.SUPERVISOR, RL_UID)
+    try:
+        assert wait_until(
+            lambda: all(
+                running.mailbox.state(role) is LearnedChannelState.CONNECTED for role in LearnedRole
+            )
+        )
+        running.mailbox.offer(hinted)
+        received: dict[str, LearnedFrame] = {}
+        for worker, role in ((mpc, "mpc"), (rl, "supervisor")):
+            message = worker.receive()
+            assert message is not None and message["role"] == role
+            received[role] = LearnedFrame.model_validate_json(json.dumps(message["body"]["frame"]))
+        assert received["mpc"] == hinted
+        assert received["supervisor"].supervisor_hint is None
+        assert received["supervisor"].hint_certification is None
+        assert received["supervisor"] == hinted.without_hint()
+    finally:
+        mpc.close()
+        rl.close()
+
+
+def test_the_hint_domain_values_are_read_from_the_channel_config() -> None:
+    """``domain_lookback_ms`` / ``domain_stale_after_ms`` は経路の設定に置く（0162 §2.2）。"""
+    settings = LearnedChannelSettings.from_yaml(CONFIG_DIR / "learned-channel.yaml")
+    assert settings.hint_domain is not None
+    assert settings.hint_domain.domain_lookback_ms.value > 0
+    assert settings.hint_domain.domain_stale_after_ms.value > 0
+    document = yaml.safe_load((CONFIG_DIR / "learned-channel.yaml").read_text(encoding="utf-8"))
+    document.pop("hint_domain")
+    # 塊を省いた設定も読める（その起動では fand が frame にヒントの欄を入れない）
+    assert LearnedChannelSettings.model_validate(document).hint_domain is None
 
 
 def test_a_frame_over_the_limit_is_dropped(channel, sample_frame) -> None:

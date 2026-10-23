@@ -92,6 +92,20 @@ class ChannelLimits(_Strict):
     """`listen()` の待ち行列。**同時に持つ接続は役割ごとに1つ**で、これはその手前の待ち行列。"""
 
 
+class HintDomainSettings(_Strict):
+    """Workload Hint の B1 で fand が行う認証領域の判定の値（決定記録 0162 §2.2）。
+
+    fand が読み、frame v4 の ``hint_certification`` に載せて MPC worker へ渡す（worker は自分の
+    設定ではなく frame の値で比べる）。**証明書には束ねない**（解の結果に効かず、判定を厳しくする
+    向きにしか働かない。0162 §2.2 / §5 の 2）。
+    """
+
+    domain_lookback_ms: ProvisionalMs
+    """fand が判定する区間の長さ。artifact の ``window_ms`` 以下でなければ worker は解かない。"""
+    domain_stale_after_ms: ProvisionalMs
+    """fand の古さの閾値。artifact の ``stale_after_ms`` 以上でなければ worker は解かない。"""
+
+
 class LearnedChannelSettings(_Strict):
     """`config/learned-channel.yaml` 全体。"""
 
@@ -102,6 +116,12 @@ class LearnedChannelSettings(_Strict):
     """worker が提案・失敗を送らない間も heartbeat を送る間隔。接続を認めた最初の応答で知らせる。"""
     worker_idle_timeout_ms: ProvisionalMs
     """最後の有効なメッセージからこの時間黙った接続を閉じる（`worker_idle`）。"""
+    hint_domain: HintDomainSettings | None = None
+    """Workload Hint の B1 の値（決定記録 0162 §2.2）。省ける。
+
+    省いた設定では、fand は frame にヒントの欄（``supervisor_hint`` / ``hint_certification``）を
+    入れない（B1 の依頼が worker に届かないだけで、基準の経路は変わらない）。
+    """
 
     @model_validator(mode="after")
     def _idle_covers_three_heartbeats(self) -> Self:

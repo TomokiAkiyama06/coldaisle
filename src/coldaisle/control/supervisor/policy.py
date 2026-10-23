@@ -317,6 +317,29 @@ class SupervisorCoordinator:
             selected.target_band,
         )
 
+    def hinted_output(
+        self, policy_input: SupervisorInput, decision: SupervisorDecision
+    ) -> SupervisorOutput | None:
+        """ヒント有りの context による出力（frame v4 の ``supervisor_hint``。決定記録 0133 §2.5）。
+
+        :meth:`would_override` が真の tick だけ作る（ヒントが ``active``・対応表に鍵があり・
+        ヒント有りの context が基準と違う。読むのは設定の active slot の RulePolicy だけ）。
+        選ばれた基準の出力から ``target_band`` だけを置き換える（同じ tick・regime・policy の版・
+        ``computed_at_ms``）。上書き先の ``strategy`` / ``weights`` は設定の読み込みで基準と
+        等しいことを確かめてあり（0066 §2.1 (a)）、等しくなければ作らない。
+        **選ばれた出力は変えない**（B1 は shadow だけ。0162 §2.1）。
+        """
+        if not self.would_override(policy_input, decision):
+            return None
+        selected = decision.selected_output
+        assert selected is not None and isinstance(self._rule, RulePolicy)
+        context = self._rule.hinted_context(policy_input)
+        assert context is not None
+        if (context.strategy, context.weights) != (selected.strategy, selected.weights):
+            return None
+        fields = {name: value for name, value in selected if name != "target_band"}
+        return SupervisorOutput(**fields, target_band=context.target_band)
+
     def evaluate(
         self,
         policy_input: SupervisorInput,
