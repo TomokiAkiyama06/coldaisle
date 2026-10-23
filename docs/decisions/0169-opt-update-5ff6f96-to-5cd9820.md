@@ -71,13 +71,16 @@ R3 の最初の 30 分と重ねてよい（どちらもアイドルの区間で�
 3. 共通の確認のうち C2（`fand_trace_silent.enabled` は出荷の `false` に戻るので `true` に直す）と C3。**確認の間は fand を `disabled` にしておく**
    （T3・R1〜R3 は `systemctl start` / `stop` で動かし、R2 の再起動で fand が勝手に起動しないようにする。0167 §2.3 の「R3 に合格するまで常駐の状態に戻さない」）。
    止まっている間は BIOS の制御
+   続けて、止めた書き手とタイマー（`coldaisle-daemon` / `coldaisle-api` / `coldaisle-telemetry`、常駐していれば `coldaisle-eventd`、`coldaisle-rollup.timer` /
+   `coldaisle-report.timer`）を起動し直し、`air.*`・内部の telemetry・`sys.gpu_state` の新しい sample が DB に届いたことを確かめてから 4 へ進む
+   （0161 §2.5 の手順 3a と同じ。届かないまま T3 を始めると、止める前から stale になっていて T3 を測れない。PR #377 の Codex の指摘）
 4. §2.1 (b) の T3 の短い回
 5. R1・R2（R1 は所有者が現地。0161 §2.4）
 6. R3（2 時間）と、その最初の 30 分に I1。基準との照合は、R3 が CPU の負荷を始める 20 分より前のアイドルで 2 分ごとに 10 組とる
 7. すべて合格したら fand を `enable --now` して C1・C4（0167 §2.3）を確かめ、続けて `coldaisle-slackbot` を `enable --now` し、許可したチャンネルでメンションして答えが返ることを確かめる（0168 / `docs/ubuntu-deploy.md` 4.3）
 8. 結果を #74 にコメントで残す（0167 §5 の 3）。#374 は 7 を確かめてから閉じる
 
-どれかが条件を満たさなければ、`/opt` を `5ff6f96` へ戻して C1 からやり直す（migration が無いので DB は戻さなくてよい）。
+どれかが条件を満たさなければ、`/opt` を `5ff6f96` へ戻し（venv も同期し直し、`fand_trace_silent.enabled` を true に戻す）、**fand を `enable --now` して**常駐の状態に戻してから C1 からやり直す（3 で `disabled` にしたので、`start` だけでは次の再起動で起動しない。PR #377 の Codex の指摘）。migration が無いので DB は戻さなくてよい。
 
 ## 3. Consequences
 
