@@ -603,6 +603,37 @@ def test_numbers_not_in_tool_results_get_the_unverified_mark(qa_settings, store)
     assert text.endswith(UNVERIFIED_MARK)
 
 
+def test_digits_in_field_names_do_not_verify_an_answer(qa_settings, store):
+    """`p95` の 95 のような欄の名前の数字で、作った数値を検証済みにしない（PR #376 の指摘）。"""
+    provider = ScriptedProvider(
+        ChatResult(available=True, tool_calls=[call("get_stats", {"metric": "air.room"})]),
+        ChatResult(available=True, text="温度は 95 ℃です。"),
+    )
+    posted = Posted()
+    target = handler(qa_settings, provider, store, post=posted)
+    target.offer(mention())
+    drain(target)
+    [(_, _, text)] = posted.items
+    assert text.endswith(UNVERIFIED_MARK)
+
+
+def test_numbers_echoed_in_an_error_do_not_verify_an_answer(qa_settings, store):
+    """エラーの文に写った引数の数字（window の 77）で検証済みにしない（PR #376 の指摘）。"""
+    provider = ScriptedProvider(
+        ChatResult(
+            available=True,
+            tool_calls=[call("get_stats", {"metric": "air.room", "window": "77q"})],
+        ),
+        ChatResult(available=True, text="温度は 77 ℃です。"),
+    )
+    posted = Posted()
+    target = handler(qa_settings, provider, store, post=posted)
+    target.offer(mention())
+    drain(target)
+    [(_, _, text)] = posted.items
+    assert text.endswith(UNVERIFIED_MARK)
+
+
 def test_numbers_in_tool_results_are_verified():
     allowed = number_values('{"value": 31.5, "slope": -0.25, "ts_local": "2026-08-25 09:00:00"}')
     assert invented_numbers("31.50 ℃、−0.25 ℃/分、2026-08-25 09:00", allowed) == []

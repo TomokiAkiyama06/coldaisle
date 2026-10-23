@@ -176,17 +176,21 @@ class QuestionAnswerer:
                 name = call["function"]["name"]
                 # ログに残す名前は既知のものだけ（LLM の作った文字列をそのまま残さない）
                 used.append(name if name in DEFINED_TOOLS else "unknown")
-                content, ran = self._run(
+                content, ran, numbers = self._run(
                     tools, name, call["function"]["arguments"], index, executed_in_question
                 )
                 executed_in_question += ran
-                allowed |= number_values(content)
+                allowed |= numbers
                 messages.append(ChatMessage(role="tool", content=content, tool_call_id=call["id"]))
 
     def _run(
         self, tools: ToolRegistry, name: str, arguments: str, index: int, so_far: int
-    ) -> tuple[str, int]:
-        """1 つ実行し、LLM へ渡す文（JSON）と実行した数（0 か 1）を返す。
+    ) -> tuple[str, int, frozenset[float]]:
+        """1 つ実行し、LLM へ渡す文（JSON）・実行した数（0 か 1）・検証に使ってよい数値を返す。
+
+        検証に使う数値は、成功した結果の**値**（数値と、コードが整形した `*_local` の時刻）だけ。
+        欄の名前（`p95` の 95 など）やエラーの文（引数の写しを含みうる）からは取らない
+        （PR #376 の指摘）。
 
         **許可していないツールは実行しない。**
         `index` はこの応答の中の順番、`so_far` はこの質問でこれより前に実行した呼び出しの数。
@@ -203,8 +207,10 @@ class QuestionAnswerer:
         else:
             result = _narrow(name, tools.call(name, arguments))
             ran = 1
-        text = json.dumps(_with_local_times(result, self.zone), ensure_ascii=False, default=str)
-        return text[: self.settings.max_tool_result_chars], ran
+        shaped = _with_local_times(result, self.zone)
+        text = json.dumps(shaped, ensure_ascii=False, default=str)
+        numbers = frozenset() if not ran or "error" in result else _value_numbers(shaped)
+        return text[: self.settings.max_tool_result_chars], ran, numbers
 
 
 DROPPED_FIELDS: dict[str, tuple[str, ...]] = {"describe_system": ("devices",)}
@@ -212,6 +218,33 @@ DROPPED_FIELDS: dict[str, tuple[str, ...]] = {"describe_system": ("devices",)}
 `gpio`・ROM の末尾・分解能で、個体の識別に近く、質問に答えるのに要らない。
 Workspace 向けの `describe_system` は変えない（ここで取り除くだけ）。
 """
+
+
+def _value_numbers(value: Any) -> frozenset[float]:  # noqa: ANN401 - JSON の木をそのまま辿る
+    """結果の木の**値**から、検証に使ってよい数値を集める（欄の名前は見ない）。
+
+    数値（bool を除く）と、コードが整形した時刻の文字列（`*_local`）の数字だけ。ほかの文字列
+    （`detail`・表示名など）の数字は使わない。
+    """
+    found: set[float] = set()
+
+    def walk(item: Any, key: str | None) -> None:  # noqa: ANN401
+        if isinstance(item, bool):
+            return
+        if isinstance(item, int | float):
+            found.add(float(item))
+        elif isinstance(item, str):
+            if key is not None and key.endswith(_LOCAL_SUFFIX):
+                found.update(number_values(item))
+        elif isinstance(item, dict):
+            for child_key, child in item.items():
+                walk(child, child_key if isinstance(child_key, str) else None)
+        elif isinstance(item, list | tuple):
+            for child in item:
+                walk(child, key)
+
+    walk(value, None)
+    return frozenset(found)
 
 
 def _narrow(name: str, result: dict[str, Any]) -> dict[str, Any]:
