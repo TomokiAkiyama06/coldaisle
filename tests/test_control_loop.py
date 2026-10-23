@@ -432,6 +432,7 @@ class Harness:
         learned_health: Any = None,
         learned_sink: Any = None,
         learned_calibration: Any = None,
+        learned_hint_certification: Any = None,
         watchdog: Any = None,
         authority: Any = None,
         guard: Any = None,
@@ -521,6 +522,8 @@ class Harness:
                 or UnavailableCalibration(reason=CalibrationUnavailableCode.PATH_NOT_GIVEN)
             ),
             metric_catalog_sha256=(None if learned_sink is None else METRIC_CATALOG_SHA256),
+            # frame v4 の `hint_certification`（0152 §2.6）。B1 以上の tick でだけ frame に入る
+            learned_hint_certification=learned_hint_certification,
             shadow=ShadowRecorder(self.config.policy.shadow),
             trace=ControlTraceLogger(self.trace) if with_trace else None,
             authority=authority or RecordingAuthority(self.authority, self.order),
