@@ -17,6 +17,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Any
 
@@ -346,16 +347,22 @@ class ToolRegistry:
         explicit_start = start_ms is not None
         start_ms, end_ms = self._range(start_ms, end_ms, window)
         excluded = self._excluded(metric)
-        stats = (
-            _empty_stats(metric, start_ms, end_ms)  # 無いメトリクスと同じ（0131 §2.4a）
-            if excluded
-            else self.store.stats(metric, start_ms, end_ms)
+        # 集計と最大・最小の時刻を同じスナップショットで読む。間に取り込みの書き込みが入っても、
+        # 古い最大値と新しい行の時刻を組にしない。呼び出し側が既に読み取りの中ならそれに乗る
+        snapshot = (
+            nullcontext() if self.store.connection.in_transaction else self.store.read_snapshot()
         )
-        max_ts_ms, min_ts_ms = (
-            (None, None)
-            if excluded or stats.ok_value_count == 0
-            else self.store.extreme_times(metric, start_ms, end_ms)
-        )
+        with snapshot:
+            stats = (
+                _empty_stats(metric, start_ms, end_ms)  # 無いメトリクスと同じ（0131 §2.4a）
+                if excluded
+                else self.store.stats(metric, start_ms, end_ms)
+            )
+            max_ts_ms, min_ts_ms = (
+                (None, None)
+                if excluded or stats.ok_value_count == 0
+                else self.store.extreme_times(metric, start_ms, end_ms)
+            )
         return {
             "metric": metric,
             "unit": self._unit(metric),

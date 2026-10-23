@@ -482,3 +482,28 @@ def test_get_stats_hides_the_extreme_times_of_an_excluded_metric(store):
     assert result["max_ts_ms"] is None
     assert result["min_ts_ms"] is None
     assert result["max"] is None
+
+
+def test_get_stats_reads_the_aggregate_and_the_extreme_times_in_one_snapshot(
+    tools, store, monkeypatch
+):
+    """集計と最大・最小の時刻を同じ読み取りの中で取る（PR #376 の指摘）。"""
+    store.insert_samples(
+        [
+            Sample(
+                ts_ms=NOW_MS - 1_000,
+                readings=(Reading(metric="air.room", value=25.0, quality=Quality.OK),),
+            )
+        ]
+    )
+    seen: list[bool] = []
+    original = store.extreme_times
+
+    def spy(*args, **kwargs):
+        seen.append(store.connection.in_transaction)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(store, "extreme_times", spy)
+    tools.call("get_stats", {"metric": "air.room", "window": "1h"})
+    assert seen == [True]
+    assert not store.connection.in_transaction  # 読み終えたら閉じる

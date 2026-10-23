@@ -1439,3 +1439,27 @@ def test_the_tool_calls_of_one_question_are_capped(qa_settings, store):
     assert all(e.startswith("1 つの質問") for e in errors[18:26])
     assert errors[26].startswith("1 回の応答")
     assert sum(1 for e in errors if not e) == 16
+
+
+@pytest.mark.parametrize("flag", ["--metrics", "--rules", "--quality-rules"])
+@pytest.mark.parametrize("content", [None, "metrics: [\n"], ids=["missing", "broken-yaml"])
+def test_an_unreadable_tool_config_exits_with_the_config_code(
+    monkeypatch, tmp_path, caplog, flag, content
+):
+    """metrics / rules / quality の設定の誤りも終了コード 2（unit は再起動しない。PR #376 の指摘）。
+
+    Slack へつなぐ前に止まる（auth.test を呼ばない）。
+    """
+    monkeypatch.setenv("COLDAISLE_SLACK_APP_TOKEN", APP_TOKEN)
+    monkeypatch.setenv("COLDAISLE_SLACK_BOT_TOKEN", BOT_TOKEN)
+
+    def no_network(self):
+        raise AssertionError("設定の誤りでは Slack へつながない")
+
+    monkeypatch.setattr(cli.SlackApi, "bot_user_id", no_network)
+    path = tmp_path / "broken.yaml"
+    if content is not None:
+        path.write_text(content, encoding="utf-8")
+    with caplog.at_level(logging.ERROR):
+        assert cli.main(["--ai", str(CONFIG_DIR / "ai.yaml"), flag, str(path)]) == cli.EXIT_CONFIG
+    assert BOT_TOKEN not in caplog.text and APP_TOKEN not in caplog.text

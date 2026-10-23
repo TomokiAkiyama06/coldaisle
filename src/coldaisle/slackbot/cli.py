@@ -106,6 +106,16 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         return EXIT_CONFIG
 
+    zone = _zone(args.report_config)
+    try:
+        opener = _tools_opener(args)
+    except (OSError, yaml.YAMLError, ValueError) as error:
+        # metrics / rules / quality の設定は起動し直しても直らない（終了コード 2。再起動しない）
+        LOGGER.error(
+            "ツールの設定（metrics / rules / quality）を読めないので起動しない",
+            extra={logs.FIELDS_KEY: {"error": type(error).__name__}},
+        )
+        return EXIT_CONFIG
     allowlist = Allowlist.from_env()
     allowlist.warn_if_empty()
     bot_api = SlackApi(bot_token)
@@ -118,13 +128,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         return EXIT_UNREACHABLE
 
-    zone = _zone(args.report_config)
     answerer = QuestionAnswerer(
         provider=provider_from_env(settings, allow_tools=True),
         settings=qa,
         budget=DailyCallBudget(qa.daily_call_limit),
         # 時刻帯が読めなければ答えない（「昨日」を OS の時刻帯で解かない。0168 §2.3）
-        open_tools=None if zone is None else _tools_opener(args),
+        open_tools=None if zone is None else opener,
         zone=zone or ZoneInfo("UTC"),
     )
     handler = MentionHandler(
