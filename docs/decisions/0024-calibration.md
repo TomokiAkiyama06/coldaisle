@@ -4,6 +4,7 @@
 - **Status**: FINAL（2026-09-10、PR #30 のマージ。**実機での較正は別**。§5-1）
 - **Date**: 2026-09-10
 - **Supersedes**: なし
+- **Superseded by**: [0164](0164-no-sensor-calibration.md)（§5 の 1「実機での較正」と §5 の 4「較正が先」のみ＝較正は行わない。仕組みと他の節は有効）
 - **関連**: `docs/spec-review.md` W-02 / [`0007-ingest-pipeline.md`](0007-ingest-pipeline.md) /
   [`0020-decision-memory.md`](0020-decision-memory.md) /
   `docs/requirements.md` FR-107 / FR-403 / #13 / #12 / #19

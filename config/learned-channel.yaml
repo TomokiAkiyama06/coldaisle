@@ -59,3 +59,21 @@ worker_idle_timeout_ms:
   value: 5000
   status: provisional
   basis: "決定記録 0077 §5（実測を待つ値）。heartbeat を4回取りこぼすまで待つ暫定値"
+
+# Workload Hint の B1（shadow_mpc）で coldaisle-fand が行う認証領域の判定の値（#288 / 決定記録 0162 §2.2）。
+# fand が読み、frame の hint_certification で MPC worker へ渡します（worker は自分の設定では比べません）。
+# 証明書には束ねません（解の結果に効かず、判定を厳しくする向きにしか働かないため）。
+# この塊を省くと、fand は frame にヒントの欄を入れません（B1 が動かないだけで、基準の経路は変わりません）。
+hint_domain:
+  # fand が自分の送った frame で判定する区間の長さ（ミリ秒）。区間とその直前の 1 frame のすべてが
+  # 認証領域の中であることを確かめます。**artifact の window_ms 以上にします**（短いと worker が解きません）。
+  domain_lookback_ms:
+    value: 600000
+    status: provisional
+    basis: "決定記録 0162 §2.2（実測を待つ値）。artifact の window_ms がまだ無いので、それを覆う側の暫定値"
+  # fand の古さの閾値（ミリ秒）。区間の各 frame の軸の metric で「次の frame の時刻 − source_ts_ms」が
+  # これ以上なら範囲の外にします。**artifact の stale_after_ms 以下にします**（長いと worker が解きません）。
+  domain_stale_after_ms:
+    value: 10000
+    status: provisional
+    basis: "決定記録 0162 §2.2（実測を待つ値）。config/quality.yaml の stale_after_ms と同じ桁の暫定値"

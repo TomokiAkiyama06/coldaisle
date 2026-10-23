@@ -1,6 +1,6 @@
 """合成の起点: Learned MPC worker（`coldaisle-learnd --role mpc`。#86 / 決定記録 0077 段階 3）。
 
-`coldaisle-fand` が毎 tick 送る frame（`LearnedFrame` v3）の列だけを入力にし、検証した
+`coldaisle-fand` が毎 tick 送る frame（`LearnedFrame` v4）の列だけを入力にし、検証した
 反実仮想 Thermal Model artifact で `LearnedMpcRuntime.propose()` を `mpc.period_ms` ごとに呼んで、
 結果（`MpcProposal`。提案か失敗）を fand の役割ごとのソケットへ返す。
 
@@ -10,4 +10,6 @@
 - hwmon / PWM・シリアル・LLM 層に触れない（`coldaisle.ai` / `coldaisle.api` / `coldaisle.store` /
   `coldaisle.control.hardware` / `serial` を import しない。試験で止める）
 - 観測 window・anchor の action・提案を作らない周期の規則は決定記録 0107
+- frame v4 のヒントの欄（`supervisor_hint` / `hint_certification`）は**読まない**。読むのは
+  Shadow solver の子プロセス（決定記録 0162 §2.5 の PR-B）で、基準の solve には使わない
 """
