@@ -49,8 +49,9 @@ Top が Max・Front / Rear が `fault_demand` 1.0／air は Front / Rear だけ�
 loop を通って `effective_demand` と hardware まで届くことを、実際の fault で確かめる。所要は約 15 分。
 
 **(c) 較正**: `offsets_c` が変わらないことを、更新の前に `git diff 5ff6f96 5cd9820 -- config/calibration.json` で確かめる（`note` の行だけが違うこと）。
-ファイルの bytes が変わるので、取り込みの起動時に `calibration_activations` へ 1 行が足される（0099。offset は同じ）。これは想定どおりで、
-Dataset v2 の較正の区切りになる。fand の frame の較正（offset の写像）と、Workload Hint の部品 `calibration`（`stage: off` では使わない）は
+`calibration_activations` の digest は実効の offset から作るので（`activate_calibration()` は直前の行と digest が同じなら書かない。0099）、
+`note` だけの変更では**行は足されず、Dataset v2 の較正の区切りにもならない**（PR #377 の Codex の指摘で、先の版の「1 行が足される」を直した）。
+更新の後に行の数が変わっていないことを確かめる。fand の frame の較正（offset の写像）と、Workload Hint の部品 `calibration`（`stage: off` では使わない）は
 offset から作るので変わらない。
 
 ### 2.2 F の部分の確認: 0161 §2.4 の R1〜R3
@@ -62,6 +63,12 @@ trace の `schema_version` は 16）。R3 の 2 時間の soak は常駐の運�
 
 基準との照合を含める（`nvml.py` が変わったので、GPU の温度と電力を `nvidia-smi` と比べる。CPU 温度と CPU 電力も比べる）。
 R3 の最初の 30 分と重ねてよい（どちらもアイドルの区間で行う）。`sys.gpu_state` の新しい sample が DB に届くことも見る。
+
+`sys.gpu_state` はこの更新で初めて導入されるので、0163 §2.6 の**陽性の対照**も行う（PR #377 の Codex の指摘）: `paw-llm-main.service`（PAW の vLLM）を
+起動して GPU に process が載ったら `sys.gpu_state` が `ai`（他の CUDA process があれば `mixed`）になり、止めた後に `idle` になることを確かめる。
+`compute` になったら `config/gpu_state.yaml` の `ai_units` を直すまで、`compute` を「AI 由来 0」の証拠に使わない（0163 §2.6）。
+GPU に負荷がかかるので、T3・R1〜R3・I1 の区間には入れず、§2.4 の 7 で fand を常駐に戻した後に行う。`sys.gpu_state` は fand の入力ではない（0163 §2.6）ので、
+この対照の結果は 7 の fand の判定を変えない。不合格なら fand は戻さず、`ai_units` を直す別の PR にする。
 
 ### 2.4 順序
 
@@ -78,9 +85,11 @@ R3 の最初の 30 分と重ねてよい（どちらもアイドルの区間で�
 5. R1・R2（R1 は所有者が現地。0161 §2.4）
 6. R3（2 時間）と、その最初の 30 分に I1。基準との照合は、R3 が CPU の負荷を始める 20 分より前のアイドルで 2 分ごとに 10 組とる
 7. すべて合格したら fand を `enable --now` して C1・C4（0167 §2.3）を確かめ、続けて `coldaisle-slackbot` を `enable --now` し、許可したチャンネルでメンションして答えが返ることを確かめる（0168 / `docs/ubuntu-deploy.md` 4.3）
-8. 結果を #74 にコメントで残す（0167 §5 の 3）。#374 は 7 を確かめてから閉じる
+8. §2.3 の `sys.gpu_state` の陽性の対照（`paw-llm-main.service` の起動で `ai`／`mixed`、停止で `idle`）
+9. 結果を #74 にコメントで残す（0167 §5 の 3）。#374 は 7 を確かめてから閉じる
 
-どれかが条件を満たさなければ、`/opt` を `5ff6f96` へ戻し（venv も同期し直し、`fand_trace_silent.enabled` を true に戻す）、**fand を `enable --now` して**常駐の状態に戻してから C1 からやり直す（3 で `disabled` にしたので、`start` だけでは次の再起動で起動しない。PR #377 の Codex の指摘）。migration が無いので DB は戻さなくてよい。
+4〜7 のどれかが条件を満たさなければ、**まず書き手とタイマー（3 で起動し直したもの）を止め**、`/opt` を `5ff6f96` へ戻し（venv も同期し直し、`fand_trace_silent.enabled` を true に戻す）、**fand を `enable --now` して**止めた書き手とタイマーを戻した venv から起動し直し、新しい sample を確かめ、常駐の状態に戻してから C1 からやり直す（動いている書き手の下で `/opt` を
+書き換えると、`5cd9820` の読み込み済みのコードが残り、後の import で 2 つの版が混ざる。PR #377 の Codex の指摘。3 で `disabled` にしたので、`start` だけでは次の再起動で起動しない。PR #377 の Codex の指摘）。migration が無いので DB は戻さなくてよい。
 
 ## 3. Consequences
 
