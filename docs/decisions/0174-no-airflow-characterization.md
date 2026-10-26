@@ -1,7 +1,7 @@
 # 決定記録 0174: 3 系統の Fan の風量の特性は測らない。Air Balance の協調は `mode: "off"` のまま運用する
 
 - **種別**: Decision Record
-- **Status**: Proposed
+- **Status**: FINAL（2026-10-26、リポジトリ所有者の承認）
 - **Date**: 2026-10-26
 - **Supersedes**: [`0153`](0153-airflow-measurement-method.md) のうち「導入先で掃引と応答の行列を測り、結果を承認する」予定の部分（§2.7 の 3・4 と §2.12 の EFU の定義を待つ部分）のみ（測り方の定義と解析の道具 `coldaisle-airflow-characterization` は有効）/
   [`0078`](0078-air-balance-fallback-coordination.md) §2.11 の段 5〜7（校正済み `air-balance.yaml`・shadow → apply）を行う予定の部分のみ（協調の仕組み・検証・`uncalibrated` との組み合わせの拒否は有効）
