@@ -23,11 +23,11 @@ from coldaisle.report import ReportConfig
 from coldaisle.report_table import TableRow, render_table_png
 from conftest import CONFIG_DIR
 
-HEADER = ("メトリクス", "最低", "平均", "最高", "前日比(平均)", "欠測", "収録")
+HEADER = ("メトリクス", "平均", "最高")
 ROWS = [
-    TableRow(("室温", "24.00", "25.00", "27.50", "+0.10", "0.0%", "1440/1440")),
-    TableRow(("GPUコア温度", "40.00", "60.00", "71.25", "—", "50.0%", "1440/1440")),
-    TableRow(("GPU消費電力", "—", "—", "—", "—", "100.0%", "1440/1440"), muted=True),
+    TableRow(("室温", "24.6 °C", "27.5 °C")),
+    TableRow(("室内湿度", "52.0 %RH", "65.3 %RH")),
+    TableRow(("GPU消費電力", "—", "—"), muted=True),
 ]
 
 _CANDIDATES = (

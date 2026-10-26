@@ -49,6 +49,21 @@ HIGHLIGHTS = (
     "power.gpu.0",
     "power.cpu.package",
 )
+TABLE_METRICS = (
+    "air.room",
+    "air.room_humidity",
+    "air.front_intake",
+    "air.gpu_intake",
+    "air.gpu_exhaust",
+    "air.top_exhaust",
+    "air.rear_exhaust",
+    "gpu.0.core",
+    "cpu.package",
+    "cpu.vrm",
+    "board.connector_12v2x6",
+    "power.gpu.0",
+    "power.cpu.package",
+)
 MINUTE_MS = 60_000
 DAY_MS = MINUTES_PER_DAY * MINUTE_MS
 
@@ -98,6 +113,7 @@ def config(tmp_path) -> ReportConfig:
         max_notification_chars=3500,
         thread_title="📄 {month}月{day}日の振り返り",
         highlight_metrics=list(HIGHLIGHTS),
+        table_metrics=list(TABLE_METRICS),
         table_font=tmp_path / "no-such-font.ttc",
         table_font_size=28,
     )
@@ -447,6 +463,7 @@ def _config_with(**overrides) -> ReportConfig:
         "max_notification_chars": 3500,
         "thread_title": "📄 {month}月{day}日の振り返り",
         "highlight_metrics": list(HIGHLIGHTS),
+        "table_metrics": list(TABLE_METRICS),
         "table_font": Path("/nonexistent/font.ttc"),
         "table_font_size": 28,
     }
@@ -601,7 +618,7 @@ def test_lead_missing_uses_the_same_rounding_as_the_table():
         _gauge("全部", 1.0),
     )
     assert _missing_section(report) == ["千分の一 0.1%", "全部 100.0%"]
-    table = report.table_markdown()
+    table = report.as_markdown()
     assert "| わずか（x.3） | 20.00 | 25.00 | 30.00 | — | 0.0% |" in table
     assert "-0.0%" not in table
 
@@ -609,7 +626,7 @@ def test_lead_missing_uses_the_same_rounding_as_the_table():
 def test_lead_missing_carries_the_minutes_note_like_the_table():
     report = _report_with_missing(_gauge("一部", 0.5, missing_minutes=600))
     assert _missing_section(report) == ["一部 50.0%（600分）"]
-    assert "50.0%（600分）" in report.table_markdown()
+    assert "50.0%（600分）" in report.as_markdown()
 
 
 def test_lead_has_no_missing_section_when_everything_shows_zero():
@@ -652,14 +669,42 @@ def test_shipped_highlights_are_the_agreed_default():
     assert set(config.highlight_metrics) <= set(catalog.metrics)
 
 
-def test_table_rows_use_labels_and_mute_rows_without_values(store, catalog):
+def test_table_rows_follow_the_list_with_mean_and_max_only(store, catalog):
+    """行は `table_metrics` の順、列は名前・平均・最高だけ（0171 §2.3）。
+
+    値が無い行も「—」で残す。
+    """
     _lead_fixture(store)
-    header, rows = report_for(store, catalog).table_rows()
-    assert header[0] == "メトリクス" and len(header) == 7
+    header, rows = report_for(store, catalog).table_rows(TABLE_METRICS)
+    assert header == ("メトリクス", "平均", "最高")
+    assert [row.cells[0] for row in rows][:3] == ["室温", "室内湿度", "前面吸気"]
+    assert len(rows) == len(TABLE_METRICS)
     by_name = {row.cells[0]: row for row in rows}
+    assert by_name["室温"].cells == ("室温", "25.0 °C", "27.5 °C")
     assert not by_name["室温"].muted
+    assert by_name["GPU消費電力"].cells == ("GPU消費電力", "—", "—")
     assert by_name["GPU消費電力"].muted
-    assert by_name["室温"].cells[3] == "27.50"
+    assert by_name["CPU VRM温度"].cells == ("CPU VRM温度", "—", "—"), "その日に行が無くても残す"
+
+
+def test_shipped_table_metrics_are_the_agreed_default():
+    config = ReportConfig.from_yaml(CONFIG_DIR / "report.yaml")
+    assert config.table_metrics == list(TABLE_METRICS)
+    assert config.unknown_metrics(MetricCatalog.from_yaml(CONFIG_DIR / "metrics.yaml")) == {}
+
+
+def test_cli_rejects_an_unknown_table_metric(tmp_path):
+    config_path = tmp_path / "report.yaml"
+    config_path.write_text(
+        "timezone: Asia/Tokyo\nto: []\nsummarise: false\n"
+        'max_alerts: 20\nmax_notification_chars: 3500\nthread_title: "{month}月{day}日"\n'
+        "highlight_metrics: [air.room]\ntable_metrics: [air.romo]\n"
+        "table_font: /nonexistent/font.ttc\ntable_font_size: 28\n",
+        encoding="utf-8",
+    )
+    argv = ["--config", str(config_path), "--metrics", str(CONFIG_DIR / "metrics.yaml")]
+    with pytest.raises(ValueError, match=r"air\.romo"):
+        main(argv)
 
 
 def test_thread_without_a_font_sends_the_table_as_text(store, catalog, config):
@@ -668,7 +713,9 @@ def test_thread_without_a_font_sends_the_table_as_text(store, catalog, config):
     thread = as_thread(report_for(store, catalog), config, dashboard_url="")
     assert thread.table_image is None
     assert thread.table_text.startswith("## 測定値")
-    assert "| 室温（air.room） |" in thread.table_text
+    assert "| メトリクス | 平均 | 最高 |" in thread.table_text
+    assert "| 室温 | 25.0 °C | 27.5 °C |" in thread.table_text
+    assert "最低" not in thread.table_text and "欠測" not in thread.table_text
 
 
 def test_a_failing_destination_does_not_stop_the_others(store, catalog):
@@ -693,7 +740,8 @@ def test_config_rejects_a_misspelled_timezone(tmp_path):
     path.write_text(
         "timezone: Asia/Tokio\nto: []\nsummarise: false\n"
         'max_alerts: 20\nmax_notification_chars: 3500\nthread_title: "{month}月{day}日"\n'
-        "highlight_metrics: [air.room]\ntable_font: /nonexistent/font.ttc\ntable_font_size: 28\n",
+        "highlight_metrics: [air.room]\ntable_metrics: [air.room]\n"
+        "table_font: /nonexistent/font.ttc\ntable_font_size: 28\n",
         encoding="utf-8",
     )
     with pytest.raises(ValueError, match="タイムゾーン"):
@@ -716,7 +764,8 @@ def test_cli_does_not_write_a_report_file(tmp_path, rules, catalog, monkeypatch,
     config_path.write_text(
         "timezone: Asia/Tokyo\nto: []\nsummarise: false\n"
         'max_alerts: 20\nmax_notification_chars: 3500\nthread_title: "{month}月{day}日"\n'
-        "highlight_metrics: [air.room]\ntable_font: /nonexistent/font.ttc\ntable_font_size: 28\n",
+        "highlight_metrics: [air.room]\ntable_metrics: [air.room]\n"
+        "table_font: /nonexistent/font.ttc\ntable_font_size: 28\n",
         encoding="utf-8",
     )
     assert (

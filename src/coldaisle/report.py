@@ -91,6 +91,11 @@ class ReportConfig(BaseModel):
     """
     highlight_metrics: list[str] = Field(min_length=1)
     """要点の「主な値」に最高値を載せる metric（0171 §2.2）。その日の値が無いものは書かない。"""
+    table_metrics: list[str] = Field(min_length=1)
+    """Slack のスレッドの表（画像と、描けないときの文）に載せる metric とその順（0171 §2.3）。
+
+    その日の値が無い metric も「—」の行で残す。Webhook・LINE・`--print` の全行の表には効かない。
+    """
     table_font: Path
     """測定値の表の画像に使う日本語のフォントのファイル（0171 §2.3）。無ければ表を文で送る。"""
     table_font_size: int = Field(ge=8, le=96)
@@ -113,12 +118,21 @@ class ReportConfig(BaseModel):
         """対象日の親の題（例 `📄 10月25日の振り返り`）。"""
         return self.thread_title.format(month=day.month, day=day.day)
 
-    @field_validator("highlight_metrics")
+    @field_validator("highlight_metrics", "table_metrics")
     @classmethod
-    def _check_highlights(cls, value: list[str]) -> list[str]:
+    def _check_metric_list(cls, value: list[str]) -> list[str]:
         if len(set(value)) != len(value):
-            raise ValueError("highlight_metrics に同じ metric が 2 回ある")
+            raise ValueError("metric の一覧に同じ名前が 2 回ある")
         return value
+
+    def unknown_metrics(self, catalog: MetricCatalog) -> dict[str, list[str]]:
+        """`config/metrics.yaml` に無い名前（一覧の名前 → 名前）。空なら無い。"""
+        known = set(catalog.metrics)
+        found = {
+            "highlight_metrics": sorted(set(self.highlight_metrics) - known),
+            "table_metrics": sorted(set(self.table_metrics) - known),
+        }
+        return {key: names for key, names in found.items() if names}
 
     @property
     def zone(self) -> ZoneInfo:
@@ -240,33 +254,47 @@ class DailyReport:
             raise ValueError("LLM へ渡す除外の一覧を当てていない（決定記録 0131 §2.4a）")
         return "\n".join(self.llm_view._facts()).rstrip() + "\n"
 
-    def table_markdown(self) -> str:
-        """測定値の表だけ。表の画像を描けない・上げられないときの返信（決定記録 0171 §2.3）。"""
-        lines = self._gauge_table()
-        if not lines:
-            return "測定値はありません。\n"
-        return "\n".join(lines).rstrip() + "\n"
+    def table_markdown(self, metrics: Sequence[str]) -> str:
+        """Slack のスレッドの表を文で。画像を描けない・上げられないときの返信（0171 §2.3）。
 
-    def table_rows(self) -> tuple[tuple[str, ...], list[TableRow]]:
-        """測定値の表の画像の見出しと行。Markdown の表と同じ値・同じ書式（0171 §2.3）。
-
-        名前は表示名だけにする（画像では metric 名を並べると読みにくい）。
-        平均が無い行（届いたサンプルがすべて欠測など）は薄い色で描く。
+        画像と同じ行と列（`table_rows`）。Webhook・LINE・`--print` の全行の表は `as_markdown`。
         """
-        rows = [
-            TableRow(
-                cells=(line.label, *_gauge_values(line)),
-                muted=line.mean is None,
-            )
-            for line in self._gauges()
+        header, rows = self.table_rows(metrics)
+        lines = [
+            "## 測定値",
+            "",
+            "| " + " | ".join(header) + " |",
+            "|" + "---|" * len(header),
+            *("| " + " | ".join(row.cells) + " |" for row in rows),
         ]
-        return GAUGE_HEADER, rows
+        return "\n".join(lines) + "\n"
+
+    def table_rows(self, metrics: Sequence[str]) -> tuple[tuple[str, ...], list[TableRow]]:
+        """Slack のスレッドの表の見出しと行（決定記録 0171 §2.3）。
+
+        行は `metrics` の順。列は名前・平均・最高だけ（欠測は要点に出ている）。値には単位を付ける。
+        その日の値が無い metric も「—」の行で残し、薄い色で描く。
+        """
+        by_metric = {line.metric: line for line in self.metrics}
+        rows: list[TableRow] = []
+        for name in metrics:
+            line = by_metric.get(name)
+            if line is None:
+                rows.append(TableRow(cells=(name, "—", "—"), muted=True))
+                continue
+            rows.append(
+                TableRow(
+                    cells=(line.label, _cell(line.mean, line.unit), _cell(line.maximum, line.unit)),
+                    muted=line.mean is None,
+                )
+            )
+        return THREAD_TABLE_HEADER, rows
 
     def lead_text(self, highlights: Sequence[str], dashboard_url: str) -> str:
         """Slack のスレッドの要点（決定記録 0171 §2.2）。**切らない。**
 
         順は アラート → AI の所見 → 主な値（最高）→ 欠測の名前 → ダッシュボードのリンク。
-        表（最低・平均・前日比・欠測率）は画像で見る。
+        平均・最高の表は画像（`table_rows`）で見る。全行の表は `as_markdown`。
         """
         zone = ZoneInfo(self.timezone)
         lines: list[str] = []
@@ -322,7 +350,7 @@ class DailyReport:
         lines = [
             "## 測定値",
             "",
-            "| " + " | ".join(("メトリクス", *GAUGE_HEADER[1:])) + " |",
+            "| " + " | ".join(GAUGE_HEADER) + " |",
             "|---|---|---|---|---|---|---|",
         ]
         lines += [_gauge_row(line) for line in gauges]
@@ -387,7 +415,14 @@ _NO_DATA_NOTE = (
 
 
 GAUGE_HEADER = ("メトリクス", "最低", "平均", "最高", "前日比(平均)", "欠測", "収録")
-"""測定値の表の見出し。Markdown の表と画像で同じものを使う（決定記録 0171 §2.3）。"""
+"""全行の測定値の表の見出し（Webhook・LINE・`--print`）。"""
+
+THREAD_TABLE_HEADER = ("メトリクス", "平均", "最高")
+"""Slack のスレッドの表の見出し。画像と、描けないときの文で同じもの（決定記録 0171 §2.3）。"""
+
+
+def _cell(value: float | None, unit: str) -> str:
+    return "—" if value is None else _reading(value, unit)
 
 
 def _gauge_values(line: MetricLine) -> tuple[str, ...]:
@@ -721,7 +756,7 @@ def as_notification(
 
 def as_thread(report: DailyReport, config: ReportConfig, *, dashboard_url: str) -> ReportThread:
     """Slack の Bot で送る形（決定記録 0171 §2.1〜§2.3）。表の画像は描けなければ付けない。"""
-    header, rows = report.table_rows()
+    header, rows = report.table_rows(config.table_metrics)
     png = render_table_png(
         header, rows, font_path=config.table_font.expanduser(), font_size=config.table_font_size
     )
@@ -738,7 +773,7 @@ def as_thread(report: DailyReport, config: ReportConfig, *, dashboard_url: str) 
     return ReportThread(
         title=config.thread_title_for(report.day),
         lead=report.lead_text(config.highlight_metrics, dashboard_url),
-        table_text=report.table_markdown(),
+        table_text=report.table_markdown(config.table_metrics),
         table_image=image,
     )
 
@@ -833,10 +868,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     logs.configure(args.log_level)
     config = ReportConfig.from_yaml(args.config)
     catalog = MetricCatalog.from_yaml(args.metrics)
-    unknown = sorted(set(config.highlight_metrics) - set(catalog.metrics))
+    unknown = config.unknown_metrics(catalog)
     if unknown:
-        # 綴り違いで「主な値」から黙って消えないよう、起動時に落とす
-        raise ValueError(f"highlight_metrics に定義の無い metric がある: {unknown}")
+        # 綴り違いで「主な値」や表から黙って消えないよう、起動時に落とす
+        raise ValueError(f"定義の無い metric がある: {unknown}")
     rule_labels = RuleSet.from_yaml(args.rules).labels()
     notify_config = NotifyConfig.from_yaml(args.notify)
     clock = WallClock()
