@@ -701,10 +701,11 @@ def _hint_config(stage: str) -> Any:
 
 
 @pytest.mark.parametrize("configured", ["shadow_mpc", "active"])
-def test_the_implementation_ceiling_keeps_b0_even_when_certified(configured: str) -> None:
-    """B1 の Shadow solver はまだ無い（段 4）ので、照合が通っても B0。"""
+def test_the_implementation_ceiling_is_b1_and_needs_the_certificate(configured: str) -> None:
+    """実装の上限は B1（0162 §2.5 の PR-C）。照合が通らなければ B0、B2 は未実装で B1 に留まる。"""
+    assert workload_hint_module.IMPLEMENTED_STAGE is WorkloadHintStage.SHADOW_MPC
     stage = WorkloadHintStage(configured)
-    assert effective_stage(stage, certified=True) is WorkloadHintStage.OBSERVE
+    assert effective_stage(stage, certified=True) is WorkloadHintStage.SHADOW_MPC
     assert effective_stage(stage, certified=False) is WorkloadHintStage.OBSERVE
     assert effective_stage(stage) is WorkloadHintStage.OBSERVE
 

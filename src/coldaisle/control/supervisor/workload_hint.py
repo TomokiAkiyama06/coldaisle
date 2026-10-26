@@ -59,12 +59,17 @@ from coldaisle.control.supervisor.hint_clock import (
 
 LOGGER = logging.getLogger("coldaisle.control")
 
-IMPLEMENTED_STAGE = WorkloadHintStage.OBSERVE
-"""この実装が動かせる最も高い段階（B0）。
+IMPLEMENTED_STAGE = WorkloadHintStage.SHADOW_MPC
+"""この実装が動かせる最も高い段階（B1）。
 
-fand の起動時の証明書の照合（決定記録 0152 §2.4。``coldaisle.hint_certification``）はあるが、
-B1 の Shadow solver（0152 段 4）はまだ無いので、照合が通っても実効の段階は B0 に留まる
-（0152 §2.4「実効の段階 = min(設定の stage, 実装が動かせる最も高い段階, 照合の結果)」）。
+frame v4（0162 §2.5 の PR-A）・worker の Shadow solver（PR-B）・fand の受信・検証・記録と
+``ControlTick`` v17（PR-C）が揃ったので B1 まで上げる（0162 §2.5「最後に IMPLEMENTED_STAGE =
+SHADOW_MPC」）。B2（``active``）は未実装で、設定が ``active`` でも実効は B1 に留まる。
+
+実効の段階 = min(設定の stage, この上限, 照合の結果)（0152 §2.4）。設定の ``stage`` の既定は
+``off`` のままで、B1 が動くのは所有者が設定を ``shadow_mpc`` にし、証明書を昇格し、0133 §2.6 の
+前提（RulePolicy の本番値・本番のホストでの実時間の試験の合格）を揃えたときだけ。B1 は shadow
+だけで ``requested_demand`` を変えない（0162 §2.1）。
 """
 
 

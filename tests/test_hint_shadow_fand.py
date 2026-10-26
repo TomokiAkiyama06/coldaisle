@@ -15,7 +15,9 @@
 5. **2 条件の再検査**は fand が設定から導いた ``eps`` / ``eps_c`` で行い、領域の外でも残す
 6. **受付**: ``hint_shadow`` は MPC のソケットで受け口を渡されたときだけ受け取り、生存の知らせに
    数えない。受け口の失敗で受付スレッドを止めない。送り出した frame を受け口の列へ渡す
-7. **境界**: Safety / Guard / Fallback / hardware は新しい部品を import しない。worker からの本文は
+7. **組み立て**: fand は照合が通り ``hint_domain`` がある B1 の run だけ受け口を開いて受付に渡す。
+   trace の塊 v2 は証明書の識別と最後に受け入れた数を持つ
+8. **境界**: Safety / Guard / Fallback / hardware は新しい部品を import しない。worker からの本文は
    Demand・モード・authority を運べない
 """
 
@@ -62,6 +64,7 @@ from coldaisle.learned_channel.messages import (
 from coldaisle.learned_channel.messages import HintShadowCounters as WorkerCounters
 from coldaisle.learned_channel.messages import HintShadowStatus as WorkerShadowStatus
 from coldaisle.store import SqliteStore
+from test_hint_certification import world as _world_fixture
 from test_hint_domain import CPU_UPPER, GPU_UPPER, LOOKBACK_MS, STALE_MS, good_frame, ok, ts
 from test_hint_domain import spec as _spec_fixture
 from test_learned_channel import (
@@ -86,6 +89,7 @@ no_file_groups = _no_file_groups_fixture
 sample_frame = _sample_frame_fixture
 short_dir = _short_dir_fixture
 trained = _trained_fixture
+world = _world_fixture
 
 SRC = Path(__file__).resolve().parents[1] / "src" / "coldaisle"
 CONFIG_DIR = Path(__file__).resolve().parents[1] / "config"
@@ -1267,3 +1271,139 @@ def test_a_skipped_record_without_conditions_is_kept(spec, base, metrics) -> Non
         HintShadowStatus.SKIPPED,
         HintShadowReason.CERTIFICATION_MISMATCH,
     )
+
+
+# ---------------------------------------------------------------- fand の組み立て（B1 の受け口）
+
+
+def _open_with_hint_domain(short_dir: Path) -> Any:
+    document = channel_document(short_dir / "run")
+    provisional = {"status": "provisional", "basis": "test"}
+    document["limits"]["max_shadow_record_bytes"] = {"value": 32_768, **provisional}
+    document["limits"]["packet_overhead_bytes"] = {"value": 4_096, **provisional}
+    document["hint_domain"] = {
+        "domain_lookback_ms": {"value": LOOKBACK_MS, **provisional},
+        "domain_stale_after_ms": {"value": STALE_MS, **provisional},
+        "pending_domain_result_ms": {"value": PENDING_MS, **provisional},
+        "max_pending_domain_results": {"value": MAX_PENDING, **provisional},
+    }
+    config = short_dir / "learned-channel.yaml"
+    config.write_text(yaml.safe_dump(document), "utf-8")
+    entry = open_learned_channel(
+        config,
+        run_id=RUN_ID,
+        tick_deadline_ms=500,
+        monotonic=SystemMonotonicClock(),
+        server_uid=os.geteuid(),
+        groups=FakeGroups(),
+        peer=FakePeer(),
+    )
+    assert entry is not None
+    return entry
+
+
+def test_fand_attaches_the_intake_only_for_a_certified_b1_run(
+    short_dir: Path, no_file_groups: None, tmp_path: Path, rules: Any, world: Any
+) -> None:
+    """照合が通り ``hint_domain`` があれば、fand は受け口と書き手を開いて受付に渡す。"""
+    from types import SimpleNamespace
+
+    from coldaisle.control.config import ControlConfig
+    from coldaisle.control.supervisor.workload_hint import HintCertificationLatch
+    from coldaisle.control_daemon import _learned_hint_certification, _open_hint_shadow
+    from coldaisle.learned_channel.registry_watch import read_startup_registry
+    from test_hint_certification import run_verify
+    from test_hint_certify import REGISTRY_LIMITS_DIR
+
+    control = ControlConfig.from_directory(world.config_dir)
+    startup = read_startup_registry(
+        world.root, limits_dir=REGISTRY_LIMITS_DIR, hint_latch=HintCertificationLatch()
+    )
+    certified = run_verify(world)
+    assert certified.certified
+    entry = _open_with_hint_domain(short_dir)
+    try:
+        learned_hint = _learned_hint_certification(entry, certified)
+        assert learned_hint is not None
+        common: dict[str, Any] = {
+            "learned": entry,
+            "registry_binding": startup.binding,
+            "rules": rules,
+            "wall": SimulatedClock(0),
+            "run_id": RUN_ID,
+        }
+        config = SimpleNamespace(db=tmp_path / "coldaisle.db")
+        # 照合が通らない run は開かない（受付は hint_shadow を unsupported_body で捨てる）
+        failed = run_verify(world, lockfile=None)
+        assert (
+            _open_hint_shadow(
+                config,  # type: ignore[arg-type]
+                control,
+                certification=failed,
+                learned_hint_certification=_learned_hint_certification(entry, failed),
+                **common,
+            )
+            is None
+        )
+        opened = _open_hint_shadow(
+            config,  # type: ignore[arg-type]
+            control,
+            certification=certified,
+            learned_hint_certification=learned_hint,
+            **common,
+        )
+        assert opened is not None
+        intake, writer = opened
+        assert entry.server._hint_shadow is intake
+        assert intake.latest_counters() is None
+        writer.stop(timeout_s=5.0)
+    finally:
+        entry.stop()
+
+
+def test_a_sent_frame_is_reduced_to_its_axes_and_the_hint_key(
+    spec: HintGateSpec, sample_frame: Any
+) -> None:
+    """frame はヒントの workload を運ばないので、band から設定の対応表で鍵を引き直す。"""
+    from coldaisle.control.schema import WorkloadHintKind
+    from hint_frame_world import with_hint
+
+    frame = with_hint(sample_frame)
+    hint = frame.supervisor_hint
+    assert hint is not None and frame.supervisor is not None
+    tracker = HintDomainTracker(
+        spec=spec,
+        cpu_temperature_metric=CPU_METRIC,
+        gpu_temperature_metric=GPU_METRIC,
+        lookback_ms=LOOKBACK_MS,
+        stale_after_ms=STALE_MS,
+        pending_ms=PENDING_MS,
+        max_pending=MAX_PENDING,
+        hint_keys={(hint.regime, hint.target_band): (WorkloadHintKind.TRAINING,)},
+    )
+    axes = tracker.axes(frame)
+    assert axes.key == (
+        frame.snapshot.tick_id,
+        frame.snapshot.ts_ms,
+        frame.snapshot.monotonic_ms,
+    )
+    assert axes.applied == frame.applied
+    assert axes.hint is not None
+    assert axes.hint.key == (hint.regime.value, "training")
+    # 区間の全 frame は**基準の** upper_c で測る（0156 §2.4）
+    assert axes.hint.cpu_upper_c == frame.supervisor.target_band.cpu_temperature.upper_c
+    assert axes.hint.safety_floor == frame.safety_floor
+    # 設定の対応表に無い band の鍵は引けない（判定 1 で外）
+    other = HintDomainTracker(
+        spec=spec,
+        cpu_temperature_metric=CPU_METRIC,
+        gpu_temperature_metric=GPU_METRIC,
+        lookback_ms=LOOKBACK_MS,
+        stale_after_ms=STALE_MS,
+        pending_ms=PENDING_MS,
+        max_pending=MAX_PENDING,
+        hint_keys={},
+    )
+    reduced = other.axes(frame)
+    assert reduced.hint is not None and reduced.hint.key is None
+    assert other.axes(sample_frame).hint is None

@@ -2,14 +2,13 @@
 
 実機なし（simulated backend・注入した時計・偽の受け渡し口・偽の frame の送り出し）。
 
-``IMPLEMENTED_STAGE`` は ``OBSERVE`` のまま（上げるのは PR-C）。埋める経路は、**試験の中で**
-実装の上限を ``monkeypatch`` で ``SHADOW_MPC`` に差し替えて確かめる（本番のコードに試験用の
-抜け道を作らない）。
+``IMPLEMENTED_STAGE`` は PR-C の最後のコミットで ``SHADOW_MPC`` に上げた（0162 §2.5）。
+照合が通らない run は B0 に留まり、埋めない。
 
 守りたいこと（0162 §2.1）:
 
 1. 実効の段階が B1 以上の tick だけ、``supervisor_hint`` と ``hint_certification`` が組で入る。
-   いまの実装の上限（B0）では、照合が通っていても入らない
+   照合が通らない run（実効は B0）では入らない
 2. 0133 §2.5 の関係に合わなければ両方 None で、frame そのものは送る（基準の frame を失わない）
 3. 同じ入力に対し、``stage: off`` と B1 で各 tick の ``requested`` / ``effective`` が一致する
 4. Safety / Guard / Fallback / hardware は frame の新しい型・判定の module を import しない
@@ -26,6 +25,7 @@ from coldaisle.clock import ManualMonotonicClock, SimulatedClock
 from coldaisle.control.learned_handoff import LearnedFrame, supervisor_hint_relation_holds
 from coldaisle.control.schema import (
     ControlTick,
+    HintPriorSkipped,
     WorkloadHintInfluence,
     WorkloadHintStage,
     Zone,
@@ -57,9 +57,9 @@ def catalog() -> MetricCatalog:
 
 
 @pytest.fixture
-def b1_implemented(monkeypatch: pytest.MonkeyPatch) -> None:
-    """**試験の中だけ**実装の上限を B1 にする（PR-C で本番の値を上げるまでの確かめ方）。"""
-    monkeypatch.setattr(workload_hint_module, "IMPLEMENTED_STAGE", WorkloadHintStage.SHADOW_MPC)
+def b1_implemented() -> None:
+    """実装の上限が B1 であること（PR-C の最後のコミットで上げた。0162 §2.5）。"""
+    assert workload_hint_module.IMPLEMENTED_STAGE is WorkloadHintStage.SHADOW_MPC
 
 
 def staged_policy(stage: str) -> dict[str, Any]:
@@ -139,16 +139,31 @@ def test_b1_fills_both_fields_only_on_ticks_that_would_override(catalog: MetricC
         assert hint.target_band != frame.supervisor.target_band
 
 
-def test_the_current_implementation_ceiling_never_fills_the_hint(catalog: MetricCatalog) -> None:
-    """``IMPLEMENTED_STAGE`` が B0 の間は、照合が通っていても埋めない（0162 §2.5 の PR-A の行）。"""
-    assert workload_hint_module.IMPLEMENTED_STAGE is WorkloadHintStage.OBSERVE
-    h, sink = harness(catalog)
+def test_an_uncertified_run_never_fills_the_hint(catalog: MetricCatalog) -> None:
+    """照合が通らない run は B0 に留まり、埋めない（0133 §2.6 / 0152 §2.4）。"""
+    h, sink = harness(catalog, certified=False)
     pairs = run(h, sink)
     assert any(_would_override(tick) for tick, _ in pairs)
     for tick, frame in pairs:
         assert tick.workload_hint is not None
         assert tick.workload_hint.stage is WorkloadHintStage.OBSERVE
         assert frame.supervisor_hint is None and frame.hint_certification is None
+        if _would_override(tick):
+            assert tick.workload_hint.skipped is HintPriorSkipped.CERTIFICATION_MISMATCH
+
+
+@pytest.mark.usefixtures("b1_implemented")
+def test_a_certified_run_at_b1_does_not_report_a_certification_mismatch(
+    catalog: MetricCatalog,
+) -> None:
+    """``active`` の設定でも実装の上限で B1 に留まるだけで、認証の失敗ではない（0152 §2.4）。"""
+    h, sink = harness(catalog, stage="active")
+    pairs = run(h, sink)
+    assert any(_would_override(tick) for tick, _ in pairs)
+    for tick, _frame in pairs:
+        assert tick.workload_hint is not None
+        assert tick.workload_hint.stage is WorkloadHintStage.SHADOW_MPC
+        assert tick.workload_hint.skipped is not HintPriorSkipped.CERTIFICATION_MISMATCH
 
 
 @pytest.mark.usefixtures("b1_implemented")

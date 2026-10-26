@@ -2257,9 +2257,12 @@ class WorkloadHintStage(StrEnum):
     OBSERVE = "observe"
     """B0: 読み、状態を進め、「効かせていたら選んだ context」を記録するだけ。Demand は変えない。"""
     SHADOW_MPC = "shadow_mpc"
-    """B1: B0 に加え、Shadow solver の二重解法を記録する。**未実装**（実効は B0 に留まる）。"""
+    """B1: B0 に加え、Shadow solver の二重解法を ``hint_shadow_records`` に記録する。
+
+    Demand は変えない。証明書の照合が通らなければ実効は B0 に留まる（0152 §2.4）。
+    """
     ACTIVE = "active"
-    """B2: 再検査を通ったヒント有りの plan を Gate へ渡す。**未実装**（実効は B0 に留まる）。"""
+    """B2: 再検査を通ったヒント有りの plan を Gate へ渡す。**未実装**（実効は B1 に留まる）。"""
 
 
 _WORKLOAD_HINT_STAGE_ORDER = (
