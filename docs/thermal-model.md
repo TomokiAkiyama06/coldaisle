@@ -2,7 +2,7 @@
 
 Issue #84のうち、実機datasetなしで検証できるartifact・学習・読み取り専用推論の契約を
 実装する。設計判断は[決定記録0048](decisions/0048-thermal-model-artifact-and-inference.md)に
-記録している。決定記録は`Proposed`であり、実データ評価とproduction利用は未承認である。
+記録している。決定記録は`FINAL`（2026-09-19、PR #143のマージ）だが、実データ評価とproduction利用は未承認である。
 
 ## 対応範囲
 
@@ -128,8 +128,8 @@ Dataset v1はanchor ControlTickのactionしか持たず、各targetまでの後�
 actionを候補値へ変えたcounterfactual予測や#86 MPC optimizerの内部modelとして使ってはならない。
 これには、将来のeffective action trajectoryまたはaction holdを証明するDataset schemaの追加が要る。
 
-また、#84の最低予測対象にある`d.case_delta`は現行`config/metrics.yaml`に未登録で、Dataset v1は
-保存済みmetricから派生targetを作らない。`air.rear_exhaust`と`air.front_intake`の品質・時刻を保った
+また、#84の最低予測対象にある`d.case_delta`は`config/metrics.yaml`に派生値（`air.rear_exhaust` −
+`air.front_intake`）として登録されたが、Dataset v1は保存済みmetricから派生targetを作らない。`air.rear_exhaust`と`air.front_intake`の品質・時刻を保った
 versioned derived-target契約が必要である。
 
 実機到着後に最低限、次を完了するまでIssue #84をcloseしない。
@@ -223,8 +223,8 @@ step の OOD の記録は段 6（#105）で行う。
 ## Learned MPC への束縛（決定記録 0079 段 4 / 0084 / 0087 §2.5）
 
 `control/mpc/`。Gate / Guard / Safety・`ControlTick`・`fan-policy.yaml` の版は変えない。新しいしきい値・
-設定値は足していない。MPC worker のプロセス（決定記録 0077 段階 3）はまだ無いので、ここは worker の外で
-試験できる境界までである。
+設定値は足していない。この節は worker の外で試験できる境界を書く。MPC worker のプロセス（決定記録 0077 段階 3）は
+PR #260 で `coldaisle-learnd --role mpc`（`src/coldaisle/learned_worker/`。決定記録 0107 / 0113）として入った。
 
 - **束縛**（`MpcModelBinding.from_verified_artifact(verified, metric_catalog=, calibration=,
   authority_stage=, expected_model_version=)`）: Registry が発行した `VerifiedArtifact` を1つ受け取り、
@@ -244,5 +244,5 @@ step の OOD の記録は段 6（#105）で行う。
 - **読み込みの失敗**（`LearnedMpcRuntime.load`）: 検査・較正・格子・authority・版のどれで外れても
   起動を止めず、以後の提案を `MODEL_LOAD_FAILURE`（`failure_reason` 付き）にする。Gate は Fallback を選ぶ
 - **runtime の較正**: `coldaisle-fand --calibration <path>` が起動時に1回だけ読み、`RuntimeCalibration`
-  （読めなければ `unavailable` と構造化ログ）を作る。既定の path は置かない。worker の loader へ渡す経路は
-  worker の実装と合わせて決める（Issue #86）
+  （読めなければ `unavailable` と構造化ログ）を作る。既定の path は置かない。worker の loader へは
+  `LearnedFrame` の `calibration` で運ぶ（worker は較正ファイルを読まない。決定記録 0101）
