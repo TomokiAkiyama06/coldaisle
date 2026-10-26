@@ -3,6 +3,7 @@
 - **種別**: Decision Record
 - **Status**: FINAL（2026-10-19、リポジトリ所有者の承認。§5 の 1 点は推奨の案）
 - **Date**: 2026-10-16（2026-10-19 に範囲を絞って書き直し。§1）
+- **Superseded by**: [0174](0174-no-airflow-characterization.md)（導入先で掃引と応答の行列を測り結果を承認する予定（§2.7 の 3・4）と §2.12 の EFU の定義を待つ部分のみ＝測らない。測り方の定義と解析の道具は有効）
 - **Supersedes**: なし
 - **関連**: [`0026`](0026-three-zone-fan-control.md) /
   [`0028`](0028-fan-control-contracts.md) §2.4 / §2.5 (a) /
