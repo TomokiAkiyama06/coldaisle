@@ -1,7 +1,7 @@
 # 決定記録 0173: 取り込みのデーモンの RSS が 24 時間で増加傾向を示さないことの測り方と判定基準
 
 - **種別**: Decision Record
-- **Status**: Proposed
+- **Status**: FINAL（2026-10-26、リポジトリ所有者の承認。§5 の 1〜8 はすべて推奨の案）
 - **Date**: 2026-10-26
 - **Supersedes**: なし（[`0070`](0070-soak-acceptance-interpretation.md) の読み方に RSS の項目を足す。0070 の決定は変えない）
 - **関連**: `issues/15-soak-test.md` / [`0070`](0070-soak-acceptance-interpretation.md) /
