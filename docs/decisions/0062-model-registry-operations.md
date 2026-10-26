@@ -4,7 +4,8 @@
 - **Status**: FINAL（2026-09-21、リポジトリ所有者が承認）
 - **Date**: 2026-09-21
 - **Supersedes**: なし
-- **Superseded by**: [0150](0150-train-cli.md)（§2.1 の `register` のうち、`--metadata` / `--payload` で `kind` = `thermal_model` かつ `capability` = `counterfactual_action` の artifact を登録できる点のみ。その組は `register --training-output` からだけ登録する。他の点は有効。0150 は FINAL）
+- **Superseded by**: [0150](0150-train-cli.md)（§2.1 の `register` のうち、`--metadata` / `--payload` で `kind` = `thermal_model` かつ `capability` = `counterfactual_action` の artifact を登録できる点のみ。その組は `register --training-output` からだけ登録する。他の点は有効。0150 は FINAL） /
+  [0172](0172-thermal-offline-evaluation.md)（§2.1 の `validate` のうち、`kind` = `thermal_model` かつ `capability` = `counterfactual_action` の artifact を自由記述の `--offline-evaluation-ref` で validated にできる点のみ＝評価の報告を照合する経路だけにする。0062 の他の点は変えない）
 - **関連**: [`docs/model-registry.md`](../model-registry.md)、
   [`0030-control-decision-trace-storage.md`](0030-control-decision-trace-storage.md) §2、
   [`0037-model-registry-rollback-target.md`](0037-model-registry-rollback-target.md) §2 / §5、

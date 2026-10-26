@@ -3,6 +3,7 @@
 - **種別**: Decision Record
 - **Status**: FINAL（2026-08-25、PR #23 のマージ）
 - **Date**: 2026-08-25
+- **Superseded by**: [0171](0171-daily-report-thread.md)（§2.4 の出力先 `var/reports/` へ毎日ファイルを書く点と、§2.5 の末尾の「全文はファイルに残し、通知は長ければ切る」のみ＝ファイルに保存しない。集計・欠けの扱い・`Router` を通さない方針は有効）
 - **Supersedes**: なし
 - **関連**: [`0002-metric-naming.md`](0002-metric-naming.md) §2.8 /
   [`0004-storage-read-contract.md`](0004-storage-read-contract.md) §2.9 /
