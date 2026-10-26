@@ -313,7 +313,8 @@ def test_cli_skips_the_summary_when_the_list_is_malformed(tmp_path, rules, monke
     config_path = tmp_path / "report.yaml"
     config_path.write_text(
         f"timezone: Asia/Tokyo\noutput_dir: {tmp_path / 'out'}\nto: []\nsummarise: true\n"
-        "max_alerts: 20\nmax_notification_chars: 3500\nllm_excluded_metrics: oops\n"
+        'max_alerts: 20\nmax_notification_chars: 3500\nthread_title: "{month}月{day}日"\n'
+        "llm_excluded_metrics: oops\n"
         "llm_excluded_rules: []\n",
         encoding="utf-8",
     )

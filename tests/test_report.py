@@ -88,6 +88,7 @@ def config(tmp_path) -> ReportConfig:
         summarise=True,
         max_alerts=20,
         max_notification_chars=3500,
+        thread_title="📄 {month}月{day}日の振り返り",
     )
 
 
@@ -434,6 +435,7 @@ def _config_with(**overrides) -> ReportConfig:
         "summarise": True,
         "max_alerts": 20,
         "max_notification_chars": 3500,
+        "thread_title": "📄 {month}月{day}日の振り返り",
     }
     return ReportConfig(**{**base, **overrides})
 
@@ -477,6 +479,43 @@ def test_notification_is_titled_as_a_report(store, catalog):
     assert notification.kind == "report"
 
 
+def test_thread_title_is_month_and_day_without_year_or_padding():
+    """親の題は対象日の月日だけ。0 埋めしない・年を付けない（決定記録 0171）。"""
+    shipped = ReportConfig.from_yaml(CONFIG_DIR / "report.yaml")
+    assert shipped.thread_title_for(date(2026, 10, 25)) == "📄 10月25日の振り返り"
+    assert shipped.thread_title_for(date(2026, 3, 5)) == "📄 3月5日の振り返り"
+
+
+@pytest.mark.parametrize("template", ["{mon}月{day}日", "{0}", "{month", "   "])
+def test_config_rejects_a_broken_thread_title(template):
+    with pytest.raises(ValueError, match="thread_title"):
+        _config_with(thread_title=template)
+
+
+def test_thread_title_does_not_change_the_text(store, catalog):
+    """親の題は `as_text()` に入らない。Webhook・LINE・stdout の本文と長さは今までどおり。"""
+    report = report_for(store, catalog)
+    plain = as_notification(report, dashboard_url="http://x/", max_chars=500)
+    titled = as_notification(
+        report, dashboard_url="http://x/", max_chars=500, thread_title="📄 8月24日の振り返り"
+    )
+    assert titled.thread_title == "📄 8月24日の振り返り"
+    assert plain.thread_title == ""
+    assert titled.as_text() == plain.as_text()
+    assert "振り返り" not in titled.as_text()
+
+
+def test_non_slack_destinations_get_the_same_single_message(store, catalog):
+    """Slack 以外（LINE・stdout など）は 1 通のまま。親の題を送らない。"""
+    recorder = Recorder()
+    notification = as_notification(
+        report_for(store, catalog), dashboard_url="", max_chars=9999, thread_title="題"
+    )
+    assert send(notification, {"line": recorder}, ["line"]) == 1
+    assert len(recorder.sent) == 1
+    assert recorder.sent[0].as_text() == notification.as_text()
+
+
 def test_a_failing_destination_does_not_stop_the_others(store, catalog):
     """**1日1回しか出ない。** 1つ落ちても残りへ送る。"""
     good, bad = Recorder(), Recorder(fail=True)
@@ -498,7 +537,7 @@ def test_config_rejects_a_misspelled_timezone(tmp_path):
     path = tmp_path / "report.yaml"
     path.write_text(
         "timezone: Asia/Tokio\noutput_dir: var/reports\nto: []\nsummarise: false\n"
-        "max_alerts: 20\nmax_notification_chars: 3500\n",
+        'max_alerts: 20\nmax_notification_chars: 3500\nthread_title: "{month}月{day}日"\n',
         encoding="utf-8",
     )
     with pytest.raises(ValueError, match="タイムゾーン"):
@@ -518,7 +557,7 @@ def test_cli_writes_a_file_without_sending(tmp_path, rules, catalog):
     config_path = tmp_path / "report.yaml"
     config_path.write_text(
         f"timezone: Asia/Tokyo\noutput_dir: {tmp_path / 'out'}\nto: []\nsummarise: false\n"
-        "max_alerts: 20\nmax_notification_chars: 3500\n",
+        'max_alerts: 20\nmax_notification_chars: 3500\nthread_title: "{month}月{day}日"\n',
         encoding="utf-8",
     )
     assert (

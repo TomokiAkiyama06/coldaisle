@@ -46,3 +46,10 @@ max_alerts: 20
 
 # 通知に載せる文字数。全文はファイルに残ります（LINE は5000文字で切られる）
 max_notification_chars: 3500
+
+# Slack の Bot（`COLDAISLE_SLACK_BOT_TOKEN` / `COLDAISLE_SLACK_CHANNEL`）で送るときの親の題（決定記録 0171）。
+#
+# チャンネルにはこの題だけを送り、レポートの本文はそのスレッドへ返します。`{month}` と `{day}` に
+# 対象日の月と日が 0 埋めせずに入ります（年は付けません）。Webhook だけのとき・LINE・stdout では
+# 使いません（今までどおり 1 通）。
+thread_title: "📄 {month}月{day}日の振り返り"

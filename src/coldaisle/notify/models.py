@@ -316,6 +316,13 @@ class Notification:
     """
     body: str = ""
     """本文をそのまま渡す場合に使う（説明の全文）。"""
+    thread_title: str = ""
+    """スレッドにできる宛先で、**親として先に送る題**（日次レポート。決定記録 0171）。
+
+    空なら今までどおり 1 通。Slack の Bot（`SlackBotNotifier`）だけがこれを見て、題だけの親を
+    送ってから `as_text()` をそのスレッドへ返す。Webhook・LINE・stdout は見ない（`as_text()` にも
+    入れない）ので、宛先ごとの本文は変わらない。
+    """
     names: DisplayNames = field(default_factory=DisplayNames)
     """ID → 人が読む文と名前（決定記録 0142）。空なら ID のまま出す。"""
     reference: ExpectedReference | None = None

@@ -27,7 +27,7 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from coldaisle import logs
 from coldaisle.ai import provider as ai_provider
@@ -72,6 +72,29 @@ class ReportConfig(BaseModel):
     max_alerts: int = Field(ge=1)
     max_notification_chars: int = Field(ge=500)
     """通知に載せる長さ。**全文はファイルに残る。** LINE は5000文字で切られる。"""
+    thread_title: str
+    """Slack の Bot で送るときの親の題の書式（決定記録 0171）。`{month}` と `{day}` だけを使える。
+
+    対象日の月と日を 0 埋めせずに入れる。Webhook・LINE・stdout では使わない（今までどおり 1 通）。
+    """
+
+    @field_validator("thread_title")
+    @classmethod
+    def _check_thread_title(cls, value: str) -> str:
+        # 綴り違いの置き場所（`{mon}` など）を毎朝の送信で初めて知ることにしない
+        try:
+            sample = value.format(month=1, day=1)
+        except (KeyError, IndexError, ValueError) as error:
+            raise ValueError(
+                f"thread_title の書式が不正（使えるのは {{month}} と {{day}} だけ）: {value!r}"
+            ) from error
+        if not sample.strip():
+            raise ValueError("thread_title が空")
+        return value
+
+    def thread_title_for(self, day: date) -> str:
+        """対象日の親の題（例 `📄 10月25日の振り返り`）。"""
+        return self.thread_title.format(month=day.month, day=day.day)
 
     @property
     def zone(self) -> ZoneInfo:
@@ -531,8 +554,14 @@ def write(report: DailyReport, out_dir: Path) -> Path:
     return path
 
 
-def as_notification(report: DailyReport, *, dashboard_url: str, max_chars: int) -> Notification:
-    """通知1通ぶん。**長ければ切る**（全文はファイルに残っている）。"""
+def as_notification(
+    report: DailyReport, *, dashboard_url: str, max_chars: int, thread_title: str = ""
+) -> Notification:
+    """通知1通ぶん。**長ければ切る**（全文はファイルに残っている）。
+
+    `thread_title` は Slack の Bot だけが使う親の題（決定記録 0171）。本文（`as_text()`）と
+    長さの上限はこれに関係なく同じで、スレッドへ返す本文は今までの 1 通と同じ文になる。
+    """
     text = report.as_markdown()
     if len(text) > max_chars:
         text = text[:max_chars].rstrip() + f"\n\n…（全文は {report.day.isoformat()}.md）"
@@ -546,6 +575,7 @@ def as_notification(report: DailyReport, *, dashboard_url: str, max_chars: int) 
         dashboard_url=dashboard_url,
         kind="report",
         body=text,
+        thread_title=thread_title,
     )
 
 
@@ -555,6 +585,10 @@ def send(notification: Notification, notifiers: dict[str, Notifier], to: Sequenc
     **`Router` は通さない。** 連投の抑制・夜間の方針・重大度の振り分けは
     どれもアラートの都合であって、決まった時刻に1通出すレポートには当たらない。
     分岐を足すと、アラートを鳴らすかどうかの判定が読みにくくなる。
+
+    **数えるのは本文が届いた宛先。** Slack の Bot で題だけの親が届いても、本文が
+    スレッドにもチャンネルにも届かなければ数えない（`SlackBotNotifier` が例外を投げる。
+    決定記録 0171）。
     """
     sent = 0
     for name in to:
@@ -664,6 +698,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 report,
                 dashboard_url=notify_config.dashboard_url,
                 max_chars=config.max_notification_chars,
+                thread_title=config.thread_title_for(day),
             ),
             notifiers_from_env(),
             config.to,

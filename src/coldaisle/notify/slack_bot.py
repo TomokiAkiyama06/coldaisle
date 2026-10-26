@@ -193,6 +193,9 @@ class SlackApi:
 class SlackBotNotifier:
     """`chat.postMessage` で本文を送る宛先。名前は Webhook と同じ `slack`（`routing` を変えない）。
 
+    通知に `thread_title` があれば、題だけの親を先に送り、本文をそのスレッドへ返す
+    （日次レポート。決定記録 0171）。
+
     **Bot の送信が失敗し、Webhook が設定されていれば、その 1 通は Webhook で送り直す**
     （0147 §2.1）。トークンの失効で critical が届かなくなるのを避ける。送り直した通知には
     グラフを添えない（スレッドの `ts` が無い）。
@@ -241,6 +244,45 @@ class SlackBotNotifier:
         self._on_posted = on_posted
 
     def send(self, notification: Notification) -> None:
+        if notification.thread_title:
+            self._send_threaded(notification)
+            return
+        self._send_one(notification)
+
+    def _send_threaded(self, notification: Notification) -> None:
+        """題だけの親を送り、本文をそのスレッドへ返す（日次レポート。決定記録 0171）。
+
+        **本文を黙って失わない。** どこで失敗しても、最後は今までと同じ 1 通（`_send_one`。
+        Bot が落ちれば Webhook）に戻す。
+
+        - 親が送れない: スレッドをあきらめ、本文を 1 通で送る（親は無い）
+        - 親は送れたが返信が送れない: 本文をスレッドでなくチャンネルへ 1 通で送る。
+          題だけの親がチャンネルに残るが、本文が無いより良い。返信が実は届いていて応答だけが
+          失われた（timeout など）なら本文が 2 通になるが、失うより重ねるほうを選ぶ
+        - 戻した 1 通も送れなければ `DeliveryError` を投げる（呼び出し側が送れなかったと数える）
+
+        `on_posted`（アラートのグラフの依頼）は呼ばない。スレッドはレポートのためのもので、
+        グラフを添える対象でもない（0147 §2.1）。
+        """
+        try:
+            parent_ts = self.api.post_message(self.channel, notification.thread_title)
+        except DeliveryError as error:
+            LOGGER.warning(
+                "スレッドの親を送れなかったので、本文を 1 通で送る",
+                extra={logs.FIELDS_KEY: {"rule": notification.rule_id, "reason": str(error)}},
+            )
+            self._send_one(notification)
+            return
+        try:
+            self.api.post_message(self.channel, notification.as_text(), thread_ts=parent_ts)
+        except DeliveryError as error:
+            LOGGER.warning(
+                "スレッドへ本文を返せなかったので、本文をチャンネルへ 1 通で送る",
+                extra={logs.FIELDS_KEY: {"rule": notification.rule_id, "reason": str(error)}},
+            )
+            self._send_one(notification)
+
+    def _send_one(self, notification: Notification) -> None:
         try:
             ts = self.api.post_message(self.channel, notification.as_text())
         except DeliveryError as error:

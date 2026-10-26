@@ -578,6 +578,154 @@ def test_on_posted_failure_does_not_fail_the_text():
     SlackBotNotifier(api(FakeSlack()), CHANNEL, on_posted=broken).send(firing())
 
 
+# ---------------------------------------------------------------- 日次レポートのスレッド（0171）
+
+OK = "ok"
+FAIL = httpx.Response(200, json={"ok": False, "error": "ratelimited"})
+
+
+class ScriptedSlack:
+    """`chat.postMessage` に、決めた順で成功（`OK`）か失敗の応答を返す偽物。"""
+
+    def __init__(self, *script: object) -> None:
+        self.payloads: list[dict[str, object]] = []
+        self._script = list(script)
+
+    def __call__(self, request: httpx.Request) -> httpx.Response:
+        assert str(request.url).endswith("/chat.postMessage")
+        self.payloads.append(json.loads(request.content))
+        step = self._script.pop(0) if self._script else OK
+        if isinstance(step, httpx.Response):
+            return step
+        return httpx.Response(200, json={"ok": True, "ts": f"1787626800.00020{len(self.payloads)}"})
+
+
+class WebhookRecorder:
+    def __init__(self) -> None:
+        self.texts: list[str] = []
+
+    def __call__(self, request: httpx.Request) -> httpx.Response:
+        self.texts.append(json.loads(request.content)["text"])
+        return httpx.Response(200)
+
+    def notifier(self) -> SlackNotifier:
+        return SlackNotifier(
+            "https://hooks.example.invalid/x",
+            client=httpx.Client(transport=httpx.MockTransport(self)),
+        )
+
+
+def report_notification(thread_title: str = "📄 10月25日の振り返り") -> Notification:
+    return Notification(
+        rule_id="日次レポート 2026-10-25",
+        severity=AlertSeverity.INFO,
+        state="report",
+        metric=None,
+        value=None,
+        detail=None,
+        dashboard_url="http://127.0.0.1:8000/",
+        kind="report",
+        body="# 日次レポート 2026-10-25\n\n本文",
+        thread_title=thread_title,
+    )
+
+
+def bot(
+    slack: ScriptedSlack,
+    *,
+    fallback: SlackNotifier | None = None,
+    posted: list[str] | None = None,
+) -> SlackBotNotifier:
+    seen = posted if posted is not None else []
+    return SlackBotNotifier(
+        SlackApi(TOKEN, client=httpx.Client(transport=httpx.MockTransport(slack))),
+        CHANNEL,
+        fallback=fallback,
+        on_posted=lambda n, c, ts: seen.append(ts),
+    )
+
+
+def test_report_goes_as_a_title_then_a_reply_in_its_thread():
+    """親は題だけ、本文は親の ts を `thread_ts` にした返信。グラフの依頼はしない。"""
+    slack = ScriptedSlack()
+    posted: list[str] = []
+    notification = report_notification()
+    bot(slack, posted=posted).send(notification)
+    assert slack.payloads == [
+        {"channel": CHANNEL, "text": "📄 10月25日の振り返り"},
+        {
+            "channel": CHANNEL,
+            "text": notification.as_text(),
+            "thread_ts": "1787626800.000201",
+        },
+    ]
+    assert posted == []
+
+
+def test_report_without_a_thread_title_is_one_message():
+    slack = ScriptedSlack()
+    bot(slack).send(report_notification(thread_title=""))
+    assert len(slack.payloads) == 1
+    assert "thread_ts" not in slack.payloads[0]
+
+
+def test_failed_reply_sends_the_text_to_the_channel(caplog):
+    """返信が落ちたら、本文をスレッドでなくチャンネルへ 1 通で送る（黙って失わない）。"""
+    slack = ScriptedSlack(OK, FAIL, OK)
+    notification = report_notification()
+    with caplog.at_level(logging.WARNING, logger="coldaisle.notify"):
+        bot(slack).send(notification)
+    assert [p.get("thread_ts") for p in slack.payloads] == [None, "1787626800.000201", None]
+    assert slack.payloads[2]["text"] == notification.as_text()
+    assert "スレッドへ本文を返せなかった" in caplog.text
+    assert TOKEN not in caplog.text
+
+
+def test_failed_title_sends_the_text_as_one_message(caplog):
+    """親が落ちたら、スレッドをあきらめて今と同じ 1 通で送る。"""
+    slack = ScriptedSlack(FAIL, OK)
+    notification = report_notification()
+    with caplog.at_level(logging.WARNING, logger="coldaisle.notify"):
+        bot(slack).send(notification)
+    assert slack.payloads[1] == {"channel": CHANNEL, "text": notification.as_text()}
+    assert "スレッドの親を送れなかった" in caplog.text
+
+
+@pytest.mark.parametrize("script", [(FAIL, FAIL), (OK, FAIL, FAIL)])
+def test_when_the_bot_cannot_send_the_text_the_webhook_gets_one_message(script):
+    """Bot で本文を送れなければ、Webhook で今と同じ 1 通を送る（0147 §2.1 の送り直し）。"""
+    webhook = WebhookRecorder()
+    notification = report_notification()
+    bot(ScriptedSlack(*script), fallback=webhook.notifier()).send(notification)
+    assert webhook.texts == [notification.as_text()]
+
+
+@pytest.mark.parametrize("script", [(FAIL, FAIL), (OK, FAIL, FAIL)])
+def test_when_the_text_reaches_nowhere_it_raises(script):
+    """本文がどこにも届かなければ例外。日次レポートの `send` は送れなかったと数える。"""
+    with pytest.raises(DeliveryError):
+        bot(ScriptedSlack(*script)).send(report_notification())
+
+
+def test_webhook_only_sends_the_report_as_one_message():
+    """Bot が無く Webhook だけなら今と同じ 1 通。親の題は送らない。"""
+    webhook = WebhookRecorder()
+    notification = report_notification()
+    webhook.notifier().send(notification)
+    assert webhook.texts == [notification.as_text()]
+    assert "振り返り" not in webhook.texts[0]
+
+
+def test_report_send_counts_only_destinations_the_text_reached():
+    """題だけ届いて本文が届かない Slack は数えない（`coldaisle.report.send`）。"""
+    from coldaisle.report import send
+
+    failing = bot(ScriptedSlack(OK, FAIL, FAIL))
+    working = bot(ScriptedSlack())
+    assert send(report_notification(), {"slack": failing}, ["slack"]) == 0
+    assert send(report_notification(), {"slack": working}, ["slack"]) == 1
+
+
 def test_from_env_prefers_the_bot_and_keeps_the_webhook_as_fallback(monkeypatch):
     monkeypatch.setenv(SLACK_BOT_TOKEN_ENV, TOKEN)
     monkeypatch.setenv(SLACK_CHANNEL_ENV, CHANNEL)
