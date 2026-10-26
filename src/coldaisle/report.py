@@ -294,10 +294,9 @@ class DailyReport:
         ]
         if peaks:
             lines += ["", "*主な値（最高）*", *peaks]
+        # 表で 0.0% と見えるもの（数サンプルの欠け・浮動小数の端数）は出さない。基準は表と同じ
         missing = [
-            line.label
-            for line in self.metrics
-            if line.missing_ratio is not None and line.missing_ratio > 0
+            f"{line.label} {_missing(line)}" for line in self.metrics if _missing_shown(line)
         ]
         incomplete = any(0 < line.minutes < MINUTES_PER_DAY for line in self.metrics)
         if missing or incomplete:
@@ -440,11 +439,30 @@ def _delta(value: float | None, previous: float | None) -> str:
     return f"{value - previous:+.2f}"
 
 
+def _missing_percent(line: MetricLine) -> float | None:
+    """表に出す欠測率（% の小数第 1 位に丸めた値）。表と要点の**唯一の基準**（決定記録 0171 §2.2）。
+
+    `1.0 - 届いた数 / 期待数` は浮動小数の端数や数サンプルの欠けで 0 をわずかに超える。
+    丸めた値で判定しないと、表では 0.0% の metric が要点の「欠測」に並ぶ。
+    """
+    if line.missing_ratio is None:
+        return None
+    # `-0.0` を `0.0` に揃える（届いた数が期待数をわずかに超えたとき）
+    return round(line.missing_ratio * 100, 1) + 0.0
+
+
+def _missing_shown(line: MetricLine) -> bool:
+    """表で 0.0% でない（要点の「欠測」に名前を出す）か。"""
+    percent = _missing_percent(line)
+    return percent is not None and percent > 0
+
+
 def _missing(line: MetricLine) -> str:
     """欠測率。**母数が1日ぶんに満たないなら、その分数も書く。**"""
-    if line.missing_ratio is None:
+    percent = _missing_percent(line)
+    if percent is None:
         return "—"
-    text = f"{line.missing_ratio * 100:.1f}%"
+    text = f"{percent:.1f}%"
     return text if line.missing_minutes >= line.minutes else f"{text}（{line.missing_minutes}分）"
 
 

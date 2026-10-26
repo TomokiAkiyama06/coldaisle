@@ -22,6 +22,7 @@ from coldaisle.notify.models import Notification
 from coldaisle.report import (
     MINUTES_PER_DAY,
     DailyReport,
+    MetricLine,
     ReportConfig,
     as_notification,
     as_thread,
@@ -557,8 +558,63 @@ def test_lead_has_alerts_summary_peaks_missing_and_link_in_order(store, catalog)
     assert "GPU消費電力 " not in lead.split("*欠測*")[0]
     assert "CPU Package温度" not in lead
     missing_line = lead.split("*欠測*\n", 1)[1].splitlines()[0]
-    assert missing_line == "GPUコア温度、GPU消費電力"
+    assert missing_line == "GPUコア温度 50.0%、GPU消費電力 100.0%"
     assert "|" not in lead, "表は画像で送る"
+
+
+def _report_with_missing(*lines: MetricLine) -> DailyReport:
+    return DailyReport(
+        day=DAY, timezone="Asia/Tokyo", metrics=lines, alerts=(), alert_total=0, prev_alert_total=0
+    )
+
+
+def _gauge(label: str, ratio: float, *, missing_minutes: int = MINUTES_PER_DAY) -> MetricLine:
+    return MetricLine(
+        metric=f"x.{len(label)}",
+        label=label,
+        unit="C",
+        counter=False,
+        minimum=20.0,
+        maximum=30.0,
+        mean=25.0,
+        missing_ratio=ratio,
+        missing_minutes=missing_minutes,
+        minutes=MINUTES_PER_DAY,
+    )
+
+
+def _missing_section(report: DailyReport) -> list[str]:
+    lead = report.lead_text(HIGHLIGHTS, "")
+    if "*欠測*" not in lead:
+        return []
+    return lead.split("*欠測*\n", 1)[1].splitlines()[0].split("、")
+
+
+def test_lead_missing_uses_the_same_rounding_as_the_table():
+    """表で 0.0% に見えるもの（数サンプル・浮動小数の端数）は要点に出さない（0171 §2.2）。"""
+    report = _report_with_missing(
+        _gauge("わずか", 0.000004),  # 0.0004 %（表では 0.0%）
+        _gauge("端数", 1 - 1439.9999999 / 1440),
+        _gauge("負の端数", 1 - 1440.0000001 / 1440),
+        _gauge("切り捨て", 0.00049),  # 0.049 %（表では 0.0%）
+        _gauge("千分の一", 0.001),  # 0.1 %
+        _gauge("全部", 1.0),
+    )
+    assert _missing_section(report) == ["千分の一 0.1%", "全部 100.0%"]
+    table = report.table_markdown()
+    assert "| わずか（x.3） | 20.00 | 25.00 | 30.00 | — | 0.0% |" in table
+    assert "-0.0%" not in table
+
+
+def test_lead_missing_carries_the_minutes_note_like_the_table():
+    report = _report_with_missing(_gauge("一部", 0.5, missing_minutes=600))
+    assert _missing_section(report) == ["一部 50.0%（600分）"]
+    assert "50.0%（600分）" in report.table_markdown()
+
+
+def test_lead_has_no_missing_section_when_everything_shows_zero():
+    report = _report_with_missing(_gauge("わずか", 0.0004 / 100))
+    assert _missing_section(report) == []
 
 
 def test_lead_never_cuts_the_summary(store, catalog):
