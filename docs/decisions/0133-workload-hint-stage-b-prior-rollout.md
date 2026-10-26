@@ -3,6 +3,7 @@
 - **種別**: Decision Record
 - **Status**: FINAL（2026-10-14、リポジトリ所有者の承認）
 - **Date**: 2026-10-14
+- **Superseded by**: [0175](0175-hint-shadow-implementation-points.md)（§2.5a の「失敗の回数は trace のヒントの塊に数える」のみ＝構造化ログに出す。保存先・追記専用・保持などは有効）
 - **Supersedes**（いずれも限定的な置き換え。旧記録は FINAL のため本文を書き換えず、`Superseded by` の追記だけを行った）:
   - [0064](0064-workload-hint-entry-and-supervisor-prior.md) §2.10 の Stage A の「**制御デーモンは読まない**」の記述
     （§2.6 の段階 B0 / B1 で制御デーモンがヒントを**読んで記録する**が、`requested_demand` は1ビットも変えない。
