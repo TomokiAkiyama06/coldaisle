@@ -1,12 +1,11 @@
 # 決定記録 0172: 反実仮想 Thermal Model の offline 評価の形と `offline_evaluation_ref`（読み取り専用の評価の CLI・未学習の baseline との比較・合否の置き場所・Registry の検証）
 
 - **種別**: Decision Record
-- **Status**: Proposed
+- **Status**: FINAL（2026-10-26、リポジトリ所有者の承認。§5 の 1〜11 はすべて推奨の案）
 - **Date**: 2026-10-26
-- **Supersedes**: なし。ただし §5 の 9 を推奨の案で決めると、[0062](0062-model-registry-operations.md) §2.1 の `validate` のうち、
+- **Supersedes**: [0062](0062-model-registry-operations.md) §2.1 の `validate` のうち、
   `kind` = `thermal_model` かつ `capability` = `counterfactual_action` の artifact を自由記述の `--offline-evaluation-ref` で
   validated にできる点**のみ**を置き換える（0150 §5 の 14 が `register` について行ったのと同じ範囲の置き換え。0062 の他の点は変えない）。
-  そのときは承認の PR で本欄を書き直す
 - **関連**: [0031](0031-thermal-dataset-contract.md) §2.5 / [0048](0048-thermal-model-artifact-and-inference.md) §1 / §5 /
   [0050](0050-model-confidence-ood-and-authority.md) §5 の 1・2 / [0054](0054-offline-evaluation-attribution-and-gates.md) §2.4〜§2.8 /
   [0056](0056-model-drift-detection-and-retraining-triggers.md) / [0057](0057-authority-rollout-stage-changes.md) /
