@@ -3,7 +3,9 @@
 - **種別**: Decision Record
 - **Status**: FINAL（2026-10-26、リポジトリ所有者の承認。§2 の 1〜4 はすべて推奨の案）
 - **Date**: 2026-10-26
-- **Supersedes**: なし（0162・0133 の決定は変えない。記録に無かった点を足す）
+- **Supersedes**: [`0133`](0133-workload-hint-stage-b-prior-rollout.md) §2.5a の「失敗の回数は trace のヒントの塊に数える」のみ（構造化ログに出す。§2.4）/
+  [`0162`](0162-hint-b1-shadow-solver-open-points.md) §2.3 のうち、元の tick の trace の `skipped` に `mpc_unavailable` を載せる点を、本記録の実装では配線しない（PR-D の集計の後に要否を決める。§2.4・§5）点のみ。
+  ほかの 0133・0162 の決定は変えず、記録に無かった点を足す
 - **関連**: [`0133`](0133-workload-hint-stage-b-prior-rollout.md) §2.5 / §2.5a / [`0152`](0152-hint-monotonic-gate-certificate.md) / [`0157`](0157-hint-runtime-launch-form.md) /
   [`0160`](0160-hint-conditions-digest-scope.md) / [`0162`](0162-hint-b1-shadow-solver-open-points.md) §2.2・§2.3・§2.5 / [`0167`](0167-opt-update-recheck-scope.md)
 - **対象 Issue**: #288
@@ -40,8 +42,8 @@ backup を取ってから当てる**（0167 §2.3 の migration の扱い）。
 | 同じ元の tick の 2 件目 | fand は `rejected` / `duplicate_source`（0162 §2.2 の「2 件目は拒否」の reason。語彙を 1 つ足す） |
 | 元の frame の config が fand の設定と違う・記録の基準の plan が受け渡し口の基準の解と違う | `rejected` / `base_mismatch` |
 | `conditions_sha256` が無い `skipped`（子が束縛を作る前に止まった） | conditions を照らさずに受け入れ、証明書の照合だけ行う |
-| 書けなかった件数（0133 §2.5a） | trace の欄は 0162 のとおり `certificate` と `shadow_counters` だけにし、件数は構造化ログに出す |
-| `mpc_unavailable`（0162 §2.3） | 今回は配線しない（PR-D の集計の後に要否を決める） |
+| 書けなかった件数（0133 §2.5a。**置き換え**） | trace の欄は 0162 のとおり `certificate` と `shadow_counters` だけにし、件数は構造化ログに出す（0162 §2.5 の PR-C の欄の範囲と 0133 §2.5a が食い違うため、0162 に合わせる） |
+| `mpc_unavailable`（0162 §2.3。**置き換え**） | 今回は配線しない（PR-D の集計の後に要否を決める。それまで、MPC が使えない tick は trace の既存の Gate・Fallback の記録で分かる） |
 | `learned-channel.yaml` の `hint_domain` | `pending_domain_result_ms`・`max_pending_domain_results`・`limits.max_shadow_record_bytes` を必須にする。欠ければ Learned の経路だけを開かない（今の不正な設定の扱い）。行を書く待ち行列の上限は `max_pending_domain_results` を使う |
 | 基準の解が無い周期 | worker は Shadow の依頼も記録も作らない（対にする基準が無い）。PR-D の集計ではこの周期を候補から除く |
 | 子が artifact を読めない・digest が違う・L9 で束縛できない | `skipped` / `artifact_mismatch`。solve の例外は `budget_exhausted`（0133 §2.8 の「解けない」） |
