@@ -574,6 +574,49 @@ def test_numbers_and_units_are_not_taken_for_urls():
     assert sanitize("GPU は 71.0 °C、電力は 300 W です") == "GPU は 71.0 °C、電力は 300 W です"
 
 
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("GPU 温度は **29.0 ℃** です", "GPU 温度は *29.0 ℃* です"),
+        ("**吸気** は 31.5、**排気** は 48.0", "*吸気* は 31.5、*排気* は 48.0"),
+        ("**温度 < 50** & 安定", "*温度 &lt; 50* &amp; 安定"),  # エスケープと両立する
+    ],
+)
+def test_markdown_bold_becomes_slack_bold(raw, expected):
+    """LLM の `**…**` を mrkdwn の `*…*` にする（#379）。"""
+    assert sanitize(raw) == expected
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("温度は **29.0 ℃ です", "温度は 29.0 ℃ です"),  # 閉じが無い
+        ("**\n29.0 ℃**", "29.0 ℃"),  # 行をまたぐものは太字にしない
+        ("** 注意 ** 29.0 ℃", "注意  29.0 ℃"),  # 内側の両端が空白なら太字ではない
+        ("合計は 2**10 です", "合計は 2**10 です"),  # 消すと 210 という数値ができる
+    ],
+)
+def test_unpaired_markdown_bold_markers_are_removed_except_between_digits(raw, expected):
+    assert sanitize(raw) == expected
+
+
+def test_single_asterisks_and_underscores_are_left_alone():
+    """Slack の `*太字*` `_斜体_` はそのまま。
+
+    `__…__` は直さない（`gpu__core` のような名前を壊さない）。
+    """
+    assert sanitize("*注意* と _参考_ と __x__") == "*注意* と _参考_ と __x__"
+
+
+def test_bold_around_a_bare_url_leaves_no_stray_asterisk():
+    text = sanitize("**https://phish.example.invalid** を開いて")
+    assert "phish" not in text and "*" not in text
+
+
+def test_bold_markers_do_not_change_the_number_check():
+    assert invented_numbers("**29.0 ℃**", frozenset({29.0})) == []
+
+
 def test_plain_broadcast_words_and_brackets_are_defused():
     text = sanitize("@here 温度 < 50 かつ > 30 & 安定")
     assert "@here" not in text
