@@ -1,7 +1,7 @@
 # 決定記録 0170: telemetry は DB の書き込みロックの待ち切れで落ちず、その周期の書き込みだけを捨てる。保持期間の削除は metric ごとに確定する
 
 - **種別**: Decision Record
-- **Status**: Proposed
+- **Status**: FINAL（2026-10-26、リポジトリ所有者の承認）
 - **Date**: 2026-10-26
 - **Supersedes**: なし
 - **関連**: [`0002`](0002-metric-naming.md) §2.4 / [`0038`](0038-internal-telemetry-outage-counting.md) / [`0060`](0060-control-loop-runtime.md) §2.2 /
