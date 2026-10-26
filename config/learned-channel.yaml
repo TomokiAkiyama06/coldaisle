@@ -46,6 +46,19 @@ limits:
     basis: "決定記録 0077 §5（実測を待つ値）。段階 1 の試験用の設定で frame は約 6 KB。10 倍の余裕を取った暫定値"
   # listen() の待ち行列。同時に持つ接続は役割ごとに1つ（0077 §2.7）で、これはその手前の待ち行列です。
   listen_backlog: 4
+  # Workload Hint の B1 の Shadow の記録1件の上限バイト数（#288 / 決定記録 0133 §2.5）。max_message_bytes 以下。
+  # 超えた記録は切り詰めずに捨てます（worker は shadow_record_too_large に数え、fand の受信側も同じ上限で検査します）。
+  # 下の packet_overhead_bytes と組で置きます（片方だけは不正）。
+  max_shadow_record_bytes:
+    value: 32768
+    status: provisional
+    basis: "決定記録 0133 §2.5（horizon と offset の数から見積もる値）。両 plan の予測の全 offset で数 KB の見積もりに余裕を取った暫定値"
+  # 1メッセージあたりのカーネルの管理領域の見積もり。MPC worker は送信バッファ（SO_SNDBUF）を、ヒントを扱わないときの値に
+  # max_shadow_record_bytes + packet_overhead_bytes を足した値にします（基準の提案と heartbeat の空きを減らさない）。
+  packet_overhead_bytes:
+    value: 8192
+    status: provisional
+    basis: "決定記録 0133 §2.5（実測で決める値）。開発機（Linux 7.0）で 32768 B の記録の SIOCOUTQ が 37120 B（余分 4352 B）。2倍に近い余裕を取った暫定値。本番のホストで測り直す"
 
 # worker が提案・失敗を送らない間も heartbeat を送る間隔（ミリ秒）。接続を認めた最初の応答で worker へ知らせます。
 heartbeat_interval_ms:
@@ -77,3 +90,21 @@ hint_domain:
     value: 10000
     status: provisional
     basis: "決定記録 0162 §2.2（実測を待つ値）。config/quality.yaml の stale_after_ms と同じ桁の暫定値"
+
+# Learned MPC worker の Shadow solver の子プロセス（#288 / 決定記録 0133 §2.5・0162 §2.5 の PR-B）。worker だけが読みます。
+# 子は SCHED_IDLE で動き、基準の solve と送信を待たせません。この塊を省くと worker は子を作りません
+# （ヒントの依頼を解かないだけで、基準の経路は変わりません）。置くときは limits の max_shadow_record_bytes と
+# packet_overhead_bytes も要ります。
+hint_shadow:
+  # 子が死んだ・応答しない・経路が壊れたとき、作り直すまでにあける間隔（ミリ秒）。
+  # SCHED_IDLE に下げられない子は作り直しません（そのプロセスの間は Shadow solver を使いません）。
+  respawn_interval_ms:
+    value: 30000
+    status: provisional
+    basis: "決定記録 0133 §2.5（実測を待つ値）。子の起動時の指紋の計算（数秒）を繰り返し続けない間隔の暫定値"
+  # 依頼の打ち切り時刻からこの時間たっても結果が来ない子を「応答しない」として終わらせます（ミリ秒）。
+  # 子は SCHED_IDLE なので CPU が空かない間は遅れて当然です。短すぎると飢えているだけの子を作り直し続けます。
+  unresponsive_after_ms:
+    value: 60000
+    status: provisional
+    basis: "決定記録 0133 §2.5（実測を待つ値）。mpc.period_ms の数周期分を待つ暫定値"

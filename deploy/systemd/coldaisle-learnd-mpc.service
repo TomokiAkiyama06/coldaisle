@@ -37,7 +37,12 @@ WorkingDirectory=/opt/coldaisle
 # 較正ファイルは読まない（frame で受け取る。0101 §2.1）
 # 起動の形は coldaisle-fand と同じく root の所有の venv の interpreter を -I -m で（決定記録 0157 §2.1）。
 # console script（.venv/bin/coldaisle-learnd）は本番では使わない
-ExecStart=/opt/coldaisle/.venv/bin/python -I -m coldaisle.learned_worker.cli --role mpc --config-dir /etc/coldaisle/control-config --registry-root /var/lib/coldaisle-registry --learned-channel-config /etc/coldaisle/learned-channel.yaml
+# --hint-lockfile: Workload Hint の B1 の Shadow solver の子が部品 lockfile を計算するロックファイル
+#   （決定記録 0152 §2.4 / §5 の 4・0162 §2.5）。coldaisle-fand の unit と同じ root の所有の uv.lock を渡す。
+#   **MPC の unit にだけ渡す**（Supervisor の worker はヒントを受け取らない。0133 §2.2）。読めなければ子は
+#   certification_mismatch を返すだけで、基準の提案は変わらない。子は learned-channel.yaml の hint_shadow を
+#   置いたときだけ、最初のヒントの依頼で作られる（同じ unit・同じ cgroup。SCHED_IDLE。unit の停止で一緒に止まる）
+ExecStart=/opt/coldaisle/.venv/bin/python -I -m coldaisle.learned_worker.cli --role mpc --config-dir /etc/coldaisle/control-config --registry-root /var/lib/coldaisle-registry --learned-channel-config /etc/coldaisle/learned-channel.yaml --hint-lockfile /opt/coldaisle/uv.lock
 
 # fand の再起動・停止で接続が切れると終了コード 3 で終わる（0113 §2.1）。それが通常の経路なので戻す。
 # 2（引数の誤り。未知の --role を含む。0114 §2.1 の8）は人が直すまで変わらないので戻さない。**3 と 5 は入れない**（5 は一時的な失敗も含む。0115 §2.5）
@@ -48,6 +53,8 @@ RestartPreventExitStatus=2
 
 # 資源の上限（**すべて暫定値**。段階 3 の shadow と 0080 段階 5 の実機の確認で決める。0115 §2.6）。
 # 片方の worker の暴走で、もう片方と fand を巻き込まない
+# B1 を使うと、Shadow solver の子（artifact を自分で読む）と multiprocessing の resource tracker も同じ上限に
+# 数える（決定記録 0133 §2.5）。B1 の前に本番のホストで使用量を確かめる（docs/ubuntu-deploy.md 6.8）
 MemoryMax=1G
 TasksMax=32
 CPUWeight=20

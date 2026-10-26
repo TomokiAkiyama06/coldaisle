@@ -38,6 +38,7 @@ from coldaisle.control.hint_gate import (
     hint_policy_sha256,
     optimizer_sha256,
 )
+from coldaisle.control.hint_monotonicity import monotonicity_violation
 from coldaisle.control.model.counterfactual import (
     FEATURE_SCHEMA_V2_VERSION,
     TARGET_SCHEMA_V2_VERSION,
@@ -696,29 +697,19 @@ def _violation(
 ) -> str | None:
     """0066 §2.1 (b) の 2 条件。破れた条件の名前（値は返さない）か、満たせば None。
 
-    1. 各系統で ``demand_hint >= demand_base - eps``
-    2. 両 plan の予測の**対応するすべての offset** で、CPU / GPU を要素ごとに
-       ``hint <= base + eps_c``
+    規則は Shadow solver と fand の再検査と共有する1つの関数（``control/hint_monotonicity.py``）。
     """
-    for zone in ("front", "rear", "top"):
-        if getattr(hinted.requested, zone) < getattr(base.requested, zone) - spec.eps:
-            return f"demand_{zone}"
-    base_targets = base.prediction.targets
-    hint_targets = hinted.prediction.targets
-    if [target.offset_ms for target in base_targets] != [
-        target.offset_ms for target in hint_targets
-    ]:
-        return "prediction_offsets_differ"
     cost = control.policy.mpc.optimizer.cost_metrics
-    for base_target, hint_target in zip(base_targets, hint_targets, strict=True):
-        for name, metric in (("cpu", cost.cpu_temperature), ("gpu", cost.gpu_temperature)):
-            base_value = base_target.values.get(metric)
-            hint_value = hint_target.values.get(metric)
-            if base_value is None or hint_value is None:
-                return f"prediction_{name}_missing"
-            if hint_value > base_value + spec.eps_c:
-                return f"temperature_{name}"
-    return None
+    return monotonicity_violation(
+        base_requested=base.requested,
+        base_targets=base.prediction.targets,
+        hint_requested=hinted.requested,
+        hint_targets=hinted.prediction.targets,
+        cpu_temperature_metric=cost.cpu_temperature,
+        gpu_temperature_metric=cost.gpu_temperature,
+        eps=spec.eps,
+        eps_c=spec.eps_c,
+    )
 
 
 def _code(name: str) -> str:

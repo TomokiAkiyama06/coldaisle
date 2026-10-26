@@ -11,15 +11,21 @@
   最後の frame に対して1回結果を作る
 - heartbeat は別のスレッドから `heartbeat_interval_ms`（fand の `hello`）ごとに送る
 - fand との接続が切れたら終了する（再接続はしない。再起動は unit の仕事。0077 §2.10 段階 6）
+- MPC は ``config/learned-channel.yaml`` に ``hint_shadow`` があるとき、Workload Hint の B1 の
+  Shadow solver の子プロセスを最初のヒントの依頼で作る（決定記録 0133 §2.5 / 0162 §2.5 の PR-B）。
+  基準の solve と送信を先に済ませ、``next_due`` を数えた後に依頼を1枠で渡す。子の結果は frame を
+  待つ間の受信の多重化の中でだけ読む。``--hint-lockfile`` は子が部品 ``lockfile`` の計算に使う
+  （MPC だけ。渡さない・読めないなら子は ``certification_mismatch``。0152 §5 の 4 / 0162 §2.5）
 """
 
 from __future__ import annotations
 
 import argparse
 import logging
+import os
 import signal
 import threading
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from pathlib import Path
 from types import FrameType
 from typing import Protocol
@@ -31,14 +37,21 @@ from coldaisle.control.learned_handoff import LearnedFrame, LearnedRole
 from coldaisle.control.model_registry import ModelRegistry, load_model_registry_limits
 from coldaisle.control.mpc.controller import MpcProposal
 from coldaisle.control.supervisor.policy import DeliveredSupervisorOutput
+from coldaisle.hint_certificate_digest import LaunchForm, current_launch_form
 from coldaisle.learned_channel.config import LearnedChannelSettings
-from coldaisle.learned_worker.client import ChannelClosed, WorkerChannel
+from coldaisle.learned_worker.client import ChannelClosed, ReceivedFrame, WorkerChannel
 from coldaisle.learned_worker.mpc import (
     MpcWorkerCore,
     RegistryArtifactSource,
     WorkerInputs,
 )
 from coldaisle.learned_worker.registry import RegistryProductionCheck
+from coldaisle.learned_worker.shadow import HintShadowCoordinator
+from coldaisle.learned_worker.shadow_solver import (
+    WORKER_ENTRY_MODULE,
+    ShadowChildArgs,
+    ShadowSolverProcess,
+)
 from coldaisle.learned_worker.supervisor import (
     RegistryPolicySource,
     SupervisorWorkerCore,
@@ -96,6 +109,8 @@ class PeriodicWorker[ResultT]:
         self._stop = threading.Event()
         self._run_id: str | None = None
         self.sent = 0
+        self.on_sent: Callable[[int, int], None] | None = None
+        """結果を送るたびに（その周期の開始の予定時刻, 送り終えた時刻）で呼ぶ（試験と計測）。"""
 
     def close(self) -> None:
         """fand との接続を閉じる。"""
@@ -124,26 +139,33 @@ class PeriodicWorker[ResultT]:
                 if failure:
                     raise ChannelClosed("heartbeat を送れない")
                 wait_ms = max(0, next_due - self._monotonic.monotonic_ms())
-                for received in self._channel.receive_frames(timeout_s=wait_ms / 1_000):
+                for received in self._receive(wait_ms):
                     self._core.receive(received.run_id, received.frame)
                     self._run_id = received.run_id
                 now = self._monotonic.monotonic_ms()
                 if now < next_due:
                     continue
+                due = next_due
                 result = self._core.step()
                 run_id = self._core_run_id()
                 if result is not None and run_id is not None:
                     self._send(run_id, result)
                     self.sent += 1
+                    if self.on_sent is not None:
+                        self.on_sent(due, self._monotonic.monotonic_ms())
                 periods += 1
-                if max_periods is not None and periods >= max_periods:
-                    return
                 # 遅れた周期を詰めて取り戻さない（最後の frame に1回だけ。0077 §2.3）。
-                # 推論や送信が周期を超えたら、**終わった時刻から**次の周期を数える
+                # 推論や送信が周期を超えたら、**終わった時刻から**次の周期を数える。
+                # next_due は基準の solve と送信の終わりだけから数え、Shadow solver との
+                # 受け渡し（下の _after_step）の進み具合を見ない（0133 §2.5）
                 next_due += self._period_ms
                 finished = self._monotonic.monotonic_ms()
                 if next_due <= finished:
                     next_due = finished + self._period_ms
+                if result is not None and run_id is not None:
+                    self._after_step(run_id, result, started_ms=now, next_due_ms=next_due)
+                if max_periods is not None and periods >= max_periods:
+                    return
         finally:
             self._stop.set()
             heartbeat.join(timeout=hello.heartbeat_interval_ms / 1_000)
@@ -153,6 +175,15 @@ class PeriodicWorker[ResultT]:
 
     def _send(self, run_id: str, result: ResultT) -> None:
         raise NotImplementedError
+
+    def _receive(self, wait_ms: int) -> list[ReceivedFrame]:
+        """``wait_ms`` まで frame を待つ（役割ごとに多重化を足せる）。"""
+        return self._channel.receive_frames(timeout_s=wait_ms / 1_000)
+
+    def _after_step(
+        self, run_id: str, result: ResultT, *, started_ms: int, next_due_ms: int
+    ) -> None:
+        """結果を送り、次の周期を数えた後に呼ぶ（既定は何もしない）。"""
 
     def _heartbeat(self, interval_ms: int, failure: list[BaseException]) -> None:
         while not self._stop.wait(interval_ms / 1_000):
@@ -167,15 +198,106 @@ class PeriodicWorker[ResultT]:
 
 
 class MpcWorker(PeriodicWorker[MpcProposal]):
-    """`MpcWorkerCore` をソケットと時計につなぐ。"""
+    """`MpcWorkerCore` をソケットと時計につなぐ。
+
+    ``shadow`` を渡すと、Workload Hint の B1 の Shadow solver との受け渡しを足す（0133 §2.5）。
+    基準の solve と送信・``next_due`` の数え方は ``shadow`` の有無で変わらない。
+    """
 
     _core: MpcWorkerCore
+
+    def __init__(
+        self,
+        core: MpcWorkerCore,
+        channel: WorkerChannel,
+        *,
+        period_ms: int,
+        hello_timeout_ms: int,
+        monotonic: MonotonicClock,
+        shadow: HintShadowCoordinator | None = None,
+    ) -> None:
+        super().__init__(
+            core,
+            channel,
+            period_ms=period_ms,
+            hello_timeout_ms=hello_timeout_ms,
+            monotonic=monotonic,
+        )
+        self._shadow = shadow
+
+    def close(self) -> None:
+        """Shadow solver の子を終わらせ、fand との接続を閉じる。"""
+        if self._shadow is not None:
+            self._shadow.close()
+        super().close()
 
     def _core_run_id(self) -> str | None:
         return self._core.history.run_id
 
     def _send(self, run_id: str, result: MpcProposal) -> None:
         self._channel.send_result(run_id, result)
+
+    def _receive(self, wait_ms: int) -> list[ReceivedFrame]:
+        shadow = self._shadow
+        if shadow is None:
+            return super()._receive(wait_ms)
+        try:
+            readable, writable = shadow.readable_fds(), shadow.writable_fds()
+        except Exception:
+            self._shadow_failed()
+            return super()._receive(wait_ms)
+        if readable or writable:
+            try:
+                # 子の結果は基準の solve の外（frame を待つ間の多重化の中）でだけ読む（0133 §2.5）
+                frames = self._channel.receive_frames_or_wait(
+                    timeout_s=wait_ms / 1_000, readable=readable, writable=writable
+                )
+            except (OSError, ValueError):
+                # 子の fd の不具合で基準の受信を止めない（fand のソケットの切断は ChannelClosed）
+                self._shadow_failed()
+                return super()._receive(wait_ms)
+        else:
+            frames = super()._receive(wait_ms)
+        try:
+            shadow.service()
+        except Exception:
+            self._shadow_failed()
+        return frames
+
+    def _after_step(
+        self, run_id: str, result: MpcProposal, *, started_ms: int, next_due_ms: int
+    ) -> None:
+        shadow = self._shadow
+        step = self._core.last_input
+        if shadow is None or step is None:
+            return
+        try:
+            shadow.after_base(
+                run_id=run_id,
+                step=step,
+                base=result,
+                base_started_ms=started_ms,
+                next_due_ms=next_due_ms,
+            )
+        except Exception:
+            self._shadow_failed()
+
+    def _shadow_failed(self) -> None:
+        """Shadow solver との受け渡しの想定外の失敗。**このプロセスの間は使わない。**
+
+        失敗の影響は片方向にする（0133 §2.5）。基準の solve と送信は続け、worker を終了しない。
+        握りつぶさず、ログに残してから受け渡しを外す。
+        """
+        LOGGER.exception(
+            "Workload Hint の Shadow solver との受け渡しが失敗した; このプロセスの間は使わない",
+            extra={logs.FIELDS_KEY: {"reason": "shadow_unavailable"}},
+        )
+        shadow, self._shadow = self._shadow, None
+        if shadow is not None:
+            try:
+                shadow.close()
+            except Exception:
+                LOGGER.exception("Shadow solver の子を終わらせられなかった")
 
 
 class SupervisorWorker(PeriodicWorker[DeliveredSupervisorOutput]):
@@ -205,13 +327,33 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--registry-root", type=Path, required=True)
     parser.add_argument("--registry-limits", type=Path, default=DEFAULT_REGISTRY_LIMITS)
     parser.add_argument("--learned-channel-config", type=Path, required=True)
+    parser.add_argument(
+        "--hint-lockfile",
+        type=Path,
+        default=None,
+        help=(
+            "Workload Hint の証明書の部品 lockfile（MPC の Shadow solver だけが読む。"
+            "fand と同じ root の所有の uv.lock。決定記録 0152 §2.4 / 0162 §2.5）"
+        ),
+    )
     parser.add_argument("--log-level", default="INFO")
     return parser
 
 
-def main(argv: Sequence[str] | None = None) -> int:
-    """`coldaisle-learnd` の入口。"""
-    args = build_parser().parse_args(argv)
+def main(
+    argv: Sequence[str] | None = None,
+    *,
+    launch_form: Callable[[str], LaunchForm] = current_launch_form,
+) -> int:
+    """`coldaisle-learnd` の入口。
+
+    ``launch_form`` は起動の形の確かめ方だけを差し替える（試験のため。0157 §2.3）。
+    """
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if args.role != LearnedRole.MPC.value and args.hint_lockfile is not None:
+        # ヒントを受け取るのは MPC の worker だけ（0133 §2.2 / 0162 §2.5）
+        parser.error("--hint-lockfile は --role mpc でだけ渡す")
     logs.configure(args.log_level)
     role = LearnedRole(args.role)
     monotonic: MonotonicClock = SystemMonotonicClock()
@@ -221,7 +363,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         registry = ModelRegistry(
             args.registry_root, limits=load_model_registry_limits(args.registry_limits)
         )
-        worker = _build_worker(role, args, control, settings, registry, monotonic)
+        worker = _build_worker(
+            role, args, control, settings, registry, monotonic, launch_form=launch_form
+        )
     except ChannelClosed:
         LOGGER.exception(
             "coldaisle-fand の役割のソケットに接続できない",
@@ -254,6 +398,8 @@ def _build_worker(
     settings: LearnedChannelSettings,
     registry: ModelRegistry,
     monotonic: MonotonicClock,
+    *,
+    launch_form: Callable[[str], LaunchForm],
 ) -> MpcWorker | SupervisorWorker:
     """役割の core を作り、その役割のソケットへ接続する（接続は最後。設定の誤りを先に見せる）。"""
     production = RegistryProductionCheck(registry, args.registry_root, role=role)
@@ -265,12 +411,22 @@ def _build_worker(
             production=production,
             monotonic_ms=monotonic.monotonic_ms,
         )
+        channel = _connect(role, settings)
+        shadow = _build_shadow(
+            args,
+            control,
+            settings,
+            channel,
+            monotonic,
+            parent_isolated=launch_form(WORKER_ENTRY_MODULE) is LaunchForm.ISOLATED_MODULE,
+        )
         return MpcWorker(
             mpc_core,
-            _connect(role, settings),
+            channel,
             period_ms=control.policy.mpc.period_ms,
             hello_timeout_ms=settings.worker_idle_timeout_ms.value,
             monotonic=monotonic,
+            shadow=shadow,
         )
     supervisor_core = SupervisorWorkerCore(
         SupervisorWorkerInputs(control=control),
@@ -286,6 +442,67 @@ def _build_worker(
         hello_timeout_ms=settings.worker_idle_timeout_ms.value,
         monotonic=monotonic,
     )
+
+
+def _build_shadow(
+    args: argparse.Namespace,
+    control: ControlConfig,
+    settings: LearnedChannelSettings,
+    channel: WorkerChannel,
+    monotonic: MonotonicClock,
+    *,
+    parent_isolated: bool,
+) -> HintShadowCoordinator | None:
+    """Shadow solver との受け渡し（決定記録 0133 §2.5 / 0162 §2.5）。設定が無ければ None。
+
+    送信バッファを Shadow の分だけ足せないときは子を作らない（``shadow_unavailable``）。起動の形が
+    ``isolated_module`` でない worker は子を作らず、ヒントの依頼に ``certification_mismatch`` を
+    返す（0157 §2.3）。子そのものは最初のヒントの依頼で作る。
+    """
+    shadow_settings = settings.hint_shadow
+    record_limit = settings.limits.max_shadow_record_bytes
+    overhead = settings.limits.packet_overhead_bytes
+    if shadow_settings is None or record_limit is None or overhead is None:
+        return None
+    reserved = channel.reserve_shadow_send_buffer(record_limit.value + overhead.value)
+    solver = None
+    if reserved and parent_isolated:
+        solver = ShadowSolverProcess(
+            ShadowChildArgs(
+                config_dir=args.config_dir,
+                metrics=args.metrics,
+                registry_root=args.registry_root,
+                registry_limits=args.registry_limits,
+                lockfile=args.hint_lockfile,
+                parent_isolated=parent_isolated,
+                parent_pid=os.getpid(),
+                log_level=args.log_level,
+            ),
+            respawn_interval_ms=shadow_settings.respawn_interval_ms.value,
+            unresponsive_after_ms=shadow_settings.unresponsive_after_ms.value,
+            max_reply_bytes=settings.limits.max_message_bytes.value,
+            monotonic_ms=monotonic.monotonic_ms,
+        )
+    coordinator = HintShadowCoordinator(
+        solver=solver,
+        sender=channel,
+        control=control,
+        max_record_bytes=record_limit.value,
+        parent_isolated=parent_isolated,
+        monotonic_ms=monotonic.monotonic_ms,
+    )
+    LOGGER.info(
+        "Workload Hint の Shadow solver の受け渡しを用意した",
+        extra={
+            logs.FIELDS_KEY: {
+                "launch_form": "isolated_module" if parent_isolated else "other",
+                "send_buffer_reserved": reserved,
+                "solver": solver is not None,
+                "worker_instance_id": coordinator.worker_instance_id,
+            }
+        },
+    )
+    return coordinator
 
 
 def _connect(role: LearnedRole, settings: LearnedChannelSettings) -> WorkerChannel:

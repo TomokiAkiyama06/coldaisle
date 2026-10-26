@@ -10,6 +10,12 @@
   `DeliveredSupervisorOutput`）と `heartbeat` だけ。Demand の上書き・モード・authority・束縛の
   用途を表す型は封筒に無い（0077 §2.4 の 6 / §2.8）
 - heartbeat は推論とは別のスレッドから送る（0107 §2.7）。送信は lock で直列にする
+- Workload Hint の B1 の Shadow の記録（`hint_shadow`）は**別の送信の入口**
+  （:meth:`WorkerChannel.try_send_shadow`）で送る。lock を待たずに取り（取れなければ送らない）、
+  経路の送信待ちが空のとき（`SIOCOUTQ` が 0）だけ `MSG_DONTWAIT` の `send` を1回行う。送れなければ
+  送らずに返す（`ChannelClosed` にしない。経路の切断として扱うのは基準と heartbeat の送信の失敗
+  だけ。決定記録 0133 §2.5）。送信バッファは Shadow の分だけ足す
+  （:meth:`WorkerChannel.reserve_shadow_send_buffer`）
 
 切断（EOF・送受信の失敗）は `ChannelClosed` で知らせる。再接続はしない（プロセスの再起動は unit の
 仕事。0077 §2.10 段階 6）。
@@ -18,12 +24,16 @@
 from __future__ import annotations
 
 import contextlib
+import fcntl
 import logging
 import select
 import socket
+import struct
+import termios
 import threading
 from collections import Counter
 from dataclasses import dataclass
+from enum import StrEnum
 from pathlib import Path
 
 from pydantic import ValidationError
@@ -48,6 +58,20 @@ LOGGER = logging.getLogger("coldaisle.learned_worker.client")
 
 class ChannelClosed(Exception):
     """fand との接続が切れた（EOF・拒否・送受信の失敗）。"""
+
+
+class ShadowSendOutcome(StrEnum):
+    """Shadow の記録の1回の送信の試みの結果（決定記録 0133 §2.5）。"""
+
+    SENT = "sent"
+    LOCK_BUSY = "lock_busy"
+    """heartbeat のスレッドが送信の lock を持っていた（待たない）。"""
+    QUEUE_NOT_EMPTY = "queue_not_empty"
+    """経路の送信待ち（fand がまだ読んでいない bytes）が 0 でない・確かめられない。"""
+    WOULD_BLOCK = "would_block"
+    """``MSG_DONTWAIT`` の ``send`` が ``EAGAIN`` / ``EWOULDBLOCK`` を返した。"""
+    FAILED = "failed"
+    """その他の送信の失敗（上限を超えた bytes を含む）。経路の切断としては扱わない。"""
 
 
 @dataclass(frozen=True, slots=True)
@@ -134,6 +158,69 @@ class WorkerChannel:
                 continue
             frames.append(ReceivedFrame(run_id=envelope.run_id, frame=envelope.body.frame))
 
+    def receive_frames_or_wait(
+        self, *, timeout_s: float, readable: list[int], writable: list[int]
+    ) -> list[ReceivedFrame]:
+        """fand のソケットと ``readable`` / ``writable`` の fd のどれかが動くまで待つ。
+
+        fand のソケットが読めたときだけ、届いているメッセージをすべて読む（:meth:`receive_frames`
+        と同じ扱い）。ほかの fd の処理は呼び出し側が行う（Shadow solver の子の結果。0133 §2.5）。
+        """
+        ready, _, _ = select.select(
+            [self._sock.fileno(), *readable], writable, [], max(0.0, timeout_s)
+        )
+        if self._sock.fileno() not in ready:
+            return []
+        return self.receive_frames(timeout_s=0.0)
+
+    def reserve_shadow_send_buffer(self, extra_bytes: int) -> bool:
+        """送信バッファを、いまの値に ``extra_bytes`` を**足した**値にする（決定記録 0133 §2.5）。
+
+        Shadow の記録が経路に1件残っていても、基準の提案と heartbeat が使える空きをヒントを扱わない
+        ときと同じにする。``getsockopt`` で確かめた値が足りなければ False（Shadow solver
+        を使わない）。
+        Linux は ``setsockopt`` の値を倍にして持つので、まず半分を渡し、足りなければそのまま渡す。
+        """
+        if extra_bytes < 0:
+            raise ValueError("extra_bytes は 0 以上にする")
+        try:
+            base = self._sock.getsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF)
+            target = base + extra_bytes
+            for requested in ((target + 1) // 2, target):
+                self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, requested)
+                if self._sock.getsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF) >= target:
+                    return True
+        except OSError:
+            return False
+        return False
+
+    def try_send_shadow(self, data: bytes) -> ShadowSendOutcome:
+        """Shadow の記録を1回だけ送ってみる。**待たない・``ChannelClosed`` にしない**（0133 §2.5）。
+
+        周期のループのスレッドだけが呼ぶ（基準の送信と並行しない）。heartbeat のスレッドとは lock を
+        共有するが、lock は待たずに取る。lock を持つ間に行うのは送信待ちの確かめと
+        ``MSG_DONTWAIT`` の ``send`` 1回だけ。
+        """
+        if self._role is not LearnedRole.MPC:
+            raise ValueError("Shadow の記録は MPC の役割の接続からだけ送る")
+        if len(data) > self._max:
+            return ShadowSendOutcome.FAILED
+        if not self._send_lock.acquire(blocking=False):
+            return ShadowSendOutcome.LOCK_BUSY
+        try:
+            if self._unsent_bytes() != 0:
+                # 経路に残る Shadow の記録を高々1件にし、次の基準の送信を待たせない
+                return ShadowSendOutcome.QUEUE_NOT_EMPTY
+            try:
+                self._sock.send(data, socket.MSG_DONTWAIT)
+            except (BlockingIOError, InterruptedError):
+                return ShadowSendOutcome.WOULD_BLOCK
+            except OSError:
+                return ShadowSendOutcome.FAILED
+            return ShadowSendOutcome.SENT
+        finally:
+            self._send_lock.release()
+
     @property
     def role(self) -> LearnedRole:
         """この接続の役割。"""
@@ -214,6 +301,18 @@ class WorkerChannel:
                 self._sock.send(data)
             except OSError as error:
                 raise ChannelClosed(f"送信に失敗: {type(error).__name__}") from error
+
+    def _unsent_bytes(self) -> int | None:
+        """経路の送信待ちのバイト数（``SIOCOUTQ``。fand がまだ読んでいない分）。
+
+        読めなければ None。
+        """
+        try:
+            raw = fcntl.ioctl(self._sock.fileno(), termios.TIOCOUTQ, struct.pack("i", 0))
+        except OSError:
+            return None
+        (count,) = struct.unpack("i", raw)
+        return int(count)
 
     def _drop(self, code: str) -> None:
         self._dropped[code] += 1

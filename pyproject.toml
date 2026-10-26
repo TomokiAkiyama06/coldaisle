@@ -142,6 +142,7 @@ addopts = "--strict-markers"
 markers = [
     'hardware: 実機が必要なテスト（CI は -m "not hardware" で除外する）',
     'slow: 秒単位で時間がかかるテスト（24時間相当の連続運転など）',
+    'realtime: 実時間の CPU の取り合いを測るテスト（決定記録 0133 §2.5）。CI から外すため hardware と併記し、本番のホストで -m realtime で走らせる',
 ]
 asyncio_mode = "strict"
 asyncio_default_fixture_loop_scope = "function"

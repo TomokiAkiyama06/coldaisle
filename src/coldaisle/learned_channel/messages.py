@@ -11,20 +11,35 @@
 - `coldaisle-fand` → worker: `hello`（接続を認めた最初の応答。`heartbeat_interval_ms` と
   `run_id`）と `frame`（毎 tick の `LearnedFrame`）
 
-worker からの本文は `MpcProposal` / `DeliveredSupervisorOutput` の型しか運べず、Demand の
-上書き・モード・authority・束縛の用途（`origin`）を表す型を持たない（0077 §2.4 の 6 / §2.8、
+- MPC worker → `coldaisle-fand`: `hint_shadow`（Workload Hint の B1 の Shadow solver の記録。
+  決定記録 0133 §2.5 / §2.5a・0152 §2.6・0162 §2.3 / §2.5 の PR-B）。基準の `mpc_result` の**後に**
+  別のメッセージとして送る。fand の受信・検証・記録は PR-C で足す（それまで fand は
+  `unsupported_body` として捨て、生存の知らせに数えない）
+
+worker からの本文は `MpcProposal` / `DeliveredSupervisorOutput` と、Shadow の記録
+（`requested_demand` の段の値と予測の写しだけ）の型しか運べず、Demand の上書き・モード・
+authority・束縛の用途（`origin`）を表す型を持たない（0077 §2.4 の 6 / §2.8・0162 §2.1、
 AGENTS.md ルール2）。
 """
 
 from __future__ import annotations
 
-from typing import Annotated, Literal
+from enum import StrEnum
+from typing import Annotated, Literal, Self
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from coldaisle.control.learned_handoff import LearnedFrame, LearnedRole
+from coldaisle.control.learned_handoff import LearnedFrame, LearnedRole, PinnedArtifact
 from coldaisle.control.mpc.controller import MpcProposal
+from coldaisle.control.mpc.counterfactual import PlannedTarget
+from coldaisle.control.schema import (
+    ControlConfigDigest,
+    Demand,
+    PerZone,
+    SupervisorTargetBand,
+)
 from coldaisle.control.supervisor.policy import DeliveredSupervisorOutput
+from coldaisle.hint_certificate import Sha256
 
 ENVELOPE_SCHEMA_VERSION: Literal[1] = 1
 
@@ -56,8 +71,128 @@ class SupervisorResultBody(_Strict):
     result: DeliveredSupervisorOutput
 
 
+HINT_SHADOW_RECORD_SCHEMA_VERSION: Literal[1] = 1
+"""Shadow の記録の形の版（``hint_shadow_records.schema_version`` に写す。0133 §2.5a）。"""
+
+
+class HintShadowStatus(StrEnum):
+    """worker が送る Shadow の記録の状態（0133 §2.5a の ``status`` のうち worker が決める2つ）。
+
+    ``rejected``（fand の検証に落ちた）は fand だけが付ける（PR-C）。
+    """
+
+    RECORDED = "recorded"
+    """ヒント有りの plan がある（worker の領域の判定と 2 条件に通った）。"""
+    SKIPPED = "skipped"
+    """worker が解かなかった・打ち切った・worker の判定に落ちた（理由つき）。"""
+
+
+class HintShadowSkipReason(StrEnum):
+    """``skipped`` の理由（閉じた語彙。0133 §2.5a / §2.8・0152 §2.6・0162 §2.3）。
+
+    fand はこの値を ``hint_shadow_records.reason`` へ写す（PR-C で ``certification_mismatch`` を
+    ``HintShadowReason`` に足す）。
+    """
+
+    BUDGET_EXHAUSTED = "budget_exhausted"
+    """基準の solve の残りの評価の回数・打ち切り時刻が無い、またはヒント有りが解けなかった。"""
+    SHADOW_BUSY = "shadow_busy"
+    """Shadow solver が前の依頼の途中だった（依頼を捨てた。待ち行列を作らない）。"""
+    OUT_OF_CERTIFIED_DOMAIN = "out_of_certified_domain"
+    """worker の認証領域の判定（実際の window の全 frame。0156 §2.4）に落ちた。"""
+    MONOTONICITY_VIOLATED = "monotonicity_violated"
+    """worker の 2 条件（0066 §2.1 (b)）に落ちた。"""
+    CERTIFICATION_MISMATCH = "certification_mismatch"
+    """worker 側の部品・起動の形・``window_ms`` / ``stale_after_ms`` の照合に落ちた。
+
+    0152 §2.6 / 0157 §2.3 / 0162 §2.2。
+    """
+    ARTIFACT_MISMATCH = "artifact_mismatch"
+    """子が固定された artifact を読めない・digest が合わない（0133 §2.5）。"""
+    BASE_MISMATCH = "base_mismatch"
+    """ヒント有りの解の anchor 推論が基準の解のものと違う。
+
+    同じ window・同じ model で解いていない解を基準と比べない。
+    """
+
+
+class HintShadowCounters(_Strict):
+    """worker のプロセスの中の累積の数（0162 §2.3）。
+
+    ``worker_instance_id`` の epoch の中で減らない。
+    """
+
+    shadow_dropped_backpressure: int = Field(ge=0)
+    """送れずに捨てた記録（新しい記録で置き換えた・期限を過ぎた・送信に失敗した）。"""
+    shadow_record_too_large: int = Field(ge=0)
+    """``limits.max_shadow_record_bytes`` を超えて捨てた記録（切り詰めない）。"""
+    shadow_unavailable: int = Field(ge=0)
+    """Shadow solver の子が使えず、依頼を渡せなかった回数（記録を作らない。0162 §2.3）。"""
+
+
+class HintShadowPlan(_Strict):
+    """1つの plan の写し（0133 §2.5a）。``requested_demand`` の段の値と、予測の全 offset。"""
+
+    requested: PerZone[Demand]
+    targets: Annotated[tuple[PlannedTarget, ...], Field(min_length=1)]
+    """``PlanPrediction.targets`` の全 offset（fand の 2 条件の再検査に使う）。"""
+
+
+class HintShadowPlans(_Strict):
+    """``recorded`` の記録の両 plan とヒント有りの context の band（0133 §2.5a）。"""
+
+    base: HintShadowPlan
+    hint: HintShadowPlan
+    hint_target_band: SupervisorTargetBand
+
+
+class HintShadowBody(_Strict):
+    """Workload Hint の B1 の Shadow solver の1件の記録（0133 §2.5 / §2.5a・0162 §2.3）。
+
+    基準の ``MpcProposal`` を送った**後に**、別のメッセージとして MPC の接続からだけ送る。
+    ``base_result_digest`` で対になる基準の結果（``MpcProposal.result_digest()``）を指し、
+    ``source_*`` で元の frame の snapshot を指す。**Demand の上書き・モード・authority を表す欄を
+    持たない**（``plans`` は値の写しで、受け渡し口にも Gate にも入らない。0162 §2.1）。
+    """
+
+    kind: Literal["hint_shadow"]
+    record_schema_version: Literal[1]
+    worker_instance_id: str = Field(pattern=RUN_ID_PATTERN)
+    """worker のプロセスの起動ごとの乱数の識別子（``run_id`` と同じ形。個体識別子を含まない）。"""
+    counters: HintShadowCounters
+    """送った時点の累積の数（``worker_instance_id`` と組で1つの epoch。0162 §2.3）。"""
+    source_tick_id: int = Field(ge=0)
+    source_ts_ms: int = Field(ge=0)
+    source_monotonic_ms: int = Field(ge=0)
+    base_result_digest: Sha256
+    """対になる基準の ``MpcProposal.result_digest()``。"""
+    thermal_model: PinnedArtifact
+    """元の frame が固定した artifact（``expected_artifacts.thermal_model``）。"""
+    config: ControlConfigDigest
+    """元の frame の ``config``（worker の設定と一致したものだけが基準の solve に使われる）。"""
+    certificate_sha256: Sha256
+    """照合に使った認証のハッシュ（元の frame の ``hint_certification``。0152 §2.6）。"""
+    conditions_sha256: Sha256 | None
+    """子が束縛から計算した ``conditions`` の digest。計算する前に止まった記録では None。"""
+    status: HintShadowStatus
+    reason: HintShadowSkipReason | None
+    plans: HintShadowPlans | None
+
+    @model_validator(mode="after")
+    def _fields_match_the_status(self) -> Self:
+        recorded = self.status is HintShadowStatus.RECORDED
+        if recorded != (self.reason is None):
+            raise ValueError("reason を持つのは skipped の記録だけ")
+        if recorded != (self.plans is not None):
+            raise ValueError("plans を持つのは recorded の記録だけ")
+        if recorded and self.conditions_sha256 is None:
+            raise ValueError("recorded の記録には conditions の digest を載せる")
+        return self
+
+
 InboundBody = Annotated[
-    HeartbeatBody | MpcResultBody | SupervisorResultBody, Field(discriminator="kind")
+    HeartbeatBody | MpcResultBody | SupervisorResultBody | HintShadowBody,
+    Field(discriminator="kind"),
 ]
 
 

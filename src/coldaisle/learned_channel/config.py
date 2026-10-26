@@ -90,6 +90,33 @@ class ChannelLimits(_Strict):
     """1メッセージ（両方向）の上限バイト数。超えたものは受け取らず・送らずに捨てて数える。"""
     listen_backlog: int = Field(ge=1)
     """`listen()` の待ち行列。**同時に持つ接続は役割ごとに1つ**で、これはその手前の待ち行列。"""
+    max_shadow_record_bytes: ProvisionalBytes | None = None
+    """Workload Hint の B1 の Shadow の記録1件の符号化後の上限（決定記録 0133 §2.5）。省ける。
+
+    ``max_message_bytes`` 以下。超えた記録は切り詰めずに捨てる（worker は
+    ``shadow_record_too_large`` に数える。fand の受信側も同じ上限で検査する）。
+    ``packet_overhead_bytes`` と組で置く。
+    """
+    packet_overhead_bytes: ProvisionalBytes | None = None
+    """1メッセージあたりのカーネルの管理領域の見積もり（決定記録 0133 §2.5。実測で決める）。
+
+    worker は自分のソケットの ``SO_SNDBUF`` を、ヒントを扱わないときの値に
+    ``max_shadow_record_bytes + packet_overhead_bytes`` を**足した**値にする（基準の提案と
+    heartbeat の空きを減らさない）。``max_shadow_record_bytes`` と組で置く。
+    """
+
+    @model_validator(mode="after")
+    def _shadow_record_limits_come_together(self) -> Self:
+        record, overhead = self.max_shadow_record_bytes, self.packet_overhead_bytes
+        if (record is None) != (overhead is None):
+            raise ValueError("max_shadow_record_bytes と packet_overhead_bytes は組で置く")
+        if record is not None and record.value > self.max_message_bytes.value:
+            raise ValueError(
+                "max_shadow_record_bytes は max_message_bytes 以下にする: "
+                f"max_shadow_record_bytes={record.value}; "
+                f"max_message_bytes={self.max_message_bytes.value}"
+            )
+        return self
 
 
 class HintDomainSettings(_Strict):
@@ -112,6 +139,24 @@ class HintDomainSettings(_Strict):
     """
 
 
+class HintShadowSettings(_Strict):
+    """Learned MPC worker の Shadow solver の子プロセスの扱い（決定記録 0133 §2.5 / 0162 §2.5）。
+
+    worker だけが読む。省くと worker は Shadow solver を作らない（ヒントの依頼を解かないだけで、
+    基準の solve と送信は変わらない）。置くときは ``limits.max_shadow_record_bytes`` /
+    ``limits.packet_overhead_bytes`` も要る。
+    """
+
+    respawn_interval_ms: ProvisionalMs
+    """子が死んだ・応答しない・経路が壊れたとき、作り直すまでにあける間隔。"""
+    unresponsive_after_ms: ProvisionalMs
+    """依頼の打ち切り時刻からこの時間たっても結果が来ない子を「応答しない」として終わらせる。
+
+    子は ``SCHED_IDLE`` で動くので、CPU が空かない間は遅れて当然である。短すぎると、飢えている
+    だけの子を作り直し続ける。
+    """
+
+
 class LearnedChannelSettings(_Strict):
     """`config/learned-channel.yaml` 全体。"""
 
@@ -128,6 +173,21 @@ class LearnedChannelSettings(_Strict):
     省いた設定では、fand は frame にヒントの欄（``supervisor_hint`` / ``hint_certification``）を
     入れない（B1 の依頼が worker に届かないだけで、基準の経路は変わらない）。
     """
+
+    hint_shadow: HintShadowSettings | None = None
+    """Learned MPC worker の Shadow solver の値（決定記録 0133 §2.5）。
+
+    省ける（worker だけが読む）。
+    """
+
+    @model_validator(mode="after")
+    def _hint_shadow_has_its_limits(self) -> Self:
+        if self.hint_shadow is not None and self.limits.max_shadow_record_bytes is None:
+            raise ValueError(
+                "hint_shadow を置くなら limits.max_shadow_record_bytes と "
+                "limits.packet_overhead_bytes も置く"
+            )
+        return self
 
     @model_validator(mode="after")
     def _idle_covers_three_heartbeats(self) -> Self:

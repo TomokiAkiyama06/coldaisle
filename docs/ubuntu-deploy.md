@@ -1447,6 +1447,25 @@ Registry と制御設定への書き込み、root。artifact の本体は `raise
      console script（`.venv/bin/coldaisle-learnd`）は本番では使いません
    - `--config-dir`・`--registry-root`・`--learned-channel-config` と `WorkingDirectory=` は fand の unit と同じ値です。
      fand の側を変えたら worker の側も変えます（違うと frame の照合が外れ続け、提案が使われません）
+   - **MPC の unit だけ**が `--hint-lockfile /opt/coldaisle/uv.lock`（fand の unit と同じ root の所有のファイル）を持ちます
+     （Workload Hint の B1 の Shadow solver の子が部品 `lockfile` を計算するため。決定記録 0152 §2.4 / 0162 §2.5）。
+     Supervisor の unit には渡しません（渡すと引数の誤りで終了コード 2）。読めなくても子が `certification_mismatch` を
+     返すだけで、基準の提案は変わりません
+   - Shadow solver の子は、`learned-channel.yaml` に `hint_shadow` と `limits.max_shadow_record_bytes` /
+     `limits.packet_overhead_bytes` があるときだけ、**最初のヒントの依頼で**作られます（fand が B1 の frame を送るまで
+     作られません。決定記録 0133 §2.5）。同じ unit・同じ cgroup に入り、`SCHED_IDLE` で動き、unit の停止と親の終了で
+     一緒に止まります。`SCHED_IDLE` に下げられない環境では子は何もせずに終わり、そのプロセスの間は作り直されません。
+     子と `multiprocessing` の resource tracker も `MemoryMax=` / `TasksMax=` に数えるので、B1 の前に使用量を確かめます
+   - B1 の前提として、**本番のホストで**実時間の試験に合格していることを確かめます（決定記録 0133 §2.5 / §2.6）。
+     許容幅は `config/hint-shadow-realtime.yaml`（暫定値）です
+
+     ```bash
+     # 同じ commit の作業ツリー（開発の clone）で。/opt/coldaisle の venv では走らせない
+     #（--no-dev で入れてあり、uv run が venv を同期し直すため）
+     uv sync && uv run pytest -m realtime tests/test_hint_shadow_realtime.py
+     ```
+
+     本番のホストの CPU の構成（fand と worker が動いている状態）で走らせます
    - `RestartSec=` と資源の上限（`MemoryMax=` など）は暫定値です（0115 §2.6）
    - worker は `After=coldaisle-fand.service` だけを持ち、fand を起動しません。fand が止まっている間は終了コード 3 で
      終わり、`RestartSec` ごとに再起動します（Fallback で運転するだけ）
