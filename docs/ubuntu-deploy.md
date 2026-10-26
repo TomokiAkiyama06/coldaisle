@@ -56,7 +56,7 @@
 ユーザーのホームを `/var/lib/coldaisle` にしておくと、設定を変えずに CSV も
 `/var/lib/coldaisle` の下に入ります。
 
-各 CLI の既定の出力先（`var/coldaisle.db`、`config/report.yaml` の `var/reports` など）は
+各 CLI の既定の出力先（`var/coldaisle.db` など。日次レポートはファイルに書かない。決定記録 0171 §2.4）は
 作業ディレクトリ基準です。`/opt/coldaisle/var` を `/var/lib/coldaisle` へのリンクに
 しておくと、**設定を変えずに**すべて `/var/lib/coldaisle` へ入ります。
 

@@ -24,11 +24,11 @@ from coldaisle.report import (
     DailyReport,
     ReportConfig,
     as_notification,
+    as_thread,
     build,
     main,
     run,
     send,
-    write,
 )
 from coldaisle.rules import RuleSet
 from coldaisle.store import AlertSeverity, SqliteStore
@@ -40,6 +40,14 @@ EXCLUSIONS = LlmExclusions.from_yaml(CONFIG_DIR / "report.yaml")
 DAY_START_MS = 1_787_497_200_000
 """2026-08-24T00:00:00+09:00。"""
 
+HIGHLIGHTS = (
+    "air.room",
+    "gpu.0.core",
+    "cpu.package",
+    "board.connector_12v2x6",
+    "power.gpu.0",
+    "power.cpu.package",
+)
 MINUTE_MS = 60_000
 DAY_MS = MINUTES_PER_DAY * MINUTE_MS
 
@@ -83,12 +91,14 @@ def catalog() -> MetricCatalog:
 def config(tmp_path) -> ReportConfig:
     return ReportConfig(
         timezone="Asia/Tokyo",
-        output_dir=tmp_path / "reports",
         to=["recorder"],
         summarise=True,
         max_alerts=20,
         max_notification_chars=3500,
         thread_title="📄 {month}月{day}日の振り返り",
+        highlight_metrics=list(HIGHLIGHTS),
+        table_font=tmp_path / "no-such-font.ttc",
+        table_font_size=28,
     )
 
 
@@ -430,12 +440,14 @@ def test_model_receives_the_table_not_the_raw_series(store, catalog):
 def _config_with(**overrides) -> ReportConfig:
     base = {
         "timezone": "Asia/Tokyo",
-        "output_dir": Path("var/reports"),
         "to": [],
         "summarise": True,
         "max_alerts": 20,
         "max_notification_chars": 3500,
         "thread_title": "📄 {month}月{day}日の振り返り",
+        "highlight_metrics": list(HIGHLIGHTS),
+        "table_font": Path("/nonexistent/font.ttc"),
+        "table_font_size": 28,
     }
     return ReportConfig(**{**base, **overrides})
 
@@ -450,25 +462,15 @@ def test_facts_come_before_the_summary(store, catalog):
 # ---------------------------------------------------------------- 出力と送信
 
 
-def test_file_keeps_the_full_text_even_when_the_notification_is_cut(store, catalog, tmp_path):
-    """**全文はファイルに残る。** LINE は5000文字で切られる。"""
+def test_long_single_message_is_cut_with_the_dashboard_note(store, catalog):
+    """Webhook・LINE の 1 通は長ければ切り、続きはダッシュボードで（決定記録 0171 §2.4）。"""
     for minute in range(MINUTES_PER_DAY):
         bucket(store, "air.room", minute, mean=25.0, ok=24)
     report = report_for(store, catalog).with_summary("あ" * 300)
-    path = write(report, tmp_path / "reports")
     notification = as_notification(report, dashboard_url="http://x/", max_chars=500)
-    assert len(notification.body) <= 560
-    assert "…（全文は 2026-08-24.md）" in notification.body
-    assert path.read_text(encoding="utf-8") == report.as_markdown()
-
-
-def test_rewriting_the_same_day_is_idempotent(store, catalog, tmp_path):
-    bucket(store, "air.room", 0, mean=26.0, ok=24)
-    report = report_for(store, catalog)
-    first = write(report, tmp_path / "reports")
-    second = write(report, tmp_path / "reports")
-    assert first == second
-    assert first.read_text(encoding="utf-8") == report.as_markdown()
+    assert len(notification.body) <= 530
+    assert notification.body.endswith("…（続きはダッシュボードで）")
+    assert ".md" not in notification.body
 
 
 def test_notification_is_titled_as_a_report(store, catalog):
@@ -492,28 +494,125 @@ def test_config_rejects_a_broken_thread_title(template):
         _config_with(thread_title=template)
 
 
-def test_thread_title_does_not_change_the_text(store, catalog):
-    """親の題は `as_text()` に入らない。Webhook・LINE・stdout の本文と長さは今までどおり。"""
+def test_thread_does_not_change_the_single_message(store, catalog, config):
+    """スレッドの形は `as_text()` に入らない。Webhook・LINE・stdout の本文と長さは今までどおり。"""
+    bucket(store, "air.room", 0, mean=26.0, ok=24)
     report = report_for(store, catalog)
     plain = as_notification(report, dashboard_url="http://x/", max_chars=500)
-    titled = as_notification(
-        report, dashboard_url="http://x/", max_chars=500, thread_title="📄 8月24日の振り返り"
+    threaded = as_notification(
+        report,
+        dashboard_url="http://x/",
+        max_chars=500,
+        thread=as_thread(report, config, dashboard_url="http://x/"),
     )
-    assert titled.thread_title == "📄 8月24日の振り返り"
-    assert plain.thread_title == ""
-    assert titled.as_text() == plain.as_text()
-    assert "振り返り" not in titled.as_text()
+    assert plain.thread is None
+    assert threaded.thread is not None
+    assert threaded.thread.title == "📄 8月24日の振り返り"
+    assert threaded.as_text() == plain.as_text()
+    assert "振り返り" not in threaded.as_text()
 
 
-def test_non_slack_destinations_get_the_same_single_message(store, catalog):
-    """Slack 以外（LINE・stdout など）は 1 通のまま。親の題を送らない。"""
+def test_non_slack_destinations_get_the_same_single_message(store, catalog, config):
+    """Slack 以外（LINE・stdout など）は 1 通のまま。親の題も要点も送らない。"""
     recorder = Recorder()
+    report = report_for(store, catalog)
     notification = as_notification(
-        report_for(store, catalog), dashboard_url="", max_chars=9999, thread_title="題"
+        report, dashboard_url="", max_chars=9999, thread=as_thread(report, config, dashboard_url="")
     )
     assert send(notification, {"line": recorder}, ["line"]) == 1
     assert len(recorder.sent) == 1
     assert recorder.sent[0].as_text() == notification.as_text()
+
+
+# ---------------------------------------------------------------- 要点と表（0171 §2.2 / §2.3）
+
+
+def _lead_fixture(store) -> None:
+    for minute in range(MINUTES_PER_DAY):
+        bucket(store, "air.room", minute, mean=25.0, maximum=27.5, ok=24, expected=24)
+    bucket(store, "gpu.0.core", 0, mean=60.0, maximum=71.25, ok=12, expected=24)
+    bucket(store, "power.gpu.0", 0, mean=None, ok=0, expected=24)
+    alert(store, "CPU_HOT", minute=10, severity="warning")
+    alert(store, "CPU_HOT", minute=20 - MINUTES_PER_DAY, severity="warning")  # 前日
+
+
+def test_lead_has_alerts_summary_peaks_missing_and_link_in_order(store, catalog):
+    _lead_fixture(store)
+    report = report_for(store, catalog).with_summary("室温は安定していた。")
+    lead = report.lead_text(HIGHLIGHTS, "https://dashboard.example.invalid/")
+    order = [
+        "*アラート*",
+        "発火 1 件（前日 1 件）",
+        "*所見（AI 生成・未検証）*",
+        "室温は安定していた。",
+        "*主な値（最高）*",
+        "・室温 27.5 °C",
+        "・GPUコア温度 71.2 °C",
+        "*欠測*",
+        "https://dashboard.example.invalid/",
+    ]
+    positions = [lead.index(text) for text in order]
+    assert positions == sorted(positions)
+    # 値の無い metric（GPU 消費電力は届いたサンプルが無い・CPU は行が無い）は主な値に書かない
+    assert "GPU消費電力 " not in lead.split("*欠測*")[0]
+    assert "CPU Package温度" not in lead
+    missing_line = lead.split("*欠測*\n", 1)[1].splitlines()[0]
+    assert missing_line == "GPUコア温度、GPU消費電力"
+    assert "|" not in lead, "表は画像で送る"
+
+
+def test_lead_never_cuts_the_summary(store, catalog):
+    """所見は切らない（デモでは 3500 文字の上限で所見が消えた。0171 §2）。"""
+    _lead_fixture(store)
+    summary = "所見の文。" * 1000
+    lead = report_for(store, catalog).with_summary(summary).lead_text(HIGHLIGHTS, "")
+    assert summary in lead
+
+
+def test_lead_names_ongoing_alerts_with_severity(store, catalog):
+    fired = DAY_START_MS + 1430 * MINUTE_MS
+    store.connection.execute(
+        "INSERT INTO alerts (rule_id, severity, state, metric, started_ms, fired_ms) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        ("CPU_HOT", "critical", "firing", "cpu.package", fired, fired),
+    )
+    store.connection.commit()
+    lead = report_for(store, catalog).lead_text(HIGHLIGHTS, "")
+    assert "日の終わりに続いている:" in lead
+    assert "CPU_HOT" in lead and "[重大]" in lead
+
+
+def test_lead_without_data_says_so(store, catalog):
+    lead = report_for(store, catalog).lead_text(HIGHLIGHTS, "http://127.0.0.1:8000/")
+    assert lead.startswith("*この日のデータがありません。*")
+    assert "127.0.0.1" not in lead, "ループバックのリンクは載せない（0142 §2.2）"
+
+
+def test_shipped_highlights_are_the_agreed_default():
+    """既定の主な値（0171 §2.2）。すべて `config/metrics.yaml` にある。"""
+    config = ReportConfig.from_yaml(CONFIG_DIR / "report.yaml")
+    assert config.highlight_metrics == list(HIGHLIGHTS)
+    catalog = MetricCatalog.from_yaml(CONFIG_DIR / "metrics.yaml")
+    assert set(config.highlight_metrics) <= set(catalog.metrics)
+
+
+def test_table_rows_use_labels_and_mute_rows_without_values(store, catalog):
+    _lead_fixture(store)
+    header, rows = report_for(store, catalog).table_rows()
+    assert header[0] == "メトリクス" and len(header) == 7
+    by_name = {row.cells[0]: row for row in rows}
+    assert not by_name["室温"].muted
+    assert by_name["GPU消費電力"].muted
+    assert by_name["室温"].cells[3] == "27.50"
+
+
+def test_thread_without_a_font_sends_the_table_as_text(store, catalog, config):
+    """フォントのファイルが無ければ画像を付けず、表を Markdown で送る（0171 §2.3）。"""
+    _lead_fixture(store)
+    thread = as_thread(report_for(store, catalog), config, dashboard_url="")
+    assert thread.table_image is None
+    assert thread.table_text.startswith("## 測定値")
+    assert "| 室温（air.room） |" in thread.table_text
 
 
 def test_a_failing_destination_does_not_stop_the_others(store, catalog):
@@ -536,8 +635,9 @@ def test_an_unknown_destination_is_logged_not_raised(store, catalog, caplog):
 def test_config_rejects_a_misspelled_timezone(tmp_path):
     path = tmp_path / "report.yaml"
     path.write_text(
-        "timezone: Asia/Tokio\noutput_dir: var/reports\nto: []\nsummarise: false\n"
-        'max_alerts: 20\nmax_notification_chars: 3500\nthread_title: "{month}月{day}日"\n',
+        "timezone: Asia/Tokio\nto: []\nsummarise: false\n"
+        'max_alerts: 20\nmax_notification_chars: 3500\nthread_title: "{month}月{day}日"\n'
+        "highlight_metrics: [air.room]\ntable_font: /nonexistent/font.ttc\ntable_font_size: 28\n",
         encoding="utf-8",
     )
     with pytest.raises(ValueError, match="タイムゾーン"):
@@ -550,14 +650,17 @@ def test_shipped_config_is_valid():
     assert config.zone.key == "Asia/Tokyo"
 
 
-def test_cli_writes_a_file_without_sending(tmp_path, rules, catalog):
+def test_cli_does_not_write_a_report_file(tmp_path, rules, catalog, monkeypatch, capsys):
+    """ファイルに保存しない。`--print` で標準出力へ出す（決定記録 0171 §2.4）。"""
+    monkeypatch.chdir(tmp_path)
     db = tmp_path / "cli.db"
     with SqliteStore(db, rules=rules, clock=SimulatedClock(0)) as store:
         bucket(store, "air.room", 0, mean=26.0, ok=24)
     config_path = tmp_path / "report.yaml"
     config_path.write_text(
-        f"timezone: Asia/Tokyo\noutput_dir: {tmp_path / 'out'}\nto: []\nsummarise: false\n"
-        'max_alerts: 20\nmax_notification_chars: 3500\nthread_title: "{month}月{day}日"\n',
+        "timezone: Asia/Tokyo\nto: []\nsummarise: false\n"
+        'max_alerts: 20\nmax_notification_chars: 3500\nthread_title: "{month}月{day}日"\n'
+        "highlight_metrics: [air.room]\ntable_font: /nonexistent/font.ttc\ntable_font_size: 28\n",
         encoding="utf-8",
     )
     assert (
@@ -573,11 +676,30 @@ def test_cli_writes_a_file_without_sending(tmp_path, rules, catalog):
                 str(CONFIG_DIR / "notify.yaml"),
                 "--quality-rules",
                 str(CONFIG_DIR / "quality.yaml"),
+                "--rules",
+                str(CONFIG_DIR / "rules.yaml"),
                 "--date",
                 "2026-08-24",
                 "--no-send",
+                "--print",
             ]
         )
         == 0
     )
-    assert "26.00" in (tmp_path / "out" / "2026-08-24.md").read_text(encoding="utf-8")
+    assert "26.00" in capsys.readouterr().out
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["cli.db", "report.yaml"]
+
+
+@pytest.mark.skipif(
+    not ReportConfig.from_yaml(CONFIG_DIR / "report.yaml").table_font.exists(),
+    reason="日本語のフォントが無い（CI）",
+)
+def test_thread_with_the_shipped_font_attaches_the_table_image(store, catalog):
+    _lead_fixture(store)
+    config = ReportConfig.from_yaml(CONFIG_DIR / "report.yaml")
+    report = report_for(store, catalog)
+    first = as_thread(report, config, dashboard_url="").table_image
+    second = as_thread(report, config, dashboard_url="").table_image
+    assert first is not None and second is not None
+    assert first.content.startswith(b"\x89PNG")
+    assert first.content == second.content

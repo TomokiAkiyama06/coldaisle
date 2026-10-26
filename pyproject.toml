@@ -16,6 +16,9 @@ dependencies = [
     "httpx",
     # GPU Telemetry は nvidia-smi を spawn せず NVML を直接読む（#65）
     "nvidia-ml-py>=13",
+    # 日次レポートの測定値の表の画像だけに使う（coldaisle.report_table。決定記録 0171 §2.3）。
+    # 取り込み・API・fand・Learned からは import しない
+    "pillow>=12,<13",
 ]
 
 [dependency-groups]

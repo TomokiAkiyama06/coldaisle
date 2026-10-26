@@ -20,6 +20,7 @@ import logging
 import struct
 import threading
 import zlib
+from dataclasses import replace
 from pathlib import Path
 from urllib.parse import parse_qs
 
@@ -41,6 +42,7 @@ from coldaisle.alert_graph import (
 from coldaisle.clock import SimulatedClock
 from coldaisle.metrics import MetricCatalog
 from coldaisle.notify import DisplayNames, Notification, NotifyConfig, Router
+from coldaisle.notify.models import ReportThread, ThreadImage
 from coldaisle.notify.notifiers import SLACK_WEBHOOK_ENV, DeliveryError, SlackNotifier
 from coldaisle.notify.notifiers import from_env as notifiers_from_env
 from coldaisle.notify.png_chart import (
@@ -580,24 +582,51 @@ def test_on_posted_failure_does_not_fail_the_text():
 
 # ---------------------------------------------------------------- 日次レポートのスレッド（0171）
 
-OK = "ok"
 FAIL = httpx.Response(200, json={"ok": False, "error": "ratelimited"})
+PARENT_TS = "1787626800.000201"
 
 
 class ScriptedSlack:
-    """`chat.postMessage` に、決めた順で成功（`OK`）か失敗の応答を返す偽物。"""
+    """`chat.postMessage` の n 回目（1 から）と画像の上げを、指定したときだけ失敗させる偽物。
 
-    def __init__(self, *script: object) -> None:
-        self.payloads: list[dict[str, object]] = []
-        self._script = list(script)
+    `events` に送った順で (`post`, payload) か (`upload`, completeUploadExternal の form) を残す。
+    """
+
+    def __init__(self, *, fail_posts: frozenset[int] = frozenset(), fail_upload: bool = False):
+        self.events: list[tuple[str, dict[str, object]]] = []
+        self._fail_posts = fail_posts
+        self._fail_upload = fail_upload
+        self._posts = 0
 
     def __call__(self, request: httpx.Request) -> httpx.Response:
-        assert str(request.url).endswith("/chat.postMessage")
-        self.payloads.append(json.loads(request.content))
-        step = self._script.pop(0) if self._script else OK
-        if isinstance(step, httpx.Response):
-            return step
-        return httpx.Response(200, json={"ok": True, "ts": f"1787626800.00020{len(self.payloads)}"})
+        url = str(request.url)
+        if url.endswith("/chat.postMessage"):
+            self._posts += 1
+            payload = json.loads(request.content)
+            if self._posts in self._fail_posts:
+                return FAIL
+            self.events.append(("post", payload))
+            return httpx.Response(200, json={"ok": True, "ts": f"1787626800.00020{self._posts}"})
+        if url.endswith("/files.getUploadURLExternal"):
+            if self._fail_upload:
+                return FAIL
+            return httpx.Response(
+                200, json={"ok": True, "upload_url": UPLOAD_URL, "file_id": "F00000TEST"}
+            )
+        if url == UPLOAD_URL:
+            return httpx.Response(200, text="OK")
+        if url.endswith("/files.completeUploadExternal"):
+            form = {k: v[0] for k, v in parse_qs(request.content.decode()).items()}
+            self.events.append(("upload", dict(form)))
+            return httpx.Response(200, json={"ok": True})
+        return httpx.Response(404)
+
+    def kinds(self) -> list[tuple[str, str | None]]:
+        """(種類, thread_ts) の並び。"""
+        return [
+            (kind, str(body["thread_ts"]) if "thread_ts" in body else None)
+            for kind, body in self.events
+        ]
 
 
 class WebhookRecorder:
@@ -615,7 +644,20 @@ class WebhookRecorder:
         )
 
 
-def report_notification(thread_title: str = "📄 10月25日の振り返り") -> Notification:
+def report_notification(*, image: bool = True) -> Notification:
+    thread = ReportThread(
+        title="📄 10月25日の振り返り",
+        lead="*アラート*\n発火 0 件（前日 0 件）",
+        table_text="## 測定値\n\n| メトリクス | 最低 |\n|---|---|\n| 室温（air.room） | 24.00 |\n",
+        table_image=ThreadImage(
+            filename="report-2026-10-25.png",
+            content=b"\x89PNG-table",
+            title="測定値 2026-10-25",
+            comment="測定値",
+        )
+        if image
+        else None,
+    )
     return Notification(
         rule_id="日次レポート 2026-10-25",
         severity=AlertSeverity.INFO,
@@ -626,7 +668,7 @@ def report_notification(thread_title: str = "📄 10月25日の振り返り") ->
         dashboard_url="http://127.0.0.1:8000/",
         kind="report",
         body="# 日次レポート 2026-10-25\n\n本文",
-        thread_title=thread_title,
+        thread=thread,
     )
 
 
@@ -645,70 +687,110 @@ def bot(
     )
 
 
-def test_report_goes_as_a_title_then_a_reply_in_its_thread():
-    """親は題だけ、本文は親の ts を `thread_ts` にした返信。グラフの依頼はしない。"""
+def test_report_goes_as_title_then_lead_then_table_image_in_one_thread():
+    """親（題だけ）→ 要点（thread_ts は親の ts）→ 表の画像（同じ thread_ts）。
+
+    グラフの依頼はしない。
+    """
     slack = ScriptedSlack()
     posted: list[str] = []
     notification = report_notification()
     bot(slack, posted=posted).send(notification)
-    assert slack.payloads == [
-        {"channel": CHANNEL, "text": "📄 10月25日の振り返り"},
-        {
-            "channel": CHANNEL,
-            "text": notification.as_text(),
-            "thread_ts": "1787626800.000201",
-        },
-    ]
+    assert slack.events[0] == ("post", {"channel": CHANNEL, "text": "📄 10月25日の振り返り"})
+    assert slack.events[1] == (
+        "post",
+        {"channel": CHANNEL, "text": notification.thread.lead, "thread_ts": PARENT_TS},
+    )
+    kind, upload = slack.events[2]
+    assert kind == "upload"
+    assert upload["thread_ts"] == PARENT_TS
+    assert upload["channel_id"] == CHANNEL
+    assert len(slack.events) == 3
     assert posted == []
 
 
-def test_report_without_a_thread_title_is_one_message():
+def test_without_an_image_the_table_goes_as_text_in_the_thread():
+    """フォントが無く描けなかったときは、表を Markdown の返信で送る（0171 §2.3）。"""
     slack = ScriptedSlack()
-    bot(slack).send(report_notification(thread_title=""))
-    assert len(slack.payloads) == 1
-    assert "thread_ts" not in slack.payloads[0]
+    notification = report_notification(image=False)
+    bot(slack).send(notification)
+    assert slack.kinds() == [("post", None), ("post", PARENT_TS), ("post", PARENT_TS)]
+    assert slack.events[2][1]["text"] == notification.thread.table_text
 
 
-def test_failed_reply_sends_the_text_to_the_channel(caplog):
-    """返信が落ちたら、本文をスレッドでなくチャンネルへ 1 通で送る（黙って失わない）。"""
-    slack = ScriptedSlack(OK, FAIL, OK)
+def test_failed_upload_sends_the_table_as_text(caplog):
+    slack = ScriptedSlack(fail_upload=True)
+    with caplog.at_level(logging.WARNING, logger="coldaisle.notify"):
+        bot(slack).send(report_notification())
+    assert slack.kinds() == [("post", None), ("post", PARENT_TS), ("post", PARENT_TS)]
+    assert "表の画像を上げられなかった" in caplog.text
+    assert TOKEN not in caplog.text and "signed-secret-part" not in caplog.text
+
+
+def test_failed_table_text_reply_goes_to_the_channel():
+    slack = ScriptedSlack(fail_posts=frozenset({3}), fail_upload=True)
+    notification = report_notification()
+    bot(slack).send(notification)
+    assert slack.kinds() == [("post", None), ("post", PARENT_TS), ("post", None)]
+    assert slack.events[2][1]["text"] == notification.thread.table_text
+
+
+def test_table_reaching_nowhere_is_logged_but_still_counts_as_sent(caplog):
+    """要点が届いていれば送れたと数える。表が届かないことはログに残す（0171 §2.5）。"""
+    from coldaisle.report import send
+
+    slack = ScriptedSlack(fail_posts=frozenset({3, 4}), fail_upload=True)
+    with caplog.at_level(logging.WARNING, logger="coldaisle.notify"):
+        assert send(report_notification(), {"slack": bot(slack)}, ["slack"]) == 1
+    assert "日次レポートの表を送れなかった" in caplog.text
+
+
+def test_failed_lead_reply_sends_the_lead_to_the_channel(caplog):
+    """要点がスレッドへ返せなければ、要点をチャンネルへ 1 通で送る。表はそのあとスレッドへ。"""
+    slack = ScriptedSlack(fail_posts=frozenset({2}))
     notification = report_notification()
     with caplog.at_level(logging.WARNING, logger="coldaisle.notify"):
         bot(slack).send(notification)
-    assert [p.get("thread_ts") for p in slack.payloads] == [None, "1787626800.000201", None]
-    assert slack.payloads[2]["text"] == notification.as_text()
-    assert "スレッドへ本文を返せなかった" in caplog.text
-    assert TOKEN not in caplog.text
+    assert slack.kinds() == [("post", None), ("post", None), ("upload", PARENT_TS)]
+    assert slack.events[1][1]["text"] == notification.thread.lead
+    assert "スレッドへ要点を返せなかった" in caplog.text
 
 
-def test_failed_title_sends_the_text_as_one_message(caplog):
-    """親が落ちたら、スレッドをあきらめて今と同じ 1 通で送る。"""
-    slack = ScriptedSlack(FAIL, OK)
+def test_failed_title_sends_the_markdown_as_one_message(caplog):
+    """親が落ちたら、スレッドをあきらめて今と同じ Markdown の 1 通で送る。"""
+    slack = ScriptedSlack(fail_posts=frozenset({1}))
     notification = report_notification()
     with caplog.at_level(logging.WARNING, logger="coldaisle.notify"):
         bot(slack).send(notification)
-    assert slack.payloads[1] == {"channel": CHANNEL, "text": notification.as_text()}
+    assert slack.events == [("post", {"channel": CHANNEL, "text": notification.as_text()})]
     assert "スレッドの親を送れなかった" in caplog.text
 
 
-@pytest.mark.parametrize("script", [(FAIL, FAIL), (OK, FAIL, FAIL)])
-def test_when_the_bot_cannot_send_the_text_the_webhook_gets_one_message(script):
-    """Bot で本文を送れなければ、Webhook で今と同じ 1 通を送る（0147 §2.1 の送り直し）。"""
+@pytest.mark.parametrize("fail_posts", [{1, 2}, {2, 3}])
+def test_when_the_bot_fails_the_webhook_gets_the_markdown_once(fail_posts):
+    """Bot が使えなくなったら、Webhook で今と同じ 1 通を送る（0147 §2.1）。表は重ねない。"""
     webhook = WebhookRecorder()
+    slack = ScriptedSlack(fail_posts=frozenset(fail_posts))
     notification = report_notification()
-    bot(ScriptedSlack(*script), fallback=webhook.notifier()).send(notification)
+    bot(slack, fallback=webhook.notifier()).send(notification)
     assert webhook.texts == [notification.as_text()]
+    assert all(kind == "post" for kind, _ in slack.events), "表の画像は上げない"
 
 
-@pytest.mark.parametrize("script", [(FAIL, FAIL), (OK, FAIL, FAIL)])
-def test_when_the_text_reaches_nowhere_it_raises(script):
-    """本文がどこにも届かなければ例外。日次レポートの `send` は送れなかったと数える。"""
+@pytest.mark.parametrize("fail_posts", [{1, 2}, {2, 3}])
+def test_when_the_lead_reaches_nowhere_it_raises_and_is_not_counted(fail_posts):
+    """要点がどこにも届かなければ例外。日次レポートの `send` は送れなかったと数える。"""
+    from coldaisle.report import send
+
+    notifier = bot(ScriptedSlack(fail_posts=frozenset(fail_posts)))
     with pytest.raises(DeliveryError):
-        bot(ScriptedSlack(*script)).send(report_notification())
+        notifier.send(report_notification())
+    notifier = bot(ScriptedSlack(fail_posts=frozenset(fail_posts)))
+    assert send(report_notification(), {"slack": notifier}, ["slack"]) == 0
 
 
 def test_webhook_only_sends_the_report_as_one_message():
-    """Bot が無く Webhook だけなら今と同じ 1 通。親の題は送らない。"""
+    """Bot が無く Webhook だけなら今と同じ 1 通。題・要点・表を別には送らない。"""
     webhook = WebhookRecorder()
     notification = report_notification()
     webhook.notifier().send(notification)
@@ -716,14 +798,11 @@ def test_webhook_only_sends_the_report_as_one_message():
     assert "振り返り" not in webhook.texts[0]
 
 
-def test_report_send_counts_only_destinations_the_text_reached():
-    """題だけ届いて本文が届かない Slack は数えない（`coldaisle.report.send`）。"""
-    from coldaisle.report import send
-
-    failing = bot(ScriptedSlack(OK, FAIL, FAIL))
-    working = bot(ScriptedSlack())
-    assert send(report_notification(), {"slack": failing}, ["slack"]) == 0
-    assert send(report_notification(), {"slack": working}, ["slack"]) == 1
+def test_report_without_a_thread_is_one_message_through_the_bot():
+    slack = ScriptedSlack()
+    notification = replace(report_notification(), thread=None)
+    bot(slack).send(notification)
+    assert slack.events == [("post", {"channel": CHANNEL, "text": notification.as_text()})]
 
 
 def test_from_env_prefers_the_bot_and_keeps_the_webhook_as_fallback(monkeypatch):
