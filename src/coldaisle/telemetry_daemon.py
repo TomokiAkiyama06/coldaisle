@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import logging
 import signal
+import sqlite3
 import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
@@ -22,6 +23,7 @@ from coldaisle.clock import Clock, WallClock
 from coldaisle.internal_telemetry import (
     SOURCE_STATE_PREFIX,
     TELEMETRY_KIND_KEY,
+    CollectionCycle,
     CpuPowerAdapter,
     GpuStateClassifier,
     GpuStateConfig,
@@ -45,6 +47,9 @@ DEFAULT_QUALITY_RULES = Path("config/quality.yaml")
 DEFAULT_METRICS = Path("config/metrics.yaml")
 DEFAULT_GPU_STATE = Path("config/gpu_state.yaml")
 
+_SQLITE_BUSY_CODES = frozenset({sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED})
+"""書き込みのロックを busy_timeout の間に取れなかっただけの失敗（#378 / 決定記録 0170）。"""
+
 
 @dataclass(frozen=True, slots=True)
 class Config:
@@ -67,6 +72,8 @@ class TelemetryStats:
     unavailable_cycles: int = 0
     skipped_slots: int = 0
     """処理が周期を超えて飛ばした収集枠の数。追いつくために連続で収集しない。"""
+    locked_cycles: int = 0
+    """DB の書き込みロックを取れず、書き込みを途中で破棄した cycle の数（#378）。"""
 
     def as_fields(self) -> dict[str, int]:
         return {
@@ -75,7 +82,14 @@ class TelemetryStats:
             "duplicates": self.duplicates,
             "unavailable_cycles": self.unavailable_cycles,
             "skipped_slots": self.skipped_slots,
+            "locked_cycles": self.locked_cycles,
         }
+
+
+def _is_lock_contention(error: sqlite3.OperationalError) -> bool:
+    """SQLite の BUSY / LOCKED（拡張コードを含む）か。"""
+    code = getattr(error, "sqlite_errorcode", None)
+    return code is not None and (code & 0xFF) in _SQLITE_BUSY_CODES
 
 
 def _monotonic_ms() -> int:
@@ -112,6 +126,7 @@ class InternalTelemetryDaemon:
         self._sleep = sleep
         self._monotonic_ms = monotonic_ms
         self._stop = False
+        self._consecutive_locked = 0
         self.stats = TelemetryStats()
 
     @property
@@ -154,6 +169,71 @@ class InternalTelemetryDaemon:
         """現在の poll を保存し終えてから停止する。"""
         self._stop = True
 
+    def _write_cycle(self, cycle: CollectionCycle) -> None:
+        """1 cycle の sample と状態を Store へ書く。ロック待ちの失敗だけはその cycle を破棄する。
+
+        rollup などが書き込みロックを busy_timeout より長く持つと ``BEGIN IMMEDIATE`` が
+        BUSY で失敗する。それで落ちると再起動までの数秒の sample が欠け、fand が入力の
+        stale で Max・fault になる（#378）。取り込みの「1サンプルの失敗で落とさない」に
+        合わせ、**BUSY / LOCKED のときだけ** その cycle の残りを書かずに次の周期へ進む。
+        それ以外の失敗（スキーマ・ディスク・権限など）は上げて落とし、systemd に任せる。
+        書けないまま動き続けると、壊れた DB に気付けないため。
+
+        **cycle の途中で失敗したら、それ以降はその cycle では書かない。** 書き込みは
+        readings → 各 source の状態の順に、それぞれ別のトランザクションで行う。先に
+        コミットできた分は残し、後ろは捨てる。捨てた状態は ``set_system_state`` が
+        「直近の値と違えば書く」ので、次の cycle の時刻で書き直される（1 周期遅れるだけ）。
+        捨てた readings は書き直さない（その時刻の観測は欠測として残る）。
+        """
+        attempted = len(cycle.sample.readings)
+        written: int | None = None
+        try:
+            written = self._store.insert_sample(cycle.sample)
+            self.stats.readings += written
+            self.stats.duplicates += attempted - written
+            for source in cycle.sources:
+                self._store.set_system_state(
+                    SOURCE_STATE_PREFIX + source.source,
+                    source.status.value,
+                    at_ms=cycle.sample.ts_ms,
+                )
+                # sys.gpu_state など。値が変わったときだけ行が増える（0002 §2.6）
+                for key, value in source.states:
+                    self._store.set_system_state(key, value, at_ms=cycle.sample.ts_ms)
+        except sqlite3.OperationalError as error:
+            if not _is_lock_contention(error):
+                raise
+            # COMMIT が BUSY で失敗した場合はトランザクションが開いたまま残る。閉じないと
+            # 次の BEGIN が「入れ子の transaction」で失敗し、ロックと無関係に落ちる
+            if self._store.connection.in_transaction:
+                self._store.connection.execute("ROLLBACK")
+            self._consecutive_locked += 1
+            self.stats.locked_cycles += 1
+            # 毎 cycle 出す。ロック待ちで1回に busy_timeout（既定 5 s）かかるので、
+            # 出る間隔は周期（2.5 s）より長く、件数は抑えられる
+            LOGGER.warning(
+                "DB の書き込みロックを取れず、この cycle の書き込みを破棄する",
+                extra={
+                    logs.FIELDS_KEY: {
+                        "ts_ms": cycle.sample.ts_ms,
+                        "stage": "readings" if written is None else "system_state",
+                        "dropped_readings": attempted if written is None else 0,
+                        "consecutive_locked_cycles": self._consecutive_locked,
+                        "locked_cycles": self.stats.locked_cycles,
+                        "sqlite_errorcode": error.sqlite_errorcode,
+                        "error": str(error),
+                    }
+                },
+            )
+            return
+        if self._consecutive_locked:
+            # 破棄が何 cycle 続いたかを1行で残す。warning の数を数えなくて済む
+            LOGGER.info(
+                "DB への書き込みが回復した",
+                extra={logs.FIELDS_KEY: {"consecutive_locked_cycles": self._consecutive_locked}},
+            )
+            self._consecutive_locked = 0
+
     def run(self, *, max_cycles: int | None = None) -> TelemetryStats:
         """停止要求または ``max_cycles`` まで収集する。"""
         LOGGER.info(
@@ -177,22 +257,11 @@ class InternalTelemetryDaemon:
         try:
             while not self._stop:
                 cycle = self._collector.collect()
-                attempted = len(cycle.sample.readings)
-                written = self._store.insert_sample(cycle.sample)
                 self.stats.cycles += 1
-                self.stats.readings += written
-                self.stats.duplicates += attempted - written
                 if any(source.status is SourceStatus.UNAVAILABLE for source in cycle.sources):
                     self.stats.unavailable_cycles += 1
+                self._write_cycle(cycle)
                 for source in cycle.sources:
-                    self._store.set_system_state(
-                        SOURCE_STATE_PREFIX + source.source,
-                        source.status.value,
-                        at_ms=cycle.sample.ts_ms,
-                    )
-                    # sys.gpu_state など。値が変わったときだけ行が増える（0002 §2.6）
-                    for key, value in source.states:
-                        self._store.set_system_state(key, value, at_ms=cycle.sample.ts_ms)
                     if source.status in (SourceStatus.DEGRADED, SourceStatus.UNAVAILABLE):
                         LOGGER.warning(
                             "Internal Telemetry source の取得が不完全",
