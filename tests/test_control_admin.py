@@ -639,7 +639,7 @@ def test_a_command_takes_effect_at_the_start_of_the_next_tick(catalog):
         assert record.demand.requested == pytest.approx(0.9)
     assert mailbox.outcomes == [ModeOutcome(ModeOutcomeKind.APPLIED, 1, tick.tick_id)]
     assert mailbox.status is not None and mailbox.status.command_id == 1
-    assert tick.schema_version == 16
+    assert tick.schema_version == 17
     # 最上位の run_id と管理ソケットの記録の run_id は同じ値（決定記録 0133 §2.9）
     assert tick.run_id == tick.mode_command.run_id == RUN_ID
     assert ControlTick.model_validate_json(tick.model_dump_json()) == tick

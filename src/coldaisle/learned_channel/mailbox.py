@@ -138,6 +138,15 @@ class LearnedMailbox:
             self._supervisor = None
             self._last_polled_supervisor = None
 
+    def current_mpc(self) -> MpcProposal | None:
+        """いま MPC の枠にある結果（受付スレッドが Shadow の記録の対の基準を照らす。0133 §2.5）。
+
+        **受付スレッドだけが呼ぶ**（枠を置き換えるのも受付スレッドなので、lock は loop の
+        ``poll`` と取り合うだけ）。取り出さない。
+        """
+        with self._lock:
+            return self._mpc
+
     def take_outgoing(self) -> LearnedFrame | None:
         """送り出し用の枠から取り出す。"""
         with self._outgoing_lock:

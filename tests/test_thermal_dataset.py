@@ -1286,6 +1286,15 @@ def _tick_for_schema_version(version: int, *, ts_ms: int, tick_id: int) -> Contr
         raw["run_id"] = "0123456789abcdef" * 2
         # 同じ版で Workload Hint の塊も必須（#319 / 決定記録 0133 §2.9）
         raw["workload_hint"] = {"schema_version": 1, "stage": "off", "influence": "none"}
+    if version >= 17:
+        # v17 の塊は v2（certificate / shadow_counters。#288 / 決定記録 0162 §2.5 の PR-C）
+        raw["workload_hint"] = {
+            "schema_version": 2,
+            "stage": "off",
+            "influence": "none",
+            "certificate": None,
+            "shadow_counters": None,
+        }
     return ControlTick.model_validate_json(json.dumps(raw))
 
 

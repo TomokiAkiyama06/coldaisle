@@ -47,6 +47,7 @@ V16 = json.loads((FIXTURES / "control_tick_v16.json").read_text(encoding="utf-8"
 V15 = json.loads((FIXTURES / "control_tick_v15.json").read_text(encoding="utf-8"))
 RUN_ID = V16["run_id"]
 OTHER_RUN_ID = "1" * 32
+WORKER_INSTANCE_ID = "fedcba9876543210" * 2
 
 PLAN_JSON = json.dumps(
     {
@@ -83,6 +84,10 @@ def record(
         status=status,
         reason=reason,
         record_json=record_json,
+        worker_instance_id=WORKER_INSTANCE_ID,
+        shadow_dropped_backpressure=2,
+        shadow_record_too_large=0,
+        shadow_unavailable=1,
     )
 
 
@@ -165,11 +170,20 @@ def test_the_hint_note_source_and_uid_are_never_recorded(key: str) -> None:
         ("reason", "'budget_exhausted'"),  # recorded の行は reason を持たない
         ("record_json", "'[1]'"),
         ("source_tick_id", "-1"),
+        ("worker_instance_id", "'0123'"),
+        ("worker_instance_id", "NULL"),
+        ("shadow_dropped_backpressure", "-1"),
+        ("shadow_record_too_large", "NULL"),
+        ("shadow_unavailable", "-1"),
     ],
 )
 def test_the_table_checks_the_shape_without_the_model(store: Any, column: str, value: str) -> None:
     """アプリの外からの書き込みでも、形の違う行を残さない。"""
     values = {
+        "worker_instance_id": f"'{WORKER_INSTANCE_ID}'",
+        "shadow_dropped_backpressure": "0",
+        "shadow_record_too_large": "0",
+        "shadow_unavailable": "0",
         "run_id": f"'{RUN_ID}'",
         "source_tick_id": "1",
         "source_ts_ms": "1",
@@ -186,6 +200,69 @@ def test_the_table_checks_the_shape_without_the_model(store: Any, column: str, v
             f"INSERT INTO hint_shadow_records ({', '.join(values)}) "
             f"VALUES ({', '.join(values.values())})"
         )
+
+
+def test_the_well_formed_row_passes_the_table_checks(store: Any) -> None:
+    """上の各列の拒否が、その列だけで起きていること（正しい行は入る）を確かめる。"""
+    values = {
+        "worker_instance_id": f"'{WORKER_INSTANCE_ID}'",
+        "shadow_dropped_backpressure": "0",
+        "shadow_record_too_large": "0",
+        "shadow_unavailable": "0",
+        "run_id": f"'{RUN_ID}'",
+        "source_tick_id": "1",
+        "source_ts_ms": "1",
+        "source_monotonic_ms": "1",
+        "received_monotonic_ms": "1",
+        "received_ts_ms": "1",
+        "schema_version": "1",
+        "status": "'recorded'",
+        "reason": "NULL",
+        "record_json": "'{}'",
+    }
+    store.connection.execute(
+        f"INSERT INTO hint_shadow_records ({', '.join(values)}) "
+        f"VALUES ({', '.join(values.values())})"
+    )
+
+
+def test_every_row_keeps_its_epoch_and_counters(store: Any) -> None:
+    """``recorded`` 以外の行も worker の epoch と累積の数を持つ（0162 §2.3）。"""
+    rejected = record(
+        status=HintShadowStatus.REJECTED,
+        reason=HintShadowReason.COUNTERS_DECREASED,
+        record_json=None,
+    )
+    store.record_hint_shadow(rejected)
+    (match,) = store.hint_shadow_matches(0, rejected.source_ts_ms + 1)
+    row = match.record
+    assert row.worker_instance_id == WORKER_INSTANCE_ID
+    assert (
+        row.shadow_dropped_backpressure,
+        row.shadow_record_too_large,
+        row.shadow_unavailable,
+    ) == (2, 0, 1)
+    document = rejected.model_dump(mode="json")
+    document.pop("worker_instance_id")
+    with pytest.raises(ValidationError):
+        HintShadowRecord.model_validate(document)
+
+
+def test_the_closed_vocabulary_has_the_b1_reasons() -> None:
+    """0152 §2.6 / 0162 §2.3 が足した理由（と 2件目の拒否）を持つ。"""
+    assert {
+        "certification_mismatch",
+        "counters_decreased",
+        "duplicate_source",
+    } <= {reason.value for reason in HintShadowReason}
+
+
+def test_the_record_shape_is_shared_without_loading_sqlite() -> None:
+    """行の形は SQLite 層を読み込まない横断の module にあり、store は同じ物を再 export する。"""
+    import coldaisle.hint_shadow_record as shared
+
+    assert shared.HintShadowRecord is HintShadowRecord
+    assert shared.HintShadowReason is HintShadowReason
 
 
 # ---------------------------------------------------------------- 3. 突き合わせ
@@ -314,7 +391,7 @@ def test_the_daemon_stores_its_run_id_on_every_tick_without_an_admin_entry(
 
     with SqliteStore(configs[0].db, rules=rules, clock=SimulatedClock(0)) as opened:
         (stored,) = [json.loads(trace.trace_json) for trace in opened.control_traces(0, 2**62)]
-        assert stored["schema_version"] == 16
+        assert stored["schema_version"] == 17
         assert stored["run_id"] == ticks[0].run_id
         # 同じ run の記録だけが突き合う（tick_id と ts_ms が同じでも別の run は対応しない）
         opened.record_hint_shadow(

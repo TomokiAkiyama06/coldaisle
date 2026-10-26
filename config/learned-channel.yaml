@@ -90,6 +90,17 @@ hint_domain:
     value: 10000
     status: provisional
     basis: "決定記録 0162 §2.2（実測を待つ値）。config/quality.yaml の stale_after_ms と同じ桁の暫定値"
+  # 送り出しの時点の判定の結果を、Shadow の記録が届くまで持つ時間（ミリ秒）。worker の記録の期限
+  # （元の frame の次の基準の周期の開始）より長く置きます。過ぎて届いた記録は範囲の外として残します。
+  pending_domain_result_ms:
+    value: 120000
+    status: provisional
+    basis: "決定記録 0162 §2.2（実測を待つ値）。mpc.period_ms より十分長い暫定値"
+  # 保留の表の件数の上限。超えたら古いものから捨てます（Shadow の記録を書く待ち行列の上限にも使います）。
+  max_pending_domain_results:
+    value: 256
+    status: provisional
+    basis: "決定記録 0162 §2.2（実測を待つ値）。pending_domain_result_ms の間の tick の数を覆う暫定値"
 
 # Learned MPC worker の Shadow solver の子プロセス（#288 / 決定記録 0133 §2.5・0162 §2.5 の PR-B）。worker だけが読みます。
 # 子は SCHED_IDLE で動き、基準の solve と送信を待たせません。この塊を省くと worker は子を作りません

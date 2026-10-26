@@ -13,7 +13,7 @@
    ヒントを扱わない worker と同じ時点まで通る。記録が経路に2件以上残らない
 5. 実際の子プロセス: ``SCHED_IDLE`` に下げられなければ何もせず終了し作り直さない・下げた子は
    ``SCHED_IDLE``・死んだ子は間隔をあけて作り直す・親が死ねば子も終わる
-6. fand は PR-C まで ``hint_shadow`` を ``unsupported_body`` として捨て、生存に数えない
+6. 受け口を開いていない fand は ``hint_shadow`` を ``unsupported_body`` として捨て、生存に数えない
 7. 増える経路は記録だけ: 本文は Demand の上書き・モード・authority を運べない（ルール 2）
 """
 
@@ -1007,7 +1007,7 @@ def test_the_child_ends_when_the_parent_dies(world: World, tmp_path: Path) -> No
     raise AssertionError("親の死後も子が残った")
 
 
-# ================================================================ 6. fand（PR-C までは捨てる）
+# ================================================================ 6. fand（受け口が無ければ捨てる）
 
 
 def hint_shadow_envelope(run_id: str = CHANNEL_RUN_ID) -> dict[str, Any]:

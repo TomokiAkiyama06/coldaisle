@@ -91,6 +91,7 @@ from coldaisle.control.hardware import (
     HwmonStartupError,
     SimulatedFanBackend,
 )
+from coldaisle.control.hint_gate import derive_hint_gate_spec
 from coldaisle.control.learned_handoff import (
     AvailableCalibration,
     LearnedHintCertification,
@@ -123,7 +124,13 @@ from coldaisle.control.safety.write_fail_exit import (
     HardwareWriteFailureExit,
     HardwareWriteFailureExitError,
 )
-from coldaisle.control.schema import PerZone, WorkloadHintStage, Zone, workload_hint_stage_rank
+from coldaisle.control.schema import (
+    HintCertificateRef,
+    PerZone,
+    WorkloadHintStage,
+    Zone,
+    workload_hint_stage_rank,
+)
 from coldaisle.control.shadow.record import ShadowRecorder
 from coldaisle.control.state import ControlInputContract, ControlStateEstimator
 from coldaisle.control.supervisor.policy import SupervisorCoordinator
@@ -138,12 +145,20 @@ from coldaisle.control_admin.runtime import new_run_id
 from coldaisle.hint_certification import (
     HintCertificateSource,
     HintCertificationResult,
+    certificate_trace_ref,
     verify_hint_certificate,
 )
 from coldaisle.learned_channel import (
     DisabledLearnedChannel,
     LearnedChannelEntry,
     open_learned_channel,
+)
+from coldaisle.learned_channel.hint_shadow import (
+    HintDomainTracker,
+    HintShadowExpectations,
+    HintShadowIntake,
+    HintShadowWriter,
+    hint_keys_by_band,
 )
 from coldaisle.learned_channel.mailbox import LearnedMailbox
 from coldaisle.learned_channel.registry_watch import RegistryWatch, read_startup_registry
@@ -781,6 +796,11 @@ class ControlDaemon:
     """組み立てた Hardware Backend。正常停止で制御を返すために持つ（決定記録 0080 §2.8）。"""
     workload_hint_reader: WorkloadHintReader | None = None
     """Workload Hint の読み手のスレッド（0133 §2.8）。`close()` で止め、run の終了を書かせる。"""
+    hint_shadow_writer: HintShadowWriter | None = None
+    """Workload Hint B1 の Shadow の記録の書き手（0162 §2.5 の PR-C）。
+
+    Learned の経路の後に止める（受付スレッドが置いた行を書き終えてから）。
+    """
     runtime_calibration: RuntimeCalibration | None = None
     """起動時に1回だけ読んだ runtime の較正（決定記録 0079 §2.4 / 0096 §5 #8）。
 
@@ -822,9 +842,16 @@ class ControlDaemon:
         **lock を待たずに1回だけ**書き残しを試す（取れなければ error に残す）。
         """
         leftover: AdminAuthorityCommand | None = None
+        shutdown_wait_ms = 0
         if self.learned is not None:
+            shutdown_wait_ms = self.learned.shutdown_wait_ms
             self.learned.stop(drain=drain)
             self.learned = None
+        if self.hint_shadow_writer is not None:
+            # 受付スレッドが止まった後に、置いた行を書き終えてから止める。待つ上限は受付スレッドと
+            # 同じ（`tick_deadline_ms`）で、例外の経路では待たない
+            self.hint_shadow_writer.stop(timeout_s=shutdown_wait_ms / 1_000 if drain else 0.0)
+            self.hint_shadow_writer = None
         if self.admin is not None:
             leftover = self.admin.stop(drain=drain)
             self.admin = None
@@ -1112,17 +1139,40 @@ def build(
     learned = _open_learned(
         config, control, monotonic=monotonic, run_id=run_id, registry_watch=registry.watch
     )
+    # 証明書の照合は tick を始める前に1回だけ（0152 §2.4）。B1 / B2 を設定したときだけ
+    hint_certification = _verify_workload_hint(
+        config,
+        control,
+        certificate=registry.hint_certificate,
+        hint_latch=hint_latch,
+        calibration=learned_calibration,
+    )
+    learned_hint_certification = _learned_hint_certification(learned, hint_certification)
+    # **Shadow の記録の受け口と書き手**（B1。0162 §2.5 の PR-C）。記録は hint_shadow_records に
+    # 書くだけで、受け渡し口にも Gate にも入らない（0162 §2.1）
+    hint_shadow = _open_hint_shadow(
+        config,
+        control,
+        learned=learned,
+        certification=hint_certification,
+        learned_hint_certification=learned_hint_certification,
+        registry_binding=registry.binding,
+        rules=rules,
+        wall=wall,
+        run_id=run_id,
+    )
     # **Workload Hint の読み手は loop の外のスレッド**（0133 §2.8）。読めなくても起動は続ける
-    hint_tracker, hint_reader, hint_certification = _open_workload_hint(
+    hint_tracker, hint_reader = _open_workload_hint(
         config,
         control,
         rules=rules,
         wall=wall,
         monotonic=monotonic,
         run_id=run_id,
-        certificate=registry.hint_certificate,
+        certification=hint_certification,
         hint_latch=hint_latch,
-        calibration=learned_calibration,
+        certificate_ref=certificate_trace_ref(registry.hint_certificate, hint_certification),
+        shadow_intake=None if hint_shadow is None else hint_shadow[0],
     )
     built_backends: list[FanHardwareBackend] = []
 
@@ -1154,11 +1204,13 @@ def build(
             metric_catalog_sha256=metric_catalog_sha256,
             run_id=run_id,
             workload_hint=hint_tracker,
-            learned_hint_certification=_learned_hint_certification(learned, hint_certification),
+            learned_hint_certification=learned_hint_certification,
         )
     except BaseException:
         if hint_reader is not None:
             hint_reader.stop()
+        if hint_shadow is not None:
+            hint_shadow[1].stop(timeout_s=0.0)
         if isinstance(learned, LearnedChannelEntry):
             learned.stop()
         if admin is not None:
@@ -1173,6 +1225,7 @@ def build(
         learned=learned if isinstance(learned, LearnedChannelEntry) else None,
         authority=authority,
         workload_hint_reader=hint_reader,
+        hint_shadow_writer=None if hint_shadow is None else hint_shadow[1],
         hardware=built_backends[0] if built_backends else None,
         # **書けないまま制御を持ち続けない**（決定記録 0080 §2.6）。時間は safety.yaml が持つ
         write_fail_exit=HardwareWriteFailureExit(control.safety.hardware_write_fail_exit_ms.value),
@@ -1321,6 +1374,47 @@ def _open_learned(
     return entry if entry is not None else DisabledLearnedChannel()
 
 
+def _verify_workload_hint(
+    config: Config,
+    control: ControlConfig,
+    *,
+    certificate: HintCertificateSource | None,
+    hint_latch: HintCertificationLatch | None,
+    calibration: AvailableCalibration | UnavailableCalibration,
+) -> HintCertificationResult | None:
+    """起動時の証明書の照合（0152 §2.4。``coldaisle.hint_certification``）。
+
+    B1 / B2 を設定したとき（``hint_latch`` がある）だけ照合し、閉じた語彙の1行をログに残す。
+    それ以外は None。**照合が通らなくても起動は止めない**（ヒントは任意の機能。0133 §2.8）。
+    """
+    if hint_latch is None:
+        return None
+    hint = control.policy.supervisor.workload_hint
+    result = verify_hint_certificate(
+        source=certificate,
+        supervisor=control.policy.supervisor,
+        limits=control.safety.workload_hint,
+        lockfile=config.hint_lockfile,
+        calibration=calibration,
+    )
+    stage = effective_stage(hint.stage, certified=result.certified)
+    # 0152 §2.4 / 0157 §2.3: 閉じた語彙の1行。path・ホスト名は載せない
+    LOGGER.log(
+        logging.INFO if stage is hint.stage else logging.WARNING,
+        "workload hint の証明書を照合した",
+        extra={
+            logs.FIELDS_KEY: {
+                "configured_stage": hint.stage.value,
+                "effective_stage": stage.value,
+                "certification": result.certification.value,
+                "certificate_sha256": result.certificate_sha256,
+                "launch_form": result.launch_form.value,
+            }
+        },
+    )
+    return result
+
+
 def _open_workload_hint(
     config: Config,
     control: ControlConfig,
@@ -1329,49 +1423,22 @@ def _open_workload_hint(
     wall: WallClock,
     monotonic: MonotonicClock,
     run_id: str,
-    certificate: HintCertificateSource | None,
+    certification: HintCertificationResult | None,
     hint_latch: HintCertificationLatch | None,
-    calibration: AvailableCalibration | UnavailableCalibration,
-) -> tuple[WorkloadHintTracker | None, WorkloadHintReader | None, HintCertificationResult | None]:
+    certificate_ref: HintCertificateRef | None = None,
+    shadow_intake: HintShadowIntake | None = None,
+) -> tuple[WorkloadHintTracker | None, WorkloadHintReader | None]:
     """Workload Hint の読み手を起こし、loop が使う tracker を返す（決定記録 0133 §2.6 / §2.8）。
 
-    3つ目の値は起動時の証明書の照合の結果（B1 / B2 を設定したときだけ。それ以外は None）。
-
-    ``stage: off`` なら何もしない（Stage A のまま。ヒントを読まない）。B1 / B2 を設定したときは、
-    tick を始める前に証明書を1回だけ照合し（0152 §2.4。``coldaisle.hint_certification``）、
-    実効の段階 = min(設定, 実装の上限, 照合の結果) とする。照合の結果を1行のログに残す。
-    **照合が通らなくても・読めなくても起動は止めない**（ヒントは任意の機能。0133 §2.8）。
+    ``stage: off`` なら何もしない（Stage A のまま。ヒントを読まない）。実効の段階 =
+    min(設定, 実装の上限, 照合の結果)（0152 §2.4）。``certificate_ref`` / ``shadow_intake`` は
+    trace の塊 v2 の ``certificate`` / ``shadow_counters`` の出どころ（0152 §2.7 / 0162 §2.3）。
     """
     hint = control.policy.supervisor.workload_hint
-    certified = False
-    result: HintCertificationResult | None = None
-    if hint_latch is not None:
-        result = verify_hint_certificate(
-            source=certificate,
-            supervisor=control.policy.supervisor,
-            limits=control.safety.workload_hint,
-            lockfile=config.hint_lockfile,
-            calibration=calibration,
-        )
-        certified = result.certified
-        stage = effective_stage(hint.stage, certified=certified)
-        # 0152 §2.4 / 0157 §2.3: 閉じた語彙の1行。path・ホスト名は載せない
-        LOGGER.log(
-            logging.INFO if stage is hint.stage else logging.WARNING,
-            "workload hint の証明書を照合した",
-            extra={
-                logs.FIELDS_KEY: {
-                    "configured_stage": hint.stage.value,
-                    "effective_stage": stage.value,
-                    "certification": result.certification.value,
-                    "certificate_sha256": result.certificate_sha256,
-                    "launch_form": result.launch_form.value,
-                }
-            },
-        )
+    certified = certification is not None and certification.certified
     stage = effective_stage(hint.stage, certified=certified)
     if stage is WorkloadHintStage.OFF:
-        return None, None, result
+        return None, None
     db = config.db
     mailbox = HintMailbox()
     reader = WorkloadHintReader(
@@ -1396,8 +1463,88 @@ def _open_workload_hint(
         monotonic=monotonic,
         certified=certified,
         revocation=hint_latch,
+        certificate=certificate_ref if certified else None,
+        shadow_counters=shadow_intake,
     )
-    return tracker, reader, result
+    return tracker, reader
+
+
+def _open_hint_shadow(
+    config: Config,
+    control: ControlConfig,
+    *,
+    learned: LearnedChannelEntry | DisabledLearnedChannel | None,
+    certification: HintCertificationResult | None,
+    learned_hint_certification: LearnedHintCertification | None,
+    registry_binding: RegistryBinding,
+    rules: QualityRules,
+    wall: WallClock,
+    run_id: str,
+) -> tuple[HintShadowIntake, HintShadowWriter] | None:
+    """Workload Hint B1 の Shadow の記録の受け口と書き手を開く（決定記録 0162 §2.5 の PR-C）。
+
+    開くのは、Learned の経路を開けて ``hint_domain`` の設定があり、起動時の照合が通り
+    （frame の ``hint_certification`` を作れた）、実効の段階が B1 以上になる起動だけ。
+    それ以外は None で、受付は ``hint_shadow`` を ``unsupported_body`` として捨てる。
+    **開けなくても起動は止めない**（ヒントは任意の機能。0133 §2.8）。
+    """
+    hint = control.policy.supervisor.workload_hint
+    if (
+        not isinstance(learned, LearnedChannelEntry)
+        or learned_hint_certification is None
+        or certification is None
+        or certification.components is None
+        or workload_hint_stage_rank(effective_stage(hint.stage, certified=certification.certified))
+        < workload_hint_stage_rank(WorkloadHintStage.SHADOW_MPC)
+    ):
+        return None
+    domain = learned.settings.hint_domain
+    assert domain is not None  # learned_hint_certification を作れたなら hint_domain がある
+    try:
+        spec = derive_hint_gate_spec(hint, control.safety.workload_hint)
+        metrics = control.policy.mpc.optimizer.cost_metrics
+        tracker = HintDomainTracker(
+            spec=spec,
+            cpu_temperature_metric=metrics.cpu_temperature,
+            gpu_temperature_metric=metrics.gpu_temperature,
+            lookback_ms=domain.domain_lookback_ms.value,
+            stale_after_ms=domain.domain_stale_after_ms.value,
+            pending_ms=domain.pending_domain_result_ms.value,
+            max_pending=domain.max_pending_domain_results.value,
+            hint_keys=hint_keys_by_band(control.policy.supervisor),
+        )
+        db = config.db
+        writer = HintShadowWriter(
+            # 書き手のスレッドの中で自分の接続を開く（0133 §2.5a。trace の接続と共有しない）
+            open_store=lambda: SqliteStore(db, rules=rules, clock=wall),
+            max_queue=domain.max_pending_domain_results.value,
+        )
+        intake = HintShadowIntake(
+            run_id=run_id,
+            tracker=tracker,
+            expectations=HintShadowExpectations(
+                thermal_model=registry_binding.expected_artifacts.thermal_model,
+                certificate_sha256=learned_hint_certification.certificate_sha256,
+                conditions_sha256=certification.components.conditions,
+                config=control.runtime_digest(),
+                max_source_age_ms=control.policy.mpc.max_source_age_ms.value,
+                eps=spec.eps,
+                eps_c=spec.eps_c,
+                cpu_temperature_metric=metrics.cpu_temperature,
+                gpu_temperature_metric=metrics.gpu_temperature,
+            ),
+            wall=wall,
+            sink=writer,
+        )
+        writer.start()
+    except Exception:
+        LOGGER.exception(
+            "Shadow の記録の受け口を開けない（B1 の記録は受け取らない）",
+            extra={logs.FIELDS_KEY: {"reason": "hint_shadow_unavailable"}},
+        )
+        return None
+    learned.server.attach_hint_shadow(intake)
+    return intake, writer
 
 
 def _learned_hint_certification(

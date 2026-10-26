@@ -1298,11 +1298,7 @@ class ControlLoop:
                 "workload hint の記録を組み立てられなかった; ヒントを使わない記録にする",
                 extra={logs.FIELDS_KEY: {"stage": tracker.stage.value}},
             )
-            if tracker.stage is WorkloadHintStage.OFF:
-                return WorkloadHintRecord.off()
-            return WorkloadHintRecord(
-                stage=tracker.stage, skipped=HintPriorSkipped.HINT_STATE_UNREADABLE
-            )
+            return tracker.lost_record(tracker.stage, HintPriorSkipped.HINT_STATE_UNREADABLE)
 
     def _rl_candidate(
         self, now_mono_ms: int

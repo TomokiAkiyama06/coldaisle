@@ -37,7 +37,9 @@ from coldaisle.clock import BootClock, MonotonicClock
 from coldaisle.control.config import WorkloadHintConfig
 from coldaisle.control.schema import (
     HINT_SOURCE_LABEL_OTHER,
+    HintCertificateRef,
     HintPriorSkipped,
+    HintShadowCounters,
     WorkloadHintInfluence,
     WorkloadHintKind,
     WorkloadHintRecord,
@@ -188,6 +190,18 @@ class HintTransition:
     boottime_ns: int
 
 
+class HintShadowCountersSource(Protocol):
+    """fand が最後に受け入れた worker の累積の数を読む口（決定記録 0162 §2.3）。**待たない。**
+
+    実装は合成の起点（``coldaisle.learned_channel.hint_shadow.HintShadowIntake``）。control は
+    それを import しない。
+    """
+
+    def latest_counters(self) -> HintShadowCounters | None:
+        """最後に受け入れた値。まだ受け取っていなければ None。**lock を取らない。**"""
+        ...
+
+
 class WorkloadHintMailbox(Protocol):
     """読み手のスレッドと loop の間の受け渡し口のうち、**loop が使う面**（0133 §2.8）。
 
@@ -229,10 +243,12 @@ class WorkloadHintTracker:
 
     __slots__ = (
         "_boot_clock",
+        "_certificate",
         "_config",
         "_configured",
         "_contradiction_event",
         "_contradiction_since_ns",
+        "_counters",
         "_effective",
         "_mailbox",
         "_monotonic",
@@ -249,13 +265,21 @@ class WorkloadHintTracker:
         monotonic: MonotonicClock,
         certified: bool = False,
         revocation: HintCertificationLatch | None = None,
+        certificate: HintCertificateRef | None = None,
+        shadow_counters: HintShadowCountersSource | None = None,
     ) -> None:
         """``mailbox`` が None なのは ``stage: off`` の構成だけ（読み手を作らない）。
 
         ``certified`` は fand の起動時の照合の結果（0152 §2.4）。省けば照合していない扱いで、
         B1 / B2 の設定は B0 に留まる。``revocation`` は稼働中の production の変化の印で、
         立てばその tick から B0 に下げる（再起動まで上げない）。
+
+        ``certificate`` は照合を通した証明書の識別（trace の ``certificate``。0152 §2.7）で、
+        ``certified`` のときだけ渡す。``shadow_counters`` は fand が最後に受け入れた worker の
+        累積の数を**待たずに**読む口（trace の ``shadow_counters``。0162 §2.3）。
         """
+        if certificate is not None and not certified:
+            raise ValueError("certificate は照合が通った起動でだけ渡す（0152 §2.7）")
         self._config = config
         self._configured = config.stage
         self._effective = effective_stage(config.stage, certified=certified)
@@ -269,6 +293,8 @@ class WorkloadHintTracker:
         self._terminal: dict[int, WorkloadHintStatus] = {}
         self._contradiction_event: int | None = None
         self._contradiction_since_ns: int | None = None
+        self._certificate = certificate
+        self._counters = shadow_counters
 
     @property
     def stage(self) -> WorkloadHintStage:
@@ -313,10 +339,14 @@ class WorkloadHintTracker:
         if tick.stage is WorkloadHintStage.OFF:
             return WorkloadHintRecord.off()
         if tick.lost is not None:
-            return WorkloadHintRecord(stage=tick.stage, skipped=tick.lost)
+            return self.lost_record(tick.stage, tick.lost)
         observation = tick.observation
         if observation is None:
-            return WorkloadHintRecord(stage=tick.stage)
+            return WorkloadHintRecord(
+                stage=tick.stage,
+                certificate=self._certificate,
+                shadow_counters=self._latest_counters(),
+            )
         influence = WorkloadHintInfluence.NONE
         skipped: HintPriorSkipped | None = None
         if tick.hint is not None:
@@ -328,9 +358,13 @@ class WorkloadHintTracker:
                 if would_override:
                     influence = WorkloadHintInfluence.WOULD_OVERRIDE
                 if workload_hint_stage_rank(self._configured) > workload_hint_stage_rank(
-                    self._effective
+                    WorkloadHintStage.OBSERVE
+                ) and workload_hint_stage_rank(self._effective) <= workload_hint_stage_rank(
+                    WorkloadHintStage.OBSERVE
                 ):
-                    # 設定は B1 / B2 だが、認証のハッシュが無いので B0 に留めた（0133 §2.6）
+                    # 設定は B1 / B2 だが、認証のハッシュが無い・稼働中に production が変わったので
+                    # B0 に留めた（0133 §2.6 / 0152 §2.4）。実装の上限で B2 → B1 に留めた tick は
+                    # 認証の失敗ではないので、この理由を付けない
                     skipped = HintPriorSkipped.CERTIFICATION_MISMATCH
         return WorkloadHintRecord(
             stage=tick.stage,
@@ -341,7 +375,34 @@ class WorkloadHintTracker:
             age_ms=tick.age_ms,
             influence=influence,
             skipped=skipped,
+            certificate=self._certificate,
+            shadow_counters=self._latest_counters(),
         )
+
+    def lost_record(self, stage: WorkloadHintStage, lost: HintPriorSkipped) -> WorkloadHintRecord:
+        """ヒントの状態を読めない tick の塊（ヒントの欄を持たない。v2 の欄は置く）。"""
+        if stage is WorkloadHintStage.OFF:
+            return WorkloadHintRecord.off()
+        return WorkloadHintRecord(
+            stage=stage,
+            skipped=lost,
+            certificate=self._certificate,
+            shadow_counters=self._latest_counters(),
+        )
+
+    def _latest_counters(self) -> HintShadowCounters | None:
+        """塊 v2 の ``shadow_counters``（0162 §2.3）。**待たない。** ``certificate`` は毎 run 同じ。
+
+        数の口が壊れていても塊は作る（数を ``None`` にするだけ。ヒントは任意。0133 §2.8）。
+        """
+        source = self._counters
+        if source is None:
+            return None
+        try:
+            return source.latest_counters()
+        except Exception:
+            LOGGER.exception("Shadow の記録の数を読めなかった; trace の数を null にする")
+            return None
 
     # ------------------------------------------------------------------ 内部
 

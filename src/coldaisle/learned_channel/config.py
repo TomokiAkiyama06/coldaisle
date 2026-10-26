@@ -119,6 +119,14 @@ class ChannelLimits(_Strict):
         return self
 
 
+class ProvisionalCount(_Strict):
+    """`status` / `basis` 付きの件数（0077 §5「実測を待つ値」と同じ形）。"""
+
+    value: int = Field(ge=1)
+    status: Literal["provisional", "confirmed"]
+    basis: str = Field(min_length=1)
+
+
 class HintDomainSettings(_Strict):
     """Workload Hint の B1 で fand が行う認証領域の判定の値（決定記録 0162 §2.2）。
 
@@ -136,6 +144,18 @@ class HintDomainSettings(_Strict):
     """fand の古さの閾値。
 
     artifact の ``stale_after_ms`` がこれ**以上**でなければ worker は解かない。
+    """
+    pending_domain_result_ms: ProvisionalMs
+    """送り出しの時点の判定の結果を、Shadow の記録が届くまで持つ時間（決定記録 0162 §2.2）。
+
+    worker の Shadow の記録の期限（元の frame の次の基準の周期の開始）より長く置く。過ぎて届いた
+    記録は ``source_interval_unavailable`` で範囲の外になる（危険側には倒れない）。
+    """
+    max_pending_domain_results: ProvisionalCount
+    """保留の表の件数の上限（決定記録 0162 §2.2）。超えたら古いものから捨てる。
+
+    同じ件数を、Shadow の記録を DB へ書く書き手の待ち行列の上限にも使う（行は保留の結果ごとに
+    高々1件と、検証に落ちた記録だけ）。
     """
 
 
@@ -187,6 +207,13 @@ class LearnedChannelSettings(_Strict):
                 "hint_shadow を置くなら limits.max_shadow_record_bytes と "
                 "limits.packet_overhead_bytes も置く"
             )
+        return self
+
+    @model_validator(mode="after")
+    def _hint_domain_names_the_shadow_record_limit(self) -> Self:
+        if self.hint_domain is not None and self.limits.max_shadow_record_bytes is None:
+            # B1 の記録を受け取る構成で、受信側の上限を持たない構成を作らない（0133 §2.5）
+            raise ValueError("hint_domain を置くなら limits.max_shadow_record_bytes も置く")
         return self
 
     @model_validator(mode="after")

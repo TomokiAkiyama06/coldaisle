@@ -21,7 +21,7 @@
 (function (root) {
   // 版ごとに**初めて現れた**欄（control/schema.py の SCHEMA_VERSION の説明）。
   // **schema.py にある版だけを知っている版にする。** 版の番号は先にマージされた PR で決まる
-  // （0064 §2.9 / 0071 §2.5）ため、推測で先取りしない。v17 以降は「未対応の版」。
+  // （0064 §2.9 / 0071 §2.5）ため、推測で先取りしない。v18 以降は「未対応の版」。
   // v11（#81 / 決定記録 0073 §2.5）: `air_balance` と `zones.*.applied_demand`。
   // v12（#74 / 決定記録 0072 §2.7）: `mode_command`（モードの出どころ・lease 切れ・受付の停止）。
   // v13（#92 / 決定記録 0072 §2.6）: `authority`（制御権の出どころ・journal を読めない・降格の指令）。
@@ -33,6 +33,8 @@
   //   突き合わせの検算に使うだけで、画面には出さない（版を読めるようにするだけ）。
   //   同じ版で `workload_hint`（#319 / 0133 §2.9 の B0。ヒントの段階・状態・`influence`）も足した。
   //   画面に出すかは 0064 §5 #5 のとおり別に決めるので、ここでは表示しない。
+  // v17（#288 / 決定記録 0162 §2.5 の PR-C）: `workload_hint` を v2 にした（`certificate` と
+  //   `shadow_counters`）。版を読めるようにするだけで、証明書・Shadow の数は画面に出さない（0133 §2.5a）。
   const SINCE = {
     workload_regime: 2,
     supervisor: 3,
@@ -50,7 +52,7 @@
     telemetry_health: 15,
     run_id: 16,
   };
-  const KNOWN_VERSIONS = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16];
+  const KNOWN_VERSIONS = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17];
 
   const NOT_IN_VERSION = "この版の記録には無い";
   const ZONE_KEYS = ["front", "rear", "top"];
