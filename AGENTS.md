@@ -42,6 +42,7 @@ uv run coldaisle-evaluate --runs var/evaluation-runs.yaml --out var/evaluation.j
 uv run coldaisle-drift --evidence var/drift-evidence.yaml --profile var/confidence-profile.json  # Model driftの検知（読み取りのみ・書き込みはしない。`--format markdown` で trend を人が読む表に）
 uv run coldaisle-supervisor-shadow --evidence var/supervisor-shadow-runs.yaml --registry-root var/model-registry --out var/supervisor-shadow.json  # Supervisor の Shadow 集計（DB と Registry を読むだけ。昇格は CLI の外）
 uv run coldaisle-air-balance-shadow --evidence var/air-balance-shadow-evidence.yaml --control-config var/control-config --out var/air-balance-shadow.json  # Air Balance の協調の shadow 集計（DB を読むだけ。**合否は出さない**。`--format markdown` で表に。決定記録 0093）
+uv run coldaisle-hint-shadow --evidence var/hint-shadow-evidence.yaml --db <DB の写し> --out var/hint-shadow.json  # Workload Hint B1 の Shadow の記録の集計（DB を読むだけ。**合否は出さない**。成功率は上限。`--format markdown` で表に。#288 / 決定記録 0162 §2.4）
 uv run coldaisle-eventd             # 書き込み専用の Unix ソケット入口（決定記録 0045。API とは別）
 uv run coldaisle-event gpu-mode compute  # GPU Mode の切り替えを記録する（#67）
 uv run coldaisle-event workload-hint training --expected-duration 4h  # Workload Hint を記録する（記録のみ。#107 / 決定記録 0064）
@@ -284,6 +285,7 @@ src/coldaisle/
   evaluate.py # 合成の起点: Controller構成の比較レポート（読み取りのみ）。#91
   supervisor_shadow.py # 合成の起点: 保存済み trace から Supervisor の Shadow 集計（読み取りのみ。制御へ届かない）。#89
   air_balance_shadow.py # 合成の起点: 保存済み trace から Air Balance の協調の shadow 集計（読み取りのみ・合否なし。制御へ届かない）。#81 / 決定記録 0093
+  hint_shadow.py # 合成の起点: Workload Hint B1 の Shadow の記録（hint_shadow_records）と trace の集計 `coldaisle-hint-shadow`（読み取りのみ・合否なし。control・AI 層・API・日次レポート・運用メモリから import しない）。#288 / 決定記録 0162 §2.4
   event_entry/ # 合成の起点: 書き込み専用の Unix ソケット入口。AI 層・API から import しない。#67
   control_admin/ # 合成の起点: coldaisle-fand の管理ソケット（運転モードと Authority の降格。昇格は受けない）。AI 層・API・eventd・control から import しない。#74 / #92 / 決定記録 0072
   learned_worker/ # 合成の起点: Learned MPC / RL Supervisor worker（`coldaisle-learnd --role mpc|supervisor`）。frame の列から MPC の提案・Supervisor の出力（Demand を含まない）を返す。MPC は B1 の Shadow solver の子（`shadow_solver.py`）の記録を転送するだけ（`shadow.py`。#288）。Telemetry・SQLite・較正ファイル・hwmon・AI 層を import しない。#86 / #89 / 決定記録 0077 / 0101 / 0107
