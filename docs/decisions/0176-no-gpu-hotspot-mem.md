@@ -43,7 +43,8 @@ collector（`coldaisle-telemetry`）は 2 つを毎回 `quality=missing` で保�
 
 - `config/server-health.yaml`: `panels.gpu` から 2 つを消す。`missing_tolerated` からも消す（もう行が来ないので要らない。`gpu.0.fan_policy` は残す）
 - `config/evaluation.yaml`: `temperature_metrics` から `gpu.0.hotspot` を消す
-- `config/airflow-characterization.yaml`: `telemetry.metrics` から `gpu.0.hotspot` を消す（0174 で測らないことにしたが、残すと `min_ok_ratio` で必ず不合格になる）
+- `config/airflow-characterization.yaml` は**変えない**。0153 の測り方は `gpu.0.hotspot` を必須の指標としてコードに持ち（`REQUIRED_METRICS`）、設定から外すと読み込みで拒否される。
+  0174 で測らないことにしたので実害は無い。導入先で測ることになったら、0153 の指標の見直しと一緒に扱う
 - `docs/requirements.md` の metric の表に、導入先では公開されず記録しない旨を書き添える
 
 ### 2.3 残すもの（機種によらない定義）
@@ -75,3 +76,4 @@ collector（`coldaisle-telemetry`）は 2 つを毎回 `quality=missing` で保�
 ## 4. 承認
 
 - 2026-10-29: 所有者が「取れないなら外してほしい」と判断し、同日に本記録の範囲（§2.1〜§2.5）を承認
+- 2026-10-29: 実装で、特性評価の設定は外せない（0153 の必須の指標）と分かり、§2.2 の該当の行を「変えない」に直した（範囲を狭める修正。マージ前）
