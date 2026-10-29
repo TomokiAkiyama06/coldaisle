@@ -38,6 +38,7 @@ from coldaisle.control.model.counterfactual import (
     FEATURE_SCHEMA_V2_VERSION,
     TARGET_SCHEMA_V2_VERSION,
 )
+from coldaisle.control.model.thermal import ObservedThermalInput
 from coldaisle.control.model_registry import (
     ArtifactKind,
     ArtifactRef,
@@ -128,6 +129,20 @@ class FrameAuthority:
 
 
 @dataclass(frozen=True, slots=True)
+class StepInput:
+    """基準の solve に使った入力（Workload Hint の B1 の Shadow solver の依頼に写す。0133 §2.5）。
+
+    ヒントの欄（``supervisor_hint`` / ``hint_certification``）を持つ frame で提案を作った周期にだけ
+    残す。基準の solve はヒントの欄を読まない。
+    """
+
+    frame: LearnedFrame
+    observed: ObservedThermalInput
+    frames: tuple[LearnedFrame, ...]
+    """window を作った frame の列（時刻順・最後が ``frame``）。"""
+
+
+@dataclass(frozen=True, slots=True)
 class WorkerInputs:
     """worker が起動時に読んだもの（Control Config と Metric Catalog）。"""
 
@@ -162,6 +177,12 @@ class MpcWorkerCore:
         self._runtime_failure: Reason | None = None
         self._bound_stage: AuthorityStage | None = None
         self._authority = FrameAuthority(AuthorityStage.SHADOW)
+        self._last_input: StepInput | None = None
+
+    @property
+    def last_input(self) -> StepInput | None:
+        """最後の ``step()`` がヒントの欄を持つ frame で提案を作ったときの入力。それ以外は None。"""
+        return self._last_input
 
     @property
     def history(self) -> FrameHistory:
@@ -194,6 +215,7 @@ class MpcWorkerCore:
 
     def step(self) -> MpcProposal | None:
         """この周期の結果。何も送らない周期は None（0107 §2.3）。"""
+        self._last_input = None
         frame = self._history.latest
         run_id = self._history.run_id
         if frame is None or run_id is None:
@@ -238,6 +260,11 @@ class MpcWorkerCore:
         if built.observed is None or frame.supervisor is None or frame.baseline is None:
             return None
         self._authority.stage = frame.authority_stage
+        if frame.supervisor_hint is not None:
+            # 基準の solve には使わない。Shadow solver の依頼に写すためだけに残す（0133 §2.5）
+            self._last_input = StepInput(
+                frame=frame, observed=built.observed, frames=self._history.frames
+            )
         return runtime.propose(
             snapshot=frame.snapshot,
             observed=built.observed,

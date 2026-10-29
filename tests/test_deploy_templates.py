@@ -797,8 +797,23 @@ def test_the_two_worker_units_differ_only_in_role_identity():
         for key in mpc[section]:
             if (section, key) not in identity:
                 assert mpc[section][key] == rl[section][key], f"{section}.{key}"
-    a = one(mpc, "Service", "ExecStart").replace("--role mpc", "--role supervisor")
+    # --hint-lockfile は MPC の unit にだけある（下の試験。0162 §2.5）
+    mpc_exec = one(mpc, "Service", "ExecStart").split()
+    lockfile = mpc_exec.index("--hint-lockfile")
+    del mpc_exec[lockfile : lockfile + 2]
+    a = " ".join(mpc_exec).replace("--role mpc", "--role supervisor")
     assert a == one(rl, "Service", "ExecStart")
+
+
+def test_only_the_mpc_worker_gets_the_same_hint_lockfile_as_fand():
+    """Shadow solver の子の部品 lockfile は fand と同じファイル（0152 §2.4 / 0162 §2.5 / §5 の 8）。
+
+    Supervisor の worker はヒントを受け取らない（0133 §2.2）ので渡さない（渡すと引数の誤り）。
+    """
+    mpc_exec = one(worker("mpc"), "Service", "ExecStart").split()
+    fand_exec = one(fand(), "Service", "ExecStart").split()
+    assert option(mpc_exec, "--hint-lockfile") == option(fand_exec, "--hint-lockfile")
+    assert "--hint-lockfile" not in one(worker("supervisor"), "Service", "ExecStart").split()
 
 
 @pytest.mark.parametrize("role", WORKERS)

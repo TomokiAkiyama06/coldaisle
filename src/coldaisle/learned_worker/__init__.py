@@ -10,6 +10,8 @@
 - hwmon / PWM・シリアル・LLM 層に触れない（`coldaisle.ai` / `coldaisle.api` / `coldaisle.store` /
   `coldaisle.control.hardware` / `serial` を import しない。試験で止める）
 - 観測 window・anchor の action・提案を作らない周期の規則は決定記録 0107
-- frame v4 のヒントの欄（`supervisor_hint` / `hint_certification`）は**読まない**。読むのは
-  Shadow solver の子プロセス（決定記録 0162 §2.5 の PR-B）で、基準の solve には使わない
+- frame v4 のヒントの欄（`supervisor_hint` / `hint_certification`）は基準の solve に**使わない**。
+  基準を送った後に、Shadow solver の子プロセス（`shadow_solver.py`。`SCHED_IDLE`）へ1枠の依頼として
+  渡し、子の結果を Shadow の記録（`hint_shadow`）として fand へ転送するだけ（`shadow.py`。決定記録
+  0133 §2.5・0162 §2.5 の PR-B）。記録は値の写しで、受け渡し口にも Gate にも入らない
 """

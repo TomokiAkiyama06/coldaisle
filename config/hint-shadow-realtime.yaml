@@ -1,0 +1,48 @@
+# Workload Hint の B1 の Shadow solver の実時間の試験の設定（#288 / 決定記録 0133 §2.5・0162 §2.5 の PR-B）
+#
+# **試験だけが読みます**（tests/test_hint_shadow_realtime.py。coldaisle-fand・worker は読みません）。
+# 実際の Shadow solver の子を SCHED_IDLE で起動し、論理 CPU の数だけの計算ループ（SCHED_IDLE）で CPU を
+# 使い切った状態と、子を起動しない状態とで、同じ frame の列を実時間で流します。各周期の
+# 「next_due から基準の MpcProposal を送り終えるまでの時間」の分布の p50 / p99 / 最大の差が、下の許容幅に
+# 収まることを確かめます。fand 側の受信を遅らせる条件も含めます。
+#
+# 実時間に依存するので、通常の CI（-m "not hardware"）からは外します（hardware と realtime の marker）。
+# リリースゲートと B1 の着手の前に**本番のホスト**で走らせます（B1 の前提。決定記録 0133 §2.6）:
+#
+#   uv run pytest -m realtime tests/test_hint_shadow_realtime.py
+#
+# 値はすべて暫定値です。本番のホストで測ってから決めます（ルール 9）。
+
+version: 1
+
+# 1つの条件で流す周期の数と、worker の周期（ミリ秒）。fand の frame も同じ周期で送ります。
+periods:
+  value: 300
+  status: provisional
+  basis: "決定記録 0133 §2.5（数百周期）。1条件あたり約 15 s"
+period_ms:
+  value: 50
+  status: provisional
+  basis: "試験の時間を抑える短い周期。本番の mpc.period_ms より短くし、取り合いを厳しい側にする"
+
+# fand 側の受信を遅らせる条件で、fand が1件読むごとに待つ時間（ミリ秒）。
+slow_reader_delay_ms:
+  value: 20
+  status: provisional
+  basis: "決定記録 0133 §2.5（fand 側の受信を遅らせる条件）。周期の半分に近い遅れの暫定値"
+
+# 子と計算ループがある条件と無い条件の、送るまでの時間の分布の差の上限（ミリ秒）。
+# 子がある条件のほうが遅い向きの差だけを見ます（早い向きの差は危険側ではないため）。
+tolerance_ms:
+  p50:
+    value: 2
+    status: provisional
+    basis: "決定記録 0133 §2.5（許容幅は本番のホストで決める）。開発機での暫定値"
+  p99:
+    value: 10
+    status: provisional
+    basis: "決定記録 0133 §2.5（許容幅は本番のホストで決める）。開発機での暫定値"
+  max:
+    value: 25
+    status: provisional
+    basis: "決定記録 0133 §2.5（許容幅は本番のホストで決める）。周期の半分の暫定値"

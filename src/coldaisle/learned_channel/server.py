@@ -50,6 +50,7 @@ from coldaisle.learned_channel.mailbox import LearnedMailbox
 from coldaisle.learned_channel.messages import (
     FrameBody,
     HelloBody,
+    HintShadowBody,
     MpcResultBody,
     OutboundEnvelope,
     SupervisorResultBody,
@@ -491,6 +492,12 @@ class LearnedChannelServer:
             self._drop(conn.role, "role_mismatch")
             return
         body = envelope.body
+        if isinstance(body, HintShadowBody):
+            # Shadow の記録の受信・検証・記録は PR-C で足す（決定記録 0162 §2.5）。それまでは捨て、
+            # **生存の知らせに数えない**（生存は基準の結果と heartbeat だけで決める。0162 §2.3）。
+            # 接続は切らない（基準の経路を Shadow の記録の有無で変えない。0133 §2.5）
+            self._drop(conn.role, "unsupported_body")
+            return
         if isinstance(body, MpcResultBody):
             if conn.role is not LearnedRole.MPC:
                 self._drop(conn.role, "unsupported_body")
