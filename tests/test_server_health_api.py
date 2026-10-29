@@ -3,13 +3,16 @@
 from __future__ import annotations
 
 import ast
+import functools
 import importlib
 import json
+import tempfile
 import threading
 import time
 from pathlib import Path
 
 import pytest
+import yaml
 from fastapi.testclient import TestClient
 
 from coldaisle.ai import (
@@ -154,6 +157,39 @@ def _populate(
         store.set_system_state("sys.gpu_mode", "ai", at_ms=ts_ms)
 
 
+UNPUBLISHED_GPU_TEMPERATURES = ("gpu.0.hotspot", "gpu.0.mem")
+"""導入先の GPU が NVML で公開しない温度（決定記録 0040 / 0176）。"""
+
+
+def unpublished_but_recorded_settings(tmp_dir: Path) -> Path:
+    """リポジトリの設定に、公開されない温度を panels と ``missing_tolerated`` へ戻したもの。
+
+    導入先は collector で記録しない（0176）が、記録したまま ``missing`` を許す 0040 の仕組みは残る。
+    その仕組みの試験は、記録を止めていない GPU の設定で行う。
+    """
+    document = yaml.safe_load((CONFIG_DIR / "server-health.yaml").read_text(encoding="utf-8"))
+    gpu_panel = document["panels"]["gpu"]
+    core = gpu_panel.index("gpu.0.core")
+    document["panels"]["gpu"] = [
+        *gpu_panel[: core + 1],
+        *UNPUBLISHED_GPU_TEMPERATURES,
+        *gpu_panel[core + 1 :],
+    ]
+    document["missing_tolerated"] = [
+        *UNPUBLISHED_GPU_TEMPERATURES,
+        *document["missing_tolerated"],
+    ]
+    path = tmp_dir / "server-health-unpublished-recorded.yaml"
+    path.write_text(yaml.safe_dump(document, allow_unicode=True), encoding="utf-8")
+    return path
+
+
+@functools.cache
+def _unpublished_but_recorded() -> Path:
+    # 別の試験 module も `_app` を import して使うので、fixture ではなく初回に作る
+    return unpublished_but_recorded_settings(Path(tempfile.mkdtemp(prefix="server-health-")))
+
+
 def _app(
     path: Path,
     clock: SimulatedClock,
@@ -163,12 +199,14 @@ def _app(
     nvml_metrics=NVML_METRICS,
     cpu_power_metrics=(),
     llm_exclusions=None,
+    server_health: Path | None = None,
 ):
     return create_app(
         Config(
             db=path,
             quality_rules=QUALITY_RULES_PATH,
             metrics=CONFIG_DIR / "metrics.yaml",
+            server_health=server_health or _unpublished_but_recorded(),
             compute_mode_advisory=CONFIG_DIR / "compute-mode-advisory.yaml",
             stream_poll_s=0.001,
         ),
@@ -928,7 +966,51 @@ def test_server_health_settings_reject_tolerating_a_required_metric(tmp_path):
 def test_repository_server_health_settings_load():
     catalog = MetricCatalog.from_yaml(CONFIG_DIR / "metrics.yaml")
     settings = ServerHealthSettings.from_yaml(CONFIG_DIR / "server-health.yaml", catalog=catalog)
-    assert settings.missing_tolerated == {"gpu.0.hotspot", "gpu.0.mem", "gpu.0.fan_policy"}
+    # 公開されない温度は collector が記録しない（0176）ので、許容の一覧にもパネルにも無い
+    assert settings.missing_tolerated == {"gpu.0.fan_policy"}
+    assert not set(UNPUBLISHED_GPU_TEMPERATURES) & set(settings.panels.gpu)
+
+
+def test_unrecorded_gpu_temperatures_are_neither_shown_nor_monitored(tmp_path, rules):
+    """導入先の設定: 記録しない温度はパネルに出ず、古い missing の行が残っても signal を下げない。
+
+    0176 の前に保存した ``missing`` の行は保持期間まで残る。監視対象は collector の
+    ``expected_metrics`` から決まるので、記録しない metric の行は見ない（§2.5）。
+    """
+    path = tmp_path / "unrecorded.db"
+    _populate(
+        path,
+        rules,
+        internal_values={
+            name: value
+            for name, value in INTERNAL_VALUES.items()
+            if name not in UNPUBLISHED_GPU_TEMPERATURES
+        },
+    )
+    with SqliteStore(path, rules=rules, clock=SimulatedClock(NOW_MS)) as store:
+        for metric in UNPUBLISHED_GPU_TEMPERATURES:
+            store.insert_sample(
+                Sample(
+                    ts_ms=NOW_MS - 3_600_000,
+                    readings=(Reading(metric=metric, value=None, quality=Quality.MISSING),),
+                )
+            )
+    nvml = NvmlAdapter(
+        NvmlConfig(enabled=True, gpu_indices=(0,), excluded_metrics=UNPUBLISHED_GPU_TEMPERATURES)
+    ).expected_metrics
+
+    with TestClient(
+        _app(
+            path,
+            SimulatedClock(NOW_MS),
+            nvml_metrics=nvml,
+            server_health=CONFIG_DIR / "server-health.yaml",
+        )
+    ) as client:
+        body = client.get("/api/v1/server-health").json()
+
+    assert not set(UNPUBLISHED_GPU_TEMPERATURES) & set(body["gpu"]["metrics"])
+    assert body["signal"] == "green"
 
 
 def test_stale_row_of_a_removed_input_does_not_degrade_the_signal(tmp_path, rules):

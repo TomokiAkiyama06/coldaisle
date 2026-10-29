@@ -3,17 +3,21 @@
 from __future__ import annotations
 
 import importlib
+import logging
 import math
 from collections.abc import Callable
 from types import ModuleType
 from typing import Any, NamedTuple, Protocol, cast
 
+from coldaisle import logs
 from coldaisle.internal_telemetry.config import NvmlConfig
 from coldaisle.internal_telemetry.gpu_state import GPU_STATE_KEY, GpuState, GpuStateClassifier
 from coldaisle.internal_telemetry.models import AdapterResult, SourceStatus
 from coldaisle.store import Quality, Reading
 
 GIB = 1024**3
+
+LOGGER = logging.getLogger("coldaisle.internal_telemetry")
 
 THROTTLE_REASON_BITS: dict[str, int] = {
     "hw_slowdown": 0x8,
@@ -256,8 +260,11 @@ class NvmlAdapter:
         self._api = api or PynvmlApi()
         self._gpu_state = gpu_state
         self._initialized = False
+        self._excluded = frozenset(config.excluded_metrics)
+        # 除外した metric が読めるかは起動後に1回だけ確かめる（決定記録 0176 §2.1）
+        self._excluded_probed = not self._excluded
         self._expected_metrics = (
-            *(metric for index in config.gpu_indices for metric in _gpu_metrics(index)),
+            *(metric for index in config.gpu_indices for metric in self._gpu_metrics(index)),
             "sys.cuda_processes",
         )
 
@@ -308,7 +315,7 @@ class NvmlAdapter:
         any_available = False
         for index in self._config.gpu_indices:
             if index >= count:
-                readings.extend(_missing(metric) for metric in _gpu_metrics(index))
+                readings.extend(_missing(metric) for metric in self._gpu_metrics(index))
                 critical_available = False
                 power_available = False
                 process_info_complete = False
@@ -316,15 +323,20 @@ class NvmlAdapter:
             try:
                 handle = self._api.handle(index)
             except Exception:
-                readings.extend(_missing(metric) for metric in _gpu_metrics(index))
+                readings.extend(_missing(metric) for metric in self._gpu_metrics(index))
                 critical_available = False
                 power_available = False
                 process_info_complete = False
                 continue
 
+            self._probe_excluded(index, handle)
             core = self._read(self._api.core_temperature_c, handle)
-            hotspot = self._read(self._api.hotspot_temperature_c, handle)
-            memory = self._read(self._api.memory_temperature_c, handle)
+            hotspot = self._read_unless_excluded(
+                f"gpu.{index}.hotspot", self._api.hotspot_temperature_c, handle
+            )
+            memory = self._read_unless_excluded(
+                f"gpu.{index}.mem", self._api.memory_temperature_c, handle
+            )
             utilization = self._read(self._api.utilization_pct, handle)
             vram = self._read(self._api.vram_used_gb, handle)
             power = self._read(self._api.power_w, handle)
@@ -333,7 +345,8 @@ class NvmlAdapter:
             fan_policy = self._read(self._api.fan_policy_manual, handle)
             throttle = _throttle_flags(self._api, handle)
             readings.extend(
-                (
+                reading
+                for reading in (
                     _reading(f"gpu.{index}.core", core),
                     _reading(f"gpu.{index}.hotspot", hotspot),
                     _reading(f"gpu.{index}.mem", memory),
@@ -348,6 +361,7 @@ class NvmlAdapter:
                         for reason, flag in throttle.items()
                     ),
                 )
+                if reading.metric not in self._excluded
             )
             critical_available &= core is not None
             power_available &= power is not None
@@ -422,6 +436,46 @@ class NvmlAdapter:
         if value is None or not math.isfinite(value):
             return None
         return value
+
+    def _gpu_metrics(self, index: int) -> tuple[str, ...]:
+        """この GPU で記録する metric（``excluded_metrics`` を除く）。"""
+        return tuple(metric for metric in _gpu_metrics(index) if metric not in self._excluded)
+
+    def _read_unless_excluded(
+        self, metric: str, reader: Callable[[object], float | None], handle: object
+    ) -> float | None:
+        # 除外した値は NVML から読まない。公開されない値を毎周期問い合わせても得るものが無い
+        if metric in self._excluded:
+            return None
+        return self._read(reader, handle)
+
+    def _probe_excluded(self, index: int, handle: object) -> None:
+        """除外した metric を1回だけ読み、取れたら警告する（決定記録 0176 §2.1）。
+
+        driver の更新で値が出るようになっても、黙って捨て続けないため。行は書かない。
+        """
+        if self._excluded_probed:
+            return
+        self._excluded_probed = True
+        readers = {
+            f"gpu.{index}.hotspot": self._api.hotspot_temperature_c,
+            f"gpu.{index}.mem": self._api.memory_temperature_c,
+        }
+        available = sorted(
+            metric
+            for metric, reader in readers.items()
+            if metric in self._excluded and self._read(reader, handle) is not None
+        )
+        if available:
+            LOGGER.warning(
+                "記録しない設定の GPU の metric が読める",
+                extra={
+                    logs.FIELDS_KEY: {
+                        "event": "excluded_metric_available",
+                        "metrics": available,
+                    }
+                },
+            )
 
     def _unavailable(self, error: Exception) -> AdapterResult:
         return AdapterResult(

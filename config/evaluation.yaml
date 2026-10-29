@@ -13,7 +13,6 @@ schema_version: 1
 # 平均・percentile・最大と threshold margin を出す温度。閾値は safety.yaml から取る。
 temperature_metrics:
   - gpu.0.core
-  - gpu.0.hotspot
   - cpu.package
 
 # ΔT（GPU 吸気 / ケース内予熱）。名前だけを書き、式は config/metrics.yaml から引く。

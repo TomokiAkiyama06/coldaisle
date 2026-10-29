@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 import pytest
 from pydantic import ValidationError
 
+from coldaisle import logs
 from coldaisle.internal_telemetry import (
     THROTTLE_REASON_BITS,
     ClockEventReasons,
@@ -401,3 +402,108 @@ def test_nvml_adapter_never_writes_the_fan():
     ).read_text(encoding="utf-8")
     assert "nvmlDeviceSetFan" not in source
     assert "SetDefaultFan" not in source
+
+
+# ------------------------------------------------ 記録しない metric（決定記録 0176）
+
+
+class CountingNvml(FakeNvml):
+    """hotspot / memory を読んだ回数を数える。"""
+
+    def __init__(self, *, hotspot: float | None = None, memory: float | None = None) -> None:
+        super().__init__()
+        self.hotspot = hotspot
+        self.memory = memory
+        self.hotspot_reads = 0
+        self.memory_reads = 0
+
+    def hotspot_temperature_c(self, handle: object) -> float | None:
+        self.hotspot_reads += 1
+        return self.hotspot
+
+    def memory_temperature_c(self, handle: object) -> float | None:
+        self.memory_reads += 1
+        return self.memory
+
+
+def excluding(*metrics: str) -> NvmlConfig:
+    return NvmlConfig(enabled=True, gpu_indices=(0,), excluded_metrics=metrics)
+
+
+def test_excluded_metrics_are_neither_expected_nor_written() -> None:
+    adapter = NvmlAdapter(excluding("gpu.0.hotspot", "gpu.0.mem"), CountingNvml())
+
+    assert "gpu.0.hotspot" not in adapter.expected_metrics
+    assert "gpu.0.mem" not in adapter.expected_metrics
+    assert "gpu.0.core" in adapter.expected_metrics
+    for _ in range(3):
+        readings = by_metric(adapter)
+        assert "gpu.0.hotspot" not in readings
+        assert "gpu.0.mem" not in readings
+        assert readings["gpu.0.core"].value == 60.0
+
+
+def test_excluded_metrics_are_left_out_of_the_missing_rows_too() -> None:
+    """NVML が使えない周期の missing の行にも、除外した metric を書かない。"""
+    adapter = NvmlAdapter(excluding("gpu.0.hotspot", "gpu.0.mem"), FakeNvml(fail_init=True))
+
+    readings = by_metric(adapter)
+
+    assert "gpu.0.hotspot" not in readings
+    assert "gpu.0.mem" not in readings
+    assert readings["gpu.0.core"].quality is Quality.MISSING
+
+
+def test_excluded_metrics_are_probed_once_and_never_read_again() -> None:
+    api = CountingNvml()
+    adapter = NvmlAdapter(excluding("gpu.0.hotspot", "gpu.0.mem"), api)
+
+    for _ in range(4):
+        adapter.poll()
+
+    assert (api.hotspot_reads, api.memory_reads) == (1, 1)
+
+
+def test_an_excluded_metric_that_becomes_readable_is_logged_not_written(caplog) -> None:
+    """driver の更新で値が出ても、黙って捨て続けない。行は書かない。"""
+    api = CountingNvml(hotspot=None, memory=71.0)
+    adapter = NvmlAdapter(excluding("gpu.0.hotspot", "gpu.0.mem"), api)
+
+    with caplog.at_level("WARNING", logger="coldaisle.internal_telemetry"):
+        readings = by_metric(adapter)
+        adapter.poll()
+
+    warnings = [
+        getattr(record, logs.FIELDS_KEY)
+        for record in caplog.records
+        if getattr(record, logs.FIELDS_KEY, {}).get("event") == "excluded_metric_available"
+    ]
+    assert warnings == [{"event": "excluded_metric_available", "metrics": ["gpu.0.mem"]}]
+    assert "gpu.0.mem" not in readings
+
+
+def test_unpublished_temperatures_still_read_when_not_excluded() -> None:
+    api = CountingNvml(memory=71.0)
+    adapter = NvmlAdapter(config(0), api)
+
+    readings = by_metric(adapter)
+
+    assert readings["gpu.0.mem"].value == 71.0
+    assert readings["gpu.0.hotspot"].quality is Quality.MISSING
+    assert api.hotspot_reads == 1
+
+
+@pytest.mark.parametrize(
+    "metrics",
+    [
+        ("gpu.0.core",),
+        ("power.gpu.0",),
+        ("gpu.0.utilization",),
+        ("gpu.1.hotspot",),
+        ("gpu.0.hotspot", "gpu.0.hotspot"),
+    ],
+)
+def test_only_unpublished_temperatures_can_be_excluded(metrics: tuple[str, ...]) -> None:
+    """core（Critical Safety の入力）や電力を誤記で止めない（決定記録 0176 §2.1）。"""
+    with pytest.raises(ValidationError):
+        excluding(*metrics)
