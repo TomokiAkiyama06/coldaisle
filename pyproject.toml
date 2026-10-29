@@ -16,6 +16,9 @@ dependencies = [
     "httpx",
     # GPU Telemetry は nvidia-smi を spawn せず NVML を直接読む（#65）
     "nvidia-ml-py>=13",
+    # 日次レポートの測定値の表の画像だけに使う（coldaisle.report_table。決定記録 0171 §2.3）。
+    # 取り込み・API・fand・Learned からは import しない
+    "pillow>=12,<13",
 ]
 
 [dependency-groups]
@@ -78,6 +81,9 @@ coldaisle-authority = "coldaisle.authority_cli:main"
 # 設定にも書かない（登録は人が coldaisle-registry で行う）。本番は `python -I -m coldaisle.hint_certify`
 # で起動し、この console script は開発用（-I -m でなければ何もせずに終わる。#288 / 決定記録 0152 / 0157）
 coldaisle-hint-certify = "coldaisle.hint_certify:main"
+# 反実仮想 Thermal Model の offline 評価。**書くのは --out の報告だけ**（Registry・設定・DB に書かない）。
+# 人が手で実行し、timer から呼ばない。gate は助言（#84 / 決定記録 0172）
+coldaisle-thermal-evaluate = "coldaisle.thermal_evaluate:main"
 # fan daemon 停止後にだけ systemd ExecStopPost から起動する。
 # 制御モデル・Safety Config・外部パッケージに依存せず Max しか書かない。
 coldaisle-safety-handoff = "coldaisle.safety_handoff:main"

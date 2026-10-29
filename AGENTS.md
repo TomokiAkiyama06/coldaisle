@@ -70,6 +70,7 @@ uv run coldaisle-authority raise --authority-root <dir> --approval <承認.json>
 uv run python -I -m coldaisle.hint_certify --config-dir var/control-config --registry-root var/model-registry --hint-lockfile uv.lock --calibration config/calibration.json --out var/hint-certificate.json  # Workload Hint の単調性ゲートの認証ランナー（合格したときだけ --out に証明書を書く。**Registry・設定に書かない**。登録は人が coldaisle-registry で。-I -m でない・SCHED_IDLE に下げられないなら何もしない。#288 / 決定記録 0152 §2.1 / 0157 / 0160 §2.4）
 #   本番は `/opt/coldaisle/.venv/bin/python -I -m coldaisle.hint_certify ...`（console script の coldaisle-hint-certify は -I -m でないので何もしない。docs/ubuntu-deploy.md 6.10）
 uv run coldaisle-authority rollback --authority-root <dir> --reason "fand 停止中に戻す"  # fand が止まっているときの rollback（uid で拒まない）
+uv run coldaisle-thermal-evaluate --registry-root var/model-registry --registry-limits config --artifact rack-thermal@0.1.0 --dataset var/datasets/dataset-<32 hex> --validation-start-ms <境界> --test-start-ms <境界> --evaluation-config var/thermal-evaluation.yaml --metrics-config config/metrics.yaml --calibration config/calibration.json --out var/thermal-evaluation/<名前>.json  # 反実仮想 Thermal Model の offline 評価（学習した dataset の test だけ・persistence と対で比べる。**書くのは --out だけ**・Registry に書かない。gate は助言。設定の例は config/thermal-evaluation.example.yaml（仮の値）。#84 / 決定記録 0172）
 COLDAISLE_DB=var/coldaisle.db uv run uvicorn coldaisle.api:app --host 127.0.0.1 --port 8000
 COLDAISLE_DB=var/coldaisle.db uv run uvicorn coldaisle.server:app --port 8000  # + AI ツールの窓口
 # エアフロー画面: http://127.0.0.1:8000/airflow.html（制御の状態は /api/v1/control/latest の trace から。
@@ -269,6 +270,7 @@ src/coldaisle/
   ingest/     # L0: Source実装（serial / mock / replay）、正規化
   alert_graph.py # 合成の起点の部品: Slack の発火の通知に直近 60 分のグラフを後から添える（専用のスレッド・自分の DB の接続・LLM を使わない）。#334 / 決定記録 0147
   report.py   # 合成の起点: 日次レポート（Store→AI→通知）。#25
+  report_table.py # 合成の起点の部品: 日次レポートの測定値の表を PNG に描く（Pillow は関数の中で読む。取り込み・API・fand・Learned から import しない）。#380 / 決定記録 0171
   soak.py     # 合成の起点: 連続運転テストの集計（Store を読むだけ）。#47
   load_distribution.py # 合成の起点: 負荷の状態（電力の帯）ごとの d.* の分布（DB を mode=ro で読むだけ・合否なし。AI 層・API から import しない）。#50 / 決定記録 0151
   airflow_characterization.py # 合成の起点: 回転数の掃引と応答の行列の解析（checkpoint 済みの DB の写しを immutable で読むだけ・設定へ書かない。control・AI 層・API から import しない）。#75 / 決定記録 0153
@@ -297,6 +299,7 @@ src/coldaisle/
   cpu_power_publisher.py # root の `coldaisle-cpu-power`: RAPL の CPU Package 電力を 1 s 平均・1 W で `/run` へ書く。**標準ライブラリだけ・coldaisle を import しない**（`python3 -I -S`）。#278 / 決定記録 0122
   gpu_fan_curve.py # root の `coldaisle-gpu-fan`: GPU の Fan を GPU コアの温度の曲線で書く（NVML を ctypes で。fand の外）。止まったら既定の制御へ戻す。**標準ライブラリだけ・coldaisle を import しない**（`python3 -I -S`）。#285 / 決定記録 0128
   calibration_log.py # 合成の起点の部品: 較正の変更の記録（取り込みの起動時の lock と追記・運転中の時刻の下限・Dataset v2 と学習の入口の検査）。書き手は取り込みだけ。#233 / 決定記録 0099
+  thermal_evaluate.py # 合成の起点: 反実仮想 Thermal Model の offline 評価の CLI `coldaisle-thermal-evaluate`（学習した dataset の test・persistence との対の比較・辞書式の gate）。**書くのは --out だけ**。**どこからも import しない**。#84 / 決定記録 0172。報告・設定の型と gate・digest の関数は葉の `thermal_evaluation_report.py`（coldaisle を import しない）
   control_daemon.py # 合成の起点: Fan制御デーモン。**hwmonへ書くのはこのプロセスだけ**。#74
   store/      # L1: SQLite、ロールアップ、CSVエクスポート
   api/        # L2: FastAPI、WebSocket

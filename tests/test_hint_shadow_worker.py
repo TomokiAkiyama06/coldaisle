@@ -925,7 +925,10 @@ def test_a_real_child_runs_at_sched_idle_answers_and_is_respawned_after_dying(
         assert [result.seq for result in results] == [7]
         # 親が other（pytest は -I でない）なので environment を計算せず、照合は不一致
         assert results[0].reason is HintShadowSkipReason.CERTIFICATION_MISMATCH
-        # 子が死んだら、結果を返さずに失われた依頼として数え、間隔をあけて作り直す
+        # 子が死んだら、結果を返さずに失われた依頼として数え、間隔をあけて作り直す。
+        # 先に止めてから頼む。頼んでから殺すと、速い子が殺される前に答えを返し、
+        # 依頼が失われない（CI でまれに落ちた）
+        os.kill(child.process.pid, signal.SIGSTOP)
         solver.submit(world.with_request(seq=8, deadline_mono_ms=clock.monotonic_ms() + 30_000))
         os.kill(child.process.pid, signal.SIGKILL)
         events = drive(solver, lambda: solver.state is not SolverState.BUSY)

@@ -1,6 +1,7 @@
 """返す文の扱い（決定記録 0168 §2.3 の数値の検査 / §2.4）。
 
 - 通知を起こす記法（`<!channel>` `<!here>` `<@U…>` など）と `<…|…>` のリンクを取り除く
+- Markdown の太字 `**…**` を Slack の mrkdwn の太字 `*…*` に直す（#379）
 - `&` `<` `>` を Slack の規則でエスケープする
 - 1 投稿の長さで切る
 - ツールの結果に無い数値があれば末尾に未検証の印を付ける（答えは捨てない。0168 §5 の 5）
@@ -53,6 +54,20 @@ _BROADCAST = re.compile(r"@(channel|here|everyone)\b", re.IGNORECASE)
 `chat.postMessage` は既定では通知にしないが、念のため全角の `＠` にする。
 """
 
+_MARKDOWN_BOLD = re.compile(r"\*\*(?=\S)([^\n]+?)(?<=\S)\*\*")
+"""Markdown の太字 `**…**`（1 行の中で、内側の両端が空白でないもの）。
+
+LLM は Markdown の太字を書くが、Slack の mrkdwn では `**` は記号のまま出る（#379）。
+内側の両端が空白のもの（`** 注意 **`）は Markdown でも太字ではないので直さない。
+"""
+
+_STRAY_BOLD = re.compile(r"(?<![0-9])\*\*|\*\*(?![0-9])")
+"""対にならずに残った `**`。
+
+記号のまま出るので消す。ただし数字に挟まれたもの（`2**10`）は残す。消すと `210` という
+**ツールの結果に無い数値**ができてしまい、数値の検査（検査は直す前の文で行う）をすり抜ける。
+"""
+
 _CONTROL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 
 _PARTIAL_ENTITY = re.compile(r"&[a-z]{0,3}$")
@@ -71,6 +86,10 @@ def sanitize(text: str) -> str:
     cleaned = _SPECIAL.sub("", cleaned)
     cleaned = _BARE_URL.sub(LINK_OMITTED, cleaned)
     cleaned = _BROADCAST.sub(lambda m: f"＠{m.group(1)}", cleaned)
+    # URL を消した後に直す。先に直すと `**https://…**` の閉じの `*` を URL が飲み込み、
+    # `*` が 1 つだけ残る。エスケープは `*` を変えないので、その前でも後でも同じ
+    cleaned = _MARKDOWN_BOLD.sub(r"*\1*", cleaned)
+    cleaned = _STRAY_BOLD.sub("", cleaned)
     return cleaned.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").strip()
 
 

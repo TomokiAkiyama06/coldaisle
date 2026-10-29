@@ -10,17 +10,14 @@
 # 日の境界に使うローカル時刻
 timezone: "Asia/Tokyo"
 
-# Markdown の保存先。`~` は展開します。
-#
-# **`docs/` には置きません**（#25 の記述からの変更。決定記録 0017 §2.4）。
-# 生成物であって文書ではなく、リポジトリは public です。室温と在室の傾向は
-# 生活パターンそのものなので、公開リポジトリへ自動でコミットされうる場所には
-# 置きません。閲覧したいだけなら `--print` で標準出力へ出せます。
-output_dir: "var/reports"
+# ファイルには保存しません（決定記録 0171 §2.4。0017 §2.4 の `var/reports` を置き換え）。
+# 読みたいときは `coldaisle-report --date <日> --no-send --print` で標準出力へ出します。
 
-# 宛先の名前。空にすると送らず、ファイルだけ残します。
+# 宛先の名前。空にすると送りません。
 # **`Router` は通しません**（連投の抑制・夜間の方針はアラートの都合）
-to: [stdout]
+# Slack の宛先（Bot か Webhook の環境変数）が無い導入では、「宛先が設定されていない」の warning を
+# 残して何も送りません（stdout にも出しません）。
+to: [slack]
 
 # AI に所見（2〜3文）を書かせるか。**失敗しても表だけで成立します**
 summarise: true
@@ -44,5 +41,46 @@ llm_excluded_rules: []
 # アラートの内訳に載せるルール数の上限
 max_alerts: 20
 
-# 通知に載せる文字数。全文はファイルに残ります（LINE は5000文字で切られる）
+# Webhook・LINE・stdout の 1 通に載せる文字数。長ければ切り、末尾に「…（続きはダッシュボードで）」を
+# 付けます（LINE は5000文字で切られる）。Slack の Bot の要点はこれで切りません（決定記録 0171 §2.2）
 max_notification_chars: 3500
+
+# Slack の Bot（`COLDAISLE_SLACK_BOT_TOKEN` / `COLDAISLE_SLACK_CHANNEL`）で送るときの親の題（決定記録 0171）。
+#
+# チャンネルにはこの題だけを送り、レポートの本文はそのスレッドへ返します。`{month}` と `{day}` に
+# 対象日の月と日が 0 埋めせずに入ります（年は付けません）。Webhook だけのとき・LINE・stdout では
+# 使いません（今までどおり 1 通）。
+thread_title: "📄 {month}月{day}日の振り返り"
+
+# Slack の Bot のスレッドの要点（返信 1）の「主な値」に最高値を載せる metric（決定記録 0171 §2.2）。
+# その日の値が無いものは書きません。`config/metrics.yaml` に無い名前は起動時に落ちます。
+highlight_metrics:
+  - air.room
+  - gpu.0.core
+  - cpu.package
+  - board.connector_12v2x6
+  - power.gpu.0
+  - power.cpu.package
+
+# Slack の Bot のスレッドの表（返信 2。画像と、描けないときの文）に載せる metric とその順（決定記録 0171 §2.3）。
+# 列は「メトリクス・平均・最高」だけです。その日の値が無い metric も「—」の行で残します。
+# Webhook・LINE・`--print` の 1 通の全行の表には効きません。`config/metrics.yaml` に無い名前は起動時に落ちます。
+table_metrics:
+  - air.room
+  - air.room_humidity
+  - air.front_intake
+  - air.gpu_intake
+  - air.gpu_exhaust
+  - air.top_exhaust
+  - air.rear_exhaust
+  - gpu.0.core
+  - cpu.package
+  - cpu.vrm
+  - board.connector_12v2x6
+  - power.gpu.0
+  - power.cpu.package
+
+# 測定値の表の画像（返信 2）に使う日本語のフォントのファイル（決定記録 0171 §2.3）。
+# 既定は Ubuntu の `fonts-noto-cjk` の場所です。ファイルが無い・読めないときは表を Markdown の文で送ります。
+table_font: "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc"
+table_font_size: 40

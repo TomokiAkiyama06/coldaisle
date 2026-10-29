@@ -85,6 +85,24 @@ Incoming Webhook ではファイルを添付できないため、Slack アプリ
 - 無ければ今までどおり Webhook で本文だけを送ります
 - `COLDAISLE_SLACK_WEBHOOK` も残しておくと、Bot の送信が失敗したとき（トークンの失効・Bot がチャンネルから
   外れたなど）にその通知を Webhook で送り直します（グラフは付きません）
+- 日次レポート（`coldaisle-report`）は、**題だけの親**（例 `📄 10月25日の振り返り`。対象日の月日で、年は付けず
+  0 埋めしない）をチャンネルへ送り、そのスレッドへ次の 2 つを返します（決定記録 0171）
+  1. 要点: アラート（当日と前日の件数・日の終わりに続いているもの）→ AI の所見（切らない）→ 主な値の最高
+     （`config/report.yaml` の `highlight_metrics`）→ 欠測のあった metric の名前 → ダッシュボードのリンク
+  2. 測定値の表の PNG 画像。行は `config/report.yaml` の `table_metrics`（既定 13 行）、列は名前・平均・最高だけ
+     （日本語の表示名。フォントは `table_font`）。Bot トークンの `files:write` を使います。Webhook・LINE・`--print` の
+     1 通の全行の表は変わりません
+
+  題の書式は `config/report.yaml` の `thread_title` です。失敗したときは次のとおりです
+  - 親が送れなければスレッドにせず、今までどおり Markdown の 1 通で送ります（Bot が落ちれば Webhook で送り直す）
+  - 親は送れたが要点を返せなければ、要点をチャンネルへ 1 通で送ります（題だけの親が残ります）
+  - 画像が描けない（フォントのファイルが無いなど）・上げられないときは、表を Markdown の文でスレッドへ
+    （それも送れなければチャンネルへ）送ります
+  - Bot が無く Webhook だけのとき・LINE・stdout では、今までどおり Markdown の 1 通です。長ければ
+    `max_notification_chars` で切り、末尾に `…（続きはダッシュボードで）` を付けます
+  - レポートはファイルに保存しません。読みたいときは `coldaisle-report --date <日> --no-send --print`
+  - 宛先は `config/report.yaml` の `to`（既定 `[slack]`）。Slack の宛先が無い導入では「宛先が設定されていない」の
+    warning を残して何も送りません
 - 解除・発火の説明・日次レポートにはグラフを添えません。同じアラートのグラフは `repeat_after_s`（30 分）に 1 回まで
 - グラフの設定は `config/notify-graph.yaml`。壊れていても文章の通知は止まらず、グラフだけが付かなくなります
   （起動時に `グラフの設定が読めないので…` の error が出ます）

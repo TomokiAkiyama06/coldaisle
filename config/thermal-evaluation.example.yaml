@@ -1,0 +1,81 @@
+# `coldaisle-thermal-evaluate --evaluation-config` の例（#84 / 決定記録 0172 §2.5）
+#
+# **仮の値の例です。実運用の値ではありません。** 値はすべて実データの評価を見た後、所有者の承認を得て
+# 別の決定記録で決めます（0172 §2.10 の段 3）。そのまま使わず、別のファイル（例: var/thermal-evaluation.yaml）
+# に書いてください。コードに既定値はありません（AGENTS.md「絶対に守るルール」9）。
+#
+# 構造（段の順・比べる相手 persistence・対の比較・ブロックの符号検定・underprediction の向き・層の作り方・
+# insufficient の扱い）は 0172 で決まっていて、ここでは変えられません。
+#
+# **ほかの契約が持つ値をここへ写さない**（0054 §2.6）。絶対温度上限は config/safety.yaml のもので、
+# この評価（予測の誤差を見る）の判定には使いません。
+schema_version: 1
+
+# artifact の target schema の metric と過不足なく一致させる（過不足は拒否）。direction は v1 では
+# higher_is_worse だけ（予測が実際より低い＝冷えていると見誤る向きを underprediction として見る）
+outputs:
+  - {metric: gpu.0.core, direction: higher_is_worse}
+
+# underprediction（max(0, 観測 − 予測)）の上側の分位（nearest-rank。重複なしの昇順）
+quantiles: [0.5, 0.9, 0.99]
+
+# worst-case として並べる件数
+worst_case_count: 5
+
+# 符号検定の時間ブロックの長さ（ms）。ブロックは split の test_start_ms を起点に重ならずに切る
+block_ms: {value: 3600000, status: provisional}
+
+# 室温帯を決める metric（anchor の時点の window の最後のフレーム。欠測・stale は unknown）
+room_temperature_metric: air.room
+
+# 室温の帯。below_c 未満をその帯とし、**最後の帯だけ上限を持たない**
+room_temperature_bands:
+  - name: cool
+    below_c: {value: 22.0, status: provisional}
+  - name: mild
+    below_c: {value: 27.0, status: provisional}
+  - name: warm
+
+# workload の層（0151 と同じ考え方。window の CPU / GPU の電力の平均を帯に入れた組み合わせ。
+# どちらかが欠ければ unknown。GPU Mode の申告は使わない）
+workload_bands:
+  window_ms: {value: 30000, status: provisional}
+  cpu_metric: power.cpu.package
+  gpu_metric: power.gpu.0
+  cpu_power:
+    - name: idle
+      below_w: {value: 50.0, status: provisional}
+    - name: light
+      below_w: {value: 120.0, status: provisional}
+    - name: full
+  gpu_power:
+    - name: idle
+      below_w: {value: 30.0, status: provisional}
+    - name: light
+      below_w: {value: 200.0, status: provisional}
+    - name: high
+
+# 件数の下限。全体が下限に届かなければ evidence で blocked。層が届かなければ insufficient
+# （数字は出すが合否の条件にしない）
+minimum:
+  test_examples: {value: 1000, status: provisional}
+  blocks: {value: 24, status: provisional}
+  stratum_examples: {value: 200, status: provisional}
+  stratum_blocks: {value: 6, status: provisional}
+  predicted_fraction: {value: 0.9, status: provisional}
+
+# gate（辞書式: evidence → underprediction → skill。上の段が落ちたら下の段で覆らない）
+gate:
+  skill:
+    # ブロックの片側の符号検定の p 値の上限
+    alpha: {value: 0.05, status: provisional}
+    # 1 − MAE_model / MAE_persistence の下限（全出力で）
+    minimum_mae_improvement_fraction: {value: 0.1, status: provisional}
+  underprediction:
+    # quantiles のどれか
+    quantile: {value: 0.99, status: provisional}
+    maximum_c: {value: 2.0, status: provisional}
+    # 全体の underprediction の最大の上限（層で薄めない）
+    worst_case_maximum_c: {value: 5.0, status: provisional}
+  # 十分な件数のある層で、model の MAE が persistence の MAE をこれより上回れば落とす
+  stratum_regression_tolerance_c: {value: 0.2, status: provisional}
