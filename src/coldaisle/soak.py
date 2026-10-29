@@ -954,11 +954,8 @@ def summarize_rss(
     )
     ingest = [sample for sample in in_window if sample.unit == config.ingest_unit]
     judge_start_ms = min(end_ms, start_ms + round(config.warmup_hours * 3_600_000))
-    judged = [
-        sample
-        for sample in ingest
-        if sample.ts_ms >= judge_start_ms and sample.rss_anon_kb is not None
-    ]
+    in_judge = [sample for sample in ingest if sample.ts_ms >= judge_start_ms]
+    judged = [sample for sample in in_judge if sample.rss_anon_kb is not None]
     points = [(sample.ts_ms, sample.rss_anon_kb) for sample in judged]
     values = [value for _, value in points if value is not None]
     expected = int((end_ms - judge_start_ms) // round(config.sample_interval_s * 1000))
@@ -978,7 +975,9 @@ def summarize_rss(
         slope_kib_per_hour=_slope_per_hour(points),
         min_kib=min(values) if values else None,
         max_kib=max(values) if values else None,
-        judged_pids=_distinct_pids(sample for sample in judged),
+        # RSS が読めなかった行の MainPID も数える。落とすと、入れ替わる前のプロセスが
+        # 見えず「判定不能」を合格にしてしまう（決定記録 0173 §2.3）
+        judged_pids=_distinct_pids(in_judge),
         window_pids=_distinct_pids(running),
         pid_changes=pid_changes,
         stopped_rows=sum(1 for sample in ingest if sample.main_pid is None),

@@ -11,6 +11,7 @@
 DB は MockSource / ReplaySource を取り込みデーモンに通して作る。RSS の CSV は合成した値。
 """
 
+import dataclasses
 import json
 import os
 import shutil
@@ -699,6 +700,29 @@ def test_a_pid_change_in_the_judged_window(empty_db, tmp_path, config):
     assert restart_check.verdict is Verdict.FAIL
     assert restart_check.observed == 1
     assert report.verdict is Verdict.FAIL
+
+
+def test_a_pid_without_a_readable_rss_still_counts_in_the_judged_window(empty_db, tmp_path, config):
+    """区間の最初の行の PID は RSS が読めず、残りは別の PID で平ら → **それでも RSS は判定不能**。
+
+    RSS の値が無い行を PID の一覧から落とすと、プロセスが1つに見えて合格になる（0173 §2.3）。
+    """
+    judge_start = 2 * HOUR_MS
+    rows = [
+        sample
+        if sample.ts_ms != TEST_EPOCH_MS + judge_start
+        else dataclasses.replace(sample, rss_anon_kb=None)
+        for sample in rss_rows(
+            lambda _: BASE_KIB, pid=lambda ms: 4242 if ms <= judge_start else 4343
+        )
+    ]
+
+    report = rss_report(empty_db, tmp_path, config, rows)
+
+    rss_check, restart_check = rss_checks(report)
+    assert report.rss is not None and report.rss.judged_pids == (4242, 4343)
+    assert rss_check.verdict is Verdict.UNKNOWN
+    assert restart_check.verdict is Verdict.FAIL
 
 
 def test_a_pid_change_during_the_warmup_still_counts_as_a_restart(empty_db, tmp_path, config):
