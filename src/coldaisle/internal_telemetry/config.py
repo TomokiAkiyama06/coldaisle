@@ -42,11 +42,20 @@ class ConfirmationEvidence(_ConfigModel):
         return self
 
 
+EXCLUDABLE_GPU_METRIC_SUFFIXES = ("hotspot", "mem")
+"""``excluded_metrics`` に書ける GPU の metric（決定記録 0176 §2.1）。
+
+GPU / driver によって公開されない温度だけ。``core`` は Critical Safety の入力、``power`` は
+Workload Regime と Guard の入力なので、誤記で黙って止めないよう一覧の外にする。
+"""
+
+
 class NvmlConfig(_ConfigModel):
     """NVML adapter の設定。v1 は単一 GPU の論理 index 0 だけを扱う。"""
 
     enabled: bool
     gpu_indices: tuple[int, ...] = Field(min_length=1)
+    excluded_metrics: tuple[str, ...] = ()
 
     @model_validator(mode="after")
     def _indices_are_unique_and_non_negative(self) -> Self:
@@ -58,6 +67,23 @@ class NvmlConfig(_ConfigModel):
             raise ValueError(
                 "v1 は単一 GPU の logical index 0 だけを扱う; "
                 "複数 GPU には承認済みの物理 GPU 対応が必要"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _only_unpublished_temperatures_are_excluded(self) -> Self:
+        allowed = {
+            f"gpu.{index}.{suffix}"
+            for index in self.gpu_indices
+            for suffix in EXCLUDABLE_GPU_METRIC_SUFFIXES
+        }
+        if len(set(self.excluded_metrics)) != len(self.excluded_metrics):
+            raise ValueError("excluded_metrics は重複させない")
+        rejected = sorted(set(self.excluded_metrics) - allowed)
+        if rejected:
+            raise ValueError(
+                f"excluded_metrics に書けるのは {sorted(allowed)} だけ（決定記録 0176 §2.1）: "
+                f"{rejected}"
             )
         return self
 

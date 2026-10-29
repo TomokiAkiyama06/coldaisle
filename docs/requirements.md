@@ -242,7 +242,7 @@ coldaisle が NVML / lm-sensors も収集し、`GET /api/v1/server-health` を�
 | `air.gpu_exhaust` | °C | DS18B20 #3 | ✅ |
 | `air.top_exhaust` | °C | DS18B20 #4 | ✅ |
 | `air.rear_exhaust` | °C | DS18B20 #5 | ✅ |
-| `gpu.0.core` / `gpu.0.hotspot` / `gpu.0.mem` | °C | NVML | ✅ |
+| `gpu.0.core` / `gpu.0.hotspot` / `gpu.0.mem` | °C | NVML | ✅（導入先の GPU は hotspot / mem を公開せず、記録しない。決定記録 0176） |
 | `gpu.0.vram_used` | GB | NVML | ✅ |
 | `cpu.package` / `cpu.vrm` / `chipset` | °C | lm-sensors | ✅ |
 | `power.gpu.0` | W | NVML | ✅ |

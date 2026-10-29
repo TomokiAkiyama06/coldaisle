@@ -816,6 +816,31 @@ def test_invariant_6_a_guard_floor_is_never_bypassed(catalog) -> None:
         assert demand.effective >= guard_floor
 
 
+def test_a_never_recorded_gpu_hotspot_keeps_health_normal_and_the_guard_quiet(catalog) -> None:
+    """記録しない hotspot（行が一度も無い）は、健全度を下げず Guard も発火させない。
+
+    決定記録 0176 §2.4。導入先では collector が ``gpu.0.hotspot`` を記録しない。
+    契約では ADVISORY の入力なので、行が無くても ``missing`` の行があるときと同じく、
+    Demand を変えないことを固定する。
+    """
+    recorded = Harness(catalog, with_supervisor=False)
+    recorded.settle()
+    absent = Harness(catalog, with_supervisor=False)
+    del absent.telemetry.values["gpu.0.hotspot"]
+    absent.settle()
+
+    for _ in range(5):
+        with_row = recorded.tick()
+        without_row = absent.tick()
+        health, degraded, _ = _health(without_row.tick)
+        assert health is TelemetryHealth.NORMAL
+        assert "gpu.0.hotspot" not in degraded
+        for zone in (Zone.FRONT, Zone.REAR):
+            demand = without_row.tick.zones.get(zone).demand
+            assert demand.guard_floor is None
+            assert demand.effective == with_row.tick.zones.get(zone).demand.effective
+
+
 def _guard_log_fields(caplog: pytest.LogCaptureFixture) -> list[dict[str, Any]]:
     return [
         getattr(record, logs.FIELDS_KEY)

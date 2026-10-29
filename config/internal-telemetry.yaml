@@ -12,6 +12,11 @@ nvml:
   # v1 は物理 GPU が1台だけの構成を検証し、その唯一の GPU を logical 0 とする。
   # 複数 GPU を列挙順で永続 metric へ割り当てることは禁止する。
   gpu_indices: [0]
+  # 記録しない metric（決定記録 0176）。導入先の GPU（RTX PRO 6000）は NVML で hotspot / memory 温度を
+  # 公開しないため、毎回 missing の行を書かない。書けるのは gpu.<index>.hotspot / gpu.<index>.mem だけ。
+  # 起動後に1回だけ読み、値が取れたら excluded_metric_available をログに出す（行は書かない）。
+  # 値を出す GPU に替えたら、ここから消し、server-health.yaml の panels.gpu などへ戻す。
+  excluded_metrics: [gpu.0.hotspot, gpu.0.mem]
 
 # /proc/stat の全 CPU 合計の使用率（cpu.utilization。決定記録 0047）。
 # 前回 poll との差分で計算するため、起動直後の1回目は missing になる。Linux 以外は missing。

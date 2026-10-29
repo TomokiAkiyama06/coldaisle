@@ -136,7 +136,7 @@ EVALUATION_YAML = ROOT / "config" / "evaluation.yaml"
 
 GPU = "gpu.0.core"
 ROOM = "air.room"
-TEMPERATURES = ("gpu.0.core", "gpu.0.hotspot", "cpu.package")
+TEMPERATURES = ("gpu.0.core", "cpu.package")
 """`config/evaluation.yaml` の `temperature_metrics`。**全部揃わないと Safety の段は通らない。**"""
 TICK_TS_MS = 1_787_616_000_000
 STEP_MS = 10_000

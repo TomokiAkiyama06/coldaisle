@@ -161,10 +161,12 @@ lm_sensors は有効な hwmon 入力の**いずれか1本**が届いていれば
 外します（決定記録 0009 §2.12）。AI 停止は監視の停止ではないため signal 判定から
 外します。
 
-`config/server-health.yaml` の `missing_tolerated` に挙げた metric（GPU / driver が
-公開しない `gpu.0.hotspot` / `gpu.0.mem` など）は、`missing` だけを signal 判定から
+`config/server-health.yaml` の `missing_tolerated` に挙げた metric（driver が
+制御方式を公開しない `gpu.0.fan_policy` など）は、`missing` だけを signal 判定から
 外します（一度も保存されていない場合も同じ）。`suspect` / `stale` は外しません。監視必須 metric と監視対象の一覧も同じ
-ファイルにあります（決定記録 0040）。
+ファイルにあります（決定記録 0040）。導入先の GPU が公開しない `gpu.0.hotspot` / `gpu.0.mem` は、
+collector が記録しない（`config/internal-telemetry.yaml` の `nvml.excluded_metrics`。決定記録 0176）ので、
+監視対象にもパネルにも入りません。
 
 signal が見る周期メトリクスは**現在の監視対象**に限ります。`config/server-health.yaml`
 の source ごとの監視必須 metric と、`config/internal-telemetry.yaml` で有効な入力
