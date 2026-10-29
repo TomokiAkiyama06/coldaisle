@@ -315,4 +315,9 @@ def test_nothing_imports_train() -> None:
 
 
 def test_only_train_and_registry_import_training_output() -> None:
-    assert _importers_of("coldaisle.training_output") == ["registry.py", "train.py"]
+    # thermal_evaluate.py は --out の親の検査（check_trusted_parent）だけを使う（0172 §2.2）
+    assert _importers_of("coldaisle.training_output") == [
+        "registry.py",
+        "thermal_evaluate.py",
+        "train.py",
+    ]
