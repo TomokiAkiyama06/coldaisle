@@ -3,6 +3,7 @@
 - **種別**: Decision Record
 - **Status**: FINAL（2026-10-26、リポジトリ所有者の承認。§2 の 1〜4 はすべて推奨の案）
 - **Date**: 2026-10-26
+- **Superseded by**: [0177](0177-hint-shadow-summary-scope.md)（§2.4 の「基準の解が無い周期は PR-D の集計で候補から除く」点のみ。後続の PR で出す）
 - **Supersedes**: [`0133`](0133-workload-hint-stage-b-prior-rollout.md) §2.5a の「失敗の回数は trace のヒントの塊に数える」のみ（構造化ログに出す。§2.4）/
   [`0162`](0162-hint-b1-shadow-solver-open-points.md) §2.3 のうち、元の tick の trace の `skipped` に `mpc_unavailable` を載せる点を、本記録の実装では配線しない（PR-D の集計の後に要否を決める。§2.4・§5）点のみ。
   ほかの 0133・0162 の決定は変えず、記録に無かった点を足す
