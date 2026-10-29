@@ -57,12 +57,17 @@ Model、Supervisor Policy、Feature Transform の artifact lifecycle をロー�
 状態は `candidate → validated → production → retired` の順に進む。Candidateを直接
 Productionとして暗黙loadすることはない。`mark_validated()` はoffline evaluation参照を、
 `promote()` はshadow evaluation参照と明示的な `HumanApproval` を必須にする。
+反実仮想 Thermal Model（`thermal_model` / `counterfactual_action`）では、`mark_validated()` が書き込みの時点で
+参照が `thermal-offline-v1:<64 hex>` の形であることと、渡された評価の報告の bytes の SHA-256 がその digest と
+一致することを確かめ、報告を artifact の隣へ写す（決定記録 0172 §5 の 10・11。下の「運用」）。
+snapshot の読み込みの検証は変えていない（既存の Registry を読めなくしない）。
 
 ```text
 <root>/
   registry.json
   .registry.lock
   artifacts/<kind>/<model-id>/<semantic-version>/artifact.payload
+  artifacts/thermal_model/<model-id>/<semantic-version>/offline-evaluation.json  # 反実仮想 thermal model の validated の根拠
 ```
 
 `registry.json` はartifact本体と分離したProduction pointer、全artifactのlifecycle、監査eventを
@@ -165,7 +170,12 @@ uv run coldaisle-registry register --root var/model-registry \
     --actor trainer --reason "training completed"
 uv run coldaisle-registry validate --root var/model-registry \
     --artifact thermal_model/rack-thermal/1.2.0 \
-    --offline-evaluation-ref evaluation/offline/1.2.0 \
+    --thermal-evaluation var/thermal-evaluation/rack-thermal-1.2.0.json \
+    --evaluation-config var/thermal-evaluation.yaml \
+    --actor evaluator --reason "offline gates passed" --expected-revision 1
+uv run coldaisle-registry validate --root var/model-registry \
+    --artifact rl_supervisor_policy/rack-supervisor/1.0.0 \
+    --offline-evaluation-ref evaluation/offline/1.0.0 \
     --actor evaluator --reason "offline gates passed" --expected-revision 1
 uv run coldaisle-registry promote  --root var/model-registry --approval var/approval.json \
     --shadow-evaluation-ref evaluation/shadow/1.2.0 \
@@ -299,6 +309,24 @@ MemoryErrorで落とさないためである。壊れたYAML・JSONやファイ�
     （書きかけの学習の出力を登録させない。判定は読んだ bytes の中身。決定記録 0150 §2.5 / §5 の 14）。
     `registry.json` の置き換えの後に fsync が失敗したときは `RegistryCommitNotDurableError`（登録した ref を持つ）で
     「登録は見えている・再登録しない」と分ける
+  - **validated にする**（決定記録 0172 §2.7）: `coldaisle-thermal-evaluate` の報告（`--out`）と、それを作ったときの
+    評価の設定を `validate --thermal-evaluation <報告> --evaluation-config <設定>` で渡す（`--offline-evaluation-ref`
+    と排他。この kind に `--offline-evaluation-ref` を渡すと拒否する。他の kind の自由記述の経路は変えない）。
+    CLI は artifact を deserialize も実行もせず、次をすべて確かめてから `mark_validated()` を1回だけ呼ぶ。
+    1つでも外れれば Registry を変えない:
+    1. 報告を `max_snapshot_bytes` で上限を切って読み、strict な型・canonical な bytes・`conditions_sha256` を確かめる
+    2. 報告の `artifact` が `--artifact` と同じ key を名指し、`sha256` が Registry の記録の checksum と一致し、
+       artifact が candidate で、報告も candidate のときに作ったもの（`--expected-revision` と読んだ snapshot の
+       revision が一致することも先に確かめる）
+    3. `--evaluation-config` の bytes の SHA-256 が報告の `config_sha256` と一致し、設定が読み込みの検査を通る
+    4. gate を報告の数字と設定から作り直し（報告の `gate` の欄は信じない）、報告の gate と一致し、`pass`
+    5. `offline_evaluation_ref` は CLI が `thermal-offline-v1:<報告の bytes の SHA-256>` として作る（人が文字列を
+       渡す経路は無い）。`mark_validated()` は報告の bytes を
+       `artifacts/thermal_model/<model-id>/<version>/offline-evaluation.json` へ写す（報告が先・`registry.json` が後。
+       確定しなければ写した報告を消す）。後から `sha256sum` で ref の digest と照合できる
+
+    gate は助言で、`pass` は production への昇格や Authority の上げの承認ではない（0172 §2.6）。脅威の前提は
+    0150 §2.5 と同じで、同じ uid の偽造は前提の外（検査が捕まえるのは取り違え）
   - **読み込み**: `RegistryCounterfactualThermalModel.from_verified_artifact(verified, metric_catalog=,
     calibration=)` だけが封をした型（model と同梱 Profile v2）を作る。0079 §2.4 の L1〜L10 と 0084 の
     L11 / L12 を検査し（順は 0097 §2.4）、1つでも外れたら `CounterfactualArtifactRejectedError`（`check` に

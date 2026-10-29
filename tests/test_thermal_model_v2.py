@@ -105,6 +105,7 @@ from coldaisle.control.schema import (
 )
 from coldaisle.metrics import MetricCatalog
 from coldaisle.store.models import Quality
+from offline_validation import offline_validation
 
 RUN_ID = "run-00000000000000000000000000000002"
 SOURCE_ID = "source-00000000000000000000000000000002"
@@ -1369,7 +1370,7 @@ def test_promotion_and_rollback_move_model_and_profile_as_one_artifact(
         registry.register_candidate(metadata, payload, actor="trainer", reason="trained")
         registry.mark_validated(
             metadata.ref,
-            offline_evaluation_ref=f"evaluation/offline/{version}",
+            **offline_validation(metadata, f"evaluation/offline/{version}"),
             actor="evaluator",
             reason="offline gates passed",
             expected_revision=registry.inspect().revision,

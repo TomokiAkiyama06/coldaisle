@@ -173,6 +173,7 @@ from coldaisle.control.schema import (
 )
 from coldaisle.control.state import ControlStateSnapshot, TelemetryHealth
 from coldaisle.metrics import MetricCatalog
+from offline_validation import offline_validation
 from test_control_config import valid_documents
 from test_critical_safety import safety_config
 from test_fallback_controller import fallback_proposal, gate_for, policy
@@ -486,7 +487,7 @@ def _promote(
     registry.register_candidate(metadata, payload, actor="trainer", reason="training completed")
     registry.mark_validated(
         metadata.ref,
-        offline_evaluation_ref="evaluation/offline/86",
+        **offline_validation(metadata, "evaluation/offline/86"),
         actor="evaluator",
         reason="offline gates passed",
         expected_revision=registry.inspect().revision,

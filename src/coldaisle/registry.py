@@ -16,7 +16,12 @@ uv run coldaisle-registry register --root var/model-registry \\
     --actor trainer --reason "training completed"
 uv run coldaisle-registry validate --root var/model-registry \\
     --artifact thermal_model/rack-thermal/1.2.0 \\
-    --offline-evaluation-ref evaluation/offline/1.2.0 \\
+    --thermal-evaluation var/thermal-evaluation/rack-thermal-1.2.0.json \\
+    --evaluation-config var/thermal-evaluation.yaml \\
+    --actor evaluator --reason "offline gates passed" --expected-revision 1
+uv run coldaisle-registry validate --root var/model-registry \\
+    --artifact rl_supervisor_policy/rack-supervisor/1.0.0 \\
+    --offline-evaluation-ref evaluation/offline/1.0.0 \\
     --actor evaluator --reason "offline gates passed" --expected-revision 1
 uv run coldaisle-registry promote  --root var/model-registry --approval var/approval.json \\
     --shadow-evaluation-ref evaluation/shadow/1.2.0 \\
@@ -39,6 +44,7 @@ uv run coldaisle-registry rollback --root var/model-registry --kind thermal_mode
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import logging
 import os
@@ -50,12 +56,13 @@ from typing import Literal
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
-from coldaisle import logs, training_output
+from coldaisle import logs, thermal_evaluation_report, training_output
 from coldaisle.control.model_registry import (
     ArtifactCapability,
     ArtifactKind,
     ArtifactMetadata,
     ArtifactRef,
+    ArtifactStatus,
     ArtifactVerificationError,
     HumanApproval,
     ModelCompatibility,
@@ -449,8 +456,27 @@ def _training_output_after_register(
 
 
 def run_validate(args: argparse.Namespace) -> int:
-    """offline evaluation の結果を記録し、candidate を validated にする。"""
-    revision = _registry(args).mark_validated(
+    """offline evaluation の結果を記録し、candidate を validated にする。
+
+    反実仮想 thermal model は ``--thermal-evaluation``（``coldaisle-thermal-evaluate`` の報告）と
+    ``--evaluation-config`` でだけ validated にする（決定記録 0172 §2.7）。他の kind は従来どおり
+    ``--offline-evaluation-ref`` の自由記述を受ける。
+    """
+    if args.thermal_evaluation is not None:
+        return run_validate_thermal_evaluation(args)
+    if args.evaluation_config is not None:
+        raise ValueError("--evaluation-config は --thermal-evaluation と一緒にだけ渡す")
+    limits = _limits(args)
+    registry = _registry(args, limits)
+    record = registry.inspect().artifacts.get(args.artifact.key)
+    if record is not None and _is_counterfactual_thermal(record.metadata):
+        # 判定は Registry の記録の中身で行う（0150 §5 の 14 と同じ）。人が文字列を渡す経路を作らない
+        raise ValueError(
+            "反実仮想 thermal model（thermal_model / counterfactual_action）は"
+            " --offline-evaluation-ref で validated にしない。coldaisle-thermal-evaluate の報告を"
+            " --thermal-evaluation と --evaluation-config で渡す（決定記録 0172）"
+        )
+    revision = registry.mark_validated(
         args.artifact,
         offline_evaluation_ref=args.offline_evaluation_ref,
         actor=args.actor,
@@ -465,6 +491,96 @@ def run_validate(args: argparse.Namespace) -> int:
         revision=revision,
     )
     emit({"artifact": args.artifact.key, "status": "validated", "revision": revision})
+    return EXIT_OK
+
+
+def run_validate_thermal_evaluation(args: argparse.Namespace) -> int:
+    """評価の報告と設定を照合してから、反実仮想 thermal model を validated にする。
+
+    決定記録 0172 §2.7 の 1〜5。**1つでも外れれば ``mark_validated()`` を呼ばない**
+    （Registry を変えない）。artifact を deserialize も実行もしない（0062 §2.3）。gate は報告の
+    数字と設定から作り直し、報告の ``gate`` の欄を信じない。ref は CLI が報告の bytes から作り、
+    報告の bytes は Registry が artifact の隣へ写す（0172 §5 の 10）。
+    """
+    if args.evaluation_config is None:
+        raise ValueError("--thermal-evaluation には --evaluation-config が要る")
+    limits = _limits(args)
+    # 1. 上限で切って読み、strict な型・canonical な bytes・conditions_sha256 を確かめる
+    report_bytes = read_bounded(args.thermal_evaluation, limits.max_snapshot_bytes)
+    report = thermal_evaluation_report.parse_report_bytes(report_bytes)
+
+    # 2. 報告が --artifact と同じ key を名指し、Registry の記録の checksum と一致し、candidate
+    registry = _registry(args, limits)
+    snapshot = registry.inspect()
+    if snapshot.revision != args.expected_revision:
+        # 照合した記録と書き込む時点の記録を同じにする（mark_validated も lock の中で確かめる）
+        raise ValueError(
+            f"registry revision が --expected-revision と違う: expected={args.expected_revision},"
+            f" actual={snapshot.revision}"
+        )
+    target: ArtifactRef = args.artifact
+    record = snapshot.artifacts.get(target.key)
+    if record is None:
+        raise ValueError(f"artifact が登録されていない: {target.key}")
+    if not _is_counterfactual_thermal(record.metadata):
+        raise ValueError(
+            "--thermal-evaluation で validated にできるのは"
+            " thermal_model / counterfactual_action だけ"
+        )
+    named = (report.artifact.model_id, report.artifact.version)
+    if named != (target.model_id, target.version):
+        raise ValueError(
+            f"報告が名指す artifact が --artifact と違う: {'@'.join(named)} != {target.key}"
+        )
+    if report.artifact.sha256 != record.metadata.sha256:
+        raise ValueError("報告の artifact の sha256 が Registry の記録の checksum と一致しない")
+    if record.status is not ArtifactStatus.CANDIDATE:
+        raise ValueError(f"candidate だけを validated にできる（いまは {record.status.value}）")
+    if report.artifact.registry_status != ArtifactStatus.CANDIDATE.value:
+        # validated・production・retired のときに作った報告は validate に使わない（0172 §2.2）
+        raise ValueError(
+            f"candidate のときに作った報告ではない（{report.artifact.registry_status}）"
+        )
+
+    # 3. 設定の bytes の digest が報告と一致し、その設定が読み込みの検査を通る
+    config_bytes = read_bounded(args.evaluation_config, limits.max_snapshot_bytes)
+    if hashlib.sha256(config_bytes).hexdigest() != report.inputs.config_sha256:
+        raise ValueError("--evaluation-config の SHA-256 が報告の config_sha256 と一致しない")
+    with as_configuration_error(args.evaluation_config.name):
+        config = thermal_evaluation_report.parse_evaluation_config(config_bytes)
+
+    # 4. gate を報告の数字と設定から作り直し、報告の gate と一致し、pass
+    gate = thermal_evaluation_report.evaluate_gate(report, config)
+    if gate != report.gate:
+        raise ValueError("報告の gate が、報告の数字と設定から作り直した gate と一致しない")
+    if gate.outcome != "pass":
+        raise ValueError(f"gate が pass ではない（{gate.failed_stage}: {'; '.join(gate.reasons)}）")
+
+    # 5. ref は CLI が作る（人が文字列を渡す経路を作らない）
+    ref = thermal_evaluation_report.offline_evaluation_ref(report_bytes)
+    revision = registry.mark_validated(
+        target,
+        offline_evaluation_ref=ref,
+        actor=args.actor,
+        reason=args.reason,
+        expected_revision=args.expected_revision,
+        offline_evaluation_report=report_bytes,
+    )
+    _log_change(
+        "artifact を validated にした",
+        artifact=target,
+        actor=args.actor,
+        reason=args.reason,
+        revision=revision,
+    )
+    emit(
+        {
+            "artifact": target.key,
+            "status": "validated",
+            "revision": revision,
+            "offline_evaluation_ref": ref,
+        }
+    )
     return EXIT_OK
 
 
@@ -635,7 +751,24 @@ def build_parser() -> argparse.ArgumentParser:
     validate = subparsers.add_parser("validate", help="candidate を validated にする")
     _add_common(validate)
     validate.add_argument("--artifact", type=parse_artifact, required=True)
-    validate.add_argument("--offline-evaluation-ref", required=True)
+    source = validate.add_mutually_exclusive_group(required=True)
+    source.add_argument(
+        "--offline-evaluation-ref",
+        default=None,
+        help="offline 評価の参照（反実仮想 thermal model には使えない）",
+    )
+    source.add_argument(
+        "--thermal-evaluation",
+        type=Path,
+        default=None,
+        help="coldaisle-thermal-evaluate の報告（反実仮想 thermal model。決定記録 0172）",
+    )
+    validate.add_argument(
+        "--evaluation-config",
+        type=Path,
+        default=None,
+        help="報告を作ったときの評価の設定（--thermal-evaluation と一緒に渡す）",
+    )
     _add_actor(validate)
     _add_expected_revision(validate)
     validate.set_defaults(handler=run_validate)
