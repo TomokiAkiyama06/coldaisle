@@ -1,17 +1,24 @@
 """連続運転テスト（soak）の集計（#47）。
 
-守る線は4つ。
+守る線は5つ。
 
 1. **欠測率の母数は期間と送信周期から出す**（装置ごと沈黙した時間も欠測に入る）
 2. **閾値は `config/soak.yaml` から読む**（AGENTS.md ルール9）
 3. **分からないものを合格と書かない**（期間が終わっていない・周期が不明）
 4. **DB に書かない**（行・スキーマ・journal_mode のどれも変えない。マイグレーションも当てない）
+5. **RSS は採取の CSV（`--rss-csv`）を渡したときだけ判定する**（決定記録 0173 §2.7）
 
-DB は MockSource / ReplaySource を取り込みデーモンに通して作る。
+DB は MockSource / ReplaySource を取り込みデーモンに通して作る。RSS の CSV は合成した値。
 """
 
+import dataclasses
 import json
+import os
+import shutil
 import sqlite3
+import subprocess
+import sys
+from collections.abc import Callable
 from contextlib import closing
 from pathlib import Path
 
@@ -23,6 +30,11 @@ from coldaisle.ingest import MockSource, Normalizer
 from coldaisle.ingest.calibration import Calibration
 from coldaisle.ingest.replay import ReplaySource
 from coldaisle.soak import (
+    NOT_COVERED,
+    REFERENCE_ONLY,
+    RSS_CSV_COLUMNS,
+    RssCsvError,
+    RssSample,
     SoakConfig,
     SoakDatabase,
     SoakDatabaseError,
@@ -30,6 +42,7 @@ from coldaisle.soak import (
     Verdict,
     build,
     main,
+    read_rss_csv,
     window,
 )
 from coldaisle.store import Quality, SqliteStore
@@ -376,6 +389,8 @@ def test_main_writes_markdown_and_json_without_touching_the_db(
     assert printed["db_verdict"] == "fail"
     assert printed["counters"]["sys.dropped_samples"] == 12
     assert printed["not_covered"], "判定できない項目を書く"
+    assert printed["rss"] is None
+    assert printed["reference"] == list(REFERENCE_ONLY)
     written = sorted(path.name for path in out_dir.iterdir())
     assert written == ["soak-20260825T090000.json", "soak-20260825T090000.md"]
     markdown = (out_dir / "soak-20260825T090000.md").read_text(encoding="utf-8")
@@ -517,3 +532,509 @@ def test_an_interval_announced_after_the_window_is_not_judged(tmp_path, rules, s
     assert report.checks[0].verdict is Verdict.UNKNOWN
     assert "期間より後" in report.as_markdown()
     assert report.as_dict()["interval_after_window"] is True
+
+
+# ---------------------------------------------------------------- RSS（決定記録 0173）
+
+ROOT = Path(__file__).resolve().parents[1]
+SAMPLER = ROOT / "deploy" / "soak" / "rss-sample.sh"
+HOUR_MS = 3_600_000
+DAY_MS = 24 * HOUR_MS
+MINUTE_MS = 60_000
+INGEST = "coldaisle-daemon"
+BASE_KIB = 55_000
+
+
+def rss_rows(
+    kib: Callable[[int], float],
+    *,
+    unit: str = INGEST,
+    pid: Callable[[int], int | None] = lambda _: 4242,
+    start_ms: int = TEST_EPOCH_MS,
+    end_ms: int = TEST_EPOCH_MS + DAY_MS,
+    step_ms: int = MINUTE_MS,
+    keep: Callable[[int], bool] = lambda _: True,
+) -> list[RssSample]:
+    """1 分ごとの合成の行。`kib` / `pid` / `keep` は期間の始まりからの経過 ms を受ける。"""
+    rows: list[RssSample] = []
+    for at in range(start_ms, end_ms, step_ms):
+        elapsed = at - start_ms
+        if not keep(elapsed):
+            continue
+        main_pid = pid(elapsed)
+        anon = None if main_pid is None else round(kib(elapsed))
+        rows.append(RssSample(at, unit, main_pid, anon, anon, 20_000, None, None, None))
+    return rows
+
+
+def write_rss_csv(path: Path, rows: list[RssSample]) -> Path:
+    def cell(value: object) -> str:
+        return "" if value is None else str(value)
+
+    lines = [",".join(RSS_CSV_COLUMNS)]
+    lines += [",".join(cell(getattr(row, column)) for column in RSS_CSV_COLUMNS) for row in rows]
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return path
+
+
+@pytest.fixture
+def empty_db(tmp_path, rules) -> Path:
+    """周期のデータが無い DB。**RSS の項目だけを見る試験**に使う（DB の項目は判定不能になる）。"""
+    db = tmp_path / "empty.db"
+    SqliteStore(db, rules=rules, clock=SimulatedClock(TEST_EPOCH_MS)).close()
+    return db
+
+
+def rss_report(
+    db: Path,
+    tmp_path: Path,
+    config: SoakConfig,
+    rows: list[RssSample],
+    *,
+    now_ms: int | None = None,
+) -> SoakReport:
+    """24 時間の期間で、CSV に書いてから読み直した行で集計する（CSV の読み手も通す）。"""
+    samples = read_rss_csv(write_rss_csv(tmp_path / "rss.csv", rows))
+    end_ms = TEST_EPOCH_MS + DAY_MS
+    with SoakDatabase(db) as store:
+        return build(
+            store,
+            start_ms=TEST_EPOCH_MS,
+            end_ms=end_ms,
+            now_ms=end_ms if now_ms is None else now_ms,
+            config=config,
+            rss_samples=samples,
+        )
+
+
+def rss_checks(report: SoakReport):
+    rss_check, restart_check = report.rss_checks
+    assert rss_check.name.startswith("取り込みのデーモンの RSS")
+    assert restart_check.name == "取り込みのプロセスの再起動"
+    return rss_check, restart_check
+
+
+def test_rss_values_come_from_the_config(config):
+    assert config.rss.ingest_unit == INGEST
+    assert config.rss.warmup_hours == 2
+    assert config.rss.max_slope_kib_per_hour == 256
+    assert config.rss.max_range_mib == 16
+    assert config.rss.sample_interval_s == 60
+    assert config.rss.min_coverage == 0.95
+    assert config.rss.max_gap_minutes == 10
+    assert config.rss.max_process_restarts == 0
+
+
+def test_flat_rss_passes(empty_db, tmp_path, config):
+    report = rss_report(empty_db, tmp_path, config, rss_rows(lambda _: BASE_KIB))
+
+    rss_check, restart_check = rss_checks(report)
+    assert rss_check.verdict is Verdict.PASS
+    assert restart_check.verdict is Verdict.PASS
+    assert report.rss is not None
+    assert report.rss.rows == 22 * 60
+    assert report.rss.expected == 22 * 60
+    assert report.rss.slope_kib_per_hour == pytest.approx(0.0)
+    assert report.not_covered == ()
+    # DB の項目（周期データが無い）は判定不能のまま。db_verdict に CSV の項目を入れない
+    assert report.db_verdict is Verdict.UNKNOWN
+
+
+def test_steady_growth_above_the_slope_fails(empty_db, tmp_path, config):
+    """300 KiB/h（> 256）。22 時間で 6.4 MiB なので範囲（16 MiB）は満たす。**傾きだけで落ちる。**"""
+    report = rss_report(
+        empty_db, tmp_path, config, rss_rows(lambda ms: BASE_KIB + 300 * ms / HOUR_MS)
+    )
+
+    rss_check, _ = rss_checks(report)
+    assert rss_check.verdict is Verdict.FAIL
+    assert rss_check.observed == pytest.approx(300, abs=1)
+    assert report.verdict is Verdict.FAIL
+
+
+def test_growth_just_below_the_slope_passes(empty_db, tmp_path, config):
+    report = rss_report(
+        empty_db, tmp_path, config, rss_rows(lambda ms: BASE_KIB + 200 * ms / HOUR_MS)
+    )
+
+    assert rss_checks(report)[0].verdict is Verdict.PASS
+
+
+def test_a_tall_spike_fails_on_the_range(empty_db, tmp_path, config):
+    """区間の真ん中の 20 MiB の山。傾きはほぼ 0 だが、**範囲（16 MiB）で落ちる。**"""
+
+    def spike(ms: int) -> float:
+        return BASE_KIB + (20 * 1024 if 12 * HOUR_MS <= ms < 12 * HOUR_MS + 30 * MINUTE_MS else 0)
+
+    report = rss_report(empty_db, tmp_path, config, rss_rows(spike))
+
+    rss_check, _ = rss_checks(report)
+    assert abs(rss_check.observed or 0) < 256
+    assert report.rss is not None and report.rss.range_kib == 20 * 1024
+    assert rss_check.verdict is Verdict.FAIL
+
+
+def test_growth_only_during_the_warmup_passes(empty_db, tmp_path, config):
+    """暖機の 2 時間で 30 MiB 増え、あとは平ら。**暖機は傾向に入れない。**"""
+
+    def warmup(ms: int) -> float:
+        return BASE_KIB + 30 * 1024 * min(ms, 2 * HOUR_MS) / (2 * HOUR_MS)
+
+    report = rss_report(empty_db, tmp_path, config, rss_rows(warmup))
+
+    rss_check, _ = rss_checks(report)
+    assert rss_check.verdict is Verdict.PASS
+    assert report.rss is not None
+    assert report.rss.judge_start_ms == TEST_EPOCH_MS + 2 * HOUR_MS
+
+
+def test_a_pid_change_in_the_judged_window(empty_db, tmp_path, config):
+    """区間の途中で MainPID が変わる → RSS は判定不能、プロセスの再起動は不合格。"""
+    rows = rss_rows(lambda _: BASE_KIB, pid=lambda ms: 4242 if ms < 12 * HOUR_MS else 4343)
+
+    report = rss_report(empty_db, tmp_path, config, rows)
+
+    rss_check, restart_check = rss_checks(report)
+    assert rss_check.verdict is Verdict.UNKNOWN
+    assert "MainPID" in rss_check.note
+    assert restart_check.verdict is Verdict.FAIL
+    assert restart_check.observed == 1
+    assert report.verdict is Verdict.FAIL
+
+
+def test_a_pid_without_a_readable_rss_still_counts_in_the_judged_window(empty_db, tmp_path, config):
+    """区間の最初の行の PID は RSS が読めず、残りは別の PID で平ら → **それでも RSS は判定不能**。
+
+    RSS の値が無い行を PID の一覧から落とすと、プロセスが1つに見えて合格になる（0173 §2.3）。
+    """
+    judge_start = 2 * HOUR_MS
+    rows = [
+        sample
+        if sample.ts_ms != TEST_EPOCH_MS + judge_start
+        else dataclasses.replace(sample, rss_anon_kb=None)
+        for sample in rss_rows(
+            lambda _: BASE_KIB, pid=lambda ms: 4242 if ms <= judge_start else 4343
+        )
+    ]
+
+    report = rss_report(empty_db, tmp_path, config, rows)
+
+    rss_check, restart_check = rss_checks(report)
+    assert report.rss is not None and report.rss.judged_pids == (4242, 4343)
+    assert rss_check.verdict is Verdict.UNKNOWN
+    assert restart_check.verdict is Verdict.FAIL
+
+
+def test_a_pid_change_during_the_warmup_still_counts_as_a_restart(empty_db, tmp_path, config):
+    """再起動は**暖機を含む期間**で数える（0173 §2.4）。RSS は区間の1つのプロセスで判定できる。"""
+    rows = rss_rows(lambda _: BASE_KIB, pid=lambda ms: 4242 if ms < HOUR_MS else 4343)
+
+    report = rss_report(empty_db, tmp_path, config, rows)
+
+    rss_check, restart_check = rss_checks(report)
+    assert rss_check.verdict is Verdict.PASS
+    assert restart_check.verdict is Verdict.FAIL
+    assert report.rss is not None and report.rss.window_pids == (4242, 4343)
+
+
+def test_too_few_rows_is_unknown(empty_db, tmp_path, config):
+    """10 行に 1 行が欠ける（90%）。**95% 未満は判定不能**（平らな値でも合格にしない）。"""
+    rows = rss_rows(lambda _: BASE_KIB, keep=lambda ms: (ms // MINUTE_MS) % 10 != 0)
+
+    report = rss_report(empty_db, tmp_path, config, rows)
+
+    rss_check, _ = rss_checks(report)
+    assert rss_check.verdict is Verdict.UNKNOWN
+    assert "95%" in rss_check.note
+
+
+def test_a_long_gap_is_unknown(empty_db, tmp_path, config):
+    """15 分の隙間。行の数は 98% あるが、**10 分を超える隙間**で判定不能。"""
+    rows = rss_rows(
+        lambda _: BASE_KIB,
+        keep=lambda ms: not 10 * HOUR_MS <= ms < 10 * HOUR_MS + 15 * MINUTE_MS,
+    )
+
+    report = rss_report(empty_db, tmp_path, config, rows)
+
+    rss_check, restart_check = rss_checks(report)
+    assert report.rss is not None and report.rss.coverage > 0.95
+    assert rss_check.verdict is Verdict.UNKNOWN
+    assert "10 分" in rss_check.note
+    # 隙間の前後で MainPID が同じなら、再起動は無かった（変われば数えられる）
+    assert restart_check.verdict is Verdict.PASS
+
+
+def test_a_csv_that_stops_early_is_unknown(empty_db, tmp_path, config):
+    """CSV が期間の終わりまで覆っていない（採取の止め忘れの逆。始め忘れも同じ）。"""
+    rows = rss_rows(lambda _: BASE_KIB, end_ms=TEST_EPOCH_MS + 20 * HOUR_MS)
+
+    report = rss_report(empty_db, tmp_path, config, rows)
+
+    rss_check, restart_check = rss_checks(report)
+    assert rss_check.verdict is Verdict.UNKNOWN
+    assert restart_check.verdict is Verdict.UNKNOWN
+
+
+def test_a_stopped_daemon_is_not_zero_restarts(empty_db, tmp_path, config):
+    """MainPID が空の行（止まっていた）。戻らなければ MainPID は変わらないので、0 回と言わない。"""
+    rows = rss_rows(lambda _: BASE_KIB, pid=lambda ms: None if ms >= 23 * HOUR_MS else 4242)
+
+    report = rss_report(empty_db, tmp_path, config, rows)
+
+    _, restart_check = rss_checks(report)
+    assert restart_check.verdict is Verdict.UNKNOWN
+    assert report.rss is not None and report.rss.stopped_rows == 60
+
+
+def test_an_unfinished_window_is_not_judged_from_the_csv(empty_db, tmp_path, config):
+    report = rss_report(
+        empty_db,
+        tmp_path,
+        config,
+        rss_rows(lambda _: BASE_KIB),
+        now_ms=TEST_EPOCH_MS + 12 * HOUR_MS,
+    )
+
+    assert {check.verdict for check in report.rss_checks} == {Verdict.UNKNOWN}
+
+
+def test_other_units_do_not_change_the_verdict(empty_db, tmp_path, config):
+    """fand など参考の unit がどれだけ増えても、判定は取り込みの行だけで決まる。"""
+    ingest = rss_rows(lambda _: BASE_KIB)
+    growing = rss_rows(
+        lambda ms: 40_000 + 10_000 * ms / HOUR_MS, unit="coldaisle-fand", pid=lambda _: 99
+    )
+
+    alone = rss_report(empty_db, tmp_path, config, ingest)
+    mixed = rss_report(empty_db, tmp_path, config, ingest + growing)
+
+    assert [check.verdict for check in mixed.rss_checks] == [
+        check.verdict for check in alone.rss_checks
+    ]
+    assert rss_checks(mixed)[0].verdict is Verdict.PASS
+    assert mixed.rss is not None
+    fand = next(unit for unit in mixed.rss.units if unit.unit == "coldaisle-fand")
+    assert fand.first is not None and fand.last is not None
+    assert fand.last.rss_anon_kb - fand.first.rss_anon_kb > 200_000
+    assert "coldaisle-fand" in mixed.as_markdown()
+
+
+def test_without_rss_csv_nothing_changes(empty_db, config):
+    """`--rss-csv` を渡さない → RSS は `NOT_COVERED`、再接続回数は参考の一覧（0173 §2.5）。"""
+    end_ms = TEST_EPOCH_MS + DAY_MS
+    with SoakDatabase(empty_db) as store:
+        report = build(store, start_ms=TEST_EPOCH_MS, end_ms=end_ms, now_ms=end_ms, config=config)
+
+    assert report.rss is None
+    assert report.rss_checks == ()
+    assert report.not_covered == NOT_COVERED
+    assert all("RSS" in item for item in NOT_COVERED)
+    assert not any("再接続" in item for item in NOT_COVERED)
+    assert any("再接続" in item for item in REFERENCE_ONLY)
+    markdown = report.as_markdown()
+    assert "## 参考（判定に使わない）" in markdown
+    assert "「この集計に無いもの」が未確認" in markdown
+
+
+def test_everything_passing_gives_an_overall_pass(tmp_path, rules, scenarios, config):
+    """DB の項目と CSV の項目がすべて合格 → `verdict` が合格（`NOT_COVERED` が空になる）。
+
+    Mock の DB は 10 分なので、RSS の区間と間隔だけを縮めた設定で判定する。
+    """
+    db = tmp_path / "soak.db"
+    ingest_mock(db, rules, scenarios, "ramp")
+    short = config.model_copy(
+        update={
+            "rss": config.rss.model_copy(
+                update={"warmup_hours": 0, "sample_interval_s": 10, "max_gap_minutes": 1}
+            )
+        }
+    )
+    end_ms = TEST_EPOCH_MS + TEN_MINUTES_MS
+    rows = rss_rows(lambda _: BASE_KIB, end_ms=end_ms, step_ms=10_000)
+
+    with SoakDatabase(db) as store:
+        report = build(
+            store,
+            start_ms=TEST_EPOCH_MS,
+            end_ms=end_ms,
+            now_ms=end_ms,
+            config=short,
+            rss_samples=rows,
+        )
+
+    assert report.db_verdict is Verdict.PASS
+    assert {check.verdict for check in report.rss_checks} == {Verdict.PASS}
+    assert report.not_covered == ()
+    assert report.verdict is Verdict.PASS
+    document = report.as_dict()
+    assert document["verdict"] == "pass"
+    assert document["not_covered"] == []
+    assert {check["source"] for check in document["checks"]} == {"db", "rss_csv"}
+    assert "未確認" not in report.as_markdown()
+
+
+def test_main_reads_the_rss_csv(tmp_path, empty_db, capsys):
+    csv_path = write_rss_csv(tmp_path / "rss.csv", rss_rows(lambda _: BASE_KIB))
+
+    code = main(
+        [
+            "--db",
+            str(empty_db),
+            "--config",
+            str(CONFIG_DIR / "soak.yaml"),
+            "--start",
+            "2026-08-25T00:00:00+00:00",  # TEST_EPOCH_MS
+            "--rss-csv",
+            str(csv_path),
+            "--no-write",
+            "--print",
+            "json",
+        ],
+        clock=SimulatedClock(TEST_EPOCH_MS + 2 * DAY_MS),
+    )
+
+    assert code == 0
+    printed = json.loads(capsys.readouterr().out)
+    assert printed["not_covered"] == []
+    assert printed["rss"]["rows"] == 22 * 60
+    names = {check["name"]: check["verdict"] for check in printed["checks"]}
+    assert names["取り込みのプロセスの再起動"] == "pass"
+
+
+def test_main_refuses_a_malformed_rss_csv(tmp_path, empty_db):
+    bad = tmp_path / "rss.csv"
+    bad.write_text("ts_ms,unit,rss\n1,coldaisle-daemon,3\n", encoding="utf-8")
+
+    with pytest.raises(SystemExit):
+        main(
+            [
+                "--db",
+                str(empty_db),
+                "--config",
+                str(CONFIG_DIR / "soak.yaml"),
+                "--start",
+                "2026-08-25T00:00:00+00:00",
+                "--rss-csv",
+                str(bad),
+                "--no-write",
+            ]
+        )
+
+
+@pytest.mark.parametrize(
+    "row",
+    [
+        "x,coldaisle-daemon,1,2,3,4,5,6,7",  # 時刻が数でない
+        "1,coldaisle-daemon,1,2,3",  # 列が足りない
+        "1,,1,2,3,4,5,6,7",  # unit が空
+        "1,coldaisle-daemon,1,-2,3,4,5,6,7",  # 負の値
+    ],
+)
+def test_malformed_rss_rows_are_refused(tmp_path, row):
+    path = tmp_path / "rss.csv"
+    path.write_text(",".join(RSS_CSV_COLUMNS) + "\n" + row + "\n", encoding="utf-8")
+
+    with pytest.raises(RssCsvError):
+        read_rss_csv(path)
+
+
+def test_blank_cells_are_none(tmp_path):
+    path = tmp_path / "rss.csv"
+    path.write_text(",".join(RSS_CSV_COLUMNS) + "\n1,coldaisle-daemon,,,,,,,\n", encoding="utf-8")
+
+    (sample,) = read_rss_csv(path)
+
+    assert sample == RssSample(1, "coldaisle-daemon", None, None, None, None, None, None, None)
+
+
+# ---------------------------------------------------------------- 採取のスクリプト
+
+
+def test_sampler_is_valid_bash():
+    bash = shutil.which("bash")
+    if bash is None:
+        pytest.skip("bash が無い")
+    subprocess.run([bash, "-n", str(SAMPLER)], check=True)
+    assert os.access(SAMPLER, os.X_OK), "timer から直接起動できるよう実行権限を付ける"
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="GNU date（%3N）が要る")
+def test_sampler_writes_the_columns_from_fake_proc_and_cgroup(tmp_path):
+    """偽の `/proc` / cgroup / `systemctl` を渡す。**実機の `/proc` を読まない。**"""
+    bash = shutil.which("bash")
+    if bash is None:
+        pytest.skip("bash が無い")
+    proc = tmp_path / "proc"
+    (proc / "4242").mkdir(parents=True)
+    (proc / "4242" / "status").write_text(
+        "Name:\tcoldaisle-daemon\nVmRSS:\t   75396 kB\nRssAnon:\t   55204 kB\n"
+        "RssFile:\t   20192 kB\nRssShmem:\t       0 kB\n",
+        encoding="utf-8",
+    )
+    cgroup = tmp_path / "cgroup" / "system.slice" / "coldaisle-daemon.service"
+    cgroup.mkdir(parents=True)
+    (cgroup / "memory.current").write_text("122683392\n", encoding="utf-8")
+    (cgroup / "memory.stat").write_text(
+        "anon 56528896\nfile 63963136\nkernel 1048576\n", encoding="utf-8"
+    )
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    systemctl = fake_bin / "systemctl"
+    # `systemctl show <unit> -p MainPID --value`。止まっている unit は 0 を返す
+    systemctl.write_text(
+        '#!/bin/sh\ncase "$2" in\n  coldaisle-daemon.service) echo 4242 ;;\n  *) echo 0 ;;\nesac\n',
+        encoding="utf-8",
+    )
+    systemctl.chmod(0o755)
+    env = {
+        **os.environ,
+        "PATH": f"{fake_bin}{os.pathsep}{os.environ.get('PATH', '')}",
+        "COLDAISLE_SOAK_PROC_ROOT": str(proc),
+        "COLDAISLE_SOAK_CGROUP_ROOT": str(tmp_path / "cgroup"),
+    }
+    out = tmp_path / "rss.csv"
+
+    for _ in range(2):
+        subprocess.run(
+            [bash, str(SAMPLER), str(out), "coldaisle-daemon", "coldaisle-fand"],
+            check=True,
+            env=env,
+        )
+
+    lines = out.read_text(encoding="utf-8").splitlines()
+    assert lines[0] == ",".join(RSS_CSV_COLUMNS), "見出しは最初の1回だけ"
+    assert len(lines) == 1 + 2 * 2
+    ingest = lines[1].split(",")
+    assert ingest[0].isdigit()
+    assert ingest[1:] == [
+        "coldaisle-daemon",
+        "4242",
+        "55204",
+        "75396",
+        "20192",
+        "122683392",
+        "56528896",
+        "63963136",
+    ]
+    # 止まっている unit（MainPID 0）・cgroup の無い unit は空欄（推測で埋めない）
+    assert lines[2].split(",")[1:] == ["coldaisle-fand", "", "", "", "", "", "", ""]
+    # soak の集計がそのまま読める形
+    samples = read_rss_csv(out)
+    assert [sample.unit for sample in samples] == ["coldaisle-daemon", "coldaisle-fand"] * 2
+    assert samples[0].rss_anon_kb == 55204
+
+
+def test_sampler_refuses_a_unit_name_that_breaks_the_csv(tmp_path):
+    bash = shutil.which("bash")
+    if bash is None:
+        pytest.skip("bash が無い")
+    out = tmp_path / "rss.csv"
+
+    result = subprocess.run(
+        [bash, str(SAMPLER), str(out), "bad,unit"], capture_output=True, check=False
+    )
+
+    assert result.returncode == 2
+    assert not out.exists()

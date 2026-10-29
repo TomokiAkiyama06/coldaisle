@@ -25,6 +25,29 @@ thresholds:
   # （受入基準「意図しない再起動が0回」。DB では意図したかどうかを区別できません）
   max_device_restarts: 0
 
+# 取り込みのデーモンの RSS の判定（決定記録 0173 §2.3）。`--rss-csv` を渡したときだけ使います。
+# CSV は導入先で `deploy/soak/rss-sample.sh` が 1 分ごとに 1 行ずつ書いたもの（手順は docs/ubuntu-deploy.md 4.4）。
+# **値は測る前に決め、測った後に動かしません**（結果に合わせて閾値を緩めない）。
+rss:
+  # 判定する unit（CSV の `unit` の列）。判定に使うのはこの unit の `rss_anon_kb`（`/proc/<MainPID>/status` の RssAnon）だけで、
+  # ほかの unit の行は参考として表に出すだけです（0173 §2.1）
+  ingest_unit: "coldaisle-daemon"
+  # 期間の始まりから除く暖機の時間。起動直後の import・キャッシュ・SQLite の接続の確保による増加を傾向に入れない
+  warmup_hours: 2
+  # 判定の区間の最小二乗の直線の傾きがこれ**以下**なら合格（256 KiB/h は続けば 1 日 6 MiB）
+  max_slope_kib_per_hour: 256
+  # 判定の区間の最大値と最小値の差がこれ**以下**なら合格
+  max_range_mib: 16
+  # 採取の間隔（timer の `--on-unit-active=60s` と揃える）。期待の行数 = 判定の区間 ÷ この間隔
+  sample_interval_s: 60
+  # 判定の区間の行が期待の行数のこの割合**未満**なら判定不能
+  min_coverage: 0.95
+  # 行の間隔（区間の端からの間隔を含む）がこれを**超える**ところがあれば判定不能
+  max_gap_minutes: 10
+  # 期間（暖機を含む）での取り込みの MainPID の変化（プロセスの再起動）がこの回数**以下**なら合格
+  # （受入基準「意図しない再起動が0回」。0173 §2.4。デバイス再起動の項目とは別に数えます）
+  max_process_restarts: 0
+
 # Markdown と JSON の保存先。`~` は展開します。
 # `docs/` には置きません（室温の推移は生活パターンそのもの。決定記録 0017 §2.4 と同じ理由）。
 # `docs/soak-test-YYYY-MM-DD.md` への記録は、人が内容を確かめてから書きます
