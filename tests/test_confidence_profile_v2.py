@@ -90,6 +90,7 @@ from coldaisle.control.schema import (
     Zone,
 )
 from coldaisle.store.models import Quality
+from offline_validation import offline_validation
 from test_fallback_controller import gate_for, learned_proposal, policy
 from test_model_confidence import _select
 from test_thermal_model_v2 import (
@@ -978,7 +979,7 @@ def test_promotion_and_rollback_move_the_fitted_profile_with_its_model(tmp_path:
         registry.register_candidate(metadata, fitted.payload, actor="trainer", reason="trained")
         registry.mark_validated(
             metadata.ref,
-            offline_evaluation_ref=f"evaluation/offline/{version}",
+            **offline_validation(metadata, f"evaluation/offline/{version}"),
             actor="evaluator",
             reason="offline gates passed",
             expected_revision=registry.inspect().revision,

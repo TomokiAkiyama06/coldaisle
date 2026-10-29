@@ -293,9 +293,14 @@ def test_nothing_imports_thermal_evaluate() -> None:
     assert _importers_of("coldaisle.thermal_evaluate") == []
 
 
-def test_only_the_evaluation_cli_imports_the_report_module() -> None:
-    # 段 2 で coldaisle-registry（registry.py）が加わる（0172 §2.7）
-    assert _importers_of("coldaisle.thermal_evaluation_report") == ["thermal_evaluate.py"]
+def test_only_the_evaluation_cli_and_the_registry_import_the_report_module() -> None:
+    # 書き手（評価の CLI）と、段 2 の読み手（coldaisle-registry の validate と、ref の形を書き込みの
+    # 時点で確かめる ModelRegistry.mark_validated()）だけ（0172 §2.7 / §5 の 11）
+    assert _importers_of("coldaisle.thermal_evaluation_report") == [
+        "control/model_registry.py",
+        "registry.py",
+        "thermal_evaluate.py",
+    ]
 
 
 def test_the_report_has_no_wall_clock_field(world: World) -> None:

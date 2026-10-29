@@ -44,6 +44,10 @@ from coldaisle.control.schema import (
     registry_reason_sha256,
 )
 from coldaisle.hint_certificate import HINT_CERTIFICATE_SCHEMA_VERSION, HINT_GATE_SPEC_VERSION
+from coldaisle.thermal_evaluation_report import is_offline_evaluation_ref
+from coldaisle.thermal_evaluation_report import (
+    offline_evaluation_ref as thermal_offline_evaluation_ref,
+)
 
 MODEL_REGISTRY_SCHEMA_VERSION: Literal[4] = 4
 """**書き出す** registry schema version。"""
@@ -81,6 +85,12 @@ _DIRECTORY_MODE_MASK = 0o2770
 other には何も渡さない。
 """
 _ARTIFACT_FILENAME = "artifact.payload"
+OFFLINE_EVALUATION_FILENAME = "offline-evaluation.json"
+"""反実仮想 thermal model の offline 評価の報告を artifact の隣へ写す file 名。
+
+決定記録 0172 §5 の 10。`offline_evaluation_ref`（`thermal-offline-v1:<sha256>`）の digest は、
+この file の bytes の SHA-256。
+"""
 _READ_CHUNK_BYTES = 1024 * 1024
 # One JSON lexical unit relevant to structure: a string, a bracket, or a scalar run.
 # The string branch always matches (possessively) up to its closing quote *or* the end
@@ -1439,8 +1449,17 @@ class ModelRegistry:
         actor: str,
         reason: str,
         expected_revision: int,
+        offline_evaluation_report: bytes | None = None,
     ) -> int:
-        """Record successful offline evaluation and move candidate to validated."""
+        """Record successful offline evaluation and move candidate to validated.
+
+        反実仮想 thermal model（``thermal_model`` / ``counterfactual_action``）では、ref が
+        ``thermal-offline-v1:`` + 64 hex の形であること、``offline_evaluation_report`` に報告の
+        bytes を渡し、その SHA-256 が ref の digest と一致することを書き込みの時点で確かめ、報告を
+        artifact の隣（``offline-evaluation.json``）へ写す（決定記録 0172 §2.7 / §5 の 10・11）。
+        報告の中身は読まない（照合は ``coldaisle-registry validate --thermal-evaluation`` が行う）。
+        他の kind は従来どおり自由記述の ref を受け、報告の bytes は受けない。
+        """
         self._validate_actor_reason(actor, reason)
         self._validate_reference(offline_evaluation_ref, "offline_evaluation_ref")
         with self._exclusive_lock() as root_fd:
@@ -1449,6 +1468,9 @@ class ModelRegistry:
             record = self._record(snapshot, ref)
             if record.status is not ArtifactStatus.CANDIDATE:
                 raise InvalidTransitionError("candidate だけを validated にできる")
+            self._check_offline_evaluation(
+                record.metadata, offline_evaluation_ref, offline_evaluation_report
+            )
             self._verify(root_fd, record, compatibility=None)
 
             metadata = record.metadata.model_copy(
@@ -1468,7 +1490,24 @@ class ModelRegistry:
                 actor=actor,
                 reason=reason,
             )
-            self._write_snapshot(root_fd, updated)
+            if offline_evaluation_report is None:
+                self._write_snapshot(root_fd, updated)
+                return updated.revision
+            # 容量の上限を fs に触る前に確かめる。書く順は報告が先・snapshot が後（register と
+            # 同じ）: 間で止まっても、candidate の隣に参照されない報告が残るだけで、validated が
+            # 報告を欠くことはない
+            snapshot_payload = self._encode_snapshot(updated)
+            snapshot_attempted = False
+            try:
+                self._write_offline_evaluation(root_fd, ref, offline_evaluation_report)
+                snapshot_attempted = True
+                self._atomic_write(root_fd, _STATE_FILENAME, snapshot_payload)
+            except BaseException as exc:
+                # snapshot の置き換えの後の永続の失敗は確定している（報告は参照されている）。
+                # 消さない
+                if not (snapshot_attempted and isinstance(exc, RegistryDurabilityError)):
+                    self._remove_offline_evaluation_if_unvalidated(root_fd, ref)
+                raise
             return updated.revision
 
     def promote(
@@ -2060,6 +2099,77 @@ class ModelRegistry:
             return payload
         finally:
             os.close(directory_fd)
+
+    def _check_offline_evaluation(
+        self,
+        metadata: ArtifactMetadata,
+        offline_evaluation_ref: str,
+        report: bytes | None,
+    ) -> None:
+        """反実仮想 thermal model の ref の形と報告の bytes を確かめる（0172 §5 の 10・11）。
+
+        snapshot の読み込みの検証には入れない（既存の Registry を読めなくしない。0172 §2.7）。
+        """
+        counterfactual_thermal = (
+            metadata.kind is ArtifactKind.THERMAL_MODEL
+            and metadata.capability is ArtifactCapability.COUNTERFACTUAL_ACTION
+        )
+        if not counterfactual_thermal:
+            if report is not None:
+                # 報告を写すのは反実仮想 thermal model だけ。他の kind に置き場所を作らない
+                raise ValueError(
+                    "offline 評価の報告を写すのは thermal_model / counterfactual_action だけ"
+                )
+            return
+        if not is_offline_evaluation_ref(offline_evaluation_ref):
+            raise ValueError(
+                "反実仮想 thermal model の offline_evaluation_ref は thermal-offline-v1:<64 hex>"
+                " にする（coldaisle-registry validate --thermal-evaluation。決定記録 0172）"
+            )
+        if report is None:
+            raise ValueError(
+                "反実仮想 thermal model の validate には offline 評価の報告の bytes が要る"
+            )
+        if len(report) > self._limits.max_snapshot_bytes:
+            raise ArtifactVerificationError("offline 評価の報告がsize上限を超えている")
+        if thermal_offline_evaluation_ref(report) != offline_evaluation_ref:
+            raise ArtifactVerificationError("offline 評価の報告の digest が ref と一致しない")
+
+    def _write_offline_evaluation(self, root_fd: int, ref: ArtifactRef, report: bytes) -> None:
+        directory_fd = self._open_directory_chain(
+            root_fd,
+            ("artifacts", ref.kind.value, ref.model_id, ref.version),
+            create=False,
+        )
+        try:
+            self._atomic_write(directory_fd, OFFLINE_EVALUATION_FILENAME, report)
+        finally:
+            os.close(directory_fd)
+
+    def _remove_offline_evaluation_if_unvalidated(self, root_fd: int, ref: ArtifactRef) -> None:
+        """validate が確定しなかったときに写した報告を消す（best effort）。
+
+        lock を持ったまま snapshot を読み直し、まだ candidate のときだけ消す。読めない snapshot は
+        確定したかが分からないので残す（``_remove_artifact_if_unreferenced`` と同じ考え方）。
+        """
+        try:
+            record = self._read_snapshot(root_fd).artifacts.get(ref.key)
+        except RegistryCorruptError:
+            return
+        if record is None or record.status is not ArtifactStatus.CANDIDATE:
+            return
+        with suppress(OSError, UnsafeRegistryPathError):
+            directory_fd = self._open_directory_chain(
+                root_fd,
+                ("artifacts", ref.kind.value, ref.model_id, ref.version),
+                create=False,
+            )
+            try:
+                with suppress(FileNotFoundError):
+                    os.unlink(OFFLINE_EVALUATION_FILENAME, dir_fd=directory_fd)
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
 
     def _write_artifact(self, root_fd: int, ref: ArtifactRef, payload: bytes) -> None:
         directory_fd = self._open_directory_chain(
