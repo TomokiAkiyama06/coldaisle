@@ -396,6 +396,69 @@ journalctl -u coldaisle-slackbot -n 20 --no-pager   # 「Slack の Socket Mode �
 止めるときは `sudo systemctl disable --now coldaisle-slackbot.service`。トークンを無効にするときは、Slack のアプリの
 **Basic Information** で App-Level Token を **Revoke** し、env から `COLDAISLE_SLACK_APP_TOKEN` の行を消します。
 
+### 4.4 連続運転テスト（soak）の RSS の採取（#47。決定記録 0173）
+
+受入基準「デーモンの RSS が 24 時間で増加傾向を示さない」は DB に記録の経路が無いので、導入先で**一時的に**採取した CSV を
+`coldaisle-soak-report --rss-csv` に渡して判定します。常駐の unit・取り込みのコード・DB には何も足しません。
+
+- 採取は `deploy/soak/rss-sample.sh`。1 回の起動で、unit ごとに 1 行（`/proc/<MainPID>/status` の `RssAnon` / `VmRSS` / `RssFile` と
+  cgroup の `memory.current` / `memory.stat` の `anon` / `file`）を CSV に追記して終わります。**読むだけなので sudo は要りません**
+- 判定に使うのは取り込み（`coldaisle-daemon`）の `RssAnon` だけです。fand・telemetry・api・slackbot の行は参考として表に出るだけです
+- 閾値は `config/soak.yaml` の `rss:`（暖機 2 時間を除いた 22 時間で、傾き ≤ 256 KiB/h かつ 最大−最小 ≤ 16 MiB）。
+  **測る前に決めた値で、測った後に動かしません**
+- 期間中に取り込みの MainPID が変わると「取り込みのプロセスの再起動」が不合格になります（受入基準「意図しない再起動 0 回」）
+
+**測る条件**（0173 §2.6）: fand・telemetry・api・slackbot・report / rollup の timer が普段どおり動いている状態で測ります。
+負荷の試験とは重ねません。期間中は `/opt/coldaisle` の更新・`coldaisle-daemon` の再起動・基板の送信周期の変更・基板の抜き差しをしません。
+OS が再起動すると一時的な timer は消えるので、そのときは最初からやり直します。
+
+#### 始める
+
+採取のスクリプトを作業用のディレクトリへ写してから使います（期間中にリポジトリを更新しても、動いているものが変わらないように）。
+CSV もリポジトリの外に置きます（`docs/` に置かない。決定記録 0017 §2.4 と同じ）。
+
+```bash
+mkdir -p ~/coldaisle-soak
+install -m 0755 /opt/coldaisle/deploy/soak/rss-sample.sh ~/coldaisle-soak/   # この版を含むリポジトリの写しからでもよい
+# ログアウトしても user の timer が止まらないこと（Linger=yes）。no なら enable-linger を所有者の判断で行う
+loginctl show-user "$USER" -p Linger
+# 1 回だけ手で動かし、取り込みの行に PID と rss_anon_kb が入ることを見る（確かめたら消す）
+~/coldaisle-soak/rss-sample.sh ~/coldaisle-soak/check.csv && cat ~/coldaisle-soak/check.csv && rm ~/coldaisle-soak/check.csv
+# 1 分ごとの一時的な timer。AccuracySec を詰めないと、既定（1 分）の揺れで間隔が延びる
+csv=~/coldaisle-soak/rss-$(date +%Y%m%d).csv
+systemd-run --user --unit=coldaisle-rss-sample \
+  --on-active=1s --on-unit-active=60s --timer-property=AccuracySec=1s \
+  "$HOME/coldaisle-soak/rss-sample.sh" "$csv"
+echo "$csv"   # 判定のときに使うので控える
+```
+
+timer を始めてから数分のうちの、きりのよい時刻を soak の始まり（`--start`）として控えます。
+期間の始まりより前から採取していれば、暖機の除外は期間の始まりから数えます。
+
+#### 途中で確かめる
+
+```bash
+systemctl --user list-timers 'coldaisle-rss-sample*'   # NEXT が 1 分以内であること
+tail -n 6 "$csv"                                         # 直近の行（unit ごとに 1 行）
+systemctl --user status coldaisle-rss-sample.service    # 失敗していないこと
+```
+
+#### 止めて判定する（始まりから 24 時間の後）
+
+```bash
+systemctl --user stop coldaisle-rss-sample.timer
+# 欠測率・デバイス再起動も同じ 24 時間で確かめ直す（T1 の結果に頼らない）
+# DB を直接読めないときは、期間の後に取った DB の写しを --db に渡す（集計は DB を書き換えない）
+uv run coldaisle-soak-report --db /var/lib/coldaisle/coldaisle.db --start <始まり> --rss-csv "$csv" --print markdown
+# 参考（判定に使わない）: 同じ期間のシリアルの再接続回数
+journalctl -u coldaisle-daemon --since "<始まり>" --until "<始まり + 24 時間>" --no-pager | grep -c 'シリアルが切れた'
+```
+
+- `判定（総合）` が**合格**なら、結果を人が確かめ、`docs/soak-test-YYYY-MM-DD.md` に要約（判定の表・傾き・範囲・MainPID・参考の unit の値）を書きます
+- RSS が**判定不能**（行の欠け・10 分を超える隙間・MainPID の入れ替わり）なら測り直します。
+  **不合格はリークの断定ではありません。** #47 を閉じず、48 時間で測り直すか `tracemalloc` で調べます（別の Issue）
+- CSV と `var/soak/` の出力は生の記録なのでコミットしません
+
 ## 5. Mac からのデータ移行
 
 1. **Mac 側で DB に書くプロセスをすべて止める。** 取り込み（`coldaisle-daemon`）だけでなく、

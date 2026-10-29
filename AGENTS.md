@@ -29,6 +29,7 @@ uv run coldaisle-rollup             # ロールアップと保持期間の適用
 uv run coldaisle-report             # 前日の日次レポート（ロールアップのあと）
 uv run coldaisle-report --date 2026-08-24 --no-send --print  # 任意の日を作り直す
 uv run coldaisle-soak-report --start 2026-08-24T09:00  # 連続運転テストの集計（**DB を読むだけ**）
+uv run coldaisle-soak-report --start 2026-08-24T09:00 --rss-csv ~/coldaisle-soak/rss-20260824.csv  # 取り込みの RSS と再起動も判定（CSV は導入先で deploy/soak/rss-sample.sh が採る。**読むだけ**。手順は docs/ubuntu-deploy.md 4.4。決定記録 0173）
 uv run coldaisle-load-distribution --db <DB の写し> --start 2026-10-15T16:36 --end 2026-10-16T16:36 --out var/load-distribution/t1.json  # 負荷の状態ごとの d.* の分布（**DB を読むだけ・合否も閾値の提案も出さない**。`--periods` で区間と bios_confirmed。決定記録 0151）
 uv run coldaisle-airflow-characterization --run var/airflow-characterization/<run>.yaml [--run ...] --format markdown --out var/airflow-characterization/report.md  # 回転数の掃引と応答の行列の解析（**DB の写しと manifest を読むだけ・設定へ写さない**。分解能の未定の値があると失敗する。決定記録 0153）
 uv run coldaisle-escalate           # 故障疑いの案件資料（**送信はしない**）
