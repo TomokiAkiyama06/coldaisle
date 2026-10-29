@@ -3,6 +3,7 @@
 - **種別**: Decision Record
 - **Status**: FINAL（2026-10-21、リポジトリ所有者の承認。§5 の 1〜8 はすべて推奨の案）
 - **Date**: 2026-10-21
+- **Superseded by**: [0175](0175-hint-shadow-implementation-points.md)（§2.3 のうち元の tick の trace の `skipped` に `mpc_unavailable` を載せる点を PR-C では配線しない点のみ。PR-D の集計の後に要否を決める。ほかは有効）
 - **Supersedes**: なし（採った案はどれも、[0133](0133-workload-hint-stage-b-prior-rollout.md) §2.5 / §2.5a / §2.8 / §2.9・
   [0152](0152-hint-monotonic-gate-certificate.md) §2.3 / §2.6 / §2.7・[0156](0156-hint-gate-spec-schema.md) §2.4 を置き換えず、
   具体の形を補う。§5 の 1 の (b)・(d) や 2 の (b) なら置き換えが要ったが、どれも採っていない）

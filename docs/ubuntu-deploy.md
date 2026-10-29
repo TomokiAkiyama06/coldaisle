@@ -1139,7 +1139,7 @@ Registry と制御設定への書き込み、root。artifact の本体は `raise
       どちらの場合も承認の期限内であることと、承認の `to_stage` が `fan-policy.yaml` の上限以下であることが要ります
       （それより前の検査で拒まれるため）
    6. **隔離した interpreter が import に使う場所のすべてに、承認者が書けないこと**（0134 §2.4 の 1。走査の範囲と外の場所の扱いは決定記録 [`0141`](decisions/0141-c1-import-scan-scope.md)。C1）。
-      **0141 は Proposed です。FINAL になるまで、この 6 で C1 を通したとはしません**（0134 の文面のままでは、システムの Python の導入で通らないため）。
+      0141 は FINAL です（2026-10-15、リポジトリ所有者の承認）。この 6 は 0141 の範囲で確かめます（0134 の文面のままでは、システムの Python の導入で通らないため）。
       `coldaisle-authority` だけのアカウントで行います。`-I` は site の処理を止めず、site-packages の `.pth`
       （`import` で始まる行は実行される。editable の導入の `.pth` は `src` を `sys.path` に足す）は `-I` でも
       効くので、`.venv/bin`・`config`・`src` だけを見るのでは足りません。**隔離した interpreter 自身が報告する
