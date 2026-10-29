@@ -4,6 +4,7 @@
 **1分→1時間は件数で加重**、**集計前の生データを消さない**。
 """
 
+import sqlite3
 from pathlib import Path
 
 import pytest
@@ -275,6 +276,47 @@ def test_every_metric_is_swept(store, rules_30d):
     rollup_minutes(store)
     deleted, _ = apply_retention(store, rules_30d, now_ms=40 * DAY_MS)
     assert deleted == 3
+
+
+def test_retention_commits_per_metric_and_can_be_retried(store, rules_30d):
+    """メトリクスごとにコミットする（#378 / 決定記録 0170）。
+
+    途中のメトリクスで失敗しても前のメトリクスの削除は残り、次の実行で残りを
+    同じ条件で消せる（冪等）。書き込みロックを全メトリクス分まとめて持たないため。
+    """
+    metrics = ("air.gpu_intake", "air.room", "sys.dropped_samples")
+    for metric in metrics:
+        write(store, metric, 1 * DAY_MS, 1.0)
+        write(store, metric, 2 * DAY_MS, 1.0)
+    rollup_minutes(store)
+    assert store.metrics() == metrics, "削除はこの順に進む"
+    conn = store.connection
+    conn.execute(
+        "CREATE TEMP TRIGGER fail_room BEFORE DELETE ON readings "
+        "WHEN OLD.metric = 'air.room' BEGIN SELECT RAISE(ABORT, 'injected'); END"
+    )
+
+    with pytest.raises(sqlite3.IntegrityError, match="injected"):
+        apply_retention(store, rules_30d, now_ms=40 * DAY_MS)
+
+    assert not conn.in_transaction
+    remaining = {
+        metric: [point.ts_ms for point in store.series(metric, 0, 50 * DAY_MS)]
+        for metric in metrics
+    }
+    assert remaining == {
+        "air.gpu_intake": [2 * DAY_MS],
+        "air.room": [1 * DAY_MS, 2 * DAY_MS],
+        "sys.dropped_samples": [1 * DAY_MS, 2 * DAY_MS],
+    }
+
+    conn.execute("DROP TRIGGER fail_room")
+    deleted, cutoff = apply_retention(store, rules_30d, now_ms=40 * DAY_MS)
+    assert deleted == 2
+    assert cutoff == 2 * DAY_MS
+    for metric in metrics:
+        assert [point.ts_ms for point in store.series(metric, 0, 50 * DAY_MS)] == [2 * DAY_MS]
+    assert apply_retention(store, rules_30d, now_ms=40 * DAY_MS)[0] == 0
 
 
 def test_expired_control_traces_are_deleted_by_the_rollup_job(store, rules_30d):

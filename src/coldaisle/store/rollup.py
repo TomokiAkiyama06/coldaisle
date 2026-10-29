@@ -423,6 +423,15 @@ def apply_retention(store: SqliteStore, rules: RetentionRules, *, now_ms: int) -
 
     メトリクスごとにループするのは主キー `(metric, ts_ms)` を使うため
     （決定記録 0002 §2.4）。1本の `DELETE ... WHERE ts_ms < ?` は全走査になる。
+
+    **トランザクションもメトリクスごとに分ける**（#378 / 決定記録 0170）。全メトリクスを
+    1つにまとめると書き込みロックを数秒持ち、取り込みと Internal Telemetry の
+    `BEGIN IMMEDIATE` が busy_timeout を過ぎて失敗する。`_rollup_minutes` と同じ考え方。
+
+    途中のメトリクスで失敗しても、それまでのメトリクスの削除はコミット済みで残り、
+    失敗したメトリクス以降は手付かずのまま例外が上がる。条件は「保持期間を過ぎ、
+    かつ1分ロールアップ済み」の行だけなので、**次の実行で同じ削除をやり直せる**（冪等）。
+    途中で止まっても、集計前の行や最終バケットの行が消えた状態にはならない。
     """
     _refuse_dataset_db(store)
     conn = store.connection
@@ -434,8 +443,8 @@ def apply_retention(store: SqliteStore, rules: RetentionRules, *, now_ms: int) -
     # 可能性があり、集計し直す前に生データを消すと二度と正しくならない
     cutoff = min(cutoff, int(rolled))
     deleted = 0
-    with store.transaction():
-        for metric in store.metrics():
+    for metric in store.metrics():
+        with store.transaction():
             cursor = conn.execute(
                 "DELETE FROM readings WHERE metric = ? AND ts_ms < ?", (metric, cutoff)
             )

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -587,3 +588,153 @@ def test_hwmon_metric_missing_from_the_catalog_fails_at_load(tmp_path: Path):
         InternalTelemetryConfig.from_yaml(
             _hwmon_config(tmp_path, "cpu.unknown_sensor", "temperature"), catalog=CATALOG
         )
+
+
+# ------------------------------------------- DB の書き込みロック待ち（#378 / 決定記録 0170）
+
+
+class LockHolder:
+    """別の接続で ``BEGIN IMMEDIATE`` を取り、書き込みロックを持つ（rollup の代わり）。"""
+
+    def __init__(self, path: Path) -> None:
+        self._conn = sqlite3.connect(path, isolation_level=None)
+
+    def hold(self) -> None:
+        self._conn.execute("BEGIN IMMEDIATE")
+
+    def release(self) -> None:
+        if self._conn.in_transaction:
+            self._conn.execute("ROLLBACK")
+
+    def close(self) -> None:
+        self.release()
+        self._conn.close()
+
+
+def _locking_daemon(tmp_path: Path, rules):
+    clock = SimulatedClock(1_000)
+    path = tmp_path / "locked.db"
+    # ロック待ちで試験が遅くならないよう busy_timeout を短くする
+    store = SqliteStore(path, rules=rules, clock=clock, busy_timeout_ms=50)
+    adapter = FakeAdapter(
+        name="nvml",
+        expected_metrics=("gpu.0.core",),
+        result=AdapterResult(
+            source="nvml",
+            status=SourceStatus.DEGRADED,
+            readings=(Reading(metric="gpu.0.core", value=55.0, quality=Quality.OK),),
+        ),
+    )
+    holder = LockHolder(path)
+
+    def sleep(seconds: float) -> None:
+        # 周期の間にロックが外れる（rollup が終わる）
+        holder.release()
+        clock.advance_to_ms(clock.now_ms() + round(seconds * 1_000))
+
+    daemon = InternalTelemetryDaemon(
+        collector=InternalTelemetryCollector((adapter,), clock),
+        store=store,
+        interval_ms=2_500,
+        source_kind=TelemetrySourceKind.MOCK,
+        sleep=sleep,
+        monotonic_ms=clock.now_ms,
+    )
+    return daemon, store, adapter, holder
+
+
+def test_a_locked_cycle_is_dropped_and_the_next_cycle_writes(tmp_path: Path, rules, caplog):
+    """ロックを取れない cycle は落ちずに破棄し、ロックが外れた次の cycle で書く。"""
+    daemon, store, adapter, holder = _locking_daemon(tmp_path, rules)
+    original_poll = adapter.poll
+    polls = 0
+
+    def poll_then_lock() -> AdapterResult:
+        nonlocal polls
+        polls += 1
+        if polls == 1:
+            holder.hold()  # 最初の cycle の書き込みの直前にロックを取られる
+        return original_poll()
+
+    adapter.poll = poll_then_lock  # type: ignore[method-assign]
+    try:
+        with caplog.at_level(logging.INFO, logger="coldaisle.internal_telemetry"):
+            stats = daemon.run(max_cycles=2)
+    finally:
+        holder.close()
+
+    assert stats.cycles == 2
+    assert stats.locked_cycles == 1
+    assert stats.as_fields()["locked_cycles"] == 1
+    assert stats.readings == 1
+    assert [point.ts_ms for point in store.series("gpu.0.core", 0, 60_000)] == [3_500]
+    assert store.current_state(SOURCE_STATE_PREFIX + "nvml") == "degraded"
+    assert not store.connection.in_transaction
+    dropped = [r for r in caplog.records if "書き込みを破棄する" in r.getMessage()]
+    assert len(dropped) == 1
+    fields = getattr(dropped[0], logs.FIELDS_KEY)
+    assert dropped[0].levelno == logging.WARNING
+    assert fields["stage"] == "readings"
+    assert fields["dropped_readings"] == 1
+    assert fields["consecutive_locked_cycles"] == 1
+    assert fields["sqlite_errorcode"] & 0xFF == sqlite3.SQLITE_BUSY
+    recovered = [r for r in caplog.records if "回復した" in r.getMessage()]
+    assert [getattr(r, logs.FIELDS_KEY)["consecutive_locked_cycles"] for r in recovered] == [1]
+
+
+def test_a_lock_in_the_middle_of_a_cycle_keeps_the_committed_readings(tmp_path: Path, rules):
+    """readings を書いた後に状態の書き込みでロックを取れなければ、残りだけを捨てる。
+
+    捨てた状態は変化時だけ書く規則（0002 §2.6）により、次の cycle の時刻で書き直される。
+    """
+    daemon, store, _, holder = _locking_daemon(tmp_path, rules)
+    original = store.set_system_state
+    calls = 0
+
+    def lock_before_the_first_source_state(key: str, value: str, *, at_ms: int) -> bool:
+        nonlocal calls
+        if key.startswith(SOURCE_STATE_PREFIX):
+            calls += 1
+            if calls == 1:
+                holder.hold()
+        return original(key, value, at_ms=at_ms)
+
+    store.set_system_state = lock_before_the_first_source_state  # type: ignore[method-assign]
+    try:
+        stats = daemon.run(max_cycles=2)
+    finally:
+        holder.close()
+
+    assert stats.locked_cycles == 1
+    assert [point.ts_ms for point in store.series("gpu.0.core", 0, 60_000)] == [1_000, 3_500]
+    state_at = store.connection.execute(
+        "SELECT ts_ms FROM system_state WHERE key = ?", (SOURCE_STATE_PREFIX + "nvml",)
+    ).fetchall()
+    assert [row[0] for row in state_at] == [3_500]
+
+
+def test_an_operational_error_other_than_a_lock_is_raised(tmp_path: Path, rules):
+    """BUSY / LOCKED 以外は破棄せず上げる（systemd が起動し直す）。"""
+    daemon, store, adapter, holder = _locking_daemon(tmp_path, rules)
+    holder.close()
+
+    def broken(_sample: Sample) -> int:
+        raise sqlite3.OperationalError("disk I/O error")
+
+    store.insert_sample = broken  # type: ignore[method-assign]
+    with pytest.raises(sqlite3.OperationalError, match="disk I/O"):
+        daemon.run(max_cycles=1)
+    assert daemon.stats.locked_cycles == 0
+    assert adapter.closed
+
+
+def test_a_real_non_lock_operational_error_is_raised(tmp_path: Path, rules):
+    """実際の SQLite の失敗（BUSY でないコード）も上げる。"""
+    daemon, store, _, holder = _locking_daemon(tmp_path, rules)
+    holder.close()
+    store.connection.execute("DROP TABLE readings")
+
+    with pytest.raises(sqlite3.OperationalError) as raised:
+        daemon.run(max_cycles=1)
+    assert raised.value.sqlite_errorcode & 0xFF not in (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED)
+    assert daemon.stats.locked_cycles == 0
