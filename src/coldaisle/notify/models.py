@@ -295,6 +295,35 @@ class DisplayNames:
 
 
 @dataclass(frozen=True)
+class ThreadImage:
+    """スレッドへ上げる画像 1 枚（日次レポートの測定値の表。決定記録 0171 §2.3）。"""
+
+    filename: str
+    content: bytes
+    title: str
+    comment: str
+
+
+@dataclass(frozen=True)
+class ReportThread:
+    """題だけの親とそのスレッドで送るときの中身（決定記録 0171 §2.1）。
+
+    送る順は 親（`title`）→ 返信 1（`lead`）→ 返信 2（`table_image`、無ければ `table_text`）。
+    **届いたと数えるのは `lead`（要点）が届いたときだけ**（0171 §2.5）。表は添え物で、
+    届かなくてもログに残すだけにする。
+    """
+
+    title: str
+    """親の投稿。題だけ（`📄 10月25日の振り返り`）。"""
+    lead: str
+    """返信 1: 要点。**切らない**（0171 §2.2）。"""
+    table_text: str
+    """測定値の表の Markdown。画像が無い・上げられないときに返信 2 として送る。"""
+    table_image: ThreadImage | None = None
+    """測定値の表の PNG。描けなかったら `None`（0171 §2.3）。"""
+
+
+@dataclass(frozen=True)
 class Notification:
     """1通ぶん。**本文は宛先ごとに組み立て直さない。**"""
 
@@ -316,6 +345,12 @@ class Notification:
     """
     body: str = ""
     """本文をそのまま渡す場合に使う（説明の全文）。"""
+    thread: ReportThread | None = None
+    """スレッドにできる宛先（Slack の Bot）だけが使う、日次レポートの別の形（決定記録 0171 §2.1）。
+
+    `None` なら今までどおり 1 通。Webhook・LINE・stdout はこれを見ない（`as_text()` にも
+    入れない）ので、それらの宛先の本文は今の Markdown の 1 通のまま。
+    """
     names: DisplayNames = field(default_factory=DisplayNames)
     """ID → 人が読む文と名前（決定記録 0142）。空なら ID のまま出す。"""
     reference: ExpectedReference | None = None

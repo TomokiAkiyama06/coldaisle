@@ -269,6 +269,7 @@ src/coldaisle/
   ingest/     # L0: Source実装（serial / mock / replay）、正規化
   alert_graph.py # 合成の起点の部品: Slack の発火の通知に直近 60 分のグラフを後から添える（専用のスレッド・自分の DB の接続・LLM を使わない）。#334 / 決定記録 0147
   report.py   # 合成の起点: 日次レポート（Store→AI→通知）。#25
+  report_table.py # 合成の起点の部品: 日次レポートの測定値の表を PNG に描く（Pillow は関数の中で読む。取り込み・API・fand・Learned から import しない）。#380 / 決定記録 0171
   soak.py     # 合成の起点: 連続運転テストの集計（Store を読むだけ）。#47
   load_distribution.py # 合成の起点: 負荷の状態（電力の帯）ごとの d.* の分布（DB を mode=ro で読むだけ・合否なし。AI 層・API から import しない）。#50 / 決定記録 0151
   airflow_characterization.py # 合成の起点: 回転数の掃引と応答の行列の解析（checkpoint 済みの DB の写しを immutable で読むだけ・設定へ書かない。control・AI 層・API から import しない）。#75 / 決定記録 0153

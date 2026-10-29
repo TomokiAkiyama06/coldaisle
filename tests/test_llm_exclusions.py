@@ -306,14 +306,17 @@ def test_summary_is_not_requested_without_a_valid_list(store, catalog):
     assert report.summary is None
 
 
-def test_cli_skips_the_summary_when_the_list_is_malformed(tmp_path, rules, monkeypatch):
+def test_cli_skips_the_summary_when_the_list_is_malformed(tmp_path, rules, monkeypatch, capsys):
     db = tmp_path / "cli.db"
     with SqliteStore(db, rules=rules, clock=SimulatedClock(0)) as opened:
         bucket(opened, "air.room", 0, 26.0)
     config_path = tmp_path / "report.yaml"
     config_path.write_text(
-        f"timezone: Asia/Tokyo\noutput_dir: {tmp_path / 'out'}\nto: []\nsummarise: true\n"
-        "max_alerts: 20\nmax_notification_chars: 3500\nllm_excluded_metrics: oops\n"
+        "timezone: Asia/Tokyo\nto: []\nsummarise: true\n"
+        'max_alerts: 20\nmax_notification_chars: 3500\nthread_title: "{month}月{day}日"\n'
+        "highlight_metrics: [air.room]\ntable_metrics: [air.room]\n"
+        "table_font: /nonexistent/font.ttc\ntable_font_size: 28\n"
+        "llm_excluded_metrics: oops\n"
         "llm_excluded_rules: []\n",
         encoding="utf-8",
     )
@@ -333,10 +336,11 @@ def test_cli_skips_the_summary_when_the_list_is_malformed(tmp_path, rules, monke
         "--date",
         DAY.isoformat(),
         "--no-send",
+        "--print",
     ]
     assert report_module.main(argv) == 0
     assert called == [], "一覧が不正なら所見の provider を作らない"
-    assert (tmp_path / "out" / f"{DAY.isoformat()}.md").exists(), "表だけのレポートは出る"
+    assert "## 測定値" in capsys.readouterr().out, "表だけのレポートは出る"
 
 
 # ---------------------------------------------------------------- AI ツール

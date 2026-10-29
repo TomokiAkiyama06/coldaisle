@@ -22,7 +22,7 @@ from typing import Any
 import httpx
 
 from coldaisle import logs
-from coldaisle.notify.models import Notification
+from coldaisle.notify.models import Notification, ReportThread
 from coldaisle.notify.notifiers import TIMEOUT_S, DeliveryError, Notifier
 
 LOGGER = logging.getLogger("coldaisle.notify")
@@ -193,6 +193,9 @@ class SlackApi:
 class SlackBotNotifier:
     """`chat.postMessage` で本文を送る宛先。名前は Webhook と同じ `slack`（`routing` を変えない）。
 
+    通知に `thread` があれば、題だけの親を先に送り、要点と表をそのスレッドへ返す
+    （日次レポート。決定記録 0171）。
+
     **Bot の送信が失敗し、Webhook が設定されていれば、その 1 通は Webhook で送り直す**
     （0147 §2.1）。トークンの失効で critical が届かなくなるのを避ける。送り直した通知には
     グラフを添えない（スレッドの `ts` が無い）。
@@ -241,6 +244,92 @@ class SlackBotNotifier:
         self._on_posted = on_posted
 
     def send(self, notification: Notification) -> None:
+        if notification.thread is not None:
+            self._send_threaded(notification, notification.thread)
+            return
+        self._send_one(notification)
+
+    def _send_threaded(self, notification: Notification, thread: ReportThread) -> None:
+        """題だけの親 → 要点 → 表の順に送る（日次レポート。決定記録 0171 §2.1 / §2.5）。
+
+        **本文を黙って失わない。**
+
+        - 親が送れない: スレッドをあきらめ、今と同じ 1 通（Markdown。Bot が落ちれば Webhook）で送る
+        - 要点がスレッドへ送れない: 要点をチャンネルへ 1 通で送る（題だけの親は残る）
+        - 表の画像が無い・上げられない: 表の Markdown をスレッドへ、それも送れなければチャンネルへ
+        - 要点がどこにも届かなければ `DeliveryError` を投げる（呼び出し側が送れなかったと数える）。
+          表が届かないことは送れたかどうかに数えない（ログに残すだけ）
+
+        返信が実は届いていて応答だけが失われた（timeout など）なら同じ文が 2 通になるが、
+        失うより重ねるほうを選ぶ。`on_posted`（アラートのグラフの依頼）は呼ばない。
+        """
+        try:
+            parent_ts = self.api.post_message(self.channel, thread.title)
+        except DeliveryError as error:
+            self._warn("スレッドの親を送れなかったので、本文を 1 通で送る", notification, error)
+            self._send_one(notification)
+            return
+        if not self._post_lead(notification, thread, parent_ts):
+            return
+        self._post_table(notification, thread, parent_ts)
+
+    def _post_lead(self, notification: Notification, thread: ReportThread, parent_ts: str) -> bool:
+        """要点を送る。スレッドの形で届けば `True`、Webhook の 1 通に戻したら `False`。"""
+        try:
+            self.api.post_message(self.channel, thread.lead, thread_ts=parent_ts)
+            return True
+        except DeliveryError as error:
+            self._warn(
+                "スレッドへ要点を返せなかったので、チャンネルへ 1 通で送る", notification, error
+            )
+        try:
+            self.api.post_message(self.channel, thread.lead)
+            return True
+        except DeliveryError as error:
+            if self._fallback is None:
+                raise
+            # Bot が使えなくなった。Webhook には要点と表を分けて送れないので、今と同じ 1 通にする
+            self._warn("Bot で要点を送れなかったので、Webhook で 1 通を送る", notification, error)
+            self._fallback.send(notification)
+            return False
+
+    def _post_table(self, notification: Notification, thread: ReportThread, parent_ts: str) -> None:
+        image = thread.table_image
+        if image is not None:
+            try:
+                self.api.upload_to_thread(
+                    channel=self.channel,
+                    thread_ts=parent_ts,
+                    filename=image.filename,
+                    content=image.content,
+                    title=image.title,
+                    comment=image.comment,
+                )
+                return
+            except DeliveryError as error:
+                self._warn("表の画像を上げられなかったので、表を文で返す", notification, error)
+        try:
+            self.api.post_message(self.channel, thread.table_text, thread_ts=parent_ts)
+            return
+        except DeliveryError as error:
+            self._warn("スレッドへ表を返せなかったので、チャンネルへ送る", notification, error)
+        try:
+            self.api.post_message(self.channel, thread.table_text)
+        except DeliveryError as error:
+            # 要点は届いている。表だけが届かなかったことを残す（送れなかったとは数えない）
+            LOGGER.error(
+                "日次レポートの表を送れなかった（要点は届いている）",
+                extra={logs.FIELDS_KEY: {"rule": notification.rule_id, "reason": str(error)}},
+            )
+
+    @staticmethod
+    def _warn(message: str, notification: Notification, error: DeliveryError) -> None:
+        LOGGER.warning(
+            message,
+            extra={logs.FIELDS_KEY: {"rule": notification.rule_id, "reason": str(error)}},
+        )
+
+    def _send_one(self, notification: Notification) -> None:
         try:
             ts = self.api.post_message(self.channel, notification.as_text())
         except DeliveryError as error:
