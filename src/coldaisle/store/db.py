@@ -612,7 +612,8 @@ class SqliteStore:
 
         **追記のみ。** 更新は DB のトリガが拒否する。削除は保持期間の適用
         （:meth:`delete_hint_shadow_before`）だけ。書くのは ``coldaisle-fand`` の tick の外の書き手
-        だけ（B1 で配線する）。``seq`` は保存時に AUTOINCREMENT で決まり、再利用しない。
+        だけ（``coldaisle.learned_channel.hint_shadow`` の書き手のスレッド。自分の接続で書く）。
+        ``seq`` は保存時に AUTOINCREMENT で決まり、再利用しない。
         """
         if record.seq is not None:
             raise ValueError("採番前の記録を渡す（seq は保存時に決まる）")
@@ -620,7 +621,9 @@ class SqliteStore:
             cursor = self._conn.execute(
                 "INSERT INTO hint_shadow_records (run_id, source_tick_id, source_ts_ms,"
                 " source_monotonic_ms, received_monotonic_ms, received_ts_ms, schema_version,"
-                " status, reason, record_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                " status, reason, record_json, worker_instance_id, shadow_dropped_backpressure,"
+                " shadow_record_too_large, shadow_unavailable)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     record.run_id,
                     record.source_tick_id,
@@ -632,6 +635,10 @@ class SqliteStore:
                     record.status.value,
                     None if record.reason is None else record.reason.value,
                     record.record_json,
+                    record.worker_instance_id,
+                    record.shadow_dropped_backpressure,
+                    record.shadow_record_too_large,
+                    record.shadow_unavailable,
                 ),
             )
         row_id = cursor.lastrowid
@@ -666,7 +673,8 @@ class SqliteStore:
         rows = self._conn.execute(
             "SELECT h.seq, h.run_id, h.source_tick_id, h.source_ts_ms, h.source_monotonic_ms,"
             " h.received_monotonic_ms, h.received_ts_ms, h.schema_version, h.status, h.reason,"
-            " h.record_json,"
+            " h.record_json, h.worker_instance_id, h.shadow_dropped_backpressure,"
+            " h.shadow_record_too_large, h.shadow_unavailable,"
             " EXISTS (SELECT 1 FROM control_traces AS c"
             "         WHERE c.ts_ms = h.source_ts_ms AND c.tick_id = h.source_tick_id"
             "           AND json_extract(c.trace_json, '$.run_id') = h.run_id) AS trace_matched"
@@ -688,6 +696,10 @@ class SqliteStore:
                     status=row["status"],
                     reason=row["reason"],
                     record_json=row["record_json"],
+                    worker_instance_id=row["worker_instance_id"],
+                    shadow_dropped_backpressure=row["shadow_dropped_backpressure"],
+                    shadow_record_too_large=row["shadow_record_too_large"],
+                    shadow_unavailable=row["shadow_unavailable"],
                 ),
                 trace_matched=bool(row["trace_matched"]),
             )

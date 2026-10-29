@@ -22,11 +22,18 @@ import json
 from enum import StrEnum
 from typing import Annotated, Literal, Protocol, Self, runtime_checkable
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    SerializerFunctionWrapHandler,
+    model_serializer,
+    model_validator,
+)
 
 from coldaisle.measurement import validate_metric
 
-SCHEMA_VERSION: Literal[16] = 16
+SCHEMA_VERSION: Literal[17] = 17
 """`ControlTick` の形の版。**フィールドの名前や意味を変えたら上げる。**
 
 #82 が保存したデータを読み違えないため。
@@ -88,6 +95,12 @@ SCHEMA_VERSION: Literal[16] = 16
   `hint_shadow_records`（0133 §2.5a）との突き合わせの検算に使う。
   同じ版上げで Workload Hint の塊（`workload_hint`。#319 / 0133 §2.9 の B0。実効の段階・
   ヒントの状態・`influence`・`skipped`）も**v16 に必須**にした。`stage: off` でも載せる
+- v17（#288 / 決定記録 0162 §2.5 の PR-C・0152 §2.7・0162 §2.3）: Workload Hint の塊を
+  ``WorkloadHintRecord`` v2 にした（``certificate``: fand が起動時に照合を通した
+  hint_certificate の production の識別と認証のハッシュ、``shadow_counters``: MPC worker が
+  送らずに捨てた Shadow の記録の累積の数と epoch）。**v17 の塊は v2 で、欄を必ず置く**
+  （値が無ければ null）。保存済みの v16 の塊は v1 のまま読める（欄を持たない。「記録が無い」
+  であって「証明書が無かった」ではない）
 """
 
 Demand = Annotated[float, Field(ge=0.0, le=1.0, allow_inf_nan=False)]
@@ -2244,9 +2257,12 @@ class WorkloadHintStage(StrEnum):
     OBSERVE = "observe"
     """B0: 読み、状態を進め、「効かせていたら選んだ context」を記録するだけ。Demand は変えない。"""
     SHADOW_MPC = "shadow_mpc"
-    """B1: B0 に加え、Shadow solver の二重解法を記録する。**未実装**（実効は B0 に留まる）。"""
+    """B1: B0 に加え、Shadow solver の二重解法を ``hint_shadow_records`` に記録する。
+
+    Demand は変えない。証明書の照合が通らなければ実効は B0 に留まる（0152 §2.4）。
+    """
     ACTIVE = "active"
-    """B2: 再検査を通ったヒント有りの plan を Gate へ渡す。**未実装**（実効は B0 に留まる）。"""
+    """B2: 再検査を通ったヒント有りの plan を Gate へ渡す。**未実装**（実効は B1 に留まる）。"""
 
 
 _WORKLOAD_HINT_STAGE_ORDER = (
@@ -2299,8 +2315,11 @@ class HintPriorSkipped(StrEnum):
     """ヒントを使わなかった・使えなかった理由（決定記録 0133 §2.8 / 0066 §2.1 (d) / §2.2）。
 
     閉じた語彙。B1 / B2 の値も先に置く（版を上げずに B1 の記録を足せるように）が、
-    **B0 の実装が出すのは** ``hint_state_unreadable`` / ``run_start_not_durable`` /
+    **B0 / B1 の実装が trace に出すのは** ``hint_state_unreadable`` / ``run_start_not_durable`` /
     ``certification_mismatch`` / ``supervisor_unavailable`` / ``rule_policy_not_active`` だけ。
+    Shadow の記録が届いた後に分かる理由（``budget_exhausted`` / ``shadow_busy`` /
+    ``out_of_certified_domain`` / ``monotonicity_violated`` / ``hint_record_rejected`` など）は、
+    元の tick の trace（不変）には書かず ``hint_shadow_records`` にだけ残す（決定記録 0162 §2.3）。
     """
 
     MPC_UNAVAILABLE = "mpc_unavailable"
@@ -2326,8 +2345,57 @@ class HintPriorSkipped(StrEnum):
 HINT_SOURCE_LABEL_OTHER = "other"
 """許可リストに無い（または書き手が付けなかった）``source`` の trace 上の値（0064 §2.9）。"""
 
-WORKLOAD_HINT_RECORD_SCHEMA_VERSION: Literal[1] = 1
-"""`WorkloadHintRecord` の形の版。"""
+WORKLOAD_HINT_RECORD_SCHEMA_VERSION: Literal[2] = 2
+"""`WorkloadHintRecord` の形の版。
+
+- v1（#319 / 決定記録 0133 §2.9。``ControlTick`` v16）: 実効の段階・ヒントの状態・``influence``・
+  ``skipped``
+- v2（#288 / 決定記録 0162 §2.5 の PR-C。``ControlTick`` v17）: ``certificate``（0152 §2.7）と
+  ``shadow_counters``（0162 §2.3）を足した。**v2 では欄を必ず置く**（値が無ければ null）。
+  v1 はどちらも持たない
+"""
+
+
+class HintCertificateRef(_Frozen):
+    """trace のヒントの塊の ``certificate``（決定記録 0152 §2.7）。
+
+    fand が**起動時に照合を通した** hint_certificate の production の識別（``model_id`` /
+    ``version`` / ``artifact_sha256`` と、その pointer を成立させた registry の変更の
+    ``registry_revision``）と、認証のハッシュ ``certificate_sha256``。毎 tick 同じ値。
+    照合の理由の細目は載せない（起動時のログに1回残す）。path を持たない（ルール 10）。
+    """
+
+    model_id: str = Field(pattern=r"^[a-z][a-z0-9_.-]*$", max_length=120)
+    version: str = Field(min_length=1, max_length=80)
+    artifact_sha256: Sha256Hex
+    registry_revision: int = Field(ge=1)
+    certificate_sha256: Sha256Hex
+
+
+class HintShadowCounters(_Frozen):
+    """MPC worker が送らずに捨てた Shadow の記録の**累積の数**と、その epoch（決定記録 0162 §2.3）。
+
+    ``worker_instance_id`` は worker のプロセスの起動ごとの乱数の識別子（``run_id`` と同じ形。
+    個体識別子を含まない。ルール 10）。数は ``(run_id, worker_instance_id)`` の epoch の中でだけ
+    増える向きに進む。worker は Shadow の記録のメッセージに毎回載せ、fand は最後に受け入れた値を
+    trace のヒントの塊に写す。
+    """
+
+    worker_instance_id: str = Field(pattern=r"^[0-9a-f]{32}$")
+    shadow_dropped_backpressure: int = Field(ge=0)
+    shadow_record_too_large: int = Field(ge=0)
+    shadow_unavailable: int = Field(ge=0)
+
+    def decreased_from(self, previous: HintShadowCounters) -> bool:
+        """同じ epoch の前の値から、どれかの数が減ったか（epoch が違えば比べない）。"""
+        if previous.worker_instance_id != self.worker_instance_id:
+            return False
+        return (
+            self.shadow_dropped_backpressure < previous.shadow_dropped_backpressure
+            or self.shadow_record_too_large < previous.shadow_record_too_large
+            or self.shadow_unavailable < previous.shadow_unavailable
+        )
+
 
 _HINT_STATE_LOST = frozenset(
     {HintPriorSkipped.HINT_STATE_UNREADABLE, HintPriorSkipped.RUN_START_NOT_DURABLE}
@@ -2346,10 +2414,16 @@ class WorkloadHintRecord(_Frozen):
     - ``age_ms``: ``status`` が ``active`` の tick だけ。同じ boot の ``CLOCK_BOOTTIME`` と行の
       ``boottime_ns`` の差（0066 §2.2）
     - ``influence``: ヒントで判断が変わったか（B0 は ``would_override`` まで）
-    - ``skipped``: ヒントを使えなかった理由（0133 §2.8）。使った tick と効かない tick は None
+    - ``skipped``: ヒントを使えなかった理由（0133 §2.8）。使った tick と効かない tick は None。
+      **その tick に fand が知っていることだけ**を載せる。記録が届いた後に分かる理由は
+      ``hint_shadow_records`` にだけ残す（0162 §2.3）
+    - ``certificate``（v2）: 起動時に照合を通した証明書の識別（0152 §2.7）。production が
+      無い・照合が通らなかった run では None
+    - ``shadow_counters``（v2）: fand が最後に受け入れた worker の累積の数（0162 §2.3）。受け取って
+      いなければ None
     """
 
-    schema_version: Literal[1] = WORKLOAD_HINT_RECORD_SCHEMA_VERSION
+    schema_version: Literal[1, 2] = WORKLOAD_HINT_RECORD_SCHEMA_VERSION
     stage: WorkloadHintStage
     event_id: int | None = Field(default=None, ge=1)
     workload: WorkloadHintKind | None = None
@@ -2360,15 +2434,35 @@ class WorkloadHintRecord(_Frozen):
     age_ms: int | None = Field(default=None, ge=0)
     influence: WorkloadHintInfluence = WorkloadHintInfluence.NONE
     skipped: HintPriorSkipped | None = None
+    certificate: HintCertificateRef | None = None
+    shadow_counters: HintShadowCounters | None = None
 
     @classmethod
     def off(cls) -> WorkloadHintRecord:
         """``stage: off`` の tick（ヒントを読まない）。"""
         return cls(stage=WorkloadHintStage.OFF)
 
+    @model_serializer(mode="wrap")
+    def _v1_has_no_v2_fields(self, handler: SerializerFunctionWrapHandler) -> dict[str, object]:
+        # v2 は欄を必ず置き（値が無ければ null。0152 §2.7）、v1 には欄そのものを出さない
+        # （保存済みの v16 の本文を読み直して書いても同じ bytes にする）
+        data: dict[str, object] = handler(self)
+        if self.schema_version == 1:
+            data.pop("certificate", None)
+            data.pop("shadow_counters", None)
+        return data
+
     @model_validator(mode="after")
     def _fields_match_the_stage_and_status(self) -> Self:
+        if self.schema_version == 1 and (
+            self.certificate is not None or self.shadow_counters is not None
+        ):
+            # 古い形に、その版に無かった欄を持たせない（0064 §2.9 と同じ規律）
+            raise ValueError("certificate / shadow_counters を記録する塊は schema version 2 にする")
         if self.stage is WorkloadHintStage.OFF:
+            if self.certificate is not None or self.shadow_counters is not None:
+                # 読まない段階は証明書を照合せず、Shadow の記録も受け取らない
+                raise ValueError("stage: off の記録は certificate / shadow_counters を持たない")
             if (
                 any(
                     value is not None
@@ -2426,7 +2520,9 @@ class WorkloadHintRecord(_Frozen):
 class ControlTick(_Frozen):
     """1 tick の判断の記録（decision trace。0028 §2.3）。#82 が保存し、#90 / #91 が読む。"""
 
-    schema_version: Literal[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16] = SCHEMA_VERSION
+    schema_version: Literal[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17] = (
+        SCHEMA_VERSION
+    )
     tick_id: int = Field(ge=0)
     ts_ms: int = Field(ge=0)
     """記録の時刻（壁時計。0028 §2.6）。"""
@@ -2824,16 +2920,25 @@ class ControlTick(_Frozen):
             raise ValueError("mode_command.run_id は最上位の run_id と等しくする")
 
     def _check_workload_hint(self) -> None:
-        """v16 の ``workload_hint`` が必須で、古い版に無いか（0064 §2.9 / 0133 §2.9）。"""
+        """v16 以降の ``workload_hint`` が必須で、古い版に無いか（0064 §2.9 / 0133 §2.9）。
+
+        塊の版は ``ControlTick`` の版で決まる: v16 は v1、v17 は v2（0162 §2.5 の PR-C）。
+        """
         if self.workload_hint is None:
             if self.schema_version >= 16:
                 # 版が中身を表さない記録を作らない（0060 §2.4）。stage: off でも載せる
-                raise ValueError("v16 の ControlTick には workload_hint が要る")
+                raise ValueError("v16 以降の ControlTick には workload_hint が要る")
             return
         if self.schema_version < 16:
             # 「昔の tick はヒントが無かった」と「昔の形にはヒントという概念が無かった」を
             # 取り違えない（0064 §2.9）
             raise ValueError("workload_hint を記録する ControlTick は schema version 16 にする")
+        expected = 1 if self.schema_version == 16 else 2
+        if self.workload_hint.schema_version != expected:
+            raise ValueError(
+                f"schema version {self.schema_version} の ControlTick の workload_hint は "
+                f"v{expected} にする"
+            )
 
     def _check_tach_unconfirmed(self, record: AirBalanceCoordinationRecord) -> None:
         zones = self.tach_unconfirmed_zones

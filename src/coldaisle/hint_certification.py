@@ -57,7 +57,7 @@ from coldaisle.control.model_registry import (
     ModelCompatibility,
     RegistrySnapshot,
 )
-from coldaisle.control.schema import AuthorityStage
+from coldaisle.control.schema import AuthorityStage, HintCertificateRef
 from coldaisle.hint_certificate import (
     COMPONENT_NAMES,
     CertifiedThermalModel,
@@ -137,6 +137,9 @@ class HintCertificateSource:
     thermal_model: CertifiedThermalModel | None
     certificate_ref: ArtifactRef | None
     max_artifact_bytes: int
+    certificate_revision: int | None = None
+    """hint_certificate の production の pointer を成立させた registry の変更の revision（trace の
+    ``certificate`` に載せる。0152 §2.7）。production が無ければ None。"""
 
 
 def production_thermal_model(snapshot: RegistrySnapshot) -> CertifiedThermalModel | None:
@@ -161,6 +164,22 @@ def production_certificate_ref(snapshot: RegistrySnapshot) -> ArtifactRef | None
     return None if slot is None else slot.active
 
 
+def production_certificate_revision(snapshot: RegistrySnapshot) -> int | None:
+    """hint_certificate の production の pointer を成立させた最後の変更の revision。
+
+    ``trace_provenance()`` と同じく、pointer の変更を順に追って最後のものを取る（0152 §2.7）。
+    production が無い・成立させた変更が見つからなければ None。
+    """
+    active = production_certificate_ref(snapshot)
+    if active is None:
+        return None
+    revision: int | None = None
+    for event in snapshot.pointer_changes:
+        if event.artifact.kind is ArtifactKind.HINT_CERTIFICATE:
+            revision = event.revision if event.artifact == active else None
+    return revision
+
+
 def certificate_source(
     snapshot: RegistrySnapshot, load: ArtifactLoadResult, *, max_artifact_bytes: int
 ) -> HintCertificateSource:
@@ -170,6 +189,33 @@ def certificate_source(
         thermal_model=production_thermal_model(snapshot),
         certificate_ref=production_certificate_ref(snapshot),
         max_artifact_bytes=max_artifact_bytes,
+        certificate_revision=production_certificate_revision(snapshot),
+    )
+
+
+def certificate_trace_ref(
+    source: HintCertificateSource | None, result: HintCertificationResult | None
+) -> HintCertificateRef | None:
+    """trace のヒントの塊の ``certificate``（0152 §2.7）。照合が通った run だけ値を持つ。
+
+    production が無い・照合が通らなかった・pointer を成立させた変更が言えないときは None。
+    """
+    if (
+        source is None
+        or result is None
+        or not result.certified
+        or result.certificate_sha256 is None
+        or source.certificate_ref is None
+        or source.certificate_revision is None
+        or source.load.artifact is None
+    ):
+        return None
+    return HintCertificateRef(
+        model_id=source.certificate_ref.model_id,
+        version=source.certificate_ref.version,
+        artifact_sha256=source.load.artifact.metadata.sha256,
+        registry_revision=source.certificate_revision,
+        certificate_sha256=result.certificate_sha256,
     )
 
 

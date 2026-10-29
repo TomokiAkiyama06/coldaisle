@@ -58,6 +58,7 @@ from coldaisle.hint_certification import (
     CERTIFICATE_COMPATIBILITY,
     HintCertification,
     HintCertificationResult,
+    certificate_trace_ref,
     verify_hint_certificate,
 )
 from coldaisle.hint_certify import EXIT_CERTIFIED, certify
@@ -262,6 +263,35 @@ def test_certificate_and_thermal_model_come_from_one_snapshot(world: World) -> N
     pinned = startup.binding.expected_artifacts.thermal_model
     assert pinned is not None
     assert pinned.artifact_sha256 == world.certificate.thermal_model.artifact_sha256
+
+
+def test_the_trace_names_the_certificate_only_for_a_certified_run(world: World) -> None:
+    """trace の ``certificate``（0152 §2.7）は照合が通った run だけ値を持つ。"""
+    startup = read_startup_registry(
+        world.root, limits_dir=REGISTRY_LIMITS_DIR, hint_latch=HintCertificationLatch()
+    )
+    source = startup.hint_certificate
+    assert source is not None and source.certificate_ref is not None
+    snapshot = ModelRegistry(world.root, limits=_limits()).inspect()
+    (change,) = [
+        event
+        for event in snapshot.pointer_changes
+        if event.artifact.kind is ArtifactKind.HINT_CERTIFICATE
+    ]
+    ref = certificate_trace_ref(source, run_verify(world))
+    assert ref is not None
+    assert (ref.model_id, ref.version) == (
+        source.certificate_ref.model_id,
+        source.certificate_ref.version,
+    )
+    assert ref.artifact_sha256 == hashlib.sha256(world.payload).hexdigest()
+    assert ref.registry_revision == change.revision
+    assert ref.certificate_sha256 == world.certificate.certificate_sha256
+    # 照合が通らなかった run・production が無い run では null
+    failed = run_verify(world, lockfile=None)
+    assert not failed.certified
+    assert certificate_trace_ref(source, failed) is None
+    assert certificate_trace_ref(None, run_verify(world)) is None
 
 
 def test_without_a_latch_the_registry_read_does_not_load_the_certificate(world: World) -> None:
@@ -671,10 +701,11 @@ def _hint_config(stage: str) -> Any:
 
 
 @pytest.mark.parametrize("configured", ["shadow_mpc", "active"])
-def test_the_implementation_ceiling_keeps_b0_even_when_certified(configured: str) -> None:
-    """B1 の Shadow solver はまだ無い（段 4）ので、照合が通っても B0。"""
+def test_the_implementation_ceiling_is_b1_and_needs_the_certificate(configured: str) -> None:
+    """実装の上限は B1（0162 §2.5 の PR-C）。照合が通らなければ B0、B2 は未実装で B1 に留まる。"""
+    assert workload_hint_module.IMPLEMENTED_STAGE is WorkloadHintStage.SHADOW_MPC
     stage = WorkloadHintStage(configured)
-    assert effective_stage(stage, certified=True) is WorkloadHintStage.OBSERVE
+    assert effective_stage(stage, certified=True) is WorkloadHintStage.SHADOW_MPC
     assert effective_stage(stage, certified=False) is WorkloadHintStage.OBSERVE
     assert effective_stage(stage) is WorkloadHintStage.OBSERVE
 

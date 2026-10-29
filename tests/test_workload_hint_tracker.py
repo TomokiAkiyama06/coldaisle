@@ -455,6 +455,8 @@ def test_trace_record_does_not_carry_free_text_fields():
         "age_ms",
         "influence",
         "skipped",
+        "certificate",
+        "shadow_counters",
     }
 
 
@@ -473,9 +475,9 @@ def _fixture(version: int) -> dict[str, object]:
 
 def test_v16_requires_the_workload_hint_block():
     raw = _fixture(16)
-    assert (
-        ControlTick.model_validate_json(json.dumps(raw)).workload_hint == WorkloadHintRecord.off()
-    )
+    assert ControlTick.model_validate_json(
+        json.dumps(raw)
+    ).workload_hint == WorkloadHintRecord.off().model_copy(update={"schema_version": 1})
     raw.pop("workload_hint")
     with pytest.raises(ValidationError, match="workload_hint が要る"):
         ControlTick.model_validate_json(json.dumps(raw))

@@ -15,6 +15,11 @@
   （`worker_idle`）。EOF は `worker_disconnected`。どちらも**その時点で**受け渡し口を空にする
 - loop が置いた frame を、接続している役割へ非ブロッキングで送る。送れなければ捨てる（再送も待ちも
   しない）
+- Workload Hint B1 の Shadow の記録（`hint_shadow`。0162 §2.5 の PR-C）は、`attach_hint_shadow()` で
+  受け口を渡されたときだけ受け取り、検証して `hint_shadow_records` の書き手へ渡す。**受け渡し口にも
+  Gate にも入れず、生存の知らせにも数えない**（0162 §2.1 / §2.3）。受け口が無ければ
+  `unsupported_body` として捨てる。MPC worker へ送れた frame は受け口の環状の列にも入れる
+  （0162 §2.2）
 - `registry_watch` を渡されたら、`registry_check_interval_ms`（`safety.tick_ms`）ごとに registry の
   production を起動時の固定と比べ、移動・消失・読めない役割を**再起動まで閉じる**
   （`registry_superseded`。0077 §2.6）。閉じた役割に届いたメッセージは検証の前に捨てる。
@@ -38,7 +43,7 @@ from collections import Counter
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Protocol
+from typing import TYPE_CHECKING, Protocol
 
 from pydantic import ValidationError
 
@@ -72,6 +77,11 @@ from coldaisle.local_socket import (
     umask,
     unlink_if_same,
 )
+
+if TYPE_CHECKING:
+    # 型だけを使う。worker も `coldaisle.learned_channel` を読むので、受け口の実装（判定と行の
+    # 組み立て）を受付の import に載せない
+    from coldaisle.learned_channel.hint_shadow import HintShadowIntake
 
 LOGGER = logging.getLogger("coldaisle.learned_channel")
 
@@ -174,6 +184,9 @@ class LearnedChannelServer:
         self._stop = False
         self._registry_watch = registry_watch
         self._registry_interval_ms = registry_check_interval_ms or 0
+        # Workload Hint B1 の受け口（0162 §2.5 の PR-C）。loop を始める前に1回だけ渡される。
+        # 参照の差し替えは原子的で、受付スレッドは読むだけ
+        self._hint_shadow: HintShadowIntake | None = None
         # 起動直後に1回確かめる（起動時の読み込みから受付の開始までの間の移動も拾う）
         self._next_registry_check_ms: int | None = (
             None if registry_watch is None else self._monotonic.monotonic_ms()
@@ -188,6 +201,15 @@ class LearnedChannelServer:
     def dropped(self) -> dict[str, int]:
         """捨てたメッセージ・frame の件数（理由の code ごと）。"""
         return dict(self._dropped)
+
+    def attach_hint_shadow(self, intake: HintShadowIntake) -> None:
+        """Shadow の記録の受け口を渡す（決定記録 0162 §2.5 の PR-C）。**loop を始める前に**呼ぶ。
+
+        渡すのは、起動時の証明書の照合が通り、``hint_domain`` の設定がある起動だけ。
+        """
+        if self._hint_shadow is not None:
+            raise RuntimeError("Shadow の記録の受け口は1回だけ渡す")
+        self._hint_shadow = intake
 
     def socket_path(self, role: LearnedRole) -> Path:
         """役割のソケットの場所。"""
@@ -493,10 +515,8 @@ class LearnedChannelServer:
             return
         body = envelope.body
         if isinstance(body, HintShadowBody):
-            # Shadow の記録の受信・検証・記録は PR-C で足す（決定記録 0162 §2.5）。それまでは捨て、
-            # **生存の知らせに数えない**（生存は基準の結果と heartbeat だけで決める。0162 §2.3）。
-            # 接続は切らない（基準の経路を Shadow の記録の有無で変えない。0133 §2.5）
-            self._drop(conn.role, "unsupported_body")
+            # **生存の知らせに数えない**（0162 §2.3）。`last_valid_mono_ms` を数え直さずに戻る
+            self._on_hint_shadow(conn, body, size=len(data))
             return
         if isinstance(body, MpcResultBody):
             if conn.role is not LearnedRole.MPC:
@@ -511,6 +531,36 @@ class LearnedChannelServer:
             self._mailbox.place_supervisor(body.result)
         # heartbeat は idle を数え直すだけで、受け渡し口の値も受信時刻も変えない
         conn.last_valid_mono_ms = self._monotonic.monotonic_ms()
+
+    def _on_hint_shadow(self, conn: _Connection, body: HintShadowBody, *, size: int) -> None:
+        """Shadow の記録 1件（0133 §2.5 / 0162 §2.2 / §2.3）。どの失敗でも受付スレッドを止めない。
+
+        封筒の検証（長さ・JSON・型・`run_id`・`role`）に落ちたものは、ここへ来る前に行を作らずに
+        捨てている（0162 §2.3）。ここでは本文の上限・役割・受け口の有無を見てから受け口へ渡す。
+        """
+        intake = self._hint_shadow
+        if conn.role is not LearnedRole.MPC or intake is None:
+            # Shadow の記録を送るのは MPC worker だけ。受け口の無い起動（B1 でない）は受け取らない
+            self._drop(conn.role, "unsupported_body")
+            return
+        limit = self._settings.limits.max_shadow_record_bytes
+        if limit is not None and size > limit.value:
+            # 受信側も同じ上限で検査する（0133 §2.5）。切り詰めずに捨てる
+            self._drop(conn.role, "shadow_record_too_large")
+            return
+        try:
+            intake.receive(
+                body,
+                base=self._mailbox.current_mpc(),
+                received_mono_ms=self._monotonic.monotonic_ms(),
+            )
+        except Exception:
+            # 失敗の影響は片方向（0133 §2.5）。基準の扱いも経路も変えない
+            LOGGER.exception(
+                "Shadow の記録を扱えなかった（その記録を捨てる）",
+                extra={logs.FIELDS_KEY: {"reason": "hint_shadow_failed", "run_id": self._run_id}},
+            )
+            self._drop(conn.role, "hint_shadow_failed")
 
     def _expire_idle(self) -> None:
         timeout_ms = self._settings.worker_idle_timeout_ms.value
@@ -560,11 +610,25 @@ class LearnedChannelServer:
         except (BlockingIOError, InterruptedError):
             # 送信バッファが一杯。捨てる（再送も待ちもしない。0077 §2.2）
             self._drop(conn.role, "frame_send_busy")
+            return
         except OSError as exc:
             if exc.errno == errno.EMSGSIZE:
                 self._drop(conn.role, "frame_too_long")
                 return
             self._disconnect(conn, LearnedChannelState.WORKER_DISCONNECTED, "send_failed")
+            return
+        intake = self._hint_shadow
+        if intake is not None and conn.role is LearnedRole.MPC:
+            # **実際に送り出した** frame だけを環状の列に入れる（0162 §2.2）。送れなかった tick は
+            # 列の欠けになり、その区間の判定は外になる
+            try:
+                intake.on_frame_sent(frame, sent_mono_ms=self._monotonic.monotonic_ms())
+            except Exception:
+                LOGGER.exception(
+                    "送り出した frame を領域の判定の列に入れられなかった",
+                    extra={logs.FIELDS_KEY: {"reason": "hint_domain_failed"}},
+                )
+                self._drop(conn.role, "hint_domain_failed")
 
     # ---------------------------------------------------------------- 記録
 

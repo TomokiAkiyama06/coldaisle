@@ -86,6 +86,7 @@ def test_open_applies_migrations(store):
         14,
         15,
         16,
+        17,
     ]
 
 
@@ -112,6 +113,7 @@ def test_reopen_does_not_reapply(db_path, rules):
             (14, 111),
             (15, 111),
             (16, 111),
+            (17, 111),
         ]
         # 適用済みの DB を開き直してもデータは残る
         assert second.latest(at_ms=1_000)["air.room"].value == 26.0
@@ -531,7 +533,7 @@ def test_concurrent_open_does_not_break(tmp_path, rules):
         futures = [pool.submit(open_store) for _ in range(2)]
         counts = [future.result(timeout=30) for future in futures]
 
-    assert counts == [16, 16], "どちらの接続から見ても全マイグレーションが1回ずつ適用される"
+    assert counts == [17, 17], "どちらの接続から見ても全マイグレーションが1回ずつ適用される"
 
 
 def test_version_is_rechecked_after_taking_the_lock(tmp_path, rules, monkeypatch):

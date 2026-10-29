@@ -13,8 +13,9 @@
 
 - MPC worker → `coldaisle-fand`: `hint_shadow`（Workload Hint の B1 の Shadow solver の記録。
   決定記録 0133 §2.5 / §2.5a・0152 §2.6・0162 §2.3 / §2.5 の PR-B）。基準の `mpc_result` の**後に**
-  別のメッセージとして送る。fand の受信・検証・記録は PR-C で足す（それまで fand は
-  `unsupported_body` として捨て、生存の知らせに数えない）
+  別のメッセージとして送る。fand は B1 の受け口を開いた起動でだけ検証して
+  `hint_shadow_records` に書き（PR-C。`learned_channel/hint_shadow.py`）、それ以外の起動では
+  `unsupported_body` として捨てる。どちらでも生存の知らせに数えない
 
 worker からの本文は `MpcProposal` / `DeliveredSupervisorOutput` と、Shadow の記録
 （`requested_demand` の段の値と予測の写しだけ）の型しか運べず、Demand の上書き・モード・
@@ -90,8 +91,7 @@ class HintShadowStatus(StrEnum):
 class HintShadowSkipReason(StrEnum):
     """``skipped`` の理由（閉じた語彙。0133 §2.5a / §2.8・0152 §2.6・0162 §2.3）。
 
-    fand はこの値を ``hint_shadow_records.reason`` へ写す（PR-C で ``certification_mismatch`` を
-    ``HintShadowReason`` に足す）。
+    fand はこの値を ``hint_shadow_records.reason`` へ写す（どの値も ``HintShadowReason`` にある）。
     """
 
     BUDGET_EXHAUSTED = "budget_exhausted"

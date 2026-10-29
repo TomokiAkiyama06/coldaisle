@@ -2,7 +2,7 @@
 
 `airflow-trace.js` の変換を node で実際に動かして確かめる（決定記録 0044。CI では node が必須）。
 
-1. **版の解釈は1か所**（`airflow-trace.js`）。v1〜v16 の fixture を読める
+1. **版の解釈は1か所**（`airflow-trace.js`）。v1〜v17 の fixture を読める
    （schema.py に無い版は「未対応の版」）
 2. **3つの状態を混ぜない**: その版に欄が無い／欄はあるが値が無い／画面が知らない版
 3. Safety override・Fallback・OOD を通常状態と区別して出す
@@ -38,7 +38,7 @@ AIRFLOW_UI_PATH = CONFIG_DIR / "airflow-ui.yaml"
 NOW_MS = 1_787_616_020_000
 
 NOT_IN_VERSION = "この版の記録には無い"
-FIXTURE_VERSIONS = range(1, 17)
+FIXTURE_VERSIONS = range(1, 18)
 
 
 def _node() -> str:
@@ -113,7 +113,7 @@ def _steps(result: Any, zone: str) -> dict[str, dict[str, Any]]:
 
 @pytest.mark.parametrize("version", FIXTURE_VERSIONS)
 def test_every_stored_version_is_read(version):
-    """保存済みの v1〜v16 の fixture を、同じ `page.control` の形にできる。"""
+    """保存済みの v1〜v17 の fixture を、同じ `page.control` の形にできる。"""
     result = _convert(_body(version))
     assert result["status"] == "ok"
     assert result["schema_version"] == version
@@ -182,11 +182,11 @@ def test_workload_regime_absent_in_v1_only():
     assert _chip(_convert(_body(2)), "負荷の傾向")["v"] != NOT_IN_VERSION
 
 
-@pytest.mark.parametrize("version", [17, 999])
+@pytest.mark.parametrize("version", [18, 999])
 def test_an_unknown_version_is_not_shown(version):
     """画面が知らない版は「未対応の版」。**制御由来の項目を出さない。**
 
-    v17 は schema.py にまだ無い。中身は先にマージされた PR で決まるので、推測で読まない。
+    v18 は schema.py にまだ無い。中身は先にマージされた PR で決まるので、推測で読まない。
     """
     body = _body(10)
     body["schema_version"] = version
@@ -874,3 +874,18 @@ def test_v16_reads_like_v15_and_does_not_show_the_run_id():
     assert v16["control"]["chips"] == v15["control"]["chips"]
     run_id = _body(16)["run_id"]
     assert run_id not in json.dumps(v16, ensure_ascii=False)
+
+
+# ------------------------------------------------ v17: ヒントの塊 v2（0162 §2.5 の PR-C）
+
+
+def test_v17_reads_like_v16_and_does_not_show_the_hint_block():
+    """v17 は版を読めるようにするだけ。証明書・Shadow の数は画面に出さない（0133 §2.5a）。"""
+    v16 = _convert(_body(16))
+    v17 = _convert(_body(17))
+    assert v17["status"] == "ok"
+    assert v17["control"]["chips"] == v16["control"]["chips"]
+    hint = _body(17)["workload_hint"]
+    shown = json.dumps(v17, ensure_ascii=False)
+    assert hint["certificate"]["certificate_sha256"] not in shown
+    assert hint["shadow_counters"]["worker_instance_id"] not in shown

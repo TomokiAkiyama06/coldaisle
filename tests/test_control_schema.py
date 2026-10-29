@@ -844,7 +844,7 @@ def test_the_stored_v1_record_still_loads_unchanged():
     stored = FIXTURE.read_text(encoding="utf-8")
     tick = ControlTick.model_validate_json(stored)
     assert tick.schema_version == 1
-    assert SCHEMA_VERSION == 16
+    assert SCHEMA_VERSION == 17
     assert json.loads(tick.model_dump_json()) == json.loads(stored)
 
 
@@ -1243,7 +1243,7 @@ def test_a_v10_tick_round_trips_the_registry_pointer_it_used():
     recorded = registry_tick(bound_registry())
 
     payload = json.loads(recorded.model_dump_json())
-    assert payload["schema_version"] == SCHEMA_VERSION == 16
+    assert payload["schema_version"] == SCHEMA_VERSION == 17
     assert payload["registry"]["revision"] == 3
     thermal = payload["registry"]["production"]["thermal_model"]
     assert thermal["artifact_sha256"] == REGISTRY_SHA
@@ -1922,7 +1922,7 @@ def test_a_v15_tick_round_trips_the_telemetry_health():
     recorded = registry_tick(REGISTRY_PROVENANCE, telemetry_health=record)
 
     payload = json.loads(recorded.model_dump_json())
-    assert payload["schema_version"] == SCHEMA_VERSION == 16
+    assert payload["schema_version"] == SCHEMA_VERSION == 17
     assert payload["telemetry_health"] == {
         "schema_version": 1,
         "health": "degraded",
@@ -2037,7 +2037,7 @@ def test_a_v16_tick_round_trips_the_run_id():
     recorded = registry_tick(REGISTRY_PROVENANCE)
 
     payload = json.loads(recorded.model_dump_json())
-    assert payload["schema_version"] == SCHEMA_VERSION == 16
+    assert payload["schema_version"] == SCHEMA_VERSION == 17
     assert payload["run_id"] == TRACE_RUN_ID
     assert ControlTick.model_validate_json(recorded.model_dump_json()) == recorded
 

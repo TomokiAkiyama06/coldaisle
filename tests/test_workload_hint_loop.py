@@ -176,7 +176,7 @@ def test_hint_does_not_change_one_bit_of_the_control_path(catalog, variant):
 def test_default_config_records_stage_off_every_tick(catalog):
     h = Harness(catalog)
     for result in h.run(3):
-        assert result.tick.schema_version == 16
+        assert result.tick.schema_version == 17
         assert result.tick.workload_hint == WorkloadHintRecord.off()
 
 
