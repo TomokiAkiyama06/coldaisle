@@ -1,7 +1,7 @@
 # 決定記録 0179: 記録をやめた metric（`nvml.excluded_metrics`）を、API の鮮度の判定から外す
 
 - **種別**: Decision Record
-- **Status**: Proposed
+- **Status**: FINAL（2026-11-02、リポジトリ所有者の承認）
 - **Date**: 2026-11-02
 - **Supersedes**: なし（0176 の収集と表示の決定は変えない。0176 が見ていなかった API の鮮度の判定を足す）
 - **関連**: [`0009`](0009-read-api.md) / [`0167`](0167-opt-update-recheck-scope.md) / [`0173`](0173-ingest-rss-trend-check.md) /
@@ -71,4 +71,4 @@ API の `_is_stale`（`api/app.py`）は `EVENT_METRICS` 以外をすべて周�
 ## 5. 承認
 
 - 2026-11-02: 所有者が 0178 の I1 のこの項目を例外として更新を進め、修正を別 Issue で進めて RSS の後に入れると判断した
-- 本記録の §2 の承認は未了（Proposed）
+- 2026-11-02: 所有者が本記録を了解した（§2 の承認。Codex のレビューは指摘なし）
