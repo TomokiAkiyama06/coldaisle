@@ -344,6 +344,69 @@ def test_alerts_can_be_filtered(db, rules, clock):
 # ---------------------------------------------------------------- レビュー指摘の退行防止
 
 
+def _health_and_latest(db, clock, excluded):
+    app = create_app(
+        Config(db=db, quality_rules=QUALITY_RULES_PATH, metrics=METRICS_PATH),
+        clock=clock,
+        freshness_excluded_metrics=excluded,
+    )
+    with TestClient(app) as client:
+        return client.get("/api/v1/health").json(), client.get("/api/v1/latest").json()
+
+
+def _insert_old_gpu_and_fresh_air(db, rules, clock, *, old_metric):
+    with SqliteStore(db, rules=rules, clock=clock) as store:
+        store.insert_sample(
+            Sample(
+                ts_ms=NOW_MS - 30 * MINUTE_MS,
+                readings=(Reading(metric=old_metric, value=None, quality=Quality.MISSING),),
+            )
+        )
+        store.insert_sample(
+            Sample(
+                ts_ms=NOW_MS,
+                readings=(Reading(metric="air.room", value=22.0, quality=Quality.OK),),
+            )
+        )
+
+
+def test_old_rows_of_an_excluded_metric_do_not_make_health_stale(db, rules, clock):
+    """**記録をやめた metric の古い行で health は赤にならない（決定記録 0179 §2.1）。**
+
+    行は保持期間で消えるまで残るので、`/latest` には古いものとして載ったままにする（§2.2）。
+    """
+    _insert_old_gpu_and_fresh_air(db, rules, clock, old_metric="gpu.0.hotspot")
+
+    health, latest = _health_and_latest(db, clock, ("gpu.0.hotspot", "gpu.0.mem"))
+
+    assert health["stale"] is False
+    assert health["ok"] is True
+    assert latest["stale"] is False
+    assert latest["metrics"]["gpu.0.hotspot"]["quality"] == "stale", "値としては古い"
+
+
+def test_a_stopped_metric_is_stale_even_with_excluded_metrics(db, rules, clock):
+    """除外していない周期メトリクスが止まれば、今までどおり赤になる（決定記録 0179 §2.3）。"""
+    _insert_old_gpu_and_fresh_air(db, rules, clock, old_metric="gpu.0.core")
+
+    health, latest = _health_and_latest(db, clock, ("gpu.0.hotspot", "gpu.0.mem"))
+
+    assert health["stale"] is True
+    assert health["ok"] is False
+    assert latest["stale"] is True
+
+
+def test_without_exclusions_an_old_row_is_stale(db, rules, clock):
+    """除外の一覧が空なら今までと同じ結果になる（決定記録 0179 §2.3）。"""
+    _insert_old_gpu_and_fresh_air(db, rules, clock, old_metric="gpu.0.hotspot")
+
+    health, latest = _health_and_latest(db, clock, ())
+
+    assert health["stale"] is True
+    assert health["ok"] is False
+    assert latest["stale"] is True
+
+
 def test_event_metrics_do_not_make_health_stale(db, rules, clock):
     """**一度取りこぼしが起きても health は赤にならない。**
 

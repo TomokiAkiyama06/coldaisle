@@ -306,6 +306,7 @@ def create_app(
     health_hwmon_metrics: tuple[str, ...] | None = None,
     health_nvml_metrics: tuple[str, ...] | None = None,
     health_cpu_power_metrics: tuple[str, ...] | None = None,
+    freshness_excluded_metrics: tuple[str, ...] | None = None,
     llm_exclusions: LlmExclusions | None = None,
 ) -> FastAPI:
     """API を作る。
@@ -326,6 +327,7 @@ def create_app(
         health_hwmon_metrics is None
         or health_nvml_metrics is None
         or health_cpu_power_metrics is None
+        or freshness_excluded_metrics is None
     ):
         internal_telemetry = InternalTelemetryConfig.from_yaml(
             settings.internal_telemetry, catalog=catalog
@@ -344,6 +346,10 @@ def create_app(
             health_cpu_power_metrics = CpuPowerAdapter(
                 internal_telemetry.cpu_power, clock=WallClock()
             ).expected_metrics
+        if freshness_excluded_metrics is None:
+            # 記録をやめた metric の古い行で health を赤にしない（決定記録 0179 §2.1）
+            freshness_excluded_metrics = internal_telemetry.nvml.excluded_metrics
+    not_periodic = EVENT_METRICS | frozenset(freshness_excluded_metrics)
     provider = StoreProvider(settings, clock or WallClock())
 
     @asynccontextmanager
@@ -381,7 +387,7 @@ def create_app(
                 for metric, reading in sorted(readings.items())
             },
             derived=compute_derived(readings, catalog),
-            stale=_is_stale(readings),
+            stale=_is_stale(readings, not_periodic),
         )
 
     def server_health_payload() -> ServerHealthResponse:
@@ -697,9 +703,9 @@ def create_app(
         store = provider.get()
         readings = store.latest()
         now_ms = store.clock.now_ms()
-        periodic = _periodic(readings)
+        periodic = _periodic(readings, not_periodic)
         newest = max((reading.ts_ms for reading in periodic.values()), default=None)
-        stale = _is_stale(readings)
+        stale = _is_stale(readings, not_periodic)
         return HealthResponse(
             ok=bool(periodic) and not stale,
             source=store.current_state("sys.ingest_source"),
@@ -943,17 +949,22 @@ def _control_trace_out(trace: SequencedControlTrace) -> ControlTraceOut:
     )
 
 
-def _periodic(readings: Mapping[str, LatestReading]) -> dict[str, LatestReading]:
+def _periodic(
+    readings: Mapping[str, LatestReading], not_periodic: frozenset[str]
+) -> dict[str, LatestReading]:
     """周期的に届く前提のメトリクスだけを残す。
 
     事象メトリクス（`sys.dropped_samples` など）は起きたときにしか書かれない。
     含めると、**一度取りこぼしが起きた10秒後から health が永久に赤になる。**
+    `nvml.excluded_metrics` も同じで、記録をやめた後は最後の行が保持期間で消えるまで
+    古いまま残る（決定記録 0179 §2.1）。
     """
-    return {metric: reading for metric, reading in readings.items() if metric not in EVENT_METRICS}
+    return {metric: reading for metric, reading in readings.items() if metric not in not_periodic}
 
 
-def _is_stale(readings: Mapping[str, LatestReading]) -> bool:
-    return any(reading.quality is Quality.STALE for reading in _periodic(readings).values())
+def _is_stale(readings: Mapping[str, LatestReading], not_periodic: frozenset[str]) -> bool:
+    periodic = _periodic(readings, not_periodic)
+    return any(reading.quality is Quality.STALE for reading in periodic.values())
 
 
 def stream_state(payload: LatestResponse) -> tuple[int, bool, tuple[str, ...]]:
