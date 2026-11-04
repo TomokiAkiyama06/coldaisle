@@ -148,6 +148,26 @@ def test_prune_advances_the_boundary_and_never_moves_it_back(store: SqliteStore)
     assert state.pruned_through_seq == 2 and state.pruned_before_ms == NOW_MS, "前へ戻さない"
 
 
+def test_prune_reads_only_the_expired_range_of_the_ts_index(store: SqliteStore) -> None:
+    """削除の境界は `(ts_ms, seq)` の索引の `ts_ms < cutoff` だけを読む（#408）。
+
+    seq の UNIQUE 索引で `MAX(seq)` を解くと、境界より新しい全行の本体を読み、30 日ぶんで
+    書き込みロックを数秒持つ。時間で見ると環境に左右されるので、実行計画で確かめる。
+    """
+    statements: list[str] = []
+    store.connection.set_trace_callback(statements.append)
+    try:
+        store.delete_control_traces_before(NOW_MS)
+    finally:
+        store.connection.set_trace_callback(None)
+    update = next(sql for sql in statements if sql.lstrip().startswith("UPDATE control_trace"))
+    # trace callback は名前付きの引数を展開済みの文で渡す
+    plan = [row[-1] for row in store.connection.execute(f"EXPLAIN QUERY PLAN {update}")]
+    scans = [detail for detail in plan if "control_traces" in detail]
+    assert scans, plan
+    assert all("COVERING INDEX ix_control_traces_ts_seq (ts_ms<?)" in d for d in scans), plan
+
+
 @pytest.mark.parametrize(
     "assignment",
     [
