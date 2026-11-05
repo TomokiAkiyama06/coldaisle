@@ -513,10 +513,15 @@ class SqliteStore:
         if cutoff_ms < 0:
             raise ValueError("control trace の削除基準時刻が不正")
         with self.transaction():
+            # `MAX(+seq)` の `+` は消さない（#408）。`MAX(seq)` だと SQLite は seq の UNIQUE 索引で
+            # min/max を解き、新しい順に本体（trace_json を含む）を読んで `ts_ms` を確かめるので、
+            # 境界より新しい全行を舐める。30 日ぶん（約 100 万行）で 6 s かかり、その間の書き込み
+            # ロックで取り込みの `BEGIN IMMEDIATE` が busy_timeout を過ぎていた。`+` で seq の索引を
+            # 外すと、覆う索引 `(ts_ms, seq)` の `ts_ms < cutoff` の範囲だけを読む
             self._conn.execute(
                 "UPDATE control_trace_prune SET "
                 "pruned_through_seq = MAX(pruned_through_seq, COALESCE("
-                "    (SELECT MAX(seq) FROM control_traces WHERE ts_ms < :cutoff), 0)), "
+                "    (SELECT MAX(+seq) FROM control_traces WHERE ts_ms < :cutoff), 0)), "
                 "pruned_before_ms = MAX(COALESCE(pruned_before_ms, :cutoff), :cutoff)",
                 {"cutoff": cutoff_ms},
             )
