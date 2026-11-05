@@ -14,10 +14,12 @@ DB は MockSource / ReplaySource を取り込みデーモンに通して作る�
 import dataclasses
 import json
 import os
+import re
 import shutil
 import sqlite3
 import subprocess
 import sys
+import time
 from collections.abc import Callable
 from contextlib import closing
 from pathlib import Path
@@ -960,7 +962,7 @@ def test_sampler_is_valid_bash():
     assert os.access(SAMPLER, os.X_OK), "timer から直接起動できるよう実行権限を付ける"
 
 
-@pytest.mark.skipif(sys.platform != "linux", reason="GNU date（%3N）が要る")
+@pytest.mark.skipif(sys.platform != "linux", reason="bash 5（EPOCHREALTIME）が要る")
 def test_sampler_writes_the_columns_from_fake_proc_and_cgroup(tmp_path):
     """偽の `/proc` / cgroup / `systemctl` を渡す。**実機の `/proc` を読まない。**"""
     bash = shutil.which("bash")
@@ -988,6 +990,10 @@ def test_sampler_writes_the_columns_from_fake_proc_and_cgroup(tmp_path):
         encoding="utf-8",
     )
     systemctl.chmod(0o755)
+    # uutils の date は `+%s%3N` にナノ秒（19 桁）を返す（#407）。sampler は date に頼らないこと
+    fake_date = fake_bin / "date"
+    fake_date.write_text("#!/bin/sh\necho 1793796750122345678\n", encoding="utf-8")
+    fake_date.chmod(0o755)
     env = {
         **os.environ,
         "PATH": f"{fake_bin}{os.pathsep}{os.environ.get('PATH', '')}",
@@ -996,18 +1002,22 @@ def test_sampler_writes_the_columns_from_fake_proc_and_cgroup(tmp_path):
     }
     out = tmp_path / "rss.csv"
 
+    before_ms = int(time.time() * 1000)
     for _ in range(2):
         subprocess.run(
             [bash, str(SAMPLER), str(out), "coldaisle-daemon", "coldaisle-fand"],
             check=True,
             env=env,
         )
+    after_ms = int(time.time() * 1000)
 
     lines = out.read_text(encoding="utf-8").splitlines()
     assert lines[0] == ",".join(RSS_CSV_COLUMNS), "見出しは最初の1回だけ"
     assert len(lines) == 1 + 2 * 2
     ingest = lines[1].split(",")
-    assert ingest[0].isdigit()
+    # ms の 13 桁で、いまの時刻（ns・µs・秒ではない）
+    assert re.fullmatch(r"[0-9]{13}", ingest[0])
+    assert before_ms - 1000 <= int(ingest[0]) <= after_ms
     assert ingest[1:] == [
         "coldaisle-daemon",
         "4242",

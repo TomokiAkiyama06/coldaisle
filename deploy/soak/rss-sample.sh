@@ -71,9 +71,18 @@ single_value() {
   digits "$value"
 }
 
-ts_ms=$(date +%s%3N)
-if [[ ! $ts_ms =~ ^[0-9]+$ ]]; then
-  echo "時刻を ms で得られない（GNU date が要る）: $ts_ms" >&2
+# 時刻は bash 5 の EPOCHREALTIME（秒.マイクロ秒）から ms を作る。`date +%s%3N` は使わない:
+# uutils coreutils の date は `%3N` の桁数を無視してナノ秒（19 桁）を出し、数字だけなので
+# 検査を通って ts_ms 列が ns になる（#407）。小数点は locale で `,` になり得るので、
+# 数字以外の 1 文字で分ける。ms は切り捨て（四捨五入で次の秒へ繰り上げない）。
+epoch=${EPOCHREALTIME:-}
+epoch_sec=${epoch%%[^0-9]*}
+epoch_frac=${epoch#"$epoch_sec"}
+epoch_frac=${epoch_frac#[^0-9]}
+ts_ms="$epoch_sec${epoch_frac:0:3}"
+# 13 桁（ms）まで見る。ns・µs・秒のままの値を通さない
+if [[ ! $epoch_sec =~ ^[0-9]{10}$ || ! $epoch_frac =~ ^[0-9]{6}$ || ! $ts_ms =~ ^[0-9]{13}$ ]]; then
+  echo "時刻を ms で得られない（bash 5 の EPOCHREALTIME が要る）: ${epoch:-（未設定）}" >&2
   exit 1
 fi
 
