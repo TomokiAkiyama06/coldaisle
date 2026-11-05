@@ -19,16 +19,19 @@
 | `deploy/systemd/coldaisle-rollup.service` / `.timer` | ロールアップと保持期間の適用。毎日 03:00 |
 | `deploy/systemd/coldaisle-report.service` / `.timer` | 前日の日次レポート。毎朝 08:05（ロールアップのあと） |
 | `deploy/udev/99-coldaisle-sensors.rules` | センサー基板に `/dev/server-sensors` の固定名を付ける |
-| `deploy/systemd/coldaisle-fand.service` | 3系統 Fan 制御デーモン。**置くだけで `enable` しない**（6 節） |
+| `deploy/systemd/coldaisle-fand.service` | 3系統 Fan 制御デーモン。**置くだけでは有効にならない。`enable` は決定記録 0161 §2.5 の手順の中で行う**（6 節） |
 | `deploy/udev/99-coldaisle-hwmon.rules` | fand に、対象 zone の hwmon の `pwmN` / `pwmN_enable` だけの書き込み権限を渡す |
 
 ## まだ含めないもの
 
-- **`coldaisle-fand`（3系統 Fan 制御）は、テンプレートを置くだけで有効化しません。**
+- **`coldaisle-fand`（3系統 Fan 制御）は、テンプレートを置くだけでは有効になりません。**
   unit の中身は決定記録 [`0080`](decisions/0080-fand-systemd-unit.md) で決めました。
   サービスとして `systemctl enable` するのは、0080 §2.10 の段階 5（systemd のある環境での
   kill・watchdog・正常停止の確認）と、0028 §2.9 の承認点 3 の後です
   （`docs/critical-safety.md`「統合と実機検証までサービスで Fan 制御を有効化しない」）。
+  そこから `enable` までの順序は決定記録 [`0161`](decisions/0161-fand-enable-prerequisites.md) §2.5 の
+  表です（`enable --now` は手順 8）。最初の導入先はこの順序を終えて `enable` 済みです
+  （結果は `docs/fan-header-mapping.md` の「HEAD での確認」）。新しい導入先も同じ順序を一からたどります。
 - **Learned worker（`coldaisle-learnd-mpc` / `coldaisle-learnd-supervisor`）も、テンプレートを置くだけで有効化しません**
   （6.8。決定記録 [`0115`](decisions/0115-learned-worker-units.md) §2.9）。
 - `coldaisle-eventd`（書き込みソケット。決定記録 0045 未決 4）の unit も含めません。
@@ -535,7 +538,8 @@ journalctl -u coldaisle-daemon --since "<始まり>" --until "<始まり + 24 �
 **実機のユーザー名・ホスト名・path・driver 名・channel 番号はコミットしません**（AGENTS.md ルール10）。
 
 > **この節の手順で `systemctl enable` も `systemctl start` もしません。** 有効化は 0080 §2.10 の
-> 段階 5 と、0028 §2.9 の承認点 3 の後です。テンプレートを置いただけでは Fan 制御は有効になりません。
+> 段階 5 と、0028 §2.9 の承認点 3 の後で、順序は決定記録 [`0161`](decisions/0161-fand-enable-prerequisites.md) §2.5 の
+> 表のとおりです。テンプレートを置いただけでは Fan 制御は有効になりません。
 
 > **fand の状態の通知（決定記録 [`0148`](decisions/0148-fand-state-alert.md)）。** 取り込み（`coldaisle-daemon`）が
 > fand の decision trace の最後の 1 行を読み、`EMERGENCY`（重大・即時）・`DEGRADED` の 120 s の継続（警告）・
@@ -792,13 +796,14 @@ sudo /usr/bin/python3 -I -S /opt/coldaisle/src/coldaisle/safety_handoff.py; echo
   終え、journal に `shutdown_left_max_manual` が出ます（0080 §2.8）。
   下の段階 5 を実機の無い環境（VM）で simulated backend のまま行うときは、置いた unit の `ExecStart=` から
   `--backend hwmon` を外して行い、終わったら戻します
-- **`sudo systemctl enable coldaisle-fand` は実行しません。** 0080 §2.10 の段階 5（simulated backend
+- **この節では `sudo systemctl enable coldaisle-fand` を実行しません。** `enable` は 0080 §2.10 の段階 5（simulated backend
   のまま、`kill -STOP`・`kill -KILL`・`systemctl stop`・再起動の連続で `ExecStopPost` が走ること・
-  `/run/coldaisle` が残ること・順序を確かめる）と、0028 §2.9 の承認点 3 の後に行います。
+  `/run/coldaisle` が残ること・順序を確かめる）と、0028 §2.9 の承認点 3 の後に、0161 §2.5 の手順 8 で行います。
   Learned を配備した導入先では、段階 5 の確認に **Learned の経路が開くこと**（6.8 の手順 7）も含めます
   （決定記録 0115 §3）。
   時間切れ（`TimeoutStartSec` / `TimeoutStopSec` / `TimeoutAbortSec`）・`WatchdogSec`・`RestartSec` は
-  暫定値で、実機の測定と所有者の承認で決めます（0080 §5 の 1）
+  実機の測定と所有者の承認でテンプレートの値のまま確定しました（決定記録 0161 §5 の 3。0080 §5 の 1 への答え）。
+  テンプレートの冒頭のコメントはまだ「暫定値」のままですが、値は確定済みです
 - **fand を `enable` するときは、途絶の警告も有効にします**（決定記録 0148 §5 の 2）。
   出荷の `config/rules.yaml` では `fand_trace_silent.enabled` が false です。`config/` は root の所有なので
   `sudo` で書き換え、取り込みを再起動して読ませます（ルールは起動時に1回だけ読みます）:
