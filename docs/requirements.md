@@ -171,7 +171,7 @@ L1〜L4 は Source が何であるかを一切知らない。
 |---|---|---|---|
 | Safety-0 | BIOS Q-Fan / GPU自身のサーマルスロットリング | なし | — （最終防衛線） |
 | Safety-1 | ルールエンジンによる検知・通知 | **なし** | Yes（通知が止まるだけ） |
-| Control-1 | 3系統Fan制御（Supervisor / Learned MPC → Reactive Guard → Critical Safety） | 制御ML（Supervisor / Learned MPC）のみ。**LLMは不可**。Reactive Guard / Critical Safety は**なし** | Yes（ML停止時は Baseline / Fallback へ退避。制御デーモン自体の停止時の挙動は実機で確認（#43）） |
+| Control-1 | 3系統Fan制御（Supervisor / Learned MPC → Reactive Guard → Critical Safety） | 制御ML（Supervisor / Learned MPC）のみ。**LLMは不可**。Reactive Guard / Critical Safety は**なし** | Yes（ML停止時は Baseline / Fallback へ退避。制御デーモン自体の停止時の挙動は実機で確認済み（kill・停止で Max・BIOS へ戻る。`docs/fan-header-mapping.md` の T5・R1） |
 | Advisory-2 | LLMによる説明・診断・要約・対話 | あり | Yes（説明が出ないだけ） |
 
 **LLMは一切のアクチュエーションを持たない。** 出力は常に「人間への提案」で終わる。
