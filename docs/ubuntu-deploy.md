@@ -790,6 +790,11 @@ sudo /usr/bin/python3 -I -S /opt/coldaisle/src/coldaisle/safety_handoff.py; echo
   無ければ終了コード 5、header を一意に特定できなければ終了コード 2 で、どちらも `pwmN_enable` に触りません。
   正常停止（`systemctl stop`）では元の自動制御へ戻して記録を消します。元が manual の header があれば Max のまま
   終え、journal に `shutdown_left_max_manual` が出ます（0080 §2.8）。
+- **終了コード 1 は 2 つの原因で共有しています**（決定記録 0180 §2.2。どちらも再起動します）。見分けは journal で行います:
+  制御設定（`safety.yaml` / `fan-policy.yaml` / `air-balance.yaml`）が無い・不正なときは全 zone を Max に書いてから
+  `config_invalid で停止` の error の行を出して終わり、未捕捉の例外のときは traceback が出ます。
+  `config_invalid` の間は、停止の後の `ExecStopPost` の Max → `RestartSec` の後の起動 → Max の輪が数秒ごとに Max を書き直します
+  （0180 §2.4。外から `pwmN_enable` を戻されても数秒で Max に戻ります）。正しい設定を置いて `systemctl restart` するまで続きます
   下の段階 5 を実機の無い環境（VM）で simulated backend のまま行うときは、置いた unit の `ExecStart=` から
   `--backend hwmon` を外して行い、終わったら戻します
 - **`sudo systemctl enable coldaisle-fand` は実行しません。** 0080 §2.10 の段階 5（simulated backend
