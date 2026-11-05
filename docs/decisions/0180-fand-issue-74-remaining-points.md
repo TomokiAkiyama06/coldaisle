@@ -1,12 +1,12 @@
 # 決定記録 0180: #74 を閉じる前に残っている判断（CALIBRATION・終了コード 1・D 状態の hang・config_invalid の再主張・Guard の値の status）
 
 - **種別**: Decision Record
-- **Status**: FINAL（2026-11-05、リポジトリ所有者の承認。§5 の 1〜6 はすべて推奨の案）
+- **Status**: FINAL（2026-11-05、リポジトリ所有者の承認。§5 の 1〜7 はすべて推奨の案）
 - **Date**: 2026-11-05
 - **Supersedes**: なし（[`0072`](0072-control-admin-entry.md) §2.10 の段階 4・[`0080`](0080-fand-systemd-unit.md) §5 の 4 / 6 / 7・
   [`0028`](0028-fan-control-contracts.md) §5 の 6・[`0060`](0060-control-loop-runtime.md) §5 の 1・
   [`0118`](0118-hwmon-backend-label-less-headers.md) §5 の 3 / 4 に答える。どの記録の決定も置き換えない。新しい安全の値は決めない）
-- **関連**: [`0119`](0119-safety-values-first-host.md) §2.14 / [`0153`](0153-airflow-measurement-method.md) /
+- **関連**: [`0031`](0031-thermal-dataset-contract.md) §5 / [`0119`](0119-safety-values-first-host.md) §2.14 / [`0153`](0153-airflow-measurement-method.md) /
   [`0161`](0161-fand-enable-prerequisites.md) §2.1 / [`0174`](0174-no-airflow-characterization.md) /
   `docs/reactive-guard.md` / `docs/fan-header-mapping.md`
 - **対象 Issue**: #74
@@ -90,10 +90,18 @@ fand は 0161 §2.5 の順序を終えて導入先で常駐している（2026-1
 
 1. 本記録のマージ
 2. 文書の追従の PR（`docs/ubuntu-deploy.md` の enable の記述。PR #412）と、§2.2・§2.5 の文書の書き足し、§2.4 の unit の設定の試験
-3. Replay からの E2E の再現の試験（受入基準「同じ Replay + Clock + Config で tick の順序を再現できる」の補い。別の PR）
+3. Replay からの E2E の再現の試験（受入基準「同じ Replay + Clock + Config で tick の順序を再現できる」の補い。PR #415。§2.7）
 
 Learned（#84 / #85 / #86 / #89 / #92 / #104）の統合と、Learned を配備するときの soak のやり直し（0161 §2.2 の注）は
 それぞれの Issue で扱い、#74 を開けたままにする理由にしない。
+
+### 2.7 0031 §5 の「Replay で Control Engine 全体から ControlTick を作る導線」を閉じる
+
+- `tests/test_fand_replay_reproducibility.py`（PR #415）が、CSV を Replay で DB へ取り込み、その DB から fand（simulated backend・
+  模擬の時計）を 2 回走らせて、tick の列と trace の中身（起動ごとの `run_id` を除く）が一致することを確かめる。これをもって
+  [`0031`](0031-thermal-dataset-contract.md) §5 の 3 つ目の未決を**閉じる**（所有者、2026-11-05）
+- 取り込みと fand を交互に進める、実運用に近い形の再現は含まない。要る場面が出たら別に扱う
+- 試験は `control_daemon` の時計を monkeypatch で差し替える。時計の注入口を本体に作るのは、要るようになってから
 
 ## 3. Consequences
 
@@ -133,3 +141,4 @@ Learned（#84 / #85 / #86 / #89 / #92 / #104）の統合と、Learned を配備�
 | 4 | D: `config_invalid` の再主張 | **(推奨) 再起動の輪を再主張の仕組みとして決め、unit の 3 つの設定の試験を足す** / fand の中に周期的な書き直しを足す / 決めずに開けておく | #74 を閉じる前 | 決定済み（所有者、2026-11-05）: 推奨の案 |
 | 5 | E: Guard の値の `status` | **(推奨) 0119 §2.14 で満たしたとし、文書を直す。`status` の書き換えは Authority を上げる前にまとめる** / 導入先の `status` を今すぐ `confirmed` にする / #74 の要件を満たしていないとして開けておく | #74 を閉じる前 | 決定済み（所有者、2026-11-05）: 推奨の案 |
 | 6 | #74 を閉じる条件 | **(推奨) §2.6 の 3 つがそろったら閉じる** / Learned の統合まで開けておく | — | 決定済み（所有者、2026-11-05）: 推奨の案 |
+| 7 | 0031 §5 の Replay の導線の未決 | **(推奨) PR #415 の試験で閉じる** / 取り込みと fand を交互に進める再現まで開けておく | — | 決定済み（所有者、2026-11-05）: 推奨の案 |
