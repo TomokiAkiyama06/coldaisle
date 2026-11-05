@@ -283,6 +283,7 @@ def thermal_dataset_v2(
                 action_step_ms=STEP_MS,
                 action_steps=STEPS,
                 action_stale_after_ms=2_000,
+                anchor_stride_ms=1,
             ),
             source_runs=data.manifest.source_runs,
             telemetry_sha256=data.manifest.telemetry_sha256,

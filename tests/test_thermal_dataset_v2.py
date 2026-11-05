@@ -8,6 +8,7 @@ anchor + 最大の horizon が run に収まるのは 5000 だけ）。除外の
 from __future__ import annotations
 
 import ast
+import hashlib
 import json
 import shutil
 import sqlite3
@@ -38,7 +39,12 @@ from coldaisle.control.model.dataset import (
 from coldaisle.control.model.thermal import ObservedThermalInput
 from coldaisle.control.mpc.plan import ActionPlan
 from coldaisle.control.schema import PerZone
-from coldaisle.dataset import ThermalDatasetBuilder, ThermalDatasetV2Builder, write_dataset
+from coldaisle.dataset import (
+    ThermalDatasetBuilder,
+    ThermalDatasetV2Builder,
+    _anchor_candidates,
+    write_dataset,
+)
 from coldaisle.store import Quality, QualityRules, Reading, Sample, SqliteStore, migrations
 from coldaisle.store.calibration_history import (
     CalibrationActivation,
@@ -102,6 +108,8 @@ def spec_v2(**updates: object) -> DatasetSpecV2:
         "action_step_ms": 1_000,
         "action_steps": 2,
         "action_stale_after_ms": 1_500,
+        # 1 ms の格子ならすべての tick が候補になり、間引く前と同じ（決定記録 0181 §2.4）
+        "anchor_stride_ms": 1,
     }
     values.update(updates)
     return DatasetSpecV2.model_validate(values)
@@ -428,7 +436,7 @@ def test_action_freshness_uses_the_explicit_limit(build_ticks, stale_after, expe
 def test_spec_without_action_fields_is_not_a_type():
     """既定値は置かない（0087 §2.2 / §2.4、AGENTS.md ルール9）。"""
     full = spec_v2().model_dump()
-    for field in ("action_stale_after_ms", "action_step_ms", "action_steps"):
+    for field in ("action_stale_after_ms", "action_step_ms", "action_steps", "anchor_stride_ms"):
         values = dict(full)
         del values[field]
         with pytest.raises(ValidationError, match=field):
@@ -1064,25 +1072,29 @@ def test_control_model_does_not_import_control_drift():
 # ---------------------------------------------------------------- 除外の件数・決定性・版
 
 
+MANY_ANCHORS: tuple[TickSpec, ...] = (
+    (1_000, 1, A),  # 前に tick が無い → 鮮度
+    (2_000, 2, A),  # 作る
+    (3_000, 3, A),  # 作る
+    (4_000, 4, A),  # 区間 [5000, 6000) の 5500 が違う → 区間内の変化
+    (5_000, 5, A),  # 区間 [5000, 6000) の 5500 が違う → 区間内の変化
+    (5_500, 6, B),  # 作る
+    (6_000, 7, B),  # 9 → 11 → 欠番
+    (7_000, 8, B),  # 欠番
+    (8_000, 9, B),  # 欠番
+    (9_000, 11, B),  # 欠番と再起動（13 → 0）の両方 → 再起動
+    (10_000, 12, B),  # 再起動
+    (11_000, 13, B),  # 最大の horizon（13000）の後に tick が無い → 連続
+    (12_000, 0, B),
+    (13_000, 1, B),
+)
+"""anchor ごとに理由が違う run（window 1000 ms・action の鮮度 1100 ms で使う）。"""
+
+
 def test_exclusion_counts_add_up_over_many_anchors(build_ticks):
     """anchor ごとに理由が違う run。理由ごとの件数と、作った example の和が anchor の数になる。"""
     spec = spec_v2(window_ms=1_000, action_stale_after_ms=1_100)
-    ticks: tuple[TickSpec, ...] = (
-        (1_000, 1, A),  # 前に tick が無い → 鮮度
-        (2_000, 2, A),  # 作る
-        (3_000, 3, A),  # 作る
-        (4_000, 4, A),  # 区間 [5000, 6000) の 5500 が違う → 区間内の変化
-        (5_000, 5, A),  # 区間 [5000, 6000) の 5500 が違う → 区間内の変化
-        (5_500, 6, B),  # 作る
-        (6_000, 7, B),  # 9 → 11 → 欠番
-        (7_000, 8, B),  # 欠番
-        (8_000, 9, B),  # 欠番
-        (9_000, 11, B),  # 欠番と再起動（13 → 0）の両方 → 再起動
-        (10_000, 12, B),  # 再起動
-        (11_000, 13, B),  # 最大の horizon（13000）の後に tick が無い → 連続
-        (12_000, 0, B),
-        (13_000, 1, B),
-    )
+    ticks = MANY_ANCHORS
     dataset = build_ticks(ticks, end_ms=13_500, spec=spec)
 
     counts = excluded(dataset)
@@ -1289,3 +1301,137 @@ def test_loaded_source_tick_ids_follow_the_consecutive_rule(build_ticks, path, v
     target[path[-1]] = value
     with pytest.raises(ValidationError, match=match):
         DatasetExampleV2.model_validate_json(json.dumps(raw))
+
+
+# ------------------------------------------------------- anchor の間隔（決定記録 0181 §2.1）
+
+MANY_ANCHORS_EXAMPLES_SHA256 = (
+    "a3370f3ce4f427cf11755efcec9c46520d5413110f6a9515bf7aa89dcbc73fbd"  # pragma: allowlist secret
+)
+"""``MANY_ANCHORS`` の examples.jsonl の SHA-256。anchor の間隔を足す前（#417 の main）の出力。"""
+
+
+def test_stride_of_one_ms_gives_the_same_bytes_as_before_the_stride(build_ticks):
+    """1 ms の格子ではすべての tick が候補になり、間隔を足す前と同じ bytes になる（0181 §2.4）。"""
+    dataset = build_ticks(
+        MANY_ANCHORS,
+        end_ms=13_500,
+        spec=spec_v2(window_ms=1_000, action_stale_after_ms=1_100, anchor_stride_ms=1),
+    )
+
+    body = examples_jsonl_bytes(dataset.examples)
+    assert hashlib.sha256(body).hexdigest() == MANY_ANCHORS_EXAMPLES_SHA256
+    assert dataset.manifest.examples_sha256 == MANY_ANCHORS_EXAMPLES_SHA256
+    assert excluded(dataset) == zero_excluded(
+        stale=1, discontinuity=1, in_step_change=2, restart=2, tick_id_gap=3
+    )
+
+
+STEADY: tuple[TickSpec, ...] = tuple(
+    (ts_ms, index + 1, (index / 20, index / 20, index / 20))
+    for index, ts_ms in enumerate(range(0, 13_000, 1_000))
+)
+"""1 s の tick が 0〜12000 に並ぶ run。値は tick ごとに違い、どの tick から引いたかが分かる。"""
+
+
+def test_stride_keeps_only_the_tick_right_after_each_grid_time(build_ticks):
+    """間隔 2000 ms では anchor は格子の直後の tick だけ。間引いた tick は除外に数えない。"""
+    every = build_ticks(STEADY, end_ms=13_001, spec=spec_v2(anchor_stride_ms=1))
+    strided = build_ticks(STEADY, end_ms=13_001, spec=spec_v2(anchor_stride_ms=2_000))
+
+    assert [example.action_ts_ms - T0 for example in every.examples] == [
+        5_000,
+        6_000,
+        7_000,
+        8_000,
+        9_000,
+    ]
+    assert [example.action_ts_ms - T0 for example in strided.examples] == [6_000, 8_000]
+    # 10000 / 11000 は最大の horizon の後に tick が無い。間引いた 11000 は数えない
+    assert excluded(every) == zero_excluded(discontinuity=2)
+    assert excluded(strided) == zero_excluded(discontinuity=1)
+    assert strided.manifest.spec.anchor_stride_ms == 2_000
+    # 間引いても、残った anchor の example は全 tick の dataset の同じ anchor と同じ
+    by_anchor = {example.action_ts_ms: example for example in every.examples}
+    assert all(example == by_anchor[example.action_ts_ms] for example in strided.examples)
+
+
+def test_prior_action_and_steps_come_from_thinned_ticks(build_ticks):
+    """prior_action と action の各 step は、anchor にならなかった tick からも引く（0181 §2.1）。"""
+    dataset = build_ticks(STEADY, end_ms=13_001, spec=spec_v2(anchor_stride_ms=2_000))
+
+    first = dataset.examples[0]
+    assert first.action_ts_ms == T0 + 6_000
+    assert (first.prior_action.source_ts_ms, first.prior_action.source_tick_id) == (
+        T0 + 5_000,
+        6,
+    )
+    assert first.prior_action.effective_demand == per_zone((5 / 20, 5 / 20, 5 / 20))
+    assert [(step.source_ts_ms, step.source_tick_id) for step in first.action_steps] == [
+        (T0 + 6_000, 7),
+        (T0 + 7_000, 8),
+    ]
+    assert first.action_steps[1].effective_demand == per_zone((7 / 20, 7 / 20, 7 / 20))
+
+
+def test_anchor_candidates_take_the_first_tick_of_each_grid_interval():
+    """同じ区間の 2 つ目の tick は候補にしない。tick の無い区間は次の tick を 1 回だけ選ぶ。"""
+    # 格子 0 / 2000 / 4000 / 6000 / 8000
+    ts = (100, 2_100, 2_500, 6_500, 8_000)
+
+    assert _anchor_candidates(ts, 0, 2_000) == (0, 1, 3, 4)
+    assert _anchor_candidates(ts, 0, 1) == (0, 1, 2, 3, 4)
+    assert _anchor_candidates((), 0, 2_000) == ()
+    # 格子の起点は run の開始。tick がそれより前に無くても、起点からの格子で選ぶ
+    assert _anchor_candidates((1_000, 1_999, 2_000, 2_001), 1_000, 1_000) == (0, 2)
+
+
+def test_two_ticks_in_one_grid_interval_keep_only_the_first(build_ticks):
+    """区間 [6000, 8000) に 6000 と 6500 があれば 6000 だけを anchor の候補にする。"""
+    ticks: tuple[TickSpec, ...] = (
+        (4_000, 1, A),
+        (5_000, 2, A),
+        (6_000, 3, A),
+        (6_500, 4, A),
+        (7_000, 5, A),
+        (8_000, 6, A),
+        (9_000, 7, A),
+    )
+    every = build_ticks(ticks, end_ms=9_001, spec=spec_v2(anchor_stride_ms=1))
+    strided = build_ticks(ticks, end_ms=9_001, spec=spec_v2(anchor_stride_ms=2_000))
+
+    assert [example.action_ts_ms - T0 for example in every.examples] == [5_000, 6_000, 6_500]
+    # 候補は 4000（格子 0〜4000）・6000・8000。window を満たし horizon が run に収まるのは 6000 だけ
+    assert [example.action_ts_ms - T0 for example in strided.examples] == [6_000]
+    assert excluded(strided) == zero_excluded()
+
+
+def test_grid_interval_without_a_tick_selects_the_next_tick_once(build_ticks):
+    """区間 [6000, 7000) に tick が無ければ、次の 7200 を 1 回だけ候補にする（7000 も 7200）。"""
+    ticks: tuple[TickSpec, ...] = (
+        (4_000, 1, A),
+        (5_000, 2, A),
+        (5_900, 3, A),
+        (7_200, 4, A),
+        (8_000, 5, A),
+        (9_000, 6, A),
+        (10_000, 7, A),
+    )
+    spec = spec_v2(anchor_stride_ms=1_000, action_stale_after_ms=1_500)
+    dataset = build_ticks(ticks, end_ms=10_001, spec=spec)
+
+    # 格子 5000 → 5000（5900 は同じ区間の 2 つ目）、6000 と 7000 → 7200（1 回だけ）、8000 → 8000。
+    # 8000 は最大の horizon（10000）の後に tick が無い
+    assert [example.action_ts_ms - T0 for example in dataset.examples] == [5_000, 7_200]
+    assert excluded(dataset) == zero_excluded(discontinuity=1)
+
+
+@pytest.mark.parametrize("value", [0, -1_000])
+def test_anchor_stride_must_be_positive(value):
+    with pytest.raises(ValidationError, match="anchor_stride_ms"):
+        spec_v2(anchor_stride_ms=value)
+
+
+def test_v1_spec_has_no_anchor_stride():
+    """間隔は v2 だけの欄。v1 の spec には足さない（0181 §2.1）。"""
+    assert "anchor_stride_ms" not in DatasetSpec.model_fields

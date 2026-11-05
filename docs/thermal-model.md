@@ -185,6 +185,17 @@ v1 artifact は変えず、v1 を v2 として読み替えない。
   `--out` の親（と祖先）は既にあり、実行した uid（か root）の所有で他人が書けないこと。symlink を含まない実の path を
   渡す（macOS は `/private/tmp/...`。macOS では祖先に ACL が無いことを運用の前提とする。0150 §5 の 15）。失敗した段
   （`stage`）と回復は 0150 §2.4 の表。手動の登録は `coldaisle-registry register --training-output <--out>`
+
+  **メモリの上限を付けて走らせる**（決定記録 [0181](decisions/0181-dataset-anchor-stride-and-training-limits.md) §2.2）。
+  学習の入口の上限（`examples.jsonl` 1 GiB・cells 5 × 10⁷・ridge の演算量 2 × 10¹⁰）は資源の安全弁で、上限の近くでは
+  1 回の学習が数分〜10 分かかり数 GB を使う。導入先の常駐サービス（fand ほか）と同じ機械で走りうるので、
+  user の scope にメモリの上限を付け、swap を使わせない（上限を超えたら学習だけが止まる）。Dataset の生成
+  （`coldaisle-dataset`）も同じ形で走らせる。値（`8G` など）は機械の空きに合わせて人が選ぶ:
+
+  ```bash
+  systemd-run --user --scope -p MemoryMax=8G -p MemorySwapMax=0 \
+      uv run coldaisle-train --dataset var/datasets/dataset-<32 hex> ...
+  ```
 - **offline 評価の CLI**（`coldaisle-thermal-evaluate`。決定記録 [0172](decisions/0172-thermal-offline-evaluation.md)）: Registry の candidate を、それを学習した dataset の **test だけ**（`split_sha256` で束縛）で、実際に適用された action 列のもとで予測し、未学習の baseline `persistence` と対で比べた報告（MAE・RMSE・bias・underprediction の分位と worst-case・時間ブロックの符号検定・室温帯 / workload / action の変化の層・辞書式の gate `evidence → underprediction → skill`）を `--out` に書く。**Registry・設定・DB に書かない**。gate は助言で、値は `config/thermal-evaluation.example.yaml`（仮の値）を写した設定から読む。test を何度も見て学習の選択を調整しない（`ridge_lambda` などの選択は validation で行う）。validated にするのは `coldaisle-registry validate --thermal-evaluation <報告> --evaluation-config <設定>`（報告と設定を照合し gate を作り直す。自由記述の `--offline-evaluation-ref` は拒否。`docs/model-registry.md`・0172 §2.7）
 
 MPC への束縛（`MpcModelBinding`・`PlanPrediction`・§2.5 の探索範囲の写し）は段 4（#86。次の次の節）、
