@@ -281,6 +281,7 @@ def common_args(env: dict[str, Path]) -> list[str]:
 
 def v2_args(env: dict[str, Path], **overrides: str | None) -> list[str]:
     options: dict[str, str | None] = {
+        "--anchor-stride-ms": "1",
         "--action-step-ms": "1000",
         "--action-steps": "2",
         "--action-stale-after-ms": "1500",
@@ -332,6 +333,7 @@ def test_dataset_version_has_no_default(cli_env):
 @pytest.mark.parametrize(
     "option",
     [
+        "anchor_stride_ms",
         "action_step_ms",
         "action_steps",
         "action_stale_after_ms",
@@ -350,6 +352,7 @@ def test_v2_requires_each_v2_option(cli_env, capsys, option):
 @pytest.mark.parametrize(
     ("option", "value"),
     [
+        ("--anchor-stride-ms", "1"),
         ("--action-step-ms", "1000"),
         ("--action-steps", "2"),
         ("--action-stale-after-ms", "1500"),

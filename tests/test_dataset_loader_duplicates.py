@@ -98,6 +98,7 @@ def v2_spec() -> DatasetSpecV2:
         action_step_ms=1_000,
         action_steps=2,
         action_stale_after_ms=1_500,
+        anchor_stride_ms=1,
     )
 
 

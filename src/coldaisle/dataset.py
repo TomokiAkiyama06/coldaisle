@@ -307,6 +307,24 @@ def _assess_anchor(
     return None, tuple(as_of)
 
 
+def _anchor_candidates(ts: tuple[int, ...], start_ms: int, stride_ms: int) -> tuple[int, ...]:
+    """格子 ``start_ms + k × stride_ms`` の各時刻 g 以上で最初の tick の位置（決定記録 0181 §2.1）。
+
+    同じ tick が複数の g に当たれば 1 回だけ返す。選んだ tick の時刻より後の最初の格子へ跳ぶ
+    ので、tick の無い長い区間があっても格子を 1 つずつ歩かない（O(min(格子数, tick 数) × log n)）。
+    ``ts`` は狭義単調増加（:class:`_RunTicks` が確かめてある）。
+    """
+    candidates: list[int] = []
+    grid_ms = start_ms
+    while True:
+        index = bisect_left(ts, grid_ms)
+        if index >= len(ts):
+            return tuple(candidates)
+        candidates.append(index)
+        # この tick に当たる格子をすべて飛ばし、tick の時刻より後の最初の格子へ
+        grid_ms = start_ms + ((ts[index] - start_ms) // stride_ms + 1) * stride_ms
+
+
 class ThermalDatasetV2Builder:
     """SQLite の raw readings と ControlTick から Thermal Dataset v2 を作る（0079 段 1 / 0087）。"""
 
@@ -349,6 +367,8 @@ class ThermalDatasetV2Builder:
         - ``seq`` の順に並べた ControlTick の ``ts_ms`` が狭義単調増加でない
         - 移行前の行（``seq ≤ legacy_through_seq``）を含む
 
+        anchor の候補は ``spec.anchor_stride_ms`` の格子の直後の tick だけで、候補にならなかった
+        tick は除外の件数に数えない（決定記録 0181 §2.1）。
         完全な window と target をrun内に持てない端の tick は v1 と同じく anchor にしない。
         anchor にできる tick のうち、action の規則（0087 §2.2 / §2.3 / §2.7）に外れたものは
         作らず、理由ごとの件数を manifest に記録する。
@@ -393,10 +413,15 @@ class ThermalDatasetV2Builder:
                 raise ValueError("移行前の ControlTick を含む run から Dataset v2 は作らない")
             ticks = _RunTicks(traces)
             earliest_action_ms = source_run.start_ms + spec.window_ms
+            # 間引くのは anchor の候補だけ。prior_action・action の格子・as-of は全 tick から引く
+            # （決定記録 0181 §2.1）
             eligible = tuple(
                 index
-                for index, ts_ms in enumerate(ticks.ts)
-                if ts_ms >= earliest_action_ms and ts_ms + spec.horizons_ms[-1] < source_run.end_ms
+                for index in _anchor_candidates(
+                    ticks.ts, source_run.start_ms, spec.anchor_stride_ms
+                )
+                if ticks.ts[index] >= earliest_action_ms
+                and ticks.ts[index] + spec.horizons_ms[-1] < source_run.end_ms
             )
             if not eligible:
                 raise ValueError("source run内に完全なwindow/targetを持つControlTickが無い")
@@ -1112,6 +1137,7 @@ def write_dataset(
 
 
 _V2_ONLY_OPTIONS = (
+    "anchor_stride_ms",
     "action_step_ms",
     "action_steps",
     "action_stale_after_ms",
@@ -1155,6 +1181,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--feature-metric", action="append", required=True)
     parser.add_argument("--target-metric", action="append", required=True)
     v2 = parser.add_argument_group("v2（--dataset-version 2 で必須。v1 では渡さない）")
+    v2.add_argument(
+        "--anchor-stride-ms",
+        type=int,
+        help="anchor の候補を選ぶ格子の間隔（ms）。既定値は無い（決定記録 0181 §2.1）",
+    )
     v2.add_argument("--action-step-ms", type=int)
     v2.add_argument("--action-steps", type=int)
     v2.add_argument("--action-stale-after-ms", type=int)
@@ -1260,6 +1291,7 @@ def _main_v2(args: argparse.Namespace) -> int:
     spec = DatasetSpecV2.model_validate(
         {
             **_common_spec(args),
+            "anchor_stride_ms": args.anchor_stride_ms,
             "action_step_ms": args.action_step_ms,
             "action_steps": args.action_steps,
             "action_stale_after_ms": args.action_stale_after_ms,

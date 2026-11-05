@@ -52,19 +52,26 @@ from coldaisle.control.model.thermal import (
 from coldaisle.control.schema import AuthorityStage
 from coldaisle.measurement import Quality
 
+# 学習の入口の上限は**資源の安全弁**（巨大な入力で CPU とメモリを食い尽くさない）で、制御・安全の
+# 閾値ではない。config/ に出すと設定の書き換えで弁を外せてしまうので、コードの定数のままにする。
+# cells・ridge の演算量・examples.jsonl の bytes は、数日分の実データ（30 s 間隔の anchor）で
+# 学習と offline 評価（0172）の最小の件数を同時に満たせる値（決定記録 0181 §2.2）。
 MAX_TRAIN_EXAMPLES = 100_000
-MAX_TRAINING_CELLS = 1_000_000
+MAX_TRAINING_CELLS = 50_000_000
+"""train の件数 × 特徴量の列（50,000 件 × 1,000 列。0181 §2.2）。"""
 MAX_DATASET_EXAMPLES = 100_000
-MAX_DATASET_FEATURE_CELLS = 1_000_000
-MAX_DATASET_TARGET_CELLS = 1_000_000
+MAX_DATASET_FEATURE_CELLS = 50_000_000
+MAX_DATASET_TARGET_CELLS = 50_000_000
 MAX_SOURCE_REFS_PER_RUN = 256
 MAX_DATASET_METADATA_ITEMS = 1_000_000
 MAX_METADATA_ITEMS_PER_EXAMPLE = 256
 MAX_METADATA_TEXT_LENGTH = 500
 MAX_DATASET_TEXT_BYTES = 8 * 1024 * 1024
-MAX_RIDGE_WORK_UNITS = 50_000_000
+MAX_RIDGE_WORK_UNITS = 20_000_000_000
+"""出力 × (件数 × 列² + 列³)。純粋な Python の ridge で約 10 分（3.5 × 10⁷ 単位/秒。0181 §2.2）。"""
 MAX_DATASET_MANIFEST_BYTES = 8 * 1024 * 1024
-MAX_DATASET_EXAMPLES_BYTES = 256 * 1024 * 1024
+MAX_DATASET_EXAMPLES_BYTES = 1024**3
+"""``examples.jsonl`` の bytes（1 GiB。30 s 間隔で 30 日分に近い。0181 §2.2）。"""
 _DATASET_ARTIFACT_ALIAS = re.compile(r"^dataset-[0-9a-f]{32}$")
 _DATASET_MANIFEST_FILENAME = "manifest.json"
 _DATASET_EXAMPLES_FILENAME = "examples.jsonl"

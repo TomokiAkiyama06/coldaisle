@@ -1173,3 +1173,82 @@ def test_runtime_expectation_is_bound_to_identity_schema_and_shadow():
     assert bridged["schema_version"] == 3
     assert bridged["capability"] == "observational_replay"
     assert bridged["kind"] == "thermal_model"
+
+
+# ------------------------------------------------- 学習の入口の上限（決定記録 0181 §2.2）
+
+
+def test_training_limits_are_the_values_of_decision_0181():
+    """上限はコードの定数のまま（config に出さない）。ほかの上限は変えない。"""
+    assert training_module.MAX_TRAINING_CELLS == 50_000_000
+    assert training_module.MAX_DATASET_FEATURE_CELLS == 50_000_000
+    assert training_module.MAX_DATASET_TARGET_CELLS == 50_000_000
+    assert training_module.MAX_RIDGE_WORK_UNITS == 20_000_000_000
+    assert training_module.MAX_DATASET_EXAMPLES_BYTES == 1024**3
+    assert training_module.MAX_TRAIN_EXAMPLES == 100_000
+    assert training_module.MAX_DATASET_EXAMPLES == 100_000
+
+
+def _limit_inputs(*, train: int, purged: int) -> tuple[SimpleNamespace, SimpleNamespace]:
+    """件数だけを持つ dataset と split（上限の判定は件数と列の数だけを見る）。"""
+    spec = SimpleNamespace(
+        window_ms=1_000,
+        sample_period_ms=1_000,
+        feature_metrics=("air.room",),
+        horizons_ms=(1_000,),
+        target_metrics=("air.gpu_exhaust",),
+    )
+    dataset = SimpleNamespace(
+        examples=(None,) * (train + purged),
+        manifest=SimpleNamespace(source_runs=(None,), spec=spec),
+    )
+    split = SimpleNamespace(train=(None,) * train, validation=(), test=(), purged=(None,) * purged)
+    return dataset, split
+
+
+@pytest.fixture
+def check_limits(monkeypatch):
+    """件数と列の数の上限だけを判定する（example の中身の検査は別の試験が見る）。"""
+    monkeypatch.setattr(training_module, "_validate_source_run_container_sizes", lambda _d: None)
+    monkeypatch.setattr(
+        training_module, "_validate_examples_container_sizes", lambda *_a, **_k: (0, 0)
+    )
+
+    def check(*, train: int, purged: int, feature_count: int, output_count: int) -> None:
+        dataset, split = _limit_inputs(train=train, purged=purged)
+        training_module._validate_training_resource_limits(
+            dataset=dataset,
+            split=split,
+            feature_count=feature_count,
+            output_count=output_count,
+        )
+
+    return check
+
+
+def test_train_feature_cells_at_the_limit_pass_and_beyond_are_refused(check_limits):
+    # 100,000 件 × 500 列 = 50,000,000（ちょうど）。cells は通り、次の ridge の演算量で止まる
+    with pytest.raises(ValueError, match="ridge演算量"):
+        check_limits(train=100_000, purged=0, feature_count=500, output_count=1)
+    with pytest.raises(ValueError, match="train feature cell数"):
+        check_limits(train=100_000, purged=0, feature_count=501, output_count=1)
+
+
+def test_dataset_feature_cells_at_the_limit_pass_and_beyond_are_refused(check_limits):
+    check_limits(train=1, purged=99_999, feature_count=500, output_count=1)
+    with pytest.raises(ValueError, match="dataset feature cell総数"):
+        check_limits(train=1, purged=99_999, feature_count=501, output_count=1)
+
+
+def test_dataset_target_cells_at_the_limit_pass_and_beyond_are_refused(check_limits):
+    check_limits(train=1, purged=99_999, feature_count=1, output_count=500)
+    with pytest.raises(ValueError, match="dataset target cell総数"):
+        check_limits(train=1, purged=99_999, feature_count=1, output_count=501)
+
+
+def test_ridge_work_at_the_limit_passes_and_beyond_is_refused(check_limits):
+    # 1 × (79,500 × 500² + 500³) = 20,000,000,000（ちょうど）
+    assert training_module.MAX_RIDGE_WORK_UNITS == 79_500 * 500**2 + 500**3
+    check_limits(train=79_500, purged=0, feature_count=500, output_count=1)
+    with pytest.raises(ValueError, match="ridge演算量"):
+        check_limits(train=79_501, purged=0, feature_count=500, output_count=1)

@@ -141,8 +141,15 @@ v1 との違い（規則の正本は [0087](decisions/0087-dataset-v2-action-gri
 - **`prior_action`**: anchor の tick より厳密に前で直近の tick の `effective`。v2 の anchor action はこれで、
   `ObservedThermalInput.from_example_v2` はこの値を action に使う。v1 と同じ `action`（anchor の tick 自身）は
   分析用に残す
-- **spec の必須の欄**: `action_step_ms` / `action_steps` / `action_stale_after_ms`。**既定値は無い**（値は実データの後に
-  選ぶ。0087 §2.2）。各 horizon は `action_step_ms` の整数倍、`action_steps × action_step_ms` は最大の horizon と等しい
+- **spec の必須の欄**: `action_step_ms` / `action_steps` / `action_stale_after_ms` / `anchor_stride_ms`。**既定値は無い**（値は実データの後に
+  選ぶ。0087 §2.2 / 0181 §2.1）。各 horizon は `action_step_ms` の整数倍、`action_steps × action_step_ms` は最大の horizon と等しい
+- **anchor の間隔**（`anchor_stride_ms`。決定記録 [0181](decisions/0181-dataset-anchor-stride-and-training-limits.md) §2.1）:
+  run の開始 `start_ms` から `anchor_stride_ms` ごとの格子の時刻 `g` のそれぞれについて、`g` 以上で最初の ControlTick を
+  anchor の候補にする（同じ tick が複数の格子に当たれば 1 回だけ）。候補に下の判定（window・target・鮮度・除外の理由）を
+  そのまま当てる。候補にならなかった tick は `excluded` に数えない。`prior_action`・action の格子・as-of は**全 tick** から
+  引く（間引くのは anchor だけ）。1 s の tick をすべて anchor にすると隣り合う example が window のほとんどを共有し、
+  1 日で約 86,000 件・1 GB を超えるためである。`1` を渡すとすべての tick が候補になる（間隔を足す前と同じ bytes）。
+  manifest の `spec` に載るので、間隔の違う dataset は別の spec として区別される
 - **target**: `[期待時刻 − 許容誤差, 期待時刻]` の観測のうち最も遅いものだけを採る（後ろの観測は、近くても採らない）。
   `label_end_ms` は `t_a + 最大の horizon`
 - **作らない example と件数**: 次のどれかに当たる anchor の example は作らず、manifest の `excluded` に理由ごとの
@@ -205,7 +212,8 @@ v1 との違い（規則の正本は [0087](decisions/0087-dataset-v2-action-gri
 
 v1 の引数に加えて、次を**すべて必須**で渡す（既定値は無い。v1 で渡すと拒否する）。
 
-- `--action-step-ms` / `--action-steps` / `--action-stale-after-ms`: `DatasetSpecV2` の欄
+- `--anchor-stride-ms` / `--action-step-ms` / `--action-steps` / `--action-stale-after-ms`: `DatasetSpecV2` の欄
+  （`--anchor-stride-ms` は決定記録 0181 §2.1）
 - `--declared-changes <path>`: 宣言された変更の YAML。宣言が無いときも `changes: []` と書いたファイルを渡す
 - `--calibration-history-db <path>`: 較正の変更の記録（`calibration_activations`）を持つ本番の DB。読み取り専用で
   開き、migration を当てない。専用 DB（`--db`）と同じ実体（symlink・hard link の別名を含む）は拒否する。
@@ -229,11 +237,16 @@ uv run coldaisle-dataset \
   --dataset-version 2 \
   --declared-changes var/declared-changes.yaml \
   --calibration-history-db var/coldaisle.db \
+  --anchor-stride-ms 30000 \
   --action-step-ms 1000 \
   --action-steps 10 \
   --action-stale-after-ms 3000 \
   ...                          # v1 と同じ引数（--db / --replay-path / --horizon-ms ほか）
 ```
+
+生成は example を全部メモリに持つので、導入先の常駐サービスと同じ機械で走らせるときは、学習と同じく
+`systemd-run --user --scope -p MemoryMax=… -p MemorySwapMax=0` で上限を付ける（`docs/thermal-model.md` の学習の CLI・
+決定記録 0181 §2.2）。
 
 - 宣言のファイルは DB を開く前に検証し、外れれば終了コード 1 で何も書かない。拒否するもの: 空のファイル・`null`・
   `changes` の鍵の欠け・未知の種別・`bool` / 浮動小数 / 文字列の `ts_ms`・負の `ts_ms`・知らない鍵・重複した鍵・

@@ -567,6 +567,10 @@ class DatasetSpecV2(_Frozen):
     （``action_stale_after_ms``）は実データの後に選ぶ値である
     （0087 §2.2 / §2.4、AGENTS.md ルール9）。
     ``action_stale_after_ms`` は Telemetry の ``stale_after_ms`` と共用しない。
+
+    ``anchor_stride_ms`` は anchor の候補を選ぶ格子の間隔（決定記録 0181 §2.1）。1 s の tick を
+    すべて anchor にすると隣り合う example が window のほとんどを共有し、件数のわりに情報が
+    増えない。既定値を持たないので、欄の無い古い呼び出しは黙って全 tick にならず拒否される。
     """
 
     window_ms: int = Field(gt=0)
@@ -579,6 +583,7 @@ class DatasetSpecV2(_Frozen):
     action_step_ms: int = Field(gt=0)
     action_steps: int = Field(gt=0)
     action_stale_after_ms: int = Field(gt=0)
+    anchor_stride_ms: int = Field(gt=0)
 
     @model_validator(mode="after")
     def _validate_shape(self) -> Self:
