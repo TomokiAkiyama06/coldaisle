@@ -400,6 +400,11 @@ def test_fand_stops_every_process_before_the_handoff():
 
 
 def test_fand_never_gives_up_restarting():
+    """`config_invalid` の Max の再主張は、この再起動の輪が担う（決定記録 0180 §2.4）。
+
+    `StartLimitIntervalSec=0` を外すと既定の上限（10 秒に 5 回）で輪が止まり、外から
+    `pwmN_enable` を戻されたときに Max へ書き直されなくなる。
+    """
     unit = fand()
     assert one(unit, "Service", "Restart") == "always"
     assert one(unit, "Unit", "StartLimitIntervalSec") == "0"
@@ -407,7 +412,10 @@ def test_fand_never_gives_up_restarting():
 
 
 def test_fand_prevents_restart_only_for_the_permanent_exit_codes():
-    """**ちょうど {3, 4}。** 1 を入れると未捕捉の例外の後に再起動しない（0080 §2.4）。"""
+    """**ちょうど {3, 4}。** 1 を入れると未捕捉の例外の後に再起動しない（0080 §2.4）。
+
+    `config_invalid` も終了コード 1 で、再起動の輪で Max を書き直す（0180 §2.2 / §2.4）。
+    """
     assert set(words(fand(), "Service", "RestartPreventExitStatus")) == {"3", "4"}
     assert len(words(fand(), "Service", "RestartPreventExitStatus")) == 2
 

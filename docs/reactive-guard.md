@@ -50,8 +50,14 @@ Control loop（`coldaisle-fand`）は `events` を1件ずつ構造化ログ（`r
 
 `floor` / `hold_ms` と各 trigger の通常・Degraded の発火/解除閾値は、すべて
 `ConfigValue` として `status: provisional | confirmed` を持つ。実運用用の3つの Control
-Config はリポジトリに置いていない。#50 / #75 の実測が終わるまでは値を `confirmed` に
-せず、値の確定・緩和には決定記録 0028 §2.9 の所有者承認が必要である。
+Config はリポジトリに置いていない。値の確定・緩和には決定記録 0028 §2.9 の所有者承認が必要である。
+
+最初の導入先の値は、2500 ms ごとの実測の上昇の速さの p99 付近から決め、所有者が承認した
+（決定記録 0119 §2.14、2026-10-11）。#75 の測定は行わないことになった（0174）ので、
+これをもって「実測から確定済み」とする（0180 §2.5）。導入先の `fan-policy.yaml` の `status` は
+`provisional` のまま残っており、起動ログの `provisional_values` に出るが、Guard の動作には効かない。
+`confirmed` への書き換えは、`fan-policy.yaml` のほかの値と合わせて Authority を上げる前に行う
+（0119 §5 の 3 / 0028 の承認点 5）。
 
 CPU package power の metric 名は、#65 の PR #128 で提案中の決定記録 0032
 （内部Telemetryのメトリクス名。未マージ）が `power.cpu.package` を案として挙げている
