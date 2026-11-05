@@ -3,6 +3,7 @@
 - **種別**: Decision Record
 - **Status**: FINAL（2026-09-19、PR #143 のマージ）
 - **Date**: 2026-09-18
+- **Superseded by**: [0181](0181-dataset-anchor-stride-and-training-limits.md)（baseline trainer の cells と ridge の演算量の上限の値だけ。構造上限と他の節は有効）
 - **Supersedes**: なし
 - **関連**: [`0027-fan-control-architecture.md`](0027-fan-control-architecture.md) /
   [`0028-fan-control-contracts.md`](0028-fan-control-contracts.md) /
