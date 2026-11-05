@@ -1185,6 +1185,8 @@ def test_training_limits_are_the_values_of_decision_0181():
     assert training_module.MAX_DATASET_TARGET_CELLS == 50_000_000
     assert training_module.MAX_RIDGE_WORK_UNITS == 20_000_000_000
     assert training_module.MAX_DATASET_EXAMPLES_BYTES == 1024**3
+    # 文字列の合計は examples.jsonl の一部なので、同じ上限にそろえる
+    assert training_module.MAX_DATASET_TEXT_BYTES == training_module.MAX_DATASET_EXAMPLES_BYTES
     assert training_module.MAX_TRAIN_EXAMPLES == 100_000
     assert training_module.MAX_DATASET_EXAMPLES == 100_000
 

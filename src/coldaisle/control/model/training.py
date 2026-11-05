@@ -66,7 +66,9 @@ MAX_SOURCE_REFS_PER_RUN = 256
 MAX_DATASET_METADATA_ITEMS = 1_000_000
 MAX_METADATA_ITEMS_PER_EXAMPLE = 256
 MAX_METADATA_TEXT_LENGTH = 500
-MAX_DATASET_TEXT_BYTES = 8 * 1024 * 1024
+MAX_DATASET_TEXT_BYTES = 1024**3
+"""全 example（と split）の metric 名・ID・理由の文字列の合計。数える文字列は ``examples.jsonl`` の
+中身の一部なので ``MAX_DATASET_EXAMPLES_BYTES`` と同じにする（0181 §2.2。レビューで足した）。"""
 MAX_RIDGE_WORK_UNITS = 20_000_000_000
 """出力 × (件数 × 列² + 列³)。純粋な Python の ridge で約 10 分（3.5 × 10⁷ 単位/秒。0181 §2.2）。"""
 MAX_DATASET_MANIFEST_BYTES = 8 * 1024 * 1024
