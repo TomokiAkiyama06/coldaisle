@@ -3,6 +3,7 @@
 - **種別**: Decision Record
 - **Status**: FINAL（2026-10-01、リポジトリ所有者が承認）
 - **Date**: 2026-10-01
+- **Superseded by**: [0181](0181-dataset-anchor-stride-and-training-limits.md)（anchor にできる ControlTick をすべて anchor にする部分だけ。v2 の spec の欄 `anchor_stride_ms` で間引く。他の節は有効）
 - **Supersedes**: [0079](0079-model-artifact-formats.md) の次の部分だけを置き換える。0079 の他の点は有効。
   - §2.9 の段 1 の行のうち、action 列の範囲を「anchor から `label_end_ms` まで」とする部分。本記録 §2.4 で
     格子 `[anchor, anchor + steps × step_ms)` に置き換える（v2 の `label_end_ms` は `anchor + 最大の horizon`。§2.4）

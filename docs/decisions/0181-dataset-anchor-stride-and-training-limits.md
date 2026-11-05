@@ -3,10 +3,13 @@
 - **種別**: Decision Record
 - **Status**: FINAL（2026-11-05、リポジトリ所有者の承認。§5 の 1〜3 はすべて推奨の案）
 - **Date**: 2026-11-05
-- **Supersedes**: なし（[`0087`](0087-dataset-v2-action-grid.md) の「anchor にできる tick はすべて anchor にする」を、v2 の spec の
-  欄で間引けるようにする。0087 の格子・鮮度・除外の規則は変えない。[`0150`](0150-train-cli.md) の学習の入口の上限の値を変える。
-  どちらも採用されたら旧記録に `Superseded by` を追記する）
-- **関連**: [`0031`](0031-thermal-dataset-contract.md) §5 の 1 / [`0079`](0079-model-artifact-formats.md) /
+- **Supersedes**: 次の部分だけを置き換える。他の点は有効。
+  - [`0087`](0087-dataset-v2-action-grid.md) のうち、Dataset v2 で anchor にできる ControlTick を**すべて** anchor にする部分（0031 §2.1 の
+    「1つの ControlTick を基点とする」を v2 で受け継いだもの）。v2 の spec の欄 `anchor_stride_ms` で間引く（§2.1）。0087 の格子・鮮度・除外の規則は変えない
+  - [`0048`](0048-thermal-model-artifact-and-inference.md) の baseline trainer の上限のうち、train / dataset / split の cells（各 1,000,000）と
+    ridge の演算量（50,000,000 work units）の値（§2.2）。あわせて、学習の入口（[`0150`](0150-train-cli.md) の実装）の
+    `examples.jsonl` の上限 256 MiB を変える。0048 の構造上限（artifact 8 MiB・列 512 ほか）は変えない
+- **関連**: [`0150`](0150-train-cli.md) / [`0031`](0031-thermal-dataset-contract.md) §5 の 1 / [`0079`](0079-model-artifact-formats.md) /
   [`0109`](0109-dataset-declared-changes-cli.md) / [`0172`](0172-thermal-offline-evaluation.md) / #416（PR #417）
 - **対象 Issue**: #83 / #84
 
