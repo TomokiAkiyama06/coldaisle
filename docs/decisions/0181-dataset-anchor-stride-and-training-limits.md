@@ -65,9 +65,11 @@ ridge は純粋な Python（`math.fsum` と掃き出し）で解く。この機�
 | 上限 | 今 | 新しい値 | 目安 |
 |---|---|---|---|
 | `MAX_DATASET_EXAMPLES_BYTES` | 256 MiB | 1 GiB | 30 s 間隔で 30 日分（約 86,000 件・約 1.1 GB）に近い |
+| `MAX_DATASET_TEXT_BYTES`（全 example の metric 名・ID・理由の文字列の合計） | 8 MiB | 1 GiB（`MAX_DATASET_EXAMPLES_BYTES` と同じ） | 数える文字列は `examples.jsonl` の中身の一部なので、`examples.jsonl` の上限を超えない。§2.3 の spec で 1 件 約 2.2 KB（window の 5 つの mapping × 7 frame × 3 metric の名前を数える）、6 日分で約 37 MB |
 | `MAX_TRAINING_CELLS` / `MAX_DATASET_FEATURE_CELLS` / `MAX_DATASET_TARGET_CELLS` | 1,000,000 | 50,000,000 | 50,000 件 × 1,000 列。float の tuple で数 GB |
 | `MAX_RIDGE_WORK_UNITS` | 5 × 10⁷ | 2 × 10¹⁰ | この機械で約 10 分（3.5 × 10⁷ 単位/秒の実測から） |
 
+- `MAX_DATASET_TEXT_BYTES` は初版の表に無く、PR #418 のレビュー（Codex）で §2.3 の試行が当たると分かって足した（所有者、2026-11-05）
 - 上限は**資源の安全弁**（巨大な入力で CPU とメモリを食い尽くさない）で、制御・安全の閾値ではないので、コードの定数のままにする
   （`config/` に出すと、設定の書き換えで弁を外せてしまう）
 - 学習の CLI は人が手で実行し、timer にしない（0150）。上限に当たったときの終了とログは今のまま
