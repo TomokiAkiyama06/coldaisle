@@ -55,7 +55,6 @@ from coldaisle.control.model.dataset import (
     ThermalDataset,
     ThermalDatasetV2,
     WindowFrame,
-    examples_jsonl_bytes,
     examples_sha256,
     reject_calibration_changes,
 )
@@ -218,23 +217,32 @@ class _RunTicks:
 
     def __init__(self, traces: tuple[SequencedControlTrace, ...]) -> None:
         self.traces = traces
-        self.ticks = tuple(_parse_tick(trace) for trace in traces)
+        # **全 tick を検証するが、解析したものは持たない**（#416）。1 tick の ControlTick と生の
+        # dict は合わせて約 60 KB で、1 s の tick の 1 日（86,400 tick）で 5 GB を超える。持つのは
+        # 判定に使う欄だけにし、example を作る anchor の tick は `parsed()` で解析し直す
+        effective: list[_ZoneDemands] = []
+        for trace in traces:
+            tick, _raw = _parse_tick(trace)
+            effective.append(
+                (
+                    tick.zones.front.demand.effective,
+                    tick.zones.rear.demand.effective,
+                    tick.zones.top.demand.effective,
+                )
+            )
+        self.effective: tuple[_ZoneDemands, ...] = tuple(effective)
         self.ts = tuple(trace.ts_ms for trace in traces)
         self.tick_ids = tuple(trace.tick_id for trace in traces)
-        self.effective: tuple[_ZoneDemands, ...] = tuple(
-            (
-                tick.zones.front.demand.effective,
-                tick.zones.rear.demand.effective,
-                tick.zones.top.demand.effective,
-            )
-            for tick, _raw in self.ticks
-        )
         if any(later <= earlier for earlier, later in zip(self.ts, self.ts[1:], strict=False)):
             # 黙って並べ替えない。壁時計が戻った run では「直近」が実行の順と一致しない
             raise ValueError(
                 "seq の順に並べた ControlTick の ts_ms が狭義単調増加でない run から"
                 " Dataset v2 は作らない"
             )
+
+    def parsed(self, index: int) -> tuple[ControlTick, dict[str, object]]:
+        """``index`` の tick を解析し直す（構築時の検証と同じ :func:`_parse_tick`）。"""
+        return _parse_tick(self.traces[index])
 
     def as_of(self, ts_ms: int) -> int:
         """``ts_ms`` 以前で直近の tick の位置。無ければ -1。"""
@@ -465,7 +473,7 @@ def _example_v2(
     spec: DatasetSpecV2,
     points: dict[str, SeriesIndex],
 ) -> DatasetExampleV2:
-    tick, raw = ticks.ticks[index]
+    tick, raw = ticks.parsed(index)
     history_start_ms = tick.ts_ms - spec.window_ms
     frame_times = range(history_start_ms, tick.ts_ms + 1, spec.sample_period_ms)
     window = tuple(_window_frame(ts_ms, spec=spec, points=points) for ts_ms in frame_times)
@@ -995,6 +1003,44 @@ def _cleanup_staging(root_fd: int, name: str, directory_fd: int) -> None:
     os.rmdir(name, dir_fd=root_fd)
 
 
+def _revalidated_payloads(dataset: ThermalDataset | ThermalDatasetV2) -> tuple[bytes, bytes]:
+    """書き出す bytes を作り、その bytes を検証し直す（v1 / v2 共通）。
+
+    ``model_copy(update=...)`` などで検証を迂回した instance も、書き出しの境界で拒否する。
+    **Dataset 全体の JSON を作って丸ごと検証し直さない**（#416）。全体の複製で example の分の
+    メモリが2倍になり、1 s の tick の 1 日（約 86,000 example）で 20 GB を超えた。代わりに
+
+    1. manifest と、書き出す ``examples.jsonl`` の行を1行ずつ、その bytes から検証し直す
+       （検証した instance は持たない）。書く bytes そのものが field の検証を通る
+    2. 検証し直した manifest と元の example で Dataset の検証（件数・ID・tick の照合・
+       ``examples_sha256``）を走らせる。example は 1 の bytes と同じ instance から作ったもの
+    """
+    if isinstance(dataset, ThermalDatasetV2):
+        manifest_v2 = DatasetManifestV2.model_validate_json(dataset.manifest.model_dump_json())
+        lines_v2 = [example.model_dump_json() for example in dataset.examples]
+        for line in lines_v2:
+            DatasetExampleV2.model_validate_json(line)
+        checked: ThermalDataset | ThermalDatasetV2 = ThermalDatasetV2.model_validate(
+            {"manifest": manifest_v2, "examples": dataset.examples}
+        )
+        payload = b"".join((line + "\n").encode() for line in lines_v2)
+        del lines_v2
+    else:
+        manifest_v1 = DatasetManifest.model_validate_json(dataset.manifest.model_dump_json())
+        lines_v1 = [example.model_dump_json() for example in dataset.examples]
+        for line in lines_v1:
+            DatasetExample.model_validate_json(line)
+        checked = ThermalDataset.model_validate(
+            {"manifest": manifest_v1, "examples": dataset.examples}
+        )
+        payload = b"".join((line + "\n").encode() for line in lines_v1)
+        del lines_v1
+    if hashlib.sha256(payload).hexdigest() != checked.manifest.examples_sha256:
+        raise ValueError("manifestのexamples_sha256が書き出すbytesと一致しない")
+    manifest_payload = (checked.manifest.model_dump_json(indent=2) + "\n").encode()
+    return payload, manifest_payload
+
+
 def write_dataset(
     dataset: ThermalDataset | ThermalDatasetV2,
     output_root: Path,
@@ -1009,14 +1055,7 @@ def write_dataset(
         raise ValueError("artifact_nameは公開用の dataset-<32 hex> aliasにする")
     # model_copy(update=...)等でvalidationを迂回したinstanceも書き出し境界で拒否する。
     # 版は入力の型で決め、v1 を v2 として（またはその逆に）読み替えない（0087 §2.8）
-    if isinstance(dataset, ThermalDatasetV2):
-        dataset = ThermalDatasetV2.model_validate_json(dataset.model_dump_json())
-    else:
-        dataset = ThermalDataset.model_validate_json(dataset.model_dump_json())
-    examples_payload = examples_jsonl_bytes(dataset.examples)
-    if hashlib.sha256(examples_payload).hexdigest() != dataset.manifest.examples_sha256:
-        raise ValueError("manifestのexamples_sha256が書き出すbytesと一致しない")
-    manifest_payload = (dataset.manifest.model_dump_json(indent=2) + "\n").encode()
+    examples_payload, manifest_payload = _revalidated_payloads(dataset)
 
     root_fd = open_output_root(output_root)
     lock_fd: int | None = None

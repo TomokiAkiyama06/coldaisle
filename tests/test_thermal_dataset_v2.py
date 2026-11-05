@@ -31,6 +31,7 @@ from coldaisle.control.model.dataset import (
     SourceRun,
     ThermalDataset,
     ThermalDatasetV2,
+    examples_jsonl_bytes,
     examples_sha256,
     split_temporally_v2,
 )
@@ -1115,6 +1116,31 @@ def test_same_db_and_spec_give_the_same_bytes(tmp_path, rules, clock):
         )
     )
     assert loaded == first
+
+
+def test_write_dataset_writes_the_same_bytes_as_the_whole_roundtrip(tmp_path, rules, clock):
+    """書き出しの再検証を1行ずつにしても、書く bytes は丸ごとの作り直しと同じ（#416）。"""
+    with run_store(tmp_path / "rt.db", rules, clock, ALIGNED, end_ms=7_501) as store:
+        dataset = build(store, end_ms=7_501)
+    manifest_path, examples_path = write_dataset(dataset, tmp_path / "out", ARTIFACT_ONE)
+    whole = ThermalDatasetV2.model_validate_json(dataset.model_dump_json())
+    assert examples_path.read_bytes() == examples_jsonl_bytes(whole.examples)
+    assert manifest_path.read_bytes() == (whole.manifest.model_dump_json(indent=2) + "\n").encode()
+
+
+def test_write_dataset_rejects_an_example_that_bypassed_field_validation(tmp_path, rules, clock):
+    """``model_copy`` で field の検証を迂回した example も、書き出しの境界で拒む（#416）。"""
+    with run_store(tmp_path / "fv.db", rules, clock, ALIGNED, end_ms=7_501) as store:
+        dataset = build(store, end_ms=7_501)
+    forged_example = dataset.examples[0].model_copy(update={"control_tick_id": -1})
+    examples = (forged_example, *dataset.examples[1:])
+    forged = ThermalDatasetV2.model_construct(
+        manifest=dataset.manifest.model_copy(update={"examples_sha256": examples_sha256(examples)}),
+        examples=examples,
+    )
+    with pytest.raises(ValidationError, match="control_tick_id"):
+        write_dataset(forged, tmp_path / "out", ARTIFACT_ONE)
+    assert not (tmp_path / "out" / ARTIFACT_ONE).exists()
 
 
 def test_manifest_without_exclusion_counts_is_not_a_type(build_ticks):
