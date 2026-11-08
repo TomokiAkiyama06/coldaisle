@@ -13,7 +13,7 @@ import os
 import re
 import sqlite3
 import time
-from collections.abc import Collection, Iterable, Iterator, Sequence
+from collections.abc import Callable, Collection, Iterable, Iterator, Sequence
 from contextlib import contextmanager
 from enum import StrEnum
 from pathlib import Path
@@ -502,6 +502,32 @@ class SqliteStore:
                     for trace in rows
                 ],
             )
+
+    @contextmanager
+    def control_trace_copy(self) -> Iterator[Callable[[SequencedControlTrace], None]]:
+        """:meth:`copy_control_traces` と同じ写し方を、全体を持たずに 1 行ずつ行う（#416）。
+
+        ブロックの間は 1 つの transaction を開いたままにし、渡された関数で 1 行ずつ書く。ブロックを
+        正常に抜けたら commit し、例外で抜けたら rollback する（途中まで写した trace を残さない）。
+        trace の無い DB にだけ写す。``seq`` は狭義に増える順で渡す（振り直さない。0112 §2.3）。
+        """
+        with self.transaction():
+            if self._conn.execute("SELECT 1 FROM control_traces LIMIT 1").fetchone() is not None:
+                raise ValueError("trace のある DB へは写さない（決定記録 0112 §2.3）")
+            last_seq = 0
+
+            def append(trace: SequencedControlTrace) -> None:
+                nonlocal last_seq
+                if trace.seq <= last_seq:
+                    raise ValueError("写す trace は seq の順に重複なく並べる")
+                self._conn.execute(
+                    "INSERT INTO control_traces (seq, ts_ms, tick_id, schema_version, trace_json) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    (trace.seq, trace.ts_ms, trace.tick_id, trace.schema_version, trace.trace_json),
+                )
+                last_seq = trace.seq
+
+            yield append
 
     def delete_control_traces_before(self, cutoff_ms: int) -> int:
         """保持期間を過ぎた decision trace を削除して行数を返す（決定記録 0030 §5 / 0071 §2.2a）。

@@ -20,7 +20,7 @@ from coldaisle.clock import SimulatedClock
 from coldaisle.control import ControlTraceLogger
 from coldaisle.control.model.dataset import DatasetSourceKind, SourceRun, ThermalDatasetV2
 from coldaisle.daemon import Daemon
-from coldaisle.dataset import ThermalDatasetV2Builder, write_dataset
+from coldaisle.dataset import ThermalDatasetV2Builder, production_trace_sink, write_dataset
 from coldaisle.ingest.calibration import Calibration
 from coldaisle.ingest.normalize import Normalizer
 from coldaisle.ingest.replay import ReplaySource, read_replay_export_inputs
@@ -146,7 +146,6 @@ def _build(out: Path, prod: Path, rules: QualityRules, dedicated: Path) -> Therm
     replay = ReplaySource(out, tz=UTC, timezone_explicit=False, bulk=True, dataset_provenance=True)
     inputs = read_replay_export_inputs(out)
     assert inputs.records is not None
-    production = read_training_production(prod, inputs.records, start_ms=T0, end_ms=T0 + END_MS + 1)
     with SqliteStore(dedicated, rules=rules, clock=replay.clock) as store:
         Daemon(
             source=replay,
@@ -155,7 +154,10 @@ def _build(out: Path, prod: Path, rules: QualityRules, dedicated: Path) -> Therm
             source_name="replay",
             dataset_run_alias=RUN_ALIAS,
         ).run()
-        store.copy_control_traces(production.traces)
+        with production_trace_sink(store) as sink:
+            production = read_training_production(
+                prod, inputs.records, start_ms=T0, end_ms=T0 + END_MS + 1, trace_sink=sink
+            )
         return ThermalDatasetV2Builder(store).build(
             source_run=SourceRun(
                 run_id=RUN_ALIAS,
