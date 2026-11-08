@@ -3,6 +3,7 @@
 - **種別**: Decision Record
 - **Status**: FINAL（2026-10-26、リポジトリ所有者の承認）
 - **Date**: 2026-10-26
+- **Superseded by**: [0183](0183-zone-step-excitation-for-thermal-model.md)（「#75 の測定は行わない」のうち、Thermal Model の学習データのために 0153 §2.5 の応答の行列の一部を 1 回行う点だけ。風量の特性・EFU を求めない点と #75 / #81・Air Balance の協調の扱いは有効）
 - **Supersedes**: [`0153`](0153-airflow-measurement-method.md) のうち「導入先で掃引と応答の行列を測り、結果を承認する」予定の部分（§2.7 の 3・4 と §2.12 の EFU の定義を待つ部分）のみ（測り方の定義と解析の道具 `coldaisle-airflow-characterization` は有効）/
   [`0078`](0078-air-balance-fallback-coordination.md) §2.11 の段 5〜7（校正済み `air-balance.yaml`・shadow → apply）を行う予定の部分のみ（協調の仕組み・検証・`uncalibrated` との組み合わせの拒否は有効）
 - **関連**: [`0073`](0073-air-balance-control-config-integration.md) / [`0078`](0078-air-balance-fallback-coordination.md) / [`0085`](0085-coordination-failure-bypasses-gate.md) /
