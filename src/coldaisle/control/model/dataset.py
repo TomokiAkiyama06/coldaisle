@@ -16,6 +16,7 @@ from typing import Annotated, Literal, Self
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from coldaisle.channels import METRIC_TO_CHANNEL
 from coldaisle.control.schema import (
     AuthorityStage,
     ControllerKind,
@@ -804,6 +805,17 @@ class ReplayBindingV2(_Frozen):
         return self
 
 
+def production_metrics_of(spec: DatasetSpecV2) -> tuple[str, ...]:
+    """spec の feature / target のうち、本番の DB から読む metric（名前の昇順。0184 §2.1）。
+
+    日次 CSV の列（0008 §2.8。``channels.py`` の表）にある metric は専用 DB（再生）から読み、
+    それ以外（内部 Telemetry）は本番の DB から読む。出どころは名前だけで決まる。
+    """
+    return tuple(
+        sorted({*spec.feature_metrics, *spec.target_metrics}.difference(METRIC_TO_CHANNEL))
+    )
+
+
 class DatasetManifestV2(_Frozen):
     """Dataset v2 の再生成条件と、action の規則で除いた件数。"""
 
@@ -822,6 +834,21 @@ class DatasetManifestV2(_Frozen):
     ``None`` は束縛の無い dataset（0100 の段 3 より前に作った、または照合していない run）。
     読み込みは拒否しないが、v2 の builder は書かずに作らず、学習の入口は拒否する。
     """
+    production_metrics: tuple[MetricName, ...] = ()
+    """本番の DB から読んだ metric（名前の昇順。0184 §2.2）。欄の無い古い manifest は空の列。
+
+    builder は :func:`production_metrics_of` の値を書く。読み込みでは昇順・重複なし・spec の
+    CSV に無い metric であることだけを確かめる（spec と一致するかは、学習の入口の作り直しの
+    bytes の照合が見る。手で組んだ manifest の試験の fixture を拒まないため）。"""
+
+    @model_validator(mode="after")
+    def _production_metrics_are_non_csv_spec_metrics(self) -> Self:
+        names = list(self.production_metrics)
+        if names != sorted(set(names)):
+            raise ValueError("production_metrics は重複の無い名前の昇順")
+        if not set(names) <= set(production_metrics_of(self.spec)):
+            raise ValueError("production_metrics に spec の CSV に無い metric 以外がある")
+        return self
 
     @model_validator(mode="after")
     def _one_binding_per_source_run(self) -> Self:

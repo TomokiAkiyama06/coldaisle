@@ -18,13 +18,18 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from coldaisle.csv_export_manifest import ExportRecord, export_binding_sha256
+from coldaisle.measurement import Quality, validate_metric
 from coldaisle.store.calibration_history import (
     CalibrationHistory,
     CalibrationHistoryError,
     read_calibration_history_with,
 )
 from coldaisle.store.csv_export import TABLE, read_csv_export
-from coldaisle.store.models import SequencedControlTrace
+from coldaisle.store.models import SequencedControlTrace, SeriesPoint
+
+
+class ProductionTelemetryError(ValueError):
+    """本番の DB の内部 Telemetry から Dataset v2 を作れない（決定記録 0184 §2.3）。"""
 
 
 class ExportBindingError(ValueError):
@@ -157,6 +162,8 @@ class TrainingProduction:
     """trace の削除の境界。これより前の ``ts_ms`` の行は消したことがある（0071 §2.2a）。"""
     legacy_through_seq: int
     """移行前の行の ``seq`` の上限（0087 §2.1）。"""
+    production_series: Mapping[str, tuple[SeriesPoint, ...]]
+    """``production_metrics`` の各 metric の run の期間の raw（時刻の昇順。決定記録 0184 §2.1）。"""
 
 
 def read_training_production(
@@ -166,6 +173,7 @@ def read_training_production(
     start_ms: int,
     end_ms: int,
     trace_sink: Callable[[SequencedControlTrace], None],
+    production_metrics: tuple[str, ...] = (),
 ) -> TrainingProduction:
     """学習の入口: 較正の記録・``csv_exports``・run の期間の trace を同じ read transaction で読む。
 
@@ -179,15 +187,35 @@ def read_training_production(
     （:func:`coldaisle.dataset.production_trace_sink`）。
     ``trace_sink`` は例外を投げないこと（投げると読み出しの失敗として扱われる）。写し先の失敗は
     写し先が覚えておき、読み出しの後で報告する。
+
+    ``production_metrics`` は日次 CSV に無い metric（内部 Telemetry）で、同じ read transaction で
+    run の期間の raw（``readings``）を読む（決定記録 0184 §2.1）。専用 DB へは写さない。期間の
+    先頭より前の raw が1行も無い metric は、保持期間で消えた（作り直せない）とみなして
+    :class:`ProductionTelemetryError` で拒否する（0184 §2.3）。
     """
     manifests = _require_manifests(records)
     if start_ms < 0 or end_ms <= start_ms:
         raise ValueError("run の期間が不正")
+    if list(production_metrics) != sorted(set(production_metrics)):
+        raise ValueError("production_metrics は重複の無い名前の昇順で渡す")
+    for metric in production_metrics:
+        validate_metric(metric)
 
     def read(
         conn: sqlite3.Connection,
-    ) -> tuple[dict[str, ExportRecord | None], int, bool, int | None, int]:
+    ) -> tuple[
+        dict[str, ExportRecord | None],
+        int,
+        bool,
+        int | None,
+        int,
+        dict[str, tuple[SeriesPoint, ...]],
+    ]:
         rows = _read_rows(conn, (record.export_id for record in manifests))
+        series = {
+            metric: _read_production_series(conn, metric, start_ms=start_ms, end_ms=end_ms)
+            for metric in production_metrics
+        }
         prune = conn.execute(
             "SELECT pruned_before_ms, legacy_through_seq FROM control_trace_prune"
         ).fetchone()
@@ -211,13 +239,14 @@ def read_training_production(
             count += 1
             legacy = legacy or trace.seq <= legacy_through
             trace_sink(trace)
-        return rows, count, legacy, None if prune[0] is None else int(prune[0]), legacy_through
+        pruned = None if prune[0] is None else int(prune[0])
+        return rows, count, legacy, pruned, legacy_through, series
 
     try:
-        history, (rows, trace_count, has_legacy, pruned_before_ms, legacy_through_seq) = (
+        history, (rows, trace_count, has_legacy, pruned_before_ms, legacy_through_seq, series) = (
             read_calibration_history_with(path, read)
         )
-    except (CalibrationHistoryError, ExportBindingError):
+    except (CalibrationHistoryError, ExportBindingError, ProductionTelemetryError):
         raise
     except ValueError as error:
         raise ExportBindingError(f"本番の DB の行を読めない: {error}") from error
@@ -229,4 +258,28 @@ def read_training_production(
         has_legacy_traces=has_legacy,
         pruned_before_ms=pruned_before_ms,
         legacy_through_seq=legacy_through_seq,
+        production_series=series,
+    )
+
+
+def _read_production_series(
+    conn: sqlite3.Connection, metric: str, *, start_ms: int, end_ms: int
+) -> tuple[SeriesPoint, ...]:
+    # 期間の先頭より前に raw が1行も無ければ、保持期間（raw_days）で先頭が消えたか、まだ
+    # 記録していなかった。どちらでも作り直しの bytes が保てないので拒否する（決定記録 0184 §2.3）
+    before = conn.execute(
+        "SELECT 1 FROM readings WHERE metric = ? AND ts_ms < ? LIMIT 1", (metric, start_ms)
+    ).fetchone()
+    if before is None:
+        raise ProductionTelemetryError(
+            f"本番の DB に {metric} の期間の先頭より前の raw が無い"
+            "（保持期間で消えた期間からは作らない。決定記録 0184 §2.3）"
+        )
+    return tuple(
+        SeriesPoint(ts_ms=int(row[0]), value=row[1], quality=Quality(row[2]))
+        for row in conn.execute(
+            "SELECT ts_ms, value, quality FROM readings "
+            "WHERE metric = ? AND ts_ms >= ? AND ts_ms < ? ORDER BY ts_ms",
+            (metric, start_ms, end_ms),
+        )
     )

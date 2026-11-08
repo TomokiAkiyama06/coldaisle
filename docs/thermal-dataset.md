@@ -214,6 +214,16 @@ v1 との違い（規則の正本は [0087](decisions/0087-dataset-v2-action-gri
   [0150](decisions/0150-train-cli.md)）がこの検査と、返した記録での較正ファイルとの照合（`verify_training_calibration`）を
   必須の引数で続けて行う
 - `control_trace_sha256` は run の全 ControlTick を `seq` 付きで hash する（v2 は anchor 以外の tick も使うため）
+- **内部 Telemetry の feature / target**（決定記録 [0184](decisions/0184-dataset-internal-telemetry-from-production.md)）:
+  日次 CSV の列（0008 §2.8 の 7 列。`channels.py` の表）に無い metric（`power.gpu.0`・`power.cpu.package` ほか）は、
+  `--feature-metric` / `--target-metric` に書けば**本番の DB（`--calibration-history-db`）から**読む。どちらから読むかは
+  metric の名前だけで決まる。較正の記録・`csv_exports`・trace と同じ read transaction で run の期間の raw を読み、
+  専用 DB へは写さない（再生の後の readings の封印を変えない）。cell の作り方（as-of・鮮度・品質の mask）は `air.*` と
+  同じ。manifest の `production_metrics` に本番の DB から読んだ metric（名前の昇順。無ければ空の列）を書き、
+  `telemetry_sha256` はどちらの出どころの系列も含む。学習の入口も同じ read transaction で読み直すので、系列が 1 点でも
+  違えば作り直した bytes が合わず拒否される。**期間の先頭より前の raw が本番の DB に 1 行も無い metric は拒否する**
+  （raw の保持期間 `raw_days`・既定 30 日で消えた期間。作り直せないため）。運転では、fand の入力の契約に無い feature の
+  metric を持つ artifact を、Learned MPC worker が読み込みで止める（`feature_metric_not_in_snapshot`。0184 §2.4）
 
 ### v2 の CLI（決定記録 0109）
 
