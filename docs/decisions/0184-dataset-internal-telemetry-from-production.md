@@ -55,16 +55,18 @@ snapshot の signal から作るので、これらの metric を特徴量にし�
 
 ### 2.4 運転との対応
 
-- model の feature の metric が fand の入力の契約に無ければ、運転ではその cell が毎回欠測になる。**起動時の registry の束縛
-  （0098）で、artifact の feature の metric が入力の契約にすべて含まれることを確かめ、含まれなければその artifact を
-  Learned に使わない**（Fallback のまま運転する）。黙って欠測の入力で推論しない
+- model の feature の metric が fand の入力の契約に無ければ、運転ではその cell が毎回欠測になる。**黙って欠測の入力で推論しない**
+- この守りは既にある。Learned MPC worker は artifact を読み込むとき、feature の metric（と cost の温度）が最初の frame の
+  snapshot（= fand の入力の契約）にすべて含まれることを確かめ、欠ければ `feature_metric_not_in_snapshot` で止まる
+  （`learned_worker/mpc.py`。#86 / 0107）。fand は提案を受けず Fallback のまま運転する。本記録では新しい検査を足さず、
+  内部 Telemetry を feature にした artifact について、この検査を試験で確かめる（§2.5）
 
 ### 2.5 試験（すべて `-m "not hardware"`）
 
 - `air.*` は専用 DB から、内部 Telemetry は本番の DB から読み、どちらも同じ規則で cell になる
 - 本番の DB の系列が 1 点でも違えば、学習の入口で作り直した bytes が一致せず拒否される
 - 期間の先頭より前の raw が無い metric は拒否する
-- 入力の契約に無い feature の metric を持つ artifact は、起動時の束縛で Learned に使わない
+- 入力の契約に無い feature の metric を持つ artifact は、worker の読み込みで止まり Learned に使わない（既存の検査）。契約にある内部 Telemetry（電力）を feature にした artifact は読み込める
 - 内部 Telemetry を使わない spec では、今と同じ bytes（`production_metrics` が空の列）
 
 ## 3. Consequences
@@ -98,4 +100,4 @@ snapshot の signal から作るので、これらの metric を特徴量にし�
 |---|---|---|
 | 1 | 最初の試行で足す metric | **`power.gpu.0`・`power.cpu.package` に決定**。退けた案: 電力と温度（`gpu.0.core`・`cpu.package`）の 4 つ / 利用率（`gpu.0.utilization`）も |
 | 2 | raw が保持期間で消えたことの見分け方 | **期間の先頭より前の raw が本番の DB に 1 行も無い metric を拒否に決定**。退けた案: 保持期間の設定値と run の開始で判定 / 判定せず bytes の不一致に任せる |
-| 3 | 起動時の束縛で入力の契約を確かめる（§2.4）のを、本記録の実装に含めるか | **含めるに決定**（Learned を shadow にする前に要る）。退けた案: 別の PR にする |
+| 3 | 入力の契約を確かめる（§2.4）のを、本記録の実装に含めるか | **含めるに決定**（Learned を shadow にする前に要る）。退けた案: 別の PR にする。承認の後に、worker の読み込みに同じ検査が既にあると分かり、§2.4 を「既存の検査を試験で確かめる」に改めた |
