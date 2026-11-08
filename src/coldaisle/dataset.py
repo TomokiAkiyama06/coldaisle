@@ -17,7 +17,7 @@ import secrets
 import stat
 from bisect import bisect_left, bisect_right
 from collections import Counter
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
 from contextlib import suppress
 from enum import StrEnum
 from pathlib import Path
@@ -215,14 +215,40 @@ class _RunTicks:
     ``ts_ms`` の二分探索で「直近」を引ける（0087 §2.1）。
     """
 
-    def __init__(self, traces: tuple[SequencedControlTrace, ...]) -> None:
-        self.traces = traces
-        # **全 tick を検証するが、解析したものは持たない**（#416）。1 tick の ControlTick と生の
-        # dict は合わせて約 60 KB で、1 s の tick の 1 日（86,400 tick）で 5 GB を超える。持つのは
-        # 判定に使う欄だけにし、example を作る anchor の tick は `parsed()` で解析し直す
+    def __init__(
+        self,
+        store: SqliteStore,
+        traces: Iterable[SequencedControlTrace],
+        *,
+        legacy_through_seq: int,
+    ) -> None:
+        self._store = store
+        # **全 tick を検証するが、解析したものも trace の本文も持たない**（#416）。1 tick の
+        # ControlTick と生の dict は合わせて約 60 KB、本文の文字列は数 KB〜10 KB で、1 s の tick の
+        # 数日分では数 GB〜数十 GB になる。1 回の走査で検証・digest・判定に使う欄の抽出を済ませ、
+        # example を作る anchor の tick は `parsed()` で同じ snapshot から ``seq`` で引き直す
+        digest = hashlib.sha256()
         effective: list[_ZoneDemands] = []
+        seqs: list[int] = []
+        ts: list[int] = []
+        tick_ids: list[int] = []
+        legacy = False
+        parse_error: ValueError | None = None
         for trace in traces:
-            tick, _raw = _parse_tick(trace)
+            seqs.append(trace.seq)
+            ts.append(trace.ts_ms)
+            tick_ids.append(trace.tick_id)
+            if trace.seq <= legacy_through_seq:
+                legacy = True
+            if legacy or parse_error is not None:
+                # 拒否は決まっている。理由の優先（移行前 → 検証 → 単調）を変えないため、
+                # 走査は最後まで回すが解析はしない
+                continue
+            try:
+                tick, raw = _parse_tick(trace)
+            except ValueError as error:
+                parse_error = error
+                continue
             effective.append(
                 (
                     tick.zones.front.demand.effective,
@@ -230,9 +256,23 @@ class _RunTicks:
                     tick.zones.top.demand.effective,
                 )
             )
+            _update_digest(
+                digest, [trace.seq, trace.ts_ms, trace.tick_id, trace.schema_version, raw]
+            )
+        if legacy:
+            # 移行前の行の seq は記録した順を表さない（0007 が (ts_ms, tick_id) の順に振った）
+            raise ValueError("移行前の ControlTick を含む run から Dataset v2 は作らない")
+        if parse_error is not None:
+            raise parse_error
         self.effective: tuple[_ZoneDemands, ...] = tuple(effective)
-        self.ts = tuple(trace.ts_ms for trace in traces)
-        self.tick_ids = tuple(trace.tick_id for trace in traces)
+        self.seqs = tuple(seqs)
+        self.ts = tuple(ts)
+        self.tick_ids = tuple(tick_ids)
+        self.trace_sha256 = digest.hexdigest()
+        """run の全 tick の SHA-256（manifest の ``control_trace_sha256``）。
+
+        ``seq``・時刻・``tick_id``・版・本文を記録した順に hash する。
+        """
         if any(later <= earlier for earlier, later in zip(self.ts, self.ts[1:], strict=False)):
             # 黙って並べ替えない。壁時計が戻った run では「直近」が実行の順と一致しない
             raise ValueError(
@@ -241,8 +281,15 @@ class _RunTicks:
             )
 
     def parsed(self, index: int) -> tuple[ControlTick, dict[str, object]]:
-        """``index`` の tick を解析し直す（構築時の検証と同じ :func:`_parse_tick`）。"""
-        return _parse_tick(self.traces[index])
+        """``index`` の tick を同じ snapshot から引き直して解析する（:func:`_parse_tick`）。
+
+        走査の時と同じ行であることを ``seq``・``ts_ms``・``tick_id`` で確かめる（snapshot の外で
+        呼ばれた・行が変わった場合に、別の tick から example を作らない）。
+        """
+        trace = self._store.control_trace_by_seq(self.seqs[index])
+        if trace is None or (trace.ts_ms, trace.tick_id) != (self.ts[index], self.tick_ids[index]):
+            raise ValueError("走査の後に ControlTick の trace が変わった")
+        return _parse_tick(trace)
 
     def as_of(self, ts_ms: int) -> int:
         """``ts_ms`` 以前で直近の tick の位置。無ければ -1。"""
@@ -406,12 +453,14 @@ class ThermalDatasetV2Builder:
             _require_db_binding(
                 self._store, (export_binding.timezone, export_binding.export_binding_sha256)
             )
-            traces = self._store.control_traces_in_seq_order(source_run.start_ms, source_run.end_ms)
-            legacy_through_seq = self._store.control_trace_legacy_through_seq()
-            if any(trace.seq <= legacy_through_seq for trace in traces):
-                # 移行前の行の seq は記録した順を表さない（0007 が (ts_ms, tick_id) の順に振った）
-                raise ValueError("移行前の ControlTick を含む run から Dataset v2 は作らない")
-            ticks = _RunTicks(traces)
+            # trace は tuple にせず流す（#416）。移行前の行の拒否も _RunTicks の走査の中で行う
+            ticks = _RunTicks(
+                self._store,
+                self._store.iter_control_traces_in_seq_order(
+                    source_run.start_ms, source_run.end_ms
+                ),
+                legacy_through_seq=self._store.control_trace_legacy_through_seq(),
+            )
             earliest_action_ms = source_run.start_ms + spec.window_ms
             # 間引くのは anchor の候補だけ。prior_action・action の格子・as-of は全 tick から引く
             # （決定記録 0181 §2.1）
@@ -468,7 +517,7 @@ class ThermalDatasetV2Builder:
                 spec=spec,
                 source_runs=(source_run,),
                 telemetry_sha256=_telemetry_digest(metrics, points),
-                control_trace_sha256=_sequenced_trace_digest(traces),
+                control_trace_sha256=ticks.trace_sha256,
                 examples_sha256=examples_sha256(built),
                 example_count=len(built),
                 excluded=ActionExclusionCounts(
@@ -834,27 +883,6 @@ def _target_frame(
         quality=qualities,
         missing_mask=missing,
     )
-
-
-def _sequenced_trace_digest(traces: tuple[SequencedControlTrace, ...]) -> str:
-    """Dataset v2 の生成に読んだ ControlTick 全体（記録した順）の SHA-256。
-
-    v2 は anchor の tick だけでなく、prior_action・格子の as-of・連続と tick_id の検査に run の全
-    tick を使うので、run の全 tick を ``seq`` 付きで hash する。
-    """
-    digest = hashlib.sha256()
-    for trace in traces:
-        _update_digest(
-            digest,
-            [
-                trace.seq,
-                trace.ts_ms,
-                trace.tick_id,
-                trace.schema_version,
-                json.loads(trace.trace_json),
-            ],
-        )
-    return digest.hexdigest()
 
 
 def _target_frame_at_or_before(
@@ -1325,18 +1353,25 @@ def _main_v2(args: argparse.Namespace) -> int:
             extra={logs.FIELDS_KEY: {"reason": str(error)}},
         )
         return 1
-    history = production.history
+    # 本番の trace（数日分で数 GB）は専用 DB へ写したら手放す（#416）
+    history, production_binding, production_traces = (
+        production.history,
+        production.binding,
+        production.traces,
+    )
+    del production
     rules = QualityRules.from_yaml(args.quality_config)
     try:
         with SqliteStore(args.db, rules=rules, clock=WallClock()) as store:
             # ControlTick の出どころは本番の DB の trace（決定記録 0116 §2.1）
-            copy_or_match_production_traces(store, production.traces)
+            copy_or_match_production_traces(store, production_traces)
+            del production_traces
             dataset = ThermalDatasetV2Builder(store).build(
                 source_run=source_run,
                 spec=spec,
                 declared_changes=declared.changes,
                 calibration_history=history,
-                export_binding=production.binding,
+                export_binding=production_binding,
             )
     except ValueError as error:
         LOGGER.error(

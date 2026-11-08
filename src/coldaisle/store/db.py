@@ -861,6 +861,32 @@ class SqliteStore:
         ).fetchall()
         return tuple(_sequenced_trace(row) for row in rows)
 
+    def iter_control_traces_in_seq_order(
+        self, start_ms: int, end_ms: int
+    ) -> Iterator[SequencedControlTrace]:
+        """:meth:`control_traces_in_seq_order` と同じ行を、全体を持たずに 1 行ずつ返す（#416）。
+
+        数日分の trace（1 s の tick で 1 日 86,400 行・1 行 数 KB）を tuple にすると、文字列だけで
+        数 GB になる。走査の間に同じ接続で書かないこと。1 つの時点で読むには
+        :meth:`read_snapshot` の中で最後まで回す。
+        """
+        if start_ms < 0 or end_ms < start_ms:
+            raise ValueError("control traceの期間が不正")
+        cursor = self._conn.execute(
+            f"SELECT {_SEQUENCED_TRACE_COLUMNS} FROM control_traces "
+            "WHERE ts_ms >= ? AND ts_ms < ? ORDER BY seq",
+            (start_ms, end_ms),
+        )
+        for row in cursor:
+            yield _sequenced_trace(row)
+
+    def control_trace_by_seq(self, seq: int) -> SequencedControlTrace | None:
+        """``seq`` の trace を 1 行読む。無ければ ``None``。"""
+        row = self._conn.execute(
+            f"SELECT {_SEQUENCED_TRACE_COLUMNS} FROM control_traces WHERE seq = ?", (seq,)
+        ).fetchone()
+        return None if row is None else _sequenced_trace(row)
+
     def latest_control_trace(self) -> SequencedControlTrace | None:
         """最後に記録した trace（``seq`` が最大の行。決定記録 0071 §2.2）。
 

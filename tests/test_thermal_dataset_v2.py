@@ -43,6 +43,8 @@ from coldaisle.dataset import (
     ThermalDatasetBuilder,
     ThermalDatasetV2Builder,
     _anchor_candidates,
+    _RunTicks,
+    _update_digest,
     write_dataset,
 )
 from coldaisle.store import Quality, QualityRules, Reading, Sample, SqliteStore, migrations
@@ -737,6 +739,56 @@ def test_runs_with_pre_migration_rows_are_refused(tmp_path, rules, clock):
         store.connection.execute("UPDATE control_trace_prune SET legacy_through_seq = 1")
         with pytest.raises(ValueError, match="移行前"):
             build(store, end_ms=7_501)
+
+
+def test_pre_migration_refusal_wins_over_an_earlier_invalid_trace(tmp_path, rules, clock):
+    """trace を流して検証しても、拒否の理由の優先（移行前 → 検証）は前と同じ（#416）。"""
+    with run_store(tmp_path / "order.db", rules, clock, ALIGNED, end_ms=7_501) as store:
+        last = store.connection.execute("SELECT MAX(seq) FROM control_traces").fetchone()[0]
+        store.connection.execute("UPDATE control_traces SET trace_json = '{}' WHERE seq = 1")
+        store.connection.execute("UPDATE control_trace_prune SET legacy_through_seq = ?", (last,))
+        with pytest.raises(ValueError, match="移行前"):
+            build(store, end_ms=7_501)
+
+
+def test_invalid_trace_is_refused(tmp_path, rules, clock):
+    with run_store(tmp_path / "invalid.db", rules, clock, ALIGNED, end_ms=7_501) as store:
+        store.connection.execute("UPDATE control_traces SET trace_json = '{}' WHERE seq = 2")
+        with pytest.raises(ValueError, match="検証できない"):
+            build(store, end_ms=7_501)
+
+
+def test_control_trace_digest_covers_every_tick_in_seq_order(tmp_path, rules, clock):
+    """流して作る ``control_trace_sha256`` は、全 tick を記録した順に hash した値（#416）。"""
+    with run_store(tmp_path / "digest.db", rules, clock, ALIGNED, end_ms=7_501) as store:
+        dataset = build(store, end_ms=7_501)
+        digest = hashlib.sha256()
+        for trace in store.control_traces_in_seq_order(0, 2**62):
+            _update_digest(
+                digest,
+                [
+                    trace.seq,
+                    trace.ts_ms,
+                    trace.tick_id,
+                    trace.schema_version,
+                    json.loads(trace.trace_json),
+                ],
+            )
+    assert dataset.manifest.control_trace_sha256 == digest.hexdigest()
+
+
+def test_anchor_tick_is_looked_up_again_by_seq_and_checked(tmp_path, rules, clock):
+    """anchor の tick は ``seq`` で引き直し、走査の時と違う行なら example を作らない（#416）。"""
+    with run_store(tmp_path / "lookup.db", rules, clock, ALIGNED, end_ms=7_501) as store:
+        ticks = _RunTicks(
+            store,
+            store.iter_control_traces_in_seq_order(0, 2**62),
+            legacy_through_seq=0,
+        )
+        assert ticks.parsed(1)[0].tick_id == ticks.tick_ids[1]
+        store.connection.execute("DELETE FROM control_traces WHERE seq = ?", (ticks.seqs[1],))
+        with pytest.raises(ValueError, match="走査の後"):
+            ticks.parsed(1)
 
 
 def test_new_db_whose_first_tick_equals_legacy_until_ms_is_not_refused(tmp_path, rules):
