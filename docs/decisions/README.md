@@ -249,3 +249,4 @@ docs/decisions/NNNN-<slug>.md      例: 0002-metric-naming.md
 | [0179](0179-stale-excluded-metrics.md) | 記録をやめた metric（`nvml.excluded_metrics`）の古い行で `/api/v1/health` が `stale` のままにならないよう、API の鮮度の判定から外す。保存した行は消さない。区分は O で、0178 の RSS の 24 時間の後に入れる（#404）。 |
 | [0180](0180-fand-issue-74-remaining-points.md) | #74 を閉じる前に残る判断。CALIBRATION の受理の取り下げ・終了コード 1 を分けない・D 状態の hang を既知の限界として閉じる・config_invalid の再主張は再起動の輪で担う・Guard の値は 0119 §2.14 で確定済みとする、と #74 を閉じる条件（#74）。 |
 | [0181](0181-dataset-anchor-stride-and-training-limits.md) | Thermal Dataset v2 の anchor を spec の必須の欄 `anchor_stride_ms` で間引き、学習の入口の資源の上限（Dataset 256 MiB・ridge の演算量ほか）を上げる。実データの 1 日で example 約 86,000 件・1.1 GB になり学習に入れなかった（#83 / #84）。 |
+| [0182](0182-dataset-in-step-action-mean.md) | Thermal Dataset v2 の step の値を区間の時間平均にし、区間の中の幅が spec の上限 `action_max_in_step_range` を超えたときだけ除く。fand の ramp で Fan が動いた区間が 0087 §2.3 でほとんど捨てられていた（負荷の試験の 90 分で 180 中 26。#83 / #84）。 | FINAL |
