@@ -30,7 +30,7 @@ from coldaisle.control.model.dataset import (
     examples_sha256,
 )
 from coldaisle.daemon import Daemon
-from coldaisle.dataset import ThermalDatasetV2Builder
+from coldaisle.dataset import ThermalDatasetV2Builder, production_trace_sink
 from coldaisle.ingest.calibration import Calibration
 from coldaisle.ingest.normalize import Normalizer
 from coldaisle.ingest.replay import ReplaySource, read_replay_export_inputs
@@ -91,12 +91,21 @@ def export_to(prod: Path, rules: QualityRules, out: Path) -> Path:
     return out
 
 
-def build_from(out: Path, prod: Path, rules: QualityRules, dedicated: Path) -> ThermalDatasetV2:
-    """元の入力を専用 DB へ再生し、本番の trace を写して Dataset v2 を作る（正当な経路）。"""
+def build_from(
+    out: Path,
+    prod: Path,
+    rules: QualityRules,
+    dedicated: Path,
+    *,
+    record_locally: bool = False,
+) -> ThermalDatasetV2:
+    """元の入力を専用 DB へ再生し、本番の trace を写して Dataset v2 を作る（正当な経路）。
+
+    ``record_locally`` では本番の trace を写さず、同じ tick を専用 DB で記録し直す（不正な経路）。
+    """
     replay = ReplaySource(out, tz=UTC, timezone_explicit=False, bulk=True, dataset_provenance=True)
     inputs = read_replay_export_inputs(out)
     assert inputs.records is not None
-    production = read_training_production(prod, inputs.records, start_ms=T0, end_ms=T0 + END_MS)
     with SqliteStore(dedicated, rules=rules, clock=replay.clock) as store:
         Daemon(
             source=replay,
@@ -105,7 +114,18 @@ def build_from(out: Path, prod: Path, rules: QualityRules, dedicated: Path) -> T
             source_name="replay",
             dataset_run_alias=RUN_ALIAS,
         ).run()
-        store.copy_control_traces(production.traces)
+        if record_locally:
+            logger = ControlTraceLogger(store)
+            for ts_ms, tick_id, demands in ALIGNED:
+                logger.record(tick(T0 + ts_ms, tick_id, demands))
+            production = read_training_production(
+                prod, inputs.records, start_ms=T0, end_ms=T0 + END_MS, trace_sink=lambda _: None
+            )
+        else:
+            with production_trace_sink(store) as sink:
+                production = read_training_production(
+                    prod, inputs.records, start_ms=T0, end_ms=T0 + END_MS, trace_sink=sink
+                )
         return ThermalDatasetV2Builder(store).build(
             source_run=SourceRun(
                 run_id=RUN_ALIAS,
@@ -235,17 +255,7 @@ def test_a_dataset_whose_traces_were_not_copied_from_production_is_refused(tmp_p
     honest = build_from(out, prod, rules, tmp_path / "honest.db")
     verify(honest, prod, out, rules)
 
-    def record_locally(store: SqliteStore, _traces: object) -> None:
-        logger = ControlTraceLogger(store)
-        for ts_ms, tick_id, demands in ALIGNED:
-            logger.record(tick(T0 + ts_ms, tick_id, demands))
-
-    original = SqliteStore.copy_control_traces
-    SqliteStore.copy_control_traces = record_locally  # type: ignore[method-assign]
-    try:
-        local = build_from(out, prod, rules, tmp_path / "local.db")
-    finally:
-        SqliteStore.copy_control_traces = original  # type: ignore[method-assign]
+    local = build_from(out, prod, rules, tmp_path / "local.db", record_locally=True)
     assert local.examples == honest.examples, "試験の前提: example は同じで trace の seq だけが違う"
     with pytest.raises(TrainingDatasetRefused, match="作り直した dataset"):
         verify(local, prod, out, rules)

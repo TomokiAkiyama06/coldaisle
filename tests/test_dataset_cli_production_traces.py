@@ -17,7 +17,10 @@ import coldaisle.dataset as dataset_module
 from coldaisle.clock import SimulatedClock
 from coldaisle.control import ControlTraceLogger
 from coldaisle.control.model.dataset import ThermalDatasetV2
+from coldaisle.ingest.replay import read_replay_export_inputs
 from coldaisle.store import QualityRules, SqliteStore
+from coldaisle.store.export_binding import read_training_production
+from coldaisle.store.models import SequencedControlTrace
 from coldaisle.training_entry import verify_training_dataset_v2
 from conftest import CALIBRATION_PATH, QUALITY_RULES_PATH
 from test_dataset_cli_v2 import ARTIFACT_ONE, log_lines, v2_args
@@ -158,3 +161,77 @@ def test_a_period_with_legacy_production_traces_is_refused(env, rules):
         store.connection.execute("UPDATE control_trace_prune SET legacy_through_seq = 1")
     assert dataset_module.main(v2_args(env)) == 1
     assert traces_of(env["db"], rules) == ()
+
+
+# ---------------------------------------------------------------- #416 trace を持たずに写す
+
+
+def test_extra_traces_in_the_dedicated_db_refuse_generation(env, rules, capsys):
+    """本番の trace に一致する行の後に専用 DB だけの行が余っても作らない（0116 §2.2 の 1）。"""
+    production = traces_of(env["history"], rules)
+    with SqliteStore(env["db"], rules=rules, clock=SimulatedClock(0)) as store:
+        store.copy_control_traces(production)
+        ControlTraceLogger(store).record(tick(T0 + 7_900, 99, (0.1, 0.1, 0.1)))
+    before = traces_of(env["db"], rules)
+    assert len(before) == len(production) + 1
+    assert dataset_module.main(v2_args(env)) == 1
+    refused = [line for line in log_lines(capsys.readouterr().err) if line.get("level") == "error"]
+    assert refused and "一致しない" in str(refused[0]["reason"])
+    assert traces_of(env["db"], rules) == before
+    assert not (env["out"] / ARTIFACT_ONE).exists()
+
+
+def test_read_training_production_streams_traces_in_seq_order(env, rules):
+    """trace は持たずに記録した順で trace_sink へ渡し、件数と移行前の行の有無だけを残す。"""
+    received: list[SequencedControlTrace] = []
+    inputs = read_replay_export_inputs(env["replay"])
+    assert inputs.records is not None
+    production = read_training_production(
+        env["history"], inputs.records, start_ms=0, end_ms=ALL, trace_sink=received.append
+    )
+    assert tuple(received) == traces_of(env["history"], rules)
+    assert production.trace_count == len(received)
+    assert production.has_legacy_traces is False
+    assert not hasattr(production, "traces")
+
+
+def test_streaming_copy_writes_in_one_transaction(tmp_path, rules):
+    source = traces_of_store(tmp_path / "source.db", rules)
+    with SqliteStore(tmp_path / "copy.db", rules=rules, clock=SimulatedClock(0)) as store:
+        with store.control_trace_copy() as append:
+            for trace in source:
+                append(trace)
+        assert store.control_traces_in_seq_order(0, ALL) == source
+
+
+def test_streaming_copy_rolls_back_when_the_block_fails(tmp_path, rules):
+    """ブロックが例外で抜けたら、途中まで写した trace を残さない（#416）。"""
+    source = traces_of_store(tmp_path / "source.db", rules)
+    with SqliteStore(tmp_path / "copy.db", rules=rules, clock=SimulatedClock(0)) as store:
+        with pytest.raises(RuntimeError, match="拒否"), store.control_trace_copy() as append:
+            append(source[0])
+            raise RuntimeError("検査で拒否")
+        assert store.control_traces_in_seq_order(0, ALL) == ()
+
+
+def test_streaming_copy_refuses_out_of_order_seq_and_a_db_with_traces(tmp_path, rules):
+    source = traces_of_store(tmp_path / "source.db", rules)
+    with SqliteStore(tmp_path / "copy.db", rules=rules, clock=SimulatedClock(0)) as store:
+        with pytest.raises(ValueError, match="seq の順"), store.control_trace_copy() as append:
+            append(source[1])
+            append(source[0])
+        assert store.control_traces_in_seq_order(0, ALL) == ()
+        store.copy_control_traces(source)
+        with pytest.raises(ValueError, match="trace のある DB"), store.control_trace_copy():
+            pass
+
+
+def traces_of_store(path: Path, rules: QualityRules) -> tuple[SequencedControlTrace, ...]:
+    """seq が 1 から並ぶ 3 件の trace を記録した DB を作り、その trace を返す。"""
+    with SqliteStore(path, rules=rules, clock=SimulatedClock(10**13)) as store:
+        logger = ControlTraceLogger(store)
+        for index in range(3):
+            logger.record(tick(T0 + 1_000 * index, 1 + index, (0.5, 0.5, 0.5)))
+        traces = store.control_traces_in_seq_order(0, ALL)
+    assert len(traces) == 3
+    return traces

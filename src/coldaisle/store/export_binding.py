@@ -13,7 +13,7 @@
 from __future__ import annotations
 
 import sqlite3
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -149,8 +149,10 @@ class TrainingProduction:
     binding: ExportBinding
     rows: Mapping[str, ExportRecord | None]
     """``csv_exports`` の行（入力の manifest の ``export_id`` ごと）。"""
-    traces: tuple[SequencedControlTrace, ...]
-    """run の期間 ``[start_ms, end_ms)`` の ControlTick の trace（記録した順）。"""
+    trace_count: int
+    """run の期間 ``[start_ms, end_ms)`` の trace の件数（``trace_sink`` へ渡した数）。"""
+    has_legacy_traces: bool
+    """その trace に移行前の行（``seq ≤ legacy_through_seq``）があったか（0087 §2.1）。"""
     pruned_before_ms: int | None
     """trace の削除の境界。これより前の ``ts_ms`` の行は消したことがある（0071 §2.2a）。"""
     legacy_through_seq: int
@@ -158,13 +160,25 @@ class TrainingProduction:
 
 
 def read_training_production(
-    path: Path, records: Iterable[ExportRecord], *, start_ms: int, end_ms: int
+    path: Path,
+    records: Iterable[ExportRecord],
+    *,
+    start_ms: int,
+    end_ms: int,
+    trace_sink: Callable[[SequencedControlTrace], None],
 ) -> TrainingProduction:
     """学習の入口: 較正の記録・``csv_exports``・run の期間の trace を同じ read transaction で読む。
 
     入力の manifest は :func:`read_production_records` と同じく全欄で照合する（0100 §2.6）。
     ControlTick の出どころは本番の DB の trace（決定記録 0112 §2.3）。削除の境界と移行前の
     境界も同じ transaction で読み、呼び出し側が「trace が消えた期間」を判定する。
+
+    trace は**持たずに** 1 行ずつ記録した順（``seq``）で ``trace_sink`` へ渡す（#416）。trace の
+    本文には日本語の reason が入り、Python の文字列では 1 件 約 11 KB になる。数日分を tuple で
+    持つと 6 GB を超えるため、同じ read transaction の中で専用 DB へ写す
+    （:func:`coldaisle.dataset.production_trace_sink`）。
+    ``trace_sink`` は例外を投げないこと（投げると読み出しの失敗として扱われる）。写し先の失敗は
+    写し先が覚えておき、読み出しの後で報告する。
     """
     manifests = _require_manifests(records)
     if start_ms < 0 or end_ms <= start_ms:
@@ -172,31 +186,35 @@ def read_training_production(
 
     def read(
         conn: sqlite3.Connection,
-    ) -> tuple[dict[str, ExportRecord | None], tuple[SequencedControlTrace, ...], int | None, int]:
+    ) -> tuple[dict[str, ExportRecord | None], int, bool, int | None, int]:
         rows = _read_rows(conn, (record.export_id for record in manifests))
-        traces = tuple(
-            SequencedControlTrace(
+        prune = conn.execute(
+            "SELECT pruned_before_ms, legacy_through_seq FROM control_trace_prune"
+        ).fetchone()
+        if prune is None:
+            raise ExportBindingError("本番の DB に control_trace_prune の行が無い")
+        legacy_through = int(prune[1])
+        count = 0
+        legacy = False
+        for row in conn.execute(
+            "SELECT seq, ts_ms, tick_id, schema_version, trace_json FROM control_traces "
+            "WHERE ts_ms >= ? AND ts_ms < ? ORDER BY seq",
+            (start_ms, end_ms),
+        ):
+            trace = SequencedControlTrace(
                 seq=int(row[0]),
                 ts_ms=int(row[1]),
                 tick_id=int(row[2]),
                 schema_version=int(row[3]),
                 trace_json=str(row[4]),
             )
-            for row in conn.execute(
-                "SELECT seq, ts_ms, tick_id, schema_version, trace_json FROM control_traces "
-                "WHERE ts_ms >= ? AND ts_ms < ? ORDER BY seq",
-                (start_ms, end_ms),
-            )
-        )
-        prune = conn.execute(
-            "SELECT pruned_before_ms, legacy_through_seq FROM control_trace_prune"
-        ).fetchone()
-        if prune is None:
-            raise ExportBindingError("本番の DB に control_trace_prune の行が無い")
-        return rows, traces, None if prune[0] is None else int(prune[0]), int(prune[1])
+            count += 1
+            legacy = legacy or trace.seq <= legacy_through
+            trace_sink(trace)
+        return rows, count, legacy, None if prune[0] is None else int(prune[0]), legacy_through
 
     try:
-        history, (rows, traces, pruned_before_ms, legacy_through_seq) = (
+        history, (rows, trace_count, has_legacy, pruned_before_ms, legacy_through_seq) = (
             read_calibration_history_with(path, read)
         )
     except (CalibrationHistoryError, ExportBindingError):
@@ -207,7 +225,8 @@ def read_training_production(
         history=history,
         binding=_bind(manifests, rows),
         rows=rows,
-        traces=traces,
+        trace_count=trace_count,
+        has_legacy_traces=has_legacy,
         pruned_before_ms=pruned_before_ms,
         legacy_through_seq=legacy_through_seq,
     )

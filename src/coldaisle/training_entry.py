@@ -33,7 +33,7 @@ from coldaisle.daemon import Daemon
 from coldaisle.dataset import (
     ThermalDatasetV2Builder,
     check_production_traces,
-    copy_or_match_production_traces,
+    production_trace_sink,
 )
 from coldaisle.ingest.calibration import Calibration
 from coldaisle.ingest.normalize import Normalizer
@@ -102,27 +102,6 @@ def verify_training_dataset_v2(
             "--replay-path の manifest から計算した束縛が ReplayBindingV2 と一致しない"
         )
 
-    # 0100 §2.6 / §2.8 と 0112 §2.3: 本番の DB を1つの read transaction で読む
-    production = read_training_production(
-        production_db, inputs.records, start_ms=run.start_ms, end_ms=run.end_ms
-    )
-    verify_training_export_binding(
-        dataset,
-        {export_id: production.rows.get(export_id) for export_id in training_export_ids(dataset)},
-    )
-    try:
-        check_production_traces(production, start_ms=run.start_ms)
-    except ValueError as error:
-        raise TrainingDatasetRefused(str(error)) from error
-    # 本番の trace（数日分で数 GB）は専用 DB へ写したら手放す（#416）。
-    # dataclass に持たせたままだと、作り直しの間ずっと残る
-    history, production_binding, production_traces = (
-        production.history,
-        production.binding,
-        production.traces,
-    )
-    del production
-
     # 0112 §2.3: 一時の専用 DB で作り直して公開物の bytes を比べる
     with tempfile.TemporaryDirectory(prefix="coldaisle-training-") as directory:
         replay = ReplaySource(
@@ -157,14 +136,36 @@ def verify_training_dataset_v2(
             ).run()
             if stats.dataset_incomplete:
                 raise TrainingDatasetRefused("元の入力を欠けなく再生できない")
-            copy_or_match_production_traces(store, production_traces)
-            del production_traces
+            # 0100 §2.6 / §2.8 と 0112 §2.3 の 2: 本番の DB を1つの read transaction で読み、
+            # trace は持たずにその中で一時の専用 DB へ写す（#416）。専用 DB の bind は空の DB を
+            # 求めるので、写すのは再生の後（0112 §2.3 の 1 → 2 の順）。ブロックの中の検査で
+            # 拒否すれば、写した trace は rollback される
+            with production_trace_sink(store) as sink:
+                production = read_training_production(
+                    production_db,
+                    inputs.records,
+                    start_ms=run.start_ms,
+                    end_ms=run.end_ms,
+                    trace_sink=sink,
+                )
+                verify_training_export_binding(
+                    dataset,
+                    {
+                        export_id: production.rows.get(export_id)
+                        for export_id in training_export_ids(dataset)
+                    },
+                )
+                try:
+                    check_production_traces(production, start_ms=run.start_ms)
+                except ValueError as error:
+                    raise TrainingDatasetRefused(str(error)) from error
+            history = production.history
             rebuilt = ThermalDatasetV2Builder(store).build(
                 source_run=run,
                 spec=dataset.manifest.spec,
                 declared_changes=declared_changes,
                 calibration_history=history,
-                export_binding=production_binding,
+                export_binding=production.binding,
             )
     if published_bytes(rebuilt) != published_bytes(dataset):
         raise TrainingDatasetRefused(

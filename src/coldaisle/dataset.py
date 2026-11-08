@@ -15,11 +15,12 @@ import math
 import os
 import re
 import secrets
+import sqlite3
 import stat
 from bisect import bisect_left, bisect_right
 from collections import Counter
-from collections.abc import Iterable, Sequence
-from contextlib import suppress
+from collections.abc import Callable, Iterable, Iterator, Sequence
+from contextlib import contextmanager, suppress
 from enum import StrEnum
 from pathlib import Path
 from typing import NamedTuple
@@ -724,38 +725,97 @@ _ALL_TRACES_END_MS = 2**62
 """専用 DB の全 trace を読むときの期間の上端（``ts_ms`` の上限ではなく、全体を指すための値）。"""
 
 
+class ProductionTracesRefused(ValueError):
+    """本番の DB の trace から作れない期間（保持期間で消えた・移行前の行。0112 §2.3 の 4）。"""
+
+
 def check_production_traces(production: TrainingProduction, *, start_ms: int) -> None:
     """本番の DB の trace から dataset を作れる期間か（決定記録 0112 §2.3 の 4 / 0116 §2.1）。
 
     trace が保持期間で消えた期間（削除の境界が run の開始より後）と、移行前の行を含む期間は
-    ``ValueError``。``coldaisle-dataset`` の v2 と学習の入口が同じ関数を使う（0116 §2.2 の 3）。
+    :class:`ProductionTracesRefused`。``coldaisle-dataset`` の v2 と学習の入口が同じ関数を使う
+    （0116 §2.2 の 3）。:func:`production_trace_sink` のブロックの中で呼べば、拒否したときに
+    写した trace は rollback される。
     """
     if production.pruned_before_ms is not None and production.pruned_before_ms > start_ms:
-        raise ValueError(
+        raise ProductionTracesRefused(
             "本番の DB の trace が run の期間で保持期間により消えている（決定記録 0112 §2.3 の 4）"
         )
-    if any(trace.seq <= production.legacy_through_seq for trace in production.traces):
-        raise ValueError("移行前の ControlTick を含む期間からは作らない（0087 §2.1）")
+    if production.has_legacy_traces:
+        raise ProductionTracesRefused("移行前の ControlTick を含む期間からは作らない（0087 §2.1）")
 
 
-def copy_or_match_production_traces(
-    store: SqliteStore, traces: tuple[SequencedControlTrace, ...]
-) -> None:
+_TRACE_MISMATCH = (
+    "専用 DB の ControlTick が本番の DB の trace と一致しない（決定記録 0116 §2.2 の 1）。"
+    "新しい専用 DB で再生し直す"
+)
+
+
+class _ProductionTraceSink:
+    """本番の DB の trace を 1 行ずつ受け取り、専用 DB へ写すか、既にある trace と突き合わせる。
+
+    本番の DB の読み出しの最中に呼ばれるので、例外を投げない。最初の失敗だけを覚えておき、
+    :meth:`finish` で報告する（読み出しの失敗と取り違えないため）。
+    """
+
+    def __init__(
+        self,
+        *,
+        append: Callable[[SequencedControlTrace], None] | None = None,
+        existing: Iterator[SequencedControlTrace] | None = None,
+    ) -> None:
+        self._append = append
+        self._existing = existing
+        self._error: Exception | None = None
+
+    def __call__(self, trace: SequencedControlTrace) -> None:
+        if self._error is not None:
+            return
+        try:
+            if self._append is not None:
+                self._append(trace)
+            elif self._existing is not None and next(self._existing, None) != trace:
+                self._error = ValueError(_TRACE_MISMATCH)
+        except (ValueError, sqlite3.Error) as error:
+            self._error = error
+
+    def finish(self) -> None:
+        """覚えておいた失敗を投げる。突き合わせでは、専用 DB に余った trace も不一致とする。"""
+        if self._error is not None:
+            raise self._error
+        if self._existing is not None and next(self._existing, None) is not None:
+            raise ValueError(_TRACE_MISMATCH)
+
+
+@contextmanager
+def production_trace_sink(
+    store: SqliteStore,
+) -> Iterator[Callable[[SequencedControlTrace], None]]:
     """専用 DB の ControlTick を本番の DB の trace にそろえる（決定記録 0116 §2.1 / §2.2 の 1）。
 
-    trace の無い専用 DB へは ``seq`` を保って写す。既に trace があれば、全 trace が本番の trace と
-    ``seq``・時刻・``tick_id``・版・``trace_json`` と順序まで完全に一致するときだけそのまま使う。
-    1件でも違えば ``ValueError``（上書きも混ぜることもしない）。
+    返す関数を :func:`~coldaisle.store.export_binding.read_training_production` の
+    ``trace_sink`` に渡す。trace を持たずに、同じ read transaction の中で 1 行ずつ処理する（#416）。
+
+    - trace の無い専用 DB へは ``seq`` を保って写す。1 つの transaction で書き、ブロックを正常に
+      抜けたときだけ commit する。ブロックの中の検査（:func:`check_production_traces` など）で
+      拒否すれば rollback し、途中まで写した trace を残さない（0116 §2.2 の 2 の「すべて通った
+      後に写す」と同じ結果）
+    - 既に trace があれば、全 trace が本番の trace と ``seq``・時刻・``tick_id``・版・
+      ``trace_json`` と順序まで完全に一致するときだけそのまま使う。1 件でも違えば ``ValueError``
+      （上書きも混ぜることもしない）
     """
-    existing = store.control_traces_in_seq_order(0, _ALL_TRACES_END_MS)
-    if not existing:
-        store.copy_control_traces(traces)
+    if store.latest_control_trace() is None:
+        with store.control_trace_copy() as append:
+            sink = _ProductionTraceSink(append=append)
+            yield sink
+            sink.finish()
         return
-    if existing != traces:
-        raise ValueError(
-            "専用 DB の ControlTick が本番の DB の trace と一致しない（決定記録 0116 §2.2 の 1）。"
-            "新しい専用 DB で再生し直す"
+    with store.read_snapshot():
+        sink = _ProductionTraceSink(
+            existing=store.iter_control_traces_in_seq_order(0, _ALL_TRACES_END_MS)
         )
+        yield sink
+        sink.finish()
 
 
 def _validate_dedicated_source_db(store: SqliteStore, source_run: SourceRun) -> None:
@@ -1392,53 +1452,47 @@ def _main_v2(args: argparse.Namespace) -> int:
             "action_stale_after_ms": args.action_stale_after_ms,
         }
     )
-    try:
-        # 較正の記録・csv_exports の行・run の期間の trace を同じ read transaction で読む
-        # （決定記録 0100 §2.6 / 0116 §2.1）
-        production = read_training_production(
-            args.calibration_history_db,
-            inputs.records,
-            start_ms=source_run.start_ms,
-            end_ms=source_run.end_ms,
-        )
-        check_production_traces(production, start_ms=source_run.start_ms)
-    except CalibrationHistoryError as error:
-        LOGGER.error(
-            "較正の変更の記録を読めない（dataset を作らない）",
-            extra={logs.FIELDS_KEY: {"reason": str(error)}},
-        )
-        return 1
-    except ExportBindingError as error:
-        LOGGER.error(
-            "入力の export を本番の DB の csv_exports と照合できない（dataset を作らない）",
-            extra={logs.FIELDS_KEY: {"reason": str(error)}},
-        )
-        return 1
-    except ValueError as error:
-        LOGGER.error(
-            "本番の DB の trace から作れない期間（dataset を作らない）",
-            extra={logs.FIELDS_KEY: {"reason": str(error)}},
-        )
-        return 1
-    # 本番の trace（数日分で数 GB）は専用 DB へ写したら手放す（#416）
-    history, production_binding, production_traces = (
-        production.history,
-        production.binding,
-        production.traces,
-    )
-    del production
     rules = QualityRules.from_yaml(args.quality_config)
     try:
         with SqliteStore(args.db, rules=rules, clock=WallClock()) as store:
-            # ControlTick の出どころは本番の DB の trace（決定記録 0116 §2.1）
-            copy_or_match_production_traces(store, production_traces)
-            del production_traces
+            try:
+                # 較正の記録・csv_exports の行・run の期間の trace を同じ read transaction で読み、
+                # trace は持たずにその中で専用 DB へ写す（決定記録 0100 §2.6 / 0116 §2.1 / #416）。
+                # ブロックの中の検査で拒否すれば、写した trace は rollback される
+                with production_trace_sink(store) as sink:
+                    production = read_training_production(
+                        args.calibration_history_db,
+                        inputs.records,
+                        start_ms=source_run.start_ms,
+                        end_ms=source_run.end_ms,
+                        trace_sink=sink,
+                    )
+                    check_production_traces(production, start_ms=source_run.start_ms)
+            except CalibrationHistoryError as error:
+                LOGGER.error(
+                    "較正の変更の記録を読めない（dataset を作らない）",
+                    extra={logs.FIELDS_KEY: {"reason": str(error)}},
+                )
+                return 1
+            except ExportBindingError as error:
+                LOGGER.error(
+                    "入力の export を本番の DB の csv_exports と照合できない（dataset を作らない）",
+                    extra={logs.FIELDS_KEY: {"reason": str(error)}},
+                )
+                return 1
+            except ProductionTracesRefused as error:
+                LOGGER.error(
+                    "本番の DB の trace から作れない期間（dataset を作らない）",
+                    extra={logs.FIELDS_KEY: {"reason": str(error)}},
+                )
+                return 1
+            history = production.history
             dataset = ThermalDatasetV2Builder(store).build(
                 source_run=source_run,
                 spec=spec,
                 declared_changes=declared.changes,
                 calibration_history=history,
-                export_binding=production_binding,
+                export_binding=production.binding,
             )
     except ValueError as error:
         LOGGER.error(
