@@ -114,6 +114,14 @@ def verify_training_dataset_v2(
         check_production_traces(production, start_ms=run.start_ms)
     except ValueError as error:
         raise TrainingDatasetRefused(str(error)) from error
+    # 本番の trace（数日分で数 GB）は専用 DB へ写したら手放す（#416）。
+    # dataclass に持たせたままだと、作り直しの間ずっと残る
+    history, production_binding, production_traces = (
+        production.history,
+        production.binding,
+        production.traces,
+    )
+    del production
 
     # 0112 §2.3: 一時の専用 DB で作り直して公開物の bytes を比べる
     with tempfile.TemporaryDirectory(prefix="coldaisle-training-") as directory:
@@ -149,17 +157,18 @@ def verify_training_dataset_v2(
             ).run()
             if stats.dataset_incomplete:
                 raise TrainingDatasetRefused("元の入力を欠けなく再生できない")
-            copy_or_match_production_traces(store, production.traces)
+            copy_or_match_production_traces(store, production_traces)
+            del production_traces
             rebuilt = ThermalDatasetV2Builder(store).build(
                 source_run=run,
                 spec=dataset.manifest.spec,
                 declared_changes=declared_changes,
-                calibration_history=production.history,
-                export_binding=production.binding,
+                calibration_history=history,
+                export_binding=production_binding,
             )
     if published_bytes(rebuilt) != published_bytes(dataset):
         raise TrainingDatasetRefused(
             "元の入力と本番の trace から作り直した dataset が渡された dataset と一致しない"
             "（決定記録 0112 §2.3）"
         )
-    return production.history
+    return history
