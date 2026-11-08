@@ -22,6 +22,7 @@ from coldaisle.control.schema import (
     OperatingMode,
     PerZone,
     SafetyState,
+    Zone,
 )
 from coldaisle.csv_export_manifest import (
     EXPORT_ID_PATTERN,
@@ -557,6 +558,8 @@ def _split_by_time[E: (DatasetExample, DatasetExampleV2)](
 DATASET_V2_SCHEMA_VERSION: Literal[2] = 2
 """Thermal Dataset v2 の版。action 列（0087）を持つ。"""
 
+_ZONES: tuple[Zone, ...] = (Zone.FRONT, Zone.REAR, Zone.TOP)
+
 DemandValue = Annotated[float, Field(ge=0.0, le=1.0, allow_inf_nan=False)]
 
 
@@ -571,6 +574,10 @@ class DatasetSpecV2(_Frozen):
     ``anchor_stride_ms`` は anchor の候補を選ぶ格子の間隔（決定記録 0181 §2.1）。1 s の tick を
     すべて anchor にすると隣り合う example が window のほとんどを共有し、件数のわりに情報が
     増えない。既定値を持たないので、欄の無い古い呼び出しは黙って全 tick にならず拒否される。
+
+    ``action_max_in_step_range`` は step の区間の中の ``effective`` の幅（zone ごとの最大 − 最小）の
+    上限（決定記録 0182 §2.2）。どれか1つの zone・step で超えた example は作らない。``0`` で
+    0087 §2.3 と同じ example の集合になる。
     """
 
     window_ms: int = Field(gt=0)
@@ -584,6 +591,7 @@ class DatasetSpecV2(_Frozen):
     action_steps: int = Field(gt=0)
     action_stale_after_ms: int = Field(gt=0)
     anchor_stride_ms: int = Field(gt=0)
+    action_max_in_step_range: float = Field(ge=0.0, le=1.0, allow_inf_nan=False)
 
     @model_validator(mode="after")
     def _validate_shape(self) -> Self:
@@ -602,10 +610,14 @@ class ActionStepV2(_Frozen):
     """step ``k`` の action（0087 §2.1）。
 
     区間 ``[action_ts_ms + k × step_ms, action_ts_ms + (k + 1) × step_ms)`` に掛かっていた
-    effective demand。値は区間の開始時刻 ``ts_ms`` 以前で直近の ControlTick から取る（as-of）。
-    元にした tick の時刻と ``tick_id`` を step ごとに持つ（1つの tick が全 zone の値を持つ）。
-    ``ActionPlan.steps[k]``（``offset_ms = step_ms × (k + 1)`` は区間の終端）と
-    同じ区間である（0087 §2.5）。
+    effective demand。``effective_demand`` は区間の開始時刻 ``ts_ms`` 以前で直近の
+    ControlTick の値（as-of）で、元にした tick の時刻と ``tick_id`` を step ごとに持つ
+    （1つの tick が全 zone の値を持つ）。``ActionPlan.steps[k]``（``offset_ms = step_ms × (k + 1)``
+    は区間の終端）と同じ区間である（0087 §2.5）。
+
+    ``step_demand`` は step の action の値で、区間の中の ``effective`` の時間平均（tick と tick の
+    間は直前の値が掛かっていたとみなす。決定記録 0182 §2.1）。区間の中で値が変わらなければ
+    ``effective_demand`` と同じ値になる。学習・信頼度・評価が action として読むのはこちら。
     """
 
     step: int = Field(ge=0)
@@ -613,6 +625,7 @@ class ActionStepV2(_Frozen):
     source_ts_ms: int = Field(ge=0)
     source_tick_id: int = Field(ge=0)
     effective_demand: PerZone[DemandValue]
+    step_demand: PerZone[DemandValue]
 
     @model_validator(mode="after")
     def _source_is_as_of(self) -> Self:
@@ -646,7 +659,7 @@ class ActionExclusionCounts(_Frozen):
     discontinuity: int = Field(ge=0)
     """連続: 隣り合う tick・最後の tick から最大の horizon までの差が上限以上。run の末尾。"""
     in_step_change: int = Field(ge=0)
-    """区間内の変化: step の区間の中の tick の effective が1つの zone でも step の値と違う。"""
+    """区間内の変化: step の区間の中の effective の幅が1つの zone でも上限を超える（0182 §2.2）。"""
     restart: int = Field(ge=0)
     """再起動: ``seq`` の順に隣り合う tick の ``tick_id`` が減る、または同じ。"""
     tick_id_gap: int = Field(ge=0)
@@ -658,6 +671,9 @@ class DatasetExampleV2(_Frozen):
 
     ``action`` と ``context`` は v1 と同じく anchor の tick 自身のもので、分析用に持つ。
     v2 の anchor action は ``prior_action`` である（0087 §2.7）。
+
+    ``in_step_range`` は zone ごとの、全 step を通した区間の中の ``effective`` の幅の最大
+    （決定記録 0182 §2.3）。評価で幅ごとの誤差を見るために持つ。
     """
 
     schema_version: Literal[2] = DATASET_V2_SCHEMA_VERSION
@@ -673,6 +689,7 @@ class DatasetExampleV2(_Frozen):
     context: ActionContext
     prior_action: PriorAction
     action_steps: tuple[ActionStepV2, ...] = Field(min_length=1)
+    in_step_range: PerZone[DemandValue]
     targets: tuple[TargetFrame, ...] = Field(min_length=1)
 
     @model_validator(mode="after")
@@ -727,6 +744,16 @@ class DatasetExampleV2(_Frozen):
             )
             if seen != (step.source_tick_id, step.effective_demand):
                 raise ValueError("同じ元の tick を使う step の tick_id か値が食い違っている")
+        # 時間平均は区間の中の値の最小と最大の間にあり、開始の as-of の値もその中にある。
+        # したがって両者の差は区間の中の幅を超えない（0182 §2.1 / §2.3）
+        for step in self.action_steps:
+            for zone in _ZONES:
+                if abs(step.step_demand.get(zone) - step.effective_demand.get(zone)) > (
+                    self.in_step_range.get(zone)
+                ):
+                    raise ValueError(
+                        "step の時間平均と開始の as-of の値の差が区間の中の幅を超えている"
+                    )
         return self
 
 
@@ -876,6 +903,8 @@ def _check_action_steps(example: DatasetExampleV2, run: SourceRun, spec: Dataset
     """
     if len(example.action_steps) != spec.action_steps:
         raise ValueError("action 列の長さが action_steps と一致しない")
+    if any(example.in_step_range.get(zone) > spec.action_max_in_step_range for zone in _ZONES):
+        raise ValueError("区間の中の幅が action_max_in_step_range を超えている（0182 §2.2）")
     for step in example.action_steps:
         if step.ts_ms != example.action_ts_ms + step.step * spec.action_step_ms:
             raise ValueError("action 列の時刻が spec の格子と一致しない")

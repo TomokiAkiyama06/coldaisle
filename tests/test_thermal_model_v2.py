@@ -252,9 +252,11 @@ def example(anchor_tick: int) -> DatasetExampleV2:
                 source_ts_ms=anchor_ms + step * STEP_MS,
                 source_tick_id=anchor_tick + step,
                 effective_demand=demands(anchor_tick + step),
+                step_demand=demands(anchor_tick + step),
             )
             for step in range(STEPS)
         ),
+        in_step_range=PerZone(front=0.0, rear=0.0, top=0.0),
         targets=tuple(
             TargetFrame(
                 horizon_ms=horizon,
@@ -282,6 +284,7 @@ def dataset_spec() -> DatasetSpecV2:
         action_steps=STEPS,
         action_stale_after_ms=2_000,
         anchor_stride_ms=1,
+        action_max_in_step_range=0.0,
     )
 
 

@@ -500,9 +500,7 @@ def _action_support(
 
     0084 §2.2。
     """
-    sequences = tuple(
-        tuple(step.effective_demand for step in example.action_steps) for example in train
-    )
+    sequences = tuple(tuple(step.step_demand for step in example.action_steps) for example in train)
     if any(len(sequence) != steps for sequence in sequences):
         raise ValueError("train の action 列の長さが action schema の step 数と一致しない")
     anchors = tuple(example.prior_action.effective_demand for example in train)

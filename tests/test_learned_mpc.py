@@ -254,9 +254,11 @@ def _as_v2(item: DatasetExample, index: int) -> DatasetExampleV2:
                 source_ts_ms=item.action_ts_ms + step * STEP_MS,
                 source_tick_id=tick + step,
                 effective_demand=current,
+                step_demand=current,
             )
             for step in range(STEPS)
         ),
+        in_step_range=PerZone(front=0.0, rear=0.0, top=0.0),
         targets=item.targets,
     )
 
@@ -284,6 +286,7 @@ def thermal_dataset_v2(
                 action_steps=STEPS,
                 action_stale_after_ms=2_000,
                 anchor_stride_ms=1,
+                action_max_in_step_range=0.0,
             ),
             source_runs=data.manifest.source_runs,
             telemetry_sha256=data.manifest.telemetry_sha256,

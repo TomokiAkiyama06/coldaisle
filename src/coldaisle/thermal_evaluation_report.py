@@ -45,7 +45,12 @@ UNKNOWN_STRATUM = "unknown"
 """帯を決められなかった example の層。黙って落とさずにここへ入れる（0054 §2.8 と同じ）。"""
 
 StratumAxis = Literal[
-    "room_temperature", "workload", "action_change", "workload_regime", "action_support"
+    "room_temperature",
+    "workload",
+    "action_change",
+    "workload_regime",
+    "action_support",
+    "in_step_range",
 ]
 """層の軸。"""
 
@@ -54,12 +59,23 @@ AXIS_WORKLOAD: StratumAxis = "workload"
 AXIS_ACTION_CHANGE: StratumAxis = "action_change"
 AXIS_WORKLOAD_REGIME: StratumAxis = "workload_regime"
 AXIS_ACTION_SUPPORT: StratumAxis = "action_support"
+AXIS_IN_STEP_RANGE: StratumAxis = "in_step_range"
 
 GATING_AXES: tuple[StratumAxis, ...] = (AXIS_ROOM_TEMPERATURE, AXIS_WORKLOAD, AXIS_ACTION_CHANGE)
 """十分な件数があれば合否の条件にする層の軸（0172 §2.4 / §2.6）。"""
 
-REPORT_ONLY_AXES: tuple[StratumAxis, ...] = (AXIS_WORKLOAD_REGIME, AXIS_ACTION_SUPPORT)
-"""報告に載せるだけの層の軸（0172 §2.4 の ``workload_regime``・§5 の 5 の support の中の集計）。"""
+REPORT_ONLY_AXES: tuple[StratumAxis, ...] = (
+    AXIS_WORKLOAD_REGIME,
+    AXIS_ACTION_SUPPORT,
+    AXIS_IN_STEP_RANGE,
+)
+"""報告に載せるだけの層の軸（0172 §2.4 の ``workload_regime``・§5 の 5 の support の中の集計・
+決定記録 0182 §2.3 / §5 の 2 の区間の中の幅）。"""
+
+IN_STEP_RANGE_NONE = "none"
+"""全 zone・全 step で区間の中の ``effective`` が変わらなかった example の層（0182 §2.3）。"""
+IN_STEP_RANGE_VARIED = "varied"
+"""どれかの zone・step で区間の中の ``effective`` が動いた example の層（0182 §2.3）。"""
 
 GateStage = Literal["evidence", "underprediction", "skill"]
 """gate の段。"""

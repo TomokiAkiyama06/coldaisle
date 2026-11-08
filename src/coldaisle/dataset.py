@@ -11,6 +11,7 @@ import fcntl
 import hashlib
 import json
 import logging
+import math
 import os
 import re
 import secrets
@@ -21,6 +22,7 @@ from collections.abc import Iterable, Sequence
 from contextlib import suppress
 from enum import StrEnum
 from pathlib import Path
+from typing import NamedTuple
 
 from pydantic import ValidationError
 
@@ -296,12 +298,58 @@ class _RunTicks:
         return bisect_right(self.ts, ts_ms) - 1
 
 
+class _StepAction(NamedTuple):
+    """1つの step の action（0087 §2.1 の as-of と、0182 §2.1 / §2.2 の時間平均と幅）。"""
+
+    source: int
+    """区間の開始時刻の as-of の tick の位置。"""
+    mean: _ZoneDemands
+    """区間の中の ``effective`` の時間平均（zone ごと）。"""
+    spread: _ZoneDemands
+    """区間の中の ``effective`` の幅（最大 − 最小。開始の as-of の値を含む。zone ごと）。"""
+
+
+def _step_action(ticks: _RunTicks, source: int, start_ms: int, step_ms: int) -> _StepAction:
+    """区間 ``[start_ms, start_ms + step_ms)`` の時間平均と幅（決定記録 0182 §2.1 / §2.2）。
+
+    tick と tick の間は直前の tick の値が掛かっていたとみなす（区分的に一定）。区間の開始では
+    as-of の tick ``source`` の値が掛かっている。終端（次の step の開始時刻）の tick は区間に
+    入れない。
+    平均は ``math.fsum`` で足し、丸めで区間の値の範囲を出ないように最小と最大の間に収める。
+    """
+    end_ms = start_ms + step_ms
+    inside = range(bisect_left(ticks.ts, start_ms), bisect_left(ticks.ts, end_ms))
+    values = [ticks.effective[source]]
+    durations: list[int] = []
+    current_ms = start_ms
+    for position in inside:
+        durations.append(ticks.ts[position] - current_ms)
+        values.append(ticks.effective[position])
+        current_ms = ticks.ts[position]
+    durations.append(end_ms - current_ms)
+    means: list[float] = []
+    spreads: list[float] = []
+    for zone in range(3):
+        zone_values = [value[zone] for value in values]
+        low, high = min(zone_values), max(zone_values)
+        total = math.fsum(
+            value * duration for value, duration in zip(zone_values, durations, strict=True)
+        )
+        means.append(min(high, max(low, total / step_ms)))
+        spreads.append(high - low)
+    return _StepAction(
+        source=source,
+        mean=(means[0], means[1], means[2]),
+        spread=(spreads[0], spreads[1], spreads[2]),
+    )
+
+
 def _assess_anchor(
     ticks: _RunTicks, index: int, spec: DatasetSpecV2
-) -> tuple[ActionExclusionReason | None, tuple[int, ...]]:
-    """anchor ``index`` の example を作れるかを 0087 §2.2 / §2.3 / §2.7 の順で判定する。
+) -> tuple[ActionExclusionReason | None, tuple[_StepAction, ...]]:
+    """anchor ``index`` の example を作れるかを 0087 §2.2 / §2.7 と 0182 §2.2 の順で判定する。
 
-    作れるなら ``(None, step ごとの as-of の tick の位置)`` を返す。作れなければ、最初に当たった
+    作れるなら ``(None, step ごとの action)`` を返す。作れなければ、最初に当たった
     理由を返す（理由の順は :class:`ActionExclusionReason` の定義の順）。
     """
     stale_after = spec.action_stale_after_ms
@@ -333,14 +381,15 @@ def _assess_anchor(
     if horizon_end_ms - ticks.ts[last] >= stale_after or last + 1 >= len(ticks.ts):
         return ActionExclusionReason.DISCONTINUITY, ()
 
-    # 3. 区間内の変化: 区間 [開始, 終端) の中の tick の effective が step の値と違う。
-    #    終端（次の step の開始時刻）の tick は数えない
-    for step, source in enumerate(as_of):
-        start_ms = anchor_ms + step * step_ms
-        value = ticks.effective[source]
-        inside = range(bisect_left(ticks.ts, start_ms), bisect_left(ticks.ts, start_ms + step_ms))
-        if any(ticks.effective[position] != value for position in inside):
-            return ActionExclusionReason.IN_STEP_CHANGE, ()
+    # 3. 区間内の変化: 区間 [開始, 終端) の中の effective の幅が、どれか1つの zone で上限を超える
+    #    （0182 §2.2）。終端（次の step の開始時刻）の tick は数えない
+    actions = tuple(
+        _step_action(ticks, source, anchor_ms + step * step_ms, step_ms)
+        for step, source in enumerate(as_of)
+    )
+    limit = spec.action_max_in_step_range
+    if any(spread > limit for action in actions for spread in action.spread):
+        return ActionExclusionReason.IN_STEP_CHANGE, ()
 
     # 4 / 5. tick_id は最大の horizon より後の最初の tick まで、ちょうど 1 ずつ増える
     differences = tuple(
@@ -351,7 +400,7 @@ def _assess_anchor(
         return ActionExclusionReason.RESTART, ()
     if any(difference >= 2 for difference in differences):
         return ActionExclusionReason.TICK_ID_GAP, ()
-    return None, tuple(as_of)
+    return None, actions
 
 
 def _anchor_candidates(ts: tuple[int, ...], start_ms: int, stride_ms: int) -> tuple[int, ...]:
@@ -484,7 +533,7 @@ class ThermalDatasetV2Builder:
             excluded = dict.fromkeys(ActionExclusionReason, 0)
             examples: list[DatasetExampleV2] = []
             for index in eligible:
-                reason, as_of = _assess_anchor(ticks, index, spec)
+                reason, actions = _assess_anchor(ticks, index, spec)
                 if reason is not None:
                     excluded[reason] += 1
                     continue
@@ -492,7 +541,7 @@ class ThermalDatasetV2Builder:
                     _example_v2(
                         ticks=ticks,
                         index=index,
-                        as_of=as_of,
+                        actions=actions,
                         source_run=source_run,
                         spec=spec,
                         points=points,
@@ -542,7 +591,7 @@ def _example_v2(
     *,
     ticks: _RunTicks,
     index: int,
-    as_of: tuple[int, ...],
+    actions: tuple[_StepAction, ...],
     source_run: SourceRun,
     spec: DatasetSpecV2,
     points: dict[str, SeriesIndex],
@@ -576,11 +625,19 @@ def _example_v2(
             ActionStepV2(
                 step=step,
                 ts_ms=tick.ts_ms + step * spec.action_step_ms,
-                source_ts_ms=ticks.ts[source],
-                source_tick_id=ticks.tick_ids[source],
-                effective_demand=_zone_demands(ticks.effective[source]),
+                source_ts_ms=ticks.ts[action.source],
+                source_tick_id=ticks.tick_ids[action.source],
+                effective_demand=_zone_demands(ticks.effective[action.source]),
+                step_demand=_zone_demands(action.mean),
             )
-            for step, source in enumerate(as_of)
+            for step, action in enumerate(actions)
+        ),
+        in_step_range=_zone_demands(
+            (
+                max(action.spread[0] for action in actions),
+                max(action.spread[1] for action in actions),
+                max(action.spread[2] for action in actions),
+            )
         ),
         targets=targets,
     )
@@ -1166,6 +1223,7 @@ def write_dataset(
 
 _V2_ONLY_OPTIONS = (
     "anchor_stride_ms",
+    "action_max_in_step_range",
     "action_step_ms",
     "action_steps",
     "action_stale_after_ms",
@@ -1213,6 +1271,14 @@ def build_parser() -> argparse.ArgumentParser:
         "--anchor-stride-ms",
         type=int,
         help="anchor の候補を選ぶ格子の間隔（ms）。既定値は無い（決定記録 0181 §2.1）",
+    )
+    v2.add_argument(
+        "--action-max-in-step-range",
+        type=float,
+        help=(
+            "step の区間の中の effective の幅の上限（0〜1）。超えた example は作らない。"
+            "0 で区間の中の変化を許さない。既定値は無い（決定記録 0182 §2.2）"
+        ),
     )
     v2.add_argument("--action-step-ms", type=int)
     v2.add_argument("--action-steps", type=int)
@@ -1320,6 +1386,7 @@ def _main_v2(args: argparse.Namespace) -> int:
         {
             **_common_spec(args),
             "anchor_stride_ms": args.anchor_stride_ms,
+            "action_max_in_step_range": args.action_max_in_step_range,
             "action_step_ms": args.action_step_ms,
             "action_steps": args.action_steps,
             "action_stale_after_ms": args.action_stale_after_ms,

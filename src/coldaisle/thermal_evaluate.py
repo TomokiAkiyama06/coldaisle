@@ -81,10 +81,13 @@ from coldaisle.metrics import MetricCatalog
 from coldaisle.thermal_evaluation_report import (
     AXIS_ACTION_CHANGE,
     AXIS_ACTION_SUPPORT,
+    AXIS_IN_STEP_RANGE,
     AXIS_ROOM_TEMPERATURE,
     AXIS_WORKLOAD,
     AXIS_WORKLOAD_REGIME,
     GATING_AXES,
+    IN_STEP_RANGE_NONE,
+    IN_STEP_RANGE_VARIED,
     PROCEDURE_VERSION,
     REPORT_SCHEMA_VERSION,
     UNKNOWN_STRATUM,
@@ -340,10 +343,21 @@ def _workload_stratum(example: DatasetExampleV2, config: ThermalEvaluationConfig
     return f"cpu_{cpu_band}.gpu_{gpu_band}"
 
 
+def _in_step_range_stratum(example: DatasetExampleV2) -> str:
+    """区間の中の幅の層（決定記録 0182 §2.3。報告だけ）。境目の値を置かず、動いたかで分ける。"""
+    spread = example.in_step_range
+    if spread.front == 0.0 and spread.rear == 0.0 and spread.top == 0.0:
+        return IN_STEP_RANGE_NONE
+    return IN_STEP_RANGE_VARIED
+
+
 def action_changed(example: DatasetExampleV2) -> bool:
-    """action 列のどこかの step が ``prior_action`` と違う（0172 §2.3）。"""
+    """action 列のどこかの step が ``prior_action`` と違う（0172 §2.3）。
+
+    step の値は区間の時間平均 ``step_demand``（決定記録 0182 §2.1）。
+    """
     prior = example.prior_action.effective_demand
-    return any(step.effective_demand != prior for step in example.action_steps)
+    return any(step.step_demand != prior for step in example.action_steps)
 
 
 @dataclass(frozen=True, slots=True)
@@ -414,6 +428,7 @@ def _evaluate_example(
         AXIS_WORKLOAD: _workload_stratum(example, config),
         AXIS_ACTION_CHANGE: "changed" if changed else "held",
         AXIS_WORKLOAD_REGIME: UNKNOWN_STRATUM if regime is None else regime.value,
+        AXIS_IN_STEP_RANGE: _in_step_range_stratum(example),
     }
     if support is not None:
         try:
@@ -735,7 +750,7 @@ def evaluate_test_split(
             results, outputs, config=config, train_means=means, residual_scales=scales
         ),
     )
-    axes: list[StratumAxis] = [*GATING_AXES, AXIS_WORKLOAD_REGIME]
+    axes: list[StratumAxis] = [*GATING_AXES, AXIS_WORKLOAD_REGIME, AXIS_IN_STEP_RANGE]
     if support is not None:
         axes.append(AXIS_ACTION_SUPPORT)
     strata: list[StratumResult] = []
