@@ -37,7 +37,7 @@ uv run coldaisle-memory             # 運用メモリの更新案（**既定で�
 uv run coldaisle-memory --apply --commit  # 確認してから書く
 uv run coldaisle-calibrate          # 較正オフセットの算出（**既定では書かない**）
 uv run coldaisle-calibrate --apply  # 確認してから書く。手順は docs/calibration.md
-uv run coldaisle-dataset --dataset-version 2 --declared-changes var/declared-changes.yaml --calibration-history-db var/coldaisle.db --anchor-stride-ms <ms> ...  # Thermal Dataset v2（版と anchor の間隔は必須。手順は docs/thermal-dataset.md。決定記録 0109 / 0181）
+uv run coldaisle-dataset --dataset-version 2 --declared-changes var/declared-changes.yaml --calibration-history-db var/coldaisle.db --anchor-stride-ms <ms> --action-max-in-step-range <0〜1> ...  # Thermal Dataset v2（版・anchor の間隔・step の中の幅の上限は必須。手順は docs/thermal-dataset.md。決定記録 0109 / 0181 / 0182）
 uv run coldaisle-train --dataset var/datasets/dataset-<32 hex> --replay-path ... --training-spec var/training.yaml --out var/training/<名前> ...  # 反実仮想 Thermal Model の学習（**既定では Registry を書かない**。`--apply` で candidate だけ。人が手で実行し timer にしない。例は docs/thermal-model.md。#84 / 決定記録 0150）
 uv run coldaisle-evaluate --runs var/evaluation-runs.yaml --out var/evaluation.json  # Controller構成の比較（読み取りのみ）
 uv run coldaisle-drift --evidence var/drift-evidence.yaml --profile var/confidence-profile.json  # Model driftの検知（読み取りのみ・書き込みはしない。`--format markdown` で trend を人が読む表に）

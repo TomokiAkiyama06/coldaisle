@@ -15,6 +15,7 @@ import sqlite3
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from pathlib import Path
+from typing import Any
 
 import pytest
 from pydantic import ValidationError
@@ -23,6 +24,8 @@ from coldaisle.calibration_offsets import effective_metric_offsets
 from coldaisle.clock import SimulatedClock
 from coldaisle.control import ControlTick, ControlTraceLogger
 from coldaisle.control.drift.model import ChangeKind, DeclaredChange
+from coldaisle.control.model.counterfactual import ThermalActionSchema
+from coldaisle.control.model.counterfactual_training import recorded_trajectory
 from coldaisle.control.model.dataset import (
     DatasetExampleV2,
     DatasetManifestV2,
@@ -55,6 +58,7 @@ from coldaisle.store.calibration_history import (
     read_calibration_history,
 )
 from coldaisle.store.export_binding import ExportBinding
+from coldaisle.thermal_evaluate import _in_step_range_stratum, action_changed
 from conftest import QUALITY_RULES_PATH, fixture_export_binding, fixture_replay_binding
 
 CONTROL_FIXTURE = Path(__file__).resolve().parent / "fixtures" / "control_tick_v1.json"
@@ -112,6 +116,7 @@ def spec_v2(**updates: object) -> DatasetSpecV2:
         "action_stale_after_ms": 1_500,
         # 1 ms の格子ならすべての tick が候補になり、間引く前と同じ（決定記録 0181 §2.4）
         "anchor_stride_ms": 1,
+        "action_max_in_step_range": 0.0,
     }
     values.update(updates)
     return DatasetSpecV2.model_validate(values)
@@ -532,6 +537,95 @@ def test_unchanged_ticks_inside_a_step_keep_the_start_value(build_ticks):
     (example,) = dataset.examples
     assert [step.effective_demand for step in example.action_steps] == [per_zone(A), per_zone(B)]
     assert [step.source_tick_id for step in example.action_steps] == [11, 13]
+
+
+# ---------------------------------------------------------------- 0182 区間の時間平均と幅
+
+RAMP: tuple[TickSpec, ...] = (
+    (4_000, 10, PRIOR),
+    (5_000, 11, A),
+    (5_200, 12, (0.625, 0.5, 0.5)),
+    (5_700, 13, (0.75, 0.5, 0.5625)),
+    (6_000, 14, B),
+    (7_000, 15, C),
+    (7_500, 16, D),
+)
+"""step 0 の区間 [5000, 6000) の中で、Front が 200 / 500 / 300 ms ずつ 0.5 → 0.625 → 0.75、
+Top が 700 / 300 ms ずつ 0.5 → 0.5625 と動く（値は2進で割り切れる）。step 1 は B のまま。"""
+
+
+def _anchored_at(dataset: ThermalDatasetV2, tick_id: int) -> DatasetExampleV2:
+    (example,) = (item for item in dataset.examples if item.control_tick_id == tick_id)
+    return example
+
+
+def test_step_value_is_the_time_weighted_mean_of_the_interval(build_ticks):
+    """step の値は区間の中の時間平均（tick の間隔が不揃いでも時間で重み付ける。0182 §2.1）。"""
+    dataset = build_ticks(RAMP, spec=spec_v2(action_max_in_step_range=0.25))
+
+    example = _anchored_at(dataset, 11)
+    first, second = example.action_steps
+    assert first.step_demand.front == pytest.approx((0.5 * 200 + 0.625 * 500 + 0.75 * 300) / 1_000)
+    assert first.step_demand.rear == 0.5
+    assert first.step_demand.top == pytest.approx((0.5 * 700 + 0.5625 * 300) / 1_000)
+    # 開始の as-of の値と元の tick は今のまま（0087 §2.1）
+    assert (first.effective_demand, first.source_tick_id) == (per_zone(A), 11)
+    assert (second.step_demand, second.effective_demand) == (per_zone(B), per_zone(B))
+    assert example.in_step_range == PerZone(front=0.25, rear=0.0, top=0.0625)
+
+
+def test_range_at_the_limit_is_kept_and_above_it_is_excluded(build_ticks):
+    """幅が上限ちょうどの example は作り、超えたら区間内の変化に数える（0182 §2.2）。"""
+    at_limit = build_ticks(RAMP, spec=spec_v2(action_max_in_step_range=0.25))
+    above = build_ticks(RAMP, spec=spec_v2(action_max_in_step_range=0.2499))
+
+    assert _anchored_at(at_limit, 11).in_step_range.front == 0.25
+    assert 11 not in {example.control_tick_id for example in above.examples}
+    assert excluded(above) == zero_excluded(in_step_change=1)
+
+
+@pytest.mark.parametrize("value", [-0.01, 1.01, float("nan")])
+def test_in_step_range_limit_must_be_between_zero_and_one(value):
+    with pytest.raises(ValidationError, match="action_max_in_step_range"):
+        spec_v2(action_max_in_step_range=value)
+
+
+def test_spec_without_the_in_step_range_limit_is_refused():
+    """既定値を持たない（0182 §2.2）。欄の無い spec は黙って 0087 の規則にならない。"""
+    values = spec_v2().model_dump()
+    del values["action_max_in_step_range"]
+    with pytest.raises(ValidationError, match="action_max_in_step_range"):
+        DatasetSpecV2.model_validate(values)
+
+
+def test_dataset_whose_range_exceeds_the_spec_limit_is_rejected(build_ticks):
+    """manifest の上限より広い幅の example を持つ Dataset は読めない（0182 §2.2）。"""
+    raw = build_ticks(RAMP, spec=spec_v2(action_max_in_step_range=0.25)).model_dump(mode="json")
+    raw["manifest"]["spec"]["action_max_in_step_range"] = 0.2
+    with pytest.raises(ValidationError, match="action_max_in_step_range を超えている"):
+        ThermalDatasetV2.model_validate_json(json.dumps(raw))
+
+
+def test_training_and_evaluation_read_the_step_mean(build_ticks):
+    """学習の action 列と評価の変化・幅の層は step の時間平均を読む（0182 §2.1 / §2.3）。"""
+    ramp = _anchored_at(build_ticks(RAMP, spec=spec_v2(action_max_in_step_range=0.25)), 11)
+    (steady,) = build_ticks(ALIGNED).examples
+
+    trajectory = recorded_trajectory(ramp, ThermalActionSchema(step_ms=1_000, steps=2))
+    assert trajectory.demands == tuple(step.step_demand for step in ramp.action_steps)
+    assert trajectory.demands[0] != ramp.action_steps[0].effective_demand
+    assert action_changed(ramp)
+    assert _in_step_range_stratum(ramp) == "varied"
+    assert _in_step_range_stratum(steady) == "none"
+
+
+def test_step_mean_farther_than_the_range_from_the_start_value_is_rejected(build_ticks):
+    """時間平均と開始の as-of の値の差は、区間の中の幅を超えない（0182 §2.1 / §2.3）。"""
+    raw = build_ticks(RAMP, spec=spec_v2(action_max_in_step_range=0.25)).model_dump(mode="json")
+    item = raw["examples"][0]
+    item["action_steps"][0]["step_demand"]["rear"] = 0.9
+    with pytest.raises(ValidationError, match="区間の中の幅を超えている"):
+        DatasetExampleV2.model_validate_json(json.dumps(item))
 
 
 # ---------------------------------------------------------------- §2.2 再起動・欠番
@@ -1328,6 +1422,10 @@ def test_source_ticks_must_agree_across_examples(build_ticks, where, field, valu
         else raw["examples"][1][where]
     )
     target[field] = value
+    if (where, field) == ("action_steps", "effective_demand"):
+        # step の時間平均も同じ値にし、example の中では矛盾しない形にする（0182 §2.1）。
+        # example の間の照合だけで見つかることを確かめる
+        target["step_demand"] = value
     examples = tuple(
         DatasetExampleV2.model_validate_json(json.dumps(item)) for item in raw["examples"]
     )
@@ -1362,6 +1460,12 @@ MANY_ANCHORS_EXAMPLES_SHA256 = (
 )
 """``MANY_ANCHORS`` の examples.jsonl の SHA-256。anchor の間隔を足す前（#417 の main）の出力。"""
 
+_FIELDS_ADDED_BY_0182: dict[str, Any] = {
+    "in_step_range": True,
+    "action_steps": {"__all__": {"step_demand"}},
+}
+"""0182 で足した欄。除いて書けば、足す前の examples.jsonl と同じ形になる。"""
+
 
 def test_stride_of_one_ms_gives_the_same_bytes_as_before_the_stride(build_ticks):
     """1 ms の格子ではすべての tick が候補になり、間隔を足す前と同じ bytes になる（0181 §2.4）。"""
@@ -1371,9 +1475,16 @@ def test_stride_of_one_ms_gives_the_same_bytes_as_before_the_stride(build_ticks)
         spec=spec_v2(window_ms=1_000, action_stale_after_ms=1_100, anchor_stride_ms=1),
     )
 
-    body = examples_jsonl_bytes(dataset.examples)
+    # 0182 で足した欄（step_demand・in_step_range）を除けば、間隔を足す前と同じ bytes。
+    # 上限 0 では step の時間平均は開始の as-of の値で、幅は 0（0182 §2.2）
+    body = b"".join(
+        (example.model_dump_json(exclude=_FIELDS_ADDED_BY_0182) + "\n").encode()
+        for example in dataset.examples
+    )
     assert hashlib.sha256(body).hexdigest() == MANY_ANCHORS_EXAMPLES_SHA256
-    assert dataset.manifest.examples_sha256 == MANY_ANCHORS_EXAMPLES_SHA256
+    for example in dataset.examples:
+        assert example.in_step_range == PerZone(front=0.0, rear=0.0, top=0.0)
+        assert all(step.step_demand == step.effective_demand for step in example.action_steps)
     assert excluded(dataset) == zero_excluded(
         stale=1, discontinuity=1, in_step_change=2, restart=2, tick_id_gap=3
     )

@@ -519,10 +519,13 @@ def train_counterfactual_ridge(
 def recorded_trajectory(
     example: DatasetExampleV2, action_schema: ThermalActionSchema
 ) -> ActionTrajectory:
-    """Dataset v2 に記録した action 列（係数の当てはめに使う。0084 §2.1 の表）。"""
+    """Dataset v2 に記録した action 列（係数の当てはめに使う。0084 §2.1 の表）。
+
+    step の値は区間の時間平均 ``step_demand``（決定記録 0182 §2.1）。
+    """
     return ActionTrajectory(
         step_ms=action_schema.step_ms,
-        demands=tuple(step.effective_demand for step in example.action_steps),
+        demands=tuple(step.step_demand for step in example.action_steps),
     )
 
 
@@ -540,7 +543,7 @@ def _action_variation(
     for example in examples:
         sequence = (
             example.prior_action.effective_demand,
-            *(step.effective_demand for step in example.action_steps),
+            *(step.step_demand for step in example.action_steps),
         )
         for before, after in pairwise(sequence):
             for zone in ZONE_ORDER:
