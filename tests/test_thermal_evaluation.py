@@ -410,6 +410,7 @@ def test_strata_cover_every_axis_and_unknown_is_kept(examples: Any) -> None:
         "workload",
         "action_change",
         "workload_regime",
+        "in_step_range",
     }
     for stratum in report.evaluation.strata:
         assert (

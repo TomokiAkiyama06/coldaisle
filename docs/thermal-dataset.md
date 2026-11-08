@@ -138,11 +138,17 @@ v1 との違い（規則の正本は [0087](decisions/0087-dataset-v2-action-gri
   step ごとに、区間の開始時刻以前で直近の ControlTick の `effective` を持つ（as-of。丸め・補間をしない）。
   元にした tick の時刻と `tick_id` を step ごとに残す。step 0 は anchor の tick 自身である。
   step `k` は `ActionPlan.steps[k]`（`offset_ms` は区間の終端）と同じ区間である
+- **step の action の値 `step_demand`**（決定記録 [0182](decisions/0182-dataset-in-step-action-mean.md) §2.1）: 区間の中の
+  `effective` の時間平均。tick と tick の間は直前の tick の値が掛かっていたとみなす（区分的に一定）。区間の中で値が
+  変わらなければ `effective_demand`（開始の as-of の値）と同じ値になる。学習の action 列・信頼度の範囲・評価の
+  action の変化はこの値を読む。fand の auto は ramp で Demand を毎 tick 動かすので、開始の 1 点だけでは区間を表さない
+- **区間の中の幅 `in_step_range`**（0182 §2.3）: example ごとに、zone ごとの「全 step を通した区間の中の `effective` の
+  幅（最大 − 最小）の最大」。評価の報告だけの層 `in_step_range`（`none` / `varied`）に使う
 - **`prior_action`**: anchor の tick より厳密に前で直近の tick の `effective`。v2 の anchor action はこれで、
   `ObservedThermalInput.from_example_v2` はこの値を action に使う。v1 と同じ `action`（anchor の tick 自身）は
   分析用に残す
-- **spec の必須の欄**: `action_step_ms` / `action_steps` / `action_stale_after_ms` / `anchor_stride_ms`。**既定値は無い**（値は実データの後に
-  選ぶ。0087 §2.2 / 0181 §2.1）。各 horizon は `action_step_ms` の整数倍、`action_steps × action_step_ms` は最大の horizon と等しい
+- **spec の必須の欄**: `action_step_ms` / `action_steps` / `action_stale_after_ms` / `anchor_stride_ms` /
+  `action_max_in_step_range`。**既定値は無い**（値は実データの後に選ぶ。0087 §2.2 / 0181 §2.1 / 0182 §2.2）。各 horizon は `action_step_ms` の整数倍、`action_steps × action_step_ms` は最大の horizon と等しい
 - **anchor の間隔**（`anchor_stride_ms`。決定記録 [0181](decisions/0181-dataset-anchor-stride-and-training-limits.md) §2.1）:
   run の開始 `start_ms` から `anchor_stride_ms` ごとの格子の時刻 `g` のそれぞれについて、`g` 以上で最初の ControlTick を
   anchor の候補にする（同じ tick が複数の格子に当たれば 1 回だけ）。候補に下の判定（window・target・鮮度・除外の理由）を
@@ -158,7 +164,8 @@ v1 との違い（規則の正本は [0087](decisions/0087-dataset-v2-action-gri
      anchor より前に tick が無い
   2. `discontinuity`: `prior_action` の元の tick から最大の horizon までの隣り合う tick の差、または最後の tick から
      最大の horizon までの差が `action_stale_after_ms` 以上。最大の horizon より後に tick が無い（run の末尾）
-  3. `in_step_change`: step の区間の中の tick の `effective` が、どれか1つの zone でも step の値と違う
+  3. `in_step_change`: step の区間の中の `effective` の幅が、どれか1つの zone・step で `action_max_in_step_range` を
+     超える（0182 §2.2。`0` を渡すと 0087 §2.3 と同じく、区間の中で 1 つでも値が違えば作らない）
   4. `restart`: 検査の範囲（`prior_action` の元の tick から、最大の horizon より後の最初の tick まで）で、
      `seq` の順に隣り合う tick の `tick_id` が減る、または同じ
   5. `tick_id_gap`: 同じ範囲で `tick_id` が 2 以上増える（trace の保存に失敗した tick がある）
@@ -212,8 +219,9 @@ v1 との違い（規則の正本は [0087](decisions/0087-dataset-v2-action-gri
 
 v1 の引数に加えて、次を**すべて必須**で渡す（既定値は無い。v1 で渡すと拒否する）。
 
-- `--anchor-stride-ms` / `--action-step-ms` / `--action-steps` / `--action-stale-after-ms`: `DatasetSpecV2` の欄
-  （`--anchor-stride-ms` は決定記録 0181 §2.1）
+- `--anchor-stride-ms` / `--action-max-in-step-range` / `--action-step-ms` / `--action-steps` / `--action-stale-after-ms`:
+  `DatasetSpecV2` の欄（`--anchor-stride-ms` は決定記録 0181 §2.1、`--action-max-in-step-range` は 0182 §2.2。最初の
+  試行の値は 0.10。0182 §5 の 1）
 - `--declared-changes <path>`: 宣言された変更の YAML。宣言が無いときも `changes: []` と書いたファイルを渡す
 - `--calibration-history-db <path>`: 較正の変更の記録（`calibration_activations`）を持つ本番の DB。読み取り専用で
   開き、migration を当てない。専用 DB（`--db`）と同じ実体（symlink・hard link の別名を含む）は拒否する。
@@ -240,6 +248,7 @@ uv run coldaisle-dataset \
   --declared-changes var/declared-changes.yaml \
   --calibration-history-db var/coldaisle.db \
   --anchor-stride-ms 30000 \
+  --action-max-in-step-range 0.10 \
   --action-step-ms 1000 \
   --action-steps 10 \
   --action-stale-after-ms 3000 \
