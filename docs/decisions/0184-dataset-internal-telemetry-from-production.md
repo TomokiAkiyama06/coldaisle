@@ -1,7 +1,7 @@
 # 決定記録 0184: Thermal Dataset v2 の特徴量に内部 Telemetry（GPU・CPU の電力と温度）を使えるようにする（本番の DB から同じ read transaction で読む）
 
 - **種別**: Decision Record
-- **Status**: Proposed
+- **Status**: FINAL（2026-11-08、リポジトリ所有者の承認。§5 の 1〜3 はすべて推奨の案）
 - **Date**: 2026-11-08
 - **Supersedes**: なし（足すだけ）。0008 §2.8（日次 CSV は従来の 7 列だけ）・0100 / 0112（再生の束縛）・0116（trace の出どころ）は変えない
 - **関連**: [`0008`](0008-rollup-and-retention.md) §2.8 / [`0031`](0031-thermal-dataset-contract.md) / [`0087`](0087-dataset-v2-action-grid.md) /
@@ -96,6 +96,6 @@ snapshot の signal から作るので、これらの metric を特徴量にし�
 
 | # | 論点 | 選択肢 |
 |---|---|---|
-| 1 | 最初の試行で足す metric | **(推奨) `power.gpu.0`・`power.cpu.package`** / 電力と温度（`gpu.0.core`・`cpu.package`）の 4 つ / 利用率（`gpu.0.utilization`）も |
-| 2 | raw が保持期間で消えたことの見分け方 | **(推奨) 期間の先頭より前の raw が本番の DB に 1 行も無い metric を拒否** / 保持期間の設定値と run の開始で判定 / 判定せず bytes の不一致に任せる |
-| 3 | 起動時の束縛で入力の契約を確かめる（§2.4）のを、本記録の実装に含めるか | **(推奨) 含める**（Learned を shadow にする前に要る） / 別の PR にする |
+| 1 | 最初の試行で足す metric | **`power.gpu.0`・`power.cpu.package` に決定**。退けた案: 電力と温度（`gpu.0.core`・`cpu.package`）の 4 つ / 利用率（`gpu.0.utilization`）も |
+| 2 | raw が保持期間で消えたことの見分け方 | **期間の先頭より前の raw が本番の DB に 1 行も無い metric を拒否に決定**。退けた案: 保持期間の設定値と run の開始で判定 / 判定せず bytes の不一致に任せる |
+| 3 | 起動時の束縛で入力の契約を確かめる（§2.4）のを、本記録の実装に含めるか | **含めるに決定**（Learned を shadow にする前に要る）。退けた案: 別の PR にする |
