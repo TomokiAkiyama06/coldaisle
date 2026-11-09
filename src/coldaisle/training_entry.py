@@ -27,7 +27,11 @@ from zoneinfo import ZoneInfo
 
 from coldaisle.calibration_log import training_export_ids, verify_training_export_binding
 from coldaisle.control.drift.model import DeclaredChange
-from coldaisle.control.model.dataset import ThermalDatasetV2, examples_jsonl_bytes
+from coldaisle.control.model.dataset import (
+    ThermalDatasetV2,
+    examples_jsonl_bytes,
+    production_metrics_of,
+)
 from coldaisle.csv_export_manifest import replay_binding_of_records
 from coldaisle.daemon import Daemon
 from coldaisle.dataset import (
@@ -40,7 +44,7 @@ from coldaisle.ingest.normalize import Normalizer
 from coldaisle.ingest.replay import ReplaySource, read_replay_export_inputs
 from coldaisle.store import QualityRules, SqliteStore
 from coldaisle.store.calibration_history import CalibrationHistory
-from coldaisle.store.export_binding import read_training_production
+from coldaisle.store.export_binding import ProductionTelemetryError, read_training_production
 
 _SOURCE_NAME = "replay"
 _DATABASE_NAME = "rebuild.db"
@@ -141,13 +145,18 @@ def verify_training_dataset_v2(
             # 求めるので、写すのは再生の後（0112 §2.3 の 1 → 2 の順）。ブロックの中の検査で
             # 拒否すれば、写した trace は rollback される
             with production_trace_sink(store) as sink:
-                production = read_training_production(
-                    production_db,
-                    inputs.records,
-                    start_ms=run.start_ms,
-                    end_ms=run.end_ms,
-                    trace_sink=sink,
-                )
+                try:
+                    production = read_training_production(
+                        production_db,
+                        inputs.records,
+                        start_ms=run.start_ms,
+                        end_ms=run.end_ms,
+                        trace_sink=sink,
+                        # 内部 Telemetry も同じ read transaction で読み直す（決定記録 0184 §2.3）
+                        production_metrics=production_metrics_of(dataset.manifest.spec),
+                    )
+                except ProductionTelemetryError as error:
+                    raise TrainingDatasetRefused(str(error)) from error
                 verify_training_export_binding(
                     dataset,
                     {
@@ -166,6 +175,7 @@ def verify_training_dataset_v2(
                 declared_changes=declared_changes,
                 calibration_history=history,
                 export_binding=production.binding,
+                production_series=production.production_series,
             )
     if published_bytes(rebuilt) != published_bytes(dataset):
         raise TrainingDatasetRefused(

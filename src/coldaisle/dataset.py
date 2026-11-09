@@ -19,7 +19,7 @@ import sqlite3
 import stat
 from bisect import bisect_left, bisect_right
 from collections import Counter
-from collections.abc import Callable, Iterable, Iterator, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager, suppress
 from enum import StrEnum
 from pathlib import Path
@@ -59,6 +59,7 @@ from coldaisle.control.model.dataset import (
     ThermalDatasetV2,
     WindowFrame,
     examples_sha256,
+    production_metrics_of,
     reject_calibration_changes,
 )
 from coldaisle.control.schema import ControlTick, PerZone, Zone
@@ -79,6 +80,7 @@ from coldaisle.store.csv_export import TIMESTAMP_RESOLUTION_MS
 from coldaisle.store.export_binding import (
     ExportBinding,
     ExportBindingError,
+    ProductionTelemetryError,
     TrainingProduction,
     read_training_production,
 )
@@ -436,6 +438,7 @@ class ThermalDatasetV2Builder:
         declared_changes: tuple[DeclaredChange, ...],
         calibration_history: CalibrationHistory,
         export_binding: ExportBinding,
+        production_series: Mapping[str, tuple[SeriesPoint, ...]] | None = None,
     ) -> ThermalDatasetV2:
         """1 source run を決定的に変換する。
 
@@ -458,6 +461,12 @@ class ThermalDatasetV2Builder:
         照合した結果（決定記録 0100 §2.6）。専用 DB の ``dataset_source_run`` の timezone と
         ``export_binding_sha256`` が一致しなければ拒否し、照合していない run（``NULL``）も拒否する
         （0100 §2.8）。通れば source run ごとの ``ReplayBindingV2`` を manifest に書く。
+
+        ``production_series`` は日次 CSV に無い metric（内部 Telemetry）の run の期間の raw で、
+        本番の DB から trace と同じ read transaction で読んだもの（決定記録 0184 §2.1。
+        :func:`~coldaisle.store.export_binding.read_training_production` の結果）。専用 DB には
+        写さない。鍵は :func:`production_metrics_of` とちょうど一致しなければ拒否する
+        （``None`` は空。CSV の metric だけの spec）。cell の作り方は ``air.*`` と同じ。
 
         次の run からは生成しない（example の除外ではなく、生成全体の拒否。0087 §2.1）。
 
@@ -526,9 +535,16 @@ class ThermalDatasetV2Builder:
                 raise ValueError("source run内に完全なwindow/targetを持つControlTickが無い")
 
             metrics = tuple(dict.fromkeys((*spec.feature_metrics, *spec.target_metrics)))
+            from_production = _checked_production_series(
+                spec, source_run, {} if production_series is None else production_series
+            )
             points: dict[str, SeriesIndex] = {}
             for metric in metrics:
-                metric_points = self._store.series(metric, source_run.start_ms, source_run.end_ms)
+                metric_points = from_production.get(metric)
+                if metric_points is None:
+                    metric_points = self._store.series(
+                        metric, source_run.start_ms, source_run.end_ms
+                    )
                 points[metric] = (tuple(point.ts_ms for point in metric_points), metric_points)
 
             excluded = dict.fromkeys(ActionExclusionReason, 0)
@@ -578,9 +594,31 @@ class ThermalDatasetV2Builder:
                     tick_id_gap=excluded[ActionExclusionReason.TICK_ID_GAP],
                 ),
                 replay_bindings=(_replay_binding_v2(source_run, export_binding),),
+                production_metrics=production_metrics_of(spec),
             ),
             examples=built,
         )
+
+
+def _checked_production_series(
+    spec: DatasetSpecV2,
+    source_run: SourceRun,
+    series: Mapping[str, tuple[SeriesPoint, ...]],
+) -> Mapping[str, tuple[SeriesPoint, ...]]:
+    """本番の DB から読んだ系列が spec の CSV に無い metric とちょうど一致することを確かめる。"""
+    expected = production_metrics_of(spec)
+    if sorted(series) != list(expected):
+        raise ValueError(
+            "本番の DB から読む metric が spec と一致しない"
+            f"（要る: {list(expected)}・渡された: {sorted(series)}。決定記録 0184 §2.1）"
+        )
+    for metric, metric_points in series.items():
+        times = [point.ts_ms for point in metric_points]
+        if times != sorted(set(times)) or any(
+            not source_run.start_ms <= ts_ms < source_run.end_ms for ts_ms in times
+        ):
+            raise ValueError(f"本番の DB の {metric} の系列が run の期間の時刻の昇順でない")
+    return series
 
 
 def _zone_demands(values: _ZoneDemands) -> PerZone[float]:
@@ -1466,6 +1504,7 @@ def _main_v2(args: argparse.Namespace) -> int:
                         start_ms=source_run.start_ms,
                         end_ms=source_run.end_ms,
                         trace_sink=sink,
+                        production_metrics=production_metrics_of(spec),
                     )
                     check_production_traces(production, start_ms=source_run.start_ms)
             except CalibrationHistoryError as error:
@@ -1486,6 +1525,12 @@ def _main_v2(args: argparse.Namespace) -> int:
                     extra={logs.FIELDS_KEY: {"reason": str(error)}},
                 )
                 return 1
+            except ProductionTelemetryError as error:
+                LOGGER.error(
+                    "本番の DB の内部 Telemetry から作れない期間（dataset を作らない）",
+                    extra={logs.FIELDS_KEY: {"reason": str(error)}},
+                )
+                return 1
             history = production.history
             dataset = ThermalDatasetV2Builder(store).build(
                 source_run=source_run,
@@ -1493,6 +1538,7 @@ def _main_v2(args: argparse.Namespace) -> int:
                 declared_changes=declared.changes,
                 calibration_history=history,
                 export_binding=production.binding,
+                production_series=production.production_series,
             )
     except ValueError as error:
         LOGGER.error(
