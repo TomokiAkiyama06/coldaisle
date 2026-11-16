@@ -242,6 +242,12 @@ v1 の引数に加えて、次を**すべて必須**で渡す（既定値は無�
   あれば、本番の trace と完全に一致するときだけそのまま作り、違えば作らない（新しい専用 DB で再生し直す）。
   本番の trace が保持期間で消えた期間・移行前の行を含む期間からは作らない。これで作った dataset はそのまま
   学習の入口（`training_entry.verify_training_dataset_v2`）を通る
+- `--start-ms` / `--end-ms`: 専用 DB の readings と trace は、**すべて** source run の期間 `[--start-ms, --end-ms)` に
+  入っていなければならない（入っていない行が 1 行でもあれば「dataset生成DBはsource run期間だけを持つ専用DBで
+  なければならない」で拒否する）。日次 CSV は 1 日分を丸ごと再生するので、期間の両端は**再生した CSV の日の境目**
+  （export manifest の timezone の 0 時）に合わせる。たとえば 11-14 の CSV を再生したのに `--end-ms` を 11-14 18:00 に
+  すると拒否される。日の途中で区切りたいときは、期間ではなく学習の spec の `validation_start_ms` / `test_start_ms`
+  で区切る
 
 ```yaml
 # var/declared-changes.yaml（数値は説明用の仮の値）
