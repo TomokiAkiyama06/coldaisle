@@ -3,6 +3,7 @@
 - **種別**: Decision Record
 - **Status**: FINAL（2026-11-19、リポジトリ所有者の承認。§5 の 1〜6 はすべて推奨の案）
 - **Date**: 2026-11-19
+- **Superseded by**: §2.1 の「位置」の行、§2.3 の CPU と GPU の温度の条件、§2.4 の `margin_c` は [`0186`](0186-zone-excitation-after-gate.md)（Gate の後・Guard の前に掛け、温度の条件は `cpu_max_c` / `gpu_max_c` で書く）
 - **Supersedes**: なし。[0183](0183-zone-step-excitation-for-thermal-model.md) §4 で却下した案「fand の auto の曲線に zone ごとのずれを入れて
   普段から分ける」を、本記録の形（Baseline の後で上げるだけ・既定は off）に限って開き直す。0183 の決定（段の試験）は変えない
 - **関連**: [0028](0028-fan-control-contracts.md) §2.3 / [0053](0053-control-shadow-mode-and-counterfactual-logging.md) / [0078](0078-air-balance-fallback-coordination.md) /
