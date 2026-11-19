@@ -1295,6 +1295,10 @@ def _tick_for_schema_version(version: int, *, ts_ms: int, tick_id: int) -> Contr
             "certificate": None,
             "shadow_counters": None,
         }
+    if version >= 18:
+        # v18 は揺らぎの記録が必須で、authority は v2（#84 / 決定記録 0185 §2.5）
+        raw["authority"]["schema_version"] = 2
+        raw["zone_excitation"] = {"schema_version": 1, "mode": "off", "state": "off"}
     return ControlTick.model_validate_json(json.dumps(raw))
 
 

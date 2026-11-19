@@ -99,6 +99,7 @@ from coldaisle.control.schema import (
     WorkloadHintRecord,
     WorkloadRegime,
     Zone,
+    ZoneExcitationRecord,
     ZoneRecord,
 )
 from coldaisle.control.shadow import (
@@ -202,7 +203,8 @@ def strip_v4_provenance(document: dict[str, Any]) -> None:
 def strip_v11_fields(document: dict[str, Any]) -> None:
     """v11 以降で足した欄（`air_balance`・zone の `applied_demand`・v12 の `mode_command`・
     v13 の `authority`・v14 の `air_balance_coordination` / `tach_unconfirmed_zones`・
-    v15 の `telemetry_health`・v16 の `run_id` / `workload_hint`）を旧い版の形へ戻す。"""
+    v15 の `telemetry_health`・v16 の `run_id` / `workload_hint`・v18 の `zone_excitation`）を
+    旧い版の形へ戻す。"""
     document.pop("air_balance", None)
     document.pop("mode_command", None)
     document.pop("authority", None)
@@ -211,6 +213,7 @@ def strip_v11_fields(document: dict[str, Any]) -> None:
     document.pop("telemetry_health", None)
     document.pop("run_id", None)
     document.pop("workload_hint", None)
+    document.pop("zone_excitation", None)
     for zone in ("front", "rear", "top"):
         document["zones"][zone].pop("applied_demand", None)
 
@@ -409,6 +412,7 @@ def tick_at(
         telemetry_health=TELEMETRY_HEALTH_RECORD,
         run_id=TRACE_RUN_ID,
         workload_hint=WorkloadHintRecord.off(),
+        zone_excitation=ZoneExcitationRecord.off(),
     )
 
 

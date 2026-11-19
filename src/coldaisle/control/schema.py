@@ -33,7 +33,7 @@ from pydantic import (
 
 from coldaisle.measurement import validate_metric
 
-SCHEMA_VERSION: Literal[17] = 17
+SCHEMA_VERSION: Literal[18] = 18
 """`ControlTick` の形の版。**フィールドの名前や意味を変えたら上げる。**
 
 #82 が保存したデータを読み違えないため。
@@ -101,6 +101,12 @@ SCHEMA_VERSION: Literal[17] = 17
   送らずに捨てた Shadow の記録の累積の数と epoch）。**v17 の塊は v2 で、欄を必ず置く**
   （値が無ければ null）。保存済みの v16 の塊は v1 のまま読める（欄を持たない。「記録が無い」
   であって「証明書が無かった」ではない）
+- v18（#84 / 決定記録 0185 §2.5 / 0186・0089 §5 の 1 / 0090 §5 の 3）: 普段の運転の揺らぎの記録
+  ``zone_excitation``（``ZoneExcitationRecord`` v1）を**必須**にし、``authority`` を
+  ``AuthorityRecord`` v2 にした（``artifact_ceiling`` / ``config_binding_ceiling``: 実効の stage が
+  journal より低い理由のうち、loaded artifact と loaded config の照合の上限。上限が無ければ null）。
+  ``mode: "off"`` の構成の v18 も揺らぎの記録を ``state: off`` の形で持つ。保存済みの v13〜v17 の
+  ``authority`` は v1 のまま読める（欄を持たない。「上限が無かった」ではない）
 """
 
 Demand = Annotated[float, Field(ge=0.0, le=1.0, allow_inf_nan=False)]
@@ -2084,6 +2090,86 @@ v1〜v3 の reader は知らないため v3 以前には記録しない。
 MODE_COMMAND_RECORD_SCHEMA_VERSION: Literal[1] = 1
 """`ModeCommandRecord` の形の版。"""
 
+ZONE_EXCITATION_RECORD_SCHEMA_VERSION: Literal[1] = 1
+"""`ZoneExcitationRecord` の形の版（決定記録 0185 §2.5）。"""
+
+
+class ZoneExcitationState(StrEnum):
+    """その tick の揺らぎの状態（決定記録 0185 §2.2 / §2.5）。
+
+    - ``off``: ``mode: "off"``。予定を進めない
+    - ``idle``: 揺らぎの区間の間（``off`` の区間）。何も足さない
+    - ``on``: 揺らぎの区間の中で、この tick の requested に足した
+    - ``skipped``: 揺らぎの区間の中（または始まり）で条件が外れたので、区間をこの tick で打ち切った
+      （0185 §2.2。条件が戻っても再開しない）
+    """
+
+    OFF = "off"
+    IDLE = "idle"
+    ON = "on"
+    SKIPPED = "skipped"
+
+
+class ZoneExcitationSkipReason(StrEnum):
+    """揺らぎの区間を打ち切った理由（決定記録 0185 §2.3 / 0186）。最初に外れた条件を1つ残す。"""
+
+    NOT_AUTO = "not_auto"
+    NOT_BASELINE = "not_baseline"
+    """Gate が Baseline を選ばなかった（Learned MPC の提案・Gate の迂回・Gate の例外）。
+
+    決定記録 0186 §2.1。"""
+    SAFETY_NOT_NORMAL = "safety_not_normal"
+    FAULT_ACTIVE = "fault_active"
+    GUARD_ACTIVE = "guard_active"
+    TEMPERATURE_UNAVAILABLE = "temperature_unavailable"
+    CPU_TEMPERATURE = "cpu_temperature"
+    GPU_TEMPERATURE = "gpu_temperature"
+    OUTSIDE_HOURS = "outside_hours"
+
+
+class ZoneExcitationRecord(_Frozen):
+    """その tick の揺らぎ（`ControlTick` v18。#84 / 決定記録 0185 §2.5 / 0186）。
+
+    - ``episode``: fand の起動からの揺らぎの区間の番号（0 から）。``on`` / ``skipped`` で必須
+    - ``zone``: その区間で選んだ zone。``on`` / ``skipped`` で必須
+    - ``before`` / ``after``: ``on`` の tick の、その zone の揺らぎの前と後の requested。
+      ``after >= before``（上げるだけ。0185 §2.1）。``1.0`` で切れた量は
+      ``before + amplitude - after``
+    - ``skip_reason``: ``skipped`` の tick だけ
+    """
+
+    schema_version: Literal[1] = ZONE_EXCITATION_RECORD_SCHEMA_VERSION
+    mode: ZoneExcitationMode
+    state: ZoneExcitationState
+    episode: int | None = Field(default=None, ge=0)
+    zone: Zone | None = None
+    before: Demand | None = None
+    after: Demand | None = None
+    skip_reason: ZoneExcitationSkipReason | None = None
+
+    @model_validator(mode="after")
+    def _fields_match_state(self) -> Self:
+        state = self.state
+        if (self.mode is ZoneExcitationMode.OFF) != (state is ZoneExcitationState.OFF):
+            raise ValueError("mode: off の tick だけを state: off で記録する")
+        in_episode = state in (ZoneExcitationState.ON, ZoneExcitationState.SKIPPED)
+        if in_episode != (self.episode is not None and self.zone is not None):
+            raise ValueError("episode と zone は on / skipped の tick だけに記録する")
+        applied = state is ZoneExcitationState.ON
+        if applied != (self.before is not None and self.after is not None):
+            raise ValueError("before と after は on の tick だけに記録する")
+        if (state is ZoneExcitationState.SKIPPED) != (self.skip_reason is not None):
+            raise ValueError("skip_reason は skipped の tick だけに記録する")
+        if self.before is not None and self.after is not None and self.after < self.before:
+            raise ValueError("揺らぎは requested を下げない（0185 §2.1）")
+        return self
+
+    @classmethod
+    def off(cls) -> Self:
+        """``mode: "off"`` の構成の記録。"""
+        return cls(mode=ZoneExcitationMode.OFF, state=ZoneExcitationState.OFF)
+
+
 RUN_ID_PATTERN = r"^[0-9a-f]{32}$"
 """`coldaisle-fand` の起動ごとの識別子の形（決定記録 0072 §2.7）。個体識別子を含まない乱数。"""
 
@@ -2137,8 +2223,8 @@ class ModeCommandRecord(_Frozen):
         return self
 
 
-AUTHORITY_RECORD_SCHEMA_VERSION: Literal[1] = 1
-"""`AuthorityRecord` の形の版。"""
+AUTHORITY_RECORD_SCHEMA_VERSION: Literal[2] = 2
+"""`AuthorityRecord` の形の版。v2（`ControlTick` v18）で照合の上限 2 つを足した。"""
 
 
 class AuthorityRecord(_Frozen):
@@ -2159,11 +2245,15 @@ class AuthorityRecord(_Frozen):
     - ``command_id``: **この tick の先頭で**適用した管理ソケットの降格（`lower_authority` /
       `rollback_authority`）。``ModeCommandRecord.run_id`` との組で監査の表の行と対応する
     - ``persist_failure``: 直近の降格を書き残せなかった理由（0057 §2.6）
+    - ``artifact_ceiling`` / ``config_binding_ceiling``（v2）: journal の承認と loaded artifact
+      （0089 §2.2）・loaded config（0090 §2.2）の照合から決まる上限。上限が無ければ None。
+      **照らした hash は載せない**（0057 §2.7。artifact は Gate と registry、設定は
+      ``runtime.config`` が持つ）。``static`` の構成は照合をしないので、どちらも None
 
     **model version を含めない**（0057 §2.7。stage と model は独立に残す）。
     """
 
-    schema_version: Literal[1] = AUTHORITY_RECORD_SCHEMA_VERSION
+    schema_version: Literal[1, 2] = AUTHORITY_RECORD_SCHEMA_VERSION
     entry: Literal["static", "journal"]
     journal_stage: AuthorityStage | None = None
     journal_revision: int | None = Field(default=None, ge=0)
@@ -2172,9 +2262,26 @@ class AuthorityRecord(_Frozen):
     journal_unreadable: bool = False
     command_id: int | None = Field(default=None, ge=1)
     persist_failure: Reason | None = None
+    artifact_ceiling: AuthorityStage | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
+    config_binding_ceiling: AuthorityStage | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
 
     @model_validator(mode="after")
     def _describes_one_source(self) -> Self:
+        if self.schema_version < 2 and (
+            self.artifact_ceiling is not None or self.config_binding_ceiling is not None
+        ):
+            raise ValueError("照合の上限を記録する AuthorityRecord は schema version 2 にする")
+        if AuthorityStage.FULL in (self.artifact_ceiling, self.config_binding_ceiling):
+            # FULL の上限は「上限なし」と同じ事実。2通りの書き方を作らない
+            raise ValueError("照合の上限が無い状態は None で表す")
+        if self.entry == "static" and (
+            self.artifact_ceiling is not None or self.config_binding_ceiling is not None
+        ):
+            raise ValueError("journal を持たない構成は照合の上限を持たない")
         if (self.journal_stage is None) != (self.journal_revision is None):
             raise ValueError("journal の stage と revision は一緒に記録する")
         if self.entry == "static":
@@ -2198,6 +2305,10 @@ class AuthorityRecord(_Frozen):
             stages.append(self.journal_stage)
         if self.unpersisted_ceiling is not None:
             stages.append(self.unpersisted_ceiling)
+        if self.artifact_ceiling is not None:
+            stages.append(self.artifact_ceiling)
+        if self.config_binding_ceiling is not None:
+            stages.append(self.config_binding_ceiling)
         return lowest_stage(*stages)
 
 
@@ -2532,7 +2643,7 @@ class WorkloadHintRecord(_Frozen):
 class ControlTick(_Frozen):
     """1 tick の判断の記録（decision trace。0028 §2.3）。#82 が保存し、#90 / #91 が読む。"""
 
-    schema_version: Literal[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17] = (
+    schema_version: Literal[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18] = (
         SCHEMA_VERSION
     )
     tick_id: int = Field(ge=0)
@@ -2624,6 +2735,14 @@ class ControlTick(_Frozen):
     保存済みの v1〜v15 では None（「記録が無い」であって「ヒントが無かった」ではない）。
     ``stage: off`` の構成の v16 も ``None`` ではなく ``WorkloadHintRecord.off()`` を持つ。
     """
+    zone_excitation: ZoneExcitationRecord | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
+    """その tick の揺らぎの記録（v18。#84 / 決定記録 0185 §2.5 / 0186）。
+
+    保存済みの v1〜v17 では None（「記録が無い」であって「揺らぎが無かった」ではない）。
+    ``mode: "off"`` の構成の v18 も ``None`` ではなく ``ZoneExcitationRecord.off()`` を持つ。
+    """
     faults: tuple[Fault, ...] = ()
     """いま有効な故障。
 
@@ -2680,6 +2799,7 @@ class ControlTick(_Frozen):
         self._check_telemetry_health()
         self._check_run_id()
         self._check_workload_hint()
+        self._check_zone_excitation()
         self._check_model_gate()
         self._check_registry_binds_model()
         self._check_shadow()
@@ -2854,6 +2974,13 @@ class ControlTick(_Frozen):
             return
         if self.schema_version < 13:
             raise ValueError("authority を記録する ControlTick は schema version 13 にする")
+        expected = 2 if self.schema_version >= 18 else 1
+        if record.schema_version != expected:
+            # 塊の版は ControlTick の版で決まる（v18 から v2。0089 §5 の 1 / 0090 §5 の 3）
+            raise ValueError(
+                f"schema version {self.schema_version} の ControlTick の authority は "
+                f"v{expected} にする"
+            )
         if stage_rank(self.state.authority_stage) > stage_rank(record.ceiling()):
             # 実効 stage は journal・設定・この process の上限の最小を超えない（0057 §2.2）
             raise ValueError("authority_stage が記録した上限を超えている")
@@ -2952,6 +3079,50 @@ class ControlTick(_Frozen):
                 f"v{expected} にする"
             )
 
+    def _check_zone_excitation(self) -> None:
+        """v18 の揺らぎの記録が、同じ tick の状態・requested と同じ事実を指すか（0185 / 0186）。"""
+        record = self.zone_excitation
+        if record is None:
+            if self.schema_version >= 18:
+                # 版が中身を表さない記録を作らない（0060 §2.4）。mode: off でも載せる
+                raise ValueError("v18 の ControlTick には zone_excitation が要る")
+            return
+        if self.schema_version < 18:
+            raise ValueError("zone_excitation を記録する ControlTick は schema version 18 にする")
+        if record.state is not ZoneExcitationState.ON:
+            return
+        state = self.state
+        coordination = self.air_balance_coordination
+        if (
+            state.operating_mode is not OperatingMode.AUTO
+            or state.active_controller is not ControllerKind.FALLBACK
+            or state.safety_state is not SafetyState.NORMAL
+            or self.faults
+            or (coordination is not None and coordination.bypassed_gate)
+        ):
+            # 揺らぎは AUTO・Gate が Baseline を選んだ・Safety が normal・fault が無い tick だけ
+            # （0185 §2.3 / 0186 §2.1）
+            raise ValueError("揺らぎを掛けられない tick に zone_excitation: on を記録しない")
+        for zone in Zone:
+            demand = self.zones.get(zone).demand
+            if demand.guard_floor is not None or demand.guard_ceiling is not None:
+                raise ValueError("Guard が掛かった tick に zone_excitation: on を記録しない")
+        assert record.zone is not None and record.after is not None
+        if self.zones.get(record.zone).demand.requested != record.after:
+            raise ValueError(f"{record.zone.value}: 揺らぎの zone の requested は after にする")
+
+    def _pre_excitation_requested(self, zone: Zone) -> float:
+        """揺らぎを足す前の requested（協調の検査は揺らぎの前の値で比べる。0186 §2.1）。"""
+        record = self.zone_excitation
+        if (
+            record is not None
+            and record.state is ZoneExcitationState.ON
+            and record.zone is zone
+            and record.before is not None
+        ):
+            return record.before
+        return self.zones.get(zone).demand.requested
+
     def _check_tach_unconfirmed(self, record: AirBalanceCoordinationRecord) -> None:
         zones = self.tach_unconfirmed_zones
         assert zones is not None
@@ -3015,7 +3186,7 @@ class ControlTick(_Frozen):
             return
         for zone in Zone:
             zone_record = self.zones.get(zone)
-            requested = zone_record.demand.requested
+            requested = self._pre_excitation_requested(zone)
             code = zone_record.controller_reason.code
             if requested < output.get(zone):
                 raise ValueError(f"{zone.value}: Fallback の requested が協調の output を下回る")
@@ -3043,7 +3214,7 @@ class ControlTick(_Frozen):
                 fallback
                 and output is not None
                 and candidate is not None
-                and zone_record.demand.requested == output.get(zone)
+                and self._pre_excitation_requested(zone) == output.get(zone)
                 and output.get(zone) > candidate.get(zone)
             )
             if not raised:

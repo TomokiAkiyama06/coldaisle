@@ -203,8 +203,11 @@ zone_excitation:
   でない・未知の鍵）はどれも Control Config の不正（`config_invalid` の全 zone Max）。黙って `off` と読まない
 - 揺らぎは**上げるだけ**で、Gate の後・Reactive Guard / Critical Safety の前に、Gate が Baseline を選んだ tick の requested に
   だけ掛かる（0185 §2.1 / 0186 §2.1）。Guard の ceiling も Safety の floor・`forced_max` も迂回しない
-- **この版では設定を読むだけで、fand はまだ揺らぎを掛けない**（`mode: "apply"` でも運転は変わらない）。揺らぎの部品と
-  ControlTick v18 の記録は後続の PR で足す
+- `mode: "apply"` で fand が揺らぎを掛ける（`control/zone_excitation.py`）。予定は `off` の区間から始まり、`seed` と
+  fand の起動の `run_id` から決定論的に決まる。区間の中で条件（AUTO・Gate が Baseline を選んだ・Safety が normal・fault が無い・
+  Guard が掛かっていない・温度・時間帯）が外れた tick は区間をそこで打ち切り、再開しない（0185 §2.2 / §2.3・0186）
+- 毎 tick の状態は ControlTick v18 の `zone_excitation`（`off` / `idle` / `on` / `skipped`、区間の番号・zone・揺らぎの前と後の
+  requested・打ち切りの理由）に残る
 - 欄を足したので `fan-policy.yaml` の hash が変わる。authority の照合（0090）で、承認のときと設定が違えば Baseline より上を
   有効にしない（いまは shadow なので影響しない）
 

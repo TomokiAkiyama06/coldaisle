@@ -55,6 +55,7 @@ from coldaisle.control.schema import (
     SafetyState,
     WorkloadHintRecord,
     Zone,
+    ZoneExcitationRecord,
 )
 from coldaisle.store import QualityRules, SqliteStore
 from coldaisle.store.models import ControlTraceRecord
@@ -197,6 +198,7 @@ class Fixture:
             telemetry_health=TELEMETRY_HEALTH_RECORD,
             run_id=TRACE_RUN_ID,
             workload_hint=WorkloadHintRecord.off(),
+            zone_excitation=ZoneExcitationRecord.off(),
             faults=faults,
         )
 
@@ -531,6 +533,8 @@ def test_a_trace_without_coordination_rejects_the_run(setup: Fixture) -> None:
     del body["telemetry_health"]
     del body["run_id"]
     del body["workload_hint"]
+    del body["zone_excitation"]
+    body["authority"]["schema_version"] = 1
     row = ControlTraceRecord(
         ts_ms=tick.ts_ms, tick_id=tick.tick_id, schema_version=13, trace_json=json.dumps(body)
     )
