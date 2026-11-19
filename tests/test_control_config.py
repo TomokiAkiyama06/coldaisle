@@ -55,6 +55,21 @@ def air_balance_coordination(mode: str = "off") -> dict[str, object]:
     }
 
 
+def zone_excitation(mode: str = "off") -> dict[str, object]:
+    """`fan-policy.yaml` v14 の `zone_excitation`（決定記録 0185 §2.4）。値は仮。"""
+    return {
+        "mode": mode,
+        "zones": ["front", "rear", "top"],
+        "amplitude": provisional(0.10),
+        "on_ms": provisional(300_000),
+        "off_min_ms": provisional(600_000),
+        "off_max_ms": provisional(1_200_000),
+        "margin_c": provisional(8.0),
+        "allowed_hours": {"value": [0, 24], "status": "provisional"},
+        "seed": 1,
+    }
+
+
 def guard_band(
     activate: float,
     clear: float,
@@ -255,7 +270,7 @@ def valid_documents() -> dict[str, dict[str, object]]:
             "hardware_write_fail_exit_ms": provisional(5000),
         },
         "fan-policy.yaml": {
-            "schema_version": 13,
+            "schema_version": 14,
             "fallback_curve": [
                 {"temperature_c": 25.0, "demand": 0.3},
                 {"temperature_c": 80.0, "demand": 1.0},
@@ -374,6 +389,7 @@ def valid_documents() -> dict[str, dict[str, object]]:
                 "applied_demand_tolerance": provisional(0.01),
             },
             "air_balance_coordination": air_balance_coordination(),
+            "zone_excitation": zone_excitation(),
             "recovery_hold_ms": 1000,
             "demote_window_ms": 60000,
             "demote_after": 3,
@@ -394,13 +410,13 @@ def load_config(tmp_path: Path) -> ControlConfig:
 def test_complete_config_has_traceable_sources_and_is_not_actuation_ready(tmp_path: Path) -> None:
     config = load_config(tmp_path)
 
-    assert CONTROL_CONFIG_VERSION == 17
+    assert CONTROL_CONFIG_VERSION == 18
     assert config.actuation_permitted is False
-    assert config.trace_metadata()["control_config_version"] == 17
+    assert config.trace_metadata()["control_config_version"] == 18
     metadata = config.trace_metadata()["control_config"]
     assert metadata["fan_hardware"]["name"] == "fan-hardware.yaml"
     assert metadata["safety"]["schema_version"] == 5
-    assert metadata["policy"]["schema_version"] == 13
+    assert metadata["policy"]["schema_version"] == 14
     assert metadata["air_balance"]["name"] == "air-balance.yaml"
     assert metadata["air_balance"]["schema_version"] == 2
     assert len(metadata["safety"]["sha256"]) == 64
@@ -1070,9 +1086,9 @@ def test_v4_to_v5_migration_requires_explicit_supervisor_policy_values(tmp_path:
         ControlConfig.from_directory(tmp_path)
 
     documents["fan-policy.yaml"]["supervisor"] = supervisor
-    documents["fan-policy.yaml"]["schema_version"] = 13
+    documents["fan-policy.yaml"]["schema_version"] = 14
     write_documents(tmp_path, documents)
-    assert ControlConfig.from_directory(tmp_path).policy.schema_version == 13
+    assert ControlConfig.from_directory(tmp_path).policy.schema_version == 14
 
     del documents["fan-policy.yaml"]["supervisor"]["active_policy"]
     write_documents(tmp_path, documents)

@@ -34,9 +34,10 @@ from coldaisle.control.schema import (
     WorkloadRegime,
     Zone,
 )
+from coldaisle.control.schema import ZoneExcitationMode as ZoneExcitationMode
 from coldaisle.measurement import validate_metric
 
-CONTROL_CONFIG_VERSION: Literal[17] = 17
+CONTROL_CONFIG_VERSION: Literal[18] = 18
 """4ファイルを束ねた Control Config の版。
 
 - v11（#81 / 決定記録 0073 §2.1）: ``air-balance.yaml``（v2）を4つ目のファイルにした。
@@ -60,9 +61,11 @@ CONTROL_CONFIG_VERSION: Literal[17] = 17
   どちらの塊も省ける。**形**の誤りだけを Control Config の不正にし、値の制約（有限・非負・大小・
   点の数）はゲートの仕様の関数（``control/hint_gate.py``）が検査して B0 に倒す
   （0156 §2.6 / §5 の 3）
+- v18（#84 / 決定記録 0185 §2.4）: ``fan-policy.yaml`` を v14 にした（``zone_excitation``。
+  **必須**。v13 以前を補完しない）。``mode: "off"`` の間は運転を変えない
 """
 FAN_HARDWARE_CONFIG_VERSION: Literal[2] = 2
-FAN_POLICY_CONFIG_VERSION: Literal[13] = 13
+FAN_POLICY_CONFIG_VERSION: Literal[14] = 14
 SAFETY_CONFIG_VERSION: Literal[5] = 5
 CONFIG_FILENAMES = {
     "fan_hardware": "fan-hardware.yaml",
@@ -1360,10 +1363,65 @@ class AirBalanceCoordinationConfig(_ConfigModel):
     """引き上げ幅が消えた・縮んだ後も、直近の最大の幅を保つ時間（単調時計）。0 は保持しない。"""
 
 
+def _yaml_excitation_mode(value: object) -> object:
+    """YAML の ``zone_excitation.mode`` を列挙値に正規化する（決定記録 0185 §2.4）。
+
+    ``_yaml_coordination_mode`` と同じく、YAML 1.1 が真偽値の偽として読む引用符の無い ``off``
+    だけを ``off`` と読む。真は揺らぎを開く向きの値なので推測せず拒否する。
+    """
+    if value is False:
+        return ZoneExcitationMode.OFF
+    return ZoneExcitationMode(value) if isinstance(value, str) else value
+
+
+ExcitationAmplitude = Annotated[float, Field(gt=0.0, le=0.3, allow_inf_nan=False)]
+"""揺らぎで足す幅（demand）。0 は「掛けない」と同じなので ``mode: "off"`` で表し、値では許さない。
+上限 0.3 は 0183 の段の試験の幅（0.60 → 0.90）。それより大きな上乗せは段の試験の外の運転になる。"""
+PositiveCelsiusMargin = Annotated[float, Field(gt=0.0, allow_inf_nan=False)]
+HourRange = Annotated[tuple[int, int], BeforeValidator(_yaml_sequence_to_tuple)]
+
+
+class ZoneExcitationConfig(_ConfigModel):
+    """Baseline に 1 つの zone だけの小さな上乗せ（揺らぎ）を挟む方針（#84 / 決定記録 0185 §2.4）。
+
+    有効化は ``mode`` を人が ``off`` → ``apply`` と設定して再起動するだけで進む（0078 §2.8 と同じ。
+    authority journal を経ない）。揺らぎは上げるだけで、Guard と Critical Safety の前に掛かる
+    （0185 §2.1）。**値の既定はコードに持たない**（AGENTS.md ルール 9）。
+    """
+
+    mode: Annotated[ZoneExcitationMode, BeforeValidator(_yaml_excitation_mode)]
+    zones: Annotated[
+        frozenset[Zone], BeforeValidator(_yaml_zones_to_frozenset), Field(min_length=1)
+    ]
+    """選ぶ zone（0185 §2.2）。空は不正。"""
+    amplitude: ConfigValue[ExcitationAmplitude]
+    on_ms: PolicyMilliseconds
+    """1 つの揺らぎの区間（``on``）の長さ。"""
+    off_min_ms: PolicyMilliseconds
+    off_max_ms: PolicyMilliseconds
+    """``off`` の区間の長さは ``[off_min_ms, off_max_ms]`` の一様乱数（0185 §2.2）。"""
+    margin_c: ConfigValue[PositiveCelsiusMargin]
+    """CPU・GPU の温度が中止の基準（0121 §2.1）よりこれだけ低いときだけ掛ける（0185 §2.3）。"""
+    allowed_hours: ConfigValue[HourRange]
+    """掛ける時間帯 ``[開始, 終了)``（fand のローカル時刻の時）。``[0, 24]`` は終日。日をまたぐ帯は
+    書けない（2 つの帯が要る運用になったら版を上げて列にする）。"""
+    seed: Annotated[int, Field(ge=0, le=2**63 - 1)]
+    """予定の乱数の種（0185 §2.2）。run の識別子と合わせて決定論的な列を作る。"""
+
+    @model_validator(mode="after")
+    def _schedule_is_consistent(self) -> Self:
+        if self.off_min_ms.value > self.off_max_ms.value:
+            raise ValueError("zone_excitation.off_min_ms は off_max_ms 以下にする")
+        start, end = self.allowed_hours.value
+        if not 0 <= start < end <= 24:
+            raise ValueError("zone_excitation.allowed_hours は 0 <= 開始 < 終了 <= 24 にする")
+        return self
+
+
 class FanPolicyConfig(_ConfigModel):
-    schema_version: Literal[13]
+    schema_version: Literal[14]
     """v13（#288 / 決定記録 0156 §2.1）で ``supervisor.workload_hint.monotonicity_gate``
-    を足した。"""
+    を足した。v14（#84 / 決定記録 0185 §2.4）で ``zone_excitation`` を足した（必須）。"""
     fallback_curve: Annotated[
         tuple[FallbackPoint, ...], BeforeValidator(_yaml_sequence_to_tuple), Field(min_length=2)
     ]
@@ -1390,6 +1448,8 @@ class FanPolicyConfig(_ConfigModel):
 
     v11（#86 / 決定記録 0077 §2.4）は ``mpc.max_source_age_ms`` を足した。v10 以前を補完しない。
     """
+    zone_excitation: ZoneExcitationConfig
+    """v14（#84 / 決定記録 0185 §2.4）。**必須。** v13 以前を補完しない。"""
     recovery_hold_ms: PositiveMilliseconds
     demote_window_ms: PositiveMilliseconds
     demote_after: Annotated[int, Field(gt=0)]
@@ -1793,6 +1853,9 @@ class ControlConfig(_ConfigModel):
             "air_balance_coordination.release_hold_ms",
             coordination.release_hold_ms,
         )
+        excitation = self.policy.zone_excitation
+        for name in ("amplitude", "on_ms", "off_min_ms", "off_max_ms", "margin_c", "allowed_hours"):
+            append("fan-policy.yaml", f"zone_excitation.{name}", getattr(excitation, name))
         for zone in Zone:
             bound = optimizer.zone_bounds.get(zone)
             append("fan-policy.yaml", f"mpc.optimizer.zone_bounds.{zone.value}.floor", bound.floor)

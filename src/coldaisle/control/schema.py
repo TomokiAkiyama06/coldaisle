@@ -1725,6 +1725,18 @@ class AirBalanceCoordinationMode(StrEnum):
     APPLY = "apply"
 
 
+class ZoneExcitationMode(StrEnum):
+    """Baseline に zone ごとの小さな上乗せ（揺らぎ）を掛けるか（決定記録 0185 §2.4）。
+
+    ``fan-policy.yaml`` の ``zone_excitation.mode`` と trace の記録が同じ値を指すよう、
+    型はここに1つだけ置く（``config`` はこれを import する）。``shadow`` は持たない
+    （0185 §5 の 6 で、最初の運用は ``apply`` に決めた）。
+    """
+
+    OFF = "off"
+    APPLY = "apply"
+
+
 class AirBalanceCoordinationStatus(StrEnum):
     """1 tick の協調の結果（決定記録 0078 §2.7）。"""
 
